@@ -358,6 +358,12 @@ package_soyeht_mac() {
     copy_helper "store-ipc" "store-ipc"
     copy_helper "terminal-ipc" "terminal-ipc"
     copy_helper "vmrunner_macos_ipc" "vmrunner_macos_ipc"
+    # Privileged APFS provisioning helper used by Soyeht.app onboarding to
+    # mount the macOS guest disk image with `-o owners` and write provision
+    # files as `root:wheel`. Built as part of `-p vmrunner-macos-rs`, but it
+    # was previously omitted from this copy block, leaving the release
+    # tarball without it. Soyeht.app rejects bundles missing this binary.
+    copy_helper "theyos-provision-inject" "theyos-provision-inject"
 
     printf '%s' "${version}" > "${helpers_dir}/engine-version.txt"
     info "  + engine-version.txt (${version})"
@@ -407,6 +413,9 @@ package_soyeht_mac() {
     sign_helper "store-ipc" "com.soyeht.theyos.store-ipc" ""
     sign_helper "terminal-ipc" "com.soyeht.theyos.terminal-ipc" ""
     sign_helper "vmrunner_macos_ipc" "com.soyeht.theyos.vmrunner_macos_ipc" "${entitlements}"
+    # provision-inject does not need VM entitlements; it elevates via sudo
+    # at runtime to mount the guest disk and write root-owned files.
+    sign_helper "theyos-provision-inject" "com.soyeht.theyos.theyos-provision-inject" ""
 
     # Notarize the signed binary. Required for Gatekeeper on machines that don't
     # have the Developer ID cert in their trust store. Gracefully no-ops when any
