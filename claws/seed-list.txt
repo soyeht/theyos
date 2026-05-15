@@ -1,0 +1,83 @@
+# theyOS claw catalog — curated seed list (P-46 Fase G).
+#
+# One GitHub repo URL per line. Blank lines and `#` comments are ignored by
+# `soyeht claws-detect --from-list`. Lines commented out with `#!` are
+# claws that already exist in claws/manifest.yml at tier: supported — kept
+# here as documentation of what was considered.
+#
+# Workflow to populate the catalog from this file:
+#   1. Set GITHUB_TOKEN in .env (unauth rate limit is 60/hr — insufficient).
+#   2. soyeht claws-detect --from-list claws/seed-list.txt --yes
+#      ~5min with cache; skips entries already in manifest.
+#   3. soyeht claws-verify --all-detected --concurrency 2
+#      overnight; promotes passing claws from detected → available.
+#   4. For stubborn catalog-only claws that the detector couldn't classify:
+#      soyeht claws-discover --all-catalog       (dry-run; writes patches)
+#      Review patches in artifacts/discover/, then:
+#      soyeht claws-discover --all-catalog --apply
+#
+# Curation is drawn from `awesome-claws` / `awesome-openclaw` and direct
+# inspection of GitHub repos ranked by stars. Some pairs of repos share
+# a name (e.g. princezuda/safeclaw vs rawalrahul/safeclaw); the higher-
+# star variant wins. Known name collisions are commented `# collides:`.
+
+# ── Top tier by stars (already supported in manifest.yml) ─────────────────────
+#! https://github.com/openclaw/openclaw            # 357k ★ — supported
+#! https://github.com/NousResearch/hermes-agent    # 76.6k ★ — supported (hermes-agent)
+#! https://github.com/HKUDS/nanobot                # 39.4k ★ — supported
+#! https://github.com/zeroclaw-labs/zeroclaw       # 30.1k ★ — supported
+#! https://github.com/sipeed/picoclaw              # 28.1k ★ — supported
+#! https://github.com/nullclaw/nullclaw            # 7.2k ★  — supported
+#! https://github.com/nearai/ironclaw              # 11.7k ★ — supported
+# (noclaw is proprietary — not on GitHub)
+
+# ── High star (likely candidates for detected → available pipeline) ──────────
+https://github.com/NVIDIA/NemoClaw                 # 19.2k ★
+https://github.com/HKUDS/ClawWork                  # 8k ★
+https://github.com/qwibitai/nanoclaw               # 27.2k ★ (collides with nanobot? check)
+https://github.com/ValueCell-ai/ClawX              # 6.5k ★
+https://github.com/memovai/mimiclaw                # 5.2k ★
+
+# ── Mid tier ─────────────────────────────────────────────────────────────────
+https://github.com/TinyAGI/tinyagi                 # 3.5k ★ (renamed: tinyclaw → tinyagi)
+https://github.com/tnm/zclaw                       # 2.1k ★
+https://github.com/unitedbyai/droidclaw            # 1.4k ★
+https://github.com/OpenBMB/EdgeClaw                # 1.2k ★
+https://github.com/GreenSheep01201/claw-empire     # 1.1k ★
+https://github.com/OpenLAIR/dr-claw                # 854 ★
+https://github.com/zevorn/rt-claw                  # 818 ★
+https://github.com/microclaw/microclaw             # 647 ★
+https://github.com/mosaxiv/clawlet                 # 606 ★  (collides: DracoBlue/clawlet 4 ★)
+https://github.com/qhkm/zeptoclaw                  # 588 ★
+https://github.com/PlaiPin/rosclaw                 # 479 ★
+https://github.com/freddy-schuetz/n8n-claw         # 375 ★
+https://github.com/brendanhogan/hermitclaw         # 319 ★
+https://github.com/stellarlinkco/myclaw            # 262 ★
+https://github.com/gaoyangz77/rivonclaw            # 252 ★  (renamed: easyclaw → rivonclaw)
+https://github.com/kk43994/kkclaw                  # 155 ★
+
+# ── Low tier (likely catalog; needs claws-discover LLM fallback) ─────────────
+https://github.com/princezuda/safeclaw             # 130 ★  (collides: rawalrahul/safeclaw 2 ★)
+https://github.com/jmlago/subzeroclaw              # 119 ★
+https://github.com/XSafeAI/XSafeClaw               # 81 ★
+# https://github.com/angristan/noclaw              # 69 ★ — collides with supported noclaw; skip
+https://github.com/vincenzodomina/supaclaw         # 58 ★
+https://github.com/dorringel/epsiclaw              # 45 ★
+https://github.com/Clawland-AI/Geneclaw            # 35 ★
+https://github.com/RikyZ90/ShibaClaw               # 28 ★
+https://github.com/imxcstar/sharpclaw              # 22 ★
+https://github.com/KarakuriAgent/clawdroid         # 10 ★
+https://github.com/Abdur-rahmaanJ/angel-claw       # 6 ★
+https://github.com/andrehuang/claude-claw          # 5 ★
+https://github.com/wrxck/LegacyPodClaw             # 5 ★ (renamed: ClawPod → LegacyPodClaw)
+https://github.com/Clawland-AI/OpenclawBox         # 4 ★
+https://github.com/asklokesh/loki-claw             # 0 ★
+
+# ClawArm — gap from 46-list review (2026-04-14). URL inferred from same
+# Clawland-AI org as Geneclaw/OpenclawBox; detector will 404 cleanly if wrong
+# and we can retarget by hand.
+https://github.com/Clawland-AI/clawarm              # 7 ★
+
+# ── Excluded name collisions (reference only) ────────────────────────────────
+# https://github.com/DracoBlue/clawlet             # 4 ★  — collides with mosaxiv/clawlet
+# https://github.com/rawalrahul/safeclaw           # 2 ★  — collides with princezuda/safeclaw

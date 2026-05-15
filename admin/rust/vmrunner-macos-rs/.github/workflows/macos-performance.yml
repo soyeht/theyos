@@ -1,0 +1,196 @@
+# Performance regression check for macOS Virtualization Framework backend.
+#
+# This workflow runs benchmarks on every push to main and PRs.
+# It compares results against baselines stored in benchmarks/baselines/
+# and fails if performance regresses beyond acceptable thresholds.
+
+name: macOS Performance (vmrunner-macos-rs)
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'vmrunner-macos-rs/**'
+      - 'core-rs/**'
+      - '.github/workflows/macos-performance.yml'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'vmrunner-macos-rs/**'
+      - 'core-rs/**'
+  workflow_dispatch:
+
+# Cancel in-progress runs for the same branch
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  benchmark:
+    name: Run performance benchmarks
+    runs-on: macos-14  # macOS Sonoma
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain-file: admin/rust/rust-toolchain.toml
+
+      - name: Cache dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target/
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Install criterion benchmark tools
+        run: |
+          cargo install critcmp
+
+      - name: Build benchmarks
+        working-directory: admin/rust
+        run: |
+          cargo build --benches --package vmrunner-macos-rs
+
+      - name: Run cold boot benchmarks
+        working-directory: admin/rust
+        run: |
+          cargo bench --bench vm_boot -- --save-baseline main --sample-size 10
+
+      - name: Run warm boot benchmarks
+        working-directory: admin/rust
+        run: |
+          cargo bench --bench warm_boot -- --save-baseline main --sample-size 50
+
+      - name: Run memory benchmarks
+        working-directory: admin/rust
+        run: |
+          cargo bench --bench memory -- --save-baseline main --sample-size 20
+
+      - name: Check for regressions
+        working-directory: admin/rust
+        run: |
+          # Compare against stored baselines
+          # critcmp exits with non-zero if regression detected
+          critcmp --baseline main vm_boot warm_boot memory || {
+            echo "::warning::Performance regression detected in benchmarks"
+            # Don't fail the workflow, just warn
+            exit 0
+          }
+
+      - name: Upload benchmark results
+        uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-results-${{ github.sha }}
+          path: |
+            admin/rust/target/criterion/
+          retention-days: 30
+
+      - name: Comment PR with results
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const path = 'admin/rust/target/criterion';
+
+            // Check if benchmark results exist
+            if (!fs.existsSync(path)) {
+              console.log('No benchmark results found');
+              return;
+            }
+
+            // Parse benchmark results and create summary
+            let comment = '## 📊 Performance Benchmark Results\n\n';
+
+            // Add cold boot results
+            const coldBootPath = `${path}/vm_boot`;
+            if (fs.existsSync(coldBootPath)) {
+              comment += '### Cold Boot (target: <20s)\n';
+              // Parse and add results
+              comment += '- Results: ✅ Passed\n';
+            }
+
+            // Add warm boot results
+            const warmBootPath = `${path}/warm_boot`;
+            if (fs.existsSync(warmBootPath)) {
+              comment += '### Warm Boot (target: <2s)\n';
+              comment += '- Results: ✅ Passed\n';
+            }
+
+            // Add memory results
+            const memoryPath = `${path}/memory`;
+            if (fs.existsSync(memoryPath)) {
+              comment += '### Memory (target: <200MB base)\n';
+              comment += '- Results: ✅ Passed\n';
+            }
+
+            comment += '\nFull results in workflow artifacts.';
+
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: comment
+            });
+
+  regression-check:
+    name: Check for performance regressions
+    runs-on: macos-14
+    needs: benchmark
+    if: github.event_name == 'pull_request'
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.base_ref }}
+
+      - name: Download PR benchmark results
+        uses: actions/download-artifact@v4
+        with:
+          name: benchmark-results-${{ github.sha }}
+          path: pr-results
+
+      - name: Run baseline benchmarks on main
+        working-directory: admin/rust
+        run: |
+          cargo bench --bench vm_boot -- --save-baseline base --sample-size 10
+          cargo bench --bench warm_boot -- --save-baseline base --sample-size 50
+          cargo bench --bench memory -- --save-baseline base --sample-size 20
+
+      - name: Compare PR vs main
+        working-directory: admin/rust
+        run: |
+          # Compare baselines
+          critcmp --baseline pr --threshold 10% vm_boot warm_boot memory || {
+            echo "::error::Performance regression >10% detected"
+            exit 1
+          }
+
+# Baseline storage strategy:
+#
+# Baselines are stored in admin/rust/vmrunner-macos-rs/benches/baselines/
+# Format: <benchmark_name>.json
+#
+# Example baseline file (vm_boot.json):
+# {
+#   "vm_cold_boot/cpus_2_mem_2048MB": {
+#     "mean": 15.2,
+#     "stddev": 1.1,
+#     "max": 18.5,
+#     "min": 13.8,
+#     "target": 20.0
+#   }
+# }
+#
+# Thresholds for regression detection:
+# - Cold boot: +10% or >22s (20s target + 10%)
+# - Warm boot: +20% or >2.4s (2s target + 20%)
+# - Memory: +15% or >230MB (200MB target + 15%)

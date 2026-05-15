@@ -1,0 +1,128 @@
+[package]
+name    = "server-rs"
+version = "0.1.11"
+edition.workspace = true
+rust-version.workspace = true
+build   = "build.rs"
+
+[lib]
+name = "server_rs"
+path = "src/lib.rs"
+
+[[bin]]
+name = "server"
+path = "src/main.rs"
+
+[[bin]]
+name = "gen-owner-cert-fixture"
+path = "src/bin/gen_owner_cert_fixture.rs"
+
+[dependencies]
+# Async runtime + HTTP framework
+tokio       = { workspace = true }
+axum        = { workspace = true }
+tower       = { workspace = true }
+tower-http  = { workspace = true }
+hyper       = { workspace = true }
+hyper-util  = { workspace = true }
+# Serialization
+serde       = { workspace = true }
+serde_json  = { workspace = true }
+
+# Observability
+tracing             = { workspace = true }
+tracing-subscriber  = { workspace = true }
+
+# System
+libc         = { workspace = true }
+
+# Shared foundation
+core-rs      = { workspace = true, features = ["http", "db"] }
+
+# Internal crates (Phase 1)
+session-rs   = { workspace = true }
+claw-rs      = { workspace = true }
+jobs-rs      = { workspace = true }
+
+# Internal crates (Phase 2)
+store-rs        = { workspace = true }
+executor-rs     = { workspace = true }
+
+# Phase 1 cryptographic skeleton
+household-rs    = { workspace = true }
+mdns-sd         = { workspace = true }
+gethostname     = { workspace = true }
+if-addrs        = { workspace = true }
+
+# For inlined ratelimit module
+rusqlite        = { workspace = true }
+thiserror       = { workspace = true }
+
+# Mobile QR auth tokens
+rand            = "0.8"
+base64          = { workspace = true }
+hex             = { workspace = true }
+subtle          = { workspace = true }
+qrcode          = { workspace = true }
+image           = { workspace = true }
+percent-encoding = { workspace = true }
+
+# HTTP client (for Caddy admin API in expose handler)
+ureq            = { workspace = true }
+
+# Internal crates (Phase 3)
+terminal-rs  = { workspace = true }
+vmrunner-rs  = { workspace = true }
+
+# Phase 3 machine-join push transport (APNS HTTP/2 client; runtime-gated by THEYOS_PUSH_DISABLED)
+a2            = { workspace = true }
+
+# Phase 3 wire types (ByteBuf / serde_bytes integration with the
+# household-rs Phase 3 schema)
+serde_bytes   = { workspace = true }
+zeroize       = { workspace = true }
+
+# File uploads
+tempfile      = { workspace = true }
+
+# Artifact installation (zstd decompression, SHA-256 verification)
+zstd          = { workspace = true }
+sha2          = { workspace = true }
+blake3        = { workspace = true }
+
+# Phase 3 transitive deps used directly
+pty-process   = { workspace = true }
+tokio-stream  = { workspace = true }
+
+[dev-dependencies]
+axum-test    = "17"
+serde_json   = { workspace = true }
+tokio        = { workspace = true }
+tower        = { workspace = true }
+claw-rs      = { workspace = true }
+executor-rs  = { workspace = true }
+jobs-rs      = { workspace = true }
+tempfile     = { workspace = true }
+session-rs   = { workspace = true }
+store-rs     = { workspace = true }
+terminal-rs  = { workspace = true }
+vmrunner-rs  = { workspace = true }
+
+[features]
+# Phase 3 failure-injection harness (T063/T064). Enabling this feature
+# compiles in `tokio::sync::Notify`-driven crash points used by
+# `e2e-rs/tests/phase3_atomic_rollback.rs`. Production builds MUST NOT
+# enable this feature; the gates are also `#[cfg(test)]` so unit tests
+# in this crate compile them in unconditionally.
+failure-injection = []
+
+# macOS-only FFI bindings to Apple's dns_sd.h system header. Used by
+# `bonjour_impl_dns_sd.rs` to publish/browse via `mDNSResponder` (the
+# system mDNS daemon) instead of racing it on UDP 5353 with the
+# pure-Rust `mdns-sd` crate. See
+# `docs/followup-mdns-sd-macos-publisher.md` for context.
+[target.'cfg(target_os = "macos")'.build-dependencies]
+bindgen = { workspace = true }
+
+[lints]
+workspace = true

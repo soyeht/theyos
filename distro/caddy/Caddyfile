@@ -1,0 +1,207 @@
+# Global options
+{
+    # Enable admin API for dynamic route management (claw instances).
+    # Caddy runs as a native NixOS systemd service; the Rust backend
+    # (caddyadmin-rs) connects to localhost:2019 directly.
+    admin localhost:2019
+
+    # Prevent automatic HTTP→HTTPS redirects. Without this, Caddy redirects
+    # http://admin.{env.THEYOS_BASE_DOMAIN} to https://, which breaks the
+    # Cloudflare Tunnel path (tunnel sends HTTP to localhost:8080).
+    auto_https disable_redirects
+}
+
+# Host-header-based routing with security protections
+
+:8080 {
+    # Access log for diagnosing tunnel/origin latency (duration in seconds).
+    # Caddy 2.9 requires the parent directory to exist before startup.
+    log {
+        output file /var/log/caddy/access.log {
+            roll_size 100mb
+            roll_keep 5
+            roll_keep_for 720h
+        }
+        format json
+    }
+
+    # Security headers
+    header {
+        # XSS protection
+        X-Content-Type-Options nosniff
+        X-Frame-Options DENY
+        X-XSS-Protection "1; mode=block"
+        Referrer-Policy strict-origin-when-cross-origin
+
+        # Content Security Policy (CSP)
+        Content-Security-Policy "default-src 'self'; script-src 'self' 'unsafe-inline' 'unsafe-eval' blob:; style-src 'self' 'unsafe-inline'; img-src 'self' data: https:; font-src 'self' data:; connect-src 'self' wss: ws:; object-src 'none';"
+
+        # HTTPS Strict Transport Security (only if HTTPS is in use)
+        Strict-Transport-Security "max-age=31536000; includeSubDomains"
+
+        # Remove headers that leak information
+        -Server
+        -X-Powered-By
+    }
+    
+    # Domain matchers read THEYOS_BASE_DOMAIN from the systemd service env.
+    # Caddy substitutes {env.THEYOS_BASE_DOMAIN} at config-load time.
+    @panel host admin.{env.THEYOS_BASE_DOMAIN}
+    @root host {env.THEYOS_BASE_DOMAIN}
+    @www host www.{env.THEYOS_BASE_DOMAIN}
+    @local host localhost 127.0.0.1
+
+    # LAN — direct IP (192.168.x.x range, e.g. Mac simulator)
+    @lan header_regexp lan_ip Host ^192\.168\.
+
+    # Tailscale — direct IP (100.64.0.0/10 range)
+    @tailscale_ip header_regexp tailscale_ip Host ^100\.
+
+    # Tailscale — MagicDNS (machine.tailnet.ts.net)
+    @tailscale_dns host *.*.ts.net
+
+    # Defense-in-depth: never trust a client-supplied X-TheyOS-Public-Site
+    # header. The public handles below re-add it explicitly. Without this,
+    # a request to admin.{env.THEYOS_BASE_DOMAIN} could ride the @panel
+    # path with the marker set; the backend would still 404 on unmapped
+    # hosts, but stripping here keeps the marker fully Caddy-controlled.
+    request_header -X-TheyOS-Public-Site
+
+    # Block sensitive paths
+    @blocked_paths {
+        path /.env* /config* /secret* /.git* /backup* /.streamlit/secrets*
+    }
+    respond @blocked_paths 404
+    
+    handle @www {
+        redir https://{env.THEYOS_BASE_DOMAIN}{uri}
+    }
+
+    handle @root {
+        handle /privacy {
+            reverse_proxy 127.0.0.1:8892
+        }
+        handle {
+            respond "{env.THEYOS_BASE_DOMAIN} coming soon" 200
+        }
+    }
+
+    handle @panel {
+        reverse_proxy 127.0.0.1:8892
+    }
+
+    handle @local {
+        reverse_proxy 127.0.0.1:8892
+    }
+
+    handle @lan {
+        reverse_proxy 127.0.0.1:8892
+    }
+
+    handle @tailscale_ip {
+        reverse_proxy 127.0.0.1:8892
+    }
+
+    handle @tailscale_dns {
+        reverse_proxy 127.0.0.1:8892
+    }
+
+    # Claw instance subdomains (e.g. user-pico.{env.THEYOS_BASE_DOMAIN})
+    # Routed to the backend which handles dynamic reverse-proxying to VMs.
+    # The marker header prevents unknown public hosts from falling through to
+    # the admin SPA/API; the backend returns 404 unless a public_sites mapping
+    # exists for the Host.
+    @claw_subdomain host *.{env.THEYOS_BASE_DOMAIN}
+    handle @claw_subdomain {
+        reverse_proxy 127.0.0.1:8892 {
+            header_up X-TheyOS-Public-Site "1"
+        }
+    }
+
+    # Custom public claw domains outside THEYOS_BASE_DOMAIN also route through
+    # the backend public-site gate. Unmapped hosts receive 404 from the backend.
+    handle {
+        reverse_proxy 127.0.0.1:8892 {
+            header_up X-TheyOS-Public-Site "1"
+        }
+    }
+}
+
+# LAN HTTPS: direct access to admin.{env.THEYOS_BASE_DOMAIN} from devices on
+# the local network. Requires split DNS so LAN clients resolve the host to
+# your internal IP (e.g. 192.0.2.x). Uses Let's Encrypt via DNS-01 challenge
+# (no public ports needed for cert issuance). The :8080 block above continues
+# handling HTTP traffic from the Cloudflare Tunnel.
+admin.{env.THEYOS_BASE_DOMAIN}:443 {
+    log {
+        output file /var/log/caddy/access.log {
+            roll_size 100mb
+            roll_keep 5
+            roll_keep_for 720h
+        }
+        format json
+    }
+
+    tls {
+        dns cloudflare {env.CF_API_TOKEN}
+    }
+
+    header {
+        X-Content-Type-Options nosniff
+        X-Frame-Options DENY
+        X-XSS-Protection "1; mode=block"
+        Referrer-Policy strict-origin-when-cross-origin
+        Content-Security-Policy "default-src 'self'; script-src 'self' 'unsafe-inline' 'unsafe-eval' blob:; style-src 'self' 'unsafe-inline'; img-src 'self' data: https:; font-src 'self' data:; connect-src 'self' wss: ws:; object-src 'none';"
+        Strict-Transport-Security "max-age=31536000; includeSubDomains"
+        -Server
+        -X-Powered-By
+    }
+
+    @blocked_paths {
+        path /.env* /config* /secret* /.git* /backup* /.streamlit/secrets*
+    }
+    respond @blocked_paths 404
+
+    reverse_proxy 127.0.0.1:8892
+}
+
+# ── Local HTTPS (macOS dev primary use case) ────────────────────────────────
+#
+# On macOS, `soyeht setup` runs `caddy trust` to install Caddy's local CA into
+# the System keychain. The blocks below use that CA via `tls internal`, giving
+# the developer real HTTPS on https://admin.localhost and any *.localhost host
+# without browser warnings.
+#
+# On NixOS in production these blocks are harmless: nothing outside the host
+# resolves `localhost` to anything, so no traffic ever reaches them.
+#
+# *.localhost intentionally goes through the public-site gate so it mirrors
+# production behavior — devs can register `app.localhost` via the public-sites
+# API and exercise the same code path as `app.example.com` on prod.
+
+admin.localhost {
+    tls internal
+
+    header {
+        X-Content-Type-Options nosniff
+        X-Frame-Options DENY
+        Referrer-Policy strict-origin-when-cross-origin
+        -Server
+    }
+
+    reverse_proxy 127.0.0.1:8892
+}
+
+*.localhost {
+    tls internal
+
+    request_header -X-TheyOS-Public-Site
+
+    reverse_proxy 127.0.0.1:8892 {
+        header_up X-TheyOS-Public-Site "1"
+    }
+}
+
+# Extra configs (e.g. HTTPS Tailscale) — generated by setup.sh in theyos/tailscale/
+# Not versioned — avoids exposing the personal Tailscale hostname.
+import /etc/caddy/conf.d/*.caddy

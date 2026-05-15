@@ -1,0 +1,18 @@
+{
+  "manifest_version": 1,
+  "claw": "noclaw",
+  "version": "2.1.92",
+  "arch": "x86_64-linux",
+  "fingerprint": "0e6fd65103ce5c433e8a0b021ff3f6d37880de111b44a69923d9d56f5f92be7e",
+  "base_rootfs_version": "v2",
+  "sha256": "194c4f9b16582180ede6884426aadfe2ccee139465e4d590f30e2bb7d4222482",
+  "size_bytes": 732096374,
+  "url": "https://github.com/soyeht/theyos/releases/download/artifact-noclaw-2.1.92/noclaw-x86_64-linux-rootfs.ext4.zst",
+  "published_at": "2026-04-10T03:33:41Z",
+  "channel": "stable",
+  "base_rootfs_sha256": "e965c55c8220953a1c323a6a4b748d4eb299393b1451ad3a9d153c6c2c751899",
+  "installer_plan_sha256": "42ad1590153dfe70c8cb22661e0889feb1e01f294a032c7ac0e32f3b6e912af2",
+  "kernel_sha256": "e20e46d0c36c55c0d1014eb20576171b3f3d922260d9f792017aeff53af3d4f2",
+  "kernel_version": "vmlinux-6.1.155",
+  "firecracker_version": "v1.15.0"
+}

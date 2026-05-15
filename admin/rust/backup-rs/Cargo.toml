@@ -1,0 +1,23 @@
+[package]
+name = "backup-rs"
+version = "0.1.11"
+edition.workspace = true
+rust-version.workspace = true
+description = "Rust implementation of SQLite backup management for theyOS"
+
+[[bin]]
+name = "backup_ipc"
+path = "src/bin/backup_ipc.rs"
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+rusqlite = { workspace = true }
+thiserror = { workspace = true }
+core-rs = { workspace = true, features = ["db"] }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+
+[lints]
+workspace = true

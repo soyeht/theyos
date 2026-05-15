@@ -1,0 +1,119 @@
+name: Backend CI
+
+on:
+  push:
+    paths:
+      - "admin/rust/**"
+      - ".github/workflows/backend-ci.yml"
+  pull_request:
+    paths:
+      - "admin/rust/**"
+      - ".github/workflows/backend-ci.yml"
+  workflow_dispatch:
+
+jobs:
+  build-and-test-linux:
+    name: Build & Test (Rust / Linux)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - name: Install native test dependencies
+        run: sudo apt-get update && sudo apt-get install -y openssh-server pkg-config libdbus-1-dev libkeyutils-dev
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: "admin/rust -> target"
+      - name: Clippy (deny warnings)
+        run: cd admin/rust && cargo clippy --workspace -- -D warnings 2>&1
+      - name: Build workspace
+        run: cd admin/rust && cargo build --workspace 2>&1
+      - name: Run tests (serialised)
+        run: cd admin/rust && cargo test --workspace -- --test-threads=1 2>&1
+      - name: APNS dispatcher opacity lint (Constitution III source-level gate)
+        # Third leg of the three-layer "no household metadata reaches the
+        # push provider" enforcement stack (compile-time API shape +
+        # runtime spy test + this lint). The contract documents this as
+        # "wired into CI" — keep it true.
+        run: bash admin/rust/scripts/lint-apns-payload.sh
+
+  build-and-test-macos:
+    name: Build & Test (Rust / macOS)
+    runs-on: macos-15
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      # macOS-15 GitHub-hosted runners ship Xcode 16 by default; no xcode-select needed.
+      # The bonjour_impl_dns_sd build.rs calls xcrun --show-sdk-path, which requires
+      # the Xcode CLI tools — they are pre-installed on all macos-15 images.
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: "admin/rust -> target"
+      - name: Clippy (deny warnings)
+        run: cd admin/rust && cargo clippy --workspace -- -D warnings 2>&1
+      - name: Build workspace
+        run: cd admin/rust && cargo build --workspace 2>&1
+      - name: Run tests (serialised)
+        run: cd admin/rust && cargo test --workspace -- --test-threads=1 2>&1
+      - name: APNS dispatcher opacity lint (Constitution III source-level gate)
+        # Third leg of the three-layer "no household metadata reaches the
+        # push provider" enforcement stack (compile-time API shape +
+        # runtime spy test + this lint). The contract documents this as
+        # "wired into CI" — keep it true.
+        run: bash admin/rust/scripts/lint-apns-payload.sh
+
+  no-bash-policy:
+    name: No-Bash Policy Check
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Check for bash invocations in Rust source
+        run: |
+          # Fail on any Command::new("bash") or /bin/bash in operational Rust code.
+          # Test files (tests/, src/bin/*_test.rs) are excluded — they may use shell scripts
+          # as fake IPC binaries. Comments (lines starting with //) are also excluded.
+          # Guest-side content (strings written into VMs/chroots) is acceptable.
+          HITS=$(grep -rn 'Command::new("bash")\|/bin/bash' admin/rust/ \
+                   --include='*.rs' \
+                   | grep -v '/target/' \
+                   | grep -v '/tests/' \
+                   | grep -v '^\s*//' \
+                 || true)
+          if [ -n "$HITS" ]; then
+            echo "::error::Found bash invocation in Rust operational code:"
+            echo "$HITS"
+            echo "Policy: use /bin/sh or direct exec. See P28 in CLAUDE.md."
+            exit 1
+          fi
+          echo "OK: no bash invocations found in operational Rust source"
+
+      - name: Check for new operational .sh scripts
+        run: |
+          # P28: operational shell scripts are forbidden. Keep the policy strict for
+          # unexpected additions, but allow the existing repo-root release/dev helpers.
+          OPERATIONAL=$(find scripts/ -name '*.sh' -type f \
+                   ! -path 'scripts/make.sh' \
+                   ! -path 'scripts/publish-claw-artifact.sh' \
+                   ! -path 'scripts/generate-brew-formula.sh' \
+                   ! -path 'scripts/install-linux.sh' \
+                   2>/dev/null || true)
+          if [ -n "$OPERATIONAL" ]; then
+            echo "::error::Found .sh scripts in scripts/ — policy: all operations must use Rust binaries"
+            echo "$OPERATIONAL"
+            exit 1
+          fi
+          echo "OK: no .sh scripts found in scripts/"

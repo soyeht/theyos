@@ -1,0 +1,43 @@
+name: macOS restore image not found automatically
+description: Report that theyOS could not find a compatible signed macOS restore image for this Mac automatically.
+title: "[macOS restore] automatic lookup failed on <model> <version> (<build>)"
+labels:
+  - macos
+  - restore-image
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Paste the block printed by `theyos init-macos-guest` below.
+        It already includes the Mac model, macOS version/build, and the restore image details we need to investigate.
+
+  - type: textarea
+    id: restore_context
+    attributes:
+      label: Restore details from the CLI
+      description: Paste the exact `host_model/...` block from the CLI output.
+      placeholder: |
+        host_model: Mac13,2
+        host_macos_version: 26.4
+        host_macos_build: 25E246
+        latest_supported_restore_version: 26.4.1
+        latest_supported_restore_url: https://updates.cdn-apple.com/...
+        host_match_lookup: no signed restore match found in automatic lookup
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: What you ran
+      description: Include the command and the exact message shown in the terminal.
+      placeholder: |
+        theyos init-macos-guest
+    validations:
+      required: true
+
+  - type: textarea
+    id: extra
+    attributes:
+      label: Extra context
+      description: Optional notes, for example whether you already tried `--ipsw` manually or updated macOS first.

@@ -1,0 +1,18 @@
+{
+  "manifest_version": 1,
+  "claw": "openclaw",
+  "version": "2026.4.6",
+  "arch": "x86_64-linux",
+  "fingerprint": "73813d1b1cc89bf45aede9c17c86499e12829f266b5fd04869582cae23738011",
+  "base_rootfs_version": "v2",
+  "sha256": "bb3bbad4b15f611e471f11a60e29fa2cf9877e47a15352b76aada887784f2632",
+  "size_bytes": 814986565,
+  "url": "https://github.com/soyeht/theyos/releases/download/artifact-openclaw-2026.4.6/openclaw-x86_64-linux-rootfs.ext4.zst",
+  "published_at": "2026-04-10T03:49:04Z",
+  "channel": "stable",
+  "base_rootfs_sha256": "e965c55c8220953a1c323a6a4b748d4eb299393b1451ad3a9d153c6c2c751899",
+  "installer_plan_sha256": "41911d6346bc187f7a9df1e68d17524ee1169ee3f9f12cd286b1635180c34ebc",
+  "kernel_sha256": "e20e46d0c36c55c0d1014eb20576171b3f3d922260d9f792017aeff53af3d4f2",
+  "kernel_version": "vmlinux-6.1.155",
+  "firecracker_version": "v1.15.0"
+}

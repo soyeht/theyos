@@ -1,0 +1,18 @@
+{
+  "manifest_version": 1,
+  "claw": "ironclaw",
+  "version": "0.12.0",
+  "arch": "x86_64-linux",
+  "fingerprint": "cfe582ab0836a61a83b837103a0070caf11ab1e5bba2edf1a92b3c3da812ed41",
+  "base_rootfs_version": "v2",
+  "sha256": "f46bd5ae613867f3a47109687760976df2a7f547a6368626b3f6a8465f3ba952",
+  "size_bytes": 115198553,
+  "url": "https://github.com/soyeht/theyos/releases/download/artifact-ironclaw-0.12.0/ironclaw-x86_64-linux-rootfs.ext4.zst",
+  "published_at": "2026-04-10T02:53:47Z",
+  "channel": "stable",
+  "base_rootfs_sha256": "e965c55c8220953a1c323a6a4b748d4eb299393b1451ad3a9d153c6c2c751899",
+  "installer_plan_sha256": "f4b7fd45badfe744d1dbaa90985c32b624b57085a0287a52f95c5f2cbe907bc7",
+  "kernel_sha256": "e20e46d0c36c55c0d1014eb20576171b3f3d922260d9f792017aeff53af3d4f2",
+  "kernel_version": "vmlinux-6.1.155",
+  "firecracker_version": "v1.15.0"
+}

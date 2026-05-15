@@ -1,0 +1,18 @@
+{
+  "manifest_version": 1,
+  "claw": "nanobot",
+  "version": "0.1.5",
+  "arch": "x86_64-linux",
+  "fingerprint": "bcbf77bbc755db4a2774625b22b61efa0a016f4c03fb7cd7a0c6eaa0983c625a",
+  "base_rootfs_version": "v2",
+  "sha256": "be53b80a2ba04205b4cfea89cd4435ad74a03fc31d7ccd11932bb6f1e8d284f3",
+  "size_bytes": 152601542,
+  "url": "https://github.com/soyeht/theyos/releases/download/artifact-nanobot-0.1.5/nanobot-x86_64-linux-rootfs.ext4.zst",
+  "published_at": "2026-04-10T03:02:02Z",
+  "channel": "stable",
+  "base_rootfs_sha256": "e965c55c8220953a1c323a6a4b748d4eb299393b1451ad3a9d153c6c2c751899",
+  "installer_plan_sha256": "5c4018d19fe5fc5f6b046c738315c740e1963f3df8091b0b4f70d299addb5fd9",
+  "kernel_sha256": "e20e46d0c36c55c0d1014eb20576171b3f3d922260d9f792017aeff53af3d4f2",
+  "kernel_version": "vmlinux-6.1.155",
+  "firecracker_version": "v1.15.0"
+}

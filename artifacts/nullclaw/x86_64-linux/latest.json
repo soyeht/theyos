@@ -1,0 +1,18 @@
+{
+  "manifest_version": 1,
+  "claw": "nullclaw",
+  "version": "2026.3.1",
+  "arch": "x86_64-linux",
+  "fingerprint": "5ffd73ce2d8e524d5285c07ec2d1ab98213abaabf516d7c08338a859a0947586",
+  "base_rootfs_version": "v2",
+  "sha256": "6206424b4d9ded4f5bb188d7b62074831fc9c0d11d4102c8e5fe71ad7e8cd398",
+  "size_bytes": 98368111,
+  "url": "https://github.com/soyeht/theyos/releases/download/artifact-nullclaw-2026.3.1/nullclaw-x86_64-linux-rootfs.ext4.zst",
+  "published_at": "2026-04-10T01:13:55Z",
+  "channel": "stable",
+  "base_rootfs_sha256": "e965c55c8220953a1c323a6a4b748d4eb299393b1451ad3a9d153c6c2c751899",
+  "installer_plan_sha256": "9e5b88918645e0095a016826c1235e4b4e4150fd3e34d29fd71f59bbf880fafc",
+  "kernel_sha256": "e20e46d0c36c55c0d1014eb20576171b3f3d922260d9f792017aeff53af3d4f2",
+  "kernel_version": "vmlinux-6.1.155",
+  "firecracker_version": "v1.15.0"
+}

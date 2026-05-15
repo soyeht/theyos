@@ -1,0 +1,18 @@
+{
+  "manifest_version": 1,
+  "claw": "picoclaw",
+  "version": "0.2.5",
+  "arch": "x86_64-linux",
+  "fingerprint": "cf5d5b3504f238f69b161e5608fad6b26ba94cd2ca76e386c47b7d7563399fee",
+  "base_rootfs_version": "v2",
+  "sha256": "2a02c727d5b68ab629cb2ebcc8ef8467e4cc95d45df2d722cb8d19619bf71275",
+  "size_bytes": 106386771,
+  "url": "https://github.com/soyeht/theyos/releases/download/artifact-picoclaw-0.2.5/picoclaw-x86_64-linux-rootfs.ext4.zst",
+  "published_at": "2026-04-10T01:29:15Z",
+  "channel": "stable",
+  "base_rootfs_sha256": "e965c55c8220953a1c323a6a4b748d4eb299393b1451ad3a9d153c6c2c751899",
+  "installer_plan_sha256": "20809d58a27e74f0a5225d880c6752de9731e3529fb5dde52316c1b6cf570886",
+  "kernel_sha256": "e20e46d0c36c55c0d1014eb20576171b3f3d922260d9f792017aeff53af3d4f2",
+  "kernel_version": "vmlinux-6.1.155",
+  "firecracker_version": "v1.15.0"
+}

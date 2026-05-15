@@ -1,0 +1,51 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>soyeht</title>
+    <script>
+      (function() {
+        var t = localStorage.getItem('soyeht-theme');
+        if (!t) t = matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
+        document.documentElement.setAttribute('data-theme', t);
+      })();
+    </script>
+    <link rel="preload" href="/fonts/JetBrainsMono-Regular.woff2" as="font" type="font/woff2" crossorigin>
+    <link rel="preload" href="/fonts/JetBrainsMono-Medium.woff2" as="font" type="font/woff2" crossorigin>
+    <link rel="preload" href="/fonts/JetBrainsMono-Bold.woff2" as="font" type="font/woff2" crossorigin>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+    <script>
+      // Brand-mandated: if JetBrains Mono fails to load, surface it loudly.
+      // Uses document.fonts.load() (not just .ready) so we actually wait for
+      // each specific weight to finish fetching — .ready alone can resolve
+      // before @font-face rules start loading, giving false negatives.
+      (function() {
+        if (!document.fonts || !document.fonts.load) return;
+        Promise.all([
+          document.fonts.load('1em "JetBrains Mono"'),
+          document.fonts.load('bold 1em "JetBrains Mono"')
+        ]).then(function(results) {
+          var regular = results[0], bold = results[1];
+          if (regular.length > 0 && bold.length > 0) return;
+          throw new Error('JetBrains Mono face list empty');
+        }).catch(function(err) {
+          console.error('[brand] JetBrains Mono failed to load — UI is off-brand.', err);
+          var bar = document.createElement('div');
+          bar.setAttribute('role', 'alert');
+          bar.style.cssText = [
+            'position:fixed','top:0','left:0','right:0','z-index:2147483647',
+            'background:#ff0033','color:#fff','padding:10px 16px',
+            'font:700 14px/1.3 "Comic Sans MS",cursive','text-align:center',
+            'box-shadow:0 2px 8px rgba(0,0,0,.35)'
+          ].join(';');
+          bar.textContent = 'BRAND ERROR: JetBrains Mono did not load. UI is rendering in a fallback font.';
+          document.body.appendChild(bar);
+        });
+      })();
+    </script>
+  </body>
+</html>

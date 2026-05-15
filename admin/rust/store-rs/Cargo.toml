@@ -1,0 +1,25 @@
+[package]
+name = "store-rs"
+version = "0.1.11"
+edition.workspace = true
+rust-version.workspace = true
+description = "Rust implementation of the theyOS instance store — in-memory with filesystem bootstrap"
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+rusqlite = { workspace = true }
+core-rs = { workspace = true, features = ["db"] }
+rand = "0.8"
+tracing = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+
+[[bin]]
+name = "store-ipc"
+path = "src/bin/store_ipc.rs"
+
+[lints]
+workspace = true

@@ -1,0 +1,50 @@
+#!/bin/sh
+# theyOS bootstrap installer.
+# Usage: curl -fsSL https://raw.githubusercontent.com/soyeht/theyos/main/bootstrap | sh
+set -eu
+
+REPO_URL="https://github.com/soyeht/theyos.git"
+INSTALL_DIR="$HOME/theyos"
+
+printf '============================================\n'
+printf ' theyOS bootstrap\n'
+printf '============================================\n\n'
+
+# ── Must be NixOS ────────────────────────────────────────────────────────────
+
+if [ ! -f /etc/NIXOS ]; then
+    printf '[error] This installer requires NixOS.\n'
+    exit 1
+fi
+
+# ── Enable flakes ────────────────────────────────────────────────────────────
+# Persist to per-user config so future nix commands (install-nixos, etc.)
+# can use flakes without extra flags.
+
+NIXCONF="$HOME/.config/nix/nix.conf"
+mkdir -p "$(dirname "$NIXCONF")"
+if ! grep -q 'experimental-features' "$NIXCONF" 2>/dev/null; then
+    printf '[bootstrap] Enabling Nix flakes...\n'
+    echo 'experimental-features = nix-command flakes' >> "$NIXCONF"
+    printf '[bootstrap] Flakes enabled in %s\n\n' "$NIXCONF"
+fi
+
+# ── Clone repo ───────────────────────────────────────────────────────────────
+# Use the new `nix` CLI with --extra-experimental-features.
+# The legacy `nix-shell` does not support this flag and fails on fresh NixOS.
+
+NIX="nix --extra-experimental-features nix-command --extra-experimental-features flakes"
+
+if [ -d "$INSTALL_DIR/.git" ]; then
+    printf '[bootstrap] theyOS already cloned at %s — pulling latest...\n' "$INSTALL_DIR"
+    $NIX shell nixpkgs#git -c git -C "$INSTALL_DIR" pull --ff-only
+else
+    printf '[bootstrap] Cloning theyOS to %s...\n' "$INSTALL_DIR"
+    $NIX shell nixpkgs#git -c git clone "$REPO_URL" "$INSTALL_DIR"
+fi
+
+# ── Run installer ────────────────────────────────────────────────────────────
+# curl | sh redirects stdin from the pipe, so interactive prompts need /dev/tty.
+
+printf '\n[bootstrap] Starting installer...\n\n'
+"$INSTALL_DIR/install-nixos" < /dev/tty

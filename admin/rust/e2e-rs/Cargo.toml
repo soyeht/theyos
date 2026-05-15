@@ -1,0 +1,55 @@
+[package]
+name = "e2e-rs"
+version = "0.1.11"
+edition.workspace = true
+rust-version.workspace = true
+description = "E2E test runner for theyOS claw instances"
+
+[[bin]]
+name = "e2e-runner"
+path = "src/main.rs"
+
+[dependencies]
+serde       = { workspace = true }
+serde_json  = { workspace = true }
+thiserror   = { workspace = true }
+ureq        = { workspace = true, features = ["cookies"] }
+russh       = { workspace = true }
+tokio       = { workspace = true }
+clap        = { version = "4", features = ["derive", "env"] }
+core-rs     = { workspace = true }
+futures-util = "0.3"
+tokio-tungstenite = "0.28"
+
+[features]
+default = []
+# Phase 3 atomic-rollback tests that drive `server-rs::failure_injection`
+# via the test-side facade in `tests/phase3_support/failure_injector.rs`.
+# The `server-rs` dev-dep already enables `failure-injection`, so this
+# feature flag exists primarily to silence `unexpected_cfgs` warnings on
+# `#[cfg(feature = "failure-injection")]` test gates and to give CI a
+# canonical knob for "compile the failure-injection test scenarios".
+failure-injection = []
+
+[dev-dependencies]
+axum        = { workspace = true }
+base64      = { workspace = true }
+criterion   = { workspace = true, features = ["async_tokio"] }
+household-rs = { workspace = true }
+rusqlite    = { workspace = true }
+serde_bytes = { workspace = true }
+server-rs   = { workspace = true, features = ["failure-injection"] }
+store-rs    = { workspace = true }
+subtle      = { workspace = true }
+tempfile    = { workspace = true }
+tower       = { workspace = true }
+tracing             = { workspace = true }
+tracing-subscriber  = { workspace = true }
+zeroize     = { workspace = true }
+
+[[bench]]
+name = "phase1_identity"
+harness = false
+
+[lints]
+workspace = true

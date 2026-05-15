@@ -1,0 +1,110 @@
+;; theyOS macOS Sandbox Profile
+;;
+;; This sandbox profile restricts the vmrunner-macos binary to only the
+;; resources it needs to create and manage virtual machines.
+;;
+;; Key restrictions:
+;; - Network: Outbound and inbound (for port forwarding) connections allowed
+;; - File I/O: Limited to specific directories for VM images and state
+;; - Processes: Cannot spawn other processes (security isolation)
+
+;; Version: 1.0
+;; For: vmrunner-macos (theyOS Virtualization Backend)
+
+;; Import basic sandbox definitions
+(require 'sandbox')
+
+;; Allow outbound network connections (VM needs internet)
+(allow network-outbound
+    (control-name "com.apple.security.network.client")
+    (remote ip))
+
+;; Allow inbound network connections (for port forwarding to VMs)
+(allow network-bind
+    (control-name "com.apple.security.network.server")
+    (local ip))
+
+;; Allow file system access to specific directories
+
+;; Homebrew installation directory (read-only executables)
+(allow file-read*
+    (file-system-read*)
+    (literal "/usr/local")
+    (literal "/opt/homebrew")
+    (subpath "/usr/local")
+    (subpath "/opt/homebrew"))
+
+;; User config directory (read-write)
+(allow file-read*
+    (file-system-read*)
+    (subpath (string-append (home-directory) "/.theyos")))
+
+(allow file-write*
+    (file-system-write*)
+    (subpath (string-append (home-directory) "/.theyos")))
+
+;; Application Support directory (snapshots, VM state)
+(allow file-read*
+    (file-system-read*)
+    (subpath (string-append (home-directory) "/Library/Application Support/theyos")))
+
+(allow file-write*
+    (file-system-write*)
+    (subpath (string-append (home-directory) "/Library/Application Support/theyos")))
+
+;; Logs directory (read-write)
+(allow file-read*
+    (file-system-read*)
+    (subpath (string-append (home-directory) "/Library/Logs/theyos")))
+
+(allow file-write*
+    (file-system-write*)
+    (subpath (string-append (home-directory) "/Library/Logs/theyos")))
+
+;; Caches directory (crash reports)
+(allow file-read*
+    (file-system-read*)
+    (subpath (string-append (home-directory) "/Library/Caches/theyos")))
+
+(allow file-write*
+    (file-system-write*)
+    (subpath (string-append (home-directory) "/Library/Caches/theyos")))
+
+;; VM state directory (Firecracker-style state, for compatibility)
+(allow file-read*
+    (file-system-read*)
+    (subpath "/var/lib/firecracker"))
+(allow file-write*
+    (file-system-write*)
+    (subpath "/var/lib/firecracker"))
+
+;; Allow reading system frameworks needed for Virtualization
+(allow file-read*
+    (file-system-read*)
+    (subpath "/System/Library/Frameworks")
+    (subpath "/System/Library/PrivateFrameworks"))
+
+;; Allow shared library loading
+(allow file-read*
+    (file-system-read*)
+    (subpath "/usr/lib")
+    (subpath "/usr/local/lib")
+    (subpath "/opt/homebrew/lib"))
+
+;; Allow mach lookup for Virtualization Framework services
+(allow mach-lookup
+    (global-name "com.apple.Virtualization.Framework")
+    (global-name "com.apple.vm.network"))
+
+;; Allow process execution for VM launching
+(allow process-exec
+    (literal "/usr/local/bin/theyos")
+    (literal "/opt/homebrew/bin/theyos")
+    (literal "/usr/bin/sudo")
+    (literal "/bin/sh"))
+
+;; Deny everything else (default-deny)
+(deny default)
+
+;; Debugging: Set to true to see what operations are being blocked
+;; (debug deny)

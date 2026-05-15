@@ -1,0 +1,82 @@
+# theyOS NixOS Configuration — Example
+#
+# Copy this to /etc/nixos/configuration.nix (or symlink to it).
+# This file is NOT committed — keep your real config private.
+#
+# Minimal required sections documented below.
+# For full reference: https://nixos.org/manual/nixos/stable/options
+
+{ config, pkgs, ... }:
+
+let
+  theyosUser = "YOUR_USERNAME";
+  theyosHome = "/home/${theyosUser}";
+  theyosDir  = "${theyosHome}/theyos";
+in
+{
+  imports = [ ./hardware-configuration.nix ];
+
+  # --- Boot ---
+  boot.loader.systemd-boot.enable = true;
+  boot.loader.efi.canTouchEfiVariables = true;
+  boot.kernel.sysctl."net.ipv4.ip_unprivileged_port_start" = 80;
+
+  # --- Network ---
+  networking.hostName = "nixos";
+  networking.networkmanager.enable = true;
+  networking.firewall.allowedTCPPorts = [ 80 443 22 ];
+  networking.firewall.allowedUDPPorts = [ config.services.tailscale.port ];
+  networking.firewall.trustedInterfaces = [ "tailscale0" ];
+  networking.firewall.enable = true;
+
+  # --- Locale ---
+  time.timeZone = "YOUR_TIMEZONE";  # e.g. "America/Sao_Paulo"
+  i18n.defaultLocale = "en_US.UTF-8";
+
+  # --- User ---
+  users.users.${theyosUser} = {
+    isNormalUser = true;
+    description = theyosUser;
+    extraGroups = [ "kvm" "networkmanager" "wheel" ];
+  };
+  services.getty.autologinUser = theyosUser;
+
+  # --- Packages ---
+  nixpkgs.config.allowUnfree = true;
+  environment.systemPackages = with pkgs; [
+    vim wget tmux git bash
+    firecracker slirp4netns
+    python3 python3Packages.uv uv
+    cloudflared sqlite
+  ];
+
+  # --- Services ---
+  services.openssh.enable = true;
+  services.tailscale.enable = true;
+  programs.nix-ld.enable = true;
+
+  # --- theyOS admin backend ---
+  # NOTE: The recommended approach is to use the theyOS NixOS module
+  # (nix/module.nix) via flakes instead of this manual configuration.
+  # See install-nixos for the flake-based setup.
+
+  # --- Cloudflare Tunnel ---
+  # Token file: ${theyosHome}/.cloudflared/<tunnel>.token
+  systemd.services.cloudflared = {
+    description = "Cloudflare Tunnel";
+    after  = [ "network-online.target" ];
+    wants  = [ "network-online.target" ];
+    wantedBy = [ "multi-user.target" ];
+    unitConfig.RefuseManualStop = "no";
+    serviceConfig = {
+      ExecStart = "${pkgs.cloudflared}/bin/cloudflared --no-autoupdate --metrics 127.0.0.1:2000 tunnel --config ${theyosDir}/distro/cloudflared/config.yml run --token-file ${theyosHome}/.cloudflared/YOUR_TUNNEL.token";
+      Restart    = "always";
+      RestartSec = "5s";
+      Type       = "simple";
+      User       = theyosUser;
+      WorkingDirectory = theyosDir;
+    };
+  };
+
+  system.stateVersion = "25.05";
+}

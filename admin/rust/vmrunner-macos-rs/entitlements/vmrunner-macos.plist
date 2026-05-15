@@ -1,0 +1,41 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!-- Virtualization Framework Entitlement -->
+    <!-- Required to create and manage virtual machines using Apple Virtualization Framework -->
+    <key>com.apple.security.virtualization</key>
+    <true/>
+
+    <!-- Network Client Entitlement -->
+    <!-- Required for VMs to make outbound network connections -->
+    <key>com.apple.security.network.client</key>
+    <true/>
+
+    <!-- Network Server Entitlement -->
+    <!-- Required for VMs to accept inbound network connections (port forwarding) -->
+    <key>com.apple.security.network.server</key>
+    <true/>
+
+    <!-- File Access Entitlements (User Selected) -->
+    <!-- Required to access VM disk images and kernel files -->
+    <key>com.apple.security.files.user-selected.read-write</key>
+    <true/>
+
+    <!-- Optional: Asset access for specific directories -->
+    <!-- Uncomment if VMs need access to specific directories -->
+    <!--
+    <key>com.apple.security.assets.pictures.read-write</key>
+    <true/>
+    <key>com.apple.security.assets.music.read-write</key>
+    <true/>
+    -->
+
+    <!-- Optional: Temporary files access -->
+    <!-- Uncomment if VMs need write access to temp directory -->
+    <!--
+    <key>com.apple.security.temporary-files.read-write</key>
+    <true/>
+    -->
+</dict>
+</plist>

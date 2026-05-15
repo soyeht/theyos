@@ -1,0 +1,49 @@
+[package]
+name = "soyeht-rs"
+version = "0.1.11"
+edition.workspace = true
+rust-version.workspace = true
+description = "theyOS operations CLI (health, status, rebuild, backup, admin-host, golden, dev)"
+
+[[bin]]
+name = "soyeht"
+path = "src/main.rs"
+
+[[bin]]
+name = "theyos"
+path = "src/bin/theyos.rs"
+
+[[bin]]
+name = "theyos-ssh"
+path = "src/bin/theyos-ssh.rs"
+
+[[bin]]
+name = "init_macos_guest"
+path = "src/bin/init_macos_guest.rs"
+
+[[bin]]
+name = "init_linux_guest"
+path = "src/bin/init_linux_guest.rs"
+
+[dependencies]
+clap       = { version = "4", features = ["derive", "env"] }
+claw-rs    = { workspace = true }
+core-rs    = { workspace = true }
+e2e-rs     = { path = "../e2e-rs" }
+libc       = { workspace = true }
+serde      = { workspace = true }
+serde_json = { workspace = true }
+serde_yaml = "0.9"
+base64     = { workspace = true }
+tokio      = { workspace = true }
+async-trait = { workspace = true }
+ureq       = { workspace = true }
+vmrunner-rs = { workspace = true }
+tracing    = { workspace = true }
+qrcode     = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+
+[lints]
+workspace = true

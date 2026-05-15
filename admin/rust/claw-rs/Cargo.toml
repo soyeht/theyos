@@ -1,0 +1,23 @@
+[package]
+name = "claw-rs"
+version = "0.1.11"
+edition.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "claw_ipc"
+path = "src/bin/claw_ipc.rs"
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+core-rs = { workspace = true }
+libc = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+
+[lints]
+workspace = true

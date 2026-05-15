@@ -1,0 +1,119 @@
+[workspace]
+resolver = "2"
+members = [
+    "backup-rs",
+    "claw-rs",
+    "core-rs",
+    "e2e-rs",
+    "executor-rs",
+    "household-rs",
+    "imagebuilder-rs",
+    "jobs-rs",
+    "session-rs",
+    "server-rs",
+    "store-rs",
+    "terminal-rs",
+    "rootfsbuilder-rs",
+    "launcher-rs",
+    "soyeht-rs",
+    "updater-rs",
+    "claw-autoupdate-rs",
+    "vmrunner-rs",
+    "vmrunner-macos-rs",
+]
+
+[workspace.package]
+edition = "2024"
+rust-version = "1.85"
+
+[workspace.lints.rust]
+unsafe_code = "warn"
+
+[workspace.lints.clippy]
+all      = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+
+# Pedantic lints that the codebase has historically not enforced and that
+# are noisy on existing public surface. Re-allowed at workspace level.
+missing_errors_doc = "allow"
+too_many_lines     = "allow"
+
+# Workspace-level dependency versions (used by member crates via `dep.workspace = true`)
+[workspace.dependencies]
+serde       = { version = "1", features = ["derive"] }
+serde_json  = "1"
+thiserror   = "1"
+tokio       = { version = "1", features = ["rt-multi-thread", "macros", "io-util", "io-std", "sync", "time", "signal", "process", "fs", "net"] }
+axum        = { version = "0.8", features = ["ws", "multipart"] }
+tower       = "0.5"
+tower-http  = { version = "0.6", features = ["cors", "fs", "trace", "timeout", "compression-gzip"] }
+hyper       = { version = "1", features = ["client", "http1", "http2"] }
+hyper-util  = { version = "0.1", features = ["client", "client-legacy", "http1", "http2", "tokio"] }
+tracing             = "0.1"
+tracing-subscriber  = { version = "0.3", features = ["env-filter", "json"] }
+rusqlite    = { version = "0.32", features = ["bundled"] }
+ureq        = { version = "2", features = ["json"] }
+base64      = "0.22"
+sha2        = "0.10"
+libc        = "0.2"
+russh       = { version = "0.59", default-features = false, features = ["flate2", "ring", "rsa"] }
+async-trait = "0.1"
+hyperlocal  = { version = "0.9", default-features = false, features = ["client"] }
+http-body-util = "0.1"
+pty-process  = { version = "0.5", features = ["async"] }
+tokio-stream = { version = "0.1", features = ["sync"] }
+tempfile     = "3"
+zstd         = "0.13"
+qrcode       = { version = "0.14", features = ["image"] }
+image        = { version = "0.25", default-features = false, features = ["png"] }
+
+# Phase 1 cryptographic skeleton (household-rs)
+p256          = { version = "0.13", default-features = false, features = ["ecdsa", "ecdh", "pkcs8", "std", "arithmetic"] }
+ecdsa         = { version = "0.16", features = ["der"] }
+serde_bytes   = "0.11"
+blake3        = "1"
+ciborium      = "0.2"
+keyring       = { version = "3", features = ["linux-native-sync-persistent", "crypto-rust"] }
+data-encoding = "2"
+zeroize       = { version = "1", features = ["derive"] }
+subtle        = "2"
+mdns-sd       = "0.10"
+gethostname   = "0.5"
+if-addrs      = "0.10"
+hex           = "0.4"
+percent-encoding = "2"
+
+# Phase 3 cryptographic primitives (household-rs)
+chacha20poly1305 = { version = "0.10", default-features = false, features = ["alloc", "rand_core"] }
+vsss-rs          = { version = "5", default-features = false, features = ["std"] }
+
+# Phase 3 push transport (server-rs); gated at runtime by THEYOS_PUSH_DISABLED
+a2 = { version = "0.10", default-features = false, features = ["ring"] }
+
+# macOS-only at the consumer level (household-rs gates via target.'cfg(target_os = "macos")')
+security-framework      = "2"
+security-framework-sys  = "2"
+core-foundation         = "0.10"
+
+# Test-only dependencies
+tracing-test  = "0.2"
+criterion     = "0.5"
+
+# Build-time codegen (FFI bindings for Apple's dns_sd.h on macOS,
+# consumed via target.'cfg(target_os = "macos")'.build-dependencies).
+# bindgen 0.71+ emits Edition 2024 `unsafe extern "C"` blocks.
+bindgen       = "0.71"
+
+# Internal crates
+core-rs         = { path = "core-rs" }
+backup-rs       = { path = "backup-rs" }
+claw-rs         = { path = "claw-rs" }
+executor-rs     = { path = "executor-rs" }
+household-rs    = { path = "household-rs" }
+jobs-rs         = { path = "jobs-rs" }
+session-rs      = { path = "session-rs" }
+server-rs       = { path = "server-rs" }
+store-rs        = { path = "store-rs" }
+terminal-rs     = { path = "terminal-rs" }
+vmrunner-rs     = { path = "vmrunner-rs" }
+vmrunner-macos-rs = { path = "vmrunner-macos-rs" }

@@ -1,0 +1,4 @@
+# NixOS: OpenSSL dev package location for crates that link against libssl (e.g. ssh2).
+# This avoids requiring nix-shell for cargo build.
+[env]
+PKG_CONFIG_PATH = "/nix/store/wr6qvslzqrd3rsf2mw0ssxwmyi2sqjdh-openssl-3.4.2-dev/lib/pkgconfig"

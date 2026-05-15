@@ -1,0 +1,419 @@
+[
+  {
+    "id": "create_instance_basic",
+    "description": "CreateInstance with valid name and clawType returns active instance with auto-assigned port",
+    "operation": "create_instance",
+    "input": {
+      "name": "Alice",
+      "claw_type": "PicoClaw"
+    },
+    "expected": {
+      "id": "inst-alice",
+      "name": "alice",
+      "container": "picoclaw-alice",
+      "claw_type": "picoclaw",
+      "status": "active",
+      "auto_update": false,
+      "memory_mb": 128,
+      "cpu_pct": 0.0,
+      "tokens_24h": 0,
+      "uptime_hours": 0
+    }
+  },
+  {
+    "id": "create_instance_default_claw_type",
+    "description": "CreateInstance with empty clawType defaults to picoclaw",
+    "operation": "create_instance",
+    "input": {
+      "name": "bob",
+      "claw_type": ""
+    },
+    "expected": {
+      "id": "inst-bob",
+      "name": "bob",
+      "container": "picoclaw-bob",
+      "claw_type": "picoclaw",
+      "status": "active"
+    }
+  },
+  {
+    "id": "create_instance_empty_name_error",
+    "description": "CreateInstance with empty name returns an error",
+    "operation": "create_instance",
+    "input": {
+      "name": "",
+      "claw_type": "picoclaw"
+    },
+    "expected": {
+      "error": true,
+      "error_contains": "name is required"
+    }
+  },
+  {
+    "id": "create_instance_with_port",
+    "description": "CreateInstanceWithPort creates a provisioning instance at a specific port",
+    "operation": "create_instance_with_port",
+    "input": {
+      "name": "charlie",
+      "claw_type": "zeroclaw",
+      "port": 30500
+    },
+    "expected": {
+      "id": "inst-charlie",
+      "name": "charlie",
+      "container": "zeroclaw-charlie",
+      "claw_type": "zeroclaw",
+      "status": "provisioning",
+      "port": 30500,
+      "provisioning_message": "Waiting to start provisioning..."
+    }
+  },
+  {
+    "id": "create_instance_with_port_zero_error",
+    "description": "CreateInstanceWithPort with port=0 returns an error",
+    "operation": "create_instance_with_port",
+    "input": {
+      "name": "dave",
+      "claw_type": "picoclaw",
+      "port": 0
+    },
+    "expected": {
+      "error": true,
+      "error_contains": "port is required"
+    }
+  },
+  {
+    "id": "get_instance_existing",
+    "description": "GetInstance returns a previously created instance",
+    "operation": "get_instance",
+    "setup": [
+      {"op": "create_instance", "name": "eve", "claw_type": "picoclaw"}
+    ],
+    "input": {
+      "id": "inst-eve"
+    },
+    "expected": {
+      "id": "inst-eve",
+      "name": "eve",
+      "status": "active"
+    }
+  },
+  {
+    "id": "get_instance_missing",
+    "description": "GetInstance for unknown ID returns ErrInstanceNotFound",
+    "operation": "get_instance",
+    "input": {
+      "id": "inst-nonexistent"
+    },
+    "expected": {
+      "error": true,
+      "error_contains": "instance not found"
+    }
+  },
+  {
+    "id": "set_auto_update_on",
+    "description": "SetAutoUpdate(true) toggles the flag and returns the updated instance",
+    "operation": "set_auto_update",
+    "setup": [
+      {"op": "create_instance", "name": "frank", "claw_type": "picoclaw"}
+    ],
+    "input": {
+      "id": "inst-frank",
+      "enabled": true
+    },
+    "expected": {
+      "auto_update": true
+    }
+  },
+  {
+    "id": "set_auto_update_off",
+    "description": "SetAutoUpdate(false) after enabling returns auto_update=false",
+    "operation": "set_auto_update",
+    "setup": [
+      {"op": "create_instance", "name": "grace", "claw_type": "picoclaw"},
+      {"op": "set_auto_update", "id": "inst-grace", "enabled": true}
+    ],
+    "input": {
+      "id": "inst-grace",
+      "enabled": false
+    },
+    "expected": {
+      "auto_update": false
+    }
+  },
+  {
+    "id": "set_auto_update_missing",
+    "description": "SetAutoUpdate on nonexistent instance returns error",
+    "operation": "set_auto_update",
+    "input": {
+      "id": "inst-ghost",
+      "enabled": true
+    },
+    "expected": {
+      "error": true,
+      "error_contains": "instance not found"
+    }
+  },
+  {
+    "id": "update_instance_status",
+    "description": "UpdateInstanceStatus changes status and provisioning fields",
+    "operation": "update_instance_status",
+    "setup": [
+      {"op": "create_instance_with_port", "name": "heidi", "claw_type": "picoclaw", "port": 31000}
+    ],
+    "input": {
+      "id": "inst-heidi",
+      "status": "active",
+      "message": "VM ready",
+      "error": "",
+      "job_id": "job-123"
+    },
+    "expected": {
+      "status": "active",
+      "provisioning_message": "VM ready",
+      "job_id": "job-123"
+    }
+  },
+  {
+    "id": "set_instance_active",
+    "description": "SetInstanceActive sets status to active",
+    "operation": "set_instance_active",
+    "setup": [
+      {"op": "create_instance_with_port", "name": "ivan", "claw_type": "picoclaw", "port": 31001}
+    ],
+    "input": {
+      "id": "inst-ivan"
+    },
+    "expected": {
+      "status": "active"
+    }
+  },
+  {
+    "id": "set_instance_failed",
+    "description": "SetInstanceFailed sets status to failed with error message",
+    "operation": "set_instance_failed",
+    "setup": [
+      {"op": "create_instance_with_port", "name": "judy", "claw_type": "picoclaw", "port": 31002}
+    ],
+    "input": {
+      "id": "inst-judy",
+      "error": "port conflict"
+    },
+    "expected": {
+      "status": "failed",
+      "provisioning_error": "port conflict"
+    }
+  },
+  {
+    "id": "apply_action_stop",
+    "description": "ApplyAction stop sets status to stopped",
+    "operation": "apply_action",
+    "setup": [
+      {"op": "create_instance", "name": "karl", "claw_type": "picoclaw"}
+    ],
+    "input": {
+      "id": "inst-karl",
+      "action": "stop"
+    },
+    "expected": {
+      "status": "stopped"
+    }
+  },
+  {
+    "id": "apply_action_restart",
+    "description": "ApplyAction restart sets status to active and resets uptime to 0",
+    "operation": "apply_action",
+    "setup": [
+      {"op": "create_instance", "name": "liam", "claw_type": "picoclaw"},
+      {"op": "apply_action", "id": "inst-liam", "action": "stop"}
+    ],
+    "input": {
+      "id": "inst-liam",
+      "action": "restart"
+    },
+    "expected": {
+      "status": "active",
+      "uptime_hours": 0
+    }
+  },
+  {
+    "id": "apply_action_delete",
+    "description": "ApplyAction delete removes the instance from the store",
+    "operation": "apply_action",
+    "setup": [
+      {"op": "create_instance", "name": "mallory", "claw_type": "picoclaw"}
+    ],
+    "input": {
+      "id": "inst-mallory",
+      "action": "delete"
+    },
+    "expected": {
+      "deleted": true,
+      "get_after_returns_error": true
+    }
+  },
+  {
+    "id": "apply_action_invalid",
+    "description": "ApplyAction with unknown action returns ErrInvalidAction",
+    "operation": "apply_action",
+    "setup": [
+      {"op": "create_instance", "name": "nina", "claw_type": "picoclaw"}
+    ],
+    "input": {
+      "id": "inst-nina",
+      "action": "explode"
+    },
+    "expected": {
+      "error": true,
+      "error_contains": "invalid action"
+    }
+  },
+  {
+    "id": "list_instances_ordering",
+    "description": "ListInstances returns instances ordered by CreatedAt ascending",
+    "operation": "list_instances",
+    "setup": [
+      {"op": "create_instance", "name": "zara", "claw_type": "picoclaw"},
+      {"op": "create_instance", "name": "alice", "claw_type": "picoclaw"},
+      {"op": "create_instance", "name": "mika", "claw_type": "picoclaw"}
+    ],
+    "input": {},
+    "expected": {
+      "count": 3,
+      "ordered_names": ["zara", "alice", "mika"]
+    }
+  },
+  {
+    "id": "append_log_basic",
+    "description": "AppendLog adds a log entry that appears in ListLogs",
+    "operation": "append_log",
+    "input": {
+      "level": "info",
+      "component": "system",
+      "message": "test log entry"
+    },
+    "expected": {
+      "level": "info",
+      "component": "system",
+      "message": "test log entry"
+    }
+  },
+  {
+    "id": "append_log_normalizes",
+    "description": "AppendLog normalizes level (lowercase) and component (slug), defaults empty level to info",
+    "operation": "append_log",
+    "input": {
+      "level": "",
+      "component": "My System",
+      "message": "  trimmed message  "
+    },
+    "expected": {
+      "level": "info",
+      "component": "my-system",
+      "message": "trimmed message"
+    }
+  },
+  {
+    "id": "list_logs_reverse_order",
+    "description": "ListLogs returns entries in reverse chronological order (newest first)",
+    "operation": "list_logs",
+    "setup": [
+      {"op": "append_log", "level": "info", "component": "sys", "message": "first"},
+      {"op": "append_log", "level": "warn", "component": "sys", "message": "second"},
+      {"op": "append_log", "level": "error", "component": "sys", "message": "third"}
+    ],
+    "input": {
+      "limit": 10
+    },
+    "expected": {
+      "count": 3,
+      "first_message": "third",
+      "last_message": "first"
+    }
+  },
+  {
+    "id": "list_logs_default_limit",
+    "description": "ListLogs with limit=0 uses default limit of 100",
+    "operation": "list_logs",
+    "setup": [
+      {"op": "append_log", "level": "info", "component": "sys", "message": "entry"}
+    ],
+    "input": {
+      "limit": 0
+    },
+    "expected": {
+      "count": 1
+    }
+  },
+  {
+    "id": "list_containers_sorted",
+    "description": "ListContainers returns sorted container names from all instances",
+    "operation": "list_containers",
+    "setup": [
+      {"op": "create_instance", "name": "zeta", "claw_type": "picoclaw"},
+      {"op": "create_instance", "name": "alpha", "claw_type": "zeroclaw"}
+    ],
+    "input": {},
+    "expected": {
+      "containers": ["picoclaw-zeta", "zeroclaw-alpha"]
+    }
+  },
+  {
+    "id": "update_usage",
+    "description": "UpdateUsage sets memory and CPU on the matching instance",
+    "operation": "update_usage",
+    "setup": [
+      {"op": "create_instance", "name": "oscar", "claw_type": "picoclaw"}
+    ],
+    "input": {
+      "container": "picoclaw-oscar",
+      "memory_mb": 256,
+      "cpu_pct": 45.5
+    },
+    "expected": {
+      "memory_mb": 256,
+      "cpu_pct": 45.5
+    }
+  },
+  {
+    "id": "has_container_true",
+    "description": "HasContainer returns true for an existing container",
+    "operation": "has_container",
+    "setup": [
+      {"op": "create_instance", "name": "pat", "claw_type": "picoclaw"}
+    ],
+    "input": {
+      "container": "picoclaw-pat"
+    },
+    "expected": {
+      "result": true
+    }
+  },
+  {
+    "id": "has_container_false",
+    "description": "HasContainer returns false for nonexistent container",
+    "operation": "has_container",
+    "input": {
+      "container": "picoclaw-ghost"
+    },
+    "expected": {
+      "result": false
+    }
+  },
+  {
+    "id": "normalize_slug",
+    "description": "NormalizeSlug lowercases, replaces spaces/underscores with dashes, strips leading/trailing dashes",
+    "operation": "normalize_slug",
+    "input": {
+      "values": [
+        {"input": "Alice", "expected": "alice"},
+        {"input": "  My Instance  ", "expected": "my-instance"},
+        {"input": "hello_world", "expected": "hello-world"},
+        {"input": "---trimmed---", "expected": "trimmed"},
+        {"input": "", "expected": ""},
+        {"input": "UPPER CASE", "expected": "upper-case"},
+        {"input": "a--b__c  d", "expected": "a-b-c-d"}
+      ]
+    }
+  }
+]

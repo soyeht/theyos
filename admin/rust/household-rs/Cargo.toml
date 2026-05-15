@@ -1,0 +1,61 @@
+[package]
+name    = "household-rs"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+
+[lib]
+name = "household_rs"
+path = "src/lib.rs"
+
+[features]
+default = []
+
+[dependencies]
+serde         = { workspace = true }
+serde_json    = { workspace = true }
+thiserror     = { workspace = true }
+tracing       = { workspace = true }
+tokio         = { workspace = true }
+
+p256          = { workspace = true }
+ecdsa         = { workspace = true }
+serde_bytes   = { workspace = true }
+blake3        = { workspace = true }
+sha2          = { workspace = true }
+ciborium      = { workspace = true }
+data-encoding = { workspace = true }
+zeroize       = { workspace = true }
+subtle        = { workspace = true }
+mdns-sd       = { workspace = true }
+gethostname   = { workspace = true }
+qrcode        = { workspace = true }
+hex           = { workspace = true }
+percent-encoding = { workspace = true }
+rand          = "0.8"
+base64        = { workspace = true }
+core-rs       = { workspace = true }
+store-rs      = { workspace = true }
+ureq          = { workspace = true }
+
+# Phase 3 cryptographic primitives
+chacha20poly1305 = { workspace = true }
+vsss-rs          = { workspace = true }
+
+# Linux keystore (Secret Service / kernel keyring)
+[target.'cfg(target_os = "linux")'.dependencies]
+keyring = { workspace = true }
+
+# macOS Secure Enclave + Keychain access
+[target.'cfg(target_os = "macos")'.dependencies]
+security-framework     = { workspace = true }
+security-framework-sys = { workspace = true }
+core-foundation        = { workspace = true }
+
+[dev-dependencies]
+tempfile      = { workspace = true }
+tracing-test  = { workspace = true, features = ["no-env-filter"] }
+rusqlite      = { workspace = true }
+
+[lints]
+workspace = true

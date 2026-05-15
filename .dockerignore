@@ -1,0 +1,15 @@
+node_modules/
+admin/frontend/node_modules/
+admin/rust/target/
+dist/
+build/
+coverage/
+.git/
+Dockerfile*
+.dockerignore
+*.log
+*.log.*
+.env
+.env.*
+.DS_Store
+Thumbs.db

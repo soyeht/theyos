@@ -1,0 +1,177 @@
+[
+  {
+    "input": {
+      "hh_id": "hh_27rstotomsrvm6xtqr3ekdux752yag6zgrjpx3xku6rj4ws2ew3a",
+      "hh_name": "Maple Home",
+      "machine_id": "m_ea7zhpk3uf2mvm7tvhoxl6xcc7imknljxeepjc6rwebml4gjnd5q",
+      "machine_label": "Developer Mac",
+      "pair_qr_uri": "soyeht://pair?hh=hh_27rstotomsrvm6xtqr3ekdux752yag6zgrjpx3xku6rj4ws2ew3a&anchor=c32a78f8272ea4398146ea99c87e372b",
+      "ts": 1746921600
+    },
+    "expected": {
+      "aps": {
+        "alert": {
+          "title-loc-key": "house_created_title",
+          "loc-key": "house_created_body",
+          "loc-args": [
+            "Maple Home"
+          ]
+        },
+        "sound": "house-created.caf",
+        "mutable-content": 1,
+        "interruption-level": "active",
+        "thread-id": "house-events"
+      },
+      "soyeht": {
+        "v": 1,
+        "type": "house_created",
+        "hh_id": "hh_27rstotomsrvm6xtqr3ekdux752yag6zgrjpx3xku6rj4ws2ew3a",
+        "hh_name": "Maple Home",
+        "machine_id": "m_ea7zhpk3uf2mvm7tvhoxl6xcc7imknljxeepjc6rwebml4gjnd5q",
+        "machine_label": "Developer Mac",
+        "pair_qr_uri": "soyeht://pair?hh=hh_27rstotomsrvm6xtqr3ekdux752yag6zgrjpx3xku6rj4ws2ew3a&anchor=c32a78f8272ea4398146ea99c87e372b",
+        "ts": 1746921600
+      }
+    }
+  },
+  {
+    "input": {
+      "hh_id": "hh_ocwnohpqtuodcktgvqaz4ylnteslomzmk7tvpui5vam6itnpxrka",
+      "hh_name": "River Home",
+      "machine_id": "m_2lj2mzlf5h66zk7mefrh7eypubucfc5sosm3c6ya3riseodvxtoq",
+      "machine_label": "MacBook Pro",
+      "pair_qr_uri": "soyeht://pair?hh=hh_ocwnohpqtuodcktgvqaz4ylnteslomzmk7tvpui5vam6itnpxrka&anchor=ee6e64384ec293e9ac38eeb3bf6cda49",
+      "ts": 1747008000
+    },
+    "expected": {
+      "aps": {
+        "alert": {
+          "title-loc-key": "house_created_title",
+          "loc-key": "house_created_body",
+          "loc-args": [
+            "River Home"
+          ]
+        },
+        "sound": "house-created.caf",
+        "mutable-content": 1,
+        "interruption-level": "active",
+        "thread-id": "house-events"
+      },
+      "soyeht": {
+        "v": 1,
+        "type": "house_created",
+        "hh_id": "hh_ocwnohpqtuodcktgvqaz4ylnteslomzmk7tvpui5vam6itnpxrka",
+        "hh_name": "River Home",
+        "machine_id": "m_2lj2mzlf5h66zk7mefrh7eypubucfc5sosm3c6ya3riseodvxtoq",
+        "machine_label": "MacBook Pro",
+        "pair_qr_uri": "soyeht://pair?hh=hh_ocwnohpqtuodcktgvqaz4ylnteslomzmk7tvpui5vam6itnpxrka&anchor=ee6e64384ec293e9ac38eeb3bf6cda49",
+        "ts": 1747008000
+      }
+    }
+  },
+  {
+    "input": {
+      "hh_id": "hh_gprd5mkd4zeq2szui4ezyulcv3mvewshfd7pzwdawnkcnf5vjiwq",
+      "hh_name": "Harbor Home",
+      "machine_id": "m_ftbklcn3iw2cobhqivmrhqec4y5jtnbuhem6mwl6sqt7bjbjj24q",
+      "machine_label": "Mac mini",
+      "pair_qr_uri": "soyeht://pair?hh=hh_gprd5mkd4zeq2szui4ezyulcv3mvewshfd7pzwdawnkcnf5vjiwq&anchor=c1c5fae2a191046e0d86eb8972742ec9",
+      "ts": 1747094400
+    },
+    "expected": {
+      "aps": {
+        "alert": {
+          "title-loc-key": "house_created_title",
+          "loc-key": "house_created_body",
+          "loc-args": [
+            "Harbor Home"
+          ]
+        },
+        "sound": "house-created.caf",
+        "mutable-content": 1,
+        "interruption-level": "active",
+        "thread-id": "house-events"
+      },
+      "soyeht": {
+        "v": 1,
+        "type": "house_created",
+        "hh_id": "hh_gprd5mkd4zeq2szui4ezyulcv3mvewshfd7pzwdawnkcnf5vjiwq",
+        "hh_name": "Harbor Home",
+        "machine_id": "m_ftbklcn3iw2cobhqivmrhqec4y5jtnbuhem6mwl6sqt7bjbjj24q",
+        "machine_label": "Mac mini",
+        "pair_qr_uri": "soyeht://pair?hh=hh_gprd5mkd4zeq2szui4ezyulcv3mvewshfd7pzwdawnkcnf5vjiwq&anchor=c1c5fae2a191046e0d86eb8972742ec9",
+        "ts": 1747094400
+      }
+    }
+  },
+  {
+    "input": {
+      "hh_id": "hh_burv3mflissameyzqntstzkdclpm6dux5v25udzf5wq32sw6tesq",
+      "hh_name": "Family Home",
+      "machine_id": "m_r5fje7o7f7w77aqefx4b6lsqoqwa45nkixqn2kes4tq3yjorquaa",
+      "machine_label": "iMac 24\"",
+      "pair_qr_uri": "soyeht://pair?hh=hh_burv3mflissameyzqntstzkdclpm6dux5v25udzf5wq32sw6tesq&anchor=6bd3f936e8a24d09fae81389f4d6ffe1",
+      "ts": 1747180800
+    },
+    "expected": {
+      "aps": {
+        "alert": {
+          "title-loc-key": "house_created_title",
+          "loc-key": "house_created_body",
+          "loc-args": [
+            "Family Home"
+          ]
+        },
+        "sound": "house-created.caf",
+        "mutable-content": 1,
+        "interruption-level": "active",
+        "thread-id": "house-events"
+      },
+      "soyeht": {
+        "v": 1,
+        "type": "house_created",
+        "hh_id": "hh_burv3mflissameyzqntstzkdclpm6dux5v25udzf5wq32sw6tesq",
+        "hh_name": "Family Home",
+        "machine_id": "m_r5fje7o7f7w77aqefx4b6lsqoqwa45nkixqn2kes4tq3yjorquaa",
+        "machine_label": "iMac 24\"",
+        "pair_qr_uri": "soyeht://pair?hh=hh_burv3mflissameyzqntstzkdclpm6dux5v25udzf5wq32sw6tesq&anchor=6bd3f936e8a24d09fae81389f4d6ffe1",
+        "ts": 1747180800
+      }
+    }
+  },
+  {
+    "input": {
+      "hh_id": "hh_jyrdkccofoj5oy4ivcbfremcgy7gidbeo7wt7z5hzdazxb2s3ora",
+      "hh_name": "Aurora Home",
+      "machine_id": "m_oo5jx54mi6gn7t7b3dzrsiwx4wcquzudkbgmdryd6kz5ygviurtq",
+      "machine_label": "MacBook Air",
+      "pair_qr_uri": "soyeht://pair?hh=hh_jyrdkccofoj5oy4ivcbfremcgy7gidbeo7wt7z5hzdazxb2s3ora&anchor=ee49f7d948caf929995267407200034a",
+      "ts": 1747267200
+    },
+    "expected": {
+      "aps": {
+        "alert": {
+          "title-loc-key": "house_created_title",
+          "loc-key": "house_created_body",
+          "loc-args": [
+            "Aurora Home"
+          ]
+        },
+        "sound": "house-created.caf",
+        "mutable-content": 1,
+        "interruption-level": "active",
+        "thread-id": "house-events"
+      },
+      "soyeht": {
+        "v": 1,
+        "type": "house_created",
+        "hh_id": "hh_jyrdkccofoj5oy4ivcbfremcgy7gidbeo7wt7z5hzdazxb2s3ora",
+        "hh_name": "Aurora Home",
+        "machine_id": "m_oo5jx54mi6gn7t7b3dzrsiwx4wcquzudkbgmdryd6kz5ygviurtq",
+        "machine_label": "MacBook Air",
+        "pair_qr_uri": "soyeht://pair?hh=hh_jyrdkccofoj5oy4ivcbfremcgy7gidbeo7wt7z5hzdazxb2s3ora&anchor=ee49f7d948caf929995267407200034a",
+        "ts": 1747267200
+      }
+    }
+  }
+]

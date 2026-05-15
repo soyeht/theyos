@@ -1,0 +1,140 @@
+[
+  {
+    "id": "set_and_items",
+    "description": "Set a key, verify Items() returns it with a masked value",
+    "operation": "set_and_items",
+    "input": {
+      "name": "OPENAI_API_KEY",
+      "value": "test-fixture-key-openai"
+    },
+    "expected": {
+      "items_count": 1,
+      "first_name": "OPENAI_API_KEY",
+      "first_masked_suffix": "enai"
+    }
+  },
+  {
+    "id": "set_overwrites",
+    "description": "Setting the same key twice replaces the value",
+    "operation": "set_overwrites",
+    "input": {
+      "name": "MY_KEY",
+      "first_value": "old-secret-value",
+      "second_value": "new-secret-value-xyz"
+    },
+    "expected": {
+      "items_count": 1,
+      "masked_suffix": "-xyz"
+    }
+  },
+  {
+    "id": "delete_existing",
+    "description": "Delete an existing key, verify it is removed from Items()",
+    "operation": "delete_existing",
+    "input": {
+      "name": "TO_DELETE",
+      "value": "some-value-here"
+    },
+    "expected": {
+      "items_count_after": 0,
+      "error": false
+    }
+  },
+  {
+    "id": "delete_missing",
+    "description": "Deleting a nonexistent key does not error",
+    "operation": "delete_missing",
+    "input": {
+      "name": "NONEXISTENT_KEY"
+    },
+    "expected": {
+      "error": false
+    }
+  },
+  {
+    "id": "items_sorted",
+    "description": "Items() returns keys sorted alphabetically",
+    "operation": "items_sorted",
+    "input": {
+      "keys": [
+        {"name": "ZEBRA_KEY", "value": "zzz-secret"},
+        {"name": "ALPHA_KEY", "value": "aaa-secret"},
+        {"name": "MIDDLE_KEY", "value": "mmm-secret"}
+      ]
+    },
+    "expected": {
+      "order": ["ALPHA_KEY", "MIDDLE_KEY", "ZEBRA_KEY"]
+    }
+  },
+  {
+    "id": "items_empty",
+    "description": "Fresh store returns empty Items()",
+    "operation": "items_empty",
+    "input": {},
+    "expected": {
+      "items_count": 0
+    }
+  },
+  {
+    "id": "mask_short",
+    "description": "Value with 4 or fewer chars is masked as ****",
+    "operation": "mask",
+    "input": {
+      "value": "abcd"
+    },
+    "expected": {
+      "masked": "****"
+    }
+  },
+  {
+    "id": "mask_medium",
+    "description": "Value with 5-12 chars: stars equal to (len-4) then ...last4",
+    "operation": "mask",
+    "input": {
+      "value": "abcdefghij"
+    },
+    "expected": {
+      "masked": "******...ghij"
+    }
+  },
+  {
+    "id": "mask_long",
+    "description": "Value with >12 chars: max 8 stars then ...last4",
+    "operation": "mask",
+    "input": {
+      "value": "abcdefghijklmnopqrst"
+    },
+    "expected": {
+      "masked": "********...qrst"
+    }
+  },
+  {
+    "id": "environ_format",
+    "description": "Environ() returns NAME=value strings (sorted for comparison)",
+    "operation": "environ",
+    "input": {
+      "keys": [
+        {"name": "KEY_A", "value": "val-a"},
+        {"name": "KEY_B", "value": "val-b"}
+      ]
+    },
+    "expected": {
+      "environ_sorted": ["KEY_A=val-a", "KEY_B=val-b"]
+    }
+  },
+  {
+    "id": "persistence_round_trip",
+    "description": "Data persisted to disk survives reload into a new store",
+    "operation": "persistence",
+    "input": {
+      "keys": [
+        {"name": "PERSIST_A", "value": "secret-a"},
+        {"name": "PERSIST_B", "value": "secret-b"}
+      ]
+    },
+    "expected": {
+      "items_count": 2,
+      "order": ["PERSIST_A", "PERSIST_B"]
+    }
+  }
+]

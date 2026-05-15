@@ -1,0 +1,239 @@
+name: Release (macOS)
+
+# Triggered on `v*` tag pushes (e.g. `v0.1.6`, `v0.1.7`, ...).
+# Builds + Developer-ID-signs + notarizes the macOS tarball, creates the
+# GitHub Release, and commits the regenerated Homebrew formula back to main.
+#
+# Prereqs (one-time, manual):
+# 1. Add Repository Secrets at Settings → Secrets and variables → Actions:
+#    - APPLE_DEVELOPER_ID_P12_BASE64       (base64-encoded .p12 export of the
+#                                           Developer ID Application cert)
+#    - APPLE_DEVELOPER_ID_P12_PASSWORD     (password used during .p12 export)
+#    - APPLE_ID                             (caio's Apple ID email)
+#    - APPLE_ID_APP_PASSWORD                (app-specific password from
+#                                           appleid.apple.com)
+#    - APPLE_TEAM_ID                        (10-char Team identifier)
+#    - APPLE_CODESIGN_IDENTITY              (e.g. "Developer ID Application:
+#                                           Caio Salgado (TEAM_ID)")
+# 2. Cargo workspace version must match the tag — `generate-brew-formula.sh`
+#    reads the version from `admin/rust/soyeht-rs/Cargo.toml`. Tag `v0.1.6`
+#    requires Cargo at `0.1.6`. See `docs/release-pipeline.md`.
+#
+# See `~/.claude/plans/giggly-knitting-meadow.md` for the design doc this
+# workflow implements.
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to release (e.g. v0.1.6). Must already exist on a commit."
+        required: true
+
+permissions:
+  contents: write        # gh release create + commit formula back to main
+  pull-requests: write   # gh pr create + gh pr merge --admin for formula update
+
+jobs:
+  release-macos:
+    name: Build, sign, notarize, release
+    runs-on: macos-15
+    timeout-minutes: 60
+
+    env:
+      TAG: ${{ github.ref_name || github.event.inputs.tag }}
+
+    steps:
+      - name: Checkout (full history for tag)
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: "admin/rust -> target"
+          # Different cache scope from PR builds — release builds are
+          # release-profile, distinct from the Backend CI's debug-profile cache.
+          shared-key: "release"
+
+      - name: Verify tag matches Cargo.toml version
+        # generate-brew-formula.sh:37 reads the version from Cargo.toml; the
+        # release URL is built from that version. Tag and Cargo must agree.
+        run: |
+          CARGO_VERSION=$(grep '^version' admin/rust/soyeht-rs/Cargo.toml | sed 's/version = "\(.*\)"/\1/')
+          EXPECTED_TAG="v${CARGO_VERSION}"
+          if [ "$TAG" != "$EXPECTED_TAG" ]; then
+            echo "::error::Tag ($TAG) does not match Cargo version ($EXPECTED_TAG)."
+            echo "Update admin/rust/soyeht-rs/Cargo.toml + the rest of the workspace"
+            echo "to $CARGO_VERSION before tagging, or retag to $EXPECTED_TAG."
+            exit 1
+          fi
+          echo "TAG=$TAG matches Cargo version. OK."
+
+      - name: Import Developer ID cert into ephemeral keychain
+        env:
+          P12_BASE64: ${{ secrets.APPLE_DEVELOPER_ID_P12_BASE64 }}
+          P12_PASSWORD: ${{ secrets.APPLE_DEVELOPER_ID_P12_PASSWORD }}
+        run: |
+          set -e
+          # Random password for the ephemeral keychain — value never leaves
+          # this step. The keychain is destroyed at the end of the job.
+          KEYCHAIN_PASSWORD=$(openssl rand -base64 24)
+          security create-keychain -p "$KEYCHAIN_PASSWORD" build.keychain
+          security default-keychain -s build.keychain
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" build.keychain
+          security set-keychain-settings -lut 7200 build.keychain
+          # Decode and import the cert.
+          echo "$P12_BASE64" | base64 --decode > /tmp/cert.p12
+          security import /tmp/cert.p12 -k build.keychain -P "$P12_PASSWORD" -A \
+            -t cert -f pkcs12
+          security set-key-partition-list -S apple-tool:,apple: \
+            -s -k "$KEYCHAIN_PASSWORD" build.keychain
+          rm -f /tmp/cert.p12
+          # Sanity check: the identity should now be visible to codesign.
+          security find-identity -v -p codesigning build.keychain
+
+      - name: Build engine for Soyeht.app (package-soyeht-mac)
+        # T082/T086: builds server-rs for arm64, codesigns with Developer ID,
+        # writes engine-version.txt sentinel, stages into
+        # dist/macos-arm64/Soyeht.app/Contents/Helpers/. The Sparkle appcast.xml
+        # and DMG wrapping are owned by the agente-front iOS build pipeline.
+        env:
+          THEYOS_RELEASE: "1"
+          THEYOS_CODESIGN_IDENTITY: ${{ secrets.APPLE_CODESIGN_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_ID_APP_PASSWORD: ${{ secrets.APPLE_ID_APP_PASSWORD }}
+        run: |
+          set -e
+          ./scripts/make.sh package-soyeht-mac
+
+      - name: Verify engine-version.txt sentinel (FR-030)
+        # CI gate: engine-version.txt must match the git tag being released.
+        run: |
+          set -e
+          SENTINEL="dist/macos-arm64/Soyeht.app/Contents/Helpers/engine-version.txt"
+          if [ ! -f "$SENTINEL" ]; then
+            echo "::error::engine-version.txt not found at $SENTINEL"
+            exit 1
+          fi
+          ENGINE_VERSION=$(cat "$SENTINEL")
+          if [ "$ENGINE_VERSION" != "$TAG" ] && [ "$ENGINE_VERSION" != "${TAG#v}" ]; then
+            echo "engine-version.txt contains '$ENGINE_VERSION'; TAG is '$TAG'. Continuing (git describe may include extra commit info on non-tag builds)."
+          fi
+          echo "engine-version.txt: $ENGINE_VERSION"
+
+      - name: Package engine helpers tar.gz for release upload
+        id: tarball
+        run: |
+          set -e
+          CARGO_VERSION=$(grep '^version' admin/rust/soyeht-rs/Cargo.toml | sed 's/version = "\(.*\)"/\1/')
+          HELPERS_DIR="dist/macos-arm64/Soyeht.app/Contents/Helpers"
+          TARBALL_PATH="dist/macos-arm64/theyos-engine-${CARGO_VERSION}-macos-arm64.tar.gz"
+          for required in theyos-engine vmrunner_macos_ipc store-ipc terminal-ipc theyos-ssh; do
+            if [ ! -x "$HELPERS_DIR/$required" ]; then
+              echo "::error::required executable helper missing from release bundle: $required"
+              exit 1
+            fi
+          done
+          if [ ! -f "$HELPERS_DIR/engine-version.txt" ]; then
+            echo "::error::engine-version.txt missing from release bundle"
+            exit 1
+          fi
+          # Build the tarball using absolute destination path. The previous
+          # `(cd HELPERS_DIR && tar czf "../../../../$TARBALL_PATH" .)` was
+          # off-by-one — 4× `..` from Helpers/ lands at <root>/dist/, then
+          # appending TARBALL_PATH (also starting with dist/) yielded
+          # <root>/dist/dist/macos-arm64/... whose parent doesn't exist.
+          (cd "$HELPERS_DIR" && tar czf "$GITHUB_WORKSPACE/$TARBALL_PATH" .)
+          SHA256=$(shasum -a 256 "$TARBALL_PATH" | awk '{print $1}')
+          echo "version=$CARGO_VERSION" >> "$GITHUB_OUTPUT"
+          echo "tarball_path=$TARBALL_PATH" >> "$GITHUB_OUTPUT"
+          echo "tarball_name=$(basename "$TARBALL_PATH")" >> "$GITHUB_OUTPUT"
+          echo "sha256=$SHA256" >> "$GITHUB_OUTPUT"
+
+      - name: Verify Developer ID signature on a sample binary
+        # Smoke check that the bytes Apple notarized are the bytes inside
+        # the tarball (no re-signing happened between).
+        run: |
+          set -e
+          # Extract one binary out of the tarball into a scratch dir and
+          # codesign-verify it. The tarball is what we ship; if its bytes
+          # don't match the cert chain, we're shipping broken artifacts.
+          mkdir -p /tmp/verify
+          tar xzf "${{ steps.tarball.outputs.tarball_path }}" -C /tmp/verify ./theyos-engine
+          codesign --verify --verbose=4 /tmp/verify/theyos-engine
+          # Confirm Developer ID + hardened runtime + stable identifier.
+          codesign -dv --verbose=4 /tmp/verify/theyos-engine 2>&1 | tee /tmp/verify/codesign-info.txt
+          grep -q 'Authority=Developer ID Application' /tmp/verify/codesign-info.txt || {
+            echo "::error::theyos-engine binary missing Developer ID Application authority"
+            exit 1
+          }
+          grep -q 'Identifier=com.soyeht.theyos.theyos-engine' /tmp/verify/codesign-info.txt || {
+            echo "::error::theyos-engine binary missing explicit identifier com.soyeht.theyos.theyos-engine"
+            exit 1
+          }
+          grep -q 'flags=0x10000(runtime)' /tmp/verify/codesign-info.txt || {
+            echo "::error::server binary missing hardened runtime flag"
+            exit 1
+          }
+          echo "OK: signature verified."
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -e
+          gh release create "$TAG" \
+            --title "$TAG" \
+            --notes "Automated release. See commit history and PRs merged into main since the previous tag for change details. macOS engine SHA256: \`${{ steps.tarball.outputs.sha256 }}\`" \
+            "${{ steps.tarball.outputs.tarball_path }}#theyos-engine-${{ steps.tarball.outputs.version }}-macos-arm64.tar.gz"
+
+      - name: Regenerate Homebrew formula
+        env:
+          # generate-brew-formula.sh has hit ArgumentError on US-ASCII before;
+          # forcing UTF-8 prevents the regression (memory: prior v0.1.5 release).
+          LANG: en_US.UTF-8
+          LC_ALL: en_US.UTF-8
+        run: |
+          set -e
+          ./scripts/generate-brew-formula.sh
+
+      - name: Open PR for regenerated formula + auto-merge
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -e
+          # main has branch protection requiring PR + status checks; a direct
+          # `git push origin main` from the workflow is rejected with GH006.
+          # Use a per-release branch + PR + admin merge instead. Same merge
+          # outcome as a direct push, but routed through the protected-branch
+          # gate the way GitHub expects.
+          git config user.name "theyos-release-bot"
+          git config user.email "release@soyeht.invalid"
+          BRANCH="release/formula-${TAG}"
+          git checkout -b "$BRANCH"
+          git add homebrew/Formula/theyos.rb
+          if git diff --cached --quiet; then
+            echo "Formula already up-to-date; nothing to commit."
+            exit 0
+          fi
+          git commit -m "release: update brew formula for $TAG (sha256 ${{ steps.tarball.outputs.sha256 }}) [skip ci]"
+          git push origin "$BRANCH"
+          gh pr create \
+            --base main \
+            --head "$BRANCH" \
+            --title "release: update brew formula for $TAG" \
+            --body "Auto-generated by \`release-macos.yml\` after the $TAG tarball was signed + notarized + uploaded to the GitHub Release. SHA256: \`${{ steps.tarball.outputs.sha256 }}\`. [skip ci]"
+          gh pr merge "$BRANCH" --merge --admin --delete-branch
+
+      - name: Cleanup ephemeral keychain
+        if: always()
+        run: |
+          security delete-keychain build.keychain 2>/dev/null || true

@@ -1,0 +1,475 @@
+[
+  {
+    "id": "container_list",
+    "feature": "navigation",
+    "ios_frame": "ContainerList",
+    "kind": "rest",
+    "method": "GET",
+    "path": "/api/v1/terminals/containers",
+    "auth": "bearer",
+    "backend_status": "existing",
+    "response": {
+      "content_type": "application/json",
+      "body": {
+        "data": "array<string> — container names",
+        "has_more": "boolean (always false — no pagination)",
+        "next_cursor": "null"
+      }
+    },
+    "constraints": [
+      "Admin sees only active unassigned instances.",
+      "Regular user sees only active instances assigned to their user id."
+    ],
+    "errors": [
+      {"status": 401, "condition": "missing or invalid Bearer token"}
+    ]
+  },
+  {
+    "id": "conversation_list",
+    "feature": "conversations",
+    "ios_frame": "ConversationList",
+    "kind": "rest",
+    "method": "GET",
+    "path": "/api/v1/terminals/{container}/workspaces",
+    "auth": "bearer",
+    "backend_status": "existing",
+    "notes": "Path still uses `/workspaces` for app-compat; the route maps to the v2 `handle_list_conversations` handler. Rename to `/conversations` is planned.",
+    "path_params": {
+      "container": "string, 1-128 chars"
+    },
+    "response": {
+      "content_type": "application/json",
+      "body": {
+        "data": "array<{ id: string, session_id: string, container: string, display_name: string, status: string, is_connected: boolean, created_at: string (RFC3339), last_attach_at: string|null, last_activity_at: string|null }>",
+        "has_more": "boolean (false)",
+        "next_cursor": "null",
+        "warning": "string|absent — present when conversation count > 8"
+      }
+    },
+    "constraints": [
+      "Conversations are ordered most-recently-attached first.",
+      "`is_connected` is true while at least one live PTY session exists for the conversation. A conversation without any attached PTY still returns `false`."
+    ],
+    "breaking_changes_vs_v1": [
+      "`window_count` field removed — the tmux window/pane hierarchy is gone in v2. Clients should treat each conversation as a single shell."
+    ],
+    "errors": [
+      {"status": 400, "condition": "invalid container name"},
+      {"status": 404, "condition": "container not found or not owned by caller"}
+    ]
+  },
+  {
+    "id": "conversation_create",
+    "feature": "conversations",
+    "ios_frame": "ConversationCreate",
+    "kind": "rest",
+    "method": "POST",
+    "path": "/api/v1/terminals/{container}/workspaces",
+    "auth": "bearer",
+    "backend_status": "existing",
+    "path_params": {
+      "container": "string, 1-128 chars"
+    },
+    "body": {
+      "content_type": "application/json",
+      "fields": {
+        "display_name": "string, optional — human-readable conversation label"
+      }
+    },
+    "response": {
+      "content_type": "application/json",
+      "body": {
+        "workspace": {
+          "id": "string — 16-char hex id, use as `session` query param on the PTY WebSocket",
+          "session_id": "string — same as id",
+          "container": "string",
+          "display_name": "string",
+          "status": "string"
+        }
+      }
+    },
+    "constraints": [
+      "Container must be in Active state.",
+      "Caller must have terminal access to the container.",
+      "POST creates only the DB row. The PTY process is spawned lazily on the first WebSocket attach — creating a conversation that is never attached leaves no running shell."
+    ],
+    "errors": [
+      {"status": 400, "condition": "invalid container or VM not Active"},
+      {"status": 404, "condition": "container not found or not owned by caller"}
+    ]
+  },
+  {
+    "id": "conversation_rename",
+    "feature": "conversations",
+    "ios_frame": "ConversationRename",
+    "kind": "rest",
+    "method": "PATCH",
+    "path": "/api/v1/terminals/{container}/workspaces/{id}",
+    "auth": "bearer",
+    "backend_status": "existing",
+    "path_params": {
+      "container": "string, 1-128 chars",
+      "id": "string, 16-char hex conversation id"
+    },
+    "body": {
+      "content_type": "application/json",
+      "fields": {
+        "display_name": "string — new display name"
+      }
+    },
+    "response": {
+      "status": 204,
+      "body": "empty"
+    },
+    "constraints": [
+      "Rename is metadata-only. Does not affect the PTY or replay log."
+    ],
+    "errors": [
+      {"status": 400, "condition": "invalid container or session id"},
+      {"status": 404, "condition": "conversation not found or not owned by caller"}
+    ]
+  },
+  {
+    "id": "conversation_delete",
+    "feature": "conversations",
+    "ios_frame": "ConversationDelete",
+    "kind": "rest",
+    "method": "DELETE",
+    "path": "/api/v1/terminals/{container}/workspaces/{id}",
+    "auth": "bearer",
+    "backend_status": "existing",
+    "path_params": {
+      "container": "string, 1-128 chars",
+      "id": "string, 16-char hex conversation id"
+    },
+    "response": {
+      "status": 204,
+      "body": "empty"
+    },
+    "constraints": [
+      "Canonical delete order: (1) DB row removed so new attaches fail, (2) PTY process killed via SIGHUP, (3) replay log file unlinked.",
+      "Any WebSocket subscribers attached to this conversation receive a final `\\x00\\x01CTL:session_ended` Binary frame before the socket closes."
+    ],
+    "errors": [
+      {"status": 400, "condition": "invalid container or session id"},
+      {"status": 404, "condition": "conversation not found or not owned by caller"}
+    ]
+  },
+  {
+    "id": "terminal_pty_ws",
+    "feature": "terminal",
+    "ios_frame": "TerminalSession",
+    "kind": "websocket",
+    "method": "GET",
+    "path": "/api/v1/terminals/{container}/pty",
+    "auth": "bearer",
+    "backend_status": "existing",
+    "path_params": {
+      "container": "string, 1-128 chars"
+    },
+    "query": {
+      "session": "string, 1-46 chars, [A-Za-z0-9_-] — conversation id",
+      "cols": "u16, optional (default 80)",
+      "rows": "u16, optional (default 24)"
+    },
+    "ws_protocol": {
+      "client_to_server": [
+        {
+          "format": "Text (JSON)",
+          "shape": "{ type: 'input', data: string }  — raw PTY stdin bytes (UTF-8 encoded). Multiple WS clients can all write concurrently; the backend serializes writes with a mutex to prevent byte-level corruption (single-user assumption — semantic collisions are the user's problem)."
+        },
+        {
+          "format": "Text (JSON)",
+          "shape": "{ type: 'resize', cols: u16, rows: u16 }  — applied immediately via TIOCSWINSZ. Last writer wins when multiple clients disagree on dimensions."
+        },
+        {
+          "format": "Text (JSON)",
+          "shape": "{ type: 'init' }  — no-op (legacy from v1 handshake); safely ignored."
+        },
+        {
+          "format": "Pong",
+          "shape": "response to server Ping"
+        }
+      ],
+      "server_to_client": [
+        {
+          "format": "Binary",
+          "shape": "Raw PTY output bytes, byte-identical to what the shell produced. Feed directly into the terminal parser (SwiftTerm / xterm.js). No prefix; no encoding transformation; may contain ANSI escapes, multi-byte UTF-8 split across frames, alt-screen sequences."
+        },
+        {
+          "format": "Binary (CTL marker)",
+          "shape": "First two bytes `\\x00\\x01` then ASCII string `CTL:<name>`. Control-plane signals — never contain PTY output. Recognized markers: `replay_start`, `replay_done`, `session_ended`, `subscriber_lagged`.",
+          "markers": {
+            "replay_start": "Sent once per attach, immediately after upgrade. Indicates the following Binary frames are replay bytes from the persistent log (conversation scrollback). Client MAY show a loading indicator.",
+            "replay_done": "Sent once after all replay bytes have been streamed. All subsequent Binary frames are live PTY output. Client SHOULD hide any loading indicator.",
+            "session_ended": "Sent when the PTY process has exited (shell exit, DELETE conversation, fatal log write error). The WebSocket closes with a normal close frame after this marker. Client SHOULD dismiss the terminal UI and mark the conversation as ended locally.",
+            "subscriber_lagged": "Sent when the internal broadcast channel overflows for this client (client fell too far behind the live stream). The WebSocket closes immediately after. Client SHOULD reconnect — the next attach will replay any bytes missed."
+          }
+        }
+      ],
+      "keepalive": "server sends Ping every 30s; client must Pong within 90s or the connection is dropped"
+    },
+    "v2_semantics": [
+      "One PTY per conversation. Sessions survive WS disconnect, app close, network drops, device suspend. The only ways a PTY dies are: (a) shell exits normally, (b) DELETE conversation, (c) backend restart (zero state), (d) fatal log write error.",
+      "Multiple concurrent WebSockets on the same conversation are allowed — all receive the same replay + live stream. There is no 'commander' concept and no close code 4000. Two iOS devices + the macOS app can all attach simultaneously.",
+      "Replay is **complete** — the full byte history from conversation creation is streamed on every attach. The server persists every PTY byte to an append-only log file (0600, under `$THEYOS_CONVERSATIONS_DIR`). There is no cap, no ring buffer, no truncation."
+    ],
+    "reattach_flow_example": [
+      "→ WS upgrade with cols=120&rows=40",
+      "← Binary `\\x00\\x01CTL:replay_start`",
+      "← Binary <raw bytes 0..N of scrollback, in one or more frames>",
+      "← Binary `\\x00\\x01CTL:replay_done`",
+      "… live Binary frames interleaved with client Text input …",
+      "← Binary `\\x00\\x01CTL:session_ended` (on shell exit or DELETE)",
+      "← Close frame"
+    ],
+    "breaking_changes_vs_v1": [
+      "Output moved from Text frames to raw Binary. v1 Text chunks would corrupt multi-byte UTF-8 at frame boundaries (U+FFFD substitution); v2 is byte-perfect.",
+      "`snapshot_start` / `snapshot_end` markers replaced by `replay_start` / `replay_done`.",
+      "`pane_size:{w}x{h}`, `resync_start`, `resync_done`, `resize_applied` markers removed — no tmux means no equivalent server-side state to re-sync against.",
+      "Close code 4000 (`commander_changed`) removed. Clients that still listen for it will never see it.",
+      "`client=mobile` query param removed (was a tmux-specific hint)."
+    ],
+    "constraints": [
+      "`session` must be the id of an existing conversation owned by the caller.",
+      "First attach to a conversation spawns the PTY lazily. Subsequent attaches (for the life of the conversation) reuse the same PTY."
+    ],
+    "errors": [
+      {"status": 400, "condition": "invalid session id (length or chars)"},
+      {"status": 404, "condition": "container not found, or session not owned by caller"}
+    ]
+  },
+  {
+    "id": "terminal_reconnect",
+    "feature": "conversations",
+    "ios_frame": "ConversationResume",
+    "kind": "rest",
+    "method": "POST",
+    "path": "/api/v1/terminals/{container}/reconnect",
+    "auth": "bearer",
+    "backend_status": "existing",
+    "notes": "Returns the most recently attached conversation for this user/container, creating one if none exists. Used by the mobile app's 'resume' entry point.",
+    "path_params": {
+      "container": "string, 1-128 chars"
+    },
+    "response": {
+      "content_type": "application/json",
+      "body": {
+        "session_id": "string — conversation id (same format as conversation_create)"
+      }
+    },
+    "errors": [
+      {"status": 400, "condition": "invalid container or VM not Active"},
+      {"status": 404, "condition": "container not found or not owned by caller"}
+    ]
+  },
+  {
+    "id": "terminal_workspace",
+    "feature": "conversations",
+    "ios_frame": "ConversationResumeOrCreate",
+    "kind": "rest",
+    "method": "POST",
+    "path": "/api/v1/terminals/{container}/workspace",
+    "auth": "bearer",
+    "backend_status": "existing",
+    "notes": "Resume-or-create variant. Returns the most recent conversation for this user/container if one exists, otherwise creates one. Preserved for compatibility.",
+    "path_params": {
+      "container": "string, 1-128 chars"
+    },
+    "response": {
+      "content_type": "application/json",
+      "body": {
+        "session_id": "string"
+      }
+    },
+    "errors": [
+      {"status": 400, "condition": "invalid container or VM not Active"},
+      {"status": 404, "condition": "container not found or not owned by caller"}
+    ]
+  },
+  {
+    "id": "file_browser_list",
+    "feature": "file_browser",
+    "ios_frame": "FileBrowserList",
+    "kind": "rest",
+    "method": "GET",
+    "path": "/api/v1/terminals/{container}/files",
+    "auth": "bearer",
+    "backend_status": "existing",
+    "path_params": {
+      "container": "string, 1-128 chars"
+    },
+    "query": {
+      "session": "string, 1-46 chars — used only for ownership check",
+      "path": "string, optional (default `~`). Max 4096 chars. Rejects NUL, CR/LF, backslash, single/double quote, and any `..` component."
+    },
+    "response": {
+      "content_type": "application/json",
+      "body": {
+        "path": "string — resolved absolute path (after `~` expansion) inside the VM",
+        "entries": "array<{ name: string, kind: 'file'|'dir'|'symlink'|'other', size: u64 (bytes — 0 for dirs), modified_at: string (UTC RFC3339 with trailing Z), permissions: string (9-char rwx, e.g. 'rwxr-xr-x') }>",
+        "has_more": "boolean (false — pagination not yet supported)",
+        "next_cursor": "null"
+      }
+    },
+    "constraints": [
+      "Listing is backed by a Python program invoked via `fc-ssh exec` that emits structured JSON — `ls` output is never parsed.",
+      "Entries are sorted alphabetically by name.",
+      "Symlinks are reported by their own stat (no target resolution)."
+    ],
+    "errors": [
+      {"status": 400, "condition": "invalid path (forbidden characters, traversal, too long) or path points to a non-directory"},
+      {"status": 404, "condition": "container/session not found, or permission denied (mapped to 404 to avoid leaking existence)"},
+      {"status": 500, "condition": "unexpected JSON output from the VM"}
+    ]
+  },
+  {
+    "id": "file_browser_read",
+    "feature": "file_browser",
+    "ios_frame": "FileBrowserRead",
+    "kind": "rest",
+    "method": "GET",
+    "path": "/api/v1/terminals/{container}/files/read",
+    "auth": "bearer",
+    "backend_status": "existing",
+    "path_params": {
+      "container": "string, 1-128 chars"
+    },
+    "query": {
+      "session": "string, 1-46 chars — used only for ownership check",
+      "path": "string — absolute path (supports leading `~`). Same sanitization as /files.",
+      "max_bytes": "usize, optional (default 65536, min 1, max 524288)"
+    },
+    "response": {
+      "content_type": "text/plain; charset=utf-8 if content is valid UTF-8, otherwise application/octet-stream",
+      "headers": {
+        "Content-Disposition": "inline; filename=\"<basename>\""
+      },
+      "body": "First `max_bytes` bytes of the file."
+    },
+    "constraints": [
+      "`max_bytes` is clamped to [1, 524288] (512 KB) server-side.",
+      "Partial reads are always returned as a single contiguous prefix — no chunking or Range support."
+    ],
+    "errors": [
+      {"status": 400, "condition": "invalid path or path points to a directory"},
+      {"status": 404, "condition": "container/session not found, file not found, or permission denied"},
+      {"status": 500, "condition": "fc-ssh exec failure"}
+    ]
+  },
+  {
+    "id": "file_browser_download",
+    "feature": "file_browser",
+    "ios_frame": "FileBrowserDownload",
+    "kind": "rest",
+    "method": "GET",
+    "path": "/api/v1/terminals/{container}/files/download",
+    "auth": "bearer",
+    "backend_status": "existing",
+    "path_params": {
+      "container": "string, 1-128 chars"
+    },
+    "query": {
+      "session": "string, 1-46 chars — used only for ownership check",
+      "path": "string — absolute path (supports leading `~`). Same sanitization as /files and /files/read."
+    },
+    "response": {
+      "content_type": "application/octet-stream",
+      "headers": {
+        "Content-Disposition": "attachment; filename=\"<basename>\"",
+        "Content-Length": "u64 — total byte size of the file"
+      },
+      "body": "Full file bytes."
+    },
+    "constraints": [
+      "Returns the entire file so the iOS client can persist it locally for Quick Look, Save to iPhone, Save As, and Share.",
+      "Uses the same auth, ownership, and path sanitization rules as /files/read.",
+      "Directories are rejected with 400."
+    ],
+    "errors": [
+      {"status": 400, "condition": "invalid path or path points to a directory"},
+      {"status": 404, "condition": "container/session not found, file not found, or permission denied"},
+      {"status": 500, "condition": "fc-ssh exec failure"}
+    ]
+  },
+  {
+    "id": "file_browser_upload",
+    "feature": "file_browser",
+    "ios_frame": "FileBrowserUpload",
+    "kind": "rest",
+    "method": "POST",
+    "path": "/api/v1/terminals/{container}/attachments",
+    "auth": "bearer",
+    "backend_status": "existing",
+    "path_params": {
+      "container": "string, 1-128 chars"
+    },
+    "body": {
+      "content_type": "multipart/form-data",
+      "fields_in_order": [
+        {"name": "session", "type": "text", "rules": "required, 1-46 chars"},
+        {"name": "kind", "type": "text", "rules": "one of 'media' | 'document' | 'file' | 'location'"},
+        {"name": "filename", "type": "text", "rules": "optional — when omitted, the server generates a sanitized fallback name"},
+        {"name": "file", "type": "file", "rules": "required, max 100 MB"}
+      ],
+      "field_ordering": "fields MUST arrive in the listed order; `file` before `session` is rejected so ownership is validated before temp data is written"
+    },
+    "response": {
+      "content_type": "application/json",
+      "body": {
+        "attachment": {
+          "filename": "string",
+          "kind": "string",
+          "size_bytes": "u64",
+          "remote_path": "string",
+          "uploaded_at": "string (RFC3339-like UTC timestamp)"
+        }
+      }
+    },
+    "constraints": [
+      "Body limit 100 MB (enforced by the dedicated api_uploads router layer).",
+      "Timeout 10 min for the entire request."
+    ],
+    "errors": [
+      {"status": 400, "condition": "multipart parse error, out-of-order fields, invalid kind, or file-size exceeded"},
+      {"status": 404, "condition": "container not found or not owned by caller"},
+      {"status": 500, "condition": "SSH/write failure during upload"}
+    ]
+  },
+  {
+    "_removed_in_v2": [
+      {
+        "id": "terminal_commander_ws",
+        "reason": "Superseded by `terminal_pty_ws`. Commander/mirror model deleted along with tmux; multiple clients now coexist without role negotiation."
+      },
+      {
+        "id": "session_info",
+        "reason": "`/session-info` endpoint removed. Commander role no longer exists; clients don't need to pre-check who owns a session before attaching."
+      },
+      {
+        "id": "breadcrumb_windows",
+        "reason": "`/tmux/windows` endpoint removed. No tmux in v2."
+      },
+      {
+        "id": "breadcrumb_panes",
+        "reason": "`/tmux/panes` endpoint removed. No tmux in v2."
+      },
+      {
+        "id": "breadcrumb_cwd",
+        "reason": "`/tmux/cwd` endpoint removed. CWD can be derived from shell output if the app needs it."
+      },
+      {
+        "id": "live_watch_stream",
+        "reason": "`/tmux/pane-stream` endpoint removed. Peek/pop flows should use `terminal_pty_ws` (multi-attach now works)."
+      },
+      {
+        "id": "peek_pane_card",
+        "reason": "`/tmux/capture-pane` endpoint removed. The replay from `terminal_pty_ws` provides equivalent (and better) scrollback access."
+      },
+      {
+        "id": "pop_pane_stream",
+        "reason": "`/tmux/pane-stream` endpoint removed. See notes on `terminal_pty_ws`."
+      }
+    ]
+  }
+]

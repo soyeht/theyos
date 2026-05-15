@@ -1,0 +1,109 @@
+name: Cross-Repo Contract Sync
+
+# Constitution V enforcement: contract markdown files shared between theyos
+# and iSoyehtTerm must not drift silently. This workflow detects drift by
+# scanning iSoyehtTerm contract mirrors and diffing them against the CURRENT
+# theyos@HEAD source-of-truth (not the pinned hash in the mirror header).
+# The pinned hash is preserved as audit metadata (when the mirror was last
+# synced), but the enforced invariant is: mirror == theyos@HEAD.
+#
+# Triggers: all PRs to main, plus pushes to 005-soyeht-onboarding where
+# contracts are developed.
+# Passes silently when no mirrors are registered yet.
+
+on:
+  pull_request:
+    branches:
+      - main
+  push:
+    branches:
+      - "005-soyeht-onboarding"
+    paths:
+      - "specs/005-soyeht-onboarding/contracts/**"
+      - ".github/workflows/contracts-cross-repo-sync.yml"
+  workflow_dispatch:
+
+jobs:
+  contracts-sync-check:
+    name: Contract drift detection (theyos ↔ iSoyehtTerm)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout theyos
+        uses: actions/checkout@v5
+        with:
+          path: theyos
+
+      # Checkout iSoyehtTerm (public read — uses GITHUB_TOKEN for API rate limits).
+      - name: Checkout iSoyehtTerm
+        uses: actions/checkout@v5
+        with:
+          repository: soyeht/iSoyehtTerm
+          path: iSoyehtTerm
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Scan and diff contract mirrors
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          CONTRACTS_DIR="theyos/specs/005-soyeht-onboarding/contracts"
+          ISOYEHTTERM_DIR="iSoyehtTerm"
+          DRIFT=0
+          MIRRORS_FOUND=0
+
+          # Pattern: <!-- mirror of theyos:005/contracts/<file>.md as of <hash> -->
+          MIRROR_PATTERN='<!-- mirror of theyos:005/contracts/([^.]+\.md) as of ([0-9a-f]{7,40}) -->'
+
+          # Walk all markdown files in iSoyehtTerm looking for mirror headers.
+          while IFS= read -r -d '' mirror_file; do
+            if grep -qP "$MIRROR_PATTERN" "$mirror_file" 2>/dev/null; then
+              while IFS= read -r match_line; do
+                if [[ "$match_line" =~ $MIRROR_PATTERN ]]; then
+                  CONTRACT_FILE="${BASH_REMATCH[1]}"
+                  PINNED_HASH="${BASH_REMATCH[2]}"
+                  MIRRORS_FOUND=$((MIRRORS_FOUND + 1))
+
+                  SOURCE="$CONTRACTS_DIR/$CONTRACT_FILE"
+                  if [[ ! -f "$SOURCE" ]]; then
+                    echo "::error file=$mirror_file::Mirror references $CONTRACT_FILE but no such file in theyos contracts."
+                    DRIFT=1
+                    continue
+                  fi
+
+                  # Write mirror content (header stripped) to a temp file.
+                  # Avoids echo flag swallowing (-n/-e) and trailing newline
+                  # mismatch from command substitution + echo round-trip.
+                  MIRROR_TMP=$(mktemp)
+                  grep -v '<!-- mirror of theyos' "$mirror_file" > "$MIRROR_TMP" || true
+
+                  # Diff current theyos@HEAD contract against the stripped mirror.
+                  # The pinned hash is audit metadata only; the enforced invariant
+                  # is mirror == HEAD so that upstream drift is caught immediately.
+                  if ! diff "$SOURCE" "$MIRROR_TMP" > /dev/null 2>&1; then
+                    echo "::error file=$mirror_file::Contract drift detected: $CONTRACT_FILE at HEAD differs from mirror $mirror_file (mirror pinned at $PINNED_HASH)"
+                    echo "--- theyos $CONTRACT_FILE @ HEAD"
+                    echo "+++ iSoyehtTerm mirror $mirror_file"
+                    diff "$SOURCE" "$MIRROR_TMP" || true
+                    DRIFT=1
+                  else
+                    echo "✓ $CONTRACT_FILE @ HEAD matches mirror $mirror_file (pinned at $PINNED_HASH)"
+                  fi
+                  rm -f "$MIRROR_TMP"
+                fi
+              done < <(grep -P "$MIRROR_PATTERN" "$mirror_file")
+            fi
+          done < <(find "$ISOYEHTTERM_DIR" -name "*.md" -print0)
+
+          if [[ $MIRRORS_FOUND -eq 0 ]]; then
+            echo "No contract mirrors registered yet — pass."
+          else
+            echo "Checked $MIRRORS_FOUND mirror(s)."
+          fi
+
+          if [[ $DRIFT -ne 0 ]]; then
+            echo ""
+            echo "Contract drift detected. Update the iSoyehtTerm mirror to match theyos@HEAD and bump its pinned hash."
+            exit 1
+          fi

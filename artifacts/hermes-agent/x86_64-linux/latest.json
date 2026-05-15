@@ -1,0 +1,18 @@
+{
+  "manifest_version": 1,
+  "claw": "hermes-agent",
+  "version": "0.7.0",
+  "arch": "x86_64-linux",
+  "fingerprint": "3604b011065d7fa6bb1a6b79634a15812d539d2d085a697df7155d31d497258f",
+  "base_rootfs_version": "v2",
+  "sha256": "b121e201c110af04e58a40ed9b208da4d2afd0d16d351fbd79c7ce69cbe8b922",
+  "size_bytes": 1601563738,
+  "url": "https://github.com/soyeht/theyos/releases/download/artifact-hermes-agent-0.7.0/hermes-agent-x86_64-linux-rootfs.ext4.zst",
+  "published_at": "2026-04-09T23:07:46Z",
+  "channel": "stable",
+  "base_rootfs_sha256": "e965c55c8220953a1c323a6a4b748d4eb299393b1451ad3a9d153c6c2c751899",
+  "installer_plan_sha256": "4df2d175abdfe45b06b2c0f5903cd76b744b1589ed47d2d3e5994c60384588a0",
+  "kernel_sha256": "e20e46d0c36c55c0d1014eb20576171b3f3d922260d9f792017aeff53af3d4f2",
+  "kernel_version": "vmlinux-6.1.155",
+  "firecracker_version": "v1.15.0"
+}

@@ -1,0 +1,120 @@
+[
+  {
+    "id": "first_request_allowed",
+    "description": "First request in a fresh window is allowed",
+    "operation": "check",
+    "input": {
+      "user_id": "user-a",
+      "action": "create_instance",
+      "requests_per_hour": 10
+    },
+    "expected": {
+      "allowed": true,
+      "error": false
+    }
+  },
+  {
+    "id": "under_limit_allowed",
+    "description": "Requests under the limit are all allowed",
+    "operation": "check_sequence",
+    "input": {
+      "user_id": "user-b",
+      "action": "create_instance",
+      "requests_per_hour": 5,
+      "request_count": 5
+    },
+    "expected": {
+      "all_allowed": true
+    }
+  },
+  {
+    "id": "at_limit_denied",
+    "description": "The request exceeding the limit is denied",
+    "operation": "check_over_limit",
+    "input": {
+      "user_id": "user-c",
+      "action": "create_instance",
+      "requests_per_hour": 3,
+      "request_count": 4
+    },
+    "expected": {
+      "first_three_allowed": true,
+      "fourth_denied": true
+    }
+  },
+  {
+    "id": "different_users_independent",
+    "description": "Different users have independent rate limits",
+    "operation": "check_independent_users",
+    "input": {
+      "user_a": "alice",
+      "user_b": "bob",
+      "action": "create_instance",
+      "requests_per_hour": 2,
+      "user_a_requests": 2,
+      "user_b_requests": 1
+    },
+    "expected": {
+      "user_a_third_denied": true,
+      "user_b_second_allowed": true
+    }
+  },
+  {
+    "id": "different_actions_independent",
+    "description": "Different actions have independent rate limits",
+    "operation": "check_independent_actions",
+    "input": {
+      "user_id": "user-d",
+      "action_a": "create_instance",
+      "action_b": "delete_instance",
+      "requests_per_hour": 2,
+      "action_a_requests": 2
+    },
+    "expected": {
+      "action_a_third_denied": true,
+      "action_b_first_allowed": true
+    }
+  },
+  {
+    "id": "remaining_fresh",
+    "description": "Fresh window shows full quota remaining",
+    "operation": "get_remaining",
+    "input": {
+      "user_id": "user-e",
+      "action": "create_instance",
+      "requests_per_hour": 10,
+      "prior_requests": 0
+    },
+    "expected": {
+      "remaining": 10
+    }
+  },
+  {
+    "id": "remaining_after_requests",
+    "description": "After 3 requests, remaining = limit - 3",
+    "operation": "get_remaining",
+    "input": {
+      "user_id": "user-f",
+      "action": "create_instance",
+      "requests_per_hour": 10,
+      "prior_requests": 3
+    },
+    "expected": {
+      "remaining": 7
+    }
+  },
+  {
+    "id": "remaining_at_zero",
+    "description": "At limit, remaining is 0",
+    "operation": "get_remaining",
+    "input": {
+      "user_id": "user-g",
+      "action": "create_instance",
+      "requests_per_hour": 5,
+      "prior_requests": 5
+    },
+    "expected": {
+      "remaining": 0
+    }
+  }
+]

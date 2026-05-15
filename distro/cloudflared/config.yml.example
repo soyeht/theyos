@@ -1,0 +1,44 @@
+# Cloudflare Tunnel configuration
+# Copy this to config.yml and replace YOUR_TUNNEL_ID with your tunnel ID.
+# See: https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/
+
+tunnel: YOUR_TUNNEL_ID
+
+# Force HTTP/2 (TCP) instead of QUIC (UDP) for the edge tunnel connection.
+# QUIC is sensitive to ISP/router UDP deprioritization, causing intermittent
+# "timeout: no recent network activity" drops.
+protocol: http2
+
+ingress:
+  - hostname: admin.example.com
+    service: http://localhost:8080
+
+  - hostname: example.com
+    service: http://localhost:8080
+
+  - hostname: www.example.com
+    service: http://localhost:8080
+
+  - hostname: analytics.example.com
+    service: http://localhost:8080
+
+  # Wildcard: all claw subdomains route to Caddy for dynamic reverse-proxying.
+  # Requires a wildcard DNS CNAME record: *.example.com -> <tunnel-id>.cfargotunnel.com
+  - hostname: "*.example.com"
+    service: http://localhost:8080
+
+  # Public claw custom domains: add one ingress entry per user-owned domain
+  # that should reach Caddy. The theyOS backend only proxies hosts configured
+  # via /api/v1/instances/{id}/public-sites; unmapped public hosts return 404.
+  #
+  # - hostname: livre.org
+  #   service: http://localhost:8080
+  # - hostname: www.livre.org
+  #   service: http://localhost:8080
+  # - hostname: personasgpt.ai
+  #   service: http://localhost:8080
+  # - hostname: www.personasgpt.ai
+  #   service: http://localhost:8080
+
+  # Catch-all
+  - service: http_status:404

@@ -1,0 +1,25 @@
+[package]
+name = "executor-rs"
+version = "0.1.11"
+edition.workspace = true
+rust-version.workspace = true
+description = "Rust executor daemon that runs complete instance lifecycle flows via IPC subprocesses"
+
+[[bin]]
+name = "executor_ipc"
+path = "src/bin/executor_ipc.rs"
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+core-rs = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+serde_json = { workspace = true }
+
+[lints]
+workspace = true

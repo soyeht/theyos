@@ -1,0 +1,18 @@
+{
+  "manifest_version": 1,
+  "claw": "zeroclaw",
+  "version": "0.1.9",
+  "arch": "x86_64-linux",
+  "fingerprint": "f4c4f4c7b77e66f8da23b5ba816ce3d5769359773f23e69351984434dc0aaeb3",
+  "base_rootfs_version": "v2",
+  "sha256": "1e40e13558d6b72d19eed35726bc4dcbdad1c4fa2901ba56ba73f63c3811192e",
+  "size_bytes": 661036589,
+  "url": "https://github.com/soyeht/theyos/releases/download/artifact-zeroclaw-0.1.9/zeroclaw-x86_64-linux-rootfs.ext4.zst",
+  "published_at": "2026-04-10T02:46:10Z",
+  "channel": "stable",
+  "base_rootfs_sha256": "e965c55c8220953a1c323a6a4b748d4eb299393b1451ad3a9d153c6c2c751899",
+  "installer_plan_sha256": "da0804e9029a24390a48ada6a828e5ca0d23348c9818d90e12631f29feb0b8ca",
+  "kernel_sha256": "e20e46d0c36c55c0d1014eb20576171b3f3d922260d9f792017aeff53af3d4f2",
+  "kernel_version": "vmlinux-6.1.155",
+  "firecracker_version": "v1.15.0"
+}

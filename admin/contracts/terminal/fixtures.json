@@ -1,0 +1,463 @@
+[
+  {
+    "id": "ensure_container_adds_and_lists_sorted",
+    "description": "EnsureContainer adds containers that appear sorted in ListContainers, each with boot lines in default session",
+    "operation": "ensure_and_list",
+    "setup": [],
+    "input": {
+      "containers": ["zeta", "alpha", "mid"]
+    },
+    "expected": {
+      "list": ["alpha", "mid", "zeta"],
+      "boot_history_per_container": [
+        "[boot] terminal ready :: alpha",
+        "soyeht@local:~$ "
+      ]
+    }
+  },
+  {
+    "id": "ensure_container_idempotent",
+    "description": "Calling EnsureContainer twice for the same name does not duplicate it",
+    "operation": "ensure_idempotent",
+    "setup": [
+      {"op": "ensure_container", "container": "boxA"}
+    ],
+    "input": {
+      "container": "boxA"
+    },
+    "expected": {
+      "list": ["boxA"],
+      "count": 1
+    }
+  },
+  {
+    "id": "ensure_container_empty_ignored",
+    "description": "EnsureContainer with empty or whitespace-only name is silently ignored",
+    "operation": "ensure_empty",
+    "setup": [],
+    "input": {
+      "containers": ["", "  "]
+    },
+    "expected": {
+      "list": [],
+      "count": 0
+    }
+  },
+  {
+    "id": "remove_container_removes_from_list",
+    "description": "RemoveContainer removes the container from ListContainers",
+    "operation": "remove_and_list",
+    "setup": [
+      {"op": "ensure_container", "container": "keep"},
+      {"op": "ensure_container", "container": "remove_me"}
+    ],
+    "input": {
+      "container": "remove_me"
+    },
+    "expected": {
+      "list": ["keep"],
+      "count": 1
+    }
+  },
+  {
+    "id": "remove_container_cleans_sessions",
+    "description": "After RemoveContainer, RunCommand on that container returns container-not-found error",
+    "operation": "remove_then_run",
+    "setup": [
+      {"op": "ensure_container", "container": "temp"}
+    ],
+    "input": {
+      "container": "temp",
+      "command": "ls",
+      "user": "soyeht",
+      "session_id": ""
+    },
+    "expected": {
+      "error": true,
+      "error_contains": "container not found"
+    }
+  },
+  {
+    "id": "has_container_true",
+    "description": "HasContainer returns true for an existing container",
+    "operation": "has_container",
+    "setup": [
+      {"op": "ensure_container", "container": "mybox"}
+    ],
+    "input": {
+      "container": "mybox"
+    },
+    "expected": {
+      "result": true
+    }
+  },
+  {
+    "id": "has_container_false_empty",
+    "description": "HasContainer returns false when no containers exist",
+    "operation": "has_container",
+    "setup": [],
+    "input": {
+      "container": "ghost"
+    },
+    "expected": {
+      "result": false
+    }
+  },
+  {
+    "id": "has_container_false_whitespace",
+    "description": "HasContainer returns false for empty/whitespace-only name",
+    "operation": "has_container",
+    "setup": [
+      {"op": "ensure_container", "container": "real"}
+    ],
+    "input": {
+      "container": "  "
+    },
+    "expected": {
+      "result": false
+    }
+  },
+  {
+    "id": "run_command_empty_noop",
+    "description": "RunCommand with empty command is a no-op (no new lines added)",
+    "operation": "run_command",
+    "setup": [
+      {"op": "ensure_container", "container": "box1"}
+    ],
+    "input": {
+      "container": "box1",
+      "session_id": "",
+      "user": "soyeht",
+      "command": ""
+    },
+    "expected": {
+      "error": false,
+      "history_count": 2,
+      "history": [
+        "[boot] terminal ready :: box1",
+        "soyeht@local:~$ "
+      ]
+    }
+  },
+  {
+    "id": "run_command_clear_resets_history",
+    "description": "RunCommand 'clear' resets history and adds cleared + prompt lines",
+    "operation": "run_command",
+    "setup": [
+      {"op": "ensure_container", "container": "box2"}
+    ],
+    "input": {
+      "container": "box2",
+      "session_id": "",
+      "user": "soyeht",
+      "command": "clear"
+    },
+    "expected": {
+      "error": false,
+      "history": [
+        "[ok] cleared terminal box2",
+        "soyeht@local:~$ "
+      ],
+      "history_count": 2
+    }
+  },
+  {
+    "id": "run_command_success_appends_output_and_prompt",
+    "description": "RunCommand with successful exec appends command echo, output lines, and prompt",
+    "operation": "run_command_with_exec",
+    "setup": [
+      {"op": "ensure_container", "container": "box3"}
+    ],
+    "input": {
+      "container": "box3",
+      "session_id": "",
+      "user": "admin",
+      "command": "echo hello",
+      "mock_output": "hello",
+      "mock_exit_code": 0
+    },
+    "expected": {
+      "error": false,
+      "history": [
+        "[boot] terminal ready :: box3",
+        "soyeht@local:~$ ",
+        "admin@box3:~$ echo hello",
+        "hello",
+        "soyeht@local:~$ "
+      ],
+      "history_count": 5
+    }
+  },
+  {
+    "id": "run_command_nonzero_adds_exit_line",
+    "description": "RunCommand with non-zero exit code appends [exit N] line before prompt",
+    "operation": "run_command_with_exec",
+    "setup": [
+      {"op": "ensure_container", "container": "box4"}
+    ],
+    "input": {
+      "container": "box4",
+      "session_id": "",
+      "user": "admin",
+      "command": "false",
+      "mock_output": "error occurred",
+      "mock_exit_code": 1
+    },
+    "expected": {
+      "error": false,
+      "history": [
+        "[boot] terminal ready :: box4",
+        "soyeht@local:~$ ",
+        "admin@box4:~$ false",
+        "error occurred",
+        "[exit 1]",
+        "soyeht@local:~$ "
+      ],
+      "history_count": 6
+    }
+  },
+  {
+    "id": "run_command_missing_container_error",
+    "description": "RunCommand on a non-existent container returns container-not-found error",
+    "operation": "run_command",
+    "setup": [],
+    "input": {
+      "container": "no-such-box",
+      "session_id": "",
+      "user": "soyeht",
+      "command": "ls"
+    },
+    "expected": {
+      "error": true,
+      "error_contains": "container not found"
+    }
+  },
+  {
+    "id": "restart_appends_reset_and_prompt",
+    "description": "Restart appends a [restart] line and a fresh prompt",
+    "operation": "restart",
+    "setup": [
+      {"op": "ensure_container", "container": "box5"}
+    ],
+    "input": {
+      "container": "box5",
+      "session_id": ""
+    },
+    "expected": {
+      "error": false,
+      "history": [
+        "[boot] terminal ready :: box5",
+        "soyeht@local:~$ ",
+        "[restart] box5 terminal session reset",
+        "soyeht@local:~$ "
+      ],
+      "history_count": 4
+    }
+  },
+  {
+    "id": "restart_missing_container_error",
+    "description": "Restart on a non-existent container returns container-not-found error",
+    "operation": "restart",
+    "setup": [],
+    "input": {
+      "container": "no-such-box",
+      "session_id": ""
+    },
+    "expected": {
+      "error": true,
+      "error_contains": "container not found"
+    }
+  },
+  {
+    "id": "history_cap_400_lines",
+    "description": "Session history is capped at 400 lines — oldest lines are dropped",
+    "operation": "history_cap",
+    "setup": [
+      {"op": "ensure_container", "container": "capbox"}
+    ],
+    "input": {
+      "container": "capbox",
+      "session_id": "",
+      "user": "soyeht",
+      "num_commands": 200,
+      "mock_output_per_command": "line1\nline2"
+    },
+    "expected": {
+      "max_history": 400
+    }
+  },
+  {
+    "id": "list_containers_empty",
+    "description": "ListContainers returns empty slice when no containers exist",
+    "operation": "list_containers",
+    "setup": [],
+    "input": {},
+    "expected": {
+      "list": [],
+      "count": 0
+    }
+  },
+  {
+    "id": "list_containers_sorted_multiple",
+    "description": "ListContainers returns containers in sorted order after multiple adds",
+    "operation": "list_containers",
+    "setup": [
+      {"op": "ensure_container", "container": "charlie"},
+      {"op": "ensure_container", "container": "alpha"},
+      {"op": "ensure_container", "container": "bravo"}
+    ],
+    "input": {},
+    "expected": {
+      "list": ["alpha", "bravo", "charlie"],
+      "count": 3
+    }
+  },
+  {
+    "id": "start_pty_session_success",
+    "description": "StartPTYSession creates a session that appears in history",
+    "operation": "start_pty_session",
+    "setup": [
+      {"op": "ensure_container", "container": "ptybox"}
+    ],
+    "input": {
+      "container": "ptybox",
+      "session_id": ""
+    },
+    "expected": {
+      "error": false,
+      "session_exists": true
+    }
+  },
+  {
+    "id": "start_pty_session_idempotent",
+    "description": "StartPTYSession returns same session when called twice with same container/session",
+    "operation": "start_pty_session_idempotent",
+    "setup": [
+      {"op": "ensure_container", "container": "ptybox"}
+    ],
+    "input": {
+      "container": "ptybox",
+      "session_id": "sess-1"
+    },
+    "expected": {
+      "error": false,
+      "same_session": true
+    }
+  },
+  {
+    "id": "start_pty_session_missing_container",
+    "description": "StartPTYSession on non-existent container returns container-not-found error",
+    "operation": "start_pty_session",
+    "setup": [],
+    "input": {
+      "container": "ghost-box",
+      "session_id": ""
+    },
+    "expected": {
+      "error": true,
+      "error_contains": "container not found"
+    }
+  },
+  {
+    "id": "pty_snapshot_returns_lines_and_cursor",
+    "description": "PTYSnapshot returns history lines and current cursor position",
+    "operation": "pty_snapshot",
+    "setup": [
+      {"op": "ensure_container", "container": "ptybox"}
+    ],
+    "input": {
+      "container": "ptybox",
+      "session_id": ""
+    },
+    "expected": {
+      "error": false,
+      "has_lines": true,
+      "cursor_gte": 2
+    }
+  },
+  {
+    "id": "pty_poll_returns_incremental_lines",
+    "description": "PTYPoll returns only new lines since cursor position",
+    "operation": "pty_poll",
+    "setup": [
+      {"op": "ensure_container", "container": "ptybox"}
+    ],
+    "input": {
+      "container": "ptybox",
+      "session_id": "",
+      "cursor": 2,
+      "wait_ms": 0
+    },
+    "expected": {
+      "error": false,
+      "lines_count": 0,
+      "cursor_gte": 2
+    }
+  },
+  {
+    "id": "pty_write_accepts_commands",
+    "description": "PTYWrite accepts input commands and appends them to history",
+    "operation": "pty_write",
+    "setup": [
+      {"op": "ensure_container", "container": "ptybox"}
+    ],
+    "input": {
+      "container": "ptybox",
+      "session_id": "",
+      "data": "echo test\n"
+    },
+    "expected": {
+      "error": false,
+      "accepted_gte": 1
+    }
+  },
+  {
+    "id": "pty_resize_noop_success",
+    "description": "PTYResize succeeds (no-op in current implementation) for valid container/session",
+    "operation": "pty_resize",
+    "setup": [
+      {"op": "ensure_container", "container": "ptybox"}
+    ],
+    "input": {
+      "container": "ptybox",
+      "session_id": "",
+      "cols": 120,
+      "rows": 40
+    },
+    "expected": {
+      "error": false
+    }
+  },
+  {
+    "id": "pty_operations_missing_container",
+    "description": "All PTY operations on non-existent container return container-not-found error",
+    "operation": "pty_operations_error",
+    "setup": [],
+    "input": {
+      "container": "ghost-box",
+      "session_id": ""
+    },
+    "expected": {
+      "error": true,
+      "error_contains": "container not found",
+      "operations": ["snapshot", "poll", "write", "resize"]
+    }
+  },
+  {
+    "id": "get_session_history_with_session",
+    "description": "GetSessionHistory returns history for specific session ID",
+    "operation": "get_session_history",
+    "setup": [
+      {"op": "ensure_container", "container": "box6"}
+    ],
+    "input": {
+      "container": "box6",
+      "session_id": "custom-session"
+    },
+    "expected": {
+      "error": false,
+      "history_count": 2,
+      "has_boot_line": true
+    }
+  }
+]

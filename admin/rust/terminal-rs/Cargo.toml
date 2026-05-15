@@ -1,0 +1,26 @@
+[package]
+name = "terminal-rs"
+version = "0.1.11"
+edition.workspace = true
+rust-version.workspace = true
+description = "Rust implementation of the theyOS terminal manager — in-memory sessions with history cap"
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+core-rs = { workspace = true }
+pty-process  = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+base64 = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+
+[[bin]]
+name = "terminal-ipc"
+path = "src/bin/terminal_ipc.rs"
+
+[lints]
+workspace = true

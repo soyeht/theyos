@@ -1,0 +1,16 @@
+#!/usr/bin/env bash
+# Thin wrapper — delegates to `soyeht rebuild-admin`.
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
+
+BINARY="${REPO_ROOT}/admin/rust/target/debug/soyeht"
+
+if [[ -x "${BINARY}" ]]; then
+    exec "${BINARY}" rebuild-admin "$@"
+fi
+
+echo "[rebuild] soyeht binary not found. Build it first:" >&2
+echo "    cd ${REPO_ROOT}/admin/rust && cargo build -p soyeht-rs" >&2
+exit 1

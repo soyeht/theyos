@@ -1,0 +1,1089 @@
+# theyOS Claw Manifest — canonical source of truth for all supported claw types.
+#
+# This file defines every claw that theyOS knows about. At compile time, build.rs
+# in core-rs reads this file and generates:
+#   - core_rs::manifest::CATALOG (compiled-in Rust const)
+#   - claws/catalog.json (for frontend runtime)
+#
+# Fields used by the claw store (admin panel):
+#   name:          claw type identifier (the YAML key)
+#   description:   human-readable description shown in the UI
+#   language:      primary language/runtime (go, rust, python, node, zig)
+#   buildable:     true if the Rust codebase has a get_plan() entry for golden builds
+#
+# Other fields are used by the build pipeline (imagebuilder, installer plans, etc.)
+# but are NOT consumed by the claw store UI.
+
+claws:
+  picoclaw:
+    description: "Go-based lightweight AI assistant"
+    tier: supported
+    stars: 28100
+    install_plan_source: "builtin"
+    language: go
+    buildable: true
+    distribution: prebuilt
+    version: "0.2.5"
+    binary_size_mb: 30
+    min_ram_mb: 256
+    license: "MIT"
+    source_type: git
+    source: https://github.com/sipeed/picoclaw
+    ref: main
+    install_cmd: "make deps && make build"
+    binary_path: "build/picoclaw-linux-amd64"
+    run_cmd: "picoclaw gateway"
+    health_cmd: "curl -sf http://localhost:{PORT}/health || picoclaw status"
+    config_path: "/root/.picoclaw/config.json"
+    workspace_path: "/root/.picoclaw/workspace"
+    system_deps:
+      - golang-go
+      - git
+      - make
+    language_runtime: go
+    fallback_binary: "PICOCLAW_BINARY"
+
+  zeroclaw:
+    description: "Rust-based AI assistant"
+    tier: supported
+    stars: 30100
+    install_plan_source: "builtin"
+    language: rust
+    buildable: true
+    distribution: prebuilt
+    version: "0.1.9"
+    binary_size_mb: 25
+    min_ram_mb: 256
+    license: "Apache-2.0"
+    source_type: git
+    source: https://github.com/zeroclaw-labs/zeroclaw
+    ref: master
+    install_cmd: "cargo build --release --locked && cargo install --path . --force --locked"
+    binary_path: "target/release/zeroclaw"
+    run_cmd: "zeroclaw gateway"
+    health_cmd: "curl -sf http://localhost:{PORT}/health || zeroclaw status"
+    config_path: "/root/.zeroclaw/config.toml"
+    workspace_path: "/root/.zeroclaw/workspace"
+    system_deps:
+      - git
+      - build-essential
+      - pkg-config
+    language_runtime: rust
+    fallback_binary: "ZEROCLAW_BINARY"
+
+  nanobot:
+    description: "Ultra-lightweight personal AI agent in Python"
+    tier: supported
+    stars: 39400
+    install_plan_source: "builtin"
+    language: python
+    buildable: true
+    distribution: prebuilt
+    version: "0.1.5"
+    binary_size_mb: 270
+    min_ram_mb: 512
+    license: "MIT"
+    source_type: git
+    source: https://github.com/HKUDS/nanobot
+    ref: main
+    install_cmd: "pip install -e ."
+    binary_path: "$(python3 -c 'import nanobot; print(nanobot.__file__)' 2>/dev/null | xargs dirname)/../bin/nanobot || $(which nanobot)"
+    run_cmd: "nanobot gateway"
+    health_cmd: "curl -sf http://localhost:{PORT}/health || nanobot status"
+    config_path: "/root/.nanobot/config.json"
+    workspace_path: "/root/.nanobot/workspace"
+    system_deps:
+      - python3
+      - python3-pip
+      - python3-venv
+      - git
+    language_runtime: python
+    fallback_binary: "NANOBOT_BINARY"
+
+  openclaw:
+    description: "Node.js personal AI assistant"
+    tier: supported
+    stars: 357000
+    install_plan_source: "builtin"
+    language: node
+    buildable: true
+    distribution: prebuilt
+    version: "2026.4.6"
+    binary_size_mb: 2360
+    min_ram_mb: 512
+    license: "MIT"
+    source_type: git
+    source: https://github.com/openclaw/openclaw
+    ref: main
+    install_cmd: "pnpm install && pnpm build"
+    binary_path: "openclaw.mjs"
+    run_cmd: "node openclaw.mjs gateway"
+    health_cmd: "curl -sf http://localhost:{PORT}/health"
+    config_path: "/root/.openclaw/openclaw.json"
+    workspace_path: "/root/.openclaw/workspace"
+    system_deps:
+      - git
+      - curl
+    language_runtime: node
+    node_version: ">=22"
+    fallback_binary: "OPENCLAW_BINARY"
+
+  noclaw:
+    description: "AI coding environment (Claude Code, OpenCode, Codex)"
+    tier: supported
+    stars: 0
+    install_plan_source: "builtin"
+    language: none
+    buildable: true
+    distribution: prebuilt
+    version: "2.1.92"
+    binary_size_mb: 866
+    min_ram_mb: 2048
+    license: "proprietary"
+
+  nullclaw:
+    description: "Ultra-small AI assistant infrastructure in Zig"
+    tier: supported
+    stars: 7200
+    install_plan_source: "builtin"
+    language: zig
+    buildable: true
+    distribution: prebuilt
+    version: "2026.3.1"
+    binary_size_mb: 3
+    min_ram_mb: 128
+    license: "MIT"
+    source_type: git
+    source: https://github.com/nullclaw/nullclaw
+    ref: main
+    binary_path: "nullclaw-linux-x86_64.bin"
+    run_cmd: "nullclaw gateway"
+    health_cmd: "curl -sf http://localhost:{PORT}/health"
+    config_path: "/root/.nullclaw/config.json"
+    workspace_path: "/root/.nullclaw/workspace"
+    system_deps:
+      - curl
+    language_runtime: none
+    fallback_binary: "NULLCLAW_BINARY"
+
+  hermes-agent:
+    description: "Self-improving AI assistant by Nous Research"
+    tier: supported
+    stars: 76600
+    install_plan_source: "builtin"
+    language: python
+    buildable: true
+    distribution: prebuilt
+    version: "0.7.0"
+    binary_size_mb: 263
+    min_ram_mb: 1024
+    license: "MIT"
+    source_type: git
+    source: https://github.com/NousResearch/hermes-agent
+    ref: main
+    install_cmd: "pip install -e '.[all]' && npm install"
+    binary_path: "$(which hermes)"
+    run_cmd: "hermes"
+    health_cmd: "hermes --version"
+    config_path: "/root/.hermes"
+    workspace_path: "/root/.hermes/workspace"
+    system_deps:
+      - build-essential
+      - python3
+      - python3-pip
+      - python3-dev
+      - libffi-dev
+      - nodejs
+      - npm
+      - ripgrep
+      - ffmpeg
+      - git
+    language_runtime: python
+    fallback_binary: "HERMES_AGENT_BINARY"
+
+  ironclaw:
+    description: "Security-focused AI assistant in Rust"
+    tier: supported
+    stars: 11700
+    install_plan_source: "builtin"
+    language: rust
+    buildable: true
+    distribution: prebuilt
+    version: "0.12.0"
+    binary_size_mb: 73
+    min_ram_mb: 512
+    license: "Apache-2.0"
+    source_type: git
+    source: https://github.com/nearai/ironclaw
+    ref: staging
+    binary_path: "ironclaw"
+    run_cmd: "ironclaw serve"
+    health_cmd: "curl -sf http://localhost:{PORT}/health"
+    config_path: "/root/.ironclaw"
+    workspace_path: "/root/.ironclaw/workspace"
+    system_deps:
+      - curl
+    language_runtime: none
+    fallback_binary: "IRONCLAW_BINARY"
+
+  nemoclaw:
+    description: "Run OpenClaw more securely inside NVIDIA OpenShell with managed inference"
+    language: node
+    tier: catalog
+    skip_install_reason: "Requires Docker+k3s (via OpenShell gateway) — iptables/nftables not supported in Firecracker guest kernel; container DNS fails inside microVMs"
+    stars: 19186
+    source: "https://github.com/NVIDIA/NemoClaw"
+    last_updated: "2026-04-14"
+    reviewed_upstream_commit: "6020536a42f23659c7d0ef2c195693be1f5f6143"
+    reviewed_at: "2026-04-15"
+    reviewed_by: claude-sonnet-4-6
+    latest_upstream_commit: "6020536a42f23659c7d0ef2c195693be1f5f6143"
+    latest_checked_at: "2026-04-15"
+    install_template: ""
+    install_plan_source: "template:manual-shell"
+    license: "Apache-2.0"
+    binary_size_mb: 0  # TBD
+    min_ram_mb: 1024
+
+  clawwork:
+    description: "OpenClaw as Your AI Coworker — AI agents pay for their own tokens and earn income by completing GDPVal tasks, with a React dashboard tracking survival metrics."
+    language: python
+    tier: available
+    stars: 7954
+    source: "https://github.com/HKUDS/ClawWork"
+    last_updated: "2026-03-03"
+    reviewed_upstream_commit: "9c73ac05fdb0bffdb23febdd971eb70f44dd46eb"
+    reviewed_at: "2026-04-14"
+    reviewed_by: claude-opus-4-6
+    latest_upstream_commit: "9c73ac05fdb0bffdb23febdd971eb70f44dd46eb"
+    latest_checked_at: "2026-04-14"
+    install_template: manual-shell
+    install_plan_source: "template:manual-shell"
+    license: "MIT"
+    binary_size_mb: 0  # TBD
+    min_ram_mb: 2048
+    install:
+      # Ubuntu 24.04 ships PyJWT 2.7.0 via apt; it has no RECORD file so pip
+      # cannot uninstall it when requirements.txt pulls a newer version.
+      # Using a venv avoids the system-package namespace entirely — clean install
+      # with no Debian-managed packages visible.
+      # The React dashboard (frontend/) is a separate UI; the FastAPI backend
+      # (server.py) runs independently, so we skip the npm build to stay well
+      # inside the 1800s SSH install ceiling.
+      # Runtime requires OPENAI_API_KEY + E2B_API_KEY; verify injects placeholders.
+      manual_script: |
+        set -euxo pipefail
+        export DEBIAN_FRONTEND=noninteractive
+        apt-get update
+        apt-get install -y git python3 python3-venv
+        mkdir -p /opt
+        git clone --depth 1 https://github.com/HKUDS/ClawWork.git /opt/clawwork
+        python3 -m venv /opt/clawwork-venv
+        /opt/clawwork-venv/bin/pip install --quiet -r /opt/clawwork/requirements.txt
+        cat > /usr/local/bin/clawwork <<'SHIM'
+        #!/bin/sh
+        export OPENAI_API_KEY="${OPENAI_API_KEY:-sk-verify-placeholder}"
+        export E2B_API_KEY="${E2B_API_KEY:-verify-placeholder}"
+        cd /opt/clawwork && exec /opt/clawwork-venv/bin/python server.py "$@"
+        SHIM
+        chmod +x /usr/local/bin/clawwork
+
+  clawx:
+    description: "ClawX is a desktop app that provides a graphical interface for OpenClaw AI agents. It turns CLI-based AI orchestration into a desktop experience without using the terminal. China website is https://clawx.com.cn."
+    language: node
+    tier: catalog
+    skip_install_reason: "Electron desktop app — requires X11/Wayland display server; cannot run headlessly in a VM sandbox."
+    stars: 6485
+    source: "https://github.com/ValueCell-ai/ClawX"
+    last_updated: "2026-04-15"
+    reviewed_upstream_commit: "6acd8acf5aa3433003277a380f95692e674380b3"
+    reviewed_at: "2026-04-15"
+    reviewed_by: claude-sonnet-4-6
+    latest_upstream_commit: "6acd8acf5aa3433003277a380f95692e674380b3"
+    latest_checked_at: "2026-04-15"
+    install_template: ""
+    install_plan_source: "template:manual-shell"
+    # run_cmd intentionally absent (defaults to ""): Electron requires X11/Wayland to
+    # start; the binary is verified by install-only mode (no 60s soak). Users who want
+    # a display can use X11 forwarding or a VNC session. The bundled openclaw CLI
+    # (/usr/local/bin/openclaw) works headlessly and is also installed by the post-install hook.
+    license: "MIT"
+    binary_size_mb: 300
+    min_ram_mb: 1024
+
+  nanoclaw:
+    description: "A lightweight alternative to OpenClaw that runs in containers for security. Connects to WhatsApp, Telegram, Slack, Discord, Gmail and other messaging apps, has memory, scheduled jobs, and runs directly on Anthropic's Agents SDK"
+    language: node
+    tier: catalog
+    skip_install_reason: "Locked to Anthropic Agents SDK — no OpenRouter or alternative provider support; also requires Docker/Apple Container at runtime."
+    stars: 27257
+    source: "https://github.com/qwibitai/nanoclaw"
+    last_updated: "2026-04-14"
+    reviewed_upstream_commit: "934f063aff5c30e7b49ce58b53b41901d3472a3e"
+    reviewed_at: "2026-04-14"
+    reviewed_by: claude-opus-4-6
+    latest_upstream_commit: "934f063aff5c30e7b49ce58b53b41901d3472a3e"
+    latest_checked_at: "2026-04-14"
+    install_template: ""
+    install_plan_source: "template:manual-shell"
+    license: "MIT"
+    binary_size_mb: 0  # TBD
+    min_ram_mb: 2048
+
+  mimiclaw:
+    description: "MimiClaw: Run OpenClaw on a $5 chip. No OS(Linux). No Node.js. No Mac mini. No Raspberry Pi. No VPS. Hardware agents OS."
+    language: none
+    tier: catalog
+    stars: 5170
+    skip_install_reason: "ESP32-S3 firmware built with ESP-IDF — embedded microcontroller target, not a Linux server."
+    source: "https://github.com/memovai/mimiclaw"
+    last_updated: "2026-03-17"
+    reviewed_upstream_commit: "bb10ea0149080d506d920c09054f4c5b20409de2"
+    reviewed_at: "2026-04-14"
+    reviewed_by: claude-opus-4-6
+    latest_upstream_commit: "bb10ea0149080d506d920c09054f4c5b20409de2"
+    latest_checked_at: "2026-04-14"
+    install_template: ""
+    license: "MIT"
+    binary_size_mb: 0  # TBD
+    min_ram_mb: 512
+    # needs_manual: "no recognizable build system"
+
+  zclaw:
+    description: "Your personal AI assistant at all-in 888KiB (~35KB in app code). Running on an ESP32. GPIO, cron, custom tools, memory, and more."
+    language: none
+    tier: catalog
+    stars: 2071
+    skip_install_reason: "ESP32-C3 firmware — embedded microcontroller target (Seeed XIAO board), not a Linux server."
+    source: "https://github.com/tnm/zclaw"
+    last_updated: "2026-03-23"
+    reviewed_upstream_commit: "0ae82f1c4423f80bc96f06dc3bbff3812e7438b8"
+    reviewed_at: "2026-04-14"
+    reviewed_by: claude-opus-4-6
+    latest_upstream_commit: "0ae82f1c4423f80bc96f06dc3bbff3812e7438b8"
+    latest_checked_at: "2026-04-14"
+    install_template: ""
+    license: "MIT"
+    binary_size_mb: 0  # TBD
+    min_ram_mb: 512
+    # needs_manual: "no recognizable build system"
+
+  droidclaw:
+    description: "turn old phones into ai agents - give it a goal in plain english. it reads the screen, thinks about what to do, taps and types via adb, and repeats until the job is done. "
+    language: none
+    tier: catalog
+    stars: 1381
+    skip_install_reason: "Android Tasker-style workflow JSON (package.json describes a workflow, not an npm package). Not installable as a Linux daemon."
+    source: "https://github.com/unitedbyai/droidclaw"
+    last_updated: "2026-02-28"
+    reviewed_upstream_commit: "c7c991933e4a0c03cec6044aa7fb9067d391f4d4"
+    reviewed_at: "2026-04-14"
+    reviewed_by: claude-opus-4-6
+    latest_upstream_commit: "c7c991933e4a0c03cec6044aa7fb9067d391f4d4"
+    latest_checked_at: "2026-04-14"
+    install_template: ""
+    license: "unknown"
+    binary_size_mb: 0  # TBD
+    min_ram_mb: 512
+    # needs_manual: "no recognizable build system"
+
+  edgeclaw:
+    description: "EdgeClaw: Edge-Cloud Collaborative Personal AI Assistant based on OpenClaw"
+    language: node
+    tier: available
+    stars: 1186
+    source: "https://github.com/OpenBMB/EdgeClaw"
+    last_updated: "2026-04-10"
+    reviewed_upstream_commit: "d2d3553de5e5b8496eb5ce99b837bfaadce87462"
+    reviewed_at: "2026-04-14"
+    reviewed_by: claude-opus-4-6
+    latest_upstream_commit: "d2d3553de5e5b8496eb5ce99b837bfaadce87462"
+    latest_checked_at: "2026-04-14"
+    install_template: node-package
+    install_plan_source: "template:node-package"
+    license: "MIT"
+    binary_size_mb: 0  # TBD
+    min_ram_mb: 512
+    install:
+      npm_package: "openclaw"
+      entry_point: "openclaw"
+
+  claw-empire:
+    description: "Command Your AI Agent Empire from the CEO Desk — A local-first AI agent office simulator that orchestrates CLI, OAuth, and API-connected agents (Claude Code, Codex CLI, Gemini CLI, OpenCode, and more) as a virtual autonomous company."
+    language: node
+    tier: available
+    stars: 1073
+    source: "https://github.com/GreenSheep01201/claw-empire"
+    last_updated: "2026-03-16"
+    reviewed_upstream_commit: "66a24ea7df2435ef897c48c147deb7ec572c01c2"
+    reviewed_at: "2026-04-14"
+    reviewed_by: claude-opus-4-6
+    latest_upstream_commit: "66a24ea7df2435ef897c48c147deb7ec572c01c2"
+    latest_checked_at: "2026-04-14"
+    install_template: manual-shell
+    install_plan_source: "template:manual-shell"
+    license: "Apache-2.0"
+    binary_size_mb: 0  # TBD
+    min_ram_mb: 2048
+    install:
+      # Node 22+ + pnpm. pnpm install / pnpm run build / tsx server serves
+      # on port 8800. Upstream Dockerfile also globally installs
+      # @anthropic-ai/claude-code, @openai/codex, @google/gemini-cli,
+      # opencode-ai — those are runtime deps for the orchestrator; we
+      # install them too so the server doesn't crash on boot.
+      manual_script: |
+        set -euxo pipefail
+        export DEBIAN_FRONTEND=noninteractive
+        curl -fsSL https://deb.nodesource.com/setup_22.x | bash -
+        apt-get install -y git nodejs
+        npm install -g pnpm @anthropic-ai/claude-code @openai/codex @google/gemini-cli opencode-ai
+        mkdir -p /opt
+        git clone --depth 1 https://github.com/GreenSheep01201/claw-empire.git /opt/claw-empire
+        cd /opt/claw-empire
+        pnpm install --frozen-lockfile
+        pnpm run build
+        cat > /usr/local/bin/claw-empire <<'SHIM'
+        #!/bin/bash
+        export HOST="${HOST:-0.0.0.0}"
+        export ANTHROPIC_API_KEY="${ANTHROPIC_API_KEY:-sk-verify-placeholder}"
+        cd /opt/claw-empire && exec pnpm start "$@"
+        SHIM
+        chmod +x /usr/local/bin/claw-empire
+
+  dr-claw:
+    description: "A Super AI Lab with massive AI Doctors as Assistants. Best IDE for Research via AI Power. "
+    language: node
+    tier: available
+    stars: 858
+    source: "https://github.com/OpenLAIR/dr-claw"
+    last_updated: "2026-04-13"
+    reviewed_upstream_commit: "298c4ddf6c9497024104be81dcedf3d312b0e17d"
+    reviewed_at: "2026-04-14"
+    reviewed_by: claude-opus-4-6
+    latest_upstream_commit: "298c4ddf6c9497024104be81dcedf3d312b0e17d"
+    latest_checked_at: "2026-04-14"
+    install_template: node-package
+    install_plan_source: "template:node-package"
+    license: "NOASSERTION"
+    binary_size_mb: 0  # TBD
+    min_ram_mb: 1024
+    install:
+      # node-gyp build of node-pty transitive dep needs distutils (removed from
+      # Python 3.12 stdlib on Ubuntu 24.04). python3-setuptools provides a
+      # vendored distutils; build-essential + python3-dev give the compiler
+      # toolchain node-gyp invokes.
+      npm_package: "dr-claw"
+      entry_point: "dr-claw"
+      system_deps: ["python3-setuptools", "python3-dev", "build-essential"]
+
+  rt-claw:
+    description: "Making AI Assistants Cheap Again!"
+    language: c
+    tier: available
+    stars: 818
+    source: "https://github.com/zevorn/rt-claw"
+    last_updated: "2026-03-31"
+    reviewed_upstream_commit: "5811922c4886cb5e90a5908fff792665e913ca48"
+    reviewed_at: "2026-04-15"
+    reviewed_by: claude-sonnet-4-6
+    latest_upstream_commit: "5811922c4886cb5e90a5908fff792665e913ca48"
+    latest_checked_at: "2026-04-15"
+    install_template: manual-shell
+    install_plan_source: "template:manual-shell"
+    license: "MIT"
+    binary_size_mb: 0  # TBD
+    min_ram_mb: 512
+    install:
+      # rt-claw uses Meson + libcurl. The Ubuntu 24.04 apt packages ship libcurl4
+      # but pkg-config is not installed by default — meson finds libcurl via pkgconfig,
+      # so we must also install pkg-config or the dependency lookup fails.
+      # Builds the linux OSAL target (platform/linux/rtclaw) and installs to PATH.
+      manual_script: |
+        set -euxo pipefail
+        export DEBIAN_FRONTEND=noninteractive
+        apt-get update
+        apt-get install -y git meson ninja-build gcc libcurl4-openssl-dev ca-certificates pkg-config
+        git clone --depth 1 https://github.com/zevorn/rt-claw.git /opt/rt-claw
+        cd /opt/rt-claw
+        meson setup build/linux -Dosal=linux
+        meson compile -C build/linux
+        install -m755 build/linux/platform/linux/rtclaw /usr/local/bin/rt-claw
+      entry_point: "rt-claw"
+
+  microclaw:
+    description: "🦀An agentic AI assistant that lives in your chats, inspired by nanoclaw and incorporating some of its design ideas. Built with Rust 🦀"
+    language: rust
+    tier: catalog
+    skip_install_reason: "Full install (apt + Node 22 via NodeSource + rustup + cargo install with Vite web build + heavy LLM/observability crates like opentelemetry, serenity, teloxide, ratatui, reqwest) exceeds the 1800s SSH install ceiling. Compile was progressing at 180%% CPU, just genuinely too large. Would need cargo's CARGO_TARGET_DIR warm cache across verify runs or a higher SSH timeout to fit in one pass."
+    stars: 649
+    source: "https://github.com/microclaw/microclaw"
+    last_updated: "2026-04-12"
+    reviewed_upstream_commit: "92134ea651aa14a3b7dd53901dc16ebff15d34ea"
+    reviewed_at: "2026-04-14"
+    reviewed_by: claude-opus-4-6
+    latest_upstream_commit: "92134ea651aa14a3b7dd53901dc16ebff15d34ea"
+    latest_checked_at: "2026-04-14"
+    license: "MIT"
+    binary_size_mb: 0  # TBD
+    min_ram_mb: 2048
+
+  clawlet:
+    description: "Ultra-lightweight and efficient personal AI assistant"
+    language: none
+    tier: catalog
+    skip_install_reason: "Upstream publishes only Darwin x86_64 tarball (clawlet_Darwin_x86_64.tar.gz). No Linux binary released; cannot run inside x86_64 Ubuntu Firecracker VM."
+    stars: 606
+    source: "https://github.com/mosaxiv/clawlet"
+    last_updated: "2026-03-24"
+    reviewed_upstream_commit: "c6ea754c8932c16591a973d30a97abb26b9a12a6"
+    reviewed_at: "2026-04-14"
+    reviewed_by: claude-opus-4-6
+    latest_upstream_commit: "c6ea754c8932c16591a973d30a97abb26b9a12a6"
+    latest_checked_at: "2026-04-14"
+    install_template: ""
+    license: "MIT"
+    binary_size_mb: 0  # TBD
+    min_ram_mb: 512
+
+  zeptoclaw:
+    description: "AI coding agent — 32 tools, 9 providers, 9 channels. The agent runtime that ZeptoRT supervises."
+    language: rust
+    tier: available
+    stars: 588
+    source: "https://github.com/qhkm/zeptoclaw"
+    last_updated: "2026-04-14"
+    reviewed_upstream_commit: "11156f40e9dbb05e1cb955fdc24c19a0155d2836"
+    reviewed_at: "2026-04-14"
+    reviewed_by: claude-opus-4-6
+    latest_upstream_commit: "11156f40e9dbb05e1cb955fdc24c19a0155d2836"
+    latest_checked_at: "2026-04-14"
+    install_template: cargo-build
+    install_plan_source: "template:cargo-build"
+    license: "Apache-2.0"
+    binary_size_mb: 0  # TBD
+    min_ram_mb: 2048
+    install:
+      github_repo: "qhkm/zeptoclaw"
+      binary_name: "zeptoclaw"
+
+  rosclaw:
+    description: "ROS2 meets OpenClaw — bridges ROS2 robot state and actions into an OpenClaw agent loop."
+    language: node
+    tier: catalog
+    skip_install_reason: "Requires a running ROS2 stack (docker compose) at runtime — not available in the VM sandbox."
+    stars: 480
+    source: "https://github.com/PlaiPin/rosclaw"
+    last_updated: "2026-03-03"
+    reviewed_upstream_commit: "98e7874d1dda17edaf33a5a1eb91309b9a6116c9"
+    reviewed_at: "2026-04-14"
+    reviewed_by: claude-opus-4-6
+    latest_upstream_commit: "98e7874d1dda17edaf33a5a1eb91309b9a6116c9"
+    latest_checked_at: "2026-04-14"
+    install_template: ""
+    install_plan_source: "template:manual-shell"
+    license: "Apache-2.0"
+    binary_size_mb: 0  # TBD
+    min_ram_mb: 2048
+
+  n8n-claw:
+    description: "OpenClaw-inspired autonomous AI agent built entirely in n8n. Adaptive RAG-powered memory, Skills via MCP templates, Expert Agents with delegated sub-agents, proactive task management, media understanding - self-hosted with one setup script"
+    language: node
+    tier: available
+    stars: 377
+    source: "https://github.com/freddy-schuetz/n8n-claw"
+    last_updated: "2026-04-14"
+    reviewed_upstream_commit: "e605c0e4f97f644cb180f9cd915ffd6ab9f3a923"
+    reviewed_at: "2026-04-15"
+    reviewed_by: claude-sonnet-4-6
+    latest_upstream_commit: "e605c0e4f97f644cb180f9cd915ffd6ab9f3a923"
+    latest_checked_at: "2026-04-15"
+    install_template: manual-shell
+    install_plan_source: "template:manual-shell"
+    license: "unknown"
+    binary_size_mb: 0  # TBD
+    min_ram_mb: 512
+    install:
+      # n8n-claw is a workflow pack that runs inside the n8n automation platform.
+      # The n8n CLI is published to npm and installs cleanly via npm -g.
+      # Ubuntu Noble ships Node 18 by default; n8n 2.x requires Node 22+, so we
+      # install from NodeSource. --legacy-peer-deps suppresses zod peer conflicts
+      # in n8n 2.16+ that otherwise block the install.
+      # upstream setup.sh is interactive (Telegram token, API key, domain, SSL) so
+      # we skip it and install the engine only — workflows are imported at runtime.
+      manual_script: |
+        set -euxo pipefail
+        export DEBIAN_FRONTEND=noninteractive
+        apt-get update
+        apt-get install -y ca-certificates curl gnupg
+        curl -fsSL https://deb.nodesource.com/setup_22.x | bash -
+        apt-get install -y nodejs
+        npm install -g n8n --legacy-peer-deps
+      entry_point: "n8n"
+
+  hermitclaw:
+    description: "A tiny AI creature that lives in a folder on your computer — pixel-art room, dreaming cycle, personality genome from keyboard entropy."
+    language: python
+    tier: available
+    stars: 319
+    source: "https://github.com/brendanhogan/hermitclaw"
+    last_updated: "2026-02-17"
+    reviewed_upstream_commit: "2b69414969e66702f4aad50e0b09594cc26ccd11"
+    reviewed_at: "2026-04-14"
+    reviewed_by: claude-opus-4-6
+    latest_upstream_commit: "2b69414969e66702f4aad50e0b09594cc26ccd11"
+    latest_checked_at: "2026-04-14"
+    install_template: manual-shell
+    install_plan_source: "template:manual-shell"
+    license: "unknown"
+    binary_size_mb: 0  # TBD
+    min_ram_mb: 1024
+    install:
+      # pyproject.toml has no [project.scripts]; we install with `pip install -e .`
+      # and write a PATH shim that cds into the cloned repo before exec'ing main.
+      # OPENAI_API_KEY is required at runtime — verify soak will crash without it.
+      manual_script: |
+        set -euxo pipefail
+        export DEBIAN_FRONTEND=noninteractive
+        apt-get update
+        apt-get install -y git python3 python3-pip python3-venv nodejs npm
+        mkdir -p /opt
+        git clone --depth 1 https://github.com/brendanhogan/hermitclaw.git /opt/hermitclaw
+        cd /opt/hermitclaw
+        pip3 install --break-system-packages -e .
+        cd frontend && npm install && npm run build && cd ..
+        cat > /usr/local/bin/hermitclaw <<'SHIM'
+        #!/bin/bash
+        export OPENAI_API_KEY="${OPENAI_API_KEY:-sk-verify-placeholder}"
+        cd /opt/hermitclaw && exec python3 hermitclaw/main.py "$@"
+        SHIM
+        chmod +x /usr/local/bin/hermitclaw
+
+  myclaw:
+    description: "Your own personal AI assistant. Any OS. Any Platform. mini clawbot."
+    language: go
+    tier: available
+    stars: 262
+    source: "https://github.com/stellarlinkco/myclaw"
+    last_updated: "2026-03-15"
+    reviewed_upstream_commit: "7b1f24cdd292b0b532862b69957eecc036b5da19"
+    reviewed_at: "2026-04-14"
+    reviewed_by: claude-opus-4-6
+    latest_upstream_commit: "7b1f24cdd292b0b532862b69957eecc036b5da19"
+    latest_checked_at: "2026-04-14"
+    install_template: manual-shell
+    install_plan_source: "template:manual-shell"
+    license: "unknown"
+    binary_size_mb: 0  # TBD
+    min_ram_mb: 1024
+    install:
+      # v0.6.2 ships no prebuilt assets on GitHub releases — build from
+      # source with the upstream Makefile. Smoke test uses `myclaw gateway`
+      # (channel + cron loop); runtime wants MYCLAW_API_KEY.
+      manual_script: |
+        set -euxo pipefail
+        export DEBIAN_FRONTEND=noninteractive
+        apt-get update
+        apt-get install -y git golang-go make
+        mkdir -p /opt
+        git clone --depth 1 https://github.com/stellarlinkco/myclaw.git /opt/myclaw
+        cd /opt/myclaw
+        make build-release
+        install -m 0755 ./myclaw /usr/local/bin/myclaw-bin
+        cat > /usr/local/bin/myclaw <<'SHIM'
+        #!/bin/bash
+        export MYCLAW_API_KEY="${MYCLAW_API_KEY:-verify-placeholder}"
+        cd /opt/myclaw && exec /usr/local/bin/myclaw-bin gateway "$@"
+        SHIM
+        chmod +x /usr/local/bin/myclaw
+
+  kkclaw:
+    description: "🦞 一个可爱的桌面龙虾AI助手 - Desktop lobster pet with OpenClaw AI, Edge TTS voice, and emotion animations"
+    language: node
+    tier: catalog
+    skip_install_reason: "Electron desktop app with Edge TTS — requires X11/Wayland display server; cannot run headlessly in a VM sandbox."
+    stars: 155
+    source: "https://github.com/kk43994/kkclaw"
+    last_updated: "2026-04-14"
+    reviewed_upstream_commit: "0e1879befe5327fa71762b98a999502f0e3fcbfd"
+    reviewed_at: "2026-04-15"
+    reviewed_by: claude-sonnet-4-6
+    latest_upstream_commit: "0e1879befe5327fa71762b98a999502f0e3fcbfd"
+    latest_checked_at: "2026-04-15"
+    install_template: ""
+    install_plan_source: "template:node-package"
+    license: "NOASSERTION"
+    binary_size_mb: 0  # TBD
+    min_ram_mb: 512
+
+  safeclaw:
+    description: "Safeclaw is the alternative to openclaw.. You can naturally chat with it via text and voice, and you can choose not to use a language model., By default it picks up on intent and semantics..  No prompt injection while you get over ninety percent of what openclaw does plus tts and voice to text  "
+    language: python
+    tier: available
+    stars: 130
+    source: "https://github.com/princezuda/safeclaw"
+    last_updated: "2026-03-25"
+    reviewed_upstream_commit: "2b66b88dc6b5d6fc88f10ab544df6e4dae2b30c3"
+    reviewed_at: "2026-04-14"
+    reviewed_by: claude-opus-4-6
+    latest_upstream_commit: "2b66b88dc6b5d6fc88f10ab544df6e4dae2b30c3"
+    latest_checked_at: "2026-04-14"
+    install_template: pip-package
+    install_plan_source: "template:pip-package"
+    license: "MIT"
+    binary_size_mb: 0  # TBD
+    min_ram_mb: 512
+    install:
+      pip_package: "safeclaw"
+      entry_point: "safeclaw"
+
+  subzeroclaw:
+    description: "Minimal C AI agent (~54KB) with watchdog, OpenRouter-backed. Skills live in ~/.subzeroclaw/skills."
+    language: c
+    tier: available
+    stars: 119
+    source: "https://github.com/jmlago/subzeroclaw"
+    last_updated: "2026-04-08"
+    reviewed_upstream_commit: "1d203dd4a896b02d521b300431c9127f2917d10a"
+    reviewed_at: "2026-04-14"
+    reviewed_by: claude-opus-4-6
+    latest_upstream_commit: "1d203dd4a896b02d521b300431c9127f2917d10a"
+    latest_checked_at: "2026-04-14"
+    install_template: manual-shell
+    install_plan_source: "template:manual-shell"
+    license: "MIT"
+    binary_size_mb: 0  # TBD
+    min_ram_mb: 512
+    install:
+      # Tiny C binary — upstream Makefile does `make && make install` into
+      # ~/.local/bin; we redirect to /usr/local/bin for smoke discovery.
+      manual_script: |
+        set -euxo pipefail
+        export DEBIAN_FRONTEND=noninteractive
+        apt-get update
+        apt-get install -y git build-essential libcjson-dev
+        mkdir -p /opt ~/.subzeroclaw/skills
+        git clone --depth 1 https://github.com/jmlago/subzeroclaw.git /opt/subzeroclaw
+        cd /opt/subzeroclaw
+        make
+        install -m 0755 ./subzeroclaw /usr/local/bin/subzeroclaw
+        cat > ~/.subzeroclaw/config <<'CFG'
+        api_key = "sk-or-verify-placeholder"
+        model = "minimax/minimax-m2.5"
+        CFG
+
+  xsafeclaw:
+    description: "Introducing XSafeClaw: The Open-Source Agent Safety Platform from Fudan University"
+    language: python
+    tier: available
+    stars: 108
+    source: "https://github.com/XSafeAI/XSafeClaw"
+    last_updated: "2026-04-14"
+    reviewed_upstream_commit: "6e0532fdbacd8ed1cd76c5d9c13ff732b2d52eb6"
+    reviewed_at: "2026-04-14"
+    reviewed_by: claude-opus-4-6
+    latest_upstream_commit: "6e0532fdbacd8ed1cd76c5d9c13ff732b2d52eb6"
+    latest_checked_at: "2026-04-14"
+    install_template: pip-package
+    install_plan_source: "template:pip-package"
+    license: "MIT"
+    binary_size_mb: 0  # TBD
+    min_ram_mb: 512
+    install:
+      pip_package: "xsafeclaw"
+      entry_point: "xsafeclaw"
+
+  supaclaw:
+    description: "A basic version of OpenClaw but built entirely on Supabase built-in features."
+    language: none
+    tier: catalog
+    stars: 58
+    skip_install_reason: "Supabase-native stack — needs Supabase CLI, Deno, Docker Desktop, ngrok tunnel, Telegram bot. Doesn't fit a self-contained Firecracker VM."
+    source: "https://github.com/vincenzodomina/supaclaw"
+    last_updated: "2026-03-15"
+    reviewed_upstream_commit: "db4abb083248a9265e58b29dbec4256cf0e3a074"
+    reviewed_at: "2026-04-14"
+    reviewed_by: claude-opus-4-6
+    latest_upstream_commit: "db4abb083248a9265e58b29dbec4256cf0e3a074"
+    latest_checked_at: "2026-04-14"
+    install_template: ""
+    license: "MIT"
+    binary_size_mb: 0  # TBD
+    min_ram_mb: 512
+    # needs_manual: "no recognizable build system"
+
+  epsiclaw:
+    description: "The Karpathy treatment for OpenClaw - stripped to ε. 515 lines of Python, 6 files, one dependency."
+    language: python
+    tier: available
+    stars: 45
+    source: "https://github.com/dorringel/epsiclaw"
+    last_updated: "2026-03-26"
+    reviewed_upstream_commit: "475147f68fb1fb951b2f5b8bc96b3a58f075c340"
+    reviewed_at: "2026-04-14"
+    reviewed_by: claude-opus-4-6
+    latest_upstream_commit: "475147f68fb1fb951b2f5b8bc96b3a58f075c340"
+    latest_checked_at: "2026-04-14"
+    install_template: manual-shell
+    install_plan_source: "template:manual-shell"
+    license: "MIT"
+    binary_size_mb: 0  # TBD
+    min_ram_mb: 512
+    install:
+      # Single-file Python agent — `pip install httpx` + `python agent.py`.
+      # Runtime requires OPENAI_API_KEY + TELEGRAM_BOT_TOKEN; verify soak
+      # will fail without them unless sandbox injects placeholders.
+      manual_script: |
+        set -euxo pipefail
+        export DEBIAN_FRONTEND=noninteractive
+        apt-get update
+        apt-get install -y git python3 python3-pip
+        mkdir -p /opt
+        git clone --depth 1 https://github.com/dorringel/epsiclaw.git /opt/epsiclaw
+        cd /opt/epsiclaw
+        pip3 install --break-system-packages httpx
+        cat > /usr/local/bin/epsiclaw <<'SHIM'
+        #!/bin/bash
+        export OPENAI_API_KEY="${OPENAI_API_KEY:-sk-verify-placeholder}"
+        export TELEGRAM_BOT_TOKEN="${TELEGRAM_BOT_TOKEN:-verify-placeholder}"
+        cd /opt/epsiclaw && exec python3 agent.py "$@"
+        SHIM
+        chmod +x /usr/local/bin/epsiclaw
+
+  geneclaw:
+    description: "Self-evolving AI agent framework with 5-layer safety gatekeeper. Agents observe failures, propose fixes, and safely apply them. Built on HKUDS/nanobot."
+    language: python
+    tier: available
+    stars: 35
+    source: "https://github.com/Clawland-AI/Geneclaw"
+    last_updated: "2026-02-18"
+    reviewed_upstream_commit: "59d1c356cdb227d419f8b060abd38693da010499"
+    reviewed_at: "2026-04-14"
+    reviewed_by: claude-opus-4-6
+    latest_upstream_commit: "59d1c356cdb227d419f8b060abd38693da010499"
+    latest_checked_at: "2026-04-14"
+    install_template: pip-package
+    install_plan_source: "template:pip-package"
+    license: "MIT"
+    binary_size_mb: 0  # TBD
+    min_ram_mb: 512
+    install:
+      pip_package: "nanobot-ai"
+      entry_point: "nanobot"
+
+  shibaclaw:
+    description: "🛡️ Self-hosted AI agent with 5-layer prompt injection protection. Multi-channel, parallel agents, MCP, Docker-ready, LLM-agnostic."
+    language: python
+    tier: available
+    stars: 28
+    source: "https://github.com/RikyZ90/ShibaClaw"
+    last_updated: "2026-04-14"
+    reviewed_upstream_commit: "5590d59df6105bdca64fec086fd0ddbfcfc57e0b"
+    reviewed_at: "2026-04-14"
+    reviewed_by: claude-opus-4-6
+    latest_upstream_commit: "5590d59df6105bdca64fec086fd0ddbfcfc57e0b"
+    latest_checked_at: "2026-04-14"
+    install_template: pip-package
+    install_plan_source: "template:pip-package"
+    license: "MIT"
+    binary_size_mb: 0  # TBD
+    min_ram_mb: 512
+    install:
+      pip_package: "shibaclaw"
+      entry_point: "shibaclaw"
+
+  sharpclaw:
+    description: "AI agent with long-term memory, built on .NET 10. Supports Anthropic, OpenAI, and Gemini, featuring a Python WASM sandbox for secure code execution."
+    language: none
+    tier: catalog
+    skip_install_reason: "Upstream publishes only linux-arm64 zip (sharpclaw-linux-arm64.zip). VM is x86_64; no compatible binary available."
+    stars: 22
+    source: "https://github.com/imxcstar/sharpclaw"
+    last_updated: "2026-03-30"
+    reviewed_upstream_commit: "c8f34ec30105b1f7d91355bb442234799e17624b"
+    reviewed_at: "2026-04-14"
+    reviewed_by: claude-opus-4-6
+    latest_upstream_commit: "c8f34ec30105b1f7d91355bb442234799e17624b"
+    latest_checked_at: "2026-04-14"
+    install_template: ""
+    license: "MIT"
+    binary_size_mb: 0  # TBD
+    min_ram_mb: 512
+
+  clawdroid:
+    description: "Android AI assistant with an embedded Go backend. Install the APK, launch, and start chatting — no separate server setup needed. "
+    language: none
+    tier: catalog
+    stars: 10
+    skip_install_reason: "Android APK — targets Android, not Linux. Cannot boot inside a Firecracker Ubuntu VM."
+    source: "https://github.com/KarakuriAgent/clawdroid"
+    last_updated: "2026-03-21"
+    reviewed_upstream_commit: "ab6eceadf8bada54a5b3ebc2f78d07f6ffb7b580"
+    reviewed_at: "2026-04-14"
+    reviewed_by: claude-opus-4-6
+    latest_upstream_commit: "ab6eceadf8bada54a5b3ebc2f78d07f6ffb7b580"
+    latest_checked_at: "2026-04-14"
+    install_template: ""
+    license: "NOASSERTION"
+    binary_size_mb: 0  # TBD
+    min_ram_mb: 512
+    # needs_manual: "Makefile install target detected"
+
+  angel-claw:
+    description: "Lean. Compatible. Based OpenClaw. Python ❤️"
+    language: python
+    tier: available
+    stars: 6
+    source: "https://github.com/Abdur-rahmaanJ/angel-claw"
+    last_updated: "2026-04-10"
+    reviewed_upstream_commit: "1c66aeea338c46fb6debbcb387fa9e6f7ef3febd"
+    reviewed_at: "2026-04-14"
+    reviewed_by: claude-opus-4-6
+    latest_upstream_commit: "1c66aeea338c46fb6debbcb387fa9e6f7ef3febd"
+    latest_checked_at: "2026-04-14"
+    install_template: manual-shell
+    install_plan_source: "template:manual-shell"
+    license: "Apache-2.0"
+    binary_size_mb: 0  # TBD
+    min_ram_mb: 512
+    install:
+      # angel-claw is published on PyPI. neonize transitive dep pins protobuf>=6.32.1
+      # (too loose), so pip may land on an older protobuf that mismatches the
+      # gencode (7.34.1) baked into neonize's generated pb2 files — force >=7.30.
+      # libmagic1 is needed at runtime by the python-magic dep neonize pulls in.
+      manual_script: |
+        set -euxo pipefail
+        export DEBIAN_FRONTEND=noninteractive
+        apt-get update
+        apt-get install -y python3 python3-venv pipx git libmagic1
+        pipx install --force angel-claw
+        pipx inject angel-claw "protobuf>=7.30,<8"
+        ln -sf /root/.local/bin/angel-claw /usr/local/bin/angel-claw
+        /usr/local/bin/angel-claw --help 2>&1 | head -20 || true
+
+  claude-claw:
+    description: "OpenClaw-inspired enhancements for Claude Code: multi-agent safety, session continuity, task management, and memory architecture"
+    language: none
+    tier: catalog
+    stars: 5
+    skip_install_reason: "Claude Code plugin, not a server daemon — installed via `claude plugin install --url https://github.com/andrehuang/claude-claw`. Does not fit the Firecracker VM smoke-test model."
+    source: "https://github.com/andrehuang/claude-claw"
+    last_updated: "2026-03-28"
+    reviewed_upstream_commit: "84a99521be61177ec77f2ef1a453fee2865b20e5"
+    reviewed_at: "2026-04-14"
+    reviewed_by: claude-opus-4-6
+    latest_upstream_commit: "84a99521be61177ec77f2ef1a453fee2865b20e5"
+    latest_checked_at: "2026-04-14"
+    install_template: ""
+    license: "MIT"
+    binary_size_mb: 0  # TBD
+    min_ram_mb: 512
+    # needs_manual: "no recognizable build system"
+
+  openclawbox:
+    description: "ClawBox plug-and-play AI appliance powered by CheapRouter + Clawland-Fleet. OpenAI-compatible gateway with 38+ models, smart routing, auto-failover, fleet management, and OTA."
+    language: none
+    tier: catalog
+    skip_install_reason: "Upstream scripts/install.sh (CheapRouter bootstrap) still runs past the 1800s SSH install ceiling even after we install Node 22 ahead of it. It does heavy model/config/setup work that exceeds 30min in a clean VM."
+    stars: 4
+    source: "https://github.com/Clawland-AI/OpenclawBox"
+    last_updated: "2026-02-23"
+    reviewed_upstream_commit: "894deb4d3b64f86d156e8c08aa7ae7f784c24b98"
+    reviewed_at: "2026-04-14"
+    reviewed_by: claude-opus-4-6
+    latest_upstream_commit: "894deb4d3b64f86d156e8c08aa7ae7f784c24b98"
+    latest_checked_at: "2026-04-14"
+    license: "Apache-2.0"
+    binary_size_mb: 0  # TBD
+    min_ram_mb: 1024
+
+  loki-claw:
+    description: "Your own personal AI assistant. Any OS. Any Platform. The Loki way. "
+    language: node
+    tier: available
+    stars: 0
+    source: "https://github.com/asklokesh/loki-claw"
+    last_updated: "2026-02-16"
+    reviewed_upstream_commit: "4088c0b89d01caace4574ce83354c5f2239cfcb7"
+    reviewed_at: "2026-04-14"
+    reviewed_by: claude-opus-4-6
+    latest_upstream_commit: "4088c0b89d01caace4574ce83354c5f2239cfcb7"
+    latest_checked_at: "2026-04-14"
+    install_template: node-package
+    install_plan_source: "template:node-package"
+    license: "MIT"
+    binary_size_mb: 0  # TBD
+    min_ram_mb: 512
+    install:
+      npm_package: "openclaw"
+      entry_point: "openclaw"
+
+  clawarm:
+    description: "Robotic arm controled via OpenClaw. Natural language to motion. Where Openclaw having arm"
+    language: python
+    tier: catalog
+    skip_install_reason: "Upstream pyproject.toml is broken in three places: (1) build-backend `setuptools.backends._legacy:_Backend` doesn't exist, (2) duplicate license info rejected under PEP 639, (3) flat-layout with 7 top-level dirs (setup/bridge/skills/config/assets/plugin/workspace) breaks setuptools auto-discovery. Patching 3 things in install plan is worse than catalog."
+    stars: 7
+    source: "https://github.com/Clawland-AI/Clawarm"
+    last_updated: "2026-02-22"
+    reviewed_upstream_commit: "527d4f3246274bf71fa9b16f6ff8e67d9a5df777"
+    reviewed_at: "2026-04-14"
+    reviewed_by: claude-opus-4-6
+    latest_upstream_commit: "527d4f3246274bf71fa9b16f6ff8e67d9a5df777"
+    latest_checked_at: "2026-04-14"
+    license: "MIT"
+    binary_size_mb: 0  # TBD
+    min_ram_mb: 512
+
+  tinyagi:
+    description: "TinyAGI is the agent teams orchestrator for One Person Company. (fka TinyClaw)"
+    language: node
+    tier: catalog
+    skip_install_reason: "npm package `tinyagi` ships no `bin` field — it is a library, not a CLI. Same cause as nemoclaw."
+    stars: 3507
+    source: "https://github.com/TinyAGI/tinyagi"
+    last_updated: "2026-03-30"
+    reviewed_upstream_commit: "2db3a03a891b302c460f624d6c5a0523b8aa3528"
+    reviewed_at: "2026-04-14"
+    reviewed_by: claude-opus-4-6
+    latest_upstream_commit: "2db3a03a891b302c460f624d6c5a0523b8aa3528"
+    latest_checked_at: "2026-04-14"
+    install_template: ""
+    license: "MIT"
+    binary_size_mb: 0  # TBD
+    min_ram_mb: 512
+
+  rivonclaw:
+    description: "RivonClaw is an easy-mode runtime and UI layer built on top of OpenClaw, designed to turn long-lived AI agents into personal digital butlers."
+    language: node
+    tier: catalog
+    skip_install_reason: "pnpm install + pnpm build with OpenClaw vendored (setup-vendor.sh clones all of OpenClaw into /opt/rivonclaw/vendor/openclaw) exceeds the 1800s SSH install ceiling. Two verify runs confirmed: one failed around 25min with an ERR_SOCKET_TIMEOUT on npmjs, the second at 30:00 timeout still compiling — the build is genuinely too large for a single-pass clean install."
+    stars: 252
+    source: "https://github.com/gaoyangz77/rivonclaw"
+    last_updated: "2026-04-14"
+    reviewed_upstream_commit: "23180f5a35999dcf473840c25b20982d8808d763"
+    reviewed_at: "2026-04-14"
+    reviewed_by: claude-opus-4-6
+    latest_upstream_commit: "23180f5a35999dcf473840c25b20982d8808d763"
+    latest_checked_at: "2026-04-14"
+    license: "NOASSERTION"
+    binary_size_mb: 0  # TBD
+    min_ram_mb: 4096
+
+  legacypodclaw:
+    description: "AI Assistant for iOS 6 — native Objective-C port of OpenClaw for jailbroken devices. System-level integration via MobileSubstrate."
+    language: none
+    tier: catalog
+    stars: 5
+    skip_install_reason: "iOS 6.0–6.1.6 MobileSubstrate tweak (.deb) — targets jailbroken iPhones, not Linux."
+    source: "https://github.com/wrxck/LegacyPodClaw"
+    last_updated: "2026-03-30"
+    reviewed_upstream_commit: "d9524b366419e53c46c2c865afa18d654c5276aa"
+    reviewed_at: "2026-04-14"
+    reviewed_by: claude-opus-4-6
+    latest_upstream_commit: "d9524b366419e53c46c2c865afa18d654c5276aa"
+    latest_checked_at: "2026-04-14"
+    install_template: ""
+    license: "MIT"
+    binary_size_mb: 0  # TBD
+    min_ram_mb: 512
+    # needs_manual: "no recognizable build system"

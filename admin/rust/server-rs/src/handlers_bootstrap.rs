@@ -1,0 +1,1060 @@
+//! Bootstrap endpoints: `/bootstrap/*` and `/health`.
+//!
+//! These handlers are always live — even on a fresh, uninitialized engine.
+//! They power the onboarding state machine that replaces the legacy
+//! `theyos install` CLI flow (FR-002..FR-004).
+//!
+//! Routes exported:
+//! - `GET  /bootstrap/status`                 — onboarding state machine (T009)
+//! - `POST /bootstrap/initialize`             — mint the casa identity (T025, FR-003)
+//! - `POST /bootstrap/claim-setup-invitation` — iPhone-first scenario B claim (T053, FR-005)
+//! - `GET  /health`                           — liveness probe (T010)
+
+use std::net::SocketAddr;
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::time::Instant;
+
+use axum::{
+    Json, Router,
+    body::Bytes,
+    extract::{ConnectInfo, State},
+    http::{HeaderMap, HeaderValue, StatusCode, header},
+    response::{IntoResponse, Response},
+    routing::{get, post},
+};
+
+use crate::setup_invitation::SetupInvitationCache;
+use household_rs::HouseholdAuthState;
+use household_rs::bootstrap::{BootstrapOpts, KeyBackingPolicy, bootstrap_or_load};
+use household_rs::bootstrap_state::{self, BootstrapState};
+use household_rs::household_record::validate_household_name;
+use household_rs::keys::{P256PublicKey, P256Signature, verify_signature};
+use household_rs::pair_device::PairDeviceWindow;
+use serde::{Deserialize, Serialize};
+use serde_bytes::ByteBuf;
+use tokio::sync::RwLock;
+use tokio::time::Duration;
+use tracing::info;
+
+use crate::household_state::{HouseholdState, SharedHouseholdIdentity};
+
+// ── Shared state ──────────────────────────────────────────────────────────────
+
+/// State visible to all bootstrap handlers.
+#[derive(Clone)]
+pub struct BootstrapHandlerState {
+    /// Current onboarding state. Written by initialize / teardown / pairing
+    /// finalize handlers; read by every handler in this module.
+    pub bootstrap: Arc<RwLock<BootstrapState>>,
+    /// Household identity (loaded after pairing completes, or on boot if
+    /// state dir already has identity).
+    pub household: HouseholdState,
+    /// Absolute path to the engine state directory.
+    pub state_dir: PathBuf,
+    /// Wall-clock instant when the engine process started (for `uptime_secs`).
+    pub started_at: Instant,
+    /// Pair-device window for minting the first pairing QR after initialize.
+    pub pair_device_window: Arc<PairDeviceWindow>,
+    /// In-memory cache of discovered `_soyeht-setup._tcp.` invitations from
+    /// iPhones (scenario B `AirDrop` flow). Populated by the Bonjour browser task;
+    /// consumed by `POST /bootstrap/claim-setup-invitation` (T053).
+    pub setup_invitation_cache: SetupInvitationCache,
+}
+
+pub type BootstrapStateArc = Arc<RwLock<BootstrapState>>;
+
+impl BootstrapHandlerState {
+    #[must_use]
+    pub fn new(
+        bootstrap: BootstrapStateArc,
+        household: HouseholdState,
+        state_dir: PathBuf,
+        pair_device_window: Arc<PairDeviceWindow>,
+    ) -> Self {
+        Self {
+            bootstrap,
+            household,
+            state_dir,
+            pair_device_window,
+            started_at: Instant::now(),
+            setup_invitation_cache: crate::setup_invitation::new_cache(),
+        }
+    }
+}
+
+// ── Router ────────────────────────────────────────────────────────────────────
+
+/// Wire the bootstrap router. The returned `Router` MUST be merged into the
+/// top-level app **before** the auth middleware layer so these endpoints are
+/// accessible without a session token.
+pub fn bootstrap_router(state: BootstrapHandlerState) -> Router {
+    Router::new()
+        .route("/bootstrap/status", get(get_bootstrap_status))
+        .route("/bootstrap/initialize", post(post_initialize))
+        .route(
+            "/bootstrap/claim-setup-invitation",
+            post(post_claim_setup_invitation),
+        )
+        .route("/bootstrap/teardown", post(post_teardown))
+        .route("/health", get(get_health))
+        .route("/healthz", get(get_health))
+        .with_state(state)
+}
+
+// ── Request / response types ───────────────────────────────────────────────────
+
+#[derive(Deserialize)]
+struct InitializeRequest {
+    #[serde(rename = "v")]
+    version: u8,
+    name: String,
+}
+
+#[derive(Serialize)]
+struct InitializeResponse {
+    #[serde(rename = "v")]
+    version: u8,
+    hh_id: String,
+    hh_pub: ByteBuf,
+    name: String,
+    pair_qr_uri: String,
+    created_at: u64,
+}
+
+#[derive(Serialize)]
+struct InitializeError<'a> {
+    #[serde(rename = "v")]
+    version: u8,
+    error: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    state: Option<&'a str>,
+}
+
+fn cbor_error(
+    status: StatusCode,
+    error: &str,
+    reason: Option<String>,
+    state: Option<&str>,
+) -> Response {
+    let body = InitializeError {
+        version: 1,
+        error,
+        reason,
+        state,
+    };
+    let bytes = household_rs::cbor::to_canonical_vec(&body).unwrap_or_default();
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/cbor"),
+    );
+    (status, headers, bytes).into_response()
+}
+
+// ── Teardown types ────────────────────────────────────────────────────────────
+
+/// Fields the iPhone signs — everything in `TeardownRequest` except `signature`.
+#[derive(Serialize, Deserialize)]
+struct TeardownPayload {
+    #[serde(rename = "v")]
+    version: u8,
+    op: String,
+    hh_id: String,
+    m_id: String,
+    nonce: ByteBuf,
+    ts: u64,
+    signed_by: ByteBuf,
+}
+
+/// Full teardown wire shape; `signature` covers canonical CBOR of `TeardownPayload`.
+#[derive(Serialize, Deserialize)]
+struct TeardownRequest {
+    #[serde(rename = "v")]
+    version: u8,
+    op: String,
+    hh_id: String,
+    m_id: String,
+    nonce: ByteBuf,
+    ts: u64,
+    signed_by: ByteBuf,
+    signature: ByteBuf,
+}
+
+#[derive(Serialize)]
+struct TeardownAck {
+    #[serde(rename = "v")]
+    version: u8,
+    torn_at: u64,
+}
+
+// ── Claim-setup-invitation types ──────────────────────────────────────────────
+
+#[derive(Deserialize)]
+struct ClaimSetupInvitationRequest {
+    #[serde(rename = "v")]
+    version: u8,
+    token: serde_bytes::ByteBuf,
+    iphone_apns_token: Option<serde_bytes::ByteBuf>,
+}
+
+#[derive(Serialize)]
+struct ClaimSetupInvitationAck {
+    #[serde(rename = "v")]
+    version: u8,
+    iphone_endpoint: String,
+    owner_display_name: String,
+    hh_id: Option<String>,
+}
+
+fn claim_cbor_error(status: StatusCode, error: &str) -> Response {
+    let bytes = household_rs::cbor::to_canonical_vec(&InitializeError {
+        version: 1,
+        error,
+        reason: None,
+        state: None,
+    })
+    .unwrap_or_default();
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/cbor"),
+    );
+    (status, headers, bytes).into_response()
+}
+
+fn cbor_ok(body: impl serde::Serialize) -> Response {
+    match household_rs::cbor::to_canonical_vec(&body) {
+        Ok(bytes) => {
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                header::CONTENT_TYPE,
+                HeaderValue::from_static("application/cbor"),
+            );
+            (StatusCode::OK, headers, bytes).into_response()
+        }
+        Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    }
+}
+
+// ── Response types ─────────────────────────────────────────────────────────────
+
+#[derive(Serialize)]
+struct BootstrapStatusResponse {
+    v: u8,
+    state: &'static str,
+    version: &'static str,
+    platform: &'static str,
+    host_label: String,
+    uptime_secs: u64,
+    hh_id: Option<String>,
+    device_count: u32,
+}
+
+#[derive(Serialize)]
+struct HealthResponse {
+    status: &'static str,
+    service: &'static str,
+    version: &'static str,
+    platform: &'static str,
+}
+
+// ── Handlers ─────────────────────────────────────────────────────────────────
+
+/// `GET /bootstrap/status` — poll-friendly onboarding state machine report.
+///
+/// Contract: `specs/005-soyeht-onboarding/contracts/bootstrap-status.md`
+///
+/// No auth required. Response MUST be served in <200 ms per the contract
+/// (this handler is I/O-free on the hot path — all state is in-memory).
+#[allow(clippy::cast_possible_truncation)]
+pub async fn get_bootstrap_status(State(state): State<BootstrapHandlerState>) -> impl IntoResponse {
+    let t0 = Instant::now();
+    let bootstrap_state = *state.bootstrap.read().await;
+    let uptime_secs = state.started_at.elapsed().as_secs();
+
+    let (hh_id, device_count) = hh_info(&state.household, bootstrap_state).await;
+
+    let body = BootstrapStatusResponse {
+        v: 1,
+        state: bootstrap_state.as_str(),
+        version: env!("CARGO_PKG_VERSION"),
+        platform: current_platform(),
+        host_label: detect_host_label(),
+        uptime_secs,
+        hh_id,
+        device_count,
+    };
+
+    // elapsed_ms: u128→u64 truncation impossible in practice (u64 covers ~585 millennia).
+    #[allow(clippy::cast_possible_truncation)]
+    let elapsed_ms = t0.elapsed().as_millis() as u64;
+    tracing::info!(
+        stage = "bootstrap.status.served",
+        elapsed_ms,
+        state = bootstrap_state.as_str(),
+    );
+
+    (StatusCode::OK, Json(body))
+}
+
+/// `GET /health` / `GET /healthz` — liveness probe.
+///
+/// Returns 200 OK if the engine process is alive and the HTTP stack is
+/// serving requests. No dependency checks — this MUST always respond, even
+/// during bootstrap (the app uses it as a dead-man's-switch check).
+pub async fn get_health(_: State<BootstrapHandlerState>) -> impl IntoResponse {
+    let body = HealthResponse {
+        status: "ok",
+        service: "soyeht-engine",
+        version: env!("CARGO_PKG_VERSION"),
+        platform: current_platform(),
+    };
+    (StatusCode::OK, Json(body))
+}
+
+/// `POST /bootstrap/claim-setup-invitation` — iPhone-first scenario B claim (T053).
+///
+/// Contract: `specs/005-soyeht-onboarding/contracts/setup-invitation.md`
+///
+/// No auth required. Token must match a Bonjour-discovered `_soyeht-setup._tcp.`
+/// advertisement, not be expired, and survive a callback ping to the iPhone.
+pub async fn post_claim_setup_invitation(
+    State(state): State<BootstrapHandlerState>,
+    body: Bytes,
+) -> Response {
+    use crate::setup_invitation::{
+        cache_purge_expired, cache_reinsert_if_absent, cache_take, callback_verify_blocking,
+        persist_invitation,
+    };
+
+    // 1. State gate — must be uninitialized.
+    {
+        let current = state.bootstrap.read().await;
+        if !matches!(
+            *current,
+            household_rs::bootstrap_state::BootstrapState::Uninitialized
+        ) {
+            return claim_cbor_error(StatusCode::CONFLICT, "already_initialized");
+        }
+    }
+
+    // 2. Decode CBOR.
+    let req: ClaimSetupInvitationRequest = match household_rs::cbor::from_canonical_slice(&body) {
+        Ok(r) => r,
+        Err(_) => return claim_cbor_error(StatusCode::BAD_REQUEST, "invalid_request"),
+    };
+    if req.version != 1 {
+        return claim_cbor_error(StatusCode::BAD_REQUEST, "invalid_request");
+    }
+
+    // 3. Token shape check — exactly 32 bytes.
+    let Ok(token): Result<[u8; 32], _> = req.token.as_ref().try_into() else {
+        return claim_cbor_error(StatusCode::BAD_REQUEST, "invalid_request");
+    };
+
+    // 4. Atomic cache take — removes the entry in one lock acquire so concurrent
+    //    callers with the same token get None immediately (closes replay window).
+    //    Look up before purging so expired entries return 404 not 401.
+    let now = crate::time_util::unix_now_secs_checked("claim_setup_invitation.clock").unwrap_or(0);
+    let Some(entry) = cache_take(&state.setup_invitation_cache, &token).await else {
+        tracing::warn!(
+            stage = "claim_setup_invitation.rejected",
+            reason = "token_not_in_cache",
+        );
+        return claim_cbor_error(StatusCode::UNAUTHORIZED, "invitation_not_recognized");
+    };
+
+    // 5. TTL check — distinct error from "not found". Entry already removed; don't re-insert.
+    if now >= entry.expires_at {
+        tracing::warn!(
+            stage = "claim_setup_invitation.rejected",
+            reason = "token_expired",
+            expires_at = entry.expires_at,
+        );
+        return claim_cbor_error(StatusCode::NOT_FOUND, "invitation_expired");
+    }
+
+    // Opportunistic cleanup of other expired entries; does not affect this request.
+    cache_purge_expired(&state.setup_invitation_cache, now).await;
+
+    // 6. Callback verify — blocking HTTP to iPhone. Re-insert on failure so the
+    //    client can retry (transient network error, not a replay attack).
+    let iphone_endpoint = entry.iphone_endpoint.clone();
+    let token_for_verify = token;
+    if let Err(e) = tokio::task::spawn_blocking(move || {
+        callback_verify_blocking(&iphone_endpoint, &token_for_verify)
+    })
+    .await
+    .unwrap_or_else(|e| Err(format!("task failed: {e}")))
+    {
+        tracing::warn!(
+            stage = "claim_setup_invitation.rejected",
+            reason = "callback_verify_failed",
+            error = %e,
+        );
+        cache_reinsert_if_absent(&state.setup_invitation_cache, entry).await;
+        return claim_cbor_error(StatusCode::UNAUTHORIZED, "invitation_not_recognized");
+    }
+
+    // 7. Persist invitation to disk. Re-insert on failure (disk error is transient).
+    let apns_token: Option<[u8; 32]> = req
+        .iphone_apns_token
+        .as_ref()
+        .and_then(|t| t.as_ref().try_into().ok());
+    if let Err(e) = persist_invitation(&state.state_dir, &entry, apns_token) {
+        tracing::error!(
+            stage = "claim_setup_invitation.persist_failed",
+            error = %e,
+        );
+        cache_reinsert_if_absent(&state.setup_invitation_cache, entry).await;
+        return claim_cbor_error(StatusCode::INTERNAL_SERVER_ERROR, "internal_error");
+    }
+
+    // Entry already removed by cache_take; no separate remove needed.
+
+    tracing::info!(
+        stage = "claim_setup_invitation.accepted",
+        iphone_endpoint = %entry.iphone_endpoint,
+        has_apns_token = apns_token.is_some(),
+    );
+
+    cbor_ok(ClaimSetupInvitationAck {
+        version: 1,
+        iphone_endpoint: entry.iphone_endpoint,
+        owner_display_name: entry.owner_display_name,
+        hh_id: entry.hh_id,
+    })
+}
+
+/// `POST /bootstrap/teardown` — atomic casa destruction (T077, FR-004).
+///
+/// Contract: `specs/005-soyeht-onboarding/contracts/bootstrap-teardown.md`
+///
+/// No session auth — owner biometric + cert chain serves as authentication.
+/// Validation follows the 14-step contract order; steps 6+9 are merged into one
+/// atomic `check_and_persist` (burns nonce before cert/sig checks to prevent
+/// probing different `signed_by` values with the same nonce).
+pub async fn post_teardown(State(state): State<BootstrapHandlerState>, body: Bytes) -> Response {
+    // Step 1: State gate.
+    let current_bs = *state.bootstrap.read().await;
+    match current_bs {
+        BootstrapState::NamedAwaitingPair | BootstrapState::Ready | BootstrapState::Recovering => {}
+        other => {
+            tracing::warn!(
+                stage = "teardown.rejected",
+                reason = "no_household",
+                state = other.as_str()
+            );
+            return cbor_error(
+                StatusCode::CONFLICT,
+                "no_household_to_teardown",
+                None,
+                Some(other.as_str()),
+            );
+        }
+    }
+
+    // Step 2: CBOR re-encode check — decode + canonical re-encode must be byte-equal.
+    let req: TeardownRequest = if let Ok(r) = household_rs::cbor::from_canonical_slice(&body) {
+        r
+    } else {
+        tracing::warn!(stage = "teardown.rejected", reason = "cbor_decode_failed");
+        return cbor_error(StatusCode::BAD_REQUEST, "invalid_request", None, None);
+    };
+    let Ok(re_encoded) = household_rs::cbor::to_canonical_vec(&req) else {
+        return cbor_error(StatusCode::BAD_REQUEST, "invalid_request", None, None);
+    };
+    if re_encoded != body.as_ref() {
+        tracing::warn!(
+            stage = "teardown.rejected",
+            reason = "cbor_reencode_mismatch"
+        );
+        return cbor_error(StatusCode::BAD_REQUEST, "invalid_request", None, None);
+    }
+
+    // Step 3: op constant check.
+    if req.op != "teardown" {
+        tracing::warn!(stage = "teardown.rejected", reason = "op_mismatch", op = %req.op);
+        return cbor_error(StatusCode::BAD_REQUEST, "invalid_request", None, None);
+    }
+
+    // Step 4: Field shape checks.
+    let Ok(signed_by_bytes): Result<[u8; 33], _> = req.signed_by.as_ref().try_into() else {
+        return cbor_error(StatusCode::BAD_REQUEST, "invalid_request", None, None);
+    };
+    let Ok(d_pub) = P256PublicKey::from_bytes(&signed_by_bytes) else {
+        return cbor_error(StatusCode::BAD_REQUEST, "invalid_request", None, None);
+    };
+    let Ok(nonce_bytes): Result<[u8; 32], _> = req.nonce.as_ref().try_into() else {
+        return cbor_error(StatusCode::BAD_REQUEST, "invalid_request", None, None);
+    };
+    let Ok(sig_bytes): Result<[u8; 64], _> = req.signature.as_ref().try_into() else {
+        return cbor_error(StatusCode::BAD_REQUEST, "invalid_request", None, None);
+    };
+    let Ok(sig) = P256Signature::from_bytes(&sig_bytes) else {
+        return cbor_error(StatusCode::BAD_REQUEST, "invalid_request", None, None);
+    };
+
+    // Validate hh_id / m_id against this engine's live identity.
+    let Some(identity) = state.household.current().await else {
+        tracing::error!(stage = "teardown.identity_unavailable");
+        return cbor_error(
+            StatusCode::CONFLICT,
+            "no_household_to_teardown",
+            None,
+            Some(current_bs.as_str()),
+        );
+    };
+    if req.hh_id != identity.record.hh_id.as_str() {
+        return cbor_error(StatusCode::BAD_REQUEST, "invalid_request", None, None);
+    }
+    if req.m_id != identity.cert.m_id.as_str() {
+        return cbor_error(StatusCode::BAD_REQUEST, "invalid_request", None, None);
+    }
+
+    // Step 5: ts skew — |now − ts| ≤ 300 s.
+    let now_unix = crate::time_util::unix_now_secs_checked("teardown.clock").unwrap_or(0);
+    // Unix timestamps (seconds since 1970) fit comfortably in i64 until year ~2554.
+    #[allow(clippy::cast_possible_wrap)]
+    let skew = (now_unix as i64) - (req.ts as i64);
+    if skew.abs() > 300 {
+        tracing::warn!(
+            stage = "teardown.rejected",
+            reason = "ts_skew",
+            skew_secs = skew
+        );
+        return cbor_error(StatusCode::UNAUTHORIZED, "unauthorized", None, None);
+    }
+
+    // Steps 6 + 9: atomic nonce check-and-persist (burns nonce before cert/sig checks).
+    let state_dir_nonce = state.state_dir.clone();
+    match tokio::task::spawn_blocking(move || {
+        crate::nonce_cache::check_and_persist(&state_dir_nonce, &nonce_bytes, now_unix)
+    })
+    .await
+    {
+        Ok(Ok(())) => {
+            // Opportunistic cleanup — fire-and-forget; does not block the request.
+            let sd = state.state_dir.clone();
+            let ts = now_unix;
+            let _handle = tokio::task::spawn_blocking(move || crate::nonce_cache::cleanup(&sd, ts));
+        }
+        Ok(Err(crate::nonce_cache::NonceError::AlreadyUsed)) => {
+            tracing::warn!(stage = "teardown.rejected", reason = "nonce_replay");
+            return cbor_error(StatusCode::UNAUTHORIZED, "unauthorized", None, None);
+        }
+        Ok(Err(crate::nonce_cache::NonceError::Io(e))) => {
+            tracing::error!(stage = "teardown.nonce_io_error", error = %e);
+            return cbor_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal_error",
+                None,
+                None,
+            );
+        }
+        Err(e) => {
+            tracing::error!(stage = "teardown.nonce_task_failed", error = %e);
+            return cbor_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal_error",
+                None,
+                None,
+            );
+        }
+    }
+
+    // Steps 7–8: Skip cert+sig check when NamedAwaitingPair — no owner cert
+    // has been issued yet, so there is no key material to validate. The nonce
+    // + ts skew checks above are sufficient anti-replay for a fresh-start reset.
+    if current_bs != BootstrapState::NamedAwaitingPair {
+        // Step 7: Owner cert chain validation.
+        let record_for_auth = identity.record.clone();
+        let hh_pub = record_for_auth.hh_pub.clone();
+        let state_dir_auth = state.state_dir.clone();
+        let auth = match tokio::task::spawn_blocking(move || {
+            HouseholdAuthState::load_optional(&state_dir_auth, &record_for_auth, now_unix)
+        })
+        .await
+        {
+            Ok(Ok(Some(a))) => a,
+            Ok(Ok(None)) => {
+                tracing::warn!(stage = "teardown.rejected", reason = "no_owner_auth_state");
+                return cbor_error(StatusCode::UNAUTHORIZED, "unauthorized", None, None);
+            }
+            Ok(Err(e)) => {
+                tracing::error!(stage = "teardown.auth_load_failed", error = %e);
+                return cbor_error(StatusCode::UNAUTHORIZED, "unauthorized", None, None);
+            }
+            Err(e) => {
+                tracing::error!(stage = "teardown.auth_task_failed", error = %e);
+                return cbor_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "internal_error",
+                    None,
+                    None,
+                );
+            }
+        };
+        if let Err(e) =
+            crate::owner_cert_auth::verify_owner_cert(&auth, &signed_by_bytes, &hh_pub, now_unix)
+        {
+            tracing::warn!(stage = "teardown.rejected", reason = "cert_invalid", error = %e);
+            return cbor_error(StatusCode::UNAUTHORIZED, "unauthorized", None, None);
+        }
+
+        // Step 8: Signature verification over canonical CBOR of TeardownPayload.
+        let payload = TeardownPayload {
+            version: req.version,
+            op: req.op.clone(),
+            hh_id: req.hh_id.clone(),
+            m_id: req.m_id.clone(),
+            nonce: req.nonce.clone(),
+            ts: req.ts,
+            signed_by: req.signed_by.clone(),
+        };
+        let Ok(msg_bytes) = household_rs::cbor::to_canonical_vec(&payload) else {
+            return cbor_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal_error",
+                None,
+                None,
+            );
+        };
+        if let Err(e) = verify_signature(&d_pub, &msg_bytes, &sig) {
+            tracing::warn!(stage = "teardown.rejected", reason = "signature_invalid", error = %e);
+            return cbor_error(StatusCode::UNAUTHORIZED, "unauthorized", None, None);
+        }
+    }
+
+    // Step 10: Atomic household dir teardown — rename then async rm -rf.
+    let hh_dir = household_rs::storage::household_dir(&state.state_dir);
+    let tearing_down = state.state_dir.join("household.tearing-down");
+    if hh_dir.exists() {
+        if let Err(e) = std::fs::rename(&hh_dir, &tearing_down) {
+            tracing::error!(stage = "teardown.rename_failed", error = %e);
+            return cbor_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal_error",
+                None,
+                None,
+            );
+        }
+        let td = tearing_down.clone();
+        tokio::spawn(async move {
+            if let Err(e) = tokio::fs::remove_dir_all(&td).await {
+                tracing::warn!(stage = "teardown.rmrf_failed", error = %e, path = ?td);
+            }
+        });
+    }
+    crate::setup_invitation::clear_persisted_invitation(&state.state_dir);
+
+    // Step 11: Persist bootstrap state = uninitialized. If persist fails, return
+    // 500 and leave `household.tearing-down/` as a recovery breadcrumb — on next
+    // boot the engine detects it and completes the teardown (R5-F).
+    if let Err(e) = bootstrap_state::persist(&state.state_dir, BootstrapState::Uninitialized) {
+        tracing::error!(stage = "teardown.state_persist_failed", error = %e);
+        return cbor_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "internal_error",
+            None,
+            None,
+        );
+    }
+
+    // Clear in-memory identity so no stale cert material is reachable after
+    // teardown (R5-B). Do this before flipping the state flag.
+    state.household.clear().await;
+    *state.bootstrap.write().await = BootstrapState::Uninitialized;
+
+    // Steps 12-13 bridge: schedule process exit so listener unbind + Bonjour
+    // revert happen automatically on next boot. Exit is delayed 100 ms to allow
+    // the response to flush. Not compiled in test builds: process::exit kills
+    // the test binary when teardown_contract tests call this handler in-process.
+    // Full graceful shutdown via axum::serve(...).with_graceful_shutdown() is
+    // tracked as future work (T091).
+    #[cfg(not(test))]
+    tokio::spawn(async {
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        std::process::exit(0);
+    });
+
+    tracing::info!(
+        stage = "teardown.complete",
+        hh_id = %req.hh_id,
+        m_id = %req.m_id,
+        torn_at = now_unix,
+    );
+
+    cbor_ok(TeardownAck {
+        version: 1,
+        torn_at: now_unix,
+    })
+}
+
+/// `POST /bootstrap/initialize` — mint the casa identity (FR-003, T025).
+///
+/// Contract: `specs/005-soyeht-onboarding/contracts/bootstrap-initialize.md`
+///
+/// State gate: engine must be in `uninitialized` or `ready_for_naming`.
+/// All other states → 409. On success, state advances to `named_awaiting_pair`
+/// and the pair-device window opens for the first owner-pairing QR.
+///
+/// T054: When a setup invitation is pending, the source IP MUST be the
+/// iPhone's Tailnet address. 403 with `{v:1, error:"tailnet_required"}` otherwise.
+pub async fn post_initialize(
+    State(state): State<BootstrapHandlerState>,
+    req: axum::extract::Request,
+) -> Response {
+    let t0 = Instant::now();
+
+    // T054: Source IP guard when a setup invitation is pending.
+    // Check before reading the body to return the error early.
+    if let Ok(Some(invitation)) =
+        crate::setup_invitation::load_persisted_invitation(&state.state_dir)
+    {
+        let src_ip = req
+            .extensions()
+            .get::<ConnectInfo<SocketAddr>>()
+            .map(|ci| ci.0.ip());
+        match src_ip {
+            None => {
+                return cbor_error(StatusCode::FORBIDDEN, "tailnet_required", None, None);
+            }
+            Some(ip) => {
+                if let Err(reason) =
+                    crate::setup_invitation::validate_initialize_source(&invitation, ip).await
+                {
+                    tracing::warn!(
+                        stage = "bootstrap.initialize.rejected",
+                        reason = reason,
+                        src_ip = %ip,
+                    );
+                    return cbor_error(StatusCode::FORBIDDEN, "tailnet_required", None, None);
+                }
+            }
+        }
+    }
+
+    // Extract body bytes from the request.
+    let Ok(body) = axum::body::to_bytes(req.into_body(), 1024 * 64).await else {
+        return cbor_error(StatusCode::BAD_REQUEST, "invalid_cbor", None, None);
+    };
+
+    // 1. Decode CBOR request.
+    let req: InitializeRequest = match household_rs::cbor::from_canonical_slice(&body) {
+        Ok(r) => r,
+        Err(_) => {
+            return cbor_error(StatusCode::BAD_REQUEST, "invalid_cbor", None, None);
+        }
+    };
+    if req.version != 1 {
+        return cbor_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_cbor",
+            Some("unsupported v".into()),
+            None,
+        );
+    }
+
+    // 2. Name sanitize.
+    let name = req.name.trim().to_string();
+    if let Err(e) = validate_household_name(&name) {
+        return cbor_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_name",
+            Some(e.to_string()),
+            None,
+        );
+    }
+
+    // 3. State gate (read first for fast rejection).
+    {
+        let current = state.bootstrap.read().await;
+        match *current {
+            BootstrapState::Uninitialized | BootstrapState::ReadyForNaming => {}
+            other => {
+                return cbor_error(
+                    StatusCode::CONFLICT,
+                    "already_initialized",
+                    None,
+                    Some(other.as_str()),
+                );
+            }
+        }
+    }
+
+    // 4. Keygen + persist (blocking I/O — run off the async executor).
+    let state_dir = state.state_dir.clone();
+    let opts = BootstrapOpts {
+        household_name: name.clone(),
+        hostname_label: None,
+    };
+    let policy = KeyBackingPolicy::from_env();
+    let t_keygen = Instant::now();
+    let loaded = match tokio::task::spawn_blocking(move || {
+        bootstrap_or_load(&state_dir, opts, policy)
+    })
+    .await
+    {
+        Ok(Ok(id)) => id,
+        Ok(Err(e)) => {
+            tracing::error!(stage = "bootstrap.initialize_failed", error = %e);
+            return cbor_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "keygen_failed",
+                None,
+                None,
+            );
+        }
+        Err(e) => {
+            tracing::error!(stage = "bootstrap.initialize_task_failed", error = %e);
+            return cbor_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "keygen_failed",
+                None,
+                None,
+            );
+        }
+    };
+    // u128→u64 truncation impossible in practice (u64 covers ~585 millennia).
+    #[allow(clippy::cast_possible_truncation)]
+    let keygen_ms = t_keygen.elapsed().as_millis() as u64;
+
+    let hh_id = loaded.record.hh_id.to_string();
+    let hh_pub_bytes: [u8; 33] = *loaded.record.hh_pub.as_bytes();
+    let created_at = loaded.record.created_at;
+    let name_persisted = loaded.record.name.clone();
+    let machine_id = loaded.cert.m_id.to_string();
+
+    // 5. Advance bootstrap state to named_awaiting_pair.
+    {
+        let mut bs = state.bootstrap.write().await;
+        *bs = BootstrapState::NamedAwaitingPair;
+        let state_dir = state.state_dir.clone();
+        if let Err(e) = bootstrap_state::persist(&state_dir, BootstrapState::NamedAwaitingPair) {
+            tracing::error!(stage = "bootstrap.state_persist_failed", error = %e);
+        }
+    }
+
+    // 6. Update HouseholdState in memory.
+    state
+        .household
+        .set_loaded(SharedHouseholdIdentity::new(loaded))
+        .await;
+
+    // 7. Mint pair-device window and build QR URI.
+    let pair_qr_uri = match state
+        .pair_device_window
+        .mint_token(Duration::from_secs(300), None)
+        .await
+    {
+        Ok(token) => match P256PublicKey::from_bytes(&hh_pub_bytes) {
+            Ok(pub_key) => token.to_uri(&pub_key),
+            Err(_) => String::new(),
+        },
+        Err(e) => {
+            tracing::warn!(stage = "bootstrap.mint_token_failed", error = %e);
+            String::new()
+        }
+    };
+
+    // u128→u64 truncation impossible in practice (u64 covers ~585 millennia).
+    #[allow(clippy::cast_possible_truncation)]
+    let elapsed_ms = t0.elapsed().as_millis() as u64;
+    info!(
+        stage = "bootstrap.initialized",
+        hh_id = %hh_id,
+        name = %name_persisted,
+        keygen_ms,
+        elapsed_ms,
+    );
+
+    // 7.5: Emit `house_created` push for scenario B (setup invitation with APNs token).
+    // Always clear the invitation after a successful initialize — it is single-use
+    // regardless of whether an APNs token was present (scenario A or scenario B).
+    if let Ok(Some(inv)) = crate::setup_invitation::load_persisted_invitation(&state.state_dir) {
+        if let Some(token_buf) = &inv.iphone_apns_token {
+            if let Ok(token_arr) = <[u8; 32]>::try_from(token_buf.as_ref()) {
+                crate::apns_push::dispatch_fire_and_forget(crate::apns_push::HouseCreatedEvent {
+                    apns_device_token: token_arr,
+                    hh_id: hh_id.clone(),
+                    hh_name: name_persisted.clone(),
+                    machine_id: machine_id.clone(),
+                    machine_label: detect_host_label(),
+                    pair_qr_uri: pair_qr_uri.clone(),
+                    ts: created_at,
+                });
+            }
+        }
+        crate::setup_invitation::clear_persisted_invitation(&state.state_dir);
+    }
+
+    // 8. Return InitializeResponse.
+    cbor_ok(InitializeResponse {
+        version: 1,
+        hh_id,
+        hh_pub: ByteBuf::from(hh_pub_bytes),
+        name: name_persisted,
+        pair_qr_uri,
+        created_at,
+    })
+}
+
+// ── Helpers ───────────────────────────────────────────────────────────────────
+
+/// Return `(hh_id, device_count)` from the household state.
+///
+/// - `hh_id` is `None` while the engine is in `uninitialized` or
+///   `ready_for_naming`; populated once the household record is on disk.
+/// - `device_count` counts paired personal devices (iPhones with a
+///   `PersonCert` in `HouseholdAuthState`). It is 0 in `named_awaiting_pair`
+///   and ≥1 in `ready`.
+async fn hh_info(household: &HouseholdState, state: BootstrapState) -> (Option<String>, u32) {
+    match state {
+        BootstrapState::Uninitialized | BootstrapState::ReadyForNaming => (None, 0),
+        BootstrapState::NamedAwaitingPair => {
+            let hh_id = household
+                .current()
+                .await
+                .map(|id| id.record.hh_id.to_string());
+            (hh_id, 0)
+        }
+        BootstrapState::Ready | BootstrapState::Recovering => {
+            let identity = household.current().await;
+            let hh_id = identity.as_ref().map(|id| id.record.hh_id.to_string());
+            // device_count = 1 if owner auth is present, 0 otherwise.
+            let device_count = u32::from(household.current_owner_auth().await.is_some());
+            (hh_id, device_count)
+        }
+    }
+}
+
+/// Detect the current platform string (`"macos"` or `"linux"`).
+#[must_use]
+fn current_platform() -> &'static str {
+    if cfg!(target_os = "macos") {
+        "macos"
+    } else {
+        "linux"
+    }
+}
+
+/// Detect a human-readable host label.
+///
+/// - macOS: tries `sysctl -n hw.model` (e.g. "MacBookPro18,3"); on failure
+///   falls back to hostname.
+/// - Linux: tries `/sys/devices/virtual/dmi/id/product_name`; on failure
+///   falls back to hostname.
+///
+/// Result is trimmed and truncated to 32 bytes (UTF-8 characters) per the
+/// Bonjour TXT contract.
+#[must_use]
+pub fn detect_host_label() -> String {
+    let raw = platform_model_string()
+        .unwrap_or_else(|| gethostname::gethostname().to_string_lossy().into_owned());
+    let trimmed = raw.trim();
+    // Truncate at 32 UTF-8 character boundary.
+    trimmed.chars().take(32).collect()
+}
+
+#[cfg(target_os = "macos")]
+fn platform_model_string() -> Option<String> {
+    // `sysctl -n hw.model` returns e.g. "MacBookPro18,3"
+    let out = std::process::Command::new("sysctl")
+        .args(["-n", "hw.model"])
+        .output()
+        .ok()?;
+    if out.status.success() {
+        let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        if !s.is_empty() {
+            return Some(s);
+        }
+    }
+    None
+}
+
+#[cfg(not(target_os = "macos"))]
+fn platform_model_string() -> Option<String> {
+    std::fs::read_to_string("/sys/devices/virtual/dmi/id/product_name")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+// ── Tests ─────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::{
+        body::Body,
+        http::{Request, StatusCode as HStatus},
+    };
+    use serde_json::Value;
+    use tower::ServiceExt;
+
+    fn make_state(bs: BootstrapState) -> BootstrapHandlerState {
+        use std::path::PathBuf;
+        BootstrapHandlerState {
+            bootstrap: Arc::new(RwLock::new(bs)),
+            household: HouseholdState::empty(),
+            state_dir: PathBuf::from("/tmp/test"),
+            pair_device_window: Arc::new(PairDeviceWindow::new()),
+            started_at: Instant::now(),
+            setup_invitation_cache: crate::setup_invitation::new_cache(),
+        }
+    }
+
+    async fn json_get(app: Router, uri: &str) -> (HStatus, Value) {
+        let req = Request::builder().uri(uri).body(Body::empty()).unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        let status = resp.status();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let val: Value = serde_json::from_slice(&bytes).unwrap();
+        (status, val)
+    }
+
+    #[tokio::test]
+    async fn health_returns_200() {
+        let app = bootstrap_router(make_state(BootstrapState::Uninitialized));
+        let (status, body) = json_get(app, "/health").await;
+        assert_eq!(status, HStatus::OK);
+        assert_eq!(body["status"], "ok");
+    }
+
+    #[tokio::test]
+    async fn bootstrap_status_uninitialized_shape() {
+        let app = bootstrap_router(make_state(BootstrapState::Uninitialized));
+        let (status, body) = json_get(app, "/bootstrap/status").await;
+        assert_eq!(status, HStatus::OK);
+        assert_eq!(body["v"], 1);
+        assert_eq!(body["state"], "uninitialized");
+        assert!(body["hh_id"].is_null());
+        assert_eq!(body["device_count"], 0);
+        assert!(body.get("platform").is_some());
+        assert!(body.get("version").is_some());
+        assert!(body.get("uptime_secs").is_some());
+        assert!(body.get("host_label").is_some());
+    }
+
+    #[tokio::test]
+    async fn bootstrap_status_ready_for_naming() {
+        let app = bootstrap_router(make_state(BootstrapState::ReadyForNaming));
+        let (_, body) = json_get(app, "/bootstrap/status").await;
+        assert_eq!(body["state"], "ready_for_naming");
+        assert!(body["hh_id"].is_null());
+        assert_eq!(body["device_count"], 0);
+    }
+
+    #[tokio::test]
+    async fn bootstrap_status_recovering_shape() {
+        let app = bootstrap_router(make_state(BootstrapState::Recovering));
+        let (_, body) = json_get(app, "/bootstrap/status").await;
+        assert_eq!(body["state"], "recovering");
+    }
+}

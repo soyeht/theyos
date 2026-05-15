@@ -1,0 +1,19 @@
+[package]
+name = "updater-rs"
+version = "0.1.11"
+edition.workspace = true
+rust-version.workspace = true
+description = "theyOS self-update — replaces scripts/update-theyos.sh"
+
+[[bin]]
+name = "theyos-update"
+path = "src/main.rs"
+
+[dependencies]
+core-rs = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+
+[lints]
+workspace = true

@@ -1,0 +1,155 @@
+{
+  "clawdroid": {
+    "verify_status": "ok",
+    "verify_log_path": "artifacts/verify/clawdroid-2026-04-15T09-49-47Z.log",
+    "verify_attempted_at": "2026-04-15T09:49:47Z"
+  },
+  "shibaclaw": {
+    "verify_status": "ok",
+    "verify_log_path": "artifacts/verify/shibaclaw-2026-04-15T17-22-43Z.log",
+    "verify_attempted_at": "2026-04-15T17:22:43Z"
+  },
+  "subzeroclaw": {
+    "verify_status": "ok",
+    "verify_log_path": "artifacts/verify/subzeroclaw-2026-04-15T17-22-43Z.log",
+    "verify_attempted_at": "2026-04-15T17:22:43Z"
+  },
+  "clawx": {
+    "verify_status": "ok",
+    "verify_log_path": "artifacts/verify/clawx-2026-04-15T17-22-43Z.log",
+    "verify_attempted_at": "2026-04-15T17:22:43Z"
+  },
+  "rosclaw": {
+    "verify_status": "ok",
+    "verify_log_path": "artifacts/verify/rosclaw-2026-04-15T17-22-43Z.log",
+    "verify_attempted_at": "2026-04-15T17:22:43Z"
+  },
+  "nemoclaw": {
+    "status": "fail",
+    "reason": "Docker/k3s required but iptables/nftables not supported in Firecracker guest kernel — container DNS fails, OpenShell gateway cannot start",
+    "verified_at": "2026-04-15",
+    "verified_by": "claude-sonnet-4-6"
+  },
+  "tinyagi": {
+    "verify_status": "ok",
+    "verify_log_path": "artifacts/verify/tinyagi-2026-04-14T16-32-06Z.log",
+    "verify_attempted_at": "2026-04-14T16:32:06Z"
+  },
+  "loki-claw": {
+    "verify_status": "ok",
+    "verify_log_path": "artifacts/verify/loki-claw-2026-04-15T17-22-43Z.log",
+    "verify_attempted_at": "2026-04-15T17:22:43Z"
+  },
+  "kkclaw": {
+    "verify_status": "ok",
+    "verify_log_path": "artifacts/verify/kkclaw-2026-04-15T16-27-24Z.log",
+    "verify_attempted_at": "2026-04-15T16:27:24Z"
+  },
+  "openclawbox": {
+    "verify_status": "ok",
+    "verify_log_path": "artifacts/verify/openclawbox-2026-04-15T09-48-22.log",
+    "verify_attempted_at": "2026-04-15T09:48:22Z"
+  },
+  "edgeclaw": {
+    "verify_status": "ok",
+    "verify_log_path": "artifacts/verify/edgeclaw-2026-04-15T17-22-43Z.log",
+    "verify_attempted_at": "2026-04-15T17:22:43Z"
+  },
+  "rivonclaw": {
+    "verify_status": "failed",
+    "verify_error": "[rivonclaw] phase=run-installer — command failed: bash -c 'set -euxo pipefail ¶ export DEBIAN_FRONTEND=noninteractive ¶ curl -fsSL https://deb.nodesource.com/setup_22.x | bash - ¶ apt-get install -y git nodejs ¶ npm install -g pnpm ¶ mkdir -p /opt ¶ git clone --depth 1 https://github.com/gaoyangz77/rivonclaw.git /opt/rivonclaw ¶ cd /opt/rivonclaw ¶ ./scripts/setup-vendor.sh ¶ pnpm install ¶ pnpm build ¶ cat > /usr/local/bin/rivonclaw <<'\\''SHIM'\\'' ¶ #!/bin/bash ¶ cd /opt/rivonclaw && exec pnpm start \"$@\" ¶ SHIM ¶ chmod +x /usr/local/bin/rivonclaw ¶ ': timeout: SSH command timed out after 1800s: `bash -c 'set -euxo pipefail ¶ export DEBIAN_FRONTEND=noninteractive ¶ curl -fsSL https://deb.nodesource.com/setup_22.x | bash - ¶ apt-get install -y git nodejs ¶ npm install -g pnpm ¶ mkdir -p /opt ¶ git clone --depth 1 https://github.com/gaoyangz77/rivonclaw.git /opt/rivonclaw ¶ cd /opt/rivonclaw ¶ ./scripts/setup-vendor.sh ¶ pnpm install ¶ pnpm build ¶ cat > /usr/local/bin/rivonclaw <<'\\''SHIM'\\'' ¶ #!/bin/bash ¶ cd /opt/rivonclaw && exec pnpm start \"$@\" ¶ SHIM ¶ chmod +x /usr/local/bin/rivonclaw ¶ '`",
+    "verify_log_path": "artifacts/verify/rivonclaw-2026-04-15T00-18-41Z.log",
+    "verify_attempted_at": "2026-04-15T00:18:41Z"
+  },
+  "myclaw": {
+    "verify_status": "ok",
+    "verify_log_path": "artifacts/verify/myclaw-2026-04-15T18-01-17Z.log",
+    "verify_attempted_at": "2026-04-15T18:01:17Z"
+  },
+  "dr-claw": {
+    "verify_status": "ok",
+    "verify_log_path": "artifacts/verify/dr-claw-2026-04-15T17-22-43Z.log",
+    "verify_attempted_at": "2026-04-15T17:22:43Z"
+  },
+  "microclaw": {
+    "verify_status": "ok",
+    "verify_log_path": "artifacts/verify/microclaw-2026-04-15T09-47-34Z.log",
+    "verify_attempted_at": "2026-04-15T09:47:34Z"
+  },
+  "clawarm": {
+    "verify_status": "failed",
+    "verify_error": "[clawarm] phase=run-installer — command failed: bash -c 'set -euxo pipefail ¶ export DEBIAN_FRONTEND=noninteractive ¶ apt-get update ¶ apt-get install -y python3 python3-venv pipx git ¶ rm -rf /tmp/clawarm-src ¶ git clone --depth 1 https://github.com/Clawland-AI/clawarm.git /tmp/clawarm-src ¶ sed -i '\\''s|setuptools\\.backends\\._legacy:_Backend|setuptools.build_meta|'\\'' /tmp/clawarm-src/pyproject.toml ¶ sed -i '\\''/License :: OSI Approved :: MIT License/d'\\'' /tmp/clawarm-src/pyproject.toml ¶ pipx install --force /tmp/clawarm-src ¶ ln -sf /root/.local/bin/clawarm-bridge /usr/local/bin/clawarm-bridge ¶ /usr/local/bin/clawarm-bridge --help 2>&1 | head -20 || true ¶ ': SSH exec error: command exited 1: `bash -c 'set -euxo pipefail ¶ export DEBIAN_FRONTEND=noninteractive ¶ apt-get update ¶ apt-get install -y python3 python3-venv pipx git ¶ rm -rf /tmp/clawarm-src ¶ git clone --depth 1 https://github.com/Clawland-AI/clawarm.git /tmp/clawarm-src ¶ sed -i '\\''s|setuptools\\.backends\\._legacy:_Backend|setuptools.build_meta|'\\'' /tmp/clawarm-src/pyproject.toml ¶ sed -i '\\''/License :: OSI Approved :: MIT License/d'\\'' /tmp/clawarm-src/pyproject.toml ¶ pipx install --force /tmp/clawarm-src ¶ ln -sf /root/.local/bin/clawarm-bridge /usr/local/bin/clawarm-bridge ¶ /usr/local/bin/clawarm-bridge --help 2>&1 | head -20 || true ¶ '` stderr: + export DEBIAN_FRONTEND=noninteractive ¶ + DEBIAN_FRONTEND=noninteractive ¶ + apt-get update ¶ + apt-get install -y python3 python3-venv pipx git ¶ debconf: delaying package configuration, since apt-utils is not installed ¶ + rm -rf /tmp/clawarm-src ¶ + git clone --depth 1 https://github.com/Clawland-AI/clawarm.git /tmp/clawarm-src ¶ Cloning into '/tmp/clawarm-src'... ¶ + sed -i 's|setuptools\\.backends\\._legacy:_Backend|setuptools.build_meta|' /tmp/clawarm-src/pyproject.toml ¶ + sed -i '/License :: OSI Approved :: MIT License/d' /tmp/clawarm-src/pyproject.toml ¶ + pipx install --force /tmp/clawarm-src ¶ creating virtual environment... ¶ creating shared libraries... ¶ upgrading shared libraries... ¶ determining package name from '/tmp/clawarm-src'... ¶   error: subprocess-exited-with-error ¶    ¶   × Getting requirements to build wheel did not run successfully. ¶   │ exit code: 1 ¶   ╰─> [14 lines of output] ¶       error: Multiple top-level packages discovered in a flat-layout: ['setup', 'bridge', 'skills', 'config', 'assets', 'plugin', 'workspace']. ¶        ¶       To avoid accidental inclusion of unwanted files or directories, ¶       setuptools will not proceed with this build. ¶        ¶       If you are trying to create a single distribution with multiple packages ¶       on purpose, you should not rely on automatic discovery. ¶       Instead, consider the following options: ¶        ¶       1. set up custom discovery (`find` directive with `include` or `exclude`) ¶       2. use a `src-layout` ¶       3. explicitly set `py_modules` or `packages` with a list of names ¶        ¶       To find more information, look for \"package discovery\" on setuptools docs. ¶       [end of output] ¶    ¶   note: This error originates from a subprocess, and is likely not a problem with pip. ¶ ERROR: Failed to build 'file:///tmp/clawarm-src' when getting requirements to build wheel ¶ Cannot determine package name from spec '/tmp/clawarm-src'. Check package spec ¶ for errors. ¶   --- stdout tail --- ¶ Preparing to unpack .../09-python3-userpath_1.9.1-1_all.deb ... ¶ Unpacking python3-userpath (1.9.1-1) ... ¶ Selecting previously unselected package pipx. ¶ Preparing to unpack .../10-pipx_1.4.3-1_all.deb ... ¶ Unpacking pipx (1.4.3-1) ... ¶ Selecting previously unselected package python3-psutil. ¶ Preparing to unpack .../11-python3-psutil_5.9.8-2build2_amd64.deb ... ¶ Unpacking python3-psutil (5.9.8-2build2) ... ¶ Setting up python3-setuptools-whl (68.1.2-2ubuntu1.2) ... ¶ Setting up python3-colorama (0.4.6-4) ... ¶ Setting up python3-pip-whl (24.0+dfsg-1ubuntu1.3) ... ¶ Setting up python3-click (8.1.6-2) ... ¶ Setting up python3-platformdirs (4.2.0-1) ... ¶ Setting up python3-psutil (5.9.8-2build2) ... ¶ Setting up python3-packaging (24.0-1) ... ¶ Setting up python3-argcomplete (3.1.4-1ubuntu0.1) ... ¶ Setting up python3-userpath (1.9.1-1) ... ¶ Setting up python3.12-venv (3.12.3-1ubuntu0.12) ... ¶ Setting up python3-venv (3.12.3-0ubuntu2.1) ... ¶ Setting up pipx (1.4.3-1) ... ¶   --- ¶   --- stderr tail --- ¶       error: Multiple top-level packages discovered in a flat-layout: ['setup', 'bridge', 'skills', 'config', 'assets', 'plugin', 'workspace']. ¶        ¶       To avoid accidental inclusion of unwanted files or directories, ¶       setuptools will not proceed with this build. ¶        ¶       If you are trying to create a single distribution with multiple packages ¶       on purpose, you should not rely on automatic discovery. ¶       Instead, consider the following options: ¶        ¶       1. set up custom discovery (`find` directive with `include` or `exclude`) ¶       2. use a `src-layout` ¶       3. explicitly set `py_modules` or `packages` with a list of names ¶        ¶       To find more information, look for \"package discovery\" on setuptools docs. ¶       [end of output] ¶    ¶   note: This error originates from a subprocess, and is likely not a problem with pip. ¶ ERROR: Failed to build 'file:///tmp/clawarm-src' when getting requirements to build wheel ¶ Cannot determine package name from spec '/tmp/clawarm-src'. Check package spec ¶ for errors. ¶   ---",
+    "verify_log_path": "artifacts/verify/clawarm-2026-04-15T02-15-59Z.log",
+    "verify_attempted_at": "2026-04-15T02:15:59Z"
+  },
+  "angel-claw": {
+    "verify_status": "ok",
+    "verify_log_path": "artifacts/verify/angel-claw-2026-04-15T18-01-22Z.log",
+    "verify_attempted_at": "2026-04-15T18:01:22Z"
+  },
+  "clawwork": {
+    "verify_status": "ok",
+    "verify_log_path": "artifacts/verify/clawwork-2026-04-15T18-01-02Z.log",
+    "verify_attempted_at": "2026-04-15T18:01:02Z"
+  },
+  "epsiclaw": {
+    "verify_status": "ok",
+    "verify_log_path": "artifacts/verify/epsiclaw-2026-04-15T17-22-43Z.log",
+    "verify_attempted_at": "2026-04-15T17:22:43Z"
+  },
+  "zeptoclaw": {
+    "verify_status": "ok",
+    "verify_log_path": "artifacts/verify/zeptoclaw-2026-04-15T17-22-47Z.log",
+    "verify_attempted_at": "2026-04-15T17:22:47Z"
+  },
+  "geneclaw": {
+    "verify_status": "ok",
+    "verify_log_path": "artifacts/verify/geneclaw-2026-04-15T17-22-43Z.log",
+    "verify_attempted_at": "2026-04-15T17:22:43Z"
+  },
+  "safeclaw": {
+    "verify_status": "ok",
+    "verify_log_path": "artifacts/verify/safeclaw-2026-04-15T17-22-43Z.log",
+    "verify_attempted_at": "2026-04-15T17:22:43Z"
+  },
+  "n8n-claw": {
+    "verify_status": "ok",
+    "verify_log_path": "artifacts/verify/n8n-claw-2026-04-15T16-46-15Z.log",
+    "verify_attempted_at": "2026-04-15T16:46:15Z"
+  },
+  "claw-empire": {
+    "verify_status": "ok",
+    "verify_log_path": "artifacts/verify/claw-empire-2026-04-15T18-01-12Z.log",
+    "verify_attempted_at": "2026-04-15T18:01:12Z"
+  },
+  "clawlet": {
+    "verify_status": "ok",
+    "verify_log_path": "artifacts/verify/clawlet-2026-04-14T15-37-55Z.log",
+    "verify_attempted_at": "2026-04-14T15:37:55Z"
+  },
+  "hermitclaw": {
+    "verify_status": "ok",
+    "verify_log_path": "artifacts/verify/hermitclaw-2026-04-15T17-22-43Z.log",
+    "verify_attempted_at": "2026-04-15T17:22:43Z"
+  },
+  "sharpclaw": {
+    "verify_status": "ok",
+    "verify_log_path": "artifacts/verify/sharpclaw-2026-04-14T16-29-04Z.log",
+    "verify_attempted_at": "2026-04-14T16:29:04Z"
+  },
+  "rt-claw": {
+    "verify_status": "ok",
+    "verify_log_path": "artifacts/verify/rt-claw-2026-04-15T16-27-24Z.log",
+    "verify_attempted_at": "2026-04-15T16:27:24Z"
+  },
+  "xsafeclaw": {
+    "verify_status": "ok",
+    "verify_log_path": "artifacts/verify/xsafeclaw-2026-04-15T17-22-43Z.log",
+    "verify_attempted_at": "2026-04-15T17:22:43Z"
+  },
+  "nanoclaw": {
+    "verify_status": "ok",
+    "verify_log_path": "artifacts/verify/nanoclaw-2026-04-15T18-01-07Z.log",
+    "verify_attempted_at": "2026-04-15T18:01:07Z"
+  }
+}

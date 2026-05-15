@@ -1,0 +1,183 @@
+//! Small startup wiring helpers kept in the library so the binary's boot
+//! path can be tested without launching the full server.
+
+use std::sync::Arc;
+
+use crate::apns_push::{self, HouseCreatedTransport};
+use crate::setup_beacon::SetupBeaconParams;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PushTransportStartupStatus {
+    Installed,
+    Skipped,
+    AlreadyInstalled,
+}
+
+/// Install the production `house_created` APNs transport from environment.
+///
+/// Missing or invalid APNs environment returns `Skipped`; startup must remain
+/// graceful so scenario A and Bonjour-only scenario B keep working.
+pub fn install_house_created_push_transport_from_env() -> PushTransportStartupStatus {
+    install_house_created_push_transport_with(
+        || {
+            apns_push::A2Transport::from_env()
+                .map(|transport| Arc::new(transport) as Arc<dyn HouseCreatedTransport>)
+        },
+        apns_push::install_transport,
+    )
+}
+
+pub fn install_house_created_push_transport_with<Load, Install>(
+    load: Load,
+    install: Install,
+) -> PushTransportStartupStatus
+where
+    Load: FnOnce() -> Option<Arc<dyn HouseCreatedTransport>>,
+    Install: FnOnce(Arc<dyn HouseCreatedTransport>) -> Result<(), Arc<dyn HouseCreatedTransport>>,
+{
+    let Some(transport) = load() else {
+        tracing::info!(
+            stage = "apns.push.transport_skipped",
+            "THEYOS_APNS_KEY_PATH/_KEY_ID/_TEAM_ID/_TOPIC not all set or invalid - house_created push will no-op"
+        );
+        return PushTransportStartupStatus::Skipped;
+    };
+
+    if let Ok(()) = install(transport) {
+        tracing::info!(stage = "apns.push.transport_installed");
+        PushTransportStartupStatus::Installed
+    } else {
+        tracing::info!(stage = "apns.push.transport_already_installed");
+        PushTransportStartupStatus::AlreadyInstalled
+    }
+}
+
+#[must_use]
+pub fn setup_beacon_params_for_host(
+    host_label: String,
+    raw_hostname: &str,
+    port: u16,
+) -> SetupBeaconParams {
+    SetupBeaconParams {
+        host_label,
+        host_dns: host_dns_from_hostname(raw_hostname),
+        port,
+        pair_machine_window: None,
+    }
+}
+
+#[must_use]
+pub fn host_dns_from_hostname(raw_hostname: &str) -> String {
+    let label = sanitize_dns_label(raw_hostname);
+    format!("{label}.local")
+}
+
+fn sanitize_dns_label(raw: &str) -> String {
+    let trimmed = raw.trim().trim_end_matches('.');
+    let without_local = trimmed
+        .strip_suffix(".local")
+        .or_else(|| trimmed.strip_suffix(".LOCAL"))
+        .unwrap_or(trimmed);
+    let mut out: String = without_local
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' {
+                c.to_ascii_lowercase()
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    while out.starts_with('-') {
+        out.remove(0);
+    }
+    while out.ends_with('-') {
+        out.pop();
+    }
+    if out.len() > 63 {
+        out.truncate(63);
+        while out.ends_with('-') {
+            out.pop();
+        }
+    }
+    if out.is_empty() {
+        "soyeht-engine".to_string()
+    } else {
+        out
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::future::Future;
+    use std::pin::Pin;
+    use std::sync::Mutex;
+
+    struct FakeTransport;
+
+    impl HouseCreatedTransport for FakeTransport {
+        fn topic(&self) -> &str {
+            "com.soyeht.app"
+        }
+
+        fn send_push<'a>(
+            &'a self,
+            _token_hex: &'a str,
+            _json_body: &'a str,
+        ) -> Pin<Box<dyn Future<Output = Result<(), apns_push::DispatchAttemptError>> + Send + 'a>>
+        {
+            Box::pin(async { Ok(()) })
+        }
+    }
+
+    #[test]
+    fn push_transport_wiring_installs_when_loader_returns_transport() {
+        let installed = Mutex::new(false);
+        let status = install_house_created_push_transport_with(
+            || Some(Arc::new(FakeTransport) as Arc<dyn HouseCreatedTransport>),
+            |transport| {
+                assert_eq!(transport.topic(), "com.soyeht.app");
+                *installed.lock().unwrap() = true;
+                Ok(())
+            },
+        );
+
+        assert_eq!(status, PushTransportStartupStatus::Installed);
+        assert!(*installed.lock().unwrap());
+    }
+
+    #[test]
+    fn push_transport_wiring_gracefully_skips_without_env_transport() {
+        let status = install_house_created_push_transport_with(
+            || None,
+            |_| panic!("installer must not be called when loader returns None"),
+        );
+
+        assert_eq!(status, PushTransportStartupStatus::Skipped);
+    }
+
+    #[test]
+    fn push_transport_wiring_reports_already_installed() {
+        let status = install_house_created_push_transport_with(
+            || Some(Arc::new(FakeTransport) as Arc<dyn HouseCreatedTransport>),
+            Err,
+        );
+
+        assert_eq!(status, PushTransportStartupStatus::AlreadyInstalled);
+    }
+
+    #[test]
+    fn setup_beacon_params_preserve_label_and_sanitize_dns_host() {
+        let params = setup_beacon_params_for_host(
+            "Developer Mac".to_string(),
+            "Developer Mac.local.",
+            8091,
+        );
+
+        assert_eq!(params.host_label, "Developer Mac");
+        assert_eq!(params.host_dns, "developer-mac.local");
+        assert_eq!(params.port, 8091);
+        assert!(params.pair_machine_window.is_none());
+    }
+}

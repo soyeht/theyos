@@ -1,0 +1,21 @@
+[package]
+name = "claw-autoupdate-rs"
+version = "0.1.11"
+edition.workspace = true
+rust-version.workspace = true
+description = "theyOS claw autoupdate — replaces scripts/claw-autoupdate.sh and claws/scripts/autoupdate.sh"
+
+[[bin]]
+name = "claw-autoupdate"
+path = "src/main.rs"
+
+[dependencies]
+core-rs     = { workspace = true }
+serde       = { workspace = true }
+serde_json  = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+
+[lints]
+workspace = true

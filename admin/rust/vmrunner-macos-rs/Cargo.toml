@@ -1,0 +1,53 @@
+[package]
+name = "vmrunner-macos-rs"
+version = "0.1.11"
+edition.workspace = true
+rust-version.workspace = true
+description = "macOS VM runner using Apple Virtualization Framework"
+autobins = false
+
+[[bin]]
+name = "vmrunner_macos_ipc"
+path = "src/bin/vmrunner_macos_ipc.rs"
+
+[[bin]]
+name = "theyos-provision-inject"
+path = "src/bin/theyos_provision_inject.rs"
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+async-trait = { workspace = true }
+core-rs = { workspace = true }
+
+# macOS-specific dependencies (only available on macOS targets)
+[target.'cfg(target_os = "macos")'.dependencies]
+objc = "0.2"
+cocoa = "0.25"
+block = "0.1"
+libc = { workspace = true }
+
+# YAML for config parsing
+serde_yaml = "0.9"
+
+# For directory paths
+dirs = "5.0"
+# For UUID generation
+uuid = { version = "1", features = ["v4"] }
+tempfile = { workspace = true }
+# For base64 encoding of hardware model data
+base64 = { workspace = true }
+# For IPSW download (range-request resume)
+ureq = { workspace = true }
+
+[dev-dependencies]
+criterion = { workspace = true }
+mockall = "0.13"
+proptest = "1.6"
+
+[lints]
+workspace = true

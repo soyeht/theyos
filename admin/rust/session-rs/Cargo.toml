@@ -1,0 +1,25 @@
+[package]
+name = "session-rs"
+version = "0.1.11"
+edition.workspace = true
+rust-version.workspace = true
+description = "Rust session management with SQLite persistence for theyOS"
+
+[[bin]]
+name = "session_ipc"
+path = "src/bin/session_ipc.rs"
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+rusqlite = { workspace = true }
+sha2 = { workspace = true }
+hex = "0.4"
+rand = "0.8"
+base64 = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+core-rs = { workspace = true, features = ["db"] }
+
+[lints]
+workspace = true

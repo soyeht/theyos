@@ -1,0 +1,129 @@
+name: Homebrew Smoke (macOS)
+
+on:
+  push:
+    paths:
+      - "admin/rust/**"
+      - "admin/web/**"
+      - "homebrew/Formula/theyos.rb"
+      - "scripts/generate-brew-formula.sh"
+      - ".github/workflows/homebrew-smoke-macos.yml"
+  pull_request:
+    paths:
+      - "admin/rust/**"
+      - "admin/web/**"
+      - "homebrew/Formula/theyos.rb"
+      - "scripts/generate-brew-formula.sh"
+      - ".github/workflows/homebrew-smoke-macos.yml"
+  workflow_dispatch:
+
+jobs:
+  brew-smoke:
+    name: Install/Uninstall Smoke
+    runs-on: macos-15
+    timeout-minutes: 90
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Verify Apple Silicon runner
+        run: test "$(uname -m)" = "arm64"
+
+      - name: Detect deprecation stub formula
+        id: stub
+        run: |
+          # PR #51 T095 introduced a Homebrew deprecation stub
+          # (homebrew/Formula/theyos.rb has `desc "... DEPRECATED ..."` +
+          # `url "data:,"` + `def install` that runs `odie`). Installing it
+          # always fails by design — so the install/uninstall smoke is
+          # meaningless against a stub. Skip the install-flow steps when
+          # the stub is detected.
+          if grep -q '^  desc ".*DEPRECATED' homebrew/Formula/theyos.rb; then
+            echo "Formula is a deprecation stub — skipping install/uninstall smoke."
+            echo "(brew install is intentionally broken; def install runs odie to redirect users)"
+            echo "is_stub=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "is_stub=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Setup Rust
+        if: steps.stub.outputs.is_stub != 'true'
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust dependencies
+        if: steps.stub.outputs.is_stub != 'true'
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: "admin/rust -> target"
+
+      - name: Build distribution package
+        if: steps.stub.outputs.is_stub != 'true'
+        run: ./scripts/make.sh package
+
+      - name: Refresh release formula metadata
+        if: steps.stub.outputs.is_stub != 'true'
+        run: ./scripts/generate-brew-formula.sh
+
+      - name: Prepare local tap formula
+        if: steps.stub.outputs.is_stub != 'true'
+        run: |
+          set -euo pipefail
+          VERSION=$(ruby -e 'print File.read("admin/rust/soyeht-rs/Cargo.toml")[/version = "([^"]+)"/, 1]')
+          TARBALL="$GITHUB_WORKSPACE/dist/macos-arm64/theyos-${VERSION}-macos-arm64.tar.gz"
+          SHA=$(shasum -a 256 "$TARBALL" | awk '{print $1}')
+
+          brew untap soyeht/local-ci >/dev/null 2>&1 || true
+          brew tap-new soyeht/local-ci >/dev/null
+          TAP_REPO="$(brew --repo soyeht/local-ci)"
+          cp homebrew/Formula/theyos.rb "$TAP_REPO/Formula/theyos.rb"
+
+          ruby - "$TAP_REPO/Formula/theyos.rb" "$VERSION" "$TARBALL" "$SHA" <<'RUBY'
+            formula_path, version, tarball, sha = ARGV
+            content = File.read(formula_path)
+            content.sub!(/^  version ".+"$/, "  version \"#{version}\"") or abort("missing version line")
+            content.sub!(/^  url ".+"$/, "  url \"file://#{tarball}\"") or abort("missing url line")
+            content.sub!(/^  sha256 ".+"$/, "  sha256 \"#{sha}\"") or abort("missing sha256 line")
+            File.write(formula_path, content)
+          RUBY
+
+          ruby -c "$TAP_REPO/Formula/theyos.rb"
+
+      - name: Install formula from local tap
+        if: steps.stub.outputs.is_stub != 'true'
+        run: |
+          set -euo pipefail
+          brew install soyeht/local-ci/theyos
+          brew test soyeht/local-ci/theyos
+          soyeht --version
+          test -x "$(brew --prefix)/opt/theyos/libexec/server"
+          test -x "$(brew --prefix)/opt/theyos/libexec/vmrunner_macos_ipc"
+
+      - name: Seed uninstall fixtures
+        if: steps.stub.outputs.is_stub != 'true'
+        run: |
+          set -euo pipefail
+          mkdir -p "$HOME/Library/LaunchAgents"
+          touch "$HOME/Library/LaunchAgents/homebrew.mxcl.theyos.plist"
+          bash -lc 'exec -a "$(brew --prefix)/opt/theyos/libexec/server" sleep 600' &
+          echo $! > "$RUNNER_TEMP/theyos-managed.pid"
+          sleep 1
+          ps -p "$(cat "$RUNNER_TEMP/theyos-managed.pid")" -o command= | grep '/opt/homebrew/opt/theyos/libexec/server'
+
+      - name: Cleanup Homebrew runtime state
+        if: steps.stub.outputs.is_stub != 'true'
+        run: |
+          set -euo pipefail
+          soyeht cleanup-homebrew
+          test ! -e "$HOME/Library/LaunchAgents/homebrew.mxcl.theyos.plist"
+          if ps -p "$(cat "$RUNNER_TEMP/theyos-managed.pid")" >/dev/null 2>&1; then
+            echo "managed theyos process survived cleanup-homebrew"
+            exit 1
+          fi
+
+      - name: Uninstall formula
+        if: steps.stub.outputs.is_stub != 'true'
+        run: |
+          set -euo pipefail
+          brew uninstall theyos
+          test ! -e "$(brew --prefix)/opt/theyos"
+          brew untap soyeht/local-ci

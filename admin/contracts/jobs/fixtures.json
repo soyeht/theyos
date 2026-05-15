@@ -1,0 +1,209 @@
+[
+  {
+    "id": "create_sets_status_pending",
+    "description": "Create com job sem status → status=pending, id preenchido, created_at não-zero",
+    "operation": "create",
+    "input": {
+      "job": {
+        "type": "create_instance",
+        "instance_id": "inst-create-001",
+        "payload": "{\"name\":\"test\",\"clawType\":\"picoclaw\",\"port\":0}"
+      }
+    },
+    "expected": {
+      "status": "pending",
+      "id_non_empty": true,
+      "created_at_non_zero": true
+    }
+  },
+  {
+    "id": "create_preserves_provided_id",
+    "description": "Create com ID pré-definido → store mantém o ID fornecido",
+    "operation": "create_with_id",
+    "input": {
+      "job": {
+        "id": "job_contract_fixed_id",
+        "type": "create_instance",
+        "instance_id": "inst-create-002",
+        "payload": "{\"name\":\"test\",\"clawType\":\"picoclaw\",\"port\":0}"
+      }
+    },
+    "expected": {
+      "id": "job_contract_fixed_id"
+    }
+  },
+  {
+    "id": "get_returns_created_job",
+    "description": "Get após Create → retorna mesmo type e instance_id",
+    "operation": "get",
+    "input": {
+      "job": {
+        "type": "delete_instance",
+        "instance_id": "inst-get-001",
+        "payload": "{\"name\":\"test\",\"container\":\"c\",\"clawType\":\"picoclaw\"}"
+      }
+    },
+    "expected": {
+      "type": "delete_instance",
+      "instance_id": "inst-get-001",
+      "status": "pending"
+    }
+  },
+  {
+    "id": "get_missing_id_errors",
+    "description": "Get com ID inexistente → retorna erro (não nil)",
+    "operation": "get_missing",
+    "input": {
+      "id": "job_does_not_exist_xyz"
+    },
+    "expected": {
+      "error": true
+    }
+  },
+  {
+    "id": "update_changes_status",
+    "description": "Update com status=completed → visível via Get subsequente",
+    "operation": "update",
+    "input": {
+      "job": {
+        "type": "restart_instance",
+        "instance_id": "inst-update-001",
+        "payload": "{\"name\":\"test\",\"clawType\":\"picoclaw\",\"port\":0}"
+      },
+      "update_status": "completed"
+    },
+    "expected": {
+      "status": "completed"
+    }
+  },
+  {
+    "id": "claim_sets_status_running",
+    "description": "ClaimNextPending → status=running, started_at não-nil, message=Processing...",
+    "operation": "claim_next_pending",
+    "input": {
+      "job": {
+        "type": "create_instance",
+        "instance_id": "inst-claim-001",
+        "payload": "{\"name\":\"test\",\"clawType\":\"picoclaw\",\"port\":0}"
+      }
+    },
+    "expected": {
+      "status": "running",
+      "started_at_non_nil": true,
+      "message": "Processing..."
+    }
+  },
+  {
+    "id": "claim_empty_store_returns_nil",
+    "description": "ClaimNextPending em store vazio → nil job, nil error",
+    "operation": "claim_empty",
+    "input": {},
+    "expected": {
+      "job_nil": true,
+      "error": false
+    }
+  },
+  {
+    "id": "claim_oldest_first",
+    "description": "Dois jobs pendentes: o mais antigo (offset_seconds=-600) é claimado primeiro",
+    "operation": "claim_oldest",
+    "input": {
+      "jobs": [
+        {
+          "instance_id": "inst-old",
+          "type": "create_instance",
+          "payload": "{\"name\":\"old\",\"clawType\":\"picoclaw\",\"port\":0}",
+          "offset_seconds": -600
+        },
+        {
+          "instance_id": "inst-new",
+          "type": "create_instance",
+          "payload": "{\"name\":\"new\",\"clawType\":\"picoclaw\",\"port\":0}",
+          "offset_seconds": 0
+        }
+      ]
+    },
+    "expected": {
+      "claimed_instance_id": "inst-old"
+    }
+  },
+  {
+    "id": "claim_skips_non_pending",
+    "description": "1 job running + 1 job pending → apenas o pending é claimável",
+    "operation": "claim_skip_non_pending",
+    "input": {
+      "running_job": {
+        "instance_id": "inst-running",
+        "type": "create_instance",
+        "payload": "{\"name\":\"r\",\"clawType\":\"picoclaw\",\"port\":0}"
+      },
+      "pending_job": {
+        "instance_id": "inst-pending",
+        "type": "create_instance",
+        "payload": "{\"name\":\"p\",\"clawType\":\"picoclaw\",\"port\":0}"
+      }
+    },
+    "expected": {
+      "claimed_instance_id": "inst-pending"
+    }
+  },
+  {
+    "id": "claim_rollback_on_save_failure",
+    "description": "Falha no save (trigger=read_only_dir) → job volta a status=pending na memória",
+    "operation": "claim_rollback",
+    "input": {
+      "job": {
+        "type": "create_instance",
+        "instance_id": "inst-rollback",
+        "payload": "{\"name\":\"rb\",\"clawType\":\"picoclaw\",\"port\":0}"
+      },
+      "trigger": "read_only_dir"
+    },
+    "expected": {
+      "claim_fails": true,
+      "job_still_pending": true
+    }
+  },
+  {
+    "id": "list_pending_sorted_oldest_first",
+    "description": "ListPending com 3 jobs → retornados em ordem crescente de created_at",
+    "operation": "list_pending_order",
+    "input": {
+      "jobs": [
+        {
+          "instance_id": "inst-lp-mid",
+          "type": "create_instance",
+          "payload": "{\"name\":\"mid\",\"clawType\":\"picoclaw\",\"port\":0}",
+          "offset_seconds": -300
+        },
+        {
+          "instance_id": "inst-lp-old",
+          "type": "create_instance",
+          "payload": "{\"name\":\"old\",\"clawType\":\"picoclaw\",\"port\":0}",
+          "offset_seconds": -600
+        },
+        {
+          "instance_id": "inst-lp-new",
+          "type": "create_instance",
+          "payload": "{\"name\":\"new\",\"clawType\":\"picoclaw\",\"port\":0}",
+          "offset_seconds": 0
+        }
+      ]
+    },
+    "expected": {
+      "order": ["inst-lp-old", "inst-lp-mid", "inst-lp-new"]
+    }
+  },
+  {
+    "id": "claim_no_duplicate_min",
+    "description": "N workers concorrentes tentam claimar 1 job → exatamente 1 claim bem-sucedido",
+    "operation": "claim_concurrent",
+    "input": {
+      "workers": 10,
+      "jobs": 1
+    },
+    "expected": {
+      "max_claims": 1
+    }
+  }
+]

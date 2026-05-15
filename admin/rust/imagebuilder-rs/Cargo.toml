@@ -1,0 +1,28 @@
+[package]
+name = "imagebuilder-rs"
+version = "0.1.11"
+edition.workspace = true
+rust-version.workspace = true
+description = "Golden image check/rebuild and base snapshot management for theyOS (replaces build-golden-images.sh + rebuild-golden-images.sh)"
+
+[[bin]]
+name = "imagebuilder"
+path = "src/main.rs"
+
+[dependencies]
+clap        = { version = "4", features = ["derive", "env"] }
+tokio       = { workspace = true }
+russh       = { workspace = true }
+async-trait = { workspace = true }
+tracing     = { workspace = true }
+serde       = { workspace = true }
+serde_json  = { workspace = true }
+sha2        = { workspace = true }
+core-rs     = { workspace = true, features = ["async-ipc"] }
+vmrunner-rs = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+
+[lints]
+workspace = true
