@@ -43,7 +43,7 @@ jobs:
     timeout-minutes: 60
 
     env:
-      TAG: ${{ github.ref_name || github.event.inputs.tag }}
+      TAG: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.tag || github.ref_name }}
 
     steps:
       - name: Checkout (full history for tag)
@@ -136,7 +136,7 @@ jobs:
           CARGO_VERSION=$(grep '^version' admin/rust/soyeht-rs/Cargo.toml | sed 's/version = "\(.*\)"/\1/')
           HELPERS_DIR="dist/macos-arm64/Soyeht.app/Contents/Helpers"
           TARBALL_PATH="dist/macos-arm64/theyos-engine-${CARGO_VERSION}-macos-arm64.tar.gz"
-          for required in theyos-engine vmrunner_macos_ipc store-ipc terminal-ipc theyos-ssh; do
+          for required in theyos-engine vmrunner_macos_ipc store-ipc terminal-ipc theyos-ssh theyos-provision-inject; do
             if [ ! -x "$HELPERS_DIR/$required" ]; then
               echo "::error::required executable helper missing from release bundle: $required"
               exit 1

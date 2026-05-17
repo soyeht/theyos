@@ -136,11 +136,16 @@ impl WarmPoolManager {
     where
         Self: Sized,
     {
-        let snapshots_dir = if let Some(ref macos_cfg) = config.vm_backend.macos {
-            PathBuf::from(&macos_cfg.snapshots_path)
-        } else {
-            let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-            PathBuf::from(home).join("Library/Application Support/theyos/snapshots")
+        let snapshots_dir = match std::env::var("THEYOS_SNAPSHOTS_DIR") {
+            Ok(dir) if !dir.is_empty() => PathBuf::from(dir),
+            _ => {
+                if let Some(ref macos_cfg) = config.vm_backend.macos {
+                    PathBuf::from(&macos_cfg.snapshots_path)
+                } else {
+                    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+                    PathBuf::from(home).join("Library/Application Support/theyos/snapshots")
+                }
+            }
         };
 
         let pool_config = WarmPoolConfig {

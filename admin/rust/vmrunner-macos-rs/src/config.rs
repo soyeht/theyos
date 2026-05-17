@@ -399,11 +399,16 @@ impl MacOSConfig {
     /// Get snapshots directory.
     #[must_use]
     pub fn snapshots_dir(&self) -> PathBuf {
-        if let Some(ref macos_cfg) = self.vm_backend.macos {
-            PathBuf::from(&macos_cfg.snapshots_path)
-        } else {
-            let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-            PathBuf::from(home).join("Library/Application Support/theyos/snapshots")
+        match std::env::var("THEYOS_SNAPSHOTS_DIR") {
+            Ok(dir) if !dir.is_empty() => PathBuf::from(dir),
+            _ => {
+                if let Some(ref macos_cfg) = self.vm_backend.macos {
+                    PathBuf::from(&macos_cfg.snapshots_path)
+                } else {
+                    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+                    PathBuf::from(home).join("Library/Application Support/theyos/snapshots")
+                }
+            }
         }
     }
 

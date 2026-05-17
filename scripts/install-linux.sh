@@ -7,8 +7,10 @@
 #   SOYEHT_VERSION=0.2.0 sh install-linux.sh
 #
 # Environment variables (all optional):
-#   SOYEHT_VERSION     — engine version to install (default: latest from soyeht.com/VERSION)
+#   SOYEHT_VERSION     — engine version to install (default: latest release)
 #   SOYEHT_INSTALL_DIR — base install directory (default: ~/.local/share/Soyeht)
+#   SOYEHT_BASE_URL    — primary download base URL (default: https://soyeht.com)
+#   SOYEHT_GITHUB_REPO — GitHub fallback repo (default: soyeht/theyos)
 #   SOYEHT_LINGER      — "yes" to enable systemd linger without prompting (CI / automation)
 #
 # Requirements:
@@ -30,8 +32,11 @@ set -eu
 # ── Constants ────────────────────────────────────────────────────────────────
 
 SOYEHT_BASE_URL="${SOYEHT_BASE_URL:-https://soyeht.com}"
+SOYEHT_GITHUB_REPO="${SOYEHT_GITHUB_REPO:-soyeht/theyos}"
 SOYEHT_INSTALL_DIR="${SOYEHT_INSTALL_DIR:-$HOME/.local/share/Soyeht}"
 ENGINE_DIR="$SOYEHT_INSTALL_DIR/engine"
+RECEIPT_FILE="$SOYEHT_INSTALL_DIR/install-receipt"
+LINGER_MARKER="$SOYEHT_INSTALL_DIR/.linger-enabled-by-soyeht"
 SYSTEMD_USER_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
 SERVICE_NAME="soyeht-engine.service"
 HOUSEHOLD_PORT="8091"
@@ -57,8 +62,9 @@ require_cmd() {
     command -v "$1" >/dev/null 2>&1 || die "Required command not found: $1. Install it and re-run."
 }
 
-# Download a URL to a local file using curl or wget.
-download() {
+# Download a URL to a local file using curl or wget. Returns non-zero when the
+# source is unavailable so callers can try a fallback.
+try_download() {
     url="$1"; dest="$2"
     if command -v curl >/dev/null 2>&1; then
         curl -fsSL --retry 3 --retry-delay 2 -o "$dest" "$url"
@@ -67,6 +73,43 @@ download() {
     else
         die "Neither curl nor wget found. Install one and re-run."
     fi
+}
+
+download() {
+    url="$1"; dest="$2"
+    try_download "$url" "$dest" || die "Could not download $url"
+}
+
+download_first() {
+    dest="$1"; shift
+    for url in "$@"; do
+        if try_download "$url" "$dest"; then
+            log "Downloaded: $url"
+            return 0
+        fi
+    done
+    die "Could not download $(basename "$dest") from any release source."
+}
+
+github_release_tag() {
+    case "$1" in
+        v*) printf '%s\n' "$1" ;;
+        *) printf 'v%s\n' "$1" ;;
+    esac
+}
+
+version_without_v() {
+    case "$1" in
+        v*) printf '%s\n' "${1#v}" ;;
+        *) printf '%s\n' "$1" ;;
+    esac
+}
+
+latest_version_from_github() {
+    dest="$1"
+    api_url="${SOYEHT_GITHUB_API_URL:-https://api.github.com/repos/$SOYEHT_GITHUB_REPO/releases/latest}"
+    try_download "$api_url" "$dest" || return 1
+    sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$dest" | head -1
 }
 
 # Verify sha256 of a file against a sidecar .sha256 file.
@@ -135,6 +178,30 @@ Wants=network-online.target
 Type=simple
 ExecStart=$engine_bin
 Environment=THEYOS_DIR=$SOYEHT_INSTALL_DIR
+Environment=THEYOS_HOME=$SOYEHT_INSTALL_DIR
+Environment=THEYOS_STATE_DIR=$SOYEHT_INSTALL_DIR/state
+Environment=ADMIN_PORT=8892
+Environment=ADDR=0.0.0.0:8892
+Environment=THEYOS_SQLITE_DB=$SOYEHT_INSTALL_DIR/theyos.db
+Environment=THEYOS_SESSION_DB=$SOYEHT_INSTALL_DIR/theyos.sessions.db
+Environment=THEYOS_JOBS_DB=$SOYEHT_INSTALL_DIR/jobs-rs.db
+Environment=THEYOS_RATELIMIT_DB=$SOYEHT_INSTALL_DIR/ratelimit-rs.db
+Environment=THEYOS_CONVERSATIONS_DIR=$SOYEHT_INSTALL_DIR/conversations
+Environment=THEYOS_BIN_DIR=$ENGINE_DIR
+Environment=THEYOS_VMRUNNER_RS_BIN=$ENGINE_DIR/vmrunner_ipc
+Environment=THEYOS_STORE_RS_BIN=$ENGINE_DIR/store-ipc
+Environment=THEYOS_TERMINAL_RS_BIN=$ENGINE_DIR/terminal-ipc
+Environment=THEYOS_IMAGEBUILDER_BIN=$ENGINE_DIR/imagebuilder
+Environment=THEYOS_VM_ASSETS_DIR=$SOYEHT_INSTALL_DIR/vms
+Environment=THEYOS_VM_STATE_DIR=$SOYEHT_INSTALL_DIR/vms
+Environment=THEYOS_SNAPSHOTS_DIR=$SOYEHT_INSTALL_DIR/snapshots
+Environment=FIRECRACKER_STATE_DIR=$SOYEHT_INSTALL_DIR/firecracker/instances
+Environment=FIRECRACKER_CTL=$ENGINE_DIR/fc-ssh
+Environment=FIRECRACKER_BIN=$SOYEHT_INSTALL_DIR/firecracker/bin/firecracker
+Environment=FIRECRACKER_KERNEL_IMAGE=$SOYEHT_INSTALL_DIR/firecracker/assets/vmlinux-6.1.155
+Environment=FIRECRACKER_BASE_ROOTFS=$SOYEHT_INSTALL_DIR/firecracker/assets/ubuntu-24.04-rootfs-v2.ext4
+Environment=FIRECRACKER_SSH_KEY=$SOYEHT_INSTALL_DIR/firecracker/assets/ubuntu-24.04-root.id_rsa
+Environment=FIRECRACKER_SSH_PUBKEY=$SOYEHT_INSTALL_DIR/firecracker/assets/ubuntu-24.04-root.id_rsa.pub
 Environment=THEYOS_HOUSEHOLD_PORT=$HOUSEHOLD_PORT
 Environment=XDG_DATA_HOME=%h/.local/share
 Restart=on-failure
@@ -176,35 +243,64 @@ main() {
     # Resolve version.
     if [ -z "${SOYEHT_VERSION:-}" ]; then
         tmp_ver="$(mktemp)"
-        download "$SOYEHT_BASE_URL/VERSION" "$tmp_ver" 2>/dev/null || true
+        try_download "$SOYEHT_BASE_URL/VERSION" "$tmp_ver" 2>/dev/null || true
         SOYEHT_VERSION="$(cat "$tmp_ver" 2>/dev/null | tr -d '[:space:]')"
+        if [ -z "$SOYEHT_VERSION" ]; then
+            SOYEHT_VERSION="$(latest_version_from_github "$tmp_ver" 2>/dev/null | tr -d '[:space:]' || true)"
+        fi
         rm -f "$tmp_ver"
-        [ -n "$SOYEHT_VERSION" ] || die "Could not determine latest version. Set SOYEHT_VERSION= and retry."
+        [ -n "$SOYEHT_VERSION" ] || die "Could not determine latest version from $SOYEHT_BASE_URL or GitHub. Set SOYEHT_VERSION= and retry."
     fi
+    SOYEHT_VERSION="$(version_without_v "$SOYEHT_VERSION")"
     log "Version: $SOYEHT_VERSION"
 
     TARBALL_NAME="theyos-engine-${SOYEHT_VERSION}-linux-${ARCH}.tar.gz"
     TARBALL_URL="$SOYEHT_BASE_URL/dist/linux-${ARCH}/$TARBALL_NAME"
     SHA256_URL="${TARBALL_URL}.sha256"
+    GITHUB_TAG="$(github_release_tag "$SOYEHT_VERSION")"
+    GITHUB_RELEASE_URL="https://github.com/$SOYEHT_GITHUB_REPO/releases/download/$GITHUB_TAG/$TARBALL_NAME"
+    GITHUB_SHA256_URL="${GITHUB_RELEASE_URL}.sha256"
 
     # Download to a temp directory.
     TMP_DIR="$(mktemp -d)"
     trap 'rm -rf "$TMP_DIR"' EXIT
 
     info "Baixando $TARBALL_NAME..."
-    download "$TARBALL_URL" "$TMP_DIR/$TARBALL_NAME"
-    download "$SHA256_URL" "$TMP_DIR/${TARBALL_NAME}.sha256"
+    download_first "$TMP_DIR/$TARBALL_NAME" "$TARBALL_URL" "$GITHUB_RELEASE_URL"
+    download_first "$TMP_DIR/${TARBALL_NAME}.sha256" "$SHA256_URL" "$GITHUB_SHA256_URL"
 
     info "Verificando sha256..."
     verify_sha256 "$TMP_DIR/$TARBALL_NAME"
 
     # Install.
-    mkdir -p "$ENGINE_DIR"
-    info "Extraindo para $ENGINE_DIR..."
-    tar xzf "$TMP_DIR/$TARBALL_NAME" -C "$ENGINE_DIR"
+    mkdir -p "$SOYEHT_INSTALL_DIR"
+    if command -v systemctl >/dev/null 2>&1; then
+        systemctl --user stop "$SERVICE_NAME" 2>/dev/null || true
+    fi
+
+    NEW_ENGINE_DIR="$SOYEHT_INSTALL_DIR/.engine.new.$$"
+    OLD_ENGINE_DIR="$SOYEHT_INSTALL_DIR/.engine.old.$$"
+    rm -rf "$NEW_ENGINE_DIR" "$OLD_ENGINE_DIR"
+    mkdir -p "$NEW_ENGINE_DIR"
+    info "Extraindo para $NEW_ENGINE_DIR..."
+    tar xzf "$TMP_DIR/$TARBALL_NAME" -C "$NEW_ENGINE_DIR"
+    if [ ! -f "$NEW_ENGINE_DIR/theyos-engine" ] && [ -f "$NEW_ENGINE_DIR/server-rs" ]; then
+        mv "$NEW_ENGINE_DIR/server-rs" "$NEW_ENGINE_DIR/theyos-engine"
+    fi
+    if [ ! -f "$NEW_ENGINE_DIR/theyos-engine" ] && [ -f "$NEW_ENGINE_DIR/server" ]; then
+        mv "$NEW_ENGINE_DIR/server" "$NEW_ENGINE_DIR/theyos-engine"
+    fi
+    [ -f "$NEW_ENGINE_DIR/theyos-engine" ] || die "Package did not contain theyos-engine."
+    for bin in theyos-engine vmrunner_ipc fc-ssh store-ipc terminal-ipc imagebuilder; do
+        [ -f "$NEW_ENGINE_DIR/$bin" ] && chmod +x "$NEW_ENGINE_DIR/$bin"
+    done
+    if [ -d "$ENGINE_DIR" ]; then
+        mv "$ENGINE_DIR" "$OLD_ENGINE_DIR"
+    fi
+    mv "$NEW_ENGINE_DIR" "$ENGINE_DIR"
+    rm -rf "$OLD_ENGINE_DIR"
 
     ENGINE_BIN="$ENGINE_DIR/theyos-engine"
-    chmod +x "$ENGINE_BIN"
 
     # Write systemd unit.
     write_systemd_unit "$ENGINE_BIN"
@@ -225,8 +321,19 @@ main() {
     # Linger prompt.
     if prompt_linger; then
         sudo loginctl enable-linger "$USER"
+        printf 'enabled_by=soyeht\nuser=%s\n' "$USER" > "$LINGER_MARKER"
         info "Linger ativado — Soyeht será iniciado automaticamente no boot."
     fi
+
+    {
+        printf 'version=%s\n' "$SOYEHT_VERSION"
+        printf 'arch=%s\n' "$ARCH"
+        printf 'install_dir=%s\n' "$SOYEHT_INSTALL_DIR"
+        printf 'engine_dir=%s\n' "$ENGINE_DIR"
+        printf 'service=%s\n' "$SERVICE_NAME"
+        printf 'unit_file=%s\n' "$SYSTEMD_USER_DIR/$SERVICE_NAME"
+        printf 'installed_at_utc=%s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+    } > "$RECEIPT_FILE"
 
     info "Instalação concluída. Acesse o painel em http://127.0.0.1:8892"
 }
