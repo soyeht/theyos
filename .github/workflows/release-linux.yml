@@ -54,6 +54,9 @@ jobs:
       - name: Cross-compile (release)
         working-directory: admin/rust
         run: |
+          mkdir -p claws
+          cp ../../claws/manifest.yml claws/manifest.yml
+          export CLAWS_MANIFEST_YML="$PWD/claws/manifest.yml"
           cross build \
             --target x86_64-unknown-linux-musl \
             --release \
@@ -148,6 +151,9 @@ jobs:
       - name: Cross-compile (release)
         working-directory: admin/rust
         run: |
+          mkdir -p claws
+          cp ../../claws/manifest.yml claws/manifest.yml
+          export CLAWS_MANIFEST_YML="$PWD/claws/manifest.yml"
           cross build \
             --target aarch64-unknown-linux-musl \
             --release \
