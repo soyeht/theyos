@@ -215,15 +215,18 @@ EOF
 # ── Linger prompt ─────────────────────────────────────────────────────────────
 
 prompt_linger() {
-    if [ "${SOYEHT_LINGER:-}" = "yes" ]; then
-        return 0  # automation: skip prompt
-    fi
+    case "${SOYEHT_LINGER:-}" in
+        yes|YES|true|TRUE|1) return 0 ;;
+        no|NO|false|FALSE|0) return 1 ;;
+    esac
     # In CI or piped installs /dev/tty may not exist; default to no-linger.
-    if [ ! -r /dev/tty ]; then
+    if [ ! -r /dev/tty ] || [ ! -w /dev/tty ]; then
         return 1
     fi
-    printf '\nManter Soyeht ativo mesmo deslogado? (s/N): '
-    read -r answer </dev/tty
+    printf '\nManter Soyeht ativo mesmo deslogado? (s/N): ' >/dev/tty
+    if ! IFS= read -r answer </dev/tty; then
+        return 1
+    fi
     case "$answer" in
         s|S|y|Y|sim|yes) return 0 ;;
         *) return 1 ;;

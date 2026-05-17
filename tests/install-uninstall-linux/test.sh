@@ -85,3 +85,18 @@ test ! -e "$SOYEHT_INSTALL_DIR"
 test ! -e "$XDG_CONFIG_HOME/systemd/user/soyeht-engine.service"
 grep -q 'disable --now soyeht-engine.service' "$TEST_LOG"
 grep -q 'sudo loginctl disable-linger' "$TEST_LOG"
+
+: > "$TEST_LOG"
+export SOYEHT_LINGER=no
+
+sh "$REPO_DIR/scripts/install-linux.sh"
+
+test -x "$SOYEHT_INSTALL_DIR/engine/theyos-engine"
+test -f "$SOYEHT_INSTALL_DIR/install-receipt"
+test ! -e "$SOYEHT_INSTALL_DIR/.linger-enabled-by-soyeht"
+grep -q 'enable --now soyeht-engine.service' "$TEST_LOG"
+
+sh "$REPO_DIR/scripts/uninstall-linux.sh" --yes
+
+test ! -e "$SOYEHT_INSTALL_DIR"
+test ! -e "$XDG_CONFIG_HOME/systemd/user/soyeht-engine.service"
