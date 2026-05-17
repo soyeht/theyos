@@ -31,7 +31,7 @@ jobs:
 
     env:
       TAG: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.tag || github.ref_name }}
-      CARGO_TARGET: x86_64-unknown-linux-musl
+      CARGO_TARGET: x86_64-unknown-linux-gnu
 
     steps:
       - name: Checkout
@@ -39,11 +39,11 @@ jobs:
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: x86_64-unknown-linux-musl
 
-      - name: Install cross
-        run: cargo install cross --git https://github.com/cross-rs/cross --locked
+      - name: Install Linux build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libdbus-1-dev pkg-config
 
       - name: Cache Rust dependencies
         uses: Swatinem/rust-cache@v2
@@ -51,14 +51,13 @@ jobs:
           workspaces: "admin/rust -> target"
           shared-key: "release-linux-x86_64"
 
-      - name: Cross-compile (release)
+      - name: Build (release)
         working-directory: admin/rust
         run: |
           mkdir -p claws
           cp ../../claws/manifest.yml claws/manifest.yml
           export CLAWS_MANIFEST_YML="$PWD/claws/manifest.yml"
-          cross build \
-            --target x86_64-unknown-linux-musl \
+          cargo build \
             --release \
             -p server-rs \
             -p vmrunner-rs \
@@ -76,7 +75,7 @@ jobs:
           mkdir -p "$OUTDIR"
           rm -rf "$STAGE"
           mkdir -p "$STAGE"
-          BINARY_DIR="target/x86_64-unknown-linux-musl/release"
+          BINARY_DIR="target/release"
           BINARY="$BINARY_DIR/server"
           TARBALL="$OUTDIR/theyos-engine-${CARGO_VERSION}-linux-x86_64.tar.gz"
           cp "$BINARY_DIR/server" "$STAGE/theyos-engine"
@@ -95,7 +94,7 @@ jobs:
         working-directory: admin/rust
         run: |
           set -e
-          BINARY="target/x86_64-unknown-linux-musl/release/server"
+          BINARY="target/release/server"
           # --version exits 0 immediately — proves ELF loads, argv is parsed, no linker fault.
           docker run --rm \
             -v "$(pwd)/$BINARY:/engine" \
@@ -123,6 +122,9 @@ jobs:
 
   build-linux-aarch64:
     name: Build Linux (aarch64)
+    # Disabled for v0.1.12: libdbus-sys/keyring needs a target dbus sysroot for
+    # cross builds. Do not block the x86_64 Linux release asset on that.
+    if: false
     runs-on: ubuntu-latest
     timeout-minutes: 60
 
