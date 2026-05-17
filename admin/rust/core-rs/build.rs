@@ -334,10 +334,22 @@ fn main() {
 
     // CLAWS_MANIFEST_YML is set by the Nix build (sandbox doesn't have the repo layout).
     // Falls back to the relative path for normal `cargo build` in the repo.
-    let manifest_path = std::env::var_os("CLAWS_MANIFEST_YML").map_or_else(
-        || Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../claws/manifest.yml"),
-        PathBuf::from,
-    );
+    let manifest_path = if let Some(path) = std::env::var_os("CLAWS_MANIFEST_YML") {
+        PathBuf::from(path)
+    } else {
+        let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+        [
+            manifest_dir.join("../../../claws/manifest.yml"),
+            // cross-rs mounts the workflow working-directory (`admin/rust`) as
+            // the project root, so the repo-level `claws/` directory is copied
+            // beside the crates for release builds.
+            manifest_dir.join("../claws/manifest.yml"),
+            PathBuf::from("/project/claws/manifest.yml"),
+        ]
+        .into_iter()
+        .find(|candidate| candidate.is_file())
+        .unwrap_or_else(|| manifest_dir.join("../../../claws/manifest.yml"))
+    };
     println!("cargo:rerun-if-changed={}", manifest_path.to_string_lossy());
 
     let content = fs::read_to_string(&manifest_path)
