@@ -1,7 +1,7 @@
 //! OS keystore wrapper.
 //!
 //! - On Linux, the 32-byte private scalar is stored via the `keyring` crate
-//!   (Secret Service or kernel keyring depending on availability).
+//!   using the kernel keyring backend.
 //! - On macOS, the private scalar lives **inside the Secure Enclave** —
 //!   nothing software-side stores it; the keystore label is the only handle
 //!   and lookup happens via `SecItemCopyMatching` (see [`crate::keys_se`]).
@@ -21,9 +21,9 @@ pub const SERVICE: &str = "com.soyeht.theyos";
 pub const MACOS_KEYCHAIN_DENIED_HINT: &str =
     "Allow theyos to access the Keychain in System Settings → Privacy & Security.";
 
-/// Exact operator hint for Linux Secret Service / kernel-keyring unavailability.
-pub const LINUX_SECRET_SERVICE_UNAVAILABLE_HINT: &str = "Install and unlock gnome-keyring/Secret Service, or set THEYOS_KEYRING=kernel \
-     to use the Linux kernel keyring backend.";
+/// Exact operator hint for Linux kernel keyring unavailability.
+pub const LINUX_SECRET_SERVICE_UNAVAILABLE_HINT: &str =
+    "Enable Linux kernel keyring support and ensure the user session keyring is available.";
 
 /// Contract helper for mapping a macOS Keychain-denied backend failure.
 #[doc(hidden)]
@@ -34,7 +34,7 @@ pub fn macos_keychain_denied_error() -> KeystoreError {
     }
 }
 
-/// Contract helper for mapping a Linux Secret-Service-unavailable backend failure.
+/// Contract helper for mapping a Linux kernel-keyring-unavailable backend failure.
 #[doc(hidden)]
 #[must_use]
 pub fn linux_secret_service_unavailable_error() -> KeystoreError {

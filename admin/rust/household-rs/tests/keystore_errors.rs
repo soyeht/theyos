@@ -19,20 +19,20 @@ fn mocked_keychain_denied_maps_to_exact_contract_hint() {
 
 #[cfg(target_os = "linux")]
 #[test]
-fn mocked_secret_service_unavailable_maps_to_exact_contract_hint() {
+fn mocked_linux_keyring_unavailable_maps_to_exact_contract_hint() {
     #[derive(Debug)]
-    struct SecretServiceUnavailable;
+    struct LinuxKeyringUnavailable;
 
-    impl std::fmt::Display for SecretServiceUnavailable {
+    impl std::fmt::Display for LinuxKeyringUnavailable {
         fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            f.write_str("mock Secret Service unavailable")
+            f.write_str("mock Linux keyring unavailable")
         }
     }
 
-    impl std::error::Error for SecretServiceUnavailable {}
+    impl std::error::Error for LinuxKeyringUnavailable {}
 
     let error = household_rs::keystore::map_linux_keyring_error_for_contract(
-        keyring::Error::PlatformFailure(Box::new(SecretServiceUnavailable)),
+        keyring::Error::PlatformFailure(Box::new(LinuxKeyringUnavailable)),
     );
 
     assert_eq!(error.kind(), "keystore.unavailable");
@@ -47,7 +47,7 @@ fn mocked_secret_service_unavailable_maps_to_exact_contract_hint() {
 
 #[cfg(not(target_os = "linux"))]
 #[test]
-fn secret_service_unavailable_contract_hint_is_stable_on_non_linux() {
+fn linux_keyring_unavailable_contract_hint_is_stable_on_non_linux() {
     let error = household_rs::keystore::linux_secret_service_unavailable_error();
 
     assert_eq!(error.kind(), "keystore.unavailable");

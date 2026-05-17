@@ -4,7 +4,7 @@ name: Release (Linux)
 # Builds Linux engine binaries for x86_64 and aarch64 via `cross`,
 # packages each into tar.gz + sha256, and uploads to the GitHub Release.
 #
-# Smoke-tests the binary boots in a minimal Alpine+glibc container.
+# Smoke-tests the binary boots in a minimal Alpine container.
 #
 # Prereqs: GitHub Release must already exist (created by release-macos.yml,
 # which runs first because it also does the notarization). This workflow
@@ -31,7 +31,7 @@ jobs:
 
     env:
       TAG: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.tag || github.ref_name }}
-      CARGO_TARGET: x86_64-unknown-linux-gnu
+      CARGO_TARGET: x86_64-unknown-linux-musl
 
     steps:
       - name: Checkout
@@ -39,11 +39,11 @@ jobs:
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
 
-      - name: Install Linux build dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libdbus-1-dev pkg-config
+      - name: Install cross
+        run: cargo install cross --git https://github.com/cross-rs/cross --locked
 
       - name: Cache Rust dependencies
         uses: Swatinem/rust-cache@v2
@@ -57,7 +57,8 @@ jobs:
           mkdir -p claws
           cp ../../claws/manifest.yml claws/manifest.yml
           export CLAWS_MANIFEST_YML="$PWD/claws/manifest.yml"
-          cargo build \
+          cross build \
+            --target x86_64-unknown-linux-musl \
             --release \
             -p server-rs \
             -p vmrunner-rs \
@@ -75,7 +76,7 @@ jobs:
           mkdir -p "$OUTDIR"
           rm -rf "$STAGE"
           mkdir -p "$STAGE"
-          BINARY_DIR="target/release"
+          BINARY_DIR="target/x86_64-unknown-linux-musl/release"
           BINARY="$BINARY_DIR/server"
           TARBALL="$OUTDIR/theyos-engine-${CARGO_VERSION}-linux-x86_64.tar.gz"
           cp "$BINARY_DIR/server" "$STAGE/theyos-engine"
@@ -90,16 +91,16 @@ jobs:
           echo "tarball=$TARBALL" >> "$GITHUB_ENV"
           echo "version=$CARGO_VERSION" >> "$GITHUB_ENV"
 
-      - name: Smoke-test binary (glibc, x86_64)
+      - name: Smoke-test binary (static musl, x86_64)
         working-directory: admin/rust
         run: |
           set -e
-          BINARY="target/release/server"
+          BINARY="target/x86_64-unknown-linux-musl/release/server"
           # --version exits 0 immediately — proves ELF loads, argv is parsed, no linker fault.
           docker run --rm \
             -v "$(pwd)/$BINARY:/engine" \
             --entrypoint /engine \
-            debian:stable-slim \
+            alpine:3.20 \
             --version
           echo "Smoke test passed: x86_64 binary --version exit 0"
 
@@ -122,9 +123,6 @@ jobs:
 
   build-linux-aarch64:
     name: Build Linux (aarch64)
-    # Disabled for v0.1.12: libdbus-sys/keyring needs a target dbus sysroot for
-    # cross builds. Do not block the x86_64 Linux release asset on that.
-    if: false
     runs-on: ubuntu-latest
     timeout-minutes: 60
 
@@ -195,7 +193,7 @@ jobs:
         with:
           platforms: arm64
 
-      - name: Smoke-test binary (glibc, aarch64)
+      - name: Smoke-test binary (static musl, aarch64)
         working-directory: admin/rust
         run: |
           set -e
@@ -204,7 +202,7 @@ jobs:
           docker run --rm --platform linux/arm64 \
             -v "$(pwd)/$BINARY:/engine" \
             --entrypoint /engine \
-            debian:stable-slim \
+            alpine:3.20 \
             --version
           echo "Smoke test passed: aarch64 binary --version exit 0"
 
