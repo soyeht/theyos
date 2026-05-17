@@ -51,6 +51,16 @@ fn macos_vm_limit_message(source: &str, error: &str) -> String {
     )
 }
 
+fn snapshots_dir_from_env_or_home() -> PathBuf {
+    match std::env::var("THEYOS_SNAPSHOTS_DIR") {
+        Ok(path) if !path.is_empty() => PathBuf::from(path),
+        _ => {
+            let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
+            PathBuf::from(home).join("Library/Application Support/theyos/snapshots")
+        }
+    }
+}
+
 // ── Shared state ──────────────────────────────────────────────────────────────
 
 /// A running VM entry that keeps the VZ machine and (for macOS guests) the
@@ -88,9 +98,7 @@ struct IpcState {
 
 impl IpcState {
     fn new() -> Result<Self, String> {
-        let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
-        let snapshots_dir =
-            PathBuf::from(&home).join("Library/Application Support/theyos/snapshots");
+        let snapshots_dir = snapshots_dir_from_env_or_home();
         std::fs::create_dir_all(&snapshots_dir)
             .map_err(|e| format!("create snapshots dir: {e}"))?;
 
@@ -108,7 +116,7 @@ impl IpcState {
             ..WarmPoolConfig::default()
         };
 
-        let warm_pool = WarmPoolManager::new(snapshots_dir, pool_cfg)
+        let warm_pool = WarmPoolManager::new(snapshots_dir.clone(), pool_cfg)
             .map_err(|e| format!("warm pool init: {e}"))?;
 
         let slots = MacOSVmSlotManager::new();
@@ -121,7 +129,7 @@ impl IpcState {
         });
         let base_snapshot = PathBuf::from(&assets_dir).join("macos-base/base.vzsnapshot");
         let mut snapshot_mgr = SnapshotManager::new(
-            PathBuf::from(&home).join("Library/Application Support/theyos/snapshots"),
+            snapshots_dir.clone(),
             24, // TTL hours (unused for base snapshots)
         );
         if base_snapshot.exists() {

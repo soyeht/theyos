@@ -43,7 +43,7 @@ jobs:
     timeout-minutes: 60
 
     env:
-      TAG: ${{ github.ref_name || github.event.inputs.tag }}
+      TAG: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.tag || github.ref_name }}
 
     steps:
       - name: Checkout (full history for tag)

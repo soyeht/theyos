@@ -1,6 +1,6 @@
 [package]
 name = "soyeht-rs"
-version = "0.1.11"
+version = "0.1.12"
 edition.workspace = true
 rust-version.workspace = true
 description = "theyOS operations CLI (health, status, rebuild, backup, admin-host, golden, dev)"

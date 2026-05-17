@@ -30,8 +30,8 @@ jobs:
     timeout-minutes: 45
 
     env:
-      TAG: ${{ github.ref_name || github.event.inputs.tag }}
-      CARGO_TARGET: x86_64-unknown-linux-gnu
+      TAG: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.tag || github.ref_name }}
+      CARGO_TARGET: x86_64-unknown-linux-musl
 
     steps:
       - name: Checkout
@@ -40,7 +40,7 @@ jobs:
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
         with:
-          targets: x86_64-unknown-linux-gnu
+          targets: x86_64-unknown-linux-musl
 
       - name: Install cross
         run: cargo install cross --git https://github.com/cross-rs/cross --locked
@@ -55,9 +55,13 @@ jobs:
         working-directory: admin/rust
         run: |
           cross build \
-            --target x86_64-unknown-linux-gnu \
+            --target x86_64-unknown-linux-musl \
             --release \
-            -p server-rs
+            -p server-rs \
+            -p vmrunner-rs \
+            -p store-rs \
+            -p terminal-rs \
+            -p imagebuilder-rs
 
       - name: Package + sha256
         working-directory: admin/rust
@@ -65,10 +69,21 @@ jobs:
           set -e
           CARGO_VERSION=$(grep '^version' soyeht-rs/Cargo.toml | sed 's/version = "\(.*\)"/\1/')
           OUTDIR="dist/linux-x86_64"
+          STAGE="dist/.linux-stage-x86_64"
           mkdir -p "$OUTDIR"
-          BINARY="target/x86_64-unknown-linux-gnu/release/server-rs"
+          rm -rf "$STAGE"
+          mkdir -p "$STAGE"
+          BINARY_DIR="target/x86_64-unknown-linux-musl/release"
+          BINARY="$BINARY_DIR/server"
           TARBALL="$OUTDIR/theyos-engine-${CARGO_VERSION}-linux-x86_64.tar.gz"
-          tar czf "$TARBALL" -C "$(dirname "$BINARY")" "$(basename "$BINARY")"
+          cp "$BINARY_DIR/server" "$STAGE/theyos-engine"
+          cp "$BINARY_DIR/vmrunner_ipc" "$STAGE/vmrunner_ipc"
+          cp "$BINARY_DIR/fc-ssh" "$STAGE/fc-ssh"
+          cp "$BINARY_DIR/store-ipc" "$STAGE/store-ipc"
+          cp "$BINARY_DIR/terminal-ipc" "$STAGE/terminal-ipc"
+          cp "$BINARY_DIR/imagebuilder" "$STAGE/imagebuilder"
+          printf '%s\n' "$CARGO_VERSION" > "$STAGE/engine-version.txt"
+          tar czf "$TARBALL" -C "$STAGE" .
           sha256sum "$TARBALL" > "${TARBALL}.sha256"
           echo "tarball=$TARBALL" >> "$GITHUB_ENV"
           echo "version=$CARGO_VERSION" >> "$GITHUB_ENV"
@@ -77,7 +92,7 @@ jobs:
         working-directory: admin/rust
         run: |
           set -e
-          BINARY="target/x86_64-unknown-linux-gnu/release/server-rs"
+          BINARY="target/x86_64-unknown-linux-musl/release/server"
           # --version exits 0 immediately — proves ELF loads, argv is parsed, no linker fault.
           docker run --rm \
             -v "$(pwd)/$BINARY:/engine" \
@@ -90,6 +105,14 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          for i in $(seq 1 90); do
+            if gh release view "$TAG" >/dev/null 2>&1; then
+              break
+            fi
+            echo "Waiting for GitHub Release $TAG to be created by release-macos.yml ($i/90)..."
+            sleep 10
+          done
+          gh release view "$TAG" >/dev/null
           gh release upload "$TAG" \
             "admin/rust/${{ env.tarball }}#theyos-engine-${{ env.version }}-linux-x86_64.tar.gz" \
             "admin/rust/${{ env.tarball }}.sha256#theyos-engine-${{ env.version }}-linux-x86_64.tar.gz.sha256" \
@@ -101,8 +124,8 @@ jobs:
     timeout-minutes: 60
 
     env:
-      TAG: ${{ github.ref_name || github.event.inputs.tag }}
-      CARGO_TARGET: aarch64-unknown-linux-gnu
+      TAG: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.tag || github.ref_name }}
+      CARGO_TARGET: aarch64-unknown-linux-musl
 
     steps:
       - name: Checkout
@@ -111,7 +134,7 @@ jobs:
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
         with:
-          targets: aarch64-unknown-linux-gnu
+          targets: aarch64-unknown-linux-musl
 
       - name: Install cross
         run: cargo install cross --git https://github.com/cross-rs/cross --locked
@@ -126,9 +149,13 @@ jobs:
         working-directory: admin/rust
         run: |
           cross build \
-            --target aarch64-unknown-linux-gnu \
+            --target aarch64-unknown-linux-musl \
             --release \
-            -p server-rs
+            -p server-rs \
+            -p vmrunner-rs \
+            -p store-rs \
+            -p terminal-rs \
+            -p imagebuilder-rs
 
       - name: Package + sha256
         working-directory: admin/rust
@@ -136,10 +163,21 @@ jobs:
           set -e
           CARGO_VERSION=$(grep '^version' soyeht-rs/Cargo.toml | sed 's/version = "\(.*\)"/\1/')
           OUTDIR="dist/linux-aarch64"
+          STAGE="dist/.linux-stage-aarch64"
           mkdir -p "$OUTDIR"
-          BINARY="target/aarch64-unknown-linux-gnu/release/server-rs"
+          rm -rf "$STAGE"
+          mkdir -p "$STAGE"
+          BINARY_DIR="target/aarch64-unknown-linux-musl/release"
+          BINARY="$BINARY_DIR/server"
           TARBALL="$OUTDIR/theyos-engine-${CARGO_VERSION}-linux-aarch64.tar.gz"
-          tar czf "$TARBALL" -C "$(dirname "$BINARY")" "$(basename "$BINARY")"
+          cp "$BINARY_DIR/server" "$STAGE/theyos-engine"
+          cp "$BINARY_DIR/vmrunner_ipc" "$STAGE/vmrunner_ipc"
+          cp "$BINARY_DIR/fc-ssh" "$STAGE/fc-ssh"
+          cp "$BINARY_DIR/store-ipc" "$STAGE/store-ipc"
+          cp "$BINARY_DIR/terminal-ipc" "$STAGE/terminal-ipc"
+          cp "$BINARY_DIR/imagebuilder" "$STAGE/imagebuilder"
+          printf '%s\n' "$CARGO_VERSION" > "$STAGE/engine-version.txt"
+          tar czf "$TARBALL" -C "$STAGE" .
           sha256sum "$TARBALL" > "${TARBALL}.sha256"
           echo "tarball=$TARBALL" >> "$GITHUB_ENV"
           echo "version=$CARGO_VERSION" >> "$GITHUB_ENV"
@@ -153,7 +191,7 @@ jobs:
         working-directory: admin/rust
         run: |
           set -e
-          BINARY="target/aarch64-unknown-linux-gnu/release/server-rs"
+          BINARY="target/aarch64-unknown-linux-musl/release/server"
           # --version exits 0 immediately — proves ELF loads, argv is parsed, no linker fault.
           docker run --rm --platform linux/arm64 \
             -v "$(pwd)/$BINARY:/engine" \
@@ -166,6 +204,14 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          for i in $(seq 1 90); do
+            if gh release view "$TAG" >/dev/null 2>&1; then
+              break
+            fi
+            echo "Waiting for GitHub Release $TAG to be created by release-macos.yml ($i/90)..."
+            sleep 10
+          done
+          gh release view "$TAG" >/dev/null
           gh release upload "$TAG" \
             "admin/rust/${{ env.tarball }}#theyos-engine-${{ env.version }}-linux-aarch64.tar.gz" \
             "admin/rust/${{ env.tarball }}.sha256#theyos-engine-${{ env.version }}-linux-aarch64.tar.gz.sha256" \
