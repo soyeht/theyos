@@ -106,11 +106,12 @@ jobs:
           # P28: operational shell scripts are forbidden. Keep the policy strict for
           # unexpected additions, but allow the existing repo-root release/dev helpers.
           OPERATIONAL=$(find scripts/ -name '*.sh' -type f \
-                   ! -path 'scripts/make.sh' \
-                   ! -path 'scripts/publish-claw-artifact.sh' \
-                   ! -path 'scripts/generate-brew-formula.sh' \
-                   ! -path 'scripts/install-linux.sh' \
-                   2>/dev/null || true)
+            ! -path 'scripts/make.sh' \
+            ! -path 'scripts/publish-claw-artifact.sh' \
+            ! -path 'scripts/generate-brew-formula.sh' \
+            ! -path 'scripts/install-linux.sh' \
+            ! -path 'scripts/uninstall-linux.sh' \
+            2>/dev/null || true)
           if [ -n "$OPERATIONAL" ]; then
             echo "::error::Found .sh scripts in scripts/ — policy: all operations must use Rust binaries"
             echo "$OPERATIONAL"
