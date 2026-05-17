@@ -52,12 +52,10 @@ jobs:
           shared-key: "release-linux-x86_64"
 
       - name: Build (release)
-        working-directory: admin/rust
         run: |
-          mkdir -p claws
-          cp ../../claws/manifest.yml claws/manifest.yml
           export CLAWS_MANIFEST_YML="$PWD/claws/manifest.yml"
           cross build \
+            --manifest-path admin/rust/Cargo.toml \
             --target x86_64-unknown-linux-musl \
             --release \
             -p server-rs \
@@ -149,12 +147,10 @@ jobs:
           shared-key: "release-linux-aarch64"
 
       - name: Cross-compile (release)
-        working-directory: admin/rust
         run: |
-          mkdir -p claws
-          cp ../../claws/manifest.yml claws/manifest.yml
           export CLAWS_MANIFEST_YML="$PWD/claws/manifest.yml"
           cross build \
+            --manifest-path admin/rust/Cargo.toml \
             --target aarch64-unknown-linux-musl \
             --release \
             -p server-rs \
