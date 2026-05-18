@@ -190,10 +190,14 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -e
-          gh release create "$TAG" \
-            --title "$TAG" \
-            --notes "Automated release. See commit history and PRs merged into main since the previous tag for change details. macOS engine SHA256: \`${{ steps.tarball.outputs.sha256 }}\`" \
-            "${{ steps.tarball.outputs.tarball_path }}#theyos-engine-${{ steps.tarball.outputs.version }}-macos-arm64.tar.gz"
+          NOTES="Automated release. See commit history and PRs merged into main since the previous tag for change details. macOS engine SHA256: \`${{ steps.tarball.outputs.sha256 }}\`"
+          ASSET="${{ steps.tarball.outputs.tarball_path }}#theyos-engine-${{ steps.tarball.outputs.version }}-macos-arm64.tar.gz"
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" "$ASSET" --clobber
+            gh release edit "$TAG" --title "$TAG" --notes "$NOTES"
+          else
+            gh release create "$TAG" --title "$TAG" --notes "$NOTES" "$ASSET"
+          fi
 
       - name: Regenerate Homebrew formula
         env:
