@@ -297,11 +297,11 @@ main() {
     fi
     [ -f "$NEW_ENGINE_DIR/theyos-engine" ] || die "Package did not contain theyos-engine."
     [ -f "$NEW_ENGINE_DIR/soyeht" ] || die "Package did not contain soyeht CLI."
-    [ -f "$NEW_ENGINE_DIR/uninstall-release-linux.sh" ] || die "Package did not contain uninstall helper."
+    [ -f "$NEW_ENGINE_DIR/uninstall-linux.sh" ] || die "Package did not contain uninstall helper."
     for bin in theyos-engine soyeht vmrunner_ipc fc-ssh store-ipc terminal-ipc imagebuilder; do
         [ -f "$NEW_ENGINE_DIR/$bin" ] && chmod +x "$NEW_ENGINE_DIR/$bin"
     done
-    chmod +x "$NEW_ENGINE_DIR/uninstall-release-linux.sh"
+    chmod +x "$NEW_ENGINE_DIR/uninstall-linux.sh"
     if [ -d "$ENGINE_DIR" ]; then
         mv "$ENGINE_DIR" "$OLD_ENGINE_DIR"
     fi

@@ -1,0 +1,467 @@
+#!/usr/bin/env bash
+set -euo pipefail
+REPO_DIR="$(cd "$(dirname "$0")" && pwd)"
+NIX_DIR="$REPO_DIR/nix"
+
+# ── Parse flags ─────────────────────────────────────────────────────────────
+
+KEEP_DATA=false
+AUTO_YES=false
+for arg in "$@"; do
+    case "$arg" in
+        --keep-data) KEEP_DATA=true ;;
+        --yes|-y)    AUTO_YES=true ;;
+        --help|-h)
+            printf 'Usage: ./uninstall-nixos [--keep-data] [--yes]\n\n'
+            printf '  --keep-data   Keep customer data (claws/data/) and Firecracker VMs\n'
+            printf '  --yes, -y     Skip confirmation prompt\n'
+            exit 0
+            ;;
+        *)
+            printf '[error] Unknown flag: %s\n' "$arg"
+            printf 'Usage: ./uninstall-nixos [--keep-data] [--yes]\n'
+            exit 1
+            ;;
+    esac
+done
+
+# ── Re-exec inside nix-shell if dependencies are missing ────────────────────
+
+if [ -z "${_THEYOS_IN_NIX_SHELL:-}" ]; then
+    MISSING=()
+    for cmd in git; do
+        command -v "$cmd" >/dev/null 2>&1 || MISSING+=("$cmd")
+    done
+    if [ ${#MISSING[@]} -gt 0 ]; then
+        printf '[uninstall] Missing: %s — entering nix-shell...\n' "${MISSING[*]}"
+        exec nix-shell -p git --run "_THEYOS_IN_NIX_SHELL=1 $0 $*"
+    fi
+fi
+
+if [ "${EUID:-$(id -u)}" -ne 0 ]; then
+    exec sudo env THEYOS_UNINSTALL_USER="${SUDO_USER:-$(id -un)}" "$0" "$@"
+fi
+
+printf '============================================\n'
+printf ' theyOS NixOS uninstaller\n'
+printf '============================================\n\n'
+
+FAILURES=()
+
+remove_path() {
+    local path="$1"
+    if [ ! -e "$path" ] && [ ! -L "$path" ]; then
+        return 0
+    fi
+    if rm -rf "$path" 2>/dev/null; then
+        printf '[uninstall]   %s removed.\n' "$path"
+    elif sudo rm -rf "$path" 2>/dev/null; then
+        printf '[uninstall]   %s removed with sudo.\n' "$path"
+    else
+        printf '[warn] Could not remove %s\n' "$path" >&2
+        FAILURES+=("$path")
+    fi
+}
+
+secure_remove_file() {
+    local path="$1"
+    [ -f "$path" ] || return 0
+    if command -v shred >/dev/null 2>&1; then
+        shred -fz -n 3 "$path" 2>/dev/null || sudo shred -fz -n 3 "$path" 2>/dev/null || true
+    fi
+    remove_path "$path"
+}
+
+# ── Preflight ────────────────────────────────────────────────────────────────
+
+if [ ! -f /etc/NIXOS ]; then
+    printf '[error] This script requires NixOS.\n'
+    printf '        For other Linux distros, use the appropriate uninstall method.\n'
+    exit 1
+fi
+
+# Detect user from nix/host.nix (fallback: the user that invoked sudo)
+THEYOS_USER="${THEYOS_UNINSTALL_USER:-${SUDO_USER:-$(whoami)}}"
+if [ -f "$NIX_DIR/host.nix" ]; then
+    DETECTED_USER="$(sed -n 's/.*user\s*=\s*"\([^"]*\)".*/\1/p' "$NIX_DIR/host.nix" 2>/dev/null || true)"
+    [ -n "$DETECTED_USER" ] && THEYOS_USER="$DETECTED_USER"
+fi
+USER_HOME="/home/$THEYOS_USER"
+
+# Detect backup
+BACKUP="/etc/nixos/configuration.nix.pre-theyos"
+HAS_BACKUP=false
+[ -f "$BACKUP" ] && HAS_BACKUP=true
+
+# Verify theyOS is actually installed
+INSTALLED=false
+[ -f "$NIX_DIR/host.nix" ] && INSTALLED=true
+[ -d /var/lib/theyos/secrets ] && INSTALLED=true
+systemctl list-unit-files soyeht-admin-host.service >/dev/null 2>&1 && INSTALLED=true
+
+if [ "$INSTALLED" = false ]; then
+    printf '[error] theyOS does not appear to be installed.\n'
+    printf '        No host.nix, no secrets, no systemd services found.\n'
+    exit 1
+fi
+
+# ── Confirmation ─────────────────────────────────────────────────────────────
+
+printf '  This will:\n\n'
+printf '    1. Stop all theyOS systemd services and timers\n'
+
+if [ -f "$NIX_DIR/base-configuration.nix" ]; then
+    printf '    2. Restore original NixOS configuration from nix/base-configuration.nix\n'
+elif [ "$HAS_BACKUP" = true ]; then
+    printf '    2. Restore original NixOS configuration from backup\n'
+elif [ -f /etc/nixos/configuration.nix ] && ! grep -qiE 'theyos|soyeht' /etc/nixos/configuration.nix; then
+    printf '    2. Rebuild using current /etc/nixos/configuration.nix (no theyOS references found)\n'
+else
+    printf '    2. Generate minimal NixOS configuration (last resort)\n'
+fi
+
+printf '    3. Run nixos-rebuild switch (revert system to pre-theyOS state)\n'
+printf '    4. Securely wipe secrets (/var/lib/theyos/secrets/)\n'
+
+if [ "$KEEP_DATA" = true ]; then
+    printf '    5. Remove Firecracker symlinks and SSH keys (keep VMs and data)\n'
+    printf '    6. Remove runtime files (.env, .run/, logs/, claws/src/)\n'
+    printf '    7. KEEP customer data (claws/data/) and Firecracker instances\n'
+else
+    printf '    5. Remove Firecracker directory (~/firecracker/)\n'
+    printf '    6. Remove all runtime and customer data\n'
+fi
+
+printf '    %d. Remove generated nix files and clean Nix store\n' "$([ "$KEEP_DATA" = true ] && echo 8 || echo 7)"
+printf '\n'
+
+if [ "$KEEP_DATA" = true ]; then
+    printf '  [i] --keep-data: customer data in claws/data/ will be preserved.\n\n'
+fi
+
+if [ "$AUTO_YES" = false ]; then
+    printf '  Type "uninstall" to confirm: '
+    read -r CONFIRM
+    if [ "$CONFIRM" != "uninstall" ]; then
+        printf '\n  Aborted.\n'
+        exit 1
+    fi
+    printf '\n'
+fi
+
+# ── Stop services ────────────────────────────────────────────────────────────
+
+printf '[uninstall] Stopping theyOS services...\n'
+
+# Timers first (prevent scheduled activations)
+for timer in theyos-golden-rebuild.timer daily-backup.timer app-healthcheck.timer; do
+    if sudo systemctl is-active --quiet "$timer" 2>/dev/null; then
+        sudo systemctl stop "$timer" 2>/dev/null || true
+    fi
+    sudo systemctl disable "$timer" 2>/dev/null || true
+    printf '[uninstall]   stopped %s\n' "$timer"
+done
+
+# Services (reverse dependency order)
+for svc in \
+    app-healthcheck.service \
+    daily-backup.service \
+    theyos-golden-rebuild.service \
+    theyos-rootfs-build.service \
+    theyos-clone-claws.service \
+    cloudflared.service \
+    soyeht-admin-host.service \
+; do
+    if sudo systemctl is-active --quiet "$svc" 2>/dev/null; then
+        sudo systemctl stop "$svc" 2>/dev/null || true
+        printf '[uninstall]   stopped %s\n' "$svc"
+    fi
+done
+
+printf '[uninstall] Services stopped.\n\n'
+
+# ── Build minimal NixOS configuration ────────────────────────────────────────
+#
+# NixOS with flakes has a read-only /etc, so we can't write to /etc/nixos/.
+# Instead, build a temporary minimal flake and use nixos-rebuild --flake.
+
+printf '[uninstall] Preparing minimal NixOS configuration...\n'
+
+# Detect stateVersion
+STATE_VERSION="25.05"
+if [ -f "$NIX_DIR/base-configuration.nix" ]; then
+    DETECTED_SV="$(sed -n 's/.*stateVersion\s*=\s*"\([^"]*\)".*/\1/p' "$NIX_DIR/base-configuration.nix" 2>/dev/null || true)"
+    [ -n "$DETECTED_SV" ] && STATE_VERSION="$DETECTED_SV"
+fi
+
+# Find hardware-configuration.nix
+HW_CONFIG=""
+if [ -f "$NIX_DIR/hardware-configuration.nix" ]; then
+    HW_CONFIG="$NIX_DIR/hardware-configuration.nix"
+elif [ -f /etc/nixos/hardware-configuration.nix ]; then
+    HW_CONFIG="/etc/nixos/hardware-configuration.nix"
+fi
+
+if [ -z "$HW_CONFIG" ]; then
+    printf '[error] Cannot find hardware-configuration.nix.\n'
+    printf '        Run: sudo nixos-generate-config\n'
+    printf '        Then re-run this script.\n'
+    exit 1
+fi
+
+# Build a temporary minimal flake in /tmp
+UNINSTALL_DIR="$(mktemp -d /tmp/theyos-uninstall.XXXXXX)"
+trap 'sudo rm -rf "$UNINSTALL_DIR"' EXIT
+
+# Copy hardware config
+cp "$HW_CONFIG" "$UNINSTALL_DIR/hardware-configuration.nix"
+
+# Pick the best available configuration:
+# 1. base-configuration.nix (original /etc/nixos/configuration.nix, has correct boot loader)
+# 2. Backup from /etc/nixos/configuration.nix.pre-theyos
+# 3. Current /etc/nixos/configuration.nix when it does not reference theyOS
+# 4. Generate minimal (last resort)
+if [ -f "$NIX_DIR/base-configuration.nix" ]; then
+    cp "$NIX_DIR/base-configuration.nix" "$UNINSTALL_DIR/configuration.nix"
+    printf '[uninstall]   Using original configuration from nix/base-configuration.nix\n'
+elif [ "$HAS_BACKUP" = true ]; then
+    cp "$BACKUP" "$UNINSTALL_DIR/configuration.nix"
+    printf '[uninstall]   Using backed-up configuration from %s\n' "$BACKUP"
+elif [ -f /etc/nixos/configuration.nix ] && ! grep -qiE 'theyos|soyeht' /etc/nixos/configuration.nix; then
+    cp /etc/nixos/configuration.nix "$UNINSTALL_DIR/configuration.nix"
+    printf '[uninstall]   Using current /etc/nixos/configuration.nix (no theyOS references found)\n'
+else
+    # Generate minimal configuration with auto-detected boot loader.
+    if [ -d /sys/firmware/efi ]; then
+        BOOT_LOADER_LINES='  boot.loader.systemd-boot.enable = true;
+  boot.loader.efi.canTouchEfiVariables = true;'
+    else
+        BOOT_DISK="$(lsblk -ndo NAME,TYPE | awk '$2=="disk"{print $1; exit}')"
+        BOOT_LOADER_LINES="  boot.loader.grub.enable = true;
+  boot.loader.grub.device = \"/dev/${BOOT_DISK:-sda}\";
+  boot.loader.grub.forceInstall = true;"
+    fi
+    cat > "$UNINSTALL_DIR/configuration.nix" <<MINEOF
+# Minimal NixOS configuration generated by theyOS uninstaller.
+{ config, pkgs, ... }:
+
+{
+  imports = [ ./hardware-configuration.nix ];
+
+$BOOT_LOADER_LINES
+
+  services.openssh.enable = true;
+
+  system.stateVersion = "$STATE_VERSION";
+}
+MINEOF
+    printf '[uninstall]   Generated minimal configuration (no backup found).\n'
+fi
+
+NIXPKGS_URL="github:NixOS/nixpkgs/nixos-unstable"
+if [ -d /nix/var/nix/profiles/per-user/root/channels/nixos ]; then
+    NIXPKGS_URL="path:$(readlink -f /nix/var/nix/profiles/per-user/root/channels/nixos)"
+elif [ -d /nix/var/nix/profiles/per-user/root/channels/nixpkgs ]; then
+    NIXPKGS_URL="path:$(readlink -f /nix/var/nix/profiles/per-user/root/channels/nixpkgs)"
+fi
+
+case "$(uname -m)" in
+    x86_64) NIX_SYSTEM="x86_64-linux" ;;
+    aarch64|arm64) NIX_SYSTEM="aarch64-linux" ;;
+    *) NIX_SYSTEM="$(uname -m)-linux" ;;
+esac
+
+# Generate flake.nix wrapper
+cat > "$UNINSTALL_DIR/flake.nix" <<FLAKEEOF
+{
+  inputs.nixpkgs.url = "$NIXPKGS_URL";
+  outputs = { self, nixpkgs }: {
+    nixosConfigurations.uninstall = nixpkgs.lib.nixosSystem {
+      system = "$NIX_SYSTEM";
+      modules = [ ./configuration.nix ];
+    };
+  };
+}
+FLAKEEOF
+printf '[uninstall]   nixpkgs input: %s\n' "$NIXPKGS_URL"
+
+# Initialize git repo (flakes require tracked files)
+git -C "$UNINSTALL_DIR" init -q
+git -C "$UNINSTALL_DIR" add -A
+
+printf '\n'
+
+# ── Rebuild NixOS (revert system to pre-theyOS state) ───────────────────────
+
+printf '[uninstall] Rebuilding NixOS configuration...\n'
+printf '[uninstall] This may take a few minutes.\n\n'
+
+# Ensure all fstab mounts are active (EFI partition needed for bootloader install)
+sudo mount -a 2>/dev/null || true
+
+sudo nixos-rebuild switch --flake "${UNINSTALL_DIR}#uninstall" \
+    --option experimental-features "nix-command flakes" \
+    --no-build-nix \
+    --fast
+
+printf '\n[uninstall] NixOS configuration reverted.\n\n'
+
+# ── Remove stateful data ────────────────────────────────────────────────────
+
+printf '[uninstall] Removing stateful data...\n'
+
+# Secrets (secure wipe)
+if [ -d /var/lib/theyos/secrets ]; then
+    if command -v shred >/dev/null 2>&1; then
+        sudo find /var/lib/theyos/secrets -type f -exec shred -fz -n 3 {} \; 2>/dev/null || true
+    fi
+    remove_path /var/lib/theyos
+fi
+
+# Sudoers drop-in
+_SUDOERS_FILE="/etc/sudoers.d/theyos-$(whoami)"
+if [ -f "$_SUDOERS_FILE" ]; then
+    remove_path "$_SUDOERS_FILE"
+fi
+
+# .env (contains secrets)
+secure_remove_file "$REPO_DIR/.env"
+
+# Firecracker directory
+if [ -d "$USER_HOME/firecracker" ]; then
+    if [ "$KEEP_DATA" = true ]; then
+        # Keep instances and golden builds, remove only nix symlinks and SSH keys
+        rm -f "$USER_HOME/firecracker/bin/firecracker" 2>/dev/null || true
+        rm -f "$USER_HOME/firecracker/bin/jailer" 2>/dev/null || true
+        rm -f "$USER_HOME/firecracker/assets/vmlinux-6.1.155" 2>/dev/null || true
+        rm -f "$USER_HOME/firecracker/assets/ubuntu-24.04-root.id_rsa" 2>/dev/null || true
+        rm -f "$USER_HOME/firecracker/assets/ubuntu-24.04-root.id_rsa.pub" 2>/dev/null || true
+        printf '[uninstall]   ~/firecracker/ symlinks and SSH keys removed (data kept).\n'
+else
+        remove_path "$USER_HOME/firecracker"
+    fi
+fi
+
+# Runtime directories
+remove_path "$REPO_DIR/.run"
+remove_path "$REPO_DIR/logs"
+remove_path "$USER_HOME/.local/share/Soyeht"
+remove_path "$USER_HOME/.local/share/theyos"
+remove_path "$USER_HOME/.config/theyos"
+remove_path "$USER_HOME/.cache/theyos"
+remove_path "$USER_HOME/.local/state/theyos"
+remove_path "$USER_HOME/.local/state/theyos-ollama"
+remove_path "$USER_HOME/.theyos"
+if [ "$KEEP_DATA" = false ]; then
+    remove_path "$USER_HOME/theyos-backups"
+fi
+remove_path /tmp/theyos.db
+remove_path /tmp/theyos.db-shm
+remove_path /tmp/theyos.db-wal
+remove_path /tmp/theyos.sessions.db
+remove_path /tmp/theyos.sessions.db-shm
+remove_path /tmp/theyos.sessions.db-wal
+remove_path /tmp/theyos-sessions.db
+remove_path /tmp/theyos-sessions.db-shm
+remove_path /tmp/theyos-sessions.db-wal
+remove_path /tmp/jobs-rs.db
+remove_path /tmp/jobs-rs.db-shm
+remove_path /tmp/jobs-rs.db-wal
+remove_path /tmp/ratelimit-rs.db
+remove_path /tmp/ratelimit-rs.db-shm
+remove_path /tmp/ratelimit-rs.db-wal
+for tmp_path in /tmp/soyeht-* /tmp/theyos-ollama-*; do
+    [ -e "$tmp_path" ] || [ -L "$tmp_path" ] || continue
+    remove_path "$tmp_path"
+done
+
+# Claws
+if [ "$KEEP_DATA" = true ]; then
+    remove_path "$REPO_DIR/claws/src"
+    printf '[uninstall]   claws/src/ removed (claws/data/ kept).\n'
+else
+    remove_path "$REPO_DIR/claws/src"
+    remove_path "$REPO_DIR/claws/data"
+    printf '[uninstall]   claws/src/ and claws/data/ removed.\n'
+fi
+
+printf '\n'
+
+# ── Remove generated nix files ──────────────────────────────────────────────
+
+printf '[uninstall] Removing generated nix files...\n'
+
+# Remove from git index (they were force-added despite gitignore)
+git -C "$REPO_DIR" rm -f --cached \
+    nix/host.nix \
+    nix/hardware-configuration.nix \
+    nix/base-configuration.nix \
+    2>/dev/null || true
+
+# Delete the files
+remove_path "$NIX_DIR/host.nix"
+remove_path "$NIX_DIR/hardware-configuration.nix"
+remove_path "$NIX_DIR/base-configuration.nix"
+printf '[uninstall]   nix/host.nix, hardware-configuration.nix, base-configuration.nix removed.\n'
+
+# Remove nix build artifacts
+remove_path "$REPO_DIR/result"
+remove_path "$REPO_DIR/flake.lock"
+printf '[uninstall]   result and flake.lock removed.\n'
+
+# Remove backup (already restored)
+if [ -f "$BACKUP" ]; then
+    remove_path "$BACKUP"
+fi
+
+printf '\n'
+
+# ── Nix store garbage collection ────────────────────────────────────────────
+
+printf '[uninstall] Cleaning Nix store (garbage collection)...\n'
+printf '[uninstall] This may take a few minutes.\n'
+
+sudo nix-collect-garbage -d 2>/dev/null || true
+
+printf '[uninstall] Nix store cleaned.\n'
+
+# ── Verification ────────────────────────────────────────────────────────────
+
+RESIDUALS=()
+for svc in soyeht-admin-host.service cloudflared.service theyos-golden-rebuild.service theyos-rootfs-build.service theyos-clone-claws.service; do
+    if sudo systemctl is-active --quiet "$svc" 2>/dev/null; then
+        RESIDUALS+=("active $svc")
+    fi
+done
+for path in /var/lib/theyos "$USER_HOME/firecracker" "$USER_HOME/.local/share/Soyeht" "$USER_HOME/.local/share/theyos" "$USER_HOME/.config/theyos" "$USER_HOME/.cache/theyos" "$USER_HOME/.local/state/theyos" "$USER_HOME/.local/state/theyos-ollama" "$USER_HOME/.theyos" /tmp/theyos.db /tmp/theyos.sessions.db /tmp/jobs-rs.db /tmp/ratelimit-rs.db; do
+    [ -e "$path" ] || [ -L "$path" ] && RESIDUALS+=("$path")
+done
+if [ "$KEEP_DATA" = false ] && { [ -e "$USER_HOME/theyos-backups" ] || [ -L "$USER_HOME/theyos-backups" ]; }; then
+    RESIDUALS+=("$USER_HOME/theyos-backups")
+fi
+
+if [ "${#FAILURES[@]}" -gt 0 ] || [ "${#RESIDUALS[@]}" -gt 0 ]; then
+    printf '[error] Residual theyOS artifacts remain:\n' >&2
+    printf '  %s\n' "${FAILURES[@]}" "${RESIDUALS[@]}" >&2
+    exit 1
+fi
+
+# ── Done ─────────────────────────────────────────────────────────────────────
+
+printf '\n============================================\n'
+printf ' theyOS has been uninstalled.\n'
+printf '============================================\n\n'
+
+printf '  What was done:\n'
+printf '    - All theyOS services stopped and removed\n'
+printf '    - NixOS configuration restored to pre-theyOS state\n'
+printf '    - Secrets securely wiped\n'
+if [ "$KEEP_DATA" = true ]; then
+    printf '    - Customer data preserved (claws/data/, firecracker instances)\n'
+fi
+printf '    - Nix store garbage collected\n'
+printf '\n'
+printf '  The theyOS repo is still at: %s\n' "$REPO_DIR"
+printf '  To fully remove it: rm -rf %s\n\n' "$REPO_DIR"
+printf '  Your system is back to its original NixOS configuration.\n'
+printf '  Edit /etc/nixos/configuration.nix to make further changes.\n\n'

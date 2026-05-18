@@ -65,15 +65,15 @@ if [ "${1:-}" = "uninstall" ]; then
     target="$(readlink "$0" 2>/dev/null || true)"
     [ -n "$target" ] && self="$target"
   fi
-  exec "$(dirname "$self")/uninstall-release-linux.sh" "$@"
+  exec "$(dirname "$self")/uninstall-linux.sh" "$@"
 fi
 printf 'fake soyeht: unsupported command: %s\n' "${1:-}" >&2
 exit 2
 SH
-cp "$REPO_DIR/scripts/internal/uninstall-release-linux.sh" "$TMP/package/uninstall-release-linux.sh"
-chmod +x "$TMP/package/soyeht" "$TMP/package/uninstall-release-linux.sh"
+cp "$REPO_DIR/scripts/uninstall-linux.sh" "$TMP/package/uninstall-linux.sh"
+chmod +x "$TMP/package/soyeht" "$TMP/package/uninstall-linux.sh"
 chmod +x "$TMP/package/theyos-engine"
-(cd "$TMP/package" && tar czf "$TMP/dist/theyos-engine-9.9.9-linux-aarch64.tar.gz" theyos-engine soyeht uninstall-release-linux.sh)
+(cd "$TMP/package" && tar czf "$TMP/dist/theyos-engine-9.9.9-linux-aarch64.tar.gz" theyos-engine soyeht uninstall-linux.sh)
 shasum -a 256 "$TMP/dist/theyos-engine-9.9.9-linux-aarch64.tar.gz" > "$TMP/dist/theyos-engine-9.9.9-linux-aarch64.tar.gz.sha256"
 cp "$TMP/dist/theyos-engine-9.9.9-linux-aarch64.tar.gz" "$TMP/dist/theyos-engine-9.9.9-linux-x86_64.tar.gz"
 cp "$TMP/dist/theyos-engine-9.9.9-linux-aarch64.tar.gz.sha256" "$TMP/dist/theyos-engine-9.9.9-linux-x86_64.tar.gz.sha256"
@@ -89,7 +89,7 @@ sh "$REPO_DIR/scripts/install-linux.sh"
 
 test -x "$SOYEHT_INSTALL_DIR/engine/theyos-engine"
 test -x "$SOYEHT_INSTALL_DIR/engine/soyeht"
-test -x "$SOYEHT_INSTALL_DIR/engine/uninstall-release-linux.sh"
+test -x "$SOYEHT_INSTALL_DIR/engine/uninstall-linux.sh"
 test "$(readlink "$HOME/.local/bin/soyeht")" = "$SOYEHT_INSTALL_DIR/engine/soyeht"
 test -f "$SOYEHT_INSTALL_DIR/install-receipt"
 test -f "$SOYEHT_INSTALL_DIR/.linger-enabled-by-soyeht"

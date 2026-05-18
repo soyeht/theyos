@@ -63,12 +63,12 @@ fn detect_target() -> Result<UninstallTarget, String> {
 
     if let Some(root) = repo_root.as_deref() {
         if crate::nixos::is_nixos_managed(root) {
-            return internal_script(root, "uninstall-nixos-managed.sh")
+            return repo_script(root, "uninstall-nixos")
                 .map(|script| UninstallTarget::NixosManaged { script });
         }
 
         if source_checkout_installed(root, &home) {
-            return internal_script(root, "uninstall-source-checkout.sh")
+            return repo_script(root, "uninstall")
                 .map(|script| UninstallTarget::SourceCheckout { script });
         }
     }
@@ -88,15 +88,12 @@ fn detect_target() -> Result<UninstallTarget, String> {
     Err("no Soyeht installation was detected on this machine".into())
 }
 
-fn internal_script(root: &Path, name: &str) -> Result<PathBuf, String> {
-    let script = root.join("scripts/internal").join(name);
+fn repo_script(root: &Path, name: &str) -> Result<PathBuf, String> {
+    let script = root.join(name);
     if script.is_file() {
         Ok(script)
     } else {
-        Err(format!(
-            "internal uninstall helper missing: {}",
-            script.display()
-        ))
+        Err(format!("uninstall helper missing: {}", script.display()))
     }
 }
 
@@ -106,12 +103,12 @@ fn release_linux_script(home: &Path, repo_root: Option<&Path>) -> Option<PathBuf
         return None;
     }
 
-    let packaged = install_dir.join("engine/uninstall-release-linux.sh");
+    let packaged = install_dir.join("engine/uninstall-linux.sh");
     if packaged.is_file() {
         return Some(packaged);
     }
 
-    let repo_script = repo_root?.join("scripts/internal/uninstall-release-linux.sh");
+    let repo_script = repo_root?.join("scripts/uninstall-linux.sh");
     repo_script.is_file().then_some(repo_script)
 }
 
@@ -221,8 +218,8 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let home = tmp.path().join("home");
         let repo = tmp.path().join("repo");
-        std::fs::create_dir_all(repo.join("scripts/internal")).unwrap();
-        std::fs::write(repo.join("scripts/internal/uninstall-release-linux.sh"), "").unwrap();
+        std::fs::create_dir_all(repo.join("scripts")).unwrap();
+        std::fs::write(repo.join("scripts/uninstall-linux.sh"), "").unwrap();
 
         assert!(release_linux_script(&home, Some(&repo)).is_none());
 
@@ -231,7 +228,7 @@ mod tests {
         std::fs::write(install_dir.join("install-receipt"), "").unwrap();
         assert_eq!(
             release_linux_script(&home, Some(&repo)).unwrap(),
-            repo.join("scripts/internal/uninstall-release-linux.sh")
+            repo.join("scripts/uninstall-linux.sh")
         );
     }
 }

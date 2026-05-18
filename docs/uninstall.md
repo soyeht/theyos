@@ -12,9 +12,9 @@ That command detects the install model and runs the correct cleanup path:
 - repo-managed NixOS install
 - local developer/source checkout install
 
-The internal helpers under `scripts/internal/` are not user-facing
-uninstallers. They exist so `soyeht uninstall` can handle different install
-models without exposing multiple choices to users or agents.
+Compatibility helpers in the repository are not user-facing uninstallers.
+They exist so `soyeht uninstall` and the recovery endpoint can handle
+different install models without exposing multiple choices to users or agents.
 
 ## Options
 

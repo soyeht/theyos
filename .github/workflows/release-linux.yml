@@ -85,8 +85,8 @@ jobs:
           cp "$BINARY_DIR/store-ipc" "$STAGE/store-ipc"
           cp "$BINARY_DIR/terminal-ipc" "$STAGE/terminal-ipc"
           cp "$BINARY_DIR/imagebuilder" "$STAGE/imagebuilder"
-          cp "../../scripts/internal/uninstall-release-linux.sh" "$STAGE/uninstall-release-linux.sh"
-          chmod +x "$STAGE/soyeht" "$STAGE/uninstall-release-linux.sh"
+          cp "../../scripts/uninstall-linux.sh" "$STAGE/uninstall-linux.sh"
+          chmod +x "$STAGE/soyeht" "$STAGE/uninstall-linux.sh"
           printf '%s\n' "$CARGO_VERSION" > "$STAGE/engine-version.txt"
           tar czf "$TARBALL" -C "$STAGE" .
           sha256sum "$TARBALL" > "${TARBALL}.sha256"
@@ -189,8 +189,8 @@ jobs:
           cp "$BINARY_DIR/store-ipc" "$STAGE/store-ipc"
           cp "$BINARY_DIR/terminal-ipc" "$STAGE/terminal-ipc"
           cp "$BINARY_DIR/imagebuilder" "$STAGE/imagebuilder"
-          cp "../../scripts/internal/uninstall-release-linux.sh" "$STAGE/uninstall-release-linux.sh"
-          chmod +x "$STAGE/soyeht" "$STAGE/uninstall-release-linux.sh"
+          cp "../../scripts/uninstall-linux.sh" "$STAGE/uninstall-linux.sh"
+          chmod +x "$STAGE/soyeht" "$STAGE/uninstall-linux.sh"
           printf '%s\n' "$CARGO_VERSION" > "$STAGE/engine-version.txt"
           tar czf "$TARBALL" -C "$STAGE" .
           sha256sum "$TARBALL" > "${TARBALL}.sha256"

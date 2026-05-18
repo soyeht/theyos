@@ -510,8 +510,8 @@ package_engine_linux() {
         mkdir -p "${stage}"
         cp "${engine_src}" "${stage}/theyos-engine"
         cp "${soyeht_src}" "${stage}/soyeht"
-        cp "${REPO_ROOT}/scripts/internal/uninstall-release-linux.sh" "${stage}/uninstall-release-linux.sh"
-        chmod +x "${stage}/soyeht" "${stage}/uninstall-release-linux.sh"
+        cp "${REPO_ROOT}/scripts/uninstall-linux.sh" "${stage}/uninstall-linux.sh"
+        chmod +x "${stage}/soyeht" "${stage}/uninstall-linux.sh"
         printf '%s' "${version}" > "${stage}/engine-version.txt"
 
         local tarball="${dist_dir}/${pkg_name}.tar.gz"
