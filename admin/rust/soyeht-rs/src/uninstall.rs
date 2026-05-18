@@ -60,24 +60,41 @@ pub fn cmd_uninstall(args: &UninstallArgs) {
 fn detect_target() -> Result<UninstallTarget, String> {
     let home = home_dir()?;
     let repo_root = core_rs::path::resolve_repo_root().ok();
+    let nixos_managed = repo_root
+        .as_deref()
+        .map_or(false, crate::nixos::is_nixos_managed);
 
-    if let Some(root) = repo_root.as_deref() {
-        if crate::nixos::is_nixos_managed(root) {
-            return repo_script(root, "uninstall-nixos")
-                .map(|script| UninstallTarget::NixosManaged { script });
-        }
+    detect_target_with(
+        &home,
+        repo_root.as_deref(),
+        nixos_managed,
+        Path::new("/etc/NIXOS").exists(),
+    )
+}
 
-        if source_checkout_installed(root, &home) {
-            return repo_script(root, "uninstall")
-                .map(|script| UninstallTarget::SourceCheckout { script });
-        }
-    }
-
-    if let Some(script) = release_linux_script(&home, repo_root.as_deref()) {
+fn detect_target_with(
+    home: &Path,
+    repo_root: Option<&Path>,
+    nixos_managed: bool,
+    nixos_detected: bool,
+) -> Result<UninstallTarget, String> {
+    if let Some(script) = release_linux_script(home, repo_root) {
         return Ok(UninstallTarget::ReleaseLinux { script });
     }
 
-    if Path::new("/etc/NIXOS").exists() {
+    if let Some(root) = repo_root {
+        if source_checkout_installed(root, home) {
+            return repo_script(root, "uninstall")
+                .map(|script| UninstallTarget::SourceCheckout { script });
+        }
+
+        if nixos_managed {
+            return repo_script(root, "uninstall-nixos")
+                .map(|script| UninstallTarget::NixosManaged { script });
+        }
+    }
+
+    if nixos_detected {
         return Err(
             "NixOS detected, but no repo-managed theyOS install receipt was found. \
              Remove the services.theyos module from your NixOS configuration and rebuild."
@@ -230,5 +247,27 @@ mod tests {
             release_linux_script(&home, Some(&repo)).unwrap(),
             repo.join("scripts/uninstall-linux.sh")
         );
+    }
+
+    #[test]
+    fn release_install_wins_over_nixos_managed_repo() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        let repo = tmp.path().join("repo");
+        let install_dir = home.join(".local/share/Soyeht");
+
+        std::fs::create_dir_all(install_dir.join("engine")).unwrap();
+        std::fs::create_dir_all(&repo).unwrap();
+        std::fs::write(install_dir.join("install-receipt"), "").unwrap();
+        std::fs::write(install_dir.join("engine/uninstall-linux.sh"), "").unwrap();
+        std::fs::write(repo.join("uninstall-nixos"), "").unwrap();
+
+        let target = detect_target_with(&home, Some(&repo), true, true).unwrap();
+        match target {
+            UninstallTarget::ReleaseLinux { script } => {
+                assert_eq!(script, install_dir.join("engine/uninstall-linux.sh"));
+            }
+            other => panic!("expected release Linux uninstall, got {other:?}"),
+        }
     }
 }
