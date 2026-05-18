@@ -33,15 +33,17 @@ Download **Soyeht.app** from [soyeht.com/install](https://soyeht.com/install), o
 
 **Requirements:** Apple Silicon (M1/M2/M3/M4), macOS 14+, 100 GB free disk space.
 
-### Linux — curl installer
+### Linux — release installer
 
 ```bash
 curl -fsSL https://soyeht.com/install | sh
 ```
 
-The script installs the engine binary, writes a NixOS configuration, and starts the service. Works on an existing NixOS host or a fresh install.
+The script installs the engine under `~/.local/share/Soyeht`, creates the
+user-level `soyeht-engine.service`, and starts the service.
 
-**Requirements:** NixOS 24.05+, x86_64 with KVM support.
+**Requirements:** Linux with systemd user services, x86_64 or aarch64, and KVM
+support.
 
 ### Linux — NixOS flake module
 
@@ -86,11 +88,21 @@ sudo soyeht update
 ### Uninstall
 
 ```bash
-# macOS — quit Soyeht.app, then delete it from /Applications.
+# macOS
+# Use Soyeht > Uninstall Soyeht... in the app, or Uninstall Soyeht.app
+# from the DMG if the main app was already deleted.
 
 # Linux
-sudo soyeht update --uninstall   # or nixos-rebuild switch after removing the module
+soyeht uninstall
 ```
+
+If the `soyeht` binary is missing or damaged, use the recovery endpoint:
+
+```bash
+curl -fsSL https://soyeht.com/uninstall | sh
+```
+
+See [docs/uninstall.md](docs/uninstall.md) for details.
 
 ## Accessing the Admin Panel
 

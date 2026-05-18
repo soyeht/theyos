@@ -9,12 +9,10 @@ FAILURES=()
 
 usage() {
     cat <<'EOF'
-Usage: ./uninstall [--yes] [--dry-run] [--keep-data]
+Usage: soyeht uninstall [--yes] [--dry-run] [--keep-data]
 
-Removes a source checkout install created by ./install on macOS or Linux:
-PATH symlinks, local services, runtime files, generated secrets, logs, and
-VM/customer data unless --keep-data is passed. NixOS deployments still use
-./uninstall-nixos because they modify system configuration declaratively.
+Developer/source checkout cleanup only. This internal helper is called by
+`soyeht uninstall`; do not present it as a user-facing uninstaller.
 EOF
 }
 
@@ -214,7 +212,11 @@ main() {
     stop_services
     remove_files
     [ "$DRY_RUN" = true ] || verify_no_residuals
-    log "done"
+    if [ "$DRY_RUN" = true ]; then
+        log "dry-run complete"
+    else
+        log "done"
+    fi
 }
 
 main "$@"

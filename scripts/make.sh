@@ -486,10 +486,21 @@ package_engine_linux() {
             (cd "${rust_dir}" && cargo build -p server-rs --release --target "${rust_target}")
         fi
 
+        info "Building soyeht CLI for ${rust_target}..."
+        if command -v cross &>/dev/null; then
+            (cd "${rust_dir}" && cross build -p soyeht-rs --bin soyeht --release --target "${rust_target}")
+        else
+            (cd "${rust_dir}" && cargo build -p soyeht-rs --bin soyeht --release --target "${rust_target}")
+        fi
+
         # Binary name is `server` per server-rs/Cargo.toml [[bin]] config.
         local engine_src="${rust_dir}/target/${rust_target}/release/server"
+        local soyeht_src="${rust_dir}/target/${rust_target}/release/soyeht"
         if [ ! -f "${engine_src}" ]; then
             error "server binary not found at: ${engine_src} (expected from server-rs crate)"
+        fi
+        if [ ! -f "${soyeht_src}" ]; then
+            error "soyeht CLI not found at: ${soyeht_src} (expected from soyeht-rs crate)"
         fi
 
         mkdir -p "${dist_dir}"
@@ -498,6 +509,9 @@ package_engine_linux() {
         rm -rf "${stage}"
         mkdir -p "${stage}"
         cp "${engine_src}" "${stage}/theyos-engine"
+        cp "${soyeht_src}" "${stage}/soyeht"
+        cp "${REPO_ROOT}/scripts/internal/uninstall-release-linux.sh" "${stage}/uninstall-release-linux.sh"
+        chmod +x "${stage}/soyeht" "${stage}/uninstall-release-linux.sh"
         printf '%s' "${version}" > "${stage}/engine-version.txt"
 
         local tarball="${dist_dir}/${pkg_name}.tar.gz"

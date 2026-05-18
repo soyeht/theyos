@@ -59,6 +59,7 @@ jobs:
             --target x86_64-unknown-linux-musl \
             --release \
             -p server-rs \
+            -p soyeht-rs \
             -p vmrunner-rs \
             -p store-rs \
             -p terminal-rs \
@@ -78,11 +79,14 @@ jobs:
           BINARY="$BINARY_DIR/server"
           TARBALL="$OUTDIR/theyos-engine-${CARGO_VERSION}-linux-x86_64.tar.gz"
           cp "$BINARY_DIR/server" "$STAGE/theyos-engine"
+          cp "$BINARY_DIR/soyeht" "$STAGE/soyeht"
           cp "$BINARY_DIR/vmrunner_ipc" "$STAGE/vmrunner_ipc"
           cp "$BINARY_DIR/fc-ssh" "$STAGE/fc-ssh"
           cp "$BINARY_DIR/store-ipc" "$STAGE/store-ipc"
           cp "$BINARY_DIR/terminal-ipc" "$STAGE/terminal-ipc"
           cp "$BINARY_DIR/imagebuilder" "$STAGE/imagebuilder"
+          cp "../../scripts/internal/uninstall-release-linux.sh" "$STAGE/uninstall-release-linux.sh"
+          chmod +x "$STAGE/soyeht" "$STAGE/uninstall-release-linux.sh"
           printf '%s\n' "$CARGO_VERSION" > "$STAGE/engine-version.txt"
           tar czf "$TARBALL" -C "$STAGE" .
           sha256sum "$TARBALL" > "${TARBALL}.sha256"
@@ -100,6 +104,11 @@ jobs:
             --entrypoint /engine \
             alpine:3.20 \
             --version
+          docker run --rm \
+            -v "$(pwd)/target/x86_64-unknown-linux-musl/release/soyeht:/soyeht" \
+            --entrypoint /soyeht \
+            alpine:3.20 \
+            uninstall --help
           echo "Smoke test passed: x86_64 binary --version exit 0"
 
       - name: Upload to GitHub Release
@@ -154,6 +163,7 @@ jobs:
             --target aarch64-unknown-linux-musl \
             --release \
             -p server-rs \
+            -p soyeht-rs \
             -p vmrunner-rs \
             -p store-rs \
             -p terminal-rs \
@@ -173,11 +183,14 @@ jobs:
           BINARY="$BINARY_DIR/server"
           TARBALL="$OUTDIR/theyos-engine-${CARGO_VERSION}-linux-aarch64.tar.gz"
           cp "$BINARY_DIR/server" "$STAGE/theyos-engine"
+          cp "$BINARY_DIR/soyeht" "$STAGE/soyeht"
           cp "$BINARY_DIR/vmrunner_ipc" "$STAGE/vmrunner_ipc"
           cp "$BINARY_DIR/fc-ssh" "$STAGE/fc-ssh"
           cp "$BINARY_DIR/store-ipc" "$STAGE/store-ipc"
           cp "$BINARY_DIR/terminal-ipc" "$STAGE/terminal-ipc"
           cp "$BINARY_DIR/imagebuilder" "$STAGE/imagebuilder"
+          cp "../../scripts/internal/uninstall-release-linux.sh" "$STAGE/uninstall-release-linux.sh"
+          chmod +x "$STAGE/soyeht" "$STAGE/uninstall-release-linux.sh"
           printf '%s\n' "$CARGO_VERSION" > "$STAGE/engine-version.txt"
           tar czf "$TARBALL" -C "$STAGE" .
           sha256sum "$TARBALL" > "${TARBALL}.sha256"
@@ -200,6 +213,11 @@ jobs:
             --entrypoint /engine \
             alpine:3.20 \
             --version
+          docker run --rm --platform linux/arm64 \
+            -v "$(pwd)/target/aarch64-unknown-linux-musl/release/soyeht:/soyeht" \
+            --entrypoint /soyeht \
+            alpine:3.20 \
+            uninstall --help
           echo "Smoke test passed: aarch64 binary --version exit 0"
 
       - name: Upload to GitHub Release

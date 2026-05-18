@@ -91,6 +91,8 @@ pub enum Commands {
     /// Pull latest code, rebuild, and deploy in one command.
     /// Wraps git pull → build → deploy for end users.
     Update(UpdateArgs),
+    /// Completely remove Soyeht/theyOS from this machine.
+    Uninstall(UninstallArgs),
     /// Render .env from .env.example template + key-value overrides.
     /// Used by NixOS module activation and install-nixos fallback.
     RenderEnv(RenderEnvArgs),
@@ -342,6 +344,21 @@ pub struct UpdateArgs {
     /// After build, sync stale artifacts (golden images, snapshots) via DAG reconciliation.
     #[arg(long)]
     pub sync_artifacts: bool,
+}
+
+#[derive(clap::Args)]
+pub struct UninstallArgs {
+    /// Skip confirmation prompts (for automation).
+    #[arg(long, short = 'y')]
+    pub yes: bool,
+
+    /// Show the uninstall action without removing anything.
+    #[arg(long)]
+    pub dry_run: bool,
+
+    /// Remove services and binaries but keep customer/VM data.
+    #[arg(long)]
+    pub keep_data: bool,
 }
 
 #[derive(clap::Args)]

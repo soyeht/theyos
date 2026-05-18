@@ -12,14 +12,15 @@ for arg in "$@"; do
         --keep-data) KEEP_DATA=true ;;
         --yes|-y)    AUTO_YES=true ;;
         --help|-h)
-            printf 'Usage: ./uninstall-nixos [--keep-data] [--yes]\n\n'
+            printf 'Usage: soyeht uninstall [--keep-data] [--yes]\n\n'
+            printf '  NixOS repo-managed cleanup helper. Called by soyeht uninstall.\n\n'
             printf '  --keep-data   Keep customer data (claws/data/) and Firecracker VMs\n'
             printf '  --yes, -y     Skip confirmation prompt\n'
             exit 0
             ;;
         *)
             printf '[error] Unknown flag: %s\n' "$arg"
-            printf 'Usage: ./uninstall-nixos [--keep-data] [--yes]\n'
+            printf 'Usage: soyeht uninstall [--keep-data] [--yes]\n'
             exit 1
             ;;
     esac

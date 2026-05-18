@@ -31,6 +31,7 @@
 //! sudo soyeht deploy [--skip-restart]     (stage → release, restart, smoke test)
 //! sudo soyeht validate [--rebuild-snapshots] [--settle N] [--timeout N]
 //! soyeht update [--skip-frontend] [--test] [--skip-deploy]  (git pull → build → deploy)
+//! soyeht uninstall [--keep-data] [--dry-run] [--yes]
 //! soyeht render-env [--template FILE] [--output FILE] --set KEY=VALUE ...
 //! ```
 
@@ -58,6 +59,7 @@ mod pair;
 mod render_env;
 mod sandbox;
 mod setup;
+mod uninstall;
 mod util;
 mod verify_sandbox;
 
@@ -74,7 +76,14 @@ use cli::{Cli, Commands};
 fn main() {
     let cli = Cli::parse();
 
-    // Pair is the only subcommand that doesn't need the theyOS repo root —
+    // Pair and uninstall do not require a repo root. Pair reads a bootstrap
+    // token path; uninstall detects the install receipt/model by itself.
+    if let Commands::Uninstall(a) = &cli.command {
+        uninstall::cmd_uninstall(a);
+        return;
+    }
+
+    // Pair is the only remaining subcommand that doesn't need the theyOS repo root —
     // it reads a bootstrap token path (default or from THEYOS_BOOTSTRAP_TOKEN_PATH)
     // and POSTs to THEYOS_ADMIN_URL. Handle it before `resolve_repo_root()` so
     // it works from any working directory.
@@ -225,6 +234,7 @@ fn main() {
                 }
             }
         }
+        Commands::Uninstall(_) => unreachable!("Uninstall is handled before resolve_repo_root"),
         Commands::RenderEnv(a) => render_env::cmd_render_env(&root, &a),
         Commands::Pair(_) => unreachable!("Pair is handled before resolve_repo_root"),
         Commands::Caddy(a) => {

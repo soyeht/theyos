@@ -5,6 +5,8 @@
 #   curl -fsSL https://soyeht.com/install | sh
 #   # or for a specific version:
 #   SOYEHT_VERSION=0.2.0 sh install-linux.sh
+#   # uninstall after installation:
+#   soyeht uninstall
 #
 # Environment variables (all optional):
 #   SOYEHT_VERSION     — engine version to install (default: latest release)
@@ -294,9 +296,12 @@ main() {
         mv "$NEW_ENGINE_DIR/server" "$NEW_ENGINE_DIR/theyos-engine"
     fi
     [ -f "$NEW_ENGINE_DIR/theyos-engine" ] || die "Package did not contain theyos-engine."
-    for bin in theyos-engine vmrunner_ipc fc-ssh store-ipc terminal-ipc imagebuilder; do
+    [ -f "$NEW_ENGINE_DIR/soyeht" ] || die "Package did not contain soyeht CLI."
+    [ -f "$NEW_ENGINE_DIR/uninstall-release-linux.sh" ] || die "Package did not contain uninstall helper."
+    for bin in theyos-engine soyeht vmrunner_ipc fc-ssh store-ipc terminal-ipc imagebuilder; do
         [ -f "$NEW_ENGINE_DIR/$bin" ] && chmod +x "$NEW_ENGINE_DIR/$bin"
     done
+    chmod +x "$NEW_ENGINE_DIR/uninstall-release-linux.sh"
     if [ -d "$ENGINE_DIR" ]; then
         mv "$ENGINE_DIR" "$OLD_ENGINE_DIR"
     fi
@@ -304,6 +309,11 @@ main() {
     rm -rf "$OLD_ENGINE_DIR"
 
     ENGINE_BIN="$ENGINE_DIR/theyos-engine"
+    SOYEHT_CLI="$ENGINE_DIR/soyeht"
+
+    mkdir -p "$HOME/.local/bin"
+    ln -sf "$SOYEHT_CLI" "$HOME/.local/bin/soyeht"
+    ln -sf "$ENGINE_BIN" "$HOME/.local/bin/theyos-engine"
 
     # Write systemd unit.
     write_systemd_unit "$ENGINE_BIN"
@@ -333,12 +343,14 @@ main() {
         printf 'arch=%s\n' "$ARCH"
         printf 'install_dir=%s\n' "$SOYEHT_INSTALL_DIR"
         printf 'engine_dir=%s\n' "$ENGINE_DIR"
+        printf 'cli=%s\n' "$SOYEHT_CLI"
         printf 'service=%s\n' "$SERVICE_NAME"
         printf 'unit_file=%s\n' "$SYSTEMD_USER_DIR/$SERVICE_NAME"
         printf 'installed_at_utc=%s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
     } > "$RECEIPT_FILE"
 
     info "Instalação concluída. Acesse o painel em http://127.0.0.1:8892"
+    info "Para desinstalar: soyeht uninstall"
 }
 
 main "$@"
