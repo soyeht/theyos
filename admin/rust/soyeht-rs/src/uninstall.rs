@@ -62,7 +62,7 @@ fn detect_target() -> Result<UninstallTarget, String> {
     let repo_root = core_rs::path::resolve_repo_root().ok();
     let nixos_managed = repo_root
         .as_deref()
-        .map_or(false, crate::nixos::is_nixos_managed);
+        .is_some_and(crate::nixos::is_nixos_managed);
 
     detect_target_with(
         &home,
