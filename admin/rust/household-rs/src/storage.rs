@@ -277,16 +277,15 @@ fn clear_stale_phase3_marker_if_post_shamir(state_dir: &Path) {
         return;
     }
     let record_path = household_record_path(state_dir);
-    let post_shamir = match read_optional_cbor::<crate::household_record::HouseholdRecord>(
-        &record_path,
-    ) {
-        Ok(Some(r)) => r.shamir_n > 1,
-        // Pre-Shamir / missing / undecodable record — leave marker
-        // alone. Pre-Shamir + marker is "preserve, T073/T074 will
-        // probe"; missing record is uninitialised; undecodable is
-        // already a tracing crisis (R6.NB2).
-        _ => return,
-    };
+    let post_shamir =
+        match read_optional_cbor::<crate::household_record::HouseholdRecord>(&record_path) {
+            Ok(Some(r)) => r.shamir_n > 1,
+            // Pre-Shamir / missing / undecodable record — leave marker
+            // alone. Pre-Shamir + marker is "preserve, T073/T074 will
+            // probe"; missing record is uninitialised; undecodable is
+            // already a tracing crisis (R6.NB2).
+            _ => return,
+        };
     if !post_shamir {
         return;
     }
@@ -485,26 +484,25 @@ fn recover_post_join_sole_shard(state_dir: &Path) -> Result<bool, StorageError> 
         return Ok(false);
     }
     let record_path = household_record_path(state_dir);
-    let record_post_shamir = match read_optional_cbor::<crate::household_record::HouseholdRecord>(
-        &record_path,
-    ) {
-        Ok(Some(r)) => r.shamir_n > 1,
-        Ok(None) => false,
-        Err(e) => {
-            // R6.NB2: undecodable record is a crisis signal, not a
-            // default-to-pre-Shamir. Refuse to delete `sole` here —
-            // the operator-visible WARN above the early return makes
-            // the boot-time diagnosis explicit.
-            tracing::error!(
-                stage = "recovery.post_join_sole_shard.record_undecodable",
-                path = %record_path.display(),
-                error = %e,
-                hint = "refusing to unlink household_root_sole.cbor; \
-                        operator must hand-validate household state before next boot",
-            );
-            return Ok(false);
-        }
-    };
+    let record_post_shamir =
+        match read_optional_cbor::<crate::household_record::HouseholdRecord>(&record_path) {
+            Ok(Some(r)) => r.shamir_n > 1,
+            Ok(None) => false,
+            Err(e) => {
+                // R6.NB2: undecodable record is a crisis signal, not a
+                // default-to-pre-Shamir. Refuse to delete `sole` here —
+                // the operator-visible WARN above the early return makes
+                // the boot-time diagnosis explicit.
+                tracing::error!(
+                    stage = "recovery.post_join_sole_shard.record_undecodable",
+                    path = %record_path.display(),
+                    error = %e,
+                    hint = "refusing to unlink household_root_sole.cbor; \
+                            operator must hand-validate household state before next boot",
+                );
+                return Ok(false);
+            }
+        };
     if !record_post_shamir {
         // The crash promoted `self_shard.cbor` but the canonical
         // commit marker (`record.shamir_n > 1`) hasn't flipped.
@@ -558,33 +556,32 @@ fn recover_partial_phase3_commit(state_dir: &Path) -> (usize, usize) {
         return (0, 0);
     }
     let record_path = household_record_path(state_dir);
-    let post_shamir = match read_optional_cbor::<crate::household_record::HouseholdRecord>(
-        &record_path,
-    ) {
-        Ok(Some(r)) => r.shamir_n > 1,
-        Ok(None) => false,
-        Err(e) => {
-            // R6.NB2: an undecodable record (truncated CBOR, partial
-            // write that survived `fsync`, schema drift) is a crisis
-            // signal, not "default to pre-Shamir → roll back". The
-            // roll-back branch unlinks `.staged` and the partial
-            // candidate cert, which on a healthy-but-undecodable
-            // household would destroy ceremony evidence. Skip
-            // recovery entirely; the operator-visible ERROR carries
-            // the diagnosis. Subsequent boots through `try_load_existing`
-            // / `bootstrap_or_load` will fail loudly on the same
-            // record decode and refuse to start, which is the right
-            // safety posture.
-            tracing::error!(
-                stage = "recovery.partial_phase3_commit.record_undecodable",
-                path = %record_path.display(),
-                error = %e,
-                hint = "skipping Phase-3 .staged recovery; .staged files preserved; \
-                        operator must hand-validate household state",
-            );
-            return (0, 0);
-        }
-    };
+    let post_shamir =
+        match read_optional_cbor::<crate::household_record::HouseholdRecord>(&record_path) {
+            Ok(Some(r)) => r.shamir_n > 1,
+            Ok(None) => false,
+            Err(e) => {
+                // R6.NB2: an undecodable record (truncated CBOR, partial
+                // write that survived `fsync`, schema drift) is a crisis
+                // signal, not "default to pre-Shamir → roll back". The
+                // roll-back branch unlinks `.staged` and the partial
+                // candidate cert, which on a healthy-but-undecodable
+                // household would destroy ceremony evidence. Skip
+                // recovery entirely; the operator-visible ERROR carries
+                // the diagnosis. Subsequent boots through `try_load_existing`
+                // / `bootstrap_or_load` will fail loudly on the same
+                // record decode and refuse to start, which is the right
+                // safety posture.
+                tracing::error!(
+                    stage = "recovery.partial_phase3_commit.record_undecodable",
+                    path = %record_path.display(),
+                    error = %e,
+                    hint = "skipping Phase-3 .staged recovery; .staged files preserved; \
+                            operator must hand-validate household state",
+                );
+                return (0, 0);
+            }
+        };
     // R6.1/R8: finalize-intent preservation gate — when the on-disk
     // record is still pre-Shamir BUT a `phase3_finalize_ack.marker`
     // exists, M1 has launched or may have launched finalize with M2.
@@ -681,13 +678,15 @@ fn recover_partial_phase3_commit(state_dir: &Path) -> (usize, usize) {
         // (record absent), every staged member is "new" — both the
         // founder cert and M2's own cert get unlinked (M2 has no
         // pre-ceremony reason to hold them).
-        let on_disk_members: Vec<String> = match read_optional_cbor::<
-            crate::household_record::HouseholdRecord,
-        >(&record_path)
-        {
-            Ok(Some(r)) => r.members.iter().map(std::string::ToString::to_string).collect(),
-            _ => Vec::new(),
-        };
+        let on_disk_members: Vec<String> =
+            match read_optional_cbor::<crate::household_record::HouseholdRecord>(&record_path) {
+                Ok(Some(r)) => r
+                    .members
+                    .iter()
+                    .map(std::string::ToString::to_string)
+                    .collect(),
+                _ => Vec::new(),
+            };
         for candidate in staged_record
             .members
             .iter()
@@ -872,13 +871,12 @@ fn migrate_self_machine_cert(state_dir: &Path) -> Result<Option<String>, Storage
     // Decode the legacy cert to learn its m_id; the new location is
     // `machine_certs/<m_id>.cbor` per
     // `contracts/machine-cert-cbor.md`'s Storage section.
-    let cert: crate::machine_cert::MachineCert = read_optional_cbor(&legacy)?
-        .ok_or_else(|| {
-            StorageError::Encoding(HouseholdError::Cbor(format!(
-                "decode legacy {}: file vanished mid-migration",
-                legacy.display()
-            )))
-        })?;
+    let cert: crate::machine_cert::MachineCert = read_optional_cbor(&legacy)?.ok_or_else(|| {
+        StorageError::Encoding(HouseholdError::Cbor(format!(
+            "decode legacy {}: file vanished mid-migration",
+            legacy.display()
+        )))
+    })?;
     let m_id_str = cert.m_id.to_string();
     let new_path = machine_cert_for(state_dir, &m_id_str);
     if new_path.exists() {

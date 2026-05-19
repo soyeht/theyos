@@ -148,7 +148,13 @@ async fn uri_round_trips_every_field() {
     assert!(uri.contains("&platform=linux-nix"));
     assert!(uri.contains("&transport=lan"));
     // base64url no-pad encoding of 33-byte SEC1 m_pub is exactly 44 chars
-    let m_pub_param = uri.split("&m_pub=").nth(1).unwrap().split('&').next().unwrap();
+    let m_pub_param = uri
+        .split("&m_pub=")
+        .nth(1)
+        .unwrap()
+        .split('&')
+        .next()
+        .unwrap();
     assert_eq!(m_pub_param.len(), 44);
 
     // Decode the m_pub from the URI and assert it matches the

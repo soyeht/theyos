@@ -1,9 +1,7 @@
 //! T010 round-trip and tamper coverage for the Phase 3 Shamir 2-of-2
 //! wrapper exposed by `household_rs::shamir`.
 
-use household_rs::shamir::{
-    SHARD_X_M1, SHARD_X_M2, ShamirError, reconstruct_from_2, split_2_of_2,
-};
+use household_rs::shamir::{SHARD_X_M1, SHARD_X_M2, ShamirError, reconstruct_from_2, split_2_of_2};
 use rand::RngCore;
 use rand::rngs::OsRng;
 use zeroize::Zeroizing;

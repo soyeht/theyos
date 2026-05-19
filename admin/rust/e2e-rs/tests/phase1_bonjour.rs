@@ -19,5 +19,8 @@ async fn pair_device_window_state_mirrors_bonjour_txt_contract() {
     }
 
     window.consume_token(&token.nonce).await.unwrap();
-    assert!(matches!(rx.recv().await.unwrap(), PairDeviceWindowState::Closed));
+    assert!(matches!(
+        rx.recv().await.unwrap(),
+        PairDeviceWindowState::Closed
+    ));
 }

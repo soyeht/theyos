@@ -100,7 +100,12 @@ mod phase3 {
     use household_rs::{IdentityKey, P256Keypair, derive_household_id};
     use zeroize::Zeroizing;
 
-    fn hh_keypair() -> (P256Keypair, [u8; 33], household_rs::HouseholdId, Zeroizing<[u8; 32]>) {
+    fn hh_keypair() -> (
+        P256Keypair,
+        [u8; 33],
+        household_rs::HouseholdId,
+        Zeroizing<[u8; 32]>,
+    ) {
         let kp = P256Keypair::generate();
         let pub_arr = *kp.public().as_bytes();
         let hh_id = derive_household_id(&kp.public());

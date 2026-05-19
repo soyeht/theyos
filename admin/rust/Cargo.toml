@@ -9,6 +9,8 @@ members = [
     "household-rs",
     "imagebuilder-rs",
     "jobs-rs",
+    "keystore-rs",
+    "llm-proxy-rs",
     "session-rs",
     "server-rs",
     "store-rs",
@@ -53,6 +55,11 @@ tracing             = "0.1"
 tracing-subscriber  = { version = "0.3", features = ["env-filter", "json"] }
 rusqlite    = { version = "0.32", features = ["bundled"] }
 ureq        = { version = "2", features = ["json"] }
+reqwest     = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls", "http2"] }
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
+toml        = "0.8"
+bytes       = "1"
+wiremock    = "0.6"
 base64      = "0.22"
 sha2        = "0.10"
 libc        = "0.2"
@@ -111,6 +118,8 @@ claw-rs         = { path = "claw-rs" }
 executor-rs     = { path = "executor-rs" }
 household-rs    = { path = "household-rs" }
 jobs-rs         = { path = "jobs-rs" }
+keystore-rs     = { path = "keystore-rs" }
+llm-proxy-rs    = { path = "llm-proxy-rs" }
 session-rs      = { path = "session-rs" }
 server-rs       = { path = "server-rs" }
 store-rs        = { path = "store-rs" }

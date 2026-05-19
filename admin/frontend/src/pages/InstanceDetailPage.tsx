@@ -8,6 +8,8 @@ import { getStatusClass, getStatusIcon } from "../lib/statusUtils";
 import type {
   CloudflaredWarning,
   Instance,
+  LlmActiveResponse,
+  LlmCatalog,
   PublicSite,
   PublicSiteInstructions,
 } from "../lib/types";
@@ -63,6 +65,168 @@ export function InstanceDetailPage() {
       {instanceError && <p className="form-error">{instanceError}</p>}
 
       <PublicSitesSection instance={instance} />
+      <LlmOverrideSection instance={instance} />
+    </section>
+  );
+}
+
+/// Per-claw LLM override picker. Lets the operator pin a specific
+/// provider+model for this claw_type while everything else uses the
+/// global default. Backed by PUT /api/v1/llm/active/{claw_type} (set) and
+/// DELETE /api/v1/llm/active/{claw_type} (clear).
+///
+/// The picker only acts on `claw_type`, not the instance id — the proxy
+/// routes by claw type (one override applies to every instance of that
+/// type). Document this in the help text so operators don't expect
+/// per-instance granularity.
+function LlmOverrideSection({ instance }: { instance: Instance | null }) {
+  const clawType = instance?.claw_type;
+  const [catalog, setCatalog] = useState<LlmCatalog | null>(null);
+  const [active, setActive] = useState<LlmActiveResponse | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [selectedProvider, setSelectedProvider] = useState("");
+  const [selectedModel, setSelectedModel] = useState("");
+
+  const reload = useCallback(async () => {
+    if (!clawType) return;
+    try {
+      const [c, a] = await Promise.all([api.llmCatalog(), api.llmActive()]);
+      setCatalog(c);
+      setActive(a);
+      const ov = a.per_claw[clawType];
+      if (ov) {
+        setSelectedProvider(ov.provider);
+        setSelectedModel(ov.model);
+      } else {
+        setSelectedProvider("");
+        setSelectedModel("");
+      }
+      setError(null);
+    } catch (e) {
+      setError(extractErrorMessage(e, "failed to load llm config"));
+    }
+  }, [clawType]);
+
+  useEffect(() => {
+    void reload();
+  }, [reload]);
+
+  if (!instance || !clawType) {
+    return null;
+  }
+
+  const currentOverride = active?.per_claw[clawType];
+  const providerEntry = catalog?.entries.find((e) => e.id === selectedProvider);
+
+  const handleSave = async () => {
+    if (!selectedProvider || !selectedModel) return;
+    setBusy(true);
+    try {
+      await api.llmSetActiveForClaw(clawType, {
+        provider: selectedProvider,
+        model: selectedModel,
+      });
+      await reload();
+    } catch (e) {
+      setError(extractErrorMessage(e, "failed to set override"));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const handleClear = async () => {
+    setBusy(true);
+    try {
+      await api.llmClearActiveForClaw(clawType);
+      await reload();
+    } catch (e) {
+      setError(extractErrorMessage(e, "failed to clear override"));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <section className="section">
+      <header>
+        <h2>llm engine</h2>
+        <p className="muted">
+          override the default provider+model for every claw of type{" "}
+          <code>{clawType}</code>. clear it to inherit the global default.
+        </p>
+      </header>
+      {error && <p className="form-error">{error}</p>}
+      {active && (
+        <p>
+          current:{" "}
+          {currentOverride ? (
+            <>
+              <strong>{currentOverride.provider}</strong> · {currentOverride.model}{" "}
+              <em>(override)</em>
+            </>
+          ) : (
+            <>
+              <strong>{active.default.provider}</strong> · {active.default.model}{" "}
+              <em>(default)</em>
+            </>
+          )}
+        </p>
+      )}
+      <div className="form-row">
+        <label>
+          <span>provider</span>
+          <select
+            value={selectedProvider}
+            onChange={(e) => {
+              setSelectedProvider(e.target.value);
+              setSelectedModel("");
+            }}
+            disabled={busy || !catalog}
+          >
+            <option value="">— pick —</option>
+            {catalog?.entries.map((entry) => (
+              <option key={entry.id} value={entry.id}>
+                {entry.display_name}
+              </option>
+            ))}
+          </select>
+        </label>
+        <label>
+          <span>model</span>
+          <select
+            value={selectedModel}
+            onChange={(e) => setSelectedModel(e.target.value)}
+            disabled={busy || !providerEntry}
+          >
+            <option value="">— pick —</option>
+            {providerEntry?.models.map((m) => (
+              <option key={m.id} value={m.id}>
+                {m.display_name}
+              </option>
+            ))}
+          </select>
+        </label>
+      </div>
+      <div className="form-actions">
+        <button
+          type="button"
+          className="btn-primary"
+          disabled={busy || !selectedProvider || !selectedModel}
+          onClick={() => void handleSave()}
+        >
+          {busy ? "saving…" : currentOverride ? "update override" : "set override"}
+        </button>
+        {currentOverride && (
+          <button
+            type="button"
+            disabled={busy}
+            onClick={() => void handleClear()}
+          >
+            clear override
+          </button>
+        )}
+      </div>
     </section>
   );
 }

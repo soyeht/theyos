@@ -1,12 +1,12 @@
 //! T035 — Contract tests for `GET /pair-machine/anchor-handoff`.
 //!
 //! Covers:
-//! - 403 when source IP is not in Tailnet range (LAN or no ConnectInfo)
-//! - 403 when ConnectInfo is absent (unconfigured server)
-//! - 404 when pair_machine_window is Idle (no active ceremony)
-//! - 410 when pair_machine_window is Committed or Aborted (terminated)
+//! - 403 when source IP is not in Tailnet range (LAN or no `ConnectInfo`)
+//! - 403 when `ConnectInfo` is absent (unconfigured server)
+//! - 404 when `pair_machine_window` is Idle (no active ceremony)
+//! - 410 when `pair_machine_window` is Committed or Aborted (terminated)
 //! - 200 with correct response shape for Staging window + Tailnet IP
-//! - 200 for AwaitingOwner window + Tailnet IP
+//! - 200 for `AwaitingOwner` window + Tailnet IP
 //! - Fingerprint field is present and non-empty in success path
 
 use std::net::SocketAddr;
@@ -89,7 +89,10 @@ async fn call_anchor_handoff(
     let req = builder.body(Body::empty()).unwrap();
     let resp = router.oneshot(req).await.unwrap();
     let status = resp.status();
-    let bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap().to_vec();
+    let bytes = to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap()
+        .to_vec();
     (status, bytes)
 }
 
@@ -178,12 +181,16 @@ async fn anchor_handoff_200_staging_response_shape() {
     let (status, body) = call_anchor_handoff(w, Some(TAILNET_IP)).await;
     assert_eq!(status, StatusCode::OK);
 
-    let ok: HandoffOk = household_rs::cbor::from_canonical_slice(&body)
-        .expect("response must decode as HandoffOk");
+    let ok: HandoffOk =
+        household_rs::cbor::from_canonical_slice(&body).expect("response must decode as HandoffOk");
     assert_eq!(ok.v, 1, "v must be 1");
     assert_eq!(ok.m_pub.as_ref(), test_m_pub(), "m_pub must match");
     assert_eq!(ok.nonce.as_ref(), test_nonce(), "nonce must match");
-    assert_eq!(ok.anchor_secret.as_ref(), test_anchor_secret(), "anchor_secret must match");
+    assert_eq!(
+        ok.anchor_secret.as_ref(),
+        test_anchor_secret(),
+        "anchor_secret must match"
+    );
     assert_eq!(ok.fingerprint, "🦊🌙🔑🎯🌊🦋", "fingerprint must match");
     assert!(ok.expires_at > 0, "expires_at must be non-zero");
 }
@@ -220,7 +227,9 @@ async fn anchor_handoff_response_has_cbor_content_type() {
     let resp = router.oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
     assert_eq!(
-        resp.headers().get("content-type").and_then(|v| v.to_str().ok()),
+        resp.headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok()),
         Some("application/cbor"),
     );
 }

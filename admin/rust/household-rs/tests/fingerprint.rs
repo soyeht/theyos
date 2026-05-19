@@ -5,12 +5,11 @@
 //! in the derivation algorithm (BLAKE3, bit-extraction, BIP-39 lookup,
 //! join character) MUST surface as a test failure here.
 //!
-//! Cross-repo sync: the canonical vectors file lives at the
-//! repo-root path
-//! `specs/003-machine-join/tests/fingerprint_vectors.json` so the
-//! iSoyehtTerm Swift test target can vendor the same file by relative
-//! path (the spec dir is a stable reference point that doesn't depend
-//! on the Rust crate layout). Each entry exposes BOTH a
+//! Cross-repo sync: the canonical vectors file lives at
+//! `admin/rust/household-rs/tests/data/fingerprint_vectors.json`. The
+//! iSoyehtTerm Swift test target vendors the same file via a
+//! repo-relative path (still stable — anchored at the Rust crate root
+//! rather than the retired `specs/` dir). Each entry exposes BOTH a
 //! space-separated `fingerprint` string AND a `fingerprint_words`
 //! array of six lowercase ASCII strings so each side of the cross-
 //! repo gate can pick the shape that matches its existing assertion
@@ -118,9 +117,17 @@ fn fingerprint_vectors_json_exists_and_is_consistent() {
             .iter()
             .map(|v| v.as_str().expect("each word is a string").to_string())
             .collect();
-        assert_eq!(arr_words.len(), 6, "fingerprint_words must have six entries");
+        assert_eq!(
+            arr_words.len(),
+            6,
+            "fingerprint_words must have six entries"
+        );
         for (j, w) in words.iter().enumerate() {
-            assert_eq!(arr_words[j].as_str(), *w, "word {j} disagrees with fingerprint string");
+            assert_eq!(
+                arr_words[j].as_str(),
+                *w,
+                "word {j} disagrees with fingerprint string"
+            );
         }
     }
 }
@@ -151,18 +158,16 @@ fn regenerate_fingerprint_vectors_json() {
 }
 
 fn vectors_json_path() -> std::path::PathBuf {
-    // Canonical cross-repo location, anchored at the repo root via the
-    // `CARGO_MANIFEST_DIR` of `household-rs` (which is two levels deep
-    // under the repo root: <repo>/admin/rust/household-rs).
+    // Anchored at the crate root so the path survives any cross-repo
+    // sandbox (Nix, devcontainer, etc.). Used to live under
+    // `specs/003-machine-join/tests/` when the spec-kit flow was active;
+    // moved into the crate alongside the other fixture data after the
+    // spec-kit retire (see `docs/followup-llm-proxy-protecthome.md`-era
+    // cleanup commits).
     let crate_root = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let repo_root = crate_root
-        .ancestors()
-        .nth(3)
-        .expect("repo root is three ancestors above household-rs/Cargo.toml");
-    repo_root
-        .join("specs")
-        .join("003-machine-join")
+    crate_root
         .join("tests")
+        .join("data")
         .join("fingerprint_vectors.json")
 }
 
@@ -174,4 +179,3 @@ fn hex(bytes: &[u8]) -> String {
     }
     s
 }
-

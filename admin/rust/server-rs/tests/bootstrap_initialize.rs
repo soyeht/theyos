@@ -5,7 +5,7 @@
 //! - `v` version field present and correct
 //! - Name validation edge cases: empty, too long, control chars
 //! - State precondition: 409 when engine already initialized
-//! - State precondition: 200 when uninitialized or ready_for_naming
+//! - State precondition: 200 when uninitialized or `ready_for_naming`
 //! - 400 on invalid CBOR body
 //!
 //! Integration-level persistence and state machine transitions are covered by
@@ -113,7 +113,7 @@ async fn initialize_valid_name_returns_200() {
     let dir = make_state_dir();
     let state = make_state(BootstrapState::Uninitialized, dir);
     let (status, body) = call_initialize(state, cbor_request("Sample Home")).await;
-    assert_eq!(status, StatusCode::OK, "body raw: {:?}", body);
+    assert_eq!(status, StatusCode::OK, "body raw: {body:?}");
 }
 
 #[tokio::test]

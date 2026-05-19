@@ -93,8 +93,7 @@ fn in_ipv4_prefix(addr: Ipv4Addr, base: Ipv4Addr, prefix_bits: u32) -> bool {
         return true;
     }
     let shift = 32u32.saturating_sub(prefix_bits);
-    (u32::from_be_bytes(addr.octets()) >> shift)
-        == (u32::from_be_bytes(base.octets()) >> shift)
+    (u32::from_be_bytes(addr.octets()) >> shift) == (u32::from_be_bytes(base.octets()) >> shift)
 }
 
 fn in_ipv6_prefix(addr: Ipv6Addr, base: Ipv6Addr, prefix_bits: u32) -> bool {
@@ -121,10 +120,7 @@ fn is_ula(addr: Ipv6Addr) -> bool {
 /// A service is forwarded if **at least one** of its addresses is Tailnet,
 /// or if `include_local_network` is set and it has any address at all.
 #[must_use]
-pub fn should_emit<'a>(
-    addrs: impl IntoIterator<Item = &'a IpAddr>,
-    config: BrowserConfig,
-) -> bool {
+pub fn should_emit<'a>(addrs: impl IntoIterator<Item = &'a IpAddr>, config: BrowserConfig) -> bool {
     let mut any_tailnet = false;
     let mut any_addr = false;
     for addr in addrs {
@@ -153,17 +149,38 @@ mod tests {
     #[test]
     fn tailscale_cgnat_is_tailnet() {
         assert_eq!(classify_source(ip4("100.64.0.1")), DiscoverySource::Tailnet);
-        assert_eq!(classify_source(ip4("100.100.200.50")), DiscoverySource::Tailnet);
-        assert_eq!(classify_source(ip4("100.127.255.255")), DiscoverySource::Tailnet);
+        assert_eq!(
+            classify_source(ip4("100.100.200.50")),
+            DiscoverySource::Tailnet
+        );
+        assert_eq!(
+            classify_source(ip4("100.127.255.255")),
+            DiscoverySource::Tailnet
+        );
     }
 
     #[test]
     fn addresses_outside_cgnat_are_local() {
-        assert_eq!(classify_source(ip4("192.168.1.10")), DiscoverySource::LocalNetwork);
-        assert_eq!(classify_source(ip4("10.0.0.1")), DiscoverySource::LocalNetwork);
-        assert_eq!(classify_source(ip4("172.16.0.1")), DiscoverySource::LocalNetwork);
-        assert_eq!(classify_source(ip4("100.63.255.255")), DiscoverySource::LocalNetwork);
-        assert_eq!(classify_source(ip4("100.128.0.0")), DiscoverySource::LocalNetwork);
+        assert_eq!(
+            classify_source(ip4("192.168.1.10")),
+            DiscoverySource::LocalNetwork
+        );
+        assert_eq!(
+            classify_source(ip4("10.0.0.1")),
+            DiscoverySource::LocalNetwork
+        );
+        assert_eq!(
+            classify_source(ip4("172.16.0.1")),
+            DiscoverySource::LocalNetwork
+        );
+        assert_eq!(
+            classify_source(ip4("100.63.255.255")),
+            DiscoverySource::LocalNetwork
+        );
+        assert_eq!(
+            classify_source(ip4("100.128.0.0")),
+            DiscoverySource::LocalNetwork
+        );
     }
 
     #[test]
@@ -181,7 +198,10 @@ mod tests {
     #[test]
     fn broader_ula_is_tailnet() {
         assert_eq!(classify_source(ip6("fd00::1")), DiscoverySource::Tailnet);
-        assert_eq!(classify_source(ip6("fd12:3456:7890::1")), DiscoverySource::Tailnet);
+        assert_eq!(
+            classify_source(ip6("fd12:3456:7890::1")),
+            DiscoverySource::Tailnet
+        );
         assert_eq!(classify_source(ip6("fc00::1")), DiscoverySource::Tailnet);
     }
 
@@ -199,7 +219,10 @@ mod tests {
 
     #[test]
     fn loopback_is_local() {
-        assert_eq!(classify_source(ip4("127.0.0.1")), DiscoverySource::LocalNetwork);
+        assert_eq!(
+            classify_source(ip4("127.0.0.1")),
+            DiscoverySource::LocalNetwork
+        );
         assert_eq!(classify_source(ip6("::1")), DiscoverySource::LocalNetwork);
     }
 
@@ -224,35 +247,45 @@ mod tests {
     #[test]
     fn should_emit_tailnet_only() {
         let addrs = vec![ip4("100.64.1.1"), ip4("192.168.0.1")];
-        let config = BrowserConfig { include_local_network: false };
+        let config = BrowserConfig {
+            include_local_network: false,
+        };
         assert!(should_emit(&addrs, config), "Tailnet addr present → emit");
     }
 
     #[test]
     fn should_emit_lan_suppressed_by_default() {
         let addrs = vec![ip4("192.168.0.1")];
-        let config = BrowserConfig { include_local_network: false };
+        let config = BrowserConfig {
+            include_local_network: false,
+        };
         assert!(!should_emit(&addrs, config), "LAN-only → suppressed");
     }
 
     #[test]
     fn should_emit_lan_when_opted_in() {
         let addrs = vec![ip4("192.168.0.1")];
-        let config = BrowserConfig { include_local_network: true };
+        let config = BrowserConfig {
+            include_local_network: true,
+        };
         assert!(should_emit(&addrs, config), "LAN with opt-in → emit");
     }
 
     #[test]
     fn should_emit_ipv6_tailnet() {
         let addrs = vec![ip6("fd7a:115c:a1e0::2")];
-        let config = BrowserConfig { include_local_network: false };
+        let config = BrowserConfig {
+            include_local_network: false,
+        };
         assert!(should_emit(&addrs, config), "IPv6 Tailnet → emit");
     }
 
     #[test]
     fn should_emit_ipv6_lan_suppressed() {
         let addrs = vec![ip6("fe80::1")];
-        let config = BrowserConfig { include_local_network: false };
+        let config = BrowserConfig {
+            include_local_network: false,
+        };
         assert!(!should_emit(&addrs, config), "IPv6 link-local → suppressed");
     }
 
@@ -260,6 +293,11 @@ mod tests {
     fn should_emit_empty_addrs_is_false() {
         let addrs: Vec<IpAddr> = vec![];
         assert!(!should_emit(&addrs, BrowserConfig::default()));
-        assert!(!should_emit(&addrs, BrowserConfig { include_local_network: true }));
+        assert!(!should_emit(
+            &addrs,
+            BrowserConfig {
+                include_local_network: true
+            }
+        ));
     }
 }

@@ -8,11 +8,11 @@
 //! invariant under test.
 //!
 //! Flow:
-//!   1. Candidate prepare_candidate() → Staging (transport=Tailscale)
-//!   2. iPhone GET /pair-machine/anchor-handoff (Tailnet IP) → {m_pub, nonce, anchor_secret, fingerprint}
-//!   3. iPhone GET /pair-machine/local/seed?nonce=<short> → JoinRequest bytes
+//!   1. Candidate `prepare_candidate()` → Staging (transport=Tailscale)
+//!   2. iPhone GET /pair-machine/anchor-handoff (Tailnet IP) → {`m_pub`, nonce, `anchor_secret`, fingerprint}
+//!   3. iPhone GET /pair-machine/local/seed?nonce=<short> → `JoinRequest` bytes
 //!   4. iPhone POST founder /api/v1/household/join-request → accepted
-//!   5. iPhone POST candidate /pair-machine/local/anchor (anchor_secret from step 2)
+//!   5. iPhone POST candidate /pair-machine/local/anchor (`anchor_secret` from step 2)
 //!   6. iPhone POST founder /owner-events/{cursor}/approve
 //!   7. Founder → candidate POST /pair-machine/local/finalize (internal HTTP)
 //!   8. Both windows → Committed; elapsed < SC-003 budget (30 s)
@@ -55,7 +55,10 @@ async fn get_anchor_handoff(
         .unwrap();
     let resp = candidate.router.clone().oneshot(req).await.unwrap();
     let status = resp.status();
-    let bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap().to_vec();
+    let bytes = to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap()
+        .to_vec();
     (status, bytes)
 }
 
@@ -70,7 +73,10 @@ async fn get_local_seed(
         .unwrap();
     let resp = candidate.router.clone().oneshot(req).await.unwrap();
     let status = resp.status();
-    let bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap().to_vec();
+    let bytes = to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap()
+        .to_vec();
     (status, bytes)
 }
 
@@ -83,12 +89,19 @@ async fn linux_candidate_joins_via_tailnet_anchor_handoff() {
 
     // ── 1. iPhone fetches anchor-handoff over Tailnet ─────────────────────────
     let (status, body) = get_anchor_handoff(&candidate, TAILNET_IP).await;
-    assert_eq!(status, StatusCode::OK, "anchor-handoff must return 200 for Tailnet IP");
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "anchor-handoff must return 200 for Tailnet IP"
+    );
 
     let handoff: HandoffOk = household_rs::cbor::from_canonical_slice(&body)
         .expect("anchor-handoff response must decode as HandoffOk");
     assert_eq!(handoff.v, 1);
-    assert!(!handoff.fingerprint.is_empty(), "fingerprint must be non-empty");
+    assert!(
+        !handoff.fingerprint.is_empty(),
+        "fingerprint must be non-empty"
+    );
     assert!(handoff.expires_at > 0, "expires_at must be non-zero");
     assert_eq!(
         handoff.fingerprint, candidate.prepared.fingerprint,
@@ -106,14 +119,12 @@ async fn linux_candidate_joins_via_tailnet_anchor_handoff() {
         .try_into()
         .expect("anchor_secret must be 32 bytes");
     assert_eq!(
-        anchor_secret,
-        candidate.prepared.anchor_secret,
+        anchor_secret, candidate.prepared.anchor_secret,
         "anchor-handoff anchor_secret must match candidate's prepared secret"
     );
 
     // ── 2. iPhone fetches JoinRequest bytes via local/seed (not QR) ──────────
-    let (seed_status, join_request_cbor) =
-        get_local_seed(&candidate, handoff.nonce.as_ref()).await;
+    let (seed_status, join_request_cbor) = get_local_seed(&candidate, handoff.nonce.as_ref()).await;
     assert_eq!(seed_status, StatusCode::OK, "local/seed must return 200");
     assert_eq!(
         join_request_cbor, candidate.prepared.join_request_cbor,

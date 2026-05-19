@@ -47,13 +47,23 @@ use phase3_support::*;
 /// let the window expire, or crash a participant before continuing.
 async fn drive_to_awaiting_owner(
     candidate_ttl: Duration,
-) -> (FounderHarness, CandidateHarness, JoinRequestAccepted, [u8; 32]) {
+) -> (
+    FounderHarness,
+    CandidateHarness,
+    JoinRequestAccepted,
+    [u8; 32],
+) {
     drive_to_awaiting_owner_with_ttl(candidate_ttl).await
 }
 
 async fn drive_to_awaiting_owner_with_ttl(
     candidate_ttl: Duration,
-) -> (FounderHarness, CandidateHarness, JoinRequestAccepted, [u8; 32]) {
+) -> (
+    FounderHarness,
+    CandidateHarness,
+    JoinRequestAccepted,
+    [u8; 32],
+) {
     let founder = founder_harness();
     // Mirror the on-disk state production has before a Phase-3 ceremony
     // begins: `household_root_sole.cbor` is the plaintext custody of
@@ -95,8 +105,8 @@ async fn drive_to_awaiting_owner_with_ttl(
     (founder, candidate, accepted, anchor_secret)
 }
 
-/// Like `candidate_harness()` from phase3_support, but with a custom
-/// PairMachineWindow TTL so the timeout test (T066) can drive an
+/// Like `candidate_harness()` from `phase3_support`, but with a custom
+/// `PairMachineWindow` TTL so the timeout test (T066) can drive an
 /// expiry without waiting 5 minutes.
 async fn candidate_harness_with_ttl(ttl: Duration) -> CandidateHarness {
     use server_rs::handlers_pair_machine::{PreHouseholdRouterState, pre_household_router};
@@ -562,12 +572,11 @@ async fn test_m1_crash_between_step12_and_step13_recovers_to_commit() {
     let dir = founder.dir.path();
 
     // Post-Shamir record on disk (canonical commit marker flipped).
-    let record: household_rs::HouseholdRecord =
-        household_rs::storage::read_optional_cbor(&household_rs::storage::household_record_path(
-            dir,
-        ))
-        .expect("read record")
-        .expect("record exists");
+    let record: household_rs::HouseholdRecord = household_rs::storage::read_optional_cbor(
+        &household_rs::storage::household_record_path(dir),
+    )
+    .expect("read record")
+    .expect("record exists");
     assert_eq!(record.shamir_n, 2);
 
     // Sole-shard still present because the unlink was skipped.
@@ -580,8 +589,7 @@ async fn test_m1_crash_between_step12_and_step13_recovers_to_commit() {
     // unlinks the leftover sole-shard;
     // clear_stale_phase3_marker_if_post_shamir clears the marker AND
     // the pending JoinResponse on every post-Shamir boot.
-    let outcome =
-        household_rs::storage::load_state_dir(dir).expect("load_state_dir runs sweeps");
+    let outcome = household_rs::storage::load_state_dir(dir).expect("load_state_dir runs sweeps");
     assert!(
         outcome.recovered_post_join_sole_shard_deleted,
         "boot-time sweep must unlink leftover sole-shard"
@@ -612,8 +620,7 @@ async fn test_m1_crash_during_step13_is_idempotent() {
     fs::create_dir_all(household_rs::storage::household_dir(dir)).expect("mkdir household");
 
     // Run #1: empty state, nothing to recover.
-    let outcome1 =
-        household_rs::storage::load_state_dir(dir).expect("load_state_dir on empty dir");
+    let outcome1 = household_rs::storage::load_state_dir(dir).expect("load_state_dir on empty dir");
     assert!(!outcome1.recovered_post_join_sole_shard_deleted);
     assert_eq!(outcome1.partial_phase3_commit_rolled_back, 0);
     assert_eq!(outcome1.partial_phase3_commit_rolled_forward, 0);
@@ -668,12 +675,10 @@ async fn test_recovery_timeout_rolls_back_when_m2_permanently_lost() {
     // back AFTER that timeout has elapsed".
     let test_timeout = Duration::from_millis(200);
     let start = Instant::now();
-    let outcome = household_rs::pair_machine::recover_phase3_ceremony(
-        founder.dir.path(),
-        test_timeout,
-    )
-    .await
-    .expect("recovery completes");
+    let outcome =
+        household_rs::pair_machine::recover_phase3_ceremony(founder.dir.path(), test_timeout)
+            .await
+            .expect("recovery completes");
     let elapsed = start.elapsed();
     assert!(
         matches!(

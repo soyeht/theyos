@@ -892,13 +892,13 @@ fn restart_macos_vm(
         Ok(c) => c,
         Err(e) => return Response::err(format!("build VZ config: {e}")),
     };
+    let mac = config.mac_address.clone();
 
     let result = block_on(async {
         let existing_ips = vmrunner_macos_rs::snapshot_leased_ips().await;
         let vm = VZVirtualMachine::new(&config, container)?;
         vm.start().await?;
 
-        let mac = vm.get_mac_address().unwrap_or_default();
         let _ = std::fs::write(inst_dir.join("vm_mac"), &mac);
 
         let ip = resolve_dhcp_ip(&mac, 120, &existing_ips).await?;

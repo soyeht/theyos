@@ -17,6 +17,15 @@ let
 
 in
 {
+  # ── Imports ──────────────────────────────────────────────────────────────────
+  # Sub-modules that own their own option tree under
+  # `services.theyos.<name>`. Imported here (not from the flake) so they
+  # see the same `config.services.theyos.*` resolution this file builds.
+
+  imports = [
+    ./modules/llm-proxy.nix
+  ];
+
   # ── Options ──────────────────────────────────────────────────────────────────
 
   options.services.theyos = {

@@ -19,7 +19,7 @@
 //! - 403 when invitation pending and source IP is LAN
 //! - 403 when invitation pending and source IP is Tailnet but not iPhone's
 //! - 200 when invitation pending and source IP matches iPhone's Tailnet address
-//! - 200 when no invitation pending (guard not active — no ConnectInfo required)
+//! - 200 when no invitation pending (guard not active — no `ConnectInfo` required)
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -51,7 +51,7 @@ use tower::ServiceExt;
 
 /// Tailscale CGNAT address in 100.64.0.0/10 — classified as Tailnet.
 const IPHONE_TAILNET_IP: &str = "100.64.1.1";
-/// Plain LAN address — classified as LocalNetwork, not Tailnet.
+/// Plain LAN address — classified as `LocalNetwork`, not Tailnet.
 const LAN_IP: &str = "192.168.1.10";
 /// A different Tailnet IP — valid range but not the iPhone's registered IP.
 const OTHER_TAILNET_IP: &str = "100.64.2.2";
@@ -232,7 +232,7 @@ async fn call_claim(state: BootstrapHandlerState, body: Vec<u8>) -> (StatusCode,
 }
 
 /// Call `POST /bootstrap/initialize`. `src_ip` is a bare IP string
-/// (`"100.64.1.1"`) or `None` for no ConnectInfo header.
+/// (`"100.64.1.1"`) or `None` for no `ConnectInfo` header.
 async fn call_initialize(
     state: BootstrapHandlerState,
     body: Vec<u8>,
@@ -469,7 +469,7 @@ async fn claim_200_response_shape() {
     populate_cache(&state, entry).await;
 
     let (status, body) = call_claim(state, cbor_claim(&token)).await;
-    assert_eq!(status, StatusCode::OK, "unexpected body: {:?}", body);
+    assert_eq!(status, StatusCode::OK, "unexpected body: {body:?}");
     let ack = decode_ack(&body);
     assert_eq!(ack.version, 1, "v must be 1");
     assert_eq!(ack.iphone_endpoint, mock_addr.to_string());

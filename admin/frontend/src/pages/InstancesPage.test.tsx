@@ -214,9 +214,13 @@ describe("InstancesPage", () => {
     mockedApi.stopInstance.mockResolvedValue(undefined);
     renderPage();
 
-    await waitFor(() => expect(mockedApi.listInstances).toHaveBeenCalledTimes(1));
-
-    await userEvent.click(screen.getByRole("button", { name: "stop" }));
+    // Wait for the instance row + action buttons to actually render —
+    // `listInstances` being called once is necessary but not sufficient
+    // (CI runners can take a few extra ticks between the resolved
+    // promise and React committing the DOM). Use findByRole so the
+    // assertion retries until the button exists.
+    const stopButton = await screen.findByRole("button", { name: "stop" });
+    await userEvent.click(stopButton);
 
     await waitFor(() => {
       expect(mockedApi.listInstances).toHaveBeenCalledTimes(2);

@@ -97,8 +97,21 @@ BASEEOF
         fi
     fi
 
-    # Detect values
-    CURRENT_USER="$(whoami)"
+    # Detect values. `whoami` returns `root` when this script is invoked
+    # via `sudo` (which is the documented entry point); fall back to
+    # SUDO_USER so the generated nix/host.nix points at the operator's
+    # real user, not root. If neither is meaningful, fail loudly rather
+    # than silently writing a profile pointed at root — `services.theyos`
+    # then tries to set `users.users.root.{...}` and collides with NixOS's
+    # built-in root definition, producing an opaque "defined multiple
+    # times" error at the next rebuild.
+    CURRENT_USER="${SUDO_USER:-$(whoami)}"
+    if [ "$CURRENT_USER" = "root" ]; then
+        printf '[install-nixos] ERROR: refusing to generate nix/host.nix with user=root.\n'
+        printf '  Run this script as your normal user via "sudo ./install-nixos" so SUDO_USER is set.\n'
+        printf '  If you really need a root-owned install, edit nix/host.nix manually after this aborts.\n' >&2
+        exit 64
+    fi
     DETECTED_HOSTNAME="$(hostname)"
     DETECTED_TIMEZONE="$(timedatectl show -p Timezone --value 2>/dev/null || echo 'UTC')"
 

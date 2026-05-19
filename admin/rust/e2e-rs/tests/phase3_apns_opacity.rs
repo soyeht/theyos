@@ -28,9 +28,7 @@ use std::time::Duration;
 
 use household_rs::owner_events::OwnerDevicePushToken;
 use serde_bytes::ByteBuf;
-use server_rs::apns_dispatcher::{
-    APNS_TICKLE_BODY, ApnsError, ApnsTransport, install_transport,
-};
+use server_rs::apns_dispatcher::{APNS_TICKLE_BODY, ApnsError, ApnsTransport, install_transport};
 
 use phase3_support::{
     OwnerApprovalAck, OwnerEventsResponse, candidate_harness, cursor_param, founder_harness,
@@ -73,10 +71,7 @@ impl ApnsTransport for SpyTransport {
         let token_bytes = push_token.to_vec();
         Box::pin(async move {
             self.captured_bodies.lock().unwrap().push(body_bytes);
-            self.captured_push_tokens
-                .lock()
-                .unwrap()
-                .push(token_bytes);
+            self.captured_push_tokens.lock().unwrap().push(token_bytes);
             Ok(())
         })
     }
@@ -116,7 +111,12 @@ fn forbidden_household_substrings(
         b"hh_".to_vec(),
         b"m_".to_vec(),
         b"p_".to_vec(),
-        candidate.prepared.join_request.hostname.clone().into_bytes(),
+        candidate
+            .prepared
+            .join_request
+            .hostname
+            .clone()
+            .into_bytes(),
     ];
     // Check the full phrase, not individual BIP-39 words. Single words like
     // "lab" or "device" can legitimately appear inside fixed non-household
@@ -176,12 +176,8 @@ async fn test_no_household_data_in_apns() {
     // Briefly catch up the long-poll just to surface the JoinRequest
     // event's cursor; the call returns immediately because the head is
     // already ahead of `since=0`.
-    let owner_events_uri = format!(
-        "/api/v1/household/owner-events?since={}",
-        cursor_param(0)
-    );
-    let (_, _, body) =
-        get_cbor(founder.router.clone(), &owner_events_uri, &founder.owner).await;
+    let owner_events_uri = format!("/api/v1/household/owner-events?since={}", cursor_param(0));
+    let (_, _, body) = get_cbor(founder.router.clone(), &owner_events_uri, &founder.owner).await;
     let events: OwnerEventsResponse =
         household_rs::cbor::from_canonical_slice(&body).expect("decode events");
     assert_eq!(events.events.len(), 1);
@@ -206,8 +202,7 @@ async fn test_no_household_data_in_apns() {
     )
     .await;
     assert_eq!(status.as_u16(), 200);
-    let _: OwnerApprovalAck =
-        household_rs::cbor::from_canonical_slice(&body).expect("decode ack");
+    let _: OwnerApprovalAck = household_rs::cbor::from_canonical_slice(&body).expect("decode ack");
 
     // Wait for the spawned APNS dispatch tasks to drain. Each event
     // append spawns a `tokio::spawn(...)` — by the time we reach this

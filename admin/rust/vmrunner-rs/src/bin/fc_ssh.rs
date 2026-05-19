@@ -21,6 +21,7 @@
 //!   `fc-ssh status        [CONTAINER]`                   — Show running status of one or all instances
 //!   `fc-ssh help`                                        — Print this usage
 
+use core_rs::claw_llm::{LlmBootstrapTarget, LlmContract, shell_quote};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -203,20 +204,24 @@ fn cmd_pty(container: &str, _session_name: &str, _grouped_base: Option<&str>) {
     // ignored — the backend identifies conversations on its own side.
     let (ssh_key, ssh_port) = resolve_instance(container);
     let port_str = ssh_port.to_string();
+    let target = LlmBootstrapTarget::LinuxFirecracker;
+    let contract = LlmContract::from_env(resolve_instance_claw_type(container), target);
 
-    // Launch a direct interactive login shell inside the guest. Try bash first
-    // (standard on Ubuntu guests); fall back to sh -l if bash is missing.
-    // `exec` replaces the shell that SSH itself spawns so `$!` in scripts and
-    // tty ownership are clean.
-    let shell_cmd = "export TERM=xterm-256color LANG=C.UTF-8 COLORTERM=truecolor; \
-                     if command -v bash >/dev/null 2>&1; then exec bash -l -i; \
-                     else exec sh -l; fi";
+    // Launch a direct interactive login shell inside the guest. The bootstrap
+    // exports the local LLM contract and can auto-start a claw chat adapter.
+    let shell_cmd = contract.render_pty_shell(target);
 
     let ssh_bin = resolve_ssh_bin();
-    let err = Command::new(&ssh_bin)
-        .args(build_ssh_opts(&ssh_key, &port_str))
-        .args(["-tt", "root@127.0.0.1", shell_cmd])
-        .exec(); // replaces the process — only returns on error
+    let mut command = Command::new(&ssh_bin);
+    command.args(build_ssh_opts(&ssh_key, &port_str));
+    if let Some(reverse_spec) = contract.ssh_reverse_forward() {
+        command
+            .arg("-o")
+            .arg("ExitOnForwardFailure=no")
+            .arg("-R")
+            .arg(reverse_spec);
+    }
+    let err = command.args(["-tt", "root@127.0.0.1", &shell_cmd]).exec(); // replaces the process — only returns on error
 
     eprintln!("[fc-ssh] pty execvp failed: {err}");
     std::process::exit(1);
@@ -570,6 +575,14 @@ fn resolve_instance(container: &str) -> (PathBuf, u16) {
     (ssh_key, port)
 }
 
+fn resolve_instance_claw_type(container: &str) -> Option<String> {
+    let inst_env = resolve_state_dir().join(container).join("instance.env");
+    read_instance_field(&inst_env, "CLAW_TYPE")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
 fn read_instance_field(env_path: &Path, field: &str) -> Result<String, String> {
     core_rs::env::read_env_field(env_path, field)
         .ok_or_else(|| format!("{field} not found in {}", env_path.display()))
@@ -651,11 +664,6 @@ fn sanitize_tmux_name(name: &str) -> Result<String, String> {
     Ok(name.to_string())
 }
 
-/// POSIX shell quoting: wrap in single quotes, escape embedded single quotes.
-fn shell_quote(s: &str) -> String {
-    format!("'{}'", s.replace('\'', "'\\''"))
-}
-
 fn print_usage() {
     eprintln!("Usage:");
     eprintln!(
@@ -696,6 +704,18 @@ fn print_usage() {
         "  FIRECRACKER_SSH_KEY     SSH private key path (default: ~/firecracker/assets/ubuntu-24.04-root.id_rsa)"
     );
     eprintln!("  SSH_BIN                 Override ssh binary path (default: auto-detect)");
+    eprintln!(
+        "  THEYOS_LLM_SSH_TUNNEL    Enable local LLM reverse SSH tunnel for PTYs (default: 1)"
+    );
+    eprintln!("  THEYOS_LLM_HOST_ADDR     Upstream LLM host/address (default: 127.0.0.1)");
+    eprintln!("  THEYOS_LLM_HOST_PORT     Linux host LLM port (default: provider-specific)");
+    eprintln!("  THEYOS_LLM_GUEST_PORT    Guest LLM port inside the claw (default: host port)");
+    eprintln!("  THEYOS_LLM_PROVIDER      Local LLM provider id (default: ollama)");
+    eprintln!("  THEYOS_LLM_MODEL         Default local LLM model (default: llama3.1)");
+    eprintln!("  THEYOS_LLM_PROFILE_PATH  Optional KEY=VALUE profile for easy provider switching");
+    eprintln!("  THEYOS_LLM_ADAPTER_PATH  Optional claw-specific LLM adapter executable");
+    eprintln!("  THEYOS_AUTO_START_CLAW_CHAT Auto-start a claw chat adapter in PTYs (default: 1)");
+    eprintln!("  THEYOS_OLLAMA_*          Backward-compatible aliases for the same contract");
 }
 
 #[cfg(test)]

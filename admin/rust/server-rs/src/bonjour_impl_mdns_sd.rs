@@ -14,9 +14,7 @@ use std::collections::{HashMap, HashSet};
 use std::net::IpAddr;
 use std::time::Duration;
 
-use mdns_sd::{
-    DaemonStatus, Receiver, ServiceDaemon, ServiceEvent, ServiceInfo, UnregisterStatus,
-};
+use mdns_sd::{DaemonStatus, Receiver, ServiceDaemon, ServiceEvent, ServiceInfo, UnregisterStatus};
 use tokio::time::timeout;
 
 /// Backend-specific error type. Re-exported so the facade signatures don't
@@ -89,11 +87,7 @@ impl PublisherHandle {
     }
 
     /// Unregister and await completion with `wait` budget.
-    pub async fn unregister_and_wait(
-        &self,
-        fullname: &str,
-        wait: Duration,
-    ) -> UnregisterOutcome {
+    pub async fn unregister_and_wait(&self, fullname: &str, wait: Duration) -> UnregisterOutcome {
         let rx: Receiver<UnregisterStatus> = match self.daemon.unregister(fullname) {
             Ok(rx) => rx,
             Err(e) => return UnregisterOutcome::Failed(e.to_string()),

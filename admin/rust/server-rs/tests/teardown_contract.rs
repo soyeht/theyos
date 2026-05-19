@@ -2,15 +2,15 @@
 //!
 //! Coverage per `contracts/bootstrap-teardown.md` validation order:
 //!
-//! - 409 when engine state is not in {named_awaiting_pair, ready, recovering}
+//! - 409 when engine state is not in {`named_awaiting_pair`, ready, recovering}
 //! - 400 on non-decodable CBOR body
 //! - 400 on op != "teardown"
 //! - 400 on malformed field (wrong `signed_by` or `nonce` byte length)
 //! - 401 on `ts` skew > 300 s
 //! - 401 on nonce replay (nonce used twice)
-//! - 401 when `signed_by` not in owner cert set (unknown D_pub)
+//! - 401 when `signed_by` not in owner cert set (unknown `D_pub`)
 //! - 401 on signature mismatch (tampered body)
-//! - 200 success — correct TeardownAck shape, state resets to uninitialized
+//! - 200 success — correct `TeardownAck` shape, state resets to uninitialized
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -81,10 +81,10 @@ struct Fixture {
 }
 
 /// Like `make_fixture` but skips `auth_state.save()` — state dir has NO owner
-/// cert on disk. Used to verify the NamedAwaitingPair bypass invariant: teardown
+/// cert on disk. Used to verify the `NamedAwaitingPair` bypass invariant: teardown
 /// must succeed without a cert when the state machine is pre-pairing.
 ///
-/// Only valid for NamedAwaitingPair — the bypass only exists for that state.
+/// Only valid for `NamedAwaitingPair` — the bypass only exists for that state.
 fn make_fixture_no_auth(bs: BootstrapState) -> (Fixture, Router) {
     assert!(
         matches!(bs, BootstrapState::NamedAwaitingPair),
@@ -497,10 +497,10 @@ async fn valid_request_returns_200_and_resets_state() {
     );
 }
 
-/// R6-D: Verify that teardown succeeds in NamedAwaitingPair state even when
+/// R6-D: Verify that teardown succeeds in `NamedAwaitingPair` state even when
 /// there is NO owner cert on disk. This exercises the bypass invariant: the
 /// cert+sig check must be skipped entirely (not just found-and-passed) for the
-/// pre-pairing state. make_fixture_no_auth guarantees no cert is written.
+/// pre-pairing state. `make_fixture_no_auth` guarantees no cert is written.
 #[tokio::test]
 async fn named_awaiting_pair_teardown_succeeds_without_cert_on_disk() {
     let (fix, app) = make_fixture_no_auth(BootstrapState::NamedAwaitingPair);

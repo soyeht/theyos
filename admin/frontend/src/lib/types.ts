@@ -232,3 +232,104 @@ export type CloudflareSetupResponse = {
   tunnel_name: string;
   configured_at: string;
 };
+
+// ── LLM proxy (admin-facing) ──────────────────────────────────────────────
+
+export type LlmProviderKind = "openai-compat" | "anthropic-api" | "cli-oauth";
+export type LlmCliFlavor = "claude" | "codex" | "gemini" | "opencode";
+
+export type LlmCatalogModel = {
+  id: string;
+  display_name: string;
+  context_window?: number;
+};
+
+export type LlmCredentialHint =
+  | { kind: "none" }
+  | { kind: "api-key"; env_hint: string }
+  | { kind: "cli-oauth"; cli_binary: string };
+
+export type LlmPlanInfo = {
+  name: string;
+  signup_url: string;
+  plan_model_id?: string;
+};
+
+export type LlmCatalogEntry = {
+  id: string;
+  display_name: string;
+  tagline: string;
+  kind: LlmProviderKind;
+  default_base_url: string;
+  coding_plan_base_url?: string;
+  models: LlmCatalogModel[];
+  credential: LlmCredentialHint;
+  docs_url?: string;
+  plan?: LlmPlanInfo;
+  region?: "global" | "china";
+  cli_flavor?: LlmCliFlavor;
+};
+
+export type LlmCatalog = {
+  entries: LlmCatalogEntry[];
+};
+
+export type LlmActiveProfile = {
+  provider: string;
+  model: string;
+};
+
+export type LlmActiveResponse = {
+  default: LlmActiveProfile;
+  per_claw: Record<string, LlmActiveProfile>;
+};
+
+export type LlmProviderSummary = {
+  id: string;
+  kind: LlmProviderKind;
+  base_url: string;
+  models: string[];
+  has_credential: boolean;
+  credential_account?: string;
+  in_use: boolean;
+};
+
+export type LlmProvidersResponse = {
+  providers: LlmProviderSummary[];
+};
+
+export type LlmUpsertProviderBody = {
+  id: string;
+  kind: LlmProviderKind;
+  base_url: string;
+  credential_account?: string;
+  models: string[];
+  cli_binary_path?: string;
+  cli_timeout_secs?: number;
+  cli_flavor?: LlmCliFlavor;
+  /** Secret value to store under `credential_account`. Never echoed back. */
+  credential?: string;
+};
+
+export type LlmTestResponse = {
+  ok: boolean;
+  latency_ms: number;
+  error?: string;
+};
+
+export type LlmAuditRecord = {
+  ts: string;
+  provider: string;
+  claw_type?: string;
+  model: string;
+  stream: boolean;
+  status: "ok" | "error";
+  error_kind?: string;
+  latency_ms: number;
+  input_tokens?: number;
+  output_tokens?: number;
+};
+
+export type LlmAuditResponse = {
+  records: LlmAuditRecord[];
+};

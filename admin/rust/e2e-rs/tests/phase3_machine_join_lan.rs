@@ -69,7 +69,8 @@ async fn phase3_machine_join_lan() {
     // Owner reads the staged event off the long-poll endpoint exactly as
     // the iPhone would. The cursor returned here drives the approve path.
     let owner_events_uri = format!("{OWNER_EVENTS_PATH}?since={}", cursor_param(0));
-    let (status, _, body) = get_cbor(founder.router.clone(), &owner_events_uri, &founder.owner).await;
+    let (status, _, body) =
+        get_cbor(founder.router.clone(), &owner_events_uri, &founder.owner).await;
     assert_eq!(status, StatusCode::OK);
     let events: OwnerEventsResponse =
         household_rs::cbor::from_canonical_slice(&body).expect("decode events");
@@ -160,10 +161,7 @@ async fn phase3_machine_join_lan() {
         PairMachineState::Committed
     );
 
-    let final_events = founder
-        .event_log
-        .read_since(0)
-        .expect("read owner events");
+    let final_events = founder.event_log.read_since(0).expect("read owner events");
     assert_eq!(final_events.len(), 2);
     assert_eq!(final_events[1].cursor, 2);
     assert_eq!(final_events[1].event_type, OwnerEventType::MachineJoined);

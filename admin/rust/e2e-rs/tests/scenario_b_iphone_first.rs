@@ -1,4 +1,4 @@
-//! T050 — Integration test: iPhone-first AirDrop install flow (scenario B).
+//! T050 — Integration test: iPhone-first `AirDrop` install flow (scenario B).
 //!
 //! Simulates the full sequence where Soyeht iPhone initiates a Mac install
 //! before the user double-clicks Soyeht.dmg:
@@ -24,7 +24,7 @@
 //!
 //! The "fake iPhone" is an in-process axum server on a random loopback port
 //! that handles `POST /setup/verify` (echoing the token back → success) or
-//! returns 404 (→ failure). No real Bonjour or AirDrop is involved.
+//! returns 404 (→ failure). No real Bonjour or `AirDrop` is involved.
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -240,7 +240,7 @@ fn err(bytes: &[u8]) -> ErrResp {
 // ═══════════════════════════════════════════════════════════════════════════════
 
 /// Full scenario B happy path:
-/// beacon → claim → initialize (from iPhone Tailnet IP) → NamedAwaitingPair.
+/// beacon → claim → initialize (from iPhone Tailnet IP) → `NamedAwaitingPair`.
 #[tokio::test]
 async fn scenario_b_full_happy_path() {
     set_test_env("THEYOS_FORCE_SOFTWARE_KEYS", "1");
@@ -404,7 +404,7 @@ async fn scenario_b_hijack_blocked_lan_ip() {
     assert_eq!(err(&body).error, "tailnet_required");
 }
 
-/// After claim, missing ConnectInfo (no source IP) → 403.
+/// After claim, missing `ConnectInfo` (no source IP) → 403.
 #[tokio::test]
 async fn scenario_b_hijack_blocked_no_connect_info() {
     let dir = make_state_dir();

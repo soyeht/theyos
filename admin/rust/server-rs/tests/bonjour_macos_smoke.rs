@@ -13,7 +13,7 @@
 //! - `dns_sd_enriched_txt_keys_round_trip` (T016b) — asserts that ALL
 //!   FR-012/FR-013 TXT enrichment keys (`hh_name`, `owner_display_name`,
 //!   `device_count`, `platform`, `bootstrap_state`, `host_label`) survive
-//!   the full dns_sd publish → browse → resolve chain.
+//!   the full `dns_sd` publish → browse → resolve chain.
 //!
 //! Runs unconditionally on macOS as part of `cargo test` so the lock
 //! against regression of either the chain logic or the teardown
@@ -102,7 +102,7 @@ async fn dns_sd_publish_then_browse_round_trips() {
 }
 
 /// T016b — verify that ALL FR-012/FR-013 TXT enrichment keys survive the
-/// full dns_sd publish → browse → resolve chain. This prevents future
+/// full `dns_sd` publish → browse → resolve chain. This prevents future
 /// regressions where a new key is added to `PublishParams` but silently
 /// dropped by the `ServiceInfo` TXT encoding.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

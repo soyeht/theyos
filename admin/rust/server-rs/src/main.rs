@@ -41,7 +41,7 @@ use axum::{
     extract::DefaultBodyLimit,
     middleware,
     response::Html,
-    routing::{delete, get, patch, post},
+    routing::{delete, get, patch, post, put},
 };
 use executor_rs::{Executor, FlowConfig};
 use jobs_rs::Store as JobsStore;
@@ -364,6 +364,7 @@ async fn main() {
         theyos_dir,
         locks_dir,
         capacity_lock: tokio::sync::Mutex::new(()),
+        llm_proxy_client: server_rs::handlers_llm::ProxyClient::from_env(),
     });
 
     // ── Cloudflared sync ─────────────────────────────────────────────────
@@ -774,6 +775,37 @@ async fn main() {
         .route(
             "/admin/cloudflare/setup",
             post(cloudflare_admin::handle_setup).delete(cloudflare_admin::handle_disconnect),
+        )
+        // LLM proxy — reverse-proxied to the host-side daemon after admin
+        // auth. See handlers_llm.rs for the rationale (split user identity
+        // between server-rs and llm-proxy-rs).
+        .route("/llm/catalog", get(server_rs::handlers_llm::handle_catalog))
+        .route(
+            "/llm/active",
+            get(server_rs::handlers_llm::handle_get_active)
+                .put(server_rs::handlers_llm::handle_put_active),
+        )
+        .route(
+            "/llm/active/{claw_type}",
+            put(server_rs::handlers_llm::handle_put_active_claw)
+                .delete(server_rs::handlers_llm::handle_delete_active_claw),
+        )
+        .route(
+            "/llm/providers",
+            get(server_rs::handlers_llm::handle_list_providers)
+                .post(server_rs::handlers_llm::handle_upsert_provider),
+        )
+        .route(
+            "/llm/providers/{id}",
+            delete(server_rs::handlers_llm::handle_delete_provider),
+        )
+        .route(
+            "/llm/providers/{id}/test",
+            post(server_rs::handlers_llm::handle_test_provider),
+        )
+        .route(
+            "/llm/audit",
+            get(server_rs::handlers_llm::handle_get_audit),
         )
         // Terminals (non-streaming)
         .route(

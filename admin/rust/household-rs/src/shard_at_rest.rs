@@ -182,8 +182,8 @@ fn encrypt_with_derived_key(
     if shard.len() != 32 {
         return Err(ShardError::BadShardLength(shard.len()));
     }
-    let cipher = ChaCha20Poly1305::new_from_slice(key.as_slice())
-        .map_err(|_| ShardError::AeadFailed)?;
+    let cipher =
+        ChaCha20Poly1305::new_from_slice(key.as_slice()).map_err(|_| ShardError::AeadFailed)?;
     let mut nonce_bytes = [0u8; 12];
     OsRng.fill_bytes(&mut nonce_bytes);
     let nonce = Nonce::from_slice(&nonce_bytes);
@@ -209,8 +209,8 @@ fn decrypt_with_derived_key(
     es: &EncryptedShard,
     aad_m_id: &str,
 ) -> Result<Zeroizing<[u8; 32]>, ShardError> {
-    let cipher = ChaCha20Poly1305::new_from_slice(key.as_slice())
-        .map_err(|_| ShardError::AeadFailed)?;
+    let cipher =
+        ChaCha20Poly1305::new_from_slice(key.as_slice()).map_err(|_| ShardError::AeadFailed)?;
     let nonce = Nonce::from_slice(&es.nonce);
     let plaintext = cipher
         .decrypt(

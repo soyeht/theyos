@@ -7,6 +7,8 @@ let
   # Use crane's cleanCargoSource plus extra filters for non-Rust assets that
   # crates pull in via include_str!:
   #   - .html files (e.g. server-rs/.../privacy.html)
+  #   - .sh files (e.g. core-rs/src/claw_llm_bootstrap.sh)
+  #   - .json files (test fixtures, contract docs)
   #   - anything under an `assets/` directory (e.g.
   #     rootfsbuilder-rs/assets/how-to-publish.md)
   src = pkgs.lib.cleanSourceWith {
@@ -14,6 +16,8 @@ let
     filter = path: type:
       (craneLib.filterCargoSources path type)
       || (builtins.match ".*\\.html$" path != null)
+      || (builtins.match ".*\\.sh$" path != null)
+      || (builtins.match ".*\\.json$" path != null)
       || (builtins.match ".*/assets/.*" path != null);
   };
 
@@ -23,6 +27,14 @@ let
 
   # core-rs/build.rs reads this to generate the claw catalog at compile time.
   manifestSrc = ../../claws/manifest.yml;
+
+  # household-rs/build.rs reads this to embed the emoji-security-code
+  # wordlist CSV. The CSV lives inside admin/rust/household-rs/data/ so
+  # plain `cargo build` resolves it via build.rs's CARGO_MANIFEST_DIR
+  # fallback. We still pin the absolute path here so the Nix sandbox
+  # resolves the file deterministically (the same recipe used for
+  # `manifestSrc` above).
+  emojiWordlistSrc = ../../admin/rust/household-rs/data/emoji-security-code-wordlist.csv;
 
   commonArgs = {
     inherit src;
@@ -55,6 +67,10 @@ let
     # core-rs/build.rs uses CLAWS_MANIFEST_YML to find manifest.yml in the
     # Nix sandbox (the repo-relative ../../../ path doesn't exist here).
     CLAWS_MANIFEST_YML = manifestSrc;
+
+    # household-rs/build.rs uses THEYOS_EMOJI_WORDLIST to find the CSV;
+    # without this the relative include_str! path escapes the sandbox.
+    THEYOS_EMOJI_WORDLIST = emojiWordlistSrc;
 
     # Contract tests expect admin/contracts/ at ../../contracts/ relative to
     # each crate's CARGO_MANIFEST_DIR. In the Nix sandbox the workspace is at

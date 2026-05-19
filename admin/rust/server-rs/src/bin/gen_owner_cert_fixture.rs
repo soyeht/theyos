@@ -83,16 +83,15 @@ fn derive_scalar(domain: &[u8]) -> [u8; 32] {
 
 fn derive_keypair(domain: &[u8]) -> P256Keypair {
     let scalar = derive_scalar(domain);
-    P256Keypair::from_secret_scalar(&scalar)
-        .unwrap_or_else(|_| {
-            // Extremely unlikely: scalar == 0 or >= n. Retry with a suffix.
-            let mut h = blake3::Hasher::new();
-            h.update(SEED);
-            h.update(domain);
-            h.update(b"-retry");
-            let scalar2: [u8; 32] = *h.finalize().as_bytes();
-            P256Keypair::from_secret_scalar(&scalar2).expect("second scalar derivation failed")
-        })
+    P256Keypair::from_secret_scalar(&scalar).unwrap_or_else(|_| {
+        // Extremely unlikely: scalar == 0 or >= n. Retry with a suffix.
+        let mut h = blake3::Hasher::new();
+        h.update(SEED);
+        h.update(domain);
+        h.update(b"-retry");
+        let scalar2: [u8; 32] = *h.finalize().as_bytes();
+        P256Keypair::from_secret_scalar(&scalar2).expect("second scalar derivation failed")
+    })
 }
 
 fn fixed_nonce(domain: &[u8]) -> [u8; 32] {
@@ -173,7 +172,13 @@ fn main() {
     };
 
     // (c) ts skew: ts is 400 seconds behind BASE_TS (> 300-second gate).
-    let ts_skew = build_request(&hh_id, &m_id, BASE_TS.saturating_sub(400), nonce, &owner_key);
+    let ts_skew = build_request(
+        &hh_id,
+        &m_id,
+        BASE_TS.saturating_sub(400),
+        nonce,
+        &owner_key,
+    );
 
     // (d) Nonce replay: identical CBOR to `valid`. Server accepts the first use
     // and rejects the second (nonce already consumed). Fixture consumers should
@@ -202,12 +207,10 @@ fn main() {
 
     let cbor_bytes = to_canonical_vec(&fixture).expect("encode fixture");
 
-    let output_path = std::env::args()
-        .nth(1)
-        .map_or_else(
-            || PathBuf::from("admin/rust/server-rs/tests/fixtures/owner_cert_auth.cbor"),
-            PathBuf::from,
-        );
+    let output_path = std::env::args().nth(1).map_or_else(
+        || PathBuf::from("admin/rust/server-rs/tests/fixtures/owner_cert_auth.cbor"),
+        PathBuf::from,
+    );
 
     if let Some(parent) = output_path.parent() {
         std::fs::create_dir_all(parent).expect("create output dir");

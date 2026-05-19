@@ -6,7 +6,7 @@
 //! 1. Ready → teardown → Uninitialized (in-memory + persisted).
 //! 2. `GET /bootstrap/status` reflects `uninitialized` after teardown.
 //! 3. Second teardown returns 409 (state gate: uninitialized not valid).
-//! 4. NamedAwaitingPair → teardown succeeds without owner cert (R5-E bypass).
+//! 4. `NamedAwaitingPair` → teardown succeeds without owner cert (R5-E bypass).
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -307,7 +307,7 @@ async fn teardown_flow_second_call_returns_409() {
     );
 }
 
-/// NamedAwaitingPair teardown succeeds without owner cert (R5-E: cert+sig skipped).
+/// `NamedAwaitingPair` teardown succeeds without owner cert (R5-E: cert+sig skipped).
 #[tokio::test]
 async fn teardown_flow_named_awaiting_pair_no_cert_required() {
     set_test_env("THEYOS_FORCE_SOFTWARE_KEYS", "1");

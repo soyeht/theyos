@@ -1,7 +1,7 @@
 //! T088b spy-transport tests for the `house_created` APNs push client.
 //!
 //! Tests cover:
-//! - Payload shape conformance against the house_created_push.json fixture (T088c).
+//! - Payload shape conformance against the `house_created_push.json` fixture (T088c).
 //! - Retry on transient (5xx) failures followed by success.
 //! - Immediate abort on permanent (4xx) failures.
 //! - Retry exhaustion with no successful response.
@@ -37,7 +37,7 @@ impl SpyTransport {
 }
 
 impl HouseCreatedTransport for SpyTransport {
-    fn topic(&self) -> &str {
+    fn topic(&self) -> &'static str {
         "com.soyeht.iSoyehtTerm.test"
     }
 
@@ -76,7 +76,7 @@ fn test_event(hh_name: &str) -> HouseCreatedEvent {
 
 // ── Payload shape tests ───────────────────────────────────────────────────────
 
-/// Verify build_house_created_json output against each fixture entry.
+/// Verify `build_house_created_json` output against each fixture entry.
 #[test]
 fn payload_shape_matches_fixture() {
     let fixture: Vec<serde_json::Value> =

@@ -540,10 +540,7 @@ impl PairMachineWindow {
         // transitioned `idle → staging`. Audit consumers count this
         // against `enter_awaiting_owner` to detect ceremonies that
         // started but never reached the owner-event append stage.
-        tracing::info!(
-            stage = "pair_machine.window_opened",
-            expiry = expiry,
-        );
+        tracing::info!(stage = "pair_machine.window_opened", expiry = expiry,);
         Ok(expiry)
     }
 
@@ -2023,12 +2020,8 @@ pub async fn recover_phase3_ceremony(
         // exercises (re-POST succeeds when local/finalize accepts the
         // body). Keeping the probe as a diagnostic helps operators
         // distinguish "M2 hasn't committed yet" from "network broken".
-        let pre_commit = probe_pre_commit(
-            &m2_addr,
-            &nonce_short,
-            cached_join_request.m_pub.as_ref(),
-        )
-        .await;
+        let pre_commit =
+            probe_pre_commit(&m2_addr, &nonce_short, cached_join_request.m_pub.as_ref()).await;
         tracing::debug!(
             stage = "recovery.phase3.pre_commit_outcome",
             attempt = attempt,
@@ -2066,7 +2059,11 @@ enum ProbeOutcome {
 /// `GET /api/v1/household/identity` over HTTP/HTTPS to detect that M2
 /// has committed and is now serving the household listener with the
 /// expected `hh_id`/`hh_pub`.
-async fn probe_post_commit(addr: &str, expected_hh_id: &str, expected_hh_pub: &[u8; 33]) -> ProbeOutcome {
+async fn probe_post_commit(
+    addr: &str,
+    expected_hh_id: &str,
+    expected_hh_pub: &[u8; 33],
+) -> ProbeOutcome {
     let url = identity_url(addr);
     let owned = url.clone();
     let result = tokio::task::spawn_blocking(move || {
@@ -2228,7 +2225,11 @@ async fn finish_phase3_locally(state_dir: &Path) -> Result<(), RecoveryError> {
                 continue;
             }
             std::fs::rename(staged_path, &final_path).map_err(|e| {
-                RecoveryError::Promotion(format!("rename {} -> {}: {e}", staged_path.display(), final_path.display()))
+                RecoveryError::Promotion(format!(
+                    "rename {} -> {}: {e}",
+                    staged_path.display(),
+                    final_path.display()
+                ))
             })?;
             if let Some(parent) = final_path.parent() {
                 if let Ok(dir) = std::fs::File::open(parent) {

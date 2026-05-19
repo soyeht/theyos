@@ -117,7 +117,7 @@ mod tests {
     struct FakeTransport;
 
     impl HouseCreatedTransport for FakeTransport {
-        fn topic(&self) -> &str {
+        fn topic(&self) -> &'static str {
             "com.soyeht.app"
         }
 
@@ -169,11 +169,8 @@ mod tests {
 
     #[test]
     fn setup_beacon_params_preserve_label_and_sanitize_dns_host() {
-        let params = setup_beacon_params_for_host(
-            "Developer Mac".to_string(),
-            "Developer Mac.local.",
-            8091,
-        );
+        let params =
+            setup_beacon_params_for_host("Developer Mac".to_string(), "Developer Mac.local.", 8091);
 
         assert_eq!(params.host_label, "Developer Mac");
         assert_eq!(params.host_dns, "developer-mac.local");

@@ -1,0 +1,31 @@
+[package]
+name    = "keystore-rs"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+
+[lib]
+name = "keystore_rs"
+path = "src/lib.rs"
+
+[dependencies]
+thiserror = { workspace = true }
+tracing   = { workspace = true }
+base64    = { workspace = true }
+
+# Linux: Secret Service (gnome-keyring) or kernel keyring via the `keyring` crate.
+[target.'cfg(target_os = "linux")'.dependencies]
+keyring = { workspace = true }
+
+# macOS: security-framework wrapper around Keychain Services for generic-password
+# entries. The household crate's Secure-Enclave key path stays where it is
+# (household-rs::keys_se) — keystore-rs is only the generic (service, account)
+# → bytes API.
+[target.'cfg(target_os = "macos")'.dependencies]
+security-framework = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+
+[lints]
+workspace = true

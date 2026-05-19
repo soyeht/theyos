@@ -1,6 +1,6 @@
 //! T022 — Integration test: Mac founder onboarding flow (scenario A).
 //!
-//! Simulates the SoyehtMac onboarding flow against a local engine in test mode
+//! Simulates the `SoyehtMac` onboarding flow against a local engine in test mode
 //! (in-process, using `THEYOS_FORCE_SOFTWARE_KEYS=1`). Validates that the
 //! bootstrap state machine advances through the full founder sequence:
 //!
@@ -13,8 +13,8 @@
 //! ```
 //!
 //! The "fake owner-pairing client" generates a fresh P-256 keypair and
-//! simulates the SoyehtMac owner-pairing ceremony without a real iPhone:
-//! it calls `PairingProofContext::sign` to produce the proof_sig, then
+//! simulates the `SoyehtMac` owner-pairing ceremony without a real iPhone:
+//! it calls `PairingProofContext::sign` to produce the `proof_sig`, then
 //! POSTs the confirm request. This covers the engine-side state transition
 //! without requiring a hardware iPhone in CI.
 
@@ -114,7 +114,7 @@ async fn post_initialize(app: Router, name: &str) -> (StatusCode, Vec<u8>) {
 
 // ── Test: full state machine ──────────────────────────────────────────────────
 
-/// Full scenario A flow: uninitialized → named_awaiting_pair via POST /bootstrap/initialize.
+/// Full scenario A flow: uninitialized → `named_awaiting_pair` via POST /bootstrap/initialize.
 #[tokio::test]
 async fn scenario_a_state_machine_uninitialized_to_named_awaiting_pair() {
     // Ensure software key backend for CI.
@@ -262,7 +262,7 @@ async fn scenario_a_initialize_preserves_name_exactly() {
     assert_eq!(resp.name, "Chez Côté", "name must be trimmed");
 }
 
-/// Verify state machine idempotency: ReadyForNaming also accepts initialize.
+/// Verify state machine idempotency: `ReadyForNaming` also accepts initialize.
 #[tokio::test]
 async fn scenario_a_ready_for_naming_also_accepts_initialize() {
     set_test_env("THEYOS_FORCE_SOFTWARE_KEYS", "1");

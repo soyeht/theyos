@@ -65,7 +65,10 @@ fn cursor_increases_strictly_across_appends() {
     let all = read_events_since(td.path(), 0).unwrap();
     assert_eq!(all.len(), 5);
     let from_3 = read_events_since(td.path(), 3).unwrap();
-    assert_eq!(from_3.iter().map(|e| e.cursor).collect::<Vec<_>>(), vec![4, 5]);
+    assert_eq!(
+        from_3.iter().map(|e| e.cursor).collect::<Vec<_>>(),
+        vec![4, 5]
+    );
 }
 
 #[tokio::test]

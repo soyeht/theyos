@@ -1,4 +1,4 @@
-import type { ClawCatalogEntry, CloudflareSetupResponse, CloudflareStatus, CloudflareZone, HostResources, Instance, Job, ListResponse, ListWorkspacesResponse, LogEntry, MaintenanceStatus, NetworkStatus, PublicSitesResponse, User, Workspace } from "./types";
+import type { ClawCatalogEntry, CloudflareSetupResponse, CloudflareStatus, CloudflareZone, HostResources, Instance, Job, ListResponse, ListWorkspacesResponse, LlmActiveProfile, LlmActiveResponse, LlmAuditResponse, LlmCatalog, LlmProvidersResponse, LlmProviderSummary, LlmTestResponse, LlmUpsertProviderBody, LogEntry, MaintenanceStatus, NetworkStatus, PublicSitesResponse, User, Workspace } from "./types";
 
 type JsonValue = Record<string, unknown>;
 
@@ -294,5 +294,71 @@ export const api = {
       cnames_attempted: number;
       cnames_deleted: number;
     }>("/api/v1/admin/cloudflare/setup", { method: "DELETE" });
+  },
+
+  // ── LLM proxy (admin) ─────────────────────────────────────────────────
+  // Reverse-proxied through server-rs `handlers_llm` to the host-side
+  // theyos-llm-proxy daemon. AdminUser auth is enforced on the
+  // server-rs side; the proxy itself is loopback-only.
+
+  llmCatalog: async () => {
+    return request<LlmCatalog>("/api/v1/llm/catalog");
+  },
+
+  llmActive: async () => {
+    return request<LlmActiveResponse>("/api/v1/llm/active");
+  },
+
+  llmSetActive: async (body: LlmActiveProfile) => {
+    return request<LlmActiveProfile>("/api/v1/llm/active", {
+      method: "PUT",
+      body: JSON.stringify(body),
+    });
+  },
+
+  llmSetActiveForClaw: async (clawType: string, body: LlmActiveProfile) => {
+    return request<LlmActiveProfile>(
+      `/api/v1/llm/active/${encodeURIComponent(clawType)}`,
+      {
+        method: "PUT",
+        body: JSON.stringify(body),
+      }
+    );
+  },
+
+  llmClearActiveForClaw: async (clawType: string) => {
+    await request<void>(`/api/v1/llm/active/${encodeURIComponent(clawType)}`, {
+      method: "DELETE",
+    });
+  },
+
+  llmListProviders: async () => {
+    return request<LlmProvidersResponse>("/api/v1/llm/providers");
+  },
+
+  llmUpsertProvider: async (body: LlmUpsertProviderBody) => {
+    return request<LlmProviderSummary>("/api/v1/llm/providers", {
+      method: "POST",
+      body: JSON.stringify(body),
+    });
+  },
+
+  llmDeleteProvider: async (id: string) => {
+    await request<void>(`/api/v1/llm/providers/${encodeURIComponent(id)}`, {
+      method: "DELETE",
+    });
+  },
+
+  llmTestProvider: async (id: string) => {
+    return request<LlmTestResponse>(
+      `/api/v1/llm/providers/${encodeURIComponent(id)}/test`,
+      { method: "POST" }
+    );
+  },
+
+  llmAudit: async (limit = 100, before?: string) => {
+    const params = new URLSearchParams({ limit: String(limit) });
+    if (before) params.set("before", before);
+    return request<LlmAuditResponse>(`/api/v1/llm/audit?${params.toString()}`);
   },
 };

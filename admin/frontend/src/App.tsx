@@ -10,6 +10,8 @@ import { InstanceDetailPage } from "./pages/InstanceDetailPage";
 import { InstancesPage } from "./pages/InstancesPage";
 import { LoginPage } from "./pages/LoginPage";
 import { LogsPage } from "./pages/LogsPage";
+import { ModelsLivePage } from "./pages/ModelsLivePage";
+import { ModelsPage } from "./pages/ModelsPage";
 import { NetworkPage } from "./pages/NetworkPage";
 import { SettingsPage } from "./pages/SettingsPage";
 import { TerminalsPage } from "./pages/TerminalsPage";
@@ -55,6 +57,10 @@ export default function App() {
       <Routes>
         <Route path="/login" element={<LoginPage onLoginSuccess={refreshUser} />} />
 
+        {/* TODO(remove-before-merge): unauthenticated UX preview of /models so
+            we can iterate on the design without booting the full server-rs stack. */}
+        <Route path="/models-preview" element={<ModelsPage />} />
+
         <Route
           element={
             <RequireAuth user={user}>
@@ -66,6 +72,7 @@ export default function App() {
           <Route path="/instances" element={<InstancesPage />} />
           <Route path="/instances/:id" element={<InstanceDetailPage />} />
           <Route path="/claws" element={<ClawStorePage />} />
+          <Route path="/models" element={<ModelsLivePage />} />
           <Route path="/create" element={<CreatePage />} />
           <Route path="/logs" element={<LogsPage />} />
           <Route path="/terminals" element={<TerminalsPage />} />

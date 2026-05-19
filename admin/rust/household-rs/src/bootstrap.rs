@@ -1030,14 +1030,14 @@ mod tests {
     fn create_legacy_db(db_path: &Path) {
         let conn = Connection::open(db_path).unwrap();
         conn.execute_batch(
-            r#"
+            r"
             CREATE TABLE users (id INTEGER PRIMARY KEY, value TEXT);
             CREATE TABLE mobile_sessions (id INTEGER PRIMARY KEY, value TEXT);
             CREATE TABLE invites (id INTEGER PRIMARY KEY, value TEXT);
             INSERT INTO users (value) VALUES ('user');
             INSERT INTO mobile_sessions (value) VALUES ('session');
             INSERT INTO invites (value) VALUES ('invite');
-            "#,
+            ",
         )
         .unwrap();
     }

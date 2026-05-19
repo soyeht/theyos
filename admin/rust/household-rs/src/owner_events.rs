@@ -212,7 +212,10 @@ impl OwnerEventLog {
         // moves only on success). So `into_inner()` on a poisoned
         // guard is safe and prevents a single panic from bricking the
         // log for the rest of process lifetime.
-        let _guard = self.append_mu.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _guard = self
+            .append_mu
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let head = self.head.load(Ordering::Acquire);
         let cursor = head
             .checked_add(1)
@@ -226,8 +229,8 @@ impl OwnerEventLog {
             payload: payload.clone(),
             issuer_m_id: issuer_m_id.to_string(),
         };
-        let canonical =
-            cbor::to_canonical_vec(&unsigned).map_err(|e| EventError::Cbor(format!("encode: {e}")))?;
+        let canonical = cbor::to_canonical_vec(&unsigned)
+            .map_err(|e| EventError::Cbor(format!("encode: {e}")))?;
         let signature = issuer_key.sign(&canonical)?;
         let event = OwnerEvent {
             version: OWNER_EVENT_VERSION,
@@ -465,8 +468,7 @@ use std::sync::OnceLock;
 static OWNER_EVENT_LOG_REGISTRY: OnceLock<std::sync::Mutex<HashMap<PathBuf, Arc<OwnerEventLog>>>> =
     OnceLock::new();
 
-fn registry()
--> &'static std::sync::Mutex<HashMap<PathBuf, Arc<OwnerEventLog>>> {
+fn registry() -> &'static std::sync::Mutex<HashMap<PathBuf, Arc<OwnerEventLog>>> {
     OWNER_EVENT_LOG_REGISTRY.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
 }
 
@@ -479,14 +481,18 @@ fn shared_log_for(state_dir: &Path) -> Result<Arc<OwnerEventLog>, EventError> {
     {
         // Recover from poisoning: the only mutation is inserting into
         // the map, so a poisoned guard is still safe to read.
-        let map = registry().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let map = registry()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         if let Some(log) = map.get(&canonical) {
             return Ok(Arc::clone(log));
         }
     }
     // Slow path: open and insert. Re-check after acquiring the lock to
     // race-free against another caller doing the same.
-    let mut map = registry().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut map = registry()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     if let Some(log) = map.get(&canonical) {
         return Ok(Arc::clone(log));
     }
@@ -559,8 +565,7 @@ pub fn append_raw_for_test(state_dir: &Path, bytes: &[u8]) -> Result<(), EventEr
         .create(true)
         .open(&path)
         .map_err(|e| io_to_event_err(&e, &path))?;
-    f.write_all(bytes)
-        .map_err(|e| io_to_event_err(&e, &path))?;
+    f.write_all(bytes).map_err(|e| io_to_event_err(&e, &path))?;
     f.sync_all().map_err(|e| io_to_event_err(&e, &path))?;
     Ok(())
 }

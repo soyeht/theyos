@@ -259,6 +259,7 @@ impl TestFixture {
             theyos_dir: std::path::PathBuf::from("/tmp/theyos-test"),
             locks_dir: std::path::PathBuf::from("/tmp/theyos-test-locks"),
             capacity_lock: tokio::sync::Mutex::new(()),
+            llm_proxy_client: server_rs::handlers_llm::ProxyClient::from_env(),
         });
 
         let admin = AuthUser {

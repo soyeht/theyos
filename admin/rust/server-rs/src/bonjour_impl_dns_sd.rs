@@ -59,7 +59,7 @@ use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
-use tokio::sync::{mpsc, Mutex as AsyncMutex};
+use tokio::sync::{Mutex as AsyncMutex, mpsc};
 use tracing::{info, warn};
 
 #[allow(
@@ -78,7 +78,8 @@ const KDNS_SERVICE_ERR_NO_ERROR: ffi::DNSServiceErrorType = 0;
 const KDNS_SERVICE_FLAGS_NONE: ffi::DNSServiceFlags = 0;
 const KDNS_SERVICE_INTERFACE_INDEX_ANY: u32 = 0;
 // Re-exported as plain u32/u32 to avoid sprinkling `ffi::` casts at call sites.
-const KDNS_SERVICE_FLAG_ADD: ffi::DNSServiceFlags = ffi::kDNSServiceFlagsAdd as ffi::DNSServiceFlags;
+const KDNS_SERVICE_FLAG_ADD: ffi::DNSServiceFlags =
+    ffi::kDNSServiceFlagsAdd as ffi::DNSServiceFlags;
 const KDNS_SERVICE_FLAG_MORE_COMING: ffi::DNSServiceFlags =
     ffi::kDNSServiceFlagsMoreComing as ffi::DNSServiceFlags;
 const KDNS_SERVICE_PROTOCOL_IPV4: ffi::DNSServiceProtocol =
@@ -285,11 +286,7 @@ impl PublisherHandle {
     /// effectively synchronous (the system call returns once the ref is
     /// released), so we always return `Ok` once the join completes within
     /// the budget, or `TimedOut` if joining exceeds `wait`.
-    pub async fn unregister_and_wait(
-        &self,
-        fullname: &str,
-        wait: Duration,
-    ) -> UnregisterOutcome {
+    pub async fn unregister_and_wait(&self, fullname: &str, wait: Duration) -> UnregisterOutcome {
         let services_arc = Arc::clone(&self.inner);
         let fullname_owned = fullname.to_string();
         let join_result = tokio::time::timeout(
@@ -855,11 +852,7 @@ impl ShutdownPipe {
         // full, EBADF if already closed) are non-fatal: the reader is
         // either already going to wake or has already exited.
         unsafe {
-            let _ = libc::write(
-                self.write_fd,
-                ptr::addr_of!(byte).cast::<c_void>(),
-                1,
-            );
+            let _ = libc::write(self.write_fd, ptr::addr_of!(byte).cast::<c_void>(), 1);
         }
     }
 }
@@ -931,8 +924,7 @@ fn select_pump_ready(sd_fd: c_int, shutdown_fd: c_int) -> Result<bool, c_int> {
             return Err(err);
         }
         // SAFETY: `FD_ISSET` reads the readset populated by `select`.
-        let shutdown_ready =
-            unsafe { libc::FD_ISSET(shutdown_fd, &raw const readset) };
+        let shutdown_ready = unsafe { libc::FD_ISSET(shutdown_fd, &raw const readset) };
         if shutdown_ready {
             return Ok(false);
         }
@@ -965,10 +957,7 @@ fn pump_events(sd_ref: ffi::DNSServiceRef, shutdown_fd: c_int) {
                 // this thread (and only deallocates after the join).
                 let err = unsafe { ffi::DNSServiceProcessResult(sd_ref) };
                 if err != KDNS_SERVICE_ERR_NO_ERROR {
-                    tracing::debug!(
-                        stage = "dns_sd.pump_exit",
-                        error_code = err,
-                    );
+                    tracing::debug!(stage = "dns_sd.pump_exit", error_code = err,);
                     break;
                 }
             }
@@ -1019,11 +1008,7 @@ fn pump_chain_events(
                 // exit) or the drainer deallocates after joining us.
                 let err = unsafe { ffi::DNSServiceProcessResult(sd_ref) };
                 if err != KDNS_SERVICE_ERR_NO_ERROR {
-                    tracing::debug!(
-                        stage = "dns_sd.chain_pump_error_exit",
-                        error_code = err,
-                        id,
-                    );
+                    tracing::debug!(stage = "dns_sd.chain_pump_error_exit", error_code = err, id,);
                     // Forced exit: drainer owns deallocation.
                     return;
                 }
@@ -1317,10 +1302,7 @@ extern "C" fn resolve_reply(
     ctx.done.store(true, Ordering::Release);
 
     if error_code != KDNS_SERVICE_ERR_NO_ERROR {
-        warn!(
-            stage = "dns_sd.resolve_callback_error",
-            error_code,
-        );
+        warn!(stage = "dns_sd.resolve_callback_error", error_code,);
         return;
     }
 
@@ -1489,10 +1471,7 @@ extern "C" fn getaddrinfo_reply(
             ctx.addresses.insert(ip);
         }
     } else if error_code != KDNS_SERVICE_ERR_NO_ERROR {
-        warn!(
-            stage = "dns_sd.getaddrinfo_callback_error",
-            error_code,
-        );
+        warn!(stage = "dns_sd.getaddrinfo_callback_error", error_code,);
     }
 
     // Terminal callback (no MoreComing flag): emit and clean up.
@@ -1568,7 +1547,9 @@ unsafe fn sockaddr_to_ipaddr(addr: *const libc::sockaddr) -> Option<IpAddr> {
             // SAFETY: ditto for sockaddr_in6.
             let sa_in6: libc::sockaddr_in6 =
                 unsafe { ptr::read_unaligned(addr.cast::<libc::sockaddr_in6>()) };
-            Some(IpAddr::V6(std::net::Ipv6Addr::from(sa_in6.sin6_addr.s6_addr)))
+            Some(IpAddr::V6(std::net::Ipv6Addr::from(
+                sa_in6.sin6_addr.s6_addr,
+            )))
         }
         _ => None,
     }
@@ -1611,7 +1592,9 @@ unsafe fn c_str_to_string(ptr: *const c_char) -> String {
         return "<null>".to_string();
     }
     // SAFETY: caller asserts `ptr` is a NUL-terminated C string.
-    unsafe { CStr::from_ptr(ptr) }.to_string_lossy().into_owned()
+    unsafe { CStr::from_ptr(ptr) }
+        .to_string_lossy()
+        .into_owned()
 }
 
 // ─────────────────────── TXT record builder ────────────────────────────────
@@ -1700,13 +1683,7 @@ mod tests {
         // `hh_id=abc` = 9 bytes; `proto=1` = 7 bytes
         // Sorted keys → hh_id first, then proto
         // Expected: [9, "hh_id=abc", 7, "proto=1"]
-        let expected: Vec<u8> = [
-            &[9u8][..],
-            b"hh_id=abc",
-            &[7u8][..],
-            b"proto=1",
-        ]
-        .concat();
+        let expected: Vec<u8> = [&[9u8][..], b"hh_id=abc", &[7u8][..], b"proto=1"].concat();
         assert_eq!(buf.bytes, expected);
         assert_eq!(buf.len() as usize, expected.len());
     }
@@ -1783,9 +1760,7 @@ mod tests {
 
         tokio::time::sleep(Duration::from_secs(4)).await;
 
-        let outcome = publisher
-            .shutdown_and_wait(Duration::from_secs(2))
-            .await;
+        let outcome = publisher.shutdown_and_wait(Duration::from_secs(2)).await;
         eprintln!("[register_smoke] shutdown outcome: {outcome:?}");
         assert!(matches!(outcome, ShutdownOutcome::Ok));
     }
@@ -1882,9 +1857,7 @@ mod tests {
 
         // Clean shutdown of both ends.
         browser.shutdown();
-        let outcome = publisher
-            .shutdown_and_wait(Duration::from_secs(2))
-            .await;
+        let outcome = publisher.shutdown_and_wait(Duration::from_secs(2)).await;
         eprintln!("[browse_smoke] publisher shutdown outcome: {outcome:?}");
         assert!(matches!(outcome, ShutdownOutcome::Ok));
     }

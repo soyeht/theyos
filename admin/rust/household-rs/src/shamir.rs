@@ -11,8 +11,8 @@
 //! drop. Share indices are not zeroized (they are public knowledge by
 //! contract).
 
-use rand::rngs::OsRng;
 use rand::RngCore;
+use rand::rngs::OsRng;
 use vsss_rs::Gf256;
 use zeroize::Zeroizing;
 

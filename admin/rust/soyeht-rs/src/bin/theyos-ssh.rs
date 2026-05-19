@@ -23,6 +23,7 @@
 // and for `std::env::set_var`. All sites have SAFETY comments documenting invariants.
 #![allow(unsafe_code)]
 
+use core_rs::claw_llm::{LlmBootstrapTarget, LlmContract, resolve_macos_claw_type};
 use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
 
@@ -65,27 +66,32 @@ fn main() {
             // v2: tmux removed from the guest. The backend owns the PTY master and
             // handles scrollback/replay. `session` and `--grouped` args accepted for
             // CLI compatibility but ignored.
-            let remote_cmd = "export PATH=/opt/homebrew/bin:/usr/local/bin:$HOME/.local/bin:$PATH; \
-                 export TERM=xterm-256color LANG=C.UTF-8 COLORTERM=truecolor; \
-                 if command -v bash >/dev/null 2>&1; then exec bash -l -i; \
-                 elif command -v zsh >/dev/null 2>&1; then exec zsh -l; \
-                 else exec sh -l; fi";
+            let target = LlmBootstrapTarget::MacosVz;
+            let contract = LlmContract::from_env(resolve_macos_claw_type(container), target);
+            let remote_cmd = contract.render_pty_shell(target);
             // -tt forces PTY allocation even if stdin is not a terminal.
-            let err = std::process::Command::new("ssh")
-                .args([
-                    "-tt",
-                    "-o",
-                    "StrictHostKeyChecking=no",
-                    "-o",
-                    "UserKnownHostsFile=/dev/null",
-                    "-o",
-                    "ConnectTimeout=10",
-                    "-i",
-                    ssh_key.to_str().unwrap_or("/tmp/id_ed25519"),
-                    &user_at_host,
-                    remote_cmd,
-                ])
-                .exec();
+            let mut command = std::process::Command::new("ssh");
+            command.args([
+                "-tt",
+                "-o",
+                "StrictHostKeyChecking=no",
+                "-o",
+                "UserKnownHostsFile=/dev/null",
+                "-o",
+                "ConnectTimeout=10",
+                "-o",
+                "LogLevel=ERROR",
+                "-i",
+                ssh_key.to_str().unwrap_or("/tmp/id_ed25519"),
+            ]);
+            if let Some(reverse_spec) = contract.ssh_reverse_forward() {
+                command
+                    .arg("-o")
+                    .arg("ExitOnForwardFailure=no")
+                    .arg("-R")
+                    .arg(reverse_spec);
+            }
+            let err = command.args([&user_at_host, &remote_cmd]).exec();
             eprintln!("theyos-ssh: exec failed: {err}");
             std::process::exit(1);
         }
@@ -107,6 +113,8 @@ fn main() {
                     "UserKnownHostsFile=/dev/null",
                     "-o",
                     "ConnectTimeout=10",
+                    "-o",
+                    "LogLevel=ERROR",
                     "-i",
                     ssh_key.to_str().unwrap_or("/tmp/id_ed25519"),
                     &user_at_host,
@@ -146,6 +154,8 @@ fn main() {
                     "UserKnownHostsFile=/dev/null",
                     "-o",
                     "ConnectTimeout=10",
+                    "-o",
+                    "LogLevel=ERROR",
                     "-i",
                     ssh_key.to_str().unwrap_or("/tmp/id_ed25519"),
                     &user_at_host,
@@ -234,10 +244,12 @@ fn exec_mac_host(subcommand: &str, args: &[String]) -> ! {
                 std::process::exit(1);
             }
             // v2: tmux removed; launch the user's login shell directly.
+            let target = LlmBootstrapTarget::MacosVz;
+            let contract = LlmContract::from_env(resolve_macos_claw_type("mac-host"), target);
             let cmd = format!(
                 "{path_prefix}; \
-                 export TERM=xterm-256color LANG=en_US.UTF-8 COLORTERM=truecolor; \
-                 exec $SHELL -l -i"
+                 {}",
+                contract.render_pty_shell(target)
             );
             if let Some(ref entry) = user_entry {
                 // Set HOME/SHELL so the login shell finds the correct rc files.
@@ -351,4 +363,41 @@ fn ssh_key_path() -> PathBuf {
     }
     let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
     PathBuf::from(home).join(".theyos/keys/id_ed25519")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use core_rs::claw_llm::{DEFAULT_LLM_MODEL, infer_claw_type_from_container};
+
+    #[test]
+    fn infer_known_hyphenated_claw_type() {
+        assert_eq!(
+            infer_claw_type_from_container("hermes-agent-hermes-agent"),
+            Some("hermes-agent".to_string())
+        );
+        assert_eq!(
+            infer_claw_type_from_container("openclaw-openclaw"),
+            Some("openclaw".to_string())
+        );
+    }
+
+    #[test]
+    fn pty_shell_exports_llm_contract_and_openclaw_tui() {
+        let shell = LlmContract::for_tests("openclaw", LlmBootstrapTarget::MacosVz)
+            .with_model("qwen3.6:35b-a3b-coding-mxfp8")
+            .render_pty_shell(LlmBootstrapTarget::MacosVz);
+        assert!(shell.contains("export THEYOS_LLM_CONTRACT_VERSION=1;"));
+        assert!(shell.contains("export THEYOS_CLAW_TYPE='openclaw';"));
+        assert!(shell.contains("export THEYOS_LLM_MODEL='qwen3.6:35b-a3b-coding-mxfp8';"));
+        assert!(
+            shell.contains(
+                "export THEYOS_OPENCLAW_MODEL_REF='ollama/qwen3.6:35b-a3b-coding-mxfp8';"
+            )
+        );
+        assert!(shell.contains("theyos_openclaw_tui_local"));
+        assert!(shell.contains(r#"hermes chat -m "$THEYOS_LLM_MODEL""#));
+        assert!(shell.contains("hermes config set model.base_url"));
+        assert!(!shell.contains(DEFAULT_LLM_MODEL));
+    }
 }

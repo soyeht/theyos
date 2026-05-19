@@ -589,12 +589,14 @@ mod tests {
 
         // Persisted snapshot should carry the same nonce.
         let path = crate::storage::pair_device_window_path(td.path());
-        let snap: PairDeviceWindowSnapshot = crate::storage::read_optional_cbor(&path).unwrap().unwrap();
+        let snap: PairDeviceWindowSnapshot =
+            crate::storage::read_optional_cbor(&path).unwrap().unwrap();
         assert_eq!(snap.nonce_b64, token.nonce.as_b64());
 
         // Consuming the token must wipe the persisted snapshot.
         w.consume_token(&token.nonce).await.unwrap();
-        let stale: Option<PairDeviceWindowSnapshot> = crate::storage::read_optional_cbor(&path).unwrap();
+        let stale: Option<PairDeviceWindowSnapshot> =
+            crate::storage::read_optional_cbor(&path).unwrap();
         assert!(stale.is_none(), "persisted snapshot leaked after consume");
     }
 

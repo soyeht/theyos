@@ -4,6 +4,7 @@
 //! Phase 2: instance DB, rate limiter, executor.
 //! Phase 3: terminal manager, PTY manager, VM runner, log store.
 
+use crate::handlers_llm::ProxyClient;
 use crate::mobile_token::{MobileSessionDb, MobileTokenStore};
 use crate::ratelimit::Limiter;
 use executor_rs::Executor;
@@ -73,6 +74,12 @@ pub struct AppState {
     // ── Capacity guard ─────────────────────────────────────────────────
     /// Serializes capacity check + DB insert to prevent over-commitment.
     pub capacity_lock: tokio::sync::Mutex<()>,
+
+    // ── LLM proxy reverse-proxy client ──────────────────────────────────
+    /// reqwest client pre-built for talking to the host-side
+    /// `theyos-llm-proxy` daemon on loopback. Used by `handlers_llm` to
+    /// forward `/api/v1/llm/*` admin requests after auth. Cheap to clone.
+    pub llm_proxy_client: ProxyClient,
 }
 
 pub type SharedState = Arc<AppState>;

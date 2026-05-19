@@ -69,6 +69,8 @@ percent-encoding = { workspace = true }
 
 # HTTP client (for Caddy admin API in expose handler)
 ureq            = { workspace = true }
+# Async HTTP client (for LLM-proxy reverse-proxy + future webhooks)
+reqwest         = { workspace = true }
 
 # Internal crates (Phase 3)
 terminal-rs  = { workspace = true }

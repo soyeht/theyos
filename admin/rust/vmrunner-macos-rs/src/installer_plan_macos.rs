@@ -53,6 +53,24 @@ pub async fn install_claw_and_start(
              npm install @img/sharp-darwin-arm64 2>/dev/null || true"
                 .to_string()
         }
+        "hermes-agent" => {
+            r#"export PATH=/opt/homebrew/bin:/usr/local/bin:$HOME/.local/bin:$PATH && \
+             mkdir -p /opt/claws /usr/local/bin /opt/data /var/root/.hermes && \
+             if [ -d /opt/claws/hermes-agent/.git ]; then \
+               cd /opt/claws/hermes-agent && git pull --ff-only || true; \
+             else \
+               git clone --depth 1 https://github.com/NousResearch/hermes-agent /opt/claws/hermes-agent; \
+             fi && \
+             cd /opt/claws/hermes-agent && \
+             python3 -m pip install --break-system-packages --no-cache-dir --ignore-installed -e ".[all]" && \
+             npm install --prefer-offline --no-audit || true; \
+             HERMES_BIN=$(command -v hermes 2>/dev/null || true); \
+             test -n "$HERMES_BIN"; \
+             printf '#!/bin/sh\nexport HERMES_HOME="${HERMES_HOME:-/opt/data}"\ncd /opt/claws/hermes-agent || exit 1\nexec "%s" "$@"\n' "$HERMES_BIN" > /usr/local/bin/hermes-agent && \
+             chmod +x /usr/local/bin/hermes-agent && \
+             hermes-agent --version 2>/dev/null || hermes-agent --help 2>/dev/null | head -1"#
+                .to_string()
+        }
         "nullclaw" => {
             "mkdir -p /usr/local/bin && \
              curl -fsSL https://github.com/nullclaw/nullclaw/releases/latest/download/nullclaw-macos-aarch64.bin \
@@ -81,6 +99,13 @@ pub async fn install_claw_and_start(
         .await
         .map_err(|e| VZError::Internal(format!("claw install ({claw_type}): {e}")))?;
     tracing::info!(claw_type, "Claw binary installed");
+
+    // Hermes is an interactive terminal app, not a long-running gateway daemon.
+    // `theyos-ssh pty` starts the real chat when a terminal attaches.
+    if claw_type == "hermes-agent" {
+        tracing::info!(claw_type, "Hermes installed; launchd service skipped");
+        return Ok(());
+    }
 
     // Step 2: Determine the run command
     let (binary, args) = match claw_type {

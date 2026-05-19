@@ -75,6 +75,19 @@ pub unsafe fn dispatch_async_on_queue(queue: DispatchQueue, block: *const libc::
     }
 }
 
+/// Release a GCD dispatch queue created by [`create_serial_queue`].
+///
+/// # Safety
+///
+/// `queue` must be a valid queue returned by `dispatch_queue_create`, and callers
+/// must not dispatch new work onto it after release.
+pub unsafe fn release_dispatch_queue(queue: DispatchQueue) {
+    // SAFETY: caller guarantees the queue is valid and no longer needed.
+    unsafe {
+        dispatch_release(queue);
+    }
+}
+
 // ── VZ state constants (from VZVirtualMachineState enum) ────────────────────
 // 0=stopped, 1=running, 2=paused, 3=error, 4=starting, 5=pausing, 6=resuming,
 // 7=stopping, 8=saving, 9=restoring

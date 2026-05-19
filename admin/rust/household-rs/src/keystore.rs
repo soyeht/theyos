@@ -1,47 +1,32 @@
-//! OS keystore wrapper.
+//! Domain-specific keystore helpers for the household crate.
 //!
-//! - On Linux, the 32-byte private scalar is stored via the `keyring` crate
-//!   using the kernel keyring backend.
-//! - On macOS, the private scalar lives **inside the Secure Enclave** —
-//!   nothing software-side stores it; the keystore label is the only handle
-//!   and lookup happens via `SecItemCopyMatching` (see [`crate::keys_se`]).
+//! The generic cross-platform keystore primitives — [`KeystoreError`],
+//! [`SERVICE`], the Secret Service / Keychain / file backends — live in the
+//! `keystore-rs` crate and are re-exported below. This module adds the
+//! identifier-shaped account labels that the household ceremony uses and
+//! preserves the legacy 32-byte scalar API consumed by [`crate::bootstrap`]
+//! and [`crate::keys_se`].
 //!
-//! This module owns the cross-platform error mapping; backend-specific code
-//! sits in [`crate::keys_se`] (macOS) and the `linux` submodule below.
+//! Backward compat invariants:
+//!
+//! - Same service prefix (`com.soyeht.theyos`) — Keychain / Secret Service
+//!   entries written by older builds continue to load.
+//! - Same account labels (`household.private_key.<hh_id>`,
+//!   `machine.private_key.<m_id>`, `com.soyeht.theyos.<which>.bootstrap`).
+//! - Same call signatures on `software_fallback::*` and `linux::*` so
+//!   existing call sites do not need to change.
 
 #![allow(dead_code)]
 
-use crate::error::KeystoreError;
 use crate::ids::{HouseholdId, MachineId};
 
-/// Stable keystore service prefix used across crates.
-pub const SERVICE: &str = "com.soyeht.theyos";
-
-/// Exact operator hint for macOS Keychain access denial.
-pub const MACOS_KEYCHAIN_DENIED_HINT: &str =
-    "Allow theyos to access the Keychain in System Settings → Privacy & Security.";
-
-/// Exact operator hint for Linux kernel keyring unavailability.
-pub const LINUX_SECRET_SERVICE_UNAVAILABLE_HINT: &str =
-    "Enable Linux kernel keyring support and ensure the user session keyring is available.";
-
-/// Contract helper for mapping a macOS Keychain-denied backend failure.
-#[doc(hidden)]
-#[must_use]
-pub fn macos_keychain_denied_error() -> KeystoreError {
-    KeystoreError::PermissionDenied {
-        hint: MACOS_KEYCHAIN_DENIED_HINT.into(),
-    }
-}
-
-/// Contract helper for mapping a Linux kernel-keyring-unavailable backend failure.
-#[doc(hidden)]
-#[must_use]
-pub fn linux_secret_service_unavailable_error() -> KeystoreError {
-    KeystoreError::Unavailable {
-        hint: LINUX_SECRET_SERVICE_UNAVAILABLE_HINT.into(),
-    }
-}
+// Generic keystore surface re-exported so callers can `use crate::keystore::*`
+// like before. The error type comes through `crate::error::KeystoreError`,
+// which is itself a re-export of `keystore_rs::KeystoreError`.
+pub use keystore_rs::{
+    KeystoreError, LINUX_SECRET_SERVICE_UNAVAILABLE_HINT, MACOS_KEYCHAIN_DENIED_HINT, SERVICE,
+    linux_secret_service_unavailable_error, macos_keychain_denied_error,
+};
 
 /// Account label for the household private key, parametrised by `hh_id`.
 #[must_use]
@@ -74,12 +59,19 @@ pub fn se_bootstrap_label(which: &str) -> String {
     format!("com.soyeht.theyos.{which}.bootstrap")
 }
 
-/// File-based fallback keystore. Used **only** when the operator opts into
-/// software keys via `THEYOS_FORCE_SOFTWARE_KEYS=1` (covers the macOS-no-SE
-/// case — Intel pre-T2 hardware, CI runners with no SE access).
+/// File-based fallback keystore for 32-byte cryptographic scalars.
 ///
-/// Stores the 32-byte scalar at `<state_dir>/household/secrets/{account}.bin`
-/// with `mode 0600`.
+/// Used **only** when the operator opts into software keys via
+/// `THEYOS_FORCE_SOFTWARE_KEYS=1` (covers the macOS-no-SE case — Intel pre-T2
+/// hardware, CI runners with no SE access).
+///
+/// Stores scalars at `<state_dir>/household/secrets/<account>.bin` with mode
+/// `0600`. This domain-specific on-disk layout pre-dates the keystore-rs
+/// extraction and is preserved verbatim — bootstrap tests load files from
+/// these exact paths to simulate keystore corruption.
+///
+/// New code that needs a generic file-backed keystore should use
+/// [`keystore_rs::FileKeystore`] directly with its own service namespacing.
 pub mod software_fallback {
     use std::fs::{self, OpenOptions};
     use std::io::{ErrorKind, Read, Write};
@@ -118,11 +110,6 @@ pub mod software_fallback {
     /// Best-effort destruction of the on-disk scalar file. Returns `Ok(())`
     /// when the file is already absent — the post-condition is "the file is
     /// gone", not "we unlinked it ourselves".
-    ///
-    /// Used by the Phase 3 Shamir transition (`CeremonyTxn::commit`) to wipe
-    /// the sole-machine `HH_priv` from the file fallback once the household
-    /// has grown to N≥2. After this call no software-fallback caller can
-    /// read the scalar back.
     pub fn delete_secret_scalar(state_dir: &Path, account: &str) -> Result<(), KeystoreError> {
         let path = account_path(state_dir, account);
         match fs::remove_file(&path) {
@@ -229,42 +216,25 @@ pub mod software_fallback {
     }
 }
 
+/// Linux Secret Service / kernel-keyring wrapper for 32-byte cryptographic
+/// scalars. Delegates to [`keystore_rs::SystemKeystore`] (which is
+/// `LinuxSystemKeystore` on Linux) and re-imposes the 32-byte invariant.
 #[cfg(target_os = "linux")]
 pub mod linux {
-    use super::{
-        KeystoreError, LINUX_SECRET_SERVICE_UNAVAILABLE_HINT, SERVICE,
-        linux_secret_service_unavailable_error,
-    };
+    use keystore_rs::{KeystoreBackend, SystemKeystore};
 
-    fn configure_backend_from_env() {
-        if std::env::var("THEYOS_KEYRING")
-            .map(|v| v.eq_ignore_ascii_case("kernel"))
-            .unwrap_or(false)
-        {
-            keyring::set_default_credential_builder(keyring::keyutils::default_credential_builder());
-        }
+    use super::KeystoreError;
+
+    fn store() -> SystemKeystore {
+        SystemKeystore::default()
     }
 
-    /// Write a 32-byte private scalar (base64-encoded) under `(SERVICE, account)`.
     pub fn write_secret_scalar(account: &str, scalar: &[u8; 32]) -> Result<(), KeystoreError> {
-        use base64::{Engine as _, engine::general_purpose::STANDARD as B64};
-        configure_backend_from_env();
-        let entry = keyring::Entry::new(SERVICE, account).map_err(map_keyring_err)?;
-        entry
-            .set_password(&B64.encode(scalar))
-            .map_err(map_keyring_err)?;
-        Ok(())
+        store().set(account, scalar)
     }
 
-    /// Read a 32-byte private scalar.
     pub fn read_secret_scalar(account: &str) -> Result<[u8; 32], KeystoreError> {
-        use base64::{Engine as _, engine::general_purpose::STANDARD as B64};
-        configure_backend_from_env();
-        let entry = keyring::Entry::new(SERVICE, account).map_err(map_keyring_err)?;
-        let pw = entry.get_password().map_err(map_keyring_err)?;
-        let bytes = B64
-            .decode(pw)
-            .map_err(|e| KeystoreError::InvalidKeyMaterial(format!("base64: {e}")))?;
+        let bytes = store().get(account)?;
         if bytes.len() != 32 {
             return Err(KeystoreError::InvalidKeyMaterial(format!(
                 "expected 32-byte scalar, got {}",
@@ -277,34 +247,17 @@ pub mod linux {
     }
 
     pub fn delete_secret_scalar(account: &str) -> Result<(), KeystoreError> {
-        configure_backend_from_env();
-        let entry = keyring::Entry::new(SERVICE, account).map_err(map_keyring_err)?;
-        entry.delete_credential().map_err(map_keyring_err)?;
-        Ok(())
-    }
-
-    pub(super) fn map_keyring_err(e: keyring::Error) -> KeystoreError {
-        match e {
-            keyring::Error::NoEntry => KeystoreError::NotFound {
-                label: "(unknown)".into(),
-            },
-            keyring::Error::PlatformFailure(_) | keyring::Error::NoStorageAccess(_) => {
-                linux_secret_service_unavailable_error()
-            }
-            other => KeystoreError::Io {
-                kind: format!("{other:?}"),
-                hint: LINUX_SECRET_SERVICE_UNAVAILABLE_HINT.into(),
-            },
-        }
+        store().delete(account)
     }
 }
 
-/// Contract helper for Linux keyring error-mapping tests.
+/// Contract helper kept for the keystore-error test in
+/// `tests/keystore_errors.rs`. Delegates to keystore-rs.
 #[cfg(target_os = "linux")]
 #[doc(hidden)]
 #[must_use]
 pub fn map_linux_keyring_error_for_contract(error: keyring::Error) -> KeystoreError {
-    linux::map_keyring_err(error)
+    keystore_rs::linux_backend::map_keyring_err(error)
 }
 
 #[cfg(test)]

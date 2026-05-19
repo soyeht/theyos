@@ -1,0 +1,72 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  theyOS LLM proxy launchd template (macOS).
+
+  Install path: ~/Library/LaunchAgents/com.theyos.llm-proxy.plist
+  Activation:   launchctl bootstrap gui/$(id -u) <path>
+
+  Replace __USER__ and __BIN_PATH__ with the operator's home username and
+  the absolute path to the theyos-llm-proxy binary (typically
+  /opt/homebrew/bin/theyos-llm-proxy after `brew install theyos`). The
+  installer script that ships in homebrew/Formula/theyos.rb performs the
+  substitution.
+
+  Not enabled by default in Slice 1 — operators opt in once they have a
+  profile configured. See docs/llm-proxy.md (Slice 8).
+-->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.theyos.llm-proxy</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>__BIN_PATH__</string>
+  </array>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>THEYOS_LLM_PROXY_PORT</key>
+    <string>18900</string>
+    <key>THEYOS_LLM_PROXY_BIND</key>
+    <string>127.0.0.1</string>
+    <key>RUST_LOG</key>
+    <string>info,llm_proxy=info,tower_http=warn</string>
+    <key>HOME</key>
+    <string>/Users/__USER__</string>
+  </dict>
+
+  <key>RunAtLoad</key>
+  <true/>
+
+  <!-- Restart on crash / unclean exit. The proxy is allowed to exit
+       cleanly on first run when no profile exists; the operator then
+       configures one and triggers a relaunch. -->
+  <key>KeepAlive</key>
+  <dict>
+    <key>SuccessfulExit</key>
+    <false/>
+    <key>Crashed</key>
+    <true/>
+  </dict>
+
+  <key>ThrottleInterval</key>
+  <integer>10</integer>
+
+  <key>ProcessType</key>
+  <string>Interactive</string>
+
+  <key>StandardOutPath</key>
+  <string>/Users/__USER__/Library/Logs/theyos-llm-proxy.log</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/__USER__/Library/Logs/theyos-llm-proxy.err.log</string>
+
+  <!-- Bind to loopback only — the proxy must never be reachable from
+       outside the host. Reverse SSH tunnels from claws are the only legal
+       inbound path. -->
+  <key>WorkingDirectory</key>
+  <string>/Users/__USER__</string>
+</dict>
+</plist>

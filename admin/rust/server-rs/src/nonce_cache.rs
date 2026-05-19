@@ -53,7 +53,11 @@ fn nonce_path(state_dir: &Path, nonce: &[u8; 32]) -> PathBuf {
 
 /// Check that `nonce` has not been used within the last 24 h, then atomically
 /// persist it. Returns `Err(AlreadyUsed)` on replay.
-pub fn check_and_persist(state_dir: &Path, nonce: &[u8; 32], now_unix: u64) -> Result<(), NonceError> {
+pub fn check_and_persist(
+    state_dir: &Path,
+    nonce: &[u8; 32],
+    now_unix: u64,
+) -> Result<(), NonceError> {
     let dir = nonce_dir(state_dir);
     fs::create_dir_all(&dir).map_err(NonceError::Io)?;
 
@@ -86,7 +90,9 @@ pub fn check_and_persist(state_dir: &Path, nonce: &[u8; 32], now_unix: u64) -> R
 /// Remove nonce files older than [`TTL_SECS`]. Call opportunistically.
 pub fn evict_expired(state_dir: &Path, now_unix: u64) {
     let dir = nonce_dir(state_dir);
-    let Ok(entries) = fs::read_dir(&dir) else { return };
+    let Ok(entries) = fs::read_dir(&dir) else {
+        return;
+    };
     let cutoff = now_unix.saturating_sub(TTL_SECS);
     for entry in entries.flatten() {
         if let Ok(content) = fs::read_to_string(entry.path()) {
@@ -102,7 +108,9 @@ pub fn evict_expired(state_dir: &Path, now_unix: u64) {
 /// Enforce the 100 k entry cap by removing oldest-mtime files above the limit.
 pub fn evict_oldest_if_over_limit(state_dir: &Path) {
     let dir = nonce_dir(state_dir);
-    let Ok(entries) = fs::read_dir(&dir) else { return };
+    let Ok(entries) = fs::read_dir(&dir) else {
+        return;
+    };
     let mut files: Vec<(std::time::SystemTime, PathBuf)> = entries
         .flatten()
         .filter_map(|e| {

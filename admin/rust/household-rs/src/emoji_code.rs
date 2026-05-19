@@ -15,12 +15,11 @@
 //! is embedded at compile time via `include_str!`. Any deviation between
 //! the Rust parse and the CSV file is a test failure.
 
-
 // The CSV is embedded at compile time so the mapping is always in sync with
-// the contract file — no runtime I/O needed.
-const WORDLIST_CSV: &str = include_str!(
-    "../../../../specs/005-soyeht-onboarding/contracts/emoji-security-code-wordlist.csv"
-);
+// the contract file — no runtime I/O needed. `build.rs` resolves the
+// absolute path (Nix env var, with repo-relative fallback for cargo build)
+// and exposes it as THEYOS_EMOJI_WORDLIST_PATH.
+const WORDLIST_CSV: &str = include_str!(env!("THEYOS_EMOJI_WORDLIST_PATH"));
 
 /// Parse the embedded CSV into a 2048-entry array of (emoji, `codepoint_str`).
 ///
@@ -168,7 +167,10 @@ mod tests {
             let digest: [u8; 32] = {
                 let mut d = [0u8; 32];
                 for (i, b) in d.iter_mut().enumerate() {
-                    *b = seed.wrapping_add(i as u8);
+                    // i ∈ [0, 32) so the truncation cast is safe by construction.
+                    #[allow(clippy::cast_possible_truncation)]
+                    let i_u8 = i as u8;
+                    *b = seed.wrapping_add(i_u8);
                 }
                 d
             };

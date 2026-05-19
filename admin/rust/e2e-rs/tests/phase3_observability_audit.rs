@@ -50,9 +50,9 @@ use tracing::subscriber::DefaultGuard;
 use tracing_subscriber::fmt;
 
 use phase3_support::{
-    JOIN_REQUEST_PATH, OWNER_EVENTS_PATH, OwnerApprovalAck, OwnerEventsResponse,
-    candidate_harness, cursor_param, founder_harness, get_cbor, owner_approval_body, post_cbor,
-    post_local_anchor, unix_now,
+    JOIN_REQUEST_PATH, OWNER_EVENTS_PATH, OwnerApprovalAck, OwnerEventsResponse, candidate_harness,
+    cursor_param, founder_harness, get_cbor, owner_approval_body, post_cbor, post_local_anchor,
+    unix_now,
 };
 
 #[derive(Clone)]
@@ -250,10 +250,8 @@ async fn test_phase3_happy_path_observability_is_complete_and_leak_free() {
             .m_priv
             .as_software_secret()
             .expect("software-backed candidate m_priv");
-        let m_pub = household_rs::keys::P256PublicKey::from_bytes(
-            &candidate.prepared.m_pub_sec1,
-        )
-        .expect("decode candidate m_pub");
+        let m_pub = household_rs::keys::P256PublicKey::from_bytes(&candidate.prepared.m_pub_sec1)
+            .expect("decode candidate m_pub");
         let m_id = candidate.prepared.m_id.to_string();
         let pt = decrypt_self(&candidate_encrypted, scalar, &m_pub, &m_id)
             .expect("decrypt candidate self-shard");
@@ -416,5 +414,7 @@ async fn test_owner_timeout_aborts_window_and_emits_tracing() {
     // `*cancel_rx.borrow()` check at the top of the loop observes
     // the cancel.
     cancel_tx.send(true).expect("cancel_tx send");
-    watchdog.await.expect("watchdog returns cleanly on shutdown");
+    watchdog
+        .await
+        .expect("watchdog returns cleanly on shutdown");
 }

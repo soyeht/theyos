@@ -66,6 +66,9 @@ export function ProtectedLayout({ user, onLogout }: ProtectedLayoutProps) {
           <NavLink to="/claws" className="nav-item" onClick={closeNav}>
             claws
           </NavLink>
+          <NavLink to="/models" className="nav-item" onClick={closeNav}>
+            models
+          </NavLink>
           <NavLink to="/create" className="nav-item" onClick={closeNav}>
             create
           </NavLink>

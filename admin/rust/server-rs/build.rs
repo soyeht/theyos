@@ -48,9 +48,7 @@ mod macos {
             .generate()
             .expect("bindgen failed to generate dns_sd bindings");
 
-        let out_path: PathBuf = env::var("OUT_DIR")
-            .expect("OUT_DIR not set")
-            .into();
+        let out_path: PathBuf = env::var("OUT_DIR").expect("OUT_DIR not set").into();
         bindings
             .write_to_file(out_path.join("dns_sd_bindings.rs"))
             .expect("failed to write dns_sd_bindings.rs");

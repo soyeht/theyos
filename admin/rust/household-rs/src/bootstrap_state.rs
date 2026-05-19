@@ -20,9 +20,9 @@
 use std::fmt;
 use std::fs;
 use std::io::{self, Write};
-use std::path::{Path, PathBuf};
 #[cfg(unix)]
 use std::os::unix::fs::OpenOptionsExt as _;
+use std::path::{Path, PathBuf};
 
 use crate::error::StorageError;
 
@@ -72,9 +72,7 @@ impl BootstrapState {
     /// Attempt to transition to `next`. Returns `Err` if the transition is
     /// not valid per the state machine specification.
     pub fn transition(self, next: Self) -> Result<Self, TransitionError> {
-        use BootstrapState::{
-            NamedAwaitingPair, Ready, ReadyForNaming, Recovering, Uninitialized,
-        };
+        use BootstrapState::{NamedAwaitingPair, Ready, ReadyForNaming, Recovering, Uninitialized};
         let ok = matches!(
             (self, next),
             // Forward onboarding transitions + idempotent self-transitions
@@ -88,7 +86,10 @@ impl BootstrapState {
         if ok {
             Ok(next)
         } else {
-            Err(TransitionError { from: self, to: next })
+            Err(TransitionError {
+                from: self,
+                to: next,
+            })
         }
     }
 }
@@ -220,10 +221,7 @@ mod tests {
             (Recovering, Ready),
         ];
         for (from, to) in pairs {
-            assert!(
-                from.transition(to).is_ok(),
-                "{from} → {to} should be valid"
-            );
+            assert!(from.transition(to).is_ok(), "{from} → {to} should be valid");
         }
     }
 
@@ -248,8 +246,11 @@ mod tests {
     #[test]
     fn unknown_file_content_returns_error() {
         let dir = tmp();
-        std::fs::write(dir.path().join("identity.bootstrap_state"), "some_future_state\n")
-            .unwrap();
+        std::fs::write(
+            dir.path().join("identity.bootstrap_state"),
+            "some_future_state\n",
+        )
+        .unwrap();
         assert!(matches!(
             load(dir.path()),
             Err(BootstrapStateError::Unknown(_))

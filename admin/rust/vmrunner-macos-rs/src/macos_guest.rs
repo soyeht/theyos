@@ -1965,8 +1965,8 @@ pub fn install_macos(
                         std::ptr::addr_of!(*install_block).cast::<libc::c_void>(),
                     );
 
-                    // Wait up to 40 minutes
-                    match install_rx.recv_timeout(Duration::from_secs(40 * 60)) {
+                    // Wait up to 40 minutes.
+                    let install_result = match install_rx.recv_timeout(Duration::from_secs(40 * 60)) {
                         Ok(Ok(())) => {
                             // Encode hardware model data for persistence
                             let hw_data: *mut Object = msg_send![hw_model, dataRepresentation];
@@ -1989,10 +1989,58 @@ pub fn install_macos(
                                 install_cpu_count: install_cpu_count_u32,
                                 install_memory_mb,
                             }));
+                            Ok(())
                         }
-                        Ok(Err(e)) => { let _ = tx.send(Err(e)); }
-                        Err(_) => { let _ = tx.send(Err("VZMacOSInstaller timed out after 40 min".to_string())); }
+                        Ok(Err(e)) => {
+                            let _ = tx.send(Err(e));
+                            Err(())
+                        }
+                        Err(_) => {
+                            let _ = tx.send(Err(
+                                "VZMacOSInstaller timed out after 40 min".to_string(),
+                            ));
+                            Err(())
+                        }
+                    };
+
+                    // Always stop and release the installer VM. If this object is
+                    // dropped without an explicit stop, AppleVirtualPlatformSystemService
+                    // can retain a ghost active-VM slot until the host reboots.
+                    let (cleanup_tx, cleanup_rx) = mpsc::sync_channel::<()>(1);
+                    let cleanup_block = ConcreteBlock::new(move || {
+                        let state: isize = msg_send![vm, state];
+                        if state == 0 || state == 3 {
+                            let _ = cleanup_tx.send(());
+                            return;
+                        }
+
+                        eprintln!("[install] cleanup: stopping installer VM state={state}");
+                        let done = cleanup_tx.clone();
+                        let completion = ConcreteBlock::new(move |err: *mut Object| {
+                            if !err.is_null() {
+                                let msg = nserror_details_string(err);
+                                eprintln!("[install] cleanup: stop returned error={msg}");
+                            }
+                            let _ = done.send(());
+                        });
+                        let completion = completion.copy();
+                        let _: () = msg_send![vm, stopWithCompletionHandler: &*completion];
+                    });
+                    let cleanup_block = cleanup_block.copy();
+                    crate::vz::dispatch_async_on_queue(
+                        install_queue,
+                        std::ptr::addr_of!(*cleanup_block).cast::<libc::c_void>(),
+                    );
+                    if cleanup_rx.recv_timeout(Duration::from_secs(30)).is_err()
+                        && install_result.is_err()
+                    {
+                        eprintln!(
+                            "[install] cleanup: timed out waiting for installer VM to stop"
+                        );
                     }
+
+                    let _: () = msg_send![vm, release];
+                    crate::vz::release_dispatch_queue(install_queue);
 
                     // Drain the autorelease pool created at the top of this block.
                     let _: () = msg_send![pool, drain];

@@ -164,11 +164,19 @@ impl HouseholdBonjour {
         // platform — static per binary.
         txt.insert(
             "platform".to_string(),
-            if cfg!(target_os = "macos") { "macos" } else { "linux" }.to_string(),
+            if cfg!(target_os = "macos") {
+                "macos"
+            } else {
+                "linux"
+            }
+            .to_string(),
         );
         // bootstrap_state — only emitted when set (non-empty).
         if !params.bootstrap_state.is_empty() {
-            txt.insert("bootstrap_state".to_string(), params.bootstrap_state.clone());
+            txt.insert(
+                "bootstrap_state".to_string(),
+                params.bootstrap_state.clone(),
+            );
         }
         // version — engine version string.
         txt.insert("version".to_string(), env!("CARGO_PKG_VERSION").to_string());
@@ -180,10 +188,7 @@ impl HouseholdBonjour {
     /// enforce UTF-8, and truncate to `max_bytes` bytes at a char boundary.
     fn sanitize_txt_value(s: &str, max_bytes: usize) -> String {
         // Strip forbidden chars.
-        let clean: String = s
-            .chars()
-            .filter(|&c| c >= ' ' || c == '\t')
-            .collect();
+        let clean: String = s.chars().filter(|&c| c >= ' ' || c == '\t').collect();
         // Truncate at char boundary.
         let mut end = 0;
         for (i, _) in clean.char_indices() {

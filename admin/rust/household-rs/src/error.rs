@@ -7,6 +7,11 @@
 use std::path::PathBuf;
 use thiserror::Error;
 
+// KeystoreError lives in the `keystore-rs` crate now; re-exported here so
+// downstream code (bootstrap, callers of household-rs) keeps importing
+// `household_rs::error::KeystoreError` unchanged.
+pub use keystore_rs::KeystoreError;
+
 /// Cryptographic / encoding errors at the protocol layer (CBOR, signatures,
 /// identifier derivation).
 #[derive(Debug, Error)]
@@ -43,61 +48,6 @@ pub enum HouseholdError {
 
     #[error("QR encoding failed: {0}")]
     QrEncode(String),
-}
-
-/// Errors from the OS keystore wrapper. Each variant carries a `hint` field so
-/// the caller can show the operator the recovery action.
-#[derive(Debug, Error)]
-pub enum KeystoreError {
-    #[error("keystore unavailable: {hint}")]
-    Unavailable { hint: String },
-
-    #[error("keystore permission denied: {hint}")]
-    PermissionDenied { hint: String },
-
-    #[error("Secure Enclave unavailable on this machine: {hint}")]
-    SeUnavailable { hint: String },
-
-    #[error("entry not found: {label}")]
-    NotFound { label: String },
-
-    #[error("keystore I/O error: {kind}: {hint}")]
-    Io { kind: String, hint: String },
-
-    #[error("signing failed: {0}")]
-    SigningFailed(String),
-
-    #[error("invalid key material: {0}")]
-    InvalidKeyMaterial(String),
-}
-
-impl KeystoreError {
-    /// Stable machine-readable error kind for the `error.kind` log field.
-    #[must_use]
-    pub fn kind(&self) -> &'static str {
-        match self {
-            Self::Unavailable { .. } => "keystore.unavailable",
-            Self::PermissionDenied { .. } => "se.permission_denied",
-            Self::SeUnavailable { .. } => "se.unavailable",
-            Self::NotFound { .. } => "keystore.not_found",
-            Self::Io { .. } => "keystore.io",
-            Self::SigningFailed(_) => "keystore.signing_failed",
-            Self::InvalidKeyMaterial(_) => "keystore.invalid_key_material",
-        }
-    }
-
-    /// Hint string for the operator (matches `error.hint` log field).
-    #[must_use]
-    pub fn hint(&self) -> String {
-        match self {
-            Self::Unavailable { hint }
-            | Self::PermissionDenied { hint }
-            | Self::SeUnavailable { hint }
-            | Self::Io { hint, .. } => hint.clone(),
-            Self::NotFound { label } => format!("entry {label} missing from keystore"),
-            Self::SigningFailed(msg) | Self::InvalidKeyMaterial(msg) => msg.clone(),
-        }
-    }
 }
 
 /// Errors from atomic CBOR file I/O.

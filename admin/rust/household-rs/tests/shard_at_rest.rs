@@ -12,8 +12,7 @@ use std::path::PathBuf;
 
 use household_rs::keys::{IdentityKey, P256Keypair};
 use household_rs::shard_at_rest::{
-    EncryptedShard, ShardError, decrypt_from_peer, decrypt_self, encrypt_for_peer,
-    encrypt_for_self,
+    EncryptedShard, ShardError, decrypt_from_peer, decrypt_self, encrypt_for_peer, encrypt_for_self,
 };
 use zeroize::Zeroizing;
 
