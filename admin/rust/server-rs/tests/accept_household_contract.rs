@@ -400,6 +400,7 @@ async fn accept_410_on_expired_token_and_overlong_ttl() {
 
 #[tokio::test]
 async fn accept_410_on_invitation_token_reuse() {
+    set_test_env("THEYOS_FORCE_SOFTWARE_KEYS", "1");
     let hh_key = P256Keypair::generate();
     let hh_pub = hh_key.public();
     let hh_id = derive_household_id(&hh_pub).to_string();
