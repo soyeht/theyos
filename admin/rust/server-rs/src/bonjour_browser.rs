@@ -28,7 +28,7 @@ use tracing::{info, warn};
 use crate::bonjour_impl_dns_sd as backend;
 #[cfg(not(target_os = "macos"))]
 use crate::bonjour_impl_mdns_sd as backend;
-use crate::bonjour_trust::{BrowserConfig, should_emit};
+use crate::bonjour_trust::{BrowserConfig, should_emit_with_txt_hint};
 use crate::handlers_pair_machine::{
     FounderStageError, FounderStageOutcome, JoinSource, PairMachineRouterState,
     founder_stage_join_request,
@@ -365,11 +365,22 @@ pub fn spawn_setup_invitation_browser_with_cache(
             if resolved.service_type() != SOYEHT_SETUP_SERVICE {
                 continue;
             }
-            if !should_emit(resolved.addresses(), config) {
+            // iOS mDNSResponder announces NWListener.service on every
+            // interface (LAN + Tailnet). `NWParameters.requiredInterfaceType`
+            // restricts the socket but NOT the announcement, so an iPhone
+            // on WiFi+Tailscale ends up advertising with only LAN
+            // addresses even when it IS reachable on Tailnet. Parse the
+            // publisher's self-reported `tailnet_addr` TXT field and feed
+            // it to the trust filter as a per-service hint.
+            let txt_tailnet_hint: Option<IpAddr> = resolved
+                .txt("tailnet_addr")
+                .and_then(|s| s.parse::<IpAddr>().ok());
+            if !should_emit_with_txt_hint(resolved.addresses(), txt_tailnet_hint.as_ref(), config) {
                 info!(
                     stage = "setup_browser.suppressed",
                     reason = "non_tailnet",
                     host = resolved.txt("host_label").unwrap_or("?"),
+                    txt_tailnet_addr = ?txt_tailnet_hint,
                 );
                 continue;
             }
