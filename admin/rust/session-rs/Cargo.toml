@@ -1,6 +1,6 @@
 [package]
 name = "session-rs"
-version = "0.1.14"
+version = "0.1.15"
 edition.workspace = true
 rust-version.workspace = true
 description = "Rust session management with SQLite persistence for theyOS"
