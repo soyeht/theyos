@@ -48,6 +48,7 @@ fn log_ts() -> String {
     )
 }
 
+use crate::bootstrap_state::{self, BootstrapState};
 use crate::chain::verify_loaded_chain;
 use crate::error::{BootstrapError, HouseholdError, KeystoreError, StorageError};
 use crate::household_record::{HouseholdRecord, validate_household_name};
@@ -834,7 +835,10 @@ pub fn prepare_accept_household(
             source: e,
             stage: "accept_household.encode_pending",
         })?;
+    let mut state_bytes = BootstrapState::ReadyForNaming.as_str().as_bytes().to_vec();
+    state_bytes.push(b'\n');
     let staged = storage::stage_commit_files(&[
+        (bootstrap_state::state_file_path(state_dir), state_bytes),
         (household_record_path(state_dir), record_bytes),
         (pending_accept_household_path(state_dir), pending_bytes),
     ])
@@ -901,7 +905,7 @@ pub fn confirm_accept_household(
     // Family Sharing, AirDrop, and Find My: hardware-backed keys (Secure
     // Enclave on iOS, T2/Apple Silicon Keychain on macOS, keyring-rs on Linux)
     // plus CRL gossip already cover the realistic threat model for a single
-    // household. Adding cert TTL/rotation was evaluated and rejected for v1
+    // household. Cert TTL/rotation is intentionally outside the v1 model
     // because the security gain is marginal against the operational cost
     // (cross-cutting schema change, renewal UX, offline-device handling).
     //
@@ -1457,6 +1461,11 @@ mod tests {
         .unwrap();
         assert!(prepared.record.is_follower);
         assert_eq!(prepared.record.shamir_n, 0);
+        assert_eq!(
+            bootstrap_state::load(td.path()).unwrap(),
+            BootstrapState::ReadyForNaming,
+            "accept-household prepare persists ReadyForNaming with the pending follower record"
+        );
         assert!(
             try_load_existing(td.path(), policy).unwrap().is_none(),
             "pending follower without cert should not load as initialized"

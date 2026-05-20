@@ -809,12 +809,6 @@ pub async fn post_accept_household(
     };
 
     let token_hash = *blake3::hash(&invitation_token).as_bytes();
-    let invitation =
-        match consume_accept_household_invitation(&state, &invitation_token, token_hash).await {
-            Ok(entry) => entry,
-            Err(resp) => return resp,
-        };
-
     if let Err(reason) = validate_accept_household_name(&req.hh_name) {
         return cbor_error(StatusCode::BAD_REQUEST, "invalid_name", Some(reason), None);
     }
@@ -829,18 +823,6 @@ pub async fn post_accept_household(
             );
         }
     };
-    if invitation
-        .hh_id
-        .as_deref()
-        .is_some_and(|advertised| advertised != hh_id.as_str())
-    {
-        return cbor_error(
-            StatusCode::UNPROCESSABLE_ENTITY,
-            "crypto_validation_failed",
-            Some("invitation_token household mismatch".into()),
-            None,
-        );
-    }
     let hh_pub = match P256PublicKey::from_bytes(req.hh_pub.as_ref()) {
         Ok(pubkey) => pubkey,
         Err(e) => {
@@ -865,6 +847,28 @@ pub async fn post_accept_household(
         );
     }
 
+    let invitation =
+        match consume_accept_household_invitation(&state, &invitation_token, token_hash).await {
+            Ok(entry) => entry,
+            Err(resp) => return resp,
+        };
+    if invitation
+        .hh_id
+        .as_deref()
+        .is_some_and(|advertised| advertised != hh_id.as_str())
+    {
+        crate::setup_invitation::cache_reinsert_if_absent(
+            &state.setup_invitation_cache,
+            invitation,
+        )
+        .await;
+        return cbor_error(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "crypto_validation_failed",
+            Some("invitation_token household mismatch".into()),
+            None,
+        );
+    }
     let state_dir = state.state_dir.clone();
     let hh_name = req.hh_name.clone();
     let policy = KeyBackingPolicy::from_env();
@@ -885,6 +889,11 @@ pub async fn post_accept_household(
         Ok(Ok(prepared)) => prepared,
         Ok(Err(e)) => {
             tracing::error!(stage = "bootstrap.accept_household_failed", error = %e);
+            crate::setup_invitation::cache_reinsert_if_absent(
+                &state.setup_invitation_cache,
+                invitation,
+            )
+            .await;
             return cbor_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "keygen_failed",
@@ -894,6 +903,11 @@ pub async fn post_accept_household(
         }
         Err(e) => {
             tracing::error!(stage = "bootstrap.accept_household_task_failed", error = %e);
+            crate::setup_invitation::cache_reinsert_if_absent(
+                &state.setup_invitation_cache,
+                invitation,
+            )
+            .await;
             return cbor_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "keygen_failed",
@@ -906,15 +920,6 @@ pub async fn post_accept_household(
     {
         let mut bs = state.bootstrap.write().await;
         *bs = BootstrapState::ReadyForNaming;
-        if let Err(e) = bootstrap_state::persist(&state.state_dir, BootstrapState::ReadyForNaming) {
-            tracing::error!(stage = "bootstrap.accept_household.state_persist_failed", error = %e);
-            return cbor_error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "internal_error",
-                None,
-                None,
-            );
-        }
     }
 
     tracing::info!(

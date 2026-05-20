@@ -14,12 +14,13 @@ use household_rs::ids::derive_household_id;
 use household_rs::keys::{IdentityKey, P256Keypair, P256PublicKey};
 use household_rs::machine_cert::{MachineCert, Platform, SignOptions};
 use household_rs::pair_device::PairDeviceWindow;
+use household_rs::{BootstrapOpts, KeyBackingPolicy};
 use serde::{Deserialize, Serialize};
 use serde_bytes::ByteBuf;
 use server_rs::bonjour_publisher::{HouseholdBonjour, PairMachineBonjourRole, PublishParams};
 use server_rs::handlers_bootstrap::{BootstrapHandlerState, BootstrapStateArc, bootstrap_router};
 use server_rs::household_state::HouseholdState;
-use server_rs::setup_invitation::{SetupInvitationEntry, cache_insert};
+use server_rs::setup_invitation::{SetupInvitationEntry, cache_insert, cache_lookup};
 use tokio::sync::RwLock;
 use tower::ServiceExt;
 
@@ -413,6 +414,67 @@ async fn accept_410_on_invitation_token_reuse() {
     let (status, body) = call_accept(state, body).await;
     assert_eq!(status, StatusCode::GONE);
     assert_eq!(decode_err(&body).error, "invitation_expired_or_spent");
+}
+
+#[tokio::test]
+async fn accept_reinserts_invitation_token_when_prepare_fails() {
+    set_test_env("THEYOS_FORCE_SOFTWARE_KEYS", "1");
+    let hh_key = P256Keypair::generate();
+    let hh_pub = hh_key.public();
+    let hh_id = derive_household_id(&hh_pub).to_string();
+    let state_dir = make_state_dir();
+    let _existing = household_rs::bootstrap_or_load(
+        &state_dir,
+        BootstrapOpts {
+            household_name: "Already Here".to_string(),
+            hostname_label: Some("existing-mac".to_string()),
+        },
+        KeyBackingPolicy::ForceSoftware,
+    )
+    .unwrap();
+    let state = make_state(BootstrapState::Uninitialized, state_dir);
+    let invite = token(10);
+    populate_invitation(&state, invite, &hh_id, unix_now() + 1800).await;
+
+    let (status, body) = call_accept(
+        state.clone(),
+        cbor_accept(&hh_id, hh_pub.as_bytes(), "Home", &invite),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(decode_err(&body).error, "keygen_failed");
+    assert!(
+        cache_lookup(&state.setup_invitation_cache, &invite)
+            .await
+            .is_some(),
+        "transient prepare failure must not burn the one-time invitation token"
+    );
+}
+
+#[tokio::test]
+async fn accept_reinserts_invitation_token_on_advertised_household_mismatch() {
+    let hh_key = P256Keypair::generate();
+    let hh_id = derive_household_id(&hh_key.public()).to_string();
+    let other_hh_id = derive_household_id(&P256Keypair::generate().public()).to_string();
+    let state = make_state(BootstrapState::Uninitialized, make_state_dir());
+    let invite = token(11);
+    populate_invitation(&state, invite, &other_hh_id, unix_now() + 1800).await;
+
+    let (status, body) = call_accept(
+        state.clone(),
+        cbor_accept(&hh_id, hh_key.public().as_bytes(), "Home", &invite),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(decode_err(&body).error, "crypto_validation_failed");
+    assert!(
+        cache_lookup(&state.setup_invitation_cache, &invite)
+            .await
+            .is_some(),
+        "household mismatch after cache_take must not burn the invitation token"
+    );
 }
 
 #[tokio::test]
