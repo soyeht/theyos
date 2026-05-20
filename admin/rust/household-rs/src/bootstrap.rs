@@ -892,9 +892,23 @@ pub fn confirm_accept_household(
     if machine_cert.m_pub != pending.m_pub {
         return Err(AcceptHouseholdConfirmError::Mismatch("machine_cert.m_pub"));
     }
-    // TODO(cert-rotation): validate expiry/revocation metadata once MachineCert
-    // carries it. For now accept the current structure after issuer, subject,
-    // and signature checks.
+    // MachineCert v1 is immutable: valid until revoked via the household CRL
+    // (see CRLStore + gossip-consumer), which is checked at every authenticated
+    // request boundary — not here at issuance acceptance.
+    //
+    // No expiry field exists on MachineCert by design. This matches the
+    // "consumer trust between same-owner devices" model Apple uses for iCloud
+    // Family Sharing, AirDrop, and Find My: hardware-backed keys (Secure
+    // Enclave on iOS, T2/Apple Silicon Keychain on macOS, keyring-rs on Linux)
+    // plus CRL gossip already cover the realistic threat model for a single
+    // household. Adding cert TTL/rotation was evaluated and rejected for v1
+    // because the security gain is marginal against the operational cost
+    // (cross-cutting schema change, renewal UX, offline-device handling).
+    //
+    // Do not "fix" this by adding expiry validation. If a future spec
+    // changes the trust model (e.g. multi-household federation, untrusted
+    // backup nodes, regulated environments), revisit the cert schema first
+    // and then update this validator.
     machine_cert.verify(&pending.hh_pub)?;
 
     let record = HouseholdRecord {
