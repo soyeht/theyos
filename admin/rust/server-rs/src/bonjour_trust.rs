@@ -133,6 +133,59 @@ pub fn should_emit<'a>(addrs: impl IntoIterator<Item = &'a IpAddr>, config: Brow
     any_tailnet || (config.include_local_network && any_addr)
 }
 
+/// Like [`should_emit`], but also consults a TXT-advertised Tailnet hint.
+///
+/// iOS `mDNSResponder` announces `NWListener.service` on every interface
+/// (LAN + Tailnet). `NWParameters.requiredInterfaceType` restricts only
+/// the SOCKET, not the mDNS announcement. Pure mDNS-address filtering
+/// therefore rejects iPhones on the same Wi-Fi as the Mac even when the
+/// iPhone IS reachable on Tailnet.
+///
+/// To recover those services, the iPhone publisher self-reports its
+/// Tailnet address in the TXT record under the `tailnet_addr` key. We
+/// only trust that hint if it parses to an IP in a Tailnet range
+/// (`100.64.0.0/10`, `fd7a:115c:a1e0::/48`, or broader `fc00::/7` ULA —
+/// the same set [`classify_source`] uses).
+///
+/// Order of decision:
+/// 1. If any of the resolved mDNS addresses is Tailnet → emit.
+/// 2. Else if `txt_tailnet_hint` is `Some(ip)` and the IP classifies as
+///    Tailnet → emit (the iPhone vouched for itself).
+/// 3. Else fall back to [`should_emit`]'s `include_local_network` branch
+///    (i.e. emit only if the operator opted in to LAN bruta).
+///
+/// The TXT hint is an **additive, per-service** trust signal. It does not
+/// relax the default global posture — [`BrowserConfig::default()`] still
+/// rejects LAN-only services that carry no hint or a non-Tailnet hint.
+#[must_use]
+pub fn should_emit_with_txt_hint<'a>(
+    addrs: impl IntoIterator<Item = &'a IpAddr>,
+    txt_tailnet_hint: Option<&IpAddr>,
+    config: BrowserConfig,
+) -> bool {
+    // Materialize the iterator so we can both classify it and re-use it
+    // in the `include_local_network` fallback without consuming twice.
+    let collected: Vec<IpAddr> = addrs.into_iter().copied().collect();
+
+    let mut any_tailnet = false;
+    let any_addr = !collected.is_empty();
+    for addr in &collected {
+        if classify_source(*addr) == DiscoverySource::Tailnet {
+            any_tailnet = true;
+            break;
+        }
+    }
+    if any_tailnet {
+        return true;
+    }
+    if let Some(hint) = txt_tailnet_hint {
+        if classify_source(*hint) == DiscoverySource::Tailnet {
+            return true;
+        }
+    }
+    config.include_local_network && any_addr
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -299,5 +352,108 @@ mod tests {
                 include_local_network: true
             }
         ));
+    }
+
+    // ── should_emit_with_txt_hint ─────────────────────────────────────────
+
+    #[test]
+    fn should_emit_with_txt_hint_promotes_lan_when_tailnet_txt_present() {
+        // mDNS announced only on LAN, but the iPhone vouches for its own
+        // Tailnet address via TXT. We must trust that hint and emit.
+        let addrs = vec![ip4("192.168.1.42"), ip6("fe80::1")];
+        let hint = ip4("100.100.55.7");
+        let config = BrowserConfig::default(); // include_local_network=false
+        assert!(
+            should_emit_with_txt_hint(&addrs, Some(&hint), config),
+            "LAN-only addrs + Tailnet TXT hint → emit"
+        );
+    }
+
+    #[test]
+    fn should_emit_with_txt_hint_rejects_lan_txt_value() {
+        // TXT carries an IP, but it's a LAN address — not Tailnet. Hint
+        // must be ignored and the service stays suppressed under default
+        // config (no opt-in to LAN bruta).
+        let addrs = vec![ip4("192.168.1.42")];
+        let bogus_hint = ip4("10.0.0.5");
+        let config = BrowserConfig::default();
+        assert!(
+            !should_emit_with_txt_hint(&addrs, Some(&bogus_hint), config),
+            "LAN TXT hint must not promote a LAN-only service"
+        );
+
+        // IPv6 link-local hint also rejected.
+        let bogus_v6_hint = ip6("fe80::dead");
+        assert!(
+            !should_emit_with_txt_hint(&addrs, Some(&bogus_v6_hint), config),
+            "IPv6 link-local TXT hint must not promote"
+        );
+    }
+
+    #[test]
+    fn should_emit_with_txt_hint_rejects_garbage_txt() {
+        // The browser parses `resolved.txt("tailnet_addr")` via
+        // `IpAddr::from_str`; a non-IP value yields `None`. We model that
+        // here: `txt_tailnet_hint = None`. Service stays suppressed.
+        let addrs = vec![ip4("192.168.1.42")];
+        let config = BrowserConfig::default();
+        assert!(
+            !should_emit_with_txt_hint(&addrs, None, config),
+            "Garbage / missing TXT (None hint) must not promote"
+        );
+    }
+
+    #[test]
+    fn should_emit_with_txt_hint_no_hint_falls_back_to_should_emit() {
+        // Without a hint, behaviour must match `should_emit` exactly for
+        // every combination of (Tailnet-in-addrs, opt-in flag).
+        let tailnet_addrs = vec![ip4("100.64.1.1")];
+        let lan_addrs = vec![ip4("192.168.0.1")];
+        let no_addrs: Vec<IpAddr> = vec![];
+
+        for &include_local in &[false, true] {
+            let config = BrowserConfig {
+                include_local_network: include_local,
+            };
+            assert_eq!(
+                should_emit_with_txt_hint(&tailnet_addrs, None, config),
+                should_emit(&tailnet_addrs, config),
+                "Tailnet addrs, include_local={include_local}: hinted=None must match should_emit",
+            );
+            assert_eq!(
+                should_emit_with_txt_hint(&lan_addrs, None, config),
+                should_emit(&lan_addrs, config),
+                "LAN addrs, include_local={include_local}: hinted=None must match should_emit",
+            );
+            assert_eq!(
+                should_emit_with_txt_hint(&no_addrs, None, config),
+                should_emit(&no_addrs, config),
+                "Empty addrs, include_local={include_local}: hinted=None must match should_emit",
+            );
+        }
+    }
+
+    #[test]
+    fn should_emit_with_txt_hint_does_not_override_tailnet_in_addrs() {
+        // Sanity: if addrs already contain a Tailnet IP, we emit
+        // regardless of the hint (including garbage or absent).
+        let addrs = vec![ip4("100.64.1.1"), ip4("192.168.0.1")];
+        let config = BrowserConfig::default();
+        assert!(should_emit_with_txt_hint(&addrs, None, config));
+        let lan_hint = ip4("10.0.0.5");
+        assert!(should_emit_with_txt_hint(&addrs, Some(&lan_hint), config));
+    }
+
+    #[test]
+    fn should_emit_with_txt_hint_respects_include_local_when_no_tailnet_signal() {
+        // No Tailnet in addrs, no usable TXT hint, but operator opted into
+        // LAN bruta. Should emit because there is at least one address.
+        let addrs = vec![ip4("192.168.0.1")];
+        let config = BrowserConfig {
+            include_local_network: true,
+        };
+        assert!(should_emit_with_txt_hint(&addrs, None, config));
+        let bogus_hint = ip4("10.0.0.5");
+        assert!(should_emit_with_txt_hint(&addrs, Some(&bogus_hint), config));
     }
 }
