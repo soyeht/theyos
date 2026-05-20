@@ -99,6 +99,7 @@ fn make_fixture(bs: BootstrapState) -> Fixture {
         shamir_k: 1,
         members: vec![m_id.clone()],
         created_at: 1_000,
+        is_follower: false,
     };
 
     let machine_cert = MachineCert::sign(

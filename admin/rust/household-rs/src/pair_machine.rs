@@ -1137,6 +1137,7 @@ impl CeremonyTxn {
             shamir_k: 2,
             shamir_n: 2,
             members: new_members,
+            is_follower: false,
         };
         new_record
             .validate()

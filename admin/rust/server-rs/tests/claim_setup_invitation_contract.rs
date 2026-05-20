@@ -61,7 +61,7 @@ const OTHER_TAILNET_IP: &str = "100.64.2.2";
 fn test_token() -> [u8; 32] {
     let mut t = [0u8; 32];
     for (i, b) in t.iter_mut().enumerate() {
-        *b = i as u8;
+        *b = u8::try_from(i).unwrap();
     }
     t
 }

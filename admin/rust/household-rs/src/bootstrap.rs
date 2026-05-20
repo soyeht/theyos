@@ -13,9 +13,12 @@
 //!
 //! Or, on idempotent rerun, a single `bootstrap.skip` line.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use rand::RngCore;
+use serde::{Deserialize, Serialize};
+use serde_bytes::ByteBuf;
 use tracing::{error, info};
 
 /// Convert an `Instant` elapsed duration to whole milliseconds without
@@ -46,13 +49,15 @@ fn log_ts() -> String {
 }
 
 use crate::chain::verify_loaded_chain;
-use crate::error::{BootstrapError, KeystoreError, StorageError};
+use crate::error::{BootstrapError, HouseholdError, KeystoreError, StorageError};
 use crate::household_record::{HouseholdRecord, validate_household_name};
 use crate::ids::{HouseholdId, MachineId, derive_household_id, derive_machine_id};
-use crate::keys::{IdentityKey, P256Keypair};
+use crate::keys::{IdentityKey, P256Keypair, P256PublicKey, P256Signature, verify_signature};
 use crate::keystore;
 use crate::machine_cert::{MachineCert, Platform, SignOptions};
-use crate::storage::{self, atomic_write_cbor, household_record_path};
+use crate::storage::{
+    self, atomic_write_cbor, household_record_path, machine_cert_for, self_m_id_marker_path,
+};
 
 /// Caller-supplied options for a fresh bootstrap.
 #[derive(Clone)]
@@ -180,7 +185,7 @@ pub fn try_load_existing(
                 &cert.m_pub,
                 "machine",
             )?;
-            let (hh_priv, backing) = if record.shamir_n == 1 {
+            let (hh_priv, backing) = if record.has_local_household_private_key() {
                 let hh_priv = read_existing_household_key(state_dir, &record.hh_id, policy)?;
                 ensure_loaded_key_matches(
                     "keystore.read.household",
@@ -207,22 +212,24 @@ pub fn try_load_existing(
                 // succeed even if the residual cleanup hasn't, because
                 // the household has already grown to N=2 and refusing
                 // to start would be worse than a logged residue.
-                if let Err(e) =
-                    destroy_household_keystore_material(state_dir, &record.hh_id, policy)
-                {
-                    tracing::warn!(
-                        stage = "bootstrap.post_shamir_destroy_retry",
-                        hh_id = %record.hh_id,
-                        error = %e,
-                        "boot-time HH_priv keystore destruction retry failed; \
-                         ceremony already committed, residue persists until next boot",
-                    );
-                } else {
-                    tracing::info!(
-                        stage = "bootstrap.post_shamir_destroy_retry",
-                        hh_id = %record.hh_id,
-                        "boot-time HH_priv keystore destruction retry: idempotent (NotFound or freshly destroyed)",
-                    );
+                if !record.is_follower {
+                    if let Err(e) =
+                        destroy_household_keystore_material(state_dir, &record.hh_id, policy)
+                    {
+                        tracing::warn!(
+                            stage = "bootstrap.post_shamir_destroy_retry",
+                            hh_id = %record.hh_id,
+                            error = %e,
+                            "boot-time HH_priv keystore destruction retry failed; \
+                             ceremony already committed, residue persists until next boot",
+                        );
+                    } else {
+                        tracing::info!(
+                            stage = "bootstrap.post_shamir_destroy_retry",
+                            hh_id = %record.hh_id,
+                            "boot-time HH_priv keystore destruction retry: idempotent (NotFound or freshly destroyed)",
+                        );
+                    }
                 }
                 (None, m_priv.backing())
             };
@@ -234,6 +241,7 @@ pub fn try_load_existing(
                 backing,
             }))
         }
+        (Some(record), None) if record.is_follower => Ok(None),
         (Some(_), None) => Err(BootstrapError::CertMissingButRecordPresent),
         (None, Some(_)) => Err(BootstrapError::RecordMissingButCertPresent),
         (None, None) => Ok(None),
@@ -298,7 +306,7 @@ pub fn bootstrap_or_load(
                 &cert.m_pub,
                 "machine",
             )?;
-            let (hh_priv, backing) = if record.shamir_n == 1 {
+            let (hh_priv, backing) = if record.has_local_household_private_key() {
                 let hh_priv = read_existing_household_key(state_dir, &record.hh_id, policy)?;
                 ensure_loaded_key_matches(
                     "keystore.read.household",
@@ -311,22 +319,24 @@ pub fn bootstrap_or_load(
             } else {
                 // Boot-time B1 invariant retry — see equivalent comment
                 // in `try_load_existing` above.
-                if let Err(e) =
-                    destroy_household_keystore_material(state_dir, &record.hh_id, policy)
-                {
-                    tracing::warn!(
-                        stage = "bootstrap.post_shamir_destroy_retry",
-                        hh_id = %record.hh_id,
-                        error = %e,
-                        "boot-time HH_priv keystore destruction retry failed; \
-                         ceremony already committed, residue persists until next boot",
-                    );
-                } else {
-                    tracing::info!(
-                        stage = "bootstrap.post_shamir_destroy_retry",
-                        hh_id = %record.hh_id,
-                        "boot-time HH_priv keystore destruction retry: idempotent (NotFound or freshly destroyed)",
-                    );
+                if !record.is_follower {
+                    if let Err(e) =
+                        destroy_household_keystore_material(state_dir, &record.hh_id, policy)
+                    {
+                        tracing::warn!(
+                            stage = "bootstrap.post_shamir_destroy_retry",
+                            hh_id = %record.hh_id,
+                            error = %e,
+                            "boot-time HH_priv keystore destruction retry failed; \
+                             ceremony already committed, residue persists until next boot",
+                        );
+                    } else {
+                        tracing::info!(
+                            stage = "bootstrap.post_shamir_destroy_retry",
+                            hh_id = %record.hh_id,
+                            "boot-time HH_priv keystore destruction retry: idempotent (NotFound or freshly destroyed)",
+                        );
+                    }
                 }
                 (None, m_priv.backing())
             };
@@ -338,6 +348,9 @@ pub fn bootstrap_or_load(
                 backing,
             })
         }
+        (Some(record), None) if record.is_follower => Err(BootstrapError::InvalidOption(
+            "accept-household follower record is awaiting confirm".into(),
+        )),
         (Some(_), None) => Err(BootstrapError::CertMissingButRecordPresent),
         (None, Some(_)) => Err(BootstrapError::RecordMissingButCertPresent),
         (None, None) => {
@@ -477,6 +490,7 @@ fn fresh_bootstrap(
         shamir_k: 1,
         shamir_n: 1,
         members: vec![m_id.clone()],
+        is_follower: false,
     };
     record.validate().map_err(|e| BootstrapError::Encoding {
         source: e,
@@ -554,6 +568,415 @@ fn fresh_bootstrap(
         cert,
         hh_priv: Some(hh_kp),
         m_priv: m_kp,
+        backing,
+    })
+}
+
+/// Caller-supplied inputs for accepting an existing household from an owner
+/// device that holds `HH_priv`.
+pub struct AcceptHouseholdPrepareOpts {
+    pub household_name: String,
+    pub hh_id: HouseholdId,
+    pub hh_pub: P256PublicKey,
+    pub invitation_token_hash: [u8; 32],
+}
+
+/// Canonical challenge bytes returned by `POST /bootstrap/accept-household`
+/// and signed by the owner device's household key.
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq, Debug)]
+#[serde(deny_unknown_fields)]
+pub struct AcceptHouseholdJoinChallenge {
+    #[serde(rename = "v")]
+    pub version: u8,
+    pub hh_id: HouseholdId,
+    pub m_pub: ByteBuf,
+    pub machine_nonce: ByteBuf,
+    pub timestamp: u64,
+}
+
+impl AcceptHouseholdJoinChallenge {
+    #[must_use]
+    pub fn build(
+        hh_id: HouseholdId,
+        m_pub: &[u8; 33],
+        machine_nonce: &[u8; 32],
+        timestamp: u64,
+    ) -> Self {
+        Self {
+            version: 1,
+            hh_id,
+            m_pub: ByteBuf::from(m_pub.to_vec()),
+            machine_nonce: ByteBuf::from(machine_nonce.to_vec()),
+            timestamp,
+        }
+    }
+
+    pub fn to_canonical_bytes(&self) -> Result<Vec<u8>, crate::error::HouseholdError> {
+        crate::cbor::to_canonical_vec(self)
+    }
+}
+
+/// Durable pending state between `accept-household` and
+/// `accept-household/confirm`.
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq, Debug)]
+#[serde(deny_unknown_fields)]
+pub struct PendingAcceptHousehold {
+    #[serde(rename = "v")]
+    pub version: u8,
+    pub hh_id: HouseholdId,
+    pub hh_pub: P256PublicKey,
+    pub hh_name: String,
+    pub m_id: MachineId,
+    pub m_pub: P256PublicKey,
+    pub machine_nonce: ByteBuf,
+    pub timestamp: u64,
+    pub invitation_token_hash: ByteBuf,
+}
+
+impl PendingAcceptHousehold {
+    pub fn join_challenge(&self) -> Result<AcceptHouseholdJoinChallenge, HouseholdError> {
+        let nonce = <[u8; 32]>::try_from(self.machine_nonce.as_ref())
+            .map_err(|_| HouseholdError::InvalidRecord("machine_nonce must be 32 bytes".into()))?;
+        Ok(AcceptHouseholdJoinChallenge::build(
+            self.hh_id.clone(),
+            self.m_pub.as_bytes(),
+            &nonce,
+            self.timestamp,
+        ))
+    }
+
+    pub fn invitation_token_hash_bytes(&self) -> Result<[u8; 32], HouseholdError> {
+        <[u8; 32]>::try_from(self.invitation_token_hash.as_ref()).map_err(|_| {
+            HouseholdError::InvalidRecord("invitation_token_hash must be 32 bytes".into())
+        })
+    }
+}
+
+pub struct PreparedAcceptHousehold {
+    pub record: HouseholdRecord,
+    pub m_id: MachineId,
+    pub m_pub: P256PublicKey,
+    pub join_challenge_cbor: Vec<u8>,
+    pub backing: &'static str,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum AcceptHouseholdConfirmError {
+    #[error("pending accept-household state is missing")]
+    PendingMissing,
+    #[error("pending accept-household state mismatch: {0}")]
+    Mismatch(&'static str),
+    #[error("crypto validation failed: {0}")]
+    Crypto(#[from] HouseholdError),
+    #[error("keystore failure during {stage}: {source}")]
+    Keystore {
+        #[source]
+        source: KeystoreError,
+        stage: &'static str,
+    },
+    #[error("storage failure during {stage}: {source}")]
+    Storage {
+        #[source]
+        source: StorageError,
+        stage: &'static str,
+    },
+}
+
+#[must_use]
+pub fn pending_accept_household_path(state_dir: &Path) -> PathBuf {
+    storage::household_dir(state_dir)
+        .join("pending")
+        .join("accept_household.cbor")
+}
+
+pub fn load_pending_accept_household(
+    state_dir: &Path,
+) -> Result<Option<PendingAcceptHousehold>, StorageError> {
+    storage::read_optional_cbor(&pending_accept_household_path(state_dir))
+}
+
+pub fn clear_pending_accept_household(state_dir: &Path) -> Result<(), StorageError> {
+    let path = pending_accept_household_path(state_dir);
+    match std::fs::remove_file(&path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(StorageError::Io {
+            path,
+            kind: e.kind().to_string(),
+            hint: e.to_string(),
+        }),
+    }
+}
+
+pub fn prepare_accept_household(
+    state_dir: &Path,
+    opts: AcceptHouseholdPrepareOpts,
+    policy: KeyBackingPolicy,
+) -> Result<PreparedAcceptHousehold, BootstrapError> {
+    validate_household_name(&opts.household_name).map_err(|e| BootstrapError::Encoding {
+        source: e,
+        stage: "accept_household.opts.household_name",
+    })?;
+    let recomputed = derive_household_id(&opts.hh_pub);
+    if recomputed != opts.hh_id {
+        return Err(BootstrapError::Encoding {
+            source: HouseholdError::IdentifierMismatch {
+                expected: recomputed.to_string(),
+                actual: opts.hh_id.to_string(),
+            },
+            stage: "accept_household.hh_id",
+        });
+    }
+
+    storage::load_state_dir(state_dir).map_err(|e| BootstrapError::Storage {
+        source: e,
+        stage: "accept_household.load_state_dir",
+    })?;
+    let existing_record: Option<HouseholdRecord> =
+        storage::read_optional_cbor(&household_record_path(state_dir)).map_err(|e| {
+            BootstrapError::Storage {
+                source: e,
+                stage: "accept_household.existing_record",
+            }
+        })?;
+    let existing_cert =
+        crate::machine_cert::load_self_cert(state_dir).map_err(|e| BootstrapError::Storage {
+            source: e,
+            stage: "accept_household.existing_cert",
+        })?;
+    if existing_record.is_some() || existing_cert.is_some() {
+        return Err(BootstrapError::InvalidOption(
+            "household identity already exists or accept-household is pending".into(),
+        ));
+    }
+
+    let backing = key_backing(policy);
+    let t0 = Instant::now();
+    let m_kp = create_identity_key("machine", policy).map_err(|e| BootstrapError::Keystore {
+        source: e,
+        stage: "accept_household.key_gen.machine",
+    })?;
+    info!(
+        ts = %log_ts(),
+        stage = "bootstrap.key_gen.machine",
+        elapsed_ms = elapsed_ms_clamped(t0),
+        result = "ok",
+        backing,
+    );
+
+    let m_pub = m_kp.public();
+    let m_id = derive_machine_id(&m_pub);
+    let now = unix_now("accept_household.clock")?;
+    let mut machine_nonce = [0_u8; 32];
+    rand::rngs::OsRng.fill_bytes(&mut machine_nonce);
+
+    let record = HouseholdRecord {
+        version: HouseholdRecord::SCHEMA_VERSION,
+        hh_id: opts.hh_id.clone(),
+        hh_pub: opts.hh_pub.clone(),
+        name: opts.household_name,
+        created_at: now,
+        shamir_k: 0,
+        shamir_n: 0,
+        members: vec![m_id.clone()],
+        is_follower: true,
+    };
+    record.validate().map_err(|e| BootstrapError::Encoding {
+        source: e,
+        stage: "accept_household.validate_record",
+    })?;
+
+    let t1 = Instant::now();
+    persist_machine_key(state_dir, &m_id, m_kp.as_ref(), policy).map_err(|e| {
+        BootstrapError::Keystore {
+            source: e,
+            stage: "accept_household.keystore.write.machine",
+        }
+    })?;
+    info!(
+        ts = %log_ts(),
+        stage = "bootstrap.keystore.write",
+        which = "machine",
+        elapsed_ms = elapsed_ms_clamped(t1),
+        result = "ok",
+    );
+
+    let challenge = AcceptHouseholdJoinChallenge::build(
+        opts.hh_id.clone(),
+        m_pub.as_bytes(),
+        &machine_nonce,
+        now,
+    );
+    let challenge_cbor = challenge
+        .to_canonical_bytes()
+        .map_err(|e| BootstrapError::Encoding {
+            source: e,
+            stage: "accept_household.encode_challenge",
+        })?;
+    let pending = PendingAcceptHousehold {
+        version: 1,
+        hh_id: opts.hh_id,
+        hh_pub: opts.hh_pub,
+        hh_name: record.name.clone(),
+        m_id: m_id.clone(),
+        m_pub: m_pub.clone(),
+        machine_nonce: ByteBuf::from(machine_nonce.to_vec()),
+        timestamp: now,
+        invitation_token_hash: ByteBuf::from(opts.invitation_token_hash.to_vec()),
+    };
+    let record_bytes =
+        crate::cbor::to_canonical_vec(&record).map_err(|e| BootstrapError::Encoding {
+            source: e,
+            stage: "accept_household.encode_record",
+        })?;
+    let pending_bytes =
+        crate::cbor::to_canonical_vec(&pending).map_err(|e| BootstrapError::Encoding {
+            source: e,
+            stage: "accept_household.encode_pending",
+        })?;
+    let staged = storage::stage_commit_files(&[
+        (household_record_path(state_dir), record_bytes),
+        (pending_accept_household_path(state_dir), pending_bytes),
+    ])
+    .map_err(|e| BootstrapError::Storage {
+        source: e,
+        stage: "accept_household.stage_pending",
+    })?;
+    staged.commit().map_err(|e| BootstrapError::Storage {
+        source: e,
+        stage: "accept_household.commit_pending",
+    })?;
+
+    Ok(PreparedAcceptHousehold {
+        record,
+        m_id,
+        m_pub,
+        join_challenge_cbor: challenge_cbor,
+        backing,
+    })
+}
+
+pub fn confirm_accept_household(
+    state_dir: &Path,
+    m_id: &MachineId,
+    machine_cert: MachineCert,
+    challenge_sig: &P256Signature,
+    policy: KeyBackingPolicy,
+) -> Result<LoadedIdentity, AcceptHouseholdConfirmError> {
+    let pending = load_pending_accept_household(state_dir).map_err(|e| {
+        AcceptHouseholdConfirmError::Storage {
+            source: e,
+            stage: "accept_household.load_pending",
+        }
+    })?;
+    let Some(pending) = pending else {
+        return Err(AcceptHouseholdConfirmError::PendingMissing);
+    };
+    if &pending.m_id != m_id {
+        return Err(AcceptHouseholdConfirmError::Mismatch("m_id"));
+    }
+    if pending.version != 1 {
+        return Err(AcceptHouseholdConfirmError::Mismatch("pending.version"));
+    }
+
+    let challenge = pending.join_challenge()?;
+    let challenge_cbor = challenge.to_canonical_bytes()?;
+    verify_signature(&pending.hh_pub, &challenge_cbor, challenge_sig)?;
+
+    if machine_cert.hh_id != pending.hh_id {
+        return Err(AcceptHouseholdConfirmError::Mismatch("machine_cert.hh_id"));
+    }
+    if machine_cert.m_id != pending.m_id {
+        return Err(AcceptHouseholdConfirmError::Mismatch("machine_cert.m_id"));
+    }
+    if machine_cert.m_pub != pending.m_pub {
+        return Err(AcceptHouseholdConfirmError::Mismatch("machine_cert.m_pub"));
+    }
+    // TODO(cert-rotation): validate expiry/revocation metadata once MachineCert
+    // carries it. For now accept the current structure after issuer, subject,
+    // and signature checks.
+    machine_cert.verify(&pending.hh_pub)?;
+
+    let record = HouseholdRecord {
+        version: HouseholdRecord::SCHEMA_VERSION,
+        hh_id: pending.hh_id.clone(),
+        hh_pub: pending.hh_pub.clone(),
+        name: pending.hh_name.clone(),
+        created_at: pending.timestamp,
+        shamir_k: 0,
+        shamir_n: 0,
+        members: vec![pending.m_id.clone()],
+        is_follower: true,
+    };
+    crate::chain::verify_loaded_chain(&record, &machine_cert)?;
+
+    let m_priv =
+        read_existing_machine_key(state_dir, &pending.m_id, policy).map_err(|e| match e {
+            BootstrapError::Keystore { source, stage } => {
+                AcceptHouseholdConfirmError::Keystore { source, stage }
+            }
+            BootstrapError::Storage { source, stage } => {
+                AcceptHouseholdConfirmError::Storage { source, stage }
+            }
+            BootstrapError::Encoding { source, .. } => AcceptHouseholdConfirmError::Crypto(source),
+            other => AcceptHouseholdConfirmError::Crypto(HouseholdError::InvalidRecord(
+                other.to_string(),
+            )),
+        })?;
+    ensure_loaded_key_matches(
+        "accept_household.keystore.read.machine",
+        m_priv.as_ref(),
+        &pending.m_pub,
+        "machine",
+    )
+    .map_err(|e| match e {
+        BootstrapError::Keystore { source, stage } => {
+            AcceptHouseholdConfirmError::Keystore { source, stage }
+        }
+        BootstrapError::Storage { source, stage } => {
+            AcceptHouseholdConfirmError::Storage { source, stage }
+        }
+        BootstrapError::Encoding { source, .. } => AcceptHouseholdConfirmError::Crypto(source),
+        other => {
+            AcceptHouseholdConfirmError::Crypto(HouseholdError::InvalidRecord(other.to_string()))
+        }
+    })?;
+
+    let record_bytes = crate::cbor::to_canonical_vec(&record)?;
+    let cert_bytes = crate::cbor::to_canonical_vec(&machine_cert)?;
+    let mut marker_bytes = pending.m_id.to_string().into_bytes();
+    marker_bytes.push(b'\n');
+    let staged = storage::stage_commit_files(&[
+        (household_record_path(state_dir), record_bytes),
+        (
+            machine_cert_for(state_dir, pending.m_id.as_str()),
+            cert_bytes,
+        ),
+        (self_m_id_marker_path(state_dir), marker_bytes),
+    ])
+    .map_err(|e| AcceptHouseholdConfirmError::Storage {
+        source: e,
+        stage: "accept_household.stage_confirm",
+    })?;
+    staged
+        .commit()
+        .map_err(|e| AcceptHouseholdConfirmError::Storage {
+            source: e,
+            stage: "accept_household.commit_confirm",
+        })?;
+    clear_pending_accept_household(state_dir).map_err(|e| {
+        AcceptHouseholdConfirmError::Storage {
+            source: e,
+            stage: "accept_household.clear_pending",
+        }
+    })?;
+
+    let backing = m_priv.backing();
+    Ok(LoadedIdentity {
+        record,
+        cert: machine_cert,
+        hh_priv: None,
+        m_priv,
         backing,
     })
 }
@@ -997,6 +1420,56 @@ mod tests {
             ),
             "unexpected error: {err:?}"
         );
+    }
+
+    #[test]
+    fn accept_household_prepare_and_confirm_loads_follower_without_hh_priv() {
+        let td = tempdir().unwrap();
+        let policy = KeyBackingPolicy::ForceSoftware;
+        let hh = P256Keypair::generate();
+        let hh_pub = hh.public();
+        let hh_id = derive_household_id(&hh_pub);
+
+        let prepared = prepare_accept_household(
+            td.path(),
+            AcceptHouseholdPrepareOpts {
+                household_name: "Existing Home".into(),
+                hh_id: hh_id.clone(),
+                hh_pub: hh_pub.clone(),
+                invitation_token_hash: [0x11; 32],
+            },
+            policy,
+        )
+        .unwrap();
+        assert!(prepared.record.is_follower);
+        assert_eq!(prepared.record.shamir_n, 0);
+        assert!(
+            try_load_existing(td.path(), policy).unwrap().is_none(),
+            "pending follower without cert should not load as initialized"
+        );
+
+        let sig = hh.sign(&prepared.join_challenge_cbor).unwrap();
+        let cert = MachineCert::sign(
+            &hh,
+            &prepared.m_pub,
+            &SignOptions {
+                hh_id: hh_id.clone(),
+                hostname: "test-mac".into(),
+                platform: Platform::Macos,
+                joined_at: unix_now("test.now").unwrap(),
+            },
+        )
+        .unwrap();
+        let loaded =
+            confirm_accept_household(td.path(), &prepared.m_id, cert, &sig, policy).unwrap();
+        assert!(loaded.record.is_follower);
+        assert!(loaded.hh_priv.is_none());
+
+        let reloaded = try_load_existing(td.path(), policy)
+            .unwrap()
+            .expect("confirmed follower should load");
+        assert!(reloaded.record.is_follower);
+        assert!(reloaded.hh_priv.is_none());
     }
 
     #[test]

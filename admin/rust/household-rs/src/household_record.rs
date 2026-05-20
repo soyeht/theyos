@@ -24,6 +24,10 @@ pub struct HouseholdRecord {
     pub shamir_k: u8,
     pub shamir_n: u8,
     pub members: Vec<MachineId>,
+    /// True when this engine joined a household whose `HH_priv` is held by an
+    /// owner device instead of local engine storage.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub is_follower: bool,
 }
 
 impl HouseholdRecord {
@@ -55,27 +59,36 @@ impl HouseholdRecord {
             });
         }
         validate_household_name(&self.name)?;
-        // Shamir invariants:
-        //   1 <= k <= n
-        //   members.len() == n
-        // Phase 1: (1, 1). Phase 3: (2, 2). Larger n reserved for later phases.
-        if self.shamir_k == 0 || self.shamir_n == 0 || self.shamir_k > self.shamir_n {
-            return Err(HouseholdError::InvalidRecord(format!(
-                "shamir_k/n must satisfy 1 <= k <= n (got {}/{})",
-                self.shamir_k, self.shamir_n
-            )));
-        }
         if self.members.is_empty() {
             return Err(HouseholdError::InvalidRecord(
                 "members[] must be non-empty".into(),
             ));
         }
-        if self.members.len() != usize::from(self.shamir_n) {
-            return Err(HouseholdError::InvalidRecord(format!(
-                "members.len()={} != shamir_n={}",
-                self.members.len(),
-                self.shamir_n
-            )));
+        if self.is_follower {
+            if self.shamir_k != 0 || self.shamir_n != 0 {
+                return Err(HouseholdError::InvalidRecord(format!(
+                    "follower records must use shamir_k/n = 0/0 (got {}/{})",
+                    self.shamir_k, self.shamir_n
+                )));
+            }
+        } else {
+            // Shamir invariants:
+            //   1 <= k <= n
+            //   members.len() == n
+            // Phase 1: (1, 1). Phase 3: (2, 2). Larger n reserved for later phases.
+            if self.shamir_k == 0 || self.shamir_n == 0 || self.shamir_k > self.shamir_n {
+                return Err(HouseholdError::InvalidRecord(format!(
+                    "shamir_k/n must satisfy 1 <= k <= n (got {}/{})",
+                    self.shamir_k, self.shamir_n
+                )));
+            }
+            if self.members.len() != usize::from(self.shamir_n) {
+                return Err(HouseholdError::InvalidRecord(format!(
+                    "members.len()={} != shamir_n={}",
+                    self.members.len(),
+                    self.shamir_n
+                )));
+            }
         }
         for m in &self.members {
             if !MachineId::is_well_formed(m.as_str()) {
@@ -103,6 +116,16 @@ impl HouseholdRecord {
         }
         Ok(())
     }
+
+    #[must_use]
+    pub fn has_local_household_private_key(&self) -> bool {
+        !self.is_follower && self.shamir_n == 1
+    }
+}
+
+#[allow(clippy::trivially_copy_pass_by_ref)]
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 /// Spec invariant: name length 1..=64 **UTF-8 bytes** (not grapheme clusters);

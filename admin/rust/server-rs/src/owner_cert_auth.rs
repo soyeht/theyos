@@ -82,6 +82,7 @@ mod tests {
             shamir_k: 1,
             members: vec![derive_machine_id(hh_pub)],
             created_at: 1000,
+            is_follower: false,
         }
     }
 

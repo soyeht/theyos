@@ -59,6 +59,7 @@ fn fixture() -> (
         shamir_k: 1,
         shamir_n: 1,
         members: vec![m1_id_typed],
+        is_follower: false,
     };
     (
         td,
@@ -530,6 +531,7 @@ fn try_load_existing_runs_partial_phase3_commit_recovery() {
         shamir_k: 2,
         shamir_n: 2,
         members,
+        is_follower: false,
     };
     fs::write(
         household_record_path(td.path()),
