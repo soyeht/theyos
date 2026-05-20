@@ -270,6 +270,7 @@ fn sole_shard_alongside_shamir_is_recovered_at_boot() {
         shamir_k: 2,
         shamir_n: 2,
         members,
+        is_follower: false,
     };
     fs::write(
         household_record_path(td.path()),

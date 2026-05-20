@@ -57,8 +57,11 @@ pub mod shard_at_rest;
 pub mod storage;
 
 pub use bootstrap::{
-    BootstrapOpts, KeyBackingPolicy, LoadedIdentity, bootstrap_or_load,
-    destroy_household_keystore_material, ensure_candidate_machine_keypair, try_load_existing,
+    AcceptHouseholdConfirmError, AcceptHouseholdJoinChallenge, AcceptHouseholdPrepareOpts,
+    BootstrapOpts, KeyBackingPolicy, LoadedIdentity, PendingAcceptHousehold, bootstrap_or_load,
+    clear_pending_accept_household, confirm_accept_household, destroy_household_keystore_material,
+    ensure_candidate_machine_keypair, load_pending_accept_household, pending_accept_household_path,
+    prepare_accept_household, try_load_existing,
 };
 pub use chain::verify_loaded_chain;
 pub use error::{BootstrapError, HouseholdError, KeystoreError, StorageError};

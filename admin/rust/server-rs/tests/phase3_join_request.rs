@@ -80,17 +80,17 @@ fn owner_auth_for(identity: &household_rs::LoadedIdentity) -> (HouseholdAuthStat
 fn router_with_state(state_dir: &std::path::Path) -> (Router, Arc<PairMachineWindow>, P256Keypair) {
     let identity = Arc::new(bootstrap(state_dir));
     let (owner_auth, person) = owner_auth_for(&identity);
-    let (router, window) = router_with_loaded_identity(state_dir, identity, owner_auth);
+    let (router, window) = router_with_loaded_identity(state_dir, &identity, owner_auth);
     (router, window, person)
 }
 
 fn router_with_loaded_identity(
     state_dir: &std::path::Path,
-    identity: Arc<LoadedIdentity>,
+    identity: &Arc<LoadedIdentity>,
     owner_auth: HouseholdAuthState,
 ) -> (Router, Arc<PairMachineWindow>) {
     let owner_auth = Arc::new(owner_auth);
-    let household = HouseholdState::loaded_with_owner_auth(Arc::clone(&identity), Some(owner_auth));
+    let household = HouseholdState::loaded_with_owner_auth(Arc::clone(identity), Some(owner_auth));
     let window = Arc::new(PairMachineWindow::with_persistence(state_dir.to_path_buf()).unwrap());
     let broadcaster = OwnerEventsBroadcaster::new();
     let event_log =
@@ -242,7 +242,8 @@ async fn replay_within_grace_precedes_post_shamir_membership_gates() {
     identity.record.shamir_n = 2;
     identity.record.members.push(candidate_machine_id(&body));
     identity.record.validate().unwrap();
-    let (router, _window) = router_with_loaded_identity(td.path(), Arc::new(identity), owner_auth);
+    let identity = Arc::new(identity);
+    let (router, _window) = router_with_loaded_identity(td.path(), &identity, owner_auth);
 
     let (status, resp_bytes) = post_cbor(router, body, Some(&person)).await;
 

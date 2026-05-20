@@ -26,9 +26,15 @@ use axum::{
 
 use crate::setup_invitation::SetupInvitationCache;
 use household_rs::HouseholdAuthState;
-use household_rs::bootstrap::{BootstrapOpts, KeyBackingPolicy, bootstrap_or_load};
+use household_rs::MachineCert;
+use household_rs::bootstrap::{
+    AcceptHouseholdConfirmError, AcceptHouseholdPrepareOpts, BootstrapOpts, KeyBackingPolicy,
+    bootstrap_or_load, confirm_accept_household, load_pending_accept_household,
+    prepare_accept_household,
+};
 use household_rs::bootstrap_state::{self, BootstrapState};
 use household_rs::household_record::validate_household_name;
+use household_rs::ids::{HouseholdId, MachineId, derive_household_id};
 use household_rs::keys::{P256PublicKey, P256Signature, verify_signature};
 use household_rs::pair_device::PairDeviceWindow;
 use serde::{Deserialize, Serialize};
@@ -92,6 +98,11 @@ pub fn bootstrap_router(state: BootstrapHandlerState) -> Router {
     Router::new()
         .route("/bootstrap/status", get(get_bootstrap_status))
         .route("/bootstrap/initialize", post(post_initialize))
+        .route("/bootstrap/accept-household", post(post_accept_household))
+        .route(
+            "/bootstrap/accept-household/confirm",
+            post(post_accept_household_confirm),
+        )
         .route(
             "/bootstrap/claim-setup-invitation",
             post(post_claim_setup_invitation),
@@ -120,6 +131,46 @@ struct InitializeResponse {
     name: String,
     pair_qr_uri: String,
     created_at: u64,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AcceptHouseholdRequest {
+    #[serde(rename = "v")]
+    version: u8,
+    hh_id: String,
+    hh_pub: ByteBuf,
+    hh_name: String,
+    invitation_token: ByteBuf,
+}
+
+#[derive(Serialize)]
+struct AcceptHouseholdResponse {
+    #[serde(rename = "v")]
+    version: u8,
+    m_id: String,
+    m_pub: ByteBuf,
+    join_challenge: ByteBuf,
+    challenge_sig_required: bool,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AcceptHouseholdConfirmRequest {
+    #[serde(rename = "v")]
+    version: u8,
+    m_id: String,
+    machine_cert: ByteBuf,
+    challenge_sig: ByteBuf,
+}
+
+#[derive(Serialize)]
+struct AcceptHouseholdConfirmResponse {
+    #[serde(rename = "v")]
+    version: u8,
+    bootstrap_state: &'static str,
+    m_id: String,
+    hh_id: String,
 }
 
 #[derive(Serialize)]
@@ -237,6 +288,29 @@ fn cbor_ok(body: impl serde::Serialize) -> Response {
         }
         Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     }
+}
+
+fn strict_cbor_request<T>(body: &[u8]) -> Result<T, ()>
+where
+    T: serde::de::DeserializeOwned + serde::Serialize,
+{
+    let req: T = household_rs::cbor::from_canonical_slice(body).map_err(|_| ())?;
+    let reencoded = household_rs::cbor::to_canonical_vec(&req).map_err(|_| ())?;
+    if reencoded == body { Ok(req) } else { Err(()) }
+}
+
+fn validate_accept_household_name(name: &str) -> Result<(), String> {
+    if name.is_empty() {
+        return Err("hh_name must be non-empty".into());
+    }
+    if name.chars().count() > 32 {
+        return Err("hh_name must be <= 32 UTF-8 characters".into());
+    }
+    if name.chars().any(char::is_control) {
+        return Err("hh_name contains control character".into());
+    }
+    validate_household_name(name).map_err(|e| e.to_string())?;
+    Ok(())
 }
 
 // ── Response types ─────────────────────────────────────────────────────────────
@@ -691,6 +765,398 @@ pub async fn post_teardown(State(state): State<BootstrapHandlerState>, body: Byt
     cbor_ok(TeardownAck {
         version: 1,
         torn_at: now_unix,
+    })
+}
+
+/// `POST /bootstrap/accept-household` — accept an existing household from an
+/// owner device that holds `HH_priv`.
+pub async fn post_accept_household(
+    State(state): State<BootstrapHandlerState>,
+    body: Bytes,
+) -> Response {
+    {
+        let current = state.bootstrap.read().await;
+        match *current {
+            BootstrapState::Uninitialized | BootstrapState::ReadyForNaming => {}
+            other => {
+                return cbor_error(
+                    StatusCode::CONFLICT,
+                    "already_initialized",
+                    None,
+                    Some(other.as_str()),
+                );
+            }
+        }
+    }
+
+    let req: AcceptHouseholdRequest = match strict_cbor_request(&body) {
+        Ok(req) => req,
+        Err(()) => return cbor_error(StatusCode::BAD_REQUEST, "invalid_cbor", None, None),
+    };
+    if req.version != 1 {
+        return cbor_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_cbor",
+            Some("unsupported v".into()),
+            None,
+        );
+    }
+    if req.invitation_token.len() != 32 {
+        return cbor_error(StatusCode::BAD_REQUEST, "invalid_request", None, None);
+    }
+    let Ok(invitation_token): Result<[u8; 32], _> = req.invitation_token.as_ref().try_into() else {
+        return cbor_error(StatusCode::BAD_REQUEST, "invalid_request", None, None);
+    };
+
+    let token_hash = *blake3::hash(&invitation_token).as_bytes();
+    if let Err(reason) = validate_accept_household_name(&req.hh_name) {
+        return cbor_error(StatusCode::BAD_REQUEST, "invalid_name", Some(reason), None);
+    }
+    let hh_id = match HouseholdId::parse(req.hh_id.clone()) {
+        Ok(id) => id,
+        Err(e) => {
+            return cbor_error(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "crypto_validation_failed",
+                Some(e.to_string()),
+                None,
+            );
+        }
+    };
+    let hh_pub = match P256PublicKey::from_bytes(req.hh_pub.as_ref()) {
+        Ok(pubkey) => pubkey,
+        Err(e) => {
+            return cbor_error(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "crypto_validation_failed",
+                Some(e.to_string()),
+                None,
+            );
+        }
+    };
+    let derived_hh_id = derive_household_id(&hh_pub);
+    if derived_hh_id != hh_id {
+        return cbor_error(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "crypto_validation_failed",
+            Some(format!(
+                "hh_id mismatch: expected {derived_hh_id}, got {}",
+                req.hh_id
+            )),
+            None,
+        );
+    }
+
+    let invitation =
+        match consume_accept_household_invitation(&state, &invitation_token, token_hash).await {
+            Ok(entry) => entry,
+            Err(resp) => return resp,
+        };
+    if invitation
+        .hh_id
+        .as_deref()
+        .is_some_and(|advertised| advertised != hh_id.as_str())
+    {
+        crate::setup_invitation::cache_reinsert_if_absent(
+            &state.setup_invitation_cache,
+            invitation,
+        )
+        .await;
+        return cbor_error(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "crypto_validation_failed",
+            Some("invitation_token household mismatch".into()),
+            None,
+        );
+    }
+    let state_dir = state.state_dir.clone();
+    let hh_name = req.hh_name.clone();
+    let policy = KeyBackingPolicy::from_env();
+    let prepared = match tokio::task::spawn_blocking(move || {
+        prepare_accept_household(
+            &state_dir,
+            AcceptHouseholdPrepareOpts {
+                household_name: hh_name,
+                hh_id,
+                hh_pub,
+                invitation_token_hash: token_hash,
+            },
+            policy,
+        )
+    })
+    .await
+    {
+        Ok(Ok(prepared)) => prepared,
+        Ok(Err(e)) => {
+            tracing::error!(stage = "bootstrap.accept_household_failed", error = %e);
+            crate::setup_invitation::cache_reinsert_if_absent(
+                &state.setup_invitation_cache,
+                invitation,
+            )
+            .await;
+            return cbor_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "keygen_failed",
+                None,
+                None,
+            );
+        }
+        Err(e) => {
+            tracing::error!(stage = "bootstrap.accept_household_task_failed", error = %e);
+            crate::setup_invitation::cache_reinsert_if_absent(
+                &state.setup_invitation_cache,
+                invitation,
+            )
+            .await;
+            return cbor_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "keygen_failed",
+                None,
+                None,
+            );
+        }
+    };
+
+    {
+        let mut bs = state.bootstrap.write().await;
+        *bs = BootstrapState::ReadyForNaming;
+    }
+
+    tracing::info!(
+        stage = "bootstrap.accept_household.prepared",
+        hh_id = %prepared.record.hh_id,
+        m_id = %prepared.m_id,
+        backing = prepared.backing,
+    );
+
+    cbor_ok(AcceptHouseholdResponse {
+        version: 1,
+        m_id: prepared.m_id.to_string(),
+        m_pub: ByteBuf::from(prepared.m_pub.as_bytes().to_vec()),
+        join_challenge: ByteBuf::from(prepared.join_challenge_cbor),
+        challenge_sig_required: true,
+    })
+}
+
+async fn consume_accept_household_invitation(
+    state: &BootstrapHandlerState,
+    token: &[u8; 32],
+    token_hash: [u8; 32],
+) -> Result<crate::setup_invitation::SetupInvitationEntry, Response> {
+    use crate::setup_invitation::{cache_purge_expired, cache_take};
+
+    if let Ok(Some(pending)) = load_pending_accept_household(&state.state_dir) {
+        if pending
+            .invitation_token_hash_bytes()
+            .is_ok_and(|pending_hash| pending_hash == token_hash)
+        {
+            return Err(cbor_error(
+                StatusCode::GONE,
+                "invitation_expired_or_spent",
+                None,
+                None,
+            ));
+        }
+    }
+
+    let now = crate::time_util::unix_now_secs_checked("accept_household.clock").unwrap_or(0);
+    let Some(entry) = cache_take(&state.setup_invitation_cache, token).await else {
+        return Err(cbor_error(
+            StatusCode::NOT_FOUND,
+            "invitation_not_found",
+            None,
+            None,
+        ));
+    };
+    if now >= entry.expires_at || entry.expires_at.saturating_sub(now) > 3600 {
+        return Err(cbor_error(
+            StatusCode::GONE,
+            "invitation_expired_or_spent",
+            None,
+            None,
+        ));
+    }
+    cache_purge_expired(&state.setup_invitation_cache, now).await;
+    Ok(entry)
+}
+
+/// `POST /bootstrap/accept-household/confirm` — persist the owner-issued
+/// `MachineCert` and mark the follower engine ready.
+pub async fn post_accept_household_confirm(
+    State(state): State<BootstrapHandlerState>,
+    body: Bytes,
+) -> Response {
+    {
+        let current = state.bootstrap.read().await;
+        if *current != BootstrapState::ReadyForNaming {
+            return cbor_error(
+                StatusCode::CONFLICT,
+                "accept_household_not_pending",
+                None,
+                Some(current.as_str()),
+            );
+        }
+    }
+
+    let req: AcceptHouseholdConfirmRequest = match strict_cbor_request(&body) {
+        Ok(req) => req,
+        Err(()) => return cbor_error(StatusCode::BAD_REQUEST, "invalid_cbor", None, None),
+    };
+    if req.version != 1 {
+        return cbor_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_cbor",
+            Some("unsupported v".into()),
+            None,
+        );
+    }
+    let m_id = match MachineId::parse(req.m_id.clone()) {
+        Ok(id) => id,
+        Err(e) => {
+            return cbor_error(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "crypto_validation_failed",
+                Some(e.to_string()),
+                None,
+            );
+        }
+    };
+    let sig_bytes: [u8; 64] = match req.challenge_sig.as_ref().try_into() {
+        Ok(bytes) => bytes,
+        Err(_) => {
+            return cbor_error(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "crypto_validation_failed",
+                Some("challenge_sig must be 64 bytes".into()),
+                None,
+            );
+        }
+    };
+    let challenge_sig = match P256Signature::from_bytes(&sig_bytes) {
+        Ok(sig) => sig,
+        Err(e) => {
+            return cbor_error(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "crypto_validation_failed",
+                Some(e.to_string()),
+                None,
+            );
+        }
+    };
+    let machine_cert: MachineCert = match strict_cbor_request(req.machine_cert.as_ref()) {
+        Ok(cert) => cert,
+        Err(()) => {
+            return cbor_error(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "crypto_validation_failed",
+                Some("machine_cert CBOR invalid".into()),
+                None,
+            );
+        }
+    };
+
+    let state_dir = state.state_dir.clone();
+    let policy = KeyBackingPolicy::from_env();
+    let loaded = match tokio::task::spawn_blocking(move || {
+        confirm_accept_household(&state_dir, &m_id, machine_cert, &challenge_sig, policy)
+    })
+    .await
+    {
+        Ok(Ok(loaded)) => loaded,
+        Ok(Err(AcceptHouseholdConfirmError::PendingMissing)) => {
+            return cbor_error(
+                StatusCode::CONFLICT,
+                "accept_household_not_pending",
+                None,
+                Some("ready_for_naming"),
+            );
+        }
+        Ok(Err(
+            AcceptHouseholdConfirmError::Mismatch(_) | AcceptHouseholdConfirmError::Crypto(_),
+        )) => {
+            return cbor_error(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "crypto_validation_failed",
+                None,
+                None,
+            );
+        }
+        Ok(Err(e)) => {
+            tracing::error!(stage = "bootstrap.accept_household.confirm_failed", error = %e);
+            return cbor_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal_error",
+                None,
+                None,
+            );
+        }
+        Err(e) => {
+            tracing::error!(stage = "bootstrap.accept_household.confirm_task_failed", error = %e);
+            return cbor_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal_error",
+                None,
+                None,
+            );
+        }
+    };
+
+    {
+        let mut bs = state.bootstrap.write().await;
+        let current = *bs;
+        if current
+            .transition(BootstrapState::NamedAwaitingPair)
+            .is_err()
+        {
+            return cbor_error(
+                StatusCode::CONFLICT,
+                "accept_household_not_pending",
+                None,
+                Some(current.as_str()),
+            );
+        }
+        *bs = BootstrapState::NamedAwaitingPair;
+        if let Err(e) =
+            bootstrap_state::persist(&state.state_dir, BootstrapState::NamedAwaitingPair)
+        {
+            tracing::error!(stage = "bootstrap.accept_household.state_persist_failed", error = %e);
+            return cbor_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal_error",
+                None,
+                None,
+            );
+        }
+        *bs = BootstrapState::Ready;
+        if let Err(e) = bootstrap_state::persist(&state.state_dir, BootstrapState::Ready) {
+            tracing::error!(stage = "bootstrap.accept_household.state_persist_failed", error = %e);
+            return cbor_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal_error",
+                None,
+                None,
+            );
+        }
+    }
+
+    let hh_id = loaded.record.hh_id.to_string();
+    let m_id = loaded.cert.m_id.to_string();
+    state
+        .household
+        .set_loaded(SharedHouseholdIdentity::new(loaded))
+        .await;
+
+    tracing::info!(
+        stage = "bootstrap.accept_household.ready",
+        hh_id = %hh_id,
+        m_id = %m_id,
+    );
+
+    cbor_ok(AcceptHouseholdConfirmResponse {
+        version: 1,
+        bootstrap_state: "ready",
+        m_id,
+        hh_id,
     })
 }
 

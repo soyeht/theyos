@@ -34,6 +34,7 @@ pub mod handlers_network;
 pub mod handlers_owner_events;
 pub mod handlers_pair_device;
 pub mod handlers_pair_machine;
+pub mod handlers_sign_machine_cert;
 pub mod handlers_terminal;
 pub mod handlers_terminal_attachments;
 pub mod health;

@@ -93,6 +93,7 @@ fn recover_partial_phase3_commit_rolls_forward_when_record_post_shamir() {
         shamir_k: 2,
         shamir_n: 2,
         members,
+        is_follower: false,
     };
     fs::write(
         household_record_path(td.path()),
@@ -150,6 +151,7 @@ fn recover_partial_phase3_commit_rolls_back_when_record_pre_shamir() {
         shamir_k: 1,
         shamir_n: 1,
         members: vec![m1_id.clone()],
+        is_follower: false,
     };
     fs::write(
         household_record_path(td.path()),
@@ -242,6 +244,7 @@ fn recover_post_join_sole_shard_preserves_sole_when_record_pre_shamir() {
         shamir_k: 1,
         shamir_n: 1,
         members: vec![m1_id.clone()],
+        is_follower: false,
     };
     fs::write(
         household_record_path(td.path()),
@@ -321,6 +324,7 @@ fn recover_partial_phase3_commit_preserves_staged_when_finalize_ack_marker_prese
         shamir_k: 1,
         shamir_n: 1,
         members: vec![m1_id.clone()],
+        is_follower: false,
     };
     fs::write(
         household_record_path(td.path()),
@@ -484,6 +488,7 @@ fn stale_phase3_marker_cleared_when_record_post_shamir_and_no_staged() {
         shamir_k: 2,
         shamir_n: 2,
         members,
+        is_follower: false,
     };
     fs::write(
         household_record_path(td.path()),
@@ -526,6 +531,7 @@ fn stale_phase3_marker_sweep_skips_pre_shamir_record() {
         shamir_k: 1,
         shamir_n: 1,
         members: vec![m1_id],
+        is_follower: false,
     };
     fs::write(
         household_record_path(td.path()),
@@ -578,6 +584,7 @@ fn recover_partial_phase3_commit_rolls_back_m2_side_full_staged_set() {
         shamir_k: 2,
         shamir_n: 2,
         members: staged_members,
+        is_follower: false,
     };
     fs::write(
         staged_path_for(&household_record_path(td.path())),

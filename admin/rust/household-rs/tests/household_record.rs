@@ -19,6 +19,7 @@ fn fresh_record() -> HouseholdRecord {
         shamir_k: 1,
         shamir_n: 1,
         members: vec![m_id],
+        is_follower: false,
     }
 }
 
@@ -92,4 +93,14 @@ fn duplicate_members_rejected() {
     r.members.push(dup);
     let err = r.validate().unwrap_err();
     assert!(format!("{err}").contains("duplicate"));
+}
+
+#[test]
+fn follower_record_uses_zero_shamir_counts() {
+    let mut r = fresh_record();
+    r.is_follower = true;
+    r.shamir_k = 0;
+    r.shamir_n = 0;
+    r.validate().unwrap();
+    assert!(!r.has_local_household_private_key());
 }

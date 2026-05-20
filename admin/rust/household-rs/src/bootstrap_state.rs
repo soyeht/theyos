@@ -123,7 +123,7 @@ pub enum BootstrapStateError {
 
 // ── Persistence ────────────────────────────────────────────────────────────────
 
-fn state_file_path(state_dir: &Path) -> PathBuf {
+pub(crate) fn state_file_path(state_dir: &Path) -> PathBuf {
     state_dir.join("identity.bootstrap_state")
 }
 

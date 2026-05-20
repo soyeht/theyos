@@ -268,6 +268,10 @@ impl MachineCert {
         }
         validate_hostname(&self.hostname)?;
         // Verify signature over canonical bytes excluding the signature field.
+        verify_signature(hh_pub, &self.signing_bytes()?, &self.signature)
+    }
+
+    pub fn signing_bytes(&self) -> Result<Vec<u8>, HouseholdError> {
         let unsigned = MachineCertUnsigned {
             version: self.version,
             cert_type: self.cert_type.clone(),
@@ -280,8 +284,7 @@ impl MachineCert {
             issued_by: self.issued_by.clone(),
             caveats: self.caveats.clone(),
         };
-        let canonical = cbor::to_canonical_vec(&unsigned)?;
-        verify_signature(hh_pub, &canonical, &self.signature)
+        cbor::to_canonical_vec(&unsigned)
     }
 }
 

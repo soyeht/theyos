@@ -79,6 +79,7 @@ mod tests {
             shamir_k: 1,
             shamir_n: 1,
             members: vec![m_id],
+            is_follower: false,
         };
         let cert = MachineCert::sign(
             &hh,
