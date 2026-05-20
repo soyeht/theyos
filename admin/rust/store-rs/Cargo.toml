@@ -1,6 +1,6 @@
 [package]
 name = "store-rs"
-version = "0.1.15"
+version = "0.1.16"
 edition.workspace = true
 rust-version.workspace = true
 description = "Rust implementation of the theyOS instance store — in-memory with filesystem bootstrap"

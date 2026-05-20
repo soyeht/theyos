@@ -448,6 +448,7 @@ pub async fn bootstrap_household() {
         identity_state.clone(),
         state_dir.clone(),
         Arc::clone(&pair_device_window),
+        port,
     );
     if matches!(
         initial_bootstrap_state,

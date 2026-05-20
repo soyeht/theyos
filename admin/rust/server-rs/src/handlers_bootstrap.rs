@@ -66,6 +66,15 @@ pub struct BootstrapHandlerState {
     /// iPhones (scenario B `AirDrop` flow). Populated by the Bonjour browser task;
     /// consumed by `POST /bootstrap/claim-setup-invitation` (T053).
     pub setup_invitation_cache: SetupInvitationCache,
+    /// The TCP port the engine binds household endpoints on. Used to build
+    /// the `mac_engine_url` advertised in the setup-invitation claim ACK so
+    /// the iPhone can reach `POST /bootstrap/initialize` over Tailnet.
+    pub engine_port: u16,
+    /// Function that returns the engine's local Tailnet IPv4 when one is
+    /// available. Defaults to `tailnet_address::current_tailnet_ipv4` which
+    /// walks `getifaddrs(3)`. Tests inject a deterministic resolver so they
+    /// don't depend on whether the test host is on a Tailnet.
+    pub tailnet_resolver: crate::tailnet_address::TailnetResolver,
 }
 
 pub type BootstrapStateArc = Arc<RwLock<BootstrapState>>;
@@ -77,6 +86,7 @@ impl BootstrapHandlerState {
         household: HouseholdState,
         state_dir: PathBuf,
         pair_device_window: Arc<PairDeviceWindow>,
+        engine_port: u16,
     ) -> Self {
         Self {
             bootstrap,
@@ -85,6 +95,8 @@ impl BootstrapHandlerState {
             pair_device_window,
             started_at: Instant::now(),
             setup_invitation_cache: crate::setup_invitation::new_cache(),
+            engine_port,
+            tailnet_resolver: crate::tailnet_address::current_tailnet_ipv4,
         }
     }
 }
@@ -258,6 +270,14 @@ struct ClaimSetupInvitationAck {
     iphone_endpoint: String,
     owner_display_name: String,
     hh_id: Option<String>,
+    /// `http://<engine-tailnet-ipv4>:<engine-port>` when the engine has a
+    /// Tailscale CGNAT address available. Omitted when no Tailnet address is
+    /// found — the caller (Soyeht.app) keeps whatever URL it would otherwise
+    /// derive from local discovery. Surfacing the Tailnet URL here lets the
+    /// iPhone reach `POST /bootstrap/initialize` over Tailnet, which is
+    /// required to survive the `tailnet_required` source-IP guard.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    mac_engine_url: Option<String>,
 }
 
 fn claim_cbor_error(status: StatusCode, error: &str) -> Response {
@@ -489,10 +509,20 @@ pub async fn post_claim_setup_invitation(
 
     // Entry already removed by cache_take; no separate remove needed.
 
+    // Resolve the engine's OWN Tailnet IPv4 so the ACK steers the iPhone to
+    // a URL whose source IP will pass the `tailnet_required` guard on
+    // `POST /bootstrap/initialize`. Falls back to omitting the field when
+    // no Tailnet address is available — the caller keeps whatever URL it
+    // would otherwise derive from local discovery.
+    let (mac_engine_url, mac_engine_url_source) =
+        crate::tailnet_address::build_mac_engine_url(state.engine_port, state.tailnet_resolver);
+
     tracing::info!(
         stage = "claim_setup_invitation.accepted",
         iphone_endpoint = %entry.iphone_endpoint,
         has_apns_token = apns_token.is_some(),
+        mac_engine_url = mac_engine_url.as_deref().unwrap_or(""),
+        mac_engine_url_source = mac_engine_url_source.as_str(),
     );
 
     cbor_ok(ClaimSetupInvitationAck {
@@ -500,6 +530,7 @@ pub async fn post_claim_setup_invitation(
         iphone_endpoint: entry.iphone_endpoint,
         owner_display_name: entry.owner_display_name,
         hh_id: entry.hh_id,
+        mac_engine_url,
     })
 }
 
@@ -1471,6 +1502,8 @@ mod tests {
             pair_device_window: Arc::new(PairDeviceWindow::new()),
             started_at: Instant::now(),
             setup_invitation_cache: crate::setup_invitation::new_cache(),
+            engine_port: 8091,
+            tailnet_resolver: || None,
         }
     }
 

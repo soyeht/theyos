@@ -83,6 +83,21 @@ fn make_state_dir() -> PathBuf {
     dir
 }
 
+/// Default test resolver returns `None` so `mac_engine_url` is omitted
+/// from the ACK and existing assertions continue to hold.
+fn no_tailnet() -> Option<std::net::Ipv4Addr> {
+    None
+}
+
+/// Test resolver returning Caio's Mac Studio Tailnet address — the same
+/// value the iOS-side `TailnetAddressResolver` produced during the tonight
+/// e2e session. Matches `TailnetResolver`'s fn-pointer signature exactly,
+/// so the body is unconditionally `Some(_)`.
+#[allow(clippy::unnecessary_wraps)]
+fn fixed_tailnet_ip() -> Option<std::net::Ipv4Addr> {
+    Some(std::net::Ipv4Addr::new(100, 103, 149, 48))
+}
+
 fn make_state(bs: BootstrapState, state_dir: PathBuf) -> BootstrapHandlerState {
     BootstrapHandlerState {
         bootstrap: Arc::new(RwLock::new(bs)) as BootstrapStateArc,
@@ -91,6 +106,8 @@ fn make_state(bs: BootstrapState, state_dir: PathBuf) -> BootstrapHandlerState {
         pair_device_window: Arc::new(PairDeviceWindow::new()),
         started_at: Instant::now(),
         setup_invitation_cache: server_rs::setup_invitation::new_cache(),
+        engine_port: 8091,
+        tailnet_resolver: no_tailnet,
     }
 }
 
@@ -266,6 +283,8 @@ struct ClaimAck {
     iphone_endpoint: String,
     owner_display_name: String,
     hh_id: Option<String>,
+    #[serde(default)]
+    mac_engine_url: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -534,6 +553,56 @@ async fn claim_200_persists_invitation_to_disk() {
     assert!(
         persisted.iphone_apns_token.is_none(),
         "no APNs token in request"
+    );
+}
+
+#[tokio::test]
+async fn claim_200_includes_mac_engine_url_when_tailnet_available() {
+    // Inject a deterministic resolver so this test does not depend on the
+    // test host having a real Tailscale interface.
+    let dir = make_state_dir();
+    let mut state = make_state(BootstrapState::Uninitialized, dir);
+    state.engine_port = 8091;
+    state.tailnet_resolver = fixed_tailnet_ip;
+    let token = test_token();
+    let mock_addr = spawn_mock_iphone_ok(token).await;
+    populate_cache(
+        &state,
+        make_entry(token, &mock_addr.to_string(), FAR_FUTURE),
+    )
+    .await;
+
+    let (status, body) = call_claim(state, cbor_claim(&token)).await;
+    assert_eq!(status, StatusCode::OK, "unexpected body: {body:?}");
+    let ack = decode_ack(&body);
+    assert_eq!(
+        ack.mac_engine_url.as_deref(),
+        Some("http://100.103.149.48:8091"),
+        "engine must steer iPhone to its OWN Tailnet IPv4 + bound port",
+    );
+}
+
+#[tokio::test]
+async fn claim_200_omits_mac_engine_url_when_no_tailnet() {
+    // Default resolver in `make_state` returns None — ACK must omit the field
+    // so the Soyeht.app keeps its existing local-discovery URL.
+    let dir = make_state_dir();
+    let state = make_state(BootstrapState::Uninitialized, dir);
+    let token = test_token();
+    let mock_addr = spawn_mock_iphone_ok(token).await;
+    populate_cache(
+        &state,
+        make_entry(token, &mock_addr.to_string(), FAR_FUTURE),
+    )
+    .await;
+
+    let (status, body) = call_claim(state, cbor_claim(&token)).await;
+    assert_eq!(status, StatusCode::OK);
+    let ack = decode_ack(&body);
+    assert!(
+        ack.mac_engine_url.is_none(),
+        "mac_engine_url must be omitted when engine has no Tailnet IP, got {:?}",
+        ack.mac_engine_url,
     );
 }
 
