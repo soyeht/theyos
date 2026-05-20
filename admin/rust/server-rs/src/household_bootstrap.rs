@@ -353,6 +353,15 @@ pub async fn bootstrap_household() {
                 state_dir.clone(),
                 key_policy,
             );
+            let sign_machine_cert_state =
+                crate::handlers_sign_machine_cert::SignMachineCertRouterState {
+                    household: identity_state.clone(),
+                    event_log: Arc::clone(&pair_machine_state.event_log),
+                };
+            let sign_machine_cert_router =
+                crate::handlers_sign_machine_cert::sign_machine_cert_router(
+                    sign_machine_cert_state,
+                );
             // Spawn the runtime owner-timeout watchdog (FR-019 active
             // half: the in-process counterpart to load_state_dir's
             // boot recovery).
@@ -412,7 +421,8 @@ pub async fn bootstrap_household() {
                                 axum::routing::post(handlers_owner_events::owner_decline_handler),
                             )
                             .with_state(owner_events_state),
-                    ),
+                    )
+                    .merge(sign_machine_cert_router),
             )
         }
         Err(e) => {

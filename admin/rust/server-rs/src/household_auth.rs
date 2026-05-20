@@ -18,6 +18,12 @@ pub struct SoyehtPoP {
     pub signature: P256Signature,
 }
 
+#[derive(Clone)]
+pub struct AuthorizedRequest {
+    pub owner_auth: Arc<HouseholdAuthState>,
+    pub actor_person_id: String,
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum AuthError {
     #[error("missing proof")]
@@ -30,6 +36,8 @@ pub enum AuthError {
     IdentityUnavailable,
     #[error("owner auth state is unavailable")]
     OwnerAuthUnavailable,
+    #[error("signer is not a household member")]
+    NotAMember,
     #[error("certificate rejected")]
     CertRejected,
     #[error("signature rejected")]
@@ -78,6 +86,20 @@ pub async fn authorize_request(
     operation: Operation,
     now: u64,
 ) -> Result<Arc<HouseholdAuthState>, AuthError> {
+    authorize_request_with_actor(state, headers, method, path_and_query, body, operation, now)
+        .await
+        .map(|authorized| authorized.owner_auth)
+}
+
+pub async fn authorize_request_with_actor(
+    state: &HouseholdState,
+    headers: &HeaderMap,
+    method: &Method,
+    path_and_query: &str,
+    body: &[u8],
+    operation: Operation,
+    now: u64,
+) -> Result<AuthorizedRequest, AuthError> {
     let pop = SoyehtPoP::parse(headers).inspect_err(log_rejected)?;
     let skew = now.abs_diff(pop.timestamp);
     if skew > TIMESTAMP_TOLERANCE_SECS {
@@ -100,8 +122,8 @@ pub async fn authorize_request(
             .as_bytes()
             .ct_eq(pop.p_id.as_bytes()),
     ) {
-        log_rejected(&AuthError::CertRejected);
-        return Err(AuthError::CertRejected);
+        log_rejected(&AuthError::NotAMember);
+        return Err(AuthError::NotAMember);
     }
     owner_auth
         .owner_person_cert
@@ -125,7 +147,10 @@ pub async fn authorize_request(
         p_id = %pop.p_id,
         operation = %operation,
     );
-    Ok(owner_auth)
+    Ok(AuthorizedRequest {
+        owner_auth,
+        actor_person_id: pop.p_id,
+    })
 }
 
 fn log_rejected(err: &AuthError) {

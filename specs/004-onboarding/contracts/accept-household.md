@@ -71,6 +71,10 @@ Endpoint: `POST /bootstrap/accept-household/confirm`
 State gate: accepted only when `BootstrapState` is `ready_for_naming` and a
 pending accept-household record exists. Otherwise return `409`.
 
+When the iPhone is acting as proxy for a follower household, it MAY obtain
+`machine_cert` and `challenge_signature` from an existing member engine via
+`POST /api/v1/household/sign-machine-cert`.
+
 Request:
 
 ```cbor

@@ -43,6 +43,8 @@ pub enum OwnerEventType {
     JoinRequest,
     MachineJoined,
     JoinCancelled,
+    #[serde(rename = "sign_machine_cert_for_proxy")]
+    SignMachineCertForProxy,
 }
 
 /// Polymorphic event payload. Variant is chosen by `OwnerEvent.type`.
@@ -52,6 +54,7 @@ pub enum OwnerEventPayload {
     JoinRequest(JoinRequestPayload),
     MachineJoined(MachineJoinedPayload),
     JoinCancelled(JoinCancelledPayload),
+    SignMachineCertForProxy(SignMachineCertForProxyPayload),
 }
 
 impl OwnerEventPayload {
@@ -61,6 +64,10 @@ impl OwnerEventPayload {
             (Self::JoinRequest(_), OwnerEventType::JoinRequest)
                 | (Self::MachineJoined(_), OwnerEventType::MachineJoined)
                 | (Self::JoinCancelled(_), OwnerEventType::JoinCancelled)
+                | (
+                    Self::SignMachineCertForProxy(_),
+                    OwnerEventType::SignMachineCertForProxy,
+                )
         )
     }
 }
@@ -87,6 +94,16 @@ pub struct MachineJoinedPayload {
 pub struct JoinCancelledPayload {
     pub m_pub: ByteBuf,
     pub reason: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SignMachineCertForProxyPayload {
+    pub actor_person_id: String,
+    pub target_m_id: String,
+    pub joined_at: u64,
+    pub hostname: String,
+    pub platform: String,
 }
 
 /// Append-log entry per `data-model.md::OwnerEvent`.
