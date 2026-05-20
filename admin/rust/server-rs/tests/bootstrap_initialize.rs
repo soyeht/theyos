@@ -60,6 +60,10 @@ fn make_state_dir() -> PathBuf {
     dir
 }
 
+fn no_tailnet() -> Option<std::net::Ipv4Addr> {
+    None
+}
+
 fn make_state(bs: BootstrapState, state_dir: PathBuf) -> BootstrapHandlerState {
     BootstrapHandlerState {
         bootstrap: Arc::new(RwLock::new(bs)) as BootstrapStateArc,
@@ -68,6 +72,8 @@ fn make_state(bs: BootstrapState, state_dir: PathBuf) -> BootstrapHandlerState {
         pair_device_window: Arc::new(PairDeviceWindow::new()),
         started_at: Instant::now(),
         setup_invitation_cache: server_rs::setup_invitation::new_cache(),
+        engine_port: 8091,
+        tailnet_resolver: no_tailnet,
     }
 }
 

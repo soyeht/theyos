@@ -77,6 +77,8 @@ fn make_bootstrap_state(bs: BootstrapState, state_dir: PathBuf) -> BootstrapHand
         pair_device_window: Arc::new(PairDeviceWindow::new()),
         started_at: Instant::now(),
         setup_invitation_cache: server_rs::setup_invitation::new_cache(),
+        engine_port: 8091,
+        tailnet_resolver: || None,
     }
 }
 
@@ -256,6 +258,8 @@ async fn scenario_b_full_happy_path() {
         pair_device_window: Arc::new(PairDeviceWindow::new()),
         started_at: Instant::now(),
         setup_invitation_cache: server_rs::setup_invitation::new_cache(),
+        engine_port: 8091,
+        tailnet_resolver: || None,
     };
     let (status, body) = {
         let app = bootstrap_router(state.clone());
@@ -437,6 +441,8 @@ async fn scenario_b_second_claim_after_initialize_returns_409() {
         pair_device_window: Arc::new(PairDeviceWindow::new()),
         started_at: Instant::now(),
         setup_invitation_cache: server_rs::setup_invitation::new_cache(),
+        engine_port: 8091,
+        tailnet_resolver: || None,
     };
 
     // Claim and initialize to advance state.

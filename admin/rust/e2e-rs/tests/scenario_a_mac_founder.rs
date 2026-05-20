@@ -57,6 +57,8 @@ fn bootstrap_app(
         pair_device_window: Arc::clone(&pdw),
         started_at: Instant::now(),
         setup_invitation_cache: server_rs::setup_invitation::new_cache(),
+        engine_port: 8091,
+        tailnet_resolver: || None,
     };
     bootstrap_router(state)
 }

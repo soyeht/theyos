@@ -1,6 +1,6 @@
 [package]
 name = "claw-autoupdate-rs"
-version = "0.1.15"
+version = "0.1.16"
 edition.workspace = true
 rust-version.workspace = true
 description = "theyOS claw autoupdate — replaces scripts/claw-autoupdate.sh and claws/scripts/autoupdate.sh"

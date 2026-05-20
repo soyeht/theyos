@@ -1,6 +1,6 @@
 [package]
 name = "vmrunner-macos-rs"
-version = "0.1.15"
+version = "0.1.16"
 edition.workspace = true
 rust-version.workspace = true
 description = "macOS VM runner using Apple Virtualization Framework"

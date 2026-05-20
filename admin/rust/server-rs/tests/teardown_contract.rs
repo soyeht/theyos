@@ -143,6 +143,8 @@ fn make_fixture_no_auth(bs: BootstrapState) -> (Fixture, Router) {
         pair_device_window: Arc::new(PairDeviceWindow::new()),
         started_at: Instant::now(),
         setup_invitation_cache: server_rs::setup_invitation::new_cache(),
+        engine_port: 8091,
+        tailnet_resolver: || None,
     };
 
     let app = bootstrap_router(handler_state);
@@ -225,6 +227,8 @@ fn make_fixture(bs: BootstrapState) -> (Fixture, Router) {
         pair_device_window: Arc::new(PairDeviceWindow::new()),
         started_at: Instant::now(),
         setup_invitation_cache: server_rs::setup_invitation::new_cache(),
+        engine_port: 8091,
+        tailnet_resolver: || None,
     };
 
     let app = bootstrap_router(handler_state);
