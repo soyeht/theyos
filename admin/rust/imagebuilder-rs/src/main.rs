@@ -29,15 +29,15 @@
 //! | `FIRECRACKER_SSH_KEY`             | `~/firecracker/assets/ubuntu-24.04-root.id_rsa` |
 //! | `SLIRP4NETNS_BIN`                 | auto-resolved                         |
 
-mod build;
+mod imagebuild;
 
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
 use clap::{Parser, Subcommand};
 
-use build::artifacts::{all_claws, file_size_human, golden_image_path, image_age_days};
-use build::runner::{BuildContext, build_golden_image, stale_reason, verify_golden_image};
+use imagebuild::artifacts::{all_claws, file_size_human, golden_image_path, image_age_days};
+use imagebuild::runner::{BuildContext, build_golden_image, stale_reason, verify_golden_image};
 
 // ── CLI ───────────────────────────────────────────────────────────────────────
 
@@ -317,7 +317,7 @@ async fn cmd_verify(targets: &[&str], ctx: &BuildContext) -> bool {
             Err(e) => {
                 // Collapse the multi-line BuildError to a single-line reason so
                 // downstream parsers can `.lines().find(...)` easily.
-                let reason = e.to_string().replace('\n', " ¶ ");
+                let reason: String = ToString::to_string(&e).replace('\n', " ¶ ");
                 println!("VERIFY_FAIL:{claw}:{reason}");
                 ok = false;
             }
@@ -423,7 +423,7 @@ fn cmd_dag_check(targets: &[&str], ctx: &BuildContext) {
     let mut results: BTreeMap<&str, serde_json::Value> = BTreeMap::new();
 
     for &claw in targets {
-        let reason = build::runner::stale_reason_dag(claw, ctx);
+        let reason = imagebuild::runner::stale_reason_dag(claw, ctx);
         let current_meta = core_rs::artifact_meta::read_current_golden_meta(&ctx.assets_dir, claw);
         let fp = current_meta
             .as_ref()
@@ -431,7 +431,7 @@ fn cmd_dag_check(targets: &[&str], ctx: &BuildContext) {
 
         let entry = serde_json::json!({
             "stale": reason.is_some(),
-            "reason": reason.map(|r| r.to_string()),
+            "reason": reason.map(|r: core_rs::artifact_meta::StaleReason| r.to_string()),
             "fingerprint": fp,
         });
         results.insert(claw, entry);
@@ -784,7 +784,7 @@ mod tests {
         // (cmd_dag_check prints to stdout, which is hard to capture in-process,
         //  so test the underlying logic instead.)
         for claw in &all_claws() {
-            let reason = build::runner::stale_reason_dag(claw, &ctx);
+            let reason = imagebuild::runner::stale_reason_dag(claw, &ctx);
             assert!(
                 reason.is_some(),
                 "{claw} should be stale when nothing exists"
@@ -847,7 +847,7 @@ mod tests {
             repo_root: d.path().to_path_buf(),
         };
 
-        let reason = build::runner::stale_reason_dag(claw, &ctx);
+        let reason = imagebuild::runner::stale_reason_dag(claw, &ctx);
         assert!(
             reason.is_none(),
             "nullclaw should be fresh, got: {reason:?}"

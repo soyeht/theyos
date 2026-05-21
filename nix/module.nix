@@ -386,10 +386,19 @@ in
     ];
 
     # Firewall.
+    #
+    # UDP 5353 is open for mDNS/Bonjour multicast (FR-017) — the household
+    # engine publishes `_soyeht-household._tcp.local.` and
+    # `_soyeht-setup._tcp.local.` records that iPhone/Mac discover via
+    # NWBrowser. Without 5353 open, queries from peers on the same LAN are
+    # silently dropped by the default NixOS firewall and discovery fails
+    # (confirmed via `tcpdump -i any udp port 5353` showing 0 incoming
+    # packets on devs 2026-05-20).
     networking.firewall = {
       enable = lib.mkDefault true;
       allowedTCPPorts = [ 80 443 22 cfg.adminPort cfg.householdPort ];
-      allowedUDPPorts = lib.optional cfg.tailscale.enable config.services.tailscale.port;
+      allowedUDPPorts = [ 5353 ]
+        ++ lib.optional cfg.tailscale.enable config.services.tailscale.port;
       trustedInterfaces = lib.optional cfg.tailscale.enable "tailscale0";
     };
 

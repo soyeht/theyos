@@ -384,7 +384,21 @@ pub fn spawn_setup_invitation_browser_with_cache(
                 );
                 continue;
             }
-            let addrs = resolved.addresses().iter().copied().collect::<Vec<_>>();
+            // Include the publisher's self-reported `tailnet_addr` in the
+            // cached address set so `validate_initialize_source` accepts the
+            // iPhone connecting from its Tailscale CGNAT IP. The mDNSResponder
+            // resolution gives only LAN/link-local addresses (per the comment
+            // above), which makes the source-IP guard reject otherwise-valid
+            // Tailnet POSTs to `/bootstrap/initialize`. (Confirmed live-debug
+            // 2026-05-20: rejected `src_ip:100.66.202.16` with
+            // `iphone_addrs:[192.168.15.7, ...]` when the TXT carried
+            // `tailnet_addr=100.66.202.16`.)
+            let mut addrs = resolved.addresses().iter().copied().collect::<Vec<_>>();
+            if let Some(tailnet_ip) = txt_tailnet_hint {
+                if !addrs.contains(&tailnet_ip) {
+                    addrs.push(tailnet_ip);
+                }
+            }
             let txt = |key: &str| resolved.txt(key).map(str::to_string);
             if let Some(entry) = setup_invitation::cache_setup_txt(
                 &cache,

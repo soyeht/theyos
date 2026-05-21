@@ -168,8 +168,26 @@ impl PairToken {
     /// SEC1 public key, base64url-encoded) so the scanning device can verify
     /// the household identity before generating its own keypair and posting
     /// to `/pair-device/confirm`. `ttl` is the unix-seconds expiry timestamp.
+    ///
+    /// The optional `host` argument is included as `&host=<ip-or-hostname>:<port>`
+    /// when the engine knows a reachable endpoint at QR-render time (the
+    /// Tailnet IPv4 + bound port). This is a fallback for peers whose Bonjour
+    /// implementation does not interoperate with macOS/iOS `NWBrowser`
+    /// (observed on Linux's `mdns-sd` 0.10/0.13 crates which fail to emit
+    /// announcement records). When `host` is present the scanning device
+    /// MAY skip Bonjour browse and connect directly; when absent the device
+    /// MUST discover via Bonjour as before. The field is non-critical so
+    /// older scanners ignore it without error.
     #[must_use]
     pub fn to_uri(&self, hh_pub: &P256PublicKey) -> String {
+        self.to_uri_with_host(hh_pub, None)
+    }
+
+    /// As [`Self::to_uri`] but also includes a `host=<addr>:<port>` fallback
+    /// query parameter when `host` is `Some`. See [`Self::to_uri`] for the
+    /// rationale.
+    #[must_use]
+    pub fn to_uri_with_host(&self, hh_pub: &P256PublicKey, host: Option<&str>) -> String {
         let mut uri = String::from("soyeht://household/pair-device");
         uri.push_str("?v=1");
         uri.push_str("&hh_pub=");
@@ -182,8 +200,30 @@ impl PairToken {
             uri.push_str("&p_id=");
             uri.push_str(&p.0);
         }
+        if let Some(h) = host {
+            uri.push_str("&host=");
+            uri.push_str(&percent_encode_host(h));
+        }
         uri
     }
+}
+
+fn percent_encode_host(host: &str) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::with_capacity(host.len());
+    for b in host.as_bytes() {
+        match b {
+            b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b':' => {
+                out.push(*b as char);
+            }
+            _ => {
+                // write! into String is infallible, so swallowing the Result
+                // matches the previous push_str(&format!(...)) semantics.
+                let _ = write!(out, "%{b:02X}");
+            }
+        }
+    }
+    out
 }
 
 fn unix_now_secs() -> Result<u64, String> {

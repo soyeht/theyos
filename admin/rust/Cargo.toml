@@ -84,7 +84,7 @@ keyring       = { version = "3", features = ["linux-native"] }
 data-encoding = "2"
 zeroize       = { version = "1", features = ["derive"] }
 subtle        = "2"
-mdns-sd       = "0.10"
+mdns-sd       = "0.13"
 gethostname   = "0.5"
 if-addrs      = "0.10"
 hex           = "0.4"

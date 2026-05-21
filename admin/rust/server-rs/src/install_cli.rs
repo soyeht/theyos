@@ -221,13 +221,25 @@ async fn emit_fresh_pair_device_window(state_dir: &Path, hh_pub: &P256PublicKey)
             return 1;
         }
     };
-    let uri = token.to_uri(hh_pub);
+    // Include a Tailnet host fallback in the URI so peers whose Bonjour
+    // implementation does not interoperate with the engine's mDNS publisher
+    // (observed cross-platform with `mdns-sd` 0.10/0.13 → macOS/iOS
+    // NWBrowser) can connect directly. Bonjour discovery remains the gold
+    // path when it works; the `host` field is consulted as a fallback only.
+    let port: u16 = std::env::var("THEYOS_HOUSEHOLD_PORT")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(8091);
+    let host_fallback = crate::tailnet_address::current_tailnet_ipv4()
+        .map(|ip| format!("{ip}:{port}"));
+    let uri = token.to_uri_with_host(hh_pub, host_fallback.as_deref());
 
     info!(
         stage = "pair_device_window.opened",
         source = "install",
         ttl_secs = ttl.as_secs(),
         expires_at_unix = token.expires_at_unix,
+        host_fallback = host_fallback.as_deref().unwrap_or(""),
     );
 
     let qr = match household_rs::qr_render::render_ansi_qr(&uri) {
