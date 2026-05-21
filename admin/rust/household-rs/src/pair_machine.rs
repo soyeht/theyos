@@ -1717,7 +1717,7 @@ pub enum CandidateError {
     BadHostname(usize),
     #[error("join request validation failed: {0}")]
     JoinRequest(#[from] JoinError),
-    #[error("ttl must be 1..=300 seconds; got {0}")]
+    #[error("ttl must be 1..=3600 seconds; got {0}")]
     BadTtl(u64),
     #[error("bootstrap error: {0}")]
     Bootstrap(#[from] crate::error::BootstrapError),
@@ -1748,8 +1748,13 @@ pub async fn prepare_candidate(
     }
     validate_join_hostname(&opts.hostname)?;
     validate_join_addr(&opts.addr)?;
+    // Upper bound widened from 300 to 3600 to support operator-driven
+    // e2e validation walks that exceed the production budget. Production
+    // callers still pass 300s by default; only opt-in env-var overrides
+    // (THEYOS_PAIR_MACHINE_TTL_SECS) reach values above 300. Same
+    // rationale and upper bound as the pair-device window.
     let ttl_secs = opts.ttl.as_secs();
-    if ttl_secs == 0 || ttl_secs > 300 {
+    if ttl_secs == 0 || ttl_secs > 3600 {
         return Err(CandidateError::BadTtl(ttl_secs));
     }
 
