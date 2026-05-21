@@ -20,6 +20,7 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{get, post},
 };
+use household_rs::bootstrap_state::{self, BootstrapState};
 use household_rs::caveats::Operation;
 use household_rs::owner_events::{
     JoinRequestPayload, OwnerEventLog, OwnerEventPayload, OwnerEventType, OwnerEventsBroadcaster,
@@ -930,6 +931,13 @@ pub async fn local_finalize_handler(
             error = %e,
         );
         return unauthenticated_response();
+    }
+    if let Err(e) = bootstrap_state::persist(&state.state_dir, BootstrapState::Ready) {
+        tracing::warn!(
+            stage = "pair_machine.local_finalize.bootstrap_state_persist_failed",
+            error = %e,
+            hint = "candidate identity committed; bootstrap status may remain stale until repaired",
+        );
     }
     // T064: failure-injection crash point — fires after M2's
     // staged.commit() but BEFORE the FinalizeAck reaches M1. A
