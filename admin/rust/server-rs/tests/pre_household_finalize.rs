@@ -226,6 +226,10 @@ async fn local_finalize_commits_candidate_state() {
     assert_eq!(self_cert.m_id.to_string(), m2_id);
     assert!(household_record_path(f.m2_dir.path()).exists());
     assert!(household_rs::pair_machine::shamir_self_shard_path(f.m2_dir.path()).exists());
+    assert_eq!(
+        household_rs::bootstrap_state::load(f.m2_dir.path()).unwrap(),
+        household_rs::bootstrap_state::BootstrapState::Ready
+    );
     assert_eq!(f.window.snapshot().await.state, PairMachineState::Committed);
     assert!(!household_rs::storage::legacy_machine_cert_path(f.m2_dir.path()).exists());
 }
