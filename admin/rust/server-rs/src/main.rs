@@ -803,10 +803,7 @@ async fn main() {
             "/llm/providers/{id}/test",
             post(server_rs::handlers_llm::handle_test_provider),
         )
-        .route(
-            "/llm/audit",
-            get(server_rs::handlers_llm::handle_get_audit),
-        )
+        .route("/llm/audit", get(server_rs::handlers_llm::handle_get_audit))
         // Terminals (non-streaming)
         .route(
             "/terminals/containers",

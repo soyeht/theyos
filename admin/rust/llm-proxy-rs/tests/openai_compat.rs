@@ -8,9 +8,7 @@ use serde_json::json;
 use wiremock::matchers::{header, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
-async fn collect_stream(
-    mut response: ChatResponse,
-) -> String {
+async fn collect_stream(mut response: ChatResponse) -> String {
     let ChatResponse::Stream(ref mut stream) = response else {
         panic!("expected stream response");
     };
@@ -98,8 +96,14 @@ async fn streams_sse_chunks_verbatim() {
 
     let response = provider.chat(&req, true).await.unwrap();
     let collected = collect_stream(response).await;
-    assert!(collected.contains("data: {"), "missing chunk start: {collected}");
-    assert!(collected.contains("[DONE]"), "missing terminator: {collected}");
+    assert!(
+        collected.contains("data: {"),
+        "missing chunk start: {collected}"
+    );
+    assert!(
+        collected.contains("[DONE]"),
+        "missing terminator: {collected}"
+    );
 }
 
 #[tokio::test]

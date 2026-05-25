@@ -78,11 +78,7 @@ fn file_and_system_backends_do_not_share_storage() {
     let system_store = build_credential_store(&cfg_system);
     let res = system_store.get("llm.api_key.isolated");
     assert!(
-        res.is_err()
-            || res
-                .as_ref()
-                .ok()
-                .is_some_and(|v| v != b"file-only"),
+        res.is_err() || res.as_ref().ok().is_some_and(|v| v != b"file-only"),
         "file backend value must NOT be readable through the system backend"
     );
 }

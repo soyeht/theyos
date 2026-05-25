@@ -131,7 +131,12 @@ pub async fn run(args: &[String]) -> i32 {
     if reissue_pair_qr {
         return match household_rs::try_load_existing(&state_dir, key_policy) {
             Ok(Some(loaded)) => {
-                emit_fresh_pair_device_window(&state_dir, &loaded.record.hh_pub).await
+                emit_fresh_pair_device_window(
+                    &state_dir,
+                    &loaded.record.hh_pub,
+                    Some(&loaded.record.name),
+                )
+                .await
             }
             Ok(None) => {
                 eprintln!(
@@ -177,7 +182,12 @@ pub async fn run(args: &[String]) -> i32 {
                         hh_id = %loaded.record.hh_id,
                         name = %loaded.record.name,
                     );
-                    emit_fresh_pair_device_window(&state_dir, &loaded.record.hh_pub).await
+                    emit_fresh_pair_device_window(
+                        &state_dir,
+                        &loaded.record.hh_pub,
+                        Some(&loaded.record.name),
+                    )
+                    .await
                 }
                 Err(e) => {
                     household_rs::bootstrap::log_error(&e);
@@ -210,7 +220,11 @@ fn print_usage() {
 /// Mint a fresh pair-receiving window, persist it via `PairDeviceWindow`, and
 /// render the QR to stdout. Returns a process exit code (0 on success,
 /// 1 on render failure).
-async fn emit_fresh_pair_device_window(state_dir: &Path, hh_pub: &P256PublicKey) -> i32 {
+async fn emit_fresh_pair_device_window(
+    state_dir: &Path,
+    hh_pub: &P256PublicKey,
+    household_name: Option<&str>,
+) -> i32 {
     // Pair-device QR window TTL. Production default is 5 minutes — short
     // enough that a leaked QR doesn't sit valid in chat logs / screenshots
     // for hours. Operators running validation pass overrides via env var
@@ -243,9 +257,9 @@ async fn emit_fresh_pair_device_window(state_dir: &Path, hh_pub: &P256PublicKey)
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(8091);
-    let host_fallback = crate::tailnet_address::current_tailnet_ipv4()
-        .map(|ip| format!("{ip}:{port}"));
-    let uri = token.to_uri_with_host(hh_pub, host_fallback.as_deref());
+    let host_fallback =
+        crate::tailnet_address::current_tailnet_ipv4().map(|ip| format!("{ip}:{port}"));
+    let uri = token.to_uri_with_host_and_name(hh_pub, host_fallback.as_deref(), household_name);
 
     info!(
         stage = "pair_device_window.opened",

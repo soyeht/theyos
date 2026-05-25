@@ -92,11 +92,15 @@ fn catalog_base_urls_are_well_formed() {
         );
         // Strip scheme and verify there's a host segment before the first /.
         let after_scheme = entry
-            .default_base_url.split_once("://").map(|x| x.1)
+            .default_base_url
+            .split_once("://")
+            .map(|x| x.1)
             .unwrap_or("");
         let host = after_scheme.split('/').next().unwrap_or("");
         assert!(
-            !host.is_empty() && host.contains('.') || host == "127.0.0.1" || host.starts_with("localhost"),
+            !host.is_empty() && host.contains('.')
+                || host == "127.0.0.1"
+                || host.starts_with("localhost"),
             "catalog {} base URL has no recognisable host: {}",
             entry.id,
             entry.default_base_url

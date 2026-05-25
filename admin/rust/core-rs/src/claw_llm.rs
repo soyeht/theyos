@@ -1246,7 +1246,9 @@ mod tests {
             "render_pty_shell must emit model:\n{shell}",
         );
         assert!(
-            shell.contains("export THEYOS_LLM_OPENAI_BASE_URL='http://127.0.0.1:18900/v1/c/hermes-agent';"),
+            shell.contains(
+                "export THEYOS_LLM_OPENAI_BASE_URL='http://127.0.0.1:18900/v1/c/hermes-agent';"
+            ),
             "render_pty_shell must stamp the per-claw routing URL for proxy provider:\n{shell}",
         );
 

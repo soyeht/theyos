@@ -153,9 +153,7 @@ impl ProxyConfig {
         let profile_dir = if let Ok(dir) = std::env::var(ENV_PROFILE_DIR) {
             PathBuf::from(dir)
         } else {
-            let home = std::env::var("HOME")
-                .map(PathBuf::from)
-                .unwrap_or_default();
+            let home = std::env::var("HOME").map(PathBuf::from).unwrap_or_default();
             home.join(".theyos").join("llm-profiles")
         };
 
@@ -163,9 +161,7 @@ impl ProxyConfig {
             Ok(raw) if raw.trim().is_empty() => None,
             Ok(raw) => Some(PathBuf::from(raw)),
             Err(_) => {
-                let home = std::env::var("HOME")
-                    .map(PathBuf::from)
-                    .unwrap_or_default();
+                let home = std::env::var("HOME").map(PathBuf::from).unwrap_or_default();
                 Some(home.join(".theyos").join(".run").join("llm-audit.log"))
             }
         };
@@ -174,9 +170,7 @@ impl ProxyConfig {
         let keystore_dir = if let Ok(dir) = std::env::var(ENV_KEYSTORE_DIR) {
             PathBuf::from(dir)
         } else {
-            let home = std::env::var("HOME")
-                .map(PathBuf::from)
-                .unwrap_or_default();
+            let home = std::env::var("HOME").map(PathBuf::from).unwrap_or_default();
             home.join(".theyos").join("keystore")
         };
 

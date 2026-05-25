@@ -166,7 +166,9 @@ pub fn build_provider_registry(
             ProviderKind::AnthropicApi => {
                 let api_key = api_key.ok_or_else(|| ProxyError::Credential {
                     provider: id.clone(),
-                    hint: "anthropic-api needs a credential — set credential_account in the profile".into(),
+                    hint:
+                        "anthropic-api needs a credential — set credential_account in the profile"
+                            .into(),
                 })?;
                 Arc::new(AnthropicApiProvider::new(
                     id,
@@ -273,10 +275,7 @@ pub fn build_credential_store(config: &ProxyConfig) -> Arc<dyn KeystoreBackend> 
                 dir = %config.keystore_dir.display(),
                 "keystore: TPM2-sealed (systemd-creds)"
             );
-            Arc::new(TpmKeystore::new(
-                &config.keystore_dir,
-                keystore_rs::SERVICE,
-            ))
+            Arc::new(TpmKeystore::new(&config.keystore_dir, keystore_rs::SERVICE))
         }
         #[cfg(not(target_os = "linux"))]
         KeystoreKind::Tpm => {

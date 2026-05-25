@@ -17,8 +17,8 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use futures_util::{StreamExt, TryStreamExt};
-use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderValue};
 use reqwest::Client;
+use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderValue};
 use serde_json::Value;
 
 use crate::error::ProxyError;

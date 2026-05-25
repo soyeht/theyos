@@ -20,7 +20,9 @@ use serde_bytes::ByteBuf;
 use server_rs::bonjour_publisher::{HouseholdBonjour, PairMachineBonjourRole, PublishParams};
 use server_rs::handlers_bootstrap::{BootstrapHandlerState, BootstrapStateArc, bootstrap_router};
 use server_rs::household_state::HouseholdState;
-use server_rs::setup_invitation::{SetupInvitationEntry, cache_insert, cache_lookup};
+use server_rs::setup_invitation::{
+    SetupInvitationEntry, cache_insert, cache_lookup, persist_invitation,
+};
 use tokio::sync::RwLock;
 use tower::ServiceExt;
 
@@ -384,6 +386,40 @@ async fn accept_404_on_unknown_invitation_token() {
     .await;
     assert_eq!(status, StatusCode::NOT_FOUND);
     assert_eq!(decode_err(&body).error, "invitation_not_found");
+}
+
+#[tokio::test]
+async fn accept_uses_persisted_invitation_after_claim_consumed_cache() {
+    set_test_env("THEYOS_FORCE_SOFTWARE_KEYS", "1");
+    let hh_key = P256Keypair::generate();
+    let hh_pub = hh_key.public();
+    let hh_id = derive_household_id(&hh_pub).to_string();
+    let state_dir = make_state_dir();
+    let state = make_state(BootstrapState::Uninitialized, state_dir.clone());
+    let invite = token(12);
+    let entry = SetupInvitationEntry {
+        token: invite,
+        iphone_endpoint: "127.0.0.1:9".to_string(),
+        iphone_addrs: vec!["100.64.1.1".parse().unwrap()],
+        owner_display_name: "Owner".to_string(),
+        hh_id: Some(hh_id.clone()),
+        expires_at: unix_now() + 1800,
+    };
+    persist_invitation(&state_dir, &entry, None).expect("persist invitation");
+
+    let (status, body) = call_accept(
+        state.clone(),
+        cbor_accept(&hh_id, hh_pub.as_bytes(), "Home", &invite),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK, "body: {body:?}");
+    let accept = decode_accept_ok(&body);
+    assert_eq!(accept.version, 1);
+    assert_eq!(
+        *state.bootstrap.read().await,
+        BootstrapState::ReadyForNaming
+    );
 }
 
 #[tokio::test]

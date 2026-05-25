@@ -66,10 +66,7 @@ impl AuditLogger {
                 std::fs::create_dir_all(parent)?;
             }
         }
-        let file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(path)?;
+        let file = OpenOptions::new().create(true).append(true).open(path)?;
         Ok(Self {
             inner: Some(Arc::new(AuditInner {
                 path: path.to_path_buf(),
@@ -402,8 +399,14 @@ mod tests {
         // to keep the log file small and grep-friendly.
         assert!(!json.contains("claw_type"), "claw_type leaked: {json}");
         assert!(!json.contains("error_kind"), "error_kind leaked: {json}");
-        assert!(!json.contains("input_tokens"), "input_tokens leaked: {json}");
-        assert!(!json.contains("output_tokens"), "output_tokens leaked: {json}");
+        assert!(
+            !json.contains("input_tokens"),
+            "input_tokens leaked: {json}"
+        );
+        assert!(
+            !json.contains("output_tokens"),
+            "output_tokens leaked: {json}"
+        );
     }
 
     #[test]
@@ -444,6 +447,9 @@ mod tests {
             .unwrap()
             .as_secs();
         let (y, _, _, _, _, _) = epoch_to_ymdhms(now_secs);
-        assert!((2024..3000).contains(&y), "wall-clock year out of bounds: {y}");
+        assert!(
+            (2024..3000).contains(&y),
+            "wall-clock year out of bounds: {y}"
+        );
     }
 }

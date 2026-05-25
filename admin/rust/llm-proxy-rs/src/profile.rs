@@ -353,11 +353,7 @@ impl ProfileDoc {
         // Also clear the active block if it referenced the deleted
         // provider — otherwise the next request would 503 with
         // `proxy.no_provider`. Leaving active orphaned is a footgun.
-        if doc
-            .active
-            .as_ref()
-            .is_some_and(|a| a.provider == id)
-        {
+        if doc.active.as_ref().is_some_and(|a| a.provider == id) {
             doc.active = None;
         }
         doc.save_to(&path)?;
@@ -389,15 +385,16 @@ impl ProfileDoc {
             .active
             .as_ref()
             .ok_or_else(|| ProxyError::NoProvider(String::new()))?;
-        let provider = self.providers.get(&active.provider).ok_or_else(|| {
-            ProxyError::UnknownProvider {
-                provider: active.provider.clone(),
-                hint: format!(
-                    "profile has no [providers.{}] table; configure it via the admin API",
-                    active.provider,
-                ),
-            }
-        })?;
+        let provider =
+            self.providers
+                .get(&active.provider)
+                .ok_or_else(|| ProxyError::UnknownProvider {
+                    provider: active.provider.clone(),
+                    hint: format!(
+                        "profile has no [providers.{}] table; configure it via the admin API",
+                        active.provider,
+                    ),
+                })?;
         Ok((&active.provider, provider, &active.model))
     }
 }

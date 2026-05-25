@@ -8,17 +8,11 @@ use keystore_rs::KeystoreError;
 #[test]
 fn error_kinds_are_stable() {
     assert_eq!(
-        KeystoreError::Unavailable {
-            hint: "x".into()
-        }
-        .kind(),
+        KeystoreError::Unavailable { hint: "x".into() }.kind(),
         "keystore.unavailable"
     );
     assert_eq!(
-        KeystoreError::PermissionDenied {
-            hint: "x".into()
-        }
-        .kind(),
+        KeystoreError::PermissionDenied { hint: "x".into() }.kind(),
         "se.permission_denied"
     );
     assert_eq!(

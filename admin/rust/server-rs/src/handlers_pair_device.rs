@@ -92,7 +92,11 @@ pub async fn initiate(State(state): State<PairDeviceState>) -> Response {
         return StatusCode::NOT_FOUND.into_response();
     };
     Json(InitiateResponse {
-        uri: token.to_uri(&identity.record.hh_pub),
+        uri: token.to_uri_with_host_and_name(
+            &identity.record.hh_pub,
+            None,
+            Some(&identity.record.name),
+        ),
     })
     .into_response()
 }

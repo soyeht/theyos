@@ -188,6 +188,19 @@ impl PairToken {
     /// rationale.
     #[must_use]
     pub fn to_uri_with_host(&self, hh_pub: &P256PublicKey, host: Option<&str>) -> String {
+        self.to_uri_with_host_and_name(hh_pub, host, None)
+    }
+
+    /// As [`Self::to_uri_with_host`] but also includes the household display
+    /// name for scanners that skip Bonjour and therefore cannot learn `hh_name`
+    /// from service TXT records.
+    #[must_use]
+    pub fn to_uri_with_host_and_name(
+        &self,
+        hh_pub: &P256PublicKey,
+        host: Option<&str>,
+        household_name: Option<&str>,
+    ) -> String {
         let mut uri = String::from("soyeht://household/pair-device");
         uri.push_str("?v=1");
         uri.push_str("&hh_pub=");
@@ -202,16 +215,23 @@ impl PairToken {
         }
         if let Some(h) = host {
             uri.push_str("&host=");
-            uri.push_str(&percent_encode_host(h));
+            uri.push_str(&percent_encode_query_value(h));
+        }
+        if let Some(name) = household_name {
+            let trimmed = name.trim();
+            if !trimmed.is_empty() {
+                uri.push_str("&house_name=");
+                uri.push_str(&percent_encode_query_value(trimmed));
+            }
         }
         uri
     }
 }
 
-fn percent_encode_host(host: &str) -> String {
+fn percent_encode_query_value(value: &str) -> String {
     use std::fmt::Write as _;
-    let mut out = String::with_capacity(host.len());
-    for b in host.as_bytes() {
+    let mut out = String::with_capacity(value.len());
+    for b in value.as_bytes() {
         match b {
             b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b':' => {
                 out.push(*b as char);
@@ -561,6 +581,19 @@ mod tests {
 
         w.consume_token(&token.nonce).await.unwrap();
         assert!(!w.is_open().await);
+    }
+
+    #[tokio::test]
+    async fn uri_with_host_and_name_percent_encodes_household_name() {
+        let w = PairDeviceWindow::new();
+        let token = w.mint_token(Duration::from_secs(60), None).await.unwrap();
+        let uri = token.to_uri_with_host_and_name(
+            &fake_hh_pub(),
+            Some("100.82.47.115:8091"),
+            Some("Sample Home"),
+        );
+        assert!(uri.contains("&host=100.82.47.115:8091"));
+        assert!(uri.contains("&house_name=Sample%20Home"));
     }
 
     #[tokio::test]

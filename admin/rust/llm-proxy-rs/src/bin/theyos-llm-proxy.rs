@@ -8,7 +8,9 @@
 //! Slice 1. Hot-reload via admin API arrives in Slice 5.
 
 use keystore_rs::KeystoreBackend;
-use llm_proxy::{ProxyConfig, build_credential_store, build_state_from_profile, first_run_profile, router};
+use llm_proxy::{
+    ProxyConfig, build_credential_store, build_state_from_profile, first_run_profile, router,
+};
 use std::io::Read;
 use std::process::ExitCode;
 use std::sync::Arc;
@@ -100,14 +102,13 @@ async fn main() -> ExitCode {
     // task lives for the process lifetime; tokio cancels it on shutdown.
     let reload_state = state.clone();
     tokio::spawn(async move {
-        let mut hup =
-            match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup()) {
-                Ok(s) => s,
-                Err(e) => {
-                    tracing::warn!(error = %e, "could not install SIGHUP handler; credential reload disabled");
-                    return;
-                }
-            };
+        let mut hup = match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup()) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!(error = %e, "could not install SIGHUP handler; credential reload disabled");
+                return;
+            }
+        };
         while hup.recv().await.is_some() {
             match reload_state.reload_from_disk() {
                 Ok(n) => tracing::info!(provider_count = n, "SIGHUP: reloaded profile + keystore"),
