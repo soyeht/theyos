@@ -73,23 +73,14 @@ impl CliFlavor {
             }
             CliFlavor::Codex => {
                 // `codex exec -m <model> -` reads prompt from stdin.
-                vec![
-                    "exec".into(),
-                    "-m".into(),
-                    model.to_string(),
-                    "-".into(),
-                ]
+                vec!["exec".into(), "-m".into(), model.to_string(), "-".into()]
             }
             CliFlavor::Gemini => {
                 // `gemini --model <model> --prompt <text>` — verified
                 // against the published Gemini CLI 1.x contract. The
                 // CLI also accepts stdin via `-` but argv is more
                 // direct for the v1 case where prompts are small.
-                let mut a = vec![
-                    "--model".to_string(),
-                    model.to_string(),
-                    "--prompt".into(),
-                ];
+                let mut a = vec!["--model".to_string(), model.to_string(), "--prompt".into()];
                 if let Some(p) = prompt {
                     a.push(p.to_string());
                 }
@@ -190,10 +181,7 @@ impl CliSubprocessProvider {
         };
         let mut parts: Vec<String> = Vec::with_capacity(arr.len());
         for msg in arr {
-            let role = msg
-                .get("role")
-                .and_then(Value::as_str)
-                .unwrap_or("user");
+            let role = msg.get("role").and_then(Value::as_str).unwrap_or("user");
             let content = msg.get("content");
             let text = match content {
                 Some(Value::String(s)) => s.clone(),
@@ -227,7 +215,9 @@ impl CliSubprocessProvider {
 
         let mut cmd = Command::new(&self.cli_path);
         cmd.args(&argv);
-        cmd.stdout(Stdio::piped()).stderr(Stdio::piped()).kill_on_drop(true);
+        cmd.stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
         match delivery {
             PromptDelivery::Argv => {
                 cmd.stdin(Stdio::null());
@@ -281,10 +271,7 @@ impl CliSubprocessProvider {
             Err(_) => {
                 return Err(ProxyError::Upstream {
                     provider: self.id.clone(),
-                    message: format!(
-                        "subprocess timed out after {}s",
-                        self.timeout.as_secs()
-                    ),
+                    message: format!("subprocess timed out after {}s", self.timeout.as_secs()),
                 });
             }
         };
@@ -292,7 +279,11 @@ impl CliSubprocessProvider {
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
             let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
-            let mut msg = if stderr.trim().is_empty() { stdout } else { stderr };
+            let mut msg = if stderr.trim().is_empty() {
+                stdout
+            } else {
+                stderr
+            };
             if msg.len() > 1024 {
                 msg.truncate(1024);
                 msg.push('…');
@@ -360,7 +351,10 @@ impl CliSubprocessProvider {
         let push = |frames: &mut Vec<Bytes>, payload: Value| {
             frames.push(Bytes::from(format!("data: {payload}\n\n")));
         };
-        push(&mut frames, chunk(json!({"role": "assistant", "content": ""}), None));
+        push(
+            &mut frames,
+            chunk(json!({"role": "assistant", "content": ""}), None),
+        );
         push(&mut frames, chunk(json!({"content": text}), None));
         push(&mut frames, chunk(json!({}), Some("stop")));
         frames.push(Bytes::from_static(b"data: [DONE]\n\n"));
@@ -424,16 +418,16 @@ mod tests {
     fn codex_argv_uses_dash_for_stdin_and_passes_model_through() {
         let argv = CliFlavor::Codex.argv("gpt-5", None);
         assert_eq!(argv, vec!["exec", "-m", "gpt-5", "-"]);
-        assert!(matches!(CliFlavor::Codex.prompt_delivery(), PromptDelivery::Stdin));
+        assert!(matches!(
+            CliFlavor::Codex.prompt_delivery(),
+            PromptDelivery::Stdin
+        ));
     }
 
     #[test]
     fn gemini_argv_uses_named_flags() {
         let argv = CliFlavor::Gemini.argv("gemini-2.0-pro", Some("hi"));
-        assert_eq!(
-            argv,
-            vec!["--model", "gemini-2.0-pro", "--prompt", "hi"]
-        );
+        assert_eq!(argv, vec!["--model", "gemini-2.0-pro", "--prompt", "hi"]);
     }
 
     #[test]

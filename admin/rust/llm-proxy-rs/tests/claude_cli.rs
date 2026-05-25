@@ -128,16 +128,16 @@ async fn passes_p_flag_and_model_alias_and_prompt_as_args() {
         .await
         .unwrap();
     let argv = std::fs::read_to_string(&argv_log).unwrap();
-    assert!(argv.lines().any(|l| l == "haiku"), "haiku flag missing: {argv}");
+    assert!(
+        argv.lines().any(|l| l == "haiku"),
+        "haiku flag missing: {argv}"
+    );
 }
 
 #[tokio::test]
 async fn non_zero_exit_propagates_as_upstream_error_with_stderr() {
     let dir = tempfile::tempdir().unwrap();
-    let cli = install_mock_claude(
-        &dir,
-        "#!/bin/sh\nprintf 'not logged in\\n' >&2\nexit 1\n",
-    );
+    let cli = install_mock_claude(&dir, "#!/bin/sh\nprintf 'not logged in\\n' >&2\nexit 1\n");
     let provider = ClaudeCliProvider::new(
         "claude-cli",
         Some(&cli),
@@ -149,13 +149,8 @@ async fn non_zero_exit_propagates_as_upstream_error_with_stderr() {
         .chat(&body("claude-sonnet", "hi", false), false)
         .await;
 
-
     let Err(err) = result else {
-
-
         panic!("expected Err, got Ok");
-
-
     };
     match err {
         llm_proxy::ProxyError::Upstream { provider, message } => {
@@ -189,9 +184,7 @@ async fn missing_binary_reports_a_clear_install_hint() {
         .await;
 
     let Err(err) = result else {
-
         panic!("expected Err, got Ok");
-
     };
     match err {
         llm_proxy::ProxyError::Upstream { provider, message } => {
@@ -226,9 +219,7 @@ async fn subprocess_timeout_is_enforced() {
         .await;
 
     let Err(err) = result else {
-
         panic!("expected Err, got Ok");
-
     };
     let elapsed = start.elapsed();
     // kill_on_drop + tokio::time::timeout must bail well before the 5s
@@ -268,7 +259,12 @@ async fn streaming_response_emits_sse_chunks_with_role_then_content_then_stop_th
     use futures_util::StreamExt;
     let collected: Vec<_> = stream.collect().await;
     // 4 frames: role, content, stop, [DONE].
-    assert_eq!(collected.len(), 4, "expected 4 SSE frames, got {}", collected.len());
+    assert_eq!(
+        collected.len(),
+        4,
+        "expected 4 SSE frames, got {}",
+        collected.len()
+    );
     let f0 = String::from_utf8(collected[0].as_ref().unwrap().to_vec()).unwrap();
     let f1 = String::from_utf8(collected[1].as_ref().unwrap().to_vec()).unwrap();
     let f2 = String::from_utf8(collected[2].as_ref().unwrap().to_vec()).unwrap();
@@ -295,9 +291,7 @@ async fn bad_request_when_messages_array_missing() {
         .await;
 
     let Err(err) = result else {
-
         panic!("expected Err, got Ok");
-
     };
     match err {
         llm_proxy::ProxyError::BadRequest(msg) => {
@@ -332,9 +326,7 @@ async fn bad_request_when_messages_yield_empty_prompt() {
         .await;
 
     let Err(err) = result else {
-
         panic!("expected Err, got Ok");
-
     };
     match err {
         llm_proxy::ProxyError::BadRequest(_) => {}
@@ -348,10 +340,7 @@ async fn proxy_router_serves_claude_via_default_active() {
     // active profile points at it, request through /v1/chat/completions
     // ends up at the subprocess.
     let dir = tempfile::tempdir().unwrap();
-    let cli = install_mock_claude(
-        &dir,
-        "#!/bin/sh\nprintf 'reply from claude via proxy\\n'\n",
-    );
+    let cli = install_mock_claude(&dir, "#!/bin/sh\nprintf 'reply from claude via proxy\\n'\n");
     let provider = ClaudeCliProvider::new(
         "claude-cli",
         Some(&cli),
@@ -396,10 +385,7 @@ async fn proxy_router_serves_claude_via_per_claw_overlay() {
     // Same shape as the test above, but the overlay path. Hermes uses the
     // openai-compat default; openclaw overlays to the Claude CLI.
     let dir = tempfile::tempdir().unwrap();
-    let cli = install_mock_claude(
-        &dir,
-        "#!/bin/sh\nprintf 'overlay reply\\n'\n",
-    );
+    let cli = install_mock_claude(&dir, "#!/bin/sh\nprintf 'overlay reply\\n'\n");
     let claude = ClaudeCliProvider::new(
         "claude-cli",
         Some(&cli),

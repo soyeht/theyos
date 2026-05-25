@@ -55,7 +55,7 @@ fn fixture_state(profile_dir: &std::path::Path) -> ServerState {
                     models: vec!["model-a".into()],
                     cli_binary_path: None,
                     cli_timeout_secs: None,
-                cli_flavor: CliFlavor::default(),
+                    cli_flavor: CliFlavor::default(),
                 },
             );
             m.insert(
@@ -67,7 +67,7 @@ fn fixture_state(profile_dir: &std::path::Path) -> ServerState {
                     models: vec!["model-b".into()],
                     cli_binary_path: None,
                     cli_timeout_secs: None,
-                cli_flavor: CliFlavor::default(),
+                    cli_flavor: CliFlavor::default(),
                 },
             );
             m

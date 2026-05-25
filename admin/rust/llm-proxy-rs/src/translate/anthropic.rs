@@ -68,7 +68,11 @@ pub fn to_anthropic_request(openai_body: &Value) -> Value {
     let max_tokens = openai_body
         .get("max_tokens")
         .and_then(Value::as_u64)
-        .or_else(|| openai_body.get("max_completion_tokens").and_then(Value::as_u64))
+        .or_else(|| {
+            openai_body
+                .get("max_completion_tokens")
+                .and_then(Value::as_u64)
+        })
         .map_or(DEFAULT_MAX_TOKENS, |n| {
             u32::try_from(n).unwrap_or(DEFAULT_MAX_TOKENS)
         });
@@ -170,7 +174,11 @@ fn split_system_and_messages(messages: &[Value]) -> (Option<String>, Vec<Value>)
                 }
                 if let Some(tool_calls) = msg.get("tool_calls").and_then(Value::as_array) {
                     for tc in tool_calls {
-                        let id = tc.get("id").and_then(Value::as_str).unwrap_or("").to_string();
+                        let id = tc
+                            .get("id")
+                            .and_then(Value::as_str)
+                            .unwrap_or("")
+                            .to_string();
                         let function = tc.get("function").cloned().unwrap_or(json!({}));
                         let name = function
                             .get("name")
@@ -763,7 +771,10 @@ mod tests {
         // Assistant message has the tool_use content block.
         assert_eq!(messages[1]["role"], "assistant");
         let asst_content = messages[1]["content"].as_array().unwrap();
-        let tool_use = asst_content.iter().find(|b| b["type"] == "tool_use").unwrap();
+        let tool_use = asst_content
+            .iter()
+            .find(|b| b["type"] == "tool_use")
+            .unwrap();
         assert_eq!(tool_use["id"], "call_abc");
         assert_eq!(tool_use["name"], "get_weather");
         // Arguments string parsed back into a JSON object (Anthropic wants object).
@@ -830,7 +841,10 @@ mod tests {
             "tool_choice": {"type": "function", "function": {"name": "lookup"}}
         });
         let out = to_anthropic_request(&body);
-        assert_eq!(out["tool_choice"], json!({"type": "tool", "name": "lookup"}));
+        assert_eq!(
+            out["tool_choice"],
+            json!({"type": "tool", "name": "lookup"})
+        );
     }
 
     #[test]
@@ -879,7 +893,8 @@ mod tests {
         // id contains chatcmpl- prefix (from msg_ prefix substitution).
         assert!(
             out["id"].as_str().unwrap().starts_with("chatcmpl-"),
-            "id = {}", out["id"]
+            "id = {}",
+            out["id"]
         );
     }
 
@@ -900,7 +915,11 @@ mod tests {
         let out = from_anthropic_response(&resp, "claude-opus-4-7");
         let msg = &out["choices"][0]["message"];
         assert_eq!(msg["role"], "assistant");
-        assert_eq!(msg["content"], Value::Null, "content should be null when only tool calls");
+        assert_eq!(
+            msg["content"],
+            Value::Null,
+            "content should be null when only tool calls"
+        );
         let tcs = msg["tool_calls"].as_array().unwrap();
         assert_eq!(tcs.len(), 1);
         assert_eq!(tcs[0]["id"], "toolu_1");
@@ -968,7 +987,7 @@ mod tests {
         let mut out = Vec::new();
         out.extend(t.translate_event(&json!({"type": "message_start", "message": {}})));
         out.extend(t.translate_event(
-            &json!({"type": "content_block_start", "index": 0, "content_block": {"type": "text"}})
+            &json!({"type": "content_block_start", "index": 0, "content_block": {"type": "text"}}),
         ));
         out.extend(t.translate_event(&json!({
             "type": "content_block_delta", "index": 0,

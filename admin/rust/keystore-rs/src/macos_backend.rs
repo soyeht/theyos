@@ -113,10 +113,7 @@ fn is_not_found(e: security_framework::base::Error) -> bool {
     e.code() == -25300
 }
 
-fn map_keychain_err(
-    e: security_framework::base::Error,
-    account: &str,
-) -> KeystoreError {
+fn map_keychain_err(e: security_framework::base::Error, account: &str) -> KeystoreError {
     if is_not_found(e) {
         return KeystoreError::NotFound {
             label: account.to_string(),

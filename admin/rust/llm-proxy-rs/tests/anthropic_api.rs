@@ -50,7 +50,10 @@ async fn posts_to_v1_messages_with_anthropic_version_and_x_api_key_headers() {
     )
     .unwrap();
 
-    let response = provider.chat(&req("claude-opus-4-7", "hi", false), false).await.unwrap();
+    let response = provider
+        .chat(&req("claude-opus-4-7", "hi", false), false)
+        .await
+        .unwrap();
     let ChatResponse::Json(bytes) = response else {
         panic!("expected JSON");
     };
@@ -60,7 +63,8 @@ async fn posts_to_v1_messages_with_anthropic_version_and_x_api_key_headers() {
     // id translated from msg_ → chatcmpl-
     assert!(
         body["id"].as_str().unwrap().starts_with("chatcmpl-"),
-        "id = {}", body["id"]
+        "id = {}",
+        body["id"]
     );
 }
 
@@ -126,7 +130,9 @@ async fn upstream_401_surfaces_as_typed_upstream_error() {
     .unwrap();
 
     let result = provider.chat(&req("m", "hi", false), false).await;
-    let Err(err) = result else { panic!("expected Err") };
+    let Err(err) = result else {
+        panic!("expected Err")
+    };
     match err {
         llm_proxy::ProxyError::Upstream { provider, message } => {
             assert_eq!(provider, "anthropic");
@@ -197,11 +203,26 @@ async fn translates_streaming_response_into_openai_chunks() {
     // Joined view because the upstream chunking is implementation-defined;
     // verify substrings rather than exact frame counts.
     let joined: String = frames.join("");
-    assert!(joined.contains("\"role\":\"assistant\""), "missing role chunk: {joined}");
-    assert!(joined.contains("\"content\":\"hello \""), "missing first delta: {joined}");
-    assert!(joined.contains("\"content\":\"world\""), "missing second delta: {joined}");
-    assert!(joined.contains("\"finish_reason\":\"stop\""), "missing stop: {joined}");
-    assert!(joined.ends_with("data: [DONE]\n\n"), "missing trailer: {joined}");
+    assert!(
+        joined.contains("\"role\":\"assistant\""),
+        "missing role chunk: {joined}"
+    );
+    assert!(
+        joined.contains("\"content\":\"hello \""),
+        "missing first delta: {joined}"
+    );
+    assert!(
+        joined.contains("\"content\":\"world\""),
+        "missing second delta: {joined}"
+    );
+    assert!(
+        joined.contains("\"finish_reason\":\"stop\""),
+        "missing stop: {joined}"
+    );
+    assert!(
+        joined.ends_with("data: [DONE]\n\n"),
+        "missing trailer: {joined}"
+    );
 }
 
 #[tokio::test]
@@ -256,8 +277,14 @@ async fn translates_streaming_tool_use_response_into_openai_tool_calls_deltas() 
     }
     // The tool_call open frame carries id + name; subsequent deltas only
     // carry function.arguments fragments.
-    assert!(joined.contains("\"id\":\"toolu_xx\""), "missing tool id: {joined}");
-    assert!(joined.contains("\"name\":\"lookup\""), "missing tool name: {joined}");
+    assert!(
+        joined.contains("\"id\":\"toolu_xx\""),
+        "missing tool id: {joined}"
+    );
+    assert!(
+        joined.contains("\"name\":\"lookup\""),
+        "missing tool name: {joined}"
+    );
     assert!(
         joined.contains("\"arguments\":\"{\\\"q\\\":\""),
         "missing first args delta: {joined}"

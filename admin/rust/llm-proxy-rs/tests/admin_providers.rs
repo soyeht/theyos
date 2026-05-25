@@ -17,13 +17,8 @@ use llm_proxy::server::ServerState;
 
 fn fake_provider(id: &str) -> Arc<dyn Provider> {
     Arc::new(
-        OpenAiCompatProvider::new(
-            id,
-            "http://127.0.0.1:1/v1",
-            None,
-            vec!["model-a".into()],
-        )
-        .expect("build OpenAiCompatProvider for tests"),
+        OpenAiCompatProvider::new(id, "http://127.0.0.1:1/v1", None, vec!["model-a".into()])
+            .expect("build OpenAiCompatProvider for tests"),
     )
 }
 
@@ -53,7 +48,7 @@ fn fixture(
             models: vec!["model-a".into()],
             cli_binary_path: None,
             cli_timeout_secs: None,
-        cli_flavor: CliFlavor::default(),
+            cli_flavor: CliFlavor::default(),
         },
     );
     doc.save_default(profile_dir).expect("seed default.toml");
@@ -136,7 +131,10 @@ async fn upsert_provider_writes_credential_and_profile_and_hot_reloads() {
     // default.toml got the provider entry.
     let on_disk = std::fs::read_to_string(tmp.path().join("default.toml")).unwrap();
     assert!(on_disk.contains("[providers.prov-b]"), "{on_disk}");
-    assert!(on_disk.contains("base_url = \"http://127.0.0.1:2/v1\""), "{on_disk}");
+    assert!(
+        on_disk.contains("base_url = \"http://127.0.0.1:2/v1\""),
+        "{on_disk}"
+    );
 
     // Hot-reload: the runtime registry now has prov-b without restart.
     let v: serde_json::Value = reqwest::get(format!("{base}/admin/llm/providers"))
@@ -368,10 +366,7 @@ async fn audit_endpoint_filters_by_before_cutoff() {
     let recs = v["records"].as_array().unwrap();
     // Strictly less than the cutoff: m-2 (00:00:01) and m-1 (00:00:00).
     assert_eq!(recs.len(), 2);
-    let models: Vec<&str> = recs
-        .iter()
-        .map(|r| r["model"].as_str().unwrap())
-        .collect();
+    let models: Vec<&str> = recs.iter().map(|r| r["model"].as_str().unwrap()).collect();
     assert_eq!(models, vec!["m-2", "m-1"]);
 }
 
@@ -451,8 +446,16 @@ async fn list_providers_never_returns_credential_value() {
         .iter()
         .find(|p| p["id"] == "prov-leak-canary")
         .expect("canary in providers list");
-    let keys: Vec<&str> = canary.as_object().unwrap().keys().map(String::as_str).collect();
-    assert!(keys.contains(&"has_credential"), "missing has_credential boolean");
+    let keys: Vec<&str> = canary
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .collect();
+    assert!(
+        keys.contains(&"has_credential"),
+        "missing has_credential boolean"
+    );
     for forbidden in ["credential", "api_key", "secret", "password", "token"] {
         assert!(
             !keys.contains(&forbidden),

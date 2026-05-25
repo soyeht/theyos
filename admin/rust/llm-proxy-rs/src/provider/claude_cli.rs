@@ -193,10 +193,7 @@ impl ClaudeCliProvider {
             Err(_) => {
                 return Err(ProxyError::Upstream {
                     provider: self.id.clone(),
-                    message: format!(
-                        "subprocess timed out after {}s",
-                        self.timeout.as_secs()
-                    ),
+                    message: format!("subprocess timed out after {}s", self.timeout.as_secs()),
                 });
             }
         };
@@ -206,7 +203,11 @@ impl ClaudeCliProvider {
             let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
             // Prefer stderr; fall back to stdout in case the CLI logged its
             // error there. Truncate to avoid log spam.
-            let mut msg = if stderr.trim().is_empty() { stdout } else { stderr };
+            let mut msg = if stderr.trim().is_empty() {
+                stdout
+            } else {
+                stderr
+            };
             if msg.len() > 1024 {
                 msg.truncate(1024);
                 msg.push('…');
@@ -279,7 +280,10 @@ impl ClaudeCliProvider {
         let push = |frames: &mut Vec<Bytes>, payload: Value| {
             frames.push(Bytes::from(format!("data: {payload}\n\n")));
         };
-        push(&mut frames, chunk(json!({"role": "assistant", "content": ""}), None));
+        push(
+            &mut frames,
+            chunk(json!({"role": "assistant", "content": ""}), None),
+        );
         push(&mut frames, chunk(json!({"content": text}), None));
         push(&mut frames, chunk(json!({}), Some("stop")));
         frames.push(Bytes::from_static(b"data: [DONE]\n\n"));
@@ -399,29 +403,50 @@ mod tests {
 
     #[test]
     fn map_model_alias_routes_each_family() {
-        assert_eq!(ClaudeCliProvider::map_model_alias("claude-opus-4-7"), "opus");
-        assert_eq!(ClaudeCliProvider::map_model_alias("claude-opus-4-6"), "opus");
-        assert_eq!(ClaudeCliProvider::map_model_alias("anthropic/claude-opus"), "opus");
+        assert_eq!(
+            ClaudeCliProvider::map_model_alias("claude-opus-4-7"),
+            "opus"
+        );
+        assert_eq!(
+            ClaudeCliProvider::map_model_alias("claude-opus-4-6"),
+            "opus"
+        );
+        assert_eq!(
+            ClaudeCliProvider::map_model_alias("anthropic/claude-opus"),
+            "opus"
+        );
 
         assert_eq!(
             ClaudeCliProvider::map_model_alias("claude-haiku-4-5"),
             "haiku"
         );
-        assert_eq!(ClaudeCliProvider::map_model_alias("anthropic/claude-haiku-3"), "haiku");
+        assert_eq!(
+            ClaudeCliProvider::map_model_alias("anthropic/claude-haiku-3"),
+            "haiku"
+        );
 
         assert_eq!(
             ClaudeCliProvider::map_model_alias("claude-sonnet-4-7"),
             "sonnet"
         );
         // Unknown family falls back to sonnet.
-        assert_eq!(ClaudeCliProvider::map_model_alias("mystery-model"), "sonnet");
+        assert_eq!(
+            ClaudeCliProvider::map_model_alias("mystery-model"),
+            "sonnet"
+        );
         assert_eq!(ClaudeCliProvider::map_model_alias(""), "sonnet");
     }
 
     #[test]
     fn map_model_alias_is_case_insensitive() {
-        assert_eq!(ClaudeCliProvider::map_model_alias("CLAUDE-OPUS-4-7"), "opus");
-        assert_eq!(ClaudeCliProvider::map_model_alias("Claude-Haiku-4-5"), "haiku");
+        assert_eq!(
+            ClaudeCliProvider::map_model_alias("CLAUDE-OPUS-4-7"),
+            "opus"
+        );
+        assert_eq!(
+            ClaudeCliProvider::map_model_alias("Claude-Haiku-4-5"),
+            "haiku"
+        );
     }
 
     #[test]

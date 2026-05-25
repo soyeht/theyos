@@ -73,8 +73,8 @@ impl ProxyClient {
     /// process is already broken.
     #[must_use]
     pub fn from_env() -> Self {
-        let raw = std::env::var("THEYOS_LLM_PROXY_URL")
-            .unwrap_or_else(|_| DEFAULT_PROXY_URL.to_string());
+        let raw =
+            std::env::var("THEYOS_LLM_PROXY_URL").unwrap_or_else(|_| DEFAULT_PROXY_URL.to_string());
         let base = match validate_loopback_url(&raw) {
             Ok(normalized) => normalized,
             Err(reason) => {
@@ -130,7 +130,14 @@ pub async fn handle_catalog(
     State(state): State<SharedState>,
     AdminUser(AuthUser { .. }): AdminUser,
 ) -> Result<Response, ApiError> {
-    forward(&state, Method::GET, "/admin/catalog", HeaderMap::new(), Bytes::new()).await
+    forward(
+        &state,
+        Method::GET,
+        "/admin/catalog",
+        HeaderMap::new(),
+        Bytes::new(),
+    )
+    .await
 }
 
 /// `GET /api/v1/llm/active` — current default + per-claw overlays.
@@ -138,7 +145,14 @@ pub async fn handle_get_active(
     State(state): State<SharedState>,
     AdminUser(AuthUser { .. }): AdminUser,
 ) -> Result<Response, ApiError> {
-    forward(&state, Method::GET, "/admin/llm/active", HeaderMap::new(), Bytes::new()).await
+    forward(
+        &state,
+        Method::GET,
+        "/admin/llm/active",
+        HeaderMap::new(),
+        Bytes::new(),
+    )
+    .await
 }
 
 /// `PUT /api/v1/llm/active` — change the global default provider/model.
@@ -161,10 +175,10 @@ pub async fn handle_put_active_claw(
     request: Request,
 ) -> Result<Response, ApiError> {
     let (headers, body) = take_json_body(request).await?;
-    let path = format!("/admin/llm/active/{}", percent_encoding::utf8_percent_encode(
-        &claw_type,
-        percent_encoding::NON_ALPHANUMERIC,
-    ));
+    let path = format!(
+        "/admin/llm/active/{}",
+        percent_encoding::utf8_percent_encode(&claw_type, percent_encoding::NON_ALPHANUMERIC,)
+    );
     forward(&state, Method::PUT, &path, headers, body).await
 }
 
@@ -174,11 +188,18 @@ pub async fn handle_delete_active_claw(
     AdminUser(AuthUser { .. }): AdminUser,
     Path(claw_type): Path<String>,
 ) -> Result<Response, ApiError> {
-    let path = format!("/admin/llm/active/{}", percent_encoding::utf8_percent_encode(
-        &claw_type,
-        percent_encoding::NON_ALPHANUMERIC,
-    ));
-    forward(&state, Method::DELETE, &path, HeaderMap::new(), Bytes::new()).await
+    let path = format!(
+        "/admin/llm/active/{}",
+        percent_encoding::utf8_percent_encode(&claw_type, percent_encoding::NON_ALPHANUMERIC,)
+    );
+    forward(
+        &state,
+        Method::DELETE,
+        &path,
+        HeaderMap::new(),
+        Bytes::new(),
+    )
+    .await
 }
 
 /// `GET /api/v1/llm/providers` — list all configured providers.
@@ -186,7 +207,14 @@ pub async fn handle_list_providers(
     State(state): State<SharedState>,
     AdminUser(AuthUser { .. }): AdminUser,
 ) -> Result<Response, ApiError> {
-    forward(&state, Method::GET, "/admin/llm/providers", HeaderMap::new(), Bytes::new()).await
+    forward(
+        &state,
+        Method::GET,
+        "/admin/llm/providers",
+        HeaderMap::new(),
+        Bytes::new(),
+    )
+    .await
 }
 
 /// `POST /api/v1/llm/providers` — create or update a provider config +
@@ -212,7 +240,14 @@ pub async fn handle_delete_provider(
         "/admin/llm/providers/{}",
         percent_encoding::utf8_percent_encode(&id, percent_encoding::NON_ALPHANUMERIC)
     );
-    forward(&state, Method::DELETE, &path, HeaderMap::new(), Bytes::new()).await
+    forward(
+        &state,
+        Method::DELETE,
+        &path,
+        HeaderMap::new(),
+        Bytes::new(),
+    )
+    .await
 }
 
 /// `POST /api/v1/llm/providers/{id}/test` — live probe against the
@@ -233,9 +268,7 @@ pub async fn handle_test_provider(
 pub async fn handle_get_audit(
     State(state): State<SharedState>,
     AdminUser(AuthUser { .. }): AdminUser,
-    axum::extract::Query(q): axum::extract::Query<
-        std::collections::BTreeMap<String, String>,
-    >,
+    axum::extract::Query(q): axum::extract::Query<std::collections::BTreeMap<String, String>>,
 ) -> Result<Response, ApiError> {
     // Forward arbitrary query params (limit, before) verbatim so the
     // proxy's typed deserialization stays the single validation point.
@@ -301,9 +334,7 @@ async fn forward(
                 upstream = %url,
                 "llm-proxy reverse-proxy: upstream call failed"
             );
-            return Err(ApiError::internal(
-                "llm proxy unreachable on loopback",
-            ));
+            return Err(ApiError::internal("llm proxy unreachable on loopback"));
         }
     };
     let status = resp.status();
@@ -317,8 +348,8 @@ async fn forward(
         .bytes()
         .await
         .map_err(|e| ApiError::internal(format!("llm proxy response read: {e}")))?;
-    let status_code = StatusCode::from_u16(status.as_u16())
-        .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+    let status_code =
+        StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
     let mut response = Response::new(Body::from(bytes));
     *response.status_mut() = status_code;
     *response.headers_mut() = out_headers;

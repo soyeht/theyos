@@ -10,9 +10,7 @@
 
 use crate::profile::{CliFlavor, ProviderKind};
 
-use super::{
-    CatalogEntry, CatalogModel, CredentialHint, PlanInfo, Region,
-};
+use super::{CatalogEntry, CatalogModel, CredentialHint, PlanInfo, Region};
 
 /// Construct the full catalog. Cheap — clones a few static strings into
 /// owned Strings; called once at proxy startup by `CatalogDoc::builtin`.

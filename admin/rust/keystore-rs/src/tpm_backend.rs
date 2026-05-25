@@ -101,19 +101,14 @@ fn encrypt_with_systemd_creds(account: &str, plaintext: &[u8]) -> Result<Vec<u8>
         })?;
 
     {
-        let stdin = child
-            .stdin
-            .as_mut()
-            .ok_or_else(|| KeystoreError::Io {
-                kind: "no stdin".into(),
-                hint: format!("{SYSTEMD_CREDS} child has no stdin pipe"),
-            })?;
-        stdin
-            .write_all(plaintext)
-            .map_err(|e| KeystoreError::Io {
-                kind: e.kind().to_string(),
-                hint: format!("write to {SYSTEMD_CREDS} stdin: {e}"),
-            })?;
+        let stdin = child.stdin.as_mut().ok_or_else(|| KeystoreError::Io {
+            kind: "no stdin".into(),
+            hint: format!("{SYSTEMD_CREDS} child has no stdin pipe"),
+        })?;
+        stdin.write_all(plaintext).map_err(|e| KeystoreError::Io {
+            kind: e.kind().to_string(),
+            hint: format!("write to {SYSTEMD_CREDS} stdin: {e}"),
+        })?;
     }
 
     let output = child.wait_with_output().map_err(|e| KeystoreError::Io {
@@ -150,19 +145,14 @@ fn decrypt_with_systemd_creds(account: &str, ciphertext: &[u8]) -> Result<Vec<u8
         })?;
 
     {
-        let stdin = child
-            .stdin
-            .as_mut()
-            .ok_or_else(|| KeystoreError::Io {
-                kind: "no stdin".into(),
-                hint: format!("{SYSTEMD_CREDS} child has no stdin pipe"),
-            })?;
-        stdin
-            .write_all(ciphertext)
-            .map_err(|e| KeystoreError::Io {
-                kind: e.kind().to_string(),
-                hint: format!("write to {SYSTEMD_CREDS} stdin: {e}"),
-            })?;
+        let stdin = child.stdin.as_mut().ok_or_else(|| KeystoreError::Io {
+            kind: "no stdin".into(),
+            hint: format!("{SYSTEMD_CREDS} child has no stdin pipe"),
+        })?;
+        stdin.write_all(ciphertext).map_err(|e| KeystoreError::Io {
+            kind: e.kind().to_string(),
+            hint: format!("write to {SYSTEMD_CREDS} stdin: {e}"),
+        })?;
     }
 
     let output = child.wait_with_output().map_err(|e| KeystoreError::Io {
@@ -210,10 +200,7 @@ fn probe_tpm2() -> bool {
     // encrypt/decrypt with InteractiveAuthenticationRequired. So we
     // must verify the resource-manager device is reachable from THIS
     // process, not just from the kernel's point of view.
-    match std::fs::OpenOptions::new()
-        .read(true)
-        .open("/dev/tpmrm0")
-    {
+    match std::fs::OpenOptions::new().read(true).open("/dev/tpmrm0") {
         Ok(_) => {
             tracing::debug!("TPM2 backend available (/dev/tpmrm0 readable)");
             true
@@ -240,7 +227,8 @@ mod tests {
         // Delete only touches the file backend; safe to test without a TPM.
         let dir = TempDir::new().unwrap();
         let ks = TpmKeystore::new(dir.path(), "test.service");
-        ks.delete("never.existed").expect("missing key delete is ok");
+        ks.delete("never.existed")
+            .expect("missing key delete is ok");
     }
 
     /// Round-trip end-to-end. Gated on a real TPM2 + systemd-creds — CI
@@ -271,9 +259,7 @@ mod tests {
 
         // Manually rename the file to look like provider.b — decrypt
         // should reject because the sealed --name doesn't match.
-        let src = ks
-            .inner
-            .path_for("provider.a");
+        let src = ks.inner.path_for("provider.a");
         let dst = ks.inner.path_for("provider.b");
         std::fs::rename(&src, &dst).unwrap();
 

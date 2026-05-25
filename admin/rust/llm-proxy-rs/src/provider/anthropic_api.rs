@@ -23,7 +23,7 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use futures_util::stream::{BoxStream, StreamExt, TryStreamExt};
 use reqwest::Client;
-use reqwest::header::{HeaderMap, HeaderValue, CONTENT_TYPE};
+use reqwest::header::{CONTENT_TYPE, HeaderMap, HeaderValue};
 use serde_json::Value;
 
 use crate::error::ProxyError;
@@ -356,7 +356,10 @@ mod tests {
         match err {
             ProxyError::Credential { provider, hint } => {
                 assert_eq!(provider, "anthropic");
-                assert!(hint.contains("API key"), "hint missing API-key reference: {hint}");
+                assert!(
+                    hint.contains("API key"),
+                    "hint missing API-key reference: {hint}"
+                );
             }
             other => panic!("expected Credential, got {other:?}"),
         }
@@ -383,4 +386,3 @@ mod tests {
         assert_eq!(p.endpoint(), "https://api.anthropic.com/v1/messages");
     }
 }
-

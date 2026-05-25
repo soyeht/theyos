@@ -79,6 +79,8 @@ pub struct BootstrapHandlerState {
 
 pub type BootstrapStateArc = Arc<RwLock<BootstrapState>>;
 
+static ACCEPT_HOUSEHOLD_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 impl BootstrapHandlerState {
     #[must_use]
     pub fn new(
@@ -805,6 +807,8 @@ pub async fn post_accept_household(
     State(state): State<BootstrapHandlerState>,
     body: Bytes,
 ) -> Response {
+    let _guard = ACCEPT_HOUSEHOLD_LOCK.lock().await;
+
     {
         let current = state.bootstrap.read().await;
         match *current {
@@ -974,7 +978,9 @@ async fn consume_accept_household_invitation(
     token: &[u8; 32],
     token_hash: [u8; 32],
 ) -> Result<crate::setup_invitation::SetupInvitationEntry, Response> {
-    use crate::setup_invitation::{cache_purge_expired, cache_take};
+    use crate::setup_invitation::{
+        cache_purge_expired, cache_take, load_persisted_invitation, persisted_invitation_entry,
+    };
 
     if let Ok(Some(pending)) = load_pending_accept_household(&state.state_dir) {
         if pending
@@ -991,7 +997,21 @@ async fn consume_accept_household_invitation(
     }
 
     let now = crate::time_util::unix_now_secs_checked("accept_household.clock").unwrap_or(0);
-    let Some(entry) = cache_take(&state.setup_invitation_cache, token).await else {
+    let entry = if let Some(entry) = cache_take(&state.setup_invitation_cache, token).await {
+        entry
+    } else if let Ok(Some(persisted)) = load_persisted_invitation(&state.state_dir) {
+        match persisted_invitation_entry(&persisted).filter(|entry| &entry.token == token) {
+            Some(entry) => entry,
+            None => {
+                return Err(cbor_error(
+                    StatusCode::NOT_FOUND,
+                    "invitation_not_found",
+                    None,
+                    None,
+                ));
+            }
+        }
+    } else {
         return Err(cbor_error(
             StatusCode::NOT_FOUND,
             "invitation_not_found",
@@ -1017,6 +1037,8 @@ pub async fn post_accept_household_confirm(
     State(state): State<BootstrapHandlerState>,
     body: Bytes,
 ) -> Response {
+    let _guard = ACCEPT_HOUSEHOLD_LOCK.lock().await;
+
     {
         let current = state.bootstrap.read().await;
         if *current != BootstrapState::ReadyForNaming {
@@ -1349,7 +1371,7 @@ pub async fn post_initialize(
         .await
     {
         Ok(token) => match P256PublicKey::from_bytes(&hh_pub_bytes) {
-            Ok(pub_key) => token.to_uri(&pub_key),
+            Ok(pub_key) => token.to_uri_with_host_and_name(&pub_key, None, Some(&name_persisted)),
             Err(_) => String::new(),
         },
         Err(e) => {

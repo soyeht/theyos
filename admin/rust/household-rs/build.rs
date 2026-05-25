@@ -36,7 +36,10 @@ fn main() {
     });
 
     let canon = path.canonicalize().unwrap_or_else(|_| path.clone());
-    println!("cargo:rustc-env=THEYOS_EMOJI_WORDLIST_PATH={}", canon.display());
+    println!(
+        "cargo:rustc-env=THEYOS_EMOJI_WORDLIST_PATH={}",
+        canon.display()
+    );
     println!("cargo:rerun-if-env-changed=THEYOS_EMOJI_WORDLIST");
     println!("cargo:rerun-if-changed={}", canon.display());
 }

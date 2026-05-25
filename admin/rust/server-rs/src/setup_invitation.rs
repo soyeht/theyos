@@ -322,6 +322,28 @@ pub fn load_persisted_invitation(
     household_rs::storage::read_optional_cbor(&path)
 }
 
+/// Convert a claimed, persisted invitation back into the runtime entry shape
+/// used by the accept-household path.
+#[must_use]
+pub fn persisted_invitation_entry(
+    invitation: &PersistedSetupInvitation,
+) -> Option<SetupInvitationEntry> {
+    let token = <[u8; 32]>::try_from(invitation.token.as_ref()).ok()?;
+    let iphone_addrs = invitation
+        .iphone_addrs
+        .iter()
+        .filter_map(|addr| addr.parse::<IpAddr>().ok())
+        .collect();
+    Some(SetupInvitationEntry {
+        token,
+        iphone_endpoint: invitation.iphone_endpoint.clone(),
+        iphone_addrs,
+        owner_display_name: invitation.owner_display_name.clone(),
+        hh_id: invitation.hh_id.clone(),
+        expires_at: invitation.expires_at,
+    })
+}
+
 /// Remove the persisted invitation (called after initialize completes or teardown).
 pub fn clear_persisted_invitation(state_dir: &Path) {
     let path = pending_invitation_path(state_dir);

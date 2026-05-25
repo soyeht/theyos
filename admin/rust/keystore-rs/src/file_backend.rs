@@ -80,10 +80,11 @@ impl KeystoreBackend for FileKeystore {
             }
         };
         let mut bytes = Vec::new();
-        file.read_to_end(&mut bytes).map_err(|e| KeystoreError::Io {
-            kind: e.kind().to_string(),
-            hint: format!("read {}: {e}", path.display()),
-        })?;
+        file.read_to_end(&mut bytes)
+            .map_err(|e| KeystoreError::Io {
+                kind: e.kind().to_string(),
+                hint: format!("read {}: {e}", path.display()),
+            })?;
         Ok(bytes)
     }
 

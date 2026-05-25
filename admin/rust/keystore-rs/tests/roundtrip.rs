@@ -86,11 +86,16 @@ fn file_backend_isolates_services() {
     let household = FileKeystore::new(dir.path(), "com.soyeht.theyos.household");
     let llm = FileKeystore::new(dir.path(), "com.soyeht.theyos.llm");
 
-    household.set("shared-account-name", b"household-value").unwrap();
+    household
+        .set("shared-account-name", b"household-value")
+        .unwrap();
     llm.set("shared-account-name", b"llm-value").unwrap();
 
     // Same account label, different services → distinct values.
-    assert_eq!(household.get("shared-account-name").unwrap(), b"household-value");
+    assert_eq!(
+        household.get("shared-account-name").unwrap(),
+        b"household-value"
+    );
     assert_eq!(llm.get("shared-account-name").unwrap(), b"llm-value");
 }
 

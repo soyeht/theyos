@@ -130,13 +130,7 @@ impl ServerState {
         per_claw_active: HashMap<String, ActiveProfile>,
         audit: AuditLogger,
     ) -> Self {
-        Self::with_audit_and_profile_dir(
-            providers,
-            default_active,
-            per_claw_active,
-            audit,
-            None,
-        )
+        Self::with_audit_and_profile_dir(providers, default_active, per_claw_active, audit, None)
     }
 
     /// Full constructor — audit logger + profile dir for disk-backed
@@ -228,18 +222,22 @@ impl ServerState {
     /// guarantee as `set_active`: disk is the source of truth, memory
     /// is updated only on success.
     pub fn reload_from_disk(&self) -> Result<usize, ProxyError> {
-        let dir = self.inner.profile_dir.as_ref().ok_or_else(|| {
-            ProxyError::Profile {
+        let dir = self
+            .inner
+            .profile_dir
+            .as_ref()
+            .ok_or_else(|| ProxyError::Profile {
                 path: "<no-profile-dir>".into(),
                 kind: "reload_from_disk called on a ServerState without profile_dir wired".into(),
-            }
-        })?;
-        let keystore = self.inner.keystore.as_ref().ok_or_else(|| {
-            ProxyError::Profile {
+            })?;
+        let keystore = self
+            .inner
+            .keystore
+            .as_ref()
+            .ok_or_else(|| ProxyError::Profile {
                 path: dir.display().to_string(),
                 kind: "reload_from_disk called on a ServerState without keystore wired".into(),
-            }
-        })?;
+            })?;
         let _io = self
             .inner
             .profile_io_lock
@@ -282,10 +280,7 @@ impl ServerState {
         claw_type: Option<&str>,
     ) -> Result<(Arc<dyn Provider>, String), ProxyError> {
         let active = match claw_type {
-            Some(ct) => snap
-                .per_claw_active
-                .get(ct)
-                .unwrap_or(&snap.default_active),
+            Some(ct) => snap.per_claw_active.get(ct).unwrap_or(&snap.default_active),
             None => &snap.default_active,
         };
         let provider = snap
@@ -304,13 +299,13 @@ pub fn router(state: ServerState) -> Router {
         .route("/v1/models", get(list_models_default))
         .route("/v1/chat/completions", post(chat_default))
         .route("/v1/c/{claw_type}/models", get(list_models_claw))
-        .route(
-            "/v1/c/{claw_type}/chat/completions",
-            post(chat_claw),
-        )
+        .route("/v1/c/{claw_type}/chat/completions", post(chat_claw))
         // Admin (loopback only; server-rs reverse-proxies after auth).
         .route("/admin/catalog", get(admin_catalog))
-        .route("/admin/llm/active", get(admin_get_active).put(admin_put_active))
+        .route(
+            "/admin/llm/active",
+            get(admin_get_active).put(admin_put_active),
+        )
         .route(
             "/admin/llm/active/{claw_type}",
             put(admin_put_active_claw).delete(admin_delete_active_claw),
@@ -319,14 +314,8 @@ pub fn router(state: ServerState) -> Router {
             "/admin/llm/providers",
             get(admin_list_providers).post(admin_upsert_provider),
         )
-        .route(
-            "/admin/llm/providers/{id}",
-            delete(admin_delete_provider),
-        )
-        .route(
-            "/admin/llm/providers/{id}/test",
-            post(admin_test_provider),
-        )
+        .route("/admin/llm/providers/{id}", delete(admin_delete_provider))
+        .route("/admin/llm/providers/{id}/test", post(admin_test_provider))
         .route("/admin/llm/audit", get(admin_get_audit))
         .with_state(state)
 }
@@ -499,14 +488,15 @@ async fn chat_inner(
             Ok(match resp {
                 ChatResponse::Json(bytes) => {
                     let mut headers = HeaderMap::new();
-                    headers
-                        .insert("content-type", HeaderValue::from_static("application/json"));
+                    headers.insert("content-type", HeaderValue::from_static("application/json"));
                     (StatusCode::OK, headers, bytes).into_response()
                 }
                 ChatResponse::Stream(stream) => {
                     let mut headers = HeaderMap::new();
-                    headers
-                        .insert("content-type", HeaderValue::from_static("text/event-stream"));
+                    headers.insert(
+                        "content-type",
+                        HeaderValue::from_static("text/event-stream"),
+                    );
                     headers.insert("cache-control", HeaderValue::from_static("no-cache"));
                     headers.insert("connection", HeaderValue::from_static("keep-alive"));
                     let body = Body::from_stream(stream);
@@ -670,10 +660,14 @@ fn set_active(
 ) -> Result<Json<ActiveProfile>, ApiError> {
     let SetActiveBody { provider, model } = body;
     if provider.trim().is_empty() {
-        return Err(ApiError(ProxyError::BadRequest("provider must not be empty".into())));
+        return Err(ApiError(ProxyError::BadRequest(
+            "provider must not be empty".into(),
+        )));
     }
     if model.trim().is_empty() {
-        return Err(ApiError(ProxyError::BadRequest("model must not be empty".into())));
+        return Err(ApiError(ProxyError::BadRequest(
+            "model must not be empty".into(),
+        )));
     }
     let new_active = ActiveProfile {
         provider: provider.clone(),
@@ -871,7 +865,11 @@ async fn admin_upsert_provider(
     State(state): State<ServerState>,
     Json(body): Json<UpsertProviderBody>,
 ) -> Result<Json<ProviderSummary>, ApiError> {
-    let UpsertProviderBody { id, config, credential } = body;
+    let UpsertProviderBody {
+        id,
+        config,
+        credential,
+    } = body;
     let id = normalize_provider_id(&id)?;
 
     // Write the credential (if any) BEFORE persisting the profile entry.
@@ -909,18 +907,14 @@ async fn admin_upsert_provider(
         // remains but the in-memory snapshot stays at the previous
         // version — surfacing the error without leaving the runtime in
         // a half-updated state.
-        let keystore = state
-            .inner
-            .keystore
-            .as_ref()
-            .ok_or_else(|| {
-                ApiError(ProxyError::Profile {
-                    path: dir.display().to_string(),
-                    kind: "keystore not wired on this ServerState; admin mutators disabled".into(),
-                })
-            })?;
-        let registry = crate::build_provider_registry(&doc.providers, &**keystore)
-            .map_err(ApiError)?;
+        let keystore = state.inner.keystore.as_ref().ok_or_else(|| {
+            ApiError(ProxyError::Profile {
+                path: dir.display().to_string(),
+                kind: "keystore not wired on this ServerState; admin mutators disabled".into(),
+            })
+        })?;
+        let registry =
+            crate::build_provider_registry(&doc.providers, &**keystore).map_err(ApiError)?;
         let snap = state.snapshot();
         state.replace_snapshot(Arc::new(StateSnapshot {
             providers: registry,
@@ -952,8 +946,7 @@ async fn admin_delete_provider(
 ) -> Result<StatusCode, ApiError> {
     let id = normalize_provider_id(&id)?;
     let snap = state.snapshot();
-    if snap.default_active.provider == id
-        || snap.per_claw_active.values().any(|a| a.provider == id)
+    if snap.default_active.provider == id || snap.per_claw_active.values().any(|a| a.provider == id)
     {
         return Err(ApiError(ProxyError::BadRequest(format!(
             "provider {id:?} is in use by the active profile or a per-claw overlay; switch active first"
@@ -987,13 +980,11 @@ async fn admin_delete_provider(
             let _ = cfg; // silence unused warning if we ever take a different path
             let _ = keystore.delete(&format!("llm.api_key.{id}"));
         }
-        let registry = crate::build_provider_registry(&doc.providers, &**keystore)
-            .map_err(ApiError)?;
+        let registry =
+            crate::build_provider_registry(&doc.providers, &**keystore).map_err(ApiError)?;
         state.replace_snapshot(Arc::new(StateSnapshot {
             providers: registry,
-            default_active: doc
-                .active
-                .unwrap_or_else(|| snap.default_active.clone()),
+            default_active: doc.active.unwrap_or_else(|| snap.default_active.clone()),
             per_claw_active: snap.per_claw_active.clone(),
         }));
     }
@@ -1015,17 +1006,16 @@ async fn admin_test_provider(
 ) -> Result<Json<ProviderTestResponse>, ApiError> {
     let id = normalize_provider_id(&id)?;
     let snap = state.snapshot();
-    let provider = snap
-        .providers
-        .get(&id)
-        .cloned()
-        .ok_or_else(|| ApiError(ProxyError::InvalidProviderSelection {
+    let provider = snap.providers.get(&id).cloned().ok_or_else(|| {
+        ApiError(ProxyError::InvalidProviderSelection {
             provider: id.clone(),
             hint: "not configured; add it via POST /admin/llm/providers first".into(),
-        }))?;
+        })
+    })?;
     let model = provider
         .models()
-        .first().map_or_else(|| "default".to_string(), |m| m.id.clone());
+        .first()
+        .map_or_else(|| "default".to_string(), |m| m.id.clone());
     // Minimal one-token probe — most upstreams will respond in under a
     // second for "hi". This is intentionally not configurable: a long
     // test prompt would invite operators to use this endpoint as a
@@ -1078,10 +1068,12 @@ async fn admin_get_audit(
         .inner
         .audit
         .read_paginated(limit, q.before.as_deref())
-        .map_err(|e| ApiError(ProxyError::Profile {
-            path: "audit.log".into(),
-            kind: format!("read: {e}"),
-        }))?;
+        .map_err(|e| {
+            ApiError(ProxyError::Profile {
+                path: "audit.log".into(),
+                kind: format!("read: {e}"),
+            })
+        })?;
     Ok(Json(AuditResponse { records }))
 }
 

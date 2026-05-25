@@ -12,24 +12,15 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use llm_proxy::audit::{AuditLogger, AuditRecord, AuditStatus};
-use llm_proxy::{
-    ActiveProfile, OpenAiCompatProvider, Provider, ServerState, router,
-};
+use llm_proxy::{ActiveProfile, OpenAiCompatProvider, Provider, ServerState, router};
 use serde_json::{Value, json};
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
-async fn spawn_proxy(
-    upstream_url: String,
-    audit: AuditLogger,
-) -> String {
-    let provider = OpenAiCompatProvider::new(
-        "ollama-test",
-        upstream_url,
-        None,
-        vec!["llama3.1".into()],
-    )
-    .unwrap();
+async fn spawn_proxy(upstream_url: String, audit: AuditLogger) -> String {
+    let provider =
+        OpenAiCompatProvider::new("ollama-test", upstream_url, None, vec!["llama3.1".into()])
+            .unwrap();
     let mut providers: HashMap<String, Arc<dyn Provider>> = HashMap::new();
     providers.insert("ollama-test".into(), Arc::new(provider));
     let state = ServerState::with_audit(
@@ -258,5 +249,8 @@ async fn multiple_requests_append_in_order() {
     let t0 = &records[0].ts;
     let t1 = &records[1].ts;
     let t2 = &records[2].ts;
-    assert!(t0 <= t1 && t1 <= t2, "timestamps not monotonic: {t0} {t1} {t2}");
+    assert!(
+        t0 <= t1 && t1 <= t2,
+        "timestamps not monotonic: {t0} {t1} {t2}"
+    );
 }

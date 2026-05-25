@@ -14,9 +14,7 @@ use serde_json::json;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
-async fn spawn_proxy_with_provider(
-    upstream_url: String,
-) -> (tokio::task::JoinHandle<()>, String) {
+async fn spawn_proxy_with_provider(upstream_url: String) -> (tokio::task::JoinHandle<()>, String) {
     spawn_proxy_with_overrides(upstream_url, HashMap::new()).await
 }
 
@@ -24,13 +22,9 @@ async fn spawn_proxy_with_overrides(
     upstream_url: String,
     per_claw_active: HashMap<String, ActiveProfile>,
 ) -> (tokio::task::JoinHandle<()>, String) {
-    let provider = OpenAiCompatProvider::new(
-        "ollama-test",
-        upstream_url,
-        None,
-        vec!["llama3.1".into()],
-    )
-    .unwrap();
+    let provider =
+        OpenAiCompatProvider::new("ollama-test", upstream_url, None, vec!["llama3.1".into()])
+            .unwrap();
     let mut providers: HashMap<String, Arc<dyn Provider>> = HashMap::new();
     providers.insert("ollama-test".to_string(), Arc::new(provider));
     let default_active = ActiveProfile {
@@ -321,7 +315,7 @@ async fn profile_round_trip_via_disk() {
             models: vec!["llama3.1".into()],
             cli_binary_path: None,
             cli_timeout_secs: None,
-        cli_flavor: CliFlavor::default(),
+            cli_flavor: CliFlavor::default(),
         },
     );
     let profile = ProfileDoc {
