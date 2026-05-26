@@ -13,8 +13,8 @@
 
 use crate::bonjour_trust::BrowserConfig;
 use crate::handlers_bootstrap::{BootstrapHandlerState, BootstrapStateArc};
-use crate::handlers_claws;
 use crate::handlers_household;
+use crate::handlers_household_claws;
 use crate::handlers_owner_events;
 use crate::handlers_pair_device;
 use crate::handlers_pair_machine;
@@ -474,35 +474,45 @@ pub async fn bootstrap_household(shared_state: Option<SharedState>) {
     }
     let bootstrap_rt = crate::handlers_bootstrap::bootstrap_router(bootstrap_handler_state);
 
-    // Household-namespaced Claw Store router. Reuses the same handlers that
-    // serve `/api/v1/claws*` under the Bearer-authenticated admin listener
-    // (`api_rest` in main.rs). Mounting them here exposes the same surface
-    // to PoP-authenticated household callers (iPhone Soyeht client) without
-    // duplicating logic. Wire format is `application/json` — the iOS Claw
-    // Store decoder is a `JSONDecoder`; do not switch to CBOR here.
+    // Household-namespaced Claw Store router. Wraps the shared handlers
+    // (`handlers_claws::*`, also mounted on the Bearer-authenticated admin
+    // router in `main.rs`) with a per-handler PoP authorization gate, so
+    // every route here is restricted to delegated household devices
+    // (iPhone Soyeht client) whose certs carry the matching `Operation::Claws*`
+    // capability. The wrappers live in `handlers_household_claws.rs` and
+    // mirror the per-handler auth pattern used by `handlers_pair_machine`
+    // and `handlers_household::snapshot`. See `handlers_household_claws.rs`
+    // for the route → `Operation` mapping.
+    //
+    // Wire format is `application/json` — the iOS Claw Store decoder is a
+    // `JSONDecoder`; do not switch to CBOR here.
     //
     // Only mounted when caller supplies `SharedState` (main daemon path).
     // Short-lived bring-up paths (e.g. `theyos install` post-commit
     // listener) pass `None` and omit these routes.
     let claws_router = shared_state.map(|state| {
+        let claws_state = handlers_household_claws::HouseholdClawsState {
+            shared: state,
+            household: identity_state.clone(),
+        };
         axum::Router::new()
             .route(
                 "/api/v1/household/claws",
-                axum::routing::get(handlers_claws::handle_list_claws),
+                axum::routing::get(handlers_household_claws::handle_household_list_claws),
             )
             .route(
                 "/api/v1/household/claws/{name}/availability",
-                axum::routing::get(handlers_claws::handle_claw_availability),
+                axum::routing::get(handlers_household_claws::handle_household_claw_availability),
             )
             .route(
                 "/api/v1/household/claws/{name}/install",
-                axum::routing::post(handlers_claws::handle_install_claw),
+                axum::routing::post(handlers_household_claws::handle_household_install_claw),
             )
             .route(
                 "/api/v1/household/claws/{name}/uninstall",
-                axum::routing::post(handlers_claws::handle_uninstall_claw),
+                axum::routing::post(handlers_household_claws::handle_household_uninstall_claw),
             )
-            .with_state(state)
+            .with_state(claws_state)
     });
 
     let mut household_router = identity_router.merge(pair_router).merge(bootstrap_rt);
