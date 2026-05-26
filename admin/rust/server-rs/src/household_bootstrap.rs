@@ -14,12 +14,14 @@
 use crate::bonjour_trust::BrowserConfig;
 use crate::handlers_bootstrap::{BootstrapHandlerState, BootstrapStateArc};
 use crate::handlers_household;
+use crate::handlers_household_claws;
 use crate::handlers_owner_events;
 use crate::handlers_pair_device;
 use crate::handlers_pair_machine;
 use crate::household_listener;
 use crate::household_listener::InterfaceClass;
 use crate::household_state::HouseholdState;
+use crate::state::SharedState;
 use crate::time_util;
 use crate::{bonjour_browser, bonjour_publisher, setup_beacon, startup_wiring};
 use household_rs::KeyBackingPolicy;
@@ -122,12 +124,23 @@ pub fn household_port_from_env() -> u16 {
 /// On a fresh, uninitialized state directory, `/identity` returns 503 until
 /// `theyos install` writes identity records; a watcher then hot-loads them.
 ///
+/// `shared_state` is `Some(state)` when called from the main daemon path
+/// (mounts household-namespaced Claw Store routes at
+/// `/api/v1/household/claws*` using the engine's main `SharedState`).
+/// Pass `None` from short-lived bring-up paths that don't have a full
+/// `SharedState` yet (e.g. `theyos install`'s post-commit listener) —
+/// Claw Store routes will be omitted, but identity / snapshot / pair /
+/// bootstrap remain available.
+///
+/// The household listener is independent from the main `cfg.addr`
+/// listener (FR-010 untouched).
+///
 /// # Panics
 ///
 /// Panics if the on-disk identity is corrupted or fails chain verification —
 /// refuse-to-start (US1 acceptance C6). The structured-log envelope at
 /// `bootstrap.error` carries the underlying cause before the panic.
-pub async fn bootstrap_household() {
+pub async fn bootstrap_household(shared_state: Option<SharedState>) {
     let state_dir = resolve_household_state_dir();
     if let Err(e) = std::fs::create_dir_all(&state_dir) {
         tracing::warn!(
@@ -461,7 +474,51 @@ pub async fn bootstrap_household() {
     }
     let bootstrap_rt = crate::handlers_bootstrap::bootstrap_router(bootstrap_handler_state);
 
+    // Household-namespaced Claw Store router. Wraps the shared handlers
+    // (`handlers_claws::*`, also mounted on the Bearer-authenticated admin
+    // router in `main.rs`) with a per-handler PoP authorization gate, so
+    // every route here is restricted to delegated household devices
+    // (iPhone Soyeht client) whose certs carry the matching `Operation::Claws*`
+    // capability. The wrappers live in `handlers_household_claws.rs` and
+    // mirror the per-handler auth pattern used by `handlers_pair_machine`
+    // and `handlers_household::snapshot`. See `handlers_household_claws.rs`
+    // for the route → `Operation` mapping.
+    //
+    // Wire format is `application/json` — the iOS Claw Store decoder is a
+    // `JSONDecoder`; do not switch to CBOR here.
+    //
+    // Only mounted when caller supplies `SharedState` (main daemon path).
+    // Short-lived bring-up paths (e.g. `theyos install` post-commit
+    // listener) pass `None` and omit these routes.
+    let claws_router = shared_state.map(|state| {
+        let claws_state = handlers_household_claws::HouseholdClawsState {
+            shared: state,
+            household: identity_state.clone(),
+        };
+        axum::Router::new()
+            .route(
+                "/api/v1/household/claws",
+                axum::routing::get(handlers_household_claws::handle_household_list_claws),
+            )
+            .route(
+                "/api/v1/household/claws/{name}/availability",
+                axum::routing::get(handlers_household_claws::handle_household_claw_availability),
+            )
+            .route(
+                "/api/v1/household/claws/{name}/install",
+                axum::routing::post(handlers_household_claws::handle_household_install_claw),
+            )
+            .route(
+                "/api/v1/household/claws/{name}/uninstall",
+                axum::routing::post(handlers_household_claws::handle_household_uninstall_claw),
+            )
+            .with_state(claws_state)
+    });
+
     let mut household_router = identity_router.merge(pair_router).merge(bootstrap_rt);
+    if let Some(r) = claws_router {
+        household_router = household_router.merge(r);
+    }
     if let Some(r) = pair_machine_router {
         household_router = household_router.merge(r);
     }

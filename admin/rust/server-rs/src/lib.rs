@@ -24,6 +24,7 @@ pub mod handlers_admin;
 pub mod handlers_bootstrap;
 pub mod handlers_claws;
 pub mod handlers_household;
+pub mod handlers_household_claws;
 pub mod handlers_instances;
 pub mod handlers_invites;
 pub mod handlers_jobs;

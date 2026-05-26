@@ -560,7 +560,11 @@ async fn run_pair_machine(
             stage = "pair_machine.listener_swap",
             "candidate committed; starting household listener"
         );
-        crate::household_bootstrap::bootstrap_household().await;
+        // Install CLI runs without a SharedState — skip mounting the
+        // household-namespaced Claw Store routes here. Identity/snapshot/
+        // pair-device/bootstrap remain available; the main daemon picks up
+        // and provides Claws once it boots with full state.
+        crate::household_bootstrap::bootstrap_household(None).await;
         info!(
             stage = "pair_machine.listener_swap",
             "household listener is now serving"
