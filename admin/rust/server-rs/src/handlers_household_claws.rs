@@ -1,10 +1,10 @@
 //! Household-namespaced Claw Store handlers (`/api/v1/household/claws*`).
 //!
-//! Wraps the underlying `handlers_claws::*` logic with a per-handler PoP
+//! Wraps the underlying `handlers_claws::*` logic with a per-handler `PoP`
 //! authorization gate matching the pattern in `handlers_pair_machine.rs`
 //! (`founder_join_request_handler`) and `handlers_household.rs`
 //! (`snapshot`). The shared `handlers_claws` handlers themselves cannot
-//! enforce PoP auth — they're also mounted on the Bearer-authenticated
+//! enforce `PoP` auth — they're also mounted on the Bearer-authenticated
 //! admin router (`api_rest` in `main.rs`) and must stay shape-compatible
 //! with that surface.
 //!
@@ -12,10 +12,10 @@
 //! `Operation::Claws*` so the founder's caveats can restrict which
 //! delegated devices may perform which action):
 //!
-//!   GET    /api/v1/household/claws                       → Operation::ClawsList
-//!   GET    /api/v1/household/claws/{name}/availability   → Operation::ClawsList
-//!   POST   /api/v1/household/claws/{name}/install        → Operation::ClawsCreate
-//!   POST   /api/v1/household/claws/{name}/uninstall      → Operation::ClawsDelete
+//!   GET    /api/v1/household/claws                       → `Operation::ClawsList`
+//!   GET    /api/v1/household/claws/{name}/availability   → `Operation::ClawsList`
+//!   POST   /api/v1/household/claws/{name}/install        → `Operation::ClawsCreate`
+//!   POST   /api/v1/household/claws/{name}/uninstall      → `Operation::ClawsDelete`
 //!
 //! Failure mode is `401 Unauthorized` with a deterministic empty body —
 //! no oracle that distinguishes "missing header" from "bad signature".
@@ -36,7 +36,7 @@ use household_rs::caveats::Operation;
 
 /// Combined state for the household Claws router. Holds both the engine's
 /// main `SharedState` (forwarded to the underlying `handlers_claws::*`
-/// logic) and the `HouseholdState` needed for PoP authorization.
+/// logic) and the `HouseholdState` needed for `PoP` authorization.
 #[derive(Clone)]
 pub struct HouseholdClawsState {
     pub shared: SharedState,
