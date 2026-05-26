@@ -580,7 +580,23 @@ impl ClawStore {
 }
 
 /// Atomic write-rename to prevent corruption.
+///
+/// Ensures the parent directory exists before writing — on a fresh
+/// install the engine's state directory (e.g. `${THEYOS_DIR}/.run/`)
+/// has not been created by anything else: `ClawStore::new()` tolerates
+/// the state file being absent (returns an empty map), so the first
+/// write through this function is the first time anything inside that
+/// directory is touched. Without `create_dir_all`, `std::fs::write`
+/// returns `ENOENT` and the user sees
+/// `"failed to mark installing: IO error: No such file or directory"`
+/// on the very first Claw install attempt.
+///
+/// `create_dir_all` is idempotent — a no-op when the directory already
+/// exists from a previous successful run.
 fn persist(path: &Path, state: &HashMap<String, InstalledState>) -> Result<(), StoreError> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
     let json = serde_json::to_string_pretty(state)?;
     let tmp = path.with_extension("json.tmp");
     std::fs::write(&tmp, format!("{json}\n"))?;
@@ -607,6 +623,32 @@ mod tests {
         assert!(!store.state_file.exists());
         store.mark_ready("picoclaw").expect("mark_ready");
         assert!(store.state_file.exists());
+    }
+
+    /// Regression test for the fresh-install crash: when the state
+    /// file's *parent* directory does not exist yet, `persist()` must
+    /// create it instead of returning ENOENT. Reproduces the user-facing
+    /// "failed to mark installing: IO error: No such file or directory"
+    /// that fired on the very first Claw install attempt against a
+    /// brand-new theyos engine on macOS Sequoia.
+    #[test]
+    fn clawstore_persist_creates_missing_parent_directory() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // Path one level deeper than the tempdir — parent doesn't exist.
+        let nested = dir.path().join(".run").join("installed_claws.json");
+        assert!(!nested.parent().unwrap().exists());
+
+        let store = ClawStore::new(&nested).expect("ClawStore::new tolerates missing path");
+        store
+            .mark_installing("picoclaw", "job_42")
+            .expect("mark_installing must create the missing parent directory");
+
+        assert!(nested.exists(), "state file written");
+        assert!(nested.parent().unwrap().exists(), "parent dir created");
+
+        // Round-trip: re-loading sees the persisted state.
+        let store2 = ClawStore::new(&nested).expect("reload");
+        assert_eq!(store2.get_status("picoclaw"), ClawStatus::Installing);
     }
 
     #[test]
