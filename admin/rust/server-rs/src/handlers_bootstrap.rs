@@ -122,6 +122,10 @@ pub fn bootstrap_router(state: BootstrapHandlerState) -> Router {
             post(post_claim_setup_invitation),
         )
         .route("/bootstrap/teardown", post(post_teardown))
+        .route(
+            "/bootstrap/pair-machine/local/stage",
+            post(post_pair_machine_local_stage),
+        )
         .route("/health", get(get_health))
         .route("/healthz", get(get_health))
         .with_state(state)
@@ -347,6 +351,26 @@ struct BootstrapStatusResponse {
     uptime_secs: u64,
     hh_id: Option<String>,
     device_count: u32,
+
+    /// Top-level phase of the macOS guest-image init (`download_ipsw`,
+    /// `create_disk`, `install_macos`, `provision`, `create_snapshot`,
+    /// `complete`). `None` on Linux (no guest VM) and on Macs that
+    /// haven't started provisioning yet. See `guest_image_state.rs`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    guest_image_phase: Option<String>,
+
+    /// Overall init status (`pending`, `in_progress`, `done`,
+    /// `failed`). Paired with `guest_image_phase` — when the iPhone
+    /// Claw Store sees `status != "done"` it gates the install button
+    /// and renders a "preparing this Mac" state.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    guest_image_status: Option<String>,
+
+    /// Most recent error from a failed phase attempt. Only present
+    /// when `guest_image_status == "failed"`. Surfaces user-facing
+    /// retry hints in the iPhone UI.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    guest_image_error: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -373,6 +397,7 @@ pub async fn get_bootstrap_status(State(state): State<BootstrapHandlerState>) ->
 
     let (hh_id, device_count) = hh_info(&state.household, bootstrap_state).await;
 
+    let guest_image = crate::guest_image_state::GuestImageState::read_current();
     let body = BootstrapStatusResponse {
         v: 1,
         state: bootstrap_state.as_str(),
@@ -382,6 +407,9 @@ pub async fn get_bootstrap_status(State(state): State<BootstrapHandlerState>) ->
         uptime_secs,
         hh_id,
         device_count,
+        guest_image_phase: guest_image.phase,
+        guest_image_status: guest_image.status,
+        guest_image_error: guest_image.error,
     };
 
     // elapsed_ms: u128→u64 truncation impossible in practice (u64 covers ~585 millennia).
@@ -542,6 +570,145 @@ pub async fn post_claim_setup_invitation(
 ///
 /// No session auth — owner biometric + cert chain serves as authentication.
 /// Validation follows the 14-step contract order; steps 6+9 are merged into one
+/// `POST /bootstrap/pair-machine/local/stage` — daemon-side equivalent of
+/// `theyos install --pair-machine`. Mints a candidate keypair + signed
+/// `JoinRequest`, opens the `PairMachineWindow` with persistence,
+/// spawns the pre-household listener so the founder can deliver the
+/// trust anchor + signed `JoinResponse`, and returns the canonical
+/// `pair-machine` URI for the SoyehtMac.app to render as a QR.
+///
+/// Loopback-only: the request `ConnectInfo` peer address MUST be
+/// `127.0.0.1` / `::1`. Calls from the LAN / Tailscale side return
+/// `404 Not Found` (we intentionally do not advertise the endpoint
+/// shape across the LAN, so the response is indistinguishable from
+/// a missing route).
+///
+/// Engine-state gate: the candidate must NOT already have a household
+/// identity. Accepted states are `Uninitialized` and `ReadyForNaming`.
+/// `NamedAwaitingPair` is also accepted because the `SoyehtMac` welcome
+/// flow offers a "join my existing house instead" escape hatch on a
+/// Mac that mistakenly started the bootstrap-accept ceremony — the
+/// caller is expected to follow up with `POST /bootstrap/teardown`
+/// before this endpoint mutates state, but the gate itself permits
+/// the call to make that flow recoverable.
+///
+/// Body: `{"v":1,"transport":"tailscale"|"lan"}`. Default transport is
+/// `tailscale` when the body is empty or the field is omitted.
+///
+/// Response 200: `{"pair_machine_uri": "...", "fingerprint": "...",
+/// "ttl_unix": <u64>}`.
+#[derive(serde::Deserialize, Default)]
+struct PairMachineStageRequest {
+    #[serde(rename = "v", default)]
+    _version: Option<u8>,
+    #[serde(default)]
+    transport: Option<String>,
+}
+
+pub async fn post_pair_machine_local_stage(
+    State(state): State<BootstrapHandlerState>,
+    ConnectInfo(peer): ConnectInfo<std::net::SocketAddr>,
+    body: Bytes,
+) -> Response {
+    // Loopback-only ACL — calls from any other address get the same
+    // 404 a missing route would produce, hiding the endpoint shape.
+    if !peer.ip().is_loopback() {
+        tracing::warn!(
+            stage = "pair_machine.local.stage.non_loopback_rejected",
+            peer = %peer,
+        );
+        return StatusCode::NOT_FOUND.into_response();
+    }
+
+    // Engine-state gate. The candidate must not yet hold a household
+    // identity (Ready / Recovering). NamedAwaitingPair is accepted to
+    // support the welcome-flow escape hatch — the caller still has to
+    // teardown before this becomes usable, but the gate doesn't
+    // pre-emptively reject so the SoyehtMac UI can branch cleanly.
+    let current_bs = *state.bootstrap.read().await;
+    match current_bs {
+        BootstrapState::Uninitialized
+        | BootstrapState::ReadyForNaming
+        | BootstrapState::NamedAwaitingPair => {}
+        other => {
+            tracing::warn!(
+                stage = "pair_machine.local.stage.rejected",
+                reason = "household_already_paired",
+                state = other.as_str(),
+            );
+            return cbor_error(
+                StatusCode::CONFLICT,
+                "household_already_paired",
+                None,
+                Some(other.as_str()),
+            );
+        }
+    }
+
+    let req: PairMachineStageRequest = if body.is_empty() {
+        PairMachineStageRequest::default()
+    } else {
+        match serde_json::from_slice(&body) {
+            Ok(parsed) => parsed,
+            Err(e) => {
+                return cbor_error(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_request_body",
+                    Some(format!("{e}")),
+                    None,
+                );
+            }
+        }
+    };
+
+    let transport = match req.transport.as_deref().unwrap_or("tailscale") {
+        "tailscale" => household_rs::pair_machine::JoinTransport::Tailscale,
+        "lan" => household_rs::pair_machine::JoinTransport::Lan,
+        other => {
+            return cbor_error(
+                StatusCode::BAD_REQUEST,
+                "unsupported_transport",
+                Some(format!("transport={other:?}; expected 'tailscale' or 'lan'")),
+                None,
+            );
+        }
+    };
+
+    let key_policy = household_rs::KeyBackingPolicy::from_env();
+
+    match crate::pair_machine_local::stage(&state.state_dir, transport, key_policy).await {
+        Ok(outcome) => {
+            tracing::info!(
+                stage = "pair_machine.local.stage.ok",
+                fingerprint = %outcome.fingerprint,
+                ttl_unix = outcome.ttl_unix,
+                transport = match transport {
+                    household_rs::pair_machine::JoinTransport::Tailscale => "tailscale",
+                    household_rs::pair_machine::JoinTransport::Lan => "lan",
+                },
+            );
+            (
+                StatusCode::OK,
+                [(header::CONTENT_TYPE, HeaderValue::from_static("application/json"))],
+                serde_json::to_vec(&outcome).unwrap_or_default(),
+            )
+                .into_response()
+        }
+        Err(e) => {
+            tracing::warn!(
+                stage = "pair_machine.local.stage.failed",
+                error = %e,
+            );
+            cbor_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "stage_failed",
+                Some(format!("{e}")),
+                None,
+            )
+        }
+    }
+}
+
 /// atomic `check_and_persist` (burns nonce before cert/sig checks to prevent
 /// probing different `signed_by` values with the same nonce).
 pub async fn post_teardown(State(state): State<BootstrapHandlerState>, body: Bytes) -> Response {

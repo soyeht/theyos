@@ -20,6 +20,8 @@ pub mod cloudflared_sync;
 pub mod config;
 #[cfg(any(test, feature = "failure-injection"))]
 pub mod failure_injection;
+pub mod guest_image_state;
+pub mod pair_machine_local;
 pub mod handlers_admin;
 pub mod handlers_bootstrap;
 pub mod handlers_claws;
