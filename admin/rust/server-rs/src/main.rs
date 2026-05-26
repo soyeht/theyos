@@ -180,14 +180,19 @@ async fn main() {
     info!("Starting server-rs on {}", cfg.addr);
     info!("Serving SPA from {:?}", cfg.web_dir);
 
-    // ─── Household identity (Phase 1) — separate listener, brought up first ──
+    // ─── Household identity (Phase 1) — separate listener, deferred ──
     //
     // Per spec/001-phase-1-crypto-skeleton: a dedicated listener serves
     // /api/v1/household/* on every loopback + LAN + Tailscale interface. This
     // is independent of the main `cfg.addr` listener (which carries the
     // existing /api/v1/mobile/* surface — FR-010 untouched).
+    //
+    // `bootstrap_household` is now invoked AFTER `SharedState` is built (see
+    // below) so that household-namespaced Claw Store routes can be mounted
+    // on the same listener. The household listener still comes up well
+    // before the main `cfg.addr` listener at `axum::serve()` near EOF, so
+    // iPhone onboarding via Bonjour discovery is unaffected.
     let _push_status = server_rs::startup_wiring::install_house_created_push_transport_from_env();
-    server_rs::household_bootstrap::bootstrap_household().await;
 
     // ─── Shared state construction ────────────────────────────────────────────
 
@@ -366,6 +371,14 @@ async fn main() {
         capacity_lock: tokio::sync::Mutex::new(()),
         llm_proxy_client: server_rs::handlers_llm::ProxyClient::from_env(),
     });
+
+    // ── Household identity listener bring-up ─────────────────────────────
+    // Deferred from line ~190 to here so the listener can mount the
+    // household-namespaced Claw Store routes that require SharedState.
+    // The household listener still comes up before the main api listener
+    // at the bottom of `main`, so iPhone onboarding via Bonjour stays
+    // unaffected (FR-008/FR-017 timing window preserved).
+    server_rs::household_bootstrap::bootstrap_household(Some(Arc::clone(&state))).await;
 
     // ── Cloudflared sync ─────────────────────────────────────────────────
     // Reconcile the on-disk cloudflared config.yml against the public_sites
