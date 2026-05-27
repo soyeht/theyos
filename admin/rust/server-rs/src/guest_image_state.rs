@@ -24,6 +24,7 @@
 //! iPhone can distinguish "doesn't apply" from "in progress" cleanly.
 
 use serde::Serialize;
+#[cfg(target_os = "macos")]
 use std::path::PathBuf;
 
 /// Snapshot of guest-image init progress for one Mac engine. All
