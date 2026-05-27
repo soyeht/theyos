@@ -59,15 +59,32 @@ pub struct PairMachineRouterState {
     pub state_dir: PathBuf,
 }
 
-/// State for M2's pre-household listener. This process does not have a
-/// household identity yet; it only has the candidate keypair and a staged
-/// `PairMachineWindow` from `theyos install --pair-machine`.
+/// State for M2's pre-household listener (CLI `theyos install
+/// --pair-machine` path) AND for the daemon-mounted `/pair-machine/local/*`
+/// routes wired in `household_bootstrap::bootstrap_household`.
+///
+/// On the CLI path the process has no household identity yet, so
+/// `bootstrap` is `None` — the candidate's own install path is the
+/// pre-household phase by construction. On the daemon path we plumb
+/// the live `BootstrapState` lock so `local_finalize_handler` can
+/// re-check the engine has not transitioned into Ready/Recovering
+/// while it was waiting on `BOOTSTRAP_MUTATION_LOCK`.
+///
+/// Single-flight finalize serialisation is now handled by
+/// `bootstrap_mutation_lock::BOOTSTRAP_MUTATION_LOCK` (acquired in
+/// `local_finalize_handler`) rather than a per-instance mutex; the
+/// shared lock also covers `accept_household_confirm`, closing the
+/// TOCTOU window where both writers could race
+/// `household_record.cbor` / `machine_cert.cbor` / the self-shard.
 #[derive(Clone)]
 pub struct PreHouseholdRouterState {
     pub window: Arc<PairMachineWindow>,
     pub state_dir: PathBuf,
     pub key_policy: household_rs::KeyBackingPolicy,
-    pub finalize_lock: Arc<tokio::sync::Mutex<()>>,
+    /// Live engine bootstrap state lock when running inside the daemon;
+    /// `None` on the CLI install path, where the candidate process has
+    /// no household identity yet and finalize is always allowed.
+    pub bootstrap: Option<Arc<tokio::sync::RwLock<BootstrapState>>>,
 }
 
 pub fn pre_household_router(state: PreHouseholdRouterState) -> Router {
@@ -496,7 +513,43 @@ pub async fn local_finalize_handler(
     body: Bytes,
 ) -> Response {
     let t0 = Instant::now();
-    let _finalize_guard = state.finalize_lock.lock().await;
+    // Serialise finalize with every other bootstrap-mutation writer
+    // (`accept_household`, `accept_household_confirm`, `pair_machine_local
+    // stage`). Acquiring the shared lock BEFORE reading the window
+    // snapshot and BEFORE re-validating bootstrap state means a
+    // concurrent `accept_household_confirm` cannot land mid-finalize and
+    // overwrite the candidate's `household_record.cbor` /
+    // `machine_cert.cbor` / self-shard. The lock is dropped at the end
+    // of the handler (after `staged.commit()` and the bootstrap-state
+    // persist).
+    let _mutation_guard = crate::bootstrap_mutation_lock::BOOTSTRAP_MUTATION_LOCK
+        .lock()
+        .await;
+
+    // Daemon path only: re-check engine bootstrap state inside the
+    // critical section. If the engine already advanced past pre-household
+    // (Ready/Recovering) — for example a sibling `accept_household_confirm`
+    // committed while we waited on the lock — refuse with the contract's
+    // generic-401 surface. The CLI install path (`bootstrap: None`) has no
+    // local bootstrap state machine: finalize is always allowed because
+    // the CLI binary is itself the pre-household phase.
+    if let Some(bs_lock) = state.bootstrap.as_ref() {
+        let bs = *bs_lock.read().await;
+        match bs {
+            BootstrapState::Uninitialized
+            | BootstrapState::ReadyForNaming
+            | BootstrapState::NamedAwaitingPair => {}
+            BootstrapState::Ready | BootstrapState::Recovering => {
+                tracing::warn!(
+                    stage = "pair_machine.local_finalize.rejected",
+                    reason = "bootstrap_state_advanced",
+                    state = bs.as_str(),
+                );
+                return unauthenticated_response();
+            }
+        }
+    }
+
     let snap = state.window.snapshot().await;
     if matches!(snap.state, PairMachineState::Committed) {
         if snap

@@ -464,7 +464,11 @@ async fn run_pair_machine(
         window: Arc::clone(&window),
         state_dir: state_dir.to_path_buf(),
         key_policy: policy,
-        finalize_lock: Arc::new(tokio::sync::Mutex::new(())),
+        // The CLI install path has no daemon bootstrap state machine —
+        // the candidate process is itself the pre-household phase, so
+        // `local_finalize_handler` falls through to its window-state
+        // checks without an extra bootstrap-state revalidation.
+        bootstrap: None,
     });
     let listener_handle = tokio::spawn(async move {
         if let Err(e) = axum::serve(

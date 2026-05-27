@@ -86,7 +86,7 @@ async fn fixture() -> Fixture {
         window: Arc::clone(&window),
         state_dir: m2_dir.path().to_path_buf(),
         key_policy: KeyBackingPolicy::ForceSoftware,
-        finalize_lock: Arc::new(tokio::sync::Mutex::new(())),
+        bootstrap: None,
     });
     Fixture {
         _m1_dir: m1_dir,
@@ -477,7 +477,7 @@ async fn fixture_without_anchor() -> (Fixture, household_rs::LoadedIdentity, [u8
         window: Arc::clone(&window),
         state_dir: m2_dir.path().to_path_buf(),
         key_policy: KeyBackingPolicy::ForceSoftware,
-        finalize_lock: Arc::new(tokio::sync::Mutex::new(())),
+        bootstrap: None,
     });
     (
         Fixture {

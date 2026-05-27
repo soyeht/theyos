@@ -13,6 +13,7 @@ pub mod bonjour_impl_dns_sd;
 pub mod bonjour_impl_mdns_sd;
 pub mod bonjour_publisher;
 pub mod bonjour_trust;
+pub mod bootstrap_mutation_lock;
 pub mod capacity;
 pub mod cloudflare_admin;
 pub mod cloudflare_api;

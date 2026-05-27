@@ -104,6 +104,7 @@ fn make_state(bs: BootstrapState, state_dir: PathBuf) -> BootstrapHandlerState {
         household: HouseholdState::empty(),
         state_dir,
         pair_device_window: Arc::new(PairDeviceWindow::new()),
+        pair_machine_window: Arc::new(household_rs::pair_machine::PairMachineWindow::new_in_memory()),
         started_at: Instant::now(),
         setup_invitation_cache: server_rs::setup_invitation::new_cache(),
         engine_port: 8091,
