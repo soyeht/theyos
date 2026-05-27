@@ -699,13 +699,61 @@ pub async fn post_pair_machine_local_stage(
                 stage = "pair_machine.local.stage.failed",
                 error = %e,
             );
-            cbor_error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "stage_failed",
-                Some(format!("{e}")),
-                None,
-            )
+            pair_machine_stage_error_response(&e)
         }
+    }
+}
+
+/// Structured CBOR body for the `no_transport_address` error code. Returned
+/// when `pair_machine_local::stage` reports `StageError::NoTransportAddress`
+/// for a specific transport — the iOS-side PR-4 needs this discrimination
+/// to fall back from `tailscale` to `lan` without substring-matching the
+/// generic `stage_failed` reason field.
+#[derive(Serialize)]
+struct NoTransportAddressErrorBody<'a> {
+    #[serde(rename = "v")]
+    version: u8,
+    /// Stable machine-readable code. Currently always `"no_transport_address"`.
+    error: &'static str,
+    /// Which transport was attempted and found unusable. Matches the
+    /// request's `transport` field on `POST /bootstrap/pair-machine/local/stage`
+    /// (`"tailscale"` or `"lan"`).
+    transport: &'a str,
+    /// Human-readable diagnostic, suitable for logs and developer-facing UI.
+    /// Carries the `StageError::Display` text so existing log scraping
+    /// keeps working.
+    reason: String,
+}
+
+/// Maps a `StageError` to the HTTP response handed back to the daemon's
+/// pair-machine stage caller. Only `NoTransportAddress` is discriminated
+/// into its own error code (see `NoTransportAddressErrorBody`); every
+/// other variant keeps the legacy `stage_failed` contract so existing
+/// clients that only handled the generic case continue to work.
+fn pair_machine_stage_error_response(error: &crate::pair_machine_local::StageError) -> Response {
+    use crate::pair_machine_local::StageError;
+    match error {
+        StageError::NoTransportAddress { transport } => {
+            let body = NoTransportAddressErrorBody {
+                version: 1,
+                error: "no_transport_address",
+                transport,
+                reason: format!("{error}"),
+            };
+            let bytes = household_rs::cbor::to_canonical_vec(&body).unwrap_or_default();
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                header::CONTENT_TYPE,
+                HeaderValue::from_static("application/cbor"),
+            );
+            (StatusCode::INTERNAL_SERVER_ERROR, headers, bytes).into_response()
+        }
+        _ => cbor_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "stage_failed",
+            Some(format!("{error}")),
+            None,
+        ),
     }
 }
 
@@ -1744,5 +1792,111 @@ mod tests {
         let app = bootstrap_router(make_state(BootstrapState::Recovering));
         let (_, body) = json_get(app, "/bootstrap/status").await;
         assert_eq!(body["state"], "recovering");
+    }
+
+    // ── pair_machine stage error mapping ─────────────────────────────────
+    //
+    // The full stage flow is integration-shaped (binds a TCP listener,
+    // persists `PairMachineWindow`, mints a candidate keypair), so we
+    // unit-test the error-mapping helper in isolation. PR-4 (iOS Add
+    // Server / Join existing Soyeht) needs `NoTransportAddress` to be
+    // discriminated from the generic `stage_failed` so the client can
+    // do `tailscale → lan` fallback without substring-matching the
+    // reason field.
+
+    #[derive(serde::Deserialize, Debug)]
+    struct CborErrorBodyForTest {
+        #[serde(rename = "v")]
+        version: u8,
+        error: String,
+        #[serde(default)]
+        transport: Option<String>,
+        #[serde(default)]
+        reason: Option<String>,
+    }
+
+    async fn decode_cbor_error(response: Response) -> (HStatus, CborErrorBodyForTest) {
+        let status = response.status();
+        let content_type = response
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .and_then(|h| h.to_str().ok())
+            .map(ToString::to_string);
+        assert_eq!(
+            content_type.as_deref(),
+            Some("application/cbor"),
+            "structured stage errors must use CBOR content-type"
+        );
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: CborErrorBodyForTest =
+            household_rs::cbor::from_canonical_slice(&bytes).expect("CBOR decode");
+        (status, body)
+    }
+
+    #[tokio::test]
+    async fn pair_machine_stage_error_tailscale_no_transport_address() {
+        let err = crate::pair_machine_local::StageError::NoTransportAddress {
+            transport: "tailscale",
+        };
+        let response = pair_machine_stage_error_response(&err);
+        let (status, body) = decode_cbor_error(response).await;
+        assert_eq!(status, HStatus::INTERNAL_SERVER_ERROR);
+        assert_eq!(body.version, 1);
+        assert_eq!(
+            body.error, "no_transport_address",
+            "code must be structured, not generic stage_failed"
+        );
+        assert_eq!(
+            body.transport.as_deref(),
+            Some("tailscale"),
+            "transport must carry the attempted transport so the client can fall back"
+        );
+        let reason = body.reason.unwrap_or_default();
+        assert!(
+            reason.contains("tailscale"),
+            "reason should remain the Display text for log compatibility, got {reason:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn pair_machine_stage_error_lan_no_transport_address() {
+        let err = crate::pair_machine_local::StageError::NoTransportAddress { transport: "lan" };
+        let response = pair_machine_stage_error_response(&err);
+        let (status, body) = decode_cbor_error(response).await;
+        assert_eq!(status, HStatus::INTERNAL_SERVER_ERROR);
+        assert_eq!(body.error, "no_transport_address");
+        assert_eq!(body.transport.as_deref(), Some("lan"));
+    }
+
+    #[tokio::test]
+    async fn pair_machine_stage_error_other_variants_remain_stage_failed() {
+        // Any non-NoTransportAddress variant continues to use the
+        // legacy `stage_failed` contract. BadHostname is a stable
+        // sentinel — purely value-typed, no I/O.
+        let err = crate::pair_machine_local::StageError::BadHostname { got: 42 };
+        let response = pair_machine_stage_error_response(&err);
+        let (status, body) = decode_cbor_error(response).await;
+        assert_eq!(status, HStatus::INTERNAL_SERVER_ERROR);
+        assert_eq!(
+            body.error, "stage_failed",
+            "non-NoTransportAddress variants must NOT be rewired — only the new code is being introduced"
+        );
+        assert!(
+            body.transport.is_none(),
+            "transport field must be absent for stage_failed responses"
+        );
+        let reason = body.reason.unwrap_or_default();
+        assert!(reason.contains("hostname"), "reason carries Display text");
+    }
+
+    #[tokio::test]
+    async fn pair_machine_stage_error_unsupported_platform_remains_stage_failed() {
+        let err = crate::pair_machine_local::StageError::UnsupportedPlatform { os: "haiku" };
+        let response = pair_machine_stage_error_response(&err);
+        let (_status, body) = decode_cbor_error(response).await;
+        assert_eq!(body.error, "stage_failed");
+        assert!(body.transport.is_none());
     }
 }
