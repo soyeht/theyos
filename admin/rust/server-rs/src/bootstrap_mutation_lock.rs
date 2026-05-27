@@ -8,6 +8,7 @@
 //!   - `POST /bootstrap/accept-household`
 //!   - `POST /bootstrap/accept-household/confirm`
 //!   - `POST /bootstrap/pair-machine/local/stage`
+//!   - `POST /pair-machine/local/anchor` (when served by the daemon)
 //!   - `POST /pair-machine/local/finalize` (when served by the daemon)
 //!
 //! Without serialisation, two of these can land concurrently and
