@@ -141,7 +141,7 @@ async fn candidate_harness_with_ttl(ttl: Duration) -> CandidateHarness {
         window: Arc::clone(&window),
         state_dir: dir.path().to_path_buf(),
         key_policy: KeyBackingPolicy::ForceSoftware,
-        finalize_lock: Arc::new(tokio::sync::Mutex::new(())),
+        bootstrap: None,
     });
     let served_router = router.clone();
     let server = tokio::spawn(async move {

@@ -122,7 +122,7 @@ async fn candidate_harness(hostname: &str) -> CandidateHarness {
         window,
         state_dir: td.path().to_path_buf(),
         key_policy: KeyBackingPolicy::ForceSoftware,
-        finalize_lock: Arc::new(tokio::sync::Mutex::new(())),
+        bootstrap: None,
     });
     tokio::spawn(async move {
         axum::serve(listener, router).await.unwrap();

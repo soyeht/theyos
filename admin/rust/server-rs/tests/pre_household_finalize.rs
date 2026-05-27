@@ -7,6 +7,7 @@ use std::time::Duration;
 use axum::Router;
 use axum::body::{Body, to_bytes};
 use axum::http::{Request, StatusCode};
+use household_rs::bootstrap_state::BootstrapState;
 use household_rs::machine_cert::Platform;
 use household_rs::pair_machine::{
     CeremonyInputs, CeremonyTxn, FinalizeAck, JoinResponse, JoinResponseUnsigned, JoinTransport,
@@ -86,7 +87,7 @@ async fn fixture() -> Fixture {
         window: Arc::clone(&window),
         state_dir: m2_dir.path().to_path_buf(),
         key_policy: KeyBackingPolicy::ForceSoftware,
-        finalize_lock: Arc::new(tokio::sync::Mutex::new(())),
+        bootstrap: None,
     });
     Fixture {
         _m1_dir: m1_dir,
@@ -449,7 +450,9 @@ fn build_anchor_for(
 
 /// Build a fresh fixture without the auto-pinned anchor so the
 /// finalize-without-anchor test can verify the gate fires.
-async fn fixture_without_anchor() -> (Fixture, household_rs::LoadedIdentity, [u8; 32]) {
+async fn fixture_without_anchor_with_bootstrap(
+    bootstrap_state: Option<Arc<tokio::sync::RwLock<BootstrapState>>>,
+) -> (Fixture, household_rs::LoadedIdentity, [u8; 32]) {
     let m1_dir = tempfile::tempdir().unwrap();
     let m2_dir = tempfile::tempdir().unwrap();
     let m1 = bootstrap(m1_dir.path());
@@ -477,7 +480,7 @@ async fn fixture_without_anchor() -> (Fixture, household_rs::LoadedIdentity, [u8
         window: Arc::clone(&window),
         state_dir: m2_dir.path().to_path_buf(),
         key_policy: KeyBackingPolicy::ForceSoftware,
-        finalize_lock: Arc::new(tokio::sync::Mutex::new(())),
+        bootstrap: bootstrap_state,
     });
     (
         Fixture {
@@ -494,6 +497,11 @@ async fn fixture_without_anchor() -> (Fixture, household_rs::LoadedIdentity, [u8
     )
 }
 
+/// Build a fresh CLI-style fixture without a daemon bootstrap-state gate.
+async fn fixture_without_anchor() -> (Fixture, household_rs::LoadedIdentity, [u8; 32]) {
+    fixture_without_anchor_with_bootstrap(None).await
+}
+
 #[tokio::test]
 async fn local_finalize_rejects_when_anchor_not_pinned() {
     // The `fixture()` helper pre-pins the anchor for the happy-path
@@ -501,7 +509,7 @@ async fn local_finalize_rejects_when_anchor_not_pinned() {
     // finalize gate fires when the iPhone has not delivered the
     // anchor yet.
     let (f, _m1, _anchor) = fixture_without_anchor().await;
-    let (status, body) = post_finalize(f.router, f.join_response_bytes).await;
+    let (status, body) = post_finalize(f.router.clone(), f.join_response_bytes).await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
     let parsed: serde_cbor_like::GenericUnauth =
         household_rs::cbor::from_canonical_slice(&body).unwrap();
@@ -532,6 +540,25 @@ async fn local_anchor_pins_household_for_finalize() {
 }
 
 #[tokio::test]
+async fn local_anchor_rejects_daemon_named_awaiting_pair_state() {
+    let bootstrap = Arc::new(tokio::sync::RwLock::new(BootstrapState::NamedAwaitingPair));
+    let (f, m1, anchor_secret) = fixture_without_anchor_with_bootstrap(Some(bootstrap)).await;
+    let body = build_anchor_for(
+        &m1,
+        &anchor_secret,
+        m1.record.hh_pub.as_bytes(),
+        m1.record.hh_id.as_str(),
+    );
+    let (status, _) = post_anchor(f.router, body).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    let snap = f.window.snapshot().await;
+    assert!(
+        snap.pinned_hh_pub.is_none(),
+        "daemon anchor must not pin while bootstrap is already in NamedAwaitingPair"
+    );
+}
+
+#[tokio::test]
 async fn local_anchor_rejects_wrong_secret() {
     let (f, m1, _real_secret) = fixture_without_anchor().await;
     let body = build_anchor_for(
@@ -546,6 +573,26 @@ async fn local_anchor_rejects_wrong_secret() {
     assert!(
         snap.pinned_hh_pub.is_none(),
         "wrong-secret anchor must not pin"
+    );
+}
+
+#[tokio::test]
+async fn local_finalize_rejects_daemon_named_awaiting_pair_state() {
+    let bootstrap = Arc::new(tokio::sync::RwLock::new(BootstrapState::NamedAwaitingPair));
+    let (f, m1, _anchor_secret) = fixture_without_anchor_with_bootstrap(Some(bootstrap)).await;
+    f.window
+        .pin_household_anchor(m1.record.hh_id.to_string(), *m1.record.hh_pub.as_bytes())
+        .await
+        .unwrap();
+
+    let (status, body) = post_finalize(f.router.clone(), f.join_response_bytes).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    let parsed: serde_cbor_like::GenericUnauth =
+        household_rs::cbor::from_canonical_slice(&body).unwrap();
+    assert_eq!(parsed.error, "unauthenticated");
+    assert!(
+        !household_record_path(f.m2_dir.path()).exists(),
+        "finalize must not write household identity while bootstrap is NamedAwaitingPair"
     );
 }
 

@@ -329,7 +329,7 @@ async fn start_candidate_harness_with_mode(mode: CandidateFinalizeMode) -> Candi
         window: Arc::clone(&window),
         state_dir: td.path().to_path_buf(),
         key_policy: KeyBackingPolicy::ForceSoftware,
-        finalize_lock: Arc::new(tokio::sync::Mutex::new(())),
+        bootstrap: None,
     };
     let router = match mode {
         CandidateFinalizeMode::Normal => pre_household_router(state),

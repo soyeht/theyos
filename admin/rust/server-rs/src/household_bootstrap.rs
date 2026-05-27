@@ -461,6 +461,7 @@ pub async fn bootstrap_household(shared_state: Option<SharedState>) {
         identity_state.clone(),
         state_dir.clone(),
         Arc::clone(&pair_device_window),
+        Arc::clone(&pair_machine_window),
         port,
     );
     if matches!(
@@ -515,7 +516,29 @@ pub async fn bootstrap_household(shared_state: Option<SharedState>) {
             .with_state(claws_state)
     });
 
-    let mut household_router = identity_router.merge(pair_router).merge(bootstrap_rt);
+    // Pre-household router. Carries the candidate-side `/pair-machine/local/*`
+    // endpoints (`seed`, `anchor`, `finalize`) plus `/pair-machine/anchor-handoff`.
+    // These were previously bound on a separate `TcpListener` inside
+    // `pair_machine_local::stage` — that collided with the daemon's existing
+    // bind (`addr:engine_port` is owned by `spawn_household_listeners` below).
+    // Mounting them here on the SAME router that serves `/bootstrap/*` reuses
+    // the daemon's listeners, shares the `Arc<PairMachineWindow>` with the
+    // stage handler so the seed lookup is a zero-cost memory read, and lets
+    // `local_finalize_handler` consult the engine `BootstrapState` to refuse
+    // a finalize that would race a sibling `accept_household_confirm`.
+    let pre_household_rt = handlers_pair_machine::pre_household_router(
+        handlers_pair_machine::PreHouseholdRouterState {
+            window: Arc::clone(&pair_machine_window),
+            state_dir: state_dir.clone(),
+            key_policy,
+            bootstrap: Some(Arc::clone(&bootstrap_state_arc)),
+        },
+    );
+
+    let mut household_router = identity_router
+        .merge(pair_router)
+        .merge(bootstrap_rt)
+        .merge(pre_household_rt);
     if let Some(r) = claws_router {
         household_router = household_router.merge(r);
     }

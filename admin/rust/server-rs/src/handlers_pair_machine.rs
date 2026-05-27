@@ -59,15 +59,34 @@ pub struct PairMachineRouterState {
     pub state_dir: PathBuf,
 }
 
-/// State for M2's pre-household listener. This process does not have a
-/// household identity yet; it only has the candidate keypair and a staged
-/// `PairMachineWindow` from `theyos install --pair-machine`.
+/// State for M2's pre-household listener (CLI `theyos install
+/// --pair-machine` path) AND for the daemon-mounted `/pair-machine/local/*`
+/// routes wired in `household_bootstrap::bootstrap_household`.
+///
+/// On the CLI path the process has no household identity yet, so
+/// `bootstrap` is `None` — the candidate's own install path is the
+/// pre-household phase by construction. On the daemon path we plumb
+/// the live `BootstrapState` lock so `local_finalize_handler` can
+/// re-check the engine has not transitioned into Ready/Recovering
+/// while it was waiting on `BOOTSTRAP_MUTATION_LOCK`.
+///
+/// Single-flight anchor/finalize serialisation is now handled by
+/// `bootstrap_mutation_lock::BOOTSTRAP_MUTATION_LOCK` (acquired in
+/// `local_anchor_handler` and `local_finalize_handler`) rather than a
+/// per-instance mutex; the shared lock also covers `stage()` and
+/// `accept_household_confirm`, closing both the QR-regeneration race
+/// around anchor pinning and the TOCTOU window where identity writers
+/// could race `household_record.cbor` / `machine_cert.cbor` /
+/// the self-shard.
 #[derive(Clone)]
 pub struct PreHouseholdRouterState {
     pub window: Arc<PairMachineWindow>,
     pub state_dir: PathBuf,
     pub key_policy: household_rs::KeyBackingPolicy,
-    pub finalize_lock: Arc<tokio::sync::Mutex<()>>,
+    /// Live engine bootstrap state lock when running inside the daemon;
+    /// `None` on the CLI install path, where the candidate process has
+    /// no household identity yet and finalize is always allowed.
+    pub bootstrap: Option<Arc<tokio::sync::RwLock<BootstrapState>>>,
 }
 
 pub fn pre_household_router(state: PreHouseholdRouterState) -> Router {
@@ -78,6 +97,13 @@ pub fn pre_household_router(state: PreHouseholdRouterState) -> Router {
         .route("/pair-machine/local/finalize", post(local_finalize_handler))
         .fallback(pre_household_reject)
         .with_state(state)
+}
+
+fn bootstrap_allows_local_pair_machine(bs: BootstrapState) -> bool {
+    matches!(
+        bs,
+        BootstrapState::Uninitialized | BootstrapState::ReadyForNaming
+    )
 }
 
 /// `JoinRequestAccepted = {v=1, owner_event_cursor: uint, expiry: uint}` —
@@ -379,13 +405,6 @@ pub async fn local_anchor_handler(
     use subtle::ConstantTimeEq;
     let t0 = Instant::now();
 
-    let snap = state.window.snapshot().await;
-    if !matches!(
-        snap.state,
-        PairMachineState::Staging | PairMachineState::AwaitingOwner
-    ) {
-        return unauthenticated_response();
-    }
     let anchor: LocalAnchor = match from_canonical_slice(&body) {
         Ok(a) => a,
         Err(e) => {
@@ -413,6 +432,48 @@ pub async fn local_anchor_handler(
     if anchor.anchor_secret.len() != 32 {
         return unauthenticated_response();
     }
+    let Ok(hh_pub_arr) = <[u8; 33]>::try_from(anchor.hh_pub.as_ref()) else {
+        return unauthenticated_response();
+    };
+    let Ok(hh_pub_key) = household_rs::keys::P256PublicKey::from_bytes(&hh_pub_arr) else {
+        return unauthenticated_response();
+    };
+    let derived_hh_id = household_rs::derive_household_id(&hh_pub_key);
+    if derived_hh_id.to_string() != anchor.hh_id {
+        tracing::warn!(
+            stage = "pair_machine.local_anchor.rejected",
+            reason = "hh_id_derivation_mismatch",
+        );
+        return unauthenticated_response();
+    }
+
+    // Serialise anchor pinning with `stage()` and `local/finalize`.
+    // Without this, a stale QR can pass the anchor-secret check against an
+    // old snapshot, then pin that old household anchor onto a freshly
+    // regenerated `PairMachineWindow`.
+    let _mutation_guard = crate::bootstrap_mutation_lock::BOOTSTRAP_MUTATION_LOCK
+        .lock()
+        .await;
+
+    if let Some(bs_lock) = state.bootstrap.as_ref() {
+        let bs = *bs_lock.read().await;
+        if !bootstrap_allows_local_pair_machine(bs) {
+            tracing::warn!(
+                stage = "pair_machine.local_anchor.rejected",
+                reason = "bootstrap_state_advanced",
+                state = bs.as_str(),
+            );
+            return unauthenticated_response();
+        }
+    }
+
+    let snap = state.window.snapshot().await;
+    if !matches!(
+        snap.state,
+        PairMachineState::Staging | PairMachineState::AwaitingOwner
+    ) {
+        return unauthenticated_response();
+    }
     let Some(window_secret) = snap.anchor_secret.as_ref() else {
         // Window was opened by the founder-side staging path
         // (Story 2 fetched JoinRequest), which has no candidate
@@ -435,20 +496,6 @@ pub async fn local_anchor_handler(
         tracing::warn!(
             stage = "pair_machine.local_anchor.rejected",
             reason = "anchor_secret_mismatch",
-        );
-        return unauthenticated_response();
-    }
-    let Ok(hh_pub_arr) = <[u8; 33]>::try_from(anchor.hh_pub.as_ref()) else {
-        return unauthenticated_response();
-    };
-    let Ok(hh_pub_key) = household_rs::keys::P256PublicKey::from_bytes(&hh_pub_arr) else {
-        return unauthenticated_response();
-    };
-    let derived_hh_id = household_rs::derive_household_id(&hh_pub_key);
-    if derived_hh_id.to_string() != anchor.hh_id {
-        tracing::warn!(
-            stage = "pair_machine.local_anchor.rejected",
-            reason = "hh_id_derivation_mismatch",
         );
         return unauthenticated_response();
     }
@@ -496,7 +543,38 @@ pub async fn local_finalize_handler(
     body: Bytes,
 ) -> Response {
     let t0 = Instant::now();
-    let _finalize_guard = state.finalize_lock.lock().await;
+    // Serialise finalize with every other bootstrap-mutation writer
+    // (`accept_household`, `accept_household_confirm`, `pair_machine_local
+    // stage`). Acquiring the shared lock BEFORE reading the window
+    // snapshot and BEFORE re-validating bootstrap state means a
+    // concurrent `accept_household_confirm` cannot land mid-finalize and
+    // overwrite the candidate's `household_record.cbor` /
+    // `machine_cert.cbor` / self-shard. The lock is dropped at the end
+    // of the handler (after `staged.commit()` and the bootstrap-state
+    // persist).
+    let _mutation_guard = crate::bootstrap_mutation_lock::BOOTSTRAP_MUTATION_LOCK
+        .lock()
+        .await;
+
+    // Daemon path only: re-check engine bootstrap state inside the
+    // critical section. If the engine already advanced past pre-household
+    // (Ready/Recovering) — for example a sibling `accept_household_confirm`
+    // committed while we waited on the lock — refuse with the contract's
+    // generic-401 surface. The CLI install path (`bootstrap: None`) has no
+    // local bootstrap state machine: finalize is always allowed because
+    // the CLI binary is itself the pre-household phase.
+    if let Some(bs_lock) = state.bootstrap.as_ref() {
+        let bs = *bs_lock.read().await;
+        if !bootstrap_allows_local_pair_machine(bs) {
+            tracing::warn!(
+                stage = "pair_machine.local_finalize.rejected",
+                reason = "bootstrap_state_advanced",
+                state = bs.as_str(),
+            );
+            return unauthenticated_response();
+        }
+    }
+
     let snap = state.window.snapshot().await;
     if matches!(snap.state, PairMachineState::Committed) {
         if snap

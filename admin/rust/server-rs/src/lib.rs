@@ -13,6 +13,7 @@ pub mod bonjour_impl_dns_sd;
 pub mod bonjour_impl_mdns_sd;
 pub mod bonjour_publisher;
 pub mod bonjour_trust;
+pub mod bootstrap_mutation_lock;
 pub mod capacity;
 pub mod cloudflare_admin;
 pub mod cloudflare_api;
@@ -20,6 +21,8 @@ pub mod cloudflared_sync;
 pub mod config;
 #[cfg(any(test, feature = "failure-injection"))]
 pub mod failure_injection;
+pub mod guest_image_state;
+pub mod pair_machine_local;
 pub mod handlers_admin;
 pub mod handlers_bootstrap;
 pub mod handlers_claws;

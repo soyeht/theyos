@@ -464,7 +464,11 @@ async fn run_pair_machine(
         window: Arc::clone(&window),
         state_dir: state_dir.to_path_buf(),
         key_policy: policy,
-        finalize_lock: Arc::new(tokio::sync::Mutex::new(())),
+        // The CLI install path has no daemon bootstrap state machine —
+        // the candidate process is itself the pre-household phase, so
+        // `local_finalize_handler` falls through to its window-state
+        // checks without an extra bootstrap-state revalidation.
+        bootstrap: None,
     });
     let listener_handle = tokio::spawn(async move {
         if let Err(e) = axum::serve(
@@ -627,7 +631,7 @@ async fn wait_for_window_terminal(window: &PairMachineWindow, ttl_unix: u64) -> 
 /// Sanitize an OS hostname to the host-label charset
 /// (`[A-Za-z0-9.-]`). Replaces every other byte with `-` and lowercases.
 /// Truncates to 64 bytes if the OS hostname is longer.
-fn sanitize_hostname(raw: &str) -> String {
+pub(crate) fn sanitize_hostname(raw: &str) -> String {
     let mut out: String = raw
         .chars()
         .map(|c| {
@@ -656,7 +660,7 @@ fn sanitize_hostname(raw: &str) -> String {
     out
 }
 
-fn pick_addr_for_transport(transport: JoinTransport, port: u16) -> Option<String> {
+pub(crate) fn pick_addr_for_transport(transport: JoinTransport, port: u16) -> Option<String> {
     let want = match transport {
         JoinTransport::Tailscale => InterfaceClass::Tailscale,
         JoinTransport::Lan => InterfaceClass::Lan,
@@ -667,14 +671,14 @@ fn pick_addr_for_transport(transport: JoinTransport, port: u16) -> Option<String
         .map(|(ip, _)| format_addr(ip, port))
 }
 
-fn format_addr(ip: IpAddr, port: u16) -> String {
+pub(crate) fn format_addr(ip: IpAddr, port: u16) -> String {
     match ip {
         IpAddr::V4(v4) => format!("{v4}:{port}"),
         IpAddr::V6(v6) => format!("[{v6}]:{port}"),
     }
 }
 
-async fn probe_mdns_available() -> bool {
+pub(crate) async fn probe_mdns_available() -> bool {
     tokio::time::timeout(
         Duration::from_secs(5),
         tokio::task::spawn_blocking(|| {

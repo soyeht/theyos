@@ -37,6 +37,7 @@ use household_rs::household_record::validate_household_name;
 use household_rs::ids::{HouseholdId, MachineId, derive_household_id};
 use household_rs::keys::{P256PublicKey, P256Signature, verify_signature};
 use household_rs::pair_device::PairDeviceWindow;
+use household_rs::pair_machine::PairMachineWindow;
 use serde::{Deserialize, Serialize};
 use serde_bytes::ByteBuf;
 use tokio::sync::RwLock;
@@ -62,6 +63,13 @@ pub struct BootstrapHandlerState {
     pub started_at: Instant,
     /// Pair-device window for minting the first pairing QR after initialize.
     pub pair_device_window: Arc<PairDeviceWindow>,
+    /// Pair-machine window shared with the daemon-mounted
+    /// `/pair-machine/local/*` routes. The `POST /bootstrap/pair-machine/local/stage`
+    /// handler mutates this window via `pair_machine_local::stage`; the
+    /// `local/seed`, `local/anchor`, and `local/finalize` routes read it
+    /// without a disk round-trip. Holding a single `Arc` here removes the
+    /// need for a second `TcpListener` bound at the daemon's address.
+    pub pair_machine_window: Arc<PairMachineWindow>,
     /// In-memory cache of discovered `_soyeht-setup._tcp.` invitations from
     /// iPhones (scenario B `AirDrop` flow). Populated by the Bonjour browser task;
     /// consumed by `POST /bootstrap/claim-setup-invitation` (T053).
@@ -79,8 +87,6 @@ pub struct BootstrapHandlerState {
 
 pub type BootstrapStateArc = Arc<RwLock<BootstrapState>>;
 
-static ACCEPT_HOUSEHOLD_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-
 impl BootstrapHandlerState {
     #[must_use]
     pub fn new(
@@ -88,6 +94,7 @@ impl BootstrapHandlerState {
         household: HouseholdState,
         state_dir: PathBuf,
         pair_device_window: Arc<PairDeviceWindow>,
+        pair_machine_window: Arc<PairMachineWindow>,
         engine_port: u16,
     ) -> Self {
         Self {
@@ -95,6 +102,7 @@ impl BootstrapHandlerState {
             household,
             state_dir,
             pair_device_window,
+            pair_machine_window,
             started_at: Instant::now(),
             setup_invitation_cache: crate::setup_invitation::new_cache(),
             engine_port,
@@ -122,6 +130,10 @@ pub fn bootstrap_router(state: BootstrapHandlerState) -> Router {
             post(post_claim_setup_invitation),
         )
         .route("/bootstrap/teardown", post(post_teardown))
+        .route(
+            "/bootstrap/pair-machine/local/stage",
+            post(post_pair_machine_local_stage),
+        )
         .route("/health", get(get_health))
         .route("/healthz", get(get_health))
         .with_state(state)
@@ -347,6 +359,26 @@ struct BootstrapStatusResponse {
     uptime_secs: u64,
     hh_id: Option<String>,
     device_count: u32,
+
+    /// Top-level phase of the macOS guest-image init (`download_ipsw`,
+    /// `create_disk`, `install_macos`, `provision`, `create_snapshot`,
+    /// `complete`). `None` on Linux (no guest VM) and on Macs that
+    /// haven't started provisioning yet. See `guest_image_state.rs`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    guest_image_phase: Option<String>,
+
+    /// Overall init status (`pending`, `in_progress`, `done`,
+    /// `failed`). Paired with `guest_image_phase` — when the iPhone
+    /// Claw Store sees `status != "done"` it gates the install button
+    /// and renders a "preparing this Mac" state.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    guest_image_status: Option<String>,
+
+    /// Most recent error from a failed phase attempt. Only present
+    /// when `guest_image_status == "failed"`. Surfaces user-facing
+    /// retry hints in the iPhone UI.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    guest_image_error: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -373,6 +405,7 @@ pub async fn get_bootstrap_status(State(state): State<BootstrapHandlerState>) ->
 
     let (hh_id, device_count) = hh_info(&state.household, bootstrap_state).await;
 
+    let guest_image = crate::guest_image_state::GuestImageState::read_current();
     let body = BootstrapStatusResponse {
         v: 1,
         state: bootstrap_state.as_str(),
@@ -382,6 +415,9 @@ pub async fn get_bootstrap_status(State(state): State<BootstrapHandlerState>) ->
         uptime_secs,
         hh_id,
         device_count,
+        guest_image_phase: guest_image.phase,
+        guest_image_status: guest_image.status,
+        guest_image_error: guest_image.error,
     };
 
     // elapsed_ms: u128→u64 truncation impossible in practice (u64 covers ~585 millennia).
@@ -542,6 +578,246 @@ pub async fn post_claim_setup_invitation(
 ///
 /// No session auth — owner biometric + cert chain serves as authentication.
 /// Validation follows the 14-step contract order; steps 6+9 are merged into one
+/// `POST /bootstrap/pair-machine/local/stage` — daemon-side equivalent of
+/// `theyos install --pair-machine`. Mints a candidate keypair + signed
+/// `JoinRequest`, opens the `PairMachineWindow` in `Staging` (sharing the
+/// SAME `Arc<PairMachineWindow>` the daemon's `household_router` mounts
+/// `/pair-machine/local/*` against), and returns the canonical
+/// `pair-machine` URI for the `SoyehtMac`.app to render as a QR.
+///
+/// No new listener is bound: the founder-facing `local/seed`,
+/// `local/anchor`, and `local/finalize` routes are served by the
+/// daemon's existing `household_router`. The CLI install path
+/// (`install_cli.rs`) keeps its own pre-household bind because in that
+/// flow the daemon is not yet running.
+///
+/// Loopback-only: the request `ConnectInfo` peer address MUST be
+/// `127.0.0.1` / `::1`. Calls from the LAN / Tailscale side return
+/// `404 Not Found` (we intentionally do not advertise the endpoint
+/// shape across the LAN, so the response is indistinguishable from
+/// a missing route).
+///
+/// Engine-state gate: the candidate must NOT already have a household
+/// identity in flight or committed. **Accepted states are
+/// `Uninitialized` and `ReadyForNaming` only.** `NamedAwaitingPair`
+/// is intentionally rejected — a Mac that started the `accept_household`
+/// ceremony and wants to back out must first issue an explicit
+/// `POST /bootstrap/teardown`; silently re-routing through `stage` would
+/// overwrite mid-ceremony household identity material. The state gate is
+/// re-checked inside the shared bootstrap-mutation lock before the
+/// `PairMachineWindow` is mutated, so the call cannot race
+/// `accept_household` / `accept_household_confirm` / `local_finalize`.
+///
+/// **Not idempotent**: every call mints a fresh `nonce`/`anchor_secret`,
+/// invalidating any QR returned by a prior call. Callers MUST surface
+/// this as an explicit user action — never as a probe.
+///
+/// Body: `{"v":1,"transport":"tailscale"|"lan"}`. Default transport is
+/// `tailscale` when the body is empty or the field is omitted.
+///
+/// Response 200 (`application/cbor`): canonical CBOR encoding of
+/// `StageOutcome` — `{pair_machine_uri: text, fingerprint: text,
+/// ttl_unix: uint}`. Matches the wire format of sibling bootstrap
+/// endpoints (`accept_household`, `accept_household_confirm`,
+/// `teardown`, `initialize`).
+#[derive(serde::Deserialize, Default)]
+struct PairMachineStageRequest {
+    #[serde(rename = "v", default)]
+    _version: Option<u8>,
+    #[serde(default)]
+    transport: Option<String>,
+}
+
+pub async fn post_pair_machine_local_stage(
+    State(state): State<BootstrapHandlerState>,
+    ConnectInfo(peer): ConnectInfo<std::net::SocketAddr>,
+    body: Bytes,
+) -> Response {
+    // Loopback-only ACL — calls from any other address get the same
+    // 404 a missing route would produce, hiding the endpoint shape.
+    if !peer.ip().is_loopback() {
+        tracing::warn!(
+            stage = "pair_machine.local.stage.non_loopback_rejected",
+            peer = %peer,
+        );
+        return StatusCode::NOT_FOUND.into_response();
+    }
+
+    // Engine-state gate — fast rejection BEFORE we attempt the shared
+    // mutation lock. The candidate must not yet hold an in-flight or
+    // committed household identity. Only `Uninitialized` and
+    // `ReadyForNaming` are accepted. `NamedAwaitingPair` is intentionally
+    // rejected — a Mac that started `accept_household` and wants to back
+    // out must issue an explicit `POST /bootstrap/teardown` first;
+    // silently restaging through this endpoint would overwrite
+    // mid-ceremony identity material the welcome flow has already
+    // staked. The state will be re-checked inside the mutation lock.
+    let current_bs = *state.bootstrap.read().await;
+    match current_bs {
+        BootstrapState::Uninitialized | BootstrapState::ReadyForNaming => {}
+        other => {
+            tracing::warn!(
+                stage = "pair_machine.local.stage.rejected",
+                reason = "household_already_paired",
+                state = other.as_str(),
+            );
+            return cbor_error(
+                StatusCode::CONFLICT,
+                "household_already_paired",
+                None,
+                Some(other.as_str()),
+            );
+        }
+    }
+
+    let req: PairMachineStageRequest = if body.is_empty() {
+        PairMachineStageRequest::default()
+    } else {
+        match serde_json::from_slice(&body) {
+            Ok(parsed) => parsed,
+            Err(e) => {
+                return cbor_error(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_request_body",
+                    Some(format!("{e}")),
+                    None,
+                );
+            }
+        }
+    };
+
+    let transport = match req.transport.as_deref().unwrap_or("tailscale") {
+        "tailscale" => household_rs::pair_machine::JoinTransport::Tailscale,
+        "lan" => household_rs::pair_machine::JoinTransport::Lan,
+        other => {
+            return cbor_error(
+                StatusCode::BAD_REQUEST,
+                "unsupported_transport",
+                Some(format!("transport={other:?}; expected 'tailscale' or 'lan'")),
+                None,
+            );
+        }
+    };
+
+    let key_policy = household_rs::KeyBackingPolicy::from_env();
+
+    // Acquire the shared bootstrap-mutation lock and re-check the
+    // engine state INSIDE the critical section before mutating the
+    // `PairMachineWindow`. A concurrent `accept_household_confirm`
+    // could have advanced the state between the fast-path check above
+    // and our acquiring this lock; without the re-check we would
+    // overwrite the founder's just-written `household_record.cbor`
+    // through the shared candidate window.
+    //
+    // The lock is dropped at the end of this block — Bonjour publish
+    // inside `stage()` is detached to a background task so it cannot
+    // extend the critical section.
+    let stage_result = {
+        let _mutation_guard = crate::bootstrap_mutation_lock::BOOTSTRAP_MUTATION_LOCK
+            .lock()
+            .await;
+        let current_bs = *state.bootstrap.read().await;
+        match current_bs {
+            BootstrapState::Uninitialized | BootstrapState::ReadyForNaming => {}
+            other => {
+                tracing::warn!(
+                    stage = "pair_machine.local.stage.rejected",
+                    reason = "household_already_paired_under_lock",
+                    state = other.as_str(),
+                );
+                return cbor_error(
+                    StatusCode::CONFLICT,
+                    "household_already_paired",
+                    None,
+                    Some(other.as_str()),
+                );
+            }
+        }
+        crate::pair_machine_local::stage(
+            &state.state_dir,
+            Arc::clone(&state.pair_machine_window),
+            transport,
+            key_policy,
+        )
+        .await
+    };
+
+    match stage_result {
+        Ok(outcome) => {
+            tracing::info!(
+                stage = "pair_machine.local.stage.ok",
+                fingerprint = %outcome.fingerprint,
+                ttl_unix = outcome.ttl_unix,
+                transport = match transport {
+                    household_rs::pair_machine::JoinTransport::Tailscale => "tailscale",
+                    household_rs::pair_machine::JoinTransport::Lan => "lan",
+                },
+            );
+            cbor_ok(outcome)
+        }
+        Err(e) => {
+            tracing::warn!(
+                stage = "pair_machine.local.stage.failed",
+                error = %e,
+            );
+            pair_machine_stage_error_response(&e)
+        }
+    }
+}
+
+/// Structured CBOR body for the `no_transport_address` error code. Returned
+/// when `pair_machine_local::stage` reports `StageError::NoTransportAddress`
+/// for a specific transport — the iOS-side PR-4 needs this discrimination
+/// to fall back from `tailscale` to `lan` without substring-matching the
+/// generic `stage_failed` reason field.
+#[derive(Serialize)]
+struct NoTransportAddressErrorBody<'a> {
+    #[serde(rename = "v")]
+    version: u8,
+    /// Stable machine-readable code. Currently always `"no_transport_address"`.
+    error: &'static str,
+    /// Which transport was attempted and found unusable. Matches the
+    /// request's `transport` field on `POST /bootstrap/pair-machine/local/stage`
+    /// (`"tailscale"` or `"lan"`).
+    transport: &'a str,
+    /// Human-readable diagnostic, suitable for logs and developer-facing UI.
+    /// Carries the `StageError::Display` text so existing log scraping
+    /// keeps working.
+    reason: String,
+}
+
+/// Maps a `StageError` to the HTTP response handed back to the daemon's
+/// pair-machine stage caller. Only `NoTransportAddress` is discriminated
+/// into its own error code (see `NoTransportAddressErrorBody`); every
+/// other variant keeps the legacy `stage_failed` contract so existing
+/// clients that only handled the generic case continue to work.
+fn pair_machine_stage_error_response(error: &crate::pair_machine_local::StageError) -> Response {
+    use crate::pair_machine_local::StageError;
+    match error {
+        StageError::NoTransportAddress { transport } => {
+            let body = NoTransportAddressErrorBody {
+                version: 1,
+                error: "no_transport_address",
+                transport,
+                reason: format!("{error}"),
+            };
+            let bytes = household_rs::cbor::to_canonical_vec(&body).unwrap_or_default();
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                header::CONTENT_TYPE,
+                HeaderValue::from_static("application/cbor"),
+            );
+            (StatusCode::INTERNAL_SERVER_ERROR, headers, bytes).into_response()
+        }
+        _ => cbor_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "stage_failed",
+            Some(format!("{error}")),
+            None,
+        ),
+    }
+}
+
 /// atomic `check_and_persist` (burns nonce before cert/sig checks to prevent
 /// probing different `signed_by` values with the same nonce).
 pub async fn post_teardown(State(state): State<BootstrapHandlerState>, body: Bytes) -> Response {
@@ -807,7 +1083,9 @@ pub async fn post_accept_household(
     State(state): State<BootstrapHandlerState>,
     body: Bytes,
 ) -> Response {
-    let _guard = ACCEPT_HOUSEHOLD_LOCK.lock().await;
+    let _guard = crate::bootstrap_mutation_lock::BOOTSTRAP_MUTATION_LOCK
+        .lock()
+        .await;
 
     {
         let current = state.bootstrap.read().await;
@@ -1037,7 +1315,9 @@ pub async fn post_accept_household_confirm(
     State(state): State<BootstrapHandlerState>,
     body: Bytes,
 ) -> Response {
-    let _guard = ACCEPT_HOUSEHOLD_LOCK.lock().await;
+    let _guard = crate::bootstrap_mutation_lock::BOOTSTRAP_MUTATION_LOCK
+        .lock()
+        .await;
 
     {
         let current = state.bootstrap.read().await;
@@ -1522,6 +1802,7 @@ mod tests {
             household: HouseholdState::empty(),
             state_dir: PathBuf::from("/tmp/test"),
             pair_device_window: Arc::new(PairDeviceWindow::new()),
+            pair_machine_window: Arc::new(PairMachineWindow::new_in_memory()),
             started_at: Instant::now(),
             setup_invitation_cache: crate::setup_invitation::new_cache(),
             engine_port: 8091,
@@ -1577,5 +1858,181 @@ mod tests {
         let app = bootstrap_router(make_state(BootstrapState::Recovering));
         let (_, body) = json_get(app, "/bootstrap/status").await;
         assert_eq!(body["state"], "recovering");
+    }
+
+    // ── pair_machine stage error mapping ─────────────────────────────────
+    //
+    // The full stage flow is integration-shaped (binds a TCP listener,
+    // persists `PairMachineWindow`, mints a candidate keypair), so we
+    // unit-test the error-mapping helper in isolation. PR-4 (iOS Add
+    // Server / Join existing Soyeht) needs `NoTransportAddress` to be
+    // discriminated from the generic `stage_failed` so the client can
+    // do `tailscale → lan` fallback without substring-matching the
+    // reason field.
+
+    #[derive(serde::Deserialize, Debug)]
+    struct CborErrorBodyForTest {
+        #[serde(rename = "v")]
+        version: u8,
+        error: String,
+        #[serde(default)]
+        transport: Option<String>,
+        #[serde(default)]
+        reason: Option<String>,
+    }
+
+    async fn decode_cbor_error(response: Response) -> (HStatus, CborErrorBodyForTest) {
+        let status = response.status();
+        let content_type = response
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .and_then(|h| h.to_str().ok())
+            .map(ToString::to_string);
+        assert_eq!(
+            content_type.as_deref(),
+            Some("application/cbor"),
+            "structured stage errors must use CBOR content-type"
+        );
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: CborErrorBodyForTest =
+            household_rs::cbor::from_canonical_slice(&bytes).expect("CBOR decode");
+        (status, body)
+    }
+
+    #[tokio::test]
+    async fn pair_machine_stage_error_tailscale_no_transport_address() {
+        let err = crate::pair_machine_local::StageError::NoTransportAddress {
+            transport: "tailscale",
+        };
+        let response = pair_machine_stage_error_response(&err);
+        let (status, body) = decode_cbor_error(response).await;
+        assert_eq!(status, HStatus::INTERNAL_SERVER_ERROR);
+        assert_eq!(body.version, 1);
+        assert_eq!(
+            body.error, "no_transport_address",
+            "code must be structured, not generic stage_failed"
+        );
+        assert_eq!(
+            body.transport.as_deref(),
+            Some("tailscale"),
+            "transport must carry the attempted transport so the client can fall back"
+        );
+        let reason = body.reason.unwrap_or_default();
+        assert!(
+            reason.contains("tailscale"),
+            "reason should remain the Display text for log compatibility, got {reason:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn pair_machine_stage_error_lan_no_transport_address() {
+        let err = crate::pair_machine_local::StageError::NoTransportAddress { transport: "lan" };
+        let response = pair_machine_stage_error_response(&err);
+        let (status, body) = decode_cbor_error(response).await;
+        assert_eq!(status, HStatus::INTERNAL_SERVER_ERROR);
+        assert_eq!(body.error, "no_transport_address");
+        assert_eq!(body.transport.as_deref(), Some("lan"));
+    }
+
+    #[tokio::test]
+    async fn pair_machine_stage_error_other_variants_remain_stage_failed() {
+        // Any non-NoTransportAddress variant continues to use the
+        // legacy `stage_failed` contract. BadHostname is a stable
+        // sentinel — purely value-typed, no I/O.
+        let err = crate::pair_machine_local::StageError::BadHostname { got: 42 };
+        let response = pair_machine_stage_error_response(&err);
+        let (status, body) = decode_cbor_error(response).await;
+        assert_eq!(status, HStatus::INTERNAL_SERVER_ERROR);
+        assert_eq!(
+            body.error, "stage_failed",
+            "non-NoTransportAddress variants must NOT be rewired — only the new code is being introduced"
+        );
+        assert!(
+            body.transport.is_none(),
+            "transport field must be absent for stage_failed responses"
+        );
+        let reason = body.reason.unwrap_or_default();
+        assert!(reason.contains("hostname"), "reason carries Display text");
+    }
+
+    #[tokio::test]
+    async fn pair_machine_stage_error_unsupported_platform_remains_stage_failed() {
+        let err = crate::pair_machine_local::StageError::UnsupportedPlatform { os: "haiku" };
+        let response = pair_machine_stage_error_response(&err);
+        let (_status, body) = decode_cbor_error(response).await;
+        assert_eq!(body.error, "stage_failed");
+        assert!(body.transport.is_none());
+    }
+
+    // ── /bootstrap/pair-machine/local/stage state-gate rejections ────────
+    //
+    // The state gate runs before any state mutation, so we can drive it
+    // from a pure in-memory `BootstrapHandlerState`. Tests assert that the
+    // CBOR error body shape matches the contract (`household_already_paired`
+    // with the offending state name) and that the gate is enforced for
+    // every disallowed state — including `NamedAwaitingPair`, which used
+    // to be silently accepted but now requires an explicit
+    // `POST /bootstrap/teardown` first.
+
+    async fn call_stage_with_state(bs: BootstrapState) -> (HStatus, CborErrorBodyForTest) {
+        let app = bootstrap_router(make_state(bs));
+        let req = Request::builder()
+            .method("POST")
+            .uri("/bootstrap/pair-machine/local/stage")
+            .extension(ConnectInfo::<SocketAddr>(SocketAddr::from((
+                [127, 0, 0, 1],
+                12345,
+            ))))
+            .body(Body::empty())
+            .unwrap();
+        let response = app.oneshot(req).await.unwrap();
+        decode_cbor_error(response).await
+    }
+
+    #[tokio::test]
+    async fn pair_machine_local_stage_rejects_named_awaiting_pair() {
+        // NamedAwaitingPair is intentionally rejected by PR-#82 review
+        // follow-up: a Mac mid-ceremony must teardown explicitly before
+        // restaging as a candidate, otherwise this endpoint would
+        // overwrite household identity files written by
+        // `accept_household_confirm`.
+        let (status, body) = call_stage_with_state(BootstrapState::NamedAwaitingPair).await;
+        assert_eq!(status, HStatus::CONFLICT);
+        assert_eq!(body.error, "household_already_paired");
+    }
+
+    #[tokio::test]
+    async fn pair_machine_local_stage_rejects_ready() {
+        let (status, body) = call_stage_with_state(BootstrapState::Ready).await;
+        assert_eq!(status, HStatus::CONFLICT);
+        assert_eq!(body.error, "household_already_paired");
+    }
+
+    #[tokio::test]
+    async fn pair_machine_local_stage_rejects_recovering() {
+        let (status, body) = call_stage_with_state(BootstrapState::Recovering).await;
+        assert_eq!(status, HStatus::CONFLICT);
+        assert_eq!(body.error, "household_already_paired");
+    }
+
+    // ── PreHouseholdRouterState wired into bootstrap router ─────────────
+    //
+    // Static check that `BootstrapHandlerState` carries the same
+    // `Arc<PairMachineWindow>` that's mounted on the pre-household routes
+    // — Fix 1 collapses the two listeners into one and `local_seed_handler`
+    // must read from the SAME window the stage handler mutates. We assert
+    // pointer-equality through `Arc::ptr_eq` so a future refactor that
+    // accidentally clones the value can't silently break the seed lookup.
+    #[tokio::test]
+    async fn bootstrap_handler_state_owns_shared_pair_machine_window() {
+        let state = make_state(BootstrapState::Uninitialized);
+        let cloned = Arc::clone(&state.pair_machine_window);
+        assert!(
+            Arc::ptr_eq(&state.pair_machine_window, &cloned),
+            "BootstrapHandlerState must expose the same Arc the daemon hands to pre_household_router; \
+             otherwise stage() and local/seed read different windows."
+        );
     }
 }
