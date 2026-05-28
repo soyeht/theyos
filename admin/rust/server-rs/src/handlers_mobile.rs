@@ -1887,23 +1887,21 @@ pub async fn handle_mobile_install_claw(
         return Err(ApiError::not_found(format!("unknown claw type: {name}")));
     };
 
-    // 2. Tier gate (P-46 Phase C): only Available/Supported can be installed
-    //    by user action. Catalog/Detected tiers have not been smoke-verified.
-    if !entry.tier.can_user_install() {
-        return Err(ApiError::bad_request(format!(
-            "claw type '{name}' is not installable yet (tier: {:?})",
-            entry.tier
-        )));
+    // 2. Single installability gate — see handle_install_claw for context.
+    //    `ManifestEntry::installability()` is the one and only predicate.
+    if let core_rs::manifest::ClawInstallability::Unavailable { code, message } =
+        entry.installability()
+    {
+        return Err(ApiError::bad_request_with_reasons(
+            format!("claw type '{name}' is not installable yet: {message}"),
+            json!({
+                "unavailable_reason_code": code,
+                "unavailable_reason": message,
+            }),
+        ));
     }
 
-    // 3. Must be installable (prebuilt artifact or local build plan)
-    if !core_rs::manifest::is_installable(&name) {
-        return Err(ApiError::bad_request(format!(
-            "claw type '{name}' is not installable yet"
-        )));
-    }
-
-    // 4. Check current status
+    // 3. Check current status
     let current = state.claw_store.get_status(&name);
     match current {
         claw_rs::ClawStatus::Ready => {

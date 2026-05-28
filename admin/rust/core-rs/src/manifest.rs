@@ -37,9 +37,116 @@ impl Tier {
     /// Gate used by install handlers (`handlers_claws.rs`, `handlers_mobile.rs`)
     /// and the install worker. Only `Available` and `Supported` tiers can be
     /// installed by user action.
+    ///
+    /// Prefer [`ManifestEntry::installability`] in new code — it additionally
+    /// catches "tier ok but no install path" manifest inconsistencies and
+    /// surfaces a structured reason. This helper is kept as a lower-level
+    /// tier-only check; the catalog API and install handlers MUST go through
+    /// the entry-level method.
     #[must_use]
     pub const fn can_user_install(self) -> bool {
         matches!(self, Tier::Available | Tier::Supported)
+    }
+}
+
+/// Structured reason a claw cannot be installed right now. Serialised as
+/// snake-case strings (`"catalog_only"`, `"detected_unverified"`,
+/// `"no_install_plan"`) for the wire format consumed by the iPhone/Mac UI.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UnavailableReasonCode {
+    /// `tier: catalog` — entry exists for discovery only. Common case for
+    /// Claude Code plugins (claude-claw), Electron desktop apps, ESP
+    /// microcontroller firmware, jailbreak tweaks.
+    CatalogOnly,
+    /// `tier: detected` — the detector assigned a template but
+    /// `claws-verify` has not run a smoke install in a sandbox VM yet.
+    DetectedUnverified,
+    /// Manifest inconsistency: the entry's tier qualifies for install
+    /// (`Available` / `Supported`) but it has neither a `buildable: true`
+    /// flag, a `distribution: "prebuilt"` artifact, nor an `install:`
+    /// template block. Asserted absent in tests; if this is ever observed
+    /// in the wild it is a manifest bug, not a user-facing condition.
+    NoInstallPlan,
+}
+
+/// Result of asking "can a user install this claw right now?".
+///
+/// Returned from [`ManifestEntry::installability`]. The HTTP catalog
+/// response, the install handlers (`handlers_claws`/`handlers_mobile`),
+/// the background install worker, the vmrunner installer factory, and
+/// the imagebuilder filter all consult this single API — there is no
+/// other predicate.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ClawInstallability {
+    /// Cleared for user action: handler accepts the install request,
+    /// catalog response advertises `installable: true`.
+    Installable,
+    /// Blocked. `code` carries a stable machine-readable category;
+    /// `message` is operator-facing text (uses
+    /// `ManifestEntry::skip_install_reason` when present, otherwise a
+    /// generic default keyed off `code`).
+    Unavailable {
+        code: UnavailableReasonCode,
+        message: String,
+    },
+}
+
+impl ManifestEntry {
+    /// Single source of truth for installability. **All** install gates —
+    /// HTTP handlers, install worker, vmrunner installer factory,
+    /// imagebuilder filter, catalog response — delegate to this method.
+    /// Adding another parallel predicate is a regression.
+    ///
+    /// Categorisation:
+    ///   - `Supported`/`Available` tier + an install path
+    ///     (`buildable` | `prebuilt` | `install:` block) → `Installable`.
+    ///   - `Supported`/`Available` tier with NO install path → `Unavailable
+    ///     { code: NoInstallPlan, .. }` (asserted absent in tests).
+    ///   - `Catalog` tier → `Unavailable { code: CatalogOnly, .. }`.
+    ///   - `Detected` tier → `Unavailable { code: DetectedUnverified, .. }`.
+    #[must_use]
+    pub fn installability(&self) -> ClawInstallability {
+        match self.tier {
+            Tier::Supported | Tier::Available => {
+                let has_install_path =
+                    self.buildable || self.distribution == "prebuilt" || self.install.is_some();
+                if has_install_path {
+                    ClawInstallability::Installable
+                } else {
+                    ClawInstallability::Unavailable {
+                        code: UnavailableReasonCode::NoInstallPlan,
+                        message: format!(
+                            "{} qualifies by tier {:?} but has no install path \
+                             (buildable=false, distribution!=prebuilt, install: absent) \
+                             — manifest invariant violated",
+                            self.name, self.tier,
+                        ),
+                    }
+                }
+            }
+            Tier::Catalog => ClawInstallability::Unavailable {
+                code: UnavailableReasonCode::CatalogOnly,
+                message: if self.skip_install_reason.is_empty() {
+                    String::from(
+                        "this claw is exposed for discovery only \
+                         and not yet installable",
+                    )
+                } else {
+                    self.skip_install_reason.to_string()
+                },
+            },
+            Tier::Detected => ClawInstallability::Unavailable {
+                code: UnavailableReasonCode::DetectedUnverified,
+                message: if self.skip_install_reason.is_empty() {
+                    String::from(
+                        "claws-verify has not confirmed this claw runs in a sandbox VM yet",
+                    )
+                } else {
+                    self.skip_install_reason.to_string()
+                },
+            },
+        }
     }
 }
 
@@ -144,6 +251,16 @@ pub struct ManifestEntry {
     /// bare invocation prints help and exits — that's why this is a
     /// dedicated field instead of reusing `install.entry_point`.
     pub run_cmd: &'static str,
+
+    /// Operator-visible reason a claw entry is intentionally not
+    /// installable. Populated for `tier: catalog` entries that exist
+    /// purely for discovery (Claude Code plugins, Electron desktop apps,
+    /// ESP microcontroller firmware, etc.). Empty for installable claws.
+    ///
+    /// Surfaced to clients via
+    /// `ClawCatalogResponse.unavailable_reason` (claw-rs/store.rs) and
+    /// inside [`ClawInstallability::Unavailable`].
+    pub skip_install_reason: &'static str,
 }
 
 /// Returns the full compiled-in catalog, sorted alphabetically by name.
@@ -180,13 +297,13 @@ pub fn supported_names() -> Vec<&'static str> {
         .collect()
 }
 
-/// Returns names of claws that a user can install (`Tier::Supported` or
-/// `Tier::Available`). Complement to [`Tier::can_user_install`].
+/// Returns names of claws that a user can install — the single source of
+/// truth, delegating to [`ManifestEntry::installability`].
 #[must_use]
 pub fn installable_names() -> Vec<&'static str> {
     catalog()
         .iter()
-        .filter(|e| e.tier.can_user_install())
+        .filter(|e| matches!(e.installability(), ClawInstallability::Installable))
         .map(|e| e.name)
         .collect()
 }
@@ -203,25 +320,15 @@ pub fn is_buildable(name: &str) -> bool {
     catalog().iter().any(|e| e.name == name && e.buildable)
 }
 
-/// Returns true if the claw can be installed by a user.
-///
-/// Three ways to qualify:
-///   1. Tier is `Available` or `Supported` — both pass `Tier::can_user_install`
-///      and have either a prebuilt artifact or a template-driven plan.
-///   2. Legacy `buildable: true` flag — the claw has a builtin installer plan
-///      in `vmrunner-rs/src/installer_plan.rs` (true for every supported claw).
-///   3. Legacy `distribution: "prebuilt"` — a prebuilt rootfs is published
-///      somewhere the artifact resolver can fetch it.
-///
-/// The `tier`-based clause is what unblocks P-46 template claws: once
-/// `claws-verify` flips a detected claw to `tier: available`, install via the
-/// template-driven build-from-plan path is enabled by this function alone —
-/// no manual edit to `buildable`/`distribution` required.
+/// Look up a claw's installability by name. Returns `None` for entries that
+/// are not in the manifest (so callers can distinguish "unknown claw" from
+/// "known but unavailable").
 #[must_use]
-pub fn is_installable(name: &str) -> bool {
-    catalog().iter().any(|e| {
-        e.name == name && (e.tier.can_user_install() || e.buildable || e.distribution == "prebuilt")
-    })
+pub fn installability_of(name: &str) -> Option<ClawInstallability> {
+    catalog()
+        .iter()
+        .find(|e| e.name == name)
+        .map(ManifestEntry::installability)
 }
 
 /// Returns true if the claw uses pre-built artifact distribution.
@@ -302,13 +409,16 @@ mod tests {
     }
 
     #[test]
-    fn manifest_is_installable_for_buildable_claw() {
-        assert!(is_installable("picoclaw"));
+    fn installability_of_buildable_claw_is_installable() {
+        assert_eq!(
+            installability_of("picoclaw"),
+            Some(ClawInstallability::Installable),
+        );
     }
 
     #[test]
-    fn manifest_is_installable_false_for_unknown() {
-        assert!(!is_installable("fakeclaw"));
+    fn installability_of_unknown_claw_is_none() {
+        assert!(installability_of("fakeclaw").is_none());
     }
 
     #[test]
@@ -325,7 +435,10 @@ mod tests {
     #[test]
     fn manifest_hermes_agent_is_prebuilt() {
         assert!(is_prebuilt("hermes-agent"));
-        assert!(is_installable("hermes-agent"));
+        assert_eq!(
+            installability_of("hermes-agent"),
+            Some(ClawInstallability::Installable),
+        );
     }
 
     #[test]
@@ -348,9 +461,10 @@ mod tests {
                     "{} has distribution=prebuilt but is_prebuilt() returns false",
                     entry.name
                 );
-                assert!(
-                    is_installable(entry.name),
-                    "{} has distribution=prebuilt but is_installable() returns false",
+                assert_eq!(
+                    entry.installability(),
+                    ClawInstallability::Installable,
+                    "{} has distribution=prebuilt but is not Installable",
                     entry.name
                 );
             } else {
@@ -484,14 +598,14 @@ mod tests {
     }
 
     #[test]
-    fn installable_names_matches_can_user_install() {
+    fn installable_names_delegates_to_installability_api() {
         let installable = installable_names();
-        let via_filter: Vec<_> = catalog()
+        let via_method: Vec<_> = catalog()
             .iter()
-            .filter(|e| e.tier.can_user_install())
+            .filter(|e| matches!(e.installability(), ClawInstallability::Installable))
             .map(|e| e.name)
             .collect();
-        assert_eq!(installable, via_filter);
+        assert_eq!(installable, via_method);
     }
 
     #[test]
@@ -499,5 +613,153 @@ mod tests {
         assert!(is_supported("picoclaw"));
         assert!(is_supported("zeroclaw"));
         assert!(!is_supported("fakeclaw"));
+    }
+
+    // ─── Installability single-source-of-truth tests ──────────────────────
+
+    #[test]
+    fn installability_categorises_each_tier_correctly() {
+        for entry in catalog() {
+            let result = entry.installability();
+            match entry.tier {
+                Tier::Supported | Tier::Available => {
+                    assert_eq!(
+                        result,
+                        ClawInstallability::Installable,
+                        "{} has tier {:?} but installability() returned {result:?} \
+                         — Supported/Available with a real install path must be Installable",
+                        entry.name,
+                        entry.tier,
+                    );
+                }
+                Tier::Catalog => {
+                    let ClawInstallability::Unavailable { code, .. } = result else {
+                        panic!(
+                            "{} has tier: catalog but installability() returned \
+                             Installable — expected Unavailable {{ code: CatalogOnly }}",
+                            entry.name
+                        );
+                    };
+                    assert_eq!(code, UnavailableReasonCode::CatalogOnly);
+                }
+                Tier::Detected => {
+                    let ClawInstallability::Unavailable { code, .. } = result else {
+                        panic!(
+                            "{} has tier: detected but installability() returned \
+                             Installable — expected Unavailable {{ code: DetectedUnverified }}",
+                            entry.name
+                        );
+                    };
+                    assert_eq!(code, UnavailableReasonCode::DetectedUnverified);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn installability_no_install_plan_is_absent_in_current_manifest() {
+        // Invariant: a `Supported` or `Available` entry must declare an
+        // install path (buildable, prebuilt, or template install: block).
+        // Any `NoInstallPlan` observation here is a manifest bug, not a
+        // user-facing condition — fix the manifest entry rather than the
+        // test. See the comment on UnavailableReasonCode::NoInstallPlan.
+        let offenders: Vec<&str> = catalog()
+            .iter()
+            .filter(|entry| {
+                matches!(
+                    entry.installability(),
+                    ClawInstallability::Unavailable {
+                        code: UnavailableReasonCode::NoInstallPlan,
+                        ..
+                    }
+                )
+            })
+            .map(|entry| entry.name)
+            .collect();
+        assert!(
+            offenders.is_empty(),
+            "manifest invariant violated — these claws have an installable \
+             tier but no install path (buildable=false, distribution!=prebuilt, \
+             install: absent): {offenders:?}"
+        );
+    }
+
+    #[test]
+    fn installability_claude_claw_is_catalog_only_with_human_message() {
+        let entry = get("claude-claw").expect("claude-claw must exist in manifest");
+        match entry.installability() {
+            ClawInstallability::Unavailable {
+                code: UnavailableReasonCode::CatalogOnly,
+                message,
+            } => {
+                assert!(
+                    message.contains("Claude Code plugin"),
+                    "expected skip_install_reason text, got: {message}"
+                );
+            }
+            other => panic!("expected CatalogOnly Unavailable, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn installability_catalog_entry_without_skip_reason_uses_default_message() {
+        // Synthesise an entry inline rather than depending on an absent
+        // skip_install_reason in the live manifest (every catalog entry
+        // happens to set one today).
+        let entry = ManifestEntry {
+            name: "ghostclaw",
+            description: "",
+            language: "",
+            buildable: false,
+            version: "",
+            binary_size_mb: 0,
+            min_ram_mb: 0,
+            license: "",
+            distribution: "",
+            tier: Tier::Catalog,
+            stars: 0,
+            source: "",
+            last_updated: "",
+            reviewed_upstream_commit: "",
+            reviewed_at: "",
+            reviewed_by: "",
+            latest_upstream_commit: "",
+            latest_checked_at: "",
+            install_template: "",
+            install_plan_source: "",
+            install: None,
+            run_cmd: "",
+            skip_install_reason: "",
+        };
+        match entry.installability() {
+            ClawInstallability::Unavailable {
+                code: UnavailableReasonCode::CatalogOnly,
+                message,
+            } => {
+                assert!(
+                    message.contains("discovery only"),
+                    "expected default catalog message, got: {message}"
+                );
+            }
+            other => panic!("expected CatalogOnly Unavailable, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn unavailable_reason_code_serialises_snake_case() {
+        let cases = [
+            (UnavailableReasonCode::CatalogOnly, "\"catalog_only\""),
+            (
+                UnavailableReasonCode::DetectedUnverified,
+                "\"detected_unverified\"",
+            ),
+            (UnavailableReasonCode::NoInstallPlan, "\"no_install_plan\""),
+        ];
+        for (code, expected) in cases {
+            let json = serde_json::to_string(&code).unwrap();
+            assert_eq!(json, expected);
+            let back: UnavailableReasonCode = serde_json::from_str(expected).unwrap();
+            assert_eq!(back, code);
+        }
     }
 }

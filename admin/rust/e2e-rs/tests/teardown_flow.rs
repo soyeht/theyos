@@ -157,7 +157,9 @@ fn make_app(fix: &Fixture) -> Router {
         household: HouseholdState::loaded(Arc::clone(&fix.identity)),
         state_dir: fix.state_dir.clone(),
         pair_device_window: Arc::new(PairDeviceWindow::new()),
-        pair_machine_window: Arc::new(household_rs::pair_machine::PairMachineWindow::new_in_memory()),
+        pair_machine_window: Arc::new(
+            household_rs::pair_machine::PairMachineWindow::new_in_memory(),
+        ),
         started_at: Instant::now(),
         setup_invitation_cache: server_rs::setup_invitation::new_cache(),
         engine_port: 8091,

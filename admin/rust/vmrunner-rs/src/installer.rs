@@ -179,7 +179,10 @@ pub fn get_installer(claw_type: &str) -> Option<Box<dyn ClawInstaller>> {
     }
 
     let entry = core_rs::manifest::get(claw_type)?;
-    if !entry.tier.can_user_install() {
+    if !matches!(
+        entry.installability(),
+        core_rs::manifest::ClawInstallability::Installable,
+    ) {
         return None;
     }
     installer_plan::get_plan(entry.name)?;

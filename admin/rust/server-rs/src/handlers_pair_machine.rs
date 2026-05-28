@@ -1017,6 +1017,22 @@ pub async fn local_finalize_handler(
             hint = "candidate identity committed; bootstrap status may remain stale until repaired",
         );
     }
+    // Daemon path: also flip the in-memory bootstrap-state RwLock so
+    // `GET /bootstrap/status` reports `ready` without waiting for a
+    // process restart. The CLI install path (`bootstrap: None`) skips
+    // this — that process is the pre-household phase by construction
+    // and has no live status endpoint to serve. We are still inside
+    // `BOOTSTRAP_MUTATION_LOCK` (acquired at the top of the handler),
+    // so the lock ordering — mutation-lock outer, BootstrapState
+    // RwLock inner — matches `accept_household_confirm` and
+    // `post_teardown`; no new race window is opened. If the on-disk
+    // persist above failed, the in-memory flip still goes through:
+    // on restart, bootstrap state is re-derived from the committed
+    // household record and owner auth, and once owner auth is present
+    // this resolves to Ready — so the divergence is self-healing.
+    if let Some(bs_lock) = state.bootstrap.as_ref() {
+        *bs_lock.write().await = BootstrapState::Ready;
+    }
     // T064: failure-injection crash point — fires after M2's
     // staged.commit() but BEFORE the FinalizeAck reaches M1. A
     // registered Panic models "M2 committed but the ack packet was

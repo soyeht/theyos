@@ -24,12 +24,6 @@
     "verify_log_path": "artifacts/verify/rosclaw-2026-04-15T17-22-43Z.log",
     "verify_attempted_at": "2026-04-15T17:22:43Z"
   },
-  "nemoclaw": {
-    "status": "fail",
-    "reason": "Docker/k3s required but iptables/nftables not supported in Firecracker guest kernel — container DNS fails, OpenShell gateway cannot start",
-    "verified_at": "2026-04-15",
-    "verified_by": "claude-sonnet-4-6"
-  },
   "tinyagi": {
     "verify_status": "ok",
     "verify_log_path": "artifacts/verify/tinyagi-2026-04-14T16-32-06Z.log",

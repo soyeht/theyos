@@ -75,7 +75,9 @@ fn make_bootstrap_state(bs: BootstrapState, state_dir: PathBuf) -> BootstrapHand
         household: HouseholdState::empty(),
         state_dir,
         pair_device_window: Arc::new(PairDeviceWindow::new()),
-        pair_machine_window: Arc::new(household_rs::pair_machine::PairMachineWindow::new_in_memory()),
+        pair_machine_window: Arc::new(
+            household_rs::pair_machine::PairMachineWindow::new_in_memory(),
+        ),
         started_at: Instant::now(),
         setup_invitation_cache: server_rs::setup_invitation::new_cache(),
         engine_port: 8091,
@@ -257,7 +259,9 @@ async fn scenario_b_full_happy_path() {
         household: HouseholdState::empty(),
         state_dir: dir.clone(),
         pair_device_window: Arc::new(PairDeviceWindow::new()),
-        pair_machine_window: Arc::new(household_rs::pair_machine::PairMachineWindow::new_in_memory()),
+        pair_machine_window: Arc::new(
+            household_rs::pair_machine::PairMachineWindow::new_in_memory(),
+        ),
         started_at: Instant::now(),
         setup_invitation_cache: server_rs::setup_invitation::new_cache(),
         engine_port: 8091,
@@ -441,7 +445,9 @@ async fn scenario_b_second_claim_after_initialize_returns_409() {
         household: HouseholdState::empty(),
         state_dir: dir.clone(),
         pair_device_window: Arc::new(PairDeviceWindow::new()),
-        pair_machine_window: Arc::new(household_rs::pair_machine::PairMachineWindow::new_in_memory()),
+        pair_machine_window: Arc::new(
+            household_rs::pair_machine::PairMachineWindow::new_in_memory(),
+        ),
         started_at: Instant::now(),
         setup_invitation_cache: server_rs::setup_invitation::new_cache(),
         engine_port: 8091,

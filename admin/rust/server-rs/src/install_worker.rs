@@ -354,11 +354,13 @@ async fn run_install_claw(state: &SharedState, job: &jobs_rs::Job) -> Result<(),
         return Ok(());
     };
 
-    if !entry.tier.can_user_install() {
-        let msg = format!(
-            "claw '{claw_name}' is not installable (tier: {:?})",
-            entry.tier
-        );
+    // Defense-in-depth installability check using the single-source-of-truth
+    // API. Mirrors the HTTP handler gate so a job written directly to the
+    // DB (tests, migrations) cannot bypass `ManifestEntry::installability()`.
+    if let core_rs::manifest::ClawInstallability::Unavailable { code, message } =
+        entry.installability()
+    {
+        let msg = format!("claw '{claw_name}' is not installable ({code:?}): {message}");
         error!("[install-worker] {claw_name}: {msg}");
         if let Err(e) = state.claw_store.mark_failed(&claw_name, &msg) {
             error!("[install-worker] {claw_name}: mark_failed failed: {e}");

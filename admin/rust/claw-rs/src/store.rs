@@ -7,7 +7,7 @@
 //! State is persisted as a JSON file at `$THEYOS_DIR/.run/installed_claws.json`.
 //! All mutations use atomic write-rename to prevent corruption.
 
-use core_rs::manifest;
+use core_rs::manifest::{self, ClawInstallability, UnavailableReasonCode};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::io;
@@ -104,6 +104,23 @@ pub struct ClawCatalogResponse {
     /// `"builtin"` | `"template:<name>"` | `"llm"` | `"manual"`.
     #[serde(skip_serializing_if = "String::is_empty")]
     pub install_plan_source: String,
+
+    // ─── Installability single-source-of-truth ──────────────────────────────
+    /// Derived from [`core_rs::manifest::ManifestEntry::installability`] —
+    /// the same predicate the HTTP install handlers and install worker use.
+    /// Always serialised so the UI can gate the Install button without
+    /// duplicating tier/buildable/distribution logic client-side.
+    pub installable: bool,
+    /// Machine-readable category when `installable == false`. Snake-case
+    /// strings on the wire (`"catalog_only"`, `"detected_unverified"`,
+    /// `"no_install_plan"`). Absent when the claw is installable.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub unavailable_reason_code: Option<UnavailableReasonCode>,
+    /// Human-readable explanation for the operator/UI. Falls back from
+    /// `ManifestEntry::skip_install_reason` to a generic default when the
+    /// manifest entry does not set one. Absent when installable.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub unavailable_reason: Option<String>,
 }
 
 // `skip_serializing_if` requires an `&T` signature, so we can't take this by
@@ -413,6 +430,13 @@ impl ClawStore {
                     manifest::Tier::Available => "available",
                     manifest::Tier::Supported => "supported",
                 };
+                let (installable, unavailable_reason_code, unavailable_reason) =
+                    match entry.installability() {
+                        ClawInstallability::Installable => (true, None, None),
+                        ClawInstallability::Unavailable { code, message } => {
+                            (false, Some(code), Some(message))
+                        }
+                    };
                 ClawCatalogResponse {
                     name: entry.name.to_string(),
                     description: entry.description.to_string(),
@@ -436,6 +460,9 @@ impl ClawStore {
                     reviewed_upstream_commit: entry.reviewed_upstream_commit.to_string(),
                     latest_upstream_commit: entry.latest_upstream_commit.to_string(),
                     install_plan_source: entry.install_plan_source.to_string(),
+                    installable,
+                    unavailable_reason_code,
+                    unavailable_reason,
                 }
             })
             .collect()
@@ -823,5 +850,78 @@ mod tests {
         let catalog = store.catalog_with_status_merged(Some(&missing));
         let pico = catalog.iter().find(|c| c.name == "picoclaw").unwrap();
         assert!(pico.verify_status.is_none());
+    }
+
+    #[test]
+    fn catalog_installable_matches_handler_installability_api() {
+        // The catalog response and the install handler MUST agree —
+        // both delegate to ManifestEntry::installability(). This test
+        // sweeps every entry and asserts the two views agree, so future
+        // catalog changes cannot reintroduce the iOS Claw Store bug where
+        // the UI offered an Install button for entries the backend rejects.
+        let (_dir, store) = temp_store();
+        let catalog = store.catalog_with_status();
+        for entry in manifest::catalog() {
+            let row = catalog
+                .iter()
+                .find(|c| c.name == entry.name)
+                .unwrap_or_else(|| panic!("catalog row missing for {}", entry.name));
+            let expected_installable =
+                matches!(entry.installability(), ClawInstallability::Installable);
+            assert_eq!(
+                row.installable, expected_installable,
+                "{} disagrees with ManifestEntry::installability()",
+                entry.name
+            );
+            if expected_installable {
+                assert!(row.unavailable_reason_code.is_none());
+                assert!(row.unavailable_reason.is_none());
+            } else {
+                let ClawInstallability::Unavailable { code, message } = entry.installability()
+                else {
+                    unreachable!()
+                };
+                assert_eq!(row.unavailable_reason_code, Some(code));
+                assert_eq!(row.unavailable_reason.as_deref(), Some(message.as_str()));
+            }
+        }
+    }
+
+    #[test]
+    fn catalog_claude_claw_is_unavailable_catalog_only_with_human_message() {
+        let (_dir, store) = temp_store();
+        let catalog = store.catalog_with_status();
+        let claude = catalog
+            .iter()
+            .find(|c| c.name == "claude-claw")
+            .expect("claude-claw must exist in catalog");
+        assert!(!claude.installable);
+        assert_eq!(
+            claude.unavailable_reason_code,
+            Some(UnavailableReasonCode::CatalogOnly)
+        );
+        let reason = claude.unavailable_reason.as_deref().unwrap_or_default();
+        assert!(
+            reason.contains("Claude Code plugin"),
+            "expected manifest skip_install_reason in unavailable_reason, got: {reason}"
+        );
+    }
+
+    #[test]
+    fn catalog_unavailable_reason_code_serialises_snake_case() {
+        // Wire-format guarantee for the iPhone/Mac UI: the code is a
+        // snake_case string, not a JSON object or upper-case enum name.
+        let (_dir, store) = temp_store();
+        let catalog = store.catalog_with_status();
+        let claude = catalog
+            .iter()
+            .find(|c| c.name == "claude-claw")
+            .expect("claude-claw must exist in catalog");
+        let json = serde_json::to_value(claude).unwrap();
+        assert_eq!(json["installable"], serde_json::Value::Bool(false));
+        assert_eq!(
+            json["unavailable_reason_code"],
+            serde_json::Value::String("catalog_only".to_string()),
+        );
     }
 }

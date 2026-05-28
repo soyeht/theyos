@@ -139,6 +139,14 @@ struct ClawEntry {
     // soak the claw for 60s. Empty ⇒ the soak is skipped (install-only verify).
     #[serde(default)]
     run_cmd: String,
+
+    // Operator-visible reason a claw is intentionally not installable
+    // (`tier: catalog` entries that exist for discovery only — Electron
+    // apps, ESP firmware, Claude Code plugins like claude-claw, etc.).
+    // Surfaced to clients via `ClawCatalogResponse.unavailable_reason`
+    // when the entry's tier is not user-installable.
+    #[serde(default)]
+    skip_install_reason: String,
 }
 
 /// Escape `\` and `"` for inclusion inside a short, single-line Rust `"..."` literal.
@@ -464,7 +472,8 @@ fn main() {
                   install_template: \"{}\", \
                   install_plan_source: \"{}\", \
                   install: {install_ref}, \
-                  run_cmd: \"{}\" \
+                  run_cmd: \"{}\", \
+                  skip_install_reason: \"{}\" \
                   }},",
                 escape_str(&entry.description),
                 escape_str(&entry.language),
@@ -486,6 +495,7 @@ fn main() {
                 escape_str(&entry.install_template),
                 escape_str(&entry.install_plan_source),
                 escape_str(&entry.run_cmd),
+                escape_str(&entry.skip_install_reason),
             )
             .expect("write to String");
         }
@@ -519,6 +529,7 @@ fn main() {
                 "install_template": entry.install_template,
                 "install_plan_source": entry.install_plan_source,
                 "run_cmd": entry.run_cmd,
+                "skip_install_reason": entry.skip_install_reason,
             })
         })
         .collect();

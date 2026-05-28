@@ -55,7 +55,9 @@ fn bootstrap_app(
         household,
         state_dir,
         pair_device_window: Arc::clone(&pdw),
-        pair_machine_window: Arc::new(household_rs::pair_machine::PairMachineWindow::new_in_memory()),
+        pair_machine_window: Arc::new(
+            household_rs::pair_machine::PairMachineWindow::new_in_memory(),
+        ),
         started_at: Instant::now(),
         setup_invitation_cache: server_rs::setup_invitation::new_cache(),
         engine_port: 8091,

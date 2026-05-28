@@ -74,9 +74,17 @@ pub enum VerifyResultsError {
 
 /// Load the full verify-results map.  Returns an empty map if the file does not exist.
 ///
+/// Per-entry deserialisation: any entry whose JSON shape does not match
+/// [`VerifyResult`] (e.g. legacy hand-authored entries missing
+/// `verify_status`) is logged via `tracing::warn!` and skipped — it does not
+/// poison the rest of the map. A *top-level* parse failure (the file is not
+/// valid JSON, or is not a JSON object) is still returned as a hard error so
+/// genuine corruption is not hidden.
+///
 /// # Errors
 ///
-/// Returns an error if the file exists but cannot be parsed.
+/// Returns an error if the file exists but the top-level JSON cannot be
+/// parsed as an object. Malformed individual entries are skipped, not raised.
 pub fn load(path: &Path) -> Result<HashMap<String, VerifyResult>, VerifyResultsError> {
     if !path.is_file() {
         return Ok(HashMap::new());
@@ -85,8 +93,24 @@ pub fn load(path: &Path) -> Result<HashMap<String, VerifyResult>, VerifyResultsE
     if content.trim().is_empty() {
         return Ok(HashMap::new());
     }
-    let map: HashMap<String, VerifyResult> = serde_json::from_str(&content)?;
-    Ok(map)
+    let raw: HashMap<String, serde_json::Value> = serde_json::from_str(&content)?;
+    let mut out = HashMap::with_capacity(raw.len());
+    for (claw, value) in raw {
+        match serde_json::from_value::<VerifyResult>(value) {
+            Ok(result) => {
+                out.insert(claw, result);
+            }
+            Err(e) => {
+                tracing::warn!(
+                    stage = "verify_results.entry_skipped",
+                    claw = %claw,
+                    error = %e,
+                    "skipping malformed verify-results entry; re-run claws-verify to repair"
+                );
+            }
+        }
+    }
+    Ok(out)
 }
 
 /// Fetch the record for `claw`, if any.
@@ -293,5 +317,59 @@ mod tests {
         assert!(parsed.contains_key("picoclaw"));
         // The .tmp file must be gone after the rename.
         assert!(!path.with_extension("json.tmp").exists());
+    }
+
+    #[test]
+    fn load_skips_malformed_entry_and_keeps_valid_ones() {
+        // A hand-authored legacy entry (commit 84f307e shape: status/reason/
+        // verified_at/verified_by) used to poison the whole map because the
+        // single from_str call aborted on the first missing `verify_status`.
+        // The resilient reader must skip the malformed entry and return the
+        // remaining valid ones.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("verify-results.json");
+        let json = r#"{
+          "picoclaw": {
+            "verify_status": "ok",
+            "verify_log_path": "artifacts/verify/picoclaw.log",
+            "verify_attempted_at": "2026-04-15T12:00:00Z"
+          },
+          "nemoclaw": {
+            "status": "fail",
+            "reason": "Docker/k3s incompatible",
+            "verified_at": "2026-04-15",
+            "verified_by": "claude-sonnet-4-6"
+          }
+        }"#;
+        fs::write(&path, json).unwrap();
+
+        let map = load(&path).expect("malformed entry must not abort the load");
+        assert_eq!(map.len(), 1, "expected only the canonical entry");
+        assert!(map.contains_key("picoclaw"));
+        assert!(!map.contains_key("nemoclaw"));
+    }
+
+    #[test]
+    fn load_returns_error_on_top_level_invalid_json() {
+        // A truly broken file (not parseable as a JSON object) must still
+        // raise a hard error — silent recovery would hide real corruption.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("verify-results.json");
+        fs::write(&path, "{ this is not json").unwrap();
+
+        let err = load(&path).expect_err("top-level invalid JSON must error");
+        assert!(matches!(err, VerifyResultsError::Json(_)));
+    }
+
+    #[test]
+    fn load_returns_error_when_top_level_is_not_an_object() {
+        // A JSON array at the root is parseable as JSON but not as the
+        // expected map shape; treat as hard corruption.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("verify-results.json");
+        fs::write(&path, "[\"picoclaw\"]").unwrap();
+
+        let err = load(&path).expect_err("non-object root must error");
+        assert!(matches!(err, VerifyResultsError::Json(_)));
     }
 }
