@@ -72,6 +72,14 @@ pub enum VZError {
     #[error("Virtualization error: {0}")]
     VirtualizationError(String),
 
+    /// The macOS host active-VM limit has been reached (Apple's per-host
+    /// concurrent macOS-guest limit). Either detected up front by the admission
+    /// authority, or mapped reactively from VZ error `Code=6`. Carries an
+    /// operator-readable message; the machine-readable failure code
+    /// (`host_vm_limit_reached`) is attached downstream in `init-state.json`.
+    #[error("Host VM limit reached: {0}")]
+    HostVmLimitReached(String),
+
     /// Snapshot operation error.
     #[error("Snapshot error: {0}")]
     SnapshotError(String),

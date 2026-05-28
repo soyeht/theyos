@@ -379,6 +379,48 @@ struct BootstrapStatusResponse {
     /// retry hints in the iPhone UI.
     #[serde(skip_serializing_if = "Option::is_none")]
     guest_image_error: Option<String>,
+
+    /// Machine-readable failure reason (`snake_case` enum) for the most recent
+    /// failed phase. Present only when `guest_image_status == "failed"`; absent
+    /// on older engines. The iPhone keys localized recovery copy off this code
+    /// and treats `guest_image_error` as display-only detail.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    guest_image_failure_code: Option<core_rs::guest_image_failure::GuestImageFailureCode>,
+}
+
+impl BootstrapStatusResponse {
+    /// Build the status response, mapping a [`GuestImageState`] snapshot onto the
+    /// four `guest_image_*` wire fields. Extracted so the guest-image contract
+    /// (incl. `guest_image_failure_code`) is unit-testable without the global
+    /// `read_current()` / env path.
+    ///
+    /// [`GuestImageState`]: crate::guest_image_state::GuestImageState
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        state: &'static str,
+        version: &'static str,
+        platform: &'static str,
+        host_label: String,
+        uptime_secs: u64,
+        hh_id: Option<String>,
+        device_count: u32,
+        guest_image: crate::guest_image_state::GuestImageState,
+    ) -> Self {
+        Self {
+            v: 1,
+            state,
+            version,
+            platform,
+            host_label,
+            uptime_secs,
+            hh_id,
+            device_count,
+            guest_image_phase: guest_image.phase,
+            guest_image_status: guest_image.status,
+            guest_image_error: guest_image.error,
+            guest_image_failure_code: guest_image.failure_code,
+        }
+    }
 }
 
 #[derive(Serialize)]
@@ -406,19 +448,16 @@ pub async fn get_bootstrap_status(State(state): State<BootstrapHandlerState>) ->
     let (hh_id, device_count) = hh_info(&state.household, bootstrap_state).await;
 
     let guest_image = crate::guest_image_state::GuestImageState::read_current();
-    let body = BootstrapStatusResponse {
-        v: 1,
-        state: bootstrap_state.as_str(),
-        version: env!("CARGO_PKG_VERSION"),
-        platform: current_platform(),
-        host_label: detect_host_label(),
+    let body = BootstrapStatusResponse::new(
+        bootstrap_state.as_str(),
+        env!("CARGO_PKG_VERSION"),
+        current_platform(),
+        detect_host_label(),
         uptime_secs,
         hh_id,
         device_count,
-        guest_image_phase: guest_image.phase,
-        guest_image_status: guest_image.status,
-        guest_image_error: guest_image.error,
-    };
+        guest_image,
+    );
 
     // elapsed_ms: u128→u64 truncation impossible in practice (u64 covers ~585 millennia).
     #[allow(clippy::cast_possible_truncation)]
@@ -1790,12 +1829,70 @@ fn platform_model_string() -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::guest_image_state::GuestImageState;
     use axum::{
         body::Body,
         http::{Request, StatusCode as HStatus},
     };
+    use core_rs::guest_image_failure::GuestImageFailureCode;
     use serde_json::Value;
     use tower::ServiceExt;
+
+    /// The `/bootstrap/status` body MUST carry `guest_image_failure_code` when
+    /// the guest image last failed — this is the contract iOS/Mac consume.
+    #[test]
+    fn bootstrap_status_serializes_guest_image_failure_code() {
+        let gi = GuestImageState {
+            phase: Some("install_macos".into()),
+            status: Some("failed".into()),
+            error: Some("macOS VM startup hit the host active-VM limit".into()),
+            failure_code: Some(GuestImageFailureCode::HostVmLimitReached),
+        };
+        let resp = BootstrapStatusResponse::new(
+            "ready",
+            "0.0.0-test",
+            "macos",
+            "test-host".into(),
+            0,
+            None,
+            0,
+            gi,
+        );
+        let json = serde_json::to_value(&resp).expect("serialize");
+        assert_eq!(json["guest_image_status"], "failed");
+        assert_eq!(
+            json["guest_image_failure_code"], "host_vm_limit_reached",
+            "guest_image_failure_code must appear in /bootstrap/status"
+        );
+    }
+
+    /// Compat: an older `failed` state with no `failure_code` must still
+    /// serialize, omitting the field (never emit null / never break).
+    #[test]
+    fn bootstrap_status_omits_failure_code_when_absent() {
+        let gi = GuestImageState {
+            phase: Some("install_macos".into()),
+            status: Some("failed".into()),
+            error: Some("boom".into()),
+            failure_code: None,
+        };
+        let resp = BootstrapStatusResponse::new(
+            "ready",
+            "0.0.0-test",
+            "macos",
+            "test-host".into(),
+            0,
+            None,
+            0,
+            gi,
+        );
+        let json = serde_json::to_value(&resp).expect("serialize");
+        assert_eq!(json["guest_image_status"], "failed");
+        assert!(
+            json.get("guest_image_failure_code").is_none(),
+            "absent failure_code must be omitted, not null"
+        );
+    }
 
     fn make_state(bs: BootstrapState) -> BootstrapHandlerState {
         use std::path::PathBuf;

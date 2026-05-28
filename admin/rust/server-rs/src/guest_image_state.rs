@@ -23,6 +23,7 @@
 //! non-macOS targets. The handler emits Option-typed fields so the
 //! iPhone can distinguish "doesn't apply" from "in progress" cleanly.
 
+use core_rs::guest_image_failure::GuestImageFailureCode;
 use serde::Serialize;
 #[cfg(target_os = "macos")]
 use std::path::PathBuf;
@@ -44,6 +45,11 @@ pub struct GuestImageState {
     /// Error message extracted from the most recent failed phase
     /// record in `phase_history`. Only set when `status == "failed"`.
     pub error: Option<String>,
+
+    /// Machine-readable failure reason for the most recent failed phase.
+    /// Only set when `status == "failed"`; absent on older state files that
+    /// predate the field (the iPhone then falls back to generic copy).
+    pub failure_code: Option<GuestImageFailureCode>,
 }
 
 impl GuestImageState {
@@ -58,6 +64,7 @@ impl GuestImageState {
             phase: None,
             status: None,
             error: None,
+            failure_code: None,
         }
     }
 
@@ -125,23 +132,19 @@ fn read_from_path(path: &std::path::Path) -> Option<GuestImageState> {
     // Extract the error from the most recent failed phase in phase_history.
     // Schema: `phase_history` is `BTreeMap<String, PhaseRecord>` where
     // each `PhaseRecord` has `status: PhaseStatus` and `error: Option<String>`.
-    let error = if status.as_deref() == Some("failed") {
+    // Locate the most recent failed phase record (highest sorted key with
+    // status == "failed"), then pull both its `error` and `failure_code`.
+    let failed_record = if status.as_deref() == Some("failed") {
         json.get("phase_history")
             .and_then(|h| h.as_object())
             .and_then(|history| {
-                // Iterate in reverse-insertion order via BTreeMap's
-                // natural ordering — phases run in a fixed sequence
-                // (download → disk → install → provision → snapshot →
-                // complete), so the latest failed one is the highest
-                // sorted key with status == "failed".
+                // Phases run in a fixed sequence (download → disk → install →
+                // provision → snapshot → complete), so the latest failed one is
+                // the highest sorted key with status == "failed".
                 history.iter().rev().find_map(|(_, record)| {
                     let rec_obj = record.as_object()?;
-                    let rec_status = rec_obj.get("status")?.as_str()?;
-                    if rec_status == "failed" {
-                        rec_obj
-                            .get("error")
-                            .and_then(|e| e.as_str())
-                            .map(String::from)
+                    if rec_obj.get("status")?.as_str()? == "failed" {
+                        Some(rec_obj.clone())
                     } else {
                         None
                     }
@@ -151,10 +154,23 @@ fn read_from_path(path: &std::path::Path) -> Option<GuestImageState> {
         None
     };
 
+    let error = failed_record
+        .as_ref()
+        .and_then(|rec| rec.get("error").and_then(|e| e.as_str()).map(String::from));
+
+    // `failure_code` is fail-soft: an unrecognized/absent code never breaks
+    // decoding. Absent → None (older state file); unknown string → Unknown.
+    let failure_code = failed_record.as_ref().and_then(|rec| {
+        rec.get("failure_code")
+            .and_then(|c| c.as_str())
+            .map(GuestImageFailureCode::from_wire)
+    });
+
     Some(GuestImageState {
         phase,
         status,
         error,
+        failure_code,
     })
 }
 
@@ -304,5 +320,77 @@ mod tests {
         fs::write(&state_file, "{ this is not json").unwrap();
         let result = read_from_path(&state_file);
         assert!(result.is_none(), "corrupted JSON → None → not_applicable");
+    }
+
+    #[test]
+    fn read_extracts_failure_code_from_failed_phase() {
+        let dir = tempdir().unwrap();
+        let state_file = dir.path().join("init-state.json");
+        fs::write(
+            &state_file,
+            r#"{
+                "phase": "install_macos",
+                "status": "failed",
+                "phase_history": {
+                    "install_macos": {
+                        "status": "failed",
+                        "error": "macOS VM startup hit the host active-VM limit",
+                        "failure_code": "host_vm_limit_reached"
+                    }
+                }
+            }"#,
+        )
+        .unwrap();
+        let result = read_from_path(&state_file).expect("parses");
+        assert_eq!(result.status.as_deref(), Some("failed"));
+        assert_eq!(
+            result.failure_code,
+            Some(GuestImageFailureCode::HostVmLimitReached)
+        );
+    }
+
+    #[test]
+    fn read_failure_code_absent_on_old_state_is_none() {
+        // Compat: an older failed record predates `failure_code`. Decoding must
+        // not break, and the code is simply absent (iPhone falls back to copy).
+        let dir = tempdir().unwrap();
+        let state_file = dir.path().join("init-state.json");
+        fs::write(
+            &state_file,
+            r#"{
+                "phase": "install_macos",
+                "status": "failed",
+                "phase_history": {
+                    "install_macos": { "status": "failed", "error": "boom" }
+                }
+            }"#,
+        )
+        .unwrap();
+        let result = read_from_path(&state_file).expect("parses");
+        assert_eq!(result.error.as_deref(), Some("boom"));
+        assert!(result.failure_code.is_none());
+    }
+
+    #[test]
+    fn read_unknown_failure_code_is_failsoft_unknown() {
+        let dir = tempdir().unwrap();
+        let state_file = dir.path().join("init-state.json");
+        fs::write(
+            &state_file,
+            r#"{
+                "phase": "install_macos",
+                "status": "failed",
+                "phase_history": {
+                    "install_macos": {
+                        "status": "failed",
+                        "error": "boom",
+                        "failure_code": "some_future_code"
+                    }
+                }
+            }"#,
+        )
+        .unwrap();
+        let result = read_from_path(&state_file).expect("parses");
+        assert_eq!(result.failure_code, Some(GuestImageFailureCode::Unknown));
     }
 }

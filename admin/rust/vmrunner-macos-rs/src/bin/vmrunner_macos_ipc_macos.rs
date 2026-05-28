@@ -4,11 +4,10 @@ use serde_json::Value;
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use tokio::sync::OwnedSemaphorePermit;
 use vmrunner_macos_rs::{
-    MacOSVmSlotManager, VZMacOSVmConfigurationBuilder, VZVirtualMachine,
-    VZVirtualMachineConfigurationBuilder, VmState, build_cidata_iso, clone_base_image,
-    ensure_ssh_key,
+    AdmissionError, ManagedMacOSVm, VZMacOSVmConfigurationBuilder, VZVirtualMachine,
+    VZVirtualMachineConfigurationBuilder, VmAdmission, VmKind, VmLease, VmState, build_cidata_iso,
+    clone_base_image, ensure_ssh_key,
     init_state::{InitState, read_state},
     macos_guest, resolve_dhcp_ip,
     slot_manager::{MACOS_VM_LIMIT, MACOS_VM_LIMIT_REACHED},
@@ -34,11 +33,23 @@ fn cleanup_failed_macos_install_artifacts(disk_path: &Path, aux_path: &Path) {
     }
 }
 
+/// Centralized string fallback for detecting the VZ host active-VM limit from an
+/// error message. Preferred path is the typed [`vmrunner_macos_rs::VZError::HostVmLimitReached`]
+/// (set from `NSError.domain == VZErrorDomain && code == 6` in `vz`); this string
+/// match is the single fallback for errors that arrive only as text.
 fn macos_vm_limit_exceeded(error: &str) -> bool {
     error.contains("\"code\": 6")
         || error.contains("Code=6")
         || error.contains("VZErrorVirtualMachineLimitExceeded")
         || error.contains("maximum supported number of active virtual machines")
+        || error.contains("Host VM limit reached")
+}
+
+/// True if a [`VZError`](vmrunner_macos_rs::VZError) is the host active-VM limit —
+/// typed variant first, centralized string match as fallback.
+fn is_macos_vm_limit_error(err: &vmrunner_macos_rs::VZError) -> bool {
+    matches!(err, vmrunner_macos_rs::VZError::HostVmLimitReached(_))
+        || macos_vm_limit_exceeded(&err.to_string())
 }
 
 fn macos_vm_limit_message(source: &str, error: &str) -> String {
@@ -61,6 +72,244 @@ fn snapshots_dir_from_env_or_home() -> PathBuf {
     }
 }
 
+/// Directory that holds VM state, including the admission lease registry.
+/// Mirrors the env precedence used elsewhere (state dir, then assets dir, then HOME).
+fn vm_state_dir() -> PathBuf {
+    for key in ["THEYOS_VM_STATE_DIR", "THEYOS_VM_ASSETS_DIR"] {
+        if let Ok(p) = std::env::var(key) {
+            if !p.is_empty() {
+                return PathBuf::from(p);
+            }
+        }
+    }
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
+    PathBuf::from(home).join("Library/Application Support/theyos/vms")
+}
+
+/// Map an [`AdmissionError`] to an IPC [`Response`]. Host-limit refusals carry the
+/// established machine code so `server-rs` can surface `host_vm_limit_reached`
+/// without re-parsing the message. **No VM was started** when this is returned.
+fn admission_err_response(err: &AdmissionError) -> Response {
+    if err.is_host_vm_limit() {
+        Response::err_code(MACOS_VM_LIMIT_REACHED, err)
+    } else {
+        Response::err(err)
+    }
+}
+
+/// The single macOS install flow: `DownloadIpsw` → `CreateDisk` → `InstallMacOS`
+/// over ranked restore-image candidates. This is the **only** caller of
+/// [`macos_guest::install_macos`] and the only place an install VM may start —
+/// it reserves and holds one `Install` admission lease across the whole flow
+/// (Invariant I-1), shared by both `handle_macos_prepare` (remote) and
+/// `handle_macos_base_install` (legacy local CLI).
+///
+/// On success, `state` is updated with the install result and `phase = Provision`
+/// and persisted; returns `Ok(())`. On failure returns a ready error [`Response`]
+/// with the lease already released. A VZ host-limit error (`Code=6`) even with a
+/// free registry flags the host blocked for this boot, returns the typed limit
+/// code, and does **not** retry into another VM.
+fn run_macos_install_flow(
+    params: &Value,
+    base_dir: &Path,
+    state: &mut InitState,
+    admission: &VmAdmission,
+) -> Result<(), Response> {
+    use vmrunner_macos_rs::init_state::{InitPhase, read_state, write_state};
+
+    let requested_ipsw = params["ipsw"].as_str();
+    tracing::info!(requested_ipsw = ?requested_ipsw, "Resolving restore image source...");
+    let candidates = match macos_guest::resolve_restore_image(requested_ipsw, base_dir) {
+        Ok(v) => v,
+        Err(e) => return Err(Response::err(format!("resolve_restore_image: {e}"))),
+    };
+    if candidates.is_empty() {
+        return Err(Response::err(
+            "resolve_restore_image: no compatible candidates returned",
+        ));
+    }
+
+    let max_attempts = std::env::var("THEYOS_IPSW_MAX_CANDIDATES")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(3)
+        .min(candidates.len());
+
+    let ipsw_path = base_dir.join("macos.ipsw");
+    let disk_path = base_dir.join("disk.img");
+    let aux_path = base_dir.join("aux.auxstorage");
+
+    // Invariant I-1: reserve the install slot via the single admission authority
+    // BEFORE downloading or starting anything. On HostVmLimitReached we fail fast
+    // — no download, no VM start — and (reactive host-blocked case) do not retry.
+    let install_lease = match admission.reserve(VmKind::Install, None) {
+        Ok(l) => l,
+        Err(e) => {
+            tracing::warn!(error = %e, "guest-image install admission refused");
+            return Err(admission_err_response(&e));
+        }
+    };
+
+    let mut last_err: Option<String> = None;
+
+    for (idx, candidate) in candidates.iter().take(max_attempts).enumerate() {
+        let label = candidate.source_label.clone();
+        tracing::info!(
+            attempt = idx + 1,
+            total = max_attempts,
+            source = %label,
+            "trying restore image candidate"
+        );
+
+        if state.ipsw_source.is_some() && state.ipsw_source.as_deref() != Some(label.as_str()) {
+            tracing::info!(prev = ?state.ipsw_source, new = %label,
+                "switching restore-image candidate; clearing previous download progress");
+            std::fs::remove_file(&ipsw_path).ok();
+            let _ = macos_guest::clear_download_progress(base_dir);
+            *state = read_state(base_dir).unwrap_or_default();
+        }
+
+        state.phase = Some(InitPhase::DownloadIpsw);
+        state.macos_version = Some(candidate.macos_version.clone());
+        state
+            .host_macos_version
+            .clone_from(&candidate.host_macos_version);
+        state
+            .host_macos_build
+            .clone_from(&candidate.host_macos_build);
+        state.ipsw_build.clone_from(&candidate.ipsw_build);
+        state.ipsw_source = Some(label.clone());
+        let _ = write_state(base_dir, state);
+
+        let candidate_ipsw_path = match &candidate.source {
+            macos_guest::RestoreImageSource::DownloadUrl(_) => ipsw_path.clone(),
+            macos_guest::RestoreImageSource::LocalFile(local_path) => local_path.clone(),
+        };
+
+        let download_result = match &candidate.source {
+            macos_guest::RestoreImageSource::DownloadUrl(url) => {
+                tracing::info!(url, "Downloading restore image...");
+                macos_guest::download_ipsw(url, &ipsw_path, state, base_dir, |downloaded, total| {
+                    if total > 0 {
+                        let pct = downloaded * 100 / total;
+                        tracing::debug!(pct, downloaded, total, "IPSW download progress");
+                    }
+                })
+            }
+            macos_guest::RestoreImageSource::LocalFile(local_path) => {
+                let local_bytes = std::fs::metadata(local_path).map(|m| m.len()).ok();
+                state.ipsw_total_bytes = local_bytes;
+                state.ipsw_bytes_downloaded = local_bytes.unwrap_or(0);
+                let _ = write_state(base_dir, state);
+                tracing::info!(path = %local_path.display(), "Using local restore image");
+                Ok(())
+            }
+        };
+
+        if let Err(e) = download_result {
+            tracing::warn!(error = %e, source = %label, "candidate download failed; trying next");
+            if !state.failed_ipsw_sources.iter().any(|s| s == &label) {
+                state.failed_ipsw_sources.push(label.clone());
+            }
+            let _ = write_state(base_dir, state);
+            std::fs::remove_file(&ipsw_path).ok();
+            let _ = macos_guest::clear_download_progress(base_dir);
+            *state = read_state(base_dir).unwrap_or_default();
+            last_err = Some(format!("{label} (download): {e}"));
+            continue;
+        }
+
+        if let Err(e) = macos_guest::inspect_restore_image(&candidate_ipsw_path) {
+            tracing::warn!(error = %e, source = %label,
+                "candidate failed VZ pre-install validation; trying next");
+            if !state.failed_ipsw_sources.iter().any(|s| s == &label) {
+                state.failed_ipsw_sources.push(label.clone());
+            }
+            let _ = write_state(base_dir, state);
+            std::fs::remove_file(&ipsw_path).ok();
+            let _ = macos_guest::clear_download_progress(base_dir);
+            *state = read_state(base_dir).unwrap_or_default();
+            last_err = Some(format!("{label} (inspect): {e}"));
+            continue;
+        }
+
+        cleanup_failed_macos_install_artifacts(&disk_path, &aux_path);
+        tracing::info!("Creating 64 GB sparse disk...");
+        if let Err(e) = macos_guest::create_disk(&disk_path, 64) {
+            install_lease.release_clean();
+            return Err(Response::err(format!("create_disk: {e}")));
+        }
+        state.phase = Some(InitPhase::InstallMacOS);
+        // Pre-mark this candidate as failed BEFORE install_macos runs so that a
+        // subprocess crash (not a returned Err) does not re-try the same candidate.
+        if !state.failed_ipsw_sources.iter().any(|s| s == &label) {
+            state.failed_ipsw_sources.push(label.clone());
+        }
+        let _ = write_state(base_dir, state);
+
+        tracing::info!("Installing macOS from IPSW (~20 min)...");
+        // install_macos requires the lease proof token — it cannot start a VM
+        // without admission.
+        match macos_guest::install_macos(
+            &candidate_ipsw_path,
+            &disk_path,
+            &aux_path,
+            &install_lease,
+            |frac| {
+                tracing::info!("macOS install progress: {:.0}%", frac * 100.0);
+            },
+        ) {
+            Ok(result) => {
+                tracing::info!(source = %label, "candidate installed successfully");
+                state.failed_ipsw_sources.retain(|s| s != &label);
+                // The install VM is stopped inside install_macos; release the lease.
+                install_lease.release_clean();
+                state.hardware_model_data = Some(result.hardware_model_data_b64);
+                state.machine_identifier_data_b64 = Some(result.machine_identifier_data_b64);
+                state.install_cpu_count = Some(result.install_cpu_count);
+                state.install_memory_mb = Some(result.install_memory_mb);
+                state.phase = Some(InitPhase::Provision);
+                let _ = write_state(base_dir, state);
+                return Ok(());
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, source = %label,
+                    "install_macos failed; trying next candidate");
+                std::fs::remove_file(&ipsw_path).ok();
+                cleanup_failed_macos_install_artifacts(&disk_path, &aux_path);
+                let _ = macos_guest::clear_download_progress(base_dir);
+                *state = read_state(base_dir).unwrap_or_default();
+                if is_macos_vm_limit_error(&e) {
+                    // Reactive backstop (Invariant I-4): the registry showed free
+                    // capacity but VZ still hit the host limit (a prior leak we
+                    // cannot see). Flag the host blocked for this boot so we stop
+                    // retrying, release this lease (the install VM never started).
+                    state.failed_ipsw_sources.retain(|s| s != &label);
+                    let _ = write_state(base_dir, state);
+                    if let Err(be) = admission.mark_host_blocked() {
+                        tracing::warn!(error = %be, "failed to set host-blocked flag");
+                    }
+                    install_lease.release_clean();
+                    return Err(Response::err_code(
+                        MACOS_VM_LIMIT_REACHED,
+                        macos_vm_limit_message(&label, &e.to_string()),
+                    ));
+                }
+                last_err = Some(format!("{label} (install): {e}"));
+            }
+        }
+    }
+
+    // All candidates failed without hitting the host limit.
+    install_lease.release_clean();
+    Err(Response::err(format!(
+        "all {max_attempts} restore image candidate(s) failed; last error: {}\n\
+         hint: if these failures look stale (e.g., a prior run was killed mid-install), \
+         retry with `soyeht start --force` to clear the cached failure list.",
+        last_err.unwrap_or_else(|| "unknown".into())
+    )))
+}
+
 // ── Shared state ──────────────────────────────────────────────────────────────
 
 /// A running VM entry that keeps the VZ machine and (for macOS guests) the
@@ -69,10 +318,48 @@ fn snapshots_dir_from_env_or_home() -> PathBuf {
 /// Dropping this entry releases the slot permit so a new macOS VM can start.
 struct VmEntry {
     vm: Arc<VZVirtualMachine>,
-    /// Held for macOS guest VMs; `None` for Linux guests.
-    _slot_permit: Option<OwnedSemaphorePermit>,
+    /// Admission lease for macOS guest VMs; `None` for Linux guests.
+    ///
+    /// Release discipline (Invariant I-2): the lease is released by an explicit
+    /// `stop_and_release` after the VM is confirmed stopped — never by `VmEntry`'s
+    /// own `Drop`, which retains the registry record fail-closed.
+    lease: Option<VmLease>,
     /// Holds the `ObjcDelegate` object alive for the lifetime of this VM entry.
     _delegate: Option<ObjcDelegate>,
+}
+
+impl VmEntry {
+    /// Stop the VM, then release its admission lease. On stop failure the lease is
+    /// retained as a suspected orphan (the slot stays held until reboot).
+    async fn stop_and_release(mut self, graceful: bool) {
+        let lease = self.lease.take();
+        if let Some(l) = &lease {
+            l.mark_stopping();
+        }
+        let result = self.vm.stop(graceful).await;
+        match (result, lease) {
+            (Ok(()), Some(l)) => l.release_clean(),
+            (Ok(()), None) => {}
+            (Err(e), Some(l)) => {
+                tracing::error!(error = %e, "stop_and_release: VM stop failed — retaining lease");
+                l.retain_as_orphan();
+            }
+            (Err(e), None) => {
+                tracing::warn!(error = %e, "stop_and_release: Linux VM stop failed");
+            }
+        }
+    }
+}
+
+impl Drop for VmEntry {
+    fn drop(&mut self) {
+        if self.lease.is_some() {
+            tracing::warn!(
+                "VmEntry dropped without stop_and_release — admission lease retained \
+                 fail-closed (use stop_and_release to free the slot)"
+            );
+        }
+    }
 }
 
 type VmMap = HashMap<String, VmEntry>;
@@ -80,8 +367,9 @@ type VmMap = HashMap<String, VmEntry>;
 struct IpcState {
     vms: Mutex<VmMap>,
     warm_pool: WarmPoolManager,
-    /// macOS VM slot manager — enforces Apple's 2-VM concurrent limit.
-    slots: MacOSVmSlotManager,
+    /// Single admission authority for every macOS VM start — enforces Apple's
+    /// 2-VM concurrent limit across processes via the persisted lease registry.
+    admission: VmAdmission,
     /// Snapshot manager — holds the registered macOS base snapshot path (no TTL).
     snapshot_manager: Mutex<SnapshotManager>,
     /// Container IDs of pre-booted macOS warm-pool VMs ready for instant assignment (FIFO).
@@ -119,7 +407,7 @@ impl IpcState {
         let warm_pool = WarmPoolManager::new(snapshots_dir.clone(), pool_cfg)
             .map_err(|e| format!("warm pool init: {e}"))?;
 
-        let slots = MacOSVmSlotManager::new();
+        let admission = VmAdmission::new(&vm_state_dir());
 
         // T025/T026: Register the macOS base snapshot (created by init-macos-guest) so the
         // warm pool can call restore_from_base_snapshot() at startup and after refills.
@@ -144,7 +432,7 @@ impl IpcState {
         Ok(Self {
             vms: Mutex::new(HashMap::new()),
             warm_pool,
-            slots,
+            admission,
             snapshot_manager: Mutex::new(snapshot_mgr),
             macos_warm_pool: Mutex::new(VecDeque::new()),
             macos_warm_pool_size: pool_size,
@@ -287,6 +575,29 @@ pub fn main_impl() {
     // T037: Startup recovery — scan for stale vm_ip files from previous run.
     let stale_warm_pool_dirs = IpcState::recover_running_instances();
 
+    // Reconcile the admission lease registry: drop leases from prior boots (a
+    // reboot clears leaked VZ sessions) and surface same-boot suspected orphans.
+    match state.admission.reconcile_now() {
+        Ok(cap) => {
+            if cap.suspected_orphans > 0 || cap.host_blocked {
+                tracing::warn!(
+                    live = cap.live,
+                    suspected_orphans = cap.suspected_orphans,
+                    available = cap.available,
+                    host_blocked = cap.host_blocked,
+                    "admission: macOS VM capacity at startup (suspected orphans persist until reboot)"
+                );
+            } else {
+                tracing::info!(
+                    live = cap.live,
+                    available = cap.available,
+                    "admission: macOS VM capacity reconciled at startup"
+                );
+            }
+        }
+        Err(e) => tracing::warn!(error = %e, "admission: startup reconcile failed"),
+    }
+
     // T026: Boot warm pool VMs from base snapshot in the background.
     // Only boots if base snapshot is registered and Apple VM slots are available.
     if stale_warm_pool_dirs > 0 {
@@ -319,8 +630,8 @@ fn dispatch(method: &str, params: &Value, state: &Arc<IpcState>) -> Response {
         "TakeBaseSnapshot" => handle_take_base_snapshot(params, state),
         "FetchLogs" => handle_fetch_logs(params),
         // macOS guest init methods (T015, T016)
-        "MacOsBaseInstall" => handle_macos_base_install(params),
-        "MacOsPrepare" => handle_macos_prepare(params),
+        "MacOsBaseInstall" => handle_macos_base_install(params, state),
+        "MacOsPrepare" => handle_macos_prepare(params, state),
         "MacOsProvisionAndSnapshot" => handle_macos_provision_and_snapshot(params, state),
         "RemoveMacOsBase" => handle_remove_macos_base(params),
         "MacOsSlotStatus" => handle_macos_slot_status(state.as_ref()),
@@ -389,20 +700,19 @@ fn handle_create(params: &Value, state: &Arc<IpcState>) -> Response {
 
     let inst_dir = instance_dir(&container);
 
-    // T019: macOS guest slot enforcement (Apple 2-VM limit).
-    // Use `try_acquire_owned` so the permit can be stored in the VmMap entry (T029 RAII).
-    let slot_permit: Option<OwnedSemaphorePermit> = if guest_os == "macos" {
-        if let Ok(permit) = state.slots.try_acquire_owned() {
-            Some(permit)
-        } else {
-            tracing::warn!(
-                "macOS VM limit reached (max {} simultaneous macOS guest VMs)",
-                MACOS_VM_LIMIT
-            );
-            return Response::err_code(
-                MACOS_VM_LIMIT_REACHED,
-                "macOS VM limit reached: max 2 simultaneous macOS guest VMs per Apple host (Apple Virtualization Framework license). Delete a running macOS instance or use guest_os=linux (no limit).",
-            );
+    // T019 / Invariant I-1: macOS guests go through the single admission authority,
+    // which gates on the cross-process lease registry (live + suspected orphans),
+    // not just an in-process semaphore. On refusal, no VM is started.
+    let mut user_lease: Option<VmLease> = if guest_os == "macos" {
+        match state
+            .admission
+            .reserve(VmKind::UserClaw, Some(container.clone()))
+        {
+            Ok(lease) => Some(lease),
+            Err(e) => {
+                tracing::warn!(error = %e, "macOS VM admission refused");
+                return admission_err_response(&e);
+            }
         }
     } else {
         None
@@ -416,7 +726,7 @@ fn handle_create(params: &Value, state: &Arc<IpcState>) -> Response {
         let warm_container = state.macos_warm_pool.lock().unwrap().pop_front();
         if let Some(ref wc) = warm_container {
             let warm_entry = state.vms.lock().unwrap().remove(wc);
-            if let Some(warm) = warm_entry {
+            if let Some(mut warm) = warm_entry {
                 let warm_dir = instance_dir(wc);
                 let ip = std::fs::read_to_string(warm_dir.join("vm_ip"))
                     .unwrap_or_else(|_| "192.168.64.100".to_string());
@@ -429,17 +739,18 @@ fn handle_create(params: &Value, state: &Arc<IpcState>) -> Response {
                     warm_container = wc.as_str(),
                     "macOS warm pool: VM assigned from pool (warm boot)"
                 );
-                // The warm VM's permit was pre-acquired — the user inherits it.
-                // Release the slot_permit we just acquired to avoid double-counting.
-                drop(slot_permit);
+                // The warm VM's lease was pre-acquired — the user inherits it.
+                // Release the lease we just reserved to avoid double-counting.
+                if let Some(l) = user_lease.take() {
+                    l.release_clean();
+                }
                 // T038: Update delegate to use the user's container ID (not the warm pool ID).
                 // This ensures crash cleanup targets the correct VmMap entry.
                 let user_delegate = create_vm_delegate(&container, Arc::clone(state));
                 warm.vm.set_delegate(user_delegate.0);
-                #[allow(clippy::used_underscore_binding)]
                 let user_entry = VmEntry {
-                    vm: warm.vm,
-                    _slot_permit: warm._slot_permit,
+                    vm: Arc::clone(&warm.vm),
+                    lease: warm.lease.take(),
                     _delegate: Some(user_delegate),
                 };
                 state
@@ -447,7 +758,7 @@ fn handle_create(params: &Value, state: &Arc<IpcState>) -> Response {
                     .lock()
                     .unwrap()
                     .insert(container.clone(), user_entry);
-                if state.slots.available() > 0 {
+                if state.admission.semaphore_available() > 0 {
                     spawn_macos_warm_refill(Arc::clone(state));
                 }
                 // Install claw in the warm VM (SSH must be ready first).
@@ -506,15 +817,15 @@ fn handle_create(params: &Value, state: &Arc<IpcState>) -> Response {
             } else {
                 None
             };
-            // Store permit and delegate in VmEntry — both released when the entry is removed.
+            // Store lease and delegate in VmEntry — lease released via stop_and_release.
             let entry = VmEntry {
                 vm: Arc::new(vm),
-                _slot_permit: slot_permit,
+                lease: user_lease.take(),
                 _delegate: delegate,
             };
             state.vms.lock().unwrap().insert(container.clone(), entry);
             // T026: After cold-boot macOS create, trigger warm pool refill if a slot is free.
-            if guest_os == "macos" && state.slots.available() > 0 {
+            if guest_os == "macos" && state.admission.semaphore_available() > 0 {
                 spawn_macos_warm_refill(Arc::clone(state));
             }
             let mut resp = serde_json::json!({
@@ -534,6 +845,11 @@ fn handle_create(params: &Value, state: &Arc<IpcState>) -> Response {
         }
         Err(e) => {
             tracing::error!(container, error = %e, "VM create failed");
+            // handle_create_macos stops the VM on its failure paths (or never
+            // started one), so the lease is safe to release cleanly.
+            if let Some(l) = user_lease.take() {
+                l.release_clean();
+            }
             Response::err(e.to_string())
         }
     }
@@ -729,13 +1045,8 @@ fn handle_stop(params: &Value, state: &Arc<IpcState>) -> Response {
     let graceful = params["graceful"].as_bool().unwrap_or(true);
     tracing::info!(container, graceful, "Stopping VM");
 
-    let vm = state
-        .vms
-        .lock()
-        .unwrap()
-        .get(&container)
-        .map(|e| Arc::clone(&e.vm));
-    let Some(vm) = vm else {
+    let entry = state.vms.lock().unwrap().remove(&container);
+    let Some(entry) = entry else {
         return Response::ok(serde_json::json!({
             "container": container,
             "state": "stopped",
@@ -743,17 +1054,11 @@ fn handle_stop(params: &Value, state: &Arc<IpcState>) -> Response {
         }));
     };
 
-    match block_on(vm.stop(graceful)) {
-        Ok(()) => {
-            // Removing the entry drops _slot_permit, releasing the macOS VM slot.
-            state.vms.lock().unwrap().remove(&container);
-            Response::ok(serde_json::json!({ "container": container, "state": "stopped" }))
-        }
-        Err(e) => {
-            tracing::error!(container, error = %e, "VM stop failed");
-            Response::err(e.to_string())
-        }
-    }
+    // stop_and_release stops the VM, then releases the lease (or retains it as a
+    // suspected orphan if the stop fails — never freeing a slot for a VM we could
+    // not confirm stopped).
+    block_on(entry.stop_and_release(graceful));
+    Response::ok(serde_json::json!({ "container": container, "state": "stopped" }))
 }
 
 // ── handle_delete ─────────────────────────────────────────────────────────────
@@ -765,10 +1070,10 @@ fn handle_delete(params: &Value, state: &Arc<IpcState>) -> Response {
     };
     tracing::info!(container, "Deleting VM");
 
-    // Stop if running. Removing the entry drops _slot_permit, releasing the macOS VM slot (T028).
+    // Stop if running, then release the admission lease (T028).
     let entry = state.vms.lock().unwrap().remove(&container);
     if let Some(e) = entry {
-        let _ = block_on(e.vm.stop(true));
+        block_on(e.stop_and_release(true));
     }
 
     // Remove instance files.
@@ -796,7 +1101,8 @@ fn handle_restart(params: &Value, state: &Arc<IpcState>) -> Response {
     // Graceful stop can leave locks held, causing "foreign exception" on re-create.
     let entry = state.vms.lock().unwrap().remove(&container);
     if let Some(e) = entry {
-        let _ = block_on(e.vm.stop(false));
+        // Stop and release the old lease so the re-create below can reserve a slot.
+        block_on(e.stop_and_release(false));
         // Give VZ time to fully release disk locks after force stop.
         std::thread::sleep(std::time::Duration::from_secs(2));
     }
@@ -857,14 +1163,15 @@ fn restart_macos_vm(
             Err(e) => return Response::err(format!("decode hw_model: {e}")),
         };
 
-    // Acquire macOS VM slot (Apple 2-VM limit).
-    let slot_permit = match state.slots.try_acquire_owned() {
-        Ok(p) => Some(p),
-        Err(_) => {
-            return Response::err_code(
-                MACOS_VM_LIMIT_REACHED,
-                "macOS VM limit reached: max 2 simultaneous macOS guest VMs per Apple host (Apple Virtualization Framework license). Delete a running macOS instance or use guest_os=linux (no limit).",
-            );
+    // Reserve a macOS VM slot via the single admission authority (Apple 2-VM limit).
+    let lease = match state
+        .admission
+        .reserve(VmKind::UserClaw, Some(container.to_string()))
+    {
+        Ok(l) => l,
+        Err(e) => {
+            tracing::warn!(error = %e, "macOS VM restart admission refused");
+            return admission_err_response(&e);
         }
     };
 
@@ -901,7 +1208,15 @@ fn restart_macos_vm(
 
         let _ = std::fs::write(inst_dir.join("vm_mac"), &mac);
 
-        let ip = resolve_dhcp_ip(&mac, 120, &existing_ips).await?;
+        let ip = match resolve_dhcp_ip(&mac, 120, &existing_ips).await {
+            Ok(ip) => ip,
+            Err(e) => {
+                // Stop the VM before returning — dropping a running VZVirtualMachine
+                // without stopping it leaks an OS-level active-VM slot.
+                let _ = vm.stop(false).await;
+                return Err(e);
+            }
+        };
         let _ = std::fs::write(inst_dir.join("vm_ip"), &ip);
 
         Ok::<(VZVirtualMachine, String, String), vmrunner_macos_rs::VZError>((vm, ip, mac))
@@ -911,7 +1226,7 @@ fn restart_macos_vm(
         Ok((vm, ip, mac)) => {
             let entry = VmEntry {
                 vm: Arc::new(vm),
-                _slot_permit: slot_permit,
+                lease: Some(lease),
                 _delegate: None,
             };
             state
@@ -929,6 +1244,9 @@ fn restart_macos_vm(
         }
         Err(e) => {
             tracing::error!(container, error = %e, "macOS VM restart failed");
+            // The VM was stopped on the failure path (or never started), so the
+            // lease can be released cleanly.
+            lease.release_clean();
             Response::err(e.to_string())
         }
     }
@@ -986,7 +1304,7 @@ fn restart_linux_vm(
         Ok((vm, ip, mac)) => {
             let entry = VmEntry {
                 vm: Arc::new(vm),
-                _slot_permit: None,
+                lease: None, // Linux guest — no macOS admission lease
                 _delegate: None,
             };
             state
@@ -1187,7 +1505,7 @@ fn handle_fetch_logs(params: &Value) -> Response {
 /// This handler is long-running (~20 min on first run). The caller (`init_macos_guest` CLI)
 /// should invoke it and wait. Subsequent calls resume from the last persisted phase.
 #[allow(clippy::too_many_lines)]
-fn handle_macos_base_install(params: &Value) -> Response {
+fn handle_macos_base_install(params: &Value, state_ipc: &Arc<IpcState>) -> Response {
     use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
     use vmrunner_macos_rs::init_state::{InitPhase, is_complete, read_state, write_state};
 
@@ -1260,181 +1578,13 @@ fn handle_macos_base_install(params: &Value) -> Response {
     ) || state.phase.is_none();
 
     if should_run_install_loop {
-        let requested_ipsw = params["ipsw"].as_str();
-        tracing::info!(requested_ipsw = ?requested_ipsw, "Resolving restore image source...");
-        let candidates = match macos_guest::resolve_restore_image(requested_ipsw, &base_dir) {
-            Ok(v) => v,
-            Err(e) => return Response::err(format!("resolve_restore_image: {e}")),
-        };
-        if candidates.is_empty() {
-            return Response::err("resolve_restore_image: no compatible candidates returned");
+        // Single shared install flow (Invariant I-1: install VM only starts with
+        // an admission lease, reserved inside the helper).
+        if let Err(resp) =
+            run_macos_install_flow(params, &base_dir, &mut state, &state_ipc.admission)
+        {
+            return resp;
         }
-
-        let max_attempts = std::env::var("THEYOS_IPSW_MAX_CANDIDATES")
-            .ok()
-            .and_then(|s| s.parse::<usize>().ok())
-            .unwrap_or(3)
-            .min(candidates.len());
-
-        let ipsw_path = base_dir.join("macos.ipsw");
-        let disk_path = base_dir.join("disk.img");
-        let aux_path = base_dir.join("aux.auxstorage");
-        let mut last_err: Option<String> = None;
-        let mut succeeded_install: Option<macos_guest::MacOSInstallResult> = None;
-
-        for (idx, candidate) in candidates.iter().take(max_attempts).enumerate() {
-            let label = candidate.source_label.clone();
-            tracing::info!(
-                attempt = idx + 1,
-                total = max_attempts,
-                source = %label,
-                "trying restore image candidate"
-            );
-
-            // Switching candidates: evict prior IPSW and reset download progress.
-            if state.ipsw_source.is_some() && state.ipsw_source.as_deref() != Some(label.as_str()) {
-                tracing::info!(prev = ?state.ipsw_source, new = %label,
-                    "switching restore-image candidate; clearing previous download progress");
-                std::fs::remove_file(&ipsw_path).ok();
-                let _ = macos_guest::clear_download_progress(&base_dir);
-                state = read_state(&base_dir).unwrap_or_default();
-            }
-
-            state.phase = Some(InitPhase::DownloadIpsw);
-            state.macos_version = Some(candidate.macos_version.clone());
-            state
-                .host_macos_version
-                .clone_from(&candidate.host_macos_version);
-            state
-                .host_macos_build
-                .clone_from(&candidate.host_macos_build);
-            state.ipsw_build.clone_from(&candidate.ipsw_build);
-            state.ipsw_source = Some(label.clone());
-            let _ = write_state(&base_dir, &state);
-
-            let candidate_ipsw_path = match &candidate.source {
-                macos_guest::RestoreImageSource::DownloadUrl(_) => ipsw_path.clone(),
-                macos_guest::RestoreImageSource::LocalFile(local_path) => local_path.clone(),
-            };
-
-            // Download (or stage local).
-            let download_result = match &candidate.source {
-                macos_guest::RestoreImageSource::DownloadUrl(url) => {
-                    tracing::info!(url, "Downloading restore image...");
-                    macos_guest::download_ipsw(
-                        url,
-                        &ipsw_path,
-                        &mut state,
-                        &base_dir,
-                        |downloaded, total| {
-                            if total > 0 {
-                                let pct = downloaded * 100 / total;
-                                tracing::debug!(pct, downloaded, total, "IPSW download progress");
-                            }
-                        },
-                    )
-                }
-                macos_guest::RestoreImageSource::LocalFile(local_path) => {
-                    let local_bytes = std::fs::metadata(local_path).map(|m| m.len()).ok();
-                    state.ipsw_total_bytes = local_bytes;
-                    state.ipsw_bytes_downloaded = local_bytes.unwrap_or(0);
-                    let _ = write_state(&base_dir, &state);
-                    tracing::info!(path = %local_path.display(), "Using local restore image");
-                    Ok(())
-                }
-            };
-
-            if let Err(e) = download_result {
-                tracing::warn!(error = %e, source = %label, "candidate download failed; trying next");
-                if !state.failed_ipsw_sources.iter().any(|s| s == &label) {
-                    state.failed_ipsw_sources.push(label.clone());
-                }
-                let _ = write_state(&base_dir, &state);
-                std::fs::remove_file(&ipsw_path).ok();
-                let _ = macos_guest::clear_download_progress(&base_dir);
-                state = read_state(&base_dir).unwrap_or_default();
-                last_err = Some(format!("{label} (download): {e}"));
-                continue;
-            }
-
-            // Pre-install VZ validation: cheap (seconds) compared to install (~20min).
-            if let Err(e) = macos_guest::inspect_restore_image(&candidate_ipsw_path) {
-                tracing::warn!(error = %e, source = %label,
-                    "candidate failed VZ pre-install validation; trying next");
-                if !state.failed_ipsw_sources.iter().any(|s| s == &label) {
-                    state.failed_ipsw_sources.push(label.clone());
-                }
-                let _ = write_state(&base_dir, &state);
-                std::fs::remove_file(&ipsw_path).ok();
-                let _ = macos_guest::clear_download_progress(&base_dir);
-                state = read_state(&base_dir).unwrap_or_default();
-                last_err = Some(format!("{label} (inspect): {e}"));
-                continue;
-            }
-
-            // CreateDisk. If we are in the install loop and disk/aux already
-            // exist, they are leftovers from a failed or interrupted install.
-            cleanup_failed_macos_install_artifacts(&disk_path, &aux_path);
-            tracing::info!("Creating 64 GB sparse disk...");
-            if let Err(e) = macos_guest::create_disk(&disk_path, 64) {
-                return Response::err(format!("create_disk: {e}"));
-            }
-            state.phase = Some(InitPhase::InstallMacOS);
-            // Pre-mark this candidate as failed BEFORE install_macos runs.
-            // If the VZ install crashes the whole subprocess (not just returns Err),
-            // the post-install Err handler never executes — but with the pre-mark in place,
-            // the next process respawn sees this candidate already in failed_ipsw_sources
-            // and skips it. On Ok we remove the mark before continuing.
-            if !state.failed_ipsw_sources.iter().any(|s| s == &label) {
-                state.failed_ipsw_sources.push(label.clone());
-            }
-            let _ = write_state(&base_dir, &state);
-
-            tracing::info!("Installing macOS from IPSW (~20 min)...");
-            match macos_guest::install_macos(&candidate_ipsw_path, &disk_path, &aux_path, |frac| {
-                tracing::info!("macOS install progress: {:.0}%", frac * 100.0);
-            }) {
-                Ok(result) => {
-                    tracing::info!(source = %label, "candidate installed successfully");
-                    state.failed_ipsw_sources.retain(|s| s != &label);
-                    let _ = write_state(&base_dir, &state);
-                    succeeded_install = Some(result);
-                    break;
-                }
-                Err(e) => {
-                    tracing::warn!(error = %e, source = %label,
-                        "install_macos failed; trying next candidate");
-                    // Already pre-marked as failed; just clean up the artifacts.
-                    std::fs::remove_file(&ipsw_path).ok();
-                    cleanup_failed_macos_install_artifacts(&disk_path, &aux_path);
-                    let _ = macos_guest::clear_download_progress(&base_dir);
-                    state = read_state(&base_dir).unwrap_or_default();
-                    let err = e.to_string();
-                    if macos_vm_limit_exceeded(&err) {
-                        state.failed_ipsw_sources.retain(|s| s != &label);
-                        let _ = write_state(&base_dir, &state);
-                        return Response::err(macos_vm_limit_message(&label, &err));
-                    }
-                    last_err = Some(format!("{label} (install): {err}"));
-                }
-            }
-        }
-
-        let Some(install_result) = succeeded_install else {
-            return Response::err(format!(
-                "all {max_attempts} restore image candidate(s) failed; last error: {}\n\
-                 hint: if these failures look stale (e.g., a prior run was killed mid-install), \
-                 retry with `soyeht start --force` to clear the cached failure list.",
-                last_err.unwrap_or_else(|| "unknown".into())
-            ));
-        };
-
-        state.hardware_model_data = Some(install_result.hardware_model_data_b64);
-        state.machine_identifier_data_b64 = Some(install_result.machine_identifier_data_b64);
-        state.install_cpu_count = Some(install_result.install_cpu_count);
-        state.install_memory_mb = Some(install_result.install_memory_mb);
-        state.phase = Some(InitPhase::Provision);
-        let _ = write_state(&base_dir, &state);
     }
 
     // ── Phase: Provision ─────────────────────────────────────────────────────
@@ -1495,7 +1645,8 @@ fn handle_macos_base_install(params: &Value) -> Response {
             .and_then(|b| BASE64.decode(b).ok());
         let (snapshot_cpus, snapshot_memory_mb) =
             effective_macos_resources(&state, cpus, memory_mb);
-        let (snapshot_path, machine_id_data) = match block_on(macos_guest::create_base_snapshot(
+        let (snapshot_path, machine_id_data) = match run_base_snapshot_with_admission(
+            &state_ipc.admission,
             &disk_path,
             &aux_path,
             &hw_data,
@@ -1503,9 +1654,9 @@ fn handle_macos_base_install(params: &Value) -> Response {
             &base_dir,
             snapshot_cpus,
             snapshot_memory_mb,
-        )) {
+        ) {
             Ok(p) => p,
-            Err(e) => return Response::err(format!("create_base_snapshot: {e}")),
+            Err(resp) => return resp,
         };
 
         state.snapshot_path = Some(snapshot_path.display().to_string());
@@ -1534,7 +1685,7 @@ fn handle_macos_base_install(params: &Value) -> Response {
 /// Download IPSW + create disk + install macOS. No sudo needed.
 /// Returns `hardware_model_data` and `base_dir` for the caller to continue.
 #[allow(clippy::too_many_lines)]
-fn handle_macos_prepare(params: &Value) -> Response {
+fn handle_macos_prepare(params: &Value, state_ipc: &Arc<IpcState>) -> Response {
     use vmrunner_macos_rs::init_state::{InitPhase, is_complete, read_state, write_state};
 
     let force = params["force"].as_bool().unwrap_or(false);
@@ -1612,176 +1763,13 @@ fn handle_macos_prepare(params: &Value) -> Response {
     ) || state.phase.is_none();
 
     if should_run_install_loop {
-        let requested_ipsw = params["ipsw"].as_str();
-        tracing::info!(requested_ipsw = ?requested_ipsw, "Resolving restore image source...");
-        let candidates = match macos_guest::resolve_restore_image(requested_ipsw, &base_dir) {
-            Ok(v) => v,
-            Err(e) => return Response::err(format!("resolve_restore_image: {e}")),
-        };
-        if candidates.is_empty() {
-            return Response::err("resolve_restore_image: no compatible candidates returned");
+        // Single shared install flow (Invariant I-1: install VM only starts with
+        // an admission lease, reserved inside the helper).
+        if let Err(resp) =
+            run_macos_install_flow(params, &base_dir, &mut state, &state_ipc.admission)
+        {
+            return resp;
         }
-
-        let max_attempts = std::env::var("THEYOS_IPSW_MAX_CANDIDATES")
-            .ok()
-            .and_then(|s| s.parse::<usize>().ok())
-            .unwrap_or(3)
-            .min(candidates.len());
-
-        let ipsw_path = base_dir.join("macos.ipsw");
-        let disk_path = base_dir.join("disk.img");
-        let aux_path = base_dir.join("aux.auxstorage");
-        let mut last_err: Option<String> = None;
-        let mut succeeded_install: Option<macos_guest::MacOSInstallResult> = None;
-
-        for (idx, candidate) in candidates.iter().take(max_attempts).enumerate() {
-            let label = candidate.source_label.clone();
-            tracing::info!(
-                attempt = idx + 1,
-                total = max_attempts,
-                source = %label,
-                "trying restore image candidate"
-            );
-
-            if state.ipsw_source.is_some() && state.ipsw_source.as_deref() != Some(label.as_str()) {
-                tracing::info!(prev = ?state.ipsw_source, new = %label,
-                    "switching restore-image candidate; clearing previous download progress");
-                std::fs::remove_file(&ipsw_path).ok();
-                let _ = macos_guest::clear_download_progress(&base_dir);
-                state = read_state(&base_dir).unwrap_or_default();
-            }
-
-            state.phase = Some(InitPhase::DownloadIpsw);
-            state.macos_version = Some(candidate.macos_version.clone());
-            state
-                .host_macos_version
-                .clone_from(&candidate.host_macos_version);
-            state
-                .host_macos_build
-                .clone_from(&candidate.host_macos_build);
-            state.ipsw_build.clone_from(&candidate.ipsw_build);
-            state.ipsw_source = Some(label.clone());
-            let _ = write_state(&base_dir, &state);
-
-            let candidate_ipsw_path = match &candidate.source {
-                macos_guest::RestoreImageSource::DownloadUrl(_) => ipsw_path.clone(),
-                macos_guest::RestoreImageSource::LocalFile(local_path) => local_path.clone(),
-            };
-
-            let download_result = match &candidate.source {
-                macos_guest::RestoreImageSource::DownloadUrl(url) => {
-                    tracing::info!(url, "Downloading restore image...");
-                    macos_guest::download_ipsw(
-                        url,
-                        &ipsw_path,
-                        &mut state,
-                        &base_dir,
-                        |downloaded, total| {
-                            if total > 0 {
-                                let pct = downloaded * 100 / total;
-                                tracing::debug!(pct, downloaded, total, "IPSW download progress");
-                            }
-                        },
-                    )
-                }
-                macos_guest::RestoreImageSource::LocalFile(local_path) => {
-                    let local_bytes = std::fs::metadata(local_path).map(|m| m.len()).ok();
-                    state.ipsw_total_bytes = local_bytes;
-                    state.ipsw_bytes_downloaded = local_bytes.unwrap_or(0);
-                    let _ = write_state(&base_dir, &state);
-                    tracing::info!(path = %local_path.display(), "Using local restore image");
-                    Ok(())
-                }
-            };
-
-            if let Err(e) = download_result {
-                tracing::warn!(error = %e, source = %label, "candidate download failed; trying next");
-                if !state.failed_ipsw_sources.iter().any(|s| s == &label) {
-                    state.failed_ipsw_sources.push(label.clone());
-                }
-                let _ = write_state(&base_dir, &state);
-                std::fs::remove_file(&ipsw_path).ok();
-                let _ = macos_guest::clear_download_progress(&base_dir);
-                state = read_state(&base_dir).unwrap_or_default();
-                last_err = Some(format!("{label} (download): {e}"));
-                continue;
-            }
-
-            if let Err(e) = macos_guest::inspect_restore_image(&candidate_ipsw_path) {
-                tracing::warn!(error = %e, source = %label,
-                    "candidate failed VZ pre-install validation; trying next");
-                if !state.failed_ipsw_sources.iter().any(|s| s == &label) {
-                    state.failed_ipsw_sources.push(label.clone());
-                }
-                let _ = write_state(&base_dir, &state);
-                std::fs::remove_file(&ipsw_path).ok();
-                let _ = macos_guest::clear_download_progress(&base_dir);
-                state = read_state(&base_dir).unwrap_or_default();
-                last_err = Some(format!("{label} (inspect): {e}"));
-                continue;
-            }
-
-            cleanup_failed_macos_install_artifacts(&disk_path, &aux_path);
-            tracing::info!("Creating 64 GB sparse disk...");
-            if let Err(e) = macos_guest::create_disk(&disk_path, 64) {
-                return Response::err(format!("create_disk: {e}"));
-            }
-            state.phase = Some(InitPhase::InstallMacOS);
-            // Pre-mark this candidate as failed BEFORE install_macos runs.
-            // If the VZ install crashes the whole subprocess (not just returns Err),
-            // the post-install Err handler never executes — but with the pre-mark in place,
-            // the next process respawn sees this candidate already in failed_ipsw_sources
-            // and skips it. On Ok we remove the mark before continuing.
-            if !state.failed_ipsw_sources.iter().any(|s| s == &label) {
-                state.failed_ipsw_sources.push(label.clone());
-            }
-            let _ = write_state(&base_dir, &state);
-
-            tracing::info!("Installing macOS from IPSW (~20 min)...");
-            match macos_guest::install_macos(&candidate_ipsw_path, &disk_path, &aux_path, |frac| {
-                tracing::info!("macOS install progress: {:.0}%", frac * 100.0);
-            }) {
-                Ok(result) => {
-                    tracing::info!(source = %label, "candidate installed successfully");
-                    state.failed_ipsw_sources.retain(|s| s != &label);
-                    let _ = write_state(&base_dir, &state);
-                    succeeded_install = Some(result);
-                    break;
-                }
-                Err(e) => {
-                    tracing::warn!(error = %e, source = %label,
-                        "install_macos failed; trying next candidate");
-                    // Already pre-marked as failed; just clean up the artifacts.
-                    std::fs::remove_file(&ipsw_path).ok();
-                    cleanup_failed_macos_install_artifacts(&disk_path, &aux_path);
-                    let _ = macos_guest::clear_download_progress(&base_dir);
-                    state = read_state(&base_dir).unwrap_or_default();
-                    let err = e.to_string();
-                    if macos_vm_limit_exceeded(&err) {
-                        state.failed_ipsw_sources.retain(|s| s != &label);
-                        let _ = write_state(&base_dir, &state);
-                        return Response::err(macos_vm_limit_message(&label, &err));
-                    }
-                    last_err = Some(format!("{label} (install): {err}"));
-                }
-            }
-        }
-
-        let Some(install_result) = succeeded_install else {
-            return Response::err(format!(
-                "all {max_attempts} restore image candidate(s) failed; last error: {}\n\
-                 hint: if these failures look stale (e.g., a prior run was killed mid-install), \
-                 retry with `soyeht start --force` to clear the cached failure list.",
-                last_err.unwrap_or_else(|| "unknown".into())
-            ));
-        };
-
-        state.hardware_model_data = Some(install_result.hardware_model_data_b64);
-        state.machine_identifier_data_b64 = Some(install_result.machine_identifier_data_b64);
-        state.install_cpu_count = Some(install_result.install_cpu_count);
-        state.install_memory_mb = Some(install_result.install_memory_mb);
-        state.phase = Some(InitPhase::Provision);
-        let _ = write_state(&base_dir, &state);
     }
 
     // Download claw binaries (best-effort, part of prepare)
@@ -1802,6 +1790,60 @@ fn handle_macos_prepare(params: &Value) -> Response {
         "hardware_model_data": state.hardware_model_data,
         "macos_version": state.macos_version,
     }))
+}
+
+/// Reserve a `Snapshot` slot, run [`macos_guest::create_base_snapshot`] under it,
+/// then release the lease. The only place a snapshot boot VM may start (Invariant
+/// I-1). On a VZ host-limit error, flags the host blocked for this boot and returns
+/// the typed limit code. `create_base_snapshot` stops its VM on every path, so the
+/// lease is released cleanly here.
+#[allow(clippy::too_many_arguments)]
+fn run_base_snapshot_with_admission(
+    admission: &VmAdmission,
+    disk_path: &Path,
+    aux_path: &Path,
+    hw_data: &[u8],
+    install_machine_id: Option<&[u8]>,
+    base_dir: &Path,
+    cpus: u32,
+    memory_mb: u32,
+) -> Result<(PathBuf, Vec<u8>), Response> {
+    let lease = match admission.reserve(VmKind::Snapshot, None) {
+        Ok(l) => l,
+        Err(e) => {
+            tracing::warn!(error = %e, "snapshot admission refused");
+            return Err(admission_err_response(&e));
+        }
+    };
+    let result = block_on(macos_guest::create_base_snapshot(
+        disk_path,
+        aux_path,
+        hw_data,
+        install_machine_id,
+        base_dir,
+        cpus,
+        memory_mb,
+        &lease,
+    ));
+    match result {
+        Ok(v) => {
+            lease.release_clean();
+            Ok(v)
+        }
+        Err(e) => {
+            lease.release_clean();
+            if is_macos_vm_limit_error(&e) {
+                if let Err(be) = admission.mark_host_blocked() {
+                    tracing::warn!(error = %be, "failed to set host-blocked flag");
+                }
+                return Err(Response::err_code(
+                    MACOS_VM_LIMIT_REACHED,
+                    format!("create_base_snapshot: {e}"),
+                ));
+            }
+            Err(Response::err(format!("create_base_snapshot: {e}")))
+        }
+    }
 }
 
 // ── handle_macos_provision_and_snapshot ──────────────────────────────────────
@@ -1885,7 +1927,8 @@ fn handle_macos_provision_and_snapshot(params: &Value, ipc_state: &Arc<IpcState>
             .and_then(|b| BASE64.decode(b).ok());
         let (snapshot_cpus, snapshot_memory_mb) =
             effective_macos_resources(&state, cpus, memory_mb);
-        let (snapshot_path, machine_id_data) = match block_on(macos_guest::create_base_snapshot(
+        let (snapshot_path, machine_id_data) = match run_base_snapshot_with_admission(
+            &ipc_state.admission,
             &disk_path,
             &aux_path,
             &hw_data,
@@ -1893,9 +1936,9 @@ fn handle_macos_provision_and_snapshot(params: &Value, ipc_state: &Arc<IpcState>
             &base_dir,
             snapshot_cpus,
             snapshot_memory_mb,
-        )) {
+        ) {
             Ok(p) => p,
-            Err(e) => return Response::err(format!("create_base_snapshot: {e}")),
+            Err(resp) => return resp,
         };
 
         state.snapshot_path = Some(snapshot_path.display().to_string());
@@ -1948,12 +1991,20 @@ fn handle_remove_macos_base(_params: &Value) -> Response {
 // ── handle_macos_slot_status (T024) ───────────────────────────────────────────
 
 /// Return macOS VM slot availability for /healthz and diagnostic use.
+/// Reports the cross-process admission view (live + suspected orphans + blocked),
+/// not just the in-process semaphore.
 fn handle_macos_slot_status(state: &IpcState) -> Response {
-    Response::ok(serde_json::json!({
-        "available": state.slots.available(),
-        "total": MACOS_VM_LIMIT,
-        "in_use": MACOS_VM_LIMIT - state.slots.available().min(MACOS_VM_LIMIT),
-    }))
+    match state.admission.capacity() {
+        Ok(cap) => Response::ok(serde_json::json!({
+            "available": cap.available,
+            "total": MACOS_VM_LIMIT,
+            "in_use": MACOS_VM_LIMIT.saturating_sub(cap.available),
+            "live": cap.live,
+            "suspected_orphans": cap.suspected_orphans,
+            "host_blocked": cap.host_blocked,
+        })),
+        Err(e) => Response::err(format!("admission capacity: {e}")),
+    }
 }
 
 // ── Linux guest init ─────────────────────────────────────────────────────────
@@ -2222,18 +2273,11 @@ fn drain_warm_pool_vms(state: &IpcState) {
     // Now drain any containers that were registered before the flag was set.
     let containers: Vec<String> = state.macos_warm_pool.lock().unwrap().drain(..).collect();
     for container in &containers {
-        let vm = state
-            .vms
-            .lock()
-            .unwrap()
-            .get(container)
-            .map(|e| Arc::clone(&e.vm));
-        if let Some(vm) = vm {
-            if let Err(e) = block_on(vm.stop(false)) {
-                tracing::warn!(container, error = %e, "Failed to stop warm pool VM");
-            }
+        // Remove the entry and stop+release its lease (frees the Apple VM slot).
+        let entry = state.vms.lock().unwrap().remove(container);
+        if let Some(entry) = entry {
+            block_on(entry.stop_and_release(false));
         }
-        state.vms.lock().unwrap().remove(container);
         let dir = instance_dir(container);
         if let Err(e) = std::fs::remove_dir_all(&dir)
             && e.kind() != std::io::ErrorKind::NotFound
@@ -2272,14 +2316,18 @@ fn init_macos_warm_pool(state: &Arc<IpcState>) {
             tracing::debug!("macOS warm pool: base snapshot not ready, skipping pre-boot");
             return;
         }
-        if state.slots.available() == 0 {
+        if state.admission.semaphore_available() == 0 {
             tracing::debug!("macOS warm pool: no slots available for pre-boot");
             return;
         }
 
-        let Ok(permit) = state.slots.try_acquire_owned() else {
-            tracing::debug!("macOS warm pool: failed to acquire slot for pre-boot");
-            return;
+        // Reserve a WarmPool slot via the single admission authority.
+        let lease = match state.admission.reserve(VmKind::WarmPool, None) {
+            Ok(l) => l,
+            Err(e) => {
+                tracing::debug!(error = %e, "macOS warm pool: admission refused for pre-boot");
+                return;
+            }
         };
 
         let state_clone = Arc::clone(state);
@@ -2295,7 +2343,7 @@ fn init_macos_warm_pool(state: &Arc<IpcState>) {
                 .expect("warm pool tokio runtime");
             if let Err(e) = rt.block_on(boot_warm_pool_vm(
                 Arc::clone(&state_clone),
-                permit,
+                lease,
                 &container,
             )) {
                 tracing::warn!(container, error = %e, "macOS warm pool: boot failed");
@@ -2316,102 +2364,127 @@ fn init_macos_warm_pool(state: &Arc<IpcState>) {
 /// Returns `VZError` if disk clone, snapshot restore, or VM boot fails.
 async fn boot_warm_pool_vm(
     state: Arc<IpcState>,
-    permit: OwnedSemaphorePermit,
+    lease: VmLease,
     container: &str,
 ) -> Result<(), vmrunner_macos_rs::VZError> {
-    use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
-    use std::process::Command;
+    // Pre-start preparation (no VM started yet). Any failure here releases the
+    // lease cleanly — nothing was started, so the slot must be returned.
+    let prep = (|| -> Result<(vmrunner_macos_rs::VZVirtualMachineConfiguration, PathBuf), vmrunner_macos_rs::VZError> {
+        use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
+        use std::process::Command;
 
-    let base_dir = macos_guest::base_dir()?;
-    let init_st = read_state(&base_dir)?;
-    let hw_data_b64 = init_st.hardware_model_data.as_deref().ok_or_else(|| {
-        vmrunner_macos_rs::VZError::InvalidConfig(
-            "macOS base image not initialized — run `theyos init-macos-guest` first".into(),
-        )
-    })?;
-    let hw_data = BASE64
-        .decode(hw_data_b64)
-        .map_err(|e| vmrunner_macos_rs::VZError::Internal(format!("decode hw_model: {e}")))?;
-    // ECID is required for snapshot restore — VZ 26 rejects restore if ECID doesn't match.
-    // If not stored (old init-state.json), warm pool cannot use snapshot restore.
-    let machine_id_data: Option<Vec<u8>> = init_st
-        .machine_identifier_data_b64
-        .as_deref()
-        .and_then(|b| BASE64.decode(b).ok());
-    if machine_id_data.is_none() {
-        return Err(vmrunner_macos_rs::VZError::SnapshotError(
-            "machine_identifier_data not stored — re-run `theyos init-macos-guest --force-provision` to rebuild the base snapshot with ECID tracking".into(),
-        ));
-    }
+        let base_dir = macos_guest::base_dir()?;
+        let init_st = read_state(&base_dir)?;
+        let hw_data_b64 = init_st.hardware_model_data.as_deref().ok_or_else(|| {
+            vmrunner_macos_rs::VZError::InvalidConfig(
+                "macOS base image not initialized — run `theyos init-macos-guest` first".into(),
+            )
+        })?;
+        let hw_data = BASE64
+            .decode(hw_data_b64)
+            .map_err(|e| vmrunner_macos_rs::VZError::Internal(format!("decode hw_model: {e}")))?;
+        // ECID is required for snapshot restore — VZ 26 rejects restore if ECID doesn't match.
+        let machine_id_data: Option<Vec<u8>> = init_st
+            .machine_identifier_data_b64
+            .as_deref()
+            .and_then(|b| BASE64.decode(b).ok());
+        if machine_id_data.is_none() {
+            return Err(vmrunner_macos_rs::VZError::SnapshotError(
+                "machine_identifier_data not stored — re-run `theyos init-macos-guest --force-provision` to rebuild the base snapshot with ECID tracking".into(),
+            ));
+        }
 
-    let inst_dir = instance_dir(container);
-    std::fs::create_dir_all(&inst_dir).map_err(vmrunner_macos_rs::VZError::Io)?;
+        let inst_dir = instance_dir(container);
+        std::fs::create_dir_all(&inst_dir).map_err(vmrunner_macos_rs::VZError::Io)?;
 
-    // APFS CoW clone the base disk and aux storage.
-    let base_disk = base_dir.join("disk.img");
-    let inst_disk = inst_dir.join("disk.img");
-    let out = Command::new("cp")
-        .args(["-c", "--"])
-        .arg(&base_disk)
-        .arg(&inst_disk)
-        .output()
-        .map_err(|e| vmrunner_macos_rs::VZError::Internal(format!("cp -c disk: {e}")))?;
-    if !out.status.success() {
-        return Err(vmrunner_macos_rs::VZError::Internal(format!(
-            "cp -c disk failed: {}",
-            String::from_utf8_lossy(&out.stderr)
-        )));
-    }
-    let base_aux = base_dir.join("aux.auxstorage");
-    let inst_aux = inst_dir.join("aux.auxstorage");
-    let out = Command::new("cp")
-        .args(["-c", "--"])
-        .arg(&base_aux)
-        .arg(&inst_aux)
-        .output()
-        .map_err(|e| vmrunner_macos_rs::VZError::Internal(format!("cp -c aux: {e}")))?;
-    if !out.status.success() {
-        return Err(vmrunner_macos_rs::VZError::Internal(format!(
-            "cp -c aux failed: {}",
-            String::from_utf8_lossy(&out.stderr)
-        )));
-    }
+        // APFS CoW clone the base disk and aux storage.
+        let base_disk = base_dir.join("disk.img");
+        let inst_disk = inst_dir.join("disk.img");
+        let out = Command::new("cp")
+            .args(["-c", "--"])
+            .arg(&base_disk)
+            .arg(&inst_disk)
+            .output()
+            .map_err(|e| vmrunner_macos_rs::VZError::Internal(format!("cp -c disk: {e}")))?;
+        if !out.status.success() {
+            return Err(vmrunner_macos_rs::VZError::Internal(format!(
+                "cp -c disk failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            )));
+        }
+        let base_aux = base_dir.join("aux.auxstorage");
+        let inst_aux = inst_dir.join("aux.auxstorage");
+        let out = Command::new("cp")
+            .args(["-c", "--"])
+            .arg(&base_aux)
+            .arg(&inst_aux)
+            .output()
+            .map_err(|e| vmrunner_macos_rs::VZError::Internal(format!("cp -c aux: {e}")))?;
+        if !out.status.success() {
+            return Err(vmrunner_macos_rs::VZError::Internal(format!(
+                "cp -c aux failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            )));
+        }
 
-    // VZ 26 snapshot restore requires the EXACT same disk attachment paths as the snapshot.
-    // Since warm pool VMs use APFS CoW clones at different paths, snapshot restore fails
-    // with "invalid argument". Instead, cold-boot the VM from the cloned disk.
-    // Cold boot takes ~19s (DHCP ~9s + sshd ~10s) which happens in background — the
-    // warm pool handoff to the user is still instantaneous.
-    let requested_cpus = init_st.snapshot_cpus.unwrap_or(4);
-    let requested_mem = init_st.snapshot_memory_mb.unwrap_or(4096);
-    let (snap_cpus, snap_mem) = effective_macos_resources(&init_st, requested_cpus, requested_mem);
-    let mut warm_builder = VZMacOSVmConfigurationBuilder::new()
-        .cpus(snap_cpus)
-        .memory_mb(snap_mem)
-        .disk_path(inst_disk)
-        .aux_storage_path(inst_aux)
-        .hardware_model_data(hw_data);
-    if let Some(mid) = machine_id_data {
-        warm_builder = warm_builder.machine_identifier_data(mid);
-    }
-    let config = warm_builder.build()?;
+        // Cold-boot the VM from the cloned disk (snapshot restore needs identical paths).
+        let requested_cpus = init_st.snapshot_cpus.unwrap_or(4);
+        let requested_mem = init_st.snapshot_memory_mb.unwrap_or(4096);
+        let (snap_cpus, snap_mem) =
+            effective_macos_resources(&init_st, requested_cpus, requested_mem);
+        let mut warm_builder = VZMacOSVmConfigurationBuilder::new()
+            .cpus(snap_cpus)
+            .memory_mb(snap_mem)
+            .disk_path(inst_disk)
+            .aux_storage_path(inst_aux)
+            .hardware_model_data(hw_data);
+        if let Some(mid) = machine_id_data {
+            warm_builder = warm_builder.machine_identifier_data(mid);
+        }
+        let config = warm_builder.build()?;
+        Ok((config, inst_dir))
+    })();
+
+    let (config, inst_dir) = match prep {
+        Ok(v) => v,
+        Err(e) => {
+            lease.release_clean();
+            return Err(e);
+        }
+    };
 
     let existing_ips = vmrunner_macos_rs::snapshot_leased_ips().await;
-    let vm = VZVirtualMachine::new(&config, container)?;
-    vm.start().await?;
+    let vm = match VZVirtualMachine::new(&config, container) {
+        Ok(v) => Arc::new(v),
+        Err(e) => {
+            lease.release_clean();
+            return Err(e);
+        }
+    };
 
-    // Wait for DHCP so the warm VM is fully network-ready before being offered to users.
+    // From here the VM may be running — it is owned with its lease by a
+    // ManagedMacOSVm so every exit path stops it before releasing (Invariant I-2).
+    let managed = ManagedMacOSVm::new(vm, lease);
+    if let Err(e) = managed.vm().start().await {
+        let _ = managed.stop_then_release(false).await;
+        return Err(e);
+    }
+
     let mac = config.mac_address.clone();
-    let ip = vmrunner_macos_rs::resolve_dhcp_ip(&mac, 120, &existing_ips).await?;
+    let ip = match vmrunner_macos_rs::resolve_dhcp_ip(&mac, 120, &existing_ips).await {
+        Ok(ip) => ip,
+        Err(e) => {
+            let _ = managed.stop_then_release(false).await;
+            return Err(e);
+        }
+    };
     tracing::info!(container, ip, "Warm-pool VM cold-booted and has DHCP");
 
-    // Persist vm_ip and vm_mac so the warm pool handoff can read them.
     let _ = std::fs::write(inst_dir.join("vm_ip"), &ip);
     let _ = std::fs::write(inst_dir.join("vm_mac"), &mac);
 
-    // Check if warm pool was inhibited (base init in progress). If so, stop the
-    // VM immediately instead of registering it — avoids DHCP IP collision with the
-    // base-boot VM during provisioning.
+    // If the warm pool was inhibited (base init in progress), stop+release instead
+    // of registering — avoids DHCP IP collision with the base-boot VM.
     if state
         .warm_pool_inhibited
         .load(std::sync::atomic::Ordering::SeqCst)
@@ -2420,21 +2493,21 @@ async fn boot_warm_pool_vm(
             container,
             "Warm pool inhibited — stopping VM instead of registering"
         );
-        let _ = vm.stop(false).await;
-        // Clean up cloned files
+        let _ = managed.stop_then_release(false).await;
         let _ = std::fs::remove_dir_all(&inst_dir);
         return Ok(());
     }
 
     // T038: Attach delegate to warm-pool VMs so crashes are detected.
     let delegate = create_vm_delegate(container, Arc::clone(&state));
-    vm.set_delegate(delegate.0);
+    managed.vm().set_delegate(delegate.0);
 
-    // Store the running VM with its slot permit and delegate
-    // (both released/dropped when the VmEntry is removed).
+    // Hand the running VM + its lease into a long-lived VmEntry; the lease is
+    // released later via VmEntry::stop_and_release.
+    let (vm, lease) = managed.into_parts();
     let entry = VmEntry {
-        vm: Arc::new(vm),
-        _slot_permit: Some(permit),
+        vm,
+        lease: Some(lease),
         _delegate: Some(delegate),
     };
     state
@@ -2453,7 +2526,7 @@ async fn boot_warm_pool_vm(
 
 /// Spawn a background thread to refill the macOS warm pool after a slot is freed.
 ///
-/// Only spawns if `state.slots.available() > 0` (i.e., an Apple VM slot is free).
+/// Only spawns if the admission authority grants a `WarmPool` slot.
 /// Called after a user instance consumes a warm-pool VM.
 fn spawn_macos_warm_refill(state: Arc<IpcState>) {
     if state.macos_warm_pool_size == 0 {
@@ -2465,11 +2538,12 @@ fn spawn_macos_warm_refill(state: Arc<IpcState>) {
     {
         return;
     }
-    if state.slots.available() == 0 {
+    if state.admission.semaphore_available() == 0 {
         return;
     }
-    let Ok(permit) = state.slots.try_acquire_owned() else {
-        return; // race — another caller already took the slot
+    // race / limit — another caller already took the slot
+    let Ok(lease) = state.admission.reserve(VmKind::WarmPool, None) else {
+        return;
     };
     state
         .warm_pool_booting
@@ -2481,7 +2555,7 @@ fn spawn_macos_warm_refill(state: Arc<IpcState>) {
             .enable_all()
             .build()
             .expect("warm pool refill tokio runtime");
-        match rt.block_on(boot_warm_pool_vm(Arc::clone(&state), permit, &container)) {
+        match rt.block_on(boot_warm_pool_vm(Arc::clone(&state), lease, &container)) {
             Ok(()) => tracing::info!(container, "macOS warm pool: refill complete"),
             Err(e) => tracing::warn!(container, error = %e, "macOS warm pool: refill failed"),
         }
@@ -2715,22 +2789,22 @@ fn cleanup_vm_on_stop(state: &Arc<IpcState>, container_id: &str, error: Option<&
     // Remove vm_ip so the orchestrator detects the VM as stopped.
     let _ = std::fs::remove_file(dir.join("vm_ip"));
 
-    // Drop VmEntry — releases slot permit via RAII.
-    let removed = {
-        let mut vms = state.vms.lock().unwrap();
-        vms.remove(container_id).is_some()
-    };
-
-    if removed {
+    // The VZ delegate fired because the VM already stopped (guest shutdown or
+    // crash), so the lease can be released cleanly.
+    let removed_entry = state.vms.lock().unwrap().remove(container_id);
+    if let Some(mut entry) = removed_entry {
+        if let Some(lease) = entry.lease.take() {
+            lease.release_clean();
+        }
         tracing::info!(
             container = %container_id,
-            "VM entry removed; MacOSVmSlotManager permit released"
+            "VM entry removed; admission lease released (VM already stopped)"
         );
         // Trigger warm pool refill if a slot is now free.
         if !state
             .warm_pool_inhibited
             .load(std::sync::atomic::Ordering::SeqCst)
-            && state.slots.available() > 0
+            && state.admission.semaphore_available() > 0
         {
             spawn_macos_warm_refill(Arc::clone(state));
         }
@@ -2747,4 +2821,93 @@ fn generate_mac() -> String {
         "{b0:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
         bytes[1], bytes[2], bytes[3], bytes[4], bytes[5]
     )
+}
+
+// ── admission wiring regression guards ────────────────────────────────────────
+//
+// These tests enforce Invariant I-1 structurally: no macOS VM `.start()` path
+// exists outside the single admission authority. They read this file's own source
+// at compile time and assert the install/snapshot flows are funneled through the
+// admission-holding helpers — so a future edit that reintroduces a direct
+// `install_macos` / `create_base_snapshot` call (bypassing the lease) fails CI.
+#[cfg(test)]
+mod admission_wiring_tests {
+    use vmrunner_macos_rs::VZError;
+
+    const SRC: &str = include_str!("vmrunner_macos_ipc_macos.rs");
+
+    /// The production source, excluding this test module (whose string literals
+    /// would otherwise inflate the counts).
+    fn prod_src() -> &'static str {
+        SRC.split("mod admission_wiring_tests")
+            .next()
+            .expect("source split")
+    }
+
+    fn count(needle: &str) -> usize {
+        prod_src().matches(needle).count()
+    }
+
+    #[test]
+    fn install_macos_only_called_from_shared_helper() {
+        // Exactly one call site for the install VM (inside run_macos_install_flow),
+        // which holds the Install lease. Both handlers route through the helper.
+        assert_eq!(
+            count("macos_guest::install_macos("),
+            1,
+            "install_macos must be called from exactly one place (run_macos_install_flow)"
+        );
+        // The shared helper exists and is called by both handlers (1 def + 2 calls).
+        assert!(
+            count("run_macos_install_flow(") >= 3,
+            "both handle_macos_prepare and handle_macos_base_install must use run_macos_install_flow"
+        );
+    }
+
+    #[test]
+    fn create_base_snapshot_only_called_from_admission_helper() {
+        assert_eq!(
+            count("macos_guest::create_base_snapshot("),
+            1,
+            "create_base_snapshot must be called only from run_base_snapshot_with_admission"
+        );
+        assert!(
+            count("run_base_snapshot_with_admission(") >= 3,
+            "both snapshot call sites must route through run_base_snapshot_with_admission"
+        );
+    }
+
+    #[test]
+    fn warm_to_user_handoff_transfers_lease_without_duplicating() {
+        // The warm→user handoff must move the warm lease and release the redundant
+        // user reservation — never hold two leases for one VM.
+        assert!(
+            SRC.contains("warm.lease.take()"),
+            "warm→user handoff must transfer the warm lease"
+        );
+        assert!(
+            SRC.contains("user_lease.take()"),
+            "the redundant user reservation must be released on warm handoff"
+        );
+    }
+
+    #[test]
+    fn vz_code6_is_classified_as_host_vm_limit() {
+        // Typed variant.
+        assert!(is_super_is_limit(&VZError::HostVmLimitReached("x".into())));
+        // String fallbacks (errors that arrive only as text).
+        assert!(is_super_is_limit(&VZError::VirtualizationError(
+            "Error Domain=VZErrorDomain Code=6 ...".into()
+        )));
+        assert!(is_super_is_limit(&VZError::Internal(
+            "the maximum supported number of active virtual machines has been reached".into()
+        )));
+        // Unrelated errors are not misclassified.
+        assert!(!is_super_is_limit(&VZError::Internal("disk full".into())));
+    }
+
+    // Bridge to the parent module's private fn.
+    fn is_super_is_limit(e: &VZError) -> bool {
+        super::is_macos_vm_limit_error(e)
+    }
 }

@@ -890,6 +890,37 @@ Special case: when state == `named_awaiting_pair` (casa named but owner cert not
 
 Cross-language contract mirror: `specs/005-soyeht-onboarding/contracts/bootstrap-teardown.md` is mirrored in `soyeht/soyeht-ios/specs/017-onboarding-canonical/contracts/bootstrap-teardown.md`.
 
+### Guest-image preparation status (macOS engines, added 2026-05-28)
+
+A macOS engine builds a base macOS guest image before it can host claws. Its
+progress is surfaced **additively** on `GET /bootstrap/status` (and echoed by
+`POST /api/v1/household/guest-image/prepare`). All fields are optional; Linux
+engines and Mac engines that have not started provisioning omit them entirely.
+
+| Field | Type | Meaning |
+|---|---|---|
+| `guest_image_phase` | string? | `download_ipsw` \| `create_disk` \| `install_macos` \| `provision` \| `create_snapshot` \| `complete` |
+| `guest_image_status` | string? | `pending` \| `in_progress` \| `done` \| `failed` |
+| `guest_image_error` | string? | Human-readable error from the most recent failed phase. **Display-only** — clients MUST NOT parse it for logic. Present only when `guest_image_status == "failed"`. |
+| `guest_image_failure_code` | string? | **Machine-readable** failure reason (snake_case enum). Present only when `guest_image_status == "failed"`; absent on older engines. |
+
+`guest_image_failure_code` values (fail-soft — an unknown/future value MUST
+decode to `unknown`, never break the client):
+
+| Code | Meaning | Suggested client action |
+|---|---|---|
+| `host_vm_limit_reached` | Apple's per-host concurrent macOS-VM limit was hit (VZ `Code=6`); a prior VM session is still held by the OS. | Offer "Restart Soyeht engine", then "Restart your Mac" if it persists. Reboot clears the leaked session. |
+| `helper_missing` | A privileged helper (e.g. `theyos-provision-inject`) is missing or `sudo` is not NOPASSWD-configured. | Guide the operator to reinstall / configure the helper. |
+| `insufficient_disk` | Not enough free disk to build the image. | Ask the user to free space (≥ image size). |
+| `entitlement_missing` | Virtualization entitlement absent / not honored. | Surface a reinstall / re-sign hint. |
+| `ipsw_download_failed` | The macOS restore image failed to download. | Offer retry (transient/network). |
+| `ipsw_incompatible` | No restore image is compatible with this host. | Explain the host/OS mismatch; not retryable as-is. |
+| `unknown` | Unclassified failure (fail-soft catch-all). | Show the generic "couldn't prepare" copy + `guest_image_error` as secondary detail. |
+
+The code is the contract; clients key localized recovery copy off it and treat
+`guest_image_error` as optional secondary detail (never the primary user-facing
+line). Mirrors the `unavailable_reason_code` pattern used for claw installability.
+
 ---
 
 ## 17. Ratified product decisions (2026-05-06)

@@ -1494,6 +1494,9 @@ pub fn install_macos(
     ipsw_path: &Path,
     disk_path: &Path,
     aux_storage_path: &Path,
+    // Proof token (Invariant I-1): an install VM cannot start without an admission
+    // lease. The lease is reserved/held by the caller (`run_macos_install_flow`).
+    _admission_lease: &crate::vm_admission::VmLease,
     progress_cb: impl Fn(f64) + Send + 'static,
 ) -> Result<MacOSInstallResult, VZError> {
     use std::sync::mpsc;
@@ -3121,6 +3124,9 @@ pub async fn create_base_snapshot(
     base_dir: &Path,
     cpus: u32,
     memory_mb: u32,
+    // Proof token (Invariant I-1): the snapshot boot VM cannot start without an
+    // admission lease, reserved/held by the caller.
+    _admission_lease: &crate::vm_admission::VmLease,
 ) -> Result<(PathBuf, Vec<u8>), VZError> {
     use crate::vz::{VZMacOSVmConfigurationBuilder, VZVirtualMachine};
 
@@ -3207,7 +3213,12 @@ pub async fn create_base_snapshot(
 
     tracing::info!(ip = %vm_ip, "Provisioning done. Pausing and saving snapshot...");
 
-    vm.pause().await?;
+    if let Err(e) = vm.pause().await {
+        // Stop the running VM before returning — dropping it without stopping leaks
+        // an OS-level active-VM slot.
+        let _ = vm.stop(false).await;
+        return Err(e);
+    }
     if let Err(e) = vm.save_snapshot(&snapshot_tmp_path).await {
         let _ = vm.stop(false).await;
         let _ = std::fs::remove_file(&snapshot_tmp_path);
@@ -3288,6 +3299,7 @@ pub async fn rebuild_base_snapshot(
     plist_dir: &Path,
     cpus: u32,
     memory_mb: u32,
+    admission: &crate::vm_admission::VmAdmission,
 ) -> Result<PathBuf, VZError> {
     use crate::init_state::{InitPhase, read_state, write_state};
     use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
@@ -3358,7 +3370,17 @@ pub async fn rebuild_base_snapshot(
         .and_then(|b| BASE64.decode(b).ok());
     let snapshot_cpus = cpus.max(state.install_cpu_count.unwrap_or(cpus));
     let snapshot_memory_mb = memory_mb.max(state.install_memory_mb.unwrap_or(memory_mb));
-    let (snapshot_path, machine_id_data) = create_base_snapshot(
+    // Invariant I-1: reserve a Snapshot slot before the snapshot boot VM starts.
+    let snapshot_lease = admission
+        .reserve(crate::vm_admission::VmKind::Snapshot, None)
+        .map_err(|e| {
+            if e.is_host_vm_limit() {
+                VZError::HostVmLimitReached(e.to_string())
+            } else {
+                VZError::Internal(e.to_string())
+            }
+        })?;
+    let snapshot_result = create_base_snapshot(
         &disk_path,
         &aux_path,
         &hw_data,
@@ -3366,8 +3388,21 @@ pub async fn rebuild_base_snapshot(
         base_dir,
         snapshot_cpus,
         snapshot_memory_mb,
+        &snapshot_lease,
     )
-    .await?;
+    .await;
+    // create_base_snapshot stops the VM on every path; release the lease cleanly
+    // (or retain as orphan if the snapshot VM stop could not be confirmed).
+    let (snapshot_path, machine_id_data) = match snapshot_result {
+        Ok(v) => {
+            snapshot_lease.release_clean();
+            v
+        }
+        Err(e) => {
+            snapshot_lease.release_clean();
+            return Err(e);
+        }
+    };
 
     state.snapshot_path = Some(snapshot_path.display().to_string());
     state.machine_identifier_data_b64 = if machine_id_data.is_empty() {
@@ -3819,6 +3854,7 @@ mod rebuild_tests {
             &PathBuf::from("scripts/launchd"),
             2,
             2048,
+            &crate::vm_admission::VmAdmission::new(dir.path()),
         ));
         assert!(result.is_err());
         let msg = result.unwrap_err().to_string();
@@ -3841,6 +3877,7 @@ mod rebuild_tests {
             &PathBuf::from("scripts/launchd"),
             2,
             2048,
+            &crate::vm_admission::VmAdmission::new(dir.path()),
         ));
         assert!(result.is_err());
         let msg = result.unwrap_err().to_string();
@@ -3871,6 +3908,7 @@ mod rebuild_tests {
             &PathBuf::from("scripts/launchd"),
             2,
             2048,
+            &crate::vm_admission::VmAdmission::new(dir.path()),
         ));
         assert!(result.is_err());
         let msg = result.unwrap_err().to_string();
@@ -3897,6 +3935,7 @@ mod rebuild_tests {
             &PathBuf::from("scripts/launchd"),
             2,
             2048,
+            &crate::vm_admission::VmAdmission::new(dir.path()),
         ));
         assert!(result.is_err());
         let msg = result.unwrap_err().to_string();
@@ -3932,6 +3971,7 @@ mod rebuild_tests {
             &PathBuf::from("scripts/launchd"),
             2,
             2048,
+            &crate::vm_admission::VmAdmission::new(dir.path()),
         ));
         // Should fail (no real hdiutil or VZ in unit tests)
         assert!(result.is_err());

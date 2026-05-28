@@ -17,6 +17,7 @@ pub mod crash;
 pub mod db;
 pub mod env;
 pub mod error;
+pub mod guest_image_failure;
 pub mod host_resources;
 pub mod id;
 pub mod ipc;

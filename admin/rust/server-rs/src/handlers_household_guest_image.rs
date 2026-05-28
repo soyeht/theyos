@@ -175,6 +175,10 @@ pub struct PrepareResponse {
     guest_image_status: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     guest_image_error: Option<String>,
+    /// Machine-readable failure reason (`snake_case`). Present only when the
+    /// most recent phase failed; absent otherwise and on older engines.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    guest_image_failure_code: Option<core_rs::guest_image_failure::GuestImageFailureCode>,
 }
 
 // ── Handler ───────────────────────────────────────────────────────────
@@ -683,6 +687,7 @@ fn reply(code: StatusCode, status: &'static str, current: &GuestImageState) -> R
         guest_image_phase: current.phase.clone(),
         guest_image_status: current.status.clone(),
         guest_image_error: current.error.clone(),
+        guest_image_failure_code: current.failure_code,
     };
     (code, Json(body)).into_response()
 }
@@ -800,6 +805,15 @@ pub(crate) fn mark_init_state_failed_at_path(state_path: &std::path::Path, messa
     record_map.insert(
         "error".to_string(),
         serde_json::Value::String(message.to_string()),
+    );
+    // Machine-readable reason code, classified from the failure message (the
+    // IPC's host-limit message carries stable tokens; PR-A returns err_code
+    // 2001 for it). Lets the iPhone select localized recovery copy instead of
+    // parsing the raw daemon string.
+    let failure_code = core_rs::guest_image_failure::GuestImageFailureCode::classify(None, message);
+    record_map.insert(
+        "failure_code".to_string(),
+        serde_json::Value::String(failure_code.as_str().to_string()),
     );
 
     // Write atomically: tempfile + persist (rename). Tempfile shares
@@ -1111,6 +1125,7 @@ mod tests {
             phase: Some("complete".into()),
             status: Some("done".into()),
             error: None,
+            failure_code: None,
         };
         let fx = fixture_with(done, CapabilityCheck::Available);
         let path = "/api/v1/household/guest-image/prepare";
@@ -1129,6 +1144,7 @@ mod tests {
             phase: Some("install_macos".into()),
             status: Some("in_progress".into()),
             error: None,
+            failure_code: None,
         };
         let fx = fixture_with(in_progress, CapabilityCheck::Available);
         let path = "/api/v1/household/guest-image/prepare";
@@ -1176,6 +1192,9 @@ mod tests {
             phase: Some("install_macos".into()),
             status: Some("failed".into()),
             error: Some("VZMacOSInstaller failed".into()),
+            failure_code: Some(
+                core_rs::guest_image_failure::GuestImageFailureCode::HostVmLimitReached,
+            ),
         };
         let fx = fixture_with(failed, CapabilityCheck::Available);
         let path = "/api/v1/household/guest-image/prepare";
@@ -1184,6 +1203,8 @@ mod tests {
         assert_eq!(status, StatusCode::CONFLICT);
         assert_eq!(body["status"], "failed");
         assert_eq!(body["guest_image_error"], "VZMacOSInstaller failed");
+        // The machine-readable code rides alongside the human error.
+        assert_eq!(body["guest_image_failure_code"], "host_vm_limit_reached");
         assert_eq!(fx.launcher.start_count(), 0);
     }
 
@@ -1193,6 +1214,9 @@ mod tests {
             phase: Some("install_macos".into()),
             status: Some("failed".into()),
             error: Some("VZMacOSInstaller failed".into()),
+            failure_code: Some(
+                core_rs::guest_image_failure::GuestImageFailureCode::HostVmLimitReached,
+            ),
         };
         let fx = fixture_with(failed, CapabilityCheck::Available);
         let path = "/api/v1/household/guest-image/prepare";
@@ -1240,6 +1264,7 @@ mod tests {
             phase: Some("provision".into()),
             status: Some("pending".into()),
             error: None,
+            failure_code: None,
         };
         let fx = fixture_with(stale_pending, CapabilityCheck::Available);
         // No pre-set on `fx.in_flight` — default is `false`, matching
@@ -1266,6 +1291,7 @@ mod tests {
             phase: Some("provision".into()),
             status: Some("pending".into()),
             error: None,
+            failure_code: None,
         };
         let fx = fixture_with(live_pending, CapabilityCheck::Available);
         fx.in_flight.store(true, Ordering::SeqCst);
@@ -1294,6 +1320,35 @@ mod tests {
         assert_eq!(written["status"], "failed");
         assert_eq!(written["phase_history"]["unknown"]["status"], "failed");
         assert_eq!(written["phase_history"]["unknown"]["error"], "boom");
+        // Unclassifiable message → fail-soft `unknown` code (still stamped).
+        assert_eq!(
+            written["phase_history"]["unknown"]["failure_code"],
+            "unknown"
+        );
+    }
+
+    #[test]
+    fn mark_failed_classifies_host_vm_limit_code() {
+        let td = tempfile::tempdir().unwrap();
+        let path = td.path().join("init-state.json");
+        std::fs::write(
+            &path,
+            r#"{ "version": 2, "phase": "install_macos", "status": "in_progress" }"#,
+        )
+        .unwrap();
+        // The IPC's host-limit message carries a stable token (PR-A returns
+        // err_code 2001 with this guidance text).
+        super::mark_init_state_failed_at_path(
+            &path,
+            "MacOsPrepare: macOS VM startup hit the host active-VM limit while installing",
+        );
+        let written: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(written["status"], "failed");
+        assert_eq!(
+            written["phase_history"]["install_macos"]["failure_code"],
+            "host_vm_limit_reached"
+        );
     }
 
     #[test]

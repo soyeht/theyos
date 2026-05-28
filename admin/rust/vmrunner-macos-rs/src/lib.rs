@@ -38,6 +38,7 @@ pub mod macos_guest;
 pub mod network;
 pub mod slot_manager;
 pub mod snapshot;
+pub mod vm_admission;
 pub mod vz;
 pub mod warm_pool;
 
@@ -49,6 +50,9 @@ pub use error::VZError;
 pub use network::{NetworkConfig, PortForward, PortProtocol};
 pub use slot_manager::{MACOS_VM_LIMIT, MACOS_VM_LIMIT_REACHED, MacOSVmSlotManager};
 pub use snapshot::{SnapshotManager, SnapshotState};
+pub use vm_admission::{
+    AdmissionError, CapacitySnapshot, LimitReason, ManagedMacOSVm, VmAdmission, VmKind, VmLease,
+};
 pub use vz::{
     GuestOs, VZMacOSVmConfigurationBuilder, VZVirtualMachine, VZVirtualMachineConfiguration,
     VZVirtualMachineConfigurationBuilder, VmState,
