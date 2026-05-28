@@ -514,6 +514,14 @@ pub async fn bootstrap_household(shared_state: Option<SharedState>) {
                 "/api/v1/household/claws/{name}/uninstall",
                 axum::routing::post(handlers_household_claws::handle_household_uninstall_claw),
             )
+            .route(
+                "/api/v1/household/instances",
+                axum::routing::post(handlers_household_claws::handle_household_create_instance),
+            )
+            .route(
+                "/api/v1/household/instances/{id}/status",
+                axum::routing::get(handlers_household_claws::handle_household_instance_status),
+            )
             .with_state(claws_state)
     });
 

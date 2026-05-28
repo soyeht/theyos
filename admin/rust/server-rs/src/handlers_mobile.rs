@@ -37,6 +37,7 @@ const DEEP_LINK_QUERY_VALUE_SET: &AsciiSet = &CONTROLS
     .add(b'>')
     .add(b'?')
     .add(b'`');
+const PROVISIONING_TTL_SECS: i64 = 1200;
 
 #[must_use]
 pub fn mobile_deep_link(action: &str, query_items: &[(&str, &str)]) -> String {
@@ -1314,6 +1315,22 @@ pub async fn handle_mobile_create_instance(
         _ => return Err(ApiError::forbidden("admin access required")),
     }
 
+    create_mobile_instance_for_actor(state, username, req).await
+}
+
+/// Shared mobile-shaped create-instance implementation.
+///
+/// The normal `/api/v1/mobile/instances` handler performs bearer-token
+/// authentication and admin lookup before calling this. Household `PoP` routes
+/// call it after owner-key authorization and pass the owner person id as the
+/// actor. Response shape intentionally stays flat `snake_case` for iOS.
+#[allow(clippy::too_many_lines)]
+#[allow(clippy::similar_names)]
+pub(crate) async fn create_mobile_instance_for_actor(
+    state: SharedState,
+    username: String,
+    req: MobileCreateInstanceReq,
+) -> Result<Response, ApiError> {
     // Validate name
     let name = store_rs::normalize_slug(&req.name);
     if name.is_empty() {
@@ -1425,6 +1442,24 @@ pub async fn handle_mobile_create_instance(
         }
     };
 
+    #[cfg(target_os = "macos")]
+    {
+        let guest = crate::guest_image_state::GuestImageState::read_current();
+        if guest.status.as_deref() != Some("done") {
+            return Ok((
+                StatusCode::CONFLICT,
+                Json(json!({
+                    "error": "macOS guest image is not ready",
+                    "code": "GUEST_IMAGE_NOT_READY",
+                    "guest_image_phase": guest.phase,
+                    "guest_image_status": guest.status,
+                    "guest_image_error": guest.error,
+                })),
+            )
+                .into_response());
+        }
+    }
+
     // Validate resources — only enforce physical minimums.
     // Maximum limits enforced dynamically by check_capacity().
     let cpu_cores = req.cpu_cores.unwrap_or(2);
@@ -1534,7 +1569,6 @@ pub async fn handle_mobile_create_instance(
     };
 
     // DB insert + lease creation (atomic transaction)
-    const PROVISIONING_TTL_SECS: i64 = 1200;
     let use_warm_pool = crate::capacity::request_matches_warm_pool_lease(
         &state.instance_db,
         Some(&claw_type),

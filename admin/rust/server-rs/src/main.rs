@@ -389,16 +389,23 @@ async fn main() {
 
     // ── Phase 1: snapshot active instances, then sweep orphans + reconcile DB ──
     // Save the list of Active containers BEFORE sweep/reconcile marks them as Stopped.
-    let previously_active: Vec<(String, String)> = {
+    let previously_active: Vec<(String, String, i64, i64)> = {
         let st = Arc::clone(&state);
         tokio::task::spawn_blocking(move || {
             match st.instance_db.list() {
                 Ok(rows) => {
-                    let active: Vec<(String, String)> = rows
+                    let active: Vec<(String, String, i64, i64)> = rows
                         .into_iter()
                         .filter(|r| r.status == store_rs::InstanceStatus::Active)
                         .filter(|r| r.claw_type != "mac-host") // no VM restart needed
-                        .map(|r| (r.id, r.container))
+                        .map(|r| {
+                            (
+                                r.id,
+                                r.container,
+                                r.cpu_cores.unwrap_or(2),
+                                r.ram_config_mb.unwrap_or(2048),
+                            )
+                        })
                         .collect();
                     tracing::info!(
                         "[startup] found {} active instance(s) to restart after sweep",
@@ -451,20 +458,22 @@ async fn main() {
                 previously_active.len()
             );
 
-            for (instance_id, container) in &previously_active {
+            for (instance_id, container, cpu_cores, ram_mb) in &previously_active {
                 tracing::info!("[startup] restarting {container} ({instance_id})...");
 
                 let result = tokio::task::spawn_blocking({
                     let st3 = Arc::clone(&st);
                     let instance_id = instance_id.clone();
                     let container = container.clone();
+                    let cpu_cores = *cpu_cores;
+                    let ram_mb = *ram_mb;
                     move || {
                         let Ok(exec) = st3.executor.lock() else {
                             return Err("executor lock".into());
                         };
                         let req = executor_rs::ExecuteFlowRequest {
                             flow_type: executor_rs::FlowType::Restart,
-                            instance_id,
+                            instance_id: instance_id.clone(),
                             name: String::new(),
                             container,
                             claw_type: String::new(),
@@ -479,6 +488,18 @@ async fn main() {
                         };
                         let result = exec.execute_flow(&req);
                         if result.status == executor_rs::FlowStatus::Completed {
+                            let created = server_rs::reconcile::ensure_restarted_runtime_lease(
+                                &st3.instance_db,
+                                &instance_id,
+                                cpu_cores,
+                                ram_mb,
+                            )
+                            .map_err(|e| format!("ensure runtime lease: {e}"))?;
+                            if created {
+                                tracing::info!(
+                                    "[startup] restored runtime lease for restarted instance {instance_id}"
+                                );
+                            }
                             Ok(())
                         } else {
                             Err(result.error.unwrap_or_else(|| "unknown".into()))

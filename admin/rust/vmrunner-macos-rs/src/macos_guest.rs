@@ -3378,7 +3378,8 @@ pub async fn rebuild_base_snapshot(
     };
     state.snapshot_cpus = Some(snapshot_cpus);
     state.snapshot_memory_mb = Some(snapshot_memory_mb);
-    state.phase = Some(InitPhase::Complete);
+    state.begin_phase(InitPhase::Complete);
+    state.complete_phase();
     write_state(base_dir, &state)?;
 
     tracing::info!(path = %snapshot_path.display(), "Base snapshot rebuilt successfully");

@@ -6,7 +6,7 @@
 
 use std::path::Path;
 
-use store_rs::{InstanceDb, InstanceStatus, StatusUpdate};
+use store_rs::{InstanceDb, InstanceStatus, NewLease, StatusUpdate, StoreError};
 use vmrunner_rs::SweepReport;
 
 /// Reconcile database state after `sweep_orphans`.
@@ -106,6 +106,34 @@ pub fn reconcile_after_sweep(db: &InstanceDb, state_dir: &Path, report: &SweepRe
         );
     }
     reconciled
+}
+
+/// Ensure a restarted instance is represented in capacity accounting.
+///
+/// Startup reconciliation releases runtime leases when it marks dead VMs as
+/// stopped. The later auto-restart path may successfully bring those VMs back;
+/// when it does, the instance needs a fresh active runtime lease so the warm
+/// pool and future creates see the true CPU/RAM allocation.
+pub fn ensure_restarted_runtime_lease(
+    db: &InstanceDb,
+    instance_id: &str,
+    cpu_cores: i64,
+    ram_mb: i64,
+) -> Result<bool, StoreError> {
+    if db.has_active_lease("instance", instance_id, "runtime")? {
+        return Ok(false);
+    }
+
+    db.create_lease(&NewLease {
+        owner_type: "instance",
+        owner_id: instance_id,
+        lease_kind: "runtime",
+        cpu_cores,
+        ram_mb,
+        disk_gb: 0,
+        expires_at: None,
+    })?;
+    Ok(true)
 }
 
 #[cfg(test)]
@@ -221,6 +249,51 @@ mod tests {
 
         let row = db.get("i1").unwrap().unwrap();
         assert_eq!(row.status, InstanceStatus::Provisioning);
+    }
+
+    #[test]
+    fn ensure_restarted_runtime_lease_recreates_released_runtime_lease() {
+        let db = InstanceDb::open(":memory:").unwrap();
+        db.create_lease(&NewLease {
+            owner_type: "instance",
+            owner_id: "inst-1",
+            lease_kind: "runtime",
+            cpu_cores: 2,
+            ram_mb: 2048,
+            disk_gb: 0,
+            expires_at: None,
+        })
+        .unwrap();
+        db.release_lease("instance", "inst-1", "runtime").unwrap();
+
+        let created = ensure_restarted_runtime_lease(&db, "inst-1", 2, 2048).unwrap();
+
+        assert!(created);
+        assert!(
+            db.has_active_lease("instance", "inst-1", "runtime")
+                .unwrap()
+        );
+        assert_eq!(db.sum_active_runtime_leases().unwrap(), (2, 2048));
+    }
+
+    #[test]
+    fn ensure_restarted_runtime_lease_is_noop_when_active_lease_exists() {
+        let db = InstanceDb::open(":memory:").unwrap();
+        db.create_lease(&NewLease {
+            owner_type: "instance",
+            owner_id: "inst-1",
+            lease_kind: "runtime",
+            cpu_cores: 2,
+            ram_mb: 2048,
+            disk_gb: 0,
+            expires_at: None,
+        })
+        .unwrap();
+
+        let created = ensure_restarted_runtime_lease(&db, "inst-1", 2, 2048).unwrap();
+
+        assert!(!created);
+        assert_eq!(db.sum_active_runtime_leases().unwrap(), (2, 2048));
     }
 
     #[test]

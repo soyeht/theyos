@@ -1516,7 +1516,8 @@ fn handle_macos_base_install(params: &Value) -> Response {
         };
         state.snapshot_cpus = Some(snapshot_cpus);
         state.snapshot_memory_mb = Some(snapshot_memory_mb);
-        state.phase = Some(InitPhase::Complete);
+        state.begin_phase(InitPhase::Complete);
+        state.complete_phase();
         let _ = write_state(&base_dir, &state);
     }
 
@@ -1905,7 +1906,8 @@ fn handle_macos_provision_and_snapshot(params: &Value, ipc_state: &Arc<IpcState>
         };
         state.snapshot_cpus = Some(snapshot_cpus);
         state.snapshot_memory_mb = Some(snapshot_memory_mb);
-        state.phase = Some(InitPhase::Complete);
+        state.begin_phase(InitPhase::Complete);
+        state.complete_phase();
         let _ = write_state(&base_dir, &state);
     }
 

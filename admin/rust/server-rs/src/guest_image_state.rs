@@ -109,10 +109,18 @@ fn read_from_path(path: &std::path::Path) -> Option<GuestImageState> {
     let json: serde_json::Value = serde_json::from_str(&content).ok()?;
 
     let phase = json.get("phase").and_then(|v| v.as_str()).map(String::from);
-    let status = json
+    let mut status = json
         .get("status")
         .and_then(|v| v.as_str())
         .map(String::from);
+
+    // Compatibility for 0.1.20 builds that reached the final phase
+    // by assigning `phase = "complete"` directly, without also
+    // flipping the v2 status field to `done`. The snapshot is already
+    // usable at this point, so surface the state the iPhone needs.
+    if phase.as_deref() == Some("complete") && status.as_deref() != Some("failed") {
+        status = Some("done".to_string());
+    }
 
     // Extract the error from the most recent failed phase in phase_history.
     // Schema: `phase_history` is `BTreeMap<String, PhaseRecord>` where
@@ -179,6 +187,26 @@ mod tests {
                 "version": 2,
                 "phase": "complete",
                 "status": "done",
+                "phase_history": {}
+            }"#,
+        )
+        .unwrap();
+        let result = read_from_path(&state_file).expect("parses");
+        assert_eq!(result.phase.as_deref(), Some("complete"));
+        assert_eq!(result.status.as_deref(), Some("done"));
+        assert!(result.error.is_none());
+    }
+
+    #[test]
+    fn read_treats_complete_pending_as_done() {
+        let dir = tempdir().unwrap();
+        let state_file = dir.path().join("init-state.json");
+        fs::write(
+            &state_file,
+            r#"{
+                "version": 2,
+                "phase": "complete",
+                "status": "pending",
                 "phase_history": {}
             }"#,
         )
