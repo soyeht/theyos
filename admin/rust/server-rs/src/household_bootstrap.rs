@@ -15,6 +15,7 @@ use crate::bonjour_trust::BrowserConfig;
 use crate::handlers_bootstrap::{BootstrapHandlerState, BootstrapStateArc};
 use crate::handlers_household;
 use crate::handlers_household_claws;
+use crate::handlers_household_guest_image;
 use crate::handlers_owner_events;
 use crate::handlers_pair_device;
 use crate::handlers_pair_machine;
@@ -535,10 +536,35 @@ pub async fn bootstrap_household(shared_state: Option<SharedState>) {
         },
     );
 
+    // Guest-image prepare endpoint — `POST /api/v1/household/guest-image/prepare`.
+    // PoP-gated under the existing `Operation::ClawsCreate` caveat (see
+    // module docs in `handlers_household_guest_image.rs` for the rationale
+    // — letting already-issued owner certs initiate guest-image prep
+    // without forcing a re-pair). Mounted on every host (not only when
+    // `shared_state` is provided) because it relies on `init-state.json`
+    // and the launcher trait, not on `SharedState`.
+    let guest_image_router = {
+        let guest_image_state = handlers_household_guest_image::GuestImagePrepareState {
+            household: identity_state.clone(),
+            inspector: Arc::new(handlers_household_guest_image::DefaultInspector),
+            launcher: Arc::new(handlers_household_guest_image::MacosPrepareLauncher),
+            in_flight: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        };
+        axum::Router::new()
+            .route(
+                "/api/v1/household/guest-image/prepare",
+                axum::routing::post(
+                    handlers_household_guest_image::handle_household_prepare_guest_image,
+                ),
+            )
+            .with_state(guest_image_state)
+    };
+
     let mut household_router = identity_router
         .merge(pair_router)
         .merge(bootstrap_rt)
-        .merge(pre_household_rt);
+        .merge(pre_household_rt)
+        .merge(guest_image_router);
     if let Some(r) = claws_router {
         household_router = household_router.merge(r);
     }

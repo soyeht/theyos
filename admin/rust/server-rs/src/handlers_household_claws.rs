@@ -63,7 +63,17 @@ pub async fn handle_household_list_claws(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    if let Err(reject) = authorize(&state, &method, &uri, &headers, &body, Operation::ClawsList, "list").await {
+    if let Err(reject) = authorize(
+        &state,
+        &method,
+        &uri,
+        &headers,
+        &body,
+        Operation::ClawsList,
+        "list",
+    )
+    .await
+    {
         return reject;
     }
     forward(handlers_claws::handle_list_claws(State(state.shared.clone())).await)
@@ -78,7 +88,17 @@ pub async fn handle_household_claw_availability(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    if let Err(reject) = authorize(&state, &method, &uri, &headers, &body, Operation::ClawsList, "availability").await {
+    if let Err(reject) = authorize(
+        &state,
+        &method,
+        &uri,
+        &headers,
+        &body,
+        Operation::ClawsList,
+        "availability",
+    )
+    .await
+    {
         return reject;
     }
     forward(handlers_claws::handle_claw_availability(State(state.shared.clone()), Path(name)).await)
@@ -93,7 +113,17 @@ pub async fn handle_household_install_claw(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    if let Err(reject) = authorize(&state, &method, &uri, &headers, &body, Operation::ClawsCreate, "install").await {
+    if let Err(reject) = authorize(
+        &state,
+        &method,
+        &uri,
+        &headers,
+        &body,
+        Operation::ClawsCreate,
+        "install",
+    )
+    .await
+    {
         return reject;
     }
     forward(handlers_claws::handle_install_claw(State(state.shared.clone()), Path(name)).await)
@@ -108,7 +138,17 @@ pub async fn handle_household_uninstall_claw(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    if let Err(reject) = authorize(&state, &method, &uri, &headers, &body, Operation::ClawsDelete, "uninstall").await {
+    if let Err(reject) = authorize(
+        &state,
+        &method,
+        &uri,
+        &headers,
+        &body,
+        Operation::ClawsDelete,
+        "uninstall",
+    )
+    .await
+    {
         return reject;
     }
     forward(handlers_claws::handle_uninstall_claw(State(state.shared.clone()), Path(name)).await)

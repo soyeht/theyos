@@ -54,7 +54,11 @@ impl GuestImageState {
     /// (Mac with fresh install).
     #[must_use]
     pub const fn not_applicable() -> Self {
-        Self { phase: None, status: None, error: None }
+        Self {
+            phase: None,
+            status: None,
+            error: None,
+        }
     }
 
     /// Reads + parses `init-state.json` from the canonical macOS base
@@ -77,8 +81,15 @@ impl GuestImageState {
     }
 }
 
+/// Canonical macOS base directory for the guest image
+/// (`$THEYOS_VM_ASSETS_DIR/macos-base` if set, otherwise
+/// `~/Library/Application Support/theyos/vms/macos-base`). Exposed
+/// pub(crate) so the remote-prepare launcher can stamp a `failed`
+/// record into `init-state.json` when its background task fails
+/// without going through the IPC handler's `fail_phase` path.
 #[cfg(target_os = "macos")]
-fn macos_base_dir() -> PathBuf {
+#[must_use]
+pub(crate) fn macos_base_dir() -> PathBuf {
     if let Ok(d) = std::env::var("THEYOS_VM_ASSETS_DIR") {
         return PathBuf::from(d).join("macos-base");
     }
@@ -98,7 +109,10 @@ fn read_from_path(path: &std::path::Path) -> Option<GuestImageState> {
     let json: serde_json::Value = serde_json::from_str(&content).ok()?;
 
     let phase = json.get("phase").and_then(|v| v.as_str()).map(String::from);
-    let status = json.get("status").and_then(|v| v.as_str()).map(String::from);
+    let status = json
+        .get("status")
+        .and_then(|v| v.as_str())
+        .map(String::from);
 
     // Extract the error from the most recent failed phase in phase_history.
     // Schema: `phase_history` is `BTreeMap<String, PhaseRecord>` where
@@ -112,24 +126,28 @@ fn read_from_path(path: &std::path::Path) -> Option<GuestImageState> {
                 // (download → disk → install → provision → snapshot →
                 // complete), so the latest failed one is the highest
                 // sorted key with status == "failed".
-                history
-                    .iter()
-                    .rev()
-                    .find_map(|(_, record)| {
-                        let rec_obj = record.as_object()?;
-                        let rec_status = rec_obj.get("status")?.as_str()?;
-                        if rec_status == "failed" {
-                            rec_obj.get("error").and_then(|e| e.as_str()).map(String::from)
-                        } else {
-                            None
-                        }
-                    })
+                history.iter().rev().find_map(|(_, record)| {
+                    let rec_obj = record.as_object()?;
+                    let rec_status = rec_obj.get("status")?.as_str()?;
+                    if rec_status == "failed" {
+                        rec_obj
+                            .get("error")
+                            .and_then(|e| e.as_str())
+                            .map(String::from)
+                    } else {
+                        None
+                    }
+                })
             })
     } else {
         None
     };
 
-    Some(GuestImageState { phase, status, error })
+    Some(GuestImageState {
+        phase,
+        status,
+        error,
+    })
 }
 
 // ─── Tests ───────────────────────────────────────────────────────────────────
@@ -145,7 +163,10 @@ mod tests {
     fn read_returns_not_applicable_when_file_missing() {
         let dir = tempdir().unwrap();
         let result = read_from_path(&dir.path().join("init-state.json"));
-        assert!(result.is_none(), "missing file → None → caller treats as not_applicable");
+        assert!(
+            result.is_none(),
+            "missing file → None → caller treats as not_applicable"
+        );
     }
 
     #[test]

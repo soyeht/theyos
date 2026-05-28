@@ -54,11 +54,11 @@
 //!
 //! See `specs/006-pair-machine-daemon-stage/` for the contract.
 
-use crate::household_listener::{InterfaceClass, enumerate_bind_targets};
-use crate::install_cli::{pick_addr_for_transport, probe_mdns_available, sanitize_hostname};
 use crate::bonjour_publisher::{
     PairMachineBonjourRole, PublishParams, publish_candidate_joiner_bonjour,
 };
+use crate::household_listener::{InterfaceClass, enumerate_bind_targets};
+use crate::install_cli::{pick_addr_for_transport, probe_mdns_available, sanitize_hostname};
 use household_rs::KeyBackingPolicy;
 use household_rs::machine_cert::Platform;
 use household_rs::pair_machine::{
@@ -120,7 +120,10 @@ pub enum StageError {
     Prepare(String),
 
     #[error("invalid candidate addr {addr:?}: {source}")]
-    InvalidBindAddr { addr: String, source: std::net::AddrParseError },
+    InvalidBindAddr {
+        addr: String,
+        source: std::net::AddrParseError,
+    },
 }
 
 /// Prepare a fresh pair-machine candidate ceremony from the daemon and
@@ -186,7 +189,9 @@ pub async fn stage(
 
     let hostname = sanitize_hostname(&gethostname::gethostname().to_string_lossy());
     if hostname.is_empty() || hostname.len() > 64 {
-        return Err(StageError::BadHostname { got: hostname.len() });
+        return Err(StageError::BadHostname {
+            got: hostname.len(),
+        });
     }
 
     let now_unix = SystemTime::now()

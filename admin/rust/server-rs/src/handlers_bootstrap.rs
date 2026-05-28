@@ -693,7 +693,9 @@ pub async fn post_pair_machine_local_stage(
             return cbor_error(
                 StatusCode::BAD_REQUEST,
                 "unsupported_transport",
-                Some(format!("transport={other:?}; expected 'tailscale' or 'lan'")),
+                Some(format!(
+                    "transport={other:?}; expected 'tailscale' or 'lan'"
+                )),
                 None,
             );
         }
