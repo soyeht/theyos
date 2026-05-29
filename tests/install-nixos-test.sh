@@ -170,6 +170,18 @@ test_on_interrupt() {
     assert_contains "postapply: notes theyOS already activated" "$out" "already activated"
 }
 
+# ── 7. pairing runs as the soyeht service account ───────────────────────────
+# The bootstrap token is owned by `soyeht` (0600); the auto-pair step must run
+# as that account, not the operator's login. Static guard against a regression
+# back to a non-privileged `soyeht pair` that always fails the QR at install end.
+test_pair_runs_as_service_account() {
+    local body
+    body="$(cat "$SCRIPT")"
+    assert_contains "auto-pair runs as soyeht service account" "$body" 'sudo -u soyeht "$(command -v soyeht)" pair'
+    # The fallback hint must point at a command that actually works (sudo).
+    assert_contains "pair fallback hint uses sudo" "$body" 'Run "sudo soyeht pair" later'
+}
+
 # ── run ──────────────────────────────────────────────────────────────────────
 main() {
     printf 'install-nixos unit tests\n\n'
@@ -181,6 +193,7 @@ main() {
     test_existing_host_nix
     test_dry_run
     test_on_interrupt
+    test_pair_runs_as_service_account
     printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
     [ "$FAIL" -eq 0 ]
 }

@@ -1,5 +1,6 @@
 //! `soyeht pair` — generate a server-pairing QR code for the mobile app.
 
+use std::io::IsTerminal;
 use std::path::Path;
 
 /// Default bootstrap token path.
@@ -140,15 +141,85 @@ fn format_token_read_error(token_path: &str, kind: std::io::ErrorKind, raw: &str
     }
 }
 
+/// Decide whether to transparently re-exec `soyeht pair` under `sudo` after a
+/// bootstrap-token read failure.
+///
+/// On Linux the token is owned by the `soyeht` service account (mode 0600), so
+/// the operator's own login cannot read it. Rather than make them discover
+/// `sudo` by hand, we re-exec under sudo — but ONLY under a strict gate, so we
+/// never silently elevate in a script or hang on a password prompt:
+///
+/// - Linux only (on macOS the token lives in the user's `$HOME` and is
+///   readable — a permission error there is not the service-account case).
+/// - `PermissionDenied` only (a missing token is a different problem with its
+///   own hint).
+/// - Interactive TTY only (`stdin` is a terminal) — so sudo can prompt; a
+///   non-interactive/scripted run must never block on a password.
+/// - Not already root (`euid != 0`) — defense in depth; a root caller would not
+///   have hit `PermissionDenied` in the first place.
+fn should_reexec_with_sudo(
+    kind: std::io::ErrorKind,
+    is_linux: bool,
+    is_interactive_tty: bool,
+    is_root: bool,
+) -> bool {
+    is_linux
+        && kind == std::io::ErrorKind::PermissionDenied
+        && is_interactive_tty
+        && !is_root
+}
+
+/// Re-exec the current `soyeht pair` invocation under `sudo`, preserving all
+/// arguments, then exit with the child's status. Prints an explicit notice
+/// first so the elevation is never a surprise. Diverges.
+fn reexec_with_sudo() -> ! {
+    eprintln!(
+        "soyeht pair: the bootstrap token is readable only by the service account.\n\
+         Re-running with sudo (you may be prompted for your password)..."
+    );
+    let exe = std::env::current_exe().unwrap_or_else(|e| {
+        eprintln!("error: cannot locate the soyeht executable to re-exec under sudo: {e}");
+        eprintln!("hint: run it yourself: sudo soyeht pair");
+        std::process::exit(1);
+    });
+    // sudo <this-exe> <original args minus argv[0]>  e.g. `sudo /…/soyeht pair -d 2h`
+    match std::process::Command::new("sudo")
+        .arg(exe)
+        .args(std::env::args().skip(1))
+        .status()
+    {
+        Ok(s) => std::process::exit(s.code().unwrap_or(1)),
+        Err(e) => {
+            eprintln!("error: failed to re-exec under sudo: {e}");
+            eprintln!("hint: run it yourself: sudo soyeht pair");
+            std::process::exit(1);
+        }
+    }
+}
+
 /// Read the bootstrap token file, or print an actionable hint and exit(1).
 ///
 /// Thin wrapper around `format_token_read_error` that handles the I/O side
 /// effect. The message construction itself lives in the pure helper above
 /// so it can be tested.
+///
+/// On a Linux permission error at an interactive terminal (non-root), we
+/// transparently re-exec under sudo via [`should_reexec_with_sudo`] instead of
+/// only printing the hint — so the fresh-start operator never has to discover
+/// `sudo` themselves. Non-interactive callers always get the actionable hint
+/// and exit(1), never an auto-sudo.
 fn read_bootstrap_token_or_exit(token_path: &str) -> String {
     match std::fs::read_to_string(token_path) {
         Ok(t) => t.trim().to_string(),
         Err(e) => {
+            if should_reexec_with_sudo(
+                e.kind(),
+                cfg!(target_os = "linux"),
+                std::io::stdin().is_terminal(),
+                core_rs::os::geteuid() == 0,
+            ) {
+                reexec_with_sudo();
+            }
             eprintln!(
                 "{}",
                 format_token_read_error(token_path, e.kind(), &e.to_string())
@@ -414,5 +485,69 @@ mod tests {
         f.flush().unwrap();
         let token = read_bootstrap_token_or_exit(f.path().to_str().unwrap());
         assert_eq!(token, "my-bearer-token-with-surrounding-whitespace");
+    }
+
+    // ── sudo self-elevation gate ────────────────────────────────────────────
+    //
+    // The re-exec must fire ONLY when all four conditions hold: Linux, a
+    // PermissionDenied read error, an interactive TTY, and not-already-root.
+    // Any other combination must fall through to the actionable hint + exit(1)
+    // (never a silent sudo, never a blocked password prompt in a script).
+
+    use std::io::ErrorKind;
+
+    #[test]
+    fn sudo_gate_fires_only_when_all_conditions_hold() {
+        assert!(should_reexec_with_sudo(
+            ErrorKind::PermissionDenied,
+            true,  // linux
+            true,  // interactive tty
+            false, // not root
+        ));
+    }
+
+    #[test]
+    fn sudo_gate_blocked_on_non_linux() {
+        // macOS: token lives in $HOME and is user-readable; a perm error there
+        // is not the service-account case, so never auto-sudo.
+        assert!(!should_reexec_with_sudo(
+            ErrorKind::PermissionDenied,
+            false, // not linux
+            true,
+            false,
+        ));
+    }
+
+    #[test]
+    fn sudo_gate_blocked_when_not_interactive() {
+        // Scripted / installer context: must print the hint, never block on a
+        // password prompt.
+        assert!(!should_reexec_with_sudo(
+            ErrorKind::PermissionDenied,
+            true,
+            false, // no tty
+            false,
+        ));
+    }
+
+    #[test]
+    fn sudo_gate_blocked_when_root() {
+        assert!(!should_reexec_with_sudo(
+            ErrorKind::PermissionDenied,
+            true,
+            true,
+            true, // already root
+        ));
+    }
+
+    #[test]
+    fn sudo_gate_blocked_on_non_permission_errors() {
+        // NotFound (missing token) and other errors get their own hints, not sudo.
+        for kind in [ErrorKind::NotFound, ErrorKind::InvalidData, ErrorKind::Other] {
+            assert!(
+                !should_reexec_with_sudo(kind, true, true, false),
+                "kind {kind:?} must not trigger sudo re-exec"
+            );
+        }
     }
 }

@@ -186,6 +186,22 @@ pub fn getuid() -> u32 {
     unsafe { getuid() }
 }
 
+/// Get the current process's effective UID.
+///
+/// Distinct from [`getuid`]: the *effective* UID is what the kernel checks for
+/// file-access permissions, so this is the right test for "do I have the
+/// privilege to read a root/service-account-owned file" and, by extension,
+/// "should I attempt to re-exec under sudo".
+#[must_use]
+pub fn geteuid() -> u32 {
+    unsafe extern "C" {
+        fn geteuid() -> u32;
+    }
+    // SAFETY: geteuid() is a POSIX syscall that takes no arguments and returns
+    // a simple integer. No memory safety concerns.
+    unsafe { geteuid() }
+}
+
 /// Get the current user's GID.
 #[must_use]
 pub fn getgid() -> u32 {

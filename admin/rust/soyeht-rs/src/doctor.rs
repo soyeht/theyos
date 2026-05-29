@@ -272,6 +272,72 @@ fn check_macos_runtime(root: &Path, r: &mut DoctorReport) {
     }
 }
 
+/// Health of a NixOS secret file, classified from metadata ONLY.
+///
+/// `soyeht doctor` is normally run by the operator's own login, but the secrets
+/// are owned by the `soyeht` service account (mode 0600), so their contents are
+/// unreadable as that user. Reading the file would yield `PermissionDenied`,
+/// which the old check mistook for "missing". We therefore classify from
+/// `stat` alone — existence, size, and permission bits — which only needs
+/// search (`x`) on the 0755 secrets dir, not read on the file.
+#[derive(Debug, PartialEq, Eq)]
+enum SecretHealth {
+    /// Not present (or not a regular file) — genuinely not configured.
+    Missing,
+    /// Present but zero-length — broken.
+    Empty,
+    /// Present and non-empty but group/other-accessible — an insecure config we
+    /// must surface (the permission bits, masked to 0o777, are carried along).
+    InsecurePerms(u32),
+    /// Present, non-empty, and not group/other-accessible — healthy.
+    Ok,
+}
+
+/// Pure classifier (no I/O) so the security logic is unit-testable.
+/// `mode` is the permission bits already masked to `0o777`.
+fn classify_secret_facts(exists: bool, is_file: bool, len: u64, mode: u32) -> SecretHealth {
+    if !exists || !is_file {
+        return SecretHealth::Missing;
+    }
+    if len == 0 {
+        return SecretHealth::Empty;
+    }
+    // A secret must not be readable/writable/executable by group or other.
+    // Surface any loosening rather than masking it behind a green check.
+    if mode & 0o077 != 0 {
+        return SecretHealth::InsecurePerms(mode);
+    }
+    SecretHealth::Ok
+}
+
+fn report_secret(r: &mut DoctorReport, path: &Path, label: &str, missing_hint: &str) {
+    use std::os::unix::fs::PermissionsExt;
+
+    let health = match std::fs::metadata(path) {
+        Ok(m) => classify_secret_facts(true, m.is_file(), m.len(), m.permissions().mode() & 0o777),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => SecretHealth::Missing,
+        Err(e) => {
+            // Couldn't even stat it (should not happen with a 0755 dir) — report
+            // as a warning rather than a false "missing".
+            r.warn(&format!("{label}: cannot stat {} ({e})", path.display()));
+            return;
+        }
+    };
+
+    match health {
+        // Present + non-empty + 0600: read is intentionally NOT attempted (the
+        // file is service-account-owned and unreadable as the operator).
+        SecretHealth::Ok => r.pass(&format!("{label} present (service-account-owned, 0600)")),
+        SecretHealth::Missing => r.fail(&format!("{label} missing — {missing_hint}")),
+        SecretHealth::Empty => {
+            r.fail(&format!("{label} present but empty in /var/lib/theyos/secrets/"));
+        }
+        SecretHealth::InsecurePerms(mode) => r.fail(&format!(
+            "{label} has insecure permissions {mode:o} (expected 600) — secrets must not be group/world accessible"
+        )),
+    }
+}
+
 fn check_nixos_secrets(r: &mut DoctorReport) {
     let secrets_dir = Path::new("/var/lib/theyos/secrets");
     if !secrets_dir.is_dir() {
@@ -280,19 +346,18 @@ fn check_nixos_secrets(r: &mut DoctorReport) {
     }
     r.pass("NixOS secrets directory exists");
 
-    let pw = secrets_dir.join("admin-password");
-    if pw.is_file() && std::fs::read_to_string(&pw).is_ok_and(|s| !s.trim().is_empty()) {
-        r.pass("admin-password configured");
-    } else {
-        r.fail("admin-password missing in /var/lib/theyos/secrets/");
-    }
-
-    let pepper = secrets_dir.join("session-pepper");
-    if pepper.is_file() && std::fs::read_to_string(&pepper).is_ok_and(|s| !s.trim().is_empty()) {
-        r.pass("session-pepper configured");
-    } else {
-        r.fail("session-pepper missing — sessions will not work");
-    }
+    report_secret(
+        r,
+        &secrets_dir.join("admin-password"),
+        "admin-password",
+        "run: ./install-nixos",
+    );
+    report_secret(
+        r,
+        &secrets_dir.join("session-pepper"),
+        "session-pepper",
+        "sessions will not work; run: ./install-nixos",
+    );
 }
 
 fn check_env(root: &Path, r: &mut DoctorReport) {
@@ -643,6 +708,56 @@ fn query_dag_check(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── Secret classification (EACCES must NOT read as "missing") ────────────
+
+    #[test]
+    fn secret_missing_when_absent_or_not_file() {
+        assert_eq!(
+            classify_secret_facts(false, false, 0, 0o600),
+            SecretHealth::Missing
+        );
+        // Exists but is a directory, not a regular file.
+        assert_eq!(
+            classify_secret_facts(true, false, 4096, 0o700),
+            SecretHealth::Missing
+        );
+    }
+
+    #[test]
+    fn secret_empty_when_zero_length() {
+        assert_eq!(
+            classify_secret_facts(true, true, 0, 0o600),
+            SecretHealth::Empty
+        );
+    }
+
+    #[test]
+    fn secret_ok_when_present_nonempty_0600() {
+        // The real-world case that used to false-FAIL: present, non-empty, 0600,
+        // and (implicitly) unreadable by the operator. Metadata alone → Ok.
+        assert_eq!(
+            classify_secret_facts(true, true, 24, 0o600),
+            SecretHealth::Ok
+        );
+        // Stricter than 0600 is also fine.
+        assert_eq!(
+            classify_secret_facts(true, true, 24, 0o400),
+            SecretHealth::Ok
+        );
+    }
+
+    #[test]
+    fn secret_insecure_when_group_or_other_accessible() {
+        // Must not mask an insecure config behind a green check.
+        for mode in [0o640, 0o644, 0o604, 0o660, 0o666, 0o601] {
+            assert_eq!(
+                classify_secret_facts(true, true, 24, mode),
+                SecretHealth::InsecurePerms(mode),
+                "mode {mode:o} should be flagged insecure"
+            );
+        }
+    }
 
     #[test]
     fn doctor_report_counts_failures_and_warnings() {

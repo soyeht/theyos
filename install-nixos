@@ -775,13 +775,17 @@ post_apply() {
             printf '  ########################################################\n'
             printf '  #  Scan to pair your mobile app with this server:      #\n'
             printf '  ########################################################\n\n'
-            THEYOS_DIR="$REPO_DIR" soyeht pair 2>/dev/null || printf '  [!] QR code generation failed.\n      Run "soyeht pair" later to pair your mobile app.\n\n'
+            # The bootstrap token is owned by the soyeht service account (0600),
+            # so pair must run as that account — not the operator's login, which
+            # cannot read it. Passwordless sudo to any runas was configured above
+            # (configure_sudo), so this needs no prompt.
+            sudo -u soyeht "$(command -v soyeht)" pair 2>/dev/null || printf '  [!] QR code generation failed.\n      Run "sudo soyeht pair" later to pair your mobile app.\n\n'
         else
             printf '  [!] Admin backend not ready yet.\n'
-            printf '      Run "soyeht pair" later to pair your mobile app.\n\n'
+            printf '      Run "sudo soyeht pair" later to pair your mobile app.\n\n'
         fi
     else
-        printf '  [i] Run "soyeht pair" to connect your mobile app.\n\n'
+        printf '  [i] Run "sudo soyeht pair" to connect your mobile app.\n\n'
     fi
 
     # Check rootfs (may still be building in background oneshot)
