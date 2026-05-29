@@ -4,10 +4,14 @@ on:
   push:
     paths:
       - "admin/rust/**"
+      - "install-nixos"
+      - "tests/install-nixos-test.sh"
       - ".github/workflows/backend-ci.yml"
   pull_request:
     paths:
       - "admin/rust/**"
+      - "install-nixos"
+      - "tests/install-nixos-test.sh"
       - ".github/workflows/backend-ci.yml"
   workflow_dispatch:
 
@@ -118,3 +122,20 @@ jobs:
             exit 1
           fi
           echo "OK: no .sh scripts found in scripts/"
+
+  installer-tests:
+    name: Installer Unit Tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Syntax check
+        run: bash -n install-nixos && bash -n tests/install-nixos-test.sh
+
+      - name: Run install-nixos unit tests
+        # Pure bash; never invokes nixos-rebuild. Covers --help side-effects,
+        # no-TTY access-mode resolution, --dry-run, host.nix reuse/conflict,
+        # and SIGINT guidance.
+        run: bash tests/install-nixos-test.sh

@@ -1,52 +1,290 @@
 #!/usr/bin/env bash
-set -euo pipefail
-REPO_DIR="$(cd "$(dirname "$0")" && pwd)"
-NIX_DIR="$REPO_DIR/nix"
+#
+# theyOS NixOS installer.
+#
+# Structure: every step is a function and the imperative flow lives in main().
+# This lets the test harness `source` the script in library-only mode
+# (THEYOS_INSTALL_LIB_ONLY=1) and unit-test the load-bearing decisions
+# (argument parsing, access-mode resolution, dry-run preview, interrupt
+# guidance) WITHOUT running nixos-rebuild. `set -euo pipefail` is therefore
+# enabled inside main(), not at top level, so sourcing only defines functions.
+
+# REPO_DIR / NIX_DIR are overridable via env so tests can point at a fixture
+# directory. `${VAR:-$(...)}` only runs the command substitution when the env
+# override is unset, so sourcing in a test never shells out for the repo path.
+REPO_DIR="${THEYOS_REPO_DIR:-$(cd "$(dirname "$0")" && pwd)}"
+NIX_DIR="${THEYOS_NIX_DIR:-$REPO_DIR/nix}"
+
+# nixos-rebuild --flake .#theyos auto-resolves to nixosConfigurations; nix eval
+# needs the full attribute path.
+NIXOS_FLAKE="${REPO_DIR}#theyos"
+NIXOS_EVAL_PREFIX="${REPO_DIR}#nixosConfigurations.theyos"
+
+# Populated by parse_args.
+ARG_ACCESS_MODE=""
+ARG_HOSTNAME=""
+DRY_RUN=false
+
+# Tracks how far the install got, so the interrupt handler can give accurate,
+# phase-specific guidance about what state the machine is left in.
+INSTALL_PHASE="preflight"
+
+# ── Small helpers ────────────────────────────────────────────────────────────
+
+print_help() {
+    cat <<'EOF'
+theyOS NixOS installer
+
+Usage: ./install-nixos [OPTIONS]
+
+Installs and activates theyOS on a NixOS host. Safe to re-run (idempotent).
+
+Options:
+  --access-mode <mode>   How theyOS is reached: tailscale | local | domain.
+                         Required when running non-interactively (no terminal);
+                         interactive runs prompt for it if omitted.
+  --hostname <name>      Tailscale hostname (only with --access-mode tailscale).
+                         Defaults to the current system hostname.
+  --dry-run              Show what would happen and exit. Makes no changes.
+  -h, --help             Show this help and exit.
+
+Examples:
+  sudo ./install-nixos                                # interactive
+  sudo ./install-nixos --access-mode tailscale        # non-interactive, Tailscale
+  sudo ./install-nixos --access-mode local            # non-interactive, local-only
+  ./install-nixos --dry-run --access-mode tailscale   # preview, no changes
+
+For non-NixOS distributions, use ./install instead.
+EOF
+}
+
+# True when an interactive terminal is reachable for prompts.
+has_tty() {
+    [ -t 0 ] && return 0
+    (exec </dev/tty) 2>/dev/null && return 0
+    return 1
+}
+
+# Reads the accessMode value out of an existing nix/host.nix.
+# Uses POSIX [[:space:]] (not GNU's \s) so it is portable across GNU sed (the
+# NixOS target / CI) and BSD sed (developer macOS test runs).
+read_host_access_mode() {
+    sed -n 's/.*accessMode[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' "$NIX_DIR/host.nix" 2>/dev/null | head -1
+}
+
+parse_args() {
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            -h|--help)
+                print_help
+                exit 0
+                ;;
+            --access-mode)
+                shift
+                [ $# -gt 0 ] || { printf '[error] --access-mode requires a value (tailscale|local|domain)\n' >&2; exit 1; }
+                ARG_ACCESS_MODE="$1"
+                ;;
+            --access-mode=*)
+                ARG_ACCESS_MODE="${1#*=}"
+                ;;
+            --hostname)
+                shift
+                [ $# -gt 0 ] || { printf '[error] --hostname requires a value\n' >&2; exit 1; }
+                ARG_HOSTNAME="$1"
+                ;;
+            --hostname=*)
+                ARG_HOSTNAME="${1#*=}"
+                ;;
+            --dry-run)
+                DRY_RUN=true
+                ;;
+            *)
+                printf '[error] unknown option: %s\n\n' "$1" >&2
+                print_help >&2
+                exit 1
+                ;;
+        esac
+        shift
+    done
+
+    if [ -n "$ARG_ACCESS_MODE" ]; then
+        case "$ARG_ACCESS_MODE" in
+            tailscale|local|domain) ;;
+            *)
+                printf '[error] invalid --access-mode: %s (expected tailscale|local|domain)\n' "$ARG_ACCESS_MODE" >&2
+                exit 1
+                ;;
+        esac
+    fi
+}
+
+# Prompts interactively for the access mode. Prompt text goes to stderr (so it
+# is visible but does not pollute the captured stdout); the chosen mode is the
+# only thing written to stdout. Mirrors the historical local-default UX.
+prompt_access_mode() {
+    {
+        printf 'How will you access theyOS?\n\n'
+        printf '  → Local only   — http://localhost:8892 (this machine only)\n'
+        printf '    Tailscale    — https://hostname.tailnet.ts.net (any device on your VPN)\n'
+        printf '\n'
+        printf '  You can change this later in nix/host.nix.\n\n'
+        printf "Press Enter for Local, or type 't' for Tailscale: "
+    } >&2
+    local choice=""
+    if (exec </dev/tty) 2>/dev/null; then
+        read -r choice </dev/tty || true
+    else
+        read -r choice || true
+    fi
+    printf '\n' >&2
+    case "$choice" in
+        t|T|tailscale) printf 'tailscale\n' ;;
+        *)             printf 'local\n' ;;
+    esac
+}
+
+# Single source of truth for the access mode. Echoes the resolved mode on
+# stdout. Returns:
+#   0  resolved (echoed)
+#   2  first run, no --access-mode and no interactive terminal
+#   3  --access-mode contradicts an existing nix/host.nix
+# It never makes a dangerous silent choice: non-interactive first runs MUST pass
+# --access-mode rather than defaulting to local.
+resolve_access_mode() {
+    if [ -f "$NIX_DIR/host.nix" ]; then
+        local existing
+        existing="$(read_host_access_mode)"
+        if [ -n "$ARG_ACCESS_MODE" ] && [ "$ARG_ACCESS_MODE" != "$existing" ]; then
+            printf '[error] --access-mode=%s conflicts with the existing nix/host.nix (accessMode=%s).\n' "$ARG_ACCESS_MODE" "$existing" >&2
+            printf '        Edit nix/host.nix (set accessMode = "%s";), or remove nix/host.nix to\n' "$ARG_ACCESS_MODE" >&2
+            printf '        regenerate it, then re-run ./install-nixos.\n' >&2
+            return 3
+        fi
+        printf '%s\n' "$existing"
+        return 0
+    fi
+
+    if [ -n "$ARG_ACCESS_MODE" ]; then
+        printf '%s\n' "$ARG_ACCESS_MODE"
+        return 0
+    fi
+
+    if has_tty; then
+        prompt_access_mode
+        return 0
+    fi
+
+    printf '[error] no access mode selected and no interactive terminal available.\n' >&2
+    printf '        Re-run non-interactively with an explicit mode, e.g.:\n' >&2
+    printf '          ./install-nixos --access-mode tailscale   # or local | domain\n' >&2
+    return 2
+}
+
+# Prints exactly what a real install would do, then returns. No side effects:
+# no sudo, no writes, no nix-shell, no rebuild.
+print_dry_run_plan() {
+    local nixos_state mode_desc existing
+    if [ -f /etc/NIXOS ]; then
+        nixos_state="NixOS (ok)"
+    else
+        nixos_state="non-NixOS (a real install would abort here — use ./install)"
+    fi
+
+    if [ -f "$NIX_DIR/host.nix" ]; then
+        existing="$(read_host_access_mode)"
+        if [ -n "$ARG_ACCESS_MODE" ] && [ "$ARG_ACCESS_MODE" != "$existing" ]; then
+            mode_desc="CONFLICT — existing host.nix has accessMode=$existing but --access-mode=$ARG_ACCESS_MODE (install would abort)"
+        else
+            mode_desc="reuse existing nix/host.nix (accessMode=$existing)"
+        fi
+    elif [ -n "$ARG_ACCESS_MODE" ]; then
+        mode_desc="first run — would generate nix/host.nix (accessMode=$ARG_ACCESS_MODE)"
+    elif has_tty; then
+        mode_desc="first run — would prompt interactively for access mode"
+    else
+        mode_desc="first run — would ABORT (no --access-mode and no interactive terminal)"
+    fi
+
+    printf '[install-nixos] DRY RUN — no changes will be made.\n\n'
+    printf '  target system : %s\n' "$nixos_state"
+    printf '  repo dir      : %s\n' "$REPO_DIR"
+    printf '  host.nix      : %s\n' "$NIX_DIR/host.nix"
+    printf '  access mode   : %s\n' "$mode_desc"
+    printf '  would run     : sudo nixos-rebuild switch --flake %s\n' "$NIXOS_FLAKE"
+    printf '\n[install-nixos] Re-run without --dry-run to perform the install.\n'
+}
+
+# SIGINT/SIGTERM handler. Reports the exact state the machine is left in for the
+# phase that was interrupted. host.nix is written atomically (temp + mv) and the
+# install is idempotent, so no interrupt leaves a half-written, flake-breaking
+# config behind — the worst case is a fully-old or fully-new host.nix.
+on_interrupt() {
+    printf '\n[install-nixos] Interrupted (SIGINT/SIGTERM).\n' >&2
+    case "$INSTALL_PHASE" in
+        preflight|configure)
+            printf '  No NixOS generation was activated — your running system is unchanged.\n' >&2
+            printf '  Any setup files written so far (under nix/ and /var/lib/theyos/secrets) are\n' >&2
+            printf '  complete, not half-written. Re-run ./install-nixos to resume (it is idempotent),\n' >&2
+            printf '  or remove nix/host.nix to start over.\n' >&2
+            ;;
+        rebuild)
+            printf '  Interrupted during nixos-rebuild. NixOS activation is atomic: if the switch\n' >&2
+            printf '  did not complete, your running system is unchanged. Re-run ./install-nixos to resume.\n' >&2
+            ;;
+        postapply)
+            printf '  theyOS was already activated; only post-install steps were interrupted.\n' >&2
+            printf '  Finish them by re-running ./install-nixos or "soyeht doctor".\n' >&2
+            ;;
+        *)
+            printf '  Re-run ./install-nixos to resume.\n' >&2
+            ;;
+    esac
+    exit 130
+}
 
 # ── Re-exec inside nix-shell if dependencies are missing ────────────────────
 
-if [ -z "${_THEYOS_IN_NIX_SHELL:-}" ]; then
-    MISSING=()
+maybe_reexec_nix_shell() {
+    [ -n "${_THEYOS_IN_NIX_SHELL:-}" ] && return 0
+    local missing=()
+    local cmd
     for cmd in git openssl; do
-        command -v "$cmd" >/dev/null 2>&1 || MISSING+=("$cmd")
+        command -v "$cmd" >/dev/null 2>&1 || missing+=("$cmd")
     done
-    if [ ${#MISSING[@]} -gt 0 ]; then
-        printf '[install-nixos] Missing: %s — entering nix-shell...\n' "${MISSING[*]}"
-        exec nix-shell -p git openssl --run "_THEYOS_IN_NIX_SHELL=1 $0 $*"
+    [ ${#missing[@]} -eq 0 ] && return 0
+    printf '[install-nixos] Missing: %s — entering nix-shell...\n' "${missing[*]}"
+    exec nix-shell -p git openssl --run "_THEYOS_IN_NIX_SHELL=1 $0 $*"
+}
+
+print_banner() {
+    printf '============================================\n'
+    printf ' theyOS NixOS installer\n'
+    printf '============================================\n\n'
+}
+
+preflight_nixos() {
+    if [ ! -f /etc/NIXOS ]; then
+        printf '[error] This script requires NixOS.\n'
+        printf '        For other Linux distros, use: ./install\n'
+        exit 1
     fi
-fi
+}
 
-printf '============================================\n'
-printf ' theyOS NixOS installer\n'
-printf '============================================\n\n'
-
-# ── Preflight ────────────────────────────────────────────────────────────────
-
-if [ ! -f /etc/NIXOS ]; then
-    printf '[error] This script requires NixOS.\n'
-    printf '        For other Linux distros, use: ./install\n'
-    exit 1
-fi
-
-# ── Enable flakes if needed ──────────────────────────────────────────────────
-
-if ! nix flake --help >/dev/null 2>&1; then
-    printf '[install-nixos] Enabling Nix flakes...\n'
-    sudo mkdir -p /etc/nix
-    if ! grep -q 'experimental-features' /etc/nix/nix.conf 2>/dev/null; then
-        echo 'experimental-features = nix-command flakes' | sudo tee -a /etc/nix/nix.conf
+enable_flakes() {
+    if ! nix flake --help >/dev/null 2>&1; then
+        printf '[install-nixos] Enabling Nix flakes...\n'
+        sudo mkdir -p /etc/nix
+        if ! grep -q 'experimental-features' /etc/nix/nix.conf 2>/dev/null; then
+            echo 'experimental-features = nix-command flakes' | sudo tee -a /etc/nix/nix.conf
+        fi
+        printf '[install-nixos] Flakes enabled. You may need to restart nix-daemon:\n'
+        printf '                sudo systemctl restart nix-daemon\n\n'
     fi
-    printf '[install-nixos] Flakes enabled. You may need to restart nix-daemon:\n'
-    printf '                sudo systemctl restart nix-daemon\n\n'
-fi
+}
 
 # ── First-run setup ──────────────────────────────────────────────────────────
 
-if [ ! -f "$NIX_DIR/host.nix" ]; then
-    printf '[install-nixos] First run detected. Setting up...\n\n'
-    mkdir -p "$NIX_DIR"
-
-    # Copy hardware config
+copy_hardware_config() {
     if [ ! -f "$NIX_DIR/hardware-configuration.nix" ]; then
         if [ -f /etc/nixos/hardware-configuration.nix ]; then
             cp /etc/nixos/hardware-configuration.nix "$NIX_DIR/hardware-configuration.nix"
@@ -57,7 +295,9 @@ if [ ! -f "$NIX_DIR/host.nix" ]; then
             exit 1
         fi
     fi
+}
 
+copy_or_generate_base_config() {
     # Copy existing NixOS configuration as the base.
     # This preserves the user's boot loader, networking, SSH, users, locale, etc.
     if [ ! -f "$NIX_DIR/base-configuration.nix" ]; then
@@ -68,6 +308,7 @@ if [ ! -f "$NIX_DIR/host.nix" ]; then
         else
             # No existing config — generate a minimal base.
             # Detect boot mode: UEFI (systemd-boot) vs BIOS (GRUB).
+            local BOOT_LOADER_LINES BOOT_DISK
             if [ -d /sys/firmware/efi ]; then
                 BOOT_LOADER_LINES='  boot.loader.systemd-boot.enable = true;
   boot.loader.efi.canTouchEfiVariables = true;'
@@ -96,7 +337,9 @@ BASEEOF
             printf '[install-nixos] Generated minimal base-configuration.nix (no existing NixOS config found)\n'
         fi
     fi
+}
 
+detect_user_or_die() {
     # Detect values. `whoami` returns `root` when this script is invoked
     # via `sudo` (which is the documented entry point); fall back to
     # SUDO_USER so the generated nix/host.nix points at the operator's
@@ -114,61 +357,62 @@ BASEEOF
     fi
     DETECTED_HOSTNAME="$(hostname)"
     DETECTED_TIMEZONE="$(timedatectl show -p Timezone --value 2>/dev/null || echo 'UTC')"
+}
 
-    # Prompt for access mode (domain is configured later via admin panel)
-    PROMPTED_DOMAIN="localhost"
-
-    printf 'How will you access theyOS?\n\n'
-    printf '  → Local only   — http://localhost:8892 (this machine only)\n'
-    printf '    Tailscale    — https://hostname.tailnet.ts.net (any device on your VPN)\n'
-    printf '\n'
-    printf '  You can change this later in nix/host.nix.\n\n'
-    printf "Press Enter for Local, or type 't' for Tailscale: "
-    ACCESS_CHOICE=""
-    if (exec </dev/tty) 2>/dev/null; then
-        read -r ACCESS_CHOICE </dev/tty || true
+apply_hostname_to_base_config() {
+    local name="$1"
+    if grep -q 'networking.hostName' "$NIX_DIR/base-configuration.nix" 2>/dev/null; then
+        sed -i "s/networking.hostName\s*=\s*\"[^\"]*\"/networking.hostName = \"$name\"/" "$NIX_DIR/base-configuration.nix"
     else
-        read -r ACCESS_CHOICE 2>/dev/null || true
+        sed -i "/^{/a\\  networking.hostName = \"$name\";" "$NIX_DIR/base-configuration.nix"
     fi
-    case "$ACCESS_CHOICE" in
-        t|T|tailscale) PROMPTED_ACCESS_MODE="tailscale" ;;
-        *)             PROMPTED_ACCESS_MODE="local" ;;
-    esac
-    printf '\n'
+}
 
-    # Ask for Tailscale hostname
-    if [ "$PROMPTED_ACCESS_MODE" = "tailscale" ]; then
-        CURRENT_HOSTNAME="$(hostname)"
-        printf 'Choose a hostname for this machine on Tailscale.\n'
-        printf 'This will appear as https://<hostname>.<tailnet>.ts.net\n\n'
-        printf "Hostname [%s]: " "$CURRENT_HOSTNAME"
-        PROMPTED_HOSTNAME=""
+resolve_hostname() {
+    local current chosen
+    current="$(hostname)"
+    if [ -n "$ARG_HOSTNAME" ]; then
+        chosen="$ARG_HOSTNAME"
+    elif has_tty; then
+        {
+            printf 'Choose a hostname for this machine on Tailscale.\n'
+            printf 'This will appear as https://<hostname>.<tailnet>.ts.net\n\n'
+            printf 'Hostname [%s]: ' "$current"
+        } >&2
+        chosen=""
         if (exec </dev/tty) 2>/dev/null; then
-            read -r PROMPTED_HOSTNAME </dev/tty || true
+            read -r chosen </dev/tty || true
         else
-            read -r PROMPTED_HOSTNAME 2>/dev/null || true
+            read -r chosen || true
         fi
-        PROMPTED_HOSTNAME="${PROMPTED_HOSTNAME:-$CURRENT_HOSTNAME}"
-        # Apply hostname to base config
-        if grep -q 'networking.hostName' "$NIX_DIR/base-configuration.nix" 2>/dev/null; then
-            sed -i "s/networking.hostName\s*=\s*\"[^\"]*\"/networking.hostName = \"$PROMPTED_HOSTNAME\"/" "$NIX_DIR/base-configuration.nix"
-        else
-            sed -i "/^{/a\\  networking.hostName = \"$PROMPTED_HOSTNAME\";" "$NIX_DIR/base-configuration.nix"
-        fi
-        printf '[install-nixos] Hostname set to: %s\n\n' "$PROMPTED_HOSTNAME"
+        chosen="${chosen:-$current}"
+    else
+        # Defaulting the hostname to the current system hostname is safe (no
+        # security or network-divergence risk), unlike defaulting the access
+        # mode. Proceed with a printed notice instead of failing.
+        chosen="$current"
+        printf '[install-nixos] No --hostname given (non-interactive); using current hostname: %s\n' "$chosen"
     fi
+    apply_hostname_to_base_config "$chosen"
+    printf '[install-nixos] Hostname set to: %s\n\n' "$chosen"
+}
 
-    # Generate nix/host.nix from template
+generate_host_nix() {
+    # Atomic write: render into a temp file in the same directory, then rename.
+    # An interrupt during rendering can never leave a half-written host.nix that
+    # would break flake evaluation.
+    local tmp
+    tmp="$(mktemp "$NIX_DIR/.host.nix.XXXXXX")"
     sed \
         -e "s|«DETECTED_USER»|$CURRENT_USER|g" \
         -e "s|«PROMPTED_DOMAIN»|$PROMPTED_DOMAIN|g" \
-        -e "s|«PROMPTED_ACCESS_MODE»|$PROMPTED_ACCESS_MODE|g" \
-        "$NIX_DIR/host.nix.template" > "$NIX_DIR/host.nix"
+        -e "s|«PROMPTED_ACCESS_MODE»|$ACCESS_MODE|g" \
+        "$NIX_DIR/host.nix.template" > "$tmp"
+    mv -f "$tmp" "$NIX_DIR/host.nix"
+    printf '[install-nixos] Generated nix/host.nix (accessMode=%s)\n' "$ACCESS_MODE"
+}
 
-    printf '[install-nixos] Generated nix/host.nix\n'
-
-    # Generate secrets
-    FIRST_INSTALL=1
+generate_secrets() {
     sudo mkdir -p /var/lib/theyos/secrets
     if [ ! -f /var/lib/theyos/secrets/admin-password ]; then
         ADMIN_PASS="$(openssl rand -base64 16)"
@@ -182,28 +426,58 @@ BASEEOF
     else
         printf '[install-nixos] Secrets already exist in /var/lib/theyos/secrets/\n'
     fi
+}
 
-    # Back up existing config
+backup_existing_config() {
     if [ -f /etc/nixos/configuration.nix ]; then
-        BACKUP="/etc/nixos/configuration.nix.pre-theyos"
+        local BACKUP="/etc/nixos/configuration.nix.pre-theyos"
         if [ ! -f "$BACKUP" ]; then
             sudo cp /etc/nixos/configuration.nix "$BACKUP"
             printf '[install-nixos] Backed up /etc/nixos/configuration.nix to %s\n' "$BACKUP"
         fi
     fi
+}
+
+first_run_setup() {
+    printf '[install-nixos] First run detected. Setting up...\n\n'
+    mkdir -p "$NIX_DIR"
+
+    copy_hardware_config
+    copy_or_generate_base_config
+    detect_user_or_die
+
+    # domain is configured later via admin panel
+    PROMPTED_DOMAIN="localhost"
+
+    # Resolve access mode: explicit flag > interactive prompt > fail loudly on
+    # a non-interactive first run. Under `set -e`, a non-zero return here
+    # (no-TTY/no-flag, or conflict) aborts the install with the message above.
+    ACCESS_MODE="$(resolve_access_mode)"
+
+    if [ "$ACCESS_MODE" = "tailscale" ]; then
+        resolve_hostname
+    fi
+
+    generate_host_nix
+    generate_secrets
+    backup_existing_config
 
     printf '\n'
-fi
+}
 
 # ── Ensure passwordless sudo (idempotent, covers upgrades) ──────────────────
-_SUDO_USER="$(whoami)"
-_SUDOERS_FILE="/etc/sudoers.d/theyos-${_SUDO_USER}"
-if [ ! -f "$_SUDOERS_FILE" ]; then
-    printf '[install-nixos] Configuring passwordless sudo for %s ...\n' "$_SUDO_USER"
-    sudo mkdir -p /etc/sudoers.d
-    printf '%s ALL=(ALL) NOPASSWD: ALL\n' "$_SUDO_USER" | sudo tee "$_SUDOERS_FILE" > /dev/null
-    sudo chmod 440 "$_SUDOERS_FILE"
-fi
+
+configure_sudo() {
+    local sudo_user sudoers_file
+    sudo_user="$(whoami)"
+    sudoers_file="/etc/sudoers.d/theyos-${sudo_user}"
+    if [ ! -f "$sudoers_file" ]; then
+        printf '[install-nixos] Configuring passwordless sudo for %s ...\n' "$sudo_user"
+        sudo mkdir -p /etc/sudoers.d
+        printf '%s ALL=(ALL) NOPASSWD: ALL\n' "$sudo_user" | sudo tee "$sudoers_file" > /dev/null
+        sudo chmod 440 "$sudoers_file"
+    fi
+}
 
 # ── Bootloader auto-fix: BIOS vs UEFI ───────────────────────────────────────
 # /sys/firmware/efi exists only on UEFI-booted systems.  If the machine is BIOS
@@ -212,53 +486,52 @@ fi
 # kernel boot, etc.) continues to work.  Trying to install a different
 # bootloader is fragile (GPT without BIOS Boot Partition, missing EFI, etc.).
 
-if [ ! -d /sys/firmware/efi ]; then
-    if grep -qE 'systemd-boot\.enable\s*=\s*true' "$NIX_DIR/base-configuration.nix" 2>/dev/null; then
-        printf '[install-nixos] Detected BIOS boot (no UEFI firmware).\n'
-        printf '[install-nixos] Disabling bootloader management (existing boot mechanism preserved).\n'
-        sed -i \
-            -e 's/boot\.loader\.systemd-boot\.enable\s*=\s*true/boot.loader.systemd-boot.enable = false/' \
-            -e '/boot\.loader\.efi\.canTouchEfiVariables/d' \
-            "$NIX_DIR/base-configuration.nix"
-        # NixOS defaults grub.enable=true on non-containers; explicitly disable it.
-        if ! grep -q 'boot\.loader\.grub\.enable' "$NIX_DIR/base-configuration.nix"; then
-            sed -i "/boot\.loader\.systemd-boot\.enable/a\\  boot.loader.grub.enable = false;" \
+bootloader_autofix() {
+    if [ ! -d /sys/firmware/efi ]; then
+        if grep -qE 'systemd-boot\.enable\s*=\s*true' "$NIX_DIR/base-configuration.nix" 2>/dev/null; then
+            printf '[install-nixos] Detected BIOS boot (no UEFI firmware).\n'
+            printf '[install-nixos] Disabling bootloader management (existing boot mechanism preserved).\n'
+            sed -i \
+                -e 's/boot\.loader\.systemd-boot\.enable\s*=\s*true/boot.loader.systemd-boot.enable = false/' \
+                -e '/boot\.loader\.efi\.canTouchEfiVariables/d' \
                 "$NIX_DIR/base-configuration.nix"
+            # NixOS defaults grub.enable=true on non-containers; explicitly disable it.
+            if ! grep -q 'boot\.loader\.grub\.enable' "$NIX_DIR/base-configuration.nix"; then
+                sed -i "/boot\.loader\.systemd-boot\.enable/a\\  boot.loader.grub.enable = false;" \
+                    "$NIX_DIR/base-configuration.nix"
+            fi
+            printf '\n'
         fi
-        printf '\n'
     fi
-fi
+}
 
 # ── Ensure flake files are tracked by git ────────────────────────────────────
 
-# Nix flakes require all referenced files to be tracked by git.
-# Committed files just need --intent-to-add if not yet tracked.
-git -C "$REPO_DIR" add --intent-to-add \
-    flake.nix \
-    nix/module.nix \
-    nix/packages/firecracker.nix \
-    nix/packages/rust-workspace.nix \
-    nix/packages/frontend.nix \
-    nix/packages/kernel.nix \
-    nix/packages/firecracker-kernel-x86_64.config \
-    nix/host.nix.template \
-    2>/dev/null || true
+git_track_flake_files() {
+    # Nix flakes require all referenced files to be tracked by git.
+    # Committed files just need --intent-to-add if not yet tracked.
+    git -C "$REPO_DIR" add --intent-to-add \
+        flake.nix \
+        nix/module.nix \
+        nix/packages/firecracker.nix \
+        nix/packages/rust-workspace.nix \
+        nix/packages/frontend.nix \
+        nix/packages/kernel.nix \
+        nix/packages/firecracker-kernel-x86_64.config \
+        nix/host.nix.template \
+        2>/dev/null || true
 
-# Machine-specific files are gitignored — use -f to force-add them so the
-# flake can see their content. They won't be accidentally committed because
-# .gitignore prevents `git add .` from re-adding them after a reset.
-git -C "$REPO_DIR" add -f \
-    nix/host.nix \
-    nix/hardware-configuration.nix \
-    nix/base-configuration.nix \
-    2>/dev/null || true
+    # Machine-specific files are gitignored — use -f to force-add them so the
+    # flake can see their content. They won't be accidentally committed because
+    # .gitignore prevents `git add .` from re-adding them after a reset.
+    git -C "$REPO_DIR" add -f \
+        nix/host.nix \
+        nix/hardware-configuration.nix \
+        nix/base-configuration.nix \
+        2>/dev/null || true
+}
 
 # ── Bootloader preflight ──────────────────────────────────────────────────────
-
-NIXOS_FLAKE="${REPO_DIR}#theyos"
-# nix eval requires the full attribute path (nixosConfigurations.theyos.config...),
-# whereas nixos-rebuild --flake .#theyos auto-resolves to nixosConfigurations.
-NIXOS_EVAL_PREFIX="${REPO_DIR}#nixosConfigurations.theyos"
 
 ensure_efi_mountpoint() {
     local systemd_boot grub_enabled grub_efi_support efi_mount
@@ -299,7 +572,12 @@ verify_ai_cli_tools() {
     for cli in claude codex opencode; do
         printf '[install-nixos] Verified %s: ' "$cli"
         if ! "/run/current-system/sw/bin/${cli}" --version; then
-            printf '[error] %s is missing or failed to report its version.\n' "$cli"
+            printf '\n[error] %s is not available in the active system profile.\n' "$cli" >&2
+            printf '        This usually means the theyOS NixOS module did not activate cleanly\n' >&2
+            printf '        (a failed unit, or a stale configuration). Try:\n' >&2
+            printf '          systemctl --failed                              # find failed units\n' >&2
+            printf '          sudo nixos-rebuild switch --flake %s\n' "$NIXOS_FLAKE" >&2
+            printf '        If you just ran "soyeht uninstall", re-run ./install-nixos to reinstall the module.\n' >&2
             return 1
         fi
     done
@@ -307,215 +585,270 @@ verify_ai_cli_tools() {
 
 # ── Build and apply ──────────────────────────────────────────────────────────
 
-ensure_efi_mountpoint
+build_and_apply() {
+    ensure_efi_mountpoint
 
-printf '[install-nixos] Building NixOS configuration...\n'
-printf '[install-nixos] First build may take 20-30 minutes (Rust workspace + kernel compilation).\n'
-printf '[install-nixos] Subsequent builds are much faster (Nix caches dependencies).\n\n'
+    printf '[install-nixos] Building NixOS configuration...\n'
+    printf '[install-nixos] First build may take 20-30 minutes (Rust workspace + kernel compilation).\n'
+    printf '[install-nixos] Subsequent builds are much faster (Nix caches dependencies).\n'
+    printf '[install-nixos] nixos-rebuild streams its own build progress below; Ctrl-C is safe\n'
+    printf '[install-nixos] until activation completes (the switch is atomic).\n\n'
 
-# nixos-rebuild switch installs the bootloader AND activates services.
-# On some machines (BIOS+GPT without BIOS Boot Partition, QEMU direct-kernel boot),
-# the bootloader step fails but service activation still completes.
-# Detect this case and continue with a warning instead of aborting.
-set +e
-sudo nixos-rebuild switch --flake "$NIXOS_FLAKE"
-REBUILD_RC=$?
-set -e
+    # nixos-rebuild switch installs the bootloader AND activates services.
+    # On some machines (BIOS+GPT without BIOS Boot Partition, QEMU direct-kernel boot),
+    # the bootloader step fails but service activation still completes.
+    # Detect this case and continue with a warning instead of aborting.
+    set +e
+    sudo nixos-rebuild switch --flake "$NIXOS_FLAKE"
+    REBUILD_RC=$?
+    set -e
 
-REBUILD_WARNING=false
-if [ "$REBUILD_RC" -ne 0 ]; then
-    # switch-to-configuration may exit non-zero if some units failed to start
-    # (exit 4) or the bootloader couldn't be installed. If theyOS was activated
-    # (soyeht binary exists in the new system), treat as success with warning.
-    if [ -x /run/current-system/sw/bin/soyeht ]; then
-        REBUILD_WARNING=true
-        printf '\n[install-nixos] WARNING: nixos-rebuild exited with warnings (exit code %d).\n' "$REBUILD_RC"
-        printf '[install-nixos] theyOS services are active. Some non-critical units may have failed.\n'
-        printf '[install-nixos] Run "systemctl --failed" to check.\n'
-    else
-        printf '\n[install-nixos] nixos-rebuild failed.\n'
-        exit 1
-    fi
-fi
-
-# ── Post-apply: ensure /dev/kvm is accessible ────────────────────────────────
-# The module sets a udev rule (MODE="0666") for /dev/kvm, but it only takes
-# effect after a udev reload+trigger or reboot. Apply it immediately.
-
-if [ -e /dev/kvm ]; then
-    sudo udevadm control --reload-rules 2>/dev/null || true
-    sudo udevadm trigger /dev/kvm 2>/dev/null || true
-    # Fallback: set permissions directly if udev didn't apply yet
-    if [ ! -w /dev/kvm ]; then
-        sudo chmod 666 /dev/kvm 2>/dev/null || true
-    fi
-fi
-
-# ── Post-apply: verify .env exists ───────────────────────────────────────────
-# The NixOS module creates .env via an activation script. If it failed for any
-# reason, create it here as a fallback so artifacts-sync can find the admin
-# password.
-
-if [ ! -f "$REPO_DIR/.env" ]; then
-    printf '[install-nixos] .env not found — creating from secrets (fallback)...\n'
-    _PW="$(sudo cat /var/lib/theyos/secrets/admin-password 2>/dev/null || true)"
-    _PP="$(sudo cat /var/lib/theyos/secrets/session-pepper 2>/dev/null || true)"
-    CURRENT_USER="$(whoami)"
-    # Read values from host.nix so the fallback matches the module's .env
-    _DOMAIN="$(sed -n 's/.*domain\s*=\s*"\([^"]*\)".*/\1/p' "$NIX_DIR/host.nix" 2>/dev/null || echo "localhost")"
-    _ACCESS="$(sed -n 's/.*accessMode\s*=\s*"\([^"]*\)".*/\1/p' "$NIX_DIR/host.nix" 2>/dev/null || echo "${PROMPTED_ACCESS_MODE:-local}")"
-    _USER="$(sed -n 's/.*user\s*=\s*"\([^"]*\)".*/\1/p' "$NIX_DIR/host.nix" 2>/dev/null || echo "$CURRENT_USER")"
-    _PORT="$(sed -n 's/.*adminPort\s*=\s*\([0-9]*\).*/\1/p' "$NIX_DIR/host.nix" 2>/dev/null || echo "8892")"
-    [ -z "$_PORT" ] && _PORT="8892"
-    [ -z "$_USER" ] && _USER="$CURRENT_USER"
-    if [ -n "$_PW" ] && [ -n "$_PP" ]; then
-        # Use the same renderer as the NixOS module activation script.
-        THEYOS_DIR="$REPO_DIR" /run/current-system/sw/bin/soyeht render-env \
-            --template "$REPO_DIR/.env.example" \
-            --set "SOYEHT_ADMIN_USER=admin" \
-            --set "SOYEHT_ADMIN_PASSWORD=$_PW" \
-            --set "THEYOS_SESSION_PEPPER=$_PP" \
-            --set "THEYOS_HOME=/home/$_USER" \
-            --set "ACCESS_MODE=$_ACCESS" \
-            --set "ADMIN_PORT=$_PORT" \
-            --set "THEYOS_BASE_DOMAIN=$_DOMAIN" \
-            --output "$REPO_DIR/.env"
-    else
-        printf '[install-nixos] WARNING: Could not read secrets. Re-run ./install-nixos to retry.\n'
-    fi
-fi
-
-# ── Post-apply: verify AI CLIs from the active system profile ────────────────
-
-verify_ai_cli_tools
-
-# ── Post-apply ───────────────────────────────────────────────────────────────
-
-printf '\n============================================\n'
-printf ' theyOS installed successfully!\n'
-printf '============================================\n\n'
-
-# Always show the admin password (read from file if not set in this run)
-if [ -z "${ADMIN_PASS:-}" ] && [ -f /var/lib/theyos/secrets/admin-password ]; then
-    ADMIN_PASS="$(sudo cat /var/lib/theyos/secrets/admin-password 2>/dev/null || true)"
-fi
-if [ -n "${ADMIN_PASS:-}" ]; then
-    printf '  ########################################################\n'
-    printf '  #                                                      #\n'
-    printf '  #  Admin credentials:                                  #\n'
-    printf '  #    User:     admin                                   #\n'
-    printf '  #    Password: %-40s#\n' "$ADMIN_PASS"
-    printf '  #                                                      #\n'
-    printf '  #  To view later:                                      #\n'
-    printf '  #  sudo cat /var/lib/theyos/secrets/admin-password     #\n'
-    printf '  #                                                      #\n'
-    printf '  ########################################################\n\n'
-fi
-
-printf '  Admin panel:  http://localhost:8892\n'
-printf '  Claw Store:   http://localhost:8892/claws  (install claw types here)\n'
-printf '  CLI:          soyeht --help\n'
-printf '  Diagnostics:  soyeht doctor\n'
-printf '  Logs:         soyeht logs\n\n'
-printf '  Fresh installs start with zero claws.\n'
-printf '  Open the Claw Store to install the claw types you need.\n\n'
-
-# Detect access mode from host.nix (set during first install or re-read on re-runs)
-DETECTED_ACCESS_MODE="${PROMPTED_ACCESS_MODE:-}"
-if [ -z "$DETECTED_ACCESS_MODE" ] && [ -f "$NIX_DIR/host.nix" ]; then
-    DETECTED_ACCESS_MODE="$(sed -n 's/.*accessMode\s*=\s*"\([^"]*\)".*/\1/p' "$NIX_DIR/host.nix" 2>/dev/null || true)"
-fi
-
-if [ "$DETECTED_ACCESS_MODE" = "tailscale" ]; then
-    # ── Tailscale setup ─────────────────────────────────────────────────────
-    TS_AUTHENTICATED=false
-
-    if command -v tailscale >/dev/null 2>&1; then
-        # Check if already authenticated
-        if tailscale status >/dev/null 2>&1; then
-            TS_AUTHENTICATED=true
+    REBUILD_WARNING=false
+    if [ "$REBUILD_RC" -ne 0 ]; then
+        # switch-to-configuration may exit non-zero if some units failed to start
+        # (exit 4) or the bootloader couldn't be installed. If theyOS was activated
+        # (soyeht binary exists in the new system), treat as success with warning.
+        if [ -x /run/current-system/sw/bin/soyeht ]; then
+            REBUILD_WARNING=true
+            printf '\n[install-nixos] WARNING: nixos-rebuild exited with warnings (exit code %d).\n' "$REBUILD_RC"
+            printf '[install-nixos] theyOS services are active. Some non-critical units may have failed.\n'
+            printf '[install-nixos] Run "systemctl --failed" to check.\n'
         else
-            printf '  Connecting to Tailscale...\n'
-            printf '  A browser link will appear — visit it to authenticate.\n\n'
-            if (exec </dev/tty) 2>/dev/null; then
-                sudo tailscale up </dev/tty
-            else
-                sudo tailscale up
-            fi
+            printf '\n[install-nixos] nixos-rebuild failed.\n'
+            exit 1
+        fi
+    fi
+}
+
+# ── Post-apply ─────────────────────────────────────────────────────────────
+
+post_apply() {
+    # ── ensure /dev/kvm is accessible ────────────────────────────────────────
+    # The module sets a udev rule (MODE="0666") for /dev/kvm, but it only takes
+    # effect after a udev reload+trigger or reboot. Apply it immediately.
+    if [ -e /dev/kvm ]; then
+        sudo udevadm control --reload-rules 2>/dev/null || true
+        sudo udevadm trigger /dev/kvm 2>/dev/null || true
+        # Fallback: set permissions directly if udev didn't apply yet
+        if [ ! -w /dev/kvm ]; then
+            sudo chmod 666 /dev/kvm 2>/dev/null || true
+        fi
+    fi
+
+    # ── verify .env exists ───────────────────────────────────────────────────
+    # The NixOS module creates .env via an activation script. If it failed for any
+    # reason, create it here as a fallback so artifacts-sync can find the admin
+    # password.
+    if [ ! -f "$REPO_DIR/.env" ]; then
+        printf '[install-nixos] .env not found — creating from secrets (fallback)...\n'
+        local _PW _PP _DOMAIN _ACCESS _USER _PORT
+        _PW="$(sudo cat /var/lib/theyos/secrets/admin-password 2>/dev/null || true)"
+        _PP="$(sudo cat /var/lib/theyos/secrets/session-pepper 2>/dev/null || true)"
+        CURRENT_USER="$(whoami)"
+        # Read values from host.nix so the fallback matches the module's .env
+        _DOMAIN="$(sed -n 's/.*domain\s*=\s*"\([^"]*\)".*/\1/p' "$NIX_DIR/host.nix" 2>/dev/null || echo "localhost")"
+        _ACCESS="$(sed -n 's/.*accessMode\s*=\s*"\([^"]*\)".*/\1/p' "$NIX_DIR/host.nix" 2>/dev/null || echo "${ACCESS_MODE:-local}")"
+        _USER="$(sed -n 's/.*user\s*=\s*"\([^"]*\)".*/\1/p' "$NIX_DIR/host.nix" 2>/dev/null || echo "$CURRENT_USER")"
+        _PORT="$(sed -n 's/.*adminPort\s*=\s*\([0-9]*\).*/\1/p' "$NIX_DIR/host.nix" 2>/dev/null || echo "8892")"
+        [ -z "$_PORT" ] && _PORT="8892"
+        [ -z "$_USER" ] && _USER="$CURRENT_USER"
+        if [ -n "$_PW" ] && [ -n "$_PP" ]; then
+            # Use the same renderer as the NixOS module activation script.
+            THEYOS_DIR="$REPO_DIR" /run/current-system/sw/bin/soyeht render-env \
+                --template "$REPO_DIR/.env.example" \
+                --set "SOYEHT_ADMIN_USER=admin" \
+                --set "SOYEHT_ADMIN_PASSWORD=$_PW" \
+                --set "THEYOS_SESSION_PEPPER=$_PP" \
+                --set "THEYOS_HOME=/home/$_USER" \
+                --set "ACCESS_MODE=$_ACCESS" \
+                --set "ADMIN_PORT=$_PORT" \
+                --set "THEYOS_BASE_DOMAIN=$_DOMAIN" \
+                --output "$REPO_DIR/.env"
+        else
+            printf '[install-nixos] WARNING: Could not read secrets. Re-run ./install-nixos to retry.\n'
+        fi
+    fi
+
+    # ── verify AI CLIs from the active system profile ────────────────────────
+    verify_ai_cli_tools
+
+    printf '\n============================================\n'
+    printf ' theyOS installed successfully!\n'
+    printf '============================================\n\n'
+
+    # Always show the admin password (read from file if not set in this run)
+    if [ -z "${ADMIN_PASS:-}" ] && [ -f /var/lib/theyos/secrets/admin-password ]; then
+        ADMIN_PASS="$(sudo cat /var/lib/theyos/secrets/admin-password 2>/dev/null || true)"
+    fi
+    if [ -n "${ADMIN_PASS:-}" ]; then
+        printf '  ########################################################\n'
+        printf '  #                                                      #\n'
+        printf '  #  Admin credentials:                                  #\n'
+        printf '  #    User:     admin                                   #\n'
+        printf '  #    Password: %-40s#\n' "$ADMIN_PASS"
+        printf '  #                                                      #\n'
+        printf '  #  To view later:                                      #\n'
+        printf '  #  sudo cat /var/lib/theyos/secrets/admin-password     #\n'
+        printf '  #                                                      #\n'
+        printf '  ########################################################\n\n'
+    fi
+
+    printf '  Admin panel:  http://localhost:8892\n'
+    printf '  Claw Store:   http://localhost:8892/claws  (install claw types here)\n'
+    printf '  CLI:          soyeht --help\n'
+    printf '  Diagnostics:  soyeht doctor\n'
+    printf '  Logs:         soyeht logs\n\n'
+    printf '  Fresh installs start with zero claws.\n'
+    printf '  Open the Claw Store to install the claw types you need.\n\n'
+
+    # Detect access mode from host.nix (set during first install or re-read on re-runs)
+    local DETECTED_ACCESS_MODE="${ACCESS_MODE:-}"
+    if [ -z "$DETECTED_ACCESS_MODE" ] && [ -f "$NIX_DIR/host.nix" ]; then
+        DETECTED_ACCESS_MODE="$(read_host_access_mode)"
+    fi
+
+    if [ "$DETECTED_ACCESS_MODE" = "tailscale" ]; then
+        # ── Tailscale setup ─────────────────────────────────────────────────────
+        local TS_AUTHENTICATED=false TS_HOSTNAME
+
+        if command -v tailscale >/dev/null 2>&1; then
+            # Check if already authenticated
             if tailscale status >/dev/null 2>&1; then
                 TS_AUTHENTICATED=true
-                printf '\n'
             else
-                printf '\n  [!] Tailscale authentication failed or was skipped.\n'
-                printf '      Run "sudo tailscale up" later to connect.\n\n'
+                printf '  Connecting to Tailscale...\n'
+                printf '  A browser link will appear — visit it to authenticate.\n\n'
+                if (exec </dev/tty) 2>/dev/null; then
+                    sudo tailscale up </dev/tty
+                else
+                    sudo tailscale up
+                fi
+                if tailscale status >/dev/null 2>&1; then
+                    TS_AUTHENTICATED=true
+                    printf '\n'
+                else
+                    printf '\n  [!] Tailscale authentication failed or was skipped.\n'
+                    printf '      Run "sudo tailscale up" later to connect.\n\n'
+                fi
             fi
         fi
-    fi
 
-    if [ "$TS_AUTHENTICATED" = true ]; then
-        # Enable HTTPS reverse proxy via tailscale serve (persists across reboots)
-        sudo tailscale serve --bg 8892 2>/dev/null || true
+        if [ "$TS_AUTHENTICATED" = true ]; then
+            # Enable HTTPS reverse proxy via tailscale serve (persists across reboots)
+            sudo tailscale serve --bg 8892 2>/dev/null || true
 
-        TS_HOSTNAME="$(tailscale status --json 2>/dev/null | sed -n 's/.*"DNSName":\s*"\([^"]*\)".*/\1/p' | head -1 | sed 's/\.$//')"
-        if [ -n "$TS_HOSTNAME" ]; then
-            printf '  Tailscale:    https://%s\n' "$TS_HOSTNAME"
-            printf '                (accessible from any device on your tailnet)\n\n'
+            TS_HOSTNAME="$(tailscale status --json 2>/dev/null | sed -n 's/.*"DNSName":\s*"\([^"]*\)".*/\1/p' | head -1 | sed 's/\.$//')"
+            if [ -n "$TS_HOSTNAME" ]; then
+                printf '  Tailscale:    https://%s\n' "$TS_HOSTNAME"
+                printf '                (accessible from any device on your tailnet)\n\n'
+            else
+                printf '  Tailscale:    connected (run "tailscale status" for URL)\n\n'
+            fi
         else
-            printf '  Tailscale:    connected (run "tailscale status" for URL)\n\n'
+            printf '  ########################################################\n'
+            printf '  #  Tailscale: authenticate to connect to your tailnet  #\n'
+            printf '  #                                                      #\n'
+            printf '  #  Run:  sudo tailscale up                             #\n'
+            printf '  #  Then: sudo tailscale serve --bg 8892                #\n'
+            printf '  #                                                      #\n'
+            printf '  #  Access: https://<hostname>.<tailnet>.ts.net         #\n'
+            printf '  ########################################################\n\n'
+        fi
+    fi
+
+    # ── Mobile app pairing QR code ─────────────────────────────────────────────
+    if command -v soyeht >/dev/null 2>&1; then
+        # Wait for admin backend to be ready (up to 30 seconds)
+        printf '  Waiting for admin backend...'
+        local HEALTH_OK=false i
+        for i in $(seq 1 30); do
+            if curl -sf http://localhost:8892/healthz >/dev/null 2>&1; then
+                HEALTH_OK=true
+                break
+            fi
+            sleep 1
+            printf '.'
+        done
+        printf '\n\n'
+
+        if [ "$HEALTH_OK" = true ]; then
+            printf '  ########################################################\n'
+            printf '  #  Scan to pair your mobile app with this server:      #\n'
+            printf '  ########################################################\n\n'
+            THEYOS_DIR="$REPO_DIR" soyeht pair 2>/dev/null || printf '  [!] QR code generation failed.\n      Run "soyeht pair" later to pair your mobile app.\n\n'
+        else
+            printf '  [!] Admin backend not ready yet.\n'
+            printf '      Run "soyeht pair" later to pair your mobile app.\n\n'
         fi
     else
-        printf '  ########################################################\n'
-        printf '  #  Tailscale: authenticate to connect to your tailnet  #\n'
-        printf '  #                                                      #\n'
-        printf '  #  Run:  sudo tailscale up                             #\n'
-        printf '  #  Then: sudo tailscale serve --bg 8892                #\n'
-        printf '  #                                                      #\n'
-        printf '  #  Access: https://<hostname>.<tailnet>.ts.net         #\n'
-        printf '  ########################################################\n\n'
+        printf '  [i] Run "soyeht pair" to connect your mobile app.\n\n'
     fi
-fi
 
-# ── Mobile app pairing QR code ─────────────────────────────────────────────
-if command -v soyeht >/dev/null 2>&1; then
-    # Wait for admin backend to be ready (up to 30 seconds)
-    printf '  Waiting for admin backend...'
-    HEALTH_OK=false
-    for i in $(seq 1 30); do
-        if curl -sf http://localhost:8892/healthz >/dev/null 2>&1; then
-            HEALTH_OK=true
-            break
-        fi
-        sleep 1
-        printf '.'
-    done
-    printf '\n\n'
+    # Check rootfs (may still be building in background oneshot)
+    if systemctl is-active --quiet theyos-rootfs-build 2>/dev/null; then
+        printf '  [i] Base rootfs is being built in background.\n'
+        printf '      Check progress: systemctl status theyos-rootfs-build\n\n'
+    elif [ ! -f "$HOME/firecracker/assets/ubuntu-24.04-rootfs-v2.ext4" ]; then
+        printf '  [i] Base rootfs build will start automatically (systemd oneshot).\n'
+        printf '      Check progress: systemctl status theyos-rootfs-build\n\n'
+    fi
 
-    if [ "$HEALTH_OK" = true ]; then
-        printf '  ########################################################\n'
-        printf '  #  Scan to pair your mobile app with this server:      #\n'
-        printf '  ########################################################\n\n'
-        THEYOS_DIR="$REPO_DIR" soyeht pair 2>/dev/null || printf '  [!] QR code generation failed.\n      Run "soyeht pair" later to pair your mobile app.\n\n'
+    if [ "$REBUILD_WARNING" = true ]; then
+        printf '  [!] Some non-critical services failed during activation.\n'
+        printf '      Run "systemctl --failed" to see which ones.\n'
+        printf '      theyOS core services are running normally.\n\n'
+    fi
+
+    printf '  Run "soyeht doctor" to verify the full setup.\n\n'
+}
+
+# ── Orchestration ────────────────────────────────────────────────────────────
+
+run_install() {
+    INSTALL_PHASE="configure"
+
+    if [ -f "$NIX_DIR/host.nix" ]; then
+        # Reuse path: respect the existing config, surface it, and reject a
+        # contradicting --access-mode (resolve_access_mode returns non-zero →
+        # set -e aborts with a clear message).
+        ACCESS_MODE="$(resolve_access_mode)"
+        printf '[install-nixos] Reusing existing nix/host.nix (accessMode=%s)\n\n' "$ACCESS_MODE"
     else
-        printf '  [!] Admin backend not ready yet.\n'
-        printf '      Run "soyeht pair" later to pair your mobile app.\n\n'
+        first_run_setup
     fi
-else
-    printf '  [i] Run "soyeht pair" to connect your mobile app.\n\n'
-fi
 
-# Check rootfs (may still be building in background oneshot)
-if systemctl is-active --quiet theyos-rootfs-build 2>/dev/null; then
-    printf '  [i] Base rootfs is being built in background.\n'
-    printf '      Check progress: systemctl status theyos-rootfs-build\n\n'
-elif [ ! -f "$HOME/firecracker/assets/ubuntu-24.04-rootfs-v2.ext4" ]; then
-    printf '  [i] Base rootfs build will start automatically (systemd oneshot).\n'
-    printf '      Check progress: systemctl status theyos-rootfs-build\n\n'
-fi
+    configure_sudo
+    bootloader_autofix
+    git_track_flake_files
 
-if [ "$REBUILD_WARNING" = true ]; then
-    printf '  [!] Some non-critical services failed during activation.\n'
-    printf '      Run "systemctl --failed" to see which ones.\n'
-    printf '      theyOS core services are running normally.\n\n'
-fi
+    INSTALL_PHASE="rebuild"
+    build_and_apply
 
-printf '  Run "soyeht doctor" to verify the full setup.\n\n'
+    INSTALL_PHASE="postapply"
+    post_apply
+}
+
+main() {
+    set -euo pipefail
+
+    parse_args "$@"
+
+    if [ "$DRY_RUN" = true ]; then
+        print_banner
+        print_dry_run_plan
+        exit 0
+    fi
+
+    maybe_reexec_nix_shell "$@"
+    print_banner
+    preflight_nixos
+    enable_flakes
+
+    trap on_interrupt INT TERM
+    run_install
+}
+
+# When sourced in library-only mode (tests), define functions but do not run.
+if [ -z "${THEYOS_INSTALL_LIB_ONLY:-}" ]; then
+    main "$@"
+fi
