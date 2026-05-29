@@ -28,7 +28,7 @@
 //! | CleanupSystemd  | container                                                           |
 //! | CleanupFs       | claw_type, name, state_dir                                         |
 //! | FetchLogs       | container, state_dir, ssh_key, tail                                |
-//! | TakeBaseSnapshot| container, claw_type, state_dir, ssh_key                           |
+//! | TakeBaseSnapshot| container, claw_type, state_dir, kernel_image, ssh_key             |
 //! | WarmPoolInit    | state_dir, firecracker_bin, kernel_image, base_rootfs,             |
 //! |                 | ssh_key, ssh_pubkey                                                |
 //! | WarmPoolRefill  | claw_type, state_dir, firecracker_bin, kernel_image,               |
@@ -355,9 +355,18 @@ async fn handle_take_base_snapshot(params: &Value) -> Response {
         Some(v) if !v.is_empty() => PathBuf::from(v),
         _ => return Response::err("ssh_key is required"),
     };
+    let kernel_image = params["kernel_image"]
+        .as_str()
+        .filter(|s| !s.is_empty())
+        .map(PathBuf::from);
 
     let mut env = minimal_env(state_dir);
     env.ssh_key = ssh_key;
+    if let Some(kernel_image) = kernel_image {
+        env.kernel_image = kernel_image;
+    } else if let Ok(default_env) = VmEnv::from_env() {
+        env.kernel_image = default_env.kernel_image;
+    }
     let runner = VmRunner { env };
     match runner.take_base_snapshot(&container, &claw_type).await {
         Ok(()) => Response::ok(serde_json::json!({"snapshot_taken": true})),

@@ -351,11 +351,13 @@ fn run_snap(client: AdminClient, args: SnapshotArgs, ssh_key: PathBuf, state_dir
     let assets_dir = args
         .assets_dir
         .unwrap_or_else(|| PathBuf::from(&home).join("firecracker/assets"));
+    let kernel_image = assets_dir.join("vmlinux-6.1.155");
 
     let config = SnapshotConfig {
         vmrunner_bin,
         state_dir,
         assets_dir,
+        kernel_image,
         ssh_key,
         force: args.force,
         settle: Duration::from_secs(args.settle),

@@ -28,6 +28,8 @@
 //! | `FIRECRACKER_BASE_ROOTFS`         | `~/firecracker/assets/ubuntu-24.04-rootfs-v2.ext4` |
 //! | `FIRECRACKER_SSH_KEY`             | `~/firecracker/assets/ubuntu-24.04-root.id_rsa` |
 //! | `SLIRP4NETNS_BIN`                 | auto-resolved                         |
+//! | `THEYOS_IMAGEBUILDER_VCPUS`       | `2`                                   |
+//! | `THEYOS_IMAGEBUILDER_MEM_MIB`     | `12288`                               |
 
 mod imagebuild;
 
@@ -38,6 +40,9 @@ use clap::{Parser, Subcommand};
 
 use imagebuild::artifacts::{all_claws, file_size_human, golden_image_path, image_age_days};
 use imagebuild::runner::{BuildContext, build_golden_image, stale_reason, verify_golden_image};
+
+const DEFAULT_IMAGEBUILDER_VCPUS: u32 = 2;
+const DEFAULT_IMAGEBUILDER_MEM_MIB: u32 = 12288;
 
 // ── CLI ───────────────────────────────────────────────────────────────────────
 
@@ -632,9 +637,32 @@ fn make_build_context(repo_root: &Path, home: &str, assets_dir: &Path) -> BuildC
         firecracker_bin: fc_bin,
         kernel_image: kernel,
         slirp_bin,
-        vcpu_count: 2,
-        mem_mib: 4096,
+        vcpu_count: env_u32("THEYOS_IMAGEBUILDER_VCPUS", DEFAULT_IMAGEBUILDER_VCPUS),
+        mem_mib: env_u32("THEYOS_IMAGEBUILDER_MEM_MIB", DEFAULT_IMAGEBUILDER_MEM_MIB),
         repo_root: repo_root.to_path_buf(),
+    }
+}
+
+fn env_u32(name: &str, default: u32) -> u32 {
+    match std::env::var(name) {
+        Ok(raw) => {
+            if let Some(value) = parse_env_u32(&raw) {
+                value
+            } else {
+                eprintln!(
+                    "[imagebuilder] ignoring invalid {name}={raw:?}; using default {default}"
+                );
+                default
+            }
+        }
+        Err(_) => default,
+    }
+}
+
+fn parse_env_u32(raw: &str) -> Option<u32> {
+    match raw.trim().parse::<u32>() {
+        Ok(value) if value > 0 => Some(value),
+        _ => None,
     }
 }
 
@@ -756,6 +784,20 @@ mod tests {
     fn cmd_list_does_not_panic() {
         let d = TempDir::new().unwrap();
         cmd_list(d.path()); // just ensure no panic
+    }
+
+    #[test]
+    fn parse_env_u32_accepts_positive_values() {
+        assert_eq!(parse_env_u32("8192"), Some(8192));
+        assert_eq!(parse_env_u32(" 4 "), Some(4));
+    }
+
+    #[test]
+    fn parse_env_u32_rejects_zero_negative_and_invalid_values() {
+        assert_eq!(parse_env_u32("0"), None);
+        assert_eq!(parse_env_u32("-1"), None);
+        assert_eq!(parse_env_u32("not-a-number"), None);
+        assert_eq!(parse_env_u32(""), None);
     }
 
     /// `cmd_dag_check` should output valid JSON even when no goldens or build

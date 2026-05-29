@@ -11,6 +11,7 @@ pub struct SnapshotConfig {
     pub vmrunner_bin: PathBuf,
     pub state_dir: PathBuf,
     pub assets_dir: PathBuf,
+    pub kernel_image: PathBuf,
     pub ssh_key: PathBuf,
     pub force: bool,
     pub settle: Duration,
@@ -279,6 +280,7 @@ fn snapshot_one(
             "container": container,
             "claw_type": claw_type,
             "state_dir": config.state_dir.to_str().unwrap_or(""),
+            "kernel_image": config.kernel_image.to_str().unwrap_or(""),
             "ssh_key": config.ssh_key.to_str().unwrap_or("")
         }),
     );
