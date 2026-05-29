@@ -476,6 +476,13 @@ impl ManagedMacOSVm {
         Arc::clone(&self.vm)
     }
 
+    /// Mark the held lease `Running` after the VM has successfully started.
+    pub fn mark_running(&self) {
+        if let Some(l) = &self.lease {
+            l.mark_running();
+        }
+    }
+
     /// Consume the wrapper, returning the VM and its still-held lease — for a
     /// long-lived VM that will be stored (e.g. a warm-pool entry) and stopped
     /// later via `VmEntry::stop_and_release`.
@@ -995,5 +1002,21 @@ mod tests {
         assert_eq!(read_raw(tmp.path()).leases.len(), 1);
         l.release_clean();
         assert_eq!(read_raw(tmp.path()).leases.len(), 0);
+    }
+
+    #[test]
+    fn mark_running_updates_record_state() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut alive = HashSet::new();
+        alive.insert(current_pid());
+        let adm = test_admission(tmp.path(), "boot-A", alive);
+
+        let l = adm
+            .reserve(VmKind::UserClaw, Some("inst-a".into()))
+            .unwrap();
+        assert_eq!(read_raw(tmp.path()).leases[0].state, LeaseState::Starting);
+        l.mark_running();
+        assert_eq!(read_raw(tmp.path()).leases[0].state, LeaseState::Running);
+        l.release_clean();
     }
 }

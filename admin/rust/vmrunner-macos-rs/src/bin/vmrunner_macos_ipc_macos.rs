@@ -744,6 +744,9 @@ fn handle_create(params: &Value, state: &Arc<IpcState>) -> Response {
                 if let Some(l) = user_lease.take() {
                     l.release_clean();
                 }
+                if let Some(l) = &warm.lease {
+                    l.mark_running();
+                }
                 // T038: Update delegate to use the user's container ID (not the warm pool ID).
                 // This ensures crash cleanup targets the correct VmMap entry.
                 let user_delegate = create_vm_delegate(&container, Arc::clone(state));
@@ -817,6 +820,9 @@ fn handle_create(params: &Value, state: &Arc<IpcState>) -> Response {
             } else {
                 None
             };
+            if let Some(l) = &user_lease {
+                l.mark_running();
+            }
             // Store lease and delegate in VmEntry — lease released via stop_and_release.
             let entry = VmEntry {
                 vm: Arc::new(vm),
@@ -1224,6 +1230,7 @@ fn restart_macos_vm(
 
     match result {
         Ok((vm, ip, mac)) => {
+            lease.mark_running();
             let entry = VmEntry {
                 vm: Arc::new(vm),
                 lease: Some(lease),
@@ -2479,6 +2486,7 @@ async fn boot_warm_pool_vm(
         }
     };
     tracing::info!(container, ip, "Warm-pool VM cold-booted and has DHCP");
+    managed.mark_running();
 
     let _ = std::fs::write(inst_dir.join("vm_ip"), &ip);
     let _ = std::fs::write(inst_dir.join("vm_mac"), &mac);
@@ -2888,6 +2896,18 @@ mod admission_wiring_tests {
         assert!(
             SRC.contains("user_lease.take()"),
             "the redundant user reservation must be released on warm handoff"
+        );
+    }
+
+    #[test]
+    fn long_lived_macos_leases_are_marked_running() {
+        // User VMs, restarted VMs, and warm-pool VMs remain registered after
+        // startup. Each path must move the persisted lease from `starting` to
+        // `running`, otherwise diagnostics look stuck even after provisioning
+        // completed successfully.
+        assert!(
+            count(".mark_running();") >= 4,
+            "every long-lived macOS VM path must mark its lease running"
         );
     }
 
