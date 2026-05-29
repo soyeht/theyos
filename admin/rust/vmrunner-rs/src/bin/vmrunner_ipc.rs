@@ -28,7 +28,7 @@
 //! | CleanupSystemd  | container                                                           |
 //! | CleanupFs       | claw_type, name, state_dir                                         |
 //! | FetchLogs       | container, state_dir, ssh_key, tail                                |
-//! | TakeBaseSnapshot| container, claw_type, state_dir, kernel_image, ssh_key             |
+//! | TakeBaseSnapshot| container, claw_type, home, state_dir, kernel_image, ssh_key       |
 //! | WarmPoolInit    | state_dir, firecracker_bin, kernel_image, base_rootfs,             |
 //! |                 | ssh_key, ssh_pubkey                                                |
 //! | WarmPoolRefill  | claw_type, state_dir, firecracker_bin, kernel_image,               |
@@ -359,8 +359,15 @@ async fn handle_take_base_snapshot(params: &Value) -> Response {
         .as_str()
         .filter(|s| !s.is_empty())
         .map(PathBuf::from);
+    let home = params["home"]
+        .as_str()
+        .filter(|s| !s.is_empty())
+        .map(PathBuf::from);
 
     let mut env = minimal_env(state_dir);
+    if let Some(home) = home {
+        env.home = home;
+    }
     env.ssh_key = ssh_key;
     if let Some(kernel_image) = kernel_image {
         env.kernel_image = kernel_image;

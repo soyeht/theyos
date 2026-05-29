@@ -963,6 +963,7 @@ impl VmRunner {
             );
             (flat_dir, None)
         };
+        align_snapshot_dir_owner(&snap_dir, &inst.instance_dir)?;
 
         let vmstate_path = snap_dir.join("vmstate.snapshot");
         let mem_path = snap_dir.join("mem.snapshot");
@@ -2720,6 +2721,53 @@ wait $!
         }
         drained
     }
+}
+
+#[cfg(unix)]
+fn align_snapshot_dir_owner(snapshot_dir: &Path, instance_dir: &Path) -> Result<(), VmError> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::MetadataExt;
+
+    if core_rs::os::geteuid() != 0 {
+        return Ok(());
+    }
+
+    let owner = fs::metadata(instance_dir).map_err(|e| {
+        VmError::Io(format!(
+            "read instance dir owner {}: {e}",
+            instance_dir.display()
+        ))
+    })?;
+    let path = CString::new(snapshot_dir.as_os_str().as_bytes()).map_err(|_| {
+        VmError::Io(format!(
+            "snapshot dir path contains NUL: {}",
+            snapshot_dir.display()
+        ))
+    })?;
+
+    // The Firecracker process that owns the API socket may be running as the
+    // service account while a maintenance command is invoked via sudo. In that
+    // case root creates the snapshot directory, but Firecracker must write the
+    // vmstate/memory files into it. Align the empty directory with the running
+    // instance owner before calling /snapshot/create.
+    let rc = unsafe { libc::chown(path.as_ptr(), owner.uid(), owner.gid()) };
+    if rc != 0 {
+        return Err(VmError::Io(format!(
+            "chown snapshot dir {} to {}:{}: {}",
+            snapshot_dir.display(),
+            owner.uid(),
+            owner.gid(),
+            std::io::Error::last_os_error()
+        )));
+    }
+
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn align_snapshot_dir_owner(_snapshot_dir: &Path, _instance_dir: &Path) -> Result<(), VmError> {
+    Ok(())
 }
 
 /// Report returned by `sweep_orphans`.

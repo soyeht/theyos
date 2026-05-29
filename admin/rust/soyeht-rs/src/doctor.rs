@@ -459,7 +459,7 @@ fn check_golden_images(fc_home: &Path, installed: &[String], r: &mut DoctorRepor
         ));
     } else {
         r.warn(&format!(
-            "{} golden image(s) missing: {} — reinstall via claw store or run: soyeht artifacts-sync",
+            "{} golden image(s) missing: {} — reinstall via claw store or run: sudo soyeht artifacts-sync",
             missing.len(),
             missing.join(", ")
         ));
@@ -660,12 +660,12 @@ fn check_artifact_dag(root: &Path, fc_home: &Path, installed: &[String], r: &mut
 
     if total_missing > 0 {
         r.warn(&format!(
-            "{total_missing} artifact(s) missing — run: soyeht artifacts-sync"
+            "{total_missing} artifact(s) missing — run: sudo soyeht artifacts-sync"
         ));
     }
     if total_stale > 0 {
         r.warn(&format!(
-            "{total_stale} artifact(s) stale — run: soyeht artifacts-sync"
+            "{total_stale} artifact(s) stale — run: sudo soyeht artifacts-sync"
         ));
     }
     if total_stale == 0 && total_missing == 0 {

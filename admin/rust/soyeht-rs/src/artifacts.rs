@@ -170,6 +170,7 @@ pub fn cmd_artifacts_sync(root: &Path, force: bool, gc_after: bool, claw_types: 
                 .arg("rebuild")
                 .arg("--force")
                 .arg(claw)
+                .current_dir(root)
                 .status()
                 .unwrap_or_else(|e| {
                     eprintln!("[artifacts] imagebuilder spawn: {e}");
@@ -235,6 +236,7 @@ pub fn cmd_artifacts_sync(root: &Path, force: bool, gc_after: bool, claw_types: 
         }
         let status = Command::new(&runner)
             .args(&args)
+            .current_dir(root)
             .status()
             .unwrap_or_else(|e| {
                 eprintln!("[artifacts] e2e-runner spawn: {e}");
@@ -407,6 +409,7 @@ fn query_golden_staleness(
 
     let mut cmd = Command::new(&imagebuilder);
     cmd.arg("dag-check");
+    cmd.current_dir(root);
     for claw in claws {
         cmd.arg(claw);
     }

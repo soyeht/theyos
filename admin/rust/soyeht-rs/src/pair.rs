@@ -163,10 +163,7 @@ fn should_reexec_with_sudo(
     is_interactive_tty: bool,
     is_root: bool,
 ) -> bool {
-    is_linux
-        && kind == std::io::ErrorKind::PermissionDenied
-        && is_interactive_tty
-        && !is_root
+    is_linux && kind == std::io::ErrorKind::PermissionDenied && is_interactive_tty && !is_root
 }
 
 /// Re-exec the current `soyeht pair` invocation under `sudo`, preserving all
@@ -543,7 +540,11 @@ mod tests {
     #[test]
     fn sudo_gate_blocked_on_non_permission_errors() {
         // NotFound (missing token) and other errors get their own hints, not sudo.
-        for kind in [ErrorKind::NotFound, ErrorKind::InvalidData, ErrorKind::Other] {
+        for kind in [
+            ErrorKind::NotFound,
+            ErrorKind::InvalidData,
+            ErrorKind::Other,
+        ] {
             assert!(
                 !should_reexec_with_sudo(kind, true, true, false),
                 "kind {kind:?} must not trigger sudo re-exec"

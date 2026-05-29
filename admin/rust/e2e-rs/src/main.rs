@@ -355,6 +355,7 @@ fn run_snap(client: AdminClient, args: SnapshotArgs, ssh_key: PathBuf, state_dir
 
     let config = SnapshotConfig {
         vmrunner_bin,
+        home: PathBuf::from(&home),
         state_dir,
         assets_dir,
         kernel_image,

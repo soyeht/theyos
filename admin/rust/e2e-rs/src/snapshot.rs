@@ -9,6 +9,7 @@ use crate::runner::all_claw_types;
 
 pub struct SnapshotConfig {
     pub vmrunner_bin: PathBuf,
+    pub home: PathBuf,
     pub state_dir: PathBuf,
     pub assets_dir: PathBuf,
     pub kernel_image: PathBuf,
@@ -172,7 +173,7 @@ fn snapshot_one(
                 .exists();
     if !golden_exists {
         return Err(E2eError::BenchmarkFailed(format!(
-            "golden image not found for {claw_type} — install via claw store or run: soyeht artifacts-sync"
+            "golden image not found for {claw_type} — install via claw store or run: sudo soyeht artifacts-sync"
         )));
     }
 
@@ -279,6 +280,7 @@ fn snapshot_one(
         serde_json::json!({
             "container": container,
             "claw_type": claw_type,
+            "home": config.home.to_str().unwrap_or(""),
             "state_dir": config.state_dir.to_str().unwrap_or(""),
             "kernel_image": config.kernel_image.to_str().unwrap_or(""),
             "ssh_key": config.ssh_key.to_str().unwrap_or("")
