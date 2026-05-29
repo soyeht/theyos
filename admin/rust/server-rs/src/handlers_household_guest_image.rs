@@ -815,6 +815,28 @@ pub(crate) fn mark_init_state_failed_at_path(state_path: &std::path::Path, messa
         "failure_code".to_string(),
         serde_json::Value::String(failure_code.as_str().to_string()),
     );
+    // Failure-scope semantics: classify *how long* this failure stays a
+    // blocking condition (item 1/2 of the design). A `current_boot`-scoped
+    // failure (e.g. `host_vm_limit_reached`) is additionally stamped with the
+    // boot it occurred on, so the status reader can tell — without mutating
+    // this file — that a reboot has since cleared it (`failure_boot_id` !=
+    // live boot id). Boot id comes from the same `core_rs` SSoT the admission
+    // registry uses, so the two compare byte-for-byte.
+    let failure_scope = failure_code.default_scope();
+    record_map.insert(
+        "failure_scope".to_string(),
+        serde_json::Value::String(failure_scope.as_str().to_string()),
+    );
+    if failure_scope == core_rs::guest_image_failure::FailureScope::CurrentBoot {
+        record_map.insert(
+            "failure_boot_id".to_string(),
+            serde_json::Value::String(core_rs::boot_id::current_boot_id()),
+        );
+    }
+    record_map.insert(
+        "occurred_at".to_string(),
+        serde_json::Value::Number(core_rs::time::unix_now_secs().into()),
+    );
 
     // Write atomically: tempfile + persist (rename). Tempfile shares
     // the destination directory so `persist` stays on a single
@@ -1171,6 +1193,27 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn stale_boot_scoped_failure_is_preparable_and_spawns_without_force() {
+        // After a reboot, `guest_image_state::reconcile_failure` masks a stale
+        // `current_boot` host-limit failure to a preparable state (the resolver
+        // returns `not_applicable()`, validated in guest_image_state tests). The
+        // prepare handler reads through that same resolver, so a masked-stale
+        // state must NOT hit the `failed → 409 without force` branch — it falls
+        // through and spawns, with no `force` required. This is the end of the
+        // "Check Again after reboot un-sticks the iPhone" chain.
+        let fx = fixture_with(
+            GuestImageState::not_applicable(),
+            CapabilityCheck::Available,
+        );
+        let path = "/api/v1/household/guest-image/prepare";
+        let auth = signed(&fx.person, path, b"");
+        let (status, body) = post_prepare(fx.app, Some(auth), b"").await;
+        assert_eq!(status, StatusCode::ACCEPTED, "stale failure must not 409");
+        assert_eq!(body["status"], "starting");
+        assert_eq!(fx.launcher.start_count(), 1);
+    }
+
+    #[tokio::test]
     async fn helper_missing_returns_503_and_does_not_spawn() {
         let fx = fixture_with(
             GuestImageState::not_applicable(),
@@ -1325,6 +1368,19 @@ mod tests {
             written["phase_history"]["unknown"]["failure_code"],
             "unknown"
         );
+        // `unknown` code defaults to `persistent` scope (conservative — keeps
+        // blocking) and therefore carries NO `failure_boot_id`. `occurred_at`
+        // is stamped regardless.
+        let rec = &written["phase_history"]["unknown"];
+        assert_eq!(rec["failure_scope"], "persistent");
+        assert!(
+            rec.get("failure_boot_id").is_none(),
+            "persistent failures must not carry a boot id"
+        );
+        assert!(
+            rec["occurred_at"].is_number(),
+            "occurred_at must be stamped"
+        );
     }
 
     #[test]
@@ -1345,10 +1401,21 @@ mod tests {
         let written: serde_json::Value =
             serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
         assert_eq!(written["status"], "failed");
-        assert_eq!(
-            written["phase_history"]["install_macos"]["failure_code"],
-            "host_vm_limit_reached"
+        let rec = &written["phase_history"]["install_macos"];
+        assert_eq!(rec["failure_code"], "host_vm_limit_reached");
+        // host_vm_limit_reached is boot-scoped: scope `current_boot` plus a
+        // `failure_boot_id` stamped from the core_rs SSoT (so it compares
+        // byte-for-byte with the admission registry / live boot id later).
+        assert_eq!(rec["failure_scope"], "current_boot");
+        let boot_id = rec["failure_boot_id"]
+            .as_str()
+            .expect("current_boot failure must carry a boot id");
+        assert!(
+            boot_id.starts_with("boottime:") || boot_id.starts_with("boottime-raw:"),
+            "boot id must match the core_rs::boot_id format, got: {boot_id}"
         );
+        assert_eq!(boot_id, core_rs::boot_id::current_boot_id());
+        assert!(rec["occurred_at"].is_number());
     }
 
     #[test]

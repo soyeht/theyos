@@ -10,6 +10,7 @@ pub mod artifact_meta;
 pub mod artifact_registry;
 pub mod audit;
 pub mod availability;
+pub mod boot_id;
 pub mod claw_llm;
 pub mod constants;
 pub mod crash;

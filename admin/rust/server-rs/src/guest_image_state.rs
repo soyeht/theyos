@@ -23,6 +23,8 @@
 //! non-macOS targets. The handler emits Option-typed fields so the
 //! iPhone can distinguish "doesn't apply" from "in progress" cleanly.
 
+#[cfg(target_os = "macos")]
+use core_rs::guest_image_failure::FailureScope;
 use core_rs::guest_image_failure::GuestImageFailureCode;
 use serde::Serialize;
 #[cfg(target_os = "macos")]
@@ -77,7 +79,10 @@ impl GuestImageState {
     #[must_use]
     pub fn read_current() -> Self {
         let path = macos_base_dir().join("init-state.json");
-        read_from_path(&path).unwrap_or_default()
+        match read_raw(&path) {
+            Some(raw) => reconcile_failure(raw, &core_rs::boot_id::current_boot_id()),
+            None => Self::not_applicable(),
+        }
     }
 
     /// Linux has no guest VM. Always returns not-applicable.
@@ -104,11 +109,30 @@ pub(crate) fn macos_base_dir() -> PathBuf {
     PathBuf::from(home).join("Library/Application Support/theyos/vms/macos-base")
 }
 
-/// Pure parser — used by the macOS reader above and by tests that
-/// want to drive the function from a tempfile without setting
-/// `THEYOS_VM_ASSETS_DIR`.
+/// Raw parsed guest-image state plus the failure-scope metadata the reader
+/// needs to reconcile boot-scoped failures. Internal to this module: callers
+/// outside use [`GuestImageState::read_current`], which applies reconciliation.
 #[cfg(target_os = "macos")]
-fn read_from_path(path: &std::path::Path) -> Option<GuestImageState> {
+struct RawGuestImage {
+    /// The state exactly as recorded on disk (raw `failure_code`, unmasked).
+    state: GuestImageState,
+    /// Failure scope from the failed record, when present. Absent on older
+    /// records that predate the field (the reader falls back to
+    /// `failure_code.default_scope()`).
+    failure_scope: Option<FailureScope>,
+    /// Boot id the failure was stamped on, for `current_boot`-scoped failures.
+    /// Absent on older records (handled by the compat rule in
+    /// [`reconcile_failure`]).
+    failure_boot_id: Option<String>,
+}
+
+/// Pure parser — reads + parses `init-state.json` into a [`RawGuestImage`]
+/// **without** reconciling boot-scoped failures (so the raw, on-disk
+/// `failure_code` is preserved). Used by [`GuestImageState::read_current`]
+/// (which then reconciles) and by tests that drive it from a tempfile without
+/// setting `THEYOS_VM_ASSETS_DIR`.
+#[cfg(target_os = "macos")]
+fn read_raw(path: &std::path::Path) -> Option<RawGuestImage> {
     if !path.exists() {
         return None;
     }
@@ -133,7 +157,8 @@ fn read_from_path(path: &std::path::Path) -> Option<GuestImageState> {
     // Schema: `phase_history` is `BTreeMap<String, PhaseRecord>` where
     // each `PhaseRecord` has `status: PhaseStatus` and `error: Option<String>`.
     // Locate the most recent failed phase record (highest sorted key with
-    // status == "failed"), then pull both its `error` and `failure_code`.
+    // status == "failed"), then pull `error`, `failure_code`, `failure_scope`,
+    // and `failure_boot_id`.
     let failed_record = if status.as_deref() == Some("failed") {
         json.get("phase_history")
             .and_then(|h| h.as_object())
@@ -166,12 +191,87 @@ fn read_from_path(path: &std::path::Path) -> Option<GuestImageState> {
             .map(GuestImageFailureCode::from_wire)
     });
 
-    Some(GuestImageState {
-        phase,
-        status,
-        error,
-        failure_code,
+    // `failure_scope` is fail-soft like `failure_code`. Absent → None (older
+    // record; the reader falls back to `failure_code.default_scope()`).
+    let failure_scope = failed_record.as_ref().and_then(|rec| {
+        rec.get("failure_scope")
+            .and_then(|s| s.as_str())
+            .map(FailureScope::from_wire)
+    });
+
+    let failure_boot_id = failed_record.as_ref().and_then(|rec| {
+        rec.get("failure_boot_id")
+            .and_then(|b| b.as_str())
+            .map(String::from)
+    });
+
+    Some(RawGuestImage {
+        state: GuestImageState {
+            phase,
+            status,
+            error,
+            failure_code,
+        },
+        failure_scope,
+        failure_boot_id,
     })
+}
+
+/// Reconcile a parsed state against the live boot id (read-time only — never
+/// mutates `init-state.json`; `phase_history` is always preserved on disk).
+///
+/// A **boot-scoped** failure (`failure_scope == current_boot`, the default for
+/// `host_vm_limit_reached`) is only a *current, blocking* condition while the
+/// boot it was stamped on is still the live boot. Once the boot id differs, a
+/// reboot has cleared the underlying host condition (e.g. a leaked VZ active-VM
+/// session), so the failure is **stale** and we return a preparable state —
+/// `/bootstrap/status` stops surfacing it and the prepare handler (which reads
+/// through the same resolver) falls through to spawn without `--force`.
+///
+/// Compat rule (b): a legacy `current_boot` record stamped *before*
+/// `failure_boot_id` existed (so the id is absent) is treated as **stale** too
+/// — it cannot prove it belongs to the live boot, and the underlying condition
+/// is inherently boot-scoped. This un-blocks Macs already stuck at upgrade
+/// time. If the host genuinely is still blocked, the next prepare attempt is
+/// refused and re-stamps the failure *with* the current boot id, which then
+/// correctly blocks (self-correcting in one cycle, never a permanent stuck
+/// state).
+///
+/// `persistent` and `retryable` failures are left exactly as recorded (a reboot
+/// does not clear them); only `current_boot`-stale is masked.
+#[cfg(target_os = "macos")]
+fn reconcile_failure(raw: RawGuestImage, current_boot_id: &str) -> GuestImageState {
+    let RawGuestImage {
+        state,
+        failure_scope,
+        failure_boot_id,
+    } = raw;
+
+    // Only a `failed` state with a known code can be a boot-scoped failure.
+    if state.status.as_deref() != Some("failed") {
+        return state;
+    }
+    let Some(code) = state.failure_code else {
+        return state;
+    };
+
+    // Explicit scope wins; otherwise classify from the code (older records).
+    let scope = failure_scope.unwrap_or_else(|| code.default_scope());
+    if scope != FailureScope::CurrentBoot {
+        // persistent / retryable / unknown → surface the failure as recorded.
+        return state;
+    }
+
+    // current_boot: blocking only while the stamped boot is the live boot.
+    // Absent boot id ⇒ compat rule (b) ⇒ treated as a different (stale) boot.
+    let is_current_boot = failure_boot_id.as_deref() == Some(current_boot_id);
+    if is_current_boot {
+        return state; // still this boot → genuinely blocking.
+    }
+
+    // Stale boot-scoped failure: no longer the current blocking state. Present a
+    // preparable state (history on disk is untouched).
+    GuestImageState::not_applicable()
 }
 
 // ─── Tests ───────────────────────────────────────────────────────────────────
@@ -182,6 +282,21 @@ mod tests {
     use super::*;
     use std::fs;
     use tempfile::tempdir;
+
+    /// Test shim: parse to the raw on-disk state (no boot reconciliation) — the
+    /// historical `read_from_path` shape the parsing tests below assert against.
+    fn read_from_path(path: &std::path::Path) -> Option<GuestImageState> {
+        read_raw(path).map(|r| r.state)
+    }
+
+    /// Parse `json` into a [`RawGuestImage`] via a tempfile (exercises the real
+    /// `read_raw` path, including `scope`/`boot_id` extraction).
+    fn raw_from_json(json: &str) -> RawGuestImage {
+        let dir = tempdir().unwrap();
+        let state_file = dir.path().join("init-state.json");
+        fs::write(&state_file, json).unwrap();
+        read_raw(&state_file).expect("parses")
+    }
 
     #[test]
     fn read_returns_not_applicable_when_file_missing() {
@@ -392,5 +507,178 @@ mod tests {
         .unwrap();
         let result = read_from_path(&state_file).expect("parses");
         assert_eq!(result.failure_code, Some(GuestImageFailureCode::Unknown));
+    }
+
+    // ── reconcile_failure: boot-scoped failure reconciliation ──────────────
+
+    const BOOT_NOW: &str = "boottime:222";
+
+    /// A `current_boot` host-limit failure stamped on the *live* boot still
+    /// blocks: `/bootstrap/status` keeps surfacing it (restart / Check Again).
+    #[test]
+    fn same_boot_host_limit_still_blocks() {
+        let raw = raw_from_json(
+            r#"{
+                "phase": "install_macos",
+                "status": "failed",
+                "phase_history": {
+                    "install_macos": {
+                        "status": "failed",
+                        "error": "host macOS VM limit reached (HostBlocked)",
+                        "failure_code": "host_vm_limit_reached",
+                        "failure_scope": "current_boot",
+                        "failure_boot_id": "boottime:222"
+                    }
+                }
+            }"#,
+        );
+        let result = reconcile_failure(raw, BOOT_NOW);
+        assert_eq!(result.status.as_deref(), Some("failed"));
+        assert_eq!(
+            result.failure_code,
+            Some(GuestImageFailureCode::HostVmLimitReached),
+            "same-boot host limit must remain blocking"
+        );
+    }
+
+    /// A `current_boot` host-limit failure stamped on a *previous* boot is stale
+    /// (reboot cleared it): reader masks it to a preparable state.
+    #[test]
+    fn previous_boot_host_limit_stops_blocking() {
+        let raw = raw_from_json(
+            r#"{
+                "phase": "install_macos",
+                "status": "failed",
+                "phase_history": {
+                    "install_macos": {
+                        "status": "failed",
+                        "error": "host macOS VM limit reached (HostBlocked)",
+                        "failure_code": "host_vm_limit_reached",
+                        "failure_scope": "current_boot",
+                        "failure_boot_id": "boottime:111"
+                    }
+                }
+            }"#,
+        );
+        let result = reconcile_failure(raw, BOOT_NOW);
+        assert!(
+            result.status.is_none() && result.failure_code.is_none(),
+            "previous-boot host limit must be masked (preparable), got {result:?}"
+        );
+    }
+
+    /// Compat rule (b): a legacy host-limit failure with NO `failure_scope` and
+    /// NO `failure_boot_id` is treated as stale (un-blocks Macs stuck at upgrade
+    /// time). `default_scope(host_vm_limit_reached) == current_boot`, absent boot
+    /// id ⇒ different boot ⇒ masked.
+    #[test]
+    fn legacy_host_limit_without_boot_id_stops_blocking() {
+        let raw = raw_from_json(
+            r#"{
+                "phase": "install_macos",
+                "status": "failed",
+                "phase_history": {
+                    "install_macos": {
+                        "status": "failed",
+                        "error": "host macOS VM limit reached (HostBlocked)",
+                        "failure_code": "host_vm_limit_reached"
+                    }
+                }
+            }"#,
+        );
+        // No failure_scope / failure_boot_id parsed from the legacy record.
+        assert!(raw.failure_scope.is_none());
+        assert!(raw.failure_boot_id.is_none());
+        let result = reconcile_failure(raw, BOOT_NOW);
+        assert!(
+            result.status.is_none() && result.failure_code.is_none(),
+            "legacy host limit (no boot id) must be masked per compat rule (b), got {result:?}"
+        );
+    }
+
+    /// Persistent failures (e.g. missing entitlement) are never boot-scoped and
+    /// must keep blocking regardless of boot — a reboot does not fix them.
+    #[test]
+    fn persistent_failure_keeps_blocking_across_boots() {
+        let json = r#"{
+                "phase": "install_macos",
+                "status": "failed",
+                "phase_history": {
+                    "install_macos": {
+                        "status": "failed",
+                        "error": "hypervisor entitlement missing",
+                        "failure_code": "entitlement_missing",
+                        "failure_scope": "persistent"
+                    }
+                }
+            }"#;
+        // Even on a different boot id, persistent stays blocking.
+        let result = reconcile_failure(raw_from_json(json), BOOT_NOW);
+        assert_eq!(result.status.as_deref(), Some("failed"));
+        assert_eq!(
+            result.failure_code,
+            Some(GuestImageFailureCode::EntitlementMissing)
+        );
+    }
+
+    /// A legacy persistent failure with no explicit scope is classified via
+    /// `default_scope` and still blocks (`entitlement_missing` → persistent).
+    #[test]
+    fn legacy_persistent_failure_keeps_blocking() {
+        let raw = raw_from_json(
+            r#"{
+                "phase": "install_macos",
+                "status": "failed",
+                "phase_history": {
+                    "install_macos": {
+                        "status": "failed",
+                        "error": "hypervisor entitlement missing",
+                        "failure_code": "entitlement_missing"
+                    }
+                }
+            }"#,
+        );
+        assert!(raw.failure_scope.is_none());
+        let result = reconcile_failure(raw, BOOT_NOW);
+        assert_eq!(
+            result.failure_code,
+            Some(GuestImageFailureCode::EntitlementMissing),
+            "legacy persistent failure must keep blocking"
+        );
+    }
+
+    /// Retryable failures (e.g. IPSW download) are not boot-scoped: they stay
+    /// visible as a failure (never masked), so the user still sees what happened.
+    #[test]
+    fn retryable_failure_is_not_masked() {
+        let raw = raw_from_json(
+            r#"{
+                "phase": "download_ipsw",
+                "status": "failed",
+                "phase_history": {
+                    "download_ipsw": {
+                        "status": "failed",
+                        "error": "IPSW download failed: connection reset",
+                        "failure_code": "ipsw_download_failed",
+                        "failure_scope": "retryable"
+                    }
+                }
+            }"#,
+        );
+        let result = reconcile_failure(raw, BOOT_NOW);
+        assert_eq!(result.status.as_deref(), Some("failed"));
+        assert_eq!(
+            result.failure_code,
+            Some(GuestImageFailureCode::IpswDownloadFailed),
+            "retryable failure must stay visible, not masked"
+        );
+    }
+
+    /// Non-failed states pass through reconciliation untouched.
+    #[test]
+    fn reconcile_passes_through_non_failed_states() {
+        let raw = raw_from_json(r#"{ "phase": "install_macos", "status": "in_progress" }"#);
+        let result = reconcile_failure(raw, BOOT_NOW);
+        assert_eq!(result.status.as_deref(), Some("in_progress"));
     }
 }

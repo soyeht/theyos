@@ -196,7 +196,7 @@ impl VmAdmission {
         Self {
             slots: MacOSVmSlotManager::new(),
             registry_path: state_dir.join(REGISTRY_FILENAME),
-            boot_id: current_boot_id(),
+            boot_id: core_rs::boot_id::current_boot_id(),
             liveness: Arc::new(pid_alive_real),
         }
     }
@@ -731,32 +731,10 @@ fn new_lease_id() -> String {
     uuid::Uuid::new_v4().to_string()
 }
 
-/// Stable per-boot identity derived from `kern.boottime` seconds. Changes only
-/// across reboots, which is exactly when leaked VZ sessions are cleared.
-fn current_boot_id() -> String {
-    if let Ok(out) = std::process::Command::new("sysctl")
-        .args(["-n", "kern.boottime"])
-        .output()
-    {
-        if let Ok(s) = String::from_utf8(out.stdout) {
-            // e.g. "{ sec = 1700000000, usec = 0 } Wed Jan ..."
-            if let Some(idx) = s.find("sec = ") {
-                let digits: String = s[idx + 6..]
-                    .chars()
-                    .take_while(char::is_ascii_digit)
-                    .collect();
-                if !digits.is_empty() {
-                    return format!("boottime:{digits}");
-                }
-            }
-            let trimmed = s.trim();
-            if !trimmed.is_empty() {
-                return format!("boottime-raw:{trimmed}");
-            }
-        }
-    }
-    "boottime:unknown".to_string()
-}
+// Boot identity is owned by `core_rs::boot_id::current_boot_id()` — the single
+// source of truth shared with the guest-image status reader, so a
+// `failure_boot_id` stamped there compares byte-for-byte with `blocked_boot_id`
+// / per-lease `boot_id` here.
 
 // ── tests ───────────────────────────────────────────────────────────────────
 

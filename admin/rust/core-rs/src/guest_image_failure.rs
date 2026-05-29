@@ -43,6 +43,88 @@ pub enum GuestImageFailureCode {
     Unknown,
 }
 
+/// The **lifetime scope** of a guest-image failure — how long a stamped failure
+/// stays a *current, blocking* condition.
+///
+/// A failure code says *what* went wrong; the scope says *whether the failure
+/// is still in effect*. This distinction is what lets the status reader stop
+/// surfacing a transient, boot-scoped failure (e.g. `host_vm_limit_reached`)
+/// once the condition that caused it has cleared — without erasing the audit
+/// record in `phase_history`.
+///
+/// Serializes to a `snake_case` string; unknown/future strings decode fail-soft
+/// to [`FailureScope::Unknown`], which callers treat as the most conservative
+/// scope ([`FailureScope::Persistent`] — keep blocking) so an older client never
+/// silently un-blocks on a code it doesn't understand.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FailureScope {
+    /// Valid only for the boot it occurred on (recorded in `failure_boot_id`).
+    /// On any other boot it is **stale** and no longer blocking — a reboot
+    /// cleared the underlying host condition (e.g. a leaked VZ active-VM
+    /// session). The canonical example is `host_vm_limit_reached`.
+    CurrentBoot,
+    /// Sticky until the user fixes the underlying environment and explicitly
+    /// retries (e.g. missing entitlement, incompatible restore image, missing
+    /// helper). Stays blocking across reboots; reboot does not clear it.
+    Persistent,
+    /// Transient and worth retrying directly (e.g. a network blip during the
+    /// IPSW download). Stays visible as a failure but does not require an
+    /// environment change to attempt again.
+    Retryable,
+    /// Unrecognized / future scope (fail-soft). Callers treat this as
+    /// [`Self::Persistent`] (the conservative, keep-blocking choice).
+    #[serde(other)]
+    Unknown,
+}
+
+impl FailureScope {
+    /// The stable `snake_case` wire string.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::CurrentBoot => "current_boot",
+            Self::Persistent => "persistent",
+            Self::Retryable => "retryable",
+            Self::Unknown => "unknown",
+        }
+    }
+
+    /// Parse a wire string fail-soft: unrecognized values become [`Self::Unknown`].
+    #[must_use]
+    pub fn from_wire(s: &str) -> Self {
+        match s {
+            "current_boot" => Self::CurrentBoot,
+            "persistent" => Self::Persistent,
+            "retryable" => Self::Retryable,
+            _ => Self::Unknown,
+        }
+    }
+
+    /// Whether a failure with this scope should be treated as **currently
+    /// blocking** by the status reader, given whether its recorded boot matches
+    /// the live boot.
+    ///
+    /// - [`Self::CurrentBoot`] blocks **only** when `boot_matches` is true (the
+    ///   failure happened on the boot we are still running). On a different boot
+    ///   it is stale → not blocking.
+    /// - [`Self::Persistent`] and [`Self::Unknown`] always block (conservative).
+    /// - [`Self::Retryable`] does not hard-block (the caller may still surface it
+    ///   as a non-blocking, retry-able failure).
+    ///
+    /// `boot_matches` semantics for the compat case (a legacy record with no
+    /// recorded boot id) are decided by the caller; see
+    /// `guest_image_state::reconcile_failure`.
+    #[must_use]
+    pub const fn is_blocking(self, boot_matches: bool) -> bool {
+        match self {
+            Self::CurrentBoot => boot_matches,
+            Self::Persistent | Self::Unknown => true,
+            Self::Retryable => false,
+        }
+    }
+}
+
 impl GuestImageFailureCode {
     /// The stable `snake_case` wire string.
     #[must_use]
@@ -55,6 +137,32 @@ impl GuestImageFailureCode {
             Self::IpswDownloadFailed => "ipsw_download_failed",
             Self::IpswIncompatible => "ipsw_incompatible",
             Self::Unknown => "unknown",
+        }
+    }
+
+    /// The scope a failure of this code defaults to when the on-disk record
+    /// does not carry an explicit `failure_scope` (older engines stamped the
+    /// code but not the scope). This is the authoritative classification table
+    /// (item 2 of the failure-scope design):
+    ///
+    /// - `host_vm_limit_reached` → [`FailureScope::CurrentBoot`] (a reboot
+    ///   clears the host active-VM limit / leaked VZ session).
+    /// - `ipsw_download_failed`, `insufficient_disk` → [`FailureScope::Retryable`]
+    ///   (a network retry, or the user freeing disk, can succeed without a
+    ///   reboot or reinstall).
+    /// - `helper_missing`, `entitlement_missing`, `ipsw_incompatible` →
+    ///   [`FailureScope::Persistent`] (needs a reinstall / different host /
+    ///   different image — neither reboot nor a plain retry helps).
+    /// - `unknown` → [`FailureScope::Persistent`] (conservative: keep blocking).
+    #[must_use]
+    pub const fn default_scope(self) -> FailureScope {
+        match self {
+            Self::HostVmLimitReached => FailureScope::CurrentBoot,
+            Self::IpswDownloadFailed | Self::InsufficientDisk => FailureScope::Retryable,
+            Self::HelperMissing | Self::EntitlementMissing | Self::IpswIncompatible => {
+                FailureScope::Persistent
+            }
+            Self::Unknown => FailureScope::Persistent,
         }
     }
 
@@ -216,5 +324,80 @@ mod tests {
         // Unknown/future string deserializes fail-soft to Unknown.
         let back: GuestImageFailureCode = serde_json::from_str("\"brand_new_code\"").unwrap();
         assert_eq!(back, GuestImageFailureCode::Unknown);
+    }
+
+    // ── FailureScope ──────────────────────────────────────────────────────
+
+    #[test]
+    fn default_scope_classifies_each_code() {
+        use FailureScope::{CurrentBoot, Persistent, Retryable};
+        assert_eq!(
+            GuestImageFailureCode::HostVmLimitReached.default_scope(),
+            CurrentBoot
+        );
+        assert_eq!(
+            GuestImageFailureCode::IpswDownloadFailed.default_scope(),
+            Retryable
+        );
+        assert_eq!(
+            GuestImageFailureCode::InsufficientDisk.default_scope(),
+            Retryable
+        );
+        assert_eq!(
+            GuestImageFailureCode::HelperMissing.default_scope(),
+            Persistent
+        );
+        assert_eq!(
+            GuestImageFailureCode::EntitlementMissing.default_scope(),
+            Persistent
+        );
+        assert_eq!(
+            GuestImageFailureCode::IpswIncompatible.default_scope(),
+            Persistent
+        );
+        // Unknown is conservative: keep blocking.
+        assert_eq!(GuestImageFailureCode::Unknown.default_scope(), Persistent);
+    }
+
+    #[test]
+    fn scope_is_blocking_rules() {
+        // current_boot blocks only when the boot matches.
+        assert!(FailureScope::CurrentBoot.is_blocking(true));
+        assert!(!FailureScope::CurrentBoot.is_blocking(false));
+        // persistent / unknown always block regardless of boot.
+        assert!(FailureScope::Persistent.is_blocking(true));
+        assert!(FailureScope::Persistent.is_blocking(false));
+        assert!(FailureScope::Unknown.is_blocking(true));
+        assert!(FailureScope::Unknown.is_blocking(false));
+        // retryable never hard-blocks.
+        assert!(!FailureScope::Retryable.is_blocking(true));
+        assert!(!FailureScope::Retryable.is_blocking(false));
+    }
+
+    #[test]
+    fn scope_serde_round_trips_and_fail_soft() {
+        for scope in [
+            FailureScope::CurrentBoot,
+            FailureScope::Persistent,
+            FailureScope::Retryable,
+            FailureScope::Unknown,
+        ] {
+            let json = serde_json::to_string(&scope).unwrap();
+            assert_eq!(json, format!("\"{}\"", scope.as_str()));
+            let back: FailureScope = serde_json::from_str(&json).unwrap();
+            assert_eq!(back, scope);
+        }
+        // from_wire fail-soft.
+        assert_eq!(
+            FailureScope::from_wire("current_boot"),
+            FailureScope::CurrentBoot
+        );
+        assert_eq!(
+            FailureScope::from_wire("future_scope"),
+            FailureScope::Unknown
+        );
+        // serde fail-soft on unknown string.
+        let back: FailureScope = serde_json::from_str("\"future_scope\"").unwrap();
+        assert_eq!(back, FailureScope::Unknown);
     }
 }
