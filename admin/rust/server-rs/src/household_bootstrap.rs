@@ -605,6 +605,20 @@ pub async fn bootstrap_household(shared_state: Option<SharedState>) {
         )
         .with_state(identity_state.clone());
 
+    // R101: owner-authed list of the household's own machine certs (surfaces
+    // the base/self engine machine). Same PoP gate as `snapshot`, but the
+    // handler also reads `machine_certs/<m_id>.cbor`, so it needs the combined
+    // (identity + state_dir) state.
+    let machines_router = axum::Router::new()
+        .route(
+            "/api/v1/household/machines",
+            axum::routing::get(handlers_household::machines),
+        )
+        .with_state(handlers_household::MachinesRouterState {
+            household: identity_state.clone(),
+            state_dir: state_dir.clone(),
+        });
+
     let pair_router = axum::Router::new()
         .route(
             "/api/v1/household/pair-device/initiate",
@@ -1101,6 +1115,7 @@ pub async fn bootstrap_household(shared_state: Option<SharedState>) {
 
     let mut household_router = identity_router
         .merge(pair_router)
+        .merge(machines_router) // R101
         .merge(bootstrap_rt)
         .merge(pre_household_rt)
         .merge(guest_image_router)
