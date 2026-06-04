@@ -217,6 +217,56 @@ fn print_usage() {
     );
 }
 
+/// Read the pair-device QR window TTL from the environment, clamped to the
+/// documented `60..=3600` range with a 5-minute production default.
+///
+/// Production default is 5 minutes — short enough that a leaked QR doesn't
+/// sit valid in chat logs / screenshots for hours. Operators running
+/// validation pass overrides via `THEYOS_PAIR_DEVICE_TTL_SECS` to handle
+/// manual / appium-driven walks through Welcome carousel + permission alerts
+/// + Face ID, which routinely exceed the 5-minute window during e2e
+/// sessions. The clamp bounds keep accidental absurd values from weakening
+/// prod beyond the documented threat surface.
+///
+/// Shared by the CLI `--reissue-pair-qr` path and the in-process engine
+/// reissue route so both honor the same env override + clamp.
+pub(crate) fn pair_device_ttl_from_env() -> Duration {
+    Duration::from_secs(
+        crate::household_bootstrap::pair_window_ttl_secs_from_env(
+            "THEYOS_PAIR_DEVICE_TTL_SECS",
+        ),
+    )
+}
+
+/// Mint a fresh owner pair-device token on a persistent [`PairDeviceWindow`]
+/// rooted at `state_dir`, and render the canonical
+/// `soyeht://household/pair-device?…` URI.
+///
+/// Pure async helper — NO stdout, NO `process::exit`. The reachable `host`
+/// fallback is passed IN by the caller (it must NOT call
+/// `current_tailnet_ipv4` itself) so callers can resolve a LAN-first address
+/// that works with Tailscale OFF. Returns `(uri, expires_at_unix)`.
+///
+/// Reused by the install CLI's [`emit_fresh_pair_device_window`] and by the
+/// engine's in-process `POST /bootstrap/pair-device/reissue` route. The
+/// reissue route mints on the SHARED `Arc<PairDeviceWindow>` instead (for
+/// liveness), but renders via the same `to_uri_with_host_and_name` path.
+pub(crate) async fn mint_pair_device_uri(
+    state_dir: &Path,
+    hh_pub: &P256PublicKey,
+    household_name: Option<&str>,
+    host_fallback: Option<String>,
+) -> Result<(String, u64), String> {
+    let ttl = pair_device_ttl_from_env();
+    let window = PairDeviceWindow::with_persistence(state_dir.to_path_buf());
+    let token = window
+        .mint_token(ttl, None)
+        .await
+        .map_err(|e| format!("failed to mint pair token: {e}"))?;
+    let uri = token.to_uri_with_host_and_name(hh_pub, host_fallback.as_deref(), household_name);
+    Ok((uri, token.expires_at_unix))
+}
+
 /// Mint a fresh pair-receiving window, persist it via `PairDeviceWindow`, and
 /// render the QR to stdout. Returns a process exit code (0 on success,
 /// 1 on render failure).
@@ -225,40 +275,31 @@ async fn emit_fresh_pair_device_window(
     hh_pub: &P256PublicKey,
     household_name: Option<&str>,
 ) -> i32 {
-    // Pair-device QR window TTL. Production default is 5 minutes — short enough
-    // that a leaked QR doesn't sit valid in chat logs / screenshots for hours.
-    // Operators running validation pass an override via THEYOS_PAIR_DEVICE_TTL_SECS
-    // to handle manual / appium-driven walks (Welcome carousel + permission alerts +
-    // Face ID) that routinely exceed the 5-minute window during e2e sessions. The
-    // parse/clamp/default policy lives in one owner — see
-    // household_bootstrap::pair_window_ttl_secs_from_env.
-    let ttl_secs: u64 =
-        crate::household_bootstrap::pair_window_ttl_secs_from_env("THEYOS_PAIR_DEVICE_TTL_SECS");
-    let ttl = Duration::from_secs(ttl_secs);
-
-    let window = PairDeviceWindow::with_persistence(state_dir.to_path_buf());
-    let token = match window.mint_token(ttl, None).await {
-        Ok(token) => token,
-        Err(e) => {
-            eprintln!("error: failed to mint pair token: {e}");
-            return 1;
-        }
-    };
-    // Include a Tailnet host fallback in the URI so peers whose Bonjour
+    // Resolve a reachable host fallback for the URI so peers whose Bonjour
     // implementation does not interoperate with the engine's mDNS publisher
     // (observed cross-platform with `mdns-sd` 0.10/0.13 → macOS/iOS
     // NWBrowser) can connect directly. Bonjour discovery remains the gold
     // path when it works; the `host` field is consulted as a fallback only.
-    let port: u16 = crate::household_bootstrap::household_port_from_env();
-    let host_fallback =
-        crate::tailnet_address::current_tailnet_ipv4().map(|ip| format!("{ip}:{port}"));
-    let uri = token.to_uri_with_host_and_name(hh_pub, host_fallback.as_deref(), household_name);
+    // LAN-first: prefer an RFC1918 address (works with Tailscale OFF), then
+    // fall back to the Tailnet IPv4.
+    let port = crate::household_bootstrap::household_port_from_env();
+    let host_fallback = pick_addr_for_transport(JoinTransport::Lan, port)
+        .or_else(|| crate::tailnet_address::current_tailnet_ipv4().map(|ip| format!("{ip}:{port}")));
+
+    let (uri, expires_at_unix) =
+        match mint_pair_device_uri(state_dir, hh_pub, household_name, host_fallback.clone()).await {
+            Ok(pair) => pair,
+            Err(e) => {
+                eprintln!("error: {e}");
+                return 1;
+            }
+        };
 
     info!(
         stage = "pair_device_window.opened",
         source = "install",
-        ttl_secs = ttl.as_secs(),
-        expires_at_unix = token.expires_at_unix,
+        ttl_secs = pair_device_ttl_from_env().as_secs(),
+        expires_at_unix = expires_at_unix,
         host_fallback = host_fallback.as_deref().unwrap_or(""),
     );
 
@@ -721,5 +762,68 @@ mod tests {
             Some("LAN discovery unavailable - scan the QR with your iPhone.")
         );
         assert_eq!(lan_fallback_prompt(false), None);
+    }
+
+    // A throwaway, deterministic household public key for URI-render tests.
+    // 33-byte SEC1 compressed point; bootstrap a software-keyed identity in a
+    // tempdir to obtain a valid `P256PublicKey` without touching the network.
+    fn test_hh_pub() -> P256PublicKey {
+        let td = tempfile::tempdir().unwrap();
+        let loaded = household_rs::bootstrap_or_load(
+            td.path(),
+            household_rs::BootstrapOpts {
+                household_name: "Reissue Test Home".into(),
+                hostname_label: Some("reissue-test".into()),
+            },
+            household_rs::KeyBackingPolicy::ForceSoftware,
+        )
+        .expect("bootstrap");
+        loaded.record.hh_pub.clone()
+    }
+
+    #[tokio::test]
+    async fn mint_pair_device_uri_includes_host_when_some() {
+        let state_dir = tempfile::tempdir().unwrap();
+        let hh_pub = test_hh_pub();
+        let (uri, expires_at_unix) = mint_pair_device_uri(
+            state_dir.path(),
+            &hh_pub,
+            Some("Reissue Test Home"),
+            Some("192.168.15.12:8091".to_string()),
+        )
+        .await
+        .expect("mint");
+
+        assert!(uri.starts_with("soyeht://household/pair-device?"), "uri={uri}");
+        assert!(uri.contains("v=1"), "uri={uri}");
+        assert!(uri.contains("&hh_pub="), "uri={uri}");
+        assert!(uri.contains("&nonce="), "uri={uri}");
+        assert!(uri.contains("&ttl="), "uri={uri}");
+        // host is percent-encoded (the ':' is preserved per the encoder).
+        assert!(
+            uri.contains("&host=192.168.15.12:8091"),
+            "host fallback must be present: uri={uri}"
+        );
+
+        // expires_at_unix matches the persisted snapshot's expiry.
+        let snap: Option<household_rs::pair_device::PairDeviceWindowSnapshot> =
+            household_rs::storage::read_optional_cbor(
+                &household_rs::storage::pair_device_window_path(state_dir.path()),
+            )
+            .expect("read snapshot");
+        let snap = snap.expect("snapshot present");
+        assert_eq!(snap.expires_at_unix, expires_at_unix);
+    }
+
+    #[tokio::test]
+    async fn mint_pair_device_uri_omits_host_when_none() {
+        let state_dir = tempfile::tempdir().unwrap();
+        let hh_pub = test_hh_pub();
+        let (uri, _expires) =
+            mint_pair_device_uri(state_dir.path(), &hh_pub, Some("Reissue Test Home"), None)
+                .await
+                .expect("mint");
+        assert!(!uri.contains("&host="), "host must be omitted when None: uri={uri}");
+        assert!(uri.contains("v=1") && uri.contains("&nonce="), "uri={uri}");
     }
 }

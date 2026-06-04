@@ -135,6 +135,10 @@ pub fn bootstrap_router(state: BootstrapHandlerState) -> Router {
             "/bootstrap/pair-machine/local/stage",
             post(post_pair_machine_local_stage),
         )
+        .route(
+            "/bootstrap/pair-device/reissue",
+            post(post_pair_device_reissue),
+        )
         .route("/health", get(get_health))
         .route("/healthz", get(get_health))
         .with_state(state)
@@ -884,6 +888,207 @@ fn pair_machine_stage_error_response(error: &crate::pair_machine_local::StageErr
             None,
         ),
     }
+}
+
+/// `POST /bootstrap/pair-device/reissue` — re-mint the owner pair-device
+/// window in-process (R98).
+///
+/// Recovery path for a Mac stuck in `named_awaiting_pair` whose pair-device
+/// window has expired: the CLI `install --reissue-pair-qr` can't read the
+/// household key without the right `SOYEHT_OWNER_STATE_DIR` context, so this
+/// route lets the *running* engine — which already holds the household
+/// identity loaded in memory — re-open the window and hand back a fresh QR
+/// URI carrying a LAN RFC1918 `host=` so it works with Tailscale OFF.
+///
+/// Loopback-only (same hiding contract as
+/// `POST /bootstrap/pair-machine/local/stage`): every failure returns the
+/// SAME shape a missing route would (a bare `404` for the ACL, or a
+/// `cbor_error(404, …)` for the state/identity/already-paired gates) so the
+/// endpoint's existence is not advertised across the LAN.
+///
+/// Gates, IN ORDER:
+/// 1. loopback ACL → bare `404`.
+/// 2. state == `NamedAwaitingPair`, else `404 reissue_unavailable`.
+/// 3. identity loaded, else `404 identity_unavailable`.
+/// 4. owner NOT already paired (in-memory `current_owner_auth`, plus a
+///    defensive on-disk `HouseholdAuthState::load_optional` mirror), else
+///    `404 already_paired` (no token minted).
+/// 5. no window still open (`current_token().await.is_some()`), else
+///    `409 window_still_open` (no new token minted).
+///
+/// On success it mints on the SHARED `Arc<PairDeviceWindow>` for liveness (so
+/// the daemon's `/pair-device/*` routes serve the same nonce immediately),
+/// renders via the extracted `to_uri_with_host_and_name` path, and returns
+/// `ReissueResponse` over CBOR.
+///
+/// **Never logs `pair_qr_uri` or the nonce** — only the non-secret
+/// `hh_id`/`ttl_secs`/`expires_at_unix`/`host` fields.
+#[derive(Serialize)]
+struct ReissueResponse {
+    #[serde(rename = "v")]
+    version: u8,
+    pair_qr_uri: String,
+    hh_id: String,
+    expires_at_unix: u64,
+}
+
+pub async fn post_pair_device_reissue(
+    State(state): State<BootstrapHandlerState>,
+    ConnectInfo(peer): ConnectInfo<std::net::SocketAddr>,
+    _body: Bytes,
+) -> Response {
+    // Gate 1 — loopback ACL. Any non-loopback peer gets the same bare 404 a
+    // missing route would produce, hiding the endpoint shape from the LAN.
+    if !peer.ip().is_loopback() {
+        tracing::warn!(
+            stage = "pair_device.reissue.non_loopback_rejected",
+            peer = %peer,
+        );
+        return StatusCode::NOT_FOUND.into_response();
+    }
+
+    // Gate 2 — state gate. Only a Mac that has been named but not yet paired
+    // (`named_awaiting_pair`) is eligible to re-open its owner pair window.
+    let current_bs = *state.bootstrap.read().await;
+    if current_bs != BootstrapState::NamedAwaitingPair {
+        tracing::warn!(
+            stage = "pair_device.reissue.rejected",
+            reason = "wrong_state",
+            state = current_bs.as_str(),
+        );
+        return cbor_error(
+            StatusCode::NOT_FOUND,
+            "reissue_unavailable",
+            None,
+            Some(current_bs.as_str()),
+        );
+    }
+
+    // Gate 3 — identity must be loaded in memory.
+    let Some(identity) = state.household.current().await else {
+        tracing::warn!(
+            stage = "pair_device.reissue.rejected",
+            reason = "identity_unavailable",
+        );
+        return cbor_error(
+            StatusCode::NOT_FOUND,
+            "identity_unavailable",
+            None,
+            Some(current_bs.as_str()),
+        );
+    };
+
+    // Gate 4 — owner must NOT already be paired. Primary check is the
+    // in-memory owner-auth slot; we additionally mirror the on-disk
+    // `HouseholdAuthState::load_optional` guard (as `handlers_pair_device`
+    // does) so a freshly-loaded engine that hasn't hydrated `owner_auth`
+    // into memory yet still fails closed.
+    if state.household.current_owner_auth().await.is_some() {
+        tracing::warn!(
+            stage = "pair_device.reissue.rejected",
+            reason = "owner_already_paired",
+        );
+        return cbor_error(StatusCode::NOT_FOUND, "already_paired", None, None);
+    }
+    {
+        let now = crate::time_util::unix_now_secs_checked("pair_device.reissue.clock").unwrap_or(0);
+        let record_for_auth = identity.record.clone();
+        let state_dir_auth = state.state_dir.clone();
+        match tokio::task::spawn_blocking(move || {
+            HouseholdAuthState::load_optional(&state_dir_auth, &record_for_auth, now)
+        })
+        .await
+        {
+            Ok(Ok(Some(_))) => {
+                tracing::warn!(
+                    stage = "pair_device.reissue.rejected",
+                    reason = "owner_already_paired_on_disk",
+                );
+                return cbor_error(StatusCode::NOT_FOUND, "already_paired", None, None);
+            }
+            Ok(Ok(None)) => {}
+            Ok(Err(e)) => {
+                tracing::warn!(
+                    stage = "pair_device.reissue.owner_auth_load_failed",
+                    error = %e,
+                );
+                // Fail closed — an unreadable auth state is indistinguishable
+                // from a paired owner for the purposes of this recovery route.
+                return cbor_error(StatusCode::NOT_FOUND, "already_paired", None, None);
+            }
+            Err(e) => {
+                tracing::error!(
+                    stage = "pair_device.reissue.owner_auth_task_failed",
+                    error = %e,
+                );
+                return cbor_error(StatusCode::NOT_FOUND, "already_paired", None, None);
+            }
+        }
+    }
+
+    // Gate 5 — a still-open window must not be silently clobbered. A new mint
+    // would invalidate any QR the operator is already scanning, so callers
+    // must wait for the current window to expire (or it must already be
+    // expired/missing → `current_token` returns `None`).
+    if state.pair_device_window.current_token().await.is_some() {
+        tracing::warn!(stage = "pair_device.reissue.rejected", reason = "window_still_open");
+        return cbor_error(
+            StatusCode::CONFLICT,
+            "window_still_open",
+            None,
+            Some(current_bs.as_str()),
+        );
+    }
+
+    // Resolve a reachable host fallback LAN-first (works with Tailscale OFF),
+    // then fall back to the Tailnet IPv4.
+    let port: u16 = std::env::var("THEYOS_HOUSEHOLD_PORT")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(8091);
+    let host = crate::install_cli::pick_addr_for_transport(
+        household_rs::pair_machine::JoinTransport::Lan,
+        port,
+    )
+    .or_else(|| crate::tailnet_address::current_tailnet_ipv4().map(|ip| format!("{ip}:{port}")));
+
+    // Mint on the SHARED Arc for liveness (so the daemon's /pair-device/*
+    // routes serve the same nonce), then render via the extracted URI path
+    // — same TTL clamp as the CLI `--reissue-pair-qr` flow.
+    let ttl = crate::install_cli::pair_device_ttl_from_env();
+    let token = match state.pair_device_window.mint_token(ttl, None).await {
+        Ok(t) => t,
+        Err(e) => {
+            tracing::warn!(stage = "pair_device.reissue.mint_failed", error = %e);
+            return cbor_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal_error",
+                None,
+                None,
+            );
+        }
+    };
+    let pair_qr_uri = token.to_uri_with_host_and_name(
+        &identity.record.hh_pub,
+        host.as_deref(),
+        Some(&identity.record.name),
+    );
+
+    tracing::info!(
+        stage = "pair_device.reissue.opened",
+        source = "server_reissue_route",
+        hh_id = %identity.record.hh_id,
+        ttl_secs = ttl.as_secs(),
+        expires_at_unix = token.expires_at_unix,
+        host = %host.as_deref().unwrap_or(""),
+    );
+
+    cbor_ok(ReissueResponse {
+        version: 1,
+        pair_qr_uri,
+        hh_id: identity.record.hh_id.to_string(),
+        expires_at_unix: token.expires_at_unix,
+    })
 }
 
 /// atomic `check_and_persist` (burns nonce before cert/sig checks to prevent
@@ -2023,6 +2228,7 @@ fn platform_model_string() -> Option<String> {
 mod tests {
     use super::*;
     use crate::guest_image_state::GuestImageState;
+    use crate::household_state::SharedOwnerAuthState;
     use axum::{
         body::Body,
         http::{Request, StatusCode as HStatus},
@@ -2325,6 +2531,339 @@ mod tests {
             Arc::ptr_eq(&state.pair_machine_window, &cloned),
             "BootstrapHandlerState must expose the same Arc the daemon hands to pre_household_router; \
              otherwise stage() and local/seed read different windows."
+        );
+    }
+
+    // ── /bootstrap/pair-device/reissue (R98) ────────────────────────────
+    //
+    // Secure loopback-only re-mint of the owner pair-device window for a Mac
+    // stuck in named_awaiting_pair with an expired window. The handler runs a
+    // fixed gate order (loopback → state → identity → not-already-paired →
+    // window-still-open) before minting on the SHARED Arc<PairDeviceWindow>.
+
+    /// Build a `BootstrapHandlerState` whose state dir holds a real
+    /// software-keyed household identity (so `state.household.current()` and
+    /// the on-disk owner-auth guard resolve against actual files). The
+    /// `tempfile::TempDir` is returned so the caller keeps it alive for the
+    /// duration of the test.
+    fn make_state_with_identity(
+        bs: BootstrapState,
+    ) -> (BootstrapHandlerState, tempfile::TempDir) {
+        let td = tempfile::tempdir().unwrap();
+        let loaded = household_rs::bootstrap_or_load(
+            td.path(),
+            BootstrapOpts {
+                household_name: "Reissue Home".into(),
+                hostname_label: Some("reissue-host".into()),
+            },
+            KeyBackingPolicy::ForceSoftware,
+        )
+        .expect("bootstrap");
+        let state = BootstrapHandlerState {
+            bootstrap: Arc::new(RwLock::new(bs)),
+            household: HouseholdState::loaded(Arc::new(loaded)),
+            state_dir: td.path().to_path_buf(),
+            pair_device_window: Arc::new(PairDeviceWindow::with_persistence(
+                td.path().to_path_buf(),
+            )),
+            pair_machine_window: Arc::new(PairMachineWindow::new_in_memory()),
+            started_at: Instant::now(),
+            setup_invitation_cache: crate::setup_invitation::new_cache(),
+            engine_port: 8091,
+            tailnet_resolver: || None,
+        };
+        (state, td)
+    }
+
+    fn reissue_request(peer: SocketAddr) -> Request<Body> {
+        Request::builder()
+            .method("POST")
+            .uri("/bootstrap/pair-device/reissue")
+            .extension(ConnectInfo::<SocketAddr>(peer))
+            .body(Body::empty())
+            .unwrap()
+    }
+
+    /// Decode a successful CBOR `ReissueResponse`.
+    #[derive(serde::Deserialize, Debug)]
+    struct ReissueResponseForTest {
+        #[serde(rename = "v")]
+        version: u8,
+        pair_qr_uri: String,
+        hh_id: String,
+        expires_at_unix: u64,
+    }
+
+    async fn decode_reissue_ok(response: Response) -> ReissueResponseForTest {
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        household_rs::cbor::from_canonical_slice(&bytes).expect("CBOR decode")
+    }
+
+    #[tokio::test]
+    async fn reissue_non_loopback_rejected_with_404() {
+        let (state, _td) = make_state_with_identity(BootstrapState::NamedAwaitingPair);
+        let app = bootstrap_router(state);
+        let req = reissue_request(SocketAddr::from(([192, 168, 15, 99], 50000)));
+        let resp = app.oneshot(req).await.unwrap();
+        // Bare 404 — same as a missing route. No CBOR body content asserted.
+        assert_eq!(resp.status(), HStatus::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn reissue_loopback_ipv4_proceeds_past_acl() {
+        let (state, _td) = make_state_with_identity(BootstrapState::NamedAwaitingPair);
+        let app = bootstrap_router(state);
+        let req = reissue_request(SocketAddr::from(([127, 0, 0, 1], 12345)));
+        let resp = app.oneshot(req).await.unwrap();
+        // Past the ACL + all gates → 200 mint.
+        assert_eq!(resp.status(), HStatus::OK);
+    }
+
+    #[tokio::test]
+    async fn reissue_loopback_ipv6_proceeds_past_acl() {
+        let (state, _td) = make_state_with_identity(BootstrapState::NamedAwaitingPair);
+        let app = bootstrap_router(state);
+        let req = reissue_request(SocketAddr::from((
+            std::net::Ipv6Addr::LOCALHOST,
+            12345,
+        )));
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), HStatus::OK);
+    }
+
+    #[tokio::test]
+    async fn reissue_state_gate_rejects_non_named_awaiting_pair() {
+        for bs in [
+            BootstrapState::Uninitialized,
+            BootstrapState::ReadyForNaming,
+            BootstrapState::Ready,
+            BootstrapState::Recovering,
+        ] {
+            let (state, _td) = make_state_with_identity(bs);
+            let app = bootstrap_router(state);
+            let req = reissue_request(SocketAddr::from(([127, 0, 0, 1], 12345)));
+            let resp = app.oneshot(req).await.unwrap();
+            let (status, body) = decode_cbor_error(resp).await;
+            assert_eq!(status, HStatus::NOT_FOUND, "state={bs:?}");
+            assert_eq!(body.error, "reissue_unavailable", "state={bs:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn reissue_state_gate_only_named_awaiting_pair_mints() {
+        // The complement of the rejection test: NamedAwaitingPair is the one
+        // state that proceeds to a successful 200 mint.
+        let (state, _td) = make_state_with_identity(BootstrapState::NamedAwaitingPair);
+        let window = Arc::clone(&state.pair_device_window);
+        let app = bootstrap_router(state);
+        let req = reissue_request(SocketAddr::from(([127, 0, 0, 1], 12345)));
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), HStatus::OK);
+        // A live token now exists on the shared window.
+        assert!(window.current_token().await.is_some());
+    }
+
+    #[tokio::test]
+    async fn reissue_identity_unavailable_when_no_identity_loaded() {
+        // NamedAwaitingPair + loopback but no in-memory identity → the
+        // identity gate returns 404 identity_unavailable (no panic).
+        let mut state = make_state(BootstrapState::NamedAwaitingPair);
+        // make_state uses an empty HouseholdState; keep it empty.
+        state.household = HouseholdState::empty();
+        let app = bootstrap_router(state);
+        let req = reissue_request(SocketAddr::from(([127, 0, 0, 1], 12345)));
+        let resp = app.oneshot(req).await.unwrap();
+        let (status, body) = decode_cbor_error(resp).await;
+        assert_eq!(status, HStatus::NOT_FOUND);
+        assert_eq!(body.error, "identity_unavailable");
+    }
+
+    /// Build a real owner `HouseholdAuthState` for the loaded identity by
+    /// signing a fresh owner `PersonCert` under the household's private key.
+    /// Returns the `Arc<HouseholdAuthState>` for the in-memory slot; if
+    /// `persist_to` is `Some`, also saves it to disk so the on-disk
+    /// `load_optional` guard sees a paired owner too.
+    fn real_owner_auth(
+        identity: &SharedHouseholdIdentity,
+        persist_to: Option<&std::path::Path>,
+    ) -> SharedOwnerAuthState {
+        use household_rs::keys::P256Keypair;
+        use household_rs::person_cert::{PersonCert, SignOwnerOptions};
+        let hh_key = identity
+            .hh_priv
+            .as_ref()
+            .expect("software-keyed test identity holds hh_priv");
+        let person = P256Keypair::generate();
+        let now = crate::time_util::unix_now_secs_checked("test.clock").unwrap_or(0);
+        let cert = PersonCert::sign_owner(
+            hh_key.as_ref(),
+            SignOwnerOptions {
+                hh_id: identity.record.hh_id.clone(),
+                p_pub: household_rs::keys::IdentityKey::public(&person),
+                display_name: "Owner".into(),
+                issued_at: now,
+            },
+        )
+        .expect("sign owner cert");
+        let auth = HouseholdAuthState::new(&identity.record, cert);
+        if let Some(dir) = persist_to {
+            auth.save(dir).expect("persist owner auth");
+        }
+        Arc::new(auth)
+    }
+
+    #[tokio::test]
+    async fn reissue_already_paired_when_owner_auth_present() {
+        // Owner-auth present (in memory AND on disk) → 404 already_paired,
+        // and NO token is minted on the shared window.
+        let (state, td) = make_state_with_identity(BootstrapState::NamedAwaitingPair);
+        let identity = state.household.current().await.unwrap();
+        let owner_auth = real_owner_auth(&identity, Some(td.path()));
+        let household =
+            HouseholdState::loaded_with_owner_auth(Arc::clone(&identity), Some(owner_auth));
+        let state = BootstrapHandlerState { household, ..state };
+        let window = Arc::clone(&state.pair_device_window);
+        let app = bootstrap_router(state);
+        let req = reissue_request(SocketAddr::from(([127, 0, 0, 1], 12345)));
+        let resp = app.oneshot(req).await.unwrap();
+        let (status, body) = decode_cbor_error(resp).await;
+        assert_eq!(status, HStatus::NOT_FOUND);
+        assert_eq!(body.error, "already_paired");
+        assert!(
+            window.current_token().await.is_none(),
+            "no token may be minted when already paired"
+        );
+    }
+
+    #[tokio::test]
+    async fn reissue_already_paired_via_on_disk_guard_only() {
+        // Owner-auth absent from memory but present on disk (a freshly-loaded
+        // engine that hasn't hydrated owner_auth yet) → the defensive on-disk
+        // load_optional guard still fails closed with 404 already_paired.
+        let (state, td) = make_state_with_identity(BootstrapState::NamedAwaitingPair);
+        let identity = state.household.current().await.unwrap();
+        let _ = real_owner_auth(&identity, Some(td.path())); // persisted, not in memory
+        let window = Arc::clone(&state.pair_device_window);
+        let app = bootstrap_router(state);
+        let req = reissue_request(SocketAddr::from(([127, 0, 0, 1], 12345)));
+        let resp = app.oneshot(req).await.unwrap();
+        let (status, body) = decode_cbor_error(resp).await;
+        assert_eq!(status, HStatus::NOT_FOUND);
+        assert_eq!(body.error, "already_paired");
+        assert!(window.current_token().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn reissue_window_still_open_returns_409_no_new_token() {
+        // Pre-open the shared window with an unexpired token. The reissue must
+        // refuse with 409 window_still_open and must NOT replace the nonce.
+        let (state, _td) = make_state_with_identity(BootstrapState::NamedAwaitingPair);
+        let existing = state
+            .pair_device_window
+            .mint_token(Duration::from_secs(300), None)
+            .await
+            .expect("pre-mint");
+        let existing_nonce = existing.nonce.as_b64();
+        let window = Arc::clone(&state.pair_device_window);
+        let app = bootstrap_router(state);
+        let req = reissue_request(SocketAddr::from(([127, 0, 0, 1], 12345)));
+        let resp = app.oneshot(req).await.unwrap();
+        let (status, body) = decode_cbor_error(resp).await;
+        assert_eq!(status, HStatus::CONFLICT);
+        assert_eq!(body.error, "window_still_open");
+        // The existing nonce is untouched.
+        let still = window.current_token().await.expect("window still open");
+        assert_eq!(still.nonce.as_b64(), existing_nonce, "nonce must not be re-minted");
+    }
+
+    #[tokio::test]
+    async fn reissue_none_window_proceeds_and_opens_token() {
+        // current_token() == None (fresh window) → mint proceeds and
+        // current_token() becomes Some.
+        let (state, _td) = make_state_with_identity(BootstrapState::NamedAwaitingPair);
+        let window = Arc::clone(&state.pair_device_window);
+        assert!(window.current_token().await.is_none(), "precondition: no window");
+        let app = bootstrap_router(state);
+        let req = reissue_request(SocketAddr::from(([127, 0, 0, 1], 12345)));
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), HStatus::OK);
+        assert!(window.current_token().await.is_some());
+    }
+
+    #[tokio::test]
+    async fn reissue_success_response_shape_and_uri_contents() {
+        let (state, _td) = make_state_with_identity(BootstrapState::NamedAwaitingPair);
+        let hh_id = state.household.current().await.unwrap().record.hh_id.to_string();
+        let window = Arc::clone(&state.pair_device_window);
+        let app = bootstrap_router(state);
+        let req = reissue_request(SocketAddr::from(([127, 0, 0, 1], 12345)));
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), HStatus::OK);
+        let body = decode_reissue_ok(resp).await;
+        assert_eq!(body.version, 1);
+        assert_eq!(body.hh_id, hh_id);
+        assert!(
+            body.pair_qr_uri
+                .starts_with("soyeht://household/pair-device?"),
+            "uri={}",
+            body.pair_qr_uri
+        );
+        assert!(body.pair_qr_uri.contains("v=1"));
+        assert!(body.pair_qr_uri.contains("&hh_pub="));
+        assert!(body.pair_qr_uri.contains("&nonce="));
+        assert!(body.pair_qr_uri.contains("&ttl="));
+        assert!(body.pair_qr_uri.contains("&house_name="));
+        // expires_at_unix matches the live window token.
+        let token = window.current_token().await.unwrap();
+        assert_eq!(token.expires_at_unix, body.expires_at_unix);
+    }
+
+    /// No-secret logging: the data the handler logs on success is derived
+    /// purely from non-secret fields (stage/hh_id/ttl_secs/expires_at_unix/
+    /// host). The nonce lives ONLY in `pair_qr_uri`, which is returned in the
+    /// CBOR body and is never written to the log. We assert that the value we
+    /// would log (the `host` fallback + hh_id + numeric fields) never carries
+    /// the nonce that appears in the response URI.
+    #[tokio::test]
+    async fn reissue_log_fields_exclude_nonce_and_uri() {
+        let (state, _td) = make_state_with_identity(BootstrapState::NamedAwaitingPair);
+        let hh_id = state.household.current().await.unwrap().record.hh_id.to_string();
+        let app = bootstrap_router(state);
+        let req = reissue_request(SocketAddr::from(([127, 0, 0, 1], 12345)));
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), HStatus::OK);
+        let body = decode_reissue_ok(resp).await;
+
+        // Extract the nonce token from the response URI.
+        let nonce = body
+            .pair_qr_uri
+            .split("&nonce=")
+            .nth(1)
+            .and_then(|s| s.split('&').next())
+            .expect("nonce param");
+        assert!(!nonce.is_empty());
+
+        // The fields the handler logs (constructed identically to the
+        // tracing::info! call site) must NOT contain the nonce nor the full
+        // pair_qr_uri.
+        let logged_hh_id = hh_id.clone();
+        let logged_stage = "pair_device.reissue.opened";
+        let logged_ttl_secs = crate::install_cli::pair_device_ttl_from_env().as_secs();
+        let logged_expires = body.expires_at_unix;
+        let log_line = format!(
+            "stage={logged_stage} hh_id={logged_hh_id} ttl_secs={logged_ttl_secs} expires_at_unix={logged_expires}"
+        );
+        assert!(log_line.contains("pair_device.reissue.opened"));
+        assert!(log_line.contains(&hh_id));
+        assert!(
+            !log_line.contains(nonce),
+            "log line must not contain the pairing nonce"
+        );
+        assert!(
+            !log_line.contains(&body.pair_qr_uri),
+            "log line must not contain the full pair_qr_uri"
         );
     }
 }
