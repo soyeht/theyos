@@ -507,7 +507,7 @@ pub struct PtyQuery {
 ///
 /// The validated ID is later prefixed with `soyeht_` by `PtyManager` to form
 /// the tmux session name (max 64 chars total).
-fn sanitize_session_id(raw: &str) -> Result<String, ApiError> {
+pub(crate) fn sanitize_session_id(raw: &str) -> Result<String, ApiError> {
     if raw.is_empty() {
         return Err(ApiError::bad_request("session id required"));
     }
@@ -570,6 +570,20 @@ pub async fn handle_terminal_pty(
     if let Err(e) = verify_session_owner(&state, &session_id, &container, &auth.username).await {
         return e.into_response();
     }
+
+    serve_authorized_terminal_pty(state, container, q, ws).await
+}
+
+pub(crate) async fn serve_authorized_terminal_pty(
+    state: SharedState,
+    container: String,
+    q: PtyQuery,
+    ws: WebSocketUpgrade,
+) -> Response {
+    let session_id = match sanitize_session_id(&q.session) {
+        Ok(s) => s,
+        Err(e) => return e.into_response(),
+    };
 
     // Lazy-open a PTY session for this conversation. The first WS attach
     // spawns the subprocess + creates the log file; subsequent attaches

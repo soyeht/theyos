@@ -264,8 +264,8 @@ fn is_link_local(ip: &IpAddr) -> bool {
     }
 }
 
-fn classify(name: &str, ip: &IpAddr) -> Option<InterfaceClass> {
-    if name.starts_with("tailscale") || is_tailscale(ip) {
+fn classify(_name: &str, ip: &IpAddr) -> Option<InterfaceClass> {
+    if crate::tailnet_address::is_tailnet_ip(*ip) {
         return Some(InterfaceClass::Tailscale);
     }
     if is_lan(ip) {
@@ -274,26 +274,11 @@ fn classify(name: &str, ip: &IpAddr) -> Option<InterfaceClass> {
     None
 }
 
-fn is_tailscale(ip: &IpAddr) -> bool {
-    match ip {
-        IpAddr::V4(v4) => {
-            // 100.64.0.0/10 (CGNAT) — Tailscale uses 100.64.0.0/10.
-            let oct = v4.octets();
-            oct[0] == 100 && (64..=127).contains(&oct[1])
-        }
-        IpAddr::V6(v6) => {
-            // fd7a:115c:a1e0::/48
-            let s = v6.segments();
-            s[0] == 0xfd7a && s[1] == 0x115c && s[2] == 0xa1e0
-        }
-    }
-}
-
 fn is_lan(ip: &IpAddr) -> bool {
     match ip {
         IpAddr::V4(v4) => v4.is_private(),
         IpAddr::V6(v6) => {
-            // ULA fc00::/7 (excluding the Tailscale ULA prefix already filtered above)
+            // ULA fc00::/7. Tailscale's ULA prefix is filtered first.
             let first = v6.segments()[0];
             (first & 0xfe00) == 0xfc00
         }
@@ -308,6 +293,12 @@ mod tests {
     fn classify_tailscale_v4() {
         let ip: IpAddr = "100.64.1.2".parse().unwrap();
         assert_eq!(classify("eth0", &ip), Some(InterfaceClass::Tailscale));
+    }
+
+    #[test]
+    fn classify_tailscale_named_non_tailnet_as_lan() {
+        let ip: IpAddr = "10.0.0.2".parse().unwrap();
+        assert_eq!(classify("tailscale0", &ip), Some(InterfaceClass::Lan));
     }
 
     #[test]

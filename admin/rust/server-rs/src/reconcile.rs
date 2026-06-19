@@ -154,6 +154,8 @@ mod tests {
             cpu_cores: None,
             ram_config_mb: None,
             disk_gb: None,
+            household_id: None,
+            household_machine_id: None,
         })
         .unwrap();
         db.update_status(&StatusUpdate {
@@ -234,6 +236,8 @@ mod tests {
             cpu_cores: None,
             ram_config_mb: None,
             disk_gb: None,
+            household_id: None,
+            household_machine_id: None,
         })
         .unwrap();
 

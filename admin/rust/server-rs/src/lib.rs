@@ -42,6 +42,7 @@ pub mod handlers_sign_machine_cert;
 pub mod handlers_terminal;
 pub mod handlers_terminal_attachments;
 pub mod health;
+pub mod household_attach_token;
 pub mod household_auth;
 pub mod household_bootstrap;
 pub mod household_listener;

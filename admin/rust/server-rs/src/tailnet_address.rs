@@ -13,7 +13,7 @@
 //! request. By steering the iPhone to the engine's Tailnet IP we guarantee
 //! the source IP is also a Tailnet address.
 
-use std::net::Ipv4Addr;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 /// Resolver function type — returns the engine's local Tailnet IPv4 if any.
 ///
@@ -40,6 +40,23 @@ const TAILSCALE_INTERFACE_PREFIXES: &[&str] = &["utun", "tailscale"];
 pub fn is_tailnet_ipv4(ip: Ipv4Addr) -> bool {
     let octets = ip.octets();
     octets[0] == 100 && (64..=127).contains(&octets[1])
+}
+
+/// `true` if `ip` is in Tailscale's IPv6 ULA range
+/// `fd7a:115c:a1e0::/48`.
+#[must_use]
+pub fn is_tailnet_ipv6(ip: Ipv6Addr) -> bool {
+    let segments = ip.segments();
+    segments[0] == 0xfd7a && segments[1] == 0x115c && segments[2] == 0xa1e0
+}
+
+/// `true` if `ip` is in one of Tailscale's well-known address ranges.
+#[must_use]
+pub fn is_tailnet_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => is_tailnet_ipv4(v4),
+        IpAddr::V6(v6) => is_tailnet_ipv6(v6),
+    }
 }
 
 /// Scan the local interface list and return the first IPv4 address that
@@ -130,8 +147,20 @@ mod tests {
 
     #[test]
     fn mid_cgnat_is_tailnet() {
-        // Caio's Mac Studio's actual Tailscale address from tonight's e2e.
-        assert!(is_tailnet_ipv4(Ipv4Addr::new(100, 103, 149, 48)));
+        assert!(is_tailnet_ipv4(Ipv4Addr::new(100, 64, 0, 10)));
+    }
+
+    #[test]
+    fn tailscale_ula_is_tailnet() {
+        assert!(is_tailnet_ipv6("fd7a:115c:a1e0::10".parse().unwrap()));
+        assert!(is_tailnet_ip("100.64.0.10".parse().unwrap()));
+        assert!(is_tailnet_ip("fd7a:115c:a1e0::10".parse().unwrap()));
+    }
+
+    #[test]
+    fn non_tailscale_ipv6_is_not_tailnet() {
+        assert!(!is_tailnet_ipv6("fd7a:115c:a1e1::10".parse().unwrap()));
+        assert!(!is_tailnet_ip("2001:db8::10".parse().unwrap()));
     }
 
     #[test]
@@ -198,7 +227,7 @@ mod tests {
     // body is unconditionally `Some(_)` / `None`.
     #[allow(clippy::unnecessary_wraps)]
     fn resolver_present() -> Option<Ipv4Addr> {
-        Some(Ipv4Addr::new(100, 103, 149, 48))
+        Some(Ipv4Addr::new(100, 64, 0, 10))
     }
 
     fn resolver_absent() -> Option<Ipv4Addr> {
@@ -208,7 +237,7 @@ mod tests {
     #[test]
     fn build_url_when_resolver_returns_tailnet_ip() {
         let (url, source) = build_mac_engine_url(8091, resolver_present);
-        assert_eq!(url.as_deref(), Some("http://100.103.149.48:8091"));
+        assert_eq!(url.as_deref(), Some("http://100.64.0.10:8091"));
         assert_eq!(source, MacEngineUrlSource::Tailnet);
     }
 
@@ -217,5 +246,37 @@ mod tests {
         let (url, source) = build_mac_engine_url(8091, resolver_absent);
         assert!(url.is_none());
         assert_eq!(source, MacEngineUrlSource::Fallback);
+    }
+
+    #[test]
+    fn no_experimental_transport_bleed_in_household_sources() {
+        let crate_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let relative_paths = [
+            "src/handlers_household_claws.rs",
+            "src/household_listener.rs",
+            "src/tailnet_address.rs",
+            "tests/household_instances.rs",
+            "tests/claim_setup_invitation_contract.rs",
+        ];
+        let forbidden_tokens = [
+            ["10", ".", "44"].concat(),
+            ["Product", " ", "A"].concat(),
+            ["n", "v", "p", "n"].concat(),
+            ["Claw", "Share", "Bridge"].concat(),
+            ["is_household_", "mesh"].concat(),
+            ["mesh", "-only"].concat(),
+            ["mesh_", "peer"].concat(),
+        ];
+
+        for relative_path in relative_paths {
+            let source = std::fs::read_to_string(crate_root.join(relative_path))
+                .unwrap_or_else(|e| panic!("read {relative_path}: {e}"));
+            for token in &forbidden_tokens {
+                assert!(
+                    !source.contains(token),
+                    "{relative_path} must not reintroduce {token}"
+                );
+            }
+        }
     }
 }

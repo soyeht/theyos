@@ -111,6 +111,8 @@ fn handle_instancedb_insert(params: &Value) -> Response {
         cpu_cores,
         ram_config_mb,
         disk_gb,
+        household_id: None,
+        household_machine_id: None,
     }) {
         Ok(()) => Response::ok_empty(),
         Err(e) => Response::err(e.to_string()),

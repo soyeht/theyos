@@ -13,7 +13,7 @@ const INSTANCE_COLS: &str = "id, name, container, claw_type, host_port, status, 
     vm_ip, vm_mac, efi_store_path, cidata_iso_path, disk_path, \
     guest_os, aux_storage_path, owner_id, \
     cpu_cores, ram_config_mb, disk_gb, \
-    desired_state, observed_state, deleted_at";
+    desired_state, observed_state, deleted_at, household_id, household_machine_id";
 
 /// User role within the multi-tenant system.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -405,6 +405,10 @@ pub struct NewInstance<'a> {
     pub ram_config_mb: Option<i64>,
     /// Disk size in GB (5-50). `None` uses DB default (10).
     pub disk_gb: Option<i64>,
+    /// Household id stamped for instances created through household `PoP` routes.
+    pub household_id: Option<&'a str>,
+    /// Engine machine id stamped for instances created through household `PoP` routes.
+    pub household_machine_id: Option<&'a str>,
 }
 
 /// A row from the instances table, as returned by queries.
@@ -463,6 +467,10 @@ pub struct InstanceRow {
     pub observed_state: Option<String>,
     /// Unix timestamp when the instance was soft-deleted. `None` = not deleted.
     pub deleted_at: Option<i64>,
+    /// Household id for household-created instances. `None` for legacy/admin rows.
+    pub household_id: Option<String>,
+    /// Engine machine id for household-created instances. `None` for legacy/admin rows.
+    pub household_machine_id: Option<String>,
 }
 
 impl InstanceDb {
@@ -553,6 +561,8 @@ impl InstanceDb {
         Self::migrate_instance_events(conn)?;
         // Migration: add desired_state, observed_state, deleted_at columns
         Self::migrate_desired_observed_state(conn)?;
+        // Migration: add household instance scope columns
+        Self::migrate_household_scope(conn)?;
         // Migration: add public claw site mappings
         Self::migrate_public_sites(conn)?;
         // Migration: add Cloudflare tunnel config (single-row table for the
@@ -578,6 +588,43 @@ impl InstanceDb {
             );",
         )
         .map_err(|e| StoreError::Internal(format!("migrate cloudflare_config: {e}")))?;
+        Ok(())
+    }
+
+    /// Add household scope columns for rows created through household `PoP` routes.
+    fn migrate_household_scope(conn: &Connection) -> Result<(), StoreError> {
+        let has_household_id: bool = conn
+            .query_row(
+                "SELECT COUNT(*) > 0 FROM pragma_table_info('instances') WHERE name='household_id'",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|e| StoreError::Internal(format!("check household_id column: {e}")))?;
+        let has_household_machine_id: bool = conn
+            .query_row(
+                "SELECT COUNT(*) > 0 FROM pragma_table_info('instances') WHERE name='household_machine_id'",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|e| {
+                StoreError::Internal(format!("check household_machine_id column: {e}"))
+            })?;
+
+        if !has_household_id {
+            conn.execute_batch("ALTER TABLE instances ADD COLUMN household_id TEXT;")
+                .map_err(|e| StoreError::Internal(format!("migrate household_id: {e}")))?;
+        }
+        if !has_household_machine_id {
+            conn.execute_batch("ALTER TABLE instances ADD COLUMN household_machine_id TEXT;")
+                .map_err(|e| StoreError::Internal(format!("migrate household_machine_id: {e}")))?;
+        }
+        conn.execute_batch(
+            "CREATE INDEX IF NOT EXISTS idx_instances_household_scope \
+                 ON instances(household_id, created_at, id) \
+                 WHERE household_id IS NOT NULL AND deleted_at IS NULL;",
+        )
+        .map_err(|e| StoreError::Internal(format!("migrate household_scope index: {e}")))?;
+
         Ok(())
     }
 
@@ -1138,8 +1185,9 @@ impl InstanceDb {
             "INSERT INTO instances (id, name, container, claw_type, status, \
              sunset_port_direct_date, guest_os, aux_storage_path, \
              cpu_cores, ram_config_mb, disk_gb, \
+             household_id, household_machine_id, \
              created_at, updated_at) \
-             VALUES (?1, ?2, ?3, ?4, 'provisioning', ?5, ?6, ?7, ?8, ?9, ?10, \
+             VALUES (?1, ?2, ?3, ?4, 'provisioning', ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, \
              CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
             params![
                 inst.id,
@@ -1152,6 +1200,8 @@ impl InstanceDb {
                 inst.cpu_cores,
                 inst.ram_config_mb,
                 inst.disk_gb,
+                inst.household_id,
+                inst.household_machine_id,
             ],
         )
         .map_err(|e| StoreError::Internal(format!("insert: {e}")))?;
@@ -1212,6 +1262,61 @@ impl InstanceDb {
         .map_err(|e| StoreError::Internal(format!("get_by_container: {e}")))
     }
 
+    /// Get a non-deleted instance by container when it belongs to the local household.
+    ///
+    /// The container column is globally unique in the local DB, but household
+    /// routes must not use the unscoped `get_by_container` helper. Missing,
+    /// foreign-household, legacy-unscoped, and soft-deleted rows all return
+    /// `Ok(None)` so callers can expose a uniform 404.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the lock is poisoned or the SQL query fails.
+    pub fn get_for_household_by_container(
+        &self,
+        container: &str,
+        household_id: &str,
+    ) -> Result<Option<InstanceRow>, StoreError> {
+        let conn = self.conn()?;
+        conn.query_row(
+            &format!(
+                "SELECT {INSTANCE_COLS} FROM instances \
+                 WHERE container = ?1 AND household_id = ?2 AND deleted_at IS NULL"
+            ),
+            params![container, household_id],
+            row_to_instance,
+        )
+        .optional()
+        .map_err(|e| StoreError::Internal(format!("get_for_household_by_container: {e}")))
+    }
+
+    /// Get a non-deleted instance by id when it belongs to the local household.
+    ///
+    /// Mutating household routes use this stricter helper instead of the
+    /// status helper, so legacy/unscoped rows remain readable by the Fase 2
+    /// fallback but cannot be mutated through owner-`PoP`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the lock is poisoned or the SQL query fails.
+    pub fn get_for_household_by_id(
+        &self,
+        id: &str,
+        household_id: &str,
+    ) -> Result<Option<InstanceRow>, StoreError> {
+        let conn = self.conn()?;
+        conn.query_row(
+            &format!(
+                "SELECT {INSTANCE_COLS} FROM instances \
+                 WHERE id = ?1 AND household_id = ?2 AND deleted_at IS NULL"
+            ),
+            params![id, household_id],
+            row_to_instance,
+        )
+        .optional()
+        .map_err(|e| StoreError::Internal(format!("get_for_household_by_id: {e}")))
+    }
+
     /// List all instances ordered by `created_at` DESC.
     ///
     /// # Errors
@@ -1232,6 +1337,62 @@ impl InstanceDb {
 
         rows.map(|row| row.map_err(|e| StoreError::Internal(format!("list row: {e}"))))
             .collect()
+    }
+
+    /// List non-deleted instances stamped for a household on this local engine DB.
+    ///
+    /// The DB itself is local to one engine/machine. `household_machine_id` is
+    /// persisted as metadata and defense-in-depth, but list membership is scoped
+    /// by `household_id` only so restored/imported local rows from the same
+    /// household remain visible.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the lock is poisoned or the SQL query fails.
+    pub fn list_for_household(&self, household_id: &str) -> Result<Vec<InstanceRow>, StoreError> {
+        let conn = self.conn()?;
+        let mut stmt = conn
+            .prepare(&format!(
+                "SELECT {INSTANCE_COLS} FROM instances \
+                 WHERE household_id = ?1 AND deleted_at IS NULL \
+                 ORDER BY created_at DESC"
+            ))
+            .map_err(|e| StoreError::Internal(format!("list_for_household prepare: {e}")))?;
+
+        let rows = stmt
+            .query_map(params![household_id], row_to_instance)
+            .map_err(|e| StoreError::Internal(format!("list_for_household query: {e}")))?;
+
+        rows.map(|row| {
+            row.map_err(|e| StoreError::Internal(format!("list_for_household row: {e}")))
+        })
+        .collect()
+    }
+
+    /// Get a non-deleted instance when it is either scoped to the supplied
+    /// household or still fully legacy/unscoped.
+    ///
+    /// Partially-scoped rows and rows scoped to another household are hidden.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the lock is poisoned or the SQL query fails.
+    pub fn get_for_household_status(
+        &self,
+        id: &str,
+        household_id: &str,
+    ) -> Result<Option<InstanceRow>, StoreError> {
+        let Some(row) = self.get(id)? else {
+            return Ok(None);
+        };
+        if row.deleted_at.is_some() {
+            return Ok(None);
+        }
+        match &row.household_id {
+            Some(row_household) if row_household == household_id => Ok(Some(row)),
+            None if row.household_machine_id.is_none() => Ok(Some(row)),
+            _ => Ok(None),
+        }
     }
 
     /// List all instances including soft-deleted ones. For admin/audit views.
@@ -2856,9 +3017,10 @@ impl InstanceDb {
              sunset_port_direct_date, guest_os, aux_storage_path, \
              cpu_cores, ram_config_mb, disk_gb, \
              desired_state, observed_state, \
+             household_id, household_machine_id, \
              created_at, updated_at) \
              VALUES (?1, ?2, ?3, ?4, 'provisioning', ?5, ?6, ?7, ?8, ?9, ?10, \
-             'running', 'provisioning', \
+             'running', 'provisioning', ?11, ?12, \
              CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
             params![
                 inst.id,
@@ -2871,6 +3033,8 @@ impl InstanceDb {
                 cpu,
                 ram,
                 disk,
+                inst.household_id,
+                inst.household_machine_id,
             ],
         )
         .map_err(|e| StoreError::Internal(format!("insert_with_leases instance: {e}")))?;
@@ -2953,9 +3117,10 @@ impl InstanceDb {
              sunset_port_direct_date, guest_os, aux_storage_path, \
              cpu_cores, ram_config_mb, disk_gb, \
              desired_state, observed_state, \
+             household_id, household_machine_id, \
              created_at, updated_at) \
              VALUES (?1, ?2, ?3, ?4, 'provisioning', ?5, ?6, ?7, ?8, ?9, ?10, \
-             'running', 'provisioning', \
+             'running', 'provisioning', ?11, ?12, \
              CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
             params![
                 inst.id,
@@ -2968,6 +3133,8 @@ impl InstanceDb {
                 cpu,
                 ram,
                 disk,
+                inst.household_id,
+                inst.household_machine_id,
             ],
         )
         .map_err(|e| StoreError::Internal(format!("insert_with_warm_pool instance: {e}")))?;
@@ -3802,6 +3969,8 @@ fn row_to_instance(row: &rusqlite::Row<'_>) -> rusqlite::Result<InstanceRow> {
         desired_state: row.get(30)?,
         observed_state: row.get(31)?,
         deleted_at: row.get(32)?,
+        household_id: row.get(33)?,
+        household_machine_id: row.get(34)?,
     })
 }
 
@@ -3811,6 +3980,50 @@ mod instance_db_tests {
 
     fn open_temp() -> InstanceDb {
         InstanceDb::open(":memory:").expect("open :memory:")
+    }
+
+    fn instance_column_exists(conn: &Connection, name: &str) -> bool {
+        conn.query_row(
+            "SELECT COUNT(*) > 0 FROM pragma_table_info('instances') WHERE name = ?1",
+            params![name],
+            |row| row.get(0),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn household_scope_migration_repairs_partial_columns() {
+        for schema in [
+            "CREATE TABLE instances (
+                id TEXT PRIMARY KEY,
+                created_at DATETIME,
+                deleted_at DATETIME,
+                household_id TEXT
+            );",
+            "CREATE TABLE instances (
+                id TEXT PRIMARY KEY,
+                created_at DATETIME,
+                deleted_at DATETIME,
+                household_machine_id TEXT
+            );",
+        ] {
+            let conn = Connection::open_in_memory().unwrap();
+            conn.execute_batch(schema).unwrap();
+
+            InstanceDb::migrate_household_scope(&conn).unwrap();
+
+            assert!(instance_column_exists(&conn, "household_id"));
+            assert!(instance_column_exists(&conn, "household_machine_id"));
+            let index_exists: bool = conn
+                .query_row(
+                    "SELECT COUNT(*) > 0 FROM sqlite_master \
+                     WHERE type = 'index' AND name = 'idx_instances_household_scope'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert!(index_exists);
+        }
     }
 
     fn foo_inst() -> NewInstance<'static> {
@@ -3825,6 +4038,8 @@ mod instance_db_tests {
             cpu_cores: None,
             ram_config_mb: None,
             disk_gb: None,
+            household_id: None,
+            household_machine_id: None,
         }
     }
 
@@ -3912,6 +4127,8 @@ mod instance_db_tests {
             cpu_cores: None,
             ram_config_mb: None,
             disk_gb: None,
+            household_id: None,
+            household_machine_id: None,
         })
         .unwrap();
         db.insert(&NewInstance {
@@ -3925,10 +4142,214 @@ mod instance_db_tests {
             cpu_cores: None,
             ram_config_mb: None,
             disk_gb: None,
+            household_id: None,
+            household_machine_id: None,
         })
         .unwrap();
         let rows = db.list().unwrap();
         assert_eq!(rows.len(), 2);
+    }
+
+    #[test]
+    fn household_list_includes_only_matching_active_household_rows() {
+        let db = open_temp();
+        db.insert(&NewInstance {
+            id: "inst-household-alpha",
+            name: "household-alpha",
+            container: "picoclaw-household-alpha",
+            claw_type: "picoclaw",
+            sunset_date: "2026-12-31",
+            guest_os: None,
+            aux_storage_path: None,
+            cpu_cores: None,
+            ram_config_mb: None,
+            disk_gb: None,
+            household_id: Some("hh_alpha"),
+            household_machine_id: Some("m_alpha"),
+        })
+        .unwrap();
+        db.insert(&NewInstance {
+            id: "inst-household-beta",
+            name: "household-beta",
+            container: "picoclaw-household-beta",
+            claw_type: "picoclaw",
+            sunset_date: "2026-12-31",
+            guest_os: None,
+            aux_storage_path: None,
+            cpu_cores: None,
+            ram_config_mb: None,
+            disk_gb: None,
+            household_id: Some("hh_beta"),
+            household_machine_id: Some("m_beta"),
+        })
+        .unwrap();
+        db.insert(&NewInstance {
+            id: "inst-legacy",
+            name: "legacy",
+            container: "picoclaw-legacy",
+            claw_type: "picoclaw",
+            sunset_date: "2026-12-31",
+            guest_os: None,
+            aux_storage_path: None,
+            cpu_cores: None,
+            ram_config_mb: None,
+            disk_gb: None,
+            household_id: None,
+            household_machine_id: None,
+        })
+        .unwrap();
+        db.insert(&NewInstance {
+            id: "inst-household-deleted",
+            name: "household-deleted",
+            container: "picoclaw-household-deleted",
+            claw_type: "picoclaw",
+            sunset_date: "2026-12-31",
+            guest_os: None,
+            aux_storage_path: None,
+            cpu_cores: None,
+            ram_config_mb: None,
+            disk_gb: None,
+            household_id: Some("hh_alpha"),
+            household_machine_id: Some("m_alpha"),
+        })
+        .unwrap();
+        db.soft_delete("inst-household-deleted").unwrap();
+
+        let rows = db.list_for_household("hh_alpha").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].id, "inst-household-alpha");
+        assert_eq!(rows[0].household_id.as_deref(), Some("hh_alpha"));
+        assert_eq!(rows[0].household_machine_id.as_deref(), Some("m_alpha"));
+    }
+
+    #[test]
+    fn household_status_accepts_matching_household_independent_of_machine_metadata() {
+        let db = open_temp();
+        db.insert(&NewInstance {
+            id: "inst-household-alpha",
+            name: "household-alpha",
+            container: "picoclaw-household-alpha",
+            claw_type: "picoclaw",
+            sunset_date: "2026-12-31",
+            guest_os: None,
+            aux_storage_path: None,
+            cpu_cores: None,
+            ram_config_mb: None,
+            disk_gb: None,
+            household_id: Some("hh_alpha"),
+            household_machine_id: None,
+        })
+        .unwrap();
+
+        let row = db
+            .get_for_household_status("inst-household-alpha", "hh_alpha")
+            .unwrap()
+            .expect("matching household row");
+        assert_eq!(row.id, "inst-household-alpha");
+    }
+
+    #[test]
+    fn household_status_accepts_legacy_unscoped_rows() {
+        let db = open_temp();
+        db.insert(&NewInstance {
+            id: "inst-legacy",
+            name: "legacy",
+            container: "picoclaw-legacy",
+            claw_type: "picoclaw",
+            sunset_date: "2026-12-31",
+            guest_os: None,
+            aux_storage_path: None,
+            cpu_cores: None,
+            ram_config_mb: None,
+            disk_gb: None,
+            household_id: None,
+            household_machine_id: None,
+        })
+        .unwrap();
+
+        assert!(
+            db.get_for_household_status("inst-legacy", "hh_alpha")
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn household_status_hides_machine_only_partial_scope() {
+        let db = open_temp();
+        db.insert(&NewInstance {
+            id: "inst-machine-only",
+            name: "machine-only",
+            container: "picoclaw-machine-only",
+            claw_type: "picoclaw",
+            sunset_date: "2026-12-31",
+            guest_os: None,
+            aux_storage_path: None,
+            cpu_cores: None,
+            ram_config_mb: None,
+            disk_gb: None,
+            household_id: None,
+            household_machine_id: Some("m_alpha"),
+        })
+        .unwrap();
+
+        assert!(
+            db.get_for_household_status("inst-machine-only", "hh_alpha")
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn household_status_hides_deleted_or_other_household_rows() {
+        let db = open_temp();
+        db.insert(&NewInstance {
+            id: "inst-other-household",
+            name: "other-household",
+            container: "picoclaw-other-household",
+            claw_type: "picoclaw",
+            sunset_date: "2026-12-31",
+            guest_os: None,
+            aux_storage_path: None,
+            cpu_cores: None,
+            ram_config_mb: None,
+            disk_gb: None,
+            household_id: Some("hh_beta"),
+            household_machine_id: Some("m_beta"),
+        })
+        .unwrap();
+        db.insert(&NewInstance {
+            id: "inst-deleted",
+            name: "deleted",
+            container: "picoclaw-deleted",
+            claw_type: "picoclaw",
+            sunset_date: "2026-12-31",
+            guest_os: None,
+            aux_storage_path: None,
+            cpu_cores: None,
+            ram_config_mb: None,
+            disk_gb: None,
+            household_id: Some("hh_alpha"),
+            household_machine_id: Some("m_alpha"),
+        })
+        .unwrap();
+        db.soft_delete("inst-deleted").unwrap();
+
+        assert!(
+            db.get_for_household_status("inst-other-household", "hh_alpha")
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            db.get_for_household_status("inst-deleted", "hh_alpha")
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            db.get_for_household_status("inst-missing", "hh_alpha")
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
@@ -4165,6 +4586,8 @@ mod instance_db_tests {
             cpu_cores: None,
             ram_config_mb: None,
             disk_gb: None,
+            household_id: None,
+            household_machine_id: None,
         })
         .unwrap();
         db.set_custom_domain("inst-foo", "app.example.com", "cf-1")
@@ -4193,6 +4616,8 @@ mod instance_db_tests {
             cpu_cores: None,
             ram_config_mb: None,
             disk_gb: None,
+            household_id: None,
+            household_machine_id: None,
         })
         .unwrap();
         db.insert(&NewInstance {
@@ -4206,6 +4631,8 @@ mod instance_db_tests {
             cpu_cores: None,
             ram_config_mb: None,
             disk_gb: None,
+            household_id: None,
+            household_machine_id: None,
         })
         .unwrap();
 
@@ -4264,6 +4691,190 @@ mod instance_db_tests {
         assert_eq!(row.id, "inst-foo");
         assert_eq!(row.container, "picoclaw-foo");
         assert!(db.get_by_container("nonexistent").unwrap().is_none());
+    }
+
+    #[test]
+    fn get_for_household_by_container_filters_household_and_deleted_state() {
+        let db = open_temp();
+        db.insert(&NewInstance {
+            id: "inst-household-alpha",
+            name: "household-alpha",
+            container: "picoclaw-household-alpha",
+            claw_type: "picoclaw",
+            sunset_date: "2026-12-31",
+            guest_os: None,
+            aux_storage_path: None,
+            cpu_cores: None,
+            ram_config_mb: None,
+            disk_gb: None,
+            household_id: Some("hh_alpha"),
+            household_machine_id: Some("m_alpha"),
+        })
+        .unwrap();
+        db.insert(&NewInstance {
+            id: "inst-other-household",
+            name: "other-household",
+            container: "picoclaw-other-household",
+            claw_type: "picoclaw",
+            sunset_date: "2026-12-31",
+            guest_os: None,
+            aux_storage_path: None,
+            cpu_cores: None,
+            ram_config_mb: None,
+            disk_gb: None,
+            household_id: Some("hh_beta"),
+            household_machine_id: Some("m_beta"),
+        })
+        .unwrap();
+        db.insert(&NewInstance {
+            id: "inst-legacy",
+            name: "legacy",
+            container: "picoclaw-legacy",
+            claw_type: "picoclaw",
+            sunset_date: "2026-12-31",
+            guest_os: None,
+            aux_storage_path: None,
+            cpu_cores: None,
+            ram_config_mb: None,
+            disk_gb: None,
+            household_id: None,
+            household_machine_id: None,
+        })
+        .unwrap();
+        db.insert(&NewInstance {
+            id: "inst-deleted",
+            name: "deleted",
+            container: "picoclaw-deleted",
+            claw_type: "picoclaw",
+            sunset_date: "2026-12-31",
+            guest_os: None,
+            aux_storage_path: None,
+            cpu_cores: None,
+            ram_config_mb: None,
+            disk_gb: None,
+            household_id: Some("hh_alpha"),
+            household_machine_id: Some("m_alpha"),
+        })
+        .unwrap();
+        db.soft_delete("inst-deleted").unwrap();
+
+        let row = db
+            .get_for_household_by_container("picoclaw-household-alpha", "hh_alpha")
+            .unwrap()
+            .expect("matching household row");
+        assert_eq!(row.id, "inst-household-alpha");
+        assert!(
+            db.get_for_household_by_container("picoclaw-other-household", "hh_alpha")
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            db.get_for_household_by_container("picoclaw-legacy", "hh_alpha")
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            db.get_for_household_by_container("picoclaw-deleted", "hh_alpha")
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            db.get_for_household_by_container("picoclaw-missing", "hh_alpha")
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn get_for_household_by_id_filters_household_and_deleted_state() {
+        let db = open_temp();
+        db.insert(&NewInstance {
+            id: "inst-household-alpha",
+            name: "household-alpha",
+            container: "picoclaw-household-alpha",
+            claw_type: "picoclaw",
+            sunset_date: "2026-12-31",
+            guest_os: None,
+            aux_storage_path: None,
+            cpu_cores: None,
+            ram_config_mb: None,
+            disk_gb: None,
+            household_id: Some("hh_alpha"),
+            household_machine_id: Some("m_alpha"),
+        })
+        .unwrap();
+        db.insert(&NewInstance {
+            id: "inst-other-household",
+            name: "other-household",
+            container: "picoclaw-other-household",
+            claw_type: "picoclaw",
+            sunset_date: "2026-12-31",
+            guest_os: None,
+            aux_storage_path: None,
+            cpu_cores: None,
+            ram_config_mb: None,
+            disk_gb: None,
+            household_id: Some("hh_beta"),
+            household_machine_id: Some("m_beta"),
+        })
+        .unwrap();
+        db.insert(&NewInstance {
+            id: "inst-legacy",
+            name: "legacy",
+            container: "picoclaw-legacy",
+            claw_type: "picoclaw",
+            sunset_date: "2026-12-31",
+            guest_os: None,
+            aux_storage_path: None,
+            cpu_cores: None,
+            ram_config_mb: None,
+            disk_gb: None,
+            household_id: None,
+            household_machine_id: None,
+        })
+        .unwrap();
+        db.insert(&NewInstance {
+            id: "inst-deleted",
+            name: "deleted",
+            container: "picoclaw-deleted",
+            claw_type: "picoclaw",
+            sunset_date: "2026-12-31",
+            guest_os: None,
+            aux_storage_path: None,
+            cpu_cores: None,
+            ram_config_mb: None,
+            disk_gb: None,
+            household_id: Some("hh_alpha"),
+            household_machine_id: Some("m_alpha"),
+        })
+        .unwrap();
+        db.soft_delete("inst-deleted").unwrap();
+
+        let row = db
+            .get_for_household_by_id("inst-household-alpha", "hh_alpha")
+            .unwrap()
+            .expect("matching household row");
+        assert_eq!(row.container, "picoclaw-household-alpha");
+        assert!(
+            db.get_for_household_by_id("inst-other-household", "hh_alpha")
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            db.get_for_household_by_id("inst-legacy", "hh_alpha")
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            db.get_for_household_by_id("inst-deleted", "hh_alpha")
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            db.get_for_household_by_id("inst-missing", "hh_alpha")
+                .unwrap()
+                .is_none()
+        );
     }
 
     // ── Terminal workspace tests ─────────────────────────────────────────────
@@ -4817,6 +5428,8 @@ mod instance_db_tests {
             cpu_cores: None,
             ram_config_mb: None,
             disk_gb: None,
+            household_id: None,
+            household_machine_id: None,
         })
         .unwrap();
         db.insert(&NewInstance {
@@ -4830,6 +5443,8 @@ mod instance_db_tests {
             cpu_cores: None,
             ram_config_mb: None,
             disk_gb: None,
+            household_id: None,
+            household_machine_id: None,
         })
         .unwrap();
 
@@ -5442,6 +6057,8 @@ mod instance_db_tests {
             cpu_cores: None,
             ram_config_mb: None,
             disk_gb: None,
+            household_id: None,
+            household_machine_id: None,
         })
         .unwrap();
         db.create_lease(&NewLease {

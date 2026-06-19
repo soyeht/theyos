@@ -526,6 +526,8 @@ pub async fn handle_create_instance_body(
                 cpu_cores: Some(i64::from(cpu_cores)),
                 ram_config_mb: Some(i64::from(ram_mb)),
                 disk_gb: Some(i64::from(disk_gb)),
+                household_id: None,
+                household_machine_id: None,
             };
             if use_warm_pool {
                 st.instance_db
@@ -683,14 +685,13 @@ pub async fn handle_instance_status(
 
 // ─── Actions ─────────────────────────────────────────────────────────────────
 
-/// Shared logic: resolve instance, execute flow, return (name, container, `claw_type`).
-async fn execute_instance_flow(
+/// Shared logic after the caller has already authorized and resolved the row.
+pub(crate) async fn execute_instance_flow_for_row(
     state: &SharedState,
-    auth: &AuthUser,
     id: &str,
+    row: store_rs::InstanceRow,
     flow_type: FlowType,
 ) -> Result<(String, String, String), ApiError> {
-    let row = require_instance(state, auth, id).await?;
     let (name, container, claw_type) = (row.name, row.container, row.claw_type);
 
     let flow_req = ExecuteFlowRequest {
@@ -741,10 +742,20 @@ pub async fn handle_stop_instance(
     auth: AuthUser,
     Path(id): Path<String>,
 ) -> Result<StatusCode, ApiError> {
-    let (_, container, _) = execute_instance_flow(&state, &auth, &id, FlowType::Stop).await?;
+    let row = require_instance(&state, &auth, &id).await?;
+    stop_instance_for_row(&state, &auth.username, &id, row).await
+}
+
+pub(crate) async fn stop_instance_for_row(
+    state: &SharedState,
+    actor_label: &str,
+    id: &str,
+    row: store_rs::InstanceRow,
+) -> Result<StatusCode, ApiError> {
+    let (_, container, _) = execute_instance_flow_for_row(state, id, row, FlowType::Stop).await?;
 
     let st = state.clone();
-    let iid = id.clone();
+    let iid = id.to_string();
     blocking(move || {
         st.instance_db
             .set_desired_state(&iid, store_rs::DesiredState::Stopped)?;
@@ -763,22 +774,22 @@ pub async fn handle_stop_instance(
 
     info!(
         "[instances] user={} action=stop instance={id} container={container}",
-        auth.username
+        actor_label
     );
-    let snapshot = current_capacity_snapshot(&state).await;
+    let snapshot = current_capacity_snapshot(state).await;
     // Record instance event (append-only audit trail)
     let _ = state
         .instance_db
         .record_instance_event(&store_rs::NewInstanceEvent {
-            instance_id: Some(&id),
+            instance_id: Some(id),
             event_type: "stopped",
-            actor: &auth.username,
+            actor: actor_label,
             detail: Some(&format!("container={container}")),
             resource_snapshot: snapshot.as_deref(),
         });
-    state.spawn_audit(
-        Some(id),
-        auth.username,
+    state.clone().spawn_audit(
+        Some(id.to_string()),
+        actor_label.to_string(),
         "stop".to_string(),
         Some(format!("container={container}")),
     );
@@ -797,6 +808,15 @@ pub async fn handle_restart_instance(
     Path(id): Path<String>,
 ) -> Result<StatusCode, ApiError> {
     let row = require_instance(&state, &auth, &id).await?;
+    restart_instance_for_row(&state, &auth.username, &id, row).await
+}
+
+pub(crate) async fn restart_instance_for_row(
+    state: &SharedState,
+    actor_label: &str,
+    id: &str,
+    row: store_rs::InstanceRow,
+) -> Result<StatusCode, ApiError> {
     let cpu = u32::try_from(row.cpu_cores.unwrap_or(2)).unwrap_or(2);
     let ram = u32::try_from(row.ram_config_mb.unwrap_or(2048)).unwrap_or(2048);
     let guest_os = row.guest_os.clone();
@@ -811,12 +831,12 @@ pub async fn handle_restart_instance(
         let _cap_guard = state.capacity_lock.lock().await;
         let needs_runtime_lease = !state
             .instance_db
-            .has_active_lease("instance", &id, "runtime")
+            .has_active_lease("instance", id, "runtime")
             .map_err(ApiError::from)?;
 
         if needs_runtime_lease {
             if let Err(cap_err) = crate::capacity::check_capacity(
-                &state,
+                state,
                 &host,
                 &crate::capacity::CapacityRequest {
                     cpu_cores: cpu,
@@ -836,7 +856,7 @@ pub async fn handle_restart_instance(
                 .instance_db
                 .create_lease(&store_rs::NewLease {
                     owner_type: "instance",
-                    owner_id: &id,
+                    owner_id: id,
                     lease_kind: "runtime",
                     cpu_cores: i64::from(cpu),
                     ram_mb: i64::from(ram),
@@ -848,19 +868,19 @@ pub async fn handle_restart_instance(
         }
     }
 
-    let (_, container, _) = match execute_instance_flow(&state, &auth, &id, FlowType::Restart).await
-    {
-        Ok(out) => out,
-        Err(err) => {
-            if acquired_runtime_lease {
-                let _ = state.instance_db.release_lease("instance", &id, "runtime");
+    let (_, container, _) =
+        match execute_instance_flow_for_row(state, id, row, FlowType::Restart).await {
+            Ok(out) => out,
+            Err(err) => {
+                if acquired_runtime_lease {
+                    let _ = state.instance_db.release_lease("instance", id, "runtime");
+                }
+                return Err(err);
             }
-            return Err(err);
-        }
-    };
+        };
 
     let st = state.clone();
-    let iid = id.clone();
+    let iid = id.to_string();
     blocking(move || {
         st.instance_db
             .set_desired_state(&iid, store_rs::DesiredState::Running)?;
@@ -877,28 +897,27 @@ pub async fn handle_restart_instance(
     })
     .await??;
 
-    if let Err(e) = crate::public_sites::ensure_public_site_targets_for_instance(&state, &id).await
-    {
+    if let Err(e) = crate::public_sites::ensure_public_site_targets_for_instance(state, id).await {
         warn!("[instances] restart public site forward restore failed for {id}: {e}");
     }
 
     info!(
         "[instances] user={} action=restart instance={id} container={container}",
-        auth.username
+        actor_label
     );
-    let snapshot = current_capacity_snapshot(&state).await;
+    let snapshot = current_capacity_snapshot(state).await;
     let _ = state
         .instance_db
         .record_instance_event(&store_rs::NewInstanceEvent {
-            instance_id: Some(&id),
+            instance_id: Some(id),
             event_type: "started",
-            actor: &auth.username,
+            actor: actor_label,
             detail: Some(&format!("container={container}")),
             resource_snapshot: snapshot.as_deref(),
         });
-    state.spawn_audit(
-        Some(id),
-        auth.username,
+    state.clone().spawn_audit(
+        Some(id.to_string()),
+        actor_label.to_string(),
         "restart".to_string(),
         Some(format!("container={container}")),
     );
@@ -916,10 +935,21 @@ pub async fn handle_rebuild_instance(
     auth: AuthUser,
     Path(id): Path<String>,
 ) -> Result<StatusCode, ApiError> {
-    let (_, container, _) = execute_instance_flow(&state, &auth, &id, FlowType::Rebuild).await?;
+    let row = require_instance(&state, &auth, &id).await?;
+    rebuild_instance_for_row(&state, &auth.username, &id, row).await
+}
+
+pub(crate) async fn rebuild_instance_for_row(
+    state: &SharedState,
+    actor_label: &str,
+    id: &str,
+    row: store_rs::InstanceRow,
+) -> Result<StatusCode, ApiError> {
+    let (_, container, _) =
+        execute_instance_flow_for_row(state, id, row, FlowType::Rebuild).await?;
 
     let st = state.clone();
-    let iid = id.clone();
+    let iid = id.to_string();
     blocking(move || {
         st.instance_db
             .update_status(&StatusUpdate {
@@ -934,28 +964,27 @@ pub async fn handle_rebuild_instance(
     })
     .await??;
 
-    if let Err(e) = crate::public_sites::ensure_public_site_targets_for_instance(&state, &id).await
-    {
+    if let Err(e) = crate::public_sites::ensure_public_site_targets_for_instance(state, id).await {
         warn!("[instances] rebuild public site forward restore failed for {id}: {e}");
     }
 
     info!(
         "[instances] user={} action=rebuild instance={id} container={container}",
-        auth.username
+        actor_label
     );
-    let snapshot = current_capacity_snapshot(&state).await;
+    let snapshot = current_capacity_snapshot(state).await;
     let _ = state
         .instance_db
         .record_instance_event(&store_rs::NewInstanceEvent {
-            instance_id: Some(&id),
+            instance_id: Some(id),
             event_type: "rebuilt",
-            actor: &auth.username,
+            actor: actor_label,
             detail: Some(&format!("container={container}")),
             resource_snapshot: snapshot.as_deref(),
         });
-    state.spawn_audit(
-        Some(id),
-        auth.username,
+    state.clone().spawn_audit(
+        Some(id.to_string()),
+        actor_label.to_string(),
         "rebuild".to_string(),
         Some(format!("container={container}")),
     );
@@ -974,21 +1003,30 @@ pub async fn handle_delete_instance(
     Path(id): Path<String>,
 ) -> Result<StatusCode, ApiError> {
     let row = require_instance(&state, &auth, &id).await?;
-    let delete_started_snapshot = current_capacity_snapshot(&state).await;
+    delete_instance_for_row(&state, &auth.username, &id, row).await
+}
+
+pub(crate) async fn delete_instance_for_row(
+    state: &SharedState,
+    actor_label: &str,
+    id: &str,
+    row: store_rs::InstanceRow,
+) -> Result<StatusCode, ApiError> {
+    let delete_started_snapshot = current_capacity_snapshot(state).await;
     let _ = state
         .instance_db
         .record_instance_event(&store_rs::NewInstanceEvent {
-            instance_id: Some(&id),
+            instance_id: Some(id),
             event_type: "delete_started",
-            actor: &auth.username,
+            actor: actor_label,
             detail: Some(&format!("container={}", row.container)),
             resource_snapshot: delete_started_snapshot.as_deref(),
         });
 
-    let (_, container, _) = execute_instance_flow(&state, &auth, &id, FlowType::Delete).await?;
+    let (_, container, _) = execute_instance_flow_for_row(state, id, row, FlowType::Delete).await?;
 
     let st = state.clone();
-    let iid = id.clone();
+    let iid = id.to_string();
     let container_for_ws = container.clone();
     blocking(move || {
         // Clean up terminal workspaces (they reference the container).
@@ -1006,21 +1044,21 @@ pub async fn handle_delete_instance(
 
     info!(
         "[instances] user={} action=delete instance={id} container={container}",
-        auth.username
+        actor_label
     );
-    let snapshot = current_capacity_snapshot(&state).await;
+    let snapshot = current_capacity_snapshot(state).await;
     let _ = state
         .instance_db
         .record_instance_event(&store_rs::NewInstanceEvent {
-            instance_id: Some(&id),
+            instance_id: Some(id),
             event_type: "delete_completed",
-            actor: &auth.username,
+            actor: actor_label,
             detail: Some(&format!("container={container}")),
             resource_snapshot: snapshot.as_deref(),
         });
-    state.spawn_audit(
-        Some(id),
-        auth.username,
+    state.clone().spawn_audit(
+        Some(id.to_string()),
+        actor_label.to_string(),
         "delete".to_string(),
         Some(format!("container={container}")),
     );

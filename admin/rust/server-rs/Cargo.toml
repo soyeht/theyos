@@ -97,7 +97,7 @@ pty-process   = { workspace = true }
 tokio-stream  = { workspace = true }
 
 [dev-dependencies]
-axum-test    = "17"
+axum-test    = { version = "17", features = ["ws"] }
 serde_json   = { workspace = true }
 tokio        = { workspace = true }
 tower        = { workspace = true }

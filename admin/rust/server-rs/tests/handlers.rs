@@ -147,6 +147,8 @@ impl TestFixture {
                 cpu_cores: None,
                 ram_config_mb: None,
                 disk_gb: None,
+                household_id: None,
+                household_machine_id: None,
             })
             .expect("insert alice instance");
         instance_db
@@ -176,6 +178,8 @@ impl TestFixture {
                 cpu_cores: None,
                 ram_config_mb: None,
                 disk_gb: None,
+                household_id: None,
+                household_machine_id: None,
             })
             .expect("insert admin instance");
         instance_db

@@ -1315,7 +1315,14 @@ pub async fn handle_mobile_create_instance(
         _ => return Err(ApiError::forbidden("admin access required")),
     }
 
-    create_mobile_instance_for_actor(state, username, req).await
+    create_mobile_instance_for_actor(state, username, req, None).await
+}
+
+/// Household scope stamped on instances created through household `PoP` routes.
+#[derive(Clone, Debug)]
+pub(crate) struct HouseholdInstanceScope {
+    pub household_id: String,
+    pub household_machine_id: String,
 }
 
 /// Shared mobile-shaped create-instance implementation.
@@ -1330,6 +1337,7 @@ pub(crate) async fn create_mobile_instance_for_actor(
     state: SharedState,
     username: String,
     req: MobileCreateInstanceReq,
+    household_scope: Option<HouseholdInstanceScope>,
 ) -> Result<Response, ApiError> {
     // Validate name
     let name = store_rs::normalize_slug(&req.name);
@@ -1591,7 +1599,14 @@ pub(crate) async fn create_mobile_instance_for_actor(
         let sdate = sunset_date.clone();
         let gos = guest_os.clone();
         let resource_snapshot = create_started_snapshot.clone();
+        let household_scope = household_scope.clone();
         blocking(move || {
+            let household_id = household_scope
+                .as_ref()
+                .map(|scope| scope.household_id.as_str());
+            let household_machine_id = household_scope
+                .as_ref()
+                .map(|scope| scope.household_machine_id.as_str());
             let new_instance = store_rs::NewInstance {
                 id: &iid,
                 name: &n,
@@ -1603,6 +1618,8 @@ pub(crate) async fn create_mobile_instance_for_actor(
                 cpu_cores: Some(i64::from(cpu_cores)),
                 ram_config_mb: Some(i64::from(ram_mb)),
                 disk_gb: Some(i64::from(disk_gb)),
+                household_id,
+                household_machine_id,
             };
             if use_warm_pool {
                 st.instance_db

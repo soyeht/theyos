@@ -496,6 +496,9 @@ pub async fn bootstrap_household(shared_state: Option<SharedState>) {
         let claws_state = handlers_household_claws::HouseholdClawsState {
             shared: state,
             household: identity_state.clone(),
+            attach_tokens: Arc::new(
+                crate::household_attach_token::HouseholdAttachTokenStore::new(),
+            ),
         };
         axum::Router::new()
             .route(
@@ -516,11 +519,46 @@ pub async fn bootstrap_household(shared_state: Option<SharedState>) {
             )
             .route(
                 "/api/v1/household/instances",
-                axum::routing::post(handlers_household_claws::handle_household_create_instance),
+                axum::routing::get(handlers_household_claws::handle_household_list_instances)
+                    .post(handlers_household_claws::handle_household_create_instance),
             )
             .route(
                 "/api/v1/household/instances/{id}/status",
                 axum::routing::get(handlers_household_claws::handle_household_instance_status),
+            )
+            .route(
+                "/api/v1/household/instances/{id}/stop",
+                axum::routing::post(handlers_household_claws::handle_household_stop_instance),
+            )
+            .route(
+                "/api/v1/household/instances/{id}/restart",
+                axum::routing::post(handlers_household_claws::handle_household_restart_instance),
+            )
+            .route(
+                "/api/v1/household/instances/{id}/rebuild",
+                axum::routing::post(handlers_household_claws::handle_household_rebuild_instance),
+            )
+            .route(
+                "/api/v1/household/instances/{id}",
+                axum::routing::delete(handlers_household_claws::handle_household_delete_instance),
+            )
+            .route(
+                "/api/v1/household/terminals/{container}/workspaces",
+                axum::routing::get(handlers_household_claws::handle_household_list_workspaces)
+                    .post(handlers_household_claws::handle_household_create_workspace),
+            )
+            .route(
+                "/api/v1/household/terminals/{container}/workspaces/{id}",
+                axum::routing::patch(handlers_household_claws::handle_household_rename_workspace)
+                    .delete(handlers_household_claws::handle_household_delete_workspace),
+            )
+            .route(
+                "/api/v1/household/terminals/{container}/attach-token",
+                axum::routing::post(handlers_household_claws::handle_household_mint_attach_token),
+            )
+            .route(
+                "/api/v1/household/terminals/{container}/pty",
+                axum::routing::get(handlers_household_claws::handle_household_terminal_pty),
             )
             .with_state(claws_state)
     });

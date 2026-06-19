@@ -89,13 +89,12 @@ fn no_tailnet() -> Option<std::net::Ipv4Addr> {
     None
 }
 
-/// Test resolver returning Caio's Mac Studio Tailnet address — the same
-/// value the iOS-side `TailnetAddressResolver` produced during the tonight
-/// e2e session. Matches `TailnetResolver`'s fn-pointer signature exactly,
-/// so the body is unconditionally `Some(_)`.
+/// Test resolver returning a privacy-safe Tailnet fixture. Matches
+/// `TailnetResolver`'s fn-pointer signature exactly, so the body is
+/// unconditionally `Some(_)`.
 #[allow(clippy::unnecessary_wraps)]
 fn fixed_tailnet_ip() -> Option<std::net::Ipv4Addr> {
-    Some(std::net::Ipv4Addr::new(100, 103, 149, 48))
+    Some(std::net::Ipv4Addr::new(100, 64, 0, 10))
 }
 
 fn make_state(bs: BootstrapState, state_dir: PathBuf) -> BootstrapHandlerState {
@@ -580,7 +579,7 @@ async fn claim_200_includes_mac_engine_url_when_tailnet_available() {
     let ack = decode_ack(&body);
     assert_eq!(
         ack.mac_engine_url.as_deref(),
-        Some("http://100.103.149.48:8091"),
+        Some("http://100.64.0.10:8091"),
         "engine must steer iPhone to its OWN Tailnet IPv4 + bound port",
     );
 }
