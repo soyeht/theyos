@@ -517,7 +517,38 @@ mod tests {
             offenders.is_empty(),
             "manual install scripts must not default daemon binds to every \
              interface; use loopback by default and require explicit exposure: \
-             {offenders:?}"
+            {offenders:?}"
+        );
+    }
+
+    #[test]
+    fn manual_install_scripts_pin_git_clones_to_reviewed_commits() {
+        let offenders: Vec<_> = catalog()
+            .iter()
+            .filter_map(|entry| {
+                let script = entry.install?.manual_script;
+                if !script.contains("git clone ") {
+                    return None;
+                }
+
+                let commit = entry.reviewed_upstream_commit;
+                let pins_reviewed_commit = !commit.is_empty()
+                    && script.contains(&format!("git checkout {commit}"))
+                    && script.contains("git rev-parse HEAD")
+                    && script.contains(&format!("\"{commit}\""));
+
+                if pins_reviewed_commit {
+                    None
+                } else {
+                    Some(entry.name)
+                }
+            })
+            .collect();
+
+        assert!(
+            offenders.is_empty(),
+            "manual install scripts that clone source repos must checkout and \
+             verify reviewed_upstream_commit before building: {offenders:?}"
         );
     }
 
