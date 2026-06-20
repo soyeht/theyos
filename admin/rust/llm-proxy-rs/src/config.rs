@@ -10,7 +10,7 @@ use std::path::PathBuf;
 /// Listening port the proxy binds to. Claws reach the proxy by reverse SSH
 /// tunnel that maps guest-loopback → host-loopback on this port. Default
 /// matches `core_rs::claw_llm::DEFAULT_LLM_PROXY_PORT`.
-pub const DEFAULT_PROXY_PORT: u16 = 18900;
+pub const DEFAULT_PROXY_PORT: u16 = core_rs::claw_llm::DEFAULT_LLM_PROXY_PORT;
 
 /// Env var override for the bind port.
 pub const ENV_PROXY_PORT: &str = "THEYOS_LLM_PROXY_PORT";

@@ -2562,6 +2562,7 @@ dependencies = [
  "async-trait",
  "axum",
  "bytes",
+ "core-rs",
  "futures-util",
  "hyper",
  "keystore-rs",

@@ -7,8 +7,8 @@
 //! server-rs runs as the `soyeht` service account.
 //!
 //! The boundary between them is one HTTP hop on loopback: every
-//! `/api/v1/llm/*` admin request lands here, gets the admin-cookie
-//! check, then is forwarded verbatim to `127.0.0.1:18900/admin/llm/*`.
+//! `/api/v1/llm/*` admin request lands here, gets the admin-cookie check,
+//! then is forwarded verbatim to the default LLM proxy loopback port.
 //! Method, headers we care about, body, and status all pass through; the
 //! proxy's typed error JSON is forwarded so the frontend sees one shape
 //! regardless of which crate produced the error.
@@ -21,19 +21,16 @@ use axum::body::{Body, Bytes};
 use axum::extract::{Path, Request, State};
 use axum::http::{HeaderMap, HeaderValue, Method, StatusCode};
 use axum::response::Response;
-use core_rs::error::ApiError;
+use core_rs::{claw_llm::DEFAULT_LLM_PROXY_PORT, error::ApiError};
 use std::sync::Arc;
 use std::time::Duration;
 
 use crate::auth::{AdminUser, AuthUser};
 use crate::state::SharedState;
 
-/// Default loopback endpoint of the host-side LLM proxy. Matches
-/// `llm_proxy::config::DEFAULT_PROXY_PORT` (18900). Overridden by the
-/// `THEYOS_LLM_PROXY_URL` env var in case an operator binds the daemon
-/// elsewhere — but the override MUST still resolve to a loopback host
-/// (see `ProxyClient::from_env`).
-const DEFAULT_PROXY_URL: &str = "http://127.0.0.1:18900";
+fn default_proxy_url() -> String {
+    format!("http://127.0.0.1:{DEFAULT_LLM_PROXY_PORT}")
+}
 
 /// Thin reqwest wrapper. Cheap to clone (`reqwest::Client` is internally
 /// `Arc`'d). Held inside `SharedState` so handlers don't construct a
@@ -73,8 +70,7 @@ impl ProxyClient {
     /// process is already broken.
     #[must_use]
     pub fn from_env() -> Self {
-        let raw =
-            std::env::var("THEYOS_LLM_PROXY_URL").unwrap_or_else(|_| DEFAULT_PROXY_URL.to_string());
+        let raw = std::env::var("THEYOS_LLM_PROXY_URL").unwrap_or_else(|_| default_proxy_url());
         let base = match validate_loopback_url(&raw) {
             Ok(normalized) => normalized,
             Err(reason) => {
@@ -87,7 +83,7 @@ impl ProxyClient {
                     reason = reason,
                     "THEYOS_LLM_PROXY_URL rejected; falling back to default loopback. LLM admin endpoints will only function if the proxy listens on the default."
                 );
-                DEFAULT_PROXY_URL.trim_end_matches('/').to_string()
+                default_proxy_url()
             }
         };
 
@@ -362,7 +358,7 @@ mod tests {
 
     #[test]
     fn validate_accepts_default_loopback() {
-        assert!(validate_loopback_url("http://127.0.0.1:18900").is_ok());
+        assert!(validate_loopback_url(&default_proxy_url()).is_ok());
     }
 
     #[test]
@@ -393,9 +389,7 @@ mod tests {
 
     #[test]
     fn trailing_slash_is_stripped() {
-        assert_eq!(
-            validate_loopback_url("http://127.0.0.1:18900/").unwrap(),
-            "http://127.0.0.1:18900"
-        );
+        let raw = format!("{}/", default_proxy_url());
+        assert_eq!(validate_loopback_url(&raw).unwrap(), default_proxy_url());
     }
 }

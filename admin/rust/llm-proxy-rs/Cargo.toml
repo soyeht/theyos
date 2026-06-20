@@ -39,6 +39,7 @@ tracing      = { workspace = true }
 tracing-subscriber = { workspace = true }
 
 # Internal crates
+core-rs      = { workspace = true }
 keystore-rs  = { workspace = true }
 
 # SIGHUP signalling for set-credential (Linux only; cfg-gated). macOS dev

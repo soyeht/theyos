@@ -14,6 +14,10 @@ export NODE_NO_WARNINGS="${NODE_NO_WARNINGS:-1}";
 export HERMES_HOME="${HERMES_HOME:-/opt/data}";
 export HERMES_MODEL="${HERMES_MODEL:-$THEYOS_LLM_MODEL}";
 export OPENCLAW_MODEL="${OPENCLAW_MODEL:-$THEYOS_LLM_MODEL}";
+export OPENCLAW_GATEWAY_PORT="${OPENCLAW_GATEWAY_PORT:-${THEYOS_OPENCLAW_GATEWAY_PORT:-18789}}";
+case "$OPENCLAW_GATEWAY_PORT" in
+  ''|*[!0-9]*) OPENCLAW_GATEWAY_PORT=18789 ;;
+esac;
 export OPENCLAW_GATEWAY_TOKEN="${OPENCLAW_GATEWAY_TOKEN:-${THEYOS_OPENCLAW_GATEWAY_TOKEN:-theyos-local}}";
 
 theyos_have() {
@@ -78,7 +82,7 @@ theyos_openclaw_config_set_json() {
 }
 
 theyos_start_openclaw_gateway() {
-  gateway_url="${OPENCLAW_GATEWAY_URL:-ws://127.0.0.1:18789}";
+  gateway_url="${OPENCLAW_GATEWAY_URL:-ws://127.0.0.1:$OPENCLAW_GATEWAY_PORT}";
   gateway_log="${OPENCLAW_GATEWAY_LOG:-/tmp/theyos-openclaw-gateway.log}";
   export OPENCLAW_GATEWAY_URL="$gateway_url";
   if theyos_openclaw_gateway_port_open && theyos_openclaw_gateway_health >/dev/null 2>&1; then
@@ -86,7 +90,7 @@ theyos_start_openclaw_gateway() {
   fi;
   if ! theyos_openclaw_gateway_port_open; then
     : >"$gateway_log" 2>/dev/null || true;
-    (openclaw gateway --allow-unconfigured --auth token --token "$OPENCLAW_GATEWAY_TOKEN" --bind loopback --port 18789 run >"$gateway_log" 2>&1 &);
+    (openclaw gateway --allow-unconfigured --auth token --token "$OPENCLAW_GATEWAY_TOKEN" --bind loopback --port "$OPENCLAW_GATEWAY_PORT" run >"$gateway_log" 2>&1 &);
   fi;
   i=0;
   while [ "$i" -lt 60 ]; do
@@ -104,11 +108,11 @@ theyos_start_openclaw_gateway() {
 
 theyos_openclaw_gateway_port_open() {
   if theyos_have nc; then
-    nc -z 127.0.0.1 18789 >/dev/null 2>&1;
+    nc -z 127.0.0.1 "$OPENCLAW_GATEWAY_PORT" >/dev/null 2>&1;
     return $?;
   fi;
   if theyos_have bash; then
-    bash -c ':</dev/tcp/127.0.0.1/18789' >/dev/null 2>&1;
+    bash -c ":</dev/tcp/127.0.0.1/$OPENCLAW_GATEWAY_PORT" >/dev/null 2>&1;
     return $?;
   fi;
   return 1;
@@ -152,7 +156,7 @@ theyos_openclaw_tui_local() {
     return 0;
   fi;
   theyos_start_openclaw_gateway || true;
-  openclaw tui --url "${OPENCLAW_GATEWAY_URL:-ws://127.0.0.1:18789}" --token "$OPENCLAW_GATEWAY_TOKEN" --timeout-ms "${THEYOS_OPENCLAW_TIMEOUT_MS:-180000}" || true
+  openclaw tui --url "${OPENCLAW_GATEWAY_URL:-ws://127.0.0.1:$OPENCLAW_GATEWAY_PORT}" --token "$OPENCLAW_GATEWAY_TOKEN" --timeout-ms "${THEYOS_OPENCLAW_TIMEOUT_MS:-180000}" || true
 }
 
 theyos_configure_builtin_claw_llm() {
@@ -194,7 +198,7 @@ theyos_start_builtin_claw_chat() {
         case "${THEYOS_OPENCLAW_CHAT_MODE:-local}" in
           gateway)
             theyos_start_openclaw_gateway || true;
-            openclaw tui --url "${OPENCLAW_GATEWAY_URL:-ws://127.0.0.1:18789}" --token "$OPENCLAW_GATEWAY_TOKEN" --timeout-ms "${THEYOS_OPENCLAW_TIMEOUT_MS:-180000}" || true
+            openclaw tui --url "${OPENCLAW_GATEWAY_URL:-ws://127.0.0.1:$OPENCLAW_GATEWAY_PORT}" --token "$OPENCLAW_GATEWAY_TOKEN" --timeout-ms "${THEYOS_OPENCLAW_TIMEOUT_MS:-180000}" || true
             ;;
           *)
             theyos_openclaw_tui_local
