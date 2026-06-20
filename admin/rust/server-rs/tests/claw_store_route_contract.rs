@@ -39,6 +39,17 @@ struct Expectation {
     fixture: Option<String>,
 }
 
+fn status_for_error_code(code: &str) -> Option<u16> {
+    match code {
+        "INVALID_INPUT" => Some(400),
+        "UNAUTHORIZED" => Some(401),
+        "FORBIDDEN" => Some(403),
+        "NOT_FOUND" => Some(404),
+        "CONFLICT" => Some(409),
+        _ => None,
+    }
+}
+
 fn contract() -> Contract {
     serde_json::from_str(include_str!(
         "../../../contracts/claw-store/v1/contract.json"
@@ -140,9 +151,31 @@ fn claw_store_v1_contract_metadata_is_valid() {
                 expectation.status
             );
             if let Some(fixture) = &expectation.fixture {
+                let body = contract.fixtures.get(fixture).unwrap_or_else(|| {
+                    panic!(
+                        "{} expectation {name} references missing fixture {fixture}",
+                        route.id
+                    )
+                });
+                if let Some(code) = body.get("code").and_then(Value::as_str) {
+                    if let Some(expected_status) = status_for_error_code(code) {
+                        assert_eq!(
+                            expectation.status, expected_status,
+                            "{} expectation {name} status must match fixture {fixture} code {code}",
+                            route.id
+                        );
+                    }
+                }
+                if fixture == "empty_body" {
+                    assert_eq!(
+                        expectation.status, 401,
+                        "{} expectation {name} uses empty_body outside the current 401 auth shape",
+                        route.id
+                    );
+                }
                 assert!(
-                    contract.fixtures.contains_key(fixture),
-                    "{} expectation {name} references missing fixture {fixture}",
+                    !fixture.ends_with("_schema"),
+                    "{} expectation {name} must declare an exact fixture, not schema fixture {fixture}",
                     route.id
                 );
             }
@@ -263,6 +296,79 @@ fn current_wire_quirks_are_explicitly_pinned() {
         assert_eq!(
             route(id).expectations["unavailable"].fixture.as_deref(),
             Some("install_unavailable_reasons_object")
+        );
+    }
+
+    for id in [
+        "admin_list_claws",
+        "admin_get_claw",
+        "admin_claw_availability",
+        "admin_install_claw",
+        "admin_uninstall_claw",
+    ] {
+        assert_eq!(
+            route(id).expectations["auth_error"].fixture.as_deref(),
+            Some("admin_auth_unauthorized")
+        );
+    }
+
+    for id in [
+        "mobile_list_claws",
+        "mobile_claw_availability",
+        "mobile_install_claw",
+        "mobile_uninstall_claw",
+    ] {
+        assert_eq!(
+            route(id).expectations["auth_error"].fixture.as_deref(),
+            Some("mobile_missing_auth")
+        );
+    }
+
+    for id in ["mobile_install_claw", "mobile_uninstall_claw"] {
+        assert_eq!(
+            route(id).expectations["admin_required"].fixture.as_deref(),
+            Some("mobile_admin_required")
+        );
+    }
+
+    for id in [
+        "admin_get_claw",
+        "admin_install_claw",
+        "admin_uninstall_claw",
+        "mobile_install_claw",
+        "mobile_uninstall_claw",
+        "household_install_claw",
+        "household_uninstall_claw",
+    ] {
+        assert_eq!(
+            route(id).expectations["unknown"].fixture.as_deref(),
+            Some("unknown_claw_error")
+        );
+    }
+
+    for id in [
+        "admin_install_claw",
+        "mobile_install_claw",
+        "household_install_claw",
+    ] {
+        assert_eq!(
+            route(id).expectations["already_ready"].fixture.as_deref(),
+            Some("already_ready_error")
+        );
+    }
+
+    for id in [
+        "admin_uninstall_claw",
+        "mobile_uninstall_claw",
+        "household_uninstall_claw",
+    ] {
+        assert_eq!(
+            route(id).expectations["not_ready"].fixture.as_deref(),
+            Some("not_installed_error")
+        );
+        assert_eq!(
+            route(id).expectations["instances_exist"].fixture.as_deref(),
+            Some("uninstall_instances_exist_error")
         );
     }
 }

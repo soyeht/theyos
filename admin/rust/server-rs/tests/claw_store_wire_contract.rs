@@ -4,6 +4,7 @@ use axum::{
     Router,
     body::{Body, to_bytes},
     http::{Method, Request, StatusCode, header},
+    middleware,
     response::{IntoResponse, Response},
     routing::{get, post},
 };
@@ -27,6 +28,7 @@ use household_rs::{
 use jobs_rs::Store as JobsStore;
 use serde_json::{Value, json};
 use server_rs::{
+    auth::require_auth,
     handlers_claws, handlers_household_claws,
     handlers_household_claws::HouseholdClawsState,
     handlers_mobile,
@@ -37,7 +39,7 @@ use server_rs::{
     state::{AppState, SharedState},
 };
 use session_rs::SessionStore;
-use store_rs::{InstanceDb, UserRole};
+use store_rs::{InstanceDb, NewInstance, UserRole};
 use terminal_rs::pty::PtyManager;
 use tower::ServiceExt;
 use vmrunner_rs::VmRunner;
@@ -168,6 +170,7 @@ fn shared_state() -> SharedState {
 
 fn admin_router(state: SharedState) -> Router {
     Router::new()
+        .route("/api/v1/claws", get(handlers_claws::handle_list_claws))
         .route(
             "/api/v1/claws/{name}/availability",
             get(handlers_claws::handle_claw_availability),
@@ -176,6 +179,20 @@ fn admin_router(state: SharedState) -> Router {
             "/api/v1/claws/{name}/install",
             post(handlers_claws::handle_install_claw),
         )
+        .route(
+            "/api/v1/claws/{name}/uninstall",
+            post(handlers_claws::handle_uninstall_claw),
+        )
+        .with_state(state)
+}
+
+fn admin_auth_router(state: SharedState) -> Router {
+    Router::new()
+        .route("/api/v1/claws", get(handlers_claws::handle_list_claws))
+        .layer(middleware::from_fn_with_state(
+            Arc::clone(&state),
+            require_auth,
+        ))
         .with_state(state)
 }
 
@@ -188,6 +205,10 @@ fn mobile_router(state: SharedState) -> Router {
         .route(
             "/api/v1/mobile/claws/{name}/install",
             post(handlers_mobile::handle_mobile_install_claw),
+        )
+        .route(
+            "/api/v1/mobile/claws/{name}/uninstall",
+            post(handlers_mobile::handle_mobile_uninstall_claw),
         )
         .with_state(state)
 }
@@ -245,6 +266,10 @@ fn household_fixture() -> HouseholdFixture {
             "/api/v1/household/claws/{name}/install",
             post(handlers_household_claws::handle_household_install_claw),
         )
+        .route(
+            "/api/v1/household/claws/{name}/uninstall",
+            post(handlers_household_claws::handle_household_uninstall_claw),
+        )
         .with_state(claws_state);
 
     HouseholdFixture {
@@ -298,15 +323,44 @@ fn pop_header(person: &P256Keypair, method: &Method, path: &str, body: &[u8]) ->
 }
 
 fn admin_mobile_token(state: &SharedState) -> String {
+    mobile_token_for_role(state, "admin", UserRole::Admin)
+}
+
+fn mobile_token_for_role(state: &SharedState, username: &str, role: UserRole) -> String {
     state
         .instance_db
-        .create_user("admin", UserRole::Admin, None)
-        .expect("create admin user");
+        .create_user(username, role, None)
+        .expect("create mobile user");
     state
         .mobile_sessions
-        .create_session("admin")
+        .create_session(username)
         .expect("create mobile session")
         .0
+}
+
+fn insert_picoclaw_instance(state: &SharedState) {
+    state
+        .instance_db
+        .insert(&NewInstance {
+            id: "inst-contract",
+            name: "Contract Instance",
+            container: "contract-container",
+            claw_type: "picoclaw",
+            sunset_date: "2026-12-31",
+            guest_os: None,
+            aux_storage_path: None,
+            cpu_cores: None,
+            ram_config_mb: None,
+            disk_gb: None,
+            household_id: None,
+            household_machine_id: None,
+        })
+        .expect("insert picoclaw instance");
+}
+
+fn assert_fixture_body(status: StatusCode, body: &Value, expected: StatusCode, fixture_id: &str) {
+    assert_eq!(status, expected);
+    assert_eq!(body, fixture(fixture_id));
 }
 
 async fn request(
@@ -451,7 +505,7 @@ fn unknown_availability_serializer_matches_claw_store_v1_fixture() {
 }
 
 #[tokio::test]
-async fn api_error_envelope_matches_claw_store_v1_fixture() {
+async fn api_error_bad_request_reasons_matches_claw_store_v1_fixture() {
     let response = ApiError::bad_request_with_reasons(
         "blocked",
         json!({ "unavailable_reason_code": "catalog_only" }),
@@ -460,7 +514,282 @@ async fn api_error_envelope_matches_claw_store_v1_fixture() {
     let (status, _bytes, body) = response_parts(response).await;
 
     assert_eq!(status, StatusCode::BAD_REQUEST);
-    assert_eq!(&body, fixture("api_error_envelope"));
+    assert_eq!(&body, fixture("api_error_bad_request_reasons"));
+}
+
+#[tokio::test]
+async fn auth_and_admin_required_errors_match_declared_claw_store_v1_fixtures() {
+    let admin_state = shared_state();
+    let (status, _bytes, body) = request(
+        admin_auth_router(Arc::clone(&admin_state)),
+        Method::GET,
+        "/api/v1/claws",
+        Vec::new(),
+        None,
+    )
+    .await;
+    assert_fixture_body(
+        status,
+        &body,
+        StatusCode::UNAUTHORIZED,
+        "admin_auth_unauthorized",
+    );
+
+    let mobile_state = shared_state();
+    let (status, _bytes, body) = request(
+        mobile_router(Arc::clone(&mobile_state)),
+        Method::POST,
+        "/api/v1/mobile/claws/picoclaw/install",
+        Vec::new(),
+        None,
+    )
+    .await;
+    assert_fixture_body(
+        status,
+        &body,
+        StatusCode::UNAUTHORIZED,
+        "mobile_missing_auth",
+    );
+
+    let member_token = mobile_token_for_role(&mobile_state, "member", UserRole::User);
+    let (status, _bytes, body) = request(
+        mobile_router(Arc::clone(&mobile_state)),
+        Method::POST,
+        "/api/v1/mobile/claws/picoclaw/install",
+        Vec::new(),
+        Some(format!("Bearer {member_token}")),
+    )
+    .await;
+    assert_fixture_body(
+        status,
+        &body,
+        StatusCode::FORBIDDEN,
+        "mobile_admin_required",
+    );
+}
+
+#[tokio::test]
+async fn unknown_claw_action_errors_match_declared_claw_store_v1_fixture() {
+    let admin_state = shared_state();
+    let admin_app = admin_router(Arc::clone(&admin_state));
+    for path in [
+        "/api/v1/claws/unknown-claw/install",
+        "/api/v1/claws/unknown-claw/uninstall",
+    ] {
+        let (status, _bytes, body) =
+            request(admin_app.clone(), Method::POST, path, Vec::new(), None).await;
+        assert_fixture_body(status, &body, StatusCode::NOT_FOUND, "unknown_claw_error");
+    }
+
+    let mobile_state = shared_state();
+    let token = admin_mobile_token(&mobile_state);
+    let mobile_app = mobile_router(Arc::clone(&mobile_state));
+    for path in [
+        "/api/v1/mobile/claws/unknown-claw/install",
+        "/api/v1/mobile/claws/unknown-claw/uninstall",
+    ] {
+        let (status, _bytes, body) = request(
+            mobile_app.clone(),
+            Method::POST,
+            path,
+            Vec::new(),
+            Some(format!("Bearer {token}")),
+        )
+        .await;
+        assert_fixture_body(status, &body, StatusCode::NOT_FOUND, "unknown_claw_error");
+    }
+
+    let household = household_fixture();
+    for path in [
+        "/api/v1/household/claws/unknown-claw/install",
+        "/api/v1/household/claws/unknown-claw/uninstall",
+    ] {
+        let (status, _bytes, body) =
+            household_request(household.app.clone(), &household.person, Method::POST, path).await;
+        assert_fixture_body(status, &body, StatusCode::NOT_FOUND, "unknown_claw_error");
+    }
+}
+
+#[tokio::test]
+async fn already_ready_install_errors_match_declared_claw_store_v1_fixture() {
+    let admin_state = shared_state();
+    admin_state
+        .claw_store
+        .mark_ready("picoclaw")
+        .expect("mark admin ready");
+    let (status, _bytes, body) = request(
+        admin_router(Arc::clone(&admin_state)),
+        Method::POST,
+        "/api/v1/claws/picoclaw/install",
+        Vec::new(),
+        None,
+    )
+    .await;
+    assert_fixture_body(
+        status,
+        &body,
+        StatusCode::BAD_REQUEST,
+        "already_ready_error",
+    );
+
+    let mobile_state = shared_state();
+    mobile_state
+        .claw_store
+        .mark_ready("picoclaw")
+        .expect("mark mobile ready");
+    let token = admin_mobile_token(&mobile_state);
+    let (status, _bytes, body) = request(
+        mobile_router(Arc::clone(&mobile_state)),
+        Method::POST,
+        "/api/v1/mobile/claws/picoclaw/install",
+        Vec::new(),
+        Some(format!("Bearer {token}")),
+    )
+    .await;
+    assert_fixture_body(
+        status,
+        &body,
+        StatusCode::BAD_REQUEST,
+        "already_ready_error",
+    );
+
+    let household = household_fixture();
+    household
+        .shared
+        .claw_store
+        .mark_ready("picoclaw")
+        .expect("mark household ready");
+    let (status, _bytes, body) = household_request(
+        household.app,
+        &household.person,
+        Method::POST,
+        "/api/v1/household/claws/picoclaw/install",
+    )
+    .await;
+    assert_fixture_body(
+        status,
+        &body,
+        StatusCode::BAD_REQUEST,
+        "already_ready_error",
+    );
+}
+
+#[tokio::test]
+async fn uninstall_not_ready_errors_match_declared_claw_store_v1_fixture() {
+    let admin_state = shared_state();
+    let (status, _bytes, body) = request(
+        admin_router(Arc::clone(&admin_state)),
+        Method::POST,
+        "/api/v1/claws/picoclaw/uninstall",
+        Vec::new(),
+        None,
+    )
+    .await;
+    assert_fixture_body(
+        status,
+        &body,
+        StatusCode::BAD_REQUEST,
+        "not_installed_error",
+    );
+
+    let mobile_state = shared_state();
+    let token = admin_mobile_token(&mobile_state);
+    let (status, _bytes, body) = request(
+        mobile_router(Arc::clone(&mobile_state)),
+        Method::POST,
+        "/api/v1/mobile/claws/picoclaw/uninstall",
+        Vec::new(),
+        Some(format!("Bearer {token}")),
+    )
+    .await;
+    assert_fixture_body(
+        status,
+        &body,
+        StatusCode::BAD_REQUEST,
+        "not_installed_error",
+    );
+
+    let household = household_fixture();
+    let (status, _bytes, body) = household_request(
+        household.app,
+        &household.person,
+        Method::POST,
+        "/api/v1/household/claws/picoclaw/uninstall",
+    )
+    .await;
+    assert_fixture_body(
+        status,
+        &body,
+        StatusCode::BAD_REQUEST,
+        "not_installed_error",
+    );
+}
+
+#[tokio::test]
+async fn uninstall_instances_exist_errors_match_declared_claw_store_v1_fixture() {
+    let admin_state = shared_state();
+    admin_state
+        .claw_store
+        .mark_ready("picoclaw")
+        .expect("mark admin ready");
+    insert_picoclaw_instance(&admin_state);
+    let (status, _bytes, body) = request(
+        admin_router(Arc::clone(&admin_state)),
+        Method::POST,
+        "/api/v1/claws/picoclaw/uninstall",
+        Vec::new(),
+        None,
+    )
+    .await;
+    assert_fixture_body(
+        status,
+        &body,
+        StatusCode::BAD_REQUEST,
+        "uninstall_instances_exist_error",
+    );
+
+    let mobile_state = shared_state();
+    mobile_state
+        .claw_store
+        .mark_ready("picoclaw")
+        .expect("mark mobile ready");
+    insert_picoclaw_instance(&mobile_state);
+    let token = admin_mobile_token(&mobile_state);
+    let (status, _bytes, body) = request(
+        mobile_router(Arc::clone(&mobile_state)),
+        Method::POST,
+        "/api/v1/mobile/claws/picoclaw/uninstall",
+        Vec::new(),
+        Some(format!("Bearer {token}")),
+    )
+    .await;
+    assert_fixture_body(
+        status,
+        &body,
+        StatusCode::BAD_REQUEST,
+        "uninstall_instances_exist_error",
+    );
+
+    let household = household_fixture();
+    household
+        .shared
+        .claw_store
+        .mark_ready("picoclaw")
+        .expect("mark household ready");
+    insert_picoclaw_instance(&household.shared);
+    let (status, _bytes, body) = household_request(
+        household.app,
+        &household.person,
+        Method::POST,
+        "/api/v1/household/claws/picoclaw/uninstall",
+    )
+    .await;
+    assert_fixture_body(
+        status,
+        &body,
+        StatusCode::BAD_REQUEST,
+        "uninstall_instances_exist_error",
+    );
 }
 
 #[tokio::test]

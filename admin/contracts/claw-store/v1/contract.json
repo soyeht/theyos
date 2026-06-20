@@ -18,7 +18,7 @@
       },
       "expectations": {
         "success": { "status": 200, "fixture": "list_envelope_ready" },
-        "auth_error": { "status": 401, "fixture": "api_error_envelope" }
+        "auth_error": { "status": 401, "fixture": "admin_auth_unauthorized" }
       }
     },
     {
@@ -36,8 +36,8 @@
       },
       "expectations": {
         "success": { "status": 200, "fixture": "detail_ready" },
-        "unknown": { "status": 404, "fixture": "api_error_envelope" },
-        "auth_error": { "status": 401, "fixture": "api_error_envelope" }
+        "unknown": { "status": 404, "fixture": "unknown_claw_error" },
+        "auth_error": { "status": 401, "fixture": "admin_auth_unauthorized" }
       }
     },
     {
@@ -56,7 +56,7 @@
       "expectations": {
         "success": { "status": 200, "fixture": "unknown_availability" },
         "unknown": { "status": 200, "fixture": "unknown_availability" },
-        "auth_error": { "status": 401, "fixture": "api_error_envelope" }
+        "auth_error": { "status": 401, "fixture": "admin_auth_unauthorized" }
       }
     },
     {
@@ -75,10 +75,10 @@
       "expectations": {
         "queued": { "status": 200, "fixture": "action_job_body" },
         "already_installing": { "status": 200, "fixture": "action_job_body" },
-        "unknown": { "status": 404, "fixture": "api_error_envelope" },
+        "unknown": { "status": 404, "fixture": "unknown_claw_error" },
         "unavailable": { "status": 400, "fixture": "install_unavailable_reasons_object" },
-        "already_ready": { "status": 400, "fixture": "api_error_envelope" },
-        "auth_error": { "status": 401, "fixture": "api_error_envelope" }
+        "already_ready": { "status": 400, "fixture": "already_ready_error" },
+        "auth_error": { "status": 401, "fixture": "admin_auth_unauthorized" }
       }
     },
     {
@@ -96,10 +96,10 @@
       },
       "expectations": {
         "queued": { "status": 200, "fixture": "action_job_body" },
-        "unknown": { "status": 404, "fixture": "api_error_envelope" },
-        "not_ready": { "status": 400, "fixture": "api_error_envelope" },
-        "instances_exist": { "status": 400, "fixture": "api_error_envelope" },
-        "auth_error": { "status": 401, "fixture": "api_error_envelope" }
+        "unknown": { "status": 404, "fixture": "unknown_claw_error" },
+        "not_ready": { "status": 400, "fixture": "not_installed_error" },
+        "instances_exist": { "status": 400, "fixture": "uninstall_instances_exist_error" },
+        "auth_error": { "status": 401, "fixture": "admin_auth_unauthorized" }
       }
     },
     {
@@ -117,7 +117,7 @@
       },
       "expectations": {
         "success": { "status": 200, "fixture": "list_envelope_ready" },
-        "auth_error": { "status": 401, "fixture": "api_error_envelope" }
+        "auth_error": { "status": 401, "fixture": "mobile_missing_auth" }
       }
     },
     {
@@ -136,7 +136,7 @@
       "expectations": {
         "success": { "status": 200, "fixture": "unknown_availability" },
         "unknown": { "status": 200, "fixture": "unknown_availability" },
-        "auth_error": { "status": 401, "fixture": "api_error_envelope" }
+        "auth_error": { "status": 401, "fixture": "mobile_missing_auth" }
       }
     },
     {
@@ -155,11 +155,11 @@
       "expectations": {
         "queued": { "status": 200, "fixture": "action_job_body" },
         "already_installing": { "status": 409, "fixture": "action_job_body" },
-        "unknown": { "status": 404, "fixture": "api_error_envelope" },
+        "unknown": { "status": 404, "fixture": "unknown_claw_error" },
         "unavailable": { "status": 400, "fixture": "install_unavailable_reasons_object" },
-        "already_ready": { "status": 400, "fixture": "api_error_envelope" },
-        "admin_required": { "status": 403, "fixture": "api_error_envelope" },
-        "auth_error": { "status": 401, "fixture": "api_error_envelope" }
+        "already_ready": { "status": 400, "fixture": "already_ready_error" },
+        "admin_required": { "status": 403, "fixture": "mobile_admin_required" },
+        "auth_error": { "status": 401, "fixture": "mobile_missing_auth" }
       }
     },
     {
@@ -177,11 +177,11 @@
       },
       "expectations": {
         "queued": { "status": 200, "fixture": "action_job_body" },
-        "unknown": { "status": 404, "fixture": "api_error_envelope" },
-        "not_ready": { "status": 400, "fixture": "api_error_envelope" },
-        "instances_exist": { "status": 400, "fixture": "api_error_envelope" },
-        "admin_required": { "status": 403, "fixture": "api_error_envelope" },
-        "auth_error": { "status": 401, "fixture": "api_error_envelope" }
+        "unknown": { "status": 404, "fixture": "unknown_claw_error" },
+        "not_ready": { "status": 400, "fixture": "not_installed_error" },
+        "instances_exist": { "status": 400, "fixture": "uninstall_instances_exist_error" },
+        "admin_required": { "status": 403, "fixture": "mobile_admin_required" },
+        "auth_error": { "status": 401, "fixture": "mobile_missing_auth" }
       }
     },
     {
@@ -240,9 +240,9 @@
       "expectations": {
         "queued": { "status": 200, "fixture": "action_job_body" },
         "already_installing": { "status": 200, "fixture": "action_job_body" },
-        "unknown": { "status": 404, "fixture": "api_error_envelope" },
+        "unknown": { "status": 404, "fixture": "unknown_claw_error" },
         "unavailable": { "status": 400, "fixture": "install_unavailable_reasons_object" },
-        "already_ready": { "status": 400, "fixture": "api_error_envelope" },
+        "already_ready": { "status": 400, "fixture": "already_ready_error" },
         "auth_error": { "status": 401, "fixture": "empty_body" }
       }
     },
@@ -262,9 +262,9 @@
       },
       "expectations": {
         "queued": { "status": 200, "fixture": "action_job_body" },
-        "unknown": { "status": 404, "fixture": "api_error_envelope" },
-        "not_ready": { "status": 400, "fixture": "api_error_envelope" },
-        "instances_exist": { "status": 400, "fixture": "api_error_envelope" },
+        "unknown": { "status": 404, "fixture": "unknown_claw_error" },
+        "not_ready": { "status": 400, "fixture": "not_installed_error" },
+        "instances_exist": { "status": 400, "fixture": "uninstall_instances_exist_error" },
         "auth_error": { "status": 401, "fixture": "empty_body" }
       }
     }
@@ -346,12 +346,40 @@
       ],
       "degradations": []
     },
-    "api_error_envelope": {
+    "api_error_bad_request_reasons": {
       "error": "blocked",
       "code": "INVALID_INPUT",
       "reasons": {
         "unavailable_reason_code": "catalog_only"
       }
+    },
+    "admin_auth_unauthorized": {
+      "error": "unauthorized",
+      "code": "UNAUTHORIZED"
+    },
+    "mobile_missing_auth": {
+      "error": "missing Authorization header",
+      "code": "UNAUTHORIZED"
+    },
+    "mobile_admin_required": {
+      "error": "admin access required",
+      "code": "FORBIDDEN"
+    },
+    "unknown_claw_error": {
+      "error": "unknown claw type: unknown-claw",
+      "code": "NOT_FOUND"
+    },
+    "already_ready_error": {
+      "error": "claw type 'picoclaw' is already installed",
+      "code": "INVALID_INPUT"
+    },
+    "not_installed_error": {
+      "error": "claw type 'picoclaw' is not installed",
+      "code": "INVALID_INPUT"
+    },
+    "uninstall_instances_exist_error": {
+      "error": "cannot uninstall: 1 instance(s) of type 'picoclaw' still exist \u2014 delete them first",
+      "code": "INVALID_INPUT"
     },
     "install_unavailable_reasons_object": {
       "code": "INVALID_INPUT",
