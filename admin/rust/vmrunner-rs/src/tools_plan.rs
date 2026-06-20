@@ -8,6 +8,7 @@
 
 use crate::installer_plan::{InstallerPlan, InstallerStep};
 use crate::ssh_client::SshActions;
+use core_rs::node_source::{INSTALL_NODE_22_COMMAND, NODE_22_CHECK};
 
 /// Canonical tool names accepted by the API.
 pub const TOOL_CODEX: &str = "codex";
@@ -38,12 +39,11 @@ fn ensure_nodejs_step() -> InstallerStep {
                 | grep -i '^date:' | sed 's/^[Dd]ate: //') && \
          [ -n \"$DATE\" ] && date -s \"$DATE\" >/dev/null 2>&1 || true && \
          rm -rf /var/lib/apt/lists/* && \
-         apt-get update -qq && \
-         apt-get install -y --no-install-recommends curl ca-certificates gnupg >/dev/null 2>&1 && \
-         curl -fsSL https://deb.nodesource.com/setup_22.x | sh - >/dev/null 2>&1 && \
-         apt-get install -y --no-install-recommends nodejs >/dev/null 2>&1",
+         "
+        .to_owned()
+            + INSTALL_NODE_22_COMMAND,
     )
-    .with_check("command -v node && command -v npm")
+    .with_check(NODE_22_CHECK)
     .with_timeout(240)
     .with_retries(2)
 }
@@ -214,6 +214,8 @@ mod tests {
     fn codex_plan_has_nodejs_step() {
         let plan = codex_plan();
         assert_eq!(plan.steps[0].phase, "ensure_nodejs");
+        assert!(plan.steps[0].command.contains("nodesource.sources"));
+        assert!(!plan.steps[0].command.contains("setup_22.x"));
         assert_eq!(plan.steps[1].phase, "install_codex");
     }
 

@@ -24,6 +24,7 @@ pub mod id;
 pub mod ipc;
 pub mod maintenance;
 pub mod manifest;
+pub mod node_source;
 pub mod os;
 pub mod pagination;
 pub mod path;

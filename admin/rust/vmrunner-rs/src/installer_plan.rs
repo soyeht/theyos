@@ -31,6 +31,8 @@
 use std::borrow::Cow;
 use std::time::Duration;
 
+use core_rs::node_source::{INSTALL_NODE_22_COMMAND, NODE_22_12_CHECK, NODE_22_CHECK};
+
 use crate::error::{ErrorContext, VmError};
 use crate::ssh_client::SshActions;
 
@@ -488,15 +490,11 @@ pub fn openclaw_plan() -> InstallerPlan {
             )
             .with_timeout(120),
             // Install Node.js 22.12+ via NodeSource (matches engines.node in package.json).
-            // Downloads setup script to tmpfile then executes (not piped to bash).
             // Validates both node and npm are available and node >= 22.12.
             InstallerStep::new(
                 "install_node",
-                "curl -fsSL https://deb.nodesource.com/setup_22.x -o /tmp/nodesource_setup.sh && \
-                 bash /tmp/nodesource_setup.sh && \
-                 apt-get install -y nodejs && \
-                 rm -f /tmp/nodesource_setup.sh && \
-                 node --version && npm --version && \
+                INSTALL_NODE_22_COMMAND.to_owned()
+                    + " && \
                  NODE_VER=$(node --version | sed 's/v//') && \
                  NODE_MAJOR=$(echo \"$NODE_VER\" | cut -d. -f1) && \
                  NODE_MINOR=$(echo \"$NODE_VER\" | cut -d. -f2) && \
@@ -504,7 +502,7 @@ pub fn openclaw_plan() -> InstallerPlan {
                    echo \"ERROR: need node >= 22.12.0, got v${NODE_VER}\" >&2; exit 1; \
                  fi",
             )
-            .with_check("node --version 2>/dev/null | grep -qE '^v(2[2-9]|[3-9][0-9])' && command -v npm >/dev/null 2>&1")
+            .with_check(NODE_22_12_CHECK)
             .with_timeout(240)
             .with_retries(2),
             // Clone before install_pnpm so corepack can read packageManager from package.json
@@ -675,15 +673,10 @@ pub fn hermes_agent_plan() -> InstallerPlan {
             .with_timeout(240),
             InstallerStep::new(
                 "install_node",
-                "curl -fsSL https://deb.nodesource.com/setup_22.x -o /tmp/nodesource_setup.sh && \
-                 bash /tmp/nodesource_setup.sh && \
-                 apt-get install -y nodejs && \
-                 rm -f /tmp/nodesource_setup.sh && \
-                 node --version && npm --version",
+                INSTALL_NODE_22_COMMAND,
             )
             .with_check(
-                "node --version 2>/dev/null | grep -qE '^v(2[2-9]|[3-9][0-9])' \
-                 && command -v npm >/dev/null 2>&1",
+                NODE_22_CHECK,
             )
             .with_timeout(240)
             .with_retries(2),
@@ -802,17 +795,10 @@ pub fn noclaw_plan() -> InstallerPlan {
                    curl ca-certificates gnupg git >/dev/null 2>&1",
             )
             .with_timeout(180),
-            InstallerStep::new(
-                "install_node",
-                "curl -fsSL https://deb.nodesource.com/setup_22.x -o /tmp/nodesource_setup.sh && \
-                 bash /tmp/nodesource_setup.sh && \
-                 apt-get install -y nodejs && \
-                 rm -f /tmp/nodesource_setup.sh && \
-                 node --version && npm --version",
-            )
-            .with_check("command -v node && command -v npm")
-            .with_timeout(240)
-            .with_retries(2),
+            InstallerStep::new("install_node", INSTALL_NODE_22_COMMAND)
+                .with_check(NODE_22_CHECK)
+                .with_timeout(240)
+                .with_retries(2),
             InstallerStep::new("install_claude_code", install_claude_cmd)
                 .with_check("command -v claude")
                 .with_timeout(180)
@@ -1197,10 +1183,15 @@ mod tests {
 
         // ── install_node assertions ──────────────────────────────────────
         let install_node = &plan.steps[1];
-        // Must target Node 22 via NodeSource
+        // Must target Node 22 via the explicit NodeSource repo config.
         assert!(
-            install_node.command.contains("setup_22"),
-            "install_node should use nodesource setup_22, got: {}",
+            install_node.command.contains("nodesource.sources"),
+            "install_node should configure nodesource.sources, got: {}",
+            install_node.command
+        );
+        assert!(
+            !install_node.command.contains("setup_22"),
+            "install_node should not execute the remote setup script, got: {}",
             install_node.command
         );
         // Must validate npm is available (not just node)
@@ -1209,10 +1200,10 @@ mod tests {
             "install_node should validate npm availability, got: {}",
             install_node.command
         );
-        // Must NOT pipe setup script directly (download + exec is safer)
+        // Must NOT pipe remote setup scripts into a shell.
         assert!(
             !install_node.command.contains("| bash"),
-            "install_node should not pipe to bash (download then exec), got: {}",
+            "install_node should not pipe to bash, got: {}",
             install_node.command
         );
 
@@ -1324,10 +1315,14 @@ mod tests {
             plan.steps[3].command.contains("break-system-packages"),
             "hermes-agent pip_install should use --break-system-packages"
         );
-        // install_node should use nodesource setup_22
+        // install_node should use the explicit NodeSource repo config.
         assert!(
-            plan.steps[1].command.contains("setup_22"),
-            "hermes-agent install_node should use nodesource setup_22"
+            plan.steps[1].command.contains("nodesource.sources"),
+            "hermes-agent install_node should configure nodesource.sources"
+        );
+        assert!(
+            !plan.steps[1].command.contains("setup_22"),
+            "hermes-agent install_node should not execute the remote setup script"
         );
         // clone_repo should have retries (network)
         assert!(
@@ -1355,10 +1350,14 @@ mod tests {
         assert_eq!(plan.steps[6].phase, "create_config_dir");
         assert_eq!(plan.steps[7].phase, "verify");
         assert_eq!(plan.steps[8].phase, "setup_shell_prompt");
-        // install_node should use nodesource setup_22
+        // install_node should use the explicit NodeSource repo config.
         assert!(
-            plan.steps[1].command.contains("setup_22"),
-            "noclaw install_node should use nodesource setup_22"
+            plan.steps[1].command.contains("nodesource.sources"),
+            "noclaw install_node should configure nodesource.sources"
+        );
+        assert!(
+            !plan.steps[1].command.contains("setup_22"),
+            "noclaw install_node should not execute the remote setup script"
         );
         // Tool install steps reference correct npm packages
         assert!(

@@ -553,6 +553,27 @@ mod tests {
     }
 
     #[test]
+    fn manual_install_scripts_do_not_execute_nodesource_setup_scripts() {
+        let offenders: Vec<_> = catalog()
+            .iter()
+            .filter_map(|entry| {
+                let script = entry.install?.manual_script;
+                if script.contains("setup_22.x") || script.contains("deb.nodesource.com/setup_") {
+                    Some(entry.name)
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        assert!(
+            offenders.is_empty(),
+            "manual install scripts must configure NodeSource explicitly instead \
+             of executing remote setup scripts: {offenders:?}"
+        );
+    }
+
+    #[test]
     fn root_version_matches_workspace_crate_version() {
         let root_version_path =
             std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../VERSION");

@@ -6,6 +6,7 @@
 
 use super::{StepSpec, apt_install_step, config_dir_step};
 use crate::manifest::InstallConfig;
+use crate::node_source::{INSTALL_NODE_22_COMMAND, NODE_22_CHECK};
 
 const DEFAULT_DEPS: &[&str] = &["curl", "ca-certificates", "gnupg"];
 
@@ -39,22 +40,12 @@ pub fn render(config: &InstallConfig) -> Vec<StepSpec> {
         steps.push(step);
     }
 
-    // 2. Install Node 22 via NodeSource (download → exec, not piped).
+    // 2. Install Node 22 via NodeSource.
     steps.push(
-        StepSpec::new(
-            "install_node",
-            "curl -fsSL https://deb.nodesource.com/setup_22.x -o /tmp/nodesource_setup.sh && \
-             bash /tmp/nodesource_setup.sh && \
-             apt-get install -y nodejs && \
-             rm -f /tmp/nodesource_setup.sh && \
-             node --version && npm --version",
-        )
-        .with_check(
-            "node --version 2>/dev/null | grep -qE '^v(2[2-9]|[3-9][0-9])' \
-             && command -v npm >/dev/null 2>&1",
-        )
-        .with_timeout(300)
-        .with_retries(2),
+        StepSpec::new("install_node", INSTALL_NODE_22_COMMAND)
+            .with_check(NODE_22_CHECK)
+            .with_timeout(300)
+            .with_retries(2),
     );
 
     // 3. npm install -g.
@@ -109,7 +100,8 @@ mod tests {
             .into_iter()
             .find(|s| s.phase == "install_node")
             .unwrap();
-        assert!(node_step.command.contains("setup_22.x"));
+        assert!(node_step.command.contains("nodesource.sources"));
+        assert!(!node_step.command.contains("setup_22.x"));
         assert!(node_step.command.contains("node --version"));
     }
 
