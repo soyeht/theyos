@@ -19,12 +19,11 @@ pub enum WarmPoolSlotState {
 impl WarmPoolSlotState {
     #[must_use]
     pub fn from_wire_str(value: &str) -> Self {
-        match value {
-            "Ready" | "ready" | "warm" | "Warm" => Self::Warm,
-            "Filling" | "filling" => Self::Filling,
-            "Stale" | "stale" => Self::Stale,
-            "Expired" | "expired" => Self::Expired,
-            "Empty" | "empty" => Self::Empty,
+        match value.to_ascii_lowercase().as_str() {
+            "ready" | "warm" => Self::Warm,
+            "filling" => Self::Filling,
+            "stale" => Self::Stale,
+            "expired" => Self::Expired,
             _ => Self::Empty,
         }
     }
