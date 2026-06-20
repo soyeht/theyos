@@ -8,15 +8,19 @@
 
 use core_rs::host_resources::HostResources;
 use store_rs::InstanceDb;
-use vmrunner_common_rs::WarmPoolStatusWire;
+use vmrunner_common_rs::{DEFAULT_CREATE_CPU_CORES, DEFAULT_CREATE_RAM_MB, WarmPoolStatusWire};
 
 use crate::state::SharedState;
 
 // ── Constants ────────────────────────────────────────────────────────────────
 
-/// Hardcoded slot size — matches `fill_pool_slot_impl` in `vmrunner-rs/src/lib.rs:2073`.
-pub const SLOT_CPU: i64 = 2;
-pub const SLOT_RAM: i64 = 2048;
+/// Warm-pool slot size.
+///
+/// A warm slot is prefilled with the default Create CPU/RAM shape, so capacity
+/// matching aliases the shared vmrunner Create defaults instead of owning local
+/// resource literals. Disk is handled separately by storage leases.
+pub const SLOT_CPU: i64 = DEFAULT_CREATE_CPU_CORES as i64;
+pub const SLOT_RAM: i64 = DEFAULT_CREATE_RAM_MB as i64;
 
 /// Disk margin in GB — always keep this much free (default: 5 GB).
 const DISK_MARGIN_GB: u64 = 5;
@@ -368,6 +372,51 @@ mod tests {
             available_ram_mb: ram_mb / 2,
             available_disk_gb: disk_gb,
             total_disk_gb: disk_gb * 2,
+        }
+    }
+
+    #[test]
+    fn migrated_create_default_sites_use_common_owner() {
+        let migrated_sources = [
+            (
+                "server-rs/src/handlers_instances.rs",
+                include_str!("handlers_instances.rs"),
+                &["unwrap_or(2)", "unwrap_or(2048)", "unwrap_or(10)"][..],
+            ),
+            (
+                "server-rs/src/handlers_mobile.rs",
+                include_str!("handlers_mobile.rs"),
+                &["unwrap_or(2)", "unwrap_or(2048)", "unwrap_or(10)"][..],
+            ),
+            (
+                "server-rs/src/main.rs",
+                include_str!("main.rs"),
+                &["unwrap_or(2)", "unwrap_or(2048)"][..],
+            ),
+            (
+                "vmrunner-rs/src/lib.rs",
+                include_str!("../../vmrunner-rs/src/lib.rs"),
+                &[
+                    "prepare_rootfs(&inst, 10)",
+                    "start_vm(&mut inst, false, true, 2, 2048)",
+                    "start_vm(&mut inst, false, false, 2, 2048)",
+                    "start_vm(&mut inst, true, false, 2, 2048)",
+                ][..],
+            ),
+            (
+                "vmrunner-macos-rs/src/bin/vmrunner_macos_ipc_macos.rs",
+                include_str!("../../vmrunner-macos-rs/src/bin/vmrunner_macos_ipc_macos.rs"),
+                &["parse_resource_params(params, 2, 2048)"][..],
+            ),
+        ];
+
+        for (path, source, forbidden_patterns) in migrated_sources {
+            for forbidden in forbidden_patterns {
+                assert!(
+                    !source.contains(forbidden),
+                    "{path} reintroduced create-default literal fallback `{forbidden}`"
+                );
+            }
         }
     }
 
