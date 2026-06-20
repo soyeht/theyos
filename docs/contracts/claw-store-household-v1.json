@@ -1,0 +1,158 @@
+{
+  "contract": "claw-store-household",
+  "version": 1,
+  "attach_token_header": "X-Soyeht-Household-Attach-Token",
+  "routes": [
+    {
+      "name": "list_claws",
+      "method": "GET",
+      "path": "/api/v1/household/claws",
+      "handler": "handle_household_list_claws",
+      "operation": "claws.list",
+      "auth": "pop"
+    },
+    {
+      "name": "claw_availability",
+      "method": "GET",
+      "path": "/api/v1/household/claws/{name}/availability",
+      "handler": "handle_household_claw_availability",
+      "operation": "claws.list",
+      "auth": "pop"
+    },
+    {
+      "name": "install_claw",
+      "method": "POST",
+      "path": "/api/v1/household/claws/{name}/install",
+      "handler": "handle_household_install_claw",
+      "operation": "claws.create",
+      "auth": "pop"
+    },
+    {
+      "name": "uninstall_claw",
+      "method": "POST",
+      "path": "/api/v1/household/claws/{name}/uninstall",
+      "handler": "handle_household_uninstall_claw",
+      "operation": "claws.delete",
+      "auth": "pop"
+    },
+    {
+      "name": "list_instances",
+      "method": "GET",
+      "path": "/api/v1/household/instances",
+      "handler": "handle_household_list_instances",
+      "operation": "claws.list",
+      "auth": "pop"
+    },
+    {
+      "name": "create_instance",
+      "method": "POST",
+      "path": "/api/v1/household/instances",
+      "handler": "handle_household_create_instance",
+      "operation": "claws.create",
+      "auth": "pop"
+    },
+    {
+      "name": "instance_status",
+      "method": "GET",
+      "path": "/api/v1/household/instances/{id}/status",
+      "handler": "handle_household_instance_status",
+      "operation": "claws.list",
+      "auth": "pop"
+    },
+    {
+      "name": "stop_instance",
+      "method": "POST",
+      "path": "/api/v1/household/instances/{id}/stop",
+      "handler": "handle_household_stop_instance",
+      "operation": "claws.use",
+      "auth": "pop"
+    },
+    {
+      "name": "restart_instance",
+      "method": "POST",
+      "path": "/api/v1/household/instances/{id}/restart",
+      "handler": "handle_household_restart_instance",
+      "operation": "claws.use",
+      "auth": "pop"
+    },
+    {
+      "name": "rebuild_instance",
+      "method": "POST",
+      "path": "/api/v1/household/instances/{id}/rebuild",
+      "handler": "handle_household_rebuild_instance",
+      "operation": "claws.use",
+      "auth": "pop"
+    },
+    {
+      "name": "delete_instance",
+      "method": "DELETE",
+      "path": "/api/v1/household/instances/{id}",
+      "handler": "handle_household_delete_instance",
+      "operation": "claws.delete",
+      "auth": "pop"
+    },
+    {
+      "name": "list_workspaces",
+      "method": "GET",
+      "path": "/api/v1/household/terminals/{container}/workspaces",
+      "handler": "handle_household_list_workspaces",
+      "operation": "claws.list",
+      "auth": "pop"
+    },
+    {
+      "name": "create_workspace",
+      "method": "POST",
+      "path": "/api/v1/household/terminals/{container}/workspaces",
+      "handler": "handle_household_create_workspace",
+      "operation": "claws.use",
+      "auth": "pop"
+    },
+    {
+      "name": "rename_workspace",
+      "method": "PATCH",
+      "path": "/api/v1/household/terminals/{container}/workspaces/{id}",
+      "handler": "handle_household_rename_workspace",
+      "operation": "claws.use",
+      "auth": "pop"
+    },
+    {
+      "name": "delete_workspace",
+      "method": "DELETE",
+      "path": "/api/v1/household/terminals/{container}/workspaces/{id}",
+      "handler": "handle_household_delete_workspace",
+      "operation": "claws.use",
+      "auth": "pop"
+    },
+    {
+      "name": "mint_attach_token",
+      "method": "POST",
+      "path": "/api/v1/household/terminals/{container}/attach-token",
+      "handler": "handle_household_mint_attach_token",
+      "operation": "claws.use",
+      "auth": "pop",
+      "peer_guard": true
+    },
+    {
+      "name": "terminal_pty",
+      "method": "GET",
+      "path": "/api/v1/household/terminals/{container}/pty",
+      "handler": "handle_household_terminal_pty",
+      "operation": null,
+      "auth": "attach_token",
+      "peer_guard": true
+    }
+  ],
+  "response_samples": {
+    "list_claws": {
+      "data": []
+    },
+    "action": {
+      "job_id": "job-alpha",
+      "message": "queued"
+    },
+    "attach_token": {
+      "token": "attach-token-alpha",
+      "expires_at": 1810000000
+    }
+  }
+}
