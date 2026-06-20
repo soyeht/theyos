@@ -444,7 +444,7 @@ claws:
         pnpm run build
         cat > /usr/local/bin/claw-empire <<'SHIM'
         #!/bin/bash
-        export HOST="${HOST:-0.0.0.0}"
+        export HOST="${HOST:-127.0.0.1}"
         export ANTHROPIC_API_KEY="${ANTHROPIC_API_KEY:-sk-verify-placeholder}"
         cd /opt/claw-empire && exec pnpm start "$@"
         SHIM

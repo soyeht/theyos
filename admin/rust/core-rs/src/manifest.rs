@@ -496,6 +496,46 @@ mod tests {
         }
     }
 
+    #[test]
+    fn manual_install_scripts_do_not_default_daemons_to_all_interfaces() {
+        let offenders: Vec<_> = catalog()
+            .iter()
+            .filter_map(|entry| {
+                let script = entry.install?.manual_script;
+                if script.contains("HOST:-0.0.0.0")
+                    || script.contains("HOST=\"${HOST:-0.0.0.0}\"")
+                    || script.contains("HOST='${HOST:-0.0.0.0}'")
+                {
+                    Some(entry.name)
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        assert!(
+            offenders.is_empty(),
+            "manual install scripts must not default daemon binds to every \
+             interface; use loopback by default and require explicit exposure: \
+             {offenders:?}"
+        );
+    }
+
+    #[test]
+    fn root_version_matches_workspace_crate_version() {
+        let root_version_path =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../VERSION");
+        let root_version = std::fs::read_to_string(&root_version_path)
+            .unwrap_or_else(|err| panic!("failed to read {root_version_path:?}: {err}"));
+
+        assert_eq!(
+            root_version.trim(),
+            env!("CARGO_PKG_VERSION"),
+            "repo root VERSION must stay aligned with the workspace crates \
+             because release tooling and humans use it as metadata"
+        );
+    }
+
     // ─── P-46: tier model tests ─────────────────────────────────────────
 
     #[test]
