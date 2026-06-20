@@ -363,6 +363,34 @@ fn assert_fixture_body(status: StatusCode, body: &Value, expected: StatusCode, f
     assert_eq!(body, fixture(fixture_id));
 }
 
+fn assert_queued_job_schema(status: StatusCode, body: &Value, fixture_id: &str) {
+    assert_eq!(status, StatusCode::OK);
+    let schema = fixture(fixture_id);
+    assert_eq!(
+        schema["schema"], "claw_job_response_pattern",
+        "{fixture_id} must declare the queued response schema class"
+    );
+    assert_eq!(
+        schema["job_id_pattern"], "^job_[0-9a-f]{16}$",
+        "{fixture_id} must pin the current generated job id shape"
+    );
+    assert_eq!(body["message"], schema["message"]);
+
+    let object = body
+        .as_object()
+        .expect("queued response body must be object");
+    assert_eq!(object.len(), 2, "queued response must stay flat");
+    let job_id = body["job_id"].as_str().expect("queued job_id string");
+    assert_eq!(job_id.len(), "job_".len() + 16);
+    assert!(job_id.starts_with("job_"));
+    assert!(
+        job_id["job_".len()..]
+            .chars()
+            .all(|ch| ch.is_ascii_hexdigit() && !ch.is_ascii_uppercase()),
+        "queued job_id must stay lowercase hex after job_ prefix: {job_id}"
+    );
+}
+
 async fn request(
     app: Router,
     method: Method,
@@ -480,7 +508,7 @@ fn typed_response_serializers_match_claw_store_v1_fixtures() {
         message: "install already in progress".to_string(),
     })
     .expect("serialize action");
-    assert_eq!(&action_json, fixture("action_job_body"));
+    assert_eq!(&action_json, fixture("already_installing_job_body"));
 }
 
 #[test]
@@ -793,6 +821,88 @@ async fn uninstall_instances_exist_errors_match_declared_claw_store_v1_fixture()
 }
 
 #[tokio::test]
+async fn queued_action_responses_match_declared_claw_store_v1_schemas() {
+    let admin_install_state = shared_state();
+    let (status, _bytes, body) = request(
+        admin_router(Arc::clone(&admin_install_state)),
+        Method::POST,
+        "/api/v1/claws/picoclaw/install",
+        Vec::new(),
+        None,
+    )
+    .await;
+    assert_queued_job_schema(status, &body, "install_queued_job_schema");
+
+    let mobile_install_state = shared_state();
+    let token = admin_mobile_token(&mobile_install_state);
+    let (status, _bytes, body) = request(
+        mobile_router(Arc::clone(&mobile_install_state)),
+        Method::POST,
+        "/api/v1/mobile/claws/picoclaw/install",
+        Vec::new(),
+        Some(format!("Bearer {token}")),
+    )
+    .await;
+    assert_queued_job_schema(status, &body, "install_queued_job_schema");
+
+    let household_install = household_fixture();
+    let (status, _bytes, body) = household_request(
+        household_install.app,
+        &household_install.person,
+        Method::POST,
+        "/api/v1/household/claws/picoclaw/install",
+    )
+    .await;
+    assert_queued_job_schema(status, &body, "install_queued_job_schema");
+
+    let admin_uninstall_state = shared_state();
+    admin_uninstall_state
+        .claw_store
+        .mark_ready("picoclaw")
+        .expect("mark admin ready");
+    let (status, _bytes, body) = request(
+        admin_router(Arc::clone(&admin_uninstall_state)),
+        Method::POST,
+        "/api/v1/claws/picoclaw/uninstall",
+        Vec::new(),
+        None,
+    )
+    .await;
+    assert_queued_job_schema(status, &body, "uninstall_queued_job_schema");
+
+    let mobile_uninstall_state = shared_state();
+    mobile_uninstall_state
+        .claw_store
+        .mark_ready("picoclaw")
+        .expect("mark mobile ready");
+    let token = admin_mobile_token(&mobile_uninstall_state);
+    let (status, _bytes, body) = request(
+        mobile_router(Arc::clone(&mobile_uninstall_state)),
+        Method::POST,
+        "/api/v1/mobile/claws/picoclaw/uninstall",
+        Vec::new(),
+        Some(format!("Bearer {token}")),
+    )
+    .await;
+    assert_queued_job_schema(status, &body, "uninstall_queued_job_schema");
+
+    let household_uninstall = household_fixture();
+    household_uninstall
+        .shared
+        .claw_store
+        .mark_ready("picoclaw")
+        .expect("mark household ready");
+    let (status, _bytes, body) = household_request(
+        household_uninstall.app,
+        &household_uninstall.person,
+        Method::POST,
+        "/api/v1/household/claws/picoclaw/uninstall",
+    )
+    .await;
+    assert_queued_job_schema(status, &body, "uninstall_queued_job_schema");
+}
+
+#[tokio::test]
 async fn already_installing_status_split_is_pinned() {
     let admin_state = shared_state();
     admin_state
@@ -808,7 +918,7 @@ async fn already_installing_status_split_is_pinned() {
     )
     .await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(&body, fixture("action_job_body"));
+    assert_eq!(&body, fixture("already_installing_job_body"));
 
     let mobile_state = shared_state();
     mobile_state
@@ -825,7 +935,7 @@ async fn already_installing_status_split_is_pinned() {
     )
     .await;
     assert_eq!(status, StatusCode::CONFLICT);
-    assert_eq!(&body, fixture("action_job_body"));
+    assert_eq!(&body, fixture("already_installing_job_body"));
 
     let household = household_fixture();
     household
@@ -841,7 +951,7 @@ async fn already_installing_status_split_is_pinned() {
     )
     .await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(&body, fixture("action_job_body"));
+    assert_eq!(&body, fixture("already_installing_job_body"));
 }
 
 #[tokio::test]
@@ -890,7 +1000,7 @@ async fn unknown_availability_is_200_unknown_on_all_claw_store_surfaces() {
 }
 
 #[tokio::test]
-async fn install_unavailable_reason_shape_is_object_not_availability_reason_list() {
+async fn install_unavailable_errors_match_declared_claw_store_v1_fixture() {
     let admin_state = shared_state();
     let (status, _bytes, body) = request(
         admin_router(Arc::clone(&admin_state)),
@@ -900,18 +1010,11 @@ async fn install_unavailable_reason_shape_is_object_not_availability_reason_list
         None,
     )
     .await;
-    assert_eq!(status, StatusCode::BAD_REQUEST);
-    assert_eq!(
-        body["code"],
-        fixture("install_unavailable_reasons_object")["code"]
-    );
-    assert!(
-        body["reasons"].is_object(),
-        "admin reasons must stay object"
-    );
-    assert_eq!(
-        body["reasons"]["unavailable_reason_code"],
-        fixture("install_unavailable_reasons_object")["reasons"]["unavailable_reason_code"]
+    assert_fixture_body(
+        status,
+        &body,
+        StatusCode::BAD_REQUEST,
+        "install_unavailable_reasons_object",
     );
 
     let mobile_state = shared_state();
@@ -924,18 +1027,26 @@ async fn install_unavailable_reason_shape_is_object_not_availability_reason_list
         Some(format!("Bearer {token}")),
     )
     .await;
-    assert_eq!(status, StatusCode::BAD_REQUEST);
-    assert_eq!(
-        body["code"],
-        fixture("install_unavailable_reasons_object")["code"]
+    assert_fixture_body(
+        status,
+        &body,
+        StatusCode::BAD_REQUEST,
+        "install_unavailable_reasons_object",
     );
-    assert!(
-        body["reasons"].is_object(),
-        "mobile reasons must stay object"
-    );
-    assert_eq!(
-        body["reasons"]["unavailable_reason_code"],
-        fixture("install_unavailable_reasons_object")["reasons"]["unavailable_reason_code"]
+
+    let household = household_fixture();
+    let (status, _bytes, body) = household_request(
+        household.app,
+        &household.person,
+        Method::POST,
+        "/api/v1/household/claws/claude-claw/install",
+    )
+    .await;
+    assert_fixture_body(
+        status,
+        &body,
+        StatusCode::BAD_REQUEST,
+        "install_unavailable_reasons_object",
     );
 }
 

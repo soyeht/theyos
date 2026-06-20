@@ -73,8 +73,8 @@
         "method_helper": "post"
       },
       "expectations": {
-        "queued": { "status": 200, "fixture": "action_job_body" },
-        "already_installing": { "status": 200, "fixture": "action_job_body" },
+        "queued": { "status": 200, "fixture": "install_queued_job_schema" },
+        "already_installing": { "status": 200, "fixture": "already_installing_job_body" },
         "unknown": { "status": 404, "fixture": "unknown_claw_error" },
         "unavailable": { "status": 400, "fixture": "install_unavailable_reasons_object" },
         "already_ready": { "status": 400, "fixture": "already_ready_error" },
@@ -95,7 +95,7 @@
         "method_helper": "post"
       },
       "expectations": {
-        "queued": { "status": 200, "fixture": "action_job_body" },
+        "queued": { "status": 200, "fixture": "uninstall_queued_job_schema" },
         "unknown": { "status": 404, "fixture": "unknown_claw_error" },
         "not_ready": { "status": 400, "fixture": "not_installed_error" },
         "instances_exist": { "status": 400, "fixture": "uninstall_instances_exist_error" },
@@ -153,8 +153,8 @@
         "method_helper": "post"
       },
       "expectations": {
-        "queued": { "status": 200, "fixture": "action_job_body" },
-        "already_installing": { "status": 409, "fixture": "action_job_body" },
+        "queued": { "status": 200, "fixture": "install_queued_job_schema" },
+        "already_installing": { "status": 409, "fixture": "already_installing_job_body" },
         "unknown": { "status": 404, "fixture": "unknown_claw_error" },
         "unavailable": { "status": 400, "fixture": "install_unavailable_reasons_object" },
         "already_ready": { "status": 400, "fixture": "already_ready_error" },
@@ -176,7 +176,7 @@
         "method_helper": "post"
       },
       "expectations": {
-        "queued": { "status": 200, "fixture": "action_job_body" },
+        "queued": { "status": 200, "fixture": "uninstall_queued_job_schema" },
         "unknown": { "status": 404, "fixture": "unknown_claw_error" },
         "not_ready": { "status": 400, "fixture": "not_installed_error" },
         "instances_exist": { "status": 400, "fixture": "uninstall_instances_exist_error" },
@@ -238,8 +238,8 @@
         "method_helper": "post"
       },
       "expectations": {
-        "queued": { "status": 200, "fixture": "action_job_body" },
-        "already_installing": { "status": 200, "fixture": "action_job_body" },
+        "queued": { "status": 200, "fixture": "install_queued_job_schema" },
+        "already_installing": { "status": 200, "fixture": "already_installing_job_body" },
         "unknown": { "status": 404, "fixture": "unknown_claw_error" },
         "unavailable": { "status": 400, "fixture": "install_unavailable_reasons_object" },
         "already_ready": { "status": 400, "fixture": "already_ready_error" },
@@ -261,7 +261,7 @@
         "method_helper": "post"
       },
       "expectations": {
-        "queued": { "status": 200, "fixture": "action_job_body" },
+        "queued": { "status": 200, "fixture": "uninstall_queued_job_schema" },
         "unknown": { "status": 404, "fixture": "unknown_claw_error" },
         "not_ready": { "status": 400, "fixture": "not_installed_error" },
         "instances_exist": { "status": 400, "fixture": "uninstall_instances_exist_error" },
@@ -316,9 +316,19 @@
       "job_id": "job-alpha",
       "error": null
     },
-    "action_job_body": {
+    "already_installing_job_body": {
       "job_id": "job-alpha",
       "message": "install already in progress"
+    },
+    "install_queued_job_schema": {
+      "schema": "claw_job_response_pattern",
+      "job_id_pattern": "^job_[0-9a-f]{16}$",
+      "message": "install queued for picoclaw"
+    },
+    "uninstall_queued_job_schema": {
+      "schema": "claw_job_response_pattern",
+      "job_id_pattern": "^job_[0-9a-f]{16}$",
+      "message": "uninstall queued for picoclaw"
     },
     "unknown_availability": {
       "name": "unknown-claw",
@@ -382,9 +392,11 @@
       "code": "INVALID_INPUT"
     },
     "install_unavailable_reasons_object": {
+      "error": "claw type 'claude-claw' is not installable yet: Claude Code plugin, not a server daemon \u2014 installed via `claude plugin install --url https://github.com/andrehuang/claude-claw`. Does not fit the Firecracker VM smoke-test model.",
       "code": "INVALID_INPUT",
       "reasons": {
-        "unavailable_reason_code": "catalog_only"
+        "unavailable_reason_code": "catalog_only",
+        "unavailable_reason": "Claude Code plugin, not a server daemon \u2014 installed via `claude plugin install --url https://github.com/andrehuang/claude-claw`. Does not fit the Firecracker VM smoke-test model."
       }
     },
     "empty_body": {

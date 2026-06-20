@@ -50,6 +50,13 @@ fn status_for_error_code(code: &str) -> Option<u16> {
     }
 }
 
+fn is_allowed_schema_fixture(fixture: &str) -> bool {
+    matches!(
+        fixture,
+        "install_queued_job_schema" | "uninstall_queued_job_schema"
+    )
+}
+
 fn contract() -> Contract {
     serde_json::from_str(include_str!(
         "../../../contracts/claw-store/v1/contract.json"
@@ -157,6 +164,37 @@ fn claw_store_v1_contract_metadata_is_valid() {
                         route.id
                     )
                 });
+                if fixture.ends_with("_schema") {
+                    assert!(
+                        is_allowed_schema_fixture(fixture),
+                        "{} expectation {name} references unknown schema fixture {fixture}",
+                        route.id
+                    );
+                    assert_eq!(
+                        name, "queued",
+                        "{} schema fixture {fixture} may only describe queued dynamic responses",
+                        route.id
+                    );
+                    assert_eq!(
+                        expectation.status, 200,
+                        "{} queued schema fixture {fixture} must stay HTTP 200",
+                        route.id
+                    );
+                    assert_eq!(
+                        body.get("schema").and_then(Value::as_str),
+                        Some("claw_job_response_pattern"),
+                        "{fixture} must declare the Claw job response schema class"
+                    );
+                    assert!(
+                        body.get("job_id_pattern").and_then(Value::as_str).is_some(),
+                        "{fixture} must declare the dynamic job_id pattern"
+                    );
+                    assert!(
+                        body.get("message").and_then(Value::as_str).is_some(),
+                        "{fixture} must declare the exact queued message"
+                    );
+                    continue;
+                }
                 if let Some(code) = body.get("code").and_then(Value::as_str) {
                     if let Some(expected_status) = status_for_error_code(code) {
                         assert_eq!(
@@ -173,11 +211,6 @@ fn claw_store_v1_contract_metadata_is_valid() {
                         route.id
                     );
                 }
-                assert!(
-                    !fixture.ends_with("_schema"),
-                    "{} expectation {name} must declare an exact fixture, not schema fixture {fixture}",
-                    route.id
-                );
             }
         }
     }
@@ -292,10 +325,31 @@ fn current_wire_quirks_are_explicitly_pinned() {
         "mobile_install_claw",
         "household_install_claw",
     ] {
+        assert_eq!(
+            route(id).expectations["queued"].fixture.as_deref(),
+            Some("install_queued_job_schema")
+        );
+        assert_eq!(
+            route(id).expectations["already_installing"]
+                .fixture
+                .as_deref(),
+            Some("already_installing_job_body")
+        );
         assert_eq!(route(id).expectations["unavailable"].status, 400);
         assert_eq!(
             route(id).expectations["unavailable"].fixture.as_deref(),
             Some("install_unavailable_reasons_object")
+        );
+    }
+
+    for id in [
+        "admin_uninstall_claw",
+        "mobile_uninstall_claw",
+        "household_uninstall_claw",
+    ] {
+        assert_eq!(
+            route(id).expectations["queued"].fixture.as_deref(),
+            Some("uninstall_queued_job_schema")
         );
     }
 
