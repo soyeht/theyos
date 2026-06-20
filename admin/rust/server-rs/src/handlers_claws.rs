@@ -5,7 +5,9 @@
 //!   POST   /api/v1/claws/{name}/install
 //!   POST   /api/v1/claws/{name}/uninstall
 
-use crate::responses::{ClawDetailResponse, ClawJobResponse, ClawListItemResponse, ListResponse};
+use crate::responses::{
+    ClawDetailResponse, ClawJobResponse, ClawListItemResponse, ListResponse, claw_list_response,
+};
 use crate::state::SharedState;
 use axum::{
     Json,
@@ -13,7 +15,7 @@ use axum::{
 };
 use claw_rs::ClawStatus;
 use core_rs::error::{ApiError, blocking};
-use serde_json::{Value, json};
+use serde_json::json;
 
 /// `GET /api/v1/claws`
 ///
@@ -37,23 +39,7 @@ pub async fn handle_list_claws(
         .catalog_with_status_merged(Some(&verify_path));
     // Share one host probe across all claws in the list.
     let availabilities = crate::availability::project_all_claws(&state);
-    let by_name: std::collections::HashMap<String, _> = availabilities
-        .into_iter()
-        .map(|a| (a.name.clone(), a))
-        .collect();
-
-    let enriched: Vec<ClawListItemResponse> = items
-        .into_iter()
-        .map(|item| {
-            let availability = by_name.get(&item.name).cloned();
-            ClawListItemResponse {
-                catalog: item,
-                availability,
-            }
-        })
-        .collect();
-
-    Ok(Json(ListResponse::all(enriched)))
+    Ok(Json(claw_list_response(items, availabilities, None)))
 }
 
 /// `GET /api/v1/claws/{name}/availability`
@@ -76,11 +62,9 @@ pub async fn handle_list_claws(
 pub async fn handle_claw_availability(
     State(state): State<SharedState>,
     Path(name): Path<String>,
-) -> Result<Json<Value>, ApiError> {
+) -> Result<Json<core_rs::availability::ClawAvailability>, ApiError> {
     let avail = crate::availability::project_claw(&name, &state);
-    Ok(Json(serde_json::to_value(&avail).map_err(|e| {
-        ApiError::internal(format!("availability serialization: {e}"))
-    })?))
+    Ok(Json(avail))
 }
 
 /// `GET /api/v1/claws/{name}`
@@ -163,10 +147,7 @@ pub async fn handle_install_claw(
             // Idempotent: return existing job ID
             let existing_state = state.claw_store.get_state(&name);
             let job_id = existing_state.and_then(|s| s.job_id).unwrap_or_default();
-            return Ok(Json(ClawJobResponse {
-                job_id,
-                message: "install already in progress".to_string(),
-            }));
+            return Ok(Json(ClawJobResponse::install_already_in_progress(job_id)));
         }
         _ => {} // NotInstalled, Failed, Uninstalling — proceed
     }
@@ -192,10 +173,7 @@ pub async fn handle_install_claw(
 
     tracing::info!("[claw-store] install queued: claw={claw_name} job={job_id}");
 
-    Ok(Json(ClawJobResponse {
-        job_id,
-        message: format!("install queued for {claw_name}"),
-    }))
+    Ok(Json(ClawJobResponse::install_queued(job_id, &claw_name)))
 }
 
 /// `POST /api/v1/claws/{name}/uninstall`
@@ -259,10 +237,7 @@ pub async fn handle_uninstall_claw(
 
     tracing::info!("[claw-store] uninstall queued: claw={claw_name} job={job_id}");
 
-    Ok(Json(ClawJobResponse {
-        job_id,
-        message: format!("uninstall queued for {claw_name}"),
-    }))
+    Ok(Json(ClawJobResponse::uninstall_queued(job_id, &claw_name)))
 }
 
 fn claw_status_wire(status: ClawStatus) -> &'static str {
