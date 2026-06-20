@@ -65,7 +65,7 @@ pub struct ArtifactManifest {
     pub kernel_sha256: String,
 
     // ── Observable metadata (not installation gates) ────────────────────────
-    /// Kernel version used during the build (e.g. `"vmlinux-6.1.155"`).
+    /// Kernel version used during the build.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kernel_version: Option<String>,
     /// Firecracker version used during the build (e.g. `"v1.15.0"`).
@@ -214,7 +214,7 @@ mod tests {
             base_rootfs_sha256: "b".repeat(64),
             installer_plan_sha256: "c".repeat(64),
             kernel_sha256: "d".repeat(64),
-            kernel_version: Some("vmlinux-6.1.155".into()),
+            kernel_version: Some(crate::guest_net::KERNEL_FILENAME.into()),
             firecracker_version: Some("v1.15.0".into()),
             runtime_min_version: None,
         }
@@ -230,7 +230,10 @@ mod tests {
         assert_eq!(parsed.claw, "hermes-agent");
         assert_eq!(parsed.manifest_version, 1);
         assert_eq!(parsed.sha256, "a".repeat(64));
-        assert_eq!(parsed.kernel_version.as_deref(), Some("vmlinux-6.1.155"));
+        assert_eq!(
+            parsed.kernel_version.as_deref(),
+            Some(crate::guest_net::KERNEL_FILENAME)
+        );
     }
 
     #[test]

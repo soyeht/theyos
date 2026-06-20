@@ -241,9 +241,7 @@ fn execute_create_steps(
                 #[cfg(target_os = "macos")]
                 {
                     use std::net::TcpListener;
-                    const MIN_PORT: u16 = 18790;
-                    const MAX_PORT: u16 = 19999;
-                    for p in MIN_PORT..=MAX_PORT {
+                    for p in core_rs::guest_net::host_app_port_range() {
                         if TcpListener::bind(("127.0.0.1", p)).is_ok() {
                             host_port = i64::from(p);
                             break;
