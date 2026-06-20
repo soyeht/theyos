@@ -54,6 +54,7 @@ mod doctor;
 mod github_cache;
 mod github_client;
 mod infra;
+mod manifest_yaml;
 mod nixos;
 mod pair;
 mod render_env;

@@ -18,6 +18,7 @@ use std::path::{Path, PathBuf};
 
 use claw_rs::verify_results::{self, VerifyResult, VerifyStatus};
 
+use crate::manifest_yaml;
 use crate::verify_sandbox::{self, SandboxKind, Verifier, VerifyReport};
 
 /// Arguments for `soyeht claws-verify`.
@@ -200,56 +201,13 @@ pub(crate) fn patch_manifest_tier_available(root: &Path, claw: &str) -> Result<b
     }
     let content =
         std::fs::read_to_string(&manifest_path).map_err(|e| format!("read manifest: {e}"))?;
-    let patched = apply_tier_patch(&content, claw, "available")?;
+    let patched =
+        manifest_yaml::patch_unquoted_field_after_header(&content, claw, "tier", "available")?;
     if patched == content {
         return Ok(false);
     }
     std::fs::write(&manifest_path, patched).map_err(|e| format!("write manifest: {e}"))?;
     Ok(true)
-}
-
-/// Pure helper for the YAML string patch — exposed for tests.
-fn apply_tier_patch(content: &str, claw: &str, new_tier: &str) -> Result<String, String> {
-    let lines: Vec<&str> = content.lines().collect();
-    let header = format!("  {claw}:");
-    let Some(start) = lines.iter().position(|l| l.trim_end() == header.trim_end()) else {
-        return Err(format!("claw block {claw:?} not found in manifest"));
-    };
-    // The block ends at the next top-level (2-space indented) "name:" header
-    // or EOF.  Inside the block, every line is indented >= 4 spaces.
-    let end = lines
-        .iter()
-        .enumerate()
-        .skip(start + 1)
-        .find(|(_, l)| !l.is_empty() && !l.starts_with("    "))
-        .map_or(lines.len(), |(i, _)| i);
-
-    let mut patched_block: Vec<String> = Vec::with_capacity(end - start + 1);
-    let mut saw_tier = false;
-    for l in &lines[start..end] {
-        if let Some(rest) = l.strip_prefix("    tier:") {
-            let _ = rest; // we replace regardless of previous value
-            patched_block.push(format!("    tier: {new_tier}"));
-            saw_tier = true;
-        } else {
-            patched_block.push((*l).to_string());
-        }
-    }
-    if !saw_tier {
-        // Insert `tier: available` right after the header.
-        patched_block.insert(1, format!("    tier: {new_tier}"));
-    }
-
-    let mut out = Vec::with_capacity(lines.len() + 1);
-    out.extend(lines[..start].iter().map(|s| (*s).to_string()));
-    out.extend(patched_block);
-    out.extend(lines[end..].iter().map(|s| (*s).to_string()));
-    let trailing_newline = content.ends_with('\n');
-    let mut joined = out.join("\n");
-    if trailing_newline {
-        joined.push('\n');
-    }
-    Ok(joined)
 }
 
 // ─── Tests ───────────────────────────────────────────────────────────────────
@@ -332,20 +290,38 @@ mod tests {
 
     #[test]
     fn apply_tier_patch_inserts_when_missing() {
-        let out = apply_tier_patch(FIXTURE_YML, "picoclaw", "available").unwrap();
+        let out = manifest_yaml::patch_unquoted_field_after_header(
+            FIXTURE_YML,
+            "picoclaw",
+            "tier",
+            "available",
+        )
+        .unwrap();
         assert!(out.contains("  picoclaw:\n    tier: available\n    description:"));
     }
 
     #[test]
     fn apply_tier_patch_replaces_existing() {
-        let out = apply_tier_patch(FIXTURE_YML, "zeroclaw", "available").unwrap();
+        let out = manifest_yaml::patch_unquoted_field_after_header(
+            FIXTURE_YML,
+            "zeroclaw",
+            "tier",
+            "available",
+        )
+        .unwrap();
         assert!(out.contains("    tier: available"));
         assert!(!out.contains("    tier: detected"));
     }
 
     #[test]
     fn apply_tier_patch_unknown_claw_errors() {
-        let err = apply_tier_patch(FIXTURE_YML, "ghostclaw", "available").unwrap_err();
+        let err = manifest_yaml::patch_unquoted_field_after_header(
+            FIXTURE_YML,
+            "ghostclaw",
+            "tier",
+            "available",
+        )
+        .unwrap_err();
         assert!(err.contains("not found"), "got {err}");
     }
 
@@ -353,7 +329,13 @@ mod tests {
     fn apply_tier_patch_preserves_trailing_newline() {
         let yml_with_newline = FIXTURE_YML; // already ends with \n
         assert!(yml_with_newline.ends_with('\n'));
-        let out = apply_tier_patch(yml_with_newline, "picoclaw", "available").unwrap();
+        let out = manifest_yaml::patch_unquoted_field_after_header(
+            yml_with_newline,
+            "picoclaw",
+            "tier",
+            "available",
+        )
+        .unwrap();
         assert!(out.ends_with('\n'));
     }
 

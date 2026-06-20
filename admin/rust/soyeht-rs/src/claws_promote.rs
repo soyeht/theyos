@@ -23,6 +23,8 @@
 
 use std::path::Path;
 
+use crate::manifest_yaml;
+
 /// CLI args for `soyeht claws-promote`.
 #[derive(Debug, Clone)]
 pub struct ClawsPromoteArgs {
@@ -59,7 +61,7 @@ fn run(root: &Path, claw: &str) -> Result<(), String> {
 
     // The manifest patch refuses to run unless the claw is currently
     // `tier: available` — promoting a `detected` claw skips verification.
-    let current = current_tier(&content, claw)?;
+    let current = manifest_yaml::read_scalar_field(&content, claw, "tier")?;
     if current.as_deref() != Some("available") {
         return Err(format!(
             "claw {claw} is not `tier: available` (currently: {})",
@@ -67,116 +69,13 @@ fn run(root: &Path, claw: &str) -> Result<(), String> {
         ));
     }
 
-    let patched = apply_promotion(&content, claw)?;
+    let patched = manifest_yaml::promote_available_to_builtin(&content, claw)?;
     if patched == content {
         return Err("patch produced no diff".to_string());
     }
     std::fs::write(&manifest_path, patched)
         .map_err(|e| format!("write manifest {}: {e}", manifest_path.display()))?;
     Ok(())
-}
-
-/// Extract the current `tier:` value for `claw`, if any.
-pub(crate) fn current_tier(content: &str, claw: &str) -> Result<Option<String>, String> {
-    let lines: Vec<&str> = content.lines().collect();
-    let header = format!("  {claw}:");
-    let Some(start) = lines.iter().position(|l| l.trim_end() == header.trim_end()) else {
-        return Err(format!("claw block {claw:?} not found in manifest"));
-    };
-    let end = lines
-        .iter()
-        .enumerate()
-        .skip(start + 1)
-        .find(|(_, l)| !l.is_empty() && !l.starts_with("    "))
-        .map_or(lines.len(), |(i, _)| i);
-    for l in &lines[start + 1..end] {
-        if let Some(rest) = l.strip_prefix("    tier:") {
-            return Ok(Some(rest.trim().trim_matches('"').to_string()));
-        }
-    }
-    Ok(None)
-}
-
-/// Core transformation (pure).  Exposed for tests.
-pub(crate) fn apply_promotion(content: &str, claw: &str) -> Result<String, String> {
-    let lines: Vec<&str> = content.lines().collect();
-    let header = format!("  {claw}:");
-    let Some(start) = lines.iter().position(|l| l.trim_end() == header.trim_end()) else {
-        return Err(format!("claw block {claw:?} not found in manifest"));
-    };
-    let end = lines
-        .iter()
-        .enumerate()
-        .skip(start + 1)
-        .find(|(_, l)| !l.is_empty() && !l.starts_with("    "))
-        .map_or(lines.len(), |(i, _)| i);
-
-    let mut out_block: Vec<String> = Vec::new();
-    out_block.push(lines[start].to_string()); // header
-
-    let mut saw_install_plan_source = false;
-    let mut i = start + 1;
-    while i < end {
-        let l = lines[i];
-
-        if let Some(_rest) = l.strip_prefix("    tier:") {
-            out_block.push("    tier: supported".to_string());
-            i += 1;
-            continue;
-        }
-
-        if l.strip_prefix("    install_template:").is_some() {
-            // drop the line entirely
-            i += 1;
-            continue;
-        }
-
-        if l.strip_prefix("    install_plan_source:").is_some() {
-            out_block.push("    install_plan_source: \"builtin\"".to_string());
-            saw_install_plan_source = true;
-            i += 1;
-            continue;
-        }
-
-        if l.trim_end() == "    install:" {
-            // Skip the `install:` block: every subsequent line that is
-            // indented >= 6 spaces belongs to it (nested list / mapping).
-            i += 1;
-            while i < end {
-                let nested = lines[i];
-                if nested.is_empty() {
-                    // Blank lines inside the block are fine — continue scanning.
-                    i += 1;
-                    continue;
-                }
-                if nested.starts_with("      ") {
-                    i += 1;
-                    continue;
-                }
-                break;
-            }
-            continue;
-        }
-
-        out_block.push(l.to_string());
-        i += 1;
-    }
-
-    if !saw_install_plan_source {
-        // Insert right after the header so it's visibly the promotion marker.
-        out_block.insert(1, "    install_plan_source: \"builtin\"".to_string());
-    }
-
-    let mut result = Vec::with_capacity(lines.len());
-    result.extend(lines[..start].iter().map(|s| (*s).to_string()));
-    result.extend(out_block);
-    result.extend(lines[end..].iter().map(|s| (*s).to_string()));
-    let trailing = content.ends_with('\n');
-    let mut joined = result.join("\n");
-    if trailing {
-        joined.push('\n');
-    }
-    Ok(joined)
 }
 
 #[cfg(test)]
@@ -202,11 +101,11 @@ mod tests {
     #[test]
     fn current_tier_reads_value() {
         assert_eq!(
-            current_tier(FIXTURE, "picoclaw").unwrap(),
+            manifest_yaml::read_scalar_field(FIXTURE, "picoclaw", "tier").unwrap(),
             Some("available".to_string())
         );
         assert_eq!(
-            current_tier(FIXTURE, "zeroclaw").unwrap(),
+            manifest_yaml::read_scalar_field(FIXTURE, "zeroclaw", "tier").unwrap(),
             Some("detected".to_string())
         );
     }
@@ -214,30 +113,33 @@ mod tests {
     #[test]
     fn current_tier_missing_is_none() {
         let yml = "claws:\n  picoclaw:\n    description: \"x\"\n";
-        assert_eq!(current_tier(yml, "picoclaw").unwrap(), None);
+        assert_eq!(
+            manifest_yaml::read_scalar_field(yml, "picoclaw", "tier").unwrap(),
+            None
+        );
     }
 
     #[test]
     fn current_tier_unknown_claw_errors() {
-        assert!(current_tier(FIXTURE, "ghostclaw").is_err());
+        assert!(manifest_yaml::read_scalar_field(FIXTURE, "ghostclaw", "tier").is_err());
     }
 
     #[test]
     fn apply_promotion_sets_tier_and_source() {
-        let out = apply_promotion(FIXTURE, "picoclaw").unwrap();
+        let out = manifest_yaml::promote_available_to_builtin(FIXTURE, "picoclaw").unwrap();
         assert!(out.contains("    tier: supported"));
         assert!(out.contains("    install_plan_source: \"builtin\""));
     }
 
     #[test]
     fn apply_promotion_strips_install_template() {
-        let out = apply_promotion(FIXTURE, "picoclaw").unwrap();
+        let out = manifest_yaml::promote_available_to_builtin(FIXTURE, "picoclaw").unwrap();
         assert!(!out.contains("install_template:"));
     }
 
     #[test]
     fn apply_promotion_strips_install_block() {
-        let out = apply_promotion(FIXTURE, "picoclaw").unwrap();
+        let out = manifest_yaml::promote_available_to_builtin(FIXTURE, "picoclaw").unwrap();
         // The `install:` header and its nested children must all be gone.
         assert!(!out.contains("    install:"));
         assert!(!out.contains("      run_cmd"));
@@ -255,14 +157,14 @@ mod tests {
             "    tier: available\n",
             "    install_plan_source: \"template\"\n",
         );
-        let out = apply_promotion(yml, "picoclaw").unwrap();
+        let out = manifest_yaml::promote_available_to_builtin(yml, "picoclaw").unwrap();
         assert!(out.contains("install_plan_source: \"builtin\""));
         assert!(!out.contains("install_plan_source: \"template\""));
     }
 
     #[test]
     fn apply_promotion_unknown_claw_errors() {
-        assert!(apply_promotion(FIXTURE, "ghostclaw").is_err());
+        assert!(manifest_yaml::promote_available_to_builtin(FIXTURE, "ghostclaw").is_err());
     }
 
     // ── End-to-end run() tests ────────────────────────────────────────

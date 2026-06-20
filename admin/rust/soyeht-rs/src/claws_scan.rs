@@ -9,13 +9,14 @@
 //! `core_rs::manifest::catalog`) so this command works even before Phase A
 //! fields have been merged into the compiled manifest.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
 use crate::github_cache;
 use crate::github_client::{self, GitHubApi, GitHubClient};
+use crate::manifest_yaml;
 
 /// CLI arguments for `soyeht claws-scan`.
 #[derive(Debug, Default)]
@@ -216,101 +217,27 @@ fn apply_latest_updates(manifest_path: &Path, rows: &[ScanRow]) -> Result<(), St
         if row.latest.is_empty() {
             continue;
         }
-        updated = patch_field(&updated, &row.claw, "latest_upstream_commit", &row.latest);
-        updated = patch_field(&updated, &row.claw, "latest_checked_at", &today);
+        updated = manifest_yaml::patch_quoted_field_noop_unknown(
+            &updated,
+            &row.claw,
+            "latest_upstream_commit",
+            &row.latest,
+        );
+        updated = manifest_yaml::patch_quoted_field_noop_unknown(
+            &updated,
+            &row.claw,
+            "latest_checked_at",
+            &today,
+        );
     }
 
     // Write via a tempfile in the same dir to make it atomic-ish.
-    let tmp_path = tmp_sibling(manifest_path);
+    let tmp_path = manifest_yaml::tmp_sibling(manifest_path);
     std::fs::write(&tmp_path, &updated)
         .map_err(|e| format!("write {}: {e}", tmp_path.display()))?;
     std::fs::rename(&tmp_path, manifest_path)
         .map_err(|e| format!("rename to {}: {e}", manifest_path.display()))?;
     Ok(())
-}
-
-/// Locate the block for `<claw>:` inside a YAML file and patch a single
-/// key (either by rewriting the existing line, or by inserting a new line
-/// at the end of the block). Preserves all other content byte-for-byte.
-fn patch_field(content: &str, claw: &str, key: &str, value: &str) -> String {
-    let lines: Vec<&str> = content.lines().collect();
-    let Some((start, indent)) = find_claw_block(&lines, claw) else {
-        return content.to_string();
-    };
-    let end = find_block_end(&lines, start, &indent);
-
-    let field_indent = format!("{indent}  ");
-    let mut patched: Vec<String> = lines.iter().take(start).map(|s| (*s).to_string()).collect();
-    // Push the header unchanged.
-    patched.push(lines[start].to_string());
-
-    let mut wrote = false;
-    for line in &lines[start + 1..end] {
-        let trimmed = line.trim_start();
-        if trimmed.starts_with(&format!("{key}:")) && line.starts_with(field_indent.as_str()) {
-            patched.push(format!("{field_indent}{key}: {}", yaml_quoted(value)));
-            wrote = true;
-        } else {
-            patched.push((*line).to_string());
-        }
-    }
-    if !wrote {
-        patched.push(format!("{field_indent}{key}: {}", yaml_quoted(value)));
-    }
-    // Append the rest of the file (after the block end).
-    for line in &lines[end..] {
-        patched.push((*line).to_string());
-    }
-
-    // Preserve trailing newline behaviour.
-    let trailing = if content.ends_with('\n') { "\n" } else { "" };
-    format!("{}{trailing}", patched.join("\n"))
-}
-
-fn yaml_quoted(s: &str) -> String {
-    let escaped = s.replace('\\', "\\\\").replace('"', "\\\"");
-    format!("\"{escaped}\"")
-}
-
-fn find_claw_block(lines: &[&str], claw: &str) -> Option<(usize, String)> {
-    // A claw header is `<indent><claw>:` where <indent> has at least 2 spaces.
-    for (i, raw) in lines.iter().enumerate() {
-        let stripped = raw.trim_start();
-        let indent_len = raw.len() - stripped.len();
-        if indent_len >= 2 && stripped == format!("{claw}:") {
-            return Some((i, " ".repeat(indent_len)));
-        }
-    }
-    None
-}
-
-fn find_block_end(lines: &[&str], start: usize, indent: &str) -> usize {
-    // End of block = first non-blank line at indent <= `indent.len()`.
-    let indent_len = indent.len();
-    let mut end = lines.len();
-    for (i, raw) in lines.iter().enumerate().skip(start + 1) {
-        if raw.trim().is_empty() {
-            continue;
-        }
-        let stripped = raw.trim_start();
-        let this_indent = raw.len() - stripped.len();
-        if this_indent <= indent_len {
-            end = i;
-            break;
-        }
-    }
-    end
-}
-
-fn tmp_sibling(path: &Path) -> PathBuf {
-    let mut tmp = path.to_path_buf();
-    let name = format!(
-        "{}.tmp.{}",
-        path.file_name().and_then(|s| s.to_str()).unwrap_or("out"),
-        std::process::id()
-    );
-    tmp.set_file_name(name);
-    tmp
 }
 
 // ── Tests ───────────────────────────────────────────────────────────────────
@@ -321,6 +248,7 @@ mod tests {
     use crate::github_client::{FileContent, GitHubError, Release, RepoMeta};
     use std::cell::RefCell;
     use std::collections::HashMap;
+    use std::path::PathBuf;
 
     struct MockApi {
         heads: HashMap<(String, String, Option<String>), String>,
@@ -461,7 +389,12 @@ mod tests {
     #[test]
     fn patch_field_replaces_existing_value() {
         let src = "claws:\n  picoclaw:\n    source: https://x\n    latest_upstream_commit: old\n    other: keep\n";
-        let out = patch_field(src, "picoclaw", "latest_upstream_commit", "new");
+        let out = manifest_yaml::patch_quoted_field_noop_unknown(
+            src,
+            "picoclaw",
+            "latest_upstream_commit",
+            "new",
+        );
         assert!(out.contains("latest_upstream_commit: \"new\""));
         assert!(out.contains("other: keep"));
         // old value is gone
@@ -471,7 +404,12 @@ mod tests {
     #[test]
     fn patch_field_appends_when_key_missing() {
         let src = "claws:\n  foo:\n    source: https://x\n    other: keep\n";
-        let out = patch_field(src, "foo", "latest_upstream_commit", "abc");
+        let out = manifest_yaml::patch_quoted_field_noop_unknown(
+            src,
+            "foo",
+            "latest_upstream_commit",
+            "abc",
+        );
         assert!(out.contains("latest_upstream_commit: \"abc\""));
         assert!(out.contains("other: keep"));
         assert!(out.contains("source: https://x"));
@@ -480,14 +418,24 @@ mod tests {
     #[test]
     fn patch_field_no_op_for_unknown_claw() {
         let src = "claws:\n  foo:\n    other: keep\n";
-        let out = patch_field(src, "bar", "latest_upstream_commit", "abc");
+        let out = manifest_yaml::patch_quoted_field_noop_unknown(
+            src,
+            "bar",
+            "latest_upstream_commit",
+            "abc",
+        );
         assert_eq!(out, src);
     }
 
     #[test]
     fn patch_field_does_not_touch_reviewed_commit() {
         let src = "claws:\n  foo:\n    reviewed_upstream_commit: reviewed-sha\n    latest_upstream_commit: old\n";
-        let out = patch_field(src, "foo", "latest_upstream_commit", "new");
+        let out = manifest_yaml::patch_quoted_field_noop_unknown(
+            src,
+            "foo",
+            "latest_upstream_commit",
+            "new",
+        );
         assert!(out.contains("reviewed_upstream_commit: reviewed-sha"));
         assert!(out.contains("latest_upstream_commit: \"new\""));
     }
@@ -523,17 +471,17 @@ mod tests {
 
     #[test]
     fn find_claw_block_locates_header() {
-        let lines = vec!["claws:", "  foo:", "    a: 1", "  bar:", "    b: 2"];
-        let (idx, indent) = find_claw_block(&lines, "bar").unwrap();
-        assert_eq!(idx, 3);
-        assert_eq!(indent, "  ");
+        let src = "claws:\n  foo:\n    a: 1\n  bar:\n    b: 2";
+        let block = manifest_yaml::find_claw_block(src, "bar").unwrap();
+        assert_eq!(block.start, 3);
+        assert_eq!(block.indent, "  ");
     }
 
     #[test]
     fn find_block_end_stops_at_next_sibling() {
-        let lines = vec!["claws:", "  foo:", "    a: 1", "  bar:", "    b: 2"];
-        let end = find_block_end(&lines, 1, "  ");
-        assert_eq!(end, 3);
+        let src = "claws:\n  foo:\n    a: 1\n  bar:\n    b: 2";
+        let block = manifest_yaml::find_claw_block(src, "foo").unwrap();
+        assert_eq!(block.end, 3);
     }
 
     #[test]

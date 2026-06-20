@@ -17,6 +17,7 @@ use std::time::Duration;
 use crate::detector::{self, DetectedTemplate, DetectionInput};
 use crate::github_cache;
 use crate::github_client::{self, GitHubApi, GitHubClient};
+use crate::manifest_yaml;
 
 /// CLI arguments for `soyeht claws-detect`.
 #[derive(Debug, Default)]
@@ -246,25 +247,41 @@ fn render_entry(
     let indent = "  ";
     let sub = "    ";
     let _ = writeln!(out, "{indent}{claw_name}:");
-    let _ = writeln!(out, "{sub}description: {}", yaml_scalar(&meta_description));
+    let _ = writeln!(
+        out,
+        "{sub}description: {}",
+        manifest_yaml::yaml_quoted(&meta_description)
+    );
     let _ = writeln!(out, "{sub}language: {}", template.language_hint());
     let _ = writeln!(out, "{sub}tier: {tier}");
     let _ = writeln!(out, "{sub}stars: {stars}");
-    let _ = writeln!(out, "{sub}source: {}", yaml_scalar(&source));
-    let _ = writeln!(out, "{sub}last_updated: {}", yaml_scalar(&pushed_date));
+    let _ = writeln!(out, "{sub}source: {}", manifest_yaml::yaml_quoted(&source));
+    let _ = writeln!(
+        out,
+        "{sub}last_updated: {}",
+        manifest_yaml::yaml_quoted(&pushed_date)
+    );
     let _ = writeln!(
         out,
         "{sub}reviewed_upstream_commit: {}",
-        yaml_scalar(head_sha)
+        manifest_yaml::yaml_quoted(head_sha)
     );
-    let _ = writeln!(out, "{sub}reviewed_at: {}", yaml_scalar(&today));
+    let _ = writeln!(
+        out,
+        "{sub}reviewed_at: {}",
+        manifest_yaml::yaml_quoted(&today)
+    );
     let _ = writeln!(out, "{sub}reviewed_by: claude-opus-4-6");
     let _ = writeln!(
         out,
         "{sub}latest_upstream_commit: {}",
-        yaml_scalar(head_sha)
+        manifest_yaml::yaml_quoted(head_sha)
     );
-    let _ = writeln!(out, "{sub}latest_checked_at: {}", yaml_scalar(&today));
+    let _ = writeln!(
+        out,
+        "{sub}latest_checked_at: {}",
+        manifest_yaml::yaml_quoted(&today)
+    );
 
     if matches!(template, DetectedTemplate::NeedsManual { .. }) {
         let _ = writeln!(out, "{sub}install_template: \"\"");
@@ -273,38 +290,66 @@ fn render_entry(
         let _ = writeln!(
             out,
             "{sub}install_plan_source: {}",
-            yaml_scalar(&format!("template:{template_name}"))
+            manifest_yaml::yaml_quoted(&format!("template:{template_name}"))
         );
     }
 
-    let _ = writeln!(out, "{sub}license: {}", yaml_scalar(&license));
+    let _ = writeln!(
+        out,
+        "{sub}license: {}",
+        manifest_yaml::yaml_quoted(&license)
+    );
     let _ = writeln!(out, "{sub}binary_size_mb: 0  # TBD");
     let _ = writeln!(out, "{sub}min_ram_mb: {}", template.min_ram_mb());
 
     match template {
         DetectedTemplate::GoBinary { asset_pattern } => {
             let _ = writeln!(out, "{sub}install:");
-            let _ = writeln!(out, "{sub}  asset_pattern: {}", yaml_scalar(asset_pattern));
+            let _ = writeln!(
+                out,
+                "{sub}  asset_pattern: {}",
+                manifest_yaml::yaml_quoted(asset_pattern)
+            );
         }
         DetectedTemplate::PipPackage {
             pip_package,
             entry_point,
         } => {
             let _ = writeln!(out, "{sub}install:");
-            let _ = writeln!(out, "{sub}  pip_package: {}", yaml_scalar(pip_package));
-            let _ = writeln!(out, "{sub}  entry_point: {}", yaml_scalar(entry_point));
+            let _ = writeln!(
+                out,
+                "{sub}  pip_package: {}",
+                manifest_yaml::yaml_quoted(pip_package)
+            );
+            let _ = writeln!(
+                out,
+                "{sub}  entry_point: {}",
+                manifest_yaml::yaml_quoted(entry_point)
+            );
         }
         DetectedTemplate::NodePackage {
             npm_package,
             entry_point,
         } => {
             let _ = writeln!(out, "{sub}install:");
-            let _ = writeln!(out, "{sub}  npm_package: {}", yaml_scalar(npm_package));
-            let _ = writeln!(out, "{sub}  entry_point: {}", yaml_scalar(entry_point));
+            let _ = writeln!(
+                out,
+                "{sub}  npm_package: {}",
+                manifest_yaml::yaml_quoted(npm_package)
+            );
+            let _ = writeln!(
+                out,
+                "{sub}  entry_point: {}",
+                manifest_yaml::yaml_quoted(entry_point)
+            );
         }
         DetectedTemplate::RawBinary { download_url } => {
             let _ = writeln!(out, "{sub}install:");
-            let _ = writeln!(out, "{sub}  download_url: {}", yaml_scalar(download_url));
+            let _ = writeln!(
+                out,
+                "{sub}  download_url: {}",
+                manifest_yaml::yaml_quoted(download_url)
+            );
         }
         DetectedTemplate::CargoBuild => {
             // The cargo-build template needs the `owner/repo` pair to clone
@@ -315,20 +360,26 @@ fn render_entry(
                 .map_or_else(|_| String::new(), |(o, r)| format!("{o}/{r}"));
             let binary_name = claw_name.to_string();
             let _ = writeln!(out, "{sub}install:");
-            let _ = writeln!(out, "{sub}  github_repo: {}", yaml_scalar(&github_repo));
-            let _ = writeln!(out, "{sub}  binary_name: {}", yaml_scalar(&binary_name));
+            let _ = writeln!(
+                out,
+                "{sub}  github_repo: {}",
+                manifest_yaml::yaml_quoted(&github_repo)
+            );
+            let _ = writeln!(
+                out,
+                "{sub}  binary_name: {}",
+                manifest_yaml::yaml_quoted(&binary_name)
+            );
         }
         DetectedTemplate::NeedsManual { reason } => {
-            let _ = writeln!(out, "{sub}# needs_manual: {}", yaml_scalar(reason));
+            let _ = writeln!(
+                out,
+                "{sub}# needs_manual: {}",
+                manifest_yaml::yaml_quoted(reason)
+            );
         }
     }
     out
-}
-
-/// Render a value as a YAML double-quoted scalar (safe default).
-fn yaml_scalar(s: &str) -> String {
-    let escaped = s.replace('\\', "\\\\").replace('"', "\\\"");
-    format!("\"{escaped}\"")
 }
 
 fn truncate_to_date(ts: &str) -> String {
@@ -711,7 +762,7 @@ mod tests {
     }
 
     #[test]
-    fn yaml_scalar_escapes_quotes() {
-        assert_eq!(yaml_scalar("a \"b\" c"), "\"a \\\"b\\\" c\"");
+    fn yaml_quoted_escapes_quotes() {
+        assert_eq!(manifest_yaml::yaml_quoted("a \"b\" c"), "\"a \\\"b\\\" c\"");
     }
 }
