@@ -3,6 +3,8 @@
 //! Using `#[derive(Serialize)]` with `#[serde(rename_all = "snake_case")]` ensures
 //! field names match the API convention without manual `json!()` construction.
 
+use claw_rs::ClawCatalogResponse;
+use core_rs::availability::ClawAvailability;
 use serde::Serialize;
 use store_rs::InstanceRow;
 
@@ -12,6 +14,40 @@ pub struct ListResponse<T: Serialize> {
     pub data: Vec<T>,
     pub has_more: bool,
     pub next_cursor: Option<String>,
+}
+
+/// Catalog item enriched with current host availability.
+///
+/// This preserves the `/api/v1/claws` wire shape by flattening the existing
+/// catalog response and adding the optional `availability` projection.
+#[derive(Debug, Serialize)]
+pub struct ClawListItemResponse {
+    #[serde(flatten)]
+    pub catalog: ClawCatalogResponse,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub availability: Option<ClawAvailability>,
+}
+
+/// Flat response for `GET /api/v1/claws/{name}`.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub struct ClawDetailResponse {
+    pub name: String,
+    pub description: String,
+    pub language: String,
+    pub buildable: bool,
+    pub status: String,
+    pub installed_at: Option<String>,
+    pub job_id: Option<String>,
+    pub error: Option<String>,
+}
+
+/// Flat response for install/uninstall job submissions.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub struct ClawJobResponse {
+    pub job_id: String,
+    pub message: String,
 }
 
 impl<T: Serialize> ListResponse<T> {
@@ -120,5 +156,99 @@ impl InstanceResponse {
     pub fn with_owner(mut self, owner: Option<OwnerInfo>) -> Self {
         self.owner = owner;
         self
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use claw_rs::ClawStatus;
+    use serde_json::json;
+
+    #[test]
+    fn claw_job_response_serializes_flat_snake_case() {
+        let value = serde_json::to_value(ClawJobResponse {
+            job_id: "job-alpha".to_string(),
+            message: "install queued for hermes-agent".to_string(),
+        })
+        .expect("serialize claw job response");
+
+        assert_eq!(
+            value,
+            json!({
+                "job_id": "job-alpha",
+                "message": "install queued for hermes-agent",
+            })
+        );
+    }
+
+    #[test]
+    fn claw_detail_response_preserves_existing_wire_shape() {
+        let value = serde_json::to_value(ClawDetailResponse {
+            name: "hermes-agent".to_string(),
+            description: "Hermes".to_string(),
+            language: "python".to_string(),
+            buildable: true,
+            status: "ready".to_string(),
+            installed_at: Some("2026-06-20T00:00:00Z".to_string()),
+            job_id: Some("job-alpha".to_string()),
+            error: None,
+        })
+        .expect("serialize claw detail response");
+
+        assert_eq!(
+            value,
+            json!({
+                "name": "hermes-agent",
+                "description": "Hermes",
+                "language": "python",
+                "buildable": true,
+                "status": "ready",
+                "installed_at": "2026-06-20T00:00:00Z",
+                "job_id": "job-alpha",
+                "error": null,
+            })
+        );
+    }
+
+    #[test]
+    fn claw_list_item_flattens_catalog_and_omits_missing_availability() {
+        let value = serde_json::to_value(ClawListItemResponse {
+            catalog: ClawCatalogResponse {
+                name: "hermes-agent".to_string(),
+                description: "Hermes".to_string(),
+                language: "python".to_string(),
+                buildable: true,
+                version: "1.0.0".to_string(),
+                binary_size_mb: 10,
+                min_ram_mb: 512,
+                license: "MIT".to_string(),
+                distribution: "prebuilt".to_string(),
+                status: ClawStatus::Ready,
+                installed_at: None,
+                job_id: None,
+                error: None,
+                verify_status: None,
+                verify_error: None,
+                tier: "available".to_string(),
+                stars: 0,
+                source: String::new(),
+                last_updated: String::new(),
+                reviewed_upstream_commit: String::new(),
+                latest_upstream_commit: String::new(),
+                install_plan_source: "template:manual-shell".to_string(),
+                installable: true,
+                unavailable_reason_code: None,
+                unavailable_reason: None,
+            },
+            availability: None,
+        })
+        .expect("serialize claw list item response");
+
+        assert_eq!(value["name"], "hermes-agent");
+        assert_eq!(value["status"], "ready");
+        assert_eq!(value["installable"], true);
+        assert_eq!(value.get("availability"), None);
+        assert_eq!(value.get("stars"), None);
     }
 }

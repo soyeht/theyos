@@ -5,6 +5,7 @@
 //!   POST   /api/v1/claws/{name}/install
 //!   POST   /api/v1/claws/{name}/uninstall
 
+use crate::responses::{ClawDetailResponse, ClawJobResponse, ClawListItemResponse, ListResponse};
 use crate::state::SharedState;
 use axum::{
     Json,
@@ -27,7 +28,9 @@ use serde_json::{Value, json};
 ///
 /// Returns `ApiError` if the store cannot be queried.
 #[allow(clippy::unused_async)]
-pub async fn handle_list_claws(State(state): State<SharedState>) -> Result<Json<Value>, ApiError> {
+pub async fn handle_list_claws(
+    State(state): State<SharedState>,
+) -> Result<Json<ListResponse<ClawListItemResponse>>, ApiError> {
     let verify_path = state.theyos_dir.join("claws/verify-results.json");
     let items = state
         .claw_store
@@ -39,24 +42,18 @@ pub async fn handle_list_claws(State(state): State<SharedState>) -> Result<Json<
         .map(|a| (a.name.clone(), a))
         .collect();
 
-    let enriched: Vec<Value> = items
+    let enriched: Vec<ClawListItemResponse> = items
         .into_iter()
         .map(|item| {
-            let mut v = serde_json::to_value(&item).unwrap_or(Value::Null);
-            if let Some(avail) = by_name.get(&item.name) {
-                if let Value::Object(ref mut map) = v {
-                    if let Ok(avail_v) = serde_json::to_value(avail) {
-                        map.insert("availability".to_string(), avail_v);
-                    }
-                }
+            let availability = by_name.get(&item.name).cloned();
+            ClawListItemResponse {
+                catalog: item,
+                availability,
             }
-            v
         })
         .collect();
 
-    Ok(Json(
-        json!({ "data": enriched, "has_more": false, "next_cursor": null }),
-    ))
+    Ok(Json(ListResponse::all(enriched)))
 }
 
 /// `GET /api/v1/claws/{name}/availability`
@@ -97,27 +94,26 @@ pub async fn handle_claw_availability(
 pub async fn handle_get_claw(
     State(state): State<SharedState>,
     Path(name): Path<String>,
-) -> Result<Json<Value>, ApiError> {
+) -> Result<Json<ClawDetailResponse>, ApiError> {
     let entry = core_rs::manifest::get(&name)
         .ok_or_else(|| ApiError::not_found(format!("unknown claw type: {name}")))?;
     let installed = state.claw_store.get_state(&name);
 
-    Ok(Json(json!({
-        "name": entry.name,
-        "description": entry.description,
-        "language": entry.language,
-        "buildable": entry.buildable,
-        "status": installed.as_ref().map_or("not_installed", |s| match s.status {
-            ClawStatus::NotInstalled => "not_installed",
-            ClawStatus::Installing => "installing",
-            ClawStatus::Ready => "ready",
-            ClawStatus::Uninstalling => "uninstalling",
-            ClawStatus::Failed => "failed",
-        }),
-        "installed_at": installed.as_ref().and_then(|s| s.installed_at.clone()),
-        "job_id": installed.as_ref().and_then(|s| s.job_id.clone()),
-        "error": installed.and_then(|s| s.error),
-    })))
+    Ok(Json(ClawDetailResponse {
+        name: entry.name.to_string(),
+        description: entry.description.to_string(),
+        language: entry.language.to_string(),
+        buildable: entry.buildable,
+        status: installed
+            .as_ref()
+            .map_or("not_installed", |state| claw_status_wire(state.status))
+            .to_string(),
+        installed_at: installed
+            .as_ref()
+            .and_then(|state| state.installed_at.clone()),
+        job_id: installed.as_ref().and_then(|state| state.job_id.clone()),
+        error: installed.and_then(|state| state.error),
+    }))
 }
 
 /// `POST /api/v1/claws/{name}/install`
@@ -132,7 +128,7 @@ pub async fn handle_get_claw(
 pub async fn handle_install_claw(
     State(state): State<SharedState>,
     Path(name): Path<String>,
-) -> Result<Json<Value>, ApiError> {
+) -> Result<Json<ClawJobResponse>, ApiError> {
     // 1. Must be in manifest
     let Some(entry) = core_rs::manifest::get(&name) else {
         return Err(ApiError::not_found(format!("unknown claw type: {name}")));
@@ -167,10 +163,10 @@ pub async fn handle_install_claw(
             // Idempotent: return existing job ID
             let existing_state = state.claw_store.get_state(&name);
             let job_id = existing_state.and_then(|s| s.job_id).unwrap_or_default();
-            return Ok(Json(json!({
-                "job_id": job_id,
-                "message": "install already in progress"
-            })));
+            return Ok(Json(ClawJobResponse {
+                job_id,
+                message: "install already in progress".to_string(),
+            }));
         }
         _ => {} // NotInstalled, Failed, Uninstalling — proceed
     }
@@ -196,10 +192,10 @@ pub async fn handle_install_claw(
 
     tracing::info!("[claw-store] install queued: claw={claw_name} job={job_id}");
 
-    Ok(Json(json!({
-        "job_id": job_id,
-        "message": format!("install queued for {claw_name}")
-    })))
+    Ok(Json(ClawJobResponse {
+        job_id,
+        message: format!("install queued for {claw_name}"),
+    }))
 }
 
 /// `POST /api/v1/claws/{name}/uninstall`
@@ -213,7 +209,7 @@ pub async fn handle_install_claw(
 pub async fn handle_uninstall_claw(
     State(state): State<SharedState>,
     Path(name): Path<String>,
-) -> Result<Json<Value>, ApiError> {
+) -> Result<Json<ClawJobResponse>, ApiError> {
     // 1. Must be in manifest
     if !core_rs::manifest::is_known(&name) {
         return Err(ApiError::not_found(format!("unknown claw type: {name}")));
@@ -263,8 +259,18 @@ pub async fn handle_uninstall_claw(
 
     tracing::info!("[claw-store] uninstall queued: claw={claw_name} job={job_id}");
 
-    Ok(Json(json!({
-        "job_id": job_id,
-        "message": format!("uninstall queued for {claw_name}")
-    })))
+    Ok(Json(ClawJobResponse {
+        job_id,
+        message: format!("uninstall queued for {claw_name}"),
+    }))
+}
+
+fn claw_status_wire(status: ClawStatus) -> &'static str {
+    match status {
+        ClawStatus::NotInstalled => "not_installed",
+        ClawStatus::Installing => "installing",
+        ClawStatus::Ready => "ready",
+        ClawStatus::Uninstalling => "uninstalling",
+        ClawStatus::Failed => "failed",
+    }
 }
