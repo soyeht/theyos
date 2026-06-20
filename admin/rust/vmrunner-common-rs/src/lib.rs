@@ -7,5 +7,7 @@
 pub mod network;
 pub mod warm_pool;
 
-pub use network::{HostPortRange, LINUX_SSH_HOST_PORT_RANGE, PUBLIC_APP_HOST_PORT_RANGE};
+pub use network::{
+    HostPortRange, LINUX_SSH_HOST_PORT_RANGE, PUBLIC_APP_HOST_PORT_RANGE, PortForward, PortProtocol,
+};
 pub use warm_pool::{WarmPoolSlotState, WarmPoolSlotStatus, WarmPoolStatus, WarmPoolStatusWire};
