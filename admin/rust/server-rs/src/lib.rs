@@ -15,6 +15,7 @@ pub mod bonjour_publisher;
 pub mod bonjour_trust;
 pub mod bootstrap_mutation_lock;
 pub mod capacity;
+pub mod claw_store_service;
 pub mod cloudflare_admin;
 pub mod cloudflare_api;
 pub mod cloudflared_sync;
