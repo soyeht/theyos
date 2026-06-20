@@ -93,7 +93,7 @@ fn run() -> Result<(), LaunchError> {
 
     // 2. Build the full environment the server needs.
     let admin_port = env_or("ADMIN_PORT", "8892");
-    let addr = env_opt("ADDR").unwrap_or_else(|| format!("0.0.0.0:{admin_port}"));
+    let addr = env_opt("ADDR").unwrap_or_else(|| format!("127.0.0.1:{admin_port}"));
     let frontend_origin = env_or("FRONTEND_ORIGIN", "http://localhost:5173");
     let admin_user = env_or("SOYEHT_ADMIN_USER", "admin");
     let admin_password = env_opt("SOYEHT_ADMIN_PASSWORD").unwrap_or_default();
@@ -859,7 +859,7 @@ execs the Rust admin server binary.
 Environment (read from .env or process env):
   SOYEHT_ADMIN_PASSWORD   required — admin panel password
   ADMIN_PORT              default: 8892
-  ADDR                    default: 0.0.0.0:<ADMIN_PORT>
+  ADDR                    default: 127.0.0.1:<ADMIN_PORT>
   FRONTEND_ORIGIN         default: http://localhost:5173
   CLAW_RUNTIME            default: firecracker
   CLAW_TYPES              default: picoclaw,zeroclaw,nanobot,openclaw,nullclaw,ironclaw
