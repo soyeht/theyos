@@ -3,6 +3,7 @@ mod orchestrator;
 mod shutdown;
 pub use core_rs::ipc::client::IpcClient;
 pub use shutdown::{GRACEFUL_SHUTDOWN_TIMEOUT, ShutdownResult, graceful_shutdown_all};
+pub use vmrunner_common_rs::VmCreatePhaseTiming as PhaseTiming;
 
 use core_rs::error::{AppError, ErrorCode};
 use core_rs::ipc::client::IpcError;
@@ -160,13 +161,6 @@ pub struct ExecuteFlowRequest {
     /// Disk size in GB (5-50). Default: 10.
     #[serde(default)]
     pub disk_gb: Option<u32>,
-}
-
-/// Phase timing information from VM creation.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PhaseTiming {
-    pub phase: String,
-    pub ms: u64,
 }
 
 /// Result returned by `Executor::execute_flow`.
