@@ -173,6 +173,57 @@ export type ClawTier = "catalog" | "detected" | "available" | "supported";
 
 export type ClawVerifyStatus = "pending" | "ok" | "failed";
 
+export type ClawUnavailableReasonCode = "catalog_only" | "detected_unverified" | "no_install_plan";
+
+export type ClawAvailabilityInstallStatus =
+  | "not_installed"
+  | "installing"
+  | "succeeded"
+  | "failed"
+  | "uninstalling";
+
+export type ClawAvailabilityInstallPhase = "downloading" | "verifying" | "finalizing";
+
+export type ClawAvailability = {
+  name: string;
+  install: {
+    status: ClawAvailabilityInstallStatus;
+    progress: {
+      phase: ClawAvailabilityInstallPhase;
+      percent: number;
+      bytes_downloaded: number;
+      bytes_total: number;
+      updated_at_ms: number;
+    } | null;
+    installed_at: string | null;
+    error: string | null;
+    job_id: string | null;
+  };
+  host: {
+    cold_path_ready: boolean;
+    has_golden: boolean;
+    has_base_rootfs: boolean;
+    maintenance_blocked: boolean;
+    maintenance_retry_after_secs: number | null;
+  };
+  overall:
+    | { state: "creatable" }
+    | { state: "installing"; percent: number }
+    | { state: "not_installed" }
+    | { state: "failed"; error: string }
+    | { state: "blocked" }
+    | { state: "unknown" };
+  reasons: Array<
+    | { type: "unknown_type" }
+    | { type: "not_installed" }
+    | { type: "install_in_progress"; percent: number }
+    | { type: "install_failed"; error: string }
+    | { type: "no_cold_path_available" }
+    | { type: "maintenance_mode"; retry_after_secs: number }
+  >;
+  degradations: Array<{ type: "base_rootfs_missing_but_golden_present" }>;
+};
+
 export type ClawCatalogEntry = {
   name: string;
   description: string;
@@ -195,6 +246,10 @@ export type ClawCatalogEntry = {
   reviewed_upstream_commit?: string;
   latest_upstream_commit?: string;
   install_plan_source?: string;
+  installable: boolean;
+  unavailable_reason_code?: ClawUnavailableReasonCode;
+  unavailable_reason?: string;
+  availability?: ClawAvailability;
 
   // ── Phase E: verify pipeline result ────────────────────────────────────
   verify_status?: ClawVerifyStatus;

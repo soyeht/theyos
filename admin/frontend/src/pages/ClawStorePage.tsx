@@ -58,14 +58,30 @@ function tierOf(claw: ClawCatalogEntry): ClawTier {
   return claw.tier ?? "supported";
 }
 
-/// Whether the install button should fire for this row. Matches the
-/// invariant encoded in `core_rs::manifest::Tier::can_user_install()`:
-/// only `supported` and `available` can be installed from the UI.
-/// `buildable` is not required — `available` claws use template-driven
-/// build-from-plan and have `buildable: false`, but they are installable.
 function canInstallFromUI(claw: ClawCatalogEntry): boolean {
-  const t = tierOf(claw);
-  return t === "supported" || t === "available";
+  return claw.installable;
+}
+
+function unavailableReason(claw: ClawCatalogEntry): string {
+  const backendReason = claw.unavailable_reason?.trim();
+  if (backendReason) {
+    return backendReason;
+  }
+
+  switch (claw.unavailable_reason_code) {
+    case "detected_unverified":
+      return "pending verification";
+    case "catalog_only":
+      return "listing only";
+    case "no_install_plan":
+      return "no install plan";
+    default: {
+      const tier = tierOf(claw);
+      if (tier === "detected") return "pending verification";
+      if (tier === "catalog") return "listing only";
+      return "not available yet";
+    }
+  }
 }
 
 function ClawCard({
@@ -82,7 +98,8 @@ function ClawCard({
   const isTransitional = claw.status === "installing" || claw.status === "uninstalling";
   const tier = tierOf(claw);
   const drift = hasDrift(claw);
-  const availableSlowWarning = tier === "available" && claw.status === "not_installed";
+  const isInstallable = canInstallFromUI(claw);
+  const availableSlowWarning = isInstallable && tier === "available" && claw.status === "not_installed";
 
   return (
     <div className="network-card">
@@ -179,7 +196,7 @@ function ClawCard({
       </div>
 
       <div style={{ marginTop: "auto", paddingTop: "8px" }}>
-        {(claw.status === "not_installed" || claw.status === "failed") && canInstallFromUI(claw) && (
+        {(claw.status === "not_installed" || claw.status === "failed") && isInstallable && (
           <button
             type="button"
             className="network-expose-btn"
@@ -205,9 +222,9 @@ function ClawCard({
             {claw.status === "installing" ? "installing..." : "uninstalling..."}
           </button>
         )}
-        {!canInstallFromUI(claw) && claw.status === "not_installed" && (
+        {!isInstallable && claw.status === "not_installed" && (
           <p className="network-detail muted">
-            {tier === "detected" ? "pending verification" : tier === "catalog" ? "listing only" : "not available yet"}
+            {unavailableReason(claw)}
           </p>
         )}
       </div>
