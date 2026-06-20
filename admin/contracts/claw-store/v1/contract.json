@@ -283,7 +283,29 @@
       "status": "ready",
       "tier": "supported",
       "install_plan_source": "builtin",
-      "installable": true
+      "installable": true,
+      "availability": {
+        "name": "picoclaw",
+        "install": {
+          "status": "succeeded",
+          "progress": null,
+          "installed_at": "2026-06-20T00:00:00Z",
+          "error": null,
+          "job_id": null
+        },
+        "host": {
+          "cold_path_ready": true,
+          "has_golden": false,
+          "has_base_rootfs": true,
+          "maintenance_blocked": false,
+          "maintenance_retry_after_secs": null
+        },
+        "overall": {
+          "state": "creatable"
+        },
+        "reasons": [],
+        "degradations": []
+      }
     },
     "list_envelope_ready": {
       "data": [
@@ -300,7 +322,29 @@
           "status": "ready",
           "tier": "supported",
           "install_plan_source": "builtin",
-          "installable": true
+          "installable": true,
+          "availability": {
+            "name": "picoclaw",
+            "install": {
+              "status": "succeeded",
+              "progress": null,
+              "installed_at": "2026-06-20T00:00:00Z",
+              "error": null,
+              "job_id": null
+            },
+            "host": {
+              "cold_path_ready": true,
+              "has_golden": false,
+              "has_base_rootfs": true,
+              "maintenance_blocked": false,
+              "maintenance_retry_after_secs": null
+            },
+            "overall": {
+              "state": "creatable"
+            },
+            "reasons": [],
+            "degradations": []
+          }
         }
       ],
       "has_more": false,
