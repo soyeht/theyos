@@ -7,12 +7,14 @@
 //!   2. the HTTP guest-image path (`server-rs::handlers_household_guest_image`),
 //!   3. the runner that consumes them (`vmrunner-macos-rs`).
 //!
-//! Hand-built maps drift silently: e.g. the provision/snapshot callers send
-//! `cpus`/`memory_mb` that the runner never reads, while the runner reads
-//! `ssh_pubkey`/`skip_provision_inject` that the callers never send. These structs
-//! make the full field set a single typed contract so every site agrees on one
-//! shape. Every field is `#[serde(default)]` so the wire stays backward-compatible
-//! and missing fields decode to their previous implicit defaults.
+//! Hand-built maps drift silently. These structs make the full field set a single
+//! typed contract so every site agrees on one shape. They closed two historical
+//! drifts on the provision/snapshot path: the runner now consumes `cpus`/`memory_mb`
+//! as an explicit override (previously declared but ignored — see
+//! `resolve_provision_resources` in `vmrunner-macos-rs`), and `ssh_pubkey`/
+//! `skip_provision_inject` are a single typed field rather than ad-hoc per-site keys.
+//! Every field is `#[serde(default)]` so the wire stays backward-compatible and
+//! missing fields decode to their previous implicit defaults.
 
 use serde::{Deserialize, Serialize};
 

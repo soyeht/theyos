@@ -86,7 +86,9 @@ fn shared_lifecycle_methods_handled_by_both_runners() {
     let mut missing = Vec::new();
     for method in SHARED_LIFECYCLE_METHODS {
         if !linux.contains(*method) {
-            missing.push(format!("vmrunner-rs (Linux) dispatch is missing `{method}`"));
+            missing.push(format!(
+                "vmrunner-rs (Linux) dispatch is missing `{method}`"
+            ));
         }
         if !macos.contains(*method) {
             missing.push(format!(

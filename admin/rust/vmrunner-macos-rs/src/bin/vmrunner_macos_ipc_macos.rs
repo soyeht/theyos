@@ -532,6 +532,26 @@ fn effective_macos_resources(
     )
 }
 
+/// Resolve the provision/snapshot boot sizing for `MacOsProvisionAndSnapshot`.
+///
+/// The wire field callers actually send is the shared `VmCreateResourceSpec`
+/// (`cpu_cores`/`ram_mb`), parsed here with the macOS defaults. The typed
+/// `MacOsProvisionAndSnapshotRequest` *also* declares optional `cpus`/`memory_mb`;
+/// they are honored as an explicit override when present so the typed contract is
+/// genuinely consumed end-to-end. No current caller sets `cpus`/`memory_mb`, so when
+/// they are `None` this returns exactly the parsed `VmCreateResourceSpec` values —
+/// i.e. behavior is unchanged and only the previously-dead typed fields become live.
+fn resolve_provision_resources(
+    req: &MacOsProvisionAndSnapshotRequest,
+    params: &Value,
+) -> (u32, u32) {
+    let (parsed_cpus, parsed_memory_mb, _disk_gb) = parse_resource_params(params, 4, 4096);
+    (
+        req.cpus.unwrap_or(parsed_cpus),
+        req.memory_mb.unwrap_or(parsed_memory_mb),
+    )
+}
+
 // ── Main ──────────────────────────────────────────────────────────────────────
 
 pub fn main_impl() {
@@ -1129,7 +1149,10 @@ fn handle_cleanup_fs(params: &Value) -> Response {
     let dir = instance_dir(&container);
     if dir.exists() {
         if let Err(e) = std::fs::remove_dir_all(&dir) {
-            return Response::err(format!("cleanup_fs failed to remove {}: {e}", dir.display()));
+            return Response::err(format!(
+                "cleanup_fs failed to remove {}: {e}",
+                dir.display()
+            ));
         }
     }
     Response::ok(serde_json::json!({ "container": container, "cleaned": true }))
@@ -1906,12 +1929,12 @@ fn handle_macos_provision_and_snapshot(params: &Value, ipc_state: &Arc<IpcState>
     use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
     use vmrunner_macos_rs::init_state::{InitPhase, read_state, write_state};
 
-    // Resource sizing stays on the shared VmCreateResourceSpec contract
-    // (cpu_cores/ram_mb). NOTE: MacOsProvisionAndSnapshotRequest also carries
-    // cpus/memory_mb that the callers send but this path does not consume — see
-    // the field docs on that struct.
-    let (cpus, memory_mb, _disk_gb) = parse_resource_params(params, 4, 4096);
+    // Resource sizing: VmCreateResourceSpec (cpu_cores/ram_mb) is what callers send;
+    // the typed request's optional cpus/memory_mb override it when present. See
+    // `resolve_provision_resources` — behavior-preserving today (callers omit the
+    // override), but the typed fields are now genuinely consumed.
     let req = MacOsProvisionAndSnapshotRequest::from_params(params);
+    let (cpus, memory_mb) = resolve_provision_resources(&req, params);
     let ssh_pubkey = req.ssh_pubkey;
     let plist_dir_str = req
         .plist_dir
@@ -2885,6 +2908,7 @@ mod resource_param_tests {
     use serde_json::json;
     use vmrunner_common_rs::{
         DEFAULT_CREATE_CPU_CORES, DEFAULT_CREATE_DISK_GB, DEFAULT_CREATE_RAM_MB,
+        MacOsProvisionAndSnapshotRequest,
     };
 
     #[test]
@@ -2936,6 +2960,52 @@ mod resource_param_tests {
                 DEFAULT_CREATE_RAM_MB,
                 u64::from(DEFAULT_CREATE_DISK_GB)
             )
+        );
+    }
+
+    // ── MacOsProvisionAndSnapshot resource resolution (typed-contract closure) ────
+    //
+    // `resolve_provision_resources` honors the typed request's optional cpus/memory_mb
+    // as an override while preserving the prior VmCreateResourceSpec parse. These pin
+    // the behavior-preserving semantics so the closure can never silently regress into
+    // discarding caller-sent sizing.
+
+    #[test]
+    fn resolve_provision_resources_falls_back_to_macos_defaults_when_unset() {
+        // No VmCreateResourceSpec and no typed override → the macOS provision defaults
+        // (4 vCPU / 4096 MB) this path has always used.
+        let req = MacOsProvisionAndSnapshotRequest::default();
+        assert_eq!(
+            super::resolve_provision_resources(&req, &json!({})),
+            (4, 4096)
+        );
+    }
+
+    #[test]
+    fn resolve_provision_resources_honors_vmcreate_spec_when_override_absent() {
+        // Anti-regression: callers send cpu_cores/ram_mb (VmCreateResourceSpec), not the
+        // typed cpus/memory_mb. Those caller values must still win when the typed override
+        // is omitted — naively replacing the parse with the typed fields would have
+        // silently discarded caller-sent sizing.
+        let req = MacOsProvisionAndSnapshotRequest::default();
+        assert_eq!(
+            super::resolve_provision_resources(&req, &json!({ "cpu_cores": 6, "ram_mb": 8192 })),
+            (6, 8192)
+        );
+    }
+
+    #[test]
+    fn resolve_provision_resources_typed_override_wins() {
+        // When present, the typed cpus/memory_mb override the VmCreateResourceSpec — the
+        // previously-dead contract field is now genuinely consumed end-to-end.
+        let req = MacOsProvisionAndSnapshotRequest {
+            cpus: Some(8),
+            memory_mb: Some(16_384),
+            ..MacOsProvisionAndSnapshotRequest::default()
+        };
+        assert_eq!(
+            super::resolve_provision_resources(&req, &json!({ "cpu_cores": 6, "ram_mb": 8192 })),
+            (8, 16_384)
         );
     }
 }
@@ -3098,5 +3168,112 @@ mod cleanup_step_tests {
         assert!(resp.ok, "error: {:?}", resp.error);
         assert_eq!(resp.result.expect("result")["cleaned"], json!(true));
         assert!(!dir.exists(), "CleanupFs must remove the instance dir");
+    }
+}
+
+/// Error-path / idempotency coverage for the macOS guest-image provision step.
+///
+/// These exercise `handle_macos_provision_and_snapshot` against a fully sandboxed
+/// assets dir (no real `~/Library`, no VM boot). The provision handler is the one
+/// guest-image method that does NOT gate on `check_init_disk_space` (100 GB free),
+/// so it is deterministic in CI; `MacOsPrepare`/`MacOsBaseInstall` are intentionally
+/// not driven here because their disk-space gate is environment-dependent.
+///
+/// Env is process-global, so a module-local lock serializes these tests. This bin's
+/// test binary has no other env-mutating tests (the cleanup tests above key off
+/// `$HOME`, not `THEYOS_VM_*`), so the lock is sufficient. The handler response is
+/// captured *before* env is torn down, so an assertion panic cannot leak env state.
+#[cfg(test)]
+mod provision_error_path_tests {
+    use super::{IpcState, handle_macos_provision_and_snapshot};
+    use serde_json::json;
+    use std::sync::{Arc, Mutex};
+    use tempfile::TempDir;
+    use vmrunner_macos_rs::init_state::{InitPhase, InitState, write_state};
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    /// Run `f` with `THEYOS_VM_*` pointed at a throwaway tempdir and a 0-size warm
+    /// pool. Returns whatever `f` produced; env is removed before returning so a
+    /// later assertion panic in the caller cannot leave the process env mutated.
+    fn with_sandboxed_assets<R>(f: impl FnOnce(&std::path::Path) -> R) -> R {
+        let guard = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let dir = TempDir::new().expect("tempdir");
+        let path = dir.path().to_path_buf();
+        // SAFETY: edition-2024 set_var is unsafe; serialized by ENV_LOCK and only
+        // these THEYOS_VM_* keys (untouched by other tests in this binary) are set.
+        unsafe {
+            std::env::set_var("THEYOS_VM_ASSETS_DIR", &path);
+            std::env::set_var("THEYOS_VM_STATE_DIR", &path);
+            std::env::set_var("THEYOS_SNAPSHOTS_DIR", path.join("snapshots"));
+            std::env::set_var("THEYOS_MACOS_WARM_POOL_SIZE", "0");
+        }
+        let out = f(&path);
+        unsafe {
+            std::env::remove_var("THEYOS_VM_ASSETS_DIR");
+            std::env::remove_var("THEYOS_VM_STATE_DIR");
+            std::env::remove_var("THEYOS_SNAPSHOTS_DIR");
+            std::env::remove_var("THEYOS_MACOS_WARM_POOL_SIZE");
+        }
+        drop(dir);
+        drop(guard);
+        out
+    }
+
+    #[test]
+    fn provision_errors_when_hardware_model_data_missing() {
+        // State is at CreateSnapshot but the install never recorded the hardware model
+        // (a corrupt/interrupted base-install). The snapshot step must fail loudly with
+        // a clear operator error rather than panic or attempt a boot with no model.
+        let resp = with_sandboxed_assets(|_p| {
+            let base = vmrunner_macos_rs::macos_guest::base_dir().expect("base_dir");
+            let state = InitState {
+                phase: Some(InitPhase::CreateSnapshot),
+                hardware_model_data: None,
+                ..InitState::default()
+            };
+            write_state(&base, &state).expect("write init state");
+            let ipc = Arc::new(IpcState::new().expect("ipc state"));
+            handle_macos_provision_and_snapshot(&json!({}), &ipc)
+        });
+        assert!(!resp.ok, "expected an error response, got {resp:?}");
+        assert!(
+            resp.error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("hardware_model_data missing"),
+            "expected a hardware_model_data error, got {:?}",
+            resp.error
+        );
+    }
+
+    #[test]
+    fn provision_is_idempotent_noop_when_skipping_inject_at_provision_phase() {
+        // At the Provision phase with skip_provision_inject=true, neither the inject nor
+        // the snapshot block runs: the handler is a safe no-op that reports complete and
+        // leaves state untouched. Calling it twice yields the identical result (no VM is
+        // ever booted on this path).
+        let params = json!({ "skip_provision_inject": true });
+        let (resp1, resp2) = with_sandboxed_assets(|_p| {
+            let base = vmrunner_macos_rs::macos_guest::base_dir().expect("base_dir");
+            let state = InitState {
+                phase: Some(InitPhase::Provision),
+                ..InitState::default()
+            };
+            write_state(&base, &state).expect("write init state");
+            let ipc = Arc::new(IpcState::new().expect("ipc state"));
+            let r1 = handle_macos_provision_and_snapshot(&params, &ipc);
+            let r2 = handle_macos_provision_and_snapshot(&params, &ipc);
+            (r1, r2)
+        });
+        for resp in [&resp1, &resp2] {
+            assert!(resp.ok, "expected ok, got {resp:?}");
+            assert_eq!(
+                resp.result.as_ref().expect("result")["status"],
+                json!("complete")
+            );
+        }
     }
 }
