@@ -534,13 +534,18 @@ fn effective_macos_resources(
 
 /// Resolve the provision/snapshot boot sizing for `MacOsProvisionAndSnapshot`.
 ///
-/// The wire field callers actually send is the shared `VmCreateResourceSpec`
-/// (`cpu_cores`/`ram_mb`), parsed here with the macOS defaults. The typed
-/// `MacOsProvisionAndSnapshotRequest` *also* declares optional `cpus`/`memory_mb`;
-/// they are honored as an explicit override when present so the typed contract is
-/// genuinely consumed end-to-end. No current caller sets `cpus`/`memory_mb`, so when
-/// they are `None` this returns exactly the parsed `VmCreateResourceSpec` values —
-/// i.e. behavior is unchanged and only the previously-dead typed fields become live.
+/// Callers serialize `MacOsProvisionAndSnapshotRequest`, whose sizing fields are
+/// `cpus`/`memory_mb`. The pre-existing `parse_resource_params` decoded the *create*
+/// contract's `cpu_cores`/`ram_mb` instead — fields these params never carry — so it
+/// always fell back to the macOS defaults (4/4096) and the caller's `cpus`/`memory_mb`
+/// were silently dropped (the drift the typed contract exposed). This honors the typed
+/// `cpus`/`memory_mb` when present, falling back to the `VmCreateResourceSpec` parse
+/// otherwise.
+///
+/// Behavior delta: the HTTP guest-image path sends `Some(4)`/`Some(4096)` (== the old
+/// effective defaults) so it is unchanged, and `init-macos-guest` defaults its
+/// `--cpus`/`--memory-mb` to 4/4096 so default runs are unchanged — but an explicit
+/// non-default `--cpus`/`--memory-mb`, previously a dead flag, is now honored.
 fn resolve_provision_resources(
     req: &MacOsProvisionAndSnapshotRequest,
     params: &Value,
@@ -1929,10 +1934,10 @@ fn handle_macos_provision_and_snapshot(params: &Value, ipc_state: &Arc<IpcState>
     use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
     use vmrunner_macos_rs::init_state::{InitPhase, read_state, write_state};
 
-    // Resource sizing: VmCreateResourceSpec (cpu_cores/ram_mb) is what callers send;
-    // the typed request's optional cpus/memory_mb override it when present. See
-    // `resolve_provision_resources` — behavior-preserving today (callers omit the
-    // override), but the typed fields are now genuinely consumed.
+    // Resource sizing: honor the typed request's cpus/memory_mb (what callers actually
+    // serialize), falling back to the VmCreateResourceSpec parse. See
+    // `resolve_provision_resources` for the exact delta — default/HTTP paths unchanged;
+    // the previously-ignored `init-macos-guest --cpus/--memory-mb` is now honored.
     let req = MacOsProvisionAndSnapshotRequest::from_params(params);
     let (cpus, memory_mb) = resolve_provision_resources(&req, params);
     let ssh_pubkey = req.ssh_pubkey;
