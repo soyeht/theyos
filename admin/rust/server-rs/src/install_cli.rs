@@ -253,10 +253,7 @@ async fn emit_fresh_pair_device_window(
     // (observed cross-platform with `mdns-sd` 0.10/0.13 → macOS/iOS
     // NWBrowser) can connect directly. Bonjour discovery remains the gold
     // path when it works; the `host` field is consulted as a fallback only.
-    let port: u16 = std::env::var("THEYOS_HOUSEHOLD_PORT")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(8091);
+    let port: u16 = crate::household_bootstrap::household_port_from_env();
     let host_fallback =
         crate::tailnet_address::current_tailnet_ipv4().map(|ip| format!("{ip}:{port}"));
     let uri = token.to_uri_with_host_and_name(hh_pub, host_fallback.as_deref(), household_name);
@@ -324,10 +321,7 @@ async fn run_pair_machine(
     }
 
     // Resolve a reachable address for the requested transport.
-    let port: u16 = std::env::var("THEYOS_HOUSEHOLD_PORT")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(8091);
+    let port: u16 = crate::household_bootstrap::household_port_from_env();
     let Some(addr) = pick_addr_for_transport(transport, port) else {
         eprintln!(
             "error: no {} interface address available; \

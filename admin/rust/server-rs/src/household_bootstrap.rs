@@ -112,12 +112,20 @@ fn home_dir() -> Option<PathBuf> {
         .map(PathBuf::from)
 }
 
+/// Default port the household / bootstrap engine listens on when
+/// `THEYOS_HOUSEHOLD_PORT` is unset. This is the single source for the
+/// iOS-facing engine port: it is documented in `PORTS.md` and pinned by the
+/// `ports_registry` test (and, on the client side, by the iOS
+/// `SoyehtInstallProfile` port test). Do not hardcode `8091` elsewhere — call
+/// [`household_port_from_env`] or reference this constant.
+pub const DEFAULT_HOUSEHOLD_PORT: u16 = 8091;
+
 #[must_use]
 pub fn household_port_from_env() -> u16 {
     std::env::var("THEYOS_HOUSEHOLD_PORT")
         .ok()
         .and_then(|v| v.parse().ok())
-        .unwrap_or(8091)
+        .unwrap_or(DEFAULT_HOUSEHOLD_PORT)
 }
 
 /// Bring up the household identity listener at server startup.

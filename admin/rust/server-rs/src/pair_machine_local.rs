@@ -171,10 +171,7 @@ pub async fn stage(
     transport: JoinTransport,
     key_policy: KeyBackingPolicy,
 ) -> Result<StageOutcome, StageError> {
-    let port: u16 = std::env::var("THEYOS_HOUSEHOLD_PORT")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(8091);
+    let port: u16 = crate::household_bootstrap::household_port_from_env();
 
     let addr = pick_addr_for_transport(transport, port).ok_or(StageError::NoTransportAddress {
         transport: match transport {
