@@ -116,7 +116,7 @@ impl PortProtocol {
     }
 }
 
-/// Validate port is in the dynamic range (18790-19999).
+/// Validate port is in the configured dynamic host app range.
 ///
 /// # Errors
 ///
@@ -175,12 +175,12 @@ mod tests {
 
     #[test]
     fn test_validate_port_range() {
-        assert!(validate_port_range(18790).is_ok());
+        assert!(validate_port_range(core_rs::guest_net::HOST_APP_PORT_RANGE_START).is_ok());
         assert!(validate_port_range(19000).is_ok());
-        assert!(validate_port_range(19999).is_ok());
+        assert!(validate_port_range(core_rs::guest_net::HOST_APP_PORT_RANGE_END).is_ok());
 
-        assert!(validate_port_range(18789).is_err());
-        assert!(validate_port_range(20000).is_err());
+        assert!(validate_port_range(core_rs::guest_net::HOST_APP_PORT_RANGE_START - 1).is_err());
+        assert!(validate_port_range(core_rs::guest_net::HOST_APP_PORT_RANGE_END + 1).is_err());
         assert!(validate_port_range(80).is_err());
     }
 

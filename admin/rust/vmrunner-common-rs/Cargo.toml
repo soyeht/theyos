@@ -6,6 +6,7 @@ rust-version.workspace = true
 description = "Common vmrunner warm-pool contract types shared across runners"
 
 [dependencies]
+core-rs = { workspace = true }
 serde = { workspace = true }
 
 [dev-dependencies]

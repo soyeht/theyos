@@ -679,7 +679,7 @@ fn resolve_kernel_image(assets_dir: &Path) -> PathBuf {
             return p.clone();
         }
     }
-    assets_dir.join("vmlinux-6.1.155")
+    assets_dir.join(core_rs::guest_net::KERNEL_FILENAME)
 }
 
 fn resolve_slirp4netns() -> PathBuf {
