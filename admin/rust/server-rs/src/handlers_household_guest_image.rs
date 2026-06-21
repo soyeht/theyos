@@ -450,7 +450,6 @@ mod macos {
 
     use super::{InFlightGuard, LaunchOutcome};
     use core_rs::ipc::client::IpcClient;
-    use serde_json::json;
     use std::path::PathBuf;
 
     #[derive(Debug, Clone)]
