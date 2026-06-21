@@ -128,6 +128,42 @@ pub fn household_port_from_env() -> u16 {
         .unwrap_or(DEFAULT_HOUSEHOLD_PORT)
 }
 
+/// Default pairing-window TTL (seconds) when the override env var is unset, not a
+/// number, or out of [`PAIR_WINDOW_TTL_MIN_SECS`]..=[`PAIR_WINDOW_TTL_MAX_SECS`].
+/// Short enough (5 min) that a leaked pair QR/URI does not sit valid for hours.
+pub const DEFAULT_PAIR_WINDOW_TTL_SECS: u64 = 5 * 60;
+/// Lower bound for an operator pairing-window TTL override (seconds).
+pub const PAIR_WINDOW_TTL_MIN_SECS: u64 = 60;
+/// Upper bound for an operator pairing-window TTL override (seconds). The clamp
+/// keeps an accidental absurd value from weakening prod beyond the documented
+/// threat surface.
+pub const PAIR_WINDOW_TTL_MAX_SECS: u64 = 3600;
+
+/// Clamp a parsed pairing-window TTL: an in-range value passes through; `None` or
+/// an out-of-range value falls back to [`DEFAULT_PAIR_WINDOW_TTL_SECS`]. Split out
+/// from the env read so the parse/clamp/default policy is unit-testable without
+/// mutating process env.
+#[must_use]
+fn clamp_pair_window_ttl_secs(parsed: Option<u64>) -> u64 {
+    parsed
+        .filter(|secs| (PAIR_WINDOW_TTL_MIN_SECS..=PAIR_WINDOW_TTL_MAX_SECS).contains(secs))
+        .unwrap_or(DEFAULT_PAIR_WINDOW_TTL_SECS)
+}
+
+/// Read a pairing-window TTL (seconds) from `env_var`, clamped to
+/// [`PAIR_WINDOW_TTL_MIN_SECS`]..=[`PAIR_WINDOW_TTL_MAX_SECS`] and defaulting to
+/// [`DEFAULT_PAIR_WINDOW_TTL_SECS`]. Single owner for the
+/// `THEYOS_PAIR_DEVICE_TTL_SECS` / `THEYOS_PAIR_MACHINE_TTL_SECS` reads — do not
+/// re-implement the parse/clamp/default at call sites.
+#[must_use]
+pub fn pair_window_ttl_secs_from_env(env_var: &str) -> u64 {
+    clamp_pair_window_ttl_secs(
+        std::env::var(env_var)
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok()),
+    )
+}
+
 /// Bring up the household identity listener at server startup.
 ///
 /// On a fresh, uninitialized state directory, `/identity` returns 503 until
@@ -1054,6 +1090,68 @@ mod tests {
     use super::*;
     use household_rs::keys::{IdentityKey, P256Keypair};
     use household_rs::person_cert::SignOwnerOptions;
+
+    #[test]
+    fn clamp_pair_window_ttl_secs_passes_through_in_range() {
+        assert_eq!(clamp_pair_window_ttl_secs(Some(900)), 900);
+        assert_eq!(
+            clamp_pair_window_ttl_secs(Some(PAIR_WINDOW_TTL_MIN_SECS)),
+            PAIR_WINDOW_TTL_MIN_SECS
+        );
+        assert_eq!(
+            clamp_pair_window_ttl_secs(Some(PAIR_WINDOW_TTL_MAX_SECS)),
+            PAIR_WINDOW_TTL_MAX_SECS
+        );
+    }
+
+    #[test]
+    fn clamp_pair_window_ttl_secs_defaults_when_absent_or_out_of_range() {
+        assert_eq!(
+            clamp_pair_window_ttl_secs(None),
+            DEFAULT_PAIR_WINDOW_TTL_SECS
+        );
+        assert_eq!(
+            clamp_pair_window_ttl_secs(Some(PAIR_WINDOW_TTL_MIN_SECS - 1)),
+            DEFAULT_PAIR_WINDOW_TTL_SECS
+        );
+        assert_eq!(
+            clamp_pair_window_ttl_secs(Some(PAIR_WINDOW_TTL_MAX_SECS + 1)),
+            DEFAULT_PAIR_WINDOW_TTL_SECS
+        );
+        // The historical default the migrated sites used.
+        assert_eq!(DEFAULT_PAIR_WINDOW_TTL_SECS, 300);
+    }
+
+    /// SSOT guard for the pairing-window TTL clamp. Both the anti-literal check
+    /// (no site re-inlines the `60..=3600` clamp) and the positive-consumption
+    /// check (each site actually calls the owner) are required: a site that drops
+    /// the literal but also stops resolving the TTL would pass the former alone.
+    #[test]
+    fn pair_window_ttl_clamp_has_a_single_owner() {
+        let sites = [
+            (
+                "server-rs/src/install_cli.rs",
+                include_str!("install_cli.rs"),
+            ),
+            (
+                "server-rs/src/pair_machine_local.rs",
+                include_str!("pair_machine_local.rs"),
+            ),
+        ];
+        for (path, source) in sites {
+            assert!(
+                !source.contains("60..=3600"),
+                "{path} re-inlined the pairing-window TTL clamp `60..=3600`; \
+                 call household_bootstrap::pair_window_ttl_secs_from_env instead"
+            );
+            assert!(
+                source.contains("pair_window_ttl_secs_from_env"),
+                "{path} no longer consumes the pairing-window TTL owner \
+                 (household_bootstrap::pair_window_ttl_secs_from_env); a site that \
+                 stops calling the owner can silently drift from its clamp/default"
+            );
+        }
+    }
 
     #[tokio::test]
     async fn snapshot_watcher_installs_reissued_token_without_restart() {

@@ -196,11 +196,8 @@ pub async fn stage(
         .map_err(|_| StageError::ClockBeforeEpoch)?
         .as_secs();
 
-    let ttl_secs = std::env::var("THEYOS_PAIR_MACHINE_TTL_SECS")
-        .ok()
-        .and_then(|s| s.parse::<u64>().ok())
-        .filter(|secs| (60..=3600).contains(secs))
-        .unwrap_or(300);
+    let ttl_secs =
+        crate::household_bootstrap::pair_window_ttl_secs_from_env("THEYOS_PAIR_MACHINE_TTL_SECS");
 
     let opts = PrepareCandidateOpts {
         state_dir: state_dir.to_path_buf(),

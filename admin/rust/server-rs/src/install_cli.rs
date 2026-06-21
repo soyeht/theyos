@@ -225,19 +225,15 @@ async fn emit_fresh_pair_device_window(
     hh_pub: &P256PublicKey,
     household_name: Option<&str>,
 ) -> i32 {
-    // Pair-device QR window TTL. Production default is 5 minutes — short
-    // enough that a leaked QR doesn't sit valid in chat logs / screenshots
-    // for hours. Operators running validation pass overrides via env var
-    // (range 60..=3600 sec) to handle manual / appium-driven walks
-    // through Welcome carousel + permission alerts + Face ID, which
-    // routinely exceed the 5-minute window during e2e sessions. The clamp
-    // bounds keep accidental absurd values from weakening prod beyond the
-    // documented threat surface.
-    let ttl_secs: u64 = std::env::var("THEYOS_PAIR_DEVICE_TTL_SECS")
-        .ok()
-        .and_then(|s| s.parse::<u64>().ok())
-        .filter(|secs| (60..=3600).contains(secs))
-        .unwrap_or(5 * 60);
+    // Pair-device QR window TTL. Production default is 5 minutes — short enough
+    // that a leaked QR doesn't sit valid in chat logs / screenshots for hours.
+    // Operators running validation pass an override via THEYOS_PAIR_DEVICE_TTL_SECS
+    // to handle manual / appium-driven walks (Welcome carousel + permission alerts +
+    // Face ID) that routinely exceed the 5-minute window during e2e sessions. The
+    // parse/clamp/default policy lives in one owner — see
+    // household_bootstrap::pair_window_ttl_secs_from_env.
+    let ttl_secs: u64 =
+        crate::household_bootstrap::pair_window_ttl_secs_from_env("THEYOS_PAIR_DEVICE_TTL_SECS");
     let ttl = Duration::from_secs(ttl_secs);
 
     let window = PairDeviceWindow::with_persistence(state_dir.to_path_buf());
@@ -376,19 +372,14 @@ async fn run_pair_machine(
         hostname,
         platform,
         policy,
-        // Pair-machine ceremony TTL. Same rationale as
-        // `THEYOS_PAIR_DEVICE_TTL_SECS` above: prod default 5 min,
-        // operator-override env var for e2e validation walks that
-        // exceed the production budget (Mac engine listener + iPhone
-        // owner Face ID approval can collectively burn >5 min during
-        // manual / appium-driven sessions). Same clamp 60..=3600.
-        ttl: Duration::from_secs(
-            std::env::var("THEYOS_PAIR_MACHINE_TTL_SECS")
-                .ok()
-                .and_then(|s| s.parse::<u64>().ok())
-                .filter(|secs| (60..=3600).contains(secs))
-                .unwrap_or(300),
-        ),
+        // Pair-machine ceremony TTL. Same owner/rationale as
+        // `THEYOS_PAIR_DEVICE_TTL_SECS` above: prod default 5 min, operator-override
+        // env var for e2e validation walks that exceed the production budget (Mac
+        // engine listener + iPhone owner Face ID approval can collectively burn
+        // >5 min during manual / appium-driven sessions).
+        ttl: Duration::from_secs(crate::household_bootstrap::pair_window_ttl_secs_from_env(
+            "THEYOS_PAIR_MACHINE_TTL_SECS",
+        )),
         now_unix,
     };
 
