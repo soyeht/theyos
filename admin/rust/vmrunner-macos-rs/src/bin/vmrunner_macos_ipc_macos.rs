@@ -4,7 +4,10 @@ use serde_json::Value;
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use vmrunner_common_rs::{DEFAULT_CREATE_CPU_CORES, DEFAULT_CREATE_RAM_MB, VmCreateResourceSpec};
+use vmrunner_common_rs::{
+    DEFAULT_CREATE_CPU_CORES, DEFAULT_CREATE_RAM_MB, MacOsBaseInstallRequest, MacOsPrepareRequest,
+    MacOsProvisionAndSnapshotRequest, VmCreateResourceSpec,
+};
 use vmrunner_macos_rs::{
     AdmissionError, ManagedMacOSVm, VZMacOSVmConfigurationBuilder, VZVirtualMachine,
     VZVirtualMachineConfigurationBuilder, VmAdmission, VmKind, VmLease, VmState, build_cidata_iso,
@@ -628,6 +631,12 @@ fn dispatch(method: &str, params: &Value, state: &Arc<IpcState>) -> Response {
         "WarmPoolDrain" => handle_warm_pool_drain(state.as_ref()),
         "TakeBaseSnapshot" => handle_take_base_snapshot(params, state),
         "FetchLogs" => handle_fetch_logs(params),
+        // Delete-flow cleanup steps. The shared orchestrator emits cleanup_systemd
+        // and cleanup_fs unconditionally for every host; on macOS these must
+        // succeed so the executor releases the storage lease (a missing CleanupFs
+        // leaves the disk lease allocated forever — a silent storage-lease leak).
+        "CleanupSystemd" => handle_cleanup_systemd(params),
+        "CleanupFs" => handle_cleanup_fs(params),
         // macOS guest init methods (T015, T016)
         "MacOsBaseInstall" => handle_macos_base_install(params, state),
         "MacOsPrepare" => handle_macos_prepare(params, state),
@@ -1093,6 +1102,39 @@ fn handle_delete(params: &Value, state: &Arc<IpcState>) -> Response {
     Response::ok(serde_json::json!({ "container": container, "deleted": true }))
 }
 
+/// macOS hosts do not run systemd; the shared delete orchestrator still emits a
+/// `cleanup_systemd` step for every host. Accept it as a validated no-op so the
+/// macOS method surface stays in parity with the Linux runner and the executor
+/// does not see a spurious `unknown method` on every delete.
+fn handle_cleanup_systemd(params: &Value) -> Response {
+    let container = params["container"].as_str().unwrap_or("");
+    if container.is_empty() {
+        return Response::err("container is required");
+    }
+    Response::ok(serde_json::json!({ "container": container, "cleaned": true, "noop": true }))
+}
+
+/// Remove a macOS guest's per-instance filesystem state, keyed on the instance
+/// `container` id (the same key `Delete` uses). Idempotent: returns success when
+/// the directory is already gone — `Delete` removes it first — so the executor's
+/// storage-lease release runs on macOS hosts. Without this, `CleanupFs` returned
+/// `unknown method`, the lease release was skipped, and the disk lease leaked on
+/// every macOS instance delete.
+fn handle_cleanup_fs(params: &Value) -> Response {
+    let container = match params["container"].as_str() {
+        Some(v) if !v.is_empty() => v.to_string(),
+        _ => return Response::err("container is required"),
+    };
+
+    let dir = instance_dir(&container);
+    if dir.exists() {
+        if let Err(e) = std::fs::remove_dir_all(&dir) {
+            return Response::err(format!("cleanup_fs failed to remove {}: {e}", dir.display()));
+        }
+    }
+    Response::ok(serde_json::json!({ "container": container, "cleaned": true }))
+}
+
 // ── handle_restart ────────────────────────────────────────────────────────────
 
 fn handle_restart(params: &Value, state: &Arc<IpcState>) -> Response {
@@ -1516,16 +1558,17 @@ fn handle_macos_base_install(params: &Value, state_ipc: &Arc<IpcState>) -> Respo
     use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
     use vmrunner_macos_rs::init_state::{InitPhase, is_complete, read_state, write_state};
 
-    // Optional params
-    let force = params["force"].as_bool().unwrap_or(false);
-    let force_provision = params["force_provision"].as_bool().unwrap_or(false);
+    // Optional params, typed via the shared MacOsBaseInstall contract.
+    let req = MacOsBaseInstallRequest::from_params(params);
+    let force = req.force;
+    let force_provision = req.force_provision;
+    // Resource sizing stays on the shared VmCreateResourceSpec contract.
     let (cpus, memory_mb, _disk_gb) = parse_resource_params(params, 4, 4096);
-    let registry_url = params["registry_url"].as_str().unwrap_or("").to_string();
-    let ssh_pubkey = params["ssh_pubkey"].as_str().unwrap_or("").to_string();
-    let plist_dir_str = params["plist_dir"]
-        .as_str()
-        .unwrap_or("scripts/launchd")
-        .to_string();
+    let registry_url = req.registry_url;
+    let ssh_pubkey = req.ssh_pubkey;
+    let plist_dir_str = req
+        .plist_dir
+        .unwrap_or_else(|| "scripts/launchd".to_string());
 
     let base_dir = match macos_guest::base_dir() {
         Ok(d) => d,
@@ -1695,9 +1738,10 @@ fn handle_macos_base_install(params: &Value, state_ipc: &Arc<IpcState>) -> Respo
 fn handle_macos_prepare(params: &Value, state_ipc: &Arc<IpcState>) -> Response {
     use vmrunner_macos_rs::init_state::{InitPhase, is_complete, read_state, write_state};
 
-    let force = params["force"].as_bool().unwrap_or(false);
-    let force_provision = params["force_provision"].as_bool().unwrap_or(false);
-    let registry_url = params["registry_url"].as_str().unwrap_or("").to_string();
+    let req = MacOsPrepareRequest::from_params(params);
+    let force = req.force;
+    let force_provision = req.force_provision;
+    let registry_url = req.registry_url;
 
     let base_dir = match macos_guest::base_dir() {
         Ok(d) => d,
@@ -1862,14 +1906,18 @@ fn handle_macos_provision_and_snapshot(params: &Value, ipc_state: &Arc<IpcState>
     use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
     use vmrunner_macos_rs::init_state::{InitPhase, read_state, write_state};
 
+    // Resource sizing stays on the shared VmCreateResourceSpec contract
+    // (cpu_cores/ram_mb). NOTE: MacOsProvisionAndSnapshotRequest also carries
+    // cpus/memory_mb that the callers send but this path does not consume — see
+    // the field docs on that struct.
     let (cpus, memory_mb, _disk_gb) = parse_resource_params(params, 4, 4096);
-    let ssh_pubkey = params["ssh_pubkey"].as_str().unwrap_or("").to_string();
-    let plist_dir_str = params["plist_dir"]
-        .as_str()
-        .unwrap_or("scripts/launchd")
-        .to_string();
-    let skip_provision_inject = params["skip_provision_inject"].as_bool().unwrap_or(false);
-    let force_provision = params["force_provision"].as_bool().unwrap_or(false);
+    let req = MacOsProvisionAndSnapshotRequest::from_params(params);
+    let ssh_pubkey = req.ssh_pubkey;
+    let plist_dir_str = req
+        .plist_dir
+        .unwrap_or_else(|| "scripts/launchd".to_string());
+    let skip_provision_inject = req.skip_provision_inject;
+    let force_provision = req.force_provision;
 
     let base_dir = match macos_guest::base_dir() {
         Ok(d) => d,
@@ -2990,5 +3038,65 @@ mod admission_wiring_tests {
     // Bridge to the parent module's private fn.
     fn is_super_is_limit(e: &VZError) -> bool {
         super::is_macos_vm_limit_error(e)
+    }
+}
+
+#[cfg(test)]
+mod cleanup_step_tests {
+    use super::{handle_cleanup_fs, handle_cleanup_systemd, instance_dir};
+    use serde_json::json;
+
+    #[test]
+    fn cleanup_systemd_requires_container() {
+        let resp = handle_cleanup_systemd(&json!({}));
+        assert!(!resp.ok);
+        assert!(
+            resp.error.as_deref().unwrap_or("").contains("container"),
+            "expected a container-required error, got {:?}",
+            resp.error
+        );
+    }
+
+    #[test]
+    fn cleanup_systemd_is_validated_noop_success() {
+        // macOS has no systemd; the step must still succeed so the executor does
+        // not log a spurious failure (or, worse, treat it as fatal) on delete.
+        let resp = handle_cleanup_systemd(&json!({ "container": "picoclaw-demo" }));
+        assert!(resp.ok, "error: {:?}", resp.error);
+        let result = resp.result.expect("ok response carries a result");
+        assert_eq!(result["cleaned"], json!(true));
+    }
+
+    #[test]
+    fn cleanup_fs_requires_container() {
+        let resp = handle_cleanup_fs(&json!({}));
+        assert!(!resp.ok);
+        assert!(resp.error.as_deref().unwrap_or("").contains("container"));
+    }
+
+    #[test]
+    fn cleanup_fs_is_idempotent_when_dir_absent() {
+        // The Delete step removes the instance dir first; CleanupFs must still
+        // report success on an already-clean instance so the executor releases the
+        // storage lease. (The bug this fixes: an error here leaked the disk lease.)
+        let resp = handle_cleanup_fs(&json!({
+            "container": "parity-cleanup-absent-7f3a9c00-does-not-exist"
+        }));
+        assert!(resp.ok, "error: {:?}", resp.error);
+        assert_eq!(resp.result.expect("result")["cleaned"], json!(true));
+    }
+
+    #[test]
+    fn cleanup_fs_removes_existing_instance_dir() {
+        let container = format!("parity-cleanup-real-{}", std::process::id());
+        let dir = instance_dir(&container);
+        std::fs::create_dir_all(&dir).expect("create test instance dir");
+        std::fs::write(dir.join("disk.img"), b"x").expect("write test artifact");
+        assert!(dir.exists());
+
+        let resp = handle_cleanup_fs(&json!({ "container": container }));
+        assert!(resp.ok, "error: {:?}", resp.error);
+        assert_eq!(resp.result.expect("result")["cleaned"], json!(true));
+        assert!(!dir.exists(), "CleanupFs must remove the instance dir");
     }
 }

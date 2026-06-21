@@ -8,9 +8,9 @@ description = "Common vmrunner contract types shared across runners"
 [dependencies]
 core-rs = { workspace = true }
 serde = { workspace = true }
+serde_json = { workspace = true }
 
 [dev-dependencies]
-serde_json = { workspace = true }
 
 [lints]
 workspace = true

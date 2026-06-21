@@ -107,9 +107,10 @@ fn execute_delete_steps(exec: &Executor, req: &ExecuteFlowRequest, steps: &[serd
             "cleanup_fs" => {
                 let claw_type = params["claw_type"].as_str().unwrap_or("");
                 let name = params["name"].as_str().unwrap_or("");
+                let container = params["container"].as_str().unwrap_or("");
                 match exec.vmrunner.call(
                     "CleanupFs",
-                    json!({"claw_type": claw_type, "name": name, "state_dir": exec.config.firecracker_state_dir}),
+                    json!({"claw_type": claw_type, "name": name, "container": container, "state_dir": exec.config.firecracker_state_dir}),
                 ) {
                     Ok(_) => {
                         // Filesystem cleanup confirmed — release storage lease (disk freed)
