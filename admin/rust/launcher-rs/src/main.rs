@@ -514,7 +514,9 @@ fn resolve_infra_env(
     );
     let fc_kernel = env_or(
         "FIRECRACKER_KERNEL_IMAGE",
-        &fc_home.join("assets/vmlinux-6.1.155").to_string_lossy(),
+        &fc_home
+            .join(format!("assets/{}", core_rs::guest_net::KERNEL_FILENAME))
+            .to_string_lossy(),
     );
     let fc_rootfs = env_or(
         "FIRECRACKER_BASE_ROOTFS",
