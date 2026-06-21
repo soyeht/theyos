@@ -4,7 +4,7 @@
 //!
 //! | Variable                    | Default                  | Description                        |
 //! |-----------------------------|--------------------------|-------------------------------------|
-//! | `ADDR`                      | `0.0.0.0:8090`           | Listen address                      |
+//! | `ADDR`                      | `127.0.0.1:8090`         | Listen address                      |
 //! | `WEB_DIR`                   | `web`                    | Built frontend assets directory     |
 //! | `FRONTEND_ORIGIN`           | `http://localhost:5173`  | Allowed CORS origin                 |
 //! | `THEYOS_SQLITE_DB`          | `/tmp/theyos.db`         | SQLite database path                |

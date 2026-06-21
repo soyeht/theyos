@@ -1,0 +1,15 @@
+[package]
+name = "vmrunner-common-rs"
+version = "0.1.21"
+edition.workspace = true
+rust-version.workspace = true
+description = "Common vmrunner warm-pool contract types shared across runners"
+
+[dependencies]
+serde = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }
+
+[lints]
+workspace = true
