@@ -167,6 +167,7 @@ impl ManifestEntry {
 #[derive(Debug, Clone, Copy, Default)]
 pub struct InstallConfig {
     pub github_repo: &'static str,
+    pub git_ref: &'static str,
     pub binary_name: &'static str,
     pub binary_path: &'static str,
     pub asset_pattern: &'static str,
