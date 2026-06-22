@@ -72,6 +72,7 @@ use crate::network::{
     slirp_remove_hostfwd_verified, slirp_wait_ready, which_systemctl,
 };
 use crate::ssh_client::{SshActions, SshSession};
+use vmrunner_common_rs::VmCreateResourceSpec;
 
 // ── Constants ──────────────────────────────────────────────────────────────
 
@@ -117,11 +118,11 @@ pub struct VmConfig {
     /// Empty vec means no tools; `None`-equivalent is handled at the API layer.
     #[allow(clippy::struct_field_names)]
     pub tools: Vec<String>,
-    /// CPU cores (1-4). `None` uses default (2).
+    /// CPU cores (1-4). `None` uses the shared vmrunner Create default.
     pub cpu_cores: Option<u32>,
-    /// RAM in MB (512-8192). `None` uses default (2048).
+    /// RAM in MB (512-8192). `None` uses the shared vmrunner Create default.
     pub ram_mb: Option<u32>,
-    /// Disk size in GB (5-50). `None` uses default (10).
+    /// Disk size in GB (5-50). `None` uses the shared vmrunner Create default.
     pub disk_gb: Option<u32>,
 }
 
@@ -495,8 +496,12 @@ impl VmRunner {
         // in-progress create as stateful instead of deleting its directory.
         inst.save()?;
 
+        let resources =
+            VmCreateResourceSpec::from_options(config.cpu_cores, config.ram_mb, config.disk_gb)
+                .resolve();
+
         // ── 6. Prepare rootfs ──────────────────────────────────────────────
-        let golden_image_used = self.prepare_rootfs(&inst, config.disk_gb.unwrap_or(10))?;
+        let golden_image_used = self.prepare_rootfs(&inst, resources.disk_gb)?;
         timer.start_phase("save_state");
 
         // Save initial state (port now visible to concurrent pick_ssh_port calls
@@ -510,8 +515,8 @@ impl VmRunner {
             &mut inst,
             false,
             false,
-            config.cpu_cores.unwrap_or(2),
-            config.ram_mb.unwrap_or(2048),
+            resources.cpu_cores,
+            resources.ram_mb,
         )
         .await?;
         // Register PIDs in the guard so rollback can kill them if later steps fail.
