@@ -169,32 +169,15 @@ pub async fn boot_build_vm(config: VmConfig, claw: &str) -> BuildResult<RunningV
     }
 
     // Build the inner shell command that runs inside `unshare`.
-    // Dual-TAP model:
-    //   tap0 — owned by slirp4netns (created later with --configure)
-    //   tap1 — owned by Firecracker (created here, guest NIC)
-    // iptables rules (background subshell, polls for tap0) provide
-    // MASQUERADE + FORWARD + DNAT for all TCP to guest.
+    // The shared guest-net helper owns the dual-TAP identity and iptables
+    // rules; this builder owns process orchestration.
     // P28.4: uses /bin/sh (POSIX) instead of bash; set -eu (no pipefail).
     let fc_bin = config.firecracker_bin.to_string_lossy().to_string();
     let api_sock_str = api_sock.to_string_lossy().to_string();
+    let network_setup = core_rs::guest_net::firecracker_dual_tap_setup_script();
     let inner_cmd = format!(
         r"set -eu
-ip link set lo up
-ip tuntap add dev tap1 mode tap
-ip addr add 172.16.0.1/30 dev tap1
-ip link set tap1 up
-
-(
-  i=0; while [ $i -lt 50 ]; do
-    if ip link show tap0 >/dev/null 2>&1; then break; fi
-    sleep 0.1; i=$((i+1))
-  done
-  iptables -t nat -C POSTROUTING -o tap0 -j MASQUERADE 2>/dev/null || iptables -t nat -A POSTROUTING -o tap0 -j MASQUERADE
-  iptables -C FORWARD -i tap1 -o tap0 -j ACCEPT 2>/dev/null || iptables -A FORWARD -i tap1 -o tap0 -j ACCEPT
-  iptables -C FORWARD -i tap0 -o tap1 -j ACCEPT 2>/dev/null || iptables -A FORWARD -i tap0 -o tap1 -j ACCEPT
-  iptables -C FORWARD -i tap0 -o tap1 -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || iptables -A FORWARD -i tap0 -o tap1 -m state --state RELATED,ESTABLISHED -j ACCEPT
-  iptables -t nat -C PREROUTING -i tap0 -p tcp -j DNAT --to-destination 172.16.0.2 2>/dev/null || iptables -t nat -A PREROUTING -i tap0 -p tcp -j DNAT --to-destination 172.16.0.2
-) &
+{network_setup}
 '{fc_bin}' --api-sock '{api_sock_str}' &
 wait $!",
     );
@@ -269,7 +252,7 @@ wait $!",
         ])
         .arg(&slirp_api_sock)
         .arg(fc_pid.to_string())
-        .arg("tap0")
+        .arg(core_rs::guest_net::SLIRP_TAP_NAME)
         .stdout(slirp_fd.try_clone().map_err(|e| {
             BuildError::new(BuildPhase::BootVm, claw, format!("clone slirp fd: {e}"))
         })?)
@@ -321,10 +304,9 @@ async fn configure_vm(api_sock: &Path, config: &VmConfig, claw: &str) -> BuildRe
         .await
         .map_err(&map_err)?;
 
-    // Boot source — dual-TAP model: guest on tap1 at 172.16.0.2/30.
-    let boot_args = "console=ttyS0 reboot=k panic=1 pci=off \
-                     ip=172.16.0.2::172.16.0.1:255.255.255.252::eth0:off";
-    fc.set_boot_source(&config.kernel_image.to_string_lossy(), boot_args)
+    // Boot source uses the shared guest-net Firecracker identity.
+    let boot_args = core_rs::guest_net::firecracker_boot_args();
+    fc.set_boot_source(&config.kernel_image.to_string_lossy(), &boot_args)
         .await
         .map_err(&map_err)?;
 
@@ -333,10 +315,14 @@ async fn configure_vm(api_sock: &Path, config: &VmConfig, claw: &str) -> BuildRe
         .await
         .map_err(&map_err)?;
 
-    // Network interface — tap1 is the FC TAP created by the inner script.
-    fc.set_network_interface("eth0", "tap1", "AA:FC:00:00:00:01")
-        .await
-        .map_err(&map_err)?;
+    // Network interface uses the shared Firecracker guest MAC.
+    fc.set_network_interface(
+        core_rs::guest_net::FIRECRACKER_GUEST_IFACE,
+        core_rs::guest_net::FIRECRACKER_TAP_NAME,
+        core_rs::guest_net::FIRECRACKER_GUEST_MAC,
+    )
+    .await
+    .map_err(&map_err)?;
 
     Ok(())
 }
@@ -358,9 +344,7 @@ fn allocate_free_port(claw: &str) -> BuildResult<u16> {
 
 fn setup_ssh_hostfwd(slirp_api_sock: &Path, host_port: u16, claw: &str) -> BuildResult<()> {
     // Send JSON command to slirp control socket via nc
-    let cmd = format!(
-        r#"{{"execute":"add_hostfwd","arguments":{{"proto":"tcp","host_addr":"127.0.0.1","host_port":{host_port},"guest_addr":"10.0.2.100","guest_port":22}}}}"#
-    );
+    let cmd = core_rs::guest_net::slirp_add_hostfwd_payload(host_port, 22);
 
     let out = Command::new("nc")
         .args(["-N", "-U", slirp_api_sock.to_str().unwrap_or("")])

@@ -500,23 +500,7 @@ pub async fn bootstrap_household(shared_state: Option<SharedState>) {
                 crate::household_attach_token::HouseholdAttachTokenStore::new(),
             ),
         };
-        axum::Router::new()
-            .route(
-                "/api/v1/household/claws",
-                axum::routing::get(handlers_household_claws::handle_household_list_claws),
-            )
-            .route(
-                "/api/v1/household/claws/{name}/availability",
-                axum::routing::get(handlers_household_claws::handle_household_claw_availability),
-            )
-            .route(
-                "/api/v1/household/claws/{name}/install",
-                axum::routing::post(handlers_household_claws::handle_household_install_claw),
-            )
-            .route(
-                "/api/v1/household/claws/{name}/uninstall",
-                axum::routing::post(handlers_household_claws::handle_household_uninstall_claw),
-            )
+        crate::claw_store_routes::household_routes()
             .route(
                 "/api/v1/household/instances",
                 axum::routing::get(handlers_household_claws::handle_household_list_instances)

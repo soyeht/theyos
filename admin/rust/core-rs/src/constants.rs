@@ -23,7 +23,7 @@ pub const FIRECRACKER_SHA256_AARCH64: &str =
     "58325e6c3c539482a412ec0b60e6f539c3320adebcf8179c7629d06736aee0bd";
 
 /// Expected kernel filename (without directory).
-pub const KERNEL_FILENAME: &str = "vmlinux-6.1.155";
+pub use crate::guest_net::KERNEL_FILENAME;
 
 // ── Artifact registry ──────────────────────────────────────────────────────
 
