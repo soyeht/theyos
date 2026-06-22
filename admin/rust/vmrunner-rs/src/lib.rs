@@ -38,7 +38,8 @@
 //! # SSH port selection
 //!
 //! Scans existing `instance.env` files for taken SSH ports, then probes each
-//! candidate in 22000–23999 with a TCP connect; the first free one wins.
+//! candidate in the configured host SSH port range with a TCP connect; the
+//! first free one wins.
 
 pub mod cid;
 pub mod create_guard;
@@ -71,6 +72,9 @@ use crate::network::{
     slirp_remove_hostfwd_verified, slirp_wait_ready, which_systemctl,
 };
 use crate::ssh_client::{SshActions, SshSession};
+use vmrunner_common_rs::{
+    DEFAULT_CREATE_CPU_CORES, DEFAULT_CREATE_DISK_GB, DEFAULT_CREATE_RAM_MB, VmCreateResourceSpec,
+};
 
 // ── Constants ──────────────────────────────────────────────────────────────
 
@@ -116,11 +120,11 @@ pub struct VmConfig {
     /// Empty vec means no tools; `None`-equivalent is handled at the API layer.
     #[allow(clippy::struct_field_names)]
     pub tools: Vec<String>,
-    /// CPU cores (1-4). `None` uses default (2).
+    /// CPU cores (1-4). `None` uses the shared vmrunner Create default.
     pub cpu_cores: Option<u32>,
-    /// RAM in MB (512-8192). `None` uses default (2048).
+    /// RAM in MB (512-8192). `None` uses the shared vmrunner Create default.
     pub ram_mb: Option<u32>,
-    /// Disk size in GB (5-50). `None` uses default (10).
+    /// Disk size in GB (5-50). `None` uses the shared vmrunner Create default.
     pub disk_gb: Option<u32>,
 }
 
@@ -162,8 +166,12 @@ impl VmEnv {
         let firecracker_bin = env_path("FIRECRACKER_BIN")
             .unwrap_or_else(|| PathBuf::from(format!("{home}/firecracker/bin/firecracker")));
 
-        let kernel_image = env_path("FIRECRACKER_KERNEL_IMAGE")
-            .unwrap_or_else(|| PathBuf::from(format!("{home}/firecracker/assets/vmlinux-6.1.155")));
+        let kernel_image = env_path("FIRECRACKER_KERNEL_IMAGE").unwrap_or_else(|| {
+            PathBuf::from(format!(
+                "{home}/firecracker/assets/{}",
+                core_rs::guest_net::KERNEL_FILENAME
+            ))
+        });
 
         // Prefer v2 rootfs, fall back to v1
         let base_rootfs = env_path("FIRECRACKER_BASE_ROOTFS").unwrap_or_else(|| {
@@ -490,8 +498,12 @@ impl VmRunner {
         // in-progress create as stateful instead of deleting its directory.
         inst.save()?;
 
+        let resources =
+            VmCreateResourceSpec::from_options(config.cpu_cores, config.ram_mb, config.disk_gb)
+                .resolve();
+
         // ── 6. Prepare rootfs ──────────────────────────────────────────────
-        let golden_image_used = self.prepare_rootfs(&inst, config.disk_gb.unwrap_or(10))?;
+        let golden_image_used = self.prepare_rootfs(&inst, resources.disk_gb)?;
         timer.start_phase("save_state");
 
         // Save initial state (port now visible to concurrent pick_ssh_port calls
@@ -505,8 +517,8 @@ impl VmRunner {
             &mut inst,
             false,
             false,
-            config.cpu_cores.unwrap_or(2),
-            config.ram_mb.unwrap_or(2048),
+            resources.cpu_cores,
+            resources.ram_mb,
         )
         .await?;
         // Register PIDs in the guard so rollback can kill them if later steps fail.
@@ -664,7 +676,14 @@ impl VmRunner {
         // restore. This preserves the instance's modified rootfs. Snapshot restore
         // would load the seed's kernel memory (stale dentry/inode cache) over the
         // instance's modified disk, causing ext4 corruption.
-        self.start_vm(&mut inst, false, true, 2, 2048).await?;
+        self.start_vm(
+            &mut inst,
+            false,
+            true,
+            DEFAULT_CREATE_CPU_CORES,
+            DEFAULT_CREATE_RAM_MB,
+        )
+        .await?;
 
         let ssh =
             SshSession::wait_for_ssh(inst.ssh_port, &self.env.ssh_key, self.env.ssh_wait_tries)
@@ -712,7 +731,14 @@ impl VmRunner {
 
         // Fresh rootfs was just copied — snapshot restore is safe here because
         // the disk matches the seed's state that mem.snapshot was taken from.
-        self.start_vm(&mut inst, false, false, 2, 2048).await?;
+        self.start_vm(
+            &mut inst,
+            false,
+            false,
+            DEFAULT_CREATE_CPU_CORES,
+            DEFAULT_CREATE_RAM_MB,
+        )
+        .await?;
 
         let ssh =
             SshSession::wait_for_ssh(inst.ssh_port, &self.env.ssh_key, self.env.ssh_wait_tries)
@@ -785,8 +811,8 @@ impl VmRunner {
 
     /// Ensure a Linux/Firecracker public site host forward exists.
     ///
-    /// The forward binds `127.0.0.1:{host_port}` on the host and sends traffic to
-    /// `10.0.2.100:{guest_port}` inside the VM via slirp4netns. The operation is
+    /// The forward binds the configured loopback host address on the host and
+    /// sends traffic to the configured slirp guest address. The operation is
     /// idempotent when the exact host/guest mapping already exists.
     ///
     /// # Errors
@@ -1559,11 +1585,8 @@ impl VmRunner {
         let use_snapshot = use_snapshot && baked_rootfs.is_some() && snapshot_bind_target_ready;
 
         // Build the shell script that runs inside the new network namespace.
-        // Dual-TAP model:
-        //   tap0 — owned by slirp4netns (created later with --configure)
-        //   tap1 — owned by Firecracker (created here, guest NIC)
-        // iptables rules (run in background, poll for tap0) provide:
-        //   MASQUERADE on tap0, FORWARD between tap0↔tap1, DNAT all TCP to guest.
+        // The shared guest-net helper owns the dual-TAP identity and iptables
+        // rules; this backend owns process/mount orchestration.
         // P28.4: uses /bin/sh (POSIX) instead of bash; set -eu (no pipefail).
         let inner_script = if use_snapshot {
             let baked_path = baked_rootfs
@@ -1573,24 +1596,10 @@ impl VmRunner {
             // path that was baked into the vmstate at snapshot-creation time.
             // The --mount flag on unshare ensures this bind-mount is private to
             // this namespace and doesn't affect other instances.
+            let network_setup = core_rs::guest_net::firecracker_dual_tap_setup_script();
             format!(
                 r"set -eu
-ip link set lo up
-ip tuntap add dev tap1 mode tap
-ip addr add 172.16.0.1/30 dev tap1
-ip link set tap1 up
-
-(
-  i=0; while [ $i -lt 50 ]; do
-    if ip link show tap0 >/dev/null 2>&1; then break; fi
-    sleep 0.1; i=$((i+1))
-  done
-  iptables -t nat -C POSTROUTING -o tap0 -j MASQUERADE 2>/dev/null || iptables -t nat -A POSTROUTING -o tap0 -j MASQUERADE
-  iptables -C FORWARD -i tap1 -o tap0 -j ACCEPT 2>/dev/null || iptables -A FORWARD -i tap1 -o tap0 -j ACCEPT
-  iptables -C FORWARD -i tap0 -o tap1 -j ACCEPT 2>/dev/null || iptables -A FORWARD -i tap0 -o tap1 -j ACCEPT
-  iptables -C FORWARD -i tap0 -o tap1 -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || iptables -A FORWARD -i tap0 -o tap1 -m state --state RELATED,ESTABLISHED -j ACCEPT
-  iptables -t nat -C PREROUTING -i tap0 -p tcp -j DNAT --to-destination 172.16.0.2 2>/dev/null || iptables -t nat -A PREROUTING -i tap0 -p tcp -j DNAT --to-destination 172.16.0.2
-) &
+{network_setup}
 # Bind-mount per-instance rootfs over the EXACT path that was baked into the
 # vmstate at snapshot-creation time. This makes Firecracker reopen the right file.
 # The baked path may no longer exist (seed instance was deleted), so we create
@@ -1601,6 +1610,7 @@ mount --bind '{instance_rootfs}' '{baked_rootfs_path}'
 '{firecracker_bin}' --api-sock '{api_sock}' &
 wait $!
 ",
+                network_setup = network_setup,
                 firecracker_bin = self.env.firecracker_bin.display(),
                 api_sock = inst.firecracker_sock.display(),
                 instance_rootfs = inst.rootfs_path.display(),
@@ -1610,27 +1620,14 @@ wait $!
                     .map_or_else(|| "/tmp".to_string(), |p| p.display().to_string()),
             )
         } else {
+            let network_setup = core_rs::guest_net::firecracker_dual_tap_setup_script();
             format!(
                 r"set -eu
-ip link set lo up
-ip tuntap add dev tap1 mode tap
-ip addr add 172.16.0.1/30 dev tap1
-ip link set tap1 up
-
-(
-  i=0; while [ $i -lt 50 ]; do
-    if ip link show tap0 >/dev/null 2>&1; then break; fi
-    sleep 0.1; i=$((i+1))
-  done
-  iptables -t nat -C POSTROUTING -o tap0 -j MASQUERADE 2>/dev/null || iptables -t nat -A POSTROUTING -o tap0 -j MASQUERADE
-  iptables -C FORWARD -i tap1 -o tap0 -j ACCEPT 2>/dev/null || iptables -A FORWARD -i tap1 -o tap0 -j ACCEPT
-  iptables -C FORWARD -i tap0 -o tap1 -j ACCEPT 2>/dev/null || iptables -A FORWARD -i tap0 -o tap1 -j ACCEPT
-  iptables -C FORWARD -i tap0 -o tap1 -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || iptables -A FORWARD -i tap0 -o tap1 -m state --state RELATED,ESTABLISHED -j ACCEPT
-  iptables -t nat -C PREROUTING -i tap0 -p tcp -j DNAT --to-destination 172.16.0.2 2>/dev/null || iptables -t nat -A PREROUTING -i tap0 -p tcp -j DNAT --to-destination 172.16.0.2
-) &
+{network_setup}
 '{firecracker_bin}' --api-sock '{api_sock}' &
 wait $!
 ",
+                network_setup = network_setup,
                 firecracker_bin = self.env.firecracker_bin.display(),
                 api_sock = inst.firecracker_sock.display(),
             )
@@ -1782,8 +1779,8 @@ wait $!
         let _ = crate::network::enable_ip_forward(fc_pid);
 
         // ── Configure VM via Firecracker API ─────────────────────────────────
-        // Dual-TAP: FC uses tap1 (created by script). tap0 will be created
-        // by slirp4netns later.
+        // Dual-TAP setup is prepared by the shared guest-net script. This
+        // backend configures Firecracker and slirp around those devices.
         let fc = FirecrackerClient::new(inst.firecracker_sock.clone());
 
         // Wait for mem warmup to complete before load_snapshot reads the file.
@@ -1823,16 +1820,19 @@ wait $!
                 t_vm_configure.elapsed().as_millis()
             );
         } else {
-            // Full kernel boot path — guest on tap1 (172.16.0.2/30)
+            // Full kernel boot path.
+            let boot_args = core_rs::guest_net::firecracker_boot_args();
             fc.set_machine_config(cpu_cores, ram_mb).await?;
-            fc.set_boot_source(
-                &self.env.kernel_image.display().to_string(),
-                "console=ttyS0 reboot=k panic=1 pci=off ip=172.16.0.2::172.16.0.1:255.255.255.252::eth0:off",
-            ).await?;
+            fc.set_boot_source(&self.env.kernel_image.display().to_string(), &boot_args)
+                .await?;
             fc.set_rootfs(&inst.rootfs_path.display().to_string(), false)
                 .await?;
-            fc.set_network_interface("eth0", "tap1", "06:00:ac:10:00:02")
-                .await?;
+            fc.set_network_interface(
+                core_rs::guest_net::FIRECRACKER_GUEST_IFACE,
+                core_rs::guest_net::FIRECRACKER_TAP_NAME,
+                core_rs::guest_net::FIRECRACKER_GUEST_MAC,
+            )
+            .await?;
             fc.start_instance().await?;
             tracing::info!(
                 "{timing_prefix} start_vm.full_boot_configure: {}ms",
@@ -1847,10 +1847,8 @@ wait $!
         }
 
         // ── Start slirp4netns — creates tap0 with --configure ────────────────
-        // Dual-TAP model: slirp owns tap0 exclusively (NAT to host).
-        // The iptables rules in the inner script (running in background)
-        // forward traffic between tap0 and tap1. slirp hostfwd exposes
-        // ports on the host side.
+        // Slirp owns the shared guest-net slirp TAP and exposes host-side
+        // forwards through its API socket.
         let slirp_log_file = fs::OpenOptions::new()
             .create(true)
             .append(true)
@@ -1872,7 +1870,7 @@ wait $!
                     "--api-socket",
                     &inst.slirp_api_sock.display().to_string(),
                     &fc_pid.to_string(),
-                    "tap0",
+                    core_rs::guest_net::SLIRP_TAP_NAME,
                 ])
                 .stdout(
                     slirp_log_file
@@ -2043,7 +2041,7 @@ wait $!
 
         // Prepare rootfs (copy golden image; skip debugfs if pubkey is pre-baked)
         let t_rootfs = std::time::Instant::now();
-        self.prepare_rootfs(&inst, 10)?;
+        self.prepare_rootfs(&inst, DEFAULT_CREATE_DISK_GB)?;
         tracing::info!(
             "[vmrunner-pool] prepare_rootfs done in {}ms",
             t_rootfs.elapsed().as_millis()
@@ -2063,7 +2061,14 @@ wait $!
         // Start VM without port forwards — the FC process runs, VM is booted/restored,
         // but no slirp hostfwds are added yet. Ports are added at claim time.
         let t_start = std::time::Instant::now();
-        self.start_vm(&mut inst, true, false, 2, 2048).await?;
+        self.start_vm(
+            &mut inst,
+            true,
+            false,
+            DEFAULT_CREATE_CPU_CORES,
+            DEFAULT_CREATE_RAM_MB,
+        )
+        .await?;
         tracing::info!(
             "[vmrunner-pool] start_vm(pool_mode) done in {}ms",
             t_start.elapsed().as_millis()
@@ -2798,8 +2803,11 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let state_dir = tmp.path();
 
-        // Create two fake instance.env files occupying 22000 and 22001
-        for (port, name) in [(22000, "inst0"), (22001, "inst1")] {
+        // Create two fake instance.env files occupying the first two SSH ports.
+        for (port, name) in [
+            (core_rs::guest_net::SSH_HOST_PORT_RANGE_START, "inst0"),
+            (core_rs::guest_net::SSH_HOST_PORT_RANGE_START + 1, "inst1"),
+        ] {
             let dir = state_dir.join(name);
             fs::create_dir_all(&dir).unwrap();
             fs::write(
@@ -2817,9 +2825,20 @@ mod tests {
         }
 
         let (port, _reservation) = pick_ssh_port(state_dir).unwrap();
-        assert!((22000..=23999).contains(&port), "port {port} out of range");
-        assert_ne!(port, 22000, "should skip 22000");
-        assert_ne!(port, 22001, "should skip 22001");
+        assert!(
+            core_rs::guest_net::ssh_host_port_range().contains(&port),
+            "port {port} out of range"
+        );
+        assert_ne!(
+            port,
+            core_rs::guest_net::SSH_HOST_PORT_RANGE_START,
+            "should skip first configured SSH port"
+        );
+        assert_ne!(
+            port,
+            core_rs::guest_net::SSH_HOST_PORT_RANGE_START + 1,
+            "should skip second configured SSH port"
+        );
     }
 
     #[test]
@@ -2989,8 +3008,8 @@ mod tests {
 
         for &p in ports.iter() {
             assert!(
-                (22000..=23999).contains(&p),
-                "port {p} out of range 22000-23999"
+                core_rs::guest_net::ssh_host_port_range().contains(&p),
+                "port {p} out of range"
             );
         }
     }
@@ -3229,7 +3248,9 @@ mod tests {
             customer_dir: String::new(),
         };
 
-        let used_golden = runner.prepare_rootfs(&inst, 10).unwrap();
+        let used_golden = runner
+            .prepare_rootfs(&inst, DEFAULT_CREATE_DISK_GB)
+            .unwrap();
         assert!(used_golden, "legacy golden should be used");
         assert!(instance_dir.is_dir(), "instance dir should be created");
         assert!(inst.rootfs_path.is_file(), "rootfs should be copied");

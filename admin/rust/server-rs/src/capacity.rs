@@ -8,14 +8,19 @@
 
 use core_rs::host_resources::HostResources;
 use store_rs::InstanceDb;
+use vmrunner_common_rs::{DEFAULT_CREATE_CPU_CORES, DEFAULT_CREATE_RAM_MB, WarmPoolStatusWire};
 
 use crate::state::SharedState;
 
 // ── Constants ────────────────────────────────────────────────────────────────
 
-/// Hardcoded slot size — matches `fill_pool_slot_impl` in `vmrunner-rs/src/lib.rs:2073`.
-pub const SLOT_CPU: i64 = 2;
-pub const SLOT_RAM: i64 = 2048;
+/// Warm-pool slot size.
+///
+/// A warm slot is prefilled with the default Create CPU/RAM shape, so capacity
+/// matching aliases the shared vmrunner Create defaults instead of owning local
+/// resource literals. Disk is handled separately by storage leases.
+pub const SLOT_CPU: i64 = DEFAULT_CREATE_CPU_CORES as i64;
+pub const SLOT_RAM: i64 = DEFAULT_CREATE_RAM_MB as i64;
 
 /// Disk margin in GB — always keep this much free (default: 5 GB).
 const DISK_MARGIN_GB: u64 = 5;
@@ -57,12 +62,7 @@ pub struct CapacityProjection {
 }
 
 /// Slot state for a single claw type (used by the reconciler).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SlotState {
-    Empty,
-    Filling,
-    Warm,
-}
+pub use vmrunner_common_rs::WarmPoolSlotState as SlotState;
 
 /// Request parameters for a capacity check.
 pub struct CapacityRequest<'a> {
@@ -130,37 +130,19 @@ pub fn warm_pool_slot_states(state: &SharedState) -> std::collections::HashMap<S
 fn parse_warm_pool_json(
     status: &serde_json::Value,
 ) -> std::collections::HashMap<String, SlotState> {
-    let mut slot_states = std::collections::HashMap::new();
-    if let Some(slots) = status.get("slots").and_then(serde_json::Value::as_array) {
-        for slot in slots {
-            let Some(claw_type) = slot.get("claw_type").and_then(serde_json::Value::as_str) else {
-                continue;
-            };
-            let state = match slot.get("state").and_then(serde_json::Value::as_str) {
-                Some("Ready" | "warm") => SlotState::Warm,
-                Some("Filling" | "filling") => SlotState::Filling,
-                _ => SlotState::Empty,
-            };
-            slot_states.insert(claw_type.to_string(), state);
-        }
-        return slot_states;
+    serde_json::from_value::<WarmPoolStatusWire>(status.clone())
+        .map(WarmPoolStatusWire::into_slot_states)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|(claw_type, state)| (claw_type, capacity_slot_state(state)))
+        .collect()
+}
+
+const fn capacity_slot_state(state: SlotState) -> SlotState {
+    match state {
+        SlotState::Stale | SlotState::Expired => SlotState::Empty,
+        state => state,
     }
-    if let Some(map) = status.as_object() {
-        for (claw_type, val) in map {
-            match val.as_str() {
-                Some("warm") => {
-                    slot_states.insert(claw_type.clone(), SlotState::Warm);
-                }
-                Some("filling") => {
-                    slot_states.insert(claw_type.clone(), SlotState::Filling);
-                }
-                _ => {
-                    slot_states.insert(claw_type.clone(), SlotState::Empty);
-                }
-            }
-        }
-    }
-    slot_states
 }
 
 // ── Capacity projection ─────────────────────────────────────────────────────
@@ -390,6 +372,51 @@ mod tests {
             available_ram_mb: ram_mb / 2,
             available_disk_gb: disk_gb,
             total_disk_gb: disk_gb * 2,
+        }
+    }
+
+    #[test]
+    fn migrated_create_default_sites_use_common_owner() {
+        let migrated_sources = [
+            (
+                "server-rs/src/handlers_instances.rs",
+                include_str!("handlers_instances.rs"),
+                &["unwrap_or(2)", "unwrap_or(2048)", "unwrap_or(10)"][..],
+            ),
+            (
+                "server-rs/src/handlers_mobile.rs",
+                include_str!("handlers_mobile.rs"),
+                &["unwrap_or(2)", "unwrap_or(2048)", "unwrap_or(10)"][..],
+            ),
+            (
+                "server-rs/src/main.rs",
+                include_str!("main.rs"),
+                &["unwrap_or(2)", "unwrap_or(2048)"][..],
+            ),
+            (
+                "vmrunner-rs/src/lib.rs",
+                include_str!("../../vmrunner-rs/src/lib.rs"),
+                &[
+                    "prepare_rootfs(&inst, 10)",
+                    "start_vm(&mut inst, false, true, 2, 2048)",
+                    "start_vm(&mut inst, false, false, 2, 2048)",
+                    "start_vm(&mut inst, true, false, 2, 2048)",
+                ][..],
+            ),
+            (
+                "vmrunner-macos-rs/src/bin/vmrunner_macos_ipc_macos.rs",
+                include_str!("../../vmrunner-macos-rs/src/bin/vmrunner_macos_ipc_macos.rs"),
+                &["parse_resource_params(params, 2, 2048)"][..],
+            ),
+        ];
+
+        for (path, source, forbidden_patterns) in migrated_sources {
+            for forbidden in forbidden_patterns {
+                assert!(
+                    !source.contains(forbidden),
+                    "{path} reintroduced create-default literal fallback `{forbidden}`"
+                );
+            }
         }
     }
 

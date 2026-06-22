@@ -6,8 +6,8 @@
 //! Serialization roundtrips are covered by unit tests in `executor-rs/src/lib.rs`.
 
 use executor_rs::{
-    ExecuteFlowRequest, ExecuteFlowResult, Executor, FlowConfig, FlowStatus, FlowType,
-    is_port_conflict_message,
+    ExecuteFlowRequest, ExecuteFlowResult, Executor, FlowConfig, FlowStatus, FlowType, PhaseTiming,
+    VmCreateTimingWire, is_port_conflict_message,
 };
 use std::sync::OnceLock;
 use tempfile::TempDir;
@@ -208,16 +208,52 @@ fn result_completed_serializes_optional_fields() {
     let r = ExecuteFlowResult {
         status: FlowStatus::Completed,
         host_port: Some(18790),
-        total_ms: Some(4500),
-        golden_image_used: Some(false),
-        install_skipped: Some(true),
+        create_timing: VmCreateTimingWire {
+            total_ms: Some(4500),
+            golden_image_used: Some(false),
+            install_skipped: Some(true),
+            phases: Some(vec![PhaseTiming {
+                phase: "start_vm".to_string(),
+                ms: 2500,
+            }]),
+        },
         ..Default::default()
     };
     let j = serde_json::to_value(&r).unwrap();
     assert_eq!(j["host_port"], 18790_i64);
     assert_eq!(j["total_ms"], 4500_u64);
     assert_eq!(j["install_skipped"], true);
+    assert_eq!(j["phases"][0]["phase"], "start_vm");
+    assert!(j.get("create_timing").is_none());
     assert!(j.get("error").is_none());
+}
+
+#[test]
+fn result_deserializes_flattened_timing_fields() {
+    let r: ExecuteFlowResult = serde_json::from_value(serde_json::json!({
+        "status": "completed",
+        "host_port": 18790,
+        "total_ms": 4500,
+        "golden_image_used": false,
+        "install_skipped": true,
+        "phases": [
+            {
+                "phase": "start_vm",
+                "ms": 2500
+            }
+        ]
+    }))
+    .unwrap();
+
+    assert_eq!(r.create_timing.total_ms, Some(4500));
+    assert_eq!(r.create_timing.install_skipped, Some(true));
+    assert_eq!(
+        r.create_timing.phases.as_ref().unwrap()[0],
+        PhaseTiming {
+            phase: "start_vm".to_string(),
+            ms: 2500,
+        }
+    );
 }
 
 // ─── Executor construction ────────────────────────────────────────────────────

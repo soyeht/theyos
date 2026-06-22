@@ -4,6 +4,7 @@
 //! Includes transparent auto-respawn when the subprocess crashes.
 
 use crate::error::{AppError, ErrorCode};
+use crate::ipc::wire::ERROR_CONTEXT_FIELD;
 use serde_json::{Value, json};
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
@@ -194,7 +195,7 @@ impl IpcClient {
                 .to_string();
             let ctx = resp
                 .as_object_mut()
-                .and_then(|m| m.remove("error_context"))
+                .and_then(|m| m.remove(ERROR_CONTEXT_FIELD))
                 .filter(serde_json::Value::is_object);
             let lower = err_msg.to_lowercase();
             let ipc_err = if lower.contains("not found") || lower.contains("instance not found") {

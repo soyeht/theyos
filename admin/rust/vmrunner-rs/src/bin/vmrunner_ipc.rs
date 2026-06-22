@@ -39,6 +39,7 @@ use core_rs::ipc::wire::Response;
 use serde_json::Value;
 use std::path::PathBuf;
 
+use vmrunner_common_rs::{VmCreateResourceSpec, VmCreateTimingWire};
 use vmrunner_rs::{VmConfig, VmEnv, VmRunner};
 
 #[tokio::main]
@@ -117,15 +118,8 @@ async fn handle_create(params: &Value) -> Response {
         })
         .unwrap_or_default();
 
-    let cpu_cores = params["cpu_cores"]
-        .as_u64()
-        .and_then(|v| u32::try_from(v).ok());
-    let ram_mb = params["ram_mb"]
-        .as_u64()
-        .and_then(|v| u32::try_from(v).ok());
-    let disk_gb = params["disk_gb"]
-        .as_u64()
-        .and_then(|v| u32::try_from(v).ok());
+    let resources =
+        serde_json::from_value::<VmCreateResourceSpec>(params.clone()).unwrap_or_default();
 
     let config = VmConfig {
         container,
@@ -133,31 +127,24 @@ async fn handle_create(params: &Value) -> Response {
         claw_type,
         customer_dir,
         tools,
-        cpu_cores,
-        ram_mb,
-        disk_gb,
+        cpu_cores: resources.cpu_cores,
+        ram_mb: resources.ram_mb,
+        disk_gb: resources.disk_gb,
     };
 
     match runner.create(&config).await {
         Ok(result) => {
-            let phases_json: Vec<serde_json::Value> = result
-                .phases
-                .iter()
-                .map(|(name, duration)| {
-                    serde_json::json!({
-                        "phase": name,
-                        "ms": duration.as_millis()
-                    })
-                })
-                .collect();
-
-            Response::ok(serde_json::json!({
-                "created": true,
-                "golden_image_used": result.golden_image_used,
-                "install_skipped": result.install_skipped,
-                "phases": phases_json,
-                "total_ms": result.total_duration.as_millis()
-            }))
+            let timing = VmCreateTimingWire::from_durations(
+                result.golden_image_used,
+                result.install_skipped,
+                &result.phases,
+                result.total_duration,
+            );
+            let mut response = serde_json::to_value(timing).unwrap_or_default();
+            if let Some(obj) = response.as_object_mut() {
+                obj.insert("created".to_string(), serde_json::json!(true));
+            }
+            Response::ok(response)
         }
         Err(ref e) => {
             // If the error carries structured context, include it in the response
