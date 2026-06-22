@@ -11,6 +11,7 @@ use crate::auth::{AdminUser, AuthUser};
 use crate::handlers_instances::require_instance;
 use crate::instance_create::rollback_inserted_instance;
 use crate::mobile_token::capabilities_for;
+use crate::responses::{ClawJobResponse, ClawListItemResponse, ListResponse, claw_list_response};
 use crate::state::SharedState;
 use axum::{
     Json,
@@ -18,10 +19,13 @@ use axum::{
     http::StatusCode,
     response::{IntoResponse, Response},
 };
-use core_rs::error::{ApiError, blocking};
+use core_rs::{
+    availability::ClawAvailability,
+    error::{ApiError, blocking},
+};
 use percent_encoding::{AsciiSet, CONTROLS, utf8_percent_encode};
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
+use serde_json::json;
 
 const DEEP_LINK_QUERY_VALUE_SET: &AsciiSet = &CONTROLS
     .add(b' ')
@@ -1793,7 +1797,7 @@ pub async fn handle_mobile_claws(
     State(state): State<SharedState>,
     headers: axum::http::HeaderMap,
     Query(q): Query<ClawsQuery>,
-) -> Result<Response, ApiError> {
+) -> Result<Json<ListResponse<ClawListItemResponse>>, ApiError> {
     let _username = extract_mobile_bearer(&state, &headers)?;
     let verify_path = state.theyos_dir.join("claws/verify-results.json");
     let items = state
@@ -1814,35 +1818,11 @@ pub async fn handle_mobile_claws(
 
     // Share one host probe across all claws in the list.
     let availabilities = crate::availability::project_all_claws(&state);
-    let by_name: std::collections::HashMap<String, _> = availabilities
-        .into_iter()
-        .map(|a| (a.name.clone(), a))
-        .collect();
-
-    let enriched: Vec<Value> = items
-        .into_iter()
-        .filter(|item| match &tier_filter {
-            Some(t) => &item.tier == t,
-            None => true,
-        })
-        .map(|item| {
-            let mut v = serde_json::to_value(&item).unwrap_or(Value::Null);
-            if let Some(avail) = by_name.get(&item.name) {
-                if let Value::Object(ref mut map) = v {
-                    if let Ok(avail_v) = serde_json::to_value(avail) {
-                        map.insert("availability".to_string(), avail_v);
-                    }
-                }
-            }
-            v
-        })
-        .collect();
-
-    Ok((
-        StatusCode::OK,
-        Json(json!({ "data": enriched, "has_more": false, "next_cursor": null })),
-    )
-        .into_response())
+    Ok(Json(claw_list_response(
+        items,
+        availabilities,
+        tier_filter.as_deref(),
+    )))
 }
 
 /// GET /api/v1/mobile/claws/{name}/availability — full availability projection
@@ -1863,12 +1843,10 @@ pub async fn handle_mobile_claw_availability(
     State(state): State<SharedState>,
     Path(name): Path<String>,
     headers: axum::http::HeaderMap,
-) -> Result<Response, ApiError> {
+) -> Result<Json<ClawAvailability>, ApiError> {
     let _username = extract_mobile_bearer(&state, &headers)?;
     let avail = crate::availability::project_claw(&name, &state);
-    let body = serde_json::to_value(&avail)
-        .map_err(|e| ApiError::internal(format!("availability serialization: {e}")))?;
-    Ok((StatusCode::OK, Json(body)).into_response())
+    Ok(Json(avail))
 }
 
 /// POST /api/v1/mobile/claws/{name}/install — trigger claw install (admin-only).
@@ -1931,10 +1909,7 @@ pub async fn handle_mobile_install_claw(
             let job_id = existing_state.and_then(|s| s.job_id).unwrap_or_default();
             return Ok((
                 StatusCode::CONFLICT,
-                Json(json!({
-                    "job_id": job_id,
-                    "message": "install already in progress"
-                })),
+                Json(ClawJobResponse::install_already_in_progress(job_id)),
             )
                 .into_response());
         }
@@ -1964,10 +1939,7 @@ pub async fn handle_mobile_install_claw(
 
     Ok((
         StatusCode::OK,
-        Json(json!({
-            "job_id": job_id,
-            "message": format!("install queued for {claw_name}")
-        })),
+        Json(ClawJobResponse::install_queued(job_id, &claw_name)),
     )
         .into_response())
 }
@@ -2051,10 +2023,7 @@ pub async fn handle_mobile_uninstall_claw(
 
     Ok((
         StatusCode::OK,
-        Json(json!({
-            "job_id": job_id,
-            "message": format!("uninstall queued for {claw_name}")
-        })),
+        Json(ClawJobResponse::uninstall_queued(job_id, &claw_name)),
     )
         .into_response())
 }
