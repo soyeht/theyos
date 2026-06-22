@@ -1,8 +1,8 @@
 //! `node-package` template — install a Node.js package globally via
 //! `npm install -g`.
 //!
-//! Uses `NodeSource`'s APT repo to get Node 22.x; same recipe as the
-//! `openclaw`/`noclaw` builtins for consistency.
+//! Uses `NodeSource`'s signed APT repo to get Node 22.x; same reviewed keyring
+//! recipe as the builtin Node install paths.
 
 use super::{StepSpec, apt_install_step, config_dir_step};
 use crate::manifest::InstallConfig;
@@ -74,6 +74,7 @@ pub fn render(config: &InstallConfig) -> Vec<StepSpec> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::node_source::NODESOURCE_REPO_KEY_SHA256;
 
     #[test]
     fn node_package_has_expected_steps() {
@@ -93,7 +94,7 @@ mod tests {
     #[test]
     fn node_package_installs_nodejs_22() {
         let cfg = InstallConfig {
-            npm_package: "foo",
+            npm_package: "foo@1.2.3",
             ..Default::default()
         };
         let node_step = render(&cfg)
@@ -102,13 +103,15 @@ mod tests {
             .unwrap();
         assert!(node_step.command.contains("nodesource.sources"));
         assert!(!node_step.command.contains("setup_22.x"));
+        assert!(node_step.command.contains(NODESOURCE_REPO_KEY_SHA256));
+        assert!(node_step.command.contains("sha256sum -c -"));
         assert!(node_step.command.contains("node --version"));
     }
 
     #[test]
     fn node_package_uses_npm_install_g() {
         let cfg = InstallConfig {
-            npm_package: "foo",
+            npm_package: "foo@1.2.3",
             entry_point: "foo",
             ..Default::default()
         };
@@ -116,7 +119,7 @@ mod tests {
             .into_iter()
             .find(|s| s.phase == "install_package")
             .unwrap();
-        assert!(step.command.contains("npm install -g 'foo'"));
+        assert!(step.command.contains("npm install -g 'foo@1.2.3'"));
         assert_eq!(
             step.idempotency_check.as_deref(),
             Some("command -v foo >/dev/null 2>&1")
@@ -126,7 +129,7 @@ mod tests {
     #[test]
     fn node_package_infers_bin_from_scoped_package() {
         let cfg = InstallConfig {
-            npm_package: "@anthropic-ai/claude-code",
+            npm_package: "@anthropic-ai/claude-code@2.1.183",
             // entry_point intentionally empty → fallback.
             ..Default::default()
         };

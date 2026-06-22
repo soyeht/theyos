@@ -6,6 +6,7 @@
 use claw_rs::ClawCatalogResponse;
 use core_rs::availability::ClawAvailability;
 use serde::Serialize;
+use std::collections::HashMap;
 use store_rs::InstanceRow;
 
 /// Standard list envelope: `{"data": [...], "has_more": false, "next_cursor": null}`.
@@ -48,6 +49,71 @@ pub struct ClawDetailResponse {
 pub struct ClawJobResponse {
     pub job_id: String,
     pub message: String,
+}
+
+impl ClawListItemResponse {
+    /// Combine a catalog row with its optional host availability projection.
+    #[must_use]
+    pub fn new(catalog: ClawCatalogResponse, availability: Option<ClawAvailability>) -> Self {
+        Self {
+            catalog,
+            availability,
+        }
+    }
+}
+
+/// Build the shared Claw Store list envelope used by admin, mobile, and
+/// household-forwarded surfaces.
+#[must_use]
+pub fn claw_list_response(
+    items: Vec<ClawCatalogResponse>,
+    availabilities: Vec<ClawAvailability>,
+    tier_filter: Option<&str>,
+) -> ListResponse<ClawListItemResponse> {
+    let by_name: HashMap<String, ClawAvailability> = availabilities
+        .into_iter()
+        .map(|availability| (availability.name.clone(), availability))
+        .collect();
+
+    let data = items
+        .into_iter()
+        .filter(|item| match tier_filter {
+            Some(tier) => item.tier == tier,
+            None => true,
+        })
+        .map(|item| {
+            let availability = by_name.get(&item.name).cloned();
+            ClawListItemResponse::new(item, availability)
+        })
+        .collect();
+
+    ListResponse::all(data)
+}
+
+impl ClawJobResponse {
+    #[must_use]
+    pub fn install_already_in_progress(job_id: impl Into<String>) -> Self {
+        Self {
+            job_id: job_id.into(),
+            message: "install already in progress".to_string(),
+        }
+    }
+
+    #[must_use]
+    pub fn install_queued(job_id: impl Into<String>, claw_name: &str) -> Self {
+        Self {
+            job_id: job_id.into(),
+            message: format!("install queued for {claw_name}"),
+        }
+    }
+
+    #[must_use]
+    pub fn uninstall_queued(job_id: impl Into<String>, claw_name: &str) -> Self {
+        Self {
+            job_id: job_id.into(),
+            message: format!("uninstall queued for {claw_name}"),
+        }
+    }
 }
 
 impl<T: Serialize> ListResponse<T> {
@@ -167,17 +233,38 @@ mod tests {
 
     #[test]
     fn claw_job_response_serializes_flat_snake_case() {
-        let value = serde_json::to_value(ClawJobResponse {
-            job_id: "job-alpha".to_string(),
-            message: "install queued for hermes-agent".to_string(),
-        })
-        .expect("serialize claw job response");
+        let value =
+            serde_json::to_value(ClawJobResponse::install_queued("job-alpha", "hermes-agent"))
+                .expect("serialize claw job response");
 
         assert_eq!(
             value,
             json!({
                 "job_id": "job-alpha",
                 "message": "install queued for hermes-agent",
+            })
+        );
+    }
+
+    #[test]
+    fn claw_job_response_builders_pin_current_action_messages() {
+        assert_eq!(
+            serde_json::to_value(ClawJobResponse::install_already_in_progress("job-alpha"))
+                .expect("serialize already installing"),
+            json!({
+                "job_id": "job-alpha",
+                "message": "install already in progress",
+            })
+        );
+        assert_eq!(
+            serde_json::to_value(ClawJobResponse::uninstall_queued(
+                "job-beta",
+                "hermes-agent",
+            ))
+            .expect("serialize uninstall queued"),
+            json!({
+                "job_id": "job-beta",
+                "message": "uninstall queued for hermes-agent",
             })
         );
     }

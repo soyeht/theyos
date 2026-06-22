@@ -55,15 +55,25 @@ fn household_claw_contract_routes_are_mounted_with_declared_handlers() {
     assert_eq!(contract.version, 1);
 
     let bootstrap = include_str!("../src/household_bootstrap.rs");
+    let claw_store_routes = include_str!("../src/claw_store_routes.rs");
+    assert!(
+        bootstrap.contains("crate::claw_store_routes::household_routes()"),
+        "household bootstrap must merge the shared Claw Store route owner"
+    );
     for route in &contract.routes {
+        let mount_source = if route.path.starts_with("/api/v1/household/claws") {
+            claw_store_routes
+        } else {
+            bootstrap
+        };
         assert!(
-            bootstrap.contains(&format!("\"{}\"", route.path)),
+            mount_source.contains(&format!("\"{}\"", route.path)),
             "{} {} must be mounted",
             route.method,
             route.path
         );
         assert!(
-            bootstrap.contains(&route.handler),
+            mount_source.contains(&route.handler),
             "{} must mount {}",
             route.name,
             route.handler

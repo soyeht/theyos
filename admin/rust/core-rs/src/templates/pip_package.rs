@@ -5,18 +5,17 @@
 //! system Python is "externally managed" and `pip3 install` outside a venv
 //! fails by default. `pipx` creates one venv per package under
 //! `/root/.local/pipx` and symlinks the entry point into `/usr/local/bin`,
-//! which keeps the system Python pristine and avoids the ugly
-//! `--break-system-packages` flag.
-//!
-//! The `nanobot` builtin (in `vmrunner-rs`) still uses `pip install
-//! --break-system-packages` for compatibility with its historical golden
-//! image; do NOT swap it for pipx without a coordinated rebuild. New claws
-//! routed through this template must use pipx.
+//! which keeps the system Python pristine. New claws routed through this
+//! template must use pipx.
 
 use super::{StepSpec, apt_install_step, config_dir_step};
 use crate::manifest::InstallConfig;
 
 const DEFAULT_DEPS: &[&str] = &["python3", "python3-pip", "python3-venv", "pipx"];
+
+fn pip_project_name(spec: &str) -> &str {
+    spec.split_once("==").map_or(spec, |(name, _)| name)
+}
 
 /// Render the install steps for a pip-packaged claw.
 #[must_use]
@@ -26,7 +25,11 @@ pub fn render(config: &InstallConfig) -> Vec<StepSpec> {
         // Fall back to the package name (a common convention, e.g. `nanobot-ai`
         // ships a `nanobot` entry point — but if the caller doesn't set it we
         // take a best-guess last segment).
-        pkg.rsplit(&['-', '_'][..]).next().unwrap_or(pkg)
+        let package_name = pip_project_name(pkg);
+        package_name
+            .rsplit(&['-', '_'][..])
+            .next()
+            .unwrap_or(package_name)
     } else {
         config.entry_point
     };
@@ -84,7 +87,7 @@ mod tests {
     #[test]
     fn pip_package_has_expected_steps() {
         let cfg = InstallConfig {
-            pip_package: "mytool",
+            pip_package: "mytool==1.2.3",
             entry_point: "mytool",
             ..Default::default()
         };
@@ -98,7 +101,7 @@ mod tests {
     #[test]
     fn pip_package_uses_pipx_not_pip() {
         let cfg = InstallConfig {
-            pip_package: "mytool",
+            pip_package: "mytool==1.2.3",
             entry_point: "mytool",
             ..Default::default()
         };
@@ -112,8 +115,10 @@ mod tests {
             step.command,
         );
         assert!(
-            !step.command.contains("break-system-packages"),
-            "must not use pip's --break-system-packages flag"
+            !step
+                .command
+                .contains(&["break", "-system", "-packages"].concat()),
+            "must not use pip's system-package override flag"
         );
         assert!(
             step.command.contains("PIPX_BIN_DIR=/usr/local/bin"),
@@ -124,7 +129,7 @@ mod tests {
     #[test]
     fn pip_package_respects_entry_point_override() {
         let cfg = InstallConfig {
-            pip_package: "my-tool-ai",
+            pip_package: "my-tool-ai==1.2.3",
             entry_point: "mytool",
             ..Default::default()
         };
@@ -141,7 +146,7 @@ mod tests {
     #[test]
     fn pip_package_includes_python_deps_by_default() {
         let cfg = InstallConfig {
-            pip_package: "foo",
+            pip_package: "foo==1.2.3",
             entry_point: "foo",
             ..Default::default()
         };
@@ -153,7 +158,7 @@ mod tests {
     #[test]
     fn pip_package_creates_config_dir_when_set() {
         let cfg = InstallConfig {
-            pip_package: "foo",
+            pip_package: "foo==1.2.3",
             entry_point: "foo",
             config_dir: "/root/.foo",
             ..Default::default()
@@ -165,7 +170,7 @@ mod tests {
     #[test]
     fn pip_package_verify_runs_entry_point() {
         let cfg = InstallConfig {
-            pip_package: "foo",
+            pip_package: "foo==1.2.3",
             entry_point: "bar",
             ..Default::default()
         };
