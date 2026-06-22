@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use crate::error::VmError;
+use vmrunner_common_rs::LINUX_SSH_HOST_PORT_RANGE;
 
 // ── Port lock directory ─────────────────────────────────────────────────────
 
@@ -45,7 +46,7 @@ impl Drop for PortReservation {
     }
 }
 
-/// Pick an available SSH port in the range 22000–23999 and atomically reserve it.
+/// Pick an available SSH port in [`LINUX_SSH_HOST_PORT_RANGE`] and atomically reserve it.
 ///
 /// Returns both the port number and a `PortReservation` guard. The caller
 /// **must keep the reservation alive** until either:
@@ -79,7 +80,7 @@ pub fn pick_ssh_port(state_dir: &Path) -> Result<(u16, PortReservation), VmError
     // (left behind by crashed processes).
     sweep_stale_port_locks(state_dir, &locks_dir, &used_ports);
 
-    for port in 22000u16..=23999 {
+    for port in LINUX_SSH_HOST_PORT_RANGE.iter() {
         if used_ports.contains(&port) {
             continue;
         }

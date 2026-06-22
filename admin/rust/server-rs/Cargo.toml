@@ -74,6 +74,7 @@ reqwest         = { workspace = true }
 
 # Internal crates (Phase 3)
 terminal-rs  = { workspace = true }
+vmrunner-common-rs = { workspace = true }
 vmrunner-rs  = { workspace = true }
 
 # Phase 3 machine-join push transport (APNS HTTP/2 client; runtime-gated by THEYOS_PUSH_DISABLED)

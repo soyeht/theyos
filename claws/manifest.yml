@@ -277,10 +277,11 @@ claws:
         apt-get update
         apt-get install -y git python3 python3-venv
         mkdir -p /opt
-        git clone https://github.com/HKUDS/ClawWork.git /opt/clawwork
-        cd /opt/clawwork
-        git checkout 9c73ac05fdb0bffdb23febdd971eb70f44dd46eb
-        test "$(git rev-parse HEAD)" = "9c73ac05fdb0bffdb23febdd971eb70f44dd46eb"
+        git init /opt/clawwork
+        git -C /opt/clawwork remote add origin https://github.com/HKUDS/ClawWork.git
+        git -C /opt/clawwork fetch --depth 1 origin 9c73ac05fdb0bffdb23febdd971eb70f44dd46eb
+        git -C /opt/clawwork checkout --detach FETCH_HEAD
+        test "$(git -C /opt/clawwork rev-parse HEAD)" = "9c73ac05fdb0bffdb23febdd971eb70f44dd46eb"
         python3 -m venv /opt/clawwork-venv
         /opt/clawwork-venv/bin/pip install --quiet -r /opt/clawwork/requirements.txt
         cat > /usr/local/bin/clawwork <<'SHIM'
@@ -408,7 +409,7 @@ claws:
     binary_size_mb: 0  # TBD
     min_ram_mb: 512
     install:
-      npm_package: "openclaw"
+      npm_package: "openclaw@2026.6.8"
       entry_point: "openclaw"
 
   claw-empire:
@@ -442,6 +443,7 @@ claws:
         mkdir -p /usr/share/keyrings
         rm -f /usr/share/keyrings/nodesource.gpg /etc/apt/sources.list.d/nodesource.list /etc/apt/sources.list.d/nodesource.sources
         curl -fsSL https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key -o /tmp/nodesource-repo.gpg.key
+        echo "b42e0321dabdc24e892115da705cf061167eac12a317f23d329862d0aa0a271d  /tmp/nodesource-repo.gpg.key" | sha256sum -c -
         gpg --dearmor -o /usr/share/keyrings/nodesource.gpg /tmp/nodesource-repo.gpg.key
         rm -f /tmp/nodesource-repo.gpg.key
         chmod 644 /usr/share/keyrings/nodesource.gpg
@@ -451,12 +453,14 @@ claws:
         printf 'Types: deb\nURIs: https://deb.nodesource.com/node_22.x\nSuites: nodistro\nComponents: main\nArchitectures: %s\nSigned-By: /usr/share/keyrings/nodesource.gpg\n' "$ARCH" > /etc/apt/sources.list.d/nodesource.sources
         apt-get update
         apt-get install -y git nodejs
-        npm install -g pnpm @anthropic-ai/claude-code @openai/codex @google/gemini-cli opencode-ai
+        npm install -g pnpm@11.8.0 @anthropic-ai/claude-code@2.1.183 @openai/codex@0.141.0 @google/gemini-cli@0.47.0 opencode-ai@1.17.8
         mkdir -p /opt
-        git clone https://github.com/GreenSheep01201/claw-empire.git /opt/claw-empire
+        git init /opt/claw-empire
+        git -C /opt/claw-empire remote add origin https://github.com/GreenSheep01201/claw-empire.git
+        git -C /opt/claw-empire fetch --depth 1 origin 66a24ea7df2435ef897c48c147deb7ec572c01c2
+        git -C /opt/claw-empire checkout --detach FETCH_HEAD
+        test "$(git -C /opt/claw-empire rev-parse HEAD)" = "66a24ea7df2435ef897c48c147deb7ec572c01c2"
         cd /opt/claw-empire
-        git checkout 66a24ea7df2435ef897c48c147deb7ec572c01c2
-        test "$(git rev-parse HEAD)" = "66a24ea7df2435ef897c48c147deb7ec572c01c2"
         pnpm install --frozen-lockfile
         pnpm run build
         cat > /usr/local/bin/claw-empire <<'SHIM'
@@ -489,7 +493,7 @@ claws:
       # Python 3.12 stdlib on Ubuntu 24.04). python3-setuptools provides a
       # vendored distutils; build-essential + python3-dev give the compiler
       # toolchain node-gyp invokes.
-      npm_package: "dr-claw"
+      npm_package: "dr-claw@1.1.4"
       entry_point: "dr-claw"
       system_deps: ["python3-setuptools", "python3-dev", "build-essential"]
 
@@ -520,10 +524,12 @@ claws:
         export DEBIAN_FRONTEND=noninteractive
         apt-get update
         apt-get install -y git meson ninja-build gcc libcurl4-openssl-dev ca-certificates pkg-config
-        git clone https://github.com/zevorn/rt-claw.git /opt/rt-claw
+        git init /opt/rt-claw
+        git -C /opt/rt-claw remote add origin https://github.com/zevorn/rt-claw.git
+        git -C /opt/rt-claw fetch --depth 1 origin 5811922c4886cb5e90a5908fff792665e913ca48
+        git -C /opt/rt-claw checkout --detach FETCH_HEAD
+        test "$(git -C /opt/rt-claw rev-parse HEAD)" = "5811922c4886cb5e90a5908fff792665e913ca48"
         cd /opt/rt-claw
-        git checkout 5811922c4886cb5e90a5908fff792665e913ca48
-        test "$(git rev-parse HEAD)" = "5811922c4886cb5e90a5908fff792665e913ca48"
         meson setup build/linux -Dosal=linux
         meson compile -C build/linux
         install -m755 build/linux/platform/linux/rtclaw /usr/local/bin/rt-claw
@@ -583,6 +589,7 @@ claws:
     min_ram_mb: 2048
     install:
       github_repo: "qhkm/zeptoclaw"
+      git_ref: "11156f40e9dbb05e1cb955fdc24c19a0155d2836"
       binary_name: "zeptoclaw"
 
   rosclaw:
@@ -637,6 +644,7 @@ claws:
         mkdir -p /usr/share/keyrings
         rm -f /usr/share/keyrings/nodesource.gpg /etc/apt/sources.list.d/nodesource.list /etc/apt/sources.list.d/nodesource.sources
         curl -fsSL https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key -o /tmp/nodesource-repo.gpg.key
+        echo "b42e0321dabdc24e892115da705cf061167eac12a317f23d329862d0aa0a271d  /tmp/nodesource-repo.gpg.key" | sha256sum -c -
         gpg --dearmor -o /usr/share/keyrings/nodesource.gpg /tmp/nodesource-repo.gpg.key
         rm -f /tmp/nodesource-repo.gpg.key
         chmod 644 /usr/share/keyrings/nodesource.gpg
@@ -646,7 +654,7 @@ claws:
         printf 'Types: deb\nURIs: https://deb.nodesource.com/node_22.x\nSuites: nodistro\nComponents: main\nArchitectures: %s\nSigned-By: /usr/share/keyrings/nodesource.gpg\n' "$ARCH" > /etc/apt/sources.list.d/nodesource.sources
         apt-get update
         apt-get install -y nodejs
-        npm install -g n8n --legacy-peer-deps
+        npm install -g n8n@2.26.8 --legacy-peer-deps
       entry_point: "n8n"
 
   hermitclaw:
@@ -676,16 +684,19 @@ claws:
         apt-get update
         apt-get install -y git python3 python3-pip python3-venv nodejs npm
         mkdir -p /opt
-        git clone https://github.com/brendanhogan/hermitclaw.git /opt/hermitclaw
+        git init /opt/hermitclaw
+        git -C /opt/hermitclaw remote add origin https://github.com/brendanhogan/hermitclaw.git
+        git -C /opt/hermitclaw fetch --depth 1 origin 2b69414969e66702f4aad50e0b09594cc26ccd11
+        git -C /opt/hermitclaw checkout --detach FETCH_HEAD
+        test "$(git -C /opt/hermitclaw rev-parse HEAD)" = "2b69414969e66702f4aad50e0b09594cc26ccd11"
         cd /opt/hermitclaw
-        git checkout 2b69414969e66702f4aad50e0b09594cc26ccd11
-        test "$(git rev-parse HEAD)" = "2b69414969e66702f4aad50e0b09594cc26ccd11"
-        pip3 install --break-system-packages -e .
+        python3 -m venv /opt/hermitclaw-venv
+        /opt/hermitclaw-venv/bin/pip install --quiet -e .
         cd frontend && npm install && npm run build && cd ..
         cat > /usr/local/bin/hermitclaw <<'SHIM'
         #!/bin/bash
         export OPENAI_API_KEY="${OPENAI_API_KEY:-sk-verify-placeholder}"
-        cd /opt/hermitclaw && exec python3 hermitclaw/main.py "$@"
+        cd /opt/hermitclaw && exec /opt/hermitclaw-venv/bin/python hermitclaw/main.py "$@"
         SHIM
         chmod +x /usr/local/bin/hermitclaw
 
@@ -716,10 +727,12 @@ claws:
         apt-get update
         apt-get install -y git golang-go make
         mkdir -p /opt
-        git clone https://github.com/stellarlinkco/myclaw.git /opt/myclaw
+        git init /opt/myclaw
+        git -C /opt/myclaw remote add origin https://github.com/stellarlinkco/myclaw.git
+        git -C /opt/myclaw fetch --depth 1 origin 7b1f24cdd292b0b532862b69957eecc036b5da19
+        git -C /opt/myclaw checkout --detach FETCH_HEAD
+        test "$(git -C /opt/myclaw rev-parse HEAD)" = "7b1f24cdd292b0b532862b69957eecc036b5da19"
         cd /opt/myclaw
-        git checkout 7b1f24cdd292b0b532862b69957eecc036b5da19
-        test "$(git rev-parse HEAD)" = "7b1f24cdd292b0b532862b69957eecc036b5da19"
         make build-release
         install -m 0755 ./myclaw /usr/local/bin/myclaw-bin
         cat > /usr/local/bin/myclaw <<'SHIM'
@@ -766,7 +779,7 @@ claws:
     binary_size_mb: 0  # TBD
     min_ram_mb: 512
     install:
-      pip_package: "safeclaw"
+      pip_package: "safeclaw==0.1.3"
       entry_point: "safeclaw"
 
   subzeroclaw:
@@ -795,10 +808,12 @@ claws:
         apt-get update
         apt-get install -y git build-essential libcjson-dev
         mkdir -p /opt ~/.subzeroclaw/skills
-        git clone https://github.com/jmlago/subzeroclaw.git /opt/subzeroclaw
+        git init /opt/subzeroclaw
+        git -C /opt/subzeroclaw remote add origin https://github.com/jmlago/subzeroclaw.git
+        git -C /opt/subzeroclaw fetch --depth 1 origin 1d203dd4a896b02d521b300431c9127f2917d10a
+        git -C /opt/subzeroclaw checkout --detach FETCH_HEAD
+        test "$(git -C /opt/subzeroclaw rev-parse HEAD)" = "1d203dd4a896b02d521b300431c9127f2917d10a"
         cd /opt/subzeroclaw
-        git checkout 1d203dd4a896b02d521b300431c9127f2917d10a
-        test "$(git rev-parse HEAD)" = "1d203dd4a896b02d521b300431c9127f2917d10a"
         make
         install -m 0755 ./subzeroclaw /usr/local/bin/subzeroclaw
         cat > ~/.subzeroclaw/config <<'CFG'
@@ -824,7 +839,7 @@ claws:
     binary_size_mb: 0  # TBD
     min_ram_mb: 512
     install:
-      pip_package: "xsafeclaw"
+      pip_package: "xsafeclaw==1.1.1"
       entry_point: "xsafeclaw"
 
   supaclaw:
@@ -864,25 +879,28 @@ claws:
     binary_size_mb: 0  # TBD
     min_ram_mb: 512
     install:
-      # Single-file Python agent — `pip install httpx` + `python agent.py`.
+      # Single-file Python agent — `pip install httpx==0.28.1` + `python agent.py`.
       # Runtime requires OPENAI_API_KEY + TELEGRAM_BOT_TOKEN; verify soak
       # will fail without them unless sandbox injects placeholders.
       manual_script: |
         set -euxo pipefail
         export DEBIAN_FRONTEND=noninteractive
         apt-get update
-        apt-get install -y git python3 python3-pip
+        apt-get install -y git python3 python3-venv
         mkdir -p /opt
-        git clone https://github.com/dorringel/epsiclaw.git /opt/epsiclaw
+        git init /opt/epsiclaw
+        git -C /opt/epsiclaw remote add origin https://github.com/dorringel/epsiclaw.git
+        git -C /opt/epsiclaw fetch --depth 1 origin 475147f68fb1fb951b2f5b8bc96b3a58f075c340
+        git -C /opt/epsiclaw checkout --detach FETCH_HEAD
+        test "$(git -C /opt/epsiclaw rev-parse HEAD)" = "475147f68fb1fb951b2f5b8bc96b3a58f075c340"
         cd /opt/epsiclaw
-        git checkout 475147f68fb1fb951b2f5b8bc96b3a58f075c340
-        test "$(git rev-parse HEAD)" = "475147f68fb1fb951b2f5b8bc96b3a58f075c340"
-        pip3 install --break-system-packages httpx
+        python3 -m venv /opt/epsiclaw-venv
+        /opt/epsiclaw-venv/bin/pip install --quiet httpx==0.28.1
         cat > /usr/local/bin/epsiclaw <<'SHIM'
         #!/bin/bash
         export OPENAI_API_KEY="${OPENAI_API_KEY:-sk-verify-placeholder}"
         export TELEGRAM_BOT_TOKEN="${TELEGRAM_BOT_TOKEN:-verify-placeholder}"
-        cd /opt/epsiclaw && exec python3 agent.py "$@"
+        cd /opt/epsiclaw && exec /opt/epsiclaw-venv/bin/python agent.py "$@"
         SHIM
         chmod +x /usr/local/bin/epsiclaw
 
@@ -904,7 +922,7 @@ claws:
     binary_size_mb: 0  # TBD
     min_ram_mb: 512
     install:
-      pip_package: "nanobot-ai"
+      pip_package: "nanobot-ai==0.2.1"
       entry_point: "nanobot"
 
   shibaclaw:
@@ -925,7 +943,7 @@ claws:
     binary_size_mb: 0  # TBD
     min_ram_mb: 512
     install:
-      pip_package: "shibaclaw"
+      pip_package: "shibaclaw==0.2.1"
       entry_point: "shibaclaw"
 
   sharpclaw:
@@ -983,17 +1001,17 @@ claws:
     binary_size_mb: 0  # TBD
     min_ram_mb: 512
     install:
-      # angel-claw is published on PyPI. neonize transitive dep pins protobuf>=6.32.1
+      # angel-claw is published on PyPI. neonize's protobuf lower bound is too loose,
       # (too loose), so pip may land on an older protobuf that mismatches the
-      # gencode (7.34.1) baked into neonize's generated pb2 files — force >=7.30.
+      # gencode (7.34.1) baked into neonize's generated pb2 files.
       # libmagic1 is needed at runtime by the python-magic dep neonize pulls in.
       manual_script: |
         set -euxo pipefail
         export DEBIAN_FRONTEND=noninteractive
         apt-get update
         apt-get install -y python3 python3-venv pipx git libmagic1
-        pipx install --force angel-claw
-        pipx inject angel-claw "protobuf>=7.30,<8"
+        pipx install --force angel-claw==0.13.0
+        pipx inject angel-claw "protobuf==7.34.1"
         ln -sf /root/.local/bin/angel-claw /usr/local/bin/angel-claw
         /usr/local/bin/angel-claw --help 2>&1 | head -20 || true
 
@@ -1051,7 +1069,7 @@ claws:
     binary_size_mb: 0  # TBD
     min_ram_mb: 512
     install:
-      npm_package: "openclaw"
+      npm_package: "openclaw@2026.6.8"
       entry_point: "openclaw"
 
   clawarm:
