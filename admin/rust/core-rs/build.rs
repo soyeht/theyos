@@ -67,6 +67,8 @@ struct InstallBlock {
     #[serde(default)]
     github_repo: String,
     #[serde(default)]
+    git_ref: String,
+    #[serde(default)]
     binary_name: String,
     #[serde(default)]
     binary_path: String,
@@ -411,6 +413,7 @@ fn main() {
                 rs,
                 "static {ident}: InstallConfig = InstallConfig {{ \
                   github_repo: \"{}\", \
+                  git_ref: \"{}\", \
                   binary_name: \"{}\", \
                   binary_path: \"{}\", \
                   asset_pattern: \"{}\", \
@@ -422,6 +425,7 @@ fn main() {
                   manual_script: {} \
                   }};",
                 escape_str(&install.github_repo),
+                escape_str(&install.git_ref),
                 escape_str(&install.binary_name),
                 escape_str(&install.binary_path),
                 escape_str(&install.asset_pattern),

@@ -1441,6 +1441,7 @@ dependencies = [
  "thiserror 1.0.69",
  "tokio",
  "tracing",
+ "vmrunner-common-rs",
 ]
 
 [[package]]
@@ -4166,6 +4167,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "ureq",
+ "vmrunner-common-rs",
  "vmrunner-rs",
  "zeroize",
  "zstd",
@@ -5122,6 +5124,14 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 
 [[package]]
+name = "vmrunner-common-rs"
+version = "0.1.21"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "vmrunner-macos-rs"
 version = "0.1.21"
 dependencies = [
@@ -5146,6 +5156,7 @@ dependencies = [
  "tracing-subscriber",
  "ureq",
  "uuid",
+ "vmrunner-common-rs",
 ]
 
 [[package]]
@@ -5169,6 +5180,7 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "vmrunner-common-rs",
 ]
 
 [[package]]

@@ -20,6 +20,7 @@ members = [
     "soyeht-rs",
     "updater-rs",
     "claw-autoupdate-rs",
+    "vmrunner-common-rs",
     "vmrunner-rs",
     "vmrunner-macos-rs",
 ]
@@ -124,5 +125,6 @@ session-rs      = { path = "session-rs" }
 server-rs       = { path = "server-rs" }
 store-rs        = { path = "store-rs" }
 terminal-rs     = { path = "terminal-rs" }
+vmrunner-common-rs = { path = "vmrunner-common-rs" }
 vmrunner-rs     = { path = "vmrunner-rs" }
 vmrunner-macos-rs = { path = "vmrunner-macos-rs" }

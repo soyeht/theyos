@@ -23,7 +23,7 @@ pub struct InstanceEnv {
     pub(crate) claw_type: String,
     /// Host-side port the claw agent listens on
     pub(crate) host_port: u16,
-    /// Host-side SSH forward port (22000–23999)
+    /// Host-side SSH forward port from the configured guest-net range.
     pub(crate) ssh_port: u16,
     /// PID of the `unshare`/firecracker process group leader (None if stopped)
     pub(crate) firecracker_pid: Option<u32>,

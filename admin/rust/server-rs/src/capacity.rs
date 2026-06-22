@@ -8,6 +8,7 @@
 
 use core_rs::host_resources::HostResources;
 use store_rs::InstanceDb;
+use vmrunner_common_rs::WarmPoolStatusWire;
 
 use crate::state::SharedState;
 
@@ -57,12 +58,7 @@ pub struct CapacityProjection {
 }
 
 /// Slot state for a single claw type (used by the reconciler).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SlotState {
-    Empty,
-    Filling,
-    Warm,
-}
+pub use vmrunner_common_rs::WarmPoolSlotState as SlotState;
 
 /// Request parameters for a capacity check.
 pub struct CapacityRequest<'a> {
@@ -130,37 +126,19 @@ pub fn warm_pool_slot_states(state: &SharedState) -> std::collections::HashMap<S
 fn parse_warm_pool_json(
     status: &serde_json::Value,
 ) -> std::collections::HashMap<String, SlotState> {
-    let mut slot_states = std::collections::HashMap::new();
-    if let Some(slots) = status.get("slots").and_then(serde_json::Value::as_array) {
-        for slot in slots {
-            let Some(claw_type) = slot.get("claw_type").and_then(serde_json::Value::as_str) else {
-                continue;
-            };
-            let state = match slot.get("state").and_then(serde_json::Value::as_str) {
-                Some("Ready" | "warm") => SlotState::Warm,
-                Some("Filling" | "filling") => SlotState::Filling,
-                _ => SlotState::Empty,
-            };
-            slot_states.insert(claw_type.to_string(), state);
-        }
-        return slot_states;
+    serde_json::from_value::<WarmPoolStatusWire>(status.clone())
+        .map(WarmPoolStatusWire::into_slot_states)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|(claw_type, state)| (claw_type, capacity_slot_state(state)))
+        .collect()
+}
+
+const fn capacity_slot_state(state: SlotState) -> SlotState {
+    match state {
+        SlotState::Stale | SlotState::Expired => SlotState::Empty,
+        state => state,
     }
-    if let Some(map) = status.as_object() {
-        for (claw_type, val) in map {
-            match val.as_str() {
-                Some("warm") => {
-                    slot_states.insert(claw_type.clone(), SlotState::Warm);
-                }
-                Some("filling") => {
-                    slot_states.insert(claw_type.clone(), SlotState::Filling);
-                }
-                _ => {
-                    slot_states.insert(claw_type.clone(), SlotState::Empty);
-                }
-            }
-        }
-    }
-    slot_states
 }
 
 // ── Capacity projection ─────────────────────────────────────────────────────
