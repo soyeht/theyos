@@ -307,6 +307,48 @@
         "degradations": []
       }
     },
+    "list_item_catalog_only": {
+      "name": "claude-claw",
+      "description": "Claude Code plugin, not a server daemon",
+      "language": "typescript",
+      "buildable": false,
+      "version": "1.0.0",
+      "binary_size_mb": 0,
+      "min_ram_mb": 0,
+      "license": "MIT",
+      "distribution": "prebuilt",
+      "status": "not_installed",
+      "tier": "catalog",
+      "installable": false,
+      "unavailable_reason_code": "catalog_only",
+      "unavailable_reason": "Claude Code plugin, not a server daemon. Installed via `claude plugin install`; does not fit the Firecracker VM smoke-test model.",
+      "availability": {
+        "name": "claude-claw",
+        "install": {
+          "status": "not_installed",
+          "progress": null,
+          "installed_at": null,
+          "error": null,
+          "job_id": null
+        },
+        "host": {
+          "cold_path_ready": true,
+          "has_golden": false,
+          "has_base_rootfs": true,
+          "maintenance_blocked": false,
+          "maintenance_retry_after_secs": null
+        },
+        "overall": {
+          "state": "not_installed"
+        },
+        "reasons": [
+          {
+            "type": "not_installed"
+          }
+        ],
+        "degradations": []
+      }
+    },
     "list_envelope_ready": {
       "data": [
         {

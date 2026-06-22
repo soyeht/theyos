@@ -17,6 +17,7 @@ use core_rs::{
     },
     env::set_test_env,
     error::ApiError,
+    manifest::UnavailableReasonCode,
 };
 use executor_rs::{Executor, FlowConfig};
 use household_rs::{
@@ -640,6 +641,66 @@ fn unknown_availability_serializer_matches_claw_store_v1_fixture() {
 
     let value = serde_json::to_value(availability).expect("serialize availability");
     assert_eq!(&value, fixture("unknown_availability"));
+}
+
+#[test]
+fn catalog_only_list_item_serializer_matches_claw_store_v1_fixture() {
+    // A known-but-not-installable (catalog-only) claw. The static catalog gate
+    // — `installable == false` plus the machine-readable `unavailable_reason_code`
+    // / `unavailable_reason` — is the single source of truth the UI uses to
+    // disable the Install CTA. The existing list fixtures only cover the
+    // installable=true path, so this binds the not-installable wire encoding to a
+    // shared cross-repo fixture: a rename of `unavailable_reason_code` or of the
+    // `catalog_only` value breaks here, and (once synced) on the iOS decode side.
+    let list_item = ClawListItemResponse {
+        catalog: ClawCatalogResponse {
+            name: "claude-claw".to_string(),
+            description: "Claude Code plugin, not a server daemon".to_string(),
+            language: "typescript".to_string(),
+            buildable: false,
+            version: "1.0.0".to_string(),
+            binary_size_mb: 0,
+            min_ram_mb: 0,
+            license: "MIT".to_string(),
+            distribution: "prebuilt".to_string(),
+            status: ClawStatus::NotInstalled,
+            installed_at: None,
+            job_id: None,
+            error: None,
+            verify_status: None,
+            verify_error: None,
+            tier: "catalog".to_string(),
+            stars: 0,
+            source: String::new(),
+            last_updated: String::new(),
+            reviewed_upstream_commit: String::new(),
+            latest_upstream_commit: String::new(),
+            install_plan_source: String::new(),
+            installable: false,
+            unavailable_reason_code: Some(UnavailableReasonCode::CatalogOnly),
+            unavailable_reason: Some(
+                "Claude Code plugin, not a server daemon. Installed via `claude plugin install`; does not fit the Firecracker VM smoke-test model."
+                    .to_string(),
+            ),
+        },
+        availability: Some(ClawAvailability {
+            name: "claude-claw".to_string(),
+            install: InstallProjection::default_not_installed(),
+            host: HostProjection {
+                cold_path_ready: true,
+                has_golden: false,
+                has_base_rootfs: true,
+                maintenance_blocked: false,
+                maintenance_retry_after_secs: None,
+            },
+            overall: OverallState::NotInstalled,
+            reasons: vec![UnavailReason::NotInstalled],
+            degradations: Vec::<Degradation>::new(),
+        }),
+    };
+
+    let value = serde_json::to_value(&list_item).expect("serialize catalog-only list item");
+    assert_eq!(&value, fixture("list_item_catalog_only"));
 }
 
 #[tokio::test]
