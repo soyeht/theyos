@@ -1,6 +1,7 @@
-//! Shared vmrunner Create resource contracts.
+//! Shared vmrunner Create contracts.
 
 use serde::{Deserialize, Deserializer, Serialize};
+use std::time::Duration;
 
 /// Default CPU cores for instance Create requests.
 pub const DEFAULT_CREATE_CPU_CORES: u32 = 2;
@@ -70,6 +71,80 @@ pub struct ResolvedVmCreateResourceSpec {
     pub cpu_cores: u32,
     pub ram_mb: u32,
     pub disk_gb: u32,
+}
+
+/// One VM Create phase timing entry on the vmrunner IPC wire.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VmCreatePhaseTiming {
+    pub phase: String,
+    pub ms: u64,
+}
+
+/// Optional timing fields returned by vmrunner Create IPC.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VmCreateTimingWire {
+    #[serde(
+        default,
+        deserialize_with = "deserialize_optional_lossy",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub golden_image_used: Option<bool>,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_optional_lossy",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub install_skipped: Option<bool>,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_optional_lossy",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub phases: Option<Vec<VmCreatePhaseTiming>>,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_optional_lossy",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub total_ms: Option<u64>,
+}
+
+impl VmCreateTimingWire {
+    #[must_use]
+    pub fn from_durations(
+        golden_image_used: bool,
+        install_skipped: bool,
+        phases: &[(String, Duration)],
+        total_duration: Duration,
+    ) -> Self {
+        Self {
+            golden_image_used: Some(golden_image_used),
+            install_skipped: Some(install_skipped),
+            phases: Some(
+                phases
+                    .iter()
+                    .map(|(phase, duration)| VmCreatePhaseTiming {
+                        phase: phase.clone(),
+                        ms: duration_millis_u64(*duration),
+                    })
+                    .collect(),
+            ),
+            total_ms: Some(duration_millis_u64(total_duration)),
+        }
+    }
+}
+
+fn duration_millis_u64(duration: Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+}
+
+#[allow(clippy::unnecessary_wraps)]
+fn deserialize_optional_lossy<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    D: Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Ok(T::deserialize(deserializer).ok())
 }
 
 fn deserialize_optional_u32<'de, D>(deserializer: D) -> Result<Option<u32>, D::Error>
@@ -224,5 +299,89 @@ mod tests {
         .unwrap();
 
         assert_eq!(spec, VmCreateResourceSpec::default());
+    }
+
+    #[test]
+    fn create_timing_wire_serializes_current_fields() {
+        let timing = VmCreateTimingWire::from_durations(
+            true,
+            false,
+            &[("prepare_rootfs".to_string(), Duration::from_millis(42))],
+            Duration::from_millis(100),
+        );
+        let value = serde_json::to_value(timing).unwrap();
+
+        assert_eq!(
+            value,
+            json!({
+                "golden_image_used": true,
+                "install_skipped": false,
+                "phases": [
+                    {
+                        "phase": "prepare_rootfs",
+                        "ms": 42
+                    }
+                ],
+                "total_ms": 100
+            })
+        );
+    }
+
+    #[test]
+    fn create_timing_wire_deserializes_partial_fields() {
+        let timing: VmCreateTimingWire = serde_json::from_value(json!({
+            "phases": [
+                {
+                    "phase": "start_vm",
+                    "ms": 7
+                }
+            ],
+            "total_ms": 9
+        }))
+        .unwrap();
+
+        assert_eq!(timing.golden_image_used, None);
+        assert_eq!(timing.install_skipped, None);
+        assert_eq!(
+            timing.phases,
+            Some(vec![VmCreatePhaseTiming {
+                phase: "start_vm".to_string(),
+                ms: 7,
+            }])
+        );
+        assert_eq!(timing.total_ms, Some(9));
+    }
+
+    #[test]
+    fn create_timing_wire_treats_invalid_fields_as_absent() {
+        let timing: VmCreateTimingWire = serde_json::from_value(json!({
+            "golden_image_used": "true",
+            "install_skipped": false,
+            "phases": "not-an-array",
+            "total_ms": -1
+        }))
+        .unwrap();
+
+        assert_eq!(timing.golden_image_used, None);
+        assert_eq!(timing.install_skipped, Some(false));
+        assert_eq!(timing.phases, None);
+        assert_eq!(timing.total_ms, None);
+    }
+
+    #[test]
+    fn create_timing_wire_treats_malformed_phase_array_as_absent() {
+        let timing: VmCreateTimingWire = serde_json::from_value(json!({
+            "phases": [
+                {
+                    "phase": "start_vm",
+                    "ms": "bad"
+                }
+            ],
+            "total_ms": 9
+        }))
+        .unwrap();
+
+        assert_eq!(timing.phases, None);
+        assert_eq!(timing.total_ms, Some(9));
     }
 }
