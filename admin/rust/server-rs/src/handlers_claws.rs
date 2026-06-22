@@ -5,6 +5,7 @@
 //!   POST   /api/v1/claws/{name}/install
 //!   POST   /api/v1/claws/{name}/uninstall
 
+use crate::claw_store_service;
 use crate::responses::{
     ClawDetailResponse, ClawJobResponse, ClawListItemResponse, ListResponse, claw_list_response,
 };
@@ -14,8 +15,7 @@ use axum::{
     extract::{Path, State},
 };
 use claw_rs::ClawStatus;
-use core_rs::error::{ApiError, blocking};
-use serde_json::json;
+use core_rs::error::ApiError;
 
 /// `GET /api/v1/claws`
 ///
@@ -113,67 +113,11 @@ pub async fn handle_install_claw(
     State(state): State<SharedState>,
     Path(name): Path<String>,
 ) -> Result<Json<ClawJobResponse>, ApiError> {
-    // 1. Must be in manifest
-    let Some(entry) = core_rs::manifest::get(&name) else {
-        return Err(ApiError::not_found(format!("unknown claw type: {name}")));
-    };
-
-    // 2. Single installability gate — `ManifestEntry::installability()` is the
-    //    one and only predicate for "can a user install this claw right now?".
-    //    Tier, install-path presence, and skip_install_reason are all folded
-    //    into this single call so the catalog response and the install handler
-    //    cannot disagree.
-    if let core_rs::manifest::ClawInstallability::Unavailable { code, message } =
-        entry.installability()
-    {
-        return Err(ApiError::bad_request_with_reasons(
-            format!("claw type '{name}' is not installable yet: {message}"),
-            json!({
-                "unavailable_reason_code": code,
-                "unavailable_reason": message,
-            }),
-        ));
-    }
-
-    // 3. Check current status
-    let current = state.claw_store.get_status(&name);
-    match current {
-        ClawStatus::Ready => {
-            return Err(ApiError::bad_request(format!(
-                "claw type '{name}' is already installed"
-            )));
-        }
-        ClawStatus::Installing => {
-            // Idempotent: return existing job ID
-            let existing_state = state.claw_store.get_state(&name);
-            let job_id = existing_state.and_then(|s| s.job_id).unwrap_or_default();
-            return Ok(Json(ClawJobResponse::install_already_in_progress(job_id)));
-        }
-        _ => {} // NotInstalled, Failed, Uninstalling — proceed
-    }
-
-    // 5. Create job
-    let mut job = jobs_rs::Job::new(jobs_rs::JobType::InstallClaw, &name, "{}");
-    let job_id = job.id.clone();
-    let claw_name = name.clone();
-
-    let st = state.clone();
-    blocking(move || {
-        st.jobs
-            .create(&mut job)
-            .map_err(|e| ApiError::internal(format!("failed to create install job: {e}")))
-    })
-    .await??;
-
-    // 6. Mark installing
-    state
-        .claw_store
-        .mark_installing(&claw_name, &job_id)
-        .map_err(|e| ApiError::internal(format!("failed to mark installing: {e}")))?;
-
-    tracing::info!("[claw-store] install queued: claw={claw_name} job={job_id}");
-
-    Ok(Json(ClawJobResponse::install_queued(job_id, &claw_name)))
+    Ok(Json(
+        claw_store_service::install_claw(&state, name)
+            .await?
+            .into_job_response(),
+    ))
 }
 
 /// `POST /api/v1/claws/{name}/uninstall`
@@ -188,56 +132,11 @@ pub async fn handle_uninstall_claw(
     State(state): State<SharedState>,
     Path(name): Path<String>,
 ) -> Result<Json<ClawJobResponse>, ApiError> {
-    // 1. Must be in manifest
-    if !core_rs::manifest::is_known(&name) {
-        return Err(ApiError::not_found(format!("unknown claw type: {name}")));
-    }
-
-    // 2. Must be ready (can only uninstall what's installed)
-    if !state.claw_store.is_ready(&name) {
-        return Err(ApiError::bad_request(format!(
-            "claw type '{name}' is not installed"
-        )));
-    }
-
-    // 3. D7: Block if ANY instance with this claw_type exists
-    let n = name.clone();
-    let st = state.clone();
-    let count = blocking(move || {
-        st.instance_db
-            .count_by_claw_type(&n)
-            .map_err(|e| ApiError::internal(format!("failed to count instances: {e}")))
-    })
-    .await??;
-
-    if count > 0 {
-        return Err(ApiError::bad_request(format!(
-            "cannot uninstall: {count} instance(s) of type '{name}' still exist — delete them first"
-        )));
-    }
-
-    // 4. Create job
-    let mut job = jobs_rs::Job::new(jobs_rs::JobType::UninstallClaw, &name, "{}");
-    let job_id = job.id.clone();
-    let claw_name = name.clone();
-
-    let st = state.clone();
-    blocking(move || {
-        st.jobs
-            .create(&mut job)
-            .map_err(|e| ApiError::internal(format!("failed to create uninstall job: {e}")))
-    })
-    .await??;
-
-    // 5. Mark uninstalling
-    state
-        .claw_store
-        .mark_uninstalling(&claw_name)
-        .map_err(|e| ApiError::internal(format!("failed to mark uninstalling: {e}")))?;
-
-    tracing::info!("[claw-store] uninstall queued: claw={claw_name} job={job_id}");
-
-    Ok(Json(ClawJobResponse::uninstall_queued(job_id, &claw_name)))
+    Ok(Json(
+        claw_store_service::uninstall_claw(&state, name)
+            .await?
+            .into_job_response(),
+    ))
 }
 
 fn claw_status_wire(status: ClawStatus) -> &'static str {

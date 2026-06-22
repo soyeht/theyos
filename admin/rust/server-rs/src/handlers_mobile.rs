@@ -8,10 +8,11 @@
 //!   POST /api/v1/mobile/logout             (mobile-authed — revokes session)
 
 use crate::auth::{AdminUser, AuthUser};
+use crate::claw_store_service;
 use crate::handlers_instances::require_instance;
 use crate::instance_create::rollback_inserted_instance;
 use crate::mobile_token::capabilities_for;
-use crate::responses::{ClawJobResponse, ClawListItemResponse, ListResponse, claw_list_response};
+use crate::responses::{ClawListItemResponse, ListResponse, claw_list_response};
 use crate::state::SharedState;
 use axum::{
     Json,
@@ -1877,71 +1878,13 @@ pub async fn handle_mobile_install_claw(
         _ => return Err(ApiError::forbidden("admin access required")),
     }
 
-    // 1. Must be in manifest
-    let Some(entry) = core_rs::manifest::get(&name) else {
-        return Err(ApiError::not_found(format!("unknown claw type: {name}")));
+    let outcome = claw_store_service::install_claw(&state, name).await?;
+    let status = if outcome.is_already_installing() {
+        StatusCode::CONFLICT
+    } else {
+        StatusCode::OK
     };
-
-    // 2. Single installability gate — see handle_install_claw for context.
-    //    `ManifestEntry::installability()` is the one and only predicate.
-    if let core_rs::manifest::ClawInstallability::Unavailable { code, message } =
-        entry.installability()
-    {
-        return Err(ApiError::bad_request_with_reasons(
-            format!("claw type '{name}' is not installable yet: {message}"),
-            json!({
-                "unavailable_reason_code": code,
-                "unavailable_reason": message,
-            }),
-        ));
-    }
-
-    // 3. Check current status
-    let current = state.claw_store.get_status(&name);
-    match current {
-        claw_rs::ClawStatus::Ready => {
-            return Err(ApiError::bad_request(format!(
-                "claw type '{name}' is already installed"
-            )));
-        }
-        claw_rs::ClawStatus::Installing => {
-            let existing_state = state.claw_store.get_state(&name);
-            let job_id = existing_state.and_then(|s| s.job_id).unwrap_or_default();
-            return Ok((
-                StatusCode::CONFLICT,
-                Json(ClawJobResponse::install_already_in_progress(job_id)),
-            )
-                .into_response());
-        }
-        _ => {}
-    }
-
-    // 5. Create job
-    let mut job = jobs_rs::Job::new(jobs_rs::JobType::InstallClaw, &name, "{}");
-    let job_id = job.id.clone();
-    let claw_name = name.clone();
-
-    let st = state.clone();
-    blocking(move || {
-        st.jobs
-            .create(&mut job)
-            .map_err(|e| ApiError::internal(format!("failed to create install job: {e}")))
-    })
-    .await??;
-
-    // 6. Mark installing
-    state
-        .claw_store
-        .mark_installing(&claw_name, &job_id)
-        .map_err(|e| ApiError::internal(format!("failed to mark installing: {e}")))?;
-
-    tracing::info!("[mobile] install queued: claw={claw_name} job={job_id}");
-
-    Ok((
-        StatusCode::OK,
-        Json(ClawJobResponse::install_queued(job_id, &claw_name)),
-    )
-        .into_response())
+    Ok((status, Json(outcome.into_job_response())).into_response())
 }
 
 /// POST /api/v1/mobile/claws/{name}/uninstall — trigger claw uninstall (admin-only).
@@ -1972,58 +1915,13 @@ pub async fn handle_mobile_uninstall_claw(
         _ => return Err(ApiError::forbidden("admin access required")),
     }
 
-    // 1. Must be in manifest
-    if !core_rs::manifest::is_known(&name) {
-        return Err(ApiError::not_found(format!("unknown claw type: {name}")));
-    }
-
-    // 2. Must be ready
-    if !state.claw_store.is_ready(&name) {
-        return Err(ApiError::bad_request(format!(
-            "claw type '{name}' is not installed"
-        )));
-    }
-
-    // 3. Block if instances still exist
-    let n = name.clone();
-    let st = state.clone();
-    let count = blocking(move || {
-        st.instance_db
-            .count_by_claw_type(&n)
-            .map_err(|e| ApiError::internal(format!("failed to count instances: {e}")))
-    })
-    .await??;
-
-    if count > 0 {
-        return Err(ApiError::bad_request(format!(
-            "cannot uninstall: {count} instance(s) of type '{name}' still exist — delete them first"
-        )));
-    }
-
-    // 4. Create job
-    let mut job = jobs_rs::Job::new(jobs_rs::JobType::UninstallClaw, &name, "{}");
-    let job_id = job.id.clone();
-    let claw_name = name.clone();
-
-    let st = state.clone();
-    blocking(move || {
-        st.jobs
-            .create(&mut job)
-            .map_err(|e| ApiError::internal(format!("failed to create uninstall job: {e}")))
-    })
-    .await??;
-
-    // 5. Mark uninstalling
-    state
-        .claw_store
-        .mark_uninstalling(&claw_name)
-        .map_err(|e| ApiError::internal(format!("failed to mark uninstalling: {e}")))?;
-
-    tracing::info!("[mobile] uninstall queued: claw={claw_name} job={job_id}");
-
     Ok((
         StatusCode::OK,
-        Json(ClawJobResponse::uninstall_queued(job_id, &claw_name)),
+        Json(
+            claw_store_service::uninstall_claw(&state, name)
+                .await?
+                .into_job_response(),
+        ),
     )
         .into_response())
 }
