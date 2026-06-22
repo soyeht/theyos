@@ -12,8 +12,8 @@ use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD as B64URL};
 use claw_rs::{ClawCatalogResponse, ClawStatus};
 use core_rs::{
     availability::{
-        ClawAvailability, Degradation, HostProjection, InstallProjection, OverallState,
-        UnavailReason,
+        ClawAvailability, Degradation, HostProjection, InstallProjection, InstallStatus,
+        OverallState, UnavailReason,
     },
     env::set_test_env,
     error::ApiError,
@@ -263,6 +263,10 @@ fn household_fixture() -> HouseholdFixture {
 
     let app = Router::new()
         .route(
+            "/api/v1/household/claws",
+            get(handlers_household_claws::handle_household_list_claws),
+        )
+        .route(
             "/api/v1/household/claws/{name}/availability",
             get(handlers_household_claws::handle_household_claw_availability),
         )
@@ -380,6 +384,56 @@ fn claw_list_item<'a>(body: &'a Value, name: &str) -> &'a Value {
         .iter()
         .find(|item| item["name"] == name)
         .unwrap_or_else(|| panic!("missing claw list item {name}"))
+}
+
+fn ready_picoclaw_availability(installed_at: &str) -> ClawAvailability {
+    ClawAvailability {
+        name: "picoclaw".to_string(),
+        install: InstallProjection {
+            status: InstallStatus::Succeeded,
+            progress: None,
+            installed_at: Some(installed_at.to_string()),
+            error: None,
+            job_id: None,
+        },
+        host: HostProjection {
+            cold_path_ready: true,
+            has_golden: false,
+            has_base_rootfs: true,
+            maintenance_blocked: false,
+            maintenance_retry_after_secs: None,
+        },
+        overall: OverallState::Creatable,
+        reasons: Vec::new(),
+        degradations: Vec::new(),
+    }
+}
+
+fn assert_picoclaw_ready_availability(item: &Value) -> &Value {
+    let availability = item
+        .get("availability")
+        .unwrap_or_else(|| panic!("{} must include availability", item["name"]));
+    assert_eq!(availability["name"], "picoclaw");
+    assert_eq!(availability["install"]["status"], "succeeded");
+    assert_eq!(availability["install"]["progress"], Value::Null);
+    assert!(
+        availability["install"]["installed_at"].as_str().is_some(),
+        "ready availability must include installed_at"
+    );
+    assert_eq!(availability["install"]["error"], Value::Null);
+    assert_eq!(availability["install"]["job_id"], Value::Null);
+    assert_eq!(availability["host"]["cold_path_ready"], true);
+    assert_eq!(availability["host"]["has_golden"], false);
+    assert_eq!(availability["host"]["has_base_rootfs"], true);
+    assert_eq!(availability["host"]["maintenance_blocked"], false);
+    assert_eq!(
+        availability["host"]["maintenance_retry_after_secs"],
+        Value::Null
+    );
+    assert_eq!(availability["overall"]["state"], "creatable");
+    assert_eq!(availability["reasons"], json!([]));
+    assert_eq!(availability["degradations"], json!([]));
+    availability
 }
 
 fn assert_queued_job_schema(status: StatusCode, body: &Value, fixture_id: &str) {
@@ -500,7 +554,7 @@ fn typed_response_serializers_match_claw_store_v1_fixtures() {
             unavailable_reason_code: None,
             unavailable_reason: None,
         },
-        availability: None,
+        availability: Some(ready_picoclaw_availability("2026-06-20T00:00:00Z")),
     };
     let item_json = serde_json::to_value(&list_item).expect("serialize list item");
     assert_eq!(&item_json, fixture("list_item_ready"));
@@ -528,6 +582,43 @@ fn typed_response_serializers_match_claw_store_v1_fixtures() {
     })
     .expect("serialize action");
     assert_eq!(&action_json, fixture("already_installing_job_body"));
+}
+
+#[test]
+fn claw_list_item_omits_missing_availability_for_optional_dto_path() {
+    let list_item = ClawListItemResponse {
+        catalog: ClawCatalogResponse {
+            name: "picoclaw".to_string(),
+            description: "Tiny test claw".to_string(),
+            language: "rust".to_string(),
+            buildable: true,
+            version: "1.0.0".to_string(),
+            binary_size_mb: 10,
+            min_ram_mb: 512,
+            license: "MIT".to_string(),
+            distribution: "prebuilt".to_string(),
+            status: ClawStatus::Ready,
+            installed_at: None,
+            job_id: None,
+            error: None,
+            verify_status: None,
+            verify_error: None,
+            tier: "supported".to_string(),
+            stars: 0,
+            source: String::new(),
+            last_updated: String::new(),
+            reviewed_upstream_commit: String::new(),
+            latest_upstream_commit: String::new(),
+            install_plan_source: "builtin".to_string(),
+            installable: true,
+            unavailable_reason_code: None,
+            unavailable_reason: None,
+        },
+        availability: None,
+    };
+
+    let value = serde_json::to_value(&list_item).expect("serialize list item");
+    assert_eq!(value.get("availability"), None);
 }
 
 #[test]
@@ -618,6 +709,10 @@ async fn auth_and_admin_required_errors_match_declared_claw_store_v1_fixtures() 
 #[tokio::test]
 async fn admin_and_mobile_lists_share_typed_shape_while_mobile_tier_filter_stays_active() {
     let state = shared_state();
+    state
+        .claw_store
+        .mark_ready("picoclaw")
+        .expect("mark picoclaw ready");
     let token = admin_mobile_token(&state);
 
     let (status, _bytes, admin_body) = request(
@@ -646,9 +741,9 @@ async fn admin_and_mobile_lists_share_typed_shape_while_mobile_tier_filter_stays
     let mobile_picoclaw = claw_list_item(&mobile_body, "picoclaw");
     assert_eq!(mobile_picoclaw, admin_picoclaw);
     assert_eq!(mobile_picoclaw["tier"], "supported");
-    assert!(
-        mobile_picoclaw.get("availability").is_some(),
-        "typed list item must keep the availability projection"
+    assert_eq!(
+        assert_picoclaw_ready_availability(mobile_picoclaw),
+        assert_picoclaw_ready_availability(admin_picoclaw)
     );
 
     let (status, _bytes, supported_body) = request(
@@ -690,6 +785,45 @@ async fn admin_and_mobile_lists_share_typed_shape_while_mobile_tier_filter_stays
         "mobile tier=catalog must keep filtering active"
     );
     let _ = claw_list_item(&catalog_body, "claude-claw");
+}
+
+#[tokio::test]
+async fn household_list_matches_admin_availability_after_pop_authorization() {
+    let household = household_fixture();
+    household
+        .shared
+        .claw_store
+        .mark_ready("picoclaw")
+        .expect("mark picoclaw ready");
+
+    let (admin_status, _admin_bytes, admin_body) = request(
+        admin_router(Arc::clone(&household.shared)),
+        Method::GET,
+        "/api/v1/claws",
+        Vec::new(),
+        None,
+    )
+    .await;
+    assert_eq!(admin_status, StatusCode::OK);
+    assert_list_envelope(&admin_body);
+
+    let (status, _bytes, household_body) = household_request(
+        household.app.clone(),
+        &household.person,
+        Method::GET,
+        "/api/v1/household/claws",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_list_envelope(&household_body);
+
+    let admin_picoclaw = claw_list_item(&admin_body, "picoclaw");
+    let household_picoclaw = claw_list_item(&household_body, "picoclaw");
+    assert_eq!(household_picoclaw, admin_picoclaw);
+    assert_eq!(
+        assert_picoclaw_ready_availability(household_picoclaw),
+        assert_picoclaw_ready_availability(admin_picoclaw)
+    );
 }
 
 #[tokio::test]
@@ -1177,19 +1311,45 @@ async fn install_unavailable_errors_match_declared_claw_store_v1_fixture() {
 #[tokio::test]
 async fn household_pop_auth_failure_is_empty_401() {
     let household = household_fixture();
+    for (method, path) in [
+        (Method::GET, "/api/v1/household/claws"),
+        (Method::POST, "/api/v1/household/claws/picoclaw/install"),
+    ] {
+        let response = household
+            .app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(method)
+                    .uri(path)
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        let (status, bytes, body) = response_parts(response).await;
+
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert!(
+            bytes.is_empty(),
+            "household auth failure body must stay empty"
+        );
+        assert_eq!(body, Value::Null);
+    }
+
     let response = household
         .app
         .oneshot(
             Request::builder()
-                .method(Method::POST)
-                .uri("/api/v1/household/claws/picoclaw/install")
+                .method(Method::GET)
+                .uri("/api/v1/household/claws")
+                .header(header::AUTHORIZATION, "PoP bad")
                 .body(Body::empty())
                 .expect("request"),
         )
         .await
         .expect("response");
     let (status, bytes, body) = response_parts(response).await;
-
     assert_eq!(status, StatusCode::UNAUTHORIZED);
     assert!(
         bytes.is_empty(),
