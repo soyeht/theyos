@@ -147,18 +147,17 @@ check_firewall() {
     if [ "$ufw_active" = "1" ] || [ "$firewalld_active" = "1" ]; then
         printf '\n'
         printf '⚠️  Firewall detectado.\n'
-        printf '   Soyeht escuta nas portas %s (household) e 8892 (admin).\n' "$HOUSEHOLD_PORT"
+        printf '   Soyeht escuta no household em endereços concretos na porta %s.\n' "$HOUSEHOLD_PORT"
+        printf '   O admin HTTP fica em loopback por padrão (127.0.0.1:8892).\n'
         printf '   Como sua casa é descoberta via Tailscale (tailscale0),\n'
         printf '   você NÃO precisa abrir as portas para a internet pública.\n'
-        printf '   Se quiser permitir descoberta também na rede local (não recomendado\n'
-        printf '   para servidor exposto), rode:\n'
+        printf '   Se quiser permitir descoberta household também na rede local (não recomendado\n'
+        printf '   para servidor exposto), libere somente a porta household:\n'
         if [ "$ufw_active" = "1" ]; then
             printf '     sudo ufw allow %s/tcp\n' "$HOUSEHOLD_PORT"
-            printf '     sudo ufw allow 8892/tcp\n'
         fi
         if [ "$firewalld_active" = "1" ]; then
             printf '     sudo firewall-cmd --permanent --add-port=%s/tcp\n' "$HOUSEHOLD_PORT"
-            printf '     sudo firewall-cmd --permanent --add-port=8892/tcp\n'
             printf '     sudo firewall-cmd --reload\n'
         fi
         printf '\n'
@@ -183,7 +182,7 @@ Environment=THEYOS_DIR=$SOYEHT_INSTALL_DIR
 Environment=THEYOS_HOME=$SOYEHT_INSTALL_DIR
 Environment=THEYOS_STATE_DIR=$SOYEHT_INSTALL_DIR/state
 Environment=ADMIN_PORT=8892
-Environment=ADDR=0.0.0.0:8892
+Environment=ADDR=127.0.0.1:8892
 Environment=THEYOS_SQLITE_DB=$SOYEHT_INSTALL_DIR/theyos.db
 Environment=THEYOS_SESSION_DB=$SOYEHT_INSTALL_DIR/theyos.sessions.db
 Environment=THEYOS_JOBS_DB=$SOYEHT_INSTALL_DIR/jobs-rs.db

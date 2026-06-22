@@ -18,7 +18,7 @@ Local stack (fast + secure):
 ```bash
 cd rust
 cargo build -p server-rs
-WEB_DIR=../web ADDR=:8892 ./target/debug/server
+WEB_DIR=../web ADDR=127.0.0.1:8892 ./target/debug/server
 ```
 
 Backend runs on `http://localhost:8892`.
