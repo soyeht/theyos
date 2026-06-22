@@ -3,6 +3,7 @@
 use serde_json::json;
 
 use core_rs::ipc::client::IpcError;
+use core_rs::ipc::protocol::VmRunnerOp;
 
 use crate::{
     ExecuteFlowRequest, ExecuteFlowResult, Executor, FlowStatus,
@@ -24,7 +25,7 @@ pub(crate) fn execute_stop(exec: &Executor, req: &ExecuteFlowRequest) -> Execute
                     "stop_vm" => {
                         let container = step.params.get("container").map_or("", String::as_str);
                         match exec.vmrunner.call(
-                            "Stop",
+                            VmRunnerOp::Stop.as_str(),
                             json!({
                                 "container": container,
                                 "state_dir": exec.config.firecracker_state_dir,

@@ -1,5 +1,6 @@
 //! Restart instance flow implementation.
 
+use core_rs::ipc::protocol::VmRunnerOp;
 use serde_json::json;
 
 use crate::{
@@ -22,7 +23,7 @@ pub(crate) fn execute_restart(exec: &Executor, req: &ExecuteFlowRequest) -> Exec
                     "restart_vm" => {
                         let container = step.params.get("container").map_or("", String::as_str);
                         if let Err(e) = exec.vmrunner.call(
-                            "Restart",
+                            VmRunnerOp::Restart.as_str(),
                             json!({
                                 "container": container,
                                 "state_dir": exec.config.firecracker_state_dir,
