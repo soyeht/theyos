@@ -3,7 +3,7 @@ mod orchestrator;
 mod shutdown;
 pub use core_rs::ipc::client::IpcClient;
 pub use shutdown::{GRACEFUL_SHUTDOWN_TIMEOUT, ShutdownResult, graceful_shutdown_all};
-pub use vmrunner_common_rs::VmCreatePhaseTiming as PhaseTiming;
+pub use vmrunner_common_rs::{VmCreatePhaseTiming as PhaseTiming, VmCreateTimingWire};
 
 use core_rs::error::{AppError, ErrorCode};
 use core_rs::ipc::client::IpcError;
@@ -181,18 +181,10 @@ pub struct ExecuteFlowResult {
     pub error_context: Option<serde_json::Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub host_port: Option<i64>,
-    /// Timing phases from VM creation (only populated for create flows)
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub phases: Option<Vec<PhaseTiming>>,
-    /// Total time in milliseconds (only populated for create flows)
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub total_ms: Option<u64>,
-    /// Whether golden image was used (only populated for create flows)
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub golden_image_used: Option<bool>,
-    /// Whether install was skipped (binary already present in golden image)
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub install_skipped: Option<bool>,
+    /// VM Create timing fields, flattened to preserve the existing top-level
+    /// `phases` / `total_ms` / `golden_image_used` / `install_skipped` JSON.
+    #[serde(default, flatten)]
+    pub create_timing: VmCreateTimingWire,
 }
 
 impl ExecuteFlowResult {

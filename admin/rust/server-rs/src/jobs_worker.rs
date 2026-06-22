@@ -13,6 +13,7 @@ use std::time::Duration;
 use store_rs::{InstanceStatus, StatusUpdate};
 use tokio::time::sleep;
 use tracing::{error, info, warn};
+use vmrunner_common_rs::VmCreateTimingWire;
 
 const MAX_PORT_RETRIES: i32 = 3;
 const POLL_INTERVAL: Duration = Duration::from_secs(2);
@@ -145,18 +146,7 @@ async fn process_one_job(state: &SharedState) -> Result<(), String> {
                         error!("[jobs-worker] job={} failed: {}", job_id, msg);
                         mark_failed(state, &job_id, &instance_id, &msg, result.error_context).await;
                     } else {
-                        // Extract timing info for create jobs
-                        let result_json = if result.phases.is_some() {
-                            serde_json::json!({
-                                "phases": result.phases,
-                                "total_ms": result.total_ms,
-                                "golden_image_used": result.golden_image_used,
-                                "install_skipped": result.install_skipped,
-                            })
-                            .to_string()
-                        } else {
-                            "{}".to_string()
-                        };
+                        let result_json = create_timing_result_json(&result.create_timing);
 
                         info!("[jobs-worker] job={} completed", job_id);
                         mark_completed(state, &job_id, &instance_id, &result_json).await;
@@ -362,6 +352,14 @@ async fn mark_failed(
     }
 }
 
+fn create_timing_result_json(timing: &VmCreateTimingWire) -> String {
+    if timing.phases.is_none() {
+        return "{}".to_string();
+    }
+
+    serde_json::to_string(timing).unwrap_or_else(|_| "{}".to_string())
+}
+
 async fn mark_completed(state: &SharedState, job_id: &str, instance_id: &str, result: &str) {
     let st = state.clone();
     let jid = job_id.to_string();
@@ -425,5 +423,52 @@ async fn mark_completed(state: &SharedState, job_id: &str, instance_id: &str, re
         warn!(
             "[jobs-worker] failed to ensure public site forwards for instance={instance_id}: {e}"
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use vmrunner_common_rs::VmCreatePhaseTiming;
+
+    #[test]
+    fn create_timing_result_json_preserves_current_shape() {
+        let timing = VmCreateTimingWire {
+            golden_image_used: Some(true),
+            install_skipped: Some(false),
+            phases: Some(vec![VmCreatePhaseTiming {
+                phase: "pool_install_claw".to_string(),
+                ms: 42,
+            }]),
+            total_ms: Some(100),
+        };
+
+        let value: serde_json::Value =
+            serde_json::from_str(&create_timing_result_json(&timing)).unwrap();
+
+        assert_eq!(
+            value,
+            serde_json::json!({
+                "golden_image_used": true,
+                "install_skipped": false,
+                "phases": [
+                    {
+                        "phase": "pool_install_claw",
+                        "ms": 42
+                    }
+                ],
+                "total_ms": 100
+            })
+        );
+    }
+
+    #[test]
+    fn create_timing_result_json_preserves_no_timing_gate() {
+        let timing = VmCreateTimingWire {
+            total_ms: Some(100),
+            ..Default::default()
+        };
+
+        assert_eq!(create_timing_result_json(&timing), "{}");
     }
 }
