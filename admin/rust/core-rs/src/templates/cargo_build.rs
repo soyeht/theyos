@@ -6,9 +6,8 @@
 //! Steps:
 //! 1. `install_deps` — apt-get `build-essential`, `git`, `pkg-config`, `curl`,
 //!    `ca-certificates` (plus any extras from `config.system_deps`).
-//! 2. `install_rust` — install rustup + a stable toolchain, guarded by a
-//!    command-v check so re-runs are cheap.
-//! 3. `clone_repo` — `git clone --depth 1` (or pull if already present).
+//! 2. `install_rust` — verify the distro Rust toolchain from `install_deps`.
+//! 3. `clone_repo` — fetch the manifest-reviewed commit and verify HEAD.
 //! 4. `build_and_install` — `cargo install --path . --locked --force` inside
 //!    the clone; also copies the final binary to `/usr/local/bin/<name>` so
 //!    it's on every user's PATH regardless of `~/.cargo` location.
@@ -28,7 +27,8 @@ const DEFAULT_DEPS: &[&str] = &[
     "git",
     "pkg-config",
     "ca-certificates",
-    "curl",
+    "rustc",
+    "cargo",
 ];
 
 fn trailing_repo_name(full: &str) -> &str {
@@ -39,6 +39,7 @@ fn trailing_repo_name(full: &str) -> &str {
 #[must_use]
 pub fn render(config: &InstallConfig) -> Vec<StepSpec> {
     let repo = config.github_repo;
+    let git_ref = config.git_ref;
     let repo_tail = trailing_repo_name(repo);
     let bin = if config.binary_name.is_empty() {
         repo_tail
@@ -67,14 +68,12 @@ pub fn render(config: &InstallConfig) -> Vec<StepSpec> {
         steps.push(step);
     }
 
-    // 2. Install rustup + stable toolchain.
+    // 2. Verify rustc + cargo from distro packages. Do not run remote shell
+    // installers in release-gated template paths.
     steps.push(
         StepSpec::new(
             "install_rust",
-            "if ! command -v rustc >/dev/null 2>&1; then \
-               curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
-                 | sh -s -- -y --default-toolchain stable --profile minimal; \
-             fi",
+            "command -v rustc >/dev/null 2>&1 && command -v cargo >/dev/null 2>&1",
         )
         .with_check("command -v cargo >/dev/null 2>&1")
         .with_timeout(600)
@@ -83,12 +82,14 @@ pub fn render(config: &InstallConfig) -> Vec<StepSpec> {
 
     // 3. Clone.
     let clone_cmd = format!(
-        "if [ -d {clone_dir} ]; then \
-           cd {clone_dir} && git fetch origin && git reset --hard origin/HEAD || true; \
-         else \
-           mkdir -p /opt/claws && \
-           git clone --depth 1 https://github.com/{repo}.git {clone_dir}; \
-         fi"
+        "test -n '{git_ref}' && \
+         mkdir -p {clone_dir} && \
+         git -C {clone_dir} init && \
+         (git -C {clone_dir} remote remove origin >/dev/null 2>&1 || true) && \
+         git -C {clone_dir} remote add origin https://github.com/{repo}.git && \
+         git -C {clone_dir} fetch --depth 1 origin '{git_ref}' && \
+         git -C {clone_dir} checkout --detach FETCH_HEAD && \
+         test \"$(git -C {clone_dir} rev-parse HEAD)\" = \"{git_ref}\""
     );
     steps.push(
         StepSpec::new("clone_repo", clone_cmd)
@@ -152,9 +153,10 @@ mod tests {
     }
 
     #[test]
-    fn cargo_build_installs_default_toolchain() {
+    fn cargo_build_uses_distro_toolchain() {
         let cfg = InstallConfig {
             github_repo: "x/y",
+            git_ref: "0123456789abcdef0123456789abcdef01234567",
             binary_name: "y",
             ..Default::default()
         };
@@ -162,15 +164,17 @@ mod tests {
             .into_iter()
             .find(|s| s.phase == "install_rust")
             .unwrap();
-        assert!(step.command.contains("rustup.rs"));
-        assert!(step.command.contains("stable"));
-        assert!(step.command.contains("--profile minimal"));
+        assert!(step.command.contains("command -v rustc"));
+        assert!(step.command.contains("command -v cargo"));
+        assert!(!step.command.contains("rustup.rs"));
+        assert!(!step.command.contains("| sh"));
     }
 
     #[test]
     fn cargo_build_clone_uses_github_https_url() {
         let cfg = InstallConfig {
             github_repo: "org/crate",
+            git_ref: "0123456789abcdef0123456789abcdef01234567",
             binary_name: "crate",
             ..Default::default()
         };
@@ -178,12 +182,21 @@ mod tests {
         let clone = steps.iter().find(|s| s.phase == "clone_repo").unwrap();
         assert!(clone.command.contains("https://github.com/org/crate.git"));
         assert!(clone.command.contains("/opt/claws/crate"));
+        assert!(
+            clone
+                .command
+                .contains("0123456789abcdef0123456789abcdef01234567")
+        );
+        assert!(clone.command.contains("rev-parse HEAD"));
+        assert!(!clone.command.contains(&["git clone", " --depth"].concat()));
+        assert!(!clone.command.contains(&["origin", "/HEAD"].concat()));
     }
 
     #[test]
     fn cargo_build_step_uses_cargo_install_locked() {
         let cfg = InstallConfig {
             github_repo: "x/y",
+            git_ref: "0123456789abcdef0123456789abcdef01234567",
             binary_name: "y",
             ..Default::default()
         };
@@ -207,6 +220,7 @@ mod tests {
     fn cargo_build_merges_caller_deps_with_defaults() {
         let cfg = InstallConfig {
             github_repo: "x/y",
+            git_ref: "0123456789abcdef0123456789abcdef01234567",
             binary_name: "y",
             system_deps: &["libssl-dev", "git"], // git is also in defaults
             ..Default::default()

@@ -276,7 +276,7 @@ mod tests {
             base_rootfs_sha256: "b".repeat(64),
             installer_plan_sha256: "c".repeat(64),
             kernel_sha256: "d".repeat(64),
-            kernel_version: Some("vmlinux-6.1.155".into()),
+            kernel_version: Some(core_rs::guest_net::KERNEL_FILENAME.into()),
             firecracker_version: None,
             runtime_min_version: None,
         };

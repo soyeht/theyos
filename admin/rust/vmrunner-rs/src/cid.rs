@@ -45,7 +45,7 @@ impl Drop for PortReservation {
     }
 }
 
-/// Pick an available SSH port in the range 22000–23999 and atomically reserve it.
+/// Pick an available SSH port in the configured host range and atomically reserve it.
 ///
 /// Returns both the port number and a `PortReservation` guard. The caller
 /// **must keep the reservation alive** until either:
@@ -79,7 +79,7 @@ pub fn pick_ssh_port(state_dir: &Path) -> Result<(u16, PortReservation), VmError
     // (left behind by crashed processes).
     sweep_stale_port_locks(state_dir, &locks_dir, &used_ports);
 
-    for port in 22000u16..=23999 {
+    for port in core_rs::guest_net::ssh_host_port_range() {
         if used_ports.contains(&port) {
             continue;
         }
