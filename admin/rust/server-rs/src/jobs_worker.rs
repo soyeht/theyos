@@ -7,6 +7,7 @@
 
 use crate::state::SharedState;
 use core_rs::error::MutexExt;
+use core_rs::ipc::wire::error_context_result_string;
 use executor_rs::{ExecuteFlowRequest, FlowStatus, FlowType};
 use jobs_rs::JobType;
 use std::time::Duration;
@@ -296,7 +297,7 @@ async fn mark_failed(
     let m = msg.to_string();
     // Serialize error_context into the result field so the API can return it.
     let ctx_json = error_context
-        .map(|ctx| serde_json::json!({ "error_context": ctx }).to_string())
+        .map(error_context_result_string)
         .unwrap_or_default();
     if let Err(e) = tokio::task::spawn_blocking(move || {
         let mut record_create_failed = false;
@@ -470,5 +471,23 @@ mod tests {
         };
 
         assert_eq!(create_timing_result_json(&timing), "{}");
+    }
+
+    #[test]
+    fn error_context_result_json_preserves_failed_job_shape() {
+        let value: serde_json::Value =
+            serde_json::from_str(&error_context_result_string(serde_json::json!({
+                "phase": "vm_boot",
+            })))
+            .unwrap();
+
+        assert_eq!(
+            value,
+            serde_json::json!({
+                "error_context": {
+                    "phase": "vm_boot"
+                }
+            })
+        );
     }
 }

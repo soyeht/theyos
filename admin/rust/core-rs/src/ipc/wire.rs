@@ -3,8 +3,14 @@
 //! Protocol: one JSON object per line on stdin, one JSON response per line on stdout.
 
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{Map, Value};
 use std::io::Write;
+
+/// JSON field that carries structured diagnostic context on IPC errors.
+pub const ERROR_CONTEXT_FIELD: &str = "error_context";
+
+/// JSON field inside [`ERROR_CONTEXT_FIELD`] for machine-readable numeric codes.
+pub const ERROR_CODE_FIELD: &str = "code";
 
 /// Incoming JSON-RPC request.
 #[derive(Debug, Deserialize)]
@@ -77,8 +83,30 @@ impl Response {
     /// The code is encoded in `error_context.code` so callers can dispatch
     /// on specific error conditions (e.g. `MACOS_VM_LIMIT_REACHED = 2001`).
     pub fn err_code(code: u32, msg: impl std::fmt::Display) -> Self {
-        Self::err_with_context(msg, serde_json::json!({ "code": code }))
+        Self::err_with_context(msg, error_code_context(code))
     }
+}
+
+/// Build the structured IPC error context for a numeric machine-readable code.
+#[must_use]
+pub fn error_code_context(code: u32) -> Value {
+    let mut context = Map::new();
+    context.insert(ERROR_CODE_FIELD.to_string(), Value::from(code));
+    Value::Object(context)
+}
+
+/// Wrap an IPC error context under the canonical `error_context` field.
+#[must_use]
+pub fn error_context_result(context: Value) -> Value {
+    let mut result = Map::new();
+    result.insert(ERROR_CONTEXT_FIELD.to_string(), context);
+    Value::Object(result)
+}
+
+/// Serialize an IPC error context result wrapper for storage in job results.
+#[must_use]
+pub fn error_context_result_string(context: Value) -> String {
+    serde_json::to_string(&error_context_result(context)).unwrap_or_default()
 }
 
 /// Write a response as a single JSON line to the output.
@@ -90,4 +118,38 @@ pub fn write_response(out: &mut impl Write, resp: &Response) -> std::io::Result<
     serde_json::to_writer(&mut *out, resp)?;
     out.write_all(b"\n")?;
     out.flush()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn err_code_preserves_current_context_shape() {
+        let response = serde_json::to_value(Response::err_code(2001, "limit")).unwrap();
+
+        assert_eq!(
+            response,
+            json!({
+                "ok": false,
+                "error": "limit",
+                "error_context": {
+                    "code": 2001
+                }
+            })
+        );
+    }
+
+    #[test]
+    fn error_context_result_preserves_job_result_shape() {
+        assert_eq!(
+            error_context_result(json!({"phase": "vm_boot"})),
+            json!({
+                "error_context": {
+                    "phase": "vm_boot"
+                }
+            })
+        );
+    }
 }

@@ -64,6 +64,7 @@ use tower_http::{
 };
 use tracing::info;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
+use vmrunner_common_rs::VmCreateResourceSpec;
 use vmrunner_rs::VmRunner;
 
 /// Set `Cache-Control` headers for static assets and SPA HTML responses.
@@ -392,6 +393,7 @@ async fn main() {
     let previously_active: Vec<(String, String, i64, i64)> = {
         let st = Arc::clone(&state);
         tokio::task::spawn_blocking(move || {
+            let create_defaults = VmCreateResourceSpec::default().resolve();
             match st.instance_db.list() {
                 Ok(rows) => {
                     let active: Vec<(String, String, i64, i64)> = rows
@@ -402,8 +404,8 @@ async fn main() {
                             (
                                 r.id,
                                 r.container,
-                                r.cpu_cores.unwrap_or(2),
-                                r.ram_config_mb.unwrap_or(2048),
+                                r.cpu_cores.unwrap_or(i64::from(create_defaults.cpu_cores)),
+                                r.ram_config_mb.unwrap_or(i64::from(create_defaults.ram_mb)),
                             )
                         })
                         .collect();

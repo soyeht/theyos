@@ -72,7 +72,9 @@ use crate::network::{
     slirp_remove_hostfwd_verified, slirp_wait_ready, which_systemctl,
 };
 use crate::ssh_client::{SshActions, SshSession};
-use vmrunner_common_rs::VmCreateResourceSpec;
+use vmrunner_common_rs::{
+    DEFAULT_CREATE_CPU_CORES, DEFAULT_CREATE_DISK_GB, DEFAULT_CREATE_RAM_MB, VmCreateResourceSpec,
+};
 
 // ── Constants ──────────────────────────────────────────────────────────────
 
@@ -674,7 +676,14 @@ impl VmRunner {
         // restore. This preserves the instance's modified rootfs. Snapshot restore
         // would load the seed's kernel memory (stale dentry/inode cache) over the
         // instance's modified disk, causing ext4 corruption.
-        self.start_vm(&mut inst, false, true, 2, 2048).await?;
+        self.start_vm(
+            &mut inst,
+            false,
+            true,
+            DEFAULT_CREATE_CPU_CORES,
+            DEFAULT_CREATE_RAM_MB,
+        )
+        .await?;
 
         let ssh =
             SshSession::wait_for_ssh(inst.ssh_port, &self.env.ssh_key, self.env.ssh_wait_tries)
@@ -722,7 +731,14 @@ impl VmRunner {
 
         // Fresh rootfs was just copied — snapshot restore is safe here because
         // the disk matches the seed's state that mem.snapshot was taken from.
-        self.start_vm(&mut inst, false, false, 2, 2048).await?;
+        self.start_vm(
+            &mut inst,
+            false,
+            false,
+            DEFAULT_CREATE_CPU_CORES,
+            DEFAULT_CREATE_RAM_MB,
+        )
+        .await?;
 
         let ssh =
             SshSession::wait_for_ssh(inst.ssh_port, &self.env.ssh_key, self.env.ssh_wait_tries)
@@ -2025,7 +2041,7 @@ wait $!
 
         // Prepare rootfs (copy golden image; skip debugfs if pubkey is pre-baked)
         let t_rootfs = std::time::Instant::now();
-        self.prepare_rootfs(&inst, 10)?;
+        self.prepare_rootfs(&inst, DEFAULT_CREATE_DISK_GB)?;
         tracing::info!(
             "[vmrunner-pool] prepare_rootfs done in {}ms",
             t_rootfs.elapsed().as_millis()
@@ -2045,7 +2061,14 @@ wait $!
         // Start VM without port forwards — the FC process runs, VM is booted/restored,
         // but no slirp hostfwds are added yet. Ports are added at claim time.
         let t_start = std::time::Instant::now();
-        self.start_vm(&mut inst, true, false, 2, 2048).await?;
+        self.start_vm(
+            &mut inst,
+            true,
+            false,
+            DEFAULT_CREATE_CPU_CORES,
+            DEFAULT_CREATE_RAM_MB,
+        )
+        .await?;
         tracing::info!(
             "[vmrunner-pool] start_vm(pool_mode) done in {}ms",
             t_start.elapsed().as_millis()
@@ -3225,7 +3248,9 @@ mod tests {
             customer_dir: String::new(),
         };
 
-        let used_golden = runner.prepare_rootfs(&inst, 10).unwrap();
+        let used_golden = runner
+            .prepare_rootfs(&inst, DEFAULT_CREATE_DISK_GB)
+            .unwrap();
         assert!(used_golden, "legacy golden should be used");
         assert!(instance_dir.is_dir(), "instance dir should be created");
         assert!(inst.rootfs_path.is_file(), "rootfs should be copied");

@@ -29,6 +29,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use store_rs::{InstanceStatus, NewInstance, StatusUpdate, normalize_slug};
 use tracing::{info, warn};
+use vmrunner_common_rs::VmCreateResourceSpec;
 
 const MAX_NAME_LEN: usize = 64;
 const MAX_CLAW_TYPE_LEN: usize = 32;
@@ -202,13 +203,13 @@ pub struct CreateInstanceReq {
     /// (macOS host → macOS guest, Linux host → Linux guest).
     #[serde(default)]
     guest_os: String,
-    /// CPU cores (1-4). Default: 2.
+    /// CPU cores (1-4). Defaults to the shared vmrunner Create default.
     #[serde(default)]
     cpu_cores: Option<u32>,
-    /// RAM in MB (512-8192). Default: 2048.
+    /// RAM in MB (512-8192). Defaults to the shared vmrunner Create default.
     #[serde(default)]
     ram_mb: Option<u32>,
-    /// Disk size in GB (5-50). Default: 10.
+    /// Disk size in GB (5-50). Defaults to the shared vmrunner Create default.
     #[serde(default)]
     disk_gb: Option<u32>,
     /// User to assign this instance to. Admin-only.
@@ -355,9 +356,11 @@ pub async fn handle_create_instance_body(
     // Validate resource configuration — only enforce physical minimums.
     // Maximum limits are enforced dynamically by check_capacity() based on real
     // host resources and current allocation (no hardcoded caps).
-    let cpu_cores = req.cpu_cores.unwrap_or(2);
-    let ram_mb = req.ram_mb.unwrap_or(2048);
-    let disk_gb = req.disk_gb.unwrap_or(10);
+    let resources =
+        VmCreateResourceSpec::from_options(req.cpu_cores, req.ram_mb, req.disk_gb).resolve();
+    let cpu_cores = resources.cpu_cores;
+    let ram_mb = resources.ram_mb;
+    let disk_gb = resources.disk_gb;
 
     if cpu_cores < 1 {
         return Err(ApiError::bad_request("cpu_cores must be at least 1"));
@@ -817,8 +820,15 @@ pub(crate) async fn restart_instance_for_row(
     id: &str,
     row: store_rs::InstanceRow,
 ) -> Result<StatusCode, ApiError> {
-    let cpu = u32::try_from(row.cpu_cores.unwrap_or(2)).unwrap_or(2);
-    let ram = u32::try_from(row.ram_config_mb.unwrap_or(2048)).unwrap_or(2048);
+    let create_defaults = VmCreateResourceSpec::default().resolve();
+    let cpu = row
+        .cpu_cores
+        .and_then(|v| u32::try_from(v).ok())
+        .unwrap_or(create_defaults.cpu_cores);
+    let ram = row
+        .ram_config_mb
+        .and_then(|v| u32::try_from(v).ok())
+        .unwrap_or(create_defaults.ram_mb);
     let guest_os = row.guest_os.clone();
     let claw_type = row.claw_type.clone();
     let mut acquired_runtime_lease = false;
