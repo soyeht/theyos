@@ -65,6 +65,7 @@ function makeClaw(overrides: Partial<ClawCatalogEntry> = {}): ClawCatalogEntry {
     min_ram_mb: 512,
     license: "MIT",
     status: "ready",
+    installable: true,
     ...overrides,
   };
 }
