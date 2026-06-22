@@ -3,7 +3,7 @@
 use serde_json::json;
 
 use crate::{
-    ExecuteFlowRequest, ExecuteFlowResult, Executor, ExecutorError, FlowStatus, PhaseTiming,
+    ExecuteFlowRequest, ExecuteFlowResult, Executor, ExecutorError, FlowStatus,
     orchestrator::{CreateInstanceFlowRequest, run_create_instance_flow, validate_create_request},
 };
 use core_rs::error::AppError;
@@ -178,10 +178,7 @@ fn execute_create_steps(
     _exclude_ports: &[i64],
 ) -> ExecuteFlowResult {
     let mut host_port: i64 = 0;
-    let mut timing_phases: Option<Vec<PhaseTiming>> = None;
-    let mut timing_total_ms: Option<u64> = None;
-    let mut timing_golden_image_used: Option<bool> = None;
-    let mut timing_install_skipped: Option<bool> = None;
+    let mut create_timing = VmCreateTimingWire::default();
 
     for step in steps {
         let op = step["op"].as_str().unwrap_or("");
@@ -360,10 +357,7 @@ fn execute_create_steps(
 
                 let timing = serde_json::from_value::<VmCreateTimingWire>(vm_response.clone())
                     .unwrap_or_default();
-                timing_phases = timing.phases;
-                timing_total_ms = timing.total_ms;
-                timing_golden_image_used = timing.golden_image_used;
-                timing_install_skipped = timing.install_skipped;
+                create_timing = timing;
             }
 
             "set_active" => {
@@ -422,10 +416,7 @@ fn execute_create_steps(
     ExecuteFlowResult {
         status: FlowStatus::Completed,
         host_port: Some(host_port),
-        phases: timing_phases,
-        total_ms: timing_total_ms,
-        golden_image_used: timing_golden_image_used,
-        install_skipped: timing_install_skipped,
+        create_timing,
         ..Default::default()
     }
 }
