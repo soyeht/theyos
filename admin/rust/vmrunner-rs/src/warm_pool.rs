@@ -286,7 +286,7 @@ mod tests {
                 customer: container.clone(),
                 claw_type: claw_type.to_string(),
                 host_port: 0,
-                ssh_port: 22000,
+                ssh_port: core_rs::guest_net::SSH_HOST_PORT_RANGE_START,
                 firecracker_pid: Some(99999),
                 slirp_pid: Some(99998),
                 instance_dir: PathBuf::from("/tmp/fake"),
@@ -317,7 +317,10 @@ mod tests {
         let taken = pool.take("picoclaw").expect("should return stored entry");
         assert_eq!(taken.claw_type, "picoclaw");
         assert_eq!(taken.container, "_warm-picoclaw-0");
-        assert_eq!(taken.inst.ssh_port, 22000);
+        assert_eq!(
+            taken.inst.ssh_port,
+            core_rs::guest_net::SSH_HOST_PORT_RANGE_START
+        );
     }
 
     #[test]
