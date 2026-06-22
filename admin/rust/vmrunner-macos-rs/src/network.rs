@@ -3,6 +3,7 @@
 //! Provides NAT networking setup and port forwarding for `VZVirtualMachine`.
 
 use serde::{Deserialize, Serialize};
+use vmrunner_common_rs::PUBLIC_APP_HOST_PORT_RANGE;
 
 /// Network configuration for a VM.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -121,13 +122,11 @@ impl PortProtocol {
 ///
 /// Returns an error if the port is outside the allowed range.
 pub fn validate_port_range(port: u16) -> Result<(), crate::VZError> {
-    if core_rs::guest_net::host_app_port_range().contains(&port) {
+    if PUBLIC_APP_HOST_PORT_RANGE.contains(port) {
         Ok(())
     } else {
         Err(crate::VZError::InvalidConfig(format!(
-            "Port {port} out of range (must be {}-{})",
-            core_rs::guest_net::HOST_APP_PORT_RANGE_START,
-            core_rs::guest_net::HOST_APP_PORT_RANGE_END
+            "Port {port} out of range (must be {PUBLIC_APP_HOST_PORT_RANGE})"
         )))
     }
 }
