@@ -1,8 +1,8 @@
 name: Cross-Repo Contract Sync
 
 # Constitution V enforcement: contract markdown files shared between theyos
-# and iSoyehtTerm must not drift silently. This workflow detects drift by
-# scanning iSoyehtTerm contract mirrors and diffing them against the CURRENT
+# and soyeht-ios must not drift silently. This workflow detects drift by
+# scanning soyeht-ios contract mirrors and diffing them against the CURRENT
 # theyos@HEAD source-of-truth (not the pinned hash in the mirror header).
 # The pinned hash is preserved as audit metadata (when the mirror was last
 # synced), but the enforced invariant is: mirror == theyos@HEAD.
@@ -25,7 +25,7 @@ on:
 
 jobs:
   contracts-sync-check:
-    name: Contract drift detection (theyos ↔ iSoyehtTerm)
+    name: Contract drift detection (theyos ↔ soyeht-ios)
     runs-on: ubuntu-latest
     timeout-minutes: 10
 
@@ -35,12 +35,12 @@ jobs:
         with:
           path: theyos
 
-      # Checkout iSoyehtTerm (public read — uses GITHUB_TOKEN for API rate limits).
-      - name: Checkout iSoyehtTerm
+      # Checkout soyeht-ios (public read — uses GITHUB_TOKEN for API rate limits).
+      - name: Checkout soyeht-ios
         uses: actions/checkout@v5
         with:
-          repository: soyeht/iSoyehtTerm
-          path: iSoyehtTerm
+          repository: soyeht/soyeht-ios
+          path: soyeht-ios
           token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Scan and diff contract mirrors
@@ -49,14 +49,14 @@ jobs:
           set -euo pipefail
 
           CONTRACTS_DIR="theyos/specs/005-soyeht-onboarding/contracts"
-          ISOYEHTTERM_DIR="iSoyehtTerm"
+          SOYEHT_IOS_DIR="soyeht-ios"
           DRIFT=0
           MIRRORS_FOUND=0
 
           # Pattern: <!-- mirror of theyos:005/contracts/<file>.md as of <hash> -->
           MIRROR_PATTERN='<!-- mirror of theyos:005/contracts/([^.]+\.md) as of ([0-9a-f]{7,40}) -->'
 
-          # Walk all markdown files in iSoyehtTerm looking for mirror headers.
+          # Walk all markdown files in soyeht-ios looking for mirror headers.
           while IFS= read -r -d '' mirror_file; do
             if grep -qP "$MIRROR_PATTERN" "$mirror_file" 2>/dev/null; then
               while IFS= read -r match_line; do
@@ -84,7 +84,7 @@ jobs:
                   if ! diff "$SOURCE" "$MIRROR_TMP" > /dev/null 2>&1; then
                     echo "::error file=$mirror_file::Contract drift detected: $CONTRACT_FILE at HEAD differs from mirror $mirror_file (mirror pinned at $PINNED_HASH)"
                     echo "--- theyos $CONTRACT_FILE @ HEAD"
-                    echo "+++ iSoyehtTerm mirror $mirror_file"
+                    echo "+++ soyeht-ios mirror $mirror_file"
                     diff "$SOURCE" "$MIRROR_TMP" || true
                     DRIFT=1
                   else
@@ -94,7 +94,7 @@ jobs:
                 fi
               done < <(grep -P "$MIRROR_PATTERN" "$mirror_file")
             fi
-          done < <(find "$ISOYEHTTERM_DIR" -name "*.md" -print0)
+          done < <(find "$SOYEHT_IOS_DIR" -name "*.md" -print0)
 
           if [[ $MIRRORS_FOUND -eq 0 ]]; then
             echo "No contract mirrors registered yet — pass."
@@ -104,6 +104,6 @@ jobs:
 
           if [[ $DRIFT -ne 0 ]]; then
             echo ""
-            echo "Contract drift detected. Update the iSoyehtTerm mirror to match theyos@HEAD and bump its pinned hash."
+            echo "Contract drift detected. Update the soyeht-ios mirror to match theyos@HEAD and bump its pinned hash."
             exit 1
           fi
