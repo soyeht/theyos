@@ -4,7 +4,8 @@
 //! 2 simultaneous macOS guest VMs per host. Enforced via a `Semaphore(2)`.
 //! The warm pool pre-acquires one permit on startup, leaving 1 slot for user VMs.
 //!
-//! Error code 2001 (`MACOS_VM_LIMIT_REACHED`) is returned when both slots are occupied.
+//! The IPC VM-limit error code is owned by `core_rs::guest_image_failure`
+//! and re-exported here as `MACOS_VM_LIMIT_REACHED` for compatibility.
 
 use std::sync::{Arc, OnceLock};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, SemaphorePermit, TryAcquireError};
@@ -13,7 +14,7 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore, SemaphorePermit, TryAcquireEr
 pub const MACOS_VM_LIMIT: usize = 2;
 
 /// Error code returned when the macOS VM limit is reached.
-pub const MACOS_VM_LIMIT_REACHED: u32 = 2001;
+pub use core_rs::guest_image_failure::IPC_CODE_MACOS_VM_LIMIT_REACHED as MACOS_VM_LIMIT_REACHED;
 
 /// Manages the 2-VM concurrent macOS guest limit via a Tokio semaphore.
 ///
@@ -141,7 +142,10 @@ mod tests {
     #[test]
     fn test_limit_constant() {
         assert_eq!(MACOS_VM_LIMIT, 2);
-        assert_eq!(MACOS_VM_LIMIT_REACHED, 2001);
+        assert_eq!(
+            MACOS_VM_LIMIT_REACHED,
+            core_rs::guest_image_failure::IPC_CODE_MACOS_VM_LIMIT_REACHED
+        );
     }
 
     #[test]
