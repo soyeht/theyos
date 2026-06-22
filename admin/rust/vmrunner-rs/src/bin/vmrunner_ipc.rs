@@ -39,6 +39,7 @@ use core_rs::ipc::wire::Response;
 use serde_json::Value;
 use std::path::PathBuf;
 
+use vmrunner_common_rs::VmCreateResourceSpec;
 use vmrunner_rs::{VmConfig, VmEnv, VmRunner};
 
 #[tokio::main]
@@ -117,15 +118,8 @@ async fn handle_create(params: &Value) -> Response {
         })
         .unwrap_or_default();
 
-    let cpu_cores = params["cpu_cores"]
-        .as_u64()
-        .and_then(|v| u32::try_from(v).ok());
-    let ram_mb = params["ram_mb"]
-        .as_u64()
-        .and_then(|v| u32::try_from(v).ok());
-    let disk_gb = params["disk_gb"]
-        .as_u64()
-        .and_then(|v| u32::try_from(v).ok());
+    let resources =
+        serde_json::from_value::<VmCreateResourceSpec>(params.clone()).unwrap_or_default();
 
     let config = VmConfig {
         container,
@@ -133,9 +127,9 @@ async fn handle_create(params: &Value) -> Response {
         claw_type,
         customer_dir,
         tools,
-        cpu_cores,
-        ram_mb,
-        disk_gb,
+        cpu_cores: resources.cpu_cores,
+        ram_mb: resources.ram_mb,
+        disk_gb: resources.disk_gb,
     };
 
     match runner.create(&config).await {
