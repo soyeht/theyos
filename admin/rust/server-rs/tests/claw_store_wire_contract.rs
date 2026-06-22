@@ -199,6 +199,10 @@ fn admin_auth_router(state: SharedState) -> Router {
 fn mobile_router(state: SharedState) -> Router {
     Router::new()
         .route(
+            "/api/v1/mobile/claws",
+            get(handlers_mobile::handle_mobile_claws),
+        )
+        .route(
             "/api/v1/mobile/claws/{name}/availability",
             get(handlers_mobile::handle_mobile_claw_availability),
         )
@@ -361,6 +365,21 @@ fn insert_picoclaw_instance(state: &SharedState) {
 fn assert_fixture_body(status: StatusCode, body: &Value, expected: StatusCode, fixture_id: &str) {
     assert_eq!(status, expected);
     assert_eq!(body, fixture(fixture_id));
+}
+
+fn assert_list_envelope(body: &Value) {
+    assert!(body["data"].is_array(), "list data must be an array");
+    assert_eq!(body["has_more"], false);
+    assert_eq!(body["next_cursor"], Value::Null);
+}
+
+fn claw_list_item<'a>(body: &'a Value, name: &str) -> &'a Value {
+    body["data"]
+        .as_array()
+        .expect("list data array")
+        .iter()
+        .find(|item| item["name"] == name)
+        .unwrap_or_else(|| panic!("missing claw list item {name}"))
 }
 
 fn assert_queued_job_schema(status: StatusCode, body: &Value, fixture_id: &str) {
@@ -594,6 +613,83 @@ async fn auth_and_admin_required_errors_match_declared_claw_store_v1_fixtures() 
         StatusCode::FORBIDDEN,
         "mobile_admin_required",
     );
+}
+
+#[tokio::test]
+async fn admin_and_mobile_lists_share_typed_shape_while_mobile_tier_filter_stays_active() {
+    let state = shared_state();
+    let token = admin_mobile_token(&state);
+
+    let (status, _bytes, admin_body) = request(
+        admin_router(Arc::clone(&state)),
+        Method::GET,
+        "/api/v1/claws",
+        Vec::new(),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_list_envelope(&admin_body);
+
+    let (status, _bytes, mobile_body) = request(
+        mobile_router(Arc::clone(&state)),
+        Method::GET,
+        "/api/v1/mobile/claws",
+        Vec::new(),
+        Some(format!("Bearer {token}")),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_list_envelope(&mobile_body);
+
+    let admin_picoclaw = claw_list_item(&admin_body, "picoclaw");
+    let mobile_picoclaw = claw_list_item(&mobile_body, "picoclaw");
+    assert_eq!(mobile_picoclaw, admin_picoclaw);
+    assert_eq!(mobile_picoclaw["tier"], "supported");
+    assert!(
+        mobile_picoclaw.get("availability").is_some(),
+        "typed list item must keep the availability projection"
+    );
+
+    let (status, _bytes, supported_body) = request(
+        mobile_router(Arc::clone(&state)),
+        Method::GET,
+        "/api/v1/mobile/claws?tier=supported",
+        Vec::new(),
+        Some(format!("Bearer {token}")),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_list_envelope(&supported_body);
+    assert!(
+        supported_body["data"]
+            .as_array()
+            .expect("supported data array")
+            .iter()
+            .all(|item| item["tier"] == "supported"),
+        "mobile tier=supported must keep filtering active"
+    );
+    let _ = claw_list_item(&supported_body, "picoclaw");
+
+    let (status, _bytes, catalog_body) = request(
+        mobile_router(Arc::clone(&state)),
+        Method::GET,
+        "/api/v1/mobile/claws?tier=catalog",
+        Vec::new(),
+        Some(format!("Bearer {token}")),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_list_envelope(&catalog_body);
+    assert!(
+        catalog_body["data"]
+            .as_array()
+            .expect("catalog data array")
+            .iter()
+            .all(|item| item["tier"] == "catalog"),
+        "mobile tier=catalog must keep filtering active"
+    );
+    let _ = claw_list_item(&catalog_body, "claude-claw");
 }
 
 #[tokio::test]
