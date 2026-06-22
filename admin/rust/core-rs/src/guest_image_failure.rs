@@ -16,9 +16,8 @@
 use serde::{Deserialize, Serialize};
 
 /// The IPC error code returned by `vmrunner_macos_ipc` when the macOS host
-/// active-VM limit is reached (`vmrunner_macos_rs::slot_manager::MACOS_VM_LIMIT_REACHED`).
-/// Duplicated here as a wire constant so `core-rs` need not depend on the
-/// macOS-only runner crate.
+/// active-VM limit is reached. This is the single wire owner; the macOS runner
+/// re-exports it as `MACOS_VM_LIMIT_REACHED` for compatibility.
 pub const IPC_CODE_MACOS_VM_LIMIT_REACHED: u32 = 2001;
 
 /// Machine-readable guest-image failure reason. Serializes to a `snake_case`
@@ -237,7 +236,7 @@ mod tests {
     #[test]
     fn code_2001_classifies_as_host_vm_limit() {
         assert_eq!(
-            GuestImageFailureCode::classify(Some(2001), "anything"),
+            GuestImageFailureCode::classify(Some(IPC_CODE_MACOS_VM_LIMIT_REACHED), "anything"),
             GuestImageFailureCode::HostVmLimitReached
         );
     }
