@@ -307,6 +307,53 @@
         "degradations": []
       }
     },
+    "list_item_catalog_only": {
+      "name": "claude-claw",
+      "description": "OpenClaw-inspired enhancements for Claude Code: multi-agent safety, session continuity, task management, and memory architecture",
+      "language": "none",
+      "buildable": false,
+      "version": "",
+      "binary_size_mb": 0,
+      "min_ram_mb": 512,
+      "license": "MIT",
+      "distribution": "",
+      "status": "not_installed",
+      "tier": "catalog",
+      "stars": 5,
+      "source": "https://github.com/andrehuang/claude-claw",
+      "last_updated": "2026-03-28",
+      "reviewed_upstream_commit": "84a99521be61177ec77f2ef1a453fee2865b20e5",
+      "latest_upstream_commit": "84a99521be61177ec77f2ef1a453fee2865b20e5",
+      "installable": false,
+      "unavailable_reason_code": "catalog_only",
+      "unavailable_reason": "Claude Code plugin, not a server daemon — installed via `claude plugin install --url https://github.com/andrehuang/claude-claw`. Does not fit the Firecracker VM smoke-test model.",
+      "availability": {
+        "name": "claude-claw",
+        "install": {
+          "status": "not_installed",
+          "progress": null,
+          "installed_at": null,
+          "error": null,
+          "job_id": null
+        },
+        "host": {
+          "cold_path_ready": true,
+          "has_golden": false,
+          "has_base_rootfs": true,
+          "maintenance_blocked": false,
+          "maintenance_retry_after_secs": null
+        },
+        "overall": {
+          "state": "not_installed"
+        },
+        "reasons": [
+          {
+            "type": "not_installed"
+          }
+        ],
+        "degradations": []
+      }
+    },
     "list_envelope_ready": {
       "data": [
         {

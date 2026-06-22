@@ -17,6 +17,7 @@ use core_rs::{
     },
     env::set_test_env,
     error::ApiError,
+    manifest::UnavailableReasonCode,
 };
 use executor_rs::{Executor, FlowConfig};
 use household_rs::{
@@ -640,6 +641,69 @@ fn unknown_availability_serializer_matches_claw_store_v1_fixture() {
 
     let value = serde_json::to_value(availability).expect("serialize availability");
     assert_eq!(&value, fixture("unknown_availability"));
+}
+
+#[test]
+fn catalog_only_list_item_serializer_matches_claw_store_v1_fixture() {
+    // Drive the DTO from the REAL compiled manifest + catalog builder so the
+    // golden locks the product's actual wire row for a catalog-only claw, not
+    // hand-authored values. `claude-claw` is tier=catalog in claws/manifest.yml,
+    // so `ManifestEntry::installability()` yields Unavailable { CatalogOnly, .. }
+    // and `ClawStore::catalog_with_status_merged` emits installable=false plus the
+    // manifest's `skip_install_reason`. A fresh (empty) ClawStore and no
+    // verify-results path => status=NotInstalled with no install/verify history,
+    // so every other field comes straight from the manifest entry.
+    let dir = tempfile::TempDir::new().expect("tempdir");
+    let store =
+        claw_rs::ClawStore::new(&dir.path().join("installed_claws.json")).expect("claw store");
+    let claude = store
+        .catalog_with_status_merged(None)
+        .into_iter()
+        .find(|c| c.name == "claude-claw")
+        .expect("claude-claw present in compiled manifest");
+
+    // Focus of this slice: the catalog gate the UI keys off, derived by the
+    // builder from `ManifestEntry::installability()`.
+    assert!(
+        !claude.installable,
+        "claude-claw must be catalog-only (not installable)"
+    );
+    assert_eq!(
+        claude.unavailable_reason_code,
+        Some(UnavailableReasonCode::CatalogOnly)
+    );
+    assert!(
+        claude.unavailable_reason.is_some(),
+        "catalog-only row must carry a human-readable reason from skip_install_reason"
+    );
+
+    // Availability is the independent host/install projection. For a not-installed
+    // claw the (overall, reasons) verdict is produced by the real `compute_overall`
+    // fusion; the host projection is the one runtime-derived input, fixed here to a
+    // normal host (shared base rootfs present, no per-claw golden).
+    let install = InstallProjection::default_not_installed();
+    let host = HostProjection {
+        cold_path_ready: true,
+        has_golden: false,
+        has_base_rootfs: true,
+        maintenance_blocked: false,
+        maintenance_retry_after_secs: None,
+    };
+    let (overall, reasons) = core_rs::availability::compute_overall(&install, &host);
+    let list_item = ClawListItemResponse {
+        availability: Some(ClawAvailability {
+            name: claude.name.clone(),
+            install,
+            host,
+            overall,
+            reasons,
+            degradations: Vec::<Degradation>::new(),
+        }),
+        catalog: claude,
+    };
+
+    let value = serde_json::to_value(&list_item).expect("serialize catalog-only list item");
+    assert_eq!(&value, fixture("list_item_catalog_only"));
 }
 
 #[tokio::test]
