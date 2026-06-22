@@ -7,7 +7,7 @@ use crate::{
     orchestrator::{CreateInstanceFlowRequest, run_create_instance_flow, validate_create_request},
 };
 use core_rs::error::AppError;
-use vmrunner_common_rs::VmCreateResourceSpec;
+use vmrunner_common_rs::{VmCreateResourceSpec, VmCreateTimingWire};
 
 #[allow(clippy::too_many_lines)]
 pub(crate) fn execute_create(exec: &Executor, req: &ExecuteFlowRequest) -> ExecuteFlowResult {
@@ -358,18 +358,12 @@ fn execute_create_steps(
                     }
                 }
 
-                timing_phases = vm_response
-                    .get("phases")
-                    .and_then(|v| serde_json::from_value(v.clone()).ok());
-                timing_total_ms = vm_response
-                    .get("total_ms")
-                    .and_then(serde_json::Value::as_u64);
-                timing_golden_image_used = vm_response
-                    .get("golden_image_used")
-                    .and_then(serde_json::Value::as_bool);
-                timing_install_skipped = vm_response
-                    .get("install_skipped")
-                    .and_then(serde_json::Value::as_bool);
+                let timing = serde_json::from_value::<VmCreateTimingWire>(vm_response.clone())
+                    .unwrap_or_default();
+                timing_phases = timing.phases;
+                timing_total_ms = timing.total_ms;
+                timing_golden_image_used = timing.golden_image_used;
+                timing_install_skipped = timing.install_skipped;
             }
 
             "set_active" => {

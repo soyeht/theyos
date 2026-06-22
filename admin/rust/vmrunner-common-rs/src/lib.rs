@@ -10,7 +10,7 @@ pub mod warm_pool;
 
 pub use create::{
     DEFAULT_CREATE_CPU_CORES, DEFAULT_CREATE_DISK_GB, DEFAULT_CREATE_RAM_MB,
-    ResolvedVmCreateResourceSpec, VmCreateResourceSpec,
+    ResolvedVmCreateResourceSpec, VmCreatePhaseTiming, VmCreateResourceSpec, VmCreateTimingWire,
 };
 pub use network::{
     HostPortRange, LINUX_SSH_HOST_PORT_RANGE, PUBLIC_APP_HOST_PORT_RANGE, PortForward, PortProtocol,
