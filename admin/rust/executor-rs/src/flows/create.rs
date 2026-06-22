@@ -241,7 +241,9 @@ fn execute_create_steps(
                 #[cfg(target_os = "macos")]
                 {
                     use std::net::TcpListener;
-                    for p in core_rs::guest_net::host_app_port_range() {
+                    use vmrunner_common_rs::PUBLIC_APP_HOST_PORT_RANGE;
+
+                    for p in PUBLIC_APP_HOST_PORT_RANGE.iter() {
                         if TcpListener::bind(("127.0.0.1", p)).is_ok() {
                             host_port = i64::from(p);
                             break;
