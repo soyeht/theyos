@@ -2,10 +2,10 @@
 //!
 //! Binds a fresh axum router to:
 //! - `127.0.0.1` and `::1` (always),
-//! - every active LAN-class address (`192.168/16`, `10/8`, `172.16/12`, IPv6
-//!   global), excluding link-local `169.254/16` / `fe80::/10`,
-//! - every Tailscale address (interface name `tailscale*` OR address in
-//!   `100.64.0.0/10` / `fd7a:115c:a1e0::/48`).
+//! - every active LAN-class private address (`192.168/16`, `10/8`,
+//!   `172.16/12`, IPv6 ULA), excluding link-local `169.254/16` / `fe80::/10`,
+//! - every Tailscale address (`100.64.0.0/10` /
+//!   `fd7a:115c:a1e0::/48`). Interface names are not trusted.
 //!
 //! Refuses wildcard `0.0.0.0` / `::` per FR-008. Refreshes the active address
 //! set every 60 s.
@@ -296,6 +296,12 @@ mod tests {
     }
 
     #[test]
+    fn classify_tailscale_v6() {
+        let ip: IpAddr = "fd7a:115c:a1e0::1234".parse().unwrap();
+        assert_eq!(classify("utun7", &ip), Some(InterfaceClass::Tailscale));
+    }
+
+    #[test]
     fn classify_tailscale_named_non_tailnet_as_lan() {
         let ip: IpAddr = "10.0.0.2".parse().unwrap();
         assert_eq!(classify("tailscale0", &ip), Some(InterfaceClass::Lan));
@@ -305,6 +311,12 @@ mod tests {
     fn classify_lan_v4() {
         let ip: IpAddr = "192.168.1.5".parse().unwrap();
         assert_eq!(classify("en0", &ip), Some(InterfaceClass::Lan));
+    }
+
+    #[test]
+    fn classify_public_v4_is_not_bound() {
+        let ip: IpAddr = "203.0.113.10".parse().unwrap();
+        assert_eq!(classify("en0", &ip), None);
     }
 
     #[test]

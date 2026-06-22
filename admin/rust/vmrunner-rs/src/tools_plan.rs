@@ -18,6 +18,10 @@ pub const TOOL_OPENCODE: &str = "opencode";
 /// All default tools (installed when no `tools` field is provided).
 pub const DEFAULT_TOOLS: &[&str] = &[TOOL_CODEX, TOOL_CLAUDE_CODE, TOOL_OPENCODE];
 
+const DEFAULT_CODEX_VERSION: &str = "0.141.0";
+const DEFAULT_CLAUDE_CODE_VERSION: &str = "2.1.183";
+const DEFAULT_OPENCODE_VERSION: &str = "1.17.8";
+
 /// Shared step: ensure Node.js + npm are available in the guest.
 ///
 /// Idempotent — skips if `node` and `npm` are already on PATH.
@@ -48,13 +52,14 @@ fn ensure_nodejs_step() -> InstallerStep {
     .with_retries(2)
 }
 
-/// Install plan for Codex (`npm install -g @openai/codex`).
+/// Install plan for Codex (`npm install -g @openai/codex@<version>`).
 fn codex_plan() -> InstallerPlan {
+    let package = format!("@openai/codex@{DEFAULT_CODEX_VERSION}");
     InstallerPlan {
         claw_type: "tool-codex",
         steps: vec![
             ensure_nodejs_step(),
-            InstallerStep::new("install_codex", "npm install -g @openai/codex")
+            InstallerStep::new("install_codex", format!("npm install -g {package}"))
                 .with_check("command -v codex")
                 .with_timeout(180)
                 .with_retries(2),
@@ -62,34 +67,33 @@ fn codex_plan() -> InstallerPlan {
     }
 }
 
-/// Install plan for Claude Code (`npm install -g @anthropic-ai/claude-code`).
+/// Install plan for Claude Code (`npm install -g @anthropic-ai/claude-code@<version>`).
 fn claude_code_plan() -> InstallerPlan {
+    let package = format!("@anthropic-ai/claude-code@{DEFAULT_CLAUDE_CODE_VERSION}");
     InstallerPlan {
         claw_type: "tool-claude-code",
         steps: vec![
             ensure_nodejs_step(),
-            InstallerStep::new(
-                "install_claude_code",
-                "npm install -g @anthropic-ai/claude-code",
-            )
-            .with_check("command -v claude")
-            .with_timeout(180)
-            .with_retries(2),
+            InstallerStep::new("install_claude_code", format!("npm install -g {package}"))
+                .with_check("command -v claude")
+                .with_timeout(180)
+                .with_retries(2),
         ],
     }
 }
 
-/// Install plan for `OpenCode` (`npm install -g opencode-ai`).
+/// Install plan for `OpenCode` (`npm install -g opencode-ai@<version>`).
 ///
 /// `OpenCode` moved from <https://github.com/opencode-ai/opencode> (archived Go
 /// binary) to <https://github.com/anomalyco/opencode> (TypeScript, published
 /// on npm as `opencode-ai`).
 fn opencode_plan() -> InstallerPlan {
+    let package = format!("opencode-ai@{DEFAULT_OPENCODE_VERSION}");
     InstallerPlan {
         claw_type: "tool-opencode",
         steps: vec![
             ensure_nodejs_step(),
-            InstallerStep::new("install_opencode", "npm install -g opencode-ai@latest")
+            InstallerStep::new("install_opencode", format!("npm install -g {package}"))
                 .with_check("command -v opencode")
                 .with_timeout(180)
                 .with_retries(2),
@@ -167,6 +171,7 @@ pub fn normalize_tool_name(name: &str) -> Option<&'static str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use core_rs::node_source::NODESOURCE_REPO_KEY_SHA256;
 
     #[test]
     fn normalize_canonical_names() {
@@ -241,6 +246,12 @@ mod tests {
             codex.steps[1].command.contains("@openai/codex"),
             "codex install must use @openai/codex npm package",
         );
+        assert!(
+            codex.steps[1]
+                .command
+                .contains(&format!("@openai/codex@{DEFAULT_CODEX_VERSION}")),
+            "codex install must pin @openai/codex",
+        );
 
         let claude = claude_code_plan();
         assert!(
@@ -249,11 +260,42 @@ mod tests {
                 .contains("@anthropic-ai/claude-code"),
             "claude-code install must use @anthropic-ai/claude-code npm package",
         );
+        assert!(
+            claude.steps[1].command.contains(&format!(
+                "@anthropic-ai/claude-code@{DEFAULT_CLAUDE_CODE_VERSION}"
+            )),
+            "claude-code install must pin @anthropic-ai/claude-code",
+        );
 
         let opencode = opencode_plan();
         assert!(
             opencode.steps[1].command.contains("opencode-ai"),
             "opencode install must use opencode-ai npm package",
+        );
+        assert!(
+            opencode.steps[1]
+                .command
+                .contains(&format!("opencode-ai@{DEFAULT_OPENCODE_VERSION}")),
+            "opencode install must pin opencode-ai",
+        );
+    }
+
+    #[test]
+    fn nodejs_step_uses_sha_verified_nodesource_keyring() {
+        let step = ensure_nodejs_step();
+        assert!(
+            step.command
+                .contains("Signed-By: /usr/share/keyrings/nodesource.gpg"),
+            "ensure_nodejs should use a signed NodeSource keyring"
+        );
+        assert!(
+            step.command.contains(NODESOURCE_REPO_KEY_SHA256),
+            "ensure_nodejs should verify the NodeSource key SHA-256"
+        );
+        let nodesource_setup_script = ["setup_", "22.x"].concat();
+        assert!(
+            !step.command.contains(&nodesource_setup_script),
+            "ensure_nodejs should not run the NodeSource setup script"
         );
     }
 

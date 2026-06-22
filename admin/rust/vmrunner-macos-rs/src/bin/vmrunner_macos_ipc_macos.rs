@@ -4,6 +4,7 @@ use serde_json::Value;
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+use vmrunner_common_rs::VmCreateResourceSpec;
 use vmrunner_macos_rs::{
     AdmissionError, ManagedMacOSVm, VZMacOSVmConfigurationBuilder, VZVirtualMachine,
     VZVirtualMachineConfigurationBuilder, VmAdmission, VmKind, VmLease, VmState, build_cidata_iso,
@@ -498,16 +499,14 @@ impl IpcState {
 
 /// Parse `cpu_cores`, `ram_mb`, `disk_gb` from IPC params with defaults.
 fn parse_resource_params(params: &Value, default_cpu: u32, default_ram: u32) -> (u32, u32, u64) {
-    let cpus = u32::try_from(
-        params["cpu_cores"]
-            .as_u64()
-            .unwrap_or(u64::from(default_cpu)),
+    let resources = serde_json::from_value::<VmCreateResourceSpec>(params.clone())
+        .unwrap_or_default()
+        .resolve_with_cpu_ram(default_cpu, default_ram);
+    (
+        resources.cpu_cores,
+        resources.ram_mb,
+        u64::from(resources.disk_gb),
     )
-    .unwrap_or(default_cpu);
-    let memory_mb = u32::try_from(params["ram_mb"].as_u64().unwrap_or(u64::from(default_ram)))
-        .unwrap_or(default_ram);
-    let disk_gb = params["disk_gb"].as_u64().unwrap_or(10);
-    (cpus, memory_mb, disk_gb)
 }
 
 /// Apply macOS restore-image minimums recorded during base-image install.
@@ -2829,6 +2828,51 @@ fn generate_mac() -> String {
         "{b0:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
         bytes[1], bytes[2], bytes[3], bytes[4], bytes[5]
     )
+}
+
+#[cfg(test)]
+mod resource_param_tests {
+    use serde_json::json;
+
+    #[test]
+    fn parse_resource_params_uses_current_defaults() {
+        assert_eq!(
+            super::parse_resource_params(&json!({}), 2, 2048),
+            (2, 2048, 10)
+        );
+    }
+
+    #[test]
+    fn parse_resource_params_preserves_supplied_values() {
+        assert_eq!(
+            super::parse_resource_params(
+                &json!({
+                    "cpu_cores": 4,
+                    "ram_mb": 4096,
+                    "disk_gb": 20
+                }),
+                2,
+                2048
+            ),
+            (4, 4096, 20)
+        );
+    }
+
+    #[test]
+    fn parse_resource_params_treats_invalid_values_as_defaults() {
+        assert_eq!(
+            super::parse_resource_params(
+                &json!({
+                    "cpu_cores": "4",
+                    "ram_mb": 9_999_999_999_u64,
+                    "disk_gb": null
+                }),
+                2,
+                2048
+            ),
+            (2, 2048, 10)
+        );
+    }
 }
 
 // ── admission wiring regression guards ────────────────────────────────────────

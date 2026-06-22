@@ -7,6 +7,7 @@ use crate::{
     orchestrator::{CreateInstanceFlowRequest, run_create_instance_flow, validate_create_request},
 };
 use core_rs::error::AppError;
+use vmrunner_common_rs::VmCreateResourceSpec;
 
 #[allow(clippy::too_many_lines)]
 pub(crate) fn execute_create(exec: &Executor, req: &ExecuteFlowRequest) -> ExecuteFlowResult {
@@ -241,15 +242,19 @@ fn execute_create_steps(
                 #[cfg(target_os = "macos")]
                 {
                     use std::net::TcpListener;
-                    const MIN_PORT: u16 = 18790;
-                    const MAX_PORT: u16 = 19999;
-                    for p in MIN_PORT..=MAX_PORT {
+                    use vmrunner_common_rs::PUBLIC_APP_HOST_PORT_RANGE;
+
+                    for p in PUBLIC_APP_HOST_PORT_RANGE.iter() {
                         if TcpListener::bind(("127.0.0.1", p)).is_ok() {
                             host_port = i64::from(p);
                             break;
                         }
                     }
                 }
+
+                let resources =
+                    VmCreateResourceSpec::from_options(req.cpu_cores, req.ram_mb, req.disk_gb)
+                        .resolve();
 
                 let vm_result = exec.vmrunner.call_with_context(
                     "Create",
@@ -266,9 +271,9 @@ fn execute_create_steps(
                         "ssh_wait_tries": exec.config.ssh_wait_tries,
                         "tools": req.tools,
                         "guest_os": guest_os,
-                        "cpu_cores": req.cpu_cores.unwrap_or(2),
-                        "ram_mb": req.ram_mb.unwrap_or(2048),
-                        "disk_gb": req.disk_gb.unwrap_or(10),
+                        "cpu_cores": resources.cpu_cores,
+                        "ram_mb": resources.ram_mb,
+                        "disk_gb": resources.disk_gb,
                         "port": host_port,
                     }),
                 );
