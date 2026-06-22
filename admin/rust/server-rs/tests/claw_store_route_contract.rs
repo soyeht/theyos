@@ -72,6 +72,18 @@ fn household_bootstrap_source() -> &'static str {
     include_str!("../src/household_bootstrap.rs")
 }
 
+fn handlers_claws_source() -> &'static str {
+    include_str!("../src/handlers_claws.rs")
+}
+
+fn handlers_mobile_source() -> &'static str {
+    include_str!("../src/handlers_mobile.rs")
+}
+
+fn claw_store_service_source() -> &'static str {
+    include_str!("../src/claw_store_service.rs")
+}
+
 fn between<'a>(source: &'a str, start: &str, end: &str) -> &'a str {
     let start_idx = source
         .find(start)
@@ -80,6 +92,19 @@ fn between<'a>(source: &'a str, start: &str, end: &str) -> &'a str {
     let end_idx = rest
         .find(end)
         .unwrap_or_else(|| panic!("missing source slice end marker: {end}"));
+    &rest[..end_idx]
+}
+
+fn function_slice<'a>(source: &'a str, function_name: &str) -> &'a str {
+    let marker = format!("pub async fn {function_name}");
+    let start_idx = source
+        .find(&marker)
+        .unwrap_or_else(|| panic!("missing function marker: {marker}"));
+    let rest = &source[start_idx..];
+    let end_idx = rest
+        .find("\n/// ")
+        .or_else(|| rest.find("\n#[cfg(test)]"))
+        .unwrap_or(rest.len());
     &rest[..end_idx]
 }
 
@@ -115,6 +140,73 @@ fn operation_variant(operation: &str) -> &'static str {
         "claws.create" => "Operation::ClawsCreate",
         "claws.delete" => "Operation::ClawsDelete",
         other => panic!("unknown household operation: {other}"),
+    }
+}
+
+#[test]
+fn claw_store_action_handlers_delegate_to_shared_service() {
+    let handlers = [
+        (
+            handlers_claws_source(),
+            "handle_install_claw",
+            "claw_store_service::install_claw(&state, name)",
+        ),
+        (
+            handlers_claws_source(),
+            "handle_uninstall_claw",
+            "claw_store_service::uninstall_claw(&state, name)",
+        ),
+        (
+            handlers_mobile_source(),
+            "handle_mobile_install_claw",
+            "claw_store_service::install_claw(&state, name)",
+        ),
+        (
+            handlers_mobile_source(),
+            "handle_mobile_uninstall_claw",
+            "claw_store_service::uninstall_claw(&state, name)",
+        ),
+    ];
+
+    for (source, function_name, service_call) in handlers {
+        let body = function_slice(source, function_name);
+        assert!(
+            body.contains(service_call),
+            "{function_name} must delegate to {service_call}"
+        );
+        for forbidden in [
+            "core_rs::manifest::get(",
+            "core_rs::manifest::is_known(",
+            ".installability()",
+            "jobs_rs::Job::new(",
+            "mark_installing(",
+            "mark_uninstalling(",
+            "count_by_claw_type(",
+            "bad_request_with_reasons(",
+        ] {
+            assert!(
+                !body.contains(forbidden),
+                "{function_name} must not reimplement shared Claw Store action semantics with {forbidden}"
+            );
+        }
+    }
+
+    let service = claw_store_service_source();
+    for required in [
+        "core_rs::manifest::get(&name)",
+        "core_rs::manifest::is_known(&name)",
+        "entry.installability()",
+        "jobs_rs::Job::new(jobs_rs::JobType::InstallClaw",
+        "jobs_rs::Job::new(jobs_rs::JobType::UninstallClaw",
+        "mark_installing(&claw_name, &job_id)",
+        "mark_uninstalling(&claw_name)",
+        "count_by_claw_type(&n)",
+        "ApiError::bad_request_with_reasons(",
+    ] {
+        assert!(
+            service.contains(required),
+            "claw_store_service must own shared action semantic: {required}"
+        );
     }
 }
 

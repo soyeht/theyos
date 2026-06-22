@@ -29,7 +29,7 @@ use jobs_rs::Store as JobsStore;
 use serde_json::{Value, json};
 use server_rs::{
     auth::require_auth,
-    handlers_claws, handlers_household_claws,
+    claw_store_service, handlers_claws, handlers_household_claws,
     handlers_household_claws::HouseholdClawsState,
     handlers_mobile,
     household_attach_token::HouseholdAttachTokenStore,
@@ -1000,6 +1000,22 @@ async fn queued_action_responses_match_declared_claw_store_v1_schemas() {
 
 #[tokio::test]
 async fn already_installing_status_split_is_pinned() {
+    let service_state = shared_state();
+    service_state
+        .claw_store
+        .mark_installing("picoclaw", "job-alpha")
+        .expect("mark service installing");
+    let service_outcome = claw_store_service::install_claw(&service_state, "picoclaw".to_string())
+        .await
+        .expect("service already installing");
+    assert!(
+        service_outcome.is_already_installing(),
+        "shared service must surface already-installing as an adapter-mapped outcome"
+    );
+    let service_body = serde_json::to_value(service_outcome.into_job_response())
+        .expect("serialize service already-installing body");
+    assert_eq!(&service_body, fixture("already_installing_job_body"));
+
     let admin_state = shared_state();
     admin_state
         .claw_store
@@ -1097,6 +1113,18 @@ async fn unknown_availability_is_200_unknown_on_all_claw_store_surfaces() {
 
 #[tokio::test]
 async fn install_unavailable_errors_match_declared_claw_store_v1_fixture() {
+    let service_state = shared_state();
+    let service_error = claw_store_service::install_claw(&service_state, "claude-claw".to_string())
+        .await
+        .expect_err("service install unavailable");
+    let (status, _bytes, body) = response_parts(service_error.into_response()).await;
+    assert_fixture_body(
+        status,
+        &body,
+        StatusCode::BAD_REQUEST,
+        "install_unavailable_reasons_object",
+    );
+
     let admin_state = shared_state();
     let (status, _bytes, body) = request(
         admin_router(Arc::clone(&admin_state)),
