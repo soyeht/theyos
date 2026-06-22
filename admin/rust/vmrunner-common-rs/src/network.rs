@@ -1,5 +1,7 @@
 //! Shared vmrunner host-port range contracts.
 
+use serde::{Deserialize, Serialize};
+
 /// Inclusive host-port range.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HostPortRange {
@@ -42,6 +44,71 @@ pub const LINUX_SSH_HOST_PORT_RANGE: HostPortRange = HostPortRange::new(
     core_rs::guest_net::SSH_HOST_PORT_RANGE_END,
 );
 
+/// Port forwarding rule shared by vmrunner network wire contracts.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PortForward {
+    /// Host port (external).
+    pub host_port: u16,
+
+    /// VM port (internal). The current macOS wire shape uses `vm_port`.
+    pub vm_port: u16,
+
+    /// Protocol (TCP/UDP).
+    #[serde(default)]
+    pub protocol: PortProtocol,
+}
+
+impl PortForward {
+    /// Create a new TCP port forward.
+    #[must_use]
+    pub const fn tcp(host_port: u16, vm_port: u16) -> Self {
+        Self {
+            host_port,
+            vm_port,
+            protocol: PortProtocol::TCP,
+        }
+    }
+
+    /// Create a new UDP port forward.
+    #[must_use]
+    pub const fn udp(host_port: u16, vm_port: u16) -> Self {
+        Self {
+            host_port,
+            vm_port,
+            protocol: PortProtocol::UDP,
+        }
+    }
+}
+
+/// Port protocol for vmrunner port forwarding rules.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub enum PortProtocol {
+    #[default]
+    TCP,
+    UDP,
+}
+
+impl PortProtocol {
+    /// Convert to display string.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::TCP => "tcp",
+            Self::UDP => "udp",
+        }
+    }
+
+    /// Parse from string.
+    #[must_use]
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.to_ascii_lowercase().as_str() {
+            "tcp" => Some(Self::TCP),
+            "udp" => Some(Self::UDP),
+            _ => None,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -66,5 +133,54 @@ mod tests {
         assert!(!LINUX_SSH_HOST_PORT_RANGE.contains(21_999));
         assert!(!LINUX_SSH_HOST_PORT_RANGE.contains(24_000));
         assert_eq!(LINUX_SSH_HOST_PORT_RANGE.to_string(), "22000-23999");
+    }
+
+    #[test]
+    fn port_forward_serializes_current_macos_wire_shape() {
+        let forward = PortForward::tcp(19_001, 80);
+
+        assert_eq!(
+            serde_json::to_value(forward).unwrap(),
+            serde_json::json!({
+                "host_port": 19001,
+                "vm_port": 80,
+                "protocol": "TCP"
+            })
+        );
+    }
+
+    #[test]
+    fn port_forward_deserializes_current_macos_wire_shape() {
+        let forward: PortForward = serde_json::from_value(serde_json::json!({
+            "host_port": 19001,
+            "vm_port": 80,
+            "protocol": "UDP"
+        }))
+        .unwrap();
+
+        assert_eq!(forward.host_port, 19_001);
+        assert_eq!(forward.vm_port, 80);
+        assert_eq!(forward.protocol, PortProtocol::UDP);
+    }
+
+    #[test]
+    fn port_forward_deserializes_default_protocol_as_tcp() {
+        let forward: PortForward = serde_json::from_value(serde_json::json!({
+            "host_port": 19001,
+            "vm_port": 80
+        }))
+        .unwrap();
+
+        assert_eq!(forward.protocol, PortProtocol::TCP);
+    }
+
+    #[test]
+    fn port_protocol_parse_preserves_current_inputs() {
+        assert_eq!(PortProtocol::parse("tcp"), Some(PortProtocol::TCP));
+        assert_eq!(PortProtocol::parse("TCP"), Some(PortProtocol::TCP));
+        assert_eq!(PortProtocol::parse("udp"), Some(PortProtocol::UDP));
+        assert_eq!(PortProtocol::parse("sctp"), None);
+        assert_eq!(PortProtocol::TCP.as_str(), "tcp");
+        assert_eq!(PortProtocol::UDP.as_str(), "udp");
     }
 }

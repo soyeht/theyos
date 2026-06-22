@@ -3,7 +3,8 @@
 //! Provides NAT networking setup and port forwarding for `VZVirtualMachine`.
 
 use serde::{Deserialize, Serialize};
-use vmrunner_common_rs::PUBLIC_APP_HOST_PORT_RANGE;
+pub use vmrunner_common_rs::PortProtocol;
+use vmrunner_common_rs::{PUBLIC_APP_HOST_PORT_RANGE, PortForward as CommonPortForward};
 
 /// Network configuration for a VM.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -27,37 +28,28 @@ impl Default for NetworkConfig {
 
 /// Port forwarding rule.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct PortForward {
-    /// Host port (external)
-    pub host_port: u16,
+#[serde(transparent)]
+pub struct PortForward(CommonPortForward);
 
-    /// VM port (internal)
-    pub vm_port: u16,
+impl std::ops::Deref for PortForward {
+    type Target = CommonPortForward;
 
-    /// Protocol (TCP/UDP)
-    #[serde(default)]
-    pub protocol: PortProtocol,
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
 }
 
 impl PortForward {
     /// Create a new TCP port forward.
     #[must_use]
     pub fn tcp(host_port: u16, vm_port: u16) -> Self {
-        Self {
-            host_port,
-            vm_port,
-            protocol: PortProtocol::TCP,
-        }
+        Self(CommonPortForward::tcp(host_port, vm_port))
     }
 
     /// Create a new UDP port forward.
     #[must_use]
     pub fn udp(host_port: u16, vm_port: u16) -> Self {
-        Self {
-            host_port,
-            vm_port,
-            protocol: PortProtocol::UDP,
-        }
+        Self(CommonPortForward::udp(host_port, vm_port))
     }
 
     /// Validate the port forward rule.
@@ -84,35 +76,6 @@ impl PortForward {
         }
 
         Ok(())
-    }
-}
-
-/// Port protocol.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
-pub enum PortProtocol {
-    #[default]
-    TCP,
-    UDP,
-}
-
-impl PortProtocol {
-    /// Convert to display string.
-    #[must_use]
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            Self::TCP => "tcp",
-            Self::UDP => "udp",
-        }
-    }
-
-    /// Parse from string.
-    #[must_use]
-    pub fn parse(s: &str) -> Option<Self> {
-        match s.to_lowercase().as_str() {
-            "tcp" => Some(Self::TCP),
-            "udp" => Some(Self::UDP),
-            _ => None,
-        }
     }
 }
 
