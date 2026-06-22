@@ -33,10 +33,16 @@ impl std::fmt::Display for HostPortRange {
 }
 
 /// Host ports allocated for public app forwarding on macOS VZ VMs.
-pub const PUBLIC_APP_HOST_PORT_RANGE: HostPortRange = HostPortRange::new(18_790, 19_999);
+pub const PUBLIC_APP_HOST_PORT_RANGE: HostPortRange = HostPortRange::new(
+    core_rs::guest_net::HOST_APP_PORT_RANGE_START,
+    core_rs::guest_net::HOST_APP_PORT_RANGE_END,
+);
 
 /// Host ports allocated for Linux Firecracker SSH forwarding.
-pub const LINUX_SSH_HOST_PORT_RANGE: HostPortRange = HostPortRange::new(22_000, 23_999);
+pub const LINUX_SSH_HOST_PORT_RANGE: HostPortRange = HostPortRange::new(
+    core_rs::guest_net::SSH_HOST_PORT_RANGE_START,
+    core_rs::guest_net::SSH_HOST_PORT_RANGE_END,
+);
 
 /// Port forwarding rule shared by vmrunner network wire contracts.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

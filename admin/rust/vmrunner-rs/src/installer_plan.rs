@@ -36,6 +36,14 @@ use core_rs::node_source::{INSTALL_NODE_22_COMMAND, NODE_22_12_CHECK, NODE_22_CH
 use crate::error::{ErrorContext, VmError};
 use crate::ssh_client::SshActions;
 
+const DEFAULT_PNPM_VERSION: &str = "11.8.0";
+const DEFAULT_ZEROCLAW_REPO_REF: &str = "a57ddd0ad257b3acc6351cb49b765e0e6f3f06e7";
+const DEFAULT_OPENCLAW_REPO_REF: &str = "44422b2151916191c6dff5662e1f8a6f7e4675ca";
+const DEFAULT_HERMES_AGENT_REPO_REF: &str = "b88d0007c9d0037a1ec3daa2477bd4f79eaf566b";
+const DEFAULT_CLAUDE_CODE_VERSION: &str = "2.1.183";
+const DEFAULT_OPENCODE_VERSION: &str = "1.17.8";
+const DEFAULT_CODEX_VERSION: &str = "0.141.0";
+
 /// A single step within an `InstallerPlan`.
 #[derive(Debug, Clone)]
 pub struct InstallerStep {
@@ -233,6 +241,25 @@ BASHRC"#
     InstallerStep::new("setup_shell_prompt", cmd)
 }
 
+fn fetch_reviewed_git_commit_command(path: &str, repo_url: &str, repo_ref: &str) -> String {
+    format!(
+        "mkdir -p {path} && \
+         git -C {path} init && \
+         (git -C {path} remote remove origin >/dev/null 2>&1 || true) && \
+         git -C {path} remote add origin '{repo_url}' && \
+         git -C {path} fetch --depth 1 origin '{repo_ref}' && \
+         git -C {path} checkout --detach FETCH_HEAD && \
+         test \"$(git -C {path} rev-parse HEAD)\" = \"{repo_ref}\""
+    )
+}
+
+fn env_or_default(name: &str, default: &str) -> String {
+    std::env::var(name)
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| default.into())
+}
+
 // ── Plan definitions ───────────────────────────────────────────────────────
 
 /// Nullclaw install plan.
@@ -338,17 +365,10 @@ pub fn picoclaw_plan() -> InstallerPlan {
 #[must_use]
 pub fn zeroclaw_plan() -> InstallerPlan {
     let repo_url = std::env::var("ZEROCLAW_REPO_URL")
-        .unwrap_or_else(|_| "https://github.com/openagen/zeroclaw".into());
-    let repo_ref = std::env::var("ZEROCLAW_REPO_REF").unwrap_or_else(|_| "main".into());
+        .unwrap_or_else(|_| "https://github.com/zeroclaw-labs/zeroclaw".into());
+    let repo_ref = env_or_default("ZEROCLAW_REPO_REF", DEFAULT_ZEROCLAW_REPO_REF);
 
-    let clone_cmd = format!(
-        "if [ -d /opt/claws/zeroclaw ]; then \
-           cd /opt/claws/zeroclaw && git fetch origin && git checkout '{repo_ref}' && git pull origin '{repo_ref}' || true; \
-         else \
-           mkdir -p /opt/claws && \
-           git clone --depth 1 --branch '{repo_ref}' '{repo_url}' /opt/claws/zeroclaw; \
-         fi"
-    );
+    let clone_cmd = fetch_reviewed_git_commit_command("/opt/claws/zeroclaw", &repo_url, &repo_ref);
 
     InstallerPlan {
         claw_type: "zeroclaw",
@@ -358,16 +378,14 @@ pub fn zeroclaw_plan() -> InstallerPlan {
                 "export DEBIAN_FRONTEND=noninteractive && \
                  apt-get update -qq && \
                  apt-get install -y --no-install-recommends \
-                   git build-essential pkg-config ca-certificates curl >/dev/null 2>&1",
+                   git build-essential pkg-config ca-certificates curl rustc cargo >/dev/null 2>&1",
             )
             .with_timeout(180),
             InstallerStep::new(
                 "install_rust",
-                "if ! command -v rustc >/dev/null 2>&1; then \
-                   curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
-                     | sh -s -- -y --default-toolchain stable; \
-                 fi",
+                "command -v rustc >/dev/null 2>&1 && command -v cargo >/dev/null 2>&1",
             )
+            .with_check("command -v cargo >/dev/null 2>&1")
             .with_timeout(300)
             .with_retries(1),
             InstallerStep::new("clone_repo", clone_cmd)
@@ -399,15 +417,24 @@ pub fn zeroclaw_plan() -> InstallerPlan {
 /// Nanobot install plan (Python package from `PyPI`).
 ///
 /// The `PyPI` package is `nanobot-ai` which provides the `nanobot` CLI entry point.
-/// Steps: install deps → pip install nanobot-ai → link binary → create config dir → verify.
+/// Steps: install deps → pip install nanobot-ai==0.2.1 → link binary → create config dir → verify.
 #[must_use]
 pub fn nanobot_plan() -> InstallerPlan {
     let version = std::env::var("NANOBOT_VERSION").unwrap_or_default();
 
     let install_cmd = if version.is_empty() {
-        "pip3 install --break-system-packages --ignore-installed nanobot-ai".to_string()
+        "python3 -m venv /opt/nanobot-venv && \
+         /opt/nanobot-venv/bin/pip install --quiet --upgrade pip && \
+         /opt/nanobot-venv/bin/pip install --quiet --ignore-installed nanobot-ai==0.2.1 && \
+         ln -sf /opt/nanobot-venv/bin/nanobot /usr/local/bin/nanobot"
+            .to_string()
     } else {
-        format!("pip3 install --break-system-packages --ignore-installed nanobot-ai=={version}")
+        format!(
+            "python3 -m venv /opt/nanobot-venv && \
+             /opt/nanobot-venv/bin/pip install --quiet --upgrade pip && \
+             /opt/nanobot-venv/bin/pip install --quiet --ignore-installed nanobot-ai=={version} && \
+             ln -sf /opt/nanobot-venv/bin/nanobot /usr/local/bin/nanobot"
+        )
     };
 
     InstallerPlan {
@@ -418,7 +445,7 @@ pub fn nanobot_plan() -> InstallerPlan {
                 "export DEBIAN_FRONTEND=noninteractive && \
                  apt-get update -qq && \
                  apt-get install -y --no-install-recommends \
-                   python3 python3-pip ca-certificates >/dev/null 2>&1",
+                   python3 python3-pip python3-venv ca-certificates >/dev/null 2>&1",
             )
             .with_timeout(180),
             InstallerStep::new("install_package", install_cmd)
@@ -467,16 +494,9 @@ pub fn nanobot_plan() -> InstallerPlan {
 pub fn openclaw_plan() -> InstallerPlan {
     let repo_url = std::env::var("OPENCLAW_REPO_URL")
         .unwrap_or_else(|_| "https://github.com/openclaw/openclaw".into());
-    let repo_ref = std::env::var("OPENCLAW_REPO_REF").unwrap_or_else(|_| "main".into());
+    let repo_ref = env_or_default("OPENCLAW_REPO_REF", DEFAULT_OPENCLAW_REPO_REF);
 
-    let clone_cmd = format!(
-        "if [ -d /opt/claws/openclaw ]; then \
-           cd /opt/claws/openclaw && git fetch origin && git checkout '{repo_ref}' && git pull origin '{repo_ref}' || true; \
-         else \
-           mkdir -p /opt/claws && \
-           git clone --depth 1 --branch '{repo_ref}' '{repo_url}' /opt/claws/openclaw; \
-         fi"
-    );
+    let clone_cmd = fetch_reviewed_git_commit_command("/opt/claws/openclaw", &repo_url, &repo_ref);
 
     InstallerPlan {
         claw_type: "openclaw",
@@ -498,8 +518,8 @@ pub fn openclaw_plan() -> InstallerPlan {
                  NODE_VER=$(node --version | sed 's/v//') && \
                  NODE_MAJOR=$(echo \"$NODE_VER\" | cut -d. -f1) && \
                  NODE_MINOR=$(echo \"$NODE_VER\" | cut -d. -f2) && \
-                 if [ \"$NODE_MAJOR\" -lt 22 ] || { [ \"$NODE_MAJOR\" -eq 22 ] && [ \"$NODE_MINOR\" -lt 12 ]; }; then \
-                   echo \"ERROR: need node >= 22.12.0, got v${NODE_VER}\" >&2; exit 1; \
+                 if [ \"$NODE_MAJOR\" -lt 22 ] || {{ [ \"$NODE_MAJOR\" -eq 22 ] && [ \"$NODE_MINOR\" -lt 12 ]; }}; then \
+                   echo \"ERROR: need node >= 22.12.0, got v${{NODE_VER}}\" >&2; exit 1; \
                  fi",
             )
             .with_check(NODE_22_12_CHECK)
@@ -513,11 +533,13 @@ pub fn openclaw_plan() -> InstallerPlan {
             // Runs inside cloned repo so corepack reads packageManager from package.json.
             InstallerStep::new(
                 "install_pnpm",
-                "cd /opt/claws/openclaw && \
+                format!(
+                    "cd /opt/claws/openclaw && \
                  corepack enable && \
-                 corepack prepare --activate && \
+                 corepack prepare pnpm@{DEFAULT_PNPM_VERSION} --activate && \
                  pnpm --version || \
-                 (npm install -g pnpm@10 && pnpm --version)",
+                 (npm install -g pnpm@{DEFAULT_PNPM_VERSION} && pnpm --version)"
+                ),
             )
             .with_check("command -v pnpm >/dev/null 2>&1 && pnpm --version >/dev/null 2>&1")
             .with_timeout(180)
@@ -643,21 +665,15 @@ pub fn ironclaw_plan() -> InstallerPlan {
 ///
 /// Env vars:
 ///   `HERMES_AGENT_REPO_URL` — default: `https://github.com/NousResearch/hermes-agent`
-///   `HERMES_AGENT_REPO_REF` — default: `main`
+///   `HERMES_AGENT_REPO_REF` — default: reviewed commit
 #[must_use]
 pub fn hermes_agent_plan() -> InstallerPlan {
     let repo_url = std::env::var("HERMES_AGENT_REPO_URL")
         .unwrap_or_else(|_| "https://github.com/NousResearch/hermes-agent".into());
-    let repo_ref = std::env::var("HERMES_AGENT_REPO_REF").unwrap_or_else(|_| "main".into());
+    let repo_ref = env_or_default("HERMES_AGENT_REPO_REF", DEFAULT_HERMES_AGENT_REPO_REF);
 
-    let clone_cmd = format!(
-        "if [ -d /opt/claws/hermes-agent ]; then \
-           cd /opt/claws/hermes-agent && git fetch origin && git checkout '{repo_ref}' && git pull origin '{repo_ref}' || true; \
-         else \
-           mkdir -p /opt/claws && \
-           git clone --depth 1 --branch '{repo_ref}' '{repo_url}' /opt/claws/hermes-agent; \
-         fi"
-    );
+    let clone_cmd =
+        fetch_reviewed_git_commit_command("/opt/claws/hermes-agent", &repo_url, &repo_ref);
 
     InstallerPlan {
         claw_type: "hermes-agent",
@@ -667,7 +683,7 @@ pub fn hermes_agent_plan() -> InstallerPlan {
                 "export DEBIAN_FRONTEND=noninteractive && \
                  apt-get update -qq && \
                  apt-get install -y --no-install-recommends \
-                   build-essential python3 python3-pip python3-dev libffi-dev \
+                   build-essential python3 python3-pip python3-venv python3-dev libffi-dev \
                    git curl ca-certificates ripgrep ffmpeg gcc >/dev/null 2>&1",
             )
             .with_timeout(240),
@@ -686,7 +702,10 @@ pub fn hermes_agent_plan() -> InstallerPlan {
             InstallerStep::new(
                 "pip_install",
                 "cd /opt/claws/hermes-agent && \
-                 pip3 install --break-system-packages --no-cache-dir --ignore-installed -e \".[all]\"",
+                 python3 -m venv /opt/hermes-agent-venv && \
+                 /opt/hermes-agent-venv/bin/pip install --quiet --upgrade pip && \
+                 /opt/hermes-agent-venv/bin/pip install --no-cache-dir --ignore-installed -e \".[all]\" && \
+                 ln -sf /opt/hermes-agent-venv/bin/hermes /usr/local/bin/hermes",
             )
             .with_check("command -v hermes >/dev/null 2>&1")
             .with_timeout(600)
@@ -760,25 +779,14 @@ pub fn hermes_agent_plan() -> InstallerPlan {
 ///   `NOCLAW_CODEX_VERSION`       — pin Codex version (optional)
 #[must_use]
 pub fn noclaw_plan() -> InstallerPlan {
-    let claude_code_version = std::env::var("NOCLAW_CLAUDE_CODE_VERSION").unwrap_or_default();
-    let opencode_version = std::env::var("NOCLAW_OPENCODE_VERSION").unwrap_or_default();
-    let codex_version = std::env::var("NOCLAW_CODEX_VERSION").unwrap_or_default();
+    let claude_code_version =
+        env_or_default("NOCLAW_CLAUDE_CODE_VERSION", DEFAULT_CLAUDE_CODE_VERSION);
+    let opencode_version = env_or_default("NOCLAW_OPENCODE_VERSION", DEFAULT_OPENCODE_VERSION);
+    let codex_version = env_or_default("NOCLAW_CODEX_VERSION", DEFAULT_CODEX_VERSION);
 
-    let claude_code_pkg = if claude_code_version.is_empty() {
-        "@anthropic-ai/claude-code".to_string()
-    } else {
-        format!("@anthropic-ai/claude-code@{claude_code_version}")
-    };
-    let opencode_pkg = if opencode_version.is_empty() {
-        "opencode-ai@latest".to_string()
-    } else {
-        format!("opencode-ai@{opencode_version}")
-    };
-    let codex_pkg = if codex_version.is_empty() {
-        "@openai/codex".to_string()
-    } else {
-        format!("@openai/codex@{codex_version}")
-    };
+    let claude_code_pkg = format!("@anthropic-ai/claude-code@{claude_code_version}");
+    let opencode_pkg = format!("opencode-ai@{opencode_version}");
+    let codex_pkg = format!("@openai/codex@{codex_version}");
 
     let install_claude_cmd = format!("npm install -g {claude_code_pkg}");
     let install_opencode_cmd = format!("npm install -g {opencode_pkg}");
@@ -979,6 +987,7 @@ pub fn build_env_vars(claw_type: &str) -> &'static [&'static str] {
 mod tests {
     use super::*;
     use crate::ssh_client::test_utils::{MockSshSession, SshCall};
+    use core_rs::node_source::NODESOURCE_REPO_KEY_SHA256;
 
     #[test]
     fn nullclaw_plan_has_four_steps() {
@@ -1154,10 +1163,10 @@ mod tests {
         assert_eq!(plan.steps[2].phase, "link_binary");
         assert_eq!(plan.steps[3].phase, "create_config_dir");
         assert_eq!(plan.steps[4].phase, "verify");
-        // install_package should use --break-system-packages and nanobot-ai
+        // install_package should use an isolated venv and nanobot-ai
         assert!(
-            plan.steps[1].command.contains("break-system-packages"),
-            "nanobot install should use --break-system-packages"
+            plan.steps[1].command.contains("/opt/nanobot-venv"),
+            "nanobot install should use an isolated venv"
         );
         assert!(
             plan.steps[1].command.contains("nanobot-ai"),
@@ -1183,15 +1192,16 @@ mod tests {
 
         // ── install_node assertions ──────────────────────────────────────
         let install_node = &plan.steps[1];
-        // Must target Node 22 via the explicit NodeSource repo config.
+        // Must target Node 22 via the explicit NodeSource repo config with
+        // reviewed key material, and never execute the remote setup script.
         assert!(
             install_node.command.contains("nodesource.sources"),
             "install_node should configure nodesource.sources, got: {}",
             install_node.command
         );
         assert!(
-            !install_node.command.contains("setup_22"),
-            "install_node should not execute the remote setup script, got: {}",
+            install_node.command.contains(NODESOURCE_REPO_KEY_SHA256),
+            "install_node should verify the NodeSource key SHA-256, got: {}",
             install_node.command
         );
         // Must validate npm is available (not just node)
@@ -1201,6 +1211,11 @@ mod tests {
             install_node.command
         );
         // Must NOT pipe remote setup scripts into a shell.
+        assert!(
+            !install_node.command.contains("setup_22"),
+            "install_node should not execute the remote setup script, got: {}",
+            install_node.command
+        );
         assert!(
             !install_node.command.contains("| bash"),
             "install_node should not pipe to bash, got: {}",
@@ -1218,6 +1233,13 @@ mod tests {
         assert!(
             install_pnpm.command.contains("corepack prepare"),
             "install_pnpm should use corepack prepare, got: {}",
+            install_pnpm.command
+        );
+        assert!(
+            install_pnpm
+                .command
+                .contains(&format!("pnpm@{DEFAULT_PNPM_VERSION}")),
+            "install_pnpm should pin pnpm, got: {}",
             install_pnpm.command
         );
         // Must run inside the cloned repo so corepack reads packageManager
@@ -1242,6 +1264,14 @@ mod tests {
         assert!(
             clone_idx < pnpm_idx,
             "clone_repo (idx={clone_idx}) must come before install_pnpm (idx={pnpm_idx})"
+        );
+        assert!(
+            plan.steps[2].command.contains(DEFAULT_OPENCLAW_REPO_REF),
+            "openclaw clone_repo should fetch the reviewed commit"
+        );
+        assert!(
+            plan.steps[2].command.contains("rev-parse HEAD"),
+            "openclaw clone_repo should verify checked-out HEAD"
         );
 
         // ── build assertions ─────────────────────────────────────────────
@@ -1272,6 +1302,14 @@ mod tests {
         assert!(
             plan.steps[3].idempotency_check.is_some(),
             "zeroclaw build step should have idempotency check"
+        );
+        assert!(
+            plan.steps[2].command.contains(DEFAULT_ZEROCLAW_REPO_REF),
+            "zeroclaw clone_repo should fetch the reviewed commit"
+        );
+        assert!(
+            plan.steps[2].command.contains("rev-parse HEAD"),
+            "zeroclaw clone_repo should verify checked-out HEAD"
         );
     }
 
@@ -1310,15 +1348,20 @@ mod tests {
         assert_eq!(plan.steps[7].phase, "create_config_dir");
         assert_eq!(plan.steps[8].phase, "verify");
         assert_eq!(plan.steps[9].phase, "setup_shell_prompt");
-        // pip_install should use --break-system-packages
+        // pip_install should use an isolated venv
         assert!(
-            plan.steps[3].command.contains("break-system-packages"),
-            "hermes-agent pip_install should use --break-system-packages"
+            plan.steps[3].command.contains("/opt/hermes-agent-venv"),
+            "hermes-agent pip_install should use an isolated venv"
         );
-        // install_node should use the explicit NodeSource repo config.
+        // install_node should use the explicit NodeSource repo config with
+        // reviewed key material.
         assert!(
             plan.steps[1].command.contains("nodesource.sources"),
             "hermes-agent install_node should configure nodesource.sources"
+        );
+        assert!(
+            plan.steps[1].command.contains(NODESOURCE_REPO_KEY_SHA256),
+            "hermes-agent install_node should verify NodeSource key SHA-256"
         );
         assert!(
             !plan.steps[1].command.contains("setup_22"),
@@ -1333,6 +1376,12 @@ mod tests {
         assert!(
             plan.steps[6].idempotency_check.is_some(),
             "hermes-agent install_wrapper should have idempotency check"
+        );
+        assert!(
+            plan.steps[2]
+                .command
+                .contains(DEFAULT_HERMES_AGENT_REPO_REF),
+            "hermes-agent clone_repo should fetch the reviewed commit"
         );
     }
 
@@ -1350,10 +1399,15 @@ mod tests {
         assert_eq!(plan.steps[6].phase, "create_config_dir");
         assert_eq!(plan.steps[7].phase, "verify");
         assert_eq!(plan.steps[8].phase, "setup_shell_prompt");
-        // install_node should use the explicit NodeSource repo config.
+        // install_node should use the explicit NodeSource repo config with
+        // reviewed key material.
         assert!(
             plan.steps[1].command.contains("nodesource.sources"),
             "noclaw install_node should configure nodesource.sources"
+        );
+        assert!(
+            plan.steps[1].command.contains(NODESOURCE_REPO_KEY_SHA256),
+            "noclaw install_node should verify NodeSource key SHA-256"
         );
         assert!(
             !plan.steps[1].command.contains("setup_22"),
@@ -1365,12 +1419,30 @@ mod tests {
             "noclaw should install @anthropic-ai/claude-code"
         );
         assert!(
+            plan.steps[2].command.contains(&format!(
+                "@anthropic-ai/claude-code@{DEFAULT_CLAUDE_CODE_VERSION}"
+            )),
+            "noclaw should pin @anthropic-ai/claude-code"
+        );
+        assert!(
             plan.steps[3].command.contains("opencode-ai"),
             "noclaw should install opencode-ai"
         );
         assert!(
+            plan.steps[3]
+                .command
+                .contains(&format!("opencode-ai@{DEFAULT_OPENCODE_VERSION}")),
+            "noclaw should pin opencode-ai"
+        );
+        assert!(
             plan.steps[4].command.contains("@openai/codex"),
             "noclaw should install @openai/codex"
+        );
+        assert!(
+            plan.steps[4]
+                .command
+                .contains(&format!("@openai/codex@{DEFAULT_CODEX_VERSION}")),
+            "noclaw should pin @openai/codex"
         );
         // All tool installs should have idempotency checks
         for i in 2..=4 {

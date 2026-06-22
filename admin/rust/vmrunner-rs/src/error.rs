@@ -253,7 +253,11 @@ pub enum VmError {
         context: Option<Box<ErrorContext>>,
     },
 
-    #[error("no free SSH port available in range 22000-23999")]
+    #[error(
+        "no free SSH port available in range {}-{}",
+        core_rs::guest_net::SSH_HOST_PORT_RANGE_START,
+        core_rs::guest_net::SSH_HOST_PORT_RANGE_END
+    )]
     NoFreeSshPort,
 
     #[error("{0}")]

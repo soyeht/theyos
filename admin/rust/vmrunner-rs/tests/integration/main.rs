@@ -100,10 +100,14 @@ mod live {
                 std::env::var("FIRECRACKER_BIN")
                     .unwrap_or_else(|_| format!("{home}/firecracker/bin/firecracker")),
             ),
-            kernel_image: PathBuf::from(
-                std::env::var("FIRECRACKER_KERNEL_IMAGE")
-                    .unwrap_or_else(|_| format!("{home}/firecracker/assets/vmlinux-6.1.155")),
-            ),
+            kernel_image: PathBuf::from(std::env::var("FIRECRACKER_KERNEL_IMAGE").unwrap_or_else(
+                |_| {
+                    format!(
+                        "{home}/firecracker/assets/{}",
+                        core_rs::guest_net::KERNEL_FILENAME
+                    )
+                },
+            )),
             base_rootfs: PathBuf::from(std::env::var("FIRECRACKER_BASE_ROOTFS").unwrap_or_else(
                 |_| format!("{home}/firecracker/assets/ubuntu-24.04-rootfs-v2.ext4"),
             )),
