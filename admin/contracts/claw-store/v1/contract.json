@@ -11,8 +11,8 @@
       "auth_kind": "admin_session",
       "handler": "handlers_claws::handle_list_claws",
       "mount": {
-        "file": "admin/rust/server-rs/src/main.rs",
-        "slice": "main_api_rest",
+        "file": "admin/rust/server-rs/src/claw_store_routes.rs",
+        "slice": "admin_routes",
         "route_literal": "/claws",
         "method_helper": "get"
       },
@@ -29,8 +29,8 @@
       "auth_kind": "admin_session",
       "handler": "handlers_claws::handle_get_claw",
       "mount": {
-        "file": "admin/rust/server-rs/src/main.rs",
-        "slice": "main_api_rest",
+        "file": "admin/rust/server-rs/src/claw_store_routes.rs",
+        "slice": "admin_routes",
         "route_literal": "/claws/{name}",
         "method_helper": "get"
       },
@@ -48,8 +48,8 @@
       "auth_kind": "admin_session",
       "handler": "handlers_claws::handle_claw_availability",
       "mount": {
-        "file": "admin/rust/server-rs/src/main.rs",
-        "slice": "main_api_rest",
+        "file": "admin/rust/server-rs/src/claw_store_routes.rs",
+        "slice": "admin_routes",
         "route_literal": "/claws/{name}/availability",
         "method_helper": "get"
       },
@@ -67,8 +67,8 @@
       "auth_kind": "admin_session",
       "handler": "handlers_claws::handle_install_claw",
       "mount": {
-        "file": "admin/rust/server-rs/src/main.rs",
-        "slice": "main_api_rest",
+        "file": "admin/rust/server-rs/src/claw_store_routes.rs",
+        "slice": "admin_routes",
         "route_literal": "/claws/{name}/install",
         "method_helper": "post"
       },
@@ -89,8 +89,8 @@
       "auth_kind": "admin_session",
       "handler": "handlers_claws::handle_uninstall_claw",
       "mount": {
-        "file": "admin/rust/server-rs/src/main.rs",
-        "slice": "main_api_rest",
+        "file": "admin/rust/server-rs/src/claw_store_routes.rs",
+        "slice": "admin_routes",
         "route_literal": "/claws/{name}/uninstall",
         "method_helper": "post"
       },
@@ -110,8 +110,8 @@
       "auth_kind": "mobile_bearer",
       "handler": "handlers_mobile::handle_mobile_claws",
       "mount": {
-        "file": "admin/rust/server-rs/src/main.rs",
-        "slice": "main_mobile_api",
+        "file": "admin/rust/server-rs/src/claw_store_routes.rs",
+        "slice": "mobile_nested_routes",
         "route_literal": "/claws",
         "method_helper": "get"
       },
@@ -128,8 +128,8 @@
       "auth_kind": "mobile_bearer",
       "handler": "handlers_mobile::handle_mobile_claw_availability",
       "mount": {
-        "file": "admin/rust/server-rs/src/main.rs",
-        "slice": "main_app_mobile_direct",
+        "file": "admin/rust/server-rs/src/claw_store_routes.rs",
+        "slice": "mobile_direct_routes",
         "route_literal": "/api/v1/mobile/claws/{name}/availability",
         "method_helper": "get"
       },
@@ -147,8 +147,8 @@
       "auth_kind": "mobile_bearer_admin",
       "handler": "handlers_mobile::handle_mobile_install_claw",
       "mount": {
-        "file": "admin/rust/server-rs/src/main.rs",
-        "slice": "main_app_mobile_direct",
+        "file": "admin/rust/server-rs/src/claw_store_routes.rs",
+        "slice": "mobile_direct_routes",
         "route_literal": "/api/v1/mobile/claws/{name}/install",
         "method_helper": "post"
       },
@@ -170,8 +170,8 @@
       "auth_kind": "mobile_bearer_admin",
       "handler": "handlers_mobile::handle_mobile_uninstall_claw",
       "mount": {
-        "file": "admin/rust/server-rs/src/main.rs",
-        "slice": "main_app_mobile_direct",
+        "file": "admin/rust/server-rs/src/claw_store_routes.rs",
+        "slice": "mobile_direct_routes",
         "route_literal": "/api/v1/mobile/claws/{name}/uninstall",
         "method_helper": "post"
       },
@@ -193,8 +193,8 @@
       "household_operation": "claws.list",
       "handler": "handlers_household_claws::handle_household_list_claws",
       "mount": {
-        "file": "admin/rust/server-rs/src/household_bootstrap.rs",
-        "slice": "household_claws_router",
+        "file": "admin/rust/server-rs/src/claw_store_routes.rs",
+        "slice": "household_routes",
         "route_literal": "/api/v1/household/claws",
         "method_helper": "get"
       },
@@ -212,8 +212,8 @@
       "household_operation": "claws.list",
       "handler": "handlers_household_claws::handle_household_claw_availability",
       "mount": {
-        "file": "admin/rust/server-rs/src/household_bootstrap.rs",
-        "slice": "household_claws_router",
+        "file": "admin/rust/server-rs/src/claw_store_routes.rs",
+        "slice": "household_routes",
         "route_literal": "/api/v1/household/claws/{name}/availability",
         "method_helper": "get"
       },
@@ -232,8 +232,8 @@
       "household_operation": "claws.create",
       "handler": "handlers_household_claws::handle_household_install_claw",
       "mount": {
-        "file": "admin/rust/server-rs/src/household_bootstrap.rs",
-        "slice": "household_claws_router",
+        "file": "admin/rust/server-rs/src/claw_store_routes.rs",
+        "slice": "household_routes",
         "route_literal": "/api/v1/household/claws/{name}/install",
         "method_helper": "post"
       },
@@ -255,8 +255,8 @@
       "household_operation": "claws.delete",
       "handler": "handlers_household_claws::handle_household_uninstall_claw",
       "mount": {
-        "file": "admin/rust/server-rs/src/household_bootstrap.rs",
-        "slice": "household_claws_router",
+        "file": "admin/rust/server-rs/src/claw_store_routes.rs",
+        "slice": "household_routes",
         "route_literal": "/api/v1/household/claws/{name}/uninstall",
         "method_helper": "post"
       },

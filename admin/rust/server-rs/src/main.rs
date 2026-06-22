@@ -16,10 +16,10 @@
 //! | (executor env vars)         | —                        | Forwarded to executor::FlowConfig   |
 
 use server_rs::auth;
+use server_rs::claw_store_routes;
 use server_rs::cloudflare_admin;
 use server_rs::config;
 use server_rs::handlers_admin;
-use server_rs::handlers_claws;
 use server_rs::handlers_instances;
 use server_rs::handlers_invites;
 use server_rs::handlers_jobs;
@@ -696,20 +696,7 @@ async fn main() {
         .route("/me", get(auth::handle_me))
         // Misc
         .route("/claw-types", get(handlers_misc::handle_claw_types))
-        .route("/claws", get(handlers_claws::handle_list_claws))
-        .route("/claws/{name}", get(handlers_claws::handle_get_claw))
-        .route(
-            "/claws/{name}/availability",
-            get(handlers_claws::handle_claw_availability),
-        )
-        .route(
-            "/claws/{name}/install",
-            post(handlers_claws::handle_install_claw),
-        )
-        .route(
-            "/claws/{name}/uninstall",
-            post(handlers_claws::handle_uninstall_claw),
-        )
+        .merge(claw_store_routes::admin_routes())
         .route("/version", get(handlers_misc::handle_version))
         .route("/logs", get(handlers_misc::handle_logs))
         // Network
@@ -954,7 +941,7 @@ async fn main() {
             "/resource-options",
             get(handlers_mobile::handle_resource_options),
         )
-        .route("/claws", get(handlers_mobile::handle_mobile_claws))
+        .merge(claw_store_routes::mobile_nested_routes())
         .with_state(Arc::clone(&state));
 
     let app = Router::new()
@@ -992,18 +979,7 @@ async fn main() {
         // Mobile claw install/uninstall/availability — registered directly to
         // avoid axum nest routing conflict with parameterized paths under
         // /api/v1/mobile.
-        .route(
-            "/api/v1/mobile/claws/{name}/install",
-            post(handlers_mobile::handle_mobile_install_claw).with_state(Arc::clone(&state)),
-        )
-        .route(
-            "/api/v1/mobile/claws/{name}/uninstall",
-            post(handlers_mobile::handle_mobile_uninstall_claw).with_state(Arc::clone(&state)),
-        )
-        .route(
-            "/api/v1/mobile/claws/{name}/availability",
-            get(handlers_mobile::handle_mobile_claw_availability).with_state(Arc::clone(&state)),
-        )
+        .merge(claw_store_routes::mobile_direct_routes(Arc::clone(&state)))
         .nest("/api/v1/mobile", mobile_api)
         .nest("/api/v1", api)
         .fallback_service(spa_service)

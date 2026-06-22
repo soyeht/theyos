@@ -2,6 +2,7 @@ use std::collections::{BTreeMap, HashSet};
 
 use serde::Deserialize;
 use serde_json::Value;
+use server_rs::claw_store_routes;
 
 #[derive(Debug, Deserialize)]
 struct Contract {
@@ -72,6 +73,10 @@ fn household_bootstrap_source() -> &'static str {
     include_str!("../src/household_bootstrap.rs")
 }
 
+fn claw_store_routes_source() -> &'static str {
+    include_str!("../src/claw_store_routes.rs")
+}
+
 fn handlers_claws_source() -> &'static str {
     include_str!("../src/handlers_claws.rs")
 }
@@ -96,10 +101,12 @@ fn between<'a>(source: &'a str, start: &str, end: &str) -> &'a str {
 }
 
 fn function_slice<'a>(source: &'a str, function_name: &str) -> &'a str {
-    let marker = format!("pub async fn {function_name}");
+    let async_marker = format!("pub async fn {function_name}");
+    let sync_marker = format!("pub fn {function_name}");
     let start_idx = source
-        .find(&marker)
-        .unwrap_or_else(|| panic!("missing function marker: {marker}"));
+        .find(&async_marker)
+        .or_else(|| source.find(&sync_marker))
+        .unwrap_or_else(|| panic!("missing function marker for {function_name}"));
     let rest = &source[start_idx..];
     let end_idx = rest
         .find("\n/// ")
@@ -110,6 +117,9 @@ fn function_slice<'a>(source: &'a str, function_name: &str) -> &'a str {
 
 fn source_slice(mount: &Mount) -> &'static str {
     match (mount.file.as_str(), mount.slice.as_str()) {
+        ("admin/rust/server-rs/src/claw_store_routes.rs", slice) => {
+            function_slice(claw_store_routes_source(), slice)
+        }
         ("admin/rust/server-rs/src/main.rs", "main_api_rest") => between(
             main_source(),
             "let api_rest = Router::new()",
@@ -215,11 +225,49 @@ fn claw_store_v1_contract_metadata_is_valid() {
     let contract = contract();
     assert_eq!(contract.name, "claw-store");
     assert_eq!(contract.version, 1);
-    assert_eq!(contract.routes.len(), 13);
+    assert_eq!(contract.routes.len(), claw_store_routes::ROUTES.len());
 
     let mut ids = HashSet::new();
     for route in &contract.routes {
+        let registry = claw_store_routes::route_by_id(&route.id)
+            .unwrap_or_else(|| panic!("{} must exist in claw_store_routes", route.id));
         assert!(ids.insert(&route.id), "duplicate route id {}", route.id);
+        assert_eq!(
+            route.surface, registry.surface,
+            "{} surface must match claw_store_routes",
+            route.id
+        );
+        assert_eq!(
+            route.method, registry.method,
+            "{} method must match claw_store_routes",
+            route.id
+        );
+        assert_eq!(
+            route.path_template, registry.path_template,
+            "{} path template must match claw_store_routes",
+            route.id
+        );
+        assert_eq!(
+            route.household_operation.as_deref(),
+            registry.household_operation,
+            "{} household operation must match claw_store_routes",
+            route.id
+        );
+        assert_eq!(
+            route.mount.file, registry.mount_file,
+            "{} mount file must match claw_store_routes",
+            route.id
+        );
+        assert_eq!(
+            route.mount.slice, registry.mount_slice,
+            "{} mount slice must match claw_store_routes",
+            route.id
+        );
+        assert_eq!(
+            route.mount.route_literal, registry.route_literal,
+            "{} route literal must match claw_store_routes",
+            route.id
+        );
         assert!(
             route.path_template.starts_with("/api/v1/"),
             "{} must declare a full API path template",
@@ -311,12 +359,13 @@ fn claw_store_v1_contract_metadata_is_valid() {
 #[test]
 fn claw_store_v1_routes_are_mounted_with_declared_handlers() {
     for route in contract().routes {
+        let registry = claw_store_routes::route_by_id(&route.id)
+            .unwrap_or_else(|| panic!("{} must exist in claw_store_routes", route.id));
         let slice = source_slice(&route.mount);
-        let route_token = format!("\"{}\"", route.mount.route_literal);
-        let route_idx = slice.find(&route_token).unwrap_or_else(|| {
+        let route_idx = slice.find(registry.route_expr).unwrap_or_else(|| {
             panic!(
-                "{} must mount route literal {} in {}#{}",
-                route.id, route.mount.route_literal, route.mount.file, route.mount.slice
+                "{} must mount route expression {} in {}#{}",
+                route.id, registry.route_expr, route.mount.file, route.mount.slice
             )
         });
         let local = &slice[route_idx..slice.len().min(route_idx + 700)];
