@@ -27,6 +27,7 @@ use core_rs::{
 use percent_encoding::{AsciiSet, CONTROLS, utf8_percent_encode};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use vmrunner_common_rs::VmCreateResourceSpec;
 
 const DEEP_LINK_QUERY_VALUE_SET: &AsciiSet = &CONTROLS
     .add(b' ')
@@ -199,10 +200,17 @@ fn build_resource_options_response(
     disk_max: u32,
     is_macos: bool,
 ) -> Result<ResourceOptionsResponse, crate::capacity::CapacityError> {
+    let defaults = VmCreateResourceSpec::default().resolve();
     Ok(ResourceOptionsResponse {
-        cpu_cores: build_resource_option_range("CPU", 1, cpu_max, 2, None)?,
-        ram_mb: build_resource_option_range("RAM", 512, ram_max, 2048, None)?,
-        disk_gb: build_resource_option_range("disk", 5, disk_max, 10, Some(is_macos))?,
+        cpu_cores: build_resource_option_range("CPU", 1, cpu_max, defaults.cpu_cores, None)?,
+        ram_mb: build_resource_option_range("RAM", 512, ram_max, defaults.ram_mb, None)?,
+        disk_gb: build_resource_option_range(
+            "disk",
+            5,
+            disk_max,
+            defaults.disk_gb,
+            Some(is_macos),
+        )?,
     })
 }
 
@@ -1475,9 +1483,11 @@ pub(crate) async fn create_mobile_instance_for_actor(
 
     // Validate resources — only enforce physical minimums.
     // Maximum limits enforced dynamically by check_capacity().
-    let cpu_cores = req.cpu_cores.unwrap_or(2);
-    let ram_mb = req.ram_mb.unwrap_or(2048);
-    let disk_gb = req.disk_gb.unwrap_or(10);
+    let resources =
+        VmCreateResourceSpec::from_options(req.cpu_cores, req.ram_mb, req.disk_gb).resolve();
+    let cpu_cores = resources.cpu_cores;
+    let ram_mb = resources.ram_mb;
+    let disk_gb = resources.disk_gb;
     if cpu_cores < 1 {
         return Err(ApiError::bad_request("cpu_cores must be at least 1"));
     }

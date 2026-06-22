@@ -4,7 +4,7 @@ use serde_json::Value;
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use vmrunner_common_rs::VmCreateResourceSpec;
+use vmrunner_common_rs::{DEFAULT_CREATE_CPU_CORES, DEFAULT_CREATE_RAM_MB, VmCreateResourceSpec};
 use vmrunner_macos_rs::{
     AdmissionError, ManagedMacOSVm, VZMacOSVmConfigurationBuilder, VZVirtualMachine,
     VZVirtualMachineConfigurationBuilder, VmAdmission, VmKind, VmLease, VmState, build_cidata_iso,
@@ -684,7 +684,8 @@ fn handle_create(params: &Value, state: &Arc<IpcState>) -> Response {
         _ => return Response::err("port is required"),
     };
 
-    let (cpus, memory_mb, _disk_gb) = parse_resource_params(params, 2, 2048);
+    let (cpus, memory_mb, _disk_gb) =
+        parse_resource_params(params, DEFAULT_CREATE_CPU_CORES, DEFAULT_CREATE_RAM_MB);
     let guest_os = params["guest_os"]
         .as_str()
         .unwrap_or(if cfg!(target_os = "macos") {
@@ -2024,7 +2025,8 @@ fn handle_linux_base_install(params: &Value) -> Response {
 
     let force = params["force"].as_bool().unwrap_or(false);
     let force_provision = params["force_provision"].as_bool().unwrap_or(false);
-    let (cpus, memory_mb, _disk_gb) = parse_resource_params(params, 2, 2048);
+    let (cpus, memory_mb, _disk_gb) =
+        parse_resource_params(params, DEFAULT_CREATE_CPU_CORES, DEFAULT_CREATE_RAM_MB);
     let image_url = params["image_url"]
         .as_str()
         .filter(|s| !s.is_empty())
@@ -2833,12 +2835,23 @@ fn generate_mac() -> String {
 #[cfg(test)]
 mod resource_param_tests {
     use serde_json::json;
+    use vmrunner_common_rs::{
+        DEFAULT_CREATE_CPU_CORES, DEFAULT_CREATE_DISK_GB, DEFAULT_CREATE_RAM_MB,
+    };
 
     #[test]
     fn parse_resource_params_uses_current_defaults() {
         assert_eq!(
-            super::parse_resource_params(&json!({}), 2, 2048),
-            (2, 2048, 10)
+            super::parse_resource_params(
+                &json!({}),
+                DEFAULT_CREATE_CPU_CORES,
+                DEFAULT_CREATE_RAM_MB
+            ),
+            (
+                DEFAULT_CREATE_CPU_CORES,
+                DEFAULT_CREATE_RAM_MB,
+                u64::from(DEFAULT_CREATE_DISK_GB)
+            )
         );
     }
 
@@ -2851,8 +2864,8 @@ mod resource_param_tests {
                     "ram_mb": 4096,
                     "disk_gb": 20
                 }),
-                2,
-                2048
+                DEFAULT_CREATE_CPU_CORES,
+                DEFAULT_CREATE_RAM_MB
             ),
             (4, 4096, 20)
         );
@@ -2867,10 +2880,14 @@ mod resource_param_tests {
                     "ram_mb": 9_999_999_999_u64,
                     "disk_gb": null
                 }),
-                2,
-                2048
+                DEFAULT_CREATE_CPU_CORES,
+                DEFAULT_CREATE_RAM_MB
             ),
-            (2, 2048, 10)
+            (
+                DEFAULT_CREATE_CPU_CORES,
+                DEFAULT_CREATE_RAM_MB,
+                u64::from(DEFAULT_CREATE_DISK_GB)
+            )
         );
     }
 }
