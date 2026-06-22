@@ -78,9 +78,7 @@ fn slirp_add_hostfwd_with_retry(
     use std::os::unix::net::UnixStream;
     use std::thread::sleep;
 
-    let payload = format!(
-        r#"{{"execute":"add_hostfwd","arguments":{{"proto":"tcp","host_addr":"127.0.0.1","host_port":{host_port},"guest_addr":"10.0.2.100","guest_port":{guest_port}}}}}"#
-    );
+    let payload = core_rs::guest_net::slirp_add_hostfwd_payload(host_port, guest_port);
 
     let mut last_err = String::new();
 

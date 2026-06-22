@@ -1,0 +1,406 @@
+{
+  "contract": "claw-store",
+  "version": 1,
+  "description": "Current Claw Store HTTP wire contract. Pin before centralizing route/service logic.",
+  "routes": [
+    {
+      "id": "admin_list_claws",
+      "surface": "admin",
+      "method": "GET",
+      "path_template": "/api/v1/claws",
+      "auth_kind": "admin_session",
+      "handler": "handlers_claws::handle_list_claws",
+      "mount": {
+        "file": "admin/rust/server-rs/src/claw_store_routes.rs",
+        "slice": "admin_routes",
+        "route_literal": "/claws",
+        "method_helper": "get"
+      },
+      "expectations": {
+        "success": { "status": 200, "fixture": "list_envelope_ready" },
+        "auth_error": { "status": 401, "fixture": "admin_auth_unauthorized" }
+      }
+    },
+    {
+      "id": "admin_get_claw",
+      "surface": "admin",
+      "method": "GET",
+      "path_template": "/api/v1/claws/{name}",
+      "auth_kind": "admin_session",
+      "handler": "handlers_claws::handle_get_claw",
+      "mount": {
+        "file": "admin/rust/server-rs/src/claw_store_routes.rs",
+        "slice": "admin_routes",
+        "route_literal": "/claws/{name}",
+        "method_helper": "get"
+      },
+      "expectations": {
+        "success": { "status": 200, "fixture": "detail_ready" },
+        "unknown": { "status": 404, "fixture": "unknown_claw_error" },
+        "auth_error": { "status": 401, "fixture": "admin_auth_unauthorized" }
+      }
+    },
+    {
+      "id": "admin_claw_availability",
+      "surface": "admin",
+      "method": "GET",
+      "path_template": "/api/v1/claws/{name}/availability",
+      "auth_kind": "admin_session",
+      "handler": "handlers_claws::handle_claw_availability",
+      "mount": {
+        "file": "admin/rust/server-rs/src/claw_store_routes.rs",
+        "slice": "admin_routes",
+        "route_literal": "/claws/{name}/availability",
+        "method_helper": "get"
+      },
+      "expectations": {
+        "success": { "status": 200, "fixture": "unknown_availability" },
+        "unknown": { "status": 200, "fixture": "unknown_availability" },
+        "auth_error": { "status": 401, "fixture": "admin_auth_unauthorized" }
+      }
+    },
+    {
+      "id": "admin_install_claw",
+      "surface": "admin",
+      "method": "POST",
+      "path_template": "/api/v1/claws/{name}/install",
+      "auth_kind": "admin_session",
+      "handler": "handlers_claws::handle_install_claw",
+      "mount": {
+        "file": "admin/rust/server-rs/src/claw_store_routes.rs",
+        "slice": "admin_routes",
+        "route_literal": "/claws/{name}/install",
+        "method_helper": "post"
+      },
+      "expectations": {
+        "queued": { "status": 200, "fixture": "install_queued_job_schema" },
+        "already_installing": { "status": 200, "fixture": "already_installing_job_body" },
+        "unknown": { "status": 404, "fixture": "unknown_claw_error" },
+        "unavailable": { "status": 400, "fixture": "install_unavailable_reasons_object" },
+        "already_ready": { "status": 400, "fixture": "already_ready_error" },
+        "auth_error": { "status": 401, "fixture": "admin_auth_unauthorized" }
+      }
+    },
+    {
+      "id": "admin_uninstall_claw",
+      "surface": "admin",
+      "method": "POST",
+      "path_template": "/api/v1/claws/{name}/uninstall",
+      "auth_kind": "admin_session",
+      "handler": "handlers_claws::handle_uninstall_claw",
+      "mount": {
+        "file": "admin/rust/server-rs/src/claw_store_routes.rs",
+        "slice": "admin_routes",
+        "route_literal": "/claws/{name}/uninstall",
+        "method_helper": "post"
+      },
+      "expectations": {
+        "queued": { "status": 200, "fixture": "uninstall_queued_job_schema" },
+        "unknown": { "status": 404, "fixture": "unknown_claw_error" },
+        "not_ready": { "status": 400, "fixture": "not_installed_error" },
+        "instances_exist": { "status": 400, "fixture": "uninstall_instances_exist_error" },
+        "auth_error": { "status": 401, "fixture": "admin_auth_unauthorized" }
+      }
+    },
+    {
+      "id": "mobile_list_claws",
+      "surface": "mobile",
+      "method": "GET",
+      "path_template": "/api/v1/mobile/claws",
+      "auth_kind": "mobile_bearer",
+      "handler": "handlers_mobile::handle_mobile_claws",
+      "mount": {
+        "file": "admin/rust/server-rs/src/claw_store_routes.rs",
+        "slice": "mobile_nested_routes",
+        "route_literal": "/claws",
+        "method_helper": "get"
+      },
+      "expectations": {
+        "success": { "status": 200, "fixture": "list_envelope_ready" },
+        "auth_error": { "status": 401, "fixture": "mobile_missing_auth" }
+      }
+    },
+    {
+      "id": "mobile_claw_availability",
+      "surface": "mobile",
+      "method": "GET",
+      "path_template": "/api/v1/mobile/claws/{name}/availability",
+      "auth_kind": "mobile_bearer",
+      "handler": "handlers_mobile::handle_mobile_claw_availability",
+      "mount": {
+        "file": "admin/rust/server-rs/src/claw_store_routes.rs",
+        "slice": "mobile_direct_routes",
+        "route_literal": "/api/v1/mobile/claws/{name}/availability",
+        "method_helper": "get"
+      },
+      "expectations": {
+        "success": { "status": 200, "fixture": "unknown_availability" },
+        "unknown": { "status": 200, "fixture": "unknown_availability" },
+        "auth_error": { "status": 401, "fixture": "mobile_missing_auth" }
+      }
+    },
+    {
+      "id": "mobile_install_claw",
+      "surface": "mobile",
+      "method": "POST",
+      "path_template": "/api/v1/mobile/claws/{name}/install",
+      "auth_kind": "mobile_bearer_admin",
+      "handler": "handlers_mobile::handle_mobile_install_claw",
+      "mount": {
+        "file": "admin/rust/server-rs/src/claw_store_routes.rs",
+        "slice": "mobile_direct_routes",
+        "route_literal": "/api/v1/mobile/claws/{name}/install",
+        "method_helper": "post"
+      },
+      "expectations": {
+        "queued": { "status": 200, "fixture": "install_queued_job_schema" },
+        "already_installing": { "status": 409, "fixture": "already_installing_job_body" },
+        "unknown": { "status": 404, "fixture": "unknown_claw_error" },
+        "unavailable": { "status": 400, "fixture": "install_unavailable_reasons_object" },
+        "already_ready": { "status": 400, "fixture": "already_ready_error" },
+        "admin_required": { "status": 403, "fixture": "mobile_admin_required" },
+        "auth_error": { "status": 401, "fixture": "mobile_missing_auth" }
+      }
+    },
+    {
+      "id": "mobile_uninstall_claw",
+      "surface": "mobile",
+      "method": "POST",
+      "path_template": "/api/v1/mobile/claws/{name}/uninstall",
+      "auth_kind": "mobile_bearer_admin",
+      "handler": "handlers_mobile::handle_mobile_uninstall_claw",
+      "mount": {
+        "file": "admin/rust/server-rs/src/claw_store_routes.rs",
+        "slice": "mobile_direct_routes",
+        "route_literal": "/api/v1/mobile/claws/{name}/uninstall",
+        "method_helper": "post"
+      },
+      "expectations": {
+        "queued": { "status": 200, "fixture": "uninstall_queued_job_schema" },
+        "unknown": { "status": 404, "fixture": "unknown_claw_error" },
+        "not_ready": { "status": 400, "fixture": "not_installed_error" },
+        "instances_exist": { "status": 400, "fixture": "uninstall_instances_exist_error" },
+        "admin_required": { "status": 403, "fixture": "mobile_admin_required" },
+        "auth_error": { "status": 401, "fixture": "mobile_missing_auth" }
+      }
+    },
+    {
+      "id": "household_list_claws",
+      "surface": "household",
+      "method": "GET",
+      "path_template": "/api/v1/household/claws",
+      "auth_kind": "household_pop",
+      "household_operation": "claws.list",
+      "handler": "handlers_household_claws::handle_household_list_claws",
+      "mount": {
+        "file": "admin/rust/server-rs/src/claw_store_routes.rs",
+        "slice": "household_routes",
+        "route_literal": "/api/v1/household/claws",
+        "method_helper": "get"
+      },
+      "expectations": {
+        "success": { "status": 200, "fixture": "list_envelope_ready" },
+        "auth_error": { "status": 401, "fixture": "empty_body" }
+      }
+    },
+    {
+      "id": "household_claw_availability",
+      "surface": "household",
+      "method": "GET",
+      "path_template": "/api/v1/household/claws/{name}/availability",
+      "auth_kind": "household_pop",
+      "household_operation": "claws.list",
+      "handler": "handlers_household_claws::handle_household_claw_availability",
+      "mount": {
+        "file": "admin/rust/server-rs/src/claw_store_routes.rs",
+        "slice": "household_routes",
+        "route_literal": "/api/v1/household/claws/{name}/availability",
+        "method_helper": "get"
+      },
+      "expectations": {
+        "success": { "status": 200, "fixture": "unknown_availability" },
+        "unknown": { "status": 200, "fixture": "unknown_availability" },
+        "auth_error": { "status": 401, "fixture": "empty_body" }
+      }
+    },
+    {
+      "id": "household_install_claw",
+      "surface": "household",
+      "method": "POST",
+      "path_template": "/api/v1/household/claws/{name}/install",
+      "auth_kind": "household_pop",
+      "household_operation": "claws.create",
+      "handler": "handlers_household_claws::handle_household_install_claw",
+      "mount": {
+        "file": "admin/rust/server-rs/src/claw_store_routes.rs",
+        "slice": "household_routes",
+        "route_literal": "/api/v1/household/claws/{name}/install",
+        "method_helper": "post"
+      },
+      "expectations": {
+        "queued": { "status": 200, "fixture": "install_queued_job_schema" },
+        "already_installing": { "status": 200, "fixture": "already_installing_job_body" },
+        "unknown": { "status": 404, "fixture": "unknown_claw_error" },
+        "unavailable": { "status": 400, "fixture": "install_unavailable_reasons_object" },
+        "already_ready": { "status": 400, "fixture": "already_ready_error" },
+        "auth_error": { "status": 401, "fixture": "empty_body" }
+      }
+    },
+    {
+      "id": "household_uninstall_claw",
+      "surface": "household",
+      "method": "POST",
+      "path_template": "/api/v1/household/claws/{name}/uninstall",
+      "auth_kind": "household_pop",
+      "household_operation": "claws.delete",
+      "handler": "handlers_household_claws::handle_household_uninstall_claw",
+      "mount": {
+        "file": "admin/rust/server-rs/src/claw_store_routes.rs",
+        "slice": "household_routes",
+        "route_literal": "/api/v1/household/claws/{name}/uninstall",
+        "method_helper": "post"
+      },
+      "expectations": {
+        "queued": { "status": 200, "fixture": "uninstall_queued_job_schema" },
+        "unknown": { "status": 404, "fixture": "unknown_claw_error" },
+        "not_ready": { "status": 400, "fixture": "not_installed_error" },
+        "instances_exist": { "status": 400, "fixture": "uninstall_instances_exist_error" },
+        "auth_error": { "status": 401, "fixture": "empty_body" }
+      }
+    }
+  ],
+  "fixtures": {
+    "list_item_ready": {
+      "name": "picoclaw",
+      "description": "Tiny test claw",
+      "language": "rust",
+      "buildable": true,
+      "version": "1.0.0",
+      "binary_size_mb": 10,
+      "min_ram_mb": 512,
+      "license": "MIT",
+      "distribution": "prebuilt",
+      "status": "ready",
+      "tier": "supported",
+      "install_plan_source": "builtin",
+      "installable": true
+    },
+    "list_envelope_ready": {
+      "data": [
+        {
+          "name": "picoclaw",
+          "description": "Tiny test claw",
+          "language": "rust",
+          "buildable": true,
+          "version": "1.0.0",
+          "binary_size_mb": 10,
+          "min_ram_mb": 512,
+          "license": "MIT",
+          "distribution": "prebuilt",
+          "status": "ready",
+          "tier": "supported",
+          "install_plan_source": "builtin",
+          "installable": true
+        }
+      ],
+      "has_more": false,
+      "next_cursor": null
+    },
+    "detail_ready": {
+      "name": "picoclaw",
+      "description": "Tiny test claw",
+      "language": "rust",
+      "buildable": true,
+      "status": "ready",
+      "installed_at": "2026-06-20T00:00:00Z",
+      "job_id": "job-alpha",
+      "error": null
+    },
+    "already_installing_job_body": {
+      "job_id": "job-alpha",
+      "message": "install already in progress"
+    },
+    "install_queued_job_schema": {
+      "schema": "claw_job_response_pattern",
+      "job_id_pattern": "^job_[0-9a-f]{16}$",
+      "message": "install queued for picoclaw"
+    },
+    "uninstall_queued_job_schema": {
+      "schema": "claw_job_response_pattern",
+      "job_id_pattern": "^job_[0-9a-f]{16}$",
+      "message": "uninstall queued for picoclaw"
+    },
+    "unknown_availability": {
+      "name": "unknown-claw",
+      "install": {
+        "status": "not_installed",
+        "progress": null,
+        "installed_at": null,
+        "error": null,
+        "job_id": null
+      },
+      "host": {
+        "cold_path_ready": false,
+        "has_golden": false,
+        "has_base_rootfs": false,
+        "maintenance_blocked": false,
+        "maintenance_retry_after_secs": null
+      },
+      "overall": {
+        "state": "unknown"
+      },
+      "reasons": [
+        {
+          "type": "unknown_type"
+        }
+      ],
+      "degradations": []
+    },
+    "api_error_bad_request_reasons": {
+      "error": "blocked",
+      "code": "INVALID_INPUT",
+      "reasons": {
+        "unavailable_reason_code": "catalog_only"
+      }
+    },
+    "admin_auth_unauthorized": {
+      "error": "unauthorized",
+      "code": "UNAUTHORIZED"
+    },
+    "mobile_missing_auth": {
+      "error": "missing Authorization header",
+      "code": "UNAUTHORIZED"
+    },
+    "mobile_admin_required": {
+      "error": "admin access required",
+      "code": "FORBIDDEN"
+    },
+    "unknown_claw_error": {
+      "error": "unknown claw type: unknown-claw",
+      "code": "NOT_FOUND"
+    },
+    "already_ready_error": {
+      "error": "claw type 'picoclaw' is already installed",
+      "code": "INVALID_INPUT"
+    },
+    "not_installed_error": {
+      "error": "claw type 'picoclaw' is not installed",
+      "code": "INVALID_INPUT"
+    },
+    "uninstall_instances_exist_error": {
+      "error": "cannot uninstall: 1 instance(s) of type 'picoclaw' still exist \u2014 delete them first",
+      "code": "INVALID_INPUT"
+    },
+    "install_unavailable_reasons_object": {
+      "error": "claw type 'claude-claw' is not installable yet: Claude Code plugin, not a server daemon \u2014 installed via `claude plugin install --url https://github.com/andrehuang/claude-claw`. Does not fit the Firecracker VM smoke-test model.",
+      "code": "INVALID_INPUT",
+      "reasons": {
+        "unavailable_reason_code": "catalog_only",
+        "unavailable_reason": "Claude Code plugin, not a server daemon \u2014 installed via `claude plugin install --url https://github.com/andrehuang/claude-claw`. Does not fit the Firecracker VM smoke-test model."
+      }
+    },
+    "empty_body": {
+      "body": "empty"
+    }
+  }
+}

@@ -31,8 +31,6 @@ use store_rs::{InstanceRow, InstanceStatus, NewPublicSite, PublicSiteRow};
 
 const PUBLIC_SITE_HEADER: &str = "x-theyos-public-site";
 const DEFAULT_GUEST_PORT: u16 = 3000;
-const PUBLIC_SITE_PORT_START: u16 = 24000;
-const PUBLIC_SITE_PORT_END: u16 = 25999;
 
 #[derive(Deserialize)]
 pub struct UpsertPublicSitesReq {
@@ -556,7 +554,7 @@ fn allocate_public_site_host_port(db: &store_rs::InstanceDb) -> Result<u16, ApiE
         .filter_map(|port| u16::try_from(port).ok())
         .collect();
 
-    for port in PUBLIC_SITE_PORT_START..=PUBLIC_SITE_PORT_END {
+    for port in core_rs::guest_net::public_site_host_port_range() {
         if used.contains(&port) {
             continue;
         }
@@ -565,9 +563,11 @@ fn allocate_public_site_host_port(db: &store_rs::InstanceDb) -> Result<u16, ApiE
         }
     }
 
-    Err(ApiError::service_unavailable(
-        "no free public site host ports in 24000-25999",
-    ))
+    Err(ApiError::service_unavailable(format!(
+        "no free public site host ports in {}-{}",
+        core_rs::guest_net::PUBLIC_SITE_HOST_PORT_RANGE_START,
+        core_rs::guest_net::PUBLIC_SITE_HOST_PORT_RANGE_END
+    )))
 }
 
 async fn proxy_public_site(
