@@ -27,6 +27,7 @@ use clap::{Parser, Subcommand};
 use core_rs::ipc::client::IpcClient;
 use serde_json::json;
 use std::path::PathBuf;
+use vmrunner_common_rs::{MacOsPrepareRequest, MacOsProvisionAndSnapshotRequest};
 
 /// Initialize or remove the macOS guest base image for theyOS.
 #[derive(Parser)]
@@ -135,12 +136,13 @@ fn cmd_init(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
         println!("(This will take ~30 min on first run — please wait)");
         println!();
 
-        let prepare_params = json!({
-            "force": cli.force,
-            "force_provision": false,
-            "ipsw": cli.ipsw,
-            "registry_url": cli.registry_url,
-        });
+        let prepare_params = MacOsPrepareRequest {
+            force: cli.force,
+            force_provision: false,
+            ipsw: cli.ipsw.clone(),
+            registry_url: cli.registry_url.clone(),
+        }
+        .to_value();
 
         let response = client
             .call("MacOsPrepare", prepare_params)
@@ -183,12 +185,14 @@ fn cmd_init(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
     println!("Step 3/3: Creating base snapshot (single boot + SSH + software)...");
     println!();
 
-    let snapshot_params = json!({
-        "cpus": cli.cpus,
-        "memory_mb": cli.memory_mb,
-        "force_provision": cli.force_provision,
-        "plist_dir": resolve_plist_dir(),
-    });
+    let snapshot_params = MacOsProvisionAndSnapshotRequest {
+        cpus: Some(cli.cpus),
+        memory_mb: Some(cli.memory_mb),
+        force_provision: cli.force_provision,
+        plist_dir: Some(resolve_plist_dir()),
+        ..Default::default()
+    }
+    .to_value();
 
     let response = client
         .call("MacOsProvisionAndSnapshot", snapshot_params)

@@ -161,4 +161,66 @@ mod tests {
             "no-store"
         );
     }
+
+    /// Bootstrap a real (software-keyed) household and wrap it in a loaded state.
+    /// The returned `TempDir` must be kept alive for the duration of the test.
+    fn loaded_state_with_dir() -> (HouseholdState, tempfile::TempDir) {
+        let td = tempdir().unwrap();
+        let identity = bootstrap_or_load(
+            td.path(),
+            BootstrapOpts {
+                household_name: "Sample Home".into(),
+                hostname_label: Some("studio-test".into()),
+            },
+            KeyBackingPolicy::ForceSoftware,
+        )
+        .expect("bootstrap");
+        (HouseholdState::loaded(Arc::new(identity)), td)
+    }
+
+    fn snapshot_router(state: HouseholdState) -> Router {
+        Router::new()
+            .route("/api/v1/household/snapshot", get(snapshot))
+            .with_state(state)
+    }
+
+    // The snapshot endpoint is the owner-PoP gate the iPhone hits to read claws.
+    // `get_identity` is public (503/200 above), but snapshot MUST reject any caller
+    // that does not present a valid PoP — even on a fully bootstrapped household.
+
+    #[tokio::test]
+    async fn snapshot_returns_401_without_authorization_header() {
+        let (state, _td) = loaded_state_with_dir();
+        let resp = snapshot_router(state)
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/api/v1/household/snapshot")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        // Loaded household, but no PoP → AuthError::Missing → 401, not a 200 leak.
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn snapshot_returns_401_with_malformed_pop_header() {
+        let (state, _td) = loaded_state_with_dir();
+        let resp = snapshot_router(state)
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/api/v1/household/snapshot")
+                    // Right prefix, but not the version/p_id/ts/sig structure the
+                    // parser requires → AuthError::Malformed → 401.
+                    .header(header::AUTHORIZATION, "Soyeht-PoP garbage")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
 }

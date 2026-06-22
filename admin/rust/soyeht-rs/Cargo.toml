@@ -39,6 +39,7 @@ tokio      = { workspace = true }
 async-trait = { workspace = true }
 ureq       = { workspace = true }
 vmrunner-rs = { workspace = true }
+vmrunner-common-rs = { workspace = true }
 tracing    = { workspace = true }
 qrcode     = { workspace = true }
 

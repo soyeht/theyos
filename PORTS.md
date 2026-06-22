@@ -5,11 +5,12 @@ All host ports are configurable via `.env` — change them if another project co
 
 ## Infrastructure (fixed per stack)
 
-| Env var              | Default | Bound to    | Service              | Notes                        |
-|----------------------|---------|-------------|----------------------|------------------------------|
-| `CADDY_HTTP_PORT`    | 8080    | 0.0.0.0     | Caddy HTTP           | Tailscale + Cloudflare entry |
-| `CADDY_HTTPS_PORT`   | 8443    | 0.0.0.0     | Caddy HTTPS          |                              |
-| `ADMIN_PORT`         | 8892    | 127.0.0.1   | Rust admin panel     | Direct access / healthcheck  |
+| Env var                 | Default | Bound to    | Service              | Notes                                |
+|-------------------------|---------|-------------|----------------------|--------------------------------------|
+| `CADDY_HTTP_PORT`       | 8080    | 0.0.0.0     | Caddy HTTP           | Tailscale + Cloudflare entry         |
+| `CADDY_HTTPS_PORT`      | 8443    | 0.0.0.0     | Caddy HTTPS          |                                      |
+| `ADMIN_PORT`            | 8892    | 127.0.0.1   | Rust admin panel     | Direct access / healthcheck          |
+| `THEYOS_HOUSEHOLD_PORT` | 8091    | LAN / mesh  | Household engine     | iPhone-facing bootstrap + household API; `server_rs::household_bootstrap::DEFAULT_HOUSEHOLD_PORT` |
 
 ## Dynamic claw instances
 

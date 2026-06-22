@@ -450,7 +450,6 @@ mod macos {
 
     use super::{InFlightGuard, LaunchOutcome};
     use core_rs::ipc::client::IpcClient;
-    use serde_json::json;
     use std::path::PathBuf;
 
     #[derive(Debug, Clone)]
@@ -607,12 +606,13 @@ mod macos {
         // Step 1 — non-privileged download + install. ~30 min; stdin
         // stays connected to the IPC client which only sends JSON-RPC
         // frames, never a password prompt.
-        let prepare_params = json!({
-            "force": force,
-            "force_provision": false,
-            "ipsw": serde_json::Value::Null,
-            "registry_url": registry_url,
-        });
+        let prepare_params = vmrunner_common_rs::MacOsPrepareRequest {
+            force,
+            force_provision: false,
+            ipsw: None,
+            registry_url,
+        }
+        .to_value();
         let prepare = client
             .call("MacOsPrepare", prepare_params)
             .map_err(|e| format!("MacOsPrepare: {e}"))?;
@@ -634,12 +634,14 @@ mod macos {
         // fallback above is the canonical guarantee that the iPhone
         // sees `failed` (and not `pending`) even if the IPC subprocess
         // crashes before transitioning the file.
-        let snapshot_params = json!({
-            "cpus": 4u32,
-            "memory_mb": 4096u32,
-            "force_provision": false,
-            "plist_dir": resolve_plist_dir(),
-        });
+        let snapshot_params = vmrunner_common_rs::MacOsProvisionAndSnapshotRequest {
+            cpus: Some(4),
+            memory_mb: Some(4096),
+            force_provision: false,
+            plist_dir: Some(resolve_plist_dir()),
+            ..Default::default()
+        }
+        .to_value();
         let snapshot = client
             .call("MacOsProvisionAndSnapshot", snapshot_params)
             .map_err(|e| format!("MacOsProvisionAndSnapshot: {e}"))?;

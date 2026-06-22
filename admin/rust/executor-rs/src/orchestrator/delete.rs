@@ -51,7 +51,11 @@ pub fn run_delete_instance_flow(req: &DeleteInstanceFlowRequest) -> FlowResult {
         OrchestratorStep::new("cleanup_systemd").with_param("container", &req.container),
         OrchestratorStep::new("cleanup_fs")
             .with_param("claw_type", &req.claw_type)
-            .with_param("name", &req.name),
+            .with_param("name", &req.name)
+            // The Linux runner locates the rootfs from claw_type/name/state_dir;
+            // the macOS runner keys its per-instance dir on `container`. Pass both
+            // so a single cleanup_fs contract serves both hosts.
+            .with_param("container", &req.container),
         OrchestratorStep::new("delete_db_row"),
         OrchestratorStep::new("remove_from_store"),
         OrchestratorStep::new("remove_container").with_param("container", &req.container),

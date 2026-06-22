@@ -1019,4 +1019,253 @@ mod tests {
         assert_eq!(read_raw(tmp.path()).leases[0].state, LeaseState::Running);
         l.release_clean();
     }
+
+    // ── helpers for the pure-logic / persistence tests below ──────────────────
+
+    fn liveness_from(alive: &[i32]) -> Liveness {
+        let set: HashSet<i32> = alive.iter().copied().collect();
+        Arc::new(move |pid| set.contains(&pid))
+    }
+
+    fn rec(lease_id: &str, owner_pid: i32, boot_id: &str) -> VmLeaseRecord {
+        VmLeaseRecord {
+            lease_id: lease_id.into(),
+            owner_pid,
+            boot_id: boot_id.into(),
+            kind: VmKind::Install,
+            instance_id: None,
+            started_at: 1,
+            state: LeaseState::Running,
+        }
+    }
+
+    fn write_registry_file(dir: &Path, reg: &Registry) {
+        std::fs::write(
+            dir.join(REGISTRY_FILENAME),
+            serde_json::to_string_pretty(reg).unwrap(),
+        )
+        .unwrap();
+    }
+
+    // ── FileGuard read/write I/O paths ────────────────────────────────────────
+
+    #[test]
+    fn file_guard_read_missing_registry_is_default() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join(REGISTRY_FILENAME);
+        let guard = FileGuard::lock_exclusive(&path).expect("lock");
+        let reg = guard.read_registry().expect("read missing");
+        assert!(reg.leases.is_empty());
+        assert!(reg.blocked_boot_id.is_none());
+    }
+
+    #[test]
+    fn file_guard_read_empty_and_whitespace_are_default() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join(REGISTRY_FILENAME);
+        for blob in ["", "   \n\t  "] {
+            std::fs::write(&path, blob).unwrap();
+            let guard = FileGuard::lock_exclusive(&path).expect("lock");
+            let reg = guard.read_registry().expect("read blank");
+            assert!(
+                reg.leases.is_empty(),
+                "blob {blob:?} should decode to default"
+            );
+        }
+    }
+
+    #[test]
+    fn file_guard_read_invalid_json_is_corrupt_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join(REGISTRY_FILENAME);
+        std::fs::write(&path, b"{ not json ]]").unwrap();
+        let guard = FileGuard::lock_exclusive(&path).expect("lock");
+        let err = guard.read_registry().unwrap_err();
+        match err {
+            AdmissionError::Registry(msg) => assert!(msg.contains("corrupt"), "got {msg}"),
+            AdmissionError::HostVmLimitReached { .. } => {
+                panic!("a corrupt registry must surface as a Registry error, not a limit error")
+            }
+        }
+    }
+
+    #[test]
+    fn file_guard_write_then_read_roundtrips_under_one_lock() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join(REGISTRY_FILENAME);
+        let reg = Registry {
+            version: 1,
+            blocked_boot_id: Some("boot-A".into()),
+            leases: vec![rec("a", 10, "boot-A"), rec("b", 11, "boot-A")],
+        };
+        let guard = FileGuard::lock_exclusive(&path).expect("lock");
+        guard.write_registry(&reg).expect("write");
+        let back = guard.read_registry().expect("read back");
+        assert_eq!(back.blocked_boot_id.as_deref(), Some("boot-A"));
+        let ids: Vec<_> = back.leases.iter().map(|l| l.lease_id.clone()).collect();
+        assert_eq!(ids, vec!["a".to_string(), "b".to_string()]);
+    }
+
+    #[test]
+    fn file_guard_write_is_atomic_and_locks_a_sidecar() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join(REGISTRY_FILENAME);
+        {
+            let guard = FileGuard::lock_exclusive(&path).expect("lock");
+            guard.write_registry(&Registry::default()).expect("write");
+        }
+        // The advisory lock lives on a `.lock` sidecar, not the data file.
+        assert!(
+            path.with_extension("lock").exists(),
+            "sidecar lock must exist"
+        );
+        // No leftover temp files from the atomic temp+rename.
+        let leftovers: Vec<_> = std::fs::read_dir(tmp.path())
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|e| e.file_name().to_string_lossy().contains(".tmp."))
+            .collect();
+        assert!(leftovers.is_empty(), "temp left behind: {leftovers:?}");
+    }
+
+    // ── reconcile / count / snapshot pure helpers ─────────────────────────────
+
+    #[test]
+    fn reconcile_drops_other_boot_keeps_same_boot_and_reports_change() {
+        let liveness = liveness_from(&[10]);
+        let mut reg = Registry {
+            version: 1,
+            blocked_boot_id: None,
+            leases: vec![rec("keep", 10, "boot-A"), rec("drop", 10, "boot-OLD")],
+        };
+        assert!(reconcile(&mut reg, "boot-A", &liveness));
+        let ids: Vec<_> = reg.leases.iter().map(|l| l.lease_id.clone()).collect();
+        assert_eq!(ids, vec!["keep".to_string()]);
+        // Second pass: nothing left to change → not changed (idempotent).
+        assert!(!reconcile(&mut reg, "boot-A", &liveness));
+    }
+
+    #[test]
+    fn reconcile_clears_blocked_flag_from_other_boot_only() {
+        let liveness = liveness_from(&[]);
+        let mut reg = Registry {
+            version: 1,
+            blocked_boot_id: Some("boot-OLD".into()),
+            leases: vec![],
+        };
+        assert!(reconcile(&mut reg, "boot-A", &liveness));
+        assert!(reg.blocked_boot_id.is_none());
+        // A current-boot block is preserved (no change).
+        reg.blocked_boot_id = Some("boot-A".into());
+        assert!(!reconcile(&mut reg, "boot-A", &liveness));
+        assert_eq!(reg.blocked_boot_id.as_deref(), Some("boot-A"));
+    }
+
+    #[test]
+    fn count_splits_live_and_orphans_ignoring_other_boots() {
+        let liveness = liveness_from(&[10]); // pid 10 alive, 11 dead
+        let reg = Registry {
+            version: 1,
+            blocked_boot_id: None,
+            leases: vec![
+                rec("live", 10, "boot-A"),
+                rec("orphan", 11, "boot-A"),
+                rec("elsewhere", 10, "boot-OLD"),
+            ],
+        };
+        assert_eq!(count(&reg, "boot-A", &liveness), (1, 1));
+    }
+
+    #[test]
+    fn snapshot_available_saturates_at_zero_when_overcapacity() {
+        let liveness = liveness_from(&[10]);
+        // One more live lease than the host limit allows.
+        let leases = (0..=MACOS_VM_LIMIT)
+            .map(|i| rec(&format!("l{i}"), 10, "boot-A"))
+            .collect();
+        let reg = Registry {
+            version: 1,
+            blocked_boot_id: None,
+            leases,
+        };
+        let snap = snapshot(&reg, "boot-A", &liveness);
+        assert_eq!(snap.live, MACOS_VM_LIMIT + 1);
+        assert_eq!(
+            snap.available, 0,
+            "available must floor at 0, never underflow"
+        );
+        assert!(!snap.host_blocked);
+    }
+
+    #[test]
+    fn snapshot_reports_host_blocked_only_for_current_boot() {
+        let liveness = liveness_from(&[]);
+        let mut reg = Registry {
+            version: 1,
+            blocked_boot_id: Some("boot-A".into()),
+            leases: vec![],
+        };
+        assert!(snapshot(&reg, "boot-A", &liveness).host_blocked);
+        reg.blocked_boot_id = Some("boot-OTHER".into());
+        assert!(!snapshot(&reg, "boot-A", &liveness).host_blocked);
+    }
+
+    // ── set_lease_state / remove_lease persistence helpers ────────────────────
+
+    #[test]
+    fn set_lease_state_updates_known_and_noops_unknown() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join(REGISTRY_FILENAME);
+        write_registry_file(
+            tmp.path(),
+            &Registry {
+                version: 1,
+                blocked_boot_id: None,
+                leases: vec![rec("known", 10, "boot-A")],
+            },
+        );
+        // Unknown id: Ok, no mutation.
+        set_lease_state(&path, "nope", LeaseState::Stopping).expect("noop ok");
+        assert_eq!(read_raw(tmp.path()).leases[0].state, LeaseState::Running);
+        // Known id: state updated and persisted.
+        set_lease_state(&path, "known", LeaseState::Stopping).expect("update ok");
+        assert_eq!(read_raw(tmp.path()).leases[0].state, LeaseState::Stopping);
+    }
+
+    #[test]
+    fn remove_lease_removes_known_and_noops_unknown() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join(REGISTRY_FILENAME);
+        write_registry_file(
+            tmp.path(),
+            &Registry {
+                version: 1,
+                blocked_boot_id: None,
+                leases: vec![rec("a", 10, "boot-A"), rec("b", 11, "boot-A")],
+            },
+        );
+        remove_lease(&path, "missing").expect("noop ok");
+        assert_eq!(read_raw(tmp.path()).leases.len(), 2);
+        remove_lease(&path, "a").expect("remove ok");
+        let ids: Vec<_> = read_raw(tmp.path())
+            .leases
+            .iter()
+            .map(|l| l.lease_id.clone())
+            .collect();
+        assert_eq!(ids, vec!["b".to_string()]);
+    }
+
+    // ── pid_alive_real errno edges ────────────────────────────────────────────
+
+    #[test]
+    fn pid_alive_real_handles_nonpositive_self_and_dead() {
+        assert!(!pid_alive_real(0), "pid 0 is not a real process to probe");
+        assert!(!pid_alive_real(-1), "negative pid is rejected");
+        assert!(pid_alive_real(current_pid()), "this test process is alive");
+        // launchd (pid 1) always exists; kill(1, 0) returns 0 (root) or EPERM
+        // (non-root) — both map to alive.
+        assert!(pid_alive_real(1), "pid 1 (launchd) must read as alive");
+        // Above macOS PID_MAX (~99998), so reliably absent → ESRCH → dead.
+        assert!(!pid_alive_real(999_999), "an impossible pid reads as dead");
+    }
 }
