@@ -2915,6 +2915,7 @@ mod resource_param_tests {
         DEFAULT_CREATE_CPU_CORES, DEFAULT_CREATE_DISK_GB, DEFAULT_CREATE_RAM_MB,
         MacOsProvisionAndSnapshotRequest,
     };
+    use vmrunner_macos_rs::init_state::InitState;
 
     #[test]
     fn parse_resource_params_uses_current_defaults() {
@@ -3012,6 +3013,118 @@ mod resource_param_tests {
             super::resolve_provision_resources(&req, &json!({ "cpu_cores": 6, "ram_mb": 8192 })),
             (8, 16_384)
         );
+    }
+
+    // ── effective_macos_resources (restore-image minimum merge) ──────────────────
+    //
+    // resolve_provision_resources feeds its (cpus, memory_mb) into
+    // effective_macos_resources, which raises them to the install/snapshot minimums
+    // recorded during base-image install. These pin that merge so the uplift #1 chain
+    // (typed cpus/memory_mb -> snapshot boot sizing) can't regress.
+
+    #[test]
+    fn effective_macos_resources_uses_requested_when_no_minimums() {
+        let st = InitState::default();
+        assert_eq!(super::effective_macos_resources(&st, 4, 4096), (4, 4096));
+    }
+
+    #[test]
+    fn effective_macos_resources_raises_to_install_minimums_but_keeps_larger_request() {
+        let st = InitState {
+            install_cpu_count: Some(8),
+            install_memory_mb: Some(8192),
+            ..InitState::default()
+        };
+        // A request below the install minimum is raised to it...
+        assert_eq!(super::effective_macos_resources(&st, 4, 4096), (8, 8192));
+        // ...but a larger request is preserved (max, never clamped down).
+        assert_eq!(
+            super::effective_macos_resources(&st, 16, 16_384),
+            (16, 16_384)
+        );
+    }
+
+    #[test]
+    fn effective_macos_resources_uses_snapshot_minimum_then_prefers_install() {
+        // Snapshot minimums apply when the install minimums are absent.
+        let snap_only = InitState {
+            snapshot_cpus: Some(6),
+            snapshot_memory_mb: Some(6144),
+            ..InitState::default()
+        };
+        assert_eq!(
+            super::effective_macos_resources(&snap_only, 4, 4096),
+            (6, 6144)
+        );
+        // Install minimums take precedence over snapshot minimums (`.or` ordering).
+        let both = InitState {
+            install_cpu_count: Some(8),
+            install_memory_mb: Some(8192),
+            snapshot_cpus: Some(2),
+            snapshot_memory_mb: Some(2048),
+            ..InitState::default()
+        };
+        assert_eq!(super::effective_macos_resources(&both, 4, 4096), (8, 8192));
+    }
+}
+
+// ── VZ host-limit error classifier ────────────────────────────────────────────
+//
+// macos_vm_limit_exceeded is the string fallback for the VZ active-VM limit when
+// the error arrives only as text; is_macos_vm_limit_error prefers the typed
+// VZError::HostVmLimitReached and falls back to that string match. These pin the
+// match matrix so a VZ message-format change (or an over-broad pattern) is caught.
+#[cfg(test)]
+mod vz_limit_classifier_tests {
+    use super::{is_macos_vm_limit_error, macos_vm_limit_exceeded};
+    use vmrunner_macos_rs::VZError;
+
+    #[test]
+    fn macos_vm_limit_exceeded_matches_known_vz_limit_strings() {
+        for s in [
+            r#"{"code": 6}"#,
+            "NSError Code=6 domain=VZErrorDomain",
+            "VZErrorVirtualMachineLimitExceeded",
+            "reached the maximum supported number of active virtual machines",
+            "Host VM limit reached: 2 running",
+        ] {
+            assert!(
+                macos_vm_limit_exceeded(s),
+                "should classify as limit: {s:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn macos_vm_limit_exceeded_rejects_unrelated_strings() {
+        for s in [
+            "",
+            "Code=5 some other error",
+            "code: 6", // unquoted — not the `"code": 6` JSON shape
+            "disk full",
+            "VZErrorVirtualMachineLimit", // truncated — not the `...Exceeded` variant
+        ] {
+            assert!(
+                !macos_vm_limit_exceeded(s),
+                "should NOT classify as limit: {s:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn is_macos_vm_limit_error_typed_variant_and_string_fallback() {
+        // Typed variant → true regardless of message text.
+        assert!(is_macos_vm_limit_error(&VZError::HostVmLimitReached(
+            "anything".into()
+        )));
+        // Non-limit variant whose Display carries a known limit string → fallback true.
+        assert!(is_macos_vm_limit_error(&VZError::Internal(
+            "boot failed Code=6".into()
+        )));
+        // Non-limit variant with an unrelated message → false.
+        assert!(!is_macos_vm_limit_error(&VZError::Internal(
+            "unrelated failure".into()
+        )));
     }
 }
 
