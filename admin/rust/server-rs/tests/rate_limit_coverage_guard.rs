@@ -108,16 +108,22 @@ enum Class {
 /// it here. A new `rate_limiter.check` site that is not reflected here will fail
 /// `limiter_check_sites_are_exactly_the_classified_set`.
 const COVERAGE: &[(&str, &str, Class)] = &[
-    // --- Rate-limited today (action "create_instance", 3 entrypoints) ---
+    // --- Rate-limited "create_instance" (PR-2b: the single limiter site is the
+    //     shared create_instance_core; the three surfaces inherit it) ---
+    (
+        "create_instance_core",
+        "instance_create.rs",
+        Class::RateLimited("create_instance"),
+    ),
     (
         "handle_create_instance_body",
         "handlers_instances.rs",
-        Class::RateLimited("create_instance"),
+        Class::RateLimitedViaInheritance("create_instance_core"),
     ),
     (
         "create_mobile_instance_for_actor",
         "handlers_mobile.rs",
-        Class::RateLimited("create_instance"),
+        Class::RateLimitedViaInheritance("create_instance_core"),
     ),
     (
         "handle_household_create_instance",
@@ -190,14 +196,30 @@ const COVERAGE: &[(&str, &str, Class)] = &[
 ];
 
 #[test]
-fn create_instance_surfaces_remain_rate_limited() {
+fn create_instance_surfaces_reach_the_single_core_limiter() {
+    // PR-2b: the create_instance limiter lives once in create_instance_core; the
+    // three surfaces reach it by delegating to the core (admin Rich, mobile Bare,
+    // household via the mobile adapter — see household_create_instance_inherits...).
+    assert!(
+        limiter_action_literals(&read("instance_create.rs"))
+            .iter()
+            .any(|a| a == "create_instance"),
+        "create_instance_core must hold the single create_instance limiter check"
+    );
     for file in ["handlers_instances.rs", "handlers_mobile.rs"] {
-        let actions = limiter_action_literals(&read(file));
         assert!(
-            actions.iter().any(|a| a == "create_instance"),
-            "{file} must keep the create_instance rate-limit check"
+            read(file).contains("create_instance_core("),
+            "{file} must delegate to create_instance_core (reaching the limiter)"
         );
     }
+    assert!(
+        read("handlers_instances.rs").contains("RateLimitResponseStyle::Rich"),
+        "admin adapter must call create_instance_core with the Rich 429 style"
+    );
+    assert!(
+        read("handlers_mobile.rs").contains("RateLimitResponseStyle::Bare"),
+        "mobile/household adapter must call create_instance_core with the Bare 429 style"
+    );
 }
 
 #[test]
@@ -230,12 +252,11 @@ fn limiter_check_sites_are_exactly_the_classified_set() {
     }
 
     let mut expected: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    // PR-2b: the create_instance limiter is now the single site inside the shared
+    // create_instance_core (instance_create.rs); the three create surfaces inherit
+    // it by delegating to the core.
     expected.insert(
-        "handlers_instances.rs".to_string(),
-        vec!["create_instance".to_string()],
-    );
-    expected.insert(
-        "handlers_mobile.rs".to_string(),
+        "instance_create.rs".to_string(),
         vec!["create_instance".to_string()],
     );
     expected.insert(

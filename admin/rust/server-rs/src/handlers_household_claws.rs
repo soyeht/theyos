@@ -783,15 +783,15 @@ fn forward<T: IntoResponse, E: IntoResponse>(result: Result<T, E>) -> Response {
 
 async fn household_scope(
     state: &HouseholdClawsState,
-) -> Option<handlers_mobile::HouseholdInstanceScope> {
+) -> Option<crate::instance_create::HouseholdInstanceScope> {
     household_scope_from_state(&state.household).await
 }
 
 async fn household_scope_from_state(
     state: &HouseholdState,
-) -> Option<handlers_mobile::HouseholdInstanceScope> {
+) -> Option<crate::instance_create::HouseholdInstanceScope> {
     let identity = state.current().await?;
-    Some(handlers_mobile::HouseholdInstanceScope {
+    Some(crate::instance_create::HouseholdInstanceScope {
         household_id: identity.record.hh_id.to_string(),
         household_machine_id: identity.cert.m_id.to_string(),
     })

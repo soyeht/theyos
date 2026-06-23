@@ -37,12 +37,15 @@ fn fn_body(src: &str, sig: &str) -> String {
 }
 
 #[test]
-fn admin_create_gates_guest_image_before_rate_limit_insert_and_job() {
-    let src = read("handlers_instances.rs");
-    let body = fn_body(&src, "pub async fn handle_create_instance_body");
+fn core_gates_guest_image_before_rate_limit_insert_and_job() {
+    // PR-2b: the macOS guest-image gate now lives in the shared create_instance_core
+    // and must run BEFORE rate limit / DB insert / Job creation, so an unready host
+    // never enqueues work that can only fail late.
+    let src = read("instance_create.rs");
+    let body = fn_body(&src, "pub(crate) async fn create_instance_core");
     let gate = body
         .find("guest_image_not_ready_response")
-        .expect("admin create must call the shared macOS guest-image gate");
+        .expect("create_instance_core must call the shared macOS guest-image gate");
     for (needle, what) in [
         ("rate_limiter", "rate limit"),
         ("insert_with", "DB insert"),
@@ -50,7 +53,7 @@ fn admin_create_gates_guest_image_before_rate_limit_insert_and_job() {
     ] {
         let idx = body
             .find(needle)
-            .unwrap_or_else(|| panic!("admin create must still perform: {what}"));
+            .unwrap_or_else(|| panic!("create_instance_core must still perform: {what}"));
         assert!(
             gate < idx,
             "the guest-image gate must run BEFORE {what} so an unready macOS host \
@@ -60,14 +63,14 @@ fn admin_create_gates_guest_image_before_rate_limit_insert_and_job() {
 }
 
 #[test]
-fn both_create_paths_use_the_shared_guest_image_gate() {
-    // Both create paths must call the shared helper...
+fn the_core_gates_guest_image_and_handlers_do_not_inline_it() {
+    // PR-2b: the shared core calls the gate helper; the adapters delegate to the
+    // core and must not inline the 409 shape.
+    assert!(
+        read("instance_create.rs").contains("guest_image_not_ready_response"),
+        "create_instance_core must gate macOS create on guest-image readiness via the shared helper"
+    );
     for file in ["handlers_instances.rs", "handlers_mobile.rs"] {
-        assert!(
-            read(file).contains("guest_image_not_ready_response"),
-            "{file} must gate macOS create on guest-image readiness via the shared helper"
-        );
-        // ...and must NOT inline the 409 shape — no residual duplication.
         assert!(
             !read(file).contains("GUEST_IMAGE_NOT_READY"),
             "{file} must not inline the GUEST_IMAGE_NOT_READY shape; it lives once in instance_create"

@@ -10,7 +10,6 @@
 use crate::auth::{AdminUser, AuthUser};
 use crate::claw_store_service;
 use crate::handlers_instances::require_instance;
-use crate::instance_create::rollback_inserted_instance;
 use crate::mobile_token::capabilities_for;
 use crate::responses::{ClawListItemResponse, ListResponse, claw_list_response};
 use crate::state::SharedState;
@@ -43,7 +42,6 @@ const DEEP_LINK_QUERY_VALUE_SET: &AsciiSet = &CONTROLS
     .add(b'>')
     .add(b'?')
     .add(b'`');
-const PROVISIONING_TTL_SECS: i64 = 1200;
 
 #[must_use]
 pub fn mobile_deep_link(action: &str, query_items: &[(&str, &str)]) -> String {
@@ -1331,428 +1329,57 @@ pub async fn handle_mobile_create_instance(
     create_mobile_instance_for_actor(state, username, req, None).await
 }
 
-/// Household scope stamped on instances created through household `PoP` routes.
-#[derive(Clone, Debug)]
-pub(crate) struct HouseholdInstanceScope {
-    pub household_id: String,
-    pub household_machine_id: String,
-}
-
 /// Shared mobile-shaped create-instance implementation.
 ///
 /// The normal `/api/v1/mobile/instances` handler performs bearer-token
 /// authentication and admin lookup before calling this. Household `PoP` routes
 /// call it after owner-key authorization and pass the owner person id as the
 /// actor. Response shape intentionally stays flat `snake_case` for iOS.
-#[allow(clippy::too_many_lines)]
-#[allow(clippy::similar_names)]
 pub(crate) async fn create_mobile_instance_for_actor(
     state: SharedState,
     username: String,
     req: MobileCreateInstanceReq,
-    household_scope: Option<HouseholdInstanceScope>,
+    household_scope: Option<crate::instance_create::HouseholdInstanceScope>,
 ) -> Result<Response, ApiError> {
-    // Validate name
-    let name = store_rs::normalize_slug(&req.name);
-    if name.is_empty() {
-        return Err(ApiError::bad_request("container name is required"));
-    }
-    if name.len() > crate::instance_create::MAX_NAME_LEN {
-        return Err(ApiError::bad_request("container name too long"));
-    }
-
-    // Validate claw type
-    let claw_type = {
-        let ct = store_rs::normalize_slug(&req.claw_type);
-        if ct.is_empty() {
-            "picoclaw".to_string()
-        } else {
-            ct
-        }
-    };
-    if claw_type.len() > crate::instance_create::MAX_CLAW_TYPE_LEN {
-        return Err(ApiError::bad_request("claw type name too long"));
-    }
-    // Unified availability gate: replaces the split-brain
-    // Registry::is_valid + ClawStore::is_ready + maintenance early-return.
-    // See handlers_instances.rs for the identical pattern and rationale.
-    {
-        use core_rs::availability::{OverallState, UnavailReason};
-
-        let avail = crate::availability::project_claw(&claw_type, &state);
-        let reasons_json = serde_json::to_value(&avail.reasons).unwrap_or(serde_json::Value::Null);
-        match avail.overall {
-            OverallState::Creatable => {}
-            OverallState::Unknown => {
-                return Err(ApiError::bad_request_with_reasons(
-                    format!("unknown claw type: {claw_type}"),
-                    reasons_json,
-                ));
-            }
-            OverallState::NotInstalled => {
-                return Err(ApiError::bad_request_with_reasons(
-                    format!(
-                        "claw type '{claw_type}' is not installed — install it from the claw store first"
-                    ),
-                    reasons_json,
-                ));
-            }
-            OverallState::Installing { percent } => {
-                return Err(ApiError::bad_request_with_reasons(
-                    format!(
-                        "claw type '{claw_type}' is still installing ({percent}%) — wait for it to finish"
-                    ),
-                    reasons_json,
-                ));
-            }
-            OverallState::Failed { ref error } => {
-                return Err(ApiError::bad_request_with_reasons(
-                    format!("claw type '{claw_type}' install failed: {error}"),
-                    reasons_json,
-                ));
-            }
-            OverallState::Blocked => {
-                // Maintenance → 503 + Retry-After (transient).
-                // Other blocked reasons → 400 (host config problem).
-                let maintenance_retry = avail.reasons.iter().find_map(|r| match r {
-                    UnavailReason::MaintenanceMode { retry_after_secs } => Some(*retry_after_secs),
-                    _ => None,
-                });
-                if let Some(retry) = maintenance_retry {
-                    return Ok((
-                        StatusCode::SERVICE_UNAVAILABLE,
-                        [("Retry-After", retry.to_string())],
-                        Json(json!({
-                            "error": "service temporarily unavailable — artifact sync in progress",
-                            "code": "SERVICE_UNAVAILABLE",
-                            "reasons": avail.reasons,
-                            "retry_after_secs": retry,
-                        })),
-                    )
-                        .into_response());
-                }
-
-                let blocked_msg = avail
-                    .reasons
-                    .iter()
-                    .find_map(|r| match r {
-                        UnavailReason::NoColdPathAvailable => Some(format!(
-                            "claw type '{claw_type}' cannot be created: no base rootfs or golden image available on this host"
-                        )),
-                        _ => None,
-                    })
-                    .unwrap_or_else(|| {
-                        format!("claw type '{claw_type}' cannot be created right now")
-                    });
-                return Err(ApiError::bad_request_with_reasons(
-                    blocked_msg,
-                    reasons_json,
-                ));
-            }
-        }
-    }
-
-    // Normalize guest_os: empty → platform default, validate known values
-    let guest_os: String = if req.guest_os.is_empty() {
-        (if cfg!(target_os = "macos") {
-            "macos"
-        } else {
-            "linux"
-        })
-        .into()
-    } else {
-        match req.guest_os.as_str() {
-            "macos" | "linux" => req.guest_os.clone(),
-            _ => return Err(ApiError::bad_request("guest_os must be 'macos' or 'linux'")),
-        }
+    let inputs = crate::instance_create::CreateInstanceInputs {
+        name: req.name,
+        claw_type: req.claw_type,
+        guest_os: req.guest_os,
+        cpu_cores: req.cpu_cores,
+        ram_mb: req.ram_mb,
+        disk_gb: req.disk_gb,
+        owner_id: req.owner_id,
+        tools: crate::instance_create::CreateTools::Validated(
+            crate::instance_create::default_mobile_tools(),
+        ),
     };
 
-    #[cfg(target_os = "macos")]
-    {
-        if let Some(resp) = crate::instance_create::guest_image_not_ready_response(
-            &crate::guest_image_state::GuestImageState::read_current(),
-        ) {
-            return Ok(resp);
-        }
-    }
-
-    // Validate resources — only enforce physical minimums.
-    // Maximum limits enforced dynamically by check_capacity().
-    let resources =
-        VmCreateResourceSpec::from_options(req.cpu_cores, req.ram_mb, req.disk_gb).resolve();
-    let cpu_cores = resources.cpu_cores;
-    let ram_mb = resources.ram_mb;
-    let disk_gb = resources.disk_gb;
-    if cpu_cores < 1 {
-        return Err(ApiError::bad_request("cpu_cores must be at least 1"));
-    }
-    if ram_mb < 512 {
-        return Err(ApiError::bad_request("ram_mb must be at least 512"));
-    }
-    if disk_gb < 5 {
-        return Err(ApiError::bad_request("disk_gb must be at least 5"));
-    }
-
-    #[cfg(target_os = "macos")]
-    if req.disk_gb.is_some() {
-        return Err(ApiError::bad_request(
-            "custom disk_gb is not supported on macOS hosts; disk size is determined by the base image",
-        ));
-    }
-
-    // Note: the maintenance gate that used to live here has been folded
-    // into the unified availability projection check above. See
-    // handlers_instances.rs for the same pattern, and AD5.1 in
-    // kind-booping-stearns.md for the design rationale.
-
-    // Rate limit
-    {
-        let st = state.clone();
-        let uname = username.clone();
-        let allowed = blocking(move || {
-            st.rate_limiter
-                .check(&uname, "create_instance")
-                .unwrap_or(true)
-        })
-        .await?;
-        if !allowed {
-            return Ok((
-                StatusCode::TOO_MANY_REQUESTS,
-                Json(json!({"error": "rate limit exceeded", "code": "RATE_LIMITED"})),
-            )
-                .into_response());
-        }
-    }
-
-    let instance_id = format!("inst-{name}");
-    let container = format!("{claw_type}-{name}");
-
-    // Conflict check
-    let conflict = {
-        let st = state.clone();
-        let iid = instance_id.clone();
-        let n = name.clone();
-        blocking(move || {
-            st.instance_db
-                .find_conflict(&iid, &n)
-                .map_err(ApiError::from)
-        })
-        .await??
-    };
-    if conflict.is_some() {
-        return Err(ApiError::bad_request(
-            "instance with this name already exists",
-        ));
-    }
-
-    // Detect host resources (I/O outside capacity lock)
-    let disk_path = core_rs::host_resources::resolve_instance_disk_path();
-    let host = core_rs::host_resources::detect_all(&disk_path)
-        .map_err(|e| ApiError::internal(format!("{e}")))?;
-
-    // Sunset date (30 days from now)
-    let sunset_date = {
-        let now_secs = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-        crate::time_util::format_date(now_secs + 30 * 24 * 3600)
-    };
-
-    // Capacity lock serializes check + insert to prevent over-commitment
-    let _cap_guard = state.capacity_lock.lock().await;
-
-    let cap_req = crate::capacity::CapacityRequest {
-        cpu_cores,
-        ram_mb,
-        disk_gb,
-        guest_os: &guest_os,
-        claw_type: Some(&claw_type),
-    };
-
-    // Capacity check — return 503 with retry metadata on failure
-    let projection = match crate::capacity::check_capacity(&state, &host, &cap_req) {
-        Ok(p) => p,
-        Err(cap_err) => {
-            return Ok((
-                StatusCode::SERVICE_UNAVAILABLE,
-                Json(json!({
-                    "error": cap_err.message,
-                    "code": "SERVICE_UNAVAILABLE",
-                    "retry_after_secs": cap_err.retry_after_secs,
-                })),
-            )
-                .into_response());
-        }
-    };
-
-    // DB insert + lease creation (atomic transaction)
-    let use_warm_pool = crate::capacity::request_matches_warm_pool_lease(
-        &state.instance_db,
-        Some(&claw_type),
-        cpu_cores,
-        ram_mb,
-    );
-    let create_started_snapshot = serde_json::to_string(&crate::capacity::project_after_request(
-        &projection,
-        &cap_req,
-        use_warm_pool,
-    ))
-    .ok();
-
-    {
-        let st = state.clone();
-        let iid = instance_id.clone();
-        let n = name.clone();
-        let cont = container.clone();
-        let ct = claw_type.clone();
-        let sdate = sunset_date.clone();
-        let gos = guest_os.clone();
-        let resource_snapshot = create_started_snapshot.clone();
-        let household_scope = household_scope.clone();
-        blocking(move || {
-            let household_id = household_scope
-                .as_ref()
-                .map(|scope| scope.household_id.as_str());
-            let household_machine_id = household_scope
-                .as_ref()
-                .map(|scope| scope.household_machine_id.as_str());
-            let new_instance = store_rs::NewInstance {
-                id: &iid,
-                name: &n,
-                container: &cont,
-                claw_type: &ct,
-                sunset_date: &sdate,
-                guest_os: Some(&gos),
-                aux_storage_path: None,
-                cpu_cores: Some(i64::from(cpu_cores)),
-                ram_config_mb: Some(i64::from(ram_mb)),
-                disk_gb: Some(i64::from(disk_gb)),
-                household_id,
-                household_machine_id,
-            };
-            if use_warm_pool {
-                st.instance_db
-                    .insert_with_warm_pool_leases(
-                        &new_instance,
-                        PROVISIONING_TTL_SECS,
-                        resource_snapshot.as_deref(),
-                    )
-                    .map_err(ApiError::from)
-            } else {
-                st.instance_db
-                    .insert_with_leases(
-                        &new_instance,
-                        PROVISIONING_TTL_SECS,
-                        resource_snapshot.as_deref(),
-                    )
-                    .map_err(ApiError::from)
-            }
-        })
-        .await??;
-    }
-
-    // Owner assignment
-    if let Some(ref oid) = req.owner_id {
-        let st = state.clone();
-        let iid = instance_id.clone();
-        let oid = oid.clone();
-        match blocking(move || {
-            st.instance_db
-                .set_owner(&iid, Some(&oid))
-                .map_err(ApiError::from)
-        })
-        .await
-        {
-            Ok(Ok(_)) => {}
-            Ok(Err(e)) | Err(e) => {
-                rollback_inserted_instance(&state, &instance_id, "owner assignment", use_warm_pool)
-                    .await;
-                return Err(e);
-            }
-        }
-    }
-
-    // Create async job
-    let tools = vec![
-        "codex".to_string(),
-        "claude-code".to_string(),
-        "opencode".to_string(),
-    ];
-    let payload = serde_json::to_string(&json!({
-        "name":     name,
-        "claw_type": claw_type,
-        "port":     0,
-        "tools":    tools,
-        "guest_os":  guest_os,
-        "cpu_cores": cpu_cores,
-        "ram_mb":    ram_mb,
-        "disk_gb":   disk_gb,
-    }))
-    .unwrap_or_default();
-
-    let mut job = jobs_rs::Job::new(
-        jobs_rs::JobType::CreateInstance,
-        instance_id.clone(),
-        payload,
-    );
-    job.actor = Some(username.clone());
-    let job_id = job.id.clone();
-
-    {
-        let st = state.clone();
-        match blocking(move || st.jobs.create(&mut job).map_err(ApiError::from)).await {
-            Ok(Ok(())) => {}
-            Ok(Err(e)) | Err(e) => {
-                rollback_inserted_instance(&state, &instance_id, "job creation", use_warm_pool)
-                    .await;
-                return Err(e);
-            }
-        }
-    }
-
-    // Update instance with job ID and initial "queuing" phase
-    {
-        let st = state.clone();
-        let iid = instance_id.clone();
-        let jid = job_id.clone();
-        let _ = blocking(move || {
-            if let Err(e) = st.instance_db.update_status(&store_rs::StatusUpdate {
-                id: &iid,
-                status: store_rs::InstanceStatus::Provisioning,
-                message: "Waiting for resources...",
-                error: "",
-                job_id: &jid,
-                phase: "queuing",
-            }) {
-                tracing::error!("[mobile] failed to set initial phase for {iid}: {e}");
-            }
-        })
-        .await;
-    }
-
-    tracing::info!(
-        "[mobile] user={} queued creation of {} ({}) [job: {}]",
-        username,
-        name,
-        container,
-        job_id
-    );
-
-    Ok((
-        StatusCode::ACCEPTED,
-        Json(json!({
-            "id":        instance_id,
-            "name":      name,
-            "container": container,
-            "claw_type": claw_type,
-            "status":    "provisioning",
-            "job_id":    job_id,
-        })),
+    match crate::instance_create::create_instance_core(
+        &state,
+        &username,
+        inputs,
+        household_scope.as_ref(),
+        crate::instance_create::RateLimitResponseStyle::Bare,
+        "[mobile]",
     )
-        .into_response())
+    .await?
+    {
+        crate::instance_create::CreateOutcome::EarlyResponse(resp) => Ok(resp),
+        // Mobile / household keep their FLAT body.
+        crate::instance_create::CreateOutcome::Created(facts) => Ok((
+            StatusCode::ACCEPTED,
+            Json(json!({
+                "id":        facts.instance_id,
+                "name":      facts.name,
+                "container": facts.container,
+                "claw_type": facts.claw_type,
+                "status":    "provisioning",
+                "job_id":    facts.job_id,
+            })),
+        )
+            .into_response()),
+    }
 }
-
 /// GET /api/v1/mobile/instances/{id}/status — mobile-friendly provisioning status.
 ///
 /// Returns a flat `snake_case` JSON response suitable for iOS `JSONDecoder` (no
