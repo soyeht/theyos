@@ -593,16 +593,30 @@ impl ClawStore {
     /// Returns an error if the lock is poisoned or persistence fails.
     pub fn mark_not_installed(&self, name: &str) -> Result<(), StoreError> {
         let mut state = self.state.write().map_err(|_| StoreError::LockPoisoned)?;
-        state.remove(name);
-        persist(&self.state_file, &state)
+        // Atomicity: persist a candidate map and commit only on success (see
+        // `set_state`). A failed persist leaves the live map — and `get_status`
+        // — unchanged instead of dropping the entry.
+        let mut next = state.clone();
+        next.remove(name);
+        persist(&self.state_file, &next)?;
+        *state = next;
+        Ok(())
     }
 
     // ─── Internal ────────────────────────────────────────────────────────
 
     fn set_state(&self, name: &str, entry: InstalledState) -> Result<(), StoreError> {
         let mut state = self.state.write().map_err(|_| StoreError::LockPoisoned)?;
-        state.insert(name.to_string(), entry);
-        persist(&self.state_file, &state)
+        // Atomicity: build the next map, persist it, and only commit it to the
+        // live in-memory map after the durable write succeeds. On a persist
+        // failure the caller sees `Err` AND `get_status` still reports the prior
+        // state — so a job rollback in the service layer leaves both stores
+        // consistent, with no transitional drift until the next startup reset.
+        let mut next = state.clone();
+        next.insert(name.to_string(), entry);
+        persist(&self.state_file, &next)?;
+        *state = next;
+        Ok(())
     }
 }
 
@@ -690,6 +704,83 @@ mod tests {
         assert_eq!(store2.get_status("picoclaw"), ClawStatus::Installing);
         let state = store2.get_state("picoclaw").expect("state exists");
         assert_eq!(state.job_id.as_deref(), Some("job_123"));
+    }
+
+    /// Build a store whose state-file parent *component* is a regular file, so
+    /// every `persist()` fails with `NotADirectory`. Deterministic and root-safe
+    /// (you cannot `create_dir_all` under a file) — no production seam needed.
+    fn store_with_unwritable_parent() -> (tempfile::TempDir, ClawStore) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let blocker = dir.path().join("blocker");
+        std::fs::write(&blocker, b"x").expect("write blocker file");
+        let state_file = blocker.join("installed_claws.json");
+        let store = ClawStore::new(&state_file).expect("ClawStore::new is lazy");
+        (dir, store)
+    }
+
+    #[test]
+    fn mark_installing_persist_failure_preserves_in_memory_state() {
+        let (_dir, store) = store_with_unwritable_parent();
+        assert_eq!(store.get_status("picoclaw"), ClawStatus::NotInstalled);
+        let err = store
+            .mark_installing("picoclaw", "job_x")
+            .expect_err("persist must fail when a parent component is a file");
+        assert!(
+            matches!(err, StoreError::Io(_)),
+            "expected IO error, got {err:?}"
+        );
+        assert_eq!(
+            store.get_status("picoclaw"),
+            ClawStatus::NotInstalled,
+            "no drift to Installing on persist failure"
+        );
+    }
+
+    #[test]
+    fn mark_uninstalling_persist_failure_preserves_ready_state() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let sub = dir.path().join("run");
+        std::fs::create_dir_all(&sub).expect("mkdir run");
+        let state_file = sub.join("installed_claws.json");
+        let store = ClawStore::new(&state_file).expect("ClawStore::new");
+        store.mark_ready("picoclaw").expect("mark_ready");
+        assert_eq!(store.get_status("picoclaw"), ClawStatus::Ready);
+
+        // Swap the parent component `run` from a directory to a regular file so
+        // the next persist() fails with NotADirectory.
+        std::fs::remove_dir_all(&sub).expect("rm run");
+        std::fs::write(&sub, b"x").expect("replace run dir with a file");
+
+        store
+            .mark_uninstalling("picoclaw")
+            .expect_err("persist must fail when the parent component is a file");
+        assert_eq!(
+            store.get_status("picoclaw"),
+            ClawStatus::Ready,
+            "no drift to Uninstalling on persist failure"
+        );
+    }
+
+    #[test]
+    fn mark_not_installed_persist_failure_preserves_entry() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let sub = dir.path().join("run");
+        std::fs::create_dir_all(&sub).expect("mkdir run");
+        let state_file = sub.join("installed_claws.json");
+        let store = ClawStore::new(&state_file).expect("ClawStore::new");
+        store.mark_ready("picoclaw").expect("mark_ready");
+
+        std::fs::remove_dir_all(&sub).expect("rm run");
+        std::fs::write(&sub, b"x").expect("replace run dir with a file");
+
+        store
+            .mark_not_installed("picoclaw")
+            .expect_err("persist must fail when the parent component is a file");
+        assert_eq!(
+            store.get_status("picoclaw"),
+            ClawStatus::Ready,
+            "entry must be preserved (not removed) on persist failure"
+        );
     }
 
     #[test]
