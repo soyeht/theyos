@@ -1831,4 +1831,63 @@ mod tests {
             "check_disk_space must run BEFORE the cp clone (fail-closed)"
         );
     }
+
+    /// P5b: every macOS-VZ admission `reserve()` MUST be preceded by a
+    /// `preflight_vz_supportability()` fail-closed gate, so an unsupportable host
+    /// is refused before any lease / VM work. Source-text scan because the IPC
+    /// handlers need real VZ to drive (out of scope for unit tests); the seam /
+    /// classify behaviour is unit-tested above. A NEW reserve site without a
+    /// preflight — or a changed reserve count — fails this guard.
+    #[test]
+    fn every_macos_vz_reserve_is_gated_by_supportability_preflight() {
+        fn preceding(src: &str, idx: usize, lines: usize) -> &str {
+            let head = &src[..idx];
+            let start = head
+                .match_indices('\n')
+                .rev()
+                .nth(lines)
+                .map_or(0, |(i, _)| i);
+            &src[start..idx]
+        }
+
+        let sources = [
+            (
+                include_str!("bin/vmrunner_macos_ipc_macos.rs"),
+                "vmrunner_macos_ipc_macos.rs",
+            ),
+            (include_str!("macos_guest.rs"), "macos_guest.rs"),
+        ];
+        // The admission reserve is macOS-VZ only (Linux paths carry no lease).
+        let needles = [
+            ".reserve(VmKind::",
+            ".reserve(crate::vm_admission::VmKind::",
+        ];
+        let mut total = 0usize;
+        for (src, file) in sources {
+            // Production code only — drop the in-file #[cfg(test)] module(s).
+            let prod = src.split("#[cfg(test)]").next().unwrap_or(src);
+            for needle in needles {
+                let mut from = 0usize;
+                while let Some(rel) = prod[from..].find(needle) {
+                    let idx = from + rel;
+                    from = idx + needle.len();
+                    assert!(
+                        preceding(prod, idx, 20).contains("preflight_vz_supportability"),
+                        "{file}: a `{needle}` reserve near byte {idx} is not preceded \
+                         (within 20 lines) by preflight_vz_supportability() — every \
+                         macOS-VZ start must fail closed on VZ supportability before \
+                         reserving a slot"
+                    );
+                    total += 1;
+                }
+            }
+        }
+        assert_eq!(
+            total, 7,
+            "expected 7 macOS-VZ reserve sites each gated by a supportability \
+             preflight; found {total}. A reserve site was added or removed — \
+             re-confirm each macOS-VZ path preflights before reserve, then update \
+             this count."
+        );
+    }
 }

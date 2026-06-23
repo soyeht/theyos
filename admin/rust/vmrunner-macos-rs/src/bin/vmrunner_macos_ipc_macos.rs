@@ -146,6 +146,10 @@ fn run_macos_install_flow(
     // Invariant I-1: reserve the install slot via the single admission authority
     // BEFORE downloading or starting anything. On HostVmLimitReached we fail fast
     // — no download, no VM start — and (reactive host-blocked case) do not retry.
+    if let Err(e) = vmrunner_macos_rs::vz::preflight_vz_supportability() {
+        tracing::warn!(error = %e, "guest-image install: VZ supportability preflight refused");
+        return Err(Response::err(&e));
+    }
     let install_lease = match admission.reserve(VmKind::Install, None) {
         Ok(l) => l,
         Err(e) => {
@@ -738,6 +742,10 @@ fn handle_create(params: &Value, state: &Arc<IpcState>) -> Response {
     // which gates on the cross-process lease registry (live + suspected orphans),
     // not just an in-process semaphore. On refusal, no VM is started.
     let mut user_lease: Option<VmLease> = if guest_os == "macos" {
+        if let Err(e) = vmrunner_macos_rs::vz::preflight_vz_supportability() {
+            tracing::warn!(error = %e, "macOS create: VZ supportability preflight refused");
+            return Response::err(&e);
+        }
         match state
             .admission
             .reserve(VmKind::UserClaw, Some(container.clone()))
@@ -1239,6 +1247,10 @@ fn restart_macos_vm(
             Err(e) => return Response::err(format!("decode hw_model: {e}")),
         };
 
+    if let Err(e) = vmrunner_macos_rs::vz::preflight_vz_supportability() {
+        tracing::warn!(error = %e, "macOS restart: VZ supportability preflight refused");
+        return Response::err(&e);
+    }
     // Reserve a macOS VM slot via the single admission authority (Apple 2-VM limit).
     let lease = match state
         .admission
@@ -1887,6 +1899,10 @@ fn run_base_snapshot_with_admission(
     cpus: u32,
     memory_mb: u32,
 ) -> Result<(PathBuf, Vec<u8>), Response> {
+    if let Err(e) = vmrunner_macos_rs::vz::preflight_vz_supportability() {
+        tracing::warn!(error = %e, "snapshot: VZ supportability preflight refused");
+        return Err(Response::err(&e));
+    }
     let lease = match admission.reserve(VmKind::Snapshot, None) {
         Ok(l) => l,
         Err(e) => {
@@ -2405,6 +2421,12 @@ fn init_macos_warm_pool(state: &Arc<IpcState>) {
             return;
         }
 
+        if vmrunner_macos_rs::vz::preflight_vz_supportability().is_err() {
+            tracing::debug!(
+                "macOS warm pool: VZ supportability preflight refused, skipping pre-boot"
+            );
+            return;
+        }
         // Reserve a WarmPool slot via the single admission authority.
         let lease = match state.admission.reserve(VmKind::WarmPool, None) {
             Ok(l) => l,
@@ -2630,6 +2652,9 @@ fn spawn_macos_warm_refill(state: Arc<IpcState>) {
         return;
     }
     if state.admission.semaphore_available() == 0 {
+        return;
+    }
+    if vmrunner_macos_rs::vz::preflight_vz_supportability().is_err() {
         return;
     }
     // race / limit — another caller already took the slot

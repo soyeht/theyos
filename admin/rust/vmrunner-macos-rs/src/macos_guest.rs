@@ -3370,6 +3370,10 @@ pub async fn rebuild_base_snapshot(
         .and_then(|b| BASE64.decode(b).ok());
     let snapshot_cpus = cpus.max(state.install_cpu_count.unwrap_or(cpus));
     let snapshot_memory_mb = memory_mb.max(state.install_memory_mb.unwrap_or(memory_mb));
+    if let Err(e) = crate::vz::preflight_vz_supportability() {
+        tracing::warn!(error = %e, "base snapshot: VZ supportability preflight refused");
+        return Err(e);
+    }
     // Invariant I-1: reserve a Snapshot slot before the snapshot boot VM starts.
     let snapshot_lease = admission
         .reserve(crate::vm_admission::VmKind::Snapshot, None)
