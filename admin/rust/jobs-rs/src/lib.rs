@@ -389,6 +389,26 @@ impl Store {
         Ok(())
     }
 
+    /// Delete a job by ID. Returns `JobError::NotFound` if no matching row
+    /// exists.
+    ///
+    /// Used to roll back a job that was created but whose follow-up state
+    /// transition failed (see `claw_store_service::install_claw` /
+    /// `uninstall_claw`), so the jobs table stays consistent with the claw
+    /// store. Mirrors the `rows == 0 -> NotFound` convention of `update` /
+    /// `update_result`.
+    pub fn delete_by_id(&self, id: &str) -> Result<()> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| JobError::Internal("jobs lock poisoned".into()))?;
+        let rows = conn.execute("DELETE FROM jobs WHERE id = ?1", params![id])?;
+        if rows == 0 {
+            return Err(JobError::NotFound(id.to_string()));
+        }
+        Ok(())
+    }
+
     /// Mark all pending/running install and uninstall jobs as failed on
     /// server startup.
     ///
@@ -1167,6 +1187,32 @@ mod tests {
             .update_result("does-not-exist", "{}")
             .expect_err("should be NotFound");
         matches!(err, JobError::NotFound(_));
+    }
+
+    #[test]
+    fn delete_by_id_removes_created_job() {
+        let path = temp_db();
+        let s = Store::new(&path).expect("Store::new");
+        let mut job = make_job();
+        s.create(&mut job).expect("create");
+        s.delete_by_id(&job.id).expect("delete");
+        assert!(
+            matches!(s.get(&job.id), Err(JobError::NotFound(_))),
+            "job should be gone after delete_by_id"
+        );
+    }
+
+    #[test]
+    fn delete_by_id_returns_not_found_for_missing_job() {
+        let path = temp_db();
+        let s = Store::new(&path).expect("Store::new");
+        let err = s
+            .delete_by_id("does-not-exist")
+            .expect_err("should be NotFound");
+        assert!(
+            matches!(err, JobError::NotFound(_)),
+            "expected NotFound, got {err:?}"
+        );
     }
 
     #[test]

@@ -86,7 +86,18 @@ fn fake_ipc_bin() -> String {
     path.to_string_lossy().into_owned()
 }
 
+fn default_claw_store() -> claw_rs::ClawStore {
+    let claw_dir = tempfile::TempDir::new().expect("claw tempdir");
+    let claw_path = claw_dir.path().join("installed_claws.json");
+    std::mem::forget(claw_dir);
+    claw_rs::ClawStore::new(&claw_path).expect("claw store")
+}
+
 fn shared_state() -> SharedState {
+    shared_state_with_claw_store(default_claw_store())
+}
+
+fn shared_state_with_claw_store(claw_store: claw_rs::ClawStore) -> SharedState {
     let _env_guard = ENV_LOCK
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -137,10 +148,6 @@ fn shared_state() -> SharedState {
     set_test_env("FIRECRACKER_SSH_PUBKEY", &ssh_pubkey);
     let vm_runner = Arc::new(VmRunner::from_env().expect("vm runner"));
 
-    let claw_dir = tempfile::TempDir::new().expect("claw tempdir");
-    let claw_path = claw_dir.path().join("installed_claws.json");
-    std::mem::forget(claw_dir);
-
     let theyos_dir = tempfile::TempDir::new().expect("theyos dir");
     let theyos_path = theyos_dir.path().to_path_buf();
     std::mem::forget(theyos_dir);
@@ -161,7 +168,7 @@ fn shared_state() -> SharedState {
         mobile_tokens: Arc::new(server_rs::mobile_token::MobileTokenStore::new()),
         mobile_sessions: server_rs::mobile_token::MobileSessionDb::open(":memory:")
             .expect("mobile session db"),
-        claw_store: claw_rs::ClawStore::new(&claw_path).expect("claw store"),
+        claw_store,
         theyos_dir: theyos_path,
         locks_dir: locks_path,
         capacity_lock: tokio::sync::Mutex::new(()),
@@ -1420,4 +1427,102 @@ async fn household_pop_auth_failure_is_empty_401() {
         "household auth failure body must stay empty"
     );
     assert_eq!(body, Value::Null);
+}
+
+// ─── Job-leak rollback + ClawStore atomicity (install / uninstall) ─────────────
+
+/// A `ClawStore` whose state-file parent *component* is a regular file, so every
+/// `persist()` fails with `NotADirectory` (deterministic, root-safe — no seam).
+fn bad_path_claw_store() -> claw_rs::ClawStore {
+    let dir = tempfile::TempDir::new().expect("tempdir");
+    let blocker = dir.path().join("blocker");
+    std::fs::write(&blocker, b"x").expect("write blocker file");
+    let state_file = blocker.join("installed_claws.json");
+    std::mem::forget(dir);
+    claw_rs::ClawStore::new(&state_file).expect("ClawStore::new is lazy")
+}
+
+/// `picoclaw` Ready (persisted to a valid path), after which a parent path
+/// component is swapped from a directory to a file so the *next* `persist()` (the
+/// `mark_uninstalling` transition) fails.
+fn ready_store_then_break_parent() -> claw_rs::ClawStore {
+    let dir = tempfile::TempDir::new().expect("tempdir");
+    let sub = dir.path().join("run");
+    std::fs::create_dir_all(&sub).expect("mkdir run");
+    let state_file = sub.join("installed_claws.json");
+    let store = claw_rs::ClawStore::new(&state_file).expect("ClawStore::new");
+    store
+        .mark_ready("picoclaw")
+        .expect("mark_ready on a valid path");
+    std::mem::forget(dir);
+    std::fs::remove_dir_all(&sub).expect("rm run");
+    std::fs::write(&sub, b"x").expect("replace run dir with a file");
+    store
+}
+
+/// Install: when `mark_installing` fails after the job is created, the orphaned
+/// job is rolled back AND the claw stays `NotInstalled` (atomic `set_state`).
+#[tokio::test]
+async fn install_claw_rolls_back_job_and_preserves_status_on_persist_failure() {
+    let state = shared_state_with_claw_store(bad_path_claw_store());
+    assert_eq!(
+        state.claw_store.get_status("picoclaw"),
+        ClawStatus::NotInstalled
+    );
+
+    let res = server_rs::claw_store_service::install_claw(&state, "picoclaw".to_string()).await;
+    assert!(
+        res.is_err(),
+        "install_claw must fail when mark_installing's persist fails"
+    );
+
+    assert!(
+        state.jobs.list_recent(0).expect("list_recent").is_empty(),
+        "no orphaned job may remain (list_recent)"
+    );
+    assert!(
+        state
+            .jobs
+            .list_by_instance("picoclaw", 0)
+            .expect("list_by_instance")
+            .is_empty(),
+        "no orphaned job may remain (list_by_instance)"
+    );
+    assert_eq!(
+        state.claw_store.get_status("picoclaw"),
+        ClawStatus::NotInstalled,
+        "claw status must be preserved (no drift to Installing)"
+    );
+}
+
+/// Uninstall: when `mark_uninstalling` fails after the job is created, the
+/// orphaned job is rolled back AND the claw stays `Ready` (atomic `set_state`).
+#[tokio::test]
+async fn uninstall_claw_rolls_back_job_and_preserves_status_on_persist_failure() {
+    let state = shared_state_with_claw_store(ready_store_then_break_parent());
+    assert_eq!(state.claw_store.get_status("picoclaw"), ClawStatus::Ready);
+
+    let res = server_rs::claw_store_service::uninstall_claw(&state, "picoclaw".to_string()).await;
+    assert!(
+        res.is_err(),
+        "uninstall_claw must fail when mark_uninstalling's persist fails"
+    );
+
+    assert!(
+        state.jobs.list_recent(0).expect("list_recent").is_empty(),
+        "no orphaned job may remain (list_recent)"
+    );
+    assert!(
+        state
+            .jobs
+            .list_by_instance("picoclaw", 0)
+            .expect("list_by_instance")
+            .is_empty(),
+        "no orphaned job may remain (list_by_instance)"
+    );
+    assert_eq!(
+        state.claw_store.get_status("picoclaw"),
+        ClawStatus::Ready,
+        "claw status must be preserved (no drift to Uninstalling)"
+    );
 }
