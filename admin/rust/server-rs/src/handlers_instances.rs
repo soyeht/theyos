@@ -22,6 +22,7 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use core_rs::error::{ApiError, ErrorCode, MutexExt, blocking};
+use core_rs::ipc::protocol::{LeaseKind, LeaseOwnerType};
 use core_rs::pagination::{PaginationParams, decode_cursor, encode_cursor};
 use executor_rs::{ExecuteFlowRequest, FlowStatus, FlowType};
 use jobs_rs::{Job, JobType};
@@ -841,7 +842,11 @@ pub(crate) async fn restart_instance_for_row(
         let _cap_guard = state.capacity_lock.lock().await;
         let needs_runtime_lease = !state
             .instance_db
-            .has_active_lease("instance", id, "runtime")
+            .has_active_lease(
+                LeaseOwnerType::Instance.as_str(),
+                id,
+                LeaseKind::Runtime.as_str(),
+            )
             .map_err(ApiError::from)?;
 
         if needs_runtime_lease {
@@ -865,9 +870,9 @@ pub(crate) async fn restart_instance_for_row(
             state
                 .instance_db
                 .create_lease(&store_rs::NewLease {
-                    owner_type: "instance",
+                    owner_type: LeaseOwnerType::Instance.as_str(),
                     owner_id: id,
-                    lease_kind: "runtime",
+                    lease_kind: LeaseKind::Runtime.as_str(),
                     cpu_cores: i64::from(cpu),
                     ram_mb: i64::from(ram),
                     disk_gb: 0,
@@ -883,7 +888,11 @@ pub(crate) async fn restart_instance_for_row(
             Ok(out) => out,
             Err(err) => {
                 if acquired_runtime_lease {
-                    let _ = state.instance_db.release_lease("instance", id, "runtime");
+                    let _ = state.instance_db.release_lease(
+                        LeaseOwnerType::Instance.as_str(),
+                        id,
+                        LeaseKind::Runtime.as_str(),
+                    );
                 }
                 return Err(err);
             }
