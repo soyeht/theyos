@@ -43,24 +43,43 @@ fn rs_files() -> Vec<PathBuf> {
     out
 }
 
-/// Actions passed to a `rate_limiter ... .check(..., "ACTION")` call in `source`.
-/// Window-scans after each `rate_limiter` token so it is robust to the call
-/// being line-wrapped, and ignores non-`.check(` uses (e.g. `.get_remaining`).
-fn limiter_check_actions(source: &str) -> Vec<String> {
+/// First string literal inside the argument list that immediately follows
+/// `marker` in `window`, bounded to the first `)` so it cannot wander into a
+/// later, unrelated literal. Returns `None` when the call passes a variable
+/// (e.g. `rate_limiter.check(&actor, action)` inside the shared helper, or the
+/// helper's own fn definition).
+fn literal_in_call(window: &str, marker: &str) -> Option<String> {
+    let after = &window[window.find(marker)? + marker.len()..];
+    let args = &after[..after.find(')')?];
+    let q1 = args.find('"')?;
+    let q2 = args[q1 + 1..].find('"')?;
+    Some(args[q1 + 1..q1 + 1 + q2].to_string())
+}
+
+/// Literal rate-limit actions handed to the limiter in `source`, whether passed
+/// directly via `rate_limiter ... .check(..., "ACTION")` or through the P7-C
+/// helper `actor_action_allowed(..., "ACTION")`. Window-scans (robust to
+/// line-wrapping) and ignores non-`.check(` uses (e.g. `.get_remaining`). A call
+/// that passes a variable action (the helper's own `check(&actor, action)`)
+/// contributes nothing — only literal call sites are pinned.
+fn limiter_action_literals(source: &str) -> Vec<String> {
     let mut actions = Vec::new();
     let mut from = 0;
     while let Some(idx) = source[from..].find("rate_limiter") {
         let at = from + idx;
         from = at + "rate_limiter".len();
         let window = &source[at..(at + 200).min(source.len())];
-        let Some(check_pos) = window.find(".check(") else {
-            continue;
-        };
-        let after = &window[check_pos..];
-        if let Some(q1) = after.find('"') {
-            if let Some(q2) = after[q1 + 1..].find('"') {
-                actions.push(after[q1 + 1..q1 + 1 + q2].to_string());
-            }
+        if let Some(action) = literal_in_call(window, ".check(") {
+            actions.push(action);
+        }
+    }
+    let mut from = 0;
+    while let Some(idx) = source[from..].find("actor_action_allowed(") {
+        let at = from + idx;
+        from = at + "actor_action_allowed(".len();
+        let window = &source[at..(at + 200).min(source.len())];
+        if let Some(action) = literal_in_call(window, "actor_action_allowed(") {
+            actions.push(action);
         }
     }
     actions
@@ -105,17 +124,18 @@ const COVERAGE: &[(&str, &str, Class)] = &[
         "handlers_household_claws.rs",
         Class::RateLimitedViaInheritance("create_mobile_instance_for_actor"),
     ),
-    // --- owner-PoP gated, currently NOT rate-limited (limiter candidates) ---
+    // --- Rate-limited per authenticated person (P7-C PR-C) ---
     (
         "handle_household_install_claw",
         "handlers_household_claws.rs",
-        Class::PoPOnly("ClawsCreate"),
+        Class::RateLimited("claw_install"),
     ),
     (
         "handle_household_uninstall_claw",
         "handlers_household_claws.rs",
-        Class::PoPOnly("ClawsDelete"),
+        Class::RateLimited("claw_uninstall"),
     ),
+    // --- owner-PoP gated, currently NOT rate-limited (limiter candidates) ---
     (
         "sign_machine_cert_handler",
         "handlers_sign_machine_cert.rs",
@@ -172,7 +192,7 @@ const COVERAGE: &[(&str, &str, Class)] = &[
 #[test]
 fn create_instance_surfaces_remain_rate_limited() {
     for file in ["handlers_instances.rs", "handlers_mobile.rs"] {
-        let actions = limiter_check_actions(&read(file));
+        let actions = limiter_action_literals(&read(file));
         assert!(
             actions.iter().any(|a| a == "create_instance"),
             "{file} must keep the create_instance rate-limit check"
@@ -199,7 +219,7 @@ fn limiter_check_sites_are_exactly_the_classified_set() {
     let mut found: BTreeMap<String, Vec<String>> = BTreeMap::new();
     for path in rs_files() {
         let source = fs::read_to_string(&path).unwrap();
-        let actions = limiter_check_actions(&source);
+        let actions = limiter_action_literals(&source);
         if !actions.is_empty() {
             let name = path.file_name().unwrap().to_string_lossy().to_string();
             found.entry(name).or_default().extend(actions);
@@ -218,6 +238,10 @@ fn limiter_check_sites_are_exactly_the_classified_set() {
         "handlers_mobile.rs".to_string(),
         vec!["create_instance".to_string()],
     );
+    expected.insert(
+        "handlers_household_claws.rs".to_string(),
+        vec!["claw_install".to_string(), "claw_uninstall".to_string()],
+    );
 
     assert_eq!(
         found, expected,
@@ -225,6 +249,47 @@ fn limiter_check_sites_are_exactly_the_classified_set() {
          (and reviewed for the right scope/threshold via the approval-gated PR); a REMOVED one is \
          a protection regression. found={found:?}"
     );
+}
+
+#[test]
+fn household_claw_rate_limit_helper_is_fail_open() {
+    // A limiter/db error must ALLOW the request (fail-open), matching the
+    // create_instance behaviour, so a limiter outage never blocks Claw ops.
+    let src = read("handlers_household_claws.rs");
+    let start = src
+        .find("async fn actor_action_allowed")
+        .expect("actor_action_allowed helper must exist");
+    let body = &src[start..(start + 600).min(src.len())];
+    assert!(
+        body.contains("unwrap_or(true)"),
+        "actor_action_allowed must fail-open (allow) on limiter error"
+    );
+}
+
+#[test]
+fn household_claw_install_uninstall_authorize_before_rate_limit() {
+    // No bypass: PoP `authorize` must run BEFORE the per-person rate-limit gate,
+    // so an unauthenticated request is rejected by auth, never by the limiter.
+    let src = read("handlers_household_claws.rs");
+    for (handler, action) in [
+        ("handle_household_install_claw", "claw_install"),
+        ("handle_household_uninstall_claw", "claw_uninstall"),
+    ] {
+        let start = src
+            .find(&format!("pub async fn {handler}"))
+            .unwrap_or_else(|| panic!("{handler} must exist"));
+        let body = &src[start..(start + 1600).min(src.len())];
+        let auth_pos = body
+            .find("authorize(")
+            .unwrap_or_else(|| panic!("{handler} must call authorize()"));
+        let limit_pos = body
+            .find(action)
+            .unwrap_or_else(|| panic!("{handler} must rate-limit with {action}"));
+        assert!(
+            auth_pos < limit_pos,
+            "{handler}: PoP authorize must run before the {action} rate-limit gate (no bypass)"
+        );
+    }
 }
 
 #[test]
@@ -237,7 +302,7 @@ fn coverage_table_is_not_stale_and_rate_limited_entries_are_proven() {
         );
         match *class {
             Class::RateLimited(action) => assert!(
-                limiter_check_actions(&src).iter().any(|a| a == action),
+                limiter_action_literals(&src).iter().any(|a| a == action),
                 "{handler} ({file}) is classified RateLimited({action}) but no such limiter check is present"
             ),
             Class::RateLimitedViaInheritance(via) => assert!(

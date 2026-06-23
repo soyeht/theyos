@@ -151,6 +151,14 @@ fn fixture() -> Fixture {
             "/api/v1/household/terminals/{container}/pty",
             get(handlers_household_claws::handle_household_terminal_pty),
         )
+        .route(
+            "/api/v1/household/claws/{name}/install",
+            post(handlers_household_claws::handle_household_install_claw),
+        )
+        .route(
+            "/api/v1/household/claws/{name}/uninstall",
+            post(handlers_household_claws::handle_household_uninstall_claw),
+        )
         .with_state(claws_state);
 
     Fixture {
@@ -193,7 +201,13 @@ fn shared_state() -> SharedState {
     let sessions = SessionStore::open(":memory:").expect("session store");
     let jobs = JobsStore::new(":memory:").expect("jobs store");
     let instance_db = InstanceDb::open(":memory:").expect("instance db");
-    let rate_limiter = Limiter::new(":memory:", 100).expect("rate limiter");
+    // claw_install / claw_uninstall get a low per-action limit so the P7-C
+    // wiring tests exercise the 429 path quickly. The global stays 100 for every
+    // other action (e.g. create_instance), so existing tests are unaffected.
+    let rate_limiter = Limiter::new(":memory:", 100)
+        .expect("rate limiter")
+        .with_action_limit("claw_install", 2)
+        .with_action_limit("claw_uninstall", 2);
 
     let fake_bin = fake_ipc_bin();
     let flow_config = FlowConfig {
@@ -1367,4 +1381,133 @@ async fn admin_instance_actions_preserve_effects_after_refactor() {
             .unwrap()
             .is_empty()
     );
+}
+
+// ─── P7-C: per-person rate limiting on Claw install / uninstall ─────────────
+// The fixture caps `claw_install` / `claw_uninstall` at 2/window (global stays
+// 100 for every other action). The limit is checked AFTER PoP authorization and
+// BEFORE install work, so it fires regardless of whether the claw exists.
+
+#[tokio::test]
+async fn household_claw_install_is_rate_limited_per_person() {
+    let fx = fixture();
+    let path = "/api/v1/household/claws/demo-claw/install";
+    for i in 0..2 {
+        let (status, _) = request_json(
+            fx.app.clone(),
+            &fx.person,
+            Method::POST,
+            path,
+            serde_json::Value::Null,
+        )
+        .await;
+        assert_ne!(
+            status,
+            StatusCode::TOO_MANY_REQUESTS,
+            "install {i} (under the limit) must not be rate-limited"
+        );
+    }
+    let (status, body) = request_json(
+        fx.app.clone(),
+        &fx.person,
+        Method::POST,
+        path,
+        serde_json::Value::Null,
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::TOO_MANY_REQUESTS,
+        "the 3rd install by the same person must be 429"
+    );
+    assert_eq!(body["code"], "RATE_LIMITED");
+}
+
+#[tokio::test]
+async fn household_claw_install_and_uninstall_have_independent_quota() {
+    let fx = fixture();
+    let install = "/api/v1/household/claws/demo-claw/install";
+    for _ in 0..3 {
+        let _ = request_json(
+            fx.app.clone(),
+            &fx.person,
+            Method::POST,
+            install,
+            serde_json::Value::Null,
+        )
+        .await;
+    }
+    let (install_status, _) = request_json(
+        fx.app.clone(),
+        &fx.person,
+        Method::POST,
+        install,
+        serde_json::Value::Null,
+    )
+    .await;
+    assert_eq!(
+        install_status,
+        StatusCode::TOO_MANY_REQUESTS,
+        "install quota must be exhausted"
+    );
+
+    let uninstall = "/api/v1/household/claws/demo-claw/uninstall";
+    let (uninstall_status, _) = request_json(
+        fx.app.clone(),
+        &fx.person,
+        Method::POST,
+        uninstall,
+        serde_json::Value::Null,
+    )
+    .await;
+    assert_ne!(
+        uninstall_status,
+        StatusCode::TOO_MANY_REQUESTS,
+        "uninstall must keep its own independent quota"
+    );
+}
+
+#[tokio::test]
+async fn household_claw_install_unauthenticated_is_rejected_by_auth_not_limiter() {
+    // No PoP header: rejected by authorization (401), never by the limiter —
+    // proving auth runs before the rate-limit gate and there is no bypass.
+    let fx = fixture();
+    let path = "/api/v1/household/claws/demo-claw/install";
+    for _ in 0..5 {
+        let resp = fx
+            .app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(path)
+                    .extension(ConnectInfo(allowed_peer_addr()))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::UNAUTHORIZED,
+            "unauthenticated install must be 401 (auth before limiter), never 429"
+        );
+    }
+}
+
+#[test]
+fn claw_install_limiter_quota_is_per_person_and_per_action() {
+    let limiter = Limiter::new(":memory:", 100)
+        .expect("rate limiter")
+        .with_action_limit("claw_install", 2);
+    assert!(limiter.check("person-a", "claw_install").unwrap());
+    assert!(limiter.check("person-a", "claw_install").unwrap());
+    assert!(
+        !limiter.check("person-a", "claw_install").unwrap(),
+        "person-a claw_install quota exhausted"
+    );
+    // A different person has their own independent quota...
+    assert!(limiter.check("person-b", "claw_install").unwrap());
+    // ...and a different action is independent for the same person.
+    assert!(limiter.check("person-a", "claw_uninstall").unwrap());
 }

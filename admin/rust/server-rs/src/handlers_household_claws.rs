@@ -128,6 +128,35 @@ pub async fn handle_household_claw_availability(
     forward(handlers_claws::handle_claw_availability(State(state.shared.clone()), Path(name)).await)
 }
 
+/// P7-C: the standard "rate limit exceeded" 429 response, matching the shape
+/// emitted by the `create_instance` limiter in `handlers_instances` /
+/// `handlers_mobile`. No new response/body shape is introduced.
+fn rate_limited_response() -> Response {
+    (
+        StatusCode::TOO_MANY_REQUESTS,
+        Json(json!({"error": "rate limit exceeded", "code": "RATE_LIMITED"})),
+    )
+        .into_response()
+}
+
+/// P7-C: per-actor rate-limit gate for a household Claw action, keyed by the
+/// PoP-authenticated `actor_person_id`. Returns `true` when the request is
+/// allowed. Fail-open: any limiter/db error allows the request, so a limiter
+/// outage never blocks legitimate Claw operations (matching the existing
+/// `create_instance` behaviour). Uses the global hourly limit unless an explicit
+/// per-action override is configured.
+async fn actor_action_allowed(
+    shared: &SharedState,
+    actor_person_id: &str,
+    action: &'static str,
+) -> bool {
+    let shared = shared.clone();
+    let actor = actor_person_id.to_string();
+    blocking(move || shared.rate_limiter.check(&actor, action).unwrap_or(true))
+        .await
+        .unwrap_or(true)
+}
+
 /// `PoP`-gates the request and forwards to `handlers_claws::handle_install_claw`.
 pub async fn handle_household_install_claw(
     State(state): State<HouseholdClawsState>,
@@ -137,7 +166,7 @@ pub async fn handle_household_install_claw(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    if let Err(reject) = authorize(
+    let authorized = match authorize(
         &state,
         &method,
         &uri,
@@ -148,7 +177,13 @@ pub async fn handle_household_install_claw(
     )
     .await
     {
-        return reject;
+        Ok(authorized) => authorized,
+        Err(reject) => return reject,
+    };
+    // P7-C: rate-limit Claw installs per authenticated person (`claw_install`),
+    // checked AFTER PoP authorization and BEFORE any install work.
+    if !actor_action_allowed(&state.shared, &authorized.actor_person_id, "claw_install").await {
+        return rate_limited_response();
     }
     forward(handlers_claws::handle_install_claw(State(state.shared.clone()), Path(name)).await)
 }
@@ -162,7 +197,7 @@ pub async fn handle_household_uninstall_claw(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    if let Err(reject) = authorize(
+    let authorized = match authorize(
         &state,
         &method,
         &uri,
@@ -173,7 +208,13 @@ pub async fn handle_household_uninstall_claw(
     )
     .await
     {
-        return reject;
+        Ok(authorized) => authorized,
+        Err(reject) => return reject,
+    };
+    // P7-C: rate-limit Claw uninstalls per authenticated person (`claw_uninstall`),
+    // checked AFTER PoP authorization and BEFORE any uninstall work.
+    if !actor_action_allowed(&state.shared, &authorized.actor_person_id, "claw_uninstall").await {
+        return rate_limited_response();
     }
     forward(handlers_claws::handle_uninstall_claw(State(state.shared.clone()), Path(name)).await)
 }
