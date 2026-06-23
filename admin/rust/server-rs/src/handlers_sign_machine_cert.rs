@@ -10,6 +10,7 @@ use axum::{
     response::{IntoResponse, Response},
     routing::post,
 };
+use household_rs::bootstrap_error::BootstrapErrorCode;
 use household_rs::caveats::Operation;
 use household_rs::ids::{MachineId, derive_machine_id};
 use household_rs::keys::P256PublicKey;
@@ -91,7 +92,10 @@ fn cbor_ok<T: Serialize>(value: T) -> Response {
         Ok(body) => cbor_response(StatusCode::OK, body),
         Err(e) => {
             tracing::error!(stage = "sign_machine_cert.response_encode_failed", error = %e);
-            cbor_error(StatusCode::INTERNAL_SERVER_ERROR, "internal_error")
+            cbor_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                BootstrapErrorCode::InternalError.as_str(),
+            )
         }
     }
 }
@@ -124,14 +128,23 @@ pub async fn sign_machine_cert_handler(
     body: Bytes,
 ) -> Response {
     let Some(now) = time_util::unix_now_secs_checked("sign_machine_cert.clock") else {
-        return cbor_error(StatusCode::INTERNAL_SERVER_ERROR, "internal_error");
+        return cbor_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            BootstrapErrorCode::InternalError.as_str(),
+        );
     };
 
     let Some(identity) = state.household.current().await else {
-        return cbor_error(StatusCode::CONFLICT, "household_not_initialized");
+        return cbor_error(
+            StatusCode::CONFLICT,
+            BootstrapErrorCode::HouseholdNotInitialized.as_str(),
+        );
     };
     if identity.record.is_follower || identity.hh_priv.is_none() {
-        return cbor_error(StatusCode::CONFLICT, "household_not_initialized");
+        return cbor_error(
+            StatusCode::CONFLICT,
+            BootstrapErrorCode::HouseholdNotInitialized.as_str(),
+        );
     }
 
     let path_and_query = uri
@@ -154,48 +167,90 @@ pub async fn sign_machine_cert_handler(
             | AuthError::Malformed
             | AuthError::Timestamp
             | AuthError::SignatureRejected,
-        ) => return cbor_error(StatusCode::UNAUTHORIZED, "invalid_pop"),
+        ) => {
+            return cbor_error(
+                StatusCode::UNAUTHORIZED,
+                BootstrapErrorCode::InvalidPop.as_str(),
+            );
+        }
         Err(AuthError::IdentityUnavailable) => {
-            return cbor_error(StatusCode::CONFLICT, "household_not_initialized");
+            return cbor_error(
+                StatusCode::CONFLICT,
+                BootstrapErrorCode::HouseholdNotInitialized.as_str(),
+            );
         }
         Err(
             AuthError::OwnerAuthUnavailable
             | AuthError::NotAMember
             | AuthError::CertRejected
             | AuthError::CaveatRejected,
-        ) => return cbor_error(StatusCode::FORBIDDEN, "not_a_member"),
+        ) => {
+            return cbor_error(
+                StatusCode::FORBIDDEN,
+                BootstrapErrorCode::NotAMember.as_str(),
+            );
+        }
     };
 
     let req: SignMachineCertRequest = match strict_cbor_request(&body) {
         Ok(req) => req,
-        Err(()) => return cbor_error(StatusCode::BAD_REQUEST, "invalid_cbor"),
+        Err(()) => {
+            return cbor_error(
+                StatusCode::BAD_REQUEST,
+                BootstrapErrorCode::InvalidCbor.as_str(),
+            );
+        }
     };
     if req.version != 1 {
-        return cbor_error(StatusCode::BAD_REQUEST, "invalid_cbor");
+        return cbor_error(
+            StatusCode::BAD_REQUEST,
+            BootstrapErrorCode::InvalidCbor.as_str(),
+        );
     }
     if req.kind != "machine" {
-        return cbor_error(StatusCode::BAD_REQUEST, "invalid_subject");
+        return cbor_error(
+            StatusCode::BAD_REQUEST,
+            BootstrapErrorCode::InvalidSubject.as_str(),
+        );
     }
 
     let Ok(m_pub) = P256PublicKey::from_bytes(req.subject.m_pub.as_ref()) else {
-        return cbor_error(StatusCode::BAD_REQUEST, "invalid_subject");
+        return cbor_error(
+            StatusCode::BAD_REQUEST,
+            BootstrapErrorCode::InvalidSubject.as_str(),
+        );
     };
     let Ok(m_id) = MachineId::parse(req.subject.m_id.clone()) else {
-        return cbor_error(StatusCode::BAD_REQUEST, "invalid_subject");
+        return cbor_error(
+            StatusCode::BAD_REQUEST,
+            BootstrapErrorCode::InvalidSubject.as_str(),
+        );
     };
     let derived_m_id = derive_machine_id(&m_pub);
     if derived_m_id != m_id {
-        return cbor_error(StatusCode::BAD_REQUEST, "invalid_subject");
+        return cbor_error(
+            StatusCode::BAD_REQUEST,
+            BootstrapErrorCode::InvalidSubject.as_str(),
+        );
     }
     if !valid_hostname(&req.subject.hostname) {
-        return cbor_error(StatusCode::BAD_REQUEST, "invalid_subject");
+        return cbor_error(
+            StatusCode::BAD_REQUEST,
+            BootstrapErrorCode::InvalidSubject.as_str(),
+        );
     }
     let Some(platform) = parse_platform(&req.subject.platform) else {
-        return cbor_error(StatusCode::BAD_REQUEST, "invalid_subject");
+        return cbor_error(
+            StatusCode::BAD_REQUEST,
+            BootstrapErrorCode::InvalidSubject.as_str(),
+        );
     };
 
     let Some(hh_priv) = identity.hh_priv.as_deref() else {
-        return cbor_error(StatusCode::CONFLICT, "household_not_initialized");
+        return cbor_error(
+            StatusCode::CONFLICT,
+            BootstrapErrorCode::HouseholdNotInitialized.as_str(),
+        );
     };
     let cert = match MachineCert::sign(
         hh_priv,
@@ -210,21 +265,30 @@ pub async fn sign_machine_cert_handler(
         Ok(cert) => cert,
         Err(e) => {
             tracing::error!(stage = "sign_machine_cert.cert_sign_failed", error = %e);
-            return cbor_error(StatusCode::INTERNAL_SERVER_ERROR, "keygen_failed");
+            return cbor_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                BootstrapErrorCode::KeygenFailed.as_str(),
+            );
         }
     };
     let machine_cert = match household_rs::cbor::to_canonical_vec(&cert) {
         Ok(bytes) => bytes,
         Err(e) => {
             tracing::error!(stage = "sign_machine_cert.cert_encode_failed", error = %e);
-            return cbor_error(StatusCode::INTERNAL_SERVER_ERROR, "internal_error");
+            return cbor_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                BootstrapErrorCode::InternalError.as_str(),
+            );
         }
     };
     let challenge_signature = match hh_priv.sign(req.challenge.as_ref()) {
         Ok(sig) => sig,
         Err(e) => {
             tracing::error!(stage = "sign_machine_cert.challenge_sign_failed", error = %e);
-            return cbor_error(StatusCode::INTERNAL_SERVER_ERROR, "keygen_failed");
+            return cbor_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                BootstrapErrorCode::KeygenFailed.as_str(),
+            );
         }
     };
 
@@ -241,7 +305,10 @@ pub async fn sign_machine_cert_handler(
         }),
     ) {
         tracing::error!(stage = "sign_machine_cert.audit_append_failed", error = %e);
-        return cbor_error(StatusCode::INTERNAL_SERVER_ERROR, "internal_error");
+        return cbor_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            BootstrapErrorCode::InternalError.as_str(),
+        );
     }
 
     cbor_ok(SignMachineCertResponse {

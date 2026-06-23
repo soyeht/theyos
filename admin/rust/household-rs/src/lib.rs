@@ -31,6 +31,7 @@
 
 pub mod bip39_wordlist;
 pub mod bootstrap;
+pub mod bootstrap_error;
 pub mod bootstrap_state;
 pub mod caveats;
 pub mod cbor;

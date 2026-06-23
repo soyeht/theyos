@@ -1,0 +1,25 @@
+{
+  "_comment": "Cross-language contract for BootstrapErrorCode — the `error` wire string in the bootstrap/onboarding CBOR/JSON error envelope that soyeht-ios decodes as BootstrapError.serverError(code). theyos (household-rs) owns the wire set; soyeht-ios vendors this VERBATIM via scripts/sync-cross-repo-fixtures.sh and validates its BootstrapErrorCode enum + fail-soft decode against it. `http_status` documents the HTTP status each code is emitted with (unchanged by the producer-typing PR). `Unknown` is RECEIVE-ONLY (fail-soft) and is NOT a producer code, so it is not listed. The pair-machine `StageError` codes (no_transport_address, stage_failed) are a separate taxonomy and are intentionally excluded.",
+  "codes": [
+    { "wire": "invalid_cbor",              "http_status": 400 },
+    { "wire": "invalid_request",           "http_status": 400 },
+    { "wire": "invalid_name",              "http_status": 400 },
+    { "wire": "invalid_subject",           "http_status": 400 },
+    { "wire": "invalid_pop",               "http_status": 401 },
+    { "wire": "unauthorized",              "http_status": 401 },
+    { "wire": "invitation_not_recognized", "http_status": 401 },
+    { "wire": "not_a_member",              "http_status": 403 },
+    { "wire": "tailnet_required",          "http_status": 403 },
+    { "wire": "invitation_expired",        "http_status": 404 },
+    { "wire": "already_initialized",       "http_status": 409 },
+    { "wire": "household_not_initialized", "http_status": 409 },
+    { "wire": "no_household_to_teardown",  "http_status": 409 },
+    { "wire": "internal_error",            "http_status": 500 },
+    { "wire": "keygen_failed",             "http_status": 500 },
+    { "wire": "crypto_validation_failed",  "http_status": 422 },
+    { "wire": "invitation_expired_or_spent", "http_status": 410 },
+    { "wire": "invitation_not_found",      "http_status": 404 },
+    { "wire": "accept_household_not_pending", "http_status": 409 },
+    { "wire": "engine_initializing",       "http_status": 503 }
+  ]
+}

@@ -32,6 +32,7 @@ use household_rs::bootstrap::{
     bootstrap_or_load, confirm_accept_household, load_pending_accept_household,
     prepare_accept_household,
 };
+use household_rs::bootstrap_error::BootstrapErrorCode;
 use household_rs::bootstrap_state::{self, BootstrapState};
 use household_rs::household_record::validate_household_name;
 use household_rs::ids::{HouseholdId, MachineId, derive_household_id};
@@ -508,22 +509,36 @@ pub async fn post_claim_setup_invitation(
             *current,
             household_rs::bootstrap_state::BootstrapState::Uninitialized
         ) {
-            return claim_cbor_error(StatusCode::CONFLICT, "already_initialized");
+            return claim_cbor_error(
+                StatusCode::CONFLICT,
+                BootstrapErrorCode::AlreadyInitialized.as_str(),
+            );
         }
     }
 
     // 2. Decode CBOR.
     let req: ClaimSetupInvitationRequest = match household_rs::cbor::from_canonical_slice(&body) {
         Ok(r) => r,
-        Err(_) => return claim_cbor_error(StatusCode::BAD_REQUEST, "invalid_request"),
+        Err(_) => {
+            return claim_cbor_error(
+                StatusCode::BAD_REQUEST,
+                BootstrapErrorCode::InvalidRequest.as_str(),
+            );
+        }
     };
     if req.version != 1 {
-        return claim_cbor_error(StatusCode::BAD_REQUEST, "invalid_request");
+        return claim_cbor_error(
+            StatusCode::BAD_REQUEST,
+            BootstrapErrorCode::InvalidRequest.as_str(),
+        );
     }
 
     // 3. Token shape check — exactly 32 bytes.
     let Ok(token): Result<[u8; 32], _> = req.token.as_ref().try_into() else {
-        return claim_cbor_error(StatusCode::BAD_REQUEST, "invalid_request");
+        return claim_cbor_error(
+            StatusCode::BAD_REQUEST,
+            BootstrapErrorCode::InvalidRequest.as_str(),
+        );
     };
 
     // 4. Atomic cache take — removes the entry in one lock acquire so concurrent
@@ -535,7 +550,10 @@ pub async fn post_claim_setup_invitation(
             stage = "claim_setup_invitation.rejected",
             reason = "token_not_in_cache",
         );
-        return claim_cbor_error(StatusCode::UNAUTHORIZED, "invitation_not_recognized");
+        return claim_cbor_error(
+            StatusCode::UNAUTHORIZED,
+            BootstrapErrorCode::InvitationNotRecognized.as_str(),
+        );
     };
 
     // 5. TTL check — distinct error from "not found". Entry already removed; don't re-insert.
@@ -545,7 +563,10 @@ pub async fn post_claim_setup_invitation(
             reason = "token_expired",
             expires_at = entry.expires_at,
         );
-        return claim_cbor_error(StatusCode::NOT_FOUND, "invitation_expired");
+        return claim_cbor_error(
+            StatusCode::NOT_FOUND,
+            BootstrapErrorCode::InvitationExpired.as_str(),
+        );
     }
 
     // Opportunistic cleanup of other expired entries; does not affect this request.
@@ -567,7 +588,10 @@ pub async fn post_claim_setup_invitation(
             error = %e,
         );
         cache_reinsert_if_absent(&state.setup_invitation_cache, entry).await;
-        return claim_cbor_error(StatusCode::UNAUTHORIZED, "invitation_not_recognized");
+        return claim_cbor_error(
+            StatusCode::UNAUTHORIZED,
+            BootstrapErrorCode::InvitationNotRecognized.as_str(),
+        );
     }
 
     // 7. Persist invitation to disk. Re-insert on failure (disk error is transient).
@@ -581,7 +605,10 @@ pub async fn post_claim_setup_invitation(
             error = %e,
         );
         cache_reinsert_if_absent(&state.setup_invitation_cache, entry).await;
-        return claim_cbor_error(StatusCode::INTERNAL_SERVER_ERROR, "internal_error");
+        return claim_cbor_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            BootstrapErrorCode::InternalError.as_str(),
+        );
     }
 
     // Entry already removed by cache_take; no separate remove needed.
@@ -874,7 +901,7 @@ pub async fn post_teardown(State(state): State<BootstrapHandlerState>, body: Byt
             );
             return cbor_error(
                 StatusCode::CONFLICT,
-                "no_household_to_teardown",
+                BootstrapErrorCode::NoHouseholdToTeardown.as_str(),
                 None,
                 Some(other.as_str()),
             );
@@ -886,40 +913,85 @@ pub async fn post_teardown(State(state): State<BootstrapHandlerState>, body: Byt
         r
     } else {
         tracing::warn!(stage = "teardown.rejected", reason = "cbor_decode_failed");
-        return cbor_error(StatusCode::BAD_REQUEST, "invalid_request", None, None);
+        return cbor_error(
+            StatusCode::BAD_REQUEST,
+            BootstrapErrorCode::InvalidRequest.as_str(),
+            None,
+            None,
+        );
     };
     let Ok(re_encoded) = household_rs::cbor::to_canonical_vec(&req) else {
-        return cbor_error(StatusCode::BAD_REQUEST, "invalid_request", None, None);
+        return cbor_error(
+            StatusCode::BAD_REQUEST,
+            BootstrapErrorCode::InvalidRequest.as_str(),
+            None,
+            None,
+        );
     };
     if re_encoded != body.as_ref() {
         tracing::warn!(
             stage = "teardown.rejected",
             reason = "cbor_reencode_mismatch"
         );
-        return cbor_error(StatusCode::BAD_REQUEST, "invalid_request", None, None);
+        return cbor_error(
+            StatusCode::BAD_REQUEST,
+            BootstrapErrorCode::InvalidRequest.as_str(),
+            None,
+            None,
+        );
     }
 
     // Step 3: op constant check.
     if req.op != "teardown" {
         tracing::warn!(stage = "teardown.rejected", reason = "op_mismatch", op = %req.op);
-        return cbor_error(StatusCode::BAD_REQUEST, "invalid_request", None, None);
+        return cbor_error(
+            StatusCode::BAD_REQUEST,
+            BootstrapErrorCode::InvalidRequest.as_str(),
+            None,
+            None,
+        );
     }
 
     // Step 4: Field shape checks.
     let Ok(signed_by_bytes): Result<[u8; 33], _> = req.signed_by.as_ref().try_into() else {
-        return cbor_error(StatusCode::BAD_REQUEST, "invalid_request", None, None);
+        return cbor_error(
+            StatusCode::BAD_REQUEST,
+            BootstrapErrorCode::InvalidRequest.as_str(),
+            None,
+            None,
+        );
     };
     let Ok(d_pub) = P256PublicKey::from_bytes(&signed_by_bytes) else {
-        return cbor_error(StatusCode::BAD_REQUEST, "invalid_request", None, None);
+        return cbor_error(
+            StatusCode::BAD_REQUEST,
+            BootstrapErrorCode::InvalidRequest.as_str(),
+            None,
+            None,
+        );
     };
     let Ok(nonce_bytes): Result<[u8; 32], _> = req.nonce.as_ref().try_into() else {
-        return cbor_error(StatusCode::BAD_REQUEST, "invalid_request", None, None);
+        return cbor_error(
+            StatusCode::BAD_REQUEST,
+            BootstrapErrorCode::InvalidRequest.as_str(),
+            None,
+            None,
+        );
     };
     let Ok(sig_bytes): Result<[u8; 64], _> = req.signature.as_ref().try_into() else {
-        return cbor_error(StatusCode::BAD_REQUEST, "invalid_request", None, None);
+        return cbor_error(
+            StatusCode::BAD_REQUEST,
+            BootstrapErrorCode::InvalidRequest.as_str(),
+            None,
+            None,
+        );
     };
     let Ok(sig) = P256Signature::from_bytes(&sig_bytes) else {
-        return cbor_error(StatusCode::BAD_REQUEST, "invalid_request", None, None);
+        return cbor_error(
+            StatusCode::BAD_REQUEST,
+            BootstrapErrorCode::InvalidRequest.as_str(),
+            None,
+            None,
+        );
     };
 
     // Validate hh_id / m_id against this engine's live identity.
@@ -927,16 +999,26 @@ pub async fn post_teardown(State(state): State<BootstrapHandlerState>, body: Byt
         tracing::error!(stage = "teardown.identity_unavailable");
         return cbor_error(
             StatusCode::CONFLICT,
-            "no_household_to_teardown",
+            BootstrapErrorCode::NoHouseholdToTeardown.as_str(),
             None,
             Some(current_bs.as_str()),
         );
     };
     if req.hh_id != identity.record.hh_id.as_str() {
-        return cbor_error(StatusCode::BAD_REQUEST, "invalid_request", None, None);
+        return cbor_error(
+            StatusCode::BAD_REQUEST,
+            BootstrapErrorCode::InvalidRequest.as_str(),
+            None,
+            None,
+        );
     }
     if req.m_id != identity.cert.m_id.as_str() {
-        return cbor_error(StatusCode::BAD_REQUEST, "invalid_request", None, None);
+        return cbor_error(
+            StatusCode::BAD_REQUEST,
+            BootstrapErrorCode::InvalidRequest.as_str(),
+            None,
+            None,
+        );
     }
 
     // Step 5: ts skew — |now − ts| ≤ 300 s.
@@ -950,7 +1032,12 @@ pub async fn post_teardown(State(state): State<BootstrapHandlerState>, body: Byt
             reason = "ts_skew",
             skew_secs = skew
         );
-        return cbor_error(StatusCode::UNAUTHORIZED, "unauthorized", None, None);
+        return cbor_error(
+            StatusCode::UNAUTHORIZED,
+            BootstrapErrorCode::Unauthorized.as_str(),
+            None,
+            None,
+        );
     }
 
     // Steps 6 + 9: atomic nonce check-and-persist (burns nonce before cert/sig checks).
@@ -968,13 +1055,18 @@ pub async fn post_teardown(State(state): State<BootstrapHandlerState>, body: Byt
         }
         Ok(Err(crate::nonce_cache::NonceError::AlreadyUsed)) => {
             tracing::warn!(stage = "teardown.rejected", reason = "nonce_replay");
-            return cbor_error(StatusCode::UNAUTHORIZED, "unauthorized", None, None);
+            return cbor_error(
+                StatusCode::UNAUTHORIZED,
+                BootstrapErrorCode::Unauthorized.as_str(),
+                None,
+                None,
+            );
         }
         Ok(Err(crate::nonce_cache::NonceError::Io(e))) => {
             tracing::error!(stage = "teardown.nonce_io_error", error = %e);
             return cbor_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                "internal_error",
+                BootstrapErrorCode::InternalError.as_str(),
                 None,
                 None,
             );
@@ -983,7 +1075,7 @@ pub async fn post_teardown(State(state): State<BootstrapHandlerState>, body: Byt
             tracing::error!(stage = "teardown.nonce_task_failed", error = %e);
             return cbor_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                "internal_error",
+                BootstrapErrorCode::InternalError.as_str(),
                 None,
                 None,
             );
@@ -1006,17 +1098,27 @@ pub async fn post_teardown(State(state): State<BootstrapHandlerState>, body: Byt
             Ok(Ok(Some(a))) => a,
             Ok(Ok(None)) => {
                 tracing::warn!(stage = "teardown.rejected", reason = "no_owner_auth_state");
-                return cbor_error(StatusCode::UNAUTHORIZED, "unauthorized", None, None);
+                return cbor_error(
+                    StatusCode::UNAUTHORIZED,
+                    BootstrapErrorCode::Unauthorized.as_str(),
+                    None,
+                    None,
+                );
             }
             Ok(Err(e)) => {
                 tracing::error!(stage = "teardown.auth_load_failed", error = %e);
-                return cbor_error(StatusCode::UNAUTHORIZED, "unauthorized", None, None);
+                return cbor_error(
+                    StatusCode::UNAUTHORIZED,
+                    BootstrapErrorCode::Unauthorized.as_str(),
+                    None,
+                    None,
+                );
             }
             Err(e) => {
                 tracing::error!(stage = "teardown.auth_task_failed", error = %e);
                 return cbor_error(
                     StatusCode::INTERNAL_SERVER_ERROR,
-                    "internal_error",
+                    BootstrapErrorCode::InternalError.as_str(),
                     None,
                     None,
                 );
@@ -1026,7 +1128,12 @@ pub async fn post_teardown(State(state): State<BootstrapHandlerState>, body: Byt
             crate::owner_cert_auth::verify_owner_cert(&auth, &signed_by_bytes, &hh_pub, now_unix)
         {
             tracing::warn!(stage = "teardown.rejected", reason = "cert_invalid", error = %e);
-            return cbor_error(StatusCode::UNAUTHORIZED, "unauthorized", None, None);
+            return cbor_error(
+                StatusCode::UNAUTHORIZED,
+                BootstrapErrorCode::Unauthorized.as_str(),
+                None,
+                None,
+            );
         }
 
         // Step 8: Signature verification over canonical CBOR of TeardownPayload.
@@ -1042,14 +1149,19 @@ pub async fn post_teardown(State(state): State<BootstrapHandlerState>, body: Byt
         let Ok(msg_bytes) = household_rs::cbor::to_canonical_vec(&payload) else {
             return cbor_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                "internal_error",
+                BootstrapErrorCode::InternalError.as_str(),
                 None,
                 None,
             );
         };
         if let Err(e) = verify_signature(&d_pub, &msg_bytes, &sig) {
             tracing::warn!(stage = "teardown.rejected", reason = "signature_invalid", error = %e);
-            return cbor_error(StatusCode::UNAUTHORIZED, "unauthorized", None, None);
+            return cbor_error(
+                StatusCode::UNAUTHORIZED,
+                BootstrapErrorCode::Unauthorized.as_str(),
+                None,
+                None,
+            );
         }
     }
 
@@ -1061,7 +1173,7 @@ pub async fn post_teardown(State(state): State<BootstrapHandlerState>, body: Byt
             tracing::error!(stage = "teardown.rename_failed", error = %e);
             return cbor_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                "internal_error",
+                BootstrapErrorCode::InternalError.as_str(),
                 None,
                 None,
             );
@@ -1082,7 +1194,7 @@ pub async fn post_teardown(State(state): State<BootstrapHandlerState>, body: Byt
         tracing::error!(stage = "teardown.state_persist_failed", error = %e);
         return cbor_error(
             StatusCode::INTERNAL_SERVER_ERROR,
-            "internal_error",
+            BootstrapErrorCode::InternalError.as_str(),
             None,
             None,
         );
@@ -1135,7 +1247,7 @@ pub async fn post_accept_household(
             other => {
                 return cbor_error(
                     StatusCode::CONFLICT,
-                    "already_initialized",
+                    BootstrapErrorCode::AlreadyInitialized.as_str(),
                     None,
                     Some(other.as_str()),
                 );
@@ -1145,33 +1257,55 @@ pub async fn post_accept_household(
 
     let req: AcceptHouseholdRequest = match strict_cbor_request(&body) {
         Ok(req) => req,
-        Err(()) => return cbor_error(StatusCode::BAD_REQUEST, "invalid_cbor", None, None),
+        Err(()) => {
+            return cbor_error(
+                StatusCode::BAD_REQUEST,
+                BootstrapErrorCode::InvalidCbor.as_str(),
+                None,
+                None,
+            );
+        }
     };
     if req.version != 1 {
         return cbor_error(
             StatusCode::BAD_REQUEST,
-            "invalid_cbor",
+            BootstrapErrorCode::InvalidCbor.as_str(),
             Some("unsupported v".into()),
             None,
         );
     }
     if req.invitation_token.len() != 32 {
-        return cbor_error(StatusCode::BAD_REQUEST, "invalid_request", None, None);
+        return cbor_error(
+            StatusCode::BAD_REQUEST,
+            BootstrapErrorCode::InvalidRequest.as_str(),
+            None,
+            None,
+        );
     }
     let Ok(invitation_token): Result<[u8; 32], _> = req.invitation_token.as_ref().try_into() else {
-        return cbor_error(StatusCode::BAD_REQUEST, "invalid_request", None, None);
+        return cbor_error(
+            StatusCode::BAD_REQUEST,
+            BootstrapErrorCode::InvalidRequest.as_str(),
+            None,
+            None,
+        );
     };
 
     let token_hash = *blake3::hash(&invitation_token).as_bytes();
     if let Err(reason) = validate_accept_household_name(&req.hh_name) {
-        return cbor_error(StatusCode::BAD_REQUEST, "invalid_name", Some(reason), None);
+        return cbor_error(
+            StatusCode::BAD_REQUEST,
+            BootstrapErrorCode::InvalidName.as_str(),
+            Some(reason),
+            None,
+        );
     }
     let hh_id = match HouseholdId::parse(req.hh_id.clone()) {
         Ok(id) => id,
         Err(e) => {
             return cbor_error(
                 StatusCode::UNPROCESSABLE_ENTITY,
-                "crypto_validation_failed",
+                BootstrapErrorCode::CryptoValidationFailed.as_str(),
                 Some(e.to_string()),
                 None,
             );
@@ -1182,7 +1316,7 @@ pub async fn post_accept_household(
         Err(e) => {
             return cbor_error(
                 StatusCode::UNPROCESSABLE_ENTITY,
-                "crypto_validation_failed",
+                BootstrapErrorCode::CryptoValidationFailed.as_str(),
                 Some(e.to_string()),
                 None,
             );
@@ -1192,7 +1326,7 @@ pub async fn post_accept_household(
     if derived_hh_id != hh_id {
         return cbor_error(
             StatusCode::UNPROCESSABLE_ENTITY,
-            "crypto_validation_failed",
+            BootstrapErrorCode::CryptoValidationFailed.as_str(),
             Some(format!(
                 "hh_id mismatch: expected {derived_hh_id}, got {}",
                 req.hh_id
@@ -1218,7 +1352,7 @@ pub async fn post_accept_household(
         .await;
         return cbor_error(
             StatusCode::UNPROCESSABLE_ENTITY,
-            "crypto_validation_failed",
+            BootstrapErrorCode::CryptoValidationFailed.as_str(),
             Some("invitation_token household mismatch".into()),
             None,
         );
@@ -1250,7 +1384,7 @@ pub async fn post_accept_household(
             .await;
             return cbor_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                "keygen_failed",
+                BootstrapErrorCode::KeygenFailed.as_str(),
                 None,
                 None,
             );
@@ -1264,7 +1398,7 @@ pub async fn post_accept_household(
             .await;
             return cbor_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                "keygen_failed",
+                BootstrapErrorCode::KeygenFailed.as_str(),
                 None,
                 None,
             );
@@ -1308,7 +1442,7 @@ async fn consume_accept_household_invitation(
         {
             return Err(cbor_error(
                 StatusCode::GONE,
-                "invitation_expired_or_spent",
+                BootstrapErrorCode::InvitationExpiredOrSpent.as_str(),
                 None,
                 None,
             ));
@@ -1324,7 +1458,7 @@ async fn consume_accept_household_invitation(
             None => {
                 return Err(cbor_error(
                     StatusCode::NOT_FOUND,
-                    "invitation_not_found",
+                    BootstrapErrorCode::InvitationNotFound.as_str(),
                     None,
                     None,
                 ));
@@ -1333,7 +1467,7 @@ async fn consume_accept_household_invitation(
     } else {
         return Err(cbor_error(
             StatusCode::NOT_FOUND,
-            "invitation_not_found",
+            BootstrapErrorCode::InvitationNotFound.as_str(),
             None,
             None,
         ));
@@ -1341,7 +1475,7 @@ async fn consume_accept_household_invitation(
     if now >= entry.expires_at || entry.expires_at.saturating_sub(now) > 3600 {
         return Err(cbor_error(
             StatusCode::GONE,
-            "invitation_expired_or_spent",
+            BootstrapErrorCode::InvitationExpiredOrSpent.as_str(),
             None,
             None,
         ));
@@ -1365,7 +1499,7 @@ pub async fn post_accept_household_confirm(
         if *current != BootstrapState::ReadyForNaming {
             return cbor_error(
                 StatusCode::CONFLICT,
-                "accept_household_not_pending",
+                BootstrapErrorCode::AcceptHouseholdNotPending.as_str(),
                 None,
                 Some(current.as_str()),
             );
@@ -1374,12 +1508,19 @@ pub async fn post_accept_household_confirm(
 
     let req: AcceptHouseholdConfirmRequest = match strict_cbor_request(&body) {
         Ok(req) => req,
-        Err(()) => return cbor_error(StatusCode::BAD_REQUEST, "invalid_cbor", None, None),
+        Err(()) => {
+            return cbor_error(
+                StatusCode::BAD_REQUEST,
+                BootstrapErrorCode::InvalidCbor.as_str(),
+                None,
+                None,
+            );
+        }
     };
     if req.version != 1 {
         return cbor_error(
             StatusCode::BAD_REQUEST,
-            "invalid_cbor",
+            BootstrapErrorCode::InvalidCbor.as_str(),
             Some("unsupported v".into()),
             None,
         );
@@ -1389,7 +1530,7 @@ pub async fn post_accept_household_confirm(
         Err(e) => {
             return cbor_error(
                 StatusCode::UNPROCESSABLE_ENTITY,
-                "crypto_validation_failed",
+                BootstrapErrorCode::CryptoValidationFailed.as_str(),
                 Some(e.to_string()),
                 None,
             );
@@ -1400,7 +1541,7 @@ pub async fn post_accept_household_confirm(
         Err(_) => {
             return cbor_error(
                 StatusCode::UNPROCESSABLE_ENTITY,
-                "crypto_validation_failed",
+                BootstrapErrorCode::CryptoValidationFailed.as_str(),
                 Some("challenge_sig must be 64 bytes".into()),
                 None,
             );
@@ -1411,7 +1552,7 @@ pub async fn post_accept_household_confirm(
         Err(e) => {
             return cbor_error(
                 StatusCode::UNPROCESSABLE_ENTITY,
-                "crypto_validation_failed",
+                BootstrapErrorCode::CryptoValidationFailed.as_str(),
                 Some(e.to_string()),
                 None,
             );
@@ -1422,7 +1563,7 @@ pub async fn post_accept_household_confirm(
         Err(()) => {
             return cbor_error(
                 StatusCode::UNPROCESSABLE_ENTITY,
-                "crypto_validation_failed",
+                BootstrapErrorCode::CryptoValidationFailed.as_str(),
                 Some("machine_cert CBOR invalid".into()),
                 None,
             );
@@ -1440,7 +1581,7 @@ pub async fn post_accept_household_confirm(
         Ok(Err(AcceptHouseholdConfirmError::PendingMissing)) => {
             return cbor_error(
                 StatusCode::CONFLICT,
-                "accept_household_not_pending",
+                BootstrapErrorCode::AcceptHouseholdNotPending.as_str(),
                 None,
                 Some("ready_for_naming"),
             );
@@ -1450,7 +1591,7 @@ pub async fn post_accept_household_confirm(
         )) => {
             return cbor_error(
                 StatusCode::UNPROCESSABLE_ENTITY,
-                "crypto_validation_failed",
+                BootstrapErrorCode::CryptoValidationFailed.as_str(),
                 None,
                 None,
             );
@@ -1459,7 +1600,7 @@ pub async fn post_accept_household_confirm(
             tracing::error!(stage = "bootstrap.accept_household.confirm_failed", error = %e);
             return cbor_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                "internal_error",
+                BootstrapErrorCode::InternalError.as_str(),
                 None,
                 None,
             );
@@ -1468,7 +1609,7 @@ pub async fn post_accept_household_confirm(
             tracing::error!(stage = "bootstrap.accept_household.confirm_task_failed", error = %e);
             return cbor_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                "internal_error",
+                BootstrapErrorCode::InternalError.as_str(),
                 None,
                 None,
             );
@@ -1484,7 +1625,7 @@ pub async fn post_accept_household_confirm(
         {
             return cbor_error(
                 StatusCode::CONFLICT,
-                "accept_household_not_pending",
+                BootstrapErrorCode::AcceptHouseholdNotPending.as_str(),
                 None,
                 Some(current.as_str()),
             );
@@ -1496,7 +1637,7 @@ pub async fn post_accept_household_confirm(
             tracing::error!(stage = "bootstrap.accept_household.state_persist_failed", error = %e);
             return cbor_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                "internal_error",
+                BootstrapErrorCode::InternalError.as_str(),
                 None,
                 None,
             );
@@ -1506,7 +1647,7 @@ pub async fn post_accept_household_confirm(
             tracing::error!(stage = "bootstrap.accept_household.state_persist_failed", error = %e);
             return cbor_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                "internal_error",
+                BootstrapErrorCode::InternalError.as_str(),
                 None,
                 None,
             );
@@ -1561,7 +1702,12 @@ pub async fn post_initialize(
             .map(|ci| ci.0.ip());
         match src_ip {
             None => {
-                return cbor_error(StatusCode::FORBIDDEN, "tailnet_required", None, None);
+                return cbor_error(
+                    StatusCode::FORBIDDEN,
+                    BootstrapErrorCode::TailnetRequired.as_str(),
+                    None,
+                    None,
+                );
             }
             Some(ip) => {
                 if let Err(reason) =
@@ -1572,7 +1718,12 @@ pub async fn post_initialize(
                         reason = reason,
                         src_ip = %ip,
                     );
-                    return cbor_error(StatusCode::FORBIDDEN, "tailnet_required", None, None);
+                    return cbor_error(
+                        StatusCode::FORBIDDEN,
+                        BootstrapErrorCode::TailnetRequired.as_str(),
+                        None,
+                        None,
+                    );
                 }
             }
         }
@@ -1580,20 +1731,30 @@ pub async fn post_initialize(
 
     // Extract body bytes from the request.
     let Ok(body) = axum::body::to_bytes(req.into_body(), 1024 * 64).await else {
-        return cbor_error(StatusCode::BAD_REQUEST, "invalid_cbor", None, None);
+        return cbor_error(
+            StatusCode::BAD_REQUEST,
+            BootstrapErrorCode::InvalidCbor.as_str(),
+            None,
+            None,
+        );
     };
 
     // 1. Decode CBOR request.
     let req: InitializeRequest = match household_rs::cbor::from_canonical_slice(&body) {
         Ok(r) => r,
         Err(_) => {
-            return cbor_error(StatusCode::BAD_REQUEST, "invalid_cbor", None, None);
+            return cbor_error(
+                StatusCode::BAD_REQUEST,
+                BootstrapErrorCode::InvalidCbor.as_str(),
+                None,
+                None,
+            );
         }
     };
     if req.version != 1 {
         return cbor_error(
             StatusCode::BAD_REQUEST,
-            "invalid_cbor",
+            BootstrapErrorCode::InvalidCbor.as_str(),
             Some("unsupported v".into()),
             None,
         );
@@ -1604,7 +1765,7 @@ pub async fn post_initialize(
     if let Err(e) = validate_household_name(&name) {
         return cbor_error(
             StatusCode::BAD_REQUEST,
-            "invalid_name",
+            BootstrapErrorCode::InvalidName.as_str(),
             Some(e.to_string()),
             None,
         );
@@ -1618,7 +1779,7 @@ pub async fn post_initialize(
             other => {
                 return cbor_error(
                     StatusCode::CONFLICT,
-                    "already_initialized",
+                    BootstrapErrorCode::AlreadyInitialized.as_str(),
                     None,
                     Some(other.as_str()),
                 );
@@ -1644,7 +1805,7 @@ pub async fn post_initialize(
             tracing::error!(stage = "bootstrap.initialize_failed", error = %e);
             return cbor_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                "keygen_failed",
+                BootstrapErrorCode::KeygenFailed.as_str(),
                 None,
                 None,
             );
@@ -1653,7 +1814,7 @@ pub async fn post_initialize(
             tracing::error!(stage = "bootstrap.initialize_task_failed", error = %e);
             return cbor_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                "keygen_failed",
+                BootstrapErrorCode::KeygenFailed.as_str(),
                 None,
                 None,
             );
