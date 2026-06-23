@@ -37,6 +37,11 @@ pub enum GuestImageFailureCode {
     IpswDownloadFailed,
     /// The restore image is incompatible with this host.
     IpswIncompatible,
+    /// The Virtualization framework reports this host cannot run virtual machines
+    /// (`+[VZVirtualMachine isSupported]` was false) — an unsupportable host/OS or
+    /// a missing virtualization authorization. Terminal + ambiguous: neither a
+    /// reboot nor a plain retry helps.
+    VirtualizationUnavailable,
     /// Unrecognized / unclassified failure (fail-soft catch-all).
     #[serde(other)]
     Unknown,
@@ -135,6 +140,7 @@ impl GuestImageFailureCode {
             Self::EntitlementMissing => "entitlement_missing",
             Self::IpswDownloadFailed => "ipsw_download_failed",
             Self::IpswIncompatible => "ipsw_incompatible",
+            Self::VirtualizationUnavailable => "virtualization_unavailable",
             Self::Unknown => "unknown",
         }
     }
@@ -149,19 +155,23 @@ impl GuestImageFailureCode {
     /// - `ipsw_download_failed`, `insufficient_disk` → [`FailureScope::Retryable`]
     ///   (a network retry, or the user freeing disk, can succeed without a
     ///   reboot or reinstall).
-    /// - `helper_missing`, `entitlement_missing`, `ipsw_incompatible` →
-    ///   [`FailureScope::Persistent`] (needs a reinstall / different host /
-    ///   different image — neither reboot nor a plain retry helps).
+    /// - `helper_missing`, `entitlement_missing`, `ipsw_incompatible`,
+    ///   `virtualization_unavailable` → [`FailureScope::Persistent`] (needs a
+    ///   reinstall / different host / different image — neither reboot nor a plain
+    ///   retry helps).
     /// - `unknown` → [`FailureScope::Persistent`] (conservative: keep blocking).
     #[must_use]
     pub const fn default_scope(self) -> FailureScope {
         match self {
             Self::HostVmLimitReached => FailureScope::CurrentBoot,
             Self::IpswDownloadFailed | Self::InsufficientDisk => FailureScope::Retryable,
-            Self::HelperMissing | Self::EntitlementMissing | Self::IpswIncompatible => {
-                FailureScope::Persistent
-            }
-            Self::Unknown => FailureScope::Persistent,
+            // Persistent: needs a reinstall / different host / different image; and
+            // `Unknown` is folded in as the conservative keep-blocking default.
+            Self::HelperMissing
+            | Self::EntitlementMissing
+            | Self::IpswIncompatible
+            | Self::VirtualizationUnavailable
+            | Self::Unknown => FailureScope::Persistent,
         }
     }
 
@@ -175,6 +185,7 @@ impl GuestImageFailureCode {
             "entitlement_missing" => Self::EntitlementMissing,
             "ipsw_download_failed" => Self::IpswDownloadFailed,
             "ipsw_incompatible" => Self::IpswIncompatible,
+            "virtualization_unavailable" => Self::VirtualizationUnavailable,
             _ => Self::Unknown,
         }
     }
@@ -200,6 +211,15 @@ impl GuestImageFailureCode {
             || m.contains("vzerrorvirtualmachinelimitexceeded")
         {
             return Self::HostVmLimitReached;
+        }
+        // Virtualization unavailable — the preflight's typed
+        // `VZError::VirtualizationUnsupported` (`+[VZVirtualMachine isSupported]`
+        // returned false): an unsupportable host/OS or a missing virtualization
+        // authorization. Matched on stable substrings of that message and checked
+        // BEFORE the generic "not supported"/"incompatible" branch so it never
+        // collapses into `IpswIncompatible`.
+        if m.contains("cannot run virtual machines") || m.contains("issupported() was false") {
+            return Self::VirtualizationUnavailable;
         }
         if m.contains("entitlement") {
             return Self::EntitlementMissing;
@@ -284,6 +304,33 @@ mod tests {
     }
 
     #[test]
+    fn virtualization_unavailable_classifies_from_preflight_message() {
+        // The exact preflight message (vmrunner-macos-rs `VZError::VirtualizationUnsupported`).
+        let preflight = "the Virtualization framework reports this process cannot run virtual \
+             machines on this host (VZVirtualMachine.isSupported() was false) — an unsupportable \
+             host or a missing virtualization authorization; no virtual machine can be created";
+        assert_eq!(
+            GuestImageFailureCode::classify(None, preflight),
+            GuestImageFailureCode::VirtualizationUnavailable
+        );
+        // Either stable substring is sufficient.
+        assert_eq!(
+            GuestImageFailureCode::classify(None, "VZVirtualMachine.isSupported() was false"),
+            GuestImageFailureCode::VirtualizationUnavailable
+        );
+        // Ordering guard: a message carrying BOTH the VZ phrase and the generic
+        // "not supported" wording must stay VirtualizationUnavailable, never
+        // collapse into IpswIncompatible.
+        assert_eq!(
+            GuestImageFailureCode::classify(
+                None,
+                "cannot run virtual machines on this host; configuration not supported"
+            ),
+            GuestImageFailureCode::VirtualizationUnavailable
+        );
+    }
+
+    #[test]
     fn unknown_message_is_unknown() {
         assert_eq!(
             GuestImageFailureCode::classify(None, "something totally unexpected"),
@@ -313,6 +360,7 @@ mod tests {
             GuestImageFailureCode::EntitlementMissing,
             GuestImageFailureCode::IpswDownloadFailed,
             GuestImageFailureCode::IpswIncompatible,
+            GuestImageFailureCode::VirtualizationUnavailable,
             GuestImageFailureCode::Unknown,
         ] {
             let json = serde_json::to_string(&code).unwrap();
@@ -352,6 +400,10 @@ mod tests {
         );
         assert_eq!(
             GuestImageFailureCode::IpswIncompatible.default_scope(),
+            Persistent
+        );
+        assert_eq!(
+            GuestImageFailureCode::VirtualizationUnavailable.default_scope(),
             Persistent
         );
         // Unknown is conservative: keep blocking.

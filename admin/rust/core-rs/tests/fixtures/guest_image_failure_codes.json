@@ -1,0 +1,13 @@
+{
+  "_comment": "Cross-language contract for GuestImageFailureCode. theyos (Rust) is the source of truth for `wire` + `default_scope` (validated by core-rs/tests/guest_image_failure_fixture.rs). soyeht-ios vendors this file VERBATIM via scripts/sync-cross-repo-fixtures.sh and validates `recovery_action` + `cta` against its GuestImageRecoveryAction / GuestImageRecoveryCTA. Do not hand-edit the vendored iOS copy.",
+  "codes": [
+    { "wire": "host_vm_limit_reached",      "default_scope": "current_boot", "recovery_action": "restart_mac_required",    "cta": "check_again" },
+    { "wire": "helper_missing",             "default_scope": "persistent",   "recovery_action": "open_soyeht_on_mac",      "cta": "check_again" },
+    { "wire": "insufficient_disk",          "default_scope": "retryable",    "recovery_action": "free_space_then_retry",   "cta": "prepare"     },
+    { "wire": "entitlement_missing",        "default_scope": "persistent",   "recovery_action": "reinstall_soyeht_on_mac", "cta": "check_again" },
+    { "wire": "ipsw_download_failed",        "default_scope": "retryable",    "recovery_action": "retry",                   "cta": "prepare"     },
+    { "wire": "ipsw_incompatible",          "default_scope": "persistent",   "recovery_action": "none",                    "cta": "none"        },
+    { "wire": "virtualization_unavailable", "default_scope": "persistent",   "recovery_action": "none",                    "cta": "none"        },
+    { "wire": "unknown",                    "default_scope": "persistent",   "recovery_action": "retry",                   "cta": "prepare"     }
+  ]
+}

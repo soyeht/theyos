@@ -186,10 +186,8 @@ pub fn evaluate_vz_supportability(probe: impl Fn() -> bool) -> Result<(), VZErro
         return Ok(());
     }
     Err(VZError::VirtualizationUnsupported(
-        // Worded to avoid `GuestImageFailureCode::classify` trigger substrings
-        // ("not supported", "entitlement", "incompatible", "helper missing",
-        // "insufficient disk", ...) so a VZ-unavailable host stays an honest
-        // `Unknown` rather than a dishonest specific code.
+        // Worded to classify as `virtualization_unavailable` without claiming
+        // whether the root cause is hardware support or signing authorization.
         "the Virtualization framework reports this process cannot run virtual \
          machines on this host (VZVirtualMachine.isSupported() was false) — an \
          unsupportable host or a missing virtualization authorization; no \
@@ -1725,12 +1723,12 @@ mod tests {
         ));
     }
 
-    /// The VZ-unsupported and config-nil messages must NOT trip the guest-image
-    /// failure classifier into a dishonest specific code — they must stay
-    /// `Unknown` until a deliberate wire-code mapping decision (deferred
-    /// follow-up). Pins the wording against `classify`'s trigger substrings.
+    /// The VZ-unsupported diagnostic should use the terminal, honest
+    /// virtualization-unavailable code. A nil VM init while VZ is supported
+    /// remains a generic config diagnostic and must not become a user-facing
+    /// supportability failure.
     #[test]
-    fn vz_diagnostics_classify_as_unknown_not_a_dishonest_code() {
+    fn vz_diagnostics_classify_supportability_without_overclassifying_config() {
         use core_rs::guest_image_failure::GuestImageFailureCode;
 
         let unsupported = evaluate_vz_supportability(|| false)
@@ -1738,8 +1736,8 @@ mod tests {
             .to_string();
         assert_eq!(
             GuestImageFailureCode::classify(None, &unsupported),
-            GuestImageFailureCode::Unknown,
-            "VZ-unsupported must classify as Unknown, not a dishonest specific code"
+            GuestImageFailureCode::VirtualizationUnavailable,
+            "VZ-unsupported must classify as the terminal supportability code"
         );
 
         let config = diagnose_vm_init_nil(true).to_string();
