@@ -842,11 +842,7 @@ pub(crate) async fn restart_instance_for_row(
         let _cap_guard = state.capacity_lock.lock().await;
         let needs_runtime_lease = !state
             .instance_db
-            .has_active_lease(
-                LeaseOwnerType::Instance.as_str(),
-                id,
-                LeaseKind::Runtime.as_str(),
-            )
+            .has_active_lease(LeaseOwnerType::Instance, id, LeaseKind::Runtime)
             .map_err(ApiError::from)?;
 
         if needs_runtime_lease {
@@ -870,9 +866,9 @@ pub(crate) async fn restart_instance_for_row(
             state
                 .instance_db
                 .create_lease(&store_rs::NewLease {
-                    owner_type: LeaseOwnerType::Instance.as_str(),
+                    owner_type: LeaseOwnerType::Instance,
                     owner_id: id,
-                    lease_kind: LeaseKind::Runtime.as_str(),
+                    lease_kind: LeaseKind::Runtime,
                     cpu_cores: i64::from(cpu),
                     ram_mb: i64::from(ram),
                     disk_gb: 0,
@@ -889,9 +885,9 @@ pub(crate) async fn restart_instance_for_row(
             Err(err) => {
                 if acquired_runtime_lease {
                     let _ = state.instance_db.release_lease(
-                        LeaseOwnerType::Instance.as_str(),
+                        LeaseOwnerType::Instance,
                         id,
-                        LeaseKind::Runtime.as_str(),
+                        LeaseKind::Runtime,
                     );
                 }
                 return Err(err);

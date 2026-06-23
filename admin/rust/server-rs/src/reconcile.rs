@@ -36,11 +36,9 @@ pub fn reconcile_after_sweep(db: &InstanceDb, state_dir: &Path, report: &SweepRe
                     tracing::warn!("[reconcile] failed to update {container}: {e}");
                 } else {
                     // Release runtime lease — VM is dead, CPU/RAM are free
-                    if let Err(e) = db.release_lease(
-                        LeaseOwnerType::Instance.as_str(),
-                        &row.id,
-                        LeaseKind::Runtime.as_str(),
-                    ) {
+                    if let Err(e) =
+                        db.release_lease(LeaseOwnerType::Instance, &row.id, LeaseKind::Runtime)
+                    {
                         tracing::warn!(
                             "[reconcile] failed to release runtime lease for {container}: {e}"
                         );
@@ -85,11 +83,9 @@ pub fn reconcile_after_sweep(db: &InstanceDb, state_dir: &Path, report: &SweepRe
                         tracing::warn!("[reconcile] failed to update {}: {e}", row.container);
                     } else {
                         // Release runtime lease — VM is dead, CPU/RAM are free
-                        if let Err(e) = db.release_lease(
-                            LeaseOwnerType::Instance.as_str(),
-                            &row.id,
-                            LeaseKind::Runtime.as_str(),
-                        ) {
+                        if let Err(e) =
+                            db.release_lease(LeaseOwnerType::Instance, &row.id, LeaseKind::Runtime)
+                        {
                             tracing::warn!(
                                 "[reconcile] failed to release runtime lease for {}: {e}",
                                 row.container
@@ -129,18 +125,14 @@ pub fn ensure_restarted_runtime_lease(
     cpu_cores: i64,
     ram_mb: i64,
 ) -> Result<bool, StoreError> {
-    if db.has_active_lease(
-        LeaseOwnerType::Instance.as_str(),
-        instance_id,
-        LeaseKind::Runtime.as_str(),
-    )? {
+    if db.has_active_lease(LeaseOwnerType::Instance, instance_id, LeaseKind::Runtime)? {
         return Ok(false);
     }
 
     db.create_lease(&NewLease {
-        owner_type: LeaseOwnerType::Instance.as_str(),
+        owner_type: LeaseOwnerType::Instance,
         owner_id: instance_id,
-        lease_kind: LeaseKind::Runtime.as_str(),
+        lease_kind: LeaseKind::Runtime,
         cpu_cores,
         ram_mb,
         disk_gb: 0,
@@ -272,22 +264,23 @@ mod tests {
     fn ensure_restarted_runtime_lease_recreates_released_runtime_lease() {
         let db = InstanceDb::open(":memory:").unwrap();
         db.create_lease(&NewLease {
-            owner_type: "instance",
+            owner_type: LeaseOwnerType::Instance,
             owner_id: "inst-1",
-            lease_kind: "runtime",
+            lease_kind: LeaseKind::Runtime,
             cpu_cores: 2,
             ram_mb: 2048,
             disk_gb: 0,
             expires_at: None,
         })
         .unwrap();
-        db.release_lease("instance", "inst-1", "runtime").unwrap();
+        db.release_lease_str("instance", "inst-1", "runtime")
+            .unwrap();
 
         let created = ensure_restarted_runtime_lease(&db, "inst-1", 2, 2048).unwrap();
 
         assert!(created);
         assert!(
-            db.has_active_lease("instance", "inst-1", "runtime")
+            db.has_active_lease_str("instance", "inst-1", "runtime")
                 .unwrap()
         );
         assert_eq!(db.sum_active_runtime_leases().unwrap(), (2, 2048));
@@ -297,9 +290,9 @@ mod tests {
     fn ensure_restarted_runtime_lease_is_noop_when_active_lease_exists() {
         let db = InstanceDb::open(":memory:").unwrap();
         db.create_lease(&NewLease {
-            owner_type: "instance",
+            owner_type: LeaseOwnerType::Instance,
             owner_id: "inst-1",
-            lease_kind: "runtime",
+            lease_kind: LeaseKind::Runtime,
             cpu_cores: 2,
             ram_mb: 2048,
             disk_gb: 0,

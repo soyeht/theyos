@@ -87,9 +87,9 @@ pub fn request_matches_warm_pool_lease(
             && i64::from(ram_mb) == SLOT_RAM
             && db
                 .has_active_lease(
-                    LeaseOwnerType::WarmPool.as_str(),
+                    LeaseOwnerType::WarmPool,
                     &WarmPoolSlotId::new(ct).owner_id(),
-                    LeaseKind::Runtime.as_str(),
+                    LeaseKind::Runtime,
                 )
                 .unwrap_or(false)
     })
@@ -446,9 +446,9 @@ mod tests {
     fn projection_with_leases() {
         let db = InstanceDb::open(":memory:").unwrap();
         db.create_lease(&store_rs::NewLease {
-            owner_type: "instance",
+            owner_type: LeaseOwnerType::Instance,
             owner_id: "inst-1",
-            lease_kind: "runtime",
+            lease_kind: LeaseKind::Runtime,
             cpu_cores: 2,
             ram_mb: 2048,
             disk_gb: 0,
@@ -456,9 +456,9 @@ mod tests {
         })
         .unwrap();
         db.create_lease(&store_rs::NewLease {
-            owner_type: "instance",
+            owner_type: LeaseOwnerType::Instance,
             owner_id: "inst-1",
-            lease_kind: "storage",
+            lease_kind: LeaseKind::Storage,
             cpu_cores: 0,
             ram_mb: 0,
             disk_gb: 10,
@@ -481,9 +481,9 @@ mod tests {
         let db = InstanceDb::open(":memory:").unwrap();
         // Instance lease
         db.create_lease(&store_rs::NewLease {
-            owner_type: "instance",
+            owner_type: LeaseOwnerType::Instance,
             owner_id: "inst-1",
-            lease_kind: "runtime",
+            lease_kind: LeaseKind::Runtime,
             cpu_cores: 2,
             ram_mb: 2048,
             disk_gb: 0,
@@ -492,9 +492,9 @@ mod tests {
         .unwrap();
         // Warm pool lease
         db.create_lease(&store_rs::NewLease {
-            owner_type: "warm_pool",
+            owner_type: LeaseOwnerType::WarmPool,
             owner_id: "picoclaw:slot:0",
-            lease_kind: "runtime",
+            lease_kind: LeaseKind::Runtime,
             cpu_cores: 2,
             ram_mb: 2048,
             disk_gb: 0,
@@ -515,16 +515,17 @@ mod tests {
     fn projection_released_leases_excluded() {
         let db = InstanceDb::open(":memory:").unwrap();
         db.create_lease(&store_rs::NewLease {
-            owner_type: "instance",
+            owner_type: LeaseOwnerType::Instance,
             owner_id: "inst-1",
-            lease_kind: "runtime",
+            lease_kind: LeaseKind::Runtime,
             cpu_cores: 4,
             ram_mb: 4096,
             disk_gb: 0,
             expires_at: None,
         })
         .unwrap();
-        db.release_lease("instance", "inst-1", "runtime").unwrap();
+        db.release_lease_str("instance", "inst-1", "runtime")
+            .unwrap();
 
         let host = make_host(8, 16384, 100);
         let proj = compute_capacity_projection(&db, &host).unwrap();
@@ -538,9 +539,9 @@ mod tests {
         let db = InstanceDb::open(":memory:").unwrap();
         // Allocate 6 cores (budget is 7 with default reserve=1 on 8-core host)
         db.create_lease(&store_rs::NewLease {
-            owner_type: "instance",
+            owner_type: LeaseOwnerType::Instance,
             owner_id: "inst-1",
-            lease_kind: "runtime",
+            lease_kind: LeaseKind::Runtime,
             cpu_cores: 6,
             ram_mb: 2048,
             disk_gb: 0,
@@ -561,9 +562,9 @@ mod tests {
         let db = InstanceDb::open(":memory:").unwrap();
         // RAM budget: 16384 * 80% = 13107. Allocate 12000.
         db.create_lease(&store_rs::NewLease {
-            owner_type: "instance",
+            owner_type: LeaseOwnerType::Instance,
             owner_id: "inst-1",
-            lease_kind: "runtime",
+            lease_kind: LeaseKind::Runtime,
             cpu_cores: 1,
             ram_mb: 12000,
             disk_gb: 0,
