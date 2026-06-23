@@ -156,6 +156,81 @@ pub fn check_disk_space(path: &PathBuf) -> Result<(), VZError> {
     Ok(())
 }
 
+// ── VZ supportability preflight (P5) ─────────────────────────────────────────
+
+/// Whether the Virtualization framework reports that this process can run
+/// virtual machines on this host, via `+[VZVirtualMachine isSupported]`.
+///
+/// `isSupported` is a class method performing a static capability check — it
+/// does NOT allocate, configure, or boot a VM. A `false` result means EITHER the
+/// host hardware/OS is unsupportable OR the process lacks virtualization
+/// authorization; the probe cannot distinguish the two.
+#[must_use]
+pub fn vz_is_supported() -> bool {
+    // SAFETY: +[VZVirtualMachine isSupported] is a no-argument class method
+    // returning BOOL; binding to a Rust bool matches the rest of this file
+    // (cf. requestStopWithError:, validateWithError:).
+    unsafe { msg_send![class!(VZVirtualMachine), isSupported] }
+}
+
+/// Pure, fail-closed supportability gate. `Ok(())` when the injected `probe`
+/// reports virtualization is available; otherwise a typed
+/// [`VZError::VirtualizationUnsupported`]. The `probe` seam keeps this unit
+/// testable without a real Virtualization framework.
+///
+/// # Errors
+///
+/// Returns [`VZError::VirtualizationUnsupported`] when `probe()` is `false`.
+pub fn evaluate_vz_supportability(probe: impl Fn() -> bool) -> Result<(), VZError> {
+    if probe() {
+        return Ok(());
+    }
+    Err(VZError::VirtualizationUnsupported(
+        // Worded to avoid `GuestImageFailureCode::classify` trigger substrings
+        // ("not supported", "entitlement", "incompatible", "helper missing",
+        // "insufficient disk", ...) so a VZ-unavailable host stays an honest
+        // `Unknown` rather than a dishonest specific code.
+        "the Virtualization framework reports this process cannot run virtual \
+         machines on this host (VZVirtualMachine.isSupported() was false) — an \
+         unsupportable host or a missing virtualization authorization; no \
+         virtual machine can be created"
+            .to_string(),
+    ))
+}
+
+/// Real-framework supportability preflight: [`evaluate_vz_supportability`] over
+/// the live [`vz_is_supported`] probe. Fail-closed.
+///
+/// Not yet wired into the admission path: the single safe chokepoint is
+/// `VmAdmission::reserve`, but gating there needs a new `AdmissionError` variant
+/// and the guest-image failure-code mapping decision, tracked as a follow-up.
+///
+/// # Errors
+///
+/// Propagates [`VZError::VirtualizationUnsupported`] from
+/// [`evaluate_vz_supportability`].
+pub fn preflight_vz_supportability() -> Result<(), VZError> {
+    evaluate_vz_supportability(vz_is_supported)
+}
+
+/// Build a typed, honest error for a nil `VZVirtualMachine` initializer given
+/// the host's supportability. When the framework can run VMs, a nil init points
+/// at an invalid VM configuration; when it cannot, surface the unsupportable
+/// host instead of a misleading "bad config" message. Pure for testability.
+fn diagnose_vm_init_nil(supported: bool) -> VZError {
+    if supported {
+        VZError::VirtualizationError(
+            "VZVirtualMachine initWithConfiguration:queue: returned nil while \
+             virtualization is available — most likely an invalid VM \
+             configuration"
+                .to_string(),
+        )
+    } else {
+        // Same honest typed error as the supportability seam.
+        evaluate_vz_supportability(|| false).expect_err("probe is constant false")
+    }
+}
+
 // ── async_vz_call ────────────────────────────────────────────────────────────
 
 /// Bridge an `^(NSError *)` ObjC completion handler to a Rust `Result`.
@@ -371,9 +446,10 @@ impl VZVirtualMachine {
         if vm_obj.is_null() {
             // SAFETY: release queue since we own it and the VM creation failed.
             unsafe { dispatch_release(queue) };
-            return Err(VZError::VirtualizationError(
-                "VZVirtualMachine initWithConfiguration:queue: returned nil".into(),
-            ));
+            // Typed, honest diagnostic instead of a generic "returned nil": when
+            // the host can't run VMs at all, say so (probe consulted only on this
+            // failure path; the success path above is unchanged).
+            return Err(diagnose_vm_init_nil(vz_is_supported()));
         }
 
         tracing::debug!(
@@ -1617,6 +1693,61 @@ mod tests {
     fn test_check_disk_space_nonexistent() {
         let nonexistent = PathBuf::from("/nonexistent/path/that/does/not/exist");
         assert!(check_disk_space(&nonexistent).is_err());
+    }
+
+    // ── VZ supportability preflight (P5) ──────────────────────────────────────
+
+    #[test]
+    fn evaluate_vz_supportability_ok_when_supported() {
+        assert!(evaluate_vz_supportability(|| true).is_ok());
+    }
+
+    #[test]
+    fn evaluate_vz_supportability_failclosed_when_unsupported() {
+        let err = evaluate_vz_supportability(|| false).expect_err("must fail closed");
+        assert!(matches!(err, VZError::VirtualizationUnsupported(_)));
+    }
+
+    #[test]
+    fn diagnose_vm_init_nil_supported_is_config_error() {
+        // VZ available + nil init ⇒ an invalid-config diagnostic, not "unsupported".
+        assert!(matches!(
+            diagnose_vm_init_nil(true),
+            VZError::VirtualizationError(_)
+        ));
+    }
+
+    #[test]
+    fn diagnose_vm_init_nil_unsupported_is_unsupported_error() {
+        assert!(matches!(
+            diagnose_vm_init_nil(false),
+            VZError::VirtualizationUnsupported(_)
+        ));
+    }
+
+    /// The VZ-unsupported and config-nil messages must NOT trip the guest-image
+    /// failure classifier into a dishonest specific code — they must stay
+    /// `Unknown` until a deliberate wire-code mapping decision (deferred
+    /// follow-up). Pins the wording against `classify`'s trigger substrings.
+    #[test]
+    fn vz_diagnostics_classify_as_unknown_not_a_dishonest_code() {
+        use core_rs::guest_image_failure::GuestImageFailureCode;
+
+        let unsupported = evaluate_vz_supportability(|| false)
+            .expect_err("fail closed")
+            .to_string();
+        assert_eq!(
+            GuestImageFailureCode::classify(None, &unsupported),
+            GuestImageFailureCode::Unknown,
+            "VZ-unsupported must classify as Unknown, not a dishonest specific code"
+        );
+
+        let config = diagnose_vm_init_nil(true).to_string();
+        assert_eq!(
+            GuestImageFailureCode::classify(None, &config),
+            GuestImageFailureCode::Unknown,
+            "nil-while-supported config diagnostic must classify as Unknown"
+        );
     }
 
     #[test]

@@ -80,6 +80,17 @@ pub enum VZError {
     #[error("Host VM limit reached: {0}")]
     HostVmLimitReached(String),
 
+    /// Virtualization is unavailable for this process on this host —
+    /// `+[VZVirtualMachine isSupported]` reported false. The cause is either
+    /// unsupported host hardware/OS OR a missing virtualization authorization;
+    /// the supportability probe cannot distinguish them, so this stays a typed
+    /// LOCAL error and is deliberately NOT mapped to a guest-image failure code
+    /// (that would need a new theyos<->iOS wire code — a separate decision).
+    /// The message is worded to avoid `GuestImageFailureCode::classify` trigger
+    /// substrings so it stays an honest `Unknown` if ever classified.
+    #[error("Virtualization unavailable: {0}")]
+    VirtualizationUnsupported(String),
+
     /// Snapshot operation error.
     #[error("Snapshot error: {0}")]
     SnapshotError(String),
