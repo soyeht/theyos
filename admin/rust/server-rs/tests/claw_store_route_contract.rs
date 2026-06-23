@@ -191,6 +191,7 @@ fn claw_store_action_handlers_delegate_to_shared_service() {
             "jobs_rs::Job::new(",
             "mark_installing(",
             "mark_uninstalling(",
+            "delete_by_id(",
             "count_by_claw_type(",
             "bad_request_with_reasons(",
         ] {
@@ -210,6 +211,9 @@ fn claw_store_action_handlers_delegate_to_shared_service() {
         "jobs_rs::Job::new(jobs_rs::JobType::UninstallClaw",
         "mark_installing(&claw_name, &job_id)",
         "mark_uninstalling(&claw_name)",
+        // Rollback wiring: the service owns the orphan-job cleanup on a failed
+        // mark_* transition (see install_claw / uninstall_claw).
+        "delete_by_id(&rollback_job)",
         "count_by_claw_type(&n)",
         "ApiError::bad_request_with_reasons(",
     ] {

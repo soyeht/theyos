@@ -102,10 +102,28 @@ pub async fn install_claw(
     })
     .await??;
 
-    state
-        .claw_store
-        .mark_installing(&claw_name, &job_id)
-        .map_err(|e| ApiError::internal(format!("failed to mark installing: {e}")))?;
+    if let Err(e) = state.claw_store.mark_installing(&claw_name, &job_id) {
+        // mark_installing failed *after* the job row was created. The ClawStore
+        // mutation is atomic (clone -> persist -> commit), so the claw is still
+        // NotInstalled here; roll the orphaned job back so the jobs table stays
+        // consistent with the claw store. Best-effort: a rollback failure is
+        // logged but never masks the original mark error, and `NotFound` is a
+        // benign success (the row is already gone — the desired end state).
+        let st = state.clone();
+        let rollback_job = job_id.clone();
+        match blocking(move || st.jobs.delete_by_id(&rollback_job)).await {
+            Ok(Ok(()) | Err(jobs_rs::JobError::NotFound(_))) => {}
+            Ok(Err(del)) => tracing::warn!(
+                "[claw-store] rollback: failed to delete orphaned install job {job_id}: {del}"
+            ),
+            Err(join) => tracing::warn!(
+                "[claw-store] rollback: delete task failed for install job {job_id}: {join}"
+            ),
+        }
+        return Err(ApiError::internal(format!(
+            "failed to mark installing: {e}"
+        )));
+    }
 
     tracing::info!("[claw-store] install queued: claw={claw_name} job={job_id}");
 
@@ -164,10 +182,26 @@ pub async fn uninstall_claw(
     })
     .await??;
 
-    state
-        .claw_store
-        .mark_uninstalling(&claw_name)
-        .map_err(|e| ApiError::internal(format!("failed to mark uninstalling: {e}")))?;
+    if let Err(e) = state.claw_store.mark_uninstalling(&claw_name) {
+        // Symmetric to install_claw: the ClawStore mutation is atomic, so the
+        // claw is still Ready here; roll the orphaned uninstall job back so the
+        // jobs table stays consistent. Best-effort delete; never mask the
+        // original error; `NotFound` is benign.
+        let st = state.clone();
+        let rollback_job = job_id.clone();
+        match blocking(move || st.jobs.delete_by_id(&rollback_job)).await {
+            Ok(Ok(()) | Err(jobs_rs::JobError::NotFound(_))) => {}
+            Ok(Err(del)) => tracing::warn!(
+                "[claw-store] rollback: failed to delete orphaned uninstall job {job_id}: {del}"
+            ),
+            Err(join) => tracing::warn!(
+                "[claw-store] rollback: delete task failed for uninstall job {job_id}: {join}"
+            ),
+        }
+        return Err(ApiError::internal(format!(
+            "failed to mark uninstalling: {e}"
+        )));
+    }
 
     tracing::info!("[claw-store] uninstall queued: claw={claw_name} job={job_id}");
 
