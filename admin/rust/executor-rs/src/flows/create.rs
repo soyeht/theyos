@@ -7,7 +7,7 @@ use crate::{
     orchestrator::{CreateInstanceFlowRequest, run_create_instance_flow, validate_create_request},
 };
 use core_rs::error::AppError;
-use core_rs::ipc::protocol::{StoreOp, VmRunnerOp};
+use core_rs::ipc::protocol::{LeaseKind, LeaseOwnerType, StoreOp, VmRunnerOp};
 use vmrunner_common_rs::{VmCreateResourceSpec, VmCreateTimingWire};
 
 #[allow(clippy::too_many_lines)]
@@ -215,9 +215,9 @@ fn execute_create_steps(
                         StoreOp::ResourceLeaseExtend.as_str(),
                         json!({
                             "db_path": exec.config.store_db_path,
-                            "owner_type": "instance",
+                            "owner_type": LeaseOwnerType::Instance.as_str(),
                             "owner_id": req.instance_id,
-                            "lease_kind": "runtime",
+                            "lease_kind": LeaseKind::Runtime.as_str(),
                             "new_expires_at": new_expires,
                         }),
                     ) {
@@ -299,7 +299,7 @@ fn execute_create_steps(
                             StoreOp::ResourceLeaseReleaseAll.as_str(),
                             json!({
                                 "db_path": exec.config.store_db_path,
-                                "owner_type": "instance",
+                                "owner_type": LeaseOwnerType::Instance.as_str(),
                                 "owner_id": req.instance_id,
                             }),
                         ) {
@@ -377,9 +377,9 @@ fn execute_create_steps(
                     StoreOp::ResourceLeaseFinalize.as_str(),
                     json!({
                         "db_path": exec.config.store_db_path,
-                        "owner_type": "instance",
+                        "owner_type": LeaseOwnerType::Instance.as_str(),
                         "owner_id": req.instance_id,
-                        "lease_kind": "runtime",
+                        "lease_kind": LeaseKind::Runtime.as_str(),
                     }),
                 ) {
                     tracing::warn!(

@@ -3,7 +3,7 @@
 use serde_json::json;
 
 use core_rs::ipc::client::IpcError;
-use core_rs::ipc::protocol::{StoreOp, VmRunnerOp};
+use core_rs::ipc::protocol::{LeaseKind, LeaseOwnerType, StoreOp, VmRunnerOp};
 
 use crate::{
     ExecuteFlowRequest, ExecuteFlowResult, Executor, FlowStatus,
@@ -71,9 +71,9 @@ fn execute_delete_steps(exec: &Executor, req: &ExecuteFlowRequest, steps: &[serd
                     StoreOp::ResourceLeaseRelease.as_str(),
                     json!({
                         "db_path": exec.config.store_db_path,
-                        "owner_type": "instance",
+                        "owner_type": LeaseOwnerType::Instance.as_str(),
                         "owner_id": req.instance_id,
-                        "lease_kind": "runtime",
+                        "lease_kind": LeaseKind::Runtime.as_str(),
                     }),
                 ) {
                     tracing::warn!(
@@ -119,9 +119,9 @@ fn execute_delete_steps(exec: &Executor, req: &ExecuteFlowRequest, steps: &[serd
                             StoreOp::ResourceLeaseRelease.as_str(),
                             json!({
                                 "db_path": exec.config.store_db_path,
-                                "owner_type": "instance",
+                                "owner_type": LeaseOwnerType::Instance.as_str(),
                                 "owner_id": req.instance_id,
-                                "lease_kind": "storage",
+                                "lease_kind": LeaseKind::Storage.as_str(),
                             }),
                         ) {
                             tracing::warn!(
