@@ -7,7 +7,7 @@ pub use vmrunner_common_rs::{VmCreatePhaseTiming as PhaseTiming, VmCreateTimingW
 
 use core_rs::error::{AppError, ErrorCode};
 use core_rs::ipc::client::IpcError;
-use core_rs::ipc::protocol::VmRunnerOp;
+use core_rs::ipc::protocol::{StoreOp, VmRunnerOp};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -301,7 +301,7 @@ impl Executor {
         phase: &str,
     ) {
         if let Err(e) = self.store.call(
-            "InstanceDbUpdateStatus",
+            StoreOp::InstanceDbUpdateStatus.as_str(),
             json!({
                 "db_path": self.config.store_db_path,
                 "id": id,

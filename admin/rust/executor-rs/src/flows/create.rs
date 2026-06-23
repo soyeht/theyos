@@ -7,7 +7,7 @@ use crate::{
     orchestrator::{CreateInstanceFlowRequest, run_create_instance_flow, validate_create_request},
 };
 use core_rs::error::AppError;
-use core_rs::ipc::protocol::VmRunnerOp;
+use core_rs::ipc::protocol::{StoreOp, VmRunnerOp};
 use vmrunner_common_rs::{VmCreateResourceSpec, VmCreateTimingWire};
 
 #[allow(clippy::too_many_lines)]
@@ -89,7 +89,7 @@ pub(crate) fn execute_create(exec: &Executor, req: &ExecuteFlowRequest) -> Execu
                                 attempt_ports.push(port);
                             }
                             if let Err(e) = exec.store.call(
-                                "InstanceDbClearPort",
+                                StoreOp::InstanceDbClearPort.as_str(),
                                 json!({
                                     "db_path": exec.config.store_db_path,
                                     "id": req.instance_id,
@@ -212,7 +212,7 @@ fn execute_create_steps(
                     #[allow(clippy::cast_possible_wrap)]
                     let new_expires = (now_secs as i64) + 1200;
                     if let Err(e) = exec.store.call(
-                        "ResourceLeaseExtend",
+                        StoreOp::ResourceLeaseExtend.as_str(),
                         json!({
                             "db_path": exec.config.store_db_path,
                             "owner_type": "instance",
@@ -296,7 +296,7 @@ fn execute_create_steps(
 
                         // Release all leases on create failure
                         if let Err(e) = exec.store.call(
-                            "ResourceLeaseReleaseAll",
+                            StoreOp::ResourceLeaseReleaseAll.as_str(),
                             json!({
                                 "db_path": exec.config.store_db_path,
                                 "owner_type": "instance",
@@ -340,7 +340,7 @@ fn execute_create_steps(
                 ) {
                     if !vm_ip.is_empty() && !vm_mac.is_empty() {
                         if let Err(e) = exec.store.call(
-                            "InstanceDbSetVmNetwork",
+                            StoreOp::InstanceDbSetVmNetwork.as_str(),
                             json!({
                                 "db_path": exec.config.store_db_path,
                                 "container": container,
@@ -374,7 +374,7 @@ fn execute_create_steps(
 
                 // Finalize runtime lease: clear expires_at (provisioning complete)
                 if let Err(e) = exec.store.call(
-                    "ResourceLeaseFinalize",
+                    StoreOp::ResourceLeaseFinalize.as_str(),
                     json!({
                         "db_path": exec.config.store_db_path,
                         "owner_type": "instance",

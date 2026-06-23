@@ -3,7 +3,7 @@
 use serde_json::json;
 
 use core_rs::ipc::client::IpcError;
-use core_rs::ipc::protocol::VmRunnerOp;
+use core_rs::ipc::protocol::{StoreOp, VmRunnerOp};
 
 use crate::{
     ExecuteFlowRequest, ExecuteFlowResult, Executor, FlowStatus,
@@ -68,7 +68,7 @@ fn execute_delete_steps(exec: &Executor, req: &ExecuteFlowRequest, steps: &[serd
 
                 // Release runtime lease (CPU/RAM freed on VM stop)
                 if let Err(e) = exec.store.call(
-                    "ResourceLeaseRelease",
+                    StoreOp::ResourceLeaseRelease.as_str(),
                     json!({
                         "db_path": exec.config.store_db_path,
                         "owner_type": "instance",
@@ -116,7 +116,7 @@ fn execute_delete_steps(exec: &Executor, req: &ExecuteFlowRequest, steps: &[serd
                     Ok(_) => {
                         // Filesystem cleanup confirmed — release storage lease (disk freed)
                         if let Err(e) = exec.store.call(
-                            "ResourceLeaseRelease",
+                            StoreOp::ResourceLeaseRelease.as_str(),
                             json!({
                                 "db_path": exec.config.store_db_path,
                                 "owner_type": "instance",
@@ -143,7 +143,7 @@ fn execute_delete_steps(exec: &Executor, req: &ExecuteFlowRequest, steps: &[serd
             }
             "delete_db_row" => {
                 if let Err(e) = exec.store.call(
-                    "SoftDelete",
+                    StoreOp::SoftDelete.as_str(),
                     json!({
                         "db_path": exec.config.store_db_path,
                         "id": req.instance_id,

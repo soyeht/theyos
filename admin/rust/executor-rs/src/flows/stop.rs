@@ -3,7 +3,7 @@
 use serde_json::json;
 
 use core_rs::ipc::client::IpcError;
-use core_rs::ipc::protocol::VmRunnerOp;
+use core_rs::ipc::protocol::{StoreOp, VmRunnerOp};
 
 use crate::{
     ExecuteFlowRequest, ExecuteFlowResult, Executor, FlowStatus,
@@ -40,7 +40,7 @@ pub(crate) fn execute_stop(exec: &Executor, req: &ExecuteFlowRequest) -> Execute
 
                         // Release runtime lease (CPU/RAM freed). Storage lease stays active.
                         if let Err(e) = exec.store.call(
-                            "ResourceLeaseRelease",
+                            StoreOp::ResourceLeaseRelease.as_str(),
                             json!({
                                 "db_path": exec.config.store_db_path,
                                 "owner_type": "instance",
