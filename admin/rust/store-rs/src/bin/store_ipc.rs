@@ -8,7 +8,7 @@
 
 use core_rs::ipc::{harness::run_ipc_loop, wire::Response};
 use serde_json::Value;
-use store_rs::{InstanceDb, InstanceStatus, NewInstance, NewInstanceEvent, NewLease, StatusUpdate};
+use store_rs::{InstanceDb, InstanceStatus, NewInstance, NewInstanceEvent, StatusUpdate};
 
 fn main() {
     run_ipc_loop("store-ipc", dispatch);
@@ -328,15 +328,11 @@ fn handle_lease_create(params: &Value) -> Response {
     let ram_mb = params["ram_mb"].as_i64().unwrap_or(0);
     let disk_gb = params["disk_gb"].as_i64().unwrap_or(0);
     let expires_at = params["expires_at"].as_i64();
-    match db.create_lease(&NewLease {
-        owner_type,
-        owner_id,
-        lease_kind,
-        cpu_cores,
-        ram_mb,
-        disk_gb,
-        expires_at,
-    }) {
+    // Receive-side stays lenient: forward the raw wire strings unchanged via the
+    // `_str` layer (no FromStr rejection of unknown owner_type/lease_kind).
+    match db.create_lease_str(
+        owner_type, owner_id, lease_kind, cpu_cores, ram_mb, disk_gb, expires_at,
+    ) {
         Ok(id) => Response::ok(serde_json::json!({"lease_id": id})),
         Err(e) => Response::err(e.to_string()),
     }
@@ -356,7 +352,7 @@ fn handle_lease_release(params: &Value) -> Response {
     let Some(lease_kind) = params["lease_kind"].as_str() else {
         return Response::err("missing 'lease_kind' param");
     };
-    match db.release_lease(owner_type, owner_id, lease_kind) {
+    match db.release_lease_str(owner_type, owner_id, lease_kind) {
         Ok(affected) => Response::ok(serde_json::json!({"released": affected})),
         Err(e) => Response::err(e.to_string()),
     }
@@ -373,7 +369,7 @@ fn handle_lease_release_all(params: &Value) -> Response {
     let Some(owner_id) = params["owner_id"].as_str() else {
         return Response::err("missing 'owner_id' param");
     };
-    match db.release_all_leases(owner_type, owner_id) {
+    match db.release_all_leases_str(owner_type, owner_id) {
         Ok(count) => Response::ok(serde_json::json!({"released_count": count})),
         Err(e) => Response::err(e.to_string()),
     }
@@ -560,5 +556,51 @@ mod tests {
         // (i.e. not the "unknown method" error path).
         assert!(resp.ok, "method must dispatch, got error: {:?}", resp.error);
         assert_eq!(resp.result.expect("payload")["port"].as_i64(), Some(0));
+    }
+
+    /// B4b: the lease receive-side must stay LENIENT. The typed lib API is for
+    /// producers; the IPC handlers forward raw wire strings through the `_str`
+    /// layer with NO added `FromStr` rejection. A known value is accepted; an
+    /// unknown `owner_type` is rejected by the DB's PRE-EXISTING `CHECK` constraint
+    /// (`owner_type IN ('instance','warm_pool')`) exactly as before — the receive
+    /// boundary did not get stricter. It forwards the raw string and lets the DB
+    /// decide, rather than parsing/rejecting at the IPC edge.
+    #[test]
+    fn lease_create_receive_side_forwards_raw_without_added_rejection() {
+        let tmp = NamedTempFile::new().unwrap();
+        let db_path = tmp.path().to_str().unwrap();
+        InstanceDb::open(db_path).unwrap();
+
+        // Known wire value: accepted.
+        let known = handle_lease_create(&serde_json::json!({
+            "db_path": db_path, "owner_type": "warm_pool", "owner_id": "picoclaw:slot:0",
+            "lease_kind": "runtime", "cpu_cores": 2, "ram_mb": 2048, "disk_gb": 0,
+        }));
+        assert!(
+            known.ok,
+            "known owner_type must be accepted: {:?}",
+            known.error
+        );
+
+        // Unknown owner_type: the receive-side forwards it raw, so the DB's
+        // pre-existing CHECK constraint rejects it — NOT a FromStr added at the
+        // IPC edge. Byte-for-byte the same behavior as before B4b.
+        let unknown = handle_lease_create(&serde_json::json!({
+            "db_path": db_path, "owner_type": "bogus_owner", "owner_id": "x",
+            "lease_kind": "runtime", "cpu_cores": 1, "ram_mb": 1, "disk_gb": 0,
+        }));
+        assert!(
+            !unknown.ok,
+            "unknown owner_type is still rejected (by the DB)"
+        );
+        let err = unknown.error.unwrap_or_default();
+        assert!(
+            err.contains("CHECK constraint"),
+            "rejection must come from the DB constraint (raw forward preserved), got: {err}"
+        );
+        assert!(
+            !err.contains("unknown owner_type"),
+            "store_ipc must NOT introduce a FromStr rejection at the receive boundary"
+        );
     }
 }

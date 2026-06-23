@@ -1,5 +1,6 @@
 //! SQLite-backed persistence for the instances table.
 
+use core_rs::ipc::protocol::{LeaseKind, LeaseOwnerType};
 use rusqlite::{Connection, OptionalExtension, params};
 use std::str::FromStr;
 
@@ -103,75 +104,10 @@ impl FromStr for InstanceStatus {
 
 // ── Resource Lease Types ─────────────────────────────────────────────────────
 
-/// Owner type for a resource lease.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum OwnerType {
-    Instance,
-    WarmPool,
-}
-
-impl OwnerType {
-    #[must_use]
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            Self::Instance => "instance",
-            Self::WarmPool => "warm_pool",
-        }
-    }
-}
-
-impl std::fmt::Display for OwnerType {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(self.as_str())
-    }
-}
-
-impl FromStr for OwnerType {
-    type Err = String;
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s {
-            "instance" => Ok(Self::Instance),
-            "warm_pool" => Ok(Self::WarmPool),
-            other => Err(format!("unknown owner_type: {other}")),
-        }
-    }
-}
-
-/// Kind of resource lease.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum LeaseKind {
-    Runtime,
-    Storage,
-}
-
-impl LeaseKind {
-    #[must_use]
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            Self::Runtime => "runtime",
-            Self::Storage => "storage",
-        }
-    }
-}
-
-impl std::fmt::Display for LeaseKind {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(self.as_str())
-    }
-}
-
-impl FromStr for LeaseKind {
-    type Err = String;
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s {
-            "runtime" => Ok(Self::Runtime),
-            "storage" => Ok(Self::Storage),
-            other => Err(format!("unknown lease_kind: {other}")),
-        }
-    }
-}
+// `OwnerType` / `LeaseKind` lived here as unused duplicates of
+// `core_rs::ipc::protocol::{LeaseOwnerType, LeaseKind}` (B1 mirrored the wire
+// strings; nothing referenced these). B4b deletes them and types the lease API
+// below directly on the core-rs identifiers (imported at the top of this file).
 
 /// Desired instance state (what the user wants).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -335,10 +271,13 @@ mod warm_pool_slot_id_tests {
 }
 
 /// Parameters for creating a new resource lease.
+///
+/// `owner_type`/`lease_kind` are the typed identifiers from
+/// `core_rs::ipc::protocol`; the SQL writes their `.as_str()` values unchanged.
 pub struct NewLease<'a> {
-    pub owner_type: &'a str,
+    pub owner_type: LeaseOwnerType,
     pub owner_id: &'a str,
-    pub lease_kind: &'a str,
+    pub lease_kind: LeaseKind,
     pub cpu_cores: i64,
     pub ram_mb: i64,
     pub disk_gb: i64,
@@ -2766,6 +2705,36 @@ impl InstanceDb {
     /// Returns `StoreError` if the insert fails (e.g. unique index violation for
     /// duplicate active lease on the same owner+kind).
     pub fn create_lease(&self, lease: &NewLease<'_>) -> Result<String, StoreError> {
+        self.create_lease_str(
+            lease.owner_type.as_str(),
+            lease.owner_id,
+            lease.lease_kind.as_str(),
+            lease.cpu_cores,
+            lease.ram_mb,
+            lease.disk_gb,
+            lease.expires_at,
+        )
+    }
+
+    /// Raw `&str` create used by the store IPC receive-side, which must stay
+    /// lenient — it forwards whatever wire string it was handed without
+    /// rejecting unknown values. Producers should prefer the typed
+    /// [`Self::create_lease`].
+    ///
+    /// # Errors
+    ///
+    /// Returns `StoreError` if the insert fails.
+    #[allow(clippy::too_many_arguments)]
+    pub fn create_lease_str(
+        &self,
+        owner_type: &str,
+        owner_id: &str,
+        lease_kind: &str,
+        cpu_cores: i64,
+        ram_mb: i64,
+        disk_gb: i64,
+        expires_at: Option<i64>,
+    ) -> Result<String, StoreError> {
         let id = core_rs::id::generate_id("lease");
         let now = now_unix();
         let conn = self.conn()?;
@@ -2775,14 +2744,14 @@ impl InstanceDb {
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
             params![
                 id,
-                lease.owner_type,
-                lease.owner_id,
-                lease.lease_kind,
-                lease.cpu_cores,
-                lease.ram_mb,
-                lease.disk_gb,
+                owner_type,
+                owner_id,
+                lease_kind,
+                cpu_cores,
+                ram_mb,
+                disk_gb,
                 now,
-                lease.expires_at,
+                expires_at,
             ],
         )
         .map_err(|e| StoreError::Internal(format!("create_lease: {e}")))?;
@@ -2797,6 +2766,20 @@ impl InstanceDb {
     ///
     /// Returns `StoreError` if the query fails.
     pub fn release_lease(
+        &self,
+        owner_type: LeaseOwnerType,
+        owner_id: &str,
+        lease_kind: LeaseKind,
+    ) -> Result<bool, StoreError> {
+        self.release_lease_str(owner_type.as_str(), owner_id, lease_kind.as_str())
+    }
+
+    /// Raw `&str` release used by the store IPC receive-side (kept lenient).
+    ///
+    /// # Errors
+    ///
+    /// Returns `StoreError` if the query fails.
+    pub fn release_lease_str(
         &self,
         owner_type: &str,
         owner_id: &str,
@@ -2819,7 +2802,24 @@ impl InstanceDb {
     /// # Errors
     ///
     /// Returns `StoreError` if the query fails.
-    pub fn release_all_leases(&self, owner_type: &str, owner_id: &str) -> Result<u32, StoreError> {
+    pub fn release_all_leases(
+        &self,
+        owner_type: LeaseOwnerType,
+        owner_id: &str,
+    ) -> Result<u32, StoreError> {
+        self.release_all_leases_str(owner_type.as_str(), owner_id)
+    }
+
+    /// Raw `&str` release-all used by the store IPC receive-side (kept lenient).
+    ///
+    /// # Errors
+    ///
+    /// Returns `StoreError` if the query fails.
+    pub fn release_all_leases_str(
+        &self,
+        owner_type: &str,
+        owner_id: &str,
+    ) -> Result<u32, StoreError> {
         let conn = self.conn()?;
         let affected = conn
             .execute(
@@ -3004,6 +3004,21 @@ impl InstanceDb {
     ///
     /// Returns `StoreError` if the query fails.
     pub fn has_active_lease(
+        &self,
+        owner_type: LeaseOwnerType,
+        owner_id: &str,
+        lease_kind: LeaseKind,
+    ) -> Result<bool, StoreError> {
+        self.has_active_lease_str(owner_type.as_str(), owner_id, lease_kind.as_str())
+    }
+
+    /// Raw `&str` active-lease check. Used by tests to assert the exact stored
+    /// wire bytes; not reached by IPC.
+    ///
+    /// # Errors
+    ///
+    /// Returns `StoreError` if the query fails.
+    pub fn has_active_lease_str(
         &self,
         owner_type: &str,
         owner_id: &str,
@@ -5697,9 +5712,9 @@ mod instance_db_tests {
         let db = open_temp();
         let id = db
             .create_lease(&NewLease {
-                owner_type: "instance",
+                owner_type: LeaseOwnerType::Instance,
                 owner_id: "inst-1",
-                lease_kind: "runtime",
+                lease_kind: LeaseKind::Runtime,
                 cpu_cores: 2,
                 ram_mb: 2048,
                 disk_gb: 0,
@@ -5717,9 +5732,9 @@ mod instance_db_tests {
     fn lease_unique_index_prevents_duplicate_active() {
         let db = open_temp();
         db.create_lease(&NewLease {
-            owner_type: "instance",
+            owner_type: LeaseOwnerType::Instance,
             owner_id: "inst-1",
-            lease_kind: "runtime",
+            lease_kind: LeaseKind::Runtime,
             cpu_cores: 2,
             ram_mb: 2048,
             disk_gb: 0,
@@ -5729,9 +5744,9 @@ mod instance_db_tests {
 
         // Second active lease for same owner+kind should fail
         let result = db.create_lease(&NewLease {
-            owner_type: "instance",
+            owner_type: LeaseOwnerType::Instance,
             owner_id: "inst-1",
-            lease_kind: "runtime",
+            lease_kind: LeaseKind::Runtime,
             cpu_cores: 4,
             ram_mb: 4096,
             disk_gb: 0,
@@ -5744,9 +5759,9 @@ mod instance_db_tests {
     fn lease_release_idempotent() {
         let db = open_temp();
         db.create_lease(&NewLease {
-            owner_type: "instance",
+            owner_type: LeaseOwnerType::Instance,
             owner_id: "inst-1",
-            lease_kind: "runtime",
+            lease_kind: LeaseKind::Runtime,
             cpu_cores: 2,
             ram_mb: 2048,
             disk_gb: 0,
@@ -5754,18 +5769,24 @@ mod instance_db_tests {
         })
         .unwrap();
 
-        assert!(db.release_lease("instance", "inst-1", "runtime").unwrap());
+        assert!(
+            db.release_lease_str("instance", "inst-1", "runtime")
+                .unwrap()
+        );
         // Second release should return false (already released)
-        assert!(!db.release_lease("instance", "inst-1", "runtime").unwrap());
+        assert!(
+            !db.release_lease_str("instance", "inst-1", "runtime")
+                .unwrap()
+        );
     }
 
     #[test]
     fn lease_released_excluded_from_sum() {
         let db = open_temp();
         db.create_lease(&NewLease {
-            owner_type: "instance",
+            owner_type: LeaseOwnerType::Instance,
             owner_id: "inst-1",
-            lease_kind: "runtime",
+            lease_kind: LeaseKind::Runtime,
             cpu_cores: 2,
             ram_mb: 2048,
             disk_gb: 0,
@@ -5777,7 +5798,8 @@ mod instance_db_tests {
         assert_eq!(cpu, 2);
         assert_eq!(ram, 2048);
 
-        db.release_lease("instance", "inst-1", "runtime").unwrap();
+        db.release_lease_str("instance", "inst-1", "runtime")
+            .unwrap();
 
         let (cpu, ram) = db.sum_active_runtime_leases().unwrap();
         assert_eq!(cpu, 0);
@@ -5788,22 +5810,23 @@ mod instance_db_tests {
     fn lease_after_release_can_create_new() {
         let db = open_temp();
         db.create_lease(&NewLease {
-            owner_type: "instance",
+            owner_type: LeaseOwnerType::Instance,
             owner_id: "inst-1",
-            lease_kind: "runtime",
+            lease_kind: LeaseKind::Runtime,
             cpu_cores: 2,
             ram_mb: 2048,
             disk_gb: 0,
             expires_at: None,
         })
         .unwrap();
-        db.release_lease("instance", "inst-1", "runtime").unwrap();
+        db.release_lease_str("instance", "inst-1", "runtime")
+            .unwrap();
 
         // After release, creating a new lease for the same owner+kind should work
         db.create_lease(&NewLease {
-            owner_type: "instance",
+            owner_type: LeaseOwnerType::Instance,
             owner_id: "inst-1",
-            lease_kind: "runtime",
+            lease_kind: LeaseKind::Runtime,
             cpu_cores: 4,
             ram_mb: 4096,
             disk_gb: 0,
@@ -5820,9 +5843,9 @@ mod instance_db_tests {
     fn lease_release_all() {
         let db = open_temp();
         db.create_lease(&NewLease {
-            owner_type: "instance",
+            owner_type: LeaseOwnerType::Instance,
             owner_id: "inst-1",
-            lease_kind: "runtime",
+            lease_kind: LeaseKind::Runtime,
             cpu_cores: 2,
             ram_mb: 2048,
             disk_gb: 0,
@@ -5830,9 +5853,9 @@ mod instance_db_tests {
         })
         .unwrap();
         db.create_lease(&NewLease {
-            owner_type: "instance",
+            owner_type: LeaseOwnerType::Instance,
             owner_id: "inst-1",
-            lease_kind: "storage",
+            lease_kind: LeaseKind::Storage,
             cpu_cores: 0,
             ram_mb: 0,
             disk_gb: 10,
@@ -5840,7 +5863,7 @@ mod instance_db_tests {
         })
         .unwrap();
 
-        let count = db.release_all_leases("instance", "inst-1").unwrap();
+        let count = db.release_all_leases_str("instance", "inst-1").unwrap();
         assert_eq!(count, 2);
 
         let (cpu, ram) = db.sum_active_runtime_leases().unwrap();
@@ -5854,9 +5877,9 @@ mod instance_db_tests {
     fn lease_storage_sum() {
         let db = open_temp();
         db.create_lease(&NewLease {
-            owner_type: "instance",
+            owner_type: LeaseOwnerType::Instance,
             owner_id: "inst-1",
-            lease_kind: "storage",
+            lease_kind: LeaseKind::Storage,
             cpu_cores: 0,
             ram_mb: 0,
             disk_gb: 10,
@@ -5864,9 +5887,9 @@ mod instance_db_tests {
         })
         .unwrap();
         db.create_lease(&NewLease {
-            owner_type: "instance",
+            owner_type: LeaseOwnerType::Instance,
             owner_id: "inst-2",
-            lease_kind: "storage",
+            lease_kind: LeaseKind::Storage,
             cpu_cores: 0,
             ram_mb: 0,
             disk_gb: 20,
@@ -5883,9 +5906,9 @@ mod instance_db_tests {
         let db = open_temp();
         let now = now_unix();
         db.create_lease(&NewLease {
-            owner_type: "instance",
+            owner_type: LeaseOwnerType::Instance,
             owner_id: "inst-1",
-            lease_kind: "runtime",
+            lease_kind: LeaseKind::Runtime,
             cpu_cores: 2,
             ram_mb: 2048,
             disk_gb: 0,
@@ -5905,9 +5928,9 @@ mod instance_db_tests {
         let db = open_temp();
         let now = now_unix();
         db.create_lease(&NewLease {
-            owner_type: "instance",
+            owner_type: LeaseOwnerType::Instance,
             owner_id: "inst-1",
-            lease_kind: "runtime",
+            lease_kind: LeaseKind::Runtime,
             cpu_cores: 2,
             ram_mb: 2048,
             disk_gb: 0,
@@ -5929,14 +5952,14 @@ mod instance_db_tests {
     fn lease_has_active() {
         let db = open_temp();
         assert!(
-            !db.has_active_lease("instance", "inst-1", "runtime")
+            !db.has_active_lease_str("instance", "inst-1", "runtime")
                 .unwrap()
         );
 
         db.create_lease(&NewLease {
-            owner_type: "instance",
+            owner_type: LeaseOwnerType::Instance,
             owner_id: "inst-1",
-            lease_kind: "runtime",
+            lease_kind: LeaseKind::Runtime,
             cpu_cores: 2,
             ram_mb: 2048,
             disk_gb: 0,
@@ -5945,13 +5968,14 @@ mod instance_db_tests {
         .unwrap();
 
         assert!(
-            db.has_active_lease("instance", "inst-1", "runtime")
+            db.has_active_lease_str("instance", "inst-1", "runtime")
                 .unwrap()
         );
 
-        db.release_lease("instance", "inst-1", "runtime").unwrap();
+        db.release_lease_str("instance", "inst-1", "runtime")
+            .unwrap();
         assert!(
-            !db.has_active_lease("instance", "inst-1", "runtime")
+            !db.has_active_lease_str("instance", "inst-1", "runtime")
                 .unwrap()
         );
     }
@@ -5961,9 +5985,9 @@ mod instance_db_tests {
         let db = open_temp();
         // Instance lease
         db.create_lease(&NewLease {
-            owner_type: "instance",
+            owner_type: LeaseOwnerType::Instance,
             owner_id: "inst-1",
-            lease_kind: "runtime",
+            lease_kind: LeaseKind::Runtime,
             cpu_cores: 2,
             ram_mb: 2048,
             disk_gb: 0,
@@ -5972,9 +5996,9 @@ mod instance_db_tests {
         .unwrap();
         // Warm pool lease
         db.create_lease(&NewLease {
-            owner_type: "warm_pool",
+            owner_type: LeaseOwnerType::WarmPool,
             owner_id: "picoclaw:slot:0",
-            lease_kind: "runtime",
+            lease_kind: LeaseKind::Runtime,
             cpu_cores: 2,
             ram_mb: 2048,
             disk_gb: 0,
@@ -6021,9 +6045,9 @@ mod instance_db_tests {
     fn insert_with_warm_pool_leases_transfers_runtime_atomically() {
         let db = open_temp();
         db.create_lease(&NewLease {
-            owner_type: "warm_pool",
+            owner_type: LeaseOwnerType::WarmPool,
             owner_id: "picoclaw:slot:0",
-            lease_kind: "runtime",
+            lease_kind: LeaseKind::Runtime,
             cpu_cores: 2,
             ram_mb: 2048,
             disk_gb: 0,
@@ -6037,7 +6061,7 @@ mod instance_db_tests {
         assert_eq!(id, "inst-foo");
 
         assert!(
-            !db.has_active_lease("warm_pool", "picoclaw:slot:0", "runtime")
+            !db.has_active_lease_str("warm_pool", "picoclaw:slot:0", "runtime")
                 .unwrap()
         );
 
@@ -6058,9 +6082,9 @@ mod instance_db_tests {
         let db = open_temp();
         // Create a warm pool lease
         db.create_lease(&NewLease {
-            owner_type: "warm_pool",
+            owner_type: LeaseOwnerType::WarmPool,
             owner_id: "picoclaw:slot:0",
-            lease_kind: "runtime",
+            lease_kind: LeaseKind::Runtime,
             cpu_cores: 2,
             ram_mb: 2048,
             disk_gb: 0,
@@ -6079,13 +6103,13 @@ mod instance_db_tests {
 
         // Warm pool lease should be released
         assert!(
-            !db.has_active_lease("warm_pool", "picoclaw:slot:0", "runtime")
+            !db.has_active_lease_str("warm_pool", "picoclaw:slot:0", "runtime")
                 .unwrap()
         );
 
         // Instance lease should exist
         assert!(
-            db.has_active_lease("instance", "inst-foo", "runtime")
+            db.has_active_lease_str("instance", "inst-foo", "runtime")
                 .unwrap()
         );
 
@@ -6123,9 +6147,9 @@ mod instance_db_tests {
         })
         .unwrap();
         db.create_lease(&NewLease {
-            owner_type: "instance",
+            owner_type: LeaseOwnerType::Instance,
             owner_id: "inst-mac",
-            lease_kind: "runtime",
+            lease_kind: LeaseKind::Runtime,
             cpu_cores: 2,
             ram_mb: 2048,
             disk_gb: 0,
@@ -6133,9 +6157,9 @@ mod instance_db_tests {
         })
         .unwrap();
         db.create_lease(&NewLease {
-            owner_type: "warm_pool",
+            owner_type: LeaseOwnerType::WarmPool,
             owner_id: "picoclaw:slot:0",
-            lease_kind: "runtime",
+            lease_kind: LeaseKind::Runtime,
             cpu_cores: 2,
             ram_mb: 2048,
             disk_gb: 0,
@@ -6184,5 +6208,42 @@ mod instance_db_tests {
         let (cpu, ram) = db2.sum_active_runtime_leases().unwrap();
         assert_eq!(cpu, 0);
         assert_eq!(ram, 0);
+    }
+
+    /// B4b byte-identity: the typed lease API and the raw `_str` layer agree on
+    /// the exact wire bytes, both directions. A lease created with the typed
+    /// `LeaseOwnerType`/`LeaseKind` is found by a raw string query using the
+    /// historical literals, and a raw-string-created lease is found by a typed
+    /// query — proving the typed producers still write `warm_pool`/`instance`/
+    /// `runtime` unchanged.
+    #[test]
+    fn typed_lease_api_is_byte_identical_to_raw_str() {
+        let db = open_temp();
+
+        // Typed CREATE -> raw string query finds it with the old literals.
+        db.create_lease(&NewLease {
+            owner_type: LeaseOwnerType::WarmPool,
+            owner_id: "picoclaw:slot:0",
+            lease_kind: LeaseKind::Runtime,
+            cpu_cores: 2,
+            ram_mb: 2048,
+            disk_gb: 0,
+            expires_at: None,
+        })
+        .unwrap();
+        assert!(
+            db.has_active_lease_str("warm_pool", "picoclaw:slot:0", "runtime")
+                .unwrap(),
+            "typed create must write the literal wire bytes 'warm_pool'/'runtime'"
+        );
+
+        // Raw string CREATE -> typed query finds it.
+        db.create_lease_str("instance", "inst-1", "runtime", 1, 512, 0, None)
+            .unwrap();
+        assert!(
+            db.has_active_lease(LeaseOwnerType::Instance, "inst-1", LeaseKind::Runtime)
+                .unwrap(),
+            "typed query must read leases written with the literal wire bytes"
+        );
     }
 }

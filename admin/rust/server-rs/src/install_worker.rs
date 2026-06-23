@@ -560,9 +560,9 @@ async fn run_uninstall_claw(state: &SharedState, job: &jobs_rs::Job) -> Result<(
 
     // Step 4: Release warm pool lease (if one exists for this claw type)
     match state.instance_db.release_lease(
-        LeaseOwnerType::WarmPool.as_str(),
+        LeaseOwnerType::WarmPool,
         &WarmPoolSlotId::new(&claw_name).owner_id(),
-        LeaseKind::Runtime.as_str(),
+        LeaseKind::Runtime,
     ) {
         Ok(true) => info!("[install-worker] {claw_name}: released warm pool lease"),
         Ok(false) => {} // no active lease — nothing to release
@@ -665,9 +665,9 @@ async fn run_uninstall_claw_macos(state: &SharedState, job: &jobs_rs::Job) -> Re
 
     // Release warm pool lease (if one exists for this claw type)
     match state.instance_db.release_lease(
-        LeaseOwnerType::WarmPool.as_str(),
+        LeaseOwnerType::WarmPool,
         &WarmPoolSlotId::new(&claw_name).owner_id(),
-        LeaseKind::Runtime.as_str(),
+        LeaseKind::Runtime,
     ) {
         Ok(true) => info!("[install-worker] {claw_name}: released warm pool lease"),
         Ok(false) => {} // no active lease — nothing to release

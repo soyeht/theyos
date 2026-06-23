@@ -108,9 +108,9 @@ pub fn start_warm_pool_reconciler(state: SharedState) -> tokio::task::JoinHandle
                         // Create warm pool lease BEFORE dispatching the refill.
                         // This ensures capacity is reserved even if the refill takes time.
                         if let Err(e) = state.instance_db.create_lease(&store_rs::NewLease {
-                            owner_type: LeaseOwnerType::WarmPool.as_str(),
+                            owner_type: LeaseOwnerType::WarmPool,
                             owner_id: &WarmPoolSlotId::new(ct).owner_id(),
-                            lease_kind: LeaseKind::Runtime.as_str(),
+                            lease_kind: LeaseKind::Runtime,
                             cpu_cores: SLOT_CPU,
                             ram_mb: SLOT_RAM,
                             disk_gb: 0,
@@ -132,9 +132,9 @@ pub fn start_warm_pool_reconciler(state: SharedState) -> tokio::task::JoinHandle
                                 );
                                 // Refill failed — release the lease we just created.
                                 if let Err(e2) = state.instance_db.release_lease(
-                                    LeaseOwnerType::WarmPool.as_str(),
+                                    LeaseOwnerType::WarmPool,
                                     &WarmPoolSlotId::new(ct).owner_id(),
-                                    LeaseKind::Runtime.as_str(),
+                                    LeaseKind::Runtime,
                                 ) {
                                     tracing::warn!(
                                         "[warm-pool-reconciler] release failed lease for {ct}: {e2}"
@@ -168,9 +168,9 @@ fn release_orphaned_warm_pool_leases(state: &SharedState, installed_claws: &[Str
         if let Some(ct) = owner_id.split(':').next() {
             if !installed_claws.iter().any(|ic| ic == ct) {
                 let _ = state.instance_db.release_lease(
-                    LeaseOwnerType::WarmPool.as_str(),
+                    LeaseOwnerType::WarmPool,
                     &owner_id,
-                    LeaseKind::Runtime.as_str(),
+                    LeaseKind::Runtime,
                 );
                 tracing::info!("[warm-pool-reconciler] released orphaned lease: {owner_id}");
             }
@@ -215,9 +215,9 @@ pub fn decide_refill_targets(input: &RefillDecisionInput<'_>) -> Vec<String> {
             !input
                 .instance_db
                 .has_active_lease(
-                    LeaseOwnerType::WarmPool.as_str(),
+                    LeaseOwnerType::WarmPool,
                     &WarmPoolSlotId::new(ct).owner_id(),
-                    LeaseKind::Runtime.as_str(),
+                    LeaseKind::Runtime,
                 )
                 .unwrap_or(true)
         })
@@ -378,9 +378,9 @@ mod tests {
         let db = store_rs::InstanceDb::open(":memory:").unwrap();
         // picoclaw has an existing warm pool lease (e.g. from a previous fill)
         db.create_lease(&store_rs::NewLease {
-            owner_type: "warm_pool",
+            owner_type: LeaseOwnerType::WarmPool,
             owner_id: "picoclaw:slot:0",
-            lease_kind: "runtime",
+            lease_kind: LeaseKind::Runtime,
             cpu_cores: 2,
             ram_mb: 2048,
             disk_gb: 0,

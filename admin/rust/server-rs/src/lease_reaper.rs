@@ -113,7 +113,7 @@ pub fn reap_expired_leases_once(state: &SharedState) -> u32 {
         if release_all {
             match state
                 .instance_db
-                .release_all_leases(LeaseOwnerType::Instance.as_str(), instance_id)
+                .release_all_leases(LeaseOwnerType::Instance, instance_id)
             {
                 Ok(n) => {
                     tracing::info!("[lease-reaper] released {n} lease(s) for {instance_id}");
@@ -125,9 +125,9 @@ pub fn reap_expired_leases_once(state: &SharedState) -> u32 {
                 }
             }
         } else if let Err(e) = state.instance_db.release_lease(
-            LeaseOwnerType::Instance.as_str(),
+            LeaseOwnerType::Instance,
             instance_id,
-            LeaseKind::Runtime.as_str(),
+            LeaseKind::Runtime,
         ) {
             tracing::warn!("[lease-reaper] failed to release runtime lease for {instance_id}: {e}");
         }

@@ -28,7 +28,7 @@ pub async fn rollback_inserted_instance(
         // Release leases first (best-effort)
         if let Err(e) = st
             .instance_db
-            .release_all_leases(LeaseOwnerType::Instance.as_str(), &iid)
+            .release_all_leases(LeaseOwnerType::Instance, &iid)
         {
             tracing::warn!(
                 "[create-instance] failed to release leases for {iid} during rollback: {e}"
@@ -38,9 +38,9 @@ pub async fn rollback_inserted_instance(
         if restore_warm_pool_lease {
             if let Some(row) = row.as_ref() {
                 if let Err(e) = st.instance_db.create_lease(&store_rs::NewLease {
-                    owner_type: LeaseOwnerType::WarmPool.as_str(),
+                    owner_type: LeaseOwnerType::WarmPool,
                     owner_id: &WarmPoolSlotId::new(&row.claw_type).owner_id(),
-                    lease_kind: LeaseKind::Runtime.as_str(),
+                    lease_kind: LeaseKind::Runtime,
                     cpu_cores: row.cpu_cores.unwrap_or(crate::capacity::SLOT_CPU),
                     ram_mb: row.ram_config_mb.unwrap_or(crate::capacity::SLOT_RAM),
                     disk_gb: 0,

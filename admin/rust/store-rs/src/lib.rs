@@ -40,9 +40,9 @@ pub struct LogEntry {
 pub use core_rs::slug::normalize_slug;
 pub use instance_db::{
     AuditEvent, CloudflareConfigRow, DesiredState, InstanceDb, InstanceEvent, InstanceRow,
-    InstanceStatus, InviteRow, LeaseKind, NewInstance, NewInstanceEvent, NewLease, NewPublicSite,
-    ObservedState, OwnerType, PublicSiteRow, ResourceLease, StatusUpdate, TerminalConversation,
-    UserRole, UserRow, WarmPoolSlotId,
+    InstanceStatus, InviteRow, NewInstance, NewInstanceEvent, NewLease, NewPublicSite,
+    ObservedState, PublicSiteRow, ResourceLease, StatusUpdate, TerminalConversation, UserRole,
+    UserRow, WarmPoolSlotId,
 };
 pub use legacy_migration::{
     LegacyDetection, LegacyTable, drop_legacy_at_path_if_present, drop_legacy_atomic,
