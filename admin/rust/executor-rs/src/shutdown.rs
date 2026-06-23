@@ -4,6 +4,8 @@
 //! claw instances before an upgrade, with per-claw timeouts and fallback
 //! to force-stop if needed.
 
+use core_rs::ipc::protocol::VmRunnerOp;
+
 use crate::{ExecuteFlowRequest, Executor, FlowType};
 use serde_json::json;
 use std::time::Duration;
@@ -285,7 +287,7 @@ fn shutdown_instance_with_timeout(
 /// terminates the VM.
 fn force_stop_instance(exec: &Executor, container: &str) -> Result<(), Box<dyn std::error::Error>> {
     exec.vmrunner.call(
-        "Stop",
+        VmRunnerOp::Stop.as_str(),
         json!({
             "container": container,
             "state_dir": exec.config.firecracker_state_dir,

@@ -3,6 +3,7 @@
 use serde_json::json;
 
 use core_rs::ipc::client::IpcError;
+use core_rs::ipc::protocol::VmRunnerOp;
 
 use crate::{
     ExecuteFlowRequest, ExecuteFlowResult, Executor, FlowStatus,
@@ -54,7 +55,7 @@ fn execute_delete_steps(exec: &Executor, req: &ExecuteFlowRequest, steps: &[serd
             "stop_vm" => {
                 let container = params["container"].as_str().unwrap_or("");
                 match exec.vmrunner.call(
-                    "Stop",
+                    VmRunnerOp::Stop.as_str(),
                     json!({"container": container, "state_dir": exec.config.firecracker_state_dir}),
                 ) {
                     Ok(_) | Err(IpcError::NotFound(_)) => {}
@@ -84,7 +85,7 @@ fn execute_delete_steps(exec: &Executor, req: &ExecuteFlowRequest, steps: &[serd
             "delete_vm" => {
                 let container = params["container"].as_str().unwrap_or("");
                 match exec.vmrunner.call(
-                    "Delete",
+                    VmRunnerOp::Delete.as_str(),
                     json!({"container": container, "state_dir": exec.config.firecracker_state_dir}),
                 ) {
                     Ok(_) | Err(IpcError::NotFound(_)) => {}
@@ -97,10 +98,10 @@ fn execute_delete_steps(exec: &Executor, req: &ExecuteFlowRequest, steps: &[serd
             }
             "cleanup_systemd" => {
                 let container = params["container"].as_str().unwrap_or("");
-                if let Err(e) = exec
-                    .vmrunner
-                    .call("CleanupSystemd", json!({"container": container}))
-                {
+                if let Err(e) = exec.vmrunner.call(
+                    VmRunnerOp::CleanupSystemd.as_str(),
+                    json!({"container": container}),
+                ) {
                     tracing::warn!("[executor] cleanup systemd on delete: {e}");
                 }
             }
@@ -109,7 +110,7 @@ fn execute_delete_steps(exec: &Executor, req: &ExecuteFlowRequest, steps: &[serd
                 let name = params["name"].as_str().unwrap_or("");
                 let container = params["container"].as_str().unwrap_or("");
                 match exec.vmrunner.call(
-                    "CleanupFs",
+                    VmRunnerOp::CleanupFs.as_str(),
                     json!({"claw_type": claw_type, "name": name, "container": container, "state_dir": exec.config.firecracker_state_dir}),
                 ) {
                     Ok(_) => {

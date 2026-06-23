@@ -7,6 +7,7 @@ use crate::{
     orchestrator::{CreateInstanceFlowRequest, run_create_instance_flow, validate_create_request},
 };
 use core_rs::error::AppError;
+use core_rs::ipc::protocol::VmRunnerOp;
 use vmrunner_common_rs::{VmCreateResourceSpec, VmCreateTimingWire};
 
 #[allow(clippy::too_many_lines)]
@@ -254,7 +255,7 @@ fn execute_create_steps(
                         .resolve();
 
                 let vm_result = exec.vmrunner.call_with_context(
-                    "Create",
+                    VmRunnerOp::Create.as_str(),
                     json!({
                         "container": container,
                         "customer": name,
@@ -284,7 +285,7 @@ fn execute_create_steps(
                             e
                         );
                         if let Err(e) = exec.vmrunner.call(
-                            "Delete",
+                            VmRunnerOp::Delete.as_str(),
                             json!({
                                 "container": container,
                                 "state_dir": exec.config.firecracker_state_dir,

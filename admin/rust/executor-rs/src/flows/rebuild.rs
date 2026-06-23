@@ -3,6 +3,7 @@
 //! Like restart, but replaces the rootfs with a clean copy from the snapshot
 //! before rebooting the VM.
 
+use core_rs::ipc::protocol::VmRunnerOp;
 use serde_json::json;
 
 use crate::{
@@ -25,7 +26,7 @@ pub(crate) fn execute_rebuild(exec: &Executor, req: &ExecuteFlowRequest) -> Exec
                     "rebuild_vm" => {
                         let container = step.params.get("container").map_or("", String::as_str);
                         if let Err(e) = exec.vmrunner.call(
-                            "Rebuild",
+                            VmRunnerOp::Rebuild.as_str(),
                             json!({
                                 "container": container,
                                 "state_dir": exec.config.firecracker_state_dir,

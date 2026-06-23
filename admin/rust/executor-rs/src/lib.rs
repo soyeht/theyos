@@ -7,6 +7,7 @@ pub use vmrunner_common_rs::{VmCreatePhaseTiming as PhaseTiming, VmCreateTimingW
 
 use core_rs::error::{AppError, ErrorCode};
 use core_rs::ipc::client::IpcError;
+use core_rs::ipc::protocol::VmRunnerOp;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -349,7 +350,7 @@ impl Executor {
     /// Returns an error if the vmrunner IPC call fails.
     pub fn warm_pool_status(&self) -> Result<serde_json::Value, ExecutorError> {
         Ok(self.vmrunner.call(
-            "WarmPoolStatus",
+            VmRunnerOp::WarmPoolStatus.as_str(),
             json!({
                 "state_dir": self.config.firecracker_state_dir,
             }),
@@ -367,7 +368,7 @@ impl Executor {
     /// Returns an error if the vmrunner IPC call fails.
     pub fn warm_pool_refill(&self, claw_type: &str) -> Result<serde_json::Value, ExecutorError> {
         Ok(self.vmrunner.call(
-            "WarmPoolRefill",
+            VmRunnerOp::WarmPoolRefill.as_str(),
             json!({
                 "claw_type":       claw_type,
                 "state_dir":       self.config.firecracker_state_dir,
@@ -391,7 +392,7 @@ impl Executor {
     /// Returns an error if the vmrunner IPC call fails.
     pub fn warm_pool_init(&self) -> Result<serde_json::Value, ExecutorError> {
         Ok(self.vmrunner.call(
-            "WarmPoolInit",
+            VmRunnerOp::WarmPoolInit.as_str(),
             json!({
                 "state_dir":       self.config.firecracker_state_dir,
                 "firecracker_bin": self.config.firecracker_bin,
@@ -423,7 +424,7 @@ impl Executor {
     /// Returns an error if the vmrunner IPC call fails.
     pub fn warm_pool_drain(&self) -> Result<serde_json::Value, ExecutorError> {
         Ok(self.vmrunner.call(
-            "WarmPoolDrain",
+            VmRunnerOp::WarmPoolDrain.as_str(),
             json!({
                 "state_dir": self.config.firecracker_state_dir,
             }),
