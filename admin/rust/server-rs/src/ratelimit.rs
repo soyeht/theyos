@@ -15,6 +15,7 @@
 
 use core_rs::time::civil_from_days;
 use rusqlite::{Connection, params};
+use std::collections::HashMap;
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -42,6 +43,10 @@ impl core_rs::error::AppError for RateLimitError {
 pub struct Limiter {
     conn: Mutex<Connection>,
     requests_per_hour: i64,
+    /// Optional per-action hourly limit overrides. An action absent from this
+    /// map uses the global `requests_per_hour`. Empty by default, so a limiter
+    /// built with `new` alone behaves exactly as before this field existed.
+    per_action: HashMap<String, i64>,
 }
 
 impl Limiter {
@@ -81,7 +86,35 @@ impl Limiter {
         Ok(Limiter {
             conn: Mutex::new(conn),
             requests_per_hour: rph,
+            per_action: HashMap::new(),
         })
+    }
+
+    /// Additively set a per-action hourly limit override (builder style).
+    ///
+    /// Actions without an override fall back to the global `requests_per_hour`
+    /// passed to [`Limiter::new`]. A non-positive `limit` is ignored (the action
+    /// keeps the global limit), mirroring `new`'s `<= 0` handling so an override
+    /// can never silently make an action unlimited or always-denied.
+    ///
+    /// This is purely additive: a `Limiter` built with `new` alone (no calls to
+    /// this method) has an empty override map and behaves identically to before
+    /// per-action limits existed.
+    #[must_use]
+    pub fn with_action_limit(mut self, action: impl Into<String>, limit: i64) -> Self {
+        if limit > 0 {
+            self.per_action.insert(action.into(), limit);
+        }
+        self
+    }
+
+    /// The effective hourly limit for `action`: its override if one is set, else
+    /// the global `requests_per_hour`.
+    fn limit_for(&self, action: &str) -> i64 {
+        self.per_action
+            .get(action)
+            .copied()
+            .unwrap_or(self.requests_per_hour)
     }
 
     /// Check whether a request is allowed for the given user/action.
@@ -121,7 +154,7 @@ impl Limiter {
             .map_err(RateLimitError::Db)?;
 
         // count is the value *after* increment. If count > limit, deny.
-        Ok(count <= self.requests_per_hour)
+        Ok(count <= self.limit_for(action))
     }
 
     /// Return remaining requests for the given user/action in the current window.
@@ -142,7 +175,7 @@ impl Limiter {
             )
             .unwrap_or(0);
 
-        let remaining = self.requests_per_hour - count;
+        let remaining = self.limit_for(action) - count;
         Ok(if remaining < 0 { 0 } else { remaining })
     }
 }
@@ -197,6 +230,16 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("test.db");
         let limiter = Limiter::new(db_path.to_str().unwrap(), rph).unwrap();
+        (limiter, db_path)
+    }
+
+    fn tmp_limiter_built(rph: i64, overrides: &[(&str, i64)]) -> (Limiter, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.db");
+        let mut limiter = Limiter::new(db_path.to_str().unwrap(), rph).unwrap();
+        for (action, limit) in overrides {
+            limiter = limiter.with_action_limit(*action, *limit);
+        }
         (limiter, db_path)
     }
 
@@ -324,5 +367,103 @@ mod tests {
         assert_eq!(civil_from_days(0), (1970, 1, 1));
         // 2025-01-15 = day 20103
         assert_eq!(civil_from_days(20103), (2025, 1, 15));
+    }
+
+    // ─── Per-action threshold overrides (P7-C PR-B, additive, behavior-neutral) ──
+
+    #[test]
+    fn no_override_uses_global_for_every_action() {
+        // Behaviour-neutral: with no per-action override, distinct actions all
+        // use the global limit — exactly as before the override map existed.
+        let (limiter, _) = tmp_limiter(3);
+        for _ in 0..3 {
+            assert!(limiter.check("u", "alpha").unwrap());
+            assert!(limiter.check("u", "beta").unwrap());
+        }
+        assert!(!limiter.check("u", "alpha").unwrap());
+        assert!(!limiter.check("u", "beta").unwrap());
+        assert_eq!(limiter.get_remaining("u", "alpha").unwrap(), 0);
+    }
+
+    #[test]
+    fn action_override_is_stricter_than_global() {
+        let (limiter, _) = tmp_limiter_built(30, &[("strict", 2)]);
+        assert!(limiter.check("u", "strict").unwrap());
+        assert!(limiter.check("u", "strict").unwrap());
+        assert!(
+            !limiter.check("u", "strict").unwrap(),
+            "3rd request must be denied under override=2"
+        );
+    }
+
+    #[test]
+    fn action_without_override_falls_back_to_global() {
+        let (limiter, _) = tmp_limiter_built(30, &[("strict", 2)]);
+        for i in 0..30 {
+            assert!(
+                limiter.check("u", "other").unwrap(),
+                "request {i} on the un-overridden action must use the global limit"
+            );
+        }
+        assert!(!limiter.check("u", "other").unwrap());
+    }
+
+    #[test]
+    fn overridden_and_global_actions_are_independent() {
+        let (limiter, _) = tmp_limiter_built(30, &[("strict", 1)]);
+        assert!(limiter.check("u", "strict").unwrap());
+        assert!(!limiter.check("u", "strict").unwrap());
+        // Exhausting the overridden action does not affect the global one.
+        assert!(limiter.check("u", "other").unwrap());
+    }
+
+    #[test]
+    fn action_override_can_be_more_lenient_than_global() {
+        let (limiter, _) = tmp_limiter_built(2, &[("big", 5)]);
+        for i in 0..5 {
+            assert!(
+                limiter.check("u", "big").unwrap(),
+                "request {i} should be allowed under override=5"
+            );
+        }
+        assert!(!limiter.check("u", "big").unwrap());
+        // The global (2) still applies to un-overridden actions.
+        assert!(limiter.check("u", "small").unwrap());
+        assert!(limiter.check("u", "small").unwrap());
+        assert!(!limiter.check("u", "small").unwrap());
+    }
+
+    #[test]
+    fn get_remaining_respects_action_override() {
+        let (limiter, _) = tmp_limiter_built(30, &[("strict", 3)]);
+        assert_eq!(limiter.get_remaining("u", "strict").unwrap(), 3);
+        limiter.check("u", "strict").unwrap();
+        assert_eq!(limiter.get_remaining("u", "strict").unwrap(), 2);
+        // The un-overridden action reports the global remaining.
+        assert_eq!(limiter.get_remaining("u", "other").unwrap(), 30);
+    }
+
+    #[test]
+    fn non_positive_override_is_ignored_and_keeps_global() {
+        let (limiter, _) = tmp_limiter_built(4, &[("zero", 0), ("neg", -7)]);
+        // Both ignored → both keep the global 4 (never always-denied or unlimited).
+        for _ in 0..4 {
+            assert!(limiter.check("u", "zero").unwrap());
+            assert!(limiter.check("u", "neg").unwrap());
+        }
+        assert!(!limiter.check("u", "zero").unwrap());
+        assert!(!limiter.check("u", "neg").unwrap());
+    }
+
+    #[test]
+    fn global_default_still_applies_when_overrides_present() {
+        // requests_per_hour <= 0 still defaults to 30 for un-overridden actions.
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.db");
+        let limiter = Limiter::new(db_path.to_str().unwrap(), 0)
+            .unwrap()
+            .with_action_limit("strict", 2);
+        assert_eq!(limiter.get_remaining("u", "other").unwrap(), 30);
+        assert_eq!(limiter.get_remaining("u", "strict").unwrap(), 2);
     }
 }
