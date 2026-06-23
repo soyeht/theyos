@@ -354,6 +354,27 @@ pub async fn handle_create_instance_body(
         }
     };
 
+    // PR-1 (behavior change): on macOS HOSTS, align the admin create path with the
+    // mobile / household path — refuse early when the host's guest image isn't
+    // ready, BEFORE rate limit / capacity / DB insert / Job, so we never enqueue a
+    // CreateInstance Job that can only fail late in clone_base_image.
+    //
+    // This is a HOST-level gate (`#[cfg(target_os = "macos")]`) that matches the
+    // existing mobile/household gate EXACTLY; it does not narrow or reinterpret it.
+    // On a macOS host it therefore also gates an explicit `guest_os: "linux"`
+    // create (mirroring mobile's pre-existing semantics). Linux HOSTS are
+    // unaffected (read_current() is not-applicable there). PR-2 can revisit
+    // guest_os-specific gating if product wants Linux-on-macOS creates to bypass
+    // guest-image readiness.
+    #[cfg(target_os = "macos")]
+    {
+        if let Some(resp) = crate::instance_create::guest_image_not_ready_response(
+            &crate::guest_image_state::GuestImageState::read_current(),
+        ) {
+            return Ok(resp);
+        }
+    }
+
     // Validate resource configuration — only enforce physical minimums.
     // Maximum limits are enforced dynamically by check_capacity() based on real
     // host resources and current allocation (no hardcoded caps).

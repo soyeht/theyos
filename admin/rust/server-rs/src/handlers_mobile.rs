@@ -1465,19 +1465,10 @@ pub(crate) async fn create_mobile_instance_for_actor(
 
     #[cfg(target_os = "macos")]
     {
-        let guest = crate::guest_image_state::GuestImageState::read_current();
-        if guest.status.as_deref() != Some("done") {
-            return Ok((
-                StatusCode::CONFLICT,
-                Json(json!({
-                    "error": "macOS guest image is not ready",
-                    "code": "GUEST_IMAGE_NOT_READY",
-                    "guest_image_phase": guest.phase,
-                    "guest_image_status": guest.status,
-                    "guest_image_error": guest.error,
-                })),
-            )
-                .into_response());
+        if let Some(resp) = crate::instance_create::guest_image_not_ready_response(
+            &crate::guest_image_state::GuestImageState::read_current(),
+        ) {
+            return Ok(resp);
         }
     }
 
