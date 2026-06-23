@@ -10,6 +10,12 @@ use core_rs::ipc::protocol::{LeaseKind, LeaseOwnerType};
 use serde_json::json;
 use store_rs::WarmPoolSlotId;
 
+/// Max length of a normalized instance/container name, shared by every create
+/// path (admin / mobile / household) so the limit can't drift per-surface.
+pub(crate) const MAX_NAME_LEN: usize = 64;
+/// Max length of a normalized claw-type, shared by every create path.
+pub(crate) const MAX_CLAW_TYPE_LEN: usize = 32;
+
 /// Best-effort cleanup for an instance row inserted before a later step failed.
 ///
 /// This avoids leaving orphaned `provisioning` rows behind when create flows

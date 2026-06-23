@@ -11,7 +11,7 @@
 //!   `handleInstanceAutoUpdate` → POST  /api/v1/instances/{id}/autoupdate
 
 use crate::auth::{AdminUser, AuthUser};
-use crate::instance_create::rollback_inserted_instance;
+use crate::instance_create::{MAX_CLAW_TYPE_LEN, MAX_NAME_LEN, rollback_inserted_instance};
 use crate::responses::{InstanceResponse, ListResponse};
 use crate::state::SharedState;
 use crate::time_util::format_date;
@@ -31,9 +31,6 @@ use serde_json::{Value, json};
 use store_rs::{InstanceStatus, NewInstance, StatusUpdate, normalize_slug};
 use tracing::{info, warn};
 use vmrunner_common_rs::VmCreateResourceSpec;
-
-const MAX_NAME_LEN: usize = 64;
-const MAX_CLAW_TYPE_LEN: usize = 32;
 
 /// Normalize a tool name from various user-supplied variants to the canonical form.
 fn normalize_tool_name(name: &str) -> Option<&'static str> {

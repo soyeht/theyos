@@ -1357,7 +1357,7 @@ pub(crate) async fn create_mobile_instance_for_actor(
     if name.is_empty() {
         return Err(ApiError::bad_request("container name is required"));
     }
-    if name.len() > 64 {
+    if name.len() > crate::instance_create::MAX_NAME_LEN {
         return Err(ApiError::bad_request("container name too long"));
     }
 
@@ -1370,7 +1370,7 @@ pub(crate) async fn create_mobile_instance_for_actor(
             ct
         }
     };
-    if claw_type.len() > 32 {
+    if claw_type.len() > crate::instance_create::MAX_CLAW_TYPE_LEN {
         return Err(ApiError::bad_request("claw type name too long"));
     }
     // Unified availability gate: replaces the split-brain
@@ -1391,13 +1391,17 @@ pub(crate) async fn create_mobile_instance_for_actor(
             }
             OverallState::NotInstalled => {
                 return Err(ApiError::bad_request_with_reasons(
-                    format!("claw type '{claw_type}' is not installed"),
+                    format!(
+                        "claw type '{claw_type}' is not installed — install it from the claw store first"
+                    ),
                     reasons_json,
                 ));
             }
             OverallState::Installing { percent } => {
                 return Err(ApiError::bad_request_with_reasons(
-                    format!("claw type '{claw_type}' is still installing ({percent}%)"),
+                    format!(
+                        "claw type '{claw_type}' is still installing ({percent}%) — wait for it to finish"
+                    ),
                     reasons_json,
                 ));
             }
@@ -1433,7 +1437,7 @@ pub(crate) async fn create_mobile_instance_for_actor(
                     .iter()
                     .find_map(|r| match r {
                         UnavailReason::NoColdPathAvailable => Some(format!(
-                            "claw type '{claw_type}' cannot be created: host rootfs missing"
+                            "claw type '{claw_type}' cannot be created: no base rootfs or golden image available on this host"
                         )),
                         _ => None,
                     })
