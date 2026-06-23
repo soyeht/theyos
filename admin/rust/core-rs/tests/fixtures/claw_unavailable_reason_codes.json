@@ -1,0 +1,8 @@
+{
+  "_comment": "Cross-language contract for `core_rs::manifest::UnavailableReasonCode` - the `unavailable_reason_code` wire field of the claw catalog / availability response (theyos #88). theyos (Rust) is the source of truth; these are exactly the EMITTED wire values (serde `rename_all = snake_case`), validated by `core-rs/tests/claw_unavailable_reason_fixture.rs`. soyeht-ios vendors this file VERBATIM and validates its `ClawUnavailableReasonCode` (whose `.unknown` is a receive-only fail-soft fallback, NOT an emitted wire). Do not hand-edit the vendored iOS copy.",
+  "codes": [
+    { "wire": "catalog_only" },
+    { "wire": "detected_unverified" },
+    { "wire": "no_install_plan" }
+  ]
+}
