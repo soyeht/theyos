@@ -2481,6 +2481,12 @@ async fn boot_warm_pool_vm(
         let inst_dir = instance_dir(container);
         std::fs::create_dir_all(&inst_dir).map_err(vmrunner_macos_rs::VZError::Io)?;
 
+        // Fail closed if the target volume can't fit a clone — mirrors
+        // `clone_base_image` (lib.rs). APFS CoW makes the copy near-free now, but
+        // the cloned VM writes into this space at boot. On insufficient space this
+        // returns `Err` (prep fails → lease released cleanly; no VM started).
+        vmrunner_macos_rs::vz::check_disk_space(&inst_dir)?;
+
         // APFS CoW clone the base disk and aux storage.
         let base_disk = base_dir.join("disk.img");
         let inst_disk = inst_dir.join("disk.img");

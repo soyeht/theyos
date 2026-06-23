@@ -944,6 +944,31 @@ mod tests {
     }
 
     #[test]
+    fn panicking_owner_retains_lease_failclosed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut alive = HashSet::new();
+        alive.insert(current_pid());
+        let adm = test_admission(tmp.path(), "boot-A", alive);
+
+        // A panic while holding a lease (e.g. `boot_warm_pool_vm` panicking mid-boot)
+        // must NOT become a clean release: a panic skips the explicit
+        // `release_clean`, so `VmLease::drop` runs and RETAINS the registry record.
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _lease = adm.reserve(VmKind::WarmPool, None).expect("reserve");
+            panic!("simulated boot panic while holding the lease");
+        }));
+        assert!(result.is_err(), "the closure must have panicked");
+
+        // Fail-closed: the lease record is retained (not removed) — the slot keeps
+        // counting until the owner dies and reboot clears it.
+        assert_eq!(
+            read_raw(tmp.path()).leases.len(),
+            1,
+            "a panic must retain the lease record (fail-closed), not clean-release it"
+        );
+    }
+
+    #[test]
     fn corrupt_registry_is_fail_closed() {
         let tmp = tempfile::tempdir().unwrap();
         // Write a non-JSON blob into the registry.

@@ -1669,4 +1669,35 @@ mod tests {
         let err = result.err().expect("should fail with missing disk");
         assert!(err.to_string().contains("Disk image not found"));
     }
+
+    /// P4 fail-closed guard: the warm-pool clone path (`boot_warm_pool_vm`) must
+    /// run `check_disk_space` BEFORE the `cp -c` clone, so an over-full target
+    /// volume is refused before any copy. This is a source-text scan because the
+    /// function needs VZ + a real base image to drive (out of scope for unit
+    /// tests); `check_disk_space`'s own fail-closed behaviour is covered above.
+    #[test]
+    fn warm_pool_clone_checks_disk_space_before_cp() {
+        let src = include_str!("bin/vmrunner_macos_ipc_macos.rs");
+        let start = src
+            .find("async fn boot_warm_pool_vm")
+            .expect("boot_warm_pool_vm present");
+        let after = &src[start..];
+        // Bound the scan to the function body (up to the next top-level fn).
+        let end = after[1..]
+            .find("\nasync fn ")
+            .or_else(|| after[1..].find("\nfn "))
+            .map_or(after.len(), |i| i + 1);
+        let body = &after[..end];
+
+        let check = body
+            .find("check_disk_space")
+            .expect("warm-pool clone must call check_disk_space");
+        let cp = body
+            .find("Command::new(\"cp\")")
+            .expect("warm-pool clone uses `cp` to copy the base image");
+        assert!(
+            check < cp,
+            "check_disk_space must run BEFORE the cp clone (fail-closed)"
+        );
+    }
 }
