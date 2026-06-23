@@ -4,7 +4,7 @@
 //! claw instances before an upgrade, with per-claw timeouts and fallback
 //! to force-stop if needed.
 
-use core_rs::ipc::protocol::VmRunnerOp;
+use core_rs::ipc::protocol::{StoreOp, VmRunnerOp};
 
 use crate::{ExecuteFlowRequest, Executor, FlowType};
 use serde_json::json;
@@ -96,7 +96,7 @@ pub fn graceful_shutdown_all(
 
     // Get all active instances from the database
     let instances = exec.store.call(
-        "InstanceDbList",
+        StoreOp::InstanceDbList.as_str(),
         json!({
             "db_path": exec.config.store_db_path,
         }),
@@ -188,7 +188,7 @@ fn shutdown_instance_with_timeout(
 
     // Get instance details from database
     let instance_info = match exec.store.call(
-        "InstanceDbGet",
+        StoreOp::InstanceDbGet.as_str(),
         json!({
             "db_path": exec.config.store_db_path,
             "id": instance_id,
