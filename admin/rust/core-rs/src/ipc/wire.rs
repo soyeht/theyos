@@ -12,12 +12,43 @@ pub const ERROR_CONTEXT_FIELD: &str = "error_context";
 /// JSON field inside [`ERROR_CONTEXT_FIELD`] for machine-readable numeric codes.
 pub const ERROR_CODE_FIELD: &str = "code";
 
-/// Incoming JSON-RPC request.
-#[derive(Debug, Deserialize)]
+/// JSON-RPC request envelope.
+///
+/// `Serialize` so the IPC client can build it via [`Request::new`] instead of an
+/// inline `json!` literal.
+#[derive(Debug, Serialize, Deserialize)]
 pub struct Request {
     pub method: String,
     #[serde(default)]
     pub params: Value,
+    /// Optional additive protocol version (P2). Absent on legacy wire and NOT
+    /// emitted by the default sender — `skip_serializing_if` keeps the
+    /// no-version serialization byte-identical to the pre-P2
+    /// `{"method","params"}` object. Declared last so the field order matches
+    /// the legacy form.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version: Option<u32>,
+}
+
+impl Request {
+    /// Build a request envelope with no protocol version. Serializing it is
+    /// byte-identical to the legacy `{"method", "params"}` wire form.
+    #[must_use]
+    pub fn new(method: impl Into<String>, params: Value) -> Self {
+        Request {
+            method: method.into(),
+            params,
+            version: None,
+        }
+    }
+
+    /// Attach an explicit protocol version. NOT used by the default sender (P2
+    /// is plumb-only); available for a future opt-in.
+    #[must_use]
+    pub fn with_version(mut self, version: u32) -> Self {
+        self.version = Some(version);
+        self
+    }
 }
 
 /// Outgoing JSON-RPC response.
@@ -123,7 +154,66 @@ pub fn write_response(out: &mut impl Write, resp: &Response) -> std::io::Result<
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ipc::protocol::PROTOCOL_VERSION;
     use serde_json::json;
+
+    // ── P2: additive request envelope versioning ────────────────────────────
+
+    #[test]
+    fn request_without_version_serializes_byte_identical_to_legacy() {
+        let req = Request::new("Create", json!({"a": 1}));
+        let got = serde_json::to_string(&req).unwrap();
+        // Exactly the pre-P2 inline `json!({"method","params"})` bytes.
+        let legacy =
+            serde_json::to_string(&json!({"method": "Create", "params": {"a": 1}})).unwrap();
+        assert_eq!(got, legacy);
+        assert_eq!(got, r#"{"method":"Create","params":{"a":1}}"#);
+    }
+
+    #[test]
+    fn request_with_version_round_trips() {
+        let req = Request::new("Stop", json!({})).with_version(PROTOCOL_VERSION);
+        let s = serde_json::to_string(&req).unwrap();
+        assert!(s.contains(r#""version":1"#), "serialized: {s}");
+        let back: Request = serde_json::from_str(&s).unwrap();
+        assert_eq!(back.method, "Stop");
+        assert_eq!(back.version, Some(PROTOCOL_VERSION));
+    }
+
+    #[test]
+    fn legacy_request_without_version_parses_as_none() {
+        let back: Request =
+            serde_json::from_str(r#"{"method":"Delete","params":{"id":"x"}}"#).unwrap();
+        assert_eq!(back.method, "Delete");
+        assert_eq!(back.params, json!({"id": "x"}));
+        assert_eq!(back.version, None);
+    }
+
+    #[test]
+    fn versioned_request_parses_as_some() {
+        let back: Request =
+            serde_json::from_str(r#"{"method":"Delete","params":{},"version":1}"#).unwrap();
+        assert_eq!(back.version, Some(1));
+    }
+
+    #[test]
+    fn unknown_extra_field_is_tolerated() {
+        // No `deny_unknown_fields` → forward-compatible receive.
+        let back: Request = serde_json::from_str(
+            r#"{"method":"Delete","params":{},"version":2,"future_field":"ignored"}"#,
+        )
+        .unwrap();
+        assert_eq!(back.method, "Delete");
+        assert_eq!(back.version, Some(2));
+    }
+
+    #[test]
+    fn request_missing_params_still_defaults() {
+        let back: Request = serde_json::from_str(r#"{"method":"Ping"}"#).unwrap();
+        assert_eq!(back.method, "Ping");
+        assert_eq!(back.params, Value::Null);
+        assert_eq!(back.version, None);
+    }
 
     #[test]
     fn err_code_preserves_current_context_shape() {

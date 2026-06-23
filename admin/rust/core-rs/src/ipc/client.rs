@@ -4,7 +4,7 @@
 //! Includes transparent auto-respawn when the subprocess crashes.
 
 use crate::error::{AppError, ErrorCode};
-use crate::ipc::wire::ERROR_CONTEXT_FIELD;
+use crate::ipc::wire::{ERROR_CONTEXT_FIELD, Request};
 use serde_json::{Value, json};
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
@@ -150,9 +150,11 @@ impl IpcClient {
     }
 
     /// Send a single JSON-RPC request (no retry).
-    #[allow(clippy::needless_pass_by_value)] // consumed by json!() macro
+    #[allow(clippy::needless_pass_by_value)] // consumed by Request::new
     fn call_once(&self, method: &str, params: Value) -> Result<Value, (IpcError, Option<Value>)> {
-        let req = json!({"method": method, "params": params});
+        // P2 plumb-only: build the typed envelope. `version` is left `None`, so
+        // serialization is byte-identical to the legacy `{"method","params"}`.
+        let req = Request::new(method, params);
         let mut line = serde_json::to_string(&req)
             .map_err(|e| (IpcError::Io(format!("serialize: {e}")), None))?;
         line.push('\n');
