@@ -1,0 +1,62 @@
+{
+  "contract": "soyeht-pop-cbor-cross-language",
+  "version": 1,
+  "about": [
+    "Cross-language golden vectors for the Soyeht proof-of-possession (PoP) request",
+    "signing context. They pin, byte-for-byte, what both theyos (Rust) and",
+    "soyeht-ios (Swift) MUST produce so a PoP signature made on one side verifies on",
+    "the other. The iOS half (PR2) asserts HouseholdCBOR.requestSigningContext(...)",
+    "reproduces the same canonical_cbor_hex and verifies the same verify_vector."
+  ],
+  "format": {
+    "signed_context_fields": ["v", "method", "path_and_query", "timestamp", "body_hash"],
+    "canonical_cbor": "RFC 8949 4.2.1 deterministic map encoding (keys ordered by their encoded bytes, i.e. length-first then lexicographic).",
+    "method": "ASCII-uppercased before signing.",
+    "body_hash": "BLAKE3(body), 32 bytes, encoded as a CBOR byte string.",
+    "operation_caveat_note": "Operation/caveat is NOT part of the signed request context. It is enforced separately by the cert caveats (see the P7-A household PoP/Operation gate-completeness guard). Do not add it here.",
+    "verify_vector": "public_key_sec1_compressed_hex is a 33-byte SEC1 compressed P-256 public key; signature_p256_raw_hex is the 64-byte raw r||s ECDSA signature over the canonical_cbor bytes. No private key/secret appears in this fixture."
+  },
+  "request_signing_context": [
+    {
+      "id": "get_list_claws_empty_body",
+      "input": {
+        "v": 1,
+        "method": "GET",
+        "path_and_query": "/api/v1/household/claws",
+        "timestamp": 1700000000,
+        "body_utf8": ""
+      },
+      "body_hash_blake3_hex": "af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262",
+      "canonical_cbor_hex": "a5617601666d6574686f646347455469626f64795f686173685820af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f32626974696d657374616d701a6553f1006e706174685f616e645f7175657279772f6170692f76312f686f757365686f6c642f636c617773",
+      "verify_vector": {
+        "public_key_sec1_compressed_hex": "026ff03b949241ce1dadd43519e6960e0a85b41a69a05c328103aa2bce1594ca16",
+        "signature_p256_raw_hex": "0720e99226f5e40079ff2ae871953439990e0467c5f0d0db0654e9ce77342a73d90bd17695d6f010e2f3b55334982584684776f9aa0d78688164e42d35a92603"
+      }
+    },
+    {
+      "id": "post_install_claw_json_body",
+      "input": {
+        "v": 1,
+        "method": "POST",
+        "path_and_query": "/api/v1/household/claws/demo-claw/install",
+        "timestamp": 1700000000,
+        "body_utf8": "{\"example\":true}"
+      },
+      "body_hash_blake3_hex": "6b97c5882cdd878a1c9cd9e7f93ddf283fb04c202ecf7518edee8a4058c98b39",
+      "canonical_cbor_hex": "a5617601666d6574686f6464504f535469626f64795f6861736858206b97c5882cdd878a1c9cd9e7f93ddf283fb04c202ecf7518edee8a4058c98b396974696d657374616d701a6553f1006e706174685f616e645f717565727978292f6170692f76312f686f757365686f6c642f636c6177732f64656d6f2d636c61772f696e7374616c6c"
+    }
+  ],
+  "pairing_proof_context": [
+    {
+      "id": "pair_device_confirm_synthetic",
+      "input": {
+        "v": 1,
+        "purpose": "pair-device-confirm",
+        "household_id": "hh_idmnejpudahpsktwppmorcsc6c433m3rzen7exeddpqnen2y7fda",
+        "nonce_hex": "2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a",
+        "p_pub_sec1_compressed_hex": "026ff03b949241ce1dadd43519e6960e0a85b41a69a05c328103aa2bce1594ca16"
+      },
+      "canonical_cbor_hex": "a56176016568685f6964783768685f69646d6e656a707564616870736b747770706d6f7263736336633433336d33727a656e37657865646470716e656e327937666461656e6f6e636558202a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a65705f7075625821026ff03b949241ce1dadd43519e6960e0a85b41a69a05c328103aa2bce1594ca1667707572706f736573706169722d6465766963652d636f6e6669726d"
+    }
+  ]
+}
