@@ -28,6 +28,7 @@ fn dispatch(method: &str, params: &Value) -> Response {
         "InstanceDbDelete" => handle_instancedb_delete(params),
         "InstanceDbSetJobId" => handle_instancedb_set_job_id(params),
         "InstanceDbGetCfHostnameId" => handle_instancedb_get_cf_hostname_id(params),
+        "InstanceDbGetHostPort" => handle_instancedb_get_host_port(params),
         "ResourceLeaseCreate" => handle_lease_create(params),
         "ResourceLeaseRelease" => handle_lease_release(params),
         "ResourceLeaseReleaseAll" => handle_lease_release_all(params),
@@ -147,6 +148,20 @@ fn handle_instancedb_get(params: &Value) -> Response {
     match db.get(id) {
         Ok(Some(row)) => Response::ok(serde_json::json!({"row": instance_row_to_value(&row)})),
         Ok(None) => Response::ok(serde_json::json!({"row": null})),
+        Err(e) => Response::err(e.to_string()),
+    }
+}
+
+fn handle_instancedb_get_host_port(params: &Value) -> Response {
+    let db = match open_instance_db(params) {
+        Ok(db) => db,
+        Err(resp) => return resp,
+    };
+    let Some(id) = params["id"].as_str() else {
+        return Response::err("missing 'id' param");
+    };
+    match db.get_host_port(id) {
+        Ok(port) => Response::ok(serde_json::json!({"port": port})),
         Err(e) => Response::err(e.to_string()),
     }
 }
@@ -484,5 +499,66 @@ fn handle_soft_delete(params: &Value) -> Response {
     match db.soft_delete(id) {
         Ok(()) => Response::ok_empty(),
         Err(e) => Response::err(e.to_string()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::NamedTempFile;
+
+    /// The `InstanceDbGetHostPort` arm must return the instance's real
+    /// `host_port`. Before this arm existed the executor's `get_host_port`
+    /// always hit the `unknown method` error and masked it to `0`
+    /// (`unwrap_or(0)`); this pins the fix end-to-end at the IPC boundary.
+    #[test]
+    fn get_host_port_arm_returns_real_port_not_zero() {
+        let tmp = NamedTempFile::new().unwrap();
+        let db_path = tmp.path().to_str().unwrap();
+        let db = InstanceDb::open(db_path).unwrap();
+        db.insert(&NewInstance {
+            id: "inst-1",
+            name: "demo",
+            container: "picoclaw-demo",
+            claw_type: "picoclaw",
+            sunset_date: "",
+            guest_os: None,
+            aux_storage_path: None,
+            cpu_cores: None,
+            ram_config_mb: None,
+            disk_gb: None,
+            household_id: None,
+            household_machine_id: None,
+        })
+        .unwrap();
+        db.update_port("inst-1", 49160).unwrap();
+
+        let resp = handle_instancedb_get_host_port(
+            &serde_json::json!({"db_path": db_path, "id": "inst-1"}),
+        );
+        assert!(resp.ok, "expected ok response, got error: {:?}", resp.error);
+        let port = resp.result.expect("result payload")["port"].as_i64();
+        assert_eq!(
+            port,
+            Some(49160),
+            "arm must return the real host_port, not a masked 0"
+        );
+    }
+
+    /// The method name routes to the new handler, not the `unknown method`
+    /// fallback.
+    #[test]
+    fn dispatch_routes_get_host_port() {
+        let tmp = NamedTempFile::new().unwrap();
+        let db_path = tmp.path().to_str().unwrap();
+        InstanceDb::open(db_path).unwrap(); // initialize schema
+        let resp = dispatch(
+            "InstanceDbGetHostPort",
+            &serde_json::json!({"db_path": db_path, "id": "missing"}),
+        );
+        // Unknown id → port 0 via COALESCE, but the call is ROUTED and ok
+        // (i.e. not the "unknown method" error path).
+        assert!(resp.ok, "method must dispatch, got error: {:?}", resp.error);
+        assert_eq!(resp.result.expect("payload")["port"].as_i64(), Some(0));
     }
 }

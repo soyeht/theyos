@@ -16,11 +16,10 @@
 //!
 //! Allowlist — the ONLY literals permitted on the producer paths:
 //! - `MacOsSlotStatus`: a macOS-runner method outside the shared `VmRunnerOp`
-//!   vocabulary (B1 covers only the cross-runner lifecycle methods).
-//! - `ApplyAction`, `InstanceDbGetHostPort`: PRE-EXISTING dead store calls —
-//!   no matching arm in the store IPC dispatch, error swallowed by the caller.
-//!   Left as literals pending a dedicated bugfix and allowlisted here so they
-//!   are NOT mistaken for real `StoreOp` variants.
+//!   vocabulary (B1 covers only the cross-runner lifecycle methods). This is
+//!   now the ONLY permitted literal. The two former dead store calls were fixed
+//!   in the C+A package: `InstanceDbGetHostPort` became a real `StoreOp` arm and
+//!   the executor calls it typed; `ApplyAction`'s dead delete step was removed.
 //!
 //! Test modules (`#[cfg(test)]`) are NOT scanned on purpose: those tests assert
 //! the on-the-wire string values, proving the typed producers still emit the
@@ -40,8 +39,7 @@ const LEASE_KEYWORDS: &[&str] = &[
 ];
 
 /// `.call("X")` method literals permitted on producer paths (see module docs).
-const CALL_LITERAL_ALLOWLIST: &[&str] =
-    &["MacOsSlotStatus", "ApplyAction", "InstanceDbGetHostPort"];
+const CALL_LITERAL_ALLOWLIST: &[&str] = &["MacOsSlotStatus"];
 
 /// `.../admin/rust` — the workspace root that holds the producer crates.
 fn rust_root() -> PathBuf {

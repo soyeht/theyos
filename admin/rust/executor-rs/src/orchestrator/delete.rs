@@ -57,7 +57,6 @@ pub fn run_delete_instance_flow(req: &DeleteInstanceFlowRequest) -> FlowResult {
             // so a single cleanup_fs contract serves both hosts.
             .with_param("container", &req.container),
         OrchestratorStep::new("delete_db_row"),
-        OrchestratorStep::new("remove_from_store"),
         OrchestratorStep::new("remove_container").with_param("container", &req.container),
     ];
 
@@ -110,7 +109,6 @@ mod tests {
                 "cleanup_systemd",
                 "cleanup_fs",
                 "delete_db_row",
-                "remove_from_store",
                 "remove_container",
             ]
         );

@@ -322,7 +322,7 @@ impl Executor {
 
     pub(crate) fn get_host_port(&self, id: &str) -> Result<i64, ExecutorError> {
         let v = self.store.call(
-            "InstanceDbGetHostPort",
+            StoreOp::InstanceDbGetHostPort.as_str(),
             json!({
                 "db_path": self.config.store_db_path,
                 "id": id,
