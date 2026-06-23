@@ -6246,4 +6246,211 @@ mod instance_db_tests {
             "typed query must read leases written with the literal wire bytes"
         );
     }
+
+    // ── P3: lease ownership invariants ──────────────────────────────────────
+
+    /// `ux_active_lease_per_owner`: at most one ACTIVE lease per
+    /// `(owner_type, owner_id, lease_kind)`. A second active lease for the same
+    /// triple is rejected; after release a fresh one is allowed; a different
+    /// `lease_kind` for the same owner is a distinct triple (allowed).
+    #[test]
+    fn inv_at_most_one_active_lease_per_owner_kind() {
+        let db = open_temp();
+        db.create_lease(&NewLease {
+            owner_type: LeaseOwnerType::Instance,
+            owner_id: "i1",
+            lease_kind: LeaseKind::Runtime,
+            cpu_cores: 2,
+            ram_mb: 2048,
+            disk_gb: 0,
+            expires_at: None,
+        })
+        .unwrap();
+        // Second ACTIVE runtime lease for the same owner triple → rejected.
+        assert!(
+            db.create_lease(&NewLease {
+                owner_type: LeaseOwnerType::Instance,
+                owner_id: "i1",
+                lease_kind: LeaseKind::Runtime,
+                cpu_cores: 1,
+                ram_mb: 512,
+                disk_gb: 0,
+                expires_at: None,
+            })
+            .is_err(),
+            "a second active runtime lease for the same owner must be rejected"
+        );
+        // A different kind (storage) for the same owner_id is a distinct triple.
+        db.create_lease(&NewLease {
+            owner_type: LeaseOwnerType::Instance,
+            owner_id: "i1",
+            lease_kind: LeaseKind::Storage,
+            cpu_cores: 0,
+            ram_mb: 0,
+            disk_gb: 10,
+            expires_at: None,
+        })
+        .unwrap();
+        // After releasing the runtime lease, a fresh one is allowed again.
+        db.release_lease(LeaseOwnerType::Instance, "i1", LeaseKind::Runtime)
+            .unwrap();
+        db.create_lease(&NewLease {
+            owner_type: LeaseOwnerType::Instance,
+            owner_id: "i1",
+            lease_kind: LeaseKind::Runtime,
+            cpu_cores: 2,
+            ram_mb: 2048,
+            disk_gb: 0,
+            expires_at: None,
+        })
+        .unwrap();
+    }
+
+    /// DB `CHECK` constraints reject invalid lease rows: non-negative resources
+    /// and `expires_at >= acquired_at`.
+    #[test]
+    fn inv_db_checks_reject_invalid_lease() {
+        let db = open_temp();
+        let mk = |cpu: i64, ram: i64, disk: i64, expires: Option<i64>| NewLease {
+            owner_type: LeaseOwnerType::Instance,
+            owner_id: "i1",
+            lease_kind: LeaseKind::Runtime,
+            cpu_cores: cpu,
+            ram_mb: ram,
+            disk_gb: disk,
+            expires_at: expires,
+        };
+        assert!(
+            db.create_lease(&mk(-1, 0, 0, None)).is_err(),
+            "cpu_cores >= 0"
+        );
+        assert!(db.create_lease(&mk(0, -1, 0, None)).is_err(), "ram_mb >= 0");
+        assert!(
+            db.create_lease(&mk(0, 0, -1, None)).is_err(),
+            "disk_gb >= 0"
+        );
+        // expires_at in the past (< acquired_at = now) violates the temporal CHECK.
+        assert!(
+            db.create_lease(&mk(1, 1, 0, Some(1))).is_err(),
+            "expires_at must be >= acquired_at"
+        );
+        // A valid lease still succeeds — the CHECKs don't reject good input.
+        db.create_lease(&mk(1, 1, 0, None)).unwrap();
+    }
+
+    /// `transfer_warm_pool_lease` is atomic and conserves allocation: the warm
+    /// lease is released and an instance lease created in one transaction; the
+    /// total active runtime allocation is unchanged.
+    #[test]
+    fn inv_transfer_warm_pool_lease_is_atomic_and_conserves_allocation() {
+        let db = open_temp();
+        db.create_lease(&NewLease {
+            owner_type: LeaseOwnerType::WarmPool,
+            owner_id: "picoclaw:slot:0",
+            lease_kind: LeaseKind::Runtime,
+            cpu_cores: 2,
+            ram_mb: 2048,
+            disk_gb: 0,
+            expires_at: None,
+        })
+        .unwrap();
+        assert_eq!(db.sum_active_runtime_leases().unwrap(), (2, 2048));
+        assert!(
+            db.has_active_lease_str("warm_pool", "picoclaw:slot:0", "runtime")
+                .unwrap()
+        );
+
+        assert!(
+            db.transfer_warm_pool_lease("picoclaw", "i1", 2, 2048)
+                .unwrap()
+        );
+        assert!(
+            !db.has_active_lease_str("warm_pool", "picoclaw:slot:0", "runtime")
+                .unwrap()
+        );
+        assert!(
+            db.has_active_lease_str("instance", "i1", "runtime")
+                .unwrap()
+        );
+        // Allocation conserved — still exactly one active runtime lease.
+        assert_eq!(db.sum_active_runtime_leases().unwrap(), (2, 2048));
+
+        // No warm-pool lease left → no-op transfer returns false.
+        assert!(
+            !db.transfer_warm_pool_lease("picoclaw", "i2", 2, 2048)
+                .unwrap()
+        );
+    }
+
+    /// `transfer_warm_pool_lease` rolls back fully when its internal instance
+    /// INSERT would violate `ux_active_lease_per_owner` — the warm lease is NOT
+    /// released and the pre-existing instance lease is untouched.
+    #[test]
+    fn inv_transfer_warm_pool_lease_rolls_back_on_conflict() {
+        let db = open_temp();
+        db.create_lease(&NewLease {
+            owner_type: LeaseOwnerType::WarmPool,
+            owner_id: "picoclaw:slot:0",
+            lease_kind: LeaseKind::Runtime,
+            cpu_cores: 2,
+            ram_mb: 2048,
+            disk_gb: 0,
+            expires_at: None,
+        })
+        .unwrap();
+        // The target instance ALREADY holds an active runtime lease.
+        db.create_lease(&NewLease {
+            owner_type: LeaseOwnerType::Instance,
+            owner_id: "i1",
+            lease_kind: LeaseKind::Runtime,
+            cpu_cores: 1,
+            ram_mb: 512,
+            disk_gb: 0,
+            expires_at: None,
+        })
+        .unwrap();
+
+        assert!(
+            db.transfer_warm_pool_lease("picoclaw", "i1", 2, 2048)
+                .is_err(),
+            "transfer onto an instance that already holds a runtime lease must fail"
+        );
+        // Rollback: warm lease still active; i1's original lease intact.
+        assert!(
+            db.has_active_lease_str("warm_pool", "picoclaw:slot:0", "runtime")
+                .unwrap()
+        );
+        assert!(
+            db.has_active_lease_str("instance", "i1", "runtime")
+                .unwrap()
+        );
+    }
+
+    /// Releasing a runtime lease drops the allocation with no leak. This is the
+    /// mechanism the reaper (expired) and reconcile (dead instance) use; pure
+    /// clock-expiry is intentionally not fabricated (the DB `CHECK
+    /// (expires_at >= acquired_at)` forbids a past-expiry row via the API, and we
+    /// do not bypass schema).
+    #[test]
+    fn inv_release_drops_runtime_allocation_no_leak() {
+        let db = open_temp();
+        db.create_lease(&NewLease {
+            owner_type: LeaseOwnerType::Instance,
+            owner_id: "i1",
+            lease_kind: LeaseKind::Runtime,
+            cpu_cores: 2,
+            ram_mb: 2048,
+            disk_gb: 0,
+            expires_at: None,
+        })
+        .unwrap();
+        assert_eq!(db.sum_active_runtime_leases().unwrap(), (2, 2048));
+        db.release_lease(LeaseOwnerType::Instance, "i1", LeaseKind::Runtime)
+            .unwrap();
+        assert_eq!(
+            db.sum_active_runtime_leases().unwrap(),
+            (0, 0),
+            "released lease must not leak into allocation"
+        );
+    }
 }

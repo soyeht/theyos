@@ -340,4 +340,39 @@ mod tests {
             InstanceStatus::Active
         );
     }
+
+    /// P3 end-to-end #5: reconcile of a dead (swept) instance releases its
+    /// runtime lease — the allocation drops to zero with no leak.
+    #[test]
+    fn reconcile_releases_runtime_lease_no_leak() {
+        let db = InstanceDb::open(":memory:").unwrap();
+        make_active(&db, "i1", "pico-dead");
+        db.create_lease(&NewLease {
+            owner_type: LeaseOwnerType::Instance,
+            owner_id: "i1",
+            lease_kind: LeaseKind::Runtime,
+            cpu_cores: 2,
+            ram_mb: 2048,
+            disk_gb: 0,
+            expires_at: None,
+        })
+        .unwrap();
+        assert_eq!(db.sum_active_runtime_leases().unwrap(), (2, 2048));
+
+        let report = SweepReport {
+            instances_cleaned: 1,
+            dirs_removed: 0,
+            cleaned_containers: vec!["pico-dead".to_string()],
+        };
+        let tmp = TempDir::new().unwrap();
+        let n = reconcile_after_sweep(&db, tmp.path(), &report);
+        assert_eq!(n, 1);
+
+        // Dead instance's runtime lease released → no leaked allocation.
+        assert_eq!(
+            db.sum_active_runtime_leases().unwrap(),
+            (0, 0),
+            "reconcile must release the dead instance's runtime lease"
+        );
+    }
 }

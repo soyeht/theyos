@@ -579,4 +579,49 @@ mod tests {
         assert_eq!(proj.available_ram, 1107);
         assert!(proj.allocated_ram + 4096 > proj.ram_budget);
     }
+
+    /// P3 invariant: the single capacity reader (`compute_capacity_projection`)
+    /// agrees with the single allocation source (`sum_active_runtime_leases`),
+    /// across instance + warm-pool leases, and after a release.
+    #[test]
+    fn inv_projection_allocated_matches_sum_active_runtime_leases() {
+        let db = InstanceDb::open(":memory:").unwrap();
+        db.create_lease(&store_rs::NewLease {
+            owner_type: LeaseOwnerType::Instance,
+            owner_id: "inst-1",
+            lease_kind: LeaseKind::Runtime,
+            cpu_cores: 2,
+            ram_mb: 2048,
+            disk_gb: 0,
+            expires_at: None,
+        })
+        .unwrap();
+        db.create_lease(&store_rs::NewLease {
+            owner_type: LeaseOwnerType::WarmPool,
+            owner_id: "picoclaw:slot:0",
+            lease_kind: LeaseKind::Runtime,
+            cpu_cores: 2,
+            ram_mb: 2048,
+            disk_gb: 0,
+            expires_at: None,
+        })
+        .unwrap();
+
+        let host = make_host(16, 32768, 200);
+        let proj = compute_capacity_projection(&db, &host).unwrap();
+        let (sum_cpu, sum_ram) = db.sum_active_runtime_leases().unwrap();
+        assert_eq!((proj.allocated_cpu, proj.allocated_ram), (sum_cpu, sum_ram));
+        assert_eq!((proj.allocated_cpu, proj.allocated_ram), (4, 4096));
+
+        // Releasing a lease keeps the invariant (allocation drops, no leak).
+        db.release_lease(LeaseOwnerType::Instance, "inst-1", LeaseKind::Runtime)
+            .unwrap();
+        let proj2 = compute_capacity_projection(&db, &host).unwrap();
+        let (sum_cpu2, sum_ram2) = db.sum_active_runtime_leases().unwrap();
+        assert_eq!(
+            (proj2.allocated_cpu, proj2.allocated_ram),
+            (sum_cpu2, sum_ram2)
+        );
+        assert_eq!((proj2.allocated_cpu, proj2.allocated_ram), (2, 2048));
+    }
 }
