@@ -1,5 +1,6 @@
 use crate::state::SharedState;
 use core_rs::error::{ApiError, blocking};
+use core_rs::ipc::protocol::{LeaseKind, LeaseOwnerType};
 
 /// Best-effort cleanup for an instance row inserted before a later step failed.
 ///
@@ -24,7 +25,10 @@ pub async fn rollback_inserted_instance(
         };
 
         // Release leases first (best-effort)
-        if let Err(e) = st.instance_db.release_all_leases("instance", &iid) {
+        if let Err(e) = st
+            .instance_db
+            .release_all_leases(LeaseOwnerType::Instance.as_str(), &iid)
+        {
             tracing::warn!(
                 "[create-instance] failed to release leases for {iid} during rollback: {e}"
             );
@@ -33,9 +37,9 @@ pub async fn rollback_inserted_instance(
         if restore_warm_pool_lease {
             if let Some(row) = row.as_ref() {
                 if let Err(e) = st.instance_db.create_lease(&store_rs::NewLease {
-                    owner_type: "warm_pool",
+                    owner_type: LeaseOwnerType::WarmPool.as_str(),
                     owner_id: &format!("{}:slot:0", row.claw_type),
-                    lease_kind: "runtime",
+                    lease_kind: LeaseKind::Runtime.as_str(),
                     cpu_cores: row.cpu_cores.unwrap_or(crate::capacity::SLOT_CPU),
                     ram_mb: row.ram_config_mb.unwrap_or(crate::capacity::SLOT_RAM),
                     disk_gb: 0,

@@ -6,6 +6,7 @@
 
 use std::path::Path;
 
+use core_rs::ipc::protocol::{LeaseKind, LeaseOwnerType};
 use store_rs::{InstanceDb, InstanceStatus, NewLease, StatusUpdate, StoreError};
 use vmrunner_rs::SweepReport;
 
@@ -35,7 +36,11 @@ pub fn reconcile_after_sweep(db: &InstanceDb, state_dir: &Path, report: &SweepRe
                     tracing::warn!("[reconcile] failed to update {container}: {e}");
                 } else {
                     // Release runtime lease — VM is dead, CPU/RAM are free
-                    if let Err(e) = db.release_lease("instance", &row.id, "runtime") {
+                    if let Err(e) = db.release_lease(
+                        LeaseOwnerType::Instance.as_str(),
+                        &row.id,
+                        LeaseKind::Runtime.as_str(),
+                    ) {
                         tracing::warn!(
                             "[reconcile] failed to release runtime lease for {container}: {e}"
                         );
@@ -80,7 +85,11 @@ pub fn reconcile_after_sweep(db: &InstanceDb, state_dir: &Path, report: &SweepRe
                         tracing::warn!("[reconcile] failed to update {}: {e}", row.container);
                     } else {
                         // Release runtime lease — VM is dead, CPU/RAM are free
-                        if let Err(e) = db.release_lease("instance", &row.id, "runtime") {
+                        if let Err(e) = db.release_lease(
+                            LeaseOwnerType::Instance.as_str(),
+                            &row.id,
+                            LeaseKind::Runtime.as_str(),
+                        ) {
                             tracing::warn!(
                                 "[reconcile] failed to release runtime lease for {}: {e}",
                                 row.container
@@ -120,14 +129,18 @@ pub fn ensure_restarted_runtime_lease(
     cpu_cores: i64,
     ram_mb: i64,
 ) -> Result<bool, StoreError> {
-    if db.has_active_lease("instance", instance_id, "runtime")? {
+    if db.has_active_lease(
+        LeaseOwnerType::Instance.as_str(),
+        instance_id,
+        LeaseKind::Runtime.as_str(),
+    )? {
         return Ok(false);
     }
 
     db.create_lease(&NewLease {
-        owner_type: "instance",
+        owner_type: LeaseOwnerType::Instance.as_str(),
         owner_id: instance_id,
-        lease_kind: "runtime",
+        lease_kind: LeaseKind::Runtime.as_str(),
         cpu_cores,
         ram_mb,
         disk_gb: 0,
