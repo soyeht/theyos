@@ -152,14 +152,6 @@ fn execute_delete_steps(exec: &Executor, req: &ExecuteFlowRequest, steps: &[serd
                     tracing::warn!("[executor] soft delete instance row: {e}");
                 }
             }
-            "remove_from_store" => {
-                if let Err(e) = exec.store.call(
-                    "ApplyAction",
-                    json!({"id": req.instance_id, "action": "delete"}),
-                ) {
-                    tracing::warn!("[executor] remove from store: {e}");
-                }
-            }
             "remove_container" => {
                 let container = params["container"].as_str().unwrap_or("");
                 if let Err(e) = exec
