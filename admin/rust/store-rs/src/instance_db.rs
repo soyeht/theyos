@@ -273,6 +273,67 @@ pub struct ResourceLease {
     pub released_at: Option<i64>,
 }
 
+/// Canonical identity of a claw type's single warm-pool slot — the `owner_id`
+/// of its warm-pool lease.
+///
+/// Wire format (unchanged): `"{claw_type}:slot:0"`. Centralizing it keeps every
+/// warm-pool lease producer byte-identical and removes the scattered
+/// `format!("{claw_type}:slot:0")` duplication across store-rs and server-rs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WarmPoolSlotId<'a> {
+    claw_type: &'a str,
+}
+
+impl<'a> WarmPoolSlotId<'a> {
+    /// The single warm-pool slot (index 0) for `claw_type`.
+    #[must_use]
+    pub fn new(claw_type: &'a str) -> Self {
+        Self { claw_type }
+    }
+
+    /// The warm-pool lease `owner_id`: `"{claw_type}:slot:0"`.
+    #[must_use]
+    pub fn owner_id(&self) -> String {
+        self.to_string()
+    }
+}
+
+impl std::fmt::Display for WarmPoolSlotId<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}:slot:0", self.claw_type)
+    }
+}
+
+#[cfg(test)]
+mod warm_pool_slot_id_tests {
+    use super::WarmPoolSlotId;
+
+    #[test]
+    fn owner_id_is_byte_identical_to_legacy_inline_format() {
+        // For every claw_type the helper must emit exactly the old
+        // `format!("{claw_type}:slot:0")` string the producers built inline.
+        for ct in [
+            "picoclaw",
+            "microclaw",
+            "claude-claw",
+            "mac-host",
+            "a",
+            "x-y-z",
+            "claw_underscore",
+            "",
+        ] {
+            let legacy = format!("{ct}:slot:0");
+            assert_eq!(WarmPoolSlotId::new(ct).owner_id(), legacy);
+            assert_eq!(WarmPoolSlotId::new(ct).to_string(), legacy);
+        }
+        // Pin the exact literal used by the hand-written test fixtures.
+        assert_eq!(
+            WarmPoolSlotId::new("picoclaw").owner_id(),
+            "picoclaw:slot:0"
+        );
+    }
+}
+
 /// Parameters for creating a new resource lease.
 pub struct NewLease<'a> {
     pub owner_type: &'a str,
@@ -3106,7 +3167,7 @@ impl InstanceDb {
         let runtime_lease_id = core_rs::id::generate_id("lease");
         let storage_lease_id = core_rs::id::generate_id("lease");
         let expires_at = now + ttl_secs;
-        let warm_owner_id = format!("{}:slot:0", inst.claw_type);
+        let warm_owner_id = WarmPoolSlotId::new(inst.claw_type).owner_id();
 
         let tx = conn
             .unchecked_transaction()
@@ -3214,7 +3275,7 @@ impl InstanceDb {
     ) -> Result<bool, StoreError> {
         let conn = self.conn()?;
         let now = now_unix();
-        let warm_owner_id = format!("{claw_type}:slot:0");
+        let warm_owner_id = WarmPoolSlotId::new(claw_type).owner_id();
         let new_lease_id = core_rs::id::generate_id("lease");
 
         let tx = conn

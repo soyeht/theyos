@@ -11,6 +11,7 @@
 use core_rs::ipc::protocol::{LeaseKind, LeaseOwnerType};
 use std::collections::HashMap;
 use std::time::Duration;
+use store_rs::WarmPoolSlotId;
 
 use crate::capacity::{
     SLOT_CPU, SLOT_RAM, SlotState, compute_capacity_projection, warm_pool_slot_states,
@@ -108,7 +109,7 @@ pub fn start_warm_pool_reconciler(state: SharedState) -> tokio::task::JoinHandle
                         // This ensures capacity is reserved even if the refill takes time.
                         if let Err(e) = state.instance_db.create_lease(&store_rs::NewLease {
                             owner_type: LeaseOwnerType::WarmPool.as_str(),
-                            owner_id: &format!("{ct}:slot:0"),
+                            owner_id: &WarmPoolSlotId::new(ct).owner_id(),
                             lease_kind: LeaseKind::Runtime.as_str(),
                             cpu_cores: SLOT_CPU,
                             ram_mb: SLOT_RAM,
@@ -132,7 +133,7 @@ pub fn start_warm_pool_reconciler(state: SharedState) -> tokio::task::JoinHandle
                                 // Refill failed — release the lease we just created.
                                 if let Err(e2) = state.instance_db.release_lease(
                                     LeaseOwnerType::WarmPool.as_str(),
-                                    &format!("{ct}:slot:0"),
+                                    &WarmPoolSlotId::new(ct).owner_id(),
                                     LeaseKind::Runtime.as_str(),
                                 ) {
                                     tracing::warn!(
@@ -215,7 +216,7 @@ pub fn decide_refill_targets(input: &RefillDecisionInput<'_>) -> Vec<String> {
                 .instance_db
                 .has_active_lease(
                     LeaseOwnerType::WarmPool.as_str(),
-                    &format!("{ct}:slot:0"),
+                    &WarmPoolSlotId::new(ct).owner_id(),
                     LeaseKind::Runtime.as_str(),
                 )
                 .unwrap_or(true)

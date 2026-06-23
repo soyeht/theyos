@@ -1,6 +1,7 @@
 use crate::state::SharedState;
 use core_rs::error::{ApiError, blocking};
 use core_rs::ipc::protocol::{LeaseKind, LeaseOwnerType};
+use store_rs::WarmPoolSlotId;
 
 /// Best-effort cleanup for an instance row inserted before a later step failed.
 ///
@@ -38,7 +39,7 @@ pub async fn rollback_inserted_instance(
             if let Some(row) = row.as_ref() {
                 if let Err(e) = st.instance_db.create_lease(&store_rs::NewLease {
                     owner_type: LeaseOwnerType::WarmPool.as_str(),
-                    owner_id: &format!("{}:slot:0", row.claw_type),
+                    owner_id: &WarmPoolSlotId::new(&row.claw_type).owner_id(),
                     lease_kind: LeaseKind::Runtime.as_str(),
                     cpu_cores: row.cpu_cores.unwrap_or(crate::capacity::SLOT_CPU),
                     ram_mb: row.ram_config_mb.unwrap_or(crate::capacity::SLOT_RAM),

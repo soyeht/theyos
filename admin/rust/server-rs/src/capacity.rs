@@ -8,7 +8,7 @@
 
 use core_rs::host_resources::HostResources;
 use core_rs::ipc::protocol::{LeaseKind, LeaseOwnerType};
-use store_rs::InstanceDb;
+use store_rs::{InstanceDb, WarmPoolSlotId};
 use vmrunner_common_rs::{DEFAULT_CREATE_CPU_CORES, DEFAULT_CREATE_RAM_MB, WarmPoolStatusWire};
 
 use crate::state::SharedState;
@@ -88,7 +88,7 @@ pub fn request_matches_warm_pool_lease(
             && db
                 .has_active_lease(
                     LeaseOwnerType::WarmPool.as_str(),
-                    &format!("{ct}:slot:0"),
+                    &WarmPoolSlotId::new(ct).owner_id(),
                     LeaseKind::Runtime.as_str(),
                 )
                 .unwrap_or(false)
