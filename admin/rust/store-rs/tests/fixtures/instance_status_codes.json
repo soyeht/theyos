@@ -1,0 +1,9 @@
+{
+  "_comment": "Cross-language contract for the instance lifecycle status wire string (the `status` field of instance responses). theyos store-rs `InstanceStatus` is the source of truth; these are exactly the values it EMITS via `InstanceStatus::as_str()`. soyeht-ios vendors this file VERBATIM and mirrors it as a fail-soft Swift `InstanceStatus` enum. The legacy receive-only alias `error` (`FromStr` accepts it as `Failed`) is deliberately NOT a contract wire and is covered by a separate receive-compat test.",
+  "statuses": [
+    { "wire": "provisioning" },
+    { "wire": "active" },
+    { "wire": "stopped" },
+    { "wire": "failed" }
+  ]
+}
