@@ -5,6 +5,8 @@
 //! artifact resolution/download/install work never blocks instance
 //! create/delete/restart operations.
 
+use core_rs::ipc::protocol::{LeaseKind, LeaseOwnerType};
+
 use crate::state::SharedState;
 #[cfg(not(target_os = "macos"))]
 use std::path::Path;
@@ -556,10 +558,11 @@ async fn run_uninstall_claw(state: &SharedState, job: &jobs_rs::Job) -> Result<(
     }
 
     // Step 4: Release warm pool lease (if one exists for this claw type)
-    match state
-        .instance_db
-        .release_lease("warm_pool", &format!("{claw_name}:slot:0"), "runtime")
-    {
+    match state.instance_db.release_lease(
+        LeaseOwnerType::WarmPool.as_str(),
+        &format!("{claw_name}:slot:0"),
+        LeaseKind::Runtime.as_str(),
+    ) {
         Ok(true) => info!("[install-worker] {claw_name}: released warm pool lease"),
         Ok(false) => {} // no active lease — nothing to release
         Err(e) => warn!("[install-worker] {claw_name}: release warm pool lease failed: {e}"),
@@ -660,10 +663,11 @@ async fn run_uninstall_claw_macos(state: &SharedState, job: &jobs_rs::Job) -> Re
     }
 
     // Release warm pool lease (if one exists for this claw type)
-    match state
-        .instance_db
-        .release_lease("warm_pool", &format!("{claw_name}:slot:0"), "runtime")
-    {
+    match state.instance_db.release_lease(
+        LeaseOwnerType::WarmPool.as_str(),
+        &format!("{claw_name}:slot:0"),
+        LeaseKind::Runtime.as_str(),
+    ) {
         Ok(true) => info!("[install-worker] {claw_name}: released warm pool lease"),
         Ok(false) => {} // no active lease — nothing to release
         Err(e) => warn!("[install-worker] {claw_name}: release warm pool lease failed: {e}"),

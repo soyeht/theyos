@@ -8,6 +8,7 @@
 //! resources, decide which empty slots to fill within CPU/RAM budget,
 //! then dispatch refills. Skips cycles while maintenance mode is active.
 
+use core_rs::ipc::protocol::{LeaseKind, LeaseOwnerType};
 use std::collections::HashMap;
 use std::time::Duration;
 
@@ -106,9 +107,9 @@ pub fn start_warm_pool_reconciler(state: SharedState) -> tokio::task::JoinHandle
                         // Create warm pool lease BEFORE dispatching the refill.
                         // This ensures capacity is reserved even if the refill takes time.
                         if let Err(e) = state.instance_db.create_lease(&store_rs::NewLease {
-                            owner_type: "warm_pool",
+                            owner_type: LeaseOwnerType::WarmPool.as_str(),
                             owner_id: &format!("{ct}:slot:0"),
-                            lease_kind: "runtime",
+                            lease_kind: LeaseKind::Runtime.as_str(),
                             cpu_cores: SLOT_CPU,
                             ram_mb: SLOT_RAM,
                             disk_gb: 0,
@@ -130,9 +131,9 @@ pub fn start_warm_pool_reconciler(state: SharedState) -> tokio::task::JoinHandle
                                 );
                                 // Refill failed — release the lease we just created.
                                 if let Err(e2) = state.instance_db.release_lease(
-                                    "warm_pool",
+                                    LeaseOwnerType::WarmPool.as_str(),
                                     &format!("{ct}:slot:0"),
-                                    "runtime",
+                                    LeaseKind::Runtime.as_str(),
                                 ) {
                                     tracing::warn!(
                                         "[warm-pool-reconciler] release failed lease for {ct}: {e2}"
@@ -165,9 +166,11 @@ fn release_orphaned_warm_pool_leases(state: &SharedState, installed_claws: &[Str
     for owner_id in owners {
         if let Some(ct) = owner_id.split(':').next() {
             if !installed_claws.iter().any(|ic| ic == ct) {
-                let _ = state
-                    .instance_db
-                    .release_lease("warm_pool", &owner_id, "runtime");
+                let _ = state.instance_db.release_lease(
+                    LeaseOwnerType::WarmPool.as_str(),
+                    &owner_id,
+                    LeaseKind::Runtime.as_str(),
+                );
                 tracing::info!("[warm-pool-reconciler] released orphaned lease: {owner_id}");
             }
         }
@@ -210,7 +213,11 @@ pub fn decide_refill_targets(input: &RefillDecisionInput<'_>) -> Vec<String> {
             // previous cycle if the slot was drained but lease wasn't released).
             !input
                 .instance_db
-                .has_active_lease("warm_pool", &format!("{ct}:slot:0"), "runtime")
+                .has_active_lease(
+                    LeaseOwnerType::WarmPool.as_str(),
+                    &format!("{ct}:slot:0"),
+                    LeaseKind::Runtime.as_str(),
+                )
                 .unwrap_or(true)
         })
         .collect();

@@ -7,6 +7,7 @@
 //! Host detection I/O must happen BEFORE acquiring the lock.
 
 use core_rs::host_resources::HostResources;
+use core_rs::ipc::protocol::{LeaseKind, LeaseOwnerType};
 use store_rs::InstanceDb;
 use vmrunner_common_rs::{DEFAULT_CREATE_CPU_CORES, DEFAULT_CREATE_RAM_MB, WarmPoolStatusWire};
 
@@ -85,7 +86,11 @@ pub fn request_matches_warm_pool_lease(
         i64::from(cpu_cores) == SLOT_CPU
             && i64::from(ram_mb) == SLOT_RAM
             && db
-                .has_active_lease("warm_pool", &format!("{ct}:slot:0"), "runtime")
+                .has_active_lease(
+                    LeaseOwnerType::WarmPool.as_str(),
+                    &format!("{ct}:slot:0"),
+                    LeaseKind::Runtime.as_str(),
+                )
                 .unwrap_or(false)
     })
 }
