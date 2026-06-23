@@ -8,6 +8,7 @@
 //! Runs every 60 seconds. Complementary to the startup reconcile (which handles
 //! crash recovery for active instances).
 
+use core_rs::ipc::protocol::{LeaseKind, LeaseOwnerType};
 use std::time::Duration;
 
 use crate::state::SharedState;
@@ -55,7 +56,7 @@ pub fn reap_expired_leases_once(state: &SharedState) -> u32 {
         let instance_id = &lease.owner_id;
 
         // Only reap instance leases (warm pool leases are handled by warm pool reconcile)
-        if lease.owner_type != "instance" {
+        if lease.owner_type != LeaseOwnerType::Instance.as_str() {
             continue;
         }
 
@@ -112,7 +113,7 @@ pub fn reap_expired_leases_once(state: &SharedState) -> u32 {
         if release_all {
             match state
                 .instance_db
-                .release_all_leases("instance", instance_id)
+                .release_all_leases(LeaseOwnerType::Instance.as_str(), instance_id)
             {
                 Ok(n) => {
                     tracing::info!("[lease-reaper] released {n} lease(s) for {instance_id}");
@@ -123,10 +124,11 @@ pub fn reap_expired_leases_once(state: &SharedState) -> u32 {
                     );
                 }
             }
-        } else if let Err(e) = state
-            .instance_db
-            .release_lease("instance", instance_id, "runtime")
-        {
+        } else if let Err(e) = state.instance_db.release_lease(
+            LeaseOwnerType::Instance.as_str(),
+            instance_id,
+            LeaseKind::Runtime.as_str(),
+        ) {
             tracing::warn!("[lease-reaper] failed to release runtime lease for {instance_id}: {e}");
         }
 
