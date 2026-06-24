@@ -1,14 +1,14 @@
 //! Household-endpoint listener.
 //!
-//! Binds a fresh axum router to:
-//! - `127.0.0.1` and `::1` (always),
-//! - every active LAN-class private address (`192.168/16`, `10/8`,
-//!   `172.16/12`, IPv6 ULA), excluding link-local `169.254/16` / `fe80::/10`,
-//! - every Tailscale address (`100.64.0.0/10` /
-//!   `fd7a:115c:a1e0::/48`). Interface names are not trusted.
+//! Binds a fresh axum router to concrete loopback / LAN / Tailnet addresses,
+//! then narrows the live set by [`HouseholdExposurePolicy`]:
+//! - onboarding (`uninitialized`, `ready_for_naming`) allows loopback + LAN +
+//!   Tailnet so first-launch setup can work on the local network;
+//! - post-onboarding (`named_awaiting_pair`, `ready`, `recovering`) allows only
+//!   loopback + Tailnet so the Ready control plane is not exposed over LAN HTTP.
 //!
 //! Refuses wildcard `0.0.0.0` / `::` per FR-008. Refreshes the active address
-//! set every 60 s.
+//! set every 60 s and reconciles state-policy changes every 500 ms.
 
 use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
@@ -16,9 +16,13 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use axum::Router;
+use household_rs::bootstrap_state::BootstrapState;
 use tokio::net::TcpListener;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, RwLock, oneshot};
 use tracing::{info, warn};
+
+const INTERFACE_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
+const POLICY_SYNC_INTERVAL: Duration = Duration::from_millis(500);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum InterfaceClass {
@@ -35,6 +39,41 @@ impl InterfaceClass {
             Self::Lan => "lan",
             Self::Tailscale => "tailscale",
         }
+    }
+}
+
+/// Pure transport exposure policy for household listener and Bonjour surfaces.
+///
+/// This is intentionally independent from interface names and socket binding:
+/// callers provide already-classified targets, and the policy only decides which
+/// classes are allowed for the current bootstrap state.
+pub struct HouseholdExposurePolicy;
+
+impl HouseholdExposurePolicy {
+    #[must_use]
+    pub fn allows(state: BootstrapState, class: InterfaceClass) -> bool {
+        match state {
+            BootstrapState::Uninitialized | BootstrapState::ReadyForNaming => matches!(
+                class,
+                InterfaceClass::Loopback | InterfaceClass::Lan | InterfaceClass::Tailscale
+            ),
+            BootstrapState::NamedAwaitingPair
+            | BootstrapState::Ready
+            | BootstrapState::Recovering => {
+                matches!(class, InterfaceClass::Loopback | InterfaceClass::Tailscale)
+            }
+        }
+    }
+
+    #[must_use]
+    pub fn allowed_targets(
+        state: BootstrapState,
+        targets: impl IntoIterator<Item = (IpAddr, InterfaceClass)>,
+    ) -> Vec<(IpAddr, InterfaceClass)> {
+        targets
+            .into_iter()
+            .filter(|(_, class)| Self::allows(state, *class))
+            .collect()
     }
 }
 
@@ -88,9 +127,14 @@ async fn bind_concrete(addr: SocketAddr) -> Result<TcpListener, std::io::Error> 
 /// bound addresses is exposed via a clone-able handle so the Bonjour
 /// publisher can advertise exactly the addresses a peer can actually
 /// reach.
+struct BoundTarget {
+    class: InterfaceClass,
+    shutdown: oneshot::Sender<()>,
+}
+
 #[derive(Clone, Default)]
 pub struct BoundSet {
-    inner: Arc<Mutex<HashMap<IpAddr, InterfaceClass>>>,
+    inner: Arc<Mutex<HashMap<IpAddr, BoundTarget>>>,
 }
 
 impl BoundSet {
@@ -106,7 +150,7 @@ impl BoundSet {
             .lock()
             .await
             .iter()
-            .map(|(ip, class)| (*ip, *class))
+            .map(|(ip, target)| (*ip, target.class))
             .collect()
     }
 
@@ -114,12 +158,138 @@ impl BoundSet {
         self.inner.lock().await.contains_key(&ip)
     }
 
-    async fn insert(&self, ip: IpAddr, class: InterfaceClass) {
-        self.inner.lock().await.insert(ip, class);
+    async fn insert(&self, ip: IpAddr, class: InterfaceClass, shutdown: oneshot::Sender<()>) {
+        self.inner
+            .lock()
+            .await
+            .insert(ip, BoundTarget { class, shutdown });
     }
 
-    async fn remove(&self, ip: IpAddr) {
-        self.inner.lock().await.remove(&ip);
+    async fn remove(&self, ip: IpAddr) -> Option<BoundTarget> {
+        self.inner.lock().await.remove(&ip)
+    }
+}
+
+fn spawn_listener_task(
+    router: Router,
+    listener: TcpListener,
+    addr: SocketAddr,
+    shutdown_rx: oneshot::Receiver<()>,
+) {
+    tokio::spawn(async move {
+        let shutdown = async move {
+            let _ = shutdown_rx.await;
+        };
+        if let Err(e) = axum::serve(
+            listener,
+            router.into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .with_graceful_shutdown(shutdown)
+        .await
+        {
+            warn!(
+                stage = "household_listener.serve_failed",
+                address = %addr,
+                error = %e,
+            );
+        }
+    });
+}
+
+async fn bind_allowed_target(
+    router: &Router,
+    port: u16,
+    bound: &BoundSet,
+    ip: IpAddr,
+    class: InterfaceClass,
+    source: &'static str,
+) -> Option<(IpAddr, InterfaceClass)> {
+    let addr = SocketAddr::new(ip, port);
+    match bind_concrete(addr).await {
+        Ok(listener) => {
+            info!(
+                stage = "bootstrap.endpoint.live",
+                address = %addr,
+                interface_class = class.as_str(),
+                result = "ok",
+                source,
+            );
+            let (shutdown_tx, shutdown_rx) = oneshot::channel();
+            bound.insert(ip, class, shutdown_tx).await;
+            spawn_listener_task(router.clone(), listener, addr, shutdown_rx);
+            Some((ip, class))
+        }
+        Err(e) => {
+            warn!(
+                stage = "bootstrap.endpoint.bind_failed",
+                address = %addr,
+                interface_class = class.as_str(),
+                error = %e,
+                source,
+            );
+            None
+        }
+    }
+}
+
+async fn shutdown_bound_target(bound: &BoundSet, ip: IpAddr, reason: &'static str) {
+    if let Some(target) = bound.remove(ip).await {
+        let class = target.class;
+        let _ = target.shutdown.send(());
+        info!(
+            stage = "household_listener.address_removed",
+            address = %ip,
+            interface_class = class.as_str(),
+            reason,
+        );
+    }
+}
+
+async fn bootstrap_state(bootstrap: &Arc<RwLock<BootstrapState>>) -> BootstrapState {
+    *bootstrap.read().await
+}
+
+async fn sync_interface_targets(
+    router: &Router,
+    port: u16,
+    bootstrap: &Arc<RwLock<BootstrapState>>,
+    bound: &BoundSet,
+    source: &'static str,
+) -> Vec<(IpAddr, InterfaceClass)> {
+    let state = bootstrap_state(bootstrap).await;
+    let live = HouseholdExposurePolicy::allowed_targets(state, enumerate_bind_targets());
+    let live_set: HashSet<IpAddr> = live.iter().map(|(ip, _)| *ip).collect();
+
+    for (ip, class) in &live {
+        if bound.contains(*ip).await {
+            continue;
+        }
+        let _ = bind_allowed_target(router, port, bound, *ip, *class, source).await;
+    }
+
+    let stale: Vec<IpAddr> = bound
+        .snapshot()
+        .await
+        .into_iter()
+        .filter(|ip| !live_set.contains(ip))
+        .collect();
+    for ip in stale {
+        shutdown_bound_target(bound, ip, "interface_or_policy_removed").await;
+    }
+
+    bound.snapshot_targets().await
+}
+
+async fn sync_exposure_policy(bootstrap: &Arc<RwLock<BootstrapState>>, bound: &BoundSet) {
+    let state = bootstrap_state(bootstrap).await;
+    let disallowed: Vec<IpAddr> = bound
+        .snapshot_targets()
+        .await
+        .into_iter()
+        .filter_map(|(ip, class)| (!HouseholdExposurePolicy::allows(state, class)).then_some(ip))
+        .collect();
+    for ip in disallowed {
+        shutdown_bound_target(bound, ip, "bootstrap_state_policy").await;
     }
 }
 
@@ -129,49 +299,10 @@ impl BoundSet {
 pub async fn spawn_household_listeners(
     router: Router,
     port: u16,
+    bootstrap: Arc<RwLock<BootstrapState>>,
     bound: &BoundSet,
 ) -> Vec<(IpAddr, InterfaceClass)> {
-    let targets = enumerate_bind_targets();
-    let mut bound_targets = Vec::new();
-    for (ip, class) in targets {
-        let addr = SocketAddr::new(ip, port);
-        match bind_concrete(addr).await {
-            Ok(listener) => {
-                info!(
-                    stage = "bootstrap.endpoint.live",
-                    address = %addr,
-                    interface_class = class.as_str(),
-                    result = "ok",
-                );
-                bound.insert(ip, class).await;
-                bound_targets.push((ip, class));
-                let app = router.clone();
-                tokio::spawn(async move {
-                    if let Err(e) = axum::serve(
-                        listener,
-                        app.into_make_service_with_connect_info::<SocketAddr>(),
-                    )
-                    .await
-                    {
-                        warn!(
-                            stage = "household_listener.serve_failed",
-                            address = %addr,
-                            error = %e,
-                        );
-                    }
-                });
-            }
-            Err(e) => {
-                warn!(
-                    stage = "bootstrap.endpoint.bind_failed",
-                    address = %addr,
-                    interface_class = class.as_str(),
-                    error = %e,
-                );
-            }
-        }
-    }
-    bound_targets
+    sync_interface_targets(&router, port, &bootstrap, bound, "startup").await
 }
 
 /// Periodic refresh task — every 60 s re-enumerates the local interfaces
@@ -179,78 +310,29 @@ pub async fn spawn_household_listeners(
 /// interface coming up after boot, Wi-Fi reconnect). Removed addresses are
 /// dropped from the bound set so the Bonjour publisher stops advertising
 /// them on the next state event.
-pub async fn refresh_loop(router: Router, port: u16, bound: BoundSet) {
-    let mut interval = tokio::time::interval(Duration::from_secs(60));
-    interval.tick().await; // skip the immediate first tick
+pub async fn refresh_loop(
+    router: Router,
+    port: u16,
+    bootstrap: Arc<RwLock<BootstrapState>>,
+    bound: BoundSet,
+) {
+    let mut refresh = tokio::time::interval(INTERFACE_REFRESH_INTERVAL);
+    refresh.tick().await; // skip the immediate first tick
+    let mut policy_sync = tokio::time::interval(POLICY_SYNC_INTERVAL);
+    policy_sync.tick().await; // skip the immediate first tick
     loop {
-        interval.tick().await;
-        let live = enumerate_bind_targets();
-        let live_set: HashSet<IpAddr> = live.iter().map(|(ip, _)| *ip).collect();
-
-        // Bind newly available addresses.
-        for (ip, class) in &live {
-            if bound.contains(*ip).await {
-                continue;
+        tokio::select! {
+            _ = refresh.tick() => {
+                let live = sync_interface_targets(&router, port, &bootstrap, &bound, "refresh").await;
+                info!(
+                    stage = "household_listener.refresh",
+                    target_count = live.len(),
+                );
             }
-            let addr = SocketAddr::new(*ip, port);
-            match bind_concrete(addr).await {
-                Ok(listener) => {
-                    info!(
-                        stage = "bootstrap.endpoint.live",
-                        address = %addr,
-                        interface_class = class.as_str(),
-                        result = "ok",
-                        source = "refresh",
-                    );
-                    bound.insert(*ip, *class).await;
-                    let app = router.clone();
-                    tokio::spawn(async move {
-                        if let Err(e) = axum::serve(
-                            listener,
-                            app.into_make_service_with_connect_info::<SocketAddr>(),
-                        )
-                        .await
-                        {
-                            warn!(
-                                stage = "household_listener.serve_failed",
-                                address = %addr,
-                                error = %e,
-                            );
-                        }
-                    });
-                }
-                Err(e) => warn!(
-                    stage = "bootstrap.endpoint.bind_failed",
-                    address = %addr,
-                    interface_class = class.as_str(),
-                    error = %e,
-                    source = "refresh",
-                ),
+            _ = policy_sync.tick() => {
+                sync_exposure_policy(&bootstrap, &bound).await;
             }
         }
-
-        // Drop addresses that disappeared. The axum::serve task associated
-        // with the gone address will fail on its own once the underlying
-        // socket closes; we only update the bookkeeping so Bonjour stops
-        // advertising it on the next TXT event.
-        let stale: Vec<IpAddr> = bound
-            .snapshot()
-            .await
-            .into_iter()
-            .filter(|ip| !live_set.contains(ip))
-            .collect();
-        for ip in stale {
-            bound.remove(ip).await;
-            info!(
-                stage = "household_listener.address_removed",
-                address = %ip,
-            );
-        }
-
-        info!(
-            stage = "household_listener.refresh",
-            target_count = live.len(),
-        );
     }
 }
 
@@ -340,12 +422,116 @@ mod tests {
         let bound = BoundSet::default();
         let ip: IpAddr = "100.64.1.2".parse().unwrap();
 
-        bound.insert(ip, InterfaceClass::Tailscale).await;
+        let (shutdown, _rx) = oneshot::channel();
+        bound.insert(ip, InterfaceClass::Tailscale, shutdown).await;
 
         assert_eq!(bound.snapshot().await, vec![ip]);
         assert_eq!(
             bound.snapshot_targets().await,
             vec![(ip, InterfaceClass::Tailscale)]
+        );
+    }
+
+    #[test]
+    fn exposure_policy_onboarding_keeps_lan() {
+        assert!(HouseholdExposurePolicy::allows(
+            BootstrapState::Uninitialized,
+            InterfaceClass::Lan
+        ));
+        assert!(HouseholdExposurePolicy::allows(
+            BootstrapState::ReadyForNaming,
+            InterfaceClass::Lan
+        ));
+    }
+
+    #[test]
+    fn exposure_policy_ready_excludes_lan_and_keeps_loopback_tailnet() {
+        let targets = vec![
+            (IpAddr::V4(Ipv4Addr::LOCALHOST), InterfaceClass::Loopback),
+            ("192.0.2.10".parse().unwrap(), InterfaceClass::Lan),
+            ("100.64.0.10".parse().unwrap(), InterfaceClass::Tailscale),
+        ];
+
+        let allowed = HouseholdExposurePolicy::allowed_targets(BootstrapState::Ready, targets);
+        assert_eq!(
+            allowed,
+            vec![
+                (IpAddr::V4(Ipv4Addr::LOCALHOST), InterfaceClass::Loopback),
+                ("100.64.0.10".parse().unwrap(), InterfaceClass::Tailscale),
+            ]
+        );
+    }
+
+    #[test]
+    fn exposure_policy_transitional_states_exclude_lan() {
+        for state in [
+            BootstrapState::NamedAwaitingPair,
+            BootstrapState::Recovering,
+        ] {
+            assert!(!HouseholdExposurePolicy::allows(state, InterfaceClass::Lan));
+            assert!(HouseholdExposurePolicy::allows(
+                state,
+                InterfaceClass::Loopback
+            ));
+            assert!(HouseholdExposurePolicy::allows(
+                state,
+                InterfaceClass::Tailscale
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn exposure_policy_sync_shutdowns_disallowed_lan_listener() {
+        let bound = BoundSet::default();
+        let lan_ip: IpAddr = "192.0.2.10".parse().unwrap();
+        let tailnet_ip: IpAddr = "100.64.0.10".parse().unwrap();
+        let (lan_shutdown, lan_rx) = oneshot::channel();
+        let (tailnet_shutdown, _tailnet_rx) = oneshot::channel();
+        bound
+            .insert(lan_ip, InterfaceClass::Lan, lan_shutdown)
+            .await;
+        bound
+            .insert(tailnet_ip, InterfaceClass::Tailscale, tailnet_shutdown)
+            .await;
+
+        let bootstrap = Arc::new(RwLock::new(BootstrapState::Ready));
+        sync_exposure_policy(&bootstrap, &bound).await;
+
+        assert_eq!(
+            bound.snapshot_targets().await,
+            vec![(tailnet_ip, InterfaceClass::Tailscale)]
+        );
+        tokio::time::timeout(Duration::from_secs(1), lan_rx)
+            .await
+            .expect("LAN listener shutdown signal should be sent")
+            .expect("LAN listener shutdown sender should not be dropped before send");
+    }
+
+    #[test]
+    fn listener_entry_points_route_enumeration_through_policy() {
+        let source = include_str!("household_listener.rs");
+        let sync_start = source
+            .find("async fn sync_interface_targets")
+            .expect("sync_interface_targets not found");
+        let sync_end = source[sync_start..]
+            .find("\nasync fn sync_exposure_policy")
+            .map_or(source.len(), |offset| sync_start + offset);
+        let sync_body = &source[sync_start..sync_end];
+        assert!(
+            sync_body.contains("HouseholdExposurePolicy::allowed_targets"),
+            "sync_interface_targets must filter enumerated bind targets through HouseholdExposurePolicy"
+        );
+
+        let spawn_start = source
+            .find("pub async fn spawn_household_listeners")
+            .expect("spawn_household_listeners not found");
+        let spawn_end = source[spawn_start..]
+            .find("\n/// Periodic refresh task")
+            .map_or(source.len(), |offset| spawn_start + offset);
+        let spawn_body = &source[spawn_start..spawn_end];
+        assert!(
+            spawn_body.contains("sync_interface_targets"),
+            "spawn_household_listeners must route initial binds through the policy-aware sync helper"
         );
     }
 }

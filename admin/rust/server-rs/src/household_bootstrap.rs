@@ -7,8 +7,8 @@
 //!   (or stay cold until `theyos install` runs).
 //! - [`PairDeviceWindow`](household_rs::pair_device::PairDeviceWindow) — single-use
 //!   pair-receiving state machine, persisted as `pair_device_window.cbor`.
-//! - Listener interface enumeration (loopback + LAN + Tailscale) and the
-//!   60s refresh loop (FR-008).
+//! - Listener interface enumeration (loopback + LAN + Tailscale), narrowed by
+//!   `HouseholdExposurePolicy`, and the 60s refresh loop (FR-008).
 //! - Bonjour publisher (FR-017) — only announces once identity is loaded.
 
 use crate::bonjour_trust::BrowserConfig;
@@ -647,9 +647,13 @@ pub async fn bootstrap_household(shared_state: Option<SharedState>) {
     }
 
     let bound_set = household_listener::BoundSet::default();
-    let initial_bound =
-        household_listener::spawn_household_listeners(household_router.clone(), port, &bound_set)
-            .await;
+    let initial_bound = household_listener::spawn_household_listeners(
+        household_router.clone(),
+        port,
+        Arc::clone(&bootstrap_state_arc),
+        &bound_set,
+    )
+    .await;
     info!(
         stage = "bootstrap.endpoint.live",
         bound_count = initial_bound.len(),
@@ -668,8 +672,9 @@ pub async fn bootstrap_household(shared_state: Option<SharedState>) {
     {
         let router = household_router;
         let bound = bound_set.clone();
+        let bootstrap = Arc::clone(&bootstrap_state_arc);
         tokio::spawn(async move {
-            household_listener::refresh_loop(router, port, bound).await;
+            household_listener::refresh_loop(router, port, bootstrap, bound).await;
         });
     }
 
@@ -763,12 +768,13 @@ async fn publish_household_bonjour_for_identity(
     let raw_hostname = gethostname::gethostname().to_string_lossy().into_owned();
     let host_label = raw_hostname.replace(['.', ' '], "-");
     // Read current bootstrap state for the TXT enrichment field.
-    let bs_str = global_bootstrap_state()
+    let bootstrap_state = global_bootstrap_state()
         .map(|arc| {
             let val = *arc.try_read().unwrap_or_else(|_| arc.blocking_read());
-            val.as_str().to_string()
+            val
         })
-        .unwrap_or_default();
+        .unwrap_or(BootstrapState::Ready);
+    let bs_str = bootstrap_state.as_str().to_string();
     let params = bonjour_publisher::PublishParams {
         hh_id: loaded.record.hh_id.to_string(),
         hh_name: loaded.record.name.clone(),
@@ -786,6 +792,7 @@ async fn publish_household_bonjour_for_identity(
         pair_device_window,
         pair_machine_window,
         targets,
+        bootstrap_state,
     )
     .await
     {

@@ -184,9 +184,10 @@ async fn main() {
     // ─── Household identity (Phase 1) — separate listener, deferred ──
     //
     // Per spec/001-phase-1-crypto-skeleton: a dedicated listener serves
-    // /api/v1/household/* on every loopback + LAN + Tailscale interface. This
-    // is independent of the main `cfg.addr` listener (which carries the
-    // existing /api/v1/mobile/* surface — FR-010 untouched).
+    // /api/v1/household/* on concrete loopback / LAN / Tailscale addresses,
+    // narrowed at runtime by HouseholdExposurePolicy. This is independent of
+    // the main `cfg.addr` listener (which carries the existing /api/v1/mobile/*
+    // surface — FR-010 untouched).
     //
     // `bootstrap_household` is now invoked AFTER `SharedState` is built (see
     // below) so that household-namespaced Claw Store routes can be mounted
