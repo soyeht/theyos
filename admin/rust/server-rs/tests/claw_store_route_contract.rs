@@ -279,7 +279,7 @@ fn claw_store_v1_contract_metadata_is_valid() {
             route.id
         );
         assert!(
-            matches!(route.method.as_str(), "GET" | "POST" | "DELETE"),
+            matches!(route.method.as_str(), "GET" | "POST" | "PATCH" | "DELETE"),
             "{} uses unexpected method {}",
             route.id,
             route.method
@@ -511,6 +511,10 @@ fn current_wire_quirks_are_explicitly_pinned() {
         "admin_restart_instance",
         "admin_rebuild_instance",
         "admin_delete_instance",
+        "admin_list_workspaces",
+        "admin_create_workspace",
+        "admin_rename_workspace",
+        "admin_delete_workspace",
     ] {
         assert_eq!(
             route(id).expectations["auth_error"].fixture.as_deref(),
@@ -554,6 +558,10 @@ fn current_wire_quirks_are_explicitly_pinned() {
         "household_restart_instance",
         "household_rebuild_instance",
         "household_delete_instance",
+        "household_list_workspaces",
+        "household_create_workspace",
+        "household_rename_workspace",
+        "household_delete_workspace",
     ] {
         assert_eq!(
             route(id).expectations["auth_error"].fixture.as_deref(),
@@ -604,7 +612,7 @@ fn current_wire_quirks_are_explicitly_pinned() {
 }
 
 #[test]
-fn c4_1_contract_scope_is_core_lifecycle_without_unmounted_mobile_routes() {
+fn contract_scope_is_core_lifecycle_plus_c4_2a_workspaces_without_ws_routes() {
     let contract = contract();
     let route_ids = contract
         .routes
@@ -627,10 +635,18 @@ fn c4_1_contract_scope_is_core_lifecycle_without_unmounted_mobile_routes() {
         "household_restart_instance",
         "household_rebuild_instance",
         "household_delete_instance",
+        "admin_list_workspaces",
+        "admin_create_workspace",
+        "admin_rename_workspace",
+        "admin_delete_workspace",
+        "household_list_workspaces",
+        "household_create_workspace",
+        "household_rename_workspace",
+        "household_delete_workspace",
     ] {
         assert!(
             route_ids.contains(required),
-            "missing C4.1 route {required}"
+            "missing declared contract route {required}"
         );
     }
 
@@ -640,15 +656,17 @@ fn c4_1_contract_scope_is_core_lifecycle_without_unmounted_mobile_routes() {
         "mobile_restart_instance",
         "mobile_rebuild_instance",
         "mobile_list_workspaces",
+        "mobile_create_workspace",
+        "mobile_rename_workspace",
+        "mobile_delete_workspace",
         "mobile_terminal_pty",
-        "admin_list_workspaces",
         "admin_terminal_pty",
-        "household_list_workspaces",
+        "household_attach_token",
         "household_terminal_pty",
     ] {
         assert!(
             !route_ids.contains(not_mounted),
-            "{not_mounted} is outside C4.1 and must not be declared as a success route"
+            "{not_mounted} is outside C4.2a and must not be declared as a success route"
         );
     }
 }

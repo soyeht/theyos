@@ -27,6 +27,8 @@ pub mod admin {
     pub const RESTART_INSTANCE: &str = "/instances/{id}/restart";
     pub const REBUILD_INSTANCE: &str = "/instances/{id}/rebuild";
     pub const DELETE_INSTANCE: &str = "/instances/{id}";
+    pub const WORKSPACES: &str = "/terminals/{container}/workspaces";
+    pub const WORKSPACE: &str = "/terminals/{container}/workspaces/{id}";
 
     pub const LIST_PATH: &str = "/api/v1/claws";
     pub const DETAIL_PATH: &str = "/api/v1/claws/{name}";
@@ -39,6 +41,8 @@ pub mod admin {
     pub const RESTART_INSTANCE_PATH: &str = "/api/v1/instances/{id}/restart";
     pub const REBUILD_INSTANCE_PATH: &str = "/api/v1/instances/{id}/rebuild";
     pub const DELETE_INSTANCE_PATH: &str = "/api/v1/instances/{id}";
+    pub const WORKSPACES_PATH: &str = "/api/v1/terminals/{container}/workspaces";
+    pub const WORKSPACE_PATH: &str = "/api/v1/terminals/{container}/workspaces/{id}";
 }
 
 pub mod mobile {
@@ -68,10 +72,13 @@ pub mod household {
     pub const RESTART_INSTANCE: &str = "/api/v1/household/instances/{id}/restart";
     pub const REBUILD_INSTANCE: &str = "/api/v1/household/instances/{id}/rebuild";
     pub const DELETE_INSTANCE: &str = "/api/v1/household/instances/{id}";
+    pub const WORKSPACES: &str = "/api/v1/household/terminals/{container}/workspaces";
+    pub const WORKSPACE: &str = "/api/v1/household/terminals/{container}/workspaces/{id}";
 }
 
 pub const METHOD_GET: &str = "GET";
 pub const METHOD_POST: &str = "POST";
+pub const METHOD_PATCH: &str = "PATCH";
 pub const METHOD_DELETE: &str = "DELETE";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -207,6 +214,50 @@ pub const ROUTES: &[ClawStoreRouteSpec] = &[
         mount_slice: "main_api_rest",
         route_literal: admin::DELETE_INSTANCE,
         route_expr: "delete(handlers_instances::handle_delete_instance)",
+        household_operation: None,
+    },
+    ClawStoreRouteSpec {
+        id: "admin_list_workspaces",
+        surface: "admin",
+        method: METHOD_GET,
+        path_template: admin::WORKSPACES_PATH,
+        mount_file: "admin/rust/server-rs/src/main.rs",
+        mount_slice: "main_api_rest",
+        route_literal: admin::WORKSPACES,
+        route_expr: "\"/terminals/{container}/workspaces\"",
+        household_operation: None,
+    },
+    ClawStoreRouteSpec {
+        id: "admin_create_workspace",
+        surface: "admin",
+        method: METHOD_POST,
+        path_template: admin::WORKSPACES_PATH,
+        mount_file: "admin/rust/server-rs/src/main.rs",
+        mount_slice: "main_api_rest",
+        route_literal: admin::WORKSPACES,
+        route_expr: "\"/terminals/{container}/workspaces\"",
+        household_operation: None,
+    },
+    ClawStoreRouteSpec {
+        id: "admin_rename_workspace",
+        surface: "admin",
+        method: METHOD_PATCH,
+        path_template: admin::WORKSPACE_PATH,
+        mount_file: "admin/rust/server-rs/src/main.rs",
+        mount_slice: "main_api_rest",
+        route_literal: admin::WORKSPACE,
+        route_expr: "\"/terminals/{container}/workspaces/{id}\"",
+        household_operation: None,
+    },
+    ClawStoreRouteSpec {
+        id: "admin_delete_workspace",
+        surface: "admin",
+        method: METHOD_DELETE,
+        path_template: admin::WORKSPACE_PATH,
+        mount_file: "admin/rust/server-rs/src/main.rs",
+        mount_slice: "main_api_rest",
+        route_literal: admin::WORKSPACE,
+        route_expr: "\"/terminals/{container}/workspaces/{id}\"",
         household_operation: None,
     },
     ClawStoreRouteSpec {
@@ -384,6 +435,50 @@ pub const ROUTES: &[ClawStoreRouteSpec] = &[
         route_literal: household::DELETE_INSTANCE,
         route_expr: "\"/api/v1/household/instances/{id}\"",
         household_operation: Some("claws.delete"),
+    },
+    ClawStoreRouteSpec {
+        id: "household_list_workspaces",
+        surface: "household",
+        method: METHOD_GET,
+        path_template: household::WORKSPACES,
+        mount_file: "admin/rust/server-rs/src/household_bootstrap.rs",
+        mount_slice: "household_claws_router",
+        route_literal: household::WORKSPACES,
+        route_expr: "\"/api/v1/household/terminals/{container}/workspaces\"",
+        household_operation: Some("claws.list"),
+    },
+    ClawStoreRouteSpec {
+        id: "household_create_workspace",
+        surface: "household",
+        method: METHOD_POST,
+        path_template: household::WORKSPACES,
+        mount_file: "admin/rust/server-rs/src/household_bootstrap.rs",
+        mount_slice: "household_claws_router",
+        route_literal: household::WORKSPACES,
+        route_expr: "\"/api/v1/household/terminals/{container}/workspaces\"",
+        household_operation: Some("claws.use"),
+    },
+    ClawStoreRouteSpec {
+        id: "household_rename_workspace",
+        surface: "household",
+        method: METHOD_PATCH,
+        path_template: household::WORKSPACE,
+        mount_file: "admin/rust/server-rs/src/household_bootstrap.rs",
+        mount_slice: "household_claws_router",
+        route_literal: household::WORKSPACE,
+        route_expr: "\"/api/v1/household/terminals/{container}/workspaces/{id}\"",
+        household_operation: Some("claws.use"),
+    },
+    ClawStoreRouteSpec {
+        id: "household_delete_workspace",
+        surface: "household",
+        method: METHOD_DELETE,
+        path_template: household::WORKSPACE,
+        mount_file: "admin/rust/server-rs/src/household_bootstrap.rs",
+        mount_slice: "household_claws_router",
+        route_literal: household::WORKSPACE,
+        route_expr: "\"/api/v1/household/terminals/{container}/workspaces/{id}\"",
+        household_operation: Some("claws.use"),
     },
 ];
 
