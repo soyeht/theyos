@@ -216,6 +216,78 @@
       }
     },
     {
+      "id": "admin_list_workspaces",
+      "surface": "admin",
+      "method": "GET",
+      "path_template": "/api/v1/terminals/{container}/workspaces",
+      "auth_kind": "admin_session",
+      "handler": "handlers_terminal::handle_list_conversations",
+      "mount": {
+        "file": "admin/rust/server-rs/src/main.rs",
+        "slice": "main_api_rest",
+        "route_literal": "/terminals/{container}/workspaces",
+        "method_helper": "get"
+      },
+      "expectations": {
+        "success": { "status": 200, "fixture": "workspace_list_empty" },
+        "auth_error": { "status": 401, "fixture": "admin_auth_unauthorized" }
+      }
+    },
+    {
+      "id": "admin_create_workspace",
+      "surface": "admin",
+      "method": "POST",
+      "path_template": "/api/v1/terminals/{container}/workspaces",
+      "auth_kind": "admin_session",
+      "handler": "handlers_terminal::handle_create_conversation",
+      "mount": {
+        "file": "admin/rust/server-rs/src/main.rs",
+        "slice": "main_api_rest",
+        "route_literal": "/terminals/{container}/workspaces",
+        "method_helper": "post"
+      },
+      "expectations": {
+        "success": { "status": 200, "fixture": "workspace_created" },
+        "auth_error": { "status": 401, "fixture": "admin_auth_unauthorized" }
+      }
+    },
+    {
+      "id": "admin_rename_workspace",
+      "surface": "admin",
+      "method": "PATCH",
+      "path_template": "/api/v1/terminals/{container}/workspaces/{id}",
+      "auth_kind": "admin_session",
+      "handler": "handlers_terminal::handle_rename_conversation",
+      "mount": {
+        "file": "admin/rust/server-rs/src/main.rs",
+        "slice": "main_api_rest",
+        "route_literal": "/terminals/{container}/workspaces/{id}",
+        "method_helper": "patch"
+      },
+      "expectations": {
+        "success": { "status": 204 },
+        "auth_error": { "status": 401, "fixture": "admin_auth_unauthorized" }
+      }
+    },
+    {
+      "id": "admin_delete_workspace",
+      "surface": "admin",
+      "method": "DELETE",
+      "path_template": "/api/v1/terminals/{container}/workspaces/{id}",
+      "auth_kind": "admin_session",
+      "handler": "handlers_terminal::handle_delete_conversation",
+      "mount": {
+        "file": "admin/rust/server-rs/src/main.rs",
+        "slice": "main_api_rest",
+        "route_literal": "/terminals/{container}/workspaces/{id}",
+        "method_helper": "delete"
+      },
+      "expectations": {
+        "success": { "status": 204 },
+        "auth_error": { "status": 401, "fixture": "admin_auth_unauthorized" }
+      }
+    },
+    {
       "id": "mobile_list_claws",
       "surface": "mobile",
       "method": "GET",
@@ -537,6 +609,82 @@
         "not_found": { "status": 404, "fixture": "instance_not_found_error" },
         "auth_error": { "status": 401, "fixture": "empty_body" }
       }
+    },
+    {
+      "id": "household_list_workspaces",
+      "surface": "household",
+      "method": "GET",
+      "path_template": "/api/v1/household/terminals/{container}/workspaces",
+      "auth_kind": "household_pop",
+      "household_operation": "claws.list",
+      "handler": "handlers_household_claws::handle_household_list_workspaces",
+      "mount": {
+        "file": "admin/rust/server-rs/src/household_bootstrap.rs",
+        "slice": "household_claws_router",
+        "route_literal": "/api/v1/household/terminals/{container}/workspaces",
+        "method_helper": "get"
+      },
+      "expectations": {
+        "success": { "status": 200, "fixture": "workspace_list_empty" },
+        "auth_error": { "status": 401, "fixture": "empty_body" }
+      }
+    },
+    {
+      "id": "household_create_workspace",
+      "surface": "household",
+      "method": "POST",
+      "path_template": "/api/v1/household/terminals/{container}/workspaces",
+      "auth_kind": "household_pop",
+      "household_operation": "claws.use",
+      "handler": "handlers_household_claws::handle_household_create_workspace",
+      "mount": {
+        "file": "admin/rust/server-rs/src/household_bootstrap.rs",
+        "slice": "household_claws_router",
+        "route_literal": "/api/v1/household/terminals/{container}/workspaces",
+        "method_helper": "post"
+      },
+      "expectations": {
+        "success": { "status": 200, "fixture": "workspace_created" },
+        "auth_error": { "status": 401, "fixture": "empty_body" }
+      }
+    },
+    {
+      "id": "household_rename_workspace",
+      "surface": "household",
+      "method": "PATCH",
+      "path_template": "/api/v1/household/terminals/{container}/workspaces/{id}",
+      "auth_kind": "household_pop",
+      "household_operation": "claws.use",
+      "handler": "handlers_household_claws::handle_household_rename_workspace",
+      "mount": {
+        "file": "admin/rust/server-rs/src/household_bootstrap.rs",
+        "slice": "household_claws_router",
+        "route_literal": "/api/v1/household/terminals/{container}/workspaces/{id}",
+        "method_helper": "patch"
+      },
+      "expectations": {
+        "success": { "status": 204 },
+        "auth_error": { "status": 401, "fixture": "empty_body" }
+      }
+    },
+    {
+      "id": "household_delete_workspace",
+      "surface": "household",
+      "method": "DELETE",
+      "path_template": "/api/v1/household/terminals/{container}/workspaces/{id}",
+      "auth_kind": "household_pop",
+      "household_operation": "claws.use",
+      "handler": "handlers_household_claws::handle_household_delete_workspace",
+      "mount": {
+        "file": "admin/rust/server-rs/src/household_bootstrap.rs",
+        "slice": "household_claws_router",
+        "route_literal": "/api/v1/household/terminals/{container}/workspaces/{id}",
+        "method_helper": "delete"
+      },
+      "expectations": {
+        "success": { "status": 204 },
+        "auth_error": { "status": 401, "fixture": "empty_body" }
+      }
     }
   ],
   "fixtures": {
@@ -769,6 +917,20 @@
     "instance_not_found_error": {
       "error": "instance not found",
       "code": "NOT_FOUND"
+    },
+    "workspace_list_empty": {
+      "data": [],
+      "has_more": false,
+      "next_cursor": null
+    },
+    "workspace_created": {
+      "workspace": {
+        "id": "ws-alpha",
+        "session_id": "ws-alpha",
+        "container": "picoclaw-alpha",
+        "display_name": "Dev Workspace",
+        "status": "active"
+      }
     },
     "admin_auth_unauthorized": {
       "error": "unauthorized",

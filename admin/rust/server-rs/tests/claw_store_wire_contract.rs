@@ -6,7 +6,7 @@ use axum::{
     http::{Method, Request, StatusCode, header},
     middleware,
     response::{IntoResponse, Response},
-    routing::{delete, get, post},
+    routing::{delete, get, patch, post},
 };
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD as B64URL};
 use claw_rs::{ClawCatalogResponse, ClawStatus};
@@ -32,7 +32,7 @@ use server_rs::{
     auth::require_auth,
     claw_store_service, handlers_claws, handlers_household_claws,
     handlers_household_claws::HouseholdClawsState,
-    handlers_instances, handlers_mobile,
+    handlers_instances, handlers_mobile, handlers_terminal,
     household_attach_token::HouseholdAttachTokenStore,
     household_state::HouseholdState,
     ratelimit::Limiter,
@@ -201,6 +201,16 @@ fn admin_auth_router(state: SharedState) -> Router {
             "/api/v1/instances",
             post(handlers_instances::handle_create_instance_body),
         )
+        .route(
+            "/api/v1/terminals/{container}/workspaces",
+            get(handlers_terminal::handle_list_conversations)
+                .post(handlers_terminal::handle_create_conversation),
+        )
+        .route(
+            "/api/v1/terminals/{container}/workspaces/{id}",
+            patch(handlers_terminal::handle_rename_conversation)
+                .delete(handlers_terminal::handle_delete_conversation),
+        )
         .layer(middleware::from_fn_with_state(
             Arc::clone(&state),
             require_auth,
@@ -323,6 +333,16 @@ fn household_fixture() -> HouseholdFixture {
         .route(
             "/api/v1/household/instances/{id}",
             delete(handlers_household_claws::handle_household_delete_instance),
+        )
+        .route(
+            "/api/v1/household/terminals/{container}/workspaces",
+            get(handlers_household_claws::handle_household_list_workspaces)
+                .post(handlers_household_claws::handle_household_create_workspace),
+        )
+        .route(
+            "/api/v1/household/terminals/{container}/workspaces/{id}",
+            patch(handlers_household_claws::handle_household_rename_workspace)
+                .delete(handlers_household_claws::handle_household_delete_workspace),
         )
         .with_state(claws_state);
 
@@ -675,6 +695,26 @@ fn c4_1_instance_lifecycle_fixtures_pin_nested_and_flat_shapes() {
 }
 
 #[test]
+fn c4_2a_workspace_fixtures_pin_json_shapes() {
+    let list = fixture("workspace_list_empty");
+    assert_eq!(list["data"], json!([]));
+    assert_eq!(list["has_more"], false);
+    assert_eq!(list["next_cursor"], Value::Null);
+
+    let created = fixture("workspace_created");
+    let workspace = &created["workspace"];
+    assert_eq!(workspace["id"], "ws-alpha");
+    assert_eq!(workspace["session_id"], "ws-alpha");
+    assert_eq!(workspace["container"], "picoclaw-alpha");
+    assert_eq!(workspace["display_name"], "Dev Workspace");
+    assert_eq!(workspace["status"], "active");
+    assert!(
+        created.get("data").is_none(),
+        "workspace create fixture must keep the nested workspace envelope"
+    );
+}
+
+#[test]
 fn claw_list_item_omits_missing_availability_for_optional_dto_path() {
     let list_item = ClawListItemResponse {
         catalog: ClawCatalogResponse {
@@ -841,6 +881,34 @@ async fn auth_and_admin_required_errors_match_declared_claw_store_v1_fixtures() 
         StatusCode::UNAUTHORIZED,
         "admin_auth_unauthorized",
     );
+
+    for (method, path) in [
+        (Method::GET, "/api/v1/terminals/picoclaw-alpha/workspaces"),
+        (Method::POST, "/api/v1/terminals/picoclaw-alpha/workspaces"),
+        (
+            Method::PATCH,
+            "/api/v1/terminals/picoclaw-alpha/workspaces/ws-alpha",
+        ),
+        (
+            Method::DELETE,
+            "/api/v1/terminals/picoclaw-alpha/workspaces/ws-alpha",
+        ),
+    ] {
+        let (status, _bytes, body) = request(
+            admin_auth_router(Arc::clone(&admin_state)),
+            method,
+            path,
+            Vec::new(),
+            None,
+        )
+        .await;
+        assert_fixture_body(
+            status,
+            &body,
+            StatusCode::UNAUTHORIZED,
+            "admin_auth_unauthorized",
+        );
+    }
 
     let mobile_state = shared_state();
     let (status, _bytes, body) = request(
@@ -1525,6 +1593,22 @@ async fn household_pop_auth_failure_is_empty_401() {
             "/api/v1/household/instances/inst-alpha/rebuild",
         ),
         (Method::DELETE, "/api/v1/household/instances/inst-alpha"),
+        (
+            Method::GET,
+            "/api/v1/household/terminals/picoclaw-alpha/workspaces",
+        ),
+        (
+            Method::POST,
+            "/api/v1/household/terminals/picoclaw-alpha/workspaces",
+        ),
+        (
+            Method::PATCH,
+            "/api/v1/household/terminals/picoclaw-alpha/workspaces/ws-alpha",
+        ),
+        (
+            Method::DELETE,
+            "/api/v1/household/terminals/picoclaw-alpha/workspaces/ws-alpha",
+        ),
     ] {
         let response = household
             .app

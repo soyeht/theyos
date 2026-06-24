@@ -3,9 +3,9 @@
 //! Household routes declared in BOTH `admin/contracts/claw-store/v1/contract.json`
 //! (surface "household") and `docs/contracts/claw-store-household-v1.json` must
 //! agree on path / method / operation. The household-only doc also includes
-//! workspaces and attach-token routes that are intentionally deferred from the
-//! cross-repo C4.1 contract, so this test pins the overlap instead of requiring
-//! both files to have the same full route set.
+//! attach-token routes that are intentionally deferred from the cross-repo C4.2a
+//! contract, so this test pins the overlap instead of requiring both files to
+//! have the same full route set.
 
 use std::collections::BTreeSet;
 
