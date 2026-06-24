@@ -43,6 +43,7 @@ pub enum OwnerEventType {
     JoinRequest,
     MachineJoined,
     JoinCancelled,
+    DevicePairRequest,
     #[serde(rename = "sign_machine_cert_for_proxy")]
     SignMachineCertForProxy,
 }
@@ -54,6 +55,7 @@ pub enum OwnerEventPayload {
     JoinRequest(JoinRequestPayload),
     MachineJoined(MachineJoinedPayload),
     JoinCancelled(JoinCancelledPayload),
+    DevicePairRequest(DevicePairRequestPayload),
     SignMachineCertForProxy(SignMachineCertForProxyPayload),
 }
 
@@ -64,6 +66,10 @@ impl OwnerEventPayload {
             (Self::JoinRequest(_), OwnerEventType::JoinRequest)
                 | (Self::MachineJoined(_), OwnerEventType::MachineJoined)
                 | (Self::JoinCancelled(_), OwnerEventType::JoinCancelled)
+                | (
+                    Self::DevicePairRequest(_),
+                    OwnerEventType::DevicePairRequest
+                )
                 | (
                     Self::SignMachineCertForProxy(_),
                     OwnerEventType::SignMachineCertForProxy,
@@ -94,6 +100,16 @@ pub struct MachineJoinedPayload {
 pub struct JoinCancelledPayload {
     pub m_pub: ByteBuf,
     pub reason: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DevicePairRequestPayload {
+    pub request_id: String,
+    pub d_pub: ByteBuf,
+    pub device_name: String,
+    pub platform: String,
+    pub expiry: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

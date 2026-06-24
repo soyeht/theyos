@@ -12,7 +12,10 @@
 //! - Bonjour publisher (FR-017) — only announces once identity is loaded.
 
 use crate::bonjour_trust::BrowserConfig;
+use crate::claw_share_relay_offer_challenge::RelayOfferChallengeTable;
+use crate::claw_share_relay_stream_abuse::RelayAbuseState;
 use crate::handlers_bootstrap::{BootstrapHandlerState, BootstrapStateArc};
+use crate::handlers_claw_share;
 use crate::handlers_household;
 use crate::handlers_household_claws;
 use crate::handlers_household_guest_image;
@@ -27,11 +30,15 @@ use crate::time_util;
 use crate::{bonjour_browser, bonjour_publisher, setup_beacon, startup_wiring};
 use household_rs::KeyBackingPolicy;
 use household_rs::bootstrap_state::{self, BootstrapState};
+use household_rs::claw_share::ClawShareSlotStore;
+use household_rs::claw_share_data_tunnel::ReplayGuard;
+use household_rs::household_mesh_log::MeshLogStore;
 use household_rs::owner_events::{OwnerEventLog, OwnerEventsBroadcaster};
 use household_rs::pair_machine::PairMachineWindow;
+use nostr_relay_rs::nostr::Keys;
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 use tokio::sync::RwLock;
 use tracing::info;
@@ -47,6 +54,26 @@ static BOOTSTRAP_STATE: OnceLock<BootstrapStateArc> = OnceLock::new();
 #[must_use]
 pub fn global_bootstrap_state() -> Option<BootstrapStateArc> {
     BOOTSTRAP_STATE.get().map(Arc::clone)
+}
+
+#[derive(Clone)]
+struct ClawShareRuntimeHandles {
+    slot_store: Arc<ClawShareSlotStore>,
+    mesh_log: Arc<MeshLogStore>,
+    replay_guard: Arc<ReplayGuard>,
+    relay_offer_challenges: Arc<RelayOfferChallengeTable>,
+    relay_offer_abuse: Arc<Mutex<RelayAbuseState>>,
+}
+
+struct EngineRelayIdentity {
+    keys: Keys,
+    npub_hex: String,
+}
+
+struct ClawShareBootstrapState {
+    runtime: ClawShareRuntimeHandles,
+    engine_relay_identity: Option<EngineRelayIdentity>,
+    relay_urls: Vec<String>,
 }
 
 /// Resolve the on-disk household state directory.
@@ -126,6 +153,163 @@ pub fn household_port_from_env() -> u16 {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(DEFAULT_HOUSEHOLD_PORT)
+}
+
+fn claw_share_log_path(state_dir: &Path) -> PathBuf {
+    state_dir.join("claw_share").join("mesh_log.ndjson")
+}
+
+fn csv_has_entries(raw: Option<&str>) -> bool {
+    raw.is_some_and(|value| value.split(',').any(|part| !part.trim().is_empty()))
+}
+
+fn relay_urls_from_env_value(raw: Option<&str>) -> Vec<String> {
+    raw.map(crate::claw_share_relay_loop::parse_relay_list)
+        .unwrap_or_default()
+}
+
+fn open_claw_share_mesh_log(state_dir: &Path) -> Arc<MeshLogStore> {
+    let log_path = claw_share_log_path(state_dir);
+    match MeshLogStore::open(&log_path) {
+        Ok(log) => Arc::new(log),
+        Err(e) => {
+            tracing::error!(
+                stage = "claw_share.mesh_log.open_failed",
+                path = %log_path.display(),
+                error = %e,
+                "falling back to in-memory claw-share membership log; restarts will lose relay state",
+            );
+            Arc::new(MeshLogStore::new())
+        }
+    }
+}
+
+fn prepare_engine_relay_identity(
+    state_dir: &Path,
+    relay_urls: &[String],
+) -> Result<Option<EngineRelayIdentity>, std::io::Error> {
+    if relay_urls.is_empty() {
+        return Ok(None);
+    }
+    let keys = crate::claw_share_relay_loop::load_or_create_nostr_key(state_dir)?;
+    let npub_hex = keys.public_key().to_hex();
+    Ok(Some(EngineRelayIdentity { keys, npub_hex }))
+}
+
+fn prepare_claw_share_bootstrap_state(
+    state_dir: &Path,
+    relay_env: Option<&str>,
+    claim_relays_env: Option<&str>,
+) -> ClawShareBootstrapState {
+    let mesh_log = open_claw_share_mesh_log(state_dir);
+    let projection = mesh_log.project();
+    let slot_store = Arc::new(ClawShareSlotStore::seeded_from(&projection));
+    let replay_guard = Arc::new(ReplayGuard::new());
+    let relay_offer_challenges = Arc::new(RelayOfferChallengeTable::new());
+    let relay_offer_abuse = Arc::new(Mutex::new(RelayAbuseState::default()));
+    let relay_urls = relay_urls_from_env_value(relay_env);
+
+    if relay_urls.is_empty() && csv_has_entries(claim_relays_env) {
+        tracing::warn!(
+            stage = "claw_share.relay.claim_relays_without_listener",
+            "THEYOS_CLAIM_RELAYS is configured but THEYOS_NOSTR_RELAY is empty; invite minting will fail closed",
+        );
+    }
+
+    let engine_relay_identity = match prepare_engine_relay_identity(state_dir, &relay_urls) {
+        Ok(identity) => identity,
+        Err(e) => {
+            tracing::error!(
+                stage = "claw_share.relay.key_load_failed",
+                error = %e,
+                "engine Nostr relay key could not be loaded; relay claim path disabled and minting fails closed",
+            );
+            None
+        }
+    };
+
+    ClawShareBootstrapState {
+        runtime: ClawShareRuntimeHandles {
+            slot_store,
+            mesh_log,
+            replay_guard,
+            relay_offer_challenges,
+            relay_offer_abuse,
+        },
+        engine_relay_identity,
+        relay_urls,
+    }
+}
+
+fn build_claw_share_router(
+    household: HouseholdState,
+    state_dir: PathBuf,
+    runtime: &ClawShareRuntimeHandles,
+    engine_relay_npub: Option<String>,
+) -> axum::Router {
+    handlers_claw_share::router(handlers_claw_share::ClawShareRouterState {
+        household,
+        slot_store: Arc::clone(&runtime.slot_store),
+        mesh_log: Arc::clone(&runtime.mesh_log),
+        engine_relay_npub,
+        state_dir,
+        relay_offer_challenges: Arc::clone(&runtime.relay_offer_challenges),
+        relay_offer_abuse: Arc::clone(&runtime.relay_offer_abuse),
+    })
+}
+
+fn spawn_claw_share_relay_loop_if_configured(
+    household: HouseholdState,
+    state_dir: PathBuf,
+    runtime: &ClawShareRuntimeHandles,
+    engine_relay_identity: Option<EngineRelayIdentity>,
+    relay_urls: Vec<String>,
+) {
+    if relay_urls.is_empty() {
+        return;
+    }
+    let Some(identity) = engine_relay_identity else {
+        tracing::error!(
+            stage = "claw_share.relay.no_identity",
+            "THEYOS_NOSTR_RELAY is set but engine Nostr identity is unavailable; relay loop not spawned",
+        );
+        return;
+    };
+    tracing::info!(
+        stage = "claw_share.relay.spawned",
+        relay_count = relay_urls.len(),
+        "engine relay loops spawned",
+    );
+    crate::claw_share_relay_loop::spawn(crate::claw_share_relay_loop::EngineRelayState {
+        household,
+        slot_store: Arc::clone(&runtime.slot_store),
+        mesh_log: Arc::clone(&runtime.mesh_log),
+        engine_keys: identity.keys,
+        relay_urls,
+        state_dir,
+    });
+}
+
+async fn mount_claw_share_relay_stream_live_if_enabled(
+    state_dir: PathBuf,
+    household: HouseholdState,
+    runtime: &ClawShareRuntimeHandles,
+) {
+    if let Err(e) = crate::claw_share_relay_stream_mount::mount_relay_stream_live_if_enabled(
+        state_dir,
+        household,
+        Arc::clone(&runtime.mesh_log),
+        Arc::clone(&runtime.slot_store),
+        Arc::clone(&runtime.replay_guard),
+    )
+    .await
+    {
+        tracing::warn!(
+            stage = "claw_share.relay_stream.mount_failed",
+            error = %e,
+            "relay_stream live mount failed; continuing household bootstrap",
+        );
+    }
 }
 
 /// Default pairing-window TTL (seconds) when the override env var is unset, not a
@@ -634,11 +818,47 @@ pub async fn bootstrap_household(shared_state: Option<SharedState>) {
             .with_state(guest_image_state)
     };
 
+    // Claw-share / relay HTTP surface. This is the mesh-free Product A relay
+    // mount: the durable membership log is the source of truth, the slot store is
+    // rehydrated from it on startup, and relay claim identity is loaded only when
+    // the engine is actually configured to listen to Nostr relays.
+    let claim_relays_env = std::env::var("THEYOS_CLAIM_RELAYS").ok();
+    let nostr_relay_env = std::env::var("THEYOS_NOSTR_RELAY").ok();
+    let claw_share_bootstrap = prepare_claw_share_bootstrap_state(
+        &state_dir,
+        nostr_relay_env.as_deref(),
+        claim_relays_env.as_deref(),
+    );
+    let claw_share_runtime = claw_share_bootstrap.runtime.clone();
+    let claw_share_router = build_claw_share_router(
+        identity_state.clone(),
+        state_dir.clone(),
+        &claw_share_runtime,
+        claw_share_bootstrap
+            .engine_relay_identity
+            .as_ref()
+            .map(|identity| identity.npub_hex.clone()),
+    );
+    mount_claw_share_relay_stream_live_if_enabled(
+        state_dir.clone(),
+        identity_state.clone(),
+        &claw_share_runtime,
+    )
+    .await;
+    spawn_claw_share_relay_loop_if_configured(
+        identity_state.clone(),
+        state_dir.clone(),
+        &claw_share_runtime,
+        claw_share_bootstrap.engine_relay_identity,
+        claw_share_bootstrap.relay_urls,
+    );
+
     let mut household_router = identity_router
         .merge(pair_router)
         .merge(bootstrap_rt)
         .merge(pre_household_rt)
-        .merge(guest_image_router);
+        .merge(guest_image_router)
+        .merge(claw_share_router);
     if let Some(r) = claws_router {
         household_router = household_router.merge(r);
     }
@@ -699,6 +919,7 @@ pub async fn bootstrap_household(shared_state: Option<SharedState>) {
             targets: initial_bound,
             port,
             bonjour_browser_state,
+            claw_share: Some(claw_share_runtime),
         };
         spawn_household_identity_watcher(state_dir, identity_state, key_policy, deps);
     }
@@ -809,6 +1030,7 @@ struct HouseholdIdentityWatcherDeps {
     targets: Vec<(IpAddr, InterfaceClass)>,
     port: u16,
     bonjour_browser_state: Option<handlers_pair_machine::PairMachineRouterState>,
+    claw_share: Option<ClawShareRuntimeHandles>,
 }
 
 fn spawn_household_identity_watcher(
@@ -839,6 +1061,7 @@ fn spawn_household_identity_watcher_with_interval(
         targets,
         port,
         bonjour_browser_state,
+        claw_share,
     } = deps;
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(poll_interval);
@@ -865,6 +1088,14 @@ fn spawn_household_identity_watcher_with_interval(
                         drop(bonjour_browser::spawn_bonjour_browser(state));
                     }
                 }
+                if let Some(runtime) = &claw_share {
+                    mount_claw_share_relay_stream_live_if_enabled(
+                        state_dir.clone(),
+                        identity_state.clone(),
+                        runtime,
+                    )
+                    .await;
+                }
                 break;
             }
             match household_rs::try_load_existing(&state_dir, key_policy) {
@@ -880,6 +1111,14 @@ fn spawn_household_identity_watcher_with_interval(
                         .await;
                     if close_window {
                         pair_device_window.close().await;
+                    }
+                    if let Some(runtime) = &claw_share {
+                        mount_claw_share_relay_stream_live_if_enabled(
+                            state_dir.clone(),
+                            identity_state.clone(),
+                            runtime,
+                        )
+                        .await;
                     }
                     info!(
                         stage = "bootstrap.hot_loaded",
@@ -1088,6 +1327,8 @@ async fn infer_bootstrap_state(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use household_rs::claw_share::{SlotId, SlotState};
+    use household_rs::household_mesh_log::{LogEntry, MeshEvent};
     use household_rs::keys::{IdentityKey, P256Keypair};
     use household_rs::person_cert::SignOwnerOptions;
 
@@ -1151,6 +1392,133 @@ mod tests {
                  stops calling the owner can silently drift from its clamp/default"
             );
         }
+    }
+
+    #[test]
+    fn claw_share_bootstrap_state_rehydrates_slots_from_persisted_log() {
+        let td = tempfile::tempdir().unwrap();
+        let log = MeshLogStore::open(&claw_share_log_path(td.path())).unwrap();
+        let owner = P256Keypair::from_secret_scalar(&[0x11u8; 32]).unwrap();
+        let guest = P256Keypair::from_secret_scalar(&[0x22u8; 32]).unwrap();
+        let now = 1_800_000_000;
+
+        let open_slot = SlotId([0x01u8; 16]);
+        let consumed_slot = SlotId([0x02u8; 16]);
+        let revoked_slot = SlotId([0x03u8; 16]);
+        append_log_event(
+            &log,
+            &owner,
+            now,
+            MeshEvent::ClawShareSlotMinted {
+                slot_id: open_slot.clone(),
+                claw_id: "claw-open".to_string(),
+                expires_at: now + 600,
+            },
+        );
+        append_log_event(
+            &log,
+            &owner,
+            now + 1,
+            MeshEvent::ClawShareSlotMinted {
+                slot_id: consumed_slot.clone(),
+                claw_id: "claw-consumed".to_string(),
+                expires_at: now + 600,
+            },
+        );
+        append_log_event(
+            &log,
+            &owner,
+            now + 2,
+            MeshEvent::ClawShareSlotConsumed {
+                slot_id: consumed_slot.clone(),
+                guest_device_pub: guest.public(),
+                claw_id: "claw-consumed".to_string(),
+                expires_at: now + 600,
+                participant_npub: None,
+            },
+        );
+        append_log_event(
+            &log,
+            &owner,
+            now + 3,
+            MeshEvent::ClawShareSlotMinted {
+                slot_id: revoked_slot.clone(),
+                claw_id: "claw-revoked".to_string(),
+                expires_at: now + 600,
+            },
+        );
+        append_log_event(
+            &log,
+            &owner,
+            now + 4,
+            MeshEvent::ClawShareSlotRevoked {
+                slot_id: revoked_slot.clone(),
+            },
+        );
+        drop(log);
+
+        let state = prepare_claw_share_bootstrap_state(td.path(), None, None);
+
+        assert!(state.engine_relay_identity.is_none());
+        assert!(state.relay_urls.is_empty());
+        assert!(matches!(
+            state.runtime.slot_store.get(&open_slot).unwrap().state,
+            SlotState::Open
+        ));
+        let consumed = state.runtime.slot_store.get(&consumed_slot).unwrap();
+        match consumed.state {
+            SlotState::Consumed {
+                guest_device_pub, ..
+            } => assert_eq!(guest_device_pub, guest.public()),
+            other => panic!("expected consumed slot, got {other:?}"),
+        }
+        assert!(matches!(
+            state.runtime.slot_store.get(&revoked_slot).unwrap().state,
+            SlotState::Revoked { .. }
+        ));
+    }
+
+    #[test]
+    fn engine_relay_identity_is_default_off_and_pins_advertised_npub_to_subscription_key() {
+        let td = tempfile::tempdir().unwrap();
+
+        let disabled = prepare_engine_relay_identity(td.path(), &[]).unwrap();
+        assert!(disabled.is_none());
+        assert!(!td.path().join("nostr_engine_key.hex").exists());
+
+        let relay_urls = vec!["wss://relay.example.test".to_string()];
+        let identity = prepare_engine_relay_identity(td.path(), &relay_urls)
+            .unwrap()
+            .unwrap();
+        assert_eq!(identity.npub_hex, identity.keys.public_key().to_hex());
+        assert!(td.path().join("nostr_engine_key.hex").exists());
+
+        let reloaded = prepare_engine_relay_identity(td.path(), &relay_urls)
+            .unwrap()
+            .unwrap();
+        assert_eq!(reloaded.npub_hex, identity.npub_hex);
+    }
+
+    #[test]
+    fn household_bootstrap_relay_mount_stays_mesh_runtime_free() {
+        let source = include_str!("household_bootstrap.rs");
+        let forbidden = [
+            concat!("mesh", "_rs"),
+            concat!("THEYOS", "_MESH"),
+            concat!("transit", "_bootstrap_store"),
+            concat!("community", "_relay_catalog"),
+            concat!("mesh", "_admin_dir"),
+            concat!("mesh", ".clone"),
+            concat!("private_share", "_transit"),
+        ];
+        for symbol in forbidden {
+            assert!(
+                !source.contains(symbol),
+                "household_bootstrap.rs reintroduced forbidden relay mount dependency `{symbol}`"
+            );
+        }
+        assert!(source.contains(".merge(claw_share_router)"));
+        assert!(source.contains("mount_claw_share_relay_stream_live_if_enabled"));
     }
 
     #[tokio::test]
@@ -1251,6 +1619,7 @@ mod tests {
                 targets: Vec::new(),
                 port: 8091,
                 bonjour_browser_state: None,
+                claw_share: None,
             },
         );
 
@@ -1316,5 +1685,10 @@ mod tests {
         )
         .unwrap();
         household_rs::HouseholdAuthState::new(&identity.record, cert)
+    }
+
+    fn append_log_event(log: &MeshLogStore, owner: &P256Keypair, timestamp: u64, event: MeshEvent) {
+        let entry = LogEntry::sign(timestamp, owner.public(), event, owner).unwrap();
+        log.append(entry).unwrap();
     }
 }

@@ -1,0 +1,30 @@
+[package]
+name = "friend-cli-rs"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "friend-cli"
+path = "src/main.rs"
+
+[dependencies]
+# Mesh-free relay-stream guest. Deliberately NO L3-VPN crate dependency — the
+# legacy L3 VPN subcommands were pruned out of this crate.
+household-rs   = { workspace = true }
+# claim-relay rides the Nostr relay store-and-forward path (mesh-free).
+nostr-relay-rs = { workspace = true }
+
+serde         = { workspace = true }
+serde_json    = { workspace = true }
+serde_bytes   = { workspace = true }
+tokio         = { workspace = true }
+tracing       = { workspace = true }
+tracing-subscriber = { workspace = true }
+reqwest       = { workspace = true }
+clap          = { version = "4", features = ["derive", "env"] }
+anyhow        = "1"
+rand          = "0.8"
+
+[lints]
+workspace = true
