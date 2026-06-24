@@ -685,6 +685,27 @@
         "success": { "status": 204 },
         "auth_error": { "status": 401, "fixture": "empty_body" }
       }
+    },
+    {
+      "id": "household_attach_token",
+      "surface": "household",
+      "method": "POST",
+      "path_template": "/api/v1/household/terminals/{container}/attach-token",
+      "auth_kind": "household_pop",
+      "household_operation": "claws.use",
+      "peer_guard": true,
+      "handler": "handlers_household_claws::handle_household_mint_attach_token",
+      "mount": {
+        "file": "admin/rust/server-rs/src/household_bootstrap.rs",
+        "slice": "household_claws_router",
+        "route_literal": "/api/v1/household/terminals/{container}/attach-token",
+        "method_helper": "post"
+      },
+      "expectations": {
+        "success": { "status": 200, "fixture": "household_attach_token_minted" },
+        "peer_rejected": { "status": 403 },
+        "auth_error": { "status": 401, "fixture": "empty_body" }
+      }
     }
   ],
   "fixtures": {
@@ -931,6 +952,10 @@
         "display_name": "Dev Workspace",
         "status": "active"
       }
+    },
+    "household_attach_token_minted": {
+      "token": "attach-token-alpha",
+      "expires_at": 1810000000
     },
     "admin_auth_unauthorized": {
       "error": "unauthorized",
