@@ -67,18 +67,14 @@ impl SshTarget {
 
     /// Resolve from macOS instance metadata.
     ///
-    /// Reads `vm_ip` from `~/Library/Application Support/theyos/vms/<container>/vm_ip`.
+    /// Reads `vm_ip` from `<vms_dir>/<container>/vm_ip`.
     /// Connects to `<ip>:22`.
     ///
     /// # Errors
     ///
     /// Returns error if `vm_ip` file is missing or empty.
-    pub fn from_macos(container: &str, key: &Path) -> Result<Self, E2eError> {
-        let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
-        let vm_ip_path = PathBuf::from(home)
-            .join("Library/Application Support/theyos/vms")
-            .join(container)
-            .join("vm_ip");
+    pub fn from_macos(container: &str, vms_dir: &Path, key: &Path) -> Result<Self, E2eError> {
+        let vm_ip_path = vms_dir.join(container).join("vm_ip");
         let content = std::fs::read_to_string(&vm_ip_path).map_err(|e| E2eError::Setup {
             detail: format!("read {}: {e}", vm_ip_path.display()),
         })?;
@@ -108,10 +104,12 @@ impl SshTarget {
         state_dir: &Path,
         key: &Path,
     ) -> Result<Self, E2eError> {
-        if guest_os == "macos" {
-            Self::from_macos(container, key)
-        } else {
-            Self::from_linux(container, state_dir, key)
+        match guest_os {
+            "macos" => Self::from_macos(container, state_dir, key),
+            "linux" => Self::from_linux(container, state_dir, key),
+            other => Err(E2eError::Setup {
+                detail: format!("unsupported guest_os for SSH target: {other}"),
+            }),
         }
     }
 
@@ -254,6 +252,18 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn temp_dir(name: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("e2e-ssh-target-{name}-{nanos}"));
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
 
     #[test]
     fn parse_ssh_port_from_instance_env() {
@@ -288,6 +298,40 @@ mod tests {
         assert_eq!(parse_vm_ip(""), None);
         assert_eq!(parse_vm_ip("\n"), None);
         assert_eq!(parse_vm_ip("  \n"), None);
+    }
+
+    #[test]
+    fn from_macos_reads_vm_ip_from_supplied_vms_dir() {
+        let root = temp_dir("macos-vms");
+        let container_dir = root.join("e2e-pico");
+        fs::create_dir_all(&container_dir).unwrap();
+        fs::write(container_dir.join("vm_ip"), "192.0.2.10\n").unwrap();
+
+        let target = SshTarget::from_macos("e2e-pico", &root, Path::new("/tmp/key"))
+            .expect("macOS target should read vm_ip from supplied dir");
+
+        assert_eq!(target.host, "192.0.2.10");
+        assert_eq!(target.port, 22);
+        assert_eq!(target.user, "root");
+        assert_eq!(target.key, PathBuf::from("/tmp/key"));
+        assert_eq!(target.path_prefix.as_deref(), Some(MACOS_PATH_PREFIX));
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn resolve_rejects_unknown_guest_os() {
+        let err = match SshTarget::resolve(
+            "e2e-pico",
+            "windows",
+            Path::new("/tmp"),
+            Path::new("/tmp/key"),
+        ) {
+            Ok(_) => panic!("unknown guest_os should be rejected"),
+            Err(err) => err.to_string(),
+        };
+
+        assert!(err.contains("unsupported guest_os"), "got: {err}");
     }
 
     #[test]

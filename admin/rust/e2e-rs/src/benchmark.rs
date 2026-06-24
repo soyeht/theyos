@@ -116,7 +116,7 @@ fn benchmark_one(
 
     let start = Instant::now();
 
-    let (job_id, instance_id) = match client.create_instance(&name, claw_type) {
+    let (job_id, instance_id) = match client.create_instance(&name, claw_type, None) {
         Ok(cr) => {
             let iid = cr
                 .instance
