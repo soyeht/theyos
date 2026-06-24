@@ -103,6 +103,119 @@
       }
     },
     {
+      "id": "admin_create_instance",
+      "surface": "admin",
+      "method": "POST",
+      "path_template": "/api/v1/instances",
+      "auth_kind": "admin_session",
+      "handler": "handlers_instances::handle_create_instance_body",
+      "mount": {
+        "file": "admin/rust/server-rs/src/main.rs",
+        "slice": "main_api_rest",
+        "route_literal": "/instances",
+        "method_helper": "post"
+      },
+      "expectations": {
+        "accepted": { "status": 202, "fixture": "admin_instance_create_accepted" },
+        "auth_error": { "status": 401, "fixture": "admin_auth_unauthorized" }
+      }
+    },
+    {
+      "id": "admin_instance_status",
+      "surface": "admin",
+      "method": "GET",
+      "path_template": "/api/v1/instances/{id}/status",
+      "auth_kind": "admin_session",
+      "handler": "handlers_instances::handle_instance_status",
+      "mount": {
+        "file": "admin/rust/server-rs/src/main.rs",
+        "slice": "main_api_rest",
+        "route_literal": "/instances/{id}/status",
+        "method_helper": "get"
+      },
+      "expectations": {
+        "success": { "status": 200, "fixture": "admin_instance_status_active" },
+        "not_found": { "status": 404, "fixture": "instance_not_found_error" },
+        "auth_error": { "status": 401, "fixture": "admin_auth_unauthorized" }
+      }
+    },
+    {
+      "id": "admin_stop_instance",
+      "surface": "admin",
+      "method": "POST",
+      "path_template": "/api/v1/instances/{id}/stop",
+      "auth_kind": "admin_session",
+      "handler": "handlers_instances::handle_stop_instance",
+      "mount": {
+        "file": "admin/rust/server-rs/src/main.rs",
+        "slice": "main_api_rest",
+        "route_literal": "/instances/{id}/stop",
+        "method_helper": "post"
+      },
+      "expectations": {
+        "success": { "status": 204 },
+        "not_found": { "status": 404, "fixture": "instance_not_found_error" },
+        "auth_error": { "status": 401, "fixture": "admin_auth_unauthorized" }
+      }
+    },
+    {
+      "id": "admin_restart_instance",
+      "surface": "admin",
+      "method": "POST",
+      "path_template": "/api/v1/instances/{id}/restart",
+      "auth_kind": "admin_session",
+      "handler": "handlers_instances::handle_restart_instance",
+      "mount": {
+        "file": "admin/rust/server-rs/src/main.rs",
+        "slice": "main_api_rest",
+        "route_literal": "/instances/{id}/restart",
+        "method_helper": "post"
+      },
+      "expectations": {
+        "success": { "status": 204 },
+        "not_found": { "status": 404, "fixture": "instance_not_found_error" },
+        "auth_error": { "status": 401, "fixture": "admin_auth_unauthorized" }
+      }
+    },
+    {
+      "id": "admin_rebuild_instance",
+      "surface": "admin",
+      "method": "POST",
+      "path_template": "/api/v1/instances/{id}/rebuild",
+      "auth_kind": "admin_session",
+      "handler": "handlers_instances::handle_rebuild_instance",
+      "mount": {
+        "file": "admin/rust/server-rs/src/main.rs",
+        "slice": "main_api_rest",
+        "route_literal": "/instances/{id}/rebuild",
+        "method_helper": "post"
+      },
+      "expectations": {
+        "success": { "status": 204 },
+        "not_found": { "status": 404, "fixture": "instance_not_found_error" },
+        "auth_error": { "status": 401, "fixture": "admin_auth_unauthorized" }
+      }
+    },
+    {
+      "id": "admin_delete_instance",
+      "surface": "admin",
+      "method": "DELETE",
+      "path_template": "/api/v1/instances/{id}",
+      "auth_kind": "admin_session",
+      "handler": "handlers_instances::handle_delete_instance",
+      "mount": {
+        "file": "admin/rust/server-rs/src/main.rs",
+        "slice": "main_api_rest",
+        "route_literal": "/instances/{id}",
+        "method_helper": "delete"
+      },
+      "expectations": {
+        "success": { "status": 204 },
+        "not_found": { "status": 404, "fixture": "instance_not_found_error" },
+        "auth_error": { "status": 401, "fixture": "admin_auth_unauthorized" }
+      }
+    },
+    {
       "id": "mobile_list_claws",
       "surface": "mobile",
       "method": "GET",
@@ -117,6 +230,44 @@
       },
       "expectations": {
         "success": { "status": 200, "fixture": "list_envelope_ready" },
+        "auth_error": { "status": 401, "fixture": "mobile_missing_auth" }
+      }
+    },
+    {
+      "id": "mobile_create_instance",
+      "surface": "mobile",
+      "method": "POST",
+      "path_template": "/api/v1/mobile/instances",
+      "auth_kind": "mobile_bearer_admin",
+      "handler": "handlers_mobile::handle_mobile_create_instance",
+      "mount": {
+        "file": "admin/rust/server-rs/src/main.rs",
+        "slice": "main_mobile_api",
+        "route_literal": "/instances",
+        "method_helper": "post"
+      },
+      "expectations": {
+        "accepted": { "status": 202, "fixture": "mobile_instance_create_accepted" },
+        "admin_required": { "status": 403, "fixture": "mobile_admin_required" },
+        "auth_error": { "status": 401, "fixture": "mobile_missing_auth" }
+      }
+    },
+    {
+      "id": "mobile_instance_status",
+      "surface": "mobile",
+      "method": "GET",
+      "path_template": "/api/v1/mobile/instances/{id}/status",
+      "auth_kind": "mobile_bearer",
+      "handler": "handlers_mobile::handle_mobile_instance_status",
+      "mount": {
+        "file": "admin/rust/server-rs/src/main.rs",
+        "slice": "main_mobile_api",
+        "route_literal": "/instances/{id}/status",
+        "method_helper": "get"
+      },
+      "expectations": {
+        "success": { "status": 200, "fixture": "mobile_household_instance_status_active" },
+        "not_found": { "status": 404, "fixture": "instance_not_found_error" },
         "auth_error": { "status": 401, "fixture": "mobile_missing_auth" }
       }
     },
@@ -265,6 +416,125 @@
         "unknown": { "status": 404, "fixture": "unknown_claw_error" },
         "not_ready": { "status": 400, "fixture": "not_installed_error" },
         "instances_exist": { "status": 400, "fixture": "uninstall_instances_exist_error" },
+        "auth_error": { "status": 401, "fixture": "empty_body" }
+      }
+    },
+    {
+      "id": "household_create_instance",
+      "surface": "household",
+      "method": "POST",
+      "path_template": "/api/v1/household/instances",
+      "auth_kind": "household_pop",
+      "household_operation": "claws.create",
+      "handler": "handlers_household_claws::handle_household_create_instance",
+      "mount": {
+        "file": "admin/rust/server-rs/src/household_bootstrap.rs",
+        "slice": "household_claws_router",
+        "route_literal": "/api/v1/household/instances",
+        "method_helper": "post"
+      },
+      "expectations": {
+        "accepted": { "status": 202, "fixture": "mobile_instance_create_accepted" },
+        "auth_error": { "status": 401, "fixture": "empty_body" }
+      }
+    },
+    {
+      "id": "household_instance_status",
+      "surface": "household",
+      "method": "GET",
+      "path_template": "/api/v1/household/instances/{id}/status",
+      "auth_kind": "household_pop",
+      "household_operation": "claws.list",
+      "handler": "handlers_household_claws::handle_household_instance_status",
+      "mount": {
+        "file": "admin/rust/server-rs/src/household_bootstrap.rs",
+        "slice": "household_claws_router",
+        "route_literal": "/api/v1/household/instances/{id}/status",
+        "method_helper": "get"
+      },
+      "expectations": {
+        "success": { "status": 200, "fixture": "mobile_household_instance_status_active" },
+        "not_found": { "status": 404, "fixture": "instance_not_found_error" },
+        "auth_error": { "status": 401, "fixture": "empty_body" }
+      }
+    },
+    {
+      "id": "household_stop_instance",
+      "surface": "household",
+      "method": "POST",
+      "path_template": "/api/v1/household/instances/{id}/stop",
+      "auth_kind": "household_pop",
+      "household_operation": "claws.use",
+      "handler": "handlers_household_claws::handle_household_stop_instance",
+      "mount": {
+        "file": "admin/rust/server-rs/src/household_bootstrap.rs",
+        "slice": "household_claws_router",
+        "route_literal": "/api/v1/household/instances/{id}/stop",
+        "method_helper": "post"
+      },
+      "expectations": {
+        "success": { "status": 204 },
+        "not_found": { "status": 404, "fixture": "instance_not_found_error" },
+        "auth_error": { "status": 401, "fixture": "empty_body" }
+      }
+    },
+    {
+      "id": "household_restart_instance",
+      "surface": "household",
+      "method": "POST",
+      "path_template": "/api/v1/household/instances/{id}/restart",
+      "auth_kind": "household_pop",
+      "household_operation": "claws.use",
+      "handler": "handlers_household_claws::handle_household_restart_instance",
+      "mount": {
+        "file": "admin/rust/server-rs/src/household_bootstrap.rs",
+        "slice": "household_claws_router",
+        "route_literal": "/api/v1/household/instances/{id}/restart",
+        "method_helper": "post"
+      },
+      "expectations": {
+        "success": { "status": 204 },
+        "not_found": { "status": 404, "fixture": "instance_not_found_error" },
+        "auth_error": { "status": 401, "fixture": "empty_body" }
+      }
+    },
+    {
+      "id": "household_rebuild_instance",
+      "surface": "household",
+      "method": "POST",
+      "path_template": "/api/v1/household/instances/{id}/rebuild",
+      "auth_kind": "household_pop",
+      "household_operation": "claws.use",
+      "handler": "handlers_household_claws::handle_household_rebuild_instance",
+      "mount": {
+        "file": "admin/rust/server-rs/src/household_bootstrap.rs",
+        "slice": "household_claws_router",
+        "route_literal": "/api/v1/household/instances/{id}/rebuild",
+        "method_helper": "post"
+      },
+      "expectations": {
+        "success": { "status": 204 },
+        "not_found": { "status": 404, "fixture": "instance_not_found_error" },
+        "auth_error": { "status": 401, "fixture": "empty_body" }
+      }
+    },
+    {
+      "id": "household_delete_instance",
+      "surface": "household",
+      "method": "DELETE",
+      "path_template": "/api/v1/household/instances/{id}",
+      "auth_kind": "household_pop",
+      "household_operation": "claws.delete",
+      "handler": "handlers_household_claws::handle_household_delete_instance",
+      "mount": {
+        "file": "admin/rust/server-rs/src/household_bootstrap.rs",
+        "slice": "household_claws_router",
+        "route_literal": "/api/v1/household/instances/{id}",
+        "method_helper": "delete"
+      },
+      "expectations": {
+        "success": { "status": 204 },
+        "not_found": { "status": 404, "fixture": "instance_not_found_error" },
         "auth_error": { "status": 401, "fixture": "empty_body" }
       }
     }
@@ -453,6 +723,52 @@
       "reasons": {
         "unavailable_reason_code": "catalog_only"
       }
+    },
+    "admin_instance_create_accepted": {
+      "instance": {
+        "id": "inst-alpha",
+        "name": "Contract Instance",
+        "container": "picoclaw-alpha",
+        "claw_type": "picoclaw",
+        "status": "provisioning"
+      },
+      "job_id": "job-alpha",
+      "message": "Instance creation queued. Poll /api/v1/jobs/job-alpha for status."
+    },
+    "mobile_instance_create_accepted": {
+      "id": "inst-alpha",
+      "name": "Contract Instance",
+      "container": "picoclaw-alpha",
+      "claw_type": "picoclaw",
+      "status": "provisioning",
+      "job_id": "job-alpha"
+    },
+    "admin_instance_status_active": {
+      "instance": {
+        "id": "inst-alpha",
+        "name": "Contract Instance",
+        "container": "picoclaw-alpha",
+        "claw_type": "picoclaw",
+        "status": "active",
+        "tokens_24h": 0,
+        "memory_mb": 0,
+        "cpu_pct": 0.0,
+        "uptime_hours": 0,
+        "auto_update": false,
+        "created_at": "2026-06-20T00:00:00Z",
+        "guest_os": "linux"
+      },
+      "job": null
+    },
+    "mobile_household_instance_status_active": {
+      "status": "active",
+      "provisioning_message": null,
+      "provisioning_error": null,
+      "provisioning_phase": null
+    },
+    "instance_not_found_error": {
+      "error": "instance not found",
+      "code": "NOT_FOUND"
     },
     "admin_auth_unauthorized": {
       "error": "unauthorized",

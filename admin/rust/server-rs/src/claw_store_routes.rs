@@ -21,21 +21,37 @@ pub mod admin {
     pub const AVAILABILITY: &str = "/claws/{name}/availability";
     pub const INSTALL: &str = "/claws/{name}/install";
     pub const UNINSTALL: &str = "/claws/{name}/uninstall";
+    pub const CREATE_INSTANCE: &str = "/instances";
+    pub const INSTANCE_STATUS: &str = "/instances/{id}/status";
+    pub const STOP_INSTANCE: &str = "/instances/{id}/stop";
+    pub const RESTART_INSTANCE: &str = "/instances/{id}/restart";
+    pub const REBUILD_INSTANCE: &str = "/instances/{id}/rebuild";
+    pub const DELETE_INSTANCE: &str = "/instances/{id}";
 
     pub const LIST_PATH: &str = "/api/v1/claws";
     pub const DETAIL_PATH: &str = "/api/v1/claws/{name}";
     pub const AVAILABILITY_PATH: &str = "/api/v1/claws/{name}/availability";
     pub const INSTALL_PATH: &str = "/api/v1/claws/{name}/install";
     pub const UNINSTALL_PATH: &str = "/api/v1/claws/{name}/uninstall";
+    pub const CREATE_INSTANCE_PATH: &str = "/api/v1/instances";
+    pub const INSTANCE_STATUS_PATH: &str = "/api/v1/instances/{id}/status";
+    pub const STOP_INSTANCE_PATH: &str = "/api/v1/instances/{id}/stop";
+    pub const RESTART_INSTANCE_PATH: &str = "/api/v1/instances/{id}/restart";
+    pub const REBUILD_INSTANCE_PATH: &str = "/api/v1/instances/{id}/rebuild";
+    pub const DELETE_INSTANCE_PATH: &str = "/api/v1/instances/{id}";
 }
 
 pub mod mobile {
     pub const LIST: &str = "/claws";
+    pub const CREATE_INSTANCE: &str = "/instances";
+    pub const INSTANCE_STATUS: &str = "/instances/{id}/status";
     pub const AVAILABILITY: &str = "/api/v1/mobile/claws/{name}/availability";
     pub const INSTALL: &str = "/api/v1/mobile/claws/{name}/install";
     pub const UNINSTALL: &str = "/api/v1/mobile/claws/{name}/uninstall";
 
     pub const LIST_PATH: &str = "/api/v1/mobile/claws";
+    pub const CREATE_INSTANCE_PATH: &str = "/api/v1/mobile/instances";
+    pub const INSTANCE_STATUS_PATH: &str = "/api/v1/mobile/instances/{id}/status";
     pub const AVAILABILITY_PATH: &str = "/api/v1/mobile/claws/{name}/availability";
     pub const INSTALL_PATH: &str = "/api/v1/mobile/claws/{name}/install";
     pub const UNINSTALL_PATH: &str = "/api/v1/mobile/claws/{name}/uninstall";
@@ -46,10 +62,17 @@ pub mod household {
     pub const AVAILABILITY: &str = "/api/v1/household/claws/{name}/availability";
     pub const INSTALL: &str = "/api/v1/household/claws/{name}/install";
     pub const UNINSTALL: &str = "/api/v1/household/claws/{name}/uninstall";
+    pub const CREATE_INSTANCE: &str = "/api/v1/household/instances";
+    pub const INSTANCE_STATUS: &str = "/api/v1/household/instances/{id}/status";
+    pub const STOP_INSTANCE: &str = "/api/v1/household/instances/{id}/stop";
+    pub const RESTART_INSTANCE: &str = "/api/v1/household/instances/{id}/restart";
+    pub const REBUILD_INSTANCE: &str = "/api/v1/household/instances/{id}/rebuild";
+    pub const DELETE_INSTANCE: &str = "/api/v1/household/instances/{id}";
 }
 
 pub const METHOD_GET: &str = "GET";
 pub const METHOD_POST: &str = "POST";
+pub const METHOD_DELETE: &str = "DELETE";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ClawStoreRouteSpec {
@@ -121,6 +144,72 @@ pub const ROUTES: &[ClawStoreRouteSpec] = &[
         household_operation: None,
     },
     ClawStoreRouteSpec {
+        id: "admin_create_instance",
+        surface: "admin",
+        method: METHOD_POST,
+        path_template: admin::CREATE_INSTANCE_PATH,
+        mount_file: "admin/rust/server-rs/src/main.rs",
+        mount_slice: "main_api_rest",
+        route_literal: admin::CREATE_INSTANCE,
+        route_expr: "\"/instances\"",
+        household_operation: None,
+    },
+    ClawStoreRouteSpec {
+        id: "admin_instance_status",
+        surface: "admin",
+        method: METHOD_GET,
+        path_template: admin::INSTANCE_STATUS_PATH,
+        mount_file: "admin/rust/server-rs/src/main.rs",
+        mount_slice: "main_api_rest",
+        route_literal: admin::INSTANCE_STATUS,
+        route_expr: "\"/instances/{id}/status\"",
+        household_operation: None,
+    },
+    ClawStoreRouteSpec {
+        id: "admin_stop_instance",
+        surface: "admin",
+        method: METHOD_POST,
+        path_template: admin::STOP_INSTANCE_PATH,
+        mount_file: "admin/rust/server-rs/src/main.rs",
+        mount_slice: "main_api_rest",
+        route_literal: admin::STOP_INSTANCE,
+        route_expr: "\"/instances/{id}/stop\"",
+        household_operation: None,
+    },
+    ClawStoreRouteSpec {
+        id: "admin_restart_instance",
+        surface: "admin",
+        method: METHOD_POST,
+        path_template: admin::RESTART_INSTANCE_PATH,
+        mount_file: "admin/rust/server-rs/src/main.rs",
+        mount_slice: "main_api_rest",
+        route_literal: admin::RESTART_INSTANCE,
+        route_expr: "\"/instances/{id}/restart\"",
+        household_operation: None,
+    },
+    ClawStoreRouteSpec {
+        id: "admin_rebuild_instance",
+        surface: "admin",
+        method: METHOD_POST,
+        path_template: admin::REBUILD_INSTANCE_PATH,
+        mount_file: "admin/rust/server-rs/src/main.rs",
+        mount_slice: "main_api_rest",
+        route_literal: admin::REBUILD_INSTANCE,
+        route_expr: "\"/instances/{id}/rebuild\"",
+        household_operation: None,
+    },
+    ClawStoreRouteSpec {
+        id: "admin_delete_instance",
+        surface: "admin",
+        method: METHOD_DELETE,
+        path_template: admin::DELETE_INSTANCE_PATH,
+        mount_file: "admin/rust/server-rs/src/main.rs",
+        mount_slice: "main_api_rest",
+        route_literal: admin::DELETE_INSTANCE,
+        route_expr: "delete(handlers_instances::handle_delete_instance)",
+        household_operation: None,
+    },
+    ClawStoreRouteSpec {
         id: "mobile_list_claws",
         surface: "mobile",
         method: METHOD_GET,
@@ -129,6 +218,28 @@ pub const ROUTES: &[ClawStoreRouteSpec] = &[
         mount_slice: "mobile_nested_routes",
         route_literal: mobile::LIST,
         route_expr: "mobile::LIST",
+        household_operation: None,
+    },
+    ClawStoreRouteSpec {
+        id: "mobile_create_instance",
+        surface: "mobile",
+        method: METHOD_POST,
+        path_template: mobile::CREATE_INSTANCE_PATH,
+        mount_file: "admin/rust/server-rs/src/main.rs",
+        mount_slice: "main_mobile_api",
+        route_literal: mobile::CREATE_INSTANCE,
+        route_expr: "\"/instances\"",
+        household_operation: None,
+    },
+    ClawStoreRouteSpec {
+        id: "mobile_instance_status",
+        surface: "mobile",
+        method: METHOD_GET,
+        path_template: mobile::INSTANCE_STATUS_PATH,
+        mount_file: "admin/rust/server-rs/src/main.rs",
+        mount_slice: "main_mobile_api",
+        route_literal: mobile::INSTANCE_STATUS,
+        route_expr: "\"/instances/{id}/status\"",
         household_operation: None,
     },
     ClawStoreRouteSpec {
@@ -206,6 +317,72 @@ pub const ROUTES: &[ClawStoreRouteSpec] = &[
         mount_slice: "household_routes",
         route_literal: household::UNINSTALL,
         route_expr: "household::UNINSTALL",
+        household_operation: Some("claws.delete"),
+    },
+    ClawStoreRouteSpec {
+        id: "household_create_instance",
+        surface: "household",
+        method: METHOD_POST,
+        path_template: household::CREATE_INSTANCE,
+        mount_file: "admin/rust/server-rs/src/household_bootstrap.rs",
+        mount_slice: "household_claws_router",
+        route_literal: household::CREATE_INSTANCE,
+        route_expr: "\"/api/v1/household/instances\"",
+        household_operation: Some("claws.create"),
+    },
+    ClawStoreRouteSpec {
+        id: "household_instance_status",
+        surface: "household",
+        method: METHOD_GET,
+        path_template: household::INSTANCE_STATUS,
+        mount_file: "admin/rust/server-rs/src/household_bootstrap.rs",
+        mount_slice: "household_claws_router",
+        route_literal: household::INSTANCE_STATUS,
+        route_expr: "\"/api/v1/household/instances/{id}/status\"",
+        household_operation: Some("claws.list"),
+    },
+    ClawStoreRouteSpec {
+        id: "household_stop_instance",
+        surface: "household",
+        method: METHOD_POST,
+        path_template: household::STOP_INSTANCE,
+        mount_file: "admin/rust/server-rs/src/household_bootstrap.rs",
+        mount_slice: "household_claws_router",
+        route_literal: household::STOP_INSTANCE,
+        route_expr: "\"/api/v1/household/instances/{id}/stop\"",
+        household_operation: Some("claws.use"),
+    },
+    ClawStoreRouteSpec {
+        id: "household_restart_instance",
+        surface: "household",
+        method: METHOD_POST,
+        path_template: household::RESTART_INSTANCE,
+        mount_file: "admin/rust/server-rs/src/household_bootstrap.rs",
+        mount_slice: "household_claws_router",
+        route_literal: household::RESTART_INSTANCE,
+        route_expr: "\"/api/v1/household/instances/{id}/restart\"",
+        household_operation: Some("claws.use"),
+    },
+    ClawStoreRouteSpec {
+        id: "household_rebuild_instance",
+        surface: "household",
+        method: METHOD_POST,
+        path_template: household::REBUILD_INSTANCE,
+        mount_file: "admin/rust/server-rs/src/household_bootstrap.rs",
+        mount_slice: "household_claws_router",
+        route_literal: household::REBUILD_INSTANCE,
+        route_expr: "\"/api/v1/household/instances/{id}/rebuild\"",
+        household_operation: Some("claws.use"),
+    },
+    ClawStoreRouteSpec {
+        id: "household_delete_instance",
+        surface: "household",
+        method: METHOD_DELETE,
+        path_template: household::DELETE_INSTANCE,
+        mount_file: "admin/rust/server-rs/src/household_bootstrap.rs",
+        mount_slice: "household_claws_router",
+        route_literal: household::DELETE_INSTANCE,
+        route_expr: "\"/api/v1/household/instances/{id}\"",
         household_operation: Some("claws.delete"),
     },
 ];
