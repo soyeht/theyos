@@ -738,6 +738,69 @@ fn c4_2b_1_attach_token_fixture_pins_json_shape() {
 }
 
 #[test]
+fn c4_2b_2_websocket_routes_pin_upgrade_shape_without_success_bodies() {
+    let contract: Value = serde_json::from_str(include_str!(
+        "../../../contracts/claw-store/v1/contract.json"
+    ))
+    .expect("claw-store v1 contract must parse");
+    let routes = contract["routes"]
+        .as_array()
+        .expect("routes must be an array");
+    let route = |id: &str| {
+        routes
+            .iter()
+            .find(|route| route["id"] == id)
+            .unwrap_or_else(|| panic!("missing route {id}"))
+    };
+
+    let admin = route("admin_terminal_pty");
+    assert_eq!(admin["kind"], "websocket_upgrade");
+    assert_eq!(admin["auth_kind"], "admin_stream_auth");
+    assert_eq!(admin["expectations"]["upgrade"]["status"], 101);
+    assert_eq!(admin["expectations"]["upgrade"]["protocol"], "websocket");
+    assert!(
+        admin["expectations"].get("success").is_none(),
+        "admin PTY websocket must not declare a JSON success body"
+    );
+    assert!(
+        admin["expectations"]["upgrade"].get("fixture").is_none(),
+        "admin PTY websocket upgrade must not point at a fixture"
+    );
+
+    let household = route("household_terminal_pty");
+    assert_eq!(household["kind"], "websocket_upgrade");
+    assert_eq!(household["auth_kind"], "household_attach_token");
+    assert_eq!(
+        household["attach_token_header"],
+        "x-soyeht-household-attach-token"
+    );
+    assert_eq!(household["peer_guard"], true);
+    assert_eq!(household["expectations"]["upgrade"]["status"], 101);
+    assert_eq!(
+        household["expectations"]["upgrade"]["protocol"],
+        "websocket"
+    );
+    assert_eq!(household["expectations"]["peer_rejected"]["status"], 403);
+    assert_eq!(household["expectations"]["auth_error"]["status"], 401);
+    assert!(
+        household["expectations"].get("success").is_none(),
+        "household PTY websocket must not declare a JSON success body"
+    );
+    assert!(
+        household["expectations"]["upgrade"]
+            .get("fixture")
+            .is_none(),
+        "household PTY websocket upgrade must not point at a fixture"
+    );
+    assert!(
+        household["expectations"]["auth_error"]
+            .get("fixture")
+            .is_none(),
+        "household attach-token PTY auth failure is bodyless"
+    );
+}
+
+#[test]
 fn claw_list_item_omits_missing_availability_for_optional_dto_path() {
     let list_item = ClawListItemResponse {
         catalog: ClawCatalogResponse {

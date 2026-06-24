@@ -29,6 +29,7 @@ pub mod admin {
     pub const DELETE_INSTANCE: &str = "/instances/{id}";
     pub const WORKSPACES: &str = "/terminals/{container}/workspaces";
     pub const WORKSPACE: &str = "/terminals/{container}/workspaces/{id}";
+    pub const PTY: &str = "/terminals/{container}/pty";
 
     pub const LIST_PATH: &str = "/api/v1/claws";
     pub const DETAIL_PATH: &str = "/api/v1/claws/{name}";
@@ -43,6 +44,7 @@ pub mod admin {
     pub const DELETE_INSTANCE_PATH: &str = "/api/v1/instances/{id}";
     pub const WORKSPACES_PATH: &str = "/api/v1/terminals/{container}/workspaces";
     pub const WORKSPACE_PATH: &str = "/api/v1/terminals/{container}/workspaces/{id}";
+    pub const PTY_PATH: &str = "/api/v1/terminals/{container}/pty";
 }
 
 pub mod mobile {
@@ -75,12 +77,15 @@ pub mod household {
     pub const WORKSPACES: &str = "/api/v1/household/terminals/{container}/workspaces";
     pub const WORKSPACE: &str = "/api/v1/household/terminals/{container}/workspaces/{id}";
     pub const ATTACH_TOKEN: &str = "/api/v1/household/terminals/{container}/attach-token";
+    pub const PTY: &str = "/api/v1/household/terminals/{container}/pty";
 }
 
 pub const METHOD_GET: &str = "GET";
 pub const METHOD_POST: &str = "POST";
 pub const METHOD_PATCH: &str = "PATCH";
 pub const METHOD_DELETE: &str = "DELETE";
+pub const KIND_HTTP_JSON: &str = "http_json";
+pub const KIND_WEBSOCKET_UPGRADE: &str = "websocket_upgrade";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ClawStoreRouteSpec {
@@ -93,6 +98,16 @@ pub struct ClawStoreRouteSpec {
     pub route_literal: &'static str,
     pub route_expr: &'static str,
     pub household_operation: Option<&'static str>,
+}
+
+impl ClawStoreRouteSpec {
+    #[must_use]
+    pub fn kind(&self) -> &'static str {
+        match self.id {
+            "admin_terminal_pty" | "household_terminal_pty" => KIND_WEBSOCKET_UPGRADE,
+            _ => KIND_HTTP_JSON,
+        }
+    }
 }
 
 pub const ROUTES: &[ClawStoreRouteSpec] = &[
@@ -259,6 +274,17 @@ pub const ROUTES: &[ClawStoreRouteSpec] = &[
         mount_slice: "main_api_rest",
         route_literal: admin::WORKSPACE,
         route_expr: "\"/terminals/{container}/workspaces/{id}\"",
+        household_operation: None,
+    },
+    ClawStoreRouteSpec {
+        id: "admin_terminal_pty",
+        surface: "admin",
+        method: METHOD_GET,
+        path_template: admin::PTY_PATH,
+        mount_file: "admin/rust/server-rs/src/main.rs",
+        mount_slice: "main_api_streaming",
+        route_literal: admin::PTY,
+        route_expr: "\"/terminals/{container}/pty\"",
         household_operation: None,
     },
     ClawStoreRouteSpec {
@@ -491,6 +517,17 @@ pub const ROUTES: &[ClawStoreRouteSpec] = &[
         route_literal: household::ATTACH_TOKEN,
         route_expr: "\"/api/v1/household/terminals/{container}/attach-token\"",
         household_operation: Some("claws.use"),
+    },
+    ClawStoreRouteSpec {
+        id: "household_terminal_pty",
+        surface: "household",
+        method: METHOD_GET,
+        path_template: household::PTY,
+        mount_file: "admin/rust/server-rs/src/household_bootstrap.rs",
+        mount_slice: "household_claws_router",
+        route_literal: household::PTY,
+        route_expr: "\"/api/v1/household/terminals/{container}/pty\"",
+        household_operation: None,
     },
 ];
 
