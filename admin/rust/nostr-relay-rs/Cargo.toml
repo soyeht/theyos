@@ -1,0 +1,36 @@
+[package]
+name = "nostr-relay-rs"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+
+[lib]
+name = "nostr_relay_rs"
+path = "src/lib.rs"
+
+[dependencies]
+household-rs   = { workspace = true }
+
+serde          = { workspace = true }
+serde_json     = { workspace = true }
+thiserror      = { workspace = true }
+tokio          = { workspace = true }
+tracing        = { workspace = true }
+
+# Real Nostr crypto + NIP-44 v2 encryption. The crate handles
+# secp256k1 keypair management, event id derivation (NIP-01), and
+# encrypted DMs in a reviewed implementation — rolling our own NIP-44
+# under time pressure is exactly the kind of partial work we refuse
+# to ship.
+nostr          = { version = "0.43", default-features = false, features = ["std", "nip04", "nip44"] }
+tokio-tungstenite = { version = "0.24", default-features = false, features = ["rustls-tls-webpki-roots", "connect"] }
+futures-util   = { workspace = true }
+url            = "2"
+base64         = { workspace = true }
+
+[dev-dependencies]
+tempfile       = { workspace = true }
+tracing-test   = { workspace = true, features = ["no-env-filter"] }
+
+[lints]
+workspace = true
