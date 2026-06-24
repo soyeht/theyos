@@ -36,6 +36,7 @@ use std::collections::HashMap;
 use std::net::IpAddr;
 use std::sync::{Arc, OnceLock};
 
+use household_rs::bootstrap_state::BootstrapState;
 use household_rs::pair_device::{PairDeviceWindow, PairToken};
 use household_rs::pair_machine::{PairMachineState, PairMachineWindow, PairMachineWindowSnapshot};
 use tokio::sync::Mutex;
@@ -47,7 +48,7 @@ use tracing::{info, warn};
 use crate::bonjour_impl_dns_sd as backend;
 #[cfg(not(target_os = "macos"))]
 use crate::bonjour_impl_mdns_sd as backend;
-use crate::household_listener::InterfaceClass;
+use crate::household_listener::{HouseholdExposurePolicy, InterfaceClass};
 
 /// Service type per FR-017.
 const SERVICE_TYPE: &str = "_soyeht-household._tcp.local.";
@@ -266,8 +267,8 @@ impl HouseholdBonjour {
 }
 
 /// Publish `_soyeht-household._tcp` on the supplied set of (address,
-/// interface-class) targets. Loopback entries are filtered out — Bonjour
-/// only advertises peer-reachable addresses.
+/// interface-class) targets allowed by [`HouseholdExposurePolicy`]. Loopback
+/// entries are filtered out — Bonjour only advertises peer-reachable addresses.
 ///
 /// Spawns a background task that reflects [`PairDeviceWindow`] state changes into
 /// the TXT records. Returns a [`HouseholdBonjour`] handle that owns the
@@ -277,6 +278,7 @@ pub async fn publish_household_bonjour(
     pair_device_window: Arc<PairDeviceWindow>,
     pair_machine_window: Arc<PairMachineWindow>,
     targets: Vec<(IpAddr, InterfaceClass)>,
+    exposure_state: BootstrapState,
 ) -> Result<HouseholdBonjour, backend::BackendError> {
     let daemon = backend::PublisherHandle::new()?;
     let fullnames: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
@@ -293,6 +295,7 @@ pub async fn publish_household_bonjour(
     let host = HouseholdBonjour::host_label(&params);
 
     let mut bound = 0usize;
+    let targets = HouseholdExposurePolicy::allowed_targets(exposure_state, targets);
     for (ip, class) in &targets {
         if *class == InterfaceClass::Loopback {
             continue;

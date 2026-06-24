@@ -35,7 +35,7 @@ use crate::bonjour_impl_mdns_sd as backend;
 
 use crate::bonjour_browser::SOYEHT_HOUSEHOLD_SERVICE;
 use crate::handlers_bootstrap::BootstrapStateArc;
-use crate::household_listener::{BoundSet, InterfaceClass};
+use crate::household_listener::{BoundSet, HouseholdExposurePolicy, InterfaceClass};
 use household_rs::bootstrap_state::BootstrapState;
 use household_rs::pair_machine::{PairMachineState, PairMachineWindow};
 
@@ -234,18 +234,20 @@ fn publish_targets(
     fullnames: &mut HashMap<IpAddr, String>,
     targets: &[(IpAddr, InterfaceClass)],
     spec: &SetupBeaconPublishSpec<'_>,
+    state: BootstrapState,
     source: &'static str,
 ) -> usize {
     let mut bound = 0usize;
+    let targets = HouseholdExposurePolicy::allowed_targets(state, targets.iter().copied());
     for (ip, class) in targets {
-        if *class == InterfaceClass::Loopback || fullnames.contains_key(ip) {
+        if class == InterfaceClass::Loopback || fullnames.contains_key(&ip) {
             continue;
         }
         let service = backend::ServiceSpec {
             service_type: SETUP_SERVICE_TYPE,
             instance: spec.instance,
             host: spec.host,
-            ip: *ip,
+            ip,
             port: spec.port,
             txt: spec.txt,
         };
@@ -258,7 +260,7 @@ fn publish_targets(
                     fullname = %fullname,
                     source,
                 );
-                fullnames.insert(*ip, fullname);
+                fullnames.insert(ip, fullname);
                 bound += 1;
             }
             Err(e) => {
@@ -293,8 +295,10 @@ async fn sync_bound_targets(
     inner: &SetupBeaconInner,
     targets: Vec<(IpAddr, InterfaceClass)>,
     spec: &SetupBeaconPublishSpec<'_>,
+    state: BootstrapState,
 ) {
-    let live: HashSet<IpAddr> = targets
+    let policy_targets = HouseholdExposurePolicy::allowed_targets(state, targets);
+    let live: HashSet<IpAddr> = policy_targets
         .iter()
         .filter_map(|(ip, class)| (*class != InterfaceClass::Loopback).then_some(*ip))
         .collect();
@@ -330,7 +334,14 @@ async fn sync_bound_targets(
 
     let added = {
         let mut guard = inner.fullnames.lock().await;
-        publish_targets(&inner.daemon, &mut guard, &targets, spec, "refresh")
+        publish_targets(
+            &inner.daemon,
+            &mut guard,
+            &policy_targets,
+            spec,
+            state,
+            "refresh",
+        )
     };
     if added > 0 {
         info!(
@@ -363,9 +374,10 @@ pub async fn publish_setup_beacon_with_bound_set(
     targets: Vec<(IpAddr, InterfaceClass)>,
     bound_set: Option<BoundSet>,
 ) -> Result<Option<SetupBeacon>, backend::BackendError> {
-    {
+    let initial_state = {
         let state = bootstrap.read().await;
-        if !should_publish(*state) {
+        let initial_state = *state;
+        if !should_publish(initial_state) {
             info!(
                 stage = "setup_beacon.skipped",
                 reason = "state_already_advanced",
@@ -373,7 +385,8 @@ pub async fn publish_setup_beacon_with_bound_set(
             );
             return Ok(None);
         }
-    }
+        initial_state
+    };
 
     let t0 = Instant::now();
     let daemon = backend::PublisherHandle::new()?;
@@ -394,7 +407,14 @@ pub async fn publish_setup_beacon_with_bound_set(
     };
     let bound = {
         let mut guard = fullnames.lock().await;
-        publish_targets(&daemon, &mut guard, &targets, &spec, "startup")
+        publish_targets(
+            &daemon,
+            &mut guard,
+            &targets,
+            &spec,
+            initial_state,
+            "startup",
+        )
     };
     // elapsed_ms: as_millis() returns u128 but a u64 holds ~585 millennia;
     // truncation is impossible in practice.
@@ -423,7 +443,8 @@ pub async fn publish_setup_beacon_with_bound_set(
         loop {
             interval.tick().await;
             let state = bootstrap.read().await;
-            if !should_publish(*state) {
+            let current_state = *state;
+            if !should_publish(current_state) {
                 let new_state = state.as_str().to_string();
                 drop(state);
                 info!(stage = "setup_beacon.withdrawing", new_state = %new_state);
@@ -437,7 +458,13 @@ pub async fn publish_setup_beacon_with_bound_set(
             }
             drop(state);
             if let Some(bound_set) = &bound_set {
-                sync_bound_targets(&inner_clone, bound_set.snapshot_targets().await, &spec).await;
+                sync_bound_targets(
+                    &inner_clone,
+                    bound_set.snapshot_targets().await,
+                    &spec,
+                    current_state,
+                )
+                .await;
             }
         }
     });
