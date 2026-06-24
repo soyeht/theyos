@@ -6,7 +6,7 @@ use axum::{
     http::{Method, Request, StatusCode, header},
     middleware,
     response::{IntoResponse, Response},
-    routing::{get, post},
+    routing::{delete, get, post},
 };
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD as B64URL};
 use claw_rs::{ClawCatalogResponse, ClawStatus};
@@ -32,7 +32,7 @@ use server_rs::{
     auth::require_auth,
     claw_store_service, handlers_claws, handlers_household_claws,
     handlers_household_claws::HouseholdClawsState,
-    handlers_mobile,
+    handlers_instances, handlers_mobile,
     household_attach_token::HouseholdAttachTokenStore,
     household_state::HouseholdState,
     ratelimit::Limiter,
@@ -197,6 +197,10 @@ fn admin_router(state: SharedState) -> Router {
 fn admin_auth_router(state: SharedState) -> Router {
     Router::new()
         .route("/api/v1/claws", get(handlers_claws::handle_list_claws))
+        .route(
+            "/api/v1/instances",
+            post(handlers_instances::handle_create_instance_body),
+        )
         .layer(middleware::from_fn_with_state(
             Arc::clone(&state),
             require_auth,
@@ -221,6 +225,15 @@ fn mobile_router(state: SharedState) -> Router {
         .route(
             "/api/v1/mobile/claws/{name}/uninstall",
             post(handlers_mobile::handle_mobile_uninstall_claw),
+        )
+        .route(
+            "/api/v1/mobile/instances",
+            get(handlers_mobile::handle_mobile_instances)
+                .post(handlers_mobile::handle_mobile_create_instance),
+        )
+        .route(
+            "/api/v1/mobile/instances/{id}/status",
+            get(handlers_mobile::handle_mobile_instance_status),
         )
         .with_state(state)
 }
@@ -285,6 +298,31 @@ fn household_fixture() -> HouseholdFixture {
         .route(
             "/api/v1/household/claws/{name}/uninstall",
             post(handlers_household_claws::handle_household_uninstall_claw),
+        )
+        .route(
+            "/api/v1/household/instances",
+            get(handlers_household_claws::handle_household_list_instances)
+                .post(handlers_household_claws::handle_household_create_instance),
+        )
+        .route(
+            "/api/v1/household/instances/{id}/status",
+            get(handlers_household_claws::handle_household_instance_status),
+        )
+        .route(
+            "/api/v1/household/instances/{id}/stop",
+            post(handlers_household_claws::handle_household_stop_instance),
+        )
+        .route(
+            "/api/v1/household/instances/{id}/restart",
+            post(handlers_household_claws::handle_household_restart_instance),
+        )
+        .route(
+            "/api/v1/household/instances/{id}/rebuild",
+            post(handlers_household_claws::handle_household_rebuild_instance),
+        )
+        .route(
+            "/api/v1/household/instances/{id}",
+            delete(handlers_household_claws::handle_household_delete_instance),
         )
         .with_state(claws_state);
 
@@ -593,6 +631,50 @@ fn typed_response_serializers_match_claw_store_v1_fixtures() {
 }
 
 #[test]
+fn c4_1_instance_lifecycle_fixtures_pin_nested_and_flat_shapes() {
+    let admin_create = fixture("admin_instance_create_accepted");
+    assert_eq!(admin_create["instance"]["id"], "inst-alpha");
+    assert_eq!(admin_create["instance"]["claw_type"], "picoclaw");
+    assert_eq!(admin_create["instance"]["status"], "provisioning");
+    assert_eq!(admin_create["job_id"], "job-alpha");
+    assert!(
+        admin_create["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("/api/v1/jobs/job-alpha")),
+        "admin create fixture must keep the nested job-polling message shape"
+    );
+
+    let flat_create = fixture("mobile_instance_create_accepted");
+    assert_eq!(flat_create["id"], "inst-alpha");
+    assert_eq!(flat_create["container"], "picoclaw-alpha");
+    assert_eq!(flat_create["claw_type"], "picoclaw");
+    assert_eq!(flat_create["status"], "provisioning");
+    assert_eq!(flat_create["job_id"], "job-alpha");
+    assert!(
+        flat_create.get("instance").is_none(),
+        "mobile/household create fixture must stay flat"
+    );
+
+    let admin_status = fixture("admin_instance_status_active");
+    assert_eq!(admin_status["instance"]["id"], "inst-alpha");
+    assert_eq!(admin_status["instance"]["status"], "active");
+    assert_eq!(admin_status["instance"]["guest_os"], "linux");
+    assert_eq!(admin_status["job"], Value::Null);
+
+    let flat_status = fixture("mobile_household_instance_status_active");
+    assert_eq!(flat_status["status"], "active");
+    assert_eq!(flat_status["provisioning_message"], Value::Null);
+    assert_eq!(flat_status["provisioning_error"], Value::Null);
+    assert_eq!(flat_status["provisioning_phase"], Value::Null);
+    assert!(
+        flat_status.get("instance").is_none(),
+        "mobile/household status fixture must stay flat"
+    );
+
+    assert_eq!(fixture("instance_not_found_error")["code"], "NOT_FOUND");
+}
+
+#[test]
 fn claw_list_item_omits_missing_availability_for_optional_dto_path() {
     let list_item = ClawListItemResponse {
         catalog: ClawCatalogResponse {
@@ -744,6 +826,22 @@ async fn auth_and_admin_required_errors_match_declared_claw_store_v1_fixtures() 
         "admin_auth_unauthorized",
     );
 
+    let create_body = br#"{"name":"contract-instance","claw_type":"picoclaw"}"#.to_vec();
+    let (status, _bytes, body) = request(
+        admin_auth_router(Arc::clone(&admin_state)),
+        Method::POST,
+        "/api/v1/instances",
+        create_body.clone(),
+        None,
+    )
+    .await;
+    assert_fixture_body(
+        status,
+        &body,
+        StatusCode::UNAUTHORIZED,
+        "admin_auth_unauthorized",
+    );
+
     let mobile_state = shared_state();
     let (status, _bytes, body) = request(
         mobile_router(Arc::clone(&mobile_state)),
@@ -760,12 +858,42 @@ async fn auth_and_admin_required_errors_match_declared_claw_store_v1_fixtures() 
         "mobile_missing_auth",
     );
 
+    let (status, _bytes, body) = request(
+        mobile_router(Arc::clone(&mobile_state)),
+        Method::POST,
+        "/api/v1/mobile/instances",
+        create_body.clone(),
+        None,
+    )
+    .await;
+    assert_fixture_body(
+        status,
+        &body,
+        StatusCode::UNAUTHORIZED,
+        "mobile_missing_auth",
+    );
+
     let member_token = mobile_token_for_role(&mobile_state, "member", UserRole::User);
     let (status, _bytes, body) = request(
         mobile_router(Arc::clone(&mobile_state)),
         Method::POST,
         "/api/v1/mobile/claws/picoclaw/install",
         Vec::new(),
+        Some(format!("Bearer {member_token}")),
+    )
+    .await;
+    assert_fixture_body(
+        status,
+        &body,
+        StatusCode::FORBIDDEN,
+        "mobile_admin_required",
+    );
+
+    let (status, _bytes, body) = request(
+        mobile_router(Arc::clone(&mobile_state)),
+        Method::POST,
+        "/api/v1/mobile/instances",
+        create_body,
         Some(format!("Bearer {member_token}")),
     )
     .await;
@@ -1385,6 +1513,18 @@ async fn household_pop_auth_failure_is_empty_401() {
     for (method, path) in [
         (Method::GET, "/api/v1/household/claws"),
         (Method::POST, "/api/v1/household/claws/picoclaw/install"),
+        (Method::POST, "/api/v1/household/instances"),
+        (Method::GET, "/api/v1/household/instances/inst-alpha/status"),
+        (Method::POST, "/api/v1/household/instances/inst-alpha/stop"),
+        (
+            Method::POST,
+            "/api/v1/household/instances/inst-alpha/restart",
+        ),
+        (
+            Method::POST,
+            "/api/v1/household/instances/inst-alpha/rebuild",
+        ),
+        (Method::DELETE, "/api/v1/household/instances/inst-alpha"),
     ] {
         let response = household
             .app

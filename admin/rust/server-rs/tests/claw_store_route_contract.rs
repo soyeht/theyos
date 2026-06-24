@@ -148,6 +148,7 @@ fn operation_variant(operation: &str) -> &'static str {
     match operation {
         "claws.list" => "Operation::ClawsList",
         "claws.create" => "Operation::ClawsCreate",
+        "claws.use" => "Operation::ClawsUse",
         "claws.delete" => "Operation::ClawsDelete",
         other => panic!("unknown household operation: {other}"),
     }
@@ -278,7 +279,7 @@ fn claw_store_v1_contract_metadata_is_valid() {
             route.id
         );
         assert!(
-            matches!(route.method.as_str(), "GET" | "POST"),
+            matches!(route.method.as_str(), "GET" | "POST" | "DELETE"),
             "{} uses unexpected method {}",
             route.id,
             route.method
@@ -504,6 +505,12 @@ fn current_wire_quirks_are_explicitly_pinned() {
         "admin_claw_availability",
         "admin_install_claw",
         "admin_uninstall_claw",
+        "admin_create_instance",
+        "admin_instance_status",
+        "admin_stop_instance",
+        "admin_restart_instance",
+        "admin_rebuild_instance",
+        "admin_delete_instance",
     ] {
         assert_eq!(
             route(id).expectations["auth_error"].fixture.as_deref(),
@@ -513,6 +520,8 @@ fn current_wire_quirks_are_explicitly_pinned() {
 
     for id in [
         "mobile_list_claws",
+        "mobile_create_instance",
+        "mobile_instance_status",
         "mobile_claw_availability",
         "mobile_install_claw",
         "mobile_uninstall_claw",
@@ -523,10 +532,32 @@ fn current_wire_quirks_are_explicitly_pinned() {
         );
     }
 
-    for id in ["mobile_install_claw", "mobile_uninstall_claw"] {
+    for id in [
+        "mobile_create_instance",
+        "mobile_install_claw",
+        "mobile_uninstall_claw",
+    ] {
         assert_eq!(
             route(id).expectations["admin_required"].fixture.as_deref(),
             Some("mobile_admin_required")
+        );
+    }
+
+    for id in [
+        "household_list_claws",
+        "household_claw_availability",
+        "household_install_claw",
+        "household_uninstall_claw",
+        "household_create_instance",
+        "household_instance_status",
+        "household_stop_instance",
+        "household_restart_instance",
+        "household_rebuild_instance",
+        "household_delete_instance",
+    ] {
+        assert_eq!(
+            route(id).expectations["auth_error"].fixture.as_deref(),
+            Some("empty_body")
         );
     }
 
@@ -568,6 +599,56 @@ fn current_wire_quirks_are_explicitly_pinned() {
         assert_eq!(
             route(id).expectations["instances_exist"].fixture.as_deref(),
             Some("uninstall_instances_exist_error")
+        );
+    }
+}
+
+#[test]
+fn c4_1_contract_scope_is_core_lifecycle_without_unmounted_mobile_routes() {
+    let contract = contract();
+    let route_ids = contract
+        .routes
+        .iter()
+        .map(|route| route.id.as_str())
+        .collect::<HashSet<_>>();
+
+    for required in [
+        "admin_create_instance",
+        "admin_instance_status",
+        "admin_stop_instance",
+        "admin_restart_instance",
+        "admin_rebuild_instance",
+        "admin_delete_instance",
+        "mobile_create_instance",
+        "mobile_instance_status",
+        "household_create_instance",
+        "household_instance_status",
+        "household_stop_instance",
+        "household_restart_instance",
+        "household_rebuild_instance",
+        "household_delete_instance",
+    ] {
+        assert!(
+            route_ids.contains(required),
+            "missing C4.1 route {required}"
+        );
+    }
+
+    for not_mounted in [
+        "mobile_delete_instance",
+        "mobile_stop_instance",
+        "mobile_restart_instance",
+        "mobile_rebuild_instance",
+        "mobile_list_workspaces",
+        "mobile_terminal_pty",
+        "admin_list_workspaces",
+        "admin_terminal_pty",
+        "household_list_workspaces",
+        "household_terminal_pty",
+    ] {
+        assert!(
+            !route_ids.contains(not_mounted),
+            "{not_mounted} is outside C4.1 and must not be declared as a success route"
         );
     }
 }
