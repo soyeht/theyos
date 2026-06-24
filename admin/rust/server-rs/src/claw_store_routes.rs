@@ -74,6 +74,7 @@ pub mod household {
     pub const DELETE_INSTANCE: &str = "/api/v1/household/instances/{id}";
     pub const WORKSPACES: &str = "/api/v1/household/terminals/{container}/workspaces";
     pub const WORKSPACE: &str = "/api/v1/household/terminals/{container}/workspaces/{id}";
+    pub const ATTACH_TOKEN: &str = "/api/v1/household/terminals/{container}/attach-token";
 }
 
 pub const METHOD_GET: &str = "GET";
@@ -478,6 +479,17 @@ pub const ROUTES: &[ClawStoreRouteSpec] = &[
         mount_slice: "household_claws_router",
         route_literal: household::WORKSPACE,
         route_expr: "\"/api/v1/household/terminals/{container}/workspaces/{id}\"",
+        household_operation: Some("claws.use"),
+    },
+    ClawStoreRouteSpec {
+        id: "household_attach_token",
+        surface: "household",
+        method: METHOD_POST,
+        path_template: household::ATTACH_TOKEN,
+        mount_file: "admin/rust/server-rs/src/household_bootstrap.rs",
+        mount_slice: "household_claws_router",
+        route_literal: household::ATTACH_TOKEN,
+        route_expr: "\"/api/v1/household/terminals/{container}/attach-token\"",
         household_operation: Some("claws.use"),
     },
 ];

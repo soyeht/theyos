@@ -21,6 +21,8 @@ struct Route {
     path_template: String,
     auth_kind: String,
     household_operation: Option<String>,
+    #[serde(default)]
+    peer_guard: bool,
     handler: String,
     mount: Mount,
     expectations: BTreeMap<String, Expectation>,
@@ -427,6 +429,13 @@ fn household_routes_keep_declared_pop_operations() {
             route.handler,
             operation
         );
+        if route.peer_guard {
+            assert!(
+                body.contains("is_terminal_attach_peer_allowed"),
+                "{} must keep its declared peer guard",
+                route.handler
+            );
+        }
     }
 }
 
@@ -562,12 +571,27 @@ fn current_wire_quirks_are_explicitly_pinned() {
         "household_create_workspace",
         "household_rename_workspace",
         "household_delete_workspace",
+        "household_attach_token",
     ] {
         assert_eq!(
             route(id).expectations["auth_error"].fixture.as_deref(),
             Some("empty_body")
         );
     }
+    assert_eq!(
+        route("household_attach_token").expectations["success"]
+            .fixture
+            .as_deref(),
+        Some("household_attach_token_minted")
+    );
+    assert_eq!(
+        route("household_attach_token").expectations["peer_rejected"].status,
+        403
+    );
+    assert!(
+        route("household_attach_token").peer_guard,
+        "attach token mint must keep the peer guard explicit in the contract"
+    );
 
     for id in [
         "admin_get_claw",
@@ -643,6 +667,7 @@ fn contract_scope_is_core_lifecycle_plus_c4_2a_workspaces_without_ws_routes() {
         "household_create_workspace",
         "household_rename_workspace",
         "household_delete_workspace",
+        "household_attach_token",
     ] {
         assert!(
             route_ids.contains(required),
@@ -661,7 +686,6 @@ fn contract_scope_is_core_lifecycle_plus_c4_2a_workspaces_without_ws_routes() {
         "mobile_delete_workspace",
         "mobile_terminal_pty",
         "admin_terminal_pty",
-        "household_attach_token",
         "household_terminal_pty",
     ] {
         assert!(

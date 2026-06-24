@@ -1,8 +1,12 @@
-use std::sync::{Arc, Mutex};
+use std::{
+    net::SocketAddr,
+    sync::{Arc, Mutex},
+};
 
 use axum::{
-    Router,
+    Extension, Router,
     body::{Body, to_bytes},
+    extract::ConnectInfo,
     http::{Method, Request, StatusCode, header},
     middleware,
     response::{IntoResponse, Response},
@@ -344,6 +348,10 @@ fn household_fixture() -> HouseholdFixture {
             patch(handlers_household_claws::handle_household_rename_workspace)
                 .delete(handlers_household_claws::handle_household_delete_workspace),
         )
+        .route(
+            "/api/v1/household/terminals/{container}/attach-token",
+            post(handlers_household_claws::handle_household_mint_attach_token),
+        )
         .with_state(claws_state);
 
     HouseholdFixture {
@@ -380,6 +388,10 @@ fn unix_now() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .expect("clock after epoch")
         .as_secs()
+}
+
+fn loopback_peer_addr() -> SocketAddr {
+    "127.0.0.1:8091".parse().expect("loopback peer")
 }
 
 fn pop_header(person: &P256Keypair, method: &Method, path: &str, body: &[u8]) -> String {
@@ -711,6 +723,17 @@ fn c4_2a_workspace_fixtures_pin_json_shapes() {
     assert!(
         created.get("data").is_none(),
         "workspace create fixture must keep the nested workspace envelope"
+    );
+}
+
+#[test]
+fn c4_2b_1_attach_token_fixture_pins_json_shape() {
+    let minted = fixture("household_attach_token_minted");
+    assert_eq!(minted["token"], "attach-token-alpha");
+    assert_eq!(minted["expires_at"], 1_810_000_000_u64);
+    assert!(
+        minted.get("workspace_id").is_none(),
+        "attach-token mint fixture must not expose workspace scope internals"
     );
 }
 
@@ -1649,6 +1672,65 @@ async fn household_pop_auth_failure_is_empty_401() {
     assert!(
         bytes.is_empty(),
         "household auth failure body must stay empty"
+    );
+    assert_eq!(body, Value::Null);
+}
+
+#[tokio::test]
+async fn household_attach_token_peer_rejection_is_bodyless_403() {
+    let household = household_fixture();
+    let method = Method::POST;
+    let path = "/api/v1/household/terminals/picoclaw-alpha/attach-token";
+    let body_bytes = br#"{"workspace_id":"ws-alpha"}"#.to_vec();
+    let response = household
+        .app
+        .oneshot(
+            Request::builder()
+                .method(method.clone())
+                .uri(path)
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(
+                    header::AUTHORIZATION,
+                    pop_header(&household.person, &method, path, &body_bytes),
+                )
+                .body(Body::from(body_bytes))
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    let (status, bytes, body) = response_parts(response).await;
+
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert!(
+        bytes.is_empty(),
+        "attach-token peer rejection body must stay empty"
+    );
+    assert_eq!(body, Value::Null);
+}
+
+#[tokio::test]
+async fn household_attach_token_auth_failure_is_empty_401_when_peer_is_allowed() {
+    let household = household_fixture();
+    let path = "/api/v1/household/terminals/picoclaw-alpha/attach-token";
+    let response = household
+        .app
+        .layer(Extension(ConnectInfo(loopback_peer_addr())))
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri(path)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(br#"{"workspace_id":"ws-alpha"}"#.to_vec()))
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    let (status, bytes, body) = response_parts(response).await;
+
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert!(
+        bytes.is_empty(),
+        "attach-token auth failure body must stay empty"
     );
     assert_eq!(body, Value::Null);
 }
