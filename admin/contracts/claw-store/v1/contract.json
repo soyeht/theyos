@@ -288,6 +288,25 @@
       }
     },
     {
+      "id": "admin_terminal_pty",
+      "surface": "admin",
+      "method": "GET",
+      "path_template": "/api/v1/terminals/{container}/pty",
+      "kind": "websocket_upgrade",
+      "auth_kind": "admin_stream_auth",
+      "handler": "handlers_terminal::handle_terminal_pty",
+      "mount": {
+        "file": "admin/rust/server-rs/src/main.rs",
+        "slice": "main_api_streaming",
+        "route_literal": "/terminals/{container}/pty",
+        "method_helper": "get"
+      },
+      "expectations": {
+        "upgrade": { "status": 101, "protocol": "websocket" },
+        "auth_error": { "status": 401, "fixture": "admin_auth_unauthorized" }
+      }
+    },
+    {
       "id": "mobile_list_claws",
       "surface": "mobile",
       "method": "GET",
@@ -705,6 +724,28 @@
         "success": { "status": 200, "fixture": "household_attach_token_minted" },
         "peer_rejected": { "status": 403 },
         "auth_error": { "status": 401, "fixture": "empty_body" }
+      }
+    },
+    {
+      "id": "household_terminal_pty",
+      "surface": "household",
+      "method": "GET",
+      "path_template": "/api/v1/household/terminals/{container}/pty",
+      "kind": "websocket_upgrade",
+      "auth_kind": "household_attach_token",
+      "attach_token_header": "x-soyeht-household-attach-token",
+      "peer_guard": true,
+      "handler": "handlers_household_claws::handle_household_terminal_pty",
+      "mount": {
+        "file": "admin/rust/server-rs/src/household_bootstrap.rs",
+        "slice": "household_claws_router",
+        "route_literal": "/api/v1/household/terminals/{container}/pty",
+        "method_helper": "get"
+      },
+      "expectations": {
+        "upgrade": { "status": 101, "protocol": "websocket" },
+        "peer_rejected": { "status": 403 },
+        "auth_error": { "status": 401 }
       }
     }
   ],

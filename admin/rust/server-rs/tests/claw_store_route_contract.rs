@@ -19,10 +19,13 @@ struct Route {
     surface: String,
     method: String,
     path_template: String,
+    #[serde(default = "default_route_kind")]
+    kind: String,
     auth_kind: String,
     household_operation: Option<String>,
     #[serde(default)]
     peer_guard: bool,
+    attach_token_header: Option<String>,
     handler: String,
     mount: Mount,
     expectations: BTreeMap<String, Expectation>,
@@ -40,6 +43,11 @@ struct Mount {
 struct Expectation {
     status: u16,
     fixture: Option<String>,
+    protocol: Option<String>,
+}
+
+fn default_route_kind() -> String {
+    claw_store_routes::KIND_HTTP_JSON.to_string()
 }
 
 fn status_for_error_code(code: &str) -> Option<u16> {
@@ -126,6 +134,11 @@ fn source_slice(mount: &Mount) -> &'static str {
             main_source(),
             "let api_rest = Router::new()",
             "let api_uploads = Router::new()",
+        ),
+        ("admin/rust/server-rs/src/main.rs", "main_api_streaming") => between(
+            main_source(),
+            "let api_streaming = Router::new()",
+            "let api_rest = Router::new()",
         ),
         ("admin/rust/server-rs/src/main.rs", "main_mobile_api") => between(
             main_source(),
@@ -255,6 +268,12 @@ fn claw_store_v1_contract_metadata_is_valid() {
             route.id
         );
         assert_eq!(
+            route.kind,
+            registry.kind(),
+            "{} kind must match claw_store_routes",
+            route.id
+        );
+        assert_eq!(
             route.household_operation.as_deref(),
             registry.household_operation,
             "{} household operation must match claw_store_routes",
@@ -297,9 +316,57 @@ fn claw_store_v1_contract_metadata_is_valid() {
             "{} must declare current status expectations",
             route.id
         );
+        assert!(
+            matches!(
+                route.kind.as_str(),
+                claw_store_routes::KIND_HTTP_JSON | claw_store_routes::KIND_WEBSOCKET_UPGRADE
+            ),
+            "{} uses unexpected kind {}",
+            route.id,
+            route.kind
+        );
+        if route.kind == claw_store_routes::KIND_WEBSOCKET_UPGRADE {
+            let upgrade = route
+                .expectations
+                .get("upgrade")
+                .unwrap_or_else(|| panic!("{} websocket route must declare upgrade", route.id));
+            assert_eq!(
+                upgrade.status, 101,
+                "{} websocket upgrade must declare HTTP 101",
+                route.id
+            );
+            assert_eq!(
+                upgrade.protocol.as_deref(),
+                Some("websocket"),
+                "{} websocket upgrade must declare protocol websocket",
+                route.id
+            );
+            assert!(
+                upgrade.fixture.is_none(),
+                "{} websocket upgrade must not point to a body fixture",
+                route.id
+            );
+            assert!(
+                !route.expectations.contains_key("success"),
+                "{} websocket route must not declare a JSON success body",
+                route.id
+            );
+        } else {
+            assert_eq!(
+                route.kind,
+                claw_store_routes::KIND_HTTP_JSON,
+                "{} non-websocket route must default to http_json",
+                route.id
+            );
+            assert!(
+                !route.expectations.contains_key("upgrade"),
+                "{} http_json route must not declare websocket upgrade expectations",
+                route.id
+            );
+        }
         for (name, expectation) in &route.expectations {
             assert!(
-                (200..600).contains(&usize::from(expectation.status)),
+                (100..600).contains(&usize::from(expectation.status)),
                 "{} expectation {name} has invalid HTTP status {}",
                 route.id,
                 expectation.status
@@ -403,7 +470,7 @@ fn household_routes_keep_declared_pop_operations() {
     for route in contract
         .routes
         .iter()
-        .filter(|route| route.surface == "household")
+        .filter(|route| route.surface == "household" && route.auth_kind == "household_pop")
     {
         assert_eq!(
             route.auth_kind, "household_pop",
@@ -436,6 +503,72 @@ fn household_routes_keep_declared_pop_operations() {
                 route.handler
             );
         }
+    }
+}
+
+#[test]
+fn websocket_routes_pin_stream_auth_and_attach_token_guards() {
+    let contract = contract();
+    let route = |id: &str| {
+        contract
+            .routes
+            .iter()
+            .find(|route| route.id == id)
+            .unwrap_or_else(|| panic!("missing route {id}"))
+    };
+
+    let admin = route("admin_terminal_pty");
+    assert_eq!(admin.kind, claw_store_routes::KIND_WEBSOCKET_UPGRADE);
+    assert_eq!(admin.auth_kind, "admin_stream_auth");
+    assert_eq!(
+        admin.expectations["auth_error"].fixture.as_deref(),
+        Some("admin_auth_unauthorized")
+    );
+
+    let main = main_source();
+    assert!(
+        main.contains(".merge(api_streaming)") && main.contains("require_auth"),
+        "admin PTY websocket routes must stay under require_auth"
+    );
+    let auth = include_str!("../src/auth.rs");
+    for required in [
+        "extract_session_cookie(req.headers())",
+        "extract_bearer_token(req.headers())",
+        "extract_query_token(req.uri())",
+    ] {
+        assert!(
+            auth.contains(required),
+            "admin_stream_auth must keep supporting {required}"
+        );
+    }
+
+    let household = route("household_terminal_pty");
+    assert_eq!(household.kind, claw_store_routes::KIND_WEBSOCKET_UPGRADE);
+    assert_eq!(household.auth_kind, "household_attach_token");
+    assert_eq!(household.household_operation, None);
+    assert_eq!(
+        household.attach_token_header.as_deref(),
+        Some("x-soyeht-household-attach-token")
+    );
+    assert_eq!(household.expectations["auth_error"].status, 401);
+    assert!(
+        household.expectations["auth_error"].fixture.is_none(),
+        "household attach-token auth failures are bodyless and must not reuse PoP fixtures"
+    );
+    assert_eq!(household.expectations["peer_rejected"].status, 403);
+    assert!(household.peer_guard);
+
+    let handlers = include_str!("../src/handlers_household_claws.rs");
+    for required in [
+        "const HOUSEHOLD_ATTACH_TOKEN_HEADER: &str = \"x-soyeht-household-attach-token\"",
+        "fn attach_token_from_headers(headers: &HeaderMap)",
+        ".consume(token)",
+        "is_terminal_attach_peer_allowed",
+    ] {
+        assert!(
+            handlers.contains(required),
+            "household_attach_token PTY contract must stay backed by {required}"
+        );
     }
 }
 
@@ -530,6 +663,12 @@ fn current_wire_quirks_are_explicitly_pinned() {
             Some("admin_auth_unauthorized")
         );
     }
+    assert_eq!(
+        route("admin_terminal_pty").expectations["auth_error"]
+            .fixture
+            .as_deref(),
+        Some("admin_auth_unauthorized")
+    );
 
     for id in [
         "mobile_list_claws",
@@ -578,6 +717,15 @@ fn current_wire_quirks_are_explicitly_pinned() {
             Some("empty_body")
         );
     }
+    assert_eq!(
+        route("household_terminal_pty").expectations["auth_error"].status,
+        401
+    );
+    assert!(
+        route("household_terminal_pty").expectations["auth_error"]
+            .fixture
+            .is_none()
+    );
     assert_eq!(
         route("household_attach_token").expectations["success"]
             .fixture
@@ -636,7 +784,7 @@ fn current_wire_quirks_are_explicitly_pinned() {
 }
 
 #[test]
-fn contract_scope_is_core_lifecycle_plus_c4_2a_workspaces_without_ws_routes() {
+fn contract_scope_includes_core_lifecycle_workspaces_and_c4_2b_ws_pty() {
     let contract = contract();
     let route_ids = contract
         .routes
@@ -668,6 +816,8 @@ fn contract_scope_is_core_lifecycle_plus_c4_2a_workspaces_without_ws_routes() {
         "household_rename_workspace",
         "household_delete_workspace",
         "household_attach_token",
+        "admin_terminal_pty",
+        "household_terminal_pty",
     ] {
         assert!(
             route_ids.contains(required),
@@ -685,12 +835,10 @@ fn contract_scope_is_core_lifecycle_plus_c4_2a_workspaces_without_ws_routes() {
         "mobile_rename_workspace",
         "mobile_delete_workspace",
         "mobile_terminal_pty",
-        "admin_terminal_pty",
-        "household_terminal_pty",
     ] {
         assert!(
             !route_ids.contains(not_mounted),
-            "{not_mounted} is outside C4.2a and must not be declared as a success route"
+            "{not_mounted} is outside C4.2b-2 and must not be declared as a success route"
         );
     }
 }
