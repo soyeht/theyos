@@ -39,6 +39,8 @@ struct CommonArgs {
     ssh_key: Option<PathBuf>,
 
     /// Firecracker instances state directory.
+    /// For `--guest-os macos`, this is the scratch VZ VMs directory that holds
+    /// `<container>/vm_ip`.
     #[arg(long)]
     state_dir: Option<PathBuf>,
 }
@@ -101,6 +103,10 @@ struct TestArgs {
     /// Skip warm pool refill regression test (picoclaw round 2).
     #[arg(long)]
     skip_refill_test: bool,
+
+    /// Guest OS to request for created instances.
+    #[arg(long, default_value = "linux", value_parser = ["linux", "macos"])]
+    guest_os: String,
 
     /// Treat any job failure that lacks a well-formed `error_context` as a test failure.
     #[arg(long)]
@@ -250,6 +256,7 @@ async fn main() {
                 skip_terminal_restart: false,
                 skip_terminal_persist: false,
                 skip_refill_test: false,
+                guest_os: "linux".to_string(),
                 require_error_context: false,
                 max_create_ms: 5000,
                 max_install_ms: 10,
@@ -292,6 +299,7 @@ fn run_test(client: AdminClient, args: TestArgs, ssh_key: PathBuf, state_dir: Pa
         skip_terminal_persist: args.skip_terminal_persist,
         warm_pool_assertions: args.warm_pool,
         skip_refill_test: args.skip_refill_test,
+        guest_os: args.guest_os,
         ssh_key_path: ssh_key,
         state_dir,
         max_create_ms: args.max_create_ms,
@@ -499,7 +507,8 @@ fn read_password_from_dotenv() -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::select_vmrunner_bin;
+    use super::{Cli, Commands, select_vmrunner_bin};
+    use clap::Parser;
     use std::fs;
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -548,5 +557,26 @@ mod tests {
         assert_eq!(selected, release);
 
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn test_command_accepts_macos_guest_os() {
+        let cli =
+            Cli::try_parse_from(["e2e-runner", "test", "picoclaw", "--guest-os", "macos"]).unwrap();
+
+        let Some(Commands::Test(args)) = cli.command else {
+            panic!("expected test command");
+        };
+        assert_eq!(args.guest_os, "macos");
+    }
+
+    #[test]
+    fn test_command_defaults_guest_os_to_linux() {
+        let cli = Cli::try_parse_from(["e2e-runner", "test", "picoclaw"]).unwrap();
+
+        let Some(Commands::Test(args)) = cli.command else {
+            panic!("expected test command");
+        };
+        assert_eq!(args.guest_os, "linux");
     }
 }

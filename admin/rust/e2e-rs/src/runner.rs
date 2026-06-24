@@ -4,6 +4,7 @@ use std::time::Duration;
 use crate::client::{AdminClient, InstanceItem};
 use crate::error::E2eError;
 use crate::ssh::{ssh_smoke_test, ssh_wait_and_exec};
+use crate::ssh_target::{SshTarget, wait_until_guest_ready};
 use crate::terminal::{terminal_persistence_blocking, terminal_roundtrip_blocking};
 
 /// All supported claw types from the manifest (single source of truth).
@@ -28,6 +29,7 @@ pub struct TestConfig {
     pub skip_terminal_persist: bool,
     pub warm_pool_assertions: bool,
     pub skip_refill_test: bool,
+    pub guest_os: String,
     pub ssh_key_path: PathBuf,
     pub state_dir: PathBuf,
     /// Max create time (ms) for warm pool path assertions.
@@ -93,7 +95,11 @@ impl TestRunner {
         };
 
         // Create — expect this to succeed at HTTP level (job enqueued)
-        let (job_id, instance_id) = match self.client.create_instance("e2e-broken", "brokenclaw") {
+        let (job_id, instance_id) = match self.client.create_instance(
+            "e2e-broken",
+            "brokenclaw",
+            Some(&self.config.guest_os),
+        ) {
             Ok(cr) => {
                 let instance_id = cr
                     .instance
@@ -533,7 +539,10 @@ impl TestRunner {
                 self.config.retries
             );
 
-            match self.client.create_instance(&name, claw_type) {
+            match self
+                .client
+                .create_instance(&name, claw_type, Some(&self.config.guest_os))
+            {
                 Ok(cr) => {
                     let instance_id = cr
                         .instance
@@ -637,9 +646,13 @@ impl TestRunner {
     }
 
     fn verify_claw_installed(&self, container: &str, claw_type: &str) -> Result<(), E2eError> {
-        let ssh_port = self.ssh_port_for_container(container)?;
+        let target = self.ssh_target(container)?;
         let cmd = format!("test -x /usr/local/bin/{claw_type} && echo CLAW_INSTALLED");
-        let output = ssh_wait_and_exec(ssh_port, &self.config.ssh_key_path, &cmd, 5)?;
+        let output = if self.config.guest_os == "linux" {
+            ssh_wait_and_exec(target.port, &target.key, &cmd, 5)?
+        } else {
+            target.exec_ok(&cmd)?
+        };
         if output.contains("CLAW_INSTALLED") {
             return Ok(());
         }
@@ -663,17 +676,35 @@ impl TestRunner {
 
     /// Read `SSH_PORT` from instance.env and run SSH smoke test.
     fn run_ssh_smoke(&self, container: &str) -> Result<u16, E2eError> {
-        let ssh_port = self.ssh_port_for_container(container)?;
-        ssh_smoke_test(ssh_port, &self.config.ssh_key_path)?;
-        Ok(ssh_port)
+        let target = self.ssh_target(container)?;
+        if self.config.guest_os == "linux" {
+            ssh_smoke_test(target.port, &target.key)?;
+        } else {
+            wait_until_guest_ready(
+                || {
+                    let output = target.exec_ok("echo SSH_OK")?;
+                    if output.contains("SSH_OK") {
+                        return Ok(());
+                    }
+                    Err(E2eError::Ssh {
+                        port: target.port,
+                        reason: format!("expected 'SSH_OK' in output, got: {}", output.trim()),
+                    })
+                },
+                Duration::from_secs(120),
+                Duration::from_secs(2),
+            )?;
+        }
+        Ok(target.port)
     }
 
-    fn ssh_port_for_container(&self, container: &str) -> Result<u16, E2eError> {
-        let env_file = self.config.state_dir.join(container).join("instance.env");
-        read_ssh_port(&env_file).map_err(|e| E2eError::Ssh {
-            port: 0,
-            reason: format!("reading instance.env at {}: {e}", env_file.display()),
-        })
+    fn ssh_target(&self, container: &str) -> Result<SshTarget, E2eError> {
+        SshTarget::resolve(
+            container,
+            &self.config.guest_os,
+            &self.config.state_dir,
+            &self.config.ssh_key_path,
+        )
     }
 
     fn verify_terminal_container_present(

@@ -231,9 +231,11 @@ fn snapshot_one(
 
     eprintln!("[snapshot]   Creating seed instance {claw_type}-{temp_name}...");
 
-    let cr = client.create_instance(&temp_name, claw_type).map_err(|e| {
-        E2eError::BenchmarkFailed(format!("create seed instance for {claw_type}: {e}"))
-    })?;
+    let cr = client
+        .create_instance(&temp_name, claw_type, None)
+        .map_err(|e| {
+            E2eError::BenchmarkFailed(format!("create seed instance for {claw_type}: {e}"))
+        })?;
 
     let instance_id = cr
         .instance

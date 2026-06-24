@@ -130,19 +130,21 @@ impl AdminClient {
     /// # Errors
     ///
     /// Returns an error if the HTTP request fails or the response cannot be parsed.
-    pub fn create_instance(&self, name: &str, claw_type: &str) -> Result<CreateResponse, E2eError> {
+    pub fn create_instance(
+        &self,
+        name: &str,
+        claw_type: &str,
+        guest_os: Option<&str>,
+    ) -> Result<CreateResponse, E2eError> {
         let url = format!("{}/api/v1/instances", self.base_url);
         // Pass empty tools array to skip AI coding tool installation during e2e tests.
         // Tool installation is tested separately; e2e validates the core VM lifecycle.
+        let payload = create_instance_payload(name, claw_type, guest_os);
         let resp = self
             .agent
             .post(&url)
             .set("Content-Type", "application/json")
-            .send_json(serde_json::json!({
-                "name": name,
-                "claw_type": claw_type,
-                "tools": [],
-            }));
+            .send_json(payload);
 
         match resp {
             Ok(r) => {
@@ -408,4 +410,37 @@ fn parse_job_result(job: &JobItem) -> JobResult {
 
 fn has_pool_phase(jr: &JobResult) -> bool {
     jr.phases.iter().any(|p| p.phase.contains("pool"))
+}
+
+fn create_instance_payload(name: &str, claw_type: &str, guest_os: Option<&str>) -> Value {
+    let mut payload = serde_json::json!({
+        "name": name,
+        "claw_type": claw_type,
+        "tools": [],
+    });
+    if let Some(guest_os) = guest_os.filter(|value| !value.is_empty()) {
+        payload["guest_os"] = Value::String(guest_os.to_string());
+    }
+    payload
+}
+
+#[cfg(test)]
+mod tests {
+    use super::create_instance_payload;
+
+    #[test]
+    fn create_instance_payload_omits_guest_os_when_absent() {
+        let payload = create_instance_payload("e2e-pico", "picoclaw", None);
+
+        assert_eq!(payload["name"], "e2e-pico");
+        assert_eq!(payload["claw_type"], "picoclaw");
+        assert!(payload.get("guest_os").is_none());
+    }
+
+    #[test]
+    fn create_instance_payload_includes_explicit_guest_os() {
+        let payload = create_instance_payload("e2e-pico", "picoclaw", Some("macos"));
+
+        assert_eq!(payload["guest_os"], "macos");
+    }
 }
