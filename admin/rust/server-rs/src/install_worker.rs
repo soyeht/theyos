@@ -109,6 +109,27 @@ async fn process_one_install_job(state: &SharedState) -> Result<(), String> {
 
 // ─── Install (Linux) — prebuilt artifact download ──────────────────────────
 
+/// Pre-download gate: returns a clean, client-safe failure message when the
+/// resolved manifest's `runtime_min_version` is newer than this engine, else
+/// `None`. Extracted as a pure function so the decision is unit-testable
+/// without the full worker harness.
+///
+/// `runtime_min_version` is advisory until manifests are signed (P0.1), but the
+/// gate is already semantically correct: a too-old engine is refused up front
+/// with a version-only reason instead of failing opaquely mid-install.
+#[cfg_attr(target_os = "macos", allow(dead_code))]
+fn runtime_min_version_block_reason(
+    manifest: &core_rs::artifact_registry::ArtifactManifest,
+    engine_version: &str,
+) -> Option<String> {
+    core_rs::artifact_registry::check_runtime_compatible(
+        manifest.runtime_min_version.as_deref(),
+        engine_version,
+    )
+    .err()
+    .map(|e| e.to_string())
+}
+
 /// Install a claw by downloading a pre-built golden rootfs artifact.
 ///
 /// All HTTP and I/O happens inside `spawn_blocking` because the resolver and
@@ -183,6 +204,18 @@ async fn run_install_claw_prebuilt(state: &SharedState, job: &jobs_rs::Job) -> R
         &manifest.fingerprint[..12],
         manifest.size_bytes / 1024 / 1024,
     );
+
+    // Step 1b: Refuse installs whose artifact requires a newer engine, before
+    // any up-to-date check or download work. Absent `runtime_min_version` is
+    // fail-open so existing manifests keep installing.
+    if let Some(reason) = runtime_min_version_block_reason(&manifest, env!("CARGO_PKG_VERSION")) {
+        error!("[install-worker] {claw_name}: {reason}");
+        if let Err(e) = state.claw_store.mark_failed(&claw_name, &reason) {
+            error!("[install-worker] {claw_name}: mark_failed failed: {e}");
+        }
+        mark_job_failed(state, &job_id, &reason).await;
+        return Ok(());
+    }
 
     // Step 2: Check if already up-to-date
     if ArtifactResolver::is_up_to_date(&manifest, &assets_dir) {
@@ -832,5 +865,63 @@ mod tests {
         // When unset, falls back to "imagebuilder" (on $PATH).
         let resolved = resolve_imagebuilder_bin();
         assert_eq!(resolved, "imagebuilder");
+    }
+
+    // runtime_min_version gate
+
+    fn manifest_with_runtime_min(
+        min: Option<&str>,
+    ) -> core_rs::artifact_registry::ArtifactManifest {
+        core_rs::artifact_registry::ArtifactManifest {
+            manifest_version: 1,
+            claw: "testclaw".into(),
+            version: "1.0.0".into(),
+            arch: "x86_64-linux".into(),
+            fingerprint: "e".repeat(64),
+            base_rootfs_version: "v2".into(),
+            sha256: "a".repeat(64),
+            size_bytes: 100,
+            url: "https://example.com/rootfs.ext4.zst".into(),
+            published_at: "2026-04-01T00:00:00Z".into(),
+            channel: "stable".into(),
+            base_rootfs_sha256: "b".repeat(64),
+            installer_plan_sha256: "c".repeat(64),
+            kernel_sha256: "d".repeat(64),
+            kernel_version: None,
+            firecracker_version: None,
+            runtime_min_version: min.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn runtime_gate_blocks_when_engine_too_old() {
+        let m = manifest_with_runtime_min(Some("999.0.0"));
+        let reason = runtime_min_version_block_reason(&m, "1.2.3")
+            .expect("engine older than min must be blocked");
+        assert!(
+            reason.contains("999.0.0") && reason.contains("1.2.3"),
+            "reason should name required + current versions: {reason}"
+        );
+    }
+
+    #[test]
+    fn runtime_gate_allows_absent_or_satisfied() {
+        // Absent -> fail-open.
+        assert!(
+            runtime_min_version_block_reason(&manifest_with_runtime_min(None), "1.2.3").is_none()
+        );
+        // Engine newer than min -> allowed.
+        assert!(
+            runtime_min_version_block_reason(&manifest_with_runtime_min(Some("1.0.0")), "1.2.3")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn runtime_gate_real_engine_version_satisfies_low_minimum() {
+        // Guards the call-site wiring of env!(CARGO_PKG_VERSION): the running
+        // engine must satisfy a trivially-low minimum.
+        let m = manifest_with_runtime_min(Some("0.0.1"));
+        assert!(runtime_min_version_block_reason(&m, env!("CARGO_PKG_VERSION")).is_none());
     }
 }
