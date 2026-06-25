@@ -433,6 +433,10 @@ pub struct ProjectedGroup {
     pub name: String,
     /// `member_id` → membership status (reuses [`MeshMembership`]).
     pub members: BTreeMap<String, MeshMembership>,
+    /// `member_id` → latest display label from `GroupMemberAdded` (owner UX only).
+    /// Only non-empty labels are retained; absent means no label. This is not an
+    /// authority input; the membership gate keys on `members` status.
+    pub member_labels: BTreeMap<String, String>,
     /// `claw_id` → grant status (reuses [`MeshMembership`]).
     pub granted_claws: BTreeMap<String, MeshMembership>,
     pub revision: u64,
@@ -798,11 +802,15 @@ impl ProjectedState {
         }
         for (group_id, acc) in groups {
             let name = acc.name_lww.map(|(_, n)| n).unwrap_or_default();
-            let members = acc
-                .members
-                .into_iter()
-                .map(|(mid, m)| (mid, m.resolve().0))
-                .collect();
+            let mut members = BTreeMap::new();
+            let mut member_labels = BTreeMap::new();
+            for (mid, member) in acc.members {
+                let (status, label) = member.resolve();
+                if !label.is_empty() {
+                    member_labels.insert(mid.clone(), label);
+                }
+                members.insert(mid, status);
+            }
             let granted_claws = acc
                 .grants
                 .into_iter()
@@ -814,6 +822,7 @@ impl ProjectedState {
                     group_id,
                     name,
                     members,
+                    member_labels,
                     granted_claws,
                     revision: acc.max_ts,
                 },
@@ -1485,6 +1494,12 @@ mod tests {
             ),
         ];
         let s = ProjectedState::project(&entries);
+        assert_eq!(
+            s.groups
+                .get("grp_family")
+                .and_then(|group| group.member_labels.get("g_alice")),
+            Some(&"Alice".to_string())
+        );
         assert!(
             s.members_authorized_for_claw("claw_home")
                 .contains("g_alice")
@@ -1495,6 +1510,45 @@ mod tests {
         );
         // No grant ⇒ no authorization for another claw.
         assert!(s.members_authorized_for_claw("claw_other").is_empty());
+    }
+
+    #[test]
+    fn group_projection_retains_member_labels_for_owner_display() {
+        let owner = P256Keypair::generate();
+        let entries = vec![
+            mint(
+                &owner,
+                1,
+                MeshEvent::GroupCreated {
+                    group_id: "g".into(),
+                    name: "G".into(),
+                },
+            ),
+            mint(
+                &owner,
+                2,
+                MeshEvent::GroupMemberAdded {
+                    group_id: "g".into(),
+                    member_id: "g_a".into(),
+                    label: "Alice phone".into(),
+                },
+            ),
+            mint(
+                &owner,
+                3,
+                MeshEvent::GroupMemberRemoved {
+                    group_id: "g".into(),
+                    member_id: "g_a".into(),
+                },
+            ),
+        ];
+        let state = ProjectedState::project(&entries);
+        let group = state.groups.get("g").expect("group projected");
+        assert_eq!(
+            group.member_labels.get("g_a"),
+            Some(&"Alice phone".to_string())
+        );
+        assert_eq!(group.members.get("g_a"), Some(&MeshMembership::Removed));
     }
 
     #[test]

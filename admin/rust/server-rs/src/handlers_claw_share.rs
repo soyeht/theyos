@@ -18,7 +18,7 @@ use axum::{
     extract::State,
     http::{HeaderMap, HeaderValue, Method, StatusCode, Uri, header},
     response::{IntoResponse, Response},
-    routing::post,
+    routing::{get, post},
 };
 use household_rs::caveats::Operation;
 use household_rs::cbor;
@@ -26,7 +26,9 @@ use household_rs::claw_share::{
     ClawShareClaim, ClawShareError, ClawShareSlotStore, SlotId, TunnelHandle, owner_mint_invite,
 };
 use household_rs::claw_share_flow::{EngineContext, engine_handle_claim};
-use household_rs::household_mesh_log::{LogEntry, MeshEvent, MeshLogStore};
+use household_rs::household_mesh_log::{
+    LogEntry, MeshEvent, MeshLogStore, MeshMembership, ProjectedState,
+};
 use household_rs::keys::{IdentityKey, P256PublicKey, P256Signature, verify_signature};
 use household_rs::member_identity::MemberDeviceBinding;
 use serde::{Deserialize, Serialize};
@@ -111,6 +113,117 @@ fn log_event(
     })
 }
 
+#[derive(Serialize)]
+struct MemberView {
+    member_id: String,
+    label: String,
+    device_count: u64,
+}
+
+#[derive(Serialize)]
+struct GroupView {
+    group_id: String,
+    name: String,
+    members: Vec<MemberView>,
+    granted_claws: Vec<String>,
+}
+
+#[derive(Serialize)]
+struct GroupsListResponse {
+    v: u8,
+    groups: Vec<GroupView>,
+    published_claws: Vec<String>,
+}
+
+fn build_groups_list_response(projection: &ProjectedState) -> GroupsListResponse {
+    let groups = projection
+        .groups
+        .values()
+        .map(|group| {
+            let members = group
+                .members
+                .iter()
+                .filter(|(_, status)| matches!(status, MeshMembership::Active))
+                .map(|(member_id, _)| {
+                    let device_count = projection.member_devices.get(member_id).map_or(0, |devs| {
+                        devs.values()
+                            .filter(|device| matches!(device.status, MeshMembership::Active))
+                            .count() as u64
+                    });
+                    MemberView {
+                        member_id: member_id.clone(),
+                        label: group
+                            .member_labels
+                            .get(member_id)
+                            .cloned()
+                            .unwrap_or_default(),
+                        device_count,
+                    }
+                })
+                .collect();
+            let granted_claws = group
+                .granted_claws
+                .iter()
+                .filter(|(_, status)| matches!(status, MeshMembership::Active))
+                .map(|(claw_id, _)| claw_id.clone())
+                .collect();
+            GroupView {
+                group_id: group.group_id.clone(),
+                name: group.name.clone(),
+                members,
+                granted_claws,
+            }
+        })
+        .collect();
+    let published_claws = projection
+        .published_claws
+        .iter()
+        .filter(|(_, status)| matches!(status, MeshMembership::Active))
+        .map(|(claw_id, _)| claw_id.clone())
+        .collect();
+    GroupsListResponse {
+        v: 1,
+        groups,
+        published_claws,
+    }
+}
+
+async fn handle_list_groups(
+    State(state): State<ClawShareRouterState>,
+    method: Method,
+    uri: Uri,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let now = match SystemTime::now().duration_since(UNIX_EPOCH) {
+        Ok(d) => d.as_secs(),
+        Err(_) => return StatusCode::UNAUTHORIZED.into_response(),
+    };
+    let path_and_query = uri
+        .path_and_query()
+        .map_or_else(|| uri.path().to_string(), |pq| pq.as_str().to_string());
+    if household_auth::authorize_request(
+        &state.household,
+        &headers,
+        &method,
+        &path_and_query,
+        &body,
+        Operation::HouseholdInvite,
+        now,
+    )
+    .await
+    .is_err()
+    {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+
+    let projection = state.mesh_log.project();
+    match cbor::to_canonical_vec(&build_groups_list_response(&projection)) {
+        Ok(bytes) => cbor_response(StatusCode::OK, bytes),
+        Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    }
+}
+
 /// Mount the claw-share routes on the `household_router`.
 pub fn router(state: ClawShareRouterState) -> axum::Router {
     let router = axum::Router::new()
@@ -118,6 +231,7 @@ pub fn router(state: ClawShareRouterState) -> axum::Router {
         .route("/api/v1/claw-share/invites", post(handle_mint_invite))
         .route("/api/v1/claw-share/revoke", post(handle_revoke))
         .route("/api/v1/claw-share/group-op", post(handle_group_op))
+        .route("/api/v1/claw-share/groups", get(handle_list_groups))
         .route(
             "/api/v1/claw-share/relay-offer/challenge",
             post(handle_relay_offer_challenge),
@@ -1279,6 +1393,117 @@ async fn handle_group_op(
     // intentionally not wired in this relay/membership subset.
 
     StatusCode::NO_CONTENT.into_response()
+}
+
+#[cfg(test)]
+mod groups_list_tests {
+    use super::*;
+    use household_rs::household_mesh_log::{ProjectedGroup, ProjectedMemberDevice};
+
+    #[test]
+    fn build_groups_list_shows_active_state_with_labels_and_device_counts() {
+        let mut projection = ProjectedState::default();
+        projection.groups.insert(
+            "g".to_string(),
+            ProjectedGroup {
+                group_id: "g".to_string(),
+                name: "Family".to_string(),
+                members: [
+                    ("g_alice".to_string(), MeshMembership::Active),
+                    ("g_removed".to_string(), MeshMembership::Removed),
+                ]
+                .into_iter()
+                .collect(),
+                member_labels: [("g_alice".to_string(), "Alice phone".to_string())]
+                    .into_iter()
+                    .collect(),
+                granted_claws: [
+                    ("claw_a".to_string(), MeshMembership::Active),
+                    ("claw_revoked".to_string(), MeshMembership::Removed),
+                ]
+                .into_iter()
+                .collect(),
+                revision: 7,
+            },
+        );
+        projection.member_devices.insert(
+            "g_alice".to_string(),
+            [
+                (
+                    vec![1u8; 33],
+                    ProjectedMemberDevice {
+                        participant_npub: "n1".to_string(),
+                        status: MeshMembership::Active,
+                    },
+                ),
+                (
+                    vec![2u8; 33],
+                    ProjectedMemberDevice {
+                        participant_npub: "n2".to_string(),
+                        status: MeshMembership::Active,
+                    },
+                ),
+                (
+                    vec![3u8; 33],
+                    ProjectedMemberDevice {
+                        participant_npub: "n3".to_string(),
+                        status: MeshMembership::Removed,
+                    },
+                ),
+            ]
+            .into_iter()
+            .collect(),
+        );
+        projection
+            .published_claws
+            .insert("claw_pub".to_string(), MeshMembership::Active);
+        projection
+            .published_claws
+            .insert("claw_unpub".to_string(), MeshMembership::Removed);
+
+        let response = build_groups_list_response(&projection);
+        assert_eq!(response.v, 1);
+        assert_eq!(response.groups.len(), 1);
+        let group = &response.groups[0];
+        assert_eq!(group.group_id, "g");
+        assert_eq!(group.name, "Family");
+        assert_eq!(group.members.len(), 1);
+        assert_eq!(group.members[0].member_id, "g_alice");
+        assert_eq!(group.members[0].label, "Alice phone");
+        assert_eq!(group.members[0].device_count, 2);
+        assert_eq!(group.granted_claws, vec!["claw_a".to_string()]);
+        assert_eq!(response.published_claws, vec!["claw_pub".to_string()]);
+    }
+
+    #[test]
+    fn build_groups_list_empty_projection_is_empty() {
+        let response = build_groups_list_response(&ProjectedState::default());
+        assert_eq!(response.v, 1);
+        assert!(response.groups.is_empty());
+        assert!(response.published_claws.is_empty());
+    }
+
+    #[test]
+    fn groups_list_response_gold_hex() {
+        let response = GroupsListResponse {
+            v: 1,
+            groups: vec![GroupView {
+                group_id: "group_alpha".to_string(),
+                name: "Alpha Group".to_string(),
+                members: vec![MemberView {
+                    member_id: "g_member_alpha".to_string(),
+                    label: "Alice's phone".to_string(),
+                    device_count: 1,
+                }],
+                granted_claws: vec!["claw_alpha".to_string()],
+            }],
+            published_claws: Vec::new(),
+        };
+        assert_eq!(
+            hex::encode(cbor::to_canonical_vec(&response).unwrap()),
+            "a36176016667726f75707381a4646e616d656b416c7068612047726f7570676d656d6265727381a3656c6162656c6d416c69636527732070686f6e65696d656d6265725f69646e675f6d656d6265725f616c7068616c6465766963655f636f756e74016867726f75705f69646b67726f75705f616c7068616d6772616e7465645f636c617773816a636c61775f616c7068616f7075626c69736865645f636c61777380"
+        );
+    }
 }
 
 /// `POST /api/v1/claw-share/claim` — anonymous endpoint. The friend's

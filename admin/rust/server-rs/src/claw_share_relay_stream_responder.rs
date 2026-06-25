@@ -494,6 +494,7 @@ mod tests {
                 members: [("g_a".to_string(), MeshMembership::Active)]
                     .into_iter()
                     .collect(),
+                member_labels: Default::default(),
                 granted_claws: [(RELAY_STREAM_CLAW_ID.to_string(), MeshMembership::Active)]
                     .into_iter()
                     .collect(),

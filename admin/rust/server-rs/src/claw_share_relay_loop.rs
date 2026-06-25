@@ -879,6 +879,7 @@ mod tests {
                 members: [(member_id.to_string(), MeshMembership::Active)]
                     .into_iter()
                     .collect(),
+                member_labels: Default::default(),
                 granted_claws: [(GC_CLAW.to_string(), MeshMembership::Active)]
                     .into_iter()
                     .collect(),

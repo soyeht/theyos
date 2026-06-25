@@ -483,6 +483,7 @@ mod tests {
                 members: [("g_a".to_string(), st(member_active))]
                     .into_iter()
                     .collect(),
+                member_labels: Default::default(),
                 granted_claws: [(CLAW_ID.to_string(), st(claw_granted))]
                     .into_iter()
                     .collect(),
