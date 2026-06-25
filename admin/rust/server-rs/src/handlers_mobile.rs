@@ -1122,11 +1122,27 @@ pub async fn handle_mobile_users(
     headers: axum::http::HeaderMap,
 ) -> Result<Response, ApiError> {
     let username = extract_mobile_bearer(&state, &headers)?;
+    require_mobile_admin(&state, &username).await?;
 
-    // Admin check
+    users_response(state).await
+}
+
+/// GET /api/v1/users — list all users (admin-session only).
+///
+/// # Errors
+///
+/// Returns `ApiError` if the session is invalid, user is not admin, or DB fails.
+pub async fn handle_admin_users(
+    State(state): State<SharedState>,
+    AdminUser(_auth): AdminUser,
+) -> Result<Response, ApiError> {
+    users_response(state).await
+}
+
+async fn require_mobile_admin(state: &SharedState, username: &str) -> Result<(), ApiError> {
     let user = {
         let st = state.clone();
-        let uname = username.clone();
+        let uname = username.to_string();
         blocking(move || {
             st.instance_db
                 .get_user_by_username(&uname)
@@ -1139,6 +1155,10 @@ pub async fn handle_mobile_users(
         _ => return Err(ApiError::forbidden("admin access required")),
     }
 
+    Ok(())
+}
+
+async fn users_response(state: SharedState) -> Result<Response, ApiError> {
     let users = {
         let st = state.clone();
         blocking(move || st.instance_db.list_users().map_err(ApiError::from)).await??
@@ -1213,22 +1233,25 @@ pub async fn handle_resource_options(
     headers: axum::http::HeaderMap,
 ) -> Result<Response, ApiError> {
     let username = extract_mobile_bearer(&state, &headers)?;
+    require_mobile_admin(&state, &username).await?;
 
-    // Admin check
-    let user = {
-        let st = state.clone();
-        blocking(move || {
-            st.instance_db
-                .get_user_by_username(&username)
-                .map_err(ApiError::from)
-        })
-        .await??
-    };
-    match user {
-        Some(u) if u.role == store_rs::UserRole::Admin => {}
-        _ => return Err(ApiError::forbidden("admin access required")),
-    }
+    resource_options_response(state).await
+}
 
+/// GET /api/v1/resource-options — available resource ranges (admin-session only).
+///
+/// # Errors
+///
+/// Returns `ApiError` if the session is invalid, user is not admin, or capacity
+/// projection fails.
+pub async fn handle_admin_resource_options(
+    State(state): State<SharedState>,
+    AdminUser(_auth): AdminUser,
+) -> Result<Response, ApiError> {
+    resource_options_response(state).await
+}
+
+async fn resource_options_response(state: SharedState) -> Result<Response, ApiError> {
     // Compute capacity projection (single source of truth, includes warm pool)
     let disk_path = core_rs::host_resources::resolve_instance_disk_path();
     let host = core_rs::host_resources::detect_all(&disk_path).ok();

@@ -693,6 +693,8 @@ fn current_wire_quirks_are_explicitly_pinned() {
         "admin_claw_availability",
         "admin_install_claw",
         "admin_uninstall_claw",
+        "admin_resource_options",
+        "admin_users",
         "admin_create_instance",
         "admin_instance_status",
         "admin_stop_instance",
@@ -715,6 +717,13 @@ fn current_wire_quirks_are_explicitly_pinned() {
             .as_deref(),
         Some("admin_auth_unauthorized")
     );
+
+    for id in ["admin_resource_options", "admin_users"] {
+        assert_eq!(
+            route(id).expectations["admin_required"].fixture.as_deref(),
+            Some("admin_required")
+        );
+    }
 
     for id in [
         "mobile_list_claws",
@@ -846,6 +855,8 @@ fn contract_scope_includes_core_lifecycle_workspaces_and_c4_2b_ws_pty() {
         "admin_restart_instance",
         "admin_rebuild_instance",
         "admin_delete_instance",
+        "admin_resource_options",
+        "admin_users",
         "mobile_create_instance",
         "mobile_instance_status",
         "household_list_instances",
