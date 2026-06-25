@@ -91,15 +91,24 @@ fn macos_install_command(claw_type: &str) -> Result<String, VZError> {
             // Tarball extracts to ironclaw-aarch64-apple-darwin/ironclaw (subdirectory).
             // Upstream tag format migrated from `v<version>` to `ironclaw-v<version>`;
             // the pinned manifest version still resolves with the older `v<version>`
-            // tag - re-verify the tag format before bumping the manifest version.
+            // tag - re-verify the tag and the .sha256 before bumping the manifest version.
+            //
+            // Integrity: download the pinned tarball and its upstream `<asset>.sha256`
+            // into a temp dir and verify with `shasum -a 256 -c` (the macOS guest ships
+            // `shasum`, not coreutils `sha256sum`) before extracting. A mismatch breaks
+            // the `&&` chain, so nothing is extracted or installed (fail-closed).
             let v = manifest_version("ironclaw")?;
             format!(
                 "export PATH=/opt/homebrew/bin:$PATH && \
                  su - theyos -c 'brew install postgresql@15' 2>/dev/null; \
                  mkdir -p /usr/local/bin && \
-                 curl --proto '=https' --tlsv1.2 -fsSL --retry 3 --retry-delay 2 https://github.com/nearai/ironclaw/releases/download/v{v}/ironclaw-aarch64-apple-darwin.tar.gz \
-                 | tar xz -C /tmp/ && install -m 755 /tmp/ironclaw-aarch64-apple-darwin/ironclaw /usr/local/bin/ironclaw \
-                 && rm -rf /tmp/ironclaw-aarch64-apple-darwin"
+                 d=$(mktemp -d) && cd \"$d\" && \
+                 curl --proto '=https' --tlsv1.2 -fsSL --retry 3 --retry-delay 2 -O https://github.com/nearai/ironclaw/releases/download/v{v}/ironclaw-aarch64-apple-darwin.tar.gz && \
+                 curl --proto '=https' --tlsv1.2 -fsSL --retry 3 --retry-delay 2 -O https://github.com/nearai/ironclaw/releases/download/v{v}/ironclaw-aarch64-apple-darwin.tar.gz.sha256 && \
+                 shasum -a 256 -c ironclaw-aarch64-apple-darwin.tar.gz.sha256 && \
+                 tar xzf ironclaw-aarch64-apple-darwin.tar.gz && \
+                 install -m 755 ironclaw-aarch64-apple-darwin/ironclaw /usr/local/bin/ironclaw && \
+                 cd / && rm -rf \"$d\""
             )
         }
         other => {
@@ -253,11 +262,15 @@ mod tests {
         ];
         for &claw in SUPPORTED_MACOS_CLAWS {
             let cmd = macos_install_command(claw).expect("supported claw builds a command");
-            if cmd.contains("curl") {
+            // Check EVERY curl invocation (e.g. ironclaw fetches the tarball and its
+            // .sha256), not just that the flags appear somewhere in the command. The
+            // options of each curl are the text between `curl ` and the `https://` URL.
+            for (i, after) in cmd.split("curl ").enumerate().skip(1) {
+                let opts = after.split("https://").next().unwrap_or("");
                 for flag in REQUIRED_CURL_FLAGS {
                     assert!(
-                        cmd.contains(flag),
-                        "{claw}: every curl must include the hardened flag {flag}"
+                        opts.contains(flag),
+                        "{claw}: curl #{i} must include the hardened flag {flag}"
                     );
                 }
             }
@@ -292,6 +305,46 @@ mod tests {
     #[test]
     fn macos_install_command_rejects_unknown_claw() {
         assert!(macos_install_command("definitely-not-a-claw").is_err());
+    }
+
+    #[test]
+    fn macos_ironclaw_verifies_checksum_before_extract() {
+        let cmd = macos_install_command("ironclaw").expect("ironclaw");
+        // Downloads the upstream per-asset checksum and verifies it.
+        assert!(
+            cmd.contains("ironclaw-aarch64-apple-darwin.tar.gz.sha256"),
+            "ironclaw must download the upstream .sha256: {cmd}"
+        );
+        assert!(
+            cmd.contains("shasum -a 256 -c"),
+            "ironclaw must verify with shasum -a 256 -c: {cmd}"
+        );
+        // macOS guest ships `shasum`, not coreutils `sha256sum`.
+        assert!(
+            !cmd.contains("sha256sum"),
+            "use shasum on the macOS guest, not sha256sum: {cmd}"
+        );
+        // Verification happens before extraction and install (fail-closed).
+        let verify = cmd.find("shasum -a 256 -c").expect("shasum present");
+        let extract = cmd.find("tar xz").expect("tar present");
+        let install = cmd.find("install -m 755").expect("install present");
+        assert!(verify < extract, "checksum must precede tar extract: {cmd}");
+        assert!(verify < install, "checksum must precede install: {cmd}");
+    }
+
+    #[test]
+    fn macos_only_ironclaw_uses_checksum() {
+        // Only ironclaw verifies a checksum; no other claw fakes one its upstream
+        // does not publish (picoclaw/nullclaw have no per-asset checksum yet).
+        for &claw in SUPPORTED_MACOS_CLAWS {
+            let cmd = macos_install_command(claw).expect("supported claw");
+            let has_checksum = cmd.contains("shasum") || cmd.contains(".sha256");
+            assert_eq!(
+                has_checksum,
+                claw == "ironclaw",
+                "{claw}: checksum verification must be ironclaw-only in this slice"
+            );
+        }
     }
 
     #[test]

@@ -16,7 +16,8 @@ stages.
 
 ## Current status
 
-Transport hardened, and 4 of 7 claws version-pinned. Every `curl` fetch uses:
+Transport hardened, 4 of 7 claws version-pinned, and ironclaw additionally
+verifies an upstream sha256. Every `curl` fetch uses:
 
     curl --proto '=https' --tlsv1.2 -fsSL --retry 3 --retry-delay 2
 
@@ -33,7 +34,10 @@ no matching upstream release, so pinning them would 404 / break the install.
 They stay on `latest`/HEAD and remain in the guard test's allow-list until their
 manifest versions are corrected (a separate manifest-curation task).
 
-No checksum verification yet (see the checksum follow-up).
+ironclaw is the only claw that verifies an integrity checksum: it downloads the
+upstream `ironclaw-aarch64-apple-darwin.tar.gz.sha256` and runs `shasum -a 256 -c`
+before extracting (fail-closed on mismatch). The other claws have no checksum
+verification yet (see the checksum follow-up).
 
 ## Per-claw posture
 
@@ -41,7 +45,7 @@ No checksum verification yet (see the checksum follow-up).
 |--------------|-----------------------------------------------|------------------------|----------------------|-----------|
 | picoclaw     | curl GitHub `releases/download/v<ver>` tar.gz | manifest (`v0.2.5`)    | TLS transport only   | pinned    |
 | nullclaw     | curl GitHub `releases/download/v<ver>` bin    | manifest (`v2026.3.1`) | TLS transport only   | pinned    |
-| ironclaw     | curl GitHub `releases/download/v<ver>` tar.gz | manifest (`v0.12.0`)   | TLS transport only   | pinned    |
+| ironclaw     | curl GitHub `releases/download/v<ver>` tar.gz | manifest (`v0.12.0`)   | upstream sha256 verified | pinned + checksum |
 | nanobot      | `pip3 install nanobot-ai==<ver>`              | manifest (`0.1.5`)     | registry transport only | pinned |
 | zeroclaw     | curl GitHub `releases/latest/download` tar.gz | none (latest)          | TLS transport only   | blocked   |
 | openclaw     | `npm install -g openclaw` (no version)        | none                   | registry transport only | blocked |
@@ -77,12 +81,15 @@ existing macOS-arm64 asset before pinning - `latest` masks those mismatches.
 
 ## Checksum follow-up
 
-Verify the downloaded artifact against an expected sha256, mirroring the Linux
-installer plan's `sha256sum -c` pattern. ironclaw is the best starting point:
-upstream publishes `ironclaw-aarch64-apple-darwin.tar.gz.sha256` alongside the
-binary. picoclaw and nullclaw do not publish per-asset checksums, so they would
-need a theyos-side checksum store (artifact infrastructure that does not exist
-yet).
+ironclaw is done: it downloads the upstream
+`ironclaw-aarch64-apple-darwin.tar.gz.sha256` and runs `shasum -a 256 -c` (the
+macOS guest ships `shasum`, not coreutils `sha256sum`) before extracting,
+fail-closed on mismatch. A manifest version bump must re-verify the `.sha256`
+the same way the tarball tag is re-verified.
+
+picoclaw and nullclaw do not publish per-asset checksums, so they would need a
+theyos-side checksum store (artifact infrastructure that does not exist yet).
+zeroclaw, openclaw and hermes-agent are blocked on version-pinning first.
 
 Out of scope here and tracked elsewhere: `latest.json` signing, the engine
 software-keys flag, the Swift client, and Product A / nvpn.
