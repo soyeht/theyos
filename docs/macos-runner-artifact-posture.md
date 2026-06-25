@@ -16,7 +16,7 @@ stages.
 
 ## Current status
 
-Transport hardened, 6 of 7 claws version-pinned, and ironclaw additionally
+Transport hardened, all 7 claws version-pinned, and ironclaw additionally
 verifies an upstream sha256. Every `curl` fetch uses:
 
     curl --proto '=https' --tlsv1.2 -fsSL --retry 3 --retry-delay 2
@@ -24,15 +24,15 @@ verifies an upstream sha256. Every `curl` fetch uses:
 This forces HTTPS (no protocol downgrade), requires TLS >= 1.2, and retries
 transient failures.
 
-picoclaw, nullclaw, ironclaw, nanobot, zeroclaw and openclaw are pinned to the
-version from `claws/manifest.yml`, read at build/run time via
-`core_rs::manifest::get` (single source of truth). The pinned download
-tag/package was verified to exist upstream with the expected macOS-arm64 asset.
+All seven claws are pinned to the version from `claws/manifest.yml`, read at
+build/run time via `core_rs::manifest::get` (single source of truth). The pinned
+download tag/package was verified to exist upstream with the expected macOS-arm64
+asset.
 
-hermes-agent is NOT pinned: it is installed from a HEAD `git clone` and upstream
-uses date-based tags, so pinning it needs an installer rework (HEAD -> tagged
-clone), tracked separately. It stays on HEAD and remains in the guard test's
-allow-list until then.
+hermes-agent pins its git tag (`git clone --branch v<ver>`) instead of cloning
+HEAD. This is a partial pin: only the source checkout is frozen - its pip/npm
+build dependencies still resolve at build time, and there is no checksum (it
+builds from source).
 
 ironclaw is the only claw that verifies an integrity checksum: it downloads the
 upstream `ironclaw-aarch64-apple-darwin.tar.gz.sha256` and runs `shasum -a 256 -c`
@@ -49,23 +49,25 @@ verification yet (see the checksum follow-up).
 | nanobot      | `pip3 install nanobot-ai==<ver>`              | manifest (`0.1.5`)     | registry transport only | pinned |
 | zeroclaw     | curl GitHub `releases/download/v<ver>` tar.gz | manifest (`v0.8.1`)    | TLS transport only   | pinned    |
 | openclaw     | `npm install -g openclaw@<ver>`               | manifest (`2026.6.10`) | registry transport only | pinned |
-| hermes-agent | `git clone --depth 1` HEAD + pip -e + npm     | none (HEAD)            | git transport only   | blocked   |
+| hermes-agent | `git clone --branch v<ver>` tag + pip -e + npm | manifest (`2026.6.19`) | git transport (source build) | pinned (partial) |
 
 zeroclaw and openclaw were pinned in S11-D-1: their stale manifest versions
 (`0.1.9`, `2026.4.6`) were corrected to the current upstream latest the installer
 already resolved to (`v0.8.1`, `2026.6.10`) - a freeze, not an upgrade - and the
 installer now embeds the manifest version.
 
-Remaining blocked reason (verified read-only):
-- hermes-agent: upstream uses date-based tags (e.g. `v2026.6.19`); manifest
-  `0.7.0` does not map to any tag or commit, and the install is a HEAD
-  `git clone`, so pinning needs an installer rework (HEAD -> tagged clone).
+hermes-agent was pinned in S11-D-2: manifest `0.7.0` (which mapped to no tag) was
+corrected to the date tag `2026.6.19`, and the installer reworked from a HEAD
+`git clone` to a tagged clone (`git clone --branch`, plus fetch + checkout the
+tag for existing repos, fail-closed on a missing tag). Unlike S11-D-1 this is a
+real move from HEAD back to the latest release tag (HEAD was ahead of the tag),
+accepted to eliminate HEAD drift.
 
 Notes:
 - "TLS transport only" / "git transport only" / "registry transport only" mean
-  the download channel is authenticated, but for hermes-agent we do NOT pin a
-  version and do NOT verify a checksum on our side; the artifact is whatever
-  HEAD currently resolves to and can change between provisions.
+  the download channel is authenticated. No claw verifies a per-asset checksum
+  except ironclaw; the pinned-but-unchecksummed claws rely on transport plus the
+  version/tag pin.
 - For the pinned claws, pinning intentionally freezes the version. The current
   manifest versions are behind upstream latest, so pinning trades "always
   newest" for "reproducible"; bump the manifest version to move a pinned claw.
@@ -75,10 +77,10 @@ Notes:
 
 ## Version pin follow-up
 
-Only hermes-agent remains unpinned. Pinning it requires correcting
-`claws/manifest.yml` `0.7.0` to a real date tag (e.g. `2026.6.19`) AND reworking
-the installer from a HEAD `git clone` to a tagged clone - more than a manifest
-edit, so it is a separate slice. Verify the chosen tag exists before pinning.
+Done: all seven macOS claws are version-pinned. hermes-agent's pin is partial
+(source tag only; pip/npm build deps still float). A manifest version bump for
+any claw must re-verify the upstream tag/package (and, for ironclaw, the
+`.sha256`) before landing.
 
 ## Checksum follow-up
 
@@ -91,7 +93,8 @@ the same way the tarball tag is re-verified.
 picoclaw, nullclaw and zeroclaw are version-pinned but do NOT publish a per-asset
 checksum, so verifying them needs a theyos-side checksum store (artifact
 infrastructure that does not exist yet). openclaw rides npm's built-in registry
-integrity. hermes-agent is unpinned (separate follow-up) and builds from source.
+integrity. hermes-agent is pinned to its git tag (S11-D-2) but builds from
+source, so it has no checksum either.
 
 Out of scope here and tracked elsewhere: `latest.json` signing, the engine
 software-keys flag, the Swift client, and Product A / nvpn.

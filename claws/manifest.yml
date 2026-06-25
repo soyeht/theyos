@@ -174,7 +174,7 @@ claws:
     language: python
     buildable: true
     distribution: prebuilt
-    version: "0.7.0"
+    version: "2026.6.19"
     binary_size_mb: 263
     min_ram_mb: 1024
     license: "MIT"

@@ -21,11 +21,11 @@ fn manifest_version(claw: &str) -> Result<&'static str, VZError> {
 ///
 /// Reads the pinned version from the embedded manifest (`manifest_version`), so
 /// it stays a deterministic static lookup with no I/O and is unit-testable.
-/// Every `curl` fetch is hardened to https + TLS >= 1.2 + retry. picoclaw,
-/// nullclaw, ironclaw, nanobot, zeroclaw and openclaw are pinned to the manifest
-/// version; only hermes-agent still pulls upstream HEAD (it uses date-based git
-/// tags and a HEAD `git clone`, so pinning needs an installer rework - see
-/// `docs/macos-runner-artifact-posture.md`).
+/// Every `curl` fetch is hardened to https + TLS >= 1.2 + retry. All seven claws
+/// read their version from the manifest; hermes-agent pins its git tag
+/// (`git clone --branch`) rather than a release asset - a partial pin, since its
+/// pip/npm build deps still float and there is no checksum (it builds from
+/// source). See `docs/macos-runner-artifact-posture.md`.
 fn macos_install_command(claw_type: &str) -> Result<String, VZError> {
     let cmd = match claw_type {
         "picoclaw" => {
@@ -69,22 +69,27 @@ fn macos_install_command(claw_type: &str) -> Result<String, VZError> {
             )
         }
         "hermes-agent" => {
-            r#"export PATH=/opt/homebrew/bin:/usr/local/bin:$HOME/.local/bin:$PATH && \
+            // Pinned to the manifest version's git tag (was a HEAD `git clone`).
+            // This pins only the source checkout - pip/npm build deps still float
+            // and there is no checksum (source build), so it is a partial pin.
+            let v = manifest_version("hermes-agent")?;
+            format!(
+                r#"export PATH=/opt/homebrew/bin:/usr/local/bin:$HOME/.local/bin:$PATH && \
              mkdir -p /opt/claws /usr/local/bin /opt/data /var/root/.hermes && \
              if [ -d /opt/claws/hermes-agent/.git ]; then \
-               cd /opt/claws/hermes-agent && git pull --ff-only || true; \
+               cd /opt/claws/hermes-agent && git fetch --depth 1 origin tag v{v} && git checkout -f v{v}; \
              else \
-               git clone --depth 1 https://github.com/NousResearch/hermes-agent /opt/claws/hermes-agent; \
+               git clone --depth 1 --branch v{v} https://github.com/NousResearch/hermes-agent /opt/claws/hermes-agent; \
              fi && \
              cd /opt/claws/hermes-agent && \
              python3 -m pip install --break-system-packages --no-cache-dir --ignore-installed -e ".[all]" && \
              npm install --prefer-offline --no-audit || true; \
              HERMES_BIN=$(command -v hermes 2>/dev/null || true); \
              test -n "$HERMES_BIN"; \
-             printf '#!/bin/sh\nexport HERMES_HOME="${HERMES_HOME:-/opt/data}"\ncd /opt/claws/hermes-agent || exit 1\nexec "%s" "$@"\n' "$HERMES_BIN" > /usr/local/bin/hermes-agent && \
+             printf '#!/bin/sh\nexport HERMES_HOME="${{HERMES_HOME:-/opt/data}}"\ncd /opt/claws/hermes-agent || exit 1\nexec "%s" "$@"\n' "$HERMES_BIN" > /usr/local/bin/hermes-agent && \
              chmod +x /usr/local/bin/hermes-agent && \
              hermes-agent --version 2>/dev/null || hermes-agent --help 2>/dev/null | head -1"#
-                .to_string()
+            )
         }
         "nullclaw" => {
             let v = manifest_version("nullclaw")?;
@@ -241,18 +246,18 @@ mod tests {
         "ironclaw",
     ];
 
-    /// Claws whose macOS install is still NOT version-pinned. hermes-agent uses
-    /// date-based git tags and is installed from a HEAD `git clone`, so pinning
-    /// it needs an installer rework (HEAD -> tagged clone), tracked separately.
-    /// A new claw added with an unpinned fetch (`releases/latest/download`,
-    /// `git clone` HEAD, or an unversioned pip/npm install) must be added here
-    /// consciously, or pinned. See `docs/macos-runner-artifact-posture.md`.
-    const UNPINNED_EXCEPTIONS: &[&str] = &["hermes-agent"];
+    /// Claws whose macOS install is still NOT version-pinned. Empty now that all
+    /// macOS claws pin a version (hermes-agent pins its git tag via
+    /// `git clone --branch`). A new claw added with an unpinned fetch
+    /// (`releases/latest/download`, a HEAD `git clone` without `--branch`, or an
+    /// unversioned pip/npm install) must be added here consciously, or pinned.
+    /// See `docs/macos-runner-artifact-posture.md`.
+    const UNPINNED_EXCEPTIONS: &[&str] = &[];
 
     /// Reliable markers that a command fetches an unpinned upstream artifact.
     fn looks_unpinned(cmd: &str) -> bool {
         cmd.contains("releases/latest/download")
-            || cmd.contains("git clone")
+            || (cmd.contains("git clone") && !cmd.contains("--branch"))
             || (cmd.contains("pip3 install") && !cmd.contains("=="))
             || (cmd.contains("npm install -g") && !cmd.contains("openclaw@"))
     }
@@ -360,7 +365,13 @@ mod tests {
         // manifest bump is reflected in the install command. Reads the embedded
         // manifest, no network.
         for claw in [
-            "picoclaw", "nullclaw", "ironclaw", "nanobot", "zeroclaw", "openclaw",
+            "picoclaw",
+            "nullclaw",
+            "ironclaw",
+            "nanobot",
+            "zeroclaw",
+            "openclaw",
+            "hermes-agent",
         ] {
             let cmd = macos_install_command(claw).expect("supported claw");
             let version = core_rs::manifest::get(claw)
