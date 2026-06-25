@@ -14,6 +14,8 @@ use std::sync::Mutex;
 use rand::RngCore;
 use rand::rngs::OsRng;
 
+use household_rs::claw_share::CLAIM_TIMESTAMP_TOLERANCE_SECS;
+
 /// CSPRNG entropy per challenge (same posture as the rendezvous token).
 pub const RELAY_OFFER_CHALLENGE_BYTES: usize = 32;
 
@@ -24,6 +26,12 @@ pub const RELAY_OFFER_CHALLENGE_TTL_SECS: u64 = 60;
 /// Fail-closed cap on outstanding (unconsumed, unexpired) challenges. Bounds the
 /// table against an issuance flood; at the cap, `issue` returns `None`.
 const MAX_OUTSTANDING_CHALLENGES: usize = 16_384;
+
+/// Single-use TTL for Path-A group claim nonces. This must cover the entire
+/// claim acceptance window: a claim first accepted at `T - tolerance` must still
+/// have its nonce recorded at `T + tolerance`, otherwise a boundary replay could
+/// mint a second offer from the same captured claim.
+pub const GROUP_CLAIM_NONCE_TTL_SECS: u64 = 2 * CLAIM_TIMESTAMP_TOLERANCE_SECS + 1;
 
 /// Single-use, TTL'd server-issued challenges, keyed by the raw challenge bytes.
 pub struct RelayOfferChallengeTable {
@@ -88,6 +96,65 @@ impl RelayOfferChallengeTable {
     }
 }
 
+/// Fail-closed cap on tracked single-use group-claim nonces. Bounds the table
+/// against a flood of fresh otherwise-valid group claims; at the cap a new
+/// nonce is rejected.
+const MAX_TRACKED_GROUP_NONCES: usize = 16_384;
+
+/// Single-use, TTL'd set of client-chosen group-claim nonces. Off-LAN group
+/// members cannot reach the loopback-gated `/relay-offer/challenge`, so the
+/// claim's own nonce is the freshness token. The engine records each nonce on
+/// first use and rejects any replay while the claim timestamp can still be
+/// accepted. Process-lifetime only: after restart, live membership is still
+/// checked again before a tunnel opens, and stale claims are rejected by their
+/// timestamp window.
+pub struct GroupClaimNonceTable {
+    inner: Mutex<HashMap<Vec<u8>, u64>>,
+}
+
+impl Default for GroupClaimNonceTable {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl GroupClaimNonceTable {
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            inner: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Record a group-claim nonce on first use. Returns true iff it was not seen
+    /// before within its TTL; false on replay or when the table is at its cap
+    /// after pruning.
+    pub fn record_first_use(&self, nonce: &[u8], now_unix: u64, ttl_secs: u64) -> bool {
+        let mut guard = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        guard.retain(|_, exp| *exp > now_unix);
+        if guard.contains_key(nonce) {
+            return false;
+        }
+        if guard.len() >= MAX_TRACKED_GROUP_NONCES {
+            return false;
+        }
+        guard.insert(nonce.to_vec(), now_unix.saturating_add(ttl_secs));
+        true
+    }
+
+    #[cfg(test)]
+    #[must_use]
+    pub fn tracked(&self) -> usize {
+        self.inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .len()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -123,5 +190,48 @@ mod tests {
         let _c3 = t.issue(2_000, 10).unwrap();
         assert_eq!(t.outstanding(), 1);
         assert!(!t.consume(&c1, 2_000)); // c1 was pruned
+    }
+
+    #[test]
+    fn group_nonce_first_use_then_replay_rejected() {
+        let t = GroupClaimNonceTable::new();
+        let nonce = [0x44u8; 32];
+        assert!(t.record_first_use(&nonce, 1_000, GROUP_CLAIM_NONCE_TTL_SECS));
+        assert!(!t.record_first_use(&nonce, 1_010, GROUP_CLAIM_NONCE_TTL_SECS));
+    }
+
+    #[test]
+    fn group_nonce_pruned_after_ttl() {
+        let t = GroupClaimNonceTable::new();
+        let nonce = [0x44u8; 32];
+        assert!(t.record_first_use(&nonce, 1_000, 60));
+        assert_eq!(t.tracked(), 1);
+        let other = [0x55u8; 32];
+        assert!(t.record_first_use(&other, 2_000, 60));
+        assert_eq!(t.tracked(), 1);
+        assert!(t.record_first_use(&nonce, 2_000, 60));
+    }
+
+    #[test]
+    fn group_nonce_survives_full_claim_acceptance_window() {
+        let claim_ts: u64 = 1_800_000_500;
+        let t = GroupClaimNonceTable::new();
+        let nonce = [0x44u8; 32];
+
+        assert!(t.record_first_use(
+            &nonce,
+            claim_ts - CLAIM_TIMESTAMP_TOLERANCE_SECS,
+            GROUP_CLAIM_NONCE_TTL_SECS,
+        ));
+        assert!(!t.record_first_use(
+            &nonce,
+            claim_ts + CLAIM_TIMESTAMP_TOLERANCE_SECS,
+            GROUP_CLAIM_NONCE_TTL_SECS,
+        ));
+        assert!(t.record_first_use(
+            &nonce,
+            claim_ts + CLAIM_TIMESTAMP_TOLERANCE_SECS + 1,
+            GROUP_CLAIM_NONCE_TTL_SECS,
+        ));
     }
 }

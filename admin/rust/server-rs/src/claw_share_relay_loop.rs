@@ -35,6 +35,7 @@ use nostr_relay_rs::{
 };
 use tokio::sync::broadcast;
 
+use crate::claw_share_relay_offer_challenge::GroupClaimNonceTable;
 use crate::household_state::HouseholdState;
 
 const RECONNECT_BACKOFF_INITIAL: Duration = Duration::from_secs(1);
@@ -78,6 +79,10 @@ pub struct EngineRelayState {
     /// Engine state directory root, used only by the default-off `relay_stream`
     /// claim provisioning. Read only when `THEYOS_RELAY_STREAM_LIVE` is set.
     pub state_dir: std::path::PathBuf,
+    /// Shared single-use nonce guard for Path-A Group claims. One Arc is shared
+    /// by all relay loops so replaying the same claim on another relay is still
+    /// rejected.
+    pub group_claim_nonces: Arc<GroupClaimNonceTable>,
 }
 
 struct SpawnedState {

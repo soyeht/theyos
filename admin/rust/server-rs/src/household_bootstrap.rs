@@ -12,7 +12,7 @@
 //! - Bonjour publisher (FR-017) — only announces once identity is loaded.
 
 use crate::bonjour_trust::BrowserConfig;
-use crate::claw_share_relay_offer_challenge::RelayOfferChallengeTable;
+use crate::claw_share_relay_offer_challenge::{GroupClaimNonceTable, RelayOfferChallengeTable};
 use crate::claw_share_relay_stream_abuse::RelayAbuseState;
 use crate::handlers_bootstrap::{BootstrapHandlerState, BootstrapStateArc};
 use crate::handlers_claw_share;
@@ -63,6 +63,7 @@ struct ClawShareRuntimeHandles {
     mesh_log: Arc<MeshLogStore>,
     replay_guard: Arc<ReplayGuard>,
     relay_offer_challenges: Arc<RelayOfferChallengeTable>,
+    group_claim_nonces: Arc<GroupClaimNonceTable>,
     relay_offer_abuse: Arc<Mutex<RelayAbuseState>>,
 }
 
@@ -207,6 +208,7 @@ fn prepare_claw_share_bootstrap_state(
     let slot_store = Arc::new(ClawShareSlotStore::seeded_from(&projection));
     let replay_guard = Arc::new(ReplayGuard::new());
     let relay_offer_challenges = Arc::new(RelayOfferChallengeTable::new());
+    let group_claim_nonces = Arc::new(GroupClaimNonceTable::new());
     let relay_offer_abuse = Arc::new(Mutex::new(RelayAbuseState::default()));
     let relay_urls = relay_urls_from_env_value(relay_env);
 
@@ -235,6 +237,7 @@ fn prepare_claw_share_bootstrap_state(
             mesh_log,
             replay_guard,
             relay_offer_challenges,
+            group_claim_nonces,
             relay_offer_abuse,
         },
         engine_relay_identity,
@@ -288,6 +291,7 @@ fn spawn_claw_share_relay_loop_if_configured(
         engine_keys: identity.keys,
         relay_urls,
         state_dir,
+        group_claim_nonces: Arc::clone(&runtime.group_claim_nonces),
     });
 }
 
