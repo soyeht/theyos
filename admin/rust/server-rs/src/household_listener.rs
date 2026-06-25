@@ -418,6 +418,23 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn bind_concrete_rejects_wildcard_addresses() {
+        for addr in ["0.0.0.0:0", "[::]:0"] {
+            let addr: SocketAddr = addr.parse().unwrap();
+            let err = bind_concrete(addr)
+                .await
+                .err()
+                .expect("wildcard bind must be rejected");
+            assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+            assert!(
+                err.to_string()
+                    .contains("refusing to listen on wildcard 0.0.0.0/::"),
+                "unexpected wildcard reject error: {err}"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn bound_set_preserves_interface_class() {
         let bound = BoundSet::default();
         let ip: IpAddr = "100.64.1.2".parse().unwrap();
