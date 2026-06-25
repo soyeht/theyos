@@ -56,11 +56,14 @@ pub enum MachineIssuerError {
 /// issuer for `record`.
 ///
 /// Checks, fail-closed, in order:
-/// 1. **Root/degenerate**: `signer_pub == record.hh_pub` is accepted directly.
-///    The household root is the ultimate trust anchor, so an offer signed by it
-///    needs no cert chain. This is the single-machine / test shape; in the
-///    steady-state regime the engine signs with `identity.m_priv`, not the
-///    root, so this branch is not the live path.
+/// 1. **Root/degenerate** (only when `allow_root_signer`): `signer_pub ==
+///    record.hh_pub` is accepted directly. The household root is the ultimate
+///    trust anchor, so an offer signed by it needs no cert chain. This is the
+///    single-machine / Device shape; in the steady-state regime the engine signs
+///    with `identity.m_priv`, not the root, so this branch is not the live path.
+///    Callers verifying credential-less **Group/Public** offers pass
+///    `allow_root_signer = false`: those audiences require the full machine-cert
+///    chain + revocation overlay, never the bare root fallback.
 /// 2. **Subject binding**: `cert.m_pub == signer_pub`, else [`SignerMismatch`].
 ///    A valid cert for a *different* member must not authorize this key.
 /// 3. **Authenticity**: `cert.verify(&record.hh_pub)`, else [`CertInvalid`].
@@ -76,10 +79,11 @@ pub fn is_machine_issuer_active(
     cert: &MachineCert,
     projection: Option<&ProjectedState>,
     signer_pub: &P256PublicKey,
+    allow_root_signer: bool,
 ) -> Result<(), MachineIssuerError> {
     // 1. Root/degenerate: signed directly by the household root key. The root
     //    is the trust anchor itself, so the cert chain is not consulted here.
-    if *signer_pub == record.hh_pub {
+    if allow_root_signer && *signer_pub == record.hh_pub {
         return Ok(());
     }
     // 2. The cert must speak for exactly this signer key (cheap structural
@@ -158,7 +162,7 @@ mod tests {
         let cert = member_cert(&hh, &m);
         let record = record_with(&hh, vec![derive_machine_id(&m.public())]);
 
-        is_machine_issuer_active(&record, &cert, None, &m.public()).unwrap();
+        is_machine_issuer_active(&record, &cert, None, &m.public(), true).unwrap();
     }
 
     #[test]
@@ -172,7 +176,29 @@ mod tests {
         let cert = member_cert(&hh, &m);
         let record = record_with(&hh, vec![derive_machine_id(&stranger.public())]);
 
-        is_machine_issuer_active(&record, &cert, None, &hh.public()).unwrap();
+        is_machine_issuer_active(&record, &cert, None, &hh.public(), true).unwrap();
+    }
+
+    #[test]
+    fn rejects_root_signer_when_disabled() {
+        let hh = P256Keypair::generate();
+        let m = P256Keypair::generate();
+        let cert = member_cert(&hh, &m);
+        let record = record_with(&hh, vec![derive_machine_id(&m.public())]);
+
+        let err = is_machine_issuer_active(&record, &cert, None, &hh.public(), false).unwrap_err();
+
+        assert!(matches!(err, MachineIssuerError::SignerMismatch));
+    }
+
+    #[test]
+    fn accepts_member_cert_even_when_root_signer_disabled() {
+        let hh = P256Keypair::generate();
+        let m = P256Keypair::generate();
+        let cert = member_cert(&hh, &m);
+        let record = record_with(&hh, vec![derive_machine_id(&m.public())]);
+
+        is_machine_issuer_active(&record, &cert, None, &m.public(), false).unwrap();
     }
 
     #[test]
@@ -183,7 +209,8 @@ mod tests {
         let cert = member_cert(&hh, &m);
         let record = record_with(&hh, vec![derive_machine_id(&m.public())]);
 
-        let err = is_machine_issuer_active(&record, &cert, None, &attacker.public()).unwrap_err();
+        let err =
+            is_machine_issuer_active(&record, &cert, None, &attacker.public(), true).unwrap_err();
 
         assert!(matches!(err, MachineIssuerError::SignerMismatch));
     }
@@ -197,7 +224,7 @@ mod tests {
         let cert = member_cert(&foreign_hh, &m);
         let record = record_with(&hh, vec![derive_machine_id(&m.public())]);
 
-        let err = is_machine_issuer_active(&record, &cert, None, &m.public()).unwrap_err();
+        let err = is_machine_issuer_active(&record, &cert, None, &m.public(), true).unwrap_err();
 
         assert!(matches!(err, MachineIssuerError::CertInvalid(_)));
     }
@@ -211,7 +238,7 @@ mod tests {
         // Valid, household-signed cert for `m`, but `m` is not in members.
         let record = record_with(&hh, vec![derive_machine_id(&other.public())]);
 
-        let err = is_machine_issuer_active(&record, &cert, None, &m.public()).unwrap_err();
+        let err = is_machine_issuer_active(&record, &cert, None, &m.public(), true).unwrap_err();
 
         assert!(matches!(err, MachineIssuerError::NonMember));
     }
@@ -232,7 +259,7 @@ mod tests {
             },
         )]);
 
-        is_machine_issuer_active(&record, &cert, Some(&projection), &m.public()).unwrap();
+        is_machine_issuer_active(&record, &cert, Some(&projection), &m.public(), true).unwrap();
     }
 
     #[test]
@@ -252,7 +279,7 @@ mod tests {
             },
         )]);
 
-        is_machine_issuer_active(&record, &cert, Some(&projection), &m.public()).unwrap();
+        is_machine_issuer_active(&record, &cert, Some(&projection), &m.public(), true).unwrap();
     }
 
     #[test]
@@ -270,8 +297,8 @@ mod tests {
             },
         );
 
-        let err =
-            is_machine_issuer_active(&record, &cert, Some(&projection), &m.public()).unwrap_err();
+        let err = is_machine_issuer_active(&record, &cert, Some(&projection), &m.public(), true)
+            .unwrap_err();
 
         assert!(matches!(err, MachineIssuerError::DeviceRemoved));
     }
@@ -302,8 +329,8 @@ mod tests {
             ),
         ]);
 
-        let err =
-            is_machine_issuer_active(&record, &cert, Some(&projection), &m.public()).unwrap_err();
+        let err = is_machine_issuer_active(&record, &cert, Some(&projection), &m.public(), true)
+            .unwrap_err();
 
         assert!(matches!(err, MachineIssuerError::DeviceRemoved));
     }

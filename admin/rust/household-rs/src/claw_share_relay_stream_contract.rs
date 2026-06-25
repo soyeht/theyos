@@ -548,8 +548,18 @@ impl RelayStreamOfferContract {
         now_unix: u64,
     ) -> Result<(), RelayStreamContractError> {
         self.payload.validate(now_unix)?;
-        is_machine_issuer_active(record, cert, Some(projection), &self.signer_pub)
-            .map_err(RelayStreamContractError::IssuerUnauthorized)?;
+        // Device offers may use the single-machine/root fallback. Credential-less
+        // Group/Public offers must be authorized by the machine-cert chain because
+        // they carry no per-guest credential.
+        let allow_root_signer = matches!(self.payload.audience(), RelayStreamAudience::Device);
+        is_machine_issuer_active(
+            record,
+            cert,
+            Some(projection),
+            &self.signer_pub,
+            allow_root_signer,
+        )
+        .map_err(RelayStreamContractError::IssuerUnauthorized)?;
         let signing_bytes = self.payload.to_canonical_bytes()?;
         verify_signature(&self.signer_pub, &signing_bytes, &self.signature)
             .map_err(|_| RelayStreamContractError::SignatureRejected)
@@ -721,8 +731,9 @@ pub enum RelayStreamContractError {
 mod tests {
     use super::*;
     use crate::claw_share::SlotId;
-    use crate::ids::derive_household_id;
+    use crate::ids::{derive_household_id, derive_machine_id};
     use crate::keys::{IdentityKey, P256Keypair};
+    use crate::machine_cert::{Platform, SignOptions};
     use crate::person_cert::derive_person_id;
 
     const NOW: u64 = 1_800_000_000;
@@ -969,6 +980,52 @@ mod tests {
         .unwrap()
     }
 
+    fn trust_machine() -> P256Keypair {
+        P256Keypair::from_secret_scalar(&[0x12; 32]).unwrap()
+    }
+
+    fn trust_record(root: &P256Keypair, machine: &P256Keypair) -> HouseholdRecord {
+        HouseholdRecord {
+            version: HouseholdRecord::SCHEMA_VERSION,
+            hh_id: derive_household_id(&root.public()),
+            hh_pub: root.public(),
+            name: "home".to_string(),
+            created_at: 0,
+            shamir_k: 1,
+            shamir_n: 1,
+            members: vec![derive_machine_id(&machine.public())],
+            is_follower: false,
+        }
+    }
+
+    fn trust_cert(root: &P256Keypair, machine: &P256Keypair) -> MachineCert {
+        MachineCert::sign(
+            root,
+            &machine.public(),
+            &SignOptions {
+                hh_id: derive_household_id(&root.public()),
+                hostname: "machine-alpha".to_string(),
+                platform: Platform::Macos,
+                joined_at: NOW - 60,
+            },
+        )
+        .unwrap()
+    }
+
+    fn root_trust_inputs() -> (
+        HouseholdRecord,
+        MachineCert,
+        crate::household_mesh_log::ProjectedState,
+    ) {
+        let root = signer();
+        let machine = trust_machine();
+        (
+            trust_record(&root, &machine),
+            trust_cert(&root, &machine),
+            crate::household_mesh_log::ProjectedState::default(),
+        )
+    }
+
     fn credential_for_guest(guest_pub: P256PublicKey) -> GuestCredential {
         GuestCredential::sign(
             derive_household_id(&owner_pub()),
@@ -1004,6 +1061,71 @@ mod tests {
 
     fn signed_offer() -> RelayStreamOfferContract {
         RelayStreamOfferContract::sign(payload(), &signer()).unwrap()
+    }
+
+    #[test]
+    fn verify_with_trust_allows_root_signed_device_offer() {
+        let (record, cert, projection) = root_trust_inputs();
+        let offer = signed_offer();
+
+        assert_eq!(offer.payload.audience(), RelayStreamAudience::Device);
+        offer
+            .verify_with_trust(&record, &cert, &projection, NOW)
+            .unwrap();
+    }
+
+    #[test]
+    fn verify_with_trust_rejects_root_signed_group_offer() {
+        let (record, cert, projection) = root_trust_inputs();
+        let offer = mint_relay_stream_group_offer(
+            token(0x42),
+            SlotId([0x99; 16]),
+            "g".to_string(),
+            "g_a".to_string(),
+            member_device().public(),
+            "claw_alpha".to_string(),
+            RelayStreamResource::Pty,
+            "relay-stream://127.0.0.1:49152".to_string(),
+            static_pub(0x33),
+            NOT_AFTER,
+            NOW,
+            &signer(),
+        )
+        .unwrap();
+
+        let err = offer
+            .verify_with_trust(&record, &cert, &projection, NOW)
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            RelayStreamContractError::IssuerUnauthorized(MachineIssuerError::SignerMismatch)
+        ));
+    }
+
+    #[test]
+    fn verify_with_trust_rejects_root_signed_public_offer() {
+        let (record, cert, projection) = root_trust_inputs();
+        let offer = mint_relay_stream_public_offer(
+            token(0x42),
+            SlotId([0x98; 16]),
+            guest_pub(),
+            "claw_alpha".to_string(),
+            RelayStreamResource::Pty,
+            "relay-stream://127.0.0.1:49152".to_string(),
+            static_pub(0x33),
+            NOT_AFTER,
+            NOW,
+            &signer(),
+        )
+        .unwrap();
+
+        let err = offer
+            .verify_with_trust(&record, &cert, &projection, NOW)
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            RelayStreamContractError::IssuerUnauthorized(MachineIssuerError::SignerMismatch)
+        ));
     }
 
     fn signed_offer_with(

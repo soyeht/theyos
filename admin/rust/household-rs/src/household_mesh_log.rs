@@ -2467,14 +2467,15 @@ mod tests {
         let record = household_record_with_member(&hh, &m);
         let store = MeshLogStore::new();
 
-        is_machine_issuer_active(&record, &cert, Some(&store.project()), &m.public())
+        is_machine_issuer_active(&record, &cert, Some(&store.project()), &m.public(), true)
             .expect("member machine active before removal");
 
         emit_directory_device_removed(&store, &m, &m.public(), &m.public(), 1_000)
             .expect("emit removal");
 
-        let err = is_machine_issuer_active(&record, &cert, Some(&store.project()), &m.public())
-            .expect_err("removed issuer must fail closed");
+        let err =
+            is_machine_issuer_active(&record, &cert, Some(&store.project()), &m.public(), true)
+                .expect_err("removed issuer must fail closed");
         assert!(matches!(err, MachineIssuerError::DeviceRemoved));
     }
 
