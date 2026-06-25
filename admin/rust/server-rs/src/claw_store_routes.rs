@@ -398,6 +398,17 @@ pub const ROUTES: &[ClawStoreRouteSpec] = &[
         household_operation: Some("claws.delete"),
     },
     ClawStoreRouteSpec {
+        id: "household_list_instances",
+        surface: "household",
+        method: METHOD_GET,
+        path_template: household::CREATE_INSTANCE,
+        mount_file: "admin/rust/server-rs/src/household_bootstrap.rs",
+        mount_slice: "household_claws_router",
+        route_literal: household::CREATE_INSTANCE,
+        route_expr: "\"/api/v1/household/instances\"",
+        household_operation: Some("claws.list"),
+    },
+    ClawStoreRouteSpec {
         id: "household_create_instance",
         surface: "household",
         method: METHOD_POST,

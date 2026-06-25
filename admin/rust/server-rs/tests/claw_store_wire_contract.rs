@@ -693,6 +693,11 @@ fn c4_1_instance_lifecycle_fixtures_pin_nested_and_flat_shapes() {
     assert_eq!(admin_status["instance"]["guest_os"], "linux");
     assert_eq!(admin_status["job"], Value::Null);
 
+    let household_list = fixture("household_instance_list_empty");
+    assert_eq!(household_list["data"], json!([]));
+    assert_eq!(household_list["has_more"], false);
+    assert_eq!(household_list["next_cursor"], Value::Null);
+
     let flat_status = fixture("mobile_household_instance_status_active");
     assert_eq!(flat_status["status"], "active");
     assert_eq!(flat_status["provisioning_message"], Value::Null);
@@ -1667,6 +1672,7 @@ async fn household_pop_auth_failure_is_empty_401() {
     for (method, path) in [
         (Method::GET, "/api/v1/household/claws"),
         (Method::POST, "/api/v1/household/claws/picoclaw/install"),
+        (Method::GET, "/api/v1/household/instances"),
         (Method::POST, "/api/v1/household/instances"),
         (Method::GET, "/api/v1/household/instances/inst-alpha/status"),
         (Method::POST, "/api/v1/household/instances/inst-alpha/stop"),
