@@ -267,13 +267,13 @@ async fn sync_interface_targets(
         let _ = bind_allowed_target(router, port, bound, *ip, *class, source).await;
     }
 
-    let stale: Vec<IpAddr> = bound
+    let stale_ips: Vec<IpAddr> = bound
         .snapshot()
         .await
         .into_iter()
         .filter(|ip| !live_set.contains(ip))
         .collect();
-    for ip in stale {
+    for ip in stale_ips {
         shutdown_bound_target(bound, ip, "interface_or_policy_removed").await;
     }
 

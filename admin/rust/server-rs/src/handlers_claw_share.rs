@@ -260,6 +260,8 @@ pub fn router(state: ClawShareRouterState) -> axum::Router {
         "/api/v1/claw-share/dev-publish-claw",
         post(handle_dev_publish_claw),
     );
+    #[cfg(feature = "dev_claw_share_mint")]
+    let router = router.route("/api/v1/claw-share/dev-group-op", post(handle_dev_group_op));
     router.with_state(state)
 }
 
@@ -1109,6 +1111,192 @@ async fn handle_dev_publish_claw(
     }
 }
 
+// ─── Dev-only group seed (headless Group-claim smoke) ─────────────────────────
+
+/// Request body for the DEV-ONLY `/dev-group-op` fixture. Carries the member +
+/// device SECRET scalars (hex) so the engine can MINT the member-self-signed
+/// binding locally (a `curl` client cannot sign P-256). The SAME two secrets fed
+/// to `friend-cli group-claim-relay` reproduce the byte-identical `member_id` +
+/// `device_pub` the live membership gate keys on. Secrets ride the BODY — never a
+/// query string (`/group-op` logs `path_and_query`) — and are NEVER logged.
+#[cfg(feature = "dev_claw_share_mint")]
+#[derive(Deserialize)]
+struct DevGroupOpRequest {
+    /// 64-hex (32-byte) member secret scalar. Dev/smoke ONLY.
+    member_secret: String,
+    /// 64-hex (32-byte) device secret scalar. Dev/smoke ONLY.
+    device_secret: String,
+    /// Per-device relay rendezvous npub recorded in the binding.
+    participant_npub: String,
+    group_id: String,
+    claw_id: String,
+    /// Member display label recorded by `AddMember`.
+    member_label: String,
+    /// Optional group display name (`Create`); defaults to `group_id`.
+    #[serde(default)]
+    group_name: Option<String>,
+    /// Optional binding `issued_at`; defaults to `now`. The membership gate
+    /// ignores it (`binding.verify` has no freshness check); pin it only if you
+    /// want byte-identical bindings across independent runs.
+    #[serde(default)]
+    issued_at: Option<u64>,
+}
+
+/// Response: the PUBLIC identifiers the smoke can echo/verify. No secret material.
+#[cfg(feature = "dev_claw_share_mint")]
+#[derive(Serialize)]
+struct DevGroupOpResponse {
+    member_id: String,
+    /// SEC1-compressed (33-byte) device pubkey, hex.
+    device_pub: String,
+    group_id: String,
+    claw_id: String,
+}
+
+/// Parse a 64-hex (32-byte) secret scalar into a software P-256 keypair, byte-for
+/// -byte identical to friend-cli's `member_key_from_hex` (trim, len == 64, 2-char
+/// `from_str_radix` windows, `from_secret_scalar`) so the engine-minted binding
+/// and the friend-cli claim binding agree. Returns a static reason for a
+/// shape-hiding 400. DEV-ONLY.
+#[cfg(feature = "dev_claw_share_mint")]
+fn dev_keypair_from_hex(hex: &str) -> Result<household_rs::keys::P256Keypair, &'static str> {
+    let hex = hex.trim();
+    if hex.len() != 64 {
+        return Err("secret_not_64_hex");
+    }
+    let mut scalar = [0u8; 32];
+    for (i, byte) in scalar.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16).map_err(|_| "secret_not_hex")?;
+    }
+    household_rs::keys::P256Keypair::from_secret_scalar(&scalar)
+        .map_err(|_| "secret_invalid_scalar")
+}
+
+/// `POST /api/v1/claw-share/dev-group-op` — DEV-ONLY (feature
+/// `dev_claw_share_mint`; route, handler, and types are absent entirely without
+/// it). Seeds the live group projection for a headless Group-claim smoke by
+/// applying `Create`, `AddMember`, `EnrollMemberDevice`, and `GrantClaw` WITHOUT
+/// the owner `PersonCert` `PoP` that `/group-op` requires — behind the SAME three
+/// fail-closed gates as the other dev fixtures (loopback, plus the env vars
+/// `THEYOS_DEV_CLAW_SHARE_INVITE_MINT=1` and `THEYOS_FORCE_SOFTWARE_KEYS=1`); any
+/// miss yields a bare 404, checked BEFORE the body is touched so a malformed or
+/// forged request still leaks nothing. Each op flows through the SAME
+/// [`apply_group_op`] the owner path uses (including the real `EnrollMemberDevice`
+/// `binding.verify()`), so this is a generic apply, never a parallel seeder. An
+/// explicit owner-authority bypass for the loopback dev smoke ONLY (pure test box;
+/// owner-approved); the engine-signed events fold into THIS engine's live
+/// projection but are NOT authorized for gossip replication (peer engines reject a
+/// non-owner issuer).
+#[cfg(feature = "dev_claw_share_mint")]
+async fn handle_dev_group_op(
+    State(state): State<ClawShareRouterState>,
+    ConnectInfo(peer): ConnectInfo<std::net::SocketAddr>,
+    body: Bytes,
+) -> Response {
+    // Gate FIRST — before the body is parsed — so any miss is a bare 404 with zero
+    // effect, hiding the endpoint shape even from a malformed/forged request.
+    if !dev_endpoint_allowed(
+        peer.ip(),
+        std::env::var("THEYOS_DEV_CLAW_SHARE_INVITE_MINT")
+            .ok()
+            .as_deref(),
+        std::env::var("THEYOS_FORCE_SOFTWARE_KEYS").ok().as_deref(),
+    ) {
+        tracing::warn!(stage = "claw_share.dev_group_op.gate_rejected", peer = %peer);
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    let now = match SystemTime::now().duration_since(UNIX_EPOCH) {
+        Ok(d) => d.as_secs(),
+        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    };
+
+    // Loopback + dev-gated past this point. Secrets ride the body and are never
+    // logged; parsing happens only after the gate.
+    let req: DevGroupOpRequest = match serde_json::from_slice(&body) {
+        Ok(r) => r,
+        Err(_) => return error_response(StatusCode::BAD_REQUEST, "request_malformed", None),
+    };
+
+    let member_key = match dev_keypair_from_hex(&req.member_secret) {
+        Ok(k) => k,
+        Err(reason) => return error_response(StatusCode::BAD_REQUEST, reason, None),
+    };
+    let device_key = match dev_keypair_from_hex(&req.device_secret) {
+        Ok(k) => k,
+        Err(reason) => return error_response(StatusCode::BAD_REQUEST, reason, None),
+    };
+    let device_pub = device_key.public();
+    let issued_at = req.issued_at.unwrap_or(now);
+
+    // Mint the member-self-signed binding server-side via the SAME canonical
+    // builder friend-cli calls, so the enrolled binding and the F3 claim binding
+    // agree on member_id (= derive_member_id(member_pub)) and device_pub bytes.
+    let Ok(binding) = MemberDeviceBinding::sign(
+        &member_key,
+        device_pub.clone(),
+        req.participant_npub.clone(),
+        issued_at,
+    ) else {
+        return error_response(StatusCode::BAD_REQUEST, "member_binding_sign_failed", None);
+    };
+    let member_id = binding.member_id.clone();
+
+    // The four ops the live membership gate requires, each applied through the
+    // shared post-authorization path: Create → group exists; AddMember → member
+    // Active; EnrollMemberDevice → device Active under member; GrantClaw → claw
+    // granted to group. Short-circuit on the first failure.
+    let ops = [
+        GroupOp::Create {
+            group_id: req.group_id.clone(),
+            name: req
+                .group_name
+                .clone()
+                .unwrap_or_else(|| req.group_id.clone()),
+        },
+        GroupOp::AddMember {
+            group_id: req.group_id.clone(),
+            member_id: member_id.clone(),
+            label: req.member_label.clone(),
+        },
+        GroupOp::EnrollMemberDevice { binding },
+        GroupOp::GrantClaw {
+            group_id: req.group_id.clone(),
+            claw_id: req.claw_id.clone(),
+        },
+    ];
+    for op in ops {
+        if let Err(resp) = apply_group_op(&state, &op, now).await {
+            return resp;
+        }
+    }
+
+    tracing::info!(
+        stage = "claw_share.dev_group_op.applied",
+        group_id = %req.group_id,
+        claw_id = %req.claw_id,
+        member_id = %member_id,
+    );
+
+    let resp = DevGroupOpResponse {
+        member_id,
+        device_pub: hex::encode(&device_pub.as_bytes()[..]),
+        group_id: req.group_id,
+        claw_id: req.claw_id,
+    };
+    match serde_json::to_vec(&resp) {
+        Ok(bytes) => (
+            StatusCode::OK,
+            [(
+                header::CONTENT_TYPE,
+                HeaderValue::from_static("application/json"),
+            )],
+            bytes,
+        )
+            .into_response(),
+        Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    }
+}
+
 // ─── Revoke slot (admin-PoP) ─────────────────────────────────────────────────
 
 #[derive(Deserialize)]
@@ -1264,6 +1452,109 @@ struct GroupOpRequest {
     op: GroupOp,
 }
 
+/// Translate one [`GroupOp`] into the single signed `MeshEvent` it records.
+/// `EnrollMemberDevice` fails closed (`BAD_REQUEST` / `member_binding_invalid`)
+/// if the member's self-signed binding does not verify — `member_id` must derive
+/// from `member_pub` and the member signature must hold. Pure (no I/O, no auth):
+/// the SAME translation + validation is shared by the owner-PoP'd `/group-op` and
+/// the dev-only `/dev-group-op` fixture, so the two paths can never diverge in
+/// how an op maps to mesh state — only the authorization above them differs.
+#[allow(clippy::result_large_err)] // the Err is a one-shot rejection Response
+fn group_op_to_event(op: &GroupOp) -> Result<MeshEvent, Response> {
+    Ok(match op {
+        GroupOp::Create { group_id, name } => MeshEvent::GroupCreated {
+            group_id: group_id.clone(),
+            name: name.clone(),
+        },
+        GroupOp::Rename { group_id, name } => MeshEvent::GroupRenamed {
+            group_id: group_id.clone(),
+            name: name.clone(),
+        },
+        GroupOp::AddMember {
+            group_id,
+            member_id,
+            label,
+        } => MeshEvent::GroupMemberAdded {
+            group_id: group_id.clone(),
+            member_id: member_id.clone(),
+            label: label.clone(),
+        },
+        GroupOp::RemoveMember {
+            group_id,
+            member_id,
+        } => MeshEvent::GroupMemberRemoved {
+            group_id: group_id.clone(),
+            member_id: member_id.clone(),
+        },
+        GroupOp::GrantClaw { group_id, claw_id } => MeshEvent::GroupClawGranted {
+            group_id: group_id.clone(),
+            claw_id: claw_id.clone(),
+        },
+        GroupOp::RevokeClaw { group_id, claw_id } => MeshEvent::GroupClawRevoked {
+            group_id: group_id.clone(),
+            claw_id: claw_id.clone(),
+        },
+        GroupOp::EnrollMemberDevice { binding } => {
+            if binding.verify().is_err() {
+                return Err(error_response(
+                    StatusCode::BAD_REQUEST,
+                    "member_binding_invalid",
+                    None,
+                ));
+            }
+            MeshEvent::MeshMemberDeviceEnrolled {
+                member_id: binding.member_id.clone(),
+                device_pub: binding.device_pub.clone(),
+                participant_npub: binding.participant_npub.clone(),
+            }
+        }
+        GroupOp::RetireMemberDevice {
+            member_id,
+            device_pub,
+        } => MeshEvent::MeshMemberDeviceRetired {
+            member_id: member_id.clone(),
+            device_pub: device_pub.clone(),
+        },
+        GroupOp::PublishClaw { claw_id } => MeshEvent::ClawSitePublished {
+            claw_id: claw_id.clone(),
+        },
+        GroupOp::UnpublishClaw { claw_id } => MeshEvent::ClawSiteUnpublished {
+            claw_id: claw_id.clone(),
+        },
+    })
+}
+
+/// Apply one ALREADY-AUTHORIZED [`GroupOp`]: resolve the engine signing key,
+/// translate via [`group_op_to_event`], and append the signed event to the
+/// durable mesh log (the next `project()` folds it into the live state — there is
+/// no cached projection to refresh). This is the post-authorization apply shared
+/// by `/group-op` (owner-PoP'd above) and `/dev-group-op` (dev-gated above); it
+/// performs NO authorization itself — the caller is the sole access boundary.
+async fn apply_group_op(
+    state: &ClawShareRouterState,
+    op: &GroupOp,
+    now: u64,
+) -> Result<(), Response> {
+    let Some(identity) = state.household.current().await else {
+        return Err(error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "household_unavailable",
+            None,
+        ));
+    };
+    let owner_key = identity.m_priv.as_ref();
+    let event = group_op_to_event(op)?;
+    if let Err(e) = log_event(&state.mesh_log, owner_key, now, event) {
+        tracing::warn!(stage = "claw_share.group_op.log_failed", error = %e);
+        return Err(error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "log_persist_failed",
+            None,
+        ));
+    }
+    Ok(())
+}
+
 /// `POST /api/v1/claw-share/group-op` — OWNER-authed. Applies one [`GroupOp`] to
 /// the first-class group model by appending one signed `MeshEvent` to the mesh
 /// log, then republishes the affected claws' rosters so the change is live.
@@ -1309,88 +1600,14 @@ async fn handle_group_op(
         return error_response(StatusCode::BAD_REQUEST, "version_unsupported", None);
     }
 
-    let Some(identity) = state.household.current().await else {
-        return error_response(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "household_unavailable",
-            None,
-        );
-    };
-    let owner_key = identity.m_priv.as_ref();
-
-    // Translate the op into one signed event. `EnrollMemberDevice` fails closed
-    // if the member's self-signed binding does not verify (member_id must derive
-    // from member_pub and the signature must hold).
-    let event = match &req.op {
-        GroupOp::Create { group_id, name } => MeshEvent::GroupCreated {
-            group_id: group_id.clone(),
-            name: name.clone(),
-        },
-        GroupOp::Rename { group_id, name } => MeshEvent::GroupRenamed {
-            group_id: group_id.clone(),
-            name: name.clone(),
-        },
-        GroupOp::AddMember {
-            group_id,
-            member_id,
-            label,
-        } => MeshEvent::GroupMemberAdded {
-            group_id: group_id.clone(),
-            member_id: member_id.clone(),
-            label: label.clone(),
-        },
-        GroupOp::RemoveMember {
-            group_id,
-            member_id,
-        } => MeshEvent::GroupMemberRemoved {
-            group_id: group_id.clone(),
-            member_id: member_id.clone(),
-        },
-        GroupOp::GrantClaw { group_id, claw_id } => MeshEvent::GroupClawGranted {
-            group_id: group_id.clone(),
-            claw_id: claw_id.clone(),
-        },
-        GroupOp::RevokeClaw { group_id, claw_id } => MeshEvent::GroupClawRevoked {
-            group_id: group_id.clone(),
-            claw_id: claw_id.clone(),
-        },
-        GroupOp::EnrollMemberDevice { binding } => {
-            if binding.verify().is_err() {
-                return error_response(StatusCode::BAD_REQUEST, "member_binding_invalid", None);
-            }
-            MeshEvent::MeshMemberDeviceEnrolled {
-                member_id: binding.member_id.clone(),
-                device_pub: binding.device_pub.clone(),
-                participant_npub: binding.participant_npub.clone(),
-            }
-        }
-        GroupOp::RetireMemberDevice {
-            member_id,
-            device_pub,
-        } => MeshEvent::MeshMemberDeviceRetired {
-            member_id: member_id.clone(),
-            device_pub: device_pub.clone(),
-        },
-        GroupOp::PublishClaw { claw_id } => MeshEvent::ClawSitePublished {
-            claw_id: claw_id.clone(),
-        },
-        GroupOp::UnpublishClaw { claw_id } => MeshEvent::ClawSiteUnpublished {
-            claw_id: claw_id.clone(),
-        },
-    };
-
-    if let Err(e) = log_event(&state.mesh_log, owner_key, now, event) {
-        tracing::warn!(stage = "claw_share.group_op.log_failed", error = %e);
-        return error_response(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "log_persist_failed",
-            None,
-        );
-    }
-
-    // The signed membership op is now durable in the op-log. The roster
-    // re-publish of the affected claws is part of the L3 overlay subset and is
+    // Post-authorization apply, shared with the dev-only `/dev-group-op` fixture.
+    // The owner-PoP gate above is the SOLE authorization for this production
+    // path. The signed membership op becomes durable in the op-log; the roster
+    // re-publish of affected claws is part of the L3 overlay subset and is
     // intentionally not wired in this relay/membership subset.
+    if let Err(resp) = apply_group_op(&state, &req.op, now).await {
+        return resp;
+    }
 
     StatusCode::NO_CONTENT.into_response()
 }
@@ -1809,6 +2026,176 @@ mod tests {
     }
 
     // ---- R134: public direct engine peer (CPE port-forward / WAN endpoint) ----
+
+    // ── F1: shared GroupOp → MeshEvent translation (post-auth apply helper) ──
+
+    #[test]
+    fn group_op_to_event_maps_membership_variants() {
+        // The four ops the group-claim membership gate depends on must map to the
+        // exact mesh events `check_relay_stream_group_membership` reads.
+        let ev = group_op_to_event(&GroupOp::Create {
+            group_id: "g".into(),
+            name: "G".into(),
+        })
+        .expect("create translates");
+        assert!(matches!(ev, MeshEvent::GroupCreated { .. }));
+
+        let ev = group_op_to_event(&GroupOp::AddMember {
+            group_id: "g".into(),
+            member_id: "g_m".into(),
+            label: "phone".into(),
+        })
+        .expect("add_member translates");
+        assert!(matches!(ev, MeshEvent::GroupMemberAdded { .. }));
+
+        let ev = group_op_to_event(&GroupOp::GrantClaw {
+            group_id: "g".into(),
+            claw_id: "claw_a".into(),
+        })
+        .expect("grant_claw translates");
+        assert!(matches!(ev, MeshEvent::GroupClawGranted { .. }));
+    }
+
+    #[test]
+    fn group_op_to_event_enroll_verifies_binding_fail_closed() {
+        use household_rs::keys::P256Keypair;
+        use household_rs::member_identity::MemberDeviceBinding;
+
+        let member = P256Keypair::generate();
+        let device = P256Keypair::generate();
+        let binding = MemberDeviceBinding::sign(
+            &member,
+            device.public(),
+            "participant_npub_hex".into(),
+            1_800_000_000,
+        )
+        .expect("sign member binding");
+
+        // A valid self-signed binding records the enrol event.
+        let ev = group_op_to_event(&GroupOp::EnrollMemberDevice {
+            binding: binding.clone(),
+        })
+        .expect("valid binding accepted");
+        assert!(matches!(ev, MeshEvent::MeshMemberDeviceEnrolled { .. }));
+
+        // A forged member_id (no longer derives from member_pub) is rejected with
+        // 400 — the SAME fail-closed validation the prod path enforced inline, now
+        // shared verbatim by /group-op and the dev-only /dev-group-op fixture.
+        let mut forged = binding;
+        forged.member_id = "g_forged_member_id".into();
+        let resp = group_op_to_event(&GroupOp::EnrollMemberDevice { binding: forged })
+            .expect_err("forged member_id rejected");
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    // ── F2: the /dev-group-op seed satisfies the live group-claim gate ──
+
+    #[test]
+    fn dev_group_op_sequence_satisfies_live_membership_gate() {
+        // The exact four ops /dev-group-op applies, run through the SAME
+        // group_op_to_event + log_event the handler uses, must leave the live
+        // projection in a state that PASSES check_relay_stream_group_membership
+        // for the matching member+device — i.e. the live group claim will be
+        // authorized. This is the F2↔F3 contract proven without a live engine.
+        use crate::claw_share_relay_stream_contract::check_relay_stream_group_membership;
+        use household_rs::household_mesh_log::MeshLogStore;
+        use household_rs::keys::P256Keypair;
+        use household_rs::member_identity::MemberDeviceBinding;
+
+        let owner = P256Keypair::generate();
+        // The SAME fixed secrets the smoke feeds to BOTH the dev seed and the
+        // friend-cli claim → identical member_id + device_pub.
+        let member = P256Keypair::from_secret_scalar(&[0x55u8; 32]).expect("member scalar");
+        let device = P256Keypair::from_secret_scalar(&[0x33u8; 32]).expect("device scalar");
+        let device_pub = device.public();
+        let binding = MemberDeviceBinding::sign(
+            &member,
+            device_pub.clone(),
+            "participant_npub_hex".into(),
+            1_800_000_000,
+        )
+        .expect("sign binding");
+        let member_id = binding.member_id.clone();
+
+        let mesh = MeshLogStore::new();
+        let now = 1_800_000_100u64;
+        let ops = [
+            GroupOp::Create {
+                group_id: "g".into(),
+                name: "G".into(),
+            },
+            GroupOp::AddMember {
+                group_id: "g".into(),
+                member_id: member_id.clone(),
+                label: "phone".into(),
+            },
+            GroupOp::EnrollMemberDevice { binding },
+            GroupOp::GrantClaw {
+                group_id: "g".into(),
+                claw_id: "claw_a".into(),
+            },
+        ];
+        for op in ops {
+            let event = group_op_to_event(&op).expect("translate");
+            log_event(&mesh, &owner as &dyn IdentityKey, now, event).expect("append");
+        }
+
+        let proj = mesh.project();
+        check_relay_stream_group_membership(&proj, "g", &member_id, "claw_a", &device_pub)
+            .expect("the dev-group-op sequence must satisfy the live membership gate");
+
+        // Fail-closed negatives: a different device, claw, or group is rejected.
+        let other_device = P256Keypair::from_secret_scalar(&[0x44u8; 32]).unwrap();
+        assert!(
+            check_relay_stream_group_membership(
+                &proj,
+                "g",
+                &member_id,
+                "claw_a",
+                &other_device.public()
+            )
+            .is_err()
+        );
+        assert!(
+            check_relay_stream_group_membership(&proj, "g", &member_id, "claw_other", &device_pub)
+                .is_err()
+        );
+        assert!(
+            check_relay_stream_group_membership(
+                &proj,
+                "other_g",
+                &member_id,
+                "claw_a",
+                &device_pub
+            )
+            .is_err()
+        );
+    }
+
+    #[cfg(feature = "dev_claw_share_mint")]
+    #[test]
+    fn dev_keypair_from_hex_matches_cross_language_fixture() {
+        // Scalar [0x55;32] → the member_pub, and [0x33;32] → the device_pub,
+        // pinned in docs/product-a-group-op-fixtures.md. Proves the server parse
+        // == friend-cli's member_key_from_hex == the cross-language fixture, so
+        // the same --member-secret/--device-secret yield identical keys on both.
+        let m = dev_keypair_from_hex(&"55".repeat(32)).expect("valid member scalar");
+        assert_eq!(
+            hex::encode(&m.public().as_bytes()[..]),
+            "0257e977f6db7e33c3fe7acf2842ed987009caf56d458682fca447b7d3d762ab34"
+        );
+        let d = dev_keypair_from_hex(&"33".repeat(32)).expect("valid device scalar");
+        assert_eq!(
+            hex::encode(&d.public().as_bytes()[..]),
+            "0351a7580833898ea1b183cbd7350a4099078c6ef1c1e18e970cd7683035f25e7d"
+        );
+        // Shape-hiding 400 reasons (never panic, never leak).
+        assert_eq!(
+            dev_keypair_from_hex("abcd").err(),
+            Some("secret_not_64_hex")
+        );
+        assert!(dev_keypair_from_hex(&"zz".repeat(32)).is_err());
+    }
 }
 
 #[cfg(test)]

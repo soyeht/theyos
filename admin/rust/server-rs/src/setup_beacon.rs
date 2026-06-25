@@ -302,20 +302,20 @@ async fn sync_bound_targets(
         .iter()
         .filter_map(|(ip, class)| (*class != InterfaceClass::Loopback).then_some(*ip))
         .collect();
-    let stale = {
+    let stale_entries = {
         let mut guard = inner.fullnames.lock().await;
-        let stale: Vec<IpAddr> = guard
+        let stale_ips: Vec<IpAddr> = guard
             .keys()
             .copied()
             .filter(|ip| !live.contains(ip))
             .collect();
-        stale
+        stale_ips
             .into_iter()
             .filter_map(|ip| guard.remove(&ip).map(|name| (ip, name)))
             .collect::<Vec<_>>()
     };
 
-    for (ip, fullname) in stale {
+    for (ip, fullname) in stale_entries {
         if let Err(e) = inner.daemon.unregister(&fullname) {
             warn!(
                 stage = "setup_beacon.refresh_unpublish_failed",

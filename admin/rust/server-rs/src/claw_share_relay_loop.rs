@@ -399,6 +399,24 @@ fn ingest_log_event(
 
 // ─── claim consume + ack ─────────────────────────────────────────────────────
 
+/// Whether a claim must wait for the owner identity (`owner_auth`) to be loaded
+/// before it can be processed.
+///
+/// Only the DEVICE credential flow needs it — to mint a `GuestCredential` bound to
+/// the owner `p_id`. A credential-less GROUP claim authenticates end-to-end via
+/// [`verify_group_claim`] (member-signed binding + device `PoP` + live membership)
+/// and is served a machine-cert-signed offer, so it needs only the machine key
+/// (`m_priv`) + the live projection — never `owner_auth`. Routing group claims
+/// before the `owner_auth` guard is therefore owner-independent by construction.
+///
+/// Regression: a live hardware smoke hit `error="owner auth not loaded"` on a
+/// headless dev engine (whose owner `PersonCert` lives only in the app keychain)
+/// because the group branch used to sit BELOW the guard. This predicate pins the
+/// invariant that the guard is Device-only.
+fn claim_requires_owner_auth(claim: &ClawShareClaim) -> bool {
+    claim.group_request.is_none()
+}
+
 async fn process_one(
     client: &NostrRelayClient,
     state: &SpawnedState,
@@ -421,14 +439,15 @@ async fn process_one(
     let Some(identity) = state.base.household.current().await else {
         return Err("household identity not loaded".into());
     };
-    let Some(owner_auth) = state.base.household.current_owner_auth().await else {
-        return Err("owner auth not loaded".into());
-    };
-
     let owner_key = identity.m_priv.as_ref();
-    let owner_p_id = &owner_auth.owner_person_cert.p_id;
-    let hh_id = &identity.record.hh_id;
 
+    // Credential-less GROUP claims authenticate end-to-end via the member-signed
+    // binding + device PoP carried inside the claim, and the handler needs only
+    // the machine key (`m_priv`) plus the live projection — NOT `owner_auth`.
+    // Route them BEFORE the owner_auth guard so a group member reaches the claw
+    // even when the owner identity is not loaded (owner-independent group access
+    // is the whole point; a live smoke hit "owner auth not loaded" because the
+    // branch used to sit below the guard).
     if let Some(group_req) = claim.group_request.clone() {
         return handle_group_claim(
             client,
@@ -442,6 +461,22 @@ async fn process_one(
         )
         .await;
     }
+
+    // Past the group branch every remaining claim is a Device credential claim,
+    // which DOES need the owner identity (`owner_p_id`) to mint the
+    // `GuestCredential`. The owner_auth guard is Device-only — credential-less
+    // group claims (returned above) are owner-independent. This holds by the early
+    // return above; the assert pins it so a future change that routes a non-Device
+    // claim here is caught instead of silently mis-gated.
+    assert!(
+        claim_requires_owner_auth(&claim),
+        "owner_auth guard reached by a non-Device claim; group claims must route above it",
+    );
+    let Some(owner_auth) = state.base.household.current_owner_auth().await else {
+        return Err("owner auth not loaded".into());
+    };
+    let owner_p_id = &owner_auth.owner_person_cert.p_id;
+    let hh_id = &identity.record.hh_id;
 
     // This relay/membership subset uses no overlay: a public Direct address
     // (operator-configured) wins; else a Loopback channel for the single-host
@@ -755,6 +790,61 @@ mod tests {
         let entry =
             LogEntry::sign(1_800_000_000, owner.public(), fake_consume_event(), &owner).unwrap();
         assert!(check_mesh_write_authority(&owner.public(), &entry).is_ok());
+    }
+
+    #[test]
+    fn claim_requires_owner_auth_group_false_device_true() {
+        // Regression (live hardware smoke "owner auth not loaded"): a
+        // credential-less GROUP claim is owner-independent and must NOT require
+        // owner_auth — process_one routes it to handle_group_claim BEFORE the
+        // guard. A Device credential claim DOES require it (to mint the
+        // GuestCredential bound to the owner p_id). The bug was the group branch
+        // sitting BELOW the unconditional owner_auth guard, which blocked group
+        // members on a headless engine whose owner cert is not loaded.
+        let device_key = P256Keypair::from_secret_scalar(&[0x33u8; 32]).unwrap();
+        let member_key = P256Keypair::from_secret_scalar(&[0x55u8; 32]).unwrap();
+        let now = 1_800_000_000u64;
+
+        // Device claim → requires owner_auth (hits the guard).
+        let device_claim = ClawShareClaim::sign(
+            SlotId([7u8; 16]),
+            device_key.public(),
+            ClaimNonce::random(),
+            now,
+            &device_key as &dyn IdentityKey,
+        )
+        .unwrap();
+        assert!(
+            claim_requires_owner_auth(&device_claim),
+            "device claim must require owner_auth",
+        );
+
+        // Group claim → owner-independent (routes above the guard).
+        let nonce = ClaimNonce::random();
+        let binding =
+            MemberDeviceBinding::sign(&member_key, device_key.public(), "npub".into(), now)
+                .unwrap();
+        let group_req = GroupClaimRequest::sign(
+            binding,
+            "g".into(),
+            "claw_a".into(),
+            nonce.0.to_vec(),
+            Some(600),
+            &device_key as &dyn IdentityKey,
+        )
+        .unwrap();
+        let group_claim = ClawShareClaim::sign_group(
+            device_key.public(),
+            nonce,
+            now,
+            group_req,
+            &device_key as &dyn IdentityKey,
+        )
+        .unwrap();
+        assert!(
+            !claim_requires_owner_auth(&group_claim),
+            "group claim must NOT require owner_auth",
+        );
     }
 
     #[test]
