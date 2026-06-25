@@ -8,32 +8,25 @@
 use crate::VZError;
 use crate::macos_guest::ssh_exec;
 
-/// Install a claw binary and start its service inside a macOS guest VM.
+/// Build the shell command that installs `claw_type`'s binary inside a macOS
+/// guest VM, or an error for an unknown claw.
 ///
-/// Called from `handle_create_macos` after the VM has DHCP + SSH.
-///
-/// # Errors
-///
-/// Returns `VZError` if claw binary download, launchd plist creation, or env file write fails.
-#[allow(clippy::too_many_lines)]
-pub async fn install_claw_and_start(
-    host: &str,
-    claw_type: &str,
-    _instance_name: &str,
-) -> Result<(), VZError> {
-    tracing::info!(host, claw_type, "Installing claw binary...");
-
-    // Step 1: Install the claw binary
-    let install_cmd = match claw_type {
+/// Pure (no I/O) so the install provenance posture is unit-testable. Every
+/// `curl` fetch is hardened to https + TLS >= 1.2 + retry. Several claws still
+/// pull upstream `latest`/HEAD without a version pin or checksum; that is
+/// tracked as the version-pin and checksum follow-ups in
+/// `docs/macos-runner-artifact-posture.md`.
+fn macos_install_command(claw_type: &str) -> Result<String, VZError> {
+    let cmd = match claw_type {
         "picoclaw" => {
             "mkdir -p /usr/local/bin && \
-             curl -fsSL https://github.com/sipeed/picoclaw/releases/latest/download/picoclaw_Darwin_arm64.tar.gz \
+             curl --proto '=https' --tlsv1.2 -fsSL --retry 3 --retry-delay 2 https://github.com/sipeed/picoclaw/releases/latest/download/picoclaw_Darwin_arm64.tar.gz \
              | tar xz -C /usr/local/bin/ && chmod +x /usr/local/bin/picoclaw"
                 .to_string()
         }
         "zeroclaw" => {
             "mkdir -p /usr/local/bin && \
-             curl -fsSL https://github.com/zeroclaw-labs/zeroclaw/releases/latest/download/zeroclaw-aarch64-apple-darwin.tar.gz \
+             curl --proto '=https' --tlsv1.2 -fsSL --retry 3 --retry-delay 2 https://github.com/zeroclaw-labs/zeroclaw/releases/latest/download/zeroclaw-aarch64-apple-darwin.tar.gz \
              | tar xz -C /tmp/ && install -m 755 /tmp/zeroclaw /usr/local/bin/zeroclaw && rm -f /tmp/zeroclaw"
                 .to_string()
         }
@@ -73,17 +66,17 @@ pub async fn install_claw_and_start(
         }
         "nullclaw" => {
             "mkdir -p /usr/local/bin && \
-             curl -fsSL https://github.com/nullclaw/nullclaw/releases/latest/download/nullclaw-macos-aarch64.bin \
+             curl --proto '=https' --tlsv1.2 -fsSL --retry 3 --retry-delay 2 https://github.com/nullclaw/nullclaw/releases/latest/download/nullclaw-macos-aarch64.bin \
              -o /usr/local/bin/nullclaw && chmod +x /usr/local/bin/nullclaw"
                 .to_string()
         }
         "ironclaw" => {
-            // ironclaw needs PostgreSQL 15+ — install via brew (as user theyos), then download binary.
+            // ironclaw needs PostgreSQL 15+ - install via brew (as user theyos), then download binary.
             // Tarball extracts to ironclaw-aarch64-apple-darwin/ironclaw (subdirectory).
             "export PATH=/opt/homebrew/bin:$PATH && \
              su - theyos -c 'brew install postgresql@15' 2>/dev/null; \
              mkdir -p /usr/local/bin && \
-             curl -fsSL https://github.com/nearai/ironclaw/releases/latest/download/ironclaw-aarch64-apple-darwin.tar.gz \
+             curl --proto '=https' --tlsv1.2 -fsSL --retry 3 --retry-delay 2 https://github.com/nearai/ironclaw/releases/latest/download/ironclaw-aarch64-apple-darwin.tar.gz \
              | tar xz -C /tmp/ && install -m 755 /tmp/ironclaw-aarch64-apple-darwin/ironclaw /usr/local/bin/ironclaw \
              && rm -rf /tmp/ironclaw-aarch64-apple-darwin"
                 .to_string()
@@ -94,6 +87,26 @@ pub async fn install_claw_and_start(
             )));
         }
     };
+    Ok(cmd)
+}
+
+/// Install a claw binary and start its service inside a macOS guest VM.
+///
+/// Called from `handle_create_macos` after the VM has DHCP + SSH.
+///
+/// # Errors
+///
+/// Returns `VZError` if claw binary download, launchd plist creation, or env file write fails.
+#[allow(clippy::too_many_lines)]
+pub async fn install_claw_and_start(
+    host: &str,
+    claw_type: &str,
+    _instance_name: &str,
+) -> Result<(), VZError> {
+    tracing::info!(host, claw_type, "Installing claw binary...");
+
+    // Step 1: Install the claw binary
+    let install_cmd = macos_install_command(claw_type)?;
 
     ssh_exec(host, &install_cmd)
         .await
@@ -173,4 +186,97 @@ launchctl load /Library/LaunchDaemons/com.theyos.claw.plist"#
 
     tracing::info!(claw_type, "Claw fully provisioned");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every claw the macOS runner knows how to install today.
+    const SUPPORTED_MACOS_CLAWS: &[&str] = &[
+        "picoclaw",
+        "zeroclaw",
+        "nanobot",
+        "openclaw",
+        "hermes-agent",
+        "nullclaw",
+        "ironclaw",
+    ];
+
+    /// Claws whose macOS install is NOT yet version-pinned / checksum-verified.
+    /// This slice only hardens curl transport; version pinning and checksum
+    /// verification are tracked as follow-ups in
+    /// `docs/macos-runner-artifact-posture.md`. A new claw added with an
+    /// unpinned fetch (`releases/latest/download`, `git clone` HEAD, or an
+    /// unversioned pip/npm install) must be added here consciously, or pinned.
+    const UNPINNED_EXCEPTIONS: &[&str] = &[
+        "picoclaw",
+        "zeroclaw",
+        "nanobot",
+        "openclaw",
+        "hermes-agent",
+        "nullclaw",
+        "ironclaw",
+    ];
+
+    /// Reliable markers that a command fetches an unpinned upstream artifact.
+    fn looks_unpinned(cmd: &str) -> bool {
+        cmd.contains("releases/latest/download")
+            || cmd.contains("git clone")
+            || (cmd.contains("pip3 install") && !cmd.contains("=="))
+            || (cmd.contains("npm install -g") && !cmd.contains("openclaw@"))
+    }
+
+    #[test]
+    fn macos_curl_installs_use_all_hardened_flags() {
+        // The full hardened flag set required for every macOS curl fetch.
+        const REQUIRED_CURL_FLAGS: &[&str] = &[
+            "--proto '=https'",
+            "--tlsv1.2",
+            "-fsSL",
+            "--retry 3",
+            "--retry-delay 2",
+        ];
+        for &claw in SUPPORTED_MACOS_CLAWS {
+            let cmd = macos_install_command(claw).expect("supported claw builds a command");
+            if cmd.contains("curl") {
+                for flag in REQUIRED_CURL_FLAGS {
+                    assert!(
+                        cmd.contains(flag),
+                        "{claw}: every curl must include the hardened flag {flag}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn macos_unpinned_installs_are_inventoried() {
+        // A claw that fetches an unpinned artifact must be acknowledged.
+        for &claw in SUPPORTED_MACOS_CLAWS {
+            let cmd = macos_install_command(claw).expect("supported claw");
+            if looks_unpinned(&cmd) {
+                assert!(
+                    UNPINNED_EXCEPTIONS.contains(&claw),
+                    "{claw} installs from an unpinned source but is not in \
+                     UNPINNED_EXCEPTIONS; pin it (version-pin follow-up) or \
+                     acknowledge it there"
+                );
+            }
+        }
+        // No rot: every inventoried exception must still actually be unpinned.
+        for &claw in UNPINNED_EXCEPTIONS {
+            let cmd = macos_install_command(claw).expect("supported claw");
+            assert!(
+                looks_unpinned(&cmd),
+                "{claw} is inventoried as unpinned but now looks pinned; remove it \
+                 from UNPINNED_EXCEPTIONS"
+            );
+        }
+    }
+
+    #[test]
+    fn macos_install_command_rejects_unknown_claw() {
+        assert!(macos_install_command("definitely-not-a-claw").is_err());
+    }
 }
