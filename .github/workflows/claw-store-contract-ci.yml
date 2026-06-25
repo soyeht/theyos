@@ -1,0 +1,50 @@
+name: Claw Store Contract CI
+
+on:
+  push:
+    paths:
+      - "admin/contracts/**"
+      - "docs/contracts/**"
+      - "admin/rust/server-rs/tests/claw_store_route_contract.rs"
+      - "admin/rust/server-rs/tests/claw_store_wire_contract.rs"
+      - "admin/rust/server-rs/tests/household_contract_cross_check.rs"
+      - ".github/workflows/claw-store-contract-ci.yml"
+  pull_request:
+    paths:
+      - "admin/contracts/**"
+      - "docs/contracts/**"
+      - "admin/rust/server-rs/tests/claw_store_route_contract.rs"
+      - "admin/rust/server-rs/tests/claw_store_wire_contract.rs"
+      - "admin/rust/server-rs/tests/household_contract_cross_check.rs"
+      - ".github/workflows/claw-store-contract-ci.yml"
+  workflow_dispatch:
+
+jobs:
+  contract-tests:
+    name: Route, wire, and household docs guards
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install native test dependencies
+        run: sudo apt-get update && sudo apt-get install -y openssh-server pkg-config libdbus-1-dev libkeyutils-dev
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: "admin/rust -> target"
+
+      - name: Claw Store route contract
+        run: cargo test -p server-rs --test claw_store_route_contract --manifest-path admin/rust/Cargo.toml
+
+      - name: Claw Store wire contract
+        run: cargo test -p server-rs --test claw_store_wire_contract --manifest-path admin/rust/Cargo.toml
+
+      - name: Household docs projection
+        run: cargo test -p server-rs --test household_contract_cross_check --manifest-path admin/rust/Cargo.toml
