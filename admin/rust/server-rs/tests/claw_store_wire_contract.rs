@@ -12,6 +12,7 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{delete, get, patch, post},
 };
+use axum_test::TestServer;
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD as B64URL};
 use claw_rs::{ClawCatalogResponse, ClawStatus};
 use core_rs::{
@@ -37,7 +38,7 @@ use server_rs::{
     claw_store_service, handlers_claws, handlers_household_claws,
     handlers_household_claws::HouseholdClawsState,
     handlers_instances, handlers_mobile, handlers_terminal,
-    household_attach_token::HouseholdAttachTokenStore,
+    household_attach_token::{HouseholdAttachScope, HouseholdAttachTokenStore},
     household_state::HouseholdState,
     ratelimit::Limiter,
     responses::{ClawDetailResponse, ClawJobResponse, ClawListItemResponse, ListResponse},
@@ -269,6 +270,7 @@ struct HouseholdFixture {
     app: Router,
     person: P256Keypair,
     shared: SharedState,
+    attach_tokens: Arc<HouseholdAttachTokenStore>,
 }
 
 fn household_fixture() -> HouseholdFixture {
@@ -303,10 +305,11 @@ fn household_fixture() -> HouseholdFixture {
         Some(Arc::new(owner_auth)),
     );
     let shared = shared_state();
+    let attach_tokens = Arc::new(HouseholdAttachTokenStore::new());
     let claws_state = HouseholdClawsState {
         shared: Arc::clone(&shared),
         household,
-        attach_tokens: Arc::new(HouseholdAttachTokenStore::new()),
+        attach_tokens: Arc::clone(&attach_tokens),
     };
 
     let app = Router::new()
@@ -365,12 +368,17 @@ fn household_fixture() -> HouseholdFixture {
             "/api/v1/household/terminals/{container}/attach-token",
             post(handlers_household_claws::handle_household_mint_attach_token),
         )
+        .route(
+            "/api/v1/household/terminals/{container}/pty",
+            get(handlers_household_claws::handle_household_terminal_pty),
+        )
         .with_state(claws_state);
 
     HouseholdFixture {
         app,
         person,
         shared,
+        attach_tokens,
     }
 }
 
@@ -1101,67 +1109,93 @@ async fn auth_and_admin_required_errors_match_declared_claw_store_v1_fixtures() 
         );
     }
 
-    let mobile_state = shared_state();
-    let (status, _bytes, body) = request(
-        mobile_router(Arc::clone(&mobile_state)),
-        Method::POST,
-        "/api/v1/mobile/claws/picoclaw/install",
+    let admin_cookie =
+        admin_session_cookie_for_role(&admin_state, "metadata-admin", UserRole::Admin);
+    let (status, _bytes, body) = request_with_cookie(
+        admin_auth_router(Arc::clone(&admin_state)),
+        Method::GET,
+        "/api/v1/claws",
         Vec::new(),
-        None,
+        Some(admin_cookie),
     )
     .await;
-    assert_fixture_body(
-        status,
-        &body,
-        StatusCode::UNAUTHORIZED,
-        "mobile_missing_auth",
-    );
+    assert_eq!(status, StatusCode::OK);
+    assert_list_envelope(&body);
 
-    let (status, _bytes, body) = request(
-        mobile_router(Arc::clone(&mobile_state)),
-        Method::POST,
-        "/api/v1/mobile/instances",
-        create_body.clone(),
-        None,
-    )
-    .await;
-    assert_fixture_body(
-        status,
-        &body,
-        StatusCode::UNAUTHORIZED,
-        "mobile_missing_auth",
-    );
+    let mobile_state = shared_state();
+    for (method, path, body_bytes) in [
+        (Method::GET, "/api/v1/mobile/claws", Vec::new()),
+        (
+            Method::POST,
+            "/api/v1/mobile/instances",
+            create_body.clone(),
+        ),
+        (
+            Method::GET,
+            "/api/v1/mobile/instances/inst-alpha/status",
+            Vec::new(),
+        ),
+        (
+            Method::GET,
+            "/api/v1/mobile/claws/picoclaw/availability",
+            Vec::new(),
+        ),
+        (
+            Method::POST,
+            "/api/v1/mobile/claws/picoclaw/install",
+            Vec::new(),
+        ),
+        (
+            Method::POST,
+            "/api/v1/mobile/claws/picoclaw/uninstall",
+            Vec::new(),
+        ),
+    ] {
+        let (status, _bytes, body) = request(
+            mobile_router(Arc::clone(&mobile_state)),
+            method,
+            path,
+            body_bytes,
+            None,
+        )
+        .await;
+        assert_fixture_body(
+            status,
+            &body,
+            StatusCode::UNAUTHORIZED,
+            "mobile_missing_auth",
+        );
+    }
 
     let member_token = mobile_token_for_role(&mobile_state, "member", UserRole::User);
-    let (status, _bytes, body) = request(
-        mobile_router(Arc::clone(&mobile_state)),
-        Method::POST,
-        "/api/v1/mobile/claws/picoclaw/install",
-        Vec::new(),
-        Some(format!("Bearer {member_token}")),
-    )
-    .await;
-    assert_fixture_body(
-        status,
-        &body,
-        StatusCode::FORBIDDEN,
-        "mobile_admin_required",
-    );
-
-    let (status, _bytes, body) = request(
-        mobile_router(Arc::clone(&mobile_state)),
-        Method::POST,
-        "/api/v1/mobile/instances",
-        create_body,
-        Some(format!("Bearer {member_token}")),
-    )
-    .await;
-    assert_fixture_body(
-        status,
-        &body,
-        StatusCode::FORBIDDEN,
-        "mobile_admin_required",
-    );
+    for (method, path, body_bytes) in [
+        (Method::POST, "/api/v1/mobile/instances", create_body),
+        (
+            Method::POST,
+            "/api/v1/mobile/claws/picoclaw/install",
+            Vec::new(),
+        ),
+        (
+            Method::POST,
+            "/api/v1/mobile/claws/picoclaw/uninstall",
+            Vec::new(),
+        ),
+    ] {
+        let (status, _bytes, body) = request(
+            mobile_router(Arc::clone(&mobile_state)),
+            method,
+            path,
+            body_bytes,
+            Some(format!("Bearer {member_token}")),
+        )
+        .await;
+        assert_fixture_body(
+            status,
+            &body,
+            StatusCode::FORBIDDEN,
+            "mobile_admin_required",
+        );
+    }
 }
 
 #[tokio::test]
@@ -1859,7 +1893,9 @@ async fn household_pop_auth_failure_is_empty_401() {
     let household = household_fixture();
     for (method, path) in [
         (Method::GET, "/api/v1/household/claws"),
+        (Method::GET, "/api/v1/household/claws/picoclaw/availability"),
         (Method::POST, "/api/v1/household/claws/picoclaw/install"),
+        (Method::POST, "/api/v1/household/claws/picoclaw/uninstall"),
         (Method::GET, "/api/v1/household/instances"),
         (Method::POST, "/api/v1/household/instances"),
         (Method::GET, "/api/v1/household/instances/inst-alpha/status"),
@@ -1931,6 +1967,38 @@ async fn household_pop_auth_failure_is_empty_401() {
         "household auth failure body must stay empty"
     );
     assert_eq!(body, Value::Null);
+}
+
+#[tokio::test]
+async fn household_attach_token_query_param_is_ignored() {
+    let household = household_fixture();
+    let attach_tokens = Arc::clone(&household.attach_tokens);
+    let minted = attach_tokens.mint(HouseholdAttachScope {
+        household_id: "hh-contract".to_string(),
+        container: "picoclaw-alpha".to_string(),
+        session_id: "ws-alpha".to_string(),
+        actor_person_id: "person-alpha".to_string(),
+    });
+    let path = format!(
+        "/api/v1/household/terminals/picoclaw-alpha/pty?session=ws-alpha&cols=80&rows=24&token={}",
+        minted.token
+    );
+    let server = TestServer::builder()
+        .http_transport()
+        .build(
+            household
+                .app
+                .layer(Extension(ConnectInfo(loopback_peer_addr()))),
+        )
+        .expect("test server");
+
+    let response = server.get_websocket(&path).await;
+
+    assert_eq!(response.status_code(), StatusCode::UNAUTHORIZED);
+    assert!(
+        attach_tokens.consume(&minted.token).is_some(),
+        "query token must not be consumed by household PTY auth"
+    );
 }
 
 #[tokio::test]
