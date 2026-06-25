@@ -32,6 +32,7 @@ use tokio::sync::watch;
 use zeroize::Zeroizing;
 
 use crate::apns_dispatcher;
+use crate::handlers_device_pairing::DevicePairingStore;
 use crate::household_auth;
 use crate::household_state::HouseholdState;
 use crate::time_util;
@@ -47,6 +48,7 @@ pub struct OwnerEventsRouterState {
     pub event_broadcaster: OwnerEventsBroadcaster,
     pub state_dir: PathBuf,
     pub long_poll_timeout: Duration,
+    pub device_pairing_store: DevicePairingStore,
     /// Keystore policy under which `HH_priv` was originally persisted.
     /// `owner_approve_handler` forwards it into `CeremonyInputs` so
     /// `CeremonyTxn::commit` can destroy the right backend on Shamir
@@ -92,6 +94,7 @@ impl OwnerEventsRouterState {
             event_broadcaster,
             state_dir,
             long_poll_timeout,
+            device_pairing_store: DevicePairingStore::new(),
             key_backing_policy,
         }
     }
