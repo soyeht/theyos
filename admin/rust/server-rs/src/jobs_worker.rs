@@ -311,10 +311,12 @@ async fn mark_failed(
     let st = state.clone();
     let jid = job_id.to_string();
     let iid = instance_id.to_string();
-    let m = msg.to_string();
     // Classify into a sanitized, machine-readable code before `error_context`
     // is consumed below. Always stamped (Unknown included) so the wire contract
-    // is stable without inferring by absence.
+    // is stable without inferring by absence. `provisioning_error` is the single
+    // sanitized, path-free summary used for the instance row, the job error
+    // record, and the create_failed event; the raw `msg` stays only in the
+    // caller's structured log.
     let failure_code = classify_instance_failure(&error_context, msg);
     let provisioning_error = provisioning_error_summary(&error_context, msg);
     // Serialize error_context into the result field so the API can return it.
@@ -332,7 +334,9 @@ async fn mark_failed(
                 actor = job_actor;
             }
             job.status = jobs_rs::Status::Failed;
-            job.error = Some(m.clone());
+            // Sanitized summary, not the raw message: the Jobs API serializes
+            // `Job.error` verbatim (admin UI renders it).
+            job.error = Some(provisioning_error.to_string());
             job.completed_at = Some(jobs_rs::now_iso());
             if !ctx_json.is_empty() {
                 job.result = Some(ctx_json.clone());
@@ -341,10 +345,10 @@ async fn mark_failed(
                 error!("[jobs-worker] failed to update job status: {e}");
             }
         }
-        // Update instance status in DB. The row carries only a sanitized,
-        // path-free per-code summary; raw details stay off the instance row and
-        // status surfaces. Job error records remain raw until the Jobs API
-        // sanitization follow-up lands.
+        // Update instance status in DB. The instance row, the job error record,
+        // and the create_failed event below all carry only the sanitized,
+        // path-free per-code summary; the raw message stays only in the
+        // structured log emitted by the caller.
         if let Err(e) = st.instance_db.update_status(&StatusUpdate {
             id: &iid,
             status: InstanceStatus::Failed,
@@ -373,7 +377,7 @@ async fn mark_failed(
                     instance_id: Some(&iid),
                     event_type: "create_failed",
                     actor: &actor,
-                    detail: Some(&m),
+                    detail: Some(provisioning_error),
                     resource_snapshot: resource_snapshot.as_deref(),
                 })
             {
@@ -568,5 +572,59 @@ mod tests {
             provisioning_error_summary(&None, "totally unrecognized /tmp/soyeht-test/failure");
         assert_eq!(written, "instance creation failed");
         assert!(!written.contains('/'), "leaked path: {written}");
+    }
+
+    #[test]
+    fn job_error_and_event_detail_share_sanitized_summary() {
+        // mark_failed writes this single value to both Job.error and the
+        // create_failed instance-event detail, replacing the raw message.
+        let raw = "VM start failed: /tmp/soyeht-test/efi.nvram: boot error";
+        let written = provisioning_error_summary(&None, raw);
+        assert_eq!(
+            written,
+            core_rs::instance_failure::InstanceFailureCode::VmStartFailed.operator_summary()
+        );
+        for bad in ['/', '\\'] {
+            assert!(
+                !written.contains(bad),
+                "leaked path char `{bad}`: {written}"
+            );
+        }
+        assert!(!written.contains("nvram"), "leaked raw detail: {written}");
+    }
+
+    #[test]
+    fn failed_job_serializes_without_raw_paths() {
+        // The Jobs API serializes `Job` verbatim. For a failed job, `error` is
+        // the sanitized summary and `result` is the structured error_context;
+        // neither may carry a local path, stderr, or snapshot/file detail.
+        let summary =
+            provisioning_error_summary(&None, "VM start failed: /tmp/soyeht-test/efi.nvram: boot");
+        let result = core_rs::ipc::wire::error_context_result_string(serde_json::json!({
+            "code": 2001,
+            "command": "slirp_add_hostfwd",
+            "phase": "network",
+        }));
+        let mut job = jobs_rs::Job::new(jobs_rs::JobType::CreateInstance, "inst-test", "{}");
+        job.status = jobs_rs::Status::Failed;
+        job.error = Some(summary.to_string());
+        job.result = Some(result);
+
+        let json = serde_json::to_string(&job).unwrap();
+        for bad in ["/tmp", "soyeht-test", "vzvmsave", "nvram", "stderr"] {
+            assert!(
+                !json.contains(bad),
+                "failed job JSON leaked `{bad}`: {json}"
+            );
+        }
+        // The actionable summary and machine-readable code are still present.
+        assert!(
+            json.contains("the VM failed to start"),
+            "summary missing from job JSON: {json}"
+        );
+        assert!(
+            json.contains("2001"),
+            "failure code missing from job JSON: {json}"
+        );
     }
 }
