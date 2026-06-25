@@ -1,6 +1,7 @@
 pub mod benchmark;
 pub mod client;
 pub mod error;
+pub mod household_pop;
 pub mod runner;
 pub mod smoke;
 pub mod snapshot;
