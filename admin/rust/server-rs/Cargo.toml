@@ -17,6 +17,29 @@ path = "src/main.rs"
 name = "gen-owner-cert-fixture"
 path = "src/bin/gen_owner_cert_fixture.rs"
 
+# Dev-only standalone claw responder for the relay_stream Public smoke. An
+# owner-authority bypass fixture, so it is gated at the TARGET level: without
+# `dev_claw_share_mint` the bin is ABSENT from the build entirely (compile-time
+# wall, consistent with the dev-mint endpoints). It is ALSO env-gated at runtime
+# by `THEYOS_RELAY_STREAM_CLAW_DEV=1`.
+[[bin]]
+name = "relay_stream_claw_dev"
+path = "src/bin/relay_stream_claw_dev.rs"
+required-features = ["dev_claw_share_mint"]
+
+# Dev-only relay_stream Public smoke helpers. Like `relay_stream_claw_dev`,
+# these are gated at the TARGET level: without `dev_claw_share_mint` they are
+# ABSENT from the build entirely, keeping them off the normal release surface.
+[[bin]]
+name = "relay_stream_public_relay"
+path = "src/bin/relay_stream_public_relay.rs"
+required-features = ["dev_claw_share_mint"]
+
+[[bin]]
+name = "relay_stream_relay_dev"
+path = "src/bin/relay_stream_relay_dev.rs"
+required-features = ["dev_claw_share_mint"]
+
 [dependencies]
 # Async runtime + HTTP framework
 tokio       = { workspace = true }
@@ -53,6 +76,14 @@ household-rs    = { workspace = true }
 mdns-sd         = { workspace = true }
 gethostname     = { workspace = true }
 if-addrs        = { workspace = true }
+
+# Relay/membership landing (Device Nostr-claim path + relay_stream subset):
+# - keystore-rs: Noise static-key keystore for the relay_stream responder.
+# - nostr-relay-rs: the Device Nostr claim/ack + household-log gossip transport.
+# - snow: Noise handshake primitives (also pulled in via household-rs).
+keystore-rs     = { workspace = true }
+nostr-relay-rs  = { workspace = true }
+snow            = { workspace = true }
 
 # For inlined ratelimit module
 rusqlite        = { workspace = true }
@@ -118,6 +149,13 @@ vmrunner-rs  = { workspace = true }
 # enable this feature; the gates are also `#[cfg(test)]` so unit tests
 # in this crate compile them in unconditionally.
 failure-injection = []
+
+# Dev-only claw-share invite mint endpoint. Compiles in a loopback + env-gated
+# route that mints a PTY claw-share invite on the LIVE engine for the
+# relay_stream smoke, skipping ONLY the caller owner-PoP. It is an
+# owner-authorization BYPASS fixture: production/release builds MUST NOT enable
+# it; without this feature the handler and its route do not exist.
+dev_claw_share_mint = []
 
 # macOS-only FFI bindings to Apple's dns_sd.h system header. Used by
 # `bonjour_impl_dns_sd.rs` to publish/browse via `mDNSResponder` (the
