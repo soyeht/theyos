@@ -16,6 +16,39 @@ fn manifest_version(claw: &str) -> Result<&'static str, VZError> {
         .ok_or_else(|| VZError::InvalidConfig(format!("no manifest entry for claw: {claw}")))
 }
 
+/// theyos-pinned sha256 of each macOS release asset that has no upstream
+/// checksum, keyed by `(claw, manifest version, lowercase 64-hex sha256)`. The
+/// installer verifies the downloaded asset against this before extracting; a
+/// guard test asserts each version tracks the manifest, so a version bump cannot
+/// ship a stale checksum. ironclaw uses its upstream `.sha256` and is not listed
+/// here.
+const MACOS_PINNED_SHA256: &[(&str, &str, &str)] = &[
+    (
+        "picoclaw",
+        "0.2.5",
+        "b42f93dc3c79e2e41f2852c8890beece6334afc1d09acf165e072ce64d2d018f",
+    ),
+    (
+        "nullclaw",
+        "2026.3.1",
+        "25a037041fe0a1845a4e586d0a3d72a688aff704ef52c4f5f39bbcfd5ea9a198",
+    ),
+    (
+        "zeroclaw",
+        "0.8.1",
+        "d37c15aba3e4e6ec622d305b3d36172964a1239245704fb758e1d01560362841",
+    ),
+];
+
+/// The theyos-pinned sha256 for `claw`'s macOS asset, or an error if absent.
+fn pinned_sha256(claw: &str) -> Result<&'static str, VZError> {
+    MACOS_PINNED_SHA256
+        .iter()
+        .find(|(c, _, _)| *c == claw)
+        .map(|(_, _, sha)| *sha)
+        .ok_or_else(|| VZError::InvalidConfig(format!("no pinned sha256 for claw: {claw}")))
+}
+
 /// Build the shell command that installs `claw_type`'s binary inside a macOS
 /// guest VM, or an error for an unknown claw.
 ///
@@ -29,22 +62,32 @@ fn manifest_version(claw: &str) -> Result<&'static str, VZError> {
 fn macos_install_command(claw_type: &str) -> Result<String, VZError> {
     let cmd = match claw_type {
         "picoclaw" => {
+            // Pinned tarball + theyos-pinned sha256 (upstream publishes none):
+            // download to a temp dir, verify against the repo-pinned hash, then
+            // extract and install. A mismatch breaks the && chain (fail-closed).
             let v = manifest_version("picoclaw")?;
+            let sha = pinned_sha256("picoclaw")?;
             format!(
                 "mkdir -p /usr/local/bin && \
-                 curl --proto '=https' --tlsv1.2 -fsSL --retry 3 --retry-delay 2 https://github.com/sipeed/picoclaw/releases/download/v{v}/picoclaw_Darwin_arm64.tar.gz \
-                 | tar xz -C /usr/local/bin/ && chmod +x /usr/local/bin/picoclaw"
+                 d=$(mktemp -d) && cd \"$d\" && \
+                 curl --proto '=https' --tlsv1.2 -fsSL --retry 3 --retry-delay 2 -O https://github.com/sipeed/picoclaw/releases/download/v{v}/picoclaw_Darwin_arm64.tar.gz && \
+                 printf '%s  %s\\n' \"{sha}\" \"picoclaw_Darwin_arm64.tar.gz\" | shasum -a 256 -c - && \
+                 tar xzf picoclaw_Darwin_arm64.tar.gz && install -m 755 picoclaw /usr/local/bin/picoclaw && \
+                 cd / && rm -rf \"$d\""
             )
         }
         "zeroclaw" => {
-            // Pinned to the manifest version (was releases/latest/download).
-            // Upstream publishes no per-asset .sha256, so no checksum step (same
-            // posture as picoclaw/nullclaw).
+            // Pinned tarball + theyos-pinned sha256 (upstream publishes none):
+            // download to a temp dir, verify, then extract and install.
             let v = manifest_version("zeroclaw")?;
+            let sha = pinned_sha256("zeroclaw")?;
             format!(
                 "mkdir -p /usr/local/bin && \
-                 curl --proto '=https' --tlsv1.2 -fsSL --retry 3 --retry-delay 2 https://github.com/zeroclaw-labs/zeroclaw/releases/download/v{v}/zeroclaw-aarch64-apple-darwin.tar.gz \
-                 | tar xz -C /tmp/ && install -m 755 /tmp/zeroclaw /usr/local/bin/zeroclaw && rm -f /tmp/zeroclaw"
+                 d=$(mktemp -d) && cd \"$d\" && \
+                 curl --proto '=https' --tlsv1.2 -fsSL --retry 3 --retry-delay 2 -O https://github.com/zeroclaw-labs/zeroclaw/releases/download/v{v}/zeroclaw-aarch64-apple-darwin.tar.gz && \
+                 printf '%s  %s\\n' \"{sha}\" \"zeroclaw-aarch64-apple-darwin.tar.gz\" | shasum -a 256 -c - && \
+                 tar xzf zeroclaw-aarch64-apple-darwin.tar.gz && install -m 755 zeroclaw /usr/local/bin/zeroclaw && \
+                 cd / && rm -rf \"$d\""
             )
         }
         "nanobot" => {
@@ -92,11 +135,17 @@ fn macos_install_command(claw_type: &str) -> Result<String, VZError> {
             )
         }
         "nullclaw" => {
+            // Pinned binary + theyos-pinned sha256 (upstream publishes none):
+            // download to a temp dir, verify, then install.
             let v = manifest_version("nullclaw")?;
+            let sha = pinned_sha256("nullclaw")?;
             format!(
                 "mkdir -p /usr/local/bin && \
-                 curl --proto '=https' --tlsv1.2 -fsSL --retry 3 --retry-delay 2 https://github.com/nullclaw/nullclaw/releases/download/v{v}/nullclaw-macos-aarch64.bin \
-                 -o /usr/local/bin/nullclaw && chmod +x /usr/local/bin/nullclaw"
+                 d=$(mktemp -d) && cd \"$d\" && \
+                 curl --proto '=https' --tlsv1.2 -fsSL --retry 3 --retry-delay 2 -O https://github.com/nullclaw/nullclaw/releases/download/v{v}/nullclaw-macos-aarch64.bin && \
+                 printf '%s  %s\\n' \"{sha}\" \"nullclaw-macos-aarch64.bin\" | shasum -a 256 -c - && \
+                 install -m 755 nullclaw-macos-aarch64.bin /usr/local/bin/nullclaw && \
+                 cd / && rm -rf \"$d\""
             )
         }
         "ironclaw" => {
@@ -345,17 +394,52 @@ mod tests {
     }
 
     #[test]
-    fn macos_only_ironclaw_uses_checksum() {
-        // Only ironclaw verifies a checksum; no other claw fakes one its upstream
-        // does not publish (picoclaw/nullclaw have no per-asset checksum yet).
+    fn macos_checksummed_claws_verify_a_checksum() {
+        // ironclaw verifies its upstream .sha256; picoclaw/nullclaw/zeroclaw
+        // verify a theyos-pinned sha256. No other claw fakes a checksum.
+        const CHECKSUMMED: &[&str] = &["ironclaw", "picoclaw", "nullclaw", "zeroclaw"];
         for &claw in SUPPORTED_MACOS_CLAWS {
             let cmd = macos_install_command(claw).expect("supported claw");
-            let has_checksum = cmd.contains("shasum") || cmd.contains(".sha256");
+            let has_checksum = cmd.contains("shasum -a 256 -c");
             assert_eq!(
                 has_checksum,
-                claw == "ironclaw",
-                "{claw}: checksum verification must be ironclaw-only in this slice"
+                CHECKSUMMED.contains(&claw),
+                "{claw}: checksum verification membership mismatch"
             );
+        }
+    }
+
+    #[test]
+    fn macos_pinned_sha256_matches_manifest_and_is_well_formed() {
+        for &(claw, version, sha) in MACOS_PINNED_SHA256 {
+            // The pinned version must track the manifest, so a version bump that
+            // forgets to recompute the checksum fails here.
+            assert_eq!(
+                version,
+                core_rs::manifest::get(claw)
+                    .expect("claw in manifest")
+                    .version,
+                "{claw}: MACOS_PINNED_SHA256 version is stale vs the manifest"
+            );
+            // 64 lowercase hex.
+            assert_eq!(sha.len(), 64, "{claw}: sha256 must be 64 hex chars");
+            assert!(
+                sha.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')),
+                "{claw}: sha256 must be lowercase hex"
+            );
+            // The command embeds this sha and verifies before extract/install.
+            let cmd = macos_install_command(claw).expect("supported claw");
+            assert!(
+                cmd.contains(sha),
+                "{claw}: command must embed the pinned sha"
+            );
+            let verify = cmd.find("shasum -a 256 -c").expect("shasum present");
+            if let Some(t) = cmd.find("tar xz") {
+                assert!(verify < t, "{claw}: checksum must precede tar");
+            }
+            if let Some(i) = cmd.find("install -m 755") {
+                assert!(verify < i, "{claw}: checksum must precede install");
+            }
         }
     }
 

@@ -16,8 +16,8 @@ stages.
 
 ## Current status
 
-Transport hardened, all 7 claws version-pinned, and ironclaw additionally
-verifies an upstream sha256. Every `curl` fetch uses:
+Transport hardened, all 7 claws version-pinned, and four claws (ironclaw +
+picoclaw/nullclaw/zeroclaw) verify a sha256. Every `curl` fetch uses:
 
     curl --proto '=https' --tlsv1.2 -fsSL --retry 3 --retry-delay 2
 
@@ -34,20 +34,20 @@ HEAD. This is a partial pin: only the source checkout is frozen - its pip/npm
 build dependencies still resolve at build time, and there is no checksum (it
 builds from source).
 
-ironclaw is the only claw that verifies an integrity checksum: it downloads the
-upstream `ironclaw-aarch64-apple-darwin.tar.gz.sha256` and runs `shasum -a 256 -c`
-before extracting (fail-closed on mismatch). The other claws have no checksum
-verification yet (see the checksum follow-up).
+Four claws verify an integrity checksum before extracting (fail-closed on
+mismatch): ironclaw against its upstream `.sha256`, and picoclaw, nullclaw and
+zeroclaw against a theyos-pinned sha256 (their upstream publishes none). nanobot
+and openclaw rely on pip/npm registry integrity; hermes-agent builds from source.
 
 ## Per-claw posture
 
 | Claw         | Install method                                | Version pin            | Integrity            | Status    |
 |--------------|-----------------------------------------------|------------------------|----------------------|-----------|
-| picoclaw     | curl GitHub `releases/download/v<ver>` tar.gz | manifest (`v0.2.5`)    | TLS transport only   | pinned    |
-| nullclaw     | curl GitHub `releases/download/v<ver>` bin    | manifest (`v2026.3.1`) | TLS transport only   | pinned    |
+| picoclaw     | curl GitHub `releases/download/v<ver>` tar.gz | manifest (`v0.2.5`)    | theyos-pinned sha256 verified | pinned + checksum |
+| nullclaw     | curl GitHub `releases/download/v<ver>` bin    | manifest (`v2026.3.1`) | theyos-pinned sha256 verified | pinned + checksum |
 | ironclaw     | curl GitHub `releases/download/v<ver>` tar.gz | manifest (`v0.12.0`)   | upstream sha256 verified | pinned + checksum |
 | nanobot      | `pip3 install nanobot-ai==<ver>`              | manifest (`0.1.5`)     | registry transport only | pinned |
-| zeroclaw     | curl GitHub `releases/download/v<ver>` tar.gz | manifest (`v0.8.1`)    | TLS transport only   | pinned    |
+| zeroclaw     | curl GitHub `releases/download/v<ver>` tar.gz | manifest (`v0.8.1`)    | theyos-pinned sha256 verified | pinned + checksum |
 | openclaw     | `npm install -g openclaw@<ver>`               | manifest (`2026.6.10`) | registry transport only | pinned |
 | hermes-agent | `git clone --branch v<ver>` tag + pip -e + npm | manifest (`2026.6.19`) | git transport (source build) | pinned (partial) |
 
@@ -90,11 +90,14 @@ macOS guest ships `shasum`, not coreutils `sha256sum`) before extracting,
 fail-closed on mismatch. A manifest version bump must re-verify the `.sha256`
 the same way the tarball tag is re-verified.
 
-picoclaw, nullclaw and zeroclaw are version-pinned but do NOT publish a per-asset
-checksum, so verifying them needs a theyos-side checksum store (artifact
-infrastructure that does not exist yet). openclaw rides npm's built-in registry
-integrity. hermes-agent is pinned to its git tag (S11-D-2) but builds from
-source, so it has no checksum either.
+Done (S11-E): picoclaw, nullclaw and zeroclaw publish no upstream per-asset
+checksum, so the installer verifies each downloaded asset against a theyos-pinned
+sha256 held in `MACOS_PINNED_SHA256` (`installer_plan_macos.rs`), keyed by
+`(claw, version, sha256)`. Each digest was computed once from the pinned release
+asset; a guard test asserts each pinned version tracks the manifest, so a version
+bump must recompute the sha256 (and the install fails-closed on a stale one).
+openclaw rides npm's built-in registry integrity. hermes-agent is pinned to its
+git tag (S11-D-2) but builds from source, so it has no checksum either.
 
 Out of scope here and tracked elsewhere: `latest.json` signing, the engine
 software-keys flag, the Swift client, and Product A / nvpn.
