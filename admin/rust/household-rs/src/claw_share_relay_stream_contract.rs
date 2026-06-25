@@ -1534,4 +1534,83 @@ mod tests {
             hex_actual
         );
     }
+
+    // Group/Public counterparts of the Device fixture above (Fase E merge-gate: the
+    // Swift RelayStream offer fixture mirrors these). Same deterministic inputs as the
+    // Device fixture, only `authz` differs, so the diff vs the Device hex is EXACTLY the
+    // audience encoding. authz wire shape (serde externally-tagged, snake_case):
+    // Group => {"authz":{"group":{"group_id","member_id"}}}, header `ac` = map(12);
+    // Public => {"authz":"public"}, header `ac` = map(12). Group inputs: group_id
+    // "group_alpha", member_id "member_alpha". Regenerate BOTH these and the Swift
+    // fixtures in lockstep (run with --nocapture) only on an intentional wire-shape change.
+
+    #[test]
+    fn cross_language_fixture_relay_stream_offer_authz_group_v2_hex() {
+        const EXPECTED_OFFER_V2_AUTHZ_GROUP_HEX: &str = "ac617602646b696e64781d636c61772d73686172652f72656c61792d73747265616d2d6f6666657265617574687aa16567726f7570a26867726f75705f69646b67726f75705f616c706861696d656d6265725f69646c6d656d6265725f616c70686167636c61775f69646a636c61775f616c70686167736c6f745f69645022222222222222222222222222222222687265736f7572636563707479696e6f745f61667465721a6b49d23c6d65787065637465645f706174686c72656c61795f73747265616d6e72656c61795f656e64706f696e74781e72656c61792d73747265616d3a2f2f3132372e302e302e313a34393135326f636c61775f7374617469635f707562582033333333333333333333333333333333333333333333333333333333333333337067756573745f6465766963655f70756258210351a7580833898ea1b183cbd7350a4099078c6ef1c1e18e970cd7683035f25e7d7072656e64657a766f75735f746f6b656e5042424242424242424242424242424242";
+
+        let payload = RelayStreamOfferPayload::new(
+            token(0x42),
+            "claw_alpha".to_string(),
+            SlotId([0x22; 16]),
+            guest_pub(),
+            RelayStreamResource::Pty,
+            RelayStreamExpectedPath::RelayStream,
+            "relay-stream://127.0.0.1:49152".to_string(),
+            static_pub(0x33),
+            NOT_AFTER,
+        )
+        .with_authz(RelayStreamAudience::Group {
+            group_id: "group_alpha".to_string(),
+            member_id: "member_alpha".to_string(),
+        });
+        assert_eq!(
+            payload.audience(),
+            RelayStreamAudience::Group {
+                group_id: "group_alpha".to_string(),
+                member_id: "member_alpha".to_string(),
+            }
+        );
+
+        let bytes = payload.to_canonical_bytes().unwrap();
+        // The authz key IS on the wire for a Some(_) audience (cannot be downgraded).
+        assert!(
+            bytes.windows(5).any(|w| w == b"authz"),
+            "authz must be present on the wire for a Group offer"
+        );
+        assert_eq!(
+            hex::encode(&bytes),
+            EXPECTED_OFFER_V2_AUTHZ_GROUP_HEX,
+            "relay_stream Group offer v2 wire drift — regenerate the Swift fixture in lockstep"
+        );
+    }
+
+    #[test]
+    fn cross_language_fixture_relay_stream_offer_authz_public_v2_hex() {
+        const EXPECTED_OFFER_V2_AUTHZ_PUBLIC_HEX: &str = "ac617602646b696e64781d636c61772d73686172652f72656c61792d73747265616d2d6f6666657265617574687a667075626c696367636c61775f69646a636c61775f616c70686167736c6f745f69645022222222222222222222222222222222687265736f7572636563707479696e6f745f61667465721a6b49d23c6d65787065637465645f706174686c72656c61795f73747265616d6e72656c61795f656e64706f696e74781e72656c61792d73747265616d3a2f2f3132372e302e302e313a34393135326f636c61775f7374617469635f707562582033333333333333333333333333333333333333333333333333333333333333337067756573745f6465766963655f70756258210351a7580833898ea1b183cbd7350a4099078c6ef1c1e18e970cd7683035f25e7d7072656e64657a766f75735f746f6b656e5042424242424242424242424242424242";
+
+        let payload = RelayStreamOfferPayload::new(
+            token(0x42),
+            "claw_alpha".to_string(),
+            SlotId([0x22; 16]),
+            guest_pub(),
+            RelayStreamResource::Pty,
+            RelayStreamExpectedPath::RelayStream,
+            "relay-stream://127.0.0.1:49152".to_string(),
+            static_pub(0x33),
+            NOT_AFTER,
+        )
+        .with_authz(RelayStreamAudience::Public);
+        assert_eq!(payload.audience(), RelayStreamAudience::Public);
+
+        let bytes = payload.to_canonical_bytes().unwrap();
+        assert!(
+            bytes.windows(5).any(|w| w == b"authz"),
+            "authz must be present on the wire for a Public offer"
+        );
+        assert_eq!(
+            hex::encode(&bytes),
+            EXPECTED_OFFER_V2_AUTHZ_PUBLIC_HEX,
+            "relay_stream Public offer v2 wire drift — regenerate the Swift fixture in lockstep"
+        );
+    }
 }
