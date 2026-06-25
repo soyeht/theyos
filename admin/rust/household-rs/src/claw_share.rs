@@ -42,12 +42,18 @@ use crate::error::HouseholdError;
 use crate::ids::HouseholdId;
 use crate::keys::{IdentityKey, P256PublicKey, P256Signature, verify_signature};
 use crate::machine_cert::PersonId;
+use crate::member_identity::MemberDeviceBinding;
 
 // ─── Constants ───────────────────────────────────────────────────────────────
 
 pub const CLAW_SHARE_INVITE_VERSION: u8 = 1;
 pub const CLAW_SHARE_CLAIM_VERSION: u8 = 1;
 pub const GUEST_CREDENTIAL_VERSION: u8 = 1;
+/// Version of the optional Path-A [`GroupClaimRequest`] envelope carried by a
+/// [`ClawShareClaim`].
+pub const CLAW_SHARE_GROUP_REQUEST_VERSION: u8 = 1;
+/// Version of the credential-less [`ClawShareGroupAck`] response.
+pub const CLAW_SHARE_GROUP_ACK_VERSION: u8 = 1;
 
 pub const SLOT_ID_LEN: usize = 16;
 pub const NONCE_LEN: usize = 32;
@@ -293,6 +299,14 @@ pub struct ClawShareClaim {
     /// verifying.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub participant_npub: Option<String>,
+    /// Optional Path-A Group offer request envelope. Present means this claim is
+    /// routed to the Group offer path; absent preserves the existing Device
+    /// claim shape. This field is deliberately outside
+    /// [`ClawShareClaimUnsigned`]: the nested request is self-authenticating via
+    /// its member binding and device proof-of-possession, while Device claim
+    /// signing bytes remain byte-stable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group_request: Option<GroupClaimRequest>,
     /// `r || s` over the canonical CBOR of every field above.
     pub guest_signature: P256Signature,
 }
@@ -359,6 +373,47 @@ impl ClawShareClaim {
             nonce,
             timestamp,
             participant_npub,
+            group_request: None,
+            guest_signature: signature,
+        })
+    }
+
+    /// Sign a Group claim. The slot is a zero sentinel: Group claims do not
+    /// consume invite slots, and the handler routes by `group_request`.
+    pub fn sign_group(
+        guest_device_pub: P256PublicKey,
+        nonce: ClaimNonce,
+        timestamp: u64,
+        group_request: GroupClaimRequest,
+        guest_key: &dyn IdentityKey,
+    ) -> Result<Self, ClawShareError> {
+        if guest_key.public() != guest_device_pub {
+            return Err(ClawShareError::GuestKeyMismatch);
+        }
+        if group_request.binding.device_pub != guest_device_pub {
+            return Err(ClawShareError::GroupDeviceKeyMismatch);
+        }
+        let slot_id = SlotId([0u8; SLOT_ID_LEN]);
+        let unsigned = ClawShareClaimUnsigned {
+            v: CLAW_SHARE_CLAIM_VERSION,
+            kind: CLAIM_KIND,
+            slot_id: &slot_id,
+            guest_device_pub: &guest_device_pub,
+            nonce: &nonce,
+            timestamp,
+            participant_npub: None,
+        };
+        let bytes = cbor::to_canonical_vec(&unsigned).map_err(ClawShareError::Cbor)?;
+        let signature = guest_key.sign(&bytes).map_err(ClawShareError::Sign)?;
+        Ok(Self {
+            v: CLAW_SHARE_CLAIM_VERSION,
+            kind: CLAIM_KIND.to_string(),
+            slot_id,
+            guest_device_pub,
+            nonce,
+            timestamp,
+            participant_npub: None,
+            group_request: Some(group_request),
             guest_signature: signature,
         })
     }
@@ -389,6 +444,88 @@ impl ClawShareClaim {
         let bytes = cbor::to_canonical_vec(&unsigned).map_err(ClawShareError::Cbor)?;
         verify_signature(&self.guest_device_pub, &bytes, &self.guest_signature)
             .map_err(|_| ClawShareError::ClaimSignatureRejected)
+    }
+}
+
+// ─── GroupClaimRequest (Path-A Group offer transport) ─────────────────────────
+
+/// Group offer request carried inside a [`ClawShareClaim`].
+///
+/// This mirrors the HTTP Group offer request shape so both transports can share
+/// one verifier: the member-signed [`MemberDeviceBinding`] proves the member
+/// authorized this device, and `device_pop` proves fresh possession of the bound
+/// device key over the request fields.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GroupClaimRequest {
+    pub v: u8,
+    #[serde(with = "serde_bytes")]
+    pub challenge: Vec<u8>,
+    pub binding: MemberDeviceBinding,
+    pub group_id: String,
+    pub claw_id: String,
+    pub device_pop: P256Signature,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ttl_secs: Option<u64>,
+}
+
+#[derive(Serialize)]
+#[serde(deny_unknown_fields)]
+struct GroupClaimRequestPopFields<'a> {
+    v: u8,
+    #[serde(with = "serde_bytes")]
+    challenge: &'a [u8],
+    group_id: &'a str,
+    claw_id: &'a str,
+    ttl_secs: Option<u64>,
+}
+
+impl GroupClaimRequest {
+    pub fn sign(
+        binding: MemberDeviceBinding,
+        group_id: String,
+        claw_id: String,
+        challenge: Vec<u8>,
+        ttl_secs: Option<u64>,
+        device_key: &dyn IdentityKey,
+    ) -> Result<Self, ClawShareError> {
+        if device_key.public() != binding.device_pub {
+            return Err(ClawShareError::GroupDeviceKeyMismatch);
+        }
+        let pop_fields = GroupClaimRequestPopFields {
+            v: CLAW_SHARE_GROUP_REQUEST_VERSION,
+            challenge: &challenge,
+            group_id: &group_id,
+            claw_id: &claw_id,
+            ttl_secs,
+        };
+        let bytes = cbor::to_canonical_vec(&pop_fields).map_err(ClawShareError::Cbor)?;
+        let device_pop = device_key.sign(&bytes).map_err(ClawShareError::Sign)?;
+        Ok(Self {
+            v: CLAW_SHARE_GROUP_REQUEST_VERSION,
+            challenge,
+            binding,
+            group_id,
+            claw_id,
+            device_pop,
+            ttl_secs,
+        })
+    }
+
+    pub fn verify_device_pop(&self) -> Result<(), ClawShareError> {
+        if self.v != CLAW_SHARE_GROUP_REQUEST_VERSION {
+            return Err(ClawShareError::VersionUnsupported(self.v));
+        }
+        let pop_fields = GroupClaimRequestPopFields {
+            v: self.v,
+            challenge: &self.challenge,
+            group_id: &self.group_id,
+            claw_id: &self.claw_id,
+            ttl_secs: self.ttl_secs,
+        };
+        let bytes = cbor::to_canonical_vec(&pop_fields).map_err(ClawShareError::Cbor)?;
+        verify_signature(&self.binding.device_pub, &bytes, &self.device_pop)
+            .map_err(|_| ClawShareError::GroupDevicePopRejected)
     }
 }
 
@@ -530,6 +667,13 @@ pub struct ClawShareAck {
     /// wire when `None`, so an older guest sees a byte-identical ack.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub relay_stream_offer: Option<serde_bytes::ByteBuf>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ClawShareGroupAck {
+    pub v: u8,
+    pub relay_stream_offer: serde_bytes::ByteBuf,
 }
 
 // ─── In-memory slot store ────────────────────────────────────────────────────
@@ -707,6 +851,12 @@ pub enum ClawShareError {
 
     #[error("guest-supplied key did not match the bound public key")]
     GuestKeyMismatch,
+
+    #[error("group request device key did not match the bound public key")]
+    GroupDeviceKeyMismatch,
+
+    #[error("group request device proof-of-possession verification failed")]
+    GroupDevicePopRejected,
 
     #[error("invite is past expiry")]
     InviteExpired,
@@ -1103,6 +1253,239 @@ mod tests {
         let hex = hex::encode(cbor::to_canonical_vec(&unsigned).expect("encode"));
         const EXPECTED_WITH_NPUB_HEX: &str = "a7617601646b696e6470636c61772d73686172652f636c61696d656e6f6e63655820444444444444444444444444444444444444444444444444444444444444444467736c6f745f696450222222222222222222222222222222226974696d657374616d701a6b49d3f47067756573745f6465766963655f70756258210351a7580833898ea1b183cbd7350a4099078c6ef1c1e18e970cd7683035f25e7d707061727469636970616e745f6e707562784038326632383365323030393465623464613539323263666261366330323834623739303532356634643464646232643137666439386631626430393536633032";
         assert_eq!(hex, EXPECTED_WITH_NPUB_HEX, "Some-variant claim wire hex");
+    }
+
+    // ─── Group claim (Path-A) — wire shape + byte-stability ──────────────────
+
+    fn group_test_keys() -> (P256Keypair, P256Keypair) {
+        let member = P256Keypair::from_secret_scalar(&[0x55u8; 32]).expect("member key");
+        let device = P256Keypair::from_secret_scalar(&[0x33u8; 32]).expect("device key");
+        (member, device)
+    }
+
+    fn sample_group_request() -> GroupClaimRequest {
+        let (member, device) = group_test_keys();
+        let binding = MemberDeviceBinding::sign(
+            &member as &dyn IdentityKey,
+            device.public(),
+            "npub_member_alpha".to_string(),
+            1_800_000_000,
+        )
+        .expect("sign binding");
+        GroupClaimRequest::sign(
+            binding,
+            "group_alpha".to_string(),
+            "claw_alpha".to_string(),
+            vec![0x66u8; 32],
+            Some(600),
+            &device as &dyn IdentityKey,
+        )
+        .expect("sign group request")
+    }
+
+    #[test]
+    fn group_request_round_trips_and_device_pop_verifies() {
+        let req = sample_group_request();
+        req.binding.verify().expect("binding verifies");
+        req.verify_device_pop().expect("device pop verifies");
+
+        let bytes = cbor::to_canonical_vec(&req).expect("encode");
+        let decoded: GroupClaimRequest = cbor::from_canonical_slice(&bytes).expect("decode");
+        assert_eq!(decoded, req);
+        decoded.verify_device_pop().expect("decoded pop verifies");
+    }
+
+    #[test]
+    fn group_request_device_pop_is_bound_to_group_claw_and_challenge() {
+        let base = sample_group_request();
+
+        let mut wrong_group = base.clone();
+        wrong_group.group_id = "group_beta".to_string();
+        assert!(wrong_group.binding.verify().is_ok());
+        assert!(matches!(
+            wrong_group.verify_device_pop(),
+            Err(ClawShareError::GroupDevicePopRejected)
+        ));
+
+        let mut wrong_claw = base.clone();
+        wrong_claw.claw_id = "claw_beta".to_string();
+        assert!(matches!(
+            wrong_claw.verify_device_pop(),
+            Err(ClawShareError::GroupDevicePopRejected)
+        ));
+
+        let mut wrong_challenge = base.clone();
+        wrong_challenge.challenge = vec![0x77u8; 32];
+        assert!(matches!(
+            wrong_challenge.verify_device_pop(),
+            Err(ClawShareError::GroupDevicePopRejected)
+        ));
+
+        let mut wrong_ttl = base;
+        wrong_ttl.ttl_secs = Some(601);
+        assert!(matches!(
+            wrong_ttl.verify_device_pop(),
+            Err(ClawShareError::GroupDevicePopRejected)
+        ));
+    }
+
+    #[test]
+    fn group_request_sign_rejects_device_key_not_in_binding() {
+        let (member, device) = group_test_keys();
+        let binding = MemberDeviceBinding::sign(
+            &member as &dyn IdentityKey,
+            device.public(),
+            "npub_member_alpha".to_string(),
+            1_800_000_000,
+        )
+        .unwrap();
+        let other = P256Keypair::from_secret_scalar(&[0x99u8; 32]).unwrap();
+        assert!(matches!(
+            GroupClaimRequest::sign(
+                binding,
+                "group_alpha".to_string(),
+                "claw_alpha".to_string(),
+                vec![0x66u8; 32],
+                Some(600),
+                &other as &dyn IdentityKey,
+            ),
+            Err(ClawShareError::GroupDeviceKeyMismatch)
+        ));
+    }
+
+    #[test]
+    fn group_claim_round_trips_and_device_fields_verify() {
+        let req = sample_group_request();
+        let (_member, device) = group_test_keys();
+        let nonce = ClaimNonce([0x44u8; NONCE_LEN]);
+        let ts: u64 = 1_800_000_500;
+        let claim = ClawShareClaim::sign_group(
+            device.public(),
+            nonce,
+            ts,
+            req,
+            &device as &dyn IdentityKey,
+        )
+        .expect("sign group claim");
+
+        claim.verify(ts).expect("device-field signature verifies");
+        assert_eq!(claim.slot_id, SlotId([0u8; SLOT_ID_LEN]));
+        assert!(claim.participant_npub.is_none());
+
+        let gr = claim.group_request.as_ref().expect("group request present");
+        gr.binding.verify().expect("binding verifies");
+        gr.verify_device_pop().expect("device pop verifies");
+
+        let bytes = cbor::to_canonical_vec(&claim).expect("encode claim");
+        let decoded: ClawShareClaim = cbor::from_canonical_slice(&bytes).expect("decode claim");
+        assert_eq!(decoded, claim);
+    }
+
+    #[test]
+    fn sign_group_rejects_guest_device_pub_not_matching_binding() {
+        let req = sample_group_request();
+        let nonce = ClaimNonce([0x44u8; NONCE_LEN]);
+        let ts: u64 = 1_800_000_500;
+        let other = P256Keypair::from_secret_scalar(&[0x99u8; 32]).unwrap();
+        assert!(matches!(
+            ClawShareClaim::sign_group(other.public(), nonce, ts, req, &other as &dyn IdentityKey),
+            Err(ClawShareError::GroupDeviceKeyMismatch)
+        ));
+    }
+
+    #[test]
+    fn device_claim_signed_bytes_unchanged_by_group_request_field() {
+        let slot_id = SlotId([0x22u8; SLOT_ID_LEN]);
+        let device = P256Keypair::from_secret_scalar(&[0x33u8; 32]).expect("device key");
+        let guest_device_pub = device.public();
+        let nonce = ClaimNonce([0x44u8; NONCE_LEN]);
+        let timestamp: u64 = 1_800_000_500;
+        let unsigned = ClawShareClaimUnsigned {
+            v: CLAW_SHARE_CLAIM_VERSION,
+            kind: CLAIM_KIND,
+            slot_id: &slot_id,
+            guest_device_pub: &guest_device_pub,
+            nonce: &nonce,
+            timestamp,
+            participant_npub: None,
+        };
+        let hex = hex::encode(cbor::to_canonical_vec(&unsigned).expect("encode"));
+        const EXPECTED_UNSIGNED_HEX: &str = "a6617601646b696e6470636c61772d73686172652f636c61696d656e6f6e63655820444444444444444444444444444444444444444444444444444444444444444467736c6f745f696450222222222222222222222222222222226974696d657374616d701a6b49d3f47067756573745f6465766963655f70756258210351a7580833898ea1b183cbd7350a4099078c6ef1c1e18e970cd7683035f25e7d";
+        assert_eq!(
+            hex, EXPECTED_UNSIGNED_HEX,
+            "Device claim signing bytes drifted"
+        );
+
+        let claim = ClawShareClaim::sign(
+            slot_id,
+            guest_device_pub,
+            nonce,
+            timestamp,
+            &device as &dyn IdentityKey,
+        )
+        .expect("sign device claim");
+        assert!(claim.group_request.is_none());
+        let bytes = cbor::to_canonical_vec(&claim).expect("encode");
+        let decoded: ClawShareClaim = cbor::from_canonical_slice(&bytes).expect("decode");
+        assert_eq!(decoded, claim);
+    }
+
+    #[test]
+    fn cross_language_fixture_group_claim_hex() {
+        let device = P256Keypair::from_secret_scalar(&[0x33u8; 32]).expect("device key");
+        let member = P256Keypair::from_secret_scalar(&[0x55u8; 32]).expect("member key");
+        let member_pub = member.public();
+        let device_pub = device.public();
+        let member_id = crate::member_identity::derive_member_id(&member_pub);
+        let binding = MemberDeviceBinding {
+            v: 1,
+            kind: "claw-share/member-device/v1".to_string(),
+            member_id,
+            member_pub,
+            device_pub: device_pub.clone(),
+            participant_npub: "82f283e20094eb4da5922cfba6c0284b790525f4d4ddb2d17fd98f1bd0956c02"
+                .to_string(),
+            issued_at: 1_800_000_000,
+            member_signature: P256Signature([0xABu8; 64]),
+        };
+        let group_request = GroupClaimRequest {
+            v: CLAW_SHARE_GROUP_REQUEST_VERSION,
+            challenge: vec![0x66u8; 32],
+            binding,
+            group_id: "group_alpha".to_string(),
+            claw_id: "claw_alpha".to_string(),
+            device_pop: P256Signature([0xCDu8; 64]),
+            ttl_secs: Some(600),
+        };
+        let claim = ClawShareClaim {
+            v: CLAW_SHARE_CLAIM_VERSION,
+            kind: CLAIM_KIND.to_string(),
+            slot_id: SlotId([0u8; SLOT_ID_LEN]),
+            guest_device_pub: device_pub,
+            nonce: ClaimNonce([0x44u8; NONCE_LEN]),
+            timestamp: 1_800_000_500,
+            participant_npub: None,
+            group_request: Some(group_request),
+            guest_signature: P256Signature([0xEFu8; 64]),
+        };
+        let hex = hex::encode(cbor::to_canonical_vec(&claim).expect("encode"));
+        const EXPECTED_GROUP_CLAIM_HEX: &str = "a8617601646b696e6470636c61772d73686172652f636c61696d656e6f6e63655820444444444444444444444444444444444444444444444444444444444444444467736c6f745f696450000000000000000000000000000000006974696d657374616d701a6b49d3f46d67726f75705f72657175657374a76176016762696e64696e67a8617601646b696e64781b636c61772d73686172652f6d656d6265722d6465766963652f7631696973737565645f61741a6b49d200696d656d6265725f69647836675f6c65717a6d6f6869357363377665746d3361616a64743274707061736767356f717576666a73366c78736670346c6a686a3670716a6465766963655f70756258210351a7580833898ea1b183cbd7350a4099078c6ef1c1e18e970cd7683035f25e7d6a6d656d6265725f70756258210257e977f6db7e33c3fe7acf2842ed987009caf56d458682fca447b7d3d762ab34706d656d6265725f7369676e61747572655840abababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababab707061727469636970616e745f6e70756278403832663238336532303039346562346461353932326366626136633032383462373930353235663464346464623264313766643938663162643039353663303267636c61775f69646a636c61775f616c7068616867726f75705f69646b67726f75705f616c7068616874746c5f73656373190258696368616c6c656e6765582066666666666666666666666666666666666666666666666666666666666666666a6465766963655f706f705840cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd6f67756573745f7369676e61747572655840efefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefef7067756573745f6465766963655f70756258210351a7580833898ea1b183cbd7350a4099078c6ef1c1e18e970cd7683035f25e7d";
+        assert_eq!(
+            hex, EXPECTED_GROUP_CLAIM_HEX,
+            "group claim wire shape drift — Swift fixture is now stale"
+        );
+    }
+
+    #[test]
+    fn group_ack_round_trips_credential_less() {
+        let ack = ClawShareGroupAck {
+            v: CLAW_SHARE_GROUP_ACK_VERSION,
+            relay_stream_offer: serde_bytes::ByteBuf::from(vec![0xDE, 0xAD, 0xBE, 0xEF]),
+        };
+        let bytes = cbor::to_canonical_vec(&ack).expect("encode");
+        let decoded: ClawShareGroupAck = cbor::from_canonical_slice(&bytes).expect("decode");
+        assert_eq!(decoded, ack);
+        assert_eq!(decoded.v, CLAW_SHARE_GROUP_ACK_VERSION);
     }
 
     fn relay_offer_ack(offer: Option<serde_bytes::ByteBuf>) -> ClawShareAck {
