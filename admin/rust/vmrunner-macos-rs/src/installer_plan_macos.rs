@@ -8,21 +8,33 @@
 use crate::VZError;
 use crate::macos_guest::ssh_exec;
 
+/// The pinned version for `claw` from the embedded manifest
+/// (`claws/manifest.yml` via `core_rs::manifest`). Static lookup, no I/O.
+fn manifest_version(claw: &str) -> Result<&'static str, VZError> {
+    core_rs::manifest::get(claw)
+        .map(|entry| entry.version)
+        .ok_or_else(|| VZError::InvalidConfig(format!("no manifest entry for claw: {claw}")))
+}
+
 /// Build the shell command that installs `claw_type`'s binary inside a macOS
 /// guest VM, or an error for an unknown claw.
 ///
-/// Pure (no I/O) so the install provenance posture is unit-testable. Every
-/// `curl` fetch is hardened to https + TLS >= 1.2 + retry. Several claws still
-/// pull upstream `latest`/HEAD without a version pin or checksum; that is
-/// tracked as the version-pin and checksum follow-ups in
-/// `docs/macos-runner-artifact-posture.md`.
+/// Reads the pinned version from the embedded manifest (`manifest_version`), so
+/// it stays a deterministic static lookup with no I/O and is unit-testable.
+/// Every `curl` fetch is hardened to https + TLS >= 1.2 + retry. picoclaw,
+/// nullclaw, ironclaw and nanobot are pinned to the manifest version; zeroclaw,
+/// openclaw and hermes-agent still pull upstream `latest`/HEAD (their manifest
+/// versions have no matching upstream release - see
+/// `docs/macos-runner-artifact-posture.md`).
 fn macos_install_command(claw_type: &str) -> Result<String, VZError> {
     let cmd = match claw_type {
         "picoclaw" => {
-            "mkdir -p /usr/local/bin && \
-             curl --proto '=https' --tlsv1.2 -fsSL --retry 3 --retry-delay 2 https://github.com/sipeed/picoclaw/releases/latest/download/picoclaw_Darwin_arm64.tar.gz \
-             | tar xz -C /usr/local/bin/ && chmod +x /usr/local/bin/picoclaw"
-                .to_string()
+            let v = manifest_version("picoclaw")?;
+            format!(
+                "mkdir -p /usr/local/bin && \
+                 curl --proto '=https' --tlsv1.2 -fsSL --retry 3 --retry-delay 2 https://github.com/sipeed/picoclaw/releases/download/v{v}/picoclaw_Darwin_arm64.tar.gz \
+                 | tar xz -C /usr/local/bin/ && chmod +x /usr/local/bin/picoclaw"
+            )
         }
         "zeroclaw" => {
             "mkdir -p /usr/local/bin && \
@@ -32,11 +44,13 @@ fn macos_install_command(claw_type: &str) -> Result<String, VZError> {
         }
         "nanobot" => {
             // pip installs to /opt/homebrew/bin/ when using brew Python, or ~/.local/bin/
-            "export PATH=/opt/homebrew/bin:$HOME/.local/bin:$PATH && \
-             pip3 install --break-system-packages nanobot-ai 2>/dev/null || \
-             python3 -m pip install --break-system-packages nanobot-ai 2>/dev/null || \
-             pip3 install nanobot-ai"
-                .to_string()
+            let v = manifest_version("nanobot")?;
+            format!(
+                "export PATH=/opt/homebrew/bin:$HOME/.local/bin:$PATH && \
+                 pip3 install --break-system-packages nanobot-ai=={v} 2>/dev/null || \
+                 python3 -m pip install --break-system-packages nanobot-ai=={v} 2>/dev/null || \
+                 pip3 install nanobot-ai=={v}"
+            )
         }
         "openclaw" => {
             // npm global installs to /opt/homebrew/bin/ via brew Node
@@ -65,21 +79,28 @@ fn macos_install_command(claw_type: &str) -> Result<String, VZError> {
                 .to_string()
         }
         "nullclaw" => {
-            "mkdir -p /usr/local/bin && \
-             curl --proto '=https' --tlsv1.2 -fsSL --retry 3 --retry-delay 2 https://github.com/nullclaw/nullclaw/releases/latest/download/nullclaw-macos-aarch64.bin \
-             -o /usr/local/bin/nullclaw && chmod +x /usr/local/bin/nullclaw"
-                .to_string()
+            let v = manifest_version("nullclaw")?;
+            format!(
+                "mkdir -p /usr/local/bin && \
+                 curl --proto '=https' --tlsv1.2 -fsSL --retry 3 --retry-delay 2 https://github.com/nullclaw/nullclaw/releases/download/v{v}/nullclaw-macos-aarch64.bin \
+                 -o /usr/local/bin/nullclaw && chmod +x /usr/local/bin/nullclaw"
+            )
         }
         "ironclaw" => {
             // ironclaw needs PostgreSQL 15+ - install via brew (as user theyos), then download binary.
             // Tarball extracts to ironclaw-aarch64-apple-darwin/ironclaw (subdirectory).
-            "export PATH=/opt/homebrew/bin:$PATH && \
-             su - theyos -c 'brew install postgresql@15' 2>/dev/null; \
-             mkdir -p /usr/local/bin && \
-             curl --proto '=https' --tlsv1.2 -fsSL --retry 3 --retry-delay 2 https://github.com/nearai/ironclaw/releases/latest/download/ironclaw-aarch64-apple-darwin.tar.gz \
-             | tar xz -C /tmp/ && install -m 755 /tmp/ironclaw-aarch64-apple-darwin/ironclaw /usr/local/bin/ironclaw \
-             && rm -rf /tmp/ironclaw-aarch64-apple-darwin"
-                .to_string()
+            // Upstream tag format migrated from `v<version>` to `ironclaw-v<version>`;
+            // the pinned manifest version still resolves with the older `v<version>`
+            // tag - re-verify the tag format before bumping the manifest version.
+            let v = manifest_version("ironclaw")?;
+            format!(
+                "export PATH=/opt/homebrew/bin:$PATH && \
+                 su - theyos -c 'brew install postgresql@15' 2>/dev/null; \
+                 mkdir -p /usr/local/bin && \
+                 curl --proto '=https' --tlsv1.2 -fsSL --retry 3 --retry-delay 2 https://github.com/nearai/ironclaw/releases/download/v{v}/ironclaw-aarch64-apple-darwin.tar.gz \
+                 | tar xz -C /tmp/ && install -m 755 /tmp/ironclaw-aarch64-apple-darwin/ironclaw /usr/local/bin/ironclaw \
+                 && rm -rf /tmp/ironclaw-aarch64-apple-darwin"
+            )
         }
         other => {
             return Err(VZError::InvalidConfig(format!(
@@ -203,21 +224,14 @@ mod tests {
         "ironclaw",
     ];
 
-    /// Claws whose macOS install is NOT yet version-pinned / checksum-verified.
-    /// This slice only hardens curl transport; version pinning and checksum
-    /// verification are tracked as follow-ups in
-    /// `docs/macos-runner-artifact-posture.md`. A new claw added with an
-    /// unpinned fetch (`releases/latest/download`, `git clone` HEAD, or an
-    /// unversioned pip/npm install) must be added here consciously, or pinned.
-    const UNPINNED_EXCEPTIONS: &[&str] = &[
-        "picoclaw",
-        "zeroclaw",
-        "nanobot",
-        "openclaw",
-        "hermes-agent",
-        "nullclaw",
-        "ironclaw",
-    ];
+    /// Claws whose macOS install is still NOT version-pinned. Their manifest
+    /// version has no matching upstream release (no `v0.1.9` tag for zeroclaw,
+    /// no npm `2026.4.6` for openclaw, hermes-agent uses date tags), so they
+    /// stay on `latest`/HEAD until the manifest version is corrected. A new
+    /// claw added with an unpinned fetch (`releases/latest/download`,
+    /// `git clone` HEAD, or an unversioned pip/npm install) must be added here
+    /// consciously, or pinned. See `docs/macos-runner-artifact-posture.md`.
+    const UNPINNED_EXCEPTIONS: &[&str] = &["zeroclaw", "openclaw", "hermes-agent"];
 
     /// Reliable markers that a command fetches an unpinned upstream artifact.
     fn looks_unpinned(cmd: &str) -> bool {
@@ -278,5 +292,32 @@ mod tests {
     #[test]
     fn macos_install_command_rejects_unknown_claw() {
         assert!(macos_install_command("definitely-not-a-claw").is_err());
+    }
+
+    #[test]
+    fn macos_pinned_installs_use_manifest_version() {
+        // The pinned claws embed exactly the manifest version (no `latest`), so a
+        // manifest bump is reflected in the install command. Reads the embedded
+        // manifest, no network.
+        for claw in ["picoclaw", "nullclaw", "ironclaw", "nanobot"] {
+            let cmd = macos_install_command(claw).expect("supported claw");
+            let version = core_rs::manifest::get(claw)
+                .expect("claw is in the manifest")
+                .version;
+            assert!(
+                cmd.contains(version),
+                "{claw}: pinned command must contain the manifest version {version}"
+            );
+            assert!(
+                !cmd.contains("releases/latest/download"),
+                "{claw}: pinned command must not use releases/latest/download"
+            );
+        }
+        // nanobot specifically pins the pip package version.
+        let nanobot = macos_install_command("nanobot").expect("nanobot");
+        assert!(
+            nanobot.contains("nanobot-ai=="),
+            "nanobot must pin the pip package with nanobot-ai=="
+        );
     }
 }

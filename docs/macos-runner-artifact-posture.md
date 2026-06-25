@@ -11,58 +11,78 @@ per-claw binaries layered on top of that base image at provisioning time.
 This is a different path from the Linux artifact registry (golden rootfs +
 `latest.json` + sha256, HTTPS-only). The Linux installer plan
 (`admin/rust/vmrunner-rs/src/installer_plan.rs`) already version-pins/resolves
-and uses hardened curl; the macOS guest-binary path lagged behind.
+and uses hardened curl; the macOS guest-binary path is being brought in line in
+stages.
 
 ## Current status
 
-Transport hardened only. Every `curl` fetch now uses:
+Transport hardened, and 4 of 7 claws version-pinned. Every `curl` fetch uses:
 
     curl --proto '=https' --tlsv1.2 -fsSL --retry 3 --retry-delay 2
 
 This forces HTTPS (no protocol downgrade), requires TLS >= 1.2, and retries
-transient failures. No version pinning or checksum verification was added.
-A guard test (`installer_plan_macos.rs` tests module) asserts the full curl
-flag set and keeps an explicit allow-list of the claws that are still unpinned,
-so a new unpinned claw fails CI until it is pinned or acknowledged.
+transient failures.
+
+picoclaw, nullclaw, ironclaw and nanobot are pinned to the version from
+`claws/manifest.yml`, read at build/run time via `core_rs::manifest::get`
+(single source of truth). The pinned download tag/package was verified to exist
+upstream with the expected macOS-arm64 asset.
+
+zeroclaw, openclaw and hermes-agent are NOT pinned: their manifest version has
+no matching upstream release, so pinning them would 404 / break the install.
+They stay on `latest`/HEAD and remain in the guard test's allow-list until their
+manifest versions are corrected (a separate manifest-curation task).
+
+No checksum verification yet (see the checksum follow-up).
 
 ## Per-claw posture
 
-| Claw         | Install method                                   | Version pin   | Integrity            | Risk   |
-|--------------|--------------------------------------------------|---------------|----------------------|--------|
-| picoclaw     | curl GitHub `releases/latest/download` tar.gz    | none (latest) | TLS transport only   | medium |
-| zeroclaw     | curl GitHub `releases/latest/download` tar.gz    | none (latest) | TLS transport only   | medium |
-| nullclaw     | curl GitHub `releases/latest/download` bin       | none (latest) | TLS transport only   | medium |
-| ironclaw     | curl GitHub `releases/latest/download` tar.gz    | none (latest) | TLS transport only   | medium |
-| hermes-agent | `git clone --depth 1` HEAD + pip -e + npm        | none (HEAD)   | git transport only   | medium |
-| nanobot      | `pip3 install nanobot-ai` (no version)           | none          | registry transport only | medium |
-| openclaw     | `npm install -g openclaw` (no version)           | none          | registry transport only | medium |
+| Claw         | Install method                                | Version pin            | Integrity            | Status    |
+|--------------|-----------------------------------------------|------------------------|----------------------|-----------|
+| picoclaw     | curl GitHub `releases/download/v<ver>` tar.gz | manifest (`v0.2.5`)    | TLS transport only   | pinned    |
+| nullclaw     | curl GitHub `releases/download/v<ver>` bin    | manifest (`v2026.3.1`) | TLS transport only   | pinned    |
+| ironclaw     | curl GitHub `releases/download/v<ver>` tar.gz | manifest (`v0.12.0`)   | TLS transport only   | pinned    |
+| nanobot      | `pip3 install nanobot-ai==<ver>`              | manifest (`0.1.5`)     | registry transport only | pinned |
+| zeroclaw     | curl GitHub `releases/latest/download` tar.gz | none (latest)          | TLS transport only   | blocked   |
+| openclaw     | `npm install -g openclaw` (no version)        | none                   | registry transport only | blocked |
+| hermes-agent | `git clone --depth 1` HEAD + pip -e + npm     | none (HEAD)            | git transport only   | blocked   |
+
+Blocked reasons (manifest version vs upstream, verified read-only):
+- zeroclaw: manifest `0.1.9` has no `v0.1.9` release tag (upstream latest is
+  `v0.8.1`).
+- openclaw: manifest `2026.4.6` is not a published npm version (latest is
+  `2026.6.10`).
+- hermes-agent: upstream uses date-based tags (e.g. `v2026.6.19`); manifest
+  `0.7.0` does not map to any tag or commit.
 
 Notes:
 - "TLS transport only" / "git transport only" / "registry transport only" mean
-  the download channel is authenticated (HTTPS / the registry's transport), but
-  we do NOT pin a version and we do NOT verify the artifact against a checksum
-  on our side. The installed artifact is whatever the upstream `latest`/HEAD or
-  the unversioned package currently resolves to, and it can change silently
-  between provisions.
-- For pip/npm the package name is unversioned, so the resolved version is not
-  reproducible. Do not assume the package manager closes the integrity gap for
-  us: there is no theyos-side version pin and no theyos-side artifact checksum.
+  the download channel is authenticated, but for the blocked claws we do NOT
+  pin a version and do NOT verify a checksum on our side; the artifact is
+  whatever `latest`/HEAD currently resolves to and can change between provisions.
+- For the pinned claws, pinning intentionally freezes the version. The current
+  manifest versions are behind upstream latest, so pinning trades "always
+  newest" for "reproducible"; bump the manifest version to move a pinned claw.
+- ironclaw's upstream tag format migrated from `v<version>` to
+  `ironclaw-v<version>`; the pinned `v0.12.0` still resolves, but a future
+  manifest bump for ironclaw must re-verify the tag format.
 
 ## Version pin follow-up
 
-Replace `releases/latest/download` with `releases/download/<tag>` derived from
-`claws/manifest.yml` `version:` per claw, pin pip/npm (`nanobot-ai==<v>`,
-`openclaw@<v>`), and pin hermes-agent to a tag or commit instead of HEAD.
-Requires per-claw verification that the manifest version maps to an existing
-macOS-arm64 release asset and the correct tag format - latest masks those
-mismatches today.
+Pin the remaining 3 (zeroclaw, openclaw, hermes-agent). This is blocked on
+correcting their `claws/manifest.yml` versions to values that exist upstream
+(a real release tag / npm version / git tag-or-commit), then applying the same
+manifest-derived pin. Verify per claw that the corrected version maps to an
+existing macOS-arm64 asset before pinning - `latest` masks those mismatches.
 
 ## Checksum follow-up
 
 Verify the downloaded artifact against an expected sha256, mirroring the Linux
-installer plan's `sha256sum -c` pattern. Requires either an upstream-published
-checksum file per release or a theyos-side checksum store (artifact
-infrastructure that does not exist yet).
+installer plan's `sha256sum -c` pattern. ironclaw is the best starting point:
+upstream publishes `ironclaw-aarch64-apple-darwin.tar.gz.sha256` alongside the
+binary. picoclaw and nullclaw do not publish per-asset checksums, so they would
+need a theyos-side checksum store (artifact infrastructure that does not exist
+yet).
 
 Out of scope here and tracked elsewhere: `latest.json` signing, the engine
 software-keys flag, the Swift client, and Product A / nvpn.
