@@ -1024,12 +1024,9 @@ async fn publish_household_bonjour_for_identity(
     let raw_hostname = gethostname::gethostname().to_string_lossy().into_owned();
     let host_label = raw_hostname.replace(['.', ' '], "-");
     // Read current bootstrap state for the TXT enrichment field.
-    let bootstrap_state = global_bootstrap_state()
-        .map(|arc| {
-            let val = *arc.try_read().unwrap_or_else(|_| arc.blocking_read());
-            val
-        })
-        .unwrap_or(BootstrapState::Ready);
+    let bootstrap_state = global_bootstrap_state().map_or(BootstrapState::Ready, |arc| {
+        *arc.try_read().unwrap_or_else(|_| arc.blocking_read())
+    });
     let bs_str = bootstrap_state.as_str().to_string();
     let params = bonjour_publisher::PublishParams {
         hh_id: loaded.record.hh_id.to_string(),

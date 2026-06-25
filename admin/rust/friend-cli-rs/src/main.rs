@@ -29,7 +29,8 @@ use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use household_rs::cbor;
 use household_rs::claw_share::{
-    ClaimNonce, ClawShareAck, ClawShareClaim, ClawShareInvite, GuestCredential, TunnelHandle,
+    CLAW_SHARE_GROUP_ACK_VERSION, ClaimNonce, ClawShareAck, ClawShareClaim, ClawShareGroupAck,
+    ClawShareInvite, GroupClaimRequest, GuestCredential, TunnelHandle,
 };
 use household_rs::claw_share_data_tunnel::{
     HEALTH_PROBE, SessionAuthToken, TargetExit, TunnelAck, TunnelFrame, client_authenticate,
@@ -143,6 +144,50 @@ enum Cmd {
         #[arg(long)]
         verbose: bool,
     },
+    /// Path A: acquire a GROUP `relay_stream` offer fully off-LAN over the Nostr
+    /// relay store-and-forward path (CGNAT-immune). Self-authenticating: a
+    /// member-signed `MemberDeviceBinding` + device proof-of-possession ride inside
+    /// the `ClawShareClaim`'s `group_request`, so it needs no invite slot and no
+    /// engine challenge round-trip — the claim's own nonce IS the group challenge.
+    /// The engine replies with a credential-less `ClawShareGroupAck` carrying the
+    /// signed offer; with `THEYOS_RELAY_STREAM_DIAL=1` the returned offer is dialed.
+    GroupClaimRelay {
+        /// Relay URL to publish the claim on (`ws://` or `wss://`).
+        #[arg(long)]
+        relay: String,
+        /// Engine Nostr receive pubkey — x-only hex or bech32 npub — the
+        /// `owner_engine_npub` the engine's relay loop subscribes on.
+        #[arg(long)]
+        engine_npub: String,
+        /// Group id the member is enrolled in.
+        #[arg(long)]
+        group: String,
+        /// Claw id the group has been granted.
+        #[arg(long)]
+        claw: String,
+        /// Member secret scalar (64 hex chars) whose `member_id` the engine has
+        /// enrolled in the group. Dev/smoke input; the production member key lives
+        /// in the Keychain/Secure Enclave.
+        #[arg(long)]
+        member_secret: String,
+        /// Device secret scalar (64 hex chars). Its public key threads the whole
+        /// flow: it signs the device `PoP`, is bound in the `MemberDeviceBinding`, is
+        /// the claim's `guest_device_pub`, and is the offer's dial key. Dev/smoke
+        /// input; production device keys are ephemeral / Secure-Enclave.
+        #[arg(long)]
+        device_secret: String,
+        /// The per-device mesh npub recorded in the binding.
+        #[arg(long)]
+        npub: String,
+        /// Requested offer lifetime in seconds (the engine caps it at 600).
+        #[arg(long)]
+        ttl_secs: Option<u64>,
+        /// Max seconds to wait for the group ack on the relay.
+        #[arg(long, default_value_t = 60)]
+        ack_timeout_secs: u64,
+        #[arg(long)]
+        verbose: bool,
+    },
 }
 
 #[tokio::main]
@@ -194,6 +239,32 @@ async fn main() -> Result<()> {
             offer_file,
             verbose,
         } => run_relay_offer_dial(&device_secret, offer_file.as_deref(), verbose).await,
+        Cmd::GroupClaimRelay {
+            relay,
+            engine_npub,
+            group,
+            claw,
+            member_secret,
+            device_secret,
+            npub,
+            ttl_secs,
+            ack_timeout_secs,
+            verbose,
+        } => {
+            run_group_claim_via_relay(GroupClaimRelayArgs {
+                relay,
+                engine_npub,
+                group,
+                claw,
+                member_secret,
+                device_secret,
+                npub,
+                ttl_secs,
+                ack_timeout_secs,
+                verbose,
+            })
+            .await
+        }
     }
 }
 
@@ -311,6 +382,246 @@ async fn run_claim_via_relay(
         }
     }
     Ok(())
+}
+
+// ─── Group claim flow (Path A: off-LAN GROUP offer over the Nostr relay) ──────
+
+struct GroupClaimRelayArgs {
+    relay: String,
+    engine_npub: String,
+    group: String,
+    claw: String,
+    member_secret: String,
+    device_secret: String,
+    npub: String,
+    ttl_secs: Option<u64>,
+    ack_timeout_secs: u64,
+    verbose: bool,
+}
+
+/// Build the self-authenticating GROUP claim: the member-signed binding + a device
+/// proof-of-possession wrapped in a `ClawShareClaim` whose OUTER nonce IS the group
+/// challenge (the engine asserts `group_request.challenge == claim.nonce`, so no
+/// engine challenge round-trip is needed — the loopback challenge endpoint is
+/// unreachable off-LAN, and freshness rides this single-use nonce). Pure (no I/O)
+/// so the construction is unit-tested without a live relay.
+fn build_group_claim(
+    binding: MemberDeviceBinding,
+    device_key: &P256Keypair,
+    group_id: String,
+    claw_id: String,
+    ttl_secs: Option<u64>,
+    nonce: ClaimNonce,
+    now: u64,
+) -> Result<ClawShareClaim> {
+    let device_pub = device_key.public();
+    let challenge = nonce.0.to_vec();
+    let group_request = GroupClaimRequest::sign(
+        binding,
+        group_id,
+        claw_id,
+        challenge,
+        ttl_secs,
+        device_key as &dyn IdentityKey,
+    )
+    .context("sign group claim request")?;
+    ClawShareClaim::sign_group(
+        device_pub,
+        nonce,
+        now,
+        group_request,
+        device_key as &dyn IdentityKey,
+    )
+    .context("sign group claim envelope")
+}
+
+/// Path A: acquire a GROUP `relay_stream` offer fully off-LAN over the Nostr relay
+/// store-and-forward path, then (optionally) dial it. The claim self-authenticates
+/// via a member-signed `MemberDeviceBinding` + device `PoP` carried inside
+/// `ClawShareClaim.group_request`; the engine replies with a credential-less
+/// `ClawShareGroupAck` carrying the signed offer, which is dialed with the SAME
+/// device key when `THEYOS_RELAY_STREAM_DIAL=1`.
+async fn run_group_claim_via_relay(args: GroupClaimRelayArgs) -> Result<()> {
+    use nostr_relay_rs::nostr::prelude::*;
+    use nostr_relay_rs::{
+        CLAW_SHARE_RELAY_KIND, NostrRelayClient, decrypt_claim_payload, publish_encrypted_claim,
+    };
+    use std::time::Duration;
+
+    let now = current_unix();
+
+    // Engine Nostr receive key — raw x-only hex or bech32 npub (same tolerance as
+    // the device-claim relay path).
+    let engine_pub = PublicKey::from_hex(&args.engine_npub)
+        .or_else(|_| PublicKey::parse(&args.engine_npub))
+        .context("parse --engine-npub")?;
+
+    // ONE device key threads the whole flow: it signs the device PoP, is bound in
+    // the MemberDeviceBinding, is the claim's guest_device_pub, and is the offer's
+    // dial key. The member key only signs the binding. The SAME two secrets fed to
+    // /dev-group-op reproduce the byte-identical member_id + device_pub the live
+    // membership gate checks.
+    let member_key = member_key_from_hex(&args.member_secret).context("--member-secret")?;
+    let device_key = member_key_from_hex(&args.device_secret).context("--device-secret")?;
+    let device_pub = device_key.public();
+    let device_pub_hex = device_pub
+        .as_bytes()
+        .iter()
+        .fold(String::new(), |mut acc, b| {
+            use std::fmt::Write as _;
+            let _ = write!(acc, "{b:02x}");
+            acc
+        });
+
+    // Build the binding once so we can surface the derived member_id — it MUST
+    // match the /dev-group-op enrollment for the membership gate to pass.
+    let binding = MemberDeviceBinding::sign(
+        &member_key as &dyn IdentityKey,
+        device_pub.clone(),
+        args.npub.clone(),
+        now,
+    )
+    .context("sign member device binding")?;
+    println!(
+        "member_id (must match the /dev-group-op enrollment): {}",
+        binding.member_id
+    );
+    println!("device_pub: {device_pub_hex}");
+
+    let nonce = ClaimNonce::random();
+    let claim = build_group_claim(
+        binding,
+        &device_key,
+        args.group.clone(),
+        args.claw.clone(),
+        args.ttl_secs,
+        nonce,
+        now,
+    )?;
+    let claim_cbor = cbor::to_canonical_vec(&claim).context("encode group claim CBOR")?;
+
+    // Fresh Nostr identity per claim; subscribe BEFORE publishing and drain the
+    // relay's initial EOSE so a fast ack is not raced away.
+    let friend_keys = Keys::generate();
+    let client = NostrRelayClient::connect(&args.relay)
+        .await
+        .context("connect relay")?;
+    let ack_filter = Filter::new()
+        .kind(Kind::Custom(CLAW_SHARE_RELAY_KIND))
+        .pubkey(friend_keys.public_key());
+    let mut sub = client
+        .subscribe("group-ack", &ack_filter)
+        .await
+        .context("subscribe for group ack")?;
+    let _ = tokio::time::timeout(Duration::from_millis(500), sub.recv()).await;
+
+    publish_encrypted_claim(&client, &friend_keys, &engine_pub, &claim_cbor)
+        .await
+        .context("publish encrypted group claim")?;
+    println!(
+        "group claim published to {} (engine_npub={})",
+        args.relay, args.engine_npub
+    );
+    println!("waiting up to {}s for group ack...", args.ack_timeout_secs);
+
+    let Some(event) = tokio::time::timeout(Duration::from_secs(args.ack_timeout_secs), sub.recv())
+        .await
+        .context("group ack timeout")?
+    else {
+        bail!("relay closed before group ack arrived");
+    };
+
+    let payload =
+        decrypt_claim_payload(&friend_keys, &event).context("decrypt group ack payload")?;
+    let ack: ClawShareGroupAck =
+        cbor::from_canonical_slice(&payload).context("decode CBOR group ack")?;
+    if ack.v != CLAW_SHARE_GROUP_ACK_VERSION {
+        bail!(
+            "group ack version mismatch: got {}, expected {}",
+            ack.v,
+            CLAW_SHARE_GROUP_ACK_VERSION
+        );
+    }
+
+    // Credential-less: the group ack carries ONLY the signed relay_stream offer
+    // (opaque canonical CBOR of a RelayStreamOfferContract), no GuestCredential.
+    let offer = RelayStreamOfferContract::from_canonical_bytes(&ack.relay_stream_offer)
+        .context("decode relay_stream offer from group ack")?;
+    if offer.payload.guest_device_pub != device_pub {
+        bail!("offer guest_device_pub mismatch — engine minted it for a different device");
+    }
+    println!("group ack ok — relay_stream offer received:");
+    println!("  claw_id        {}", offer.payload.claw_id);
+    println!("  resource       {:?}", offer.payload.resource);
+    println!("  audience       {:?}", offer.payload.audience());
+    println!("  expected_path  {:?}", offer.payload.expected_path);
+    println!("  relay_endpoint {}", offer.payload.relay_endpoint);
+    println!("  not_after      {}", offer.payload.not_after);
+    if args.verbose {
+        println!("  signer_pub     {:?}", offer.signer_pub);
+    }
+
+    // Credential-less Group dial (default OFF; the gated smoke sets
+    // THEYOS_RELAY_STREAM_DIAL=1). Best-effort — the offer is already obtained.
+    if relay_stream_dial_enabled() {
+        run_relay_offer_session_dial(&offer, &device_key).await;
+    } else {
+        println!("note: dialing is OFF; set THEYOS_RELAY_STREAM_DIAL=1 to dial this offer.");
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod group_claim_tests {
+    use super::*;
+
+    #[test]
+    fn build_group_claim_produces_engine_acceptable_claim() {
+        // The friend-cli construction must satisfy every LOCAL invariant the
+        // engine's verify_group_claim re-checks, so a correctly-built claim is only
+        // ever rejected for membership/replay — never for shape.
+        let member = P256Keypair::from_secret_scalar(&[0x55u8; 32]).unwrap();
+        let device = P256Keypair::from_secret_scalar(&[0x33u8; 32]).unwrap();
+        let now = 1_800_000_000u64;
+        let nonce = ClaimNonce::random();
+        let nonce_bytes = nonce.0;
+        let binding =
+            MemberDeviceBinding::sign(&member, device.public(), "npub_hex".into(), now).unwrap();
+        let member_id = binding.member_id.clone();
+
+        let claim = build_group_claim(
+            binding,
+            &device,
+            "g".into(),
+            "claw_a".into(),
+            Some(600),
+            nonce,
+            now,
+        )
+        .expect("build group claim");
+
+        // Outer device signature verifies (engine check #1).
+        claim.verify(now).expect("outer device signature verifies");
+        let gr = claim.group_request.as_ref().expect("group_request present");
+        // challenge == the claim's own nonce (engine check #3 — no round-trip).
+        assert_eq!(gr.challenge.as_slice(), &nonce_bytes[..]);
+        // ONE device key: binding.device_pub == claim.guest_device_pub == PoP signer.
+        assert_eq!(gr.binding.device_pub, claim.guest_device_pub);
+        assert_eq!(gr.binding.device_pub, device.public());
+        gr.binding
+            .verify()
+            .expect("member binding verifies (check #5)");
+        gr.verify_device_pop()
+            .expect("device PoP verifies (check #6)");
+        // member_id is cryptographically derived, never free-form.
+        assert_eq!(gr.binding.member_id, member_id);
+        // Group sentinel: no participant_npub (engine check #9).
+        assert!(claim.participant_npub.is_none());
+        // Wire-stable canonical CBOR round-trip.
+        let bytes = cbor::to_canonical_vec(&claim).unwrap();
+        let decoded: ClawShareClaim = cbor::from_canonical_slice(&bytes).unwrap();
+        assert_eq!(decoded, claim);
+    }
 }
 
 // ─── Claim flow ──────────────────────────────────────────────────────────────
