@@ -1519,6 +1519,7 @@ fn run_macos_claw_e2e(
 
     let instance_name = format!("e2e-mac-{claw_type}");
     let container = format!("{claw_type}-{instance_name}");
+    let state_dir = resolve_state_dir();
 
     // 1. Login
     let login_out = std::process::Command::new("curl")
@@ -1616,7 +1617,7 @@ fn run_macos_claw_e2e(
     }
 
     // 4. SSH reachable
-    let target = SshTarget::from_macos(&container, ssh_key)
+    let target = SshTarget::from_macos(&container, &state_dir, ssh_key)
         .map_err(|e| format!("resolve SSH target: {e}"))?;
     if !target.is_reachable(Duration::from_secs(10)) {
         let _ = delete_instance(&instance_id);
@@ -1629,7 +1630,7 @@ fn run_macos_claw_e2e(
     let key = ssh_key.to_path_buf();
     wait_until_guest_ready(
         || {
-            let t = SshTarget::from_macos(&format!("{ct}-e2e-mac-{ct}"), &key)
+            let t = SshTarget::from_macos(&format!("{ct}-e2e-mac-{ct}"), &state_dir, &key)
                 .map_err(|e| E2eError::Setup { detail: e.to_string() })?;
             // Find the claw binary — try multiple paths since pip/npm install to different locations
             let check = format!(
