@@ -7,7 +7,7 @@
 
 use crate::state::SharedState;
 use core_rs::error::MutexExt;
-use core_rs::ipc::wire::error_context_result_string;
+use core_rs::ipc::wire::{error_context_result_string, sanitize_error_context};
 use executor_rs::{ExecuteFlowRequest, FlowStatus, FlowType};
 use jobs_rs::JobType;
 use std::time::Duration;
@@ -319,9 +319,14 @@ async fn mark_failed(
     // caller's structured log.
     let failure_code = classify_instance_failure(&error_context, msg);
     let provisioning_error = provisioning_error_summary(&error_context, msg);
-    // Serialize error_context into the result field so the API can return it.
+    // Keep the full raw context in host logs only, then strip it to an allow-list
+    // of scalar diagnostic fields before persisting it on the public job result:
+    // it can carry raw stderr/paths from the executor/runner.
+    if let Some(raw) = error_context.as_ref() {
+        warn!("[jobs-worker] raw failure context (host-log only): {raw}");
+    }
     let ctx_json = error_context
-        .map(error_context_result_string)
+        .map(|c| error_context_result_string(sanitize_error_context(c)))
         .unwrap_or_default();
     if let Err(e) = tokio::task::spawn_blocking(move || {
         let mut record_create_failed = false;
@@ -625,6 +630,46 @@ mod tests {
         assert!(
             json.contains("2001"),
             "failure code missing from job JSON: {json}"
+        );
+    }
+
+    #[test]
+    fn failed_job_error_context_is_sanitized_in_result() {
+        // The executor/runner error_context can carry raw stderr and local paths
+        // (e.g. stderr_tail, path). mark_failed persists Job.result through
+        // sanitize_error_context, so only allow-listed scalars survive.
+        let raw = serde_json::json!({
+            "code": 2001,
+            "phase": "network.port_forward",
+            "command": "slirp_add_hostfwd",
+            "stderr_tail": "bind /tmp/soyeht-test/x: address in use",
+            "path": "/tmp/soyeht-test/disk.img",
+        });
+        let result = core_rs::ipc::wire::error_context_result_string(
+            core_rs::ipc::wire::sanitize_error_context(raw),
+        );
+        let mut job = jobs_rs::Job::new(jobs_rs::JobType::CreateInstance, "inst-test", "{}");
+        job.status = jobs_rs::Status::Failed;
+        job.error = Some(provisioning_error_summary(&None, "boom").to_string());
+        job.result = Some(result);
+
+        let json = serde_json::to_string(&job).unwrap();
+        for bad in [
+            "/tmp",
+            "soyeht-test",
+            "stderr_tail",
+            "slirp_add_hostfwd",
+            "disk.img",
+        ] {
+            assert!(
+                !json.contains(bad),
+                "failed job JSON leaked `{bad}`: {json}"
+            );
+        }
+        // Allow-listed scalar fields survive for triage.
+        assert!(
+            json.contains("2001") && json.contains("network.port_forward"),
+            "allow-listed context fields missing: {json}"
         );
     }
 }

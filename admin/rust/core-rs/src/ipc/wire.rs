@@ -152,6 +152,31 @@ pub fn error_context_result_string(context: Value) -> String {
     serde_json::to_string(&error_context_result(context)).unwrap_or_default()
 }
 
+/// The only keys preserved by [`sanitize_error_context`]: documented, scalar
+/// diagnostic fields that are safe to expose on a public surface.
+const SANITIZED_ERROR_CONTEXT_KEYS: &[&str] = &["code", "phase", "exit_code", "timed_out"];
+
+/// Strip an IPC error context down to a fixed allow-list of scalar diagnostic
+/// fields before it is persisted or served on a public surface (e.g. a job's
+/// stored `result`). Drops raw fields (`stderr_tail`, `path`, `command`, ...),
+/// nested values, and any unknown/future key - a positive allow-list, so a new
+/// producer field is dropped fail-closed. A non-object input yields `{}`.
+#[must_use]
+pub fn sanitize_error_context(context: Value) -> Value {
+    let mut out = Map::new();
+    if let Value::Object(obj) = context {
+        for key in SANITIZED_ERROR_CONTEXT_KEYS {
+            if let Some(v) = obj.get(*key) {
+                // Scalars only: drop objects/arrays/null even on an allow-listed key.
+                if v.is_number() || v.is_string() || v.is_boolean() {
+                    out.insert((*key).to_string(), v.clone());
+                }
+            }
+        }
+    }
+    Value::Object(out)
+}
+
 /// Write a response as a single JSON line to the output.
 ///
 /// # Errors
@@ -274,5 +299,57 @@ mod tests {
             ipc_code_from_context(&Some(json!({"code": 5_000_000_000u64}))),
             None
         );
+    }
+
+    #[test]
+    fn sanitize_error_context_keeps_only_allowlisted_scalars() {
+        let input = json!({
+            "code": 2001,
+            "phase": "network.port_forward",
+            "exit_code": 1,
+            "timed_out": false,
+            "command": "slirp_add_hostfwd",
+            "stderr_tail": "bind /tmp/x failed: address in use",
+            "path": "/tmp/soyeht/disk.img",
+            "attempt_ports": [8080, 8081],
+            "nested": {"inner": "/secret/path"},
+            "future_key": "whatever",
+        });
+        let out = sanitize_error_context(input);
+        let obj = out.as_object().expect("object");
+        // Allow-listed scalars kept.
+        assert_eq!(obj.get("code"), Some(&json!(2001)));
+        assert_eq!(obj.get("phase"), Some(&json!("network.port_forward")));
+        assert_eq!(obj.get("exit_code"), Some(&json!(1)));
+        assert_eq!(obj.get("timed_out"), Some(&json!(false)));
+        // Dropped: command + raw + array + object + future key.
+        for dropped in [
+            "command",
+            "stderr_tail",
+            "path",
+            "attempt_ports",
+            "nested",
+            "future_key",
+        ] {
+            assert!(!obj.contains_key(dropped), "must drop {dropped}");
+        }
+        // No raw substring survives anywhere in the serialized output.
+        let s = serde_json::to_string(&out).unwrap();
+        for bad in ["/tmp", "stderr", "slirp_add_hostfwd", "secret"] {
+            assert!(!s.contains(bad), "leaked `{bad}`: {s}");
+        }
+    }
+
+    #[test]
+    fn sanitize_error_context_drops_non_scalar_and_non_object() {
+        // An allow-listed key with a non-scalar value is dropped.
+        assert_eq!(
+            sanitize_error_context(json!({"phase": {"weird": "/tmp/x"}, "code": 7})),
+            json!({"code": 7})
+        );
+        // Non-object input is fail-closed to an empty object.
+        assert_eq!(sanitize_error_context(json!("just a string")), json!({}));
+        assert_eq!(sanitize_error_context(json!(null)), json!({}));
+        assert_eq!(sanitize_error_context(json!([1, 2, 3])), json!({}));
     }
 }
