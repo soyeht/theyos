@@ -400,7 +400,8 @@ pub async fn handle_household_prepare_guest_image(
 ///
 ///   - `theyos-provision-inject` binary present (NixOS/Homebrew install).
 ///   - `vmrunner_macos_ipc` binary present and resolvable via
-///     `THEYOS_VMRUNNER_MACOS_RS_BIN` or the same exe directory.
+///     `THEYOS_VMRUNNER_RS_BIN`, legacy `THEYOS_VMRUNNER_MACOS_RS_BIN`,
+///     or the same exe directory.
 ///
 /// If sudo is not NOPASSWD-configured for `theyos-provision-inject`,
 /// the IPC subprocess fails fast at the privileged step (sudo without
@@ -452,6 +453,9 @@ mod macos {
     use core_rs::ipc::client::IpcClient;
     use std::path::PathBuf;
 
+    const VMRUNNER_ENV: &str = "THEYOS_VMRUNNER_RS_BIN";
+    const LEGACY_VMRUNNER_ENV: &str = "THEYOS_VMRUNNER_MACOS_RS_BIN";
+
     #[derive(Debug, Clone)]
     pub struct ResolvedBinaries {
         pub vmrunner: PathBuf,
@@ -479,29 +483,51 @@ mod macos {
 
     /// Mirrors the binary resolution `init_macos_guest::build_client`
     /// performs. Order:
-    ///   1. `THEYOS_VMRUNNER_MACOS_RS_BIN` env var.
-    ///   2. Same directory as the running server binary.
-    ///   3. Cargo target dir (dev fallback).
+    ///   1. `THEYOS_VMRUNNER_RS_BIN` env var.
+    ///   2. Legacy `THEYOS_VMRUNNER_MACOS_RS_BIN` env var.
+    ///   3. Same directory as the running server binary.
+    ///   4. Cargo target dir (dev fallback).
     fn resolve_vmrunner_bin() -> Option<PathBuf> {
-        if let Ok(p) = std::env::var("THEYOS_VMRUNNER_MACOS_RS_BIN") {
-            let pb = PathBuf::from(p);
-            if pb.is_file() {
-                return Some(pb);
-            }
-        }
-        if let Ok(exe) = std::env::current_exe() {
-            if let Some(dir) = exe.parent() {
-                let cand = dir.join("vmrunner_macos_ipc");
-                if cand.is_file() {
-                    return Some(cand);
-                }
-            }
-        }
+        resolve_vmrunner_bin_from_candidates(
+            env_path(VMRUNNER_ENV),
+            env_path(LEGACY_VMRUNNER_ENV),
+            same_exe_vmrunner_path(),
+            cargo_vmrunner_path(),
+        )
+    }
+
+    fn resolve_vmrunner_bin_from_candidates(
+        canonical: Option<PathBuf>,
+        legacy: Option<PathBuf>,
+        same_exe: Option<PathBuf>,
+        cargo: Option<PathBuf>,
+    ) -> Option<PathBuf> {
+        [canonical, legacy, same_exe, cargo]
+            .into_iter()
+            .flatten()
+            .find(|candidate| candidate.is_file())
+    }
+
+    fn env_path(key: &str) -> Option<PathBuf> {
+        std::env::var(key)
+            .ok()
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from)
+    }
+
+    fn same_exe_vmrunner_path() -> Option<PathBuf> {
+        let exe = std::env::current_exe().ok()?;
+        let dir = exe.parent()?;
+        Some(dir.join("vmrunner_macos_ipc"))
+    }
+
+    fn cargo_vmrunner_path() -> Option<PathBuf> {
         let manifest = std::env::var("CARGO_MANIFEST_DIR").ok()?;
-        let cand = PathBuf::from(manifest)
-            .parent()?
-            .join("target/release/vmrunner_macos_ipc");
-        cand.is_file().then_some(cand)
+        Some(
+            PathBuf::from(manifest)
+                .parent()?
+                .join("target/release/vmrunner_macos_ipc"),
+        )
     }
 
     /// Mirrors `vmrunner_macos_rs::macos_guest::resolve_provision_inject_bin`
@@ -670,6 +696,59 @@ mod macos {
             }
         }
         "scripts/launchd".to_string()
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn vmrunner_resolution_prefers_canonical_over_legacy() {
+            let td = tempfile::tempdir().expect("tempdir");
+            let canonical = td.path().join("canonical-vmrunner");
+            let legacy = td.path().join("legacy-vmrunner");
+            std::fs::write(&canonical, b"canonical").expect("canonical");
+            std::fs::write(&legacy, b"legacy").expect("legacy");
+
+            let resolved = resolve_vmrunner_bin_from_candidates(
+                Some(canonical.clone()),
+                Some(legacy),
+                None,
+                None,
+            );
+
+            assert_eq!(resolved, Some(canonical));
+        }
+
+        #[test]
+        fn vmrunner_resolution_accepts_legacy_when_canonical_absent() {
+            let td = tempfile::tempdir().expect("tempdir");
+            let legacy = td.path().join("legacy-vmrunner");
+            std::fs::write(&legacy, b"legacy").expect("legacy");
+
+            let resolved =
+                resolve_vmrunner_bin_from_candidates(None, Some(legacy.clone()), None, None);
+
+            assert_eq!(resolved, Some(legacy));
+        }
+
+        #[test]
+        fn vmrunner_resolution_falls_back_to_same_exe_then_cargo() {
+            let td = tempfile::tempdir().expect("tempdir");
+            let same_exe = td.path().join("same-exe-vmrunner");
+            let cargo = td.path().join("cargo-vmrunner");
+            std::fs::write(&same_exe, b"same-exe").expect("same exe");
+            std::fs::write(&cargo, b"cargo").expect("cargo");
+
+            let resolved = resolve_vmrunner_bin_from_candidates(
+                None,
+                None,
+                Some(same_exe.clone()),
+                Some(cargo),
+            );
+
+            assert_eq!(resolved, Some(same_exe));
+        }
     }
 }
 
