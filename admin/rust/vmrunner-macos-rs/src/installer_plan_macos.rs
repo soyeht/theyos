@@ -22,9 +22,9 @@ fn manifest_version(claw: &str) -> Result<&'static str, VZError> {
 /// Reads the pinned version from the embedded manifest (`manifest_version`), so
 /// it stays a deterministic static lookup with no I/O and is unit-testable.
 /// Every `curl` fetch is hardened to https + TLS >= 1.2 + retry. picoclaw,
-/// nullclaw, ironclaw and nanobot are pinned to the manifest version; zeroclaw,
-/// openclaw and hermes-agent still pull upstream `latest`/HEAD (their manifest
-/// versions have no matching upstream release - see
+/// nullclaw, ironclaw, nanobot, zeroclaw and openclaw are pinned to the manifest
+/// version; only hermes-agent still pulls upstream HEAD (it uses date-based git
+/// tags and a HEAD `git clone`, so pinning needs an installer rework - see
 /// `docs/macos-runner-artifact-posture.md`).
 fn macos_install_command(claw_type: &str) -> Result<String, VZError> {
     let cmd = match claw_type {
@@ -37,10 +37,15 @@ fn macos_install_command(claw_type: &str) -> Result<String, VZError> {
             )
         }
         "zeroclaw" => {
-            "mkdir -p /usr/local/bin && \
-             curl --proto '=https' --tlsv1.2 -fsSL --retry 3 --retry-delay 2 https://github.com/zeroclaw-labs/zeroclaw/releases/latest/download/zeroclaw-aarch64-apple-darwin.tar.gz \
-             | tar xz -C /tmp/ && install -m 755 /tmp/zeroclaw /usr/local/bin/zeroclaw && rm -f /tmp/zeroclaw"
-                .to_string()
+            // Pinned to the manifest version (was releases/latest/download).
+            // Upstream publishes no per-asset .sha256, so no checksum step (same
+            // posture as picoclaw/nullclaw).
+            let v = manifest_version("zeroclaw")?;
+            format!(
+                "mkdir -p /usr/local/bin && \
+                 curl --proto '=https' --tlsv1.2 -fsSL --retry 3 --retry-delay 2 https://github.com/zeroclaw-labs/zeroclaw/releases/download/v{v}/zeroclaw-aarch64-apple-darwin.tar.gz \
+                 | tar xz -C /tmp/ && install -m 755 /tmp/zeroclaw /usr/local/bin/zeroclaw && rm -f /tmp/zeroclaw"
+            )
         }
         "nanobot" => {
             // pip installs to /opt/homebrew/bin/ when using brew Python, or ~/.local/bin/
@@ -53,12 +58,15 @@ fn macos_install_command(claw_type: &str) -> Result<String, VZError> {
             )
         }
         "openclaw" => {
-            // npm global installs to /opt/homebrew/bin/ via brew Node
-            "export PATH=/opt/homebrew/bin:$PATH && \
-             npm install -g openclaw 2>/dev/null && \
-             cd /opt/homebrew/lib/node_modules/openclaw/node_modules/sharp 2>/dev/null && \
-             npm install @img/sharp-darwin-arm64 2>/dev/null || true"
-                .to_string()
+            // npm global installs to /opt/homebrew/bin/ via brew Node. Pinned to
+            // the manifest version; npm verifies registry integrity on install.
+            let v = manifest_version("openclaw")?;
+            format!(
+                "export PATH=/opt/homebrew/bin:$PATH && \
+                 npm install -g openclaw@{v} 2>/dev/null && \
+                 cd /opt/homebrew/lib/node_modules/openclaw/node_modules/sharp 2>/dev/null && \
+                 npm install @img/sharp-darwin-arm64 2>/dev/null || true"
+            )
         }
         "hermes-agent" => {
             r#"export PATH=/opt/homebrew/bin:/usr/local/bin:$HOME/.local/bin:$PATH && \
@@ -233,14 +241,13 @@ mod tests {
         "ironclaw",
     ];
 
-    /// Claws whose macOS install is still NOT version-pinned. Their manifest
-    /// version has no matching upstream release (no `v0.1.9` tag for zeroclaw,
-    /// no npm `2026.4.6` for openclaw, hermes-agent uses date tags), so they
-    /// stay on `latest`/HEAD until the manifest version is corrected. A new
-    /// claw added with an unpinned fetch (`releases/latest/download`,
+    /// Claws whose macOS install is still NOT version-pinned. hermes-agent uses
+    /// date-based git tags and is installed from a HEAD `git clone`, so pinning
+    /// it needs an installer rework (HEAD -> tagged clone), tracked separately.
+    /// A new claw added with an unpinned fetch (`releases/latest/download`,
     /// `git clone` HEAD, or an unversioned pip/npm install) must be added here
     /// consciously, or pinned. See `docs/macos-runner-artifact-posture.md`.
-    const UNPINNED_EXCEPTIONS: &[&str] = &["zeroclaw", "openclaw", "hermes-agent"];
+    const UNPINNED_EXCEPTIONS: &[&str] = &["hermes-agent"];
 
     /// Reliable markers that a command fetches an unpinned upstream artifact.
     fn looks_unpinned(cmd: &str) -> bool {
@@ -352,7 +359,9 @@ mod tests {
         // The pinned claws embed exactly the manifest version (no `latest`), so a
         // manifest bump is reflected in the install command. Reads the embedded
         // manifest, no network.
-        for claw in ["picoclaw", "nullclaw", "ironclaw", "nanobot"] {
+        for claw in [
+            "picoclaw", "nullclaw", "ironclaw", "nanobot", "zeroclaw", "openclaw",
+        ] {
             let cmd = macos_install_command(claw).expect("supported claw");
             let version = core_rs::manifest::get(claw)
                 .expect("claw is in the manifest")

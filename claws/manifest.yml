@@ -51,7 +51,7 @@ claws:
     language: rust
     buildable: true
     distribution: prebuilt
-    version: "0.1.9"
+    version: "0.8.1"
     binary_size_mb: 25
     min_ram_mb: 256
     license: "Apache-2.0"
@@ -108,7 +108,7 @@ claws:
     language: node
     buildable: true
     distribution: prebuilt
-    version: "2026.4.6"
+    version: "2026.6.10"
     binary_size_mb: 2360
     min_ram_mb: 512
     license: "MIT"
