@@ -311,6 +311,52 @@ pub(crate) async fn try_provision_relay_stream_offer_for_claim(
     }
 }
 
+/// Gated wrapper around [`provision_group_offer_for_claw`] for the Path-A Group
+/// claim handler. Returns `None` when `THEYOS_RELAY_STREAM_LIVE` is unset
+/// (default-off, same gate as [`try_provision_relay_stream_offer_for_claim`]) or
+/// on provision failure, so the caller can fail closed without emitting an ack.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn try_provision_group_offer_for_claim(
+    state_dir: &Path,
+    household: &HouseholdState,
+    mesh_log: &MeshLogStore,
+    owner_key: &dyn IdentityKey,
+    group_id: String,
+    member_id: String,
+    member_device_pub: P256PublicKey,
+    claw_id: String,
+    not_after: u64,
+    now: u64,
+) -> Option<RelayStreamOfferContract> {
+    if !relay_stream_live_enabled_from_env() {
+        return None;
+    }
+    match provision_group_offer_for_claw(
+        state_dir,
+        household,
+        mesh_log,
+        owner_key,
+        group_id,
+        member_id,
+        member_device_pub,
+        claw_id,
+        not_after,
+        now,
+    )
+    .await
+    {
+        Ok(offer) => Some(offer),
+        Err(error) => {
+            tracing::warn!(
+                stage = "claw_share.relay_stream.group_provision_failed",
+                error = %error,
+                "relay_stream group offer provisioning failed; no ack emitted",
+            );
+            None
+        }
+    }
+}
+
 /// Deterministic core of [`try_provision_relay_stream_offer_for_claim`], split
 /// out (no env / no global) so it is unit-testable. Builds a FRESH trust seam
 /// from the live household record/cert + mesh-log projection (not the mount's

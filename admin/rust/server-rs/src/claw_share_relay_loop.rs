@@ -25,9 +25,13 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use household_rs::cbor;
-use household_rs::claw_share::{ClawShareAck, ClawShareClaim, ClawShareSlotStore, TunnelHandle};
+use household_rs::claw_share::{
+    CLAW_SHARE_GROUP_ACK_VERSION, CLAW_SHARE_GROUP_REQUEST_VERSION, ClawShareAck, ClawShareClaim,
+    ClawShareGroupAck, ClawShareSlotStore, GroupClaimRequest, SLOT_ID_LEN, SlotId, TunnelHandle,
+};
 use household_rs::claw_share_flow::{EngineContext, engine_handle_claim};
-use household_rs::household_mesh_log::{LogEntry, MeshEvent, MeshLogStore};
+use household_rs::household_mesh_log::{LogEntry, MeshEvent, MeshLogStore, ProjectedState};
+use household_rs::keys::{IdentityKey, P256PublicKey};
 use nostr_relay_rs::nostr::prelude::*;
 use nostr_relay_rs::{
     CLAW_SHARE_RELAY_KIND, HOUSEHOLD_LOG_KIND, NostrRelayClient, decode_household_log_payload,
@@ -35,7 +39,8 @@ use nostr_relay_rs::{
 };
 use tokio::sync::broadcast;
 
-use crate::claw_share_relay_offer_challenge::GroupClaimNonceTable;
+use crate::claw_share_relay_offer_challenge::{GROUP_CLAIM_NONCE_TTL_SECS, GroupClaimNonceTable};
+use crate::claw_share_relay_stream_contract::check_relay_stream_group_membership;
 use crate::household_state::HouseholdState;
 
 const RECONNECT_BACKOFF_INITIAL: Duration = Duration::from_secs(1);
@@ -424,6 +429,20 @@ async fn process_one(
     let owner_p_id = &owner_auth.owner_person_cert.p_id;
     let hh_id = &identity.record.hh_id;
 
+    if let Some(group_req) = claim.group_request.clone() {
+        return handle_group_claim(
+            client,
+            state,
+            relay_url,
+            &friend_pubkey,
+            owner_key,
+            &claim,
+            &group_req,
+            now,
+        )
+        .await;
+    }
+
     // This relay/membership subset uses no overlay: a public Direct address
     // (operator-configured) wins; else a Loopback channel for the single-host
     // harness. The L3 overlay handle is intentionally not part of this subset.
@@ -520,13 +539,172 @@ async fn process_one(
     Ok(())
 }
 
+// ─── Path-A Group claim handling ─────────────────────────────────────────────
+
+const GROUP_OFFER_DEFAULT_TTL_SECS: u64 = 600;
+const GROUP_OFFER_MAX_TTL_SECS: u64 = 600;
+
+pub(crate) struct VerifiedGroupClaim {
+    pub(crate) group_id: String,
+    pub(crate) member_id: String,
+    pub(crate) device_pub: P256PublicKey,
+    pub(crate) claw_id: String,
+    pub(crate) ttl_secs: Option<u64>,
+}
+
+#[derive(Debug)]
+#[allow(dead_code)]
+pub(crate) enum GroupClaimReject {
+    ClaimInvalid,
+    RequestVersion,
+    ChallengeNotNonce,
+    DeviceMismatch,
+    BindingInvalid,
+    DevicePop,
+    NonceReplay,
+    NotAuthorized(&'static str),
+    NonSentinelDeviceFields,
+}
+
+pub(crate) fn verify_group_claim(
+    claim: &ClawShareClaim,
+    group_req: &GroupClaimRequest,
+    projection: &ProjectedState,
+    nonce_table: &GroupClaimNonceTable,
+    now: u64,
+) -> Result<VerifiedGroupClaim, GroupClaimReject> {
+    claim
+        .verify(now)
+        .map_err(|_| GroupClaimReject::ClaimInvalid)?;
+
+    if group_req.v != CLAW_SHARE_GROUP_REQUEST_VERSION {
+        return Err(GroupClaimReject::RequestVersion);
+    }
+
+    if group_req.challenge.as_slice() != &claim.nonce.0[..] {
+        return Err(GroupClaimReject::ChallengeNotNonce);
+    }
+
+    if group_req.binding.device_pub != claim.guest_device_pub {
+        return Err(GroupClaimReject::DeviceMismatch);
+    }
+
+    group_req
+        .binding
+        .verify()
+        .map_err(|_| GroupClaimReject::BindingInvalid)?;
+
+    group_req
+        .verify_device_pop()
+        .map_err(|_| GroupClaimReject::DevicePop)?;
+
+    if !nonce_table.record_first_use(&claim.nonce.0, now, GROUP_CLAIM_NONCE_TTL_SECS) {
+        return Err(GroupClaimReject::NonceReplay);
+    }
+
+    check_relay_stream_group_membership(
+        projection,
+        &group_req.group_id,
+        &group_req.binding.member_id,
+        &group_req.claw_id,
+        &group_req.binding.device_pub,
+    )
+    .map_err(GroupClaimReject::NotAuthorized)?;
+
+    if claim.slot_id != SlotId([0u8; SLOT_ID_LEN]) || claim.participant_npub.is_some() {
+        return Err(GroupClaimReject::NonSentinelDeviceFields);
+    }
+
+    Ok(VerifiedGroupClaim {
+        group_id: group_req.group_id.clone(),
+        member_id: group_req.binding.member_id.clone(),
+        device_pub: group_req.binding.device_pub.clone(),
+        claw_id: group_req.claw_id.clone(),
+        ttl_secs: group_req.ttl_secs,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn handle_group_claim(
+    client: &NostrRelayClient,
+    state: &SpawnedState,
+    relay_url: &str,
+    friend_pubkey: &PublicKey,
+    owner_key: &dyn IdentityKey,
+    claim: &ClawShareClaim,
+    group_req: &GroupClaimRequest,
+    now: u64,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let projection = state.base.mesh_log.project();
+    let verified = match verify_group_claim(
+        claim,
+        group_req,
+        &projection,
+        &state.base.group_claim_nonces,
+        now,
+    ) {
+        Ok(value) => value,
+        Err(reason) => {
+            tracing::warn!(
+                stage = "claw_share.relay.group_claim_rejected",
+                reason = ?reason,
+                relay = %relay_url,
+                "group claim rejected; no ack emitted",
+            );
+            return Ok(());
+        }
+    };
+
+    let ttl = verified
+        .ttl_secs
+        .unwrap_or(GROUP_OFFER_DEFAULT_TTL_SECS)
+        .min(GROUP_OFFER_MAX_TTL_SECS);
+
+    let Some(offer) = crate::claw_share_relay_stream_mount::try_provision_group_offer_for_claim(
+        &state.base.state_dir,
+        &state.base.household,
+        &state.base.mesh_log,
+        owner_key,
+        verified.group_id,
+        verified.member_id,
+        verified.device_pub,
+        verified.claw_id,
+        now.saturating_add(ttl),
+        now,
+    )
+    .await
+    else {
+        return Ok(());
+    };
+
+    let offer_bytes = cbor::to_canonical_vec(&offer)?;
+    let ack = ClawShareGroupAck {
+        v: CLAW_SHARE_GROUP_ACK_VERSION,
+        relay_stream_offer: serde_bytes::ByteBuf::from(offer_bytes),
+    };
+    let ack_cbor = cbor::to_canonical_vec(&ack)?;
+    publish_encrypted_claim(client, &state.base.engine_keys, friend_pubkey, &ack_cbor).await?;
+    tracing::info!(
+        stage = "claw_share.relay.group_claim_acked",
+        relay = %relay_url,
+        "group offer delivered in encrypted ack",
+    );
+    Ok(())
+}
+
 // ─── tests ──────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use household_rs::household_mesh_log::MeshEvent;
+    use household_rs::claw_share::{CLAIM_TIMESTAMP_TOLERANCE_SECS, ClaimNonce, ClawShareError};
+    use household_rs::household_mesh_log::{
+        MeshEvent, MeshMembership, ProjectedGroup, ProjectedMemberDevice,
+    };
+    use household_rs::ids::derive_household_id;
     use household_rs::keys::{IdentityKey, P256Keypair};
+    use household_rs::member_identity::{MemberDeviceBinding, derive_member_id};
+    use household_rs::person_cert::derive_person_id;
 
     fn fake_consume_event() -> MeshEvent {
         MeshEvent::ClawShareSlotConsumed {
@@ -646,5 +824,364 @@ mod tests {
             .await
             .expect("alive receiver got payload");
         assert_eq!(got, payload, "alive relay receives the same payload");
+    }
+
+    const GC_GROUP: &str = "group_alpha";
+    const GC_CLAW: &str = "claw_alpha";
+    const GC_NPUB: &str = "npub_test";
+
+    fn gc_keys() -> (P256Keypair, P256Keypair) {
+        let member = P256Keypair::from_secret_scalar(&[0x55u8; 32]).unwrap();
+        let device = P256Keypair::from_secret_scalar(&[0x33u8; 32]).unwrap();
+        (member, device)
+    }
+
+    fn gc_claim(
+        member: &P256Keypair,
+        device: &P256Keypair,
+        ts: u64,
+    ) -> (ClawShareClaim, GroupClaimRequest) {
+        let nonce = ClaimNonce([0x44u8; 32]);
+        let binding = MemberDeviceBinding::sign(
+            member as &dyn IdentityKey,
+            device.public(),
+            GC_NPUB.to_string(),
+            1_800_000_000,
+        )
+        .unwrap();
+        let group_req = GroupClaimRequest::sign(
+            binding,
+            GC_GROUP.to_string(),
+            GC_CLAW.to_string(),
+            nonce.0.to_vec(),
+            Some(600),
+            device as &dyn IdentityKey,
+        )
+        .unwrap();
+        let claim = ClawShareClaim::sign_group(
+            device.public(),
+            nonce,
+            ts,
+            group_req.clone(),
+            device as &dyn IdentityKey,
+        )
+        .unwrap();
+        (claim, group_req)
+    }
+
+    fn gc_projection(member_id: &str, device: &P256Keypair) -> ProjectedState {
+        let mut projection = ProjectedState::default();
+        projection.groups.insert(
+            GC_GROUP.to_string(),
+            ProjectedGroup {
+                group_id: GC_GROUP.to_string(),
+                name: "Alpha".to_string(),
+                members: [(member_id.to_string(), MeshMembership::Active)]
+                    .into_iter()
+                    .collect(),
+                granted_claws: [(GC_CLAW.to_string(), MeshMembership::Active)]
+                    .into_iter()
+                    .collect(),
+                revision: 1,
+            },
+        );
+        projection.member_devices.insert(
+            member_id.to_string(),
+            [(
+                device.public().as_bytes()[..].to_vec(),
+                ProjectedMemberDevice {
+                    participant_npub: GC_NPUB.to_string(),
+                    status: MeshMembership::Active,
+                },
+            )]
+            .into_iter()
+            .collect(),
+        );
+        projection
+    }
+
+    #[test]
+    fn group_claim_valid_verifies() {
+        let (member, device) = gc_keys();
+        let ts = 1_800_000_500;
+        let (claim, group_req) = gc_claim(&member, &device, ts);
+        let member_id = derive_member_id(&member.public());
+        let projection = gc_projection(&member_id, &device);
+        let nonces = GroupClaimNonceTable::new();
+        let verified =
+            verify_group_claim(&claim, &group_req, &projection, &nonces, ts).expect("valid");
+        assert_eq!(verified.group_id, GC_GROUP);
+        assert_eq!(verified.member_id, member_id);
+        assert_eq!(verified.device_pub, device.public());
+        assert_eq!(verified.claw_id, GC_CLAW);
+        assert_eq!(verified.ttl_secs, Some(600));
+    }
+
+    #[test]
+    fn group_claim_carries_zeroed_sentinel_slot() {
+        let (member, device) = gc_keys();
+        let (claim, _group_req) = gc_claim(&member, &device, 1_800_000_500);
+        assert!(claim.group_request.is_some());
+        assert_eq!(claim.slot_id, SlotId([0u8; SLOT_ID_LEN]));
+        assert!(claim.participant_npub.is_none());
+    }
+
+    #[test]
+    fn group_claim_replay_same_nonce_rejected() {
+        let (member, device) = gc_keys();
+        let ts = 1_800_000_500;
+        let (claim, group_req) = gc_claim(&member, &device, ts);
+        let member_id = derive_member_id(&member.public());
+        let projection = gc_projection(&member_id, &device);
+        let nonces = GroupClaimNonceTable::new();
+        assert!(verify_group_claim(&claim, &group_req, &projection, &nonces, ts).is_ok());
+        assert!(matches!(
+            verify_group_claim(&claim, &group_req, &projection, &nonces, ts + 5),
+            Err(GroupClaimReject::NonceReplay)
+        ));
+    }
+
+    #[test]
+    fn group_claim_window_boundary_replay_rejected() {
+        let (member, device) = gc_keys();
+        let ts = 1_800_000_500;
+        let (claim, group_req) = gc_claim(&member, &device, ts);
+        let member_id = derive_member_id(&member.public());
+        let projection = gc_projection(&member_id, &device);
+        let nonces = GroupClaimNonceTable::new();
+        let early = ts - CLAIM_TIMESTAMP_TOLERANCE_SECS;
+        let late = ts + CLAIM_TIMESTAMP_TOLERANCE_SECS;
+        assert!(verify_group_claim(&claim, &group_req, &projection, &nonces, early).is_ok());
+        assert!(matches!(
+            verify_group_claim(&claim, &group_req, &projection, &nonces, late),
+            Err(GroupClaimReject::NonceReplay)
+        ));
+    }
+
+    #[test]
+    fn group_claim_forged_binding_rejected() {
+        let (member, device) = gc_keys();
+        let ts = 1_800_000_500;
+        let (claim, mut group_req) = gc_claim(&member, &device, ts);
+        group_req.binding.member_id = "g_forged".to_string();
+        let member_id = derive_member_id(&member.public());
+        let projection = gc_projection(&member_id, &device);
+        let nonces = GroupClaimNonceTable::new();
+        assert!(matches!(
+            verify_group_claim(&claim, &group_req, &projection, &nonces, ts),
+            Err(GroupClaimReject::BindingInvalid)
+        ));
+    }
+
+    #[test]
+    fn group_claim_bad_device_pop_rejected() {
+        let (member, device) = gc_keys();
+        let ts = 1_800_000_500;
+        let (claim, mut group_req) = gc_claim(&member, &device, ts);
+        group_req.device_pop = household_rs::keys::P256Signature([0u8; 64]);
+        let member_id = derive_member_id(&member.public());
+        let projection = gc_projection(&member_id, &device);
+        let nonces = GroupClaimNonceTable::new();
+        assert!(matches!(
+            verify_group_claim(&claim, &group_req, &projection, &nonces, ts),
+            Err(GroupClaimReject::DevicePop)
+        ));
+    }
+
+    #[test]
+    fn group_claim_challenge_not_nonce_rejected() {
+        let (member, device) = gc_keys();
+        let ts = 1_800_000_500;
+        let (claim, group_req) = gc_claim(&member, &device, ts);
+        let rebound = GroupClaimRequest::sign(
+            group_req.binding.clone(),
+            GC_GROUP.to_string(),
+            GC_CLAW.to_string(),
+            vec![0x99u8; 32],
+            Some(600),
+            &device as &dyn IdentityKey,
+        )
+        .unwrap();
+        let member_id = derive_member_id(&member.public());
+        let projection = gc_projection(&member_id, &device);
+        let nonces = GroupClaimNonceTable::new();
+        assert!(matches!(
+            verify_group_claim(&claim, &rebound, &projection, &nonces, ts),
+            Err(GroupClaimReject::ChallengeNotNonce)
+        ));
+    }
+
+    #[test]
+    fn group_claim_non_member_rejected() {
+        let (member, device) = gc_keys();
+        let ts = 1_800_000_500;
+        let (claim, group_req) = gc_claim(&member, &device, ts);
+        let projection = ProjectedState::default();
+        let nonces = GroupClaimNonceTable::new();
+        assert!(matches!(
+            verify_group_claim(&claim, &group_req, &projection, &nonces, ts),
+            Err(GroupClaimReject::NotAuthorized(_))
+        ));
+    }
+
+    #[test]
+    fn group_claim_device_not_enrolled_rejected() {
+        let (member, device) = gc_keys();
+        let ts = 1_800_000_500;
+        let (claim, group_req) = gc_claim(&member, &device, ts);
+        let member_id = derive_member_id(&member.public());
+        let other_device = P256Keypair::from_secret_scalar(&[0x66u8; 32]).unwrap();
+        let projection = gc_projection(&member_id, &other_device);
+        let nonces = GroupClaimNonceTable::new();
+        assert!(matches!(
+            verify_group_claim(&claim, &group_req, &projection, &nonces, ts),
+            Err(GroupClaimReject::NotAuthorized(_))
+        ));
+    }
+
+    #[test]
+    fn group_claim_stale_timestamp_rejected() {
+        let (member, device) = gc_keys();
+        let ts = 1_800_000_500;
+        let (claim, group_req) = gc_claim(&member, &device, ts);
+        let member_id = derive_member_id(&member.public());
+        let projection = gc_projection(&member_id, &device);
+        let nonces = GroupClaimNonceTable::new();
+        let stale = ts + CLAIM_TIMESTAMP_TOLERANCE_SECS + 10;
+        assert!(matches!(
+            verify_group_claim(&claim, &group_req, &projection, &nonces, stale),
+            Err(GroupClaimReject::ClaimInvalid)
+        ));
+    }
+
+    #[test]
+    fn group_claim_wrong_request_version_rejected() {
+        let (member, device) = gc_keys();
+        let ts = 1_800_000_500;
+        let (claim, mut group_req) = gc_claim(&member, &device, ts);
+        group_req.v = 2;
+        let member_id = derive_member_id(&member.public());
+        let projection = gc_projection(&member_id, &device);
+        let nonces = GroupClaimNonceTable::new();
+        assert!(matches!(
+            verify_group_claim(&claim, &group_req, &projection, &nonces, ts),
+            Err(GroupClaimReject::RequestVersion)
+        ));
+    }
+
+    #[test]
+    fn group_claim_device_pub_mismatch_rejected() {
+        let (member, device) = gc_keys();
+        let ts = 1_800_000_500;
+        let (claim, mut group_req) = gc_claim(&member, &device, ts);
+        let other_device = P256Keypair::from_secret_scalar(&[0x66u8; 32]).unwrap();
+        group_req.binding = MemberDeviceBinding::sign(
+            &member as &dyn IdentityKey,
+            other_device.public(),
+            GC_NPUB.to_string(),
+            1_800_000_000,
+        )
+        .unwrap();
+        let member_id = derive_member_id(&member.public());
+        let projection = gc_projection(&member_id, &device);
+        let nonces = GroupClaimNonceTable::new();
+        assert!(matches!(
+            verify_group_claim(&claim, &group_req, &projection, &nonces, ts),
+            Err(GroupClaimReject::DeviceMismatch)
+        ));
+    }
+
+    #[test]
+    fn group_claim_non_sentinel_slot_rejected() {
+        let (member, device) = gc_keys();
+        let ts = 1_800_000_500;
+        let (_discard, group_req) = gc_claim(&member, &device, ts);
+        let mut claim = ClawShareClaim::sign(
+            SlotId([0x01u8; SLOT_ID_LEN]),
+            device.public(),
+            ClaimNonce([0x44u8; 32]),
+            ts,
+            &device as &dyn IdentityKey,
+        )
+        .unwrap();
+        claim.group_request = Some(group_req.clone());
+        let member_id = derive_member_id(&member.public());
+        let projection = gc_projection(&member_id, &device);
+        let nonces = GroupClaimNonceTable::new();
+        assert!(matches!(
+            verify_group_claim(&claim, &group_req, &projection, &nonces, ts),
+            Err(GroupClaimReject::NonSentinelDeviceFields)
+        ));
+    }
+
+    #[test]
+    fn group_claim_filled_participant_npub_rejected() {
+        let (member, device) = gc_keys();
+        let ts = 1_800_000_500;
+        let (_discard, group_req) = gc_claim(&member, &device, ts);
+        let mut claim = ClawShareClaim::sign_with_participant(
+            SlotId([0u8; SLOT_ID_LEN]),
+            device.public(),
+            ClaimNonce([0x44u8; 32]),
+            ts,
+            Some("npub_should_not_be_here".to_string()),
+            &device as &dyn IdentityKey,
+        )
+        .unwrap();
+        claim.group_request = Some(group_req.clone());
+        let member_id = derive_member_id(&member.public());
+        let projection = gc_projection(&member_id, &device);
+        let nonces = GroupClaimNonceTable::new();
+        assert!(matches!(
+            verify_group_claim(&claim, &group_req, &projection, &nonces, ts),
+            Err(GroupClaimReject::NonSentinelDeviceFields)
+        ));
+    }
+
+    #[test]
+    fn engine_rejects_group_claim_in_device_flow() {
+        let (member, device) = gc_keys();
+        let ts = 1_800_000_500;
+        let (claim, _group_req) = gc_claim(&member, &device, ts);
+        let owner = P256Keypair::from_secret_scalar(&[0x11u8; 32]).unwrap();
+        let hh_id = derive_household_id(&owner.public());
+        let owner_p_id = derive_person_id(&owner.public());
+        let slots = ClawShareSlotStore::new();
+        let tunnel_factory = |_claw_id: &str| TunnelHandle::Loopback {
+            channel: "test".to_string(),
+        };
+        let ctx = EngineContext {
+            owner_key: &owner,
+            owner_p_id: &owner_p_id,
+            hh_id: &hh_id,
+            slot_store: &slots,
+            credential_ttl_secs: 60,
+            tunnel_factory: &tunnel_factory,
+        };
+        let err = engine_handle_claim(&ctx, &claim, ts).expect_err("group is not device flow");
+        assert!(matches!(err, ClawShareError::SlotNotFound));
+    }
+
+    #[test]
+    fn group_claim_route_precedes_device_path_source_guard() {
+        let source = include_str!("claw_share_relay_loop.rs");
+        let group_branch = source
+            .find("if let Some(group_req) = claim.group_request.clone()")
+            .expect("group branch marker");
+        let engine_call = source
+            .find("engine_handle_claim(&ctx, &claim, now)")
+            .expect("device engine call marker");
+        let slot_event_after_branch = source[group_branch..]
+            .find("MeshEvent::ClawShareSlotConsumed")
+            .expect("slot consume event after group branch")
+            + group_branch;
+        assert!(
+            group_branch < engine_call,
+            "Group claims must route before engine_handle_claim"
+        );
+        assert!(
+            group_branch < slot_event_after_branch,
+            "Group claims must route before slot-consume event append"
+        );
     }
 }
