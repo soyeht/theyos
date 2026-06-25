@@ -49,6 +49,27 @@ fn pinned_sha256(claw: &str) -> Result<&'static str, VZError> {
         .ok_or_else(|| VZError::InvalidConfig(format!("no pinned sha256 for claw: {claw}")))
 }
 
+/// theyos-pinned git commit SHA for source-build claws, keyed by
+/// `(claw, manifest version, 40-hex commit sha)`. The installer verifies the
+/// checked-out commit against this after cloning the tag, so a re-pointed
+/// (mutable) tag is caught and fails closed before any build. A guard test
+/// asserts the version tracks the manifest. This pins only the source commit -
+/// pip/npm build deps still float and there is no build checksum.
+const MACOS_PINNED_GIT_COMMIT: &[(&str, &str, &str)] = &[(
+    "hermes-agent",
+    "2026.6.19",
+    "2bd1977d8fad185c9b4be47884f7e87f1add0ce3",
+)];
+
+/// The theyos-pinned git commit SHA for `claw`, or an error if absent.
+fn pinned_git_commit(claw: &str) -> Result<&'static str, VZError> {
+    MACOS_PINNED_GIT_COMMIT
+        .iter()
+        .find(|(c, _, _)| *c == claw)
+        .map(|(_, _, sha)| *sha)
+        .ok_or_else(|| VZError::InvalidConfig(format!("no pinned git commit for claw: {claw}")))
+}
+
 /// Build the shell command that installs `claw_type`'s binary inside a macOS
 /// guest VM, or an error for an unknown claw.
 ///
@@ -112,10 +133,12 @@ fn macos_install_command(claw_type: &str) -> Result<String, VZError> {
             )
         }
         "hermes-agent" => {
-            // Pinned to the manifest version's git tag (was a HEAD `git clone`).
-            // This pins only the source checkout - pip/npm build deps still float
-            // and there is no checksum (source build), so it is a partial pin.
+            // Pinned to the manifest version's git tag, with the checked-out
+            // commit verified against a theyos-pinned SHA (the tag is mutable,
+            // the commit is not - a re-pointed tag fails closed before building).
+            // Still a partial pin: pip/npm build deps float, no build checksum.
             let v = manifest_version("hermes-agent")?;
+            let commit = pinned_git_commit("hermes-agent")?;
             format!(
                 r#"export PATH=/opt/homebrew/bin:/usr/local/bin:$HOME/.local/bin:$PATH && \
              mkdir -p /opt/claws /usr/local/bin /opt/data /var/root/.hermes && \
@@ -125,6 +148,7 @@ fn macos_install_command(claw_type: &str) -> Result<String, VZError> {
                git clone --depth 1 --branch v{v} https://github.com/NousResearch/hermes-agent /opt/claws/hermes-agent; \
              fi && \
              cd /opt/claws/hermes-agent && \
+             test "$(git rev-parse HEAD)" = "{commit}" && \
              python3 -m pip install --break-system-packages --no-cache-dir --ignore-installed -e ".[all]" && \
              npm install --prefer-offline --no-audit || true; \
              HERMES_BIN=$(command -v hermes 2>/dev/null || true); \
@@ -440,6 +464,42 @@ mod tests {
             if let Some(i) = cmd.find("install -m 755") {
                 assert!(verify < i, "{claw}: checksum must precede install");
             }
+        }
+    }
+
+    #[test]
+    fn macos_pinned_git_commit_matches_manifest_and_is_well_formed() {
+        for &(claw, version, commit) in MACOS_PINNED_GIT_COMMIT {
+            // A version bump must re-pin the commit SHA.
+            assert_eq!(
+                version,
+                core_rs::manifest::get(claw)
+                    .expect("claw in manifest")
+                    .version,
+                "{claw}: MACOS_PINNED_GIT_COMMIT version is stale vs the manifest"
+            );
+            // A git SHA-1 commit is 40 lowercase hex.
+            assert_eq!(commit.len(), 40, "{claw}: commit sha must be 40 hex chars");
+            assert!(
+                commit
+                    .bytes()
+                    .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')),
+                "{claw}: commit sha must be lowercase hex"
+            );
+            // The command embeds the commit and verifies it before building.
+            let cmd = macos_install_command(claw).expect("supported claw");
+            assert!(
+                cmd.contains(commit),
+                "{claw}: command must embed the pinned commit"
+            );
+            let verify = cmd
+                .find("git rev-parse HEAD")
+                .expect("commit verify present");
+            let build = cmd.find("pip install").expect("build present");
+            assert!(
+                verify < build,
+                "{claw}: commit verify must precede the build"
+            );
         }
     }
 

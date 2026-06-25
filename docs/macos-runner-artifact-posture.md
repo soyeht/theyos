@@ -29,10 +29,11 @@ build/run time via `core_rs::manifest::get` (single source of truth). The pinned
 download tag/package was verified to exist upstream with the expected macOS-arm64
 asset.
 
-hermes-agent pins its git tag (`git clone --branch v<ver>`) instead of cloning
-HEAD. This is a partial pin: only the source checkout is frozen - its pip/npm
-build dependencies still resolve at build time, and there is no checksum (it
-builds from source).
+hermes-agent pins its git tag (`git clone --branch v<ver>`) and verifies the
+checked-out commit against a theyos-pinned commit SHA (the tag is mutable, the
+commit is not), so a re-pointed tag fails closed before building. This is still a
+partial pin: only the source commit is frozen - its pip/npm build dependencies
+still resolve at build time, and there is no build checksum.
 
 Four claws verify an integrity checksum before extracting (fail-closed on
 mismatch): ironclaw against its upstream `.sha256`, and picoclaw, nullclaw and
@@ -49,7 +50,7 @@ and openclaw rely on pip/npm registry integrity; hermes-agent builds from source
 | nanobot      | `pip3 install nanobot-ai==<ver>`              | manifest (`0.1.5`)     | registry transport only | pinned |
 | zeroclaw     | curl GitHub `releases/download/v<ver>` tar.gz | manifest (`v0.8.1`)    | theyos-pinned sha256 verified | pinned + checksum |
 | openclaw     | `npm install -g openclaw@<ver>`               | manifest (`2026.6.10`) | registry transport only | pinned |
-| hermes-agent | `git clone --branch v<ver>` tag + pip -e + npm | manifest (`2026.6.19`) | git transport (source build) | pinned (partial) |
+| hermes-agent | `git clone --branch v<ver>` tag + commit verify + pip -e + npm | manifest (`2026.6.19`) | git tag + commit-SHA verified (source build) | pinned (partial) |
 
 zeroclaw and openclaw were pinned in S11-D-1: their stale manifest versions
 (`0.1.9`, `2026.4.6`) were corrected to the current upstream latest the installer
@@ -78,9 +79,10 @@ Notes:
 ## Version pin follow-up
 
 Done: all seven macOS claws are version-pinned. hermes-agent's pin is partial
-(source tag only; pip/npm build deps still float). A manifest version bump for
-any claw must re-verify the upstream tag/package (and, for ironclaw, the
-`.sha256`) before landing.
+(source commit verified, but pip/npm build deps still float). A manifest version
+bump for any claw must re-verify the upstream tag/package before landing - and
+re-pin the sha256 (ironclaw + picoclaw/nullclaw/zeroclaw) or the commit SHA
+(hermes-agent) accordingly.
 
 ## Checksum follow-up
 
