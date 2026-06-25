@@ -78,6 +78,7 @@ pub mod software_fallback {
     use std::path::{Path, PathBuf};
 
     use super::KeystoreError;
+    use zeroize::Zeroize;
 
     fn secrets_dir(state_dir: &Path) -> PathBuf {
         state_dir.join("household").join("secrets")
@@ -87,13 +88,34 @@ pub mod software_fallback {
         secrets_dir(state_dir).join(format!("{account}.bin"))
     }
 
+    /// Create `dir` if missing and, on unix, restrict it to owner-only `0o700`.
+    /// Idempotent: also tightens an already-existing directory whose mode is
+    /// more permissive, so installs created under a looser umask before this
+    /// guard existed get repaired on the next write. The scalar file itself is
+    /// already written `0o600`; this stops the secrets directory from being
+    /// listable by other local users (which would leak the account labels, i.e.
+    /// which household / machine ids exist).
+    fn ensure_private_dir(dir: &Path) -> std::io::Result<()> {
+        fs::create_dir_all(dir)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = fs::metadata(dir)?.permissions();
+            if perms.mode() & 0o777 != 0o700 {
+                perms.set_mode(0o700);
+                fs::set_permissions(dir, perms)?;
+            }
+        }
+        Ok(())
+    }
+
     pub fn write_secret_scalar(
         state_dir: &Path,
         account: &str,
         scalar: &[u8; 32],
     ) -> Result<(), KeystoreError> {
         let dir = secrets_dir(state_dir);
-        if let Err(e) = fs::create_dir_all(&dir) {
+        if let Err(e) = ensure_private_dir(&dir) {
             return Err(KeystoreError::Io {
                 kind: e.kind().to_string(),
                 hint: format!("create {}: {e}", dir.display()),
@@ -144,14 +166,19 @@ pub mod software_fallback {
             hint: format!("read {}: {e}", path.display()),
         })?;
         if bytes.len() != 32 {
-            return Err(KeystoreError::InvalidKeyMaterial(format!(
+            let err = KeystoreError::InvalidKeyMaterial(format!(
                 "expected 32-byte scalar in {}, got {}",
                 path.display(),
                 bytes.len()
-            )));
+            ));
+            bytes.zeroize();
+            return Err(err);
         }
         let mut out = [0u8; 32];
         out.copy_from_slice(&bytes);
+        // Wipe the heap copy of the scalar before returning. `out` is the
+        // caller-owned result; its key type zeroizes on its own drop.
+        bytes.zeroize();
         Ok(out)
     }
 
@@ -271,5 +298,65 @@ mod tests {
         let m = MachineId(format!("m_{}", base32_lower_nopad_encode(&[7u8; 32])));
         assert!(hh_priv_account(&hh).starts_with("household.private_key.hh_"));
         assert!(m_priv_account(&m).starts_with("machine.private_key.m_"));
+    }
+
+    #[test]
+    fn software_fallback_read_round_trip() {
+        let td = tempfile::tempdir().unwrap();
+        let scalar = [9u8; 32];
+        software_fallback::write_secret_scalar(td.path(), "household.private_key.hh_rt", &scalar)
+            .unwrap();
+        let got = software_fallback::read_secret_scalar(td.path(), "household.private_key.hh_rt")
+            .unwrap();
+        assert_eq!(got, scalar);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn software_fallback_write_uses_owner_only_perms() {
+        use std::os::unix::fs::PermissionsExt;
+        let td = tempfile::tempdir().unwrap();
+        software_fallback::write_secret_scalar(td.path(), "machine.private_key.m_perm", &[7u8; 32])
+            .unwrap();
+
+        let file = td
+            .path()
+            .join("household")
+            .join("secrets")
+            .join("machine.private_key.m_perm.bin");
+        let dir = td.path().join("household").join("secrets");
+        assert_eq!(
+            std::fs::metadata(&file).unwrap().permissions().mode() & 0o777,
+            0o600,
+            "scalar file must be owner-only"
+        );
+        assert_eq!(
+            std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777,
+            0o700,
+            "secrets dir must be owner-only (not listable by other local users)"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn software_fallback_tightens_preexisting_loose_dir() {
+        use std::os::unix::fs::PermissionsExt;
+        let td = tempfile::tempdir().unwrap();
+        let dir = td.path().join("household").join("secrets");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o777)).unwrap();
+
+        software_fallback::write_secret_scalar(
+            td.path(),
+            "household.private_key.hh_tight",
+            &[3u8; 32],
+        )
+        .unwrap();
+
+        assert_eq!(
+            std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777,
+            0o700,
+            "a pre-existing permissive secrets dir must be tightened on write"
+        );
     }
 }
