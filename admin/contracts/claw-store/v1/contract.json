@@ -511,6 +511,25 @@
       }
     },
     {
+      "id": "household_list_instances",
+      "surface": "household",
+      "method": "GET",
+      "path_template": "/api/v1/household/instances",
+      "auth_kind": "household_pop",
+      "household_operation": "claws.list",
+      "handler": "handlers_household_claws::handle_household_list_instances",
+      "mount": {
+        "file": "admin/rust/server-rs/src/household_bootstrap.rs",
+        "slice": "household_claws_router",
+        "route_literal": "/api/v1/household/instances",
+        "method_helper": "get"
+      },
+      "expectations": {
+        "success": { "status": 200, "fixture": "household_instance_list_empty" },
+        "auth_error": { "status": 401, "fixture": "empty_body" }
+      }
+    },
+    {
       "id": "household_create_instance",
       "surface": "household",
       "method": "POST",
@@ -969,6 +988,11 @@
         "guest_os": "linux"
       },
       "job": null
+    },
+    "household_instance_list_empty": {
+      "data": [],
+      "has_more": false,
+      "next_cursor": null
     },
     "mobile_household_instance_status_active": {
       "status": "active",
