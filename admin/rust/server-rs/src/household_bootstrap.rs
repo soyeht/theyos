@@ -16,6 +16,7 @@ use crate::claw_share_relay_offer_challenge::RelayOfferChallengeTable;
 use crate::claw_share_relay_stream_abuse::RelayAbuseState;
 use crate::handlers_bootstrap::{BootstrapHandlerState, BootstrapStateArc};
 use crate::handlers_claw_share;
+use crate::handlers_device_pairing;
 use crate::handlers_household;
 use crate::handlers_household_claws;
 use crate::handlers_household_guest_image;
@@ -661,6 +662,36 @@ pub async fn bootstrap_household(shared_state: Option<SharedState>) {
                             .route(
                                 "/api/v1/household/owner-events/{cursor}/decline",
                                 axum::routing::post(handlers_owner_events::owner_decline_handler),
+                            )
+                            .route(
+                                "/api/v1/household/device-pairing/request",
+                                axum::routing::post(
+                                    handlers_device_pairing::device_pairing_request_handler,
+                                ),
+                            )
+                            .route(
+                                "/api/v1/household/device-pairing/approve",
+                                axum::routing::post(
+                                    handlers_device_pairing::device_pairing_approve_handler,
+                                ),
+                            )
+                            .route(
+                                "/api/v1/household/device-pairing/requests",
+                                axum::routing::get(
+                                    handlers_device_pairing::device_pairing_requests_handler,
+                                ),
+                            )
+                            .route(
+                                "/api/v1/household/device-pairing/reject",
+                                axum::routing::post(
+                                    handlers_device_pairing::device_pairing_reject_handler,
+                                ),
+                            )
+                            .route(
+                                "/api/v1/household/device-pairing/{request_id}",
+                                axum::routing::get(
+                                    handlers_device_pairing::device_pairing_poll_handler,
+                                ),
                             )
                             .with_state(owner_events_state),
                     )
