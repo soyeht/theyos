@@ -8,6 +8,7 @@ pub mod artifact_gc;
 pub mod artifact_lock;
 pub mod artifact_meta;
 pub mod artifact_registry;
+pub mod artifact_signature;
 pub mod audit;
 pub mod availability;
 pub mod boot_id;
