@@ -294,6 +294,13 @@ fn classify_instance_failure(
     core_rs::instance_failure::InstanceFailureCode::classify(ipc_code, msg)
 }
 
+fn provisioning_error_summary(
+    error_context: &Option<serde_json::Value>,
+    msg: &str,
+) -> &'static str {
+    classify_instance_failure(error_context, msg).operator_summary()
+}
+
 async fn mark_failed(
     state: &SharedState,
     job_id: &str,
@@ -309,6 +316,7 @@ async fn mark_failed(
     // is consumed below. Always stamped (Unknown included) so the wire contract
     // is stable without inferring by absence.
     let failure_code = classify_instance_failure(&error_context, msg);
+    let provisioning_error = provisioning_error_summary(&error_context, msg);
     // Serialize error_context into the result field so the API can return it.
     let ctx_json = error_context
         .map(error_context_result_string)
@@ -333,12 +341,15 @@ async fn mark_failed(
                 error!("[jobs-worker] failed to update job status: {e}");
             }
         }
-        // Update instance status in DB
+        // Update instance status in DB. The row carries only a sanitized,
+        // path-free per-code summary; raw details stay off the instance row and
+        // status surfaces. Job error records remain raw until the Jobs API
+        // sanitization follow-up lands.
         if let Err(e) = st.instance_db.update_status(&StatusUpdate {
             id: &iid,
             status: InstanceStatus::Failed,
             message: "",
-            error: &m,
+            error: provisioning_error,
             job_id: "",
             phase: "",
         }) {
@@ -532,5 +543,30 @@ mod tests {
             classify_instance_failure(&None, "weird"),
             InstanceFailureCode::Unknown
         );
+    }
+
+    #[test]
+    fn provisioning_error_summary_is_sanitized_for_path_message() {
+        // A raw executor message carrying a local path + stderr.
+        let raw = "Snapshot save failed: /tmp/soyeht-test/snap.vzvmsave: write error";
+        let written = provisioning_error_summary(&None, raw);
+        assert!(!written.contains('/'), "leaked path: {written}");
+        assert!(
+            !written.contains("vzvmsave"),
+            "leaked raw detail: {written}"
+        );
+        // The machine-readable code stays coherent with the classification.
+        assert_eq!(
+            classify_instance_failure(&None, raw).as_str(),
+            "snapshot_failed"
+        );
+    }
+
+    #[test]
+    fn provisioning_error_summary_is_generic_for_unknown() {
+        let written =
+            provisioning_error_summary(&None, "totally unrecognized /tmp/soyeht-test/failure");
+        assert_eq!(written, "instance creation failed");
+        assert!(!written.contains('/'), "leaked path: {written}");
     }
 }

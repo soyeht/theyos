@@ -110,6 +110,25 @@ impl InstanceFailureCode {
         }
         Self::Unknown
     }
+
+    /// A sanitized, path-free operator-facing summary for this code. The copy is
+    /// stable, curated English, and never derived from the raw error string, so
+    /// it is safe to store on the instance row and show on any status surface.
+    /// Raw error detail may carry local paths, IPs, or stderr; keep it out of
+    /// instance rows and status surfaces. Job error records are a separate
+    /// surface until the Jobs API sanitization follow-up lands.
+    #[must_use]
+    pub const fn operator_summary(self) -> &'static str {
+        match self {
+            Self::HostVmLimitReached => "the host reached its macOS VM limit; retry shortly",
+            Self::InsufficientDisk => "the host ran out of disk space",
+            Self::SnapshotFailed => "a VM snapshot operation failed",
+            Self::VmStartFailed => "the VM failed to start",
+            Self::VmCreateFailed => "the VM could not be created",
+            Self::ProvisioningTimeout => "provisioning timed out",
+            Self::Unknown => "instance creation failed",
+        }
+    }
 }
 
 #[cfg(test)]
@@ -225,6 +244,53 @@ mod tests {
         assert_eq!(
             serde_json::to_string(&InstanceFailureCode::VmStartFailed).unwrap(),
             "\"vm_start_failed\""
+        );
+    }
+
+    #[test]
+    fn operator_summary_is_non_empty_and_path_free() {
+        for code in [
+            InstanceFailureCode::HostVmLimitReached,
+            InstanceFailureCode::InsufficientDisk,
+            InstanceFailureCode::SnapshotFailed,
+            InstanceFailureCode::VmStartFailed,
+            InstanceFailureCode::VmCreateFailed,
+            InstanceFailureCode::ProvisioningTimeout,
+            InstanceFailureCode::Unknown,
+        ] {
+            let s = code.operator_summary();
+            assert!(!s.is_empty(), "empty summary for {}", code.as_str());
+            // Path-free / no leaked detail: no path separators or format braces.
+            for bad in ['/', '\\', '{', '}'] {
+                assert!(
+                    !s.contains(bad),
+                    "summary for {} contains `{bad}`: {s}",
+                    code.as_str()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn classify_then_summary_strips_raw_path_detail() {
+        // A raw VZError-style message carrying a local path classifies to a
+        // specific code whose operator_summary is path-free.
+        let raw = "Snapshot save failed: /tmp/soyeht-test/snap.vzvmsave: write error";
+        let code = InstanceFailureCode::classify(None, raw);
+        assert_eq!(code, InstanceFailureCode::SnapshotFailed);
+        let summary = code.operator_summary();
+        assert!(!summary.contains('/'), "summary leaked a path: {summary}");
+        assert!(
+            !summary.contains("vzvmsave"),
+            "summary leaked raw detail: {summary}"
+        );
+    }
+
+    #[test]
+    fn unknown_summary_is_generic_not_raw() {
+        assert_eq!(
+            InstanceFailureCode::Unknown.operator_summary(),
+            "instance creation failed"
         );
     }
 }
