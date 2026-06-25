@@ -126,6 +126,18 @@ pub fn error_code_context(code: u32) -> Value {
     Value::Object(context)
 }
 
+/// Extract the machine-readable numeric error code from an IPC error context,
+/// if present. Strict: only an in-range `u32` JSON number is accepted - strings,
+/// floats, garbage, or out-of-range values yield `None` (no permissive parse).
+#[must_use]
+pub fn ipc_code_from_context(error_context: &Option<Value>) -> Option<u32> {
+    error_context
+        .as_ref()
+        .and_then(|ctx| ctx.get(ERROR_CODE_FIELD))
+        .and_then(Value::as_u64)
+        .and_then(|n| u32::try_from(n).ok())
+}
+
 /// Wrap an IPC error context under the canonical `error_context` field.
 #[must_use]
 pub fn error_context_result(context: Value) -> Value {
@@ -240,6 +252,27 @@ mod tests {
                     "phase": "vm_boot"
                 }
             })
+        );
+    }
+
+    #[test]
+    fn ipc_code_from_context_accepts_only_in_range_u32() {
+        assert_eq!(
+            ipc_code_from_context(&Some(json!({"code": 2001}))),
+            Some(2001)
+        );
+        // Absent context / absent code.
+        assert_eq!(ipc_code_from_context(&None), None);
+        assert_eq!(ipc_code_from_context(&Some(json!({"phase": "x"}))), None);
+        // No permissive parse: a string code is rejected.
+        assert_eq!(ipc_code_from_context(&Some(json!({"code": "2001"}))), None);
+        // Floats and negatives are not u32 integers.
+        assert_eq!(ipc_code_from_context(&Some(json!({"code": 2001.5}))), None);
+        assert_eq!(ipc_code_from_context(&Some(json!({"code": -1}))), None);
+        // Out of u32 range.
+        assert_eq!(
+            ipc_code_from_context(&Some(json!({"code": 5_000_000_000u64}))),
+            None
         );
     }
 }

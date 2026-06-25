@@ -284,6 +284,16 @@ fn build_restart_request(job: &jobs_rs::Job) -> Result<ExecuteFlowRequest, Strin
 
 // ─── Status helpers ───────────────────────────────────────────────────────────
 
+/// Classify a per-instance failure into a sanitized [`InstanceFailureCode`]
+/// from the IPC error context (numeric code, when present) and the message.
+fn classify_instance_failure(
+    error_context: &Option<serde_json::Value>,
+    msg: &str,
+) -> core_rs::instance_failure::InstanceFailureCode {
+    let ipc_code = core_rs::ipc::wire::ipc_code_from_context(error_context);
+    core_rs::instance_failure::InstanceFailureCode::classify(ipc_code, msg)
+}
+
 async fn mark_failed(
     state: &SharedState,
     job_id: &str,
@@ -295,6 +305,10 @@ async fn mark_failed(
     let jid = job_id.to_string();
     let iid = instance_id.to_string();
     let m = msg.to_string();
+    // Classify into a sanitized, machine-readable code before `error_context`
+    // is consumed below. Always stamped (Unknown included) so the wire contract
+    // is stable without inferring by absence.
+    let failure_code = classify_instance_failure(&error_context, msg);
     // Serialize error_context into the result field so the API can return it.
     let ctx_json = error_context
         .map(error_context_result_string)
@@ -329,6 +343,15 @@ async fn mark_failed(
             phase: "",
         }) {
             error!("[jobs-worker] failed to update instance status: {e}");
+        }
+
+        // Best-effort: attach the sanitized failure code. This never masks the
+        // status/job update above; a stamp failure is logged and ignored.
+        if let Err(e) = st
+            .instance_db
+            .set_provisioning_failure_code(&iid, Some(failure_code.as_str()))
+        {
+            error!("[jobs-worker] failed to stamp instance failure code for {iid}: {e}");
         }
 
         if record_create_failed {
@@ -488,6 +511,26 @@ mod tests {
                     "phase": "vm_boot"
                 }
             })
+        );
+    }
+
+    #[test]
+    fn classify_instance_failure_uses_code_then_message() {
+        use core_rs::instance_failure::InstanceFailureCode;
+        // Numeric IPC code wins.
+        assert_eq!(
+            classify_instance_failure(&Some(serde_json::json!({"code": 2001})), "anything"),
+            InstanceFailureCode::HostVmLimitReached
+        );
+        // No code -> message signal.
+        assert_eq!(
+            classify_instance_failure(&None, "Snapshot save failed: x"),
+            InstanceFailureCode::SnapshotFailed
+        );
+        // Unrecognized -> Unknown (always stamped, never absent-by-inference).
+        assert_eq!(
+            classify_instance_failure(&None, "weird"),
+            InstanceFailureCode::Unknown
         );
     }
 }

@@ -123,6 +123,11 @@ struct MobileInstanceInfo {
     provisioning_phase: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     provisioning_error: Option<String>,
+    /// Sanitized machine-readable failure reason (snake_case `InstanceFailureCode`),
+    /// kept for parity with the single-instance status endpoint. Additive and
+    /// absent for the non-failed instances this list currently includes.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    provisioning_failure_code: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -906,6 +911,7 @@ async fn build_instance_list(
                 } else {
                     None
                 },
+                provisioning_failure_code: row.provisioning_failure_code,
             }
         })
         .collect())
@@ -1404,6 +1410,7 @@ pub async fn handle_mobile_instance_status(
             "status": row.status.to_string(),
             "provisioning_message": row.provisioning_message,
             "provisioning_error": row.provisioning_error,
+            "provisioning_failure_code": row.provisioning_failure_code,
             "provisioning_phase": row.provisioning_phase,
         })),
     )

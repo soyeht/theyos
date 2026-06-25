@@ -157,6 +157,10 @@ pub struct InstanceResponse {
     pub provisioning_message: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub provisioning_error: Option<String>,
+    /// Sanitized machine-readable failure reason (snake_case
+    /// `InstanceFailureCode`); present only when the instance failed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provisioning_failure_code: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub provisioning_phase: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -206,6 +210,7 @@ impl InstanceResponse {
             created_at: row.created_at,
             provisioning_message: row.provisioning_message.filter(|s| !s.is_empty()),
             provisioning_error: row.provisioning_error.filter(|s| !s.is_empty()),
+            provisioning_failure_code: row.provisioning_failure_code.filter(|s| !s.is_empty()),
             provisioning_phase: row.provisioning_phase.filter(|s| !s.is_empty()),
             job_id: row.job_id.filter(|s| !s.is_empty()),
             guest_os: row.guest_os,
