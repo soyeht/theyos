@@ -18,75 +18,159 @@ pub(crate) const MAX_NAME_LEN: usize = 64;
 /// Max length of a normalized claw-type, shared by every create path.
 pub(crate) const MAX_CLAW_TYPE_LEN: usize = 32;
 
+/// Outcome of [`rollback_inserted_instance`]: whether the orphaned instance row
+/// was actually removed, or leaked because `delete` failed / the task panicked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RollbackOutcome {
+    /// The inserted row was deleted; no orphan remains.
+    CleanedUp,
+    /// The row could not be deleted and may still exist. The caller's original
+    /// error stays client-facing, but the failure is logged and a best-effort
+    /// second-line attempt marks the row terminally `Failed`.
+    Orphaned,
+}
+
+/// Classify the result of the rollback delete (as returned by `blocking`).
+///
+/// `Ok(Ok(_))` means the delete committed (`CleanedUp`); anything else - a
+/// `delete` error (`Ok(Err)`) or a spawn-blocking join/panic (`Err`) - means the
+/// row may still exist (`Orphaned`). Generic over the error types so it is unit-
+/// testable without constructing `ApiError` / `JoinError`.
+fn classify_rollback_outcome<T, A, B>(result: &Result<Result<T, A>, B>) -> RollbackOutcome {
+    if matches!(result, Ok(Ok(_))) {
+        RollbackOutcome::CleanedUp
+    } else {
+        RollbackOutcome::Orphaned
+    }
+}
+
+/// Best-effort lease cleanup followed by the instance-row delete, operating
+/// directly on the instance DB so it is unit-testable with an in-memory DB.
+///
+/// Releases all resource leases (best-effort), optionally restores the
+/// warm-pool lease (best-effort), then deletes the row and returns that delete
+/// result - the only step whose failure leaves an orphan.
+fn rollback_instance_db(
+    instance_db: &store_rs::InstanceDb,
+    instance_id: &str,
+    restore_warm_pool_lease: bool,
+) -> Result<(), ApiError> {
+    let row = if restore_warm_pool_lease {
+        instance_db.get(instance_id).ok().flatten()
+    } else {
+        None
+    };
+
+    // Release leases first (best-effort).
+    if let Err(e) = instance_db.release_all_leases(LeaseOwnerType::Instance, instance_id) {
+        tracing::warn!(
+            "[create-instance] failed to release leases for {instance_id} during rollback: {e}"
+        );
+    }
+
+    if restore_warm_pool_lease {
+        if let Some(row) = row.as_ref() {
+            if let Err(e) = instance_db.create_lease(&store_rs::NewLease {
+                owner_type: LeaseOwnerType::WarmPool,
+                owner_id: &WarmPoolSlotId::new(&row.claw_type).owner_id(),
+                lease_kind: LeaseKind::Runtime,
+                cpu_cores: row.cpu_cores.unwrap_or(crate::capacity::SLOT_CPU),
+                ram_mb: row.ram_config_mb.unwrap_or(crate::capacity::SLOT_RAM),
+                disk_gb: 0,
+                expires_at: None,
+            }) {
+                tracing::warn!(
+                    "[create-instance] failed to restore warm-pool lease for {instance_id} during rollback: {e}"
+                );
+            }
+        }
+    }
+
+    instance_db.delete(instance_id).map_err(ApiError::from)
+}
+
 /// Best-effort cleanup for an instance row inserted before a later step failed.
 ///
 /// This avoids leaving orphaned `provisioning` rows behind when create flows
-/// fail after `instances.insert_with_leases()` but before the corresponding job is queued.
-/// Releases all resource leases before deleting the row. When the create had
-/// already claimed a warm-pool lease but failed before the executor started, the
-/// warm-pool lease is restored so capacity accounting still matches reality.
+/// fail after `instances.insert_with_leases()` but before the corresponding job
+/// is queued. Releases all resource leases before deleting the row; when the
+/// create had already claimed a warm-pool lease but failed before the executor
+/// started, the warm-pool lease is restored so capacity accounting matches.
+///
+/// Returns [`RollbackOutcome::CleanedUp`] when the row was deleted. When the
+/// delete fails (or the task panics) the row may be orphaned: this logs a
+/// structured error and makes a best-effort second-line attempt to mark the
+/// instance terminally `Failed`, so a leaked row is represented (not a phantom
+/// `provisioning` row) - then returns [`RollbackOutcome::Orphaned`]. The
+/// original create error stays the caller's client-facing cause.
 pub async fn rollback_inserted_instance(
     state: &SharedState,
     instance_id: &str,
     failed_step: &str,
     restore_warm_pool_lease: bool,
-) {
+) -> RollbackOutcome {
     let st = state.clone();
     let iid = instance_id.to_string();
-    match blocking(move || {
-        let row = if restore_warm_pool_lease {
-            st.instance_db.get(&iid).ok().flatten()
-        } else {
-            None
-        };
+    let delete_result =
+        blocking(move || rollback_instance_db(&st.instance_db, &iid, restore_warm_pool_lease))
+            .await;
 
-        // Release leases first (best-effort)
-        if let Err(e) = st
-            .instance_db
-            .release_all_leases(LeaseOwnerType::Instance, &iid)
-        {
-            tracing::warn!(
-                "[create-instance] failed to release leases for {iid} during rollback: {e}"
-            );
-        }
-
-        if restore_warm_pool_lease {
-            if let Some(row) = row.as_ref() {
-                if let Err(e) = st.instance_db.create_lease(&store_rs::NewLease {
-                    owner_type: LeaseOwnerType::WarmPool,
-                    owner_id: &WarmPoolSlotId::new(&row.claw_type).owner_id(),
-                    lease_kind: LeaseKind::Runtime,
-                    cpu_cores: row.cpu_cores.unwrap_or(crate::capacity::SLOT_CPU),
-                    ram_mb: row.ram_config_mb.unwrap_or(crate::capacity::SLOT_RAM),
-                    disk_gb: 0,
-                    expires_at: None,
-                }) {
-                    tracing::warn!(
-                        "[create-instance] failed to restore warm-pool lease for {iid} during rollback: {e}"
-                    );
-                }
-            }
-        }
-        st.instance_db.delete(&iid).map_err(ApiError::from)
-    })
-    .await
-    {
-        Ok(Ok(())) => {
-            tracing::warn!(
-                "[create-instance] rolled back inserted instance {instance_id} after {failed_step} failed"
-            );
-        }
-        Ok(Err(e)) => {
-            tracing::error!(
-                "[create-instance] failed to roll back inserted instance {instance_id} after {failed_step} failed: {e}"
-            );
-        }
-        Err(e) => {
-            tracing::error!(
-                "[create-instance] spawn_blocking failed while rolling back inserted instance {instance_id} after {failed_step} failed: {e}"
-            );
-        }
+    let outcome = classify_rollback_outcome(&delete_result);
+    if outcome == RollbackOutcome::CleanedUp {
+        tracing::warn!(
+            "[create-instance] rolled back inserted instance {instance_id} after {failed_step} failed"
+        );
+        return outcome;
     }
+
+    // Orphaned: surface the failure loudly and try a second-line mark-Failed so
+    // the leaked row is terminal rather than a phantom `provisioning` row.
+    let reason = match &delete_result {
+        Ok(Err(e)) => e.to_string(),
+        Err(e) => format!("rollback task failed: {e}"),
+        Ok(Ok(_)) => String::new(), // unreachable: classified CleanedUp above
+    };
+    tracing::error!(
+        instance_id = %instance_id,
+        failed_step = %failed_step,
+        reason = %reason,
+        "[create-instance] failed to roll back inserted instance; attempting to mark it Failed"
+    );
+
+    // Persist only a sanitized, generic message on the row: the raw delete/join
+    // error may carry internal detail and can surface in UI/status. The raw
+    // reason stays in the structured log above.
+    let sanitized = format!("rollback cleanup failed after {failed_step}; manual cleanup required");
+    let st2 = state.clone();
+    let iid2 = instance_id.to_string();
+    let mark = blocking(move || {
+        st2.instance_db
+            .update_status(&StatusUpdate {
+                id: &iid2,
+                status: InstanceStatus::Failed,
+                message: "",
+                error: &sanitized,
+                job_id: "",
+                phase: "",
+            })
+            .map_err(ApiError::from)
+    })
+    .await;
+    if matches!(mark, Ok(Ok(()))) {
+        tracing::warn!(
+            instance_id = %instance_id,
+            failed_step = %failed_step,
+            "[create-instance] orphaned instance marked Failed after rollback delete failed"
+        );
+    } else {
+        tracing::error!(
+            instance_id = %instance_id,
+            failed_step = %failed_step,
+            "[create-instance] rollback delete failed AND could not mark instance Failed; manual cleanup required"
+        );
+    }
+
+    outcome
 }
 
 /// macOS guest-image admission gate, shared by the admin and mobile/household
@@ -571,6 +655,8 @@ pub(crate) async fn create_instance_core(
         {
             Ok(Ok(_)) => {}
             Ok(Err(e)) | Err(e) => {
+                // Original error stays client-facing; rollback represents any
+                // orphan internally (structured log + best-effort mark-Failed).
                 rollback_inserted_instance(state, &instance_id, "owner assignment", use_warm_pool)
                     .await;
                 return Err(e);
@@ -598,6 +684,8 @@ pub(crate) async fn create_instance_core(
         match blocking(move || st.jobs.create(&mut job).map_err(ApiError::from)).await {
             Ok(Ok(())) => {}
             Ok(Err(e)) | Err(e) => {
+                // Original error stays client-facing; rollback represents any
+                // orphan internally (structured log + best-effort mark-Failed).
                 rollback_inserted_instance(state, &instance_id, "job creation", use_warm_pool)
                     .await;
                 return Err(e);
@@ -702,6 +790,59 @@ mod tests {
                 .expect("object body")
                 .contains_key("guest_image_error"),
             "the gate body must always carry guest_image_error (null when absent)"
+        );
+    }
+
+    // rollback outcome classification + real delete
+
+    #[test]
+    fn classify_rollback_cleaned_up_on_ok_ok() {
+        let r: Result<Result<(), &str>, &str> = Ok(Ok(()));
+        assert_eq!(classify_rollback_outcome(&r), RollbackOutcome::CleanedUp);
+    }
+
+    #[test]
+    fn classify_rollback_orphaned_on_delete_error() {
+        let r: Result<Result<(), &str>, &str> = Ok(Err("delete failed"));
+        assert_eq!(classify_rollback_outcome(&r), RollbackOutcome::Orphaned);
+    }
+
+    #[test]
+    fn classify_rollback_orphaned_on_join_panic() {
+        let r: Result<Result<(), &str>, &str> = Err("join/panic");
+        assert_eq!(classify_rollback_outcome(&r), RollbackOutcome::Orphaned);
+    }
+
+    #[test]
+    fn rollback_instance_db_removes_inserted_row() {
+        use store_rs::{InstanceDb, NewInstance};
+        let db = InstanceDb::open(":memory:").expect("open :memory:");
+        let id = "inst-rollback-test";
+        db.insert(&NewInstance {
+            id,
+            name: "rollme",
+            container: "rollme-1",
+            claw_type: "picoclaw",
+            sunset_date: "2026-12-31",
+            guest_os: None,
+            aux_storage_path: None,
+            cpu_cores: None,
+            ram_config_mb: None,
+            disk_gb: None,
+            household_id: None,
+            household_machine_id: None,
+        })
+        .expect("insert");
+        assert!(
+            db.get(id).unwrap().is_some(),
+            "row should exist before rollback"
+        );
+
+        let result = rollback_instance_db(&db, id, false);
+        assert!(result.is_ok(), "delete should succeed: {result:?}");
+        assert!(
+            db.get(id).unwrap().is_none(),
+            "row should be removed after rollback"
         );
     }
 }
