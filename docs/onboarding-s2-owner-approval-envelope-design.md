@@ -160,6 +160,19 @@ challenge to a digest of the canonical context:
 challenge = SHA-256("soyeht-owner-approval-v2\0" || canonical_cbor(context))
 ```
 
+Implementation gate: the current `webauthn-rs` API generates authentication
+challenges internally and does not expose a public setter for the challenge
+bytes. Do not work around this by hand-rolling COSE/client-data/signature
+verification or by mutating library-internal state. Enforcement can proceed only
+after one of these designs is explicitly approved:
+
+- a safe `webauthn-rs` patch/upgrade/API that lets Soyeht provide the context
+  digest as the WebAuthn challenge while the library still performs assertion
+  verification; or
+- a reviewed design change that stores the expected context digest in
+  server-side challenge state and proves equivalent replay/operation binding
+  without changing the authenticator challenge bytes.
+
 The submitted approval body should carry:
 
 ```rust
