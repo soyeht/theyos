@@ -423,7 +423,7 @@ pub struct InstanceRow {
     pub status: InstanceStatus,
     pub provisioning_message: Option<String>,
     pub provisioning_error: Option<String>,
-    /// Sanitized machine-readable failure reason (a snake_case
+    /// Sanitized machine-readable failure reason (a `snake_case`
     /// `InstanceFailureCode`), stamped when `status == Failed`. `None` for rows
     /// that were never stamped (older rows / non-failed). The raw human detail
     /// stays in `provisioning_error`.

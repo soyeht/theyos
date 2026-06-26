@@ -287,7 +287,7 @@ fn build_restart_request(job: &jobs_rs::Job) -> Result<ExecuteFlowRequest, Strin
 /// Classify a per-instance failure into a sanitized [`InstanceFailureCode`]
 /// from the IPC error context (numeric code, when present) and the message.
 fn classify_instance_failure(
-    error_context: &Option<serde_json::Value>,
+    error_context: Option<&serde_json::Value>,
     msg: &str,
 ) -> core_rs::instance_failure::InstanceFailureCode {
     let ipc_code = core_rs::ipc::wire::ipc_code_from_context(error_context);
@@ -295,7 +295,7 @@ fn classify_instance_failure(
 }
 
 fn provisioning_error_summary(
-    error_context: &Option<serde_json::Value>,
+    error_context: Option<&serde_json::Value>,
     msg: &str,
 ) -> &'static str {
     classify_instance_failure(error_context, msg).operator_summary()
@@ -317,8 +317,8 @@ async fn mark_failed(
     // sanitized, path-free summary used for the instance row, the job error
     // record, and the create_failed event; the raw `msg` stays only in the
     // caller's structured log.
-    let failure_code = classify_instance_failure(&error_context, msg);
-    let provisioning_error = provisioning_error_summary(&error_context, msg);
+    let failure_code = classify_instance_failure(error_context.as_ref(), msg);
+    let provisioning_error = provisioning_error_summary(error_context.as_ref(), msg);
     // Keep the full raw context in host logs only, then strip it to an allow-list
     // of scalar diagnostic fields before persisting it on the public job result:
     // it can carry raw stderr/paths from the executor/runner.
@@ -539,17 +539,17 @@ mod tests {
         use core_rs::instance_failure::InstanceFailureCode;
         // Numeric IPC code wins.
         assert_eq!(
-            classify_instance_failure(&Some(serde_json::json!({"code": 2001})), "anything"),
+            classify_instance_failure(Some(&serde_json::json!({"code": 2001})), "anything"),
             InstanceFailureCode::HostVmLimitReached
         );
         // No code -> message signal.
         assert_eq!(
-            classify_instance_failure(&None, "Snapshot save failed: x"),
+            classify_instance_failure(None, "Snapshot save failed: x"),
             InstanceFailureCode::SnapshotFailed
         );
         // Unrecognized -> Unknown (always stamped, never absent-by-inference).
         assert_eq!(
-            classify_instance_failure(&None, "weird"),
+            classify_instance_failure(None, "weird"),
             InstanceFailureCode::Unknown
         );
     }
@@ -558,7 +558,7 @@ mod tests {
     fn provisioning_error_summary_is_sanitized_for_path_message() {
         // A raw executor message carrying a local path + stderr.
         let raw = "Snapshot save failed: /tmp/soyeht-test/snap.vzvmsave: write error";
-        let written = provisioning_error_summary(&None, raw);
+        let written = provisioning_error_summary(None, raw);
         assert!(!written.contains('/'), "leaked path: {written}");
         assert!(
             !written.contains("vzvmsave"),
@@ -566,7 +566,7 @@ mod tests {
         );
         // The machine-readable code stays coherent with the classification.
         assert_eq!(
-            classify_instance_failure(&None, raw).as_str(),
+            classify_instance_failure(None, raw).as_str(),
             "snapshot_failed"
         );
     }
@@ -574,7 +574,7 @@ mod tests {
     #[test]
     fn provisioning_error_summary_is_generic_for_unknown() {
         let written =
-            provisioning_error_summary(&None, "totally unrecognized /tmp/soyeht-test/failure");
+            provisioning_error_summary(None, "totally unrecognized /tmp/soyeht-test/failure");
         assert_eq!(written, "instance creation failed");
         assert!(!written.contains('/'), "leaked path: {written}");
     }
@@ -584,7 +584,7 @@ mod tests {
         // mark_failed writes this single value to both Job.error and the
         // create_failed instance-event detail, replacing the raw message.
         let raw = "VM start failed: /tmp/soyeht-test/efi.nvram: boot error";
-        let written = provisioning_error_summary(&None, raw);
+        let written = provisioning_error_summary(None, raw);
         assert_eq!(
             written,
             core_rs::instance_failure::InstanceFailureCode::VmStartFailed.operator_summary()
@@ -604,7 +604,7 @@ mod tests {
         // the sanitized summary and `result` is the structured error_context;
         // neither may carry a local path, stderr, or snapshot/file detail.
         let summary =
-            provisioning_error_summary(&None, "VM start failed: /tmp/soyeht-test/efi.nvram: boot");
+            provisioning_error_summary(None, "VM start failed: /tmp/soyeht-test/efi.nvram: boot");
         let result = core_rs::ipc::wire::error_context_result_string(serde_json::json!({
             "code": 2001,
             "command": "slirp_add_hostfwd",
@@ -650,7 +650,7 @@ mod tests {
         );
         let mut job = jobs_rs::Job::new(jobs_rs::JobType::CreateInstance, "inst-test", "{}");
         job.status = jobs_rs::Status::Failed;
-        job.error = Some(provisioning_error_summary(&None, "boom").to_string());
+        job.error = Some(provisioning_error_summary(None, "boom").to_string());
         job.result = Some(result);
 
         let json = serde_json::to_string(&job).unwrap();

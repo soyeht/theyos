@@ -56,7 +56,7 @@ enum Commands {
     Snapshot(SnapshotArgs),
     /// Lightweight smoke test — verifies 7 critical API routes in ~5s (no VMs created).
     Smoke,
-    /// Assisted-live household PoP Claw Store gate.
+    /// Assisted-live household `PoP` Claw Store gate.
     HouseholdPop(HouseholdPopArgs),
 }
 
@@ -249,8 +249,7 @@ async fn main() {
         Some(Commands::Test(args)) => run_test(client, args, ssh_key, state_dir),
         Some(Commands::Benchmark(args)) => run_bench(client, args),
         Some(Commands::Snapshot(args)) => run_snap(client, args, ssh_key, state_dir),
-        Some(Commands::Smoke) => unreachable!("handled above"),
-        Some(Commands::HouseholdPop(_)) => unreachable!("handled above"),
+        Some(Commands::Smoke | Commands::HouseholdPop(_)) => unreachable!("handled above"),
         // Backward compat: bare `e2e-runner` → treat as Test
         None => {
             let args = TestArgs {

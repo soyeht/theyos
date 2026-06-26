@@ -159,7 +159,7 @@ impl OwnerApprovalEnforcementPolicy {
 pub enum OwnerOperationEnforcement {
     /// Preserve the existing v1 owner-PoP approval path.
     LegacyOnly,
-    /// Require v2 only after the owner has at least one active WebAuthn
+    /// Require v2 only after the owner has at least one active `WebAuthn`
     /// credential. Before enrollment exists, fall back to legacy so this flag
     /// cannot brick pair-machine onboarding during migration.
     V2WhenOwnerHasActiveCredential,

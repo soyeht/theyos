@@ -55,7 +55,7 @@ pub struct HouseholdPopArgs {
     )]
     pub test_guest_os: String,
 
-    /// Require HH-CLAW-004 to observe GUEST_IMAGE_NOT_READY instead of SKIP.
+    /// Require HH-CLAW-004 to observe `GUEST_IMAGE_NOT_READY` instead of SKIP.
     #[arg(
         long,
         env = "THEYOS_HH_EXPECT_GUEST_IMAGE_NOT_READY",
@@ -923,7 +923,7 @@ impl HouseholdPopRunner {
 
     fn block_cases(&mut self, ids: &[&'static str], note: &str) {
         for id in ids {
-            self.record(*id, description_for_case(id), CaseStatus::Blocked, note);
+            self.record(id, description_for_case(id), CaseStatus::Blocked, note);
         }
     }
 
@@ -1115,8 +1115,7 @@ enum GateError {
 impl GateError {
     fn status(&self) -> CaseStatus {
         match self {
-            Self::Transport => CaseStatus::Blocked,
-            Self::Signer => CaseStatus::Blocked,
+            Self::Transport | Self::Signer => CaseStatus::Blocked,
         }
     }
 

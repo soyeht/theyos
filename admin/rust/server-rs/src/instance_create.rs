@@ -128,7 +128,7 @@ pub async fn rollback_inserted_instance(
     let reason = match &delete_result {
         Ok(Err(e)) => e.to_string(),
         Err(e) => format!("rollback task failed: {e}"),
-        Ok(Ok(_)) => String::new(), // unreachable: classified CleanedUp above
+        Ok(Ok(())) => String::new(), // unreachable: classified CleanedUp above
     };
     tracing::error!(
         instance_id = %instance_id,

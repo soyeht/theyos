@@ -1,7 +1,7 @@
 //! Owner approval Protocol-v2 primitives.
 //!
 //! This module is intentionally inert: it defines the signed context and
-//! WebAuthn challenge binding used by S2, but does not enforce it on any
+//! `WebAuthn` challenge binding used by S2, but does not enforce it on any
 //! endpoint yet.
 
 use serde::{Deserialize, Serialize};
@@ -197,11 +197,11 @@ impl OwnerApprovalContextV2 {
         validate_capabilities(&self.capabilities)?;
 
         if self.op == OwnerOperation::PairMachineApprove {
-            require_some(self.cursor, "cursor")?;
+            require_some(self.cursor.as_ref(), "cursor")?;
             require_some(self.m_id.as_ref(), "m_id")?;
             require_some(self.addr.as_ref(), "addr")?;
-            require_some(self.transport, "transport")?;
-            require_some(self.ttl_unix, "ttl_unix")?;
+            require_some(self.transport.as_ref(), "transport")?;
+            require_some(self.ttl_unix.as_ref(), "ttl_unix")?;
             require_some(self.nonce.as_ref(), "nonce")?;
             require_some(self.join_request_hash.as_ref(), "join_request_hash")?;
         }
@@ -369,7 +369,7 @@ fn require_snapshot_match(
     }
 }
 
-fn require_some<T>(value: Option<T>, field: &'static str) -> Result<(), OwnerApprovalV2Error> {
+fn require_some<T>(value: Option<&T>, field: &'static str) -> Result<(), OwnerApprovalV2Error> {
     if value.is_some() {
         Ok(())
     } else {

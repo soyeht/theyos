@@ -112,6 +112,9 @@ jobs:
           OPERATIONAL=$(find scripts/ -name '*.sh' -type f \
             ! -path 'scripts/make.sh' \
             ! -path 'scripts/publish-claw-artifact.sh' \
+            ! -path 'scripts/backfill-artifact-manifest-signatures.sh' \
+            ! -path 'scripts/check-artifact-signature-rollout.sh' \
+            ! -path 'scripts/verify-artifact-manifest-signature-urls.sh' \
             ! -path 'scripts/generate-brew-formula.sh' \
             ! -path 'scripts/install-linux.sh' \
             ! -path 'scripts/uninstall-linux.sh' \

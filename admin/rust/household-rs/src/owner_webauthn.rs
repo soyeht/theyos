@@ -2,8 +2,8 @@
 //!
 //! This is intentionally backend-only S1 scaffolding: it owns RP configuration,
 //! server-side challenge state, replay/TTL semantics, and sign-count policy. UI,
-//! Protocol-v2 envelopes, IdP federation, and persistence wiring are separate
-//! slices. The WebAuthn ceremonies themselves are delegated to `webauthn-rs`;
+//! Protocol-v2 envelopes, `IdP` federation, and persistence wiring are separate
+//! slices. The `WebAuthn` ceremonies themselves are delegated to `webauthn-rs`;
 //! we do not hand-roll COSE, client-data, or assertion verification.
 
 use std::collections::HashMap;
@@ -89,8 +89,8 @@ pub struct OwnerWebauthnChallengeId(String);
 impl OwnerWebauthnChallengeId {
     /// Generate a non-secret handle for server-side challenge state.
     ///
-    /// This ID is not the WebAuthn challenge itself; it is a lookup key into the
-    /// server-side store. The opaque WebAuthn state remains server-side.
+    /// This ID is not the `WebAuthn` challenge itself; it is a lookup key into
+    /// the server-side store. The opaque `WebAuthn` state remains server-side.
     pub fn random(rng: &mut impl RngCore) -> Self {
         let mut bytes = [0_u8; 16];
         rng.fill_bytes(&mut bytes);

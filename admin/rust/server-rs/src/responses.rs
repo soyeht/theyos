@@ -157,7 +157,7 @@ pub struct InstanceResponse {
     pub provisioning_message: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub provisioning_error: Option<String>,
-    /// Sanitized machine-readable failure reason (snake_case
+    /// Sanitized machine-readable failure reason (`snake_case`
     /// `InstanceFailureCode`); present only when the instance failed.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub provisioning_failure_code: Option<String>,

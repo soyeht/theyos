@@ -123,7 +123,7 @@ struct MobileInstanceInfo {
     provisioning_phase: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     provisioning_error: Option<String>,
-    /// Sanitized machine-readable failure reason (snake_case `InstanceFailureCode`),
+    /// Sanitized machine-readable failure reason (`snake_case` `InstanceFailureCode`),
     /// kept for parity with the single-instance status endpoint. Additive and
     /// absent for the non-failed instances this list currently includes.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1241,7 +1241,7 @@ pub async fn handle_resource_options(
     let username = extract_mobile_bearer(&state, &headers)?;
     require_mobile_admin(&state, &username).await?;
 
-    resource_options_response(state).await
+    Ok(resource_options_response(&state))
 }
 
 /// GET /api/v1/resource-options — available resource ranges (admin-session only).
@@ -1254,10 +1254,10 @@ pub async fn handle_admin_resource_options(
     State(state): State<SharedState>,
     AdminUser(_auth): AdminUser,
 ) -> Result<Response, ApiError> {
-    resource_options_response(state).await
+    Ok(resource_options_response(&state))
 }
 
-async fn resource_options_response(state: SharedState) -> Result<Response, ApiError> {
+fn resource_options_response(state: &SharedState) -> Response {
     // Compute capacity projection (single source of truth, includes warm pool)
     let disk_path = core_rs::host_resources::resolve_instance_disk_path();
     let host = core_rs::host_resources::detect_all(&disk_path).ok();
@@ -1295,10 +1295,10 @@ async fn resource_options_response(state: SharedState) -> Result<Response, ApiEr
         cfg!(target_os = "macos"),
     ) {
         Ok(options) => options,
-        Err(cap_err) => return Ok(resource_options_capacity_response(&cap_err)),
+        Err(cap_err) => return resource_options_capacity_response(&cap_err),
     };
 
-    Ok((StatusCode::OK, Json(options)).into_response())
+    (StatusCode::OK, Json(options)).into_response()
 }
 
 // ─── Create Instance (mobile) ────────────────────────────────────────────────
