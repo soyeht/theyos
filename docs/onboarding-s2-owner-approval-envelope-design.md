@@ -153,25 +153,38 @@ just a one-time review artifact.
 
 ## WebAuthn Binding
 
-WebAuthn does not sign arbitrary CBOR directly. S2 should set the WebAuthn
-challenge to a digest of the canonical context:
+The current `webauthn-rs` / `webauthn-rs-core` API generates authentication
+challenges internally. Its challenge constructor and authentication-state
+challenge field are crate-private, and `authenticate_credential` verifies only
+against the state emitted by the library. Do not fork the crate, hand-roll
+COSE/client-data/signature verification, or mutate library-internal state by
+serde/field injection just to supply custom challenge bytes.
+
+S2 therefore uses server-side challenge-state binding:
+
+- `webauthn-rs` still issues the opaque random WebAuthn challenge `R`;
+- at issue time, the server writes one atomic challenge-state record binding
+  `R` / challenge id to the canonical context bytes, challenge digest,
+  operation, credential policy, replay nonce, and expiry;
+- at finish time, the library verifies the assertion over `R`;
+- the server then requires byte-equality between `body.context`, the context
+  rebuilt from trusted live state, and the context stored with `R`;
+- only after that does the handler reassert the live window under
+  `BOOTSTRAP_MUTATION_LOCK` and mutate state.
+
+This means the context binding in S2 is enforced by security-critical server
+state, not directly by the WebAuthn signature. The signature proves owner
+presence/consent over the fresh challenge `R`; the server-side `R` to context
+record makes that consent operation-specific. The record must be single-use,
+TTL-bound to no later than the join window, and consumed without a replay window
+once verification succeeds.
+
+The deterministic context digest remains the SSOT for cross-language fixtures
+and stored challenge metadata:
 
 ```text
-challenge = SHA-256("soyeht-owner-approval-v2\0" || canonical_cbor(context))
+context_digest = SHA-256("soyeht-owner-approval-v2\0" || canonical_cbor(context))
 ```
-
-Implementation gate: the current `webauthn-rs` API generates authentication
-challenges internally and does not expose a public setter for the challenge
-bytes. Do not work around this by hand-rolling COSE/client-data/signature
-verification or by mutating library-internal state. Enforcement can proceed only
-after one of these designs is explicitly approved:
-
-- a safe `webauthn-rs` patch/upgrade/API that lets Soyeht provide the context
-  digest as the WebAuthn challenge while the library still performs assertion
-  verification; or
-- a reviewed design change that stores the expected context digest in
-  server-side challenge state and proves equivalent replay/operation binding
-  without changing the authenticator challenge bytes.
 
 The submitted approval body should carry:
 
@@ -191,13 +204,18 @@ pub struct OwnerApprovalV2 {
 Verification order:
 
 1. Decode canonical CBOR and reject non-canonical encodings.
-2. Rebuild the expected context from trusted server/window state.
-3. Require byte-equality with `body.context`.
-4. Recompute the challenge digest from canonical context bytes.
-5. Verify the WebAuthn assertion using S1, enforcing RP ID, origin,
+2. Verify the WebAuthn assertion using S1, enforcing RP ID, origin,
    single-use challenge, TTL, active credential, revoked credential rejection,
    and sign-count policy.
-6. Only then enter the existing prepare/finalize transaction under
+3. Look up and consume the server-side challenge-state record for `R`.
+4. Rebuild the expected context from trusted server/window state.
+5. Require byte-equality between `body.context`, the rebuilt context, and the
+   canonical context bytes stored with `R`.
+6. Recompute the context digest from canonical context bytes and require it to
+   match the digest stored with `R`.
+7. Reassert the live window/cursor/join request under
+   `BOOTSTRAP_MUTATION_LOCK`.
+8. Only then enter the existing prepare/finalize transaction under
    `BOOTSTRAP_MUTATION_LOCK`.
 
 The assertion itself remains opaque to local code outside the S1 verifier. Do
@@ -213,9 +231,11 @@ Replay rejection comes from the S1 challenge store consuming the challenge on
 first successful verification. A second approval body with the same WebAuthn
 assertion must be rejected before any state mutation.
 
-The single-use challenge store is keyed by the challenge digest, not by a caller
-supplied cursor or nonce alone. Submitting the same context/assertion a second
-time must miss the consumed challenge and fail closed.
+The single-use challenge store is keyed by the server-issued challenge id for
+the opaque WebAuthn challenge `R`; it stores the context digest as metadata and
+never trusts a caller-supplied cursor or nonce alone. Submitting the same
+context/assertion a second time must miss the consumed challenge and fail
+closed.
 
 ## Endpoint Integration
 

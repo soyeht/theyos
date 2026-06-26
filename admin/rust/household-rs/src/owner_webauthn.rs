@@ -17,6 +17,8 @@ use webauthn_rs::prelude::{
     RequestChallengeResponse, Url, Uuid, Webauthn, WebauthnBuilder, WebauthnError,
 };
 
+use crate::owner_approval_v2::{OwnerApprovalContextV2, OwnerOperation};
+
 const DEFAULT_CHALLENGE_TTL: Duration = Duration::from_secs(5 * 60);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -228,14 +230,85 @@ pub enum OwnerWebauthnError {
     CredentialRevoked,
     #[error("authentication credential did not match stored credential")]
     CredentialMismatch,
+    #[error("challenge is not bound to owner approval context")]
+    ChallengeContextMissing,
+    #[error("challenge is bound to owner approval context")]
+    ChallengeContextUnexpected,
+    #[error("owner approval context does not match challenge state")]
+    ChallengeContextMismatch,
+    #[error("owner approval context failed validation: {0}")]
+    ChallengeContext(String),
     #[error("signature counter regressed: previous={previous}, next={next}")]
     SignCountRegression { previous: u32, next: u32 },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OwnerWebauthnContextBinding {
+    operation: OwnerOperation,
+    canonical_context: Vec<u8>,
+    expected_context_digest: [u8; 32],
+}
+
+impl OwnerWebauthnContextBinding {
+    pub fn from_context(context: &OwnerApprovalContextV2) -> Result<Self, OwnerWebauthnError> {
+        let canonical_context = context
+            .to_canonical_bytes()
+            .map_err(|e| OwnerWebauthnError::ChallengeContext(e.to_string()))?;
+        let expected_context_digest = context
+            .challenge_digest()
+            .map_err(|e| OwnerWebauthnError::ChallengeContext(e.to_string()))?;
+        Ok(Self {
+            operation: context.op,
+            canonical_context,
+            expected_context_digest,
+        })
+    }
+
+    #[must_use]
+    pub fn operation(&self) -> OwnerOperation {
+        self.operation
+    }
+
+    #[must_use]
+    pub fn canonical_context(&self) -> &[u8] {
+        &self.canonical_context
+    }
+
+    #[must_use]
+    pub fn expected_context_digest(&self) -> [u8; 32] {
+        self.expected_context_digest
+    }
+
+    fn require_context(
+        &self,
+        submitted_context: &OwnerApprovalContextV2,
+    ) -> Result<(), OwnerWebauthnError> {
+        let submitted = submitted_context
+            .to_canonical_bytes()
+            .map_err(|e| OwnerWebauthnError::ChallengeContext(e.to_string()))?;
+        if submitted != self.canonical_context {
+            return Err(OwnerWebauthnError::ChallengeContextMismatch);
+        }
+        let submitted_digest = submitted_context
+            .challenge_digest()
+            .map_err(|e| OwnerWebauthnError::ChallengeContext(e.to_string()))?;
+        if submitted_digest != self.expected_context_digest {
+            return Err(OwnerWebauthnError::ChallengeContextMismatch);
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug)]
 enum ChallengeState {
     Registration(PasskeyRegistration),
-    Authentication(PasskeyAuthentication),
+    Authentication(StoredAuthenticationChallenge),
+}
+
+#[derive(Debug)]
+struct StoredAuthenticationChallenge {
+    state: PasskeyAuthentication,
+    context_binding: Option<OwnerWebauthnContextBinding>,
 }
 
 #[derive(Debug)]
@@ -279,13 +352,17 @@ impl OwnerWebauthnChallengeStore {
         &mut self,
         challenge_id: OwnerWebauthnChallengeId,
         state: PasskeyAuthentication,
+        context_binding: Option<OwnerWebauthnContextBinding>,
         expires_at_unix: u64,
     ) {
         self.challenges.insert(
             challenge_id,
             StoredChallenge {
                 expires_at_unix,
-                state: ChallengeState::Authentication(state),
+                state: ChallengeState::Authentication(StoredAuthenticationChallenge {
+                    state,
+                    context_binding,
+                }),
             },
         );
     }
@@ -308,11 +385,12 @@ impl OwnerWebauthnChallengeStore {
         }
     }
 
+    #[cfg(test)]
     fn take_authentication(
         &mut self,
         challenge_id: &OwnerWebauthnChallengeId,
         now_unix: u64,
-    ) -> Result<PasskeyAuthentication, OwnerWebauthnError> {
+    ) -> Result<StoredAuthenticationChallenge, OwnerWebauthnError> {
         let stored = self
             .challenges
             .remove(challenge_id)
@@ -320,6 +398,45 @@ impl OwnerWebauthnChallengeStore {
         if now_unix > stored.expires_at_unix {
             return Err(OwnerWebauthnError::ChallengeExpired);
         }
+        match stored.state {
+            ChallengeState::Authentication(state) => Ok(state),
+            ChallengeState::Registration(_) => Err(OwnerWebauthnError::ChallengeKindMismatch),
+        }
+    }
+
+    fn authentication(
+        &mut self,
+        challenge_id: &OwnerWebauthnChallengeId,
+        now_unix: u64,
+    ) -> Result<&StoredAuthenticationChallenge, OwnerWebauthnError> {
+        let expires_at_unix = self
+            .challenges
+            .get(challenge_id)
+            .ok_or(OwnerWebauthnError::ChallengeNotFound)?
+            .expires_at_unix;
+        if now_unix > expires_at_unix {
+            self.challenges.remove(challenge_id);
+            return Err(OwnerWebauthnError::ChallengeExpired);
+        }
+        match &self
+            .challenges
+            .get(challenge_id)
+            .ok_or(OwnerWebauthnError::ChallengeNotFound)?
+            .state
+        {
+            ChallengeState::Authentication(state) => Ok(state),
+            ChallengeState::Registration(_) => Err(OwnerWebauthnError::ChallengeKindMismatch),
+        }
+    }
+
+    fn consume_authentication(
+        &mut self,
+        challenge_id: &OwnerWebauthnChallengeId,
+    ) -> Result<StoredAuthenticationChallenge, OwnerWebauthnError> {
+        let stored = self
+            .challenges
+            .remove(challenge_id)
+            .ok_or(OwnerWebauthnError::ChallengeNotFound)?;
         match stored.state {
             ChallengeState::Authentication(state) => Ok(state),
             ChallengeState::Registration(_) => Err(OwnerWebauthnError::ChallengeKindMismatch),
@@ -412,6 +529,27 @@ impl OwnerWebauthnRp {
         now_unix: u64,
         credentials: &[OwnerWebauthnCredential],
     ) -> Result<(OwnerWebauthnChallengeId, RequestChallengeResponse), OwnerWebauthnError> {
+        self.start_assertion_with_binding(rng, now_unix, credentials, None)
+    }
+
+    pub fn start_owner_approval_assertion(
+        &mut self,
+        rng: &mut impl RngCore,
+        now_unix: u64,
+        credentials: &[OwnerWebauthnCredential],
+        expected_context: &OwnerApprovalContextV2,
+    ) -> Result<(OwnerWebauthnChallengeId, RequestChallengeResponse), OwnerWebauthnError> {
+        let context_binding = OwnerWebauthnContextBinding::from_context(expected_context)?;
+        self.start_assertion_with_binding(rng, now_unix, credentials, Some(context_binding))
+    }
+
+    fn start_assertion_with_binding(
+        &mut self,
+        rng: &mut impl RngCore,
+        now_unix: u64,
+        credentials: &[OwnerWebauthnCredential],
+        context_binding: Option<OwnerWebauthnContextBinding>,
+    ) -> Result<(OwnerWebauthnChallengeId, RequestChallengeResponse), OwnerWebauthnError> {
         let active_credentials = credentials
             .iter()
             .filter(|credential| !credential.is_revoked())
@@ -428,6 +566,7 @@ impl OwnerWebauthnRp {
         self.challenges.insert_authentication(
             id.clone(),
             state,
+            context_binding,
             now_unix + self.config.challenge_ttl().as_secs(),
         );
         Ok((id, challenge))
@@ -443,13 +582,42 @@ impl OwnerWebauthnRp {
         if credential.is_revoked() {
             return Err(OwnerWebauthnError::CredentialRevoked);
         }
-        let state = self
-            .challenges
-            .take_authentication(challenge_id, now_unix)?;
-        let result = self
-            .webauthn
-            .finish_passkey_authentication(assertion, &state)
-            .map_err(OwnerWebauthnError::Ceremony)?;
+        let result = {
+            let stored_challenge = self.challenges.authentication(challenge_id, now_unix)?;
+            if stored_challenge.context_binding.is_some() {
+                return Err(OwnerWebauthnError::ChallengeContextUnexpected);
+            }
+            self.webauthn
+                .finish_passkey_authentication(assertion, &stored_challenge.state)
+                .map_err(OwnerWebauthnError::Ceremony)?
+        };
+        let stored_challenge = self.challenges.consume_authentication(challenge_id)?;
+        debug_assert!(stored_challenge.context_binding.is_none());
+        credential.apply_authentication_result(&result)
+    }
+
+    pub fn finish_owner_approval_assertion(
+        &mut self,
+        now_unix: u64,
+        challenge_id: &OwnerWebauthnChallengeId,
+        assertion: &PublicKeyCredential,
+        credential: &mut OwnerWebauthnCredential,
+        submitted_context: &OwnerApprovalContextV2,
+    ) -> Result<(), OwnerWebauthnError> {
+        if credential.is_revoked() {
+            return Err(OwnerWebauthnError::CredentialRevoked);
+        }
+        let result = {
+            let stored_challenge = self.challenges.authentication(challenge_id, now_unix)?;
+            self.webauthn
+                .finish_passkey_authentication(assertion, &stored_challenge.state)
+                .map_err(OwnerWebauthnError::Ceremony)?
+        };
+        let stored_challenge = self.challenges.consume_authentication(challenge_id)?;
+        let context_binding = stored_challenge
+            .context_binding
+            .ok_or(OwnerWebauthnError::ChallengeContextMissing)?;
+        context_binding.require_context(submitted_context)?;
         credential.apply_authentication_result(&result)
     }
 }
@@ -465,6 +633,10 @@ pub fn validate_next_sign_count(previous: u32, next: u32) -> Result<(), OwnerWeb
 mod tests {
     use std::time::Duration;
 
+    use crate::ids::{HouseholdId, MachineId};
+    use crate::machine_cert::PersonId;
+    use crate::owner_approval_v2::{OwnerApprovalContextV2, PairMachineApprovalContextInput};
+    use crate::pair_machine::{JoinTransport, join_request_hash};
     use rand::SeedableRng;
     use rand::rngs::StdRng;
     use serde_json::json;
@@ -524,6 +696,36 @@ mod tests {
 
     fn synthetic_credential(id: &[u8]) -> OwnerWebauthnCredential {
         OwnerWebauthnCredential::new(synthetic_passkey(id))
+    }
+
+    fn household_id() -> HouseholdId {
+        HouseholdId::parse(format!("hh_{}", "a".repeat(52))).unwrap()
+    }
+
+    fn machine_id() -> MachineId {
+        MachineId::parse(format!("m_{}", "b".repeat(52))).unwrap()
+    }
+
+    fn owner_person_id() -> PersonId {
+        PersonId("p_owner-alpha".to_string())
+    }
+
+    fn owner_approval_context(join_request_bytes: &[u8]) -> OwnerApprovalContextV2 {
+        OwnerApprovalContextV2::pair_machine_approve(PairMachineApprovalContextInput {
+            hh_id: household_id(),
+            owner_p_id: owner_person_id(),
+            cursor: 7,
+            m_id: machine_id(),
+            addr: "192.0.2.10:8091".to_string(),
+            transport: JoinTransport::Lan,
+            ttl_unix: NOW + 60,
+            nonce: [0x11; 32],
+            join_request_hash: join_request_hash(join_request_bytes),
+            capabilities: vec!["machine-cert".to_string(), "shamir-2pc".to_string()],
+            issued_at: NOW,
+            expires_at: NOW + 60,
+            replay_nonce: [0x22; 32],
+        })
     }
 
     fn register_with_softpasskey(
@@ -728,6 +930,165 @@ mod tests {
 
         let replay = rp.finish_assertion(NOW + 1, &challenge_id, &assertion, &mut credential);
         assert!(matches!(replay, Err(OwnerWebauthnError::ChallengeNotFound)));
+    }
+
+    #[test]
+    fn owner_approval_assertion_requires_bound_context_bytes() {
+        let mut rp = rp();
+        let mut rng = StdRng::seed_from_u64(50);
+        let (mut credential, mut authenticator) = register_with_softpasskey(&mut rp, &mut rng);
+        let expected_context = owner_approval_context(b"join request A");
+
+        let (challenge_id, challenge) = rp
+            .start_owner_approval_assertion(
+                &mut rng,
+                NOW + 1,
+                &[credential.clone()],
+                &expected_context,
+            )
+            .unwrap();
+        let assertion = authenticator
+            .do_authentication(Url::parse("https://alpha.example.test").unwrap(), challenge)
+            .unwrap();
+
+        rp.finish_owner_approval_assertion(
+            NOW + 1,
+            &challenge_id,
+            &assertion,
+            &mut credential,
+            &expected_context,
+        )
+        .unwrap();
+        assert_eq!(rp.challenge_store_len(), 0);
+
+        let replay = rp.finish_owner_approval_assertion(
+            NOW + 1,
+            &challenge_id,
+            &assertion,
+            &mut credential,
+            &expected_context,
+        );
+        assert!(matches!(replay, Err(OwnerWebauthnError::ChallengeNotFound)));
+    }
+
+    #[test]
+    fn owner_approval_assertion_rejects_context_a_challenge_with_context_b_body() {
+        let mut rp = rp();
+        let mut rng = StdRng::seed_from_u64(51);
+        let (mut credential, mut authenticator) = register_with_softpasskey(&mut rp, &mut rng);
+        let expected_context = owner_approval_context(b"join request A");
+        let submitted_context = owner_approval_context(b"join request B");
+
+        let (challenge_id, challenge) = rp
+            .start_owner_approval_assertion(
+                &mut rng,
+                NOW + 1,
+                &[credential.clone()],
+                &expected_context,
+            )
+            .unwrap();
+        let assertion = authenticator
+            .do_authentication(Url::parse("https://alpha.example.test").unwrap(), challenge)
+            .unwrap();
+
+        let err = rp
+            .finish_owner_approval_assertion(
+                NOW + 1,
+                &challenge_id,
+                &assertion,
+                &mut credential,
+                &submitted_context,
+            )
+            .unwrap_err();
+        assert!(matches!(err, OwnerWebauthnError::ChallengeContextMismatch));
+        assert_eq!(rp.challenge_store_len(), 0);
+    }
+
+    #[test]
+    fn owner_approval_assertion_rejects_expired_and_consumed_context_challenges() {
+        let mut rp = rp();
+        let mut rng = StdRng::seed_from_u64(52);
+        let (mut credential, mut authenticator) = register_with_softpasskey(&mut rp, &mut rng);
+        let expected_context = owner_approval_context(b"join request A");
+
+        let (expired_id, challenge) = rp
+            .start_owner_approval_assertion(
+                &mut rng,
+                NOW + 1,
+                &[credential.clone()],
+                &expected_context,
+            )
+            .unwrap();
+        let assertion = authenticator
+            .do_authentication(Url::parse("https://alpha.example.test").unwrap(), challenge)
+            .unwrap();
+        let expired = rp.finish_owner_approval_assertion(
+            NOW + 62,
+            &expired_id,
+            &assertion,
+            &mut credential,
+            &expected_context,
+        );
+        assert!(matches!(expired, Err(OwnerWebauthnError::ChallengeExpired)));
+
+        let (challenge_id, challenge) = rp
+            .start_owner_approval_assertion(
+                &mut rng,
+                NOW + 2,
+                &[credential.clone()],
+                &expected_context,
+            )
+            .unwrap();
+        let assertion = authenticator
+            .do_authentication(Url::parse("https://alpha.example.test").unwrap(), challenge)
+            .unwrap();
+        rp.finish_owner_approval_assertion(
+            NOW + 2,
+            &challenge_id,
+            &assertion,
+            &mut credential,
+            &expected_context,
+        )
+        .unwrap();
+        let consumed = rp.finish_owner_approval_assertion(
+            NOW + 2,
+            &challenge_id,
+            &assertion,
+            &mut credential,
+            &expected_context,
+        );
+        assert!(matches!(
+            consumed,
+            Err(OwnerWebauthnError::ChallengeNotFound)
+        ));
+    }
+
+    #[test]
+    fn legacy_assertion_finish_rejects_context_bound_challenge() {
+        let mut rp = rp();
+        let mut rng = StdRng::seed_from_u64(53);
+        let (mut credential, mut authenticator) = register_with_softpasskey(&mut rp, &mut rng);
+        let expected_context = owner_approval_context(b"join request A");
+
+        let (challenge_id, challenge) = rp
+            .start_owner_approval_assertion(
+                &mut rng,
+                NOW + 1,
+                &[credential.clone()],
+                &expected_context,
+            )
+            .unwrap();
+        let assertion = authenticator
+            .do_authentication(Url::parse("https://alpha.example.test").unwrap(), challenge)
+            .unwrap();
+
+        let err = rp
+            .finish_assertion(NOW + 1, &challenge_id, &assertion, &mut credential)
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            OwnerWebauthnError::ChallengeContextUnexpected
+        ));
     }
 
     #[test]
