@@ -131,8 +131,7 @@ where
             let clock: Arc<dyn Fn() -> u64 + Send + Sync> = Arc::new(|| {
                 SystemTime::now()
                     .duration_since(UNIX_EPOCH)
-                    .map(|d| d.as_secs())
-                    .unwrap_or(0)
+                    .map_or(0, |d| d.as_secs())
             });
             serve_connection_io_with_auth_deadline(
                 noise_stream,

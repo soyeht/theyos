@@ -15,8 +15,8 @@
 //! the resolver; those are later P0.1 slices.
 
 use crate::artifact_signature::{
-    verify_envelope, ArtifactSignatureEnvelope, ArtifactSignatureError, ArtifactSignatureKey,
-    ARTIFACT_SIGNATURE_ALG_P256_ECDSA_SHA256_RAW,
+    ARTIFACT_SIGNATURE_ALG_P256_ECDSA_SHA256_RAW, ArtifactSignatureEnvelope,
+    ArtifactSignatureError, ArtifactSignatureKey, verify_envelope,
 };
 
 /// Whether an artifact-manifest signature is mandatory for the source being
@@ -187,11 +187,11 @@ pub fn production_keyring() -> ArtifactSignatureKeyring {
 mod tests {
     use super::*;
     use crate::artifact_signature::{
-        signature_payload, ARTIFACT_SIGNATURE_ALG_P256_ECDSA_SHA256_RAW,
-        ARTIFACT_SIGNATURE_SCHEMA_VERSION,
+        ARTIFACT_SIGNATURE_ALG_P256_ECDSA_SHA256_RAW, ARTIFACT_SIGNATURE_SCHEMA_VERSION,
+        signature_payload,
     };
-    use base64::{engine::general_purpose::URL_SAFE_NO_PAD as B64URL, Engine as _};
-    use p256::ecdsa::{signature::Signer, Signature, SigningKey};
+    use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD as B64URL};
+    use p256::ecdsa::{Signature, SigningKey, signature::Signer};
 
     const LATEST_JSON: &[u8] = br#"{"manifest_version":1,"claw":"picoclaw","version":"0.1.0"}"#;
     const CURRENT_ID: &str = "current-p256-2026-06";

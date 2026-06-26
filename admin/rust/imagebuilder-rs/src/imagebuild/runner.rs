@@ -618,7 +618,7 @@ const GOLDEN_ROOTFS_BYTES: u64 = 10 * 1024 * 1024 * 1024; // 10 GiB
 /// Expand the build rootfs to [`GOLDEN_ROOTFS_BYTES`] so that installers
 /// (especially openclaw's pnpm build) have enough disk space.
 fn expand_rootfs_for_build(claw: &str, rootfs: &Path) -> BuildResult<()> {
-    let current_size = fs::metadata(rootfs).map(|m| m.len()).unwrap_or(0);
+    let current_size = fs::metadata(rootfs).map_or(0, |m| m.len());
 
     if current_size >= GOLDEN_ROOTFS_BYTES {
         return Ok(()); // already large enough
@@ -755,8 +755,7 @@ fn copy_rootfs(claw: &str, src: &Path, dst: &Path, _ssh_key: &Path) -> BuildResu
             dst.to_str().unwrap_or(""),
         ])
         .status()
-        .map(|s| s.success())
-        .unwrap_or(false);
+        .is_ok_and(|s| s.success());
 
     if !reflink_ok {
         fs::copy(src, dst).map_err(|e| {

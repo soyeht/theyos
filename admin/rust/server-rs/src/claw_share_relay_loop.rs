@@ -433,8 +433,7 @@ async fn process_one(
 
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
+        .map_or(0, |d| d.as_secs());
 
     let Some(identity) = state.base.household.current().await else {
         return Err("household identity not loaded".into());

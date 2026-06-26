@@ -50,7 +50,7 @@ async fn check_update_available() -> bool {
         .output()
         .await;
 
-    if fetch.map(|o| o.status.success()).unwrap_or(false) {
+    if fetch.is_ok_and(|o| o.status.success()) {
         let local = git_rev_parse("HEAD").await;
         let remote = git_rev_parse("origin/main").await;
         matches!((local, remote), (Some(l), Some(r)) if l != r)

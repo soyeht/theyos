@@ -234,8 +234,7 @@ fn prime_sudo() -> Result<(), Box<dyn std::error::Error>> {
     let sudo_ok = std::process::Command::new("sudo")
         .args(["-n", "true"])
         .status()
-        .map(|s| s.success())
-        .unwrap_or(false);
+        .is_ok_and(|s| s.success());
     if !sudo_ok {
         println!("Admin privileges are required to configure the VM.");
         let sudo_status = std::process::Command::new("sudo")

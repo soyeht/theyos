@@ -308,8 +308,7 @@ impl CliSubprocessProvider {
     fn build_completion_json(model: &str, text: &str, provider_id: &str) -> Value {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
+            .map_or(0, |d| d.as_secs());
         json!({
             "id": format!("chatcmpl-{provider_id}-{now}"),
             "object": "chat.completion",
@@ -331,8 +330,7 @@ impl CliSubprocessProvider {
     fn build_streaming_chunks(model: &str, text: &str, provider_id: &str) -> Vec<Bytes> {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
+            .map_or(0, |d| d.as_secs());
         let id = format!("chatcmpl-{provider_id}-{now}");
         let mut frames = Vec::with_capacity(4);
         let chunk = |delta: Value, finish: Option<&str>| -> Value {

@@ -131,8 +131,7 @@ fn rebuild_stack(repo: &Path) -> bool {
             .arg("rebuild")
             .current_dir(repo)
             .status()
-            .map(|s| s.success())
-            .unwrap_or(false);
+            .is_ok_and(|s| s.success());
     }
 
     log("error: soyeht binary not found");
@@ -146,8 +145,7 @@ fn run_git(repo: &Path, args: &[&str]) -> bool {
         .args(args)
         .current_dir(repo)
         .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
+        .is_ok_and(|s| s.success())
 }
 
 fn git_rev(repo: &Path, refspec: &str) -> String {

@@ -613,8 +613,7 @@ async fn wait_for_idle(last_activity: Arc<StdMutex<Instant>>, idle_timeout: Dura
     loop {
         let elapsed = last_activity
             .lock()
-            .map(|last_activity| last_activity.elapsed())
-            .unwrap_or(idle_timeout);
+            .map_or(idle_timeout, |last_activity| last_activity.elapsed());
         if elapsed >= idle_timeout {
             return;
         }
@@ -818,8 +817,7 @@ fn nonzero_duration_or(duration: Duration, fallback: Duration) -> Duration {
 fn now_unix() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_secs())
-        .unwrap_or(0)
+        .map_or(0, |duration| duration.as_secs())
 }
 
 #[cfg(test)]

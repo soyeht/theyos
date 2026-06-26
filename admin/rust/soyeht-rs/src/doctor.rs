@@ -224,7 +224,7 @@ fn check_linux_runtime(root: &Path, fc_home: &Path, r: &mut DoctorReport) {
     let kvm = Path::new("/dev/kvm");
     if kvm.exists() {
         use std::os::unix::fs::PermissionsExt;
-        let mode = kvm.metadata().map(|m| m.permissions().mode()).unwrap_or(0);
+        let mode = kvm.metadata().map_or(0, |m| m.permissions().mode());
         if mode & 0o006 == 0o006 || mode & 0o060 == 0o060 || mode & 0o600 == 0o600 {
             r.pass("/dev/kvm present and read/write");
         } else {
@@ -240,8 +240,7 @@ fn check_linux_runtime(root: &Path, fc_home: &Path, r: &mut DoctorReport) {
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .status()
-            .map(|s| s.success())
-            .unwrap_or(false);
+            .is_ok_and(|s| s.success());
         if ok {
             r.pass("firecracker --version runnable");
         } else {
@@ -255,8 +254,7 @@ fn check_linux_runtime(root: &Path, fc_home: &Path, r: &mut DoctorReport) {
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .status()
-            .map(|s| s.success())
-            .unwrap_or(false);
+            .is_ok_and(|s| s.success());
         if ok {
             r.pass("runtime control binary (fc-ssh) help OK");
         } else {
@@ -284,8 +282,7 @@ fn check_macos_runtime(root: &Path, r: &mut DoctorReport) {
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .status()
-            .map(|s| s.success())
-            .unwrap_or(false);
+            .is_ok_and(|s| s.success());
         if ok {
             r.pass("runtime control binary (theyos-ssh) help OK");
         } else {

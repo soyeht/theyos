@@ -529,22 +529,18 @@ impl RelayStreamOfferResyncDriverHandle {
     pub fn offer_count(&self) -> usize {
         self.registry
             .lock()
-            .map(|registry| registry.entries.len())
-            .unwrap_or(0)
+            .map_or(0, |registry| registry.entries.len())
     }
 
     #[must_use]
     pub fn task_count(&self) -> usize {
-        self.registry
-            .lock()
-            .map(|registry| {
-                registry
-                    .entries
-                    .values()
-                    .map(|entry| entry.handles.iter().filter(|h| !h.is_finished()).count())
-                    .sum()
-            })
-            .unwrap_or(0)
+        self.registry.lock().map_or(0, |registry| {
+            registry
+                .entries
+                .values()
+                .map(|entry| entry.handles.iter().filter(|h| !h.is_finished()).count())
+                .sum()
+        })
     }
 }
 

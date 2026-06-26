@@ -120,7 +120,7 @@ impl VMSnapshot {
     ///
     /// Returns an error if the filesystem metadata cannot be read.
     pub fn update_size(&mut self) -> Result<(), VZError> {
-        self.size_bytes = std::fs::metadata(&self.path).map(|m| m.len()).unwrap_or(0);
+        self.size_bytes = std::fs::metadata(&self.path).map_or(0, |m| m.len());
         Ok(())
     }
 }

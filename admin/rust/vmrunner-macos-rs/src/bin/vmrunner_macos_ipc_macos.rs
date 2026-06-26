@@ -198,8 +198,10 @@ fn run_macos_install_flow(
             macos_guest::RestoreImageSource::DownloadUrl(url) => {
                 tracing::info!(url, "Downloading restore image...");
                 macos_guest::download_ipsw(url, &ipsw_path, state, base_dir, |downloaded, total| {
-                    if total > 0 {
-                        let pct = downloaded * 100 / total;
+                    if let Some(pct) = downloaded
+                        .checked_mul(100)
+                        .and_then(|scaled| scaled.checked_div(total))
+                    {
                         tracing::debug!(pct, downloaded, total, "IPSW download progress");
                     }
                 })
@@ -2177,8 +2179,10 @@ fn handle_linux_base_install(params: &Value) -> Response {
             &mut state,
             &base_dir,
             |downloaded, total| {
-                if total > 0 {
-                    let pct = downloaded * 100 / total;
+                if let Some(pct) = downloaded
+                    .checked_mul(100)
+                    .and_then(|scaled| scaled.checked_div(total))
+                {
                     if pct % 10 == 0 {
                         tracing::info!(pct, downloaded, total, "Download progress");
                     }

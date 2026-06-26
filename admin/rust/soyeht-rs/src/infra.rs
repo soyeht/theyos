@@ -88,15 +88,13 @@ fn stop_stale_homebrew_runtime_processes(skip_confirm: bool) {
         .arg("-TERM")
         .args(&pids)
         .status()
-        .map(|s| s.success())
-        .unwrap_or(false);
+        .is_ok_and(|s| s.success());
 
     if !term_ok {
         let mut sudo_ready = Command::new("sudo")
             .args(["-n", "true"])
             .status()
-            .map(|s| s.success())
-            .unwrap_or(false);
+            .is_ok_and(|s| s.success());
         if !sudo_ready && !skip_confirm {
             println!(
                 "[soyeht] admin privileges are required to stop stale root-owned theyOS helpers."
@@ -104,8 +102,7 @@ fn stop_stale_homebrew_runtime_processes(skip_confirm: bool) {
             sudo_ready = Command::new("sudo")
                 .arg("-v")
                 .status()
-                .map(|s| s.success())
-                .unwrap_or(false);
+                .is_ok_and(|s| s.success());
         }
         if sudo_ready {
             let _ = Command::new("sudo")
@@ -494,8 +491,7 @@ pub fn cmd_status(root: &Path, resources: bool, deep: bool) {
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .status()
-            .map(|s| s.success())
-            .unwrap_or(false);
+            .is_ok_and(|s| s.success());
         if git_tracked {
             println!("{ts} [CRITICAL] .env is tracked in git! Remove with:");
             println!("       git rm --cached .env && git commit -m 'Remove .env'");
@@ -620,8 +616,7 @@ pub fn cmd_backup(root: &Path) {
         .args(["bundle", "create", bundle.to_str().unwrap(), "--all"])
         .current_dir(root)
         .status()
-        .map(|s| s.success())
-        .unwrap_or(false);
+        .is_ok_and(|s| s.success());
 
     if !bundle_ok {
         println!("[soyeht] git bundle failed; falling back to tar...");

@@ -1367,7 +1367,7 @@ impl VmRunner {
     ///
     /// Skipped when the file is already at or above the target size.
     fn expand_rootfs(rootfs: &Path, target_bytes: u64) -> Result<(), VmError> {
-        let current_size = fs::metadata(rootfs).map(|m| m.len()).unwrap_or(0);
+        let current_size = fs::metadata(rootfs).map_or(0, |m| m.len());
         if current_size >= target_bytes {
             return Ok(());
         }

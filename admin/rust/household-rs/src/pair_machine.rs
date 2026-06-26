@@ -2076,7 +2076,7 @@ async fn probe_post_commit(
         let agent = ureq::AgentBuilder::new()
             .timeout(Duration::from_secs(5))
             .build();
-        agent.get(&owned).call()
+        agent.get(&owned).call().map_err(|_| ())
     })
     .await;
     let Ok(Ok(response)) = result else {
@@ -2120,7 +2120,7 @@ async fn probe_pre_commit(addr: &str, nonce_short: &str, expected_m_pub: &[u8]) 
         let agent = ureq::AgentBuilder::new()
             .timeout(Duration::from_secs(5))
             .build();
-        agent.get(&owned).call()
+        agent.get(&owned).call().map_err(|_| ())
     })
     .await;
     let Ok(Ok(response)) = result else {

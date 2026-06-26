@@ -60,8 +60,7 @@ pub async fn handle_ready(State(state): State<SharedState>) -> impl IntoResponse
         let st = state.clone();
         blocking(move || st.instance_db.has_container("__healthcheck__"))
             .await
-            .map(|r| r.is_ok())
-            .unwrap_or(false)
+            .is_ok_and(|r| r.is_ok())
     };
 
     if db_ok {

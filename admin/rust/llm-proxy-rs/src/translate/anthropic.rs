@@ -304,8 +304,7 @@ pub fn from_anthropic_response(anthropic: &Value, request_model: &str) -> Value 
         .map_or_else(generate_chatcmpl_id, |s| s.replace("msg_", "chatcmpl-"));
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
+        .map_or(0, |d| d.as_secs());
 
     let content_blocks = anthropic
         .get("content")
@@ -409,8 +408,7 @@ fn generate_chatcmpl_id() -> String {
     let n = CHATCMPL_SEQ.fetch_add(1, Ordering::Relaxed);
     let secs = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
+        .map_or(0, |d| d.as_secs());
     format!("chatcmpl-anthropic-{secs}-{n}")
 }
 
@@ -475,8 +473,7 @@ impl SseTranslator {
         let chatcmpl_id = generate_chatcmpl_id();
         let created = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
+            .map_or(0, |d| d.as_secs());
         Self {
             request_model,
             chatcmpl_id,

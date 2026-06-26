@@ -43,8 +43,7 @@ fn log_ts() -> String {
     core_rs::time::format_iso(
         SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0),
+            .map_or(0, |d| d.as_secs()),
     )
 }
 
@@ -92,10 +91,7 @@ impl KeyBackingPolicy {
     /// the variant directly.
     #[must_use]
     pub fn from_env() -> Self {
-        if std::env::var("THEYOS_FORCE_SOFTWARE_KEYS")
-            .map(|v| v == "1")
-            .unwrap_or(false)
-        {
+        if std::env::var("THEYOS_FORCE_SOFTWARE_KEYS").is_ok_and(|v| v == "1") {
             Self::ForceSoftware
         } else {
             Self::OsDefault
@@ -374,9 +370,7 @@ fn drop_legacy_tables_before_first_bootstrap(state_dir: &Path) -> Result<(), Boo
 }
 
 fn should_skip_legacy_migration() -> bool {
-    std::env::var("THEYOS_SKIP_LEGACY_MIGRATION")
-        .map(|v| v == "1")
-        .unwrap_or(false)
+    std::env::var("THEYOS_SKIP_LEGACY_MIGRATION").is_ok_and(|v| v == "1")
 }
 
 fn drop_legacy_tables_before_first_bootstrap_with_options(

@@ -24,8 +24,7 @@ pub fn curl_ok(url: &str, timeout_secs: u64) -> bool {
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
+        .is_ok_and(|s| s.success())
 }
 
 pub fn curl_headers(url: &str) -> String {

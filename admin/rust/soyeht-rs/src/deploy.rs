@@ -318,7 +318,7 @@ fn stage_binaries(root: &Path) -> bool {
     println!("[build]   staged {count} binaries to .deploy-staging/:");
     for bin in KEY_BINS {
         let path = dst.join(bin);
-        let size = fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+        let size = fs::metadata(&path).map_or(0, |m| m.len());
         #[allow(clippy::cast_precision_loss)] // display-only: sub-byte precision not needed
         let mb = size as f64 / (1024.0 * 1024.0);
         println!("[build]     {bin:<24} {mb:.1}M");
@@ -373,8 +373,7 @@ fn is_systemd_managed() -> bool {
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
+        .is_ok_and(|s| s.success())
 }
 
 /// Check if the systemd unit exists (enabled, disabled, or static).
@@ -415,16 +414,14 @@ fn restart_backend(root: &Path) -> bool {
         let ok = Command::new("systemctl")
             .args(["restart", SYSTEMD_UNIT])
             .status()
-            .map(|s| s.success())
-            .unwrap_or(false);
+            .is_ok_and(|s| s.success());
         if !ok {
             // Try with sudo
             println!("[deploy]   retrying with sudo ...");
             let ok = Command::new("/run/wrappers/bin/sudo")
                 .args(["systemctl", "restart", SYSTEMD_UNIT])
                 .status()
-                .map(|s| s.success())
-                .unwrap_or(false);
+                .is_ok_and(|s| s.success());
             if !ok {
                 eprintln!("[deploy]   systemctl restart FAILED");
                 return false;
@@ -713,8 +710,7 @@ pub fn cmd_build(root: &Path, skip_frontend: bool) {
         .args(["build", "--release", "--workspace"])
         .current_dir(&rust_dir)
         .status()
-        .map(|s| s.success())
-        .unwrap_or(false);
+        .is_ok_and(|s| s.success());
     if !ok {
         eprintln!("[build] cargo build --release --workspace FAILED");
         std::process::exit(1);
@@ -731,8 +727,7 @@ pub fn cmd_build(root: &Path, skip_frontend: bool) {
             .arg("ci")
             .current_dir(&frontend_dir)
             .status()
-            .map(|s| s.success())
-            .unwrap_or(false);
+            .is_ok_and(|s| s.success());
         if !ok {
             eprintln!("[build] npm ci FAILED");
             std::process::exit(1);
@@ -743,8 +738,7 @@ pub fn cmd_build(root: &Path, skip_frontend: bool) {
             .args(["run", "build"])
             .current_dir(&frontend_dir)
             .status()
-            .map(|s| s.success())
-            .unwrap_or(false);
+            .is_ok_and(|s| s.success());
         if !ok {
             eprintln!("[build] npm run build FAILED");
             std::process::exit(1);
@@ -807,8 +801,7 @@ fn update_preflight(root: &Path) -> String {
         .current_dir(root)
         .stderr(std::process::Stdio::null())
         .status()
-        .map(|s| s.success())
-        .unwrap_or(false);
+        .is_ok_and(|s| s.success());
     if !fetch_ok {
         eprintln!("[update] ERROR: cannot reach remote — check your network connection");
         std::process::exit(1);
@@ -1064,8 +1057,7 @@ pub fn cmd_test(root: &Path, skip_clippy: bool) {
             .args(["clippy", "--workspace", "--", "-D", "warnings"])
             .current_dir(&rust_dir)
             .status()
-            .map(|s| s.success())
-            .unwrap_or(false);
+            .is_ok_and(|s| s.success());
         if !ok {
             eprintln!("[test] cargo clippy FAILED");
             std::process::exit(1);
@@ -1078,8 +1070,7 @@ pub fn cmd_test(root: &Path, skip_clippy: bool) {
         .args(["test", "--workspace", "--", "--test-threads=1"])
         .current_dir(&rust_dir)
         .status()
-        .map(|s| s.success())
-        .unwrap_or(false);
+        .is_ok_and(|s| s.success());
     if !ok {
         eprintln!("[test] cargo test FAILED");
         std::process::exit(1);
@@ -1170,8 +1161,7 @@ pub fn cmd_deploy(root: &Path, skip_restart: bool) {
         .env("HOME", theyos_home(root))
         .env("THEYOS_DIR", root)
         .status()
-        .map(|s| s.success())
-        .unwrap_or(false);
+        .is_ok_and(|s| s.success());
 
     if !smoke_ok {
         eprintln!("[deploy] smoke test FAILED — rolling back ...");
@@ -1381,7 +1371,7 @@ pub fn cmd_validate_macos(_root: &Path, claw_types: &[String], settle: u64, time
     let health = std::process::Command::new("curl")
         .args(["-sf", "http://localhost:8892/healthz"])
         .output();
-    let server_ok = health.map(|o| o.status.success()).unwrap_or(false);
+    let server_ok = health.is_ok_and(|o| o.status.success());
     if !server_ok {
         eprintln!("[validate-macos] FAIL: admin server not responding on :8892");
         std::process::exit(1);
@@ -1461,8 +1451,7 @@ fn run_macos_smoke() -> bool {
     let health_ok = std::process::Command::new("curl")
         .args(["-sf", "-o", "/dev/null", "http://localhost:8892/healthz"])
         .status()
-        .map(|s| s.success())
-        .unwrap_or(false);
+        .is_ok_and(|s| s.success());
     println!(
         "[smoke]   healthz: {}",
         if health_ok { "OK" } else { "FAIL" }
@@ -1483,8 +1472,7 @@ fn run_macos_smoke() -> bool {
             "http://localhost:8892/api/v1/auth/login",
         ])
         .status()
-        .map(|s| s.success())
-        .unwrap_or(false);
+        .is_ok_and(|s| s.success());
     println!("[smoke]   login: {}", if login_ok { "OK" } else { "FAIL" });
 
     // 3. network status (GET with auth cookie)
@@ -1498,8 +1486,7 @@ fn run_macos_smoke() -> bool {
             "http://localhost:8892/api/v1/network/status",
         ])
         .status()
-        .map(|s| s.success())
-        .unwrap_or(false);
+        .is_ok_and(|s| s.success());
     println!("[smoke]   network: {}", if net_ok { "OK" } else { "FAIL" });
 
     health_ok && login_ok && net_ok
@@ -2109,8 +2096,7 @@ fn codesign_vmrunner(bin_dir: &Path, repo_dir: &Path) -> bool {
         .args(["-s", "-"])
         .arg(&binary)
         .status()
-        .map(|s| s.success())
-        .unwrap_or(false);
+        .is_ok_and(|s| s.success());
     if !ok {
         eprintln!("[update] CODESIGN FAILED — VMs will not work");
     }
@@ -2131,8 +2117,7 @@ fn promote_macos_frontend(repo_dir: &Path, web_dir: &Path) -> bool {
         .arg(&src)
         .arg(web_dir)
         .status()
-        .map(|s| s.success())
-        .unwrap_or(false);
+        .is_ok_and(|s| s.success());
     if ok {
         println!("[update] frontend promoted to {}", web_dir.display());
     } else {
@@ -2226,8 +2211,7 @@ fn update_smoke_macos(state_dir: &Path) -> bool {
     let net_ok = Command::new("curl")
         .args(["-sf", "-o", "/dev/null", "-b", &cookie, &net_url])
         .status()
-        .map(|s| s.success())
-        .unwrap_or(false);
+        .is_ok_and(|s| s.success());
     println!("[smoke] network: {}", if net_ok { "OK" } else { "FAIL" });
 
     health_ok && login_ok && net_ok
@@ -2287,8 +2271,7 @@ pub fn cmd_update_macos(_root: &Path, args: &UpdateArgs) {
         .args(["build", "--release", "--workspace"])
         .current_dir(&rust_dir)
         .status()
-        .map(|s| s.success())
-        .unwrap_or(false);
+        .is_ok_and(|s| s.success());
     if !ok {
         eprintln!("[update] cargo build FAILED");
         std::process::exit(1);
@@ -2304,8 +2287,7 @@ pub fn cmd_update_macos(_root: &Path, args: &UpdateArgs) {
             .arg("ci")
             .current_dir(&frontend_dir)
             .status()
-            .map(|s| s.success())
-            .unwrap_or(false);
+            .is_ok_and(|s| s.success());
         if !ok {
             eprintln!("[update] npm ci FAILED");
             std::process::exit(1);
@@ -2315,8 +2297,7 @@ pub fn cmd_update_macos(_root: &Path, args: &UpdateArgs) {
             .args(["run", "build"])
             .current_dir(&frontend_dir)
             .status()
-            .map(|s| s.success())
-            .unwrap_or(false);
+            .is_ok_and(|s| s.success());
         if !ok {
             eprintln!("[update] npm run build FAILED");
             std::process::exit(1);
@@ -2330,8 +2311,7 @@ pub fn cmd_update_macos(_root: &Path, args: &UpdateArgs) {
             .args(["clippy", "--workspace", "--", "-D", "warnings"])
             .current_dir(&rust_dir)
             .status()
-            .map(|s| s.success())
-            .unwrap_or(false);
+            .is_ok_and(|s| s.success());
         if !ok {
             eprintln!("[update] clippy FAILED");
             std::process::exit(1);
@@ -2341,8 +2321,7 @@ pub fn cmd_update_macos(_root: &Path, args: &UpdateArgs) {
             .args(["test", "--workspace"])
             .current_dir(&rust_dir)
             .status()
-            .map(|s| s.success())
-            .unwrap_or(false);
+            .is_ok_and(|s| s.success());
         if !ok {
             eprintln!("[update] cargo test FAILED");
             std::process::exit(1);

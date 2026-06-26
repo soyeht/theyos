@@ -61,8 +61,7 @@ fn update_repo(cfg: &Config, name: &str, repo: &Path) -> UpdateResult {
     let clean = Command::new("git")
         .args(["-C", repo.to_str().unwrap_or("."), "diff", "--quiet"])
         .status()
-        .map(|s| s.success())
-        .unwrap_or(false);
+        .is_ok_and(|s| s.success());
     let clean_staged = Command::new("git")
         .args([
             "-C",
@@ -72,8 +71,7 @@ fn update_repo(cfg: &Config, name: &str, repo: &Path) -> UpdateResult {
             "--quiet",
         ])
         .status()
-        .map(|s| s.success())
-        .unwrap_or(false);
+        .is_ok_and(|s| s.success());
     if !clean || !clean_staged {
         log(cfg, &format!("skip {name}: working tree dirty"));
         return UpdateResult::Skipped;
@@ -97,8 +95,7 @@ fn update_repo(cfg: &Config, name: &str, repo: &Path) -> UpdateResult {
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status()
-        .map(|s| s.success())
-        .unwrap_or(false);
+        .is_ok_and(|s| s.success());
     if !fetch_ok {
         log(cfg, &format!("error {name}: fetch failed"));
         return UpdateResult::Failed;
@@ -141,8 +138,7 @@ fn update_repo(cfg: &Config, name: &str, repo: &Path) -> UpdateResult {
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status()
-        .map(|s| s.success())
-        .unwrap_or(false);
+        .is_ok_and(|s| s.success());
 
     if pull_ok {
         let new_rev = git_rev(repo, "HEAD");
@@ -203,8 +199,7 @@ fn git_ref_exists(repo: &Path, refspec: &str) -> bool {
             refspec,
         ])
         .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
+        .is_ok_and(|s| s.success())
 }
 
 fn git_rev(repo: &Path, refspec: &str) -> String {

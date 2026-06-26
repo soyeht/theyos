@@ -3970,8 +3970,7 @@ fn generate_random_token() -> String {
     let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let ts = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
+        .map_or(0, |d| d.as_nanos());
 
     let mut bytes = [0u8; 32];
     for (i, chunk) in bytes.chunks_mut(8).enumerate() {

@@ -236,10 +236,7 @@ where
 
     fn drain_records(&mut self) {
         // Walk the buffer pulling out `\n\n`-terminated records.
-        loop {
-            let Some(idx) = self.buffer.find("\n\n") else {
-                break;
-            };
+        while let Some(idx) = self.buffer.find("\n\n") {
             let record = self.buffer[..idx].to_string();
             self.buffer.drain(..idx + 2);
             self.handle_record(&record);

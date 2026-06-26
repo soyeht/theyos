@@ -184,9 +184,7 @@ pub fn admin_backend_status(root: &Path) -> bool {
         let status = Command::new("systemctl")
             .args(["is-active", "soyeht-admin-host.service"])
             .output();
-        let active = status
-            .map(|o| String::from_utf8_lossy(&o.stdout).trim() == "active")
-            .unwrap_or(false);
+        let active = status.is_ok_and(|o| String::from_utf8_lossy(&o.stdout).trim() == "active");
         let health = admin_health_url(root);
         let healthy = curl_ok(&health, 2);
         println!(

@@ -736,8 +736,7 @@ fn curl_admin_api() -> bool {
         ])
         .stderr(std::process::Stdio::null())
         .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
+        .is_ok_and(|s| s.success())
 }
 
 fn wait_for_admin_api(max: Duration) {

@@ -541,9 +541,7 @@ fn cmd_publish_manifest(args: &PublishManifestArgs, assets_dir: &Path) -> bool {
         }
     };
 
-    let zst_size = std::fs::metadata(&args.zst_file)
-        .map(|m| m.len())
-        .unwrap_or(0);
+    let zst_size = std::fs::metadata(&args.zst_file).map_or(0, |m| m.len());
 
     // 3. Detect architecture
     let arch = core_rs::artifact_registry::host_arch();

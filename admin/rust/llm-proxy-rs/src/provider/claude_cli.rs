@@ -233,8 +233,7 @@ impl ClaudeCliProvider {
     fn build_completion_json(model: &str, text: &str) -> Value {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
+            .map_or(0, |d| d.as_secs());
         json!({
             "id": format!("chatcmpl-claude-cli-{now}"),
             "object": "chat.completion",
@@ -258,8 +257,7 @@ impl ClaudeCliProvider {
     fn build_streaming_chunks(model: &str, text: &str) -> Vec<Bytes> {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
+            .map_or(0, |d| d.as_secs());
         let id = format!("chatcmpl-claude-cli-{now}");
         let mut frames = Vec::with_capacity(4);
 

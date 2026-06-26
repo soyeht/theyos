@@ -34,8 +34,7 @@ pub fn prompt_secret(question: &str) -> String {
     let stty_ok = Command::new("stty")
         .arg("-echo")
         .status()
-        .map(|s| s.success())
-        .unwrap_or(false);
+        .is_ok_and(|s| s.success());
     let mut line = String::new();
     io::stdin().read_line(&mut line).ok();
     if stty_ok {
@@ -99,8 +98,7 @@ pub fn clone_if_missing(name: &str, repo_url: &str, dest: &Path) {
     let ok = Command::new("git")
         .args(["clone", "--depth", "1", repo_url, dest.to_str().unwrap()])
         .status()
-        .map(|s| s.success())
-        .unwrap_or(false);
+        .is_ok_and(|s| s.success());
     if ok {
         println!("  {name}: cloned OK");
     } else {
@@ -541,8 +539,7 @@ fn offer_build_rootfs(root: &Path, theyos_home: &str) {
         .args([rootfsbuilder.to_str().unwrap(), "--force"])
         .env("HOME", theyos_home)
         .status()
-        .map(|s| s.success())
-        .unwrap_or(false);
+        .is_ok_and(|s| s.success());
 
     if ok {
         println!("[setup] base rootfs built successfully");
@@ -603,8 +600,7 @@ fn download_firecracker(fc_home: &str) {
     let ok = Command::new("curl")
         .args(["-fSL", "--progress-bar", "-o", &tgz_path, &url])
         .status()
-        .map(|s| s.success())
-        .unwrap_or(false);
+        .is_ok_and(|s| s.success());
     if !ok {
         eprintln!("[setup] download failed. Download manually from:\n  {url}");
         fs::remove_dir_all(&tmp_dir).ok();
@@ -623,8 +619,7 @@ fn download_firecracker(fc_home: &str) {
     let ok = Command::new("tar")
         .args(["xzf", &tgz_path, "-C", &tmp_dir, "--strip-components=1"])
         .status()
-        .map(|s| s.success())
-        .unwrap_or(false);
+        .is_ok_and(|s| s.success());
     if !ok {
         eprintln!("[setup] failed to extract archive");
         fs::remove_dir_all(&tmp_dir).ok();
@@ -703,8 +698,7 @@ fn generate_ssh_keys(fc_home: &str) {
     let ok = Command::new("ssh-keygen")
         .args(["-t", "ed25519", "-f", &key_path, "-N", "", "-q"])
         .status()
-        .map(|s| s.success())
-        .unwrap_or(false);
+        .is_ok_and(|s| s.success());
 
     if ok {
         println!("[setup] SSH keys generated at {assets_dir}/");
@@ -816,8 +810,7 @@ fn setup_tailscale(root: &Path) {
             &ts_hostname,
         ])
         .status()
-        .map(|s| s.success())
-        .unwrap_or(false);
+        .is_ok_and(|s| s.success());
     if !ok {
         println!(
             "[setup] warning: tailscale cert failed — enable HTTPS in tailscale.com/admin/dns and re-run"

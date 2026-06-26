@@ -64,8 +64,7 @@ pub fn cmd_dev(root: &Path, kill: bool, status: bool) {
             .args(["build", "-p", "server-rs"])
             .current_dir(admin_root.join("rust"))
             .status()
-            .map(|s| s.success())
-            .unwrap_or(false);
+            .is_ok_and(|s| s.success());
         if !ok {
             eprintln!("[dev] cargo build failed");
             std::process::exit(1);
@@ -155,8 +154,7 @@ pub fn cmd_rebuild_admin(root: &Path, skip_install: bool) {
             .arg("ci")
             .current_dir(&frontend_dir)
             .status()
-            .map(|s| s.success())
-            .unwrap_or(false);
+            .is_ok_and(|s| s.success());
         if !ok {
             eprintln!("[rebuild] npm ci failed");
             std::process::exit(1);
@@ -167,8 +165,7 @@ pub fn cmd_rebuild_admin(root: &Path, skip_install: bool) {
         .args(["run", "build"])
         .current_dir(&frontend_dir)
         .status()
-        .map(|s| s.success())
-        .unwrap_or(false);
+        .is_ok_and(|s| s.success());
     if !ok {
         eprintln!("[rebuild] npm run build failed");
         std::process::exit(1);
@@ -179,8 +176,7 @@ pub fn cmd_rebuild_admin(root: &Path, skip_install: bool) {
         .args(["build", "--workspace"])
         .current_dir(admin_root.join("rust"))
         .status()
-        .map(|s| s.success())
-        .unwrap_or(false);
+        .is_ok_and(|s| s.success());
     if !ok {
         eprintln!("[rebuild] cargo build --workspace failed");
         std::process::exit(1);
@@ -197,8 +193,7 @@ pub fn cmd_test_admin(root: &Path) {
         .args(["test", "--workspace"])
         .current_dir(admin_root.join("rust"))
         .status()
-        .map(|s| s.success())
-        .unwrap_or(false);
+        .is_ok_and(|s| s.success());
     if !ok {
         eprintln!("[test] cargo test --workspace failed");
         std::process::exit(1);
@@ -209,8 +204,7 @@ pub fn cmd_test_admin(root: &Path) {
         .args(["run", "build"])
         .current_dir(admin_root.join("frontend"))
         .status()
-        .map(|s| s.success())
-        .unwrap_or(false);
+        .is_ok_and(|s| s.success());
     if !ok {
         eprintln!("[test] npm run build failed");
         std::process::exit(1);
