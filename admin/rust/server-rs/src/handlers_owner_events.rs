@@ -17,6 +17,9 @@ use axum::{
 };
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD as B64URL};
 use household_rs::caveats::Operation;
+use household_rs::owner_approval_v2::{
+    OwnerApprovalContextV2, OwnerApprovalV2Error, OwnerOperation,
+};
 use household_rs::owner_events::{
     JoinCancelledPayload, MachineJoinedPayload, OwnerDevicePushToken, OwnerEvent, OwnerEventLog,
     OwnerEventPayload, OwnerEventType, OwnerEventsBroadcaster,
@@ -24,6 +27,7 @@ use household_rs::owner_events::{
 use household_rs::pair_machine::{
     CeremonyError, CeremonyInputs, CeremonyTxn, FinalizeWithM2Options, FinalizeWithM2Outcome,
     JoinRequest, OwnerApproval, OwnerApprovalContext, PairMachineState, PairMachineWindow,
+    PairMachineWindowSnapshot, join_request_hash,
 };
 use serde::{Deserialize, Serialize};
 use serde_bytes::ByteBuf;
@@ -54,6 +58,9 @@ pub struct OwnerEventsRouterState {
     /// `CeremonyTxn::commit` can destroy the right backend on Shamir
     /// transition.
     pub key_backing_policy: household_rs::KeyBackingPolicy,
+    /// Owner-auth rollout policy. Defaults to legacy behavior for every
+    /// operation so introducing S2 primitives cannot brick existing onboarding.
+    pub owner_approval_policy: OwnerApprovalEnforcementPolicy,
 }
 
 impl OwnerEventsRouterState {
@@ -96,8 +103,146 @@ impl OwnerEventsRouterState {
             long_poll_timeout,
             device_pairing_store: DevicePairingStore::new(),
             key_backing_policy,
+            owner_approval_policy: OwnerApprovalEnforcementPolicy::default(),
         }
     }
+
+    #[must_use]
+    pub fn with_owner_approval_policy(
+        mut self,
+        owner_approval_policy: OwnerApprovalEnforcementPolicy,
+    ) -> Self {
+        self.owner_approval_policy = owner_approval_policy;
+        self
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OwnerApprovalEnforcementPolicy {
+    pub pair_machine_approve: OwnerOperationEnforcement,
+    pub bootstrap_initialize: OwnerOperationEnforcement,
+    pub bootstrap_teardown: OwnerOperationEnforcement,
+    pub pair_device_confirm: OwnerOperationEnforcement,
+    pub revoke_credential: OwnerOperationEnforcement,
+}
+
+impl Default for OwnerApprovalEnforcementPolicy {
+    fn default() -> Self {
+        Self {
+            pair_machine_approve: OwnerOperationEnforcement::LegacyOnly,
+            bootstrap_initialize: OwnerOperationEnforcement::LegacyOnly,
+            bootstrap_teardown: OwnerOperationEnforcement::LegacyOnly,
+            pair_device_confirm: OwnerOperationEnforcement::LegacyOnly,
+            revoke_credential: OwnerOperationEnforcement::LegacyOnly,
+        }
+    }
+}
+
+impl OwnerApprovalEnforcementPolicy {
+    #[must_use]
+    pub fn with_pair_machine_approve(mut self, mode: OwnerOperationEnforcement) -> Self {
+        self.pair_machine_approve = mode;
+        self
+    }
+
+    #[must_use]
+    pub fn pair_machine_approval_body_mode(
+        &self,
+        owner_has_active_webauthn_credential: bool,
+    ) -> PairMachineApprovalBodyMode {
+        self.pair_machine_approve
+            .body_mode(owner_has_active_webauthn_credential)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OwnerOperationEnforcement {
+    /// Preserve the existing v1 owner-PoP approval path.
+    LegacyOnly,
+    /// Require v2 only after the owner has at least one active WebAuthn
+    /// credential. Before enrollment exists, fall back to legacy so this flag
+    /// cannot brick pair-machine onboarding during migration.
+    V2WhenOwnerHasActiveCredential,
+}
+
+impl OwnerOperationEnforcement {
+    #[must_use]
+    fn body_mode(self, owner_has_active_webauthn_credential: bool) -> PairMachineApprovalBodyMode {
+        match (self, owner_has_active_webauthn_credential) {
+            (Self::LegacyOnly, _) | (Self::V2WhenOwnerHasActiveCredential, false) => {
+                PairMachineApprovalBodyMode::LegacyV1
+            }
+            (Self::V2WhenOwnerHasActiveCredential, true) => PairMachineApprovalBodyMode::RequireV2,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PairMachineApprovalBodyMode {
+    LegacyV1,
+    RequireV2,
+}
+
+pub fn reassert_pair_machine_approval_context_against_live_window(
+    approved_context: &OwnerApprovalContextV2,
+    live_snapshot: &PairMachineWindowSnapshot,
+) -> Result<(), OwnerApprovalV2Error> {
+    if approved_context.op != OwnerOperation::PairMachineApprove {
+        return Err(OwnerApprovalV2Error::TrustedState(
+            "operation is not pair-machine approve",
+        ));
+    }
+    let cursor = approved_context
+        .cursor
+        .ok_or(OwnerApprovalV2Error::MissingField("cursor"))?;
+    if live_snapshot.state != PairMachineState::AwaitingOwner
+        || live_snapshot.owner_event_cursor != Some(cursor)
+    {
+        return Err(OwnerApprovalV2Error::TrustedState(
+            "live window cursor changed",
+        ));
+    }
+    if live_snapshot.expiry != approved_context.ttl_unix {
+        return Err(OwnerApprovalV2Error::TrustedState(
+            "live window ttl changed",
+        ));
+    }
+    if live_snapshot.addr_hint.as_deref() != approved_context.addr.as_deref() {
+        return Err(OwnerApprovalV2Error::TrustedState(
+            "live window addr changed",
+        ));
+    }
+    if live_snapshot.transport != approved_context.transport {
+        return Err(OwnerApprovalV2Error::TrustedState(
+            "live window transport changed",
+        ));
+    }
+    if live_snapshot.nonce.as_ref().map(ByteBuf::as_ref)
+        != approved_context.nonce.as_ref().map(ByteBuf::as_ref)
+    {
+        return Err(OwnerApprovalV2Error::TrustedState(
+            "live window nonce changed",
+        ));
+    }
+    let cached_join_request =
+        live_snapshot
+            .cached_join_request
+            .as_ref()
+            .ok_or(OwnerApprovalV2Error::TrustedState(
+                "missing live cached join request",
+            ))?;
+    let live_join_request_hash = join_request_hash(cached_join_request);
+    if approved_context
+        .join_request_hash
+        .as_ref()
+        .map(ByteBuf::as_ref)
+        != Some(live_join_request_hash.as_slice())
+    {
+        return Err(OwnerApprovalV2Error::TrustedState(
+            "live join request changed",
+        ));
+    }
+    Ok(())
 }
 
 #[derive(Serialize)]
@@ -1413,5 +1558,156 @@ async fn backoff_or_cancel(cancel_rx: &mut watch::Receiver<bool>) -> bool {
             let _ = cancel;
             true
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use household_rs::ids::{HouseholdId, MachineId};
+    use household_rs::machine_cert::PersonId;
+    use household_rs::owner_approval_v2::PairMachineApprovalContextInput;
+    use household_rs::pair_machine::{JoinTransport, PAIR_MACHINE_VERSION};
+
+    fn household_id() -> HouseholdId {
+        HouseholdId::parse(format!("hh_{}", "a".repeat(52))).unwrap()
+    }
+
+    fn machine_id() -> MachineId {
+        MachineId::parse(format!("m_{}", "b".repeat(52))).unwrap()
+    }
+
+    fn owner_person_id() -> PersonId {
+        PersonId("p_owner-alpha".to_string())
+    }
+
+    fn approval_context(join_request_bytes: &[u8]) -> OwnerApprovalContextV2 {
+        OwnerApprovalContextV2::pair_machine_approve(PairMachineApprovalContextInput {
+            hh_id: household_id(),
+            owner_p_id: owner_person_id(),
+            cursor: 7,
+            m_id: machine_id(),
+            addr: "192.0.2.10:8091".to_string(),
+            transport: JoinTransport::Lan,
+            ttl_unix: 1_800,
+            nonce: [0x11; 32],
+            join_request_hash: join_request_hash(join_request_bytes),
+            capabilities: vec!["machine-cert".to_string(), "shamir-2pc".to_string()],
+            issued_at: 1_000,
+            expires_at: 1_120,
+            replay_nonce: [0x22; 32],
+        })
+    }
+
+    fn live_snapshot(join_request_bytes: &[u8]) -> PairMachineWindowSnapshot {
+        PairMachineWindowSnapshot {
+            version: PAIR_MACHINE_VERSION,
+            state: PairMachineState::AwaitingOwner,
+            m_pub: Some(ByteBuf::from(vec![0x03; 33])),
+            nonce: Some(ByteBuf::from(vec![0x11; 32])),
+            expiry: Some(1_800),
+            transport: Some(JoinTransport::Lan),
+            addr_hint: Some("192.0.2.10:8091".to_string()),
+            fingerprint: Some("fp-neutral".to_string()),
+            owner_event_cursor: Some(7),
+            cached_join_request: Some(ByteBuf::from(join_request_bytes.to_vec())),
+            cached_response: None,
+            anchor_secret: None,
+            pinned_hh_pub: None,
+            pinned_hh_id: None,
+        }
+    }
+
+    #[test]
+    fn owner_approval_policy_is_per_operation_and_default_off() {
+        let policy = OwnerApprovalEnforcementPolicy::default();
+        assert_eq!(
+            policy.pair_machine_approval_body_mode(false),
+            PairMachineApprovalBodyMode::LegacyV1
+        );
+        assert_eq!(
+            policy.pair_machine_approval_body_mode(true),
+            PairMachineApprovalBodyMode::LegacyV1
+        );
+        assert_eq!(
+            policy.bootstrap_initialize,
+            OwnerOperationEnforcement::LegacyOnly
+        );
+        assert_eq!(
+            policy.bootstrap_teardown,
+            OwnerOperationEnforcement::LegacyOnly
+        );
+        assert_eq!(
+            policy.pair_device_confirm,
+            OwnerOperationEnforcement::LegacyOnly
+        );
+        assert_eq!(
+            policy.revoke_credential,
+            OwnerOperationEnforcement::LegacyOnly
+        );
+    }
+
+    #[test]
+    fn pair_machine_v2_policy_requires_active_owner_passkey_before_requiring_v2() {
+        let policy = OwnerApprovalEnforcementPolicy::default()
+            .with_pair_machine_approve(OwnerOperationEnforcement::V2WhenOwnerHasActiveCredential);
+
+        assert_eq!(
+            policy.pair_machine_approval_body_mode(false),
+            PairMachineApprovalBodyMode::LegacyV1,
+            "owners without enrolled passkeys keep the legacy path during migration"
+        );
+        assert_eq!(
+            policy.pair_machine_approval_body_mode(true),
+            PairMachineApprovalBodyMode::RequireV2
+        );
+    }
+
+    #[test]
+    fn pair_machine_reassertion_accepts_unchanged_live_window() {
+        let join_request_bytes = b"neutral canonical join request";
+        let context = approval_context(join_request_bytes);
+        let snapshot = live_snapshot(join_request_bytes);
+
+        reassert_pair_machine_approval_context_against_live_window(&context, &snapshot).unwrap();
+    }
+
+    #[test]
+    fn pair_machine_reassertion_rejects_window_changed_after_approval() {
+        let join_request_bytes = b"neutral canonical join request";
+        let context = approval_context(join_request_bytes);
+        let mut snapshot = live_snapshot(join_request_bytes);
+        snapshot.cached_join_request = Some(ByteBuf::from(b"mutated join request".to_vec()));
+
+        let err = reassert_pair_machine_approval_context_against_live_window(&context, &snapshot)
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            OwnerApprovalV2Error::TrustedState("live join request changed")
+        ));
+    }
+
+    #[test]
+    fn pair_machine_reassertion_rejects_cursor_or_state_change_after_approval() {
+        let join_request_bytes = b"neutral canonical join request";
+        let context = approval_context(join_request_bytes);
+        let mut snapshot = live_snapshot(join_request_bytes);
+        snapshot.owner_event_cursor = Some(8);
+
+        let err = reassert_pair_machine_approval_context_against_live_window(&context, &snapshot)
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            OwnerApprovalV2Error::TrustedState("live window cursor changed")
+        ));
+
+        let mut snapshot = live_snapshot(join_request_bytes);
+        snapshot.state = PairMachineState::Committed;
+        let err = reassert_pair_machine_approval_context_against_live_window(&context, &snapshot)
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            OwnerApprovalV2Error::TrustedState("live window cursor changed")
+        ));
     }
 }
