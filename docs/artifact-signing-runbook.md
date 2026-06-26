@@ -114,13 +114,20 @@ every prebuilt install. Order:
 
     1. [done] Build the signer wrapper + wire sign-manifest into the publish script.
     2. [operator] Backfill: sign all 8 existing latest.json, commit the .sig.json,
-       git push. Verify each <url>.sig.json is reachable. Use:
+       git push. Verify the pushed raw.githubusercontent.com bytes. Use:
 
            THEYOS_ARTIFACT_SIGNING_KEY=/path/to/artifact-signing.key \
              ./scripts/backfill-artifact-manifest-signatures.sh --stage
 
        Then commit, push, and run the same helper in `--check-only` mode after
-       pulling the pushed commit on a clean checkout.
+       pulling the pushed commit on a clean checkout. Finally verify the live
+       registry bytes:
+
+           ./scripts/verify-artifact-manifest-signature-urls.sh
+
+       That helper downloads each live `latest.json` and `latest.json.sig.json`
+       pair from the registry URL and verifies the exact served bytes against
+       the production public pin.
     3. [done] Pin the public key + key_id in the client keyring, NOT yet enforced
        (the resolver still passes no trust in production).
     4. [code] Hard-cut: flip the resolver to Required for the prod registry host.
@@ -157,6 +164,8 @@ DONE and pushed:
   upload/commit.
 - `scripts/backfill-artifact-manifest-signatures.sh` - signs and verifies the
   existing registry manifests without rebuilding/uploading artifacts.
+- `scripts/verify-artifact-manifest-signature-urls.sh` - verifies the pushed
+  raw registry bytes before the Required hard-cut.
 
 PENDING (in order): the operator backfill of the 8 manifests; the Required
 hard-cut after the signed registry is pushed and verified.
