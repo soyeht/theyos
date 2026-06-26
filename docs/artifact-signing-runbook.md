@@ -75,32 +75,31 @@ via `--signer-cmd` (or `THEYOS_ARTIFACT_SIGNER_CMD`). The signer:
 - produces an ECDSA P-256 / SHA-256 signature in RAW form (64 bytes, `r||s`),
 - prints it base64url (no padding) on a single stdout line.
 
-`openssl` alone emits a DER-encoded signature, not raw `r||s`, so the signer
-needs a small DER->raw conversion wrapper.
+`openssl` alone emits a DER-encoded signature, not raw `r||s`, so
+`python3 scripts/sign_artifact_manifest_p256.py` converts DER to raw and prints
+the base64url signature. The wrapper signs the stdin payload as-is; the caller
+already applied the domain separator.
 
-Status: the signer wrapper is NOT built yet (tracked below). Until it exists,
-`sign-manifest` cannot run against the production key.
+Default builder-machine usage:
+
+    THEYOS_ARTIFACT_SIGNING_KEY=/path/to/artifact-signing.key \
+      ./scripts/publish-claw-artifact.sh <claw>
 
 ## Where signing fits in the publish flow
 
-`scripts/publish-claw-artifact.sh` today (run from the builder machine):
+`scripts/publish-claw-artifact.sh` (run from the builder machine):
 
     1. imagebuilder rebuild --force <claw>     # build the golden
     2. shrink rootfs.ext4 -> rootfs.ext4.zst
     3. imagebuilder publish-manifest <claw> .. # -> latest.json
-    4. gh release upload <tag> <.zst>          # .zst -> GitHub Releases
-    5. cp latest.json -> artifacts/<claw>/<arch>/ ; git add ; git commit
-    6. git push                                # -> raw.githubusercontent.com
-
-Signing adds one step after 3 and commits one extra file at 5:
-
     3b. imagebuilder sign-manifest <latest.json> \
           --key-id artifact-prod-p256-2026q2 \
           --signer-cmd "<signer>"              # -> latest.json.sig.json
+    3c. imagebuilder verify-manifest-signature <latest.json>
+          --signature <latest.json.sig.json>    # verify against production pin
+    4. gh release upload <tag> <.zst>           # .zst -> GitHub Releases
     5.  cp BOTH latest.json AND latest.json.sig.json ; git add both ; commit
-
-Wiring this into the script is a code change that needs review sign-off (it
-touches the release pipeline); it is not done yet.
+    6. git push                                 # -> raw.githubusercontent.com
 
 ## Rollout (publish-first, activate-second - do NOT invert)
 
@@ -109,10 +108,10 @@ nanobot, nullclaw, zeroclaw, picoclaw, hermes-agent, noclaw; x86_64-linux).
 Flipping the client to "require a signature" before those are signed would break
 every prebuilt install. Order:
 
-    1. [code] Build the signer wrapper + wire sign-manifest into the publish script.
+    1. [done] Build the signer wrapper + wire sign-manifest into the publish script.
     2. [operator] Backfill: sign all 8 existing latest.json, commit the .sig.json,
        git push. Verify each <url>.sig.json is reachable.
-    3. [code] Pin the public key + key_id in the client keyring, NOT yet enforced
+    3. [done] Pin the public key + key_id in the client keyring, NOT yet enforced
        (the resolver still passes no trust in production).
     4. [code] Hard-cut: flip the resolver to Required for the prod registry host.
        Only after step 2 is fully pushed and verified.
@@ -131,16 +130,21 @@ is proven stable in production.
 
 ## Current status (2026-06-25)
 
-DONE and reviewed (local only, branch `claw-store/p0.1a-artifact-keyring`,
-nothing pushed):
+DONE and pushed:
 
 - `core-rs/src/artifact_signature.rs` - detached-signature verifier.
-- `core-rs/src/artifact_trust.rs` - keyring (current/next/revoked) + trust mode.
+- `core-rs/src/artifact_trust.rs` - keyring (current/next/revoked), trust mode,
+  and pinned production public key.
 - `imagebuilder sign-manifest` - produces `latest.json.sig.json` from an external
   signer.
+- `imagebuilder verify-manifest-signature` - verifies `latest.json` +
+  `latest.json.sig.json` against the production pin.
 - `server-rs/src/artifact_resolver.rs` - verify-before-parse + the install-path
   seam `ArtifactResolver::for_install`. Production passes no trust, so signatures
   are NOT yet enforced (deferred status quo).
+- `scripts/sign_artifact_manifest_p256.py` - builder-machine signer wrapper.
+- `scripts/publish-claw-artifact.sh` - signs and verifies manifests before
+  upload/commit.
 
-PENDING (in order): signer wrapper + publish-script wiring; the operator backfill
-of the 8 manifests; pinning the public key in the keyring; the Required hard-cut.
+PENDING (in order): the operator backfill of the 8 manifests; the Required
+hard-cut after the signed registry is pushed and verified.
