@@ -303,6 +303,12 @@ E2E/focused handler:
 - v2 approval for one join request cannot approve a mutated `addr`,
   `transport`, `nonce`, or `join_request_hash`.
 - v2 approval cannot be replayed after a successful approval.
+- v2 approval failures use one generic HTTP error for context, credential,
+  origin/RP, sign-count, and WebAuthn verifier failures; the response must not
+  reveal which layer rejected the request.
+- pair-machine-only rollout accepts the legacy path only while the owner has no
+  active passkey credential. Once an active owner passkey exists, legacy v1
+  approval is rejected while S2 is enabled.
 - rejection happens before `CeremonyTxn::prepare` or any disk mutation.
 
 Cross-language fixture:

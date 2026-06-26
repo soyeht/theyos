@@ -1002,6 +1002,15 @@ mod tests {
             .unwrap_err();
         assert!(matches!(err, OwnerWebauthnError::ChallengeContextMismatch));
         assert_eq!(rp.challenge_store_len(), 0);
+
+        let replay = rp.finish_owner_approval_assertion(
+            NOW + 1,
+            &challenge_id,
+            &assertion,
+            &mut credential,
+            &expected_context,
+        );
+        assert!(matches!(replay, Err(OwnerWebauthnError::ChallengeNotFound)));
     }
 
     #[test]
@@ -1064,9 +1073,39 @@ mod tests {
     }
 
     #[test]
-    fn legacy_assertion_finish_rejects_context_bound_challenge() {
+    fn owner_approval_finish_rejects_and_consumes_legacy_unbound_challenge() {
         let mut rp = rp();
         let mut rng = StdRng::seed_from_u64(53);
+        let (mut credential, mut authenticator) = register_with_softpasskey(&mut rp, &mut rng);
+        let expected_context = owner_approval_context(b"join request A");
+
+        let (challenge_id, challenge) = rp
+            .start_assertion(&mut rng, NOW + 1, &[credential.clone()])
+            .unwrap();
+        let assertion = authenticator
+            .do_authentication(Url::parse("https://alpha.example.test").unwrap(), challenge)
+            .unwrap();
+
+        let err = rp
+            .finish_owner_approval_assertion(
+                NOW + 1,
+                &challenge_id,
+                &assertion,
+                &mut credential,
+                &expected_context,
+            )
+            .unwrap_err();
+        assert!(matches!(err, OwnerWebauthnError::ChallengeContextMissing));
+
+        let replay = rp.finish_assertion(NOW + 1, &challenge_id, &assertion, &mut credential);
+        assert!(matches!(replay, Err(OwnerWebauthnError::ChallengeNotFound)));
+        assert_eq!(rp.challenge_store_len(), 0);
+    }
+
+    #[test]
+    fn legacy_assertion_finish_rejects_context_bound_challenge() {
+        let mut rp = rp();
+        let mut rng = StdRng::seed_from_u64(54);
         let (mut credential, mut authenticator) = register_with_softpasskey(&mut rp, &mut rng);
         let expected_context = owner_approval_context(b"join request A");
 
@@ -1092,9 +1131,74 @@ mod tests {
     }
 
     #[test]
+    fn finish_paths_reject_authentication_result_for_wrong_credential() {
+        let mut rp = rp();
+        let mut rng = StdRng::seed_from_u64(55);
+        let (mut signing_credential, mut signing_authenticator) =
+            register_with_softpasskey(&mut rp, &mut rng);
+        let (mut other_credential, _) = register_with_softpasskey(&mut rp, &mut rng);
+
+        let (legacy_id, legacy_challenge) = rp
+            .start_assertion(&mut rng, NOW + 1, &[signing_credential.clone()])
+            .unwrap();
+        let legacy_assertion = signing_authenticator
+            .do_authentication(
+                Url::parse("https://alpha.example.test").unwrap(),
+                legacy_challenge,
+            )
+            .unwrap();
+        let err = rp
+            .finish_assertion(
+                NOW + 1,
+                &legacy_id,
+                &legacy_assertion,
+                &mut other_credential,
+            )
+            .unwrap_err();
+        assert!(matches!(err, OwnerWebauthnError::CredentialMismatch));
+        assert_eq!(rp.challenge_store_len(), 0);
+
+        let expected_context = owner_approval_context(b"join request A");
+        let (approval_id, approval_challenge) = rp
+            .start_owner_approval_assertion(
+                &mut rng,
+                NOW + 2,
+                &[signing_credential.clone()],
+                &expected_context,
+            )
+            .unwrap();
+        let approval_assertion = signing_authenticator
+            .do_authentication(
+                Url::parse("https://alpha.example.test").unwrap(),
+                approval_challenge,
+            )
+            .unwrap();
+        let err = rp
+            .finish_owner_approval_assertion(
+                NOW + 2,
+                &approval_id,
+                &approval_assertion,
+                &mut other_credential,
+                &expected_context,
+            )
+            .unwrap_err();
+        assert!(matches!(err, OwnerWebauthnError::CredentialMismatch));
+        assert_eq!(rp.challenge_store_len(), 0);
+
+        let replay = rp.finish_owner_approval_assertion(
+            NOW + 2,
+            &approval_id,
+            &approval_assertion,
+            &mut signing_credential,
+            &expected_context,
+        );
+        assert!(matches!(replay, Err(OwnerWebauthnError::ChallengeNotFound)));
+    }
+
+    #[test]
     fn softpasskey_assertion_rejects_origin_mismatch() {
         let mut rp = rp();
-        let mut rng = StdRng::seed_from_u64(49);
+        let mut rng = StdRng::seed_from_u64(56);
         let (credential, mut authenticator) = register_with_softpasskey(&mut rp, &mut rng);
 
         let (_challenge_id, challenge) = rp
