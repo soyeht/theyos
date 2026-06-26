@@ -1,0 +1,60 @@
+{
+  "contract": "soyeht-owner-approval-v2-cbor-cross-language",
+  "version": 1,
+  "about": [
+    "Cross-language golden vectors for owner approval Protocol-v2 contexts.",
+    "They pin the RFC 8949 deterministic CBOR bytes and SHA-256 challenge",
+    "digest used by WebAuthn owner assertions. The Swift side must reproduce",
+    "the same canonical_cbor_hex and challenge_sha256_hex values byte-for-byte."
+  ],
+  "format": {
+    "challenge_domain_ascii_nul": "soyeht-owner-approval-v2\\0",
+    "challenge_sha256_hex": "SHA-256(challenge_domain_ascii_nul || canonical_cbor_bytes)",
+    "canonical_cbor": "RFC 8949 4.2.1 deterministic map encoding; text keys are ordered by their encoded bytes.",
+    "none_fields": "Optional fields are omitted, never encoded as null.",
+    "byte_fields": ["nonce", "join_request_hash", "replay_nonce"],
+    "owner_operation": "kebab-case string with fixed mapping; do not let language-default enum encoding choose wire names."
+  },
+  "owner_approval_context_v2": [
+    {
+      "id": "pair_machine_approve_lan",
+      "input": {
+        "v": 2,
+        "purpose": "owner-approval-v2",
+        "op": "pair-machine-approve",
+        "hh_id": "hh_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "owner_p_id": "p_owner-alpha",
+        "cursor": 7,
+        "m_id": "m_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "addr": "192.0.2.10:8091",
+        "transport": "lan",
+        "ttl_unix": 1800,
+        "nonce_hex": "1111111111111111111111111111111111111111111111111111111111111111",
+        "join_request_hash_hex": "2222222222222222222222222222222222222222222222222222222222222222",
+        "capabilities": ["machine-cert", "shamir-2pc"],
+        "issued_at": 1000,
+        "expires_at": 1600,
+        "replay_nonce_hex": "3333333333333333333333333333333333333333333333333333333333333333"
+      },
+      "canonical_cbor_hex": "b0617602626f7074706169722d6d616368696e652d617070726f766564616464726f3139322e302e322e31303a38303931646d5f696478366d5f626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262626568685f6964783768685f61616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161656e6f6e63655820111111111111111111111111111111111111111111111111111111111111111166637572736f720767707572706f7365716f776e65722d617070726f76616c2d76326874746c5f756e6978190708696973737565645f61741903e8697472616e73706f7274636c616e6a657870697265735f61741906406a6f776e65725f705f69646d705f6f776e65722d616c7068616c6361706162696c6974696573826c6d616368696e652d636572746a7368616d69722d3270636c7265706c61795f6e6f6e636558203333333333333333333333333333333333333333333333333333333333333333716a6f696e5f726571756573745f6861736858202222222222222222222222222222222222222222222222222222222222222222",
+      "challenge_sha256_hex": "c63baf8d42fa3e6b26e40cb1289770b80c836cb95c4f6d122208ccb1a967ca7a"
+    },
+    {
+      "id": "bootstrap_teardown_omits_optional_fields",
+      "input": {
+        "v": 2,
+        "purpose": "owner-approval-v2",
+        "op": "bootstrap-teardown",
+        "hh_id": "hh_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "owner_p_id": "p_owner-alpha",
+        "capabilities": [],
+        "issued_at": 1000,
+        "expires_at": 1100,
+        "replay_nonce_hex": "7777777777777777777777777777777777777777777777777777777777777777"
+      },
+      "canonical_cbor_hex": "a9617602626f7072626f6f7473747261702d74656172646f776e6568685f6964783768685f6161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616167707572706f7365716f776e65722d617070726f76616c2d7632696973737565645f61741903e86a657870697265735f617419044c6a6f776e65725f705f69646d705f6f776e65722d616c7068616c6361706162696c6974696573806c7265706c61795f6e6f6e636558207777777777777777777777777777777777777777777777777777777777777777",
+      "challenge_sha256_hex": "bc5c8c1f7fcf4095c712bad6e25814686eedda3821581a9071d1f9981f7bb925",
+      "omitted_fields": ["cursor", "m_id", "addr", "transport", "ttl_unix", "nonce", "join_request_hash"]
+    }
+  ]
+}
