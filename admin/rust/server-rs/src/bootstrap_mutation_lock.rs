@@ -5,6 +5,9 @@
 //!
 //! Acquiring this lock serialises:
 //!
+//!   - `POST /bootstrap/initialize`
+//!   - `POST /bootstrap/teardown`
+//!   - `POST /api/v1/household/pair-device/confirm`
 //!   - `POST /bootstrap/accept-household`
 //!   - `POST /bootstrap/accept-household/confirm`
 //!   - `POST /bootstrap/pair-machine/local/stage`
@@ -20,10 +23,12 @@
 //! arrival observe the committed state and refuse cleanly with the
 //! contract's 401 / 409 surface rather than corrupting on-disk identity.
 //!
-//! The lock guards **mutation**, not the entire handler — long-running
-//! best-effort work (Bonjour publish, task spawn, network probes) must
-//! run AFTER the guard is dropped. See the call sites for the exact
-//! critical-section shape.
+//! The lock guards the full state transaction: the authoritative state
+//! check, disk writes, in-memory state updates, and pairing-window mutation
+//! must stay in one critical section. Long-running best-effort work (Bonjour
+//! publish, detached cleanup, network probes) must run AFTER the guard is
+//! dropped or be explicitly detached so it cannot extend the critical section.
+//! See the call sites for the exact shape.
 
 /// Single-process async mutex held by every handler that mutates
 /// bootstrap state or household identity files. See module docs.

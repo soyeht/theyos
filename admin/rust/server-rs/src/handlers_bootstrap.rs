@@ -889,7 +889,8 @@ fn pair_machine_stage_error_response(error: &crate::pair_machine_local::StageErr
 /// atomic `check_and_persist` (burns nonce before cert/sig checks to prevent
 /// probing different `signed_by` values with the same nonce).
 pub async fn post_teardown(State(state): State<BootstrapHandlerState>, body: Bytes) -> Response {
-    // Step 1: State gate.
+    // Step 1: Fast state gate. The authoritative gate is repeated under
+    // `BOOTSTRAP_MUTATION_LOCK` before any disk/memory mutation.
     let current_bs = *state.bootstrap.read().await;
     match current_bs {
         BootstrapState::NamedAwaitingPair | BootstrapState::Ready | BootstrapState::Recovering => {}
@@ -993,6 +994,31 @@ pub async fn post_teardown(State(state): State<BootstrapHandlerState>, body: Byt
             None,
         );
     };
+
+    let _mutation_guard = crate::bootstrap_mutation_lock::BOOTSTRAP_MUTATION_LOCK
+        .lock()
+        .await;
+
+    // Re-check inside the mutation lock so teardown cannot race initialize,
+    // pair-machine finalize, or accept-household confirm between the cheap
+    // preflight gate and the disk/memory updates below.
+    let current_bs = *state.bootstrap.read().await;
+    match current_bs {
+        BootstrapState::NamedAwaitingPair | BootstrapState::Ready | BootstrapState::Recovering => {}
+        other => {
+            tracing::warn!(
+                stage = "teardown.rejected",
+                reason = "no_household_under_lock",
+                state = other.as_str()
+            );
+            return cbor_error(
+                StatusCode::CONFLICT,
+                BootstrapErrorCode::NoHouseholdToTeardown.as_str(),
+                None,
+                Some(other.as_str()),
+            );
+        }
+    }
 
     // Validate hh_id / m_id against this engine's live identity.
     let Some(identity) = state.household.current().await else {
@@ -1771,7 +1797,13 @@ pub async fn post_initialize(
         );
     }
 
-    // 3. State gate (read first for fast rejection).
+    let _mutation_guard = crate::bootstrap_mutation_lock::BOOTSTRAP_MUTATION_LOCK
+        .lock()
+        .await;
+
+    // 3. Authoritative state gate. Keep the check, identity write, bootstrap
+    // state persist, in-memory update, and first pairing token mint inside the
+    // same mutation critical section.
     {
         let current = state.bootstrap.read().await;
         match *current {

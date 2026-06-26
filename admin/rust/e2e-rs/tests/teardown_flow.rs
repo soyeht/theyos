@@ -313,6 +313,43 @@ async fn teardown_flow_second_call_returns_409() {
     );
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_teardown_allows_exactly_one_success() {
+    set_test_env("THEYOS_FORCE_SOFTWARE_KEYS", "1");
+
+    let fix = make_fixture(BootstrapState::Ready);
+    let ts = now();
+    let app = make_app(&fix);
+    let barrier = Arc::new(tokio::sync::Barrier::new(17));
+
+    let mut tasks = Vec::new();
+    for idx in 0..16 {
+        let app = app.clone();
+        let body = signed_teardown(&fix, ts, nonce((idx + 10) as u8));
+        let barrier = Arc::clone(&barrier);
+        tasks.push(tokio::spawn(async move {
+            barrier.wait().await;
+            post_teardown(app, body).await.0
+        }));
+    }
+    barrier.wait().await;
+
+    let mut ok = 0;
+    let mut conflict = 0;
+    for task in tasks {
+        match task.await.unwrap() {
+            StatusCode::OK => ok += 1,
+            StatusCode::CONFLICT => conflict += 1,
+            other => panic!("unexpected teardown status {other}"),
+        }
+    }
+    assert_eq!(ok, 1, "exactly one teardown transaction may win");
+    assert_eq!(
+        conflict, 15,
+        "all losing races must observe torn-down state"
+    );
+}
+
 /// `NamedAwaitingPair` teardown succeeds without owner cert (R5-E: cert+sig skipped).
 #[tokio::test]
 async fn teardown_flow_named_awaiting_pair_no_cert_required() {

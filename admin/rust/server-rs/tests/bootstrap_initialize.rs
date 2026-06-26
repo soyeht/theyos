@@ -16,6 +16,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use axum::{
+    Router,
     body::Body,
     http::{Request, StatusCode},
 };
@@ -91,6 +92,10 @@ fn cbor_request(name: &str) -> Vec<u8> {
 
 async fn call_initialize(state: BootstrapHandlerState, body: Vec<u8>) -> (StatusCode, Vec<u8>) {
     let app = bootstrap_router(state);
+    call_initialize_app(app, body).await
+}
+
+async fn call_initialize_app(app: Router, body: Vec<u8>) -> (StatusCode, Vec<u8>) {
     let req = Request::builder()
         .method("POST")
         .uri("/bootstrap/initialize")
@@ -165,6 +170,42 @@ async fn initialize_when_ready_for_naming_also_succeeds() {
     let state = make_state(BootstrapState::ReadyForNaming, dir);
     let (status, _) = call_initialize(state, cbor_request("RFN Home")).await;
     assert_eq!(status, StatusCode::OK);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_initialize_allows_exactly_one_success() {
+    set_test_env("THEYOS_FORCE_SOFTWARE_KEYS", "1");
+    let dir = make_state_dir();
+    let state = make_state(BootstrapState::Uninitialized, dir);
+    let app = bootstrap_router(state);
+    let barrier = Arc::new(tokio::sync::Barrier::new(33));
+
+    let mut tasks = Vec::new();
+    for idx in 0..32 {
+        let app = app.clone();
+        let barrier = Arc::clone(&barrier);
+        tasks.push(tokio::spawn(async move {
+            barrier.wait().await;
+            let body = cbor_request(&format!("Race Home {idx}"));
+            call_initialize_app(app, body).await.0
+        }));
+    }
+    barrier.wait().await;
+
+    let mut ok = 0;
+    let mut conflict = 0;
+    for task in tasks {
+        match task.await.unwrap() {
+            StatusCode::OK => ok += 1,
+            StatusCode::CONFLICT => conflict += 1,
+            other => panic!("unexpected initialize status {other}"),
+        }
+    }
+    assert_eq!(ok, 1, "exactly one initialize transaction may win");
+    assert_eq!(
+        conflict, 31,
+        "all losing races must observe initialized state"
+    );
 }
 
 // ── Name validation ───────────────────────────────────────────────────────────

@@ -119,10 +119,6 @@ pub async fn confirm(
         log_pair_rejected("malformed_body");
         return StatusCode::NOT_FOUND.into_response();
     }
-    let Some(identity) = state.household.current().await else {
-        log_pair_rejected("identity_unavailable");
-        return StatusCode::NOT_FOUND.into_response();
-    };
     let Ok(p_pub_bytes) = B64URL.decode(&req.p_pub) else {
         log_pair_rejected("malformed_key");
         return StatusCode::NOT_FOUND.into_response();
@@ -150,6 +146,18 @@ pub async fn confirm(
         .unwrap_or_else(|| "Owner".to_string());
     let Some(now) = time_util::unix_now_secs_checked("pair_device.confirm.clock") else {
         log_pair_rejected("clock_invalid");
+        return StatusCode::NOT_FOUND.into_response();
+    };
+
+    let _mutation_guard = crate::bootstrap_mutation_lock::BOOTSTRAP_MUTATION_LOCK
+        .lock()
+        .await;
+
+    // Pair-device confirm writes owner auth, consumes the pairing window, and
+    // may advance bootstrap state. Keep that transaction serialized with
+    // initialize/teardown and the machine-pairing bootstrap mutations.
+    let Some(identity) = state.household.current().await else {
+        log_pair_rejected("identity_unavailable");
         return StatusCode::NOT_FOUND.into_response();
     };
     let state_dir = state.state_dir.clone();
