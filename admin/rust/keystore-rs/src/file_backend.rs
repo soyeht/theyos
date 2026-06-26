@@ -90,7 +90,7 @@ impl KeystoreBackend for FileKeystore {
 
     fn set(&self, account: &str, value: &[u8]) -> Result<(), KeystoreError> {
         let dir = self.secrets_dir();
-        if let Err(e) = fs::create_dir_all(&dir) {
+        if let Err(e) = ensure_private_dir(&dir) {
             return Err(KeystoreError::Io {
                 kind: e.kind().to_string(),
                 hint: format!("create {}: {e}", dir.display()),
@@ -132,6 +132,26 @@ fn sanitize_path_segment(s: &str) -> String {
         out.insert(0, '_');
     }
     out
+}
+
+/// Create `dir` if missing and, on unix, restrict it to owner-only `0o700`.
+/// Idempotent: also tightens an already-existing directory whose mode is more
+/// permissive, repairing dirs created under a looser umask before this guard
+/// existed. The files inside are already `0o600`; this stops the secrets
+/// directory from being listable by other local users (which would leak the
+/// account names stored there).
+fn ensure_private_dir(dir: &Path) -> std::io::Result<()> {
+    fs::create_dir_all(dir)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = fs::metadata(dir)?.permissions();
+        if perms.mode() & 0o777 != 0o700 {
+            perms.set_mode(0o700);
+            fs::set_permissions(dir, perms)?;
+        }
+    }
+    Ok(())
 }
 
 #[cfg(unix)]
@@ -195,4 +215,54 @@ fn write_0600(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     drop(file);
     fs::rename(&tmp_path, path)?;
     Ok(())
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    fn mode_of(path: &Path) -> u32 {
+        fs::metadata(path).unwrap().permissions().mode() & 0o777
+    }
+
+    #[test]
+    fn set_uses_owner_only_file_and_dir() {
+        let td = tempfile::tempdir().unwrap();
+        let ks = FileKeystore::new(td.path(), "household");
+        ks.set("acct", b"secret-bytes").unwrap();
+
+        let file = ks.path_for("acct");
+        assert_eq!(mode_of(&file), 0o600, "secret file must be owner-only");
+        assert_eq!(
+            mode_of(file.parent().unwrap()),
+            0o700,
+            "secrets dir must be owner-only (not listable by other local users)"
+        );
+    }
+
+    #[test]
+    fn set_tightens_preexisting_loose_dir() {
+        let td = tempfile::tempdir().unwrap();
+        let ks = FileKeystore::new(td.path(), "household");
+        let dir = ks.path_for("acct").parent().unwrap().to_path_buf();
+        fs::create_dir_all(&dir).unwrap();
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o777)).unwrap();
+
+        ks.set("acct", b"secret-bytes").unwrap();
+
+        assert_eq!(
+            mode_of(&dir),
+            0o700,
+            "a pre-existing permissive secrets dir must be tightened on write"
+        );
+    }
+
+    #[test]
+    fn set_get_round_trip() {
+        let td = tempfile::tempdir().unwrap();
+        let ks = FileKeystore::new(td.path(), "svc");
+        ks.set("a", b"hello world").unwrap();
+        assert_eq!(ks.get("a").unwrap(), b"hello world");
+    }
 }

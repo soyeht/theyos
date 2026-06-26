@@ -14,7 +14,8 @@ const INSTANCE_COLS: &str = "id, name, container, claw_type, host_port, status, 
     vm_ip, vm_mac, efi_store_path, cidata_iso_path, disk_path, \
     guest_os, aux_storage_path, owner_id, \
     cpu_cores, ram_config_mb, disk_gb, \
-    desired_state, observed_state, deleted_at, household_id, household_machine_id";
+    desired_state, observed_state, deleted_at, household_id, household_machine_id, \
+    provisioning_failure_code";
 
 /// User role within the multi-tenant system.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -422,6 +423,11 @@ pub struct InstanceRow {
     pub status: InstanceStatus,
     pub provisioning_message: Option<String>,
     pub provisioning_error: Option<String>,
+    /// Sanitized machine-readable failure reason (a snake_case
+    /// `InstanceFailureCode`), stamped when `status == Failed`. `None` for rows
+    /// that were never stamped (older rows / non-failed). The raw human detail
+    /// stays in `provisioning_error`.
+    pub provisioning_failure_code: Option<String>,
     /// Provisioning phase for mobile Live Activity (`"queuing"`, `"pulling"`, `"starting"`).
     pub provisioning_phase: Option<String>,
     pub job_id: Option<String>,
@@ -568,6 +574,8 @@ impl InstanceDb {
         // Migration: add Cloudflare tunnel config (single-row table for the
         // operator's API-driven setup)
         Self::migrate_cloudflare_config(conn)?;
+        // Migration: add provisioning_failure_code column (idempotent)
+        Self::migrate_provisioning_failure_code(conn)?;
         Ok(())
     }
 
@@ -695,6 +703,27 @@ impl InstanceDb {
             .map_err(|e| StoreError::Internal(format!("migrate vz_network_columns: {e}")))?;
         }
 
+        Ok(())
+    }
+
+    /// Add the `provisioning_failure_code` column if it doesn't exist (idempotent).
+    fn migrate_provisioning_failure_code(conn: &Connection) -> Result<(), StoreError> {
+        let has_col: bool = conn
+            .query_row(
+                "SELECT COUNT(*) > 0 FROM pragma_table_info('instances') \
+                 WHERE name='provisioning_failure_code'",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|e| {
+                StoreError::Internal(format!("check provisioning_failure_code column: {e}"))
+            })?;
+        if !has_col {
+            conn.execute_batch("ALTER TABLE instances ADD COLUMN provisioning_failure_code TEXT;")
+                .map_err(|e| {
+                    StoreError::Internal(format!("migrate provisioning_failure_code: {e}"))
+                })?;
+        }
         Ok(())
     }
 
@@ -1478,8 +1507,11 @@ impl InstanceDb {
             InstanceStatus::Failed => "failed",
         };
         conn.execute(
+            // `provisioning_failure_code=NULL` clears any stamped code on every
+            // status transition; a dedicated setter re-stamps it on failure.
             "UPDATE instances SET status=?1, provisioning_message=?2, provisioning_error=?3, \
              provisioning_phase=?4, job_id=?5, observed_state=?7, \
+             provisioning_failure_code=NULL, \
              updated_at=CURRENT_TIMESTAMP WHERE id=?6",
             params![
                 update.status.as_str(),
@@ -1492,6 +1524,28 @@ impl InstanceDb {
             ],
         )
         .map_err(|e| StoreError::Internal(format!("update_status: {e}")))?;
+        Ok(())
+    }
+
+    /// Stamp (or clear) the sanitized `provisioning_failure_code` for an
+    /// instance. Independent of [`update_status`] so the failure-code stamp
+    /// never masks the primary status update: callers mark the instance Failed
+    /// first, then best-effort attach the code.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError`] if the UPDATE fails.
+    pub fn set_provisioning_failure_code(
+        &self,
+        id: &str,
+        code: Option<&str>,
+    ) -> Result<(), StoreError> {
+        let conn = self.conn()?;
+        conn.execute(
+            "UPDATE instances SET provisioning_failure_code=?1 WHERE id=?2",
+            params![code, id],
+        )
+        .map_err(|e| StoreError::Internal(format!("set_provisioning_failure_code: {e}")))?;
         Ok(())
     }
 
@@ -4047,6 +4101,7 @@ fn row_to_instance(row: &rusqlite::Row<'_>) -> rusqlite::Result<InstanceRow> {
         deleted_at: row.get(32)?,
         household_id: row.get(33)?,
         household_machine_id: row.get(34)?,
+        provisioning_failure_code: row.get(35)?,
     })
 }
 
@@ -4128,6 +4183,86 @@ mod instance_db_tests {
         assert_eq!(row.name, "foo");
         assert_eq!(row.status, InstanceStatus::Provisioning);
         assert_eq!(row.host_port, None);
+    }
+
+    #[test]
+    fn fresh_row_has_no_provisioning_failure_code() {
+        // The migration ran (else the SELECT would fail); a fresh row is NULL.
+        let db = open_temp();
+        db.insert(&foo_inst()).unwrap();
+        assert_eq!(
+            db.get("inst-foo")
+                .unwrap()
+                .unwrap()
+                .provisioning_failure_code,
+            None
+        );
+    }
+
+    #[test]
+    fn set_and_clear_provisioning_failure_code() {
+        let db = open_temp();
+        db.insert(&foo_inst()).unwrap();
+        db.set_provisioning_failure_code("inst-foo", Some("host_vm_limit_reached"))
+            .unwrap();
+        assert_eq!(
+            db.get("inst-foo")
+                .unwrap()
+                .unwrap()
+                .provisioning_failure_code,
+            Some("host_vm_limit_reached".to_string())
+        );
+        db.set_provisioning_failure_code("inst-foo", None).unwrap();
+        assert_eq!(
+            db.get("inst-foo")
+                .unwrap()
+                .unwrap()
+                .provisioning_failure_code,
+            None
+        );
+    }
+
+    #[test]
+    fn update_status_clears_failure_code_then_restamp() {
+        let db = open_temp();
+        db.insert(&foo_inst()).unwrap();
+        db.set_provisioning_failure_code("inst-foo", Some("snapshot_failed"))
+            .unwrap();
+        // Any status transition clears the stale code.
+        db.update_status(&StatusUpdate {
+            id: "inst-foo",
+            status: InstanceStatus::Active,
+            message: "",
+            error: "",
+            job_id: "",
+            phase: "",
+        })
+        .unwrap();
+        assert_eq!(
+            db.get("inst-foo")
+                .unwrap()
+                .unwrap()
+                .provisioning_failure_code,
+            None
+        );
+        // The mark_failed order: update_status(Failed) clears, then re-stamp.
+        db.update_status(&StatusUpdate {
+            id: "inst-foo",
+            status: InstanceStatus::Failed,
+            message: "",
+            error: "boom",
+            job_id: "",
+            phase: "",
+        })
+        .unwrap();
+        db.set_provisioning_failure_code("inst-foo", Some("vm_start_failed"))
+            .unwrap();
+        let row = db.get("inst-foo").unwrap().unwrap();
+        assert_eq!(
+            row.provisioning_failure_code,
+            Some("vm_start_failed".to_string())
+        );
+        assert_eq!(row.provisioning_error, Some("boom".to_string()));
     }
 
     #[test]

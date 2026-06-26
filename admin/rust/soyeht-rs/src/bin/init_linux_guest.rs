@@ -29,6 +29,9 @@ use core_rs::ipc::client::IpcClient;
 use serde_json::json;
 use std::path::PathBuf;
 
+const VMRUNNER_ENV: &str = "THEYOS_VMRUNNER_RS_BIN";
+const LEGACY_VMRUNNER_ENV: &str = "THEYOS_VMRUNNER_MACOS_RS_BIN";
+
 /// Initialize or remove the Linux guest base image for theyOS.
 #[derive(Parser)]
 #[command(name = "init_linux_guest")]
@@ -62,8 +65,8 @@ struct Cli {
     #[arg(long, env = "THEYOS_LINUX_IMAGE_URL", default_value = "")]
     image_url: String,
 
-    /// Path to `vmrunner_macos_ipc` binary (default: `THEYOS_VMRUNNER_MACOS_RS_BIN` env)
-    #[arg(long, env = "THEYOS_VMRUNNER_MACOS_RS_BIN")]
+    /// Path to `vmrunner_macos_ipc` binary (default: `THEYOS_VMRUNNER_RS_BIN` env)
+    #[arg(long, env = "THEYOS_VMRUNNER_RS_BIN")]
     vmrunner_bin: Option<String>,
 }
 
@@ -273,30 +276,118 @@ fn cmd_status(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 fn build_client(bin_path: Option<&str>) -> Result<IpcClient, Box<dyn std::error::Error>> {
-    let resolved = bin_path
-        .map(str::to_string)
-        .or_else(|| std::env::var("THEYOS_VMRUNNER_MACOS_RS_BIN").ok())
-        .unwrap_or_else(|| {
-            let manifest = std::env::var("CARGO_MANIFEST_DIR").unwrap_or_else(|_| ".".into());
-            PathBuf::from(manifest)
-                .parent()
-                .unwrap_or_else(|| std::path::Path::new("."))
-                .join("target/release/vmrunner_macos_ipc")
-                .display()
-                .to_string()
-        });
+    let resolved = resolve_vmrunner_bin_path(bin_path);
 
     IpcClient::start(&resolved, &[]).map_err(|e| {
         format!(
             "Failed to start vmrunner_macos_ipc at '{resolved}': {e}\n\
-             Set THEYOS_VMRUNNER_MACOS_RS_BIN to the correct binary path."
+             Set THEYOS_VMRUNNER_RS_BIN to the correct binary path \
+             (legacy THEYOS_VMRUNNER_MACOS_RS_BIN is still accepted)."
         )
         .into()
     })
+}
+
+fn resolve_vmrunner_bin_path(bin_path: Option<&str>) -> String {
+    resolve_vmrunner_bin_path_from_candidates(
+        bin_path.map(str::to_string),
+        std::env::var(VMRUNNER_ENV).ok(),
+        std::env::var(LEGACY_VMRUNNER_ENV).ok(),
+        same_exe_vmrunner_path(),
+        cargo_vmrunner_path(),
+    )
+}
+
+fn resolve_vmrunner_bin_path_from_candidates(
+    explicit: Option<String>,
+    canonical: Option<String>,
+    legacy: Option<String>,
+    same_exe: Option<String>,
+    cargo: String,
+) -> String {
+    explicit
+        .filter(|value| !value.is_empty())
+        .or_else(|| canonical.filter(|value| !value.is_empty()))
+        .or_else(|| legacy.filter(|value| !value.is_empty()))
+        .or(same_exe)
+        .unwrap_or(cargo)
+}
+
+fn same_exe_vmrunner_path() -> Option<String> {
+    let exe = std::env::current_exe().ok()?;
+    let dir = exe.parent()?;
+    let candidate = dir.join("vmrunner_macos_ipc");
+    candidate.is_file().then(|| candidate.display().to_string())
+}
+
+fn cargo_vmrunner_path() -> String {
+    let manifest = std::env::var("CARGO_MANIFEST_DIR").unwrap_or_else(|_| ".".into());
+    PathBuf::from(manifest)
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new("."))
+        .join("target/release/vmrunner_macos_ipc")
+        .display()
+        .to_string()
 }
 
 #[cfg(not(target_os = "macos"))]
 fn main() {
     eprintln!("init_linux_guest requires macOS with Apple Virtualization Framework");
     std::process::exit(1);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn vmrunner_bin_resolution_prefers_explicit_then_canonical_then_legacy() {
+        let resolved = resolve_vmrunner_bin_path_from_candidates(
+            Some("/explicit/vmrunner".into()),
+            Some("/canonical/vmrunner".into()),
+            Some("/legacy/vmrunner".into()),
+            Some("/same-exe/vmrunner".into()),
+            "/cargo/vmrunner".into(),
+        );
+        assert_eq!(resolved, "/explicit/vmrunner");
+
+        let resolved = resolve_vmrunner_bin_path_from_candidates(
+            None,
+            Some("/canonical/vmrunner".into()),
+            Some("/legacy/vmrunner".into()),
+            Some("/same-exe/vmrunner".into()),
+            "/cargo/vmrunner".into(),
+        );
+        assert_eq!(resolved, "/canonical/vmrunner");
+
+        let resolved = resolve_vmrunner_bin_path_from_candidates(
+            None,
+            None,
+            Some("/legacy/vmrunner".into()),
+            Some("/same-exe/vmrunner".into()),
+            "/cargo/vmrunner".into(),
+        );
+        assert_eq!(resolved, "/legacy/vmrunner");
+    }
+
+    #[test]
+    fn vmrunner_bin_resolution_falls_back_to_same_exe_then_cargo() {
+        let resolved = resolve_vmrunner_bin_path_from_candidates(
+            None,
+            None,
+            None,
+            Some("/same-exe/vmrunner".into()),
+            "/cargo/vmrunner".into(),
+        );
+        assert_eq!(resolved, "/same-exe/vmrunner");
+
+        let resolved = resolve_vmrunner_bin_path_from_candidates(
+            None,
+            None,
+            None,
+            None,
+            "/cargo/vmrunner".into(),
+        );
+        assert_eq!(resolved, "/cargo/vmrunner");
+    }
 }

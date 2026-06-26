@@ -103,6 +103,44 @@
       }
     },
     {
+      "id": "admin_resource_options",
+      "surface": "admin",
+      "method": "GET",
+      "path_template": "/api/v1/resource-options",
+      "auth_kind": "admin_session",
+      "handler": "handlers_mobile::handle_admin_resource_options",
+      "mount": {
+        "file": "admin/rust/server-rs/src/claw_store_routes.rs",
+        "slice": "admin_routes",
+        "route_literal": "/resource-options",
+        "method_helper": "get"
+      },
+      "expectations": {
+        "success": { "status": 200, "fixture": "resource_options_success" },
+        "auth_error": { "status": 401, "fixture": "admin_auth_unauthorized" },
+        "admin_required": { "status": 403, "fixture": "admin_required" }
+      }
+    },
+    {
+      "id": "admin_users",
+      "surface": "admin",
+      "method": "GET",
+      "path_template": "/api/v1/users",
+      "auth_kind": "admin_session",
+      "handler": "handlers_mobile::handle_admin_users",
+      "mount": {
+        "file": "admin/rust/server-rs/src/claw_store_routes.rs",
+        "slice": "admin_routes",
+        "route_literal": "/users",
+        "method_helper": "get"
+      },
+      "expectations": {
+        "success": { "status": 200, "fixture": "users_list_envelope" },
+        "auth_error": { "status": 401, "fixture": "admin_auth_unauthorized" },
+        "admin_required": { "status": 403, "fixture": "admin_required" }
+      }
+    },
+    {
       "id": "admin_create_instance",
       "surface": "admin",
       "method": "POST",
@@ -507,6 +545,25 @@
         "unknown": { "status": 404, "fixture": "unknown_claw_error" },
         "not_ready": { "status": 400, "fixture": "not_installed_error" },
         "instances_exist": { "status": 400, "fixture": "uninstall_instances_exist_error" },
+        "auth_error": { "status": 401, "fixture": "empty_body" }
+      }
+    },
+    {
+      "id": "household_list_instances",
+      "surface": "household",
+      "method": "GET",
+      "path_template": "/api/v1/household/instances",
+      "auth_kind": "household_pop",
+      "household_operation": "claws.list",
+      "handler": "handlers_household_claws::handle_household_list_instances",
+      "mount": {
+        "file": "admin/rust/server-rs/src/household_bootstrap.rs",
+        "slice": "household_claws_router",
+        "route_literal": "/api/v1/household/instances",
+        "method_helper": "get"
+      },
+      "expectations": {
+        "success": { "status": 200, "fixture": "household_instance_list_empty" },
         "auth_error": { "status": 401, "fixture": "empty_body" }
       }
     },
@@ -970,11 +1027,45 @@
       },
       "job": null
     },
+    "household_instance_list_empty": {
+      "data": [],
+      "has_more": false,
+      "next_cursor": null
+    },
     "mobile_household_instance_status_active": {
       "status": "active",
       "provisioning_message": null,
       "provisioning_error": null,
       "provisioning_phase": null
+    },
+    "resource_options_success": {
+      "cpu_cores": {
+        "min": 1,
+        "max": 8,
+        "default": 2
+      },
+      "ram_mb": {
+        "min": 512,
+        "max": 16384,
+        "default": 2048
+      },
+      "disk_gb": {
+        "min": 5,
+        "max": 100,
+        "default": 10,
+        "disabled": false
+      }
+    },
+    "users_list_envelope": {
+      "data": [
+        {
+          "id": "usr-alpha",
+          "username": "admin",
+          "role": "admin"
+        }
+      ],
+      "has_more": false,
+      "next_cursor": null
     },
     "instance_not_found_error": {
       "error": "instance not found",
@@ -1007,6 +1098,10 @@
       "code": "UNAUTHORIZED"
     },
     "mobile_admin_required": {
+      "error": "admin access required",
+      "code": "FORBIDDEN"
+    },
+    "admin_required": {
       "error": "admin access required",
       "code": "FORBIDDEN"
     },

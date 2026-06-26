@@ -5,6 +5,9 @@ use std::process::{Command, Stdio};
 
 use crate::util::{cmd_available, is_exec};
 
+const VMRUNNER_ENV: &str = "THEYOS_VMRUNNER_RS_BIN";
+const LEGACY_VMRUNNER_ENV: &str = "THEYOS_VMRUNNER_MACOS_RS_BIN";
+
 // ── DoctorReport ─────────────────────────────────────────────────────────────
 
 #[derive(Default)]
@@ -104,6 +107,28 @@ fn macos_vm_assets_dir() -> PathBuf {
         },
         PathBuf::from,
     )
+}
+
+fn macos_vmrunner_bin(root: &Path) -> PathBuf {
+    resolve_macos_vmrunner_bin(
+        root,
+        std::env::var(VMRUNNER_ENV).ok(),
+        std::env::var(LEGACY_VMRUNNER_ENV).ok(),
+    )
+}
+
+fn resolve_macos_vmrunner_bin(
+    root: &Path,
+    canonical: Option<String>,
+    legacy: Option<String>,
+) -> PathBuf {
+    canonical
+        .filter(|value| !value.is_empty())
+        .or_else(|| legacy.filter(|value| !value.is_empty()))
+        .map_or_else(
+            || release_or_debug_bin(root, "vmrunner_macos_ipc"),
+            PathBuf::from,
+        )
 }
 
 // ── Commands ─────────────────────────────────────────────────────────────────
@@ -241,10 +266,7 @@ fn check_linux_runtime(root: &Path, fc_home: &Path, r: &mut DoctorReport) {
 }
 
 fn check_macos_runtime(root: &Path, r: &mut DoctorReport) {
-    let vmrunner = std::env::var("THEYOS_VMRUNNER_RS_BIN").map_or_else(
-        |_| release_or_debug_bin(root, "vmrunner_macos_ipc"),
-        PathBuf::from,
-    );
+    let vmrunner = macos_vmrunner_bin(root);
     let ssh_ctl = std::env::var("THEYOS_SSH_CTL")
         .or_else(|_| std::env::var("FIRECRACKER_CTL"))
         .map_or_else(|_| release_or_debug_bin(root, "theyos-ssh"), PathBuf::from);
@@ -781,6 +803,26 @@ mod tests {
         let mut r = DoctorReport::new();
         r.check_exec(Path::new("/tmp/no-such-bin"), "missing");
         assert_eq!(r.failures, 1);
+    }
+
+    #[test]
+    fn macos_vmrunner_resolver_prefers_canonical_over_legacy() {
+        let root = Path::new("/repo");
+        let result = resolve_macos_vmrunner_bin(
+            root,
+            Some("/canonical/vmrunner".into()),
+            Some("/legacy/vmrunner".into()),
+        );
+
+        assert_eq!(result, PathBuf::from("/canonical/vmrunner"));
+    }
+
+    #[test]
+    fn macos_vmrunner_resolver_accepts_legacy_when_canonical_absent() {
+        let root = Path::new("/repo");
+        let result = resolve_macos_vmrunner_bin(root, None, Some("/legacy/vmrunner".into()));
+
+        assert_eq!(result, PathBuf::from("/legacy/vmrunner"));
     }
 
     // ── imagebuilder bin resolution ─────────────────────────────────────

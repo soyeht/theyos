@@ -1880,6 +1880,10 @@ fn ensure_wrapper(bin_dir: &Path) {
     }
 
     let bin_str = bin_dir.to_string_lossy();
+    let vmrunner_exports = format!(
+        r#"export THEYOS_VMRUNNER_RS_BIN="{bin_str}/vmrunner_macos_ipc"
+export THEYOS_VMRUNNER_MACOS_RS_BIN="$THEYOS_VMRUNNER_RS_BIN""#
+    );
 
     // soyeht wrapper
     let wrapper = format!(
@@ -1889,7 +1893,7 @@ export THEYOS_DIR
 export THEYOS_BIN_DIR="{bin_str}"
 export WEB_DIR="{bin_str}/web"
 export THEYOS_SSH_CTL="{bin_str}/theyos-ssh"
-export THEYOS_VMRUNNER_MACOS_RS_BIN="{bin_str}/vmrunner_macos_ipc"
+{vmrunner_exports}
 export PATH="/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin:$PATH"
 exec "{bin_str}/soyeht" "$@"
 "#
@@ -1913,7 +1917,7 @@ export THEYOS_DIR
 export THEYOS_BIN_DIR="{bin_str}"
 export WEB_DIR="{bin_str}/web"
 export THEYOS_SSH_CTL="{bin_str}/theyos-ssh"
-export THEYOS_VMRUNNER_MACOS_RS_BIN="{bin_str}/vmrunner_macos_ipc"
+{vmrunner_exports}
 export PATH="/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin:$PATH"
 exec "{bin_str}/theyos" "$@"
 "#
@@ -1935,6 +1939,7 @@ exec "{bin_str}/theyos" "$@"
 : "${{THEYOS_DIR:=$HOME/.theyos}}"
 export THEYOS_DIR
 export THEYOS_BIN_DIR="{bin_str}"
+{vmrunner_exports}
 export PATH="/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin:$PATH"
 exec "{bin_str}/init_macos_guest" "$@"
 "#
@@ -2896,24 +2901,28 @@ mod tests {
         // Write a raw binary (simulating overwritten wrapper)
         fs::write(brew_bin.join("soyeht"), b"\xCF\xFA\xED\xFE").unwrap();
         fs::write(brew_bin.join("theyos"), b"\xCF\xFA\xED\xFE").unwrap();
+        fs::write(brew_bin.join("init_macos_guest"), b"\xCF\xFA\xED\xFE").unwrap();
 
         ensure_wrapper(&bin_dir);
 
-        // Verify wrappers were written
-        let content = fs::read_to_string(brew_bin.join("soyeht")).unwrap();
-        assert!(
-            content.starts_with("#!/bin/sh"),
-            "soyeht should be a shell wrapper"
-        );
-        assert!(
-            content.contains("THEYOS_BIN_DIR"),
-            "wrapper should set THEYOS_BIN_DIR"
-        );
-
-        let theyos_content = fs::read_to_string(brew_bin.join("theyos")).unwrap();
-        assert!(
-            theyos_content.starts_with("#!/bin/sh"),
-            "theyos should be a shell wrapper"
-        );
+        for name in ["soyeht", "theyos", "init_macos_guest"] {
+            let content = fs::read_to_string(brew_bin.join(name)).unwrap();
+            assert!(
+                content.starts_with("#!/bin/sh"),
+                "{name} should be a shell wrapper"
+            );
+            assert!(
+                content.contains("THEYOS_BIN_DIR"),
+                "{name} wrapper should set THEYOS_BIN_DIR"
+            );
+            assert!(
+                content.contains("export THEYOS_VMRUNNER_RS_BIN="),
+                "{name} wrapper should set canonical vmrunner env"
+            );
+            assert!(
+                content.contains("export THEYOS_VMRUNNER_MACOS_RS_BIN=\"$THEYOS_VMRUNNER_RS_BIN\""),
+                "{name} wrapper should alias legacy vmrunner env to canonical env"
+            );
+        }
     }
 }

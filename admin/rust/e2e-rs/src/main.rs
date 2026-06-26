@@ -5,6 +5,7 @@ use clap::{Parser, Subcommand};
 
 use e2e_rs::benchmark::{BenchmarkConfig, run_benchmark};
 use e2e_rs::client::AdminClient;
+use e2e_rs::household_pop::{HouseholdPopArgs, run_household_pop};
 use e2e_rs::runner::{TestConfig, TestRunner, all_claw_types, print_summary};
 use e2e_rs::smoke::run_smoke;
 use e2e_rs::snapshot::{SnapshotConfig, run_snapshots};
@@ -55,6 +56,8 @@ enum Commands {
     Snapshot(SnapshotArgs),
     /// Lightweight smoke test — verifies 7 critical API routes in ~5s (no VMs created).
     Smoke,
+    /// Assisted-live household PoP Claw Store gate.
+    HouseholdPop(HouseholdPopArgs),
 }
 
 #[derive(clap::Args)]
@@ -183,6 +186,11 @@ struct SnapshotArgs {
 async fn main() {
     let cli = Cli::parse();
 
+    if let Some(Commands::HouseholdPop(args)) = cli.command {
+        let code = run_household_pop(args).await;
+        std::process::exit(code);
+    }
+
     let password = resolve_password(cli.common.password.as_deref());
     let repo_root = core_rs::path::resolve_repo_root().unwrap_or_else(|e| {
         eprintln!("error: {e}");
@@ -242,6 +250,7 @@ async fn main() {
         Some(Commands::Benchmark(args)) => run_bench(client, args),
         Some(Commands::Snapshot(args)) => run_snap(client, args, ssh_key, state_dir),
         Some(Commands::Smoke) => unreachable!("handled above"),
+        Some(Commands::HouseholdPop(_)) => unreachable!("handled above"),
         // Backward compat: bare `e2e-runner` → treat as Test
         None => {
             let args = TestArgs {

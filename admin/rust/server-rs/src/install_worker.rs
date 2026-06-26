@@ -9,8 +9,6 @@ use core_rs::ipc::protocol::{LeaseKind, LeaseOwnerType};
 use store_rs::WarmPoolSlotId;
 
 use crate::state::SharedState;
-#[cfg(not(target_os = "macos"))]
-use std::path::Path;
 #[cfg(target_os = "macos")]
 use std::path::PathBuf;
 use std::time::Duration;
@@ -109,6 +107,93 @@ async fn process_one_install_job(state: &SharedState) -> Result<(), String> {
 
 // ─── Install (Linux) — prebuilt artifact download ──────────────────────────
 
+/// Pre-download gate: returns a clean, client-safe failure message when the
+/// resolved manifest's `runtime_min_version` is newer than this engine, else
+/// `None`. Extracted as a pure function so the decision is unit-testable
+/// without the full worker harness.
+///
+/// `runtime_min_version` is advisory until manifests are signed (P0.1), but the
+/// gate is already semantically correct: a too-old engine is refused up front
+/// with a version-only reason instead of failing opaquely mid-install.
+#[cfg_attr(target_os = "macos", allow(dead_code))]
+fn runtime_min_version_block_reason(
+    manifest: &core_rs::artifact_registry::ArtifactManifest,
+    engine_version: &str,
+) -> Option<String> {
+    core_rs::artifact_registry::check_runtime_compatible(
+        manifest.runtime_min_version.as_deref(),
+        engine_version,
+    )
+    .err()
+    .map(|e| e.to_string())
+}
+
+// Pure decision/cleanup helpers, extracted from the async install/uninstall
+// paths so the branch selection, assets-dir derivation, and artifact removal
+// are unit-testable without a SharedState harness. The call sites live on the
+// Linux (cfg(not(target_os = "macos"))) paths; these helpers are kept
+// platform-agnostic so the tests run on macOS too.
+
+/// Which install path `run_install_claw` should take for an installable claw.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(target_os = "macos", allow(dead_code))]
+enum InstallRoute {
+    /// Download a pre-built golden from the artifact registry.
+    Prebuilt,
+    /// Build the golden locally via the `imagebuilder` subprocess.
+    FromPlan,
+    /// No install path is available; fail loudly.
+    NoPath,
+}
+
+/// Select the install path from a claw's `distribution` and whether an
+/// `InstallerPlan` exists for it. Mirrors the dispatch order in
+/// `run_install_claw`: a `prebuilt` distribution wins, else a plan, else fail.
+/// `has_plan` is ignored for `prebuilt` (it is never consulted there).
+#[cfg_attr(target_os = "macos", allow(dead_code))]
+fn select_install_route(distribution: &str, has_plan: bool) -> InstallRoute {
+    if distribution == "prebuilt" {
+        InstallRoute::Prebuilt
+    } else if has_plan {
+        InstallRoute::FromPlan
+    } else {
+        InstallRoute::NoPath
+    }
+}
+
+/// Derive the assets directory from the lock directory.
+///
+/// Assets live two levels above `locks_dir` under `assets/` (e.g.
+/// `<root>/<x>/locks` -> `<root>/assets`). Falls back to `/tmp` at any missing
+/// ancestor, matching the original inline derivation shared by the install and
+/// uninstall paths.
+#[cfg_attr(target_os = "macos", allow(dead_code))]
+fn assets_dir_from_locks_dir(locks_dir: &std::path::Path) -> std::path::PathBuf {
+    locks_dir
+        .parent()
+        .unwrap_or(std::path::Path::new("/tmp"))
+        .parent()
+        .unwrap_or(std::path::Path::new("/tmp"))
+        .join("assets")
+}
+
+/// Remove a claw's on-disk golden and snapshot artifacts under `assets_dir`.
+///
+/// Best-effort: a missing directory is a no-op and a removal error is logged
+/// and swallowed so uninstall can still mark the claw not-installed. Mirrors
+/// the cleanup performed inline by `run_uninstall_claw`.
+#[cfg_attr(target_os = "macos", allow(dead_code))]
+fn remove_claw_artifacts(assets_dir: &std::path::Path, claw: &str) {
+    for kind in ["goldens", "snapshots"] {
+        let dir = assets_dir.join(kind).join(claw);
+        if dir.is_dir() {
+            if let Err(e) = std::fs::remove_dir_all(&dir) {
+                warn!("[install-worker] failed to remove {kind} for {claw}: {e}");
+            }
+        }
+    }
+}
+
 /// Install a claw by downloading a pre-built golden rootfs artifact.
 ///
 /// All HTTP and I/O happens inside `spawn_blocking` because the resolver and
@@ -136,13 +221,7 @@ async fn run_install_claw_prebuilt(state: &SharedState, job: &jobs_rs::Job) -> R
     }
 
     // Derive assets_dir from locks_dir (same as uninstall path)
-    let assets_dir = state
-        .locks_dir
-        .parent()
-        .unwrap_or(std::path::Path::new("/tmp"))
-        .parent()
-        .unwrap_or(std::path::Path::new("/tmp"))
-        .join("assets");
+    let assets_dir = assets_dir_from_locks_dir(&state.locks_dir);
 
     // Step 1: Resolve manifest
     update_job_message(state, &job_id, "resolving artifact...").await;
@@ -151,7 +230,10 @@ async fn run_install_claw_prebuilt(state: &SharedState, job: &jobs_rs::Job) -> R
     let claw_for_resolve = claw_name.clone();
     let registry_url_clone = registry_url.clone();
     let manifest = match tokio::task::spawn_blocking(move || {
-        let resolver = ArtifactResolver::new(&registry_url_clone);
+        // trust None: production keeps the deferred status quo (no signature
+        // verification) until a real public key + custody/policy exist. The
+        // ArtifactTrustConfig injection lands here once that is available.
+        let resolver = ArtifactResolver::for_install(&registry_url_clone, None);
         resolver.resolve(&claw_for_resolve)
     })
     .await
@@ -183,6 +265,18 @@ async fn run_install_claw_prebuilt(state: &SharedState, job: &jobs_rs::Job) -> R
         &manifest.fingerprint[..12],
         manifest.size_bytes / 1024 / 1024,
     );
+
+    // Step 1b: Refuse installs whose artifact requires a newer engine, before
+    // any up-to-date check or download work. Absent `runtime_min_version` is
+    // fail-open so existing manifests keep installing.
+    if let Some(reason) = runtime_min_version_block_reason(&manifest, env!("CARGO_PKG_VERSION")) {
+        error!("[install-worker] {claw_name}: {reason}");
+        if let Err(e) = state.claw_store.mark_failed(&claw_name, &reason) {
+            error!("[install-worker] {claw_name}: mark_failed failed: {e}");
+        }
+        mark_job_failed(state, &job_id, &reason).await;
+        return Ok(());
+    }
 
     // Step 2: Check if already up-to-date
     if ArtifactResolver::is_up_to_date(&manifest, &assets_dir) {
@@ -379,24 +473,26 @@ async fn run_install_claw(state: &SharedState, job: &jobs_rs::Job) -> Result<(),
     //      → build locally via the `imagebuilder` subprocess, then install
     //      the resulting golden via the same prebuilt resolver flow.
     //   3. Else → fail loudly.
-    if entry.distribution == "prebuilt" {
-        return run_install_claw_prebuilt(state, job).await;
+    // `get_plan` is only consulted for non-prebuilt claws (preserves the
+    // original short-circuit: prebuilt never does the plan lookup).
+    let has_plan = entry.distribution != "prebuilt"
+        && vmrunner_rs::installer_plan::get_plan(&claw_name).is_some();
+    match select_install_route(entry.distribution, has_plan) {
+        InstallRoute::Prebuilt => run_install_claw_prebuilt(state, job).await,
+        InstallRoute::FromPlan => run_install_claw_from_plan(state, job).await,
+        InstallRoute::NoPath => {
+            let msg = format!(
+                "no install path available for '{claw_name}' (distribution={}, no installer plan)",
+                entry.distribution
+            );
+            error!("[install-worker] {claw_name}: {msg}");
+            if let Err(e) = state.claw_store.mark_failed(&claw_name, &msg) {
+                error!("[install-worker] {claw_name}: mark_failed failed: {e}");
+            }
+            mark_job_failed(state, &job_id, &msg).await;
+            Ok(())
+        }
     }
-
-    if vmrunner_rs::installer_plan::get_plan(&claw_name).is_some() {
-        return run_install_claw_from_plan(state, job).await;
-    }
-
-    let msg = format!(
-        "no install path available for '{claw_name}' (distribution={}, no installer plan)",
-        entry.distribution
-    );
-    error!("[install-worker] {claw_name}: {msg}");
-    if let Err(e) = state.claw_store.mark_failed(&claw_name, &msg) {
-        error!("[install-worker] {claw_name}: mark_failed failed: {e}");
-    }
-    mark_job_failed(state, &job_id, &msg).await;
-    Ok(())
 }
 
 // ─── Install (Linux) — build-from-plan via imagebuilder subprocess ──────────
@@ -529,29 +625,9 @@ async fn run_uninstall_claw(state: &SharedState, job: &jobs_rs::Job) -> Result<(
     update_job_message(state, &job_id, "uninstalling...").await;
     info!("[install-worker] {claw_name}: uninstalling...");
 
-    // Step 1: Delete golden artifacts
-    let assets_dir = state
-        .locks_dir
-        .parent()
-        .unwrap_or(Path::new("/tmp"))
-        .parent()
-        .unwrap_or(Path::new("/tmp"))
-        .join("assets");
-
-    let golden_dir = assets_dir.join("goldens").join(&claw_name);
-    if golden_dir.is_dir() {
-        if let Err(e) = std::fs::remove_dir_all(&golden_dir) {
-            warn!("[install-worker] failed to remove goldens for {claw_name}: {e}");
-        }
-    }
-
-    // Step 2: Delete snapshot artifacts
-    let snapshot_dir = assets_dir.join("snapshots").join(&claw_name);
-    if snapshot_dir.is_dir() {
-        if let Err(e) = std::fs::remove_dir_all(&snapshot_dir) {
-            warn!("[install-worker] failed to remove snapshots for {claw_name}: {e}");
-        }
-    }
+    // Steps 1-2: Delete golden + snapshot artifacts.
+    let assets_dir = assets_dir_from_locks_dir(&state.locks_dir);
+    remove_claw_artifacts(&assets_dir, &claw_name);
 
     // Step 3: Update state
     if let Err(e) = state.claw_store.mark_not_installed(&claw_name) {
@@ -832,5 +908,186 @@ mod tests {
         // When unset, falls back to "imagebuilder" (on $PATH).
         let resolved = resolve_imagebuilder_bin();
         assert_eq!(resolved, "imagebuilder");
+    }
+
+    // runtime_min_version gate
+
+    fn manifest_with_runtime_min(
+        min: Option<&str>,
+    ) -> core_rs::artifact_registry::ArtifactManifest {
+        core_rs::artifact_registry::ArtifactManifest {
+            manifest_version: 1,
+            claw: "testclaw".into(),
+            version: "1.0.0".into(),
+            arch: "x86_64-linux".into(),
+            fingerprint: "e".repeat(64),
+            base_rootfs_version: "v2".into(),
+            sha256: "a".repeat(64),
+            size_bytes: 100,
+            url: "https://example.com/rootfs.ext4.zst".into(),
+            published_at: "2026-04-01T00:00:00Z".into(),
+            channel: "stable".into(),
+            base_rootfs_sha256: "b".repeat(64),
+            installer_plan_sha256: "c".repeat(64),
+            kernel_sha256: "d".repeat(64),
+            kernel_version: None,
+            firecracker_version: None,
+            runtime_min_version: min.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn runtime_gate_blocks_when_engine_too_old() {
+        let m = manifest_with_runtime_min(Some("999.0.0"));
+        let reason = runtime_min_version_block_reason(&m, "1.2.3")
+            .expect("engine older than min must be blocked");
+        assert!(
+            reason.contains("999.0.0") && reason.contains("1.2.3"),
+            "reason should name required + current versions: {reason}"
+        );
+    }
+
+    #[test]
+    fn runtime_gate_allows_absent_or_satisfied() {
+        // Absent -> fail-open.
+        assert!(
+            runtime_min_version_block_reason(&manifest_with_runtime_min(None), "1.2.3").is_none()
+        );
+        // Engine newer than min -> allowed.
+        assert!(
+            runtime_min_version_block_reason(&manifest_with_runtime_min(Some("1.0.0")), "1.2.3")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn runtime_gate_real_engine_version_satisfies_low_minimum() {
+        // Guards the call-site wiring of env!(CARGO_PKG_VERSION): the running
+        // engine must satisfy a trivially-low minimum.
+        let m = manifest_with_runtime_min(Some("0.0.1"));
+        assert!(runtime_min_version_block_reason(&m, env!("CARGO_PKG_VERSION")).is_none());
+    }
+
+    // select_install_route
+
+    #[test]
+    fn select_install_route_prebuilt_wins() {
+        assert_eq!(
+            select_install_route("prebuilt", false),
+            InstallRoute::Prebuilt
+        );
+        // has_plan is irrelevant for prebuilt.
+        assert_eq!(
+            select_install_route("prebuilt", true),
+            InstallRoute::Prebuilt
+        );
+    }
+
+    #[test]
+    fn select_install_route_from_plan_when_plan_present() {
+        assert_eq!(select_install_route("source", true), InstallRoute::FromPlan);
+    }
+
+    #[test]
+    fn select_install_route_no_path_when_no_plan() {
+        assert_eq!(select_install_route("source", false), InstallRoute::NoPath);
+    }
+
+    // assets_dir_from_locks_dir
+
+    #[test]
+    fn assets_dir_nested_resolves_sibling_assets() {
+        let assets = assets_dir_from_locks_dir(std::path::Path::new("/var/lib/theyos/locks"));
+        assert_eq!(assets, std::path::PathBuf::from("/var/lib/assets"));
+    }
+
+    #[test]
+    fn assets_dir_shallow_falls_back_to_tmp() {
+        // No grandparent -> /tmp/assets, matching the original inline fallback.
+        let assets = assets_dir_from_locks_dir(std::path::Path::new("/locks"));
+        assert_eq!(assets, std::path::PathBuf::from("/tmp/assets"));
+    }
+
+    // remove_claw_artifacts
+
+    #[test]
+    fn remove_claw_artifacts_deletes_goldens_and_snapshots() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let assets = tmp.path();
+        let goldens = assets.join("goldens").join("picoclaw");
+        let snapshots = assets.join("snapshots").join("picoclaw");
+        std::fs::create_dir_all(&goldens).unwrap();
+        std::fs::create_dir_all(&snapshots).unwrap();
+        std::fs::write(goldens.join("rootfs.ext4"), b"x").unwrap();
+
+        remove_claw_artifacts(assets, "picoclaw");
+
+        assert!(!goldens.exists(), "goldens should be removed");
+        assert!(!snapshots.exists(), "snapshots should be removed");
+    }
+
+    #[test]
+    fn remove_claw_artifacts_absent_is_noop() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        // Neither dir exists; must not panic.
+        remove_claw_artifacts(tmp.path(), "ghostclaw");
+    }
+
+    #[test]
+    fn remove_claw_artifacts_partial_and_leaves_other_claws() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let assets = tmp.path();
+        let goldens = assets.join("goldens").join("picoclaw");
+        std::fs::create_dir_all(&goldens).unwrap();
+        // No snapshots dir for picoclaw. A sibling claw has goldens.
+        let other = assets.join("goldens").join("otherclaw");
+        std::fs::create_dir_all(&other).unwrap();
+
+        remove_claw_artifacts(assets, "picoclaw");
+
+        assert!(!goldens.exists(), "present goldens should be removed");
+        assert!(
+            !assets.join("snapshots").join("picoclaw").exists(),
+            "absent snapshots stays absent"
+        );
+        assert!(other.exists(), "other claw's goldens must be untouched");
+    }
+
+    // check_macos_base_ready (macOS only)
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn check_macos_base_ready_state_machine() {
+        // Owns THEYOS_VM_ASSETS_DIR for the duration; macos_base_dir() reads it.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let base = tmp.path().join("macos-base");
+        std::fs::create_dir_all(&base).unwrap();
+        let state_file = base.join("init-state.json");
+        core_rs::env::set_test_env("THEYOS_VM_ASSETS_DIR", tmp.path().to_str().unwrap());
+
+        // 1. Missing init-state.json -> not initialized.
+        let err = check_macos_base_ready().unwrap_err();
+        assert!(err.contains("not initialized"), "got: {err}");
+
+        // 2. phase == complete -> Ok.
+        std::fs::write(&state_file, r#"{"phase":"complete"}"#).unwrap();
+        assert!(check_macos_base_ready().is_ok());
+
+        // 3. Incomplete phase -> Err naming the phase.
+        std::fs::write(&state_file, r#"{"phase":"install_macos"}"#).unwrap();
+        let err = check_macos_base_ready().unwrap_err();
+        assert!(err.contains("install_macos"), "got: {err}");
+
+        // 4. Missing phase field -> Err.
+        std::fs::write(&state_file, r#"{"foo":"bar"}"#).unwrap();
+        let err = check_macos_base_ready().unwrap_err();
+        assert!(err.contains("missing phase"), "got: {err}");
+
+        // 5. Invalid JSON -> Err.
+        std::fs::write(&state_file, b"not json{").unwrap();
+        let err = check_macos_base_ready().unwrap_err();
+        assert!(err.contains("parse init-state.json"), "got: {err}");
+
+        core_rs::env::remove_test_env("THEYOS_VM_ASSETS_DIR");
     }
 }

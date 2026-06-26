@@ -93,6 +93,10 @@ pub enum ValidationError {
     InvalidDigestHex { field: &'static str },
     #[error("url must start with http:// or https://")]
     InvalidUrlScheme,
+    #[error(
+        "url uses insecure http:// scheme for a non-loopback host (https required in production)"
+    )]
+    InsecureUrlScheme,
     #[error("empty required field: {0}")]
     EmptyField(&'static str),
 }
@@ -158,8 +162,100 @@ impl ArtifactManifest {
             return Err(ValidationError::InvalidUrlScheme);
         }
 
+        // Production artifacts must travel over HTTPS. `http://` is permitted
+        // only for loopback hosts (local test fixtures) - see
+        // [`is_secure_artifact_url`].
+        if !is_secure_artifact_url(&self.url) {
+            return Err(ValidationError::InsecureUrlScheme);
+        }
+
         Ok(())
     }
+}
+
+// ── URL scheme policy ─────────────────────────────────────────────────────────
+
+/// Whether `url` is acceptable as a production artifact URL.
+///
+/// Policy:
+/// - `https://...` is always accepted.
+/// - `http://...` is accepted **only** when the host is loopback
+///   (`127.0.0.1`, `localhost`, or `::1`), which covers local test fixtures
+///   and same-host registries where there is no meaningful MITM surface.
+/// - Anything else (public `http://`, missing/unknown scheme) is rejected.
+///
+/// This is the single source of truth for the HTTP-to-HTTPS policy and is applied
+/// to both manifest download URLs ([`ArtifactManifest::validate`]) and the
+/// artifact registry base URL (including the `THEYOS_ARTIFACT_REGISTRY_URL`
+/// override), so an environment override cannot reintroduce an insecure scheme.
+///
+/// The host is parsed defensively: userinfo (`user@host`) is stripped so a
+/// crafted `http://127.0.0.1@evil.com/...` resolves to the real host `evil.com`
+/// and is rejected; IPv6 literals (`[::1]`) and `:port` suffixes are handled.
+#[must_use]
+pub fn is_secure_artifact_url(url: &str) -> bool {
+    let lower = url.to_ascii_lowercase();
+    if lower.starts_with("https://") {
+        return true;
+    }
+    if let Some(after_scheme) = lower.strip_prefix("http://") {
+        return host_is_loopback(after_scheme);
+    }
+    false
+}
+
+/// Extract the host from the authority that follows `http://` (already
+/// lowercased) and decide whether it is a loopback host.
+fn host_is_loopback(after_scheme: &str) -> bool {
+    // The authority ends at the first '/', '?', or '#'.
+    let authority_end = after_scheme
+        .find(['/', '?', '#'])
+        .unwrap_or(after_scheme.len());
+    let authority = &after_scheme[..authority_end];
+
+    // Strip any `userinfo@` - the host is whatever follows the LAST '@'.
+    let host_port = match authority.rsplit_once('@') {
+        Some((_userinfo, host_port)) => host_port,
+        None => authority,
+    };
+
+    // IPv6 literals are bracketed: `[::1]` or `[::1]:port`.
+    let host = if let Some(rest) = host_port.strip_prefix('[') {
+        let Some((host, suffix)) = rest.split_once(']') else {
+            return false; // unclosed bracket
+        };
+        // The only legal authority after `]` is empty or a `:port`. A
+        // non-empty, non-port suffix (e.g. `[::1]evil.example`) is a malformed
+        // authority and must fail closed rather than trust the bracketed host.
+        if !suffix.is_empty() && !is_port_suffix(suffix) {
+            return false;
+        }
+        host
+    } else {
+        // Split an optional `:port`; a present port must be all ASCII digits,
+        // otherwise the authority is malformed (e.g. `127.0.0.1:notaport`).
+        match host_port.rsplit_once(':') {
+            Some((host, port)) => {
+                if !is_ascii_digits(port) {
+                    return false;
+                }
+                host
+            }
+            None => host_port,
+        }
+    };
+
+    matches!(host, "127.0.0.1" | "localhost" | "::1")
+}
+
+/// Whether `suffix` is a legal `:port` - a `:` followed by 1+ ASCII digits.
+fn is_port_suffix(suffix: &str) -> bool {
+    matches!(suffix.strip_prefix(':'), Some(port) if is_ascii_digits(port))
+}
+
+/// Whether `s` is a non-empty run of ASCII digits.
+fn is_ascii_digits(s: &str) -> bool {
+    !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit())
 }
 
 // ── Architecture detection ──────────────────────────────────────────────────
@@ -190,6 +286,75 @@ pub fn check_arch_compatible(manifest_arch: &str) -> Result<(), String> {
             "incompatible architecture: host={host}, artifact={manifest_arch}"
         ))
     }
+}
+
+// Runtime compatibility
+
+/// Error from [`check_runtime_compatible`].
+///
+/// Messages are safe to surface to clients/status: they contain only version
+/// strings, never local paths or host identifiers.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum RuntimeCompatError {
+    #[error("claw requires theyOS runtime {required} or newer, but this engine is {current}")]
+    RuntimeTooOld { required: String, current: String },
+    #[error("manifest runtime_min_version `{value}` is not valid semver")]
+    RuntimeVersionUnparseable { value: String },
+    #[error("engine version `{value}` is not valid semver")]
+    EngineVersionUnparseable { value: String },
+}
+
+/// Check whether the running engine satisfies a manifest's `runtime_min_version`.
+///
+/// Semantics:
+/// - `runtime_min_version` absent (`None`) -> **fail-open** (`Ok`). The field is
+///   optional and the currently published manifests omit it, so a missing
+///   minimum must never block an install.
+/// - present and `current_engine_version >= min` -> `Ok`.
+/// - present and `current_engine_version < min` -> [`RuntimeCompatError::RuntimeTooOld`]
+///   (**fail-closed**).
+/// - present but not valid semver -> [`RuntimeCompatError::RuntimeVersionUnparseable`]
+///   (**fail-closed**: do not silently ignore a gate the publisher intended).
+///
+/// Comparison uses full semver precedence including prerelease ordering, so a
+/// prerelease engine is older than the equivalent release (`1.2.0-rc.1 < 1.2.0`).
+/// `current_engine_version` is normally `env!("CARGO_PKG_VERSION")`, which is
+/// always valid semver; an unparseable value still fails closed rather than
+/// panicking.
+///
+/// NOTE: this gate is only as trustworthy as the manifest it reads. Until
+/// artifact manifests are signed (P0.1), `runtime_min_version` could be lowered
+/// by anyone who controls the manifest. The gate is nonetheless semantically
+/// correct and, once P0.1 lands, runs on the signature-verified manifest.
+///
+/// # Errors
+///
+/// Returns [`RuntimeCompatError`] when the engine is too old or a version
+/// string cannot be parsed.
+pub fn check_runtime_compatible(
+    runtime_min_version: Option<&str>,
+    current_engine_version: &str,
+) -> Result<(), RuntimeCompatError> {
+    let Some(min_raw) = runtime_min_version else {
+        return Ok(());
+    };
+    let min = semver::Version::parse(min_raw).map_err(|_| {
+        RuntimeCompatError::RuntimeVersionUnparseable {
+            value: min_raw.to_string(),
+        }
+    })?;
+    let current = semver::Version::parse(current_engine_version).map_err(|_| {
+        RuntimeCompatError::EngineVersionUnparseable {
+            value: current_engine_version.to_string(),
+        }
+    })?;
+    if current < min {
+        return Err(RuntimeCompatError::RuntimeTooOld {
+            required: min.to_string(),
+            current: current.to_string(),
+        });
+    }
+    Ok(())
 }
 
 // ── Tests ───────────────────────────────────────────────────────────────────
@@ -362,6 +527,120 @@ mod tests {
         );
     }
 
+    #[test]
+    fn validate_rejects_public_http_url() {
+        let mut m = valid_manifest();
+        m.url = "http://r2.example.com/hermes-agent/x86_64-linux/0.7.0/rootfs.ext4.zst".into();
+        assert_eq!(
+            m.validate().unwrap_err(),
+            ValidationError::InsecureUrlScheme
+        );
+    }
+
+    #[test]
+    fn validate_accepts_loopback_http_url() {
+        let mut m = valid_manifest();
+        m.url = "http://127.0.0.1:8080/rootfs.ext4.zst".into();
+        assert!(m.validate().is_ok());
+    }
+
+    // ── URL scheme policy ───────────────────────────────────────────────
+
+    #[test]
+    fn secure_url_accepts_https() {
+        assert!(is_secure_artifact_url(
+            "https://example.com/rootfs.ext4.zst"
+        ));
+        assert!(is_secure_artifact_url("https://r2.example.com/a/b/c"));
+        // https is accepted regardless of host, including loopback.
+        assert!(is_secure_artifact_url("https://127.0.0.1:8443/x"));
+    }
+
+    #[test]
+    fn secure_url_accepts_loopback_http() {
+        for url in [
+            "http://127.0.0.1/rootfs.ext4.zst",
+            "http://127.0.0.1:8080/rootfs.ext4.zst",
+            "http://127.0.0.1:1",
+            "http://localhost/x",
+            "http://localhost:9000/x",
+            "http://[::1]/rootfs.ext4.zst",
+            "http://[::1]:8080/x",
+        ] {
+            assert!(
+                is_secure_artifact_url(url),
+                "loopback http should be allowed: {url}"
+            );
+        }
+    }
+
+    #[test]
+    fn secure_url_rejects_public_http() {
+        for url in [
+            "http://example.com/rootfs.ext4.zst",
+            "http://r2.example.com/a/b",
+            "http://8.8.8.8/x",
+        ] {
+            assert!(
+                !is_secure_artifact_url(url),
+                "public http should be rejected: {url}"
+            );
+        }
+    }
+
+    #[test]
+    fn secure_url_rejects_userinfo_authority_spoof() {
+        // The real host is `evil.example`; the loopback string is only userinfo.
+        assert!(!is_secure_artifact_url(
+            "http://127.0.0.1@evil.example/rootfs.ext4.zst"
+        ));
+        assert!(!is_secure_artifact_url("http://localhost@evil.example/x"));
+        assert!(!is_secure_artifact_url("http://[::1]@evil.example/x"));
+    }
+
+    #[test]
+    fn secure_url_rejects_loopback_lookalike_hostnames() {
+        // `localhost` is a prefix but the host is `localhost.evil.example`.
+        assert!(!is_secure_artifact_url(
+            "http://localhost.evil.example/rootfs.ext4.zst"
+        ));
+        assert!(!is_secure_artifact_url("http://127.0.0.1.evil.example/x"));
+        assert!(!is_secure_artifact_url("http://notlocalhost/x"));
+    }
+
+    #[test]
+    fn secure_url_fails_closed_on_unknown_or_malformed() {
+        // No scheme / non-http(s) scheme / malformed authority -> not secure.
+        assert!(!is_secure_artifact_url("/relative/path"));
+        assert!(!is_secure_artifact_url("ftp://127.0.0.1/x"));
+        assert!(!is_secure_artifact_url("http://[::1/x")); // unclosed bracket
+        assert!(!is_secure_artifact_url(""));
+    }
+
+    #[test]
+    fn secure_url_rejects_malformed_ipv6_bracket_suffix() {
+        // After `]` the only legal authority is empty or `:port`. A trailing
+        // hostname smuggled after the bracket must not trust the inner `::1`.
+        assert!(!is_secure_artifact_url("http://[::1]evil.example/x"));
+        assert!(!is_secure_artifact_url("http://[::1]@evil.example/x"));
+        assert!(!is_secure_artifact_url("http://[::1].evil.example/x"));
+        // Sanity: the legitimate bracketed forms still pass.
+        assert!(is_secure_artifact_url("http://[::1]/x"));
+        assert!(is_secure_artifact_url("http://[::1]:8080/x"));
+    }
+
+    #[test]
+    fn secure_url_rejects_non_numeric_ports() {
+        assert!(!is_secure_artifact_url("http://127.0.0.1:notaport/x"));
+        assert!(!is_secure_artifact_url("http://localhost:notaport/x"));
+        assert!(!is_secure_artifact_url("http://[::1]:notaport/x"));
+        // Empty port is malformed -> rejected.
+        assert!(!is_secure_artifact_url("http://127.0.0.1:/x"));
+        // Numeric ports still pass.
+        assert!(is_secure_artifact_url("http://127.0.0.1:65535/x"));
+        assert!(is_secure_artifact_url("http://localhost:9000/x"));
+    }
+
     // ── Architecture ────────────────────────────────────────────────────
 
     #[test]
@@ -386,5 +665,63 @@ mod tests {
             err.contains("mips-bsd"),
             "error should contain artifact arch: {err}"
         );
+    }
+
+    // Runtime compatibility
+
+    #[test]
+    fn runtime_compat_absent_is_fail_open() {
+        // The currently published manifests omit the field - must not block.
+        assert!(check_runtime_compatible(None, "0.1.0").is_ok());
+    }
+
+    #[test]
+    fn runtime_compat_equal_is_ok() {
+        assert!(check_runtime_compatible(Some("1.2.3"), "1.2.3").is_ok());
+    }
+
+    #[test]
+    fn runtime_compat_newer_engine_is_ok() {
+        assert!(check_runtime_compatible(Some("1.2.0"), "1.2.1").is_ok());
+        assert!(check_runtime_compatible(Some("1.2.0"), "1.3.0").is_ok());
+        assert!(check_runtime_compatible(Some("1.2.0"), "2.0.0").is_ok());
+    }
+
+    #[test]
+    fn runtime_compat_older_engine_fails_closed() {
+        let err = check_runtime_compatible(Some("1.5.0"), "1.2.0").unwrap_err();
+        assert!(
+            matches!(err, RuntimeCompatError::RuntimeTooOld { .. }),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn runtime_compat_unparseable_min_fails_closed() {
+        let err = check_runtime_compatible(Some("not.a.version"), "1.2.0").unwrap_err();
+        assert!(matches!(
+            err,
+            RuntimeCompatError::RuntimeVersionUnparseable { .. }
+        ));
+    }
+
+    #[test]
+    fn runtime_compat_unparseable_engine_fails_closed() {
+        // Defensive: engine version is normally env!(CARGO_PKG_VERSION) and
+        // always valid, but a bad value must fail closed, not panic.
+        let err = check_runtime_compatible(Some("1.0.0"), "garbage").unwrap_err();
+        assert!(matches!(
+            err,
+            RuntimeCompatError::EngineVersionUnparseable { .. }
+        ));
+    }
+
+    #[test]
+    fn runtime_compat_prerelease_ordering() {
+        // A prerelease engine is older than the required stable release.
+        let err = check_runtime_compatible(Some("1.2.0"), "1.2.0-rc.1").unwrap_err();
+        assert!(matches!(err, RuntimeCompatError::RuntimeTooOld { .. }));
+        // A stable engine satisfies a prerelease minimum.
+        assert!(check_runtime_compatible(Some("1.2.0-rc.1"), "1.2.0").is_ok());
     }
 }

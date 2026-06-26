@@ -7,7 +7,7 @@
 
 use crate::state::SharedState;
 use core_rs::error::MutexExt;
-use core_rs::ipc::wire::error_context_result_string;
+use core_rs::ipc::wire::{error_context_result_string, sanitize_error_context};
 use executor_rs::{ExecuteFlowRequest, FlowStatus, FlowType};
 use jobs_rs::JobType;
 use std::time::Duration;
@@ -284,6 +284,23 @@ fn build_restart_request(job: &jobs_rs::Job) -> Result<ExecuteFlowRequest, Strin
 
 // ─── Status helpers ───────────────────────────────────────────────────────────
 
+/// Classify a per-instance failure into a sanitized [`InstanceFailureCode`]
+/// from the IPC error context (numeric code, when present) and the message.
+fn classify_instance_failure(
+    error_context: &Option<serde_json::Value>,
+    msg: &str,
+) -> core_rs::instance_failure::InstanceFailureCode {
+    let ipc_code = core_rs::ipc::wire::ipc_code_from_context(error_context);
+    core_rs::instance_failure::InstanceFailureCode::classify(ipc_code, msg)
+}
+
+fn provisioning_error_summary(
+    error_context: &Option<serde_json::Value>,
+    msg: &str,
+) -> &'static str {
+    classify_instance_failure(error_context, msg).operator_summary()
+}
+
 async fn mark_failed(
     state: &SharedState,
     job_id: &str,
@@ -294,10 +311,22 @@ async fn mark_failed(
     let st = state.clone();
     let jid = job_id.to_string();
     let iid = instance_id.to_string();
-    let m = msg.to_string();
-    // Serialize error_context into the result field so the API can return it.
+    // Classify into a sanitized, machine-readable code before `error_context`
+    // is consumed below. Always stamped (Unknown included) so the wire contract
+    // is stable without inferring by absence. `provisioning_error` is the single
+    // sanitized, path-free summary used for the instance row, the job error
+    // record, and the create_failed event; the raw `msg` stays only in the
+    // caller's structured log.
+    let failure_code = classify_instance_failure(&error_context, msg);
+    let provisioning_error = provisioning_error_summary(&error_context, msg);
+    // Keep the full raw context in host logs only, then strip it to an allow-list
+    // of scalar diagnostic fields before persisting it on the public job result:
+    // it can carry raw stderr/paths from the executor/runner.
+    if let Some(raw) = error_context.as_ref() {
+        warn!("[jobs-worker] raw failure context (host-log only): {raw}");
+    }
     let ctx_json = error_context
-        .map(error_context_result_string)
+        .map(|c| error_context_result_string(sanitize_error_context(c)))
         .unwrap_or_default();
     if let Err(e) = tokio::task::spawn_blocking(move || {
         let mut record_create_failed = false;
@@ -310,7 +339,9 @@ async fn mark_failed(
                 actor = job_actor;
             }
             job.status = jobs_rs::Status::Failed;
-            job.error = Some(m.clone());
+            // Sanitized summary, not the raw message: the Jobs API serializes
+            // `Job.error` verbatim (admin UI renders it).
+            job.error = Some(provisioning_error.to_string());
             job.completed_at = Some(jobs_rs::now_iso());
             if !ctx_json.is_empty() {
                 job.result = Some(ctx_json.clone());
@@ -319,16 +350,28 @@ async fn mark_failed(
                 error!("[jobs-worker] failed to update job status: {e}");
             }
         }
-        // Update instance status in DB
+        // Update instance status in DB. The instance row, the job error record,
+        // and the create_failed event below all carry only the sanitized,
+        // path-free per-code summary; the raw message stays only in the
+        // structured log emitted by the caller.
         if let Err(e) = st.instance_db.update_status(&StatusUpdate {
             id: &iid,
             status: InstanceStatus::Failed,
             message: "",
-            error: &m,
+            error: provisioning_error,
             job_id: "",
             phase: "",
         }) {
             error!("[jobs-worker] failed to update instance status: {e}");
+        }
+
+        // Best-effort: attach the sanitized failure code. This never masks the
+        // status/job update above; a stamp failure is logged and ignored.
+        if let Err(e) = st
+            .instance_db
+            .set_provisioning_failure_code(&iid, Some(failure_code.as_str()))
+        {
+            error!("[jobs-worker] failed to stamp instance failure code for {iid}: {e}");
         }
 
         if record_create_failed {
@@ -339,7 +382,7 @@ async fn mark_failed(
                     instance_id: Some(&iid),
                     event_type: "create_failed",
                     actor: &actor,
-                    detail: Some(&m),
+                    detail: Some(provisioning_error),
                     resource_snapshot: resource_snapshot.as_deref(),
                 })
             {
@@ -488,6 +531,145 @@ mod tests {
                     "phase": "vm_boot"
                 }
             })
+        );
+    }
+
+    #[test]
+    fn classify_instance_failure_uses_code_then_message() {
+        use core_rs::instance_failure::InstanceFailureCode;
+        // Numeric IPC code wins.
+        assert_eq!(
+            classify_instance_failure(&Some(serde_json::json!({"code": 2001})), "anything"),
+            InstanceFailureCode::HostVmLimitReached
+        );
+        // No code -> message signal.
+        assert_eq!(
+            classify_instance_failure(&None, "Snapshot save failed: x"),
+            InstanceFailureCode::SnapshotFailed
+        );
+        // Unrecognized -> Unknown (always stamped, never absent-by-inference).
+        assert_eq!(
+            classify_instance_failure(&None, "weird"),
+            InstanceFailureCode::Unknown
+        );
+    }
+
+    #[test]
+    fn provisioning_error_summary_is_sanitized_for_path_message() {
+        // A raw executor message carrying a local path + stderr.
+        let raw = "Snapshot save failed: /tmp/soyeht-test/snap.vzvmsave: write error";
+        let written = provisioning_error_summary(&None, raw);
+        assert!(!written.contains('/'), "leaked path: {written}");
+        assert!(
+            !written.contains("vzvmsave"),
+            "leaked raw detail: {written}"
+        );
+        // The machine-readable code stays coherent with the classification.
+        assert_eq!(
+            classify_instance_failure(&None, raw).as_str(),
+            "snapshot_failed"
+        );
+    }
+
+    #[test]
+    fn provisioning_error_summary_is_generic_for_unknown() {
+        let written =
+            provisioning_error_summary(&None, "totally unrecognized /tmp/soyeht-test/failure");
+        assert_eq!(written, "instance creation failed");
+        assert!(!written.contains('/'), "leaked path: {written}");
+    }
+
+    #[test]
+    fn job_error_and_event_detail_share_sanitized_summary() {
+        // mark_failed writes this single value to both Job.error and the
+        // create_failed instance-event detail, replacing the raw message.
+        let raw = "VM start failed: /tmp/soyeht-test/efi.nvram: boot error";
+        let written = provisioning_error_summary(&None, raw);
+        assert_eq!(
+            written,
+            core_rs::instance_failure::InstanceFailureCode::VmStartFailed.operator_summary()
+        );
+        for bad in ['/', '\\'] {
+            assert!(
+                !written.contains(bad),
+                "leaked path char `{bad}`: {written}"
+            );
+        }
+        assert!(!written.contains("nvram"), "leaked raw detail: {written}");
+    }
+
+    #[test]
+    fn failed_job_serializes_without_raw_paths() {
+        // The Jobs API serializes `Job` verbatim. For a failed job, `error` is
+        // the sanitized summary and `result` is the structured error_context;
+        // neither may carry a local path, stderr, or snapshot/file detail.
+        let summary =
+            provisioning_error_summary(&None, "VM start failed: /tmp/soyeht-test/efi.nvram: boot");
+        let result = core_rs::ipc::wire::error_context_result_string(serde_json::json!({
+            "code": 2001,
+            "command": "slirp_add_hostfwd",
+            "phase": "network",
+        }));
+        let mut job = jobs_rs::Job::new(jobs_rs::JobType::CreateInstance, "inst-test", "{}");
+        job.status = jobs_rs::Status::Failed;
+        job.error = Some(summary.to_string());
+        job.result = Some(result);
+
+        let json = serde_json::to_string(&job).unwrap();
+        for bad in ["/tmp", "soyeht-test", "vzvmsave", "nvram", "stderr"] {
+            assert!(
+                !json.contains(bad),
+                "failed job JSON leaked `{bad}`: {json}"
+            );
+        }
+        // The actionable summary and machine-readable code are still present.
+        assert!(
+            json.contains("the VM failed to start"),
+            "summary missing from job JSON: {json}"
+        );
+        assert!(
+            json.contains("2001"),
+            "failure code missing from job JSON: {json}"
+        );
+    }
+
+    #[test]
+    fn failed_job_error_context_is_sanitized_in_result() {
+        // The executor/runner error_context can carry raw stderr and local paths
+        // (e.g. stderr_tail, path). mark_failed persists Job.result through
+        // sanitize_error_context, so only allow-listed scalars survive.
+        let raw = serde_json::json!({
+            "code": 2001,
+            "phase": "network.port_forward",
+            "command": "slirp_add_hostfwd",
+            "stderr_tail": "bind /tmp/soyeht-test/x: address in use",
+            "path": "/tmp/soyeht-test/disk.img",
+        });
+        let result = core_rs::ipc::wire::error_context_result_string(
+            core_rs::ipc::wire::sanitize_error_context(raw),
+        );
+        let mut job = jobs_rs::Job::new(jobs_rs::JobType::CreateInstance, "inst-test", "{}");
+        job.status = jobs_rs::Status::Failed;
+        job.error = Some(provisioning_error_summary(&None, "boom").to_string());
+        job.result = Some(result);
+
+        let json = serde_json::to_string(&job).unwrap();
+        for bad in [
+            "/tmp",
+            "soyeht-test",
+            "stderr_tail",
+            "slirp_add_hostfwd",
+            "disk.img",
+        ] {
+            assert!(
+                !json.contains(bad),
+                "failed job JSON leaked `{bad}`: {json}"
+            );
+        }
+        // Allow-listed scalar fields survive for triage.
+        assert!(
+            json.contains("2001") && json.contains("network.port_forward"),
+            "allow-listed context fields missing: {json}"
         );
     }
 }

@@ -463,6 +463,52 @@ fn claw_store_v1_routes_are_mounted_with_declared_handlers() {
 }
 
 #[test]
+fn household_instances_mount_distinguishes_get_list_from_post_create() {
+    let contract = contract();
+    let route = |id: &str| {
+        contract
+            .routes
+            .iter()
+            .find(|route| route.id == id)
+            .unwrap_or_else(|| panic!("missing route {id}"))
+    };
+
+    let list = route("household_list_instances");
+    let create = route("household_create_instance");
+    assert_eq!(list.method, "GET");
+    assert_eq!(list.mount.method_helper, "get");
+    assert_eq!(
+        list.handler,
+        "handlers_household_claws::handle_household_list_instances"
+    );
+    assert_eq!(list.household_operation.as_deref(), Some("claws.list"));
+    assert_eq!(create.method, "POST");
+    assert_eq!(create.mount.method_helper, "post");
+    assert_eq!(
+        create.handler,
+        "handlers_household_claws::handle_household_create_instance"
+    );
+    assert_eq!(create.household_operation.as_deref(), Some("claws.create"));
+    assert_eq!(list.path_template, create.path_template);
+    assert_eq!(list.mount.route_literal, create.mount.route_literal);
+
+    let slice = source_slice(&list.mount);
+    let route_idx = slice
+        .find("\"/api/v1/household/instances\"")
+        .expect("household instances mount must be present");
+    let local = &slice[route_idx..slice.len().min(route_idx + 400)];
+
+    assert!(
+        local.contains("get(handlers_household_claws::handle_household_list_instances)"),
+        "GET /api/v1/household/instances must route to list handler"
+    );
+    assert!(
+        local.contains(".post(handlers_household_claws::handle_household_create_instance)"),
+        "POST /api/v1/household/instances must route to create handler"
+    );
+}
+
+#[test]
 fn household_routes_keep_declared_pop_operations() {
     let handlers = include_str!("../src/handlers_household_claws.rs");
     let contract = contract();
@@ -647,6 +693,8 @@ fn current_wire_quirks_are_explicitly_pinned() {
         "admin_claw_availability",
         "admin_install_claw",
         "admin_uninstall_claw",
+        "admin_resource_options",
+        "admin_users",
         "admin_create_instance",
         "admin_instance_status",
         "admin_stop_instance",
@@ -669,6 +717,13 @@ fn current_wire_quirks_are_explicitly_pinned() {
             .as_deref(),
         Some("admin_auth_unauthorized")
     );
+
+    for id in ["admin_resource_options", "admin_users"] {
+        assert_eq!(
+            route(id).expectations["admin_required"].fixture.as_deref(),
+            Some("admin_required")
+        );
+    }
 
     for id in [
         "mobile_list_claws",
@@ -700,6 +755,7 @@ fn current_wire_quirks_are_explicitly_pinned() {
         "household_claw_availability",
         "household_install_claw",
         "household_uninstall_claw",
+        "household_list_instances",
         "household_create_instance",
         "household_instance_status",
         "household_stop_instance",
@@ -799,8 +855,11 @@ fn contract_scope_includes_core_lifecycle_workspaces_and_c4_2b_ws_pty() {
         "admin_restart_instance",
         "admin_rebuild_instance",
         "admin_delete_instance",
+        "admin_resource_options",
+        "admin_users",
         "mobile_create_instance",
         "mobile_instance_status",
+        "household_list_instances",
         "household_create_instance",
         "household_instance_status",
         "household_stop_instance",

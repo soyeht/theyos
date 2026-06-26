@@ -21,6 +21,8 @@ pub mod admin {
     pub const AVAILABILITY: &str = "/claws/{name}/availability";
     pub const INSTALL: &str = "/claws/{name}/install";
     pub const UNINSTALL: &str = "/claws/{name}/uninstall";
+    pub const RESOURCE_OPTIONS: &str = "/resource-options";
+    pub const USERS: &str = "/users";
     pub const CREATE_INSTANCE: &str = "/instances";
     pub const INSTANCE_STATUS: &str = "/instances/{id}/status";
     pub const STOP_INSTANCE: &str = "/instances/{id}/stop";
@@ -36,6 +38,8 @@ pub mod admin {
     pub const AVAILABILITY_PATH: &str = "/api/v1/claws/{name}/availability";
     pub const INSTALL_PATH: &str = "/api/v1/claws/{name}/install";
     pub const UNINSTALL_PATH: &str = "/api/v1/claws/{name}/uninstall";
+    pub const RESOURCE_OPTIONS_PATH: &str = "/api/v1/resource-options";
+    pub const USERS_PATH: &str = "/api/v1/users";
     pub const CREATE_INSTANCE_PATH: &str = "/api/v1/instances";
     pub const INSTANCE_STATUS_PATH: &str = "/api/v1/instances/{id}/status";
     pub const STOP_INSTANCE_PATH: &str = "/api/v1/instances/{id}/stop";
@@ -164,6 +168,28 @@ pub const ROUTES: &[ClawStoreRouteSpec] = &[
         mount_slice: "admin_routes",
         route_literal: admin::UNINSTALL,
         route_expr: "admin::UNINSTALL",
+        household_operation: None,
+    },
+    ClawStoreRouteSpec {
+        id: "admin_resource_options",
+        surface: "admin",
+        method: METHOD_GET,
+        path_template: admin::RESOURCE_OPTIONS_PATH,
+        mount_file: "admin/rust/server-rs/src/claw_store_routes.rs",
+        mount_slice: "admin_routes",
+        route_literal: admin::RESOURCE_OPTIONS,
+        route_expr: "admin::RESOURCE_OPTIONS",
+        household_operation: None,
+    },
+    ClawStoreRouteSpec {
+        id: "admin_users",
+        surface: "admin",
+        method: METHOD_GET,
+        path_template: admin::USERS_PATH,
+        mount_file: "admin/rust/server-rs/src/claw_store_routes.rs",
+        mount_slice: "admin_routes",
+        route_literal: admin::USERS,
+        route_expr: "admin::USERS",
         household_operation: None,
     },
     ClawStoreRouteSpec {
@@ -398,6 +424,17 @@ pub const ROUTES: &[ClawStoreRouteSpec] = &[
         household_operation: Some("claws.delete"),
     },
     ClawStoreRouteSpec {
+        id: "household_list_instances",
+        surface: "household",
+        method: METHOD_GET,
+        path_template: household::CREATE_INSTANCE,
+        mount_file: "admin/rust/server-rs/src/household_bootstrap.rs",
+        mount_slice: "household_claws_router",
+        route_literal: household::CREATE_INSTANCE,
+        route_expr: "\"/api/v1/household/instances\"",
+        household_operation: Some("claws.list"),
+    },
+    ClawStoreRouteSpec {
         id: "household_create_instance",
         surface: "household",
         method: METHOD_POST,
@@ -549,6 +586,11 @@ pub fn admin_routes() -> Router<SharedState> {
             admin::UNINSTALL,
             post(handlers_claws::handle_uninstall_claw),
         )
+        .route(
+            admin::RESOURCE_OPTIONS,
+            get(handlers_mobile::handle_admin_resource_options),
+        )
+        .route(admin::USERS, get(handlers_mobile::handle_admin_users))
 }
 
 pub fn mobile_nested_routes() -> Router<SharedState> {

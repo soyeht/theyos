@@ -175,9 +175,11 @@ impl ClawStore {
     /// Scan existing golden/snapshot assets and auto-mark claws as Ready.
     ///
     /// A claw is marked Ready if ANY of:
-    /// - Golden rootfs exists (`goldens/<name>/current/golden.meta.json`)
-    ///   — snapshot is optional (VM boots via cold path without it)
-    /// - Legacy golden image exists (`ubuntu-24.04-<name>.ext4`)
+    /// - A modern golden is present AND self-consistent: a rootfs and metadata
+    ///   reachable through the `current` symlink, with matching `claw_type` and
+    ///   a fingerprint that matches the install directory (see
+    ///   `golden_ready_consistent`). Snapshot is optional.
+    /// - Legacy golden image exists (`ubuntu-24.04-<name>.ext4`).
     ///
     /// Only re-evaluates claws that are `NotInstalled` or `Failed`.
     pub fn seed_from_assets(&self, assets_dir: &Path) {
@@ -211,23 +213,26 @@ impl ClawStore {
                 }
             }
 
-            // Golden rootfs (sufficient for Ready — snapshot is optional optimization)
-            let golden_meta = assets_dir
-                .join("goldens")
-                .join(name)
-                .join("current")
-                .join("golden.meta.json");
-            let golden_rootfs = assets_dir
-                .join("goldens")
-                .join(name)
-                .join("current")
-                .join("rootfs.ext4");
+            // Modern golden: require a self-consistent fingerprint/metadata
+            // (not just files on disk) before trusting it as Ready. Fails closed
+            // so an inconsistent or corrupt golden is rebuilt by the installer.
+            let has_golden = golden_ready_consistent(assets_dir, name);
 
-            // Legacy-format golden image (ubuntu-24.04-<name>.ext4)
+            // Legacy-format golden image (ubuntu-24.04-<name>.ext4): no metadata
+            // exists, so it is still seeded on file existence alone.
             let legacy_golden = assets_dir.join(format!("ubuntu-24.04-{name}.ext4"));
-
-            let has_golden = golden_meta.is_file() && golden_rootfs.is_file();
             let has_legacy = legacy_golden.is_file();
+
+            // Surface a clear reason when a modern golden is on disk but not
+            // trusted (vs. simply absent), so the rebuild is explainable.
+            if !has_golden {
+                let current = assets_dir.join("goldens").join(name).join("current");
+                if current.symlink_metadata().is_ok() {
+                    tracing::warn!(
+                        "[claw-store] seed: {name} golden present but inconsistent (metadata/fingerprint); not marking ready"
+                    );
+                }
+            }
 
             if has_golden || has_legacy {
                 let source = if has_golden { "golden" } else { "legacy" };
@@ -620,6 +625,46 @@ impl ClawStore {
     }
 }
 
+/// Whether the modern golden for `name` is self-consistent enough to seed as
+/// Ready without re-installing.
+///
+/// Requires a usable rootfs and metadata reachable through the `current`
+/// symlink, metadata that names this claw, and a recorded fingerprint that
+/// matches the fingerprint directory `current` points to. Any failure (missing
+/// rootfs, `current` not a symlink, missing/unparseable metadata, wrong
+/// `claw_type`, or a fingerprint mismatch) returns `false` so the seed path
+/// fails closed and lets the normal install flow rebuild the golden.
+///
+/// Legacy (`ubuntu-24.04-<name>.ext4`) goldens carry no metadata and are not
+/// evaluated here.
+fn golden_ready_consistent(assets_dir: &Path, name: &str) -> bool {
+    use core_rs::artifact_meta as meta;
+
+    // The rootfs must be resolvable through the `current` symlink.
+    if meta::golden_current_rootfs(assets_dir, name).is_none() {
+        return false;
+    }
+
+    // Metadata must parse and name this claw.
+    let Some(golden) = meta::read_current_golden_meta(assets_dir, name) else {
+        return false;
+    };
+    if golden.claw_type != name {
+        return false;
+    }
+
+    // The recorded fingerprint must match the fingerprint directory that
+    // `current` resolves to. `read_current_golden_meta` already succeeded above,
+    // so `current` is a readable symlink here.
+    let link = meta::golden_current_link(assets_dir, name);
+    match std::fs::read_link(&link) {
+        Ok(target) => {
+            target.file_name().and_then(|s| s.to_str()) == Some(golden.fingerprint.as_str())
+        }
+        Err(_) => false,
+    }
+}
+
 /// Atomic write-rename to prevent corruption.
 ///
 /// Ensures the parent directory exists before writing — on a fresh
@@ -851,11 +896,10 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let assets = dir.path().join("assets");
 
-        // Create fake golden for picoclaw (no snapshot needed — golden-only is sufficient)
-        let golden = assets.join("goldens/picoclaw/current");
-        std::fs::create_dir_all(&golden).unwrap();
-        std::fs::write(golden.join("golden.meta.json"), "{}").unwrap();
-        std::fs::write(golden.join("rootfs.ext4"), b"fake").unwrap();
+        // Create a consistent golden for picoclaw (symlink + matching metadata).
+        // Snapshot is not needed; golden-only is sufficient for Ready.
+        let fp = "a".repeat(64);
+        build_golden(&assets, "picoclaw", &fp, &fp, "picoclaw", true, true, true);
 
         let state_file = dir.path().join("state.json");
         let store = ClawStore::new(&state_file).unwrap();
@@ -1013,6 +1057,216 @@ mod tests {
         assert_eq!(
             json["unavailable_reason_code"],
             serde_json::Value::String("catalog_only".to_string()),
+        );
+    }
+
+    // golden_ready_consistent / seed fingerprint check
+
+    /// Build a modern golden under `assets/goldens/<claw>/<dir_fp>/` with a
+    /// `current` symlink to `dir_fp`, writing metadata with `meta_fp` and
+    /// `meta_claw_type`. The `write_*`/`make_symlink` flags omit pieces to
+    /// exercise the missing-part cases.
+    #[allow(clippy::fn_params_excessive_bools, clippy::too_many_arguments)]
+    fn build_golden(
+        assets: &Path,
+        claw: &str,
+        dir_fp: &str,
+        meta_fp: &str,
+        meta_claw_type: &str,
+        write_rootfs: bool,
+        write_meta_file: bool,
+        make_symlink: bool,
+    ) {
+        use core_rs::artifact_meta::{self, Fingerprint, GoldenMeta};
+        let fp = Fingerprint::new(dir_fp);
+        let version_dir = artifact_meta::golden_version_dir(assets, claw, &fp);
+        std::fs::create_dir_all(&version_dir).unwrap();
+        if write_rootfs {
+            std::fs::write(version_dir.join("rootfs.ext4"), b"rootfs").unwrap();
+        }
+        if write_meta_file {
+            let meta = GoldenMeta {
+                claw_type: meta_claw_type.to_string(),
+                fingerprint: Fingerprint::new(meta_fp),
+                base_rootfs_sha256: "b".repeat(64),
+                installer_plan_sha256: "c".repeat(64),
+                kernel_sha256: "d".repeat(64),
+                builder_version: "test".into(),
+                created_at: "2026-01-01T00:00:00Z".into(),
+            };
+            artifact_meta::write_meta(&version_dir.join("golden.meta.json"), &meta).unwrap();
+        }
+        if make_symlink {
+            let link = artifact_meta::golden_current_link(assets, claw);
+            artifact_meta::update_current_link(&link, &fp).unwrap();
+        }
+    }
+
+    fn first_supported_claw() -> Option<String> {
+        manifest::catalog()
+            .into_iter()
+            .find(|e| e.tier == manifest::Tier::Supported)
+            .map(|e| e.name.to_string())
+    }
+
+    #[test]
+    fn golden_consistent_matching_is_true() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fp = "e".repeat(64);
+        build_golden(
+            tmp.path(),
+            "picoclaw",
+            &fp,
+            &fp,
+            "picoclaw",
+            true,
+            true,
+            true,
+        );
+        assert!(golden_ready_consistent(tmp.path(), "picoclaw"));
+    }
+
+    #[test]
+    fn golden_consistent_missing_meta_is_false() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fp = "e".repeat(64);
+        // rootfs + symlink, but no golden.meta.json.
+        build_golden(
+            tmp.path(),
+            "picoclaw",
+            &fp,
+            &fp,
+            "picoclaw",
+            true,
+            false,
+            true,
+        );
+        assert!(!golden_ready_consistent(tmp.path(), "picoclaw"));
+    }
+
+    #[test]
+    fn golden_consistent_mismatched_fingerprint_is_false() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Install dir/symlink fingerprint != metadata fingerprint.
+        build_golden(
+            tmp.path(),
+            "picoclaw",
+            &"e".repeat(64),
+            &"f".repeat(64),
+            "picoclaw",
+            true,
+            true,
+            true,
+        );
+        assert!(!golden_ready_consistent(tmp.path(), "picoclaw"));
+    }
+
+    #[test]
+    fn golden_consistent_wrong_claw_type_is_false() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fp = "e".repeat(64);
+        build_golden(
+            tmp.path(),
+            "picoclaw",
+            &fp,
+            &fp,
+            "otherclaw",
+            true,
+            true,
+            true,
+        );
+        assert!(!golden_ready_consistent(tmp.path(), "picoclaw"));
+    }
+
+    #[test]
+    fn golden_consistent_missing_symlink_or_rootfs_is_false() {
+        let fp = "e".repeat(64);
+        // No `current` symlink: version dir has meta+rootfs but nothing resolves.
+        let tmp = tempfile::tempdir().unwrap();
+        build_golden(
+            tmp.path(),
+            "picoclaw",
+            &fp,
+            &fp,
+            "picoclaw",
+            true,
+            true,
+            false,
+        );
+        assert!(!golden_ready_consistent(tmp.path(), "picoclaw"));
+
+        // Symlink+meta present but rootfs.ext4 absent.
+        let tmp2 = tempfile::tempdir().unwrap();
+        build_golden(
+            tmp2.path(),
+            "picoclaw",
+            &fp,
+            &fp,
+            "picoclaw",
+            false,
+            true,
+            true,
+        );
+        assert!(!golden_ready_consistent(tmp2.path(), "picoclaw"));
+    }
+
+    #[test]
+    fn seed_marks_ready_on_consistent_golden() {
+        let Some(claw) = first_supported_claw() else {
+            return; // no Supported claw in catalog; nothing to seed
+        };
+        let (_sdir, store) = temp_store();
+        let assets = tempfile::tempdir().unwrap();
+        let fp = "a".repeat(64);
+        build_golden(assets.path(), &claw, &fp, &fp, &claw, true, true, true);
+
+        store.seed_from_assets(assets.path());
+        assert!(store.is_ready(&claw), "consistent golden should seed Ready");
+    }
+
+    #[test]
+    fn seed_skips_inconsistent_golden() {
+        let Some(claw) = first_supported_claw() else {
+            return;
+        };
+        let (_sdir, store) = temp_store();
+        let assets = tempfile::tempdir().unwrap();
+        // Metadata fingerprint != install dir fingerprint.
+        build_golden(
+            assets.path(),
+            &claw,
+            &"a".repeat(64),
+            &"b".repeat(64),
+            &claw,
+            true,
+            true,
+            true,
+        );
+
+        store.seed_from_assets(assets.path());
+        assert!(
+            !store.is_ready(&claw),
+            "inconsistent golden must not seed Ready"
+        );
+    }
+
+    #[test]
+    fn seed_marks_ready_on_legacy_golden() {
+        let Some(claw) = first_supported_claw() else {
+            return;
+        };
+        let (_sdir, store) = temp_store();
+        let assets = tempfile::tempdir().unwrap();
+        std::fs::write(
+            assets.path().join(format!("ubuntu-24.04-{claw}.ext4")),
+            b"legacy",
+        )
+        .unwrap();
+
+        store.seed_from_assets(assets.path());
+        assert!(
+            store.is_ready(&claw),
+            "legacy golden should still seed Ready"
         );
     }
 }

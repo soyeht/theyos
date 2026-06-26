@@ -835,6 +835,7 @@ async fn household_instance_status(
             "status": row.status.to_string(),
             "provisioning_message": row.provisioning_message,
             "provisioning_error": row.provisioning_error,
+            "provisioning_failure_code": row.provisioning_failure_code,
             "provisioning_phase": row.provisioning_phase,
         })),
     )
