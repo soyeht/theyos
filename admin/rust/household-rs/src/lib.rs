@@ -58,6 +58,7 @@ pub mod keys_se;
 pub mod keystore;
 pub mod machine_cert;
 pub mod member_identity;
+pub mod owner_approval_v2;
 pub mod owner_auth;
 pub mod owner_events;
 pub mod owner_webauthn;

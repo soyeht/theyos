@@ -3,8 +3,8 @@
 Status: design note merged after Caio GO. No runtime behavior is changed by
 this document.
 
-Base: S1 WebAuthn RP core is merged; S2 runtime implementation is still a
-separate follow-up.
+Base: S1 WebAuthn RP core is merged; S2 runtime primitives are separate from
+the later endpoint enforcement switch.
 
 ## Goal
 
