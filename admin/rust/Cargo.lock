@@ -4317,6 +4317,7 @@ dependencies = [
  "libc",
  "mdns-sd",
  "nostr-relay-rs",
+ "p256",
  "percent-encoding",
  "pty-process",
  "qrcode",
