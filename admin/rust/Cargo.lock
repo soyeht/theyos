@@ -956,6 +956,7 @@ dependencies = [
  "libc",
  "p256",
  "rusqlite",
+ "semver",
  "serde",
  "serde_json",
  "serde_yaml",

@@ -21,6 +21,8 @@ use core_rs::artifact_trust::{ArtifactSignatureKeyring, ArtifactTrustMode};
 pub enum ArtifactError {
     #[error("artifact not available for {claw}/{arch}")]
     NotAvailable { claw: String, arch: String },
+    #[error("insecure artifact registry url (https required for non-loopback hosts): {0}")]
+    InsecureUrl(String),
     #[error("artifact registry unreachable: {0}")]
     RegistryUnreachable(String),
     #[error("sha256 mismatch: expected {expected}, got {actual}")]
@@ -222,6 +224,14 @@ impl ArtifactResolver {
     /// not found, the signature is required-but-missing/invalid, the manifest is
     /// invalid, or the architecture doesn't match.
     pub fn resolve(&self, claw: &str) -> Result<ArtifactManifest, ArtifactError> {
+        // Reject insecure registry base URLs — including any
+        // `THEYOS_ARTIFACT_REGISTRY_URL` override — before touching the
+        // network, so an `http://` override cannot fetch a manifest at all.
+        // Loopback hosts remain allowed for local test fixtures.
+        if !core_rs::artifact_registry::is_secure_artifact_url(&self.registry_url) {
+            return Err(ArtifactError::InsecureUrl(self.registry_url.clone()));
+        }
+
         let url = format!("{}/{}/{}/latest.json", self.registry_url, claw, self.arch);
 
         let latest_json_bytes = match self.fetch(&url)? {
@@ -343,6 +353,41 @@ mod tests {
     fn resolver_strips_trailing_slash() {
         let r = ArtifactResolver::new("https://example.com/artifacts/");
         assert_eq!(r.registry_url(), "https://example.com/artifacts");
+    }
+
+    #[test]
+    fn resolve_rejects_public_http_registry_override() {
+        // Simulates THEYOS_ARTIFACT_REGISTRY_URL=http://evil.example/...
+        // The override must fail before any manifest is downloaded.
+        let r = ArtifactResolver::new("http://evil.example/artifacts");
+        let err = r.resolve("picoclaw").unwrap_err();
+        assert!(
+            matches!(err, ArtifactError::InsecureUrl(_)),
+            "public http registry override must be rejected pre-network, got: {err}"
+        );
+    }
+
+    #[test]
+    fn resolve_rejects_userinfo_loopback_registry_override() {
+        // A loopback string smuggled into userinfo must not bypass the policy;
+        // the real host here is `evil.example`.
+        let r = ArtifactResolver::new("http://127.0.0.1@evil.example/artifacts");
+        assert!(matches!(
+            r.resolve("picoclaw").unwrap_err(),
+            ArtifactError::InsecureUrl(_)
+        ));
+    }
+
+    #[test]
+    fn resolve_allows_loopback_http_registry() {
+        // Loopback http is allowed by policy, so resolution proceeds past the
+        // scheme gate and fails later on the network (nothing is listening).
+        let r = ArtifactResolver::new("http://127.0.0.1:1/artifacts");
+        let err = r.resolve("picoclaw").unwrap_err();
+        assert!(
+            !matches!(err, ArtifactError::InsecureUrl(_)),
+            "loopback http registry must pass the scheme gate, got: {err}"
+        );
     }
 
     #[test]

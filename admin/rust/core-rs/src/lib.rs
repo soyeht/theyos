@@ -24,6 +24,7 @@ pub mod guest_image_failure;
 pub mod guest_net;
 pub mod host_resources;
 pub mod id;
+pub mod instance_failure;
 pub mod ipc;
 pub mod maintenance;
 pub mod manifest;
