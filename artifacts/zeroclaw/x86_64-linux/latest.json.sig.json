@@ -1,0 +1,6 @@
+{
+  "schema_version": 1,
+  "alg": "p256_ecdsa_sha256_raw",
+  "key_id": "artifact-prod-p256-2026q2",
+  "signature_b64url": "QZL1RBuBvbMN-YnWa3QUIvseK9-U8nuUYeScw8l3UypykWerky03UFsJrwDYHMtR6z4RAQtKtsAdPaNz4-4Nzg"
+}
