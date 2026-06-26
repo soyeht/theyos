@@ -8,10 +8,11 @@
 //! authorized the live mutation and is enforced as log well-formedness/audit
 //! state, not as the durable event signer.
 //!
-//! This slice verifies authenticity and hash-chain continuity, but it does not
-//! yet provide rollback/truncation protection. Before owner-auth enforcement is
-//! flipped on, the current `(sequence, head_hash)` must be anchored in durable
-//! keystore state and load must reject logs older than that anchor.
+//! This slice verifies authenticity and hash-chain continuity. Rollback and
+//! truncation protection is provided by the inert `owner_webauthn_anchor`
+//! helpers; before owner-auth enforcement is flipped on, boot/handler code must
+//! wire those helpers so load rejects logs older than the durable keystore
+//! anchor.
 
 use serde::{Deserialize, Serialize};
 use serde_bytes::ByteBuf;
