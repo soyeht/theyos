@@ -176,6 +176,26 @@ impl ArtifactResolver {
         Self::build(registry_url, Some(trust))
     }
 
+    /// Build a resolver for the install/consumption path, honoring an explicitly
+    /// injected trust config.
+    ///
+    /// `trust` is `None` in production today - no production public key exists, so
+    /// the install path keeps the deferred status quo (no verification). A caller
+    /// or future config supplies a real [`ArtifactTrustConfig`] once a production
+    /// key, custody, and policy exist; this associated fn is the single seam where
+    /// that injection lands. Tests inject a test-only keyring to prove the
+    /// consumption path end-to-end. `None` is the deferred status quo (no
+    /// verification); `Some(trust)`, including an empty keyring, activates
+    /// verification and fails closed until real key pins exist - an empty keyring
+    /// is not a production config.
+    #[must_use]
+    pub fn for_install(registry_url: &str, trust: Option<ArtifactTrustConfig>) -> Self {
+        match trust {
+            Some(trust) => Self::with_trust(registry_url, trust),
+            None => Self::new(registry_url),
+        }
+    }
+
     fn build(registry_url: &str, trust: Option<ArtifactTrustConfig>) -> Self {
         let http = ureq::AgentBuilder::new()
             .timeout_connect(Duration::from_secs(10))
@@ -843,5 +863,121 @@ mod tests {
             .resolve("testclaw")
             .expect("trust None resolves without touching .sig.json");
         assert_eq!(resolved.claw, "testclaw");
+    }
+
+    // P0.1-E: the install/consumption seam (ArtifactResolver::for_install) carries
+    // an injected trust config through to verification. Production passes None.
+
+    #[test]
+    fn for_install_with_trust_verifies_valid_signed_consumption() {
+        let manifest = test_manifest_bytes();
+        let sig = sign(7, SIGNER_KEY_ID, &manifest);
+        let (base_url, _l) = serve_signed(manifest, Some(sig));
+        let r =
+            ArtifactResolver::for_install(&base_url, Some(ArtifactTrustConfig::new(keyring(7))));
+        let resolved = r
+            .resolve("testclaw")
+            .expect("valid signed consumption resolves");
+        assert_eq!(resolved.claw, "testclaw");
+    }
+
+    #[test]
+    fn for_install_with_trust_rejects_missing_signature() {
+        let manifest = test_manifest_bytes();
+        let (base_url, _l) = serve_signed(manifest, None);
+        let r =
+            ArtifactResolver::for_install(&base_url, Some(ArtifactTrustConfig::new(keyring(7))));
+        assert!(matches!(
+            r.resolve("testclaw").unwrap_err(),
+            ArtifactError::Signature(_)
+        ));
+    }
+
+    #[test]
+    fn for_install_with_trust_rejects_bad_signature() {
+        let manifest = test_manifest_bytes();
+        let sig = sign(7, SIGNER_KEY_ID, b"other-bytes");
+        let (base_url, _l) = serve_signed(manifest, Some(sig));
+        let r =
+            ArtifactResolver::for_install(&base_url, Some(ArtifactTrustConfig::new(keyring(7))));
+        assert!(matches!(
+            r.resolve("testclaw").unwrap_err(),
+            ArtifactError::Signature(_)
+        ));
+    }
+
+    #[test]
+    fn for_install_with_trust_rejects_unknown_key() {
+        let manifest = test_manifest_bytes();
+        let sig = sign(7, SIGNER_KEY_ID, &manifest);
+        let (base_url, _l) = serve_signed(manifest, Some(sig));
+        let r =
+            ArtifactResolver::for_install(&base_url, Some(ArtifactTrustConfig::new(keyring(9))));
+        assert!(matches!(
+            r.resolve("testclaw").unwrap_err(),
+            ArtifactError::Signature(_)
+        ));
+    }
+
+    #[test]
+    fn for_install_with_trust_rejects_revoked_key() {
+        let manifest = test_manifest_bytes();
+        let sig = sign(7, SIGNER_KEY_ID, &manifest);
+        let (base_url, _l) = serve_signed(manifest, Some(sig));
+        let revoked = keyring(7).revoke(SIGNER_KEY_ID);
+        let r = ArtifactResolver::for_install(&base_url, Some(ArtifactTrustConfig::new(revoked)));
+        assert!(matches!(
+            r.resolve("testclaw").unwrap_err(),
+            ArtifactError::Signature(_)
+        ));
+    }
+
+    #[test]
+    fn for_install_with_trust_non_404_sig_fails_closed() {
+        let manifest = test_manifest_bytes();
+        let (base_url, _l) = serve_manifest_sig_status(manifest, 500);
+        let r =
+            ArtifactResolver::for_install(&base_url, Some(ArtifactTrustConfig::new(keyring(7))));
+        assert!(matches!(
+            r.resolve("testclaw").unwrap_err(),
+            ArtifactError::RegistryUnreachable(_)
+        ));
+    }
+
+    #[test]
+    fn for_install_with_trust_loopback_unsigned_only_with_override() {
+        let manifest = test_manifest_bytes();
+        let (base_url, _l) = serve_signed(manifest, None);
+        let permissive = ArtifactTrustConfig::new(keyring(7)).allow_unsigned_loopback(true);
+        let r = ArtifactResolver::for_install(&base_url, Some(permissive));
+        assert!(r.resolve("testclaw").is_ok());
+    }
+
+    #[test]
+    fn for_install_none_is_deferred_status_quo() {
+        // Production today: None means no verification - the install path resolves
+        // unsigned exactly as ArtifactResolver::new, even where a .sig.json errors.
+        let manifest = test_manifest_bytes();
+        let (base_url, _l) = serve_manifest_sig_status(manifest, 500);
+        let r = ArtifactResolver::for_install(&base_url, None);
+        let resolved = r.resolve("testclaw").expect("None resolves as status quo");
+        assert_eq!(resolved.claw, "testclaw");
+    }
+
+    #[test]
+    fn for_install_with_empty_keyring_fails_closed() {
+        // An empty keyring is NOT the status quo: Some(trust) activates
+        // verification, and with no accepted keys an otherwise-valid signature
+        // fails closed (its key_id is unknown). It must never be silently accepted
+        // as "no enforcement" - so an empty keyring is not a production config.
+        let manifest = test_manifest_bytes();
+        let sig = sign(7, SIGNER_KEY_ID, &manifest);
+        let (base_url, _l) = serve_signed(manifest, Some(sig));
+        let empty = ArtifactTrustConfig::new(ArtifactSignatureKeyring::new());
+        let r = ArtifactResolver::for_install(&base_url, Some(empty));
+        assert!(matches!(
+            r.resolve("testclaw").unwrap_err(),
+            ArtifactError::Signature(_)
+        ));
     }
 }

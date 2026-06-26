@@ -139,6 +139,13 @@ so `ArtifactResolver::new` keeps the unsigned status quo until then.
   configured keyring BEFORE parsing the manifest, but only when a trust config is
   supplied via `with_trust`. `new()` (no trust) is the deferred status quo, not a
   signed-but-permissive mode - do not describe it as a signature policy.
+- The install/consumption path builds its resolver through
+  `ArtifactResolver::for_install(registry_url, trust)`
+  (`server-rs/src/install_worker.rs`). Production passes `None` today - the
+  deferred status quo - and a real `ArtifactTrustConfig` is injected at that single
+  seam once a production key, custody, and policy exist. `None` is the status quo;
+  a configured trust with no accepted keys is not a production config and fails
+  closed (it activates verification with no key to satisfy it).
 
 Provenance rules (hold these when extending the resolver, a cache, or install flow):
 
