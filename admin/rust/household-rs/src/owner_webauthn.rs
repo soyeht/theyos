@@ -98,7 +98,8 @@ impl OwnerWebauthnChallengeId {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct OwnerWebauthnCredential {
     passkey: Passkey,
     last_sign_count: u32,

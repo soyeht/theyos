@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 use serde_bytes::ByteBuf;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
+use webauthn_rs::prelude::PublicKeyCredential;
 
 use crate::error::HouseholdError;
 use crate::ids::{HouseholdId, MachineId, derive_machine_id};
@@ -158,6 +159,35 @@ impl OwnerApprovalV2 {
             return Err(OwnerApprovalV2Error::ContextMismatch);
         }
         expected.challenge_digest()
+    }
+
+    /// Convert the embedded assertion into the public `webauthn-rs` credential
+    /// type. This does not verify the assertion; callers must pass the result
+    /// to `OwnerWebauthnRp::finish_owner_approval_assertion`.
+    pub fn to_public_key_credential(&self) -> Result<PublicKeyCredential, OwnerApprovalV2Error> {
+        self.validate_shape()?;
+
+        let credential_id = data_encoding::BASE64URL_NOPAD.encode(self.credential_id.as_ref());
+        let assertion = serde_json::json!({
+            "id": credential_id,
+            "rawId": credential_id,
+            "response": {
+                "authenticatorData": data_encoding::BASE64URL_NOPAD
+                    .encode(self.authenticator_data.as_ref()),
+                "clientDataJSON": data_encoding::BASE64URL_NOPAD
+                    .encode(self.client_data_json.as_ref()),
+                "signature": data_encoding::BASE64URL_NOPAD
+                    .encode(self.signature.as_ref()),
+                "userHandle": self
+                    .user_handle
+                    .as_ref()
+                    .map(|user_handle| data_encoding::BASE64URL_NOPAD.encode(user_handle.as_ref())),
+            },
+            "type": "public-key",
+        });
+
+        serde_json::from_value(assertion)
+            .map_err(|_| OwnerApprovalV2Error::AssertionField("public_key_credential"))
     }
 }
 
@@ -394,7 +424,15 @@ mod tests {
     use super::*;
     use crate::keys::{IdentityKey, P256Keypair};
     use crate::machine_cert::Platform;
+    use crate::owner_webauthn::{OwnerWebauthnConfig, OwnerWebauthnRp};
     use crate::pair_machine::{JoinChallenge, PAIR_MACHINE_VERSION};
+    use rand::SeedableRng;
+    use rand::rngs::StdRng;
+    use webauthn_authenticator_rs::WebauthnAuthenticator;
+    use webauthn_authenticator_rs::softpasskey::SoftPasskey;
+    use webauthn_rs::prelude::{Url, Uuid};
+
+    const NOW: u64 = 1_800_000_000;
 
     fn household_id() -> HouseholdId {
         HouseholdId::parse(format!("hh_{}", "a".repeat(52))).unwrap()
@@ -435,6 +473,59 @@ mod tests {
             client_data_json: ByteBuf::from(br#"{"type":"webauthn.get"}"#.to_vec()),
             signature: ByteBuf::from(vec![0xA3; 64]),
             user_handle: None,
+        }
+    }
+
+    fn owner_webauthn_rp() -> OwnerWebauthnRp {
+        let config = OwnerWebauthnConfig::new(
+            "alpha.example.test",
+            Url::parse("https://alpha.example.test").unwrap(),
+            "Soyeht Alpha",
+        )
+        .unwrap();
+        OwnerWebauthnRp::new(config).unwrap()
+    }
+
+    fn register_softpasskey(
+        rp: &mut OwnerWebauthnRp,
+        rng: &mut StdRng,
+    ) -> (
+        crate::owner_webauthn::OwnerWebauthnCredential,
+        WebauthnAuthenticator<SoftPasskey>,
+    ) {
+        let (challenge_id, challenge) = rp
+            .start_registration(rng, NOW, Uuid::new_v4(), "owner-alpha", "Owner Alpha", &[])
+            .unwrap();
+        let mut authenticator = WebauthnAuthenticator::new(SoftPasskey::new(true));
+        let response = authenticator
+            .do_registration(Url::parse("https://alpha.example.test").unwrap(), challenge)
+            .unwrap();
+        let credential = rp
+            .finish_registration(NOW, &challenge_id, &response)
+            .unwrap();
+        (credential, authenticator)
+    }
+
+    fn approval_from_assertion(
+        context: OwnerApprovalContextV2,
+        assertion: &PublicKeyCredential,
+    ) -> OwnerApprovalV2 {
+        OwnerApprovalV2 {
+            version: OWNER_APPROVAL_V2_VERSION,
+            context,
+            credential_id: ByteBuf::from(assertion.raw_id.as_slice().to_vec()),
+            authenticator_data: ByteBuf::from(
+                assertion.response.authenticator_data.as_slice().to_vec(),
+            ),
+            client_data_json: ByteBuf::from(
+                assertion.response.client_data_json.as_slice().to_vec(),
+            ),
+            signature: ByteBuf::from(assertion.response.signature.as_slice().to_vec()),
+            user_handle: assertion
+                .response
+                .user_handle
+                .as_ref()
+                .map(|user_handle| ByteBuf::from(user_handle.as_slice().to_vec())),
         }
     }
 
@@ -655,6 +746,68 @@ mod tests {
             approval.validate_shape(),
             Err(OwnerApprovalV2Error::AssertionField("signature"))
         ));
+    }
+
+    #[test]
+    fn owner_approval_body_converts_to_webauthn_public_key_credential() {
+        let mut rp = owner_webauthn_rp();
+        let mut rng = StdRng::seed_from_u64(61);
+        let (mut credential, mut authenticator) = register_softpasskey(&mut rp, &mut rng);
+        let expected_context = sample_context();
+
+        let (challenge_id, challenge) = rp
+            .start_owner_approval_assertion(
+                &mut rng,
+                NOW + 1,
+                &[credential.clone()],
+                &expected_context,
+            )
+            .unwrap();
+        let assertion = authenticator
+            .do_authentication(Url::parse("https://alpha.example.test").unwrap(), challenge)
+            .unwrap();
+        let approval = approval_from_assertion(expected_context.clone(), &assertion);
+
+        let converted = approval.to_public_key_credential().unwrap();
+        assert_eq!(
+            converted.id,
+            data_encoding::BASE64URL_NOPAD.encode(approval.credential_id.as_ref())
+        );
+        assert_eq!(converted.type_, "public-key");
+        assert_eq!(converted.raw_id.as_slice(), assertion.raw_id.as_slice());
+        assert_eq!(
+            converted.response.authenticator_data.as_slice(),
+            assertion.response.authenticator_data.as_slice()
+        );
+        assert_eq!(
+            converted.response.client_data_json.as_slice(),
+            assertion.response.client_data_json.as_slice()
+        );
+        assert_eq!(
+            converted.response.signature.as_slice(),
+            assertion.response.signature.as_slice()
+        );
+        assert_eq!(
+            converted
+                .response
+                .user_handle
+                .as_ref()
+                .map(|user_handle| user_handle.as_slice()),
+            assertion
+                .response
+                .user_handle
+                .as_ref()
+                .map(|user_handle| user_handle.as_slice())
+        );
+
+        rp.finish_owner_approval_assertion(
+            NOW + 1,
+            &challenge_id,
+            &converted,
+            &mut credential,
+            &expected_context,
+        )
+        .unwrap();
     }
 
     #[test]

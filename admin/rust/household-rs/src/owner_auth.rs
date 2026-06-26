@@ -7,16 +7,20 @@ use thiserror::Error;
 
 use crate::error::{HouseholdError, StorageError};
 use crate::household_record::HouseholdRecord;
+use crate::owner_webauthn::OwnerWebauthnCredentialStore;
+use crate::owner_webauthn_authority::{OwnerWebauthnAuthority, OwnerWebauthnAuthorityError};
 use crate::person_cert::PersonCert;
 use crate::storage::{self, atomic_write_cbor};
 
-#[derive(Clone, Serialize, Deserialize, PartialEq, Eq, Debug)]
+#[derive(Clone, Serialize, Deserialize, Debug)]
 #[serde(deny_unknown_fields)]
 pub struct HouseholdAuthState {
     #[serde(rename = "v")]
     pub version: u8,
     pub hh_id: crate::ids::HouseholdId,
     pub owner_person_cert: PersonCert,
+    #[serde(default, skip_serializing_if = "OwnerWebauthnAuthority::is_empty")]
+    pub owner_webauthn: OwnerWebauthnAuthority,
     pub created_at: u64,
     pub updated_at: u64,
 }
@@ -27,6 +31,8 @@ pub enum OwnerAuthError {
     Storage(#[from] StorageError),
     #[error("protocol: {0}")]
     Protocol(#[from] HouseholdError),
+    #[error("owner webauthn authority: {0}")]
+    OwnerWebauthn(#[from] OwnerWebauthnAuthorityError),
     #[error("invalid owner auth state: {0}")]
     InvalidState(String),
 }
@@ -42,6 +48,7 @@ impl HouseholdAuthState {
             created_at: owner_person_cert.issued_at,
             updated_at: owner_person_cert.issued_at,
             owner_person_cert,
+            owner_webauthn: OwnerWebauthnAuthority::new(),
         }
     }
 
@@ -60,13 +67,42 @@ impl HouseholdAuthState {
         }
         self.owner_person_cert
             .verify(&record.hh_id, &record.hh_pub, now)?;
-        if self.created_at != self.owner_person_cert.issued_at || self.updated_at != self.created_at
-        {
+        self.owner_webauthn
+            .verify(record, &self.owner_person_cert)?;
+        if self.created_at != self.owner_person_cert.issued_at {
             return Err(OwnerAuthError::InvalidState(
-                "created_at/updated_at must equal owner cert issued_at in Phase 2".into(),
+                "created_at must equal owner cert issued_at".into(),
+            ));
+        }
+        if self.owner_webauthn.is_empty() {
+            if self.updated_at != self.created_at {
+                return Err(OwnerAuthError::InvalidState(
+                    "updated_at must equal created_at when owner webauthn authority is empty"
+                        .into(),
+                ));
+            }
+        } else if self.updated_at < self.created_at {
+            return Err(OwnerAuthError::InvalidState(
+                "updated_at must be >= created_at".into(),
             ));
         }
         Ok(())
+    }
+
+    pub fn owner_webauthn_credentials(
+        &self,
+        record: &HouseholdRecord,
+    ) -> Result<OwnerWebauthnCredentialStore, OwnerAuthError> {
+        Ok(self
+            .owner_webauthn
+            .reconstruct(record, &self.owner_person_cert)?)
+    }
+
+    pub fn owner_has_active_webauthn_credential(
+        &self,
+        record: &HouseholdRecord,
+    ) -> Result<bool, OwnerAuthError> {
+        Ok(self.owner_webauthn_credentials(record)?.active_count() > 0)
     }
 
     pub fn save(&self, state_dir: &Path) -> Result<(), OwnerAuthError> {
