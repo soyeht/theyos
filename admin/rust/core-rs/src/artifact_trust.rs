@@ -15,7 +15,8 @@
 //! the resolver; those are later P0.1 slices.
 
 use crate::artifact_signature::{
-    ArtifactSignatureEnvelope, ArtifactSignatureError, ArtifactSignatureKey, verify_envelope,
+    verify_envelope, ArtifactSignatureEnvelope, ArtifactSignatureError, ArtifactSignatureKey,
+    ARTIFACT_SIGNATURE_ALG_P256_ECDSA_SHA256_RAW,
 };
 
 /// Whether an artifact-manifest signature is mandatory for the source being
@@ -150,15 +151,47 @@ impl ArtifactSignatureKeyring {
     }
 }
 
+/// The pinned production artifact-signing key identifier, baked into the client
+/// so it can verify manifests signed by the release key. See
+/// `docs/artifact-signing-runbook.md`.
+pub const PRODUCTION_ARTIFACT_KEY_ID: &str = "artifact-prod-p256-2026q2";
+
+/// SEC1-compressed P-256 public key (33 bytes) for [`PRODUCTION_ARTIFACT_KEY_ID`].
+///
+/// This is a PUBLIC key - it is not secret. The matching private key lives only
+/// on the release / builder machine and never appears in this repo. Verified
+/// 2026-06-25 by an `openssl pkeyutl` round-trip against that private key; the
+/// base64 form is `A+5hT7nQ+uckDKxwl8ym9kfxWcS+0A7tOG+0MDbAoWU/`.
+const PRODUCTION_ARTIFACT_PUBLIC_KEY_SEC1: [u8; 33] = [
+    0x03, 0xee, 0x61, 0x4f, 0xb9, 0xd0, 0xfa, 0xe7, 0x24, 0x0c, 0xac, 0x70, 0x97, 0xcc, 0xa6, 0xf6,
+    0x47, 0xf1, 0x59, 0xc4, 0xbe, 0xd0, 0x0e, 0xed, 0x38, 0x6f, 0xb4, 0x30, 0x36, 0xc0, 0xa1, 0x65,
+    0x3f,
+];
+
+/// The production artifact-signature keyring: the pinned release key as
+/// `current`, with no rotation successor and no revocations yet.
+///
+/// This builds the trusted-key set only. It does NOT by itself enable
+/// enforcement - the resolver still configures no trust in production until the
+/// activation slice wires it in. Holds only the public key; no private material.
+#[must_use]
+pub fn production_keyring() -> ArtifactSignatureKeyring {
+    ArtifactSignatureKeyring::new().with_current(ArtifactSignatureKey::new(
+        PRODUCTION_ARTIFACT_KEY_ID,
+        ARTIFACT_SIGNATURE_ALG_P256_ECDSA_SHA256_RAW,
+        PRODUCTION_ARTIFACT_PUBLIC_KEY_SEC1.to_vec(),
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::artifact_signature::{
-        ARTIFACT_SIGNATURE_ALG_P256_ECDSA_SHA256_RAW, ARTIFACT_SIGNATURE_SCHEMA_VERSION,
-        signature_payload,
+        signature_payload, ARTIFACT_SIGNATURE_ALG_P256_ECDSA_SHA256_RAW,
+        ARTIFACT_SIGNATURE_SCHEMA_VERSION,
     };
-    use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD as B64URL};
-    use p256::ecdsa::{Signature, SigningKey, signature::Signer};
+    use base64::{engine::general_purpose::URL_SAFE_NO_PAD as B64URL, Engine as _};
+    use p256::ecdsa::{signature::Signer, Signature, SigningKey};
 
     const LATEST_JSON: &[u8] = br#"{"manifest_version":1,"claw":"picoclaw","version":"0.1.0"}"#;
     const CURRENT_ID: &str = "current-p256-2026-06";
@@ -304,5 +337,78 @@ mod tests {
         assert_eq!(accepted[0].key_id, CURRENT_ID);
         assert!(keyring.is_revoked(NEXT_ID));
         assert!(!keyring.is_revoked(CURRENT_ID));
+    }
+
+    // P0.1-F1: the pinned production keyring (real public key, no activation).
+
+    #[test]
+    fn production_keyring_pins_exactly_the_expected_key() {
+        let accepted = production_keyring().accepted_keys();
+        assert_eq!(accepted.len(), 1, "only the current production key");
+        let key = &accepted[0];
+        assert_eq!(key.key_id, PRODUCTION_ARTIFACT_KEY_ID);
+        assert_eq!(key.key_id, "artifact-prod-p256-2026q2");
+        assert_eq!(key.alg, ARTIFACT_SIGNATURE_ALG_P256_ECDSA_SHA256_RAW);
+        assert_eq!(
+            key.public_key_sec1_compressed.as_slice(),
+            &PRODUCTION_ARTIFACT_PUBLIC_KEY_SEC1
+        );
+        assert_eq!(key.public_key_sec1_compressed.len(), 33);
+    }
+
+    #[test]
+    fn production_public_key_is_a_valid_p256_point() {
+        // Auditability: a transcription typo in the pinned bytes fails here, not
+        // silently at verify time.
+        assert_eq!(PRODUCTION_ARTIFACT_PUBLIC_KEY_SEC1[0] & 0xfe, 0x02);
+        p256::ecdsa::VerifyingKey::from_sec1_bytes(&PRODUCTION_ARTIFACT_PUBLIC_KEY_SEC1)
+            .expect("pinned production key is a valid SEC1-compressed P-256 point");
+    }
+
+    #[test]
+    fn production_keyring_rejects_unknown_key_id() {
+        // A signature whose key_id is not the pinned one is rejected.
+        let sig = sign("rogue-key-2025", 7, LATEST_JSON);
+        assert_eq!(
+            production_keyring()
+                .verify_latest_json(ArtifactTrustMode::Required, LATEST_JSON, Some(&sig))
+                .unwrap_err(),
+            ArtifactTrustError::Signature(ArtifactSignatureError::UnknownKeyId(
+                "rogue-key-2025".to_string()
+            ))
+        );
+    }
+
+    #[test]
+    fn production_keyring_rejects_revoked_production_key_id() {
+        // Revoking the pinned key_id rejects it up front, before signature checks.
+        let sig = sign(PRODUCTION_ARTIFACT_KEY_ID, 7, LATEST_JSON);
+        assert_eq!(
+            production_keyring()
+                .revoke(PRODUCTION_ARTIFACT_KEY_ID)
+                .verify_latest_json(ArtifactTrustMode::Required, LATEST_JSON, Some(&sig))
+                .unwrap_err(),
+            ArtifactTrustError::RevokedKeyId(PRODUCTION_ARTIFACT_KEY_ID.to_string())
+        );
+    }
+
+    #[test]
+    fn production_keyring_rejects_unsupported_algorithm() {
+        // An envelope claiming the production key_id but an unsupported alg fails.
+        let envelope = ArtifactSignatureEnvelope {
+            schema_version: ARTIFACT_SIGNATURE_SCHEMA_VERSION,
+            alg: "ed25519".to_string(),
+            key_id: PRODUCTION_ARTIFACT_KEY_ID.to_string(),
+            signature_b64url: B64URL.encode([0u8; 64]),
+        };
+        let sig = serde_json::to_vec(&envelope).expect("signature json");
+        assert_eq!(
+            production_keyring()
+                .verify_latest_json(ArtifactTrustMode::Required, LATEST_JSON, Some(&sig))
+                .unwrap_err(),
+            ArtifactTrustError::Signature(ArtifactSignatureError::UnsupportedAlgorithm(
+                "ed25519".to_string()
+            ))
+        );
     }
 }
