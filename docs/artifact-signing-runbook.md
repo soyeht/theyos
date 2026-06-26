@@ -85,6 +85,10 @@ Default builder-machine usage:
     THEYOS_ARTIFACT_SIGNING_KEY=/path/to/artifact-signing.key \
       ./scripts/publish-claw-artifact.sh <claw>
 
+`--dry-run` also signs and verifies the manifest, so it still needs either
+`THEYOS_ARTIFACT_SIGNING_KEY` for the default signer or an explicit
+`THEYOS_ARTIFACT_SIGNER_CMD` test signer.
+
 ## Where signing fits in the publish flow
 
 `scripts/publish-claw-artifact.sh` (run from the builder machine):
