@@ -10,9 +10,13 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 use crate::error::HouseholdError;
-use crate::ids::{HouseholdId, MachineId};
+use crate::ids::{HouseholdId, MachineId, derive_machine_id};
+use crate::keys::P256PublicKey;
 use crate::machine_cert::PersonId;
-use crate::pair_machine::JoinTransport;
+use crate::pair_machine::{
+    JoinRequest, JoinTransport, PairMachineState, PairMachineWindowSnapshot, join_request_hash,
+    verify_join_request,
+};
 
 pub const OWNER_APPROVAL_V2_VERSION: u8 = 2;
 pub const OWNER_APPROVAL_V2_PURPOSE: &str = "owner-approval-v2";
@@ -38,6 +42,10 @@ pub enum OwnerApprovalV2Error {
     NonCanonical,
     #[error("owner approval context CBOR error: {0}")]
     Cbor(String),
+    #[error("owner approval trusted state mismatch: {0}")]
+    TrustedState(&'static str),
+    #[error("owner approval cached join request invalid: {0}")]
+    JoinRequest(String),
 }
 
 impl From<HouseholdError> for OwnerApprovalV2Error {
@@ -165,6 +173,94 @@ impl OwnerApprovalContextV2 {
         hasher.update(&canonical);
         Ok(hasher.finalize().into())
     }
+
+    pub fn pair_machine_approve_from_trusted_state(
+        input: PairMachineTrustedContextInput<'_>,
+    ) -> Result<Self, OwnerApprovalV2Error> {
+        let snapshot = input.snapshot;
+        if snapshot.state != PairMachineState::AwaitingOwner {
+            return Err(OwnerApprovalV2Error::TrustedState(
+                "window not awaiting owner",
+            ));
+        }
+        let cursor = snapshot
+            .owner_event_cursor
+            .ok_or(OwnerApprovalV2Error::TrustedState(
+                "missing owner event cursor",
+            ))?;
+        let cached_join_request =
+            snapshot
+                .cached_join_request
+                .as_ref()
+                .ok_or(OwnerApprovalV2Error::TrustedState(
+                    "missing cached join request",
+                ))?;
+        let join_request: JoinRequest = crate::cbor::from_canonical_slice(cached_join_request)
+            .map_err(|e| OwnerApprovalV2Error::JoinRequest(e.to_string()))?;
+        verify_join_request(&join_request)
+            .map_err(|e| OwnerApprovalV2Error::JoinRequest(e.to_string()))?;
+
+        require_snapshot_match(
+            snapshot.m_pub.as_ref().map(ByteBuf::as_ref),
+            join_request.m_pub.as_ref(),
+            "m_pub mismatch",
+        )?;
+        require_snapshot_match(
+            snapshot.nonce.as_ref().map(ByteBuf::as_ref),
+            join_request.nonce.as_ref(),
+            "nonce mismatch",
+        )?;
+        if snapshot.transport != Some(join_request.transport) {
+            return Err(OwnerApprovalV2Error::TrustedState("transport mismatch"));
+        }
+        if snapshot.addr_hint.as_deref() != Some(join_request.addr.as_str()) {
+            return Err(OwnerApprovalV2Error::TrustedState("addr mismatch"));
+        }
+
+        let expiry = snapshot
+            .expiry
+            .ok_or(OwnerApprovalV2Error::TrustedState("missing expiry"))?;
+        let expires_at = input
+            .issued_at
+            .saturating_add(input.challenge_ttl_secs)
+            .min(expiry);
+        if expires_at < input.issued_at {
+            return Err(OwnerApprovalV2Error::InvalidTimeWindow);
+        }
+
+        let m_pub: [u8; 33] = join_request
+            .m_pub
+            .as_ref()
+            .try_into()
+            .map_err(|_| OwnerApprovalV2Error::JoinRequest("m_pub length".into()))?;
+        let m_pub = P256PublicKey::from_bytes(&m_pub)
+            .map_err(|e| OwnerApprovalV2Error::JoinRequest(e.to_string()))?;
+        let m_id = derive_machine_id(&m_pub);
+        let join_hash = join_request_hash(cached_join_request);
+        let nonce: [u8; 32] = join_request
+            .nonce
+            .as_ref()
+            .try_into()
+            .map_err(|_| OwnerApprovalV2Error::JoinRequest("nonce length".into()))?;
+
+        let context = Self::pair_machine_approve(PairMachineApprovalContextInput {
+            hh_id: input.hh_id,
+            owner_p_id: input.owner_p_id,
+            cursor,
+            m_id,
+            addr: join_request.addr,
+            transport: join_request.transport,
+            ttl_unix: expiry,
+            nonce,
+            join_request_hash: join_hash,
+            capabilities: input.capabilities,
+            issued_at: input.issued_at,
+            expires_at,
+            replay_nonce: input.replay_nonce,
+        });
+        context.validate_shape()?;
+        Ok(context)
+    }
 }
 
 pub struct PairMachineApprovalContextInput {
@@ -181,6 +277,28 @@ pub struct PairMachineApprovalContextInput {
     pub issued_at: u64,
     pub expires_at: u64,
     pub replay_nonce: [u8; 32],
+}
+
+pub struct PairMachineTrustedContextInput<'a> {
+    pub hh_id: HouseholdId,
+    pub owner_p_id: PersonId,
+    pub snapshot: &'a PairMachineWindowSnapshot,
+    pub capabilities: Vec<String>,
+    pub issued_at: u64,
+    pub challenge_ttl_secs: u64,
+    pub replay_nonce: [u8; 32],
+}
+
+fn require_snapshot_match(
+    snapshot_value: Option<&[u8]>,
+    request_value: &[u8],
+    label: &'static str,
+) -> Result<(), OwnerApprovalV2Error> {
+    if snapshot_value == Some(request_value) {
+        Ok(())
+    } else {
+        Err(OwnerApprovalV2Error::TrustedState(label))
+    }
 }
 
 fn require_some<T>(value: Option<T>, field: &'static str) -> Result<(), OwnerApprovalV2Error> {
@@ -206,6 +324,9 @@ fn validate_capabilities(capabilities: &[String]) -> Result<(), OwnerApprovalV2E
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::keys::{IdentityKey, P256Keypair};
+    use crate::machine_cert::Platform;
+    use crate::pair_machine::{JoinChallenge, PAIR_MACHINE_VERSION};
 
     fn household_id() -> HouseholdId {
         HouseholdId::parse(format!("hh_{}", "a".repeat(52))).unwrap()
@@ -235,6 +356,49 @@ mod tests {
             expires_at: 1_600,
             replay_nonce: [0x33; 32],
         })
+    }
+
+    fn signed_join_request() -> (P256Keypair, JoinRequest, Vec<u8>) {
+        let kp = P256Keypair::generate();
+        let m_pub = *kp.public().as_bytes();
+        let nonce = [0x44; 32];
+        let challenge = JoinChallenge::build(&m_pub, &nonce, "linux-alpha", Platform::LinuxNix);
+        let canonical = challenge.to_canonical_bytes().unwrap();
+        let sig = kp.sign(&canonical).unwrap();
+        let request = JoinRequest {
+            version: PAIR_MACHINE_VERSION,
+            m_pub: ByteBuf::from(m_pub.to_vec()),
+            hostname: "linux-alpha".into(),
+            platform: Platform::LinuxNix,
+            nonce: ByteBuf::from(nonce.to_vec()),
+            addr: "192.0.2.10:8091".into(),
+            transport: JoinTransport::Lan,
+            challenge_sig: ByteBuf::from(sig.0.to_vec()),
+        };
+        let bytes = request.to_canonical_bytes().unwrap();
+        (kp, request, bytes)
+    }
+
+    fn awaiting_owner_snapshot(
+        request: &JoinRequest,
+        request_bytes: &[u8],
+    ) -> PairMachineWindowSnapshot {
+        PairMachineWindowSnapshot {
+            version: PAIR_MACHINE_VERSION,
+            state: PairMachineState::AwaitingOwner,
+            m_pub: Some(request.m_pub.clone()),
+            nonce: Some(request.nonce.clone()),
+            expiry: Some(1_600),
+            transport: Some(request.transport),
+            addr_hint: Some(request.addr.clone()),
+            fingerprint: Some("fp-neutral".into()),
+            owner_event_cursor: Some(7),
+            cached_join_request: Some(ByteBuf::from(request_bytes.to_vec())),
+            cached_response: None,
+            anchor_secret: None,
+            pinned_hh_pub: None,
+            pinned_hh_id: None,
+        }
     }
 
     #[test]
@@ -386,5 +550,85 @@ mod tests {
         ] {
             assert!(!keys.iter().any(|key| key == omitted), "{omitted} encoded");
         }
+    }
+
+    #[test]
+    fn pair_machine_context_uses_trusted_snapshot_and_cached_join_request() {
+        let (_kp, request, request_bytes) = signed_join_request();
+        let snapshot = awaiting_owner_snapshot(&request, &request_bytes);
+        let ctx = OwnerApprovalContextV2::pair_machine_approve_from_trusted_state(
+            PairMachineTrustedContextInput {
+                hh_id: household_id(),
+                owner_p_id: person_id(),
+                snapshot: &snapshot,
+                capabilities: vec!["machine-cert".into(), "shamir-2pc".into()],
+                issued_at: 1_000,
+                challenge_ttl_secs: 120,
+                replay_nonce: [0x55; 32],
+            },
+        )
+        .unwrap();
+
+        assert_eq!(ctx.cursor, Some(7));
+        assert_eq!(ctx.addr.as_deref(), Some("192.0.2.10:8091"));
+        assert_eq!(ctx.transport, Some(JoinTransport::Lan));
+        assert_eq!(ctx.ttl_unix, Some(1_600));
+        assert_eq!(ctx.expires_at, 1_120);
+        assert_eq!(
+            ctx.join_request_hash.as_ref().map(ByteBuf::as_ref),
+            Some(join_request_hash(&request_bytes).as_slice())
+        );
+        assert_eq!(
+            ctx.nonce.as_ref().map(ByteBuf::as_ref),
+            Some(request.nonce.as_ref())
+        );
+    }
+
+    #[test]
+    fn pair_machine_context_rejects_snapshot_request_mismatch() {
+        let (_kp, request, request_bytes) = signed_join_request();
+        let mut snapshot = awaiting_owner_snapshot(&request, &request_bytes);
+        snapshot.addr_hint = Some("198.51.100.10:8091".into());
+
+        let err = OwnerApprovalContextV2::pair_machine_approve_from_trusted_state(
+            PairMachineTrustedContextInput {
+                hh_id: household_id(),
+                owner_p_id: person_id(),
+                snapshot: &snapshot,
+                capabilities: vec!["machine-cert".into()],
+                issued_at: 1_000,
+                challenge_ttl_secs: 120,
+                replay_nonce: [0x55; 32],
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            OwnerApprovalV2Error::TrustedState("addr mismatch")
+        ));
+    }
+
+    #[test]
+    fn pair_machine_context_requires_awaiting_owner_window() {
+        let (_kp, request, request_bytes) = signed_join_request();
+        let mut snapshot = awaiting_owner_snapshot(&request, &request_bytes);
+        snapshot.state = PairMachineState::Staging;
+
+        let err = OwnerApprovalContextV2::pair_machine_approve_from_trusted_state(
+            PairMachineTrustedContextInput {
+                hh_id: household_id(),
+                owner_p_id: person_id(),
+                snapshot: &snapshot,
+                capabilities: vec!["machine-cert".into()],
+                issued_at: 1_000,
+                challenge_ttl_secs: 120,
+                replay_nonce: [0x55; 32],
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            OwnerApprovalV2Error::TrustedState("window not awaiting owner")
+        ));
     }
 }
