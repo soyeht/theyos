@@ -1,0 +1,186 @@
+{
+  "contract": "soyeht-owner-webauthn-registration-cbor-cross-language",
+  "version": 1,
+  "about": [
+    "Cross-language golden vectors for owner passkey registration wire CBOR.",
+    "StartResponse vectors pin Swift decode of webauthn-rs CreationChallengeResponse.",
+    "FinishRequest vectors pin Swift canonical-CBOR encode before server byte-equality checks."
+  ],
+  "format": {
+    "base64_url_safe_data": "Base64UrlSafeData serializes as base64url text, even in CBOR; it accepts byte strings on decode but canonical re-encode emits text.",
+    "canonical_cbor": "RFC 8949 deterministic map encoding via household_rs::cbor.",
+    "finish_request_strictness": "The server decodes FinishRequest, re-encodes canonical CBOR, and rejects if bytes differ.",
+    "finish_traps": [
+      "RegisterPublicKeyCredential.response.transports None is encoded as null because the field has no skip_serializing_if.",
+      "RegisterPublicKeyCredential.extensions is always present; the default value encodes as an empty map."
+    ],
+    "webauthn_keys": "Embedded webauthn-rs-proto fields use their serde wire names, mostly camelCase.",
+    "wrapper_keys": "Soyeht wrapper fields use snake_case except version renamed to v."
+  },
+  "start_responses": [
+    {
+      "id": "start-minimal",
+      "input": {
+        "challenge_id": "11111111111111111111111111111111",
+        "options": {
+          "publicKey": {
+            "challenge": "ICEiIyQlJic",
+            "pubKeyCredParams": [
+              {
+                "alg": -7,
+                "type": "public-key"
+              }
+            ],
+            "rp": {
+              "id": "household.example.test",
+              "name": "Soyeht Test"
+            },
+            "user": {
+              "displayName": "Owner Alpha",
+              "id": "EBESExQVFhc",
+              "name": "owner-alpha"
+            }
+          }
+        },
+        "v": 1
+      },
+      "canonical_cbor_hex": "a3617601676f7074696f6e73a1697075626c69634b6579a4627270a262696476686f757365686f6c642e6578616d706c652e74657374646e616d656b536f7965687420546573746475736572a36269646b4542455345785156466863646e616d656b6f776e65722d616c7068616b646973706c61794e616d656b4f776e657220416c706861696368616c6c656e67656b494345694979516c4a6963707075624b657943726564506172616d7381a263616c672664747970656a7075626c69632d6b65796c6368616c6c656e67655f696478203131313131313131313131313131313131313131313131313131313131313131"
+    },
+    {
+      "id": "start-realistic-passkey",
+      "input": {
+        "challenge_id": "22222222222222222222222222222222",
+        "options": {
+          "publicKey": {
+            "attestation": "none",
+            "authenticatorSelection": {
+              "requireResidentKey": false,
+              "residentKey": "discouraged",
+              "userVerification": "required"
+            },
+            "challenge": "QEFCQ0RFRkdISUpLTE1OTw",
+            "excludeCredentials": [],
+            "extensions": {
+              "credProps": true,
+              "credentialProtectionPolicy": "userVerificationRequired",
+              "enforceCredentialProtectionPolicy": false,
+              "uvm": true
+            },
+            "pubKeyCredParams": [
+              {
+                "alg": -7,
+                "type": "public-key"
+              },
+              {
+                "alg": -257,
+                "type": "public-key"
+              }
+            ],
+            "rp": {
+              "id": "household.example.test",
+              "name": "Soyeht Test"
+            },
+            "timeout": 300000,
+            "user": {
+              "displayName": "Owner Alpha",
+              "id": "MDEyMzQ1Njc4OTo7PD0-Pw",
+              "name": "owner-alpha"
+            }
+          }
+        },
+        "v": 1
+      },
+      "canonical_cbor_hex": "a3617601676f7074696f6e73a1697075626c69634b6579a9627270a262696476686f757365686f6c642e6578616d706c652e74657374646e616d656b536f7965687420546573746475736572a3626964764d4445794d7a51314e6a63344f546f375044302d5077646e616d656b6f776e65722d616c7068616b646973706c61794e616d656b4f776e657220416c7068616774696d656f75741a000493e0696368616c6c656e6765765145464351305246526b64495355704c5445314f54776a657874656e73696f6e73a46375766df5696372656450726f7073f5781a63726564656e7469616c50726f74656374696f6e506f6c696379781875736572566572696669636174696f6e52657175697265647821656e666f72636543726564656e7469616c50726f74656374696f6e506f6c696379f46b6174746573746174696f6e646e6f6e65707075624b657943726564506172616d7382a263616c672664747970656a7075626c69632d6b6579a263616c6739010064747970656a7075626c69632d6b6579726578636c75646543726564656e7469616c73807661757468656e74696361746f7253656c656374696f6ea36b7265736964656e744b65796b646973636f7572616765647075736572566572696669636174696f6e68726571756972656472726571756972655265736964656e744b6579f46c6368616c6c656e67655f696478203232323232323232323232323232323232323232323232323232323232323232"
+    },
+    {
+      "id": "start-utf8-and-zero-bytes",
+      "input": {
+        "challenge_id": "33333333333333333333333333333333",
+        "options": {
+          "publicKey": {
+            "challenge": "AGFiAGNkZQA",
+            "pubKeyCredParams": [
+              {
+                "alg": -7,
+                "type": "public-key"
+              }
+            ],
+            "rp": {
+              "id": "household.example.test",
+              "name": "Soyeht Test"
+            },
+            "user": {
+              "displayName": "Dono \u00c1lpha",
+              "id": "AFFSAFNUVQA",
+              "name": "owner-alpha"
+            }
+          }
+        },
+        "v": 1
+      },
+      "canonical_cbor_hex": "a3617601676f7074696f6e73a1697075626c69634b6579a4627270a262696476686f757365686f6c642e6578616d706c652e74657374646e616d656b536f7965687420546573746475736572a36269646b4146465341464e55565141646e616d656b6f776e65722d616c7068616b646973706c61794e616d656b446f6e6f20c3816c706861696368616c6c656e67656b4147466941474e6b5a5141707075624b657943726564506172616d7381a263616c672664747970656a7075626c69632d6b65796c6368616c6c656e67655f696478203333333333333333333333333333333333333333333333333333333333333333"
+    }
+  ],
+  "finish_requests": [
+    {
+      "id": "finish-minimal-null-transports-empty-extensions",
+      "input": {
+        "challenge_id": "44444444444444444444444444444444",
+        "credential": {
+          "extensions": {},
+          "id": "AAECAwQF",
+          "rawId": "AAECAwQF",
+          "response": {
+            "attestationObject": "oA",
+            "clientDataJSON": "eyJ0eXBlIjoid2ViYXV0aG4uY3JlYXRlIiwiY2hhbGxlbmdlIjoiSUNFaUl5UWxKaWMiLCJvcmlnaW4iOiJodHRwczovL2hvdXNlaG9sZC5leGFtcGxlLnRlc3QifQ",
+            "transports": null
+          },
+          "type": "public-key"
+        },
+        "v": 1
+      },
+      "canonical_cbor_hex": "a36176016a63726564656e7469616ca562696468414145434177514664747970656a7075626c69632d6b657965726177496468414145434177514668726573706f6e7365a36a7472616e73706f727473f66e636c69656e74446174614a534f4e787e65794a306558426c496a6f6964325669595856306147347559334a6c5958526c49697769593268686247786c626d646c496a6f6953554e4661556c355557784b61574d694c434a76636d6c6e615734694f694a6f64485277637a6f764c32687664584e6c614739735a43356c654746746347786c4c6e526c633351696651716174746573746174696f6e4f626a656374626f416a657874656e73696f6e73a06c6368616c6c656e67655f696478203434343434343434343434343434343434343434343434343434343434343434"
+    },
+    {
+      "id": "finish-with-transports",
+      "input": {
+        "challenge_id": "55555555555555555555555555555555",
+        "credential": {
+          "extensions": {},
+          "id": "EBESExQVFhc",
+          "rawId": "EBESExQVFhc",
+          "response": {
+            "attestationObject": "oWNmbXRkbm9uZQ",
+            "clientDataJSON": "eyJ0eXBlIjoid2ViYXV0aG4uY3JlYXRlIiwiY2hhbGxlbmdlIjoiUUVGQ1JVWkhTRWxLUzB4TlRrOCIsIm9yaWdpbiI6Imh0dHBzOi8vaG91c2Vob2xkLmV4YW1wbGUudGVzdCJ9",
+            "transports": [
+              "internal",
+              "hybrid"
+            ]
+          },
+          "type": "public-key"
+        },
+        "v": 1
+      },
+      "canonical_cbor_hex": "a36176016a63726564656e7469616ca56269646b454245534578515646686364747970656a7075626c69632d6b65796572617749646b454245534578515646686368726573706f6e7365a36a7472616e73706f7274738268696e7465726e616c666879627269646e636c69656e74446174614a534f4e788865794a306558426c496a6f6964325669595856306147347559334a6c5958526c49697769593268686247786c626d646c496a6f695555564751314a56576b68545257784c557a4234546c52724f434973496d39796157647062694936496d68306448427a4f693876614739316332566f6232786b4c6d563459573177624755756447567a64434a39716174746573746174696f6e4f626a6563746e6f574e6d6258526b626d39755a516a657874656e73696f6e73a06c6368616c6c656e67655f696478203535353535353535353535353535353535353535353535353535353535353535"
+    },
+    {
+      "id": "finish-utf8-and-zero-bytes",
+      "input": {
+        "challenge_id": "66666666666666666666666666666666",
+        "credential": {
+          "extensions": {},
+          "id": "AIGCAIOEhQA",
+          "rawId": "AIGCAIOEhQA",
+          "response": {
+            "attestationObject": "oWRub3RlakRvbm8gw4FscGhh",
+            "clientDataJSON": "eyJ0eXBlIjoid2ViYXV0aG4uY3JlYXRlIiwiY2hhbGxlbmdlIjoiQUdGaUFHTmtaUUEiLCJvcmlnaW4iOiJodHRwczovL2hvdXNlaG9sZC5leGFtcGxlLnRlc3QiLCJub3RlIjoiRG9ubyBcdTAwYzFscGhhIn0",
+            "transports": null
+          },
+          "type": "public-key"
+        },
+        "v": 1
+      },
+      "canonical_cbor_hex": "a36176016a63726564656e7469616ca56269646b4149474341494f4568514164747970656a7075626c69632d6b65796572617749646b4149474341494f4568514168726573706f6e7365a36a7472616e73706f727473f66e636c69656e74446174614a534f4e789f65794a306558426c496a6f6964325669595856306147347559334a6c5958526c49697769593268686247786c626d646c496a6f695155644761554648546d7461555545694c434a76636d6c6e615734694f694a6f64485277637a6f764c32687664584e6c614739735a43356c654746746347786c4c6e526c633351694c434a756233526c496a6f69524739756279426364544177597a467363476868496e30716174746573746174696f6e4f626a65637478186f5752756233526c616b5276626d386777344673634768686a657874656e73696f6e73a06c6368616c6c656e67655f696478203636363636363636363636363636363636363636363636363636363636363636"
+    }
+  ]
+}
