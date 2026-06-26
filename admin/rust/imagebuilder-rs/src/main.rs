@@ -41,6 +41,11 @@ use clap::{Parser, Subcommand};
 use imagebuild::artifacts::{all_claws, file_size_human, golden_image_path, image_age_days};
 use imagebuild::runner::{BuildContext, build_golden_image, stale_reason, verify_golden_image};
 
+use core_rs::artifact_signature::{
+    ARTIFACT_SIGNATURE_ALG_P256_ECDSA_SHA256_RAW, ARTIFACT_SIGNATURE_SCHEMA_VERSION,
+    ArtifactSignatureEnvelope, signature_payload,
+};
+
 const DEFAULT_IMAGEBUILDER_VCPUS: u32 = 2;
 const DEFAULT_IMAGEBUILDER_MEM_MIB: u32 = 12288;
 
@@ -73,6 +78,9 @@ enum Commands {
     /// Generate an artifact manifest (latest.json) from an existing golden build.
     /// Used by CI to publish pre-built artifacts to the registry.
     PublishManifest(PublishManifestArgs),
+    /// Produce a detached signature (`<manifest>.sig.json`) over the exact bytes
+    /// of an existing `latest.json`, using an external auditable signer.
+    SignManifest(SignManifestArgs),
 }
 
 #[derive(clap::Args)]
@@ -109,6 +117,28 @@ struct PublishManifestArgs {
     channel: String,
 
     /// Output path for the manifest JSON file (default: stdout).
+    #[arg(long, short)]
+    output: Option<PathBuf>,
+}
+
+#[derive(clap::Args)]
+struct SignManifestArgs {
+    /// Path to the existing `latest.json` manifest to sign. The exact on-disk
+    /// bytes are signed; the file is never re-serialized.
+    manifest: PathBuf,
+
+    /// The signing key identifier recorded in the signature envelope. Required.
+    #[arg(long)]
+    key_id: String,
+
+    /// Command run to produce the signature. It receives the exact payload
+    /// (`domain || latest.json bytes`) on stdin and must print one base64url raw
+    /// P-256 signature line to stdout. The private key stays inside this command;
+    /// this process never sees it.
+    #[arg(long, env = "THEYOS_ARTIFACT_SIGNER_CMD")]
+    signer_cmd: Option<String>,
+
+    /// Output path for the detached signature (default: `<manifest>.sig.json`).
     #[arg(long, short)]
     output: Option<PathBuf>,
 }
@@ -234,6 +264,11 @@ async fn main() {
 
         Commands::PublishManifest(args) => {
             let ok = cmd_publish_manifest(&args, &assets_dir);
+            std::process::exit(i32::from(!ok));
+        }
+
+        Commands::SignManifest(args) => {
+            let ok = cmd_sign_manifest(&args);
             std::process::exit(i32::from(!ok));
         }
     }
@@ -562,6 +597,166 @@ fn cmd_publish_manifest(args: &PublishManifestArgs, assets_dir: &Path) -> bool {
     }
 
     true
+}
+
+// sign-manifest: detached signature over an existing latest.json.
+
+/// A failure while producing a detached manifest signature.
+#[derive(Debug)]
+enum SignManifestError {
+    /// No non-empty `--key-id` was provided.
+    MissingKeyId,
+    /// The external signer command failed (spawn / non-zero exit / I/O).
+    Signer(String),
+    /// The signer produced no signature line.
+    EmptySignature,
+}
+
+impl std::fmt::Display for SignManifestError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::MissingKeyId => write!(f, "a non-empty --key-id is required"),
+            Self::Signer(msg) => write!(f, "signer failed: {msg}"),
+            Self::EmptySignature => write!(f, "signer returned an empty signature"),
+        }
+    }
+}
+
+/// `<manifest>.sig.json`, beside the manifest.
+fn signature_path_for(manifest: &Path) -> PathBuf {
+    let mut name = manifest.file_name().unwrap_or_default().to_os_string();
+    name.push(".sig.json");
+    manifest.with_file_name(name)
+}
+
+/// Build the detached signature envelope over the exact `latest_json_bytes`.
+///
+/// `signer` receives the exact payload (`domain || latest_json_bytes`) and
+/// returns a base64url raw P-256 signature. This function never re-serializes
+/// the manifest and never handles a private key.
+fn build_signature_envelope(
+    latest_json_bytes: &[u8],
+    key_id: &str,
+    signer: impl FnOnce(&[u8]) -> Result<String, SignManifestError>,
+) -> Result<ArtifactSignatureEnvelope, SignManifestError> {
+    if key_id.trim().is_empty() {
+        return Err(SignManifestError::MissingKeyId);
+    }
+    let payload = signature_payload(latest_json_bytes);
+    let signature_b64url = signer(&payload)?.trim().to_string();
+    if signature_b64url.is_empty() {
+        return Err(SignManifestError::EmptySignature);
+    }
+    Ok(ArtifactSignatureEnvelope {
+        schema_version: ARTIFACT_SIGNATURE_SCHEMA_VERSION,
+        alg: ARTIFACT_SIGNATURE_ALG_P256_ECDSA_SHA256_RAW.to_string(),
+        key_id: key_id.to_string(),
+        signature_b64url,
+    })
+}
+
+/// A signer that runs an operator-supplied command via `sh -c`, pipes the
+/// payload to its stdin, and returns the first stdout line. The private key
+/// lives inside the command; this process never handles it.
+fn external_command_signer(
+    signer_cmd: &str,
+) -> impl FnOnce(&[u8]) -> Result<String, SignManifestError> + '_ {
+    move |payload: &[u8]| {
+        use std::io::Write as _;
+        use std::process::{Command, Stdio};
+
+        let mut child = Command::new("sh")
+            .arg("-c")
+            .arg(signer_cmd)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|e| SignManifestError::Signer(format!("spawn signer: {e}")))?;
+        {
+            let mut stdin = child
+                .stdin
+                .take()
+                .ok_or_else(|| SignManifestError::Signer("signer stdin unavailable".into()))?;
+            stdin
+                .write_all(payload)
+                .map_err(|e| SignManifestError::Signer(format!("write payload: {e}")))?;
+        }
+        let output = child
+            .wait_with_output()
+            .map_err(|e| SignManifestError::Signer(format!("wait signer: {e}")))?;
+        if !output.status.success() {
+            return Err(SignManifestError::Signer(format!(
+                "signer exited with {}",
+                output.status
+            )));
+        }
+        Ok(String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .next()
+            .unwrap_or("")
+            .trim()
+            .to_string())
+    }
+}
+
+/// Read the exact manifest bytes, sign them with `signer`, and write the detached
+/// signature to `output` (default `<manifest>.sig.json`).
+fn run_sign_manifest(
+    manifest: &Path,
+    key_id: &str,
+    output: Option<&Path>,
+    signer: impl FnOnce(&[u8]) -> Result<String, SignManifestError>,
+) -> bool {
+    let latest_json_bytes = match std::fs::read(manifest) {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            eprintln!("[sign-manifest] failed to read {}: {e}", manifest.display());
+            return false;
+        }
+    };
+
+    let envelope = match build_signature_envelope(&latest_json_bytes, key_id, signer) {
+        Ok(envelope) => envelope,
+        Err(e) => {
+            eprintln!("[sign-manifest] {e}");
+            return false;
+        }
+    };
+
+    let sig_path = output.map_or_else(|| signature_path_for(manifest), Path::to_path_buf);
+    let sig_json = serde_json::to_string_pretty(&envelope).expect("serialize signature envelope");
+    if let Err(e) = std::fs::write(&sig_path, format!("{sig_json}\n")) {
+        eprintln!(
+            "[sign-manifest] failed to write {}: {e}",
+            sig_path.display()
+        );
+        return false;
+    }
+    eprintln!(
+        "[sign-manifest] wrote {} (key_id={}, alg={})",
+        sig_path.display(),
+        envelope.key_id,
+        envelope.alg
+    );
+    true
+}
+
+fn cmd_sign_manifest(args: &SignManifestArgs) -> bool {
+    let Some(signer_cmd) = args
+        .signer_cmd
+        .as_deref()
+        .filter(|cmd| !cmd.trim().is_empty())
+    else {
+        eprintln!("[sign-manifest] --signer-cmd or THEYOS_ARTIFACT_SIGNER_CMD is required");
+        return false;
+    };
+    run_sign_manifest(
+        &args.manifest,
+        &args.key_id,
+        args.output.as_deref(),
+        external_command_signer(signer_cmd),
+    )
 }
 
 /// Compute SHA-256 of a file, streaming to avoid loading it all in memory.
@@ -946,5 +1141,187 @@ mod tests {
             manifest.url,
             "https://example.com/hermes-agent/rootfs.ext4.zst"
         );
+    }
+
+    // sign-manifest tests.
+
+    use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD as B64URL};
+    use core_rs::artifact_signature::{
+        ARTIFACT_SIGNATURE_ALG_P256_ECDSA_SHA256_RAW, ArtifactSignatureEnvelope,
+        ArtifactSignatureKey, verify_required_latest_json_signature,
+    };
+    use p256::ecdsa::{Signature, SigningKey, signature::Signer};
+
+    const SIGN_KEY_ID: &str = "test-signer-p256";
+    const LATEST_JSON_PRETTY: &[u8] =
+        b"{\n  \"manifest_version\": 1,\n  \"claw\": \"picoclaw\"\n}\n";
+
+    fn test_signing_key(scalar: u8) -> SigningKey {
+        SigningKey::from_slice(&[scalar; 32]).expect("valid test scalar")
+    }
+
+    /// A test-only signer that signs the payload with a fixed P-256 test key.
+    fn test_signer(scalar: u8) -> impl FnOnce(&[u8]) -> Result<String, SignManifestError> {
+        move |payload: &[u8]| {
+            let signature: Signature = test_signing_key(scalar).sign(payload);
+            Ok(B64URL.encode(signature.to_bytes()))
+        }
+    }
+
+    fn test_public_pin(scalar: u8, key_id: &str) -> ArtifactSignatureKey {
+        let public = test_signing_key(scalar)
+            .verifying_key()
+            .to_encoded_point(true)
+            .as_bytes()
+            .to_vec();
+        ArtifactSignatureKey::new(key_id, ARTIFACT_SIGNATURE_ALG_P256_ECDSA_SHA256_RAW, public)
+    }
+
+    fn envelope_json(envelope: &ArtifactSignatureEnvelope) -> Vec<u8> {
+        serde_json::to_vec(envelope).expect("envelope json")
+    }
+
+    #[test]
+    fn sign_envelope_verifies_with_public_test_key() {
+        let envelope =
+            build_signature_envelope(LATEST_JSON_PRETTY, SIGN_KEY_ID, test_signer(7)).unwrap();
+        assert_eq!(envelope.key_id, SIGN_KEY_ID);
+        assert_eq!(envelope.alg, ARTIFACT_SIGNATURE_ALG_P256_ECDSA_SHA256_RAW);
+        verify_required_latest_json_signature(
+            LATEST_JSON_PRETTY,
+            Some(&envelope_json(&envelope)),
+            &[test_public_pin(7, SIGN_KEY_ID)],
+        )
+        .expect("produced signature verifies");
+    }
+
+    #[test]
+    fn sign_envelope_fails_against_tampered_manifest() {
+        let envelope =
+            build_signature_envelope(LATEST_JSON_PRETTY, SIGN_KEY_ID, test_signer(7)).unwrap();
+        let mut tampered = LATEST_JSON_PRETTY.to_vec();
+        tampered[0] = b' ';
+        assert!(
+            verify_required_latest_json_signature(
+                &tampered,
+                Some(&envelope_json(&envelope)),
+                &[test_public_pin(7, SIGN_KEY_ID)],
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn sign_envelope_does_not_verify_against_reserialized_minified_bytes() {
+        // The exact pretty bytes are signed; a re-serialized (minified) copy is a
+        // different byte string and must not verify.
+        let envelope =
+            build_signature_envelope(LATEST_JSON_PRETTY, SIGN_KEY_ID, test_signer(7)).unwrap();
+        let value: serde_json::Value =
+            serde_json::from_slice(LATEST_JSON_PRETTY).expect("fixture parses");
+        let minified = serde_json::to_vec(&value).expect("minified json");
+        assert_ne!(LATEST_JSON_PRETTY, minified.as_slice());
+        assert!(
+            verify_required_latest_json_signature(
+                &minified,
+                Some(&envelope_json(&envelope)),
+                &[test_public_pin(7, SIGN_KEY_ID)],
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn sign_envelope_rejects_empty_key_id() {
+        assert!(matches!(
+            build_signature_envelope(LATEST_JSON_PRETTY, "  ", test_signer(7)),
+            Err(SignManifestError::MissingKeyId)
+        ));
+    }
+
+    #[test]
+    fn sign_envelope_rejects_empty_signature() {
+        assert!(matches!(
+            build_signature_envelope(
+                LATEST_JSON_PRETTY,
+                SIGN_KEY_ID,
+                |_: &[u8]| Ok(String::new())
+            ),
+            Err(SignManifestError::EmptySignature)
+        ));
+    }
+
+    #[test]
+    fn run_sign_manifest_writes_verifiable_default_sig_json() {
+        let d = TempDir::new().unwrap();
+        let manifest = d.path().join("latest.json");
+        fs::write(&manifest, LATEST_JSON_PRETTY).unwrap();
+
+        assert!(run_sign_manifest(
+            &manifest,
+            SIGN_KEY_ID,
+            None,
+            test_signer(7)
+        ));
+
+        let sig_path = d.path().join("latest.json.sig.json");
+        assert!(
+            sig_path.is_file(),
+            "default sig path is <manifest>.sig.json"
+        );
+        let sig_bytes = fs::read(&sig_path).unwrap();
+        verify_required_latest_json_signature(
+            LATEST_JSON_PRETTY,
+            Some(&sig_bytes),
+            &[test_public_pin(7, SIGN_KEY_ID)],
+        )
+        .expect("written sig.json verifies against the manifest");
+    }
+
+    #[test]
+    fn run_sign_manifest_aborts_on_signer_failure_without_writing() {
+        let d = TempDir::new().unwrap();
+        let manifest = d.path().join("latest.json");
+        fs::write(&manifest, LATEST_JSON_PRETTY).unwrap();
+
+        assert!(!run_sign_manifest(
+            &manifest,
+            SIGN_KEY_ID,
+            None,
+            |_: &[u8]| Err(SignManifestError::Signer("boom".into()))
+        ));
+        assert!(
+            !d.path().join("latest.json.sig.json").exists(),
+            "no signature is written on signer failure"
+        );
+    }
+
+    #[test]
+    fn cmd_sign_manifest_requires_a_signer() {
+        let d = TempDir::new().unwrap();
+        let manifest = d.path().join("latest.json");
+        fs::write(&manifest, LATEST_JSON_PRETTY).unwrap();
+        let args = SignManifestArgs {
+            manifest,
+            key_id: SIGN_KEY_ID.into(),
+            signer_cmd: None,
+            output: None,
+        };
+        assert!(!cmd_sign_manifest(&args));
+    }
+
+    #[test]
+    fn external_command_signer_returns_stdout_line() {
+        let signer = external_command_signer("cat >/dev/null; printf 'sig-line-xyz'");
+        assert_eq!(signer(b"payload").unwrap(), "sig-line-xyz");
+    }
+
+    #[test]
+    fn external_command_signer_nonzero_exit_fails() {
+        let signer = external_command_signer("cat >/dev/null; exit 7");
+        assert!(matches!(
+            signer(b"payload"),
+            Err(SignManifestError::Signer(_))
+        ));
     }
 }

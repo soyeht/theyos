@@ -131,6 +131,7 @@ tokio-stream  = { workspace = true }
 [dev-dependencies]
 axum-test    = { version = "17", features = ["ws"] }
 serde_json   = { workspace = true }
+p256         = { workspace = true }
 tokio        = { workspace = true }
 tower        = { workspace = true }
 claw-rs      = { workspace = true }

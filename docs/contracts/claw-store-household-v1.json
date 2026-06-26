@@ -4,6 +4,7 @@
   "attach_token_header": "X-Soyeht-Household-Attach-Token",
   "routes": [
     {
+      "id": "household_list_claws",
       "name": "list_claws",
       "method": "GET",
       "path": "/api/v1/household/claws",
@@ -12,6 +13,7 @@
       "auth": "pop"
     },
     {
+      "id": "household_claw_availability",
       "name": "claw_availability",
       "method": "GET",
       "path": "/api/v1/household/claws/{name}/availability",
@@ -20,6 +22,7 @@
       "auth": "pop"
     },
     {
+      "id": "household_install_claw",
       "name": "install_claw",
       "method": "POST",
       "path": "/api/v1/household/claws/{name}/install",
@@ -28,6 +31,7 @@
       "auth": "pop"
     },
     {
+      "id": "household_uninstall_claw",
       "name": "uninstall_claw",
       "method": "POST",
       "path": "/api/v1/household/claws/{name}/uninstall",
@@ -36,6 +40,7 @@
       "auth": "pop"
     },
     {
+      "id": "household_list_instances",
       "name": "list_instances",
       "method": "GET",
       "path": "/api/v1/household/instances",
@@ -44,6 +49,7 @@
       "auth": "pop"
     },
     {
+      "id": "household_create_instance",
       "name": "create_instance",
       "method": "POST",
       "path": "/api/v1/household/instances",
@@ -52,6 +58,7 @@
       "auth": "pop"
     },
     {
+      "id": "household_instance_status",
       "name": "instance_status",
       "method": "GET",
       "path": "/api/v1/household/instances/{id}/status",
@@ -60,6 +67,7 @@
       "auth": "pop"
     },
     {
+      "id": "household_stop_instance",
       "name": "stop_instance",
       "method": "POST",
       "path": "/api/v1/household/instances/{id}/stop",
@@ -68,6 +76,7 @@
       "auth": "pop"
     },
     {
+      "id": "household_restart_instance",
       "name": "restart_instance",
       "method": "POST",
       "path": "/api/v1/household/instances/{id}/restart",
@@ -76,6 +85,7 @@
       "auth": "pop"
     },
     {
+      "id": "household_rebuild_instance",
       "name": "rebuild_instance",
       "method": "POST",
       "path": "/api/v1/household/instances/{id}/rebuild",
@@ -84,6 +94,7 @@
       "auth": "pop"
     },
     {
+      "id": "household_delete_instance",
       "name": "delete_instance",
       "method": "DELETE",
       "path": "/api/v1/household/instances/{id}",
@@ -92,6 +103,7 @@
       "auth": "pop"
     },
     {
+      "id": "household_list_workspaces",
       "name": "list_workspaces",
       "method": "GET",
       "path": "/api/v1/household/terminals/{container}/workspaces",
@@ -100,6 +112,7 @@
       "auth": "pop"
     },
     {
+      "id": "household_create_workspace",
       "name": "create_workspace",
       "method": "POST",
       "path": "/api/v1/household/terminals/{container}/workspaces",
@@ -108,6 +121,7 @@
       "auth": "pop"
     },
     {
+      "id": "household_rename_workspace",
       "name": "rename_workspace",
       "method": "PATCH",
       "path": "/api/v1/household/terminals/{container}/workspaces/{id}",
@@ -116,6 +130,7 @@
       "auth": "pop"
     },
     {
+      "id": "household_delete_workspace",
       "name": "delete_workspace",
       "method": "DELETE",
       "path": "/api/v1/household/terminals/{container}/workspaces/{id}",
@@ -124,6 +139,7 @@
       "auth": "pop"
     },
     {
+      "id": "household_attach_token",
       "name": "mint_attach_token",
       "method": "POST",
       "path": "/api/v1/household/terminals/{container}/attach-token",
@@ -133,6 +149,7 @@
       "peer_guard": true
     },
     {
+      "id": "household_terminal_pty",
       "name": "terminal_pty",
       "method": "GET",
       "path": "/api/v1/household/terminals/{container}/pty",

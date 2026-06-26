@@ -79,9 +79,13 @@ codesign --force \
 This downloads a macOS IPSW (~18 GB), installs macOS in a VM, provisions it with SSH + Homebrew + developer tools, and creates a snapshot for instant cloning.
 
 ```bash
-THEYOS_VMRUNNER_MACOS_RS_BIN=admin/rust/target/release/vmrunner_macos_ipc \
+THEYOS_VMRUNNER_RS_BIN=admin/rust/target/release/vmrunner_macos_ipc \
   admin/rust/target/release/init_macos_guest --cpus 4 --memory-mb 8192
 ```
+
+`THEYOS_VMRUNNER_RS_BIN` is the canonical vmrunner binary override. Older
+wrappers may still set `THEYOS_VMRUNNER_MACOS_RS_BIN`; the runtime accepts that
+legacy key as a temporary fallback.
 
 **First run takes ~25-30 minutes.** The process is resumable — if interrupted, re-run the same command.
 
@@ -96,7 +100,7 @@ What gets installed in the base image:
 
 ```bash
 # Set environment
-export THEYOS_VMRUNNER_MACOS_RS_BIN=$(pwd)/admin/rust/target/release/vmrunner_macos_ipc
+export THEYOS_VMRUNNER_RS_BIN=$(pwd)/admin/rust/target/release/vmrunner_macos_ipc
 export THEYOS_SSH_CTL=$(pwd)/admin/rust/target/release/theyos-ssh
 
 # Start
@@ -128,7 +132,7 @@ The first instance takes ~30-60s (cold boot). Subsequent instances use the warm 
 After updating claw binaries or tools:
 
 ```bash
-THEYOS_VMRUNNER_MACOS_RS_BIN=admin/rust/target/release/vmrunner_macos_ipc \
+THEYOS_VMRUNNER_RS_BIN=admin/rust/target/release/vmrunner_macos_ipc \
   admin/rust/target/release/init_macos_guest --force-provision
 ```
 

@@ -954,6 +954,7 @@ dependencies = [
  "base64 0.22.1",
  "chrono",
  "libc",
+ "p256",
  "rusqlite",
  "serde",
  "serde_json",
@@ -2361,8 +2362,10 @@ name = "imagebuilder-rs"
 version = "0.1.21"
 dependencies = [
  "async-trait",
+ "base64 0.22.1",
  "clap",
  "core-rs",
+ "p256",
  "russh",
  "serde",
  "serde_json",
@@ -4314,6 +4317,7 @@ dependencies = [
  "libc",
  "mdns-sd",
  "nostr-relay-rs",
+ "p256",
  "percent-encoding",
  "pty-process",
  "qrcode",
