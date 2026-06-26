@@ -46,6 +46,10 @@ pub enum OwnerApprovalV2Error {
     TrustedState(&'static str),
     #[error("owner approval cached join request invalid: {0}")]
     JoinRequest(String),
+    #[error("owner approval assertion field is invalid: {0}")]
+    AssertionField(&'static str),
+    #[error("owner approval context does not match trusted server state")]
+    ContextMismatch,
 }
 
 impl From<HouseholdError> for OwnerApprovalV2Error {
@@ -91,6 +95,70 @@ pub struct OwnerApprovalContextV2 {
     pub issued_at: u64,
     pub expires_at: u64,
     pub replay_nonce: ByteBuf,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OwnerApprovalV2 {
+    #[serde(rename = "v")]
+    pub version: u8,
+    pub context: OwnerApprovalContextV2,
+    pub credential_id: ByteBuf,
+    pub authenticator_data: ByteBuf,
+    pub client_data_json: ByteBuf,
+    pub signature: ByteBuf,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user_handle: Option<ByteBuf>,
+}
+
+impl OwnerApprovalV2 {
+    pub fn validate_shape(&self) -> Result<(), OwnerApprovalV2Error> {
+        if self.version != OWNER_APPROVAL_V2_VERSION {
+            return Err(OwnerApprovalV2Error::UnsupportedVersion(self.version));
+        }
+        self.context.validate_shape()?;
+        if self.credential_id.is_empty() {
+            return Err(OwnerApprovalV2Error::AssertionField("credential_id"));
+        }
+        if self.authenticator_data.is_empty() {
+            return Err(OwnerApprovalV2Error::AssertionField("authenticator_data"));
+        }
+        if self.client_data_json.is_empty() {
+            return Err(OwnerApprovalV2Error::AssertionField("client_data_json"));
+        }
+        if self.signature.is_empty() {
+            return Err(OwnerApprovalV2Error::AssertionField("signature"));
+        }
+        Ok(())
+    }
+
+    pub fn to_canonical_bytes(&self) -> Result<Vec<u8>, OwnerApprovalV2Error> {
+        self.validate_shape()?;
+        crate::cbor::to_canonical_vec(self).map_err(OwnerApprovalV2Error::from)
+    }
+
+    pub fn from_canonical_bytes(bytes: &[u8]) -> Result<Self, OwnerApprovalV2Error> {
+        let decoded: Self = crate::cbor::from_canonical_slice(bytes)
+            .map_err(|e| OwnerApprovalV2Error::Cbor(e.to_string()))?;
+        let canonical = decoded.to_canonical_bytes()?;
+        if canonical != bytes {
+            return Err(OwnerApprovalV2Error::NonCanonical);
+        }
+        Ok(decoded)
+    }
+
+    pub fn require_expected_context(
+        &self,
+        expected: &OwnerApprovalContextV2,
+    ) -> Result<[u8; 32], OwnerApprovalV2Error> {
+        self.validate_shape()?;
+        let submitted = self.context.to_canonical_bytes()?;
+        let expected_bytes = expected.to_canonical_bytes()?;
+        if submitted != expected_bytes {
+            return Err(OwnerApprovalV2Error::ContextMismatch);
+        }
+        expected.challenge_digest()
+    }
 }
 
 impl OwnerApprovalContextV2 {
@@ -358,6 +426,18 @@ mod tests {
         })
     }
 
+    fn sample_approval(context: OwnerApprovalContextV2) -> OwnerApprovalV2 {
+        OwnerApprovalV2 {
+            version: OWNER_APPROVAL_V2_VERSION,
+            context,
+            credential_id: ByteBuf::from(vec![0xA1; 16]),
+            authenticator_data: ByteBuf::from(vec![0xA2; 37]),
+            client_data_json: ByteBuf::from(br#"{"type":"webauthn.get"}"#.to_vec()),
+            signature: ByteBuf::from(vec![0xA3; 64]),
+            user_handle: None,
+        }
+    }
+
     fn signed_join_request() -> (P256Keypair, JoinRequest, Vec<u8>) {
         let kp = P256Keypair::generate();
         let m_pub = *kp.public().as_bytes();
@@ -550,6 +630,55 @@ mod tests {
         ] {
             assert!(!keys.iter().any(|key| key == omitted), "{omitted} encoded");
         }
+    }
+
+    #[test]
+    fn owner_approval_body_requires_expected_context_byte_equality() {
+        let expected = sample_context();
+        let approval = sample_approval(expected.clone());
+        assert_eq!(
+            approval.require_expected_context(&expected).unwrap(),
+            expected.challenge_digest().unwrap()
+        );
+
+        let mut tampered = expected.clone();
+        tampered.addr = Some("198.51.100.10:8091".to_string());
+        let err = approval.require_expected_context(&tampered).unwrap_err();
+        assert!(matches!(err, OwnerApprovalV2Error::ContextMismatch));
+    }
+
+    #[test]
+    fn owner_approval_body_rejects_empty_assertion_fields() {
+        let mut approval = sample_approval(sample_context());
+        approval.signature = ByteBuf::from(vec![]);
+        assert!(matches!(
+            approval.validate_shape(),
+            Err(OwnerApprovalV2Error::AssertionField("signature"))
+        ));
+    }
+
+    #[test]
+    fn owner_approval_body_omits_absent_user_handle() {
+        let approval = sample_approval(sample_context());
+        let bytes = approval.to_canonical_bytes().unwrap();
+        let decoded = OwnerApprovalV2::from_canonical_bytes(&bytes).unwrap();
+        assert_eq!(decoded, approval);
+
+        let value: ciborium::value::Value = ciborium::de::from_reader(bytes.as_slice()).unwrap();
+        let ciborium::value::Value::Map(entries) = value else {
+            panic!("approval body encodes as map");
+        };
+        let keys: Vec<String> = entries
+            .into_iter()
+            .map(|(key, _)| match key {
+                ciborium::value::Value::Text(text) => text,
+                other => panic!("unexpected key: {other:?}"),
+            })
+            .collect();
+        assert!(
+            !keys.iter().any(|key| key == "user_handle"),
+            "user_handle encoded"
+        );
     }
 
     #[test]
