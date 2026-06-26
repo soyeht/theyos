@@ -35,12 +35,15 @@ use household_rs::pair_machine::{
     PairMachineWindowSnapshot, join_request_hash,
 };
 use rand::RngCore;
-use serde::{Deserialize, Serialize};
+use rand::rngs::OsRng;
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_bytes::ByteBuf;
 use tokio::sync::Mutex;
 use tokio::sync::broadcast::error::RecvError;
 use tokio::sync::watch;
-use webauthn_rs::prelude::RequestChallengeResponse;
+use webauthn_rs::prelude::{
+    CreationChallengeResponse, RegisterPublicKeyCredential, RequestChallengeResponse, Uuid,
+};
 use zeroize::Zeroizing;
 
 use crate::apns_dispatcher;
@@ -425,6 +428,38 @@ struct OwnerApprovalV2StartResponse {
     options: RequestChallengeResponse,
 }
 
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct OwnerWebauthnRegistrationStartRequest {
+    #[serde(rename = "v")]
+    version: u8,
+}
+
+#[derive(Serialize)]
+struct OwnerWebauthnRegistrationStartResponse {
+    #[serde(rename = "v")]
+    version: u8,
+    challenge_id: String,
+    options: CreationChallengeResponse,
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct OwnerWebauthnRegistrationFinishRequest {
+    #[serde(rename = "v")]
+    version: u8,
+    challenge_id: String,
+    credential: RegisterPublicKeyCredential,
+}
+
+#[derive(Serialize)]
+struct OwnerWebauthnRegistrationFinishResponse {
+    #[serde(rename = "v")]
+    version: u8,
+    credential_id: ByteBuf,
+    active_credential_count: u64,
+}
+
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct OwnerApprovalV2Finish {
@@ -508,6 +543,18 @@ fn unauthenticated_response() -> Response {
 
 fn internal_error_response() -> Response {
     generic_error_response(StatusCode::INTERNAL_SERVER_ERROR, "internal")
+}
+
+fn decode_canonical_cbor<T>(body: &[u8]) -> Result<T, String>
+where
+    T: DeserializeOwned + Serialize,
+{
+    let value: T = household_rs::cbor::from_canonical_slice(body).map_err(|e| e.to_string())?;
+    let canonical = household_rs::cbor::to_canonical_vec(&value).map_err(|e| e.to_string())?;
+    if canonical != body {
+        return Err("non_canonical_cbor".into());
+    }
+    Ok(value)
 }
 
 /// `GET /api/v1/household/owner-events?since=<cursor>` long-poll endpoint.
@@ -637,6 +684,308 @@ fn owner_events_since_response(state: &OwnerEventsRouterState, since: u64) -> Re
         version: 1,
         events,
         next_cursor,
+    })
+    .unwrap_or_default();
+    cbor_response(StatusCode::OK, bytes)
+}
+
+fn owner_webauthn_user_uuid(owner_auth: &household_rs::HouseholdAuthState) -> Uuid {
+    let mut input = b"soyeht-owner-webauthn-user-v1\0".to_vec();
+    input.extend_from_slice(owner_auth.hh_id.to_string().as_bytes());
+    input.push(0);
+    input.extend_from_slice(owner_auth.owner_person_cert.p_id.0.as_bytes());
+    let digest = blake3::hash(&input);
+    let mut bytes = [0_u8; 16];
+    bytes.copy_from_slice(&digest.as_bytes()[..16]);
+    // RFC 4122-compatible deterministic UUID shape: version 5, variant 1.
+    bytes[6] = (bytes[6] & 0x0f) | 0x50;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    Uuid::from_bytes(bytes)
+}
+
+fn reject_owner_webauthn_registration(reason: &'static str, error: Option<String>) -> Response {
+    if let Some(error) = error {
+        tracing::warn!(
+            stage = "owner_events.owner_webauthn_registration.rejected",
+            reason,
+            error = %error,
+        );
+    } else {
+        tracing::warn!(
+            stage = "owner_events.owner_webauthn_registration.rejected",
+            reason,
+        );
+    }
+    unauthenticated_response()
+}
+
+fn verify_or_migrate_owner_webauthn_credentials_for_enrollment(
+    state: &OwnerEventsRouterState,
+    identity: &household_rs::LoadedIdentity,
+    owner_auth: &household_rs::HouseholdAuthState,
+) -> Result<household_rs::owner_webauthn::OwnerWebauthnCredentialStore, String> {
+    let Some(anchor) = &state.owner_webauthn_anchor else {
+        return Err("missing_anchor_verifier".into());
+    };
+    verify_or_update_owner_webauthn_authority_anchor(
+        anchor.keystore.as_ref(),
+        &owner_auth.owner_webauthn,
+        &identity.record,
+        &owner_auth.owner_person_cert,
+        OwnerWebauthnAnchorMode::MigrationDefaultOff,
+    )
+    .map_err(|e| format!("anchor_verify_failed: {e}"))?;
+    owner_auth
+        .owner_webauthn_credentials(&identity.record)
+        .map_err(|e| format!("credential_reconstruct_failed: {e}"))
+}
+
+/// `POST /api/v1/household/owner-webauthn/registration/start`.
+///
+/// Starts enrollment for the first owner passkey. This is an S3 backend
+/// scaffold: the default router has no RP/anchor and therefore fails closed.
+/// Additional credentials and revocation stay in later owner-gated slices.
+pub async fn owner_webauthn_registration_start_handler(
+    State(state): State<OwnerEventsRouterState>,
+    method: Method,
+    uri: Uri,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let Some(now) = time_util::unix_now_secs_checked("owner_events.owner_webauthn_start.clock")
+    else {
+        return unauthenticated_response();
+    };
+    let path_and_query = uri
+        .path_and_query()
+        .map_or_else(|| uri.path().to_string(), |pq| pq.as_str().to_string());
+    let owner_auth = match household_auth::authorize_request(
+        &state.household,
+        &headers,
+        &method,
+        &path_and_query,
+        &body,
+        Operation::HouseholdAddMachine,
+        now,
+    )
+    .await
+    {
+        Ok(owner_auth) => owner_auth,
+        Err(e) => {
+            return reject_owner_webauthn_registration("pop_auth_failed", Some(e.to_string()));
+        }
+    };
+
+    let request: OwnerWebauthnRegistrationStartRequest = match decode_canonical_cbor(&body) {
+        Ok(request) => request,
+        Err(e) => return reject_owner_webauthn_registration("cbor_decode", Some(e)),
+    };
+    if request.version != 1 {
+        return reject_owner_webauthn_registration("bad_version", None);
+    }
+
+    let Some(identity) = state.household.current().await else {
+        return reject_owner_webauthn_registration("identity_unavailable", None);
+    };
+    let credentials = match verify_or_migrate_owner_webauthn_credentials_for_enrollment(
+        &state,
+        &identity,
+        &owner_auth,
+    ) {
+        Ok(credentials) => credentials,
+        Err(e) => return reject_owner_webauthn_registration("credential_load_failed", Some(e)),
+    };
+    if !owner_auth.owner_webauthn.is_empty() || credentials.active_count() > 0 {
+        return reject_owner_webauthn_registration("credential_already_enrolled", None);
+    }
+    let Some(rp) = &state.owner_webauthn_rp else {
+        return reject_owner_webauthn_registration("rp_unavailable", None);
+    };
+
+    let mut rng = OsRng;
+    let user_id = owner_webauthn_user_uuid(&owner_auth);
+    let owner_name = owner_auth.owner_person_cert.p_id.0.as_str();
+    let owner_display_name = owner_auth.owner_person_cert.display_name.as_str();
+    let (challenge_id, options) = match rp.lock().await.start_registration(
+        &mut rng,
+        now,
+        user_id,
+        owner_name,
+        owner_display_name,
+        credentials.credentials(),
+    ) {
+        Ok(result) => result,
+        Err(e) => {
+            return reject_owner_webauthn_registration(
+                "registration_start_failed",
+                Some(e.to_string()),
+            );
+        }
+    };
+    let bytes = household_rs::cbor::to_canonical_vec(&OwnerWebauthnRegistrationStartResponse {
+        version: 1,
+        challenge_id: challenge_id.as_str().to_string(),
+        options,
+    })
+    .unwrap_or_default();
+    cbor_response(StatusCode::OK, bytes)
+}
+
+/// `POST /api/v1/household/owner-webauthn/registration/finish`.
+///
+/// Commits the first owner passkey into the HH-root-signed authority log, then
+/// advances the keystore-backed anchor. Enforcement remains off until a later,
+/// explicitly approved flip.
+pub async fn owner_webauthn_registration_finish_handler(
+    State(state): State<OwnerEventsRouterState>,
+    method: Method,
+    uri: Uri,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let Some(now) = time_util::unix_now_secs_checked("owner_events.owner_webauthn_finish.clock")
+    else {
+        return unauthenticated_response();
+    };
+    let path_and_query = uri
+        .path_and_query()
+        .map_or_else(|| uri.path().to_string(), |pq| pq.as_str().to_string());
+    let authorized_owner_auth = match household_auth::authorize_request(
+        &state.household,
+        &headers,
+        &method,
+        &path_and_query,
+        &body,
+        Operation::HouseholdAddMachine,
+        now,
+    )
+    .await
+    {
+        Ok(owner_auth) => owner_auth,
+        Err(e) => {
+            return reject_owner_webauthn_registration("pop_auth_failed", Some(e.to_string()));
+        }
+    };
+
+    let request: OwnerWebauthnRegistrationFinishRequest = match decode_canonical_cbor(&body) {
+        Ok(request) => request,
+        Err(e) => return reject_owner_webauthn_registration("cbor_decode", Some(e)),
+    };
+    if request.version != 1 {
+        return reject_owner_webauthn_registration("bad_version", None);
+    }
+    let challenge_id = match OwnerWebauthnChallengeId::parse(request.challenge_id) {
+        Ok(challenge_id) => challenge_id,
+        Err(e) => {
+            return reject_owner_webauthn_registration("bad_challenge_id", Some(e.to_string()));
+        }
+    };
+
+    let _mutation_guard = crate::bootstrap_mutation_lock::BOOTSTRAP_MUTATION_LOCK
+        .lock()
+        .await;
+    let Some(identity) = state.household.current().await else {
+        return reject_owner_webauthn_registration("identity_unavailable", None);
+    };
+    let Some(current_owner_auth) = state.household.current_owner_auth().await else {
+        return reject_owner_webauthn_registration("owner_auth_unavailable", None);
+    };
+    if current_owner_auth.owner_person_cert.p_id != authorized_owner_auth.owner_person_cert.p_id {
+        return reject_owner_webauthn_registration("owner_auth_changed", None);
+    }
+    let Some(hh_priv) = identity.hh_priv.as_deref() else {
+        return reject_owner_webauthn_registration("household_root_unavailable", None);
+    };
+    let credentials = match verify_or_migrate_owner_webauthn_credentials_for_enrollment(
+        &state,
+        &identity,
+        &current_owner_auth,
+    ) {
+        Ok(credentials) => credentials,
+        Err(e) => return reject_owner_webauthn_registration("credential_load_failed", Some(e)),
+    };
+    if !current_owner_auth.owner_webauthn.is_empty() || credentials.active_count() > 0 {
+        return reject_owner_webauthn_registration("credential_already_enrolled", None);
+    }
+    let Some(rp) = &state.owner_webauthn_rp else {
+        return reject_owner_webauthn_registration("rp_unavailable", None);
+    };
+    let Some(anchor) = state.owner_webauthn_anchor.clone() else {
+        return reject_owner_webauthn_registration("missing_anchor_verifier", None);
+    };
+
+    let credential =
+        match rp
+            .lock()
+            .await
+            .finish_registration(now, &challenge_id, &request.credential)
+        {
+            Ok(credential) => credential,
+            Err(e) => {
+                return reject_owner_webauthn_registration(
+                    "registration_finish_failed",
+                    Some(e.to_string()),
+                );
+            }
+        };
+    let credential_id = ByteBuf::from(credential.credential_id_bytes().to_vec());
+    let genesis = match household_rs::owner_webauthn_authority::OwnerWebauthnAuthority::sign_genesis(
+        hh_priv,
+        &identity.record,
+        &current_owner_auth.owner_person_cert,
+        credential,
+        now,
+    ) {
+        Ok(genesis) => genesis,
+        Err(e) => {
+            return reject_owner_webauthn_registration(
+                "authority_sign_failed",
+                Some(e.to_string()),
+            );
+        }
+    };
+    let mut next_auth = current_owner_auth.as_ref().clone();
+    next_auth.owner_webauthn.push_signed(genesis);
+    next_auth.updated_at = now;
+    if let Err(e) = next_auth.verify(&identity.record, now) {
+        return reject_owner_webauthn_registration("authority_verify_failed", Some(e.to_string()));
+    }
+    let active_credential_count = match next_auth.owner_webauthn_credentials(&identity.record) {
+        Ok(credentials) => credentials.active_count() as u64,
+        Err(e) => {
+            return reject_owner_webauthn_registration(
+                "credential_reconstruct_failed",
+                Some(e.to_string()),
+            );
+        }
+    };
+
+    // `household_auth_state.cbor` is the durable log commit point. Advance the
+    // rollback anchor only after this file is safely persisted, otherwise the
+    // next boot could see an anchor ahead of the log and fail closed.
+    if let Err(e) = next_auth.save(&state.state_dir) {
+        return reject_owner_webauthn_registration("authority_save_failed", Some(e.to_string()));
+    }
+    // Keep in-memory owner auth aligned with the durable commit before any
+    // post-save anchor failure can return. A retry must see the committed
+    // credential and fail closed instead of re-enrolling against stale memory.
+    state
+        .household
+        .set_owner_auth(Arc::new(next_auth.clone()))
+        .await;
+    if let Err(e) = verify_or_update_owner_webauthn_authority_anchor(
+        anchor.keystore.as_ref(),
+        &next_auth.owner_webauthn,
+        &identity.record,
+        &next_auth.owner_person_cert,
+        OwnerWebauthnAnchorMode::MigrationDefaultOff,
+    ) {
+        return reject_owner_webauthn_registration("anchor_update_failed", Some(e.to_string()));
+    }
+    let bytes = household_rs::cbor::to_canonical_vec(&OwnerWebauthnRegistrationFinishResponse {
+        version: 1,
+        credential_id,
+        active_credential_count,
     })
     .unwrap_or_default();
     cbor_response(StatusCode::OK, bytes)
