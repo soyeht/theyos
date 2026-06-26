@@ -98,7 +98,7 @@ discover_claws() {
 fetch_url() {
     url="$1"
     output="$2"
-    curl -fsSL --retry 3 --retry-delay 1 "$url" -o "$output"
+    curl -fsSL --proto '=https' --tlsv1.2 --retry 3 --retry-delay 1 "$url" -o "$output"
 }
 
 TARGETS_FILE="$(mktemp)"
