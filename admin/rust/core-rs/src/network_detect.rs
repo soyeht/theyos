@@ -164,8 +164,7 @@ fn http_ok(url: &str, timeout: Duration) -> bool {
     agent
         .get(url)
         .call()
-        .map(|response| response.status() == 200)
-        .unwrap_or(false)
+        .is_ok_and(|response| response.status() == 200)
 }
 
 // ── Local ────────────────────────────────────────────────────────────────────

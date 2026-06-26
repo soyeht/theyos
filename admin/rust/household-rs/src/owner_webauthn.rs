@@ -96,6 +96,28 @@ impl OwnerWebauthnChallengeId {
         rng.fill_bytes(&mut bytes);
         Self(hex::encode(bytes))
     }
+
+    /// Parse the lookup handle returned by the server at ceremony start.
+    ///
+    /// The handle is intentionally narrow: 16 random bytes encoded as 32
+    /// lowercase hex characters. This keeps it as an opaque server-side lookup
+    /// key, not an owner-controlled policy input.
+    pub fn parse(value: impl Into<String>) -> Result<Self, OwnerWebauthnError> {
+        let value = value.into();
+        let valid = value.len() == 32
+            && value
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte));
+        if !valid {
+            return Err(OwnerWebauthnError::InvalidChallengeId);
+        }
+        Ok(Self(value))
+    }
+
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -221,6 +243,8 @@ pub enum OwnerWebauthnError {
     ChallengeExpired,
     #[error("challenge kind mismatch")]
     ChallengeKindMismatch,
+    #[error("challenge id is invalid")]
+    InvalidChallengeId,
     #[error("no active credentials")]
     NoActiveCredentials,
     #[error("credential is already registered")]

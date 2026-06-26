@@ -4530,6 +4530,8 @@ dependencies = [
  "ureq",
  "vmrunner-common-rs",
  "vmrunner-rs",
+ "webauthn-authenticator-rs",
+ "webauthn-rs",
  "zeroize",
  "zstd",
 ]

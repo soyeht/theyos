@@ -334,7 +334,7 @@ fn dir_size(path: &Path) -> u64 {
         for entry in entries.flatten() {
             if let Ok(ft) = entry.file_type() {
                 if ft.is_file() {
-                    total += entry.metadata().map(|m| m.len()).unwrap_or(0);
+                    total += entry.metadata().map_or(0, |m| m.len());
                 } else if ft.is_dir() {
                     total += dir_size(&entry.path());
                 }
@@ -378,7 +378,7 @@ fn scan_artifact_dirs(
             (p, mtime)
         })
         .collect();
-    dirs_with_time.sort_by(|a, b| b.1.cmp(&a.1)); // newest first
+    dirs_with_time.sort_by_key(|(_, mtime)| std::cmp::Reverse(*mtime)); // newest first
 
     // Build a set of fingerprints within the rollback window.
     // The rollback window includes the N most recent non-current versions.

@@ -15,8 +15,7 @@ pub fn generate_id(prefix: &str) -> String {
     #[allow(clippy::cast_possible_truncation)] // NOTE: lower 64 bits of nanos suffice for hashing
     let ts = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos() as u64)
-        .unwrap_or(0);
+        .map_or(0, |d| d.as_nanos() as u64);
     let mut h = DefaultHasher::new();
     ts.hash(&mut h);
     n.hash(&mut h);

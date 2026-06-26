@@ -18,21 +18,29 @@ use axum::{
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD as B64URL};
 use household_rs::caveats::Operation;
 use household_rs::owner_approval_v2::{
-    OwnerApprovalContextV2, OwnerApprovalV2Error, OwnerOperation,
+    OwnerApprovalContextV2, OwnerApprovalV2, OwnerApprovalV2Error, OwnerOperation,
+    PairMachineTrustedContextInput,
 };
 use household_rs::owner_events::{
     JoinCancelledPayload, MachineJoinedPayload, OwnerDevicePushToken, OwnerEvent, OwnerEventLog,
     OwnerEventPayload, OwnerEventType, OwnerEventsBroadcaster,
+};
+use household_rs::owner_webauthn::{OwnerWebauthnChallengeId, OwnerWebauthnRp};
+use household_rs::owner_webauthn_anchor::{
+    OwnerWebauthnAnchorMode, verify_or_update_owner_webauthn_authority_anchor,
 };
 use household_rs::pair_machine::{
     CeremonyError, CeremonyInputs, CeremonyTxn, FinalizeWithM2Options, FinalizeWithM2Outcome,
     JoinRequest, OwnerApproval, OwnerApprovalContext, PairMachineState, PairMachineWindow,
     PairMachineWindowSnapshot, join_request_hash,
 };
+use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use serde_bytes::ByteBuf;
+use tokio::sync::Mutex;
 use tokio::sync::broadcast::error::RecvError;
 use tokio::sync::watch;
+use webauthn_rs::prelude::RequestChallengeResponse;
 use zeroize::Zeroizing;
 
 use crate::apns_dispatcher;
@@ -61,6 +69,23 @@ pub struct OwnerEventsRouterState {
     /// Owner-auth rollout policy. Defaults to legacy behavior for every
     /// operation so introducing S2 primitives cannot brick existing onboarding.
     pub owner_approval_policy: OwnerApprovalEnforcementPolicy,
+    /// Tenant-scoped `WebAuthn` relying party for owner-approval ceremonies.
+    ///
+    /// `None` keeps the v2 owner-approval surface fail-closed. The production
+    /// flip must inject a tenant RP; default router construction remains
+    /// behavior-preserving.
+    pub owner_webauthn_rp: Option<Arc<Mutex<OwnerWebauthnRp>>>,
+    /// Keystore-backed rollback anchor verifier for owner passkey authority.
+    ///
+    /// Pair-machine v2 enforcement requires this before it can decide whether
+    /// an owner has active credentials. This prevents a rolled-back credential
+    /// log from re-enabling a revoked passkey or downgrading to legacy.
+    pub owner_webauthn_anchor: Option<OwnerWebauthnAnchorVerifier>,
+}
+
+#[derive(Clone)]
+pub struct OwnerWebauthnAnchorVerifier {
+    pub keystore: Arc<dyn keystore_rs::KeystoreBackend>,
 }
 
 impl OwnerEventsRouterState {
@@ -104,6 +129,8 @@ impl OwnerEventsRouterState {
             device_pairing_store: DevicePairingStore::new(),
             key_backing_policy,
             owner_approval_policy: OwnerApprovalEnforcementPolicy::default(),
+            owner_webauthn_rp: None,
+            owner_webauthn_anchor: None,
         }
     }
 
@@ -113,6 +140,21 @@ impl OwnerEventsRouterState {
         owner_approval_policy: OwnerApprovalEnforcementPolicy,
     ) -> Self {
         self.owner_approval_policy = owner_approval_policy;
+        self
+    }
+
+    #[must_use]
+    pub fn with_owner_webauthn_rp(mut self, rp: OwnerWebauthnRp) -> Self {
+        self.owner_webauthn_rp = Some(Arc::new(Mutex::new(rp)));
+        self
+    }
+
+    #[must_use]
+    pub fn with_owner_webauthn_anchor(
+        mut self,
+        keystore: Arc<dyn keystore_rs::KeystoreBackend>,
+    ) -> Self {
+        self.owner_webauthn_anchor = Some(OwnerWebauthnAnchorVerifier { keystore });
         self
     }
 }
@@ -245,12 +287,163 @@ pub fn reassert_pair_machine_approval_context_against_live_window(
     Ok(())
 }
 
+fn owner_approval_v2_capabilities() -> Vec<String> {
+    vec!["machine-cert".to_string(), "shamir-2pc".to_string()]
+}
+
+fn pair_machine_window_data(
+    cursor: u64,
+    snapshot: PairMachineWindowSnapshot,
+) -> Result<PairMachineWindowData, &'static str> {
+    if snapshot.state != PairMachineState::AwaitingOwner
+        || snapshot.owner_event_cursor != Some(cursor)
+    {
+        return Err("window_cursor_mismatch");
+    }
+    let active_m_pub = snapshot.m_pub.clone().ok_or("window_missing_m_pub")?;
+    let cached_join_request = snapshot
+        .cached_join_request
+        .clone()
+        .ok_or("missing_cached_join_request")?;
+    let join_request = household_rs::cbor::from_canonical_slice(cached_join_request.as_ref())
+        .map_err(|_| "cached_join_request_decode")?;
+    Ok(PairMachineWindowData {
+        snapshot,
+        active_m_pub,
+        cached_join_request,
+        join_request,
+    })
+}
+
+fn pair_machine_expected_context_from_snapshot(
+    identity: &household_rs::LoadedIdentity,
+    owner_auth: &household_rs::HouseholdAuthState,
+    snapshot: &PairMachineWindowSnapshot,
+    now: u64,
+    challenge_ttl_secs: u64,
+    replay_nonce: [u8; 32],
+) -> Result<OwnerApprovalContextV2, OwnerApprovalV2Error> {
+    OwnerApprovalContextV2::pair_machine_approve_from_trusted_state(
+        PairMachineTrustedContextInput {
+            hh_id: identity.record.hh_id.clone(),
+            owner_p_id: owner_auth.owner_person_cert.p_id.clone(),
+            snapshot,
+            capabilities: owner_approval_v2_capabilities(),
+            issued_at: now,
+            challenge_ttl_secs,
+            replay_nonce,
+        },
+    )
+}
+
+fn pair_machine_credentials_for_policy(
+    state: &OwnerEventsRouterState,
+    identity: &household_rs::LoadedIdentity,
+    owner_auth: &household_rs::HouseholdAuthState,
+) -> Result<Option<household_rs::owner_webauthn::OwnerWebauthnCredentialStore>, String> {
+    if state.owner_approval_policy.pair_machine_approve == OwnerOperationEnforcement::LegacyOnly {
+        return Ok(None);
+    }
+    let verifier = state
+        .owner_webauthn_anchor
+        .as_ref()
+        .ok_or_else(|| "owner webauthn anchor verifier unavailable".to_string())?;
+    verify_or_update_owner_webauthn_authority_anchor(
+        verifier.keystore.as_ref(),
+        &owner_auth.owner_webauthn,
+        &identity.record,
+        &owner_auth.owner_person_cert,
+        OwnerWebauthnAnchorMode::Enforcement,
+    )
+    .map_err(|e| e.to_string())?;
+    owner_auth
+        .owner_webauthn_credentials(&identity.record)
+        .map(Some)
+        .map_err(|e| e.to_string())
+}
+
+fn parse_pair_machine_approval_body(
+    mode: PairMachineApprovalBodyMode,
+    cursor: u64,
+    body: &[u8],
+) -> Result<PairMachineApprovalWireBody, &'static str> {
+    match mode {
+        PairMachineApprovalBodyMode::LegacyV1 => {
+            let approval: OwnerApproval =
+                household_rs::cbor::from_canonical_slice(body).map_err(|_| "cbor_decode")?;
+            match approval.to_canonical_bytes() {
+                Ok(canonical) if canonical == body => {}
+                Ok(_) => return Err("non_canonical_cbor"),
+                Err(_) => return Err("cbor_reencode"),
+            }
+            if approval.version != 1 || approval.cursor != cursor {
+                return Err("body_cursor_mismatch");
+            }
+            Ok(PairMachineApprovalWireBody::LegacyV1(approval))
+        }
+        PairMachineApprovalBodyMode::RequireV2 => {
+            let finish: OwnerApprovalV2Finish =
+                household_rs::cbor::from_canonical_slice(body).map_err(|_| "cbor_decode")?;
+            let canonical =
+                household_rs::cbor::to_canonical_vec(&finish).map_err(|_| "cbor_reencode")?;
+            if canonical != body {
+                return Err("non_canonical_cbor");
+            }
+            if finish.version != 1 || finish.approval.context.cursor != Some(cursor) {
+                return Err("body_cursor_mismatch");
+            }
+            finish
+                .approval
+                .validate_shape()
+                .map_err(|_| "approval_v2_shape")?;
+            Ok(PairMachineApprovalWireBody::V2(Box::new(finish)))
+        }
+    }
+}
+
 #[derive(Serialize)]
 struct OwnerEventsResponse {
     #[serde(rename = "v")]
     version: u8,
     events: Vec<OwnerEvent>,
     next_cursor: u64,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OwnerApprovalV2StartRequest {
+    #[serde(rename = "v")]
+    version: u8,
+}
+
+#[derive(Serialize)]
+struct OwnerApprovalV2StartResponse {
+    #[serde(rename = "v")]
+    version: u8,
+    challenge_id: String,
+    context: OwnerApprovalContextV2,
+    options: RequestChallengeResponse,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OwnerApprovalV2Finish {
+    #[serde(rename = "v")]
+    version: u8,
+    challenge_id: String,
+    approval: OwnerApprovalV2,
+}
+
+enum PairMachineApprovalWireBody {
+    LegacyV1(OwnerApproval),
+    V2(Box<OwnerApprovalV2Finish>),
+}
+
+struct PairMachineWindowData {
+    snapshot: PairMachineWindowSnapshot,
+    active_m_pub: ByteBuf,
+    cached_join_request: ByteBuf,
+    join_request: JoinRequest,
 }
 
 #[derive(Deserialize)]
@@ -531,6 +724,192 @@ pub async fn push_token_register_handler(
     cbor_response(StatusCode::OK, bytes)
 }
 
+/// `POST /api/v1/household/owner-events/<cursor>/approval-v2/start`.
+pub async fn owner_approval_v2_start_handler(
+    State(state): State<OwnerEventsRouterState>,
+    Path(cursor_raw): Path<String>,
+    method: Method,
+    uri: Uri,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let Ok(cursor) = cursor_raw.parse::<u64>() else {
+        tracing::warn!(
+            stage = "owner_events.approval_v2_start.rejected",
+            reason = "bad_cursor_path",
+        );
+        return unauthenticated_response();
+    };
+    let Some(now) = time_util::unix_now_secs_checked("owner_events.approval_v2_start.clock") else {
+        return unauthenticated_response();
+    };
+    let path_and_query = uri
+        .path_and_query()
+        .map_or_else(|| uri.path().to_string(), |pq| pq.as_str().to_string());
+    let owner_auth = match household_auth::authorize_request(
+        &state.household,
+        &headers,
+        &method,
+        &path_and_query,
+        &body,
+        Operation::HouseholdAddMachine,
+        now,
+    )
+    .await
+    {
+        Ok(owner_auth) => owner_auth,
+        Err(e) => {
+            tracing::warn!(
+                stage = "owner_events.approval_v2_start.rejected",
+                reason = "pop_auth_failed",
+                error = %e,
+            );
+            return unauthenticated_response();
+        }
+    };
+    let request: OwnerApprovalV2StartRequest = match household_rs::cbor::from_canonical_slice(&body)
+    {
+        Ok(request) => request,
+        Err(e) => {
+            tracing::warn!(
+                stage = "owner_events.approval_v2_start.rejected",
+                reason = "cbor_decode",
+                error = %e,
+            );
+            return unauthenticated_response();
+        }
+    };
+    if request.version != 1 {
+        tracing::warn!(
+            stage = "owner_events.approval_v2_start.rejected",
+            reason = "unsupported_version",
+        );
+        return unauthenticated_response();
+    }
+    match household_rs::cbor::to_canonical_vec(&request) {
+        Ok(canonical) if canonical == body.as_ref() => {}
+        Ok(_) => {
+            tracing::warn!(
+                stage = "owner_events.approval_v2_start.rejected",
+                reason = "non_canonical_cbor",
+            );
+            return unauthenticated_response();
+        }
+        Err(e) => {
+            tracing::warn!(
+                stage = "owner_events.approval_v2_start.rejected",
+                reason = "cbor_reencode",
+                error = %e,
+            );
+            return unauthenticated_response();
+        }
+    }
+
+    let Some(identity) = state.household.current().await else {
+        tracing::warn!(
+            stage = "owner_events.approval_v2_start.rejected",
+            reason = "identity_unavailable",
+        );
+        return unauthenticated_response();
+    };
+    let credentials =
+        match pair_machine_credentials_for_policy(&state, &identity, owner_auth.as_ref()) {
+            Ok(Some(credentials)) => credentials,
+            Ok(None) => {
+                tracing::warn!(
+                    stage = "owner_events.approval_v2_start.rejected",
+                    reason = "policy_legacy_only",
+                );
+                return unauthenticated_response();
+            }
+            Err(e) => {
+                tracing::warn!(
+                    stage = "owner_events.approval_v2_start.rejected",
+                    reason = "owner_webauthn_authority_unavailable",
+                    error = %e,
+                );
+                return unauthenticated_response();
+            }
+        };
+    if state
+        .owner_approval_policy
+        .pair_machine_approval_body_mode(credentials.active_count() > 0)
+        != PairMachineApprovalBodyMode::RequireV2
+    {
+        tracing::warn!(
+            stage = "owner_events.approval_v2_start.rejected",
+            reason = "owner_has_no_active_webauthn_credential",
+        );
+        return unauthenticated_response();
+    }
+    let Some(rp) = state.owner_webauthn_rp.as_ref() else {
+        tracing::warn!(
+            stage = "owner_events.approval_v2_start.rejected",
+            reason = "owner_webauthn_rp_unavailable",
+        );
+        return unauthenticated_response();
+    };
+
+    let snapshot = state.window.snapshot().await;
+    if let Err(reason) = pair_machine_window_data(cursor, snapshot.clone()) {
+        tracing::warn!(
+            stage = "owner_events.approval_v2_start.rejected",
+            reason = reason,
+            cursor = cursor,
+            window_cursor = ?snapshot.owner_event_cursor,
+        );
+        return unauthenticated_response();
+    }
+
+    let mut rng = rand::rngs::OsRng;
+    let mut replay_nonce = [0_u8; 32];
+    rng.fill_bytes(&mut replay_nonce);
+    let mut rp = rp.lock().await;
+    let expected_context = match pair_machine_expected_context_from_snapshot(
+        &identity,
+        owner_auth.as_ref(),
+        &snapshot,
+        now,
+        rp.config().challenge_ttl().as_secs(),
+        replay_nonce,
+    ) {
+        Ok(context) => context,
+        Err(e) => {
+            tracing::warn!(
+                stage = "owner_events.approval_v2_start.rejected",
+                reason = "trusted_context_build_failed",
+                error = %e,
+            );
+            return unauthenticated_response();
+        }
+    };
+    let (challenge_id, options) = match rp.start_owner_approval_assertion(
+        &mut rng,
+        now,
+        credentials.credentials(),
+        &expected_context,
+    ) {
+        Ok(started) => started,
+        Err(e) => {
+            tracing::warn!(
+                stage = "owner_events.approval_v2_start.rejected",
+                reason = "webauthn_start_failed",
+                error = %e,
+            );
+            return unauthenticated_response();
+        }
+    };
+
+    let bytes = household_rs::cbor::to_canonical_vec(&OwnerApprovalV2StartResponse {
+        version: 1,
+        challenge_id: challenge_id.as_str().to_string(),
+        context: expected_context,
+        options,
+    })
+    .unwrap_or_default();
+    cbor_response(StatusCode::OK, bytes)
+}
+
 /// `POST /api/v1/household/owner-events/<cursor>/approve`.
 pub async fn owner_approve_handler(
     State(state): State<OwnerEventsRouterState>,
@@ -586,45 +965,6 @@ pub async fn owner_approve_handler(
         }
     };
 
-    let approval: OwnerApproval = match household_rs::cbor::from_canonical_slice(&body) {
-        Ok(approval) => approval,
-        Err(e) => {
-            tracing::warn!(
-                stage = "owner_events.approve.rejected",
-                reason = "cbor_decode",
-                error = %e,
-            );
-            return unauthenticated_response();
-        }
-    };
-    match approval.to_canonical_bytes() {
-        Ok(canonical) if canonical == body.as_ref() => {}
-        Ok(_) => {
-            tracing::warn!(
-                stage = "owner_events.approve.rejected",
-                reason = "non_canonical_cbor",
-            );
-            return unauthenticated_response();
-        }
-        Err(e) => {
-            tracing::warn!(
-                stage = "owner_events.approve.rejected",
-                reason = "cbor_reencode",
-                error = %e,
-            );
-            return unauthenticated_response();
-        }
-    }
-    if approval.version != 1 || approval.cursor != cursor {
-        tracing::warn!(
-            stage = "owner_events.approve.rejected",
-            reason = "body_cursor_mismatch",
-            body_cursor = approval.cursor,
-            path_cursor = cursor,
-        );
-        return unauthenticated_response();
-    }
-
     let Some(identity) = state.household.current().await else {
         tracing::warn!(
             stage = "owner_events.approve.rejected",
@@ -632,67 +972,221 @@ pub async fn owner_approve_handler(
         );
         return unauthenticated_response();
     };
-    let snap = state.window.snapshot().await;
-    if snap.state != PairMachineState::AwaitingOwner || snap.owner_event_cursor != Some(cursor) {
-        tracing::warn!(
-            stage = "owner_events.approve.rejected",
-            reason = "window_cursor_mismatch",
-            cursor = cursor,
-            window_cursor = ?snap.owner_event_cursor,
-        );
-        return unauthenticated_response();
-    }
-    let Some(active_m_pub) = snap.m_pub.clone() else {
-        tracing::warn!(
-            stage = "owner_events.approve.rejected",
-            reason = "window_missing_m_pub",
-        );
-        return unauthenticated_response();
-    };
-    let Some(cached_join_request) = snap.cached_join_request.clone() else {
-        tracing::warn!(
-            stage = "owner_events.approve.rejected",
-            reason = "missing_cached_join_request",
-        );
-        return unauthenticated_response();
-    };
-    let join_request: JoinRequest =
-        match household_rs::cbor::from_canonical_slice(cached_join_request.as_ref()) {
-            Ok(join_request) => join_request,
+    let credentials_for_policy =
+        match pair_machine_credentials_for_policy(&state, &identity, owner_auth.as_ref()) {
+            Ok(credentials) => credentials,
             Err(e) => {
                 tracing::warn!(
                     stage = "owner_events.approve.rejected",
-                    reason = "cached_join_request_decode",
+                    reason = "owner_webauthn_authority_unavailable",
                     error = %e,
                 );
                 return unauthenticated_response();
             }
         };
-    let approval_context = OwnerApprovalContext::build(
-        identity.record.hh_id.clone(),
-        owner_auth.owner_person_cert.p_id.clone(),
-        cursor,
-        join_request.challenge_sig.clone(),
-        pop.timestamp,
+    let body_mode = state.owner_approval_policy.pair_machine_approval_body_mode(
+        credentials_for_policy
+            .as_ref()
+            .is_some_and(|credentials| credentials.active_count() > 0),
     );
-    if now.abs_diff(approval_context.timestamp) > 60 {
-        tracing::warn!(
-            stage = "owner_events.approve.rejected",
-            reason = "approval_timestamp_skew",
-        );
-        return unauthenticated_response();
-    }
-    if let Err(e) =
-        approval_context.verify(&owner_auth.owner_person_cert.p_pub, &approval.approval_sig)
-    {
-        tracing::warn!(
-            stage = "owner_events.approve.rejected",
-            reason = "approval_sig_invalid",
-            error = %e,
-        );
-        abort_with_cancel_event(&state, &identity, active_m_pub, "prepare_failed").await;
-        return unauthenticated_response();
-    }
+    let approval_wire = match parse_pair_machine_approval_body(body_mode, cursor, &body) {
+        Ok(approval) => approval,
+        Err(reason) => {
+            tracing::warn!(
+                stage = "owner_events.approve.rejected",
+                reason = reason,
+                path_cursor = cursor,
+            );
+            return unauthenticated_response();
+        }
+    };
+    let mut window_data = match pair_machine_window_data(cursor, state.window.snapshot().await) {
+        Ok(data) => data,
+        Err(reason) => {
+            tracing::warn!(
+                stage = "owner_events.approve.rejected",
+                reason = reason,
+                cursor = cursor,
+            );
+            return unauthenticated_response();
+        }
+    };
+    let approved_v2_context = match &approval_wire {
+        PairMachineApprovalWireBody::LegacyV1(approval) => {
+            let approval_context = OwnerApprovalContext::build(
+                identity.record.hh_id.clone(),
+                owner_auth.owner_person_cert.p_id.clone(),
+                cursor,
+                window_data.join_request.challenge_sig.clone(),
+                pop.timestamp,
+            );
+            if now.abs_diff(approval_context.timestamp) > 60 {
+                tracing::warn!(
+                    stage = "owner_events.approve.rejected",
+                    reason = "approval_timestamp_skew",
+                );
+                return unauthenticated_response();
+            }
+            if let Err(e) =
+                approval_context.verify(&owner_auth.owner_person_cert.p_pub, &approval.approval_sig)
+            {
+                tracing::warn!(
+                    stage = "owner_events.approve.rejected",
+                    reason = "approval_sig_invalid",
+                    error = %e,
+                );
+                abort_with_cancel_event(
+                    &state,
+                    &identity,
+                    window_data.active_m_pub.clone(),
+                    "prepare_failed",
+                )
+                .await;
+                return unauthenticated_response();
+            }
+            None
+        }
+        PairMachineApprovalWireBody::V2(finish) => {
+            if let Err(e) = finish.approval.context.validate_at(now) {
+                tracing::warn!(
+                    stage = "owner_events.approve.rejected",
+                    reason = "approval_v2_context_expired",
+                    error = %e,
+                );
+                return unauthenticated_response();
+            }
+            let Some(credentials) = credentials_for_policy.as_ref() else {
+                tracing::warn!(
+                    stage = "owner_events.approve.rejected",
+                    reason = "owner_webauthn_credentials_unavailable",
+                );
+                return unauthenticated_response();
+            };
+            let Some(mut credential) = credentials
+                .credentials()
+                .iter()
+                .find(|credential| {
+                    credential.credential_id_bytes() == finish.approval.credential_id.as_ref()
+                })
+                .cloned()
+            else {
+                tracing::warn!(
+                    stage = "owner_events.approve.rejected",
+                    reason = "owner_webauthn_credential_not_found",
+                );
+                return unauthenticated_response();
+            };
+            let Ok(challenge_id) = OwnerWebauthnChallengeId::parse(finish.challenge_id.clone())
+            else {
+                tracing::warn!(
+                    stage = "owner_events.approve.rejected",
+                    reason = "owner_webauthn_challenge_id_invalid",
+                );
+                return unauthenticated_response();
+            };
+            let assertion = match finish.approval.to_public_key_credential() {
+                Ok(assertion) => assertion,
+                Err(e) => {
+                    tracing::warn!(
+                        stage = "owner_events.approve.rejected",
+                        reason = "approval_v2_assertion_invalid",
+                        error = %e,
+                    );
+                    return unauthenticated_response();
+                }
+            };
+            let Some(rp) = state.owner_webauthn_rp.as_ref() else {
+                tracing::warn!(
+                    stage = "owner_events.approve.rejected",
+                    reason = "owner_webauthn_rp_unavailable",
+                );
+                return unauthenticated_response();
+            };
+            let Ok(replay_nonce) =
+                <[u8; 32]>::try_from(finish.approval.context.replay_nonce.as_ref())
+            else {
+                tracing::warn!(
+                    stage = "owner_events.approve.rejected",
+                    reason = "approval_v2_replay_nonce_length",
+                );
+                return unauthenticated_response();
+            };
+            let mut rp = rp.lock().await;
+            let expected_context = match pair_machine_expected_context_from_snapshot(
+                &identity,
+                owner_auth.as_ref(),
+                &window_data.snapshot,
+                finish.approval.context.issued_at,
+                rp.config().challenge_ttl().as_secs(),
+                replay_nonce,
+            ) {
+                Ok(context) => context,
+                Err(e) => {
+                    tracing::warn!(
+                        stage = "owner_events.approve.rejected",
+                        reason = "trusted_context_build_failed",
+                        error = %e,
+                    );
+                    return unauthenticated_response();
+                }
+            };
+            if let Err(e) = rp.finish_owner_approval_assertion(
+                now,
+                &challenge_id,
+                &assertion,
+                &mut credential,
+                &finish.approval.context,
+            ) {
+                tracing::warn!(
+                    stage = "owner_events.approve.rejected",
+                    reason = "owner_webauthn_finish_failed",
+                    error = %e,
+                );
+                return unauthenticated_response();
+            }
+            if let Err(e) = finish.approval.require_expected_context(&expected_context) {
+                tracing::warn!(
+                    stage = "owner_events.approve.rejected",
+                    reason = "approval_v2_context_mismatch",
+                    error = %e,
+                );
+                return unauthenticated_response();
+            }
+            Some(finish.approval.context.clone())
+        }
+    };
+    let mutation_guard = if let Some(context) = approved_v2_context.as_ref() {
+        let guard = crate::bootstrap_mutation_lock::BOOTSTRAP_MUTATION_LOCK
+            .lock()
+            .await;
+        let live_snapshot = state.window.snapshot().await;
+        let live_window_data = match pair_machine_window_data(cursor, live_snapshot) {
+            Ok(data) => data,
+            Err(reason) => {
+                tracing::warn!(
+                    stage = "owner_events.approve.rejected",
+                    reason = reason,
+                    cursor = cursor,
+                );
+                return unauthenticated_response();
+            }
+        };
+        if let Err(e) = reassert_pair_machine_approval_context_against_live_window(
+            context,
+            &live_window_data.snapshot,
+        ) {
+            tracing::warn!(
+                stage = "owner_events.approve.rejected",
+                reason = "approval_v2_live_window_mismatch",
+                error = %e,
+            );
+            return unauthenticated_response();
+        }
+        window_data = live_window_data;
+        Some(guard)
+    } else {
+        None
+    };
 
     let Some(hh_priv_handle) = identity.hh_priv.as_ref() else {
         // Post-Shamir household: the keystore custody of HH_priv has been
@@ -704,7 +1198,13 @@ pub async fn owner_approve_handler(
             stage = "owner_events.approve.rejected",
             reason = "post_shamir_household",
         );
-        abort_with_cancel_event(&state, &identity, active_m_pub, "prepare_failed").await;
+        abort_with_cancel_event(
+            &state,
+            &identity,
+            window_data.active_m_pub.clone(),
+            "prepare_failed",
+        )
+        .await;
         return unauthenticated_response();
     };
     // Phase 3 Shamir splitting requires the raw HH_priv scalar bytes
@@ -728,7 +1228,13 @@ pub async fn owner_approve_handler(
             reason = "hh_scalar_unavailable",
             hint = "SE-backed HH_priv is non-exportable; Phase 3 Shamir splitting requires THEYOS_FORCE_SOFTWARE_KEYS=1 at bootstrap",
         );
-        abort_with_cancel_event(&state, &identity, active_m_pub, "prepare_failed").await;
+        abort_with_cancel_event(
+            &state,
+            &identity,
+            window_data.active_m_pub.clone(),
+            "prepare_failed",
+        )
+        .await;
         return unauthenticated_response();
     };
     let Some(m1_priv) = identity.m_priv.as_software_secret().copied() else {
@@ -737,15 +1243,28 @@ pub async fn owner_approve_handler(
             reason = "m1_scalar_unavailable",
             hint = "SE-backed M_priv is non-exportable; Phase 3 ECDH for shard encryption requires THEYOS_FORCE_SOFTWARE_KEYS=1 at bootstrap",
         );
-        abort_with_cancel_event(&state, &identity, active_m_pub, "prepare_failed").await;
+        abort_with_cancel_event(
+            &state,
+            &identity,
+            window_data.active_m_pub.clone(),
+            "prepare_failed",
+        )
+        .await;
         return unauthenticated_response();
     };
-    let Ok(candidate_m_pub_sec1) = <[u8; 33]>::try_from(join_request.m_pub.as_ref()) else {
+    let Ok(candidate_m_pub_sec1) = <[u8; 33]>::try_from(window_data.join_request.m_pub.as_ref())
+    else {
         tracing::warn!(
             stage = "owner_events.approve.rejected",
             reason = "candidate_m_pub_length",
         );
-        abort_with_cancel_event(&state, &identity, active_m_pub, "prepare_failed").await;
+        abort_with_cancel_event(
+            &state,
+            &identity,
+            window_data.active_m_pub.clone(),
+            "prepare_failed",
+        )
+        .await;
         return unauthenticated_response();
     };
     let push_token_seed = match household_rs::owner_events::get_owner_push_token(&state.state_dir) {
@@ -756,7 +1275,13 @@ pub async fn owner_approve_handler(
                 reason = "push_token_seed_read_failed",
                 error = %e,
             );
-            abort_with_cancel_event(&state, &identity, active_m_pub, "prepare_failed").await;
+            abort_with_cancel_event(
+                &state,
+                &identity,
+                window_data.active_m_pub.clone(),
+                "prepare_failed",
+            )
+            .await;
             return unauthenticated_response();
         }
     };
@@ -768,8 +1293,8 @@ pub async fn owner_approve_handler(
         m1_pub_sec1: *identity.cert.m_pub.as_bytes(),
         m1_id: identity.cert.m_id.to_string(),
         candidate_m_pub_sec1,
-        candidate_hostname: join_request.hostname.clone(),
-        candidate_platform: join_request.platform.clone(),
+        candidate_hostname: window_data.join_request.hostname.clone(),
+        candidate_platform: window_data.join_request.platform.clone(),
         joined_at: now,
         state_dir: state.state_dir.clone(),
         existing_record: identity.record.clone(),
@@ -782,14 +1307,22 @@ pub async fn owner_approve_handler(
                 reason = "ceremony_prepare_failed",
                 error = %e,
             );
-            abort_with_cancel_event(&state, &identity, active_m_pub, "prepare_failed").await;
+            abort_with_cancel_event(
+                &state,
+                &identity,
+                window_data.active_m_pub.clone(),
+                "prepare_failed",
+            )
+            .await;
             return unauthenticated_response();
         }
     };
-    let addr = snap
+    drop(mutation_guard);
+    let addr = window_data
+        .snapshot
         .addr_hint
         .clone()
-        .unwrap_or_else(|| join_request.addr.clone());
+        .unwrap_or_else(|| window_data.join_request.addr.clone());
     // R7.2/R7.3: write the recovery-driver intent pin BEFORE invoking
     // `finalize_with_m2`. The marker says "M1 has launched a join
     // ceremony with this candidate; if the boot path observes a
@@ -826,7 +1359,13 @@ pub async fn owner_approve_handler(
         // The txn has not contacted M2 yet; explicit rollback unlinks
         // the staged set cleanly with no residue.
         txn.rollback();
-        abort_with_cancel_event(&state, &identity, active_m_pub, "prepare_failed").await;
+        abort_with_cancel_event(
+            &state,
+            &identity,
+            window_data.active_m_pub.clone(),
+            "prepare_failed",
+        )
+        .await;
         return unauthenticated_response();
     }
     // T073: persist the JoinResponse bytes we are about to POST so
@@ -835,7 +1374,7 @@ pub async fn owner_approve_handler(
     // encrypted-shard-for-M2 inside `JoinResponse` cannot be
     // reconstructed post-crash. Build the response here using the same
     // options finalize_with_m2 will use.
-    let cached_join_request_bytes = cached_join_request.to_vec();
+    let cached_join_request_bytes = window_data.cached_join_request.to_vec();
     let pending_response_bytes = {
         let opts_for_build = FinalizeWithM2Options {
             addr: &addr,
@@ -857,8 +1396,13 @@ pub async fn owner_approve_handler(
                     let _ =
                         household_rs::storage::clear_phase3_finalize_ack_marker(&state.state_dir);
                     txn.rollback();
-                    abort_with_cancel_event(&state, &identity, active_m_pub, "prepare_failed")
-                        .await;
+                    abort_with_cancel_event(
+                        &state,
+                        &identity,
+                        window_data.active_m_pub.clone(),
+                        "prepare_failed",
+                    )
+                    .await;
                     return unauthenticated_response();
                 }
             },
@@ -870,7 +1414,13 @@ pub async fn owner_approve_handler(
                 );
                 let _ = household_rs::storage::clear_phase3_finalize_ack_marker(&state.state_dir);
                 txn.rollback();
-                abort_with_cancel_event(&state, &identity, active_m_pub, "prepare_failed").await;
+                abort_with_cancel_event(
+                    &state,
+                    &identity,
+                    window_data.active_m_pub.clone(),
+                    "prepare_failed",
+                )
+                .await;
                 return unauthenticated_response();
             }
         }
@@ -887,7 +1437,13 @@ pub async fn owner_approve_handler(
         );
         let _ = household_rs::storage::clear_phase3_finalize_ack_marker(&state.state_dir);
         txn.rollback();
-        abort_with_cancel_event(&state, &identity, active_m_pub, "prepare_failed").await;
+        abort_with_cancel_event(
+            &state,
+            &identity,
+            window_data.active_m_pub.clone(),
+            "prepare_failed",
+        )
+        .await;
         return unauthenticated_response();
     }
     let identity_for_finalize = Arc::clone(&identity);
@@ -942,7 +1498,13 @@ pub async fn owner_approve_handler(
                     error = %clear_err,
                 );
             }
-            abort_with_cancel_event(&state, &identity, active_m_pub, "candidate_unreachable").await;
+            abort_with_cancel_event(
+                &state,
+                &identity,
+                window_data.active_m_pub.clone(),
+                "candidate_unreachable",
+            )
+            .await;
             return unauthenticated_response();
         }
         Ok(FinalizeAttempt::AmbiguousFailure(e)) => {

@@ -664,6 +664,12 @@ pub async fn bootstrap_household(shared_state: Option<SharedState>) {
                                 axum::routing::post(handlers_owner_events::owner_approve_handler),
                             )
                             .route(
+                                "/api/v1/household/owner-events/{cursor}/approval-v2/start",
+                                axum::routing::post(
+                                    handlers_owner_events::owner_approval_v2_start_handler,
+                                ),
+                            )
+                            .route(
                                 "/api/v1/household/owner-events/{cursor}/decline",
                                 axum::routing::post(handlers_owner_events::owner_decline_handler),
                             )

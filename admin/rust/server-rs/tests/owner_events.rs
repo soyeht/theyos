@@ -19,10 +19,16 @@ use axum::{
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD as B64URL};
 use household_rs::keys::{IdentityKey, P256Keypair};
 use household_rs::machine_cert::Platform;
+use household_rs::owner_approval_v2::{OwnerApprovalContextV2, OwnerApprovalV2};
 use household_rs::owner_events::{
     JoinRequestPayload, OwnerEvent, OwnerEventLog, OwnerEventPayload, OwnerEventType,
     OwnerEventsBroadcaster,
 };
+use household_rs::owner_webauthn::{OwnerWebauthnConfig, OwnerWebauthnCredential, OwnerWebauthnRp};
+use household_rs::owner_webauthn_anchor::{
+    OwnerWebauthnAnchorMode, verify_or_update_owner_webauthn_authority_anchor,
+};
+use household_rs::owner_webauthn_authority::OwnerWebauthnAuthority;
 use household_rs::pair_machine::{
     JoinTransport, OwnerApproval, OwnerApprovalContext, PairMachineState, PairMachineWindow,
     PrepareCandidateOpts, household_root_sole_path, machine_cert_hash, prepare_candidate,
@@ -34,15 +40,23 @@ use household_rs::storage::{
     household_record_path, machine_cert_for, phase3_finalize_ack_marker_exists, staged_path_for,
 };
 use household_rs::{BootstrapOpts, HouseholdAuthState, KeyBackingPolicy};
+use keystore_rs::FileKeystore;
+use rand::SeedableRng;
+use rand::rngs::StdRng;
 use serde::Deserialize;
 use serde_bytes::ByteBuf;
 use server_rs::apns_dispatcher::{APNS_TICKLE_BODY, ApnsError, ApnsTransport, install_transport};
-use server_rs::handlers_owner_events::{self, OwnerEventsRouterState};
+use server_rs::handlers_owner_events::{
+    self, OwnerApprovalEnforcementPolicy, OwnerEventsRouterState, OwnerOperationEnforcement,
+};
 use server_rs::handlers_pair_machine::{PreHouseholdRouterState, pre_household_router};
 use server_rs::household_state::HouseholdState;
 use tempfile::TempDir;
 use tokio::net::TcpListener;
 use tower::ServiceExt;
+use webauthn_authenticator_rs::WebauthnAuthenticator;
+use webauthn_authenticator_rs::softpasskey::SoftPasskey;
+use webauthn_rs::prelude::{PublicKeyCredential, RequestChallengeResponse, Url, Uuid};
 
 const OWNER_EVENTS_PATH: &str = "/api/v1/household/owner-events";
 
@@ -118,6 +132,29 @@ struct OwnerApprovalAck {
     machine_cert_hash: ByteBuf,
 }
 
+#[derive(serde::Serialize)]
+struct OwnerApprovalV2StartRequest {
+    #[serde(rename = "v")]
+    version: u8,
+}
+
+#[derive(Deserialize)]
+struct OwnerApprovalV2StartResponse {
+    #[serde(rename = "v")]
+    version: u8,
+    challenge_id: String,
+    context: OwnerApprovalContextV2,
+    options: RequestChallengeResponse,
+}
+
+#[derive(serde::Serialize)]
+struct OwnerApprovalV2FinishBody {
+    #[serde(rename = "v")]
+    version: u8,
+    challenge_id: String,
+    approval: OwnerApprovalV2,
+}
+
 fn unix_now() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -155,8 +192,13 @@ fn owner_auth_for(identity: &household_rs::LoadedIdentity) -> (HouseholdAuthStat
     (HouseholdAuthState::new(&identity.record, cert), person)
 }
 
-fn router_with_state(
+fn router_from_owner_auth(
+    td: TempDir,
+    identity: Arc<household_rs::LoadedIdentity>,
+    owner_auth: HouseholdAuthState,
+    person: P256Keypair,
     timeout: Duration,
+    configure: impl FnOnce(OwnerEventsRouterState) -> OwnerEventsRouterState,
 ) -> (
     TempDir,
     Router,
@@ -166,9 +208,6 @@ fn router_with_state(
     Arc<household_rs::LoadedIdentity>,
     Arc<PairMachineWindow>,
 ) {
-    let td = tempfile::tempdir().unwrap();
-    let identity = Arc::new(bootstrap(td.path()));
-    let (owner_auth, person) = owner_auth_for(&identity);
     let household =
         HouseholdState::loaded_with_owner_auth(Arc::clone(&identity), Some(Arc::new(owner_auth)));
     let broadcaster = OwnerEventsBroadcaster::new();
@@ -184,10 +223,15 @@ fn router_with_state(
         household_rs::KeyBackingPolicy::ForceSoftware,
         timeout,
     );
+    let state = configure(state);
     let router = Router::new()
         .route(
             OWNER_EVENTS_PATH,
             get(handlers_owner_events::owner_events_long_poll),
+        )
+        .route(
+            "/api/v1/household/owner-events/{cursor}/approval-v2/start",
+            post(handlers_owner_events::owner_approval_v2_start_handler),
         )
         .route(
             "/api/v1/household/owner-events/{cursor}/approve",
@@ -199,6 +243,178 @@ fn router_with_state(
         )
         .with_state(state);
     (td, router, event_log, broadcaster, person, identity, window)
+}
+
+fn router_with_state(
+    timeout: Duration,
+) -> (
+    TempDir,
+    Router,
+    Arc<OwnerEventLog>,
+    OwnerEventsBroadcaster,
+    P256Keypair,
+    Arc<household_rs::LoadedIdentity>,
+    Arc<PairMachineWindow>,
+) {
+    let td = tempfile::tempdir().unwrap();
+    let identity = Arc::new(bootstrap(td.path()));
+    let (owner_auth, person) = owner_auth_for(&identity);
+    router_from_owner_auth(td, identity, owner_auth, person, timeout, |state| state)
+}
+
+fn owner_webauthn_rp() -> OwnerWebauthnRp {
+    let config = OwnerWebauthnConfig::new(
+        "alpha.example.test",
+        Url::parse("https://alpha.example.test").unwrap(),
+        "Soyeht Alpha",
+    )
+    .unwrap()
+    .with_challenge_ttl(Duration::from_secs(60));
+    OwnerWebauthnRp::new(config).unwrap()
+}
+
+fn register_owner_softpasskey(
+    rp: &mut OwnerWebauthnRp,
+) -> (OwnerWebauthnCredential, WebauthnAuthenticator<SoftPasskey>) {
+    let mut rng = StdRng::seed_from_u64(7);
+    let (challenge_id, challenge) = rp
+        .start_registration(
+            &mut rng,
+            unix_now(),
+            Uuid::new_v4(),
+            "owner-alpha",
+            "Owner Alpha",
+            &[],
+        )
+        .unwrap();
+    let mut authenticator = WebauthnAuthenticator::new(SoftPasskey::new(true));
+    let response = authenticator
+        .do_registration(Url::parse("https://alpha.example.test").unwrap(), challenge)
+        .unwrap();
+    let credential = rp
+        .finish_registration(unix_now(), &challenge_id, &response)
+        .unwrap();
+    (credential, authenticator)
+}
+
+fn approval_v2_from_assertion(
+    context: OwnerApprovalContextV2,
+    assertion: &PublicKeyCredential,
+) -> OwnerApprovalV2 {
+    OwnerApprovalV2 {
+        version: 2,
+        context,
+        credential_id: ByteBuf::from(assertion.raw_id.as_slice().to_vec()),
+        authenticator_data: ByteBuf::from(
+            assertion.response.authenticator_data.as_slice().to_vec(),
+        ),
+        client_data_json: ByteBuf::from(assertion.response.client_data_json.as_slice().to_vec()),
+        signature: ByteBuf::from(assertion.response.signature.as_slice().to_vec()),
+        user_handle: assertion
+            .response
+            .user_handle
+            .as_ref()
+            .map(|user_handle| ByteBuf::from(user_handle.as_slice().to_vec())),
+    }
+}
+
+fn owner_auth_with_webauthn_credential(
+    identity: &household_rs::LoadedIdentity,
+) -> (
+    household_rs::HouseholdAuthState,
+    P256Keypair,
+    OwnerWebauthnRp,
+    WebauthnAuthenticator<SoftPasskey>,
+) {
+    let (mut owner_auth, person) = owner_auth_for(identity);
+    let mut rp = owner_webauthn_rp();
+    let (credential, authenticator) = register_owner_softpasskey(&mut rp);
+    let genesis = OwnerWebauthnAuthority::sign_genesis(
+        identity
+            .hh_priv
+            .as_deref()
+            .expect("hh_priv present in single-machine household"),
+        &identity.record,
+        &owner_auth.owner_person_cert,
+        credential,
+        unix_now(),
+    )
+    .unwrap();
+    owner_auth.owner_webauthn.push_signed(genesis);
+    owner_auth.updated_at = unix_now();
+    (owner_auth, person, rp, authenticator)
+}
+
+fn router_with_v2_owner(
+    timeout: Duration,
+) -> (
+    TempDir,
+    Router,
+    Arc<OwnerEventLog>,
+    OwnerEventsBroadcaster,
+    P256Keypair,
+    Arc<household_rs::LoadedIdentity>,
+    Arc<PairMachineWindow>,
+    WebauthnAuthenticator<SoftPasskey>,
+) {
+    let td = tempfile::tempdir().unwrap();
+    let identity = Arc::new(bootstrap(td.path()));
+    let (owner_auth, person, rp, authenticator) = owner_auth_with_webauthn_credential(&identity);
+
+    let anchor_store: Arc<dyn keystore_rs::KeystoreBackend> =
+        Arc::new(FileKeystore::new(td.path(), keystore_rs::SERVICE));
+    verify_or_update_owner_webauthn_authority_anchor(
+        anchor_store.as_ref(),
+        &owner_auth.owner_webauthn,
+        &identity.record,
+        &owner_auth.owner_person_cert,
+        OwnerWebauthnAnchorMode::MigrationDefaultOff,
+    )
+    .unwrap();
+    let policy = OwnerApprovalEnforcementPolicy::default()
+        .with_pair_machine_approve(OwnerOperationEnforcement::V2WhenOwnerHasActiveCredential);
+    let (td, router, log, broadcaster, person, identity, window) =
+        router_from_owner_auth(td, identity, owner_auth, person, timeout, move |state| {
+            state
+                .with_owner_approval_policy(policy)
+                .with_owner_webauthn_rp(rp)
+                .with_owner_webauthn_anchor(anchor_store)
+        });
+    (
+        td,
+        router,
+        log,
+        broadcaster,
+        person,
+        identity,
+        window,
+        authenticator,
+    )
+}
+
+fn router_with_v2_policy_without_passkey(
+    timeout: Duration,
+) -> (
+    TempDir,
+    Router,
+    Arc<OwnerEventLog>,
+    OwnerEventsBroadcaster,
+    P256Keypair,
+    Arc<household_rs::LoadedIdentity>,
+    Arc<PairMachineWindow>,
+) {
+    let td = tempfile::tempdir().unwrap();
+    let identity = Arc::new(bootstrap(td.path()));
+    let (owner_auth, person) = owner_auth_for(&identity);
+    let anchor_store: Arc<dyn keystore_rs::KeystoreBackend> =
+        Arc::new(FileKeystore::new(td.path(), keystore_rs::SERVICE));
+    let policy = OwnerApprovalEnforcementPolicy::default()
+        .with_pair_machine_approve(OwnerOperationEnforcement::V2WhenOwnerHasActiveCredential);
+    router_from_owner_auth(td, identity, owner_auth, person, timeout, move |state| {
+        state
+            .with_owner_approval_policy(policy)
+            .with_owner_webauthn_anchor(anchor_store)
+    })
 }
 
 fn cursor_param(cursor: u64) -> String {
@@ -310,12 +526,14 @@ async fn start_candidate_harness() -> CandidateHarness {
 async fn start_candidate_harness_with_mode(mode: CandidateFinalizeMode) -> CandidateHarness {
     let td = tempfile::tempdir().unwrap();
     let window = Arc::new(PairMachineWindow::with_persistence(td.path().to_path_buf()).unwrap());
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap().to_string();
     let prepared = prepare_candidate(
         &window,
         PrepareCandidateOpts {
             state_dir: td.path().to_path_buf(),
             transport: JoinTransport::Tailscale,
-            addr: "127.0.0.1:1".into(),
+            addr: addr.clone(),
             hostname: "studio-linux".into(),
             platform: Platform::LinuxNix,
             policy: KeyBackingPolicy::ForceSoftware,
@@ -340,8 +558,6 @@ async fn start_candidate_harness_with_mode(mode: CandidateFinalizeMode) -> Candi
             )
             .with_state(state),
     };
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = format!("http://{}", listener.local_addr().unwrap());
     tokio::spawn(async move {
         axum::serve(listener, router).await.unwrap();
     });
@@ -696,6 +912,398 @@ async fn approve_happy_path_drives_commit() {
         events[0].event_type,
         OwnerEventType::MachineJoined
     ));
+}
+
+#[tokio::test]
+async fn approve_policy_on_without_passkey_keeps_legacy_path() {
+    let (td, router, log, _broadcaster, person, identity, window) =
+        router_with_v2_policy_without_passkey(Duration::from_secs(45));
+    fs::write(household_root_sole_path(td.path()), b"fake-sole-shard").unwrap();
+    let candidate = start_candidate_harness().await;
+    let event = stage_prepared_join_window(&window, &log, &identity, &candidate).await;
+    candidate
+        .window
+        .pin_household_anchor(
+            identity.record.hh_id.as_str().to_string(),
+            *identity.record.hh_pub.as_bytes(),
+        )
+        .await
+        .unwrap();
+    let uri = format!("/api/v1/household/owner-events/{}/approve", event.cursor);
+    let timestamp = unix_now();
+    let body = approval_body(
+        &identity,
+        &person,
+        event.cursor,
+        candidate.prepared.join_request.challenge_sig.clone(),
+        timestamp,
+    );
+    let auth = pop_header_for(&person, "POST", &uri, timestamp, &body);
+
+    let resp = router
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(uri)
+                .header(header::AUTHORIZATION, auth)
+                .header(header::CONTENT_TYPE, "application/cbor")
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = resp.status();
+    let resp_bytes = to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap()
+        .to_vec();
+
+    assert_eq!(status, StatusCode::OK);
+    let ack: OwnerApprovalAck = household_rs::cbor::from_canonical_slice(&resp_bytes).unwrap();
+    assert_eq!(ack.version, 1);
+    assert_eq!(window.snapshot().await.state, PairMachineState::Committed);
+}
+
+#[tokio::test]
+async fn approve_policy_on_with_passkey_without_anchor_fails_closed() {
+    let td = tempfile::tempdir().unwrap();
+    let identity = Arc::new(bootstrap(td.path()));
+    let (owner_auth, person, rp, _authenticator) = owner_auth_with_webauthn_credential(&identity);
+    let policy = OwnerApprovalEnforcementPolicy::default()
+        .with_pair_machine_approve(OwnerOperationEnforcement::V2WhenOwnerHasActiveCredential);
+    let (_td, router, log, _broadcaster, person, identity, window) = router_from_owner_auth(
+        td,
+        identity,
+        owner_auth,
+        person,
+        Duration::from_secs(45),
+        |state| {
+            state
+                .with_owner_approval_policy(policy)
+                .with_owner_webauthn_rp(rp)
+        },
+    );
+    let candidate = start_candidate_harness().await;
+    let event = stage_prepared_join_window(&window, &log, &identity, &candidate).await;
+    let uri = format!("/api/v1/household/owner-events/{}/approve", event.cursor);
+    let timestamp = unix_now();
+    let body = approval_body(
+        &identity,
+        &person,
+        event.cursor,
+        candidate.prepared.join_request.challenge_sig.clone(),
+        timestamp,
+    );
+    let auth = pop_header_for(&person, "POST", &uri, timestamp, &body);
+
+    let resp = router
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(uri)
+                .header(header::AUTHORIZATION, auth)
+                .header(header::CONTENT_TYPE, "application/cbor")
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = resp.status();
+    let resp_bytes = to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap()
+        .to_vec();
+
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    let parsed: GenericUnauth = household_rs::cbor::from_canonical_slice(&resp_bytes).unwrap();
+    assert_eq!(parsed.error, "unauthenticated");
+    assert_eq!(
+        window.snapshot().await.state,
+        PairMachineState::AwaitingOwner
+    );
+    assert!(log.read_since(event.cursor).unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn approval_v2_start_does_not_migrate_missing_anchor_on_request_path() {
+    let td = tempfile::tempdir().unwrap();
+    let identity = Arc::new(bootstrap(td.path()));
+    let (owner_auth, person, rp, _authenticator) = owner_auth_with_webauthn_credential(&identity);
+    let owner_auth_for_assert = owner_auth.clone();
+    let anchor_store: Arc<dyn keystore_rs::KeystoreBackend> =
+        Arc::new(FileKeystore::new(td.path(), keystore_rs::SERVICE));
+    let policy = OwnerApprovalEnforcementPolicy::default()
+        .with_pair_machine_approve(OwnerOperationEnforcement::V2WhenOwnerHasActiveCredential);
+    let (_td, router, log, _broadcaster, person, identity, window) =
+        router_from_owner_auth(td, identity, owner_auth, person, Duration::from_secs(45), {
+            let anchor_store = Arc::clone(&anchor_store);
+            move |state| {
+                state
+                    .with_owner_approval_policy(policy)
+                    .with_owner_webauthn_rp(rp)
+                    .with_owner_webauthn_anchor(anchor_store)
+            }
+        });
+    let candidate = start_candidate_harness().await;
+    let event = stage_prepared_join_window(&window, &log, &identity, &candidate).await;
+    let start_uri = format!(
+        "/api/v1/household/owner-events/{}/approval-v2/start",
+        event.cursor
+    );
+    let start_body =
+        household_rs::cbor::to_canonical_vec(&OwnerApprovalV2StartRequest { version: 1 }).unwrap();
+    let start_auth = pop_header_for(&person, "POST", &start_uri, unix_now(), &start_body);
+
+    let start_resp = router
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(start_uri)
+                .header(header::AUTHORIZATION, start_auth)
+                .header(header::CONTENT_TYPE, "application/cbor")
+                .body(Body::from(start_body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = start_resp.status();
+    let resp_bytes = to_bytes(start_resp.into_body(), usize::MAX)
+        .await
+        .unwrap()
+        .to_vec();
+
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    let parsed: GenericUnauth = household_rs::cbor::from_canonical_slice(&resp_bytes).unwrap();
+    assert_eq!(parsed.error, "unauthenticated");
+    assert_eq!(
+        window.snapshot().await.state,
+        PairMachineState::AwaitingOwner
+    );
+    assert!(log.read_since(event.cursor).unwrap().is_empty());
+    assert!(
+        verify_or_update_owner_webauthn_authority_anchor(
+            anchor_store.as_ref(),
+            &owner_auth_for_assert.owner_webauthn,
+            &identity.record,
+            &owner_auth_for_assert.owner_person_cert,
+            OwnerWebauthnAnchorMode::Enforcement,
+        )
+        .is_err()
+    );
+}
+
+#[tokio::test]
+async fn approve_require_v2_rejects_legacy_body_without_mutation() {
+    let (_td, router, log, _broadcaster, person, identity, window, _authenticator) =
+        router_with_v2_owner(Duration::from_secs(45));
+    let candidate = start_candidate_harness().await;
+    let event = stage_prepared_join_window(&window, &log, &identity, &candidate).await;
+    let uri = format!("/api/v1/household/owner-events/{}/approve", event.cursor);
+    let timestamp = unix_now();
+    let body = approval_body(
+        &identity,
+        &person,
+        event.cursor,
+        candidate.prepared.join_request.challenge_sig.clone(),
+        timestamp,
+    );
+    let auth = pop_header_for(&person, "POST", &uri, timestamp, &body);
+
+    let resp = router
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(uri)
+                .header(header::AUTHORIZATION, auth)
+                .header(header::CONTENT_TYPE, "application/cbor")
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = resp.status();
+    let resp_bytes = to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap()
+        .to_vec();
+
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    let parsed: GenericUnauth = household_rs::cbor::from_canonical_slice(&resp_bytes).unwrap();
+    assert_eq!(parsed.error, "unauthenticated");
+    assert_eq!(
+        window.snapshot().await.state,
+        PairMachineState::AwaitingOwner
+    );
+    assert!(log.read_since(event.cursor).unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn approve_v2_happy_path_drives_commit() {
+    let (td, router, log, _broadcaster, person, identity, window, mut authenticator) =
+        router_with_v2_owner(Duration::from_secs(45));
+    fs::write(household_root_sole_path(td.path()), b"fake-sole-shard").unwrap();
+    let candidate = start_candidate_harness().await;
+    let event = stage_prepared_join_window(&window, &log, &identity, &candidate).await;
+    candidate
+        .window
+        .pin_household_anchor(
+            identity.record.hh_id.as_str().to_string(),
+            *identity.record.hh_pub.as_bytes(),
+        )
+        .await
+        .unwrap();
+
+    let start_uri = format!(
+        "/api/v1/household/owner-events/{}/approval-v2/start",
+        event.cursor
+    );
+    let start_body =
+        household_rs::cbor::to_canonical_vec(&OwnerApprovalV2StartRequest { version: 1 }).unwrap();
+    let start_auth = pop_header_for(&person, "POST", &start_uri, unix_now(), &start_body);
+    let start_resp = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(start_uri)
+                .header(header::AUTHORIZATION, start_auth)
+                .header(header::CONTENT_TYPE, "application/cbor")
+                .body(Body::from(start_body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(start_resp.status(), StatusCode::OK);
+    let start_bytes = to_bytes(start_resp.into_body(), usize::MAX)
+        .await
+        .unwrap()
+        .to_vec();
+    let start: OwnerApprovalV2StartResponse =
+        household_rs::cbor::from_canonical_slice(&start_bytes).unwrap();
+    assert_eq!(start.version, 1);
+
+    let assertion = authenticator
+        .do_authentication(
+            Url::parse("https://alpha.example.test").unwrap(),
+            start.options,
+        )
+        .unwrap();
+    let approval = approval_v2_from_assertion(start.context, &assertion);
+    let finish_body = household_rs::cbor::to_canonical_vec(&OwnerApprovalV2FinishBody {
+        version: 1,
+        challenge_id: start.challenge_id,
+        approval,
+    })
+    .unwrap();
+    let approve_uri = format!("/api/v1/household/owner-events/{}/approve", event.cursor);
+    let finish_auth = pop_header_for(&person, "POST", &approve_uri, unix_now(), &finish_body);
+    let finish_resp = router
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(approve_uri)
+                .header(header::AUTHORIZATION, finish_auth)
+                .header(header::CONTENT_TYPE, "application/cbor")
+                .body(Body::from(finish_body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = finish_resp.status();
+    let finish_bytes = to_bytes(finish_resp.into_body(), usize::MAX)
+        .await
+        .unwrap()
+        .to_vec();
+
+    assert_eq!(status, StatusCode::OK);
+    let ack: OwnerApprovalAck = household_rs::cbor::from_canonical_slice(&finish_bytes).unwrap();
+    assert_eq!(ack.version, 1);
+    assert_eq!(window.snapshot().await.state, PairMachineState::Committed);
+    let events = log.read_since(event.cursor).unwrap();
+    assert_eq!(events.len(), 1);
+    assert!(matches!(
+        events[0].event_type,
+        OwnerEventType::MachineJoined
+    ));
+}
+
+#[tokio::test]
+async fn approve_v2_context_mismatch_returns_401_without_mutation() {
+    let (_td, router, log, _broadcaster, person, identity, window, mut authenticator) =
+        router_with_v2_owner(Duration::from_secs(45));
+    let candidate = start_candidate_harness().await;
+    let event = stage_prepared_join_window(&window, &log, &identity, &candidate).await;
+
+    let start_uri = format!(
+        "/api/v1/household/owner-events/{}/approval-v2/start",
+        event.cursor
+    );
+    let start_body =
+        household_rs::cbor::to_canonical_vec(&OwnerApprovalV2StartRequest { version: 1 }).unwrap();
+    let start_auth = pop_header_for(&person, "POST", &start_uri, unix_now(), &start_body);
+    let start_resp = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(start_uri)
+                .header(header::AUTHORIZATION, start_auth)
+                .header(header::CONTENT_TYPE, "application/cbor")
+                .body(Body::from(start_body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(start_resp.status(), StatusCode::OK);
+    let start_bytes = to_bytes(start_resp.into_body(), usize::MAX)
+        .await
+        .unwrap()
+        .to_vec();
+    let start: OwnerApprovalV2StartResponse =
+        household_rs::cbor::from_canonical_slice(&start_bytes).unwrap();
+    let assertion = authenticator
+        .do_authentication(
+            Url::parse("https://alpha.example.test").unwrap(),
+            start.options,
+        )
+        .unwrap();
+    let mut tampered_context = start.context;
+    tampered_context.addr = Some("198.51.100.10:8091".to_string());
+    let approval = approval_v2_from_assertion(tampered_context, &assertion);
+    let finish_body = household_rs::cbor::to_canonical_vec(&OwnerApprovalV2FinishBody {
+        version: 1,
+        challenge_id: start.challenge_id,
+        approval,
+    })
+    .unwrap();
+    let approve_uri = format!("/api/v1/household/owner-events/{}/approve", event.cursor);
+    let finish_auth = pop_header_for(&person, "POST", &approve_uri, unix_now(), &finish_body);
+    let finish_resp = router
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(approve_uri)
+                .header(header::AUTHORIZATION, finish_auth)
+                .header(header::CONTENT_TYPE, "application/cbor")
+                .body(Body::from(finish_body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = finish_resp.status();
+    let finish_bytes = to_bytes(finish_resp.into_body(), usize::MAX)
+        .await
+        .unwrap()
+        .to_vec();
+
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    let parsed: GenericUnauth = household_rs::cbor::from_canonical_slice(&finish_bytes).unwrap();
+    assert_eq!(parsed.error, "unauthenticated");
+    assert_eq!(
+        window.snapshot().await.state,
+        PairMachineState::AwaitingOwner
+    );
+    assert!(log.read_since(event.cursor).unwrap().is_empty());
 }
 
 #[tokio::test]
