@@ -150,7 +150,7 @@ if [ ! -s "$TARGETS_FILE" ]; then
     exit 1
 fi
 
-echo "[backfill] repo: $THEYOS_DIR"
+echo "[backfill] repo: current checkout"
 echo "[backfill] arch: $ARCH"
 echo "[backfill] claws: $(tr '\n' ' ' < "$TARGETS_FILE" | sed 's/[[:space:]]*$//')"
 if [ "$DRY_RUN" = true ]; then
@@ -193,16 +193,26 @@ while IFS= read -r claw; do
             failed=1
             continue
         fi
-        run_imagebuilder verify-manifest-signature "$manifest" --signature "$signature" || failed=1
+        (cd "$THEYOS_DIR" && run_imagebuilder verify-manifest-signature "$rel_manifest" --signature "$rel_signature") || failed=1
         continue
     fi
 
     echo "[backfill] signing $rel_manifest"
-    run_imagebuilder sign-manifest "$manifest" \
-        --key-id "$ARTIFACT_KEY_ID" \
-        --signer-cmd "$ARTIFACT_SIGNER_CMD" \
-        --output "$signature"
-    run_imagebuilder verify-manifest-signature "$manifest" --signature "$signature"
+    tmp_signature="$signature.tmp.$$"
+    rel_tmp_signature="$rel_signature.tmp.$$"
+    rm -f "$tmp_signature"
+    if (cd "$THEYOS_DIR" && \
+        run_imagebuilder sign-manifest "$rel_manifest" \
+            --key-id "$ARTIFACT_KEY_ID" \
+            --signer-cmd "$ARTIFACT_SIGNER_CMD" \
+            --output "$rel_tmp_signature" && \
+        run_imagebuilder verify-manifest-signature "$rel_manifest" --signature "$rel_tmp_signature"); then
+        mv "$tmp_signature" "$signature"
+    else
+        rm -f "$tmp_signature"
+        failed=1
+        continue
+    fi
     printf '%s\n' "$rel_signature" >> "$WRITTEN_FILE"
     written_count=$((written_count + 1))
 done < "$TARGETS_FILE"
