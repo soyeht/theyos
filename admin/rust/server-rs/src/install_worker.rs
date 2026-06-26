@@ -230,10 +230,7 @@ async fn run_install_claw_prebuilt(state: &SharedState, job: &jobs_rs::Job) -> R
     let claw_for_resolve = claw_name.clone();
     let registry_url_clone = registry_url.clone();
     let manifest = match tokio::task::spawn_blocking(move || {
-        // trust None: production keeps the deferred status quo (no signature
-        // verification) until a real public key + custody/policy exist. The
-        // ArtifactTrustConfig injection lands here once that is available.
-        let resolver = ArtifactResolver::for_install(&registry_url_clone, None);
+        let resolver = ArtifactResolver::production_for_install(&registry_url_clone);
         resolver.resolve(&claw_for_resolve)
     })
     .await

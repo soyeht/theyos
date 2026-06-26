@@ -127,10 +127,11 @@ every prebuilt install. Order:
        downloads each live `latest.json` and `latest.json.sig.json` pair from
        the registry URL and verifies the exact served bytes against the
        production public pin.
-    3. [done] Pin the public key + key_id in the client keyring, NOT yet enforced
-       (the resolver still passes no trust in production).
-    4. [code] Hard-cut: flip the resolver to Required for the prod registry host.
-       Only after step 2 is fully pushed and verified.
+    3. [done] Pin the public key + key_id in the client keyring.
+    4. [code] Hard-cut: wire the install resolver to
+       `ArtifactTrustConfig::production_for_install()`, making remote registries
+       Required and loopback/local explicit dev/test. Merge/deploy only after
+       step 2 is fully pushed and verified.
 
 A downgrade lever (revert step 4) must stay available until the signed registry
 is proven stable in production.
@@ -155,9 +156,11 @@ DONE and pushed:
   signer.
 - `imagebuilder verify-manifest-signature` - verifies `latest.json` +
   `latest.json.sig.json` against the production pin.
-- `server-rs/src/artifact_resolver.rs` - verify-before-parse + the install-path
-  seam `ArtifactResolver::for_install`. Production passes no trust, so signatures
-  are NOT yet enforced (deferred status quo).
+- `server-rs/src/artifact_resolver.rs` - verify-before-parse, the
+  `ArtifactResolver::for_install` seam, and the hard-cut install policy
+  `ArtifactTrustConfig::production_for_install()`. After this hard-cut is
+  deployed, remote registries require `latest.json.sig.json`; loopback/local
+  registries remain explicit dev/test exceptions.
 - `scripts/sign_artifact_manifest_p256.py` - builder-machine signer wrapper.
 - `scripts/publish-claw-artifact.sh` - signs and verifies manifests before
   upload/commit.
@@ -168,5 +171,6 @@ DONE and pushed:
 - `scripts/verify-artifact-manifest-signature-urls.sh` - verifies the pushed
   raw registry bytes before the Required hard-cut.
 
-PENDING (in order): the operator backfill of the 8 manifests; the Required
-hard-cut after the signed registry is pushed and verified.
+PENDING (in order): operator backfill of the 8 manifests, raw URL verification,
+Linux/CI compile verification of the install-worker call site, and deployment of
+the Required hard-cut after the signed registry is proven.

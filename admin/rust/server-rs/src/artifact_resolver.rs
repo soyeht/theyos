@@ -13,7 +13,7 @@ use std::time::Duration;
 
 use core_rs::artifact_meta;
 use core_rs::artifact_registry::{ArtifactManifest, host_arch};
-use core_rs::artifact_trust::{ArtifactSignatureKeyring, ArtifactTrustMode};
+use core_rs::artifact_trust::{ArtifactSignatureKeyring, ArtifactTrustMode, production_keyring};
 
 // ── Error ───────────────────────────────────────────────────────────────────
 
@@ -51,9 +51,9 @@ const MAX_REGISTRY_BODY_BYTES: u64 = 4 * 1024 * 1024;
 /// Trust configuration for verifying an artifact manifest's detached signature
 /// during resolution.
 ///
-/// Supplied by the caller. A real production keyring is wired in a later slice,
-/// once a production public key exists; until then [`ArtifactResolver::new`]
-/// configures no trust at all (the deferred status quo, not a configured
+/// Supplied by the caller. Production install uses
+/// [`ArtifactTrustConfig::production_for_install`]. [`ArtifactResolver::new`]
+/// configures no trust at all for explicit no-trust callers (not a configured
 /// "unsigned mode"). When a config is present, a remote registry **requires** a
 /// valid signature; `allow_unsigned_loopback` is the only relaxation and applies
 /// strictly to a loopback/local host.
@@ -71,6 +71,17 @@ impl ArtifactTrustConfig {
             keyring,
             allow_unsigned_loopback: false,
         }
+    }
+
+    /// Production install trust for the P0.1 hard-cut.
+    ///
+    /// Remote registries and mirrors require a valid signature from the pinned
+    /// production keyring. A loopback/local registry may omit signatures because
+    /// selecting a loopback registry is an explicit dev/test override, not a
+    /// remote trust root.
+    #[must_use]
+    pub fn production_for_install() -> Self {
+        Self::new(production_keyring()).allow_unsigned_loopback(true)
     }
 
     /// Permit an unsigned manifest, but ONLY when the registry host is strictly
@@ -142,9 +153,10 @@ enum FetchOutcome {
 
 /// Resolves artifact manifests from the registry.
 ///
-/// `trust` is `None` for [`ArtifactResolver::new`] - the deferred status quo
-/// (fetch + parse, no verification) that predates a production public key, NOT a
-/// configured "unsigned mode". When an [`ArtifactTrustConfig`] is supplied via
+/// `trust` is `None` for [`ArtifactResolver::new`] - fetch + parse with no
+/// signature verification, NOT a configured "unsigned mode". Production install
+/// callers should use [`ArtifactResolver::for_install`] with an explicit
+/// [`ArtifactTrustConfig`]. When an [`ArtifactTrustConfig`] is supplied via
 /// [`ArtifactResolver::with_trust`], the resolver verifies the manifest's
 /// detached signature before parsing it.
 pub struct ArtifactResolver {
@@ -157,10 +169,10 @@ pub struct ArtifactResolver {
 impl ArtifactResolver {
     /// Create a resolver with NO signature trust configured.
     ///
-    /// This preserves the existing behavior (fetch + parse, no verification) and
-    /// is the deferred status quo until a production public key exists; it is not
-    /// signed-artifact enforcement. Use [`ArtifactResolver::with_trust`] to verify
-    /// signatures.
+    /// This preserves fetch + parse with no verification for explicit no-trust
+    /// callers such as focused tests or local tooling; it is not signed-artifact
+    /// enforcement. Production install callers use [`ArtifactResolver::for_install`]
+    /// with [`ArtifactTrustConfig::production_for_install`].
     ///
     /// `registry_url` is the base URL of the artifact registry (no trailing slash).
     #[must_use]
@@ -181,21 +193,31 @@ impl ArtifactResolver {
     /// Build a resolver for the install/consumption path, honoring an explicitly
     /// injected trust config.
     ///
-    /// `trust` is `None` in production today - no production public key exists, so
-    /// the install path keeps the deferred status quo (no verification). A caller
-    /// or future config supplies a real [`ArtifactTrustConfig`] once a production
-    /// key, custody, and policy exist; this associated fn is the single seam where
-    /// that injection lands. Tests inject a test-only keyring to prove the
-    /// consumption path end-to-end. `None` is the deferred status quo (no
-    /// verification); `Some(trust)`, including an empty keyring, activates
-    /// verification and fails closed until real key pins exist - an empty keyring
-    /// is not a production config.
+    /// The production install path passes
+    /// [`ArtifactTrustConfig::production_for_install`], making remote registries
+    /// fail closed unless a valid detached signature verifies against the pinned
+    /// production key. Tests and local tooling may still pass `None` to preserve
+    /// explicit no-trust behavior. `Some(trust)`, including an empty keyring,
+    /// activates verification and fails closed until real key pins exist - an
+    /// empty keyring is not a production config.
     #[must_use]
     pub fn for_install(registry_url: &str, trust: Option<ArtifactTrustConfig>) -> Self {
         match trust {
             Some(trust) => Self::with_trust(registry_url, trust),
             None => Self::new(registry_url),
         }
+    }
+
+    /// Build the production install resolver.
+    ///
+    /// This constructor is compiled on every host platform so the hard-cut trust
+    /// wiring is type-checked even when the Linux prebuilt install worker is not.
+    #[must_use]
+    pub fn production_for_install(registry_url: &str) -> Self {
+        Self::for_install(
+            registry_url,
+            Some(ArtifactTrustConfig::production_for_install()),
+        )
     }
 
     fn build(registry_url: &str, trust: Option<ArtifactTrustConfig>) -> Self {
@@ -729,6 +751,51 @@ mod tests {
     }
 
     #[test]
+    fn production_install_trust_requires_remote_and_allows_loopback_dev() {
+        let cfg = ArtifactTrustConfig::production_for_install();
+        let accepted = cfg.keyring.accepted_keys();
+
+        assert_eq!(accepted.len(), 1);
+        assert_eq!(
+            accepted[0].key_id,
+            core_rs::artifact_trust::PRODUCTION_ARTIFACT_KEY_ID
+        );
+        assert_eq!(
+            cfg.mode_for(core_rs::constants::ARTIFACT_REGISTRY_DEFAULT_URL),
+            ArtifactTrustMode::Required
+        );
+        assert_eq!(
+            cfg.mode_for("https://mirror.example.test/artifacts"),
+            ArtifactTrustMode::Required
+        );
+        assert_eq!(
+            cfg.mode_for("http://127.0.0.1:8080"),
+            ArtifactTrustMode::OptionalIfAbsent
+        );
+    }
+
+    #[test]
+    fn production_install_resolver_constructor_wires_required_remote_trust() {
+        let resolver = ArtifactResolver::production_for_install(
+            core_rs::constants::ARTIFACT_REGISTRY_DEFAULT_URL,
+        );
+        let trust = resolver
+            .trust
+            .as_ref()
+            .expect("production trust configured");
+
+        assert_eq!(
+            resolver.registry_url,
+            core_rs::constants::ARTIFACT_REGISTRY_DEFAULT_URL
+        );
+        assert_eq!(resolver.arch, core_rs::artifact_registry::host_arch());
+        assert_eq!(
+            trust.mode_for(core_rs::constants::ARTIFACT_REGISTRY_DEFAULT_URL),
+            ArtifactTrustMode::Required
+        );
+    }
+
+    #[test]
     fn resolve_required_accepts_valid_signature() {
         let manifest = test_manifest_bytes();
         let sig = sign(7, SIGNER_KEY_ID, &manifest);
@@ -911,7 +978,8 @@ mod tests {
     }
 
     // P0.1-E: the install/consumption seam (ArtifactResolver::for_install) carries
-    // an injected trust config through to verification. Production passes None.
+    // an injected trust config through to verification. Explicit `None` remains
+    // the no-trust test/local mode.
 
     #[test]
     fn for_install_with_trust_verifies_valid_signed_consumption() {
@@ -1000,8 +1068,9 @@ mod tests {
 
     #[test]
     fn for_install_none_is_deferred_status_quo() {
-        // Production today: None means no verification - the install path resolves
-        // unsigned exactly as ArtifactResolver::new, even where a .sig.json errors.
+        // Explicit no-trust callers may still pass None: it means no
+        // verification and resolves unsigned exactly as ArtifactResolver::new,
+        // even where a .sig.json errors.
         let manifest = test_manifest_bytes();
         let (base_url, _l) = serve_manifest_sig_status(manifest, 500);
         let r = ArtifactResolver::for_install(&base_url, None);
