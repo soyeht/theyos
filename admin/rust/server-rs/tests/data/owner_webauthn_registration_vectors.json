@@ -3,13 +3,18 @@
   "version": 1,
   "about": [
     "Cross-language golden vectors for owner passkey registration wire CBOR.",
+    "StartRequest vectors pin the canonical CBOR body signed by Soyeht-PoP.",
     "StartResponse vectors pin Swift decode of webauthn-rs CreationChallengeResponse.",
-    "FinishRequest vectors pin Swift canonical-CBOR encode before server byte-equality checks."
+    "FinishRequest vectors pin Swift canonical-CBOR encode before server byte-equality checks.",
+    "FinishResponse vectors pin Swift decode of the successful registration response.",
+    "RegistrationReject vectors pin the anti-oracle generic failure envelope."
   ],
   "format": {
     "base64_url_safe_data": "Base64UrlSafeData serializes as base64url text, even in CBOR; it accepts byte strings on decode but canonical re-encode emits text.",
     "canonical_cbor": "RFC 8949 deterministic map encoding via household_rs::cbor.",
     "finish_request_strictness": "The server decodes FinishRequest, re-encodes canonical CBOR, and rejects if bytes differ.",
+    "finish_response_credential_id": "FinishResponse.credential_id is serde_bytes/ByteBuf and serializes as a CBOR byte string, not base64url text.",
+    "registration_reject": "Registration start/finish failures are intentionally anti-oracle: HTTP 401 with body {v:1,error:\"unauthenticated\"}; internal reasons are tracing-only.",
     "finish_traps": [
       "RegisterPublicKeyCredential.response.transports None is encoded as null because the field has no skip_serializing_if.",
       "RegisterPublicKeyCredential.extensions is always present; the default value encodes as an empty map."
@@ -17,6 +22,15 @@
     "webauthn_keys": "Embedded webauthn-rs-proto fields use their serde wire names, mostly camelCase.",
     "wrapper_keys": "Soyeht wrapper fields use snake_case except version renamed to v."
   },
+  "start_requests": [
+    {
+      "id": "start-request-v1",
+      "input": {
+        "v": 1
+      },
+      "canonical_cbor_hex": "a1617601"
+    }
+  ],
   "start_responses": [
     {
       "id": "start-minimal",
@@ -181,6 +195,26 @@
         "v": 1
       },
       "canonical_cbor_hex": "a36176016a63726564656e7469616ca56269646b4149474341494f4568514164747970656a7075626c69632d6b65796572617749646b4149474341494f4568514168726573706f6e7365a36a7472616e73706f727473f66e636c69656e74446174614a534f4e789f65794a306558426c496a6f6964325669595856306147347559334a6c5958526c49697769593268686247786c626d646c496a6f695155644761554648546d7461555545694c434a76636d6c6e615734694f694a6f64485277637a6f764c32687664584e6c614739735a43356c654746746347786c4c6e526c633351694c434a756233526c496a6f69524739756279426364544177597a467363476868496e30716174746573746174696f6e4f626a65637478186f5752756233526c616b5276626d386777344673634768686a657874656e73696f6e73a06c6368616c6c656e67655f696478203636363636363636363636363636363636363636363636363636363636363636"
+    }
+  ],
+  "finish_responses": [
+    {
+      "id": "finish-response-byte-string-credential-id",
+      "credential_id_hex": "00010280ff7f",
+      "active_credential_count": 1,
+      "canonical_cbor_hex": "a36176016d63726564656e7469616c5f69644600010280ff7f776163746976655f63726564656e7469616c5f636f756e7401"
+    }
+  ],
+  "registration_rejects": [
+    {
+      "id": "registration-reject-unauthenticated",
+      "status": 401,
+      "content_type": "application/cbor",
+      "input": {
+        "v": 1,
+        "error": "unauthenticated"
+      },
+      "canonical_cbor_hex": "a2617601656572726f726f756e61757468656e74696361746564"
     }
   ]
 }

@@ -1,7 +1,15 @@
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD as B64URL};
 use serde::{Deserialize, Serialize};
+use serde_bytes::ByteBuf;
 use serde_json::Value;
 use webauthn_rs::prelude::{CreationChallengeResponse, RegisterPublicKeyCredential};
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OwnerWebauthnRegistrationStartRequest {
+    #[serde(rename = "v")]
+    version: u8,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -21,12 +29,32 @@ struct OwnerWebauthnRegistrationFinishRequest {
     credential: RegisterPublicKeyCredential,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OwnerWebauthnRegistrationFinishResponse {
+    #[serde(rename = "v")]
+    version: u8,
+    credential_id: ByteBuf,
+    active_credential_count: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct GenericError {
+    #[serde(rename = "v")]
+    version: u8,
+    error: String,
+}
+
 #[derive(Debug, Deserialize)]
 struct Fixture {
     contract: String,
     version: u8,
+    start_requests: Vec<VectorCase>,
     start_responses: Vec<VectorCase>,
     finish_requests: Vec<VectorCase>,
+    finish_responses: Vec<FinishResponseVector>,
+    registration_rejects: Vec<RejectVector>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -34,6 +62,38 @@ struct VectorCase {
     id: String,
     input: Value,
     canonical_cbor_hex: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct FinishResponseVector {
+    id: String,
+    credential_id_hex: String,
+    active_credential_count: u64,
+    canonical_cbor_hex: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct RejectVector {
+    id: String,
+    status: u16,
+    content_type: String,
+    input: Value,
+    canonical_cbor_hex: String,
+}
+
+#[test]
+fn owner_webauthn_registration_start_request_vectors_are_canonical() {
+    let fixture = load_fixture();
+    assert_eq!(fixture.start_requests.len(), 1);
+
+    for vector in &fixture.start_requests {
+        let typed: OwnerWebauthnRegistrationStartRequest =
+            serde_json::from_value(vector.input.clone()).unwrap();
+        assert_canonical_round_trip(vector, &typed);
+    }
+
+    let start = case_by_id(&fixture.start_requests, "start-request-v1");
+    assert_eq!(start.input.get("v").and_then(Value::as_u64), Some(1));
 }
 
 #[test]
@@ -138,6 +198,84 @@ fn owner_webauthn_registration_finish_request_vectors_are_canonical() {
             .pointer("/credential/response/transports/1")
             .and_then(Value::as_str),
         Some("hybrid"),
+    );
+}
+
+#[test]
+fn owner_webauthn_registration_finish_response_vectors_are_canonical() {
+    let fixture = load_fixture();
+    assert_eq!(fixture.finish_responses.len(), 1);
+
+    for vector in &fixture.finish_responses {
+        let credential_id = hex::decode(&vector.credential_id_hex).unwrap();
+        let typed = OwnerWebauthnRegistrationFinishResponse {
+            version: 1,
+            credential_id: ByteBuf::from(credential_id.clone()),
+            active_credential_count: vector.active_credential_count,
+        };
+        let expected = hex::decode(&vector.canonical_cbor_hex).unwrap();
+        let encoded = household_rs::cbor::to_canonical_vec(&typed).unwrap();
+        assert_eq!(
+            encoded, expected,
+            "{} fixture input must encode to the pinned canonical CBOR bytes",
+            vector.id,
+        );
+
+        let decoded: OwnerWebauthnRegistrationFinishResponse =
+            household_rs::cbor::from_canonical_slice(&expected).unwrap();
+        assert_eq!(decoded.version, 1);
+        assert_eq!(decoded.credential_id.as_ref(), credential_id.as_slice());
+        assert_eq!(
+            decoded.active_credential_count,
+            vector.active_credential_count
+        );
+        assert_eq!(
+            household_rs::cbor::to_canonical_vec(&decoded).unwrap(),
+            expected,
+            "{} pinned bytes must be a canonical decode/re-encode fixed point",
+            vector.id,
+        );
+
+        assert!(
+            credential_id.len() <= 23,
+            "fixture assertion only covers single-byte CBOR byte-string lengths"
+        );
+        let credential_id_byte_string_hex = format!(
+            "6d63726564656e7469616c5f6964{:02x}{}",
+            0x40 + credential_id.len(),
+            vector.credential_id_hex
+        );
+        assert!(
+            vector
+                .canonical_cbor_hex
+                .contains(&credential_id_byte_string_hex),
+            "{} should pin credential_id as a CBOR byte string, not base64url text",
+            vector.id,
+        );
+    }
+}
+
+#[test]
+fn owner_webauthn_registration_reject_vectors_are_canonical() {
+    let fixture = load_fixture();
+    assert_eq!(fixture.registration_rejects.len(), 1);
+
+    let reject = &fixture.registration_rejects[0];
+    assert_eq!(reject.id, "registration-reject-unauthenticated");
+    assert_eq!(reject.status, 401);
+    assert_eq!(reject.content_type, "application/cbor");
+    let typed: GenericError = serde_json::from_value(reject.input.clone()).unwrap();
+    assert_eq!(typed.version, 1);
+    assert_eq!(typed.error, "unauthenticated");
+
+    let expected = hex::decode(&reject.canonical_cbor_hex).unwrap();
+    let encoded = household_rs::cbor::to_canonical_vec(&typed).unwrap();
+    assert_eq!(encoded, expected);
+    let decoded: GenericError = household_rs::cbor::from_canonical_slice(&expected).unwrap();
+    assert_eq!(decoded.error, "unauthenticated");
+    assert_eq!(
+        household_rs::cbor::to_canonical_vec(&decoded).unwrap(),
+        expected
     );
 }
 
