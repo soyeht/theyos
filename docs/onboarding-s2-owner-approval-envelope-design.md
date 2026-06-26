@@ -1,10 +1,25 @@
 # Onboarding S2: Owner Approval Envelope Design
 
-Status: design note merged after Caio GO. No runtime behavior is changed by
-this document.
+Status: S1/S2 inert primitives are merged after Caio GO. No endpoint
+enforcement is enabled by this document.
 
 Base: S1 WebAuthn RP core is merged; S2 runtime primitives are separate from
 the later endpoint enforcement switch.
+
+Implemented inert pieces:
+
+- WebAuthn RP core with server-side challenge storage and tests.
+- `OwnerApprovalContextV2` canonical CBOR encoding and challenge digest.
+- Rust<->Swift cross-language fixture for canonical bytes and challenge digest.
+- Trusted-state builder for pair-machine approval context.
+- `OwnerApprovalV2` body shape and byte-equality guard against trusted context.
+
+Held pieces:
+
+- Handler enforcement and any behavior switch remain gated on design review and
+  explicit Caio approval.
+- Bootstrap/owner-operation enforcement remains sequenced after S3 enrollment
+  UX and CLI/installer migration.
 
 ## Goal
 
