@@ -60,6 +60,7 @@ pub mod machine_cert;
 pub mod member_identity;
 pub mod owner_auth;
 pub mod owner_events;
+pub mod owner_webauthn;
 pub mod pair_device;
 pub mod pair_machine;
 pub mod person_cert;
