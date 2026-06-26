@@ -247,6 +247,11 @@ pub fn reassert_pair_machine_approval_context_against_live_window(
             "live window cursor changed",
         ));
     }
+    if live_snapshot.approval_claim.is_some() {
+        return Err(OwnerApprovalV2Error::TrustedState(
+            "live window already claimed",
+        ));
+    }
     if live_snapshot.expiry != approved_context.ttl_unix {
         return Err(OwnerApprovalV2Error::TrustedState(
             "live window ttl changed",
@@ -302,6 +307,9 @@ fn pair_machine_window_data(
         || snapshot.owner_event_cursor != Some(cursor)
     {
         return Err("window_cursor_mismatch");
+    }
+    if snapshot.approval_claim.is_some() {
+        return Err("window_already_claimed");
     }
     let active_m_pub = snapshot.m_pub.clone().ok_or("window_missing_m_pub")?;
     let cached_join_request = snapshot
@@ -1531,6 +1539,20 @@ pub async fn owner_approve_handler(
             );
             return unauthenticated_response();
         }
+        let mut claim_id = [0_u8; 32];
+        OsRng.fill_bytes(&mut claim_id);
+        if let Err(e) = state
+            .window
+            .claim_owner_approval(cursor, claim_id, now)
+            .await
+        {
+            tracing::warn!(
+                stage = "owner_events.approve.rejected",
+                reason = "approval_v2_claim_failed",
+                error = %e,
+            );
+            return unauthenticated_response();
+        }
         window_data = live_window_data;
         Some(guard)
     } else {
@@ -1672,51 +1694,6 @@ pub async fn owner_approve_handler(
         .addr_hint
         .clone()
         .unwrap_or_else(|| window_data.join_request.addr.clone());
-    // R7.2/R7.3: write the recovery-driver intent pin BEFORE invoking
-    // `finalize_with_m2`. The marker says "M1 has launched a join
-    // ceremony with this candidate; if the boot path observes a
-    // pre-Shamir record AND this marker is durable, recovery MUST
-    // preserve `.staged` and dispatch T073/T074's two-state probe
-    // instead of rolling back". Writing it AFTER `finalize_with_m2`
-    // (the previous R6.1 placement) leaves two split-brain windows:
-    //   (a) crash between `finalize_with_m2 Ok` and the marker
-    //       fsync+rename becoming durable;
-    //   (b) FinalizeAck network response lost in flight (M2's
-    //       `staged.commit()` Ok'd, packet dropped) — the Err arm
-    //       below would have returned 401 with no marker on disk.
-    // Both leave M2 committed, M1 rolled back.
-    //
-    // The marker is "intent" not "ack-success": it is set before the
-    // irreversible action (M2's commit). Definitive pre-commit rejects
-    // clear it and roll back; ambiguous transport/ack failures leave
-    // it with the `.staged` set so recovery can probe M2 instead of
-    // destroying evidence. The `phase3_finalize_ack.marker_write_failed`
-    // branch surfaces 401 + ABORTS the ceremony before
-    // `finalize_with_m2` runs, so a marker-write failure cannot
-    // create a half-committed state on M2.
-    let candidate_m_id_str = txn.candidate_cert().m_id.to_string();
-    if let Err(e) = household_rs::storage::write_phase3_finalize_ack_marker(
-        &state.state_dir,
-        &candidate_m_id_str,
-    ) {
-        tracing::warn!(
-            stage = "owner_events.approve.rejected",
-            reason = "phase3_finalize_ack_marker_write_failed",
-            error = %e,
-            hint = "refusing to launch finalize_with_m2 without durable intent pin",
-        );
-        // The txn has not contacted M2 yet; explicit rollback unlinks
-        // the staged set cleanly with no residue.
-        txn.rollback();
-        abort_with_cancel_event(
-            &state,
-            &identity,
-            window_data.active_m_pub.clone(),
-            "prepare_failed",
-        )
-        .await;
-        return unauthenticated_response();
-    }
     // T073: persist the JoinResponse bytes we are about to POST so
     // boot-time `recover_phase3_ceremony` can re-POST them after a
     // crash. `HH_priv` is destroyed during commit, so the
@@ -1784,7 +1761,49 @@ pub async fn owner_approve_handler(
             error = %e,
             hint = "refusing to launch finalize_with_m2 without durable JoinResponse copy",
         );
-        let _ = household_rs::storage::clear_phase3_finalize_ack_marker(&state.state_dir);
+        txn.rollback();
+        abort_with_cancel_event(
+            &state,
+            &identity,
+            window_data.active_m_pub.clone(),
+            "prepare_failed",
+        )
+        .await;
+        return unauthenticated_response();
+    }
+    // R7.2/R7.3: write the recovery-driver intent pin BEFORE invoking
+    // `finalize_with_m2`. The marker says "M1 has launched a join
+    // ceremony with this candidate; if the boot path observes a
+    // pre-Shamir record AND this marker is durable, recovery MUST
+    // preserve `.staged` and dispatch T073/T074's two-state probe
+    // instead of rolling back". Writing it AFTER `finalize_with_m2`
+    // (the previous R6.1 placement) leaves two split-brain windows:
+    //   (a) crash between `finalize_with_m2 Ok` and the marker
+    //       fsync+rename becoming durable;
+    //   (b) FinalizeAck network response lost in flight (M2's
+    //       `staged.commit()` Ok'd, packet dropped) — the Err arm
+    //       below would have returned 401 with no marker on disk.
+    // Both leave M2 committed, M1 rolled back.
+    //
+    // The pending JoinResponse is durable before the marker, so a boot
+    // that observes the marker also has the bytes needed to re-POST
+    // finalize. A crash before this marker leaves only ordinary staged
+    // files; boot-time recovery rolls them back and reload clears the
+    // owner-approval claim as stale.
+    let candidate_m_id_str = txn.candidate_cert().m_id.to_string();
+    if let Err(e) = household_rs::storage::write_phase3_finalize_ack_marker(
+        &state.state_dir,
+        &candidate_m_id_str,
+    ) {
+        tracing::warn!(
+            stage = "owner_events.approve.rejected",
+            reason = "phase3_finalize_ack_marker_write_failed",
+            error = %e,
+            hint = "refusing to launch finalize_with_m2 without durable intent pin",
+        );
+        // The txn has not contacted M2 yet; explicit rollback unlinks
+        // the staged set cleanly with no residue.
+        let _ = household_rs::storage::clear_phase3_pending_join_response(&state.state_dir);
         txn.rollback();
         abort_with_cancel_event(
             &state,
@@ -2478,7 +2497,9 @@ mod tests {
     use household_rs::ids::{HouseholdId, MachineId};
     use household_rs::machine_cert::PersonId;
     use household_rs::owner_approval_v2::PairMachineApprovalContextInput;
-    use household_rs::pair_machine::{JoinTransport, PAIR_MACHINE_VERSION};
+    use household_rs::pair_machine::{
+        JoinTransport, PAIR_MACHINE_VERSION, PairMachineApprovalClaim,
+    };
 
     fn household_id() -> HouseholdId {
         HouseholdId::parse(format!("hh_{}", "a".repeat(52))).unwrap()
@@ -2526,6 +2547,7 @@ mod tests {
             anchor_secret: None,
             pinned_hh_pub: None,
             pinned_hh_id: None,
+            approval_claim: None,
         }
     }
 
@@ -2619,6 +2641,25 @@ mod tests {
         assert!(matches!(
             err,
             OwnerApprovalV2Error::TrustedState("live window cursor changed")
+        ));
+    }
+
+    #[test]
+    fn pair_machine_reassertion_rejects_claimed_window() {
+        let join_request_bytes = b"neutral canonical join request";
+        let context = approval_context(join_request_bytes);
+        let mut snapshot = live_snapshot(join_request_bytes);
+        snapshot.approval_claim = Some(PairMachineApprovalClaim {
+            claim_id: ByteBuf::from(vec![0xA5; 32]),
+            owner_event_cursor: 7,
+            claimed_at: 1_700,
+        });
+
+        let err = reassert_pair_machine_approval_context_against_live_window(&context, &snapshot)
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            OwnerApprovalV2Error::TrustedState("live window already claimed")
         ));
     }
 }

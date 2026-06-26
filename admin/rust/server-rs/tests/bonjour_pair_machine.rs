@@ -38,6 +38,7 @@ fn machine_snapshot(state: PairMachineState) -> PairMachineWindowSnapshot {
         anchor_secret: None,
         pinned_hh_pub: None,
         pinned_hh_id: None,
+        approval_claim: None,
     }
 }
 

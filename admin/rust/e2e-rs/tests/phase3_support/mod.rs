@@ -127,9 +127,10 @@ impl CandidateHarness {
     /// during M1's finalize POST". After this returns, future POSTs
     /// to `candidate.prepared.addr` get connection-refused; the
     /// candidate's on-disk state at `candidate.dir` is preserved.
-    pub fn stop_server(&mut self) {
+    pub async fn stop_server(&mut self) {
         if let Some(handle) = self.server.take() {
             handle.abort();
+            let _ = handle.await;
         }
     }
 }

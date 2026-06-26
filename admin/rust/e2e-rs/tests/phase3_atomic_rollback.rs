@@ -30,8 +30,8 @@ use axum::http::header;
 use household_rs::KeyBackingPolicy;
 use household_rs::machine_cert::Platform;
 use household_rs::pair_machine::{
-    JoinTransport, PairMachineState, PrepareCandidateOpts, household_root_sole_path,
-    prepare_candidate, shamir_self_shard_path,
+    JoinTransport, PairMachineState, PairMachineWindow, PrepareCandidateOpts,
+    household_root_sole_path, prepare_candidate, shamir_self_shard_path,
 };
 use household_rs::storage::{
     detect_orphan_staged_files, machine_cert_for, phase3_finalize_ack_marker_exists,
@@ -299,9 +299,7 @@ async fn test_m2_disconnect_after_approval_rolls_back() {
     // Stop M2's pre-household HTTP server BEFORE submitting approval —
     // M1's finalize POST in `owner_approve_handler` will hit a
     // connection-refused on the cached candidate addr.
-    candidate.stop_server();
-    // Give the OS a chance to reflect the bound port being released.
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    candidate.stop_server().await;
 
     // Submit owner approval. M1's finalize_with_m2 returns a transport
     // error (ureq connection refused), which `is_ambiguous_finalize_outcome`
@@ -327,6 +325,11 @@ async fn test_m2_disconnect_after_approval_rolls_back() {
         !detect_orphan_staged_files(dir).is_empty(),
         ".staged set must survive ambiguous finalize failure"
     );
+    founder
+        .window
+        .claim_owner_approval(accepted.owner_event_cursor, [0xA5; 32], unix_now())
+        .await
+        .expect("simulate v2 approval claim before crash");
 
     // Now drive boot recovery with a short timeout. M2 is unreachable
     // (server stopped), so both probes fail and recovery rolls back
@@ -347,6 +350,11 @@ async fn test_m2_disconnect_after_approval_rolls_back() {
 
     let m2_id = candidate.prepared.m_id.to_string();
     assert_no_phase3_residue_on_founder(&founder, &m2_id);
+    let recovered_window = PairMachineWindow::with_persistence(founder.dir.path().to_path_buf())
+        .expect("reload recovered founder window");
+    let snapshot = recovered_window.snapshot().await;
+    assert_eq!(snapshot.state, PairMachineState::Aborted);
+    assert!(snapshot.approval_claim.is_none());
 }
 
 // ---------------------------------------------------------------------------
@@ -418,8 +426,7 @@ async fn test_m1_crash_between_step10_and_step11_recovers_to_rollback() {
     let (founder, mut candidate, accepted, _anchor) =
         drive_to_awaiting_owner(Duration::from_secs(300)).await;
 
-    candidate.stop_server();
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    candidate.stop_server().await;
 
     let status = submit_approval(&founder, &candidate, accepted.owner_event_cursor).await;
     assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
@@ -506,6 +513,11 @@ async fn test_m1_crash_between_step11_and_step12_recovers_to_commit() {
     assert!(phase3_finalize_ack_marker_exists(dir));
     assert!(phase3_pending_join_response_exists(dir));
     assert!(!detect_orphan_staged_files(dir).is_empty());
+    founder
+        .window
+        .claim_owner_approval(accepted.owner_event_cursor, [0xA5; 32], unix_now())
+        .await
+        .expect("simulate v2 approval claim before crash");
 
     // M2 has already committed via local/finalize.
     assert_eq!(
@@ -534,6 +546,12 @@ async fn test_m1_crash_between_step11_and_step12_recovers_to_commit() {
 
     let m2_id = candidate.prepared.m_id.to_string();
     assert_rolled_forward_on_founder(&founder, &m2_id);
+    let recovered_window = PairMachineWindow::with_persistence(founder.dir.path().to_path_buf())
+        .expect("reload recovered founder window");
+    let snapshot = recovered_window.snapshot().await;
+    assert_eq!(snapshot.state, PairMachineState::Committed);
+    assert!(snapshot.approval_claim.is_none());
+    assert!(snapshot.cached_response.is_some());
 }
 
 // ---------------------------------------------------------------------------
@@ -663,11 +681,15 @@ async fn test_recovery_timeout_rolls_back_when_m2_permanently_lost() {
     let (founder, mut candidate, accepted, _anchor) =
         drive_to_awaiting_owner(Duration::from_secs(300)).await;
 
-    candidate.stop_server();
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    candidate.stop_server().await;
 
     let status = submit_approval(&founder, &candidate, accepted.owner_event_cursor).await;
     assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+    founder
+        .window
+        .claim_owner_approval(accepted.owner_event_cursor, [0xA5; 32], unix_now())
+        .await
+        .expect("simulate v2 approval claim before crash");
 
     // Use a short test timeout (200ms) — the production constant is
     // 5 minutes (RECOVERY_TIMEOUT), and the regression here is "the
@@ -695,4 +717,9 @@ async fn test_recovery_timeout_rolls_back_when_m2_permanently_lost() {
     // FR-013a: full residue cleanup after timeout rollback.
     let m2_id = candidate.prepared.m_id.to_string();
     assert_no_phase3_residue_on_founder(&founder, &m2_id);
+    let recovered_window = PairMachineWindow::with_persistence(founder.dir.path().to_path_buf())
+        .expect("reload recovered founder window");
+    let snapshot = recovered_window.snapshot().await;
+    assert_eq!(snapshot.state, PairMachineState::Aborted);
+    assert!(snapshot.approval_claim.is_none());
 }

@@ -5,7 +5,7 @@ use std::fs;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Mutex as StdMutex, OnceLock};
 use std::time::Duration;
 
@@ -54,6 +54,7 @@ use server_rs::handlers_pair_machine::{PreHouseholdRouterState, pre_household_ro
 use server_rs::household_state::HouseholdState;
 use tempfile::TempDir;
 use tokio::net::TcpListener;
+use tokio::sync::Notify;
 use tower::ServiceExt;
 use webauthn_authenticator_rs::WebauthnAuthenticator;
 use webauthn_authenticator_rs::softpasskey::SoftPasskey;
@@ -404,6 +405,90 @@ fn approval_v2_from_assertion(
     }
 }
 
+async fn start_approval_v2(
+    router: Router,
+    person: &P256Keypair,
+    cursor: u64,
+) -> OwnerApprovalV2StartResponse {
+    let (status, start_bytes) = post_approval_v2_start(router, person, cursor).await;
+    assert_eq!(status, StatusCode::OK);
+    let start: OwnerApprovalV2StartResponse =
+        household_rs::cbor::from_canonical_slice(&start_bytes).unwrap();
+    assert_eq!(start.version, 1);
+    start
+}
+
+async fn post_approval_v2_start(
+    router: Router,
+    person: &P256Keypair,
+    cursor: u64,
+) -> (StatusCode, Vec<u8>) {
+    let start_uri = format!("/api/v1/household/owner-events/{cursor}/approval-v2/start");
+    let start_body =
+        household_rs::cbor::to_canonical_vec(&OwnerApprovalV2StartRequest { version: 1 }).unwrap();
+    let start_auth = pop_header_for(person, "POST", &start_uri, unix_now(), &start_body);
+    let start_resp = router
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(start_uri)
+                .header(header::AUTHORIZATION, start_auth)
+                .header(header::CONTENT_TYPE, "application/cbor")
+                .body(Body::from(start_body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = start_resp.status();
+    let start_bytes = to_bytes(start_resp.into_body(), usize::MAX)
+        .await
+        .unwrap()
+        .to_vec();
+    (status, start_bytes)
+}
+
+fn approval_v2_finish_body(
+    context: OwnerApprovalContextV2,
+    challenge_id: String,
+    assertion: &PublicKeyCredential,
+) -> Vec<u8> {
+    let approval = approval_v2_from_assertion(context, assertion);
+    household_rs::cbor::to_canonical_vec(&OwnerApprovalV2FinishBody {
+        version: 1,
+        challenge_id,
+        approval,
+    })
+    .unwrap()
+}
+
+async fn post_approve_body(
+    router: Router,
+    person: &P256Keypair,
+    cursor: u64,
+    body: Vec<u8>,
+) -> (StatusCode, Vec<u8>) {
+    let approve_uri = format!("/api/v1/household/owner-events/{cursor}/approve");
+    let finish_auth = pop_header_for(person, "POST", &approve_uri, unix_now(), &body);
+    let resp = router
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(approve_uri)
+                .header(header::AUTHORIZATION, finish_auth)
+                .header(header::CONTENT_TYPE, "application/cbor")
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = resp.status();
+    let bytes = to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap()
+        .to_vec();
+    (status, bytes)
+}
+
 fn owner_auth_with_webauthn_credential(
     identity: &household_rs::LoadedIdentity,
 ) -> (
@@ -446,6 +531,54 @@ fn router_with_v2_owner(
     let td = tempfile::tempdir().unwrap();
     let identity = Arc::new(bootstrap(td.path()));
     let (owner_auth, person, rp, authenticator) = owner_auth_with_webauthn_credential(&identity);
+
+    let anchor_store: Arc<dyn keystore_rs::KeystoreBackend> =
+        Arc::new(FileKeystore::new(td.path(), keystore_rs::SERVICE));
+    verify_or_update_owner_webauthn_authority_anchor(
+        anchor_store.as_ref(),
+        &owner_auth.owner_webauthn,
+        &identity.record,
+        &owner_auth.owner_person_cert,
+        OwnerWebauthnAnchorMode::MigrationDefaultOff,
+    )
+    .unwrap();
+    let policy = OwnerApprovalEnforcementPolicy::default()
+        .with_pair_machine_approve(OwnerOperationEnforcement::V2WhenOwnerHasActiveCredential);
+    let (td, router, log, broadcaster, person, identity, window) =
+        router_from_owner_auth(td, identity, owner_auth, person, timeout, move |state| {
+            state
+                .with_owner_approval_policy(policy)
+                .with_owner_webauthn_rp(rp)
+                .with_owner_webauthn_anchor(anchor_store)
+        });
+    (
+        td,
+        router,
+        log,
+        broadcaster,
+        person,
+        identity,
+        window,
+        authenticator,
+    )
+}
+
+fn router_with_v2_owner_without_hh_priv(
+    timeout: Duration,
+) -> (
+    TempDir,
+    Router,
+    Arc<OwnerEventLog>,
+    OwnerEventsBroadcaster,
+    P256Keypair,
+    Arc<household_rs::LoadedIdentity>,
+    Arc<PairMachineWindow>,
+    WebauthnAuthenticator<SoftPasskey>,
+) {
+    let td = tempfile::tempdir().unwrap();
+    let identity = bootstrap(td.path());
+    let (owner_auth, person, rp, authenticator) = owner_auth_with_webauthn_credential(&identity);
+    let identity = Arc::new(loaded_identity_without_hh_priv(&identity));
 
     let anchor_store: Arc<dyn keystore_rs::KeystoreBackend> =
         Arc::new(FileKeystore::new(td.path(), keystore_rs::SERVICE));
@@ -721,10 +854,43 @@ struct CandidateHarness {
     addr: String,
 }
 
+#[derive(Default)]
+struct BlockingFinalizeGate {
+    calls: AtomicUsize,
+    entered: Notify,
+    release: Notify,
+}
+
+impl BlockingFinalizeGate {
+    async fn wait_for_calls(&self, expected: usize) {
+        loop {
+            if self.calls.load(Ordering::SeqCst) >= expected {
+                return;
+            }
+            self.entered.notified().await;
+        }
+    }
+
+    fn calls(&self) -> usize {
+        self.calls.load(Ordering::SeqCst)
+    }
+
+    fn release_all(&self) {
+        self.release.notify_waiters();
+    }
+}
+
+#[derive(Clone)]
+struct BlockingFinalizeState {
+    inner: PreHouseholdRouterState,
+    gate: Arc<BlockingFinalizeGate>,
+}
+
 #[derive(Clone, Copy)]
 enum CandidateFinalizeMode {
     Normal,
     CommitThenBadAck,
+    RejectFinalize,
 }
 
 async fn start_candidate_harness() -> CandidateHarness {
@@ -732,6 +898,42 @@ async fn start_candidate_harness() -> CandidateHarness {
 }
 
 async fn start_candidate_harness_with_mode(mode: CandidateFinalizeMode) -> CandidateHarness {
+    start_candidate_harness_with_router(|state| match mode {
+        CandidateFinalizeMode::Normal => pre_household_router(state),
+        CandidateFinalizeMode::CommitThenBadAck => Router::new()
+            .route(
+                "/pair-machine/local/finalize",
+                post(commit_then_bad_finalize_ack),
+            )
+            .with_state(state),
+        CandidateFinalizeMode::RejectFinalize => Router::new()
+            .route("/pair-machine/local/finalize", post(reject_finalize))
+            .with_state(state),
+    })
+    .await
+}
+
+async fn start_blocking_candidate_harness() -> (CandidateHarness, Arc<BlockingFinalizeGate>) {
+    let gate = Arc::new(BlockingFinalizeGate::default());
+    let gate_for_router = Arc::clone(&gate);
+    let candidate = start_candidate_harness_with_router(move |state| {
+        Router::new()
+            .route(
+                "/pair-machine/local/finalize",
+                post(blocking_finalize_handler),
+            )
+            .with_state(BlockingFinalizeState {
+                inner: state,
+                gate: Arc::clone(&gate_for_router),
+            })
+    })
+    .await;
+    (candidate, gate)
+}
+
+async fn start_candidate_harness_with_router(
+    router_for_state: impl FnOnce(PreHouseholdRouterState) -> Router,
+) -> CandidateHarness {
     let td = tempfile::tempdir().unwrap();
     let window = Arc::new(PairMachineWindow::with_persistence(td.path().to_path_buf()).unwrap());
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -757,15 +959,7 @@ async fn start_candidate_harness_with_mode(mode: CandidateFinalizeMode) -> Candi
         key_policy: KeyBackingPolicy::ForceSoftware,
         bootstrap: None,
     };
-    let router = match mode {
-        CandidateFinalizeMode::Normal => pre_household_router(state),
-        CandidateFinalizeMode::CommitThenBadAck => Router::new()
-            .route(
-                "/pair-machine/local/finalize",
-                post(commit_then_bad_finalize_ack),
-            )
-            .with_state(state),
-    };
+    let router = router_for_state(state);
     tokio::spawn(async move {
         axum::serve(listener, router).await.unwrap();
     });
@@ -775,6 +969,16 @@ async fn start_candidate_harness_with_mode(mode: CandidateFinalizeMode) -> Candi
         window,
         addr,
     }
+}
+
+async fn blocking_finalize_handler(
+    State(state): State<BlockingFinalizeState>,
+    body: Bytes,
+) -> Response {
+    state.gate.calls.fetch_add(1, Ordering::SeqCst);
+    state.gate.entered.notify_waiters();
+    state.gate.release.notified().await;
+    server_rs::handlers_pair_machine::local_finalize_handler(State(state.inner), body).await
 }
 
 async fn commit_then_bad_finalize_ack(
@@ -787,6 +991,10 @@ async fn commit_then_bad_finalize_ack(
         return committed;
     }
     (StatusCode::OK, b"not-cbor".to_vec()).into_response()
+}
+
+async fn reject_finalize() -> Response {
+    StatusCode::UNAUTHORIZED.into_response()
 }
 
 async fn stage_prepared_join_window(
@@ -1761,6 +1969,200 @@ async fn approve_v2_happy_path_drives_commit() {
         events[0].event_type,
         OwnerEventType::MachineJoined
     ));
+}
+
+#[tokio::test]
+async fn approve_v2_double_prepare_claim_rejects_second_valid_approval() {
+    let (td, router, log, _broadcaster, person, identity, window, mut authenticator) =
+        router_with_v2_owner(Duration::from_secs(45));
+    fs::write(household_root_sole_path(td.path()), b"fake-sole-shard").unwrap();
+    let (candidate, finalize_gate) = start_blocking_candidate_harness().await;
+    let event = stage_prepared_join_window(&window, &log, &identity, &candidate).await;
+    candidate
+        .window
+        .pin_household_anchor(
+            identity.record.hh_id.as_str().to_string(),
+            *identity.record.hh_pub.as_bytes(),
+        )
+        .await
+        .unwrap();
+
+    let first_start = start_approval_v2(router.clone(), &person, event.cursor).await;
+    let second_start = start_approval_v2(router.clone(), &person, event.cursor).await;
+    let first_context = first_start.context;
+    let first_challenge_id = first_start.challenge_id;
+    let first_assertion = authenticator
+        .do_authentication(
+            Url::parse("https://alpha.example.test").unwrap(),
+            first_start.options,
+        )
+        .unwrap();
+    let second_context = second_start.context;
+    let second_challenge_id = second_start.challenge_id;
+    let second_assertion = authenticator
+        .do_authentication(
+            Url::parse("https://alpha.example.test").unwrap(),
+            second_start.options,
+        )
+        .unwrap();
+    let first_body = approval_v2_finish_body(first_context, first_challenge_id, &first_assertion);
+    let second_body =
+        approval_v2_finish_body(second_context, second_challenge_id, &second_assertion);
+
+    let first_router = router.clone();
+    let first_cursor = event.cursor;
+    let first_uri = format!("/api/v1/household/owner-events/{first_cursor}/approve");
+    let first_auth = pop_header_for(&person, "POST", &first_uri, unix_now(), &first_body);
+    let first_request = Request::builder()
+        .method("POST")
+        .uri(first_uri)
+        .header(header::AUTHORIZATION, first_auth)
+        .header(header::CONTENT_TYPE, "application/cbor")
+        .body(Body::from(first_body))
+        .unwrap();
+    let first_task = tokio::spawn(async move {
+        let resp = first_router.oneshot(first_request).await.unwrap();
+        let status = resp.status();
+        let bytes = to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .to_vec();
+        (status, bytes)
+    });
+    finalize_gate.wait_for_calls(1).await;
+    assert_eq!(finalize_gate.calls(), 1);
+
+    let (claimed_start_status, claimed_start_bytes) =
+        post_approval_v2_start(router.clone(), &person, event.cursor).await;
+    assert_generic_unauth(claimed_start_status, &claimed_start_bytes);
+
+    let (second_status, second_bytes) = tokio::time::timeout(
+        Duration::from_secs(5),
+        post_approve_body(router.clone(), &person, event.cursor, second_body),
+    )
+    .await
+    .expect("claimed second approval must reject before finalize");
+    assert_generic_unauth(second_status, &second_bytes);
+    assert_eq!(
+        finalize_gate.calls(),
+        1,
+        "second valid approval must not reach prepare/finalize"
+    );
+
+    finalize_gate.release_all();
+    let (first_status, first_bytes) = first_task.await.unwrap();
+    assert_eq!(first_status, StatusCode::OK);
+    let ack: OwnerApprovalAck = household_rs::cbor::from_canonical_slice(&first_bytes).unwrap();
+    assert_eq!(ack.version, 1);
+    assert_eq!(window.snapshot().await.state, PairMachineState::Committed);
+    assert!(window.snapshot().await.approval_claim.is_none());
+    assert_eq!(
+        candidate.window.snapshot().await.state,
+        PairMachineState::Committed
+    );
+    let events = log.read_since(event.cursor).unwrap();
+    assert_eq!(events.len(), 1);
+    assert!(matches!(
+        events[0].event_type,
+        OwnerEventType::MachineJoined
+    ));
+}
+
+#[tokio::test]
+async fn approve_v2_post_claim_abort_clears_claim_for_next_window() {
+    let (_td, router, log, _broadcaster, person, identity, window, mut authenticator) =
+        router_with_v2_owner_without_hh_priv(Duration::from_secs(45));
+    let first_candidate = start_candidate_harness().await;
+    let first_event = stage_prepared_join_window(&window, &log, &identity, &first_candidate).await;
+    first_candidate
+        .window
+        .pin_household_anchor(
+            identity.record.hh_id.as_str().to_string(),
+            *identity.record.hh_pub.as_bytes(),
+        )
+        .await
+        .unwrap();
+
+    let first_start = start_approval_v2(router.clone(), &person, first_event.cursor).await;
+    let first_assertion = authenticator
+        .do_authentication(
+            Url::parse("https://alpha.example.test").unwrap(),
+            first_start.options,
+        )
+        .unwrap();
+    let first_body = approval_v2_finish_body(
+        first_start.context,
+        first_start.challenge_id,
+        &first_assertion,
+    );
+    let (first_status, first_bytes) =
+        post_approve_body(router.clone(), &person, first_event.cursor, first_body).await;
+    assert_generic_unauth(first_status, &first_bytes);
+    let first_snapshot = window.snapshot().await;
+    assert_eq!(first_snapshot.state, PairMachineState::Aborted);
+    assert!(first_snapshot.approval_claim.is_none());
+
+    let second_candidate = start_candidate_harness().await;
+    let second_event =
+        stage_prepared_join_window(&window, &log, &identity, &second_candidate).await;
+    assert_ne!(first_event.cursor, second_event.cursor);
+    second_candidate
+        .window
+        .pin_household_anchor(
+            identity.record.hh_id.as_str().to_string(),
+            *identity.record.hh_pub.as_bytes(),
+        )
+        .await
+        .unwrap();
+    let second_start = start_approval_v2(router, &person, second_event.cursor).await;
+    assert_eq!(second_start.version, 1);
+    assert_eq!(
+        window.snapshot().await.state,
+        PairMachineState::AwaitingOwner
+    );
+    assert!(window.snapshot().await.approval_claim.is_none());
+}
+
+#[tokio::test]
+async fn approve_v2_definite_finalize_failure_aborts_and_clears_claim() {
+    let (td, router, log, _broadcaster, person, identity, window, mut authenticator) =
+        router_with_v2_owner(Duration::from_secs(45));
+    fs::write(household_root_sole_path(td.path()), b"fake-sole-shard").unwrap();
+    let candidate = start_candidate_harness_with_mode(CandidateFinalizeMode::RejectFinalize).await;
+    let event = stage_prepared_join_window(&window, &log, &identity, &candidate).await;
+    candidate
+        .window
+        .pin_household_anchor(
+            identity.record.hh_id.as_str().to_string(),
+            *identity.record.hh_pub.as_bytes(),
+        )
+        .await
+        .unwrap();
+
+    let start = start_approval_v2(router.clone(), &person, event.cursor).await;
+    let assertion = authenticator
+        .do_authentication(
+            Url::parse("https://alpha.example.test").unwrap(),
+            start.options,
+        )
+        .unwrap();
+    let body = approval_v2_finish_body(start.context, start.challenge_id, &assertion);
+    let (status, bytes) = post_approve_body(router, &person, event.cursor, body).await;
+
+    assert_generic_unauth(status, &bytes);
+    let snapshot = window.snapshot().await;
+    assert_eq!(snapshot.state, PairMachineState::Aborted);
+    assert!(snapshot.approval_claim.is_none());
+    let events = log.read_since(event.cursor).unwrap();
+    assert_eq!(events.len(), 1);
+    assert!(matches!(
+        events[0].event_type,
+        OwnerEventType::JoinCancelled
+    ));
+    let OwnerEventPayload::JoinCancelled(payload) = &events[0].payload else {
+        panic!("expected JoinCancelled payload");
+    };
+    assert_eq!(payload.reason, "candidate_unreachable");
 }
 
 #[tokio::test]

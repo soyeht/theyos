@@ -333,6 +333,16 @@ pub enum PairMachineState {
     Aborted,
 }
 
+/// Optional, durable single-flight claim for an owner approval that has passed
+/// live-window revalidation and is about to prepare the Phase 3 transaction.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PairMachineApprovalClaim {
+    #[serde(with = "serde_bytes")]
+    pub claim_id: ByteBuf,
+    pub owner_event_cursor: u64,
+    pub claimed_at: u64,
+}
+
 /// Persisted snapshot mirroring `data-model.md::PairMachineWindow`.
 ///
 /// This is on-disk format, not a wire type. The asymmetry with the
@@ -385,6 +395,11 @@ pub struct PairMachineWindowSnapshot {
     /// cross-check against the response's `household_record.hh_id`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pinned_hh_id: Option<String>,
+    /// Optional single-flight claim for an in-progress owner approval. This is
+    /// additive and rollback-friendly: older binaries ignore it, newer binaries
+    /// reject a second approval while the first one is between prepare and commit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approval_claim: Option<PairMachineApprovalClaim>,
 }
 
 impl PairMachineWindowSnapshot {
@@ -405,6 +420,7 @@ impl PairMachineWindowSnapshot {
             anchor_secret: None,
             pinned_hh_pub: None,
             pinned_hh_id: None,
+            approval_claim: None,
         }
     }
 }
@@ -424,6 +440,8 @@ pub enum WindowError {
     MismatchedCeremony,
     #[error("window expired")]
     Expired,
+    #[error("owner approval is already claimed")]
+    AlreadyClaimed,
 }
 
 /// Shared, mutable pair-machine window. Cloning the handle shares
@@ -461,8 +479,10 @@ impl PairMachineWindow {
     /// window starts `idle`.
     pub fn with_persistence(state_dir: PathBuf) -> Result<Self, StorageError> {
         let snap_path = pair_machine_window_path(&state_dir);
-        let snapshot: PairMachineWindowSnapshot = crate::storage::read_optional_cbor(&snap_path)?
-            .unwrap_or_else(PairMachineWindowSnapshot::idle);
+        let mut snapshot: PairMachineWindowSnapshot =
+            crate::storage::read_optional_cbor(&snap_path)?
+                .unwrap_or_else(PairMachineWindowSnapshot::idle);
+        clear_stale_approval_claim_on_load(&state_dir, &snap_path, &mut snapshot)?;
         let (tx, _) = watch::channel(snapshot.state);
         Ok(Self {
             inner: Arc::new(PairMachineWindowInner {
@@ -533,6 +553,7 @@ impl PairMachineWindow {
             anchor_secret: anchor_secret.map(|s| ByteBuf::from(s.to_vec())),
             pinned_hh_pub: None,
             pinned_hh_id: None,
+            approval_claim: None,
         };
         self.persist(&guard)?;
         let _ = self.inner.notifier.send(guard.state);
@@ -601,9 +622,43 @@ impl PairMachineWindow {
         }
         guard.state = PairMachineState::AwaitingOwner;
         guard.owner_event_cursor = Some(owner_event_cursor);
+        guard.approval_claim = None;
         self.persist(&guard)?;
         let _ = self.inner.notifier.send(guard.state);
         Ok(())
+    }
+
+    /// Claim the awaiting-owner window for a single in-flight v2 owner approval.
+    ///
+    /// The caller holds `BOOTSTRAP_MUTATION_LOCK` while calling this. The claim is
+    /// persisted before the lock is released, so another valid `WebAuthn` approval
+    /// for the same window cannot re-enter `CeremonyTxn::prepare`.
+    pub async fn claim_owner_approval(
+        &self,
+        owner_event_cursor: u64,
+        claim_id: [u8; 32],
+        claimed_at: u64,
+    ) -> Result<PairMachineApprovalClaim, WindowError> {
+        let mut guard = self.inner.state.lock().await;
+        if guard.state != PairMachineState::AwaitingOwner
+            || guard.owner_event_cursor != Some(owner_event_cursor)
+        {
+            return Err(WindowError::MismatchedCeremony);
+        }
+        if guard.approval_claim.is_some() {
+            return Err(WindowError::AlreadyClaimed);
+        }
+        let claim = PairMachineApprovalClaim {
+            claim_id: ByteBuf::from(claim_id.to_vec()),
+            owner_event_cursor,
+            claimed_at,
+        };
+        guard.approval_claim = Some(claim.clone());
+        if let Err(e) = self.persist(&guard) {
+            guard.approval_claim = None;
+            return Err(e);
+        }
+        Ok(claim)
     }
 
     /// Advance to `committed` after a successful 2PC. The supplied
@@ -622,6 +677,7 @@ impl PairMachineWindow {
         }
         guard.state = PairMachineState::Committed;
         guard.cached_response = Some(ByteBuf::from(cached_response_bytes));
+        guard.approval_claim = None;
         self.persist(&guard)?;
         let _ = self.inner.notifier.send(guard.state);
         Ok(())
@@ -639,6 +695,7 @@ impl PairMachineWindow {
         let mut guard = self.inner.state.lock().await;
         guard.state = PairMachineState::Committed;
         guard.cached_response = Some(ByteBuf::from(cached_response_bytes));
+        guard.approval_claim = None;
         let _ = self.inner.notifier.send(guard.state);
     }
 
@@ -646,6 +703,7 @@ impl PairMachineWindow {
     pub async fn enter_aborted(&self) -> Result<(), WindowError> {
         let mut guard = self.inner.state.lock().await;
         guard.state = PairMachineState::Aborted;
+        guard.approval_claim = None;
         self.persist(&guard)?;
         let _ = self.inner.notifier.send(guard.state);
         Ok(())
@@ -672,6 +730,58 @@ impl PairMachineWindow {
 #[must_use]
 pub fn pair_machine_window_path(state_dir: &Path) -> PathBuf {
     crate::storage::household_dir(state_dir).join("pair_machine_window.cbor")
+}
+
+fn clear_stale_approval_claim_on_load(
+    state_dir: &Path,
+    snap_path: &Path,
+    snapshot: &mut PairMachineWindowSnapshot,
+) -> Result<(), StorageError> {
+    if snapshot.approval_claim.is_none() {
+        return Ok(());
+    }
+    if crate::storage::phase3_finalize_ack_marker_exists(state_dir) {
+        return Ok(());
+    }
+
+    // A durable claim only protects the prepare/finalize race while a process is
+    // actively driving the approval. After restart, no in-memory owner approval
+    // can still be alive. Without the Phase-3 finalize marker, recovery has no
+    // intent to preserve, so the claim is stale and must not wedge the window.
+    snapshot.approval_claim = None;
+    crate::storage::clear_phase3_pending_join_response(state_dir)?;
+    crate::storage::atomic_write_cbor(snap_path, snapshot)?;
+    Ok(())
+}
+
+fn mark_window_committed_after_recovery(
+    state_dir: &Path,
+    cached_response_bytes: Vec<u8>,
+) -> Result<(), StorageError> {
+    let snap_path = pair_machine_window_path(state_dir);
+    let Some(mut snapshot) =
+        crate::storage::read_optional_cbor::<PairMachineWindowSnapshot>(&snap_path)?
+    else {
+        return Ok(());
+    };
+    snapshot.state = PairMachineState::Committed;
+    snapshot.cached_response = Some(ByteBuf::from(cached_response_bytes));
+    snapshot.approval_claim = None;
+    crate::storage::atomic_write_cbor(&snap_path, &snapshot)?;
+    Ok(())
+}
+
+fn mark_window_aborted_after_recovery(state_dir: &Path) -> Result<(), StorageError> {
+    let snap_path = pair_machine_window_path(state_dir);
+    let Some(mut snapshot) =
+        crate::storage::read_optional_cbor::<PairMachineWindowSnapshot>(&snap_path)?
+    else {
+        return Ok(());
+    };
+    snapshot.state = PairMachineState::Aborted;
+    snapshot.approval_claim = None;
+    crate::storage::atomic_write_cbor(&snap_path, &snapshot)?;
+    Ok(())
 }
 
 fn unix_now() -> Result<u64, WindowError> {
@@ -1982,7 +2092,7 @@ pub async fn recover_phase3_ceremony(
                     addr = %m2_addr,
                     "M2 ack'd JoinResponse re-POST; finishing M1 step 12+ locally"
                 );
-                finish_phase3_locally(state_dir).await?;
+                finish_phase3_locally(state_dir, pending_response_bytes.clone()).await?;
                 return Ok(RecoveryOutcome::RolledForwardPreCommit);
             }
             Err(e) => {
@@ -2006,7 +2116,7 @@ pub async fn recover_phase3_ceremony(
                     hh_id = %staged_hh_id,
                     "M2 identity probe matches; finishing M1 step 12+ locally"
                 );
-                finish_phase3_locally(state_dir).await?;
+                finish_phase3_locally(state_dir, pending_response_bytes.clone()).await?;
                 return Ok(RecoveryOutcome::RolledForwardPostCommit);
             }
             ProbeOutcome::Mismatch => {
@@ -2200,7 +2310,10 @@ async fn repost_finalize(addr: &str, body: &[u8]) -> Result<(), CeremonyError> {
 /// This is the disk-only finishing logic for steps 12+13+17 of the
 /// 2PC; `OwnerEvent` append (step 14) is not done here because the
 /// recovery driver runs before the owner-events broadcaster is wired.
-async fn finish_phase3_locally(state_dir: &Path) -> Result<(), RecoveryError> {
+async fn finish_phase3_locally(
+    state_dir: &Path,
+    cached_response_bytes: Vec<u8>,
+) -> Result<(), RecoveryError> {
     use crate::storage as st;
     let state_dir_owned = state_dir.to_path_buf();
     tokio::task::spawn_blocking(move || -> Result<(), RecoveryError> {
@@ -2271,6 +2384,7 @@ async fn finish_phase3_locally(state_dir: &Path) -> Result<(), RecoveryError> {
         }
 
         // Clear the marker + pending JoinResponse — ceremony complete.
+        mark_window_committed_after_recovery(&state_dir_owned, cached_response_bytes)?;
         let _ = st::clear_phase3_finalize_ack_marker(&state_dir_owned);
         let _ = st::clear_phase3_pending_join_response(&state_dir_owned);
         Ok(())
@@ -2283,6 +2397,14 @@ async fn finish_phase3_locally(state_dir: &Path) -> Result<(), RecoveryError> {
 /// `FR-013a`.
 fn rollback_phase3_locally(state_dir: &Path) {
     use crate::storage as st;
+    if let Err(e) = mark_window_aborted_after_recovery(state_dir) {
+        tracing::warn!(
+            stage = "recovery.phase3.window_abort_failed",
+            error = %e,
+            hint = "leaving Phase-3 marker/pending/staged files for retry"
+        );
+        return;
+    }
     let staged = st::detect_orphan_staged_files(state_dir);
     for staged_path in &staged {
         let _ = std::fs::remove_file(staged_path);
@@ -2466,7 +2588,7 @@ mod tests {
             [0x02; 33],
             [0x42; 32],
             JoinTransport::Tailscale,
-            "100.1.2.3:5040".into(),
+            "100.64.0.10:5040".into(),
             "fp test".into(),
             vec![0xAA, 0xBB],
             300,
@@ -2483,6 +2605,112 @@ mod tests {
 
         win.enter_committed(vec![0xCC]).await.unwrap();
         assert_eq!(win.snapshot().await.state, PairMachineState::Committed);
+        assert!(win.snapshot().await.approval_claim.is_none());
+    }
+
+    #[tokio::test]
+    async fn owner_approval_claim_is_exclusive_and_stale_claim_clears_on_reload() {
+        let td = tempfile::tempdir().unwrap();
+        let win = PairMachineWindow::with_persistence(td.path().to_path_buf()).unwrap();
+        win.enter_staging(
+            [0x02; 33],
+            [0x42; 32],
+            JoinTransport::Tailscale,
+            "100.64.0.10:5040".into(),
+            "fp test".into(),
+            vec![0xAA, 0xBB],
+            300,
+            None,
+        )
+        .await
+        .unwrap();
+        win.enter_awaiting_owner(7).await.unwrap();
+
+        let claim = win
+            .claim_owner_approval(7, [0xA5; 32], 1_800)
+            .await
+            .unwrap();
+        assert_eq!(claim.owner_event_cursor, 7);
+        assert_eq!(claim.claimed_at, 1_800);
+        assert_eq!(claim.claim_id.as_ref(), &[0xA5; 32]);
+        let err = win
+            .claim_owner_approval(7, [0x5A; 32], 1_801)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, WindowError::AlreadyClaimed));
+
+        let persisted: PairMachineWindowSnapshot =
+            crate::storage::read_optional_cbor(&pair_machine_window_path(td.path()))
+                .unwrap()
+                .unwrap();
+        assert_eq!(persisted.approval_claim, Some(claim));
+
+        let reloaded = PairMachineWindow::with_persistence(td.path().to_path_buf()).unwrap();
+        let snapshot = reloaded.snapshot().await;
+        assert!(snapshot.approval_claim.is_none());
+        reloaded
+            .claim_owner_approval(7, [0x5A; 32], 1_801)
+            .await
+            .unwrap();
+        reloaded.enter_aborted().await.unwrap();
+        assert!(reloaded.snapshot().await.approval_claim.is_none());
+
+        reloaded
+            .enter_staging(
+                [0x03; 33],
+                [0x24; 32],
+                JoinTransport::Tailscale,
+                "100.64.0.11:5040".into(),
+                "fp retry".into(),
+                vec![0xCC, 0xDD],
+                300,
+                None,
+            )
+            .await
+            .unwrap();
+        reloaded.enter_awaiting_owner(8).await.unwrap();
+        let retry_claim = reloaded
+            .claim_owner_approval(8, [0xC3; 32], 1_900)
+            .await
+            .unwrap();
+        assert_eq!(retry_claim.owner_event_cursor, 8);
+    }
+
+    #[tokio::test]
+    async fn owner_approval_claim_with_phase3_marker_survives_reload() {
+        let td = tempfile::tempdir().unwrap();
+        let win = PairMachineWindow::with_persistence(td.path().to_path_buf()).unwrap();
+        win.enter_staging(
+            [0x02; 33],
+            [0x42; 32],
+            JoinTransport::Tailscale,
+            "100.64.0.10:5040".into(),
+            "fp test".into(),
+            vec![0xAA, 0xBB],
+            300,
+            None,
+        )
+        .await
+        .unwrap();
+        win.enter_awaiting_owner(7).await.unwrap();
+
+        let claim = win
+            .claim_owner_approval(7, [0xA5; 32], 1_800)
+            .await
+            .unwrap();
+        crate::storage::write_phase3_finalize_ack_marker(td.path(), "m_marker").unwrap();
+
+        let reloaded = PairMachineWindow::with_persistence(td.path().to_path_buf()).unwrap();
+        assert_eq!(reloaded.snapshot().await.approval_claim, Some(claim));
+        let err = reloaded
+            .claim_owner_approval(7, [0x5A; 32], 1_801)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, WindowError::AlreadyClaimed));
+
+        crate::storage::clear_phase3_finalize_ack_marker(td.path()).unwrap();
+        let cleaned = PairMachineWindow::with_persistence(td.path().to_path_buf()).unwrap();
+        assert!(cleaned.snapshot().await.approval_claim.is_none());
     }
 
     #[tokio::test]

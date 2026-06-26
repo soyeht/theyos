@@ -160,6 +160,7 @@ fn write_committed_snapshot(
         anchor_secret: None,
         pinned_hh_pub: None,
         pinned_hh_id: None,
+        approval_claim: None,
     };
     household_rs::storage::atomic_write_cbor(&pair_machine_window_path(state_dir), &snap).unwrap();
 }
