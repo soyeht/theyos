@@ -45,6 +45,7 @@ use core_rs::artifact_signature::{
     ARTIFACT_SIGNATURE_ALG_P256_ECDSA_SHA256_RAW, ARTIFACT_SIGNATURE_SCHEMA_VERSION,
     ArtifactSignatureEnvelope, signature_payload,
 };
+use core_rs::artifact_trust::{ArtifactSignatureKeyring, ArtifactTrustMode, production_keyring};
 
 const DEFAULT_IMAGEBUILDER_VCPUS: u32 = 2;
 const DEFAULT_IMAGEBUILDER_MEM_MIB: u32 = 12288;
@@ -81,6 +82,9 @@ enum Commands {
     /// Produce a detached signature (`<manifest>.sig.json`) over the exact bytes
     /// of an existing `latest.json`, using an external auditable signer.
     SignManifest(SignManifestArgs),
+    /// Verify an existing `latest.json` + `latest.json.sig.json` pair against the
+    /// pinned production artifact-signing key.
+    VerifyManifestSignature(VerifyManifestSignatureArgs),
 }
 
 #[derive(clap::Args)]
@@ -141,6 +145,17 @@ struct SignManifestArgs {
     /// Output path for the detached signature (default: `<manifest>.sig.json`).
     #[arg(long, short)]
     output: Option<PathBuf>,
+}
+
+#[derive(clap::Args)]
+struct VerifyManifestSignatureArgs {
+    /// Path to the existing `latest.json` manifest to verify. The exact on-disk
+    /// bytes are verified; the file is never re-serialized.
+    manifest: PathBuf,
+
+    /// Path to the detached signature (default: `<manifest>.sig.json`).
+    #[arg(long, short)]
+    signature: Option<PathBuf>,
 }
 
 #[derive(clap::Args)]
@@ -269,6 +284,11 @@ async fn main() {
 
         Commands::SignManifest(args) => {
             let ok = cmd_sign_manifest(&args);
+            std::process::exit(i32::from(!ok));
+        }
+
+        Commands::VerifyManifestSignature(args) => {
+            let ok = cmd_verify_manifest_signature(&args);
             std::process::exit(i32::from(!ok));
         }
     }
@@ -759,6 +779,64 @@ fn cmd_sign_manifest(args: &SignManifestArgs) -> bool {
     )
 }
 
+// verify-manifest-signature: publish-time verification against production pins.
+
+fn run_verify_manifest_signature(
+    manifest: &Path,
+    signature: Option<&Path>,
+    keyring: &ArtifactSignatureKeyring,
+) -> bool {
+    let latest_json_bytes = match std::fs::read(manifest) {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            eprintln!(
+                "[verify-manifest-signature] failed to read {}: {e}",
+                manifest.display()
+            );
+            return false;
+        }
+    };
+
+    let sig_path = signature.map_or_else(|| signature_path_for(manifest), Path::to_path_buf);
+    let sig_bytes = match std::fs::read(&sig_path) {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            eprintln!(
+                "[verify-manifest-signature] failed to read {}: {e}",
+                sig_path.display()
+            );
+            return false;
+        }
+    };
+
+    match keyring.verify_latest_json(
+        ArtifactTrustMode::Required,
+        &latest_json_bytes,
+        Some(&sig_bytes),
+    ) {
+        Ok(()) => {
+            eprintln!(
+                "[verify-manifest-signature] OK: {} verifies with {}",
+                sig_path.display(),
+                manifest.display()
+            );
+            true
+        }
+        Err(e) => {
+            eprintln!("[verify-manifest-signature] signature verification failed: {e}");
+            false
+        }
+    }
+}
+
+fn cmd_verify_manifest_signature(args: &VerifyManifestSignatureArgs) -> bool {
+    run_verify_manifest_signature(
+        &args.manifest,
+        args.signature.as_deref(),
+        &production_keyring(),
+    )
+}
+
 /// Compute SHA-256 of a file, streaming to avoid loading it all in memory.
 fn sha256_file_hex(path: &Path) -> Result<String, std::io::Error> {
     use sha2::{Digest, Sha256};
@@ -1136,7 +1214,12 @@ mod tests {
             serde_json::from_str(&json).unwrap();
         assert!(manifest.validate().is_ok());
         assert_eq!(manifest.claw, "hermes-agent");
-        assert_eq!(manifest.version, "0.7.0");
+        assert_eq!(
+            manifest.version,
+            core_rs::manifest::get("hermes-agent")
+                .expect("hermes manifest entry")
+                .version
+        );
         assert_eq!(
             manifest.url,
             "https://example.com/hermes-agent/rootfs.ext4.zst"
@@ -1323,5 +1406,58 @@ mod tests {
             signer(b"payload"),
             Err(SignManifestError::Signer(_))
         ));
+    }
+
+    #[test]
+    fn verify_manifest_signature_accepts_valid_pair() {
+        let d = TempDir::new().unwrap();
+        let manifest = d.path().join("latest.json");
+        fs::write(&manifest, LATEST_JSON_PRETTY).unwrap();
+        assert!(run_sign_manifest(
+            &manifest,
+            SIGN_KEY_ID,
+            None,
+            test_signer(7)
+        ));
+
+        let keyring = ArtifactSignatureKeyring::new().with_current(test_public_pin(7, SIGN_KEY_ID));
+        assert!(run_verify_manifest_signature(&manifest, None, &keyring));
+    }
+
+    #[test]
+    fn verify_manifest_signature_rejects_tampered_manifest() {
+        let d = TempDir::new().unwrap();
+        let manifest = d.path().join("latest.json");
+        fs::write(&manifest, LATEST_JSON_PRETTY).unwrap();
+        assert!(run_sign_manifest(
+            &manifest,
+            SIGN_KEY_ID,
+            None,
+            test_signer(7)
+        ));
+        fs::write(
+            &manifest,
+            b"{\"manifest_version\":1,\"claw\":\"picoclaw\"}\n",
+        )
+        .unwrap();
+
+        let keyring = ArtifactSignatureKeyring::new().with_current(test_public_pin(7, SIGN_KEY_ID));
+        assert!(!run_verify_manifest_signature(&manifest, None, &keyring));
+    }
+
+    #[test]
+    fn verify_manifest_signature_rejects_wrong_keyring() {
+        let d = TempDir::new().unwrap();
+        let manifest = d.path().join("latest.json");
+        fs::write(&manifest, LATEST_JSON_PRETTY).unwrap();
+        assert!(run_sign_manifest(
+            &manifest,
+            SIGN_KEY_ID,
+            None,
+            test_signer(7)
+        ));
+
+        let keyring = ArtifactSignatureKeyring::new().with_current(test_public_pin(9, "other-key"));
+        assert!(!run_verify_manifest_signature(&manifest, None, &keyring));
     }
 }

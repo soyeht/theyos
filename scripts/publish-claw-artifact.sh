@@ -17,6 +17,13 @@
 # Environment variables:
 #   THEYOS_DIR            Repo root (auto-detected)
 #   HOME                  Builder home directory
+#   THEYOS_ARTIFACT_KEY_ID
+#                         Signing key id (default: artifact-prod-p256-2026q2)
+#   THEYOS_ARTIFACT_SIGNER_CMD
+#                         External signer command for imagebuilder sign-manifest
+#                         (default: python3 scripts/sign_artifact_manifest_p256.py)
+#   THEYOS_ARTIFACT_SIGNING_KEY
+#                         Private key path consumed by the default signer
 #
 set -euo pipefail
 
@@ -71,6 +78,10 @@ THEYOS_DIR="${THEYOS_DIR:-$(cd "$(dirname "$0")/.." && pwd)}"
 HOME="${HOME:-/root}"
 ASSETS_DIR="$HOME/firecracker/assets"
 ARCH="x86_64-linux"
+ARTIFACT_KEY_ID="${THEYOS_ARTIFACT_KEY_ID:-artifact-prod-p256-2026q2}"
+DEFAULT_ARTIFACT_SIGNER="$THEYOS_DIR/scripts/sign_artifact_manifest_p256.py"
+DEFAULT_ARTIFACT_SIGNER_CMD="python3 \"$DEFAULT_ARTIFACT_SIGNER\""
+ARTIFACT_SIGNER_CMD="${THEYOS_ARTIFACT_SIGNER_CMD:-$DEFAULT_ARTIFACT_SIGNER_CMD}"
 
 # Resolve imagebuilder binary
 IMAGEBUILDER=""
@@ -111,6 +122,34 @@ if ! command -v truncate >/dev/null 2>&1; then
     echo "[error] truncate not found (needed to trim the shrunk image file)"
     echo "  hint: coreutils should provide truncate on the builder"
     exit 1
+fi
+
+if [ -z "$ARTIFACT_SIGNER_CMD" ]; then
+    echo "[error] artifact signer command is empty"
+    exit 1
+fi
+
+if [ "$ARTIFACT_SIGNER_CMD" = "$DEFAULT_ARTIFACT_SIGNER_CMD" ]; then
+    if ! command -v python3 >/dev/null 2>&1; then
+        echo "[error] python3 not found (needed by the default artifact signer)"
+        exit 1
+    fi
+
+    if ! command -v openssl >/dev/null 2>&1; then
+        echo "[error] openssl not found (needed by the default artifact signer)"
+        exit 1
+    fi
+
+    if [ ! -f "$DEFAULT_ARTIFACT_SIGNER" ]; then
+        echo "[error] default artifact signer is missing"
+        echo "  path: $DEFAULT_ARTIFACT_SIGNER"
+        exit 1
+    fi
+
+    if [ -z "${THEYOS_ARTIFACT_SIGNING_KEY:-}" ]; then
+        echo "[error] THEYOS_ARTIFACT_SIGNING_KEY is required for the default signer"
+        exit 1
+    fi
 fi
 
 # ── Validate golden exists ───────────────────────────────────────────────────
@@ -157,6 +196,7 @@ echo "  Arch:        $ARCH"
 echo "  Release tag: $RELEASE_TAG"
 echo "  Asset name:  $ASSET_NAME"
 echo "  Dry run:     $DRY_RUN"
+echo "  Sign key id: $ARTIFACT_KEY_ID"
 echo ""
 
 # ── Step 1: Shrink rootfs copy ──────────────────────────────────────────────
@@ -167,7 +207,7 @@ trap 'rm -rf "$WORK_DIR"' EXIT
 ROOTFS_ORIG_SIZE=$(stat -c%s "$GOLDEN_DIR/rootfs.ext4" 2>/dev/null || stat -f%z "$GOLDEN_DIR/rootfs.ext4")
 SHRUNK_ROOTFS="$WORK_DIR/rootfs-shrink.ext4"
 
-echo "[1/6] Shrinking rootfs copy ($((ROOTFS_ORIG_SIZE / 1024 / 1024)) MB original)..."
+echo "[1/7] Shrinking rootfs copy ($((ROOTFS_ORIG_SIZE / 1024 / 1024)) MB original)..."
 cp "$GOLDEN_DIR/rootfs.ext4" "$SHRUNK_ROOTFS"
 
 e2fsck -fy "$SHRUNK_ROOTFS" >/dev/null 2>&1 || true
@@ -198,7 +238,7 @@ echo "  Shrunk: $((SHRUNK_SIZE / 1024 / 1024)) MB (from $((ROOTFS_ORIG_SIZE / 10
 
 ZST_FILE="$WORK_DIR/$ASSET_NAME"
 
-echo "[2/6] Compressing shrunk rootfs..."
+echo "[2/7] Compressing shrunk rootfs..."
 zstd -19 -T0 --no-progress "$SHRUNK_ROOTFS" -o "$ZST_FILE"
 rm -f "$SHRUNK_ROOTFS"
 
@@ -224,8 +264,9 @@ fi
 # ── Step 3: Generate manifest ────────────────────────────────────────────────
 
 MANIFEST_FILE="$WORK_DIR/latest.json"
+SIGNATURE_FILE="$WORK_DIR/latest.json.sig.json"
 
-echo "[3/6] Generating manifest..."
+echo "[3/7] Generating manifest..."
 "$IMAGEBUILDER" publish-manifest "$CLAW" \
     --zst-file "$ZST_FILE" \
     --artifact-url "$RELEASE_ASSET_URL" \
@@ -234,7 +275,7 @@ echo "[3/6] Generating manifest..."
 
 # ── Step 4: Validate ─────────────────────────────────────────────────────────
 
-echo "[4/6] Validating manifest..."
+echo "[4/7] Validating manifest..."
 # Validate required fields exist
 VALID=true
 for field in claw version arch fingerprint sha256 url base_rootfs_sha256 installer_plan_sha256 kernel_sha256; do
@@ -256,18 +297,33 @@ fi
 echo "  OK: manifest valid"
 echo "  URL in manifest: $RELEASE_ASSET_URL"
 
-# ── Step 5: Upload to GitHub Release ─────────────────────────────────────────
+# -- Step 5: Sign and verify manifest -----------------------------------------
 
-echo "[5/6] Publishing to GitHub Release ($RELEASE_TAG)..."
+echo "[5/7] Signing and verifying manifest..."
+"$IMAGEBUILDER" sign-manifest "$MANIFEST_FILE" \
+    --key-id "$ARTIFACT_KEY_ID" \
+    --signer-cmd "$ARTIFACT_SIGNER_CMD" \
+    --output "$SIGNATURE_FILE"
+"$IMAGEBUILDER" verify-manifest-signature "$MANIFEST_FILE" \
+    --signature "$SIGNATURE_FILE"
+echo "  OK: manifest signature verified"
+
+# -- Step 6: Upload to GitHub Release -----------------------------------------
+
+echo "[6/7] Publishing to GitHub Release ($RELEASE_TAG)..."
 
 if [ "$DRY_RUN" = true ]; then
     echo ""
     echo "  [dry-run] Would create release: $RELEASE_TAG"
     echo "  [dry-run] Would upload asset:   $ASSET_NAME ($((ZST_SIZE / 1024 / 1024)) MB)"
     echo "  [dry-run] Would commit:         artifacts/$CLAW/$ARCH/latest.json"
+    echo "  [dry-run] Would commit:         artifacts/$CLAW/$ARCH/latest.json.sig.json"
     echo ""
     echo "  [dry-run] Manifest content:"
     cat "$MANIFEST_FILE"
+    echo ""
+    echo "  [dry-run] Signature content:"
+    cat "$SIGNATURE_FILE"
     echo ""
     echo "  [dry-run] Done. Re-run without --dry-run to publish."
     exit 0
@@ -289,19 +345,20 @@ SHA-256 (zst): \`$MANIFEST_SHA\`
 Size: $((ZST_SIZE / 1024 / 1024)) MB"
 fi
 
-# ── Step 6: Commit latest.json to repo ───────────────────────────────────────
+# -- Step 7: Commit latest.json to repo ---------------------------------------
 
-echo "[6/6] Committing latest.json to repo..."
+echo "[7/7] Committing latest.json to repo..."
 
 ARTIFACTS_DIR="$THEYOS_DIR/artifacts/$CLAW/$ARCH"
 mkdir -p "$ARTIFACTS_DIR"
 cp "$MANIFEST_FILE" "$ARTIFACTS_DIR/latest.json"
+cp "$SIGNATURE_FILE" "$ARTIFACTS_DIR/latest.json.sig.json"
 
 cd "$THEYOS_DIR"
-git add "artifacts/$CLAW/$ARCH/latest.json"
+git add "artifacts/$CLAW/$ARCH/latest.json" "artifacts/$CLAW/$ARCH/latest.json.sig.json"
 
 if git diff --cached --quiet; then
-    echo "  latest.json unchanged, skipping commit"
+    echo "  latest.json and latest.json.sig.json unchanged, skipping commit"
 else
     git commit -m "Update $CLAW $ARCH artifact manifest to $VERSION
 
@@ -325,6 +382,7 @@ echo "    THEYOS_ARTIFACT_REGISTRY_URL=https://raw.githubusercontent.com/${REPO}
 echo ""
 echo "  Verify manifest:"
 echo "    curl -sL https://raw.githubusercontent.com/${REPO}/main/artifacts/$CLAW/$ARCH/latest.json | python3 -m json.tool"
+echo "    curl -fsSL https://raw.githubusercontent.com/${REPO}/main/artifacts/$CLAW/$ARCH/latest.json.sig.json >/dev/null"
 echo ""
 echo "  Next steps:"
 echo "    1. git push (to make latest.json available via raw.githubusercontent.com)"
