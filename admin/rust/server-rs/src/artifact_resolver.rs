@@ -772,4 +772,76 @@ mod tests {
             ArtifactError::RegistryUnreachable(_)
         ));
     }
+
+    /// Serve the manifest on `latest.json` and a bare HTTP status (no body) on
+    /// `latest.json.sig.json` - to exercise non-200/404 signature-fetch outcomes.
+    fn serve_manifest_sig_status(
+        manifest: Vec<u8>,
+        sig_status: u16,
+    ) -> (String, std::net::TcpListener) {
+        use std::io::Write;
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().unwrap().port();
+        let base_url = format!("http://127.0.0.1:{port}");
+        let listener_clone = listener.try_clone().expect("clone listener");
+
+        std::thread::spawn(move || {
+            for _ in 0..8 {
+                let Ok((mut stream, _)) = listener_clone.accept() else {
+                    break;
+                };
+                let mut buf = [0u8; 4096];
+                let n = std::io::Read::read(&mut stream, &mut buf).unwrap_or(0);
+                let request = String::from_utf8_lossy(&buf[..n]);
+                let path = request
+                    .lines()
+                    .next()
+                    .and_then(|line| line.split(' ').nth(1))
+                    .unwrap_or("");
+
+                let response = if path.ends_with(".sig.json") {
+                    format!(
+                        "HTTP/1.1 {sig_status} STATUS\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    )
+                    .into_bytes()
+                } else {
+                    http_ok(&manifest)
+                };
+                let _ = stream.write_all(&response);
+                let _ = stream.flush();
+            }
+        });
+
+        (base_url, listener)
+    }
+
+    #[test]
+    fn resolve_sig_fetch_non_404_error_fails_closed() {
+        // A non-404 error fetching latest.json.sig.json (here HTTP 500) must fail
+        // closed: it is NOT treated as "signature absent" and must never fall
+        // through to accepting the manifest as unsigned.
+        let manifest = test_manifest_bytes();
+        let (base_url, _l) = serve_manifest_sig_status(manifest, 500);
+        let r = ArtifactResolver::with_trust(&base_url, ArtifactTrustConfig::new(keyring(7)));
+        assert!(matches!(
+            r.resolve("testclaw").unwrap_err(),
+            ArtifactError::RegistryUnreachable(_)
+        ));
+    }
+
+    #[test]
+    fn resolve_trust_none_preserves_status_quo_and_ignores_signatures() {
+        // trust None is the deferred status quo: the resolver never fetches or
+        // verifies a signature. Even a server that would error on the .sig.json
+        // endpoint resolves fine, because that endpoint is never requested.
+        let manifest = test_manifest_bytes();
+        let (base_url, _l) = serve_manifest_sig_status(manifest, 500);
+        let r = ArtifactResolver::new(&base_url);
+        let resolved = r
+            .resolve("testclaw")
+            .expect("trust None resolves without touching .sig.json");
+        assert_eq!(resolved.claw, "testclaw");
+    }
 }

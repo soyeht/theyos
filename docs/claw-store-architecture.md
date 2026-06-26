@@ -123,6 +123,39 @@ The macOS runner path is documented in `docs/macos-setup.md`:
 Do not change runner environment names, signing posture, or socket behavior from
 Claw Store docs. Make those changes in focused runner slices with tests.
 
+## Artifact Signature Provenance (P0.1)
+
+Registry manifests can carry a detached signature. The mechanics are in place;
+production enforcement is still blocked on a real public key, custody, and policy,
+so `ArtifactResolver::new` keeps the unsigned status quo until then.
+
+- `core-rs/src/artifact_signature.rs` verifies a detached P-256 signature over the
+  exact `latest.json` bytes; `core-rs/src/artifact_trust.rs` holds the keyring
+  (`current`/`next` plus revoked `key_id`s) and the `Required` /
+  `OptionalIfAbsent` trust mode. `imagebuilder sign-manifest` writes
+  `latest.json.sig.json` from an external signer; the private key never enters the
+  process.
+- `server-rs/src/artifact_resolver.rs` verifies `latest.json.sig.json` against the
+  configured keyring BEFORE parsing the manifest, but only when a trust config is
+  supplied via `with_trust`. `new()` (no trust) is the deferred status quo, not a
+  signed-but-permissive mode - do not describe it as a signature policy.
+
+Provenance rules (hold these when extending the resolver, a cache, or install flow):
+
+- A local golden (`golden.meta.json` / the installed `rootfs.ext4`) is a cache of
+  an already-installed artifact, NOT registry provenance. It does not stand in for
+  a verified `latest.json` plus signature.
+- A remote registry being unavailable does NOT authorize an unsigned fallback. A
+  missing `latest.json.sig.json` (HTTP 404) is "absent" for the trust mode; any
+  other fetch error fails closed.
+- Unsigned manifests are accepted only for a strictly loopback/local host
+  (`localhost`, `127.0.0.0/8`, `::1`) with an explicit `allow_unsigned_loopback`
+  override. The override never relaxes a remote, LAN, tailnet, or public host.
+- A future persistent manifest cache may only store a `latest.json` plus
+  `latest.json.sig.json` pair that was already verified, and must re-verify it
+  against the current keyring on read. It must never cache or serve an unsigned or
+  unverified remote manifest.
+
 ## Swift App Boundaries
 
 Swift has three different concepts that must not be mixed:
