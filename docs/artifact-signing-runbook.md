@@ -119,15 +119,14 @@ every prebuilt install. Order:
            THEYOS_ARTIFACT_SIGNING_KEY=/path/to/artifact-signing.key \
              ./scripts/backfill-artifact-manifest-signatures.sh --stage
 
-       Then commit, push, and run the same helper in `--check-only` mode after
-       pulling the pushed commit on a clean checkout. Finally verify the live
-       registry bytes:
+       Then commit, push, pull the pushed commit on a clean checkout, and run:
 
-           ./scripts/verify-artifact-manifest-signature-urls.sh
+           ./scripts/check-artifact-signature-rollout.sh
 
-       That helper downloads each live `latest.json` and `latest.json.sig.json`
-       pair from the registry URL and verifies the exact served bytes against
-       the production public pin.
+       That helper first verifies the committed local `.sig.json` files, then
+       downloads each live `latest.json` and `latest.json.sig.json` pair from
+       the registry URL and verifies the exact served bytes against the
+       production public pin.
     3. [done] Pin the public key + key_id in the client keyring, NOT yet enforced
        (the resolver still passes no trust in production).
     4. [code] Hard-cut: flip the resolver to Required for the prod registry host.
@@ -164,6 +163,8 @@ DONE and pushed:
   upload/commit.
 - `scripts/backfill-artifact-manifest-signatures.sh` - signs and verifies the
   existing registry manifests without rebuilding/uploading artifacts.
+- `scripts/check-artifact-signature-rollout.sh` - runs the local committed
+  signature check and the live raw registry check after backfill/push.
 - `scripts/verify-artifact-manifest-signature-urls.sh` - verifies the pushed
   raw registry bytes before the Required hard-cut.
 

@@ -239,12 +239,11 @@ if [ "$written_count" -gt 0 ]; then
         done < "$WRITTEN_FILE"
         echo "[backfill] staged $written_count signature files"
         echo "[backfill] next: commit, push, pull a clean checkout, then run:"
-        echo "[backfill]   ./scripts/backfill-artifact-manifest-signatures.sh --check-only"
-        echo "[backfill]   ./scripts/verify-artifact-manifest-signature-urls.sh"
+        echo "[backfill]   ./scripts/check-artifact-signature-rollout.sh"
     else
         echo "[backfill] wrote $written_count signature files"
         echo "[backfill] next: git add $(tr '\n' ' ' < "$WRITTEN_FILE" | sed 's/[[:space:]]*$//')"
-        echo "[backfill] after commit/push: run --check-only and verify live registry URLs"
+        echo "[backfill] after commit/push: run ./scripts/check-artifact-signature-rollout.sh"
     fi
 fi
 
