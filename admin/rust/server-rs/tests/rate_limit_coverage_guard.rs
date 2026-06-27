@@ -263,6 +263,10 @@ fn limiter_check_sites_are_exactly_the_classified_set() {
         "handlers_household_claws.rs".to_string(),
         vec!["claw_install".to_string(), "claw_uninstall".to_string()],
     );
+    expected.insert(
+        "owner_webauthn_recovery_consume_rate_limit.rs".to_string(),
+        vec!["owner_webauthn_recovery_consume".to_string()],
+    );
 
     assert_eq!(
         found, expected,
