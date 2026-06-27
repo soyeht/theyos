@@ -59,6 +59,27 @@ impl OwnerWebauthnAuthority {
         &self.entries
     }
 
+    /// Returns true once a `WebAuthn` Add has consumed the recovery head.
+    #[must_use]
+    pub fn recovery_head_consumed_by_webauthn_add(
+        &self,
+        recovery_head_sequence: u64,
+        recovery_head_hash: &[u8],
+    ) -> bool {
+        self.entries.iter().any(|entry| {
+            matches!(
+                (&entry.event.actor, &entry.event.action),
+                (
+                    OwnerWebauthnEventActor::RecoveryProof {
+                        recovery_head_sequence: sequence,
+                        recovery_head_hash: hash,
+                    },
+                    OwnerWebauthnCredentialEventAction::Add { .. },
+                ) if *sequence == recovery_head_sequence && hash.as_ref() == recovery_head_hash
+            )
+        })
+    }
+
     pub fn push_signed(&mut self, entry: SignedOwnerWebauthnCredentialEvent) {
         if self.version == 0 {
             self.version = AUTHORITY_SCHEMA_VERSION;
@@ -758,6 +779,44 @@ mod tests {
         authority.push_signed(add);
         let store = authority.reconstruct(&record, &owner_cert).unwrap();
         assert_eq!(store.active_count(), 2);
+    }
+
+    #[test]
+    fn recovery_head_is_consumed_if_webauthn_add_references_it() {
+        let (root, record, owner_cert) = setup();
+        let genesis = OwnerWebauthnAuthority::sign_genesis(
+            &root,
+            &record,
+            &owner_cert,
+            credential(b"owner-passkey-1"),
+            NOW,
+        )
+        .unwrap();
+        let recovery_head_hash = [0x51; HASH_LEN];
+        let add = OwnerWebauthnAuthority::sign_recovery_add(
+            &root,
+            &record,
+            &owner_cert,
+            OwnerWebauthnRecoveryAddInput {
+                previous_entry: &genesis,
+                recovery_head_sequence: 7,
+                recovery_head_hash,
+                credential: credential(b"owner-passkey-2"),
+                issued_at: NOW + 1,
+            },
+        )
+        .unwrap();
+
+        let mut authority = OwnerWebauthnAuthority::new();
+        authority.push_signed(genesis);
+        assert!(!authority.recovery_head_consumed_by_webauthn_add(7, &recovery_head_hash));
+
+        authority.push_signed(add);
+        assert!(authority.recovery_head_consumed_by_webauthn_add(7, &recovery_head_hash));
+        assert!(!authority.recovery_head_consumed_by_webauthn_add(8, &recovery_head_hash));
+        assert!(!authority.recovery_head_consumed_by_webauthn_add(7, &[0x52; HASH_LEN]));
+
+        authority.reconstruct(&record, &owner_cert).unwrap();
     }
 
     #[test]
