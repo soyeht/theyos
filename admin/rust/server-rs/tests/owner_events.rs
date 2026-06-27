@@ -418,6 +418,23 @@ struct OwnerWebauthnAddCredentialStartResponse {
 }
 
 #[derive(serde::Serialize)]
+struct OwnerWebauthnAddCredentialFinishRequest {
+    #[serde(rename = "v")]
+    version: u8,
+    context: OwnerApprovalContextV2,
+    registration: OwnerWebauthnRegistrationFinishRequest,
+    approval: OwnerApprovalV2FinishBody,
+}
+
+#[derive(Deserialize)]
+struct OwnerWebauthnAddCredentialFinishResponse {
+    #[serde(rename = "v")]
+    version: u8,
+    credential_id: ByteBuf,
+    active_credential_count: u64,
+}
+
+#[derive(serde::Serialize)]
 struct OwnerWebauthnRecoveryConsumeFinishRequest {
     #[serde(rename = "v")]
     version: u8,
@@ -621,6 +638,10 @@ fn router_from_owner_auth_with_router_state(
         .route(
             "/api/v1/household/owner-webauthn/add-credential/start",
             post(handlers_owner_events::owner_webauthn_add_credential_start_handler),
+        )
+        .route(
+            "/api/v1/household/owner-webauthn/add-credential/finish",
+            post(handlers_owner_events::owner_webauthn_add_credential_finish_handler),
         )
         .route(
             "/api/v1/household/owner-webauthn/recovery/status",
@@ -2134,6 +2155,62 @@ async fn start_add_credential(
     response
 }
 
+fn add_credential_finish_body(
+    context: OwnerApprovalContextV2,
+    registration_challenge_id: String,
+    approval_challenge_id: String,
+    credential: RegisterPublicKeyCredential,
+    assertion: &PublicKeyCredential,
+) -> Vec<u8> {
+    let approval = approval_v2_from_assertion(context.clone(), assertion);
+    household_rs::cbor::to_canonical_vec(&OwnerWebauthnAddCredentialFinishRequest {
+        version: 1,
+        context,
+        registration: OwnerWebauthnRegistrationFinishRequest {
+            version: 1,
+            challenge_id: registration_challenge_id,
+            credential,
+        },
+        approval: OwnerApprovalV2FinishBody {
+            version: 1,
+            challenge_id: approval_challenge_id,
+            approval,
+        },
+    })
+    .unwrap()
+}
+
+async fn post_add_credential_finish(
+    router: Router,
+    person: &P256Keypair,
+    body: Vec<u8>,
+) -> (StatusCode, HeaderMap, Vec<u8>) {
+    post_cbor(
+        router,
+        "/api/v1/household/owner-webauthn/add-credential/finish",
+        body,
+        Some(person),
+    )
+    .await
+}
+
+async fn add_credential_finish(
+    router: Router,
+    person: &P256Keypair,
+    body: Vec<u8>,
+) -> OwnerWebauthnAddCredentialFinishResponse {
+    let (status, headers, resp_bytes) = post_add_credential_finish(router, person, body).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        headers.get(header::CONTENT_TYPE).unwrap(),
+        "application/cbor"
+    );
+    let response: OwnerWebauthnAddCredentialFinishResponse =
+        household_rs::cbor::from_canonical_slice(&resp_bytes).unwrap();
+    assert_eq!(response.version, 1);
+    response
+}
+
 fn recovery_start_body() -> Vec<u8> {
     household_rs::cbor::to_canonical_vec(&OwnerWebauthnRecoveryStartRequest { version: 1 }).unwrap()
 }
@@ -2599,7 +2676,7 @@ fn owner_webauthn_add_credential_start_source_guards_challenge_only_contract() {
     let plan = source_segment(
         source,
         "fn owner_webauthn_add_credential_start_plan(",
-        "fn owner_webauthn_recovery_consume_registration_binding(",
+        "fn owner_webauthn_add_credential_finish_plan(",
     );
     assert!(plan.contains("add_credential_start_enabled"));
     assert!(plan.contains("classify_owner_webauthn_authority_anchor_read_only"));
@@ -2663,7 +2740,96 @@ fn owner_webauthn_add_credential_start_source_guards_challenge_only_contract() {
 
     let router_source = include_str!("../src/household_bootstrap.rs");
     assert!(router_source.contains("/api/v1/household/owner-webauthn/add-credential/start"));
-    assert!(!router_source.contains("/api/v1/household/owner-webauthn/add-credential/finish"));
+    assert!(router_source.contains("/api/v1/household/owner-webauthn/add-credential/finish"));
+}
+
+#[test]
+fn owner_webauthn_add_credential_finish_source_guards_mutation_contract() {
+    let source = include_str!("../src/handlers_owner_events.rs");
+    let plan = source_segment(
+        source,
+        "fn owner_webauthn_add_credential_finish_plan(",
+        "fn owner_webauthn_recovery_consume_registration_binding(",
+    );
+    assert!(plan.contains("add_credential_start_enabled"));
+    assert!(plan.contains("owner_webauthn_add_credential_registration_binding_from_context"));
+    assert!(plan.contains("owner_webauthn_active_snapshot_read_only"));
+    assert!(plan.contains("add_credential_actor_not_active"));
+    assert!(plan.contains("add_credential_head_mismatch"));
+    assert!(plan.contains("add_credential_count_mismatch"));
+    assert!(plan.contains("OwnerApprovalContextV2::add_credential"));
+    assert!(!plan.contains("OwnerWebauthnPolicySnapshot"));
+    assert!(!plan.contains("owner_webauthn_recovery"));
+    assert!(!plan.contains("verify_or_update_owner_webauthn_authority_anchor"));
+    assert!(!plan.contains("OwnerWebauthnAnchorMode::MigrationDefaultOff"));
+    assert!(!plan.contains("OwnerAuthEnrollInitial"));
+    assert!(!plan.contains("HouseholdAddMachine"));
+
+    let handler = source_segment(
+        source,
+        "pub async fn owner_webauthn_add_credential_finish_handler(",
+        "/// `POST /api/v1/household/owner-webauthn/recovery/status`",
+    );
+    assert!(handler.contains("authorize_owner_webauthn_add_credential_finish_request"));
+    assert!(handler.contains("BOOTSTRAP_MUTATION_LOCK"));
+    assert!(handler.contains("owner_webauthn_add_credential_finish_plan"));
+    assert!(handler.contains("require_expected_context"));
+    assert!(handler.contains("require_registration_challenge_binding"));
+    assert!(handler.contains("require_owner_approval_challenge_context"));
+    assert!(handler.contains("finish_registration_with_binding"));
+    assert!(handler.contains("finish_owner_approval_assertion"));
+    assert!(handler.contains("OwnerWebauthnAuthority::sign_append"));
+    assert!(handler.contains("OwnerWebauthnCredentialEventAction::Add"));
+    assert!(handler.contains(".save("));
+    assert!(handler.contains("set_owner_auth"));
+    assert!(handler.contains("verify_or_update_owner_webauthn_authority_anchor"));
+    assert!(!handler.contains("OwnerWebauthnAuthority::sign_recovery_add"));
+    assert!(!handler.contains("OwnerWebauthnRecoveryAuthority::sign_consume"));
+    assert!(!handler.contains("OwnerWebauthnCredentialEventAction::Revoke"));
+    assert!(!handler.contains("OwnerWebauthnPolicySnapshot"));
+    assert!(!handler.contains("MigrationDefaultOff"));
+    assert!(!handler.contains("OwnerAuthEnrollInitial"));
+    assert!(!handler.contains("HouseholdAddMachine"));
+    let context_check = handler.find("require_expected_context").unwrap();
+    let registration_context = handler
+        .find("require_registration_challenge_binding")
+        .unwrap();
+    let approval_context = handler
+        .find("require_owner_approval_challenge_context")
+        .unwrap();
+    let registration_finish = handler.find("finish_registration_with_binding").unwrap();
+    let approval_finish = handler.find("finish_owner_approval_assertion").unwrap();
+    let append = handler.find("OwnerWebauthnAuthority::sign_append").unwrap();
+    let save = handler.find(".save(").unwrap();
+    let memory = handler.find("set_owner_auth").unwrap();
+    let anchor = handler
+        .find("verify_or_update_owner_webauthn_authority_anchor")
+        .unwrap();
+    assert!(context_check < registration_context);
+    assert!(context_check < approval_context);
+    assert!(registration_context < registration_finish);
+    assert!(approval_context < registration_finish);
+    assert!(registration_finish < approval_finish);
+    assert!(approval_finish < append);
+    assert!(append < save);
+    assert!(save < memory);
+    assert!(memory < anchor);
+
+    let auth_source = include_str!("../src/household_auth.rs");
+    let auth_helper = source_segment(
+        auth_source,
+        "pub async fn authorize_owner_webauthn_add_credential_finish_request(",
+        "/// Authorize the owner recovery-code readiness surface.",
+    );
+    assert!(auth_helper.contains("authorize_owner_only_pop_request"));
+    assert!(auth_helper.contains("OwnerWebauthnAddCredentialFinish"));
+    assert!(!auth_helper.contains("authorize_owner_approval"));
+    assert!(!auth_helper.contains("caveats::permits"));
+    assert!(!auth_helper.contains("HouseholdAddMachine"));
+    assert!(!auth_helper.contains("OwnerAuthEnrollInitial"));
+
+    let router_source = include_str!("../src/household_bootstrap.rs");
+    assert!(router_source.contains("/api/v1/household/owner-webauthn/add-credential/finish"));
 }
 
 #[test]
@@ -2837,7 +3003,7 @@ fn owner_webauthn_recovery_source_guards_provision_readiness_contract() {
     let consume_plan = source_segment(
         source,
         "fn owner_webauthn_recovery_consume_start_plan(",
-        "fn owner_webauthn_recovery_consume_registration_binding(",
+        "fn owner_webauthn_recovery_consume_finish_plan(",
     );
     assert!(consume_plan.contains("check_recovery_consume_attempt"));
     assert!(consume_plan.contains("classify_owner_webauthn_authority_anchor_read_only"));
@@ -4206,6 +4372,465 @@ async fn owner_webauthn_add_credential_start_returns_dual_challenges_without_mut
     .expect("anchor remains present");
     assert_eq!(anchor_after.sequence(), before_head.sequence);
     assert_eq!(anchor_after.head_hash(), before_head.head_hash);
+}
+
+#[tokio::test]
+async fn owner_webauthn_add_credential_finish_adds_credential_and_advances_anchor() {
+    let (_td, router, _log, _broadcaster, person, identity, _window, mut authenticator, state) =
+        router_with_owner_webauthn_add_credential(Duration::from_secs(45), true);
+    let before = state
+        .household
+        .current_owner_auth()
+        .await
+        .expect("owner auth is present before AddCredential finish");
+    let before_entries = before.owner_webauthn.entries().len();
+    let before_head = verified_owner_webauthn_authority_head(
+        &before.owner_webauthn,
+        &identity.record,
+        &before.owner_person_cert,
+    )
+    .unwrap()
+    .expect("existing passkey has an anchored head");
+
+    let start = start_add_credential(router.clone(), &person).await;
+    let mut fresh_authenticator = WebauthnAuthenticator::new(SoftPasskey::new(true));
+    let credential = fresh_authenticator
+        .do_registration(
+            Url::parse("https://alpha.example.test").unwrap(),
+            start.registration.options,
+        )
+        .unwrap();
+    let assertion = authenticator
+        .do_authentication(
+            Url::parse("https://alpha.example.test").unwrap(),
+            start.approval.options,
+        )
+        .unwrap();
+    let approval_credential_id = ByteBuf::from(assertion.raw_id.as_slice().to_vec());
+
+    let finish = add_credential_finish(
+        router.clone(),
+        &person,
+        add_credential_finish_body(
+            start.context,
+            start.registration.challenge_id,
+            start.approval.challenge_id,
+            credential,
+            &assertion,
+        ),
+    )
+    .await;
+
+    assert_eq!(finish.active_credential_count, 2);
+    let after = state
+        .household
+        .current_owner_auth()
+        .await
+        .expect("owner auth remains present after AddCredential finish");
+    assert_eq!(after.owner_webauthn.entries().len(), before_entries + 1);
+    let add_entry = after
+        .owner_webauthn
+        .entries()
+        .last()
+        .expect("AddCredential finish appends one event");
+    match &add_entry.event.actor {
+        OwnerWebauthnEventActor::OwnerCredential { credential_id } => {
+            assert_eq!(credential_id, &approval_credential_id);
+        }
+        other => panic!("unexpected AddCredential actor: {other:?}"),
+    }
+    match &add_entry.event.action {
+        OwnerWebauthnCredentialEventAction::Add { credential } => {
+            assert_eq!(
+                credential.credential_id_bytes(),
+                finish.credential_id.as_ref()
+            );
+        }
+        other => panic!("unexpected AddCredential action: {other:?}"),
+    }
+    let credentials = after.owner_webauthn_credentials(&identity.record).unwrap();
+    assert_eq!(credentials.active_count(), 2);
+    let after_head = verified_owner_webauthn_authority_head(
+        &after.owner_webauthn,
+        &identity.record,
+        &after.owner_person_cert,
+    )
+    .unwrap()
+    .expect("AddCredential finish has a new head");
+    assert_eq!(after_head.sequence, before_head.sequence + 1);
+    let anchor_after = read_owner_webauthn_authority_anchor(
+        state
+            .owner_webauthn_anchor
+            .as_ref()
+            .unwrap()
+            .keystore
+            .as_ref(),
+        &identity.record.hh_id,
+    )
+    .unwrap()
+    .expect("anchor remains present");
+    assert_eq!(anchor_after.sequence(), after_head.sequence);
+    assert_eq!(anchor_after.head_hash(), after_head.head_hash);
+}
+
+#[tokio::test]
+async fn owner_webauthn_add_credential_finish_context_mismatch_does_not_consume_challenges() {
+    let (_td, router, _log, _broadcaster, person, _identity, _window, mut authenticator, _state) =
+        router_with_owner_webauthn_add_credential(Duration::from_secs(45), true);
+    let start = start_add_credential(router.clone(), &person).await;
+    let mut fresh_authenticator = WebauthnAuthenticator::new(SoftPasskey::new(true));
+    let credential = fresh_authenticator
+        .do_registration(
+            Url::parse("https://alpha.example.test").unwrap(),
+            start.registration.options.clone(),
+        )
+        .unwrap();
+    let assertion = authenticator
+        .do_authentication(
+            Url::parse("https://alpha.example.test").unwrap(),
+            start.approval.options,
+        )
+        .unwrap();
+
+    let mut mismatched_context = start.context.clone();
+    mismatched_context.replay_nonce = ByteBuf::from([0x44; 32].to_vec());
+    let (status, _headers, bytes) = post_add_credential_finish(
+        router.clone(),
+        &person,
+        add_credential_finish_body(
+            mismatched_context,
+            start.registration.challenge_id.clone(),
+            start.approval.challenge_id.clone(),
+            credential.clone(),
+            &assertion,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert_generic_unauth(status, &bytes);
+
+    let finish = add_credential_finish(
+        router,
+        &person,
+        add_credential_finish_body(
+            start.context,
+            start.registration.challenge_id,
+            start.approval.challenge_id,
+            credential,
+            &assertion,
+        ),
+    )
+    .await;
+    assert_eq!(finish.active_credential_count, 2);
+}
+
+#[tokio::test]
+async fn owner_webauthn_add_credential_finish_nested_version_mismatch_does_not_consume_challenges()
+{
+    let (_td, router, _log, _broadcaster, person, _identity, _window, mut authenticator, _state) =
+        router_with_owner_webauthn_add_credential(Duration::from_secs(45), true);
+    let start = start_add_credential(router.clone(), &person).await;
+    let mut fresh_authenticator = WebauthnAuthenticator::new(SoftPasskey::new(true));
+    let credential = fresh_authenticator
+        .do_registration(
+            Url::parse("https://alpha.example.test").unwrap(),
+            start.registration.options.clone(),
+        )
+        .unwrap();
+    let assertion = authenticator
+        .do_authentication(
+            Url::parse("https://alpha.example.test").unwrap(),
+            start.approval.options,
+        )
+        .unwrap();
+    let approval = approval_v2_from_assertion(start.context.clone(), &assertion);
+    let body = household_rs::cbor::to_canonical_vec(&OwnerWebauthnAddCredentialFinishRequest {
+        version: 1,
+        context: start.context.clone(),
+        registration: OwnerWebauthnRegistrationFinishRequest {
+            version: 2,
+            challenge_id: start.registration.challenge_id.clone(),
+            credential: credential.clone(),
+        },
+        approval: OwnerApprovalV2FinishBody {
+            version: 1,
+            challenge_id: start.approval.challenge_id.clone(),
+            approval,
+        },
+    })
+    .unwrap();
+
+    let (status, _headers, bytes) = post_add_credential_finish(router.clone(), &person, body).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert_generic_unauth(status, &bytes);
+
+    let finish = add_credential_finish(
+        router,
+        &person,
+        add_credential_finish_body(
+            start.context,
+            start.registration.challenge_id,
+            start.approval.challenge_id,
+            credential,
+            &assertion,
+        ),
+    )
+    .await;
+    assert_eq!(finish.active_credential_count, 2);
+}
+
+#[tokio::test]
+async fn owner_webauthn_add_credential_finish_bad_approval_does_not_append_or_anchor() {
+    let (_td, router, _log, _broadcaster, person, identity, _window, mut authenticator, state) =
+        router_with_owner_webauthn_add_credential(Duration::from_secs(45), true);
+    let before = state
+        .household
+        .current_owner_auth()
+        .await
+        .expect("owner auth is present before bad AddCredential finish");
+    let before_entries = before.owner_webauthn.entries().len();
+    let before_head = verified_owner_webauthn_authority_head(
+        &before.owner_webauthn,
+        &identity.record,
+        &before.owner_person_cert,
+    )
+    .unwrap()
+    .expect("existing passkey has an anchored head");
+
+    let start = start_add_credential(router.clone(), &person).await;
+    let mut fresh_authenticator = WebauthnAuthenticator::new(SoftPasskey::new(true));
+    let credential = fresh_authenticator
+        .do_registration(
+            Url::parse("https://alpha.example.test").unwrap(),
+            start.registration.options,
+        )
+        .unwrap();
+    let assertion = authenticator
+        .do_authentication(
+            Url::parse("https://alpha.example.test").unwrap(),
+            start.approval.options,
+        )
+        .unwrap();
+    let mut approval = approval_v2_from_assertion(start.context.clone(), &assertion);
+    approval.signature = ByteBuf::from([0x42; 64].to_vec());
+    let body = household_rs::cbor::to_canonical_vec(&OwnerWebauthnAddCredentialFinishRequest {
+        version: 1,
+        context: start.context,
+        registration: OwnerWebauthnRegistrationFinishRequest {
+            version: 1,
+            challenge_id: start.registration.challenge_id,
+            credential,
+        },
+        approval: OwnerApprovalV2FinishBody {
+            version: 1,
+            challenge_id: start.approval.challenge_id,
+            approval,
+        },
+    })
+    .unwrap();
+
+    let (status, _headers, bytes) = post_add_credential_finish(router.clone(), &person, body).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert_generic_unauth(status, &bytes);
+
+    let after = state
+        .household
+        .current_owner_auth()
+        .await
+        .expect("owner auth remains present after rejected AddCredential finish");
+    assert_eq!(
+        after.owner_webauthn.entries().len(),
+        before_entries,
+        "bad approval assertion must not append WebAuthn Add"
+    );
+    let anchor_after = read_owner_webauthn_authority_anchor(
+        state
+            .owner_webauthn_anchor
+            .as_ref()
+            .unwrap()
+            .keystore
+            .as_ref(),
+        &identity.record.hh_id,
+    )
+    .unwrap()
+    .expect("anchor remains present");
+    assert_eq!(anchor_after.sequence(), before_head.sequence);
+    assert_eq!(anchor_after.head_hash(), before_head.head_hash);
+}
+
+#[tokio::test]
+async fn owner_webauthn_add_credential_finish_replay_after_success_does_not_duplicate_add() {
+    let (_td, router, _log, _broadcaster, person, identity, _window, mut authenticator, state) =
+        router_with_owner_webauthn_add_credential(Duration::from_secs(45), true);
+    let before = state
+        .household
+        .current_owner_auth()
+        .await
+        .expect("owner auth is present before AddCredential finish replay");
+    let before_entries = before.owner_webauthn.entries().len();
+
+    let start = start_add_credential(router.clone(), &person).await;
+    let mut fresh_authenticator = WebauthnAuthenticator::new(SoftPasskey::new(true));
+    let credential = fresh_authenticator
+        .do_registration(
+            Url::parse("https://alpha.example.test").unwrap(),
+            start.registration.options,
+        )
+        .unwrap();
+    let assertion = authenticator
+        .do_authentication(
+            Url::parse("https://alpha.example.test").unwrap(),
+            start.approval.options,
+        )
+        .unwrap();
+    let body = add_credential_finish_body(
+        start.context,
+        start.registration.challenge_id,
+        start.approval.challenge_id,
+        credential,
+        &assertion,
+    );
+
+    let finish = add_credential_finish(router.clone(), &person, body.clone()).await;
+    assert_eq!(finish.active_credential_count, 2);
+
+    let (status, _headers, bytes) = post_add_credential_finish(router.clone(), &person, body).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert_generic_unauth(status, &bytes);
+
+    let after = state
+        .household
+        .current_owner_auth()
+        .await
+        .expect("owner auth remains present after replayed AddCredential finish");
+    assert_eq!(
+        after.owner_webauthn.entries().len(),
+        before_entries + 1,
+        "replaying a consumed AddCredential finish must not append a second Add"
+    );
+    let credentials = after.owner_webauthn_credentials(&identity.record).unwrap();
+    assert_eq!(credentials.active_count(), 2);
+    let adds_for_new_credential = after
+        .owner_webauthn
+        .entries()
+        .iter()
+        .filter(|entry| {
+            matches!(
+                &entry.event.action,
+                OwnerWebauthnCredentialEventAction::Add { credential }
+                    if credential.credential_id_bytes() == finish.credential_id.as_ref()
+            )
+        })
+        .count();
+    assert_eq!(
+        adds_for_new_credential, 1,
+        "replayed AddCredential finish must not duplicate the new credential"
+    );
+}
+
+#[tokio::test]
+async fn owner_webauthn_add_credential_finish_anchor_failure_does_not_duplicate_add() {
+    let td = tempfile::tempdir().unwrap();
+    let failing_anchor = Arc::new(FailingSetKeystore::new(td.path()));
+    let anchor_store: Arc<dyn keystore_rs::KeystoreBackend> = failing_anchor.clone();
+    let identity = Arc::new(bootstrap(td.path()));
+    let (owner_auth, person, rp, mut authenticator) =
+        owner_auth_with_webauthn_credential(&identity);
+    let before_entries = owner_auth.owner_webauthn.entries().len();
+    let before_head =
+        anchor_owner_webauthn_authority(failing_anchor.as_ref(), &identity, &owner_auth);
+    let policy = OwnerApprovalEnforcementPolicy::default()
+        .with_add_credential(OwnerOperationEnforcement::V2WhenOwnerHasActiveCredential);
+    let (td, router, _log, _broadcaster, person, identity, _window) =
+        router_from_owner_auth(td, identity, owner_auth, person, Duration::from_secs(45), {
+            move |state| {
+                state
+                    .with_owner_approval_policy(policy)
+                    .with_owner_webauthn_rp(rp)
+                    .with_owner_webauthn_anchor(anchor_store)
+            }
+        });
+
+    let start = start_add_credential(router.clone(), &person).await;
+    let mut fresh_authenticator = WebauthnAuthenticator::new(SoftPasskey::new(true));
+    let credential = fresh_authenticator
+        .do_registration(
+            Url::parse("https://alpha.example.test").unwrap(),
+            start.registration.options,
+        )
+        .unwrap();
+    let assertion = authenticator
+        .do_authentication(
+            Url::parse("https://alpha.example.test").unwrap(),
+            start.approval.options,
+        )
+        .unwrap();
+    let body = add_credential_finish_body(
+        start.context,
+        start.registration.challenge_id,
+        start.approval.challenge_id,
+        credential,
+        &assertion,
+    );
+
+    failing_anchor.fail_writes(true);
+    let (status, _headers, bytes) =
+        post_add_credential_finish(router.clone(), &person, body.clone()).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert_generic_unauth(status, &bytes);
+
+    let loaded_after_fail = load_owner_auth(&td, &identity);
+    assert_eq!(
+        loaded_after_fail.owner_webauthn.entries().len(),
+        before_entries + 1,
+        "failed anchor advance still saves exactly one AddCredential Add"
+    );
+    assert_eq!(
+        loaded_after_fail
+            .owner_webauthn_credentials(&identity.record)
+            .unwrap()
+            .active_count(),
+        2
+    );
+    let anchor_after_fail =
+        read_owner_webauthn_authority_anchor(failing_anchor.as_ref(), &identity.record.hh_id)
+            .unwrap()
+            .expect("previous WebAuthn anchor remains present");
+    assert_eq!(anchor_after_fail.sequence(), before_head.sequence);
+    assert_eq!(anchor_after_fail.head_hash(), before_head.head_hash);
+
+    let (status, _headers, bytes) = post_add_credential_finish(router, &person, body).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert_generic_unauth(status, &bytes);
+    let loaded_after_retry = load_owner_auth(&td, &identity);
+    assert_eq!(
+        loaded_after_retry.owner_webauthn.entries().len(),
+        before_entries + 1,
+        "retry after anchor failure must not sign a duplicate AddCredential Add"
+    );
+
+    failing_anchor.fail_writes(false);
+    verify_or_update_owner_webauthn_authority_anchor(
+        failing_anchor.as_ref(),
+        &loaded_after_retry.owner_webauthn,
+        &identity.record,
+        &loaded_after_retry.owner_person_cert,
+        OwnerWebauthnAnchorMode::Enforcement,
+    )
+    .expect("later enforcement advances anchor over persisted AddCredential Add");
+    let repaired_head = verified_owner_webauthn_authority_head(
+        &loaded_after_retry.owner_webauthn,
+        &identity.record,
+        &loaded_after_retry.owner_person_cert,
+    )
+    .unwrap()
+    .expect("persisted AddCredential Add has a head");
+    let repaired_anchor =
+        read_owner_webauthn_authority_anchor(failing_anchor.as_ref(), &identity.record.hh_id)
+            .unwrap()
+            .expect("later enforcement writes repaired WebAuthn anchor");
+    assert_eq!(repaired_anchor.sequence(), repaired_head.sequence);
+    assert_eq!(repaired_anchor.head_hash(), repaired_head.head_hash);
 }
 
 #[tokio::test]
