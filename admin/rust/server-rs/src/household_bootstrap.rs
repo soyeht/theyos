@@ -694,6 +694,12 @@ pub async fn bootstrap_household(shared_state: Option<SharedState>) {
                                 ),
                             )
                             .route(
+                                "/api/v1/household/owner-webauthn/add-credential/start",
+                                axum::routing::post(
+                                    handlers_owner_events::owner_webauthn_add_credential_start_handler,
+                                ),
+                            )
+                            .route(
                                 "/api/v1/household/owner-webauthn/recovery/status",
                                 axum::routing::post(
                                     handlers_owner_events::owner_webauthn_recovery_status_handler,

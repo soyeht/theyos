@@ -20,8 +20,8 @@ use axum::{
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD as B64URL};
 use household_rs::caveats::Operation;
 use household_rs::owner_approval_v2::{
-    OwnerApprovalContextV2, OwnerApprovalV2, OwnerApprovalV2Error, OwnerOperation,
-    PairMachineTrustedContextInput, ProvisionRecoveryCodeContextInput,
+    AddCredentialContextInput, OwnerApprovalContextV2, OwnerApprovalV2, OwnerApprovalV2Error,
+    OwnerOperation, PairMachineTrustedContextInput, ProvisionRecoveryCodeContextInput,
     RecoverCredentialContextInput, RecoveryAuthorityHeadInput, RevokeCredentialContextInput,
 };
 use household_rs::owner_events::{
@@ -232,6 +232,7 @@ pub struct OwnerApprovalEnforcementPolicy {
     pub pair_device_confirm: OwnerOperationEnforcement,
     pub revoke_credential: OwnerOperationEnforcement,
     pub recovery_code: OwnerOperationEnforcement,
+    pub add_credential: OwnerOperationEnforcement,
 }
 
 impl Default for OwnerApprovalEnforcementPolicy {
@@ -243,6 +244,7 @@ impl Default for OwnerApprovalEnforcementPolicy {
             pair_device_confirm: OwnerOperationEnforcement::LegacyOnly,
             revoke_credential: OwnerOperationEnforcement::LegacyOnly,
             recovery_code: OwnerOperationEnforcement::LegacyOnly,
+            add_credential: OwnerOperationEnforcement::LegacyOnly,
         }
     }
 }
@@ -267,6 +269,12 @@ impl OwnerApprovalEnforcementPolicy {
     }
 
     #[must_use]
+    pub fn with_add_credential(mut self, mode: OwnerOperationEnforcement) -> Self {
+        self.add_credential = mode;
+        self
+    }
+
+    #[must_use]
     pub fn pair_machine_approval_body_mode(
         &self,
         owner_webauthn_trust_state: OwnerWebauthnTrustState,
@@ -283,6 +291,11 @@ impl OwnerApprovalEnforcementPolicy {
     #[must_use]
     fn recovery_code_enabled(&self) -> bool {
         self.recovery_code == OwnerOperationEnforcement::V2WhenOwnerHasActiveCredential
+    }
+
+    #[must_use]
+    fn add_credential_start_enabled(&self) -> bool {
+        self.add_credential == OwnerOperationEnforcement::V2WhenOwnerHasActiveCredential
     }
 }
 
@@ -441,6 +454,10 @@ fn owner_recovery_code_v2_capabilities() -> Vec<String> {
     vec!["owner-auth-recovery-provision".to_string()]
 }
 
+fn owner_add_credential_v2_capabilities() -> Vec<String> {
+    vec!["owner-auth-add-credential".to_string()]
+}
+
 fn owner_recovery_consume_v2_capabilities() -> Vec<String> {
     vec!["owner-auth-recovery-consume".to_string()]
 }
@@ -584,8 +601,16 @@ struct OwnerWebauthnRecoveryConsumeFinishPlan {
     pre_active_credential_count: u64,
 }
 
+struct OwnerWebauthnAddCredentialStartPlan {
+    credentials: OwnerWebauthnCredentialStore,
+    webauthn_head: OwnerWebauthnAuthorityHead,
+    pre_active_credential_count: u64,
+}
+
 const OWNER_WEBAUTHN_RECOVERY_CONSUME_REGISTRATION_BINDING_PURPOSE: &str =
     "owner-webauthn-recovery-consume-registration-v1";
+const OWNER_WEBAUTHN_ADD_CREDENTIAL_REGISTRATION_BINDING_PURPOSE: &str =
+    "owner-webauthn-add-credential-registration-v1";
 
 #[derive(Serialize)]
 #[serde(deny_unknown_fields)]
@@ -601,6 +626,24 @@ struct OwnerWebauthnRecoveryConsumeRegistrationBindingContext {
     pre_active_credential_count: u64,
     recovery_head_sequence: u64,
     recovery_head_hash: ByteBuf,
+    capabilities: Vec<String>,
+    issued_at: u64,
+    expires_at: u64,
+    replay_nonce: ByteBuf,
+}
+
+#[derive(Serialize)]
+#[serde(deny_unknown_fields)]
+struct OwnerWebauthnAddCredentialRegistrationBindingContext {
+    #[serde(rename = "v")]
+    version: u8,
+    purpose: String,
+    op: String,
+    hh_id: household_rs::HouseholdId,
+    owner_p_id: household_rs::PersonId,
+    authority_head_sequence: u64,
+    authority_head_hash: ByteBuf,
+    pre_active_credential_count: u64,
     capabilities: Vec<String>,
     issued_at: u64,
     expires_at: u64,
@@ -1102,6 +1145,50 @@ fn owner_webauthn_recovery_consume_finish_plan(
     })
 }
 
+fn owner_webauthn_add_credential_start_plan(
+    state: &OwnerEventsRouterState,
+    identity: &household_rs::LoadedIdentity,
+    owner_auth: &household_rs::HouseholdAuthState,
+) -> Result<OwnerWebauthnAddCredentialStartPlan, &'static str> {
+    if !state.owner_approval_policy.add_credential_start_enabled() {
+        return Err("add_credential_policy_disabled");
+    }
+
+    let Some(verifier) = state.owner_webauthn_anchor.as_ref() else {
+        return Err("missing_anchor_verifier");
+    };
+    let webauthn_head = match classify_owner_webauthn_authority_anchor_read_only(
+        verifier.keystore.as_ref(),
+        &owner_auth.owner_webauthn,
+        &identity.record,
+        &owner_auth.owner_person_cert,
+    ) {
+        Ok(
+            OwnerWebauthnAnchorStatus::Verified { head }
+            | OwnerWebauthnAnchorStatus::Advanced { head, .. },
+        ) => head,
+        Ok(OwnerWebauthnAnchorStatus::EmptyAuthorityNoAnchor) => return Err("never_enrolled"),
+        Ok(OwnerWebauthnAnchorStatus::Migrated { .. }) => {
+            return Err("unexpected_anchor_migration");
+        }
+        Err(_) => return Err("credential_anchor_invalid"),
+    };
+    let credentials = owner_auth
+        .owner_webauthn_credentials(&identity.record)
+        .map_err(|_| "credential_reconstruct_failed")?;
+    let active_count = credentials.active_count();
+    if active_count == 0 {
+        return Err("add_credential_no_active_credentials");
+    }
+    let pre_active_credential_count =
+        u64::try_from(active_count).map_err(|_| "credential_count_overflow")?;
+    Ok(OwnerWebauthnAddCredentialStartPlan {
+        credentials,
+        webauthn_head,
+        pre_active_credential_count,
+    })
+}
+
 fn owner_webauthn_recovery_consume_registration_binding(
     identity: &household_rs::LoadedIdentity,
     owner_auth: &household_rs::HouseholdAuthState,
@@ -1134,6 +1221,88 @@ fn owner_webauthn_recovery_consume_registration_binding(
         canonical,
     )
     .map_err(|_| "recovery_consume_binding_invalid")
+}
+
+fn owner_webauthn_add_credential_registration_binding(
+    identity: &household_rs::LoadedIdentity,
+    owner_auth: &household_rs::HouseholdAuthState,
+    plan: &OwnerWebauthnAddCredentialStartPlan,
+    capabilities: Vec<String>,
+    issued_at: u64,
+    expires_at: u64,
+    replay_nonce: [u8; 32],
+) -> Result<OwnerWebauthnRegistrationBinding, &'static str> {
+    let binding_context = OwnerWebauthnAddCredentialRegistrationBindingContext {
+        version: 1,
+        purpose: OWNER_WEBAUTHN_ADD_CREDENTIAL_REGISTRATION_BINDING_PURPOSE.to_string(),
+        op: "add-credential".to_string(),
+        hh_id: identity.record.hh_id.clone(),
+        owner_p_id: owner_auth.owner_person_cert.p_id.clone(),
+        authority_head_sequence: plan.webauthn_head.sequence,
+        authority_head_hash: ByteBuf::from(plan.webauthn_head.head_hash.to_vec()),
+        pre_active_credential_count: plan.pre_active_credential_count,
+        capabilities,
+        issued_at,
+        expires_at,
+        replay_nonce: ByteBuf::from(replay_nonce.to_vec()),
+    };
+    let canonical = household_rs::cbor::to_canonical_vec(&binding_context)
+        .map_err(|_| "add_credential_binding_cbor")?;
+    OwnerWebauthnRegistrationBinding::from_canonical_binding(
+        OWNER_WEBAUTHN_ADD_CREDENTIAL_REGISTRATION_BINDING_PURPOSE,
+        canonical,
+    )
+    .map_err(|_| "add_credential_binding_invalid")
+}
+
+fn owner_webauthn_add_credential_registration_binding_from_context(
+    context: &OwnerApprovalContextV2,
+) -> Result<OwnerWebauthnRegistrationBinding, &'static str> {
+    let expected_digest = bytebuf_to_array_32(
+        context
+            .new_credential_binding_hash
+            .as_ref()
+            .ok_or("add_credential_missing_binding_hash")?
+            .as_ref(),
+        "add_credential_binding_hash_invalid",
+    )?;
+    let authority_head_hash = bytebuf_to_array_32(
+        context
+            .authority_head_hash
+            .as_ref()
+            .ok_or("add_credential_missing_authority_head_hash")?
+            .as_ref(),
+        "add_credential_authority_head_hash_invalid",
+    )?;
+    let binding_context = OwnerWebauthnAddCredentialRegistrationBindingContext {
+        version: 1,
+        purpose: OWNER_WEBAUTHN_ADD_CREDENTIAL_REGISTRATION_BINDING_PURPOSE.to_string(),
+        op: "add-credential".to_string(),
+        hh_id: context.hh_id.clone(),
+        owner_p_id: context.owner_p_id.clone(),
+        authority_head_sequence: context
+            .authority_head_sequence
+            .ok_or("add_credential_missing_authority_head_sequence")?,
+        authority_head_hash: ByteBuf::from(authority_head_hash.to_vec()),
+        pre_active_credential_count: context
+            .pre_active_credential_count
+            .ok_or("add_credential_missing_pre_active_count")?,
+        capabilities: context.capabilities.clone(),
+        issued_at: context.issued_at,
+        expires_at: context.expires_at,
+        replay_nonce: context.replay_nonce.clone(),
+    };
+    let canonical = household_rs::cbor::to_canonical_vec(&binding_context)
+        .map_err(|_| "add_credential_binding_cbor")?;
+    let binding = OwnerWebauthnRegistrationBinding::from_canonical_binding(
+        OWNER_WEBAUTHN_ADD_CREDENTIAL_REGISTRATION_BINDING_PURPOSE,
+        canonical,
+    )
+    .map_err(|_| "add_credential_binding_invalid")?;
+    if binding.binding_digest() != expected_digest {
+        return Err("add_credential_binding_digest_mismatch");
+    }
+    Ok(binding)
 }
 
 fn bytebuf_to_array_32(bytes: &[u8], reason: &'static str) -> Result<[u8; 32], &'static str> {
@@ -1633,6 +1802,22 @@ struct OwnerWebauthnRecoveryConsumeStartResponse {
     challenge_id: String,
     context: OwnerApprovalContextV2,
     options: CreationChallengeResponse,
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct OwnerWebauthnAddCredentialStartRequest {
+    #[serde(rename = "v")]
+    version: u8,
+}
+
+#[derive(Serialize)]
+struct OwnerWebauthnAddCredentialStartResponse {
+    #[serde(rename = "v")]
+    version: u8,
+    registration: OwnerWebauthnRegistrationStartResponse,
+    approval: OwnerApprovalV2StartResponse,
+    context: OwnerApprovalContextV2,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -2212,6 +2397,25 @@ fn reject_owner_webauthn_revoke_credential_finish(
     unauthenticated_response()
 }
 
+fn reject_owner_webauthn_add_credential_start(
+    reason: &'static str,
+    error: Option<String>,
+) -> Response {
+    if let Some(error) = error {
+        tracing::warn!(
+            stage = "owner_events.owner_webauthn_add_credential_start.rejected",
+            reason,
+            error = %error,
+        );
+    } else {
+        tracing::warn!(
+            stage = "owner_events.owner_webauthn_add_credential_start.rejected",
+            reason,
+        );
+    }
+    unauthenticated_response()
+}
+
 fn reject_owner_webauthn_recovery(reason: &'static str, error: Option<String>) -> Response {
     if let Some(error) = error {
         tracing::warn!(
@@ -2474,6 +2678,187 @@ pub async fn owner_webauthn_revoke_credential_start_handler(
         challenge_id: challenge_id.as_str().to_string(),
         context: expected_context,
         options,
+    })
+    .unwrap_or_default();
+    cbor_response(StatusCode::OK, bytes)
+}
+
+/// `POST /api/v1/household/owner-webauthn/add-credential/start`.
+///
+/// Starts the two ceremonies required to add a backup owner passkey: a
+/// registration ceremony for the new credential and an owner-approval assertion
+/// from an existing active credential. This is challenge-only; it does not
+/// finish either ceremony, append authority events, save owner auth, or advance
+/// anchors.
+pub async fn owner_webauthn_add_credential_start_handler(
+    State(state): State<OwnerEventsRouterState>,
+    method: Method,
+    uri: Uri,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let Some(now) =
+        time_util::unix_now_secs_checked("owner_events.owner_webauthn_add_credential_start.clock")
+    else {
+        return unauthenticated_response();
+    };
+    let path_and_query = uri
+        .path_and_query()
+        .map_or_else(|| uri.path().to_string(), |pq| pq.as_str().to_string());
+    let authorized_owner_auth =
+        match household_auth::authorize_owner_webauthn_add_credential_start_request(
+            &state.household,
+            &headers,
+            &method,
+            &path_and_query,
+            &body,
+            now,
+        )
+        .await
+        {
+            Ok(owner_auth) => owner_auth,
+            Err(e) => {
+                return reject_owner_webauthn_add_credential_start(
+                    "pop_auth_failed",
+                    Some(e.to_string()),
+                );
+            }
+        };
+
+    let request: OwnerWebauthnAddCredentialStartRequest = match decode_canonical_cbor(&body) {
+        Ok(request) => request,
+        Err(e) => return reject_owner_webauthn_add_credential_start("cbor_decode", Some(e)),
+    };
+    if request.version != 1 {
+        return reject_owner_webauthn_add_credential_start("bad_version", None);
+    }
+
+    let _mutation_guard = crate::bootstrap_mutation_lock::BOOTSTRAP_MUTATION_LOCK
+        .lock()
+        .await;
+    let Some(identity) = state.household.current().await else {
+        return reject_owner_webauthn_add_credential_start("identity_unavailable", None);
+    };
+    let Some(current_owner_auth) = state.household.current_owner_auth().await else {
+        return reject_owner_webauthn_add_credential_start("owner_auth_unavailable", None);
+    };
+    if current_owner_auth.owner_person_cert.p_id != authorized_owner_auth.owner_person_cert.p_id {
+        return reject_owner_webauthn_add_credential_start("owner_auth_changed", None);
+    }
+    let plan = match owner_webauthn_add_credential_start_plan(
+        &state,
+        &identity,
+        current_owner_auth.as_ref(),
+    ) {
+        Ok(plan) => plan,
+        Err(reason) => return reject_owner_webauthn_add_credential_start(reason, None),
+    };
+    let Some(rp) = state.owner_webauthn_rp.as_ref() else {
+        return reject_owner_webauthn_add_credential_start("rp_unavailable", None);
+    };
+
+    let mut rng = OsRng;
+    let mut replay_nonce = [0_u8; 32];
+    rng.fill_bytes(&mut replay_nonce);
+    let mut rp = rp.lock().await;
+    let issued_at = now;
+    let expires_at = now.saturating_add(rp.config().challenge_ttl().as_secs());
+    let capabilities = owner_add_credential_v2_capabilities();
+    let registration_binding = match owner_webauthn_add_credential_registration_binding(
+        &identity,
+        current_owner_auth.as_ref(),
+        &plan,
+        capabilities.clone(),
+        issued_at,
+        expires_at,
+        replay_nonce,
+    ) {
+        Ok(binding) => binding,
+        Err(reason) => return reject_owner_webauthn_add_credential_start(reason, None),
+    };
+    let expected_context = OwnerApprovalContextV2::add_credential(AddCredentialContextInput {
+        hh_id: identity.record.hh_id.clone(),
+        owner_p_id: current_owner_auth.owner_person_cert.p_id.clone(),
+        new_credential_binding_hash: registration_binding.binding_digest(),
+        authority_head_sequence: plan.webauthn_head.sequence,
+        authority_head_hash: plan.webauthn_head.head_hash,
+        pre_active_credential_count: plan.pre_active_credential_count,
+        capabilities,
+        issued_at,
+        expires_at,
+        replay_nonce,
+    });
+    if let Err(e) = expected_context.validate_shape() {
+        return reject_owner_webauthn_add_credential_start(
+            "trusted_context_build_failed",
+            Some(e.to_string()),
+        );
+    }
+    let reconstructed_binding =
+        match owner_webauthn_add_credential_registration_binding_from_context(&expected_context) {
+            Ok(binding) => binding,
+            Err(reason) => return reject_owner_webauthn_add_credential_start(reason, None),
+        };
+    if reconstructed_binding != registration_binding {
+        return reject_owner_webauthn_add_credential_start(
+            "add_credential_binding_reconstruction_mismatch",
+            None,
+        );
+    }
+
+    let user_id = owner_webauthn_user_uuid(current_owner_auth.as_ref());
+    let owner_name = current_owner_auth.owner_person_cert.p_id.0.as_str();
+    let owner_display_name = current_owner_auth.owner_person_cert.display_name.as_str();
+    let (registration_challenge_id, registration_options) = match rp.start_registration_from(
+        &mut rng,
+        now,
+        OwnerWebauthnRegistrationStart {
+            owner_user_id: user_id,
+            owner_name,
+            owner_display_name,
+            existing_credentials: plan.credentials.credentials(),
+            binding: Some(registration_binding),
+        },
+    ) {
+        Ok(started) => started,
+        Err(e) => {
+            return reject_owner_webauthn_add_credential_start(
+                "registration_start_failed",
+                Some(e.to_string()),
+            );
+        }
+    };
+    // If approval start fails after registration is staged, the registration
+    // challenge is an orphan until TTL. It is not a grant: finish must present
+    // both this registration binding and an approval assertion for this context.
+    let (approval_challenge_id, approval_options) = match rp.start_owner_approval_assertion(
+        &mut rng,
+        now,
+        plan.credentials.credentials(),
+        &expected_context,
+    ) {
+        Ok(started) => started,
+        Err(e) => {
+            return reject_owner_webauthn_add_credential_start(
+                "approval_start_failed",
+                Some(e.to_string()),
+            );
+        }
+    };
+    let bytes = household_rs::cbor::to_canonical_vec(&OwnerWebauthnAddCredentialStartResponse {
+        version: 1,
+        registration: OwnerWebauthnRegistrationStartResponse {
+            version: 1,
+            challenge_id: registration_challenge_id.as_str().to_string(),
+            options: registration_options,
+        },
+        approval: OwnerApprovalV2StartResponse {
+            version: 1,
+            challenge_id: approval_challenge_id.as_str().to_string(),
+            context: expected_context.clone(),
+            options: approval_options,
+        },
+        context: expected_context,
     })
     .unwrap_or_default();
     cbor_response(StatusCode::OK, bytes)
@@ -5295,6 +5680,8 @@ mod tests {
             policy.revoke_credential,
             OwnerOperationEnforcement::LegacyOnly
         );
+        assert_eq!(policy.recovery_code, OwnerOperationEnforcement::LegacyOnly);
+        assert_eq!(policy.add_credential, OwnerOperationEnforcement::LegacyOnly);
     }
 
     #[test]
