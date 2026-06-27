@@ -25,9 +25,12 @@ use household_rs::owner_events::{
     JoinCancelledPayload, MachineJoinedPayload, OwnerDevicePushToken, OwnerEvent, OwnerEventLog,
     OwnerEventPayload, OwnerEventType, OwnerEventsBroadcaster,
 };
-use household_rs::owner_webauthn::{OwnerWebauthnChallengeId, OwnerWebauthnRp};
+use household_rs::owner_webauthn::{
+    OwnerWebauthnChallengeId, OwnerWebauthnCredentialStore, OwnerWebauthnRp,
+};
 use household_rs::owner_webauthn_anchor::{
-    OwnerWebauthnAnchorMode, verify_or_update_owner_webauthn_authority_anchor,
+    OwnerWebauthnAnchorMode, OwnerWebauthnAnchorStatus,
+    verify_or_update_owner_webauthn_authority_anchor,
 };
 use household_rs::pair_machine::{
     CeremonyError, CeremonyInputs, CeremonyTxn, FinalizeWithM2Options, FinalizeWithM2Outcome,
@@ -193,10 +196,10 @@ impl OwnerApprovalEnforcementPolicy {
     #[must_use]
     pub fn pair_machine_approval_body_mode(
         &self,
-        owner_has_active_webauthn_credential: bool,
+        owner_webauthn_trust_state: OwnerWebauthnTrustState,
     ) -> PairMachineApprovalBodyMode {
         self.pair_machine_approve
-            .body_mode(owner_has_active_webauthn_credential)
+            .body_mode(owner_webauthn_trust_state)
     }
 }
 
@@ -212,12 +215,59 @@ pub enum OwnerOperationEnforcement {
 
 impl OwnerOperationEnforcement {
     #[must_use]
-    fn body_mode(self, owner_has_active_webauthn_credential: bool) -> PairMachineApprovalBodyMode {
-        match (self, owner_has_active_webauthn_credential) {
-            (Self::LegacyOnly, _) | (Self::V2WhenOwnerHasActiveCredential, false) => {
+    fn body_mode(
+        self,
+        owner_webauthn_trust_state: OwnerWebauthnTrustState,
+    ) -> PairMachineApprovalBodyMode {
+        match (self, owner_webauthn_trust_state) {
+            (Self::LegacyOnly, _)
+            | (Self::V2WhenOwnerHasActiveCredential, OwnerWebauthnTrustState::NeverEnrolled) => {
                 PairMachineApprovalBodyMode::LegacyV1
             }
-            (Self::V2WhenOwnerHasActiveCredential, true) => PairMachineApprovalBodyMode::RequireV2,
+            (Self::V2WhenOwnerHasActiveCredential, OwnerWebauthnTrustState::Active { .. }) => {
+                PairMachineApprovalBodyMode::RequireV2
+            }
+            (
+                Self::V2WhenOwnerHasActiveCredential,
+                OwnerWebauthnTrustState::RecoveryRequired | OwnerWebauthnTrustState::AnchorInvalid,
+            ) => PairMachineApprovalBodyMode::RejectFailClosed,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OwnerWebauthnTrustState {
+    NeverEnrolled,
+    Active { count: usize },
+    RecoveryRequired,
+    AnchorInvalid,
+}
+
+#[derive(Clone, Debug)]
+struct OwnerWebauthnPolicySnapshot {
+    trust_state: OwnerWebauthnTrustState,
+    credentials: Option<OwnerWebauthnCredentialStore>,
+}
+
+impl OwnerWebauthnPolicySnapshot {
+    fn never_enrolled() -> Self {
+        Self {
+            trust_state: OwnerWebauthnTrustState::NeverEnrolled,
+            credentials: None,
+        }
+    }
+
+    fn recovery_required() -> Self {
+        Self {
+            trust_state: OwnerWebauthnTrustState::RecoveryRequired,
+            credentials: None,
+        }
+    }
+
+    fn anchor_invalid() -> Self {
+        Self {
+            trust_state: OwnerWebauthnTrustState::AnchorInvalid,
+            credentials: None,
         }
     }
 }
@@ -226,6 +276,7 @@ impl OwnerOperationEnforcement {
 pub enum PairMachineApprovalBodyMode {
     LegacyV1,
     RequireV2,
+    RejectFailClosed,
 }
 
 pub fn reassert_pair_machine_approval_context_against_live_window(
@@ -347,30 +398,51 @@ fn pair_machine_expected_context_from_snapshot(
     )
 }
 
-fn pair_machine_credentials_for_policy(
+fn pair_machine_owner_webauthn_policy_snapshot(
     state: &OwnerEventsRouterState,
     identity: &household_rs::LoadedIdentity,
     owner_auth: &household_rs::HouseholdAuthState,
-) -> Result<Option<household_rs::owner_webauthn::OwnerWebauthnCredentialStore>, String> {
+) -> OwnerWebauthnPolicySnapshot {
     if state.owner_approval_policy.pair_machine_approve == OwnerOperationEnforcement::LegacyOnly {
-        return Ok(None);
+        return OwnerWebauthnPolicySnapshot::never_enrolled();
     }
-    let verifier = state
-        .owner_webauthn_anchor
-        .as_ref()
-        .ok_or_else(|| "owner webauthn anchor verifier unavailable".to_string())?;
-    verify_or_update_owner_webauthn_authority_anchor(
+
+    let Some(verifier) = state.owner_webauthn_anchor.as_ref() else {
+        return OwnerWebauthnPolicySnapshot::anchor_invalid();
+    };
+    let anchor_status = verify_or_update_owner_webauthn_authority_anchor(
         verifier.keystore.as_ref(),
         &owner_auth.owner_webauthn,
         &identity.record,
         &owner_auth.owner_person_cert,
         OwnerWebauthnAnchorMode::Enforcement,
-    )
-    .map_err(|e| e.to_string())?;
-    owner_auth
-        .owner_webauthn_credentials(&identity.record)
-        .map(Some)
-        .map_err(|e| e.to_string())
+    );
+    match anchor_status {
+        Ok(OwnerWebauthnAnchorStatus::EmptyAuthorityNoAnchor) => {
+            OwnerWebauthnPolicySnapshot::never_enrolled()
+        }
+        Ok(
+            OwnerWebauthnAnchorStatus::Verified { .. }
+            | OwnerWebauthnAnchorStatus::Advanced { .. }
+            | OwnerWebauthnAnchorStatus::Migrated { .. },
+        ) => match owner_auth.owner_webauthn_credentials(&identity.record) {
+            Ok(credentials) => {
+                let active_count = credentials.active_count();
+                if active_count == 0 {
+                    OwnerWebauthnPolicySnapshot::recovery_required()
+                } else {
+                    OwnerWebauthnPolicySnapshot {
+                        trust_state: OwnerWebauthnTrustState::Active {
+                            count: active_count,
+                        },
+                        credentials: Some(credentials),
+                    }
+                }
+            }
+            Err(_) => OwnerWebauthnPolicySnapshot::anchor_invalid(),
+        },
+        Err(_) => OwnerWebauthnPolicySnapshot::anchor_invalid(),
+    }
 }
 
 fn parse_pair_machine_approval_body(
@@ -379,6 +451,7 @@ fn parse_pair_machine_approval_body(
     body: &[u8],
 ) -> Result<PairMachineApprovalWireBody, &'static str> {
     match mode {
+        PairMachineApprovalBodyMode::RejectFailClosed => Err("owner_webauthn_trust_not_satisfied"),
         PairMachineApprovalBodyMode::LegacyV1 => {
             let approval: OwnerApproval =
                 household_rs::cbor::from_canonical_slice(body).map_err(|_| "cbor_decode")?;
@@ -1169,36 +1242,28 @@ pub async fn owner_approval_v2_start_handler(
         );
         return unauthenticated_response();
     };
-    let credentials =
-        match pair_machine_credentials_for_policy(&state, &identity, owner_auth.as_ref()) {
-            Ok(Some(credentials)) => credentials,
-            Ok(None) => {
-                tracing::warn!(
-                    stage = "owner_events.approval_v2_start.rejected",
-                    reason = "policy_legacy_only",
-                );
-                return unauthenticated_response();
-            }
-            Err(e) => {
-                tracing::warn!(
-                    stage = "owner_events.approval_v2_start.rejected",
-                    reason = "owner_webauthn_authority_unavailable",
-                    error = %e,
-                );
-                return unauthenticated_response();
-            }
-        };
+    let policy_snapshot =
+        pair_machine_owner_webauthn_policy_snapshot(&state, &identity, owner_auth.as_ref());
     if state
         .owner_approval_policy
-        .pair_machine_approval_body_mode(credentials.active_count() > 0)
+        .pair_machine_approval_body_mode(policy_snapshot.trust_state)
         != PairMachineApprovalBodyMode::RequireV2
     {
         tracing::warn!(
             stage = "owner_events.approval_v2_start.rejected",
-            reason = "owner_has_no_active_webauthn_credential",
+            reason = "owner_webauthn_trust_not_active",
+            trust_state = ?policy_snapshot.trust_state,
         );
         return unauthenticated_response();
     }
+    let Some(credentials) = policy_snapshot.credentials else {
+        tracing::warn!(
+            stage = "owner_events.approval_v2_start.rejected",
+            reason = "owner_webauthn_credentials_unavailable",
+            trust_state = ?policy_snapshot.trust_state,
+        );
+        return unauthenticated_response();
+    };
     let Some(rp) = state.owner_webauthn_rp.as_ref() else {
         tracing::warn!(
             stage = "owner_events.approval_v2_start.rejected",
@@ -1329,23 +1394,11 @@ pub async fn owner_approve_handler(
         );
         return unauthenticated_response();
     };
-    let credentials_for_policy =
-        match pair_machine_credentials_for_policy(&state, &identity, owner_auth.as_ref()) {
-            Ok(credentials) => credentials,
-            Err(e) => {
-                tracing::warn!(
-                    stage = "owner_events.approve.rejected",
-                    reason = "owner_webauthn_authority_unavailable",
-                    error = %e,
-                );
-                return unauthenticated_response();
-            }
-        };
-    let body_mode = state.owner_approval_policy.pair_machine_approval_body_mode(
-        credentials_for_policy
-            .as_ref()
-            .is_some_and(|credentials| credentials.active_count() > 0),
-    );
+    let policy_snapshot =
+        pair_machine_owner_webauthn_policy_snapshot(&state, &identity, owner_auth.as_ref());
+    let body_mode = state
+        .owner_approval_policy
+        .pair_machine_approval_body_mode(policy_snapshot.trust_state);
     let approval_wire = match parse_pair_machine_approval_body(body_mode, cursor, &body) {
         Ok(approval) => approval,
         Err(reason) => {
@@ -1412,10 +1465,11 @@ pub async fn owner_approve_handler(
                 );
                 return unauthenticated_response();
             }
-            let Some(credentials) = credentials_for_policy.as_ref() else {
+            let Some(credentials) = policy_snapshot.credentials.as_ref() else {
                 tracing::warn!(
                     stage = "owner_events.approve.rejected",
                     reason = "owner_webauthn_credentials_unavailable",
+                    trust_state = ?policy_snapshot.trust_state,
                 );
                 return unauthenticated_response();
             };
@@ -2555,11 +2609,19 @@ mod tests {
     fn owner_approval_policy_is_per_operation_and_default_off() {
         let policy = OwnerApprovalEnforcementPolicy::default();
         assert_eq!(
-            policy.pair_machine_approval_body_mode(false),
+            policy.pair_machine_approval_body_mode(OwnerWebauthnTrustState::NeverEnrolled),
             PairMachineApprovalBodyMode::LegacyV1
         );
         assert_eq!(
-            policy.pair_machine_approval_body_mode(true),
+            policy.pair_machine_approval_body_mode(OwnerWebauthnTrustState::Active { count: 1 }),
+            PairMachineApprovalBodyMode::LegacyV1
+        );
+        assert_eq!(
+            policy.pair_machine_approval_body_mode(OwnerWebauthnTrustState::RecoveryRequired),
+            PairMachineApprovalBodyMode::LegacyV1
+        );
+        assert_eq!(
+            policy.pair_machine_approval_body_mode(OwnerWebauthnTrustState::AnchorInvalid),
             PairMachineApprovalBodyMode::LegacyV1
         );
         assert_eq!(
@@ -2586,13 +2648,23 @@ mod tests {
             .with_pair_machine_approve(OwnerOperationEnforcement::V2WhenOwnerHasActiveCredential);
 
         assert_eq!(
-            policy.pair_machine_approval_body_mode(false),
+            policy.pair_machine_approval_body_mode(OwnerWebauthnTrustState::NeverEnrolled),
             PairMachineApprovalBodyMode::LegacyV1,
-            "owners without enrolled passkeys keep the legacy path during migration"
+            "owners who never enrolled passkeys keep the legacy path during migration"
         );
         assert_eq!(
-            policy.pair_machine_approval_body_mode(true),
+            policy.pair_machine_approval_body_mode(OwnerWebauthnTrustState::Active { count: 1 }),
             PairMachineApprovalBodyMode::RequireV2
+        );
+        assert_eq!(
+            policy.pair_machine_approval_body_mode(OwnerWebauthnTrustState::RecoveryRequired),
+            PairMachineApprovalBodyMode::RejectFailClosed,
+            "zero active credentials after prior enrollment must not downgrade to legacy"
+        );
+        assert_eq!(
+            policy.pair_machine_approval_body_mode(OwnerWebauthnTrustState::AnchorInvalid),
+            PairMachineApprovalBodyMode::RejectFailClosed,
+            "anchor failures must not downgrade to legacy"
         );
     }
 
