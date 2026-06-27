@@ -1062,14 +1062,23 @@ fn router_with_owner_webauthn_recovery(
     timeout: Duration,
     recovery_policy_enabled: bool,
 ) -> OwnerWebauthnRecoveryRouterFixture {
+    router_with_owner_webauthn_recovery_with_limiter(timeout, recovery_policy_enabled, Some(100))
+}
+
+fn router_with_owner_webauthn_recovery_with_limiter(
+    timeout: Duration,
+    recovery_policy_enabled: bool,
+    recovery_consume_limiter_limit: Option<i64>,
+) -> OwnerWebauthnRecoveryRouterFixture {
     let td = tempfile::tempdir().unwrap();
     let recovery_anchor_store: Arc<dyn keystore_rs::KeystoreBackend> =
         Arc::new(FileKeystore::new(td.path(), keystore_rs::SERVICE));
-    router_with_owner_webauthn_recovery_anchor(
+    router_with_owner_webauthn_recovery_anchor_with_limiter(
         timeout,
         recovery_policy_enabled,
         td,
         recovery_anchor_store,
+        recovery_consume_limiter_limit,
     )
 }
 
@@ -1079,21 +1088,39 @@ fn router_with_owner_webauthn_recovery_anchor(
     td: TempDir,
     recovery_anchor_store: Arc<dyn keystore_rs::KeystoreBackend>,
 ) -> OwnerWebauthnRecoveryRouterFixture {
+    router_with_owner_webauthn_recovery_anchor_with_limiter(
+        timeout,
+        recovery_policy_enabled,
+        td,
+        recovery_anchor_store,
+        Some(100),
+    )
+}
+
+fn router_with_owner_webauthn_recovery_anchor_with_limiter(
+    timeout: Duration,
+    recovery_policy_enabled: bool,
+    td: TempDir,
+    recovery_anchor_store: Arc<dyn keystore_rs::KeystoreBackend>,
+    recovery_consume_limiter_limit: Option<i64>,
+) -> OwnerWebauthnRecoveryRouterFixture {
     let identity = Arc::new(bootstrap(td.path()));
     let (owner_auth, person, rp, authenticator) = owner_auth_with_webauthn_credential(&identity);
     let webauthn_anchor_store: Arc<dyn keystore_rs::KeystoreBackend> =
         Arc::new(FileKeystore::new(td.path(), keystore_rs::SERVICE));
     anchor_owner_webauthn_authority(webauthn_anchor_store.as_ref(), &identity, &owner_auth);
-    let recovery_consume_limiter = Arc::new(
-        server_rs::ratelimit::Limiter::new(
-            td.path()
-                .join("recovery-consume-rate-limit.db")
-                .to_str()
-                .unwrap(),
-            100,
+    let recovery_consume_limiter = recovery_consume_limiter_limit.map(|limit| {
+        Arc::new(
+            server_rs::ratelimit::Limiter::new(
+                td.path()
+                    .join("recovery-consume-rate-limit.db")
+                    .to_str()
+                    .unwrap(),
+                limit,
+            )
+            .unwrap(),
         )
-        .unwrap(),
-    );
+    });
     let policy = if recovery_policy_enabled {
         OwnerApprovalEnforcementPolicy::default()
             .with_recovery_code(OwnerOperationEnforcement::V2WhenOwnerHasActiveCredential)
@@ -1105,12 +1132,16 @@ fn router_with_owner_webauthn_recovery_anchor(
             let webauthn_anchor_store = Arc::clone(&webauthn_anchor_store);
             let recovery_anchor_store = Arc::clone(&recovery_anchor_store);
             move |state| {
-                state
+                let state = state
                     .with_owner_approval_policy(policy)
                     .with_owner_webauthn_rp(rp)
                     .with_owner_webauthn_anchor(webauthn_anchor_store)
-                    .with_owner_webauthn_recovery_anchor(recovery_anchor_store)
-                    .with_recovery_consume_rate_limiter(recovery_consume_limiter)
+                    .with_owner_webauthn_recovery_anchor(recovery_anchor_store);
+                if let Some(limiter) = recovery_consume_limiter {
+                    state.with_recovery_consume_rate_limiter(limiter)
+                } else {
+                    state
+                }
             }
         });
     (
@@ -1981,6 +2012,31 @@ async fn recovery_finish(
         household_rs::cbor::from_canonical_slice(&resp_bytes).unwrap();
     assert_eq!(response.version, 1);
     response
+}
+
+async fn provision_recovery_code(
+    router: Router,
+    person: &P256Keypair,
+    authenticator: &mut WebauthnAuthenticator<SoftPasskey>,
+) -> String {
+    let provision_start = start_recovery(router.clone(), person).await;
+    let assertion = authenticator
+        .do_authentication(
+            Url::parse("https://alpha.example.test").unwrap(),
+            provision_start.options,
+        )
+        .unwrap();
+    recovery_finish(
+        router,
+        person,
+        recovery_finish_body(
+            provision_start.context,
+            provision_start.challenge_id,
+            &assertion,
+        ),
+    )
+    .await
+    .recovery_code
 }
 
 fn recovery_consume_start_body(recovery_code: &str) -> Vec<u8> {
@@ -3793,6 +3849,51 @@ async fn owner_webauthn_recovery_consume_start_wrong_code_is_opaque_and_does_not
     let retry =
         start_recovery_consume(router.clone(), &person, &provision_finish.recovery_code).await;
     assert_eq!(retry.context.op, OwnerOperation::RecoverCredential);
+}
+
+#[tokio::test]
+async fn owner_webauthn_recovery_consume_start_rate_limit_rejects_opaque_without_challenge() {
+    let (
+        _td,
+        router,
+        _log,
+        _broadcaster,
+        person,
+        _identity,
+        _window,
+        _webauthn_anchor,
+        _recovery_anchor,
+        mut authenticator,
+    ) = router_with_owner_webauthn_recovery_with_limiter(Duration::from_secs(45), true, Some(1));
+    let recovery_code = provision_recovery_code(router.clone(), &person, &mut authenticator).await;
+
+    let first = start_recovery_consume(router.clone(), &person, &recovery_code).await;
+    assert_eq!(first.context.op, OwnerOperation::RecoverCredential);
+
+    let (status, _headers, resp_bytes) =
+        post_recovery_consume_start(router.clone(), &person, &recovery_code).await;
+    assert_generic_unauth(status, &resp_bytes);
+}
+
+#[tokio::test]
+async fn owner_webauthn_recovery_consume_start_missing_limiter_fails_closed() {
+    let (
+        _td,
+        router,
+        _log,
+        _broadcaster,
+        person,
+        _identity,
+        _window,
+        _webauthn_anchor,
+        _recovery_anchor,
+        mut authenticator,
+    ) = router_with_owner_webauthn_recovery_with_limiter(Duration::from_secs(45), true, None);
+    let recovery_code = provision_recovery_code(router.clone(), &person, &mut authenticator).await;
+
+    let (status, _headers, resp_bytes) =
+        post_recovery_consume_start(router.clone(), &person, &recovery_code).await;
+    assert_generic_unauth(status, &resp_bytes);
 }
 
 #[tokio::test]
