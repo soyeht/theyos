@@ -167,6 +167,9 @@ impl OwnerWebauthnCredential {
         result: &AuthenticationResult,
     ) -> Result<(), OwnerWebauthnError> {
         let counter = result.counter();
+        // The counter update is local to the credential instance used for this
+        // ceremony. The authority log does not persist sign-count advances yet,
+        // so clone detection is best-effort until a future persist+anchor slice.
         validate_next_sign_count(self.last_sign_count, counter)?;
         if counter > self.last_sign_count {
             self.last_sign_count = counter;
@@ -648,6 +651,8 @@ impl OwnerWebauthnRp {
 }
 
 pub fn validate_next_sign_count(previous: u32, next: u32) -> Result<(), OwnerWebauthnError> {
+    // Synced platform passkeys commonly report zero forever. Treat zero as an
+    // unknown counter baseline, not as durable clone-detection evidence.
     if previous > 0 && next <= previous {
         return Err(OwnerWebauthnError::SignCountRegression { previous, next });
     }
@@ -1236,9 +1241,10 @@ mod tests {
     }
 
     #[test]
-    fn sign_count_accepts_zero_for_synced_passkeys_and_monotonic_increase() {
+    fn sign_count_policy_treats_zero_as_synced_passkey_unknown_baseline() {
         assert!(validate_next_sign_count(0, 0).is_ok());
         assert!(validate_next_sign_count(0, 1).is_ok());
+        assert!(validate_next_sign_count(0, 10).is_ok());
         assert!(validate_next_sign_count(1, 2).is_ok());
     }
 

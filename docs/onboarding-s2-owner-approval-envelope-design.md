@@ -221,6 +221,32 @@ Verification order:
 The assertion itself remains opaque to local code outside the S1 verifier. Do
 not hand-roll COSE/client-data/signature validation in pair-machine handlers.
 
+## Sign-count Policy
+
+WebAuthn `sign_count` is not a durable clone-detection guarantee for the
+default owner passkey path. Synced platform passkeys, including iCloud-synced
+passkeys, may report counter `0` forever. Treating repeated zero values as a
+regression would reject legitimate synced passkeys, so zero is an unknown
+counter baseline.
+
+The current S1/S2 verification path therefore uses `sign_count` as a
+best-effort, ceremony-local check only:
+
+- `previous == 0` accepts `next == 0` and any later positive counter.
+- Once a positive counter has been established for the credential instance
+  being verified, `next <= previous` is rejected as a regression.
+- Counter advances are not appended to the owner WebAuthn authority log and are
+  not advanced in the rollback anchor in the current design.
+
+This means S2 must not claim durable clone detection for the default
+synced-passkey deployment. If hardware or otherwise non-synced authenticators
+with meaningful monotonically increasing counters become a security target,
+that is a future persist+anchor slice: record the counter advance in the owner
+WebAuthn authority log, persist it before trusting it for later requests, and
+advance the keystore-backed anchor after the log commit. Until that exists,
+`sign_count` is an audit signal and local verifier hardening, not an enforced
+durable policy.
+
 ## Replay And Expiry
 
 `replay_nonce` is server-issued and stored server-side with the S1 challenge.
