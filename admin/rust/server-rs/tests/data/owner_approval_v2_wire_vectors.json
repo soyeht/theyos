@@ -10,7 +10,7 @@
   ],
   "format": {
     "canonical_cbor": "RFC 8949 deterministic map encoding via household_rs::cbor.",
-    "context": "The embedded context uses the existing ownerApprovalContextV2 pair-machine shape plus the dedicated RevokeCredential, ProvisionRecoveryCode, and AddCredential shapes.",
+    "context": "The embedded context uses the existing ownerApprovalContextV2 pair-machine shape plus the dedicated RevokeCredential, ProvisionRecoveryCode, AddCredential, and RecoverCredential shapes.",
     "owner_approval_v2_byte_string_fields": [
       "credential_id",
       "authenticator_data",
@@ -30,6 +30,7 @@
     "revoke_credential_context": "target_credential_id is CBOR bytes even when the bytes look like base64url text; authority_head_hash is exactly 32 CBOR bytes; authority_head_sequence and pre_active_credential_count are canonical CBOR unsigned integers.",
     "provision_recovery_code_context": "authority_head_hash and recovery_head_hash are exactly 32 CBOR bytes; recovery_head_sequence/recovery_head_hash are omitted together when there is no anchored recovery head; authority_head_sequence, recovery_head_sequence, and pre_active_credential_count are canonical CBOR unsigned integers.",
     "add_credential_context": "new_credential_binding_hash and authority_head_hash are exactly 32 CBOR bytes; authority_head_sequence and pre_active_credential_count are canonical CBOR unsigned integers; the actor credential is intentionally omitted and comes from the owner approval assertion.",
+    "recover_credential_context": "new_credential_binding_hash, authority_head_hash, and recovery_head_hash are exactly 32 CBOR bytes; authority_head_sequence, recovery_head_sequence, and pre_active_credential_count are canonical CBOR unsigned integers; pre_active_credential_count is telemetry and MAY be zero for break-glass recovery.",
     "webauthn_base64url_text_fields": [
       "options.publicKey.challenge",
       "options.publicKey.allowCredentials[].id"
@@ -313,6 +314,29 @@
         "replay_nonce_hex": "5555555555555555555555555555555555555555555555555555555555555555"
       },
       "canonical_cbor_hex": "ad617602626f706e6164642d63726564656e7469616c6568685f6964783768685f6161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616167707572706f7365716f776e65722d617070726f76616c2d7632696973737565645f61741903e86a657870697265735f61741906406a6f776e65725f705f69646d705f6f776e65722d616c7068616c6361706162696c69746965738178196f776e65722d617574682d6164642d63726564656e7469616c6c7265706c61795f6e6f6e63655820555555555555555555555555555555555555555555555555555555555555555573617574686f726974795f686561645f686173685820444444444444444444444444444444444444444444444444444444444444444477617574686f726974795f686561645f73657175656e63651818781b6e65775f63726564656e7469616c5f62696e64696e675f686173685820414145436750395f414145436750395f414145436750395f414145436750395f781b7072655f6163746976655f63726564656e7469616c5f636f756e7402"
+    }
+  ],
+  "recover_credential_contexts": [
+    {
+      "id": "recover-credential-allows-zero-active-count",
+      "input": {
+        "v": 2,
+        "purpose": "owner-approval-v2",
+        "op": "recover-credential",
+        "hh_id": "hh_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "owner_p_id": "p_owner-alpha",
+        "new_credential_binding_hash_hex": "5245436750395f5245436750395f5245436750395f5245436750395f52454367",
+        "authority_head_sequence": 42,
+        "authority_head_hash_hex": "6666666666666666666666666666666666666666666666666666666666666666",
+        "pre_active_credential_count": 0,
+        "recovery_head_sequence": 7,
+        "recovery_head_hash_hex": "7777777777777777777777777777777777777777777777777777777777777777",
+        "capabilities": ["owner-auth-recovery-consume"],
+        "issued_at": 2000,
+        "expires_at": 2600,
+        "replay_nonce_hex": "8888888888888888888888888888888888888888888888888888888888888888"
+      },
+      "canonical_cbor_hex": "af617602626f70727265636f7665722d63726564656e7469616c6568685f6964783768685f6161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616167707572706f7365716f776e65722d617070726f76616c2d7632696973737565645f61741907d06a657870697265735f6174190a286a6f776e65725f705f69646d705f6f776e65722d616c7068616c6361706162696c697469657381781b6f776e65722d617574682d7265636f766572792d636f6e73756d656c7265706c61795f6e6f6e636558208888888888888888888888888888888888888888888888888888888888888888727265636f766572795f686561645f686173685820777777777777777777777777777777777777777777777777777777777777777773617574686f726974795f686561645f6861736858206666666666666666666666666666666666666666666666666666666666666666767265636f766572795f686561645f73657175656e63650777617574686f726974795f686561645f73657175656e6365182a781b6e65775f63726564656e7469616c5f62696e64696e675f6861736858205245436750395f5245436750395f5245436750395f5245436750395f52454367781b7072655f6163746976655f63726564656e7469616c5f636f756e7400"
     }
   ]
 }

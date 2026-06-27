@@ -8,7 +8,8 @@ use household_rs::ids::{HouseholdId, MachineId};
 use household_rs::machine_cert::PersonId;
 use household_rs::owner_approval_v2::{
     AddCredentialContextInput, OwnerApprovalContextV2, OwnerOperation,
-    PairMachineApprovalContextInput, ProvisionRecoveryCodeContextInput, RecoveryAuthorityHeadInput,
+    PairMachineApprovalContextInput, ProvisionRecoveryCodeContextInput,
+    RecoverCredentialContextInput, RecoveryAuthorityHeadInput,
 };
 use household_rs::pair_machine::JoinTransport;
 use serde::Deserialize;
@@ -92,6 +93,7 @@ fn operation(value: &str) -> OwnerOperation {
         "revoke-credential" => OwnerOperation::RevokeCredential,
         "provision-recovery-code" => OwnerOperation::ProvisionRecoveryCode,
         "add-credential" => OwnerOperation::AddCredential,
+        "recover-credential" => OwnerOperation::RecoverCredential,
         other => panic!("unknown operation in fixture: {other}"),
     }
 }
@@ -208,6 +210,48 @@ fn context_for(case: &OwnerApprovalCase) -> OwnerApprovalContextV2 {
             pre_active_credential_count: input
                 .pre_active_credential_count
                 .expect("add credential pre_active_credential_count"),
+            capabilities: input.capabilities.clone(),
+            issued_at: input.issued_at,
+            expires_at: input.expires_at,
+            replay_nonce: unhex_array_32("replay_nonce", &input.replay_nonce_hex),
+        });
+    }
+
+    if input.op == "recover-credential" {
+        let recovery_head = match (
+            input.recovery_head_sequence,
+            input.recovery_head_hash_hex.as_deref(),
+        ) {
+            (Some(sequence), Some(head_hash)) => RecoveryAuthorityHeadInput {
+                sequence,
+                head_hash: unhex_array_32("recovery_head_hash", head_hash),
+            },
+            _ => panic!("{}: recovery head must be fully present", case.id),
+        };
+        return OwnerApprovalContextV2::recover_credential(RecoverCredentialContextInput {
+            hh_id,
+            owner_p_id,
+            new_credential_binding_hash: unhex_array_32(
+                "new_credential_binding_hash",
+                input
+                    .new_credential_binding_hash_hex
+                    .as_deref()
+                    .expect("recover credential new_credential_binding_hash"),
+            ),
+            authority_head_sequence: input
+                .authority_head_sequence
+                .expect("recover credential authority_head_sequence"),
+            authority_head_hash: unhex_array_32(
+                "authority_head_hash",
+                input
+                    .authority_head_hash_hex
+                    .as_deref()
+                    .expect("recover credential authority_head_hash"),
+            ),
+            pre_active_credential_count: input
+                .pre_active_credential_count
+                .expect("recover credential pre_active_credential_count"),
+            recovery_head,
             capabilities: input.capabilities.clone(),
             issued_at: input.issued_at,
             expires_at: input.expires_at,

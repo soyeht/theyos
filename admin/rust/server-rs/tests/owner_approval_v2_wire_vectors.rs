@@ -9,8 +9,8 @@ use household_rs::ids::{HouseholdId, MachineId};
 use household_rs::machine_cert::PersonId;
 use household_rs::owner_approval_v2::{
     AddCredentialContextInput, OwnerApprovalContextV2, OwnerApprovalV2, OwnerApprovalV2Error,
-    PairMachineApprovalContextInput, ProvisionRecoveryCodeContextInput, RecoveryAuthorityHeadInput,
-    RevokeCredentialContextInput,
+    PairMachineApprovalContextInput, ProvisionRecoveryCodeContextInput,
+    RecoverCredentialContextInput, RecoveryAuthorityHeadInput, RevokeCredentialContextInput,
 };
 use household_rs::pair_machine::JoinTransport;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
@@ -28,6 +28,7 @@ struct Fixture {
     revoke_credential_contexts: Vec<RevokeCredentialContextVector>,
     provision_recovery_code_contexts: Vec<ProvisionRecoveryCodeContextVector>,
     add_credential_contexts: Vec<AddCredentialContextVector>,
+    recover_credential_contexts: Vec<RecoverCredentialContextVector>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -69,6 +70,13 @@ struct ProvisionRecoveryCodeContextVector {
 struct AddCredentialContextVector {
     id: String,
     input: AddCredentialContextInputJson,
+    canonical_cbor_hex: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct RecoverCredentialContextVector {
+    id: String,
+    input: RecoverCredentialContextInputJson,
     canonical_cbor_hex: String,
 }
 
@@ -178,6 +186,27 @@ struct AddCredentialContextInputJson {
     authority_head_sequence: u64,
     authority_head_hash_hex: String,
     pre_active_credential_count: u64,
+    capabilities: Vec<String>,
+    issued_at: u64,
+    expires_at: u64,
+    replay_nonce_hex: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RecoverCredentialContextInputJson {
+    #[serde(rename = "v")]
+    version: u8,
+    purpose: String,
+    op: String,
+    hh_id: String,
+    owner_p_id: String,
+    new_credential_binding_hash_hex: String,
+    authority_head_sequence: u64,
+    authority_head_hash_hex: String,
+    pre_active_credential_count: u64,
+    recovery_head_sequence: u64,
+    recovery_head_hash_hex: String,
     capabilities: Vec<String>,
     issued_at: u64,
     expires_at: u64,
@@ -665,6 +694,113 @@ fn add_credential_context_sequence_and_count_are_canonical_unsigned_ints() {
 }
 
 #[test]
+fn owner_approval_v2_recover_credential_context_vectors_are_canonical() {
+    let fixture = load_fixture();
+    assert_eq!(fixture.recover_credential_contexts.len(), 1);
+
+    for vector in &fixture.recover_credential_contexts {
+        let context = recover_credential_context_from_input(&vector.input);
+        context.validate_shape().unwrap();
+        let encoded =
+            assert_canonical_round_trip(vector.id.as_str(), &vector.canonical_cbor_hex, &context);
+        let encoded_hex = hex::encode(&encoded);
+
+        assert_byte_field(
+            vector.id.as_str(),
+            &encoded,
+            "new_credential_binding_hash",
+            &vector.input.new_credential_binding_hash_hex,
+        );
+        assert_byte_field(
+            vector.id.as_str(),
+            &encoded,
+            "authority_head_hash",
+            &vector.input.authority_head_hash_hex,
+        );
+        assert_byte_field(
+            vector.id.as_str(),
+            &encoded,
+            "recovery_head_hash",
+            &vector.input.recovery_head_hash_hex,
+        );
+        assert!(
+            encoded_hex.contains(&format!(
+                "{}00",
+                cbor_text_hex("pre_active_credential_count")
+            )),
+            "{} must allow and encode pre_active_credential_count=0 as telemetry",
+            vector.id,
+        );
+    }
+}
+
+#[test]
+fn recover_credential_context_rejects_missing_and_unknown_fields() {
+    let fixture = load_fixture();
+    let input = &fixture.recover_credential_contexts[0].input;
+    for missing in [
+        "new_credential_binding_hash_hex",
+        "authority_head_sequence",
+        "authority_head_hash_hex",
+        "pre_active_credential_count",
+        "recovery_head_sequence",
+        "recovery_head_hash_hex",
+    ] {
+        let mut value = serde_json::to_value(input).unwrap();
+        value.as_object_mut().unwrap().remove(missing);
+        assert!(
+            serde_json::from_value::<RecoverCredentialContextInputJson>(value).is_err(),
+            "missing {missing} must reject",
+        );
+    }
+
+    let mut value = serde_json::to_value(input).unwrap();
+    value
+        .as_object_mut()
+        .unwrap()
+        .insert("cursor".to_string(), serde_json::json!(7));
+    assert!(
+        serde_json::from_value::<RecoverCredentialContextInputJson>(value).is_err(),
+        "unknown pair-machine field must reject",
+    );
+}
+
+#[test]
+fn recover_credential_context_rejects_invalid_hash_lengths_but_allows_zero_count() {
+    let fixture = load_fixture();
+    let mut invalid_binding =
+        recover_credential_context_from_input(&fixture.recover_credential_contexts[0].input);
+    invalid_binding.new_credential_binding_hash = Some(ByteBuf::from(vec![0x41; 31]));
+    assert!(matches!(
+        invalid_binding.validate_shape(),
+        Err(OwnerApprovalV2Error::InvalidField(
+            "new_credential_binding_hash"
+        ))
+    ));
+
+    let mut invalid_authority_hash =
+        recover_credential_context_from_input(&fixture.recover_credential_contexts[0].input);
+    invalid_authority_hash.authority_head_hash = Some(ByteBuf::from(vec![0x66; 31]));
+    assert!(matches!(
+        invalid_authority_hash.validate_shape(),
+        Err(OwnerApprovalV2Error::InvalidField("authority_head_hash"))
+    ));
+
+    let mut invalid_recovery_hash =
+        recover_credential_context_from_input(&fixture.recover_credential_contexts[0].input);
+    invalid_recovery_hash.recovery_head_hash = Some(ByteBuf::from(vec![0x77; 31]));
+    assert!(matches!(
+        invalid_recovery_hash.validate_shape(),
+        Err(OwnerApprovalV2Error::InvalidField("recovery_head_hash"))
+    ));
+
+    let mut zero_count =
+        recover_credential_context_from_input(&fixture.recover_credential_contexts[0].input);
+    zero_count.pre_active_credential_count = Some(0);
+    zero_count.validate_shape().unwrap();
+}
+
+#[test]
 fn owner_approval_context_cross_rejects_fields_from_other_operations() {
     let fixture = load_fixture();
     let mut pair_machine = context_from_input(&fixture.owner_approvals[0].input.context);
@@ -736,6 +872,24 @@ fn owner_approval_context_cross_rejects_fields_from_other_operations() {
         Err(OwnerApprovalV2Error::UnexpectedField(
             "new_credential_binding_hash"
         ))
+    ));
+
+    let mut recover =
+        recover_credential_context_from_input(&fixture.recover_credential_contexts[0].input);
+    recover.target_credential_id = Some(ByteBuf::from(vec![0x41]));
+    assert!(matches!(
+        recover.validate_shape(),
+        Err(OwnerApprovalV2Error::UnexpectedField(
+            "target_credential_id"
+        ))
+    ));
+
+    let mut recover_with_pair =
+        recover_credential_context_from_input(&fixture.recover_credential_contexts[0].input);
+    recover_with_pair.cursor = Some(7);
+    assert!(matches!(
+        recover_with_pair.validate_shape(),
+        Err(OwnerApprovalV2Error::UnexpectedField("cursor"))
     ));
 }
 
@@ -866,6 +1020,33 @@ fn add_credential_context_from_input(
         authority_head_sequence: input.authority_head_sequence,
         authority_head_hash: unhex_array_32("authority_head_hash", &input.authority_head_hash_hex),
         pre_active_credential_count: input.pre_active_credential_count,
+        capabilities: input.capabilities.clone(),
+        issued_at: input.issued_at,
+        expires_at: input.expires_at,
+        replay_nonce: unhex_array_32("replay_nonce", &input.replay_nonce_hex),
+    })
+}
+
+fn recover_credential_context_from_input(
+    input: &RecoverCredentialContextInputJson,
+) -> OwnerApprovalContextV2 {
+    assert_eq!(input.version, 2);
+    assert_eq!(input.purpose, "owner-approval-v2");
+    assert_eq!(input.op, "recover-credential");
+    OwnerApprovalContextV2::recover_credential(RecoverCredentialContextInput {
+        hh_id: HouseholdId::parse(input.hh_id.clone()).unwrap(),
+        owner_p_id: PersonId(input.owner_p_id.clone()),
+        new_credential_binding_hash: unhex_array_32(
+            "new_credential_binding_hash",
+            &input.new_credential_binding_hash_hex,
+        ),
+        authority_head_sequence: input.authority_head_sequence,
+        authority_head_hash: unhex_array_32("authority_head_hash", &input.authority_head_hash_hex),
+        pre_active_credential_count: input.pre_active_credential_count,
+        recovery_head: RecoveryAuthorityHeadInput {
+            sequence: input.recovery_head_sequence,
+            head_hash: unhex_array_32("recovery_head_hash", &input.recovery_head_hash_hex),
+        },
         capabilities: input.capabilities.clone(),
         issued_at: input.issued_at,
         expires_at: input.expires_at,
