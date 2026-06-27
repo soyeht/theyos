@@ -373,6 +373,22 @@ struct OwnerWebauthnRecoveryStartRequest {
 }
 
 #[derive(serde::Serialize)]
+struct OwnerWebauthnRecoveryConsumeStartRequest {
+    #[serde(rename = "v")]
+    version: u8,
+    recovery_code: String,
+}
+
+#[derive(Deserialize)]
+struct OwnerWebauthnRecoveryConsumeStartResponse {
+    #[serde(rename = "v")]
+    version: u8,
+    challenge_id: String,
+    context: OwnerApprovalContextV2,
+    options: CreationChallengeResponse,
+}
+
+#[derive(serde::Serialize)]
 struct OwnerWebauthnRecoveryStatusRequest {
     #[serde(rename = "v")]
     version: u8,
@@ -547,6 +563,10 @@ fn router_from_owner_auth_with_router_state(
         .route(
             "/api/v1/household/owner-webauthn/recovery/finish",
             post(handlers_owner_events::owner_webauthn_recovery_finish_handler),
+        )
+        .route(
+            "/api/v1/household/owner-webauthn/recovery/consume/start",
+            post(handlers_owner_events::owner_webauthn_recovery_consume_start_handler),
         )
         .route(
             "/api/v1/household/owner-events/{cursor}/approval-v2/start",
@@ -1042,14 +1062,23 @@ fn router_with_owner_webauthn_recovery(
     timeout: Duration,
     recovery_policy_enabled: bool,
 ) -> OwnerWebauthnRecoveryRouterFixture {
+    router_with_owner_webauthn_recovery_with_limiter(timeout, recovery_policy_enabled, Some(100))
+}
+
+fn router_with_owner_webauthn_recovery_with_limiter(
+    timeout: Duration,
+    recovery_policy_enabled: bool,
+    recovery_consume_limiter_limit: Option<i64>,
+) -> OwnerWebauthnRecoveryRouterFixture {
     let td = tempfile::tempdir().unwrap();
     let recovery_anchor_store: Arc<dyn keystore_rs::KeystoreBackend> =
         Arc::new(FileKeystore::new(td.path(), keystore_rs::SERVICE));
-    router_with_owner_webauthn_recovery_anchor(
+    router_with_owner_webauthn_recovery_anchor_with_limiter(
         timeout,
         recovery_policy_enabled,
         td,
         recovery_anchor_store,
+        recovery_consume_limiter_limit,
     )
 }
 
@@ -1059,11 +1088,39 @@ fn router_with_owner_webauthn_recovery_anchor(
     td: TempDir,
     recovery_anchor_store: Arc<dyn keystore_rs::KeystoreBackend>,
 ) -> OwnerWebauthnRecoveryRouterFixture {
+    router_with_owner_webauthn_recovery_anchor_with_limiter(
+        timeout,
+        recovery_policy_enabled,
+        td,
+        recovery_anchor_store,
+        Some(100),
+    )
+}
+
+fn router_with_owner_webauthn_recovery_anchor_with_limiter(
+    timeout: Duration,
+    recovery_policy_enabled: bool,
+    td: TempDir,
+    recovery_anchor_store: Arc<dyn keystore_rs::KeystoreBackend>,
+    recovery_consume_limiter_limit: Option<i64>,
+) -> OwnerWebauthnRecoveryRouterFixture {
     let identity = Arc::new(bootstrap(td.path()));
     let (owner_auth, person, rp, authenticator) = owner_auth_with_webauthn_credential(&identity);
     let webauthn_anchor_store: Arc<dyn keystore_rs::KeystoreBackend> =
         Arc::new(FileKeystore::new(td.path(), keystore_rs::SERVICE));
     anchor_owner_webauthn_authority(webauthn_anchor_store.as_ref(), &identity, &owner_auth);
+    let recovery_consume_limiter = recovery_consume_limiter_limit.map(|limit| {
+        Arc::new(
+            server_rs::ratelimit::Limiter::new(
+                td.path()
+                    .join("recovery-consume-rate-limit.db")
+                    .to_str()
+                    .unwrap(),
+                limit,
+            )
+            .unwrap(),
+        )
+    });
     let policy = if recovery_policy_enabled {
         OwnerApprovalEnforcementPolicy::default()
             .with_recovery_code(OwnerOperationEnforcement::V2WhenOwnerHasActiveCredential)
@@ -1075,11 +1132,16 @@ fn router_with_owner_webauthn_recovery_anchor(
             let webauthn_anchor_store = Arc::clone(&webauthn_anchor_store);
             let recovery_anchor_store = Arc::clone(&recovery_anchor_store);
             move |state| {
-                state
+                let state = state
                     .with_owner_approval_policy(policy)
                     .with_owner_webauthn_rp(rp)
                     .with_owner_webauthn_anchor(webauthn_anchor_store)
-                    .with_owner_webauthn_recovery_anchor(recovery_anchor_store)
+                    .with_owner_webauthn_recovery_anchor(recovery_anchor_store);
+                if let Some(limiter) = recovery_consume_limiter {
+                    state.with_recovery_consume_rate_limiter(limiter)
+                } else {
+                    state
+                }
             }
         });
     (
@@ -1952,6 +2014,72 @@ async fn recovery_finish(
     response
 }
 
+async fn provision_recovery_code(
+    router: Router,
+    person: &P256Keypair,
+    authenticator: &mut WebauthnAuthenticator<SoftPasskey>,
+) -> String {
+    let provision_start = start_recovery(router.clone(), person).await;
+    let assertion = authenticator
+        .do_authentication(
+            Url::parse("https://alpha.example.test").unwrap(),
+            provision_start.options,
+        )
+        .unwrap();
+    recovery_finish(
+        router,
+        person,
+        recovery_finish_body(
+            provision_start.context,
+            provision_start.challenge_id,
+            &assertion,
+        ),
+    )
+    .await
+    .recovery_code
+}
+
+fn recovery_consume_start_body(recovery_code: &str) -> Vec<u8> {
+    household_rs::cbor::to_canonical_vec(&OwnerWebauthnRecoveryConsumeStartRequest {
+        version: 1,
+        recovery_code: recovery_code.to_string(),
+    })
+    .unwrap()
+}
+
+async fn post_recovery_consume_start(
+    router: Router,
+    person: &P256Keypair,
+    recovery_code: &str,
+) -> (StatusCode, HeaderMap, Vec<u8>) {
+    post_cbor(
+        router,
+        "/api/v1/household/owner-webauthn/recovery/consume/start",
+        recovery_consume_start_body(recovery_code),
+        Some(person),
+    )
+    .await
+}
+
+async fn start_recovery_consume(
+    router: Router,
+    person: &P256Keypair,
+    recovery_code: &str,
+) -> OwnerWebauthnRecoveryConsumeStartResponse {
+    let (status, headers, resp_bytes) =
+        post_recovery_consume_start(router, person, recovery_code).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        headers.get(header::CONTENT_TYPE).unwrap(),
+        "application/cbor"
+    );
+    let response: OwnerWebauthnRecoveryConsumeStartResponse =
+        household_rs::cbor::from_canonical_slice(&resp_bytes).unwrap();
+    assert_eq!(response.version, 1);
+    assert_eq!(response.context.op, OwnerOperation::RecoverCredential);
+    response
+}
+
 fn recovery_status_body() -> Vec<u8> {
     household_rs::cbor::to_canonical_vec(&OwnerWebauthnRecoveryStatusRequest { version: 1 })
         .unwrap()
@@ -2325,7 +2453,7 @@ fn owner_webauthn_recovery_source_guards_provision_readiness_contract() {
     assert!(!status.contains("advance_owner_webauthn_recovery_anchor_after_commit"));
     assert!(!status.contains("verify_or_update"));
     assert!(!status.contains("MigrationDefaultOff"));
-    assert!(!source.contains("owner_webauthn_recovery_consume_handler"));
+    assert!(!source.contains("owner_webauthn_recovery_consume_finish_handler"));
 
     let status_handler = source_segment(
         source,
@@ -2397,6 +2525,48 @@ fn owner_webauthn_recovery_source_guards_provision_readiness_contract() {
     assert!(save < memory);
     assert!(memory < anchor);
 
+    let consume_plan = source_segment(
+        source,
+        "fn owner_webauthn_recovery_consume_start_plan(",
+        "fn owner_webauthn_recovery_consume_registration_binding(",
+    );
+    assert!(consume_plan.contains("check_recovery_consume_attempt"));
+    assert!(consume_plan.contains("classify_owner_webauthn_authority_anchor_read_only"));
+    assert!(consume_plan.contains("classify_owner_webauthn_recovery_anchor_read_only"));
+    assert!(consume_plan.contains("classify_owner_webauthn_recovery_consume_readiness"));
+    assert!(consume_plan.contains("matches_code_bytes"));
+    assert!(!consume_plan.contains("owner_webauthn_active_snapshot_read_only"));
+    assert!(!consume_plan.contains("OwnerWebauthnPolicySnapshot"));
+    assert!(!consume_plan.contains("OwnerOperation::AddCredential"));
+    assert!(!consume_plan.contains("start_owner_approval_assertion"));
+    assert!(!consume_plan.contains("finish_owner_approval_assertion"));
+    assert!(!consume_plan.contains("MigrationDefaultOff"));
+    assert!(!consume_plan.contains("OwnerAuthEnrollInitial"));
+    assert!(!consume_plan.contains("HouseholdAddMachine"));
+    let limiter = consume_plan.find("check_recovery_consume_attempt").unwrap();
+    let code_compare = consume_plan.find("matches_code_bytes").unwrap();
+    assert!(limiter < code_compare);
+
+    let consume_handler = source_segment(
+        source,
+        "pub async fn owner_webauthn_recovery_consume_start_handler(",
+        "/// `POST /api/v1/household/owner-webauthn/recovery/finish`",
+    );
+    assert!(consume_handler.contains("authorize_owner_webauthn_recovery_consume_start_request"));
+    assert!(consume_handler.contains("BOOTSTRAP_MUTATION_LOCK"));
+    assert!(consume_handler.contains("OwnerApprovalContextV2::recover_credential"));
+    assert!(consume_handler.contains("start_registration_from"));
+    assert!(!consume_handler.contains("finish_registration"));
+    assert!(!consume_handler.contains("OwnerWebauthnAuthority::sign_recovery_add"));
+    assert!(!consume_handler.contains("OwnerWebauthnRecoveryAuthority::sign_consume"));
+    assert!(!consume_handler.contains(".save("));
+    assert!(!consume_handler.contains("set_owner_auth"));
+    assert!(!consume_handler.contains("advance_owner_webauthn_recovery_anchor_after_commit"));
+    assert!(!consume_handler.contains("verify_or_update_owner_webauthn_authority_anchor"));
+    assert!(!consume_handler.contains("MigrationDefaultOff"));
+    assert!(!consume_handler.contains("OwnerAuthEnrollInitial"));
+    assert!(!consume_handler.contains("HouseholdAddMachine"));
+
     let pair_machine_policy = source_segment(
         source,
         "fn pair_machine_owner_webauthn_policy_snapshot(",
@@ -2422,6 +2592,7 @@ fn owner_webauthn_recovery_source_guards_provision_readiness_contract() {
         "pub async fn authorize_owner_webauthn_recovery_status_request(",
         "pub async fn authorize_owner_webauthn_recovery_start_request(",
         "pub async fn authorize_owner_webauthn_recovery_finish_request(",
+        "pub async fn authorize_owner_webauthn_recovery_consume_start_request(",
     ] {
         let auth_helper = source_segment(
             auth_source,
@@ -2438,7 +2609,8 @@ fn owner_webauthn_recovery_source_guards_provision_readiness_contract() {
     assert!(router_source.contains("/api/v1/household/owner-webauthn/recovery/status"));
     assert!(router_source.contains("/api/v1/household/owner-webauthn/recovery/start"));
     assert!(router_source.contains("/api/v1/household/owner-webauthn/recovery/finish"));
-    assert!(!router_source.contains("/api/v1/household/owner-webauthn/recovery/consume"));
+    assert!(router_source.contains("/api/v1/household/owner-webauthn/recovery/consume/start"));
+    assert!(!router_source.contains("/api/v1/household/owner-webauthn/recovery/consume/finish"));
 }
 
 #[tokio::test]
@@ -3524,6 +3696,204 @@ async fn owner_webauthn_recovery_provision_persists_verifier_and_anchor_without_
     );
     let status = recovery_status(router, &person).await;
     assert!(status.ready);
+}
+
+#[tokio::test]
+async fn owner_webauthn_recovery_consume_start_binds_fresh_registration_without_mutation() {
+    let (
+        td,
+        router,
+        _log,
+        _broadcaster,
+        person,
+        identity,
+        _window,
+        _webauthn_anchor,
+        recovery_anchor,
+        mut authenticator,
+    ) = router_with_owner_webauthn_recovery(Duration::from_secs(45), true);
+
+    let provision_start = start_recovery(router.clone(), &person).await;
+    let assertion = authenticator
+        .do_authentication(
+            Url::parse("https://alpha.example.test").unwrap(),
+            provision_start.options,
+        )
+        .unwrap();
+    let provision_finish = recovery_finish(
+        router.clone(),
+        &person,
+        recovery_finish_body(
+            provision_start.context,
+            provision_start.challenge_id,
+            &assertion,
+        ),
+    )
+    .await;
+    let before_start = load_owner_auth(&td, &identity);
+    let before_recovery_entries = before_start.owner_webauthn_recovery.entries().len();
+    let before_webauthn_entries = before_start.owner_webauthn.entries().len();
+    let recovery_head = verified_owner_webauthn_recovery_head(
+        &before_start.owner_webauthn_recovery,
+        &identity.record,
+        &before_start.owner_person_cert,
+    )
+    .unwrap()
+    .expect("recovery provision has a head");
+    let recovery_anchor_before =
+        read_owner_webauthn_recovery_anchor(recovery_anchor.as_ref(), &identity.record.hh_id)
+            .unwrap()
+            .expect("provision finish advanced recovery anchor");
+
+    let start =
+        start_recovery_consume(router.clone(), &person, &provision_finish.recovery_code).await;
+
+    assert!(!start.challenge_id.is_empty());
+    assert_eq!(
+        start.context.capabilities,
+        vec!["owner-auth-recovery-consume".to_string()]
+    );
+    assert_eq!(start.context.pre_active_credential_count, Some(1));
+    assert_eq!(
+        start.context.recovery_head_sequence,
+        Some(recovery_head.sequence)
+    );
+    assert_eq!(
+        start
+            .context
+            .recovery_head_hash
+            .as_ref()
+            .map(ByteBuf::as_ref),
+        Some(recovery_head.head_hash.as_slice())
+    );
+    assert_eq!(
+        start
+            .context
+            .new_credential_binding_hash
+            .as_ref()
+            .map(|hash| hash.as_ref().len()),
+        Some(32),
+        "RecoverCredential must bind the future registration ceremony"
+    );
+    let mut fresh_authenticator = WebauthnAuthenticator::new(SoftPasskey::new(true));
+    drop(
+        fresh_authenticator
+            .do_registration(
+                Url::parse("https://alpha.example.test").unwrap(),
+                start.options,
+            )
+            .unwrap(),
+    );
+    let after_start = load_owner_auth(&td, &identity);
+    assert_eq!(
+        after_start.owner_webauthn_recovery.entries().len(),
+        before_recovery_entries,
+        "consume start must not append recovery Consume"
+    );
+    assert_eq!(
+        after_start.owner_webauthn.entries().len(),
+        before_webauthn_entries,
+        "consume start must not append WebAuthn Add"
+    );
+    let recovery_anchor_after =
+        read_owner_webauthn_recovery_anchor(recovery_anchor.as_ref(), &identity.record.hh_id)
+            .unwrap()
+            .expect("recovery anchor remains present");
+    assert_eq!(
+        recovery_anchor_after.sequence(),
+        recovery_anchor_before.sequence()
+    );
+    assert_eq!(
+        recovery_anchor_after.head_hash(),
+        recovery_anchor_before.head_hash()
+    );
+}
+
+#[tokio::test]
+async fn owner_webauthn_recovery_consume_start_wrong_code_is_opaque_and_does_not_burn_recovery() {
+    let (
+        _td,
+        router,
+        _log,
+        _broadcaster,
+        person,
+        _identity,
+        _window,
+        _webauthn_anchor,
+        _recovery_anchor,
+        mut authenticator,
+    ) = router_with_owner_webauthn_recovery(Duration::from_secs(45), true);
+
+    let provision_start = start_recovery(router.clone(), &person).await;
+    let assertion = authenticator
+        .do_authentication(
+            Url::parse("https://alpha.example.test").unwrap(),
+            provision_start.options,
+        )
+        .unwrap();
+    let provision_finish = recovery_finish(
+        router.clone(),
+        &person,
+        recovery_finish_body(
+            provision_start.context,
+            provision_start.challenge_id,
+            &assertion,
+        ),
+    )
+    .await;
+
+    let (status, _headers, resp_bytes) =
+        post_recovery_consume_start(router.clone(), &person, "wrong-recovery-code").await;
+    assert_generic_unauth(status, &resp_bytes);
+
+    let retry =
+        start_recovery_consume(router.clone(), &person, &provision_finish.recovery_code).await;
+    assert_eq!(retry.context.op, OwnerOperation::RecoverCredential);
+}
+
+#[tokio::test]
+async fn owner_webauthn_recovery_consume_start_rate_limit_rejects_opaque_without_challenge() {
+    let (
+        _td,
+        router,
+        _log,
+        _broadcaster,
+        person,
+        _identity,
+        _window,
+        _webauthn_anchor,
+        _recovery_anchor,
+        mut authenticator,
+    ) = router_with_owner_webauthn_recovery_with_limiter(Duration::from_secs(45), true, Some(1));
+    let recovery_code = provision_recovery_code(router.clone(), &person, &mut authenticator).await;
+
+    let first = start_recovery_consume(router.clone(), &person, &recovery_code).await;
+    assert_eq!(first.context.op, OwnerOperation::RecoverCredential);
+
+    let (status, _headers, resp_bytes) =
+        post_recovery_consume_start(router.clone(), &person, &recovery_code).await;
+    assert_generic_unauth(status, &resp_bytes);
+}
+
+#[tokio::test]
+async fn owner_webauthn_recovery_consume_start_missing_limiter_fails_closed() {
+    let (
+        _td,
+        router,
+        _log,
+        _broadcaster,
+        person,
+        _identity,
+        _window,
+        _webauthn_anchor,
+        _recovery_anchor,
+        mut authenticator,
+    ) = router_with_owner_webauthn_recovery_with_limiter(Duration::from_secs(45), true, None);
+    let recovery_code = provision_recovery_code(router.clone(), &person, &mut authenticator).await;
+
+    let (status, _headers, resp_bytes) =
+        post_recovery_consume_start(router.clone(), &person, &recovery_code).await;
+    assert_generic_unauth(status, &resp_bytes);
 }
 
 #[tokio::test]

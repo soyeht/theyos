@@ -592,7 +592,7 @@ pub async fn bootstrap_household(shared_state: Option<SharedState>) {
                 state_dir: state_dir.clone(),
             };
             bonjour_browser_state = Some(pair_machine_state.clone());
-            let owner_events_state = handlers_owner_events::OwnerEventsRouterState::new(
+            let mut owner_events_state = handlers_owner_events::OwnerEventsRouterState::new(
                 identity_state.clone(),
                 Arc::clone(&pair_machine_window),
                 owner_event_log,
@@ -600,6 +600,10 @@ pub async fn bootstrap_household(shared_state: Option<SharedState>) {
                 state_dir.clone(),
                 key_policy,
             );
+            if let Some(state) = shared_state.as_ref() {
+                owner_events_state = owner_events_state
+                    .with_recovery_consume_rate_limiter(Arc::clone(&state.rate_limiter));
+            }
             let sign_machine_cert_state =
                 crate::handlers_sign_machine_cert::SignMachineCertRouterState {
                     household: identity_state.clone(),
@@ -705,6 +709,12 @@ pub async fn bootstrap_household(shared_state: Option<SharedState>) {
                                 "/api/v1/household/owner-webauthn/recovery/finish",
                                 axum::routing::post(
                                     handlers_owner_events::owner_webauthn_recovery_finish_handler,
+                                ),
+                            )
+                            .route(
+                                "/api/v1/household/owner-webauthn/recovery/consume/start",
+                                axum::routing::post(
+                                    handlers_owner_events::owner_webauthn_recovery_consume_start_handler,
                                 ),
                             )
                             .route(
