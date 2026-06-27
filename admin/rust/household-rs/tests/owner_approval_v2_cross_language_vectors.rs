@@ -158,6 +158,10 @@ fn context_for(case: &OwnerApprovalCase) -> OwnerApprovalContextV2 {
             .join_request_hash_hex
             .as_ref()
             .map(|value| ByteBuf::from(unhex(value))),
+        target_credential_id: None,
+        authority_head_sequence: None,
+        authority_head_hash: None,
+        pre_active_credential_count: None,
         capabilities: input.capabilities.clone(),
         issued_at: input.issued_at,
         expires_at: input.expires_at,

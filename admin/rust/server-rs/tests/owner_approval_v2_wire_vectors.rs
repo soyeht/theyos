@@ -8,7 +8,8 @@ use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD as B64URL};
 use household_rs::ids::{HouseholdId, MachineId};
 use household_rs::machine_cert::PersonId;
 use household_rs::owner_approval_v2::{
-    OwnerApprovalContextV2, OwnerApprovalV2, PairMachineApprovalContextInput,
+    OwnerApprovalContextV2, OwnerApprovalV2, OwnerApprovalV2Error, PairMachineApprovalContextInput,
+    RevokeCredentialContextInput,
 };
 use household_rs::pair_machine::JoinTransport;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
@@ -23,6 +24,7 @@ struct Fixture {
     owner_approvals: Vec<ApprovalVector>,
     owner_approval_finishes: Vec<FinishVector>,
     owner_approval_start_responses: Vec<StartResponseVector>,
+    revoke_credential_contexts: Vec<RevokeCredentialContextVector>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -43,6 +45,13 @@ struct FinishVector {
 struct StartResponseVector {
     id: String,
     input: StartResponseInput,
+    canonical_cbor_hex: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct RevokeCredentialContextVector {
+    id: String,
+    input: RevokeCredentialContextInputJson,
     canonical_cbor_hex: String,
 }
 
@@ -94,6 +103,25 @@ struct ContextInput {
     ttl_unix: u64,
     nonce_hex: String,
     join_request_hash_hex: String,
+    capabilities: Vec<String>,
+    issued_at: u64,
+    expires_at: u64,
+    replay_nonce_hex: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RevokeCredentialContextInputJson {
+    #[serde(rename = "v")]
+    version: u8,
+    purpose: String,
+    op: String,
+    hh_id: String,
+    owner_p_id: String,
+    target_credential_id_hex: String,
+    authority_head_sequence: u64,
+    authority_head_hash_hex: String,
+    pre_active_credential_count: u64,
     capabilities: Vec<String>,
     issued_at: u64,
     expires_at: u64,
@@ -223,6 +251,110 @@ fn owner_approval_v2_start_response_vector_is_canonical() {
     );
 }
 
+#[test]
+fn owner_approval_v2_revoke_credential_context_vectors_are_canonical() {
+    let fixture = load_fixture();
+    assert_eq!(fixture.revoke_credential_contexts.len(), 2);
+
+    for vector in &fixture.revoke_credential_contexts {
+        let context = revoke_context_from_input(&vector.input);
+        context.validate_shape().unwrap();
+        let encoded =
+            assert_canonical_round_trip(vector.id.as_str(), &vector.canonical_cbor_hex, &context);
+        let encoded_hex = hex::encode(&encoded);
+
+        assert_byte_field(
+            vector.id.as_str(),
+            &encoded,
+            "target_credential_id",
+            &vector.input.target_credential_id_hex,
+        );
+        assert_byte_field(
+            vector.id.as_str(),
+            &encoded,
+            "authority_head_hash",
+            &vector.input.authority_head_hash_hex,
+        );
+        assert!(
+            !encoded_hex.contains(&cbor_text_hex("AAECgP9_")),
+            "{} must not encode a base64url-looking target credential as CBOR text",
+            vector.id,
+        );
+    }
+}
+
+#[test]
+fn revoke_credential_context_rejects_missing_and_unknown_fields() {
+    let fixture = load_fixture();
+    let input = &fixture.revoke_credential_contexts[0].input;
+    for missing in [
+        "target_credential_id_hex",
+        "authority_head_sequence",
+        "authority_head_hash_hex",
+        "pre_active_credential_count",
+    ] {
+        let mut value = serde_json::to_value(input).unwrap();
+        value.as_object_mut().unwrap().remove(missing);
+        assert!(
+            serde_json::from_value::<RevokeCredentialContextInputJson>(value).is_err(),
+            "missing {missing} must reject",
+        );
+    }
+
+    let mut value = serde_json::to_value(input).unwrap();
+    value
+        .as_object_mut()
+        .unwrap()
+        .insert("cursor".to_string(), serde_json::json!(7));
+    assert!(
+        serde_json::from_value::<RevokeCredentialContextInputJson>(value).is_err(),
+        "unknown pair-machine field must reject",
+    );
+}
+
+#[test]
+fn revoke_credential_context_rejects_invalid_hash_len_and_count() {
+    let fixture = load_fixture();
+    let mut invalid_hash = revoke_context_from_input(&fixture.revoke_credential_contexts[0].input);
+    invalid_hash.authority_head_hash = Some(ByteBuf::from(vec![0x44; 31]));
+    assert!(matches!(
+        invalid_hash.validate_shape(),
+        Err(OwnerApprovalV2Error::InvalidField("authority_head_hash"))
+    ));
+
+    let mut invalid_count = revoke_context_from_input(&fixture.revoke_credential_contexts[0].input);
+    invalid_count.pre_active_credential_count = Some(0);
+    assert!(matches!(
+        invalid_count.validate_shape(),
+        Err(OwnerApprovalV2Error::InvalidField(
+            "pre_active_credential_count"
+        ))
+    ));
+}
+
+#[test]
+fn revoke_credential_context_sequence_and_count_are_canonical_unsigned_ints() {
+    let fixture = load_fixture();
+    let vector = &fixture.revoke_credential_contexts[0];
+    let context = revoke_context_from_input(&vector.input);
+    let encoded = context.to_canonical_bytes().unwrap();
+    let encoded_hex = hex::encode(encoded);
+
+    assert!(
+        encoded_hex.contains(&format!("{}1818", cbor_text_hex("authority_head_sequence"))),
+        "{} must encode authority_head_sequence=24 as canonical uint8",
+        vector.id,
+    );
+    assert!(
+        encoded_hex.contains(&format!(
+            "{}02",
+            cbor_text_hex("pre_active_credential_count")
+        )),
+        "{} must encode pre_active_credential_count=2 as canonical small uint",
+        vector.id,
+    );
+}
+
 fn approval_from_input(input: &ApprovalInput) -> OwnerApprovalV2 {
     assert_eq!(input.version, 2);
     OwnerApprovalV2 {
@@ -284,6 +416,24 @@ fn context_from_input(input: &ContextInput) -> OwnerApprovalContextV2 {
     })
 }
 
+fn revoke_context_from_input(input: &RevokeCredentialContextInputJson) -> OwnerApprovalContextV2 {
+    assert_eq!(input.version, 2);
+    assert_eq!(input.purpose, "owner-approval-v2");
+    assert_eq!(input.op, "revoke-credential");
+    OwnerApprovalContextV2::revoke_credential(RevokeCredentialContextInput {
+        hh_id: HouseholdId::parse(input.hh_id.clone()).unwrap(),
+        owner_p_id: PersonId(input.owner_p_id.clone()),
+        target_credential_id: unhex(&input.target_credential_id_hex),
+        authority_head_sequence: input.authority_head_sequence,
+        authority_head_hash: unhex_array_32("authority_head_hash", &input.authority_head_hash_hex),
+        pre_active_credential_count: input.pre_active_credential_count,
+        capabilities: input.capabilities.clone(),
+        issued_at: input.issued_at,
+        expires_at: input.expires_at,
+        replay_nonce: unhex_array_32("replay_nonce", &input.replay_nonce_hex),
+    })
+}
+
 fn assert_canonical_round_trip<T>(id: &str, canonical_cbor_hex: &str, typed: &T) -> Vec<u8>
 where
     T: Serialize + DeserializeOwned,
@@ -319,8 +469,11 @@ fn assert_byte_field(id: &str, encoded: &[u8], field: &str, bytes_hex: &str) {
 
 fn cbor_text_hex(text: &str) -> String {
     let bytes = text.as_bytes();
-    assert!(bytes.len() < 24, "test helper only supports short text");
-    format!("{:02x}{}", 0x60 + bytes.len(), hex::encode(bytes))
+    match bytes.len() {
+        len if len < 24 => format!("{:02x}{}", 0x60 + len, hex::encode(bytes)),
+        len if u8::try_from(len).is_ok() => format!("78{len:02x}{}", hex::encode(bytes)),
+        len => panic!("test helper does not support text length {len}"),
+    }
 }
 
 fn cbor_byte_string_hex(bytes_hex: &str) -> String {

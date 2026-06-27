@@ -31,6 +31,10 @@ pub enum OwnerApprovalV2Error {
     PurposeMismatch(String),
     #[error("owner approval context missing required field: {0}")]
     MissingField(&'static str),
+    #[error("owner approval context field is not allowed for this operation: {0}")]
+    UnexpectedField(&'static str),
+    #[error("owner approval context field is invalid: {0}")]
+    InvalidField(&'static str),
     #[error("owner approval context expires before it is issued")]
     InvalidTimeWindow,
     #[error("owner approval context expired at {expires_at}, now {now}")]
@@ -92,6 +96,14 @@ pub struct OwnerApprovalContextV2 {
     pub nonce: Option<ByteBuf>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub join_request_hash: Option<ByteBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_credential_id: Option<ByteBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub authority_head_sequence: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub authority_head_hash: Option<ByteBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pre_active_credential_count: Option<u64>,
     pub capabilities: Vec<String>,
     pub issued_at: u64,
     pub expires_at: u64,
@@ -207,6 +219,36 @@ impl OwnerApprovalContextV2 {
             ttl_unix: Some(input.ttl_unix),
             nonce: Some(ByteBuf::from(input.nonce.to_vec())),
             join_request_hash: Some(ByteBuf::from(input.join_request_hash.to_vec())),
+            target_credential_id: None,
+            authority_head_sequence: None,
+            authority_head_hash: None,
+            pre_active_credential_count: None,
+            capabilities: input.capabilities,
+            issued_at: input.issued_at,
+            expires_at: input.expires_at,
+            replay_nonce: ByteBuf::from(input.replay_nonce.to_vec()),
+        }
+    }
+
+    #[must_use]
+    pub fn revoke_credential(input: RevokeCredentialContextInput) -> Self {
+        Self {
+            version: OWNER_APPROVAL_V2_VERSION,
+            purpose: OWNER_APPROVAL_V2_PURPOSE.to_string(),
+            op: OwnerOperation::RevokeCredential,
+            hh_id: input.hh_id,
+            owner_p_id: input.owner_p_id,
+            cursor: None,
+            m_id: None,
+            addr: None,
+            transport: None,
+            ttl_unix: None,
+            nonce: None,
+            join_request_hash: None,
+            target_credential_id: Some(ByteBuf::from(input.target_credential_id)),
+            authority_head_sequence: Some(input.authority_head_sequence),
+            authority_head_hash: Some(ByteBuf::from(input.authority_head_hash.to_vec())),
+            pre_active_credential_count: Some(input.pre_active_credential_count),
             capabilities: input.capabilities,
             issued_at: input.issued_at,
             expires_at: input.expires_at,
@@ -226,16 +268,74 @@ impl OwnerApprovalContextV2 {
         }
         validate_capabilities(&self.capabilities)?;
 
-        if self.op == OwnerOperation::PairMachineApprove {
-            require_some(self.cursor.as_ref(), "cursor")?;
-            require_some(self.m_id.as_ref(), "m_id")?;
-            require_some(self.addr.as_ref(), "addr")?;
-            require_some(self.transport.as_ref(), "transport")?;
-            require_some(self.ttl_unix.as_ref(), "ttl_unix")?;
-            require_some(self.nonce.as_ref(), "nonce")?;
-            require_some(self.join_request_hash.as_ref(), "join_request_hash")?;
+        match self.op {
+            OwnerOperation::PairMachineApprove => {
+                require_some(self.cursor.as_ref(), "cursor")?;
+                require_some(self.m_id.as_ref(), "m_id")?;
+                require_some(self.addr.as_ref(), "addr")?;
+                require_some(self.transport.as_ref(), "transport")?;
+                require_some(self.ttl_unix.as_ref(), "ttl_unix")?;
+                require_some(self.nonce.as_ref(), "nonce")?;
+                require_some(self.join_request_hash.as_ref(), "join_request_hash")?;
+                self.require_absent_revoke_fields()?;
+            }
+            OwnerOperation::RevokeCredential => {
+                self.require_absent_pair_machine_fields()?;
+                let target =
+                    require_some(self.target_credential_id.as_ref(), "target_credential_id")?;
+                if target.is_empty() {
+                    return Err(OwnerApprovalV2Error::InvalidField("target_credential_id"));
+                }
+                require_some(
+                    self.authority_head_sequence.as_ref(),
+                    "authority_head_sequence",
+                )?;
+                let head_hash =
+                    require_some(self.authority_head_hash.as_ref(), "authority_head_hash")?;
+                if head_hash.len() != 32 {
+                    return Err(OwnerApprovalV2Error::InvalidField("authority_head_hash"));
+                }
+                let count = require_some(
+                    self.pre_active_credential_count.as_ref(),
+                    "pre_active_credential_count",
+                )?;
+                if *count == 0 {
+                    return Err(OwnerApprovalV2Error::InvalidField(
+                        "pre_active_credential_count",
+                    ));
+                }
+            }
+            OwnerOperation::BootstrapInitialize
+            | OwnerOperation::BootstrapTeardown
+            | OwnerOperation::PairDeviceConfirm => {
+                self.require_absent_pair_machine_fields()?;
+                self.require_absent_revoke_fields()?;
+            }
         }
         Ok(())
+    }
+
+    fn require_absent_pair_machine_fields(&self) -> Result<(), OwnerApprovalV2Error> {
+        require_none(self.cursor.as_ref(), "cursor")?;
+        require_none(self.m_id.as_ref(), "m_id")?;
+        require_none(self.addr.as_ref(), "addr")?;
+        require_none(self.transport.as_ref(), "transport")?;
+        require_none(self.ttl_unix.as_ref(), "ttl_unix")?;
+        require_none(self.nonce.as_ref(), "nonce")?;
+        require_none(self.join_request_hash.as_ref(), "join_request_hash")
+    }
+
+    fn require_absent_revoke_fields(&self) -> Result<(), OwnerApprovalV2Error> {
+        require_none(self.target_credential_id.as_ref(), "target_credential_id")?;
+        require_none(
+            self.authority_head_sequence.as_ref(),
+            "authority_head_sequence",
+        )?;
+        require_none(self.authority_head_hash.as_ref(), "authority_head_hash")?;
+        require_none(
+            self.pre_active_credential_count.as_ref(),
+            "pre_active_credential_count",
+        )
     }
 
     pub fn validate_at(&self, now_unix: u64) -> Result<(), OwnerApprovalV2Error> {
@@ -377,6 +477,19 @@ pub struct PairMachineApprovalContextInput {
     pub replay_nonce: [u8; 32],
 }
 
+pub struct RevokeCredentialContextInput {
+    pub hh_id: HouseholdId,
+    pub owner_p_id: PersonId,
+    pub target_credential_id: Vec<u8>,
+    pub authority_head_sequence: u64,
+    pub authority_head_hash: [u8; 32],
+    pub pre_active_credential_count: u64,
+    pub capabilities: Vec<String>,
+    pub issued_at: u64,
+    pub expires_at: u64,
+    pub replay_nonce: [u8; 32],
+}
+
 pub struct PairMachineTrustedContextInput<'a> {
     pub hh_id: HouseholdId,
     pub owner_p_id: PersonId,
@@ -399,11 +512,21 @@ fn require_snapshot_match(
     }
 }
 
-fn require_some<T>(value: Option<&T>, field: &'static str) -> Result<(), OwnerApprovalV2Error> {
-    if value.is_some() {
+fn require_some<'a, T>(
+    value: Option<&'a T>,
+    field: &'static str,
+) -> Result<&'a T, OwnerApprovalV2Error> {
+    match value {
+        Some(value) => Ok(value),
+        None => Err(OwnerApprovalV2Error::MissingField(field)),
+    }
+}
+
+fn require_none<T>(value: Option<&T>, field: &'static str) -> Result<(), OwnerApprovalV2Error> {
+    if value.is_none() {
         Ok(())
     } else {
-        Err(OwnerApprovalV2Error::MissingField(field))
+        Err(OwnerApprovalV2Error::UnexpectedField(field))
     }
 }
 
@@ -461,6 +584,21 @@ mod tests {
             issued_at: 1_000,
             expires_at: 1_600,
             replay_nonce: [0x33; 32],
+        })
+    }
+
+    fn sample_revoke_context() -> OwnerApprovalContextV2 {
+        OwnerApprovalContextV2::revoke_credential(RevokeCredentialContextInput {
+            hh_id: household_id(),
+            owner_p_id: person_id(),
+            target_credential_id: b"AAECgP9_".to_vec(),
+            authority_head_sequence: 24,
+            authority_head_hash: [0x44; 32],
+            pre_active_credential_count: 2,
+            capabilities: vec!["owner-auth-revoke".to_string()],
+            issued_at: 1_000,
+            expires_at: 1_600,
+            replay_nonce: [0x55; 32],
         })
     }
 
@@ -605,6 +743,13 @@ mod tests {
 
         let mut changed_op = sample_context();
         changed_op.op = OwnerOperation::BootstrapTeardown;
+        changed_op.cursor = None;
+        changed_op.m_id = None;
+        changed_op.addr = None;
+        changed_op.transport = None;
+        changed_op.ttl_unix = None;
+        changed_op.nonce = None;
+        changed_op.join_request_hash = None;
         assert_ne!(changed_op.challenge_digest().unwrap(), baseline);
 
         let mut changed_addr = sample_context();
@@ -644,6 +789,109 @@ mod tests {
         assert!(matches!(
             missing.validate_shape(),
             Err(OwnerApprovalV2Error::MissingField("join_request_hash"))
+        ));
+    }
+
+    #[test]
+    fn pair_machine_rejects_revoke_fields() {
+        let mut invalid = sample_context();
+        invalid.target_credential_id = Some(ByteBuf::from(vec![0x41]));
+        assert!(matches!(
+            invalid.validate_shape(),
+            Err(OwnerApprovalV2Error::UnexpectedField(
+                "target_credential_id"
+            ))
+        ));
+    }
+
+    #[test]
+    fn revoke_credential_context_round_trips_as_canonical_cbor() {
+        let ctx = sample_revoke_context();
+        let bytes = ctx.to_canonical_bytes().unwrap();
+        let decoded = OwnerApprovalContextV2::from_canonical_bytes(&bytes).unwrap();
+        assert_eq!(decoded, ctx);
+
+        let hex = hex::encode(&bytes);
+        assert!(hex.contains("717265766f6b652d63726564656e7469616c"));
+        assert!(hex.contains("747461726765745f63726564656e7469616c5f696448414145436750395f"));
+        assert!(
+            !hex.contains("6461646472"),
+            "revoke context must not carry pair-machine addr",
+        );
+        assert!(
+            !hex.contains("716a6f696e5f726571756573745f68617368"),
+            "revoke context must not carry pair-machine join_request_hash",
+        );
+    }
+
+    #[test]
+    fn revoke_credential_required_fields_are_enforced() {
+        let mut missing_target = sample_revoke_context();
+        missing_target.target_credential_id = None;
+        assert!(matches!(
+            missing_target.validate_shape(),
+            Err(OwnerApprovalV2Error::MissingField("target_credential_id"))
+        ));
+
+        let mut missing_sequence = sample_revoke_context();
+        missing_sequence.authority_head_sequence = None;
+        assert!(matches!(
+            missing_sequence.validate_shape(),
+            Err(OwnerApprovalV2Error::MissingField(
+                "authority_head_sequence"
+            ))
+        ));
+
+        let mut missing_hash = sample_revoke_context();
+        missing_hash.authority_head_hash = None;
+        assert!(matches!(
+            missing_hash.validate_shape(),
+            Err(OwnerApprovalV2Error::MissingField("authority_head_hash"))
+        ));
+
+        let mut missing_count = sample_revoke_context();
+        missing_count.pre_active_credential_count = None;
+        assert!(matches!(
+            missing_count.validate_shape(),
+            Err(OwnerApprovalV2Error::MissingField(
+                "pre_active_credential_count"
+            ))
+        ));
+    }
+
+    #[test]
+    fn revoke_credential_rejects_invalid_field_values() {
+        let mut empty_target = sample_revoke_context();
+        empty_target.target_credential_id = Some(ByteBuf::from(vec![]));
+        assert!(matches!(
+            empty_target.validate_shape(),
+            Err(OwnerApprovalV2Error::InvalidField("target_credential_id"))
+        ));
+
+        let mut short_hash = sample_revoke_context();
+        short_hash.authority_head_hash = Some(ByteBuf::from(vec![0x44; 31]));
+        assert!(matches!(
+            short_hash.validate_shape(),
+            Err(OwnerApprovalV2Error::InvalidField("authority_head_hash"))
+        ));
+
+        let mut zero_count = sample_revoke_context();
+        zero_count.pre_active_credential_count = Some(0);
+        assert!(matches!(
+            zero_count.validate_shape(),
+            Err(OwnerApprovalV2Error::InvalidField(
+                "pre_active_credential_count"
+            ))
+        ));
+    }
+
+    #[test]
+    fn revoke_credential_rejects_pair_machine_fields() {
+        let mut invalid = sample_revoke_context();
+        invalid.cursor = Some(7);
+        assert!(matches!(
+            invalid.validate_shape(),
+            Err(OwnerApprovalV2Error::UnexpectedField("cursor"))
         ));
     }
 
@@ -692,6 +940,10 @@ mod tests {
             ttl_unix: None,
             nonce: None,
             join_request_hash: None,
+            target_credential_id: None,
+            authority_head_sequence: None,
+            authority_head_hash: None,
+            pre_active_credential_count: None,
             capabilities: vec![],
             issued_at: 1_000,
             expires_at: 1_100,
@@ -719,6 +971,10 @@ mod tests {
             "ttl_unix",
             "nonce",
             "join_request_hash",
+            "target_credential_id",
+            "authority_head_sequence",
+            "authority_head_hash",
+            "pre_active_credential_count",
         ] {
             assert!(!keys.iter().any(|key| key == omitted), "{omitted} encoded");
         }
