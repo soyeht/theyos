@@ -352,6 +352,31 @@ pub async fn authorize_owner_webauthn_recovery_consume_start_request(
     .await
 }
 
+/// Authorize the owner recovery-code consume finish surface.
+///
+/// Like start, this proves only current owner identity and fresh body-bound
+/// proof-of-possession. The finish runtime re-proves recovery-code possession
+/// and validates the registration binding before any mutation.
+pub async fn authorize_owner_webauthn_recovery_consume_finish_request(
+    state: &HouseholdState,
+    headers: &HeaderMap,
+    method: &Method,
+    path_and_query: &str,
+    body: &[u8],
+    now: u64,
+) -> Result<Arc<HouseholdAuthState>, AuthError> {
+    authorize_owner_only_pop_request(
+        state,
+        headers,
+        method,
+        path_and_query,
+        body,
+        now,
+        "OwnerWebauthnRecoveryConsumeFinish",
+    )
+    .await
+}
+
 async fn authorize_owner_only_pop_request(
     state: &HouseholdState,
     headers: &HeaderMap,

@@ -38,11 +38,13 @@ use household_rs::owner_webauthn_anchor::{
     verified_owner_webauthn_authority_head, verify_or_update_owner_webauthn_authority_anchor,
 };
 use household_rs::owner_webauthn_authority::{
-    OwnerWebauthnCredentialEventAction, SignedOwnerWebauthnCredentialEvent,
+    OwnerWebauthnAuthority, OwnerWebauthnCredentialEventAction, OwnerWebauthnEventActor,
+    OwnerWebauthnRecoveryAddInput, SignedOwnerWebauthnCredentialEvent,
 };
 use household_rs::owner_webauthn_recovery::{
-    OwnerWebauthnRecoveryAuthority, OwnerWebauthnRecoveryHead, RecoveryCodeVerifier,
-    SignedOwnerWebauthnRecoveryEvent, verified_owner_webauthn_recovery_head,
+    OwnerWebauthnRecoveryActor, OwnerWebauthnRecoveryAuthority, OwnerWebauthnRecoveryEventAction,
+    OwnerWebauthnRecoveryHead, RecoveryCodeVerifier, SignedOwnerWebauthnRecoveryEvent,
+    verified_owner_webauthn_recovery_head,
 };
 use household_rs::owner_webauthn_recovery_anchor::{
     OwnerWebauthnRecoveryAnchorError, OwnerWebauthnRecoveryAnchorStatus,
@@ -573,6 +575,15 @@ struct OwnerWebauthnRecoveryConsumeStartPlan {
     pre_active_credential_count: u64,
 }
 
+struct OwnerWebauthnRecoveryConsumeFinishPlan {
+    expected_context: OwnerApprovalContextV2,
+    registration_binding: OwnerWebauthnRegistrationBinding,
+    recovery_head: OwnerWebauthnRecoveryHead,
+    previous_webauthn_entry: SignedOwnerWebauthnCredentialEvent,
+    previous_recovery_entry: SignedOwnerWebauthnRecoveryEvent,
+    pre_active_credential_count: u64,
+}
+
 const OWNER_WEBAUTHN_RECOVERY_CONSUME_REGISTRATION_BINDING_PURPOSE: &str =
     "owner-webauthn-recovery-consume-registration-v1";
 
@@ -940,6 +951,157 @@ fn owner_webauthn_recovery_consume_start_plan(
     })
 }
 
+fn owner_webauthn_entry_at_head(
+    owner_auth: &household_rs::HouseholdAuthState,
+    head: &OwnerWebauthnAuthorityHead,
+) -> Result<SignedOwnerWebauthnCredentialEvent, &'static str> {
+    let index = usize::try_from(head.sequence).map_err(|_| "credential_head_sequence_overflow")?;
+    let entry = owner_auth
+        .owner_webauthn
+        .entries()
+        .get(index)
+        .ok_or("credential_head_entry_missing")?;
+    if entry
+        .entry_hash()
+        .map_err(|_| "credential_head_hash_failed")?
+        != head.head_hash
+    {
+        return Err("credential_head_hash_mismatch");
+    }
+    Ok(entry.clone())
+}
+
+fn recovery_entry_at_head(
+    owner_auth: &household_rs::HouseholdAuthState,
+    head: &OwnerWebauthnRecoveryHead,
+) -> Result<SignedOwnerWebauthnRecoveryEvent, &'static str> {
+    let index = usize::try_from(head.sequence).map_err(|_| "recovery_head_sequence_overflow")?;
+    let entry = owner_auth
+        .owner_webauthn_recovery
+        .entries()
+        .get(index)
+        .ok_or("recovery_head_entry_missing")?;
+    if entry
+        .entry_hash()
+        .map_err(|_| "recovery_head_hash_failed")?
+        != head.head_hash
+    {
+        return Err("recovery_head_hash_mismatch");
+    }
+    Ok(entry.clone())
+}
+
+fn owner_webauthn_recovery_consume_finish_plan(
+    state: &OwnerEventsRouterState,
+    identity: &household_rs::LoadedIdentity,
+    owner_auth: &household_rs::HouseholdAuthState,
+    context: &OwnerApprovalContextV2,
+    recovery_code: &[u8],
+) -> Result<OwnerWebauthnRecoveryConsumeFinishPlan, &'static str> {
+    if !state.owner_approval_policy.recovery_code_enabled() {
+        return Err("recovery_code_policy_disabled");
+    }
+    let Some(rate_limiter) = state.recovery_consume_rate_limiter.as_ref() else {
+        return Err("recovery_consume_rate_limiter_unavailable");
+    };
+    if check_recovery_consume_attempt(
+        rate_limiter.as_ref(),
+        &identity.record.hh_id,
+        &owner_auth.owner_person_cert.p_id,
+    ) != RecoveryConsumeRateLimitDecision::Allowed
+    {
+        return Err("recovery_consume_rate_limited");
+    }
+
+    let Some(webauthn_anchor) = state.owner_webauthn_anchor.as_ref() else {
+        return Err("missing_anchor_verifier");
+    };
+    let webauthn_anchor_status = classify_owner_webauthn_authority_anchor_read_only(
+        webauthn_anchor.keystore.as_ref(),
+        &owner_auth.owner_webauthn,
+        &identity.record,
+        &owner_auth.owner_person_cert,
+    )
+    .map_err(|_| "credential_anchor_invalid")?;
+    let credentials = owner_auth
+        .owner_webauthn_credentials(&identity.record)
+        .map_err(|_| "credential_reconstruct_failed")?;
+    let pre_active_credential_count =
+        u64::try_from(credentials.active_count()).map_err(|_| "credential_count_overflow")?;
+
+    let Some(recovery_anchor) = state.owner_webauthn_recovery_anchor.as_ref() else {
+        return Err("missing_recovery_anchor_verifier");
+    };
+    let recovery_anchor_status = classify_owner_webauthn_recovery_anchor_read_only(
+        recovery_anchor.keystore.as_ref(),
+        &owner_auth.owner_webauthn_recovery,
+        &identity.record,
+        &owner_auth.owner_person_cert,
+    )
+    .map_err(|_| "recovery_anchor_invalid")?;
+    let readiness = classify_owner_webauthn_recovery_consume_readiness(
+        &owner_auth.owner_webauthn,
+        &webauthn_anchor_status,
+        &owner_auth.owner_webauthn_recovery,
+        &recovery_anchor_status,
+        pre_active_credential_count,
+    )
+    .map_err(|_| "recovery_consume_classifier_failed")?;
+    let OwnerWebauthnRecoveryConsumeReadiness::Consumable {
+        webauthn_head,
+        recovery_head,
+        pre_active_credential_count,
+    } = readiness
+    else {
+        return Err("recovery_consume_not_consumable");
+    };
+
+    let registration_binding =
+        owner_webauthn_recovery_consume_registration_binding_from_context(context)?;
+    let replay_nonce = bytebuf_to_array_32(
+        context.replay_nonce.as_ref(),
+        "recovery_consume_replay_nonce_invalid",
+    )?;
+    let expected_context =
+        OwnerApprovalContextV2::recover_credential(RecoverCredentialContextInput {
+            hh_id: identity.record.hh_id.clone(),
+            owner_p_id: owner_auth.owner_person_cert.p_id.clone(),
+            new_credential_binding_hash: registration_binding.binding_digest(),
+            authority_head_sequence: webauthn_head.sequence,
+            authority_head_hash: webauthn_head.head_hash,
+            pre_active_credential_count,
+            recovery_head: RecoveryAuthorityHeadInput {
+                sequence: recovery_head.sequence,
+                head_hash: recovery_head.head_hash,
+            },
+            capabilities: owner_recovery_consume_v2_capabilities(),
+            issued_at: context.issued_at,
+            expires_at: context.expires_at,
+            replay_nonce,
+        });
+    if &expected_context != context {
+        return Err("recovery_consume_context_mismatch");
+    }
+    let Some(verifier) = owner_auth.owner_webauthn_recovery.latest_verifier() else {
+        return Err("recovery_verifier_missing");
+    };
+    if !verifier
+        .matches_code_bytes(recovery_code)
+        .map_err(|_| "recovery_verifier_invalid")?
+    {
+        return Err("recovery_code_mismatch");
+    }
+
+    Ok(OwnerWebauthnRecoveryConsumeFinishPlan {
+        expected_context,
+        registration_binding,
+        previous_webauthn_entry: owner_webauthn_entry_at_head(owner_auth, &webauthn_head)?,
+        previous_recovery_entry: recovery_entry_at_head(owner_auth, &recovery_head)?,
+        recovery_head,
+        pre_active_credential_count,
+    })
+}
+
 fn owner_webauthn_recovery_consume_registration_binding(
     identity: &household_rs::LoadedIdentity,
     owner_auth: &household_rs::HouseholdAuthState,
@@ -972,6 +1134,231 @@ fn owner_webauthn_recovery_consume_registration_binding(
         canonical,
     )
     .map_err(|_| "recovery_consume_binding_invalid")
+}
+
+fn bytebuf_to_array_32(bytes: &[u8], reason: &'static str) -> Result<[u8; 32], &'static str> {
+    bytes.try_into().map_err(|_| reason)
+}
+
+fn recovery_consume_context_webauthn_head(
+    context: &OwnerApprovalContextV2,
+) -> Result<OwnerWebauthnAuthorityHead, &'static str> {
+    Ok(OwnerWebauthnAuthorityHead {
+        sequence: context
+            .authority_head_sequence
+            .ok_or("recovery_consume_missing_authority_head_sequence")?,
+        head_hash: bytebuf_to_array_32(
+            context
+                .authority_head_hash
+                .as_ref()
+                .ok_or("recovery_consume_missing_authority_head_hash")?
+                .as_ref(),
+            "recovery_consume_authority_head_hash_invalid",
+        )?,
+    })
+}
+
+fn recovery_consume_context_recovery_head(
+    context: &OwnerApprovalContextV2,
+) -> Result<OwnerWebauthnRecoveryHead, &'static str> {
+    Ok(OwnerWebauthnRecoveryHead {
+        sequence: context
+            .recovery_head_sequence
+            .ok_or("recovery_consume_missing_recovery_head_sequence")?,
+        head_hash: bytebuf_to_array_32(
+            context
+                .recovery_head_hash
+                .as_ref()
+                .ok_or("recovery_consume_missing_recovery_head_hash")?
+                .as_ref(),
+            "recovery_consume_recovery_head_hash_invalid",
+        )?,
+    })
+}
+
+fn owner_webauthn_recovery_consume_registration_binding_from_context(
+    context: &OwnerApprovalContextV2,
+) -> Result<OwnerWebauthnRegistrationBinding, &'static str> {
+    let webauthn_head = recovery_consume_context_webauthn_head(context)?;
+    let recovery_head = recovery_consume_context_recovery_head(context)?;
+    let expected_digest = bytebuf_to_array_32(
+        context
+            .new_credential_binding_hash
+            .as_ref()
+            .ok_or("recovery_consume_missing_binding_hash")?
+            .as_ref(),
+        "recovery_consume_binding_hash_invalid",
+    )?;
+    let binding_context = OwnerWebauthnRecoveryConsumeRegistrationBindingContext {
+        version: 1,
+        purpose: OWNER_WEBAUTHN_RECOVERY_CONSUME_REGISTRATION_BINDING_PURPOSE.to_string(),
+        op: "recover-credential".to_string(),
+        hh_id: context.hh_id.clone(),
+        owner_p_id: context.owner_p_id.clone(),
+        authority_head_sequence: webauthn_head.sequence,
+        authority_head_hash: ByteBuf::from(webauthn_head.head_hash.to_vec()),
+        pre_active_credential_count: context
+            .pre_active_credential_count
+            .ok_or("recovery_consume_missing_pre_active_count")?,
+        recovery_head_sequence: recovery_head.sequence,
+        recovery_head_hash: ByteBuf::from(recovery_head.head_hash.to_vec()),
+        capabilities: context.capabilities.clone(),
+        issued_at: context.issued_at,
+        expires_at: context.expires_at,
+        replay_nonce: context.replay_nonce.clone(),
+    };
+    let canonical = household_rs::cbor::to_canonical_vec(&binding_context)
+        .map_err(|_| "recovery_consume_binding_cbor")?;
+    let binding = OwnerWebauthnRegistrationBinding::from_canonical_binding(
+        OWNER_WEBAUTHN_RECOVERY_CONSUME_REGISTRATION_BINDING_PURPOSE,
+        canonical,
+    )
+    .map_err(|_| "recovery_consume_binding_invalid")?;
+    if binding.binding_digest() != expected_digest {
+        return Err("recovery_consume_binding_digest_mismatch");
+    }
+    Ok(binding)
+}
+
+fn recovery_consume_committed_webauthn_add(
+    owner_auth: &household_rs::HouseholdAuthState,
+    webauthn_head: &OwnerWebauthnAuthorityHead,
+    recovery_head: &OwnerWebauthnRecoveryHead,
+) -> Result<Option<ByteBuf>, &'static str> {
+    let previous_index =
+        usize::try_from(webauthn_head.sequence).map_err(|_| "credential_head_sequence_overflow")?;
+    let Some(previous_entry) = owner_auth.owner_webauthn.entries().get(previous_index) else {
+        return Err("credential_head_entry_missing");
+    };
+    if previous_entry
+        .entry_hash()
+        .map_err(|_| "credential_head_hash_failed")?
+        != webauthn_head.head_hash
+    {
+        return Err("credential_head_hash_mismatch");
+    }
+    let next_index = previous_index
+        .checked_add(1)
+        .ok_or("credential_next_sequence_overflow")?;
+    let Some(entry) = owner_auth.owner_webauthn.entries().get(next_index) else {
+        return Ok(None);
+    };
+    let matches_recovery_actor = matches!(
+        &entry.event.actor,
+        OwnerWebauthnEventActor::RecoveryProof {
+            recovery_head_sequence,
+            recovery_head_hash,
+        } if *recovery_head_sequence == recovery_head.sequence
+            && recovery_head_hash.as_ref() == recovery_head.head_hash
+    );
+    match (&entry.event.action, matches_recovery_actor) {
+        (OwnerWebauthnCredentialEventAction::Add { credential }, true) => Ok(Some(ByteBuf::from(
+            credential.credential_id_bytes().to_vec(),
+        ))),
+        (_, false) => Ok(None),
+        _ => Err("recovery_consume_committed_webauthn_event_invalid"),
+    }
+}
+
+fn recovery_consume_committed_recovery_consume(
+    owner_auth: &household_rs::HouseholdAuthState,
+    recovery_head: &OwnerWebauthnRecoveryHead,
+) -> Result<bool, &'static str> {
+    let previous_index =
+        usize::try_from(recovery_head.sequence).map_err(|_| "recovery_head_sequence_overflow")?;
+    let Some(previous_entry) = owner_auth
+        .owner_webauthn_recovery
+        .entries()
+        .get(previous_index)
+    else {
+        return Err("recovery_head_entry_missing");
+    };
+    if previous_entry
+        .entry_hash()
+        .map_err(|_| "recovery_head_hash_failed")?
+        != recovery_head.head_hash
+    {
+        return Err("recovery_head_hash_mismatch");
+    }
+    let next_index = previous_index
+        .checked_add(1)
+        .ok_or("recovery_next_sequence_overflow")?;
+    let Some(entry) = owner_auth.owner_webauthn_recovery.entries().get(next_index) else {
+        return Ok(false);
+    };
+    let matches_recovery_actor = matches!(
+        &entry.event.actor,
+        OwnerWebauthnRecoveryActor::RecoveryProof {
+            verifier_head_sequence,
+            verifier_head_hash,
+        } if *verifier_head_sequence == recovery_head.sequence
+            && verifier_head_hash.as_ref() == recovery_head.head_hash
+    );
+    match (&entry.event.action, matches_recovery_actor) {
+        (OwnerWebauthnRecoveryEventAction::Consume, true) => Ok(true),
+        (_, false) => Ok(false),
+        _ => Err("recovery_consume_committed_recovery_event_invalid"),
+    }
+}
+
+fn recovery_consume_finish_response(
+    owner_auth: &household_rs::HouseholdAuthState,
+    identity: &household_rs::LoadedIdentity,
+    credential_id: ByteBuf,
+) -> Result<OwnerWebauthnRecoveryConsumeFinishResponse, &'static str> {
+    let credentials = owner_auth
+        .owner_webauthn_credentials(&identity.record)
+        .map_err(|_| "credential_reconstruct_failed")?;
+    Ok(OwnerWebauthnRecoveryConsumeFinishResponse {
+        version: 1,
+        credential_id,
+        active_credential_count: u64::try_from(credentials.active_count())
+            .map_err(|_| "credential_count_overflow")?,
+        recovery_ready: owner_auth.owner_webauthn_recovery.recovery_ready(),
+    })
+}
+
+fn repair_recovery_consume_finish_if_committed(
+    webauthn_anchor: &dyn keystore_rs::KeystoreBackend,
+    recovery_anchor: &dyn keystore_rs::KeystoreBackend,
+    identity: &household_rs::LoadedIdentity,
+    owner_auth: &household_rs::HouseholdAuthState,
+    context: &OwnerApprovalContextV2,
+) -> Result<Option<OwnerWebauthnRecoveryConsumeFinishResponse>, &'static str> {
+    owner_webauthn_recovery_consume_registration_binding_from_context(context)?;
+    if context.hh_id != identity.record.hh_id
+        || context.owner_p_id != owner_auth.owner_person_cert.p_id
+    {
+        return Err("recovery_consume_context_identity_mismatch");
+    }
+    let webauthn_head = recovery_consume_context_webauthn_head(context)?;
+    let recovery_head = recovery_consume_context_recovery_head(context)?;
+    let maybe_credential_id =
+        recovery_consume_committed_webauthn_add(owner_auth, &webauthn_head, &recovery_head)?;
+    let recovery_consumed =
+        recovery_consume_committed_recovery_consume(owner_auth, &recovery_head)?;
+    match (maybe_credential_id, recovery_consumed) {
+        (None, false) => Ok(None),
+        (Some(_), false) | (None, true) => Err("recovery_consume_partial_commit"),
+        (Some(credential_id), true) => {
+            verify_or_update_owner_webauthn_authority_anchor(
+                webauthn_anchor,
+                &owner_auth.owner_webauthn,
+                &identity.record,
+                &owner_auth.owner_person_cert,
+                OwnerWebauthnAnchorMode::Enforcement,
+            )
+            .map_err(|_| "recovery_consume_webauthn_anchor_repair_failed")?;
+            advance_owner_webauthn_recovery_anchor_after_commit(
+                recovery_anchor,
+                &owner_auth.owner_webauthn_recovery,
+                &identity.record,
+                &owner_auth.owner_person_cert,
+            )
+            .map_err(|_| "recovery_consume_recovery_anchor_repair_failed")?;
+            recovery_consume_finish_response(owner_auth, identity, credential_id).map(Some)
+        }
+    }
 }
 
 fn owner_webauthn_revoke_credential_start_snapshot(
@@ -1246,6 +1633,26 @@ struct OwnerWebauthnRecoveryConsumeStartResponse {
     challenge_id: String,
     context: OwnerApprovalContextV2,
     options: CreationChallengeResponse,
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct OwnerWebauthnRecoveryConsumeFinishRequest {
+    #[serde(rename = "v")]
+    version: u8,
+    challenge_id: String,
+    context: OwnerApprovalContextV2,
+    credential: RegisterPublicKeyCredential,
+    recovery_code: String,
+}
+
+#[derive(Serialize)]
+struct OwnerWebauthnRecoveryConsumeFinishResponse {
+    #[serde(rename = "v")]
+    version: u8,
+    credential_id: ByteBuf,
+    active_credential_count: u64,
+    recovery_ready: bool,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -2611,6 +3018,257 @@ pub async fn owner_webauthn_recovery_consume_start_handler(
         options,
     })
     .unwrap_or_default();
+    cbor_response(StatusCode::OK, bytes)
+}
+
+/// `POST /api/v1/household/owner-webauthn/recovery/consume/finish`.
+///
+/// Commits the fresh passkey that was challenge-bound by consume/start and
+/// records a one-shot recovery consume. The mutation is ordered as `WebAuthn`
+/// Add before recovery Consume: both events are saved before anchors move, then
+/// the `WebAuthn` anchor advances before the recovery anchor. Retries first try
+/// to repair an already-saved Add+Consume pair without requiring the
+/// registration challenge to still be live.
+pub async fn owner_webauthn_recovery_consume_finish_handler(
+    State(state): State<OwnerEventsRouterState>,
+    method: Method,
+    uri: Uri,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let Some(now) = time_util::unix_now_secs_checked(
+        "owner_events.owner_webauthn_recovery_consume_finish.clock",
+    ) else {
+        return unauthenticated_response();
+    };
+    let path_and_query = uri
+        .path_and_query()
+        .map_or_else(|| uri.path().to_string(), |pq| pq.as_str().to_string());
+    let authorized_owner_auth =
+        match household_auth::authorize_owner_webauthn_recovery_consume_finish_request(
+            &state.household,
+            &headers,
+            &method,
+            &path_and_query,
+            &body,
+            now,
+        )
+        .await
+        {
+            Ok(owner_auth) => owner_auth,
+            Err(e) => {
+                return reject_owner_webauthn_recovery("pop_auth_failed", Some(e.to_string()));
+            }
+        };
+
+    let request: OwnerWebauthnRecoveryConsumeFinishRequest = match decode_canonical_cbor(&body) {
+        Ok(request) => request,
+        Err(e) => return reject_owner_webauthn_recovery("cbor_decode", Some(e)),
+    };
+    if request.version != 1 {
+        return reject_owner_webauthn_recovery("bad_version", None);
+    }
+    if request.context.op != OwnerOperation::RecoverCredential {
+        return reject_owner_webauthn_recovery("bad_operation", None);
+    }
+    if let Err(e) = request.context.validate_shape() {
+        return reject_owner_webauthn_recovery(
+            "recovery_consume_context_invalid",
+            Some(e.to_string()),
+        );
+    }
+    let challenge_id = match OwnerWebauthnChallengeId::parse(request.challenge_id.clone()) {
+        Ok(challenge_id) => challenge_id,
+        Err(e) => {
+            return reject_owner_webauthn_recovery("bad_challenge_id", Some(e.to_string()));
+        }
+    };
+    let recovery_code = Zeroizing::new(request.recovery_code);
+
+    let _mutation_guard = crate::bootstrap_mutation_lock::BOOTSTRAP_MUTATION_LOCK
+        .lock()
+        .await;
+    let Some(identity) = state.household.current().await else {
+        return reject_owner_webauthn_recovery("identity_unavailable", None);
+    };
+    let Some(current_owner_auth) = state.household.current_owner_auth().await else {
+        return reject_owner_webauthn_recovery("owner_auth_unavailable", None);
+    };
+    if current_owner_auth.owner_person_cert.p_id != authorized_owner_auth.owner_person_cert.p_id {
+        return reject_owner_webauthn_recovery("owner_auth_changed", None);
+    }
+    let Some(hh_priv) = identity.hh_priv.as_deref() else {
+        return reject_owner_webauthn_recovery("household_root_unavailable", None);
+    };
+    let Some(webauthn_anchor) = state.owner_webauthn_anchor.clone() else {
+        return reject_owner_webauthn_recovery("missing_anchor_verifier", None);
+    };
+    let Some(recovery_anchor) = state.owner_webauthn_recovery_anchor.clone() else {
+        return reject_owner_webauthn_recovery("missing_recovery_anchor_verifier", None);
+    };
+    let Some(rp) = state.owner_webauthn_rp.as_ref() else {
+        return reject_owner_webauthn_recovery("rp_unavailable", None);
+    };
+
+    match repair_recovery_consume_finish_if_committed(
+        webauthn_anchor.keystore.as_ref(),
+        recovery_anchor.keystore.as_ref(),
+        &identity,
+        current_owner_auth.as_ref(),
+        &request.context,
+    ) {
+        Ok(Some(response)) => {
+            let bytes = household_rs::cbor::to_canonical_vec(&response).unwrap_or_default();
+            return cbor_response(StatusCode::OK, bytes);
+        }
+        Ok(None) => {}
+        Err(reason) => return reject_owner_webauthn_recovery(reason, None),
+    }
+
+    if let Err(e) = request.context.validate_at(now) {
+        return reject_owner_webauthn_recovery(
+            "recovery_consume_context_expired",
+            Some(e.to_string()),
+        );
+    }
+    let plan = match owner_webauthn_recovery_consume_finish_plan(
+        &state,
+        &identity,
+        current_owner_auth.as_ref(),
+        &request.context,
+        recovery_code.as_bytes(),
+    ) {
+        Ok(plan) => plan,
+        Err(reason) => return reject_owner_webauthn_recovery(reason, None),
+    };
+    if plan.expected_context != request.context {
+        return reject_owner_webauthn_recovery("recovery_consume_expected_context_mismatch", None);
+    }
+
+    let mut rp = rp.lock().await;
+    let credential = match rp.finish_registration_with_binding(
+        now,
+        &challenge_id,
+        &request.credential,
+        &plan.registration_binding,
+    ) {
+        Ok(credential) => credential,
+        Err(e) => {
+            return reject_owner_webauthn_recovery(
+                "recovery_consume_registration_finish_failed",
+                Some(e.to_string()),
+            );
+        }
+    };
+    drop(rp);
+    let credential_id = ByteBuf::from(credential.credential_id_bytes().to_vec());
+
+    let recovery_add = match OwnerWebauthnAuthority::sign_recovery_add(
+        hh_priv,
+        &identity.record,
+        &current_owner_auth.owner_person_cert,
+        OwnerWebauthnRecoveryAddInput {
+            previous_entry: &plan.previous_webauthn_entry,
+            recovery_head_sequence: plan.recovery_head.sequence,
+            recovery_head_hash: plan.recovery_head.head_hash,
+            credential,
+            issued_at: now,
+        },
+    ) {
+        Ok(event) => event,
+        Err(e) => {
+            return reject_owner_webauthn_recovery(
+                "recovery_consume_webauthn_sign_failed",
+                Some(e.to_string()),
+            );
+        }
+    };
+    let consume = match OwnerWebauthnRecoveryAuthority::sign_consume(
+        hh_priv,
+        &identity.record,
+        &current_owner_auth.owner_person_cert,
+        &plan.previous_recovery_entry,
+        now,
+    ) {
+        Ok(event) => event,
+        Err(e) => {
+            return reject_owner_webauthn_recovery(
+                "recovery_consume_recovery_sign_failed",
+                Some(e.to_string()),
+            );
+        }
+    };
+
+    let mut next_auth = current_owner_auth.as_ref().clone();
+    next_auth.owner_webauthn.push_signed(recovery_add);
+    next_auth.owner_webauthn_recovery.push_signed(consume);
+    next_auth.updated_at = now;
+    if let Err(e) = next_auth.verify(&identity.record, now) {
+        return reject_owner_webauthn_recovery(
+            "recovery_consume_authority_verify_failed",
+            Some(e.to_string()),
+        );
+    }
+    let active_credential_count = match next_auth.owner_webauthn_credentials(&identity.record) {
+        Ok(credentials) => match u64::try_from(credentials.active_count()) {
+            Ok(count) => count,
+            Err(_) => {
+                return reject_owner_webauthn_recovery("credential_count_overflow", None);
+            }
+        },
+        Err(e) => {
+            return reject_owner_webauthn_recovery(
+                "credential_reconstruct_failed",
+                Some(e.to_string()),
+            );
+        }
+    };
+    if active_credential_count != plan.pre_active_credential_count.saturating_add(1) {
+        return reject_owner_webauthn_recovery(
+            "recovery_consume_active_count_after_add_invalid",
+            None,
+        );
+    }
+
+    if let Err(e) = next_auth.save(&state.state_dir) {
+        return reject_owner_webauthn_recovery(
+            "recovery_consume_authority_save_failed",
+            Some(e.to_string()),
+        );
+    }
+    state
+        .household
+        .set_owner_auth(Arc::new(next_auth.clone()))
+        .await;
+    if let Err(e) = verify_or_update_owner_webauthn_authority_anchor(
+        webauthn_anchor.keystore.as_ref(),
+        &next_auth.owner_webauthn,
+        &identity.record,
+        &next_auth.owner_person_cert,
+        OwnerWebauthnAnchorMode::Enforcement,
+    ) {
+        return reject_owner_webauthn_recovery(
+            "recovery_consume_webauthn_anchor_update_failed",
+            Some(e.to_string()),
+        );
+    }
+    if let Err(e) = advance_owner_webauthn_recovery_anchor_after_commit(
+        recovery_anchor.keystore.as_ref(),
+        &next_auth.owner_webauthn_recovery,
+        &identity.record,
+        &next_auth.owner_person_cert,
+    ) {
+        return reject_owner_webauthn_recovery(
+            "recovery_consume_recovery_anchor_update_failed",
+            Some(e.to_string()),
+        );
+    }
+
+    let response = match recovery_consume_finish_response(&next_auth, &identity, credential_id) {
+        Ok(response) => response,
+        Err(reason) => return reject_owner_webauthn_recovery(reason, None),
+    };
+    let bytes = household_rs::cbor::to_canonical_vec(&response).unwrap_or_default();
     cbor_response(StatusCode::OK, bytes)
 }
 
