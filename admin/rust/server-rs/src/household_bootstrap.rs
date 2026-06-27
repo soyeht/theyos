@@ -718,6 +718,12 @@ pub async fn bootstrap_household(shared_state: Option<SharedState>) {
                                 ),
                             )
                             .route(
+                                "/api/v1/household/owner-webauthn/recovery/consume/finish",
+                                axum::routing::post(
+                                    handlers_owner_events::owner_webauthn_recovery_consume_finish_handler,
+                                ),
+                            )
+                            .route(
                                 "/api/v1/household/owner-events/{cursor}/approve",
                                 axum::routing::post(handlers_owner_events::owner_approve_handler),
                             )
