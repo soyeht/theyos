@@ -32,6 +32,27 @@ fn owner_person_cert_signs_and_verifies() {
     assert_eq!(cert.p_id, derive_person_id(&person.public()));
     assert!(permits(&cert.caveats, &Operation::HouseholdInvite));
     assert!(permits(&cert.caveats, &Operation::ClawsCreate));
+    assert!(
+        !permits(&cert.caveats, &Operation::OwnerAuthEnrollInitial),
+        "old owner certificates remain valid without the dedicated enrollment operation"
+    );
+}
+
+#[test]
+fn owner_person_cert_without_owner_auth_enroll_initial_still_verifies() {
+    let (hh, _person, cert) = signed_owner();
+    assert!(
+        !cert
+            .caveats
+            .iter()
+            .any(|caveat| caveat.op == Operation::OwnerAuthEnrollInitial)
+    );
+    cert.verify(
+        &derive_household_id(&hh.public()),
+        &hh.public(),
+        cert.issued_at,
+    )
+    .unwrap();
 }
 
 #[test]

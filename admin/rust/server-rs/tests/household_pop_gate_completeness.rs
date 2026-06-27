@@ -110,6 +110,13 @@ const ADD_MACHINE_HANDLERS: &[&str] = &[
     "owner_decline_handler",
 ];
 
+/// Owner passkey initial enrollment is not delegable to add-machine caveats.
+/// These handlers must use the explicit owner-only authorizer.
+const OWNER_AUTH_ENROLL_INITIAL_HANDLERS: &[&str] = &[
+    "owner_webauthn_registration_start_handler",
+    "owner_webauthn_registration_finish_handler",
+];
+
 /// Source of `pub async fn {name}` up to the next top-level fn / test module.
 fn handler_body<'a>(source: &'a str, name: &str) -> &'a str {
     let marker = format!("pub async fn {name}");
@@ -187,6 +194,21 @@ fn add_machine_handlers_enforce_household_add_machine() {
         assert!(
             body.contains("Operation::HouseholdAddMachine"),
             "{handler} must authorize Operation::HouseholdAddMachine"
+        );
+    }
+}
+
+#[test]
+fn owner_auth_initial_enrollment_uses_dedicated_owner_authorizer() {
+    for handler in OWNER_AUTH_ENROLL_INITIAL_HANDLERS {
+        let body = handler_body(HANDLERS_OWNER_EVENTS, handler);
+        assert!(
+            body.contains("authorize_owner_auth_enroll_initial_request"),
+            "{handler} must use the dedicated owner-auth enrollment authorizer"
+        );
+        assert!(
+            !body.contains("Operation::HouseholdAddMachine"),
+            "{handler} must not authorize initial owner passkey enrollment with add-machine caveats"
         );
     }
 }

@@ -153,6 +153,66 @@ pub async fn authorize_request_with_actor(
     })
 }
 
+/// Authorize the first owner passkey enrollment surface.
+///
+/// This is intentionally not a generic helper and intentionally does not check
+/// a delegable caveat. Before a passkey exists, "owner" is proven by the
+/// current HH-root-verified owner `PersonCert` plus a fresh `Soyeht-PoP`
+/// signature over method, path/query, timestamp, and exact request body.
+pub async fn authorize_owner_auth_enroll_initial_request(
+    state: &HouseholdState,
+    headers: &HeaderMap,
+    method: &Method,
+    path_and_query: &str,
+    body: &[u8],
+    now: u64,
+) -> Result<Arc<HouseholdAuthState>, AuthError> {
+    let pop = SoyehtPoP::parse(headers).inspect_err(log_rejected)?;
+    let skew = now.abs_diff(pop.timestamp);
+    if skew > TIMESTAMP_TOLERANCE_SECS {
+        log_rejected(&AuthError::Timestamp);
+        return Err(AuthError::Timestamp);
+    }
+    let identity = state.current().await.ok_or_else(|| {
+        log_rejected(&AuthError::IdentityUnavailable);
+        AuthError::IdentityUnavailable
+    })?;
+    let owner_auth = state.current_owner_auth().await.ok_or_else(|| {
+        log_rejected(&AuthError::OwnerAuthUnavailable);
+        AuthError::OwnerAuthUnavailable
+    })?;
+    if !bool::from(
+        owner_auth
+            .owner_person_cert
+            .p_id
+            .0
+            .as_bytes()
+            .ct_eq(pop.p_id.as_bytes()),
+    ) {
+        log_rejected(&AuthError::NotAMember);
+        return Err(AuthError::NotAMember);
+    }
+    owner_auth
+        .owner_person_cert
+        .verify(&identity.record.hh_id, &identity.record.hh_pub, now)
+        .map_err(|_| {
+            log_rejected(&AuthError::CertRejected);
+            AuthError::CertRejected
+        })?;
+    let ctx = RequestSigningContext::new(method.as_str(), path_and_query, pop.timestamp, body);
+    ctx.verify(&owner_auth.owner_person_cert.p_pub, &pop.signature)
+        .map_err(|_| {
+            log_rejected(&AuthError::SignatureRejected);
+            AuthError::SignatureRejected
+        })?;
+    tracing::info!(
+        stage = "household_auth.pop.accepted",
+        p_id = %pop.p_id,
+        operation = %Operation::OwnerAuthEnrollInitial,
+    );
+    Ok(owner_auth)
+}
+
 fn log_rejected(err: &AuthError) {
     tracing::warn!(
         stage = "household_auth.pop.rejected",

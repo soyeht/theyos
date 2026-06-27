@@ -23,6 +23,8 @@ pub enum Operation {
     HouseholdRevoke,
     #[serde(rename = "household.add_machine")]
     HouseholdAddMachine,
+    #[serde(rename = "owner_auth.enroll_initial")]
+    OwnerAuthEnrollInitial,
 }
 
 impl Operation {
@@ -37,6 +39,7 @@ impl Operation {
             Self::HouseholdInvite => "household.invite",
             Self::HouseholdRevoke => "household.revoke",
             Self::HouseholdAddMachine => "household.add_machine",
+            Self::OwnerAuthEnrollInitial => "owner_auth.enroll_initial",
         }
     }
 }
@@ -60,6 +63,7 @@ impl TryFrom<&str> for Operation {
             "household.invite" => Ok(Self::HouseholdInvite),
             "household.revoke" => Ok(Self::HouseholdRevoke),
             "household.add_machine" => Ok(Self::HouseholdAddMachine),
+            "owner_auth.enroll_initial" => Ok(Self::OwnerAuthEnrollInitial),
             other => Err(format!("unknown operation {other:?}")),
         }
     }
@@ -145,7 +149,8 @@ pub fn permits(caveats: &[Caveat], op: &Operation) -> bool {
             | Operation::ClawsAssign => c.scope.as_ref().is_some_and(Scope::is_all),
             Operation::HouseholdInvite
             | Operation::HouseholdRevoke
-            | Operation::HouseholdAddMachine => c.scope.is_none(),
+            | Operation::HouseholdAddMachine
+            | Operation::OwnerAuthEnrollInitial => c.scope.is_none(),
         }
     })
 }

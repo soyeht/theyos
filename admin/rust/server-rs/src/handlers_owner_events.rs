@@ -800,25 +800,58 @@ fn reject_owner_webauthn_registration(reason: &'static str, error: Option<String
     unauthenticated_response()
 }
 
-fn verify_or_migrate_owner_webauthn_credentials_for_enrollment(
+fn owner_webauthn_initial_enrollment_policy_snapshot(
     state: &OwnerEventsRouterState,
     identity: &household_rs::LoadedIdentity,
     owner_auth: &household_rs::HouseholdAuthState,
-) -> Result<household_rs::owner_webauthn::OwnerWebauthnCredentialStore, String> {
-    let Some(anchor) = &state.owner_webauthn_anchor else {
-        return Err("missing_anchor_verifier".into());
+) -> OwnerWebauthnPolicySnapshot {
+    let Some(verifier) = state.owner_webauthn_anchor.as_ref() else {
+        return OwnerWebauthnPolicySnapshot::anchor_invalid();
     };
-    verify_or_update_owner_webauthn_authority_anchor(
-        anchor.keystore.as_ref(),
+    let anchor_status = verify_or_update_owner_webauthn_authority_anchor(
+        verifier.keystore.as_ref(),
         &owner_auth.owner_webauthn,
         &identity.record,
         &owner_auth.owner_person_cert,
-        OwnerWebauthnAnchorMode::MigrationDefaultOff,
-    )
-    .map_err(|e| format!("anchor_verify_failed: {e}"))?;
-    owner_auth
-        .owner_webauthn_credentials(&identity.record)
-        .map_err(|e| format!("credential_reconstruct_failed: {e}"))
+        OwnerWebauthnAnchorMode::Enforcement,
+    );
+    match anchor_status {
+        Ok(OwnerWebauthnAnchorStatus::EmptyAuthorityNoAnchor) => {
+            OwnerWebauthnPolicySnapshot::never_enrolled()
+        }
+        Ok(
+            OwnerWebauthnAnchorStatus::Verified { .. }
+            | OwnerWebauthnAnchorStatus::Advanced { .. }
+            | OwnerWebauthnAnchorStatus::Migrated { .. },
+        ) => match owner_auth.owner_webauthn_credentials(&identity.record) {
+            Ok(credentials) => {
+                let active_count = credentials.active_count();
+                if active_count == 0 {
+                    OwnerWebauthnPolicySnapshot::recovery_required()
+                } else {
+                    OwnerWebauthnPolicySnapshot {
+                        trust_state: OwnerWebauthnTrustState::Active {
+                            count: active_count,
+                        },
+                        credentials: Some(credentials),
+                    }
+                }
+            }
+            Err(_) => OwnerWebauthnPolicySnapshot::anchor_invalid(),
+        },
+        Err(_) => OwnerWebauthnPolicySnapshot::anchor_invalid(),
+    }
+}
+
+fn require_owner_webauthn_never_enrolled_for_initial_enrollment(
+    snapshot: &OwnerWebauthnPolicySnapshot,
+) -> Result<(), &'static str> {
+    match snapshot.trust_state {
+        OwnerWebauthnTrustState::NeverEnrolled => Ok(()),
+        OwnerWebauthnTrustState::Active { .. } => Err("credential_already_enrolled"),
+        OwnerWebauthnTrustState::RecoveryRequired => Err("credential_recovery_required"),
+        OwnerWebauthnTrustState::AnchorInvalid => Err("credential_anchor_invalid"),
+    }
 }
 
 /// `POST /api/v1/household/owner-webauthn/registration/start`.
@@ -840,13 +873,12 @@ pub async fn owner_webauthn_registration_start_handler(
     let path_and_query = uri
         .path_and_query()
         .map_or_else(|| uri.path().to_string(), |pq| pq.as_str().to_string());
-    let owner_auth = match household_auth::authorize_request(
+    let owner_auth = match household_auth::authorize_owner_auth_enroll_initial_request(
         &state.household,
         &headers,
         &method,
         &path_and_query,
         &body,
-        Operation::HouseholdAddMachine,
         now,
     )
     .await
@@ -868,16 +900,10 @@ pub async fn owner_webauthn_registration_start_handler(
     let Some(identity) = state.household.current().await else {
         return reject_owner_webauthn_registration("identity_unavailable", None);
     };
-    let credentials = match verify_or_migrate_owner_webauthn_credentials_for_enrollment(
-        &state,
-        &identity,
-        &owner_auth,
-    ) {
-        Ok(credentials) => credentials,
-        Err(e) => return reject_owner_webauthn_registration("credential_load_failed", Some(e)),
-    };
-    if !owner_auth.owner_webauthn.is_empty() || credentials.active_count() > 0 {
-        return reject_owner_webauthn_registration("credential_already_enrolled", None);
+    let snapshot =
+        owner_webauthn_initial_enrollment_policy_snapshot(&state, &identity, owner_auth.as_ref());
+    if let Err(reason) = require_owner_webauthn_never_enrolled_for_initial_enrollment(&snapshot) {
+        return reject_owner_webauthn_registration(reason, None);
     }
     let Some(rp) = &state.owner_webauthn_rp else {
         return reject_owner_webauthn_registration("rp_unavailable", None);
@@ -893,7 +919,7 @@ pub async fn owner_webauthn_registration_start_handler(
         user_id,
         owner_name,
         owner_display_name,
-        credentials.credentials(),
+        &[],
     ) {
         Ok(result) => result,
         Err(e) => {
@@ -931,13 +957,12 @@ pub async fn owner_webauthn_registration_finish_handler(
     let path_and_query = uri
         .path_and_query()
         .map_or_else(|| uri.path().to_string(), |pq| pq.as_str().to_string());
-    let authorized_owner_auth = match household_auth::authorize_request(
+    let authorized_owner_auth = match household_auth::authorize_owner_auth_enroll_initial_request(
         &state.household,
         &headers,
         &method,
         &path_and_query,
         &body,
-        Operation::HouseholdAddMachine,
         now,
     )
     .await
@@ -974,20 +999,17 @@ pub async fn owner_webauthn_registration_finish_handler(
     if current_owner_auth.owner_person_cert.p_id != authorized_owner_auth.owner_person_cert.p_id {
         return reject_owner_webauthn_registration("owner_auth_changed", None);
     }
+    let snapshot = owner_webauthn_initial_enrollment_policy_snapshot(
+        &state,
+        &identity,
+        current_owner_auth.as_ref(),
+    );
+    if let Err(reason) = require_owner_webauthn_never_enrolled_for_initial_enrollment(&snapshot) {
+        return reject_owner_webauthn_registration(reason, None);
+    }
     let Some(hh_priv) = identity.hh_priv.as_deref() else {
         return reject_owner_webauthn_registration("household_root_unavailable", None);
     };
-    let credentials = match verify_or_migrate_owner_webauthn_credentials_for_enrollment(
-        &state,
-        &identity,
-        &current_owner_auth,
-    ) {
-        Ok(credentials) => credentials,
-        Err(e) => return reject_owner_webauthn_registration("credential_load_failed", Some(e)),
-    };
-    if !current_owner_auth.owner_webauthn.is_empty() || credentials.active_count() > 0 {
-        return reject_owner_webauthn_registration("credential_already_enrolled", None);
-    }
     let Some(rp) = &state.owner_webauthn_rp else {
         return reject_owner_webauthn_registration("rp_unavailable", None);
     };
