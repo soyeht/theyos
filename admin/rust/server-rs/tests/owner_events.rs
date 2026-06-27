@@ -4260,6 +4260,60 @@ async fn owner_webauthn_add_credential_start_missing_anchor_rejects_opaque() {
 }
 
 #[tokio::test]
+async fn owner_webauthn_add_credential_start_invalid_anchor_rejects_opaque() {
+    for anchor in ["truncated", "divergent"] {
+        let td = tempfile::tempdir().unwrap();
+        let identity = Arc::new(bootstrap(td.path()));
+        let (owner_auth, person, rp, _authenticator) =
+            owner_auth_with_webauthn_credential(&identity);
+        let webauthn_anchor_store: Arc<dyn keystore_rs::KeystoreBackend> =
+            Arc::new(FileKeystore::new(td.path(), keystore_rs::SERVICE));
+        let stale_anchor = match anchor {
+            "truncated" => OwnerWebauthnAuthorityAnchor::new(
+                &identity.record,
+                &owner_auth.owner_person_cert,
+                1,
+                [0x42; 32],
+            ),
+            "divergent" => OwnerWebauthnAuthorityAnchor::new(
+                &identity.record,
+                &owner_auth.owner_person_cert,
+                0,
+                [0x43; 32],
+            ),
+            _ => unreachable!(),
+        };
+        write_owner_webauthn_authority_anchor(webauthn_anchor_store.as_ref(), &stale_anchor)
+            .unwrap();
+        let policy = OwnerApprovalEnforcementPolicy::default()
+            .with_add_credential(OwnerOperationEnforcement::V2WhenOwnerHasActiveCredential);
+        let (_td, router, _log, _broadcaster, person, identity, _window) =
+            router_from_owner_auth(td, identity, owner_auth, person, Duration::from_secs(45), {
+                let webauthn_anchor_store = Arc::clone(&webauthn_anchor_store);
+                move |state| {
+                    state
+                        .with_owner_approval_policy(policy)
+                        .with_owner_webauthn_rp(rp)
+                        .with_owner_webauthn_anchor(webauthn_anchor_store)
+                }
+            });
+
+        let (status, _headers, bytes) = post_add_credential_start(router, Some(&person)).await;
+
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert_generic_unauth(status, &bytes);
+        let persisted = read_owner_webauthn_authority_anchor(
+            webauthn_anchor_store.as_ref(),
+            &identity.record.hh_id,
+        )
+        .unwrap()
+        .expect("AddCredential start leaves invalid anchor untouched");
+        assert_eq!(persisted.sequence(), stale_anchor.sequence());
+        assert_eq!(persisted.head_hash(), stale_anchor.head_hash());
+    }
+}
+
+#[tokio::test]
 async fn owner_webauthn_add_credential_start_all_revoked_rejects_opaque() {
     let td = tempfile::tempdir().unwrap();
     let identity = Arc::new(bootstrap(td.path()));
