@@ -154,6 +154,39 @@ impl OwnerWebauthnAuthority {
         };
         SignedOwnerWebauthnCredentialEvent::sign(event, signer)
     }
+
+    pub fn sign_recovery_add(
+        signer: &dyn IdentityKey,
+        record: &HouseholdRecord,
+        owner_person_cert: &PersonCert,
+        input: OwnerWebauthnRecoveryAddInput<'_>,
+    ) -> Result<SignedOwnerWebauthnCredentialEvent, OwnerWebauthnAuthorityError> {
+        let event = OwnerWebauthnCredentialEvent {
+            version: EVENT_SCHEMA_VERSION,
+            event_type: EVENT_TYPE.to_string(),
+            hh_id: record.hh_id.clone(),
+            owner_p_id: owner_person_cert.p_id.clone(),
+            sequence: input.previous_entry.event.sequence + 1,
+            prev_hash: Some(ByteBuf::from(input.previous_entry.entry_hash()?.to_vec())),
+            actor: OwnerWebauthnEventActor::RecoveryProof {
+                recovery_head_sequence: input.recovery_head_sequence,
+                recovery_head_hash: ByteBuf::from(input.recovery_head_hash.to_vec()),
+            },
+            issued_at: input.issued_at,
+            action: OwnerWebauthnCredentialEventAction::Add {
+                credential: Box::new(input.credential),
+            },
+        };
+        SignedOwnerWebauthnCredentialEvent::sign(event, signer)
+    }
+}
+
+pub struct OwnerWebauthnRecoveryAddInput<'a> {
+    pub previous_entry: &'a SignedOwnerWebauthnCredentialEvent,
+    pub recovery_head_sequence: u64,
+    pub recovery_head_hash: [u8; HASH_LEN],
+    pub credential: OwnerWebauthnCredential,
+    pub issued_at: u64,
 }
 
 #[derive(Clone, Serialize, Deserialize, Debug)]
@@ -270,6 +303,18 @@ impl OwnerWebauthnCredentialEvent {
                     ));
                 }
             }
+            (
+                _,
+                OwnerWebauthnEventActor::RecoveryProof {
+                    recovery_head_hash, ..
+                },
+            ) => {
+                if recovery_head_hash.len() != HASH_LEN {
+                    return Err(OwnerWebauthnAuthorityError::Invalid(
+                        "recovery actor head hash must be 32 bytes".into(),
+                    ));
+                }
+            }
         }
         match expected_prev_hash {
             None if self.prev_hash.is_none() => {}
@@ -300,6 +345,11 @@ pub enum OwnerWebauthnEventActor {
     OwnerCredential {
         #[serde(with = "serde_bytes")]
         credential_id: ByteBuf,
+    },
+    RecoveryProof {
+        recovery_head_sequence: u64,
+        #[serde(with = "serde_bytes")]
+        recovery_head_hash: ByteBuf,
     },
 }
 
@@ -366,14 +416,25 @@ fn apply_event(
     store: &mut OwnerWebauthnCredentialStore,
     event: &OwnerWebauthnCredentialEvent,
 ) -> Result<(), OwnerWebauthnAuthorityError> {
-    if let OwnerWebauthnEventActor::OwnerCredential { credential_id } = &event.actor {
-        let active = store.credentials().iter().any(|credential| {
-            credential.credential_id_bytes() == credential_id.as_ref() && !credential.is_revoked()
-        });
-        if !active {
-            return Err(OwnerWebauthnAuthorityError::Invalid(
-                "actor credential was not active before event".into(),
-            ));
+    match &event.actor {
+        OwnerWebauthnEventActor::GenesisTofu => {}
+        OwnerWebauthnEventActor::OwnerCredential { credential_id } => {
+            let active = store.credentials().iter().any(|credential| {
+                credential.credential_id_bytes() == credential_id.as_ref()
+                    && !credential.is_revoked()
+            });
+            if !active {
+                return Err(OwnerWebauthnAuthorityError::Invalid(
+                    "actor credential was not active before event".into(),
+                ));
+            }
+        }
+        OwnerWebauthnEventActor::RecoveryProof { .. } => {
+            if !matches!(event.action, OwnerWebauthnCredentialEventAction::Add { .. }) {
+                return Err(OwnerWebauthnAuthorityError::Invalid(
+                    "recovery actor may only add credentials".into(),
+                ));
+            }
         }
     }
 
@@ -657,6 +718,85 @@ mod tests {
                 crate::owner_webauthn::OwnerWebauthnError::DuplicateCredential
             )
         ));
+    }
+
+    #[test]
+    fn recovery_actor_can_add_credential_with_recovery_head_reference() {
+        let (root, record, owner_cert) = setup();
+        let genesis = OwnerWebauthnAuthority::sign_genesis(
+            &root,
+            &record,
+            &owner_cert,
+            credential(b"owner-passkey-1"),
+            NOW,
+        )
+        .unwrap();
+        let recovery_head_hash = [0x51; HASH_LEN];
+        let add = OwnerWebauthnAuthority::sign_recovery_add(
+            &root,
+            &record,
+            &owner_cert,
+            OwnerWebauthnRecoveryAddInput {
+                previous_entry: &genesis,
+                recovery_head_sequence: 7,
+                recovery_head_hash,
+                credential: credential(b"owner-passkey-2"),
+                issued_at: NOW + 1,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            add.event.actor,
+            OwnerWebauthnEventActor::RecoveryProof {
+                recovery_head_sequence: 7,
+                recovery_head_hash: ByteBuf::from(recovery_head_hash.to_vec()),
+            }
+        );
+
+        let mut authority = OwnerWebauthnAuthority::new();
+        authority.push_signed(genesis);
+        authority.push_signed(add);
+        let store = authority.reconstruct(&record, &owner_cert).unwrap();
+        assert_eq!(store.active_count(), 2);
+    }
+
+    #[test]
+    fn recovery_actor_may_not_revoke_credentials() {
+        let (root, record, owner_cert) = setup();
+        let genesis = OwnerWebauthnAuthority::sign_genesis(
+            &root,
+            &record,
+            &owner_cert,
+            credential(b"owner-passkey-1"),
+            NOW,
+        )
+        .unwrap();
+        let revoke = SignedOwnerWebauthnCredentialEvent::sign(
+            OwnerWebauthnCredentialEvent {
+                version: EVENT_SCHEMA_VERSION,
+                event_type: EVENT_TYPE.to_string(),
+                hh_id: record.hh_id.clone(),
+                owner_p_id: owner_cert.p_id.clone(),
+                sequence: 1,
+                prev_hash: Some(ByteBuf::from(genesis.entry_hash().unwrap().to_vec())),
+                actor: OwnerWebauthnEventActor::RecoveryProof {
+                    recovery_head_sequence: 7,
+                    recovery_head_hash: ByteBuf::from(vec![0x51; HASH_LEN]),
+                },
+                issued_at: NOW + 1,
+                action: OwnerWebauthnCredentialEventAction::Revoke {
+                    credential_id: ByteBuf::from(b"owner-passkey-1".to_vec()),
+                },
+            },
+            &root,
+        )
+        .unwrap();
+
+        let mut authority = OwnerWebauthnAuthority::new();
+        authority.push_signed(genesis);
+        authority.push_signed(revoke);
+        let err = authority.reconstruct(&record, &owner_cert).unwrap_err();
+        assert!(matches!(err, OwnerWebauthnAuthorityError::Invalid(_)));
     }
 
     #[test]

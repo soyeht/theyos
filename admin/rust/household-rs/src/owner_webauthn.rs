@@ -10,6 +10,7 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use rand::RngCore;
+use sha2::{Digest, Sha256};
 use thiserror::Error;
 use webauthn_rs::prelude::{
     AuthenticationResult, CreationChallengeResponse, Passkey, PasskeyAuthentication,
@@ -20,6 +21,7 @@ use webauthn_rs::prelude::{
 use crate::owner_approval_v2::{OwnerApprovalContextV2, OwnerOperation};
 
 const DEFAULT_CHALLENGE_TTL: Duration = Duration::from_secs(5 * 60);
+const REGISTRATION_BINDING_DOMAIN: &[u8] = b"soyeht-owner-webauthn-registration-binding-v1\0";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OwnerWebauthnConfig {
@@ -266,6 +268,8 @@ pub enum OwnerWebauthnError {
     ChallengeContextMismatch,
     #[error("owner approval context failed validation: {0}")]
     ChallengeContext(String),
+    #[error("registration binding failed validation: {0}")]
+    RegistrationBinding(String),
     #[error("signature counter regressed: previous={previous}, next={next}")]
     SignCountRegression { previous: u32, next: u32 },
 }
@@ -327,10 +331,83 @@ impl OwnerWebauthnContextBinding {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OwnerWebauthnRegistrationBinding {
+    purpose: String,
+    canonical_binding: Vec<u8>,
+    binding_digest: [u8; 32],
+}
+
+impl OwnerWebauthnRegistrationBinding {
+    pub fn from_canonical_binding(
+        purpose: impl Into<String>,
+        canonical_binding: impl Into<Vec<u8>>,
+    ) -> Result<Self, OwnerWebauthnError> {
+        let purpose = purpose.into();
+        if purpose.is_empty() {
+            return Err(OwnerWebauthnError::RegistrationBinding(
+                "purpose is empty".into(),
+            ));
+        }
+        let canonical_binding = canonical_binding.into();
+        if canonical_binding.is_empty() {
+            return Err(OwnerWebauthnError::RegistrationBinding(
+                "canonical binding is empty".into(),
+            ));
+        }
+        let mut hasher = Sha256::new();
+        hasher.update(REGISTRATION_BINDING_DOMAIN);
+        hasher.update(purpose.as_bytes());
+        hasher.update([0_u8]);
+        hasher.update(&canonical_binding);
+        Ok(Self {
+            purpose,
+            canonical_binding,
+            binding_digest: hasher.finalize().into(),
+        })
+    }
+
+    #[must_use]
+    pub fn purpose(&self) -> &str {
+        &self.purpose
+    }
+
+    #[must_use]
+    pub fn canonical_binding(&self) -> &[u8] {
+        &self.canonical_binding
+    }
+
+    #[must_use]
+    pub fn binding_digest(&self) -> [u8; 32] {
+        self.binding_digest
+    }
+
+    fn require_binding(&self, submitted_binding: &Self) -> Result<(), OwnerWebauthnError> {
+        if self != submitted_binding {
+            return Err(OwnerWebauthnError::ChallengeContextMismatch);
+        }
+        Ok(())
+    }
+}
+
+pub struct OwnerWebauthnRegistrationStart<'a> {
+    pub owner_user_id: Uuid,
+    pub owner_name: &'a str,
+    pub owner_display_name: &'a str,
+    pub existing_credentials: &'a [OwnerWebauthnCredential],
+    pub binding: Option<OwnerWebauthnRegistrationBinding>,
+}
+
 #[derive(Debug)]
 enum ChallengeState {
-    Registration(PasskeyRegistration),
+    Registration(StoredRegistrationChallenge),
     Authentication(StoredAuthenticationChallenge),
+}
+
+#[derive(Debug)]
+struct StoredRegistrationChallenge {
+    state: PasskeyRegistration,
+    binding: Option<OwnerWebauthnRegistrationBinding>,
 }
 
 #[derive(Debug)]
@@ -365,13 +442,14 @@ impl OwnerWebauthnChallengeStore {
         &mut self,
         challenge_id: OwnerWebauthnChallengeId,
         state: PasskeyRegistration,
+        binding: Option<OwnerWebauthnRegistrationBinding>,
         expires_at_unix: u64,
     ) {
         self.challenges.insert(
             challenge_id,
             StoredChallenge {
                 expires_at_unix,
-                state: ChallengeState::Registration(state),
+                state: ChallengeState::Registration(StoredRegistrationChallenge { state, binding }),
             },
         );
     }
@@ -395,18 +473,42 @@ impl OwnerWebauthnChallengeStore {
         );
     }
 
-    fn take_registration(
-        &mut self,
+    fn registration(
+        &self,
         challenge_id: &OwnerWebauthnChallengeId,
         now_unix: u64,
-    ) -> Result<PasskeyRegistration, OwnerWebauthnError> {
+    ) -> Result<&StoredRegistrationChallenge, OwnerWebauthnError> {
         let stored = self
             .challenges
-            .remove(challenge_id)
+            .get(challenge_id)
             .ok_or(OwnerWebauthnError::ChallengeNotFound)?;
         if now_unix > stored.expires_at_unix {
             return Err(OwnerWebauthnError::ChallengeExpired);
         }
+        match &stored.state {
+            ChallengeState::Registration(state) => Ok(state),
+            ChallengeState::Authentication(_) => Err(OwnerWebauthnError::ChallengeKindMismatch),
+        }
+    }
+
+    fn take_registration(
+        &mut self,
+        challenge_id: &OwnerWebauthnChallengeId,
+        now_unix: u64,
+    ) -> Result<StoredRegistrationChallenge, OwnerWebauthnError> {
+        let expires_at_unix = self
+            .challenges
+            .get(challenge_id)
+            .ok_or(OwnerWebauthnError::ChallengeNotFound)?
+            .expires_at_unix;
+        if now_unix > expires_at_unix {
+            self.challenges.remove(challenge_id);
+            return Err(OwnerWebauthnError::ChallengeExpired);
+        }
+        let stored = self
+            .challenges
+            .remove(challenge_id)
+            .ok_or(OwnerWebauthnError::ChallengeNotFound)?;
         match stored.state {
             ChallengeState::Registration(state) => Ok(state),
             ChallengeState::Authentication(_) => Err(OwnerWebauthnError::ChallengeKindMismatch),
@@ -514,7 +616,27 @@ impl OwnerWebauthnRp {
         owner_display_name: &str,
         existing_credentials: &[OwnerWebauthnCredential],
     ) -> Result<(OwnerWebauthnChallengeId, CreationChallengeResponse), OwnerWebauthnError> {
-        let exclude_credentials = existing_credentials
+        self.start_registration_from(
+            rng,
+            now_unix,
+            OwnerWebauthnRegistrationStart {
+                owner_user_id,
+                owner_name,
+                owner_display_name,
+                existing_credentials,
+                binding: None,
+            },
+        )
+    }
+
+    pub fn start_registration_from(
+        &mut self,
+        rng: &mut impl RngCore,
+        now_unix: u64,
+        input: OwnerWebauthnRegistrationStart<'_>,
+    ) -> Result<(OwnerWebauthnChallengeId, CreationChallengeResponse), OwnerWebauthnError> {
+        let exclude_credentials = input
+            .existing_credentials
             .iter()
             .filter(|credential| !credential.is_revoked())
             .map(|credential| credential.passkey().cred_id().clone())
@@ -522,9 +644,9 @@ impl OwnerWebauthnRp {
         let (challenge, state) = self
             .webauthn
             .start_passkey_registration(
-                owner_user_id,
-                owner_name,
-                owner_display_name,
+                input.owner_user_id,
+                input.owner_name,
+                input.owner_display_name,
                 Some(exclude_credentials),
             )
             .map_err(OwnerWebauthnError::Ceremony)?;
@@ -532,6 +654,7 @@ impl OwnerWebauthnRp {
         self.challenges.insert_registration(
             id.clone(),
             state,
+            input.binding,
             now_unix + self.config.challenge_ttl().as_secs(),
         );
         Ok((id, challenge))
@@ -543,7 +666,47 @@ impl OwnerWebauthnRp {
         challenge_id: &OwnerWebauthnChallengeId,
         credential: &RegisterPublicKeyCredential,
     ) -> Result<OwnerWebauthnCredential, OwnerWebauthnError> {
-        let state = self.challenges.take_registration(challenge_id, now_unix)?;
+        let stored = self.challenges.registration(challenge_id, now_unix)?;
+        if stored.binding.is_some() {
+            return Err(OwnerWebauthnError::ChallengeContextUnexpected);
+        }
+        let state = self
+            .challenges
+            .take_registration(challenge_id, now_unix)?
+            .state;
+        let passkey = self
+            .webauthn
+            .finish_passkey_registration(credential, &state)
+            .map_err(OwnerWebauthnError::Ceremony)?;
+        Ok(OwnerWebauthnCredential::new(passkey))
+    }
+
+    pub fn require_registration_challenge_binding(
+        &self,
+        now_unix: u64,
+        challenge_id: &OwnerWebauthnChallengeId,
+        submitted_binding: &OwnerWebauthnRegistrationBinding,
+    ) -> Result<(), OwnerWebauthnError> {
+        let stored = self.challenges.registration(challenge_id, now_unix)?;
+        let expected = stored
+            .binding
+            .as_ref()
+            .ok_or(OwnerWebauthnError::ChallengeContextMissing)?;
+        expected.require_binding(submitted_binding)
+    }
+
+    pub fn finish_registration_with_binding(
+        &mut self,
+        now_unix: u64,
+        challenge_id: &OwnerWebauthnChallengeId,
+        credential: &RegisterPublicKeyCredential,
+        submitted_binding: &OwnerWebauthnRegistrationBinding,
+    ) -> Result<OwnerWebauthnCredential, OwnerWebauthnError> {
+        self.require_registration_challenge_binding(now_unix, challenge_id, submitted_binding)?;
+        let state = self
+            .challenges
+            .take_registration(challenge_id, now_unix)?
+            .state;
         let passkey = self
             .webauthn
             .finish_passkey_registration(credential, &state)
@@ -772,6 +935,14 @@ mod tests {
         })
     }
 
+    fn registration_binding(bytes: &[u8]) -> OwnerWebauthnRegistrationBinding {
+        OwnerWebauthnRegistrationBinding::from_canonical_binding(
+            "owner-webauthn-recovery-consume",
+            bytes,
+        )
+        .unwrap()
+    }
+
     fn register_with_softpasskey(
         rp: &mut OwnerWebauthnRp,
         rng: &mut StdRng,
@@ -849,6 +1020,80 @@ mod tests {
         assert!(matches!(expired, Err(OwnerWebauthnError::ChallengeExpired)));
         let replay = rp.challenges.take_registration(&challenge_id, NOW);
         assert!(matches!(replay, Err(OwnerWebauthnError::ChallengeNotFound)));
+    }
+
+    #[test]
+    fn bound_registration_mismatch_does_not_consume_challenge() {
+        let mut rp = rp();
+        let mut rng = StdRng::seed_from_u64(4301);
+        let expected = registration_binding(b"canonical-recovery-consume-context");
+        let mismatch = registration_binding(b"tampered-recovery-consume-context");
+        let (challenge_id, challenge) = rp
+            .start_registration_from(
+                &mut rng,
+                NOW,
+                OwnerWebauthnRegistrationStart {
+                    owner_user_id: Uuid::new_v4(),
+                    owner_name: "owner-alpha",
+                    owner_display_name: "Owner Alpha",
+                    existing_credentials: &[],
+                    binding: Some(expected.clone()),
+                },
+            )
+            .unwrap();
+        let mut authenticator = WebauthnAuthenticator::new(SoftPasskey::new(true));
+        let response = authenticator
+            .do_registration(Url::parse("https://alpha.example.test").unwrap(), challenge)
+            .unwrap();
+
+        let err = rp
+            .finish_registration_with_binding(NOW, &challenge_id, &response, &mismatch)
+            .unwrap_err();
+        assert!(matches!(err, OwnerWebauthnError::ChallengeContextMismatch));
+        assert_eq!(rp.challenge_store_len(), 1);
+
+        let credential = rp
+            .finish_registration_with_binding(NOW, &challenge_id, &response, &expected)
+            .unwrap();
+        assert_eq!(credential.credential_id_bytes(), response.raw_id.as_slice());
+        assert_eq!(rp.challenge_store_len(), 0);
+    }
+
+    #[test]
+    fn unbound_finish_rejects_bound_registration_without_consuming() {
+        let mut rp = rp();
+        let mut rng = StdRng::seed_from_u64(4302);
+        let expected = registration_binding(b"canonical-recovery-consume-context");
+        let (challenge_id, challenge) = rp
+            .start_registration_from(
+                &mut rng,
+                NOW,
+                OwnerWebauthnRegistrationStart {
+                    owner_user_id: Uuid::new_v4(),
+                    owner_name: "owner-alpha",
+                    owner_display_name: "Owner Alpha",
+                    existing_credentials: &[],
+                    binding: Some(expected.clone()),
+                },
+            )
+            .unwrap();
+        let mut authenticator = WebauthnAuthenticator::new(SoftPasskey::new(true));
+        let response = authenticator
+            .do_registration(Url::parse("https://alpha.example.test").unwrap(), challenge)
+            .unwrap();
+
+        let err = rp
+            .finish_registration(NOW, &challenge_id, &response)
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            OwnerWebauthnError::ChallengeContextUnexpected
+        ));
+        assert_eq!(rp.challenge_store_len(), 1);
+
+        rp.finish_registration_with_binding(NOW, &challenge_id, &response, &expected)
+            .unwrap();
+        assert_eq!(rp.challenge_store_len(), 0);
     }
 
     #[test]

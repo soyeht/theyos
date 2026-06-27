@@ -1,12 +1,14 @@
 //! Durable owner-passkey recovery readiness authority.
 //!
-//! This module models only recovery-code provision/rotation readiness. It does
-//! not consume recovery codes and it does not grant owner auth by itself. Runtime
-//! handlers must still require a live owner `WebAuthn` step-up before mutating this
-//! authority.
+//! This module models recovery-code provision, rotation, and one-shot consume
+//! state. It does not grant owner auth by itself. Runtime provision/rotation
+//! handlers must require a live owner `WebAuthn` step-up. A future consume
+//! runtime must not require a live passkey step-up; it must prove recovery-code
+//! possession through a dedicated flow.
 
 use serde::{Deserialize, Serialize};
 use serde_bytes::ByteBuf;
+use subtle::ConstantTimeEq;
 use thiserror::Error;
 
 use crate::cbor;
@@ -102,12 +104,18 @@ impl OwnerWebauthnRecoveryAuthority {
         }
 
         let mut previous_hash: Option<[u8; HASH_LEN]> = None;
+        let mut previous_carried_active_verifier = None;
         for (index, entry) in self.entries.iter().enumerate() {
             entry.verify_signature(record)?;
-            entry
-                .event
-                .validate_common(record, owner_person_cert, index, previous_hash)?;
+            entry.event.validate_common(
+                record,
+                owner_person_cert,
+                index,
+                previous_hash,
+                previous_carried_active_verifier,
+            )?;
             previous_hash = Some(entry.entry_hash()?);
+            previous_carried_active_verifier = Some(entry.event.action.carries_active_verifier());
         }
         Ok(())
     }
@@ -148,6 +156,48 @@ impl OwnerWebauthnRecoveryAuthority {
             action,
         };
         SignedOwnerWebauthnRecoveryEvent::sign(event, signer)
+    }
+
+    pub fn sign_consume(
+        signer: &dyn IdentityKey,
+        record: &HouseholdRecord,
+        owner_person_cert: &PersonCert,
+        previous_entry: &SignedOwnerWebauthnRecoveryEvent,
+        issued_at: u64,
+    ) -> Result<SignedOwnerWebauthnRecoveryEvent, OwnerWebauthnRecoveryError> {
+        if !previous_entry.event.action.carries_active_verifier() {
+            return Err(OwnerWebauthnRecoveryError::Invalid(
+                "previous recovery event is not an active verifier".into(),
+            ));
+        }
+        let previous_hash = previous_entry.entry_hash()?;
+        let event = OwnerWebauthnRecoveryEvent {
+            version: EVENT_SCHEMA_VERSION,
+            event_type: EVENT_TYPE.to_string(),
+            hh_id: record.hh_id.clone(),
+            owner_p_id: owner_person_cert.p_id.clone(),
+            sequence: previous_entry.event.sequence + 1,
+            prev_hash: Some(ByteBuf::from(previous_hash.to_vec())),
+            actor: OwnerWebauthnRecoveryActor::RecoveryProof {
+                verifier_head_sequence: previous_entry.event.sequence,
+                verifier_head_hash: ByteBuf::from(previous_hash.to_vec()),
+            },
+            issued_at,
+            action: OwnerWebauthnRecoveryEventAction::Consume,
+        };
+        SignedOwnerWebauthnRecoveryEvent::sign(event, signer)
+    }
+
+    #[must_use]
+    pub fn latest_verifier(&self) -> Option<&RecoveryCodeVerifier> {
+        self.entries
+            .last()
+            .and_then(|entry| entry.event.action.verifier())
+    }
+
+    #[must_use]
+    pub fn recovery_ready(&self) -> bool {
+        self.latest_verifier().is_some()
     }
 }
 
@@ -214,6 +264,7 @@ impl OwnerWebauthnRecoveryEvent {
         owner_person_cert: &PersonCert,
         index: usize,
         expected_prev_hash: Option<[u8; HASH_LEN]>,
+        previous_carried_active_verifier: Option<bool>,
     ) -> Result<(), OwnerWebauthnRecoveryError> {
         if self.version != EVENT_SCHEMA_VERSION {
             return Err(OwnerWebauthnRecoveryError::Invalid(format!(
@@ -263,13 +314,83 @@ impl OwnerWebauthnRecoveryEvent {
                 ));
             }
         }
-        match &self.actor {
-            OwnerWebauthnRecoveryActor::OwnerCredential { credential_id } => {
+        match (index, &self.actor, &self.action) {
+            (
+                _,
+                OwnerWebauthnRecoveryActor::OwnerCredential { credential_id },
+                OwnerWebauthnRecoveryEventAction::Provision { .. }
+                | OwnerWebauthnRecoveryEventAction::Rotate { .. },
+            ) => {
                 if credential_id.is_empty() {
                     return Err(OwnerWebauthnRecoveryError::Invalid(
                         "actor credential id is empty".into(),
                     ));
                 }
+            }
+            (
+                _,
+                OwnerWebauthnRecoveryActor::OwnerCredential { .. },
+                OwnerWebauthnRecoveryEventAction::Consume,
+            ) => {
+                return Err(OwnerWebauthnRecoveryError::Invalid(
+                    "owner credential actor may not consume recovery".into(),
+                ));
+            }
+            (
+                0,
+                OwnerWebauthnRecoveryActor::RecoveryProof { .. },
+                OwnerWebauthnRecoveryEventAction::Consume,
+            ) => {
+                return Err(OwnerWebauthnRecoveryError::Invalid(
+                    "recovery actor may not be genesis".into(),
+                ));
+            }
+            (
+                _,
+                OwnerWebauthnRecoveryActor::RecoveryProof {
+                    verifier_head_sequence,
+                    verifier_head_hash,
+                },
+                OwnerWebauthnRecoveryEventAction::Consume,
+            ) => {
+                if verifier_head_hash.len() != HASH_LEN {
+                    return Err(OwnerWebauthnRecoveryError::Invalid(
+                        "recovery actor verifier head hash must be 32 bytes".into(),
+                    ));
+                }
+                let expected_sequence = u64::try_from(index - 1).map_err(|_| {
+                    OwnerWebauthnRecoveryError::Invalid("recovery actor index overflow".into())
+                })?;
+                if *verifier_head_sequence != expected_sequence {
+                    return Err(OwnerWebauthnRecoveryError::Invalid(
+                        "recovery actor verifier sequence mismatch".into(),
+                    ));
+                }
+                let expected_hash = expected_prev_hash.ok_or_else(|| {
+                    OwnerWebauthnRecoveryError::Invalid(
+                        "recovery actor missing verifier head hash".into(),
+                    )
+                })?;
+                if verifier_head_hash.as_ref() != expected_hash {
+                    return Err(OwnerWebauthnRecoveryError::Invalid(
+                        "recovery actor verifier head hash mismatch".into(),
+                    ));
+                }
+                if !previous_carried_active_verifier.unwrap_or(false) {
+                    return Err(OwnerWebauthnRecoveryError::Invalid(
+                        "recovery consume must reference an active verifier".into(),
+                    ));
+                }
+            }
+            (
+                _,
+                OwnerWebauthnRecoveryActor::RecoveryProof { .. },
+                OwnerWebauthnRecoveryEventAction::Provision { .. }
+                | OwnerWebauthnRecoveryEventAction::Rotate { .. },
+            ) => {
+                return Err(OwnerWebauthnRecoveryError::Invalid(
+                    "recovery actor may only consume recovery".into(),
+                ));
             }
         }
         self.action.validate_for_sequence(index)
@@ -283,6 +404,11 @@ pub enum OwnerWebauthnRecoveryActor {
         #[serde(with = "serde_bytes")]
         credential_id: ByteBuf,
     },
+    RecoveryProof {
+        verifier_head_sequence: u64,
+        #[serde(with = "serde_bytes")]
+        verifier_head_hash: ByteBuf,
+    },
 }
 
 #[derive(Clone, Serialize, Deserialize, Debug)]
@@ -290,6 +416,7 @@ pub enum OwnerWebauthnRecoveryActor {
 pub enum OwnerWebauthnRecoveryEventAction {
     Provision { verifier: RecoveryCodeVerifier },
     Rotate { verifier: RecoveryCodeVerifier },
+    Consume,
 }
 
 impl OwnerWebauthnRecoveryEventAction {
@@ -303,6 +430,26 @@ impl OwnerWebauthnRecoveryEventAction {
                 "provision may only be recovery genesis".into(),
             )),
             (_, Self::Rotate { verifier }) => verifier.validate(),
+            (0, Self::Consume) => Err(OwnerWebauthnRecoveryError::Invalid(
+                "consume may not be recovery genesis".into(),
+            )),
+            (_, Self::Consume) => Ok(()),
+        }
+    }
+
+    #[must_use]
+    fn verifier(&self) -> Option<&RecoveryCodeVerifier> {
+        match self {
+            Self::Provision { verifier } | Self::Rotate { verifier } => Some(verifier),
+            Self::Consume => None,
+        }
+    }
+
+    #[must_use]
+    fn carries_active_verifier(&self) -> bool {
+        match self {
+            Self::Provision { .. } | Self::Rotate { .. } => true,
+            Self::Consume => false,
         }
     }
 }
@@ -329,6 +476,15 @@ impl RecoveryCodeVerifier {
             salt: ByteBuf::from(salt.to_vec()),
             verifier: ByteBuf::from(hasher.finalize().as_bytes().to_vec()),
         }
+    }
+
+    pub fn matches_code_bytes(&self, code: &[u8]) -> Result<bool, OwnerWebauthnRecoveryError> {
+        self.validate()?;
+        let salt: [u8; SALT_LEN] = self.salt.as_ref().try_into().map_err(|_| {
+            OwnerWebauthnRecoveryError::Invalid("recovery verifier salt must be 32 bytes".into())
+        })?;
+        let candidate = Self::from_code_bytes(salt, code);
+        Ok(bool::from(candidate.verifier.ct_eq(&self.verifier)))
     }
 
     fn validate(&self) -> Result<(), OwnerWebauthnRecoveryError> {
@@ -383,4 +539,213 @@ pub fn verified_owner_webauthn_recovery_head(
 pub struct OwnerWebauthnRecoveryHead {
     pub sequence: u64,
     pub head_hash: [u8; HASH_LEN],
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ids::{MachineId, derive_household_id};
+    use crate::keys::P256Keypair;
+    use crate::person_cert::{PersonCert, SignOwnerOptions};
+
+    const NOW: u64 = 1_800_000_000;
+
+    fn record_with(root: &P256Keypair) -> HouseholdRecord {
+        let hh_pub = root.public();
+        HouseholdRecord {
+            version: HouseholdRecord::SCHEMA_VERSION,
+            hh_id: derive_household_id(&hh_pub),
+            hh_pub,
+            name: "Alpha Household".to_string(),
+            created_at: NOW,
+            shamir_k: 1,
+            shamir_n: 1,
+            members: vec![MachineId::parse(format!("m_{}", "b".repeat(52))).unwrap()],
+            is_follower: false,
+        }
+    }
+
+    fn owner_cert(root: &P256Keypair, record: &HouseholdRecord) -> PersonCert {
+        let owner_key = P256Keypair::generate();
+        PersonCert::sign_owner(
+            root,
+            SignOwnerOptions {
+                hh_id: record.hh_id.clone(),
+                p_pub: owner_key.public(),
+                display_name: "Owner Alpha".to_string(),
+                issued_at: NOW,
+            },
+        )
+        .unwrap()
+    }
+
+    fn setup() -> (P256Keypair, HouseholdRecord, PersonCert) {
+        let root = P256Keypair::generate();
+        let record = record_with(&root);
+        let owner_cert = owner_cert(&root, &record);
+        (root, record, owner_cert)
+    }
+
+    fn verifier(code: &[u8]) -> RecoveryCodeVerifier {
+        RecoveryCodeVerifier::from_code_bytes([0xA5; SALT_LEN], code)
+    }
+
+    #[test]
+    fn recovery_verifier_matches_code_bytes_without_exposing_plaintext() {
+        let verifier = verifier(b"high-entropy-recovery-code");
+        assert!(
+            verifier
+                .matches_code_bytes(b"high-entropy-recovery-code")
+                .unwrap()
+        );
+        assert!(!verifier.matches_code_bytes(b"wrong-code").unwrap());
+    }
+
+    #[test]
+    fn consume_invalidates_recovery_readiness_and_rejects_duplicate_consume() {
+        let (root, record, owner_cert) = setup();
+        let provision = OwnerWebauthnRecoveryAuthority::sign_next(
+            &root,
+            &record,
+            &owner_cert,
+            None,
+            b"owner-passkey-1",
+            verifier(b"high-entropy-recovery-code"),
+            NOW,
+        )
+        .unwrap();
+        let consume = OwnerWebauthnRecoveryAuthority::sign_consume(
+            &root,
+            &record,
+            &owner_cert,
+            &provision,
+            NOW + 1,
+        )
+        .unwrap();
+        assert_eq!(
+            consume.event.actor,
+            OwnerWebauthnRecoveryActor::RecoveryProof {
+                verifier_head_sequence: 0,
+                verifier_head_hash: ByteBuf::from(provision.entry_hash().unwrap().to_vec()),
+            }
+        );
+
+        let mut authority = OwnerWebauthnRecoveryAuthority::new();
+        authority.push_signed(provision.clone());
+        assert!(authority.recovery_ready());
+        authority.push_signed(consume.clone());
+        authority.verify(&record, &owner_cert).unwrap();
+        assert!(!authority.recovery_ready());
+        assert!(authority.latest_verifier().is_none());
+
+        let duplicate = OwnerWebauthnRecoveryAuthority::sign_consume(
+            &root,
+            &record,
+            &owner_cert,
+            &consume,
+            NOW + 2,
+        );
+        assert!(matches!(
+            duplicate,
+            Err(OwnerWebauthnRecoveryError::Invalid(_))
+        ));
+
+        let consume_hash = consume.entry_hash().unwrap();
+        let duplicate = SignedOwnerWebauthnRecoveryEvent::sign(
+            OwnerWebauthnRecoveryEvent {
+                version: EVENT_SCHEMA_VERSION,
+                event_type: EVENT_TYPE.to_string(),
+                hh_id: record.hh_id.clone(),
+                owner_p_id: owner_cert.p_id.clone(),
+                sequence: 2,
+                prev_hash: Some(ByteBuf::from(consume_hash.to_vec())),
+                actor: OwnerWebauthnRecoveryActor::RecoveryProof {
+                    verifier_head_sequence: 1,
+                    verifier_head_hash: ByteBuf::from(consume_hash.to_vec()),
+                },
+                issued_at: NOW + 2,
+                action: OwnerWebauthnRecoveryEventAction::Consume,
+            },
+            &root,
+        )
+        .unwrap();
+        let mut tampered_authority = OwnerWebauthnRecoveryAuthority::new();
+        tampered_authority.push_signed(provision);
+        tampered_authority.push_signed(consume);
+        tampered_authority.push_signed(duplicate);
+        let err = tampered_authority.verify(&record, &owner_cert).unwrap_err();
+        assert!(matches!(err, OwnerWebauthnRecoveryError::Invalid(_)));
+    }
+
+    #[test]
+    fn consume_must_reference_immediate_recovery_head() {
+        let (root, record, owner_cert) = setup();
+        let provision = OwnerWebauthnRecoveryAuthority::sign_next(
+            &root,
+            &record,
+            &owner_cert,
+            None,
+            b"owner-passkey-1",
+            verifier(b"high-entropy-recovery-code"),
+            NOW,
+        )
+        .unwrap();
+        let mut consume = OwnerWebauthnRecoveryAuthority::sign_consume(
+            &root,
+            &record,
+            &owner_cert,
+            &provision,
+            NOW + 1,
+        )
+        .unwrap();
+        consume.event.actor = OwnerWebauthnRecoveryActor::RecoveryProof {
+            verifier_head_sequence: 0,
+            verifier_head_hash: ByteBuf::from(vec![0xEE; HASH_LEN]),
+        };
+        consume.signature = root.sign(&consume.event.signing_bytes().unwrap()).unwrap();
+
+        let mut authority = OwnerWebauthnRecoveryAuthority::new();
+        authority.push_signed(provision);
+        authority.push_signed(consume);
+        let err = authority.verify(&record, &owner_cert).unwrap_err();
+        assert!(matches!(err, OwnerWebauthnRecoveryError::Invalid(_)));
+    }
+
+    #[test]
+    fn owner_credential_actor_may_not_consume_recovery() {
+        let (root, record, owner_cert) = setup();
+        let provision = OwnerWebauthnRecoveryAuthority::sign_next(
+            &root,
+            &record,
+            &owner_cert,
+            None,
+            b"owner-passkey-1",
+            verifier(b"high-entropy-recovery-code"),
+            NOW,
+        )
+        .unwrap();
+        let consume = SignedOwnerWebauthnRecoveryEvent::sign(
+            OwnerWebauthnRecoveryEvent {
+                version: EVENT_SCHEMA_VERSION,
+                event_type: EVENT_TYPE.to_string(),
+                hh_id: record.hh_id.clone(),
+                owner_p_id: owner_cert.p_id.clone(),
+                sequence: 1,
+                prev_hash: Some(ByteBuf::from(provision.entry_hash().unwrap().to_vec())),
+                actor: OwnerWebauthnRecoveryActor::OwnerCredential {
+                    credential_id: ByteBuf::from(b"owner-passkey-1".to_vec()),
+                },
+                issued_at: NOW + 1,
+                action: OwnerWebauthnRecoveryEventAction::Consume,
+            },
+            &root,
+        )
+        .unwrap();
+
+        let mut authority = OwnerWebauthnRecoveryAuthority::new();
+        authority.push_signed(provision);
+        authority.push_signed(consume);
+        let err = authority.verify(&record, &owner_cert).unwrap_err();
+        assert!(matches!(err, OwnerWebauthnRecoveryError::Invalid(_)));
+    }
 }

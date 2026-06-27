@@ -2047,7 +2047,8 @@ fn revoke_events_for_target(
                 OwnerWebauthnEventActor::OwnerCredential { credential_id } => {
                     Some(credential_id.to_vec())
                 }
-                OwnerWebauthnEventActor::GenesisTofu => None,
+                OwnerWebauthnEventActor::GenesisTofu
+                | OwnerWebauthnEventActor::RecoveryProof { .. } => None,
             }
         })
         .collect()
@@ -2064,6 +2065,9 @@ fn recovery_event_verifier_bytes(owner_auth: &HouseholdAuthState, index: usize) 
         OwnerWebauthnRecoveryEventAction::Provision { verifier }
         | OwnerWebauthnRecoveryEventAction::Rotate { verifier } => {
             household_rs::cbor::to_canonical_vec(verifier).unwrap()
+        }
+        OwnerWebauthnRecoveryEventAction::Consume => {
+            panic!("consume event does not carry a verifier")
         }
     }
 }
@@ -2317,9 +2321,11 @@ fn owner_webauthn_recovery_source_guards_provision_readiness_contract() {
         "fn owner_webauthn_revoke_credential_start_snapshot(",
     );
     assert!(status.contains("classify_owner_webauthn_recovery_anchor_read_only"));
+    assert!(status.contains("owner_webauthn_recovery.recovery_ready()"));
     assert!(!status.contains("advance_owner_webauthn_recovery_anchor_after_commit"));
     assert!(!status.contains("verify_or_update"));
     assert!(!status.contains("MigrationDefaultOff"));
+    assert!(!source.contains("owner_webauthn_recovery_consume_handler"));
 
     let status_handler = source_segment(
         source,
@@ -2432,6 +2438,7 @@ fn owner_webauthn_recovery_source_guards_provision_readiness_contract() {
     assert!(router_source.contains("/api/v1/household/owner-webauthn/recovery/status"));
     assert!(router_source.contains("/api/v1/household/owner-webauthn/recovery/start"));
     assert!(router_source.contains("/api/v1/household/owner-webauthn/recovery/finish"));
+    assert!(!router_source.contains("/api/v1/household/owner-webauthn/recovery/consume"));
 }
 
 #[tokio::test]
@@ -3473,7 +3480,8 @@ async fn owner_webauthn_recovery_provision_persists_verifier_and_anchor_without_
                 "stored verifier must not contain plaintext recovery code"
             );
         }
-        OwnerWebauthnRecoveryEventAction::Rotate { .. } => {
+        OwnerWebauthnRecoveryEventAction::Rotate { .. }
+        | OwnerWebauthnRecoveryEventAction::Consume => {
             panic!("first recovery event must provision")
         }
     }

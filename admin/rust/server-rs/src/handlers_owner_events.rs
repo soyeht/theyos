@@ -786,7 +786,7 @@ fn owner_webauthn_recovery_ready_status(
         Ok(
             OwnerWebauthnRecoveryAnchorStatus::Verified { .. }
             | OwnerWebauthnRecoveryAnchorStatus::Created { .. },
-        ) => Ok(true),
+        ) => Ok(owner_auth.owner_webauthn_recovery.recovery_ready()),
         Err(OwnerWebauthnRecoveryAnchorError::MissingAnchor) => {
             let head = verified_owner_webauthn_recovery_head(
                 &owner_auth.owner_webauthn_recovery,
