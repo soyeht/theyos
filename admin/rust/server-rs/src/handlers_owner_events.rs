@@ -21,7 +21,7 @@ use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD as B64URL};
 use household_rs::caveats::Operation;
 use household_rs::owner_approval_v2::{
     OwnerApprovalContextV2, OwnerApprovalV2, OwnerApprovalV2Error, OwnerOperation,
-    PairMachineTrustedContextInput,
+    PairMachineTrustedContextInput, RevokeCredentialContextInput,
 };
 use household_rs::owner_events::{
     JoinCancelledPayload, MachineJoinedPayload, OwnerDevicePushToken, OwnerEvent, OwnerEventLog,
@@ -197,12 +197,23 @@ impl OwnerApprovalEnforcementPolicy {
     }
 
     #[must_use]
+    pub fn with_revoke_credential(mut self, mode: OwnerOperationEnforcement) -> Self {
+        self.revoke_credential = mode;
+        self
+    }
+
+    #[must_use]
     pub fn pair_machine_approval_body_mode(
         &self,
         owner_webauthn_trust_state: OwnerWebauthnTrustState,
     ) -> PairMachineApprovalBodyMode {
         self.pair_machine_approve
             .body_mode(owner_webauthn_trust_state)
+    }
+
+    #[must_use]
+    fn revoke_credential_start_enabled(&self) -> bool {
+        self.revoke_credential == OwnerOperationEnforcement::V2WhenOwnerHasActiveCredential
     }
 }
 
@@ -353,6 +364,10 @@ fn owner_approval_v2_capabilities() -> Vec<String> {
     vec!["machine-cert".to_string(), "shamir-2pc".to_string()]
 }
 
+fn owner_revoke_credential_v2_capabilities() -> Vec<String> {
+    vec!["owner-auth-revoke".to_string()]
+}
+
 fn pair_machine_window_data(
     cursor: u64,
     snapshot: PairMachineWindowSnapshot,
@@ -448,6 +463,67 @@ fn pair_machine_owner_webauthn_policy_snapshot(
     }
 }
 
+struct OwnerWebauthnRevokeCredentialStartSnapshot {
+    credentials: OwnerWebauthnCredentialStore,
+    authority_head: OwnerWebauthnAuthorityHead,
+    pre_active_credential_count: u64,
+}
+
+fn owner_webauthn_revoke_credential_start_snapshot(
+    state: &OwnerEventsRouterState,
+    identity: &household_rs::LoadedIdentity,
+    owner_auth: &household_rs::HouseholdAuthState,
+    target_credential_id: &[u8],
+) -> Result<OwnerWebauthnRevokeCredentialStartSnapshot, &'static str> {
+    if !state
+        .owner_approval_policy
+        .revoke_credential_start_enabled()
+    {
+        return Err("revoke_credential_policy_disabled");
+    }
+
+    let Some(verifier) = state.owner_webauthn_anchor.as_ref() else {
+        return Err("missing_anchor_verifier");
+    };
+    let authority_head = match classify_owner_webauthn_authority_anchor_read_only(
+        verifier.keystore.as_ref(),
+        &owner_auth.owner_webauthn,
+        &identity.record,
+        &owner_auth.owner_person_cert,
+    ) {
+        Ok(
+            OwnerWebauthnAnchorStatus::Verified { head }
+            | OwnerWebauthnAnchorStatus::Advanced { head, .. },
+        ) => head,
+        Ok(OwnerWebauthnAnchorStatus::EmptyAuthorityNoAnchor) => return Err("never_enrolled"),
+        Ok(OwnerWebauthnAnchorStatus::Migrated { .. }) => {
+            return Err("unexpected_anchor_migration");
+        }
+        Err(_) => return Err("credential_anchor_invalid"),
+    };
+    let credentials = owner_auth
+        .owner_webauthn_credentials(&identity.record)
+        .map_err(|_| "credential_reconstruct_failed")?;
+    let active_count = credentials.active_count();
+    if active_count <= 1 {
+        return Err("revoke_credential_last_active");
+    }
+    let target_is_active = credentials
+        .active_credentials()
+        .iter()
+        .any(|credential| credential.credential_id_bytes() == target_credential_id);
+    if !target_is_active {
+        return Err("revoke_credential_target_not_active");
+    }
+    let pre_active_credential_count =
+        u64::try_from(active_count).map_err(|_| "credential_count_overflow")?;
+    Ok(OwnerWebauthnRevokeCredentialStartSnapshot {
+        credentials,
+        authority_head,
+        pre_active_credential_count,
+    })
+}
+
 fn parse_pair_machine_approval_body(
     mode: PairMachineApprovalBodyMode,
     cursor: u64,
@@ -510,6 +586,14 @@ struct OwnerApprovalV2StartResponse {
     challenge_id: String,
     context: OwnerApprovalContextV2,
     options: RequestChallengeResponse,
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct OwnerWebauthnRevokeCredentialStartRequest {
+    #[serde(rename = "v")]
+    version: u8,
+    target_credential_id: ByteBuf,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -1002,6 +1086,25 @@ fn reject_owner_webauthn_registration(reason: &'static str, error: Option<String
     unauthenticated_response()
 }
 
+fn reject_owner_webauthn_revoke_credential_start(
+    reason: &'static str,
+    error: Option<String>,
+) -> Response {
+    if let Some(error) = error {
+        tracing::warn!(
+            stage = "owner_events.owner_webauthn_revoke_credential_start.rejected",
+            reason,
+            error = %error,
+        );
+    } else {
+        tracing::warn!(
+            stage = "owner_events.owner_webauthn_revoke_credential_start.rejected",
+            reason,
+        );
+    }
+    unauthenticated_response()
+}
+
 fn owner_webauthn_initial_enrollment_policy_snapshot(
     state: &OwnerEventsRouterState,
     identity: &household_rs::LoadedIdentity,
@@ -1122,6 +1225,132 @@ pub async fn owner_webauthn_registration_status_handler(
     let bytes = household_rs::cbor::to_canonical_vec(&OwnerWebauthnRegistrationStatusResponse {
         version: 1,
         enrolled,
+    })
+    .unwrap_or_default();
+    cbor_response(StatusCode::OK, bytes)
+}
+
+/// `POST /api/v1/household/owner-webauthn/revoke/start`.
+///
+/// Starts an owner passkey step-up challenge for a later revoke finish. This
+/// R2 slice is challenge-only: it classifies the authority read-only, binds the
+/// challenge to the exact live revoke context, and does not mutate owner auth,
+/// the rollback anchor, or any status marker. The bootstrap mutation lock is
+/// used only to coordinate the read-only identity/auth snapshot with challenge
+/// staging; the real no-brick mutation gate remains in the R3 finish slice.
+pub async fn owner_webauthn_revoke_credential_start_handler(
+    State(state): State<OwnerEventsRouterState>,
+    method: Method,
+    uri: Uri,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let Some(now) =
+        time_util::unix_now_secs_checked("owner_events.owner_webauthn_revoke_start.clock")
+    else {
+        return unauthenticated_response();
+    };
+    let path_and_query = uri
+        .path_and_query()
+        .map_or_else(|| uri.path().to_string(), |pq| pq.as_str().to_string());
+    let authorized_owner_auth =
+        match household_auth::authorize_owner_webauthn_revoke_credential_start_request(
+            &state.household,
+            &headers,
+            &method,
+            &path_and_query,
+            &body,
+            now,
+        )
+        .await
+        {
+            Ok(owner_auth) => owner_auth,
+            Err(e) => {
+                return reject_owner_webauthn_revoke_credential_start(
+                    "pop_auth_failed",
+                    Some(e.to_string()),
+                );
+            }
+        };
+
+    let request: OwnerWebauthnRevokeCredentialStartRequest = match decode_canonical_cbor(&body) {
+        Ok(request) => request,
+        Err(e) => return reject_owner_webauthn_revoke_credential_start("cbor_decode", Some(e)),
+    };
+    if request.version != 1 {
+        return reject_owner_webauthn_revoke_credential_start("bad_version", None);
+    }
+    if request.target_credential_id.is_empty() {
+        return reject_owner_webauthn_revoke_credential_start("target_credential_empty", None);
+    }
+
+    let _mutation_guard = crate::bootstrap_mutation_lock::BOOTSTRAP_MUTATION_LOCK
+        .lock()
+        .await;
+    let Some(identity) = state.household.current().await else {
+        return reject_owner_webauthn_revoke_credential_start("identity_unavailable", None);
+    };
+    let Some(current_owner_auth) = state.household.current_owner_auth().await else {
+        return reject_owner_webauthn_revoke_credential_start("owner_auth_unavailable", None);
+    };
+    if current_owner_auth.owner_person_cert.p_id != authorized_owner_auth.owner_person_cert.p_id {
+        return reject_owner_webauthn_revoke_credential_start("owner_auth_changed", None);
+    }
+    let snapshot = match owner_webauthn_revoke_credential_start_snapshot(
+        &state,
+        &identity,
+        current_owner_auth.as_ref(),
+        request.target_credential_id.as_ref(),
+    ) {
+        Ok(snapshot) => snapshot,
+        Err(reason) => return reject_owner_webauthn_revoke_credential_start(reason, None),
+    };
+    let Some(rp) = state.owner_webauthn_rp.as_ref() else {
+        return reject_owner_webauthn_revoke_credential_start("rp_unavailable", None);
+    };
+
+    let mut rng = OsRng;
+    let mut replay_nonce = [0_u8; 32];
+    rng.fill_bytes(&mut replay_nonce);
+    let mut rp = rp.lock().await;
+    let expected_context =
+        OwnerApprovalContextV2::revoke_credential(RevokeCredentialContextInput {
+            hh_id: identity.record.hh_id.clone(),
+            owner_p_id: current_owner_auth.owner_person_cert.p_id.clone(),
+            target_credential_id: request.target_credential_id.to_vec(),
+            authority_head_sequence: snapshot.authority_head.sequence,
+            authority_head_hash: snapshot.authority_head.head_hash,
+            pre_active_credential_count: snapshot.pre_active_credential_count,
+            capabilities: owner_revoke_credential_v2_capabilities(),
+            issued_at: now,
+            expires_at: now.saturating_add(rp.config().challenge_ttl().as_secs()),
+            replay_nonce,
+        });
+    if let Err(e) = expected_context.validate_shape() {
+        return reject_owner_webauthn_revoke_credential_start(
+            "trusted_context_build_failed",
+            Some(e.to_string()),
+        );
+    }
+    let (challenge_id, options) = match rp.start_owner_approval_assertion(
+        &mut rng,
+        now,
+        snapshot.credentials.credentials(),
+        &expected_context,
+    ) {
+        Ok(started) => started,
+        Err(e) => {
+            return reject_owner_webauthn_revoke_credential_start(
+                "webauthn_start_failed",
+                Some(e.to_string()),
+            );
+        }
+    };
+    let bytes = household_rs::cbor::to_canonical_vec(&OwnerApprovalV2StartResponse {
+        version: 1,
+        challenge_id: challenge_id.as_str().to_string(),
+        context: expected_context,
+        options,
     })
     .unwrap_or_default();
     cbor_response(StatusCode::OK, bytes)
