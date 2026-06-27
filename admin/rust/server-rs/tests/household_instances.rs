@@ -252,7 +252,7 @@ fn shared_state() -> SharedState {
         jobs,
         ver_cache: std::sync::RwLock::default(),
         instance_db,
-        rate_limiter,
+        rate_limiter: Arc::new(rate_limiter),
         executor: Arc::new(Mutex::new(executor)),
         pty_mgr,
         vm_runner,

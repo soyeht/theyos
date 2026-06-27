@@ -40,7 +40,7 @@ pub struct AppState {
     /// SQLite-backed instances table (new instances created via async jobs).
     pub instance_db: InstanceDb,
     /// Rate limiter — per-user per-action hourly quota.
-    pub rate_limiter: Limiter,
+    pub rate_limiter: Arc<Limiter>,
     /// Executor — orchestrates VM lifecycle flows (create/delete/restart/stop).
     /// Wrapped in Arc<Mutex> because Executor holds IPC connections (not Clone).
     pub executor: Arc<Mutex<Executor>>,
