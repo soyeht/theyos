@@ -9,7 +9,7 @@ use household_rs::ids::{HouseholdId, MachineId};
 use household_rs::machine_cert::PersonId;
 use household_rs::owner_approval_v2::{
     OwnerApprovalContextV2, OwnerApprovalV2, OwnerApprovalV2Error, PairMachineApprovalContextInput,
-    RevokeCredentialContextInput,
+    ProvisionRecoveryCodeContextInput, RecoveryAuthorityHeadInput, RevokeCredentialContextInput,
 };
 use household_rs::pair_machine::JoinTransport;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
@@ -25,6 +25,7 @@ struct Fixture {
     owner_approval_finishes: Vec<FinishVector>,
     owner_approval_start_responses: Vec<StartResponseVector>,
     revoke_credential_contexts: Vec<RevokeCredentialContextVector>,
+    provision_recovery_code_contexts: Vec<ProvisionRecoveryCodeContextVector>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -52,6 +53,13 @@ struct StartResponseVector {
 struct RevokeCredentialContextVector {
     id: String,
     input: RevokeCredentialContextInputJson,
+    canonical_cbor_hex: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ProvisionRecoveryCodeContextVector {
+    id: String,
+    input: ProvisionRecoveryCodeContextInputJson,
     canonical_cbor_hex: String,
 }
 
@@ -122,6 +130,26 @@ struct RevokeCredentialContextInputJson {
     authority_head_sequence: u64,
     authority_head_hash_hex: String,
     pre_active_credential_count: u64,
+    capabilities: Vec<String>,
+    issued_at: u64,
+    expires_at: u64,
+    replay_nonce_hex: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ProvisionRecoveryCodeContextInputJson {
+    #[serde(rename = "v")]
+    version: u8,
+    purpose: String,
+    op: String,
+    hh_id: String,
+    owner_p_id: String,
+    authority_head_sequence: u64,
+    authority_head_hash_hex: String,
+    pre_active_credential_count: u64,
+    recovery_head_sequence: Option<u64>,
+    recovery_head_hash_hex: Option<String>,
     capabilities: Vec<String>,
     issued_at: u64,
     expires_at: u64,
@@ -355,6 +383,181 @@ fn revoke_credential_context_sequence_and_count_are_canonical_unsigned_ints() {
     );
 }
 
+#[test]
+fn owner_approval_v2_provision_recovery_code_context_vectors_are_canonical() {
+    let fixture = load_fixture();
+    assert_eq!(fixture.provision_recovery_code_contexts.len(), 2);
+
+    for vector in &fixture.provision_recovery_code_contexts {
+        let context = provision_recovery_context_from_input(&vector.input);
+        context.validate_shape().unwrap();
+        let encoded =
+            assert_canonical_round_trip(vector.id.as_str(), &vector.canonical_cbor_hex, &context);
+        let encoded_hex = hex::encode(&encoded);
+
+        assert_byte_field(
+            vector.id.as_str(),
+            &encoded,
+            "authority_head_hash",
+            &vector.input.authority_head_hash_hex,
+        );
+        if let Some(recovery_head_hash_hex) = &vector.input.recovery_head_hash_hex {
+            assert_byte_field(
+                vector.id.as_str(),
+                &encoded,
+                "recovery_head_hash",
+                recovery_head_hash_hex,
+            );
+        } else {
+            assert!(
+                !encoded_hex.contains(&cbor_text_hex("recovery_head_hash")),
+                "{} must omit recovery_head_hash when no recovery head is bound",
+                vector.id,
+            );
+            assert!(
+                !encoded_hex.contains(&cbor_text_hex("recovery_head_sequence")),
+                "{} must omit recovery_head_sequence when no recovery head is bound",
+                vector.id,
+            );
+        }
+    }
+}
+
+#[test]
+fn provision_recovery_code_context_rejects_missing_and_unknown_fields() {
+    let fixture = load_fixture();
+    let input = &fixture.provision_recovery_code_contexts[0].input;
+    for missing in [
+        "authority_head_sequence",
+        "authority_head_hash_hex",
+        "pre_active_credential_count",
+    ] {
+        let mut value = serde_json::to_value(input).unwrap();
+        value.as_object_mut().unwrap().remove(missing);
+        assert!(
+            serde_json::from_value::<ProvisionRecoveryCodeContextInputJson>(value).is_err(),
+            "missing {missing} must reject",
+        );
+    }
+
+    let mut value = serde_json::to_value(input).unwrap();
+    value
+        .as_object_mut()
+        .unwrap()
+        .insert("cursor".to_string(), serde_json::json!(7));
+    assert!(
+        serde_json::from_value::<ProvisionRecoveryCodeContextInputJson>(value).is_err(),
+        "unknown pair-machine field must reject",
+    );
+}
+
+#[test]
+fn provision_recovery_code_context_rejects_invalid_values_and_half_present_head() {
+    let fixture = load_fixture();
+    let mut invalid_hash =
+        provision_recovery_context_from_input(&fixture.provision_recovery_code_contexts[0].input);
+    invalid_hash.authority_head_hash = Some(ByteBuf::from(vec![0x44; 31]));
+    assert!(matches!(
+        invalid_hash.validate_shape(),
+        Err(OwnerApprovalV2Error::InvalidField("authority_head_hash"))
+    ));
+
+    let mut invalid_count =
+        provision_recovery_context_from_input(&fixture.provision_recovery_code_contexts[0].input);
+    invalid_count.pre_active_credential_count = Some(0);
+    assert!(matches!(
+        invalid_count.validate_shape(),
+        Err(OwnerApprovalV2Error::InvalidField(
+            "pre_active_credential_count"
+        ))
+    ));
+
+    let mut recovery_hash_short =
+        provision_recovery_context_from_input(&fixture.provision_recovery_code_contexts[1].input);
+    recovery_hash_short.recovery_head_hash = Some(ByteBuf::from(vec![0x77; 31]));
+    assert!(matches!(
+        recovery_hash_short.validate_shape(),
+        Err(OwnerApprovalV2Error::InvalidField("recovery_head_hash"))
+    ));
+
+    let mut missing_recovery_hash =
+        provision_recovery_context_from_input(&fixture.provision_recovery_code_contexts[1].input);
+    missing_recovery_hash.recovery_head_hash = None;
+    assert!(matches!(
+        missing_recovery_hash.validate_shape(),
+        Err(OwnerApprovalV2Error::MissingField("recovery_head_hash"))
+    ));
+
+    let mut missing_recovery_sequence =
+        provision_recovery_context_from_input(&fixture.provision_recovery_code_contexts[1].input);
+    missing_recovery_sequence.recovery_head_sequence = None;
+    assert!(matches!(
+        missing_recovery_sequence.validate_shape(),
+        Err(OwnerApprovalV2Error::MissingField("recovery_head_sequence"))
+    ));
+}
+
+#[test]
+fn provision_recovery_code_context_sequence_and_count_are_canonical_unsigned_ints() {
+    let fixture = load_fixture();
+    let vector = &fixture.provision_recovery_code_contexts[0];
+    let context = provision_recovery_context_from_input(&vector.input);
+    let encoded = context.to_canonical_bytes().unwrap();
+    let encoded_hex = hex::encode(encoded);
+
+    assert!(
+        encoded_hex.contains(&format!("{}1818", cbor_text_hex("authority_head_sequence"))),
+        "{} must encode authority_head_sequence=24 as canonical uint8",
+        vector.id,
+    );
+    assert!(
+        encoded_hex.contains(&format!(
+            "{}02",
+            cbor_text_hex("pre_active_credential_count")
+        )),
+        "{} must encode pre_active_credential_count=2 as canonical small uint",
+        vector.id,
+    );
+}
+
+#[test]
+fn owner_approval_context_cross_rejects_fields_from_other_operations() {
+    let fixture = load_fixture();
+    let mut pair_machine = context_from_input(&fixture.owner_approvals[0].input.context);
+    pair_machine.recovery_head_sequence = Some(0);
+    assert!(matches!(
+        pair_machine.validate_shape(),
+        Err(OwnerApprovalV2Error::UnexpectedField(
+            "recovery_head_sequence"
+        ))
+    ));
+
+    let mut revoke = revoke_context_from_input(&fixture.revoke_credential_contexts[0].input);
+    revoke.recovery_head_hash = Some(ByteBuf::from(vec![0x77; 32]));
+    assert!(matches!(
+        revoke.validate_shape(),
+        Err(OwnerApprovalV2Error::UnexpectedField("recovery_head_hash"))
+    ));
+
+    let mut provision =
+        provision_recovery_context_from_input(&fixture.provision_recovery_code_contexts[0].input);
+    provision.target_credential_id = Some(ByteBuf::from(vec![0x41]));
+    assert!(matches!(
+        provision.validate_shape(),
+        Err(OwnerApprovalV2Error::UnexpectedField(
+            "target_credential_id"
+        ))
+    ));
+
+    let mut provision_with_pair_field =
+        provision_recovery_context_from_input(&fixture.provision_recovery_code_contexts[0].input);
+    provision_with_pair_field.cursor = Some(7);
+    assert!(matches!(
+        provision_with_pair_field.validate_shape(),
+        Err(OwnerApprovalV2Error::UnexpectedField("cursor"))
+    ));
+}
+
 fn approval_from_input(input: &ApprovalInput) -> OwnerApprovalV2 {
     assert_eq!(input.version, 2);
     OwnerApprovalV2 {
@@ -427,6 +630,38 @@ fn revoke_context_from_input(input: &RevokeCredentialContextInputJson) -> OwnerA
         authority_head_sequence: input.authority_head_sequence,
         authority_head_hash: unhex_array_32("authority_head_hash", &input.authority_head_hash_hex),
         pre_active_credential_count: input.pre_active_credential_count,
+        capabilities: input.capabilities.clone(),
+        issued_at: input.issued_at,
+        expires_at: input.expires_at,
+        replay_nonce: unhex_array_32("replay_nonce", &input.replay_nonce_hex),
+    })
+}
+
+fn provision_recovery_context_from_input(
+    input: &ProvisionRecoveryCodeContextInputJson,
+) -> OwnerApprovalContextV2 {
+    assert_eq!(input.version, 2);
+    assert_eq!(input.purpose, "owner-approval-v2");
+    assert_eq!(input.op, "provision-recovery-code");
+    let recovery_head = match (
+        input.recovery_head_sequence,
+        input.recovery_head_hash_hex.as_ref(),
+    ) {
+        (None, None) => None,
+        (Some(sequence), Some(head_hash_hex)) => Some(RecoveryAuthorityHeadInput {
+            sequence,
+            head_hash: unhex_array_32("recovery_head_hash", head_hash_hex),
+        }),
+        (Some(_), None) => panic!("recovery_head_hash_hex missing"),
+        (None, Some(_)) => panic!("recovery_head_sequence missing"),
+    };
+    OwnerApprovalContextV2::provision_recovery_code(ProvisionRecoveryCodeContextInput {
+        hh_id: HouseholdId::parse(input.hh_id.clone()).unwrap(),
+        owner_p_id: PersonId(input.owner_p_id.clone()),
+        authority_head_sequence: input.authority_head_sequence,
+        authority_head_hash: unhex_array_32("authority_head_hash", &input.authority_head_hash_hex),
+        pre_active_credential_count: input.pre_active_credential_count,
+        recovery_head,
         capabilities: input.capabilities.clone(),
         issued_at: input.issued_at,
         expires_at: input.expires_at,

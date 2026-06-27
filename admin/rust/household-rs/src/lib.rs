@@ -64,6 +64,8 @@ pub mod owner_events;
 pub mod owner_webauthn;
 pub mod owner_webauthn_anchor;
 pub mod owner_webauthn_authority;
+pub mod owner_webauthn_recovery;
+pub mod owner_webauthn_recovery_anchor;
 pub mod pair_device;
 pub mod pair_machine;
 pub mod person_cert;

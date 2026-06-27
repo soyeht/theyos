@@ -9,6 +9,7 @@ use crate::error::{HouseholdError, StorageError};
 use crate::household_record::HouseholdRecord;
 use crate::owner_webauthn::OwnerWebauthnCredentialStore;
 use crate::owner_webauthn_authority::{OwnerWebauthnAuthority, OwnerWebauthnAuthorityError};
+use crate::owner_webauthn_recovery::{OwnerWebauthnRecoveryAuthority, OwnerWebauthnRecoveryError};
 use crate::person_cert::PersonCert;
 use crate::storage::{self, atomic_write_cbor};
 
@@ -21,6 +22,11 @@ pub struct HouseholdAuthState {
     pub owner_person_cert: PersonCert,
     #[serde(default, skip_serializing_if = "OwnerWebauthnAuthority::is_empty")]
     pub owner_webauthn: OwnerWebauthnAuthority,
+    #[serde(
+        default,
+        skip_serializing_if = "OwnerWebauthnRecoveryAuthority::is_empty"
+    )]
+    pub owner_webauthn_recovery: OwnerWebauthnRecoveryAuthority,
     pub created_at: u64,
     pub updated_at: u64,
 }
@@ -33,6 +39,8 @@ pub enum OwnerAuthError {
     Protocol(#[from] HouseholdError),
     #[error("owner webauthn authority: {0}")]
     OwnerWebauthn(#[from] OwnerWebauthnAuthorityError),
+    #[error("owner webauthn recovery: {0}")]
+    OwnerWebauthnRecovery(#[from] OwnerWebauthnRecoveryError),
     #[error("invalid owner auth state: {0}")]
     InvalidState(String),
 }
@@ -49,6 +57,7 @@ impl HouseholdAuthState {
             updated_at: owner_person_cert.issued_at,
             owner_person_cert,
             owner_webauthn: OwnerWebauthnAuthority::new(),
+            owner_webauthn_recovery: OwnerWebauthnRecoveryAuthority::new(),
         }
     }
 
@@ -69,16 +78,17 @@ impl HouseholdAuthState {
             .verify(&record.hh_id, &record.hh_pub, now)?;
         self.owner_webauthn
             .verify(record, &self.owner_person_cert)?;
+        self.owner_webauthn_recovery
+            .verify(record, &self.owner_person_cert)?;
         if self.created_at != self.owner_person_cert.issued_at {
             return Err(OwnerAuthError::InvalidState(
                 "created_at must equal owner cert issued_at".into(),
             ));
         }
-        if self.owner_webauthn.is_empty() {
+        if self.owner_webauthn.is_empty() && self.owner_webauthn_recovery.is_empty() {
             if self.updated_at != self.created_at {
                 return Err(OwnerAuthError::InvalidState(
-                    "updated_at must equal created_at when owner webauthn authority is empty"
-                        .into(),
+                    "updated_at must equal created_at when owner auth authorities are empty".into(),
                 ));
             }
         } else if self.updated_at < self.created_at {

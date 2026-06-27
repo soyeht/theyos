@@ -21,7 +21,8 @@ use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD as B64URL};
 use household_rs::caveats::Operation;
 use household_rs::owner_approval_v2::{
     OwnerApprovalContextV2, OwnerApprovalV2, OwnerApprovalV2Error, OwnerOperation,
-    PairMachineTrustedContextInput, RevokeCredentialContextInput,
+    PairMachineTrustedContextInput, ProvisionRecoveryCodeContextInput, RecoveryAuthorityHeadInput,
+    RevokeCredentialContextInput,
 };
 use household_rs::owner_events::{
     JoinCancelledPayload, MachineJoinedPayload, OwnerDevicePushToken, OwnerEvent, OwnerEventLog,
@@ -37,6 +38,15 @@ use household_rs::owner_webauthn_anchor::{
 };
 use household_rs::owner_webauthn_authority::{
     OwnerWebauthnCredentialEventAction, SignedOwnerWebauthnCredentialEvent,
+};
+use household_rs::owner_webauthn_recovery::{
+    OwnerWebauthnRecoveryAuthority, OwnerWebauthnRecoveryHead, RecoveryCodeVerifier,
+    SignedOwnerWebauthnRecoveryEvent, verified_owner_webauthn_recovery_head,
+};
+use household_rs::owner_webauthn_recovery_anchor::{
+    OwnerWebauthnRecoveryAnchorError, OwnerWebauthnRecoveryAnchorStatus,
+    advance_owner_webauthn_recovery_anchor_after_commit,
+    classify_owner_webauthn_recovery_anchor_read_only,
 };
 use household_rs::pair_machine::{
     CeremonyError, CeremonyInputs, CeremonyTxn, FinalizeWithM2Options, FinalizeWithM2Outcome,
@@ -93,10 +103,20 @@ pub struct OwnerEventsRouterState {
     /// an owner has active credentials. This prevents a rolled-back credential
     /// log from re-enabling a revoked passkey or downgrading to legacy.
     pub owner_webauthn_anchor: Option<OwnerWebauthnAnchorVerifier>,
+    /// Keystore-backed rollback anchor verifier for owner recovery readiness.
+    ///
+    /// This is intentionally separate from the owner `WebAuthn` authority anchor.
+    /// Recovery readiness must never satisfy `WebAuthn` active-credential policy.
+    pub owner_webauthn_recovery_anchor: Option<OwnerWebauthnRecoveryAnchorVerifier>,
 }
 
 #[derive(Clone)]
 pub struct OwnerWebauthnAnchorVerifier {
+    pub keystore: Arc<dyn keystore_rs::KeystoreBackend>,
+}
+
+#[derive(Clone)]
+pub struct OwnerWebauthnRecoveryAnchorVerifier {
     pub keystore: Arc<dyn keystore_rs::KeystoreBackend>,
 }
 
@@ -143,6 +163,7 @@ impl OwnerEventsRouterState {
             owner_approval_policy: OwnerApprovalEnforcementPolicy::default(),
             owner_webauthn_rp: None,
             owner_webauthn_anchor: None,
+            owner_webauthn_recovery_anchor: None,
         }
     }
 
@@ -169,6 +190,16 @@ impl OwnerEventsRouterState {
         self.owner_webauthn_anchor = Some(OwnerWebauthnAnchorVerifier { keystore });
         self
     }
+
+    #[must_use]
+    pub fn with_owner_webauthn_recovery_anchor(
+        mut self,
+        keystore: Arc<dyn keystore_rs::KeystoreBackend>,
+    ) -> Self {
+        self.owner_webauthn_recovery_anchor =
+            Some(OwnerWebauthnRecoveryAnchorVerifier { keystore });
+        self
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -178,6 +209,7 @@ pub struct OwnerApprovalEnforcementPolicy {
     pub bootstrap_teardown: OwnerOperationEnforcement,
     pub pair_device_confirm: OwnerOperationEnforcement,
     pub revoke_credential: OwnerOperationEnforcement,
+    pub recovery_code: OwnerOperationEnforcement,
 }
 
 impl Default for OwnerApprovalEnforcementPolicy {
@@ -188,6 +220,7 @@ impl Default for OwnerApprovalEnforcementPolicy {
             bootstrap_teardown: OwnerOperationEnforcement::LegacyOnly,
             pair_device_confirm: OwnerOperationEnforcement::LegacyOnly,
             revoke_credential: OwnerOperationEnforcement::LegacyOnly,
+            recovery_code: OwnerOperationEnforcement::LegacyOnly,
         }
     }
 }
@@ -206,6 +239,12 @@ impl OwnerApprovalEnforcementPolicy {
     }
 
     #[must_use]
+    pub fn with_recovery_code(mut self, mode: OwnerOperationEnforcement) -> Self {
+        self.recovery_code = mode;
+        self
+    }
+
+    #[must_use]
     pub fn pair_machine_approval_body_mode(
         &self,
         owner_webauthn_trust_state: OwnerWebauthnTrustState,
@@ -217,6 +256,11 @@ impl OwnerApprovalEnforcementPolicy {
     #[must_use]
     fn revoke_credential_start_enabled(&self) -> bool {
         self.revoke_credential == OwnerOperationEnforcement::V2WhenOwnerHasActiveCredential
+    }
+
+    #[must_use]
+    fn recovery_code_enabled(&self) -> bool {
+        self.recovery_code == OwnerOperationEnforcement::V2WhenOwnerHasActiveCredential
     }
 }
 
@@ -371,6 +415,10 @@ fn owner_revoke_credential_v2_capabilities() -> Vec<String> {
     vec!["owner-auth-revoke".to_string()]
 }
 
+fn owner_recovery_code_v2_capabilities() -> Vec<String> {
+    vec!["owner-auth-recovery-provision".to_string()]
+}
+
 fn pair_machine_window_data(
     cursor: u64,
     snapshot: PairMachineWindowSnapshot,
@@ -478,6 +526,283 @@ struct OwnerWebauthnRevokeCredentialFinishPlan {
     previous_entry: SignedOwnerWebauthnCredentialEvent,
     target_credential_id: ByteBuf,
     pre_active_credential_count: u64,
+}
+
+struct OwnerWebauthnRecoveryStartSnapshot {
+    credentials: OwnerWebauthnCredentialStore,
+    webauthn_head: OwnerWebauthnAuthorityHead,
+    pre_active_credential_count: u64,
+    recovery_head: Option<RecoveryAuthorityHeadInput>,
+}
+
+struct OwnerWebauthnRecoveryFinishPlan {
+    actor_credential: household_rs::owner_webauthn::OwnerWebauthnCredential,
+    expected_context: OwnerApprovalContextV2,
+    previous_recovery_entry: Option<SignedOwnerWebauthnRecoveryEvent>,
+    authoritative_sequence: Option<u64>,
+}
+
+fn owner_webauthn_active_snapshot_read_only(
+    state: &OwnerEventsRouterState,
+    identity: &household_rs::LoadedIdentity,
+    owner_auth: &household_rs::HouseholdAuthState,
+) -> Result<
+    (
+        OwnerWebauthnCredentialStore,
+        OwnerWebauthnAuthorityHead,
+        u64,
+    ),
+    &'static str,
+> {
+    let Some(verifier) = state.owner_webauthn_anchor.as_ref() else {
+        return Err("missing_anchor_verifier");
+    };
+    let webauthn_head = match classify_owner_webauthn_authority_anchor_read_only(
+        verifier.keystore.as_ref(),
+        &owner_auth.owner_webauthn,
+        &identity.record,
+        &owner_auth.owner_person_cert,
+    ) {
+        Ok(
+            OwnerWebauthnAnchorStatus::Verified { head }
+            | OwnerWebauthnAnchorStatus::Advanced { head, .. },
+        ) => head,
+        Ok(OwnerWebauthnAnchorStatus::EmptyAuthorityNoAnchor) => return Err("never_enrolled"),
+        Ok(OwnerWebauthnAnchorStatus::Migrated { .. }) => {
+            return Err("unexpected_anchor_migration");
+        }
+        Err(_) => return Err("credential_anchor_invalid"),
+    };
+    let credentials = owner_auth
+        .owner_webauthn_credentials(&identity.record)
+        .map_err(|_| "credential_reconstruct_failed")?;
+    let active_count = credentials.active_count();
+    if active_count == 0 {
+        return Err("credential_recovery_required");
+    }
+    let active_count = u64::try_from(active_count).map_err(|_| "credential_count_overflow")?;
+    Ok((credentials, webauthn_head, active_count))
+}
+
+fn owner_webauthn_recovery_head_read_only(
+    state: &OwnerEventsRouterState,
+    identity: &household_rs::LoadedIdentity,
+    owner_auth: &household_rs::HouseholdAuthState,
+) -> Result<
+    (
+        Option<RecoveryAuthorityHeadInput>,
+        Option<OwnerWebauthnRecoveryHead>,
+    ),
+    &'static str,
+> {
+    let Some(verifier) = state.owner_webauthn_recovery_anchor.as_ref() else {
+        return Err("missing_recovery_anchor_verifier");
+    };
+    match classify_owner_webauthn_recovery_anchor_read_only(
+        verifier.keystore.as_ref(),
+        &owner_auth.owner_webauthn_recovery,
+        &identity.record,
+        &owner_auth.owner_person_cert,
+    ) {
+        Ok(OwnerWebauthnRecoveryAnchorStatus::EmptyRecoveryNoAnchor) => Ok((None, None)),
+        Ok(
+            OwnerWebauthnRecoveryAnchorStatus::Verified { head }
+            | OwnerWebauthnRecoveryAnchorStatus::Created { head },
+        ) => Ok((
+            Some(RecoveryAuthorityHeadInput {
+                sequence: head.sequence,
+                head_hash: head.head_hash,
+            }),
+            Some(head),
+        )),
+        Ok(OwnerWebauthnRecoveryAnchorStatus::Advanced { previous, .. }) => Ok((
+            Some(RecoveryAuthorityHeadInput {
+                sequence: previous.sequence(),
+                head_hash: previous
+                    .head_hash()
+                    .try_into()
+                    .map_err(|_| "recovery_anchor_hash_length")?,
+            }),
+            Some(OwnerWebauthnRecoveryHead {
+                sequence: previous.sequence(),
+                head_hash: previous
+                    .head_hash()
+                    .try_into()
+                    .map_err(|_| "recovery_anchor_hash_length")?,
+            }),
+        )),
+        Err(OwnerWebauthnRecoveryAnchorError::MissingAnchor) => {
+            let head = verified_owner_webauthn_recovery_head(
+                &owner_auth.owner_webauthn_recovery,
+                &identity.record,
+                &owner_auth.owner_person_cert,
+            )
+            .map_err(|_| "recovery_anchor_invalid")?
+            .ok_or("recovery_anchor_missing_empty")?;
+            if head.sequence == 0 {
+                Ok((None, None))
+            } else {
+                Err("recovery_anchor_missing")
+            }
+        }
+        Err(_) => Err("recovery_anchor_invalid"),
+    }
+}
+
+fn owner_webauthn_recovery_start_snapshot(
+    state: &OwnerEventsRouterState,
+    identity: &household_rs::LoadedIdentity,
+    owner_auth: &household_rs::HouseholdAuthState,
+) -> Result<OwnerWebauthnRecoveryStartSnapshot, &'static str> {
+    if !state.owner_approval_policy.recovery_code_enabled() {
+        return Err("recovery_code_policy_disabled");
+    }
+    let (credentials, webauthn_head, pre_active_credential_count) =
+        owner_webauthn_active_snapshot_read_only(state, identity, owner_auth)?;
+    let (recovery_head, _) = owner_webauthn_recovery_head_read_only(state, identity, owner_auth)?;
+    Ok(OwnerWebauthnRecoveryStartSnapshot {
+        credentials,
+        webauthn_head,
+        pre_active_credential_count,
+        recovery_head,
+    })
+}
+
+fn owner_webauthn_recovery_finish_plan(
+    state: &OwnerEventsRouterState,
+    identity: &household_rs::LoadedIdentity,
+    owner_auth: &household_rs::HouseholdAuthState,
+    submitted_context: &OwnerApprovalContextV2,
+    actor_credential_id: &[u8],
+) -> Result<OwnerWebauthnRecoveryFinishPlan, &'static str> {
+    if !state.owner_approval_policy.recovery_code_enabled() {
+        return Err("recovery_code_policy_disabled");
+    }
+    let bound_sequence = submitted_context
+        .authority_head_sequence
+        .ok_or("recovery_webauthn_head_sequence_missing")?;
+    let bound_hash = submitted_context
+        .authority_head_hash
+        .as_ref()
+        .ok_or("recovery_webauthn_head_hash_missing")?;
+    let pre_active_credential_count = submitted_context
+        .pre_active_credential_count
+        .ok_or("recovery_active_count_missing")?;
+    let submitted_recovery_head = match (
+        submitted_context.recovery_head_sequence,
+        submitted_context.recovery_head_hash.as_ref(),
+    ) {
+        (None, None) => None,
+        (Some(sequence), Some(hash)) => {
+            let head_hash: [u8; 32] = hash
+                .as_ref()
+                .try_into()
+                .map_err(|_| "recovery_head_hash_length")?;
+            Some(RecoveryAuthorityHeadInput {
+                sequence,
+                head_hash,
+            })
+        }
+        (Some(_), None) => return Err("recovery_head_hash_missing"),
+        (None, Some(_)) => return Err("recovery_head_sequence_missing"),
+    };
+    let replay_nonce: [u8; 32] = submitted_context
+        .replay_nonce
+        .as_ref()
+        .try_into()
+        .map_err(|_| "recovery_replay_nonce_length")?;
+
+    let (credentials, webauthn_head, active_count) =
+        owner_webauthn_active_snapshot_read_only(state, identity, owner_auth)?;
+    if webauthn_head.sequence != bound_sequence || webauthn_head.head_hash != bound_hash.as_ref() {
+        return Err("recovery_webauthn_head_mismatch");
+    }
+    if active_count != pre_active_credential_count {
+        return Err("recovery_active_count_mismatch");
+    }
+    let Some(actor_credential) = credentials
+        .credentials()
+        .iter()
+        .find(|credential| {
+            credential.credential_id_bytes() == actor_credential_id && !credential.is_revoked()
+        })
+        .cloned()
+    else {
+        return Err("recovery_actor_not_active");
+    };
+
+    let (recovery_head, authoritative_recovery_head) =
+        owner_webauthn_recovery_head_read_only(state, identity, owner_auth)?;
+    if recovery_head != submitted_recovery_head {
+        return Err("recovery_head_mismatch");
+    }
+    let expected_context =
+        OwnerApprovalContextV2::provision_recovery_code(ProvisionRecoveryCodeContextInput {
+            hh_id: identity.record.hh_id.clone(),
+            owner_p_id: owner_auth.owner_person_cert.p_id.clone(),
+            authority_head_sequence: webauthn_head.sequence,
+            authority_head_hash: webauthn_head.head_hash,
+            pre_active_credential_count: active_count,
+            recovery_head,
+            capabilities: owner_recovery_code_v2_capabilities(),
+            issued_at: submitted_context.issued_at,
+            expires_at: submitted_context.expires_at,
+            replay_nonce,
+        });
+    expected_context
+        .validate_shape()
+        .map_err(|_| "recovery_expected_context_invalid")?;
+    Ok(OwnerWebauthnRecoveryFinishPlan {
+        actor_credential,
+        expected_context,
+        previous_recovery_entry: authoritative_recovery_head.as_ref().and_then(|head| {
+            usize::try_from(head.sequence)
+                .ok()
+                .and_then(|index| owner_auth.owner_webauthn_recovery.entries().get(index))
+                .cloned()
+        }),
+        authoritative_sequence: authoritative_recovery_head.map(|head| head.sequence),
+    })
+}
+
+fn owner_webauthn_recovery_ready_status(
+    state: &OwnerEventsRouterState,
+    identity: &household_rs::LoadedIdentity,
+    owner_auth: &household_rs::HouseholdAuthState,
+) -> Result<bool, &'static str> {
+    let Some(verifier) = state.owner_webauthn_recovery_anchor.as_ref() else {
+        return Err("missing_recovery_anchor_verifier");
+    };
+    match classify_owner_webauthn_recovery_anchor_read_only(
+        verifier.keystore.as_ref(),
+        &owner_auth.owner_webauthn_recovery,
+        &identity.record,
+        &owner_auth.owner_person_cert,
+    ) {
+        Ok(
+            OwnerWebauthnRecoveryAnchorStatus::EmptyRecoveryNoAnchor
+            | OwnerWebauthnRecoveryAnchorStatus::Advanced { .. },
+        ) => Ok(false),
+        Ok(
+            OwnerWebauthnRecoveryAnchorStatus::Verified { .. }
+            | OwnerWebauthnRecoveryAnchorStatus::Created { .. },
+        ) => Ok(true),
+        Err(OwnerWebauthnRecoveryAnchorError::MissingAnchor) => {
+            let head = verified_owner_webauthn_recovery_head(
+                &owner_auth.owner_webauthn_recovery,
+                &identity.record,
+                &owner_auth.owner_person_cert,
+            )
+            .map_err(|_| "recovery_anchor_invalid")?
+            .ok_or("recovery_anchor_missing_empty")?;
+            if head.sequence == 0 {
+                Ok(false)
+            } else {
+                Err("recovery_anchor_missing")
+            }
+        }
+        Err(_) => Err("recovery_anchor_invalid"),
+    }
 }
 
 fn owner_webauthn_revoke_credential_start_snapshot(
@@ -733,6 +1058,27 @@ struct OwnerWebauthnRevokeCredentialStartRequest {
 
 #[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
+struct OwnerWebauthnRecoveryStartRequest {
+    #[serde(rename = "v")]
+    version: u8,
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct OwnerWebauthnRecoveryStatusRequest {
+    #[serde(rename = "v")]
+    version: u8,
+}
+
+#[derive(Serialize)]
+struct OwnerWebauthnRecoveryStatusResponse {
+    #[serde(rename = "v")]
+    version: u8,
+    ready: bool,
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 struct OwnerWebauthnRegistrationStartRequest {
     #[serde(rename = "v")]
     version: u8,
@@ -782,6 +1128,14 @@ struct OwnerWebauthnRevokeCredentialFinishResponse {
     #[serde(rename = "v")]
     version: u8,
     active_credential_count: u64,
+}
+
+#[derive(Serialize)]
+struct OwnerWebauthnRecoveryFinishResponse {
+    #[serde(rename = "v")]
+    version: u8,
+    recovery_code: String,
+    recovery_ready: bool,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -1266,6 +1620,22 @@ fn reject_owner_webauthn_revoke_credential_finish(
     unauthenticated_response()
 }
 
+fn reject_owner_webauthn_recovery(reason: &'static str, error: Option<String>) -> Response {
+    if let Some(error) = error {
+        tracing::warn!(
+            stage = "owner_events.owner_webauthn_recovery.rejected",
+            reason,
+            error = %error,
+        );
+    } else {
+        tracing::warn!(
+            stage = "owner_events.owner_webauthn_recovery.rejected",
+            reason,
+        );
+    }
+    unauthenticated_response()
+}
+
 fn owner_webauthn_initial_enrollment_policy_snapshot(
     state: &OwnerEventsRouterState,
     identity: &household_rs::LoadedIdentity,
@@ -1731,6 +2101,369 @@ pub async fn owner_webauthn_revoke_credential_finish_handler(
             active_credential_count,
         })
         .unwrap_or_default();
+    cbor_response(StatusCode::OK, bytes)
+}
+
+/// `POST /api/v1/household/owner-webauthn/recovery/status`.
+///
+/// Owner-authenticated readiness probe. This endpoint is read-only and only
+/// reports whether a recovery verifier is already anchor-backed; it never
+/// satisfies `WebAuthn` active-credential policy.
+pub async fn owner_webauthn_recovery_status_handler(
+    State(state): State<OwnerEventsRouterState>,
+    method: Method,
+    uri: Uri,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let Some(now) =
+        time_util::unix_now_secs_checked("owner_events.owner_webauthn_recovery_status.clock")
+    else {
+        return unauthenticated_response();
+    };
+    let path_and_query = uri
+        .path_and_query()
+        .map_or_else(|| uri.path().to_string(), |pq| pq.as_str().to_string());
+    let authorized_owner_auth =
+        match household_auth::authorize_owner_webauthn_recovery_status_request(
+            &state.household,
+            &headers,
+            &method,
+            &path_and_query,
+            &body,
+            now,
+        )
+        .await
+        {
+            Ok(owner_auth) => owner_auth,
+            Err(e) => {
+                return reject_owner_webauthn_recovery("pop_auth_failed", Some(e.to_string()));
+            }
+        };
+
+    let request: OwnerWebauthnRecoveryStatusRequest = match decode_canonical_cbor(&body) {
+        Ok(request) => request,
+        Err(e) => return reject_owner_webauthn_recovery("cbor_decode", Some(e)),
+    };
+    if request.version != 1 {
+        return reject_owner_webauthn_recovery("bad_version", None);
+    }
+
+    let _mutation_guard = crate::bootstrap_mutation_lock::BOOTSTRAP_MUTATION_LOCK
+        .lock()
+        .await;
+    let Some(identity) = state.household.current().await else {
+        return reject_owner_webauthn_recovery("identity_unavailable", None);
+    };
+    let Some(current_owner_auth) = state.household.current_owner_auth().await else {
+        return reject_owner_webauthn_recovery("owner_auth_unavailable", None);
+    };
+    if current_owner_auth.owner_person_cert.p_id != authorized_owner_auth.owner_person_cert.p_id {
+        return reject_owner_webauthn_recovery("owner_auth_changed", None);
+    }
+    let ready = match owner_webauthn_recovery_ready_status(
+        &state,
+        &identity,
+        current_owner_auth.as_ref(),
+    ) {
+        Ok(ready) => ready,
+        Err(reason) => return reject_owner_webauthn_recovery(reason, None),
+    };
+    let bytes = household_rs::cbor::to_canonical_vec(&OwnerWebauthnRecoveryStatusResponse {
+        version: 1,
+        ready,
+    })
+    .unwrap_or_default();
+    cbor_response(StatusCode::OK, bytes)
+}
+
+/// `POST /api/v1/household/owner-webauthn/recovery/start`.
+///
+/// Starts a `WebAuthn` step-up ceremony for recovery-code provision/rotation.
+/// This is read-only: it stages only the `WebAuthn` challenge state.
+pub async fn owner_webauthn_recovery_start_handler(
+    State(state): State<OwnerEventsRouterState>,
+    method: Method,
+    uri: Uri,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let Some(now) =
+        time_util::unix_now_secs_checked("owner_events.owner_webauthn_recovery_start.clock")
+    else {
+        return unauthenticated_response();
+    };
+    let path_and_query = uri
+        .path_and_query()
+        .map_or_else(|| uri.path().to_string(), |pq| pq.as_str().to_string());
+    let authorized_owner_auth =
+        match household_auth::authorize_owner_webauthn_recovery_start_request(
+            &state.household,
+            &headers,
+            &method,
+            &path_and_query,
+            &body,
+            now,
+        )
+        .await
+        {
+            Ok(owner_auth) => owner_auth,
+            Err(e) => {
+                return reject_owner_webauthn_recovery("pop_auth_failed", Some(e.to_string()));
+            }
+        };
+
+    let request: OwnerWebauthnRecoveryStartRequest = match decode_canonical_cbor(&body) {
+        Ok(request) => request,
+        Err(e) => return reject_owner_webauthn_recovery("cbor_decode", Some(e)),
+    };
+    if request.version != 1 {
+        return reject_owner_webauthn_recovery("bad_version", None);
+    }
+
+    let _mutation_guard = crate::bootstrap_mutation_lock::BOOTSTRAP_MUTATION_LOCK
+        .lock()
+        .await;
+    let Some(identity) = state.household.current().await else {
+        return reject_owner_webauthn_recovery("identity_unavailable", None);
+    };
+    let Some(current_owner_auth) = state.household.current_owner_auth().await else {
+        return reject_owner_webauthn_recovery("owner_auth_unavailable", None);
+    };
+    if current_owner_auth.owner_person_cert.p_id != authorized_owner_auth.owner_person_cert.p_id {
+        return reject_owner_webauthn_recovery("owner_auth_changed", None);
+    }
+    let snapshot = match owner_webauthn_recovery_start_snapshot(
+        &state,
+        &identity,
+        current_owner_auth.as_ref(),
+    ) {
+        Ok(snapshot) => snapshot,
+        Err(reason) => return reject_owner_webauthn_recovery(reason, None),
+    };
+    let Some(rp) = state.owner_webauthn_rp.as_ref() else {
+        return reject_owner_webauthn_recovery("rp_unavailable", None);
+    };
+
+    let mut rng = OsRng;
+    let mut replay_nonce = [0_u8; 32];
+    rng.fill_bytes(&mut replay_nonce);
+    let mut rp = rp.lock().await;
+    let expected_context =
+        OwnerApprovalContextV2::provision_recovery_code(ProvisionRecoveryCodeContextInput {
+            hh_id: identity.record.hh_id.clone(),
+            owner_p_id: current_owner_auth.owner_person_cert.p_id.clone(),
+            authority_head_sequence: snapshot.webauthn_head.sequence,
+            authority_head_hash: snapshot.webauthn_head.head_hash,
+            pre_active_credential_count: snapshot.pre_active_credential_count,
+            recovery_head: snapshot.recovery_head,
+            capabilities: owner_recovery_code_v2_capabilities(),
+            issued_at: now,
+            expires_at: now.saturating_add(rp.config().challenge_ttl().as_secs()),
+            replay_nonce,
+        });
+    if let Err(e) = expected_context.validate_shape() {
+        return reject_owner_webauthn_recovery("trusted_context_build_failed", Some(e.to_string()));
+    }
+    let (challenge_id, options) = match rp.start_owner_approval_assertion(
+        &mut rng,
+        now,
+        snapshot.credentials.credentials(),
+        &expected_context,
+    ) {
+        Ok(started) => started,
+        Err(e) => {
+            return reject_owner_webauthn_recovery("webauthn_start_failed", Some(e.to_string()));
+        }
+    };
+    let bytes = household_rs::cbor::to_canonical_vec(&OwnerApprovalV2StartResponse {
+        version: 1,
+        challenge_id: challenge_id.as_str().to_string(),
+        context: expected_context,
+        options,
+    })
+    .unwrap_or_default();
+    cbor_response(StatusCode::OK, bytes)
+}
+
+/// `POST /api/v1/household/owner-webauthn/recovery/finish`.
+///
+/// Commits a recovery-code verifier after a fresh owner `WebAuthn` step-up. The
+/// plaintext recovery code is returned once and never stored in the authority.
+pub async fn owner_webauthn_recovery_finish_handler(
+    State(state): State<OwnerEventsRouterState>,
+    method: Method,
+    uri: Uri,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let Some(now) =
+        time_util::unix_now_secs_checked("owner_events.owner_webauthn_recovery_finish.clock")
+    else {
+        return unauthenticated_response();
+    };
+    let path_and_query = uri
+        .path_and_query()
+        .map_or_else(|| uri.path().to_string(), |pq| pq.as_str().to_string());
+    let authorized_owner_auth =
+        match household_auth::authorize_owner_webauthn_recovery_finish_request(
+            &state.household,
+            &headers,
+            &method,
+            &path_and_query,
+            &body,
+            now,
+        )
+        .await
+        {
+            Ok(owner_auth) => owner_auth,
+            Err(e) => {
+                return reject_owner_webauthn_recovery("pop_auth_failed", Some(e.to_string()));
+            }
+        };
+
+    let finish: OwnerApprovalV2Finish = match decode_canonical_cbor(&body) {
+        Ok(finish) => finish,
+        Err(e) => return reject_owner_webauthn_recovery("cbor_decode", Some(e)),
+    };
+    if finish.version != 1 {
+        return reject_owner_webauthn_recovery("bad_version", None);
+    }
+    if finish.approval.context.op != OwnerOperation::ProvisionRecoveryCode {
+        return reject_owner_webauthn_recovery("bad_operation", None);
+    }
+    if let Err(e) = finish.approval.context.validate_at(now) {
+        return reject_owner_webauthn_recovery("approval_v2_context_expired", Some(e.to_string()));
+    }
+    let challenge_id = match OwnerWebauthnChallengeId::parse(finish.challenge_id.clone()) {
+        Ok(challenge_id) => challenge_id,
+        Err(e) => return reject_owner_webauthn_recovery("bad_challenge_id", Some(e.to_string())),
+    };
+    let assertion = match finish.approval.to_public_key_credential() {
+        Ok(assertion) => assertion,
+        Err(e) => {
+            return reject_owner_webauthn_recovery(
+                "approval_v2_assertion_invalid",
+                Some(e.to_string()),
+            );
+        }
+    };
+
+    let _mutation_guard = crate::bootstrap_mutation_lock::BOOTSTRAP_MUTATION_LOCK
+        .lock()
+        .await;
+    let Some(identity) = state.household.current().await else {
+        return reject_owner_webauthn_recovery("identity_unavailable", None);
+    };
+    let Some(current_owner_auth) = state.household.current_owner_auth().await else {
+        return reject_owner_webauthn_recovery("owner_auth_unavailable", None);
+    };
+    if current_owner_auth.owner_person_cert.p_id != authorized_owner_auth.owner_person_cert.p_id {
+        return reject_owner_webauthn_recovery("owner_auth_changed", None);
+    }
+    let Some(hh_priv) = identity.hh_priv.as_deref() else {
+        return reject_owner_webauthn_recovery("household_root_unavailable", None);
+    };
+    let Some(anchor) = state.owner_webauthn_recovery_anchor.clone() else {
+        return reject_owner_webauthn_recovery("missing_recovery_anchor_verifier", None);
+    };
+    let Some(rp) = state.owner_webauthn_rp.as_ref() else {
+        return reject_owner_webauthn_recovery("rp_unavailable", None);
+    };
+    let mut plan = match owner_webauthn_recovery_finish_plan(
+        &state,
+        &identity,
+        current_owner_auth.as_ref(),
+        &finish.approval.context,
+        finish.approval.credential_id.as_ref(),
+    ) {
+        Ok(plan) => plan,
+        Err(reason) => return reject_owner_webauthn_recovery(reason, None),
+    };
+    if let Err(e) = finish
+        .approval
+        .require_expected_context(&plan.expected_context)
+    {
+        return reject_owner_webauthn_recovery("approval_v2_context_mismatch", Some(e.to_string()));
+    }
+
+    let mut rp = rp.lock().await;
+    if let Err(e) =
+        rp.require_owner_approval_challenge_context(now, &challenge_id, &finish.approval.context)
+    {
+        return reject_owner_webauthn_recovery(
+            "owner_webauthn_challenge_context_mismatch",
+            Some(e.to_string()),
+        );
+    }
+    if let Err(e) = rp.finish_owner_approval_assertion(
+        now,
+        &challenge_id,
+        &assertion,
+        &mut plan.actor_credential,
+        &finish.approval.context,
+    ) {
+        return reject_owner_webauthn_recovery("owner_webauthn_finish_failed", Some(e.to_string()));
+    }
+    drop(rp);
+
+    let mut rng = OsRng;
+    let mut code_bytes = Zeroizing::new([0_u8; 32]);
+    rng.fill_bytes(&mut code_bytes[..]);
+    let recovery_code = Zeroizing::new(B64URL.encode(&code_bytes[..]));
+    let mut salt = [0_u8; 32];
+    rng.fill_bytes(&mut salt);
+    let verifier = RecoveryCodeVerifier::from_code_bytes(salt, recovery_code.as_bytes());
+    let recovery_event = match OwnerWebauthnRecoveryAuthority::sign_next(
+        hh_priv,
+        &identity.record,
+        &current_owner_auth.owner_person_cert,
+        plan.previous_recovery_entry.as_ref(),
+        finish.approval.credential_id.as_ref(),
+        verifier,
+        now,
+    ) {
+        Ok(event) => event,
+        Err(e) => {
+            return reject_owner_webauthn_recovery("recovery_sign_failed", Some(e.to_string()));
+        }
+    };
+    let mut next_auth = current_owner_auth.as_ref().clone();
+    if let Err(e) = next_auth
+        .owner_webauthn_recovery
+        .replace_after_authoritative_prefix(plan.authoritative_sequence, recovery_event)
+    {
+        return reject_owner_webauthn_recovery("recovery_replace_failed", Some(e.to_string()));
+    }
+    next_auth.updated_at = now;
+    if let Err(e) = next_auth.verify(&identity.record, now) {
+        return reject_owner_webauthn_recovery("recovery_verify_failed", Some(e.to_string()));
+    }
+
+    if let Err(e) = next_auth.save(&state.state_dir) {
+        return reject_owner_webauthn_recovery("authority_save_failed", Some(e.to_string()));
+    }
+    state
+        .household
+        .set_owner_auth(Arc::new(next_auth.clone()))
+        .await;
+    if let Err(e) = advance_owner_webauthn_recovery_anchor_after_commit(
+        anchor.keystore.as_ref(),
+        &next_auth.owner_webauthn_recovery,
+        &identity.record,
+        &next_auth.owner_person_cert,
+    ) {
+        return reject_owner_webauthn_recovery(
+            "recovery_anchor_update_failed",
+            Some(e.to_string()),
+        );
+    }
+    let bytes = household_rs::cbor::to_canonical_vec(&OwnerWebauthnRecoveryFinishResponse {
+        version: 1,
+        recovery_code: recovery_code.to_string(),
+        recovery_ready: true,
+    })
+    .unwrap_or_default();
     cbor_response(StatusCode::OK, bytes)
 }
 

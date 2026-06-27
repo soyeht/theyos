@@ -254,6 +254,78 @@ pub async fn authorize_owner_webauthn_revoke_credential_finish_request(
     .await
 }
 
+/// Authorize the owner recovery-code readiness surface.
+///
+/// Readiness is owner-authenticated but does not grant owner auth by itself.
+pub async fn authorize_owner_webauthn_recovery_status_request(
+    state: &HouseholdState,
+    headers: &HeaderMap,
+    method: &Method,
+    path_and_query: &str,
+    body: &[u8],
+    now: u64,
+) -> Result<Arc<HouseholdAuthState>, AuthError> {
+    authorize_owner_only_pop_request(
+        state,
+        headers,
+        method,
+        path_and_query,
+        body,
+        now,
+        "OwnerWebauthnRecoveryStatus",
+    )
+    .await
+}
+
+/// Authorize the owner recovery-code provision start surface.
+///
+/// This proves only current owner identity and fresh body-bound
+/// proof-of-possession. The returned `WebAuthn` challenge is the step-up proof
+/// for provision/rotation.
+pub async fn authorize_owner_webauthn_recovery_start_request(
+    state: &HouseholdState,
+    headers: &HeaderMap,
+    method: &Method,
+    path_and_query: &str,
+    body: &[u8],
+    now: u64,
+) -> Result<Arc<HouseholdAuthState>, AuthError> {
+    authorize_owner_only_pop_request(
+        state,
+        headers,
+        method,
+        path_and_query,
+        body,
+        now,
+        "OwnerWebauthnRecoveryStart",
+    )
+    .await
+}
+
+/// Authorize the owner recovery-code provision finish surface.
+///
+/// The embedded `WebAuthn` assertion remains the high-value step-up proof for the
+/// recovery verifier mutation.
+pub async fn authorize_owner_webauthn_recovery_finish_request(
+    state: &HouseholdState,
+    headers: &HeaderMap,
+    method: &Method,
+    path_and_query: &str,
+    body: &[u8],
+    now: u64,
+) -> Result<Arc<HouseholdAuthState>, AuthError> {
+    authorize_owner_only_pop_request(
+        state,
+        headers,
+        method,
+        path_and_query,
+        body,
+        now,
+        "OwnerWebauthnRecoveryFinish",
+    )
+    .await
+}
+
 async fn authorize_owner_only_pop_request(
     state: &HouseholdState,
     headers: &HeaderMap,

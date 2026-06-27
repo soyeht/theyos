@@ -8,6 +8,7 @@ use household_rs::ids::{HouseholdId, MachineId};
 use household_rs::machine_cert::PersonId;
 use household_rs::owner_approval_v2::{
     OwnerApprovalContextV2, OwnerOperation, PairMachineApprovalContextInput,
+    ProvisionRecoveryCodeContextInput, RecoveryAuthorityHeadInput,
 };
 use household_rs::pair_machine::JoinTransport;
 use serde::Deserialize;
@@ -42,6 +43,11 @@ struct OwnerApprovalInput {
     ttl_unix: Option<u64>,
     nonce_hex: Option<String>,
     join_request_hash_hex: Option<String>,
+    authority_head_sequence: Option<u64>,
+    authority_head_hash_hex: Option<String>,
+    pre_active_credential_count: Option<u64>,
+    recovery_head_sequence: Option<u64>,
+    recovery_head_hash_hex: Option<String>,
     capabilities: Vec<String>,
     issued_at: u64,
     expires_at: u64,
@@ -83,6 +89,7 @@ fn operation(value: &str) -> OwnerOperation {
         "bootstrap-teardown" => OwnerOperation::BootstrapTeardown,
         "pair-device-confirm" => OwnerOperation::PairDeviceConfirm,
         "revoke-credential" => OwnerOperation::RevokeCredential,
+        "provision-recovery-code" => OwnerOperation::ProvisionRecoveryCode,
         other => panic!("unknown operation in fixture: {other}"),
     }
 }
@@ -134,6 +141,47 @@ fn context_for(case: &OwnerApprovalCase) -> OwnerApprovalContextV2 {
         });
     }
 
+    if input.op == "provision-recovery-code" {
+        let recovery_head = match (
+            input.recovery_head_sequence,
+            input.recovery_head_hash_hex.as_deref(),
+        ) {
+            (None, None) => None,
+            (Some(sequence), Some(head_hash)) => Some(RecoveryAuthorityHeadInput {
+                sequence,
+                head_hash: unhex_array_32("recovery_head_hash", head_hash),
+            }),
+            _ => panic!(
+                "{}: recovery head must be fully present or omitted",
+                case.id
+            ),
+        };
+        return OwnerApprovalContextV2::provision_recovery_code(
+            ProvisionRecoveryCodeContextInput {
+                hh_id,
+                owner_p_id,
+                authority_head_sequence: input
+                    .authority_head_sequence
+                    .expect("provision recovery authority_head_sequence"),
+                authority_head_hash: unhex_array_32(
+                    "authority_head_hash",
+                    input
+                        .authority_head_hash_hex
+                        .as_deref()
+                        .expect("provision recovery authority_head_hash"),
+                ),
+                pre_active_credential_count: input
+                    .pre_active_credential_count
+                    .expect("provision recovery pre_active_credential_count"),
+                recovery_head,
+                capabilities: input.capabilities.clone(),
+                issued_at: input.issued_at,
+                expires_at: input.expires_at,
+                replay_nonce: unhex_array_32("replay_nonce", &input.replay_nonce_hex),
+            },
+        );
+    }
+
     OwnerApprovalContextV2 {
         version: 2,
         purpose: input.purpose.clone(),
@@ -162,6 +210,8 @@ fn context_for(case: &OwnerApprovalCase) -> OwnerApprovalContextV2 {
         authority_head_sequence: None,
         authority_head_hash: None,
         pre_active_credential_count: None,
+        recovery_head_sequence: None,
+        recovery_head_hash: None,
         capabilities: input.capabilities.clone(),
         issued_at: input.issued_at,
         expires_at: input.expires_at,
