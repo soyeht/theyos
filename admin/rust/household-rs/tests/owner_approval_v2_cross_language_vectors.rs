@@ -7,8 +7,8 @@
 use household_rs::ids::{HouseholdId, MachineId};
 use household_rs::machine_cert::PersonId;
 use household_rs::owner_approval_v2::{
-    OwnerApprovalContextV2, OwnerOperation, PairMachineApprovalContextInput,
-    ProvisionRecoveryCodeContextInput, RecoveryAuthorityHeadInput,
+    AddCredentialContextInput, OwnerApprovalContextV2, OwnerOperation,
+    PairMachineApprovalContextInput, ProvisionRecoveryCodeContextInput, RecoveryAuthorityHeadInput,
 };
 use household_rs::pair_machine::JoinTransport;
 use serde::Deserialize;
@@ -48,6 +48,7 @@ struct OwnerApprovalInput {
     pre_active_credential_count: Option<u64>,
     recovery_head_sequence: Option<u64>,
     recovery_head_hash_hex: Option<String>,
+    new_credential_binding_hash_hex: Option<String>,
     capabilities: Vec<String>,
     issued_at: u64,
     expires_at: u64,
@@ -90,6 +91,7 @@ fn operation(value: &str) -> OwnerOperation {
         "pair-device-confirm" => OwnerOperation::PairDeviceConfirm,
         "revoke-credential" => OwnerOperation::RevokeCredential,
         "provision-recovery-code" => OwnerOperation::ProvisionRecoveryCode,
+        "add-credential" => OwnerOperation::AddCredential,
         other => panic!("unknown operation in fixture: {other}"),
     }
 }
@@ -182,6 +184,37 @@ fn context_for(case: &OwnerApprovalCase) -> OwnerApprovalContextV2 {
         );
     }
 
+    if input.op == "add-credential" {
+        return OwnerApprovalContextV2::add_credential(AddCredentialContextInput {
+            hh_id,
+            owner_p_id,
+            new_credential_binding_hash: unhex_array_32(
+                "new_credential_binding_hash",
+                input
+                    .new_credential_binding_hash_hex
+                    .as_deref()
+                    .expect("add credential new_credential_binding_hash"),
+            ),
+            authority_head_sequence: input
+                .authority_head_sequence
+                .expect("add credential authority_head_sequence"),
+            authority_head_hash: unhex_array_32(
+                "authority_head_hash",
+                input
+                    .authority_head_hash_hex
+                    .as_deref()
+                    .expect("add credential authority_head_hash"),
+            ),
+            pre_active_credential_count: input
+                .pre_active_credential_count
+                .expect("add credential pre_active_credential_count"),
+            capabilities: input.capabilities.clone(),
+            issued_at: input.issued_at,
+            expires_at: input.expires_at,
+            replay_nonce: unhex_array_32("replay_nonce", &input.replay_nonce_hex),
+        });
+    }
+
     OwnerApprovalContextV2 {
         version: 2,
         purpose: input.purpose.clone(),
@@ -212,6 +245,7 @@ fn context_for(case: &OwnerApprovalCase) -> OwnerApprovalContextV2 {
         pre_active_credential_count: None,
         recovery_head_sequence: None,
         recovery_head_hash: None,
+        new_credential_binding_hash: None,
         capabilities: input.capabilities.clone(),
         issued_at: input.issued_at,
         expires_at: input.expires_at,

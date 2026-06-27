@@ -12,7 +12,7 @@
     "challenge_sha256_hex": "SHA-256(challenge_domain_ascii_nul || canonical_cbor_bytes)",
     "canonical_cbor": "RFC 8949 4.2.1 deterministic map encoding; text keys are ordered by their encoded bytes.",
     "none_fields": "Optional fields are omitted, never encoded as null.",
-    "byte_fields": ["nonce", "join_request_hash", "replay_nonce", "authority_head_hash", "recovery_head_hash"],
+    "byte_fields": ["nonce", "join_request_hash", "replay_nonce", "authority_head_hash", "recovery_head_hash", "new_credential_binding_hash"],
     "owner_operation": "kebab-case string with fixed mapping; do not let language-default enum encoding choose wire names."
   },
   "owner_approval_context_v2": [
@@ -96,6 +96,27 @@
       "canonical_cbor_hex": "a9617602626f7072626f6f7473747261702d74656172646f776e6568685f6964783768685f6161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616167707572706f7365716f776e65722d617070726f76616c2d7632696973737565645f61741903e86a657870697265735f617419044c6a6f776e65725f705f69646d705f6f776e65722d616c7068616c6361706162696c6974696573806c7265706c61795f6e6f6e636558207777777777777777777777777777777777777777777777777777777777777777",
       "challenge_sha256_hex": "bc5c8c1f7fcf4095c712bad6e25814686eedda3821581a9071d1f9981f7bb925",
       "omitted_fields": ["cursor", "m_id", "addr", "transport", "ttl_unix", "nonce", "join_request_hash"]
+    },
+    {
+      "id": "add_credential_binding_base64url_looking_bytes",
+      "input": {
+        "v": 2,
+        "purpose": "owner-approval-v2",
+        "op": "add-credential",
+        "hh_id": "hh_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "owner_p_id": "p_owner-alpha",
+        "new_credential_binding_hash_hex": "414145436750395f414145436750395f414145436750395f414145436750395f",
+        "authority_head_sequence": 24,
+        "authority_head_hash_hex": "4444444444444444444444444444444444444444444444444444444444444444",
+        "pre_active_credential_count": 2,
+        "capabilities": ["owner-auth-add-credential"],
+        "issued_at": 1000,
+        "expires_at": 1600,
+        "replay_nonce_hex": "5555555555555555555555555555555555555555555555555555555555555555"
+      },
+      "canonical_cbor_hex": "ad617602626f706e6164642d63726564656e7469616c6568685f6964783768685f6161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616167707572706f7365716f776e65722d617070726f76616c2d7632696973737565645f61741903e86a657870697265735f61741906406a6f776e65725f705f69646d705f6f776e65722d616c7068616c6361706162696c69746965738178196f776e65722d617574682d6164642d63726564656e7469616c6c7265706c61795f6e6f6e63655820555555555555555555555555555555555555555555555555555555555555555573617574686f726974795f686561645f686173685820444444444444444444444444444444444444444444444444444444444444444477617574686f726974795f686561645f73657175656e63651818781b6e65775f63726564656e7469616c5f62696e64696e675f686173685820414145436750395f414145436750395f414145436750395f414145436750395f781b7072655f6163746976655f63726564656e7469616c5f636f756e7402",
+      "challenge_sha256_hex": "ec6b3cdedb7e682bf718edcc7621b3ac37834fe6767bc9dc187cd4c22be985e8",
+      "omitted_fields": ["cursor", "m_id", "addr", "transport", "ttl_unix", "nonce", "join_request_hash", "target_credential_id", "recovery_head_sequence", "recovery_head_hash"]
     }
   ]
 }

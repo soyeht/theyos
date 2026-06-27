@@ -72,6 +72,7 @@ pub enum OwnerOperation {
     PairDeviceConfirm,
     RevokeCredential,
     ProvisionRecoveryCode,
+    AddCredential,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -109,6 +110,8 @@ pub struct OwnerApprovalContextV2 {
     pub recovery_head_sequence: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub recovery_head_hash: Option<ByteBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub new_credential_binding_hash: Option<ByteBuf>,
     pub capabilities: Vec<String>,
     pub issued_at: u64,
     pub expires_at: u64,
@@ -230,6 +233,7 @@ impl OwnerApprovalContextV2 {
             pre_active_credential_count: None,
             recovery_head_sequence: None,
             recovery_head_hash: None,
+            new_credential_binding_hash: None,
             capabilities: input.capabilities,
             issued_at: input.issued_at,
             expires_at: input.expires_at,
@@ -258,6 +262,7 @@ impl OwnerApprovalContextV2 {
             pre_active_credential_count: Some(input.pre_active_credential_count),
             recovery_head_sequence: None,
             recovery_head_hash: None,
+            new_credential_binding_hash: None,
             capabilities: input.capabilities,
             issued_at: input.issued_at,
             expires_at: input.expires_at,
@@ -288,6 +293,38 @@ impl OwnerApprovalContextV2 {
             recovery_head_hash: input
                 .recovery_head
                 .map(|head| ByteBuf::from(head.head_hash.to_vec())),
+            new_credential_binding_hash: None,
+            capabilities: input.capabilities,
+            issued_at: input.issued_at,
+            expires_at: input.expires_at,
+            replay_nonce: ByteBuf::from(input.replay_nonce.to_vec()),
+        }
+    }
+
+    #[must_use]
+    pub fn add_credential(input: AddCredentialContextInput) -> Self {
+        Self {
+            version: OWNER_APPROVAL_V2_VERSION,
+            purpose: OWNER_APPROVAL_V2_PURPOSE.to_string(),
+            op: OwnerOperation::AddCredential,
+            hh_id: input.hh_id,
+            owner_p_id: input.owner_p_id,
+            cursor: None,
+            m_id: None,
+            addr: None,
+            transport: None,
+            ttl_unix: None,
+            nonce: None,
+            join_request_hash: None,
+            target_credential_id: None,
+            authority_head_sequence: Some(input.authority_head_sequence),
+            authority_head_hash: Some(ByteBuf::from(input.authority_head_hash.to_vec())),
+            pre_active_credential_count: Some(input.pre_active_credential_count),
+            recovery_head_sequence: None,
+            recovery_head_hash: None,
+            new_credential_binding_hash: Some(ByteBuf::from(
+                input.new_credential_binding_hash.to_vec(),
+            )),
             capabilities: input.capabilities,
             issued_at: input.issued_at,
             expires_at: input.expires_at,
@@ -318,10 +355,12 @@ impl OwnerApprovalContextV2 {
                 require_some(self.join_request_hash.as_ref(), "join_request_hash")?;
                 self.require_absent_revoke_fields()?;
                 self.require_absent_recovery_fields()?;
+                self.require_absent_add_credential_fields()?;
             }
             OwnerOperation::RevokeCredential => {
                 self.require_absent_pair_machine_fields()?;
                 self.require_absent_recovery_fields()?;
+                self.require_absent_add_credential_fields()?;
                 let target =
                     require_some(self.target_credential_id.as_ref(), "target_credential_id")?;
                 if target.is_empty() {
@@ -383,6 +422,39 @@ impl OwnerApprovalContextV2 {
                         return Err(OwnerApprovalV2Error::MissingField("recovery_head_sequence"));
                     }
                 }
+                self.require_absent_add_credential_fields()?;
+            }
+            OwnerOperation::AddCredential => {
+                self.require_absent_pair_machine_fields()?;
+                require_none(self.target_credential_id.as_ref(), "target_credential_id")?;
+                self.require_absent_recovery_fields()?;
+                require_some(
+                    self.authority_head_sequence.as_ref(),
+                    "authority_head_sequence",
+                )?;
+                let head_hash =
+                    require_some(self.authority_head_hash.as_ref(), "authority_head_hash")?;
+                if head_hash.len() != 32 {
+                    return Err(OwnerApprovalV2Error::InvalidField("authority_head_hash"));
+                }
+                let count = require_some(
+                    self.pre_active_credential_count.as_ref(),
+                    "pre_active_credential_count",
+                )?;
+                if *count == 0 {
+                    return Err(OwnerApprovalV2Error::InvalidField(
+                        "pre_active_credential_count",
+                    ));
+                }
+                let binding_hash = require_some(
+                    self.new_credential_binding_hash.as_ref(),
+                    "new_credential_binding_hash",
+                )?;
+                if binding_hash.len() != 32 {
+                    return Err(OwnerApprovalV2Error::InvalidField(
+                        "new_credential_binding_hash",
+                    ));
+                }
             }
             OwnerOperation::BootstrapInitialize
             | OwnerOperation::BootstrapTeardown
@@ -390,6 +462,7 @@ impl OwnerApprovalContextV2 {
                 self.require_absent_pair_machine_fields()?;
                 self.require_absent_revoke_fields()?;
                 self.require_absent_recovery_fields()?;
+                self.require_absent_add_credential_fields()?;
             }
         }
         Ok(())
@@ -416,7 +489,8 @@ impl OwnerApprovalContextV2 {
             self.pre_active_credential_count.as_ref(),
             "pre_active_credential_count",
         )?;
-        self.require_absent_recovery_fields()
+        self.require_absent_recovery_fields()?;
+        self.require_absent_add_credential_fields()
     }
 
     fn require_absent_recovery_fields(&self) -> Result<(), OwnerApprovalV2Error> {
@@ -425,6 +499,13 @@ impl OwnerApprovalContextV2 {
             "recovery_head_sequence",
         )?;
         require_none(self.recovery_head_hash.as_ref(), "recovery_head_hash")
+    }
+
+    fn require_absent_add_credential_fields(&self) -> Result<(), OwnerApprovalV2Error> {
+        require_none(
+            self.new_credential_binding_hash.as_ref(),
+            "new_credential_binding_hash",
+        )
     }
 
     pub fn validate_at(&self, now_unix: u64) -> Result<(), OwnerApprovalV2Error> {
@@ -598,6 +679,19 @@ pub struct ProvisionRecoveryCodeContextInput {
     pub replay_nonce: [u8; 32],
 }
 
+pub struct AddCredentialContextInput {
+    pub hh_id: HouseholdId,
+    pub owner_p_id: PersonId,
+    pub new_credential_binding_hash: [u8; 32],
+    pub authority_head_sequence: u64,
+    pub authority_head_hash: [u8; 32],
+    pub pre_active_credential_count: u64,
+    pub capabilities: Vec<String>,
+    pub issued_at: u64,
+    pub expires_at: u64,
+    pub replay_nonce: [u8; 32],
+}
+
 pub struct PairMachineTrustedContextInput<'a> {
     pub hh_id: HouseholdId,
     pub owner_p_id: PersonId,
@@ -722,6 +816,21 @@ mod tests {
                 head_hash: [0x77; 32],
             }),
             capabilities: vec!["owner-auth-recovery-provision".to_string()],
+            issued_at: 1_000,
+            expires_at: 1_600,
+            replay_nonce: [0x55; 32],
+        })
+    }
+
+    fn sample_add_credential_context() -> OwnerApprovalContextV2 {
+        OwnerApprovalContextV2::add_credential(AddCredentialContextInput {
+            hh_id: household_id(),
+            owner_p_id: person_id(),
+            new_credential_binding_hash: *b"AAECgP9_AAECgP9_AAECgP9_AAECgP9_",
+            authority_head_sequence: 24,
+            authority_head_hash: [0x44; 32],
+            pre_active_credential_count: 2,
+            capabilities: vec!["owner-auth-add-credential".to_string()],
             issued_at: 1_000,
             expires_at: 1_600,
             replay_nonce: [0x55; 32],
@@ -1131,6 +1240,144 @@ mod tests {
     }
 
     #[test]
+    fn add_credential_context_round_trips_as_canonical_cbor() {
+        let ctx = sample_add_credential_context();
+        let bytes = ctx.to_canonical_bytes().unwrap();
+        let decoded = OwnerApprovalContextV2::from_canonical_bytes(&bytes).unwrap();
+        assert_eq!(decoded, ctx);
+
+        let hex = hex::encode(&bytes);
+        assert!(hex.contains("6e6164642d63726564656e7469616c"));
+        assert!(hex.contains("781b6e65775f63726564656e7469616c5f62696e64696e675f686173685820"));
+        assert!(
+            !hex.contains("747461726765745f63726564656e7469616c5f6964"),
+            "add credential context must not carry revoke target",
+        );
+        assert!(
+            !hex.contains("727265636f766572795f686561645f68617368"),
+            "add credential context must not carry recovery head",
+        );
+    }
+
+    #[test]
+    fn add_credential_required_fields_are_enforced() {
+        let mut missing_binding = sample_add_credential_context();
+        missing_binding.new_credential_binding_hash = None;
+        assert!(matches!(
+            missing_binding.validate_shape(),
+            Err(OwnerApprovalV2Error::MissingField(
+                "new_credential_binding_hash"
+            ))
+        ));
+
+        let mut missing_sequence = sample_add_credential_context();
+        missing_sequence.authority_head_sequence = None;
+        assert!(matches!(
+            missing_sequence.validate_shape(),
+            Err(OwnerApprovalV2Error::MissingField(
+                "authority_head_sequence"
+            ))
+        ));
+
+        let mut missing_hash = sample_add_credential_context();
+        missing_hash.authority_head_hash = None;
+        assert!(matches!(
+            missing_hash.validate_shape(),
+            Err(OwnerApprovalV2Error::MissingField("authority_head_hash"))
+        ));
+
+        let mut missing_count = sample_add_credential_context();
+        missing_count.pre_active_credential_count = None;
+        assert!(matches!(
+            missing_count.validate_shape(),
+            Err(OwnerApprovalV2Error::MissingField(
+                "pre_active_credential_count"
+            ))
+        ));
+    }
+
+    #[test]
+    fn add_credential_rejects_invalid_values_and_foreign_fields() {
+        let mut short_binding = sample_add_credential_context();
+        short_binding.new_credential_binding_hash = Some(ByteBuf::from(vec![0x41; 31]));
+        assert!(matches!(
+            short_binding.validate_shape(),
+            Err(OwnerApprovalV2Error::InvalidField(
+                "new_credential_binding_hash"
+            ))
+        ));
+
+        let mut short_hash = sample_add_credential_context();
+        short_hash.authority_head_hash = Some(ByteBuf::from(vec![0x44; 31]));
+        assert!(matches!(
+            short_hash.validate_shape(),
+            Err(OwnerApprovalV2Error::InvalidField("authority_head_hash"))
+        ));
+
+        let mut zero_count = sample_add_credential_context();
+        zero_count.pre_active_credential_count = Some(0);
+        assert!(matches!(
+            zero_count.validate_shape(),
+            Err(OwnerApprovalV2Error::InvalidField(
+                "pre_active_credential_count"
+            ))
+        ));
+
+        let mut with_revoke_field = sample_add_credential_context();
+        with_revoke_field.target_credential_id = Some(ByteBuf::from(vec![0x41]));
+        assert!(matches!(
+            with_revoke_field.validate_shape(),
+            Err(OwnerApprovalV2Error::UnexpectedField(
+                "target_credential_id"
+            ))
+        ));
+
+        let mut with_recovery_field = sample_add_credential_context();
+        with_recovery_field.recovery_head_hash = Some(ByteBuf::from(vec![0x77; 32]));
+        assert!(matches!(
+            with_recovery_field.validate_shape(),
+            Err(OwnerApprovalV2Error::UnexpectedField("recovery_head_hash"))
+        ));
+
+        let mut with_pair_field = sample_add_credential_context();
+        with_pair_field.cursor = Some(7);
+        assert!(matches!(
+            with_pair_field.validate_shape(),
+            Err(OwnerApprovalV2Error::UnexpectedField("cursor"))
+        ));
+    }
+
+    #[test]
+    fn non_add_contexts_reject_add_credential_fields() {
+        let mut pair_machine = sample_context();
+        pair_machine.new_credential_binding_hash = Some(ByteBuf::from(vec![0x41; 32]));
+        assert!(matches!(
+            pair_machine.validate_shape(),
+            Err(OwnerApprovalV2Error::UnexpectedField(
+                "new_credential_binding_hash"
+            ))
+        ));
+
+        let mut revoke = sample_revoke_context();
+        revoke.new_credential_binding_hash = Some(ByteBuf::from(vec![0x41; 32]));
+        assert!(matches!(
+            revoke.validate_shape(),
+            Err(OwnerApprovalV2Error::UnexpectedField(
+                "new_credential_binding_hash"
+            ))
+        ));
+
+        let mut recovery = sample_provision_recovery_context();
+        recovery.new_credential_binding_hash = Some(ByteBuf::from(vec![0x41; 32]));
+        assert!(matches!(
+            recovery.validate_shape(),
+            Err(OwnerApprovalV2Error::UnexpectedField(
+                "new_credential_binding_hash"
+            ))
+        ));
+    }
+
+    #[test]
     fn expired_context_is_rejected() {
         let ctx = sample_context();
         assert!(matches!(
@@ -1181,6 +1428,7 @@ mod tests {
             pre_active_credential_count: None,
             recovery_head_sequence: None,
             recovery_head_hash: None,
+            new_credential_binding_hash: None,
             capabilities: vec![],
             issued_at: 1_000,
             expires_at: 1_100,
