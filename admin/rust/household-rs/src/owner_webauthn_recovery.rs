@@ -195,6 +195,54 @@ impl OwnerWebauthnRecoveryAuthority {
             .and_then(|entry| entry.event.action.verifier())
     }
 
+    /// Returns the tail verifier head when the already-verified recovery log is
+    /// currently ready for consume/provision status.
+    pub fn latest_active_verifier_head(
+        &self,
+    ) -> Result<Option<OwnerWebauthnRecoveryHead>, OwnerWebauthnRecoveryError> {
+        let Some((index, entry)) = self.entries.iter().enumerate().next_back() else {
+            return Ok(None);
+        };
+        if !entry.event.action.carries_active_verifier() {
+            return Ok(None);
+        }
+        Ok(Some(OwnerWebauthnRecoveryHead {
+            sequence: u64::try_from(index).map_err(|_| {
+                OwnerWebauthnRecoveryError::Invalid("recovery sequence overflow".to_string())
+            })?,
+            head_hash: entry.entry_hash()?,
+        }))
+    }
+
+    /// Returns true once the recovery log itself has consumed the verifier head.
+    ///
+    /// R1-B combines this with the `WebAuthn` authority's
+    /// `RecoveryProof(X)` Add predicate so a recovery head is considered
+    /// consumed if either log records the consume/add side of the two-anchor
+    /// commit.
+    ///
+    /// Call this only after the recovery authority has passed `verify`/anchor
+    /// classification; it is a predicate over valid entries, not a log validator.
+    #[must_use]
+    pub fn recovery_head_consumed_by_recovery_log(
+        &self,
+        recovery_head_sequence: u64,
+        recovery_head_hash: &[u8],
+    ) -> bool {
+        self.entries.iter().any(|entry| {
+            matches!(
+                (&entry.event.actor, &entry.event.action),
+                (
+                    OwnerWebauthnRecoveryActor::RecoveryProof {
+                        verifier_head_sequence: sequence,
+                        verifier_head_hash: hash,
+                    },
+                    OwnerWebauthnRecoveryEventAction::Consume,
+                ) if *sequence == recovery_head_sequence && hash.as_ref() == recovery_head_hash
+            )
+        })
+    }
+
     #[must_use]
     pub fn recovery_ready(&self) -> bool {
         self.latest_verifier().is_some()
@@ -747,5 +795,98 @@ mod tests {
         authority.push_signed(consume);
         let err = authority.verify(&record, &owner_cert).unwrap_err();
         assert!(matches!(err, OwnerWebauthnRecoveryError::Invalid(_)));
+    }
+
+    #[test]
+    fn latest_active_verifier_head_tracks_rotate_and_consume() {
+        let (root, record, owner_cert) = setup();
+        let provision = OwnerWebauthnRecoveryAuthority::sign_next(
+            &root,
+            &record,
+            &owner_cert,
+            None,
+            b"owner-passkey-1",
+            verifier(b"first-recovery-code"),
+            NOW,
+        )
+        .unwrap();
+        let rotate = OwnerWebauthnRecoveryAuthority::sign_next(
+            &root,
+            &record,
+            &owner_cert,
+            Some(&provision),
+            b"owner-passkey-1",
+            verifier(b"second-recovery-code"),
+            NOW + 1,
+        )
+        .unwrap();
+        let consume = OwnerWebauthnRecoveryAuthority::sign_consume(
+            &root,
+            &record,
+            &owner_cert,
+            &rotate,
+            NOW + 2,
+        )
+        .unwrap();
+
+        let mut authority = OwnerWebauthnRecoveryAuthority::new();
+        assert!(authority.latest_active_verifier_head().unwrap().is_none());
+
+        authority.push_signed(provision.clone());
+        assert_eq!(
+            authority.latest_active_verifier_head().unwrap(),
+            Some(OwnerWebauthnRecoveryHead {
+                sequence: 0,
+                head_hash: provision.entry_hash().unwrap(),
+            })
+        );
+
+        authority.push_signed(rotate.clone());
+        assert_eq!(
+            authority.latest_active_verifier_head().unwrap(),
+            Some(OwnerWebauthnRecoveryHead {
+                sequence: 1,
+                head_hash: rotate.entry_hash().unwrap(),
+            })
+        );
+
+        authority.push_signed(consume);
+        authority.verify(&record, &owner_cert).unwrap();
+        assert!(authority.latest_active_verifier_head().unwrap().is_none());
+        assert!(!authority.recovery_ready());
+    }
+
+    #[test]
+    fn recovery_head_consumed_by_recovery_log_requires_exact_consume_reference() {
+        let (root, record, owner_cert) = setup();
+        let provision = OwnerWebauthnRecoveryAuthority::sign_next(
+            &root,
+            &record,
+            &owner_cert,
+            None,
+            b"owner-passkey-1",
+            verifier(b"first-recovery-code"),
+            NOW,
+        )
+        .unwrap();
+        let consume = OwnerWebauthnRecoveryAuthority::sign_consume(
+            &root,
+            &record,
+            &owner_cert,
+            &provision,
+            NOW + 1,
+        )
+        .unwrap();
+        let provision_hash = provision.entry_hash().unwrap();
+
+        let mut authority = OwnerWebauthnRecoveryAuthority::new();
+        authority.push_signed(provision);
+        assert!(!authority.recovery_head_consumed_by_recovery_log(0, &provision_hash));
+
+        authority.push_signed(consume);
+        assert!(authority.recovery_head_consumed_by_recovery_log(0, &provision_hash));
+        assert!(!authority.recovery_head_consumed_by_recovery_log(1, &provision_hash));
+        assert!(!authority.recovery_head_consumed_by_recovery_log(0, &[0x52; HASH_LEN]));
+        authority.verify(&record, &owner_cert).unwrap();
     }
 }
