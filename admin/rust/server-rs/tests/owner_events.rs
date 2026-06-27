@@ -6,7 +6,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Mutex as StdMutex, OnceLock};
+use std::sync::{Condvar, Mutex as StdMutex, OnceLock};
 use std::time::Duration;
 
 use axum::body::{Body, Bytes, to_bytes};
@@ -33,7 +33,7 @@ use household_rs::owner_webauthn_anchor::{
     verify_or_update_owner_webauthn_authority_anchor, write_owner_webauthn_authority_anchor,
 };
 use household_rs::owner_webauthn_authority::{
-    OwnerWebauthnAuthority, OwnerWebauthnCredentialEventAction,
+    OwnerWebauthnAuthority, OwnerWebauthnCredentialEventAction, OwnerWebauthnEventActor,
 };
 use household_rs::pair_machine::{
     JoinTransport, OwnerApproval, OwnerApprovalContext, PairMachineState, PairMachineWindow,
@@ -78,6 +78,17 @@ type OwnerEventsRouterFixture = (
     P256Keypair,
     Arc<household_rs::LoadedIdentity>,
     Arc<PairMachineWindow>,
+);
+
+type OwnerEventsRouterFixtureWithState = (
+    TempDir,
+    Router,
+    Arc<OwnerEventLog>,
+    OwnerEventsBroadcaster,
+    P256Keypair,
+    Arc<household_rs::LoadedIdentity>,
+    Arc<PairMachineWindow>,
+    OwnerEventsRouterState,
 );
 
 type V2OwnerRouterFixture = (
@@ -163,6 +174,64 @@ impl KeystoreBackend for FailingSetKeystore {
             return Err(KeystoreError::Unavailable {
                 hint: "test anchor write failure".into(),
             });
+        }
+        self.inner.set(account, value)
+    }
+
+    fn delete(&self, account: &str) -> Result<(), KeystoreError> {
+        self.inner.delete(account)
+    }
+}
+
+struct BlockingSetKeystore {
+    inner: FileKeystore,
+    block_next_set: AtomicBool,
+    entered: AtomicUsize,
+    release: StdMutex<bool>,
+    release_cvar: Condvar,
+}
+
+impl BlockingSetKeystore {
+    fn new(state_dir: &std::path::Path) -> Self {
+        Self {
+            inner: FileKeystore::new(state_dir, keystore_rs::SERVICE),
+            block_next_set: AtomicBool::new(false),
+            entered: AtomicUsize::new(0),
+            release: StdMutex::new(false),
+            release_cvar: Condvar::new(),
+        }
+    }
+
+    fn block_next_write(&self) {
+        self.entered.store(0, Ordering::SeqCst);
+        *self.release.lock().unwrap() = false;
+        self.block_next_set.store(true, Ordering::SeqCst);
+    }
+
+    async fn wait_for_blocked_write(&self) {
+        while self.entered.load(Ordering::SeqCst) == 0 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    fn release_blocked_write(&self) {
+        *self.release.lock().unwrap() = true;
+        self.release_cvar.notify_all();
+    }
+}
+
+impl KeystoreBackend for BlockingSetKeystore {
+    fn get(&self, account: &str) -> Result<Vec<u8>, KeystoreError> {
+        self.inner.get(account)
+    }
+
+    fn set(&self, account: &str, value: &[u8]) -> Result<(), KeystoreError> {
+        if self.block_next_set.swap(false, Ordering::SeqCst) {
+            self.entered.fetch_add(1, Ordering::SeqCst);
+            let mut released = self.release.lock().unwrap();
+            while !*released {
+                released = self.release_cvar.wait(released).unwrap();
+            }
         }
         self.inner.set(account, value)
     }
@@ -271,6 +340,13 @@ struct OwnerWebauthnRegistrationFinishResponse {
     active_credential_count: u64,
 }
 
+#[derive(Deserialize)]
+struct OwnerWebauthnRevokeCredentialFinishResponse {
+    #[serde(rename = "v")]
+    version: u8,
+    active_credential_count: u64,
+}
+
 #[derive(serde::Serialize)]
 struct OwnerWebauthnRegistrationStatusRequest {
     #[serde(rename = "v")]
@@ -357,6 +433,21 @@ fn router_from_owner_auth(
     Arc<household_rs::LoadedIdentity>,
     Arc<PairMachineWindow>,
 ) {
+    let (td, router, event_log, broadcaster, person, identity, window, _state) =
+        router_from_owner_auth_with_router_state(
+            td, identity, owner_auth, person, timeout, configure,
+        );
+    (td, router, event_log, broadcaster, person, identity, window)
+}
+
+fn router_from_owner_auth_with_router_state(
+    td: TempDir,
+    identity: Arc<household_rs::LoadedIdentity>,
+    owner_auth: HouseholdAuthState,
+    person: P256Keypair,
+    timeout: Duration,
+    configure: impl FnOnce(OwnerEventsRouterState) -> OwnerEventsRouterState,
+) -> OwnerEventsRouterFixtureWithState {
     let household =
         HouseholdState::loaded_with_owner_auth(Arc::clone(&identity), Some(Arc::new(owner_auth)));
     let broadcaster = OwnerEventsBroadcaster::new();
@@ -373,6 +464,7 @@ fn router_from_owner_auth(
         timeout,
     );
     let state = configure(state);
+    let state_for_assertion = state.clone();
     let router = Router::new()
         .route(
             OWNER_EVENTS_PATH,
@@ -395,6 +487,10 @@ fn router_from_owner_auth(
             post(handlers_owner_events::owner_webauthn_revoke_credential_start_handler),
         )
         .route(
+            "/api/v1/household/owner-webauthn/revoke/finish",
+            post(handlers_owner_events::owner_webauthn_revoke_credential_finish_handler),
+        )
+        .route(
             "/api/v1/household/owner-events/{cursor}/approval-v2/start",
             post(handlers_owner_events::owner_approval_v2_start_handler),
         )
@@ -407,7 +503,16 @@ fn router_from_owner_auth(
             post(handlers_owner_events::owner_decline_handler),
         )
         .with_state(state);
-    (td, router, event_log, broadcaster, person, identity, window)
+    (
+        td,
+        router,
+        event_log,
+        broadcaster,
+        person,
+        identity,
+        window,
+        state_for_assertion,
+    )
 }
 
 fn router_with_state(
@@ -694,6 +799,59 @@ fn owner_auth_with_two_webauthn_credentials(
             .unwrap()
             .active_count(),
         2
+    );
+    (owner_auth, person, rp, authenticator)
+}
+
+fn owner_auth_with_three_webauthn_credentials(
+    identity: &household_rs::LoadedIdentity,
+) -> (
+    household_rs::HouseholdAuthState,
+    P256Keypair,
+    OwnerWebauthnRp,
+    WebauthnAuthenticator<SoftPasskey>,
+) {
+    let (mut owner_auth, person, mut rp, authenticator) =
+        owner_auth_with_two_webauthn_credentials(identity);
+    let actor_credential_id = owner_auth
+        .owner_webauthn
+        .reconstruct(&identity.record, &owner_auth.owner_person_cert)
+        .unwrap()
+        .active_credentials()
+        .first()
+        .expect("active actor credential exists")
+        .credential_id_bytes()
+        .to_vec();
+    let previous = owner_auth
+        .owner_webauthn
+        .entries()
+        .last()
+        .expect("second add event exists")
+        .clone();
+    let (credential, _third_authenticator) = register_owner_softpasskey(&mut rp);
+    let add = OwnerWebauthnAuthority::sign_append(
+        identity
+            .hh_priv
+            .as_deref()
+            .expect("hh_priv present in single-machine household"),
+        &identity.record,
+        &owner_auth.owner_person_cert,
+        &previous,
+        &actor_credential_id,
+        OwnerWebauthnCredentialEventAction::Add {
+            credential: Box::new(credential),
+        },
+        unix_now(),
+    )
+    .unwrap();
+    owner_auth.owner_webauthn.push_signed(add);
+    owner_auth.updated_at = unix_now();
+    assert_eq!(
+        owner_auth
+            .owner_webauthn_credentials(&identity.record)
+            .unwrap()
+            .active_count(),
+        3
     );
     (owner_auth, person, rp, authenticator)
 }
@@ -1550,6 +1708,64 @@ async fn post_revoke_start(
     .await
 }
 
+async fn start_revoke(
+    router: Router,
+    person: &P256Keypair,
+    target_credential_id: Vec<u8>,
+) -> OwnerApprovalV2StartResponse {
+    let (status, headers, resp_bytes) =
+        post_revoke_start(router, person, target_credential_id).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        headers.get(header::CONTENT_TYPE).unwrap(),
+        "application/cbor"
+    );
+    let response: OwnerApprovalV2StartResponse =
+        household_rs::cbor::from_canonical_slice(&resp_bytes).unwrap();
+    assert_eq!(response.version, 1);
+    assert_eq!(response.context.op, OwnerOperation::RevokeCredential);
+    response
+}
+
+fn revoke_finish_body(
+    context: OwnerApprovalContextV2,
+    challenge_id: String,
+    assertion: &PublicKeyCredential,
+) -> Vec<u8> {
+    approval_v2_finish_body(context, challenge_id, assertion)
+}
+
+async fn post_revoke_finish(
+    router: Router,
+    person: &P256Keypair,
+    body: Vec<u8>,
+) -> (StatusCode, HeaderMap, Vec<u8>) {
+    post_cbor(
+        router,
+        "/api/v1/household/owner-webauthn/revoke/finish",
+        body,
+        Some(person),
+    )
+    .await
+}
+
+async fn revoke_finish(
+    router: Router,
+    person: &P256Keypair,
+    body: Vec<u8>,
+) -> OwnerWebauthnRevokeCredentialFinishResponse {
+    let (status, headers, resp_bytes) = post_revoke_finish(router, person, body).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        headers.get(header::CONTENT_TYPE).unwrap(),
+        "application/cbor"
+    );
+    let response: OwnerWebauthnRevokeCredentialFinishResponse =
+        household_rs::cbor::from_canonical_slice(&resp_bytes).unwrap();
+    assert_eq!(response.version, 1);
+    response
+}
+
 fn active_credential_ids(
     owner_auth: &HouseholdAuthState,
     identity: &household_rs::LoadedIdentity,
@@ -1583,6 +1799,83 @@ fn anchor_owner_webauthn_authority(
     )
     .unwrap()
     .expect("non-empty authority has a head")
+}
+
+fn load_owner_auth(td: &TempDir, identity: &household_rs::LoadedIdentity) -> HouseholdAuthState {
+    HouseholdAuthState::load_optional(td.path(), &identity.record, unix_now())
+        .unwrap()
+        .expect("owner auth state persisted")
+}
+
+fn revoke_events_for_target(
+    owner_auth: &HouseholdAuthState,
+    target_credential_id: &[u8],
+) -> Vec<Vec<u8>> {
+    owner_auth
+        .owner_webauthn
+        .entries()
+        .iter()
+        .filter_map(|entry| {
+            let OwnerWebauthnCredentialEventAction::Revoke { credential_id } = &entry.event.action
+            else {
+                return None;
+            };
+            if credential_id.as_ref() != target_credential_id {
+                return None;
+            }
+            match &entry.event.actor {
+                OwnerWebauthnEventActor::OwnerCredential { credential_id } => {
+                    Some(credential_id.to_vec())
+                }
+                OwnerWebauthnEventActor::GenesisTofu => None,
+            }
+        })
+        .collect()
+}
+
+fn append_revoke_event(
+    identity: &household_rs::LoadedIdentity,
+    owner_auth: &mut HouseholdAuthState,
+    actor_credential_id: &[u8],
+    target_credential_id: &[u8],
+) {
+    let previous = owner_auth
+        .owner_webauthn
+        .entries()
+        .last()
+        .expect("authority head exists")
+        .clone();
+    let revoke = OwnerWebauthnAuthority::sign_append(
+        identity
+            .hh_priv
+            .as_deref()
+            .expect("hh_priv present in single-machine household"),
+        &identity.record,
+        &owner_auth.owner_person_cert,
+        &previous,
+        actor_credential_id,
+        OwnerWebauthnCredentialEventAction::Revoke {
+            credential_id: ByteBuf::from(target_credential_id.to_vec()),
+        },
+        unix_now(),
+    )
+    .unwrap();
+    owner_auth.owner_webauthn.push_signed(revoke);
+    owner_auth.updated_at = unix_now();
+}
+
+fn owner_auth_without_last_webauthn_event(owner_auth: &HouseholdAuthState) -> HouseholdAuthState {
+    let mut truncated = owner_auth.clone();
+    truncated.owner_webauthn = OwnerWebauthnAuthority::new();
+    for entry in owner_auth
+        .owner_webauthn
+        .entries()
+        .iter()
+        .take(owner_auth.owner_webauthn.entries().len().saturating_sub(1))
+    {
+        truncated.owner_webauthn.push_signed(entry.clone());
+    }
+    truncated
 }
 
 fn write_test_initial_enrollment_marker(
@@ -1645,7 +1938,7 @@ fn owner_webauthn_revoke_start_source_guards_read_only_contract() {
     let handler = source_segment(
         source,
         "pub async fn owner_webauthn_revoke_credential_start_handler(",
-        "/// `POST /api/v1/household/owner-webauthn/registration/start`",
+        "/// `POST /api/v1/household/owner-webauthn/revoke/finish`",
     );
     assert!(handler.contains("authorize_owner_webauthn_revoke_credential_start_request"));
     assert!(handler.contains("BOOTSTRAP_MUTATION_LOCK"));
@@ -1676,7 +1969,80 @@ fn owner_webauthn_revoke_start_source_guards_read_only_contract() {
 
     let router_source = include_str!("../src/household_bootstrap.rs");
     assert!(router_source.contains("/api/v1/household/owner-webauthn/revoke/start"));
-    assert!(!router_source.contains("/api/v1/household/owner-webauthn/revoke/finish"));
+}
+
+#[test]
+fn owner_webauthn_revoke_finish_source_guards_mutation_contract() {
+    let source = include_str!("../src/handlers_owner_events.rs");
+    let plan = source_segment(
+        source,
+        "fn owner_webauthn_revoke_credential_finish_plan(",
+        "fn parse_pair_machine_approval_body(",
+    );
+    assert!(plan.contains("classify_owner_webauthn_authority_anchor_read_only"));
+    assert!(!plan.contains("verify_or_update_owner_webauthn_authority_anchor"));
+    assert!(!plan.contains("OwnerWebauthnAnchorMode::MigrationDefaultOff"));
+    let target_check = plan.find("revoke_credential_target_not_active").unwrap();
+    let actor_check = plan.find("revoke_credential_actor_not_active").unwrap();
+    let head_check = plan.find("revoke_credential_head_mismatch").unwrap();
+    let count_check = plan.find("revoke_credential_count_mismatch").unwrap();
+    assert!(target_check < head_check);
+    assert!(actor_check < head_check);
+    assert!(head_check < count_check);
+
+    let handler = source_segment(
+        source,
+        "pub async fn owner_webauthn_revoke_credential_finish_handler(",
+        "/// `POST /api/v1/household/owner-webauthn/registration/start`",
+    );
+    assert!(handler.contains("authorize_owner_webauthn_revoke_credential_finish_request"));
+    assert!(handler.contains("BOOTSTRAP_MUTATION_LOCK"));
+    assert!(handler.contains("require_expected_context"));
+    assert!(handler.contains("require_owner_approval_challenge_context"));
+    assert!(handler.contains("finish_owner_approval_assertion"));
+    assert!(handler.contains("OwnerWebauthnAuthority::sign_append"));
+    assert!(handler.contains("OwnerWebauthnCredentialEventAction::Revoke"));
+    assert!(handler.contains("set_owner_auth"));
+    assert!(handler.contains("OwnerWebauthnAnchorMode::Enforcement"));
+    assert!(!handler.contains("MigrationDefaultOff"));
+    assert!(!handler.contains("OwnerAuthEnrollInitial"));
+    assert!(!handler.contains("HouseholdAddMachine"));
+    assert!(!handler.contains("LegacyV1"));
+    assert!(!handler.contains("initial_enrollment_marker"));
+    assert!(!handler.contains("registration_status"));
+    let lock = handler.find("BOOTSTRAP_MUTATION_LOCK").unwrap();
+    let context_check = handler.find("require_expected_context").unwrap();
+    let challenge_check = handler
+        .find("require_owner_approval_challenge_context")
+        .unwrap();
+    let challenge_finish = handler.find("finish_owner_approval_assertion").unwrap();
+    let append = handler.find("OwnerWebauthnAuthority::sign_append").unwrap();
+    let save = handler.find(".save(").unwrap();
+    let memory = handler.find("set_owner_auth").unwrap();
+    let anchor = handler
+        .find("verify_or_update_owner_webauthn_authority_anchor")
+        .unwrap();
+    assert!(lock < context_check);
+    assert!(context_check < challenge_check);
+    assert!(challenge_check < challenge_finish);
+    assert!(challenge_finish < append);
+    assert!(append < save);
+    assert!(save < memory);
+    assert!(memory < anchor);
+
+    let auth_source = include_str!("../src/household_auth.rs");
+    let auth_helper = source_segment(
+        auth_source,
+        "pub async fn authorize_owner_webauthn_revoke_credential_finish_request(",
+        "async fn authorize_owner_only_pop_request(",
+    );
+    assert!(auth_helper.contains("authorize_owner_only_pop_request"));
+    assert!(!auth_helper.contains("caveats::permits"));
+    assert!(!auth_helper.contains("HouseholdAddMachine"));
+    assert!(!auth_helper.contains("OwnerAuthEnrollInitial"));
+
+    let router_source = include_str!("../src/household_bootstrap.rs");
+    assert!(router_source.contains("/api/v1/household/owner-webauthn/revoke/finish"));
 }
 
 #[tokio::test]
@@ -2001,6 +2367,619 @@ async fn owner_webauthn_revoke_start_rejects_bad_pop_and_cbor() {
     let body = make_version_value_noncanonical(revoke_start_body(target));
     let (status, _headers, resp_bytes) = post_cbor(router, uri, body, Some(&person)).await;
     assert_generic_unauth(status, &resp_bytes);
+}
+
+#[tokio::test]
+async fn owner_webauthn_revoke_finish_commits_revoke_and_advances_anchor() {
+    let td = tempfile::tempdir().unwrap();
+    let identity = Arc::new(bootstrap(td.path()));
+    let (owner_auth, person, rp, mut authenticator) =
+        owner_auth_with_two_webauthn_credentials(&identity);
+    let active_ids = active_credential_ids(&owner_auth, &identity);
+    let actor = active_ids[0].clone();
+    let target = active_ids[1].clone();
+    let anchor_store: Arc<dyn keystore_rs::KeystoreBackend> =
+        Arc::new(FileKeystore::new(td.path(), keystore_rs::SERVICE));
+    anchor_owner_webauthn_authority(anchor_store.as_ref(), &identity, &owner_auth);
+    let policy = OwnerApprovalEnforcementPolicy::default()
+        .with_revoke_credential(OwnerOperationEnforcement::V2WhenOwnerHasActiveCredential);
+    let (td, router, _log, _broadcaster, person, identity, _window) =
+        router_from_owner_auth(td, identity, owner_auth, person, Duration::from_secs(45), {
+            let anchor_store = Arc::clone(&anchor_store);
+            move |state| {
+                state
+                    .with_owner_approval_policy(policy)
+                    .with_owner_webauthn_rp(rp)
+                    .with_owner_webauthn_anchor(anchor_store)
+            }
+        });
+
+    let start = start_revoke(router.clone(), &person, target.clone()).await;
+    let context = start.context;
+    let challenge_id = start.challenge_id;
+    let assertion = authenticator
+        .do_authentication(
+            Url::parse("https://alpha.example.test").unwrap(),
+            start.options,
+        )
+        .unwrap();
+    let body = revoke_finish_body(context, challenge_id, &assertion);
+    let finish = revoke_finish(router, &person, body).await;
+
+    assert_eq!(finish.active_credential_count, 1);
+    let loaded = load_owner_auth(&td, &identity);
+    let loaded_active = active_credential_ids(&loaded, &identity);
+    assert_eq!(loaded_active, vec![actor.clone()]);
+    assert_eq!(revoke_events_for_target(&loaded, &target), vec![actor]);
+    let final_head = verified_owner_webauthn_authority_head(
+        &loaded.owner_webauthn,
+        &identity.record,
+        &loaded.owner_person_cert,
+    )
+    .unwrap()
+    .expect("revoked authority has a head");
+    let anchor =
+        read_owner_webauthn_authority_anchor(anchor_store.as_ref(), &identity.record.hh_id)
+            .unwrap()
+            .expect("finish advances anchor");
+    assert_eq!(anchor.sequence(), final_head.sequence);
+    assert_eq!(anchor.head_hash(), final_head.head_hash);
+}
+
+#[tokio::test]
+async fn owner_webauthn_revoke_finish_context_mismatch_does_not_consume_challenge() {
+    let td = tempfile::tempdir().unwrap();
+    let identity = Arc::new(bootstrap(td.path()));
+    let (owner_auth, person, rp, mut authenticator) =
+        owner_auth_with_three_webauthn_credentials(&identity);
+    let active_ids = active_credential_ids(&owner_auth, &identity);
+    let target = active_ids[1].clone();
+    let other_target = active_ids[2].clone();
+    let anchor_store: Arc<dyn keystore_rs::KeystoreBackend> =
+        Arc::new(FileKeystore::new(td.path(), keystore_rs::SERVICE));
+    anchor_owner_webauthn_authority(anchor_store.as_ref(), &identity, &owner_auth);
+    let policy = OwnerApprovalEnforcementPolicy::default()
+        .with_revoke_credential(OwnerOperationEnforcement::V2WhenOwnerHasActiveCredential);
+    let (td, router, _log, _broadcaster, person, identity, _window) =
+        router_from_owner_auth(td, identity, owner_auth, person, Duration::from_secs(45), {
+            let anchor_store = Arc::clone(&anchor_store);
+            move |state| {
+                state
+                    .with_owner_approval_policy(policy)
+                    .with_owner_webauthn_rp(rp)
+                    .with_owner_webauthn_anchor(anchor_store)
+            }
+        });
+
+    let start = start_revoke(router.clone(), &person, target.clone()).await;
+    let original_context = start.context;
+    let challenge_id = start.challenge_id;
+    let assertion = authenticator
+        .do_authentication(
+            Url::parse("https://alpha.example.test").unwrap(),
+            start.options,
+        )
+        .unwrap();
+    let mut tampered_context = original_context.clone();
+    tampered_context.target_credential_id = Some(ByteBuf::from(other_target));
+    let tampered_body = revoke_finish_body(tampered_context, challenge_id.clone(), &assertion);
+    let (status, _headers, resp_bytes) =
+        post_revoke_finish(router.clone(), &person, tampered_body).await;
+    assert_generic_unauth(status, &resp_bytes);
+
+    let body = revoke_finish_body(original_context, challenge_id, &assertion);
+    let finish = revoke_finish(router, &person, body).await;
+
+    assert_eq!(finish.active_credential_count, 2);
+    let loaded = load_owner_auth(&td, &identity);
+    assert_eq!(revoke_events_for_target(&loaded, &target).len(), 1);
+}
+
+#[tokio::test]
+async fn owner_webauthn_revoke_finish_rejects_stale_head_and_inactive_actor_or_target() {
+    let td = tempfile::tempdir().unwrap();
+    let identity = Arc::new(bootstrap(td.path()));
+    let (owner_auth, person, rp, mut authenticator) =
+        owner_auth_with_three_webauthn_credentials(&identity);
+    let active_ids = active_credential_ids(&owner_auth, &identity);
+    let actor = active_ids[0].clone();
+    let target = active_ids[1].clone();
+    let third = active_ids[2].clone();
+    let anchor_store: Arc<dyn keystore_rs::KeystoreBackend> =
+        Arc::new(FileKeystore::new(td.path(), keystore_rs::SERVICE));
+    anchor_owner_webauthn_authority(anchor_store.as_ref(), &identity, &owner_auth);
+    let policy = OwnerApprovalEnforcementPolicy::default()
+        .with_revoke_credential(OwnerOperationEnforcement::V2WhenOwnerHasActiveCredential);
+    let (_td, router, _log, _broadcaster, person, identity, _window, router_state) =
+        router_from_owner_auth_with_router_state(
+            td,
+            identity,
+            owner_auth.clone(),
+            person,
+            Duration::from_secs(45),
+            {
+                let anchor_store = Arc::clone(&anchor_store);
+                move |state| {
+                    state
+                        .with_owner_approval_policy(policy)
+                        .with_owner_webauthn_rp(rp)
+                        .with_owner_webauthn_anchor(anchor_store)
+                }
+            },
+        );
+
+    let start = start_revoke(router.clone(), &person, target.clone()).await;
+    let context = start.context;
+    let challenge_id = start.challenge_id;
+    let assertion = authenticator
+        .do_authentication(
+            Url::parse("https://alpha.example.test").unwrap(),
+            start.options,
+        )
+        .unwrap();
+    let body = revoke_finish_body(context, challenge_id, &assertion);
+
+    let mut live_auth = owner_auth.clone();
+    append_revoke_event(&identity, &mut live_auth, &actor, &third);
+    router_state
+        .household
+        .set_owner_auth(Arc::new(live_auth))
+        .await;
+    let (status, _headers, resp_bytes) =
+        post_revoke_finish(router.clone(), &person, body.clone()).await;
+    assert_generic_unauth(status, &resp_bytes);
+
+    let mut target_inactive = owner_auth.clone();
+    append_revoke_event(&identity, &mut target_inactive, &actor, &target);
+    router_state
+        .household
+        .set_owner_auth(Arc::new(target_inactive))
+        .await;
+    let (status, _headers, resp_bytes) =
+        post_revoke_finish(router.clone(), &person, body.clone()).await;
+    assert_generic_unauth(status, &resp_bytes);
+
+    let mut actor_inactive = owner_auth;
+    append_revoke_event(&identity, &mut actor_inactive, &target, &actor);
+    router_state
+        .household
+        .set_owner_auth(Arc::new(actor_inactive))
+        .await;
+    let (status, _headers, resp_bytes) = post_revoke_finish(router, &person, body).await;
+    assert_generic_unauth(status, &resp_bytes);
+}
+
+#[tokio::test]
+async fn owner_webauthn_revoke_finish_rejects_policy_off_bad_pop_and_noncanonical_cbor() {
+    let td = tempfile::tempdir().unwrap();
+    let identity = Arc::new(bootstrap(td.path()));
+    let (owner_auth, person, rp, mut authenticator) =
+        owner_auth_with_two_webauthn_credentials(&identity);
+    let active_ids = active_credential_ids(&owner_auth, &identity);
+    let target = active_ids[1].clone();
+    let anchor_store: Arc<dyn keystore_rs::KeystoreBackend> =
+        Arc::new(FileKeystore::new(td.path(), keystore_rs::SERVICE));
+    anchor_owner_webauthn_authority(anchor_store.as_ref(), &identity, &owner_auth);
+    let policy = OwnerApprovalEnforcementPolicy::default()
+        .with_revoke_credential(OwnerOperationEnforcement::V2WhenOwnerHasActiveCredential);
+    let (_td, router, _log, _broadcaster, person, _identity, _window, router_state) =
+        router_from_owner_auth_with_router_state(
+            td,
+            identity,
+            owner_auth,
+            person,
+            Duration::from_secs(45),
+            {
+                let anchor_store = Arc::clone(&anchor_store);
+                move |state| {
+                    state
+                        .with_owner_approval_policy(policy)
+                        .with_owner_webauthn_rp(rp)
+                        .with_owner_webauthn_anchor(anchor_store)
+                }
+            },
+        );
+    let start = start_revoke(router.clone(), &person, target).await;
+    let assertion = authenticator
+        .do_authentication(
+            Url::parse("https://alpha.example.test").unwrap(),
+            start.options,
+        )
+        .unwrap();
+    let body = revoke_finish_body(start.context, start.challenge_id, &assertion);
+
+    let mut policy_off_state = router_state.clone();
+    policy_off_state.owner_approval_policy = OwnerApprovalEnforcementPolicy::default();
+    let policy_off_router = Router::new()
+        .route(
+            "/api/v1/household/owner-webauthn/revoke/finish",
+            post(handlers_owner_events::owner_webauthn_revoke_credential_finish_handler),
+        )
+        .with_state(policy_off_state);
+    let (status, _headers, resp_bytes) =
+        post_revoke_finish(policy_off_router, &person, body.clone()).await;
+    assert_generic_unauth(status, &resp_bytes);
+
+    let uri = "/api/v1/household/owner-webauthn/revoke/finish";
+    let bad_pop = pop_header_for(
+        &person,
+        "POST",
+        "/api/v1/household/owner-webauthn/revoke/start",
+        unix_now(),
+        &body,
+    );
+    let resp = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(uri)
+                .header(header::AUTHORIZATION, bad_pop)
+                .header(header::CONTENT_TYPE, "application/cbor")
+                .body(Body::from(body.clone()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = resp.status();
+    let resp_bytes = to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap()
+        .to_vec();
+    assert_generic_unauth(status, &resp_bytes);
+
+    let noncanonical_body = make_version_value_noncanonical(body);
+    let (status, _headers, resp_bytes) =
+        post_revoke_finish(router, &person, noncanonical_body).await;
+    assert_generic_unauth(status, &resp_bytes);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn owner_webauthn_revoke_finish_concurrent_duplicate_revoke_only_appends_once() {
+    let td = tempfile::tempdir().unwrap();
+    let identity = Arc::new(bootstrap(td.path()));
+    let (owner_auth, person, rp, mut authenticator) =
+        owner_auth_with_three_webauthn_credentials(&identity);
+    let active_ids = active_credential_ids(&owner_auth, &identity);
+    let actor = active_ids[0].clone();
+    let target = active_ids[1].clone();
+    let anchor_store = Arc::new(BlockingSetKeystore::new(td.path()));
+    anchor_owner_webauthn_authority(anchor_store.as_ref(), &identity, &owner_auth);
+    let anchor_for_state: Arc<dyn keystore_rs::KeystoreBackend> = anchor_store.clone();
+    let policy = OwnerApprovalEnforcementPolicy::default()
+        .with_revoke_credential(OwnerOperationEnforcement::V2WhenOwnerHasActiveCredential);
+    let (td, router, _log, _broadcaster, person, identity, _window) =
+        router_from_owner_auth(td, identity, owner_auth, person, Duration::from_secs(45), {
+            move |state| {
+                state
+                    .with_owner_approval_policy(policy)
+                    .with_owner_webauthn_rp(rp)
+                    .with_owner_webauthn_anchor(anchor_for_state)
+            }
+        });
+
+    let first_start = start_revoke(router.clone(), &person, target.clone()).await;
+    let second_start = start_revoke(router.clone(), &person, target.clone()).await;
+    let first_assertion = authenticator
+        .do_authentication(
+            Url::parse("https://alpha.example.test").unwrap(),
+            first_start.options,
+        )
+        .unwrap();
+    let second_assertion = authenticator
+        .do_authentication(
+            Url::parse("https://alpha.example.test").unwrap(),
+            second_start.options,
+        )
+        .unwrap();
+    let first_body = revoke_finish_body(
+        first_start.context,
+        first_start.challenge_id,
+        &first_assertion,
+    );
+    let second_body = revoke_finish_body(
+        second_start.context,
+        second_start.challenge_id,
+        &second_assertion,
+    );
+    anchor_store.block_next_write();
+
+    let first_uri = "/api/v1/household/owner-webauthn/revoke/finish";
+    let first_auth = pop_header_for(&person, "POST", first_uri, unix_now(), &first_body);
+    let first_request = Request::builder()
+        .method("POST")
+        .uri(first_uri)
+        .header(header::AUTHORIZATION, first_auth)
+        .header(header::CONTENT_TYPE, "application/cbor")
+        .body(Body::from(first_body))
+        .unwrap();
+    let first_router = router.clone();
+    let first_task = tokio::spawn(async move {
+        let resp = first_router.oneshot(first_request).await.unwrap();
+        let status = resp.status();
+        let bytes = to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .to_vec();
+        (status, bytes)
+    });
+    anchor_store.wait_for_blocked_write().await;
+
+    let second_uri = "/api/v1/household/owner-webauthn/revoke/finish";
+    let second_auth = pop_header_for(&person, "POST", second_uri, unix_now(), &second_body);
+    let second_request = Request::builder()
+        .method("POST")
+        .uri(second_uri)
+        .header(header::AUTHORIZATION, second_auth)
+        .header(header::CONTENT_TYPE, "application/cbor")
+        .body(Body::from(second_body))
+        .unwrap();
+    let second_router = router.clone();
+    let second_task = tokio::spawn(async move {
+        let resp = second_router.oneshot(second_request).await.unwrap();
+        let status = resp.status();
+        let bytes = to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .to_vec();
+        (status, bytes)
+    });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    anchor_store.release_blocked_write();
+
+    let (first_status, first_bytes) = first_task.await.unwrap();
+    let (second_status, second_bytes) = second_task.await.unwrap();
+    assert_eq!(first_status, StatusCode::OK);
+    let finish: OwnerWebauthnRevokeCredentialFinishResponse =
+        household_rs::cbor::from_canonical_slice(&first_bytes).unwrap();
+    assert_eq!(finish.active_credential_count, 2);
+    assert_generic_unauth(second_status, &second_bytes);
+    let loaded = load_owner_auth(&td, &identity);
+    assert_eq!(revoke_events_for_target(&loaded, &target), vec![actor]);
+    assert_eq!(
+        loaded
+            .owner_webauthn_credentials(&identity.record)
+            .unwrap()
+            .active_count(),
+        2
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn owner_webauthn_revoke_finish_concurrent_different_targets_preserves_last_active() {
+    let td = tempfile::tempdir().unwrap();
+    let identity = Arc::new(bootstrap(td.path()));
+    let (owner_auth, person, rp, mut authenticator) =
+        owner_auth_with_two_webauthn_credentials(&identity);
+    let active_ids = active_credential_ids(&owner_auth, &identity);
+    let actor_and_second_target = active_ids[0].clone();
+    let first_target = active_ids[1].clone();
+    let anchor_store = Arc::new(BlockingSetKeystore::new(td.path()));
+    anchor_owner_webauthn_authority(anchor_store.as_ref(), &identity, &owner_auth);
+    let anchor_for_state: Arc<dyn keystore_rs::KeystoreBackend> = anchor_store.clone();
+    let policy = OwnerApprovalEnforcementPolicy::default()
+        .with_revoke_credential(OwnerOperationEnforcement::V2WhenOwnerHasActiveCredential);
+    let (td, router, _log, _broadcaster, person, identity, _window) =
+        router_from_owner_auth(td, identity, owner_auth, person, Duration::from_secs(45), {
+            move |state| {
+                state
+                    .with_owner_approval_policy(policy)
+                    .with_owner_webauthn_rp(rp)
+                    .with_owner_webauthn_anchor(anchor_for_state)
+            }
+        });
+
+    let first_start = start_revoke(router.clone(), &person, first_target.clone()).await;
+    let second_start = start_revoke(router.clone(), &person, actor_and_second_target.clone()).await;
+    let first_assertion = authenticator
+        .do_authentication(
+            Url::parse("https://alpha.example.test").unwrap(),
+            first_start.options,
+        )
+        .unwrap();
+    let second_assertion = authenticator
+        .do_authentication(
+            Url::parse("https://alpha.example.test").unwrap(),
+            second_start.options,
+        )
+        .unwrap();
+    let first_body = revoke_finish_body(
+        first_start.context,
+        first_start.challenge_id,
+        &first_assertion,
+    );
+    let second_body = revoke_finish_body(
+        second_start.context,
+        second_start.challenge_id,
+        &second_assertion,
+    );
+    anchor_store.block_next_write();
+
+    let first_uri = "/api/v1/household/owner-webauthn/revoke/finish";
+    let first_auth = pop_header_for(&person, "POST", first_uri, unix_now(), &first_body);
+    let first_request = Request::builder()
+        .method("POST")
+        .uri(first_uri)
+        .header(header::AUTHORIZATION, first_auth)
+        .header(header::CONTENT_TYPE, "application/cbor")
+        .body(Body::from(first_body))
+        .unwrap();
+    let first_router = router.clone();
+    let first_task = tokio::spawn(async move {
+        let resp = first_router.oneshot(first_request).await.unwrap();
+        let status = resp.status();
+        let bytes = to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .to_vec();
+        (status, bytes)
+    });
+    anchor_store.wait_for_blocked_write().await;
+
+    let second_uri = "/api/v1/household/owner-webauthn/revoke/finish";
+    let second_auth = pop_header_for(&person, "POST", second_uri, unix_now(), &second_body);
+    let second_request = Request::builder()
+        .method("POST")
+        .uri(second_uri)
+        .header(header::AUTHORIZATION, second_auth)
+        .header(header::CONTENT_TYPE, "application/cbor")
+        .body(Body::from(second_body))
+        .unwrap();
+    let second_router = router.clone();
+    let second_task = tokio::spawn(async move {
+        let resp = second_router.oneshot(second_request).await.unwrap();
+        let status = resp.status();
+        let bytes = to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .to_vec();
+        (status, bytes)
+    });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    anchor_store.release_blocked_write();
+
+    let (first_status, first_bytes) = first_task.await.unwrap();
+    let (second_status, second_bytes) = second_task.await.unwrap();
+    assert_eq!(first_status, StatusCode::OK);
+    let finish: OwnerWebauthnRevokeCredentialFinishResponse =
+        household_rs::cbor::from_canonical_slice(&first_bytes).unwrap();
+    assert_eq!(finish.active_credential_count, 1);
+    assert_generic_unauth(second_status, &second_bytes);
+    let loaded = load_owner_auth(&td, &identity);
+    assert_eq!(
+        revoke_events_for_target(&loaded, &first_target),
+        vec![actor_and_second_target.clone()]
+    );
+    assert!(
+        revoke_events_for_target(&loaded, &actor_and_second_target).is_empty(),
+        "last-active guard must reject the still-active second target without appending"
+    );
+    assert_eq!(
+        loaded
+            .owner_webauthn_credentials(&identity.record)
+            .unwrap()
+            .active_count(),
+        1
+    );
+    assert_eq!(
+        active_credential_ids(&loaded, &identity),
+        vec![actor_and_second_target]
+    );
+}
+
+#[tokio::test]
+async fn owner_webauthn_revoke_finish_anchor_failure_recovers_without_duplicate_revoke() {
+    let td = tempfile::tempdir().unwrap();
+    let identity = Arc::new(bootstrap(td.path()));
+    let (owner_auth, person, rp, mut authenticator) =
+        owner_auth_with_three_webauthn_credentials(&identity);
+    let active_ids = active_credential_ids(&owner_auth, &identity);
+    let actor = active_ids[0].clone();
+    let target = active_ids[1].clone();
+    let anchor_store = Arc::new(FailingSetKeystore::new(td.path()));
+    anchor_owner_webauthn_authority(anchor_store.as_ref(), &identity, &owner_auth);
+    let anchor_for_state: Arc<dyn keystore_rs::KeystoreBackend> = anchor_store.clone();
+    let policy = OwnerApprovalEnforcementPolicy::default()
+        .with_revoke_credential(OwnerOperationEnforcement::V2WhenOwnerHasActiveCredential);
+    let (td, router, _log, _broadcaster, person, identity, _window) =
+        router_from_owner_auth(td, identity, owner_auth, person, Duration::from_secs(45), {
+            move |state| {
+                state
+                    .with_owner_approval_policy(policy)
+                    .with_owner_webauthn_rp(rp)
+                    .with_owner_webauthn_anchor(anchor_for_state)
+            }
+        });
+
+    let start = start_revoke(router.clone(), &person, target.clone()).await;
+    let assertion = authenticator
+        .do_authentication(
+            Url::parse("https://alpha.example.test").unwrap(),
+            start.options,
+        )
+        .unwrap();
+    let body = revoke_finish_body(start.context, start.challenge_id, &assertion);
+    anchor_store.fail_writes(true);
+    let (status, _headers, resp_bytes) =
+        post_revoke_finish(router.clone(), &person, body.clone()).await;
+    assert_generic_unauth(status, &resp_bytes);
+    let loaded_after_fail = load_owner_auth(&td, &identity);
+    assert_eq!(
+        revoke_events_for_target(&loaded_after_fail, &target),
+        vec![actor.clone()]
+    );
+
+    let (status, _headers, resp_bytes) = post_revoke_finish(router, &person, body).await;
+    assert_generic_unauth(status, &resp_bytes);
+    let loaded_after_retry = load_owner_auth(&td, &identity);
+    assert_eq!(
+        revoke_events_for_target(&loaded_after_retry, &target),
+        vec![actor]
+    );
+
+    anchor_store.fail_writes(false);
+    verify_or_update_owner_webauthn_authority_anchor(
+        anchor_store.as_ref(),
+        &loaded_after_retry.owner_webauthn,
+        &identity.record,
+        &loaded_after_retry.owner_person_cert,
+        OwnerWebauthnAnchorMode::Enforcement,
+    )
+    .expect("later enforcement advances anchor over persisted revoke");
+    let loaded_after_recovery = load_owner_auth(&td, &identity);
+    assert_eq!(
+        revoke_events_for_target(&loaded_after_recovery, &target).len(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn owner_webauthn_revoke_finish_anchor_blocks_rollback_unrevoke() {
+    let td = tempfile::tempdir().unwrap();
+    let identity = Arc::new(bootstrap(td.path()));
+    let (owner_auth, person, rp, mut authenticator) =
+        owner_auth_with_two_webauthn_credentials(&identity);
+    let active_ids = active_credential_ids(&owner_auth, &identity);
+    let target = active_ids[1].clone();
+    let anchor_store: Arc<dyn keystore_rs::KeystoreBackend> =
+        Arc::new(FileKeystore::new(td.path(), keystore_rs::SERVICE));
+    anchor_owner_webauthn_authority(anchor_store.as_ref(), &identity, &owner_auth);
+    let policy = OwnerApprovalEnforcementPolicy::default()
+        .with_revoke_credential(OwnerOperationEnforcement::V2WhenOwnerHasActiveCredential);
+    let (td, router, _log, _broadcaster, person, identity, _window) =
+        router_from_owner_auth(td, identity, owner_auth, person, Duration::from_secs(45), {
+            let anchor_store = Arc::clone(&anchor_store);
+            move |state| {
+                state
+                    .with_owner_approval_policy(policy)
+                    .with_owner_webauthn_rp(rp)
+                    .with_owner_webauthn_anchor(anchor_store)
+            }
+        });
+
+    let start = start_revoke(router.clone(), &person, target).await;
+    let assertion = authenticator
+        .do_authentication(
+            Url::parse("https://alpha.example.test").unwrap(),
+            start.options,
+        )
+        .unwrap();
+    let body = revoke_finish_body(start.context, start.challenge_id, &assertion);
+    let finish = revoke_finish(router, &person, body).await;
+    assert_eq!(finish.active_credential_count, 1);
+    let committed = load_owner_auth(&td, &identity);
+    let truncated = owner_auth_without_last_webauthn_event(&committed);
+    assert!(
+        verify_or_update_owner_webauthn_authority_anchor(
+            anchor_store.as_ref(),
+            &truncated.owner_webauthn,
+            &identity.record,
+            &truncated.owner_person_cert,
+            OwnerWebauthnAnchorMode::Enforcement,
+        )
+        .is_err(),
+        "anchor must reject rollback that would un-revoke the credential"
+    );
 }
 
 #[tokio::test]

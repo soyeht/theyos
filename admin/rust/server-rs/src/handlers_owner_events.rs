@@ -35,6 +35,9 @@ use household_rs::owner_webauthn_anchor::{
     OwnerWebauthnAuthorityHead, classify_owner_webauthn_authority_anchor_read_only,
     verified_owner_webauthn_authority_head, verify_or_update_owner_webauthn_authority_anchor,
 };
+use household_rs::owner_webauthn_authority::{
+    OwnerWebauthnCredentialEventAction, SignedOwnerWebauthnCredentialEvent,
+};
 use household_rs::pair_machine::{
     CeremonyError, CeremonyInputs, CeremonyTxn, FinalizeWithM2Options, FinalizeWithM2Outcome,
     JoinRequest, OwnerApproval, OwnerApprovalContext, PairMachineState, PairMachineWindow,
@@ -469,6 +472,14 @@ struct OwnerWebauthnRevokeCredentialStartSnapshot {
     pre_active_credential_count: u64,
 }
 
+struct OwnerWebauthnRevokeCredentialFinishPlan {
+    actor_credential: household_rs::owner_webauthn::OwnerWebauthnCredential,
+    expected_context: OwnerApprovalContextV2,
+    previous_entry: SignedOwnerWebauthnCredentialEvent,
+    target_credential_id: ByteBuf,
+    pre_active_credential_count: u64,
+}
+
 fn owner_webauthn_revoke_credential_start_snapshot(
     state: &OwnerEventsRouterState,
     identity: &household_rs::LoadedIdentity,
@@ -521,6 +532,130 @@ fn owner_webauthn_revoke_credential_start_snapshot(
         credentials,
         authority_head,
         pre_active_credential_count,
+    })
+}
+
+fn owner_webauthn_revoke_credential_finish_plan(
+    state: &OwnerEventsRouterState,
+    identity: &household_rs::LoadedIdentity,
+    owner_auth: &household_rs::HouseholdAuthState,
+    submitted_context: &OwnerApprovalContextV2,
+    actor_credential_id: &[u8],
+) -> Result<OwnerWebauthnRevokeCredentialFinishPlan, &'static str> {
+    if !state
+        .owner_approval_policy
+        .revoke_credential_start_enabled()
+    {
+        return Err("revoke_credential_policy_disabled");
+    }
+
+    let target_credential_id = submitted_context
+        .target_credential_id
+        .as_ref()
+        .ok_or("revoke_credential_target_missing")?;
+    let bound_sequence = submitted_context
+        .authority_head_sequence
+        .ok_or("revoke_credential_head_sequence_missing")?;
+    let bound_hash = submitted_context
+        .authority_head_hash
+        .as_ref()
+        .ok_or("revoke_credential_head_hash_missing")?;
+    let pre_active_credential_count = submitted_context
+        .pre_active_credential_count
+        .ok_or("revoke_credential_count_missing")?;
+    let replay_nonce: [u8; 32] = submitted_context
+        .replay_nonce
+        .as_ref()
+        .try_into()
+        .map_err(|_| "revoke_credential_replay_nonce_length")?;
+
+    let Some(verifier) = state.owner_webauthn_anchor.as_ref() else {
+        return Err("missing_anchor_verifier");
+    };
+    let authority_head = match classify_owner_webauthn_authority_anchor_read_only(
+        verifier.keystore.as_ref(),
+        &owner_auth.owner_webauthn,
+        &identity.record,
+        &owner_auth.owner_person_cert,
+    ) {
+        Ok(
+            OwnerWebauthnAnchorStatus::Verified { head }
+            | OwnerWebauthnAnchorStatus::Advanced { head, .. },
+        ) => head,
+        Ok(OwnerWebauthnAnchorStatus::EmptyAuthorityNoAnchor) => return Err("never_enrolled"),
+        Ok(OwnerWebauthnAnchorStatus::Migrated { .. }) => {
+            return Err("unexpected_anchor_migration");
+        }
+        Err(_) => return Err("credential_anchor_invalid"),
+    };
+    let credentials = owner_auth
+        .owner_webauthn_credentials(&identity.record)
+        .map_err(|_| "credential_reconstruct_failed")?;
+    let active_count = credentials.active_count();
+    let active_count_u64 = u64::try_from(active_count).map_err(|_| "credential_count_overflow")?;
+    if active_count <= 1 {
+        return Err("revoke_credential_last_active");
+    }
+    let target_is_active = credentials
+        .active_credentials()
+        .iter()
+        .any(|credential| credential.credential_id_bytes() == target_credential_id.as_ref());
+    if !target_is_active {
+        return Err("revoke_credential_target_not_active");
+    }
+    let Some(actor_credential) = credentials
+        .credentials()
+        .iter()
+        .find(|credential| {
+            credential.credential_id_bytes() == actor_credential_id && !credential.is_revoked()
+        })
+        .cloned()
+    else {
+        return Err("revoke_credential_actor_not_active");
+    };
+    if authority_head.sequence != bound_sequence || authority_head.head_hash != bound_hash.as_ref()
+    {
+        return Err("revoke_credential_head_mismatch");
+    }
+    if active_count_u64 != pre_active_credential_count {
+        return Err("revoke_credential_count_mismatch");
+    }
+    let previous_entry = owner_auth
+        .owner_webauthn
+        .entries()
+        .last()
+        .cloned()
+        .ok_or("revoke_credential_authority_head_missing")?;
+    if previous_entry
+        .entry_hash()
+        .map_err(|_| "revoke_credential_authority_head_failed")?
+        != authority_head.head_hash
+    {
+        return Err("revoke_credential_authority_head_mismatch");
+    }
+    let expected_context =
+        OwnerApprovalContextV2::revoke_credential(RevokeCredentialContextInput {
+            hh_id: identity.record.hh_id.clone(),
+            owner_p_id: owner_auth.owner_person_cert.p_id.clone(),
+            target_credential_id: target_credential_id.to_vec(),
+            authority_head_sequence: authority_head.sequence,
+            authority_head_hash: authority_head.head_hash,
+            pre_active_credential_count: active_count_u64,
+            capabilities: owner_revoke_credential_v2_capabilities(),
+            issued_at: submitted_context.issued_at,
+            expires_at: submitted_context.expires_at,
+            replay_nonce,
+        });
+    expected_context
+        .validate_shape()
+        .map_err(|_| "revoke_credential_expected_context_invalid")?;
+
+    Ok(OwnerWebauthnRevokeCredentialFinishPlan {
+        actor_credential,
+        expected_context,
+        previous_entry,
+        target_credential_id: target_credential_id.clone(),
+        pre_active_credential_count: active_count_u64,
     })
 }
 
@@ -640,6 +775,13 @@ struct OwnerWebauthnRegistrationStatusResponse {
     #[serde(rename = "v")]
     version: u8,
     enrolled: bool,
+}
+
+#[derive(Serialize)]
+struct OwnerWebauthnRevokeCredentialFinishResponse {
+    #[serde(rename = "v")]
+    version: u8,
+    active_credential_count: u64,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -1105,6 +1247,25 @@ fn reject_owner_webauthn_revoke_credential_start(
     unauthenticated_response()
 }
 
+fn reject_owner_webauthn_revoke_credential_finish(
+    reason: &'static str,
+    error: Option<String>,
+) -> Response {
+    if let Some(error) = error {
+        tracing::warn!(
+            stage = "owner_events.owner_webauthn_revoke_credential_finish.rejected",
+            reason,
+            error = %error,
+        );
+    } else {
+        tracing::warn!(
+            stage = "owner_events.owner_webauthn_revoke_credential_finish.rejected",
+            reason,
+        );
+    }
+    unauthenticated_response()
+}
+
 fn owner_webauthn_initial_enrollment_policy_snapshot(
     state: &OwnerEventsRouterState,
     identity: &household_rs::LoadedIdentity,
@@ -1353,6 +1514,223 @@ pub async fn owner_webauthn_revoke_credential_start_handler(
         options,
     })
     .unwrap_or_default();
+    cbor_response(StatusCode::OK, bytes)
+}
+
+/// `POST /api/v1/household/owner-webauthn/revoke/finish`.
+///
+/// Commits an owner-passkey revoke authorized by a fresh v2 assertion. Unlike
+/// R2 start, this is the local mutation point: the bootstrap mutation lock is
+/// held from live revalidation through durable save, memory update, and anchor
+/// advance.
+pub async fn owner_webauthn_revoke_credential_finish_handler(
+    State(state): State<OwnerEventsRouterState>,
+    method: Method,
+    uri: Uri,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let Some(now) =
+        time_util::unix_now_secs_checked("owner_events.owner_webauthn_revoke_finish.clock")
+    else {
+        return unauthenticated_response();
+    };
+    let path_and_query = uri
+        .path_and_query()
+        .map_or_else(|| uri.path().to_string(), |pq| pq.as_str().to_string());
+    let authorized_owner_auth =
+        match household_auth::authorize_owner_webauthn_revoke_credential_finish_request(
+            &state.household,
+            &headers,
+            &method,
+            &path_and_query,
+            &body,
+            now,
+        )
+        .await
+        {
+            Ok(owner_auth) => owner_auth,
+            Err(e) => {
+                return reject_owner_webauthn_revoke_credential_finish(
+                    "pop_auth_failed",
+                    Some(e.to_string()),
+                );
+            }
+        };
+
+    let finish: OwnerApprovalV2Finish = match decode_canonical_cbor(&body) {
+        Ok(finish) => finish,
+        Err(e) => return reject_owner_webauthn_revoke_credential_finish("cbor_decode", Some(e)),
+    };
+    if finish.version != 1 {
+        return reject_owner_webauthn_revoke_credential_finish("bad_version", None);
+    }
+    if finish.approval.context.op != OwnerOperation::RevokeCredential {
+        return reject_owner_webauthn_revoke_credential_finish("bad_operation", None);
+    }
+    if let Err(e) = finish.approval.context.validate_at(now) {
+        return reject_owner_webauthn_revoke_credential_finish(
+            "approval_v2_context_expired",
+            Some(e.to_string()),
+        );
+    }
+    let challenge_id = match OwnerWebauthnChallengeId::parse(finish.challenge_id.clone()) {
+        Ok(challenge_id) => challenge_id,
+        Err(e) => {
+            return reject_owner_webauthn_revoke_credential_finish(
+                "bad_challenge_id",
+                Some(e.to_string()),
+            );
+        }
+    };
+    let assertion = match finish.approval.to_public_key_credential() {
+        Ok(assertion) => assertion,
+        Err(e) => {
+            return reject_owner_webauthn_revoke_credential_finish(
+                "approval_v2_assertion_invalid",
+                Some(e.to_string()),
+            );
+        }
+    };
+
+    let _mutation_guard = crate::bootstrap_mutation_lock::BOOTSTRAP_MUTATION_LOCK
+        .lock()
+        .await;
+    let Some(identity) = state.household.current().await else {
+        return reject_owner_webauthn_revoke_credential_finish("identity_unavailable", None);
+    };
+    let Some(current_owner_auth) = state.household.current_owner_auth().await else {
+        return reject_owner_webauthn_revoke_credential_finish("owner_auth_unavailable", None);
+    };
+    if current_owner_auth.owner_person_cert.p_id != authorized_owner_auth.owner_person_cert.p_id {
+        return reject_owner_webauthn_revoke_credential_finish("owner_auth_changed", None);
+    }
+    let Some(hh_priv) = identity.hh_priv.as_deref() else {
+        return reject_owner_webauthn_revoke_credential_finish("household_root_unavailable", None);
+    };
+    let Some(anchor) = state.owner_webauthn_anchor.clone() else {
+        return reject_owner_webauthn_revoke_credential_finish("missing_anchor_verifier", None);
+    };
+    let Some(rp) = state.owner_webauthn_rp.as_ref() else {
+        return reject_owner_webauthn_revoke_credential_finish("rp_unavailable", None);
+    };
+    let mut plan = match owner_webauthn_revoke_credential_finish_plan(
+        &state,
+        &identity,
+        current_owner_auth.as_ref(),
+        &finish.approval.context,
+        finish.approval.credential_id.as_ref(),
+    ) {
+        Ok(plan) => plan,
+        Err(reason) => return reject_owner_webauthn_revoke_credential_finish(reason, None),
+    };
+    if let Err(e) = finish
+        .approval
+        .require_expected_context(&plan.expected_context)
+    {
+        return reject_owner_webauthn_revoke_credential_finish(
+            "approval_v2_context_mismatch",
+            Some(e.to_string()),
+        );
+    }
+
+    let mut rp = rp.lock().await;
+    if let Err(e) =
+        rp.require_owner_approval_challenge_context(now, &challenge_id, &finish.approval.context)
+    {
+        return reject_owner_webauthn_revoke_credential_finish(
+            "owner_webauthn_challenge_context_mismatch",
+            Some(e.to_string()),
+        );
+    }
+    if let Err(e) = rp.finish_owner_approval_assertion(
+        now,
+        &challenge_id,
+        &assertion,
+        &mut plan.actor_credential,
+        &finish.approval.context,
+    ) {
+        return reject_owner_webauthn_revoke_credential_finish(
+            "owner_webauthn_finish_failed",
+            Some(e.to_string()),
+        );
+    }
+    drop(rp);
+
+    let revoke = match household_rs::owner_webauthn_authority::OwnerWebauthnAuthority::sign_append(
+        hh_priv,
+        &identity.record,
+        &current_owner_auth.owner_person_cert,
+        &plan.previous_entry,
+        finish.approval.credential_id.as_ref(),
+        OwnerWebauthnCredentialEventAction::Revoke {
+            credential_id: plan.target_credential_id.clone(),
+        },
+        now,
+    ) {
+        Ok(revoke) => revoke,
+        Err(e) => {
+            return reject_owner_webauthn_revoke_credential_finish(
+                "authority_sign_failed",
+                Some(e.to_string()),
+            );
+        }
+    };
+    let mut next_auth = current_owner_auth.as_ref().clone();
+    next_auth.owner_webauthn.push_signed(revoke);
+    next_auth.updated_at = now;
+    if let Err(e) = next_auth.verify(&identity.record, now) {
+        return reject_owner_webauthn_revoke_credential_finish(
+            "authority_verify_failed",
+            Some(e.to_string()),
+        );
+    }
+    let active_credential_count = match next_auth.owner_webauthn_credentials(&identity.record) {
+        Ok(credentials) => credentials.active_count() as u64,
+        Err(e) => {
+            return reject_owner_webauthn_revoke_credential_finish(
+                "credential_reconstruct_failed",
+                Some(e.to_string()),
+            );
+        }
+    };
+    if active_credential_count + 1 != plan.pre_active_credential_count
+        || active_credential_count == 0
+    {
+        return reject_owner_webauthn_revoke_credential_finish(
+            "credential_count_after_revoke_invalid",
+            None,
+        );
+    }
+
+    if let Err(e) = next_auth.save(&state.state_dir) {
+        return reject_owner_webauthn_revoke_credential_finish(
+            "authority_save_failed",
+            Some(e.to_string()),
+        );
+    }
+    state
+        .household
+        .set_owner_auth(Arc::new(next_auth.clone()))
+        .await;
+    if let Err(e) = verify_or_update_owner_webauthn_authority_anchor(
+        anchor.keystore.as_ref(),
+        &next_auth.owner_webauthn,
+        &identity.record,
+        &next_auth.owner_person_cert,
+        OwnerWebauthnAnchorMode::Enforcement,
+    ) {
+        return reject_owner_webauthn_revoke_credential_finish(
+            "anchor_update_failed",
+            Some(e.to_string()),
+        );
+    }
+    let bytes =
+        household_rs::cbor::to_canonical_vec(&OwnerWebauthnRevokeCredentialFinishResponse {
+            version: 1,
+            active_credential_count,
+        })
+        .unwrap_or_default();
     cbor_response(StatusCode::OK, bytes)
 }
 

@@ -229,6 +229,31 @@ pub async fn authorize_owner_webauthn_revoke_credential_start_request(
     .await
 }
 
+/// Authorize the owner passkey revoke finish surface.
+///
+/// This proves current owner identity and fresh body-bound
+/// proof-of-possession. The embedded `WebAuthn` assertion is still the
+/// high-value step-up proof for the revoke mutation itself.
+pub async fn authorize_owner_webauthn_revoke_credential_finish_request(
+    state: &HouseholdState,
+    headers: &HeaderMap,
+    method: &Method,
+    path_and_query: &str,
+    body: &[u8],
+    now: u64,
+) -> Result<Arc<HouseholdAuthState>, AuthError> {
+    authorize_owner_only_pop_request(
+        state,
+        headers,
+        method,
+        path_and_query,
+        body,
+        now,
+        "OwnerWebauthnRevokeCredentialFinish",
+    )
+    .await
+}
+
 async fn authorize_owner_only_pop_request(
     state: &HouseholdState,
     headers: &HeaderMap,

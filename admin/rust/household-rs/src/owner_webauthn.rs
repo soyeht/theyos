@@ -648,6 +648,20 @@ impl OwnerWebauthnRp {
         context_binding.require_context(submitted_context)?;
         credential.apply_authentication_result(&result)
     }
+
+    pub fn require_owner_approval_challenge_context(
+        &mut self,
+        now_unix: u64,
+        challenge_id: &OwnerWebauthnChallengeId,
+        submitted_context: &OwnerApprovalContextV2,
+    ) -> Result<(), OwnerWebauthnError> {
+        let stored_challenge = self.challenges.authentication(challenge_id, now_unix)?;
+        let context_binding = stored_challenge
+            .context_binding
+            .as_ref()
+            .ok_or(OwnerWebauthnError::ChallengeContextMissing)?;
+        context_binding.require_context(submitted_context)
+    }
 }
 
 pub fn validate_next_sign_count(previous: u32, next: u32) -> Result<(), OwnerWebauthnError> {
