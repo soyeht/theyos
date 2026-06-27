@@ -40,6 +40,21 @@ struct OwnerWebauthnRegistrationFinishResponse {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+struct OwnerWebauthnRegistrationStatusRequest {
+    #[serde(rename = "v")]
+    version: u8,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OwnerWebauthnRegistrationStatusResponse {
+    #[serde(rename = "v")]
+    version: u8,
+    enrolled: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct GenericError {
     #[serde(rename = "v")]
     version: u8,
@@ -54,6 +69,8 @@ struct Fixture {
     start_responses: Vec<VectorCase>,
     finish_requests: Vec<VectorCase>,
     finish_responses: Vec<FinishResponseVector>,
+    status_requests: Vec<VectorCase>,
+    status_responses: Vec<VectorCase>,
     registration_rejects: Vec<RejectVector>,
 }
 
@@ -253,6 +270,39 @@ fn owner_webauthn_registration_finish_response_vectors_are_canonical() {
             vector.id,
         );
     }
+}
+
+#[test]
+fn owner_webauthn_registration_status_vectors_are_canonical() {
+    let fixture = load_fixture();
+    assert_eq!(fixture.status_requests.len(), 1);
+    assert_eq!(fixture.status_responses.len(), 2);
+
+    for vector in &fixture.status_requests {
+        let typed: OwnerWebauthnRegistrationStatusRequest =
+            serde_json::from_value(vector.input.clone()).unwrap();
+        assert_canonical_round_trip(vector, &typed);
+    }
+
+    for vector in &fixture.status_responses {
+        let typed: OwnerWebauthnRegistrationStatusResponse =
+            serde_json::from_value(vector.input.clone()).unwrap();
+        assert_canonical_round_trip(vector, &typed);
+    }
+
+    let never_enrolled = case_by_id(&fixture.status_responses, "status-response-never-enrolled");
+    assert_eq!(
+        never_enrolled
+            .input
+            .get("enrolled")
+            .and_then(Value::as_bool),
+        Some(false),
+    );
+    let enrolled = case_by_id(&fixture.status_responses, "status-response-enrolled");
+    assert_eq!(
+        enrolled.input.get("enrolled").and_then(Value::as_bool),
+        Some(true),
+    );
 }
 
 #[test]

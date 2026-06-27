@@ -167,6 +167,52 @@ pub async fn authorize_owner_auth_enroll_initial_request(
     body: &[u8],
     now: u64,
 ) -> Result<Arc<HouseholdAuthState>, AuthError> {
+    authorize_owner_only_pop_request(
+        state,
+        headers,
+        method,
+        path_and_query,
+        body,
+        now,
+        "OwnerAuthEnrollInitial",
+    )
+    .await
+}
+
+/// Authorize the owner passkey enrollment status surface.
+///
+/// Status is a read-only E1 helper, so it proves only owner identity and fresh
+/// body-bound proof-of-possession. It intentionally does not check a delegable
+/// caveat and does not reuse the enrollment operation label.
+pub async fn authorize_owner_webauthn_registration_status_request(
+    state: &HouseholdState,
+    headers: &HeaderMap,
+    method: &Method,
+    path_and_query: &str,
+    body: &[u8],
+    now: u64,
+) -> Result<Arc<HouseholdAuthState>, AuthError> {
+    authorize_owner_only_pop_request(
+        state,
+        headers,
+        method,
+        path_and_query,
+        body,
+        now,
+        "OwnerWebauthnRegistrationStatus",
+    )
+    .await
+}
+
+async fn authorize_owner_only_pop_request(
+    state: &HouseholdState,
+    headers: &HeaderMap,
+    method: &Method,
+    path_and_query: &str,
+    body: &[u8],
+    now: u64,
+    operation_label: &'static str,
+) -> Result<Arc<HouseholdAuthState>, AuthError> {
     let pop = SoyehtPoP::parse(headers).inspect_err(log_rejected)?;
     let skew = now.abs_diff(pop.timestamp);
     if skew > TIMESTAMP_TOLERANCE_SECS {
@@ -208,7 +254,7 @@ pub async fn authorize_owner_auth_enroll_initial_request(
     tracing::info!(
         stage = "household_auth.pop.accepted",
         p_id = %pop.p_id,
-        operation = %Operation::OwnerAuthEnrollInitial,
+        operation = operation_label,
     );
     Ok(owner_auth)
 }

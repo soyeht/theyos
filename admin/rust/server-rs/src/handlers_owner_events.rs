@@ -5,7 +5,9 @@
 //! Module skeleton committed in T006 of the Phase 3 task list. Endpoint
 //! implementations arrive in T047–T057.
 
-use std::path::PathBuf;
+use std::fs;
+use std::io::ErrorKind;
+use std::path::{Path as FsPath, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -29,8 +31,9 @@ use household_rs::owner_webauthn::{
     OwnerWebauthnChallengeId, OwnerWebauthnCredentialStore, OwnerWebauthnRp,
 };
 use household_rs::owner_webauthn_anchor::{
-    OwnerWebauthnAnchorMode, OwnerWebauthnAnchorStatus,
-    verify_or_update_owner_webauthn_authority_anchor,
+    OwnerWebauthnAnchorError, OwnerWebauthnAnchorMode, OwnerWebauthnAnchorStatus,
+    OwnerWebauthnAuthorityHead, classify_owner_webauthn_authority_anchor_read_only,
+    verified_owner_webauthn_authority_head, verify_or_update_owner_webauthn_authority_anchor,
 };
 use household_rs::pair_machine::{
     CeremonyError, CeremonyInputs, CeremonyTxn, FinalizeWithM2Options, FinalizeWithM2Outcome,
@@ -541,6 +544,34 @@ struct OwnerWebauthnRegistrationFinishResponse {
     active_credential_count: u64,
 }
 
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct OwnerWebauthnRegistrationStatusRequest {
+    #[serde(rename = "v")]
+    version: u8,
+}
+
+#[derive(Serialize)]
+struct OwnerWebauthnRegistrationStatusResponse {
+    #[serde(rename = "v")]
+    version: u8,
+    enrolled: bool,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OwnerWebauthnInitialEnrollmentAnchorMarker {
+    #[serde(rename = "v")]
+    version: u8,
+    purpose: String,
+    hh_id: household_rs::HouseholdId,
+    owner_p_id: household_rs::PersonId,
+    credential_id: ByteBuf,
+    authority_head_sequence: u64,
+    authority_head_hash: ByteBuf,
+    active_credential_count: u64,
+}
+
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct OwnerApprovalV2Finish {
@@ -784,6 +815,177 @@ fn owner_webauthn_user_uuid(owner_auth: &household_rs::HouseholdAuthState) -> Uu
     Uuid::from_bytes(bytes)
 }
 
+const INITIAL_ENROLLMENT_MARKER_VERSION: u8 = 1;
+const INITIAL_ENROLLMENT_MARKER_PURPOSE: &str = "owner-webauthn-initial-enrollment-anchor-pending";
+
+fn owner_webauthn_initial_enrollment_marker_path(state_dir: &FsPath) -> PathBuf {
+    household_rs::storage::household_dir(state_dir)
+        .join("owner_webauthn_initial_enrollment_anchor_pending.cbor")
+}
+
+fn write_owner_webauthn_initial_enrollment_marker(
+    state_dir: &FsPath,
+    marker: &OwnerWebauthnInitialEnrollmentAnchorMarker,
+) -> Result<(), String> {
+    household_rs::storage::atomic_write_cbor(
+        &owner_webauthn_initial_enrollment_marker_path(state_dir),
+        marker,
+    )
+    .map_err(|e| e.to_string())
+}
+
+fn read_owner_webauthn_initial_enrollment_marker(
+    state_dir: &FsPath,
+) -> Result<Option<OwnerWebauthnInitialEnrollmentAnchorMarker>, String> {
+    household_rs::storage::read_optional_cbor(&owner_webauthn_initial_enrollment_marker_path(
+        state_dir,
+    ))
+    .map_err(|e| e.to_string())
+}
+
+fn clear_owner_webauthn_initial_enrollment_marker(state_dir: &FsPath) -> Result<(), String> {
+    let path = owner_webauthn_initial_enrollment_marker_path(state_dir);
+    match fs::remove_file(&path) {
+        Ok(()) => {
+            if let Some(parent) = path.parent() {
+                if let Ok(dir) = fs::File::open(parent) {
+                    let _ = dir.sync_all();
+                }
+            }
+            Ok(())
+        }
+        Err(e) if e.kind() == ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(format!("{}: {e}", path.display())),
+    }
+}
+
+fn initial_enrollment_marker_for(
+    identity: &household_rs::LoadedIdentity,
+    owner_auth: &household_rs::HouseholdAuthState,
+    credential_id: ByteBuf,
+    head: &OwnerWebauthnAuthorityHead,
+    active_credential_count: u64,
+) -> Result<OwnerWebauthnInitialEnrollmentAnchorMarker, String> {
+    if head.sequence != 0 {
+        return Err("initial enrollment marker requires genesis sequence".into());
+    }
+    if active_credential_count != 1 {
+        return Err("initial enrollment marker requires one active credential".into());
+    }
+    Ok(OwnerWebauthnInitialEnrollmentAnchorMarker {
+        version: INITIAL_ENROLLMENT_MARKER_VERSION,
+        purpose: INITIAL_ENROLLMENT_MARKER_PURPOSE.to_string(),
+        hh_id: identity.record.hh_id.clone(),
+        owner_p_id: owner_auth.owner_person_cert.p_id.clone(),
+        credential_id,
+        authority_head_sequence: head.sequence,
+        authority_head_hash: ByteBuf::from(head.head_hash.to_vec()),
+        active_credential_count,
+    })
+}
+
+fn marker_matches_initial_enrollment(
+    marker: &OwnerWebauthnInitialEnrollmentAnchorMarker,
+    identity: &household_rs::LoadedIdentity,
+    owner_auth: &household_rs::HouseholdAuthState,
+    head: &OwnerWebauthnAuthorityHead,
+) -> bool {
+    if marker.version != INITIAL_ENROLLMENT_MARKER_VERSION
+        || marker.purpose != INITIAL_ENROLLMENT_MARKER_PURPOSE
+        || marker.hh_id != identity.record.hh_id
+        || marker.owner_p_id != owner_auth.owner_person_cert.p_id
+        || marker.authority_head_sequence != head.sequence
+        || marker.authority_head_hash.as_ref() != head.head_hash.as_slice()
+        || marker.authority_head_sequence != 0
+        || marker.active_credential_count != 1
+    {
+        return false;
+    }
+
+    let Ok(credentials) = owner_auth.owner_webauthn_credentials(&identity.record) else {
+        return false;
+    };
+    if credentials.active_count() != usize::try_from(marker.active_credential_count).unwrap_or(0) {
+        return false;
+    }
+    let marker_credential_is_active = credentials
+        .active_credentials()
+        .iter()
+        .any(|credential| credential.credential_id_bytes() == marker.credential_id.as_ref());
+    if !marker_credential_is_active {
+        return false;
+    }
+
+    let Some(first_entry) = owner_auth.owner_webauthn.entries().first() else {
+        return false;
+    };
+    if first_entry.event.sequence != 0 {
+        return false;
+    }
+    match &first_entry.event.action {
+        household_rs::owner_webauthn_authority::OwnerWebauthnCredentialEventAction::Add {
+            credential,
+        } => credential.credential_id_bytes() == marker.credential_id.as_ref(),
+        household_rs::owner_webauthn_authority::OwnerWebauthnCredentialEventAction::Revoke {
+            ..
+        } => false,
+    }
+}
+
+fn marker_backed_initial_enrollment_committed(
+    state: &OwnerEventsRouterState,
+    identity: &household_rs::LoadedIdentity,
+    owner_auth: &household_rs::HouseholdAuthState,
+) -> Result<bool, String> {
+    let Some(marker) = read_owner_webauthn_initial_enrollment_marker(&state.state_dir)? else {
+        return Ok(false);
+    };
+    let Some(head) = verified_owner_webauthn_authority_head(
+        &owner_auth.owner_webauthn,
+        &identity.record,
+        &owner_auth.owner_person_cert,
+    )
+    .map_err(|e| e.to_string())?
+    else {
+        return Ok(false);
+    };
+    Ok(marker_matches_initial_enrollment(
+        &marker, identity, owner_auth, &head,
+    ))
+}
+
+fn owner_webauthn_registration_status(
+    state: &OwnerEventsRouterState,
+    identity: &household_rs::LoadedIdentity,
+    owner_auth: &household_rs::HouseholdAuthState,
+) -> Result<bool, &'static str> {
+    let Some(verifier) = state.owner_webauthn_anchor.as_ref() else {
+        return Err("missing_anchor_verifier");
+    };
+    match classify_owner_webauthn_authority_anchor_read_only(
+        verifier.keystore.as_ref(),
+        &owner_auth.owner_webauthn,
+        &identity.record,
+        &owner_auth.owner_person_cert,
+    ) {
+        Ok(OwnerWebauthnAnchorStatus::EmptyAuthorityNoAnchor) => Ok(false),
+        Ok(
+            OwnerWebauthnAnchorStatus::Verified { .. } | OwnerWebauthnAnchorStatus::Advanced { .. },
+        ) => Ok(true),
+        Ok(OwnerWebauthnAnchorStatus::Migrated { .. }) => Err("unexpected_anchor_migration"),
+        Err(OwnerWebauthnAnchorError::MissingAnchor) => {
+            if marker_backed_initial_enrollment_committed(state, identity, owner_auth)
+                .map_err(|_| "marker_read_failed")?
+            {
+                Ok(true)
+            } else {
+                Err("missing_anchor")
+            }
+        }
+        Err(_) => Err("credential_anchor_invalid"),
+    }
+}
+
 fn reject_owner_webauthn_registration(reason: &'static str, error: Option<String>) -> Response {
     if let Some(error) = error {
         tracing::warn!(
@@ -852,6 +1054,77 @@ fn require_owner_webauthn_never_enrolled_for_initial_enrollment(
         OwnerWebauthnTrustState::RecoveryRequired => Err("credential_recovery_required"),
         OwnerWebauthnTrustState::AnchorInvalid => Err("credential_anchor_invalid"),
     }
+}
+
+/// `POST /api/v1/household/owner-webauthn/registration/status`.
+///
+/// Owner-authenticated enrollment status for the iOS E1 flow. This endpoint is
+/// intentionally narrow: it reports only whether the first owner passkey is
+/// committed, and it never migrates or repairs the rollback anchor from the read
+/// path. The marker fallback covers only the post-save/pre-anchor window in
+/// `owner_webauthn_registration_finish_handler`.
+pub async fn owner_webauthn_registration_status_handler(
+    State(state): State<OwnerEventsRouterState>,
+    method: Method,
+    uri: Uri,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let Some(now) = time_util::unix_now_secs_checked("owner_events.owner_webauthn_status.clock")
+    else {
+        return unauthenticated_response();
+    };
+    let path_and_query = uri
+        .path_and_query()
+        .map_or_else(|| uri.path().to_string(), |pq| pq.as_str().to_string());
+    let authorized_owner_auth =
+        match household_auth::authorize_owner_webauthn_registration_status_request(
+            &state.household,
+            &headers,
+            &method,
+            &path_and_query,
+            &body,
+            now,
+        )
+        .await
+        {
+            Ok(owner_auth) => owner_auth,
+            Err(e) => {
+                return reject_owner_webauthn_registration("pop_auth_failed", Some(e.to_string()));
+            }
+        };
+
+    let request: OwnerWebauthnRegistrationStatusRequest = match decode_canonical_cbor(&body) {
+        Ok(request) => request,
+        Err(e) => return reject_owner_webauthn_registration("cbor_decode", Some(e)),
+    };
+    if request.version != 1 {
+        return reject_owner_webauthn_registration("bad_version", None);
+    }
+
+    let _mutation_guard = crate::bootstrap_mutation_lock::BOOTSTRAP_MUTATION_LOCK
+        .lock()
+        .await;
+    let Some(identity) = state.household.current().await else {
+        return reject_owner_webauthn_registration("identity_unavailable", None);
+    };
+    let Some(current_owner_auth) = state.household.current_owner_auth().await else {
+        return reject_owner_webauthn_registration("owner_auth_unavailable", None);
+    };
+    if current_owner_auth.owner_person_cert.p_id != authorized_owner_auth.owner_person_cert.p_id {
+        return reject_owner_webauthn_registration("owner_auth_changed", None);
+    }
+    let enrolled =
+        match owner_webauthn_registration_status(&state, &identity, current_owner_auth.as_ref()) {
+            Ok(enrolled) => enrolled,
+            Err(reason) => return reject_owner_webauthn_registration(reason, None),
+        };
+    let bytes = household_rs::cbor::to_canonical_vec(&OwnerWebauthnRegistrationStatusResponse {
+        version: 1,
+        enrolled,
+    })
+    .unwrap_or_default();
+    cbor_response(StatusCode::OK, bytes)
 }
 
 /// `POST /api/v1/household/owner-webauthn/registration/start`.
@@ -1062,6 +1335,32 @@ pub async fn owner_webauthn_registration_finish_handler(
             );
         }
     };
+    let authority_head = match verified_owner_webauthn_authority_head(
+        &next_auth.owner_webauthn,
+        &identity.record,
+        &next_auth.owner_person_cert,
+    ) {
+        Ok(Some(head)) => head,
+        Ok(None) => return reject_owner_webauthn_registration("authority_head_missing", None),
+        Err(e) => {
+            return reject_owner_webauthn_registration(
+                "authority_head_failed",
+                Some(e.to_string()),
+            );
+        }
+    };
+    let pending_marker = match initial_enrollment_marker_for(
+        &identity,
+        &next_auth,
+        credential_id.clone(),
+        &authority_head,
+        active_credential_count,
+    ) {
+        Ok(marker) => marker,
+        Err(e) => {
+            return reject_owner_webauthn_registration("anchor_marker_invalid", Some(e));
+        }
+    };
 
     // `household_auth_state.cbor` is the durable log commit point. Advance the
     // rollback anchor only after this file is safely persisted, otherwise the
@@ -1076,6 +1375,11 @@ pub async fn owner_webauthn_registration_finish_handler(
         .household
         .set_owner_auth(Arc::new(next_auth.clone()))
         .await;
+    if let Err(e) =
+        write_owner_webauthn_initial_enrollment_marker(&state.state_dir, &pending_marker)
+    {
+        return reject_owner_webauthn_registration("anchor_marker_write_failed", Some(e));
+    }
     if let Err(e) = verify_or_update_owner_webauthn_authority_anchor(
         anchor.keystore.as_ref(),
         &next_auth.owner_webauthn,
@@ -1084,6 +1388,9 @@ pub async fn owner_webauthn_registration_finish_handler(
         OwnerWebauthnAnchorMode::MigrationDefaultOff,
     ) {
         return reject_owner_webauthn_registration("anchor_update_failed", Some(e.to_string()));
+    }
+    if let Err(e) = clear_owner_webauthn_initial_enrollment_marker(&state.state_dir) {
+        return reject_owner_webauthn_registration("anchor_marker_clear_failed", Some(e));
     }
     let bytes = household_rs::cbor::to_canonical_vec(&OwnerWebauthnRegistrationFinishResponse {
         version: 1,

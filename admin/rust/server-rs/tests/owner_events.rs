@@ -29,7 +29,8 @@ use household_rs::owner_events::{
 use household_rs::owner_webauthn::{OwnerWebauthnConfig, OwnerWebauthnCredential, OwnerWebauthnRp};
 use household_rs::owner_webauthn_anchor::{
     OwnerWebauthnAnchorMode, OwnerWebauthnAuthorityAnchor, read_owner_webauthn_authority_anchor,
-    verify_or_update_owner_webauthn_authority_anchor, write_owner_webauthn_authority_anchor,
+    verified_owner_webauthn_authority_head, verify_or_update_owner_webauthn_authority_anchor,
+    write_owner_webauthn_authority_anchor,
 };
 use household_rs::owner_webauthn_authority::{
     OwnerWebauthnAuthority, OwnerWebauthnCredentialEventAction,
@@ -68,6 +69,38 @@ use webauthn_rs::prelude::{
 };
 
 const OWNER_EVENTS_PATH: &str = "/api/v1/household/owner-events";
+
+type OwnerEventsRouterFixture = (
+    TempDir,
+    Router,
+    Arc<OwnerEventLog>,
+    OwnerEventsBroadcaster,
+    P256Keypair,
+    Arc<household_rs::LoadedIdentity>,
+    Arc<PairMachineWindow>,
+);
+
+type V2OwnerRouterFixture = (
+    TempDir,
+    Router,
+    Arc<OwnerEventLog>,
+    OwnerEventsBroadcaster,
+    P256Keypair,
+    Arc<household_rs::LoadedIdentity>,
+    Arc<PairMachineWindow>,
+    WebauthnAuthenticator<SoftPasskey>,
+);
+
+type OwnerWebauthnRegistrationRouterFixture = (
+    TempDir,
+    Router,
+    Arc<OwnerEventLog>,
+    OwnerEventsBroadcaster,
+    P256Keypair,
+    Arc<household_rs::LoadedIdentity>,
+    Arc<PairMachineWindow>,
+    Arc<dyn keystore_rs::KeystoreBackend>,
+);
 
 #[derive(Default)]
 struct SpyTransport {
@@ -231,6 +264,32 @@ struct OwnerWebauthnRegistrationFinishResponse {
     active_credential_count: u64,
 }
 
+#[derive(serde::Serialize)]
+struct OwnerWebauthnRegistrationStatusRequest {
+    #[serde(rename = "v")]
+    version: u8,
+}
+
+#[derive(Deserialize)]
+struct OwnerWebauthnRegistrationStatusResponse {
+    #[serde(rename = "v")]
+    version: u8,
+    enrolled: bool,
+}
+
+#[derive(serde::Serialize)]
+struct TestInitialEnrollmentAnchorMarker {
+    #[serde(rename = "v")]
+    version: u8,
+    purpose: String,
+    hh_id: household_rs::HouseholdId,
+    owner_p_id: household_rs::PersonId,
+    credential_id: ByteBuf,
+    authority_head_sequence: u64,
+    authority_head_hash: ByteBuf,
+    active_credential_count: u64,
+}
+
 fn assert_generic_unauth(status: StatusCode, resp_bytes: &[u8]) {
     assert_eq!(status, StatusCode::UNAUTHORIZED);
     let parsed: GenericUnauth = household_rs::cbor::from_canonical_slice(resp_bytes).unwrap();
@@ -319,6 +378,10 @@ fn router_from_owner_auth(
         .route(
             "/api/v1/household/owner-webauthn/registration/finish",
             post(handlers_owner_events::owner_webauthn_registration_finish_handler),
+        )
+        .route(
+            "/api/v1/household/owner-webauthn/registration/status",
+            post(handlers_owner_events::owner_webauthn_registration_status_handler),
         )
         .route(
             "/api/v1/household/owner-events/{cursor}/approval-v2/start",
@@ -571,18 +634,60 @@ fn owner_auth_with_revoked_webauthn_credential(
     (owner_auth, person, rp)
 }
 
-fn router_with_v2_owner(
-    timeout: Duration,
+fn owner_auth_with_two_webauthn_credentials(
+    identity: &household_rs::LoadedIdentity,
 ) -> (
-    TempDir,
-    Router,
-    Arc<OwnerEventLog>,
-    OwnerEventsBroadcaster,
+    household_rs::HouseholdAuthState,
     P256Keypair,
-    Arc<household_rs::LoadedIdentity>,
-    Arc<PairMachineWindow>,
+    OwnerWebauthnRp,
     WebauthnAuthenticator<SoftPasskey>,
 ) {
+    let (mut owner_auth, person, mut rp, authenticator) =
+        owner_auth_with_webauthn_credential(identity);
+    let actor_credential_id = owner_auth
+        .owner_webauthn
+        .reconstruct(&identity.record, &owner_auth.owner_person_cert)
+        .unwrap()
+        .credentials()
+        .first()
+        .expect("genesis credential exists")
+        .credential_id_bytes()
+        .to_vec();
+    let previous = owner_auth
+        .owner_webauthn
+        .entries()
+        .last()
+        .expect("genesis event exists")
+        .clone();
+    let (credential, _second_authenticator) = register_owner_softpasskey(&mut rp);
+    let add = OwnerWebauthnAuthority::sign_append(
+        identity
+            .hh_priv
+            .as_deref()
+            .expect("hh_priv present in single-machine household"),
+        &identity.record,
+        &owner_auth.owner_person_cert,
+        &previous,
+        &actor_credential_id,
+        OwnerWebauthnCredentialEventAction::Add {
+            credential: Box::new(credential),
+        },
+        unix_now(),
+    )
+    .unwrap();
+    owner_auth.owner_webauthn.push_signed(add);
+    owner_auth.updated_at = unix_now();
+    assert_eq!(
+        owner_auth
+            .owner_webauthn_credentials(&identity.record)
+            .unwrap()
+            .active_count(),
+        2
+    );
+    (owner_auth, person, rp, authenticator)
+}
+
+fn router_with_v2_owner(timeout: Duration) -> V2OwnerRouterFixture {
     let td = tempfile::tempdir().unwrap();
     let identity = Arc::new(bootstrap(td.path()));
     let (owner_auth, person, rp, authenticator) = owner_auth_with_webauthn_credential(&identity);
@@ -618,18 +723,7 @@ fn router_with_v2_owner(
     )
 }
 
-fn router_with_v2_owner_without_hh_priv(
-    timeout: Duration,
-) -> (
-    TempDir,
-    Router,
-    Arc<OwnerEventLog>,
-    OwnerEventsBroadcaster,
-    P256Keypair,
-    Arc<household_rs::LoadedIdentity>,
-    Arc<PairMachineWindow>,
-    WebauthnAuthenticator<SoftPasskey>,
-) {
+fn router_with_v2_owner_without_hh_priv(timeout: Duration) -> V2OwnerRouterFixture {
     let td = tempfile::tempdir().unwrap();
     let identity = bootstrap(td.path());
     let (owner_auth, person, rp, authenticator) = owner_auth_with_webauthn_credential(&identity);
@@ -666,17 +760,7 @@ fn router_with_v2_owner_without_hh_priv(
     )
 }
 
-fn router_with_v2_policy_without_passkey(
-    timeout: Duration,
-) -> (
-    TempDir,
-    Router,
-    Arc<OwnerEventLog>,
-    OwnerEventsBroadcaster,
-    P256Keypair,
-    Arc<household_rs::LoadedIdentity>,
-    Arc<PairMachineWindow>,
-) {
+fn router_with_v2_policy_without_passkey(timeout: Duration) -> OwnerEventsRouterFixture {
     let td = tempfile::tempdir().unwrap();
     let identity = Arc::new(bootstrap(td.path()));
     let (owner_auth, person) = owner_auth_for(&identity);
@@ -693,16 +777,7 @@ fn router_with_v2_policy_without_passkey(
 
 fn router_with_owner_webauthn_registration(
     timeout: Duration,
-) -> (
-    TempDir,
-    Router,
-    Arc<OwnerEventLog>,
-    OwnerEventsBroadcaster,
-    P256Keypair,
-    Arc<household_rs::LoadedIdentity>,
-    Arc<PairMachineWindow>,
-    Arc<dyn keystore_rs::KeystoreBackend>,
-) {
+) -> OwnerWebauthnRegistrationRouterFixture {
     let td = tempfile::tempdir().unwrap();
     let anchor_store: Arc<dyn keystore_rs::KeystoreBackend> =
         Arc::new(FileKeystore::new(td.path(), keystore_rs::SERVICE));
@@ -713,16 +788,7 @@ fn router_with_owner_webauthn_registration_anchor(
     timeout: Duration,
     td: TempDir,
     anchor_store: Arc<dyn keystore_rs::KeystoreBackend>,
-) -> (
-    TempDir,
-    Router,
-    Arc<OwnerEventLog>,
-    OwnerEventsBroadcaster,
-    P256Keypair,
-    Arc<household_rs::LoadedIdentity>,
-    Arc<PairMachineWindow>,
-    Arc<dyn keystore_rs::KeystoreBackend>,
-) {
+) -> OwnerWebauthnRegistrationRouterFixture {
     let identity = Arc::new(bootstrap(td.path()));
     let (owner_auth, person) = owner_auth_for(&identity);
     let rp = owner_webauthn_rp();
@@ -1279,6 +1345,16 @@ async fn owner_webauthn_registration_start_fails_closed_without_rp_or_anchor() {
 }
 
 #[tokio::test]
+async fn owner_webauthn_registration_status_fails_closed_without_anchor_verifier() {
+    let (_td, router, _log, _broadcaster, person, _identity, _window) =
+        router_with_state(Duration::from_secs(45));
+
+    let (status, _headers, resp_bytes) = post_registration_status(router, &person).await;
+
+    assert_generic_unauth(status, &resp_bytes);
+}
+
+#[tokio::test]
 async fn owner_webauthn_registration_rejects_wrong_person_pop() {
     let (_td, router, _log, _broadcaster, person, identity, _window, _anchor_store) =
         router_with_owner_webauthn_registration(Duration::from_secs(45));
@@ -1322,6 +1398,11 @@ async fn owner_webauthn_registration_rejects_wrong_person_pop() {
         .unwrap();
     let (status, _headers, resp_bytes) =
         post_cbor(router, finish_uri, finish_body, Some(&wrong_person)).await;
+    assert_generic_unauth(status, &resp_bytes);
+
+    let (_td, router, _log, _broadcaster, _person, _identity, _window, _anchor_store) =
+        router_with_owner_webauthn_registration(Duration::from_secs(45));
+    let (status, _headers, resp_bytes) = post_registration_status(router, &wrong_person).await;
     assert_generic_unauth(status, &resp_bytes);
 }
 
@@ -1378,14 +1459,12 @@ async fn owner_webauthn_registration_finish_body(router: Router, person: &P256Ke
             start.options,
         )
         .unwrap();
-    let finish_body =
-        household_rs::cbor::to_canonical_vec(&OwnerWebauthnRegistrationFinishRequest {
-            version: 1,
-            challenge_id: start.challenge_id,
-            credential,
-        })
-        .unwrap();
-    finish_body
+    household_rs::cbor::to_canonical_vec(&OwnerWebauthnRegistrationFinishRequest {
+        version: 1,
+        challenge_id: start.challenge_id,
+        credential,
+    })
+    .unwrap()
 }
 
 async fn enroll_first_owner_passkey(
@@ -1402,6 +1481,140 @@ async fn enroll_first_owner_passkey(
         "application/cbor"
     );
     household_rs::cbor::from_canonical_slice(&resp_bytes).unwrap()
+}
+
+fn registration_status_marker_path(state_dir: &std::path::Path) -> std::path::PathBuf {
+    household_rs::storage::household_dir(state_dir)
+        .join("owner_webauthn_initial_enrollment_anchor_pending.cbor")
+}
+
+fn registration_status_body() -> Vec<u8> {
+    household_rs::cbor::to_canonical_vec(&OwnerWebauthnRegistrationStatusRequest { version: 1 })
+        .unwrap()
+}
+
+async fn post_registration_status(
+    router: Router,
+    person: &P256Keypair,
+) -> (StatusCode, HeaderMap, Vec<u8>) {
+    let uri = "/api/v1/household/owner-webauthn/registration/status";
+    post_cbor(router, uri, registration_status_body(), Some(person)).await
+}
+
+async fn registration_status(
+    router: Router,
+    person: &P256Keypair,
+) -> OwnerWebauthnRegistrationStatusResponse {
+    let (status, headers, bytes) = post_registration_status(router, person).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        headers.get(header::CONTENT_TYPE).unwrap(),
+        "application/cbor"
+    );
+    let response: OwnerWebauthnRegistrationStatusResponse =
+        household_rs::cbor::from_canonical_slice(&bytes).unwrap();
+    assert_eq!(response.version, 1);
+    response
+}
+
+fn write_test_initial_enrollment_marker(
+    state_dir: &std::path::Path,
+    marker: &TestInitialEnrollmentAnchorMarker,
+) {
+    household_rs::storage::atomic_write_cbor(&registration_status_marker_path(state_dir), marker)
+        .unwrap();
+}
+
+fn source_segment<'a>(source: &'a str, start: &str, end: &str) -> &'a str {
+    let start_index = source.find(start).expect("source start marker present");
+    let rest = &source[start_index..];
+    let end_index = rest.find(end).expect("source end marker present");
+    &rest[..end_index]
+}
+
+#[test]
+fn owner_webauthn_registration_status_source_guards_read_only_contract() {
+    let source = include_str!("../src/handlers_owner_events.rs");
+    let status_classifier = source_segment(
+        source,
+        "fn owner_webauthn_registration_status(",
+        "fn reject_owner_webauthn_registration",
+    );
+    assert!(status_classifier.contains("classify_owner_webauthn_authority_anchor_read_only"));
+    assert!(!status_classifier.contains("verify_or_update_owner_webauthn_authority_anchor"));
+    assert!(!status_classifier.contains("OwnerWebauthnAnchorMode::MigrationDefaultOff"));
+
+    let status_handler = source_segment(
+        source,
+        "pub async fn owner_webauthn_registration_status_handler(",
+        "/// `POST /api/v1/household/owner-webauthn/registration/start`",
+    );
+    assert!(status_handler.contains("authorize_owner_webauthn_registration_status_request"));
+    assert!(!status_handler.contains("authorize_owner_auth_enroll_initial_request"));
+    assert!(!status_handler.contains("HouseholdAddMachine"));
+
+    let pair_machine_policy = source_segment(
+        source,
+        "fn pair_machine_owner_webauthn_policy_snapshot(",
+        "fn parse_pair_machine_approval_body(",
+    );
+    assert!(!pair_machine_policy.contains("marker_backed_initial_enrollment_committed"));
+}
+
+#[tokio::test]
+async fn owner_webauthn_registration_status_reports_never_enrolled() {
+    let (_td, router, _log, _broadcaster, person, _identity, _window, _anchor_store) =
+        router_with_owner_webauthn_registration(Duration::from_secs(45));
+
+    let status = registration_status(router, &person).await;
+
+    assert!(!status.enrolled);
+}
+
+#[tokio::test]
+async fn owner_webauthn_registration_status_reports_read_only_advanced_without_anchor_write() {
+    let td = tempfile::tempdir().unwrap();
+    let identity = Arc::new(bootstrap(td.path()));
+    let (owner_auth, person, rp, _authenticator) =
+        owner_auth_with_two_webauthn_credentials(&identity);
+    let first_entry = owner_auth
+        .owner_webauthn
+        .entries()
+        .first()
+        .expect("genesis event exists");
+    let first_hash = first_entry.entry_hash().unwrap();
+    let first_anchor = OwnerWebauthnAuthorityAnchor::new(
+        &identity.record,
+        &owner_auth.owner_person_cert,
+        0,
+        first_hash,
+    );
+    let anchor_store: Arc<dyn keystore_rs::KeystoreBackend> =
+        Arc::new(FileKeystore::new(td.path(), keystore_rs::SERVICE));
+    write_owner_webauthn_authority_anchor(anchor_store.as_ref(), &first_anchor).unwrap();
+    let (_td, router, _log, _broadcaster, person, identity, _window) =
+        router_from_owner_auth(td, identity, owner_auth, person, Duration::from_secs(45), {
+            let anchor_store = Arc::clone(&anchor_store);
+            move |state| {
+                state
+                    .with_owner_webauthn_rp(rp)
+                    .with_owner_webauthn_anchor(anchor_store)
+            }
+        });
+
+    let status = registration_status(router, &person).await;
+
+    assert!(status.enrolled);
+    let anchor =
+        read_owner_webauthn_authority_anchor(anchor_store.as_ref(), &identity.record.hh_id)
+            .unwrap()
+            .expect("anchor remains present");
+    assert_eq!(
+        anchor.sequence(),
+        0,
+        "status must classify anchor lag without advancing the durable anchor"
+    );
+    assert_eq!(anchor.head_hash(), first_hash);
 }
 
 #[tokio::test]
@@ -1438,6 +1651,48 @@ async fn owner_webauthn_registration_round_trip_persists_genesis_and_anchor() {
         OwnerWebauthnAnchorMode::Enforcement,
     )
     .expect("anchor accepts persisted genesis");
+    let status = registration_status(router, &person).await;
+    assert!(status.enrolled);
+    assert!(
+        !registration_status_marker_path(td.path()).exists(),
+        "successful anchor update clears the transient status marker"
+    );
+}
+
+#[tokio::test]
+async fn owner_webauthn_registration_status_verified_authority_ignores_stale_marker() {
+    let (td, router, _log, _broadcaster, person, identity, _window, anchor_store) =
+        router_with_owner_webauthn_registration(Duration::from_secs(45));
+    let finish = enroll_first_owner_passkey(router.clone(), &person).await;
+    let stale_marker = TestInitialEnrollmentAnchorMarker {
+        version: 1,
+        purpose: "wrong-purpose".into(),
+        hh_id: identity.record.hh_id.clone(),
+        owner_p_id: household_rs::derive_person_id(&P256Keypair::generate().public()),
+        credential_id: ByteBuf::from(vec![0xde, 0xad, 0xbe, 0xef]),
+        authority_head_sequence: 0,
+        authority_head_hash: ByteBuf::from(vec![0x55; 32]),
+        active_credential_count: 1,
+    };
+    write_test_initial_enrollment_marker(td.path(), &stale_marker);
+    let before =
+        read_owner_webauthn_authority_anchor(anchor_store.as_ref(), &identity.record.hh_id)
+            .unwrap()
+            .expect("successful enrollment wrote anchor");
+
+    let status = registration_status(router, &person).await;
+
+    assert!(status.enrolled);
+    let after = read_owner_webauthn_authority_anchor(anchor_store.as_ref(), &identity.record.hh_id)
+        .unwrap()
+        .expect("status leaves anchor present");
+    assert_eq!(after.sequence(), before.sequence());
+    assert_eq!(after.head_hash(), before.head_hash());
+    assert!(
+        registration_status_marker_path(td.path()).exists(),
+        "status read path does not clean stale markers"
+    );
+    assert!(!finish.credential_id.is_empty());
 }
 
 #[tokio::test]
@@ -1475,7 +1730,7 @@ async fn owner_webauthn_registration_rejects_replayed_finish_after_success() {
     assert_eq!(status, StatusCode::OK);
 
     let (status, _headers, resp_bytes) =
-        post_cbor(router, finish_uri, finish_body, Some(&person)).await;
+        post_cbor(router.clone(), finish_uri, finish_body, Some(&person)).await;
     assert_generic_unauth(status, &resp_bytes);
 }
 
@@ -1532,7 +1787,7 @@ async fn owner_webauthn_registration_finish_fails_closed_without_household_root(
     let finish_body = owner_webauthn_registration_finish_body(router.clone(), &person).await;
 
     let (status, _headers, resp_bytes) =
-        post_cbor(router, finish_uri, finish_body, Some(&person)).await;
+        post_cbor(router.clone(), finish_uri, finish_body, Some(&person)).await;
 
     assert_generic_unauth(status, &resp_bytes);
 }
@@ -1633,6 +1888,83 @@ async fn owner_webauthn_registration_rejects_path_mismatch() {
 }
 
 #[tokio::test]
+async fn owner_webauthn_registration_status_rejects_bad_pop() {
+    let (_td, router, _log, _broadcaster, person, _identity, _window, _anchor_store) =
+        router_with_owner_webauthn_registration(Duration::from_secs(45));
+    let uri = "/api/v1/household/owner-webauthn/registration/status";
+    let body = registration_status_body();
+
+    let stale_timestamp = unix_now().saturating_sub(120);
+    let stale_auth = pop_header_for(&person, "POST", uri, stale_timestamp, &body);
+    let resp = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(uri)
+                .header(header::AUTHORIZATION, stale_auth)
+                .header(header::CONTENT_TYPE, "application/cbor")
+                .body(Body::from(body.clone()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = resp.status();
+    let resp_bytes = to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap()
+        .to_vec();
+    assert_generic_unauth(status, &resp_bytes);
+
+    let path_mismatch_auth = pop_header_for(
+        &person,
+        "POST",
+        "/api/v1/household/owner-webauthn/registration/start",
+        unix_now(),
+        &body,
+    );
+    let resp = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(uri)
+                .header(header::AUTHORIZATION, path_mismatch_auth)
+                .header(header::CONTENT_TYPE, "application/cbor")
+                .body(Body::from(body.clone()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = resp.status();
+    let resp_bytes = to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap()
+        .to_vec();
+    assert_generic_unauth(status, &resp_bytes);
+
+    let body_mismatch_auth = pop_header_for(&person, "POST", uri, unix_now(), b"wrong-body");
+    let resp = router
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(uri)
+                .header(header::AUTHORIZATION, body_mismatch_auth)
+                .header(header::CONTENT_TYPE, "application/cbor")
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = resp.status();
+    let resp_bytes = to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap()
+        .to_vec();
+    assert_generic_unauth(status, &resp_bytes);
+}
+
+#[tokio::test]
 async fn owner_webauthn_registration_rejects_non_empty_authority_without_anchor() {
     let td = tempfile::tempdir().unwrap();
     let identity = Arc::new(bootstrap(td.path()));
@@ -1670,6 +2002,19 @@ async fn owner_webauthn_registration_rejects_non_empty_authority_without_anchor(
         post_cbor(router, finish_uri, finish_body, Some(&person)).await;
     assert_generic_unauth(status, &resp_bytes);
 
+    let (_td, router, _log, _broadcaster, person, identity, _window) = router_from_owner_auth(
+        tempfile::tempdir().unwrap(),
+        Arc::clone(&identity),
+        owner_auth_for_assert.clone(),
+        person,
+        Duration::from_secs(45),
+        {
+            let anchor_store = Arc::clone(&anchor_store);
+            move |state| state.with_owner_webauthn_anchor(anchor_store)
+        },
+    );
+    let (status, _headers, resp_bytes) = post_registration_status(router, &person).await;
+    assert_generic_unauth(status, &resp_bytes);
     assert!(
         read_owner_webauthn_authority_anchor(anchor_store.as_ref(), &identity.record.hh_id)
             .unwrap()
@@ -1686,6 +2031,107 @@ async fn owner_webauthn_registration_rejects_non_empty_authority_without_anchor(
         )
         .is_err()
     );
+}
+
+#[tokio::test]
+async fn owner_webauthn_registration_status_rejects_marker_mismatches() {
+    #[derive(Clone, Copy)]
+    enum MarkerMismatch {
+        Purpose,
+        Household,
+        Owner,
+        Credential,
+        HeadSequence,
+        HeadHash,
+        ActiveCount,
+    }
+
+    for mismatch in [
+        MarkerMismatch::Purpose,
+        MarkerMismatch::Household,
+        MarkerMismatch::Owner,
+        MarkerMismatch::Credential,
+        MarkerMismatch::HeadSequence,
+        MarkerMismatch::HeadHash,
+        MarkerMismatch::ActiveCount,
+    ] {
+        let td = tempfile::tempdir().unwrap();
+        let identity = Arc::new(bootstrap(td.path()));
+        let (owner_auth, person, rp, _authenticator) =
+            owner_auth_with_webauthn_credential(&identity);
+        let head = verified_owner_webauthn_authority_head(
+            &owner_auth.owner_webauthn,
+            &identity.record,
+            &owner_auth.owner_person_cert,
+        )
+        .unwrap()
+        .expect("non-empty authority has a head");
+        let credential_id = owner_auth
+            .owner_webauthn_credentials(&identity.record)
+            .unwrap()
+            .active_credentials()
+            .first()
+            .expect("first enrollment has an active credential")
+            .credential_id_bytes()
+            .to_vec();
+        let mut marker = TestInitialEnrollmentAnchorMarker {
+            version: 1,
+            purpose: "owner-webauthn-initial-enrollment-anchor-pending".into(),
+            hh_id: identity.record.hh_id.clone(),
+            owner_p_id: owner_auth.owner_person_cert.p_id.clone(),
+            credential_id: ByteBuf::from(credential_id),
+            authority_head_sequence: head.sequence,
+            authority_head_hash: ByteBuf::from(head.head_hash.to_vec()),
+            active_credential_count: 1,
+        };
+        match mismatch {
+            MarkerMismatch::Purpose => {
+                marker.purpose = "wrong-purpose".into();
+            }
+            MarkerMismatch::Household => {
+                let other = bootstrap(tempfile::tempdir().unwrap().path());
+                marker.hh_id = other.record.hh_id;
+            }
+            MarkerMismatch::Owner => {
+                marker.owner_p_id =
+                    household_rs::derive_person_id(&P256Keypair::generate().public());
+            }
+            MarkerMismatch::Credential => {
+                marker.credential_id = ByteBuf::from(vec![0xde, 0xad, 0xbe, 0xef]);
+            }
+            MarkerMismatch::HeadSequence => {
+                marker.authority_head_sequence = marker.authority_head_sequence.saturating_add(1);
+            }
+            MarkerMismatch::HeadHash => {
+                marker.authority_head_hash = ByteBuf::from(vec![0x44; 32]);
+            }
+            MarkerMismatch::ActiveCount => {
+                marker.active_credential_count = 2;
+            }
+        }
+        write_test_initial_enrollment_marker(td.path(), &marker);
+        let anchor_store: Arc<dyn keystore_rs::KeystoreBackend> =
+            Arc::new(FileKeystore::new(td.path(), keystore_rs::SERVICE));
+        let (_td, router, _log, _broadcaster, person, identity, _window) =
+            router_from_owner_auth(td, identity, owner_auth, person, Duration::from_secs(45), {
+                let anchor_store = Arc::clone(&anchor_store);
+                move |state| {
+                    state
+                        .with_owner_webauthn_rp(rp)
+                        .with_owner_webauthn_anchor(anchor_store)
+                }
+            });
+
+        let (status, _headers, resp_bytes) = post_registration_status(router, &person).await;
+
+        assert_generic_unauth(status, &resp_bytes);
+        assert!(
+            read_owner_webauthn_authority_anchor(anchor_store.as_ref(), &identity.record.hh_id)
+                .unwrap()
+                .is_none(),
+            "marker mismatch must not repair or write an anchor"
+        );
+    }
 }
 
 #[tokio::test]
@@ -1733,8 +2179,14 @@ async fn owner_webauthn_registration_rejects_all_revoked_authority() {
         })
         .unwrap();
     let (status, _headers, resp_bytes) =
-        post_cbor(router, finish_uri, finish_body, Some(&person)).await;
+        post_cbor(router.clone(), finish_uri, finish_body, Some(&person)).await;
     assert_generic_unauth(status, &resp_bytes);
+
+    let status = registration_status(router, &person).await;
+    assert!(
+        status.enrolled,
+        "status reports ever-enrolled when a valid anchored authority has only revoked credentials"
+    );
 }
 
 #[tokio::test]
@@ -1769,9 +2221,59 @@ async fn owner_webauthn_registration_rejects_empty_authority_with_anchor() {
     let body =
         household_rs::cbor::to_canonical_vec(&OwnerWebauthnRegistrationStartRequest { version: 1 })
             .unwrap();
-    let (status, _headers, resp_bytes) = post_cbor(router, uri, body, Some(&person)).await;
+    let (status, _headers, resp_bytes) = post_cbor(router.clone(), uri, body, Some(&person)).await;
 
     assert_generic_unauth(status, &resp_bytes);
+
+    let (status, _headers, resp_bytes) = post_registration_status(router, &person).await;
+    assert_generic_unauth(status, &resp_bytes);
+}
+
+#[tokio::test]
+async fn owner_webauthn_registration_status_rejects_rollback_or_divergent_anchor() {
+    for anchor in ["truncated", "divergent"] {
+        let td = tempfile::tempdir().unwrap();
+        let identity = Arc::new(bootstrap(td.path()));
+        let (owner_auth, person, rp, _authenticator) =
+            owner_auth_with_webauthn_credential(&identity);
+        let anchor_store: Arc<dyn keystore_rs::KeystoreBackend> =
+            Arc::new(FileKeystore::new(td.path(), keystore_rs::SERVICE));
+        let stale_anchor = match anchor {
+            "truncated" => OwnerWebauthnAuthorityAnchor::new(
+                &identity.record,
+                &owner_auth.owner_person_cert,
+                1,
+                [0x42; 32],
+            ),
+            "divergent" => OwnerWebauthnAuthorityAnchor::new(
+                &identity.record,
+                &owner_auth.owner_person_cert,
+                0,
+                [0x43; 32],
+            ),
+            _ => unreachable!(),
+        };
+        write_owner_webauthn_authority_anchor(anchor_store.as_ref(), &stale_anchor).unwrap();
+        let (_td, router, _log, _broadcaster, person, identity, _window) =
+            router_from_owner_auth(td, identity, owner_auth, person, Duration::from_secs(45), {
+                let anchor_store = Arc::clone(&anchor_store);
+                move |state| {
+                    state
+                        .with_owner_webauthn_rp(rp)
+                        .with_owner_webauthn_anchor(anchor_store)
+                }
+            });
+
+        let (status, _headers, resp_bytes) = post_registration_status(router, &person).await;
+
+        assert_generic_unauth(status, &resp_bytes);
+        let persisted =
+            read_owner_webauthn_authority_anchor(anchor_store.as_ref(), &identity.record.hh_id)
+                .unwrap()
+                .expect("status leaves invalid anchor untouched");
+        assert_eq!(persisted.sequence(), stale_anchor.sequence());
+        assert_eq!(persisted.head_hash(), stale_anchor.head_hash());
+    }
 }
 
 #[tokio::test]
@@ -1799,8 +2301,17 @@ async fn owner_webauthn_registration_anchor_write_failure_keeps_memory_committed
         household_rs::cbor::to_canonical_vec(&OwnerWebauthnRegistrationStartRequest { version: 1 })
             .unwrap();
     let (status, _headers, resp_bytes) =
-        post_cbor(router, start_uri, start_body, Some(&person)).await;
+        post_cbor(router.clone(), start_uri, start_body, Some(&person)).await;
     assert_generic_unauth(status, &resp_bytes);
+
+    let status = registration_status(router.clone(), &person).await;
+    assert!(status.enrolled);
+    assert!(
+        read_owner_webauthn_authority_anchor(failing_anchor.as_ref(), &identity.record.hh_id)
+            .unwrap()
+            .is_none(),
+        "status marker fallback must not write or migrate the anchor"
+    );
 
     failing_anchor.fail_writes(false);
     verify_or_update_owner_webauthn_authority_anchor(

@@ -7,6 +7,7 @@
     "StartResponse vectors pin Swift decode of webauthn-rs CreationChallengeResponse.",
     "FinishRequest vectors pin Swift canonical-CBOR encode before server byte-equality checks.",
     "FinishResponse vectors pin Swift decode of the successful registration response.",
+    "StatusRequest/StatusResponse vectors pin the E1 first-enrollment status endpoint.",
     "RegistrationReject vectors pin the anti-oracle generic failure envelope."
   ],
   "format": {
@@ -14,7 +15,8 @@
     "canonical_cbor": "RFC 8949 deterministic map encoding via household_rs::cbor.",
     "finish_request_strictness": "The server decodes FinishRequest, re-encodes canonical CBOR, and rejects if bytes differ.",
     "finish_response_credential_id": "FinishResponse.credential_id is serde_bytes/ByteBuf and serializes as a CBOR byte string, not base64url text.",
-    "registration_reject": "Registration start/finish failures are intentionally anti-oracle: HTTP 401 with body {v:1,error:\"unauthenticated\"}; internal reasons are tracing-only.",
+    "registration_reject": "Registration start/finish/status failures are intentionally anti-oracle: HTTP 401 with body {v:1,error:\"unauthenticated\"}; internal reasons are tracing-only.",
+    "status_response": "Status exposes only {v,enrolled}. All recovery, anchor-invalid, all-revoked, rollback, and auth failures use the same generic 401 reject.",
     "finish_traps": [
       "RegisterPublicKeyCredential.response.transports None is encoded as null because the field has no skip_serializing_if.",
       "RegisterPublicKeyCredential.extensions is always present; the default value encodes as an empty map."
@@ -203,6 +205,33 @@
       "credential_id_hex": "00010280ff7f",
       "active_credential_count": 1,
       "canonical_cbor_hex": "a36176016d63726564656e7469616c5f69644600010280ff7f776163746976655f63726564656e7469616c5f636f756e7401"
+    }
+  ],
+  "status_requests": [
+    {
+      "id": "status-request-v1",
+      "input": {
+        "v": 1
+      },
+      "canonical_cbor_hex": "a1617601"
+    }
+  ],
+  "status_responses": [
+    {
+      "id": "status-response-never-enrolled",
+      "input": {
+        "v": 1,
+        "enrolled": false
+      },
+      "canonical_cbor_hex": "a261760168656e726f6c6c6564f4"
+    },
+    {
+      "id": "status-response-enrolled",
+      "input": {
+        "v": 1,
+        "enrolled": true
+      },
+      "canonical_cbor_hex": "a261760168656e726f6c6c6564f5"
     }
   ],
   "registration_rejects": [

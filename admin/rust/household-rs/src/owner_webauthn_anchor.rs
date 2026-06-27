@@ -265,6 +265,56 @@ pub fn verify_or_update_owner_webauthn_authority_anchor(
     }
 }
 
+pub fn classify_owner_webauthn_authority_anchor_read_only(
+    keystore: &dyn keystore_rs::KeystoreBackend,
+    authority: &OwnerWebauthnAuthority,
+    record: &HouseholdRecord,
+    owner_person_cert: &PersonCert,
+) -> Result<OwnerWebauthnAnchorStatus, OwnerWebauthnAnchorError> {
+    authority.reconstruct(record, owner_person_cert)?;
+    let head = verified_owner_webauthn_authority_head(authority, record, owner_person_cert)?;
+    let existing = read_owner_webauthn_authority_anchor(keystore, &record.hh_id)?;
+
+    match (existing, head) {
+        (None, None) => Ok(OwnerWebauthnAnchorStatus::EmptyAuthorityNoAnchor),
+        (Some(_), None) => Err(OwnerWebauthnAnchorError::Rollback(
+            "anchor exists but authority log is empty".into(),
+        )),
+        (None, Some(_)) => Err(OwnerWebauthnAnchorError::MissingAnchor),
+        (Some(anchor), Some(head)) => {
+            let anchored_hash = anchor.validate(record, owner_person_cert)?;
+            let anchored_sequence = usize::try_from(anchor.sequence).map_err(|_| {
+                OwnerWebauthnAnchorError::Invalid("anchor sequence overflow".to_string())
+            })?;
+            let Some(entry_at_anchor) = authority.entries().get(anchored_sequence) else {
+                return Err(OwnerWebauthnAnchorError::Rollback(format!(
+                    "local head sequence {} is older than anchor sequence {}",
+                    head.sequence, anchor.sequence
+                )));
+            };
+            if entry_at_anchor.entry_hash()? != anchored_hash {
+                return Err(OwnerWebauthnAnchorError::Rollback(
+                    "entry hash at anchored sequence diverged".into(),
+                ));
+            }
+            if head.sequence < anchor.sequence {
+                return Err(OwnerWebauthnAnchorError::Rollback(format!(
+                    "local head sequence {} is older than anchor sequence {}",
+                    head.sequence, anchor.sequence
+                )));
+            }
+            if head.sequence == anchor.sequence {
+                return Ok(OwnerWebauthnAnchorStatus::Verified { head });
+            }
+
+            Ok(OwnerWebauthnAnchorStatus::Advanced {
+                previous: anchor,
+                head,
+            })
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::Path;
@@ -648,6 +698,47 @@ mod tests {
             .unwrap();
         assert_eq!(advanced.sequence(), 2);
         assert_eq!(advanced.head_hash(), third_hash);
+    }
+
+    #[test]
+    fn read_only_classifier_reports_advanced_without_writing_anchor() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = file_keystore(tmp.path());
+        let (root, record, owner_cert) = setup();
+        let (_two, genesis, second) = two_entry_authority(&root, &record, &owner_cert);
+        let anchor = OwnerWebauthnAuthorityAnchor::new(
+            &record,
+            &owner_cert,
+            1,
+            second.entry_hash().unwrap(),
+        );
+        write_owner_webauthn_authority_anchor(&store, &anchor).unwrap();
+        let extended = append_third(&root, &record, &owner_cert, &genesis, &second);
+        let third_hash = extended.entries()[2].entry_hash().unwrap();
+
+        let status = classify_owner_webauthn_authority_anchor_read_only(
+            &store,
+            &extended,
+            &record,
+            &owner_cert,
+        )
+        .unwrap();
+
+        assert_eq!(
+            status,
+            OwnerWebauthnAnchorStatus::Advanced {
+                previous: anchor,
+                head: OwnerWebauthnAuthorityHead {
+                    sequence: 2,
+                    head_hash: third_hash,
+                },
+            }
+        );
+        let persisted = read_owner_webauthn_authority_anchor(&store, &record.hh_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(persisted.sequence(), 1);
+        assert_eq!(persisted.head_hash(), second.entry_hash().unwrap());
     }
 
     #[test]
