@@ -75,6 +75,7 @@ use crate::apns_dispatcher;
 use crate::handlers_device_pairing::DevicePairingStore;
 use crate::household_auth;
 use crate::household_state::HouseholdState;
+use crate::macos_local_caller_auth::{MacosLocalCallerAuth, MacosLocalCallerAuthRequest};
 use crate::owner_webauthn_recovery_consume_rate_limit::{
     RecoveryConsumeRateLimitDecision, check_recovery_consume_attempt,
 };
@@ -123,6 +124,13 @@ pub struct OwnerEventsRouterState {
     /// The limiter is injected only from daemon paths that have `SharedState`.
     /// Short-lived install/listener paths fail closed for recovery consume.
     pub recovery_consume_rate_limiter: Option<Arc<Limiter>>,
+    /// macOS local-engine caller verifier for UDS-only enrollment routes.
+    ///
+    /// `None` is the production M1 default and rejects local enrollment before
+    /// request decode or challenge staging. A future M1b must inject a real
+    /// audit-token/SecCode designated-requirement verifier; tests may inject a
+    /// fake verifier explicitly.
+    pub macos_local_caller_auth: Option<Arc<dyn MacosLocalCallerAuth>>,
 }
 
 #[derive(Clone)]
@@ -180,6 +188,7 @@ impl OwnerEventsRouterState {
             owner_webauthn_anchor: None,
             owner_webauthn_recovery_anchor: None,
             recovery_consume_rate_limiter: None,
+            macos_local_caller_auth: None,
         }
     }
 
@@ -222,6 +231,38 @@ impl OwnerEventsRouterState {
         self.recovery_consume_rate_limiter = Some(limiter);
         self
     }
+
+    #[must_use]
+    pub fn with_macos_local_caller_auth(mut self, verifier: Arc<dyn MacosLocalCallerAuth>) -> Self {
+        self.macos_local_caller_auth = Some(verifier);
+        self
+    }
+}
+
+pub const OWNER_WEBAUTHN_REGISTRATION_LOCAL_START_PATH: &str =
+    "/api/v1/household/owner-webauthn/registration/local/start";
+pub const OWNER_WEBAUTHN_REGISTRATION_LOCAL_FINISH_PATH: &str =
+    "/api/v1/household/owner-webauthn/registration/local/finish";
+pub const OWNER_WEBAUTHN_REGISTRATION_LOCAL_STATUS_PATH: &str =
+    "/api/v1/household/owner-webauthn/registration/local/status";
+
+pub fn owner_webauthn_macos_local_registration_router(
+    state: OwnerEventsRouterState,
+) -> axum::Router {
+    axum::Router::new()
+        .route(
+            OWNER_WEBAUTHN_REGISTRATION_LOCAL_START_PATH,
+            axum::routing::post(owner_webauthn_registration_local_start_handler),
+        )
+        .route(
+            OWNER_WEBAUTHN_REGISTRATION_LOCAL_FINISH_PATH,
+            axum::routing::post(owner_webauthn_registration_local_finish_handler),
+        )
+        .route(
+            OWNER_WEBAUTHN_REGISTRATION_LOCAL_STATUS_PATH,
+            axum::routing::post(owner_webauthn_registration_local_status_handler),
+        )
+        .with_state(state)
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -2615,6 +2656,26 @@ fn require_owner_webauthn_never_enrolled_for_initial_enrollment(
     }
 }
 
+fn authorize_macos_local_caller(
+    state: &OwnerEventsRouterState,
+    method: &Method,
+    uri: &Uri,
+    headers: &HeaderMap,
+    body: &Bytes,
+) -> Result<(), String> {
+    let Some(verifier) = state.macos_local_caller_auth.as_ref() else {
+        return Err("local_caller_auth_unavailable".to_string());
+    };
+    verifier
+        .authorize(&MacosLocalCallerAuthRequest {
+            method,
+            uri,
+            headers,
+            body: body.as_ref(),
+        })
+        .map_err(|e| e.to_string())
+}
+
 /// `POST /api/v1/household/owner-webauthn/registration/status`.
 ///
 /// Owner-authenticated enrollment status for the iOS E1 flow. This endpoint is
@@ -2673,6 +2734,52 @@ pub async fn owner_webauthn_registration_status_handler(
     if current_owner_auth.owner_person_cert.p_id != authorized_owner_auth.owner_person_cert.p_id {
         return reject_owner_webauthn_registration("owner_auth_changed", None);
     }
+    let enrolled =
+        match owner_webauthn_registration_status(&state, &identity, current_owner_auth.as_ref()) {
+            Ok(enrolled) => enrolled,
+            Err(reason) => return reject_owner_webauthn_registration(reason, None),
+        };
+    let bytes = household_rs::cbor::to_canonical_vec(&OwnerWebauthnRegistrationStatusResponse {
+        version: 1,
+        enrolled,
+    })
+    .unwrap_or_default();
+    cbor_response(StatusCode::OK, bytes)
+}
+
+/// `POST /api/v1/household/owner-webauthn/registration/local/status`.
+///
+/// macOS local-engine status over a UDS-only router. The local boundary is
+/// caller-auth, not `PoP`. M1 production state has no verifier and therefore
+/// rejects before decode; tests may inject a fake verifier to exercise wiring.
+pub async fn owner_webauthn_registration_local_status_handler(
+    State(state): State<OwnerEventsRouterState>,
+    method: Method,
+    uri: Uri,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    if let Err(e) = authorize_macos_local_caller(&state, &method, &uri, &headers, &body) {
+        return reject_owner_webauthn_registration("local_caller_auth_failed", Some(e));
+    }
+
+    let request: OwnerWebauthnRegistrationStatusRequest = match decode_canonical_cbor(&body) {
+        Ok(request) => request,
+        Err(e) => return reject_owner_webauthn_registration("cbor_decode", Some(e)),
+    };
+    if request.version != 1 {
+        return reject_owner_webauthn_registration("bad_version", None);
+    }
+
+    let _mutation_guard = crate::bootstrap_mutation_lock::BOOTSTRAP_MUTATION_LOCK
+        .lock()
+        .await;
+    let Some(identity) = state.household.current().await else {
+        return reject_owner_webauthn_registration("identity_unavailable", None);
+    };
+    let Some(current_owner_auth) = state.household.current_owner_auth().await else {
+        return reject_owner_webauthn_registration("owner_auth_unavailable", None);
+    };
     let enrolled =
         match owner_webauthn_registration_status(&state, &identity, current_owner_auth.as_ref()) {
             Ok(enrolled) => enrolled,
@@ -4327,6 +4434,103 @@ pub async fn owner_webauthn_registration_start_handler(
     })
     .unwrap_or_default();
     cbor_response(StatusCode::OK, bytes)
+}
+
+/// `POST /api/v1/household/owner-webauthn/registration/local/start`.
+///
+/// Starts first-passkey registration through the macOS local UDS boundary. This
+/// wrapper never accepts network `PoP` as a substitute for local caller-auth.
+/// Production M1 remains fail-closed because no real caller verifier is wired.
+pub async fn owner_webauthn_registration_local_start_handler(
+    State(state): State<OwnerEventsRouterState>,
+    method: Method,
+    uri: Uri,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let Some(now) =
+        time_util::unix_now_secs_checked("owner_events.owner_webauthn_local_start.clock")
+    else {
+        return unauthenticated_response();
+    };
+    if let Err(e) = authorize_macos_local_caller(&state, &method, &uri, &headers, &body) {
+        return reject_owner_webauthn_registration("local_caller_auth_failed", Some(e));
+    }
+
+    let request: OwnerWebauthnRegistrationStartRequest = match decode_canonical_cbor(&body) {
+        Ok(request) => request,
+        Err(e) => return reject_owner_webauthn_registration("cbor_decode", Some(e)),
+    };
+    if request.version != 1 {
+        return reject_owner_webauthn_registration("bad_version", None);
+    }
+
+    let _mutation_guard = crate::bootstrap_mutation_lock::BOOTSTRAP_MUTATION_LOCK
+        .lock()
+        .await;
+    let Some(identity) = state.household.current().await else {
+        return reject_owner_webauthn_registration("identity_unavailable", None);
+    };
+    let Some(current_owner_auth) = state.household.current_owner_auth().await else {
+        return reject_owner_webauthn_registration("owner_auth_unavailable", None);
+    };
+    let snapshot = owner_webauthn_initial_enrollment_policy_snapshot(
+        &state,
+        &identity,
+        current_owner_auth.as_ref(),
+    );
+    if let Err(reason) = require_owner_webauthn_never_enrolled_for_initial_enrollment(&snapshot) {
+        return reject_owner_webauthn_registration(reason, None);
+    }
+    let Some(rp) = &state.owner_webauthn_rp else {
+        return reject_owner_webauthn_registration("rp_unavailable", None);
+    };
+
+    let mut rng = OsRng;
+    let user_id = owner_webauthn_user_uuid(current_owner_auth.as_ref());
+    let owner_name = current_owner_auth.owner_person_cert.p_id.0.as_str();
+    let owner_display_name = current_owner_auth.owner_person_cert.display_name.as_str();
+    let (challenge_id, options) = match rp.lock().await.start_registration(
+        &mut rng,
+        now,
+        user_id,
+        owner_name,
+        owner_display_name,
+        &[],
+    ) {
+        Ok(result) => result,
+        Err(e) => {
+            return reject_owner_webauthn_registration(
+                "registration_start_failed",
+                Some(e.to_string()),
+            );
+        }
+    };
+    let bytes = household_rs::cbor::to_canonical_vec(&OwnerWebauthnRegistrationStartResponse {
+        version: 1,
+        challenge_id: challenge_id.as_str().to_string(),
+        options,
+    })
+    .unwrap_or_default();
+    cbor_response(StatusCode::OK, bytes)
+}
+
+/// `POST /api/v1/household/owner-webauthn/registration/local/finish`.
+///
+/// M1 does not make local enrollment finish production-active. Caller-auth is
+/// still mandatory, but commit remains blocked until M1b lands a real peer
+/// verifier and platform+UV attestation constraints.
+pub async fn owner_webauthn_registration_local_finish_handler(
+    State(state): State<OwnerEventsRouterState>,
+    method: Method,
+    uri: Uri,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    if let Err(e) = authorize_macos_local_caller(&state, &method, &uri, &headers, &body) {
+        return reject_owner_webauthn_registration("local_caller_auth_failed", Some(e));
+    }
+    reject_owner_webauthn_registration("local_attestation_constraints_unavailable", None)
 }
 
 /// `POST /api/v1/household/owner-webauthn/registration/finish`.

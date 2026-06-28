@@ -65,6 +65,9 @@ use server_rs::handlers_owner_events::{
 };
 use server_rs::handlers_pair_machine::{PreHouseholdRouterState, pre_household_router};
 use server_rs::household_state::HouseholdState;
+use server_rs::macos_local_caller_auth::{
+    MacosLocalCallerAuth, MacosLocalCallerAuthError, MacosLocalCallerAuthRequest,
+};
 use tempfile::TempDir;
 use tokio::net::TcpListener;
 use tokio::sync::Notify;
@@ -132,6 +135,34 @@ type OwnerWebauthnRegistrationRouterFixture = (
     Arc<PairMachineWindow>,
     Arc<dyn keystore_rs::KeystoreBackend>,
 );
+
+#[derive(Debug)]
+struct TestMacosLocalCallerAuth {
+    allow: bool,
+}
+
+impl TestMacosLocalCallerAuth {
+    fn allow() -> Arc<dyn MacosLocalCallerAuth> {
+        Arc::new(Self { allow: true })
+    }
+
+    fn deny() -> Arc<dyn MacosLocalCallerAuth> {
+        Arc::new(Self { allow: false })
+    }
+}
+
+impl MacosLocalCallerAuth for TestMacosLocalCallerAuth {
+    fn authorize(
+        &self,
+        _request: &MacosLocalCallerAuthRequest<'_>,
+    ) -> Result<(), MacosLocalCallerAuthError> {
+        if self.allow {
+            Ok(())
+        } else {
+            Err(MacosLocalCallerAuthError::Rejected)
+        }
+    }
+}
 
 type OwnerWebauthnRecoveryRouterFixture = (
     TempDir,
@@ -1153,6 +1184,49 @@ fn router_with_owner_webauthn_registration_anchor(
     )
 }
 
+fn local_router_with_owner_webauthn_registration(
+    timeout: Duration,
+    caller_auth: Option<Arc<dyn MacosLocalCallerAuth>>,
+) -> OwnerWebauthnRegistrationRouterFixture {
+    let td = tempfile::tempdir().unwrap();
+    let anchor_store: Arc<dyn keystore_rs::KeystoreBackend> =
+        Arc::new(FileKeystore::new(td.path(), keystore_rs::SERVICE));
+    let identity = Arc::new(bootstrap(td.path()));
+    let (owner_auth, person) = owner_auth_for(&identity);
+    let rp = owner_webauthn_rp();
+    let anchor_for_state = Arc::clone(&anchor_store);
+    let auth_for_state = caller_auth;
+    let (td, _network_router, log, broadcaster, person, identity, window, state) =
+        router_from_owner_auth_with_router_state(
+            td,
+            identity,
+            owner_auth,
+            person,
+            timeout,
+            move |state| {
+                let state = state
+                    .with_owner_webauthn_rp(rp)
+                    .with_owner_webauthn_anchor(anchor_for_state);
+                if let Some(auth) = auth_for_state {
+                    state.with_macos_local_caller_auth(auth)
+                } else {
+                    state
+                }
+            },
+        );
+    let local_router = handlers_owner_events::owner_webauthn_macos_local_registration_router(state);
+    (
+        td,
+        local_router,
+        log,
+        broadcaster,
+        person,
+        identity,
+        window,
+        anchor_store,
+    )
+}
+
 fn router_with_owner_webauthn_add_credential(
     timeout: Duration,
     add_policy_enabled: bool,
@@ -1836,6 +1910,115 @@ async fn owner_webauthn_registration_status_fails_closed_without_anchor_verifier
 
     let (status, _headers, resp_bytes) = post_registration_status(router, &person).await;
 
+    assert_generic_unauth(status, &resp_bytes);
+}
+
+#[tokio::test]
+async fn owner_webauthn_registration_tcp_start_still_requires_pop() {
+    let (_td, router, _log, _broadcaster, _person, _identity, _window, _anchor_store) =
+        router_with_owner_webauthn_registration(Duration::from_secs(45));
+    let body =
+        household_rs::cbor::to_canonical_vec(&OwnerWebauthnRegistrationStartRequest { version: 1 })
+            .unwrap();
+
+    let (status, _headers, resp_bytes) = post_cbor(
+        router,
+        "/api/v1/household/owner-webauthn/registration/start",
+        body,
+        None,
+    )
+    .await;
+
+    assert_generic_unauth(status, &resp_bytes);
+}
+
+#[tokio::test]
+async fn owner_webauthn_registration_local_absent_verifier_fails_closed_before_decode() {
+    let (_td, router, _log, _broadcaster, _person, _identity, _window, _anchor_store) =
+        local_router_with_owner_webauthn_registration(Duration::from_secs(45), None);
+
+    let (status, _headers, resp_bytes) = post_cbor(
+        router,
+        handlers_owner_events::OWNER_WEBAUTHN_REGISTRATION_LOCAL_START_PATH,
+        vec![0xff],
+        None,
+    )
+    .await;
+
+    assert_generic_unauth(status, &resp_bytes);
+}
+
+#[tokio::test]
+async fn owner_webauthn_registration_local_denied_rejects_opaque_without_challenge() {
+    let (_td, router, _log, _broadcaster, _person, _identity, _window, _anchor_store) =
+        local_router_with_owner_webauthn_registration(
+            Duration::from_secs(45),
+            Some(TestMacosLocalCallerAuth::deny()),
+        );
+    let body =
+        household_rs::cbor::to_canonical_vec(&OwnerWebauthnRegistrationStartRequest { version: 1 })
+            .unwrap();
+
+    let (status, _headers, resp_bytes) = post_cbor(
+        router,
+        handlers_owner_events::OWNER_WEBAUTHN_REGISTRATION_LOCAL_START_PATH,
+        body,
+        None,
+    )
+    .await;
+
+    assert_generic_unauth(status, &resp_bytes);
+}
+
+#[tokio::test]
+async fn owner_webauthn_registration_local_fake_auth_allows_start_and_status_only() {
+    let (_td, router, _log, _broadcaster, _person, _identity, _window, _anchor_store) =
+        local_router_with_owner_webauthn_registration(
+            Duration::from_secs(45),
+            Some(TestMacosLocalCallerAuth::allow()),
+        );
+    let start_body =
+        household_rs::cbor::to_canonical_vec(&OwnerWebauthnRegistrationStartRequest { version: 1 })
+            .unwrap();
+
+    let (status, _headers, resp_bytes) = post_cbor(
+        router.clone(),
+        handlers_owner_events::OWNER_WEBAUTHN_REGISTRATION_LOCAL_START_PATH,
+        start_body,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let start: OwnerWebauthnRegistrationStartResponse =
+        household_rs::cbor::from_canonical_slice(&resp_bytes).unwrap();
+    assert_eq!(start.version, 1);
+    assert!(!start.challenge_id.is_empty());
+
+    let status_body =
+        household_rs::cbor::to_canonical_vec(&OwnerWebauthnRegistrationStatusRequest {
+            version: 1,
+        })
+        .unwrap();
+    let (status, _headers, resp_bytes) = post_cbor(
+        router.clone(),
+        handlers_owner_events::OWNER_WEBAUTHN_REGISTRATION_LOCAL_STATUS_PATH,
+        status_body,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let status_body: OwnerWebauthnRegistrationStatusResponse =
+        household_rs::cbor::from_canonical_slice(&resp_bytes).unwrap();
+    assert_eq!(status_body.version, 1);
+    assert!(!status_body.enrolled);
+
+    let (status, _headers, resp_bytes) = post_cbor(
+        router,
+        handlers_owner_events::OWNER_WEBAUTHN_REGISTRATION_LOCAL_FINISH_PATH,
+        vec![0xff],
+        None,
+    )
+    .await;
     assert_generic_unauth(status, &resp_bytes);
 }
 
@@ -2619,6 +2802,121 @@ fn owner_webauthn_registration_status_source_guards_read_only_contract() {
         "struct OwnerWebauthnRevokeCredentialStartSnapshot",
     );
     assert!(!pair_machine_policy.contains("marker_backed_initial_enrollment_committed"));
+}
+
+#[test]
+fn owner_webauthn_registration_local_source_guards_fail_closed_boundary() {
+    let source = include_str!("../src/handlers_owner_events.rs");
+    assert!(source.contains(
+        "OWNER_WEBAUTHN_REGISTRATION_LOCAL_START_PATH: &str =\n    \"/api/v1/household/owner-webauthn/registration/local/start\""
+    ));
+    assert!(source.contains(
+        "OWNER_WEBAUTHN_REGISTRATION_LOCAL_FINISH_PATH: &str =\n    \"/api/v1/household/owner-webauthn/registration/local/finish\""
+    ));
+    assert!(source.contains(
+        "OWNER_WEBAUTHN_REGISTRATION_LOCAL_STATUS_PATH: &str =\n    \"/api/v1/household/owner-webauthn/registration/local/status\""
+    ));
+    let local_router = source_segment(
+        source,
+        "pub fn owner_webauthn_macos_local_registration_router(",
+        "#[derive(Clone, Debug, PartialEq, Eq)]",
+    );
+    assert!(local_router.contains("OWNER_WEBAUTHN_REGISTRATION_LOCAL_START_PATH"));
+    assert!(local_router.contains("OWNER_WEBAUTHN_REGISTRATION_LOCAL_FINISH_PATH"));
+    assert!(local_router.contains("OWNER_WEBAUTHN_REGISTRATION_LOCAL_STATUS_PATH"));
+
+    let local_start = source_segment(
+        source,
+        "pub async fn owner_webauthn_registration_local_start_handler(",
+        "/// `POST /api/v1/household/owner-webauthn/registration/local/finish`",
+    );
+    assert!(local_start.contains("authorize_macos_local_caller"));
+    assert!(local_start.contains("BOOTSTRAP_MUTATION_LOCK"));
+    assert!(local_start.contains("owner_webauthn_initial_enrollment_policy_snapshot"));
+    assert!(local_start.contains("start_registration"));
+    assert!(!local_start.contains("authorize_owner_auth_enroll_initial_request"));
+    assert!(!local_start.contains("authorize_owner_webauthn_registration_status_request"));
+    assert!(!local_start.contains("finish_registration"));
+    assert!(!local_start.contains("OwnerWebauthnAuthority::sign_genesis"));
+    assert!(!local_start.contains(".save("));
+    assert!(!local_start.contains("set_owner_auth"));
+    assert!(!local_start.contains("verify_or_update_owner_webauthn_authority_anchor"));
+    assert!(!local_start.contains("OwnerWebauthnPolicySnapshot"));
+    assert!(!local_start.contains("OwnerWebauthnCredentialEventAction::Revoke"));
+    assert!(!local_start.contains("OwnerWebauthnRecoveryAuthority"));
+    assert!(!local_start.contains("HouseholdAddMachine"));
+    assert!(
+        local_start.find("authorize_macos_local_caller").unwrap()
+            < local_start.find("decode_canonical_cbor").unwrap()
+    );
+
+    let local_finish = source_segment(
+        source,
+        "pub async fn owner_webauthn_registration_local_finish_handler(",
+        "/// `POST /api/v1/household/owner-webauthn/registration/finish`",
+    );
+    assert!(local_finish.contains("authorize_macos_local_caller"));
+    assert!(local_finish.contains("local_attestation_constraints_unavailable"));
+    assert!(!local_finish.contains("decode_canonical_cbor"));
+    assert!(!local_finish.contains("finish_registration"));
+    assert!(!local_finish.contains("OwnerWebauthnAuthority::sign_genesis"));
+    assert!(!local_finish.contains(".save("));
+    assert!(!local_finish.contains("set_owner_auth"));
+    assert!(!local_finish.contains("verify_or_update_owner_webauthn_authority_anchor"));
+
+    let local_status = source_segment(
+        source,
+        "pub async fn owner_webauthn_registration_local_status_handler(",
+        "/// `POST /api/v1/household/owner-webauthn/revoke/start`",
+    );
+    assert!(local_status.contains("authorize_macos_local_caller"));
+    assert!(local_status.contains("BOOTSTRAP_MUTATION_LOCK"));
+    assert!(local_status.contains("owner_webauthn_registration_status"));
+    assert!(!local_status.contains("authorize_owner_auth_enroll_initial_request"));
+    assert!(!local_status.contains("authorize_owner_webauthn_registration_status_request"));
+    assert!(!local_status.contains("verify_or_update_owner_webauthn_authority_anchor"));
+    assert!(!local_status.contains(".save("));
+    assert!(
+        local_status.find("authorize_macos_local_caller").unwrap()
+            < local_status.find("decode_canonical_cbor").unwrap()
+    );
+
+    let tcp_start = source_segment(
+        source,
+        "pub async fn owner_webauthn_registration_start_handler(",
+        "/// `POST /api/v1/household/owner-webauthn/registration/local/start`",
+    );
+    assert!(tcp_start.contains("authorize_owner_auth_enroll_initial_request"));
+    assert!(!tcp_start.contains("authorize_macos_local_caller"));
+
+    let tcp_finish = source_segment(
+        source,
+        "pub async fn owner_webauthn_registration_finish_handler(",
+        "let request: OwnerWebauthnRegistrationFinishRequest",
+    );
+    assert!(tcp_finish.contains("authorize_owner_auth_enroll_initial_request"));
+    assert!(!tcp_finish.contains("authorize_macos_local_caller"));
+
+    let router_source = include_str!("../src/household_bootstrap.rs");
+    assert!(!router_source.contains("/registration/local/"));
+    assert!(router_source.contains("/api/v1/household/owner-webauthn/registration/start"));
+    assert!(router_source.contains("/api/v1/household/owner-webauthn/registration/finish"));
+    assert!(router_source.contains("/api/v1/household/owner-webauthn/registration/status"));
+
+    let auth_source = include_str!("../src/macos_local_caller_auth.rs");
+    assert!(auth_source.contains("FailClosedMacosLocalCallerAuth"));
+    assert!(auth_source.contains("Err(MacosLocalCallerAuthError::Unavailable)"));
+    assert!(!auth_source.contains("DEV_ALLOW"));
+    assert!(!auth_source.contains("LOCAL_NO_AUTH"));
+    assert!(!auth_source.contains("localhost"));
+    assert!(!auth_source.contains("Authorization"));
+
+    let state_default = source_segment(
+        source,
+        "pub fn with_timeout(",
+        "pub fn with_owner_approval_policy(",
+    );
+    assert!(state_default.contains("macos_local_caller_auth: None"));
 }
 
 #[test]
