@@ -2129,6 +2129,7 @@ dependencies = [
  "vsss-rs",
  "webauthn-authenticator-rs",
  "webauthn-rs",
+ "webauthn-rs-core",
  "zeroize",
 ]
 
@@ -4534,6 +4535,7 @@ dependencies = [
  "vmrunner-rs",
  "webauthn-authenticator-rs",
  "webauthn-rs",
+ "webauthn-rs-core",
  "zeroize",
  "zstd",
 ]

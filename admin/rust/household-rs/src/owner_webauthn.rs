@@ -12,16 +12,76 @@ use std::time::Duration;
 use rand::RngCore;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
+use webauthn_rs::DEFAULT_AUTHENTICATOR_TIMEOUT;
 use webauthn_rs::prelude::{
     AuthenticationResult, AuthenticatorAttachment, CreationChallengeResponse, Passkey,
     PasskeyAuthentication, PasskeyRegistration, PublicKeyCredential, RegisterPublicKeyCredential,
     RequestChallengeResponse, Url, Uuid, Webauthn, WebauthnBuilder, WebauthnError,
 };
+use webauthn_rs_core::WebauthnCore;
+use webauthn_rs_core::proto::RegistrationState;
 
 use crate::owner_approval_v2::{OwnerApprovalContextV2, OwnerOperation};
 
 const DEFAULT_CHALLENGE_TTL: Duration = Duration::from_secs(5 * 60);
 const REGISTRATION_BINDING_DOMAIN: &[u8] = b"soyeht-owner-webauthn-registration-binding-v1\0";
+
+mod macos_local_attested_registration {
+    use webauthn_rs::prelude::{
+        AttestationFormat, AuthenticatorAttachment, CreationChallengeResponse, CredentialID,
+    };
+    use webauthn_rs_core::WebauthnCore;
+    use webauthn_rs_core::proto::{
+        AttestationConveyancePreference, CredProtect, CredentialProtectionPolicy,
+        PublicKeyCredentialHints, RegistrationState, RequestRegistrationExtensions,
+        UserVerificationPolicy,
+    };
+
+    use super::{OwnerWebauthnError, OwnerWebauthnRegistrationStart};
+
+    /// Build the macOS-local Apple Anonymous attested start challenge.
+    ///
+    /// This intentionally uses `webauthn-rs-core`: the safe `webauthn-rs`
+    /// attested-passkey helper does not expose Apple Anonymous as an accepted
+    /// attestation format. This module only shapes and stages the challenge.
+    /// Server-side proof, Apple root policy, BE/BS handling, evidence storage,
+    /// and commit all remain outside this slice and must happen in local finish.
+    pub(super) fn start(
+        webauthn_core: &WebauthnCore,
+        input: &OwnerWebauthnRegistrationStart<'_>,
+        exclude_credentials: Vec<CredentialID>,
+    ) -> Result<(CreationChallengeResponse, RegistrationState), OwnerWebauthnError> {
+        let extensions = Some(RequestRegistrationExtensions {
+            cred_protect: Some(CredProtect {
+                credential_protection_policy: CredentialProtectionPolicy::UserVerificationRequired,
+                enforce_credential_protection_policy: Some(true),
+            }),
+            uvm: Some(true),
+            cred_props: Some(true),
+            min_pin_length: Some(true),
+            hmac_create_secret: Some(true),
+        });
+        let builder = webauthn_core
+            .new_challenge_register_builder(
+                input.owner_user_id.as_bytes(),
+                input.owner_name,
+                input.owner_display_name,
+            )
+            .map_err(OwnerWebauthnError::Ceremony)?
+            .attestation(AttestationConveyancePreference::Direct)
+            .require_resident_key(true)
+            .authenticator_attachment(Some(AuthenticatorAttachment::Platform))
+            .user_verification_policy(UserVerificationPolicy::Required)
+            .reject_synchronised_authenticators(true)
+            .exclude_credentials(Some(exclude_credentials))
+            .hints(Some(vec![PublicKeyCredentialHints::ClientDevice]))
+            .attestation_formats(Some(vec![AttestationFormat::AppleAnonymous]))
+            .extensions(extensions);
+        webauthn_core
+            .generate_challenge_register(builder)
+            .map_err(OwnerWebauthnError::Ceremony)
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OwnerWebauthnConfig {
@@ -82,6 +142,17 @@ impl OwnerWebauthnConfig {
             .map_err(OwnerWebauthnError::InvalidRpConfig)?;
         builder = builder.rp_name(&self.rp_name);
         builder.build().map_err(OwnerWebauthnError::InvalidRpConfig)
+    }
+
+    fn build_webauthn_core(&self) -> WebauthnCore {
+        WebauthnCore::new_unsafe_experts_only(
+            &self.rp_name,
+            &self.rp_id,
+            vec![self.rp_origin.clone()],
+            DEFAULT_AUTHENTICATOR_TIMEOUT,
+            Some(false),
+            Some(false),
+        )
     }
 }
 
@@ -401,6 +472,8 @@ pub struct OwnerWebauthnRegistrationStart<'a> {
 #[derive(Debug)]
 enum ChallengeState {
     Registration(StoredRegistrationChallenge),
+    #[allow(dead_code)]
+    LocalAttestedRegistration(StoredLocalAttestedRegistrationChallenge),
     Authentication(StoredAuthenticationChallenge),
 }
 
@@ -408,6 +481,11 @@ enum ChallengeState {
 struct StoredRegistrationChallenge {
     state: PasskeyRegistration,
     binding: Option<OwnerWebauthnRegistrationBinding>,
+}
+
+#[derive(Debug)]
+struct StoredLocalAttestedRegistrationChallenge {
+    _state: RegistrationState,
 }
 
 #[derive(Debug)]
@@ -473,6 +551,23 @@ impl OwnerWebauthnChallengeStore {
         );
     }
 
+    fn insert_local_attested_registration(
+        &mut self,
+        challenge_id: OwnerWebauthnChallengeId,
+        state: RegistrationState,
+        expires_at_unix: u64,
+    ) {
+        self.challenges.insert(
+            challenge_id,
+            StoredChallenge {
+                expires_at_unix,
+                state: ChallengeState::LocalAttestedRegistration(
+                    StoredLocalAttestedRegistrationChallenge { _state: state },
+                ),
+            },
+        );
+    }
+
     fn registration(
         &self,
         challenge_id: &OwnerWebauthnChallengeId,
@@ -487,7 +582,9 @@ impl OwnerWebauthnChallengeStore {
         }
         match &stored.state {
             ChallengeState::Registration(state) => Ok(state),
-            ChallengeState::Authentication(_) => Err(OwnerWebauthnError::ChallengeKindMismatch),
+            ChallengeState::LocalAttestedRegistration(_) | ChallengeState::Authentication(_) => {
+                Err(OwnerWebauthnError::ChallengeKindMismatch)
+            }
         }
     }
 
@@ -511,7 +608,9 @@ impl OwnerWebauthnChallengeStore {
             .ok_or(OwnerWebauthnError::ChallengeNotFound)?;
         match stored.state {
             ChallengeState::Registration(state) => Ok(state),
-            ChallengeState::Authentication(_) => Err(OwnerWebauthnError::ChallengeKindMismatch),
+            ChallengeState::LocalAttestedRegistration(_) | ChallengeState::Authentication(_) => {
+                Err(OwnerWebauthnError::ChallengeKindMismatch)
+            }
         }
     }
 
@@ -530,7 +629,9 @@ impl OwnerWebauthnChallengeStore {
         }
         match stored.state {
             ChallengeState::Authentication(state) => Ok(state),
-            ChallengeState::Registration(_) => Err(OwnerWebauthnError::ChallengeKindMismatch),
+            ChallengeState::Registration(_) | ChallengeState::LocalAttestedRegistration(_) => {
+                Err(OwnerWebauthnError::ChallengeKindMismatch)
+            }
         }
     }
 
@@ -555,7 +656,9 @@ impl OwnerWebauthnChallengeStore {
             .state
         {
             ChallengeState::Authentication(state) => Ok(state),
-            ChallengeState::Registration(_) => Err(OwnerWebauthnError::ChallengeKindMismatch),
+            ChallengeState::Registration(_) | ChallengeState::LocalAttestedRegistration(_) => {
+                Err(OwnerWebauthnError::ChallengeKindMismatch)
+            }
         }
     }
 
@@ -569,7 +672,9 @@ impl OwnerWebauthnChallengeStore {
             .ok_or(OwnerWebauthnError::ChallengeNotFound)?;
         match stored.state {
             ChallengeState::Authentication(state) => Ok(state),
-            ChallengeState::Registration(_) => Err(OwnerWebauthnError::ChallengeKindMismatch),
+            ChallengeState::Registration(_) | ChallengeState::LocalAttestedRegistration(_) => {
+                Err(OwnerWebauthnError::ChallengeKindMismatch)
+            }
         }
     }
 }
@@ -577,6 +682,7 @@ impl OwnerWebauthnChallengeStore {
 #[derive(Debug)]
 pub struct OwnerWebauthnRp {
     webauthn: Webauthn,
+    webauthn_core: WebauthnCore,
     config: OwnerWebauthnConfig,
     challenges: OwnerWebauthnChallengeStore,
 }
@@ -590,8 +696,10 @@ impl OwnerWebauthnRp {
     /// rejects the RP ID / origin pair.
     pub fn new(config: OwnerWebauthnConfig) -> Result<Self, OwnerWebauthnError> {
         let webauthn = config.build_webauthn()?;
+        let webauthn_core = config.build_webauthn_core();
         Ok(Self {
             webauthn,
+            webauthn_core,
             config,
             challenges: OwnerWebauthnChallengeStore::default(),
         })
@@ -717,6 +825,39 @@ impl OwnerWebauthnRp {
             id.clone(),
             state,
             input.binding,
+            now_unix + self.config.challenge_ttl().as_secs(),
+        );
+        Ok((id, challenge))
+    }
+
+    /// Start the macOS local attested first-registration ceremony.
+    ///
+    /// This is the A-now foundation for the Apple Anonymous policy path. It
+    /// uses the webauthn-rs core builder because the safe attested-passkey
+    /// helper does not expose Apple Anonymous as an accepted attestation
+    /// format. The resulting state is stored under a distinct challenge kind,
+    /// so the existing Passkey finish path cannot consume it by accident.
+    pub fn start_macos_local_attested_registration_from(
+        &mut self,
+        rng: &mut impl RngCore,
+        now_unix: u64,
+        input: &OwnerWebauthnRegistrationStart<'_>,
+    ) -> Result<(OwnerWebauthnChallengeId, CreationChallengeResponse), OwnerWebauthnError> {
+        let exclude_credentials = input
+            .existing_credentials
+            .iter()
+            .filter(|credential| !credential.is_revoked())
+            .map(|credential| credential.passkey().cred_id().clone())
+            .collect::<Vec<_>>();
+        let (challenge, state) = macos_local_attested_registration::start(
+            &self.webauthn_core,
+            input,
+            exclude_credentials,
+        )?;
+        let id = OwnerWebauthnChallengeId::random(rng);
+        self.challenges.insert_local_attested_registration(
+            id.clone(),
+            state,
             now_unix + self.config.challenge_ttl().as_secs(),
         );
         Ok((id, challenge))
@@ -911,7 +1052,8 @@ mod tests {
     use serde_json::json;
     use webauthn_authenticator_rs::WebauthnAuthenticator;
     use webauthn_authenticator_rs::softpasskey::SoftPasskey;
-    use webauthn_rs::prelude::Url;
+    use webauthn_rs::prelude::{AttestationFormat, AuthenticatorAttachment, Url};
+    use webauthn_rs_core::proto::{AttestationConveyancePreference, UserVerificationPolicy};
 
     use super::*;
 
@@ -1156,6 +1298,57 @@ mod tests {
         rp.finish_registration_with_binding(NOW, &challenge_id, &response, &expected)
             .unwrap();
         assert_eq!(rp.challenge_store_len(), 0);
+    }
+
+    #[test]
+    fn macos_local_attested_registration_requests_apple_anonymous_and_separates_state() {
+        let mut rp = rp();
+        let mut rng = StdRng::seed_from_u64(4303);
+        let (challenge_id, challenge) = rp
+            .start_macos_local_attested_registration_from(
+                &mut rng,
+                NOW,
+                &OwnerWebauthnRegistrationStart {
+                    owner_user_id: Uuid::new_v4(),
+                    owner_name: "owner-alpha",
+                    owner_display_name: "Owner Alpha",
+                    existing_credentials: &[],
+                    binding: None,
+                },
+            )
+            .unwrap();
+
+        assert!(matches!(
+            challenge.public_key.attestation.as_ref(),
+            Some(AttestationConveyancePreference::Direct)
+        ));
+        assert_eq!(
+            challenge
+                .public_key
+                .attestation_formats
+                .as_ref()
+                .map(Vec::as_slice),
+            Some([AttestationFormat::AppleAnonymous].as_slice())
+        );
+        let selection = challenge
+            .public_key
+            .authenticator_selection
+            .as_ref()
+            .expect("local attested start requests authenticator selection");
+        assert_eq!(
+            selection.authenticator_attachment,
+            Some(AuthenticatorAttachment::Platform)
+        );
+        assert_eq!(
+            selection.user_verification,
+            UserVerificationPolicy::Required
+        );
+        assert!(selection.require_resident_key);
+        assert!(matches!(
+            rp.challenges.registration(&challenge_id, NOW),
+            Err(OwnerWebauthnError::ChallengeKindMismatch)
+        ));
+        assert_eq!(rp.challenge_store_len(), 1);
     }
 
     #[test]
