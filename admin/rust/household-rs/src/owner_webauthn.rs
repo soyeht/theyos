@@ -1754,7 +1754,7 @@ mod tests {
         assert_eq!(client_data_string(&client_data, "type"), "webauthn.create");
         let challenge = client_data_string(&client_data, "challenge").to_string();
         if client_data_string(&client_data, "origin") != fixture.origin {
-            panic!("clientDataJSON origin matches fixture origin");
+            panic!("clientDataJSON origin must match fixture origin");
         }
 
         let config =
