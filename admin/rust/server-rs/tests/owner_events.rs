@@ -4704,6 +4704,77 @@ async fn owner_webauthn_recovery_start_policy_default_off_is_opaque() {
 }
 
 #[tokio::test]
+async fn owner_webauthn_recovery_provision_reviewed_rollout_uses_recovery_code_switch() {
+    let (
+        td,
+        router,
+        _log,
+        _broadcaster,
+        person,
+        identity,
+        _window,
+        _webauthn_anchor,
+        recovery_anchor,
+        mut authenticator,
+        _state,
+    ) = router_with_owner_webauthn_recovery_with_state(
+        Duration::from_secs(45),
+        OwnerApprovalEnforcementPolicy::reviewed_core_v2_rollout(),
+        Some(100),
+    );
+
+    let start = start_recovery(router.clone(), &person).await;
+    assert_eq!(start.context.op, OwnerOperation::ProvisionRecoveryCode);
+    assert_eq!(start.context.pre_active_credential_count, Some(1));
+    assert_eq!(
+        start.context.capabilities,
+        vec!["owner-auth-recovery-provision".to_string()],
+        "reviewed-core-v2 must enable recovery through the dedicated recovery-code policy"
+    );
+    assert!(
+        read_owner_webauthn_recovery_anchor(recovery_anchor.as_ref(), &identity.record.hh_id)
+            .unwrap()
+            .is_none(),
+        "recovery provision start must stay challenge-only under the reviewed rollout"
+    );
+
+    let assertion = authenticator
+        .do_authentication(
+            Url::parse("https://alpha.example.test").unwrap(),
+            start.options,
+        )
+        .unwrap();
+    let finish = recovery_finish(
+        router,
+        &person,
+        recovery_finish_body(start.context, start.challenge_id, &assertion),
+    )
+    .await;
+
+    assert!(finish.recovery_ready);
+    assert!(!finish.recovery_code.is_empty());
+    let loaded = load_owner_auth(&td, &identity);
+    assert_eq!(loaded.owner_webauthn_recovery.entries().len(), 1);
+    assert!(matches!(
+        loaded.owner_webauthn_recovery.entries()[0].event.action,
+        OwnerWebauthnRecoveryEventAction::Provision { .. }
+    ));
+    let head = verified_owner_webauthn_recovery_head(
+        &loaded.owner_webauthn_recovery,
+        &identity.record,
+        &loaded.owner_person_cert,
+    )
+    .unwrap()
+    .expect("reviewed rollout recovery provision has a head");
+    let anchor =
+        read_owner_webauthn_recovery_anchor(recovery_anchor.as_ref(), &identity.record.hh_id)
+            .unwrap()
+            .expect("reviewed rollout recovery provision advances the recovery anchor");
+    assert_eq!(anchor.sequence(), head.sequence);
+    assert_eq!(anchor.head_hash(), head.head_hash);
+}
+
+#[tokio::test]
 async fn owner_webauthn_recovery_provision_persists_verifier_and_anchor_without_plaintext() {
     let (
         td,
