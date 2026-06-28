@@ -4,9 +4,10 @@ Blocking follow-up from the M1b macOS local enrollment review.
 
 As of 2026-06-28, the selected strategy is **A-now**: build the Apple
 Anonymous attestation path rather than deferring macOS-local enrollment. The
-first A-now slice is still only a foundation: local start may request and stage
-an attested Apple Anonymous ceremony, but local finish remains inert until the
-server-side proof and commit path land.
+current A-now work is still foundation-only: local start may request and stage
+an attested Apple Anonymous ceremony, and the backend may model/verify the
+Apple proof in an inert helper, but local finish remains inert until the active
+commit path lands.
 
 ## Symptom / issue
 
@@ -20,7 +21,9 @@ The macOS local enrollment route has two independent gates:
   server-side to come from an acceptable platform authenticator with user
   verification before local finish can commit it.
 
-Gate 1 is implemented. Gate 2 is not. The local finish must therefore remain
+Gate 1 is implemented. Gate 2 is being staged in slices: request/state
+foundation first, then proof/model helper, then active commit. Until the active
+commit slice lands, the local HTTP finish must remain
 `local_attestation_constraints_unavailable`.
 
 The platform option added for local start is only request shaping. In the
@@ -36,19 +39,22 @@ Selected strategy: **A-now / Apple Anonymous attestation path**.
 
 Do not activate macOS local finish with the current `Passkey` path or with
 request-shaped options alone. The route may support peer-authenticated
-start/status and may stage a distinct `LocalAttestedRegistration` challenge for
-the Apple Anonymous path, but it must not call `finish_registration`,
-`sign_genesis`, save owner auth, update memory, or advance the WebAuthn anchor
-until Gate 2 is explicitly solved.
+start/status, may stage a distinct `LocalAttestedRegistration` challenge for the
+Apple Anonymous path, and may expose an internal `VerifiedLocalAppleAttestedCredential`
+proof object after Apple-root/flag checks. The HTTP local finish still must not
+call `finish_registration`, `sign_genesis`, save owner auth, update memory, or
+advance the WebAuthn anchor until the active commit slice explicitly solves
+Gate 2.
 
 The attested challenge state must remain separate from normal
-`PasskeyRegistration` state. Normal TCP finish must reject it opaquely, and
-local finish must stay `local_attestation_constraints_unavailable` before any
-attestation consume, conversion, CA/root policy, storage, or commit work.
+`PasskeyRegistration` state. Normal TCP finish must reject it opaquely. The
+internal proof/model helper may consume only `LocalAttestedRegistration` state,
+but the HTTP local finish must stay `local_attestation_constraints_unavailable`
+before any storage or commit work.
 
 ## Acceptable active-finish policy
 
-Active local finish requires the next architecture/security slice. The minimum
+Active local finish requires a later architecture/security slice. The minimum
 acceptable shape is:
 
 - Apple WebAuthn anonymous attestation is verified against the pinned Apple
@@ -66,6 +72,8 @@ acceptable shape is:
   iOS, recovery, and AddCredential paths cannot silently weaken.
 - Attestation evidence or verified metadata is retained or audited in a way
   that makes future review/debugging possible.
+- The active commit path accepts only a typed verified proof object, not an
+  unchecked `Credential` or generic `Passkey` conversion.
 
 Apple Anonymous attestation may not expose a Mac model AAGUID. That gap is a
 policy decision, not an implementation detail: accepting Apple Anonymous means
@@ -91,7 +99,8 @@ server-side proof is available.
 ## Files of interest
 
 - `admin/rust/household-rs/src/owner_webauthn.rs` - registration challenge
-  state, platform local start helper, and normal passkey finish path.
+  state, platform local start helper, inert Apple proof model, and normal
+  passkey finish path.
 - `admin/rust/server-rs/src/handlers_owner_events.rs` - macOS local registration
   wrappers and inert local finish.
 - `admin/rust/server-rs/src/macos_local_caller_auth.rs` - Gate 1 caller-auth

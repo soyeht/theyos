@@ -3109,18 +3109,33 @@ fn owner_webauthn_registration_status_source_guards_read_only_contract() {
 fn owner_webauthn_registration_local_source_guards_fail_closed_boundary() {
     let source = include_str!("../src/handlers_owner_events.rs");
     let rp_source = include_str!("../../household-rs/src/owner_webauthn.rs");
+    let rp_runtime_source = rp_source
+        .split("#[cfg(test)]")
+        .next()
+        .expect("runtime source segment exists");
     assert!(source.contains(
         "OWNER_WEBAUTHN_REGISTRATION_LOCAL_START_PATH: &str =\n    \"/api/v1/household/owner-webauthn/registration/local/start\""
     ));
-    assert!(rp_source.contains("mod macos_local_attested_registration"));
-    assert!(rp_source.contains("LocalAttestedRegistration"));
-    assert!(rp_source.contains("AttestationFormat::AppleAnonymous"));
-    assert!(rp_source.contains("AttestationConveyancePreference::Direct"));
-    assert!(rp_source.contains("reject_synchronised_authenticators(true)"));
-    assert!(rp_source.contains("does not expose Apple Anonymous"));
-    assert!(!rp_source.contains("APPLE_WEBAUTHN_ROOT_CA"));
-    assert!(!rp_source.contains("finish_attested_passkey_registration"));
-    assert!(!rp_source.contains("AttestationCaList"));
+    assert!(rp_runtime_source.contains("mod macos_local_attested_registration"));
+    assert!(rp_runtime_source.contains("LocalAttestedRegistration"));
+    assert!(rp_runtime_source.contains("AttestationFormat::AppleAnonymous"));
+    assert!(rp_runtime_source.contains("AttestationConveyancePreference::Direct"));
+    assert!(rp_runtime_source.contains("reject_synchronised_authenticators(true)"));
+    assert!(rp_runtime_source.contains("does not expose Apple Anonymous"));
+    assert!(rp_runtime_source.contains("APPLE_WEBAUTHN_ROOT_CA_PEM"));
+    assert!(rp_runtime_source.contains("APPLE_WEBAUTHN_ROOT_CA_SHA256_FINGERPRINT"));
+    assert!(rp_runtime_source.contains("VerifiedLocalAppleAttestedCredential"));
+    assert!(rp_runtime_source.contains("fn local_attested_passkey_from_verified_credential"));
+    assert_eq!(
+        rp_runtime_source
+            .matches("let passkey: Passkey = verified.credential.into();")
+            .count(),
+        1
+    );
+    assert!(!rp_runtime_source.contains("AttestationCaList::default()"));
+    assert!(!rp_runtime_source.contains("finish_attested_passkey_registration"));
+    assert!(!rp_runtime_source.contains("Passkey::from("));
+    assert!(!rp_runtime_source.contains("Into::<Passkey>"));
     assert!(source.contains(
         "OWNER_WEBAUTHN_REGISTRATION_LOCAL_FINISH_PATH: &str =\n    \"/api/v1/household/owner-webauthn/registration/local/finish\""
     ));
@@ -3181,6 +3196,7 @@ fn owner_webauthn_registration_local_source_guards_fail_closed_boundary() {
     assert!(!local_finish.contains("AttestationCaList"));
     assert!(!local_finish.contains("finish_attested"));
     assert!(!local_finish.contains("finish_passkey_registration"));
+    assert!(!local_finish.contains("finish_macos_local_attested_registration"));
 
     let local_status = source_segment(
         source,

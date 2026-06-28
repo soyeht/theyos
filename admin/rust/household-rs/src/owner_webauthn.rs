@@ -19,7 +19,7 @@ use webauthn_rs::prelude::{
     RequestChallengeResponse, Url, Uuid, Webauthn, WebauthnBuilder, WebauthnError,
 };
 use webauthn_rs_core::WebauthnCore;
-use webauthn_rs_core::proto::RegistrationState;
+use webauthn_rs_core::proto::{AttestationFormat, Credential, RegistrationState};
 
 use crate::owner_approval_v2::{OwnerApprovalContextV2, OwnerOperation};
 
@@ -28,24 +28,57 @@ const REGISTRATION_BINDING_DOMAIN: &[u8] = b"soyeht-owner-webauthn-registration-
 
 mod macos_local_attested_registration {
     use webauthn_rs::prelude::{
-        AttestationFormat, AuthenticatorAttachment, CreationChallengeResponse, CredentialID,
+        AttestationCaList, AttestationFormat, AuthenticatorAttachment, CreationChallengeResponse,
+        CredentialID, Passkey, RegisterPublicKeyCredential,
     };
     use webauthn_rs_core::WebauthnCore;
     use webauthn_rs_core::proto::{
-        AttestationConveyancePreference, CredProtect, CredentialProtectionPolicy,
-        PublicKeyCredentialHints, RegistrationState, RequestRegistrationExtensions,
-        UserVerificationPolicy,
+        AttestationConveyancePreference, CredProtect, Credential, CredentialProtectionPolicy,
+        ParsedAttestationData, PublicKeyCredentialHints, RegistrationState,
+        RequestRegistrationExtensions, UserVerificationPolicy,
     };
 
-    use super::{OwnerWebauthnError, OwnerWebauthnRegistrationStart};
+    use super::{
+        OwnerWebauthnError, OwnerWebauthnLocalAttestationEvidence, OwnerWebauthnRegistrationStart,
+        VerifiedLocalAppleAttestedCredential,
+    };
+
+    pub(super) const APPLE_WEBAUTHN_ROOT_POLICY_VERSION: &str = "apple-webauthn-root-ca-2020-03-18";
+    pub(super) const APPLE_WEBAUTHN_ROOT_CA_SHA256_FINGERPRINT: &str = "09:15:DD:5C:07:A2:8D:B5:49:D1:F6:77:BB:5A:75:D4:BF:BE:95:61:A7:73:42:43:27:76:2E:9E:02:F9:BB:29";
+    /// Public Apple `WebAuthn` root CA from Apple's certificate authority listing.
+    ///
+    /// Provenance:
+    /// - <https://www.apple.com/certificateauthority/private/>
+    /// - <https://www.apple.com/certificateauthority/Apple_WebAuthn_Root_CA.pem>
+    /// - Same PEM is carried by `webauthn-rs-device-catalog 0.5.0-20230418`.
+    ///
+    /// This must remain a single Apple-only root policy. Do not replace it with
+    /// a default CA list, a platform trust store, or a broad device catalog.
+    /// Active local enrollment remains blocked until finish stores the
+    /// resulting evidence with the authority commit in a later slice.
+    const APPLE_WEBAUTHN_ROOT_CA_PEM: &[u8] = b"-----BEGIN CERTIFICATE-----
+MIICEjCCAZmgAwIBAgIQaB0BbHo84wIlpQGUKEdXcTAKBggqhkjOPQQDAzBLMR8w
+HQYDVQQDDBZBcHBsZSBXZWJBdXRobiBSb290IENBMRMwEQYDVQQKDApBcHBsZSBJ
+bmMuMRMwEQYDVQQIDApDYWxpZm9ybmlhMB4XDTIwMDMxODE4MjEzMloXDTQ1MDMx
+NTAwMDAwMFowSzEfMB0GA1UEAwwWQXBwbGUgV2ViQXV0aG4gUm9vdCBDQTETMBEG
+A1UECgwKQXBwbGUgSW5jLjETMBEGA1UECAwKQ2FsaWZvcm5pYTB2MBAGByqGSM49
+AgEGBSuBBAAiA2IABCJCQ2pTVhzjl4Wo6IhHtMSAzO2cv+H9DQKev3//fG59G11k
+xu9eI0/7o6V5uShBpe1u6l6mS19S1FEh6yGljnZAJ+2GNP1mi/YK2kSXIuTHjxA/
+pcoRf7XkOtO4o1qlcaNCMEAwDwYDVR0TAQH/BAUwAwEB/zAdBgNVHQ4EFgQUJtdk
+2cV4wlpn0afeaxLQG2PxxtcwDgYDVR0PAQH/BAQDAgEGMAoGCCqGSM49BAMDA2cA
+MGQCMFrZ+9DsJ1PW9hfNdBywZDsWDbWFp28it1d/5w2RPkRX3Bbn/UbDTNLx7Jr3
+jAGGiQIwHFj+dJZYUJR786osByBelJYsVZd2GbHQu209b5RCmGQ21gpSAk9QZW4B
+1bWeT0vT
+-----END CERTIFICATE-----";
 
     /// Build the macOS-local Apple Anonymous attested start challenge.
     ///
     /// This intentionally uses `webauthn-rs-core`: the safe `webauthn-rs`
     /// attested-passkey helper does not expose Apple Anonymous as an accepted
-    /// attestation format. This module only shapes and stages the challenge.
-    /// Server-side proof, Apple root policy, BE/BS handling, evidence storage,
-    /// and commit all remain outside this slice and must happen in local finish.
+    /// attestation format. This function only shapes and stages the challenge.
+    /// The proof helper below verifies Apple root and credential flags, but the
+    /// HTTP local finish route remains inert and evidence storage/commit remain
+    /// outside this slice.
     pub(super) fn start(
         webauthn_core: &WebauthnCore,
         input: &OwnerWebauthnRegistrationStart<'_>,
@@ -80,6 +113,75 @@ mod macos_local_attested_registration {
         webauthn_core
             .generate_challenge_register(builder)
             .map_err(OwnerWebauthnError::Ceremony)
+    }
+
+    pub(super) fn apple_webauthn_root_ca_list() -> Result<AttestationCaList, OwnerWebauthnError> {
+        AttestationCaList::try_from(APPLE_WEBAUTHN_ROOT_CA_PEM)
+            .map_err(|err| OwnerWebauthnError::LocalAttestationPolicy(err.to_string()))
+    }
+
+    pub(super) fn finish(
+        webauthn_core: &WebauthnCore,
+        credential: &RegisterPublicKeyCredential,
+        state: &RegistrationState,
+    ) -> Result<VerifiedLocalAppleAttestedCredential, OwnerWebauthnError> {
+        let apple_ca_list = apple_webauthn_root_ca_list()?;
+        let credential = webauthn_core
+            .register_credential(credential, state, Some(&apple_ca_list))
+            .map_err(OwnerWebauthnError::Ceremony)?;
+        verified_local_apple_attested_credential_from_core(credential)
+    }
+
+    pub(super) fn verified_local_apple_attested_credential_from_core(
+        credential: Credential,
+    ) -> Result<VerifiedLocalAppleAttestedCredential, OwnerWebauthnError> {
+        if credential.attestation_format != AttestationFormat::AppleAnonymous {
+            return Err(OwnerWebauthnError::LocalAttestationPolicy(
+                "local attestation format is not Apple Anonymous".into(),
+            ));
+        }
+        if !matches!(
+            &credential.attestation.data,
+            ParsedAttestationData::AnonCa(_)
+        ) {
+            return Err(OwnerWebauthnError::LocalAttestationPolicy(
+                "local attestation data is not anonymous CA verified".into(),
+            ));
+        }
+        if !credential.user_verified {
+            return Err(OwnerWebauthnError::LocalAttestationPolicy(
+                "local attestation is not user verified".into(),
+            ));
+        }
+        if credential.backup_eligible {
+            return Err(OwnerWebauthnError::LocalAttestationPolicy(
+                "local attestation is backup eligible".into(),
+            ));
+        }
+        if credential.backup_state {
+            return Err(OwnerWebauthnError::LocalAttestationPolicy(
+                "local attestation is backed up".into(),
+            ));
+        }
+        let evidence = OwnerWebauthnLocalAttestationEvidence {
+            attestation_format: credential.attestation_format.clone(),
+            user_verified: credential.user_verified,
+            backup_eligible: credential.backup_eligible,
+            backup_state: credential.backup_state,
+            root_policy_version: APPLE_WEBAUTHN_ROOT_POLICY_VERSION,
+            root_ca_sha256_fingerprint: APPLE_WEBAUTHN_ROOT_CA_SHA256_FINGERPRINT,
+        };
+        Ok(VerifiedLocalAppleAttestedCredential {
+            credential,
+            evidence,
+        })
+    }
+
+    pub(super) fn local_attested_passkey_from_verified_credential(
+        verified: VerifiedLocalAppleAttestedCredential,
+    ) -> (Passkey, OwnerWebauthnLocalAttestationEvidence) {
+        let passkey: Passkey = verified.credential.into();
+        (passkey, verified.evidence)
     }
 }
 
@@ -199,6 +301,80 @@ pub struct OwnerWebauthnCredential {
     passkey: Passkey,
     last_sign_count: u32,
     revoked: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OwnerWebauthnLocalAttestationEvidence {
+    attestation_format: AttestationFormat,
+    user_verified: bool,
+    backup_eligible: bool,
+    backup_state: bool,
+    root_policy_version: &'static str,
+    root_ca_sha256_fingerprint: &'static str,
+}
+
+impl OwnerWebauthnLocalAttestationEvidence {
+    #[must_use]
+    pub fn attestation_format(&self) -> &AttestationFormat {
+        &self.attestation_format
+    }
+
+    #[must_use]
+    pub fn user_verified(&self) -> bool {
+        self.user_verified
+    }
+
+    #[must_use]
+    pub fn backup_eligible(&self) -> bool {
+        self.backup_eligible
+    }
+
+    #[must_use]
+    pub fn backup_state(&self) -> bool {
+        self.backup_state
+    }
+
+    #[must_use]
+    pub fn root_policy_version(&self) -> &'static str {
+        self.root_policy_version
+    }
+
+    #[must_use]
+    pub fn root_ca_sha256_fingerprint(&self) -> &'static str {
+        self.root_ca_sha256_fingerprint
+    }
+}
+
+#[derive(Debug)]
+pub struct VerifiedLocalAppleAttestedCredential {
+    credential: Credential,
+    evidence: OwnerWebauthnLocalAttestationEvidence,
+}
+
+impl VerifiedLocalAppleAttestedCredential {
+    #[must_use]
+    pub fn credential_id_bytes(&self) -> &[u8] {
+        self.credential.cred_id.as_slice()
+    }
+
+    #[must_use]
+    pub fn evidence(&self) -> &OwnerWebauthnLocalAttestationEvidence {
+        &self.evidence
+    }
+
+    #[must_use]
+    pub fn into_owner_webauthn_credential(
+        self,
+    ) -> (
+        OwnerWebauthnCredential,
+        OwnerWebauthnLocalAttestationEvidence,
+    ) {
+        let (passkey, evidence) =
+            macos_local_attested_registration::local_attested_passkey_from_verified_credential(
+                self,
+            );
+        (OwnerWebauthnCredential::new(passkey), evidence)
+    }
 }
 
 impl OwnerWebauthnCredential {
@@ -341,6 +517,8 @@ pub enum OwnerWebauthnError {
     ChallengeContext(String),
     #[error("registration binding failed validation: {0}")]
     RegistrationBinding(String),
+    #[error("local Apple attestation policy failed: {0}")]
+    LocalAttestationPolicy(String),
     #[error("signature counter regressed: previous={previous}, next={next}")]
     SignCountRegression { previous: u32, next: u32 },
 }
@@ -485,7 +663,7 @@ struct StoredRegistrationChallenge {
 
 #[derive(Debug)]
 struct StoredLocalAttestedRegistrationChallenge {
-    _state: RegistrationState,
+    state: RegistrationState,
 }
 
 #[derive(Debug)]
@@ -562,10 +740,56 @@ impl OwnerWebauthnChallengeStore {
             StoredChallenge {
                 expires_at_unix,
                 state: ChallengeState::LocalAttestedRegistration(
-                    StoredLocalAttestedRegistrationChallenge { _state: state },
+                    StoredLocalAttestedRegistrationChallenge { state },
                 ),
             },
         );
+    }
+
+    fn local_attested_registration(
+        &self,
+        challenge_id: &OwnerWebauthnChallengeId,
+        now_unix: u64,
+    ) -> Result<&StoredLocalAttestedRegistrationChallenge, OwnerWebauthnError> {
+        let stored = self
+            .challenges
+            .get(challenge_id)
+            .ok_or(OwnerWebauthnError::ChallengeNotFound)?;
+        if now_unix > stored.expires_at_unix {
+            return Err(OwnerWebauthnError::ChallengeExpired);
+        }
+        match &stored.state {
+            ChallengeState::LocalAttestedRegistration(state) => Ok(state),
+            ChallengeState::Registration(_) | ChallengeState::Authentication(_) => {
+                Err(OwnerWebauthnError::ChallengeKindMismatch)
+            }
+        }
+    }
+
+    fn take_local_attested_registration(
+        &mut self,
+        challenge_id: &OwnerWebauthnChallengeId,
+        now_unix: u64,
+    ) -> Result<StoredLocalAttestedRegistrationChallenge, OwnerWebauthnError> {
+        let expires_at_unix = self
+            .challenges
+            .get(challenge_id)
+            .ok_or(OwnerWebauthnError::ChallengeNotFound)?
+            .expires_at_unix;
+        if now_unix > expires_at_unix {
+            self.challenges.remove(challenge_id);
+            return Err(OwnerWebauthnError::ChallengeExpired);
+        }
+        let stored = self
+            .challenges
+            .remove(challenge_id)
+            .ok_or(OwnerWebauthnError::ChallengeNotFound)?;
+        match stored.state {
+            ChallengeState::LocalAttestedRegistration(state) => Ok(state),
+            ChallengeState::Registration(_) | ChallengeState::Authentication(_) => {
+                Err(OwnerWebauthnError::ChallengeKindMismatch)
+            }
+        }
     }
 
     fn registration(
@@ -863,6 +1087,21 @@ impl OwnerWebauthnRp {
         Ok((id, challenge))
     }
 
+    pub fn finish_macos_local_attested_registration(
+        &mut self,
+        now_unix: u64,
+        challenge_id: &OwnerWebauthnChallengeId,
+        credential: &RegisterPublicKeyCredential,
+    ) -> Result<VerifiedLocalAppleAttestedCredential, OwnerWebauthnError> {
+        self.challenges
+            .local_attested_registration(challenge_id, now_unix)?;
+        let state = self
+            .challenges
+            .take_local_attested_registration(challenge_id, now_unix)?
+            .state;
+        macos_local_attested_registration::finish(&self.webauthn_core, credential, &state)
+    }
+
     pub fn finish_registration(
         &mut self,
         now_unix: u64,
@@ -1073,6 +1312,17 @@ mod tests {
         OwnerWebauthnRp::new(config()).unwrap()
     }
 
+    fn spectral_apple_fixture_rp() -> OwnerWebauthnRp {
+        let config = OwnerWebauthnConfig::new(
+            "spectral.local",
+            Url::parse("https://spectral.local:8443").unwrap(),
+            "Soyeht Spectral",
+        )
+        .unwrap()
+        .with_challenge_ttl(Duration::from_secs(60));
+        OwnerWebauthnRp::new(config).unwrap()
+    }
+
     fn synthetic_passkey(id: &[u8]) -> Passkey {
         let encoded_id = data_encoding::BASE64URL_NOPAD.encode(id);
         serde_json::from_value(json!({
@@ -1107,6 +1357,43 @@ mod tests {
 
     fn synthetic_credential(id: &[u8]) -> OwnerWebauthnCredential {
         OwnerWebauthnCredential::new(synthetic_passkey(id))
+    }
+
+    fn synthetic_core_credential(
+        id: &[u8],
+        attestation_format: &str,
+        attestation_data: serde_json::Value,
+        user_verified: bool,
+        backup_eligible: bool,
+        backup_state: bool,
+    ) -> Credential {
+        let encoded_id = data_encoding::BASE64URL_NOPAD.encode(id);
+        serde_json::from_value(json!({
+            "cred_id": encoded_id,
+            "cred": {
+                "type_": "ES256",
+                "key": {
+                    "EC_EC2": {
+                        "curve": "SECP256R1",
+                        "x": data_encoding::BASE64URL_NOPAD.encode(&[1_u8; 32]),
+                        "y": data_encoding::BASE64URL_NOPAD.encode(&[2_u8; 32])
+                    }
+                }
+            },
+            "counter": 0,
+            "transports": null,
+            "user_verified": user_verified,
+            "backup_eligible": backup_eligible,
+            "backup_state": backup_state,
+            "registration_policy": "required",
+            "extensions": {},
+            "attestation": {
+                "data": attestation_data,
+                "metadata": "None"
+            },
+            "attestation_format": attestation_format
+        }))
+        .unwrap()
     }
 
     fn household_id() -> HouseholdId {
@@ -1145,6 +1432,37 @@ mod tests {
             bytes,
         )
         .unwrap()
+    }
+
+    fn apple_anonymous_registration_response() -> RegisterPublicKeyCredential {
+        serde_json::from_value(json!({
+            "id": "u_tliFf-aXRLg9XIz-SuQ0XBlbE",
+            "rawId": "u_tliFf-aXRLg9XIz-SuQ0XBlbE",
+            "response": {
+                "attestationObject": "o2NmbXRlYXBwbGVnYXR0U3RtdKJjYWxnJmN4NWOCWQJHMIICQzCCAcmgAwIBAgIGAXZFUv6nMAoGCCqGSM49BAMCMEgxHDAaBgNVBAMME0FwcGxlIFdlYkF1dGhuIENBIDExEzARBgNVBAoMCkFwcGxlIEluYy4xEzARBgNVBAgMCkNhbGlmb3JuaWEwHhcNMjAxMjA4MDIyNzE1WhcNMjAxMjExMDIyNzE1WjCBkTFJMEcGA1UEAwxAOWFhOTBjN2M5MzZhNGUxYmI4Njg5NjVmMTQ3YTQzOTlmMTQwY2Y0MDliNDM0ZjkwNTliMmQ0ZjVhM2NmYzA5MjEaMBgGA1UECwwRQUFBIENlcnRpZmljYXRpb24xEzARBgNVBAoMCkFwcGxlIEluYy4xEzARBgNVBAgMCkNhbGlmb3JuaWEwWTATBgcqhkjOPQIBBggqhkjOPQMBBwNCAATU-GOH9U5e9ecWPuItKNcE-7y0fRbshaHqTvtpC3eUkGn5x6eYrV6TOQL6FQUzdK7ZJ6AjDPl47TSUq4aKzRqto1UwUzAMBgNVHRMBAf8EAjAAMA4GA1UdDwEB_wQEAwIE8DAzBgkqhkiG92NkCAIEJjAkoSIEIKjioMU9kg_qZHwWHSISq1v9elHxtmnw0YKwsz1Ut06-MAoGCCqGSM49BAMCA2gAMGUCMA7yhkkMMAJnuIS7hHzMP5SoTuHjofCTu1rYQZ9aamb5OJzJ1rYPrbun83_qiikyPgIxAMYPCraOZ1QHEgDngtYaQDoRdkIOxvQ60wJh7KN0fEmmRUVwa-RTaFvNFMv6fh2-KlkCODCCAjQwggG6oAMCAQICEFYlU5XHp_tA6-Io2CYIU7YwCgYIKoZIzj0EAwMwSzEfMB0GA1UEAwwWQXBwbGUgV2ViQXV0aG4gUm9vdCBDQTETMBEGA1UECgwKQXBwbGUgSW5jLjETMBEGA1UECAwKQ2FsaWZvcm5pYTAeFw0yMDAzMTgxODM4MDFaFw0zMDAzMTMwMDAwMDBaMEgxHDAaBgNVBAMME0FwcGxlIFdlYkF1dGhuIENBIDExEzARBgNVBAoMCkFwcGxlIEluYy4xEzARBgNVBAgMCkNhbGlmb3JuaWEwdjAQBgcqhkjOPQIBBgUrgQQAIgNiAASDLocvJhSRgQIlufX81rtjeLX1Xz_LBFvHNZk0df1UkETfm_4ZIRdlxpod2gULONRQg0AaQ0-yTREtVsPhz7_LmJH-wGlggb75bLx3yI3dr0alruHdUVta-quTvpwLJpGjZjBkMBIGA1UdEwEB_wQIMAYBAf8CAQAwHwYDVR0jBBgwFoAUJtdk2cV4wlpn0afeaxLQG2PxxtcwHQYDVR0OBBYEFOuugsT_oaxbUdTPJGEFAL5jvXeIMA4GA1UdDwEB_wQEAwIBBjAKBggqhkjOPQQDAwNoADBlAjEA3YsaNIGl-tnbtOdle4QeFEwnt1uHakGGwrFHV1Azcifv5VRFfvZIlQxjLlxIPnDBAjAsimBE3CAfz-Wbw00pMMFIeFHZYO1qdfHrSsq-OM0luJfQyAW-8Mf3iwelccboDgdoYXV0aERhdGFYmNoUsfKpHi3fFS3-SiJ9vGALAUcpOl78tKnz0RXnirZbRQAAAAAAAAAAAAAAAAAAAAAAAAAAABS7-2WIV_5pdEuD1cjP5K5DRcGVsaUBAgMmIAEhWCDU-GOH9U5e9ecWPuItKNcE-7y0fRbshaHqTvtpC3eUkCJYIGn5x6eYrV6TOQL6FQUzdK7ZJ6AjDPl47TSUq4aKzRqt",
+                "clientDataJSON": "eyJ0eXBlIjoid2ViYXV0aG4uY3JlYXRlIiwiY2hhbGxlbmdlIjoiSlRiazd5ZWtJS09aUXd3ZEdXN05lRElmeHJZSzBQdnVZeHN1ZS0tRzlOSSIsIm9yaWdpbiI6Imh0dHBzOi8vc3BlY3RyYWwubG9jYWw6ODQ0MyJ9"
+            },
+            "type": "public-key"
+        }))
+        .unwrap()
+    }
+
+    fn patch_local_attested_challenge_for_apple_fixture(
+        rp: &mut OwnerWebauthnRp,
+        challenge_id: &OwnerWebauthnChallengeId,
+    ) {
+        const APPLE_ANONYMOUS_CHALLENGE: &str = "JTbk7yekIKOZQwwdGW7NeDIfxrYK0PvuYxsue--G9NI";
+        let stored = rp
+            .challenges
+            .challenges
+            .get_mut(challenge_id)
+            .expect("local attested challenge exists");
+        let ChallengeState::LocalAttestedRegistration(local) = &mut stored.state else {
+            panic!("challenge is local attested");
+        };
+        let mut state = serde_json::to_value(&local.state).unwrap();
+        state["challenge"] = json!(APPLE_ANONYMOUS_CHALLENGE);
+        local.state = serde_json::from_value(state).unwrap();
     }
 
     fn register_with_softpasskey(
@@ -1348,6 +1666,155 @@ mod tests {
             rp.challenges.registration(&challenge_id, NOW),
             Err(OwnerWebauthnError::ChallengeKindMismatch)
         ));
+        assert_eq!(rp.challenge_store_len(), 1);
+    }
+
+    #[test]
+    fn local_apple_root_policy_is_single_pinned_root() {
+        let ca_list = macos_local_attested_registration::apple_webauthn_root_ca_list().unwrap();
+        assert_eq!(ca_list.len(), 1);
+        assert_eq!(
+            macos_local_attested_registration::APPLE_WEBAUTHN_ROOT_POLICY_VERSION,
+            "apple-webauthn-root-ca-2020-03-18"
+        );
+        assert_eq!(
+            macos_local_attested_registration::APPLE_WEBAUTHN_ROOT_CA_SHA256_FINGERPRINT,
+            "09:15:DD:5C:07:A2:8D:B5:49:D1:F6:77:BB:5A:75:D4:BF:BE:95:61:A7:73:42:43:27:76:2E:9E:02:F9:BB:29"
+        );
+    }
+
+    #[test]
+    fn macos_local_attested_registration_rejects_expired_apple_anonymous_fixture() {
+        let mut rp = spectral_apple_fixture_rp();
+        let mut rng = StdRng::seed_from_u64(4304);
+        let (challenge_id, _challenge) = rp
+            .start_macos_local_attested_registration_from(
+                &mut rng,
+                NOW,
+                &OwnerWebauthnRegistrationStart {
+                    owner_user_id: Uuid::new_v4(),
+                    owner_name: "owner-alpha",
+                    owner_display_name: "Owner Alpha",
+                    existing_credentials: &[],
+                    binding: None,
+                },
+            )
+            .unwrap();
+        patch_local_attested_challenge_for_apple_fixture(&mut rp, &challenge_id);
+        let response = apple_anonymous_registration_response();
+
+        let err = rp
+            .finish_macos_local_attested_registration(NOW, &challenge_id, &response)
+            .unwrap_err();
+
+        assert!(matches!(err, OwnerWebauthnError::Ceremony(_)));
+        assert_eq!(rp.challenge_store_len(), 0);
+    }
+
+    #[test]
+    fn local_apple_attestation_policy_requires_apple_uv_and_device_bound_flags() {
+        let accepted = synthetic_core_credential(
+            b"apple-local-credential",
+            "apple",
+            json!({ "AnonCa": [] }),
+            true,
+            false,
+            false,
+        );
+        let verified =
+            macos_local_attested_registration::verified_local_apple_attested_credential_from_core(
+                accepted,
+            )
+            .unwrap();
+        assert_eq!(verified.credential_id_bytes(), b"apple-local-credential");
+        assert_eq!(
+            verified.evidence().root_policy_version(),
+            macos_local_attested_registration::APPLE_WEBAUTHN_ROOT_POLICY_VERSION
+        );
+        let (owner_credential, evidence) = verified.into_owner_webauthn_credential();
+        assert_eq!(
+            owner_credential.credential_id_bytes(),
+            b"apple-local-credential"
+        );
+        assert_eq!(
+            evidence.root_ca_sha256_fingerprint(),
+            macos_local_attested_registration::APPLE_WEBAUTHN_ROOT_CA_SHA256_FINGERPRINT
+        );
+
+        let cases = [
+            synthetic_core_credential(
+                b"wrong-format",
+                "packed",
+                json!({ "AnonCa": [] }),
+                true,
+                false,
+                false,
+            ),
+            synthetic_core_credential(
+                b"wrong-attestation-data",
+                "apple",
+                json!("None"),
+                true,
+                false,
+                false,
+            ),
+            synthetic_core_credential(
+                b"uv-false",
+                "apple",
+                json!({ "AnonCa": [] }),
+                false,
+                false,
+                false,
+            ),
+            synthetic_core_credential(
+                b"backup-eligible",
+                "apple",
+                json!({ "AnonCa": [] }),
+                true,
+                true,
+                false,
+            ),
+            synthetic_core_credential(
+                b"backup-state",
+                "apple",
+                json!({ "AnonCa": [] }),
+                true,
+                false,
+                true,
+            ),
+        ];
+        for credential in cases {
+            let err =
+                macos_local_attested_registration::verified_local_apple_attested_credential_from_core(
+                    credential,
+                )
+                .unwrap_err();
+            assert!(matches!(err, OwnerWebauthnError::LocalAttestationPolicy(_)));
+        }
+    }
+
+    #[test]
+    fn local_attested_finish_rejects_normal_registration_challenge_without_consuming() {
+        let mut rp = rp();
+        let mut rng = StdRng::seed_from_u64(4306);
+        let (challenge_id, _challenge) = rp
+            .start_registration(
+                &mut rng,
+                NOW,
+                Uuid::new_v4(),
+                "owner-alpha",
+                "Owner Alpha",
+                &[],
+            )
+            .unwrap();
+        let response = apple_anonymous_registration_response();
+
+        let err = rp
+            .finish_macos_local_attested_registration(NOW, &challenge_id, &response)
+            .unwrap_err();
+
+        assert!(matches!(err, OwnerWebauthnError::ChallengeKindMismatch));
+        assert!(rp.challenges.registration(&challenge_id, NOW).is_ok());
         assert_eq!(rp.challenge_store_len(), 1);
     }
 
