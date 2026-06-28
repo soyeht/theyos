@@ -3,6 +3,7 @@
 
 use std::fs;
 use std::future::Future;
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -3076,6 +3077,79 @@ fn source_segment<'a>(source: &'a str, start: &str, end: &str) -> &'a str {
     &rest[..end_index]
 }
 
+fn path_has_component(path: &Path, component: &str) -> bool {
+    path.components()
+        .any(|entry| entry.as_os_str() == std::ffi::OsStr::new(component))
+}
+
+fn collect_runtime_rust_sources(dir: &Path, out: &mut Vec<PathBuf>) {
+    for entry in fs::read_dir(dir).unwrap_or_else(|e| panic!("read {}: {e}", dir.display())) {
+        let path = entry
+            .unwrap_or_else(|e| panic!("read entry under {}: {e}", dir.display()))
+            .path();
+        if path.is_dir() {
+            if path_has_component(&path, "target")
+                || path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with('.'))
+            {
+                continue;
+            }
+            collect_runtime_rust_sources(&path, out);
+        } else if path.extension().and_then(|ext| ext.to_str()) == Some("rs")
+            && path_has_component(&path, "src")
+        {
+            out.push(path);
+        }
+    }
+}
+
+fn assert_passkey_conversion_only_in_local_attested_helper() {
+    let admin_rust_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("server-rs parent is admin/rust")
+        .to_path_buf();
+    let mut sources = Vec::new();
+    collect_runtime_rust_sources(&admin_rust_dir, &mut sources);
+
+    let allowed_path = admin_rust_dir
+        .join("household-rs")
+        .join("src")
+        .join("owner_webauthn.rs");
+    let allowed_line = "let passkey: Passkey = verified.credential.into();";
+    let dangerous_patterns = [
+        "Passkey::from(",
+        "Into::<Passkey>",
+        ": Passkey =",
+        "credential.into()",
+    ];
+    let mut violations = Vec::new();
+
+    for path in sources {
+        let source = fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("read runtime source {}: {e}", path.display()));
+        for (index, line) in source.lines().enumerate() {
+            if !dangerous_patterns
+                .iter()
+                .any(|pattern| line.contains(pattern))
+            {
+                continue;
+            }
+            if path == allowed_path && line.contains(allowed_line) {
+                continue;
+            }
+            violations.push(format!("{}:{}: {}", path.display(), index + 1, line.trim()));
+        }
+    }
+
+    assert!(
+        violations.is_empty(),
+        "Credential -> Passkey conversion must stay allowlisted in the local attested proof-object helper:\n{}",
+        violations.join("\n")
+    );
+}
+
 #[test]
 fn owner_webauthn_registration_status_source_guards_read_only_contract() {
     let source = include_str!("../src/handlers_owner_events.rs");
@@ -3132,6 +3206,7 @@ fn owner_webauthn_registration_local_source_guards_fail_closed_boundary() {
             .count(),
         1
     );
+    assert_passkey_conversion_only_in_local_attested_helper();
     assert!(!rp_runtime_source.contains("AttestationCaList::default()"));
     assert!(!rp_runtime_source.contains("finish_attested_passkey_registration"));
     assert!(!rp_runtime_source.contains("Passkey::from("));
