@@ -7917,7 +7917,7 @@ async fn approve_happy_path_drives_commit() {
 }
 
 #[tokio::test]
-async fn approve_policy_on_without_passkey_keeps_legacy_path() {
+async fn approve_reviewed_rollout_trust_state_never_enrolled_keeps_legacy_path() {
     let (td, router, log, _broadcaster, person, identity, window) =
         router_with_v2_policy_without_passkey(Duration::from_secs(45));
     fs::write(household_root_sole_path(td.path()), b"fake-sole-shard").unwrap();
@@ -7967,12 +7967,11 @@ async fn approve_policy_on_without_passkey_keeps_legacy_path() {
 }
 
 #[tokio::test]
-async fn approve_policy_on_with_passkey_without_anchor_fails_closed() {
+async fn approve_reviewed_rollout_trust_state_missing_anchor_fails_closed() {
     let td = tempfile::tempdir().unwrap();
     let identity = Arc::new(bootstrap(td.path()));
     let (owner_auth, person, rp, _authenticator) = owner_auth_with_webauthn_credential(&identity);
-    let policy = OwnerApprovalEnforcementPolicy::default()
-        .with_pair_machine_approve(OwnerOperationEnforcement::V2WhenOwnerHasActiveCredential);
+    let policy = OwnerApprovalEnforcementPolicy::reviewed_core_v2_rollout();
     let (_td, router, log, _broadcaster, person, identity, window) = router_from_owner_auth(
         td,
         identity,
@@ -8095,7 +8094,7 @@ async fn approval_v2_start_does_not_migrate_missing_anchor_on_request_path() {
 }
 
 #[tokio::test]
-async fn approve_policy_on_all_revoked_passkeys_rejects_legacy_path() {
+async fn approve_reviewed_rollout_trust_state_recovery_required_rejects_legacy_path() {
     let td = tempfile::tempdir().unwrap();
     let identity = Arc::new(bootstrap(td.path()));
     let (owner_auth, person, rp) = owner_auth_with_revoked_webauthn_credential(&identity);
@@ -8109,8 +8108,7 @@ async fn approve_policy_on_all_revoked_passkeys_rejects_legacy_path() {
         OwnerWebauthnAnchorMode::MigrationDefaultOff,
     )
     .unwrap();
-    let policy = OwnerApprovalEnforcementPolicy::default()
-        .with_pair_machine_approve(OwnerOperationEnforcement::V2WhenOwnerHasActiveCredential);
+    let policy = OwnerApprovalEnforcementPolicy::reviewed_core_v2_rollout();
     let (_td, router, log, _broadcaster, person, identity, window) = router_from_owner_auth(
         td,
         identity,
@@ -8166,7 +8164,7 @@ async fn approve_policy_on_all_revoked_passkeys_rejects_legacy_path() {
 }
 
 #[tokio::test]
-async fn approval_v2_start_rejects_recovery_required_without_legacy_fallback() {
+async fn approval_v2_start_reviewed_rollout_trust_state_recovery_required_fails_closed() {
     let td = tempfile::tempdir().unwrap();
     let identity = Arc::new(bootstrap(td.path()));
     let (owner_auth, person, rp) = owner_auth_with_revoked_webauthn_credential(&identity);
@@ -8180,8 +8178,7 @@ async fn approval_v2_start_rejects_recovery_required_without_legacy_fallback() {
         OwnerWebauthnAnchorMode::MigrationDefaultOff,
     )
     .unwrap();
-    let policy = OwnerApprovalEnforcementPolicy::default()
-        .with_pair_machine_approve(OwnerOperationEnforcement::V2WhenOwnerHasActiveCredential);
+    let policy = OwnerApprovalEnforcementPolicy::reviewed_core_v2_rollout();
     let (_td, router, log, _broadcaster, person, identity, window) = router_from_owner_auth(
         td,
         identity,
@@ -8234,7 +8231,7 @@ async fn approval_v2_start_rejects_recovery_required_without_legacy_fallback() {
 }
 
 #[tokio::test]
-async fn approve_policy_on_empty_authority_with_anchor_fails_closed() {
+async fn approve_reviewed_rollout_trust_state_empty_authority_with_anchor_fails_closed() {
     let td = tempfile::tempdir().unwrap();
     let identity = Arc::new(bootstrap(td.path()));
     let (owner_auth, person) = owner_auth_for(&identity);
@@ -8247,8 +8244,7 @@ async fn approve_policy_on_empty_authority_with_anchor_fails_closed() {
         [0x42; 32],
     );
     write_owner_webauthn_authority_anchor(anchor_store.as_ref(), &stale_anchor).unwrap();
-    let policy = OwnerApprovalEnforcementPolicy::default()
-        .with_pair_machine_approve(OwnerOperationEnforcement::V2WhenOwnerHasActiveCredential);
+    let policy = OwnerApprovalEnforcementPolicy::reviewed_core_v2_rollout();
     let (_td, router, log, _broadcaster, person, identity, window) = router_from_owner_auth(
         td,
         identity,
@@ -8300,6 +8296,90 @@ async fn approve_policy_on_empty_authority_with_anchor_fails_closed() {
         PairMachineState::AwaitingOwner
     );
     assert!(log.read_since(event.cursor).unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn approve_reviewed_rollout_trust_state_rollback_or_divergent_anchor_fails_closed() {
+    for anchor in ["rollback", "divergent"] {
+        let td = tempfile::tempdir().unwrap();
+        let identity = Arc::new(bootstrap(td.path()));
+        let (owner_auth, person, rp, _authenticator) =
+            owner_auth_with_webauthn_credential(&identity);
+        let anchor_store: Arc<dyn keystore_rs::KeystoreBackend> =
+            Arc::new(FileKeystore::new(td.path(), keystore_rs::SERVICE));
+        let stale_anchor = match anchor {
+            "rollback" => OwnerWebauthnAuthorityAnchor::new(
+                &identity.record,
+                &owner_auth.owner_person_cert,
+                1,
+                [0x42; 32],
+            ),
+            "divergent" => OwnerWebauthnAuthorityAnchor::new(
+                &identity.record,
+                &owner_auth.owner_person_cert,
+                0,
+                [0x43; 32],
+            ),
+            _ => unreachable!(),
+        };
+        write_owner_webauthn_authority_anchor(anchor_store.as_ref(), &stale_anchor).unwrap();
+        let policy = OwnerApprovalEnforcementPolicy::reviewed_core_v2_rollout();
+        let (_td, router, log, _broadcaster, person, identity, window) =
+            router_from_owner_auth(td, identity, owner_auth, person, Duration::from_secs(45), {
+                let anchor_store = Arc::clone(&anchor_store);
+                move |state| {
+                    state
+                        .with_owner_approval_policy(policy)
+                        .with_owner_webauthn_rp(rp)
+                        .with_owner_webauthn_anchor(anchor_store)
+                }
+            });
+        let candidate = start_candidate_harness().await;
+        let event = stage_prepared_join_window(&window, &log, &identity, &candidate).await;
+        let uri = format!("/api/v1/household/owner-events/{}/approve", event.cursor);
+        let timestamp = unix_now();
+        let body = approval_body(
+            &identity,
+            &person,
+            event.cursor,
+            candidate.prepared.join_request.challenge_sig.clone(),
+            timestamp,
+        );
+        let auth = pop_header_for(&person, "POST", &uri, timestamp, &body);
+
+        let resp = router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(uri)
+                    .header(header::AUTHORIZATION, auth)
+                    .header(header::CONTENT_TYPE, "application/cbor")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = resp.status();
+        let resp_bytes = to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .to_vec();
+
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        let parsed: GenericUnauth = household_rs::cbor::from_canonical_slice(&resp_bytes).unwrap();
+        assert_eq!(parsed.error, "unauthenticated");
+        assert_eq!(
+            window.snapshot().await.state,
+            PairMachineState::AwaitingOwner
+        );
+        assert!(log.read_since(event.cursor).unwrap().is_empty());
+        let persisted =
+            read_owner_webauthn_authority_anchor(anchor_store.as_ref(), &identity.record.hh_id)
+                .unwrap()
+                .expect("fail-closed path leaves invalid anchor untouched");
+        assert_eq!(persisted.sequence(), stale_anchor.sequence());
+        assert_eq!(persisted.head_hash(), stale_anchor.head_hash());
+    }
 }
 
 #[tokio::test]
