@@ -121,7 +121,7 @@ fn owner_webauthn_registration_start_response_vectors_are_canonical() {
         "soyeht-owner-webauthn-registration-cbor-cross-language"
     );
     assert_eq!(fixture.version, 1);
-    assert_eq!(fixture.start_responses.len(), 3);
+    assert_eq!(fixture.start_responses.len(), 4);
 
     for vector in &fixture.start_responses {
         let typed: OwnerWebauthnRegistrationStartResponse =
@@ -159,6 +159,69 @@ fn owner_webauthn_registration_start_response_vectors_are_canonical() {
             .and_then(Value::as_array)
             .is_some_and(Vec::is_empty),
         "realistic start vector must pin empty excludeCredentials as []",
+    );
+
+    let local = case_by_id(
+        &fixture.start_responses,
+        "start-macos-local-attested-options",
+    );
+    assert_eq!(
+        json_path(local, &["options", "publicKey", "attestation"]),
+        "direct"
+    );
+    assert_eq!(
+        local
+            .input
+            .pointer("/options/publicKey/attestationFormats/0")
+            .and_then(Value::as_str),
+        Some("apple")
+    );
+    assert_eq!(
+        json_path(
+            local,
+            &[
+                "options",
+                "publicKey",
+                "authenticatorSelection",
+                "authenticatorAttachment",
+            ],
+        ),
+        "platform"
+    );
+    assert_eq!(
+        json_path(
+            local,
+            &[
+                "options",
+                "publicKey",
+                "authenticatorSelection",
+                "residentKey",
+            ],
+        ),
+        "required"
+    );
+    assert_eq!(
+        local
+            .input
+            .pointer("/options/publicKey/hints/0")
+            .and_then(Value::as_str),
+        Some("client-device")
+    );
+    assert!(
+        local
+            .input
+            .pointer("/options/publicKey/authenticatorSelection/requireResidentKey")
+            .and_then(Value::as_bool)
+            .is_some_and(|value| value),
+        "local start vector must request resident credentials",
+    );
+    assert!(
+        local
+            .input
+            .pointer("/options/publicKey/extensions/enforceCredentialProtectionPolicy")
+            .and_then(Value::as_bool)
+            .is_some_and(|value| value),
+        "local start vector must request enforced UV credential protection",
     );
 }
 
