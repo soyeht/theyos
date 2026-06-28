@@ -65,6 +65,18 @@ in
       description = "Network access mode.";
     };
 
+    ownerAuthV2Rollout = lib.mkOption {
+      type = lib.types.enum [ "legacy" "reviewed-core-v2" ];
+      default = "legacy";
+      description = ''
+        Owner-auth v2 rollout value rendered into
+        THEYOS_OWNER_AUTH_V2_ROLLOUT. The default `legacy` keeps every
+        owner-auth operation on LegacyOnly behavior. `reviewed-core-v2` is the
+        explicit future flip value and must only be set after the reviewed
+        flip decision/sign-offs.
+      '';
+    };
+
     # Secrets — all types.str (runtime paths), NEVER types.path.
     secretsDir = lib.mkOption {
       type = lib.types.str;
@@ -659,6 +671,7 @@ in
           --set "THEYOS_SESSION_PEPPER=$PEPPER" \
           --set THEYOS_HOME=/home/${cfg.user} \
           --set ACCESS_MODE=${cfg.accessMode} \
+          --set THEYOS_OWNER_AUTH_V2_ROLLOUT=${cfg.ownerAuthV2Rollout} \
           --set ADMIN_PORT=${toString cfg.adminPort} \
           --set THEYOS_BASE_DOMAIN=${cfg.domain} \
           --set THEYOS_BOOTSTRAP_TOKEN_PATH=${cfg.secretsDir}/bootstrap-token \

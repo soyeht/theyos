@@ -471,6 +471,7 @@ run_phase4() {
             --set "THEYOS_SESSION_PEPPER=abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890" \
             --set THEYOS_HOME=/root \
             --set ACCESS_MODE=local \
+            --set THEYOS_OWNER_AUTH_V2_ROLLOUT=legacy \
             --set ADMIN_PORT=8892 \
             --set THEYOS_BASE_DOMAIN=localhost \
             --output /root/theyos-test/.env 2>&1 || true
@@ -483,6 +484,12 @@ run_phase4() {
             pass ".env contains substituted password"
         else
             fail ".env password substitution failed"
+        fi
+
+        if run_in 'grep -q "^THEYOS_OWNER_AUTH_V2_ROLLOUT=legacy$" /root/theyos-test/.env'; then
+            pass ".env contains default-off owner-auth rollout control"
+        else
+            fail ".env owner-auth rollout control missing or not default-off"
         fi
     else
         fail "soyeht render-env failed"

@@ -13,6 +13,9 @@
     repoDir = "/home/«DETECTED_USER»/theyos";
     domain = "«PROMPTED_DOMAIN»";
     accessMode = "«PROMPTED_ACCESS_MODE»";
+    # Owner-auth v2 stays default-off. Set to "reviewed-core-v2" only for the
+    # reviewed flip; set back to "legacy" and rebuild/restart to roll back.
+    ownerAuthV2Rollout = "legacy";
 
     # Uncomment and configure to enable optional integrations:
     # cloudflare.enable = true;

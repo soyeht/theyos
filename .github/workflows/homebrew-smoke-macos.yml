@@ -5,15 +5,21 @@ on:
     paths:
       - "admin/rust/**"
       - "admin/web/**"
+      - ".env.example"
       - "homebrew/Formula/theyos.rb"
+      - "nix/**"
       - "scripts/generate-brew-formula.sh"
+      - "tests/nixos-install/**"
       - ".github/workflows/homebrew-smoke-macos.yml"
   pull_request:
     paths:
       - "admin/rust/**"
       - "admin/web/**"
+      - ".env.example"
       - "homebrew/Formula/theyos.rb"
+      - "nix/**"
       - "scripts/generate-brew-formula.sh"
+      - "tests/nixos-install/**"
       - ".github/workflows/homebrew-smoke-macos.yml"
   workflow_dispatch:
 

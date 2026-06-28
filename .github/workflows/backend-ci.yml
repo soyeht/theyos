@@ -4,14 +4,20 @@ on:
   push:
     paths:
       - "admin/rust/**"
+      - ".env.example"
       - "install-nixos"
+      - "nix/**"
       - "tests/install-nixos-test.sh"
+      - "tests/nixos-install/**"
       - ".github/workflows/backend-ci.yml"
   pull_request:
     paths:
       - "admin/rust/**"
+      - ".env.example"
       - "install-nixos"
+      - "nix/**"
       - "tests/install-nixos-test.sh"
+      - "tests/nixos-install/**"
       - ".github/workflows/backend-ci.yml"
   workflow_dispatch:
 
@@ -135,7 +141,7 @@ jobs:
         uses: actions/checkout@v5
 
       - name: Syntax check
-        run: bash -n install-nixos && bash -n tests/install-nixos-test.sh
+        run: bash -n install-nixos && bash -n tests/install-nixos-test.sh && bash -n tests/nixos-install/test.sh
 
       - name: Run install-nixos unit tests
         # Pure bash; never invokes nixos-rebuild. Covers --help side-effects,
