@@ -1288,6 +1288,7 @@ mod tests {
     use crate::pair_machine::{JoinTransport, join_request_hash};
     use rand::SeedableRng;
     use rand::rngs::StdRng;
+    use serde::Deserialize;
     use serde_json::json;
     use webauthn_authenticator_rs::WebauthnAuthenticator;
     use webauthn_authenticator_rs::softpasskey::SoftPasskey;
@@ -1447,11 +1448,11 @@ mod tests {
         .unwrap()
     }
 
-    fn patch_local_attested_challenge_for_apple_fixture(
+    fn patch_local_attested_challenge(
         rp: &mut OwnerWebauthnRp,
         challenge_id: &OwnerWebauthnChallengeId,
+        challenge: &str,
     ) {
-        const APPLE_ANONYMOUS_CHALLENGE: &str = "JTbk7yekIKOZQwwdGW7NeDIfxrYK0PvuYxsue--G9NI";
         let stored = rp
             .challenges
             .challenges
@@ -1461,8 +1462,34 @@ mod tests {
             panic!("challenge is local attested");
         };
         let mut state = serde_json::to_value(&local.state).unwrap();
-        state["challenge"] = json!(APPLE_ANONYMOUS_CHALLENGE);
+        state["challenge"] = json!(challenge);
         local.state = serde_json::from_value(state).unwrap();
+    }
+
+    fn patch_local_attested_challenge_for_apple_fixture(
+        rp: &mut OwnerWebauthnRp,
+        challenge_id: &OwnerWebauthnChallengeId,
+    ) {
+        const APPLE_ANONYMOUS_CHALLENGE: &str = "JTbk7yekIKOZQwwdGW7NeDIfxrYK0PvuYxsue--G9NI";
+        patch_local_attested_challenge(rp, challenge_id, APPLE_ANONYMOUS_CHALLENGE);
+    }
+
+    #[derive(Debug, Deserialize)]
+    struct ManualLocalAppleAttestationFixture {
+        rp_id: String,
+        origin: String,
+        credential: RegisterPublicKeyCredential,
+    }
+
+    fn client_data_json(credential: &RegisterPublicKeyCredential) -> serde_json::Value {
+        serde_json::from_slice(credential.response.client_data_json.as_slice()).unwrap()
+    }
+
+    fn client_data_string<'a>(client_data: &'a serde_json::Value, key: &str) -> &'a str {
+        client_data
+            .get(key)
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_else(|| panic!("clientDataJSON {key} is a string"))
     }
 
     fn register_with_softpasskey(
@@ -1709,6 +1736,78 @@ mod tests {
 
         assert!(matches!(err, OwnerWebauthnError::Ceremony(_)));
         assert_eq!(rp.challenge_store_len(), 0);
+    }
+
+    #[test]
+    #[ignore = "manual hardware evidence; requires SOYEHT_LOCAL_APPLE_ATTESTATION_FIXTURE"]
+    fn macos_local_attested_registration_manual_hardware_fixture_verifies_current_apple_chain() {
+        let fixture_path = std::env::var("SOYEHT_LOCAL_APPLE_ATTESTATION_FIXTURE").expect(
+            "set SOYEHT_LOCAL_APPLE_ATTESTATION_FIXTURE to an untracked local fixture path",
+        );
+        let fixture_bytes =
+            std::fs::read(&fixture_path).expect("read local Apple attestation fixture");
+        let fixture: ManualLocalAppleAttestationFixture =
+            serde_json::from_slice(&fixture_bytes).expect("parse local Apple attestation fixture");
+        let origin =
+            Url::parse(&fixture.origin).unwrap_or_else(|_| panic!("fixture origin is a URL"));
+        let client_data = client_data_json(&fixture.credential);
+        assert_eq!(client_data_string(&client_data, "type"), "webauthn.create");
+        let challenge = client_data_string(&client_data, "challenge").to_string();
+        if client_data_string(&client_data, "origin") != fixture.origin {
+            panic!("clientDataJSON origin matches fixture origin");
+        }
+
+        let config =
+            OwnerWebauthnConfig::new(fixture.rp_id, origin, "Soyeht Local Attestation Evidence")
+                .unwrap_or_else(|_| panic!("fixture RP/origin pair is valid"))
+                .with_challenge_ttl(Duration::from_secs(60));
+        let mut rp = OwnerWebauthnRp::new(config).unwrap();
+        let mut rng = StdRng::seed_from_u64(4308);
+        let (challenge_id, _challenge) = rp
+            .start_macos_local_attested_registration_from(
+                &mut rng,
+                NOW,
+                &OwnerWebauthnRegistrationStart {
+                    owner_user_id: Uuid::new_v4(),
+                    owner_name: "owner-alpha",
+                    owner_display_name: "Owner Alpha",
+                    existing_credentials: &[],
+                    binding: None,
+                },
+            )
+            .unwrap();
+        patch_local_attested_challenge(&mut rp, &challenge_id, &challenge);
+
+        let verified = rp
+            .finish_macos_local_attested_registration(NOW, &challenge_id, &fixture.credential)
+            .expect("fresh hardware Apple Anonymous fixture verifies at current time");
+        let evidence = verified.evidence();
+        assert_eq!(
+            evidence.attestation_format(),
+            &AttestationFormat::AppleAnonymous
+        );
+        assert!(evidence.user_verified());
+        assert!(!evidence.backup_eligible());
+        assert!(!evidence.backup_state());
+        assert_eq!(
+            evidence.root_policy_version(),
+            macos_local_attested_registration::APPLE_WEBAUTHN_ROOT_POLICY_VERSION
+        );
+        assert_eq!(
+            evidence.root_ca_sha256_fingerprint(),
+            macos_local_attested_registration::APPLE_WEBAUTHN_ROOT_CA_SHA256_FINGERPRINT
+        );
+        assert_eq!(rp.challenge_store_len(), 0);
+
+        eprintln!(
+            "local_apple_attestation_manual_evidence verified=true format={:?} uv={} be={} bs={} root_policy={} root_fingerprint={}",
+            evidence.attestation_format(),
+            evidence.user_verified(),
+            evidence.backup_eligible(),
+            evidence.backup_state(),
+            evidence.root_policy_version(),
+            evidence.root_ca_sha256_fingerprint(),
+        );
     }
 
     #[test]
