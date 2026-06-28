@@ -2,6 +2,12 @@
 
 Blocking follow-up from the M1b macOS local enrollment review.
 
+As of 2026-06-28, the selected strategy is **A-now**: build the Apple
+Anonymous attestation path rather than deferring macOS-local enrollment. The
+first A-now slice is still only a foundation: local start may request and stage
+an attested Apple Anonymous ceremony, but local finish remains inert until the
+server-side proof and commit path land.
+
 ## Symptom / issue
 
 The macOS local enrollment route has two independent gates:
@@ -26,18 +32,24 @@ that the server has not verified.
 
 ## Current policy
 
-Default state: **B / blocked by safe platform proof**.
+Selected strategy: **A-now / Apple Anonymous attestation path**.
 
-Do not activate macOS local finish with the current `Passkey` path. The route
-may continue to support peer-authenticated start/status and local platform
-request options, but it must not call `finish_registration`, `sign_genesis`,
-save owner auth, update memory, or advance the WebAuthn anchor until Gate 2 is
-explicitly solved.
+Do not activate macOS local finish with the current `Passkey` path or with
+request-shaped options alone. The route may support peer-authenticated
+start/status and may stage a distinct `LocalAttestedRegistration` challenge for
+the Apple Anonymous path, but it must not call `finish_registration`,
+`sign_genesis`, save owner auth, update memory, or advance the WebAuthn anchor
+until Gate 2 is explicitly solved.
+
+The attested challenge state must remain separate from normal
+`PasskeyRegistration` state. Normal TCP finish must reject it opaquely, and
+local finish must stay `local_attestation_constraints_unavailable` before any
+attestation consume, conversion, CA/root policy, storage, or commit work.
 
 ## Acceptable active-finish policy
 
-Active local finish requires a separate architecture/security decision. The
-minimum acceptable shape is:
+Active local finish requires the next architecture/security slice. The minimum
+acceptable shape is:
 
 - Apple WebAuthn anonymous attestation is verified against the pinned Apple
   WebAuthn root CA, not by hand-rolled parsing.
@@ -71,6 +83,8 @@ server-side proof is available.
   enter the local attested path.
 - Source guards prevent fallback from local active finish to the normal
   `Passkey` finish path.
+- Source guards keep `LocalAttestedRegistration` non-consumable by the normal
+  `PasskeyRegistration` finish path.
 - Successful local finish appends exactly one initial enrollment genesis event,
   saves owner auth, updates memory, and advances only the WebAuthn anchor.
 

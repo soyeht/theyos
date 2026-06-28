@@ -140,6 +140,7 @@ p256         = { workspace = true }
 tokio        = { workspace = true }
 tower        = { workspace = true }
 webauthn-authenticator-rs = { version = "0.5.5", default-features = false, features = ["softpasskey"] }
+webauthn-rs-core = { workspace = true }
 claw-rs      = { workspace = true }
 executor-rs  = { workspace = true }
 jobs-rs      = { workspace = true }
