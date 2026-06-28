@@ -1100,8 +1100,7 @@ fn router_with_v2_owner(timeout: Duration) -> V2OwnerRouterFixture {
         OwnerWebauthnAnchorMode::MigrationDefaultOff,
     )
     .unwrap();
-    let policy = OwnerApprovalEnforcementPolicy::default()
-        .with_pair_machine_approve(OwnerOperationEnforcement::V2WhenOwnerHasActiveCredential);
+    let policy = OwnerApprovalEnforcementPolicy::reviewed_core_v2_rollout();
     let (td, router, log, broadcaster, person, identity, window) =
         router_from_owner_auth(td, identity, owner_auth, person, timeout, move |state| {
             state
@@ -1137,8 +1136,7 @@ fn router_with_v2_owner_without_hh_priv(timeout: Duration) -> V2OwnerRouterFixtu
         OwnerWebauthnAnchorMode::MigrationDefaultOff,
     )
     .unwrap();
-    let policy = OwnerApprovalEnforcementPolicy::default()
-        .with_pair_machine_approve(OwnerOperationEnforcement::V2WhenOwnerHasActiveCredential);
+    let policy = OwnerApprovalEnforcementPolicy::reviewed_core_v2_rollout();
     let (td, router, log, broadcaster, person, identity, window) =
         router_from_owner_auth(td, identity, owner_auth, person, timeout, move |state| {
             state
@@ -1164,8 +1162,7 @@ fn router_with_v2_policy_without_passkey(timeout: Duration) -> OwnerEventsRouter
     let (owner_auth, person) = owner_auth_for(&identity);
     let anchor_store: Arc<dyn keystore_rs::KeystoreBackend> =
         Arc::new(FileKeystore::new(td.path(), keystore_rs::SERVICE));
-    let policy = OwnerApprovalEnforcementPolicy::default()
-        .with_pair_machine_approve(OwnerOperationEnforcement::V2WhenOwnerHasActiveCredential);
+    let policy = OwnerApprovalEnforcementPolicy::reviewed_core_v2_rollout();
     router_from_owner_auth(td, identity, owner_auth, person, timeout, move |state| {
         state
             .with_owner_approval_policy(policy)
@@ -1263,8 +1260,7 @@ fn router_with_owner_webauthn_add_credential(
         Arc::new(FileKeystore::new(td.path(), keystore_rs::SERVICE));
     anchor_owner_webauthn_authority(webauthn_anchor_store.as_ref(), &identity, &owner_auth);
     let policy = if add_policy_enabled {
-        OwnerApprovalEnforcementPolicy::default()
-            .with_add_credential(OwnerOperationEnforcement::V2WhenOwnerHasActiveCredential)
+        OwnerApprovalEnforcementPolicy::reviewed_core_v2_rollout()
     } else {
         OwnerApprovalEnforcementPolicy::default()
     };
@@ -3715,7 +3711,7 @@ fn owner_webauthn_recovery_source_guards_provision_readiness_contract() {
 }
 
 #[tokio::test]
-async fn owner_webauthn_revoke_start_binds_context_read_only_advanced() {
+async fn owner_webauthn_revoke_start_reviewed_rollout_binds_context_read_only_advanced() {
     let td = tempfile::tempdir().unwrap();
     let identity = Arc::new(bootstrap(td.path()));
     let (owner_auth, person, rp, _authenticator) =
@@ -3745,8 +3741,7 @@ async fn owner_webauthn_revoke_start_binds_context_read_only_advanced() {
     let anchor_store: Arc<dyn keystore_rs::KeystoreBackend> =
         Arc::new(FileKeystore::new(td.path(), keystore_rs::SERVICE));
     write_owner_webauthn_authority_anchor(anchor_store.as_ref(), &first_anchor).unwrap();
-    let policy = OwnerApprovalEnforcementPolicy::default()
-        .with_revoke_credential(OwnerOperationEnforcement::V2WhenOwnerHasActiveCredential);
+    let policy = OwnerApprovalEnforcementPolicy::reviewed_core_v2_rollout();
     let (_td, router, _log, _broadcaster, person, identity, _window) =
         router_from_owner_auth(td, identity, owner_auth, person, Duration::from_secs(45), {
             let anchor_store = Arc::clone(&anchor_store);
@@ -4039,7 +4034,7 @@ async fn owner_webauthn_revoke_start_rejects_bad_pop_and_cbor() {
 }
 
 #[tokio::test]
-async fn owner_webauthn_revoke_finish_commits_revoke_and_advances_anchor() {
+async fn owner_webauthn_revoke_finish_reviewed_rollout_commits_revoke_and_advances_anchor() {
     let td = tempfile::tempdir().unwrap();
     let identity = Arc::new(bootstrap(td.path()));
     let (owner_auth, person, rp, mut authenticator) =
@@ -4050,8 +4045,7 @@ async fn owner_webauthn_revoke_finish_commits_revoke_and_advances_anchor() {
     let anchor_store: Arc<dyn keystore_rs::KeystoreBackend> =
         Arc::new(FileKeystore::new(td.path(), keystore_rs::SERVICE));
     anchor_owner_webauthn_authority(anchor_store.as_ref(), &identity, &owner_auth);
-    let policy = OwnerApprovalEnforcementPolicy::default()
-        .with_revoke_credential(OwnerOperationEnforcement::V2WhenOwnerHasActiveCredential);
+    let policy = OwnerApprovalEnforcementPolicy::reviewed_core_v2_rollout();
     let (td, router, _log, _broadcaster, person, identity, _window) =
         router_from_owner_auth(td, identity, owner_auth, person, Duration::from_secs(45), {
             let anchor_store = Arc::clone(&anchor_store);
@@ -4871,7 +4865,8 @@ async fn owner_webauthn_recovery_provision_persists_verifier_and_anchor_without_
 }
 
 #[tokio::test]
-async fn owner_webauthn_add_credential_start_returns_dual_challenges_without_mutation() {
+async fn owner_webauthn_add_credential_start_reviewed_rollout_returns_dual_challenges_without_mutation()
+ {
     let (_td, router, _log, _broadcaster, person, identity, _window, mut authenticator, state) =
         router_with_owner_webauthn_add_credential(Duration::from_secs(45), true);
 
@@ -4990,7 +4985,8 @@ async fn owner_webauthn_add_credential_start_returns_dual_challenges_without_mut
 }
 
 #[tokio::test]
-async fn owner_webauthn_add_credential_finish_adds_credential_and_advances_anchor() {
+async fn owner_webauthn_add_credential_finish_reviewed_rollout_adds_credential_and_advances_anchor()
+{
     let (_td, router, _log, _broadcaster, person, identity, _window, mut authenticator, state) =
         router_with_owner_webauthn_add_credential(Duration::from_secs(45), true);
     let before = state
@@ -8352,7 +8348,7 @@ async fn approve_require_v2_rejects_legacy_body_without_mutation() {
 }
 
 #[tokio::test]
-async fn approve_v2_happy_path_drives_commit() {
+async fn approve_v2_reviewed_rollout_happy_path_drives_commit() {
     let (td, router, log, _broadcaster, person, identity, window, mut authenticator) =
         router_with_v2_owner(Duration::from_secs(45));
     fs::write(household_root_sole_path(td.path()), b"fake-sole-shard").unwrap();
