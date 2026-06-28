@@ -85,6 +85,8 @@ use crate::time_util;
 
 const CBOR_CONTENT_TYPE: &str = "application/cbor";
 const OWNER_EVENTS_LONG_POLL_TIMEOUT: Duration = Duration::from_secs(45);
+pub const OWNER_AUTH_V2_ROLLOUT_ENV: &str = "THEYOS_OWNER_AUTH_V2_ROLLOUT";
+pub const OWNER_AUTH_V2_REVIEWED_CORE_ROLLOUT: &str = "reviewed-core-v2";
 
 #[derive(Clone)]
 pub struct OwnerEventsRouterState {
@@ -273,7 +275,7 @@ pub struct OwnerApprovalEnforcementPolicy {
     pub bootstrap_teardown: OwnerOperationEnforcement,
     pub pair_device_confirm: OwnerOperationEnforcement,
     pub revoke_credential: OwnerOperationEnforcement,
-    pub recovery_code: OwnerOperationEnforcement,
+    pub recovery_code: RecoveryCodeEnforcement,
     pub add_credential: OwnerOperationEnforcement,
 }
 
@@ -285,13 +287,25 @@ impl Default for OwnerApprovalEnforcementPolicy {
             bootstrap_teardown: OwnerOperationEnforcement::LegacyOnly,
             pair_device_confirm: OwnerOperationEnforcement::LegacyOnly,
             revoke_credential: OwnerOperationEnforcement::LegacyOnly,
-            recovery_code: OwnerOperationEnforcement::LegacyOnly,
+            recovery_code: RecoveryCodeEnforcement::Disabled,
             add_credential: OwnerOperationEnforcement::LegacyOnly,
         }
     }
 }
 
 impl OwnerApprovalEnforcementPolicy {
+    /// Enables only the owner-auth v2 operations that have landed and been
+    /// reviewed. Recovery remains a dedicated break-glass/recovery-code policy
+    /// switch; its runtime does not use active credential count as a gate.
+    #[must_use]
+    pub fn reviewed_core_v2_rollout() -> Self {
+        Self::default()
+            .with_pair_machine_approve(OwnerOperationEnforcement::V2WhenOwnerHasActiveCredential)
+            .with_revoke_credential(OwnerOperationEnforcement::V2WhenOwnerHasActiveCredential)
+            .with_recovery_code(RecoveryCodeEnforcement::BreakGlassEnabled)
+            .with_add_credential(OwnerOperationEnforcement::V2WhenOwnerHasActiveCredential)
+    }
+
     #[must_use]
     pub fn with_pair_machine_approve(mut self, mode: OwnerOperationEnforcement) -> Self {
         self.pair_machine_approve = mode;
@@ -305,7 +319,7 @@ impl OwnerApprovalEnforcementPolicy {
     }
 
     #[must_use]
-    pub fn with_recovery_code(mut self, mode: OwnerOperationEnforcement) -> Self {
+    pub fn with_recovery_code(mut self, mode: RecoveryCodeEnforcement) -> Self {
         self.recovery_code = mode;
         self
     }
@@ -332,13 +346,48 @@ impl OwnerApprovalEnforcementPolicy {
 
     #[must_use]
     fn recovery_code_enabled(&self) -> bool {
-        self.recovery_code == OwnerOperationEnforcement::V2WhenOwnerHasActiveCredential
+        self.recovery_code == RecoveryCodeEnforcement::BreakGlassEnabled
     }
 
     #[must_use]
     fn add_credential_start_enabled(&self) -> bool {
         self.add_credential == OwnerOperationEnforcement::V2WhenOwnerHasActiveCredential
     }
+}
+
+#[must_use]
+pub fn owner_approval_policy_from_env() -> OwnerApprovalEnforcementPolicy {
+    owner_approval_policy_from_rollout_value(
+        std::env::var(OWNER_AUTH_V2_ROLLOUT_ENV).ok().as_deref(),
+    )
+}
+
+#[must_use]
+pub fn owner_approval_policy_from_rollout_value(
+    raw: Option<&str>,
+) -> OwnerApprovalEnforcementPolicy {
+    match raw.map(str::trim).filter(|value| !value.is_empty()) {
+        None | Some("off" | "legacy" | "legacy-only") => OwnerApprovalEnforcementPolicy::default(),
+        Some(OWNER_AUTH_V2_REVIEWED_CORE_ROLLOUT) => {
+            OwnerApprovalEnforcementPolicy::reviewed_core_v2_rollout()
+        }
+        Some(_) => {
+            tracing::warn!(
+                env = OWNER_AUTH_V2_ROLLOUT_ENV,
+                "unknown owner-auth v2 rollout value; keeping LegacyOnly policy"
+            );
+            OwnerApprovalEnforcementPolicy::default()
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RecoveryCodeEnforcement {
+    Disabled,
+    /// Enables the dedicated recovery-code break-glass runtime. This is not an
+    /// active `WebAuthn` credential gate; the recovery runtime treats
+    /// pre-active-credential count as telemetry.
+    BreakGlassEnabled,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -6292,8 +6341,73 @@ mod tests {
             policy.revoke_credential,
             OwnerOperationEnforcement::LegacyOnly
         );
-        assert_eq!(policy.recovery_code, OwnerOperationEnforcement::LegacyOnly);
+        assert_eq!(policy.recovery_code, RecoveryCodeEnforcement::Disabled);
         assert_eq!(policy.add_credential, OwnerOperationEnforcement::LegacyOnly);
+    }
+
+    #[test]
+    fn owner_auth_v2_rollout_absent_and_rollback_values_are_legacy_only() {
+        for value in [
+            None,
+            Some(""),
+            Some("off"),
+            Some("legacy"),
+            Some("legacy-only"),
+        ] {
+            assert_eq!(
+                owner_approval_policy_from_rollout_value(value),
+                OwnerApprovalEnforcementPolicy::default()
+            );
+        }
+    }
+
+    #[test]
+    fn owner_auth_v2_rollout_reviewed_core_enables_only_reviewed_operations() {
+        let policy =
+            owner_approval_policy_from_rollout_value(Some(OWNER_AUTH_V2_REVIEWED_CORE_ROLLOUT));
+
+        assert_eq!(
+            policy.pair_machine_approve,
+            OwnerOperationEnforcement::V2WhenOwnerHasActiveCredential
+        );
+        assert_eq!(
+            policy.revoke_credential,
+            OwnerOperationEnforcement::V2WhenOwnerHasActiveCredential
+        );
+        assert_eq!(
+            policy.recovery_code,
+            RecoveryCodeEnforcement::BreakGlassEnabled,
+            "recovery uses the break-glass policy switch, not an active-count gate"
+        );
+        assert_eq!(
+            policy.add_credential,
+            OwnerOperationEnforcement::V2WhenOwnerHasActiveCredential
+        );
+        assert_eq!(
+            policy.bootstrap_initialize,
+            OwnerOperationEnforcement::LegacyOnly
+        );
+        assert_eq!(
+            policy.bootstrap_teardown,
+            OwnerOperationEnforcement::LegacyOnly
+        );
+        assert_eq!(
+            policy.pair_device_confirm,
+            OwnerOperationEnforcement::LegacyOnly
+        );
+    }
+
+    #[test]
+    fn owner_auth_v2_rollout_unknown_value_fails_closed() {
+        assert_eq!(
+            owner_approval_policy_from_rollout_value(Some("1")),
+            OwnerApprovalEnforcementPolicy::default()
+        );
+        assert_eq!(
+            owner_approval_policy_from_rollout_value(Some("reviewed-core-v2 ")),
+            OwnerApprovalEnforcementPolicy::reviewed_core_v2_rollout(),
+            "operator whitespace should not disable an otherwise explicit value"
+        );
     }
 
     #[test]

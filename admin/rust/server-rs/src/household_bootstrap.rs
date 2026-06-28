@@ -599,7 +599,8 @@ pub async fn bootstrap_household(shared_state: Option<SharedState>) {
                 owner_event_broadcaster,
                 state_dir.clone(),
                 key_policy,
-            );
+            )
+            .with_owner_approval_policy(handlers_owner_events::owner_approval_policy_from_env());
             if let Some(state) = shared_state.as_ref() {
                 owner_events_state = owner_events_state
                     .with_recovery_consume_rate_limiter(Arc::clone(&state.rate_limiter));

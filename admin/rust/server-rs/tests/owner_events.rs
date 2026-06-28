@@ -62,6 +62,7 @@ use serde_bytes::ByteBuf;
 use server_rs::apns_dispatcher::{APNS_TICKLE_BODY, ApnsError, ApnsTransport, install_transport};
 use server_rs::handlers_owner_events::{
     self, OwnerApprovalEnforcementPolicy, OwnerEventsRouterState, OwnerOperationEnforcement,
+    RecoveryCodeEnforcement,
 };
 use server_rs::handlers_pair_machine::{PreHouseholdRouterState, pre_household_router};
 use server_rs::household_state::HouseholdState;
@@ -185,6 +186,20 @@ type OwnerWebauthnRecoveryRouterFixture = (
     Arc<dyn keystore_rs::KeystoreBackend>,
     Arc<dyn keystore_rs::KeystoreBackend>,
     WebauthnAuthenticator<SoftPasskey>,
+);
+
+type OwnerWebauthnRecoveryRouterFixtureWithState = (
+    TempDir,
+    Router,
+    Arc<OwnerEventLog>,
+    OwnerEventsBroadcaster,
+    P256Keypair,
+    Arc<household_rs::LoadedIdentity>,
+    Arc<PairMachineWindow>,
+    Arc<dyn keystore_rs::KeystoreBackend>,
+    Arc<dyn keystore_rs::KeystoreBackend>,
+    WebauthnAuthenticator<SoftPasskey>,
+    OwnerEventsRouterState,
 );
 
 #[derive(Default)]
@@ -1292,12 +1307,54 @@ fn router_with_owner_webauthn_recovery_with_limiter(
     recovery_policy_enabled: bool,
     recovery_consume_limiter_limit: Option<i64>,
 ) -> OwnerWebauthnRecoveryRouterFixture {
+    let policy = if recovery_policy_enabled {
+        OwnerApprovalEnforcementPolicy::default()
+            .with_recovery_code(RecoveryCodeEnforcement::BreakGlassEnabled)
+    } else {
+        OwnerApprovalEnforcementPolicy::default()
+    };
+    let (
+        td,
+        router,
+        log,
+        broadcaster,
+        person,
+        identity,
+        window,
+        webauthn_anchor,
+        recovery_anchor,
+        authenticator,
+        _state,
+    ) = router_with_owner_webauthn_recovery_with_state(
+        timeout,
+        policy,
+        recovery_consume_limiter_limit,
+    );
+    (
+        td,
+        router,
+        log,
+        broadcaster,
+        person,
+        identity,
+        window,
+        webauthn_anchor,
+        recovery_anchor,
+        authenticator,
+    )
+}
+
+fn router_with_owner_webauthn_recovery_with_state(
+    timeout: Duration,
+    policy: OwnerApprovalEnforcementPolicy,
+    recovery_consume_limiter_limit: Option<i64>,
+) -> OwnerWebauthnRecoveryRouterFixtureWithState {
     let td = tempfile::tempdir().unwrap();
     let recovery_anchor_store: Arc<dyn keystore_rs::KeystoreBackend> =
         Arc::new(FileKeystore::new(td.path(), keystore_rs::SERVICE));
-    router_with_owner_webauthn_recovery_anchor_with_limiter(
+    router_with_owner_webauthn_recovery_anchor_with_state(
         timeout,
-        recovery_policy_enabled,
+        policy,
         td,
         recovery_anchor_store,
         recovery_consume_limiter_limit,
@@ -1326,6 +1383,52 @@ fn router_with_owner_webauthn_recovery_anchor_with_limiter(
     recovery_anchor_store: Arc<dyn keystore_rs::KeystoreBackend>,
     recovery_consume_limiter_limit: Option<i64>,
 ) -> OwnerWebauthnRecoveryRouterFixture {
+    let policy = if recovery_policy_enabled {
+        OwnerApprovalEnforcementPolicy::default()
+            .with_recovery_code(RecoveryCodeEnforcement::BreakGlassEnabled)
+    } else {
+        OwnerApprovalEnforcementPolicy::default()
+    };
+    let (
+        td,
+        router,
+        log,
+        broadcaster,
+        person,
+        identity,
+        window,
+        webauthn_anchor,
+        recovery_anchor,
+        authenticator,
+        _state,
+    ) = router_with_owner_webauthn_recovery_anchor_with_state(
+        timeout,
+        policy,
+        td,
+        recovery_anchor_store,
+        recovery_consume_limiter_limit,
+    );
+    (
+        td,
+        router,
+        log,
+        broadcaster,
+        person,
+        identity,
+        window,
+        webauthn_anchor,
+        recovery_anchor,
+        authenticator,
+    )
+}
+
+fn router_with_owner_webauthn_recovery_anchor_with_state(
+    timeout: Duration,
+    policy: OwnerApprovalEnforcementPolicy,
+    td: TempDir,
+    recovery_anchor_store: Arc<dyn keystore_rs::KeystoreBackend>,
+    recovery_consume_limiter_limit: Option<i64>,
+) -> OwnerWebauthnRecoveryRouterFixtureWithState {
     let identity = Arc::new(bootstrap(td.path()));
     let (owner_auth, person, rp, authenticator) = owner_auth_with_webauthn_credential(&identity);
     let webauthn_anchor_store: Arc<dyn keystore_rs::KeystoreBackend> =
@@ -1343,14 +1446,8 @@ fn router_with_owner_webauthn_recovery_anchor_with_limiter(
             .unwrap(),
         )
     });
-    let policy = if recovery_policy_enabled {
-        OwnerApprovalEnforcementPolicy::default()
-            .with_recovery_code(OwnerOperationEnforcement::V2WhenOwnerHasActiveCredential)
-    } else {
-        OwnerApprovalEnforcementPolicy::default()
-    };
-    let (td, router, log, broadcaster, person, identity, window) =
-        router_from_owner_auth(td, identity, owner_auth, person, timeout, {
+    let (td, router, log, broadcaster, person, identity, window, state) =
+        router_from_owner_auth_with_router_state(td, identity, owner_auth, person, timeout, {
             let webauthn_anchor_store = Arc::clone(&webauthn_anchor_store);
             let recovery_anchor_store = Arc::clone(&recovery_anchor_store);
             move |state| {
@@ -1377,6 +1474,7 @@ fn router_with_owner_webauthn_recovery_anchor_with_limiter(
         webauthn_anchor_store,
         recovery_anchor_store,
         authenticator,
+        state,
     )
 }
 
@@ -3024,6 +3122,47 @@ fn owner_webauthn_registration_local_source_guards_fail_closed_boundary() {
         "pub fn with_owner_approval_policy(",
     );
     assert!(state_default.contains("macos_local_caller_auth: None"));
+}
+
+#[test]
+fn owner_approval_rollout_source_guard_requires_explicit_default_off_wiring() {
+    let source = include_str!("../src/handlers_owner_events.rs");
+    assert!(source.contains("THEYOS_OWNER_AUTH_V2_ROLLOUT"));
+    assert!(source.contains("reviewed-core-v2"));
+    assert!(source.contains("unknown owner-auth v2 rollout value; keeping LegacyOnly policy"));
+
+    let reviewed_rollout = source_segment(
+        source,
+        "pub fn reviewed_core_v2_rollout() -> Self {",
+        "pub fn with_pair_machine_approve(",
+    );
+    assert!(reviewed_rollout.contains("with_pair_machine_approve"));
+    assert!(reviewed_rollout.contains("with_revoke_credential"));
+    assert!(reviewed_rollout.contains("with_recovery_code"));
+    assert!(reviewed_rollout.contains("RecoveryCodeEnforcement::BreakGlassEnabled"));
+    assert!(
+        !reviewed_rollout.contains(
+            "with_recovery_code(OwnerOperationEnforcement::V2WhenOwnerHasActiveCredential)"
+        )
+    );
+    assert!(reviewed_rollout.contains("with_add_credential"));
+    assert!(!reviewed_rollout.contains("bootstrap_initialize"));
+    assert!(!reviewed_rollout.contains("bootstrap_teardown"));
+    assert!(!reviewed_rollout.contains("pair_device_confirm"));
+
+    let parser = source_segment(
+        source,
+        "pub fn owner_approval_policy_from_rollout_value(",
+        "#[derive(Clone, Copy, Debug, PartialEq, Eq)]",
+    );
+    assert!(parser.contains("None | Some(\"off\" | \"legacy\" | \"legacy-only\")"));
+    assert!(parser.contains("OWNER_AUTH_V2_REVIEWED_CORE_ROLLOUT"));
+    assert!(parser.contains("OwnerApprovalEnforcementPolicy::default()"));
+
+    let router_source = include_str!("../src/household_bootstrap.rs");
+    assert!(router_source.contains(
+        ".with_owner_approval_policy(handlers_owner_events::owner_approval_policy_from_env())"
+    ));
 }
 
 #[test]
@@ -5508,6 +5647,85 @@ async fn owner_webauthn_recovery_consume_start_binds_fresh_registration_without_
 }
 
 #[tokio::test]
+async fn owner_webauthn_recovery_consume_start_reviewed_rollout_allows_zero_active_break_glass() {
+    let (
+        td,
+        router,
+        _log,
+        _broadcaster,
+        person,
+        identity,
+        _window,
+        webauthn_anchor,
+        _recovery_anchor,
+        mut authenticator,
+        state,
+    ) = router_with_owner_webauthn_recovery_with_state(
+        Duration::from_secs(45),
+        OwnerApprovalEnforcementPolicy::reviewed_core_v2_rollout(),
+        Some(100),
+    );
+
+    let recovery_code = provision_recovery_code(router.clone(), &person, &mut authenticator).await;
+    let mut owner_auth = load_owner_auth(&td, &identity);
+    let credential_id = owner_auth
+        .owner_webauthn_credentials(&identity.record)
+        .unwrap()
+        .active_credentials()
+        .first()
+        .expect("provision starts from one active passkey")
+        .credential_id_bytes()
+        .to_vec();
+    let previous = owner_auth
+        .owner_webauthn
+        .entries()
+        .last()
+        .expect("webauthn head exists")
+        .clone();
+    let revoke = OwnerWebauthnAuthority::sign_append(
+        identity
+            .hh_priv
+            .as_deref()
+            .expect("hh_priv present in single-machine household"),
+        &identity.record,
+        &owner_auth.owner_person_cert,
+        &previous,
+        &credential_id,
+        OwnerWebauthnCredentialEventAction::Revoke {
+            credential_id: ByteBuf::from(credential_id.clone()),
+        },
+        unix_now(),
+    )
+    .unwrap();
+    owner_auth.owner_webauthn.push_signed(revoke);
+    owner_auth.updated_at = unix_now();
+    owner_auth.verify(&identity.record, unix_now()).unwrap();
+    assert_eq!(
+        owner_auth
+            .owner_webauthn_credentials(&identity.record)
+            .unwrap()
+            .active_count(),
+        0,
+        "test setup must exercise the break-glass case"
+    );
+    owner_auth.save(td.path()).unwrap();
+    state
+        .household
+        .set_owner_auth(Arc::new(owner_auth.clone()))
+        .await;
+    anchor_owner_webauthn_authority(webauthn_anchor.as_ref(), &identity, &owner_auth);
+
+    let start = start_recovery_consume(router, &person, &recovery_code).await;
+
+    assert_eq!(
+        start.context.pre_active_credential_count,
+        Some(0),
+        "reviewed-core-v2 recovery consume must preserve break-glass semantics"
+    );
+    assert_eq!(start.context.op, OwnerOperation::RecoverCredential);
+}
+
+#[tokio::test]
 async fn owner_webauthn_recovery_consume_start_wrong_code_is_opaque_and_does_not_burn_recovery() {
     let (
         _td,
@@ -5916,7 +6134,7 @@ async fn owner_webauthn_recovery_consume_finish_missing_limiter_fails_closed() {
         .unwrap(),
     );
     let policy = OwnerApprovalEnforcementPolicy::default()
-        .with_recovery_code(OwnerOperationEnforcement::V2WhenOwnerHasActiveCredential);
+        .with_recovery_code(RecoveryCodeEnforcement::BreakGlassEnabled);
     let (_td, router, _log, _broadcaster, person, _identity, _window, mut state_without_limiter) =
         router_from_owner_auth_with_router_state(
             td,
@@ -6134,7 +6352,7 @@ async fn owner_webauthn_recovery_consume_finish_retries_repair_after_webauthn_an
         .unwrap(),
     );
     let policy = OwnerApprovalEnforcementPolicy::default()
-        .with_recovery_code(OwnerOperationEnforcement::V2WhenOwnerHasActiveCredential);
+        .with_recovery_code(RecoveryCodeEnforcement::BreakGlassEnabled);
     let (td, router, _log, _broadcaster, person, identity, _window, _state) =
         router_from_owner_auth_with_router_state(
             td,
@@ -6592,7 +6810,7 @@ async fn owner_webauthn_recovery_rejects_unsafe_trust_states_and_bad_pop() {
         let recovery_anchor_store: Arc<dyn keystore_rs::KeystoreBackend> =
             Arc::new(FileKeystore::new(td.path(), keystore_rs::SERVICE));
         let policy = OwnerApprovalEnforcementPolicy::default()
-            .with_recovery_code(OwnerOperationEnforcement::V2WhenOwnerHasActiveCredential);
+            .with_recovery_code(RecoveryCodeEnforcement::BreakGlassEnabled);
         let (_td, router, _log, _broadcaster, person, identity, _window) = router_from_owner_auth(
             td,
             identity,
@@ -6644,7 +6862,7 @@ async fn owner_webauthn_recovery_rejects_unsafe_trust_states_and_bad_pop() {
         let recovery_anchor_store: Arc<dyn keystore_rs::KeystoreBackend> =
             Arc::new(FileKeystore::new(td.path(), keystore_rs::SERVICE));
         let policy = OwnerApprovalEnforcementPolicy::default()
-            .with_recovery_code(OwnerOperationEnforcement::V2WhenOwnerHasActiveCredential);
+            .with_recovery_code(RecoveryCodeEnforcement::BreakGlassEnabled);
         let (_td, router, _log, _broadcaster, person, _identity, _window) =
             router_from_owner_auth(td, identity, owner_auth, person, Duration::from_secs(45), {
                 let webauthn_anchor_store = Arc::clone(&webauthn_anchor_store);
