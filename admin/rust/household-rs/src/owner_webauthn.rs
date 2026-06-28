@@ -13,8 +13,8 @@ use rand::RngCore;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 use webauthn_rs::prelude::{
-    AuthenticationResult, CreationChallengeResponse, Passkey, PasskeyAuthentication,
-    PasskeyRegistration, PublicKeyCredential, RegisterPublicKeyCredential,
+    AuthenticationResult, AuthenticatorAttachment, CreationChallengeResponse, Passkey,
+    PasskeyAuthentication, PasskeyRegistration, PublicKeyCredential, RegisterPublicKeyCredential,
     RequestChallengeResponse, Url, Uuid, Webauthn, WebauthnBuilder, WebauthnError,
 };
 
@@ -629,6 +629,33 @@ impl OwnerWebauthnRp {
         )
     }
 
+    /// Start a platform-hinted registration ceremony for the macOS local engine.
+    ///
+    /// This changes only the client options. `authenticatorAttachment=platform`
+    /// is a UX hint, not a server-side proof, so local finish remains blocked
+    /// until a separate attestation slice can verify platform+UV before commit.
+    pub fn start_platform_registration(
+        &mut self,
+        rng: &mut impl RngCore,
+        now_unix: u64,
+        owner_user_id: Uuid,
+        owner_name: &str,
+        owner_display_name: &str,
+        existing_credentials: &[OwnerWebauthnCredential],
+    ) -> Result<(OwnerWebauthnChallengeId, CreationChallengeResponse), OwnerWebauthnError> {
+        self.start_platform_registration_from(
+            rng,
+            now_unix,
+            OwnerWebauthnRegistrationStart {
+                owner_user_id,
+                owner_name,
+                owner_display_name,
+                existing_credentials,
+                binding: None,
+            },
+        )
+    }
+
     pub fn start_registration_from(
         &mut self,
         rng: &mut impl RngCore,
@@ -650,6 +677,41 @@ impl OwnerWebauthnRp {
                 Some(exclude_credentials),
             )
             .map_err(OwnerWebauthnError::Ceremony)?;
+        let id = OwnerWebauthnChallengeId::random(rng);
+        self.challenges.insert_registration(
+            id.clone(),
+            state,
+            input.binding,
+            now_unix + self.config.challenge_ttl().as_secs(),
+        );
+        Ok((id, challenge))
+    }
+
+    pub fn start_platform_registration_from(
+        &mut self,
+        rng: &mut impl RngCore,
+        now_unix: u64,
+        input: OwnerWebauthnRegistrationStart<'_>,
+    ) -> Result<(OwnerWebauthnChallengeId, CreationChallengeResponse), OwnerWebauthnError> {
+        let exclude_credentials = input
+            .existing_credentials
+            .iter()
+            .filter(|credential| !credential.is_revoked())
+            .map(|credential| credential.passkey().cred_id().clone())
+            .collect::<Vec<_>>();
+        let (mut challenge, state) = self
+            .webauthn
+            .start_passkey_registration(
+                input.owner_user_id,
+                input.owner_name,
+                input.owner_display_name,
+                Some(exclude_credentials),
+            )
+            .map_err(OwnerWebauthnError::Ceremony)?;
+        if let Some(selection) = challenge.public_key.authenticator_selection.as_mut() {
+            selection.authenticator_attachment = Some(AuthenticatorAttachment::Platform);
+            selection.require_resident_key = true;
+        }
         let id = OwnerWebauthnChallengeId::random(rng);
         self.challenges.insert_registration(
             id.clone(),
