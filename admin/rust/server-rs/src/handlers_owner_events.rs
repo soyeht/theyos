@@ -13,7 +13,7 @@ use std::time::Duration;
 
 use axum::{
     body::Bytes,
-    extract::{Path, State},
+    extract::{ConnectInfo, Extension, Path, State},
     http::{HeaderMap, HeaderValue, Method, StatusCode, Uri, header},
     response::{IntoResponse, Response},
 };
@@ -76,6 +76,7 @@ use crate::handlers_device_pairing::DevicePairingStore;
 use crate::household_auth;
 use crate::household_state::HouseholdState;
 use crate::macos_local_caller_auth::{MacosLocalCallerAuth, MacosLocalCallerAuthRequest};
+use crate::macos_local_registration_listener::MacosLocalPeerConnectInfo;
 use crate::owner_webauthn_recovery_consume_rate_limit::{
     RecoveryConsumeRateLimitDecision, check_recovery_consume_attempt,
 };
@@ -2658,22 +2659,23 @@ fn require_owner_webauthn_never_enrolled_for_initial_enrollment(
 
 fn authorize_macos_local_caller(
     state: &OwnerEventsRouterState,
-    method: &Method,
-    uri: &Uri,
-    headers: &HeaderMap,
-    body: &Bytes,
+    peer: Option<&MacosLocalPeerConnectInfo>,
 ) -> Result<(), String> {
+    let Some(peer) = peer.and_then(|connect_info| connect_info.peer.as_ref()) else {
+        return Err("local_caller_peer_unavailable".to_string());
+    };
     let Some(verifier) = state.macos_local_caller_auth.as_ref() else {
         return Err("local_caller_auth_unavailable".to_string());
     };
     verifier
-        .authorize(&MacosLocalCallerAuthRequest {
-            method,
-            uri,
-            headers,
-            body: body.as_ref(),
-        })
+        .authorize(&MacosLocalCallerAuthRequest { peer })
         .map_err(|e| e.to_string())
+}
+
+fn macos_local_peer_connect_info(
+    peer: Option<&Extension<ConnectInfo<MacosLocalPeerConnectInfo>>>,
+) -> Option<&MacosLocalPeerConnectInfo> {
+    peer.map(|extension| &extension.0.0)
 }
 
 /// `POST /api/v1/household/owner-webauthn/registration/status`.
@@ -2754,12 +2756,12 @@ pub async fn owner_webauthn_registration_status_handler(
 /// rejects before decode; tests may inject a fake verifier to exercise wiring.
 pub async fn owner_webauthn_registration_local_status_handler(
     State(state): State<OwnerEventsRouterState>,
-    method: Method,
-    uri: Uri,
-    headers: HeaderMap,
+    peer: Option<Extension<ConnectInfo<MacosLocalPeerConnectInfo>>>,
     body: Bytes,
 ) -> Response {
-    if let Err(e) = authorize_macos_local_caller(&state, &method, &uri, &headers, &body) {
+    if let Err(e) =
+        authorize_macos_local_caller(&state, macos_local_peer_connect_info(peer.as_ref()))
+    {
         return reject_owner_webauthn_registration("local_caller_auth_failed", Some(e));
     }
 
@@ -4443,9 +4445,7 @@ pub async fn owner_webauthn_registration_start_handler(
 /// Production M1 remains fail-closed because no real caller verifier is wired.
 pub async fn owner_webauthn_registration_local_start_handler(
     State(state): State<OwnerEventsRouterState>,
-    method: Method,
-    uri: Uri,
-    headers: HeaderMap,
+    peer: Option<Extension<ConnectInfo<MacosLocalPeerConnectInfo>>>,
     body: Bytes,
 ) -> Response {
     let Some(now) =
@@ -4453,7 +4453,9 @@ pub async fn owner_webauthn_registration_local_start_handler(
     else {
         return unauthenticated_response();
     };
-    if let Err(e) = authorize_macos_local_caller(&state, &method, &uri, &headers, &body) {
+    if let Err(e) =
+        authorize_macos_local_caller(&state, macos_local_peer_connect_info(peer.as_ref()))
+    {
         return reject_owner_webauthn_registration("local_caller_auth_failed", Some(e));
     }
 
@@ -4522,12 +4524,11 @@ pub async fn owner_webauthn_registration_local_start_handler(
 /// verifier and platform+UV attestation constraints.
 pub async fn owner_webauthn_registration_local_finish_handler(
     State(state): State<OwnerEventsRouterState>,
-    method: Method,
-    uri: Uri,
-    headers: HeaderMap,
-    body: Bytes,
+    peer: Option<Extension<ConnectInfo<MacosLocalPeerConnectInfo>>>,
 ) -> Response {
-    if let Err(e) = authorize_macos_local_caller(&state, &method, &uri, &headers, &body) {
+    if let Err(e) =
+        authorize_macos_local_caller(&state, macos_local_peer_connect_info(peer.as_ref()))
+    {
         return reject_owner_webauthn_registration("local_caller_auth_failed", Some(e));
     }
     reject_owner_webauthn_registration("local_attestation_constraints_unavailable", None)
