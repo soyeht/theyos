@@ -129,6 +129,10 @@ blake3        = { workspace = true }
 pty-process   = { workspace = true }
 tokio-stream  = { workspace = true }
 
+[target.'cfg(target_os = "macos")'.dependencies]
+core-foundation        = { workspace = true }
+security-framework-sys = { workspace = true }
+
 [dev-dependencies]
 axum-test    = { version = "17", features = ["ws"] }
 serde_json   = { workspace = true }

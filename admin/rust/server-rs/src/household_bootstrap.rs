@@ -644,6 +644,35 @@ pub async fn bootstrap_household(shared_state: Option<SharedState>) {
                 owner_events_state.clone(),
                 cancel_rx,
             );
+            #[cfg(target_os = "macos")]
+            {
+                let macos_local_verifier: Arc<
+                    dyn crate::macos_local_caller_auth::MacosLocalCallerAuth,
+                > = Arc::new(
+                    crate::macos_local_caller_auth::DesignatedRequirementMacosLocalCallerAuth::new(
+                        crate::macos_local_caller_auth::MacosLocalAppProfile::Production,
+                    ),
+                );
+                let macos_local_state = owner_events_state
+                    .clone()
+                    .with_macos_local_caller_auth(macos_local_verifier);
+                let macos_local_router =
+                    handlers_owner_events::owner_webauthn_macos_local_registration_router(
+                        macos_local_state,
+                    );
+                if let Err(e) =
+                    crate::macos_local_registration_listener::spawn_macos_local_registration_listener(
+                        &state_dir,
+                        macos_local_router,
+                    )
+                {
+                    tracing::warn!(
+                        stage = "macos_local_registration.listener_unavailable",
+                        error = %e,
+                        "macOS local registration listener unavailable"
+                    );
+                }
+            }
             Some(
                 axum::Router::new()
                     .route(

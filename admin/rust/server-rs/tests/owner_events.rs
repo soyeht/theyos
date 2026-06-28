@@ -10,7 +10,7 @@ use std::sync::{Condvar, Mutex as StdMutex, OnceLock};
 use std::time::Duration;
 
 use axum::body::{Body, Bytes, to_bytes};
-use axum::extract::State;
+use axum::extract::{ConnectInfo, State};
 use axum::http::{HeaderMap, Request, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::{
@@ -66,8 +66,11 @@ use server_rs::handlers_owner_events::{
 use server_rs::handlers_pair_machine::{PreHouseholdRouterState, pre_household_router};
 use server_rs::household_state::HouseholdState;
 use server_rs::macos_local_caller_auth::{
-    MacosLocalCallerAuth, MacosLocalCallerAuthError, MacosLocalCallerAuthRequest,
+    MacosLocalAppProfile, MacosLocalCallerAuth, MacosLocalCallerAuthError,
+    MacosLocalCallerAuthRequest, MacosLocalPeer, SOYEHT_MACOS_DEV_BUNDLE_ID,
+    SOYEHT_MACOS_PROD_BUNDLE_ID,
 };
+use server_rs::macos_local_registration_listener::MacosLocalPeerConnectInfo;
 use tempfile::TempDir;
 use tokio::net::TcpListener;
 use tokio::sync::Notify;
@@ -154,14 +157,21 @@ impl TestMacosLocalCallerAuth {
 impl MacosLocalCallerAuth for TestMacosLocalCallerAuth {
     fn authorize(
         &self,
-        _request: &MacosLocalCallerAuthRequest<'_>,
+        request: &MacosLocalCallerAuthRequest<'_>,
     ) -> Result<(), MacosLocalCallerAuthError> {
+        assert_eq!(request.peer.audit_token_words()[0], 0x51);
         if self.allow {
             Ok(())
         } else {
             Err(MacosLocalCallerAuthError::Rejected)
         }
     }
+}
+
+fn test_macos_local_peer() -> MacosLocalPeerConnectInfo {
+    MacosLocalPeerConnectInfo::from_peer(MacosLocalPeer::from_audit_token_words([
+        0x51, 0x52, 0x53, 0x54, 0x55, 0x56, 0x57, 0x58,
+    ]))
 }
 
 type OwnerWebauthnRecoveryRouterFixture = (
@@ -1490,6 +1500,29 @@ async fn post_cbor(
     (status, headers, bytes)
 }
 
+async fn post_cbor_with_macos_local_peer(
+    router: Router,
+    uri: &str,
+    body: Vec<u8>,
+    peer: MacosLocalPeerConnectInfo,
+) -> (StatusCode, HeaderMap, Vec<u8>) {
+    let mut request = Request::builder()
+        .method("POST")
+        .uri(uri)
+        .header(header::CONTENT_TYPE, "application/cbor")
+        .body(Body::from(body))
+        .unwrap();
+    request.extensions_mut().insert(ConnectInfo(peer));
+    let resp = router.oneshot(request).await.unwrap();
+    let status = resp.status();
+    let headers = resp.headers().clone();
+    let bytes = to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap()
+        .to_vec();
+    (status, headers, bytes)
+}
+
 fn append_join_event(log: &OwnerEventLog, identity: &household_rs::LoadedIdentity) -> OwnerEvent {
     log.append(
         &identity.cert.m_id.to_string(),
@@ -1937,6 +1970,25 @@ async fn owner_webauthn_registration_local_absent_verifier_fails_closed_before_d
     let (_td, router, _log, _broadcaster, _person, _identity, _window, _anchor_store) =
         local_router_with_owner_webauthn_registration(Duration::from_secs(45), None);
 
+    let (status, _headers, resp_bytes) = post_cbor_with_macos_local_peer(
+        router,
+        handlers_owner_events::OWNER_WEBAUTHN_REGISTRATION_LOCAL_START_PATH,
+        vec![0xff],
+        test_macos_local_peer(),
+    )
+    .await;
+
+    assert_generic_unauth(status, &resp_bytes);
+}
+
+#[tokio::test]
+async fn owner_webauthn_registration_local_missing_peer_fails_closed_before_decode() {
+    let (_td, router, _log, _broadcaster, _person, _identity, _window, _anchor_store) =
+        local_router_with_owner_webauthn_registration(
+            Duration::from_secs(45),
+            Some(TestMacosLocalCallerAuth::allow()),
+        );
+
     let (status, _headers, resp_bytes) = post_cbor(
         router,
         handlers_owner_events::OWNER_WEBAUTHN_REGISTRATION_LOCAL_START_PATH,
@@ -1959,11 +2011,11 @@ async fn owner_webauthn_registration_local_denied_rejects_opaque_without_challen
         household_rs::cbor::to_canonical_vec(&OwnerWebauthnRegistrationStartRequest { version: 1 })
             .unwrap();
 
-    let (status, _headers, resp_bytes) = post_cbor(
+    let (status, _headers, resp_bytes) = post_cbor_with_macos_local_peer(
         router,
         handlers_owner_events::OWNER_WEBAUTHN_REGISTRATION_LOCAL_START_PATH,
         body,
-        None,
+        test_macos_local_peer(),
     )
     .await;
 
@@ -1981,11 +2033,11 @@ async fn owner_webauthn_registration_local_fake_auth_allows_start_and_status_onl
         household_rs::cbor::to_canonical_vec(&OwnerWebauthnRegistrationStartRequest { version: 1 })
             .unwrap();
 
-    let (status, _headers, resp_bytes) = post_cbor(
+    let (status, _headers, resp_bytes) = post_cbor_with_macos_local_peer(
         router.clone(),
         handlers_owner_events::OWNER_WEBAUTHN_REGISTRATION_LOCAL_START_PATH,
         start_body,
-        None,
+        test_macos_local_peer(),
     )
     .await;
     assert_eq!(status, StatusCode::OK);
@@ -1999,11 +2051,11 @@ async fn owner_webauthn_registration_local_fake_auth_allows_start_and_status_onl
             version: 1,
         })
         .unwrap();
-    let (status, _headers, resp_bytes) = post_cbor(
+    let (status, _headers, resp_bytes) = post_cbor_with_macos_local_peer(
         router.clone(),
         handlers_owner_events::OWNER_WEBAUTHN_REGISTRATION_LOCAL_STATUS_PATH,
         status_body,
-        None,
+        test_macos_local_peer(),
     )
     .await;
     assert_eq!(status, StatusCode::OK);
@@ -2012,14 +2064,25 @@ async fn owner_webauthn_registration_local_fake_auth_allows_start_and_status_onl
     assert_eq!(status_body.version, 1);
     assert!(!status_body.enrolled);
 
-    let (status, _headers, resp_bytes) = post_cbor(
+    let (status, _headers, resp_bytes) = post_cbor_with_macos_local_peer(
         router,
         handlers_owner_events::OWNER_WEBAUTHN_REGISTRATION_LOCAL_FINISH_PATH,
         vec![0xff],
-        None,
+        test_macos_local_peer(),
     )
     .await;
     assert_generic_unauth(status, &resp_bytes);
+}
+
+#[test]
+fn owner_webauthn_registration_local_profiles_are_mutually_exclusive() {
+    let prod = MacosLocalAppProfile::Production.designated_requirement();
+    assert!(prod.contains(&format!(r#"identifier "{}""#, SOYEHT_MACOS_PROD_BUNDLE_ID)));
+    assert!(!prod.contains(&format!(r#"identifier "{}""#, SOYEHT_MACOS_DEV_BUNDLE_ID)));
+
+    let dev = MacosLocalAppProfile::Development.designated_requirement();
+    assert!(dev.contains(&format!(r#"identifier "{}""#, SOYEHT_MACOS_DEV_BUNDLE_ID)));
+    assert!(!dev.contains(&format!(r#"identifier "{}""#, SOYEHT_MACOS_PROD_BUNDLE_ID)));
 }
 
 #[tokio::test]
@@ -2830,6 +2893,7 @@ fn owner_webauthn_registration_local_source_guards_fail_closed_boundary() {
         "pub async fn owner_webauthn_registration_local_start_handler(",
         "/// `POST /api/v1/household/owner-webauthn/registration/local/finish`",
     );
+    assert!(local_start.contains("Option<Extension<ConnectInfo<MacosLocalPeerConnectInfo>>>"));
     assert!(local_start.contains("authorize_macos_local_caller"));
     assert!(local_start.contains("BOOTSTRAP_MUTATION_LOCK"));
     assert!(local_start.contains("owner_webauthn_initial_enrollment_policy_snapshot"));
@@ -2855,6 +2919,7 @@ fn owner_webauthn_registration_local_source_guards_fail_closed_boundary() {
         "pub async fn owner_webauthn_registration_local_finish_handler(",
         "/// `POST /api/v1/household/owner-webauthn/registration/finish`",
     );
+    assert!(local_finish.contains("Option<Extension<ConnectInfo<MacosLocalPeerConnectInfo>>>"));
     assert!(local_finish.contains("authorize_macos_local_caller"));
     assert!(local_finish.contains("local_attestation_constraints_unavailable"));
     assert!(!local_finish.contains("decode_canonical_cbor"));
@@ -2869,6 +2934,7 @@ fn owner_webauthn_registration_local_source_guards_fail_closed_boundary() {
         "pub async fn owner_webauthn_registration_local_status_handler(",
         "/// `POST /api/v1/household/owner-webauthn/revoke/start`",
     );
+    assert!(local_status.contains("Option<Extension<ConnectInfo<MacosLocalPeerConnectInfo>>>"));
     assert!(local_status.contains("authorize_macos_local_caller"));
     assert!(local_status.contains("BOOTSTRAP_MUTATION_LOCK"));
     assert!(local_status.contains("owner_webauthn_registration_status"));
@@ -2899,15 +2965,42 @@ fn owner_webauthn_registration_local_source_guards_fail_closed_boundary() {
 
     let router_source = include_str!("../src/household_bootstrap.rs");
     assert!(!router_source.contains("/registration/local/"));
+    assert!(!router_source.contains(".merge(owner_webauthn_macos_local_registration_router"));
+    assert!(router_source.contains("spawn_macos_local_registration_listener"));
+    assert!(router_source.contains("DesignatedRequirementMacosLocalCallerAuth::new"));
+    assert!(router_source.contains("MacosLocalAppProfile::Production"));
+    assert!(!router_source.contains("MacosLocalAppProfile::Development"));
     assert!(router_source.contains("/api/v1/household/owner-webauthn/registration/start"));
     assert!(router_source.contains("/api/v1/household/owner-webauthn/registration/finish"));
     assert!(router_source.contains("/api/v1/household/owner-webauthn/registration/status"));
 
     let auth_source = include_str!("../src/macos_local_caller_auth.rs");
+    assert!(auth_source.contains("pub peer: &'a MacosLocalPeer"));
+    assert!(!auth_source.contains("HeaderMap"));
+    assert!(!auth_source.contains("pub headers"));
+    assert!(!auth_source.contains("pub body"));
+    assert!(auth_source.contains("MacosLocalAppProfile::Production"));
+    assert!(auth_source.contains("MacosLocalAppProfile::Development"));
+    assert!(auth_source.contains("SOYEHT_MACOS_PROD_BUNDLE_ID"));
+    assert!(auth_source.contains("SOYEHT_MACOS_DEV_BUNDLE_ID"));
+    assert!(auth_source.contains("SecCodeCopyGuestWithAttributes"));
+    assert!(auth_source.contains("SecCodeCheckValidity"));
+    assert!(auth_source.contains("SecRequirementCreateWithString"));
     assert!(auth_source.contains("FailClosedMacosLocalCallerAuth"));
     assert!(auth_source.contains("Err(MacosLocalCallerAuthError::Unavailable)"));
     assert!(!auth_source.contains("DEV_ALLOW"));
     assert!(!auth_source.contains("LOCAL_NO_AUTH"));
+    assert!(!auth_source.contains("std::env"));
+    assert!(!auth_source.contains("localhost"));
+    assert!(!auth_source.contains("kSecGuestAttributePid"));
+
+    let listener_source = include_str!("../src/macos_local_registration_listener.rs");
+    assert!(listener_source.contains("UnixListener"));
+    assert!(listener_source.contains("LOCAL_PEERTOKEN"));
+    assert!(listener_source.contains("MacosLocalPeerConnectInfo"));
+    assert!(listener_source.contains("into_make_service_with_connect_info"));
+    assert!(listener_source.contains("Permissions::from_mode(0o700)"));
+    assert!(!listener_source.contains("TcpListener"));
     assert!(!auth_source.contains("localhost"));
     assert!(!auth_source.contains("Authorization"));
 
