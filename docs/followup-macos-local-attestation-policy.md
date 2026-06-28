@@ -96,6 +96,62 @@ server-side proof is available.
 - Successful local finish appends exactly one initial enrollment genesis event,
   saves owner auth, updates memory, and advances only the WebAuthn anchor.
 
+## A3 evidence harness
+
+The public `webauthn-rs-core 0.5.5` registration API does not expose a
+test-only `verify_at` / clock-injection seam. Its public
+`register_credential` path verifies attestation certificates at the current
+OpenSSL verification time. The expired Apple Anonymous fixture kept in tests is
+therefore only a negative proof that the pinned CA path is active; it is not
+positive evidence for active finish.
+
+Positive A3 evidence must come from either a future safe upstream/test-only
+time seam or from a fresh hardware capture. The current harness is the ignored
+test
+`macos_local_attested_registration_manual_hardware_fixture_verifies_current_apple_chain`.
+It reads an untracked local fixture from
+`SOYEHT_LOCAL_APPLE_ATTESTATION_FIXTURE`, routes it through the same pinned
+Apple root verifier and five local policy checks, and prints only sanitized
+verdict data: attestation format, UV, BE, BS, root policy version, and root
+fingerprint.
+
+Do not commit fresh hardware attestation objects, credential IDs, certificate
+blobs, machine names, account names, device identifiers, local socket paths, or
+other live-device material. If a local app is needed to capture the fixture,
+use `Soyeht Dev.app` or a dedicated test harness, never the installed shipping
+`/Applications/Soyeht.app`.
+
+Manual command shape:
+
+```sh
+SOYEHT_LOCAL_APPLE_ATTESTATION_FIXTURE=/path/to/untracked/local-apple-attestation.json \
+  cargo test -p household-rs --manifest-path admin/rust/Cargo.toml \
+    macos_local_attested_registration_manual_hardware_fixture_verifies_current_apple_chain \
+    -- --ignored --nocapture
+```
+
+Fixture shape:
+
+```json
+{
+  "rp_id": "example.test",
+  "origin": "https://example.test",
+  "credential": {
+    "id": "...",
+    "rawId": "...",
+    "response": {
+      "attestationObject": "...",
+      "clientDataJSON": "..."
+    },
+    "type": "public-key"
+  }
+}
+```
+
+This harness is evidence-only. It must not activate `/registration/local/finish`,
+commit owner auth, write memory, advance anchors, or weaken the production
+certificate-time checks.
+
 ## Files of interest
 
 - `admin/rust/household-rs/src/owner_webauthn.rs` - registration challenge
