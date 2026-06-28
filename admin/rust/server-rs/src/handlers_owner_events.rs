@@ -4492,7 +4492,7 @@ pub async fn owner_webauthn_registration_local_start_handler(
     let user_id = owner_webauthn_user_uuid(current_owner_auth.as_ref());
     let owner_name = current_owner_auth.owner_person_cert.p_id.0.as_str();
     let owner_display_name = current_owner_auth.owner_person_cert.display_name.as_str();
-    let (challenge_id, options) = match rp.lock().await.start_registration(
+    let (challenge_id, options) = match rp.lock().await.start_platform_registration(
         &mut rng,
         now,
         user_id,

@@ -78,8 +78,8 @@ use tower::ServiceExt;
 use webauthn_authenticator_rs::WebauthnAuthenticator;
 use webauthn_authenticator_rs::softpasskey::SoftPasskey;
 use webauthn_rs::prelude::{
-    CreationChallengeResponse, PublicKeyCredential, RegisterPublicKeyCredential,
-    RequestChallengeResponse, Url, Uuid,
+    AuthenticatorAttachment, CreationChallengeResponse, PublicKeyCredential,
+    RegisterPublicKeyCredential, RequestChallengeResponse, Url, Uuid,
 };
 
 const OWNER_EVENTS_PATH: &str = "/api/v1/household/owner-events";
@@ -2045,6 +2045,18 @@ async fn owner_webauthn_registration_local_fake_auth_allows_start_and_status_onl
         household_rs::cbor::from_canonical_slice(&resp_bytes).unwrap();
     assert_eq!(start.version, 1);
     assert!(!start.challenge_id.is_empty());
+    let selection = start
+        .options
+        .public_key
+        .authenticator_selection
+        .as_ref()
+        .expect("local start requests platform authenticator selection");
+    assert_eq!(
+        selection.authenticator_attachment,
+        Some(AuthenticatorAttachment::Platform)
+    );
+    assert_eq!(format!("{:?}", selection.user_verification), "Required");
+    assert!(selection.require_resident_key);
 
     let status_body =
         household_rs::cbor::to_canonical_vec(&OwnerWebauthnRegistrationStatusRequest {
@@ -2897,7 +2909,7 @@ fn owner_webauthn_registration_local_source_guards_fail_closed_boundary() {
     assert!(local_start.contains("authorize_macos_local_caller"));
     assert!(local_start.contains("BOOTSTRAP_MUTATION_LOCK"));
     assert!(local_start.contains("owner_webauthn_initial_enrollment_policy_snapshot"));
-    assert!(local_start.contains("start_registration"));
+    assert!(local_start.contains("start_platform_registration"));
     assert!(!local_start.contains("authorize_owner_auth_enroll_initial_request"));
     assert!(!local_start.contains("authorize_owner_webauthn_registration_status_request"));
     assert!(!local_start.contains("finish_registration"));
@@ -2953,6 +2965,8 @@ fn owner_webauthn_registration_local_source_guards_fail_closed_boundary() {
         "/// `POST /api/v1/household/owner-webauthn/registration/local/start`",
     );
     assert!(tcp_start.contains("authorize_owner_auth_enroll_initial_request"));
+    assert!(tcp_start.contains("start_registration"));
+    assert!(!tcp_start.contains("start_platform_registration"));
     assert!(!tcp_start.contains("authorize_macos_local_caller"));
 
     let tcp_finish = source_segment(
