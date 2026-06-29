@@ -121,6 +121,15 @@ other live-device material. If a local app is needed to capture the fixture,
 use `Soyeht Dev.app` or a dedicated test harness, never the installed shipping
 `/Applications/Soyeht.app`.
 
+The operator bridge for this capture lives in `soyeht-ios` as PR #273 and is
+documented in `docs/macos-local-attestation-capture-runbook.md` in that repo.
+It depends on theyOS PR #206 so the isolated `SoyehtDev` state namespace uses
+the Development peer verifier for a normally signed `Soyeht Dev.app`. That
+bridge stops at live `/registration/local/start` -> `ASAuthorization` ->
+untracked local fixture; it does not call `/registration/local/finish`, produce
+a positive proof verdict, commit owner auth, update memory, advance anchors, or
+activate local enrollment.
+
 Manual command shape:
 
 ```sh
