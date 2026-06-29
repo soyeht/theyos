@@ -157,6 +157,28 @@ pub fn household_port_from_env() -> u16 {
         .unwrap_or(DEFAULT_HOUSEHOLD_PORT)
 }
 
+#[cfg(any(target_os = "macos", test))]
+fn macos_local_app_profile_for_state_dir(
+    state_dir: &Path,
+) -> crate::macos_local_caller_auth::MacosLocalAppProfile {
+    // The Dev engine runs in the exact `SoyehtDev` namespace. Keep this tied to
+    // state isolation, not to a caller-supplied header or permissive env flag.
+    let namespace = if state_dir
+        .file_name()
+        .is_some_and(|name| name == "household-state")
+    {
+        state_dir.parent().and_then(Path::file_name)
+    } else {
+        state_dir.file_name()
+    };
+    let is_dev_state = namespace.is_some_and(|name| name == "SoyehtDev");
+    if is_dev_state {
+        crate::macos_local_caller_auth::MacosLocalAppProfile::Development
+    } else {
+        crate::macos_local_caller_auth::MacosLocalAppProfile::Production
+    }
+}
+
 fn claw_share_log_path(state_dir: &Path) -> PathBuf {
     state_dir.join("claw_share").join("mesh_log.ndjson")
 }
@@ -651,7 +673,7 @@ pub async fn bootstrap_household(shared_state: Option<SharedState>) {
                     dyn crate::macos_local_caller_auth::MacosLocalCallerAuth,
                 > = Arc::new(
                     crate::macos_local_caller_auth::DesignatedRequirementMacosLocalCallerAuth::new(
-                        crate::macos_local_caller_auth::MacosLocalAppProfile::Production,
+                        macos_local_app_profile_for_state_dir(&state_dir),
                     ),
                 );
                 let macos_local_state = owner_events_state
@@ -1543,6 +1565,47 @@ mod tests {
                  stops calling the owner can silently drift from its clamp/default"
             );
         }
+    }
+
+    #[test]
+    fn macos_local_app_profile_tracks_state_namespace() {
+        use crate::macos_local_caller_auth::MacosLocalAppProfile;
+
+        let prod = Path::new("/Users/example/Library/Application Support/Soyeht/household-state");
+        assert_eq!(
+            macos_local_app_profile_for_state_dir(prod),
+            MacosLocalAppProfile::Production
+        );
+
+        let dev = Path::new("/Users/example/Library/Application Support/SoyehtDev/household-state");
+        assert_eq!(
+            macos_local_app_profile_for_state_dir(dev),
+            MacosLocalAppProfile::Development
+        );
+
+        let prefixed = Path::new(
+            "/Users/example/Library/Application Support/SoyehtDevelopment/household-state",
+        );
+        assert_eq!(
+            macos_local_app_profile_for_state_dir(prefixed),
+            MacosLocalAppProfile::Production,
+            "dev selection must require an exact SoyehtDev path component"
+        );
+
+        let username_match =
+            Path::new("/Users/SoyehtDev/Library/Application Support/Soyeht/household-state");
+        assert_eq!(
+            macos_local_app_profile_for_state_dir(username_match),
+            MacosLocalAppProfile::Production,
+            "dev selection must use the state namespace, not an earlier path component"
+        );
+
+        let explicit_dev_state_dir =
+            Path::new("/Users/example/Library/Application Support/SoyehtDev");
+        assert_eq!(
+            macos_local_app_profile_for_state_dir(explicit_dev_state_dir),
+            MacosLocalAppProfile::Development
+        );
     }
 
     #[test]
