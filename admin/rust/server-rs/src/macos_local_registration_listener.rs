@@ -5,6 +5,7 @@
 //! socket. HTTP handlers remain responsible for fail-closed authorization.
 
 use std::io;
+use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 
 use axum::Router;
@@ -15,8 +16,10 @@ use tracing::{info, warn};
 
 use crate::macos_local_caller_auth::MacosLocalPeer;
 
-const SOCKET_DIR: &str = "runtime";
-const SOCKET_NAME: &str = "owner-webauthn-registration.sock";
+const SOCKET_NAME: &str = "owner-webauthn.sock";
+const PROD_SOCKET_NAMESPACE: &str = "soyeht-local-reg-prod";
+const DEV_SOCKET_NAMESPACE: &str = "soyeht-local-reg-dev";
+const MACOS_SUN_PATH_LIMIT: usize = 104;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MacosLocalPeerConnectInfo {
@@ -53,7 +56,26 @@ impl Connected<IncomingStream<'_, UnixListener>> for MacosLocalPeerConnectInfo {
 
 #[must_use]
 pub fn macos_local_registration_socket_path(state_dir: &Path) -> PathBuf {
-    state_dir.join(SOCKET_DIR).join(SOCKET_NAME)
+    macos_local_registration_socket_path_from_roots(
+        state_dir,
+        macos_local_registration_runtime_roots(),
+    )
+}
+
+fn macos_local_registration_socket_path_from_roots(
+    state_dir: &Path,
+    roots: Vec<PathBuf>,
+) -> PathBuf {
+    let namespace = macos_local_registration_socket_namespace(state_dir);
+    roots
+        .into_iter()
+        .chain(std::iter::once(PathBuf::from("/tmp")))
+        .map(|root| {
+            root.join(format!("{namespace}-{}", current_euid()))
+                .join(SOCKET_NAME)
+        })
+        .find(|path| socket_path_fits_macos(path))
+        .expect("/tmp macOS local registration socket path must fit SUN_LEN")
 }
 
 pub fn spawn_macos_local_registration_listener(
@@ -83,9 +105,12 @@ pub fn spawn_macos_local_registration_listener(
 }
 
 fn prepare_socket_path(state_dir: &Path) -> io::Result<PathBuf> {
-    use std::os::unix::fs::{FileTypeExt, PermissionsExt};
+    prepare_socket_path_at(macos_local_registration_socket_path(state_dir))
+}
 
-    let socket_path = macos_local_registration_socket_path(state_dir);
+fn prepare_socket_path_at(socket_path: PathBuf) -> io::Result<PathBuf> {
+    use std::os::unix::fs::{DirBuilderExt, FileTypeExt};
+
     let Some(parent) = socket_path.parent() else {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -93,15 +118,14 @@ fn prepare_socket_path(state_dir: &Path) -> io::Result<PathBuf> {
         ));
     };
 
-    std::fs::create_dir_all(parent)?;
-    let parent_meta = std::fs::symlink_metadata(parent)?;
-    if parent_meta.file_type().is_symlink() || !parent_meta.is_dir() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "socket parent must be a real directory",
-        ));
+    match std::fs::symlink_metadata(parent) {
+        Ok(_) => {}
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            std::fs::DirBuilder::new().mode(0o700).create(parent)?;
+        }
+        Err(e) => return Err(e),
     }
-    std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))?;
+    validate_socket_parent(parent)?;
 
     match std::fs::symlink_metadata(&socket_path) {
         Ok(meta) => {
@@ -125,6 +149,102 @@ fn prepare_socket_path(state_dir: &Path) -> io::Result<PathBuf> {
     }
 
     Ok(socket_path)
+}
+
+fn validate_socket_parent(parent: &Path) -> io::Result<()> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    let parent_meta = std::fs::symlink_metadata(parent)?;
+    if parent_meta.file_type().is_symlink() || !parent_meta.is_dir() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "socket parent must be a real directory",
+        ));
+    }
+    if parent_meta.uid() != current_euid() {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "socket parent must be owned by current user",
+        ));
+    }
+    let mode = parent_meta.permissions().mode() & 0o777;
+    if mode != 0o700 {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "socket parent must be mode 0700",
+        ));
+    }
+    Ok(())
+}
+
+fn socket_path_fits_macos(path: &Path) -> bool {
+    path.as_os_str().as_bytes().len() < MACOS_SUN_PATH_LIMIT
+}
+
+fn macos_local_registration_runtime_roots() -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+    if let Some(root) = darwin_user_temp_dir() {
+        roots.push(root);
+    }
+    if let Some(root) = std::env::var_os("TMPDIR")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+    {
+        if !roots.iter().any(|existing| existing == &root) {
+            roots.push(root);
+        }
+    }
+    roots
+}
+
+#[cfg(target_os = "macos")]
+#[allow(unsafe_code)]
+fn darwin_user_temp_dir() -> Option<PathBuf> {
+    use std::ffi::CStr;
+
+    let len = unsafe { libc::confstr(libc::_CS_DARWIN_USER_TEMP_DIR, std::ptr::null_mut(), 0) };
+    if len == 0 {
+        return None;
+    }
+    let mut buffer = vec![0 as libc::c_char; len];
+    let written = unsafe {
+        libc::confstr(
+            libc::_CS_DARWIN_USER_TEMP_DIR,
+            buffer.as_mut_ptr(),
+            buffer.len(),
+        )
+    };
+    if written == 0 {
+        return None;
+    }
+    let raw = unsafe { CStr::from_ptr(buffer.as_ptr()) }.to_string_lossy();
+    Some(PathBuf::from(raw.trim_end_matches('/')))
+}
+
+#[cfg(not(target_os = "macos"))]
+fn darwin_user_temp_dir() -> Option<PathBuf> {
+    None
+}
+
+fn macos_local_registration_socket_namespace(state_dir: &Path) -> &'static str {
+    let namespace = if state_dir
+        .file_name()
+        .is_some_and(|name| name == "household-state")
+    {
+        state_dir.parent().and_then(Path::file_name)
+    } else {
+        state_dir.file_name()
+    };
+    if namespace.is_some_and(|name| name == "SoyehtDev") {
+        DEV_SOCKET_NAMESPACE
+    } else {
+        PROD_SOCKET_NAMESPACE
+    }
+}
+
+#[allow(unsafe_code)]
+fn current_euid() -> u32 {
+    unsafe { libc::geteuid() as u32 }
 }
 
 #[cfg(target_os = "macos")]
@@ -178,34 +298,120 @@ fn peer_from_unix_stream(_stream: &UnixStream) -> io::Result<MacosLocalPeer> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::os::unix::fs::{FileTypeExt, PermissionsExt};
+    use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
 
     #[test]
-    fn socket_path_is_profile_scoped_under_state_dir() {
+    fn socket_path_prefers_short_profile_scoped_runtime_dir() {
+        let root = PathBuf::from("/tmp/slr-test");
+        let prod = Path::new("/Users/example/Library/Application Support/Soyeht/household-state");
+        let dev = Path::new("/Users/example/Library/Application Support/SoyehtDev/household-state");
+        let prod_path = macos_local_registration_socket_path_from_roots(prod, vec![root.clone()]);
+        let dev_path = macos_local_registration_socket_path_from_roots(dev, vec![root.clone()]);
+        assert_ne!(prod_path, dev_path);
+        assert!(
+            prod_path.starts_with(root.join(format!("{PROD_SOCKET_NAMESPACE}-{}", current_euid())))
+        );
+        assert!(
+            dev_path.starts_with(root.join(format!("{DEV_SOCKET_NAMESPACE}-{}", current_euid())))
+        );
+        assert!(prod_path.ends_with(SOCKET_NAME));
+        assert!(dev_path.ends_with(SOCKET_NAME));
+        assert!(
+            socket_path_fits_macos(&dev_path),
+            "socket path must stay under the conservative macOS SUN_LEN limit"
+        );
+    }
+
+    #[test]
+    fn socket_path_falls_back_when_runtime_root_is_too_long() {
+        let long_root = PathBuf::from(format!("/tmp/{}", "x".repeat(MACOS_SUN_PATH_LIMIT)));
+        let dev = Path::new("/Users/example/Library/Application Support/SoyehtDev/household-state");
+        let dev_path = macos_local_registration_socket_path_from_roots(dev, vec![long_root]);
+        assert!(dev_path.starts_with(format!("/tmp/{DEV_SOCKET_NAMESPACE}-{}", current_euid())));
+        assert!(socket_path_fits_macos(&dev_path));
+    }
+
+    #[test]
+    fn prepare_socket_path_makes_parent_private() {
         let dir = tempfile::tempdir().unwrap();
-        let path = prepare_socket_path(dir.path()).unwrap();
+        let path = prepare_socket_path_at(
+            dir.path()
+                .join(format!("{DEV_SOCKET_NAMESPACE}-{}", current_euid()))
+                .join(SOCKET_NAME),
+        )
+        .unwrap();
         assert!(path.starts_with(dir.path()));
         assert!(path.ends_with(SOCKET_NAME));
         let parent = path.parent().unwrap();
-        let mode = std::fs::metadata(parent).unwrap().permissions().mode() & 0o777;
+        let parent_meta = std::fs::metadata(parent).unwrap();
+        let mode = parent_meta.permissions().mode() & 0o777;
+        assert_eq!(parent_meta.uid(), current_euid());
         assert_eq!(mode, 0o700);
+    }
+
+    #[test]
+    fn prepare_socket_path_rejects_parent_symlink() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("target");
+        std::fs::create_dir(&target).unwrap();
+        let parent = dir.path().join("runtime-link");
+        std::os::unix::fs::symlink(&target, &parent).unwrap();
+        let err = prepare_socket_path_at(parent.join(SOCKET_NAME)).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn prepare_socket_path_rejects_parent_with_group_or_other_access() {
+        let dir = tempfile::tempdir().unwrap();
+        let parent = dir.path().join("runtime");
+        std::fs::create_dir(&parent).unwrap();
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let err = prepare_socket_path_at(parent.join(SOCKET_NAME)).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
     }
 
     #[test]
     fn socket_path_rejects_non_socket_existing_file() {
         let dir = tempfile::tempdir().unwrap();
-        let path = macos_local_registration_socket_path(dir.path());
+        let path = dir.path().join("runtime").join(SOCKET_NAME);
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::set_permissions(
+            path.parent().unwrap(),
+            std::fs::Permissions::from_mode(0o700),
+        )
+        .unwrap();
         std::fs::write(&path, b"not a socket").unwrap();
-        let err = prepare_socket_path(dir.path()).unwrap_err();
+        let err = prepare_socket_path_at(path).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::AlreadyExists);
+    }
+
+    #[test]
+    fn socket_path_rejects_symlink_at_socket_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("runtime").join(SOCKET_NAME);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::set_permissions(
+            path.parent().unwrap(),
+            std::fs::Permissions::from_mode(0o700),
+        )
+        .unwrap();
+        let target = dir.path().join("target");
+        std::fs::write(&target, b"not a socket").unwrap();
+        std::os::unix::fs::symlink(&target, &path).unwrap();
+        let err = prepare_socket_path_at(path).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
     }
 
     #[test]
     fn socket_path_unlinks_stale_socket() {
         let dir = tempfile::tempdir().unwrap();
-        let path = macos_local_registration_socket_path(dir.path());
+        let path = dir.path().join("runtime").join(SOCKET_NAME);
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::set_permissions(
+            path.parent().unwrap(),
+            std::fs::Permissions::from_mode(0o700),
+        )
+        .unwrap();
         let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
         drop(listener);
         assert!(
@@ -214,7 +420,7 @@ mod tests {
                 .file_type()
                 .is_socket()
         );
-        let prepared = prepare_socket_path(dir.path()).unwrap();
+        let prepared = prepare_socket_path_at(path.clone()).unwrap();
         assert_eq!(prepared, path);
         assert!(!path.exists());
     }
