@@ -3315,8 +3315,11 @@ fn owner_webauthn_registration_local_source_guards_fail_closed_boundary() {
     assert!(!router_source.contains(".merge(owner_webauthn_macos_local_registration_router"));
     assert!(router_source.contains("spawn_macos_local_registration_listener"));
     assert!(router_source.contains("DesignatedRequirementMacosLocalCallerAuth::new"));
+    assert!(router_source.contains("macos_local_app_profile_for_state_dir(&state_dir)"));
+    assert!(router_source.contains("fn macos_local_app_profile_for_state_dir"));
     assert!(router_source.contains("MacosLocalAppProfile::Production"));
-    assert!(!router_source.contains("MacosLocalAppProfile::Development"));
+    assert!(router_source.contains("MacosLocalAppProfile::Development"));
+    assert!(router_source.contains("\"SoyehtDev\""));
     assert!(router_source.contains("/api/v1/household/owner-webauthn/registration/start"));
     assert!(router_source.contains("/api/v1/household/owner-webauthn/registration/finish"));
     assert!(router_source.contains("/api/v1/household/owner-webauthn/registration/status"));
