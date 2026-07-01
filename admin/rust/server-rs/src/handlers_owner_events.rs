@@ -2564,7 +2564,7 @@ pub async fn secure_upgrade_app_attest_start_handler(
     }
     let runtime = match secure_upgrade_runtime_or_reject(&state) {
         Ok(runtime) => runtime.clone(),
-        Err(response) => return response,
+        Err(response) => return *response,
     };
 
     let _mutation_guard = crate::bootstrap_mutation_lock::BOOTSTRAP_MUTATION_LOCK
@@ -2601,7 +2601,7 @@ pub async fn secure_upgrade_app_attest_start_handler(
         proof_environment: runtime.config.proof_environment,
         platform: request.platform,
     });
-    let record = match runtime.challenge_store.issue(transcript, now) {
+    let record = match runtime.challenge_store.issue(&transcript, now) {
         Ok(record) => record,
         Err(e) => return reject_secure_upgrade("challenge_issue_failed", Some(e.to_string())),
     };
@@ -2661,7 +2661,7 @@ pub async fn secure_upgrade_app_attest_finish_handler(
     };
     let runtime = match secure_upgrade_runtime_or_reject(&state) {
         Ok(runtime) => runtime.clone(),
-        Err(response) => return response,
+        Err(response) => return *response,
     };
 
     let _mutation_guard = crate::bootstrap_mutation_lock::BOOTSTRAP_MUTATION_LOCK
@@ -3049,17 +3049,17 @@ fn reject_secure_upgrade(reason: &'static str, error: Option<String>) -> Respons
 
 fn secure_upgrade_runtime_or_reject(
     state: &OwnerEventsRouterState,
-) -> Result<&SecureUpgradeRuntime, Response> {
+) -> Result<&SecureUpgradeRuntime, Box<Response>> {
     if !state
         .owner_approval_policy
         .secure_upgrade_strong_minting_enabled()
     {
-        return Err(reject_secure_upgrade("policy_disabled", None));
+        return Err(Box::new(reject_secure_upgrade("policy_disabled", None)));
     }
     state
         .secure_upgrade_runtime
         .as_ref()
-        .ok_or_else(|| reject_secure_upgrade("runtime_unavailable", None))
+        .ok_or_else(|| Box::new(reject_secure_upgrade("runtime_unavailable", None)))
 }
 
 fn secure_upgrade_challenge_id() -> String {

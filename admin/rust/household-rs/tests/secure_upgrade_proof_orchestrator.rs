@@ -41,7 +41,7 @@ fn transcript(challenge_id: &str, owner_key_id: &str) -> SecureUpgradeTranscript
 fn challenge_record(challenge_id: &str, owner_key_id: &str) -> SecureUpgradeChallengeRecord {
     let store = SecureUpgradeChallengeStore::new();
     store
-        .issue(transcript(challenge_id, owner_key_id), NOW)
+        .issue(&transcript(challenge_id, owner_key_id), NOW)
         .unwrap()
 }
 

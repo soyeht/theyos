@@ -41,7 +41,7 @@ const APP_ATTEST_AUTH_DATA_PREFIX_LEN: usize = 37;
 const APP_ATTEST_AAGUID_LEN: usize = 16;
 const APP_ATTEST_CREDENTIAL_ID_LEN_LEN: usize = 2;
 const APP_ATTEST_NONCE_EXTENSION_PREFIX: &[u8] = &[0x30, 0x24, 0xa1, 0x22, 0x04, 0x20];
-const APP_ATTEST_NONCE_EXTENSION_OID_COMPONENTS: &[u64] = &[1, 2, 840, 113635, 100, 8, 2];
+const APP_ATTEST_NONCE_EXTENSION_OID_COMPONENTS: &[u64] = &[1, 2, 840, 113_635, 100, 8, 2];
 const APP_ATTEST_AAGUID_DEVELOPMENT: &[u8; 16] = b"appattestdevelop";
 const APP_ATTEST_AAGUID_PRODUCTION: &[u8; 16] = b"appattest\0\0\0\0\0\0\0";
 static SECURE_UPGRADE_REPLAY_TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -1064,7 +1064,7 @@ impl SecureUpgradeChallengeStore {
 
     pub fn issue(
         &self,
-        transcript: SecureUpgradeTranscript,
+        transcript: &SecureUpgradeTranscript,
         now_unix: u64,
     ) -> Result<SecureUpgradeChallengeRecord, SecureUpgradeChallengeStoreError> {
         if now_unix > transcript.expires_at {
@@ -1091,7 +1091,7 @@ impl SecureUpgradeChallengeStore {
     ) -> Result<SecureUpgradeChallengeRecord, SecureUpgradeChallengeStoreError> {
         let submitted =
             SecureUpgradeTranscript::from_canonical_bytes(submitted_canonical_transcript_bytes)
-                .map_err(SecureUpgradeChallengeStoreError::from_transcript_error)?;
+                .map_err(|error| SecureUpgradeChallengeStoreError::from_transcript_error(&error))?;
         if submitted.challenge_id != challenge_id {
             return Err(SecureUpgradeChallengeStoreError::ChallengeIdMismatch);
         }
@@ -1144,11 +1144,11 @@ impl SecureUpgradeChallengeStore {
 
 impl SecureUpgradeChallengeRecord {
     fn from_transcript(
-        transcript: SecureUpgradeTranscript,
+        transcript: &SecureUpgradeTranscript,
     ) -> Result<Self, SecureUpgradeChallengeStoreError> {
         let canonical_transcript_bytes = transcript
             .to_canonical_bytes()
-            .map_err(SecureUpgradeChallengeStoreError::from_transcript_error)?;
+            .map_err(|error| SecureUpgradeChallengeStoreError::from_transcript_error(&error))?;
         let challenge_digest =
             SecureUpgradeTranscript::challenge_digest_from_canonical_transcript_bytes(
                 &canonical_transcript_bytes,
@@ -1159,13 +1159,13 @@ impl SecureUpgradeChallengeRecord {
             expires_at_unix: transcript.expires_at,
             canonical_transcript_bytes,
             challenge_digest,
-            scope: SecureUpgradeChallengeScope::from_transcript(&transcript),
+            scope: SecureUpgradeChallengeScope::from_transcript(transcript),
         })
     }
 }
 
 impl SecureUpgradeChallengeStoreError {
-    fn from_transcript_error(error: SecureUpgradeTranscriptError) -> Self {
+    fn from_transcript_error(error: &SecureUpgradeTranscriptError) -> Self {
         Self::Transcript(error.to_string())
     }
 }
@@ -2062,7 +2062,7 @@ mod tests {
         let store = SecureUpgradeChallengeStore::new();
         store
             .issue(
-                transcript_with_owner_person_id(challenge_id, owner_key_id, platform, owner_p_id),
+                &transcript_with_owner_person_id(challenge_id, owner_key_id, platform, owner_p_id),
                 NOW,
             )
             .unwrap()
@@ -2075,7 +2075,7 @@ mod tests {
     ) -> SecureUpgradeChallengeRecord {
         let store = SecureUpgradeChallengeStore::new();
         store
-            .issue(transcript(challenge_id, owner_key_id, platform), NOW)
+            .issue(&transcript(challenge_id, owner_key_id, platform), NOW)
             .unwrap()
     }
 
@@ -2172,7 +2172,7 @@ mod tests {
         let challenge_store = SecureUpgradeChallengeStore::new();
         let record = challenge_store
             .issue(
-                transcript_with_owner_person_id(
+                &transcript_with_owner_person_id(
                     record.challenge_id(),
                     &record.scope().owner_key_id,
                     record.scope().platform,
@@ -2800,7 +2800,7 @@ mod tests {
             OWNER_KEY_ID,
             SecureUpgradePlatform::Ios,
         );
-        let record = challenge_store.issue(transcript, NOW).unwrap();
+        let record = challenge_store.issue(&transcript, NOW).unwrap();
         let canonical = record.canonical_transcript_bytes().to_vec();
         let proof = proof_verification_for_record(&record, &owner_key);
         let replay_dir = tempfile::tempdir().expect("tempdir");
@@ -2950,7 +2950,7 @@ mod tests {
         let challenge_store = SecureUpgradeChallengeStore::new();
         let record_a = challenge_store
             .issue(
-                transcript(
+                &transcript(
                     "su-challenge-alpha",
                     OWNER_KEY_ID,
                     SecureUpgradePlatform::Ios,
@@ -2960,7 +2960,7 @@ mod tests {
             .unwrap();
         let record_b = challenge_store
             .issue(
-                transcript(
+                &transcript(
                     "su-challenge-beta",
                     OWNER_KEY_ID,
                     SecureUpgradePlatform::Ios,
@@ -3011,7 +3011,7 @@ mod tests {
             OWNER_KEY_ID,
             SecureUpgradePlatform::Ios,
         );
-        let record = challenge_store.issue(transcript, NOW).unwrap();
+        let record = challenge_store.issue(&transcript, NOW).unwrap();
         let canonical = record.canonical_transcript_bytes().to_vec();
         let challenge_digest =
             SecureUpgradeTranscript::challenge_digest_from_canonical_transcript_bytes(&canonical);

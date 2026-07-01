@@ -38,7 +38,7 @@ fn issue_persists_expected_transcript_digest_and_scope() {
     let challenge_digest =
         SecureUpgradeTranscript::challenge_digest_from_canonical_transcript_bytes(&canonical);
 
-    let record = store.issue(transcript, NOW).unwrap();
+    let record = store.issue(&transcript, NOW).unwrap();
 
     assert_eq!(store.len(), 1);
     assert_eq!(record.challenge_id(), "su-challenge-alpha");
@@ -69,12 +69,12 @@ fn issue_persists_expected_transcript_digest_and_scope() {
 fn duplicate_issue_fails_closed() {
     let store = SecureUpgradeChallengeStore::new();
     store
-        .issue(transcript("su-challenge-alpha", "owner-key-alpha"), NOW)
+        .issue(&transcript("su-challenge-alpha", "owner-key-alpha"), NOW)
         .unwrap();
 
     assert_eq!(
         store.issue(
-            transcript("su-challenge-alpha", "owner-key-replacement"),
+            &transcript("su-challenge-alpha", "owner-key-replacement"),
             NOW
         ),
         Err(SecureUpgradeChallengeStoreError::DuplicateChallenge)
@@ -86,7 +86,7 @@ fn consume_matching_transcript_succeeds_once() {
     let store = SecureUpgradeChallengeStore::new();
     let transcript = transcript("su-challenge-alpha", "owner-key-alpha");
     let canonical = transcript.to_canonical_bytes().unwrap();
-    let expected = store.issue(transcript, NOW).unwrap();
+    let expected = store.issue(&transcript, NOW).unwrap();
 
     let consumed = store
         .consume_matching_transcript("su-challenge-alpha", &canonical, NOW)
@@ -105,7 +105,7 @@ fn bound_field_swap_with_same_challenge_id_is_rejected_without_consuming() {
     let store = SecureUpgradeChallengeStore::new();
     let expected = transcript("su-challenge-alpha", "owner-key-alpha");
     let expected_canonical = expected.to_canonical_bytes().unwrap();
-    store.issue(expected, NOW).unwrap();
+    store.issue(&expected, NOW).unwrap();
 
     let tampered = transcript("su-challenge-alpha", "owner-key-beta");
     let tampered_canonical = tampered.to_canonical_bytes().unwrap();
@@ -127,7 +127,7 @@ fn submitted_challenge_id_mismatch_does_not_consume_expected_record() {
     let store = SecureUpgradeChallengeStore::new();
     let expected = transcript("su-challenge-alpha", "owner-key-alpha");
     let expected_canonical = expected.to_canonical_bytes().unwrap();
-    store.issue(expected, NOW).unwrap();
+    store.issue(&expected, NOW).unwrap();
 
     let wrong_challenge = transcript("su-challenge-beta", "owner-key-alpha");
     let wrong_canonical = wrong_challenge.to_canonical_bytes().unwrap();
@@ -149,7 +149,7 @@ fn expired_challenge_fails_closed_and_is_removed() {
     let store = SecureUpgradeChallengeStore::new();
     let transcript = transcript("su-challenge-alpha", "owner-key-alpha");
     let canonical = transcript.to_canonical_bytes().unwrap();
-    store.issue(transcript, NOW).unwrap();
+    store.issue(&transcript, NOW).unwrap();
 
     assert_eq!(
         store.consume_matching_transcript("su-challenge-alpha", &canonical, EXPIRES_AT + 1),
@@ -164,7 +164,7 @@ fn cannot_issue_already_expired_challenge() {
 
     assert_eq!(
         store.issue(
-            transcript("su-challenge-alpha", "owner-key-alpha"),
+            &transcript("su-challenge-alpha", "owner-key-alpha"),
             EXPIRES_AT + 1
         ),
         Err(SecureUpgradeChallengeStoreError::ChallengeExpired)
@@ -177,7 +177,7 @@ fn concurrent_consume_has_one_winner() {
     let store = Arc::new(SecureUpgradeChallengeStore::new());
     let transcript = transcript("su-challenge-alpha", "owner-key-alpha");
     let canonical = Arc::new(transcript.to_canonical_bytes().unwrap());
-    store.issue(transcript, NOW).unwrap();
+    store.issue(&transcript, NOW).unwrap();
 
     let barrier = Arc::new(Barrier::new(2));
     let handles = (0..2)

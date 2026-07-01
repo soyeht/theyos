@@ -331,7 +331,7 @@ pub async fn authorize_secure_upgrade_start_request(
 
 /// Authorize Secure/Upgrade App Attest finish and strong owner minting.
 ///
-/// The PoP only identifies the current owner submitting the ceremony; the
+/// The `PoP` only identifies the current owner submitting the ceremony; the
 /// handler revalidates the stored challenge, App Attest proof, owner-key
 /// signature, durable replay state, and verified provenance before minting.
 pub async fn authorize_secure_upgrade_finish_request(
