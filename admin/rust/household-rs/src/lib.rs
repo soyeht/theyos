@@ -72,6 +72,7 @@ pub mod pair_machine;
 pub mod person_cert;
 pub mod pop;
 pub mod qr_render;
+pub mod secure_upgrade;
 pub mod shamir;
 pub mod shard_at_rest;
 pub mod storage;

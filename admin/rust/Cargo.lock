@@ -2111,6 +2111,8 @@ dependencies = [
  "qrcode",
  "rand 0.8.5",
  "rusqlite",
+ "rustls-pki-types",
+ "rustls-webpki 0.103.10",
  "security-framework",
  "security-framework-sys",
  "serde",
@@ -2130,6 +2132,7 @@ dependencies = [
  "webauthn-authenticator-rs",
  "webauthn-rs",
  "webauthn-rs-core",
+ "x509-parser",
  "zeroize",
 ]
 

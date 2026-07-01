@@ -1,13 +1,19 @@
 # Follow-up: macOS local enrollment active finish needs a platform proof policy
 
-Blocking follow-up from the M1b macOS local enrollment review.
+Historical follow-up from the M1b macOS local enrollment review.
 
-As of 2026-06-28, the selected strategy is **A-now**: build the Apple
-Anonymous attestation path rather than deferring macOS-local enrollment. The
-current A-now work is still foundation-only: local start may request and stage
-an attested Apple Anonymous ceremony, and the backend may model/verify the
-Apple proof in an inert helper, but local finish remains inert until the active
-commit path lands.
+As of 2026-06-29, the previous **A-now** strategy is deferred. Hardware smoke
+reached the native Apple `ASAuthorizationPlatformPublicKeyCredentialProvider`
+ceremony and the platform reported that passkeys do not support attestation.
+The native synced platform-passkey surface cannot produce the Apple Anonymous /
+device-bound proof that the A3 policy required.
+
+The current A-now work is foundation-only and remains inert: local start may
+request and stage an attested Apple Anonymous ceremony, and the backend may
+model/verify the Apple proof in an inert helper, but local finish remains
+`local_attestation_constraints_unavailable`. This follow-up is now a record of
+why active finish must stay deferred unless a future STOP defines a new proof
+surface.
 
 ## Symptom / issue
 
@@ -21,10 +27,13 @@ The macOS local enrollment route has two independent gates:
   server-side to come from an acceptable platform authenticator with user
   verification before local finish can commit it.
 
-Gate 1 is implemented. Gate 2 is being staged in slices: request/state
-foundation first, then proof/model helper, then active commit. Until the active
-commit slice lands, the local HTTP finish must remain
-`local_attestation_constraints_unavailable`.
+Gate 1 is implemented. Gate 2 was staged in slices: request/state foundation
+first, then proof/model helper, then active commit. The native macOS
+platform-passkey hardware smoke reached the Apple ceremony and showed that this
+surface does not produce the device-bound Apple attestation required by that
+active commit design. The active commit slice is therefore blocked unless a
+future STOP selects a new proof surface. Until then, the local HTTP finish must
+remain `local_attestation_constraints_unavailable`.
 
 The platform option added for local start is only request shaping. In the
 current `webauthn-rs` wrapper, `authenticatorAttachment=platform` is a client
@@ -35,7 +44,10 @@ that the server has not verified.
 
 ## Current policy
 
-Selected strategy: **A-now / Apple Anonymous attestation path**.
+Current strategy: **defer native macOS-local active finish**. Product direction
+is Local Workspace plus Secure/Upgrade with iPhone before multi-device fan-out;
+owner-tier/provenance is tracked in the Swift-side
+`docs/local-workspace-trust-model.md`.
 
 Do not activate macOS local finish with the current `Passkey` path or with
 request-shaped options alone. The route may support peer-authenticated
@@ -43,8 +55,8 @@ start/status, may stage a distinct `LocalAttestedRegistration` challenge for the
 Apple Anonymous path, and may expose an internal `VerifiedLocalAppleAttestedCredential`
 proof object after Apple-root/flag checks. The HTTP local finish still must not
 call `finish_registration`, `sign_genesis`, save owner auth, update memory, or
-advance the WebAuthn anchor until the active commit slice explicitly solves
-Gate 2.
+advance the WebAuthn anchor unless a future reviewed proof surface explicitly
+solves Gate 2.
 
 The attested challenge state must remain separate from normal
 `PasskeyRegistration` state. Normal TCP finish must reject it opaquely. The
@@ -54,8 +66,9 @@ before any storage or commit work.
 
 ## Acceptable active-finish policy
 
-Active local finish requires a later architecture/security slice. The minimum
-acceptable shape is:
+Active local finish requires a later architecture/security STOP with a proof
+surface that actually returns evidence. The old native platform-passkey surface
+does not satisfy this requirement. The minimum acceptable shape is:
 
 - Apple WebAuthn anonymous attestation is verified against the pinned Apple
   WebAuthn root CA, not by hand-rolled parsing.
@@ -105,8 +118,9 @@ OpenSSL verification time. The expired Apple Anonymous fixture kept in tests is
 therefore only a negative proof that the pinned CA path is active; it is not
 positive evidence for active finish.
 
-Positive A3 evidence must come from either a future safe upstream/test-only
-time seam or from a fresh hardware capture. The current harness is the ignored
+Positive A3 evidence would need to come from either a future safe upstream/test-only
+time seam or from a fresh hardware capture on a surface that actually returns
+attestation evidence. The current harness is the ignored
 test
 `macos_local_attested_registration_manual_hardware_fixture_verifies_current_apple_chain`.
 It reads an untracked local fixture from
@@ -129,6 +143,10 @@ bridge stops at live `/registration/local/start` -> `ASAuthorization` ->
 untracked local fixture; it does not call `/registration/local/finish`, produce
 a positive proof verdict, commit owner auth, update memory, advance anchors, or
 activate local enrollment.
+
+The live native run did not produce a fixture because Apple platform passkeys
+refused attestation. Do not treat `attestation=none` plus UV as a substitute for
+the A3 proof.
 
 Manual command shape:
 
