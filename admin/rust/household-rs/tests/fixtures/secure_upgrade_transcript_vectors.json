@@ -1,0 +1,68 @@
+{
+  "contract": "secure_upgrade_transcript_v1",
+  "version": 1,
+  "commitment_model": {
+    "digest": "SHA256(soyeht-secure-upgrade-v1\\0 || canonical_transcript_cbor)",
+    "app_attest_client_data_hash": "challenge_digest",
+    "owner_signature_input": "challenge_digest",
+    "verify_only": true
+  },
+  "vectors": [
+    {
+      "id": "ios_app_attest_production",
+      "input": {
+        "v": 1,
+        "purpose": "secure-upgrade-owner",
+        "op": "secure-upgrade-with-iphone",
+        "hh_id": "hh_fnlwza7qi4rxuadflfmxocnx5rwdb3ef2meq6unnh7qqiosfyain",
+        "owner_p_id": "p_ty3yfdchyn7nethoiefhrolfjxavzfe2bngb4tzzqy7cl3uqjfcq",
+        "owner_key_id": "owner-key-ios-alpha",
+        "challenge_id": "su-challenge-ios-alpha",
+        "issued_at": 1714972800,
+        "expires_at": 1714973100,
+        "app_team_id": "TEAMID1234",
+        "app_bundle_id": "com.example.soyeht",
+        "proof_model": "app-attest",
+        "proof_key_id": "appattest-key-ios-alpha",
+        "proof_environment": "production",
+        "platform": "ios",
+        "target_provenance": "ios-app-attest-owner"
+      },
+      "canonical_cbor_hex": "b0617601626f70781a7365637572652d757067726164652d776974682d6970686f6e656568685f6964783768685f666e6c777a61377169347278756164666c666d786f636e783572776462336566326d657136756e6e68377171696f73667961696e67707572706f7365747365637572652d757067726164652d6f776e657268706c6174666f726d63696f73696973737565645f61741a663868806a657870697265735f61741a663869ac6a6f776e65725f705f69647836705f7479337966646368796e376e6574686f69656668726f6c666a7861767a666532626e676234747a7a717937636c3375716a6663716b6170705f7465616d5f69646a5445414d4944313233346b70726f6f665f6d6f64656c6a6170702d6174746573746c6368616c6c656e67655f69647673752d6368616c6c656e67652d696f732d616c7068616c6f776e65725f6b65795f6964736f776e65722d6b65792d696f732d616c7068616c70726f6f665f6b65795f6964776170706174746573742d6b65792d696f732d616c7068616d6170705f62756e646c655f696472636f6d2e6578616d706c652e736f796568747170726f6f665f656e7669726f6e6d656e746a70726f64756374696f6e717461726765745f70726f76656e616e636574696f732d6170702d6174746573742d6f776e6572",
+      "challenge_sha256_hex": "e9391aea1acdf0131bd6281eaae5d6538fd9a5d0b24ae6d10a173a2d6283d889",
+      "commitments": {
+        "app_attest_client_data_hash_hex": "e9391aea1acdf0131bd6281eaae5d6538fd9a5d0b24ae6d10a173a2d6283d889",
+        "owner_signature_input_hex": "e9391aea1acdf0131bd6281eaae5d6538fd9a5d0b24ae6d10a173a2d6283d889",
+        "raw_cbor_sha256_hex": "6ae9d3962564fb63af6e848ac7ea39b839b54f8d50f8de09a694074b9fb1b448"
+      }
+    },
+    {
+      "id": "ipados_app_attest_development",
+      "input": {
+        "v": 1,
+        "purpose": "secure-upgrade-owner",
+        "op": "secure-upgrade-with-iphone",
+        "hh_id": "hh_fnlwza7qi4rxuadflfmxocnx5rwdb3ef2meq6unnh7qqiosfyain",
+        "owner_p_id": "p_ty3yfdchyn7nethoiefhrolfjxavzfe2bngb4tzzqy7cl3uqjfcq",
+        "owner_key_id": "owner-key-ipados-alpha",
+        "challenge_id": "su-challenge-ipados-alpha",
+        "issued_at": 1714976400,
+        "expires_at": 1714976700,
+        "app_team_id": "TEAMID1234",
+        "app_bundle_id": "com.example.soyeht.dev",
+        "proof_model": "app-attest",
+        "proof_key_id": "appattest-key-ipados-alpha",
+        "proof_environment": "development",
+        "platform": "ipados",
+        "target_provenance": "ipados-app-attest-owner"
+      },
+      "canonical_cbor_hex": "b0617601626f70781a7365637572652d757067726164652d776974682d6970686f6e656568685f6964783768685f666e6c777a61377169347278756164666c666d786f636e783572776462336566326d657136756e6e68377171696f73667961696e67707572706f7365747365637572652d757067726164652d6f776e657268706c6174666f726d66697061646f73696973737565645f61741a663876906a657870697265735f61741a663877bc6a6f776e65725f705f69647836705f7479337966646368796e376e6574686f69656668726f6c666a7861767a666532626e676234747a7a717937636c3375716a6663716b6170705f7465616d5f69646a5445414d4944313233346b70726f6f665f6d6f64656c6a6170702d6174746573746c6368616c6c656e67655f6964781973752d6368616c6c656e67652d697061646f732d616c7068616c6f776e65725f6b65795f6964766f776e65722d6b65792d697061646f732d616c7068616c70726f6f665f6b65795f6964781a6170706174746573742d6b65792d697061646f732d616c7068616d6170705f62756e646c655f696476636f6d2e6578616d706c652e736f796568742e6465767170726f6f665f656e7669726f6e6d656e746b646576656c6f706d656e74717461726765745f70726f76656e616e636577697061646f732d6170702d6174746573742d6f776e6572",
+      "challenge_sha256_hex": "78864aaed0e7628da473b6a83c0616e7b12049535281782660b1d8590f49d4ec",
+      "commitments": {
+        "app_attest_client_data_hash_hex": "78864aaed0e7628da473b6a83c0616e7b12049535281782660b1d8590f49d4ec",
+        "owner_signature_input_hex": "78864aaed0e7628da473b6a83c0616e7b12049535281782660b1d8590f49d4ec",
+        "raw_cbor_sha256_hex": "bffce10c394c79909866bba572b051b898d87b535aa03487fd1c7075c1d4395c"
+      }
+    }
+  ]
+}

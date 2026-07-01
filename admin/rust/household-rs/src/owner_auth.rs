@@ -115,6 +115,11 @@ impl HouseholdAuthState {
         Ok(self.owner_webauthn_credentials(record)?.active_count() > 0)
     }
 
+    #[must_use]
+    pub fn owner_can_fan_out(&self) -> bool {
+        self.owner_person_cert.has_strong_owner_provenance()
+    }
+
     pub fn save(&self, state_dir: &Path) -> Result<(), OwnerAuthError> {
         // `household_auth_state.cbor` is the durable commit record. The
         // standalone cert file is a projection for fixtures/client diagnostics;

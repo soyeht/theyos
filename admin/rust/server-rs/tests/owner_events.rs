@@ -49,8 +49,11 @@ use household_rs::pair_machine::{
     PrepareCandidateOpts, household_root_sole_path, machine_cert_hash, prepare_candidate,
     shamir_self_shard_path,
 };
-use household_rs::person_cert::{PersonCert, SignOwnerOptions};
+use household_rs::person_cert::{PersonCert, SignOwnerOptions, VerifiedOwnerProvenance};
 use household_rs::pop::RequestSigningContext;
+use household_rs::secure_upgrade::{
+    SecureUpgradePlatform, SecureUpgradeProofEnvironment, SecureUpgradeTranscript,
+};
 use household_rs::storage::{
     household_record_path, machine_cert_for, phase3_finalize_ack_marker_exists, staged_path_for,
 };
@@ -58,12 +61,12 @@ use household_rs::{BootstrapOpts, HouseholdAuthState, KeyBackingPolicy};
 use keystore_rs::{FileKeystore, KeystoreBackend, KeystoreError};
 use rand::SeedableRng;
 use rand::rngs::StdRng;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_bytes::ByteBuf;
 use server_rs::apns_dispatcher::{APNS_TICKLE_BODY, ApnsError, ApnsTransport, install_transport};
 use server_rs::handlers_owner_events::{
     self, OwnerApprovalEnforcementPolicy, OwnerEventsRouterState, OwnerOperationEnforcement,
-    RecoveryCodeEnforcement,
+    RecoveryCodeEnforcement, SecureUpgradeEnforcement, SecureUpgradeRuntimeConfig,
 };
 use server_rs::handlers_pair_machine::{PreHouseholdRouterState, pre_household_router};
 use server_rs::household_state::HouseholdState;
@@ -616,6 +619,27 @@ fn bootstrap(state_dir: &std::path::Path) -> household_rs::LoadedIdentity {
 
 fn owner_auth_for(identity: &household_rs::LoadedIdentity) -> (HouseholdAuthState, P256Keypair) {
     let person = P256Keypair::generate();
+    let cert = PersonCert::sign_owner_with_verified_provenance(
+        identity
+            .hh_priv
+            .as_deref()
+            .expect("hh_priv present in single-machine household"),
+        SignOwnerOptions {
+            hh_id: identity.record.hh_id.clone(),
+            p_pub: person.public(),
+            display_name: "Owner".into(),
+            issued_at: identity.record.created_at,
+        },
+        VerifiedOwnerProvenance::IosSecureEnclaveOwner,
+    )
+    .unwrap();
+    (HouseholdAuthState::new(&identity.record, cert), person)
+}
+
+fn legacy_owner_auth_for(
+    identity: &household_rs::LoadedIdentity,
+) -> (HouseholdAuthState, P256Keypair) {
+    let person = P256Keypair::generate();
     let cert = PersonCert::sign_owner(
         identity
             .hh_priv
@@ -698,6 +722,14 @@ fn router_from_owner_auth_with_router_state(
             post(handlers_owner_events::owner_webauthn_registration_status_handler),
         )
         .route(
+            handlers_owner_events::SECURE_UPGRADE_APP_ATTEST_START_PATH,
+            post(handlers_owner_events::secure_upgrade_app_attest_start_handler),
+        )
+        .route(
+            handlers_owner_events::SECURE_UPGRADE_APP_ATTEST_FINISH_PATH,
+            post(handlers_owner_events::secure_upgrade_app_attest_finish_handler),
+        )
+        .route(
             "/api/v1/household/owner-webauthn/revoke/start",
             post(handlers_owner_events::owner_webauthn_revoke_credential_start_handler),
         )
@@ -771,7 +803,7 @@ fn router_with_state(
 ) {
     let td = tempfile::tempdir().unwrap();
     let identity = Arc::new(bootstrap(td.path()));
-    let (owner_auth, person) = owner_auth_for(&identity);
+    let (owner_auth, person) = legacy_owner_auth_for(&identity);
     router_from_owner_auth(td, identity, owner_auth, person, timeout, |state| state)
 }
 
@@ -784,6 +816,197 @@ fn owner_webauthn_rp() -> OwnerWebauthnRp {
     .unwrap()
     .with_challenge_ttl(Duration::from_secs(60));
     OwnerWebauthnRp::new(config).unwrap()
+}
+
+#[tokio::test]
+async fn secure_upgrade_start_is_default_off() {
+    let (_td, router, _log, _broadcaster, person, _identity, _window) =
+        router_with_state(Duration::from_millis(100));
+    let body = household_rs::cbor::to_canonical_vec(&SecureUpgradeStartTestRequest {
+        version: 1,
+        proof_key_id: "app-attest-proof-key-alpha".to_string(),
+        platform: SecureUpgradePlatform::Ios,
+    })
+    .unwrap();
+
+    let (status, _headers, _bytes) = post_cbor(
+        router,
+        handlers_owner_events::SECURE_UPGRADE_APP_ATTEST_START_PATH,
+        body,
+        Some(&person),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn secure_upgrade_start_issues_server_authoritative_transcript_when_enabled() {
+    let td = tempfile::tempdir().unwrap();
+    let identity = Arc::new(bootstrap(td.path()));
+    let (owner_auth, person) = legacy_owner_auth_for(&identity);
+    let (_td, router, _log, _broadcaster, person, _identity, _window, state) =
+        router_from_owner_auth_with_router_state(
+            td,
+            identity.clone(),
+            owner_auth,
+            person,
+            Duration::from_millis(100),
+            |state| {
+                state
+                    .with_owner_approval_policy(
+                        OwnerApprovalEnforcementPolicy::reviewed_core_v2_rollout()
+                            .with_secure_upgrade(SecureUpgradeEnforcement::StrongMintingEnabled),
+                    )
+                    .with_secure_upgrade_runtime(SecureUpgradeRuntimeConfig {
+                        app_team_id: "TEAMID1234".to_string(),
+                        app_bundle_id: "com.example.soyeht.dev".to_string(),
+                        proof_environment: SecureUpgradeProofEnvironment::Development,
+                        challenge_ttl: Duration::from_secs(300),
+                    })
+            },
+        );
+    let body = household_rs::cbor::to_canonical_vec(&SecureUpgradeStartTestRequest {
+        version: 1,
+        proof_key_id: "app-attest-proof-key-alpha".to_string(),
+        platform: SecureUpgradePlatform::Ios,
+    })
+    .unwrap();
+
+    let (status, _headers, bytes) = post_cbor(
+        router,
+        handlers_owner_events::SECURE_UPGRADE_APP_ATTEST_START_PATH,
+        body,
+        Some(&person),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    let response: SecureUpgradeStartTestResponse =
+        household_rs::cbor::from_canonical_slice(&bytes).unwrap();
+    assert_eq!(response.version, 1);
+    assert!(response.challenge_id.starts_with("su-"));
+    assert!(response.expires_at > unix_now());
+
+    let transcript =
+        SecureUpgradeTranscript::from_canonical_bytes(response.canonical_transcript_cbor.as_ref())
+            .unwrap();
+    assert_eq!(transcript.hh_id, identity.record.hh_id);
+    assert_eq!(
+        transcript.owner_p_id,
+        household_rs::derive_person_id(&person.public())
+    );
+    assert_eq!(
+        transcript.owner_key_id,
+        household_rs::derive_person_id(&person.public()).0
+    );
+    assert_eq!(transcript.challenge_id, response.challenge_id);
+    assert_eq!(transcript.app_team_id, "TEAMID1234");
+    assert_eq!(transcript.app_bundle_id, "com.example.soyeht.dev");
+    assert_eq!(transcript.proof_key_id, "app-attest-proof-key-alpha");
+    assert_eq!(
+        transcript.proof_environment,
+        SecureUpgradeProofEnvironment::Development
+    );
+    assert_eq!(transcript.platform, SecureUpgradePlatform::Ios);
+    let digest = SecureUpgradeTranscript::challenge_digest_from_canonical_transcript_bytes(
+        response.canonical_transcript_cbor.as_ref(),
+    );
+    assert_eq!(response.challenge_sha256.as_ref(), digest.as_slice());
+    assert!(
+        !state
+            .secure_upgrade_runtime
+            .as_ref()
+            .unwrap()
+            .challenge_store
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn secure_upgrade_finish_fails_closed_without_real_app_attest() {
+    let td = tempfile::tempdir().unwrap();
+    let identity = Arc::new(bootstrap(td.path()));
+    let (owner_auth, person) = legacy_owner_auth_for(&identity);
+    let (_td, router, _log, _broadcaster, person, _identity, _window, state) =
+        router_from_owner_auth_with_router_state(
+            td,
+            identity,
+            owner_auth,
+            person,
+            Duration::from_millis(100),
+            |state| {
+                state
+                    .with_owner_approval_policy(
+                        OwnerApprovalEnforcementPolicy::reviewed_core_v2_rollout()
+                            .with_secure_upgrade(SecureUpgradeEnforcement::StrongMintingEnabled),
+                    )
+                    .with_secure_upgrade_runtime(SecureUpgradeRuntimeConfig {
+                        app_team_id: "TEAMID1234".to_string(),
+                        app_bundle_id: "com.example.soyeht.dev".to_string(),
+                        proof_environment: SecureUpgradeProofEnvironment::Development,
+                        challenge_ttl: Duration::from_secs(300),
+                    })
+            },
+        );
+    let start_body = household_rs::cbor::to_canonical_vec(&SecureUpgradeStartTestRequest {
+        version: 1,
+        proof_key_id: "app-attest-proof-key-alpha".to_string(),
+        platform: SecureUpgradePlatform::Ios,
+    })
+    .unwrap();
+    let (status, _headers, start_bytes) = post_cbor(
+        router.clone(),
+        handlers_owner_events::SECURE_UPGRADE_APP_ATTEST_START_PATH,
+        start_body,
+        Some(&person),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let start: SecureUpgradeStartTestResponse =
+        household_rs::cbor::from_canonical_slice(&start_bytes).unwrap();
+    let digest = SecureUpgradeTranscript::challenge_digest_from_canonical_transcript_bytes(
+        start.canonical_transcript_cbor.as_ref(),
+    );
+    let owner_signature = person.sign(&digest).unwrap();
+    let finish_body = household_rs::cbor::to_canonical_vec(&SecureUpgradeFinishTestRequest {
+        version: 1,
+        challenge_id: start.challenge_id,
+        canonical_transcript_cbor: start.canonical_transcript_cbor,
+        attestation_object_cbor: ByteBuf::from(vec![0xa0]),
+        owner_signature: ByteBuf::from(owner_signature.as_bytes().to_vec()),
+    })
+    .unwrap();
+
+    let (status, _headers, resp_bytes) = post_cbor(
+        router,
+        handlers_owner_events::SECURE_UPGRADE_APP_ATTEST_FINISH_PATH,
+        finish_body,
+        Some(&person),
+    )
+    .await;
+
+    assert_generic_unauth(status, &resp_bytes);
+    let current_owner_auth = state
+        .household
+        .current_owner_auth()
+        .await
+        .expect("owner auth remains loaded");
+    assert!(
+        !current_owner_auth
+            .owner_person_cert
+            .has_strong_owner_provenance()
+    );
+    let replay_dir = state
+        .secure_upgrade_runtime
+        .as_ref()
+        .expect("secure upgrade runtime exists")
+        .replay_store
+        .dir();
+    assert!(
+        !replay_dir.exists() || fs::read_dir(replay_dir).unwrap().next().is_none(),
+        "failed finish must not record durable App Attest replay state"
+    );
 }
 
 fn register_owner_softpasskey(
@@ -923,7 +1146,32 @@ fn owner_auth_with_webauthn_credential(
     OwnerWebauthnRp,
     WebauthnAuthenticator<SoftPasskey>,
 ) {
-    let (mut owner_auth, person) = owner_auth_for(identity);
+    let (owner_auth, person) = owner_auth_for(identity);
+    owner_auth_with_webauthn_credential_from(identity, owner_auth, person)
+}
+
+fn legacy_owner_auth_with_webauthn_credential(
+    identity: &household_rs::LoadedIdentity,
+) -> (
+    household_rs::HouseholdAuthState,
+    P256Keypair,
+    OwnerWebauthnRp,
+    WebauthnAuthenticator<SoftPasskey>,
+) {
+    let (owner_auth, person) = legacy_owner_auth_for(identity);
+    owner_auth_with_webauthn_credential_from(identity, owner_auth, person)
+}
+
+fn owner_auth_with_webauthn_credential_from(
+    identity: &household_rs::LoadedIdentity,
+    mut owner_auth: HouseholdAuthState,
+    person: P256Keypair,
+) -> (
+    household_rs::HouseholdAuthState,
+    P256Keypair,
+    OwnerWebauthnRp,
+    WebauthnAuthenticator<SoftPasskey>,
+) {
     let mut rp = owner_webauthn_rp();
     let (credential, authenticator) = register_owner_softpasskey(&mut rp);
     let genesis = OwnerWebauthnAuthority::sign_genesis(
@@ -1650,6 +1898,34 @@ async fn post_cbor(
         .unwrap()
         .to_vec();
     (status, headers, bytes)
+}
+
+#[derive(Serialize)]
+struct SecureUpgradeStartTestRequest {
+    #[serde(rename = "v")]
+    version: u8,
+    proof_key_id: String,
+    platform: SecureUpgradePlatform,
+}
+
+#[derive(Deserialize)]
+struct SecureUpgradeStartTestResponse {
+    #[serde(rename = "v")]
+    version: u8,
+    challenge_id: String,
+    canonical_transcript_cbor: ByteBuf,
+    challenge_sha256: ByteBuf,
+    expires_at: u64,
+}
+
+#[derive(Serialize)]
+struct SecureUpgradeFinishTestRequest {
+    #[serde(rename = "v")]
+    version: u8,
+    challenge_id: String,
+    canonical_transcript_cbor: ByteBuf,
+    attestation_object_cbor: ByteBuf,
+    owner_signature: ByteBuf,
 }
 
 async fn post_cbor_with_macos_local_peer(
@@ -3150,6 +3426,355 @@ fn assert_passkey_conversion_only_in_local_attested_helper() {
     );
 }
 
+fn assert_strong_owner_minter_not_called_from_runtime() {
+    let admin_rust_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("server-rs parent is admin/rust")
+        .to_path_buf();
+    let mut sources = Vec::new();
+    collect_runtime_rust_sources(&admin_rust_dir, &mut sources);
+
+    let person_cert_path = admin_rust_dir
+        .join("household-rs")
+        .join("src")
+        .join("person_cert.rs");
+    let secure_upgrade_path = admin_rust_dir
+        .join("household-rs")
+        .join("src")
+        .join("secure_upgrade.rs");
+    let household_lib_path = admin_rust_dir
+        .join("household-rs")
+        .join("src")
+        .join("lib.rs");
+    let owner_events_path = admin_rust_dir
+        .join("server-rs")
+        .join("src")
+        .join("handlers_owner_events.rs");
+    let household_auth_path = admin_rust_dir
+        .join("server-rs")
+        .join("src")
+        .join("household_auth.rs");
+    let household_bootstrap_path = admin_rust_dir
+        .join("server-rs")
+        .join("src")
+        .join("household_bootstrap.rs");
+    assert!(
+        !sources.is_empty(),
+        "secure-upgrade strong-tier source guard must scan real runtime files"
+    );
+    assert!(
+        sources.iter().any(|path| path == &person_cert_path),
+        "secure-upgrade strong-tier source guard must include household-rs/src/person_cert.rs"
+    );
+    assert!(
+        sources.iter().any(|path| path == &secure_upgrade_path),
+        "secure-upgrade strong-tier source guard must include household-rs/src/secure_upgrade.rs"
+    );
+    assert!(
+        sources.iter().any(|path| path == &owner_events_path),
+        "secure-upgrade strong-tier source guard must include server-rs/src/handlers_owner_events.rs"
+    );
+    assert!(
+        sources.iter().any(|path| path == &household_auth_path),
+        "secure-upgrade strong-tier source guard must include server-rs/src/household_auth.rs"
+    );
+    assert!(
+        sources.iter().any(|path| path == &household_bootstrap_path),
+        "secure-upgrade strong-tier source guard must include server-rs/src/household_bootstrap.rs"
+    );
+    let mut violations = Vec::new();
+
+    for path in sources {
+        let source = fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("read runtime source {}: {e}", path.display()));
+        for (index, line) in source.lines().enumerate() {
+            let contains_direct_minter = line.contains("sign_owner_with_verified_provenance");
+            if contains_direct_minter {
+                let allowed_person_cert_definition = path == person_cert_path
+                    && line.contains("pub fn sign_owner_with_verified_provenance(");
+                let allowed_secure_upgrade_wrapper = path == secure_upgrade_path
+                    && line.contains("PersonCert::sign_owner_with_verified_provenance(");
+                if !allowed_person_cert_definition && !allowed_secure_upgrade_wrapper {
+                    violations.push(format!("{}:{}: {}", path.display(), index + 1, line.trim()));
+                    continue;
+                }
+            }
+
+            let contains_secure_upgrade = line.contains("SecureUpgrade")
+                || line.contains("secure_upgrade")
+                || line.contains("secure-upgrade")
+                || line.contains("secure/upgrade");
+            if !contains_secure_upgrade {
+                continue;
+            }
+            let allowed_path = path == secure_upgrade_path
+                || path == person_cert_path
+                || path == household_lib_path
+                || path == owner_events_path
+                || path == household_auth_path
+                || path == household_bootstrap_path;
+            if !allowed_path {
+                violations.push(format!("{}:{}: {}", path.display(), index + 1, line.trim()));
+            }
+        }
+    }
+
+    assert!(
+        violations.is_empty(),
+        "Secure/Upgrade strong owner minting must stay confined to the reviewed crypto module, explicit runtime handler, and bootstrap wiring; direct minter calls are only allowed through the crypto wrapper:\n{}",
+        violations.join("\n")
+    );
+
+    let owner_events_source = fs::read_to_string(&owner_events_path).unwrap();
+    assert!(owner_events_source.contains("reviewed-core-v2-secure-upgrade"));
+    assert!(owner_events_source.contains("secure_upgrade_strong_minting_enabled"));
+    assert!(owner_events_source.contains("secure_upgrade_runtime_or_reject"));
+    assert!(owner_events_source.contains("sign_owner_cert_with_secure_upgrade_verification"));
+    assert!(!owner_events_source.contains("PersonCert::sign_owner_with_verified_provenance("));
+
+    let bootstrap_source = fs::read_to_string(&household_bootstrap_path).unwrap();
+    assert!(bootstrap_source.contains("secure_upgrade_runtime_config_from_env()"));
+    assert!(bootstrap_source.contains("with_secure_upgrade_runtime(config)"));
+    assert!(bootstrap_source.contains("secure_upgrade_app_attest_start_handler"));
+    assert!(bootstrap_source.contains("secure_upgrade_app_attest_finish_handler"));
+}
+
+#[test]
+fn owner_strong_tier_minting_source_guard_requires_stop_resolution() {
+    assert_strong_owner_minter_not_called_from_runtime();
+}
+
+#[test]
+fn approved_online_signal_source_guard_remains_stop_gated() {
+    let server_src_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src");
+    let mut sources = Vec::new();
+    collect_runtime_rust_sources(&server_src_dir, &mut sources);
+    assert!(
+        !sources.is_empty(),
+        "approved/online source guard must scan real server runtime files"
+    );
+    assert!(
+        sources.iter().any(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name == "handlers_owner_events.rs")
+        }),
+        "approved/online source guard must include owner-events runtime source"
+    );
+    assert!(
+        sources.iter().any(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name == "household_bootstrap.rs")
+        }),
+        "approved/online source guard must include household bootstrap runtime source"
+    );
+
+    let forbidden = [
+        "presence_approved",
+        "approval_denied",
+        "approved_online",
+        "PresenceApproved",
+        "ApprovalDenied",
+        "ApprovedOnline",
+    ];
+    let mut violations = Vec::new();
+    for path in sources {
+        let source = fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("read server runtime source {}: {e}", path.display()));
+        for (index, line) in source.lines().enumerate() {
+            for token in forbidden {
+                if line.contains(token) {
+                    violations.push(format!("{}:{}: {}", path.display(), index + 1, line.trim()));
+                }
+            }
+        }
+    }
+
+    assert!(
+        violations.is_empty(),
+        "approved/online signal remains a STOP; do not wire it in server runtime before the reviewed signal contract lands:\n{}",
+        violations.join("\n")
+    );
+}
+
+#[test]
+fn device_pairing_fan_out_gate_source_guard_remains_stop_gated() {
+    let device_pairing = include_str!("../src/handlers_device_pairing.rs");
+    let approve_handler = source_segment(
+        device_pairing,
+        "pub async fn device_pairing_approve_handler(",
+        "fn validate_request_version(",
+    );
+    assert!(approve_handler.contains("household_auth::authorize_request"));
+    assert!(approve_handler.contains("Operation::HouseholdAddMachine"));
+    assert!(approve_handler.contains(".device_pairing_store"));
+    assert!(approve_handler.contains(".approve(&request.request_id"));
+
+    for forbidden in [
+        "owner_can_fan_out",
+        "owner_auth_allows_fan_out",
+        "OwnerApprovalEnforcementPolicy",
+        "reviewed-core-v2",
+        "sign_owner_with_verified_provenance",
+    ] {
+        assert!(
+            !device_pairing.contains(forbidden),
+            "device-pairing approve remains a future/default-safe fan-out gate; \
+             do not wire {forbidden:?} here until strong-tier minting and a separate \
+             rollout policy are reviewed"
+        );
+    }
+}
+
+#[test]
+fn household_remote_attach_source_guard_remains_stop_gated() {
+    let household_claws = include_str!("../src/handlers_household_claws.rs");
+    let public_mint_attach_token = source_segment(
+        household_claws,
+        "pub async fn handle_household_mint_attach_token(",
+        "/// Upgrades a household terminal WebSocket using a single-use attach token.",
+    );
+    assert!(public_mint_attach_token.contains("is_terminal_attach_peer_allowed"));
+    assert!(public_mint_attach_token.contains("Operation::ClawsUse"));
+    assert!(public_mint_attach_token.contains("\"mint_attach_token\""));
+    assert!(public_mint_attach_token.contains("household_mint_attach_token("));
+
+    let private_mint_attach_token = source_segment(
+        household_claws,
+        "async fn household_mint_attach_token(",
+        "async fn household_terminal_pty(",
+    );
+    assert!(private_mint_attach_token.contains("require_household_container"));
+    assert!(private_mint_attach_token.contains("verify_session_owner"));
+    assert!(private_mint_attach_token.contains(".attach_tokens"));
+    assert!(private_mint_attach_token.contains(".mint(HouseholdAttachScope"));
+
+    let public_terminal_pty = source_segment(
+        household_claws,
+        "pub async fn handle_household_terminal_pty(",
+        "/// `PoP`-gates stopping a household-scoped instance.",
+    );
+    assert!(public_terminal_pty.contains("is_terminal_attach_peer_allowed"));
+    assert!(public_terminal_pty.contains("household_terminal_pty(&state"));
+
+    let private_terminal_pty = source_segment(
+        household_claws,
+        "async fn household_terminal_pty(",
+        "fn attach_token_from_headers(",
+    );
+    assert!(private_terminal_pty.contains(".attach_tokens"));
+    assert!(private_terminal_pty.contains(".consume(token)"));
+    assert!(private_terminal_pty.contains("verify_session_owner"));
+    assert!(private_terminal_pty.contains("serve_authorized_terminal_pty"));
+
+    for forbidden in [
+        "owner_can_fan_out",
+        "owner_auth_allows_fan_out",
+        "OwnerApprovalEnforcementPolicy",
+        "reviewed-core-v2",
+        "sign_owner_with_verified_provenance",
+    ] {
+        let segments = [
+            ("public_mint_attach_token", public_mint_attach_token),
+            ("private_mint_attach_token", private_mint_attach_token),
+            ("public_terminal_pty", public_terminal_pty),
+            ("private_terminal_pty", private_terminal_pty),
+        ];
+        let offenders = segments
+            .iter()
+            .filter_map(|(name, segment)| segment.contains(forbidden).then_some(*name))
+            .collect::<Vec<_>>();
+        assert!(
+            offenders.is_empty(),
+            "household remote attach remains a future/default-safe fan-out gate; \
+             do not wire {forbidden:?} in {offenders:?} until strong-tier minting \
+             and a separate rollout policy are reviewed"
+        );
+    }
+}
+
+#[test]
+fn product_a_transport_source_guard_does_not_become_owner_tier_authority() {
+    let server_src_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src");
+    let mut sources = Vec::new();
+    collect_runtime_rust_sources(&server_src_dir, &mut sources);
+    let product_a_sources = sources
+        .into_iter()
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| {
+                    name == "handlers_claw_share.rs"
+                        || name.starts_with("claw_share_relay")
+                        || name.starts_with("claw_share_rendezvous")
+                        || name.starts_with("relay_stream_")
+                })
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        !product_a_sources.is_empty(),
+        "Product A / relay_stream source guard must scan real runtime files"
+    );
+    assert!(
+        product_a_sources.iter().any(|path| path
+            .file_name()
+            .is_some_and(|name| name == "handlers_claw_share.rs")),
+        "Product A source guard must include handlers_claw_share.rs"
+    );
+    assert!(
+        product_a_sources.iter().any(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("claw_share_relay"))
+        }),
+        "Product A source guard must include claw_share_relay* runtime sources"
+    );
+    assert!(
+        product_a_sources.iter().any(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("claw_share_rendezvous"))
+        }),
+        "Product A source guard must include claw_share_rendezvous* runtime sources"
+    );
+    assert!(
+        product_a_sources.iter().any(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("relay_stream_"))
+        }),
+        "Product A source guard must include relay_stream_* bin entrypoints"
+    );
+
+    let forbidden = [
+        "owner_can_fan_out",
+        "owner_auth_allows_fan_out",
+        "sign_owner_with_verified_provenance",
+        "OwnerApprovalEnforcementPolicy",
+        "THEYOS_OWNER_AUTH_V2_ROLLOUT",
+        "reviewed-core-v2",
+    ];
+    let mut violations = Vec::new();
+    for path in product_a_sources {
+        let source = fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("read Product A runtime source {}: {e}", path.display()));
+        for (index, line) in source.lines().enumerate() {
+            for token in forbidden {
+                if line.contains(token) {
+                    violations.push(format!("{}:{}: {}", path.display(), index + 1, line.trim()));
+                }
+            }
+        }
+    }
+
+    assert!(
+        violations.is_empty(),
+        "Product A / nvpn / relay_stream must stay post-trust connectivity, not owner-tier authority:\n{}",
+        violations.join("\n")
+    );
+}
+
 #[test]
 fn owner_webauthn_registration_status_source_guards_read_only_contract() {
     let source = include_str!("../src/handlers_owner_events.rs");
@@ -3234,7 +3859,8 @@ fn owner_webauthn_registration_local_source_guards_fail_closed_boundary() {
     assert!(local_start.contains("Option<Extension<ConnectInfo<MacosLocalPeerConnectInfo>>>"));
     assert!(local_start.contains("authorize_macos_local_caller"));
     assert!(local_start.contains("BOOTSTRAP_MUTATION_LOCK"));
-    assert!(local_start.contains("owner_webauthn_initial_enrollment_policy_snapshot"));
+    assert!(local_start.contains("owner_webauthn_initial_enrollment_policy_snapshot_read_only"));
+    assert!(!local_start.contains("owner_webauthn_initial_enrollment_policy_snapshot("));
     assert!(local_start.contains("start_macos_local_attested_registration_from"));
     assert!(!local_start.contains("authorize_owner_auth_enroll_initial_request"));
     assert!(!local_start.contains("authorize_owner_webauthn_registration_status_request"));
@@ -3253,6 +3879,16 @@ fn owner_webauthn_registration_local_source_guards_fail_closed_boundary() {
         local_start.find("authorize_macos_local_caller").unwrap()
             < local_start.find("decode_canonical_cbor").unwrap()
     );
+
+    let local_policy_snapshot = source_segment(
+        source,
+        "fn owner_webauthn_initial_enrollment_policy_snapshot_read_only(",
+        "fn require_owner_webauthn_never_enrolled_for_initial_enrollment",
+    );
+    assert!(local_policy_snapshot.contains("classify_owner_webauthn_authority_anchor_read_only"));
+    assert!(!local_policy_snapshot.contains("verify_or_update_owner_webauthn_authority_anchor"));
+    assert!(!local_policy_snapshot.contains("OwnerWebauthnAnchorMode::Enforcement"));
+    assert!(!local_policy_snapshot.contains("OwnerWebauthnAnchorMode::MigrationDefaultOff"));
 
     let local_finish = source_segment(
         source,
@@ -3316,6 +3952,14 @@ fn owner_webauthn_registration_local_source_guards_fail_closed_boundary() {
     assert!(router_source.contains("spawn_macos_local_registration_listener"));
     assert!(router_source.contains("DesignatedRequirementMacosLocalCallerAuth::new"));
     assert!(router_source.contains("macos_local_app_profile_for_state_dir(&state_dir)"));
+    assert!(router_source.contains("macos_local_owner_webauthn_registration_state("));
+    assert!(
+        router_source.contains(".with_owner_webauthn_rp(owner_webauthn_local_registration_rp()?")
+    );
+    assert!(router_source.contains(
+        ".with_owner_webauthn_anchor(owner_webauthn_local_registration_anchor_store(state_dir))"
+    ));
+    assert!(router_source.contains(".with_macos_local_caller_auth(verifier)"));
     assert!(router_source.contains("fn macos_local_app_profile_for_state_dir"));
     assert!(router_source.contains("MacosLocalAppProfile::Production"));
     assert!(router_source.contains("MacosLocalAppProfile::Development"));
@@ -3367,6 +4011,7 @@ fn owner_approval_rollout_source_guard_requires_explicit_default_off_wiring() {
     let source = include_str!("../src/handlers_owner_events.rs");
     assert!(source.contains("THEYOS_OWNER_AUTH_V2_ROLLOUT"));
     assert!(source.contains("reviewed-core-v2"));
+    assert!(source.contains("reviewed-core-v2-secure-upgrade"));
     assert!(source.contains("unknown owner-auth v2 rollout value; keeping LegacyOnly policy"));
 
     let reviewed_rollout = source_segment(
@@ -3387,6 +4032,14 @@ fn owner_approval_rollout_source_guard_requires_explicit_default_off_wiring() {
     assert!(!reviewed_rollout.contains("bootstrap_initialize"));
     assert!(!reviewed_rollout.contains("bootstrap_teardown"));
     assert!(!reviewed_rollout.contains("pair_device_confirm"));
+    assert!(!reviewed_rollout.contains("device_pairing"));
+    assert!(!reviewed_rollout.contains("device-pairing"));
+    assert!(!reviewed_rollout.contains("attach_token"));
+    assert!(!reviewed_rollout.contains("terminal_pty"));
+    assert!(!reviewed_rollout.contains("household_claws"));
+    assert!(!reviewed_rollout.contains("secure_upgrade"));
+    assert!(!reviewed_rollout.contains("SecureUpgrade"));
+    assert!(!reviewed_rollout.contains("sign_owner_with_verified_provenance"));
 
     let parser = source_segment(
         source,
@@ -3395,12 +4048,42 @@ fn owner_approval_rollout_source_guard_requires_explicit_default_off_wiring() {
     );
     assert!(parser.contains("None | Some(\"off\" | \"legacy\" | \"legacy-only\")"));
     assert!(parser.contains("OWNER_AUTH_V2_REVIEWED_CORE_ROLLOUT"));
+    assert!(parser.contains("OWNER_AUTH_V2_SECURE_UPGRADE_ROLLOUT"));
+    assert!(parser.contains("with_secure_upgrade(SecureUpgradeEnforcement::StrongMintingEnabled)"));
     assert!(parser.contains("OwnerApprovalEnforcementPolicy::default()"));
 
     let router_source = include_str!("../src/household_bootstrap.rs");
     assert!(router_source.contains(
-        ".with_owner_approval_policy(handlers_owner_events::owner_approval_policy_from_env())"
+        "let owner_approval_policy = handlers_owner_events::owner_approval_policy_from_env();"
     ));
+    assert!(router_source.contains(".with_owner_approval_policy(owner_approval_policy.clone())"));
+    assert!(router_source.contains("secure_upgrade_runtime_config_from_env()"));
+    assert!(router_source.contains("with_secure_upgrade_runtime(config)"));
+}
+
+#[test]
+fn pair_machine_fan_out_source_guard_requires_strong_owner_tier() {
+    let source = include_str!("../src/handlers_owner_events.rs");
+    assert!(source.contains("fn owner_auth_allows_fan_out("));
+    assert!(source.contains("owner_auth.owner_can_fan_out()"));
+    assert!(source.contains("owner_auth_tier_not_strong"));
+
+    let start_handler = source_segment(
+        source,
+        "pub async fn owner_approval_v2_start_handler(",
+        "let Some(credentials) = policy_snapshot.credentials",
+    );
+    assert!(start_handler.contains("PairMachineApprovalBodyMode::RequireV2"));
+    assert!(start_handler.contains("owner_auth_allows_fan_out"));
+
+    let approve_handler = source_segment(
+        source,
+        "pub async fn owner_approve_handler(",
+        "let approval_wire = match parse_pair_machine_approval_body",
+    );
+    assert!(approve_handler.contains("let body_mode = state"));
+    assert!(approve_handler.contains("body_mode == PairMachineApprovalBodyMode::RequireV2"));
+    assert!(approve_handler.contains("owner_auth_allows_fan_out"));
 }
 
 #[test]
@@ -8159,6 +8842,77 @@ async fn approve_happy_path_drives_commit() {
 }
 
 #[tokio::test]
+async fn approve_legacy_policy_allows_tierless_owner_before_strong_minting() {
+    let td = tempfile::tempdir().unwrap();
+    let identity = Arc::new(bootstrap(td.path()));
+    let (owner_auth, person) = legacy_owner_auth_for(&identity);
+    assert!(!owner_auth.owner_can_fan_out());
+    let (td, router, log, _broadcaster, person, identity, window) = router_from_owner_auth(
+        td,
+        identity,
+        owner_auth,
+        person,
+        Duration::from_secs(45),
+        |state| state,
+    );
+
+    fs::write(household_root_sole_path(td.path()), b"fake-sole-shard").unwrap();
+    let candidate = start_candidate_harness().await;
+    let event = stage_prepared_join_window(&window, &log, &identity, &candidate).await;
+    candidate
+        .window
+        .pin_household_anchor(
+            identity.record.hh_id.as_str().to_string(),
+            *identity.record.hh_pub.as_bytes(),
+        )
+        .await
+        .unwrap();
+    let uri = format!("/api/v1/household/owner-events/{}/approve", event.cursor);
+    let timestamp = unix_now();
+    let body = approval_body(
+        &identity,
+        &person,
+        event.cursor,
+        candidate.prepared.join_request.challenge_sig.clone(),
+        timestamp,
+    );
+    let auth = pop_header_for(&person, "POST", &uri, timestamp, &body);
+
+    let resp = router
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(uri)
+                .header(header::AUTHORIZATION, auth)
+                .header(header::CONTENT_TYPE, "application/cbor")
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = resp.status();
+    let resp_bytes = to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap()
+        .to_vec();
+
+    assert_eq!(status, StatusCode::OK);
+    let ack: OwnerApprovalAck = household_rs::cbor::from_canonical_slice(&resp_bytes).unwrap();
+    assert_eq!(ack.version, 1);
+    assert_eq!(window.snapshot().await.state, PairMachineState::Committed);
+    assert_eq!(
+        candidate.window.snapshot().await.state,
+        PairMachineState::Committed
+    );
+    let events = log.read_since(event.cursor).unwrap();
+    assert_eq!(events.len(), 1);
+    assert!(matches!(
+        events[0].event_type,
+        OwnerEventType::MachineJoined
+    ));
+}
+
+#[tokio::test]
 async fn approve_reviewed_rollout_trust_state_never_enrolled_keeps_legacy_path() {
     let (td, router, log, _broadcaster, person, identity, window) =
         router_with_v2_policy_without_passkey(Duration::from_secs(45));
@@ -8332,6 +9086,127 @@ async fn approval_v2_start_does_not_migrate_missing_anchor_on_request_path() {
             OwnerWebauthnAnchorMode::Enforcement,
         )
         .is_err()
+    );
+}
+
+#[tokio::test]
+async fn approval_v2_start_rejects_tierless_owner_even_with_active_passkey() {
+    let td = tempfile::tempdir().unwrap();
+    let identity = Arc::new(bootstrap(td.path()));
+    let (owner_auth, person, rp, _authenticator) =
+        legacy_owner_auth_with_webauthn_credential(&identity);
+    assert!(!owner_auth.owner_can_fan_out());
+    let anchor_store: Arc<dyn keystore_rs::KeystoreBackend> =
+        Arc::new(FileKeystore::new(td.path(), keystore_rs::SERVICE));
+    verify_or_update_owner_webauthn_authority_anchor(
+        anchor_store.as_ref(),
+        &owner_auth.owner_webauthn,
+        &identity.record,
+        &owner_auth.owner_person_cert,
+        OwnerWebauthnAnchorMode::MigrationDefaultOff,
+    )
+    .unwrap();
+    let policy = OwnerApprovalEnforcementPolicy::reviewed_core_v2_rollout();
+    let (_td, router, log, _broadcaster, person, identity, window) = router_from_owner_auth(
+        td,
+        identity,
+        owner_auth,
+        person,
+        Duration::from_secs(45),
+        move |state| {
+            state
+                .with_owner_approval_policy(policy)
+                .with_owner_webauthn_rp(rp)
+                .with_owner_webauthn_anchor(anchor_store)
+        },
+    );
+    let candidate = start_candidate_harness().await;
+    let event = stage_prepared_join_window(&window, &log, &identity, &candidate).await;
+    let (status, resp_bytes) = post_approval_v2_start(router, &person, event.cursor).await;
+
+    assert_generic_unauth(status, &resp_bytes);
+    assert_eq!(
+        window.snapshot().await.state,
+        PairMachineState::AwaitingOwner
+    );
+    assert!(log.read_since(event.cursor).unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn approve_v2_reviewed_rollout_rejects_tierless_owner_before_fan_out() {
+    let td = tempfile::tempdir().unwrap();
+    let identity = Arc::new(bootstrap(td.path()));
+    let (owner_auth, person, rp, _authenticator) =
+        legacy_owner_auth_with_webauthn_credential(&identity);
+    assert!(!owner_auth.owner_can_fan_out());
+    let anchor_store: Arc<dyn keystore_rs::KeystoreBackend> =
+        Arc::new(FileKeystore::new(td.path(), keystore_rs::SERVICE));
+    verify_or_update_owner_webauthn_authority_anchor(
+        anchor_store.as_ref(),
+        &owner_auth.owner_webauthn,
+        &identity.record,
+        &owner_auth.owner_person_cert,
+        OwnerWebauthnAnchorMode::MigrationDefaultOff,
+    )
+    .unwrap();
+    let policy = OwnerApprovalEnforcementPolicy::reviewed_core_v2_rollout();
+    let (_td, router, log, _broadcaster, person, identity, window) = router_from_owner_auth(
+        td,
+        identity,
+        owner_auth,
+        person,
+        Duration::from_secs(45),
+        move |state| {
+            state
+                .with_owner_approval_policy(policy)
+                .with_owner_webauthn_rp(rp)
+                .with_owner_webauthn_anchor(anchor_store)
+        },
+    );
+
+    fs::write(household_root_sole_path(_td.path()), b"fake-sole-shard").unwrap();
+    let candidate = start_candidate_harness().await;
+    let event = stage_prepared_join_window(&window, &log, &identity, &candidate).await;
+    candidate
+        .window
+        .pin_household_anchor(
+            identity.record.hh_id.as_str().to_string(),
+            *identity.record.hh_pub.as_bytes(),
+        )
+        .await
+        .unwrap();
+    let uri = format!("/api/v1/household/owner-events/{}/approve", event.cursor);
+    let body =
+        household_rs::cbor::to_canonical_vec(&OwnerApprovalV2StartRequest { version: 1 }).unwrap();
+    let auth = pop_header_for(&person, "POST", &uri, unix_now(), &body);
+
+    let resp = router
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(uri)
+                .header(header::AUTHORIZATION, auth)
+                .header(header::CONTENT_TYPE, "application/cbor")
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = resp.status();
+    let resp_bytes = to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap()
+        .to_vec();
+
+    assert_generic_unauth(status, &resp_bytes);
+    assert_eq!(
+        window.snapshot().await.state,
+        PairMachineState::AwaitingOwner
+    );
+    assert!(log.read_since(event.cursor).unwrap().is_empty());
+    assert_ne!(
+        candidate.window.snapshot().await.state,
+        PairMachineState::Committed
     );
 }
 

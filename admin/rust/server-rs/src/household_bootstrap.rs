@@ -179,6 +179,44 @@ fn macos_local_app_profile_for_state_dir(
     }
 }
 
+#[cfg(any(target_os = "macos", test))]
+type LocalOwnerWebauthnRp = household_rs::owner_webauthn::OwnerWebauthnRp;
+
+#[cfg(any(target_os = "macos", test))]
+fn owner_webauthn_local_registration_rp() -> Result<LocalOwnerWebauthnRp, String> {
+    let origin = webauthn_rs::prelude::Url::parse("https://household.example.test")
+        .map_err(|e| e.to_string())?;
+    let config = household_rs::owner_webauthn::OwnerWebauthnConfig::new(
+        "household.example.test",
+        origin,
+        "Soyeht",
+    )
+    .map_err(|e| e.to_string())?;
+    household_rs::owner_webauthn::OwnerWebauthnRp::new(config).map_err(|e| e.to_string())
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn owner_webauthn_local_registration_anchor_store(
+    state_dir: &Path,
+) -> Arc<dyn keystore_rs::KeystoreBackend> {
+    Arc::new(keystore_rs::FileKeystore::new(
+        state_dir,
+        keystore_rs::SERVICE,
+    ))
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn macos_local_owner_webauthn_registration_state(
+    state: handlers_owner_events::OwnerEventsRouterState,
+    state_dir: &Path,
+    verifier: Arc<dyn crate::macos_local_caller_auth::MacosLocalCallerAuth>,
+) -> Result<handlers_owner_events::OwnerEventsRouterState, String> {
+    Ok(state
+        .with_owner_webauthn_rp(owner_webauthn_local_registration_rp()?)
+        .with_owner_webauthn_anchor(owner_webauthn_local_registration_anchor_store(state_dir))
+        .with_macos_local_caller_auth(verifier))
+}
+
 fn claw_share_log_path(state_dir: &Path) -> PathBuf {
     state_dir.join("claw_share").join("mesh_log.ndjson")
 }
@@ -614,6 +652,7 @@ pub async fn bootstrap_household(shared_state: Option<SharedState>) {
                 state_dir: state_dir.clone(),
             };
             bonjour_browser_state = Some(pair_machine_state.clone());
+            let owner_approval_policy = handlers_owner_events::owner_approval_policy_from_env();
             let mut owner_events_state = handlers_owner_events::OwnerEventsRouterState::new(
                 identity_state.clone(),
                 Arc::clone(&pair_machine_window),
@@ -622,7 +661,21 @@ pub async fn bootstrap_household(shared_state: Option<SharedState>) {
                 state_dir.clone(),
                 key_policy,
             )
-            .with_owner_approval_policy(handlers_owner_events::owner_approval_policy_from_env());
+            .with_owner_approval_policy(owner_approval_policy.clone());
+            if owner_approval_policy.secure_upgrade_strong_minting_enabled() {
+                match handlers_owner_events::secure_upgrade_runtime_config_from_env() {
+                    Ok(config) => {
+                        owner_events_state = owner_events_state.with_secure_upgrade_runtime(config);
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            stage = "secure_upgrade.runtime_unavailable",
+                            reason = %e,
+                            "Secure/Upgrade rollout is enabled but runtime config is unavailable"
+                        );
+                    }
+                }
+            }
             if let Some(state) = shared_state.as_ref() {
                 owner_events_state = owner_events_state
                     .with_recovery_consume_rate_limiter(Arc::clone(&state.rate_limiter));
@@ -676,24 +729,36 @@ pub async fn bootstrap_household(shared_state: Option<SharedState>) {
                         macos_local_app_profile_for_state_dir(&state_dir),
                     ),
                 );
-                let macos_local_state = owner_events_state
-                    .clone()
-                    .with_macos_local_caller_auth(macos_local_verifier);
-                let macos_local_router =
-                    handlers_owner_events::owner_webauthn_macos_local_registration_router(
-                        macos_local_state,
-                    );
-                if let Err(e) =
-                    crate::macos_local_registration_listener::spawn_macos_local_registration_listener(
-                        &state_dir,
-                        macos_local_router,
-                    )
-                {
-                    tracing::warn!(
-                        stage = "macos_local_registration.listener_unavailable",
-                        error = %e,
-                        "macOS local registration listener unavailable"
-                    );
+                match macos_local_owner_webauthn_registration_state(
+                    owner_events_state.clone(),
+                    &state_dir,
+                    macos_local_verifier,
+                ) {
+                    Ok(macos_local_state) => {
+                        let macos_local_router =
+                            handlers_owner_events::owner_webauthn_macos_local_registration_router(
+                                macos_local_state,
+                            );
+                        if let Err(e) =
+                            crate::macos_local_registration_listener::spawn_macos_local_registration_listener(
+                                &state_dir,
+                                macos_local_router,
+                            )
+                        {
+                            tracing::warn!(
+                                stage = "macos_local_registration.listener_unavailable",
+                                error = %e,
+                                "macOS local registration listener unavailable"
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            stage = "macos_local_registration.state_unavailable",
+                            error = %e,
+                            "macOS local registration state unavailable"
+                        );
+                    }
                 }
             }
             Some(
@@ -731,6 +796,18 @@ pub async fn bootstrap_household(shared_state: Option<SharedState>) {
                                 "/api/v1/household/owner-webauthn/registration/status",
                                 axum::routing::post(
                                     handlers_owner_events::owner_webauthn_registration_status_handler,
+                                ),
+                            )
+                            .route(
+                                handlers_owner_events::SECURE_UPGRADE_APP_ATTEST_START_PATH,
+                                axum::routing::post(
+                                    handlers_owner_events::secure_upgrade_app_attest_start_handler,
+                                ),
+                            )
+                            .route(
+                                handlers_owner_events::SECURE_UPGRADE_APP_ATTEST_FINISH_PATH,
+                                axum::routing::post(
+                                    handlers_owner_events::secure_upgrade_app_attest_finish_handler,
                                 ),
                             )
                             .route(
@@ -1605,6 +1682,43 @@ mod tests {
         assert_eq!(
             macos_local_app_profile_for_state_dir(explicit_dev_state_dir),
             MacosLocalAppProfile::Development
+        );
+    }
+
+    #[test]
+    fn macos_local_registration_state_wires_runtime_webauthn_dependencies() {
+        let td = tempfile::tempdir().unwrap();
+        let broadcaster = OwnerEventsBroadcaster::new();
+        let event_log =
+            OwnerEventLog::open_with_broadcaster(td.path().to_path_buf(), broadcaster.clone())
+                .unwrap();
+        let window = Arc::new(PairMachineWindow::new_in_memory());
+        let state = handlers_owner_events::OwnerEventsRouterState::new(
+            HouseholdState::empty(),
+            window,
+            event_log,
+            broadcaster,
+            td.path().to_path_buf(),
+            household_rs::KeyBackingPolicy::ForceSoftware,
+        );
+        let verifier: Arc<dyn crate::macos_local_caller_auth::MacosLocalCallerAuth> =
+            Arc::new(crate::macos_local_caller_auth::FailClosedMacosLocalCallerAuth);
+
+        let state =
+            macos_local_owner_webauthn_registration_state(state, td.path(), verifier).unwrap();
+
+        assert!(state.macos_local_caller_auth.is_some());
+        assert!(state.owner_webauthn_anchor.is_some());
+        let rp = state
+            .owner_webauthn_rp
+            .as_ref()
+            .expect("local registration runtime state wires RP")
+            .try_lock()
+            .expect("RP lock is uncontended in unit test");
+        assert_eq!(rp.config().rp_id(), "household.example.test");
+        assert_eq!(
+            rp.config().rp_origin().as_str(),
+            "https://household.example.test/"
         );
     }
 

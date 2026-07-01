@@ -304,6 +304,56 @@ pub async fn authorize_owner_webauthn_add_credential_finish_request(
     .await
 }
 
+/// Authorize Secure/Upgrade App Attest challenge issuance.
+///
+/// This proves only the current owner identity plus a fresh body-bound
+/// proof-of-possession. The App Attest proof and owner-key signature are bound
+/// and verified by the Secure/Upgrade finish runtime.
+pub async fn authorize_secure_upgrade_start_request(
+    state: &HouseholdState,
+    headers: &HeaderMap,
+    method: &Method,
+    path_and_query: &str,
+    body: &[u8],
+    now: u64,
+) -> Result<Arc<HouseholdAuthState>, AuthError> {
+    authorize_owner_only_pop_request(
+        state,
+        headers,
+        method,
+        path_and_query,
+        body,
+        now,
+        "SecureUpgradeStart",
+    )
+    .await
+}
+
+/// Authorize Secure/Upgrade App Attest finish and strong owner minting.
+///
+/// The PoP only identifies the current owner submitting the ceremony; the
+/// handler revalidates the stored challenge, App Attest proof, owner-key
+/// signature, durable replay state, and verified provenance before minting.
+pub async fn authorize_secure_upgrade_finish_request(
+    state: &HouseholdState,
+    headers: &HeaderMap,
+    method: &Method,
+    path_and_query: &str,
+    body: &[u8],
+    now: u64,
+) -> Result<Arc<HouseholdAuthState>, AuthError> {
+    authorize_owner_only_pop_request(
+        state,
+        headers,
+        method,
+        path_and_query,
+        body,
+        now,
+        "SecureUpgradeFinish",
+    )
+    .await
+}
+
 /// Authorize the owner recovery-code readiness surface.
 ///
 /// Readiness is owner-authenticated but does not grant owner auth by itself.

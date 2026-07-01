@@ -59,6 +59,13 @@ use household_rs::pair_machine::{
     JoinRequest, OwnerApproval, OwnerApprovalContext, PairMachineState, PairMachineWindow,
     PairMachineWindowSnapshot, join_request_hash,
 };
+use household_rs::person_cert::{PersonCert, SignOwnerOptions};
+use household_rs::secure_upgrade::{
+    SecureUpgradeAppAttestTranscriptInput, SecureUpgradeChallengeStore,
+    SecureUpgradeDurableAppAttestReplayStore, SecureUpgradePlatform, SecureUpgradeProofEnvironment,
+    SecureUpgradeProofVerificationInput, SecureUpgradeTranscript,
+    sign_owner_cert_with_secure_upgrade_verification, verify_secure_upgrade_ceremony_for_challenge,
+};
 use rand::RngCore;
 use rand::rngs::OsRng;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
@@ -87,6 +94,16 @@ const CBOR_CONTENT_TYPE: &str = "application/cbor";
 const OWNER_EVENTS_LONG_POLL_TIMEOUT: Duration = Duration::from_secs(45);
 pub const OWNER_AUTH_V2_ROLLOUT_ENV: &str = "THEYOS_OWNER_AUTH_V2_ROLLOUT";
 pub const OWNER_AUTH_V2_REVIEWED_CORE_ROLLOUT: &str = "reviewed-core-v2";
+pub const OWNER_AUTH_V2_SECURE_UPGRADE_ROLLOUT: &str = "reviewed-core-v2-secure-upgrade";
+pub const SECURE_UPGRADE_APP_ATTEST_TEAM_ID_ENV: &str = "THEYOS_SECURE_UPGRADE_APP_ATTEST_TEAM_ID";
+pub const SECURE_UPGRADE_APP_ATTEST_BUNDLE_ID_ENV: &str =
+    "THEYOS_SECURE_UPGRADE_APP_ATTEST_BUNDLE_ID";
+pub const SECURE_UPGRADE_APP_ATTEST_ENVIRONMENT_ENV: &str =
+    "THEYOS_SECURE_UPGRADE_APP_ATTEST_ENVIRONMENT";
+pub const SECURE_UPGRADE_CHALLENGE_TTL_SECS_ENV: &str = "THEYOS_SECURE_UPGRADE_CHALLENGE_TTL_SECS";
+
+const SECURE_UPGRADE_DEFAULT_CHALLENGE_TTL_SECS: u64 = 300;
+const SECURE_UPGRADE_APP_ATTEST_REPLAY_DIR: &str = "secure_upgrade_app_attest_replay";
 
 #[derive(Clone)]
 pub struct OwnerEventsRouterState {
@@ -134,6 +151,11 @@ pub struct OwnerEventsRouterState {
     /// audit-token/SecCode designated-requirement verifier; tests may inject a
     /// fake verifier explicitly.
     pub macos_local_caller_auth: Option<Arc<dyn MacosLocalCallerAuth>>,
+    /// Runtime state for Secure/Upgrade strong owner minting.
+    ///
+    /// This is absent by default. Production must opt in with the dedicated
+    /// Secure/Upgrade rollout plus explicit App Attest verifier configuration.
+    pub secure_upgrade_runtime: Option<SecureUpgradeRuntime>,
 }
 
 #[derive(Clone)]
@@ -144,6 +166,21 @@ pub struct OwnerWebauthnAnchorVerifier {
 #[derive(Clone)]
 pub struct OwnerWebauthnRecoveryAnchorVerifier {
     pub keystore: Arc<dyn keystore_rs::KeystoreBackend>,
+}
+
+#[derive(Clone)]
+pub struct SecureUpgradeRuntime {
+    pub challenge_store: Arc<SecureUpgradeChallengeStore>,
+    pub replay_store: Arc<SecureUpgradeDurableAppAttestReplayStore>,
+    pub config: SecureUpgradeRuntimeConfig,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SecureUpgradeRuntimeConfig {
+    pub app_team_id: String,
+    pub app_bundle_id: String,
+    pub proof_environment: SecureUpgradeProofEnvironment,
+    pub challenge_ttl: Duration,
 }
 
 impl OwnerEventsRouterState {
@@ -192,6 +229,7 @@ impl OwnerEventsRouterState {
             owner_webauthn_recovery_anchor: None,
             recovery_consume_rate_limiter: None,
             macos_local_caller_auth: None,
+            secure_upgrade_runtime: None,
         }
     }
 
@@ -240,6 +278,18 @@ impl OwnerEventsRouterState {
         self.macos_local_caller_auth = Some(verifier);
         self
     }
+
+    #[must_use]
+    pub fn with_secure_upgrade_runtime(mut self, config: SecureUpgradeRuntimeConfig) -> Self {
+        self.secure_upgrade_runtime = Some(SecureUpgradeRuntime {
+            challenge_store: Arc::new(SecureUpgradeChallengeStore::new()),
+            replay_store: Arc::new(SecureUpgradeDurableAppAttestReplayStore::new(
+                self.state_dir.join(SECURE_UPGRADE_APP_ATTEST_REPLAY_DIR),
+            )),
+            config,
+        });
+        self
+    }
 }
 
 pub const OWNER_WEBAUTHN_REGISTRATION_LOCAL_START_PATH: &str =
@@ -248,6 +298,10 @@ pub const OWNER_WEBAUTHN_REGISTRATION_LOCAL_FINISH_PATH: &str =
     "/api/v1/household/owner-webauthn/registration/local/finish";
 pub const OWNER_WEBAUTHN_REGISTRATION_LOCAL_STATUS_PATH: &str =
     "/api/v1/household/owner-webauthn/registration/local/status";
+pub const SECURE_UPGRADE_APP_ATTEST_START_PATH: &str =
+    "/api/v1/household/secure-upgrade/app-attest/start";
+pub const SECURE_UPGRADE_APP_ATTEST_FINISH_PATH: &str =
+    "/api/v1/household/secure-upgrade/app-attest/finish";
 
 pub fn owner_webauthn_macos_local_registration_router(
     state: OwnerEventsRouterState,
@@ -277,6 +331,7 @@ pub struct OwnerApprovalEnforcementPolicy {
     pub revoke_credential: OwnerOperationEnforcement,
     pub recovery_code: RecoveryCodeEnforcement,
     pub add_credential: OwnerOperationEnforcement,
+    pub secure_upgrade: SecureUpgradeEnforcement,
 }
 
 impl Default for OwnerApprovalEnforcementPolicy {
@@ -289,6 +344,7 @@ impl Default for OwnerApprovalEnforcementPolicy {
             revoke_credential: OwnerOperationEnforcement::LegacyOnly,
             recovery_code: RecoveryCodeEnforcement::Disabled,
             add_credential: OwnerOperationEnforcement::LegacyOnly,
+            secure_upgrade: SecureUpgradeEnforcement::Disabled,
         }
     }
 }
@@ -331,6 +387,12 @@ impl OwnerApprovalEnforcementPolicy {
     }
 
     #[must_use]
+    pub fn with_secure_upgrade(mut self, mode: SecureUpgradeEnforcement) -> Self {
+        self.secure_upgrade = mode;
+        self
+    }
+
+    #[must_use]
     pub fn pair_machine_approval_body_mode(
         &self,
         owner_webauthn_trust_state: OwnerWebauthnTrustState,
@@ -353,6 +415,11 @@ impl OwnerApprovalEnforcementPolicy {
     fn add_credential_start_enabled(&self) -> bool {
         self.add_credential == OwnerOperationEnforcement::V2WhenOwnerHasActiveCredential
     }
+
+    #[must_use]
+    pub fn secure_upgrade_strong_minting_enabled(&self) -> bool {
+        self.secure_upgrade == SecureUpgradeEnforcement::StrongMintingEnabled
+    }
 }
 
 #[must_use]
@@ -371,6 +438,10 @@ pub fn owner_approval_policy_from_rollout_value(
         Some(OWNER_AUTH_V2_REVIEWED_CORE_ROLLOUT) => {
             OwnerApprovalEnforcementPolicy::reviewed_core_v2_rollout()
         }
+        Some(OWNER_AUTH_V2_SECURE_UPGRADE_ROLLOUT) => {
+            OwnerApprovalEnforcementPolicy::reviewed_core_v2_rollout()
+                .with_secure_upgrade(SecureUpgradeEnforcement::StrongMintingEnabled)
+        }
         Some(_) => {
             tracing::warn!(
                 env = OWNER_AUTH_V2_ROLLOUT_ENV,
@@ -379,6 +450,49 @@ pub fn owner_approval_policy_from_rollout_value(
             OwnerApprovalEnforcementPolicy::default()
         }
     }
+}
+
+pub fn secure_upgrade_runtime_config_from_env() -> Result<SecureUpgradeRuntimeConfig, String> {
+    let app_team_id = required_secure_upgrade_env(SECURE_UPGRADE_APP_ATTEST_TEAM_ID_ENV)?;
+    let app_bundle_id = required_secure_upgrade_env(SECURE_UPGRADE_APP_ATTEST_BUNDLE_ID_ENV)?;
+    let proof_environment =
+        match required_secure_upgrade_env(SECURE_UPGRADE_APP_ATTEST_ENVIRONMENT_ENV)?.as_str() {
+            "development" => SecureUpgradeProofEnvironment::Development,
+            "production" => SecureUpgradeProofEnvironment::Production,
+            _ => return Err("invalid_app_attest_environment".to_string()),
+        };
+    let challenge_ttl_secs = match std::env::var(SECURE_UPGRADE_CHALLENGE_TTL_SECS_ENV) {
+        Ok(raw) if !raw.trim().is_empty() => raw
+            .trim()
+            .parse::<u64>()
+            .map_err(|_| "invalid_challenge_ttl_secs".to_string())?,
+        _ => SECURE_UPGRADE_DEFAULT_CHALLENGE_TTL_SECS,
+    };
+    if challenge_ttl_secs == 0 {
+        return Err("invalid_challenge_ttl_secs".to_string());
+    }
+    Ok(SecureUpgradeRuntimeConfig {
+        app_team_id,
+        app_bundle_id,
+        proof_environment,
+        challenge_ttl: Duration::from_secs(challenge_ttl_secs),
+    })
+}
+
+fn required_secure_upgrade_env(name: &str) -> Result<String, String> {
+    std::env::var(name)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| format!("missing_{name}"))
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SecureUpgradeEnforcement {
+    Disabled,
+    /// Enables the reviewed Secure/Upgrade ceremony runtime and strong owner
+    /// provenance minting. This remains separate from `reviewed-core-v2`.
+    StrongMintingEnabled,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -599,6 +713,17 @@ fn pair_machine_expected_context_from_snapshot(
             replay_nonce,
         },
     )
+}
+
+fn owner_auth_allows_fan_out(
+    stage: &'static str,
+    owner_auth: &household_rs::HouseholdAuthState,
+) -> bool {
+    if owner_auth.owner_can_fan_out() {
+        return true;
+    }
+    tracing::warn!(stage = stage, reason = "owner_auth_tier_not_strong",);
+    false
 }
 
 fn pair_machine_owner_webauthn_policy_snapshot(
@@ -1957,6 +2082,45 @@ struct OwnerApprovalV2StartResponse {
 
 #[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
+struct SecureUpgradeStartRequest {
+    #[serde(rename = "v")]
+    version: u8,
+    proof_key_id: String,
+    platform: SecureUpgradePlatform,
+}
+
+#[derive(Serialize)]
+struct SecureUpgradeStartResponse {
+    #[serde(rename = "v")]
+    version: u8,
+    challenge_id: String,
+    canonical_transcript_cbor: ByteBuf,
+    challenge_sha256: ByteBuf,
+    expires_at: u64,
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct SecureUpgradeFinishRequest {
+    #[serde(rename = "v")]
+    version: u8,
+    challenge_id: String,
+    canonical_transcript_cbor: ByteBuf,
+    attestation_object_cbor: ByteBuf,
+    owner_signature: ByteBuf,
+}
+
+#[derive(Serialize)]
+struct SecureUpgradeFinishResponse {
+    #[serde(rename = "v")]
+    version: u8,
+    owner_person_cert: PersonCert,
+    owner_auth_tier: String,
+    owner_provenance: String,
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 struct OwnerWebauthnRevokeCredentialStartRequest {
     #[serde(rename = "v")]
     version: u8,
@@ -2359,6 +2523,224 @@ fn owner_events_since_response(state: &OwnerEventsRouterState, since: u64) -> Re
     cbor_response(StatusCode::OK, bytes)
 }
 
+/// `POST /api/v1/household/secure-upgrade/app-attest/start`.
+///
+/// Issues a server-authoritative Secure/Upgrade transcript. The client supplies
+/// only its App Attest proof key id and target platform; owner identity, app
+/// identity, environment, challenge id, and expiry are bound by the server.
+pub async fn secure_upgrade_app_attest_start_handler(
+    State(state): State<OwnerEventsRouterState>,
+    method: Method,
+    uri: Uri,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let Some(now) = time_util::unix_now_secs_checked("owner_events.secure_upgrade_start.clock")
+    else {
+        return unauthenticated_response();
+    };
+    let path_and_query = uri
+        .path_and_query()
+        .map_or_else(|| uri.path().to_string(), |pq| pq.as_str().to_string());
+    let authorized_owner_auth = match household_auth::authorize_secure_upgrade_start_request(
+        &state.household,
+        &headers,
+        &method,
+        &path_and_query,
+        &body,
+        now,
+    )
+    .await
+    {
+        Ok(owner_auth) => owner_auth,
+        Err(e) => return reject_secure_upgrade("pop_auth_failed", Some(e.to_string())),
+    };
+    let request: SecureUpgradeStartRequest = match decode_canonical_cbor(&body) {
+        Ok(request) => request,
+        Err(e) => return reject_secure_upgrade("cbor_decode", Some(e)),
+    };
+    if request.version != 1 {
+        return reject_secure_upgrade("bad_version", None);
+    }
+    let runtime = match secure_upgrade_runtime_or_reject(&state) {
+        Ok(runtime) => runtime.clone(),
+        Err(response) => return response,
+    };
+
+    let _mutation_guard = crate::bootstrap_mutation_lock::BOOTSTRAP_MUTATION_LOCK
+        .lock()
+        .await;
+    let Some(identity) = state.household.current().await else {
+        return reject_secure_upgrade("identity_unavailable", None);
+    };
+    let Some(current_owner_auth) = state.household.current_owner_auth().await else {
+        return reject_secure_upgrade("owner_auth_unavailable", None);
+    };
+    if current_owner_auth.owner_person_cert.p_id != authorized_owner_auth.owner_person_cert.p_id {
+        return reject_secure_upgrade("owner_auth_changed", None);
+    }
+    if current_owner_auth
+        .owner_person_cert
+        .has_strong_owner_provenance()
+    {
+        return reject_secure_upgrade("owner_already_strong", None);
+    }
+
+    let challenge_id = secure_upgrade_challenge_id();
+    let expires_at = now.saturating_add(runtime.config.challenge_ttl.as_secs());
+    let transcript = SecureUpgradeTranscript::app_attest(SecureUpgradeAppAttestTranscriptInput {
+        hh_id: identity.record.hh_id.clone(),
+        owner_p_id: current_owner_auth.owner_person_cert.p_id.clone(),
+        owner_key_id: secure_upgrade_owner_key_id(current_owner_auth.as_ref()),
+        challenge_id: challenge_id.clone(),
+        issued_at: now,
+        expires_at,
+        app_team_id: runtime.config.app_team_id.clone(),
+        app_bundle_id: runtime.config.app_bundle_id.clone(),
+        proof_key_id: request.proof_key_id,
+        proof_environment: runtime.config.proof_environment,
+        platform: request.platform,
+    });
+    let record = match runtime.challenge_store.issue(transcript, now) {
+        Ok(record) => record,
+        Err(e) => return reject_secure_upgrade("challenge_issue_failed", Some(e.to_string())),
+    };
+    let response = SecureUpgradeStartResponse {
+        version: 1,
+        challenge_id: record.challenge_id().to_string(),
+        canonical_transcript_cbor: ByteBuf::from(record.canonical_transcript_bytes().to_vec()),
+        challenge_sha256: ByteBuf::from(record.challenge_digest().to_vec()),
+        expires_at: record.expires_at_unix(),
+    };
+    let bytes = household_rs::cbor::to_canonical_vec(&response).unwrap_or_default();
+    cbor_response(StatusCode::OK, bytes)
+}
+
+/// `POST /api/v1/household/secure-upgrade/app-attest/finish`.
+///
+/// Consumes the stored challenge, verifies App Attest and owner signature over
+/// the same server transcript, records durable App Attest replay state, and
+/// only then mints the strong owner `PersonCert`.
+pub async fn secure_upgrade_app_attest_finish_handler(
+    State(state): State<OwnerEventsRouterState>,
+    method: Method,
+    uri: Uri,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let Some(now) = time_util::unix_now_secs_checked("owner_events.secure_upgrade_finish.clock")
+    else {
+        return unauthenticated_response();
+    };
+    let path_and_query = uri
+        .path_and_query()
+        .map_or_else(|| uri.path().to_string(), |pq| pq.as_str().to_string());
+    let authorized_owner_auth = match household_auth::authorize_secure_upgrade_finish_request(
+        &state.household,
+        &headers,
+        &method,
+        &path_and_query,
+        &body,
+        now,
+    )
+    .await
+    {
+        Ok(owner_auth) => owner_auth,
+        Err(e) => return reject_secure_upgrade("pop_auth_failed", Some(e.to_string())),
+    };
+    let request: SecureUpgradeFinishRequest = match decode_canonical_cbor(&body) {
+        Ok(request) => request,
+        Err(e) => return reject_secure_upgrade("cbor_decode", Some(e)),
+    };
+    if request.version != 1 {
+        return reject_secure_upgrade("bad_version", None);
+    }
+    let owner_signature = match household_rs::P256Signature::from_bytes(&request.owner_signature) {
+        Ok(signature) => signature,
+        Err(e) => return reject_secure_upgrade("owner_signature_invalid", Some(e.to_string())),
+    };
+    let runtime = match secure_upgrade_runtime_or_reject(&state) {
+        Ok(runtime) => runtime.clone(),
+        Err(response) => return response,
+    };
+
+    let _mutation_guard = crate::bootstrap_mutation_lock::BOOTSTRAP_MUTATION_LOCK
+        .lock()
+        .await;
+    let Some(identity) = state.household.current().await else {
+        return reject_secure_upgrade("identity_unavailable", None);
+    };
+    let Some(current_owner_auth) = state.household.current_owner_auth().await else {
+        return reject_secure_upgrade("owner_auth_unavailable", None);
+    };
+    if current_owner_auth.owner_person_cert.p_id != authorized_owner_auth.owner_person_cert.p_id {
+        return reject_secure_upgrade("owner_auth_changed", None);
+    }
+    if current_owner_auth
+        .owner_person_cert
+        .has_strong_owner_provenance()
+    {
+        return reject_secure_upgrade("owner_already_strong", None);
+    }
+    let Some(hh_priv) = identity.hh_priv.as_deref() else {
+        return reject_secure_upgrade("household_root_unavailable", None);
+    };
+    let verification = match verify_secure_upgrade_ceremony_for_challenge(
+        runtime.challenge_store.as_ref(),
+        runtime.replay_store.as_ref(),
+        &request.challenge_id,
+        request.canonical_transcript_cbor.as_ref(),
+        SecureUpgradeProofVerificationInput {
+            attestation_object_cbor: request.attestation_object_cbor.as_ref(),
+            owner_public_key: &current_owner_auth.owner_person_cert.p_pub,
+            owner_signature: &owner_signature,
+            now_unix: now,
+        },
+    ) {
+        Ok(verification) => verification,
+        Err(e) => return reject_secure_upgrade("ceremony_verify_failed", Some(e.to_string())),
+    };
+    let owner_person_cert = match sign_owner_cert_with_secure_upgrade_verification(
+        hh_priv,
+        SignOwnerOptions {
+            hh_id: identity.record.hh_id.clone(),
+            p_pub: current_owner_auth.owner_person_cert.p_pub.clone(),
+            display_name: current_owner_auth.owner_person_cert.display_name.clone(),
+            issued_at: now,
+        },
+        &verification,
+    ) {
+        Ok(cert) => cert,
+        Err(e) => return reject_secure_upgrade("owner_cert_mint_failed", Some(e.to_string())),
+    };
+    let next_auth =
+        owner_auth_with_secure_upgrade_cert(current_owner_auth.as_ref(), owner_person_cert.clone());
+    if let Err(e) = next_auth.verify(&identity.record, now) {
+        return reject_secure_upgrade("owner_auth_verify_failed", Some(e.to_string()));
+    }
+    if let Err(e) = next_auth.save(&state.state_dir) {
+        return reject_secure_upgrade("owner_auth_save_failed", Some(e.to_string()));
+    }
+    state
+        .household
+        .set_owner_auth(Arc::new(next_auth.clone()))
+        .await;
+    let response = SecureUpgradeFinishResponse {
+        version: 1,
+        owner_auth_tier: owner_person_cert
+            .owner_auth_tier_text()
+            .unwrap_or_default()
+            .to_string(),
+        owner_provenance: owner_person_cert
+            .owner_provenance_text()
+            .unwrap_or_default()
+            .to_string(),
+        owner_person_cert,
+    };
+    let bytes = household_rs::cbor::to_canonical_vec(&response).unwrap_or_default();
+    cbor_response(StatusCode::OK, bytes)
+}
+
 fn owner_webauthn_user_uuid(owner_auth: &household_rs::HouseholdAuthState) -> Uuid {
     let mut input = b"soyeht-owner-webauthn-user-v1\0".to_vec();
     input.extend_from_slice(owner_auth.hh_id.to_string().as_bytes());
@@ -2652,6 +3034,55 @@ fn reject_owner_webauthn_recovery(reason: &'static str, error: Option<String>) -
     unauthenticated_response()
 }
 
+fn reject_secure_upgrade(reason: &'static str, error: Option<String>) -> Response {
+    if let Some(error) = error {
+        tracing::warn!(
+            stage = "owner_events.secure_upgrade.rejected",
+            reason,
+            error = %error,
+        );
+    } else {
+        tracing::warn!(stage = "owner_events.secure_upgrade.rejected", reason,);
+    }
+    unauthenticated_response()
+}
+
+fn secure_upgrade_runtime_or_reject(
+    state: &OwnerEventsRouterState,
+) -> Result<&SecureUpgradeRuntime, Response> {
+    if !state
+        .owner_approval_policy
+        .secure_upgrade_strong_minting_enabled()
+    {
+        return Err(reject_secure_upgrade("policy_disabled", None));
+    }
+    state
+        .secure_upgrade_runtime
+        .as_ref()
+        .ok_or_else(|| reject_secure_upgrade("runtime_unavailable", None))
+}
+
+fn secure_upgrade_challenge_id() -> String {
+    let mut bytes = [0_u8; 32];
+    OsRng.fill_bytes(&mut bytes);
+    format!("su-{}", B64URL.encode(bytes))
+}
+
+fn secure_upgrade_owner_key_id(owner_auth: &household_rs::HouseholdAuthState) -> String {
+    owner_auth.owner_person_cert.p_id.0.clone()
+}
+
+fn owner_auth_with_secure_upgrade_cert(
+    current_owner_auth: &household_rs::HouseholdAuthState,
+    owner_person_cert: PersonCert,
+) -> household_rs::HouseholdAuthState {
+    let mut next_auth = current_owner_auth.clone();
+    next_auth.owner_person_cert = owner_person_cert;
+    next_auth.created_at = next_auth.owner_person_cert.issued_at;
+    next_auth.updated_at = next_auth.owner_person_cert.issued_at;
+    next_auth
+}
+
 fn owner_webauthn_initial_enrollment_policy_snapshot(
     state: &OwnerEventsRouterState,
     identity: &household_rs::LoadedIdentity,
@@ -2666,6 +3097,48 @@ fn owner_webauthn_initial_enrollment_policy_snapshot(
         &identity.record,
         &owner_auth.owner_person_cert,
         OwnerWebauthnAnchorMode::Enforcement,
+    );
+    match anchor_status {
+        Ok(OwnerWebauthnAnchorStatus::EmptyAuthorityNoAnchor) => {
+            OwnerWebauthnPolicySnapshot::never_enrolled()
+        }
+        Ok(
+            OwnerWebauthnAnchorStatus::Verified { .. }
+            | OwnerWebauthnAnchorStatus::Advanced { .. }
+            | OwnerWebauthnAnchorStatus::Migrated { .. },
+        ) => match owner_auth.owner_webauthn_credentials(&identity.record) {
+            Ok(credentials) => {
+                let active_count = credentials.active_count();
+                if active_count == 0 {
+                    OwnerWebauthnPolicySnapshot::recovery_required()
+                } else {
+                    OwnerWebauthnPolicySnapshot {
+                        trust_state: OwnerWebauthnTrustState::Active {
+                            count: active_count,
+                        },
+                        credentials: Some(credentials),
+                    }
+                }
+            }
+            Err(_) => OwnerWebauthnPolicySnapshot::anchor_invalid(),
+        },
+        Err(_) => OwnerWebauthnPolicySnapshot::anchor_invalid(),
+    }
+}
+
+fn owner_webauthn_initial_enrollment_policy_snapshot_read_only(
+    state: &OwnerEventsRouterState,
+    identity: &household_rs::LoadedIdentity,
+    owner_auth: &household_rs::HouseholdAuthState,
+) -> OwnerWebauthnPolicySnapshot {
+    let Some(verifier) = state.owner_webauthn_anchor.as_ref() else {
+        return OwnerWebauthnPolicySnapshot::anchor_invalid();
+    };
+    let anchor_status = classify_owner_webauthn_authority_anchor_read_only(
+        verifier.keystore.as_ref(),
+        &owner_auth.owner_webauthn,
+        &identity.record,
+        &owner_auth.owner_person_cert,
     );
     match anchor_status {
         Ok(OwnerWebauthnAnchorStatus::EmptyAuthorityNoAnchor) => {
@@ -4525,7 +4998,7 @@ pub async fn owner_webauthn_registration_local_start_handler(
     let Some(current_owner_auth) = state.household.current_owner_auth().await else {
         return reject_owner_webauthn_registration("owner_auth_unavailable", None);
     };
-    let snapshot = owner_webauthn_initial_enrollment_policy_snapshot(
+    let snapshot = owner_webauthn_initial_enrollment_policy_snapshot_read_only(
         &state,
         &identity,
         current_owner_auth.as_ref(),
@@ -4963,6 +5436,12 @@ pub async fn owner_approval_v2_start_handler(
         );
         return unauthenticated_response();
     }
+    if !owner_auth_allows_fan_out(
+        "owner_events.approval_v2_start.rejected",
+        owner_auth.as_ref(),
+    ) {
+        return unauthenticated_response();
+    }
     let Some(credentials) = policy_snapshot.credentials else {
         tracing::warn!(
             stage = "owner_events.approval_v2_start.rejected",
@@ -5093,7 +5572,6 @@ pub async fn owner_approve_handler(
             return unauthenticated_response();
         }
     };
-
     let Some(identity) = state.household.current().await else {
         tracing::warn!(
             stage = "owner_events.approve.rejected",
@@ -5106,6 +5584,11 @@ pub async fn owner_approve_handler(
     let body_mode = state
         .owner_approval_policy
         .pair_machine_approval_body_mode(policy_snapshot.trust_state);
+    if body_mode == PairMachineApprovalBodyMode::RequireV2
+        && !owner_auth_allows_fan_out("owner_events.approve.rejected", owner_auth.as_ref())
+    {
+        return unauthenticated_response();
+    }
     let approval_wire = match parse_pair_machine_approval_body(body_mode, cursor, &body) {
         Ok(approval) => approval,
         Err(reason) => {

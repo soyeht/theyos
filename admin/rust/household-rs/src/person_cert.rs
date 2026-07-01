@@ -1,7 +1,9 @@
 //! First-owner `PersonCert` issuance and verification.
 
 use rand::{RngCore, rngs::OsRng};
-use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
+
+use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::caveats::{self, Caveat};
 use crate::cbor;
@@ -9,6 +11,38 @@ use crate::error::{HouseholdError, KeystoreError};
 use crate::ids::{HouseholdId, base32_lower_nopad_encode, hash_public_key};
 use crate::keys::{IdentityKey, P256PublicKey, P256Signature, verify_signature};
 use crate::machine_cert::{PersonId, SubjectId};
+
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq, Debug)]
+#[serde(untagged)]
+pub enum OwnerAuthClaimValue {
+    Null,
+    Text(String),
+    Unsigned(u64),
+    Signed(i64),
+    Bool(bool),
+    Bytes(serde_bytes::ByteBuf),
+    Array(Vec<OwnerAuthClaimValue>),
+    Map(BTreeMap<String, OwnerAuthClaimValue>),
+}
+
+impl OwnerAuthClaimValue {
+    #[must_use]
+    pub fn as_text(&self) -> Option<&str> {
+        match self {
+            Self::Text(value) => Some(value),
+            _ => None,
+        }
+    }
+}
+
+fn deserialize_optional_owner_auth_claim<'de, D>(
+    deserializer: D,
+) -> Result<Option<OwnerAuthClaimValue>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    OwnerAuthClaimValue::deserialize(deserializer).map(Some)
+}
 
 #[derive(Clone, Serialize, Deserialize, PartialEq, Eq, Debug)]
 #[serde(deny_unknown_fields)]
@@ -28,6 +62,18 @@ pub struct PersonCert {
     pub nonce: Vec<u8>,
     pub issued_at: u64,
     pub issued_by: SubjectId,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_optional_owner_auth_claim",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub owner_auth_tier: Option<OwnerAuthClaimValue>,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_optional_owner_auth_claim",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub owner_provenance: Option<OwnerAuthClaimValue>,
     pub signature: P256Signature,
 }
 
@@ -49,6 +95,18 @@ struct PersonCertUnsigned {
     pub nonce: Vec<u8>,
     pub issued_at: u64,
     pub issued_by: SubjectId,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_optional_owner_auth_claim",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub owner_auth_tier: Option<OwnerAuthClaimValue>,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_optional_owner_auth_claim",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub owner_provenance: Option<OwnerAuthClaimValue>,
 }
 
 pub struct SignOwnerOptions {
@@ -58,12 +116,66 @@ pub struct SignOwnerOptions {
     pub issued_at: u64,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum VerifiedOwnerProvenance {
+    IosSecureEnclaveOwner,
+    IpadOsSecureEnclaveOwner,
+    IosAppAttestOwner,
+    IpadOsAppAttestOwner,
+}
+
+impl VerifiedOwnerProvenance {
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::IosSecureEnclaveOwner => PersonCert::OWNER_PROVENANCE_IOS_SECURE_ENCLAVE_OWNER,
+            Self::IpadOsSecureEnclaveOwner => {
+                PersonCert::OWNER_PROVENANCE_IPADOS_SECURE_ENCLAVE_OWNER
+            }
+            Self::IosAppAttestOwner => PersonCert::OWNER_PROVENANCE_IOS_APP_ATTEST_OWNER,
+            Self::IpadOsAppAttestOwner => PersonCert::OWNER_PROVENANCE_IPADOS_APP_ATTEST_OWNER,
+        }
+    }
+}
+
 impl PersonCert {
     pub const SCHEMA_VERSION: u8 = 1;
+    pub const OWNER_AUTH_TIER_STRONG: &'static str = "strong";
+    pub const OWNER_PROVENANCE_IOS_SECURE_ENCLAVE_OWNER: &'static str = "ios-secure-enclave-owner";
+    pub const OWNER_PROVENANCE_IPADOS_SECURE_ENCLAVE_OWNER: &'static str =
+        "ipados-secure-enclave-owner";
+    pub const OWNER_PROVENANCE_IOS_APP_ATTEST_OWNER: &'static str = "ios-app-attest-owner";
+    pub const OWNER_PROVENANCE_IPADOS_APP_ATTEST_OWNER: &'static str = "ipados-app-attest-owner";
 
     pub fn sign_owner(
         hh_key: &dyn IdentityKey,
         opts: SignOwnerOptions,
+    ) -> Result<Self, KeystoreError> {
+        Self::sign_owner_internal(hh_key, opts, None, None)
+    }
+
+    pub fn sign_owner_with_verified_provenance(
+        hh_key: &dyn IdentityKey,
+        opts: SignOwnerOptions,
+        owner_provenance: VerifiedOwnerProvenance,
+    ) -> Result<Self, KeystoreError> {
+        Self::sign_owner_internal(
+            hh_key,
+            opts,
+            Some(OwnerAuthClaimValue::Text(
+                Self::OWNER_AUTH_TIER_STRONG.to_string(),
+            )),
+            Some(OwnerAuthClaimValue::Text(
+                owner_provenance.as_str().to_string(),
+            )),
+        )
+    }
+
+    fn sign_owner_internal(
+        hh_key: &dyn IdentityKey,
+        opts: SignOwnerOptions,
+        owner_auth_tier: Option<OwnerAuthClaimValue>,
+        owner_provenance: Option<OwnerAuthClaimValue>,
     ) -> Result<Self, KeystoreError> {
         validate_display_name(&opts.display_name)
             .map_err(|e| KeystoreError::InvalidKeyMaterial(format!("display_name: {e}")))?;
@@ -83,6 +195,8 @@ impl PersonCert {
             nonce,
             issued_at: opts.issued_at,
             issued_by: SubjectId::Household(opts.hh_id),
+            owner_auth_tier,
+            owner_provenance,
         };
         let canonical = cbor::to_canonical_vec(&unsigned)
             .map_err(|e| KeystoreError::SigningFailed(format!("encode person cert: {e}")))?;
@@ -100,6 +214,8 @@ impl PersonCert {
             nonce: unsigned.nonce,
             issued_at: unsigned.issued_at,
             issued_by: unsigned.issued_by,
+            owner_auth_tier: unsigned.owner_auth_tier,
+            owner_provenance: unsigned.owner_provenance,
             signature,
         })
     }
@@ -189,8 +305,38 @@ impl PersonCert {
             nonce: self.nonce.clone(),
             issued_at: self.issued_at,
             issued_by: self.issued_by.clone(),
+            owner_auth_tier: self.owner_auth_tier.clone(),
+            owner_provenance: self.owner_provenance.clone(),
         };
         cbor::to_canonical_vec(&unsigned)
+    }
+
+    #[must_use]
+    pub fn has_strong_owner_provenance(&self) -> bool {
+        self.owner_auth_tier_text() == Some(Self::OWNER_AUTH_TIER_STRONG)
+            && matches!(
+                self.owner_provenance_text(),
+                Some(
+                    Self::OWNER_PROVENANCE_IOS_SECURE_ENCLAVE_OWNER
+                        | Self::OWNER_PROVENANCE_IPADOS_SECURE_ENCLAVE_OWNER
+                        | Self::OWNER_PROVENANCE_IOS_APP_ATTEST_OWNER
+                        | Self::OWNER_PROVENANCE_IPADOS_APP_ATTEST_OWNER
+                )
+            )
+    }
+
+    #[must_use]
+    pub fn owner_auth_tier_text(&self) -> Option<&str> {
+        self.owner_auth_tier
+            .as_ref()
+            .and_then(OwnerAuthClaimValue::as_text)
+    }
+
+    #[must_use]
+    pub fn owner_provenance_text(&self) -> Option<&str> {
+        self.owner_provenance
+            .as_ref()
+            .and_then(OwnerAuthClaimValue::as_text)
     }
 }
 
