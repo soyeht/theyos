@@ -52,6 +52,8 @@ pub mod claw_store_service;
 pub mod claw_vpn_dev_config;
 #[cfg(target_os = "linux")]
 pub mod claw_vpn_linux_tun;
+#[cfg(target_os = "macos")]
+pub mod claw_vpn_macos_utun;
 pub mod cloudflare_admin;
 pub mod cloudflare_api;
 pub mod cloudflared_sync;

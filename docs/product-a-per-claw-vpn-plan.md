@@ -4,9 +4,10 @@
 contracts, fail-closed placeholders, pure packet/admission/audit helpers, a pure
 interface-to-relay datapath core, a fixed-side agent core wrapper, a guarded
 default-off dev config parser, the exact relay-stream resource gate for future
-`IpTunnel`, the Linux Firecracker guest-kernel TUN prerequisite, and a
-Linux-only `/dev/net/tun` open primitive guarded from runtime wiring. There is
-still no checked-in runtime/bin that opens a TUN/utun interface, route
+`IpTunnel`, the Linux Firecracker guest-kernel TUN prerequisite, a
+Linux-only `/dev/net/tun` open primitive, and a macOS-only `utun` open
+primitive guarded from runtime wiring. There is still no checked-in runtime/bin
+that opens a TUN/utun interface in a product/default path, route
 installation, packet relay runtime, storage-backed session registry, iOS Packet
 Tunnel, or product activation. Runtime/product activation remains default-off by
 construction, and every activation step (deploy, flag flip, shipping) is a
@@ -226,10 +227,11 @@ Access between members/devices and claws is explicitly many-to-many:
   slice fixes the local side (`Device` or `Claw`) at construction before any
   future interface pump can forward packets, avoiding per-packet caller choice
   of direction. The next Linux-only slice isolates the `/dev/net/tun` FFI
-  boundary and validates interface names, but remains unwired: no bin,
-  bootstrap, route, relay pump, or flag invokes it. These slices are still not
-  T1 because they create no interface or route in any default/product path.
-  Exit: T1–T4 green on dev hosts.
+  boundary and validates interface names; the next macOS-only slice isolates
+  the `utun` kernel-control FFI boundary for the Rust dev client/host-side
+  runs. Both remain unwired: no bin, bootstrap, route, relay pump, or flag
+  invokes them. These slices are still not T1 because they create no interface
+  or route in any default/product path. Exit: T1–T4 green on dev hosts.
 - **Phase 2 — iOS Packet Tunnel dev build.** Entry: entitlement go/no-go.
   Dev device only. Exit: T5–T7 green (iPhone reaches Claw-A — and only
   Claw-A).
