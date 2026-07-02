@@ -3786,12 +3786,19 @@ fn product_a_per_claw_vpn_dev_config_remains_default_off_and_unwired() {
     );
 
     let config_path = server_src_dir.join("claw_vpn_dev_config.rs");
+    let interface_route_plan_path = server_src_dir.join("claw_vpn_interface_route_plan.rs");
     let linux_tun_path = server_src_dir.join("claw_vpn_linux_tun.rs");
     let macos_utun_path = server_src_dir.join("claw_vpn_macos_utun.rs");
     let lib_path = server_src_dir.join("lib.rs");
     assert!(
         sources.iter().any(|path| path == &config_path),
         "per-Claw VPN source guard must include server-rs/src/claw_vpn_dev_config.rs"
+    );
+    assert!(
+        sources
+            .iter()
+            .any(|path| path == &interface_route_plan_path),
+        "per-Claw VPN source guard must include server-rs/src/claw_vpn_interface_route_plan.rs"
     );
     assert!(
         sources.iter().any(|path| path == &linux_tun_path),
@@ -3812,11 +3819,18 @@ fn product_a_per_claw_vpn_dev_config_remains_default_off_and_unwired() {
         )
     });
     let lib_lines = lib_source.lines().collect::<Vec<_>>();
+    let mut interface_route_plan_exports = 0usize;
+    let mut interface_route_plan_export_is_unconditional = false;
     let mut linux_tun_exports = 0usize;
     let mut linux_tun_export_is_linux_only = false;
     let mut macos_utun_exports = 0usize;
     let mut macos_utun_export_is_macos_only = false;
     for (index, line) in lib_lines.iter().enumerate() {
+        if line.trim() == "pub mod claw_vpn_interface_route_plan;" {
+            interface_route_plan_exports += 1;
+            interface_route_plan_export_is_unconditional =
+                index == 0 || !lib_lines[index - 1].trim().starts_with("#[cfg");
+        }
         if line.trim() == "pub mod claw_vpn_linux_tun;" {
             linux_tun_exports += 1;
             linux_tun_export_is_linux_only =
@@ -3828,6 +3842,10 @@ fn product_a_per_claw_vpn_dev_config_remains_default_off_and_unwired() {
                 index > 0 && lib_lines[index - 1].trim() == "#[cfg(target_os = \"macos\")]";
         }
     }
+    assert!(
+        interface_route_plan_exports == 1 && interface_route_plan_export_is_unconditional,
+        "per-Claw VPN interface route plan module must have exactly one unconditional export until an explicit tunnel-runtime slice"
+    );
     assert!(
         linux_tun_exports == 1 && linux_tun_export_is_linux_only,
         "per-Claw VPN Linux TUN module must have exactly one Linux-only export until an explicit tunnel-runtime slice"
@@ -3843,16 +3861,22 @@ fn product_a_per_claw_vpn_dev_config_remains_default_off_and_unwired() {
             .unwrap_or_else(|e| panic!("read per-Claw VPN runtime source {}: {e}", path.display()));
         for (index, line) in source.lines().enumerate() {
             let module_export = path == lib_path && line.trim() == "pub mod claw_vpn_dev_config;";
+            let interface_route_plan_module_export =
+                path == lib_path && line.trim() == "pub mod claw_vpn_interface_route_plan;";
             let linux_tun_module_export =
                 path == lib_path && line.trim() == "pub mod claw_vpn_linux_tun;";
             let macos_utun_module_export =
                 path == lib_path && line.trim() == "pub mod claw_vpn_macos_utun;";
             let in_config_module = path == config_path;
+            let in_interface_route_plan_module = path == interface_route_plan_path;
             let in_linux_tun_module = path == linux_tun_path;
             let in_macos_utun_module = path == macos_utun_path;
             let references_dev_config =
                 line.contains("ClawVpnDevConfig") || line.contains("claw_vpn_dev_config");
             let references_dev_flag = line.contains("THEYOS_CLAW_VPN_");
+            let references_interface_route_plan = line.contains("ClawVpnInterfaceRoute")
+                || line.contains("ClawVpnInterfaceName")
+                || line.contains("claw_vpn_interface_route_plan");
             let references_linux_tun = line.contains("ClawVpnLinuxTun")
                 || line.contains("claw_vpn_linux_tun")
                 || line.contains("/dev/net/tun")
@@ -3880,6 +3904,9 @@ fn product_a_per_claw_vpn_dev_config_remains_default_off_and_unwired() {
                 || (!in_config_module
                     && !module_export
                     && (references_dev_config || references_dev_flag))
+                || (!in_interface_route_plan_module
+                    && !interface_route_plan_module_export
+                    && references_interface_route_plan)
                 || (!in_linux_tun_module && !linux_tun_module_export && references_linux_tun)
                 || (!in_macos_utun_module && !macos_utun_module_export && references_macos_utun)
             {
@@ -3890,7 +3917,7 @@ fn product_a_per_claw_vpn_dev_config_remains_default_off_and_unwired() {
 
     assert!(
         violations.is_empty(),
-        "per-Claw VPN dev config/TUN/utun/datapath must stay default-off/unwired until the tunnel runtime slice:\n{}",
+        "per-Claw VPN dev config/interface-route-plan/TUN/utun/datapath must stay default-off/unwired until the tunnel runtime slice:\n{}",
         violations.join("\n")
     );
 }

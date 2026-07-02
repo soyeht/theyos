@@ -8,18 +8,19 @@ default-off dev config parser, the exact relay-stream resource gate for future
 Linux-only `/dev/net/tun` open primitive, and a macOS-only `utun` open
 primitive guarded from runtime wiring. The current Phase-1 core also adds a
 fixed-session wrapper that future packet pumps can use so packet forwarding
-does not need a caller-supplied session id per packet. There is still no
+does not need a caller-supplied session id per packet, plus a pure
+interface/address/host-route command planner for future runtime execution.
+There is still no
 checked-in runtime/bin that opens a TUN/utun interface in a product/default
-path, route installation, packet relay runtime, storage-backed session
-registry, iOS Packet Tunnel, or product activation. Runtime/product activation
-remains default-off by construction, and every activation step (deploy, flag
-flip, shipping) is a separate, explicitly owner-authorized decision. The
-guest-kernel prerequisite is different from the inert runtime helpers: it
-changes the default
-`firecracker-kernel` build artifact used by future Linux installs/builds, so it
-requires Linux/Nix build validation before merge even though it does not
-activate VPN behavior. Nothing in this plan is authorized to run anywhere by
-virtue of the plan existing.
+path, command execution for `ip`/`ifconfig`/`route`, route installation, packet
+relay runtime, storage-backed session registry, iOS Packet Tunnel, or product
+activation. Runtime/product activation remains default-off by construction, and
+every activation step (deploy, flag flip, shipping) is a separate, explicitly
+owner-authorized decision. The guest-kernel prerequisite is different from the
+inert runtime helpers: it changes the default `firecracker-kernel` build
+artifact used by future Linux installs/builds, so it requires Linux/Nix build
+validation before merge even though it does not activate VPN behavior. Nothing
+in this plan is authorized to run anywhere by virtue of the plan existing.
 
 Authored 2026-07-02 by the security-review agent at the owner's request.
 
@@ -234,10 +235,13 @@ Access between members/devices and claws is explicitly many-to-many:
   the `utun` kernel-control FFI boundary for the Rust dev client/host-side
   runs. The fixed-session core slice adds a wrapper that binds one active
   session id before forwarding through that wrapper, avoiding per-packet caller
-  choice of session in the future pump. These slices remain unwired: no bin,
-  bootstrap, route, relay pump, or flag invokes them. They are still not T1
-  because they create no interface or route in any default/product path. Exit:
-  T1–T4 green on dev hosts.
+  choice of session in the future pump. The interface-route-plan slice
+  materializes the exact Linux/macOS address and Claw-peer `/32` host-route
+  argv a future runtime can execute after session auth, but it does not execute
+  commands or install routes. These slices remain unwired: no bin, bootstrap,
+  command executor, route, relay pump, or flag invokes them. They are still not
+  T1 because they create no interface or route in any default/product path.
+  Exit: T1–T4 green on dev hosts.
 - **Phase 2 — iOS Packet Tunnel dev build.** Entry: entitlement go/no-go.
   Dev device only. Exit: T5–T7 green (iPhone reaches Claw-A — and only
   Claw-A).

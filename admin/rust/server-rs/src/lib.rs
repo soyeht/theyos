@@ -50,6 +50,7 @@ pub mod claw_share_rendezvous_stream_relay_status;
 pub mod claw_store_routes;
 pub mod claw_store_service;
 pub mod claw_vpn_dev_config;
+pub mod claw_vpn_interface_route_plan;
 #[cfg(target_os = "linux")]
 pub mod claw_vpn_linux_tun;
 #[cfg(target_os = "macos")]
