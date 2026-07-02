@@ -18,11 +18,16 @@ runtime loops can forward only policy-validated packets without choosing side or
 session per packet. The following lifecycle slice keeps that pump abstract and
 unwired, but adds a bounded driver loop that executes caller-selected pump
 directions, records forwarding/drop counters, stops on I/O errors, and never
-embeds packet/frame material in Debug output.
+embeds packet/frame material in Debug output. The current lifecycle slice adds
+an unwired runtime coordinator that sequences caller-supplied route setup, the
+bounded packet pump loop, and route cleanup through abstract traits with a fixed
+step budget; it still has no concrete OS interface, relay socket, product
+caller, flag, or owner-reviewed route-tool path source.
 There is still no
 checked-in runtime/bin that opens a TUN/utun interface in a product/default
-path, caller that invokes the route executor, packet pump, or packet-pump loop, route
-installation, packet relay runtime, storage-backed session registry, iOS Packet
+path, caller that invokes the runtime coordinator, route executor, packet pump,
+or packet-pump loop from product/bootstrap code, route installation, packet
+relay runtime, storage-backed session registry, iOS Packet
 Tunnel, or product activation. Runtime/product activation remains default-off by
 construction, and every activation step (deploy, flag flip, shipping) is a
 separate, explicitly owner-authorized decision. The guest-kernel prerequisite is
@@ -257,11 +262,16 @@ Access between members/devices and claws is explicitly many-to-many:
   or relay boundary. The packet-pump-loop slice adds only an in-module,
   bounded loop driver over the same abstract traits: a future runtime can
   supply readiness/direction decisions, but the loop stops on I/O errors and
-  enforces a step budget so it cannot become an unbounded task by itself. These
-  slices remain unwired: no bin, bootstrap, route, live relay pump runtime, or
-  flag invokes the executor, packet pump, or packet-pump loop. They are still
-  not T1 because they create no interface or route in any default/product path
-  and do not run a live relay pump against OS interfaces or relay sockets.
+  enforces a step budget so it cannot become an unbounded task by itself. The
+  packet-pump-runtime slice adds an in-module lifecycle coordinator that calls
+  route setup, the bounded packet-pump loop, and route cleanup through abstract
+  controllers; it enforces a conservative step budget and still does not open
+  TUN/utun, dial relay sockets, spawn tasks, read flags, choose route tool
+  paths, or expose a product caller. These slices remain unwired: no bin,
+  bootstrap, route, live relay pump runtime, or flag invokes the runtime
+  coordinator, executor, packet pump, or packet-pump loop. They are still not
+  T1 because they create no interface or route in any default/product path and
+  do not run a live relay pump against OS interfaces or relay sockets.
   Exit: T1–T4 green on dev hosts.
 - **Phase 2 — iOS Packet Tunnel dev build.** Entry: entitlement go/no-go.
   Dev device only. Exit: T5–T7 green (iPhone reaches Claw-A — and only
