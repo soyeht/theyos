@@ -12,18 +12,22 @@ does not need a caller-supplied session id per packet, plus a pure
 interface/address/host-route command planner and an unwired executor that maps
 typed tools to owner-reviewed absolute paths for future runtime execution,
 rejects host/platform mismatches before running commands, and suppresses child
-process stdio/environment.
+process stdio/environment. The next Phase-1 core adds a single-step packet pump
+that binds abstract interface/relay traits to the fixed-session core, so future
+runtime loops can forward only policy-validated packets without choosing side or
+session per packet.
 There is still no
 checked-in runtime/bin that opens a TUN/utun interface in a product/default
-path, caller that invokes the route executor, route installation, packet relay
-runtime, storage-backed session registry, iOS Packet Tunnel, or product
-activation. Runtime/product activation remains default-off by construction, and
-every activation step (deploy, flag flip, shipping) is a separate, explicitly
-owner-authorized decision. The guest-kernel prerequisite is different from the
-inert runtime helpers: it changes the default `firecracker-kernel` build
-artifact used by future Linux installs/builds, so it requires Linux/Nix build
-validation before merge even though it does not activate VPN behavior. Nothing
-in this plan is authorized to run anywhere by virtue of the plan existing.
+path, caller that invokes the route executor or packet pump, route
+installation, packet relay runtime, storage-backed session registry, iOS Packet
+Tunnel, or product activation. Runtime/product activation remains default-off by
+construction, and every activation step (deploy, flag flip, shipping) is a
+separate, explicitly owner-authorized decision. The guest-kernel prerequisite is
+different from the inert runtime helpers: it changes the default
+`firecracker-kernel` build artifact used by future Linux installs/builds, so it
+requires Linux/Nix build validation before merge even though it does not
+activate VPN behavior. Nothing in this plan is authorized to run anywhere by
+virtue of the plan existing.
 
 Authored 2026-07-02 by the security-review agent at the owner's request.
 
@@ -244,9 +248,13 @@ Access between members/devices and claws is explicitly many-to-many:
   slice maps the typed tools to caller-supplied absolute paths, rejects
   Linux/macOS platform mismatches before running commands, runs setup in order
   with child stdio suppressed and child environment cleared, and attempts
-  cleanup if setup fails. These slices remain unwired: no bin, bootstrap, route,
-  relay pump, or flag invokes the executor. They are still not T1 because they
-  create no interface or route in any default/product path.
+  cleanup if setup fails. The packet-pump-core slice adds one-step
+  interface-to-relay and relay-to-interface forwarding over abstract traits,
+  dropping invalid/control/spoofed packets before they can cross the interface
+  or relay boundary. These slices remain unwired: no bin, bootstrap, route,
+  relay pump loop, or flag invokes the executor or packet pump. They are still
+  not T1 because they create no interface or route in any default/product path
+  and do not run a live relay pump.
   Exit: T1–T4 green on dev hosts.
 - **Phase 2 — iOS Packet Tunnel dev build.** Entry: entitlement go/no-go.
   Dev device only. Exit: T5–T7 green (iPhone reaches Claw-A — and only

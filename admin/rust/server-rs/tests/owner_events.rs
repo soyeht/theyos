@@ -3787,6 +3787,7 @@ fn product_a_per_claw_vpn_dev_config_remains_default_off_and_unwired() {
 
     let config_path = server_src_dir.join("claw_vpn_dev_config.rs");
     let interface_route_plan_path = server_src_dir.join("claw_vpn_interface_route_plan.rs");
+    let packet_pump_path = server_src_dir.join("claw_vpn_packet_pump.rs");
     let linux_tun_path = server_src_dir.join("claw_vpn_linux_tun.rs");
     let macos_utun_path = server_src_dir.join("claw_vpn_macos_utun.rs");
     let lib_path = server_src_dir.join("lib.rs");
@@ -3799,6 +3800,10 @@ fn product_a_per_claw_vpn_dev_config_remains_default_off_and_unwired() {
             .iter()
             .any(|path| path == &interface_route_plan_path),
         "per-Claw VPN source guard must include server-rs/src/claw_vpn_interface_route_plan.rs"
+    );
+    assert!(
+        sources.iter().any(|path| path == &packet_pump_path),
+        "per-Claw VPN source guard must include server-rs/src/claw_vpn_packet_pump.rs"
     );
     assert!(
         sources.iter().any(|path| path == &linux_tun_path),
@@ -3821,6 +3826,8 @@ fn product_a_per_claw_vpn_dev_config_remains_default_off_and_unwired() {
     let lib_lines = lib_source.lines().collect::<Vec<_>>();
     let mut interface_route_plan_exports = 0usize;
     let mut interface_route_plan_export_is_unconditional = false;
+    let mut packet_pump_exports = 0usize;
+    let mut packet_pump_export_is_unconditional = false;
     let mut linux_tun_exports = 0usize;
     let mut linux_tun_export_is_linux_only = false;
     let mut macos_utun_exports = 0usize;
@@ -3829,6 +3836,11 @@ fn product_a_per_claw_vpn_dev_config_remains_default_off_and_unwired() {
         if line.trim() == "pub mod claw_vpn_interface_route_plan;" {
             interface_route_plan_exports += 1;
             interface_route_plan_export_is_unconditional =
+                index == 0 || !lib_lines[index - 1].trim().starts_with("#[cfg");
+        }
+        if line.trim() == "pub mod claw_vpn_packet_pump;" {
+            packet_pump_exports += 1;
+            packet_pump_export_is_unconditional =
                 index == 0 || !lib_lines[index - 1].trim().starts_with("#[cfg");
         }
         if line.trim() == "pub mod claw_vpn_linux_tun;" {
@@ -3847,6 +3859,10 @@ fn product_a_per_claw_vpn_dev_config_remains_default_off_and_unwired() {
         "per-Claw VPN interface route planner/executor module must have exactly one unconditional export until an explicit tunnel-runtime slice"
     );
     assert!(
+        packet_pump_exports == 1 && packet_pump_export_is_unconditional,
+        "per-Claw VPN packet pump module must have exactly one unconditional export until an explicit tunnel-runtime wiring slice"
+    );
+    assert!(
         linux_tun_exports == 1 && linux_tun_export_is_linux_only,
         "per-Claw VPN Linux TUN module must have exactly one Linux-only export until an explicit tunnel-runtime slice"
     );
@@ -3855,20 +3871,98 @@ fn product_a_per_claw_vpn_dev_config_remains_default_off_and_unwired() {
         "per-Claw VPN macOS utun module must have exactly one macOS-only export until an explicit tunnel-runtime slice"
     );
 
+    fn rust_brace_delta_outside_strings(line: &str) -> isize {
+        let mut delta = 0;
+        let mut chars = line.chars().peekable();
+        let mut in_string = false;
+        let mut escaped = false;
+        while let Some(ch) = chars.next() {
+            if in_string {
+                if escaped {
+                    escaped = false;
+                } else if ch == '\\' {
+                    escaped = true;
+                } else if ch == '"' {
+                    in_string = false;
+                }
+                continue;
+            }
+            if ch == '/' && chars.peek() == Some(&'/') {
+                break;
+            }
+            if ch == '"' {
+                in_string = true;
+            } else if ch == '{' {
+                delta += 1;
+            } else if ch == '}' {
+                delta -= 1;
+            }
+        }
+        delta
+    }
+
     let mut violations = Vec::new();
     for path in sources {
         let source = fs::read_to_string(&path)
             .unwrap_or_else(|e| panic!("read per-Claw VPN runtime source {}: {e}", path.display()));
-        for (index, line) in source.lines().enumerate() {
+        let lines = source.lines().collect::<Vec<_>>();
+        let packet_pump_test_span = if path == packet_pump_path {
+            let test_markers = lines
+                .iter()
+                .enumerate()
+                .filter_map(|(index, line)| (line.trim() == "#[cfg(test)]").then_some(index))
+                .collect::<Vec<_>>();
+            assert_eq!(
+                test_markers.len(),
+                1,
+                "per-Claw VPN packet pump guard expects one explicit cfg(test) boundary"
+            );
+            let test_start = test_markers[0];
+            assert_eq!(
+                lines.get(test_start + 1).map(|line| line.trim()),
+                Some("mod tests {"),
+                "per-Claw VPN packet pump cfg(test) boundary must immediately guard the test module"
+            );
+            let mut brace_depth = 0isize;
+            let mut test_end = None;
+            for (line_index, line) in lines.iter().enumerate().skip(test_start + 1) {
+                brace_depth += rust_brace_delta_outside_strings(line);
+                assert!(
+                    brace_depth >= 0,
+                    "per-Claw VPN packet pump test module has unbalanced braces"
+                );
+                if brace_depth == 0 {
+                    test_end = Some(line_index);
+                    break;
+                }
+            }
+            let test_end =
+                test_end.expect("per-Claw VPN packet pump test module must close before EOF");
+            let trailing_runtime_items = lines
+                .iter()
+                .skip(test_end + 1)
+                .any(|line| !line.trim().is_empty() && !line.trim().starts_with("//"));
+            assert!(
+                !trailing_runtime_items,
+                "per-Claw VPN packet pump test module must remain the final item"
+            );
+            Some((test_start, test_end))
+        } else {
+            None
+        };
+        for (index, line) in lines.iter().enumerate() {
             let module_export = path == lib_path && line.trim() == "pub mod claw_vpn_dev_config;";
             let interface_route_plan_module_export =
                 path == lib_path && line.trim() == "pub mod claw_vpn_interface_route_plan;";
+            let packet_pump_module_export =
+                path == lib_path && line.trim() == "pub mod claw_vpn_packet_pump;";
             let linux_tun_module_export =
                 path == lib_path && line.trim() == "pub mod claw_vpn_linux_tun;";
             let macos_utun_module_export =
                 path == lib_path && line.trim() == "pub mod claw_vpn_macos_utun;";
             let in_config_module = path == config_path;
             let in_interface_route_plan_module = path == interface_route_plan_path;
+            let in_packet_pump_module = path == packet_pump_path;
             let in_linux_tun_module = path == linux_tun_path;
             let in_macos_utun_module = path == macos_utun_path;
             let references_dev_config =
@@ -3877,6 +3971,10 @@ fn product_a_per_claw_vpn_dev_config_remains_default_off_and_unwired() {
             let references_interface_route_plan = line.contains("ClawVpnInterfaceRoute")
                 || line.contains("ClawVpnInterfaceName")
                 || line.contains("claw_vpn_interface_route_plan");
+            let references_packet_pump = line.contains("ClawVpnPacketPump")
+                || line.contains("ClawVpnPacketInterface")
+                || line.contains("ClawVpnPacketRelay")
+                || line.contains("claw_vpn_packet_pump");
             let references_linux_tun = line.contains("ClawVpnLinuxTun")
                 || line.contains("claw_vpn_linux_tun")
                 || line.contains("/dev/net/tun")
@@ -3900,13 +3998,28 @@ fn product_a_per_claw_vpn_dev_config_remains_default_off_and_unwired() {
                 || line.contains("ClawVpnSessionRegistry")
                 || line.contains("ClawVpnSessionId")
                 || line.contains("ClawVpnAuditEvent");
-            if references_datapath_runtime
+            let in_packet_pump_tests = in_packet_pump_module
+                && matches!(packet_pump_test_span, Some((start, end)) if index >= start && index <= end);
+            let line_without_allowed_datapath_side = line.replace("ClawVpnDatapathSide", "");
+            let references_disallowed_packet_pump_datapath_runtime = line
+                .contains("ClawVpnAgentCore")
+                || line_without_allowed_datapath_side.contains("ClawVpnDatapath")
+                || line.contains("ClawVpnSessionRegistry")
+                || line.contains("ClawVpnSessionId");
+            let allowed_packet_pump_datapath_runtime = in_packet_pump_tests
+                || (in_packet_pump_module
+                    && !references_disallowed_packet_pump_datapath_runtime
+                    && (line.contains("ClawVpnAgentSessionCore")
+                        || line.contains("ClawVpnAuditEvent")
+                        || line.contains("ClawVpnDatapathSide")));
+            if (!allowed_packet_pump_datapath_runtime && references_datapath_runtime)
                 || (!in_config_module
                     && !module_export
                     && (references_dev_config || references_dev_flag))
                 || (!in_interface_route_plan_module
                     && !interface_route_plan_module_export
                     && references_interface_route_plan)
+                || (!in_packet_pump_module && !packet_pump_module_export && references_packet_pump)
                 || (!in_linux_tun_module && !linux_tun_module_export && references_linux_tun)
                 || (!in_macos_utun_module && !macos_utun_module_export && references_macos_utun)
             {
@@ -3917,7 +4030,7 @@ fn product_a_per_claw_vpn_dev_config_remains_default_off_and_unwired() {
 
     assert!(
         violations.is_empty(),
-        "per-Claw VPN dev config/interface-route-plan-executor/TUN/utun/datapath must stay default-off/unwired until the tunnel runtime slice:\n{}",
+        "per-Claw VPN dev config/interface-route-plan-executor/packet-pump/TUN/utun/datapath must stay default-off/unwired until the tunnel runtime wiring slice:\n{}",
         violations.join("\n")
     );
 }
