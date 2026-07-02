@@ -4,16 +4,18 @@
 contracts, fail-closed placeholders, pure packet/admission/audit helpers, a pure
 interface-to-relay datapath core, a fixed-side agent core wrapper, a guarded
 default-off dev config parser, the exact relay-stream resource gate for future
-`IpTunnel`, and the Linux Firecracker guest-kernel TUN prerequisite. There is
-still no TUN/utun interface created by theyOS, route installation, packet relay
-runtime, storage-backed session registry, iOS Packet Tunnel, or product
-activation. Runtime/product activation remains default-off by construction, and
-every activation step (deploy, flag flip, shipping) is a separate, explicitly
-owner-authorized decision. The guest-kernel prerequisite is different from the
-inert runtime helpers: it changes the default `firecracker-kernel` build
-artifact used by future Linux installs/builds, so it requires Linux/Nix build
-validation before merge even though it does not activate VPN behavior. Nothing
-in this plan is authorized to run anywhere by virtue of the plan existing.
+`IpTunnel`, the Linux Firecracker guest-kernel TUN prerequisite, and a
+Linux-only `/dev/net/tun` open primitive guarded from runtime wiring. There is
+still no checked-in runtime/bin that opens a TUN/utun interface, route
+installation, packet relay runtime, storage-backed session registry, iOS Packet
+Tunnel, or product activation. Runtime/product activation remains default-off by
+construction, and every activation step (deploy, flag flip, shipping) is a
+separate, explicitly owner-authorized decision. The guest-kernel prerequisite
+is different from the inert runtime helpers: it changes the default
+`firecracker-kernel` build artifact used by future Linux installs/builds, so it
+requires Linux/Nix build validation before merge even though it does not
+activate VPN behavior. Nothing in this plan is authorized to run anywhere by
+virtue of the plan existing.
 
 Authored 2026-07-02 by the security-review agent at the owner's request.
 
@@ -207,8 +209,9 @@ Access between members/devices and claws is explicitly many-to-many:
 - **Phase 0 — plan + inert scaffolding.** Security co-review of the document
   plus reserved signed resource, pure packet/admission/audit helpers, and a
   default-off dev config parser guarded from runtime wiring. STOP: no
-  TUN/utun, route installation, storage-backed registry, runtime agent, or
-  product activation before a separate implementation sign-off.
+  TUN/utun interface opened by a runtime, route installation, storage-backed
+  registry, runtime agent, or product activation before a separate
+  implementation sign-off.
 - **Phase 1 — Rust↔Rust dev proof (no Apple gates).** Claw agent with
   TUN/utun + a macOS `utun` dev *client* bin (all Rust), over the existing
   dev relay, behind new default-off flags. The first Phase-1 core slice adds
@@ -222,8 +225,11 @@ Access between members/devices and claws is explicitly many-to-many:
   `CONFIG_TUN=y`, so future Linux claw agents can open TUN. The next agent-core
   slice fixes the local side (`Device` or `Claw`) at construction before any
   future interface pump can forward packets, avoiding per-packet caller choice
-  of direction. These slices are still not T1 because they create no interface
-  or route. Exit: T1–T4 green on dev hosts.
+  of direction. The next Linux-only slice isolates the `/dev/net/tun` FFI
+  boundary and validates interface names, but remains unwired: no bin,
+  bootstrap, route, relay pump, or flag invokes it. These slices are still not
+  T1 because they create no interface or route in any default/product path.
+  Exit: T1–T4 green on dev hosts.
 - **Phase 2 — iOS Packet Tunnel dev build.** Entry: entitlement go/no-go.
   Dev device only. Exit: T5–T7 green (iPhone reaches Claw-A — and only
   Claw-A).

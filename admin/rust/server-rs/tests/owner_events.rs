@@ -3786,14 +3786,39 @@ fn product_a_per_claw_vpn_dev_config_remains_default_off_and_unwired() {
     );
 
     let config_path = server_src_dir.join("claw_vpn_dev_config.rs");
+    let linux_tun_path = server_src_dir.join("claw_vpn_linux_tun.rs");
     let lib_path = server_src_dir.join("lib.rs");
     assert!(
         sources.iter().any(|path| path == &config_path),
         "per-Claw VPN source guard must include server-rs/src/claw_vpn_dev_config.rs"
     );
     assert!(
+        sources.iter().any(|path| path == &linux_tun_path),
+        "per-Claw VPN source guard must include server-rs/src/claw_vpn_linux_tun.rs"
+    );
+    assert!(
         sources.iter().any(|path| path == &lib_path),
         "per-Claw VPN source guard must include server-rs/src/lib.rs"
+    );
+    let lib_source = fs::read_to_string(&lib_path).unwrap_or_else(|e| {
+        panic!(
+            "read per-Claw VPN runtime source {}: {e}",
+            lib_path.display()
+        )
+    });
+    let lib_lines = lib_source.lines().collect::<Vec<_>>();
+    let mut linux_tun_exports = 0usize;
+    let mut linux_tun_export_is_linux_only = false;
+    for (index, line) in lib_lines.iter().enumerate() {
+        if line.trim() == "pub mod claw_vpn_linux_tun;" {
+            linux_tun_exports += 1;
+            linux_tun_export_is_linux_only =
+                index > 0 && lib_lines[index - 1].trim() == "#[cfg(target_os = \"linux\")]";
+        }
+    }
+    assert!(
+        linux_tun_exports == 1 && linux_tun_export_is_linux_only,
+        "per-Claw VPN Linux TUN module must have exactly one Linux-only export until an explicit tunnel-runtime slice"
     );
 
     let mut violations = Vec::new();
@@ -3802,10 +3827,20 @@ fn product_a_per_claw_vpn_dev_config_remains_default_off_and_unwired() {
             .unwrap_or_else(|e| panic!("read per-Claw VPN runtime source {}: {e}", path.display()));
         for (index, line) in source.lines().enumerate() {
             let module_export = path == lib_path && line.trim() == "pub mod claw_vpn_dev_config;";
+            let linux_tun_module_export =
+                path == lib_path && line.trim() == "pub mod claw_vpn_linux_tun;";
             let in_config_module = path == config_path;
+            let in_linux_tun_module = path == linux_tun_path;
             let references_dev_config =
                 line.contains("ClawVpnDevConfig") || line.contains("claw_vpn_dev_config");
             let references_dev_flag = line.contains("THEYOS_CLAW_VPN_");
+            let references_linux_tun = line.contains("ClawVpnLinuxTun")
+                || line.contains("claw_vpn_linux_tun")
+                || line.contains("/dev/net/tun")
+                || line.contains("TUNSETIFF")
+                || line.contains("IFF_TUN")
+                || line.contains("IFF_TUN_EXCL")
+                || line.contains("IFF_NO_PI");
             let references_datapath_runtime = line.contains("ClawVpnDatapath")
                 || line.contains("ClawVpnAgentCore")
                 || line.contains("ClawVpnSessionRegistry")
@@ -3815,6 +3850,7 @@ fn product_a_per_claw_vpn_dev_config_remains_default_off_and_unwired() {
                 || (!in_config_module
                     && !module_export
                     && (references_dev_config || references_dev_flag))
+                || (!in_linux_tun_module && !linux_tun_module_export && references_linux_tun)
             {
                 violations.push(format!("{}:{}: {}", path.display(), index + 1, line.trim()));
             }
@@ -3823,7 +3859,7 @@ fn product_a_per_claw_vpn_dev_config_remains_default_off_and_unwired() {
 
     assert!(
         violations.is_empty(),
-        "per-Claw VPN dev config/datapath must stay default-off/unwired until the tunnel runtime slice:\n{}",
+        "per-Claw VPN dev config/TUN/datapath must stay default-off/unwired until the tunnel runtime slice:\n{}",
         violations.join("\n")
     );
 }

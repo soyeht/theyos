@@ -50,6 +50,8 @@ pub mod claw_share_rendezvous_stream_relay_status;
 pub mod claw_store_routes;
 pub mod claw_store_service;
 pub mod claw_vpn_dev_config;
+#[cfg(target_os = "linux")]
+pub mod claw_vpn_linux_tun;
 pub mod cloudflare_admin;
 pub mod cloudflare_api;
 pub mod cloudflared_sync;
