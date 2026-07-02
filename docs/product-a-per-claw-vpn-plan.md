@@ -9,11 +9,14 @@ Linux-only `/dev/net/tun` open primitive, and a macOS-only `utun` open
 primitive guarded from runtime wiring. The current Phase-1 core also adds a
 fixed-session wrapper that future packet pumps can use so packet forwarding
 does not need a caller-supplied session id per packet, plus a pure
-interface/address/host-route command planner for future runtime execution.
+interface/address/host-route command planner and an unwired executor that maps
+typed tools to owner-reviewed absolute paths for future runtime execution,
+rejects host/platform mismatches before running commands, and suppresses child
+process stdio/environment.
 There is still no
 checked-in runtime/bin that opens a TUN/utun interface in a product/default
-path, command execution for `ip`/`ifconfig`/`route`, route installation, packet
-relay runtime, storage-backed session registry, iOS Packet Tunnel, or product
+path, caller that invokes the route executor, route installation, packet relay
+runtime, storage-backed session registry, iOS Packet Tunnel, or product
 activation. Runtime/product activation remains default-off by construction, and
 every activation step (deploy, flag flip, shipping) is a separate, explicitly
 owner-authorized decision. The guest-kernel prerequisite is different from the
@@ -237,10 +240,13 @@ Access between members/devices and claws is explicitly many-to-many:
   session id before forwarding through that wrapper, avoiding per-packet caller
   choice of session in the future pump. The interface-route-plan slice
   materializes the exact Linux/macOS address and Claw-peer `/32` host-route
-  argv a future runtime can execute after session auth, but it does not execute
-  commands or install routes. These slices remain unwired: no bin, bootstrap,
-  command executor, route, relay pump, or flag invokes them. They are still not
-  T1 because they create no interface or route in any default/product path.
+  argv a future runtime can execute after session auth; the route-executor
+  slice maps the typed tools to caller-supplied absolute paths, rejects
+  Linux/macOS platform mismatches before running commands, runs setup in order
+  with child stdio suppressed and child environment cleared, and attempts
+  cleanup if setup fails. These slices remain unwired: no bin, bootstrap, route,
+  relay pump, or flag invokes the executor. They are still not T1 because they
+  create no interface or route in any default/product path.
   Exit: T1–T4 green on dev hosts.
 - **Phase 2 — iOS Packet Tunnel dev build.** Entry: entitlement go/no-go.
   Dev device only. Exit: T5–T7 green (iPhone reaches Claw-A — and only

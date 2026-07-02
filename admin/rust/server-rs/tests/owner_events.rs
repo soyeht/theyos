@@ -3844,7 +3844,7 @@ fn product_a_per_claw_vpn_dev_config_remains_default_off_and_unwired() {
     }
     assert!(
         interface_route_plan_exports == 1 && interface_route_plan_export_is_unconditional,
-        "per-Claw VPN interface route plan module must have exactly one unconditional export until an explicit tunnel-runtime slice"
+        "per-Claw VPN interface route planner/executor module must have exactly one unconditional export until an explicit tunnel-runtime slice"
     );
     assert!(
         linux_tun_exports == 1 && linux_tun_export_is_linux_only,
@@ -3917,7 +3917,7 @@ fn product_a_per_claw_vpn_dev_config_remains_default_off_and_unwired() {
 
     assert!(
         violations.is_empty(),
-        "per-Claw VPN dev config/interface-route-plan/TUN/utun/datapath must stay default-off/unwired until the tunnel runtime slice:\n{}",
+        "per-Claw VPN dev config/interface-route-plan-executor/TUN/utun/datapath must stay default-off/unwired until the tunnel runtime slice:\n{}",
         violations.join("\n")
     );
 }

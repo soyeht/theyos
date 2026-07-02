@@ -1,17 +1,29 @@
-//! Pure address and host-route plans for the future per-Claw VPN agent.
+//! Address and host-route plans for the future per-Claw VPN agent.
 //!
-//! This module does not execute `ip`, `ifconfig`, `route`, or any other system
-//! command. It only builds deterministic argv plans that a later runtime slice
-//! can execute after it has an authorized session and a live TUN/utun device.
+//! This module builds deterministic argv plans and contains the narrow command
+//! executor for those plans. Nothing in the product runtime calls the executor
+//! yet; a later runtime slice must supply an authorized session, a live TUN/utun
+//! device, and owner-reviewed absolute tool paths before using it.
 
 use std::fmt;
+use std::io;
 use std::net::Ipv4Addr;
+use std::path::{Component, Path, PathBuf};
+use std::process::{Command, ExitStatus, Stdio};
 
 use household_rs::claw_vpn::ClawVpnSessionAddrs;
 
 const MAX_INTERFACE_NAME_BYTES: usize = 15;
 const IPV4_HOST_PREFIX_LEN: &str = "32";
 const MACOS_HOST_NETMASK: &str = "255.255.255.255";
+#[cfg(target_os = "linux")]
+const HOST_ROUTE_PLATFORM: Option<ClawVpnInterfaceRoutePlatform> =
+    Some(ClawVpnInterfaceRoutePlatform::Linux);
+#[cfg(target_os = "macos")]
+const HOST_ROUTE_PLATFORM: Option<ClawVpnInterfaceRoutePlatform> =
+    Some(ClawVpnInterfaceRoutePlatform::Macos);
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+const HOST_ROUTE_PLATFORM: Option<ClawVpnInterfaceRoutePlatform> = None;
 
 #[derive(Clone, PartialEq, Eq, Hash)]
 pub struct ClawVpnInterfaceName {
@@ -98,6 +110,334 @@ pub enum ClawVpnInterfaceRouteTool {
     LinuxIp,
     MacosIfconfig,
     MacosRoute,
+}
+
+/// Tool executable path selected by an owner-reviewed launcher/config layer.
+///
+/// The route planner intentionally carries a typed tool enum, not an executable
+/// string. The executor maps that enum to absolute paths supplied by its caller;
+/// future product wiring must source those paths from reviewed platform config,
+/// not from the route plan or remote input.
+#[derive(Clone, PartialEq, Eq, Hash)]
+pub struct ClawVpnInterfaceRouteToolPath {
+    value: PathBuf,
+}
+
+impl fmt::Debug for ClawVpnInterfaceRouteToolPath {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_tuple("ClawVpnInterfaceRouteToolPath")
+            .field(&"<redacted>")
+            .finish()
+    }
+}
+
+impl ClawVpnInterfaceRouteToolPath {
+    pub fn new(value: impl Into<PathBuf>) -> Result<Self, ClawVpnInterfaceRouteToolPathError> {
+        let value = value.into();
+        if value.as_os_str().is_empty() {
+            return Err(ClawVpnInterfaceRouteToolPathError::Empty);
+        }
+        if !value.is_absolute() {
+            return Err(ClawVpnInterfaceRouteToolPathError::NotAbsolute);
+        }
+        let mut has_program_component = false;
+        for component in value.components() {
+            match component {
+                Component::Normal(_) => {
+                    has_program_component = true;
+                }
+                Component::RootDir | Component::Prefix(_) => {}
+                Component::CurDir | Component::ParentDir => {
+                    return Err(ClawVpnInterfaceRouteToolPathError::UnsafeComponent);
+                }
+            }
+        }
+        if !has_program_component {
+            return Err(ClawVpnInterfaceRouteToolPathError::UnsafeComponent);
+        }
+        Ok(Self { value })
+    }
+
+    #[must_use]
+    pub fn as_path(&self) -> &Path {
+        &self.value
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClawVpnInterfaceRouteToolPathError {
+    Empty,
+    NotAbsolute,
+    UnsafeComponent,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct ClawVpnInterfaceRouteToolPaths {
+    linux_ip: ClawVpnInterfaceRouteToolPath,
+    macos_ifconfig: ClawVpnInterfaceRouteToolPath,
+    macos_route: ClawVpnInterfaceRouteToolPath,
+}
+
+impl fmt::Debug for ClawVpnInterfaceRouteToolPaths {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ClawVpnInterfaceRouteToolPaths")
+            .field("linux_ip", &"<redacted>")
+            .field("macos_ifconfig", &"<redacted>")
+            .field("macos_route", &"<redacted>")
+            .finish()
+    }
+}
+
+impl ClawVpnInterfaceRouteToolPaths {
+    pub fn try_new(
+        linux_ip: impl Into<PathBuf>,
+        macos_ifconfig: impl Into<PathBuf>,
+        macos_route: impl Into<PathBuf>,
+    ) -> Result<Self, ClawVpnInterfaceRouteToolPathError> {
+        Ok(Self {
+            linux_ip: ClawVpnInterfaceRouteToolPath::new(linux_ip)?,
+            macos_ifconfig: ClawVpnInterfaceRouteToolPath::new(macos_ifconfig)?,
+            macos_route: ClawVpnInterfaceRouteToolPath::new(macos_route)?,
+        })
+    }
+
+    #[must_use]
+    pub fn path_for(&self, tool: ClawVpnInterfaceRouteTool) -> &Path {
+        match tool {
+            ClawVpnInterfaceRouteTool::LinuxIp => self.linux_ip.as_path(),
+            ClawVpnInterfaceRouteTool::MacosIfconfig => self.macos_ifconfig.as_path(),
+            ClawVpnInterfaceRouteTool::MacosRoute => self.macos_route.as_path(),
+        }
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct ClawVpnInterfaceRouteExecutor {
+    tool_paths: ClawVpnInterfaceRouteToolPaths,
+    platform: Option<ClawVpnInterfaceRoutePlatform>,
+}
+
+impl fmt::Debug for ClawVpnInterfaceRouteExecutor {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ClawVpnInterfaceRouteExecutor")
+            .field("tool_paths", &"<redacted>")
+            .field("platform", &self.platform)
+            .finish()
+    }
+}
+
+impl ClawVpnInterfaceRouteExecutor {
+    #[must_use]
+    pub fn new(tool_paths: ClawVpnInterfaceRouteToolPaths) -> Self {
+        Self {
+            tool_paths,
+            platform: HOST_ROUTE_PLATFORM,
+        }
+    }
+
+    #[cfg(test)]
+    fn new_for_platform(
+        tool_paths: ClawVpnInterfaceRouteToolPaths,
+        platform: ClawVpnInterfaceRoutePlatform,
+    ) -> Self {
+        Self {
+            tool_paths,
+            platform: Some(platform),
+        }
+    }
+
+    pub fn apply(
+        &self,
+        plan: &ClawVpnInterfaceRoutePlan,
+    ) -> Result<(), ClawVpnInterfaceRouteExecutionError> {
+        let mut runner = SystemInterfaceRouteCommandRunner;
+        self.apply_with_runner(plan, &mut runner)
+    }
+
+    pub fn cleanup(
+        &self,
+        plan: &ClawVpnInterfaceRoutePlan,
+    ) -> Result<(), ClawVpnInterfaceRouteExecutionError> {
+        let mut runner = SystemInterfaceRouteCommandRunner;
+        self.cleanup_with_runner(plan, &mut runner)
+    }
+
+    fn apply_with_runner(
+        &self,
+        plan: &ClawVpnInterfaceRoutePlan,
+        runner: &mut impl ClawVpnInterfaceRouteCommandRunner,
+    ) -> Result<(), ClawVpnInterfaceRouteExecutionError> {
+        self.ensure_platform(plan)?;
+        if let Err(setup_error) = self.run_commands(
+            ClawVpnInterfaceRouteExecutionPhase::Setup,
+            plan.setup_commands(),
+            runner,
+        ) {
+            let cleanup_error = self
+                .run_commands(
+                    ClawVpnInterfaceRouteExecutionPhase::Cleanup,
+                    plan.cleanup_commands(),
+                    runner,
+                )
+                .err()
+                .map(Box::new);
+            return Err(ClawVpnInterfaceRouteExecutionError::SetupFailed {
+                setup_error: Box::new(setup_error),
+                cleanup_error,
+            });
+        }
+        Ok(())
+    }
+
+    fn cleanup_with_runner(
+        &self,
+        plan: &ClawVpnInterfaceRoutePlan,
+        runner: &mut impl ClawVpnInterfaceRouteCommandRunner,
+    ) -> Result<(), ClawVpnInterfaceRouteExecutionError> {
+        self.ensure_platform(plan)?;
+        self.run_commands(
+            ClawVpnInterfaceRouteExecutionPhase::Cleanup,
+            plan.cleanup_commands(),
+            runner,
+        )
+    }
+
+    fn run_commands(
+        &self,
+        phase: ClawVpnInterfaceRouteExecutionPhase,
+        commands: &[ClawVpnInterfaceRouteCommand],
+        runner: &mut impl ClawVpnInterfaceRouteCommandRunner,
+    ) -> Result<(), ClawVpnInterfaceRouteExecutionError> {
+        let mut first_cleanup_error = None;
+        for (command_index, command) in commands.iter().enumerate() {
+            let result = self.run_command(phase, command_index, command, runner);
+            match (phase, result) {
+                (_, Ok(())) => {}
+                (ClawVpnInterfaceRouteExecutionPhase::Setup, Err(error)) => return Err(error),
+                (ClawVpnInterfaceRouteExecutionPhase::Cleanup, Err(error)) => {
+                    first_cleanup_error.get_or_insert(error);
+                }
+            }
+        }
+        if let Some(error) = first_cleanup_error {
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    fn run_command(
+        &self,
+        phase: ClawVpnInterfaceRouteExecutionPhase,
+        command_index: usize,
+        command: &ClawVpnInterfaceRouteCommand,
+        runner: &mut impl ClawVpnInterfaceRouteCommandRunner,
+    ) -> Result<(), ClawVpnInterfaceRouteExecutionError> {
+        let tool = command.tool();
+        let exit = runner
+            .run(tool, self.tool_paths.path_for(tool), command.args())
+            .map_err(|source| ClawVpnInterfaceRouteExecutionError::CommandSpawn {
+                phase,
+                command_index,
+                tool,
+                source,
+            })?;
+        if !exit.success {
+            return Err(ClawVpnInterfaceRouteExecutionError::CommandFailed {
+                phase,
+                command_index,
+                tool,
+                status_code: exit.status_code,
+            });
+        }
+        Ok(())
+    }
+
+    fn ensure_platform(
+        &self,
+        plan: &ClawVpnInterfaceRoutePlan,
+    ) -> Result<(), ClawVpnInterfaceRouteExecutionError> {
+        if self.platform == Some(plan.platform()) {
+            return Ok(());
+        }
+        Err(ClawVpnInterfaceRouteExecutionError::PlatformMismatch {
+            executor_platform: self.platform,
+            plan_platform: plan.platform(),
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClawVpnInterfaceRouteExecutionPhase {
+    Setup,
+    Cleanup,
+}
+
+#[derive(Debug)]
+pub enum ClawVpnInterfaceRouteExecutionError {
+    PlatformMismatch {
+        executor_platform: Option<ClawVpnInterfaceRoutePlatform>,
+        plan_platform: ClawVpnInterfaceRoutePlatform,
+    },
+    CommandSpawn {
+        phase: ClawVpnInterfaceRouteExecutionPhase,
+        command_index: usize,
+        tool: ClawVpnInterfaceRouteTool,
+        source: io::Error,
+    },
+    CommandFailed {
+        phase: ClawVpnInterfaceRouteExecutionPhase,
+        command_index: usize,
+        tool: ClawVpnInterfaceRouteTool,
+        status_code: Option<i32>,
+    },
+    SetupFailed {
+        setup_error: Box<ClawVpnInterfaceRouteExecutionError>,
+        cleanup_error: Option<Box<ClawVpnInterfaceRouteExecutionError>>,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ClawVpnInterfaceRouteCommandExit {
+    success: bool,
+    status_code: Option<i32>,
+}
+
+impl From<ExitStatus> for ClawVpnInterfaceRouteCommandExit {
+    fn from(status: ExitStatus) -> Self {
+        Self {
+            success: status.success(),
+            status_code: status.code(),
+        }
+    }
+}
+
+trait ClawVpnInterfaceRouteCommandRunner {
+    fn run(
+        &mut self,
+        tool: ClawVpnInterfaceRouteTool,
+        program: &Path,
+        args: &[String],
+    ) -> Result<ClawVpnInterfaceRouteCommandExit, io::Error>;
+}
+
+struct SystemInterfaceRouteCommandRunner;
+
+impl ClawVpnInterfaceRouteCommandRunner for SystemInterfaceRouteCommandRunner {
+    fn run(
+        &mut self,
+        _tool: ClawVpnInterfaceRouteTool,
+        program: &Path,
+        args: &[String],
+    ) -> Result<ClawVpnInterfaceRouteCommandExit, io::Error> {
+        Command::new(program)
+            .env_clear()
+            .args(args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .map(Into::into)
+    }
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -381,12 +721,111 @@ fn validate_interface_name(value: &str) -> Result<(), ClawVpnInterfaceNameError>
 mod tests {
     use super::*;
 
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct RecordedRouteCommand {
+        tool: ClawVpnInterfaceRouteTool,
+        program: String,
+        args: Vec<String>,
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum FakeRouteCommandOutcome {
+        Success,
+        ExitFailure(Option<i32>),
+        SpawnFailure,
+    }
+
+    #[derive(Debug, Default)]
+    struct RecordingRouteCommandRunner {
+        outcomes: Vec<FakeRouteCommandOutcome>,
+        calls: Vec<RecordedRouteCommand>,
+    }
+
+    impl RecordingRouteCommandRunner {
+        fn with_outcomes(outcomes: Vec<FakeRouteCommandOutcome>) -> Self {
+            Self {
+                outcomes,
+                calls: Vec::new(),
+            }
+        }
+    }
+
+    impl ClawVpnInterfaceRouteCommandRunner for RecordingRouteCommandRunner {
+        fn run(
+            &mut self,
+            tool: ClawVpnInterfaceRouteTool,
+            program: &Path,
+            args: &[String],
+        ) -> Result<ClawVpnInterfaceRouteCommandExit, io::Error> {
+            let outcome = self
+                .outcomes
+                .get(self.calls.len())
+                .copied()
+                .unwrap_or(FakeRouteCommandOutcome::Success);
+            self.calls.push(RecordedRouteCommand {
+                tool,
+                program: program.display().to_string(),
+                args: args.to_vec(),
+            });
+            match outcome {
+                FakeRouteCommandOutcome::Success => Ok(ClawVpnInterfaceRouteCommandExit {
+                    success: true,
+                    status_code: Some(0),
+                }),
+                FakeRouteCommandOutcome::ExitFailure(status_code) => {
+                    Ok(ClawVpnInterfaceRouteCommandExit {
+                        success: false,
+                        status_code,
+                    })
+                }
+                FakeRouteCommandOutcome::SpawnFailure => Err(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    "fake spawn failure",
+                )),
+            }
+        }
+    }
+
     fn session_addrs() -> ClawVpnSessionAddrs {
         ClawVpnSessionAddrs::try_new(
             "198.51.100.10".parse().unwrap(),
             "198.51.100.11".parse().unwrap(),
         )
         .unwrap()
+    }
+
+    fn tool_paths() -> ClawVpnInterfaceRouteToolPaths {
+        ClawVpnInterfaceRouteToolPaths::try_new(
+            "/run/current-system/sw/bin/ip",
+            "/sbin/ifconfig",
+            "/sbin/route",
+        )
+        .unwrap()
+    }
+
+    fn executor() -> ClawVpnInterfaceRouteExecutor {
+        ClawVpnInterfaceRouteExecutor::new_for_platform(
+            tool_paths(),
+            ClawVpnInterfaceRoutePlatform::Linux,
+        )
+    }
+
+    fn linux_plan() -> ClawVpnInterfaceRoutePlan {
+        ClawVpnInterfaceRoutePlan::new(
+            ClawVpnInterfaceRoutePlatform::Linux,
+            ClawVpnInterfaceName::new("clawvpn0").unwrap(),
+            session_addrs(),
+            ClawVpnInterfaceRouteSide::Device,
+        )
+    }
+
+    fn macos_plan() -> ClawVpnInterfaceRoutePlan {
+        ClawVpnInterfaceRoutePlan::new(
+            ClawVpnInterfaceRoutePlatform::Macos,
+            ClawVpnInterfaceName::new("utun7").unwrap(),
+            session_addrs(),
+            ClawVpnInterfaceRouteSide::Claw,
+        )
     }
 
     fn args(command: &ClawVpnInterfaceRouteCommand) -> Vec<&str> {
@@ -407,13 +846,54 @@ mod tests {
     }
 
     #[test]
-    fn linux_plan_assigns_point_to_point_address_and_single_peer_route() {
-        let plan = ClawVpnInterfaceRoutePlan::new(
-            ClawVpnInterfaceRoutePlatform::Linux,
-            ClawVpnInterfaceName::new("clawvpn0").unwrap(),
-            session_addrs(),
-            ClawVpnInterfaceRouteSide::Device,
+    fn tool_paths_require_absolute_paths_and_debug_redacts() {
+        assert_eq!(
+            ClawVpnInterfaceRouteToolPath::new("").unwrap_err(),
+            ClawVpnInterfaceRouteToolPathError::Empty
         );
+        assert_eq!(
+            ClawVpnInterfaceRouteToolPath::new("ip").unwrap_err(),
+            ClawVpnInterfaceRouteToolPathError::NotAbsolute
+        );
+        assert_eq!(
+            ClawVpnInterfaceRouteToolPath::new("/").unwrap_err(),
+            ClawVpnInterfaceRouteToolPathError::UnsafeComponent
+        );
+        assert_eq!(
+            ClawVpnInterfaceRouteToolPath::new("/run/current-system/../bin/ip").unwrap_err(),
+            ClawVpnInterfaceRouteToolPathError::UnsafeComponent
+        );
+
+        let paths = tool_paths();
+        assert_eq!(
+            paths.path_for(ClawVpnInterfaceRouteTool::LinuxIp),
+            Path::new("/run/current-system/sw/bin/ip")
+        );
+        assert_eq!(
+            paths.path_for(ClawVpnInterfaceRouteTool::MacosIfconfig),
+            Path::new("/sbin/ifconfig")
+        );
+        assert_eq!(
+            paths.path_for(ClawVpnInterfaceRouteTool::MacosRoute),
+            Path::new("/sbin/route")
+        );
+
+        let debug = format!("{paths:?}");
+        assert!(debug.contains("<redacted>"));
+        assert!(!debug.contains("/run/current-system/sw/bin/ip"));
+        assert!(!debug.contains("/sbin/ifconfig"));
+        assert!(!debug.contains("/sbin/route"));
+
+        let executor_debug = format!("{:?}", executor());
+        assert!(executor_debug.contains("<redacted>"));
+        assert!(!executor_debug.contains("/run/current-system/sw/bin/ip"));
+        assert!(!executor_debug.contains("/sbin/ifconfig"));
+        assert!(!executor_debug.contains("/sbin/route"));
+    }
+
+    #[test]
+    fn linux_plan_assigns_point_to_point_address_and_single_peer_route() {
+        let plan = linux_plan();
 
         assert_eq!(plan.platform(), ClawVpnInterfaceRoutePlatform::Linux);
         assert_eq!(plan.interface_name().as_str(), "clawvpn0");
@@ -483,13 +963,352 @@ mod tests {
     }
 
     #[test]
-    fn macos_plan_assigns_point_to_point_address_and_single_peer_route() {
-        let plan = ClawVpnInterfaceRoutePlan::new(
-            ClawVpnInterfaceRoutePlatform::Macos,
-            ClawVpnInterfaceName::new("utun7").unwrap(),
-            session_addrs(),
-            ClawVpnInterfaceRouteSide::Claw,
+    fn executor_applies_setup_and_cleanup_in_planned_order() {
+        let plan = linux_plan();
+        let executor = executor();
+        let mut runner = RecordingRouteCommandRunner::default();
+
+        executor.apply_with_runner(&plan, &mut runner).unwrap();
+        executor.cleanup_with_runner(&plan, &mut runner).unwrap();
+
+        assert_eq!(runner.calls.len(), 6);
+        for call in &runner.calls {
+            assert_eq!(call.tool, ClawVpnInterfaceRouteTool::LinuxIp);
+            assert_eq!(call.program, "/run/current-system/sw/bin/ip");
+        }
+        assert_eq!(
+            runner.calls[0].args,
+            plan.setup_commands()[0].args().to_vec()
         );
+        assert_eq!(
+            runner.calls[1].args,
+            plan.setup_commands()[1].args().to_vec()
+        );
+        assert_eq!(
+            runner.calls[2].args,
+            plan.setup_commands()[2].args().to_vec()
+        );
+        assert_eq!(
+            runner.calls[3].args,
+            plan.cleanup_commands()[0].args().to_vec()
+        );
+        assert_eq!(
+            runner.calls[4].args,
+            plan.cleanup_commands()[1].args().to_vec()
+        );
+        assert_eq!(
+            runner.calls[5].args,
+            plan.cleanup_commands()[2].args().to_vec()
+        );
+    }
+
+    #[test]
+    fn executor_applies_macos_setup_and_cleanup_in_planned_order() {
+        let plan = macos_plan();
+        let executor = ClawVpnInterfaceRouteExecutor::new_for_platform(
+            tool_paths(),
+            ClawVpnInterfaceRoutePlatform::Macos,
+        );
+        let mut runner = RecordingRouteCommandRunner::default();
+
+        executor.apply_with_runner(&plan, &mut runner).unwrap();
+        executor.cleanup_with_runner(&plan, &mut runner).unwrap();
+
+        assert_eq!(runner.calls.len(), 4);
+        assert_eq!(
+            runner.calls[0].tool,
+            ClawVpnInterfaceRouteTool::MacosIfconfig
+        );
+        assert_eq!(runner.calls[0].program, "/sbin/ifconfig");
+        assert_eq!(
+            runner.calls[0].args,
+            plan.setup_commands()[0].args().to_vec()
+        );
+        assert_eq!(runner.calls[1].tool, ClawVpnInterfaceRouteTool::MacosRoute);
+        assert_eq!(runner.calls[1].program, "/sbin/route");
+        assert_eq!(
+            runner.calls[1].args,
+            plan.setup_commands()[1].args().to_vec()
+        );
+        assert_eq!(runner.calls[2].tool, ClawVpnInterfaceRouteTool::MacosRoute);
+        assert_eq!(runner.calls[2].program, "/sbin/route");
+        assert_eq!(
+            runner.calls[2].args,
+            plan.cleanup_commands()[0].args().to_vec()
+        );
+        assert_eq!(
+            runner.calls[3].tool,
+            ClawVpnInterfaceRouteTool::MacosIfconfig
+        );
+        assert_eq!(runner.calls[3].program, "/sbin/ifconfig");
+        assert_eq!(
+            runner.calls[3].args,
+            plan.cleanup_commands()[1].args().to_vec()
+        );
+    }
+
+    #[test]
+    fn executor_rejects_platform_mismatch_before_running_commands() {
+        let plan = linux_plan();
+        let executor = ClawVpnInterfaceRouteExecutor::new_for_platform(
+            tool_paths(),
+            ClawVpnInterfaceRoutePlatform::Macos,
+        );
+        let mut runner = RecordingRouteCommandRunner::default();
+
+        let apply_error = executor.apply_with_runner(&plan, &mut runner).unwrap_err();
+        assert_eq!(runner.calls.len(), 0);
+        match apply_error {
+            ClawVpnInterfaceRouteExecutionError::PlatformMismatch {
+                executor_platform: Some(ClawVpnInterfaceRoutePlatform::Macos),
+                plan_platform: ClawVpnInterfaceRoutePlatform::Linux,
+            } => {}
+            other => panic!("unexpected apply error: {other:?}"),
+        }
+
+        let cleanup_error = executor
+            .cleanup_with_runner(&plan, &mut runner)
+            .unwrap_err();
+        assert_eq!(runner.calls.len(), 0);
+        match cleanup_error {
+            ClawVpnInterfaceRouteExecutionError::PlatformMismatch {
+                executor_platform: Some(ClawVpnInterfaceRoutePlatform::Macos),
+                plan_platform: ClawVpnInterfaceRoutePlatform::Linux,
+            } => {}
+            other => panic!("unexpected cleanup error: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn executor_reports_setup_spawn_failure_and_attempts_cleanup() {
+        let plan = linux_plan();
+        let executor = executor();
+        let mut runner =
+            RecordingRouteCommandRunner::with_outcomes(vec![FakeRouteCommandOutcome::SpawnFailure]);
+
+        let error = executor.apply_with_runner(&plan, &mut runner).unwrap_err();
+        let error_debug = format!("{error:?}");
+        assert!(!error_debug.contains("clawvpn0"));
+        assert!(!error_debug.contains("198.51.100.10"));
+        assert!(!error_debug.contains("198.51.100.11"));
+        assert!(!error_debug.contains("/run/current-system/sw/bin/ip"));
+        assert!(!error_debug.contains("/sbin/ifconfig"));
+        assert!(!error_debug.contains("/sbin/route"));
+
+        match error {
+            ClawVpnInterfaceRouteExecutionError::SetupFailed {
+                setup_error,
+                cleanup_error: None,
+            } => match *setup_error {
+                ClawVpnInterfaceRouteExecutionError::CommandSpawn {
+                    phase: ClawVpnInterfaceRouteExecutionPhase::Setup,
+                    command_index: 0,
+                    tool: ClawVpnInterfaceRouteTool::LinuxIp,
+                    ..
+                } => {}
+                other => panic!("unexpected setup error: {other:?}"),
+            },
+            other => panic!("unexpected error: {other:?}"),
+        }
+        assert_eq!(runner.calls.len(), 4);
+        assert_eq!(
+            runner.calls[0].args,
+            plan.setup_commands()[0].args().to_vec()
+        );
+        assert_eq!(
+            runner.calls[1].args,
+            plan.cleanup_commands()[0].args().to_vec()
+        );
+        assert_eq!(
+            runner.calls[2].args,
+            plan.cleanup_commands()[1].args().to_vec()
+        );
+        assert_eq!(
+            runner.calls[3].args,
+            plan.cleanup_commands()[2].args().to_vec()
+        );
+        assert!(
+            !runner
+                .calls
+                .iter()
+                .any(|call| call.args == plan.setup_commands()[1].args().to_vec())
+        );
+    }
+
+    #[test]
+    fn executor_runs_cleanup_after_setup_failure_without_continuing_setup() {
+        let plan = linux_plan();
+        let executor = executor();
+        let mut runner = RecordingRouteCommandRunner::with_outcomes(vec![
+            FakeRouteCommandOutcome::Success,
+            FakeRouteCommandOutcome::ExitFailure(Some(2)),
+        ]);
+
+        let error = executor.apply_with_runner(&plan, &mut runner).unwrap_err();
+        let error_debug = format!("{error:?}");
+        assert!(!error_debug.contains("clawvpn0"));
+        assert!(!error_debug.contains("198.51.100.10"));
+        assert!(!error_debug.contains("198.51.100.11"));
+        assert!(!error_debug.contains("/run/current-system/sw/bin/ip"));
+        assert!(!error_debug.contains("/sbin/ifconfig"));
+        assert!(!error_debug.contains("/sbin/route"));
+
+        match error {
+            ClawVpnInterfaceRouteExecutionError::SetupFailed {
+                setup_error,
+                cleanup_error: None,
+            } => match *setup_error {
+                ClawVpnInterfaceRouteExecutionError::CommandFailed {
+                    phase: ClawVpnInterfaceRouteExecutionPhase::Setup,
+                    command_index: 1,
+                    tool: ClawVpnInterfaceRouteTool::LinuxIp,
+                    status_code: Some(2),
+                } => {}
+                other => panic!("unexpected setup error: {other:?}"),
+            },
+            other => panic!("unexpected error: {other:?}"),
+        }
+
+        assert_eq!(runner.calls.len(), 5);
+        assert_eq!(
+            runner.calls[0].args,
+            plan.setup_commands()[0].args().to_vec()
+        );
+        assert_eq!(
+            runner.calls[1].args,
+            plan.setup_commands()[1].args().to_vec()
+        );
+        assert_eq!(
+            runner.calls[2].args,
+            plan.cleanup_commands()[0].args().to_vec()
+        );
+        assert_eq!(
+            runner.calls[3].args,
+            plan.cleanup_commands()[1].args().to_vec()
+        );
+        assert_eq!(
+            runner.calls[4].args,
+            plan.cleanup_commands()[2].args().to_vec()
+        );
+        assert!(
+            !runner
+                .calls
+                .iter()
+                .any(|call| call.args == plan.setup_commands()[2].args().to_vec())
+        );
+    }
+
+    #[test]
+    fn cleanup_continues_after_cleanup_command_failure() {
+        let plan = linux_plan();
+        let executor = executor();
+        let mut runner = RecordingRouteCommandRunner::with_outcomes(vec![
+            FakeRouteCommandOutcome::SpawnFailure,
+            FakeRouteCommandOutcome::Success,
+            FakeRouteCommandOutcome::ExitFailure(Some(3)),
+        ]);
+
+        let error = executor
+            .cleanup_with_runner(&plan, &mut runner)
+            .unwrap_err();
+
+        match error {
+            ClawVpnInterfaceRouteExecutionError::CommandSpawn {
+                phase: ClawVpnInterfaceRouteExecutionPhase::Cleanup,
+                command_index: 0,
+                tool: ClawVpnInterfaceRouteTool::LinuxIp,
+                ..
+            } => {}
+            other => panic!("unexpected cleanup error: {other:?}"),
+        }
+        assert_eq!(runner.calls.len(), 3);
+        assert_eq!(
+            runner.calls[0].args,
+            plan.cleanup_commands()[0].args().to_vec()
+        );
+        assert_eq!(
+            runner.calls[1].args,
+            plan.cleanup_commands()[1].args().to_vec()
+        );
+        assert_eq!(
+            runner.calls[2].args,
+            plan.cleanup_commands()[2].args().to_vec()
+        );
+    }
+
+    #[test]
+    fn setup_failure_reports_cleanup_failure_after_attempting_cleanup() {
+        let plan = linux_plan();
+        let executor = executor();
+        let mut runner = RecordingRouteCommandRunner::with_outcomes(vec![
+            FakeRouteCommandOutcome::Success,
+            FakeRouteCommandOutcome::ExitFailure(Some(2)),
+            FakeRouteCommandOutcome::SpawnFailure,
+            FakeRouteCommandOutcome::Success,
+            FakeRouteCommandOutcome::Success,
+        ]);
+
+        let error = executor.apply_with_runner(&plan, &mut runner).unwrap_err();
+        let error_debug = format!("{error:?}");
+        assert!(!error_debug.contains("clawvpn0"));
+        assert!(!error_debug.contains("198.51.100.10"));
+        assert!(!error_debug.contains("198.51.100.11"));
+        assert!(!error_debug.contains("/run/current-system/sw/bin/ip"));
+        assert!(!error_debug.contains("/sbin/ifconfig"));
+        assert!(!error_debug.contains("/sbin/route"));
+
+        match error {
+            ClawVpnInterfaceRouteExecutionError::SetupFailed {
+                setup_error,
+                cleanup_error: Some(cleanup_error),
+            } => {
+                match *setup_error {
+                    ClawVpnInterfaceRouteExecutionError::CommandFailed {
+                        phase: ClawVpnInterfaceRouteExecutionPhase::Setup,
+                        command_index: 1,
+                        tool: ClawVpnInterfaceRouteTool::LinuxIp,
+                        status_code: Some(2),
+                    } => {}
+                    other => panic!("unexpected setup error: {other:?}"),
+                }
+                match *cleanup_error {
+                    ClawVpnInterfaceRouteExecutionError::CommandSpawn {
+                        phase: ClawVpnInterfaceRouteExecutionPhase::Cleanup,
+                        command_index: 0,
+                        tool: ClawVpnInterfaceRouteTool::LinuxIp,
+                        ..
+                    } => {}
+                    other => panic!("unexpected cleanup error: {other:?}"),
+                }
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+        assert_eq!(runner.calls.len(), 5);
+        assert_eq!(
+            runner.calls[0].args,
+            plan.setup_commands()[0].args().to_vec()
+        );
+        assert_eq!(
+            runner.calls[1].args,
+            plan.setup_commands()[1].args().to_vec()
+        );
+        assert_eq!(
+            runner.calls[2].args,
+            plan.cleanup_commands()[0].args().to_vec()
+        );
+        assert_eq!(
+            runner.calls[3].args,
+            plan.cleanup_commands()[1].args().to_vec()
+        );
+        assert_eq!(
+            runner.calls[4].args,
+            plan.cleanup_commands()[2].args().to_vec()
+        );
+    }
+
+    #[test]
+    fn macos_plan_assigns_point_to_point_address_and_single_peer_route() {
+        let plan = macos_plan();
 
         assert_eq!(plan.platform(), ClawVpnInterfaceRoutePlatform::Macos);
         assert_eq!(plan.interface_name().as_str(), "utun7");
@@ -596,5 +1415,18 @@ mod tests {
         let name_debug = format!("{:?}", plan.interface_name());
         assert!(name_debug.contains("<redacted>"));
         assert!(!name_debug.contains("clawvpn0"));
+
+        let mut runner =
+            RecordingRouteCommandRunner::with_outcomes(vec![FakeRouteCommandOutcome::SpawnFailure]);
+        let error = executor()
+            .apply_with_runner(&plan, &mut runner)
+            .unwrap_err();
+        let error_debug = format!("{error:?}");
+        assert!(!error_debug.contains("clawvpn0"));
+        assert!(!error_debug.contains("198.51.100.10"));
+        assert!(!error_debug.contains("198.51.100.11"));
+        assert!(!error_debug.contains("/run/current-system/sw/bin/ip"));
+        assert!(!error_debug.contains("/sbin/ifconfig"));
+        assert!(!error_debug.contains("/sbin/route"));
     }
 }
