@@ -6,13 +6,16 @@ interface-to-relay datapath core, a fixed-side agent core wrapper, a guarded
 default-off dev config parser, the exact relay-stream resource gate for future
 `IpTunnel`, the Linux Firecracker guest-kernel TUN prerequisite, a
 Linux-only `/dev/net/tun` open primitive, and a macOS-only `utun` open
-primitive guarded from runtime wiring. There is still no checked-in runtime/bin
-that opens a TUN/utun interface in a product/default path, route
-installation, packet relay runtime, storage-backed session registry, iOS Packet
-Tunnel, or product activation. Runtime/product activation remains default-off by
-construction, and every activation step (deploy, flag flip, shipping) is a
-separate, explicitly owner-authorized decision. The guest-kernel prerequisite
-is different from the inert runtime helpers: it changes the default
+primitive guarded from runtime wiring. The current Phase-1 core also adds a
+fixed-session wrapper that future packet pumps can use so packet forwarding
+does not need a caller-supplied session id per packet. There is still no
+checked-in runtime/bin that opens a TUN/utun interface in a product/default
+path, route installation, packet relay runtime, storage-backed session
+registry, iOS Packet Tunnel, or product activation. Runtime/product activation
+remains default-off by construction, and every activation step (deploy, flag
+flip, shipping) is a separate, explicitly owner-authorized decision. The
+guest-kernel prerequisite is different from the inert runtime helpers: it
+changes the default
 `firecracker-kernel` build artifact used by future Linux installs/builds, so it
 requires Linux/Nix build validation before merge even though it does not
 activate VPN behavior. Nothing in this plan is authorized to run anywhere by
@@ -229,9 +232,12 @@ Access between members/devices and claws is explicitly many-to-many:
   of direction. The next Linux-only slice isolates the `/dev/net/tun` FFI
   boundary and validates interface names; the next macOS-only slice isolates
   the `utun` kernel-control FFI boundary for the Rust dev client/host-side
-  runs. Both remain unwired: no bin, bootstrap, route, relay pump, or flag
-  invokes them. These slices are still not T1 because they create no interface
-  or route in any default/product path. Exit: T1–T4 green on dev hosts.
+  runs. The fixed-session core slice adds a wrapper that binds one active
+  session id before forwarding through that wrapper, avoiding per-packet caller
+  choice of session in the future pump. These slices remain unwired: no bin,
+  bootstrap, route, relay pump, or flag invokes them. They are still not T1
+  because they create no interface or route in any default/product path. Exit:
+  T1–T4 green on dev hosts.
 - **Phase 2 — iOS Packet Tunnel dev build.** Entry: entitlement go/no-go.
   Dev device only. Exit: T5–T7 green (iPhone reaches Claw-A — and only
   Claw-A).

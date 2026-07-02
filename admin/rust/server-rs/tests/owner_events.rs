@@ -3872,6 +3872,7 @@ fn product_a_per_claw_vpn_dev_config_remains_default_off_and_unwired() {
                 || line.contains("SYSPROTO_CONTROL");
             let references_datapath_runtime = line.contains("ClawVpnDatapath")
                 || line.contains("ClawVpnAgentCore")
+                || line.contains("ClawVpnAgentSessionCore")
                 || line.contains("ClawVpnSessionRegistry")
                 || line.contains("ClawVpnSessionId")
                 || line.contains("ClawVpnAuditEvent");
