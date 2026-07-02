@@ -1011,6 +1011,7 @@ async fn dial_relay_stream(
     credential: &GuestCredential,
     now: u64,
 ) -> Result<()> {
+    ensure_relay_stream_client_resource_supported(offer.payload.resource)?;
     let tunnel = connect_relay_stream_transport(offer, guest_key, credential, now).await?;
     let mut tunnel =
         authenticate_open_relay_stream(tunnel, offer, guest_key, credential, now).await?;
@@ -1041,6 +1042,16 @@ async fn dial_relay_stream(
                 );
             }
         }
+        RelayStreamResource::IpTunnel => {
+            unreachable!("IpTunnel is rejected before connecting");
+        }
+    }
+    Ok(())
+}
+
+fn ensure_relay_stream_client_resource_supported(resource: RelayStreamResource) -> Result<()> {
+    if matches!(resource, RelayStreamResource::IpTunnel) {
+        bail!("relay_stream IpTunnel payload is not implemented in this client");
     }
     Ok(())
 }
@@ -1314,6 +1325,7 @@ async fn dial_relay_stream_offer_session(
 ) -> Result<()> {
     use tokio::net::TcpStream;
 
+    ensure_relay_stream_client_resource_supported(offer.payload.resource)?;
     let (host, port) = parse_relay_endpoint(&offer.payload.relay_endpoint)
         .context("parse relay_stream endpoint")?;
     println!(
@@ -1381,6 +1393,9 @@ async fn dial_relay_stream_offer_session(
                     response.len()
                 );
             }
+        }
+        RelayStreamResource::IpTunnel => {
+            unreachable!("IpTunnel is rejected before connecting");
         }
     }
     Ok(())

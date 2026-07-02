@@ -3776,6 +3776,51 @@ fn product_a_transport_source_guard_does_not_become_owner_tier_authority() {
 }
 
 #[test]
+fn product_a_per_claw_vpn_dev_config_remains_default_off_and_unwired() {
+    let server_src_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src");
+    let mut sources = Vec::new();
+    collect_runtime_rust_sources(&server_src_dir, &mut sources);
+    assert!(
+        !sources.is_empty(),
+        "per-Claw VPN source guard must scan real server runtime files"
+    );
+
+    let config_path = server_src_dir.join("claw_vpn_dev_config.rs");
+    let lib_path = server_src_dir.join("lib.rs");
+    assert!(
+        sources.iter().any(|path| path == &config_path),
+        "per-Claw VPN source guard must include server-rs/src/claw_vpn_dev_config.rs"
+    );
+    assert!(
+        sources.iter().any(|path| path == &lib_path),
+        "per-Claw VPN source guard must include server-rs/src/lib.rs"
+    );
+
+    let mut violations = Vec::new();
+    for path in sources {
+        let source = fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("read per-Claw VPN runtime source {}: {e}", path.display()));
+        for (index, line) in source.lines().enumerate() {
+            let module_export = path == lib_path && line.trim() == "pub mod claw_vpn_dev_config;";
+            let in_config_module = path == config_path;
+            let references_dev_config =
+                line.contains("ClawVpnDevConfig") || line.contains("claw_vpn_dev_config");
+            let references_dev_flag = line.contains("THEYOS_CLAW_VPN_");
+            if !in_config_module && !module_export && (references_dev_config || references_dev_flag)
+            {
+                violations.push(format!("{}:{}: {}", path.display(), index + 1, line.trim()));
+            }
+        }
+    }
+
+    assert!(
+        violations.is_empty(),
+        "per-Claw VPN dev config must stay default-off/unwired until the tunnel runtime slice:\n{}",
+        violations.join("\n")
+    );
+}
+
+#[test]
 fn owner_webauthn_registration_status_source_guards_read_only_contract() {
     let source = include_str!("../src/handlers_owner_events.rs");
     let status_classifier = source_segment(

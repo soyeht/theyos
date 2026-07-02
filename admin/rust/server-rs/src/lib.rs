@@ -49,6 +49,7 @@ pub mod claw_share_rendezvous_stream_relay_listener;
 pub mod claw_share_rendezvous_stream_relay_status;
 pub mod claw_store_routes;
 pub mod claw_store_service;
+pub mod claw_vpn_dev_config;
 pub mod cloudflare_admin;
 pub mod cloudflare_api;
 pub mod cloudflared_sync;

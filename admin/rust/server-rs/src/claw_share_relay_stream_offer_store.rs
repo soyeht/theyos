@@ -946,12 +946,19 @@ mod tests {
                 &trust(),
             )
             .unwrap();
+        let ip_tunnel = store
+            .put_minted(
+                mint_input_for(&credential, RelayStreamResource::IpTunnel, 0x45),
+                &owner(),
+                &trust(),
+            )
+            .unwrap();
 
         assert_ne!(
             first.payload.rendezvous_token,
             second.payload.rendezvous_token
         );
-        assert_eq!(store.len(), 2);
+        assert_eq!(store.len(), 3);
         let mut reloaded = RelayStreamOfferStore::load(dir.path(), &trust(), NOW).unwrap();
         let pty = reloaded
             .get_active(&SLOT, RelayStreamResource::Pty, &trust(), NOW)
@@ -961,8 +968,13 @@ mod tests {
             .get_active(&SLOT, RelayStreamResource::ClawSite, &trust(), NOW)
             .unwrap()
             .unwrap();
+        let vpn = reloaded
+            .get_active(&SLOT, RelayStreamResource::IpTunnel, &trust(), NOW)
+            .unwrap()
+            .unwrap();
         assert_eq!(pty, second);
         assert_eq!(site, clawsite);
+        assert_eq!(vpn, ip_tunnel);
     }
 
     #[test]

@@ -74,6 +74,9 @@ where
         match self.offer.payload.resource {
             RelayStreamResource::Pty => self.pty_router.open(target_id).await,
             RelayStreamResource::ClawSite => self.clawsite_router.open(target_id).await,
+            RelayStreamResource::IpTunnel => {
+                Err(target_unavailable("relay-stream-iptunnel-not-configured"))
+            }
         }
     }
 }
@@ -447,6 +450,17 @@ mod tests {
         let response = open_and_roundtrip(&router).await.unwrap();
 
         assert_eq!(response, b"SITE:hello");
+    }
+
+    #[tokio::test]
+    async fn relay_stream_target_router_iptunnel_fails_closed_until_vpn_agent_exists() {
+        let router = router_for(RelayStreamResource::IpTunnel, consumed_slots()).await;
+
+        let error = open_error(&router).await;
+
+        assert!(
+            matches!(error, DataTunnelError::TargetUnavailable(reason) if reason == "relay-stream-iptunnel-not-configured")
+        );
     }
 
     // ── Fase E2: Group + Public dial-path ────────────────────────────────────

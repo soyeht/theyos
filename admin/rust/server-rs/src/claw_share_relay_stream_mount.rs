@@ -81,7 +81,7 @@ const RELAY_STREAM_DEV_ALLOW_PUBLIC_RELAY_DIAL_ENV: &str =
 const RELAY_STREAM_CLAWSITE_BACKEND_ENV: &str = "THEYOS_RELAY_STREAM_CLAWSITE_BACKEND";
 
 /// Env var selecting the resource a provisioned offer is minted for: `pty`
-/// (default) or `clawsite`.
+/// (default), `clawsite`, or reserved `ip_tunnel`.
 const RELAY_STREAM_RESOURCE_ENV: &str = "THEYOS_RELAY_STREAM_RESOURCE";
 
 /// The single source for the relay address (`host:port`). The provisioned offer
@@ -139,16 +139,27 @@ impl ClawTargetRouter for RelayStreamClawSiteRouter {
     }
 }
 
-/// Resource a provisioned offer is minted for. Default `Pty`; `clawsite` (any
-/// case) selects `ClawSite`.
-fn parse_resource(value: Option<&str>) -> RelayStreamResource {
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum RelayStreamResourceEnvError {
+    #[error("invalid THEYOS_RELAY_STREAM_RESOURCE value")]
+    Invalid,
+}
+
+/// Resource a provisioned offer is minted for. Missing value defaults to `Pty`;
+/// recognized values select the matching signed resource. Unknown values fail
+/// closed so a typo never mints a broader/different capability.
+fn parse_resource(value: Option<&str>) -> Result<RelayStreamResource, RelayStreamResourceEnvError> {
     match value.map(str::trim) {
-        Some("clawsite" | "ClawSite" | "CLAWSITE") => RelayStreamResource::ClawSite,
-        _ => RelayStreamResource::Pty,
+        None | Some("" | "pty" | "Pty" | "PTY") => Ok(RelayStreamResource::Pty),
+        Some("clawsite" | "ClawSite" | "CLAWSITE") => Ok(RelayStreamResource::ClawSite),
+        Some("ip_tunnel" | "iptunnel" | "IpTunnel" | "IPTUNNEL") => {
+            Ok(RelayStreamResource::IpTunnel)
+        }
+        Some(_) => Err(RelayStreamResourceEnvError::Invalid),
     }
 }
 
-fn relay_stream_resource_from_env() -> RelayStreamResource {
+fn relay_stream_resource_from_env() -> Result<RelayStreamResource, RelayStreamResourceEnvError> {
     parse_resource(std::env::var(RELAY_STREAM_RESOURCE_ENV).ok().as_deref())
 }
 
@@ -423,7 +434,7 @@ async fn provision_relay_stream_offer_for_claim(
     let offer = provision_relay_stream_offer(
         &mut store,
         credential,
-        relay_stream_resource_from_env(),
+        relay_stream_resource_from_env()?,
         claw_static_pub,
         relay_endpoint,
         credential.expires_at,
@@ -461,7 +472,7 @@ pub async fn provision_group_offer_for_claw(
         member_id,
         member_device_pub,
         claw_id,
-        relay_stream_resource_from_env(),
+        relay_stream_resource_from_env()?,
         claw_static_pub,
         relay_endpoint,
         not_after,
@@ -491,7 +502,7 @@ pub async fn provision_public_offer_for_claw(
         &mut store,
         dialer_device_pub,
         claw_id,
-        relay_stream_resource_from_env(),
+        relay_stream_resource_from_env()?,
         claw_static_pub,
         relay_endpoint,
         not_after,
@@ -515,6 +526,9 @@ pub enum RelayStreamClaimProvisionError {
 
     #[error("relay stream provision error: {0}")]
     Provision(#[from] RelayStreamProvisionError),
+
+    #[error("relay stream resource env error: {0}")]
+    Resource(#[from] RelayStreamResourceEnvError),
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -593,19 +607,30 @@ mod tests {
     fn resource_env_parses_clawsite_else_pty() {
         assert_eq!(
             parse_resource(Some("clawsite")),
-            RelayStreamResource::ClawSite
+            Ok(RelayStreamResource::ClawSite)
         );
         assert_eq!(
             parse_resource(Some(" ClawSite ")),
-            RelayStreamResource::ClawSite
+            Ok(RelayStreamResource::ClawSite)
         );
         assert_eq!(
             parse_resource(Some("CLAWSITE")),
-            RelayStreamResource::ClawSite
+            Ok(RelayStreamResource::ClawSite)
         );
-        assert_eq!(parse_resource(Some("pty")), RelayStreamResource::Pty);
-        assert_eq!(parse_resource(Some("garbage")), RelayStreamResource::Pty);
-        assert_eq!(parse_resource(None), RelayStreamResource::Pty);
+        assert_eq!(
+            parse_resource(Some("ip_tunnel")),
+            Ok(RelayStreamResource::IpTunnel)
+        );
+        assert_eq!(
+            parse_resource(Some("IpTunnel")),
+            Ok(RelayStreamResource::IpTunnel)
+        );
+        assert_eq!(parse_resource(Some("pty")), Ok(RelayStreamResource::Pty));
+        assert_eq!(parse_resource(None), Ok(RelayStreamResource::Pty));
+        assert_eq!(
+            parse_resource(Some("garbage")),
+            Err(RelayStreamResourceEnvError::Invalid)
+        );
     }
 
     #[tokio::test]

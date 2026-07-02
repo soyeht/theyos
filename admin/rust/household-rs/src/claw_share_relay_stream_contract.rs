@@ -31,6 +31,11 @@ pub enum RelayStreamResource {
     Pty,
     #[serde(rename = "clawsite")]
     ClawSite,
+    /// Per-Claw VPN IP-packet stream.
+    ///
+    /// This is a signed contract resource only. Runtime routing intentionally
+    /// stays fail-closed until the Phase-1 TUN/utun agent exists.
+    IpTunnel,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1325,6 +1330,26 @@ mod tests {
 
         assert!(matches!(
             offer.verify(&owner_pub(), NOW),
+            Err(RelayStreamContractError::SignatureRejected)
+        ));
+    }
+
+    #[test]
+    fn rendezvous_stream_relay_contract_ip_tunnel_is_distinct_signed_resource() {
+        let offer = signed_offer_with(|payload| payload.resource = RelayStreamResource::IpTunnel);
+
+        offer.verify(&owner_pub(), NOW).unwrap();
+        assert_eq!(offer.payload.resource, RelayStreamResource::IpTunnel);
+
+        let encoded = offer.to_canonical_bytes().unwrap();
+        let decoded = RelayStreamOfferContract::from_canonical_bytes(&encoded).unwrap();
+        assert_eq!(decoded.payload.resource, RelayStreamResource::IpTunnel);
+        assert_eq!(decoded, offer);
+
+        let mut downgraded = offer;
+        downgraded.payload.resource = RelayStreamResource::Pty;
+        assert!(matches!(
+            downgraded.verify(&owner_pub(), NOW),
             Err(RelayStreamContractError::SignatureRejected)
         ));
     }
