@@ -2,18 +2,18 @@
 
 **Status: plan + early scaffolding.** The first code slices define signed
 contracts, fail-closed placeholders, pure packet/admission/audit helpers, a pure
-interface-to-relay datapath core, a guarded default-off dev config parser, the
-exact relay-stream resource gate for future `IpTunnel`, and the Linux
-Firecracker guest-kernel TUN prerequisite. There is still no TUN/utun interface
-created by theyOS, route installation, packet relay runtime, storage-backed
-session registry, iOS Packet Tunnel, or product activation. Runtime/product
-activation remains default-off by construction, and every activation step
-(deploy, flag flip, shipping) is a separate, explicitly owner-authorized
-decision. The guest-kernel prerequisite is different from the inert runtime
-helpers: it changes the default `firecracker-kernel` build artifact used by
-future Linux installs/builds, so it requires Linux/Nix build validation before
-merge even though it does not activate VPN behavior. Nothing in this plan is
-authorized to run anywhere by virtue of the plan existing.
+interface-to-relay datapath core, a fixed-side agent core wrapper, a guarded
+default-off dev config parser, the exact relay-stream resource gate for future
+`IpTunnel`, and the Linux Firecracker guest-kernel TUN prerequisite. There is
+still no TUN/utun interface created by theyOS, route installation, packet relay
+runtime, storage-backed session registry, iOS Packet Tunnel, or product
+activation. Runtime/product activation remains default-off by construction, and
+every activation step (deploy, flag flip, shipping) is a separate, explicitly
+owner-authorized decision. The guest-kernel prerequisite is different from the
+inert runtime helpers: it changes the default `firecracker-kernel` build
+artifact used by future Linux installs/builds, so it requires Linux/Nix build
+validation before merge even though it does not activate VPN behavior. Nothing
+in this plan is authorized to run anywhere by virtue of the plan existing.
 
 Authored 2026-07-02 by the security-review agent at the owner's request.
 
@@ -219,9 +219,11 @@ Access between members/devices and claws is explicitly many-to-many:
   authorize a future `IpTunnel` packet path and an `IpTunnel` offer cannot
   authorize a stream target. The next prerequisite slice replaces the
   Firecracker guest kernel package with a source build that force-enables
-  `CONFIG_TUN=y`, so future Linux claw agents can open TUN. These slices are
-  still not T1 because they create no interface or route. Exit: T1–T4 green on
-  dev hosts.
+  `CONFIG_TUN=y`, so future Linux claw agents can open TUN. The next agent-core
+  slice fixes the local side (`Device` or `Claw`) at construction before any
+  future interface pump can forward packets, avoiding per-packet caller choice
+  of direction. These slices are still not T1 because they create no interface
+  or route. Exit: T1–T4 green on dev hosts.
 - **Phase 2 — iOS Packet Tunnel dev build.** Entry: entitlement go/no-go.
   Dev device only. Exit: T5–T7 green (iPhone reaches Claw-A — and only
   Claw-A).
