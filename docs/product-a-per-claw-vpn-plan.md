@@ -1,14 +1,19 @@
 # Product A — per-Claw VPN plan (relay_stream → real IP tunnel)
 
-**Status: plan + early inert scaffolding.** The first code slices define signed
+**Status: plan + early scaffolding.** The first code slices define signed
 contracts, fail-closed placeholders, pure packet/admission/audit helpers, a pure
-interface-to-relay datapath core, and a guarded default-off dev config parser,
-but there is still no TUN/utun interface, route installation, packet relay
-runtime, storage-backed session registry, iOS Packet Tunnel, or product
-activation. Everything described here is default-off by construction, and every
-activation step (deploy, flag flip, shipping) is a separate, explicitly
-owner-authorized decision. Nothing in this plan is authorized to run anywhere by
-virtue of the plan existing.
+interface-to-relay datapath core, a guarded default-off dev config parser, the
+exact relay-stream resource gate for future `IpTunnel`, and the Linux
+Firecracker guest-kernel TUN prerequisite. There is still no TUN/utun interface
+created by theyOS, route installation, packet relay runtime, storage-backed
+session registry, iOS Packet Tunnel, or product activation. Runtime/product
+activation remains default-off by construction, and every activation step
+(deploy, flag flip, shipping) is a separate, explicitly owner-authorized
+decision. The guest-kernel prerequisite is different from the inert runtime
+helpers: it changes the default `firecracker-kernel` build artifact used by
+future Linux installs/builds, so it requires Linux/Nix build validation before
+merge even though it does not activate VPN behavior. Nothing in this plan is
+authorized to run anywhere by virtue of the plan existing.
 
 Authored 2026-07-02 by the security-review agent at the owner's request.
 
@@ -80,9 +85,9 @@ N:N across members and claws (§3.6). See non-goals (§7).
 - A userspace agent adjacent to the claw workload owns a tunnel interface:
   Linux `TUN` for claw guests, macOS `utun` for dev bins/host-side runs.
   - Dependency: Linux claw guests need a kernel with `CONFIG_TUN=y`. The
-    from-source kernel recipe exists on the `spike/nvpn-slirp` branch and
-    must land as a Phase-1 prerequisite for VM claws. macOS `utun` has no
-    such gate.
+    Phase-1 kernel prerequisite is landing as a source-built Firecracker kernel
+    package that force-enables built-in TUN support. macOS `utun` has no such
+    gate.
 - The agent bridges TUN ⇄ the authenticated Noise stream, mounted exactly
   like today's claw mount: outbound-only toward Relay-R.
 - Packet policy is **fail-closed DROP by default**:
@@ -197,7 +202,7 @@ Access between members/devices and claws is explicitly many-to-many:
   specific claw; no auto-connect, no wildcard offers, no implicit device
   enrollment.
 
-## 5. Implementation phases (conservative; nothing ships)
+## 5. Implementation phases (conservative; no product activation)
 
 - **Phase 0 — plan + inert scaffolding.** Security co-review of the document
   plus reserved signed resource, pure packet/admission/audit helpers, and a
@@ -212,9 +217,11 @@ Access between members/devices and claws is explicitly many-to-many:
   forwarding; the next inert bridge slice makes the relay-stream target gate
   check the signed resource exactly, so a `Pty`/`ClawSite` offer cannot
   authorize a future `IpTunnel` packet path and an `IpTunnel` offer cannot
-  authorize a stream target. Neither slice is T1 because they create no
-  interface or route. Includes landing the guest-kernel TUN prerequisite for
-  Linux claws. Exit: T1–T4 green on dev hosts.
+  authorize a stream target. The next prerequisite slice replaces the
+  Firecracker guest kernel package with a source build that force-enables
+  `CONFIG_TUN=y`, so future Linux claw agents can open TUN. These slices are
+  still not T1 because they create no interface or route. Exit: T1–T4 green on
+  dev hosts.
 - **Phase 2 — iOS Packet Tunnel dev build.** Entry: entitlement go/no-go.
   Dev device only. Exit: T5–T7 green (iPhone reaches Claw-A — and only
   Claw-A).
@@ -272,8 +279,9 @@ claw and a Linux claw.
 
 - Apple packet-tunnel entitlement (Phase-2 entry gate; approval delay is the
   risk — mitigated by the all-Rust Phase 1).
-- Linux guest kernel `CONFIG_TUN=y` (land the `spike/nvpn-slirp` kernel
-  recipe) for VM claws.
+- Linux guest kernel `CONFIG_TUN=y` for VM claws; the package is source-built
+  from the Firecracker CI config and force-enables TUN as a Phase-1
+  prerequisite.
 - TCP-over-TCP performance under loss (accepted for v1; measured in Phase 5).
 - Address-range collision with user networks (constraint-driven choice, §3.5).
 - iOS NE lifecycle quirks (background termination/restart) — covered by T18.

@@ -81,6 +81,84 @@ fn guest_net_declares_one_firecracker_guest_mac_constant() {
     assert!(!content.contains("FIRECRACKER_IMAGEBUILD_GUEST_MAC"));
 }
 
+#[test]
+fn firecracker_kernel_package_keeps_tun_prerequisite_load_bearing() {
+    let rust_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("core-rs has a workspace parent");
+    let repo_root = rust_root
+        .parent()
+        .and_then(Path::parent)
+        .expect("rust workspace has a repo parent");
+    let kernel_nix = fs::read_to_string(repo_root.join("nix/packages/kernel.nix"))
+        .expect("read firecracker kernel package");
+    let module_nix =
+        fs::read_to_string(repo_root.join("nix/module.nix")).expect("read theyOS NixOS module");
+    let kernel_config =
+        fs::read_to_string(repo_root.join("nix/packages/firecracker-kernel-x86_64.config"))
+            .expect("read firecracker kernel config");
+
+    assert!(
+        kernel_nix.contains("kernelVersion = \"6.1.155\";"),
+        "kernel package must stay pinned to the Firecracker guest kernel version theyOS expects"
+    );
+    assert!(
+        kernel_nix.contains("linux-${kernelVersion}.tar.xz"),
+        "per-Claw VPN Linux guests need a source-built kernel, not the old prebuilt kernel"
+    );
+    assert!(
+        kernel_nix
+            .contains("https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-${kernelVersion}.tar.xz"),
+        "kernel package must fetch the pinned mainline kernel source from kernel.org"
+    );
+    assert!(
+        kernel_config.contains("Linux/x86 6.1.155 Kernel Configuration"),
+        "kernel config must stay aligned with the mainline 6.1.155 Firecracker CI config"
+    );
+    assert!(
+        kernel_config.contains("\nCONFIG_TUN=y\n"),
+        "checked-in kernel config must keep CONFIG_TUN built in"
+    );
+    assert!(
+        kernel_config.contains("\nCONFIG_TUN_VNET_CROSS_LE=y\n"),
+        "checked-in kernel config must keep CONFIG_TUN_VNET_CROSS_LE built in"
+    );
+    assert!(
+        kernel_config.contains("\n# CONFIG_KEXEC is not set\n")
+            && kernel_config.contains("\n# CONFIG_KEXEC_FILE is not set\n")
+            && kernel_config.contains("\n# CONFIG_KEXEC_CORE is not set\n")
+            && kernel_config.contains("\n# CONFIG_ARCH_HAS_KEXEC_PURGATORY is not set\n"),
+        "checked-in kernel config must keep unused kexec/purgatory disabled for the Nix source build"
+    );
+    assert!(
+        kernel_nix.contains("for opt in TUN TUN_VNET_CROSS_LE"),
+        "kernel package must force-enable both TUN options"
+    );
+    assert!(
+        kernel_nix.contains("grep -q '^CONFIG_TUN=y'"),
+        "kernel package must fail closed if CONFIG_TUN is not built in"
+    );
+    assert!(
+        kernel_nix.contains("grep -q '^CONFIG_TUN_VNET_CROSS_LE=y'"),
+        "kernel package must fail closed if CONFIG_TUN_VNET_CROSS_LE is not built in"
+    );
+    assert!(
+        kernel_nix.contains("for opt in KEXEC KEXEC_FILE KEXEC_CORE ARCH_HAS_KEXEC_PURGATORY")
+            && kernel_nix.contains("grep -q \"^CONFIG_$opt=y\""),
+        "kernel package must fail closed if olddefconfig enables unused kexec/purgatory"
+    );
+    assert!(
+        kernel_nix.contains("cp vmlinux \"$out\""),
+        "kernel package must remain a vmlinux file because nix/module.nix symlinks kernelPackage directly"
+    );
+    assert!(
+        module_nix.contains(
+            "ln -sf ${cfg.kernelPackage} /home/${cfg.user}/firecracker/assets/vmlinux-6.1.155"
+        ),
+        "nix/module.nix must keep symlinking kernelPackage directly, which is why the kernel package output is a file"
+    );
+}
+
 fn collect_rust_files(dir: &Path, out: &mut Vec<PathBuf>) {
     let entries = fs::read_dir(dir).expect("read source directory");
     for entry in entries {
