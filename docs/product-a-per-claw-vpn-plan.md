@@ -15,10 +15,13 @@ rejects host/platform mismatches before running commands, and suppresses child
 process stdio/environment. The next Phase-1 core adds a single-step packet pump
 that binds abstract interface/relay traits to the fixed-session core, so future
 runtime loops can forward only policy-validated packets without choosing side or
-session per packet.
+session per packet. The following lifecycle slice keeps that pump abstract and
+unwired, but adds a bounded driver loop that executes caller-selected pump
+directions, records forwarding/drop counters, stops on I/O errors, and never
+embeds packet/frame material in Debug output.
 There is still no
 checked-in runtime/bin that opens a TUN/utun interface in a product/default
-path, caller that invokes the route executor or packet pump, route
+path, caller that invokes the route executor, packet pump, or packet-pump loop, route
 installation, packet relay runtime, storage-backed session registry, iOS Packet
 Tunnel, or product activation. Runtime/product activation remains default-off by
 construction, and every activation step (deploy, flag flip, shipping) is a
@@ -251,10 +254,14 @@ Access between members/devices and claws is explicitly many-to-many:
   cleanup if setup fails. The packet-pump-core slice adds one-step
   interface-to-relay and relay-to-interface forwarding over abstract traits,
   dropping invalid/control/spoofed packets before they can cross the interface
-  or relay boundary. These slices remain unwired: no bin, bootstrap, route,
-  relay pump loop, or flag invokes the executor or packet pump. They are still
+  or relay boundary. The packet-pump-loop slice adds only an in-module,
+  bounded loop driver over the same abstract traits: a future runtime can
+  supply readiness/direction decisions, but the loop stops on I/O errors and
+  enforces a step budget so it cannot become an unbounded task by itself. These
+  slices remain unwired: no bin, bootstrap, route, live relay pump runtime, or
+  flag invokes the executor, packet pump, or packet-pump loop. They are still
   not T1 because they create no interface or route in any default/product path
-  and do not run a live relay pump.
+  and do not run a live relay pump against OS interfaces or relay sockets.
   Exit: T1–T4 green on dev hosts.
 - **Phase 2 — iOS Packet Tunnel dev build.** Entry: entitlement go/no-go.
   Dev device only. Exit: T5–T7 green (iPhone reaches Claw-A — and only

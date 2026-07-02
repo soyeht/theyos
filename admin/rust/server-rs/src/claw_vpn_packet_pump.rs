@@ -3,7 +3,8 @@
 //! This module deliberately does not open TUN/utun interfaces, install routes,
 //! dial relays, spawn tasks, or wire itself into bootstrap. It only connects the
 //! already fixed-side/fixed-session packet policy core to abstract interface and
-//! relay traits so a future runtime can reuse one fail-closed forwarding shape.
+//! relay traits so a future runtime can reuse one fail-closed forwarding shape
+//! and one bounded lifecycle driver.
 
 use std::fmt;
 use std::io;
@@ -100,6 +101,160 @@ impl fmt::Debug for ClawVpnPacketPumpError {
                 .field("source", &"<redacted>")
                 .finish(),
         }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ClawVpnPacketPumpLoopControl {
+    Pump(ClawVpnPacketPumpDirection),
+    Stop,
+}
+
+pub trait ClawVpnPacketPumpLoopDriver {
+    fn next_step(&mut self, stats: ClawVpnPacketPumpLoopStats) -> ClawVpnPacketPumpLoopControl;
+}
+
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+pub struct ClawVpnPacketPumpLoopStats {
+    interface_to_relay_forwarded: usize,
+    interface_to_relay_dropped: usize,
+    relay_to_interface_forwarded: usize,
+    relay_to_interface_dropped: usize,
+}
+
+impl fmt::Debug for ClawVpnPacketPumpLoopStats {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ClawVpnPacketPumpLoopStats")
+            .field(
+                "interface_to_relay_forwarded",
+                &self.interface_to_relay_forwarded,
+            )
+            .field(
+                "interface_to_relay_dropped",
+                &self.interface_to_relay_dropped,
+            )
+            .field(
+                "relay_to_interface_forwarded",
+                &self.relay_to_interface_forwarded,
+            )
+            .field(
+                "relay_to_interface_dropped",
+                &self.relay_to_interface_dropped,
+            )
+            .field("total_steps", &self.total_steps())
+            .finish()
+    }
+}
+
+impl ClawVpnPacketPumpLoopStats {
+    #[must_use]
+    pub fn interface_to_relay_forwarded(&self) -> usize {
+        self.interface_to_relay_forwarded
+    }
+
+    #[must_use]
+    pub fn interface_to_relay_dropped(&self) -> usize {
+        self.interface_to_relay_dropped
+    }
+
+    #[must_use]
+    pub fn relay_to_interface_forwarded(&self) -> usize {
+        self.relay_to_interface_forwarded
+    }
+
+    #[must_use]
+    pub fn relay_to_interface_dropped(&self) -> usize {
+        self.relay_to_interface_dropped
+    }
+
+    #[must_use]
+    pub fn total_steps(&self) -> usize {
+        self.interface_to_relay_forwarded
+            + self.interface_to_relay_dropped
+            + self.relay_to_interface_forwarded
+            + self.relay_to_interface_dropped
+    }
+
+    fn record(&mut self, outcome: &ClawVpnPacketPumpOutcome) {
+        match outcome {
+            ClawVpnPacketPumpOutcome::Forwarded {
+                direction: ClawVpnPacketPumpDirection::InterfaceToRelay,
+                ..
+            } => {
+                self.interface_to_relay_forwarded += 1;
+            }
+            ClawVpnPacketPumpOutcome::Dropped {
+                direction: ClawVpnPacketPumpDirection::InterfaceToRelay,
+                ..
+            } => {
+                self.interface_to_relay_dropped += 1;
+            }
+            ClawVpnPacketPumpOutcome::Forwarded {
+                direction: ClawVpnPacketPumpDirection::RelayToInterface,
+                ..
+            } => {
+                self.relay_to_interface_forwarded += 1;
+            }
+            ClawVpnPacketPumpOutcome::Dropped {
+                direction: ClawVpnPacketPumpDirection::RelayToInterface,
+                ..
+            } => {
+                self.relay_to_interface_dropped += 1;
+            }
+        }
+    }
+}
+
+pub enum ClawVpnPacketPumpLoopStopReason {
+    DriverStopped,
+    StepBudgetExhausted,
+    IoError {
+        direction: ClawVpnPacketPumpDirection,
+        error: ClawVpnPacketPumpError,
+    },
+}
+
+impl fmt::Debug for ClawVpnPacketPumpLoopStopReason {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::DriverStopped => f
+                .debug_struct("ClawVpnPacketPumpLoopStopReason::DriverStopped")
+                .finish(),
+            Self::StepBudgetExhausted => f
+                .debug_struct("ClawVpnPacketPumpLoopStopReason::StepBudgetExhausted")
+                .finish(),
+            Self::IoError { direction, error } => f
+                .debug_struct("ClawVpnPacketPumpLoopStopReason::IoError")
+                .field("direction", direction)
+                .field("error", error)
+                .finish(),
+        }
+    }
+}
+
+pub struct ClawVpnPacketPumpLoopReport {
+    stats: ClawVpnPacketPumpLoopStats,
+    stop_reason: ClawVpnPacketPumpLoopStopReason,
+}
+
+impl fmt::Debug for ClawVpnPacketPumpLoopReport {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ClawVpnPacketPumpLoopReport")
+            .field("stats", &self.stats)
+            .field("stop_reason", &self.stop_reason)
+            .finish()
+    }
+}
+
+impl ClawVpnPacketPumpLoopReport {
+    #[must_use]
+    pub fn stats(&self) -> ClawVpnPacketPumpLoopStats {
+        self.stats
+    }
+
+    #[must_use]
+    pub fn stop_reason(&self) -> &ClawVpnPacketPumpLoopStopReason {
+        &self.stop_reason
     }
 }
 
@@ -201,6 +356,50 @@ impl ClawVpnPacketPump {
             byte_count,
         })
     }
+
+    pub fn pump_with_driver_until_stopped(
+        &mut self,
+        interface: &mut impl ClawVpnPacketInterface,
+        relay: &mut impl ClawVpnPacketRelay,
+        driver: &mut impl ClawVpnPacketPumpLoopDriver,
+        max_steps: usize,
+    ) -> ClawVpnPacketPumpLoopReport {
+        let mut stats = ClawVpnPacketPumpLoopStats::default();
+        loop {
+            if stats.total_steps() >= max_steps {
+                return ClawVpnPacketPumpLoopReport {
+                    stats,
+                    stop_reason: ClawVpnPacketPumpLoopStopReason::StepBudgetExhausted,
+                };
+            }
+            let direction = match driver.next_step(stats) {
+                ClawVpnPacketPumpLoopControl::Stop => {
+                    return ClawVpnPacketPumpLoopReport {
+                        stats,
+                        stop_reason: ClawVpnPacketPumpLoopStopReason::DriverStopped,
+                    };
+                }
+                ClawVpnPacketPumpLoopControl::Pump(direction) => direction,
+            };
+            let outcome = match direction {
+                ClawVpnPacketPumpDirection::InterfaceToRelay => {
+                    self.pump_interface_to_relay_once(interface, relay)
+                }
+                ClawVpnPacketPumpDirection::RelayToInterface => {
+                    self.pump_relay_to_interface_once(relay, interface)
+                }
+            };
+            match outcome {
+                Ok(outcome) => stats.record(&outcome),
+                Err(error) => {
+                    return ClawVpnPacketPumpLoopReport {
+                        stats,
+                        stop_reason: ClawVpnPacketPumpLoopStopReason::IoError { direction, error },
+                    };
+                }
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -293,6 +492,29 @@ mod tests {
             }
             self.sent_frames.push(frame);
             Ok(())
+        }
+    }
+
+    struct ScriptedLoopDriver {
+        controls: VecDeque<ClawVpnPacketPumpLoopControl>,
+        observed_stats: Vec<ClawVpnPacketPumpLoopStats>,
+    }
+
+    impl ScriptedLoopDriver {
+        fn new(controls: Vec<ClawVpnPacketPumpLoopControl>) -> Self {
+            Self {
+                controls: VecDeque::from(controls),
+                observed_stats: Vec::new(),
+            }
+        }
+    }
+
+    impl ClawVpnPacketPumpLoopDriver for ScriptedLoopDriver {
+        fn next_step(&mut self, stats: ClawVpnPacketPumpLoopStats) -> ClawVpnPacketPumpLoopControl {
+            self.observed_stats.push(stats);
+            self.controls
+                .pop_front()
+                .unwrap_or(ClawVpnPacketPumpLoopControl::Stop)
         }
     }
 
@@ -536,5 +758,141 @@ mod tests {
         assert!(!debug.contains(&addrs.device().to_string()));
         assert!(!debug.contains(&addrs.claw().to_string()));
         assert!(debug.contains("FrameAccepted"));
+    }
+
+    #[test]
+    fn packet_pump_loop_runs_scripted_directions_and_counts_forwarding() {
+        let (mut pump, addrs) = pump_with_addrs();
+        let local_packet = packet(addrs.device(), addrs.claw());
+        let relay_packet = packet(addrs.claw(), addrs.device());
+        let mut interface = FakeInterface::with_read(local_packet.clone());
+        let mut relay = FakeRelay::with_recv(TunnelFrame::Data(relay_packet.clone()));
+        let mut driver = ScriptedLoopDriver::new(vec![
+            ClawVpnPacketPumpLoopControl::Pump(ClawVpnPacketPumpDirection::InterfaceToRelay),
+            ClawVpnPacketPumpLoopControl::Pump(ClawVpnPacketPumpDirection::RelayToInterface),
+            ClawVpnPacketPumpLoopControl::Stop,
+        ]);
+
+        let report =
+            pump.pump_with_driver_until_stopped(&mut interface, &mut relay, &mut driver, 8);
+
+        assert!(matches!(
+            report.stop_reason(),
+            ClawVpnPacketPumpLoopStopReason::DriverStopped
+        ));
+        assert_eq!(report.stats().interface_to_relay_forwarded(), 1);
+        assert_eq!(report.stats().relay_to_interface_forwarded(), 1);
+        assert_eq!(report.stats().total_steps(), 2);
+        assert_eq!(relay.sent_frames, vec![TunnelFrame::Data(local_packet)]);
+        assert_eq!(interface.writes, vec![relay_packet]);
+        assert_eq!(driver.observed_stats.len(), 3);
+        assert_eq!(driver.observed_stats[0].total_steps(), 0);
+        assert_eq!(driver.observed_stats[1].interface_to_relay_forwarded(), 1);
+        assert_eq!(driver.observed_stats[1].total_steps(), 1);
+        assert_eq!(driver.observed_stats[2].relay_to_interface_forwarded(), 1);
+        assert_eq!(driver.observed_stats[2].total_steps(), 2);
+    }
+
+    #[test]
+    fn packet_pump_loop_continues_after_policy_drops_without_crossing_boundaries() {
+        let (mut pump, addrs) = pump_with_addrs();
+        let spoofed = packet(addrs.claw(), addrs.device());
+        let mut interface = FakeInterface::with_read(spoofed);
+        let mut relay = FakeRelay::with_recv(TunnelFrame::Close);
+        let mut driver = ScriptedLoopDriver::new(vec![
+            ClawVpnPacketPumpLoopControl::Pump(ClawVpnPacketPumpDirection::InterfaceToRelay),
+            ClawVpnPacketPumpLoopControl::Pump(ClawVpnPacketPumpDirection::RelayToInterface),
+            ClawVpnPacketPumpLoopControl::Stop,
+        ]);
+
+        let report =
+            pump.pump_with_driver_until_stopped(&mut interface, &mut relay, &mut driver, 8);
+
+        assert!(matches!(
+            report.stop_reason(),
+            ClawVpnPacketPumpLoopStopReason::DriverStopped
+        ));
+        assert_eq!(report.stats().interface_to_relay_dropped(), 1);
+        assert_eq!(report.stats().relay_to_interface_dropped(), 1);
+        assert_eq!(report.stats().total_steps(), 2);
+        assert!(relay.sent_frames.is_empty());
+        assert!(interface.writes.is_empty());
+    }
+
+    #[test]
+    fn packet_pump_loop_stops_on_io_error_without_running_later_steps() {
+        let (mut pump, addrs) = pump_with_addrs();
+        let local_packet = packet(addrs.device(), addrs.claw());
+        let mut interface = FakeInterface::with_read(local_packet.clone());
+        let mut relay = FakeRelay {
+            recv_frames: VecDeque::new(),
+            sent_frames: Vec::new(),
+            recv_error: Some(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "/tmp/private-packet-relay",
+            )),
+            send_error: None,
+        };
+        let mut driver = ScriptedLoopDriver::new(vec![
+            ClawVpnPacketPumpLoopControl::Pump(ClawVpnPacketPumpDirection::InterfaceToRelay),
+            ClawVpnPacketPumpLoopControl::Pump(ClawVpnPacketPumpDirection::RelayToInterface),
+            ClawVpnPacketPumpLoopControl::Pump(ClawVpnPacketPumpDirection::InterfaceToRelay),
+        ]);
+
+        let report =
+            pump.pump_with_driver_until_stopped(&mut interface, &mut relay, &mut driver, 8);
+        let debug = format!("{report:?}");
+
+        assert!(matches!(
+            report.stop_reason(),
+            ClawVpnPacketPumpLoopStopReason::IoError {
+                direction: ClawVpnPacketPumpDirection::RelayToInterface,
+                ..
+            }
+        ));
+        assert_eq!(report.stats().interface_to_relay_forwarded(), 1);
+        assert_eq!(report.stats().relay_to_interface_forwarded(), 0);
+        assert_eq!(report.stats().relay_to_interface_dropped(), 0);
+        assert_eq!(report.stats().total_steps(), 1);
+        assert_eq!(relay.sent_frames, vec![TunnelFrame::Data(local_packet)]);
+        assert!(interface.writes.is_empty());
+        assert_eq!(driver.observed_stats.len(), 2);
+        assert_eq!(driver.observed_stats[0].total_steps(), 0);
+        assert_eq!(driver.observed_stats[1].interface_to_relay_forwarded(), 1);
+        assert_eq!(driver.observed_stats[1].total_steps(), 1);
+        assert!(debug.contains("<redacted>"));
+        assert!(!debug.contains("/tmp/private-packet-relay"));
+        assert!(!debug.contains(&addrs.device().to_string()));
+        assert!(!debug.contains(&addrs.claw().to_string()));
+    }
+
+    #[test]
+    fn packet_pump_loop_step_budget_exhaustion_stops_before_next_driver_step() {
+        let (mut pump, addrs) = pump_with_addrs();
+        let local_packet = packet(addrs.device(), addrs.claw());
+        let relay_packet = packet(addrs.claw(), addrs.device());
+        let mut interface = FakeInterface::with_read(local_packet);
+        let mut relay = FakeRelay::with_recv(TunnelFrame::Data(relay_packet));
+        let mut driver = ScriptedLoopDriver::new(vec![
+            ClawVpnPacketPumpLoopControl::Pump(ClawVpnPacketPumpDirection::InterfaceToRelay),
+            ClawVpnPacketPumpLoopControl::Pump(ClawVpnPacketPumpDirection::RelayToInterface),
+        ]);
+
+        let report =
+            pump.pump_with_driver_until_stopped(&mut interface, &mut relay, &mut driver, 1);
+
+        assert!(matches!(
+            report.stop_reason(),
+            ClawVpnPacketPumpLoopStopReason::StepBudgetExhausted
+        ));
+        assert_eq!(report.stats().interface_to_relay_forwarded(), 1);
+        assert_eq!(report.stats().relay_to_interface_forwarded(), 0);
+        assert!(interface.writes.is_empty());
+        assert_eq!(
+            driver.observed_stats.len(),
+            1,
+            "step budget must stop before asking the driver for another step"
+        );
+        assert_eq!(driver.observed_stats[0].total_steps(), 0);
     }
 }
