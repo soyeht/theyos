@@ -763,6 +763,20 @@ impl ClawVpnSessionRegistry {
             .map_err(Into::into)
     }
 
+    pub fn validate_ipv4_packet_for_session(
+        &self,
+        session_id: ClawVpnSessionId,
+        direction: ClawVpnPacketDirection,
+        packet: &[u8],
+    ) -> Result<ClawVpnValidatedPacket, ClawVpnSessionFrameError> {
+        let session = self
+            .sessions
+            .get(&session_id)
+            .ok_or(ClawVpnSessionFrameError::UnknownSession)?;
+        ClawVpnValidatedPacket::try_from_ipv4_packet(&session.packet_policy(), direction, packet)
+            .map_err(Into::into)
+    }
+
     pub fn validate_tunnel_frame_for_session_with_audit(
         &self,
         session_id: ClawVpnSessionId,
@@ -777,18 +791,33 @@ impl ClawVpnSessionRegistry {
             .get(&session_id)
             .map(|session| ClawVpnAuditSubject::from_acl_key(session.acl_key()));
         let result = self.validate_tunnel_frame_for_session(session_id, direction, frame);
-        let (reason, byte_count) = match &result {
-            Ok(packet) => (
-                ClawVpnAuditReason::FrameAccepted,
-                Some(packet.as_bytes().len()),
-            ),
-            Err(ClawVpnSessionFrameError::UnknownSession) => {
-                (ClawVpnAuditReason::UnknownSession, None)
-            }
-            Err(ClawVpnSessionFrameError::Packet(error)) => {
-                (audit_reason_from_validated_packet_error(*error), None)
-            }
-        };
+        let (reason, byte_count) = audit_frame_validation_result(&result);
+        let event = ClawVpnAuditEvent::new(
+            subject,
+            ClawVpnAuditAction::FrameValidate,
+            reason,
+            Some(session_id),
+            byte_count,
+            None,
+        );
+        (result, event)
+    }
+
+    pub fn validate_ipv4_packet_for_session_with_audit(
+        &self,
+        session_id: ClawVpnSessionId,
+        direction: ClawVpnPacketDirection,
+        packet: &[u8],
+    ) -> (
+        Result<ClawVpnValidatedPacket, ClawVpnSessionFrameError>,
+        ClawVpnAuditEvent,
+    ) {
+        let subject = self
+            .sessions
+            .get(&session_id)
+            .map(|session| ClawVpnAuditSubject::from_acl_key(session.acl_key()));
+        let result = self.validate_ipv4_packet_for_session(session_id, direction, packet);
+        let (reason, byte_count) = audit_frame_validation_result(&result);
         let event = ClawVpnAuditEvent::new(
             subject,
             ClawVpnAuditAction::FrameValidate,
@@ -812,6 +841,130 @@ impl ClawVpnSessionRegistry {
             .values()
             .filter(|session| session.acl_key().claw_id() == claw_id)
             .count()
+    }
+}
+
+/// Which side of one point-to-point per-Claw VPN session owns the local
+/// interface that is feeding or receiving packets.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClawVpnDatapathSide {
+    Device,
+    Claw,
+}
+
+impl ClawVpnDatapathSide {
+    #[must_use]
+    pub fn local_to_relay_direction(self) -> ClawVpnPacketDirection {
+        match self {
+            Self::Device => ClawVpnPacketDirection::DeviceToClaw,
+            Self::Claw => ClawVpnPacketDirection::ClawToDevice,
+        }
+    }
+
+    #[must_use]
+    pub fn relay_to_local_direction(self) -> ClawVpnPacketDirection {
+        match self {
+            Self::Device => ClawVpnPacketDirection::ClawToDevice,
+            Self::Claw => ClawVpnPacketDirection::DeviceToClaw,
+        }
+    }
+}
+
+/// Pure packet datapath core for the future TUN/utun agent.
+///
+/// This owns the session registry so close/revoke decisions are the single
+/// authority for packet forwarding. It still does not create interfaces, install
+/// routes, open relay sessions, spawn tasks, or persist state.
+#[derive(PartialEq, Eq)]
+pub struct ClawVpnDatapath {
+    registry: ClawVpnSessionRegistry,
+}
+
+impl fmt::Debug for ClawVpnDatapath {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ClawVpnDatapath")
+            .field("registry", &self.registry)
+            .finish()
+    }
+}
+
+impl ClawVpnDatapath {
+    #[must_use]
+    pub fn new(registry: ClawVpnSessionRegistry) -> Self {
+        Self { registry }
+    }
+
+    #[must_use]
+    pub fn registry(&self) -> &ClawVpnSessionRegistry {
+        &self.registry
+    }
+
+    pub fn open_with_audit(
+        &mut self,
+        key: &ClawVpnAclKey,
+    ) -> (
+        Result<ClawVpnSession, ClawVpnSessionRegistryError>,
+        ClawVpnAuditEvent,
+    ) {
+        self.registry.open_with_audit(key)
+    }
+
+    pub fn close_with_audit(
+        &mut self,
+        session_id: ClawVpnSessionId,
+    ) -> (Option<ClawVpnSession>, ClawVpnAuditEvent) {
+        self.registry.close_with_audit(session_id)
+    }
+
+    pub fn revoke_with_audit(
+        &mut self,
+        key: &ClawVpnAclKey,
+    ) -> (ClawVpnAclRevocation, ClawVpnAuditEvent) {
+        self.registry.revoke_with_audit(key)
+    }
+
+    /// Validate a packet read from the local TUN/utun side before putting it on
+    /// the relay stream. A packet that does not match the session's exact
+    /// src/dst pair is rejected before any frame is emitted.
+    pub fn packet_from_local_interface_with_audit(
+        &self,
+        session_id: ClawVpnSessionId,
+        local_side: ClawVpnDatapathSide,
+        packet: &[u8],
+    ) -> (
+        Result<TunnelFrame, ClawVpnSessionFrameError>,
+        ClawVpnAuditEvent,
+    ) {
+        let (result, event) = self.registry.validate_ipv4_packet_for_session_with_audit(
+            session_id,
+            local_side.local_to_relay_direction(),
+            packet,
+        );
+        (result.map(ClawVpnValidatedPacket::into_tunnel_frame), event)
+    }
+
+    /// Validate a relay frame before writing the packet to the local TUN/utun
+    /// side. Control frames or spoofed IP packets are rejected before a future
+    /// runtime can hand bytes to the OS interface.
+    pub fn packet_from_relay_with_audit(
+        &self,
+        session_id: ClawVpnSessionId,
+        local_side: ClawVpnDatapathSide,
+        frame: TunnelFrame,
+    ) -> (
+        Result<ClawVpnValidatedPacket, ClawVpnSessionFrameError>,
+        ClawVpnAuditEvent,
+    ) {
+        self.registry.validate_tunnel_frame_for_session_with_audit(
+            session_id,
+            local_side.relay_to_local_direction(),
+            frame,
+        )
+    }
+
+    #[must_use]
+    pub fn into_registry(self) -> ClawVpnSessionRegistry {
+        self.registry
     }
 }
 
@@ -1104,6 +1257,21 @@ fn audit_reason_from_validated_packet_error(
             ClawVpnAuditReason::UnexpectedTunnelFrame
         }
         ClawVpnValidatedPacketError::Policy(_) => ClawVpnAuditReason::PacketPolicyRejected,
+    }
+}
+
+fn audit_frame_validation_result(
+    result: &Result<ClawVpnValidatedPacket, ClawVpnSessionFrameError>,
+) -> (ClawVpnAuditReason, Option<usize>) {
+    match result {
+        Ok(packet) => (
+            ClawVpnAuditReason::FrameAccepted,
+            Some(packet.as_bytes().len()),
+        ),
+        Err(ClawVpnSessionFrameError::UnknownSession) => (ClawVpnAuditReason::UnknownSession, None),
+        Err(ClawVpnSessionFrameError::Packet(error)) => {
+            (audit_reason_from_validated_packet_error(*error), None)
+        }
     }
 }
 
@@ -1732,6 +1900,213 @@ mod tests {
     }
 
     #[test]
+    fn datapath_maps_local_sides_to_authorized_relay_directions() {
+        let device_m1 = P256Keypair::generate();
+        let m1_claw_a = acl_key("member-m1", &device_m1, "claw-a");
+        let mut datapath =
+            ClawVpnDatapath::new(registry_with_grants(std::slice::from_ref(&m1_claw_a)));
+        let (opened, open_event) = datapath.open_with_audit(&m1_claw_a);
+        let session = opened.unwrap();
+        let addrs = session.addrs();
+        assert_eq!(open_event.reason(), ClawVpnAuditReason::SessionOpened);
+
+        let device_packet = packet(addrs.device(), addrs.claw());
+        let (device_frame, device_event) = datapath.packet_from_local_interface_with_audit(
+            session.id(),
+            ClawVpnDatapathSide::Device,
+            &device_packet,
+        );
+        assert_eq!(device_frame, Ok(TunnelFrame::Data(device_packet.clone())));
+        assert_eq!(device_event.reason(), ClawVpnAuditReason::FrameAccepted);
+
+        let (claw_local, claw_local_event) = datapath.packet_from_relay_with_audit(
+            session.id(),
+            ClawVpnDatapathSide::Claw,
+            TunnelFrame::Data(device_packet.clone()),
+        );
+        assert_eq!(claw_local.unwrap().as_bytes(), device_packet.as_slice());
+        assert_eq!(claw_local_event.reason(), ClawVpnAuditReason::FrameAccepted);
+
+        let claw_packet = packet(addrs.claw(), addrs.device());
+        let (claw_frame, claw_event) = datapath.packet_from_local_interface_with_audit(
+            session.id(),
+            ClawVpnDatapathSide::Claw,
+            &claw_packet,
+        );
+        assert_eq!(claw_frame, Ok(TunnelFrame::Data(claw_packet.clone())));
+        assert_eq!(claw_event.reason(), ClawVpnAuditReason::FrameAccepted);
+
+        let (device_local, device_local_event) = datapath.packet_from_relay_with_audit(
+            session.id(),
+            ClawVpnDatapathSide::Device,
+            TunnelFrame::Data(claw_packet.clone()),
+        );
+        assert_eq!(device_local.unwrap().as_bytes(), claw_packet.as_slice());
+        assert_eq!(
+            device_local_event.reason(),
+            ClawVpnAuditReason::FrameAccepted
+        );
+    }
+
+    #[test]
+    fn datapath_rejects_direction_swaps_control_frames_and_closed_sessions() {
+        let device_m1 = P256Keypair::generate();
+        let m1_claw_a = acl_key("member-m1", &device_m1, "claw-a");
+        let mut datapath =
+            ClawVpnDatapath::new(registry_with_grants(std::slice::from_ref(&m1_claw_a)));
+        let (opened, _) = datapath.open_with_audit(&m1_claw_a);
+        let session = opened.unwrap();
+        let addrs = session.addrs();
+
+        let wrong_direction = packet(addrs.claw(), addrs.device());
+        let (spoofed, spoofed_event) = datapath.packet_from_local_interface_with_audit(
+            session.id(),
+            ClawVpnDatapathSide::Device,
+            &wrong_direction,
+        );
+        assert_eq!(
+            spoofed,
+            Err(ClawVpnSessionFrameError::Packet(
+                ClawVpnValidatedPacketError::Policy(ClawVpnPacketPolicyError::SourceMismatch)
+            ))
+        );
+        assert_eq!(
+            spoofed_event.reason(),
+            ClawVpnAuditReason::PacketPolicyRejected
+        );
+
+        let oversized_packet = vec![0u8; CLAW_VPN_V1_INNER_MTU + 1];
+        let (oversized, oversized_event) = datapath.packet_from_local_interface_with_audit(
+            session.id(),
+            ClawVpnDatapathSide::Device,
+            &oversized_packet,
+        );
+        assert_eq!(
+            oversized,
+            Err(ClawVpnSessionFrameError::Packet(
+                ClawVpnValidatedPacketError::PacketTooLarge
+            ))
+        );
+        assert_eq!(oversized_event.reason(), ClawVpnAuditReason::PacketTooLarge);
+
+        let wrong_relay_to_device = packet(addrs.device(), addrs.claw());
+        let (relay_spoofed_device, relay_spoofed_device_event) = datapath
+            .packet_from_relay_with_audit(
+                session.id(),
+                ClawVpnDatapathSide::Device,
+                TunnelFrame::Data(wrong_relay_to_device),
+            );
+        assert_eq!(
+            relay_spoofed_device,
+            Err(ClawVpnSessionFrameError::Packet(
+                ClawVpnValidatedPacketError::Policy(ClawVpnPacketPolicyError::SourceMismatch)
+            ))
+        );
+        assert_eq!(
+            relay_spoofed_device_event.reason(),
+            ClawVpnAuditReason::PacketPolicyRejected
+        );
+
+        let (control, control_event) = datapath.packet_from_relay_with_audit(
+            session.id(),
+            ClawVpnDatapathSide::Device,
+            TunnelFrame::Close,
+        );
+        assert_eq!(
+            control,
+            Err(ClawVpnSessionFrameError::Packet(
+                ClawVpnValidatedPacketError::UnexpectedTunnelFrame
+            ))
+        );
+        assert_eq!(
+            control_event.reason(),
+            ClawVpnAuditReason::UnexpectedTunnelFrame
+        );
+
+        let (closed, close_event) = datapath.close_with_audit(session.id());
+        assert_eq!(closed.unwrap().id(), session.id());
+        assert_eq!(close_event.reason(), ClawVpnAuditReason::SessionClosed);
+        let (after_close, after_close_event) = datapath.packet_from_relay_with_audit(
+            session.id(),
+            ClawVpnDatapathSide::Claw,
+            TunnelFrame::Data(packet(addrs.device(), addrs.claw())),
+        );
+        assert_eq!(after_close, Err(ClawVpnSessionFrameError::UnknownSession));
+        assert_eq!(
+            after_close_event.reason(),
+            ClawVpnAuditReason::UnknownSession
+        );
+        assert_eq!(after_close_event.subject(), None);
+    }
+
+    #[test]
+    fn datapath_revoke_removes_only_revoked_session_from_forwarding() {
+        let device_m1 = P256Keypair::generate();
+        let device_m2 = P256Keypair::generate();
+        let m1_claw_a = acl_key("member-m1", &device_m1, "claw-a");
+        let m2_claw_a = acl_key("member-m2", &device_m2, "claw-a");
+        let mut datapath = ClawVpnDatapath::new(registry_with_grants(&[
+            m1_claw_a.clone(),
+            m2_claw_a.clone(),
+        ]));
+        let m1_session = datapath.open_with_audit(&m1_claw_a).0.unwrap();
+        let m2_session = datapath.open_with_audit(&m2_claw_a).0.unwrap();
+
+        let (revocation, revoke_event) = datapath.revoke_with_audit(&m2_claw_a);
+        assert!(revocation.grant_removed());
+        assert_eq!(revocation.closed_session_count(), 1);
+        assert_eq!(revoke_event.reason(), ClawVpnAuditReason::AclRevoked);
+
+        let m2_addrs = m2_session.addrs();
+        assert_eq!(
+            datapath
+                .packet_from_relay_with_audit(
+                    m2_session.id(),
+                    ClawVpnDatapathSide::Claw,
+                    TunnelFrame::Data(packet(m2_addrs.device(), m2_addrs.claw())),
+                )
+                .0,
+            Err(ClawVpnSessionFrameError::UnknownSession)
+        );
+
+        let m1_addrs = m1_session.addrs();
+        let (still_open, still_open_event) = datapath.packet_from_relay_with_audit(
+            m1_session.id(),
+            ClawVpnDatapathSide::Claw,
+            TunnelFrame::Data(packet(m1_addrs.device(), m1_addrs.claw())),
+        );
+        assert_eq!(
+            still_open.unwrap().as_bytes(),
+            packet(m1_addrs.device(), m1_addrs.claw()).as_slice()
+        );
+        assert_eq!(still_open_event.reason(), ClawVpnAuditReason::FrameAccepted);
+    }
+
+    #[test]
+    fn datapath_debug_does_not_print_relation_or_address_material() {
+        let device_m1 = P256Keypair::generate();
+        let m1_claw_a = acl_key("member-m1", &device_m1, "claw-a");
+        let mut datapath =
+            ClawVpnDatapath::new(registry_with_grants(std::slice::from_ref(&m1_claw_a)));
+        let session = datapath.open_with_audit(&m1_claw_a).0.unwrap();
+        let addrs = session.addrs();
+        let session_policy = session.packet_policy();
+
+        for debug in [
+            format!("{datapath:?}"),
+            format!("{session:?}"),
+            format!("{session_policy:?}"),
+        ] {
+            assert!(!debug.contains("member-m1"));
+            assert!(!debug.contains("claw-a"));
+            assert!(!debug.contains(&hex::encode(device_m1.public().as_bytes())));
+            assert!(!debug.contains(&addrs.device().to_string()));
+            assert!(!debug.contains(&addrs.claw().to_string()));
+            assert!(debug.contains("<redacted>"));
+        }
+    }
+
+    #[test]
     fn audit_subject_hashes_relation_without_raw_identifiers() {
         let device = P256Keypair::generate();
         let other_device = P256Keypair::generate();
@@ -2040,17 +2415,6 @@ mod tests {
             ClawVpnIpv4Pool::try_new(Ipv4Addr::new(1, 2, 3, 4), 0),
             Err(ClawVpnPoolError::HostBitsSet)
         );
-    }
-
-    #[test]
-    fn adversarial_struct_literal_construction_is_impossible_from_outside() {
-        // This test lives INSIDE the `claw_vpn` module's test submodule, so it
-        // cannot itself prove external-module inaccessibility. It documents the
-        // invariant: `network` and `prefix_len` on ClawVpnIpv4Pool have no `pub`
-        // qualifier (see struct definition), so any attempt to build one via
-        // `ClawVpnIpv4Pool { network: ..., prefix_len: ... }` from another module
-        // or another crate fails to compile with E0451 (field is private).
-        // Verified by grep: no such literal exists anywhere else in the repo.
     }
 
     #[test]

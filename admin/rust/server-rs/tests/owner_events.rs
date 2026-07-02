@@ -3806,7 +3806,14 @@ fn product_a_per_claw_vpn_dev_config_remains_default_off_and_unwired() {
             let references_dev_config =
                 line.contains("ClawVpnDevConfig") || line.contains("claw_vpn_dev_config");
             let references_dev_flag = line.contains("THEYOS_CLAW_VPN_");
-            if !in_config_module && !module_export && (references_dev_config || references_dev_flag)
+            let references_datapath_runtime = line.contains("ClawVpnDatapath")
+                || line.contains("ClawVpnSessionRegistry")
+                || line.contains("ClawVpnSessionId")
+                || line.contains("ClawVpnAuditEvent");
+            if references_datapath_runtime
+                || (!in_config_module
+                    && !module_export
+                    && (references_dev_config || references_dev_flag))
             {
                 violations.push(format!("{}:{}: {}", path.display(), index + 1, line.trim()));
             }
@@ -3815,7 +3822,7 @@ fn product_a_per_claw_vpn_dev_config_remains_default_off_and_unwired() {
 
     assert!(
         violations.is_empty(),
-        "per-Claw VPN dev config must stay default-off/unwired until the tunnel runtime slice:\n{}",
+        "per-Claw VPN dev config/datapath must stay default-off/unwired until the tunnel runtime slice:\n{}",
         violations.join("\n")
     );
 }

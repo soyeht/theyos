@@ -1,9 +1,10 @@
 # Product A — per-Claw VPN plan (relay_stream → real IP tunnel)
 
-**Status: plan + early inert scaffolding.** The first code slices may define
-signed contracts, fail-closed placeholders, and pure packet/admission/audit
-helpers, but there is still no TUN/utun interface, route installation, packet
-relay runtime, storage-backed session registry, iOS Packet Tunnel, or product
+**Status: plan + early inert scaffolding.** The first code slices define signed
+contracts, fail-closed placeholders, pure packet/admission/audit helpers, a pure
+interface-to-relay datapath core, and a guarded default-off dev config parser,
+but there is still no TUN/utun interface, route installation, packet relay
+runtime, storage-backed session registry, iOS Packet Tunnel, or product
 activation. Everything described here is default-off by construction, and every
 activation step (deploy, flag flip, shipping) is a separate, explicitly
 owner-authorized decision. Nothing in this plan is authorized to run anywhere by
@@ -205,8 +206,12 @@ Access between members/devices and claws is explicitly many-to-many:
   product activation before a separate implementation sign-off.
 - **Phase 1 — Rust↔Rust dev proof (no Apple gates).** Claw agent with
   TUN/utun + a macOS `utun` dev *client* bin (all Rust), over the existing
-  dev relay, behind new default-off flags. Includes landing the guest-kernel
-  TUN prerequisite for Linux claws. Exit: T1–T4 green on dev hosts.
+  dev relay, behind new default-off flags. The first Phase-1 core slice adds
+  only the pure local-interface ⇄ relay datapath helper that maps device/claw
+  sides to the correct packet direction and rejects spoof/control frames before
+  forwarding; it is not T1 because it creates no interface or route. Includes
+  landing the guest-kernel TUN prerequisite for Linux claws. Exit: T1–T4 green
+  on dev hosts.
 - **Phase 2 — iOS Packet Tunnel dev build.** Entry: entitlement go/no-go.
   Dev device only. Exit: T5–T7 green (iPhone reaches Claw-A — and only
   Claw-A).
