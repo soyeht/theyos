@@ -19,70 +19,48 @@ use crate::claw_share_relay_stream_contract::{
 };
 use crate::claw_share_relay_stream_issuer_trust::RelayStreamIssuerTrust;
 
-pub struct RelayStreamOfferTargetRouter<P, S> {
+pub(crate) struct RelayStreamOfferTargetGate {
     offer: RelayStreamOfferContract,
     trust: RelayStreamIssuerTrust,
     slots: Arc<ClawShareSlotStore>,
-    pty_router: P,
-    clawsite_router: S,
     now_unix: Arc<dyn Fn() -> u64 + Send + Sync>,
 }
 
-impl<P, S> RelayStreamOfferTargetRouter<P, S> {
+pub struct RelayStreamOfferTargetRouter<P, S> {
+    gate: RelayStreamOfferTargetGate,
+    pty_router: P,
+    clawsite_router: S,
+}
+
+impl RelayStreamOfferTargetGate {
     #[must_use]
-    pub fn new(
+    pub(crate) fn new(
         offer: RelayStreamOfferContract,
         trust: RelayStreamIssuerTrust,
         slots: Arc<ClawShareSlotStore>,
-        pty_router: P,
-        clawsite_router: S,
         now_unix: impl Fn() -> u64 + Send + Sync + 'static,
     ) -> Self {
         Self {
             offer,
             trust,
             slots,
-            pty_router,
-            clawsite_router,
             now_unix: Arc::new(now_unix),
         }
     }
-}
 
-impl<P, S> fmt::Debug for RelayStreamOfferTargetRouter<P, S> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        // Curated view: `trust`, `slots`, and `now_unix` are internal collaborators
-        // and the offer/routers are redacted, so the remaining fields are omitted.
-        f.debug_struct("RelayStreamOfferTargetRouter")
-            .field("claw_id", &self.offer.payload.claw_id)
-            .field("slot_id", &self.offer.payload.slot_id)
-            .field("resource", &self.offer.payload.resource)
-            .field("offer", &"redacted")
-            .field("pty_router", &"redacted")
-            .field("clawsite_router", &"redacted")
-            .finish_non_exhaustive()
+    fn resource(&self) -> RelayStreamResource {
+        self.offer.payload.resource
     }
-}
 
-impl<P, S> ClawTargetRouter for RelayStreamOfferTargetRouter<P, S>
-where
-    P: ClawTargetRouter,
-    S: ClawTargetRouter,
-{
-    async fn open(&self, target_id: &str) -> Result<TargetSession, DataTunnelError> {
-        self.validate_offer_target(target_id)?;
-        match self.offer.payload.resource {
-            RelayStreamResource::Pty => self.pty_router.open(target_id).await,
-            RelayStreamResource::ClawSite => self.clawsite_router.open(target_id).await,
-            RelayStreamResource::IpTunnel => {
-                Err(target_unavailable("relay-stream-iptunnel-not-configured"))
-            }
-        }
+    pub(crate) fn validate_ip_tunnel_target(&self, target_id: &str) -> Result<(), DataTunnelError> {
+        self.validate_target_for_resource(target_id, RelayStreamResource::IpTunnel)
     }
-}
 
-impl<P, S> RelayStreamOfferTargetRouter<P, S> {
-    fn validate_offer_target(&self, target_id: &str) -> Result<(), DataTunnelError> {
+    fn validate_target_for_resource(
+        &self,
+        target_id: &str,
+        expected_resource: RelayStreamResource,
+    ) -> Result<(), DataTunnelError> {
         let now = (self.now_unix)();
         // Authorize the offer's signer as an active household machine issuer on
         // every open, via the live trust source: re-verifies signature + signer,
@@ -98,6 +76,9 @@ impl<P, S> RelayStreamOfferTargetRouter<P, S> {
         let payload = &self.offer.payload;
         if payload.expected_path != RelayStreamExpectedPath::RelayStream {
             return Err(target_unavailable("relay-stream-path-mismatch"));
+        }
+        if payload.resource != expected_resource {
+            return Err(target_unavailable("relay-stream-resource-mismatch"));
         }
         if target_id != payload.claw_id {
             return Err(target_unavailable("relay-stream-target-mismatch"));
@@ -153,6 +134,81 @@ impl<P, S> RelayStreamOfferTargetRouter<P, S> {
                     return Err(target_unavailable("relay-stream-guest-device-mismatch"));
                 }
                 Ok(())
+            }
+        }
+    }
+}
+
+impl fmt::Debug for RelayStreamOfferTargetGate {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // Curated view: `trust`, `slots`, and `now_unix` are internal collaborators
+        // and the offer is redacted, so the remaining fields are omitted.
+        f.debug_struct("RelayStreamOfferTargetGate")
+            .field("claw_id", &self.offer.payload.claw_id)
+            .field("slot_id", &self.offer.payload.slot_id)
+            .field("resource", &self.offer.payload.resource)
+            .field("offer", &"redacted")
+            .finish_non_exhaustive()
+    }
+}
+
+impl<P, S> RelayStreamOfferTargetRouter<P, S> {
+    #[must_use]
+    pub fn new(
+        offer: RelayStreamOfferContract,
+        trust: RelayStreamIssuerTrust,
+        slots: Arc<ClawShareSlotStore>,
+        pty_router: P,
+        clawsite_router: S,
+        now_unix: impl Fn() -> u64 + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            gate: RelayStreamOfferTargetGate::new(offer, trust, slots, now_unix),
+            pty_router,
+            clawsite_router,
+        }
+    }
+
+    fn validate_offer_target_for_resource(
+        &self,
+        target_id: &str,
+        expected_resource: RelayStreamResource,
+    ) -> Result<(), DataTunnelError> {
+        self.gate
+            .validate_target_for_resource(target_id, expected_resource)
+    }
+}
+
+impl<P, S> fmt::Debug for RelayStreamOfferTargetRouter<P, S> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // Curated view: the offer gate and routers are redacted, so the remaining
+        // fields are omitted.
+        f.debug_struct("RelayStreamOfferTargetRouter")
+            .field("gate", &self.gate)
+            .field("pty_router", &"redacted")
+            .field("clawsite_router", &"redacted")
+            .finish_non_exhaustive()
+    }
+}
+
+impl<P, S> ClawTargetRouter for RelayStreamOfferTargetRouter<P, S>
+where
+    P: ClawTargetRouter,
+    S: ClawTargetRouter,
+{
+    async fn open(&self, target_id: &str) -> Result<TargetSession, DataTunnelError> {
+        match self.gate.resource() {
+            RelayStreamResource::Pty => {
+                self.validate_offer_target_for_resource(target_id, RelayStreamResource::Pty)?;
+                self.pty_router.open(target_id).await
+            }
+            RelayStreamResource::ClawSite => {
+                self.validate_offer_target_for_resource(target_id, RelayStreamResource::ClawSite)?;
+                self.clawsite_router.open(target_id).await
+            }
+            RelayStreamResource::IpTunnel => {
+                self.gate.validate_ip_tunnel_target(target_id)?;
+                Err(target_unavailable("relay-stream-iptunnel-not-configured"))
             }
         }
     }
@@ -416,6 +472,13 @@ mod tests {
         )
     }
 
+    fn gate_for(
+        resource: RelayStreamResource,
+        slots: Arc<ClawShareSlotStore>,
+    ) -> RelayStreamOfferTargetGate {
+        RelayStreamOfferTargetGate::new(offer(resource), trust(), slots, || NOW)
+    }
+
     // Builds a router over unreachable backends, so a validation failure surfaces
     // as `TargetUnavailable` rather than a backend connect error: any open that
     // resolves to `TargetUnavailable` provably rejected before dialing a backend.
@@ -460,6 +523,30 @@ mod tests {
 
         assert!(
             matches!(error, DataTunnelError::TargetUnavailable(reason) if reason == "relay-stream-iptunnel-not-configured")
+        );
+    }
+
+    #[test]
+    fn relay_stream_target_gate_resource_is_exact_before_future_packet_path() {
+        for (offer_resource, expected_resource) in [
+            (RelayStreamResource::Pty, RelayStreamResource::IpTunnel),
+            (RelayStreamResource::ClawSite, RelayStreamResource::IpTunnel),
+            (RelayStreamResource::IpTunnel, RelayStreamResource::Pty),
+            (RelayStreamResource::IpTunnel, RelayStreamResource::ClawSite),
+        ] {
+            let gate = gate_for(offer_resource, consumed_slots());
+            let error = gate
+                .validate_target_for_resource(CLAW_ID, expected_resource)
+                .unwrap_err();
+            assert!(
+                matches!(error, DataTunnelError::TargetUnavailable(reason) if reason == "relay-stream-resource-mismatch"),
+                "{offer_resource:?} offer must not authorize {expected_resource:?}"
+            );
+        }
+
+        let ip_gate = gate_for(RelayStreamResource::IpTunnel, consumed_slots());
+        ip_gate.validate_ip_tunnel_target(CLAW_ID).expect(
+            "IpTunnel offer should pass the exact resource gate before runtime remains fail-closed",
         );
     }
 

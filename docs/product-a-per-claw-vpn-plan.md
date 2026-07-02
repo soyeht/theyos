@@ -209,9 +209,12 @@ Access between members/devices and claws is explicitly many-to-many:
   dev relay, behind new default-off flags. The first Phase-1 core slice adds
   only the pure local-interface ⇄ relay datapath helper that maps device/claw
   sides to the correct packet direction and rejects spoof/control frames before
-  forwarding; it is not T1 because it creates no interface or route. Includes
-  landing the guest-kernel TUN prerequisite for Linux claws. Exit: T1–T4 green
-  on dev hosts.
+  forwarding; the next inert bridge slice makes the relay-stream target gate
+  check the signed resource exactly, so a `Pty`/`ClawSite` offer cannot
+  authorize a future `IpTunnel` packet path and an `IpTunnel` offer cannot
+  authorize a stream target. Neither slice is T1 because they create no
+  interface or route. Includes landing the guest-kernel TUN prerequisite for
+  Linux claws. Exit: T1–T4 green on dev hosts.
 - **Phase 2 — iOS Packet Tunnel dev build.** Entry: entitlement go/no-go.
   Dev device only. Exit: T5–T7 green (iPhone reaches Claw-A — and only
   Claw-A).
