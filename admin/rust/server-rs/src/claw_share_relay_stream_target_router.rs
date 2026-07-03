@@ -26,10 +26,20 @@ pub(crate) struct RelayStreamOfferTargetGate {
     now_unix: Arc<dyn Fn() -> u64 + Send + Sync>,
 }
 
-pub struct RelayStreamOfferTargetRouter<P, S> {
+pub struct RelayStreamOfferTargetRouter<P, S, I = RelayStreamIpTunnelUnavailableRouter> {
     gate: RelayStreamOfferTargetGate,
     pty_router: P,
     clawsite_router: S,
+    ip_tunnel_router: I,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct RelayStreamIpTunnelUnavailableRouter;
+
+impl ClawTargetRouter for RelayStreamIpTunnelUnavailableRouter {
+    async fn open(&self, _target_id: &str) -> Result<TargetSession, DataTunnelError> {
+        Err(target_unavailable("relay-stream-iptunnel-not-configured"))
+    }
 }
 
 impl RelayStreamOfferTargetGate {
@@ -162,10 +172,34 @@ impl<P, S> RelayStreamOfferTargetRouter<P, S> {
         clawsite_router: S,
         now_unix: impl Fn() -> u64 + Send + Sync + 'static,
     ) -> Self {
+        Self::new_with_ip_tunnel_router(
+            offer,
+            trust,
+            slots,
+            pty_router,
+            clawsite_router,
+            RelayStreamIpTunnelUnavailableRouter,
+            now_unix,
+        )
+    }
+}
+
+impl<P, S, I> RelayStreamOfferTargetRouter<P, S, I> {
+    #[must_use]
+    pub fn new_with_ip_tunnel_router(
+        offer: RelayStreamOfferContract,
+        trust: RelayStreamIssuerTrust,
+        slots: Arc<ClawShareSlotStore>,
+        pty_router: P,
+        clawsite_router: S,
+        ip_tunnel_router: I,
+        now_unix: impl Fn() -> u64 + Send + Sync + 'static,
+    ) -> Self {
         Self {
             gate: RelayStreamOfferTargetGate::new(offer, trust, slots, now_unix),
             pty_router,
             clawsite_router,
+            ip_tunnel_router,
         }
     }
 
@@ -179,7 +213,7 @@ impl<P, S> RelayStreamOfferTargetRouter<P, S> {
     }
 }
 
-impl<P, S> fmt::Debug for RelayStreamOfferTargetRouter<P, S> {
+impl<P, S, I> fmt::Debug for RelayStreamOfferTargetRouter<P, S, I> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         // Curated view: the offer gate and routers are redacted, so the remaining
         // fields are omitted.
@@ -187,14 +221,16 @@ impl<P, S> fmt::Debug for RelayStreamOfferTargetRouter<P, S> {
             .field("gate", &self.gate)
             .field("pty_router", &"redacted")
             .field("clawsite_router", &"redacted")
+            .field("ip_tunnel_router", &"redacted")
             .finish_non_exhaustive()
     }
 }
 
-impl<P, S> ClawTargetRouter for RelayStreamOfferTargetRouter<P, S>
+impl<P, S, I> ClawTargetRouter for RelayStreamOfferTargetRouter<P, S, I>
 where
     P: ClawTargetRouter,
     S: ClawTargetRouter,
+    I: ClawTargetRouter,
 {
     async fn open(&self, target_id: &str) -> Result<TargetSession, DataTunnelError> {
         match self.gate.resource() {
@@ -208,7 +244,7 @@ where
             }
             RelayStreamResource::IpTunnel => {
                 self.gate.validate_ip_tunnel_target(target_id)?;
-                Err(target_unavailable("relay-stream-iptunnel-not-configured"))
+                self.ip_tunnel_router.open(target_id).await
             }
         }
     }
@@ -418,12 +454,13 @@ mod tests {
         addr
     }
 
-    async fn open_and_roundtrip<P, S>(
-        router: &RelayStreamOfferTargetRouter<P, S>,
+    async fn open_and_roundtrip<P, S, I>(
+        router: &RelayStreamOfferTargetRouter<P, S, I>,
     ) -> Result<Vec<u8>, DataTunnelError>
     where
         P: ClawTargetRouter,
         S: ClawTargetRouter,
+        I: ClawTargetRouter,
     {
         let mut session = router.open(CLAW_ID).await?;
         session
@@ -445,10 +482,11 @@ mod tests {
         Ok(buf[..n].to_vec())
     }
 
-    async fn open_error<P, S>(router: &RelayStreamOfferTargetRouter<P, S>) -> DataTunnelError
+    async fn open_error<P, S, I>(router: &RelayStreamOfferTargetRouter<P, S, I>) -> DataTunnelError
     where
         P: ClawTargetRouter,
         S: ClawTargetRouter,
+        I: ClawTargetRouter,
     {
         match router.open(CLAW_ID).await {
             Ok(_) => panic!("expected target open to fail"),
@@ -524,6 +562,24 @@ mod tests {
         assert!(
             matches!(error, DataTunnelError::TargetUnavailable(reason) if reason == "relay-stream-iptunnel-not-configured")
         );
+    }
+
+    #[tokio::test]
+    async fn relay_stream_target_router_iptunnel_delegates_to_injected_router_after_gate() {
+        let ip_addr = spawn_ack_target(b"IP:").await;
+        let router = RelayStreamOfferTargetRouter::new_with_ip_tunnel_router(
+            offer(RelayStreamResource::IpTunnel),
+            trust(),
+            consumed_slots(),
+            TcpStreamRouter::new("127.0.0.1:1"),
+            TcpStreamRouter::new("127.0.0.1:1"),
+            TcpStreamRouter::new(ip_addr),
+            || NOW,
+        );
+
+        let response = open_and_roundtrip(&router).await.unwrap();
+
+        assert_eq!(response, b"IP:hello");
     }
 
     #[test]
