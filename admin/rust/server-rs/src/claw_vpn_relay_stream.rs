@@ -39,7 +39,7 @@ where
         let mut len_buf = [0u8; 4];
         self.stream
             .read_exact(&mut len_buf)
-            .map_err(|_| relay_closed_error())?;
+            .map_err(|source| relay_read_error(&source))?;
         let len = u32::from_be_bytes(len_buf) as usize;
         if len > MAX_FRAME_LEN {
             return Err(frame_too_large_error());
@@ -48,7 +48,7 @@ where
         let mut payload = vec![0u8; len];
         self.stream
             .read_exact(&mut payload)
-            .map_err(|_| relay_closed_error())?;
+            .map_err(|source| relay_read_error(&source))?;
         TunnelFrame::decode(&payload).map_err(|_| frame_decode_error())
     }
 
@@ -60,11 +60,23 @@ where
         let len = u32::try_from(payload.len()).map_err(|_| frame_too_large_error())?;
         self.stream
             .write_all(&len.to_be_bytes())
-            .map_err(|_| relay_write_error())?;
+            .map_err(|source| relay_write_error(&source))?;
         self.stream
             .write_all(&payload)
-            .map_err(|_| relay_write_error())?;
-        self.stream.flush().map_err(|_| relay_write_error())
+            .map_err(|source| relay_write_error(&source))?;
+        self.stream
+            .flush()
+            .map_err(|source| relay_write_error(&source))
+    }
+}
+
+fn relay_read_error(source: &io::Error) -> io::Error {
+    match source.kind() {
+        io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock => io::Error::new(
+            io::ErrorKind::TimedOut,
+            "relay stream read timed out before frame completed",
+        ),
+        _ => relay_closed_error(),
     }
 }
 
@@ -75,11 +87,17 @@ fn relay_closed_error() -> io::Error {
     )
 }
 
-fn relay_write_error() -> io::Error {
-    io::Error::new(
-        io::ErrorKind::BrokenPipe,
-        "relay stream write failed before frame completed",
-    )
+fn relay_write_error(source: &io::Error) -> io::Error {
+    match source.kind() {
+        io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock => io::Error::new(
+            io::ErrorKind::TimedOut,
+            "relay stream write timed out before frame completed",
+        ),
+        _ => io::Error::new(
+            io::ErrorKind::BrokenPipe,
+            "relay stream write failed before frame completed",
+        ),
+    }
 }
 
 fn frame_too_large_error() -> io::Error {
@@ -198,6 +216,36 @@ mod tests {
         let err = relay.recv_frame().expect_err("invalid frame rejected");
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
         assert!(!err.to_string().contains("SECRET-FRAME-PAYLOAD"));
+    }
+
+    #[test]
+    fn relay_stream_reports_read_timeouts_without_stream_material() {
+        struct TimeoutReadStream;
+
+        impl Read for TimeoutReadStream {
+            fn read(&mut self, _buf: &mut [u8]) -> io::Result<usize> {
+                Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "SECRET-STREAM-DETAIL",
+                ))
+            }
+        }
+
+        impl Write for TimeoutReadStream {
+            fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+                Ok(buf.len())
+            }
+
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let mut relay = ClawVpnRelayStream::new(TimeoutReadStream);
+        let err = relay.recv_frame().expect_err("timeout reported");
+
+        assert_eq!(err.kind(), io::ErrorKind::TimedOut);
+        assert!(!err.to_string().contains("SECRET-STREAM-DETAIL"));
     }
 
     #[test]

@@ -58,6 +58,7 @@ pub mod claw_vpn_macos_utun;
 pub mod claw_vpn_packet_pump;
 pub mod claw_vpn_relay_stream;
 pub mod claw_vpn_runtime;
+pub mod claw_vpn_target_session_relay;
 pub mod claw_vpn_wiring;
 pub mod cloudflare_admin;
 pub mod cloudflare_api;

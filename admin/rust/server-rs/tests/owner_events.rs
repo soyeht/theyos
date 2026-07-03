@@ -3815,6 +3815,7 @@ fn product_a_per_claw_vpn_dev_config_remains_default_off_and_unwired() {
     let interface_route_plan_path = server_src_dir.join("claw_vpn_interface_route_plan.rs");
     let packet_pump_path = server_src_dir.join("claw_vpn_packet_pump.rs");
     let relay_stream_path = server_src_dir.join("claw_vpn_relay_stream.rs");
+    let target_session_relay_path = server_src_dir.join("claw_vpn_target_session_relay.rs");
     let relay_stream_reverse_connect_binding_path =
         server_src_dir.join("claw_share_relay_stream_reverse_connect_binding.rs");
     let relay_stream_reverse_connect_pool_path =
@@ -3855,6 +3856,12 @@ fn product_a_per_claw_vpn_dev_config_remains_default_off_and_unwired() {
     assert!(
         sources.iter().any(|path| path == &relay_stream_path),
         "per-Claw VPN source guard must include server-rs/src/claw_vpn_relay_stream.rs"
+    );
+    assert!(
+        sources
+            .iter()
+            .any(|path| path == &target_session_relay_path),
+        "per-Claw VPN source guard must include server-rs/src/claw_vpn_target_session_relay.rs"
     );
     assert!(
         sources
@@ -3959,6 +3966,8 @@ fn product_a_per_claw_vpn_dev_config_remains_default_off_and_unwired() {
     let mut packet_pump_export_is_unconditional = false;
     let mut relay_stream_exports = 0usize;
     let mut relay_stream_export_is_unconditional = false;
+    let mut target_session_relay_exports = 0usize;
+    let mut target_session_relay_export_is_unconditional = false;
     let mut runtime_exports = 0usize;
     let mut runtime_export_is_unconditional = false;
     let mut wiring_exports = 0usize;
@@ -3981,6 +3990,11 @@ fn product_a_per_claw_vpn_dev_config_remains_default_off_and_unwired() {
         if line.trim() == "pub mod claw_vpn_relay_stream;" {
             relay_stream_exports += 1;
             relay_stream_export_is_unconditional =
+                index == 0 || !lib_lines[index - 1].trim().starts_with("#[cfg");
+        }
+        if line.trim() == "pub mod claw_vpn_target_session_relay;" {
+            target_session_relay_exports += 1;
+            target_session_relay_export_is_unconditional =
                 index == 0 || !lib_lines[index - 1].trim().starts_with("#[cfg");
         }
         if line.trim() == "pub mod claw_vpn_runtime;" {
@@ -4015,6 +4029,10 @@ fn product_a_per_claw_vpn_dev_config_remains_default_off_and_unwired() {
     assert!(
         relay_stream_exports == 1 && relay_stream_export_is_unconditional,
         "per-Claw VPN relay stream adapter module must have exactly one unconditional export"
+    );
+    assert!(
+        target_session_relay_exports == 1 && target_session_relay_export_is_unconditional,
+        "per-Claw VPN target-session relay adapter module must have exactly one unconditional export"
     );
     assert!(
         runtime_exports == 1 && runtime_export_is_unconditional,
@@ -4244,6 +4262,8 @@ fn product_a_per_claw_vpn_dev_config_remains_default_off_and_unwired() {
                 path == lib_path && line.trim() == "pub mod claw_vpn_packet_pump;";
             let relay_stream_module_export =
                 path == lib_path && line.trim() == "pub mod claw_vpn_relay_stream;";
+            let target_session_relay_module_export =
+                path == lib_path && line.trim() == "pub mod claw_vpn_target_session_relay;";
             let runtime_module_export =
                 path == lib_path && line.trim() == "pub mod claw_vpn_runtime;";
             let wiring_module_export =
@@ -4256,6 +4276,7 @@ fn product_a_per_claw_vpn_dev_config_remains_default_off_and_unwired() {
             let in_interface_route_plan_module = path == interface_route_plan_path;
             let in_packet_pump_module = path == packet_pump_path;
             let in_relay_stream_module = path == relay_stream_path;
+            let in_target_session_relay_module = path == target_session_relay_path;
             let in_relay_stream_reverse_connect_binding_module =
                 path == relay_stream_reverse_connect_binding_path;
             let in_relay_stream_reverse_connect_pool_module =
@@ -4279,6 +4300,9 @@ fn product_a_per_claw_vpn_dev_config_remains_default_off_and_unwired() {
                 || line.contains("claw_vpn_packet_pump");
             let references_relay_stream_adapter =
                 line.contains("ClawVpnRelayStream") || line.contains("claw_vpn_relay_stream");
+            let references_target_session_relay_adapter = line
+                .contains("ClawVpnTargetSessionRelay")
+                || line.contains("claw_vpn_target_session_relay");
             let references_ip_tunnel_target_backend = line.contains("new_with_ip_tunnel_router")
                 || line.contains("ip_tunnel_router")
                 || line.contains("RelayStreamIpTunnelUnavailableRouter")
@@ -4295,6 +4319,13 @@ fn product_a_per_claw_vpn_dev_config_remains_default_off_and_unwired() {
                 && !line.contains("ClawVpnPacketPump")
                 && !line.contains("ClawVpnPacketInterface")
                 && !line.contains("ClawVpnPacketPumpLoop");
+            let allowed_target_session_relay_packet_relay_adapter = in_target_session_relay_module
+                && line.contains("ClawVpnPacketRelay")
+                && !line.contains("ClawVpnPacketPump")
+                && !line.contains("ClawVpnPacketInterface")
+                && !line.contains("ClawVpnPacketPumpLoop");
+            let allowed_target_session_relay_stream_adapter =
+                in_target_session_relay_module && references_relay_stream_adapter;
             let references_runtime = line.contains("ClawVpnRuntime")
                 || line.contains("claw_vpn_runtime")
                 || line.contains("CLAW_VPN_RUNTIME");
@@ -4375,10 +4406,15 @@ fn product_a_per_claw_vpn_dev_config_remains_default_off_and_unwired() {
                     && !packet_pump_module_export
                     && !allowed_tun_packet_interface_adapter
                     && !allowed_relay_stream_packet_relay_adapter
+                    && !allowed_target_session_relay_packet_relay_adapter
                     && references_packet_pump)
                 || (!in_relay_stream_module
                     && !relay_stream_module_export
+                    && !allowed_target_session_relay_stream_adapter
                     && references_relay_stream_adapter)
+                || (!in_target_session_relay_module
+                    && !target_session_relay_module_export
+                    && references_target_session_relay_adapter)
                 || (!in_relay_stream_target_router_module
                     && !in_relay_stream_reverse_connect_binding_module
                     && !in_relay_stream_reverse_connect_pool_module
