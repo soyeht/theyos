@@ -98,6 +98,14 @@ after the fixed session is active it creates the socketpair, returns the
 to execute in an owner-reviewed context. It remains guard-tripwired and still
 does not swap the mount, construct real device handles, open TUN/utun, install
 routes, spawn work, run the pump, or authorize T1.
+The current target-session router follow-up wraps that builder in an unwired
+`ClawTargetRouter` adapter for the future `IpTunnel` backend. It takes
+caller-supplied runtime construction and launcher closures, fails closed when
+the builder is disabled or unavailable, and returns a `TargetSession` only after
+the launcher accepts the synchronous wiring. The source guard tripwires external
+use of the router adapter. It still does not choose device handles, route-tool
+paths, execution context, mount location, TUN/utun opens, relay dials, startup
+preflight evidence, or T1 activation.
 There is still no
 checked-in runtime/bin that opens a TUN/utun interface in a product/default
 path, caller that invokes the runtime coordinator, route executor, packet pump,
@@ -404,6 +412,12 @@ Access between members/devices and claws is explicitly many-to-many:
   the socketpair is created, while still returning the runtime wiring to a
   future caller rather than running or spawning it. The mount-swap/caller that
   executes the wiring and supplies concrete devices remains the separate T1
+  slice.
+  The target-session router follow-up then adds an unwired `ClawTargetRouter`
+  adapter that accepts caller-supplied runtime construction and launch closures,
+  returning the `TargetSession` only after the launcher accepts the synchronous
+  wiring. It still does not choose devices, route tools, execution context, or
+  a mount; the mount-swap/caller with concrete handles remains the separate T1
   slice.
   Exit: T1–T4 green on dev hosts.
 - **Phase 2 — iOS Packet Tunnel dev build.** Entry: entitlement go/no-go.

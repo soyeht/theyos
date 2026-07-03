@@ -173,6 +173,10 @@ The wiring PR that follows this runbook must show, before merge:
 - the production driver uses a finite `max_steps`, finite elapsed budget, and
   finite per-window quota, so the live caller also bounds byte-trickle peers
   that make progress just below the per-read timeout;
+- if the target-session router adapter is used, its launcher is the reviewed
+  execution boundary: the router may return a `TargetSession` only after that
+  launcher accepts the synchronous wiring, and the live caller must still prove
+  where and how the launcher runs it;
 - no raw `TunnelFrame`, packet bytes, interface name, file descriptor, local
   path, or peer address is logged through Debug or error formatting;
 - tests prove route cleanup runs after pump stop/error and that failure returns
