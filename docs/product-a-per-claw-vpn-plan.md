@@ -38,11 +38,14 @@ The merged interface-adapter follow-up makes the existing Linux TUN and macOS
 utun device wrappers implement the abstract packet-pump interface trait, while
 keeping those adapters unwired and allowing only that narrow trait reference in
 the OS-specific modules.
-The current pump-driver follow-up adds an unwired production loop driver that
+The merged pump-driver follow-up adds an unwired production loop driver that
 alternates interface-to-relay and relay-to-interface pump directions while
 enforcing fixed maximum steps, elapsed runtime, and per-window step quotas
 without sleeping, spawning, opening interfaces, dialing relays, or adding a
 product caller.
+The current T1-readiness follow-up codifies the remaining non-code gates:
+explicit owner authorization, prebuilt rollback, and sanitized hardware evidence
+for T1-T4 before any future live wiring run.
 There is still no
 checked-in runtime/bin that opens a TUN/utun interface in a product/default
 path, caller that invokes the runtime coordinator, route executor, packet pump,
@@ -310,7 +313,10 @@ Access between members/devices and claws is explicitly many-to-many:
   the first production loop driver policy, still inside the packet-pump module
   and still unwired: it alternates directions and returns `Stop` when fixed
   step, elapsed-time, or per-window quotas are reached, leaving scheduling and
-  any product caller to a future owner-reviewed wiring slice.
+  any product caller to a future owner-reviewed wiring slice. The T1-readiness
+  follow-up adds `docs/product-a-per-claw-vpn-t1-readiness-runbook.md`, which
+  makes the remaining owner-authorization, rollback, and T1-T4 hardware
+  evidence gates explicit without adding a caller or activating the datapath.
   Exit: T1–T4 green on dev hosts.
 - **Phase 2 — iOS Packet Tunnel dev build.** Entry: entitlement go/no-go.
   Dev device only. Exit: T5–T7 green (iPhone reaches Claw-A — and only
