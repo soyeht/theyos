@@ -79,9 +79,12 @@ The current target-session relay bridge follow-up adds an unwired local
 socketpair adapter that can hand one async byte-stream side to the existing
 `relay_stream` `TargetSession` API while the synchronous packet pump owns the
 other side through the already-reviewed `ClawVpnRelayStream` frame adapter with
-an explicit read/write timeout. The bridge is guard-tripwired and still does
-not mount `IpTunnel`, construct VPN session state, open TUN/utun, install
-routes, run the packet pump, spawn work, or add a product/bootstrap caller.
+an explicit read/write timeout. That timeout bounds idle reads and writes on the
+local relay side, while the production packet-pump driver remains responsible
+for aggregate elapsed-time and rate-window limits against byte-trickle peers.
+The bridge is guard-tripwired and still does not mount `IpTunnel`, construct VPN
+session state, open TUN/utun, install routes, run the packet pump, spawn work,
+or add a product/bootstrap caller.
 The current target-session runtime follow-up wires that local bridge to the
 already-reviewed per-Claw VPN runtime assembly only as an in-module builder:
 after the fixed session is active it creates the socketpair, returns the

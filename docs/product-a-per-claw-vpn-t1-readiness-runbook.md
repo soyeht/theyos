@@ -167,7 +167,8 @@ The wiring PR that follows this runbook must show, before merge:
   is handed to the relay adapter, so a peer cannot keep a partial frame open
   indefinitely;
 - the production driver uses a finite `max_steps`, finite elapsed budget, and
-  finite per-window quota;
+  finite per-window quota, so the live caller also bounds byte-trickle peers
+  that make progress just below the per-read timeout;
 - no raw `TunnelFrame`, packet bytes, interface name, file descriptor, local
   path, or peer address is logged through Debug or error formatting;
 - tests prove route cleanup runs after pump stop/error and that failure returns
