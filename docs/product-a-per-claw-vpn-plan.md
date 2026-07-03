@@ -26,7 +26,10 @@ caller, flag, or owner-reviewed route-tool path source.
 The current guard-hardening follow-up keeps those runtime helpers unwired while
 pinning the source guard's Rust span scanner to reject syntax it does not parse,
 so future wiring cannot silently broaden the reviewed packet-pump/runtime
-exceptions before an explicit T1 guard change.
+exceptions before an explicit T1 guard change. The current pre-wiring debug
+hardening follow-up also removes packet/frame bytes from `TunnelFrame` Debug
+output, so a future wiring caller cannot accidentally log raw `Health`, `Data`,
+or `Error` payloads by formatting a frame.
 There is still no
 checked-in runtime/bin that opens a TUN/utun interface in a product/default
 path, caller that invokes the runtime coordinator, route executor, packet pump,
@@ -279,7 +282,11 @@ Access between members/devices and claws is explicitly many-to-many:
   The guard-hardening follow-up before T1 keeps those helpers inert and tightens
   the source guard's packet-pump/runtime test-span scanner so it rejects
   unsupported Rust syntax in guarded files instead of relying on a loose textual
-  brace count during future wiring changes.
+  brace count during future wiring changes. The TunnelFrame-debug follow-up
+  keeps the wire format unchanged but makes the shared relay-stream frame
+  `Debug` implementation redact raw `Health` and `Data` bytes before any
+  wiring slice can log a frame in a live pump path; frame error text is also
+  redacted because it may contain local target or peer-provided detail.
   Exit: T1–T4 green on dev hosts.
 - **Phase 2 — iOS Packet Tunnel dev build.** Entry: entitlement go/no-go.
   Dev device only. Exit: T5–T7 green (iPhone reaches Claw-A — and only

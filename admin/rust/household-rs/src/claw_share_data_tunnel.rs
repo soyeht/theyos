@@ -46,6 +46,7 @@
 //! treats resize as a no-op and has no exit status.
 
 use serde::{Deserialize, Serialize};
+use std::fmt;
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
@@ -180,7 +181,7 @@ impl TargetExit {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub enum TunnelFrame {
     /// Liveness probe / echo.
     Health(Vec<u8>),
@@ -199,6 +200,60 @@ pub enum TunnelFrame {
     /// Target process exit (engine → client): the typed exit status, sent
     /// just before the closing [`TunnelFrame::Close`].
     Exit(TargetExit),
+}
+
+struct RedactedFramePayload {
+    len: usize,
+}
+
+impl fmt::Debug for RedactedFramePayload {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Payload")
+            .field("len", &self.len)
+            .field("bytes", &"<redacted>")
+            .finish()
+    }
+}
+
+struct RedactedFrameText {
+    len: usize,
+}
+
+impl fmt::Debug for RedactedFrameText {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Text")
+            .field("len", &self.len)
+            .field("value", &"<redacted>")
+            .finish()
+    }
+}
+
+impl fmt::Debug for TunnelFrame {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Health(payload) => f
+                .debug_tuple("Health")
+                .field(&RedactedFramePayload { len: payload.len() })
+                .finish(),
+            Self::Open => f.write_str("Open"),
+            Self::Data(payload) => f
+                .debug_tuple("Data")
+                .field(&RedactedFramePayload { len: payload.len() })
+                .finish(),
+            Self::Close => f.write_str("Close"),
+            Self::Error(reason) => f
+                .debug_tuple("Error")
+                .field(&RedactedFrameText { len: reason.len() })
+                .finish(),
+            Self::Window(n) => f.debug_tuple("Window").field(n).finish(),
+            Self::Resize { cols, rows } => f
+                .debug_struct("Resize")
+                .field("cols", cols)
+                .field("rows", rows)
+                .finish(),
+            Self::Exit(status) => f.debug_tuple("Exit").field(status).finish(),
+        }
+    }
 }
 
 impl TunnelFrame {
@@ -1713,6 +1768,42 @@ mod tests {
     }
 
     // ─── Interactive frames (resize / exit) ──────────────────────────────
+
+    #[test]
+    fn tunnel_frame_debug_redacts_payloads() {
+        let data_debug = format!("{:?}", TunnelFrame::Data(b"SECRET-PACKET-DATA!!".to_vec()));
+        assert!(data_debug.contains("Data"));
+        assert!(data_debug.contains("<redacted>"));
+        assert!(data_debug.contains("len: 20"));
+        assert!(!data_debug.contains("SECRET-PACKET-DATA"));
+        assert!(!data_debug.contains("83, 69, 67, 82, 69, 84"));
+
+        let health_debug = format!("{:?}", TunnelFrame::Health(b"SECRET-HEALTH".to_vec()));
+        assert!(health_debug.contains("Health"));
+        assert!(health_debug.contains("<redacted>"));
+        assert!(health_debug.contains("len: 13"));
+        assert!(!health_debug.contains("SECRET-HEALTH"));
+        assert!(!health_debug.contains("83, 69, 67, 82, 69, 84"));
+
+        let error_debug = format!(
+            "{:?}",
+            TunnelFrame::Error("SECRET-TARGET-ERROR".to_string())
+        );
+        assert!(error_debug.contains("Error"));
+        assert!(error_debug.contains("<redacted>"));
+        assert!(error_debug.contains("len: 19"));
+        assert!(!error_debug.contains("SECRET-TARGET-ERROR"));
+
+        let resize_debug = format!(
+            "{:?}",
+            TunnelFrame::Resize {
+                cols: 120,
+                rows: 40
+            }
+        );
+        assert!(resize_debug.contains("cols"));
+        assert!(resize_debug.contains("rows"));
+    }
 
     #[test]
     fn resize_frame_round_trips() {
