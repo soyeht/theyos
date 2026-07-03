@@ -163,6 +163,9 @@ The wiring PR that follows this runbook must show, before merge:
 - route setup and cleanup keep the executor's `env_clear` and null-stdio
   behavior;
 - packet interface reads preserve the MTU/oversize fail-closed behavior;
+- the concrete relay stream/socket has an explicit read/idle timeout before it
+  is handed to the relay adapter, so a peer cannot keep a partial frame open
+  indefinitely;
 - the production driver uses a finite `max_steps`, finite elapsed budget, and
   finite per-window quota;
 - no raw `TunnelFrame`, packet bytes, interface name, file descriptor, local
