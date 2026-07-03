@@ -50,6 +50,11 @@ The current wiring-assembly follow-up adds a default-off composition point that
 can bind caller-supplied fixed-session core, route-plan, packet-pump, bounded
 production driver, and runtime handles without reading flags, opening TUN/utun,
 dialing a relay, spawning work, or adding a product/bootstrap caller.
+The current deferred-wiring follow-up keeps that composition point in-module
+and adds a factory-shaped entrypoint whose disabled path returns before
+constructing even the fixed-session core, so a future default-off caller can be
+present without opening sessions, interfaces, relays, route handles, or live
+runtime state while the feature is disabled.
 The current startup-gate follow-up lets the engine bootstrap observe the
 default-off per-Claw VPN dev config and stop at the runbook's owner
 authorization/hardware-evidence gate when a dev mode is present; it still does
@@ -343,8 +348,11 @@ Access between members/devices and claws is explicitly many-to-many:
   dial relays, spawn tasks, choose route tools from configuration, or add a
   product/bootstrap caller. The source guard permits this module to name the
   already-reviewed route, pump, runtime, and datapath types only for that inert
-  assembly point; TUN/utun helpers, e2e-rs, dev flags, and product callers
-  remain guarded. The startup-gate follow-up adds the first bootstrap call site
+  assembly point; the deferred-wiring follow-up adds an equivalent factory
+  entrypoint that returns before constructing the fixed-session core or live
+  handles when disabled, preserving the same enabled-path validation. TUN/utun
+  helpers, e2e-rs, dev flags, and product callers remain guarded. The
+  startup-gate follow-up adds the first bootstrap call site
   for the per-Claw VPN dev config, but it is a stop gate only: default-off
   returns `Disabled`, enabled dev config returns owner-authorization-required,
   invalid config fails closed, and no runtime assembly, TUN/utun, relay, route,

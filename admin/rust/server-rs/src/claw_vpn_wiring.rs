@@ -220,6 +220,22 @@ where
     }))
 }
 
+pub fn assemble_claw_vpn_runtime_wiring_deferred<I, R>(
+    config: ClawVpnRuntimeWiringConfig,
+    build_session_core: impl FnOnce() -> ClawVpnAgentSessionCore,
+    build_inputs: impl FnOnce(ClawVpnRuntimeWiringContext) -> ClawVpnRuntimeWiringInputs<I, R>,
+) -> Result<Option<ClawVpnRuntimeWiring<I, R>>, ClawVpnRuntimeWiringError>
+where
+    I: ClawVpnPacketInterface,
+    R: ClawVpnPacketRelay,
+{
+    if !config.enabled() {
+        return Ok(None);
+    }
+
+    assemble_claw_vpn_runtime_wiring(config, build_session_core(), build_inputs)
+}
+
 fn route_side_for_datapath(side: ClawVpnDatapathSide) -> ClawVpnInterfaceRouteSide {
     match side {
         ClawVpnDatapathSide::Device => ClawVpnInterfaceRouteSide::Device,
@@ -322,6 +338,61 @@ mod tests {
 
         assert!(wiring.is_none());
         assert!(!called.get());
+    }
+
+    #[test]
+    fn runtime_wiring_deferred_default_off_does_not_build_session_or_inputs() {
+        let session_called = Rc::new(Cell::new(false));
+        let session_called_by_factory = Rc::clone(&session_called);
+        let inputs_called = Rc::new(Cell::new(false));
+        let inputs_called_by_factory = Rc::clone(&inputs_called);
+
+        let wiring = assemble_claw_vpn_runtime_wiring_deferred::<FakeInterface, FakeRelay>(
+            ClawVpnRuntimeWiringConfig::default(),
+            || {
+                session_called_by_factory.set(true);
+                panic!("disabled deferred wiring must not build a session core");
+            },
+            |_| {
+                inputs_called_by_factory.set(true);
+                panic!("disabled deferred wiring must not build live handles");
+            },
+        )
+        .unwrap();
+
+        assert!(wiring.is_none());
+        assert!(!session_called.get());
+        assert!(!inputs_called.get());
+    }
+
+    #[test]
+    fn runtime_wiring_deferred_enabled_builds_session_then_inputs() {
+        let (session, core) = session_and_core(ClawVpnDatapathSide::Device);
+        let addrs = session.addrs();
+        let config = enabled_config(1);
+        let session_built = Rc::new(Cell::new(false));
+        let session_built_by_factory = Rc::clone(&session_built);
+        let inputs_built = Rc::new(Cell::new(false));
+        let inputs_built_by_factory = Rc::clone(&inputs_built);
+
+        let wiring = assemble_claw_vpn_runtime_wiring_deferred(
+            config,
+            || {
+                session_built_by_factory.set(true);
+                core.into_session_core(session.id()).unwrap()
+            },
+            |context| {
+                assert!(session_built.get());
+                inputs_built_by_factory.set(true);
+                assert_eq!(context.addrs(), addrs);
+                inputs(FakeInterface::default(), FakeRelay::default())
+            },
+        )
+        .unwrap();
+
+        assert!(wiring.is_some());
+        assert!(session_built.get());
+        assert!(inputs_built.get());
     }
 
     #[test]
