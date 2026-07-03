@@ -34,10 +34,15 @@ The current guard-scope follow-up also extends the per-Claw VPN source guard to
 `e2e-rs`, which has a `server-rs` dev-dependency, so sibling-crate tests cannot
 construct or name per-Claw VPN symbols, TUN/utun helpers, or datapath wiring
 without an explicit future wiring review.
-The current interface-adapter follow-up makes the existing Linux TUN and macOS
+The merged interface-adapter follow-up makes the existing Linux TUN and macOS
 utun device wrappers implement the abstract packet-pump interface trait, while
 keeping those adapters unwired and allowing only that narrow trait reference in
 the OS-specific modules.
+The current pump-driver follow-up adds an unwired production loop driver that
+alternates interface-to-relay and relay-to-interface pump directions while
+enforcing fixed maximum steps, elapsed runtime, and per-window step quotas
+without sleeping, spawning, opening interfaces, dialing relays, or adding a
+product caller.
 There is still no
 checked-in runtime/bin that opens a TUN/utun interface in a product/default
 path, caller that invokes the runtime coordinator, route executor, packet pump,
@@ -275,7 +280,7 @@ Access between members/devices and claws is explicitly many-to-many:
   interface-to-relay and relay-to-interface forwarding over abstract traits,
   dropping invalid/control/spoofed packets before they can cross the interface
   or relay boundary. The packet-pump-loop slice adds only an in-module,
-  bounded loop driver over the same abstract traits: a future runtime can
+  bounded loop over the same abstract traits: a future runtime can
   supply readiness/direction decisions, but the loop stops on I/O errors and
   enforces a step budget so it cannot become an unbounded task by itself. The
   packet-pump-runtime slice adds an in-module lifecycle coordinator that calls
@@ -301,7 +306,11 @@ Access between members/devices and claws is explicitly many-to-many:
   test-only caller without tripping the same STOP gate. The interface-adapter
   follow-up then implements the packet-pump interface trait for the existing
   Linux TUN and macOS utun wrappers only, preserving the STOP gate against any
-  runtime caller or live route/relay activation.
+  runtime caller or live route/relay activation. The pump-driver follow-up adds
+  the first production loop driver policy, still inside the packet-pump module
+  and still unwired: it alternates directions and returns `Stop` when fixed
+  step, elapsed-time, or per-window quotas are reached, leaving scheduling and
+  any product caller to a future owner-reviewed wiring slice.
   Exit: T1–T4 green on dev hosts.
 - **Phase 2 — iOS Packet Tunnel dev build.** Entry: entitlement go/no-go.
   Dev device only. Exit: T5–T7 green (iPhone reaches Claw-A — and only
