@@ -1,0 +1,519 @@
+//! Default-off wiring assembly for the Product A per-Claw VPN proof.
+//!
+//! This module intentionally does not read product flags, open TUN/utun
+//! interfaces, dial relays, install routes during assembly, spawn tasks, or wire
+//! bootstrap. It is the reviewed composition point for caller-supplied handles:
+//! the disabled path returns before constructing any handle, and the enabled
+//! path binds one active session to the route plan, packet pump, bounded
+//! production driver, and runtime coordinator.
+
+use std::fmt;
+
+use household_rs::claw_vpn::{
+    ClawVpnAgentSessionCore, ClawVpnDatapathSide, ClawVpnSessionAddrs, ClawVpnSessionFrameError,
+};
+
+use crate::claw_vpn_interface_route_plan::{
+    ClawVpnInterfaceName, ClawVpnInterfaceRouteExecutor, ClawVpnInterfaceRoutePlatform,
+    ClawVpnInterfaceRouteSide, ClawVpnInterfaceRouteToolPaths,
+};
+use crate::claw_vpn_packet_pump::{
+    ClawVpnPacketInterface, ClawVpnPacketPump, ClawVpnPacketPumpProductionDriver,
+    ClawVpnPacketPumpProductionDriverBudget, ClawVpnPacketPumpSystemClock, ClawVpnPacketRelay,
+};
+use crate::claw_vpn_runtime::{
+    ClawVpnRuntime, ClawVpnRuntimeError, ClawVpnRuntimeReport, ClawVpnRuntimeStepBudget,
+};
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct ClawVpnRuntimeWiringConfig {
+    enabled: bool,
+    runtime_step_budget: ClawVpnRuntimeStepBudget,
+    driver_budget: ClawVpnPacketPumpProductionDriverBudget,
+}
+
+impl fmt::Debug for ClawVpnRuntimeWiringConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ClawVpnRuntimeWiringConfig")
+            .field("enabled", &self.enabled)
+            .field("runtime_step_budget", &self.runtime_step_budget)
+            .field("driver_budget", &self.driver_budget)
+            .finish()
+    }
+}
+
+impl Default for ClawVpnRuntimeWiringConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            runtime_step_budget: ClawVpnRuntimeStepBudget::new(
+                crate::claw_vpn_runtime::CLAW_VPN_RUNTIME_MAX_PACKET_PUMP_STEPS,
+            )
+            .expect("default runtime step budget is valid"),
+            driver_budget: ClawVpnPacketPumpProductionDriverBudget::default(),
+        }
+    }
+}
+
+impl ClawVpnRuntimeWiringConfig {
+    #[must_use]
+    pub fn new(
+        enabled: bool,
+        runtime_step_budget: ClawVpnRuntimeStepBudget,
+        driver_budget: ClawVpnPacketPumpProductionDriverBudget,
+    ) -> Self {
+        Self {
+            enabled,
+            runtime_step_budget,
+            driver_budget,
+        }
+    }
+
+    #[must_use]
+    pub fn enabled(self) -> bool {
+        self.enabled
+    }
+
+    #[must_use]
+    pub fn runtime_step_budget(self) -> ClawVpnRuntimeStepBudget {
+        self.runtime_step_budget
+    }
+
+    #[must_use]
+    pub fn driver_budget(self) -> ClawVpnPacketPumpProductionDriverBudget {
+        self.driver_budget
+    }
+}
+
+pub struct ClawVpnRuntimeWiringInputs<I, R> {
+    pub route_platform: ClawVpnInterfaceRoutePlatform,
+    pub interface_name: ClawVpnInterfaceName,
+    pub route_tool_paths: ClawVpnInterfaceRouteToolPaths,
+    pub interface: I,
+    pub relay: R,
+}
+
+impl<I, R> fmt::Debug for ClawVpnRuntimeWiringInputs<I, R> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ClawVpnRuntimeWiringInputs")
+            .field("route_platform", &self.route_platform)
+            .field("interface_name", &"<redacted>")
+            .field("route_tool_paths", &"<redacted>")
+            .field("interface", &"<redacted>")
+            .field("relay", &"<redacted>")
+            .finish()
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct ClawVpnRuntimeWiringContext {
+    route_side: ClawVpnInterfaceRouteSide,
+    addrs: ClawVpnSessionAddrs,
+}
+
+impl fmt::Debug for ClawVpnRuntimeWiringContext {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ClawVpnRuntimeWiringContext")
+            .field("route_side", &self.route_side)
+            .field("addrs", &"<redacted>")
+            .finish()
+    }
+}
+
+impl ClawVpnRuntimeWiringContext {
+    #[must_use]
+    pub fn route_side(self) -> ClawVpnInterfaceRouteSide {
+        self.route_side
+    }
+
+    #[must_use]
+    pub fn addrs(self) -> ClawVpnSessionAddrs {
+        self.addrs
+    }
+}
+
+pub struct ClawVpnRuntimeWiring<I, R> {
+    runtime: ClawVpnRuntime,
+    route_executor: ClawVpnInterfaceRouteExecutor,
+    interface: I,
+    relay: R,
+    driver: ClawVpnPacketPumpProductionDriver<ClawVpnPacketPumpSystemClock>,
+}
+
+impl<I, R> fmt::Debug for ClawVpnRuntimeWiring<I, R> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ClawVpnRuntimeWiring")
+            .field("runtime", &"<redacted>")
+            .field("route_executor", &"<redacted>")
+            .field("interface", &"<redacted>")
+            .field("relay", &"<redacted>")
+            .field("driver", &self.driver)
+            .finish()
+    }
+}
+
+impl<I, R> ClawVpnRuntimeWiring<I, R>
+where
+    I: ClawVpnPacketInterface,
+    R: ClawVpnPacketRelay,
+{
+    pub fn run_until_stopped(&mut self) -> Result<ClawVpnRuntimeReport, ClawVpnRuntimeError> {
+        self.runtime.run_until_stopped(
+            &mut self.route_executor,
+            &mut self.interface,
+            &mut self.relay,
+            &mut self.driver,
+        )
+    }
+}
+
+#[derive(thiserror::Error)]
+pub enum ClawVpnRuntimeWiringError {
+    #[error("claw vpn runtime wiring session is not active")]
+    Session(#[from] ClawVpnSessionFrameError),
+}
+
+impl fmt::Debug for ClawVpnRuntimeWiringError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Session(_) => f
+                .debug_struct("ClawVpnRuntimeWiringError::Session")
+                .field("source", &"<redacted>")
+                .finish(),
+        }
+    }
+}
+
+pub fn assemble_claw_vpn_runtime_wiring<I, R>(
+    config: ClawVpnRuntimeWiringConfig,
+    session_core: ClawVpnAgentSessionCore,
+    build_inputs: impl FnOnce(ClawVpnRuntimeWiringContext) -> ClawVpnRuntimeWiringInputs<I, R>,
+) -> Result<Option<ClawVpnRuntimeWiring<I, R>>, ClawVpnRuntimeWiringError>
+where
+    I: ClawVpnPacketInterface,
+    R: ClawVpnPacketRelay,
+{
+    if !config.enabled() {
+        return Ok(None);
+    }
+
+    let route_side = route_side_for_datapath(session_core.local_side());
+    let addrs = session_core.addrs()?;
+    let inputs = build_inputs(ClawVpnRuntimeWiringContext { route_side, addrs });
+    let route_plan = crate::claw_vpn_interface_route_plan::ClawVpnInterfaceRoutePlan::new(
+        inputs.route_platform,
+        inputs.interface_name,
+        addrs,
+        route_side,
+    );
+    let packet_pump = ClawVpnPacketPump::new(session_core);
+    let runtime = ClawVpnRuntime::new(route_plan, packet_pump, config.runtime_step_budget());
+    let route_executor = ClawVpnInterfaceRouteExecutor::new(inputs.route_tool_paths);
+    let driver = ClawVpnPacketPumpProductionDriver::new(config.driver_budget());
+
+    Ok(Some(ClawVpnRuntimeWiring {
+        runtime,
+        route_executor,
+        interface: inputs.interface,
+        relay: inputs.relay,
+        driver,
+    }))
+}
+
+fn route_side_for_datapath(side: ClawVpnDatapathSide) -> ClawVpnInterfaceRouteSide {
+    match side {
+        ClawVpnDatapathSide::Device => ClawVpnInterfaceRouteSide::Device,
+        ClawVpnDatapathSide::Claw => ClawVpnInterfaceRouteSide::Claw,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::cell::Cell;
+    use std::cell::RefCell;
+    use std::collections::VecDeque;
+    use std::io;
+    use std::net::Ipv4Addr;
+    use std::path::PathBuf;
+    use std::rc::Rc;
+
+    use household_rs::claw_share_data_tunnel::TunnelFrame;
+    use household_rs::claw_vpn::{
+        ClawVpnAcl, ClawVpnAclKey, ClawVpnAgentCore, ClawVpnAuditReason, ClawVpnIpv4Pool,
+        ClawVpnSession, ClawVpnSessionRegistry,
+    };
+    use household_rs::keys::{IdentityKey, P256Keypair};
+
+    use crate::claw_vpn_packet_pump::ClawVpnPacketPumpLoopStopReason;
+
+    #[derive(Default)]
+    struct FakeInterface {
+        reads: VecDeque<Vec<u8>>,
+        writes: Rc<RefCell<Vec<Vec<u8>>>>,
+    }
+
+    impl FakeInterface {
+        fn with_read_and_writes(packet: Vec<u8>, writes: Rc<RefCell<Vec<Vec<u8>>>>) -> Self {
+            let mut reads = VecDeque::new();
+            reads.push_back(packet);
+            Self { reads, writes }
+        }
+    }
+
+    impl ClawVpnPacketInterface for FakeInterface {
+        fn read_packet(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            let packet = self.reads.pop_front().unwrap_or_default();
+            let len = packet.len().min(buf.len());
+            buf[..len].copy_from_slice(&packet[..len]);
+            Ok(len)
+        }
+
+        fn write_packet(&mut self, packet: &[u8]) -> io::Result<()> {
+            self.writes.borrow_mut().push(packet.to_vec());
+            Ok(())
+        }
+    }
+
+    #[derive(Default)]
+    struct FakeRelay {
+        recv_frames: VecDeque<TunnelFrame>,
+        sent_frames: Rc<RefCell<Vec<TunnelFrame>>>,
+    }
+
+    impl FakeRelay {
+        fn with_sent_frames(sent_frames: Rc<RefCell<Vec<TunnelFrame>>>) -> Self {
+            Self {
+                recv_frames: VecDeque::new(),
+                sent_frames,
+            }
+        }
+    }
+
+    impl ClawVpnPacketRelay for FakeRelay {
+        fn recv_frame(&mut self) -> io::Result<TunnelFrame> {
+            self.recv_frames
+                .pop_front()
+                .ok_or_else(|| io::Error::new(io::ErrorKind::UnexpectedEof, "fake relay eof"))
+        }
+
+        fn send_frame(&mut self, frame: TunnelFrame) -> io::Result<()> {
+            self.sent_frames.borrow_mut().push(frame);
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn runtime_wiring_default_off_does_not_build_inputs() {
+        let called = Rc::new(Cell::new(false));
+        let called_by_factory = Rc::clone(&called);
+        let (session, core) = session_and_core(ClawVpnDatapathSide::Device);
+        let session_core = core.into_session_core(session.id()).unwrap();
+
+        let wiring = assemble_claw_vpn_runtime_wiring::<FakeInterface, FakeRelay>(
+            ClawVpnRuntimeWiringConfig::default(),
+            session_core,
+            |_| {
+                called_by_factory.set(true);
+                panic!("disabled wiring must not build live handles");
+            },
+        )
+        .unwrap();
+
+        assert!(wiring.is_none());
+        assert!(!called.get());
+    }
+
+    #[test]
+    fn runtime_wiring_rejects_session_not_active_in_core() {
+        let (session, mut core) = session_and_core(ClawVpnDatapathSide::Device);
+        assert!(core.close_with_audit(session.id()).0.is_some());
+        let closed_session_core = core.into_session_core(session.id()).err();
+        assert!(matches!(
+            closed_session_core,
+            Some(ClawVpnSessionFrameError::UnknownSession)
+        ));
+        let (session, core) = session_and_core(ClawVpnDatapathSide::Device);
+        let mut session_core = core.into_session_core(session.id()).unwrap();
+        assert!(session_core.close_with_audit().0.is_some());
+        let config = enabled_config(1);
+        let called = Rc::new(Cell::new(false));
+        let called_by_factory = Rc::clone(&called);
+
+        let error = assemble_claw_vpn_runtime_wiring(config, session_core, |_| {
+            called_by_factory.set(true);
+            inputs(FakeInterface::default(), FakeRelay::default())
+        })
+        .unwrap_err();
+
+        assert!(!called.get());
+        assert!(matches!(error, ClawVpnRuntimeWiringError::Session(_)));
+        let debug = format!("{error:?}");
+        assert!(debug.contains("<redacted>"));
+        assert!(!debug.contains("member-m1"));
+        assert!(!debug.contains("claw-a"));
+    }
+
+    #[test]
+    fn runtime_wiring_runs_bounded_pump_and_cleans_up_routes() {
+        let (session, core) = session_and_core(ClawVpnDatapathSide::Device);
+        let addrs = session.addrs();
+        let packet = packet(addrs.device(), addrs.claw());
+        let config = enabled_config(1);
+        let interface_writes = Rc::new(RefCell::new(Vec::new()));
+        let relay_sent_frames = Rc::new(RefCell::new(Vec::new()));
+
+        let mut wiring = assemble_claw_vpn_runtime_wiring(
+            config,
+            core.into_session_core(session.id()).unwrap(),
+            |context| {
+                assert_eq!(context.addrs(), addrs);
+                assert_eq!(context.route_side(), ClawVpnInterfaceRouteSide::Device);
+                inputs(
+                    FakeInterface::with_read_and_writes(
+                        packet.clone(),
+                        Rc::clone(&interface_writes),
+                    ),
+                    FakeRelay::with_sent_frames(Rc::clone(&relay_sent_frames)),
+                )
+            },
+        )
+        .unwrap()
+        .unwrap();
+
+        let report = wiring.run_until_stopped().unwrap();
+
+        assert!(matches!(
+            report.pump_report().stop_reason(),
+            ClawVpnPacketPumpLoopStopReason::StepBudgetExhausted
+        ));
+        assert_eq!(
+            report.pump_report().stats().interface_to_relay_forwarded(),
+            1
+        );
+        let relay_sent_frames = relay_sent_frames.borrow();
+        assert_eq!(relay_sent_frames.len(), 1);
+        assert!(matches!(
+            &relay_sent_frames[0],
+            TunnelFrame::Data(payload) if payload == &packet
+        ));
+        assert!(interface_writes.borrow().is_empty());
+    }
+
+    #[test]
+    fn runtime_wiring_claw_side_context_uses_claw_route_side() {
+        let (session, core) = session_and_core(ClawVpnDatapathSide::Claw);
+        let addrs = session.addrs();
+        let config = enabled_config(1);
+
+        let wiring = assemble_claw_vpn_runtime_wiring(
+            config,
+            core.into_session_core(session.id()).unwrap(),
+            |context| {
+                assert_eq!(context.addrs(), addrs);
+                assert_eq!(context.route_side(), ClawVpnInterfaceRouteSide::Claw);
+                inputs(FakeInterface::default(), FakeRelay::default())
+            },
+        )
+        .unwrap();
+
+        assert!(wiring.is_some());
+    }
+
+    #[test]
+    fn runtime_wiring_debug_redacts_live_material() {
+        let (session, core) = session_and_core(ClawVpnDatapathSide::Device);
+        let config = enabled_config(1);
+
+        let wiring = assemble_claw_vpn_runtime_wiring(
+            config,
+            core.into_session_core(session.id()).unwrap(),
+            |_| inputs(FakeInterface::default(), FakeRelay::default()),
+        )
+        .unwrap()
+        .unwrap();
+
+        let debug = format!("{wiring:?}");
+        assert!(debug.contains("ClawVpnRuntimeWiring"));
+        assert!(debug.contains("<redacted>"));
+        assert!(!debug.contains("clawvpn0"));
+        assert!(!debug.contains("/usr/bin/true"));
+        assert!(!debug.contains("198.18.0."));
+        assert!(!debug.contains("member-m1"));
+        assert!(!debug.contains("claw-a"));
+    }
+
+    fn enabled_config(max_steps: usize) -> ClawVpnRuntimeWiringConfig {
+        ClawVpnRuntimeWiringConfig::new(
+            true,
+            ClawVpnRuntimeStepBudget::new(max_steps).unwrap(),
+            ClawVpnPacketPumpProductionDriverBudget::new(
+                max_steps,
+                std::time::Duration::from_secs(60),
+                max_steps,
+                std::time::Duration::from_secs(1),
+            )
+            .unwrap(),
+        )
+    }
+
+    fn inputs(
+        interface: FakeInterface,
+        relay: FakeRelay,
+    ) -> ClawVpnRuntimeWiringInputs<FakeInterface, FakeRelay> {
+        ClawVpnRuntimeWiringInputs {
+            route_platform: host_platform(),
+            interface_name: ClawVpnInterfaceName::new("clawvpn0").unwrap(),
+            route_tool_paths: true_tool_paths(),
+            interface,
+            relay,
+        }
+    }
+
+    fn host_platform() -> ClawVpnInterfaceRoutePlatform {
+        #[cfg(target_os = "linux")]
+        {
+            ClawVpnInterfaceRoutePlatform::Linux
+        }
+        #[cfg(target_os = "macos")]
+        {
+            ClawVpnInterfaceRoutePlatform::Macos
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        {
+            panic!("test only supports Linux/macOS route platforms")
+        }
+    }
+
+    fn true_tool_paths() -> ClawVpnInterfaceRouteToolPaths {
+        let path = PathBuf::from("/usr/bin/true");
+        ClawVpnInterfaceRouteToolPaths::try_new(&path, &path, &path).unwrap()
+    }
+
+    fn session_and_core(side: ClawVpnDatapathSide) -> (ClawVpnSession, ClawVpnAgentCore) {
+        let key = acl_key();
+        let mut acl = ClawVpnAcl::new();
+        assert!(acl.grant(key.clone()));
+        let pool = ClawVpnIpv4Pool::try_new(Ipv4Addr::new(198, 18, 0, 0), 24).unwrap();
+        let registry = ClawVpnSessionRegistry::new(acl, pool);
+        let mut core = ClawVpnAgentCore::new(side, registry);
+        let (session, open_event) = core.open_with_audit(&key);
+        assert_eq!(open_event.reason(), ClawVpnAuditReason::SessionOpened);
+        (session.unwrap(), core)
+    }
+
+    fn acl_key() -> ClawVpnAclKey {
+        ClawVpnAclKey::try_new("member-m1", P256Keypair::generate().public(), "claw-a").unwrap()
+    }
+
+    fn packet(src: Ipv4Addr, dst: Ipv4Addr) -> Vec<u8> {
+        let mut packet = vec![0u8; 20];
+        packet[0] = 0x45;
+        packet[2..4].copy_from_slice(&20u16.to_be_bytes());
+        packet[8] = 64;
+        packet[9] = 6;
+        packet[12..16].copy_from_slice(&src.octets());
+        packet[16..20].copy_from_slice(&dst.octets());
+        packet
+    }
+}

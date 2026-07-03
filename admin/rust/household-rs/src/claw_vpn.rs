@@ -749,6 +749,16 @@ impl ClawVpnSessionRegistry {
         self.sessions.contains_key(&session_id)
     }
 
+    fn session_addrs(
+        &self,
+        session_id: ClawVpnSessionId,
+    ) -> Result<ClawVpnSessionAddrs, ClawVpnSessionFrameError> {
+        self.sessions
+            .get(&session_id)
+            .map(ClawVpnSession::addrs)
+            .ok_or(ClawVpnSessionFrameError::UnknownSession)
+    }
+
     pub fn validate_tunnel_frame_for_session(
         &self,
         session_id: ClawVpnSessionId,
@@ -896,6 +906,13 @@ impl ClawVpnDatapath {
 
     fn contains_session(&self, session_id: ClawVpnSessionId) -> bool {
         self.registry.contains_session(session_id)
+    }
+
+    fn session_addrs(
+        &self,
+        session_id: ClawVpnSessionId,
+    ) -> Result<ClawVpnSessionAddrs, ClawVpnSessionFrameError> {
+        self.registry.session_addrs(session_id)
     }
 
     pub fn open_with_audit(
@@ -1090,6 +1107,10 @@ impl ClawVpnAgentSessionCore {
     #[must_use]
     pub fn local_side(&self) -> ClawVpnDatapathSide {
         self.core.local_side()
+    }
+
+    pub fn addrs(&self) -> Result<ClawVpnSessionAddrs, ClawVpnSessionFrameError> {
+        self.core.datapath.session_addrs(self.session_id)
     }
 
     pub fn close_with_audit(&mut self) -> (Option<ClawVpnSession>, ClawVpnAuditEvent) {
@@ -2444,6 +2465,8 @@ mod tests {
 
         let bound = core.into_session_core(m1_session.id()).unwrap();
         assert_eq!(bound.local_side(), ClawVpnDatapathSide::Device);
+        assert_eq!(bound.addrs().unwrap(), m1_session.addrs());
+        assert_ne!(bound.addrs().unwrap(), m2_session.addrs());
         let m1_device_to_claw = packet(m1_session.addrs().device(), m1_session.addrs().claw());
         let m1_claw_to_device = packet(m1_session.addrs().claw(), m1_session.addrs().device());
         let m2_device_to_claw = packet(m2_session.addrs().device(), m2_session.addrs().claw());
@@ -2537,6 +2560,7 @@ mod tests {
         let (closed, close_event) = bound.close_with_audit();
         assert_eq!(closed.unwrap().id(), m1_session.id());
         assert_eq!(close_event.reason(), ClawVpnAuditReason::SessionClosed);
+        assert_eq!(bound.addrs(), Err(ClawVpnSessionFrameError::UnknownSession));
         let (after_close, after_close_event) = bound.frame_from_interface_with_audit(&packet(
             m1_session.addrs().device(),
             m1_session.addrs().claw(),

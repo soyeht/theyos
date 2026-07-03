@@ -46,6 +46,10 @@ product caller.
 The current T1-readiness follow-up codifies the remaining non-code gates:
 explicit owner authorization, prebuilt rollback, and sanitized hardware evidence
 for T1-T4 before any future live wiring run.
+The current wiring-assembly follow-up adds a default-off composition point that
+can bind caller-supplied fixed-session core, route-plan, packet-pump, bounded
+production driver, and runtime handles without reading flags, opening TUN/utun,
+dialing a relay, spawning work, or adding a product/bootstrap caller.
 There is still no
 checked-in runtime/bin that opens a TUN/utun interface in a product/default
 path, caller that invokes the runtime coordinator, route executor, packet pump,
@@ -317,6 +321,18 @@ Access between members/devices and claws is explicitly many-to-many:
   follow-up adds `docs/product-a-per-claw-vpn-t1-readiness-runbook.md`, which
   makes the remaining owner-authorization, rollback, and T1-T4 hardware
   evidence gates explicit without adding a caller or activating the datapath.
+  The wiring-assembly follow-up then adds a default-off in-module assembly
+  helper that composes caller-supplied fixed-session core, route-plan/executor,
+  packet-pump, bounded production driver, and runtime coordinator handles; its
+  disabled path returns before constructing any live handles, and its enabled
+  path proves the fixed session is still active before calling the handle
+  factory, then derives route addresses from the same fixed-session core that
+  drives the packet pump. It still does not read product flags, open TUN/utun,
+  dial relays, spawn tasks, choose route tools from configuration, or add a
+  product/bootstrap caller. The source guard permits this module to name the
+  already-reviewed route, pump, runtime, and datapath types only for that inert
+  assembly point; TUN/utun helpers, e2e-rs, dev flags, and product callers
+  remain guarded.
   Exit: T1–T4 green on dev hosts.
 - **Phase 2 — iOS Packet Tunnel dev build.** Entry: entitlement go/no-go.
   Dev device only. Exit: T5–T7 green (iPhone reaches Claw-A — and only

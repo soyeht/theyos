@@ -3815,6 +3815,7 @@ fn product_a_per_claw_vpn_dev_config_remains_default_off_and_unwired() {
     let interface_route_plan_path = server_src_dir.join("claw_vpn_interface_route_plan.rs");
     let packet_pump_path = server_src_dir.join("claw_vpn_packet_pump.rs");
     let runtime_path = server_src_dir.join("claw_vpn_runtime.rs");
+    let wiring_path = server_src_dir.join("claw_vpn_wiring.rs");
     let linux_tun_path = server_src_dir.join("claw_vpn_linux_tun.rs");
     let macos_utun_path = server_src_dir.join("claw_vpn_macos_utun.rs");
     let lib_path = server_src_dir.join("lib.rs");
@@ -3845,6 +3846,10 @@ fn product_a_per_claw_vpn_dev_config_remains_default_off_and_unwired() {
     assert!(
         sources.iter().any(|path| path == &runtime_path),
         "per-Claw VPN source guard must include server-rs/src/claw_vpn_runtime.rs"
+    );
+    assert!(
+        sources.iter().any(|path| path == &wiring_path),
+        "per-Claw VPN source guard must include server-rs/src/claw_vpn_wiring.rs"
     );
     assert!(
         sources.iter().any(|path| path == &linux_tun_path),
@@ -3913,6 +3918,8 @@ fn product_a_per_claw_vpn_dev_config_remains_default_off_and_unwired() {
     let mut packet_pump_export_is_unconditional = false;
     let mut runtime_exports = 0usize;
     let mut runtime_export_is_unconditional = false;
+    let mut wiring_exports = 0usize;
+    let mut wiring_export_is_unconditional = false;
     let mut linux_tun_exports = 0usize;
     let mut linux_tun_export_is_linux_only = false;
     let mut macos_utun_exports = 0usize;
@@ -3931,6 +3938,11 @@ fn product_a_per_claw_vpn_dev_config_remains_default_off_and_unwired() {
         if line.trim() == "pub mod claw_vpn_runtime;" {
             runtime_exports += 1;
             runtime_export_is_unconditional =
+                index == 0 || !lib_lines[index - 1].trim().starts_with("#[cfg");
+        }
+        if line.trim() == "pub mod claw_vpn_wiring;" {
+            wiring_exports += 1;
+            wiring_export_is_unconditional =
                 index == 0 || !lib_lines[index - 1].trim().starts_with("#[cfg");
         }
         if line.trim() == "pub mod claw_vpn_linux_tun;" {
@@ -3955,6 +3967,10 @@ fn product_a_per_claw_vpn_dev_config_remains_default_off_and_unwired() {
     assert!(
         runtime_exports == 1 && runtime_export_is_unconditional,
         "per-Claw VPN runtime coordinator module must have exactly one unconditional export"
+    );
+    assert!(
+        wiring_exports == 1 && wiring_export_is_unconditional,
+        "per-Claw VPN runtime wiring assembly module must have exactly one unconditional export"
     );
     assert!(
         linux_tun_exports == 1 && linux_tun_export_is_linux_only,
@@ -4163,6 +4179,11 @@ fn product_a_per_claw_vpn_dev_config_remains_default_off_and_unwired() {
         } else {
             None
         };
+        let wiring_test_span = if path == wiring_path {
+            Some(rust_test_module_span("runtime wiring assembly", &lines))
+        } else {
+            None
+        };
         for (index, line) in lines.iter().enumerate() {
             let module_export = path == lib_path && line.trim() == "pub mod claw_vpn_dev_config;";
             let interface_route_plan_module_export =
@@ -4171,6 +4192,8 @@ fn product_a_per_claw_vpn_dev_config_remains_default_off_and_unwired() {
                 path == lib_path && line.trim() == "pub mod claw_vpn_packet_pump;";
             let runtime_module_export =
                 path == lib_path && line.trim() == "pub mod claw_vpn_runtime;";
+            let wiring_module_export =
+                path == lib_path && line.trim() == "pub mod claw_vpn_wiring;";
             let linux_tun_module_export =
                 path == lib_path && line.trim() == "pub mod claw_vpn_linux_tun;";
             let macos_utun_module_export =
@@ -4179,6 +4202,7 @@ fn product_a_per_claw_vpn_dev_config_remains_default_off_and_unwired() {
             let in_interface_route_plan_module = path == interface_route_plan_path;
             let in_packet_pump_module = path == packet_pump_path;
             let in_runtime_module = path == runtime_path;
+            let in_wiring_module = path == wiring_path;
             let in_linux_tun_module = path == linux_tun_path;
             let in_macos_utun_module = path == macos_utun_path;
             let references_dev_config =
@@ -4200,6 +4224,8 @@ fn product_a_per_claw_vpn_dev_config_remains_default_off_and_unwired() {
             let references_runtime = line.contains("ClawVpnRuntime")
                 || line.contains("claw_vpn_runtime")
                 || line.contains("CLAW_VPN_RUNTIME");
+            let references_wiring =
+                line.contains("ClawVpnRuntimeWiring") || line.contains("claw_vpn_wiring");
             let references_linux_tun = line.contains("ClawVpnLinuxTun")
                 || line.contains("claw_vpn_linux_tun")
                 || line.contains("/dev/net/tun")
@@ -4227,7 +4253,12 @@ fn product_a_per_claw_vpn_dev_config_remains_default_off_and_unwired() {
                 && matches!(packet_pump_test_span, Some((start, end)) if index >= start && index <= end);
             let in_runtime_tests = in_runtime_module
                 && matches!(runtime_test_span, Some((start, end)) if index >= start && index <= end);
+            let in_wiring_tests = in_wiring_module
+                && matches!(wiring_test_span, Some((start, end)) if index >= start && index <= end);
             let line_without_allowed_datapath_side = line.replace("ClawVpnDatapathSide", "");
+            let line_without_wiring_allowed_datapath = line
+                .replace("ClawVpnAgentSessionCore", "")
+                .replace("ClawVpnDatapathSide", "");
             let references_disallowed_packet_pump_datapath_runtime = line
                 .contains("ClawVpnAgentCore")
                 || line_without_allowed_datapath_side.contains("ClawVpnDatapath")
@@ -4240,22 +4271,38 @@ fn product_a_per_claw_vpn_dev_config_remains_default_off_and_unwired() {
                         || line.contains("ClawVpnAuditEvent")
                         || line.contains("ClawVpnDatapathSide")));
             let allowed_runtime_datapath_runtime = in_runtime_tests;
+            let allowed_wiring_datapath_runtime = in_wiring_tests
+                || (in_wiring_module
+                    && !line_without_wiring_allowed_datapath.contains("ClawVpnDatapath")
+                    && !line.contains("ClawVpnAgentCore")
+                    && !line.contains("ClawVpnSessionRegistry")
+                    && !line.contains("ClawVpnSessionId")
+                    && !line.contains("ClawVpnAuditEvent")
+                    && (line.contains("ClawVpnAgentSessionCore")
+                        || line.contains("ClawVpnDatapathSide")));
             if (!allowed_packet_pump_datapath_runtime
                 && !allowed_runtime_datapath_runtime
+                && !allowed_wiring_datapath_runtime
                 && references_datapath_runtime)
                 || (!in_config_module
                     && !module_export
                     && (references_dev_config || references_dev_flag))
                 || (!in_interface_route_plan_module
                     && !in_runtime_module
+                    && !in_wiring_module
                     && !interface_route_plan_module_export
                     && references_interface_route_plan)
                 || (!in_packet_pump_module
                     && !in_runtime_module
+                    && !in_wiring_module
                     && !packet_pump_module_export
                     && !allowed_tun_packet_interface_adapter
                     && references_packet_pump)
-                || (!in_runtime_module && !runtime_module_export && references_runtime)
+                || (!in_runtime_module
+                    && !in_wiring_module
+                    && !runtime_module_export
+                    && references_runtime)
+                || (!in_wiring_module && !wiring_module_export && references_wiring)
                 || (!in_linux_tun_module && !linux_tun_module_export && references_linux_tun)
                 || (!in_macos_utun_module && !macos_utun_module_export && references_macos_utun)
             {
