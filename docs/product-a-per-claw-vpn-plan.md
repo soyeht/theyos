@@ -30,6 +30,10 @@ exceptions before an explicit T1 guard change. The current pre-wiring debug
 hardening follow-up also removes packet/frame bytes from `TunnelFrame` Debug
 output, so a future wiring caller cannot accidentally log raw `Health`, `Data`,
 or `Error` payloads by formatting a frame.
+The current guard-scope follow-up also extends the per-Claw VPN source guard to
+`e2e-rs`, which has a `server-rs` dev-dependency, so sibling-crate tests cannot
+construct or name per-Claw VPN symbols, TUN/utun helpers, or datapath wiring
+without an explicit future wiring review.
 There is still no
 checked-in runtime/bin that opens a TUN/utun interface in a product/default
 path, caller that invokes the runtime coordinator, route executor, packet pump,
@@ -286,7 +290,11 @@ Access between members/devices and claws is explicitly many-to-many:
   keeps the wire format unchanged but makes the shared relay-stream frame
   `Debug` implementation redact raw `Health` and `Data` bytes before any
   wiring slice can log a frame in a live pump path; frame error text is also
-  redacted because it may contain local target or peer-provided detail.
+  redacted because it may contain local target or peer-provided detail. The
+  e2e-guard-scope follow-up extends the unwired source guard to `e2e-rs`
+  sources/tests/benches and rejects per-Claw VPN symbols there, closing the
+  sibling-crate dev-dependency path before any future wiring slice can add a
+  test-only caller without tripping the same STOP gate.
   Exit: T1–T4 green on dev hosts.
 - **Phase 2 — iOS Packet Tunnel dev build.** Entry: entitlement go/no-go.
   Dev device only. Exit: T5–T7 green (iPhone reaches Claw-A — and only

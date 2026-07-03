@@ -3381,6 +3381,27 @@ fn collect_runtime_rust_sources(dir: &Path, out: &mut Vec<PathBuf>) {
     }
 }
 
+fn collect_rust_sources(dir: &Path, out: &mut Vec<PathBuf>) {
+    for entry in fs::read_dir(dir).unwrap_or_else(|e| panic!("read {}: {e}", dir.display())) {
+        let path = entry
+            .unwrap_or_else(|e| panic!("read entry under {}: {e}", dir.display()))
+            .path();
+        if path.is_dir() {
+            if path_has_component(&path, "target")
+                || path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with('.'))
+            {
+                continue;
+            }
+            collect_rust_sources(&path, out);
+        } else if path.extension().and_then(|ext| ext.to_str()) == Some("rs") {
+            out.push(path);
+        }
+    }
+}
+
 fn assert_passkey_conversion_only_in_local_attested_helper() {
     let admin_rust_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .parent()
@@ -3777,7 +3798,12 @@ fn product_a_transport_source_guard_does_not_become_owner_tier_authority() {
 
 #[test]
 fn product_a_per_claw_vpn_dev_config_remains_default_off_and_unwired() {
-    let server_src_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src");
+    let server_crate_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let admin_rust_dir = server_crate_dir
+        .parent()
+        .expect("server-rs parent is admin/rust")
+        .to_path_buf();
+    let server_src_dir = server_crate_dir.join("src");
     let mut sources = Vec::new();
     collect_runtime_rust_sources(&server_src_dir, &mut sources);
     assert!(
@@ -3792,6 +3818,16 @@ fn product_a_per_claw_vpn_dev_config_remains_default_off_and_unwired() {
     let linux_tun_path = server_src_dir.join("claw_vpn_linux_tun.rs");
     let macos_utun_path = server_src_dir.join("claw_vpn_macos_utun.rs");
     let lib_path = server_src_dir.join("lib.rs");
+    let e2e_crate_dir = admin_rust_dir.join("e2e-rs");
+    let e2e_dev_dep_manifest = e2e_crate_dir.join("Cargo.toml");
+    let e2e_runner_src_path = e2e_crate_dir.join("src").join("main.rs");
+    let e2e_failure_injection_test_path = e2e_crate_dir
+        .join("tests")
+        .join("phase3_support")
+        .join("failure_injector.rs");
+    let e2e_bench_path = e2e_crate_dir.join("benches").join("phase1_identity.rs");
+    let mut e2e_sources = Vec::new();
+    collect_rust_sources(&e2e_crate_dir, &mut e2e_sources);
     assert!(
         sources.iter().any(|path| path == &config_path),
         "per-Claw VPN source guard must include server-rs/src/claw_vpn_dev_config.rs"
@@ -3821,6 +3857,48 @@ fn product_a_per_claw_vpn_dev_config_remains_default_off_and_unwired() {
     assert!(
         sources.iter().any(|path| path == &lib_path),
         "per-Claw VPN source guard must include server-rs/src/lib.rs"
+    );
+    assert!(
+        e2e_dev_dep_manifest.exists(),
+        "per-Claw VPN source guard must anchor e2e-rs because it has a server-rs dev-dependency"
+    );
+    let e2e_manifest_source = fs::read_to_string(&e2e_dev_dep_manifest).unwrap_or_else(|e| {
+        panic!(
+            "read per-Claw VPN e2e manifest {}: {e}",
+            e2e_dev_dep_manifest.display()
+        )
+    });
+    let mut in_e2e_dev_dependencies = false;
+    let e2e_manifest_has_server_rs_dev_dep = e2e_manifest_source.lines().any(|line| {
+        let trimmed = line.trim();
+        if trimmed.starts_with('[') && trimmed.ends_with(']') {
+            in_e2e_dev_dependencies = trimmed == "[dev-dependencies]";
+            return false;
+        }
+        if !in_e2e_dev_dependencies {
+            return false;
+        }
+        let code = trimmed.split('#').next().unwrap_or("").trim();
+        code.strip_prefix("server-rs")
+            .is_some_and(|rest| rest.trim_start().starts_with('='))
+    });
+    assert!(
+        e2e_manifest_has_server_rs_dev_dep,
+        "per-Claw VPN e2e guard must stay anchored while e2e-rs can reach server-rs as a dev-dependency"
+    );
+    assert!(
+        e2e_sources.iter().any(|path| path == &e2e_runner_src_path),
+        "per-Claw VPN source guard must scan e2e-rs/src"
+    );
+    assert!(
+        e2e_sources
+            .iter()
+            .any(|path| path == &e2e_failure_injection_test_path),
+        "per-Claw VPN source guard must scan e2e-rs tests that can reach server-rs via dev-dependency"
+    );
+    assert!(
+        e2e_sources.iter().any(|path| path == &e2e_bench_path),
+        "per-Claw VPN source guard must scan e2e-rs benches"
     );
     let lib_source = fs::read_to_string(&lib_path).unwrap_or_else(|e| {
         panic!(
@@ -4113,8 +4191,9 @@ fn product_a_per_claw_vpn_dev_config_remains_default_off_and_unwired() {
                 || line.contains("ClawVpnPacketInterface")
                 || line.contains("ClawVpnPacketRelay")
                 || line.contains("claw_vpn_packet_pump");
-            let references_runtime =
-                line.contains("ClawVpnRuntime") || line.contains("claw_vpn_runtime");
+            let references_runtime = line.contains("ClawVpnRuntime")
+                || line.contains("claw_vpn_runtime")
+                || line.contains("CLAW_VPN_RUNTIME");
             let references_linux_tun = line.contains("ClawVpnLinuxTun")
                 || line.contains("claw_vpn_linux_tun")
                 || line.contains("/dev/net/tun")
@@ -4182,6 +4261,43 @@ fn product_a_per_claw_vpn_dev_config_remains_default_off_and_unwired() {
         violations.is_empty(),
         "per-Claw VPN dev config/interface-route-plan-executor/packet-pump/runtime/TUN/utun/datapath must stay default-off/unwired outside reviewed modules:\n{}",
         violations.join("\n")
+    );
+
+    let mut e2e_violations = Vec::new();
+    for path in e2e_sources {
+        let source = fs::read_to_string(&path).unwrap_or_else(|e| {
+            panic!("read per-Claw VPN e2e guard source {}: {e}", path.display())
+        });
+        for (index, line) in source.lines().enumerate() {
+            let references_per_claw_vpn_symbol =
+                line.contains("ClawVpn") || line.contains("claw_vpn") || line.contains("CLAW_VPN");
+            let references_linux_tun = line.contains("ClawVpnLinuxTun")
+                || line.contains("claw_vpn_linux_tun")
+                || line.contains("/dev/net/tun")
+                || line.contains("TUNSETIFF")
+                || line.contains("IFF_TUN")
+                || line.contains("IFF_TUN_EXCL")
+                || line.contains("IFF_NO_PI");
+            let references_macos_utun = line.contains("ClawVpnMacosUtun")
+                || line.contains("claw_vpn_macos_utun")
+                || line.contains("utun_control")
+                || line.contains("CTLIOCGINFO")
+                || line.contains("UTUN_OPT_IFNAME")
+                || line.contains("sockaddr_ctl")
+                || line.contains("PF_SYSTEM")
+                || line.contains("AF_SYSTEM")
+                || line.contains("AF_SYS_CONTROL")
+                || line.contains("SYSPROTO_CONTROL");
+            if references_per_claw_vpn_symbol || references_linux_tun || references_macos_utun {
+                e2e_violations.push(format!("{}:{}: {}", path.display(), index + 1, line.trim()));
+            }
+        }
+    }
+
+    assert!(
+        e2e_violations.is_empty(),
+        "per-Claw VPN symbols/TUN/utun wiring must stay out of e2e-rs despite its server-rs dev-dependency:\n{}",
+        e2e_violations.join("\n")
     );
 }
 
