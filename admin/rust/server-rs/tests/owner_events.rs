@@ -4191,6 +4191,12 @@ fn product_a_per_claw_vpn_dev_config_remains_default_off_and_unwired() {
                 || line.contains("ClawVpnPacketInterface")
                 || line.contains("ClawVpnPacketRelay")
                 || line.contains("claw_vpn_packet_pump");
+            let allowed_tun_packet_interface_adapter = (in_linux_tun_module
+                || in_macos_utun_module)
+                && line.contains("ClawVpnPacketInterface")
+                && !line.contains("ClawVpnPacketPump")
+                && !line.contains("ClawVpnPacketRelay")
+                && !line.contains("ClawVpnPacketPumpLoop");
             let references_runtime = line.contains("ClawVpnRuntime")
                 || line.contains("claw_vpn_runtime")
                 || line.contains("CLAW_VPN_RUNTIME");
@@ -4247,6 +4253,7 @@ fn product_a_per_claw_vpn_dev_config_remains_default_off_and_unwired() {
                 || (!in_packet_pump_module
                     && !in_runtime_module
                     && !packet_pump_module_export
+                    && !allowed_tun_packet_interface_adapter
                     && references_packet_pump)
                 || (!in_runtime_module && !runtime_module_export && references_runtime)
                 || (!in_linux_tun_module && !linux_tun_module_export && references_linux_tun)

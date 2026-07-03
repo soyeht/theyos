@@ -10,6 +10,8 @@ use std::io::{self, Read, Write};
 use std::mem::MaybeUninit;
 use std::os::fd::AsRawFd;
 
+use crate::claw_vpn_packet_pump::ClawVpnPacketInterface;
+
 const LINUX_TUN_DEVICE: &str = "/dev/net/tun";
 const LINUX_IFNAMSIZ: usize = 16;
 const LINUX_TUNSETIFF: libc::Ioctl = 0x4004_54ca;
@@ -162,6 +164,16 @@ impl ClawVpnLinuxTunDevice {
     }
 
     pub fn write_packet(&mut self, packet: &[u8]) -> io::Result<()> {
+        self.file.write_all(packet)
+    }
+}
+
+impl ClawVpnPacketInterface for ClawVpnLinuxTunDevice {
+    fn read_packet(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        self.file.read(buf)
+    }
+
+    fn write_packet(&mut self, packet: &[u8]) -> io::Result<()> {
         self.file.write_all(packet)
     }
 }
@@ -336,5 +348,32 @@ mod tests {
         assert!(!debug_name.contains("clawvpn0"));
         assert!(!debug_config.contains("clawvpn0"));
         assert!(!debug_device.contains("clawvpn0"));
+    }
+
+    #[test]
+    fn linux_tun_device_implements_packet_interface_without_exposing_fd_or_name() {
+        fn assert_packet_interface<T: ClawVpnPacketInterface>() {}
+        assert_packet_interface::<ClawVpnLinuxTunDevice>();
+
+        let name = tun_name("clawvpn0");
+        let mut device = ClawVpnLinuxTunDevice {
+            file: OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open("/dev/null")
+                .expect("test can open /dev/null"),
+            name,
+        };
+        let mut buf = [0u8; 8];
+        let read_len = ClawVpnPacketInterface::read_packet(&mut device, &mut buf)
+            .expect("/dev/null read succeeds");
+        assert_eq!(read_len, 0);
+        ClawVpnPacketInterface::write_packet(&mut device, &[0x45, 0, 0, 20])
+            .expect("/dev/null write succeeds");
+
+        let debug = format!("{device:?}");
+        assert!(debug.contains("<redacted>"));
+        assert!(!debug.contains("clawvpn0"));
+        assert!(!debug.contains(&device.file.as_raw_fd().to_string()));
     }
 }

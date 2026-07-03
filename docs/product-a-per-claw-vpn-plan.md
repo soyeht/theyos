@@ -34,6 +34,10 @@ The current guard-scope follow-up also extends the per-Claw VPN source guard to
 `e2e-rs`, which has a `server-rs` dev-dependency, so sibling-crate tests cannot
 construct or name per-Claw VPN symbols, TUN/utun helpers, or datapath wiring
 without an explicit future wiring review.
+The current interface-adapter follow-up makes the existing Linux TUN and macOS
+utun device wrappers implement the abstract packet-pump interface trait, while
+keeping those adapters unwired and allowing only that narrow trait reference in
+the OS-specific modules.
 There is still no
 checked-in runtime/bin that opens a TUN/utun interface in a product/default
 path, caller that invokes the runtime coordinator, route executor, packet pump,
@@ -294,7 +298,10 @@ Access between members/devices and claws is explicitly many-to-many:
   e2e-guard-scope follow-up extends the unwired source guard to `e2e-rs`
   sources/tests/benches and rejects per-Claw VPN symbols there, closing the
   sibling-crate dev-dependency path before any future wiring slice can add a
-  test-only caller without tripping the same STOP gate.
+  test-only caller without tripping the same STOP gate. The interface-adapter
+  follow-up then implements the packet-pump interface trait for the existing
+  Linux TUN and macOS utun wrappers only, preserving the STOP gate against any
+  runtime caller or live route/relay activation.
   Exit: T1–T4 green on dev hosts.
 - **Phase 2 — iOS Packet Tunnel dev build.** Entry: entitlement go/no-go.
   Dev device only. Exit: T5–T7 green (iPhone reaches Claw-A — and only

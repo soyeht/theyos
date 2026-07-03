@@ -10,6 +10,8 @@ use std::io::{self, Read, Write};
 use std::mem;
 use std::os::fd::{AsRawFd, FromRawFd};
 
+use crate::claw_vpn_packet_pump::ClawVpnPacketInterface;
+
 const MACOS_UTUN_CONTROL_NAME: &str = "com.apple.net.utun_control";
 const MACOS_UTUN_MAX_NAME_LEN: usize = libc::IFNAMSIZ - 1;
 const MACOS_UTUN_ADDRESS_FAMILY_HEADER_LEN: usize = 4;
@@ -96,6 +98,16 @@ impl ClawVpnMacosUtunDevice {
     }
 
     pub fn write_packet(&mut self, packet: &[u8]) -> io::Result<()> {
+        write_utun_ipv4_packet(&mut self.file, packet)
+    }
+}
+
+impl ClawVpnPacketInterface for ClawVpnMacosUtunDevice {
+    fn read_packet(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        read_utun_ipv4_packet(&mut self.file, buf)
+    }
+
+    fn write_packet(&mut self, packet: &[u8]) -> io::Result<()> {
         write_utun_ipv4_packet(&mut self.file, packet)
     }
 }
@@ -398,5 +410,53 @@ mod tests {
         assert!(!device_debug.contains(&device.file.as_raw_fd().to_string()));
         assert!(name_debug.contains("<redacted>"));
         assert!(device_debug.contains("<redacted>"));
+    }
+
+    #[test]
+    fn macos_utun_device_implements_packet_interface_for_ipv4_reads_and_writes() {
+        fn assert_packet_interface<T: ClawVpnPacketInterface>() {}
+        assert_packet_interface::<ClawVpnMacosUtunDevice>();
+
+        let mut name = [0; libc::IFNAMSIZ];
+        for (index, byte) in b"utun7".iter().enumerate() {
+            name[index] = libc::c_char::try_from(*byte).unwrap();
+        }
+        let name = ClawVpnMacosUtunName::from_kernel_name(&name).unwrap();
+        let packet = [
+            0x45, 0, 0, 20, 0, 0, 0, 0, 64, 6, 0, 0, 192, 0, 2, 10, 192, 0, 2, 20,
+        ];
+
+        let mut framed_file = tempfile::tempfile().expect("test can create temp utun file");
+        let frame = encode_utun_ipv4_frame(&packet).unwrap();
+        std::io::Write::write_all(&mut framed_file, &frame).expect("test can write framed packet");
+        std::io::Seek::rewind(&mut framed_file).expect("test can rewind framed packet");
+        let mut read_device = ClawVpnMacosUtunDevice {
+            file: framed_file,
+            name: name.clone(),
+        };
+        let mut decoded = [0; 20];
+        let decoded_len = ClawVpnPacketInterface::read_packet(&mut read_device, &mut decoded)
+            .expect("trait read decodes utun IPv4 frame");
+        assert_eq!(decoded_len, packet.len());
+        assert_eq!(decoded, packet);
+
+        let mut write_device = ClawVpnMacosUtunDevice {
+            file: File::options()
+                .write(true)
+                .open("/dev/null")
+                .expect("/dev/null exists on macOS"),
+            name,
+        };
+        ClawVpnPacketInterface::write_packet(&mut write_device, &packet)
+            .expect("/dev/null write succeeds");
+
+        let read_debug = format!("{read_device:?}");
+        let write_debug = format!("{write_device:?}");
+        assert!(read_debug.contains("<redacted>"));
+        assert!(write_debug.contains("<redacted>"));
+        assert!(!read_debug.contains("utun7"));
+        assert!(!write_debug.contains("utun7"));
+        assert!(!read_debug.contains(&read_device.file.as_raw_fd().to_string()));
+        assert!(!write_debug.contains(&write_device.file.as_raw_fd().to_string()));
     }
 }
