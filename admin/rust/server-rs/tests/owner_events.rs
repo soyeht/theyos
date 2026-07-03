@@ -3816,6 +3816,7 @@ fn product_a_per_claw_vpn_dev_config_remains_default_off_and_unwired() {
     let packet_pump_path = server_src_dir.join("claw_vpn_packet_pump.rs");
     let runtime_path = server_src_dir.join("claw_vpn_runtime.rs");
     let wiring_path = server_src_dir.join("claw_vpn_wiring.rs");
+    let startup_wiring_path = server_src_dir.join("startup_wiring.rs");
     let linux_tun_path = server_src_dir.join("claw_vpn_linux_tun.rs");
     let macos_utun_path = server_src_dir.join("claw_vpn_macos_utun.rs");
     let lib_path = server_src_dir.join("lib.rs");
@@ -3850,6 +3851,10 @@ fn product_a_per_claw_vpn_dev_config_remains_default_off_and_unwired() {
     assert!(
         sources.iter().any(|path| path == &wiring_path),
         "per-Claw VPN source guard must include server-rs/src/claw_vpn_wiring.rs"
+    );
+    assert!(
+        sources.iter().any(|path| path == &startup_wiring_path),
+        "per-Claw VPN source guard must include server-rs/src/startup_wiring.rs for the default-off startup gate"
     );
     assert!(
         sources.iter().any(|path| path == &linux_tun_path),
@@ -4203,6 +4208,7 @@ fn product_a_per_claw_vpn_dev_config_remains_default_off_and_unwired() {
             let in_packet_pump_module = path == packet_pump_path;
             let in_runtime_module = path == runtime_path;
             let in_wiring_module = path == wiring_path;
+            let in_startup_wiring_module = path == startup_wiring_path;
             let in_linux_tun_module = path == linux_tun_path;
             let in_macos_utun_module = path == macos_utun_path;
             let references_dev_config =
@@ -4280,12 +4286,15 @@ fn product_a_per_claw_vpn_dev_config_remains_default_off_and_unwired() {
                     && !line.contains("ClawVpnAuditEvent")
                     && (line.contains("ClawVpnAgentSessionCore")
                         || line.contains("ClawVpnDatapathSide")));
+            let allowed_startup_wiring_dev_config_gate =
+                in_startup_wiring_module && references_dev_config && !references_dev_flag;
             if (!allowed_packet_pump_datapath_runtime
                 && !allowed_runtime_datapath_runtime
                 && !allowed_wiring_datapath_runtime
                 && references_datapath_runtime)
                 || (!in_config_module
                     && !module_export
+                    && !allowed_startup_wiring_dev_config_gate
                     && (references_dev_config || references_dev_flag))
                 || (!in_interface_route_plan_module
                     && !in_runtime_module

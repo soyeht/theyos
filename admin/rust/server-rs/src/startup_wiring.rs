@@ -4,6 +4,7 @@
 use std::sync::Arc;
 
 use crate::apns_push::{self, HouseCreatedTransport};
+use crate::claw_vpn_dev_config::{ClawVpnDevConfig, ClawVpnDevConfigError, ClawVpnDevMode};
 use crate::setup_beacon::SetupBeaconParams;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -11,6 +12,13 @@ pub enum PushTransportStartupStatus {
     Installed,
     Skipped,
     AlreadyInstalled,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PerClawVpnStartupStatus {
+    Disabled,
+    OwnerAuthorizationRequired { mode: ClawVpnDevMode },
+    InvalidConfig,
 }
 
 /// Install the production `house_created` APNs transport from environment.
@@ -49,6 +57,44 @@ where
     } else {
         tracing::info!(stage = "apns.push.transport_already_installed");
         PushTransportStartupStatus::AlreadyInstalled
+    }
+}
+
+/// Inspect the per-Claw VPN dev flags during startup without activating the
+/// datapath.
+///
+/// This is intentionally a stop gate, not runtime wiring: when the dev config is
+/// absent it returns `Disabled`; when it is present it stops at owner
+/// authorization and hardware evidence requirements from the T1 readiness
+/// runbook. It does not call the runtime assembly, open TUN/utun, dial a relay,
+/// install routes, spawn work, or build caller-supplied handles.
+pub fn per_claw_vpn_startup_gate_from_env() -> PerClawVpnStartupStatus {
+    per_claw_vpn_startup_gate_with(ClawVpnDevConfig::from_env)
+}
+
+pub fn per_claw_vpn_startup_gate_with<Load>(load: Load) -> PerClawVpnStartupStatus
+where
+    Load: FnOnce() -> Result<Option<ClawVpnDevConfig>, ClawVpnDevConfigError>,
+{
+    match load() {
+        Ok(None) => PerClawVpnStartupStatus::Disabled,
+        Ok(Some(config)) => {
+            let mode = config.mode();
+            tracing::warn!(
+                stage = "claw_vpn.startup.owner_authorization_required",
+                mode = ?mode,
+                "per-Claw VPN dev config is present; live wiring remains blocked pending owner authorization, rollback, and T1-T4 hardware evidence"
+            );
+            PerClawVpnStartupStatus::OwnerAuthorizationRequired { mode }
+        }
+        Err(error) => {
+            tracing::warn!(
+                stage = "claw_vpn.startup.invalid_config",
+                error = %error,
+                "per-Claw VPN dev config is invalid; live wiring remains disabled"
+            );
+            PerClawVpnStartupStatus::InvalidConfig
+        }
     }
 }
 
@@ -165,6 +211,43 @@ mod tests {
         );
 
         assert_eq!(status, PushTransportStartupStatus::AlreadyInstalled);
+    }
+
+    #[test]
+    fn per_claw_vpn_startup_gate_is_default_off() {
+        let status = per_claw_vpn_startup_gate_with(|| Ok(None));
+
+        assert_eq!(status, PerClawVpnStartupStatus::Disabled);
+    }
+
+    #[test]
+    fn per_claw_vpn_startup_gate_requires_owner_auth_when_configured() {
+        let config = ClawVpnDevConfig::from_values(
+            Some("1"),
+            None,
+            Some("relay-stream://127.0.0.1:49152"),
+            Some("198.18.0.0/24"),
+            None,
+            None,
+        )
+        .unwrap()
+        .unwrap();
+        let status = per_claw_vpn_startup_gate_with(|| Ok(Some(config)));
+
+        assert_eq!(
+            status,
+            PerClawVpnStartupStatus::OwnerAuthorizationRequired {
+                mode: ClawVpnDevMode::Live
+            }
+        );
+    }
+
+    #[test]
+    fn per_claw_vpn_startup_gate_fails_closed_on_invalid_config() {
+        let status =
+            per_claw_vpn_startup_gate_with(|| Err(ClawVpnDevConfigError::ConflictingModes));
+
+        assert_eq!(status, PerClawVpnStartupStatus::InvalidConfig);
     }
 
     #[test]

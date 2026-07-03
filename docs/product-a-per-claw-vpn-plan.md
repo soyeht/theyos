@@ -50,6 +50,11 @@ The current wiring-assembly follow-up adds a default-off composition point that
 can bind caller-supplied fixed-session core, route-plan, packet-pump, bounded
 production driver, and runtime handles without reading flags, opening TUN/utun,
 dialing a relay, spawning work, or adding a product/bootstrap caller.
+The current startup-gate follow-up lets the engine bootstrap observe the
+default-off per-Claw VPN dev config and stop at the runbook's owner
+authorization/hardware-evidence gate when a dev mode is present; it still does
+not call the runtime assembly, construct route/interface/relay handles, run the
+packet pump, or authorize a live T1 run.
 There is still no
 checked-in runtime/bin that opens a TUN/utun interface in a product/default
 path, caller that invokes the runtime coordinator, route executor, packet pump,
@@ -332,7 +337,11 @@ Access between members/devices and claws is explicitly many-to-many:
   product/bootstrap caller. The source guard permits this module to name the
   already-reviewed route, pump, runtime, and datapath types only for that inert
   assembly point; TUN/utun helpers, e2e-rs, dev flags, and product callers
-  remain guarded.
+  remain guarded. The startup-gate follow-up adds the first bootstrap call site
+  for the per-Claw VPN dev config, but it is a stop gate only: default-off
+  returns `Disabled`, enabled dev config returns owner-authorization-required,
+  invalid config fails closed, and no runtime assembly, TUN/utun, relay, route,
+  pump loop, or live handle factory is invoked.
   Exit: T1–T4 green on dev hosts.
 - **Phase 2 — iOS Packet Tunnel dev build.** Entry: entitlement go/no-go.
   Dev device only. Exit: T5–T7 green (iPhone reaches Claw-A — and only
