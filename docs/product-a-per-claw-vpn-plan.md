@@ -67,13 +67,13 @@ stream but does not dial a relay, authenticate a stream, spawn work, or add a
 product/bootstrap caller. The future T1 caller that supplies the concrete
 stream/socket must impose a read/idle timeout before handing it to this adapter;
 the adapter itself remains stream-agnostic and only enforces the frame size cap.
-The current relay target-router follow-up makes the existing `IpTunnel`
-resource gate delegate to a caller-supplied target backend only after the same
-offer/slot/trust checks pass, while the production mount still uses the
-default fail-closed backend; the source guard now tripwires external use of
-that injectable `IpTunnel` backend constructor. It does not build the VPN
-runtime, open devices, dial sockets, spawn work, or add a product/bootstrap
-caller.
+The current relay target-router and reverse-connect binding follow-ups make the
+existing `IpTunnel` resource gate delegate to a caller-supplied target backend
+only after the same offer/slot/trust checks pass, while the production mount
+still uses the default fail-closed backend; the source guard now tripwires
+external use of that injectable `IpTunnel` backend constructor and binding
+entrypoint. They do not build the VPN runtime, open devices, dial sockets,
+spawn work, or add a product/bootstrap caller.
 There is still no
 checked-in runtime/bin that opens a TUN/utun interface in a product/default
 path, caller that invokes the runtime coordinator, route executor, packet pump,

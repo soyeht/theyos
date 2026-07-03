@@ -24,7 +24,9 @@ use household_rs::ids::HouseholdId;
 use crate::claw_share_relay_stream_contract::RelayStreamOfferContract;
 use crate::claw_share_relay_stream_issuer_trust::RelayStreamIssuerTrust;
 use crate::claw_share_relay_stream_responder::ResponderDataTunnelDeps;
-use crate::claw_share_relay_stream_target_router::RelayStreamOfferTargetRouter;
+use crate::claw_share_relay_stream_target_router::{
+    RelayStreamIpTunnelUnavailableRouter, RelayStreamOfferTargetRouter,
+};
 
 /// One offer bound to its target router and data-tunnel deps for a single
 /// reverse-connect attempt.
@@ -32,13 +34,13 @@ use crate::claw_share_relay_stream_target_router::RelayStreamOfferTargetRouter;
 /// `offer` is the source of truth: the handshake uses `offer`, and the router
 /// inside `deps` was built from the same offer + the same `trust` seam + the
 /// same slot store, so the two cannot diverge.
-pub struct RelayStreamReverseConnectBinding<P, S> {
+pub struct RelayStreamReverseConnectBinding<P, S, I = RelayStreamIpTunnelUnavailableRouter> {
     pub offer: Arc<RelayStreamOfferContract>,
     pub trust: RelayStreamIssuerTrust,
-    pub deps: ResponderDataTunnelDeps<RelayStreamOfferTargetRouter<P, S>>,
+    pub deps: ResponderDataTunnelDeps<RelayStreamOfferTargetRouter<P, S, I>>,
 }
 
-impl<P, S> fmt::Debug for RelayStreamReverseConnectBinding<P, S> {
+impl<P, S, I> fmt::Debug for RelayStreamReverseConnectBinding<P, S, I> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("RelayStreamReverseConnectBinding")
             .field("offer", &"redacted")
@@ -68,12 +70,38 @@ pub fn bind_relay_stream_reverse_connect<P, S>(
     clawsite_router: S,
     now_unix: impl Fn() -> u64 + Send + Sync + 'static,
 ) -> RelayStreamReverseConnectBinding<P, S> {
-    let router = RelayStreamOfferTargetRouter::new(
+    bind_relay_stream_reverse_connect_with_ip_tunnel_router(
+        offer,
+        trust,
+        household_id,
+        slots,
+        replay,
+        pty_router,
+        clawsite_router,
+        RelayStreamIpTunnelUnavailableRouter,
+        now_unix,
+    )
+}
+
+#[allow(clippy::too_many_arguments, clippy::needless_pass_by_value)]
+pub fn bind_relay_stream_reverse_connect_with_ip_tunnel_router<P, S, I>(
+    offer: Arc<RelayStreamOfferContract>,
+    trust: RelayStreamIssuerTrust,
+    household_id: HouseholdId,
+    slots: Arc<ClawShareSlotStore>,
+    replay: Arc<ReplayGuard>,
+    pty_router: P,
+    clawsite_router: S,
+    ip_tunnel_router: I,
+    now_unix: impl Fn() -> u64 + Send + Sync + 'static,
+) -> RelayStreamReverseConnectBinding<P, S, I> {
+    let router = RelayStreamOfferTargetRouter::new_with_ip_tunnel_router(
         (*offer).clone(),
         trust.clone(),
         Arc::clone(&slots),
         pty_router,
         clawsite_router,
+        ip_tunnel_router,
         now_unix,
     );
     let deps = ResponderDataTunnelDeps::new(household_id, Arc::clone(&slots), replay, router);
@@ -179,12 +207,13 @@ mod tests {
         )
     }
 
-    async fn open_roundtrip<P, S>(
-        binding: &RelayStreamReverseConnectBinding<P, S>,
+    async fn open_roundtrip<P, S, I>(
+        binding: &RelayStreamReverseConnectBinding<P, S, I>,
     ) -> Result<Vec<u8>, DataTunnelError>
     where
         P: ClawTargetRouter,
         S: ClawTargetRouter,
+        I: ClawTargetRouter,
     {
         let mut session = binding.deps.router.open(RELAY_STREAM_CLAW_ID).await?;
         session
@@ -206,10 +235,13 @@ mod tests {
         Ok(buf[..n].to_vec())
     }
 
-    async fn open_error<P, S>(binding: &RelayStreamReverseConnectBinding<P, S>) -> DataTunnelError
+    async fn open_error<P, S, I>(
+        binding: &RelayStreamReverseConnectBinding<P, S, I>,
+    ) -> DataTunnelError
     where
         P: ClawTargetRouter,
         S: ClawTargetRouter,
+        I: ClawTargetRouter,
     {
         match binding.deps.router.open(RELAY_STREAM_CLAW_ID).await {
             Ok(_) => panic!("expected target open to fail"),
@@ -239,6 +271,28 @@ mod tests {
         let response = open_roundtrip(&binding).await.unwrap();
 
         assert_eq!(response, b"SITE:x");
+    }
+
+    #[tokio::test]
+    async fn binding_routes_iptunnel_offer_to_injected_subrouter() {
+        let pty_addr = spawn_prefixed_ack(b"PTY:").await;
+        let site_addr = spawn_prefixed_ack(b"SITE:").await;
+        let ip_addr = spawn_prefixed_ack(b"IPTUNNEL:").await;
+        let binding = bind_relay_stream_reverse_connect_with_ip_tunnel_router(
+            offer_with(RelayStreamResource::IpTunnel, &owner_signer()),
+            relay_stream_issuer_trust(),
+            derive_household_id(&owner_signer().public()),
+            consumed_slots(),
+            Arc::new(ReplayGuard::new()),
+            TcpStreamRouter::new(pty_addr),
+            TcpStreamRouter::new(site_addr),
+            TcpStreamRouter::new(ip_addr),
+            || NOW,
+        );
+
+        let response = open_roundtrip(&binding).await.unwrap();
+
+        assert_eq!(response, b"IPTUNNEL:x");
     }
 
     #[tokio::test]
