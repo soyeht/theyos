@@ -159,9 +159,9 @@ where
 /// that drives the Noise prologue is by construction the same offer the router
 /// gates on (M2a airtight at the serve boundary). It does not admit; the binding
 /// already carries a fresh seam.
-pub async fn serve_relay_stream_responder_reverse_connected_binding<T, P, S>(
+pub async fn serve_relay_stream_responder_reverse_connected_binding<T, P, S, I>(
     stream: T,
-    binding: &RelayStreamReverseConnectBinding<P, S>,
+    binding: &RelayStreamReverseConnectBinding<P, S, I>,
     params: &RelayStreamResponderParams,
     now_unix: u64,
     config: RelayStreamResponderReverseConnectConfig,
@@ -170,6 +170,7 @@ where
     T: AsyncRead + AsyncWrite + Unpin,
     P: ClawTargetRouter,
     S: ClawTargetRouter,
+    I: ClawTargetRouter,
 {
     serve_relay_stream_responder_reverse_connected_with_trust(
         stream,
@@ -187,15 +188,16 @@ where
 /// binding. The binding must have been created after a fresh admission for this
 /// attempt; this function performs no admission and never accepts separate
 /// offer/deps arguments.
-pub async fn serve_relay_stream_responder_reverse_connect_binding<P, S>(
+pub async fn serve_relay_stream_responder_reverse_connect_binding<P, S, I>(
     config: RelayStreamResponderReverseConnectConfig,
-    binding: &RelayStreamReverseConnectBinding<P, S>,
+    binding: &RelayStreamReverseConnectBinding<P, S, I>,
     params: &RelayStreamResponderParams,
     now_unix: u64,
 ) -> Result<(), RelayStreamResponderReverseConnectError>
 where
     P: ClawTargetRouter,
     S: ClawTargetRouter,
+    I: ClawTargetRouter,
 {
     let config = config.validate()?;
     let stream = timeout(

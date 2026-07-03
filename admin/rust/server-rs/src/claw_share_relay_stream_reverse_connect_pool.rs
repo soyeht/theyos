@@ -30,6 +30,7 @@ use crate::claw_share_relay_stream_responder_reverse_connect::{
     serve_relay_stream_responder_reverse_connect_binding,
 };
 use crate::claw_share_relay_stream_reverse_connect_binding::RelayStreamReverseConnectBinding;
+use crate::claw_share_relay_stream_target_router::RelayStreamIpTunnelUnavailableRouter;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RelayStreamReverseConnectBackoffPolicy {
@@ -114,13 +115,15 @@ pub enum RelayStreamReverseConnectBindingBuildError {
     Unhealthy(String),
 }
 
-pub type RelayStreamReverseConnectBindingFactory<P, S> = dyn Fn(
-        Arc<RelayStreamOfferContract>,
-        u64,
-    )
-        -> Result<RelayStreamReverseConnectBinding<P, S>, RelayStreamReverseConnectBindingBuildError>
-    + Send
-    + Sync;
+pub type RelayStreamReverseConnectBindingFactory<P, S, I = RelayStreamIpTunnelUnavailableRouter> =
+    dyn Fn(
+            Arc<RelayStreamOfferContract>,
+            u64,
+        ) -> Result<
+            RelayStreamReverseConnectBinding<P, S, I>,
+            RelayStreamReverseConnectBindingBuildError,
+        > + Send
+        + Sync;
 
 pub struct RelayStreamReverseConnectPoolHandle {
     cancelled: Arc<AtomicBool>,
@@ -165,17 +168,18 @@ impl Drop for RelayStreamReverseConnectPoolHandle {
 // `Arc<fn()>` unsize-coerce to `Arc<dyn Fn>` at the call site, which an `&Arc`
 // parameter could not.
 #[allow(clippy::needless_pass_by_value)]
-pub fn spawn_relay_stream_reverse_connect_pool<P, S>(
+pub fn spawn_relay_stream_reverse_connect_pool<P, S, I>(
     config: RelayStreamReverseConnectPoolConfig,
     reverse_config: RelayStreamResponderReverseConnectConfig,
     params: Arc<RelayStreamResponderParams>,
     offers: Vec<Arc<RelayStreamOfferContract>>,
-    binding_factory: Arc<RelayStreamReverseConnectBindingFactory<P, S>>,
+    binding_factory: Arc<RelayStreamReverseConnectBindingFactory<P, S, I>>,
     now_unix: Arc<dyn Fn() -> u64 + Send + Sync>,
 ) -> Result<RelayStreamReverseConnectPoolHandle, RelayStreamReverseConnectPoolError>
 where
     P: ClawTargetRouter + 'static,
     S: ClawTargetRouter + 'static,
+    I: ClawTargetRouter + 'static,
 {
     let config = config.validate()?;
     let semaphore = Arc::new(Semaphore::new(config.max_total_connections));
@@ -214,18 +218,19 @@ where
 // for the worker's lifetime, so the parameters are genuinely consumed rather than
 // bundled into a context struct.
 #[allow(clippy::too_many_arguments)]
-async fn run_offer_worker<P, S>(
+async fn run_offer_worker<P, S, I>(
     config: RelayStreamReverseConnectPoolConfig,
     reverse_config: RelayStreamResponderReverseConnectConfig,
     params: Arc<RelayStreamResponderParams>,
     offer: Arc<RelayStreamOfferContract>,
-    binding_factory: Arc<RelayStreamReverseConnectBindingFactory<P, S>>,
+    binding_factory: Arc<RelayStreamReverseConnectBindingFactory<P, S, I>>,
     now_unix: Arc<dyn Fn() -> u64 + Send + Sync>,
     semaphore: Arc<Semaphore>,
     cancelled: Arc<AtomicBool>,
 ) where
     P: ClawTargetRouter + 'static,
     S: ClawTargetRouter + 'static,
+    I: ClawTargetRouter + 'static,
 {
     let mut failure_backoff = config.backoff.min;
     loop {
@@ -318,13 +323,13 @@ fn offer_store_key(offer: &RelayStreamOfferContract) -> RelayStreamOfferStoreKey
 
 /// Everything a resync needs to (re)spawn workers, shared by the initial sync
 /// resync and the tick loop. Cheaply `Arc`-cloned.
-struct ResyncContext<P, S> {
+struct ResyncContext<P, S, I> {
     state_dir: PathBuf,
     trust: RelayStreamIssuerTrust,
     config: RelayStreamReverseConnectPoolConfig,
     reverse_config: RelayStreamResponderReverseConnectConfig,
     params: Arc<RelayStreamResponderParams>,
-    binding_factory: Arc<RelayStreamReverseConnectBindingFactory<P, S>>,
+    binding_factory: Arc<RelayStreamReverseConnectBindingFactory<P, S, I>>,
     now_unix: Arc<dyn Fn() -> u64 + Send + Sync>,
     semaphore: Arc<Semaphore>,
     worker_cancelled: Arc<AtomicBool>,
@@ -332,13 +337,14 @@ struct ResyncContext<P, S> {
     trigger: Arc<Notify>,
 }
 
-fn spawn_offer_worker<P, S>(
-    ctx: &ResyncContext<P, S>,
+fn spawn_offer_worker<P, S, I>(
+    ctx: &ResyncContext<P, S, I>,
     offer: Arc<RelayStreamOfferContract>,
 ) -> JoinHandle<()>
 where
     P: ClawTargetRouter + 'static,
     S: ClawTargetRouter + 'static,
+    I: ClawTargetRouter + 'static,
 {
     let config = ctx.config;
     let reverse_config = ctx.reverse_config;
@@ -365,10 +371,11 @@ where
 /// Re-read the store and reconcile the worker registry. Synchronous: it loads,
 /// verifies/prunes via `list_active`, then spawns/aborts tasks (all sync). The
 /// registry mutex is never held across an await.
-fn resync_offers<P, S>(ctx: &ResyncContext<P, S>)
+fn resync_offers<P, S, I>(ctx: &ResyncContext<P, S, I>)
 where
     P: ClawTargetRouter + 'static,
     S: ClawTargetRouter + 'static,
+    I: ClawTargetRouter + 'static,
 {
     let now = (ctx.now_unix)();
     // CRITICAL: re-load from disk every tick. The claim path opens its own store,
@@ -456,10 +463,14 @@ where
     }
 }
 
-async fn resync_loop<P, S>(ctx: ResyncContext<P, S>, tick: Duration, driver_cancel: Arc<Notify>)
-where
+async fn resync_loop<P, S, I>(
+    ctx: ResyncContext<P, S, I>,
+    tick: Duration,
+    driver_cancel: Arc<Notify>,
+) where
     P: ClawTargetRouter + 'static,
     S: ClawTargetRouter + 'static,
+    I: ClawTargetRouter + 'static,
 {
     let trigger = Arc::clone(&ctx.resync_trigger());
     loop {
@@ -483,7 +494,7 @@ where
     }
 }
 
-impl<P, S> ResyncContext<P, S> {
+impl<P, S, I> ResyncContext<P, S, I> {
     fn resync_trigger(&self) -> Arc<Notify> {
         Arc::clone(&self.trigger)
     }
@@ -569,19 +580,20 @@ impl Drop for RelayStreamOfferResyncDriverHandle {
 /// connection semaphore (`max_total_connections`). Replaces the static pool in
 /// the live path: it both seeds the initial offers and tracks later ones.
 #[allow(clippy::too_many_arguments)]
-pub fn spawn_relay_stream_offer_resync_driver<P, S>(
+pub fn spawn_relay_stream_offer_resync_driver<P, S, I>(
     state_dir: PathBuf,
     trust: RelayStreamIssuerTrust,
     tick: Duration,
     config: RelayStreamReverseConnectPoolConfig,
     reverse_config: RelayStreamResponderReverseConnectConfig,
     params: Arc<RelayStreamResponderParams>,
-    binding_factory: Arc<RelayStreamReverseConnectBindingFactory<P, S>>,
+    binding_factory: Arc<RelayStreamReverseConnectBindingFactory<P, S, I>>,
     now_unix: Arc<dyn Fn() -> u64 + Send + Sync>,
 ) -> Result<RelayStreamOfferResyncDriverHandle, RelayStreamReverseConnectPoolError>
 where
     P: ClawTargetRouter + 'static,
     S: ClawTargetRouter + 'static,
+    I: ClawTargetRouter + 'static,
 {
     let config = config.validate()?;
     let worker_cancelled = Arc::new(AtomicBool::new(false));

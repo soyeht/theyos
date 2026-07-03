@@ -32,12 +32,13 @@ use crate::claw_share_relay_stream_responder_params::{
 use crate::claw_share_relay_stream_responder_reverse_connect::{
     RelayStreamResponderReverseConnectConfig, RelayStreamResponderReverseConnectError,
 };
-use crate::claw_share_relay_stream_reverse_connect_binding::bind_relay_stream_reverse_connect;
+use crate::claw_share_relay_stream_reverse_connect_binding::bind_relay_stream_reverse_connect_with_ip_tunnel_router;
 use crate::claw_share_relay_stream_reverse_connect_pool::{
     RelayStreamOfferResyncDriverHandle, RelayStreamReverseConnectBindingBuildError,
     RelayStreamReverseConnectBindingFactory, RelayStreamReverseConnectPoolConfig,
     RelayStreamReverseConnectPoolError, spawn_relay_stream_offer_resync_driver,
 };
+use crate::claw_share_relay_stream_target_router::RelayStreamIpTunnelUnavailableRouter;
 use crate::claw_share_relay_stream_trust_context_cache::RelayStreamTrustContextCacheError;
 use crate::claw_share_relay_stream_trust_context_health::{
     RelayStreamTrustContextRefreshPolicy, RelayStreamTrustContextRuntime,
@@ -166,6 +167,24 @@ where
     P: ClawTargetRouter + 'static,
     S: ClawTargetRouter + 'static,
 {
+    assemble_relay_stream_live_with_ip_tunnel_router(
+        inputs,
+        config,
+        Arc::new(|| RelayStreamIpTunnelUnavailableRouter),
+    )
+    .await
+}
+
+pub async fn assemble_relay_stream_live_with_ip_tunnel_router<P, S, I>(
+    inputs: RelayStreamLiveInputs<'_, P, S>,
+    config: RelayStreamLiveConfig,
+    ip_tunnel_router_factory: Arc<dyn Fn() -> I + Send + Sync>,
+) -> Result<Option<RelayStreamLiveHandles>, RelayStreamLiveError>
+where
+    P: ClawTargetRouter + 'static,
+    S: ClawTargetRouter + 'static,
+    I: ClawTargetRouter + 'static,
+{
     if !config.enabled {
         return Ok(None);
     }
@@ -201,6 +220,7 @@ where
         Arc::clone(&inputs.replay),
         Arc::clone(&inputs.pty_router_factory),
         Arc::clone(&inputs.clawsite_router_factory),
+        ip_tunnel_router_factory,
         Arc::clone(&inputs.now_unix),
     );
 
@@ -235,18 +255,20 @@ where
 }
 
 #[allow(clippy::too_many_arguments)]
-fn build_binding_factory<P, S>(
+fn build_binding_factory<P, S, I>(
     admission: RelayStreamAdmission,
     household_id: HouseholdId,
     slots: Arc<ClawShareSlotStore>,
     replay: Arc<ReplayGuard>,
     pty_router_factory: Arc<dyn Fn() -> P + Send + Sync>,
     clawsite_router_factory: Arc<dyn Fn() -> S + Send + Sync>,
+    ip_tunnel_router_factory: Arc<dyn Fn() -> I + Send + Sync>,
     now_unix: Arc<dyn Fn() -> u64 + Send + Sync>,
-) -> Arc<RelayStreamReverseConnectBindingFactory<P, S>>
+) -> Arc<RelayStreamReverseConnectBindingFactory<P, S, I>>
 where
     P: ClawTargetRouter + 'static,
     S: ClawTargetRouter + 'static,
+    I: ClawTargetRouter + 'static,
 {
     Arc::new(move |offer: Arc<RelayStreamOfferContract>, now| {
         if offer.payload.not_after <= now {
@@ -256,7 +278,7 @@ where
             RelayStreamReverseConnectBindingBuildError::Unhealthy(error.to_string())
         })?;
         let router_clock = Arc::clone(&now_unix);
-        Ok(bind_relay_stream_reverse_connect(
+        Ok(bind_relay_stream_reverse_connect_with_ip_tunnel_router(
             offer,
             trust,
             household_id.clone(),
@@ -264,6 +286,7 @@ where
             Arc::clone(&replay),
             pty_router_factory(),
             clawsite_router_factory(),
+            ip_tunnel_router_factory(),
             move || router_clock(),
         ))
     })
@@ -301,8 +324,11 @@ mod tests {
     use super::*;
 
     use std::path::Path;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
-    use household_rs::claw_share_data_tunnel::TcpStreamRouter;
+    use household_rs::claw_share_data_tunnel::{
+        ClawTargetRouter, DataTunnelError, TargetSession, TcpStreamRouter,
+    };
     use household_rs::ids::derive_household_id;
     use keystore_rs::FileKeystore;
     use tokio::net::TcpListener;
@@ -317,8 +343,8 @@ mod tests {
     use crate::claw_share_relay_stream_offer_store::RelayStreamOfferStore;
     use crate::claw_share_relay_stream_responder_config::RelayStreamResponderConfig;
     use crate::claw_share_relay_stream_test_support::{
-        data_tunnel_credential, data_tunnel_store, now_unix, owner_pub, owner_signer,
-        relay_stream_household_state, relay_stream_issuer_trust, rendezvous_token,
+        DATA_TUNNEL_CLAW_ID, data_tunnel_credential, data_tunnel_store, now_unix, owner_pub,
+        owner_signer, relay_stream_household_state, relay_stream_issuer_trust, rendezvous_token,
     };
 
     fn backend(dir: &tempfile::TempDir) -> FileKeystore {
@@ -392,6 +418,19 @@ mod tests {
         }
     }
 
+    struct CountingIpTunnelRouter {
+        opens: Arc<AtomicUsize>,
+    }
+
+    impl ClawTargetRouter for CountingIpTunnelRouter {
+        async fn open(&self, _target_id: &str) -> Result<TargetSession, DataTunnelError> {
+            self.opens.fetch_add(1, Ordering::SeqCst);
+            Err(DataTunnelError::TargetUnavailable(
+                "runtime-iptunnel-backend-hit".to_string(),
+            ))
+        }
+    }
+
     async fn unused_loopback_addr() -> std::net::SocketAddr {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -458,6 +497,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn live_wiring_injected_iptunnel_default_off_does_not_build_backend() {
+        let dir = tempfile::tempdir().unwrap();
+        let backend = backend(&dir);
+        let config = RelayStreamLiveConfig::default();
+        let factory_called = Arc::new(AtomicUsize::new(0));
+        let result = assemble_relay_stream_live_with_ip_tunnel_router(
+            inputs(dir.path(), &backend),
+            config,
+            {
+                let factory_called = Arc::clone(&factory_called);
+                Arc::new(move || {
+                    factory_called.fetch_add(1, Ordering::SeqCst);
+                    CountingIpTunnelRouter {
+                        opens: Arc::new(AtomicUsize::new(0)),
+                    }
+                })
+            },
+        )
+        .await
+        .unwrap();
+
+        assert!(result.is_none());
+        assert_eq!(factory_called.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
     async fn live_wiring_enabled_empty_store_spawns_zero_offer_pool() {
         let dir = tempfile::tempdir().unwrap();
         let backend = backend(&dir);
@@ -510,6 +575,64 @@ mod tests {
         assert_eq!(handles.offer_count(), 2);
         assert_eq!(handles.pool_task_count(), 2);
         handles.shutdown();
+    }
+
+    #[tokio::test]
+    async fn binding_factory_routes_iptunnel_to_injected_backend_after_gate() {
+        let dir = tempfile::tempdir().unwrap();
+        let backend = backend(&dir);
+        seed_offer(dir.path(), &backend, RelayStreamResource::IpTunnel, 0x44);
+        let household = relay_stream_household_state();
+        let mesh_log = MeshLogStore::new();
+        let trust_runtime = Arc::new(
+            RelayStreamTrustContextRuntime::load(
+                &household,
+                &mesh_log,
+                now_unix(),
+                RelayStreamTrustContextRefreshPolicy::new(Duration::from_secs(60), 2).unwrap(),
+            )
+            .await
+            .unwrap(),
+        );
+        let admission = RelayStreamAdmission::new(trust_runtime);
+        let mut store =
+            RelayStreamOfferStore::load(dir.path(), &relay_stream_issuer_trust(), now_unix())
+                .unwrap();
+        let offer = Arc::new(
+            store
+                .list_active(&relay_stream_issuer_trust(), now_unix())
+                .unwrap()
+                .into_iter()
+                .next()
+                .unwrap(),
+        );
+        let opens = Arc::new(AtomicUsize::new(0));
+        let binding_factory = build_binding_factory(
+            admission,
+            derive_household_id(&owner_pub()),
+            data_tunnel_store(),
+            Arc::new(ReplayGuard::new()),
+            Arc::new(|| TcpStreamRouter::new("127.0.0.1:1")),
+            Arc::new(|| TcpStreamRouter::new("127.0.0.1:1")),
+            {
+                let opens = Arc::clone(&opens);
+                Arc::new(move || CountingIpTunnelRouter {
+                    opens: Arc::clone(&opens),
+                })
+            },
+            Arc::new(now_unix),
+        );
+        let binding = binding_factory(offer, now_unix()).unwrap();
+
+        let error = match binding.deps.router.open(DATA_TUNNEL_CLAW_ID).await {
+            Ok(_) => panic!("expected injected IpTunnel backend to return an error"),
+            Err(error) => error,
+        };
+
+        assert!(
+            matches!(error, DataTunnelError::TargetUnavailable(reason) if reason == "runtime-iptunnel-backend-hit")
+        );
+        assert_eq!(opens.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]

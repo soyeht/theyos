@@ -3817,6 +3817,9 @@ fn product_a_per_claw_vpn_dev_config_remains_default_off_and_unwired() {
     let relay_stream_path = server_src_dir.join("claw_vpn_relay_stream.rs");
     let relay_stream_reverse_connect_binding_path =
         server_src_dir.join("claw_share_relay_stream_reverse_connect_binding.rs");
+    let relay_stream_reverse_connect_pool_path =
+        server_src_dir.join("claw_share_relay_stream_reverse_connect_pool.rs");
+    let relay_stream_runtime_path = server_src_dir.join("claw_share_relay_stream_runtime.rs");
     let relay_stream_target_router_path =
         server_src_dir.join("claw_share_relay_stream_target_router.rs");
     let runtime_path = server_src_dir.join("claw_vpn_runtime.rs");
@@ -3858,6 +3861,18 @@ fn product_a_per_claw_vpn_dev_config_remains_default_off_and_unwired() {
             .iter()
             .any(|path| path == &relay_stream_reverse_connect_binding_path),
         "per-Claw VPN source guard must include server-rs/src/claw_share_relay_stream_reverse_connect_binding.rs"
+    );
+    assert!(
+        sources
+            .iter()
+            .any(|path| path == &relay_stream_reverse_connect_pool_path),
+        "per-Claw VPN source guard must include server-rs/src/claw_share_relay_stream_reverse_connect_pool.rs"
+    );
+    assert!(
+        sources
+            .iter()
+            .any(|path| path == &relay_stream_runtime_path),
+        "per-Claw VPN source guard must include server-rs/src/claw_share_relay_stream_runtime.rs"
     );
     assert!(
         sources
@@ -4243,6 +4258,9 @@ fn product_a_per_claw_vpn_dev_config_remains_default_off_and_unwired() {
             let in_relay_stream_module = path == relay_stream_path;
             let in_relay_stream_reverse_connect_binding_module =
                 path == relay_stream_reverse_connect_binding_path;
+            let in_relay_stream_reverse_connect_pool_module =
+                path == relay_stream_reverse_connect_pool_path;
+            let in_relay_stream_runtime_module = path == relay_stream_runtime_path;
             let in_relay_stream_target_router_module = path == relay_stream_target_router_path;
             let in_runtime_module = path == runtime_path;
             let in_wiring_module = path == wiring_path;
@@ -4264,7 +4282,8 @@ fn product_a_per_claw_vpn_dev_config_remains_default_off_and_unwired() {
             let references_ip_tunnel_target_backend = line.contains("new_with_ip_tunnel_router")
                 || line.contains("ip_tunnel_router")
                 || line.contains("RelayStreamIpTunnelUnavailableRouter")
-                || line.contains("bind_relay_stream_reverse_connect_with_ip_tunnel_router");
+                || line.contains("bind_relay_stream_reverse_connect_with_ip_tunnel_router")
+                || line.contains("assemble_relay_stream_live_with_ip_tunnel_router");
             let allowed_tun_packet_interface_adapter = (in_linux_tun_module
                 || in_macos_utun_module)
                 && line.contains("ClawVpnPacketInterface")
@@ -4362,6 +4381,8 @@ fn product_a_per_claw_vpn_dev_config_remains_default_off_and_unwired() {
                     && references_relay_stream_adapter)
                 || (!in_relay_stream_target_router_module
                     && !in_relay_stream_reverse_connect_binding_module
+                    && !in_relay_stream_reverse_connect_pool_module
+                    && !in_relay_stream_runtime_module
                     && references_ip_tunnel_target_backend)
                 || (!in_runtime_module
                     && !in_wiring_module
