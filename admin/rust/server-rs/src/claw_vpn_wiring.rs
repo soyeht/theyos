@@ -184,6 +184,26 @@ impl fmt::Debug for ClawVpnRuntimeWiringError {
     }
 }
 
+pub enum ClawVpnRuntimeWiringBuildError<E> {
+    Session(ClawVpnSessionFrameError),
+    Inputs(E),
+}
+
+impl<E> fmt::Debug for ClawVpnRuntimeWiringBuildError<E> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Session(_) => f
+                .debug_struct("ClawVpnRuntimeWiringBuildError::Session")
+                .field("source", &"<redacted>")
+                .finish(),
+            Self::Inputs(_) => f
+                .debug_struct("ClawVpnRuntimeWiringBuildError::Inputs")
+                .field("source", &"<redacted>")
+                .finish(),
+        }
+    }
+}
+
 pub fn assemble_claw_vpn_runtime_wiring<I, R>(
     config: ClawVpnRuntimeWiringConfig,
     session_core: ClawVpnAgentSessionCore,
@@ -200,6 +220,48 @@ where
     let route_side = route_side_for_datapath(session_core.local_side());
     let addrs = session_core.addrs()?;
     let inputs = build_inputs(ClawVpnRuntimeWiringContext { route_side, addrs });
+    let route_plan = crate::claw_vpn_interface_route_plan::ClawVpnInterfaceRoutePlan::new(
+        inputs.route_platform,
+        inputs.interface_name,
+        addrs,
+        route_side,
+    );
+    let packet_pump = ClawVpnPacketPump::new(session_core);
+    let runtime = ClawVpnRuntime::new(route_plan, packet_pump, config.runtime_step_budget());
+    let route_executor = ClawVpnInterfaceRouteExecutor::new(inputs.route_tool_paths);
+    let driver = ClawVpnPacketPumpProductionDriver::new(config.driver_budget());
+
+    Ok(Some(ClawVpnRuntimeWiring {
+        runtime,
+        route_executor,
+        interface: inputs.interface,
+        relay: inputs.relay,
+        driver,
+    }))
+}
+
+pub fn try_assemble_claw_vpn_runtime_wiring_deferred<I, R, E>(
+    config: ClawVpnRuntimeWiringConfig,
+    build_session_core: impl FnOnce() -> ClawVpnAgentSessionCore,
+    build_inputs: impl FnOnce(
+        ClawVpnRuntimeWiringContext,
+    ) -> Result<ClawVpnRuntimeWiringInputs<I, R>, E>,
+) -> Result<Option<ClawVpnRuntimeWiring<I, R>>, ClawVpnRuntimeWiringBuildError<E>>
+where
+    I: ClawVpnPacketInterface,
+    R: ClawVpnPacketRelay,
+{
+    if !config.enabled() {
+        return Ok(None);
+    }
+
+    let session_core = build_session_core();
+    let route_side = route_side_for_datapath(session_core.local_side());
+    let addrs = session_core
+        .addrs()
+        .map_err(ClawVpnRuntimeWiringBuildError::Session)?;
+    let inputs = build_inputs(ClawVpnRuntimeWiringContext { route_side, addrs })
+        .map_err(ClawVpnRuntimeWiringBuildError::Inputs)?;
     let route_plan = crate::claw_vpn_interface_route_plan::ClawVpnInterfaceRoutePlan::new(
         inputs.route_platform,
         inputs.interface_name,

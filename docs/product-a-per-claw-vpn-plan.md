@@ -82,6 +82,13 @@ other side through the already-reviewed `ClawVpnRelayStream` frame adapter with
 an explicit read/write timeout. The bridge is guard-tripwired and still does
 not mount `IpTunnel`, construct VPN session state, open TUN/utun, install
 routes, run the packet pump, spawn work, or add a product/bootstrap caller.
+The current target-session runtime follow-up wires that local bridge to the
+already-reviewed per-Claw VPN runtime assembly only as an in-module builder:
+after the fixed session is active it creates the socketpair, returns the
+`TargetSession`, and returns the synchronous runtime wiring for a future caller
+to execute in an owner-reviewed context. It remains guard-tripwired and still
+does not swap the mount, construct real device handles, open TUN/utun, install
+routes, spawn work, run the pump, or authorize T1.
 There is still no
 checked-in runtime/bin that opens a TUN/utun interface in a product/default
 path, caller that invokes the runtime coordinator, route executor, packet pump,
@@ -378,6 +385,12 @@ Access between members/devices and claws is explicitly many-to-many:
   `ClawVpnRelayStream` with an explicit timeout. It remains unwired and
   guard-tripwired; the mount-swap/caller that actually uses it is still a
   separate T1 slice.
+  The target-session runtime follow-up then binds that bridge to the runtime
+  assembly behind another in-module builder so the session is validated before
+  the socketpair is created, while still returning the runtime wiring to a
+  future caller rather than running or spawning it. The mount-swap/caller that
+  executes the wiring and supplies concrete devices remains the separate T1
+  slice.
   Exit: T1–T4 green on dev hosts.
 - **Phase 2 — iOS Packet Tunnel dev build.** Entry: entitlement go/no-go.
   Dev device only. Exit: T5–T7 green (iPhone reaches Claw-A — and only
