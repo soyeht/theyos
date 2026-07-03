@@ -55,6 +55,11 @@ default-off per-Claw VPN dev config and stop at the runbook's owner
 authorization/hardware-evidence gate when a dev mode is present; it still does
 not call the runtime assembly, construct route/interface/relay handles, run the
 packet pump, or authorize a live T1 run.
+The current relay-adapter follow-up adds an unwired synchronous `TunnelFrame`
+relay stream adapter for the packet pump's abstract relay trait; it can
+encode/decode the existing length-prefixed frame protocol over a caller-supplied
+stream but does not dial a relay, authenticate a stream, spawn work, or add a
+product/bootstrap caller.
 There is still no
 checked-in runtime/bin that opens a TUN/utun interface in a product/default
 path, caller that invokes the runtime coordinator, route executor, packet pump,

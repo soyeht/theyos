@@ -56,6 +56,7 @@ pub mod claw_vpn_linux_tun;
 #[cfg(target_os = "macos")]
 pub mod claw_vpn_macos_utun;
 pub mod claw_vpn_packet_pump;
+pub mod claw_vpn_relay_stream;
 pub mod claw_vpn_runtime;
 pub mod claw_vpn_wiring;
 pub mod cloudflare_admin;

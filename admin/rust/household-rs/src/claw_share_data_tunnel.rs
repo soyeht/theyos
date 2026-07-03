@@ -292,7 +292,7 @@ impl TunnelFrame {
         out
     }
 
-    fn decode(bytes: &[u8]) -> Result<Self, DataTunnelError> {
+    pub fn decode(bytes: &[u8]) -> Result<Self, DataTunnelError> {
         let (&kind, payload) = bytes
             .split_first()
             .ok_or_else(|| DataTunnelError::InvalidFrame("empty frame".into()))?;
