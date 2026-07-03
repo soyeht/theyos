@@ -18,7 +18,52 @@ pub enum PushTransportStartupStatus {
 pub enum PerClawVpnStartupStatus {
     Disabled,
     OwnerAuthorizationRequired { mode: ClawVpnDevMode },
+    RollbackRequired { mode: ClawVpnDevMode },
+    HardwareEvidenceRequired { mode: ClawVpnDevMode },
+    PreflightEvidencePresent { mode: ClawVpnDevMode },
     InvalidConfig,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PerClawVpnT1PreflightEvidence {
+    owner_authorization: bool,
+    rollback: bool,
+    hardware_t1_t4: bool,
+}
+
+impl PerClawVpnT1PreflightEvidence {
+    #[must_use]
+    pub const fn missing() -> Self {
+        Self {
+            owner_authorization: false,
+            rollback: false,
+            hardware_t1_t4: false,
+        }
+    }
+
+    #[must_use]
+    pub const fn new(owner_authorization: bool, rollback: bool, hardware_t1_t4: bool) -> Self {
+        Self {
+            owner_authorization,
+            rollback,
+            hardware_t1_t4,
+        }
+    }
+
+    #[must_use]
+    pub const fn has_owner_authorization(self) -> bool {
+        self.owner_authorization
+    }
+
+    #[must_use]
+    pub const fn has_rollback(self) -> bool {
+        self.rollback
+    }
+
+    #[must_use]
+    pub const fn has_hardware_t1_t4(self) -> bool {
+        self.hardware_t1_t4
+    }
 }
 
 /// Install the production `house_created` APNs transport from environment.
@@ -76,16 +121,52 @@ pub fn per_claw_vpn_startup_gate_with<Load>(load: Load) -> PerClawVpnStartupStat
 where
     Load: FnOnce() -> Result<Option<ClawVpnDevConfig>, ClawVpnDevConfigError>,
 {
+    per_claw_vpn_startup_gate_with_preflight(load, PerClawVpnT1PreflightEvidence::missing)
+}
+
+pub fn per_claw_vpn_startup_gate_with_preflight<Load, LoadPreflight>(
+    load: Load,
+    load_preflight: LoadPreflight,
+) -> PerClawVpnStartupStatus
+where
+    Load: FnOnce() -> Result<Option<ClawVpnDevConfig>, ClawVpnDevConfigError>,
+    LoadPreflight: FnOnce() -> PerClawVpnT1PreflightEvidence,
+{
     match load() {
         Ok(None) => PerClawVpnStartupStatus::Disabled,
         Ok(Some(config)) => {
             let mode = config.mode();
+            let preflight = load_preflight();
+            if !preflight.has_owner_authorization() {
+                tracing::warn!(
+                    stage = "claw_vpn.startup.owner_authorization_required",
+                    mode = ?mode,
+                    "per-Claw VPN dev config is present; live wiring remains blocked pending owner authorization, rollback, and T1-T4 hardware evidence"
+                );
+                return PerClawVpnStartupStatus::OwnerAuthorizationRequired { mode };
+            }
+            if !preflight.has_rollback() {
+                tracing::warn!(
+                    stage = "claw_vpn.startup.rollback_required",
+                    mode = ?mode,
+                    "per-Claw VPN owner authorization is present; live wiring remains blocked pending prebuilt rollback and T1-T4 hardware evidence"
+                );
+                return PerClawVpnStartupStatus::RollbackRequired { mode };
+            }
+            if !preflight.has_hardware_t1_t4() {
+                tracing::warn!(
+                    stage = "claw_vpn.startup.hardware_evidence_required",
+                    mode = ?mode,
+                    "per-Claw VPN owner authorization and rollback are present; live wiring remains blocked pending T1-T4 hardware evidence"
+                );
+                return PerClawVpnStartupStatus::HardwareEvidenceRequired { mode };
+            }
             tracing::warn!(
-                stage = "claw_vpn.startup.owner_authorization_required",
+                stage = "claw_vpn.startup.preflight_evidence_present",
                 mode = ?mode,
-                "per-Claw VPN dev config is present; live wiring remains blocked pending owner authorization, rollback, and T1-T4 hardware evidence"
+                "per-Claw VPN T1 preflight evidence is present; startup gate does not activate live wiring"
             );
-            PerClawVpnStartupStatus::OwnerAuthorizationRequired { mode }
+            PerClawVpnStartupStatus::PreflightEvidencePresent { mode }
         }
         Err(error) => {
             tracing::warn!(
@@ -221,6 +302,16 @@ mod tests {
     }
 
     #[test]
+    fn per_claw_vpn_startup_gate_does_not_load_preflight_when_default_off() {
+        let status = per_claw_vpn_startup_gate_with_preflight(
+            || Ok(None),
+            || panic!("preflight evidence must not load when config is absent"),
+        );
+
+        assert_eq!(status, PerClawVpnStartupStatus::Disabled);
+    }
+
+    #[test]
     fn per_claw_vpn_startup_gate_requires_owner_auth_when_configured() {
         let config = ClawVpnDevConfig::from_values(
             Some("1"),
@@ -243,9 +334,68 @@ mod tests {
     }
 
     #[test]
+    fn per_claw_vpn_startup_gate_reports_preflight_blockers_in_order() {
+        let config = || {
+            ClawVpnDevConfig::from_values(
+                Some("1"),
+                None,
+                Some("relay-stream://127.0.0.1:49152"),
+                Some("198.18.0.0/24"),
+                None,
+                None,
+            )
+            .unwrap()
+            .unwrap()
+        };
+
+        let status = per_claw_vpn_startup_gate_with_preflight(
+            || Ok(Some(config())),
+            || PerClawVpnT1PreflightEvidence::new(true, false, false),
+        );
+        assert_eq!(
+            status,
+            PerClawVpnStartupStatus::RollbackRequired {
+                mode: ClawVpnDevMode::Live
+            }
+        );
+
+        let status = per_claw_vpn_startup_gate_with_preflight(
+            || Ok(Some(config())),
+            || PerClawVpnT1PreflightEvidence::new(true, true, false),
+        );
+        assert_eq!(
+            status,
+            PerClawVpnStartupStatus::HardwareEvidenceRequired {
+                mode: ClawVpnDevMode::Live
+            }
+        );
+
+        let status = per_claw_vpn_startup_gate_with_preflight(
+            || Ok(Some(config())),
+            || PerClawVpnT1PreflightEvidence::new(true, true, true),
+        );
+        assert_eq!(
+            status,
+            PerClawVpnStartupStatus::PreflightEvidencePresent {
+                mode: ClawVpnDevMode::Live
+            }
+        );
+    }
+
+    #[test]
     fn per_claw_vpn_startup_gate_fails_closed_on_invalid_config() {
         let status =
             per_claw_vpn_startup_gate_with(|| Err(ClawVpnDevConfigError::ConflictingModes));
+
+        assert_eq!(status, PerClawVpnStartupStatus::InvalidConfig);
+    }
+
+    #[test]
+    fn per_claw_vpn_startup_gate_does_not_load_preflight_for_invalid_config() {
+        let status = per_claw_vpn_startup_gate_with_preflight(
+            || Err(ClawVpnDevConfigError::ConflictingModes),
+            || panic!("preflight evidence must not load when config is invalid"),
+        );
 
         assert_eq!(status, PerClawVpnStartupStatus::InvalidConfig);
     }

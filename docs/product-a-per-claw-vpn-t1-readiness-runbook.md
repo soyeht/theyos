@@ -60,6 +60,10 @@ If the authorization omits any field, the test is not authorized. If the
 artifact SHA changes, the authorization expires and must be reissued for the
 new SHA.
 
+The startup preflight status is only a classifier for these gates. A
+`PreflightEvidencePresent` status means the caller supplied evidence for review;
+it is not owner authorization by itself and it does not run the T1 datapath.
+
 ## Rollback Plan
 
 Rollback must be prepared before the first live run. It is not acceptable to

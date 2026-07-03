@@ -4348,6 +4348,9 @@ fn product_a_per_claw_vpn_dev_config_remains_default_off_and_unwired() {
                 || line.contains("RelayStreamIpTunnelUnavailableRouter")
                 || line.contains("bind_relay_stream_reverse_connect_with_ip_tunnel_router")
                 || line.contains("assemble_relay_stream_live_with_ip_tunnel_router");
+            let references_t1_preflight_gate = line.contains("PerClawVpnT1PreflightEvidence")
+                || line.contains("per_claw_vpn_startup_gate_with_preflight")
+                || line.contains("PreflightEvidencePresent");
             let allowed_tun_packet_interface_adapter = (in_linux_tun_module
                 || in_macos_utun_module)
                 && line.contains("ClawVpnPacketInterface")
@@ -4493,6 +4496,7 @@ fn product_a_per_claw_vpn_dev_config_remains_default_off_and_unwired() {
                     && !in_relay_stream_reverse_connect_pool_module
                     && !in_relay_stream_runtime_module
                     && references_ip_tunnel_target_backend)
+                || (!in_startup_wiring_module && references_t1_preflight_gate)
                 || (!in_runtime_module
                     && !in_wiring_module
                     && !(in_target_session_runtime_module && in_target_session_runtime_tests)

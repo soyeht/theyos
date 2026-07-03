@@ -60,6 +60,12 @@ default-off per-Claw VPN dev config and stop at the runbook's owner
 authorization/hardware-evidence gate when a dev mode is present; it still does
 not call the runtime assembly, construct route/interface/relay handles, run the
 packet pump, or authorize a live T1 run.
+The current T1 live-gate follow-up keeps that startup path non-activating but
+adds an injectable preflight classifier for the runbook gates: owner
+authorization, prebuilt rollback, and T1-T4 hardware evidence are checked in
+order, and even a satisfied preflight only reports status rather than running
+the wiring. The environment-backed startup path still has no evidence loader and
+therefore stops at owner authorization by default.
 The merged relay-adapter follow-up adds an unwired synchronous `TunnelFrame`
 relay stream adapter for the packet pump's abstract relay trait; it can
 encode/decode the existing length-prefixed frame protocol over a caller-supplied
@@ -382,6 +388,11 @@ Access between members/devices and claws is explicitly many-to-many:
   returns `Disabled`, enabled dev config returns owner-authorization-required,
   invalid config fails closed, and no runtime assembly, TUN/utun, relay, route,
   pump loop, or live handle factory is invoked.
+  The T1 live-gate follow-up refines that stop gate into an ordered preflight
+  status for owner authorization, rollback, and hardware evidence while keeping
+  the environment-backed startup path blocked by default and still invoking no
+  runtime assembly, live handle factory, mount swap, TUN/utun, relay, route, or
+  pump loop.
   The target-session relay bridge follow-up then adds only the local
   async-to-sync byte-stream seam needed by a future `IpTunnel` backend: one side
   is returned as a `TargetSession`, the other side is a synchronous
