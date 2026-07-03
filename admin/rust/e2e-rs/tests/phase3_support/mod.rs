@@ -391,6 +391,31 @@ pub async fn post_cbor(
     response_parts(resp).await
 }
 
+pub async fn post_owner_approval(
+    founder: &FounderHarness,
+    join_request: &JoinRequest,
+    cursor: u64,
+) -> (StatusCode, HeaderMap, Vec<u8>) {
+    let path = format!("/api/v1/household/owner-events/{cursor}/approve");
+    let timestamp = unix_now();
+    let body = owner_approval_body(founder, join_request, cursor, timestamp);
+    let builder = Request::builder()
+        .method(Method::POST)
+        .uri(path.as_str())
+        .header(header::CONTENT_TYPE, "application/cbor")
+        .header(
+            header::AUTHORIZATION,
+            pop_header(&founder.owner, "POST", &path, timestamp, &body),
+        );
+    let resp = founder
+        .router
+        .clone()
+        .oneshot(builder.body(Body::from(body)).expect("request body"))
+        .await
+        .expect("router response");
+    response_parts(resp).await
+}
+
 pub async fn get_cbor(
     router: Router,
     path: &str,
@@ -602,21 +627,10 @@ pub async fn run_remote_ceremony() -> CompletedCeremony {
 
     post_local_anchor(&candidate, &founder, &anchor_secret).await;
 
-    let approve_path = format!(
-        "/api/v1/household/owner-events/{}/approve",
-        accepted.owner_event_cursor
-    );
-    let approval_body = owner_approval_body(
+    let (status, _, body) = post_owner_approval(
         &founder,
         &candidate.prepared.join_request,
         accepted.owner_event_cursor,
-        unix_now(),
-    );
-    let (status, _, body) = post_cbor(
-        founder.router.clone(),
-        &approve_path,
-        approval_body,
-        Some(&founder.owner),
     )
     .await;
     assert_eq!(status, StatusCode::OK);

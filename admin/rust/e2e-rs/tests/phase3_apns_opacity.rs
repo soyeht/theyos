@@ -32,7 +32,7 @@ use server_rs::apns_dispatcher::{APNS_TICKLE_BODY, ApnsError, ApnsTransport, ins
 
 use phase3_support::{
     OwnerApprovalAck, OwnerEventsResponse, candidate_harness, cursor_param, founder_harness,
-    get_cbor, owner_approval_body, post_cbor, post_local_anchor, unix_now,
+    get_cbor, post_cbor, post_local_anchor, post_owner_approval, unix_now,
 };
 
 // Use non-textual bytes so the opacity assertion cannot collide with a
@@ -184,21 +184,10 @@ async fn test_no_household_data_in_apns() {
 
     post_local_anchor(&candidate, &founder, &candidate.prepared.anchor_secret).await;
 
-    let approve_path = format!(
-        "/api/v1/household/owner-events/{}/approve",
-        accepted.owner_event_cursor
-    );
-    let approval_body = owner_approval_body(
+    let (status, _, body) = post_owner_approval(
         &founder,
         &candidate.prepared.join_request,
         accepted.owner_event_cursor,
-        unix_now(),
-    );
-    let (status, _, body) = post_cbor(
-        founder.router.clone(),
-        &approve_path,
-        approval_body,
-        Some(&founder.owner),
     )
     .await;
     assert_eq!(status.as_u16(), 200);

@@ -151,21 +151,10 @@ async fn linux_candidate_joins_via_tailnet_anchor_handoff() {
     phase3_support::post_local_anchor(&candidate, &founder, &anchor_secret).await;
 
     // ── 5. iPhone approves → founder POSTs finalize to candidate ─────────────
-    let approve_path = format!(
-        "/api/v1/household/owner-events/{}/approve",
-        accepted.owner_event_cursor
-    );
-    let approval_body = phase3_support::owner_approval_body(
+    let (status, _headers, body) = phase3_support::post_owner_approval(
         &founder,
         &candidate.prepared.join_request,
         accepted.owner_event_cursor,
-        phase3_support::unix_now(),
-    );
-    let (status, _headers, body) = phase3_support::post_cbor(
-        founder.router.clone(),
-        &approve_path,
-        approval_body,
-        Some(&founder.owner),
     )
     .await;
     assert_eq!(status, StatusCode::OK, "owner approval must succeed");

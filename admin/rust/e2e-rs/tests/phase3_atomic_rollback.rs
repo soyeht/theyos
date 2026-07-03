@@ -274,20 +274,8 @@ async fn submit_approval(
     candidate: &CandidateHarness,
     cursor: u64,
 ) -> StatusCode {
-    let path = format!("/api/v1/household/owner-events/{cursor}/approve");
-    let approval_body = owner_approval_body(
-        founder,
-        &candidate.prepared.join_request,
-        cursor,
-        unix_now(),
-    );
-    let (status, _, _) = post_cbor(
-        founder.router.clone(),
-        &path,
-        approval_body,
-        Some(&founder.owner),
-    )
-    .await;
+    let (status, _, _) =
+        post_owner_approval(founder, &candidate.prepared.join_request, cursor).await;
     status
 }
 

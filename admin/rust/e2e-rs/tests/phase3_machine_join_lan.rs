@@ -22,7 +22,7 @@ use tokio::sync::mpsc;
 use phase3_support::{
     OWNER_EVENTS_PATH, OwnerApprovalAck, OwnerEventsResponse, assert_machine_cert_layout,
     assert_record_is_two_member, candidate_harness, cursor_param, founder_harness, get_cbor,
-    owner_approval_body, post_cbor, post_local_anchor, unix_now,
+    post_local_anchor, post_owner_approval,
 };
 
 #[tokio::test]
@@ -95,20 +95,8 @@ async fn phase3_machine_join_lan() {
     // anchor gate.
     post_local_anchor(&candidate, &founder, &candidate.prepared.anchor_secret).await;
 
-    let approve_path = format!("/api/v1/household/owner-events/{cursor}/approve");
-    let approval_body = owner_approval_body(
-        &founder,
-        &candidate.prepared.join_request,
-        cursor,
-        unix_now(),
-    );
-    let (status, headers, body) = post_cbor(
-        founder.router.clone(),
-        &approve_path,
-        approval_body,
-        Some(&founder.owner),
-    )
-    .await;
+    let (status, headers, body) =
+        post_owner_approval(&founder, &candidate.prepared.join_request, cursor).await;
     assert_eq!(
         status,
         StatusCode::OK,

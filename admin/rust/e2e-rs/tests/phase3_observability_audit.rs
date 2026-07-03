@@ -51,8 +51,7 @@ use tracing_subscriber::fmt;
 
 use phase3_support::{
     JOIN_REQUEST_PATH, OWNER_EVENTS_PATH, OwnerApprovalAck, OwnerEventsResponse, candidate_harness,
-    cursor_param, founder_harness, get_cbor, owner_approval_body, post_cbor, post_local_anchor,
-    unix_now,
+    cursor_param, founder_harness, get_cbor, post_cbor, post_local_anchor, post_owner_approval,
 };
 
 #[derive(Clone)]
@@ -129,21 +128,10 @@ async fn test_phase3_happy_path_observability_is_complete_and_leak_free() {
 
     post_local_anchor(&candidate, &founder, &candidate.prepared.anchor_secret).await;
 
-    let approve_path = format!(
-        "/api/v1/household/owner-events/{}/approve",
-        accepted.owner_event_cursor
-    );
-    let approval_body = owner_approval_body(
+    let (status, _, body) = post_owner_approval(
         &founder,
         &candidate.prepared.join_request,
         accepted.owner_event_cursor,
-        unix_now(),
-    );
-    let (status, _, body) = post_cbor(
-        founder.router.clone(),
-        &approve_path,
-        approval_body,
-        Some(&founder.owner),
     )
     .await;
     assert_eq!(status, StatusCode::OK);
