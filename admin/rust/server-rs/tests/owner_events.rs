@@ -3887,6 +3887,94 @@ fn product_a_per_claw_vpn_dev_config_remains_default_off_and_unwired() {
         "per-Claw VPN macOS utun module must have exactly one macOS-only export until an explicit tunnel-runtime slice"
     );
 
+    fn rust_guard_lexer_unsupported_reason(lines: &[&str]) -> Option<String> {
+        for (line_index, line) in lines.iter().enumerate() {
+            let mut chars = line.char_indices().peekable();
+            let mut in_string = false;
+            let mut escaped = false;
+            while let Some((_, ch)) = chars.next() {
+                if in_string {
+                    if escaped {
+                        escaped = false;
+                    } else if ch == '\\' {
+                        escaped = true;
+                    } else if ch == '"' {
+                        in_string = false;
+                    }
+                    continue;
+                }
+                if ch == '/' && chars.peek().is_some_and(|(_, next)| *next == '/') {
+                    break;
+                }
+                if ch == '/' && chars.peek().is_some_and(|(_, next)| *next == '*') {
+                    return Some("block comments".to_string());
+                }
+                if ch == '*' && chars.peek().is_some_and(|(_, next)| *next == '/') {
+                    return Some("block comments".to_string());
+                }
+                if ch == 'r' {
+                    let mut raw_candidate = chars.clone();
+                    while raw_candidate
+                        .peek()
+                        .is_some_and(|(_, candidate)| *candidate == '#')
+                    {
+                        raw_candidate.next();
+                    }
+                    if raw_candidate
+                        .peek()
+                        .is_some_and(|(_, candidate)| *candidate == '"')
+                    {
+                        return Some("raw strings".to_string());
+                    }
+                }
+                if ch == '\'' {
+                    let mut char_candidate = chars.clone();
+                    let mut escaped_char = false;
+                    let mut contains_brace = false;
+                    let mut contains_double_quote = false;
+                    while let Some((_, candidate)) = char_candidate.next() {
+                        if escaped_char {
+                            contains_double_quote |= candidate == '"';
+                            escaped_char = false;
+                            continue;
+                        }
+                        if candidate == '\\' {
+                            escaped_char = true;
+                            continue;
+                        }
+                        if candidate == '\'' {
+                            if contains_brace {
+                                return Some("brace char literals".to_string());
+                            }
+                            if contains_double_quote {
+                                return Some("double-quote char literals".to_string());
+                            }
+                            break;
+                        }
+                        contains_double_quote |= candidate == '"';
+                        contains_brace |= candidate == '{' || candidate == '}';
+                    }
+                }
+                if ch == '"' {
+                    in_string = true;
+                }
+            }
+            if in_string {
+                return Some(format!(
+                    "multiline strings starting on line {}",
+                    line_index + 1
+                ));
+            }
+        }
+        None
+    }
+
+    fn assert_rust_guard_lexer_supported(module_label: &str, lines: &[&str]) {
+        if let Some(reason) = rust_guard_lexer_unsupported_reason(lines) {
+            panic!("per-Claw VPN {module_label} guard lexer does not support {reason}");
+        }
+    }
+
     fn rust_brace_delta_outside_strings(line: &str) -> isize {
         let mut delta = 0;
         let mut chars = line.chars().peekable();
@@ -3918,6 +4006,7 @@ fn product_a_per_claw_vpn_dev_config_remains_default_off_and_unwired() {
     }
 
     fn rust_test_module_span(module_label: &str, lines: &[&str]) -> (usize, usize) {
+        assert_rust_guard_lexer_supported(module_label, lines);
         let test_markers = lines
             .iter()
             .enumerate()
@@ -3958,6 +4047,28 @@ fn product_a_per_claw_vpn_dev_config_remains_default_off_and_unwired() {
         );
         (test_start, test_end)
     }
+
+    fn assert_rust_guard_lexer_rejects(_module_label: &str, lines: &[&str]) {
+        assert!(
+            rust_guard_lexer_unsupported_reason(lines).is_some(),
+            "per-Claw VPN guard lexer fixture should reject unsupported syntax"
+        );
+    }
+
+    assert_rust_guard_lexer_supported(
+        "fixture",
+        &[
+            r#"fn ok<'a>() { let debug = format!("{value:?}"); }"#,
+            "// raw-looking r\" text in comments is ignored",
+        ],
+    );
+    assert_rust_guard_lexer_rejects("fixture", &["let _ = /* unsupported */ 1;"]);
+    assert_rust_guard_lexer_rejects("fixture", &[r#"let _ = r"{ unsupported }";"#]);
+    assert_rust_guard_lexer_rejects("fixture", &["let _ = '{';"]);
+    assert_rust_guard_lexer_rejects("fixture", &[r#"let _ = { let _ = '"'; }; let _ = '"';"#]);
+    assert_rust_guard_lexer_rejects("fixture", &[r#"let _ = { let _ = '\"'; }; let _ = '\"';"#]);
+    assert_rust_guard_lexer_rejects("fixture", &[r#"let _ = { let _ = b'"'; }; let _ = b'"';"#]);
+    assert_rust_guard_lexer_rejects("fixture", &["let _ = \"unterminated;"]);
 
     let mut violations = Vec::new();
     for path in sources {

@@ -23,6 +23,10 @@ an unwired runtime coordinator that sequences caller-supplied route setup, the
 bounded packet pump loop, and route cleanup through abstract traits with a fixed
 step budget; it still has no concrete OS interface, relay socket, product
 caller, flag, or owner-reviewed route-tool path source.
+The current guard-hardening follow-up keeps those runtime helpers unwired while
+pinning the source guard's Rust span scanner to reject syntax it does not parse,
+so future wiring cannot silently broaden the reviewed packet-pump/runtime
+exceptions before an explicit T1 guard change.
 There is still no
 checked-in runtime/bin that opens a TUN/utun interface in a product/default
 path, caller that invokes the runtime coordinator, route executor, packet pump,
@@ -272,6 +276,10 @@ Access between members/devices and claws is explicitly many-to-many:
   coordinator, executor, packet pump, or packet-pump loop. They are still not
   T1 because they create no interface or route in any default/product path and
   do not run a live relay pump against OS interfaces or relay sockets.
+  The guard-hardening follow-up before T1 keeps those helpers inert and tightens
+  the source guard's packet-pump/runtime test-span scanner so it rejects
+  unsupported Rust syntax in guarded files instead of relying on a loose textual
+  brace count during future wiring changes.
   Exit: T1–T4 green on dev hosts.
 - **Phase 2 — iOS Packet Tunnel dev build.** Entry: entitlement go/no-go.
   Dev device only. Exit: T5–T7 green (iPhone reaches Claw-A — and only
