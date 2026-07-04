@@ -162,13 +162,16 @@ where
                 );
                 return PerClawVpnStartupStatus::HardwareEvidenceRequired { mode };
             }
-            if mode != ClawVpnDevMode::Live {
-                tracing::warn!(
-                    stage = "claw_vpn.startup.unsupported_mode",
-                    mode = ?mode,
-                    "per-Claw VPN T1 preflight evidence is present for a non-live mode; startup gate does not activate live wiring"
-                );
-                return PerClawVpnStartupStatus::UnsupportedMode { mode };
+            match mode {
+                ClawVpnDevMode::Live => {}
+                ClawVpnDevMode::Dial => {
+                    tracing::warn!(
+                        stage = "claw_vpn.startup.unsupported_mode",
+                        mode = ?mode,
+                        "per-Claw VPN T1 preflight evidence is present for a non-live mode; startup gate does not activate live wiring"
+                    );
+                    return PerClawVpnStartupStatus::UnsupportedMode { mode };
+                }
             }
             tracing::warn!(
                 stage = "claw_vpn.startup.preflight_evidence_present",

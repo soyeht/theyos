@@ -188,9 +188,9 @@ The wiring PR that follows this runbook must show, before merge:
   where and how the launcher runs it;
 - if the T1 caller gate is used, disabled config, invalid config, missing owner
   authorization, missing rollback, and missing hardware evidence must all return
-  before the target-session router or any caller-owned handles are built, and
-  the target-session router helper must reject client-side `Dial` mode before
-  constructing the target-side router;
+  before any caller-owned handles are built, and the gate must use an
+  exhaustive mode check that rejects client-side `Dial` mode before constructing
+  any caller;
 - no raw `TunnelFrame`, packet bytes, interface name, file descriptor, local
   path, or peer address is logged through Debug or error formatting;
 - tests prove route cleanup runs after pump stop/error and that failure returns

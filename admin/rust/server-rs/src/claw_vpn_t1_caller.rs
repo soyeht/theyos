@@ -101,6 +101,12 @@ where
     if !preflight.has_hardware_t1_t4() {
         return ClawVpnT1CallerStatus::HardwareEvidenceRequired { mode };
     }
+    match mode {
+        ClawVpnDevMode::Live => {}
+        ClawVpnDevMode::Dial => {
+            return ClawVpnT1CallerStatus::UnsupportedMode { mode };
+        }
+    }
 
     ClawVpnT1CallerStatus::Ready {
         mode,
@@ -127,9 +133,8 @@ where
     LaunchRuntime:
         Fn(ClawVpnTargetSessionRouterWiring<I>) -> ClawVpnTargetSessionRouterLaunchResult,
 {
-    let status = assemble_claw_vpn_t1_caller(load_config, load_preflight, |config| {
-        (config.mode() == ClawVpnDevMode::Live)
-            .then(|| ClawVpnTargetSessionRouter::new(build_runtime, launch_runtime))
+    let status = assemble_claw_vpn_t1_caller(load_config, load_preflight, |_config| {
+        ClawVpnTargetSessionRouter::new(build_runtime, launch_runtime)
     });
 
     match status {
@@ -143,14 +148,12 @@ where
         ClawVpnT1CallerStatus::HardwareEvidenceRequired { mode } => {
             ClawVpnT1CallerStatus::HardwareEvidenceRequired { mode }
         }
-        ClawVpnT1CallerStatus::UnsupportedMode { mode }
-        | ClawVpnT1CallerStatus::Ready { mode, caller: None } => {
+        ClawVpnT1CallerStatus::UnsupportedMode { mode } => {
             ClawVpnT1CallerStatus::UnsupportedMode { mode }
         }
-        ClawVpnT1CallerStatus::Ready {
-            mode,
-            caller: Some(caller),
-        } => ClawVpnT1CallerStatus::Ready { mode, caller },
+        ClawVpnT1CallerStatus::Ready { mode, caller } => {
+            ClawVpnT1CallerStatus::Ready { mode, caller }
+        }
         ClawVpnT1CallerStatus::InvalidConfig => ClawVpnT1CallerStatus::InvalidConfig,
     }
 }
@@ -304,6 +307,28 @@ mod tests {
         let debug = format!("{status:?}");
         assert!(debug.contains("ClawVpnT1CallerStatus::Ready"));
         assert!(!debug.contains("SECRET-CALLER"));
+    }
+
+    #[test]
+    fn t1_caller_rejects_dial_mode_without_building_caller() {
+        let caller_built = Cell::new(false);
+
+        let status = assemble_claw_vpn_t1_caller(
+            || Ok(Some(dial_config())),
+            || PerClawVpnT1PreflightEvidence::new(true, true, true),
+            |_config| {
+                caller_built.set(true);
+                "caller"
+            },
+        );
+
+        assert!(matches!(
+            status,
+            ClawVpnT1CallerStatus::UnsupportedMode {
+                mode: ClawVpnDevMode::Dial
+            }
+        ));
+        assert!(!caller_built.get());
     }
 
     #[test]

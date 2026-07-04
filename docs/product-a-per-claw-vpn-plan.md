@@ -66,10 +66,10 @@ packet pump, or authorize a live T1 run.
 The current T1 live-gate follow-up keeps that startup path non-activating but
 adds an injectable preflight classifier for the runbook gates: owner
 authorization, prebuilt rollback, and T1-T4 hardware evidence are checked in
-order, client-side `Dial` mode remains unsupported even with satisfied
-preflight, and even a satisfied `Live` preflight only reports status rather than
-running the wiring. The environment-backed startup path still has no evidence
-loader and therefore stops at owner authorization by default.
+order, an exhaustive mode check keeps client-side `Dial` mode unsupported even
+with satisfied preflight, and even a satisfied `Live` preflight only reports
+status rather than running the wiring. The environment-backed startup path still
+has no evidence loader and therefore stops at owner authorization by default.
 The merged relay-adapter follow-up adds an unwired synchronous `TunnelFrame`
 relay stream adapter for the packet pump's abstract relay trait; it can
 encode/decode the existing length-prefixed frame protocol over a caller-supplied
@@ -113,9 +113,9 @@ preflight evidence, or T1 activation.
 The current T1 caller-gate follow-up adds the default-off decision helper that
 binds dev config plus owner-auth/rollback/hardware preflight to construction of
 the caller-supplied target-session router. Disabled config, invalid config, and
-each missing preflight gate return before building the caller; the
-target-session router helper also rejects the client-side `Dial` mode before
-constructing the router. It still does not mount the router, construct concrete
+each missing preflight gate return before building the caller; the gate also
+uses an exhaustive mode check and rejects the client-side `Dial` mode before
+constructing any caller. It still does not mount the router, construct concrete
 devices, choose route tools, run wiring, open TUN/utun, dial a relay, spawn
 work, or authorize a live T1 run. The source guard tripwires external use of
 the caller-gate entrypoints so the future mount-swap or startup caller reopens
@@ -418,8 +418,9 @@ Access between members/devices and claws is explicitly many-to-many:
   status for owner authorization, rollback, and hardware evidence while keeping
   the environment-backed startup path blocked by default and still invoking no
   runtime assembly, live handle factory, mount swap, TUN/utun, relay, route, or
-  pump loop. The startup classifier also rejects client-side `Dial` mode before
-  reporting `PreflightEvidencePresent`.
+  pump loop. The startup classifier also uses an exhaustive mode check before
+  reporting `PreflightEvidencePresent`, so client-side `Dial` mode remains
+  unsupported.
   The target-session relay bridge follow-up then adds only the local
   async-to-sync byte-stream seam needed by a future `IpTunnel` backend: one side
   is returned as a `TargetSession`, the other side is a synchronous
@@ -441,10 +442,10 @@ Access between members/devices and claws is explicitly many-to-many:
   The T1 caller-gate follow-up then adds a default-off helper that consumes the
   dev config and preflight evidence before constructing that router. Disabled
   config, invalid config, missing owner authorization, missing rollback, and
-  missing hardware evidence all return before the caller is built; the
-  target-session router helper also rejects `Dial` mode before building the
-  target-side router. It remains unmounted and does not supply concrete handles
-  or execute the launcher. The caller-gate entrypoints are guard-tripwired
+  missing hardware evidence all return before the caller is built; the gate
+  also uses an exhaustive mode check and rejects `Dial` mode before building
+  any caller. It remains unmounted and does not supply concrete handles or
+  execute the launcher. The caller-gate entrypoints are guard-tripwired
   outside their module/export.
   Exit: T1–T4 green on dev hosts.
 - **Phase 2 — iOS Packet Tunnel dev build.** Entry: entitlement go/no-go.
