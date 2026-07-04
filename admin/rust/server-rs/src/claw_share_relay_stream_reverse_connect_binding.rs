@@ -116,6 +116,9 @@ mod tests {
     use household_rs::claw_share_data_tunnel::{
         ClawTargetRouter, DataTunnelError, TcpStreamRouter,
     };
+    use household_rs::household_mesh_log::{
+        MeshMembership, ProjectedGroup, ProjectedMemberDevice, ProjectedState,
+    };
     use household_rs::ids::derive_household_id;
     use household_rs::keys::IdentityKey;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -123,11 +126,13 @@ mod tests {
 
     use crate::claw_share_relay_stream_contract::{
         RelayStreamClawStaticPublicKey, RelayStreamExpectedPath, RelayStreamOfferPayload,
-        RelayStreamResource,
+        RelayStreamResource, mint_relay_stream_group_offer,
     };
+    use crate::claw_share_relay_stream_issuer_trust::RelayStreamTrustContext;
     use crate::claw_share_relay_stream_test_support::{
         DATA_TUNNEL_SLOT, RELAY_STREAM_CLAW_ID, attacker_signer, guest_pub, guest_signer,
-        owner_signer, relay_stream_issuer_trust, rendezvous_token,
+        owner_signer, relay_stream_household_record, relay_stream_issuer_trust,
+        relay_stream_machine_cert, rendezvous_token,
     };
 
     const NOW: u64 = 1_800_000_000;
@@ -148,6 +153,69 @@ mod tests {
             NOW + 600,
         );
         Arc::new(RelayStreamOfferContract::sign(payload, signer).unwrap())
+    }
+
+    fn group_offer_with(
+        resource: RelayStreamResource,
+        signer: &dyn IdentityKey,
+    ) -> Arc<RelayStreamOfferContract> {
+        Arc::new(
+            mint_relay_stream_group_offer(
+                rendezvous_token(0x42),
+                DATA_TUNNEL_SLOT,
+                "g".to_string(),
+                "g_a".to_string(),
+                guest_pub(),
+                RELAY_STREAM_CLAW_ID.to_string(),
+                resource,
+                "relay-stream://127.0.0.1:49152".to_string(),
+                RelayStreamClawStaticPublicKey::try_new([0x77; 32]).unwrap(),
+                NOW + 600,
+                NOW,
+                signer,
+            )
+            .unwrap(),
+        )
+    }
+
+    fn group_projection() -> ProjectedState {
+        let mut projection = ProjectedState::default();
+        projection.groups.insert(
+            "g".to_string(),
+            ProjectedGroup {
+                group_id: "g".to_string(),
+                name: "Family".to_string(),
+                members: [("g_a".to_string(), MeshMembership::Active)]
+                    .into_iter()
+                    .collect(),
+                member_labels: Default::default(),
+                granted_claws: [(RELAY_STREAM_CLAW_ID.to_string(), MeshMembership::Active)]
+                    .into_iter()
+                    .collect(),
+                revision: 1,
+            },
+        );
+        projection.member_devices.insert(
+            "g_a".to_string(),
+            [(
+                guest_pub().as_bytes()[..].to_vec(),
+                ProjectedMemberDevice {
+                    participant_npub: "npub".to_string(),
+                    status: MeshMembership::Active,
+                },
+            )]
+            .into_iter()
+            .collect(),
+        );
+        projection
+    }
+
+    fn group_trust() -> RelayStreamIssuerTrust {
+        RelayStreamIssuerTrust::new(|| RelayStreamTrustContext {
+            record: relay_stream_household_record(),
+            cert: relay_stream_machine_cert(),
+            projection: group_projection(),
+        })
     }
 
     // Slot store consumed by the offer's guest, matching the offer's claw/slot.
@@ -279,8 +347,8 @@ mod tests {
         let site_addr = spawn_prefixed_ack(b"SITE:").await;
         let ip_addr = spawn_prefixed_ack(b"IPTUNNEL:").await;
         let binding = bind_relay_stream_reverse_connect_with_ip_tunnel_router(
-            offer_with(RelayStreamResource::IpTunnel, &owner_signer()),
-            relay_stream_issuer_trust(),
+            group_offer_with(RelayStreamResource::IpTunnel, &owner_signer()),
+            group_trust(),
             derive_household_id(&owner_signer().public()),
             consumed_slots(),
             Arc::new(ReplayGuard::new()),

@@ -80,11 +80,13 @@ the adapter itself remains stream-agnostic and only enforces the frame size cap.
 The current relay target-router, reverse-connect binding, runtime, and pool
 follow-ups make the existing `IpTunnel` resource gate delegate to a
 caller-supplied target backend only after the same offer/slot/trust checks pass,
-while the production mount still uses the default fail-closed backend; the
-source guard now tripwires external use of that injectable `IpTunnel` backend
-constructor, binding entrypoint, and runtime entrypoint. They do not build the
-VPN runtime, open devices, dial sockets, spawn work, or add a product/bootstrap
-caller.
+and the target-router now requires the member-scoped Group audience for
+`IpTunnel` before the backend is reached, so Device/Public `IpTunnel` offers
+fail closed before any injected backend can run. The production mount still uses
+the default fail-closed backend; the source guard now tripwires external use of
+that injectable `IpTunnel` backend constructor, binding entrypoint, and runtime
+entrypoint. They do not build the VPN runtime, open devices, dial sockets, spawn
+work, or add a product/bootstrap caller.
 The current target-session relay bridge follow-up adds an unwired local
 socketpair adapter that can hand one async byte-stream side to the existing
 `relay_stream` `TargetSession` API while the synchronous packet pump owns the
@@ -474,7 +476,11 @@ Access between members/devices and claws is explicitly many-to-many:
   to be explicit and reviewed at the future caller site. It remains unmounted
   and does not supply concrete handles or execute the launcher. The caller-gate
   entrypoints, ready payload, ready seal, and router factory are guard-tripwired
-  outside their module/export.
+  outside their module/export. The relay target-router also keeps `IpTunnel`
+  member-scoped at the offer boundary: Device/Public audiences fail closed
+  before the `IpTunnel` backend, while the future live caller must still derive
+  the VPN ACL key from the authenticated Group member identity and prove that
+  mapping in review.
   Exit: T1–T4 green on dev hosts.
 - **Phase 2 — iOS Packet Tunnel dev build.** Entry: entitlement go/no-go.
   Dev device only. Exit: T5–T7 green (iPhone reaches Claw-A — and only

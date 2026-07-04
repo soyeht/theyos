@@ -329,13 +329,19 @@ mod tests {
     use household_rs::claw_share_data_tunnel::{
         ClawTargetRouter, DataTunnelError, TargetSession, TcpStreamRouter,
     };
+    use household_rs::household_mesh_log::{
+        build_group_claw_grant_event, build_group_created_event, build_group_member_add_event,
+        build_member_device_enroll_event,
+    };
     use household_rs::ids::derive_household_id;
+    use household_rs::keys::IdentityKey;
     use keystore_rs::FileKeystore;
     use tokio::net::TcpListener;
     use tokio::time::{sleep, timeout};
 
     use crate::claw_share_relay_stream_contract::{
         RelayStreamExpectedPath, RelayStreamOfferMintInput, RelayStreamResource,
+        mint_relay_stream_group_offer,
     };
     use crate::claw_share_relay_stream_noise_keystore::{
         DEFAULT_RELAY_STREAM_NOISE_KEY_ID, RelayStreamNoiseKeyStore,
@@ -343,8 +349,9 @@ mod tests {
     use crate::claw_share_relay_stream_offer_store::RelayStreamOfferStore;
     use crate::claw_share_relay_stream_responder_config::RelayStreamResponderConfig;
     use crate::claw_share_relay_stream_test_support::{
-        DATA_TUNNEL_CLAW_ID, data_tunnel_credential, data_tunnel_store, now_unix, owner_pub,
-        owner_signer, relay_stream_household_state, relay_stream_issuer_trust, rendezvous_token,
+        DATA_TUNNEL_CLAW_ID, DATA_TUNNEL_SLOT, data_tunnel_credential, data_tunnel_store,
+        guest_pub, now_unix, owner_pub, owner_signer, relay_stream_household_state,
+        relay_stream_issuer_trust, rendezvous_token,
     };
 
     fn backend(dir: &tempfile::TempDir) -> FileKeystore {
@@ -469,6 +476,88 @@ mod tests {
             .unwrap();
     }
 
+    fn seed_group_iptunnel_offer(state_dir: &Path, backend: &dyn KeystoreBackend, token_label: u8) {
+        let keypair = RelayStreamNoiseKeyStore::new(backend)
+            .get_or_create(DEFAULT_RELAY_STREAM_NOISE_KEY_ID)
+            .unwrap();
+        let mut store =
+            RelayStreamOfferStore::load(state_dir, &relay_stream_issuer_trust(), now_unix())
+                .unwrap();
+        let offer = mint_relay_stream_group_offer(
+            rendezvous_token(token_label),
+            DATA_TUNNEL_SLOT,
+            "g".to_string(),
+            "g_a".to_string(),
+            guest_pub(),
+            DATA_TUNNEL_CLAW_ID.to_string(),
+            RelayStreamResource::IpTunnel,
+            "relay-stream://127.0.0.1:49152".to_string(),
+            keypair.public_key().clone(),
+            now_unix() + 600,
+            now_unix(),
+            &owner_signer(),
+        )
+        .unwrap();
+        store
+            .put_signed(offer, &relay_stream_issuer_trust(), now_unix())
+            .unwrap();
+    }
+
+    fn seed_group_membership(mesh_log: &MeshLogStore) {
+        let owner = owner_signer();
+        let owner_pub = owner.public();
+        mesh_log
+            .append(
+                build_group_created_event(
+                    "g".to_string(),
+                    "Family".to_string(),
+                    now_unix(),
+                    owner_pub.clone(),
+                    &owner,
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        mesh_log
+            .append(
+                build_group_member_add_event(
+                    "g".to_string(),
+                    "g_a".to_string(),
+                    "Member A".to_string(),
+                    now_unix(),
+                    owner_pub.clone(),
+                    &owner,
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        mesh_log
+            .append(
+                build_member_device_enroll_event(
+                    "g_a".to_string(),
+                    guest_pub(),
+                    "npub".to_string(),
+                    now_unix(),
+                    owner_pub.clone(),
+                    &owner,
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        mesh_log
+            .append(
+                build_group_claw_grant_event(
+                    "g".to_string(),
+                    DATA_TUNNEL_CLAW_ID.to_string(),
+                    now_unix(),
+                    owner_pub,
+                    &owner,
+                )
+                .unwrap(),
+            )
+            .unwrap();
+    }
+
     #[tokio::test]
     async fn live_wiring_default_off_has_no_side_effects() {
         let dir = tempfile::tempdir().unwrap();
@@ -581,9 +670,10 @@ mod tests {
     async fn binding_factory_routes_iptunnel_to_injected_backend_after_gate() {
         let dir = tempfile::tempdir().unwrap();
         let backend = backend(&dir);
-        seed_offer(dir.path(), &backend, RelayStreamResource::IpTunnel, 0x44);
+        seed_group_iptunnel_offer(dir.path(), &backend, 0x44);
         let household = relay_stream_household_state();
         let mesh_log = MeshLogStore::new();
+        seed_group_membership(&mesh_log);
         let trust_runtime = Arc::new(
             RelayStreamTrustContextRuntime::load(
                 &household,

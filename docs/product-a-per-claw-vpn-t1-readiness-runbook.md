@@ -205,6 +205,11 @@ The wiring PR that follows this runbook must show, before merge:
   stay `#[must_use]` so warning-deny builds catch accidental bare-call discards,
   while any intentional discard such as an underscore binding remains a review
   item at the future caller site;
+- the `IpTunnel` relay-stream offer path must stay member-scoped: Device/Public
+  audiences must fail before the `IpTunnel` backend, no public/anonymous VPN
+  offer may be accepted, and the live caller must derive the VPN ACL key from
+  the authenticated Group member identity rather than from caller-controlled
+  target metadata;
 - no raw `TunnelFrame`, packet bytes, interface name, file descriptor, local
   path, or peer address is logged through Debug or error formatting;
 - tests prove route cleanup runs after pump stop/error and that failure returns

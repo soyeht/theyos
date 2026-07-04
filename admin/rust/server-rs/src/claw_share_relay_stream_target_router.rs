@@ -93,9 +93,17 @@ impl RelayStreamOfferTargetGate {
         if target_id != payload.claw_id {
             return Err(target_unavailable("relay-stream-target-mismatch"));
         }
+        let audience = payload.audience();
+        if expected_resource == RelayStreamResource::IpTunnel
+            && !matches!(audience, RelayStreamAudience::Group { .. })
+        {
+            return Err(target_unavailable("relay-stream-iptunnel-member-required"));
+        }
         // `guest_device_pub` is always the dialing device (the Noise transcript
-        // pin); the audience decides HOW it is authorized. Fase E2.
-        match payload.audience() {
+        // pin); the audience decides HOW it is authorized. `IpTunnel` is
+        // narrower than PTY/ClawSite: it requires the member-scoped Group path
+        // because the VPN ACL is keyed by (member, device, claw).
+        match audience {
             RelayStreamAudience::Device => self.validate_device_target(payload, now),
             RelayStreamAudience::Group {
                 group_id,
@@ -555,7 +563,14 @@ mod tests {
 
     #[tokio::test]
     async fn relay_stream_target_router_iptunnel_fails_closed_until_vpn_agent_exists() {
-        let router = router_for(RelayStreamResource::IpTunnel, consumed_slots()).await;
+        let router = RelayStreamOfferTargetRouter::new(
+            group_iptunnel_offer(),
+            group_trust(group_projection(true, true, true)),
+            empty_slots(),
+            TcpStreamRouter::new("127.0.0.1:1"),
+            TcpStreamRouter::new("127.0.0.1:1"),
+            || NOW,
+        );
 
         let error = open_error(&router).await;
 
@@ -568,9 +583,9 @@ mod tests {
     async fn relay_stream_target_router_iptunnel_delegates_to_injected_router_after_gate() {
         let ip_addr = spawn_ack_target(b"IP:").await;
         let router = RelayStreamOfferTargetRouter::new_with_ip_tunnel_router(
-            offer(RelayStreamResource::IpTunnel),
-            trust(),
-            consumed_slots(),
+            group_iptunnel_offer(),
+            group_trust(group_projection(true, true, true)),
+            empty_slots(),
             TcpStreamRouter::new("127.0.0.1:1"),
             TcpStreamRouter::new("127.0.0.1:1"),
             TcpStreamRouter::new(ip_addr),
@@ -600,9 +615,14 @@ mod tests {
             );
         }
 
-        let ip_gate = gate_for(RelayStreamResource::IpTunnel, consumed_slots());
+        let ip_gate = RelayStreamOfferTargetGate::new(
+            group_iptunnel_offer(),
+            group_trust(group_projection(true, true, true)),
+            empty_slots(),
+            || NOW,
+        );
         ip_gate.validate_ip_tunnel_target(CLAW_ID).expect(
-            "IpTunnel offer should pass the exact resource gate before runtime remains fail-closed",
+            "Group-scoped IpTunnel offer should pass the exact resource/member gate before runtime remains fail-closed",
         );
     }
 
@@ -662,7 +682,7 @@ mod tests {
         p
     }
 
-    fn group_clawsite_offer() -> RelayStreamOfferContract {
+    fn group_offer(resource: RelayStreamResource) -> RelayStreamOfferContract {
         mint_relay_stream_group_offer(
             RendezvousToken::try_new(vec![0x42; 16]).unwrap(),
             SlotId([0x99; 16]),
@@ -670,7 +690,7 @@ mod tests {
             "g_a".to_string(),
             guest().public(),
             CLAW_ID.to_string(),
-            RelayStreamResource::ClawSite,
+            resource,
             "relay-stream://127.0.0.1:49152".to_string(),
             static_pub(),
             NOW + 60,
@@ -678,6 +698,14 @@ mod tests {
             &owner(),
         )
         .unwrap()
+    }
+
+    fn group_clawsite_offer() -> RelayStreamOfferContract {
+        group_offer(RelayStreamResource::ClawSite)
+    }
+
+    fn group_iptunnel_offer() -> RelayStreamOfferContract {
+        group_offer(RelayStreamResource::IpTunnel)
     }
 
     async fn group_router(
@@ -720,13 +748,13 @@ mod tests {
         }
     }
 
-    fn public_clawsite_offer() -> RelayStreamOfferContract {
+    fn public_offer(resource: RelayStreamResource) -> RelayStreamOfferContract {
         mint_relay_stream_public_offer(
             RendezvousToken::try_new(vec![0x42; 16]).unwrap(),
             SlotId([0x98; 16]),
             guest().public(),
             CLAW_ID.to_string(),
-            RelayStreamResource::ClawSite,
+            resource,
             "relay-stream://127.0.0.1:49152".to_string(),
             static_pub(),
             NOW + 60,
@@ -734,6 +762,10 @@ mod tests {
             &owner(),
         )
         .unwrap()
+    }
+
+    fn public_clawsite_offer() -> RelayStreamOfferContract {
+        public_offer(RelayStreamResource::ClawSite)
     }
 
     async fn public_router(
@@ -766,6 +798,50 @@ mod tests {
         let error = open_error(&router).await;
         assert!(
             matches!(error, DataTunnelError::TargetUnavailable(reason) if reason == "relay-stream-claw-not-published")
+        );
+    }
+
+    #[tokio::test]
+    async fn relay_stream_target_router_iptunnel_rejects_device_audience_before_backend() {
+        let ip_addr = spawn_ack_target(b"IP:").await;
+        let router = RelayStreamOfferTargetRouter::new_with_ip_tunnel_router(
+            offer(RelayStreamResource::IpTunnel),
+            trust(),
+            consumed_slots(),
+            TcpStreamRouter::new("127.0.0.1:1"),
+            TcpStreamRouter::new("127.0.0.1:1"),
+            TcpStreamRouter::new(ip_addr),
+            || NOW,
+        );
+
+        let error = open_error(&router).await;
+
+        assert!(
+            matches!(error, DataTunnelError::TargetUnavailable(reason) if reason == "relay-stream-iptunnel-member-required")
+        );
+    }
+
+    #[tokio::test]
+    async fn relay_stream_target_router_iptunnel_rejects_public_audience_before_backend() {
+        let mut published = ProjectedState::default();
+        published
+            .published_claws
+            .insert(CLAW_ID.to_string(), MeshMembership::Active);
+        let ip_addr = spawn_ack_target(b"IP:").await;
+        let router = RelayStreamOfferTargetRouter::new_with_ip_tunnel_router(
+            public_offer(RelayStreamResource::IpTunnel),
+            group_trust(published),
+            empty_slots(),
+            TcpStreamRouter::new("127.0.0.1:1"),
+            TcpStreamRouter::new("127.0.0.1:1"),
+            TcpStreamRouter::new(ip_addr),
+            || NOW,
+        );
+
+        let error = open_error(&router).await;
+
+        assert!(
+            matches!(error, DataTunnelError::TargetUnavailable(reason) if reason == "relay-stream-iptunnel-member-required")
         );
     }
 
