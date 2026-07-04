@@ -380,7 +380,8 @@ where
         let session = session.map_err(|_| target_unavailable("claw-vpn-t1-session-open-failed"))?;
         let session_id = session.id();
         if let Err(reason) = (self.audit_sink)(open_event) {
-            let _closed = core.close_with_audit(session_id);
+            let (_closed, close_event) = core.close_with_audit(session_id);
+            let _ = (self.audit_sink)(close_event);
             return Err(target_unavailable(reason));
         }
         let session_core = core
@@ -925,9 +926,20 @@ mod tests {
             {
                 let audit_count = Arc::clone(&audit_count);
                 Box::new(move |event: ClawVpnAuditEvent| {
-                    assert_eq!(event.reason(), ClawVpnAuditReason::SessionOpened);
-                    audit_count.fetch_add(1, Ordering::SeqCst);
-                    Err("claw-vpn-t1-audit-open-failed")
+                    let index = audit_count.fetch_add(1, Ordering::SeqCst);
+                    match index % 2 {
+                        0 => {
+                            assert_eq!(event.action(), ClawVpnAuditAction::SessionOpen);
+                            assert_eq!(event.reason(), ClawVpnAuditReason::SessionOpened);
+                            Err("claw-vpn-t1-audit-open-failed")
+                        }
+                        1 => {
+                            assert_eq!(event.action(), ClawVpnAuditAction::SessionClose);
+                            assert_eq!(event.reason(), ClawVpnAuditReason::SessionClosed);
+                            Ok(())
+                        }
+                        _ => unreachable!(),
+                    }
                 })
             },
         );
@@ -950,7 +962,7 @@ mod tests {
             );
         }
 
-        assert_eq!(audit_count.load(Ordering::SeqCst), 2);
+        assert_eq!(audit_count.load(Ordering::SeqCst), 4);
         assert_eq!(build_count.load(Ordering::SeqCst), 0);
         assert_eq!(launch_count.load(Ordering::SeqCst), 0);
     }

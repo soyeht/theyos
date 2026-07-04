@@ -142,10 +142,12 @@ claw)` target, and assembles the target-session runtime from caller-supplied,
 post-gate build inputs. It also carries the typed `SessionOpen` audit event
 from `open_with_audit` into a caller-supplied audit sink instead of dropping it;
 sink failure fails closed before runtime inputs are built, the launcher runs, or
-a target session is returned. The current default-off mount supplies only a
-placeholder sink behind missing preflight, so a future activation slice must
-replace that placeholder with reviewed persistence and retention policy for the
-exact artifact SHA. The mount now injects that backend through the same T1
+a target session is returned, and the rollback `SessionClose` event is routed
+through the same sink on that reject path. The current default-off mount
+supplies only a placeholder sink behind missing preflight, so a future
+activation slice must replace that placeholder with reviewed persistence and
+retention policy for the exact artifact SHA. The mount now injects that backend
+through the same T1
 caller gate, but the production path still supplies
 `PerClawVpnT1PreflightEvidence::missing`, so even with the T1 dev env present it
 falls back to `RelayStreamIpTunnelUnavailableRouter` before opening TUN/utun,
@@ -505,8 +507,10 @@ Access between members/devices and claws is explicitly many-to-many:
   the authenticated Group target and the mount asks the T1 caller gate for a
   backend. The backend also delivers the typed `SessionOpen` audit event to a
   caller-supplied sink and fails closed if that sink rejects before runtime
-  inputs or launcher execution; the current mount sink is only a reviewed
-  placeholder behind missing preflight, not live audit persistence. The
+  inputs or launcher execution; on that reject path it also delivers the
+  rollback `SessionClose` event to the same sink on a best-effort basis. The
+  current mount sink is only a reviewed placeholder behind missing preflight,
+  not live audit persistence. The
   environment-backed mount still supplies missing preflight
   evidence, so `Disabled`/invalid/missing-preflight/`Dial` paths all fall back
   to the unavailable `IpTunnel` router before building runtime inputs, opening
