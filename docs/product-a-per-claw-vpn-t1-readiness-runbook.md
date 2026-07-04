@@ -8,6 +8,12 @@ bootstrap. It makes the two remaining non-code gates explicit:
 - owner authorization plus a rollback plan;
 - hardware validation evidence for T1-T4 on dev hosts.
 
+Use `docs/product-a-per-claw-vpn-t1-authorization-template.md` as the
+copy/paste artifact for the authorization record, rollback readiness, hardware
+evidence pack, and stop record. The template is not authorization by itself; it
+only becomes evidence when filled for the exact artifact SHA by the owner and
+reviewed with the hardware pack.
+
 The code gates that must already be present in `main` are:
 
 - source guard hardening for packet-pump/runtime spans
@@ -177,6 +183,11 @@ The wiring PR that follows this runbook must show, before merge:
   execution boundary: the router may return a `TargetSession` only after that
   launcher accepts the synchronous wiring, and the live caller must still prove
   where and how the launcher runs it;
+- if the T1 caller gate is used, disabled config, invalid config, missing owner
+  authorization, missing rollback, and missing hardware evidence must all return
+  before the target-session router or any caller-owned handles are built, and
+  the target-session router helper must reject client-side `Dial` mode before
+  constructing the target-side router;
 - no raw `TunnelFrame`, packet bytes, interface name, file descriptor, local
   path, or peer address is logged through Debug or error formatting;
 - tests prove route cleanup runs after pump stop/error and that failure returns

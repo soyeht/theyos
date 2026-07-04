@@ -1,0 +1,95 @@
+# Product A per-Claw VPN T1 authorization and evidence template
+
+This template is the fillable artifact for the T1 readiness runbook. It does
+not authorize activation by itself. A T1 run is authorized only when the owner
+fills the authorization record for an exact PR and commit SHA, attaches or links
+the rollback artifact, and the reviewers accept the hardware evidence for that
+same artifact.
+
+Use neutral aliases and documentation-safe addresses only. Do not paste real
+hostnames, account names, device names, LAN IPs, tailnet IPs, relay endpoints,
+local paths, secrets, packet bytes, frame payloads, screenshots with real
+identifiers, or logs containing real identifiers into this file or a PR.
+
+## Authorization Record
+
+| field | value |
+|---|---|
+| Artifact | PR `<number>`, commit `<sha>`, build artifact hash `<hash>` |
+| Scope | `dev-host T1-T4 only`; production explicitly excluded |
+| Topology | Engine-dev `<engine-alpha>`, Claw-A `<claw-alpha>`, Device-D `<device-alpha>`, Relay-R `<relay-alpha>`, Member-M1 `<member-alpha>` |
+| Time window | `<UTC start>` through `<UTC end>` |
+| Operator | `<operator-alpha>` |
+| Rollback artifact | `<rollback artifact id>` at `<private artifact location>` |
+| Data policy | Public logs/screenshots/evidence use neutral aliases and redact raw local details |
+| Stop authority | Any reviewer or operator may stop the run immediately |
+| Owner sentence | `I authorize dev-host per-Claw VPN T1-T4 validation for <artifact>; I do not authorize production activation.` |
+
+If any field is missing, the run is not authorized. If the PR head or commit
+SHA changes, this record expires and the owner must issue a new record for the
+new artifact.
+
+## Rollback Readiness
+
+| check | evidence |
+|---|---|
+| Previous known-good dev engine artifact is available | `<artifact id/hash>` |
+| Restore command or service operation is documented privately | `<private reference>` |
+| Dev-service environment snapshot exists with secrets removed/redacted | `<private reference>` |
+| Linux route cleanup procedure is ready | `<private reference>` |
+| macOS route cleanup procedure is ready | `<private reference>` |
+| Linux TUN cleanup procedure is ready | `<private reference>` |
+| macOS utun cleanup procedure is ready | `<private reference>` |
+| Relay/process stop procedure is ready | `<private reference>` |
+| Baseline health verification checklist is ready | `<private reference>` |
+
+Rollback is not ready if it depends on rebuilding locally after a failed run.
+
+## Hardware Evidence Pack
+
+Required metadata:
+
+| field | value |
+|---|---|
+| Artifact | PR `<number>`, commit `<sha>`, build artifact hash `<hash>` |
+| Host OS | `<Linux/macOS major version only>` |
+| Role | `<Engine-dev/Claw-A/Device-D/Relay-R>` |
+| Clock | `<UTC start>` through `<UTC end>` |
+| Operator | `<operator-alpha>` |
+| Authorization | `<authorization record link/reference>` |
+| Rollback | `<rollback artifact link/reference>` |
+
+Evidence rows:
+
+| ID | evidence |
+|---|---|
+| T1 interface up | Before/during/after interface snapshot with neutral interface alias and documentation-safe addresses; confirms clean removal on exit |
+| T2 tunnel plumbing | ICMP and TCP echo success from Device-D to Claw-A over Relay-R, with neutral endpoint labels only |
+| T3 route scope | Before/during/after route snapshots proving only Claw-A `/32` uses the tunnel; LAN, engine, and other-claw routes do not |
+| T4 fail-closed plumbing | Relay-R interruption followed by tunnel shutdown, route cleanup, no half-open interface, and dev engine health restored or rollback executed |
+
+Negative observations required for the evidence pack:
+
+- no default route through the tunnel;
+- no route to the claw host LAN through the tunnel;
+- no route to another claw through the tunnel;
+- no route to the engine address through the tunnel;
+- no raw `TunnelFrame` payload bytes in logs;
+- no real hostnames, account names, device names, LAN IPs, tailnet IPs, relay
+  endpoints, secrets, local paths, or packet/frame payloads in public evidence.
+
+## Stop Record
+
+If any stop condition triggers, fill this section and stop the run. Do not patch
+live state and continue in the same window.
+
+| field | value |
+|---|---|
+| Stop time | `<UTC timestamp>` |
+| Stop authority | `<reviewer/operator alias>` |
+| Trigger | `<stop condition>` |
+| Sanitized evidence captured | `<link/reference>` |
+| Rollback action executed | `<artifact/operation reference>` |
+| Post-rollback interface check | `<clean/not clean>` |
+| Post-rollback route check | `<clean/not clean>` |
+| Dev engine health after rollback | `<baseline/restored/failed>` |

@@ -3815,6 +3815,7 @@ fn product_a_per_claw_vpn_dev_config_remains_default_off_and_unwired() {
     let interface_route_plan_path = server_src_dir.join("claw_vpn_interface_route_plan.rs");
     let packet_pump_path = server_src_dir.join("claw_vpn_packet_pump.rs");
     let relay_stream_path = server_src_dir.join("claw_vpn_relay_stream.rs");
+    let t1_caller_path = server_src_dir.join("claw_vpn_t1_caller.rs");
     let target_session_relay_path = server_src_dir.join("claw_vpn_target_session_relay.rs");
     let target_session_router_path = server_src_dir.join("claw_vpn_target_session_router.rs");
     let target_session_runtime_path = server_src_dir.join("claw_vpn_target_session_runtime.rs");
@@ -3858,6 +3859,10 @@ fn product_a_per_claw_vpn_dev_config_remains_default_off_and_unwired() {
     assert!(
         sources.iter().any(|path| path == &relay_stream_path),
         "per-Claw VPN source guard must include server-rs/src/claw_vpn_relay_stream.rs"
+    );
+    assert!(
+        sources.iter().any(|path| path == &t1_caller_path),
+        "per-Claw VPN source guard must include server-rs/src/claw_vpn_t1_caller.rs"
     );
     assert!(
         sources
@@ -3980,6 +3985,8 @@ fn product_a_per_claw_vpn_dev_config_remains_default_off_and_unwired() {
     let mut packet_pump_export_is_unconditional = false;
     let mut relay_stream_exports = 0usize;
     let mut relay_stream_export_is_unconditional = false;
+    let mut t1_caller_exports = 0usize;
+    let mut t1_caller_export_is_unconditional = false;
     let mut target_session_relay_exports = 0usize;
     let mut target_session_relay_export_is_unconditional = false;
     let mut target_session_router_exports = 0usize;
@@ -4008,6 +4015,11 @@ fn product_a_per_claw_vpn_dev_config_remains_default_off_and_unwired() {
         if line.trim() == "pub mod claw_vpn_relay_stream;" {
             relay_stream_exports += 1;
             relay_stream_export_is_unconditional =
+                index == 0 || !lib_lines[index - 1].trim().starts_with("#[cfg");
+        }
+        if line.trim() == "pub mod claw_vpn_t1_caller;" {
+            t1_caller_exports += 1;
+            t1_caller_export_is_unconditional =
                 index == 0 || !lib_lines[index - 1].trim().starts_with("#[cfg");
         }
         if line.trim() == "pub mod claw_vpn_target_session_relay;" {
@@ -4057,6 +4069,10 @@ fn product_a_per_claw_vpn_dev_config_remains_default_off_and_unwired() {
     assert!(
         relay_stream_exports == 1 && relay_stream_export_is_unconditional,
         "per-Claw VPN relay stream adapter module must have exactly one unconditional export"
+    );
+    assert!(
+        t1_caller_exports == 1 && t1_caller_export_is_unconditional,
+        "per-Claw VPN T1 caller gate module must have exactly one unconditional export"
     );
     assert!(
         target_session_relay_exports == 1 && target_session_relay_export_is_unconditional,
@@ -4318,6 +4334,8 @@ fn product_a_per_claw_vpn_dev_config_remains_default_off_and_unwired() {
                 path == lib_path && line.trim() == "pub mod claw_vpn_target_session_relay;";
             let target_session_router_module_export =
                 path == lib_path && line.trim() == "pub mod claw_vpn_target_session_router;";
+            let t1_caller_module_export =
+                path == lib_path && line.trim() == "pub mod claw_vpn_t1_caller;";
             let target_session_runtime_module_export =
                 path == lib_path && line.trim() == "pub mod claw_vpn_target_session_runtime;";
             let runtime_module_export =
@@ -4332,6 +4350,7 @@ fn product_a_per_claw_vpn_dev_config_remains_default_off_and_unwired() {
             let in_interface_route_plan_module = path == interface_route_plan_path;
             let in_packet_pump_module = path == packet_pump_path;
             let in_relay_stream_module = path == relay_stream_path;
+            let in_t1_caller_module = path == t1_caller_path;
             let in_target_session_relay_module = path == target_session_relay_path;
             let in_target_session_router_module = path == target_session_router_path;
             let in_target_session_runtime_module = path == target_session_runtime_path;
@@ -4374,6 +4393,10 @@ fn product_a_per_claw_vpn_dev_config_remains_default_off_and_unwired() {
             let references_target_session_router_adapter = line
                 .contains("ClawVpnTargetSessionRouter")
                 || line.contains("claw_vpn_target_session_router");
+            let references_t1_caller_gate = line.contains("ClawVpnT1CallerStatus")
+                || line.contains("assemble_claw_vpn_t1_caller")
+                || line.contains("assemble_claw_vpn_t1_target_session_router")
+                || line.contains("claw_vpn_t1_caller");
             let references_target_session_runtime_bridge = line
                 .contains("ClawVpnTargetSessionRuntime")
                 || line.contains("claw_vpn_target_session_runtime");
@@ -4501,6 +4524,12 @@ fn product_a_per_claw_vpn_dev_config_remains_default_off_and_unwired() {
             let allowed_target_session_router_datapath = in_target_session_router_tests;
             let allowed_startup_wiring_dev_config_gate =
                 in_startup_wiring_module && references_dev_config && !references_dev_flag;
+            let allowed_t1_caller_dev_config_gate =
+                in_t1_caller_module && references_dev_config && !references_dev_flag;
+            let allowed_t1_caller_preflight_gate =
+                in_t1_caller_module && references_t1_preflight_gate;
+            let allowed_t1_caller_target_session_router =
+                in_t1_caller_module && references_target_session_router_adapter;
             if (!allowed_packet_pump_datapath_runtime
                 && !allowed_runtime_datapath_runtime
                 && !allowed_wiring_datapath_runtime
@@ -4510,6 +4539,7 @@ fn product_a_per_claw_vpn_dev_config_remains_default_off_and_unwired() {
                 || (!in_config_module
                     && !module_export
                     && !allowed_startup_wiring_dev_config_gate
+                    && !allowed_t1_caller_dev_config_gate
                     && (references_dev_config || references_dev_flag))
                 || (!in_interface_route_plan_module
                     && !in_runtime_module
@@ -4539,8 +4569,10 @@ fn product_a_per_claw_vpn_dev_config_remains_default_off_and_unwired() {
                     && !allowed_target_session_runtime_relay_pair
                     && references_target_session_relay_adapter)
                 || (!in_target_session_router_module
+                    && !allowed_t1_caller_target_session_router
                     && !target_session_router_module_export
                     && references_target_session_router_adapter)
+                || (!in_t1_caller_module && !t1_caller_module_export && references_t1_caller_gate)
                 || (!in_target_session_runtime_module
                     && !allowed_target_session_router_runtime_bridge
                     && !target_session_runtime_module_export
@@ -4550,7 +4582,9 @@ fn product_a_per_claw_vpn_dev_config_remains_default_off_and_unwired() {
                     && !in_relay_stream_reverse_connect_pool_module
                     && !in_relay_stream_runtime_module
                     && references_ip_tunnel_target_backend)
-                || (!in_startup_wiring_module && references_t1_preflight_gate)
+                || (!in_startup_wiring_module
+                    && !allowed_t1_caller_preflight_gate
+                    && references_t1_preflight_gate)
                 || (!in_runtime_module
                     && !in_wiring_module
                     && !(in_target_session_router_module && in_target_session_router_tests)

@@ -46,6 +46,9 @@ product caller.
 The current T1-readiness follow-up codifies the remaining non-code gates:
 explicit owner authorization, prebuilt rollback, and sanitized hardware evidence
 for T1-T4 before any future live wiring run.
+The current authorization-template follow-up adds only a fillable docs artifact
+for that owner record, rollback readiness, hardware evidence pack, and stop
+record; it does not authorize activation, change code, or add a caller.
 The current wiring-assembly follow-up adds a default-off composition point that
 can bind caller-supplied fixed-session core, route-plan, packet-pump, bounded
 production driver, and runtime handles without reading flags, opening TUN/utun,
@@ -106,6 +109,16 @@ the launcher accepts the synchronous wiring. The source guard tripwires external
 use of the router adapter. It still does not choose device handles, route-tool
 paths, execution context, mount location, TUN/utun opens, relay dials, startup
 preflight evidence, or T1 activation.
+The current T1 caller-gate follow-up adds the default-off decision helper that
+binds dev config plus owner-auth/rollback/hardware preflight to construction of
+the caller-supplied target-session router. Disabled config, invalid config, and
+each missing preflight gate return before building the caller; the
+target-session router helper also rejects the client-side `Dial` mode before
+constructing the router. It still does not mount the router, construct concrete
+devices, choose route tools, run wiring, open TUN/utun, dial a relay, spawn
+work, or authorize a live T1 run. The source guard tripwires external use of
+the caller-gate entrypoints so the future mount-swap or startup caller reopens
+review.
 There is still no
 checked-in runtime/bin that opens a TUN/utun interface in a product/default
 path, caller that invokes the runtime coordinator, route executor, packet pump,
@@ -377,6 +390,10 @@ Access between members/devices and claws is explicitly many-to-many:
   follow-up adds `docs/product-a-per-claw-vpn-t1-readiness-runbook.md`, which
   makes the remaining owner-authorization, rollback, and T1-T4 hardware
   evidence gates explicit without adding a caller or activating the datapath.
+  The T1 authorization-template follow-up adds only the copy/paste artifact
+  reviewers and the owner can use to bind authorization, rollback, hardware
+  evidence, and stop records to one exact PR/SHA; it remains docs-only and does
+  not authorize activation.
   The wiring-assembly follow-up then adds a default-off in-module assembly
   helper that composes caller-supplied fixed-session core, route-plan/executor,
   packet-pump, bounded production driver, and runtime coordinator handles; its
@@ -419,6 +436,14 @@ Access between members/devices and claws is explicitly many-to-many:
   wiring. It still does not choose devices, route tools, execution context, or
   a mount; the mount-swap/caller with concrete handles remains the separate T1
   slice.
+  The T1 caller-gate follow-up then adds a default-off helper that consumes the
+  dev config and preflight evidence before constructing that router. Disabled
+  config, invalid config, missing owner authorization, missing rollback, and
+  missing hardware evidence all return before the caller is built; the
+  target-session router helper also rejects `Dial` mode before building the
+  target-side router. It remains unmounted and does not supply concrete handles
+  or execute the launcher. The caller-gate entrypoints are guard-tripwired
+  outside their module/export.
   Exit: T1–T4 green on dev hosts.
 - **Phase 2 — iOS Packet Tunnel dev build.** Entry: entitlement go/no-go.
   Dev device only. Exit: T5–T7 green (iPhone reaches Claw-A — and only
