@@ -118,11 +118,13 @@ uses an exhaustive mode check and rejects the client-side `Dial` mode before
 constructing any caller. Its `Ready` status carries an encapsulated ready
 payload with private fields, so code outside the caller-gate module consumes a
 ready caller through `into_ready()` instead of fabricating or restamping one
-directly. It still does not mount the router, construct concrete devices,
-choose route tools, run wiring, open TUN/utun, dial a relay, spawn work, or
-authorize a live T1 run. The source guard tripwires external use of the
-caller-gate entrypoints, ready payload, and ready seal so the future mount-swap
-or startup caller reopens review.
+directly; the future live caller must obtain that payload from a fresh gate run
+for the exact artifact/test window, not from a stored ready value. It still does
+not mount the router, construct concrete devices, choose route tools, run
+wiring, open TUN/utun, dial a relay, spawn work, or authorize a live T1 run. The
+source guard tripwires external use of the caller-gate entrypoints, ready
+payload, and ready seal so the future mount-swap or startup caller reopens
+review.
 There is still no
 checked-in runtime/bin that opens a TUN/utun interface in a product/default
 path, caller that invokes the runtime coordinator, route executor, packet pump,
@@ -449,10 +451,11 @@ Access between members/devices and claws is explicitly many-to-many:
   also uses an exhaustive mode check and rejects `Dial` mode before building
   any caller. The ready status carries an encapsulated ready payload with
   private fields, so downstream code consumes it through `into_ready()` instead
-  of fabricating or restamping a ready caller. It remains unmounted and does not
-  supply concrete handles or execute the launcher. The caller-gate entrypoints,
-  ready payload, and ready seal are guard-tripwired
-  outside their module/export.
+  of fabricating or restamping a ready caller; the future live caller must obtain
+  it from a fresh gate run for the exact artifact/test window rather than a
+  cached ready value. It remains unmounted and does not supply concrete handles
+  or execute the launcher. The caller-gate entrypoints, ready payload, and ready
+  seal are guard-tripwired outside their module/export.
   Exit: T1–T4 green on dev hosts.
 - **Phase 2 — iOS Packet Tunnel dev build.** Entry: entitlement go/no-go.
   Dev device only. Exit: T5–T7 green (iPhone reaches Claw-A — and only

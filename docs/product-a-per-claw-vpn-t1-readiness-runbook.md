@@ -192,7 +192,11 @@ The wiring PR that follows this runbook must show, before merge:
   exhaustive mode check that rejects client-side `Dial` mode before constructing
   any caller; downstream code may consume a ready caller through `into_ready()`
   but must not be able to fabricate or restamp a ready status directly because
-  the ready payload and gate-owned seal stay encapsulated;
+  the ready payload and gate-owned seal stay encapsulated; the live caller must
+  run the gate fresh for the exact artifact/test window and consume the ready
+  payload immediately, never treating a stored ready payload or seal as a
+  durable authorization token after owner authorization, rollback, hardware
+  evidence, or config state changes;
 - no raw `TunnelFrame`, packet bytes, interface name, file descriptor, local
   path, or peer address is logged through Debug or error formatting;
 - tests prove route cleanup runs after pump stop/error and that failure returns
