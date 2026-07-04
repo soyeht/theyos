@@ -14,6 +14,7 @@ pub enum PushTransportStartupStatus {
     AlreadyInstalled,
 }
 
+#[must_use = "inspect the per-Claw VPN startup gate status before continuing"]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PerClawVpnStartupStatus {
     Disabled,
@@ -114,10 +115,12 @@ where
 /// authorization and hardware evidence requirements from the T1 readiness
 /// runbook. It does not call the runtime assembly, open TUN/utun, dial a relay,
 /// install routes, spawn work, or build caller-supplied handles.
+#[must_use = "inspect the per-Claw VPN startup gate status before continuing"]
 pub fn per_claw_vpn_startup_gate_from_env() -> PerClawVpnStartupStatus {
     per_claw_vpn_startup_gate_with(ClawVpnDevConfig::from_env)
 }
 
+#[must_use = "inspect the per-Claw VPN startup gate status before continuing"]
 pub fn per_claw_vpn_startup_gate_with<Load>(load: Load) -> PerClawVpnStartupStatus
 where
     Load: FnOnce() -> Result<Option<ClawVpnDevConfig>, ClawVpnDevConfigError>,
@@ -125,6 +128,7 @@ where
     per_claw_vpn_startup_gate_with_preflight(load, PerClawVpnT1PreflightEvidence::missing)
 }
 
+#[must_use = "inspect the per-Claw VPN startup gate status before continuing"]
 pub fn per_claw_vpn_startup_gate_with_preflight<Load, LoadPreflight>(
     load: Load,
     load_preflight: LoadPreflight,

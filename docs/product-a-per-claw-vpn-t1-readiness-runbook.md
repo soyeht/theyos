@@ -196,7 +196,10 @@ The wiring PR that follows this runbook must show, before merge:
   run the gate fresh for the exact artifact/test window and consume the ready
   payload immediately, never treating a stored ready payload or seal as a
   durable authorization token after owner authorization, rollback, hardware
-  evidence, or config state changes;
+  evidence, or config state changes; gate statuses and entrypoints must stay
+  `#[must_use]` so warning-deny builds catch accidental bare-call discards, while
+  any intentional discard such as an underscore binding remains a review item at
+  the future caller site;
 - no raw `TunnelFrame`, packet bytes, interface name, file descriptor, local
   path, or peer address is logged through Debug or error formatting;
 - tests prove route cleanup runs after pump stop/error and that failure returns

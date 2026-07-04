@@ -25,6 +25,7 @@ impl ClawVpnT1CallerReadySeal {
     }
 }
 
+#[must_use = "consume the ready payload through the reviewed T1 caller gate"]
 pub struct ClawVpnT1Ready<C> {
     mode: ClawVpnDevMode,
     caller: C,
@@ -45,6 +46,7 @@ impl<C> ClawVpnT1Ready<C> {
     }
 }
 
+#[must_use = "inspect the T1 caller gate status before using the caller"]
 pub enum ClawVpnT1CallerStatus<C> {
     Disabled,
     OwnerAuthorizationRequired { mode: ClawVpnDevMode },
@@ -116,6 +118,7 @@ impl<C> ClawVpnT1CallerStatus<C> {
     }
 }
 
+#[must_use = "inspect the T1 caller gate status before using the caller"]
 pub fn assemble_claw_vpn_t1_caller<LoadConfig, LoadPreflight, BuildCaller, C>(
     load_config: LoadConfig,
     load_preflight: LoadPreflight,
@@ -152,6 +155,7 @@ where
     ClawVpnT1CallerStatus::ready(mode, build_caller(&config))
 }
 
+#[must_use = "inspect the T1 caller gate status before using the router"]
 pub fn assemble_claw_vpn_t1_target_session_router<
     I,
     LoadConfig,
