@@ -190,8 +190,9 @@ The wiring PR that follows this runbook must show, before merge:
   authorization, missing rollback, and missing hardware evidence must all return
   before any caller-owned handles are built, and the gate must use an
   exhaustive mode check that rejects client-side `Dial` mode before constructing
-  any caller; downstream code may consume a ready caller but must not be able to
-  fabricate a ready status without the gate-owned ready seal;
+  any caller; downstream code may consume a ready caller through `into_ready()`
+  but must not be able to fabricate or restamp a ready status directly because
+  the ready payload and gate-owned seal stay encapsulated;
 - no raw `TunnelFrame`, packet bytes, interface name, file descriptor, local
   path, or peer address is logged through Debug or error formatting;
 - tests prove route cleanup runs after pump stop/error and that failure returns

@@ -115,13 +115,14 @@ binds dev config plus owner-auth/rollback/hardware preflight to construction of
 the caller-supplied target-session router. Disabled config, invalid config, and
 each missing preflight gate return before building the caller; the gate also
 uses an exhaustive mode check and rejects the client-side `Dial` mode before
-constructing any caller. Its `Ready` status is sealed so code outside the
-caller-gate module can consume a ready caller but cannot fabricate one without
-passing through the gate. It still does not mount the router, construct
-concrete devices, choose route tools, run wiring, open TUN/utun, dial a relay,
-spawn work, or authorize a live T1 run. The source guard tripwires external use
-of the caller-gate entrypoints and ready seal so the future mount-swap or
-startup caller reopens review.
+constructing any caller. Its `Ready` status carries an encapsulated ready
+payload with private fields, so code outside the caller-gate module consumes a
+ready caller through `into_ready()` instead of fabricating or restamping one
+directly. It still does not mount the router, construct concrete devices,
+choose route tools, run wiring, open TUN/utun, dial a relay, spawn work, or
+authorize a live T1 run. The source guard tripwires external use of the
+caller-gate entrypoints, ready payload, and ready seal so the future mount-swap
+or startup caller reopens review.
 There is still no
 checked-in runtime/bin that opens a TUN/utun interface in a product/default
 path, caller that invokes the runtime coordinator, route executor, packet pump,
@@ -446,10 +447,11 @@ Access between members/devices and claws is explicitly many-to-many:
   config, invalid config, missing owner authorization, missing rollback, and
   missing hardware evidence all return before the caller is built; the gate
   also uses an exhaustive mode check and rejects `Dial` mode before building
-  any caller. The ready status is sealed so downstream code can consume but not
-  fabricate a ready caller. It remains unmounted and does not supply concrete
-  handles or execute the launcher. The caller-gate entrypoints and ready seal
-  are guard-tripwired
+  any caller. The ready status carries an encapsulated ready payload with
+  private fields, so downstream code consumes it through `into_ready()` instead
+  of fabricating or restamping a ready caller. It remains unmounted and does not
+  supply concrete handles or execute the launcher. The caller-gate entrypoints,
+  ready payload, and ready seal are guard-tripwired
   outside their module/export.
   Exit: T1–T4 green on dev hosts.
 - **Phase 2 — iOS Packet Tunnel dev build.** Entry: entitlement go/no-go.

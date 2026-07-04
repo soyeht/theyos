@@ -16,7 +16,7 @@ use crate::claw_vpn_target_session_router::{
 };
 use crate::startup_wiring::PerClawVpnT1PreflightEvidence;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
 pub struct ClawVpnT1CallerReadySeal(());
 
 impl ClawVpnT1CallerReadySeal {
@@ -25,25 +25,33 @@ impl ClawVpnT1CallerReadySeal {
     }
 }
 
+pub struct ClawVpnT1Ready<C> {
+    mode: ClawVpnDevMode,
+    caller: C,
+    _seal: ClawVpnT1CallerReadySeal,
+}
+
+impl<C> ClawVpnT1Ready<C> {
+    fn new(mode: ClawVpnDevMode, caller: C) -> Self {
+        Self {
+            mode,
+            caller,
+            _seal: ClawVpnT1CallerReadySeal::new(),
+        }
+    }
+
+    fn into_parts(self) -> (ClawVpnDevMode, C) {
+        (self.mode, self.caller)
+    }
+}
+
 pub enum ClawVpnT1CallerStatus<C> {
     Disabled,
-    OwnerAuthorizationRequired {
-        mode: ClawVpnDevMode,
-    },
-    RollbackRequired {
-        mode: ClawVpnDevMode,
-    },
-    HardwareEvidenceRequired {
-        mode: ClawVpnDevMode,
-    },
-    UnsupportedMode {
-        mode: ClawVpnDevMode,
-    },
-    Ready {
-        mode: ClawVpnDevMode,
-        caller: C,
-        seal: ClawVpnT1CallerReadySeal,
-    },
+    OwnerAuthorizationRequired { mode: ClawVpnDevMode },
+    RollbackRequired { mode: ClawVpnDevMode },
+    HardwareEvidenceRequired { mode: ClawVpnDevMode },
+    UnsupportedMode { mode: ClawVpnDevMode },
+    Ready(ClawVpnT1Ready<C>),
     InvalidConfig,
 }
 
@@ -67,9 +75,9 @@ impl<C> fmt::Debug for ClawVpnT1CallerStatus<C> {
                 .debug_struct("ClawVpnT1CallerStatus::UnsupportedMode")
                 .field("mode", mode)
                 .finish(),
-            Self::Ready { mode, .. } => f
+            Self::Ready(ready) => f
                 .debug_struct("ClawVpnT1CallerStatus::Ready")
-                .field("mode", mode)
+                .field("mode", &ready.mode)
                 .field("caller", &"<redacted>")
                 .finish(),
             Self::InvalidConfig => f.write_str("ClawVpnT1CallerStatus::InvalidConfig"),
@@ -85,30 +93,26 @@ impl<C> ClawVpnT1CallerStatus<C> {
             Self::OwnerAuthorizationRequired { mode }
             | Self::RollbackRequired { mode }
             | Self::HardwareEvidenceRequired { mode }
-            | Self::UnsupportedMode { mode }
-            | Self::Ready { mode, .. } => Some(*mode),
+            | Self::UnsupportedMode { mode } => Some(*mode),
+            Self::Ready(ready) => Some(ready.mode),
         }
     }
 
     #[must_use]
     pub fn is_ready(&self) -> bool {
-        matches!(self, Self::Ready { .. })
+        matches!(self, Self::Ready(_))
     }
 
     #[must_use]
     pub fn into_ready(self) -> Option<(ClawVpnDevMode, C)> {
         match self {
-            Self::Ready { mode, caller, .. } => Some((mode, caller)),
+            Self::Ready(ready) => Some(ready.into_parts()),
             _ => None,
         }
     }
 
     fn ready(mode: ClawVpnDevMode, caller: C) -> Self {
-        Self::Ready {
-            mode,
-            caller,
-            seal: ClawVpnT1CallerReadySeal::new(),
-        }
+        Self::Ready(ClawVpnT1Ready::new(mode, caller))
     }
 }
 
