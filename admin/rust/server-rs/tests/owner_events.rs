@@ -4394,6 +4394,7 @@ fn product_a_per_claw_vpn_dev_config_remains_default_off_and_unwired() {
                 .contains("ClawVpnTargetSessionRouter")
                 || line.contains("claw_vpn_target_session_router");
             let references_t1_caller_gate = line.contains("ClawVpnT1CallerStatus")
+                || line.contains("ClawVpnT1CallerReadySeal")
                 || line.contains("assemble_claw_vpn_t1_caller")
                 || line.contains("assemble_claw_vpn_t1_target_session_router")
                 || line.contains("claw_vpn_t1_caller");

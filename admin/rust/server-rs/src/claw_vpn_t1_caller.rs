@@ -16,13 +16,34 @@ use crate::claw_vpn_target_session_router::{
 };
 use crate::startup_wiring::PerClawVpnT1PreflightEvidence;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ClawVpnT1CallerReadySeal(());
+
+impl ClawVpnT1CallerReadySeal {
+    fn new() -> Self {
+        Self(())
+    }
+}
+
 pub enum ClawVpnT1CallerStatus<C> {
     Disabled,
-    OwnerAuthorizationRequired { mode: ClawVpnDevMode },
-    RollbackRequired { mode: ClawVpnDevMode },
-    HardwareEvidenceRequired { mode: ClawVpnDevMode },
-    UnsupportedMode { mode: ClawVpnDevMode },
-    Ready { mode: ClawVpnDevMode, caller: C },
+    OwnerAuthorizationRequired {
+        mode: ClawVpnDevMode,
+    },
+    RollbackRequired {
+        mode: ClawVpnDevMode,
+    },
+    HardwareEvidenceRequired {
+        mode: ClawVpnDevMode,
+    },
+    UnsupportedMode {
+        mode: ClawVpnDevMode,
+    },
+    Ready {
+        mode: ClawVpnDevMode,
+        caller: C,
+        seal: ClawVpnT1CallerReadySeal,
+    },
     InvalidConfig,
 }
 
@@ -73,6 +94,22 @@ impl<C> ClawVpnT1CallerStatus<C> {
     pub fn is_ready(&self) -> bool {
         matches!(self, Self::Ready { .. })
     }
+
+    #[must_use]
+    pub fn into_ready(self) -> Option<(ClawVpnDevMode, C)> {
+        match self {
+            Self::Ready { mode, caller, .. } => Some((mode, caller)),
+            _ => None,
+        }
+    }
+
+    fn ready(mode: ClawVpnDevMode, caller: C) -> Self {
+        Self::Ready {
+            mode,
+            caller,
+            seal: ClawVpnT1CallerReadySeal::new(),
+        }
+    }
 }
 
 pub fn assemble_claw_vpn_t1_caller<LoadConfig, LoadPreflight, BuildCaller, C>(
@@ -108,10 +145,7 @@ where
         }
     }
 
-    ClawVpnT1CallerStatus::Ready {
-        mode,
-        caller: build_caller(&config),
-    }
+    ClawVpnT1CallerStatus::ready(mode, build_caller(&config))
 }
 
 pub fn assemble_claw_vpn_t1_target_session_router<
@@ -133,29 +167,9 @@ where
     LaunchRuntime:
         Fn(ClawVpnTargetSessionRouterWiring<I>) -> ClawVpnTargetSessionRouterLaunchResult,
 {
-    let status = assemble_claw_vpn_t1_caller(load_config, load_preflight, |_config| {
+    assemble_claw_vpn_t1_caller(load_config, load_preflight, |_config| {
         ClawVpnTargetSessionRouter::new(build_runtime, launch_runtime)
-    });
-
-    match status {
-        ClawVpnT1CallerStatus::Disabled => ClawVpnT1CallerStatus::Disabled,
-        ClawVpnT1CallerStatus::OwnerAuthorizationRequired { mode } => {
-            ClawVpnT1CallerStatus::OwnerAuthorizationRequired { mode }
-        }
-        ClawVpnT1CallerStatus::RollbackRequired { mode } => {
-            ClawVpnT1CallerStatus::RollbackRequired { mode }
-        }
-        ClawVpnT1CallerStatus::HardwareEvidenceRequired { mode } => {
-            ClawVpnT1CallerStatus::HardwareEvidenceRequired { mode }
-        }
-        ClawVpnT1CallerStatus::UnsupportedMode { mode } => {
-            ClawVpnT1CallerStatus::UnsupportedMode { mode }
-        }
-        ClawVpnT1CallerStatus::Ready { mode, caller } => {
-            ClawVpnT1CallerStatus::Ready { mode, caller }
-        }
-        ClawVpnT1CallerStatus::InvalidConfig => ClawVpnT1CallerStatus::InvalidConfig,
-    }
+    })
 }
 
 #[cfg(test)]
@@ -307,6 +321,9 @@ mod tests {
         let debug = format!("{status:?}");
         assert!(debug.contains("ClawVpnT1CallerStatus::Ready"));
         assert!(!debug.contains("SECRET-CALLER"));
+
+        let ready = status.into_ready();
+        assert_eq!(ready, Some((ClawVpnDevMode::Live, "SECRET-CALLER")));
     }
 
     #[test]
