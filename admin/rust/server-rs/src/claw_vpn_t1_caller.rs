@@ -8,6 +8,7 @@
 //! all present.
 
 use std::fmt;
+use std::sync::Arc;
 
 use crate::claw_vpn_dev_config::{ClawVpnDevConfig, ClawVpnDevConfigError, ClawVpnDevMode};
 use crate::claw_vpn_target_session_router::{
@@ -15,6 +16,24 @@ use crate::claw_vpn_target_session_router::{
     ClawVpnTargetSessionRouterLaunchResult, ClawVpnTargetSessionRouterWiring,
 };
 use crate::startup_wiring::PerClawVpnT1PreflightEvidence;
+
+pub type ClawVpnT1TargetSessionRouterBuild<I> =
+    Box<dyn Fn(&str) -> ClawVpnTargetSessionRouterBuildResult<I> + Send + Sync>;
+
+pub type ClawVpnT1TargetSessionRouterLaunch<I> = Box<
+    dyn Fn(ClawVpnTargetSessionRouterWiring<I>) -> ClawVpnTargetSessionRouterLaunchResult
+        + Send
+        + Sync,
+>;
+
+pub type ClawVpnT1TargetSessionRouter<I> = ClawVpnTargetSessionRouter<
+    I,
+    ClawVpnT1TargetSessionRouterBuild<I>,
+    ClawVpnT1TargetSessionRouterLaunch<I>,
+>;
+
+pub type ClawVpnT1TargetSessionRouterFactory<I> =
+    Arc<dyn Fn() -> ClawVpnT1TargetSessionRouter<I> + Send + Sync>;
 
 #[derive(Debug, PartialEq, Eq)]
 pub struct ClawVpnT1CallerReadySeal(());
@@ -180,10 +199,50 @@ where
     })
 }
 
+#[must_use = "inspect the T1 caller gate status before using the router factory"]
+pub fn assemble_claw_vpn_t1_target_session_router_factory<
+    I,
+    LoadConfig,
+    LoadPreflight,
+    BuildRuntime,
+    LaunchRuntime,
+>(
+    load_config: LoadConfig,
+    load_preflight: LoadPreflight,
+    build_runtime: BuildRuntime,
+    launch_runtime: LaunchRuntime,
+) -> ClawVpnT1CallerStatus<ClawVpnT1TargetSessionRouterFactory<I>>
+where
+    I: 'static,
+    LoadConfig: FnOnce() -> Result<Option<ClawVpnDevConfig>, ClawVpnDevConfigError>,
+    LoadPreflight: FnOnce() -> PerClawVpnT1PreflightEvidence,
+    BuildRuntime: Fn(&str) -> ClawVpnTargetSessionRouterBuildResult<I> + Send + Sync + 'static,
+    LaunchRuntime: Fn(ClawVpnTargetSessionRouterWiring<I>) -> ClawVpnTargetSessionRouterLaunchResult
+        + Send
+        + Sync
+        + 'static,
+{
+    assemble_claw_vpn_t1_caller(load_config, load_preflight, move |_config| {
+        let build_runtime = Arc::new(build_runtime);
+        let launch_runtime = Arc::new(launch_runtime);
+        let factory: ClawVpnT1TargetSessionRouterFactory<I> = Arc::new(move || {
+            let build_runtime = Arc::clone(&build_runtime);
+            let launch_runtime = Arc::clone(&launch_runtime);
+            let build_runtime: ClawVpnT1TargetSessionRouterBuild<I> =
+                Box::new(move |target_id| build_runtime(target_id));
+            let launch_runtime: ClawVpnT1TargetSessionRouterLaunch<I> =
+                Box::new(move |wiring| launch_runtime(wiring));
+            ClawVpnTargetSessionRouter::new(build_runtime, launch_runtime)
+        });
+        factory
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::cell::Cell;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     struct FakeInterface;
 
@@ -405,5 +464,74 @@ mod tests {
         ));
         assert!(!build_runtime_called.get());
         assert!(!launch_runtime_called.get());
+    }
+
+    #[test]
+    fn t1_target_session_router_factory_is_created_only_after_preflight_is_present() {
+        let build_runtime_called = Arc::new(AtomicUsize::new(0));
+        let launch_runtime_called = Arc::new(AtomicUsize::new(0));
+
+        let status = assemble_claw_vpn_t1_target_session_router_factory::<FakeInterface, _, _, _, _>(
+            || Ok(Some(live_config())),
+            || PerClawVpnT1PreflightEvidence::new(true, true, true),
+            {
+                let build_runtime_called = Arc::clone(&build_runtime_called);
+                move |_target_id| {
+                    build_runtime_called.fetch_add(1, Ordering::SeqCst);
+                    Ok(None)
+                }
+            },
+            {
+                let launch_runtime_called = Arc::clone(&launch_runtime_called);
+                move |_wiring| {
+                    launch_runtime_called.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                }
+            },
+        );
+
+        assert!(status.is_ready());
+        assert_eq!(build_runtime_called.load(Ordering::SeqCst), 0);
+        assert_eq!(launch_runtime_called.load(Ordering::SeqCst), 0);
+
+        let (mode, router_factory) = status.into_ready().unwrap();
+        assert_eq!(mode, ClawVpnDevMode::Live);
+        let _router = router_factory();
+        assert_eq!(build_runtime_called.load(Ordering::SeqCst), 0);
+        assert_eq!(launch_runtime_called.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn t1_target_session_router_factory_rejects_dial_mode_without_building_factory() {
+        let build_runtime_called = Arc::new(AtomicUsize::new(0));
+        let launch_runtime_called = Arc::new(AtomicUsize::new(0));
+
+        let status = assemble_claw_vpn_t1_target_session_router_factory::<FakeInterface, _, _, _, _>(
+            || Ok(Some(dial_config())),
+            || PerClawVpnT1PreflightEvidence::new(true, true, true),
+            {
+                let build_runtime_called = Arc::clone(&build_runtime_called);
+                move |_target_id| {
+                    build_runtime_called.fetch_add(1, Ordering::SeqCst);
+                    Ok(None)
+                }
+            },
+            {
+                let launch_runtime_called = Arc::clone(&launch_runtime_called);
+                move |_wiring| {
+                    launch_runtime_called.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                }
+            },
+        );
+
+        assert!(matches!(
+            status,
+            ClawVpnT1CallerStatus::UnsupportedMode {
+                mode: ClawVpnDevMode::Dial
+            }
+        ));
+        assert_eq!(build_runtime_called.load(Ordering::SeqCst), 0);
+        assert_eq!(launch_runtime_called.load(Ordering::SeqCst), 0);
     }
 }
