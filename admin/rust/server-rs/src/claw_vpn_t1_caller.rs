@@ -488,6 +488,60 @@ mod tests {
     }
 
     #[test]
+    fn t1_target_session_router_preflight_blockers_do_not_build_router_parts() {
+        let parts_built = Cell::new(0);
+        let build_runtime_called = Cell::new(false);
+        let launch_runtime_called = Cell::new(false);
+
+        macro_rules! assert_blocked {
+            ($preflight:expr, $pattern:pat) => {{
+                let status =
+                    assemble_claw_vpn_t1_target_session_router::<FakeInterface, _, _, _, _, _>(
+                        || Ok(Some(live_config())),
+                        || $preflight,
+                        |_config| {
+                            parts_built.set(parts_built.get() + 1);
+                            (
+                                |_target_id| {
+                                    build_runtime_called.set(true);
+                                    Ok(None)
+                                },
+                                |_wiring| {
+                                    launch_runtime_called.set(true);
+                                    Ok(())
+                                },
+                            )
+                        },
+                    );
+                assert!(matches!(status, $pattern));
+            }};
+        }
+
+        assert_blocked!(
+            PerClawVpnT1PreflightEvidence::missing(),
+            ClawVpnT1CallerStatus::OwnerAuthorizationRequired {
+                mode: ClawVpnDevMode::Live
+            }
+        );
+        assert_blocked!(
+            PerClawVpnT1PreflightEvidence::new(true, false, true),
+            ClawVpnT1CallerStatus::RollbackRequired {
+                mode: ClawVpnDevMode::Live
+            }
+        );
+        assert_blocked!(
+            PerClawVpnT1PreflightEvidence::new(true, true, false),
+            ClawVpnT1CallerStatus::HardwareEvidenceRequired {
+                mode: ClawVpnDevMode::Live
+            }
+        );
+
+        assert_eq!(parts_built.get(), 0);
+        assert!(!build_runtime_called.get());
+        assert!(!launch_runtime_called.get());
+    }
+
+    #[test]
     fn t1_target_session_router_factory_is_created_only_after_preflight_is_present() {
         let build_runtime_called = Arc::new(AtomicUsize::new(0));
         let launch_runtime_called = Arc::new(AtomicUsize::new(0));
@@ -567,6 +621,66 @@ mod tests {
                 mode: ClawVpnDevMode::Dial
             }
         ));
+        assert_eq!(parts_built.load(Ordering::SeqCst), 0);
+        assert_eq!(build_runtime_called.load(Ordering::SeqCst), 0);
+        assert_eq!(launch_runtime_called.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn t1_target_session_router_factory_preflight_blockers_do_not_build_parts() {
+        let build_runtime_called = Arc::new(AtomicUsize::new(0));
+        let launch_runtime_called = Arc::new(AtomicUsize::new(0));
+        let parts_built = Arc::new(AtomicUsize::new(0));
+
+        macro_rules! assert_blocked {
+            ($preflight:expr, $pattern:pat) => {{
+                let status = assemble_claw_vpn_t1_target_session_router_factory::<
+                    FakeInterface,
+                    _,
+                    _,
+                    _,
+                >(|| Ok(Some(live_config())), || $preflight, {
+                    let parts_built = Arc::clone(&parts_built);
+                    let build_runtime_called = Arc::clone(&build_runtime_called);
+                    let launch_runtime_called = Arc::clone(&launch_runtime_called);
+                    move |_config| {
+                        parts_built.fetch_add(1, Ordering::SeqCst);
+                        let build_runtime: ClawVpnT1TargetSessionRouterBuild<FakeInterface> =
+                            Box::new(move |_target_id| {
+                                build_runtime_called.fetch_add(1, Ordering::SeqCst);
+                                Ok(None)
+                            });
+                        let launch_runtime: ClawVpnT1TargetSessionRouterLaunch<FakeInterface> =
+                            Box::new(move |_wiring| {
+                                launch_runtime_called.fetch_add(1, Ordering::SeqCst);
+                                Ok(())
+                            });
+                        (build_runtime, launch_runtime)
+                    }
+                });
+                assert!(matches!(status, $pattern));
+            }};
+        }
+
+        assert_blocked!(
+            PerClawVpnT1PreflightEvidence::missing(),
+            ClawVpnT1CallerStatus::OwnerAuthorizationRequired {
+                mode: ClawVpnDevMode::Live
+            }
+        );
+        assert_blocked!(
+            PerClawVpnT1PreflightEvidence::new(true, false, true),
+            ClawVpnT1CallerStatus::RollbackRequired {
+                mode: ClawVpnDevMode::Live
+            }
+        );
+        assert_blocked!(
+            PerClawVpnT1PreflightEvidence::new(true, true, false),
+            ClawVpnT1CallerStatus::HardwareEvidenceRequired {
+                mode: ClawVpnDevMode::Live
+            }
+        );
+
         assert_eq!(parts_built.load(Ordering::SeqCst), 0);
         assert_eq!(build_runtime_called.load(Ordering::SeqCst), 0);
         assert_eq!(launch_runtime_called.load(Ordering::SeqCst), 0);
