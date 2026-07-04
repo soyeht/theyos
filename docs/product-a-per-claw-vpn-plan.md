@@ -116,21 +116,24 @@ the caller-supplied target-session router. Disabled config, invalid config, and
 each missing preflight gate return before building the caller; the gate also
 uses an exhaustive mode check and rejects the client-side `Dial` mode before
 constructing any caller. It can also emit the relay-runtime shaped router
-factory only after those same gates pass; invoking that factory only constructs
-the target-session router adapter and does not call `build_runtime`, execute
-the launcher, or open a target session. Its `Ready` status carries an
-encapsulated ready payload with private fields, so code outside the caller-gate
-module consumes a ready caller through `into_ready()` instead of fabricating or
-restamping one directly; the future live caller must obtain that payload from a
-fresh gate run for the exact artifact/test window, not from a stored ready
-value. The gate statuses and entrypoints are `#[must_use]`, so warning-deny
-builds catch accidental bare-call discards; any intentional discard still has
-to be explicit and reviewed at the future caller site. It still does not mount
-the router, construct concrete devices, choose route tools, run wiring, open
-TUN/utun, dial a relay, spawn work, or authorize a live T1 run. The source
-guard tripwires external use of the caller-gate entrypoints, ready payload,
-ready seal, and router factory so the future mount-swap or startup caller
-reopens review.
+factory only after those same gates pass. The router helpers obtain
+`build_runtime`/launcher closure parts through a post-gate builder, and invoking
+the factory only constructs the target-session router adapter; it does not call
+`build_runtime`, execute the launcher, or open a target session. The future live
+caller must still prove that the post-gate builder is lazy and does not capture
+concrete device, route, or relay handles that were opened before the blockers.
+Its `Ready` status carries an encapsulated ready payload with private fields,
+so code outside the caller-gate module consumes a ready caller through
+`into_ready()` instead of fabricating or restamping one directly; the future live
+caller must obtain that payload from a fresh gate run for the exact artifact/test
+window, not from a stored ready value. The gate statuses and entrypoints are
+`#[must_use]`, so warning-deny builds catch accidental bare-call discards; any
+intentional discard still has to be explicit and reviewed at the future caller
+site. It still does not mount the router, construct concrete devices, choose
+route tools, run wiring, open TUN/utun, dial a relay, spawn work, or authorize a
+live T1 run. The source guard tripwires external use of the caller-gate
+entrypoints, ready payload, ready seal, and router factory so the future
+mount-swap or startup caller reopens review.
 There is still no
 checked-in runtime/bin that opens a TUN/utun interface in a product/default
 path, caller that invokes the runtime coordinator, route executor, packet pump,
@@ -460,14 +463,18 @@ Access between members/devices and claws is explicitly many-to-many:
   of fabricating or restamping a ready caller; the future live caller must obtain
   it from a fresh gate run for the exact artifact/test window rather than a
   cached ready value. The same gate can return the relay-runtime shaped router
-  factory after the gates pass, but calling that factory only creates the
-  target-session router adapter and still does not call `build_runtime`, execute
-  the launcher, or open a target session. The gate statuses and entrypoints are
-  `#[must_use]` so warning-deny builds catch accidental bare-call discards; any
-  intentional discard still has to be explicit and reviewed at the future caller
-  site. It remains unmounted and does not supply concrete handles or execute the
-  launcher. The caller-gate entrypoints, ready payload, ready seal, and router
-  factory are guard-tripwired outside their module/export.
+  factory after the gates pass. The router helpers obtain
+  `build_runtime`/launcher closure parts through a post-gate builder, and
+  calling the factory only creates the target-session router adapter; it still
+  does not call `build_runtime`, execute the launcher, or open a target session.
+  The future live caller must prove that the post-gate builder is lazy and does
+  not capture concrete device, route, or relay handles opened before the
+  blockers. The gate statuses and entrypoints are `#[must_use]` so warning-deny
+  builds catch accidental bare-call discards; any intentional discard still has
+  to be explicit and reviewed at the future caller site. It remains unmounted
+  and does not supply concrete handles or execute the launcher. The caller-gate
+  entrypoints, ready payload, ready seal, and router factory are guard-tripwired
+  outside their module/export.
   Exit: T1–T4 green on dev hosts.
 - **Phase 2 — iOS Packet Tunnel dev build.** Entry: entitlement go/no-go.
   Dev device only. Exit: T5–T7 green (iPhone reaches Claw-A — and only
