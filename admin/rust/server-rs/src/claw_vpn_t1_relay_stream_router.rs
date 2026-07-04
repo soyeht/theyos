@@ -9,14 +9,18 @@
 //! caller-supplied launcher.
 
 use std::collections::HashMap;
+use std::ffi::{CString, OsStr};
 use std::fmt;
-use std::fs::OpenOptions;
+use std::fs::File;
 use std::io;
 use std::io::Write;
 use std::marker::PhantomData;
-use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::mem::MaybeUninit;
+use std::os::fd::{AsRawFd, FromRawFd, RawFd};
+use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixStream as StdUnixStream;
-use std::path::PathBuf;
+use std::path::{Component, Path, PathBuf};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{SyncSender, TrySendError, sync_channel};
@@ -99,17 +103,15 @@ fn claw_vpn_t1_spooled_jsonl_audit_sink_with_capacity(
     capacity: usize,
 ) -> Result<ClawVpnT1RelayStreamAuditSink, ClawVpnT1AuditSinkError> {
     let path = path.into();
-    if let Some(parent) = path.parent() {
+    let parent = path.parent().ok_or_else(|| {
+        ClawVpnT1AuditSinkError::OpenFile(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "claw vpn t1 audit path must include a file name",
+        ))
+    })?;
+    let parent_dir =
         ensure_claw_vpn_t1_audit_parent(parent).map_err(ClawVpnT1AuditSinkError::CreateDir)?;
-    }
-    let mut file = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .custom_flags(libc::O_NOFOLLOW)
-        .mode(0o600)
-        .open(path)
-        .map_err(ClawVpnT1AuditSinkError::OpenFile)?;
-    file.set_permissions(std::fs::Permissions::from_mode(0o600))
+    let mut file = open_claw_vpn_t1_audit_log_file(&parent_dir, &path)
         .map_err(ClawVpnT1AuditSinkError::OpenFile)?;
     let (sender, receiver) = sync_channel(capacity);
     let healthy = Arc::new(AtomicBool::new(true));
@@ -137,35 +139,154 @@ fn claw_vpn_t1_spooled_jsonl_audit_sink_with_capacity(
     }))
 }
 
-fn ensure_claw_vpn_t1_audit_parent(parent: &std::path::Path) -> io::Result<()> {
-    match std::fs::symlink_metadata(parent) {
-        Ok(_) => {}
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            std::fs::DirBuilder::new()
-                .recursive(true)
-                .mode(0o700)
-                .create(parent)?;
+fn ensure_claw_vpn_t1_audit_parent(parent: &Path) -> io::Result<File> {
+    let mut current = open_claw_vpn_t1_start_dir(parent)?;
+    for component in parent.components() {
+        match component {
+            Component::Prefix(_) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "claw vpn t1 audit parent must be a unix path",
+                ));
+            }
+            Component::RootDir | Component::CurDir => {}
+            Component::ParentDir => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "claw vpn t1 audit parent must not contain parent components",
+                ));
+            }
+            Component::Normal(component) => {
+                let component = claw_vpn_t1_path_component_cstring(component)?;
+                let (next, created) =
+                    open_or_create_claw_vpn_t1_audit_dir_at(current.as_raw_fd(), &component)?;
+                if created {
+                    set_claw_vpn_t1_audit_dir_mode(next.as_raw_fd(), 0o700)?;
+                }
+                current = next;
+            }
         }
-        Err(error) => return Err(error),
     }
-    validate_claw_vpn_t1_audit_parent(parent)
+    validate_claw_vpn_t1_audit_parent_fd(current.as_raw_fd())?;
+    Ok(current)
 }
 
-fn validate_claw_vpn_t1_audit_parent(parent: &std::path::Path) -> io::Result<()> {
-    let parent_meta = std::fs::symlink_metadata(parent)?;
-    if parent_meta.file_type().is_symlink() || !parent_meta.is_dir() {
+fn open_claw_vpn_t1_audit_log_file(parent_dir: &File, path: &Path) -> io::Result<File> {
+    let file_name = path.file_name().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "claw vpn t1 audit path must include a file name",
+        )
+    })?;
+    let file_name = claw_vpn_t1_path_component_cstring(file_name)?;
+    let file = open_claw_vpn_t1_audit_file_at(parent_dir.as_raw_fd(), &file_name)?;
+    file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    Ok(file)
+}
+
+fn open_claw_vpn_t1_start_dir(parent: &Path) -> io::Result<File> {
+    let start = if parent.is_absolute() { "/" } else { "." };
+    File::open(start)
+}
+
+fn open_or_create_claw_vpn_t1_audit_dir_at(
+    parent_fd: RawFd,
+    component: &CString,
+) -> io::Result<(File, bool)> {
+    match open_claw_vpn_t1_audit_dir_at(parent_fd, component) {
+        Ok(file) => Ok((file, false)),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            mkdir_claw_vpn_t1_audit_dir_at(parent_fd, component, 0o700)?;
+            open_claw_vpn_t1_audit_dir_at(parent_fd, component).map(|file| (file, true))
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn claw_vpn_t1_path_component_cstring(component: &OsStr) -> io::Result<CString> {
+    let bytes = component.as_bytes();
+    if bytes.is_empty() || bytes == b"." || bytes == b".." {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "claw vpn t1 audit path component must be a plain name",
+        ));
+    }
+    CString::new(bytes).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "claw vpn t1 audit path component must not contain nul",
+        )
+    })
+}
+
+#[allow(unsafe_code)]
+fn open_claw_vpn_t1_audit_dir_at(parent_fd: RawFd, component: &CString) -> io::Result<File> {
+    // SAFETY: component is a nul-terminated single path component. openat does
+    // not retain the pointer after returning, and the returned fd is owned here.
+    let fd = unsafe {
+        libc::openat(
+            parent_fd,
+            component.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: fd was returned by openat and is transferred into File ownership.
+    Ok(unsafe { File::from_raw_fd(fd) })
+}
+
+#[allow(unsafe_code)]
+fn mkdir_claw_vpn_t1_audit_dir_at(
+    parent_fd: RawFd,
+    component: &CString,
+    mode: libc::mode_t,
+) -> io::Result<()> {
+    // SAFETY: component is a nul-terminated single path component; mkdirat does
+    // not retain the pointer and only creates below parent_fd.
+    let result = unsafe { libc::mkdirat(parent_fd, component.as_ptr(), mode) };
+    if result < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+#[allow(unsafe_code)]
+fn set_claw_vpn_t1_audit_dir_mode(fd: RawFd, mode: libc::mode_t) -> io::Result<()> {
+    // SAFETY: fd is an open directory descriptor owned by File; fchmod does not
+    // take ownership and only updates permissions on that descriptor.
+    let result = unsafe { libc::fchmod(fd, mode) };
+    if result < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+#[allow(unsafe_code)]
+fn validate_claw_vpn_t1_audit_parent_fd(parent_fd: RawFd) -> io::Result<()> {
+    let mut stat = MaybeUninit::<libc::stat>::uninit();
+    // SAFETY: stat points to valid uninitialized storage for fstat to fill; fd
+    // is borrowed and fstat does not take ownership.
+    let result = unsafe { libc::fstat(parent_fd, stat.as_mut_ptr()) };
+    if result < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: fstat returned success, so stat has been initialized.
+    let stat = unsafe { stat.assume_init() };
+    if stat.st_mode & libc::S_IFMT != libc::S_IFDIR {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "claw vpn t1 audit parent must be a real directory",
         ));
     }
-    if parent_meta.uid() != claw_vpn_t1_current_euid() {
+    if stat.st_uid != claw_vpn_t1_current_euid() {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
             "claw vpn t1 audit parent must be owned by current user",
         ));
     }
-    let mode = parent_meta.permissions().mode() & 0o777;
+    let mode = stat.st_mode & 0o7777;
     if mode != 0o700 {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
@@ -173,6 +294,25 @@ fn validate_claw_vpn_t1_audit_parent(parent: &std::path::Path) -> io::Result<()>
         ));
     }
     Ok(())
+}
+
+#[allow(unsafe_code)]
+fn open_claw_vpn_t1_audit_file_at(parent_fd: RawFd, file_name: &CString) -> io::Result<File> {
+    // SAFETY: file_name is a nul-terminated single path component. openat does
+    // not retain the pointer, and the returned fd is owned by the File below.
+    let fd = unsafe {
+        libc::openat(
+            parent_fd,
+            file_name.as_ptr(),
+            libc::O_CREAT | libc::O_APPEND | libc::O_WRONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+            0o600,
+        )
+    };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: fd was returned by openat and is transferred into File ownership.
+    Ok(unsafe { File::from_raw_fd(fd) })
 }
 
 #[allow(unsafe_code)]
@@ -739,7 +879,7 @@ mod tests {
     async fn t1_spooled_audit_sink_writes_redacted_jsonl_without_raw_target_ids() {
         let build_count = Arc::new(AtomicUsize::new(0));
         let launch_count = Arc::new(AtomicUsize::new(0));
-        let dir = tempfile::tempdir().unwrap();
+        let dir = t1_audit_sink_test_tempdir();
         let audit_path = dir.path().join("audit").join("t1.jsonl");
         let router = ClawVpnT1RelayStreamIpTunnelRouter::<FakeInterface, _, _>::new(
             live_config(),
@@ -788,7 +928,7 @@ mod tests {
 
     #[test]
     fn t1_spooled_audit_sink_rejects_directory_as_log_file() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = t1_audit_sink_test_tempdir();
         let audit_dir = dir.path().join("audit");
         std::fs::create_dir(&audit_dir).unwrap();
         std::fs::set_permissions(&audit_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
@@ -805,7 +945,7 @@ mod tests {
 
     #[test]
     fn t1_spooled_audit_sink_forces_owner_only_log_file_permissions() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = t1_audit_sink_test_tempdir();
         let audit_dir = dir.path().join("audit");
         std::fs::create_dir(&audit_dir).unwrap();
         std::fs::set_permissions(&audit_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
@@ -823,12 +963,17 @@ mod tests {
 
     #[test]
     fn t1_spooled_audit_sink_creates_owner_only_parent_directory() {
-        let dir = tempfile::tempdir().unwrap();
-        let audit_dir = dir.path().join("audit");
+        let dir = t1_audit_sink_test_tempdir();
+        let audit_root = dir.path().join("audit");
+        let audit_dir = audit_root.join("nested");
         let audit_path = audit_dir.join("audit.jsonl");
 
         let _sink = claw_vpn_t1_spooled_jsonl_audit_sink(&audit_path).unwrap();
 
+        assert_eq!(
+            std::fs::metadata(&audit_root).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
         assert_eq!(
             std::fs::metadata(&audit_dir).unwrap().permissions().mode() & 0o777,
             0o700
@@ -841,7 +986,7 @@ mod tests {
 
     #[test]
     fn t1_spooled_audit_sink_rejects_symlink_parent_directory() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = t1_audit_sink_test_tempdir();
         let target_dir = dir.path().join("target");
         std::fs::create_dir(&target_dir).unwrap();
         std::fs::set_permissions(&target_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
@@ -857,8 +1002,56 @@ mod tests {
     }
 
     #[test]
+    fn t1_spooled_audit_sink_rejects_symlink_intermediate_directory() {
+        let dir = t1_audit_sink_test_tempdir();
+        let target_dir = dir.path().join("target");
+        std::fs::create_dir(&target_dir).unwrap();
+        std::fs::set_permissions(&target_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let audit_link = dir.path().join("audit-link");
+        std::os::unix::fs::symlink(&target_dir, &audit_link).unwrap();
+
+        let error = match claw_vpn_t1_spooled_jsonl_audit_sink(
+            audit_link.join("nested").join("audit.jsonl"),
+        ) {
+            Ok(_) => panic!("symlink intermediate must not create an audit sink"),
+            Err(error) => error,
+        };
+
+        assert!(matches!(error, ClawVpnT1AuditSinkError::CreateDir(_)));
+    }
+
+    #[test]
+    fn t1_spooled_audit_sink_rejects_parent_dir_components() {
+        let dir = t1_audit_sink_test_tempdir();
+
+        let error =
+            match claw_vpn_t1_spooled_jsonl_audit_sink(dir.path().join("..").join("audit.jsonl")) {
+                Ok(_) => panic!("parent-dir component must not create an audit sink"),
+                Err(error) => error,
+            };
+
+        assert!(matches!(error, ClawVpnT1AuditSinkError::CreateDir(_)));
+    }
+
+    #[test]
+    fn t1_spooled_audit_sink_rejects_file_intermediate_directory() {
+        let dir = t1_audit_sink_test_tempdir();
+        let audit_file = dir.path().join("audit-file");
+        std::fs::write(&audit_file, "").unwrap();
+
+        let error = match claw_vpn_t1_spooled_jsonl_audit_sink(
+            audit_file.join("nested").join("audit.jsonl"),
+        ) {
+            Ok(_) => panic!("file intermediate must not create an audit sink"),
+            Err(error) => error,
+        };
+
+        assert!(matches!(error, ClawVpnT1AuditSinkError::CreateDir(_)));
+    }
+
+    #[test]
     fn t1_spooled_audit_sink_rejects_shared_parent_directory() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = t1_audit_sink_test_tempdir();
         let audit_dir = dir.path().join("audit");
         std::fs::create_dir(&audit_dir).unwrap();
         std::fs::set_permissions(&audit_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
@@ -872,8 +1065,48 @@ mod tests {
     }
 
     #[test]
+    fn t1_spooled_audit_sink_rejects_sticky_parent_directory() {
+        let dir = t1_audit_sink_test_tempdir();
+        let audit_dir = dir.path().join("audit");
+        std::fs::create_dir(&audit_dir).unwrap();
+        std::fs::set_permissions(&audit_dir, std::fs::Permissions::from_mode(0o1700)).unwrap();
+
+        let error = match claw_vpn_t1_spooled_jsonl_audit_sink(audit_dir.join("audit.jsonl")) {
+            Ok(_) => panic!("sticky parent must not create an audit sink"),
+            Err(error) => error,
+        };
+
+        assert!(matches!(error, ClawVpnT1AuditSinkError::CreateDir(_)));
+    }
+
+    #[test]
+    fn t1_spooled_audit_sink_rejects_setgid_parent_directory() {
+        let dir = t1_audit_sink_test_tempdir();
+        let audit_dir = dir.path().join("audit");
+        std::fs::create_dir(&audit_dir).unwrap();
+        std::fs::set_permissions(&audit_dir, std::fs::Permissions::from_mode(0o2700)).unwrap();
+        let mode = std::fs::symlink_metadata(&audit_dir)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o7777;
+        if mode & 0o2000 == 0 {
+            eprintln!("skipping setgid rejection check because this platform cleared setgid");
+            return;
+        }
+        assert_eq!(mode, 0o2700);
+
+        let error = match claw_vpn_t1_spooled_jsonl_audit_sink(audit_dir.join("audit.jsonl")) {
+            Ok(_) => panic!("setgid parent must not create an audit sink"),
+            Err(error) => error,
+        };
+
+        assert!(matches!(error, ClawVpnT1AuditSinkError::CreateDir(_)));
+    }
+
+    #[test]
     fn t1_spooled_audit_sink_rejects_symlink_log_file() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = t1_audit_sink_test_tempdir();
         let audit_dir = dir.path().join("audit");
         std::fs::create_dir(&audit_dir).unwrap();
         std::fs::set_permissions(&audit_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
@@ -962,6 +1195,15 @@ mod tests {
             claw_vpn_t1_try_enqueue_audit_event(&sender, &healthy, event),
             Err("claw-vpn-t1-audit-sink-unavailable")
         );
+    }
+
+    fn t1_audit_sink_test_tempdir() -> tempfile::TempDir {
+        let root = Path::new("target").join("t1-audit-sink-tests");
+        std::fs::create_dir_all(&root).unwrap();
+        tempfile::Builder::new()
+            .prefix("audit-")
+            .tempdir_in(root)
+            .unwrap()
     }
 
     #[tokio::test]
