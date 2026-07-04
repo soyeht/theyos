@@ -14,6 +14,7 @@ use std::fs::OpenOptions;
 use std::io;
 use std::io::Write;
 use std::marker::PhantomData;
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::os::unix::net::UnixStream as StdUnixStream;
 use std::path::PathBuf;
 use std::pin::Pin;
@@ -104,7 +105,10 @@ fn claw_vpn_t1_spooled_jsonl_audit_sink_with_capacity(
     let mut file = OpenOptions::new()
         .create(true)
         .append(true)
+        .mode(0o600)
         .open(path)
+        .map_err(ClawVpnT1AuditSinkError::OpenFile)?;
+    file.set_permissions(std::fs::Permissions::from_mode(0o600))
         .map_err(ClawVpnT1AuditSinkError::OpenFile)?;
     let (sender, receiver) = sync_channel(capacity);
     let healthy = Arc::new(AtomicBool::new(true));
@@ -746,6 +750,21 @@ mod tests {
         };
 
         assert!(matches!(error, ClawVpnT1AuditSinkError::OpenFile(_)));
+    }
+
+    #[test]
+    fn t1_spooled_audit_sink_forces_owner_only_log_file_permissions() {
+        let dir = tempfile::tempdir().unwrap();
+        let audit_path = dir.path().join("audit.jsonl");
+        std::fs::write(&audit_path, "").unwrap();
+        std::fs::set_permissions(&audit_path, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        let _sink = claw_vpn_t1_spooled_jsonl_audit_sink(&audit_path).unwrap();
+
+        assert_eq!(
+            std::fs::metadata(&audit_path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
     }
 
     #[tokio::test]
