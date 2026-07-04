@@ -225,10 +225,12 @@ The wiring PR that follows this runbook must show, before merge:
   session, the rollback `SessionClose` event must also be routed through the
   sink on a best-effort basis. The T1 router module may provide reviewed audit
   sink helpers that force owner-only log-file permissions and reject symlink
-  log-file paths, but the current default-off mount may keep a placeholder sink
-  only while missing preflight makes it unreachable, and a live activation slice
-  must replace it with reviewed persistence, durability, safe path selection,
-  and retention policy for the exact artifact SHA;
+  log-file paths, and that create or require a real, current-user-owned, mode
+  `0700` final parent directory. The current default-off mount may keep a
+  placeholder sink only while missing preflight makes it unreachable, and a
+  live activation slice must replace it with reviewed persistence, durability,
+  retention policy, and safe path selection for the exact artifact SHA,
+  including a fixed owner-controlled location and intermediate path components;
 - no raw `TunnelFrame`, packet bytes, interface name, file descriptor, local
   path, or peer address is logged through Debug or error formatting;
 - tests prove route cleanup runs after pump stop/error and that failure returns

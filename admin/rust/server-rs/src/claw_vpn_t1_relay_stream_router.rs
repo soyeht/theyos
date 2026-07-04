@@ -14,7 +14,7 @@ use std::fs::OpenOptions;
 use std::io;
 use std::io::Write;
 use std::marker::PhantomData;
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::net::UnixStream as StdUnixStream;
 use std::path::PathBuf;
 use std::pin::Pin;
@@ -100,7 +100,7 @@ fn claw_vpn_t1_spooled_jsonl_audit_sink_with_capacity(
 ) -> Result<ClawVpnT1RelayStreamAuditSink, ClawVpnT1AuditSinkError> {
     let path = path.into();
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(ClawVpnT1AuditSinkError::CreateDir)?;
+        ensure_claw_vpn_t1_audit_parent(parent).map_err(ClawVpnT1AuditSinkError::CreateDir)?;
     }
     let mut file = OpenOptions::new()
         .create(true)
@@ -135,6 +135,50 @@ fn claw_vpn_t1_spooled_jsonl_audit_sink_with_capacity(
     Ok(Box::new(move |event| {
         claw_vpn_t1_try_enqueue_audit_event(&sender, &healthy, event)
     }))
+}
+
+fn ensure_claw_vpn_t1_audit_parent(parent: &std::path::Path) -> io::Result<()> {
+    match std::fs::symlink_metadata(parent) {
+        Ok(_) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            std::fs::DirBuilder::new()
+                .recursive(true)
+                .mode(0o700)
+                .create(parent)?;
+        }
+        Err(error) => return Err(error),
+    }
+    validate_claw_vpn_t1_audit_parent(parent)
+}
+
+fn validate_claw_vpn_t1_audit_parent(parent: &std::path::Path) -> io::Result<()> {
+    let parent_meta = std::fs::symlink_metadata(parent)?;
+    if parent_meta.file_type().is_symlink() || !parent_meta.is_dir() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "claw vpn t1 audit parent must be a real directory",
+        ));
+    }
+    if parent_meta.uid() != claw_vpn_t1_current_euid() {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "claw vpn t1 audit parent must be owned by current user",
+        ));
+    }
+    let mode = parent_meta.permissions().mode() & 0o777;
+    if mode != 0o700 {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "claw vpn t1 audit parent must be mode 0700",
+        ));
+    }
+    Ok(())
+}
+
+#[allow(unsafe_code)]
+fn claw_vpn_t1_current_euid() -> u32 {
+    // SAFETY: geteuid has no preconditions and only returns the effective uid.
+    unsafe { libc::geteuid() as u32 }
 }
 
 fn claw_vpn_t1_try_enqueue_audit_event(
@@ -745,7 +789,13 @@ mod tests {
     #[test]
     fn t1_spooled_audit_sink_rejects_directory_as_log_file() {
         let dir = tempfile::tempdir().unwrap();
-        let error = match claw_vpn_t1_spooled_jsonl_audit_sink(dir.path()) {
+        let audit_dir = dir.path().join("audit");
+        std::fs::create_dir(&audit_dir).unwrap();
+        std::fs::set_permissions(&audit_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let audit_path = audit_dir.join("audit.jsonl");
+        std::fs::create_dir(&audit_path).unwrap();
+
+        let error = match claw_vpn_t1_spooled_jsonl_audit_sink(&audit_path) {
             Ok(_) => panic!("directory path must not create an audit sink"),
             Err(error) => error,
         };
@@ -756,7 +806,10 @@ mod tests {
     #[test]
     fn t1_spooled_audit_sink_forces_owner_only_log_file_permissions() {
         let dir = tempfile::tempdir().unwrap();
-        let audit_path = dir.path().join("audit.jsonl");
+        let audit_dir = dir.path().join("audit");
+        std::fs::create_dir(&audit_dir).unwrap();
+        std::fs::set_permissions(&audit_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let audit_path = audit_dir.join("audit.jsonl");
         std::fs::write(&audit_path, "").unwrap();
         std::fs::set_permissions(&audit_path, std::fs::Permissions::from_mode(0o644)).unwrap();
 
@@ -769,10 +822,63 @@ mod tests {
     }
 
     #[test]
+    fn t1_spooled_audit_sink_creates_owner_only_parent_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let audit_dir = dir.path().join("audit");
+        let audit_path = audit_dir.join("audit.jsonl");
+
+        let _sink = claw_vpn_t1_spooled_jsonl_audit_sink(&audit_path).unwrap();
+
+        assert_eq!(
+            std::fs::metadata(&audit_dir).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        assert_eq!(
+            std::fs::metadata(&audit_path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+    }
+
+    #[test]
+    fn t1_spooled_audit_sink_rejects_symlink_parent_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let target_dir = dir.path().join("target");
+        std::fs::create_dir(&target_dir).unwrap();
+        std::fs::set_permissions(&target_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let audit_dir = dir.path().join("audit-link");
+        std::os::unix::fs::symlink(&target_dir, &audit_dir).unwrap();
+
+        let error = match claw_vpn_t1_spooled_jsonl_audit_sink(audit_dir.join("audit.jsonl")) {
+            Ok(_) => panic!("symlink parent must not create an audit sink"),
+            Err(error) => error,
+        };
+
+        assert!(matches!(error, ClawVpnT1AuditSinkError::CreateDir(_)));
+    }
+
+    #[test]
+    fn t1_spooled_audit_sink_rejects_shared_parent_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let audit_dir = dir.path().join("audit");
+        std::fs::create_dir(&audit_dir).unwrap();
+        std::fs::set_permissions(&audit_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let error = match claw_vpn_t1_spooled_jsonl_audit_sink(audit_dir.join("audit.jsonl")) {
+            Ok(_) => panic!("shared parent must not create an audit sink"),
+            Err(error) => error,
+        };
+
+        assert!(matches!(error, ClawVpnT1AuditSinkError::CreateDir(_)));
+    }
+
+    #[test]
     fn t1_spooled_audit_sink_rejects_symlink_log_file() {
         let dir = tempfile::tempdir().unwrap();
-        let target_path = dir.path().join("target.jsonl");
-        let audit_path = dir.path().join("audit.jsonl");
+        let audit_dir = dir.path().join("audit");
+        std::fs::create_dir(&audit_dir).unwrap();
+        std::fs::set_permissions(&audit_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let target_path = audit_dir.join("target.jsonl");
+        let audit_path = audit_dir.join("audit.jsonl");
         std::fs::write(&target_path, "").unwrap();
         std::fs::set_permissions(&target_path, std::fs::Permissions::from_mode(0o644)).unwrap();
         std::os::unix::fs::symlink(&target_path, &audit_path).unwrap();
