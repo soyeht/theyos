@@ -20,7 +20,8 @@ use std::time::Duration;
 
 use household_rs::claw_share_data_tunnel::{DataTunnelError, TargetSession};
 use household_rs::claw_vpn::{
-    ClawVpnAcl, ClawVpnAclKey, ClawVpnAgentCore, ClawVpnDatapathSide, ClawVpnSessionRegistry,
+    ClawVpnAcl, ClawVpnAclKey, ClawVpnAgentCore, ClawVpnAuditEvent, ClawVpnDatapathSide,
+    ClawVpnSessionRegistry,
 };
 
 use crate::claw_share_relay_stream_target_router::{
@@ -59,6 +60,8 @@ pub type ClawVpnT1RelayStreamLaunchRuntime<I> = Box<
         + Send
         + Sync,
 >;
+pub type ClawVpnT1RelayStreamAuditSink =
+    Box<dyn Fn(ClawVpnAuditEvent) -> Result<(), &'static str> + Send + Sync>;
 pub type ClawVpnT1RelayStreamBoxedRouter<I> = ClawVpnT1RelayStreamIpTunnelRouter<
     I,
     ClawVpnT1RelayStreamBuildInputs<I>,
@@ -70,6 +73,7 @@ pub struct ClawVpnT1RelayStreamRouterParts<I, BuildInputs, LaunchRuntime> {
     io_timeout: Duration,
     build_inputs: BuildInputs,
     launch_runtime: LaunchRuntime,
+    audit_sink: ClawVpnT1RelayStreamAuditSink,
     _interface: PhantomData<fn() -> I>,
 }
 
@@ -82,6 +86,7 @@ impl<I, BuildInputs, LaunchRuntime> fmt::Debug
             .field("io_timeout", &self.io_timeout)
             .field("build_inputs", &"<redacted>")
             .field("launch_runtime", &"<redacted>")
+            .field("audit_sink", &"<redacted>")
             .finish()
     }
 }
@@ -93,12 +98,14 @@ impl<I, BuildInputs, LaunchRuntime> ClawVpnT1RelayStreamRouterParts<I, BuildInpu
         io_timeout: Duration,
         build_inputs: BuildInputs,
         launch_runtime: LaunchRuntime,
+        audit_sink: ClawVpnT1RelayStreamAuditSink,
     ) -> Self {
         Self {
             runtime_config,
             io_timeout,
             build_inputs,
             launch_runtime,
+            audit_sink,
             _interface: PhantomData,
         }
     }
@@ -110,6 +117,7 @@ pub struct ClawVpnT1RelayStreamIpTunnelRouter<I, BuildInputs, LaunchRuntime> {
     io_timeout: Duration,
     build_inputs: BuildInputs,
     launch_runtime: LaunchRuntime,
+    audit_sink: ClawVpnT1RelayStreamAuditSink,
     admission: Arc<Mutex<ClawVpnT1RelayStreamAdmission>>,
     _interface: PhantomData<fn() -> I>,
 }
@@ -124,6 +132,7 @@ impl<I, BuildInputs, LaunchRuntime> fmt::Debug
             .field("io_timeout", &self.io_timeout)
             .field("build_inputs", &"<redacted>")
             .field("launch_runtime", &"<redacted>")
+            .field("audit_sink", &"<redacted>")
             .field("admission", &"<redacted>")
             .finish()
     }
@@ -139,6 +148,7 @@ impl<I, BuildInputs, LaunchRuntime>
         io_timeout: Duration,
         build_inputs: BuildInputs,
         launch_runtime: LaunchRuntime,
+        audit_sink: ClawVpnT1RelayStreamAuditSink,
     ) -> Self {
         Self::with_admission(
             config,
@@ -146,6 +156,7 @@ impl<I, BuildInputs, LaunchRuntime>
             io_timeout,
             build_inputs,
             launch_runtime,
+            audit_sink,
             Arc::new(Mutex::new(ClawVpnT1RelayStreamAdmission::default())),
         )
     }
@@ -157,6 +168,7 @@ impl<I, BuildInputs, LaunchRuntime>
         io_timeout: Duration,
         build_inputs: BuildInputs,
         launch_runtime: LaunchRuntime,
+        audit_sink: ClawVpnT1RelayStreamAuditSink,
         admission: Arc<Mutex<ClawVpnT1RelayStreamAdmission>>,
     ) -> Self {
         Self {
@@ -165,6 +177,7 @@ impl<I, BuildInputs, LaunchRuntime>
             io_timeout,
             build_inputs,
             launch_runtime,
+            audit_sink,
             admission,
             _interface: PhantomData,
         }
@@ -363,9 +376,13 @@ where
         )
         .map_err(|_| target_unavailable("claw-vpn-t1-session-registry-invalid"))?;
         let mut core = ClawVpnAgentCore::new(ClawVpnDatapathSide::Claw, registry);
-        let (session, _open_event) = core.open_with_audit(&key);
+        let (session, open_event) = core.open_with_audit(&key);
         let session = session.map_err(|_| target_unavailable("claw-vpn-t1-session-open-failed"))?;
         let session_id = session.id();
+        if let Err(reason) = (self.audit_sink)(open_event) {
+            let _closed = core.close_with_audit(session_id);
+            return Err(target_unavailable(reason));
+        }
         let session_core = core
             .into_session_core(session_id)
             .map_err(|_| target_unavailable("claw-vpn-t1-session-core-missing"))?;
@@ -417,6 +434,7 @@ where
             parts.io_timeout,
             parts.build_inputs,
             parts.launch_runtime,
+            parts.audit_sink,
         )
     })
 }
@@ -451,6 +469,7 @@ mod tests {
         ClawVpnInterfaceName, ClawVpnInterfaceRoutePlatform, ClawVpnInterfaceRouteToolPaths,
     };
 
+    use household_rs::claw_vpn::{ClawVpnAuditAction, ClawVpnAuditReason, ClawVpnAuditSubject};
     use household_rs::keys::{IdentityKey, P256Keypair};
 
     struct FakeInterface {
@@ -542,11 +561,25 @@ mod tests {
         }
     }
 
+    fn noop_audit_sink() -> ClawVpnT1RelayStreamAuditSink {
+        Box::new(|_event| Ok(()))
+    }
+
+    fn recording_audit_sink(
+        events: Arc<Mutex<Vec<ClawVpnAuditEvent>>>,
+    ) -> ClawVpnT1RelayStreamAuditSink {
+        Box::new(move |event| {
+            events.lock().unwrap().push(event);
+            Ok(())
+        })
+    }
+
     #[tokio::test]
     async fn t1_relay_stream_router_builds_wiring_from_group_target_context() {
         let build_count = Arc::new(AtomicUsize::new(0));
         let launch_count = Arc::new(AtomicUsize::new(0));
         let seen_target = Arc::new(Mutex::new(None));
+        let audit_events = Arc::new(Mutex::new(Vec::new()));
         let member_device_pub = P256Keypair::generate().public();
         let router = ClawVpnT1RelayStreamIpTunnelRouter::<FakeInterface, _, _>::new(
             live_config(),
@@ -578,6 +611,7 @@ mod tests {
                     Ok(())
                 }
             },
+            recording_audit_sink(Arc::clone(&audit_events)),
         );
 
         let _session = router
@@ -596,10 +630,27 @@ mod tests {
             Some(&(
                 "group-alpha".to_string(),
                 "member-alpha".to_string(),
-                member_device_pub,
+                member_device_pub.clone(),
                 "claw-alpha".to_string()
             ))
         );
+        let audit_events = audit_events.lock().unwrap();
+        assert_eq!(audit_events.len(), 1);
+        let audit_event = &audit_events[0];
+        assert_eq!(audit_event.action(), ClawVpnAuditAction::SessionOpen);
+        assert_eq!(audit_event.reason(), ClawVpnAuditReason::SessionOpened);
+        assert_eq!(
+            audit_event.subject(),
+            Some(ClawVpnAuditSubject::from_acl_key(
+                &ClawVpnAclKey::try_new(
+                    "member-alpha".to_string(),
+                    member_device_pub.clone(),
+                    "claw-alpha".to_string()
+                )
+                .unwrap()
+            ))
+        );
+        assert!(audit_event.session_id().is_some());
     }
 
     #[tokio::test]
@@ -629,6 +680,7 @@ mod tests {
                     Ok(())
                 }
             },
+            noop_audit_sink(),
         );
         let member_device_pub = P256Keypair::generate().public();
 
@@ -698,6 +750,7 @@ mod tests {
                     Ok(())
                 }
             },
+            noop_audit_sink(),
         );
 
         let _first_session = router
@@ -748,6 +801,7 @@ mod tests {
                         Ok(())
                     }
                 },
+                noop_audit_sink(),
                 admission,
             )
         };
@@ -821,6 +875,7 @@ mod tests {
                     Ok(())
                 }
             },
+            noop_audit_sink(),
         );
 
         let error = match router
@@ -834,6 +889,68 @@ mod tests {
         assert!(
             matches!(error, DataTunnelError::TargetUnavailable(reason) if reason == "claw-vpn-t1-acl-key-invalid")
         );
+        assert_eq!(build_count.load(Ordering::SeqCst), 0);
+        assert_eq!(launch_count.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn t1_relay_stream_router_rejects_audit_failure_before_inputs() {
+        let build_count = Arc::new(AtomicUsize::new(0));
+        let launch_count = Arc::new(AtomicUsize::new(0));
+        let audit_count = Arc::new(AtomicUsize::new(0));
+        let member_device_pub = P256Keypair::generate().public();
+        let router = ClawVpnT1RelayStreamIpTunnelRouter::<FakeInterface, _, _>::new(
+            live_config(),
+            enabled_runtime_config(),
+            Duration::from_secs(1),
+            {
+                let build_count = Arc::clone(&build_count);
+                move |
+                    _config: &ClawVpnDevConfig,
+                    _target: &RelayStreamIpTunnelTarget,
+                    _context: ClawVpnRuntimeWiringContext,
+                    relay: ClawVpnRelayStream<StdUnixStream>,
+                | -> io::Result<ClawVpnT1RelayStreamWiringInputs<FakeInterface>> {
+                    build_count.fetch_add(1, Ordering::SeqCst);
+                    Ok(inputs(FakeInterface::empty(), relay))
+                }
+            },
+            {
+                let launch_count = Arc::clone(&launch_count);
+                move |_wiring: ClawVpnTargetSessionRouterWiring<FakeInterface>| {
+                    launch_count.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                }
+            },
+            {
+                let audit_count = Arc::clone(&audit_count);
+                Box::new(move |event: ClawVpnAuditEvent| {
+                    assert_eq!(event.reason(), ClawVpnAuditReason::SessionOpened);
+                    audit_count.fetch_add(1, Ordering::SeqCst);
+                    Err("claw-vpn-t1-audit-open-failed")
+                })
+            },
+        );
+
+        for _ in 0..2 {
+            let error = match router
+                .open_ip_tunnel(target_with_device(
+                    "member-alpha",
+                    member_device_pub.clone(),
+                    "claw-alpha",
+                ))
+                .await
+            {
+                Ok(_) => panic!("audit sink failure must fail before returning a target session"),
+                Err(error) => error,
+            };
+
+            assert!(
+                matches!(error, DataTunnelError::TargetUnavailable(reason) if reason == "claw-vpn-t1-audit-open-failed")
+            );
+        }
+
+        assert_eq!(audit_count.load(Ordering::SeqCst), 2);
         assert_eq!(build_count.load(Ordering::SeqCst), 0);
         assert_eq!(launch_count.load(Ordering::SeqCst), 0);
     }
@@ -863,6 +980,7 @@ mod tests {
                                 (),
                             )
                         },
+                        noop_audit_sink(),
                     )
                 }
             },

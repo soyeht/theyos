@@ -75,9 +75,9 @@ use crate::claw_vpn_macos_utun::ClawVpnMacosUtunDevice;
 use crate::claw_vpn_packet_pump::ClawVpnPacketInterface;
 use crate::claw_vpn_t1_caller::ClawVpnT1CallerStatus;
 use crate::claw_vpn_t1_relay_stream_router::{
-    ClawVpnT1RelayStreamBoxedRouter, ClawVpnT1RelayStreamBuildInputs,
-    ClawVpnT1RelayStreamLaunchRuntime, ClawVpnT1RelayStreamRouterParts,
-    assemble_claw_vpn_t1_relay_stream_router,
+    ClawVpnT1RelayStreamAuditSink, ClawVpnT1RelayStreamBoxedRouter,
+    ClawVpnT1RelayStreamBuildInputs, ClawVpnT1RelayStreamLaunchRuntime,
+    ClawVpnT1RelayStreamRouterParts, assemble_claw_vpn_t1_relay_stream_router,
 };
 use crate::claw_vpn_target_session_router::{
     ClawVpnTargetSessionRouterLaunchError, ClawVpnTargetSessionRouterWiring,
@@ -157,9 +157,9 @@ pub struct RelayStreamClawSiteRouter {
 enum RelayStreamMountedIpTunnelRouter {
     Unavailable(RelayStreamIpTunnelUnavailableRouter),
     #[cfg(target_os = "linux")]
-    T1Linux(ClawVpnT1RelayStreamBoxedRouter<ClawVpnLinuxTunDevice>),
+    T1Linux(Box<ClawVpnT1RelayStreamBoxedRouter<ClawVpnLinuxTunDevice>>),
     #[cfg(target_os = "macos")]
-    T1Macos(ClawVpnT1RelayStreamBoxedRouter<ClawVpnMacosUtunDevice>),
+    T1Macos(Box<ClawVpnT1RelayStreamBoxedRouter<ClawVpnMacosUtunDevice>>),
 }
 
 impl RelayStreamIpTunnelRouter for RelayStreamMountedIpTunnelRouter {
@@ -363,7 +363,7 @@ fn build_mounted_ip_tunnel_router_from_t1_gate() -> RelayStreamMountedIpTunnelRo
         let status = assemble_linux_t1_ip_tunnel_router();
         if status.is_ready() {
             if let Some((_mode, router)) = status.into_ready() {
-                return RelayStreamMountedIpTunnelRouter::T1Linux(router);
+                return RelayStreamMountedIpTunnelRouter::T1Linux(Box::new(router));
             }
         } else {
             tracing::warn!(
@@ -378,7 +378,7 @@ fn build_mounted_ip_tunnel_router_from_t1_gate() -> RelayStreamMountedIpTunnelRo
         let status = assemble_macos_t1_ip_tunnel_router();
         if status.is_ready() {
             if let Some((_mode, router)) = status.into_ready() {
-                return RelayStreamMountedIpTunnelRouter::T1Macos(router);
+                return RelayStreamMountedIpTunnelRouter::T1Macos(Box::new(router));
             }
         } else {
             tracing::warn!(
@@ -403,6 +403,7 @@ fn assemble_linux_t1_ip_tunnel_router()
                 CLAW_VPN_T1_TARGET_SESSION_IO_TIMEOUT,
                 linux_t1_build_inputs(),
                 t1_runtime_launcher(),
+                t1_open_audit_sink(),
             )
         },
     )
@@ -420,9 +421,14 @@ fn assemble_macos_t1_ip_tunnel_router()
                 CLAW_VPN_T1_TARGET_SESSION_IO_TIMEOUT,
                 macos_t1_build_inputs(),
                 t1_runtime_launcher(),
+                t1_open_audit_sink(),
             )
         },
     )
+}
+
+fn t1_open_audit_sink() -> ClawVpnT1RelayStreamAuditSink {
+    Box::new(|_event| Ok(()))
 }
 
 fn enabled_claw_vpn_t1_wiring_config() -> ClawVpnRuntimeWiringConfig {

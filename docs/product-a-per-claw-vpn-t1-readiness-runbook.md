@@ -218,6 +218,13 @@ The wiring PR that follows this runbook must show, before merge:
   route install, runtime input build, launcher spawn, `run_until_stopped`, or
   packet pump execution may occur until a later evidence loader and live-run
   record are reviewed for the exact artifact SHA;
+- the T1 `IpTunnel` backend must not drop the typed session-open audit event:
+  it must hand the `open_with_audit` event to a reviewed audit sink, and sink
+  failure must fail closed before runtime inputs are built, the launcher runs,
+  or a target session is returned; the current default-off mount may keep a
+  placeholder sink only while missing preflight makes it unreachable, and a
+  live activation slice must replace it with reviewed persistence and retention
+  policy for the exact artifact SHA;
 - no raw `TunnelFrame`, packet bytes, interface name, file descriptor, local
   path, or peer address is logged through Debug or error formatting;
 - tests prove route cleanup runs after pump stop/error and that failure returns

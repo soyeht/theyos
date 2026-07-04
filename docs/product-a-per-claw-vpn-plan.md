@@ -139,7 +139,13 @@ The current relay-stream T1 backend follow-up adds a member-scoped `IpTunnel`
 router that implements the nominal `RelayStreamIpTunnelRouter` target-aware
 backend, derives the VPN ACL key from the authenticated Group `(member, device,
 claw)` target, and assembles the target-session runtime from caller-supplied,
-post-gate build inputs. The mount now injects that backend through the same T1
+post-gate build inputs. It also carries the typed `SessionOpen` audit event
+from `open_with_audit` into a caller-supplied audit sink instead of dropping it;
+sink failure fails closed before runtime inputs are built, the launcher runs, or
+a target session is returned. The current default-off mount supplies only a
+placeholder sink behind missing preflight, so a future activation slice must
+replace that placeholder with reviewed persistence and retention policy for the
+exact artifact SHA. The mount now injects that backend through the same T1
 caller gate, but the production path still supplies
 `PerClawVpnT1PreflightEvidence::missing`, so even with the T1 dev env present it
 falls back to `RelayStreamIpTunnelUnavailableRouter` before opening TUN/utun,
@@ -497,7 +503,11 @@ Access between members/devices and claws is explicitly many-to-many:
   The relay-stream T1 backend follow-up then connects those pieces to the
   `claw_share_relay_stream_mount` seam: the backend derives its ACL key from
   the authenticated Group target and the mount asks the T1 caller gate for a
-  backend. The environment-backed mount still supplies missing preflight
+  backend. The backend also delivers the typed `SessionOpen` audit event to a
+  caller-supplied sink and fails closed if that sink rejects before runtime
+  inputs or launcher execution; the current mount sink is only a reviewed
+  placeholder behind missing preflight, not live audit persistence. The
+  environment-backed mount still supplies missing preflight
   evidence, so `Disabled`/invalid/missing-preflight/`Dial` paths all fall back
   to the unavailable `IpTunnel` router before building runtime inputs, opening
   TUN/utun, installing routes, spawning the launcher, or running the packet
