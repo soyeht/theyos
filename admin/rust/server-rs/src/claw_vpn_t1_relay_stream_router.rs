@@ -105,6 +105,7 @@ fn claw_vpn_t1_spooled_jsonl_audit_sink_with_capacity(
     let mut file = OpenOptions::new()
         .create(true)
         .append(true)
+        .custom_flags(libc::O_NOFOLLOW)
         .mode(0o600)
         .open(path)
         .map_err(ClawVpnT1AuditSinkError::OpenFile)?;
@@ -764,6 +765,31 @@ mod tests {
         assert_eq!(
             std::fs::metadata(&audit_path).unwrap().permissions().mode() & 0o777,
             0o600
+        );
+    }
+
+    #[test]
+    fn t1_spooled_audit_sink_rejects_symlink_log_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let target_path = dir.path().join("target.jsonl");
+        let audit_path = dir.path().join("audit.jsonl");
+        std::fs::write(&target_path, "").unwrap();
+        std::fs::set_permissions(&target_path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        std::os::unix::fs::symlink(&target_path, &audit_path).unwrap();
+
+        let error = match claw_vpn_t1_spooled_jsonl_audit_sink(&audit_path) {
+            Ok(_) => panic!("symlink path must not create an audit sink"),
+            Err(error) => error,
+        };
+
+        assert!(matches!(error, ClawVpnT1AuditSinkError::OpenFile(_)));
+        assert_eq!(
+            std::fs::metadata(&target_path)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o644
         );
     }
 

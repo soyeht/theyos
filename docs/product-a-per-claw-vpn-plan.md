@@ -146,8 +146,9 @@ a target session is returned, and the rollback `SessionClose` event is routed
 through the same sink on that reject path. The T1 router module now includes a
 reviewed spooled JSONL audit sink helper that writes only typed, redacted audit
 fields, forces owner-only log-file permissions, and rejects when its bounded
-queue or worker is unavailable; it remains a helper for the future activation
-slice, not the mounted sink. The source guard
+queue or worker is unavailable. The helper also rejects symlink log-file paths;
+it remains a helper for the future activation slice, not the mounted sink. The
+source guard
 tripwires that helper, its error type, and its queue capacity outside the T1
 router module so future wiring into the mount reopens review. The current
 default-off mount supplies only a placeholder sink behind missing preflight, so
@@ -518,8 +519,9 @@ Access between members/devices and claws is explicitly many-to-many:
   rollback `SessionClose` event to the same sink on a best-effort basis. The
   current mount sink is only a reviewed placeholder behind missing preflight,
   not live audit persistence. A reviewed spooled JSONL helper exists in the T1
-  router module for the activation slice; it writes redacted JSONL and forces
-  owner-only log-file permissions. The source guard tripwires that helper
+  router module for the activation slice; it writes redacted JSONL, forces
+  owner-only log-file permissions, and rejects symlink log-file paths. The
+  source guard tripwires that helper
   outside the T1 router module, but it is not wired into the mount until that
   exact SHA-bound live-run review. The
   environment-backed mount still supplies missing preflight
