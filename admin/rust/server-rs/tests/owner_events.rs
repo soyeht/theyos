@@ -3816,14 +3816,18 @@ fn product_a_per_claw_vpn_dev_config_remains_default_off_and_unwired() {
     let packet_pump_path = server_src_dir.join("claw_vpn_packet_pump.rs");
     let relay_stream_path = server_src_dir.join("claw_vpn_relay_stream.rs");
     let t1_caller_path = server_src_dir.join("claw_vpn_t1_caller.rs");
+    let t1_relay_stream_router_path = server_src_dir.join("claw_vpn_t1_relay_stream_router.rs");
     let target_session_relay_path = server_src_dir.join("claw_vpn_target_session_relay.rs");
     let target_session_router_path = server_src_dir.join("claw_vpn_target_session_router.rs");
     let target_session_runtime_path = server_src_dir.join("claw_vpn_target_session_runtime.rs");
+    let relay_stream_responder_reverse_connect_path =
+        server_src_dir.join("claw_share_relay_stream_responder_reverse_connect.rs");
     let relay_stream_reverse_connect_binding_path =
         server_src_dir.join("claw_share_relay_stream_reverse_connect_binding.rs");
     let relay_stream_reverse_connect_pool_path =
         server_src_dir.join("claw_share_relay_stream_reverse_connect_pool.rs");
     let relay_stream_runtime_path = server_src_dir.join("claw_share_relay_stream_runtime.rs");
+    let relay_stream_mount_path = server_src_dir.join("claw_share_relay_stream_mount.rs");
     let relay_stream_target_router_path =
         server_src_dir.join("claw_share_relay_stream_target_router.rs");
     let runtime_path = server_src_dir.join("claw_vpn_runtime.rs");
@@ -3867,6 +3871,12 @@ fn product_a_per_claw_vpn_dev_config_remains_default_off_and_unwired() {
     assert!(
         sources
             .iter()
+            .any(|path| path == &t1_relay_stream_router_path),
+        "per-Claw VPN source guard must include server-rs/src/claw_vpn_t1_relay_stream_router.rs"
+    );
+    assert!(
+        sources
+            .iter()
             .any(|path| path == &target_session_relay_path),
         "per-Claw VPN source guard must include server-rs/src/claw_vpn_target_session_relay.rs"
     );
@@ -3885,6 +3895,12 @@ fn product_a_per_claw_vpn_dev_config_remains_default_off_and_unwired() {
     assert!(
         sources
             .iter()
+            .any(|path| path == &relay_stream_responder_reverse_connect_path),
+        "per-Claw VPN source guard must include server-rs/src/claw_share_relay_stream_responder_reverse_connect.rs"
+    );
+    assert!(
+        sources
+            .iter()
             .any(|path| path == &relay_stream_reverse_connect_binding_path),
         "per-Claw VPN source guard must include server-rs/src/claw_share_relay_stream_reverse_connect_binding.rs"
     );
@@ -3899,6 +3915,10 @@ fn product_a_per_claw_vpn_dev_config_remains_default_off_and_unwired() {
             .iter()
             .any(|path| path == &relay_stream_runtime_path),
         "per-Claw VPN source guard must include server-rs/src/claw_share_relay_stream_runtime.rs"
+    );
+    assert!(
+        sources.iter().any(|path| path == &relay_stream_mount_path),
+        "per-Claw VPN source guard must include server-rs/src/claw_share_relay_stream_mount.rs"
     );
     assert!(
         sources
@@ -3987,6 +4007,8 @@ fn product_a_per_claw_vpn_dev_config_remains_default_off_and_unwired() {
     let mut relay_stream_export_is_unconditional = false;
     let mut t1_caller_exports = 0usize;
     let mut t1_caller_export_is_unconditional = false;
+    let mut t1_relay_stream_router_exports = 0usize;
+    let mut t1_relay_stream_router_export_is_unconditional = false;
     let mut target_session_relay_exports = 0usize;
     let mut target_session_relay_export_is_unconditional = false;
     let mut target_session_router_exports = 0usize;
@@ -4020,6 +4042,11 @@ fn product_a_per_claw_vpn_dev_config_remains_default_off_and_unwired() {
         if line.trim() == "pub mod claw_vpn_t1_caller;" {
             t1_caller_exports += 1;
             t1_caller_export_is_unconditional =
+                index == 0 || !lib_lines[index - 1].trim().starts_with("#[cfg");
+        }
+        if line.trim() == "pub mod claw_vpn_t1_relay_stream_router;" {
+            t1_relay_stream_router_exports += 1;
+            t1_relay_stream_router_export_is_unconditional =
                 index == 0 || !lib_lines[index - 1].trim().starts_with("#[cfg");
         }
         if line.trim() == "pub mod claw_vpn_target_session_relay;" {
@@ -4073,6 +4100,10 @@ fn product_a_per_claw_vpn_dev_config_remains_default_off_and_unwired() {
     assert!(
         t1_caller_exports == 1 && t1_caller_export_is_unconditional,
         "per-Claw VPN T1 caller gate module must have exactly one unconditional export"
+    );
+    assert!(
+        t1_relay_stream_router_exports == 1 && t1_relay_stream_router_export_is_unconditional,
+        "per-Claw VPN T1 relay-stream router module must have exactly one unconditional export"
     );
     assert!(
         target_session_relay_exports == 1 && target_session_relay_export_is_unconditional,
@@ -4286,6 +4317,31 @@ fn product_a_per_claw_vpn_dev_config_remains_default_off_and_unwired() {
     assert_rust_guard_lexer_rejects("fixture", &[r#"let _ = { let _ = b'"'; }; let _ = b'"';"#]);
     assert_rust_guard_lexer_rejects("fixture", &["let _ = \"unterminated;"]);
 
+    let relay_stream_mount_source =
+        fs::read_to_string(&relay_stream_mount_path).unwrap_or_else(|e| {
+            panic!(
+                "read per-Claw VPN relay-stream mount source {}: {e}",
+                relay_stream_mount_path.display()
+            )
+        });
+    assert_eq!(
+        relay_stream_mount_source
+            .matches("PerClawVpnT1PreflightEvidence::missing")
+            .count(),
+        2,
+        "per-Claw VPN relay-stream mount must keep both platform T1 gates hardcoded to missing preflight"
+    );
+    for forbidden_preflight_token in [
+        "PerClawVpnT1PreflightEvidence::new",
+        "PreflightEvidencePresent",
+        "per_claw_vpn_startup_gate_with_preflight",
+    ] {
+        assert!(
+            !relay_stream_mount_source.contains(forbidden_preflight_token),
+            "per-Claw VPN relay-stream mount must not load or synthesize present T1 preflight evidence: {forbidden_preflight_token}"
+        );
+    }
+
     let mut violations = Vec::new();
     for path in sources {
         let source = fs::read_to_string(&path)
@@ -4322,6 +4378,11 @@ fn product_a_per_claw_vpn_dev_config_remains_default_off_and_unwired() {
         } else {
             None
         };
+        let t1_relay_stream_router_test_span = if path == t1_relay_stream_router_path {
+            Some(rust_test_module_span("T1 relay-stream router", &lines))
+        } else {
+            None
+        };
         for (index, line) in lines.iter().enumerate() {
             let module_export = path == lib_path && line.trim() == "pub mod claw_vpn_dev_config;";
             let interface_route_plan_module_export =
@@ -4336,6 +4397,8 @@ fn product_a_per_claw_vpn_dev_config_remains_default_off_and_unwired() {
                 path == lib_path && line.trim() == "pub mod claw_vpn_target_session_router;";
             let t1_caller_module_export =
                 path == lib_path && line.trim() == "pub mod claw_vpn_t1_caller;";
+            let t1_relay_stream_router_module_export =
+                path == lib_path && line.trim() == "pub mod claw_vpn_t1_relay_stream_router;";
             let target_session_runtime_module_export =
                 path == lib_path && line.trim() == "pub mod claw_vpn_target_session_runtime;";
             let runtime_module_export =
@@ -4351,14 +4414,18 @@ fn product_a_per_claw_vpn_dev_config_remains_default_off_and_unwired() {
             let in_packet_pump_module = path == packet_pump_path;
             let in_relay_stream_module = path == relay_stream_path;
             let in_t1_caller_module = path == t1_caller_path;
+            let in_t1_relay_stream_router_module = path == t1_relay_stream_router_path;
             let in_target_session_relay_module = path == target_session_relay_path;
             let in_target_session_router_module = path == target_session_router_path;
             let in_target_session_runtime_module = path == target_session_runtime_path;
+            let in_relay_stream_responder_reverse_connect_module =
+                path == relay_stream_responder_reverse_connect_path;
             let in_relay_stream_reverse_connect_binding_module =
                 path == relay_stream_reverse_connect_binding_path;
             let in_relay_stream_reverse_connect_pool_module =
                 path == relay_stream_reverse_connect_pool_path;
             let in_relay_stream_runtime_module = path == relay_stream_runtime_path;
+            let in_relay_stream_mount_module = path == relay_stream_mount_path;
             let in_relay_stream_target_router_module = path == relay_stream_target_router_path;
             let in_runtime_module = path == runtime_path;
             let in_wiring_module = path == wiring_path;
@@ -4375,6 +4442,8 @@ fn product_a_per_claw_vpn_dev_config_remains_default_off_and_unwired() {
                 && matches!(target_session_router_test_span, Some((start, end)) if index >= start && index <= end);
             let in_target_session_runtime_tests = in_target_session_runtime_module
                 && matches!(target_session_runtime_test_span, Some((start, end)) if index >= start && index <= end);
+            let in_t1_relay_stream_router_tests = in_t1_relay_stream_router_module
+                && matches!(t1_relay_stream_router_test_span, Some((start, end)) if index >= start && index <= end);
             let references_dev_config =
                 line.contains("ClawVpnDevConfig") || line.contains("claw_vpn_dev_config");
             let references_dev_flag = line.contains("THEYOS_CLAW_VPN_");
@@ -4397,15 +4466,20 @@ fn product_a_per_claw_vpn_dev_config_remains_default_off_and_unwired() {
                 || line.contains("ClawVpnT1Ready")
                 || line.contains("ClawVpnT1CallerReadySeal")
                 || line.contains("ClawVpnT1TargetSessionRouter")
+                || line.contains("ClawVpnT1RelayStream")
                 || line.contains("assemble_claw_vpn_t1_caller")
                 || line.contains("assemble_claw_vpn_t1_target_session_router")
                 || line.contains("assemble_claw_vpn_t1_target_session_router_factory")
+                || line.contains("assemble_claw_vpn_t1_relay_stream_router")
+                || line.contains("claw_vpn_t1_relay_stream_router")
                 || line.contains("claw_vpn_t1_caller");
             let references_target_session_runtime_bridge = line
                 .contains("ClawVpnTargetSessionRuntime")
                 || line.contains("claw_vpn_target_session_runtime");
             let references_ip_tunnel_target_backend = line.contains("new_with_ip_tunnel_router")
                 || line.contains("ip_tunnel_router")
+                || line.contains("RelayStreamIpTunnelRouter")
+                || line.contains("RelayStreamIpTunnelTarget")
                 || line.contains("RelayStreamIpTunnelUnavailableRouter")
                 || line.contains("bind_relay_stream_reverse_connect_with_ip_tunnel_router")
                 || line.contains("assemble_relay_stream_live_with_ip_tunnel_router");
@@ -4450,20 +4524,46 @@ fn product_a_per_claw_vpn_dev_config_remains_default_off_and_unwired() {
                 in_target_session_runtime_module && references_relay_stream_adapter;
             let allowed_target_session_runtime_relay_pair =
                 in_target_session_runtime_module && references_target_session_relay_adapter;
-            let line_without_target_session_runtime_wiring =
-                if in_target_session_runtime_module || in_target_session_router_module {
-                    line.replace("ClawVpnRuntimeWiring", "")
-                        .replace("try_assemble_claw_vpn_runtime_wiring_deferred", "")
-                        .replace("claw_vpn_wiring", "")
-                } else {
-                    (*line).to_owned()
-                };
+            let allowed_t1_relay_stream_router_packet_interface = in_t1_relay_stream_router_module
+                && ((line.contains("ClawVpnPacketInterface")
+                    && !line.contains("ClawVpnPacketPump")
+                    && !line.contains("ClawVpnPacketRelay")
+                    && !line.contains("ClawVpnPacketPumpLoop"))
+                    || in_t1_relay_stream_router_tests);
+            let allowed_relay_stream_mount_packet_interface = in_relay_stream_mount_module
+                && line.contains("ClawVpnPacketInterface")
+                && !line.contains("ClawVpnPacketPump")
+                && !line.contains("ClawVpnPacketRelay")
+                && !line.contains("ClawVpnPacketPumpLoop");
+            let allowed_t1_relay_stream_router_relay_stream_adapter =
+                in_t1_relay_stream_router_module && references_relay_stream_adapter;
+            let allowed_t1_relay_stream_router_target_session_router =
+                in_t1_relay_stream_router_module && references_target_session_router_adapter;
+            let allowed_relay_stream_mount_target_session_router =
+                in_relay_stream_mount_module && references_target_session_router_adapter;
+            let allowed_t1_relay_stream_router_target_session_runtime =
+                in_t1_relay_stream_router_module && references_target_session_runtime_bridge;
+            let line_without_target_session_runtime_wiring = if in_target_session_runtime_module
+                || in_target_session_router_module
+                || in_t1_relay_stream_router_module
+                || in_relay_stream_mount_module
+            {
+                line.replace("ClawVpnRuntimeWiring", "")
+                    .replace("try_assemble_claw_vpn_runtime_wiring_deferred", "")
+                    .replace("claw_vpn_wiring", "")
+            } else {
+                (*line).to_owned()
+            };
             let references_runtime = line_without_target_session_runtime_wiring
                 .contains("ClawVpnRuntime")
                 || line_without_target_session_runtime_wiring.contains("claw_vpn_runtime")
                 || line_without_target_session_runtime_wiring.contains("CLAW_VPN_RUNTIME");
             let references_wiring =
                 line.contains("ClawVpnRuntimeWiring") || line.contains("claw_vpn_wiring");
+            let allowed_t1_relay_stream_router_wiring =
+                in_t1_relay_stream_router_module && references_wiring;
+            let allowed_relay_stream_mount_wiring =
+                in_relay_stream_mount_module && references_wiring;
             let references_linux_tun = line.contains("ClawVpnLinuxTun")
                 || line.contains("claw_vpn_linux_tun")
                 || line.contains("/dev/net/tun")
@@ -4526,30 +4626,57 @@ fn product_a_per_claw_vpn_dev_config_remains_default_off_and_unwired() {
                     && (line.contains("ClawVpnAgentSessionCore")
                         || line.contains("ClawVpnDatapathSide")));
             let allowed_target_session_router_datapath = in_target_session_router_tests;
+            let allowed_t1_relay_stream_router_datapath =
+                in_t1_relay_stream_router_module && references_datapath_runtime;
             let allowed_startup_wiring_dev_config_gate =
                 in_startup_wiring_module && references_dev_config && !references_dev_flag;
             let allowed_t1_caller_dev_config_gate =
                 in_t1_caller_module && references_dev_config && !references_dev_flag;
+            let allowed_t1_relay_stream_router_dev_config_gate =
+                in_t1_relay_stream_router_module && references_dev_config && !references_dev_flag;
+            let allowed_relay_stream_mount_dev_config_gate =
+                in_relay_stream_mount_module && references_dev_config && !references_dev_flag;
             let allowed_t1_caller_preflight_gate =
                 in_t1_caller_module && references_t1_preflight_gate;
+            let allowed_t1_relay_stream_router_preflight_gate =
+                in_t1_relay_stream_router_module && references_t1_preflight_gate;
+            let allowed_relay_stream_mount_preflight_gate =
+                in_relay_stream_mount_module && references_t1_preflight_gate;
             let allowed_t1_caller_target_session_router =
                 in_t1_caller_module && references_target_session_router_adapter;
+            let allowed_t1_relay_stream_router_t1_caller_gate =
+                in_t1_relay_stream_router_module && references_t1_caller_gate;
+            let allowed_relay_stream_mount_t1_caller_gate =
+                in_relay_stream_mount_module && references_t1_caller_gate;
+            let allowed_relay_stream_mount_interface_route_plan =
+                in_relay_stream_mount_module && references_interface_route_plan;
+            let allowed_relay_stream_mount_ip_tunnel_target_backend =
+                in_relay_stream_mount_module && references_ip_tunnel_target_backend;
+            let allowed_relay_stream_mount_linux_tun =
+                in_relay_stream_mount_module && references_linux_tun;
+            let allowed_relay_stream_mount_macos_utun =
+                in_relay_stream_mount_module && references_macos_utun;
             if (!allowed_packet_pump_datapath_runtime
                 && !allowed_runtime_datapath_runtime
                 && !allowed_wiring_datapath_runtime
                 && !allowed_target_session_runtime_datapath
                 && !allowed_target_session_router_datapath
+                && !allowed_t1_relay_stream_router_datapath
                 && references_datapath_runtime)
                 || (!in_config_module
                     && !module_export
                     && !allowed_startup_wiring_dev_config_gate
                     && !allowed_t1_caller_dev_config_gate
+                    && !allowed_t1_relay_stream_router_dev_config_gate
+                    && !allowed_relay_stream_mount_dev_config_gate
                     && (references_dev_config || references_dev_flag))
                 || (!in_interface_route_plan_module
                     && !in_runtime_module
                     && !in_wiring_module
                     && !(in_target_session_router_module && in_target_session_router_tests)
                     && !(in_target_session_runtime_module && in_target_session_runtime_tests)
+                    && !in_t1_relay_stream_router_tests
+                    && !allowed_relay_stream_mount_interface_route_plan
                     && !interface_route_plan_module_export
                     && references_interface_route_plan)
                 || (!in_packet_pump_module
@@ -4561,12 +4688,15 @@ fn product_a_per_claw_vpn_dev_config_remains_default_off_and_unwired() {
                     && !allowed_target_session_relay_packet_relay_adapter
                     && !allowed_target_session_router_packet_interface
                     && !allowed_target_session_runtime_packet_interface
+                    && !allowed_t1_relay_stream_router_packet_interface
+                    && !allowed_relay_stream_mount_packet_interface
                     && references_packet_pump)
                 || (!in_relay_stream_module
                     && !relay_stream_module_export
                     && !allowed_target_session_relay_stream_adapter
                     && !allowed_target_session_router_relay_stream_adapter
                     && !allowed_target_session_runtime_relay_stream_adapter
+                    && !allowed_t1_relay_stream_router_relay_stream_adapter
                     && references_relay_stream_adapter)
                 || (!in_target_session_relay_module
                     && !target_session_relay_module_export
@@ -4574,20 +4704,33 @@ fn product_a_per_claw_vpn_dev_config_remains_default_off_and_unwired() {
                     && references_target_session_relay_adapter)
                 || (!in_target_session_router_module
                     && !allowed_t1_caller_target_session_router
+                    && !allowed_t1_relay_stream_router_target_session_router
+                    && !allowed_relay_stream_mount_target_session_router
                     && !target_session_router_module_export
                     && references_target_session_router_adapter)
-                || (!in_t1_caller_module && !t1_caller_module_export && references_t1_caller_gate)
+                || (!in_t1_caller_module
+                    && !allowed_t1_relay_stream_router_t1_caller_gate
+                    && !allowed_relay_stream_mount_t1_caller_gate
+                    && !t1_caller_module_export
+                    && !t1_relay_stream_router_module_export
+                    && references_t1_caller_gate)
                 || (!in_target_session_runtime_module
                     && !allowed_target_session_router_runtime_bridge
+                    && !allowed_t1_relay_stream_router_target_session_runtime
                     && !target_session_runtime_module_export
                     && references_target_session_runtime_bridge)
                 || (!in_relay_stream_target_router_module
+                    && !in_t1_relay_stream_router_module
+                    && !in_relay_stream_responder_reverse_connect_module
                     && !in_relay_stream_reverse_connect_binding_module
                     && !in_relay_stream_reverse_connect_pool_module
                     && !in_relay_stream_runtime_module
+                    && !allowed_relay_stream_mount_ip_tunnel_target_backend
                     && references_ip_tunnel_target_backend)
                 || (!in_startup_wiring_module
                     && !allowed_t1_caller_preflight_gate
+                    && !allowed_t1_relay_stream_router_preflight_gate
+                    && !allowed_relay_stream_mount_preflight_gate
                     && references_t1_preflight_gate)
                 || (!in_runtime_module
                     && !in_wiring_module
@@ -4598,10 +4741,18 @@ fn product_a_per_claw_vpn_dev_config_remains_default_off_and_unwired() {
                 || (!in_wiring_module
                     && !in_target_session_router_module
                     && !in_target_session_runtime_module
+                    && !allowed_t1_relay_stream_router_wiring
+                    && !allowed_relay_stream_mount_wiring
                     && !wiring_module_export
                     && references_wiring)
-                || (!in_linux_tun_module && !linux_tun_module_export && references_linux_tun)
-                || (!in_macos_utun_module && !macos_utun_module_export && references_macos_utun)
+                || (!in_linux_tun_module
+                    && !linux_tun_module_export
+                    && !allowed_relay_stream_mount_linux_tun
+                    && references_linux_tun)
+                || (!in_macos_utun_module
+                    && !macos_utun_module_export
+                    && !allowed_relay_stream_mount_macos_utun
+                    && references_macos_utun)
             {
                 violations.push(format!("{}:{}: {}", path.display(), index + 1, line.trim()));
             }

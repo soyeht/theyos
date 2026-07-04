@@ -82,11 +82,10 @@ follow-ups make the existing `IpTunnel` resource gate delegate to a
 caller-supplied target backend only after the same offer/slot/trust checks pass,
 and the target-router now requires the member-scoped Group audience for
 `IpTunnel` before the backend is reached, so Device/Public `IpTunnel` offers
-fail closed before any injected backend can run. The production mount still uses
-the default fail-closed backend; the source guard now tripwires external use of
-that injectable `IpTunnel` backend constructor, binding entrypoint, and runtime
-entrypoint. They do not build the VPN runtime, open devices, dial sockets, spawn
-work, or add a product/bootstrap caller.
+fail closed before any injected backend can run. Those slices only added the
+injectable backend seam and guarded backend constructor, binding entrypoint, and
+runtime entrypoint; they did not build the VPN runtime, open devices, dial
+sockets, spawn work, or add a product/bootstrap caller.
 The current target-session relay bridge follow-up adds an unwired local
 socketpair adapter that can hand one async byte-stream side to the existing
 `relay_stream` `TargetSession` API while the synchronous packet pump owns the
@@ -131,16 +130,27 @@ caller must obtain that payload from a fresh gate run for the exact artifact/tes
 window, not from a stored ready value. The gate statuses and entrypoints are
 `#[must_use]`, so warning-deny builds catch accidental bare-call discards; any
 intentional discard still has to be explicit and reviewed at the future caller
-site. It still does not mount the router, construct concrete devices, choose
-route tools, run wiring, open TUN/utun, dial a relay, spawn work, or authorize a
-live T1 run. The source guard tripwires external use of the caller-gate
-entrypoints, ready payload, ready seal, and router factory so the future
-mount-swap or startup caller reopens review.
+site. By itself, the caller gate does not mount the router, construct concrete
+devices, choose route tools, run wiring, open TUN/utun, dial a relay, spawn
+work, or authorize a live T1 run. The source guard tripwires external use of the
+caller-gate entrypoints, ready payload, ready seal, and router factory so any
+startup or mount wiring reopens review.
+The current relay-stream T1 backend follow-up adds a member-scoped `IpTunnel`
+router that implements the nominal `RelayStreamIpTunnelRouter` target-aware
+backend, derives the VPN ACL key from the authenticated Group `(member, device,
+claw)` target, and assembles the target-session runtime from caller-supplied,
+post-gate build inputs. The mount now injects that backend through the same T1
+caller gate, but the production path still supplies
+`PerClawVpnT1PreflightEvidence::missing`, so even with the T1 dev env present it
+falls back to `RelayStreamIpTunnelUnavailableRouter` before opening TUN/utun,
+installing routes, building runtime inputs, spawning the launcher, or running
+the packet pump. The source guard has a narrowly scoped mount exception for this
+reviewed wiring and continues to tripwire the same symbols anywhere else.
 There is still no
-checked-in runtime/bin that opens a TUN/utun interface in a product/default
-path, caller that invokes the runtime coordinator, route executor, packet pump,
-or packet-pump loop from product/bootstrap code, route installation, packet
-relay runtime, storage-backed session registry, iOS Packet
+checked-in evidence loader or authorized product/default path that can make the
+T1 mount backend ready, no runtime/bin that opens a TUN/utun interface in a
+default path, no route installation or packet pump execution in default
+bootstrap, no storage-backed session registry, iOS Packet
 Tunnel, or product activation. Runtime/product activation remains default-off by
 construction, and every activation step (deploy, flag flip, shipping) is a
 separate, explicitly owner-authorized decision. The guest-kernel prerequisite is
@@ -473,14 +483,25 @@ Access between members/devices and claws is explicitly many-to-many:
   not capture concrete device, route, or relay handles opened before the
   blockers. The gate statuses and entrypoints are `#[must_use]` so warning-deny
   builds catch accidental bare-call discards; any intentional discard still has
-  to be explicit and reviewed at the future caller site. It remains unmounted
-  and does not supply concrete handles or execute the launcher. The caller-gate
-  entrypoints, ready payload, ready seal, and router factory are guard-tripwired
-  outside their module/export. The relay target-router also keeps `IpTunnel`
+  to be explicit and reviewed at the future caller site. At that point it
+  remained unmounted and did not supply concrete handles or execute the
+  launcher. The caller-gate entrypoints, ready payload, ready seal, and router
+  factory are guard-tripwired outside their module/export. The relay
+  target-router also keeps `IpTunnel`
   member-scoped at the offer boundary: Device/Public audiences fail closed
   before the `IpTunnel` backend, while the future live caller must still derive
   the VPN ACL key from the authenticated Group member identity and prove that
-  mapping in review.
+  mapping in review. The VPN backend seam is the target-aware
+  `RelayStreamIpTunnelRouter`; generic string-only target routers are not
+  sufficient for the member/device/claw ACL boundary.
+  The relay-stream T1 backend follow-up then connects those pieces to the
+  `claw_share_relay_stream_mount` seam: the backend derives its ACL key from
+  the authenticated Group target and the mount asks the T1 caller gate for a
+  backend. The environment-backed mount still supplies missing preflight
+  evidence, so `Disabled`/invalid/missing-preflight/`Dial` paths all fall back
+  to the unavailable `IpTunnel` router before building runtime inputs, opening
+  TUN/utun, installing routes, spawning the launcher, or running the packet
+  pump. This is the reviewed mount wiring shape, not T1 execution.
   Exit: T1–T4 green on dev hosts.
 - **Phase 2 — iOS Packet Tunnel dev build.** Entry: entitlement go/no-go.
   Dev device only. Exit: T5–T7 green (iPhone reaches Claw-A — and only

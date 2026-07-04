@@ -18,14 +18,14 @@ use std::fmt;
 use std::sync::Arc;
 
 use household_rs::claw_share::ClawShareSlotStore;
-use household_rs::claw_share_data_tunnel::ReplayGuard;
+use household_rs::claw_share_data_tunnel::{ClawTargetRouter, ReplayGuard};
 use household_rs::ids::HouseholdId;
 
 use crate::claw_share_relay_stream_contract::RelayStreamOfferContract;
 use crate::claw_share_relay_stream_issuer_trust::RelayStreamIssuerTrust;
 use crate::claw_share_relay_stream_responder::ResponderDataTunnelDeps;
 use crate::claw_share_relay_stream_target_router::{
-    RelayStreamIpTunnelUnavailableRouter, RelayStreamOfferTargetRouter,
+    RelayStreamIpTunnelRouter, RelayStreamIpTunnelUnavailableRouter, RelayStreamOfferTargetRouter,
 };
 
 /// One offer bound to its target router and data-tunnel deps for a single
@@ -69,7 +69,11 @@ pub fn bind_relay_stream_reverse_connect<P, S>(
     pty_router: P,
     clawsite_router: S,
     now_unix: impl Fn() -> u64 + Send + Sync + 'static,
-) -> RelayStreamReverseConnectBinding<P, S> {
+) -> RelayStreamReverseConnectBinding<P, S>
+where
+    P: ClawTargetRouter,
+    S: ClawTargetRouter,
+{
     bind_relay_stream_reverse_connect_with_ip_tunnel_router(
         offer,
         trust,
@@ -94,7 +98,12 @@ pub fn bind_relay_stream_reverse_connect_with_ip_tunnel_router<P, S, I>(
     clawsite_router: S,
     ip_tunnel_router: I,
     now_unix: impl Fn() -> u64 + Send + Sync + 'static,
-) -> RelayStreamReverseConnectBinding<P, S, I> {
+) -> RelayStreamReverseConnectBinding<P, S, I>
+where
+    P: ClawTargetRouter,
+    S: ClawTargetRouter,
+    I: RelayStreamIpTunnelRouter,
+{
     let router = RelayStreamOfferTargetRouter::new_with_ip_tunnel_router(
         (*offer).clone(),
         trust.clone(),
@@ -114,7 +123,7 @@ mod tests {
 
     use household_rs::claw_share::{SlotRecord, SlotState};
     use household_rs::claw_share_data_tunnel::{
-        ClawTargetRouter, DataTunnelError, TcpStreamRouter,
+        ClawTargetRouter, DataTunnelError, TargetSession, TcpStreamRouter,
     };
     use household_rs::household_mesh_log::{
         MeshMembership, ProjectedGroup, ProjectedMemberDevice, ProjectedState,
@@ -123,6 +132,8 @@ mod tests {
     use household_rs::keys::IdentityKey;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
+
+    use crate::claw_share_relay_stream_target_router::RelayStreamIpTunnelTarget;
 
     use crate::claw_share_relay_stream_contract::{
         RelayStreamClawStaticPublicKey, RelayStreamExpectedPath, RelayStreamOfferPayload,
@@ -281,7 +292,7 @@ mod tests {
     where
         P: ClawTargetRouter,
         S: ClawTargetRouter,
-        I: ClawTargetRouter,
+        I: RelayStreamIpTunnelRouter,
     {
         let mut session = binding.deps.router.open(RELAY_STREAM_CLAW_ID).await?;
         session
@@ -309,11 +320,32 @@ mod tests {
     where
         P: ClawTargetRouter,
         S: ClawTargetRouter,
-        I: ClawTargetRouter,
+        I: RelayStreamIpTunnelRouter,
     {
         match binding.deps.router.open(RELAY_STREAM_CLAW_ID).await {
             Ok(_) => panic!("expected target open to fail"),
             Err(error) => error,
+        }
+    }
+
+    struct AckIpTunnelRouter {
+        addr: String,
+    }
+
+    impl AckIpTunnelRouter {
+        fn new(addr: String) -> Self {
+            Self { addr }
+        }
+    }
+
+    impl RelayStreamIpTunnelRouter for AckIpTunnelRouter {
+        async fn open_ip_tunnel(
+            &self,
+            target: RelayStreamIpTunnelTarget,
+        ) -> Result<TargetSession, DataTunnelError> {
+            TcpStreamRouter::new(self.addr.clone())
+                .open(target.claw_id())
+                .await
         }
     }
 
@@ -354,7 +386,7 @@ mod tests {
             Arc::new(ReplayGuard::new()),
             TcpStreamRouter::new(pty_addr),
             TcpStreamRouter::new(site_addr),
-            TcpStreamRouter::new(ip_addr),
+            AckIpTunnelRouter::new(ip_addr),
             || NOW,
         );
 

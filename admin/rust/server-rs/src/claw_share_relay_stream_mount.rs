@@ -23,9 +23,11 @@
 //! `FileKeystore` (live keychain hardening later); handles live in a `OnceLock`
 //! rather than a graceful `AppState` holder.
 
+use std::io;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
+use std::time::Duration;
 
 use household_rs::claw_share::{ClawShareSlotStore, GuestCredential};
 use household_rs::claw_share_data_tunnel::{
@@ -55,9 +57,34 @@ use crate::claw_share_relay_stream_provision::{
 };
 use crate::claw_share_relay_stream_runtime::{
     RelayStreamLiveConfig, RelayStreamLiveError, RelayStreamLiveHandles, RelayStreamLiveInputs,
-    assemble_relay_stream_live,
+    assemble_relay_stream_live_with_ip_tunnel_router,
 };
+use crate::claw_share_relay_stream_target_router::{
+    RelayStreamIpTunnelRouter, RelayStreamIpTunnelTarget, RelayStreamIpTunnelUnavailableRouter,
+};
+use crate::claw_vpn_dev_config::ClawVpnDevConfig;
+use crate::claw_vpn_interface_route_plan::{
+    ClawVpnInterfaceName, ClawVpnInterfaceRoutePlatform, ClawVpnInterfaceRouteToolPaths,
+};
+#[cfg(target_os = "linux")]
+use crate::claw_vpn_linux_tun::{
+    ClawVpnLinuxTunConfig, ClawVpnLinuxTunDevice, ClawVpnLinuxTunName,
+};
+#[cfg(target_os = "macos")]
+use crate::claw_vpn_macos_utun::ClawVpnMacosUtunDevice;
+use crate::claw_vpn_packet_pump::ClawVpnPacketInterface;
+use crate::claw_vpn_t1_caller::ClawVpnT1CallerStatus;
+use crate::claw_vpn_t1_relay_stream_router::{
+    ClawVpnT1RelayStreamBoxedRouter, ClawVpnT1RelayStreamBuildInputs,
+    ClawVpnT1RelayStreamLaunchRuntime, ClawVpnT1RelayStreamRouterParts,
+    assemble_claw_vpn_t1_relay_stream_router,
+};
+use crate::claw_vpn_target_session_router::{
+    ClawVpnTargetSessionRouterLaunchError, ClawVpnTargetSessionRouterWiring,
+};
+use crate::claw_vpn_wiring::{ClawVpnRuntimeWiringConfig, ClawVpnRuntimeWiringInputs};
 use crate::household_state::HouseholdState;
+use crate::startup_wiring::PerClawVpnT1PreflightEvidence;
 
 /// Env var that opts the `relay_stream` live path IN. Absent or non-truthy = OFF.
 const RELAY_STREAM_LIVE_ENV: &str = "THEYOS_RELAY_STREAM_LIVE";
@@ -84,6 +111,13 @@ const RELAY_STREAM_CLAWSITE_BACKEND_ENV: &str = "THEYOS_RELAY_STREAM_CLAWSITE_BA
 /// (default), `clawsite`, or reserved `ip_tunnel`.
 const RELAY_STREAM_RESOURCE_ENV: &str = "THEYOS_RELAY_STREAM_RESOURCE";
 
+const CLAW_VPN_T1_TARGET_SESSION_IO_TIMEOUT: Duration = Duration::from_secs(5);
+#[cfg(target_os = "linux")]
+const CLAW_VPN_T1_LINUX_TUN_NAME: &str = "clawvpn0";
+const CLAW_VPN_LINUX_IP_TOOL_PATH: &str = "/sbin/ip";
+const CLAW_VPN_MACOS_IFCONFIG_TOOL_PATH: &str = "/sbin/ifconfig";
+const CLAW_VPN_MACOS_ROUTE_TOOL_PATH: &str = "/sbin/route";
+
 /// The single source for the relay address (`host:port`). The provisioned offer
 /// stores it as `relay-stream://<addr>`; the pool dials it as a `SocketAddr`.
 /// Both read this, so the offer endpoint and the pool dial target cannot drift.
@@ -97,6 +131,12 @@ pub(crate) fn relay_stream_relay_endpoint() -> String {
 /// Process-lifetime holder so the spawned driver/pool are not Drop-aborted right
 /// after the mount returns. A graceful `AppState` holder is a future carry.
 static LIVE_HANDLES: OnceLock<RelayStreamLiveHandles> = OnceLock::new();
+
+/// Process-lifetime `IpTunnel` backend for the mounted relay-stream runtime.
+///
+/// The runtime calls its router factory per binding/worker. Caching the mounted
+/// router here keeps T1 admission state shared across those factory calls.
+static MOUNTED_IP_TUNNEL_ROUTER: OnceLock<Arc<RelayStreamMountedIpTunnelRouter>> = OnceLock::new();
 
 /// `ClawSite` target router.
 ///
@@ -112,6 +152,29 @@ static LIVE_HANDLES: OnceLock<RelayStreamLiveHandles> = OnceLock::new();
 /// is a follow-up; today it is one operator-configured backend.
 pub struct RelayStreamClawSiteRouter {
     backend_addr: Option<String>,
+}
+
+enum RelayStreamMountedIpTunnelRouter {
+    Unavailable(RelayStreamIpTunnelUnavailableRouter),
+    #[cfg(target_os = "linux")]
+    T1Linux(ClawVpnT1RelayStreamBoxedRouter<ClawVpnLinuxTunDevice>),
+    #[cfg(target_os = "macos")]
+    T1Macos(ClawVpnT1RelayStreamBoxedRouter<ClawVpnMacosUtunDevice>),
+}
+
+impl RelayStreamIpTunnelRouter for RelayStreamMountedIpTunnelRouter {
+    async fn open_ip_tunnel(
+        &self,
+        target: RelayStreamIpTunnelTarget,
+    ) -> Result<TargetSession, DataTunnelError> {
+        match self {
+            Self::Unavailable(router) => router.open_ip_tunnel(target).await,
+            #[cfg(target_os = "linux")]
+            Self::T1Linux(router) => router.open_ip_tunnel(target).await,
+            #[cfg(target_os = "macos")]
+            Self::T1Macos(router) => router.open_ip_tunnel(target).await,
+        }
+    }
 }
 
 impl RelayStreamClawSiteRouter {
@@ -279,7 +342,157 @@ async fn mount_relay_stream_live(
         now_unix,
     };
 
-    Ok(assemble_relay_stream_live(inputs, config).await?)
+    Ok(assemble_relay_stream_live_with_ip_tunnel_router(
+        inputs,
+        config,
+        Arc::new(mounted_ip_tunnel_router_from_t1_gate),
+    )
+    .await?)
+}
+
+fn mounted_ip_tunnel_router_from_t1_gate() -> Arc<RelayStreamMountedIpTunnelRouter> {
+    Arc::clone(
+        MOUNTED_IP_TUNNEL_ROUTER
+            .get_or_init(|| Arc::new(build_mounted_ip_tunnel_router_from_t1_gate())),
+    )
+}
+
+fn build_mounted_ip_tunnel_router_from_t1_gate() -> RelayStreamMountedIpTunnelRouter {
+    #[cfg(target_os = "linux")]
+    {
+        let status = assemble_linux_t1_ip_tunnel_router();
+        if status.is_ready() {
+            if let Some((_mode, router)) = status.into_ready() {
+                return RelayStreamMountedIpTunnelRouter::T1Linux(router);
+            }
+        } else {
+            tracing::warn!(
+                stage = "claw_share.relay_stream.mount.claw_vpn_t1_not_ready",
+                status = ?status,
+                "per-Claw VPN T1 IpTunnel backend remains unavailable"
+            );
+        }
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let status = assemble_macos_t1_ip_tunnel_router();
+        if status.is_ready() {
+            if let Some((_mode, router)) = status.into_ready() {
+                return RelayStreamMountedIpTunnelRouter::T1Macos(router);
+            }
+        } else {
+            tracing::warn!(
+                stage = "claw_share.relay_stream.mount.claw_vpn_t1_not_ready",
+                status = ?status,
+                "per-Claw VPN T1 IpTunnel backend remains unavailable"
+            );
+        }
+    }
+    RelayStreamMountedIpTunnelRouter::Unavailable(RelayStreamIpTunnelUnavailableRouter)
+}
+
+#[cfg(target_os = "linux")]
+fn assemble_linux_t1_ip_tunnel_router()
+-> ClawVpnT1CallerStatus<ClawVpnT1RelayStreamBoxedRouter<ClawVpnLinuxTunDevice>> {
+    assemble_claw_vpn_t1_relay_stream_router(
+        ClawVpnDevConfig::from_env,
+        PerClawVpnT1PreflightEvidence::missing,
+        |_config| {
+            ClawVpnT1RelayStreamRouterParts::new(
+                enabled_claw_vpn_t1_wiring_config(),
+                CLAW_VPN_T1_TARGET_SESSION_IO_TIMEOUT,
+                linux_t1_build_inputs(),
+                t1_runtime_launcher(),
+            )
+        },
+    )
+}
+
+#[cfg(target_os = "macos")]
+fn assemble_macos_t1_ip_tunnel_router()
+-> ClawVpnT1CallerStatus<ClawVpnT1RelayStreamBoxedRouter<ClawVpnMacosUtunDevice>> {
+    assemble_claw_vpn_t1_relay_stream_router(
+        ClawVpnDevConfig::from_env,
+        PerClawVpnT1PreflightEvidence::missing,
+        |_config| {
+            ClawVpnT1RelayStreamRouterParts::new(
+                enabled_claw_vpn_t1_wiring_config(),
+                CLAW_VPN_T1_TARGET_SESSION_IO_TIMEOUT,
+                macos_t1_build_inputs(),
+                t1_runtime_launcher(),
+            )
+        },
+    )
+}
+
+fn enabled_claw_vpn_t1_wiring_config() -> ClawVpnRuntimeWiringConfig {
+    let defaults = ClawVpnRuntimeWiringConfig::default();
+    ClawVpnRuntimeWiringConfig::new(
+        true,
+        defaults.runtime_step_budget(),
+        defaults.driver_budget(),
+    )
+}
+
+#[cfg(target_os = "linux")]
+fn linux_t1_build_inputs() -> ClawVpnT1RelayStreamBuildInputs<ClawVpnLinuxTunDevice> {
+    Box::new(|_config, _target, _context, relay| {
+        let tun_name = ClawVpnLinuxTunName::new(CLAW_VPN_T1_LINUX_TUN_NAME)
+            .map_err(|error| io::Error::other(error.to_string()))?;
+        let device = ClawVpnLinuxTunDevice::open(&ClawVpnLinuxTunConfig::new(tun_name))?;
+        let interface_name = ClawVpnInterfaceName::new(device.name().as_str())
+            .map_err(|error| io::Error::other(format!("{error:?}")))?;
+        Ok(ClawVpnRuntimeWiringInputs {
+            route_platform: ClawVpnInterfaceRoutePlatform::Linux,
+            interface_name,
+            route_tool_paths: claw_vpn_route_tool_paths()?,
+            interface: device,
+            relay,
+        })
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn macos_t1_build_inputs() -> ClawVpnT1RelayStreamBuildInputs<ClawVpnMacosUtunDevice> {
+    Box::new(|_config, _target, _context, relay| {
+        let device = ClawVpnMacosUtunDevice::open()?;
+        let interface_name = ClawVpnInterfaceName::new(device.name().as_str())
+            .map_err(|error| io::Error::other(format!("{error:?}")))?;
+        Ok(ClawVpnRuntimeWiringInputs {
+            route_platform: ClawVpnInterfaceRoutePlatform::Macos,
+            interface_name,
+            route_tool_paths: claw_vpn_route_tool_paths()?,
+            interface: device,
+            relay,
+        })
+    })
+}
+
+fn claw_vpn_route_tool_paths() -> io::Result<ClawVpnInterfaceRouteToolPaths> {
+    ClawVpnInterfaceRouteToolPaths::try_new(
+        CLAW_VPN_LINUX_IP_TOOL_PATH,
+        CLAW_VPN_MACOS_IFCONFIG_TOOL_PATH,
+        CLAW_VPN_MACOS_ROUTE_TOOL_PATH,
+    )
+    .map_err(|error| io::Error::other(format!("{error:?}")))
+}
+
+fn t1_runtime_launcher<I>() -> ClawVpnT1RelayStreamLaunchRuntime<I>
+where
+    I: ClawVpnPacketInterface + Send + 'static,
+{
+    Box::new(|mut wiring: ClawVpnTargetSessionRouterWiring<I>| {
+        tokio::task::spawn_blocking(move || {
+            if let Err(error) = wiring.run_until_stopped() {
+                tracing::warn!(
+                    stage = "claw_share.relay_stream.mount.claw_vpn_t1_runtime_stopped",
+                    error = ?error,
+                    "per-Claw VPN T1 runtime stopped with an error"
+                );
+            }
+        });
+        Ok::<(), ClawVpnTargetSessionRouterLaunchError>(())
+    })
 }
 
 /// Best-effort: when the live path is enabled, mint + store a `relay_stream` offer
@@ -541,11 +754,54 @@ pub enum RelayStreamMountError {
 mod tests {
     use super::*;
 
+    use std::ffi::OsString;
+    use std::sync::Mutex;
+
     use crate::claw_share_relay_stream_offer_store::relay_stream_offer_store_path;
     use crate::claw_share_relay_stream_test_support::{
         attacker_signer, data_tunnel_credential, now_unix, owner_signer,
         relay_stream_household_state, relay_stream_issuer_trust,
     };
+    use crate::claw_vpn_dev_config::{
+        CLAW_VPN_DIAL_ENV, CLAW_VPN_IPV4_POOL_ENV, CLAW_VPN_LIVE_ENV,
+        CLAW_VPN_MAX_SESSIONS_PER_CLAW_ENV, CLAW_VPN_MAX_SESSIONS_PER_MEMBER_CLAW_ENV,
+        CLAW_VPN_RELAY_ENDPOINT_ENV,
+    };
+
+    static CLAW_VPN_T1_TEST_ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    struct TestEnvRestore {
+        key: &'static str,
+        previous: Option<OsString>,
+    }
+
+    #[allow(unsafe_code)]
+    impl Drop for TestEnvRestore {
+        fn drop(&mut self) {
+            // SAFETY: tests that mutate these env vars hold
+            // CLAW_VPN_T1_TEST_ENV_LOCK until this guard restores them.
+            unsafe {
+                match &self.previous {
+                    Some(value) => std::env::set_var(self.key, value),
+                    None => std::env::remove_var(self.key),
+                }
+            }
+        }
+    }
+
+    #[allow(unsafe_code)]
+    fn set_t1_test_env(key: &'static str, value: Option<&str>) -> TestEnvRestore {
+        let previous = std::env::var_os(key);
+        // SAFETY: callers hold CLAW_VPN_T1_TEST_ENV_LOCK while mutating these
+        // process env vars.
+        unsafe {
+            match value {
+                Some(value) => std::env::set_var(key, value),
+                None => std::env::remove_var(key),
+            }
+        }
+        TestEnvRestore { key, previous }
+    }
 
     #[test]
     fn env_flag_parses_only_explicit_truthy_values() {
@@ -631,6 +887,50 @@ mod tests {
             parse_resource(Some("garbage")),
             Err(RelayStreamResourceEnvError::Invalid)
         );
+    }
+
+    #[test]
+    fn mounted_t1_iptunnel_router_remains_unavailable_without_preflight_evidence() {
+        let _lock = CLAW_VPN_T1_TEST_ENV_LOCK.lock().unwrap();
+        let _live = set_t1_test_env(CLAW_VPN_LIVE_ENV, Some("1"));
+        let _dial = set_t1_test_env(CLAW_VPN_DIAL_ENV, None);
+        let _endpoint = set_t1_test_env(
+            CLAW_VPN_RELAY_ENDPOINT_ENV,
+            Some("relay-stream://127.0.0.1:49152"),
+        );
+        let _pool = set_t1_test_env(CLAW_VPN_IPV4_POOL_ENV, Some("198.18.0.0/24"));
+        let _per_member = set_t1_test_env(CLAW_VPN_MAX_SESSIONS_PER_MEMBER_CLAW_ENV, None);
+        let _per_claw = set_t1_test_env(CLAW_VPN_MAX_SESSIONS_PER_CLAW_ENV, None);
+
+        let router = build_mounted_ip_tunnel_router_from_t1_gate();
+
+        assert!(matches!(
+            router,
+            RelayStreamMountedIpTunnelRouter::Unavailable(_)
+        ));
+    }
+
+    #[test]
+    fn mounted_t1_iptunnel_router_factory_reuses_process_router() {
+        let _lock = CLAW_VPN_T1_TEST_ENV_LOCK.lock().unwrap();
+        let _live = set_t1_test_env(CLAW_VPN_LIVE_ENV, Some("1"));
+        let _dial = set_t1_test_env(CLAW_VPN_DIAL_ENV, None);
+        let _endpoint = set_t1_test_env(
+            CLAW_VPN_RELAY_ENDPOINT_ENV,
+            Some("relay-stream://127.0.0.1:49152"),
+        );
+        let _pool = set_t1_test_env(CLAW_VPN_IPV4_POOL_ENV, Some("198.18.0.0/24"));
+        let _per_member = set_t1_test_env(CLAW_VPN_MAX_SESSIONS_PER_MEMBER_CLAW_ENV, None);
+        let _per_claw = set_t1_test_env(CLAW_VPN_MAX_SESSIONS_PER_CLAW_ENV, None);
+
+        let first = mounted_ip_tunnel_router_from_t1_gate();
+        let second = mounted_ip_tunnel_router_from_t1_gate();
+
+        assert!(Arc::ptr_eq(&first, &second));
+        assert!(matches!(
+            first.as_ref(),
+            RelayStreamMountedIpTunnelRouter::Unavailable(_)
+        ));
     }
 
     #[tokio::test]

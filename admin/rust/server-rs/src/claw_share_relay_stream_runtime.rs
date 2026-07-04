@@ -38,7 +38,9 @@ use crate::claw_share_relay_stream_reverse_connect_pool::{
     RelayStreamReverseConnectBindingFactory, RelayStreamReverseConnectPoolConfig,
     RelayStreamReverseConnectPoolError, spawn_relay_stream_offer_resync_driver,
 };
-use crate::claw_share_relay_stream_target_router::RelayStreamIpTunnelUnavailableRouter;
+use crate::claw_share_relay_stream_target_router::{
+    RelayStreamIpTunnelRouter, RelayStreamIpTunnelUnavailableRouter,
+};
 use crate::claw_share_relay_stream_trust_context_cache::RelayStreamTrustContextCacheError;
 use crate::claw_share_relay_stream_trust_context_health::{
     RelayStreamTrustContextRefreshPolicy, RelayStreamTrustContextRuntime,
@@ -183,7 +185,7 @@ pub async fn assemble_relay_stream_live_with_ip_tunnel_router<P, S, I>(
 where
     P: ClawTargetRouter + 'static,
     S: ClawTargetRouter + 'static,
-    I: ClawTargetRouter + 'static,
+    I: RelayStreamIpTunnelRouter + 'static,
 {
     if !config.enabled {
         return Ok(None);
@@ -268,7 +270,7 @@ fn build_binding_factory<P, S, I>(
 where
     P: ClawTargetRouter + 'static,
     S: ClawTargetRouter + 'static,
-    I: ClawTargetRouter + 'static,
+    I: RelayStreamIpTunnelRouter + 'static,
 {
     Arc::new(move |offer: Arc<RelayStreamOfferContract>, now| {
         if offer.payload.not_after <= now {
@@ -327,7 +329,7 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use household_rs::claw_share_data_tunnel::{
-        ClawTargetRouter, DataTunnelError, TargetSession, TcpStreamRouter,
+        ClawTargetRouter, DataTunnelError, TcpStreamRouter,
     };
     use household_rs::household_mesh_log::{
         build_group_claw_grant_event, build_group_created_event, build_group_member_add_event,
@@ -338,6 +340,8 @@ mod tests {
     use keystore_rs::FileKeystore;
     use tokio::net::TcpListener;
     use tokio::time::{sleep, timeout};
+
+    use crate::claw_share_relay_stream_target_router::RelayStreamIpTunnelTarget;
 
     use crate::claw_share_relay_stream_contract::{
         RelayStreamExpectedPath, RelayStreamOfferMintInput, RelayStreamResource,
@@ -429,8 +433,11 @@ mod tests {
         opens: Arc<AtomicUsize>,
     }
 
-    impl ClawTargetRouter for CountingIpTunnelRouter {
-        async fn open(&self, _target_id: &str) -> Result<TargetSession, DataTunnelError> {
+    impl RelayStreamIpTunnelRouter for CountingIpTunnelRouter {
+        async fn open_ip_tunnel(
+            &self,
+            _target: RelayStreamIpTunnelTarget,
+        ) -> Result<household_rs::claw_share_data_tunnel::TargetSession, DataTunnelError> {
             self.opens.fetch_add(1, Ordering::SeqCst);
             Err(DataTunnelError::TargetUnavailable(
                 "runtime-iptunnel-backend-hit".to_string(),

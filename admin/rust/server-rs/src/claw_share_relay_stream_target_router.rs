@@ -7,10 +7,12 @@
 //! higher-level consumer boundary and is not faked here.
 
 use std::fmt;
+use std::future::Future;
 use std::sync::Arc;
 
 use household_rs::claw_share::{ClawShareSlotStore, SlotState};
 use household_rs::claw_share_data_tunnel::{ClawTargetRouter, DataTunnelError, TargetSession};
+use household_rs::keys::P256PublicKey;
 
 use crate::claw_share_relay_stream_contract::{
     RelayStreamAudience, RelayStreamExpectedPath, RelayStreamOfferContract,
@@ -33,12 +35,96 @@ pub struct RelayStreamOfferTargetRouter<P, S, I = RelayStreamIpTunnelUnavailable
     ip_tunnel_router: I,
 }
 
+#[derive(Clone, PartialEq, Eq)]
+pub struct RelayStreamIpTunnelTarget {
+    group_id: String,
+    member_id: String,
+    member_device_pub: P256PublicKey,
+    claw_id: String,
+}
+
+impl RelayStreamIpTunnelTarget {
+    #[cfg(test)]
+    pub(crate) fn new_for_test(
+        group_id: impl Into<String>,
+        member_id: impl Into<String>,
+        member_device_pub: P256PublicKey,
+        claw_id: impl Into<String>,
+    ) -> Self {
+        Self {
+            group_id: group_id.into(),
+            member_id: member_id.into(),
+            member_device_pub,
+            claw_id: claw_id.into(),
+        }
+    }
+
+    #[must_use]
+    pub fn group_id(&self) -> &str {
+        &self.group_id
+    }
+
+    #[must_use]
+    pub fn member_id(&self) -> &str {
+        &self.member_id
+    }
+
+    #[must_use]
+    pub fn member_device_pub(&self) -> &P256PublicKey {
+        &self.member_device_pub
+    }
+
+    #[must_use]
+    pub fn claw_id(&self) -> &str {
+        &self.claw_id
+    }
+}
+
+impl fmt::Debug for RelayStreamIpTunnelTarget {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("RelayStreamIpTunnelTarget")
+            .field("group_id", &"<redacted>")
+            .field("member_id", &"<redacted>")
+            .field("member_device_pub", &"<redacted>")
+            .field("claw_id", &"<redacted>")
+            .finish()
+    }
+}
+
+pub trait RelayStreamIpTunnelRouter: Send + Sync {
+    fn open_ip_tunnel(
+        &self,
+        target: RelayStreamIpTunnelTarget,
+    ) -> impl Future<Output = Result<TargetSession, DataTunnelError>> + Send;
+}
+
 #[derive(Debug, Clone, Copy, Default)]
 pub struct RelayStreamIpTunnelUnavailableRouter;
 
 impl ClawTargetRouter for RelayStreamIpTunnelUnavailableRouter {
     async fn open(&self, _target_id: &str) -> Result<TargetSession, DataTunnelError> {
         Err(target_unavailable("relay-stream-iptunnel-not-configured"))
+    }
+}
+
+impl RelayStreamIpTunnelRouter for RelayStreamIpTunnelUnavailableRouter {
+    async fn open_ip_tunnel(
+        &self,
+        _target: RelayStreamIpTunnelTarget,
+    ) -> Result<TargetSession, DataTunnelError> {
+        Err(target_unavailable("relay-stream-iptunnel-not-configured"))
+    }
+}
+
+impl<T> RelayStreamIpTunnelRouter for Arc<T>
+where
+    T: RelayStreamIpTunnelRouter + ?Sized,
+{
+    async fn open_ip_tunnel(
+        &self,
+        target: RelayStreamIpTunnelTarget,
+    ) -> Result<TargetSession, DataTunnelError> {
+        (**self).open_ip_tunnel(target).await
     }
 }
 
@@ -62,8 +148,47 @@ impl RelayStreamOfferTargetGate {
         self.offer.payload.resource
     }
 
-    pub(crate) fn validate_ip_tunnel_target(&self, target_id: &str) -> Result<(), DataTunnelError> {
-        self.validate_target_for_resource(target_id, RelayStreamResource::IpTunnel)
+    pub(crate) fn validate_ip_tunnel_target(
+        &self,
+        target_id: &str,
+    ) -> Result<RelayStreamIpTunnelTarget, DataTunnelError> {
+        let now = (self.now_unix)();
+        let ctx = self
+            .trust
+            .verify_offer_with_context(&self.offer, now)
+            .map_err(|_| target_unavailable("relay-stream-offer-invalid"))?;
+        let payload = &self.offer.payload;
+        if payload.expected_path != RelayStreamExpectedPath::RelayStream {
+            return Err(target_unavailable("relay-stream-path-mismatch"));
+        }
+        if payload.resource != RelayStreamResource::IpTunnel {
+            return Err(target_unavailable("relay-stream-resource-mismatch"));
+        }
+        if target_id != payload.claw_id {
+            return Err(target_unavailable("relay-stream-target-mismatch"));
+        }
+        let RelayStreamAudience::Group {
+            group_id,
+            member_id,
+        } = payload.audience()
+        else {
+            return Err(target_unavailable("relay-stream-iptunnel-member-required"));
+        };
+        check_relay_stream_group_membership(
+            &ctx.projection,
+            &group_id,
+            &member_id,
+            &payload.claw_id,
+            &payload.guest_device_pub,
+        )
+        .map_err(target_unavailable)?;
+
+        Ok(RelayStreamIpTunnelTarget {
+            group_id,
+            member_id,
+            member_device_pub: payload.guest_device_pub.clone(),
+            claw_id: payload.claw_id.clone(),
+        })
     }
 
     fn validate_target_for_resource(
@@ -238,7 +363,7 @@ impl<P, S, I> ClawTargetRouter for RelayStreamOfferTargetRouter<P, S, I>
 where
     P: ClawTargetRouter,
     S: ClawTargetRouter,
-    I: ClawTargetRouter,
+    I: RelayStreamIpTunnelRouter,
 {
     async fn open(&self, target_id: &str) -> Result<TargetSession, DataTunnelError> {
         match self.gate.resource() {
@@ -251,8 +376,8 @@ where
                 self.clawsite_router.open(target_id).await
             }
             RelayStreamResource::IpTunnel => {
-                self.gate.validate_ip_tunnel_target(target_id)?;
-                self.ip_tunnel_router.open(target_id).await
+                let target = self.gate.validate_ip_tunnel_target(target_id)?;
+                self.ip_tunnel_router.open_ip_tunnel(target).await
             }
         }
     }
@@ -276,6 +401,7 @@ mod tests {
     use household_rs::keys::{IdentityKey, P256Keypair, P256PublicKey};
     use household_rs::machine_cert::{MachineCert, Platform, SignOptions};
     use household_rs::person_cert::derive_person_id;
+    use std::sync::Mutex;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
 
@@ -468,7 +594,7 @@ mod tests {
     where
         P: ClawTargetRouter,
         S: ClawTargetRouter,
-        I: ClawTargetRouter,
+        I: RelayStreamIpTunnelRouter,
     {
         let mut session = router.open(CLAW_ID).await?;
         session
@@ -494,11 +620,32 @@ mod tests {
     where
         P: ClawTargetRouter,
         S: ClawTargetRouter,
-        I: ClawTargetRouter,
+        I: RelayStreamIpTunnelRouter,
     {
         match router.open(CLAW_ID).await {
             Ok(_) => panic!("expected target open to fail"),
             Err(error) => error,
+        }
+    }
+
+    struct AckIpTunnelRouter {
+        addr: String,
+    }
+
+    impl AckIpTunnelRouter {
+        fn new(addr: String) -> Self {
+            Self { addr }
+        }
+    }
+
+    impl RelayStreamIpTunnelRouter for AckIpTunnelRouter {
+        async fn open_ip_tunnel(
+            &self,
+            target: RelayStreamIpTunnelTarget,
+        ) -> Result<TargetSession, DataTunnelError> {
+            TcpStreamRouter::new(self.addr.clone())
+                .open(target.claw_id())
+                .await
         }
     }
 
@@ -588,13 +735,55 @@ mod tests {
             empty_slots(),
             TcpStreamRouter::new("127.0.0.1:1"),
             TcpStreamRouter::new("127.0.0.1:1"),
-            TcpStreamRouter::new(ip_addr),
+            AckIpTunnelRouter::new(ip_addr),
             || NOW,
         );
 
         let response = open_and_roundtrip(&router).await.unwrap();
 
         assert_eq!(response, b"IP:hello");
+    }
+
+    #[derive(Clone)]
+    struct RecordingIpTunnelRouter {
+        seen: Arc<Mutex<Option<RelayStreamIpTunnelTarget>>>,
+    }
+
+    impl RelayStreamIpTunnelRouter for RecordingIpTunnelRouter {
+        async fn open_ip_tunnel(
+            &self,
+            target: RelayStreamIpTunnelTarget,
+        ) -> Result<TargetSession, DataTunnelError> {
+            *self.seen.lock().unwrap() = Some(target);
+            Err(target_unavailable("recording-iptunnel-router"))
+        }
+    }
+
+    #[tokio::test]
+    async fn relay_stream_target_router_iptunnel_passes_group_context_to_backend() {
+        let seen = Arc::new(Mutex::new(None));
+        let router = RelayStreamOfferTargetRouter::new_with_ip_tunnel_router(
+            group_iptunnel_offer(),
+            group_trust(group_projection(true, true, true)),
+            empty_slots(),
+            TcpStreamRouter::new("127.0.0.1:1"),
+            TcpStreamRouter::new("127.0.0.1:1"),
+            RecordingIpTunnelRouter {
+                seen: Arc::clone(&seen),
+            },
+            || NOW,
+        );
+
+        let error = open_error(&router).await;
+
+        assert!(
+            matches!(error, DataTunnelError::TargetUnavailable(reason) if reason == "recording-iptunnel-router")
+        );
+        let target = seen.lock().unwrap().clone().expect("backend saw context");
+        assert_eq!(target.group_id(), "g");
+        assert_eq!(target.member_id(), "g_a");
+        assert_eq!(target.member_device_pub(), &guest().public());
+        assert_eq!(target.claw_id(), CLAW_ID);
     }
 
     #[test]
@@ -810,7 +999,7 @@ mod tests {
             consumed_slots(),
             TcpStreamRouter::new("127.0.0.1:1"),
             TcpStreamRouter::new("127.0.0.1:1"),
-            TcpStreamRouter::new(ip_addr),
+            AckIpTunnelRouter::new(ip_addr),
             || NOW,
         );
 
@@ -834,7 +1023,7 @@ mod tests {
             empty_slots(),
             TcpStreamRouter::new("127.0.0.1:1"),
             TcpStreamRouter::new("127.0.0.1:1"),
-            TcpStreamRouter::new(ip_addr),
+            AckIpTunnelRouter::new(ip_addr),
             || NOW,
         );
 

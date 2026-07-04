@@ -59,6 +59,7 @@ pub mod claw_vpn_packet_pump;
 pub mod claw_vpn_relay_stream;
 pub mod claw_vpn_runtime;
 pub mod claw_vpn_t1_caller;
+pub mod claw_vpn_t1_relay_stream_router;
 pub mod claw_vpn_target_session_relay;
 pub mod claw_vpn_target_session_router;
 pub mod claw_vpn_target_session_runtime;
