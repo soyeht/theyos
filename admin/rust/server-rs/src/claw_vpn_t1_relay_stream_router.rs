@@ -23,7 +23,7 @@ use std::os::unix::net::UnixStream as StdUnixStream;
 use std::path::{Component, Path, PathBuf};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{SyncSender, TrySendError, sync_channel};
+use std::sync::mpsc::{Receiver, SyncSender, TrySendError, sync_channel};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use std::thread;
@@ -111,32 +111,39 @@ fn claw_vpn_t1_spooled_jsonl_audit_sink_with_capacity(
     })?;
     let parent_dir =
         ensure_claw_vpn_t1_audit_parent(parent).map_err(ClawVpnT1AuditSinkError::CreateDir)?;
-    let mut file = open_claw_vpn_t1_audit_log_file(&parent_dir, &path)
+    let file = open_claw_vpn_t1_audit_log_file(&parent_dir, &path)
         .map_err(ClawVpnT1AuditSinkError::OpenFile)?;
     let (sender, receiver) = sync_channel(capacity);
     let healthy = Arc::new(AtomicBool::new(true));
     let worker_healthy = Arc::clone(&healthy);
 
-    thread::Builder::new()
-        .name("claw-vpn-t1-audit-jsonl".to_string())
-        .spawn(move || {
-            while let Ok(event) = receiver.recv() {
-                let line = claw_vpn_t1_redacted_audit_jsonl(&event);
-                if file
-                    .write_all(line.as_bytes())
-                    .and_then(|()| file.flush())
-                    .is_err()
-                {
-                    worker_healthy.store(false, Ordering::SeqCst);
-                    break;
-                }
-            }
-        })
+    spawn_claw_vpn_t1_audit_worker(file, receiver, worker_healthy)
+        .map(|_handle| ())
         .map_err(ClawVpnT1AuditSinkError::SpawnWorker)?;
 
     Ok(Box::new(move |event| {
         claw_vpn_t1_try_enqueue_audit_event(&sender, &healthy, event)
     }))
+}
+
+fn spawn_claw_vpn_t1_audit_worker<W>(
+    mut writer: W,
+    receiver: Receiver<ClawVpnAuditEvent>,
+    worker_healthy: Arc<AtomicBool>,
+) -> io::Result<thread::JoinHandle<()>>
+where
+    W: ClawVpnT1AuditLogWriter + Send + 'static,
+{
+    thread::Builder::new()
+        .name("claw-vpn-t1-audit-jsonl".to_string())
+        .spawn(move || {
+            while let Ok(event) = receiver.recv() {
+                if claw_vpn_t1_write_audit_event(&mut writer, &event).is_err() {
+                    worker_healthy.store(false, Ordering::SeqCst);
+                    break;
+                }
+            }
+        })
 }
 
 fn ensure_claw_vpn_t1_audit_parent(parent: &Path) -> io::Result<File> {
@@ -334,6 +341,26 @@ fn claw_vpn_t1_try_enqueue_audit_event(
         Err(TrySendError::Full(_)) => Err("claw-vpn-t1-audit-sink-full"),
         Err(TrySendError::Disconnected(_)) => Err("claw-vpn-t1-audit-sink-unavailable"),
     }
+}
+
+trait ClawVpnT1AuditLogWriter: Write {
+    fn sync_audit_data(&mut self) -> io::Result<()>;
+}
+
+impl ClawVpnT1AuditLogWriter for File {
+    fn sync_audit_data(&mut self) -> io::Result<()> {
+        self.sync_data()
+    }
+}
+
+fn claw_vpn_t1_write_audit_event<W>(writer: &mut W, event: &ClawVpnAuditEvent) -> io::Result<()>
+where
+    W: ClawVpnT1AuditLogWriter,
+{
+    let line = claw_vpn_t1_redacted_audit_jsonl(event);
+    writer.write_all(line.as_bytes())?;
+    writer.flush()?;
+    writer.sync_audit_data()
 }
 
 fn claw_vpn_t1_redacted_audit_jsonl(event: &ClawVpnAuditEvent) -> String {
@@ -875,6 +902,55 @@ mod tests {
         std::fs::read_to_string(path).unwrap_or_default()
     }
 
+    fn t1_open_audit_event_for_test() -> ClawVpnAuditEvent {
+        let key = ClawVpnAclKey::try_new(
+            "member-alpha".to_string(),
+            P256Keypair::generate().public(),
+            "claw-alpha".to_string(),
+        )
+        .unwrap();
+        let mut acl = ClawVpnAcl::new();
+        acl.grant(key.clone());
+        let registry =
+            ClawVpnSessionRegistry::with_limits(acl, live_config().ipv4_pool(), 1, 1).unwrap();
+        let mut core = ClawVpnAgentCore::new(ClawVpnDatapathSide::Claw, registry);
+        core.open_with_audit(&key).1
+    }
+
+    #[derive(Default)]
+    struct FakeAuditWriterState {
+        body: Vec<u8>,
+        flush_count: usize,
+        sync_count: usize,
+    }
+
+    struct FakeAuditWriter {
+        state: Arc<Mutex<FakeAuditWriterState>>,
+        fail_sync: bool,
+    }
+
+    impl Write for FakeAuditWriter {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.state.lock().unwrap().body.extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            self.state.lock().unwrap().flush_count += 1;
+            Ok(())
+        }
+    }
+
+    impl ClawVpnT1AuditLogWriter for FakeAuditWriter {
+        fn sync_audit_data(&mut self) -> io::Result<()> {
+            self.state.lock().unwrap().sync_count += 1;
+            if self.fail_sync {
+                return Err(io::Error::other("sync failed"));
+            }
+            Ok(())
+        }
+    }
+
     #[tokio::test]
     async fn t1_spooled_audit_sink_writes_redacted_jsonl_without_raw_target_ids() {
         let build_count = Arc::new(AtomicUsize::new(0));
@@ -924,6 +1000,40 @@ mod tests {
         assert!(!body.contains("claw-alpha"));
         assert_eq!(build_count.load(Ordering::SeqCst), 1);
         assert_eq!(launch_count.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn t1_spooled_audit_sink_rejects_after_sync_data_failure() {
+        let (sender, receiver) = sync_channel(1);
+        let healthy = Arc::new(AtomicBool::new(true));
+        let state = Arc::new(Mutex::new(FakeAuditWriterState::default()));
+        let handle = spawn_claw_vpn_t1_audit_worker(
+            FakeAuditWriter {
+                state: Arc::clone(&state),
+                fail_sync: true,
+            },
+            receiver,
+            Arc::clone(&healthy),
+        )
+        .unwrap();
+
+        claw_vpn_t1_try_enqueue_audit_event(&sender, &healthy, t1_open_audit_event_for_test())
+            .unwrap();
+        handle.join().unwrap();
+
+        assert!(!healthy.load(Ordering::SeqCst));
+        {
+            let state = state.lock().unwrap();
+            let body = String::from_utf8_lossy(&state.body);
+            assert!(body.contains("\"schema\":\"claw_vpn_t1_audit_v1\""));
+            assert!(body.contains("\"reason\":\"SessionOpened\""));
+            assert_eq!(state.flush_count, 1);
+            assert_eq!(state.sync_count, 1);
+        }
+        assert_eq!(
+            claw_vpn_t1_try_enqueue_audit_event(&sender, &healthy, t1_open_audit_event_for_test()),
+            Err("claw-vpn-t1-audit-sink-unavailable")
+        );
     }
 
     #[test]
