@@ -10,12 +10,18 @@
 
 use std::collections::HashMap;
 use std::fmt;
+use std::fs::OpenOptions;
 use std::io;
+use std::io::Write;
 use std::marker::PhantomData;
 use std::os::unix::net::UnixStream as StdUnixStream;
+use std::path::PathBuf;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{SyncSender, TrySendError, sync_channel};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
+use std::thread;
 use std::time::Duration;
 
 use household_rs::claw_share_data_tunnel::{DataTunnelError, TargetSession};
@@ -62,11 +68,104 @@ pub type ClawVpnT1RelayStreamLaunchRuntime<I> = Box<
 >;
 pub type ClawVpnT1RelayStreamAuditSink =
     Box<dyn Fn(ClawVpnAuditEvent) -> Result<(), &'static str> + Send + Sync>;
+pub const CLAW_VPN_T1_AUDIT_SINK_QUEUE_CAPACITY: usize = 128;
 pub type ClawVpnT1RelayStreamBoxedRouter<I> = ClawVpnT1RelayStreamIpTunnelRouter<
     I,
     ClawVpnT1RelayStreamBuildInputs<I>,
     ClawVpnT1RelayStreamLaunchRuntime<I>,
 >;
+
+#[derive(Debug, thiserror::Error)]
+pub enum ClawVpnT1AuditSinkError {
+    #[error("claw vpn t1 audit sink parent directory unavailable")]
+    CreateDir(#[source] io::Error),
+
+    #[error("claw vpn t1 audit sink file unavailable")]
+    OpenFile(#[source] io::Error),
+
+    #[error("claw vpn t1 audit sink worker unavailable")]
+    SpawnWorker(#[source] io::Error),
+}
+
+pub fn claw_vpn_t1_spooled_jsonl_audit_sink(
+    path: impl Into<PathBuf>,
+) -> Result<ClawVpnT1RelayStreamAuditSink, ClawVpnT1AuditSinkError> {
+    claw_vpn_t1_spooled_jsonl_audit_sink_with_capacity(path, CLAW_VPN_T1_AUDIT_SINK_QUEUE_CAPACITY)
+}
+
+fn claw_vpn_t1_spooled_jsonl_audit_sink_with_capacity(
+    path: impl Into<PathBuf>,
+    capacity: usize,
+) -> Result<ClawVpnT1RelayStreamAuditSink, ClawVpnT1AuditSinkError> {
+    let path = path.into();
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(ClawVpnT1AuditSinkError::CreateDir)?;
+    }
+    let mut file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .map_err(ClawVpnT1AuditSinkError::OpenFile)?;
+    let (sender, receiver) = sync_channel(capacity);
+    let healthy = Arc::new(AtomicBool::new(true));
+    let worker_healthy = Arc::clone(&healthy);
+
+    thread::Builder::new()
+        .name("claw-vpn-t1-audit-jsonl".to_string())
+        .spawn(move || {
+            while let Ok(event) = receiver.recv() {
+                let line = claw_vpn_t1_redacted_audit_jsonl(&event);
+                if file
+                    .write_all(line.as_bytes())
+                    .and_then(|()| file.flush())
+                    .is_err()
+                {
+                    worker_healthy.store(false, Ordering::SeqCst);
+                    break;
+                }
+            }
+        })
+        .map_err(ClawVpnT1AuditSinkError::SpawnWorker)?;
+
+    Ok(Box::new(move |event| {
+        claw_vpn_t1_try_enqueue_audit_event(&sender, &healthy, event)
+    }))
+}
+
+fn claw_vpn_t1_try_enqueue_audit_event(
+    sender: &SyncSender<ClawVpnAuditEvent>,
+    healthy: &AtomicBool,
+    event: ClawVpnAuditEvent,
+) -> Result<(), &'static str> {
+    if !healthy.load(Ordering::SeqCst) {
+        return Err("claw-vpn-t1-audit-sink-unavailable");
+    }
+    match sender.try_send(event) {
+        Ok(()) => Ok(()),
+        Err(TrySendError::Full(_)) => Err("claw-vpn-t1-audit-sink-full"),
+        Err(TrySendError::Disconnected(_)) => Err("claw-vpn-t1-audit-sink-unavailable"),
+    }
+}
+
+fn claw_vpn_t1_redacted_audit_jsonl(event: &ClawVpnAuditEvent) -> String {
+    let subject = event.subject().map(|subject| {
+        serde_json::json!({
+            "member_id_hash": hex::encode(subject.member_id_hash()),
+            "device_pub_hash": hex::encode(subject.device_pub_hash()),
+            "claw_id_hash": hex::encode(subject.claw_id_hash()),
+        })
+    });
+    let line = serde_json::json!({
+        "schema": "claw_vpn_t1_audit_v1",
+        "subject": subject,
+        "action": format!("{:?}", event.action()),
+        "reason": format!("{:?}", event.reason()),
+        "session_id_present": event.session_id().is_some(),
+        "byte_count": event.byte_count(),
+        "closed_session_count": event.closed_session_count(),
+    });
+    format!("{line}\n")
+}
 
 pub struct ClawVpnT1RelayStreamRouterParts<I, BuildInputs, LaunchRuntime> {
     runtime_config: ClawVpnRuntimeWiringConfig,
@@ -573,6 +672,145 @@ mod tests {
             events.lock().unwrap().push(event);
             Ok(())
         })
+    }
+
+    fn read_audit_file_until(path: &std::path::Path, needle: &str) -> String {
+        for _ in 0..100 {
+            if let Ok(body) = std::fs::read_to_string(path) {
+                if body.contains(needle) {
+                    return body;
+                }
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        std::fs::read_to_string(path).unwrap_or_default()
+    }
+
+    #[tokio::test]
+    async fn t1_spooled_audit_sink_writes_redacted_jsonl_without_raw_target_ids() {
+        let build_count = Arc::new(AtomicUsize::new(0));
+        let launch_count = Arc::new(AtomicUsize::new(0));
+        let dir = tempfile::tempdir().unwrap();
+        let audit_path = dir.path().join("audit").join("t1.jsonl");
+        let router = ClawVpnT1RelayStreamIpTunnelRouter::<FakeInterface, _, _>::new(
+            live_config(),
+            enabled_runtime_config(),
+            Duration::from_secs(1),
+            {
+                let build_count = Arc::clone(&build_count);
+                move |
+                    _config: &ClawVpnDevConfig,
+                    _target: &RelayStreamIpTunnelTarget,
+                    _context: ClawVpnRuntimeWiringContext,
+                    relay: ClawVpnRelayStream<StdUnixStream>,
+                | -> io::Result<ClawVpnT1RelayStreamWiringInputs<FakeInterface>> {
+                    build_count.fetch_add(1, Ordering::SeqCst);
+                    Ok(inputs(FakeInterface::empty(), relay))
+                }
+            },
+            {
+                let launch_count = Arc::clone(&launch_count);
+                move |_wiring: ClawVpnTargetSessionRouterWiring<FakeInterface>| {
+                    launch_count.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                }
+            },
+            claw_vpn_t1_spooled_jsonl_audit_sink(&audit_path).unwrap(),
+        );
+
+        let _session = router
+            .open_ip_tunnel(target("member-alpha", "claw-alpha"))
+            .await
+            .unwrap();
+
+        let body = read_audit_file_until(&audit_path, "SessionOpened");
+        assert!(body.contains("\"schema\":\"claw_vpn_t1_audit_v1\""));
+        assert!(body.contains("\"action\":\"SessionOpen\""));
+        assert!(body.contains("\"reason\":\"SessionOpened\""));
+        assert!(body.contains("\"session_id_present\":true"));
+        assert!(body.contains("member_id_hash"));
+        assert!(body.contains("device_pub_hash"));
+        assert!(body.contains("claw_id_hash"));
+        assert!(!body.contains("member-alpha"));
+        assert!(!body.contains("claw-alpha"));
+        assert_eq!(build_count.load(Ordering::SeqCst), 1);
+        assert_eq!(launch_count.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn t1_spooled_audit_sink_rejects_directory_as_log_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let error = match claw_vpn_t1_spooled_jsonl_audit_sink(dir.path()) {
+            Ok(_) => panic!("directory path must not create an audit sink"),
+            Err(error) => error,
+        };
+
+        assert!(matches!(error, ClawVpnT1AuditSinkError::OpenFile(_)));
+    }
+
+    #[tokio::test]
+    async fn t1_spooled_audit_sink_rejects_disconnected_worker_at_event_time() {
+        let build_count = Arc::new(AtomicUsize::new(0));
+        let launch_count = Arc::new(AtomicUsize::new(0));
+        let captured_event = Arc::new(Mutex::new(None));
+        let router = ClawVpnT1RelayStreamIpTunnelRouter::<FakeInterface, _, _>::new(
+            live_config(),
+            enabled_runtime_config(),
+            Duration::from_secs(1),
+            {
+                let build_count = Arc::clone(&build_count);
+                move |
+                    _config: &ClawVpnDevConfig,
+                    _target: &RelayStreamIpTunnelTarget,
+                    _context: ClawVpnRuntimeWiringContext,
+                    relay: ClawVpnRelayStream<StdUnixStream>,
+                | -> io::Result<ClawVpnT1RelayStreamWiringInputs<FakeInterface>> {
+                    build_count.fetch_add(1, Ordering::SeqCst);
+                    Ok(inputs(FakeInterface::empty(), relay))
+                }
+            },
+            {
+                let launch_count = Arc::clone(&launch_count);
+                move |_wiring: ClawVpnTargetSessionRouterWiring<FakeInterface>| {
+                    launch_count.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                }
+            },
+            {
+                let captured_event = Arc::clone(&captured_event);
+                Box::new(move |event: ClawVpnAuditEvent| {
+                    *captured_event.lock().unwrap() = Some(event);
+                    Err("claw-vpn-t1-audit-open-failed")
+                })
+            },
+        );
+
+        let error = match router
+            .open_ip_tunnel(target("member-alpha", "claw-alpha"))
+            .await
+        {
+            Ok(_) => panic!("audit sink failure must fail before returning a target session"),
+            Err(error) => error,
+        };
+
+        assert!(
+            matches!(error, DataTunnelError::TargetUnavailable(reason) if reason == "claw-vpn-t1-audit-open-failed")
+        );
+        assert_eq!(build_count.load(Ordering::SeqCst), 0);
+        assert_eq!(launch_count.load(Ordering::SeqCst), 0);
+        let event = captured_event
+            .lock()
+            .unwrap()
+            .take()
+            .expect("audit sink must receive the open event before rejecting");
+        let (sender, receiver) = sync_channel(1);
+        drop(receiver);
+        let healthy = AtomicBool::new(true);
+
+        assert_eq!(
+            claw_vpn_t1_try_enqueue_audit_event(&sender, &healthy, event),
+            Err("claw-vpn-t1-audit-sink-unavailable")
+        );
     }
 
     #[tokio::test]

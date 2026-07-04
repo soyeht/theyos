@@ -223,10 +223,11 @@ The wiring PR that follows this runbook must show, before merge:
   failure must fail closed before runtime inputs are built, the launcher runs,
   or a target session is returned; if that reject path closes the in-memory
   session, the rollback `SessionClose` event must also be routed through the
-  sink on a best-effort basis. The current default-off mount may keep a
-  placeholder sink only while missing preflight makes it unreachable, and a live
-  activation slice must replace it with reviewed persistence and retention
-  policy for the exact artifact SHA;
+  sink on a best-effort basis. The T1 router module may provide reviewed audit
+  sink helpers, but the current default-off mount may keep a placeholder sink
+  only while missing preflight makes it unreachable, and a live activation slice
+  must replace it with reviewed persistence, durability, and retention policy
+  for the exact artifact SHA;
 - no raw `TunnelFrame`, packet bytes, interface name, file descriptor, local
   path, or peer address is logged through Debug or error formatting;
 - tests prove route cleanup runs after pump stop/error and that failure returns
