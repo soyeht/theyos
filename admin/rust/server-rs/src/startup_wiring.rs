@@ -20,6 +20,7 @@ pub enum PerClawVpnStartupStatus {
     OwnerAuthorizationRequired { mode: ClawVpnDevMode },
     RollbackRequired { mode: ClawVpnDevMode },
     HardwareEvidenceRequired { mode: ClawVpnDevMode },
+    UnsupportedMode { mode: ClawVpnDevMode },
     PreflightEvidencePresent { mode: ClawVpnDevMode },
     InvalidConfig,
 }
@@ -160,6 +161,14 @@ where
                     "per-Claw VPN owner authorization and rollback are present; live wiring remains blocked pending T1-T4 hardware evidence"
                 );
                 return PerClawVpnStartupStatus::HardwareEvidenceRequired { mode };
+            }
+            if mode != ClawVpnDevMode::Live {
+                tracing::warn!(
+                    stage = "claw_vpn.startup.unsupported_mode",
+                    mode = ?mode,
+                    "per-Claw VPN T1 preflight evidence is present for a non-live mode; startup gate does not activate live wiring"
+                );
+                return PerClawVpnStartupStatus::UnsupportedMode { mode };
             }
             tracing::warn!(
                 stage = "claw_vpn.startup.preflight_evidence_present",
@@ -378,6 +387,32 @@ mod tests {
             status,
             PerClawVpnStartupStatus::PreflightEvidencePresent {
                 mode: ClawVpnDevMode::Live
+            }
+        );
+    }
+
+    #[test]
+    fn per_claw_vpn_startup_gate_rejects_dial_mode_after_preflight() {
+        let config = ClawVpnDevConfig::from_values(
+            None,
+            Some("1"),
+            Some("relay-stream://127.0.0.1:49152"),
+            Some("198.18.0.0/24"),
+            None,
+            None,
+        )
+        .unwrap()
+        .unwrap();
+
+        let status = per_claw_vpn_startup_gate_with_preflight(
+            || Ok(Some(config)),
+            || PerClawVpnT1PreflightEvidence::new(true, true, true),
+        );
+
+        assert_eq!(
+            status,
+            PerClawVpnStartupStatus::UnsupportedMode {
+                mode: ClawVpnDevMode::Dial
             }
         );
     }

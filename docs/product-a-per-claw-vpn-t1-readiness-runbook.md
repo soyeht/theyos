@@ -69,6 +69,9 @@ new SHA.
 The startup preflight status is only a classifier for these gates. A
 `PreflightEvidencePresent` status means the caller supplied evidence for review;
 it is not owner authorization by itself and it does not run the T1 datapath.
+The startup classifier is target-side only: client-side `Dial` mode must report
+an unsupported mode instead of `PreflightEvidencePresent`, even when all
+preflight booleans are true.
 
 ## Rollback Plan
 
