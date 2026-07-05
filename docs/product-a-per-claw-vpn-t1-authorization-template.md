@@ -35,8 +35,9 @@ new artifact.
 Fill this JSON only after the owner authorization, rollback artifact, hardware
 evidence, and audit export policy references below exist for the same exact
 artifact SHA. This record is input for the reviewed T1 evidence loader; it is
-not authorization by itself and it must not be wired into the mount until the
-activation PR reviews the caller and source-guard changes.
+not authorization by itself. Any mount wiring that consumes it remains gated by
+the activation PR review of the caller, source-guard changes, and this record's
+real referenced contents before merge or live use.
 
 Keep the real `audit_root` value in the private activation record or secret
 store. Public PR text may identify it only by neutral alias/reference. The
