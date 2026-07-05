@@ -8,6 +8,7 @@ import json
 import os
 import stat
 import sys
+import tempfile
 from pathlib import Path
 
 
@@ -15,6 +16,14 @@ SCHEMA = "per_claw_vpn_t1_preflight_evidence_v1"
 SCOPE = "dev-host T1-T4 only"
 DEFAULT_RECORD = ".env.t1-preflight-evidence.json"
 DEFAULT_AUDIT_ROOT = ".run/t1-audit-root"
+
+
+def is_full_git_sha(value: object) -> bool:
+    return (
+        isinstance(value, str)
+        and len(value) == 40
+        and all(byte in "0123456789abcdefABCDEF" for byte in value)
+    )
 
 
 def is_template_placeholder(value: object) -> bool:
@@ -45,9 +54,22 @@ def canonical_private_audit_root(path: str) -> str:
 
 def write_private_record(path: str, record: dict[str, object]) -> None:
     output = Path(path)
-    with output.open("w", encoding="utf-8") as handle:
-        json.dump(record, handle, indent=2)
-        handle.write("\n")
+    if output.exists():
+        os.chmod(output, 0o600)
+
+    fd, temp_name = tempfile.mkstemp(prefix=f".{output.name}.tmp-", dir=output.parent)
+    temp_output = Path(temp_name)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(record, handle, indent=2)
+            handle.write("\n")
+        os.replace(temp_output, output)
+    except BaseException:
+        try:
+            os.unlink(temp_output)
+        except OSError:
+            pass
+        raise
     os.chmod(output, 0o600)
 
 
@@ -86,6 +108,10 @@ def main() -> int:
     parser.add_argument("--rollback-ref", help="private rollback artifact reference")
     parser.add_argument("--hardware-ref", help="private T1-T4 hardware evidence reference")
     args = parser.parse_args()
+
+    if not is_full_git_sha(args.artifact_sha):
+        print("ERROR: artifact_sha must be 40 hex characters", file=sys.stderr)
+        return 1
 
     existing = load_existing_record(args.record)
     owner_ref = select_private_ref(args.owner_ref, existing.get("owner_authorization_ref"))

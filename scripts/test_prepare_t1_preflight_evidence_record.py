@@ -72,6 +72,7 @@ class PrepareT1PreflightEvidenceRecordTests(unittest.TestCase):
             self.assertEqual(os.path.realpath(audit_root), record["audit_root"])
             self.assertEqual(0o600, stat.S_IMODE(os.lstat(record_path).st_mode))
             self.assertEqual(0o700, stat.S_IMODE(os.lstat(audit_root).st_mode))
+            self.assertEqual([], list(tmpdir.glob(".private-evidence.json.tmp-*")))
 
     def test_complete_private_refs_validate_with_root_check(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -154,6 +155,49 @@ class PrepareT1PreflightEvidenceRecordTests(unittest.TestCase):
             combined_output = proc.stdout + proc.stderr
             for private_value in private_values:
                 self.assertNotIn(private_value, combined_output)
+
+    def test_invalid_artifact_sha_fails_before_writing_private_files(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmpdir = Path(tmp)
+            record_path = tmpdir / "private-evidence.json"
+            audit_root = tmpdir / "audit-root"
+            proc = subprocess.run(
+                [
+                    sys.executable,
+                    str(SCRIPT),
+                    "not-a-sha",
+                    "--record",
+                    str(record_path),
+                    "--audit-root",
+                    str(audit_root),
+                ],
+                check=False,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+
+            self.assertEqual(1, proc.returncode)
+            self.assertEqual("", proc.stdout)
+            self.assertIn("ERROR: artifact_sha must be 40 hex characters", proc.stderr)
+            self.assertFalse(record_path.exists())
+            self.assertFalse(audit_root.exists())
+            self.assertNotIn(str(record_path), proc.stderr)
+            self.assertNotIn(str(audit_root), proc.stderr)
+
+    def test_restricts_existing_record_before_atomic_replace(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmpdir = Path(tmp)
+            record_path = tmpdir / "private-evidence.json"
+            audit_root = tmpdir / "audit-root"
+            record_path.write_text("stale", encoding="utf-8")
+            os.chmod(record_path, 0o644)
+
+            proc = self.run_prepare("--record", str(record_path), "--audit-root", str(audit_root))
+
+            self.assertEqual(0, proc.returncode, proc.stderr)
+            self.assertEqual(0o600, stat.S_IMODE(os.lstat(record_path).st_mode))
+            self.assertEqual([], list(tmpdir.glob(".private-evidence.json.tmp-*")))
 
 
 if __name__ == "__main__":
