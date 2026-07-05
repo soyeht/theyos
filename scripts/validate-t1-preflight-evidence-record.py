@@ -38,6 +38,11 @@ def has_only_root_and_normal_components(path: str) -> bool:
     return all(part not in ("", ".", "..") for part in pure.parts[1:])
 
 
+def is_template_placeholder(value: str) -> bool:
+    stripped = value.strip()
+    return stripped.startswith("<") and stripped.endswith(">")
+
+
 def validate_root_dir(path: str) -> list[str]:
     errors: list[str] = []
     if os.path.realpath(path) != os.path.abspath(path):
@@ -85,6 +90,8 @@ def validate_record(record: object, expected_sha: str, check_root_dir: bool) -> 
         value = record.get(field)
         if not isinstance(value, str) or not value.strip():
             errors.append(f"{field} must be a non-empty string")
+        elif is_template_placeholder(value):
+            errors.append(f"{field} must not be a template placeholder")
 
     audit_root = record.get("audit_root")
     if not isinstance(audit_root, str) or not has_only_root_and_normal_components(audit_root):

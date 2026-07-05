@@ -67,6 +67,9 @@ class ValidateT1PreflightEvidenceRecordTests(unittest.TestCase):
             ("owner_authorization_ref", " ", "owner_authorization_ref must be a non-empty string"),
             ("rollback_ref", "", "rollback_ref must be a non-empty string"),
             ("hardware_evidence_ref", None, "hardware_evidence_ref must be a non-empty string"),
+            ("owner_authorization_ref", "<owner-authorization-record-ref>", "owner_authorization_ref must not be a template placeholder"),
+            ("rollback_ref", " <prebuilt-rollback-artifact-ref> ", "rollback_ref must not be a template placeholder"),
+            ("hardware_evidence_ref", "<sanitized-t1-t4-evidence-pack-ref>", "hardware_evidence_ref must not be a template placeholder"),
         )
         for field, value, expected_error in cases:
             with self.subTest(field=field):
