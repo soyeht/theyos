@@ -146,20 +146,22 @@ a target session is returned, and the rollback `SessionClose` event is routed
 through the same sink on that reject path. The T1 router module now includes a
 reviewed spooled JSONL audit sink helper that writes only typed, redacted audit
 fields, forces owner-only log-file permissions, flushes and `sync_data`s each
-accepted event in its worker, and rejects when its bounded queue or worker is
-unavailable. The helper walks and creates parent components with fd-relative
-`openat`/`mkdirat`, rejects parent/intermediate symlinks and `..` components,
-opens the log file relative to the validated parent fd with `O_NOFOLLOW`, and
-creates or requires a real, current-user-owned, mode `0700` final parent
-directory for the log file. It remains a helper for the future activation
-slice, not the mounted sink. The source guard
+accepted event in its worker, rotates the active log before writing a record
+that would exceed the reviewed byte cap, retains a bounded number of rotated
+files, and rejects when its bounded queue or worker is unavailable. The helper
+walks and creates parent components with fd-relative `openat`/`mkdirat`,
+rejects parent/intermediate symlinks and `..` components, opens the log file
+relative to the validated parent fd with `O_NOFOLLOW`, and creates or requires
+a real, current-user-owned, mode `0700` final parent directory for the log
+file. It remains a helper for the future activation slice, not the mounted
+sink. The source guard
 tripwires that helper, its error type, and its queue capacity outside the T1
 router module so future wiring into the mount reopens review. The current
 default-off mount supplies only a placeholder sink behind missing preflight, so
 a future activation slice must replace that placeholder with reviewed
-persistence policy, retention policy, and safe path selection for the exact
-artifact SHA, including a fixed owner-controlled location and the chosen
-best-effort-vs-durable crash semantics. The mount now
+persistence policy and safe path selection for the exact artifact SHA,
+including a fixed owner-controlled location, the chosen retention/rotation
+limits, and the chosen best-effort-vs-durable crash semantics. The mount now
 injects that backend through the same T1 caller gate, but the production path
 still supplies
 `PerClawVpnT1PreflightEvidence::missing`, so even with the T1 dev env present it
@@ -526,15 +528,17 @@ Access between members/devices and claws is explicitly many-to-many:
   not live audit persistence. A reviewed spooled JSONL helper exists in the T1
   router module for the activation slice; it writes redacted JSONL, forces
   owner-only log-file permissions, flushes and `sync_data`s each accepted event
-  in its worker, walks parent components with fd-relative `openat`/`mkdirat`,
-  rejects parent/intermediate symlinks and `..` components, opens the log file
-  relative to the validated parent fd with `O_NOFOLLOW`, and creates or
-  requires a real current-user-owned `0700` final parent directory. The
+  in its worker, rotates before writing a record that would exceed the reviewed
+  byte cap, retains a bounded number of rotated files, walks parent components
+  with fd-relative `openat`/`mkdirat`, rejects parent/intermediate symlinks and
+  `..` components, opens the log file relative to the validated parent fd with
+  `O_NOFOLLOW`, and creates or requires a real current-user-owned `0700` final
+  parent directory. The
   source guard tripwires that helper
   outside the T1 router module, but it is not wired into the mount until that
-  exact SHA-bound live-run review; fixed safe path location, retention, and
-  the final best-effort-vs-durable crash semantics still belong to that
-  activation review. The
+  exact SHA-bound live-run review; fixed safe path location, final
+  retention/rotation limits, and the final best-effort-vs-durable crash
+  semantics still belong to that activation review. The
   environment-backed mount still supplies missing preflight
   evidence, so `Disabled`/invalid/missing-preflight/`Dial` paths all fall back
   to the unavailable `IpTunnel` router before building runtime inputs, opening

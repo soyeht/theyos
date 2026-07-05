@@ -74,6 +74,8 @@ pub type ClawVpnT1RelayStreamLaunchRuntime<I> = Box<
 pub type ClawVpnT1RelayStreamAuditSink =
     Box<dyn Fn(ClawVpnAuditEvent) -> Result<(), &'static str> + Send + Sync>;
 pub const CLAW_VPN_T1_AUDIT_SINK_QUEUE_CAPACITY: usize = 128;
+pub const CLAW_VPN_T1_AUDIT_LOG_ROTATE_BYTES: u64 = 1_048_576;
+pub const CLAW_VPN_T1_AUDIT_LOG_RETAINED_FILES: usize = 4;
 pub type ClawVpnT1RelayStreamBoxedRouter<I> = ClawVpnT1RelayStreamIpTunnelRouter<
     I,
     ClawVpnT1RelayStreamBuildInputs<I>,
@@ -102,6 +104,26 @@ fn claw_vpn_t1_spooled_jsonl_audit_sink_with_capacity(
     path: impl Into<PathBuf>,
     capacity: usize,
 ) -> Result<ClawVpnT1RelayStreamAuditSink, ClawVpnT1AuditSinkError> {
+    claw_vpn_t1_spooled_jsonl_audit_sink_with_capacity_and_rotation(
+        path,
+        capacity,
+        CLAW_VPN_T1_AUDIT_LOG_ROTATE_BYTES,
+        CLAW_VPN_T1_AUDIT_LOG_RETAINED_FILES,
+    )
+}
+
+fn claw_vpn_t1_spooled_jsonl_audit_sink_with_capacity_and_rotation(
+    path: impl Into<PathBuf>,
+    capacity: usize,
+    rotate_bytes: u64,
+    retained_files: usize,
+) -> Result<ClawVpnT1RelayStreamAuditSink, ClawVpnT1AuditSinkError> {
+    if rotate_bytes == 0 {
+        return Err(ClawVpnT1AuditSinkError::OpenFile(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "claw vpn t1 audit rotate bytes must be nonzero",
+        )));
+    }
     let path = path.into();
     let parent = path.parent().ok_or_else(|| {
         ClawVpnT1AuditSinkError::OpenFile(io::Error::new(
@@ -111,13 +133,16 @@ fn claw_vpn_t1_spooled_jsonl_audit_sink_with_capacity(
     })?;
     let parent_dir =
         ensure_claw_vpn_t1_audit_parent(parent).map_err(ClawVpnT1AuditSinkError::CreateDir)?;
-    let file = open_claw_vpn_t1_audit_log_file(&parent_dir, &path)
-        .map_err(ClawVpnT1AuditSinkError::OpenFile)?;
+    let file_name =
+        claw_vpn_t1_audit_log_file_name(&path).map_err(ClawVpnT1AuditSinkError::OpenFile)?;
+    let writer =
+        ClawVpnT1RotatingAuditLog::open(parent_dir, file_name, rotate_bytes, retained_files)
+            .map_err(ClawVpnT1AuditSinkError::OpenFile)?;
     let (sender, receiver) = sync_channel(capacity);
     let healthy = Arc::new(AtomicBool::new(true));
     let worker_healthy = Arc::clone(&healthy);
 
-    spawn_claw_vpn_t1_audit_worker(file, receiver, worker_healthy)
+    spawn_claw_vpn_t1_audit_worker(writer, receiver, worker_healthy)
         .map(|_handle| ())
         .map_err(ClawVpnT1AuditSinkError::SpawnWorker)?;
 
@@ -178,17 +203,83 @@ fn ensure_claw_vpn_t1_audit_parent(parent: &Path) -> io::Result<File> {
     Ok(current)
 }
 
-fn open_claw_vpn_t1_audit_log_file(parent_dir: &File, path: &Path) -> io::Result<File> {
+fn claw_vpn_t1_audit_log_file_name(path: &Path) -> io::Result<CString> {
     let file_name = path.file_name().ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::InvalidInput,
             "claw vpn t1 audit path must include a file name",
         )
     })?;
-    let file_name = claw_vpn_t1_path_component_cstring(file_name)?;
-    let file = open_claw_vpn_t1_audit_file_at(parent_dir.as_raw_fd(), &file_name)?;
+    claw_vpn_t1_path_component_cstring(file_name)
+}
+
+fn open_claw_vpn_t1_audit_log_file(parent_dir: &File, file_name: &CString) -> io::Result<File> {
+    let file = open_claw_vpn_t1_audit_file_at(parent_dir.as_raw_fd(), file_name)?;
     file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
     Ok(file)
+}
+
+struct ClawVpnT1RotatingAuditLog {
+    parent_dir: File,
+    file_name: CString,
+    file: File,
+    current_len: u64,
+    rotate_bytes: u64,
+    retained_files: usize,
+}
+
+impl ClawVpnT1RotatingAuditLog {
+    fn open(
+        parent_dir: File,
+        file_name: CString,
+        rotate_bytes: u64,
+        retained_files: usize,
+    ) -> io::Result<Self> {
+        let file = open_claw_vpn_t1_audit_log_file(&parent_dir, &file_name)?;
+        let current_len = file.metadata()?.len();
+        Ok(Self {
+            parent_dir,
+            file_name,
+            file,
+            current_len,
+            rotate_bytes,
+            retained_files,
+        })
+    }
+
+    fn rotate_before_write_if_needed(&mut self, next_len: u64) -> io::Result<()> {
+        if self.current_len == 0 || self.current_len.saturating_add(next_len) <= self.rotate_bytes {
+            return Ok(());
+        }
+
+        self.file.flush()?;
+        self.file.sync_data()?;
+        rotate_claw_vpn_t1_audit_log_files(
+            self.parent_dir.as_raw_fd(),
+            &self.file_name,
+            self.retained_files,
+        )?;
+        self.file = open_claw_vpn_t1_audit_log_file(&self.parent_dir, &self.file_name)?;
+        self.current_len = 0;
+        Ok(())
+    }
+}
+
+impl ClawVpnT1AuditLogWriter for ClawVpnT1RotatingAuditLog {
+    fn write_audit_record(&mut self, record: &[u8]) -> io::Result<()> {
+        let record_len = record.len() as u64;
+        if record_len > self.rotate_bytes {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "claw vpn t1 audit record exceeds rotate bytes",
+            ));
+        }
+        self.rotate_before_write_if_needed(record_len)?;
+        self.file.write_all(record)?;
+        self.current_len = self.current_len.saturating_add(record_len);
+        self.file.flush()?;
+        self.file.sync_data()
+    }
 }
 
 fn open_claw_vpn_t1_start_dir(parent: &Path) -> io::Result<File> {
@@ -328,6 +419,86 @@ fn claw_vpn_t1_current_euid() -> u32 {
     unsafe { libc::geteuid() as u32 }
 }
 
+fn rotate_claw_vpn_t1_audit_log_files(
+    parent_fd: RawFd,
+    file_name: &CString,
+    retained_files: usize,
+) -> io::Result<()> {
+    if retained_files == 0 {
+        return unlink_claw_vpn_t1_audit_file_if_exists(parent_fd, file_name);
+    }
+
+    let oldest = claw_vpn_t1_rotated_audit_log_file_name(file_name, retained_files)?;
+    unlink_claw_vpn_t1_audit_file_if_exists(parent_fd, &oldest)?;
+    for index in (1..retained_files).rev() {
+        let from = claw_vpn_t1_rotated_audit_log_file_name(file_name, index)?;
+        let to = claw_vpn_t1_rotated_audit_log_file_name(file_name, index + 1)?;
+        rename_claw_vpn_t1_audit_file_if_exists(parent_fd, &from, &to)?;
+    }
+    let first = claw_vpn_t1_rotated_audit_log_file_name(file_name, 1)?;
+    rename_claw_vpn_t1_audit_file(parent_fd, file_name, &first)
+}
+
+fn claw_vpn_t1_rotated_audit_log_file_name(
+    file_name: &CString,
+    index: usize,
+) -> io::Result<CString> {
+    let mut bytes = file_name.as_bytes().to_vec();
+    bytes.push(b'.');
+    bytes.extend_from_slice(index.to_string().as_bytes());
+    CString::new(bytes).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "claw vpn t1 rotated audit file name must not contain nul",
+        )
+    })
+}
+
+fn rename_claw_vpn_t1_audit_file_if_exists(
+    parent_fd: RawFd,
+    from: &CString,
+    to: &CString,
+) -> io::Result<()> {
+    match rename_claw_vpn_t1_audit_file(parent_fd, from, to) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
+#[allow(unsafe_code)]
+fn rename_claw_vpn_t1_audit_file(parent_fd: RawFd, from: &CString, to: &CString) -> io::Result<()> {
+    // SAFETY: from and to are nul-terminated single file names under the same
+    // validated parent fd. renameat does not retain either pointer.
+    let result = unsafe { libc::renameat(parent_fd, from.as_ptr(), parent_fd, to.as_ptr()) };
+    if result < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+fn unlink_claw_vpn_t1_audit_file_if_exists(
+    parent_fd: RawFd,
+    file_name: &CString,
+) -> io::Result<()> {
+    match unlink_claw_vpn_t1_audit_file(parent_fd, file_name) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
+#[allow(unsafe_code)]
+fn unlink_claw_vpn_t1_audit_file(parent_fd: RawFd, file_name: &CString) -> io::Result<()> {
+    // SAFETY: file_name is a nul-terminated single file name under the
+    // validated parent fd. unlinkat does not retain the pointer.
+    let result = unsafe { libc::unlinkat(parent_fd, file_name.as_ptr(), 0) };
+    if result < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
 fn claw_vpn_t1_try_enqueue_audit_event(
     sender: &SyncSender<ClawVpnAuditEvent>,
     healthy: &AtomicBool,
@@ -343,12 +514,14 @@ fn claw_vpn_t1_try_enqueue_audit_event(
     }
 }
 
-trait ClawVpnT1AuditLogWriter: Write {
-    fn sync_audit_data(&mut self) -> io::Result<()>;
+trait ClawVpnT1AuditLogWriter {
+    fn write_audit_record(&mut self, record: &[u8]) -> io::Result<()>;
 }
 
 impl ClawVpnT1AuditLogWriter for File {
-    fn sync_audit_data(&mut self) -> io::Result<()> {
+    fn write_audit_record(&mut self, record: &[u8]) -> io::Result<()> {
+        self.write_all(record)?;
+        self.flush()?;
         self.sync_data()
     }
 }
@@ -358,9 +531,7 @@ where
     W: ClawVpnT1AuditLogWriter,
 {
     let line = claw_vpn_t1_redacted_audit_jsonl(event);
-    writer.write_all(line.as_bytes())?;
-    writer.flush()?;
-    writer.sync_audit_data()
+    writer.write_audit_record(line.as_bytes())
 }
 
 fn claw_vpn_t1_redacted_audit_jsonl(event: &ClawVpnAuditEvent) -> String {
@@ -903,8 +1074,12 @@ mod tests {
     }
 
     fn t1_open_audit_event_for_test() -> ClawVpnAuditEvent {
+        t1_open_audit_event_for_member("member-alpha")
+    }
+
+    fn t1_open_audit_event_for_member(member_id: &str) -> ClawVpnAuditEvent {
         let key = ClawVpnAclKey::try_new(
-            "member-alpha".to_string(),
+            member_id.to_string(),
             P256Keypair::generate().public(),
             "claw-alpha".to_string(),
         )
@@ -929,21 +1104,13 @@ mod tests {
         fail_sync: bool,
     }
 
-    impl Write for FakeAuditWriter {
-        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-            self.state.lock().unwrap().body.extend_from_slice(buf);
-            Ok(buf.len())
-        }
-
-        fn flush(&mut self) -> io::Result<()> {
-            self.state.lock().unwrap().flush_count += 1;
-            Ok(())
-        }
-    }
-
     impl ClawVpnT1AuditLogWriter for FakeAuditWriter {
-        fn sync_audit_data(&mut self) -> io::Result<()> {
-            self.state.lock().unwrap().sync_count += 1;
+        fn write_audit_record(&mut self, record: &[u8]) -> io::Result<()> {
+            let mut state = self.state.lock().unwrap();
+            state.body.extend_from_slice(record);
+            state.flush_count += 1;
+            state.sync_count += 1;
+            drop(state);
             if self.fail_sync {
                 return Err(io::Error::other("sync failed"));
             }
@@ -1000,6 +1167,75 @@ mod tests {
         assert!(!body.contains("claw-alpha"));
         assert_eq!(build_count.load(Ordering::SeqCst), 1);
         assert_eq!(launch_count.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn t1_spooled_audit_sink_rotates_and_retains_bounded_files() {
+        let dir = t1_audit_sink_test_tempdir();
+        let audit_path = dir.path().join("audit").join("audit.jsonl");
+        let first = t1_open_audit_event_for_member("member-rotate-one");
+        let second = t1_open_audit_event_for_member("member-rotate-two");
+        let third = t1_open_audit_event_for_member("member-rotate-three");
+        let first_line = claw_vpn_t1_redacted_audit_jsonl(&first);
+        let second_line = claw_vpn_t1_redacted_audit_jsonl(&second);
+        let third_line = claw_vpn_t1_redacted_audit_jsonl(&third);
+        let rotate_bytes = first_line.len() as u64 + 1;
+        let sink = claw_vpn_t1_spooled_jsonl_audit_sink_with_capacity_and_rotation(
+            &audit_path,
+            8,
+            rotate_bytes,
+            1,
+        )
+        .unwrap();
+
+        sink(first).unwrap();
+        sink(second).unwrap();
+        sink(third).unwrap();
+
+        let active = read_audit_file_until(&audit_path, &third_line);
+        let rotated_path = audit_path.with_file_name("audit.jsonl.1");
+        let rotated = read_audit_file_until(&rotated_path, &second_line);
+
+        assert!(active.contains(&third_line));
+        assert!(rotated.contains(&second_line));
+        assert!(!audit_path.with_file_name("audit.jsonl.2").exists());
+        assert_eq!(
+            std::fs::metadata(&audit_path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert_eq!(
+            std::fs::metadata(&rotated_path)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+    }
+
+    #[test]
+    fn t1_spooled_audit_sink_rejects_record_larger_than_rotate_cap() {
+        let dir = t1_audit_sink_test_tempdir();
+        let audit_path = dir.path().join("audit").join("audit.jsonl");
+        let parent_dir = ensure_claw_vpn_t1_audit_parent(audit_path.parent().unwrap()).unwrap();
+        let file_name = claw_vpn_t1_audit_log_file_name(&audit_path).unwrap();
+        let writer = ClawVpnT1RotatingAuditLog::open(parent_dir, file_name, 1, 1).unwrap();
+        let (sender, receiver) = sync_channel(1);
+        let healthy = Arc::new(AtomicBool::new(true));
+        let handle =
+            spawn_claw_vpn_t1_audit_worker(writer, receiver, Arc::clone(&healthy)).unwrap();
+        let event = t1_open_audit_event_for_test();
+        assert!(claw_vpn_t1_redacted_audit_jsonl(&event).len() > 1);
+
+        claw_vpn_t1_try_enqueue_audit_event(&sender, &healthy, event).unwrap();
+        handle.join().unwrap();
+
+        assert!(!healthy.load(Ordering::SeqCst));
+        assert_eq!(
+            claw_vpn_t1_try_enqueue_audit_event(&sender, &healthy, t1_open_audit_event_for_test()),
+            Err("claw-vpn-t1-audit-sink-unavailable")
+        );
+        assert_eq!(std::fs::read_to_string(&audit_path).unwrap(), "");
     }
 
     #[test]
