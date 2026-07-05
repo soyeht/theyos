@@ -159,7 +159,8 @@ class PrepareT1PreflightEvidenceRecordTests(unittest.TestCase):
     def test_invalid_artifact_sha_fails_before_writing_private_files(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             tmpdir = Path(tmp)
-            record_path = tmpdir / "private-evidence.json"
+            record_dir = tmpdir / "private-records"
+            record_path = record_dir / "private-evidence.json"
             audit_root = tmpdir / "audit-root"
             proc = subprocess.run(
                 [
@@ -180,6 +181,7 @@ class PrepareT1PreflightEvidenceRecordTests(unittest.TestCase):
             self.assertEqual(1, proc.returncode)
             self.assertEqual("", proc.stdout)
             self.assertIn("ERROR: artifact_sha must be 40 hex characters", proc.stderr)
+            self.assertFalse(record_dir.exists())
             self.assertFalse(record_path.exists())
             self.assertFalse(audit_root.exists())
             self.assertNotIn(str(record_path), proc.stderr)
@@ -213,7 +215,7 @@ class PrepareT1PreflightEvidenceRecordTests(unittest.TestCase):
             self.assertEqual(0o700, stat.S_IMODE(os.lstat(record_dir).st_mode))
             self.assertEqual(0o600, stat.S_IMODE(os.lstat(record_path).st_mode))
 
-    def test_restricts_existing_private_record_parent_directory(self) -> None:
+    def test_preserves_existing_private_record_parent_directory_mode(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             tmpdir = Path(tmp)
             record_dir = tmpdir / "private-records"
@@ -225,8 +227,25 @@ class PrepareT1PreflightEvidenceRecordTests(unittest.TestCase):
             proc = self.run_prepare("--record", str(record_path), "--audit-root", str(audit_root))
 
             self.assertEqual(0, proc.returncode, proc.stderr)
-            self.assertEqual(0o700, stat.S_IMODE(os.lstat(record_dir).st_mode))
+            self.assertEqual(0o755, stat.S_IMODE(os.lstat(record_dir).st_mode))
             self.assertEqual(0o600, stat.S_IMODE(os.lstat(record_path).st_mode))
+
+    def test_default_record_does_not_chmod_existing_working_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmpdir = Path(tmp)
+            os.chmod(tmpdir, 0o755)
+            proc = subprocess.run(
+                [sys.executable, str(SCRIPT), ARTIFACT_SHA],
+                check=False,
+                cwd=tmpdir,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+
+            self.assertEqual(0, proc.returncode, proc.stderr)
+            self.assertEqual(0o755, stat.S_IMODE(os.lstat(tmpdir).st_mode))
+            self.assertEqual(0o600, stat.S_IMODE(os.lstat(tmpdir / prepare.DEFAULT_RECORD).st_mode))
 
 
 if __name__ == "__main__":
