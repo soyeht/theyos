@@ -57,6 +57,10 @@ class PrepareT1PreflightEvidenceRecordTests(unittest.TestCase):
             self.assertEqual(0, proc.returncode, proc.stderr)
             self.assertIn("OK: private T1 preflight evidence draft updated", proc.stdout)
             self.assertIn("INFO: record remains incomplete until all private refs are supplied", proc.stdout)
+            self.assertIn(
+                "INFO: missing private refs: owner_authorization_ref, rollback_ref, hardware_evidence_ref",
+                proc.stdout,
+            )
 
             record = self.read_record(record_path)
             self.assertEqual(ARTIFACT_SHA, record["artifact_sha"])
@@ -128,6 +132,7 @@ class PrepareT1PreflightEvidenceRecordTests(unittest.TestCase):
             self.assertEqual("owner-review-ref", record["owner_authorization_ref"])
             self.assertEqual("", record["rollback_ref"])
             self.assertEqual("hardware-evidence-ref", record["hardware_evidence_ref"])
+            self.assertIn("INFO: missing private refs: rollback_ref", proc.stdout)
 
     def test_cli_does_not_echo_private_values(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

@@ -45,6 +45,17 @@ def select_private_ref(provided: str | None, existing: object) -> str:
     return keep_real_ref(existing)
 
 
+def missing_private_ref_fields(owner_ref: str, rollback_ref: str, hardware_ref: str) -> list[str]:
+    missing: list[str] = []
+    if not owner_ref:
+        missing.append("owner_authorization_ref")
+    if not rollback_ref:
+        missing.append("rollback_ref")
+    if not hardware_ref:
+        missing.append("hardware_evidence_ref")
+    return missing
+
+
 def canonical_private_audit_root(path: str) -> str:
     root = Path(path).expanduser()
     root.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -145,8 +156,10 @@ def main() -> int:
 
     print("OK: private T1 preflight evidence draft updated")
     print("OK: private audit root is present with mode 0700")
-    if not (owner_ref and rollback_ref and hardware_ref):
+    missing_refs = missing_private_ref_fields(owner_ref, rollback_ref, hardware_ref)
+    if missing_refs:
         print("INFO: record remains incomplete until all private refs are supplied")
+        print(f"INFO: missing private refs: {', '.join(missing_refs)}")
     else:
         print("INFO: refs are present, but activation still must verify their reviewed contents")
     return 0
