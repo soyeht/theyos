@@ -10,9 +10,9 @@ bootstrap. It makes the two remaining non-code gates explicit:
 
 Use `docs/product-a-per-claw-vpn-t1-authorization-template.md` as the
 copy/paste artifact for the authorization record, rollback readiness, hardware
-evidence pack, and stop record. The template is not authorization by itself; it
-only becomes evidence when filled for the exact artifact SHA by the owner and
-reviewed with the hardware pack.
+evidence pack, SHA-bound preflight evidence record, and stop record. The
+template is not authorization by itself; it only becomes evidence when filled
+for the exact artifact SHA by the owner and reviewed with the hardware pack.
 
 The code gates that must already be present in `main` are:
 

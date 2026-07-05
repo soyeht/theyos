@@ -29,6 +29,40 @@ If any field is missing, the run is not authorized. If the PR head or commit
 SHA changes, this record expires and the owner must issue a new record for the
 new artifact.
 
+## Preflight Evidence Record
+
+Fill this JSON only after the owner authorization, rollback artifact, and
+hardware evidence references below exist for the same exact artifact SHA. This
+record is input for the reviewed T1 evidence loader; it is not authorization by
+itself and it must not be wired into the mount until the activation PR reviews
+the caller and source-guard changes.
+
+Keep the real `audit_root` value in the private activation record or secret
+store. Public PR text may identify it only by neutral alias/reference. The
+loader requires an absolute, normal path, and the later mount wiring must still
+validate that root with the canonical path helper and open the audit log through
+the fd-relative `O_NOFOLLOW` traversal.
+
+```json
+{
+  "schema": "per_claw_vpn_t1_preflight_evidence_v1",
+  "artifact_sha": "<exact-40-hex-artifact-sha>",
+  "scope": "dev-host T1-T4 only",
+  "production_activation": false,
+  "owner_authorization": true,
+  "rollback": true,
+  "hardware_t1_t4": true,
+  "owner_authorization_ref": "<owner-authorization-record-ref>",
+  "rollback_ref": "<prebuilt-rollback-artifact-ref>",
+  "hardware_evidence_ref": "<sanitized-t1-t4-evidence-pack-ref>",
+  "audit_root": "<private-absolute-normal-0700-audit-root>"
+}
+```
+
+The activation PR must verify that each reference points to the real reviewed
+artifact it names; the loader only checks that the references are non-empty and
+that the SHA, scope, production flag, booleans, and audit-root shape are valid.
+
 ## Rollback Readiness
 
 | check | evidence |
