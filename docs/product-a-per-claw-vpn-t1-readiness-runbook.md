@@ -231,12 +231,15 @@ The wiring PR that follows this runbook must show, before merge:
   mode `0700` final parent directory, flush plus `sync_data` each accepted
   event from the worker, rotate before a new record would exceed the reviewed
   byte cap, retain a bounded number of rotated files, and sync the parent
-  directory after rotation metadata changes. The current default-off mount may
-  keep a placeholder sink only while missing preflight makes it unreachable,
-  and a live activation slice must replace it with reviewed persistence policy
-  and safe path selection for the exact artifact SHA, including a fixed
-  owner-controlled location, final retention/rotation limits, and the chosen
-  best-effort-vs-durable authorization/in-flight semantics;
+  directory after rotation metadata changes. The T1 router module may also
+  provide a reviewed HMAC-SHA-256 export redactor for off-host/shared audit
+  export that emits keyed subject hashes instead of local pseudonymous hashes.
+  The current default-off mount may keep a placeholder sink only while missing
+  preflight makes it unreachable, and a live activation slice must replace it
+  with reviewed persistence policy and safe path selection for the exact
+  artifact SHA, including a fixed owner-controlled location, final
+  retention/rotation limits, reviewed export key source/rotation, and the
+  chosen best-effort-vs-durable authorization/in-flight semantics;
 - no raw `TunnelFrame`, packet bytes, interface name, file descriptor, local
   path, or peer address is logged through Debug or error formatting;
 - tests prove route cleanup runs after pump stop/error and that failure returns

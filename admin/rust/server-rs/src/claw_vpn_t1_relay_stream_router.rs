@@ -29,11 +29,14 @@ use std::task::{Context, Poll};
 use std::thread;
 use std::time::Duration;
 
+use hmac::{Hmac, Mac};
 use household_rs::claw_share_data_tunnel::{DataTunnelError, TargetSession};
 use household_rs::claw_vpn::{
     ClawVpnAcl, ClawVpnAclKey, ClawVpnAgentCore, ClawVpnAuditEvent, ClawVpnDatapathSide,
     ClawVpnSessionRegistry,
 };
+use sha2::Sha256;
+use zeroize::{Zeroize, ZeroizeOnDrop};
 
 use crate::claw_share_relay_stream_target_router::{
     RelayStreamIpTunnelRouter, RelayStreamIpTunnelTarget,
@@ -76,11 +79,38 @@ pub type ClawVpnT1RelayStreamAuditSink =
 pub const CLAW_VPN_T1_AUDIT_SINK_QUEUE_CAPACITY: usize = 128;
 pub const CLAW_VPN_T1_AUDIT_LOG_ROTATE_BYTES: u64 = 1_048_576;
 pub const CLAW_VPN_T1_AUDIT_LOG_RETAINED_FILES: usize = 4;
+pub const CLAW_VPN_T1_AUDIT_EXPORT_HMAC_KEY_BYTES: usize = 32;
 pub type ClawVpnT1RelayStreamBoxedRouter<I> = ClawVpnT1RelayStreamIpTunnelRouter<
     I,
     ClawVpnT1RelayStreamBuildInputs<I>,
     ClawVpnT1RelayStreamLaunchRuntime<I>,
 >;
+
+type ClawVpnT1AuditExportHmac = Hmac<Sha256>;
+
+#[derive(Clone, Zeroize, ZeroizeOnDrop)]
+pub struct ClawVpnT1AuditExportHmacKey {
+    bytes: [u8; CLAW_VPN_T1_AUDIT_EXPORT_HMAC_KEY_BYTES],
+}
+
+impl fmt::Debug for ClawVpnT1AuditExportHmacKey {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ClawVpnT1AuditExportHmacKey")
+            .field("bytes", &"<redacted>")
+            .finish()
+    }
+}
+
+impl ClawVpnT1AuditExportHmacKey {
+    #[must_use]
+    pub fn from_bytes(bytes: [u8; CLAW_VPN_T1_AUDIT_EXPORT_HMAC_KEY_BYTES]) -> Self {
+        Self { bytes }
+    }
+
+    fn bytes(&self) -> &[u8; CLAW_VPN_T1_AUDIT_EXPORT_HMAC_KEY_BYTES] {
+        &self.bytes
+    }
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum ClawVpnT1AuditSinkError {
@@ -586,6 +616,61 @@ fn claw_vpn_t1_redacted_audit_jsonl(event: &ClawVpnAuditEvent) -> String {
         "closed_session_count": event.closed_session_count(),
     });
     format!("{line}\n")
+}
+
+#[must_use]
+pub fn claw_vpn_t1_keyed_audit_export_jsonl(
+    event: &ClawVpnAuditEvent,
+    key: &ClawVpnT1AuditExportHmacKey,
+) -> String {
+    let subject = event.subject().map(|subject| {
+        serde_json::json!({
+            "derivation": "hmac-sha256-v1",
+            "member_id_keyed_hash": hex::encode(claw_vpn_t1_audit_export_hmac(
+                key,
+                b"member_id_hash",
+                subject.member_id_hash(),
+            )),
+            "device_pub_keyed_hash": hex::encode(claw_vpn_t1_audit_export_hmac(
+                key,
+                b"device_pub_hash",
+                subject.device_pub_hash(),
+            )),
+            "claw_id_keyed_hash": hex::encode(claw_vpn_t1_audit_export_hmac(
+                key,
+                b"claw_id_hash",
+                subject.claw_id_hash(),
+            )),
+        })
+    });
+    let line = serde_json::json!({
+        "schema": "claw_vpn_t1_audit_export_v1",
+        "subject": subject,
+        "action": format!("{:?}", event.action()),
+        "reason": format!("{:?}", event.reason()),
+        "session_id_present": event.session_id().is_some(),
+        "byte_count": event.byte_count(),
+        "closed_session_count": event.closed_session_count(),
+    });
+    format!("{line}\n")
+}
+
+fn claw_vpn_t1_audit_export_hmac(
+    key: &ClawVpnT1AuditExportHmacKey,
+    label: &[u8],
+    local_hash: [u8; 32],
+) -> [u8; 32] {
+    let mut mac = ClawVpnT1AuditExportHmac::new_from_slice(key.bytes())
+        .expect("hmac-sha256 accepts fixed-size export keys");
+    mac.update(b"claw-vpn-t1-audit-export-v1");
+    mac.update(&[0]);
+    mac.update(label);
+    mac.update(&[0]);
+    mac.update(&local_hash);
+    let bytes = mac.finalize().into_bytes();
+    let mut out = [0_u8; 32];
+    out.copy_from_slice(&bytes);
+    out
 }
 
 pub struct ClawVpnT1RelayStreamRouterParts<I, BuildInputs, LaunchRuntime> {
@@ -1223,6 +1308,42 @@ mod tests {
         assert!(!body.contains("claw-alpha"));
         assert_eq!(build_count.load(Ordering::SeqCst), 1);
         assert_eq!(launch_count.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn t1_audit_export_jsonl_uses_keyed_hashes_without_local_subject_hashes() {
+        let event = t1_open_audit_event_for_member("member-export-alpha");
+        let subject = event.subject().expect("open event has subject");
+        let local_member_hash = hex::encode(subject.member_id_hash());
+        let local_device_hash = hex::encode(subject.device_pub_hash());
+        let local_claw_hash = hex::encode(subject.claw_id_hash());
+        let key = ClawVpnT1AuditExportHmacKey::from_bytes([0xA5; 32]);
+        let alternate_key = ClawVpnT1AuditExportHmacKey::from_bytes([0x5A; 32]);
+
+        let body = claw_vpn_t1_keyed_audit_export_jsonl(&event, &key);
+        let body_again = claw_vpn_t1_keyed_audit_export_jsonl(&event, &key);
+        let alternate_body = claw_vpn_t1_keyed_audit_export_jsonl(&event, &alternate_key);
+
+        assert_eq!(body, body_again);
+        assert_ne!(body, alternate_body);
+        assert!(body.contains("\"schema\":\"claw_vpn_t1_audit_export_v1\""));
+        assert!(body.contains("\"derivation\":\"hmac-sha256-v1\""));
+        assert!(body.contains("member_id_keyed_hash"));
+        assert!(body.contains("device_pub_keyed_hash"));
+        assert!(body.contains("claw_id_keyed_hash"));
+        assert!(!body.contains("member_id_hash"));
+        assert!(!body.contains("device_pub_hash"));
+        assert!(!body.contains("claw_id_hash"));
+        assert!(!body.contains(&local_member_hash));
+        assert!(!body.contains(&local_device_hash));
+        assert!(!body.contains(&local_claw_hash));
+        assert!(!body.contains("member-export-alpha"));
+        assert!(!body.contains("claw-alpha"));
+        let key_debug = format!("{:?}", key);
+        assert!(key_debug.contains("<redacted>"));
+        assert!(!key_debug.contains("A5"));
+        assert!(!key_debug.contains("a5"));
+        assert!(!key_debug.contains("165"));
     }
 
     #[test]

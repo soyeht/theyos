@@ -4498,6 +4498,7 @@ dependencies = [
  "executor-rs",
  "gethostname",
  "hex",
+ "hmac",
  "household-rs",
  "hyper",
  "hyper-util",

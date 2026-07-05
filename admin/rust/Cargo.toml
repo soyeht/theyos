@@ -66,6 +66,7 @@ bytes       = "1"
 wiremock    = "0.6"
 base64      = "0.22"
 sha2        = "0.10"
+hmac        = "0.12"
 libc        = "0.2"
 russh       = { version = "0.59", default-features = false, features = ["flate2", "ring", "rsa"] }
 async-trait = "0.1"

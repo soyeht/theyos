@@ -153,17 +153,20 @@ when its bounded queue or worker is unavailable. The helper walks and creates
 parent components with fd-relative `openat`/`mkdirat`, rejects
 parent/intermediate symlinks and `..` components, opens the log file relative
 to the validated parent fd with `O_NOFOLLOW`, and creates or requires a real,
-current-user-owned, mode `0700` final parent directory for the log file. It
-remains a helper for the future activation slice, not the mounted sink. The
-source guard
-tripwires that helper, its error type, and its queue capacity outside the T1
-router module so future wiring into the mount reopens review. The current
+current-user-owned, mode `0700` final parent directory for the log file. The
+router module also provides a reviewed keyed export redactor that derives
+off-host subject identifiers with HMAC-SHA-256 and does not emit the local
+pseudonymous subject hashes. These remain helpers for the future activation
+slice, not the mounted sink or an active export path. The source guard
+tripwires those helpers, their public types, and their constants outside the T1
+router module so future wiring into the mount or export caller reopens review.
+The current
 default-off mount supplies only a placeholder sink behind missing preflight, so
 a future activation slice must replace that placeholder with reviewed
 persistence policy and safe path selection for the exact artifact SHA,
 including a fixed owner-controlled location, the chosen retention/rotation
-limits, and the chosen best-effort-vs-durable authorization/in-flight
-semantics. The mount now
+limits, the reviewed export key source/rotation policy, and the chosen
+best-effort-vs-durable authorization/in-flight semantics. The mount now
 injects that backend through the same T1 caller gate, but the production path
 still supplies
 `PerClawVpnT1PreflightEvidence::missing`, so even with the T1 dev env present it
@@ -363,8 +366,10 @@ Access between members/devices and claws is explicitly many-to-many:
   codes, byte counters) using internal neutral ids, so N:N access is
   attributable per relationship. Never packet payloads, external IPs, UDIDs,
   or key material in logs. Neutral ids are pseudonymous local identifiers, not
-  anonymization; any future exported/shared audit backend must use keyed
-  derivation (for example HMAC) or an explicit equivalent exposure policy.
+  anonymization; the T1 router module now has a reviewed HMAC-SHA-256 export
+  redactor for future off-host/shared audit export, but choosing the export key
+  source, rotation, and exposure policy remains part of the SHA-bound
+  activation review.
 - **S9 Anti-spoof + no forwarding** — both directions filtered to the single
   (session peer ⇄ claw) address pair; the agent never routes beyond itself;
   LAN and other claws unreachable by construction.
@@ -536,12 +541,14 @@ Access between members/devices and claws is explicitly many-to-many:
   fd-relative `openat`/`mkdirat`, rejects parent/intermediate symlinks and `..`
   components, opens the log file relative to the validated parent fd with
   `O_NOFOLLOW`, and creates or requires a real current-user-owned `0700` final
-  parent directory. The
-  source guard tripwires that helper
-  outside the T1 router module, but it is not wired into the mount until that
-  exact SHA-bound live-run review; fixed safe path location, final
-  retention/rotation limits, and the final best-effort-vs-durable
-  authorization/in-flight semantics still belong to that activation review. The
+  parent directory. The router module also has a reviewed HMAC-SHA-256 export
+  redactor that emits keyed subject hashes instead of the local pseudonymous
+  hashes for future off-host/shared audit export. The source guard tripwires
+  these helpers outside the T1 router module, but they are not wired into the
+  mount or export caller until that exact SHA-bound live-run review; fixed safe
+  path location, final retention/rotation limits, export key source/rotation,
+  and the final best-effort-vs-durable authorization/in-flight semantics still
+  belong to that activation review. The
   environment-backed mount still supplies missing preflight
   evidence, so `Disabled`/invalid/missing-preflight/`Dial` paths all fall back
   to the unavailable `IpTunnel` router before building runtime inputs, opening
