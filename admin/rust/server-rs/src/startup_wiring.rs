@@ -71,6 +71,7 @@ impl PerClawVpnT1PreflightEvidence {
 }
 
 pub const PER_CLAW_VPN_T1_PREFLIGHT_EVIDENCE_SCHEMA: &str = "per_claw_vpn_t1_preflight_evidence_v1";
+pub const THEYOS_SERVER_BUILD_GIT_SHA: &str = env!("THEYOS_SERVER_BUILD_GIT_SHA");
 const PER_CLAW_VPN_T1_PREFLIGHT_SCOPE_DEV_T1_T4: &str = "dev-host T1-T4 only";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -196,6 +197,15 @@ pub fn parse_per_claw_vpn_t1_preflight_evidence_record(
 
 fn is_full_git_sha(value: &str) -> bool {
     value.len() == 40 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+#[must_use]
+pub fn theyos_server_build_git_sha() -> Option<&'static str> {
+    if is_full_git_sha(THEYOS_SERVER_BUILD_GIT_SHA) {
+        Some(THEYOS_SERVER_BUILD_GIT_SHA)
+    } else {
+        None
+    }
 }
 
 fn has_non_normal_path_component(path: &Path) -> bool {
@@ -583,6 +593,38 @@ mod tests {
             "audit_root": audit_root,
         })
         .to_string()
+    }
+
+    #[test]
+    fn server_build_git_sha_is_full_sha_when_available() {
+        assert!(
+            THEYOS_SERVER_BUILD_GIT_SHA == "unknown"
+                || is_full_git_sha(THEYOS_SERVER_BUILD_GIT_SHA),
+            "compiled server build git SHA must be unknown or a full 40-hex SHA"
+        );
+        assert_eq!(
+            theyos_server_build_git_sha().is_some(),
+            is_full_git_sha(THEYOS_SERVER_BUILD_GIT_SHA)
+        );
+    }
+
+    #[test]
+    fn t1_preflight_evidence_record_accepts_compiled_artifact_sha_when_available() {
+        let Some(artifact_sha) = theyos_server_build_git_sha() else {
+            return;
+        };
+        let json = t1_preflight_evidence_json(
+            artifact_sha,
+            false,
+            "rollback-artifact-alpha",
+            "/tmp/t1-evidence-root",
+        );
+
+        let bundle = parse_per_claw_vpn_t1_preflight_evidence_record(&json, artifact_sha).unwrap();
+
+        assert!(bundle.evidence().has_owner_authorization());
+        assert!(bundle.evidence().has_rollback());
+        assert!(bundle.evidence().has_hardware_t1_t4());
     }
 
     #[test]
