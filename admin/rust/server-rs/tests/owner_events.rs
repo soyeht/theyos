@@ -4444,9 +4444,19 @@ fn product_a_per_claw_vpn_dev_config_remains_default_off_and_unwired() {
                 && matches!(target_session_runtime_test_span, Some((start, end)) if index >= start && index <= end);
             let in_t1_relay_stream_router_tests = in_t1_relay_stream_router_module
                 && matches!(t1_relay_stream_router_test_span, Some((start, end)) if index >= start && index <= end);
-            let references_dev_config =
-                line.contains("ClawVpnDevConfig") || line.contains("claw_vpn_dev_config");
-            let references_dev_flag = line.contains("THEYOS_CLAW_VPN_");
+            let line_without_allowed_relay_stream_mount_audit_root_env =
+                if in_relay_stream_mount_module {
+                    line.replace("CLAW_VPN_T1_AUDIT_ROOT_ENV", "")
+                        .replace("THEYOS_CLAW_VPN_T1_AUDIT_ROOT", "")
+                } else {
+                    (*line).to_owned()
+                };
+            let references_dev_config = line_without_allowed_relay_stream_mount_audit_root_env
+                .contains("ClawVpnDevConfig")
+                || line_without_allowed_relay_stream_mount_audit_root_env
+                    .contains("claw_vpn_dev_config");
+            let references_dev_flag =
+                line_without_allowed_relay_stream_mount_audit_root_env.contains("THEYOS_CLAW_VPN_");
             let references_interface_route_plan = line.contains("ClawVpnInterfaceRoute")
                 || line.contains("ClawVpnInterfaceName")
                 || line.contains("claw_vpn_interface_route_plan");
@@ -4484,7 +4494,17 @@ fn product_a_per_claw_vpn_dev_config_remains_default_off_and_unwired() {
                 || line.contains("CLAW_VPN_T1_AUDIT_LOG_RETAINED_FILES")
                 || line.contains("CLAW_VPN_T1_AUDIT_EXPORT_HMAC_KEY_BYTES")
                 || line.contains("CLAW_VPN_T1_AUDIT_LOG_DIRECTORY_NAME")
-                || line.contains("CLAW_VPN_T1_AUDIT_LOG_FILE_NAME");
+                || line.contains("CLAW_VPN_T1_AUDIT_LOG_FILE_NAME")
+                || line.contains("CLAW_VPN_T1_AUDIT_ROOT_ENV")
+                || line.contains("THEYOS_CLAW_VPN_T1_AUDIT_ROOT");
+            let references_t1_relay_stream_mount_audit_sink = line
+                .contains("claw_vpn_t1_spooled_jsonl_audit_sink")
+                || line.contains("claw_vpn_t1_canonical_audit_log_path")
+                || line.contains("ClawVpnT1AuditSinkError")
+                || line.contains("CLAW_VPN_T1_AUDIT_LOG_DIRECTORY_NAME")
+                || line.contains("CLAW_VPN_T1_AUDIT_LOG_FILE_NAME")
+                || line.contains("CLAW_VPN_T1_AUDIT_ROOT_ENV")
+                || line.contains("THEYOS_CLAW_VPN_T1_AUDIT_ROOT");
             let references_target_session_runtime_bridge = line
                 .contains("ClawVpnTargetSessionRuntime")
                 || line.contains("claw_vpn_target_session_runtime");
@@ -4660,6 +4680,8 @@ fn product_a_per_claw_vpn_dev_config_remains_default_off_and_unwired() {
                 in_t1_relay_stream_router_module && references_t1_caller_gate;
             let allowed_t1_relay_stream_router_audit_sink =
                 in_t1_relay_stream_router_module && references_t1_relay_stream_audit_sink;
+            let allowed_relay_stream_mount_audit_sink =
+                in_relay_stream_mount_module && references_t1_relay_stream_mount_audit_sink;
             let allowed_relay_stream_mount_t1_caller_gate =
                 in_relay_stream_mount_module && references_t1_caller_gate;
             let allowed_relay_stream_mount_interface_route_plan =
@@ -4729,6 +4751,7 @@ fn product_a_per_claw_vpn_dev_config_remains_default_off_and_unwired() {
                     && !t1_relay_stream_router_module_export
                     && references_t1_caller_gate)
                 || (!allowed_t1_relay_stream_router_audit_sink
+                    && !allowed_relay_stream_mount_audit_sink
                     && references_t1_relay_stream_audit_sink)
                 || (!in_target_session_runtime_module
                     && !allowed_target_session_router_runtime_bridge

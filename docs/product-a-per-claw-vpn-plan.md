@@ -159,19 +159,22 @@ off-host subject identifiers with HMAC-SHA-256 and does not emit the local
 pseudonymous subject hashes. It also provides a reviewed fixed audit-log path
 selector that accepts only an absolute, canonical, current-user-owned, mode
 `0700` root directory and appends the fixed
-`claw-vpn-t1-audit/audit.jsonl` suffix. These remain helpers for the future
-activation slice, not the mounted sink or an active export path. The source
+`claw-vpn-t1-audit/audit.jsonl` suffix. The default-off mount now has a
+reviewed post-gate audit sink builder that reads the owner-controlled root from
+`THEYOS_CLAW_VPN_T1_AUDIT_ROOT`, validates it with the fixed path selector, and
+opens the log through the spooled sink's fd-relative `O_NOFOLLOW` traversal.
+Missing or invalid root configuration yields a fail-closed sink, and the builder
+remains unreachable while the mount supplies missing T1 preflight. The source
 guard tripwires those helpers, their public types, and their constants outside
-the T1 router module so future wiring into the mount or export caller reopens
-review.
+the T1 router module and the reviewed mount use, so future export caller or
+broader wiring reopens review.
 The current
-default-off mount supplies only a placeholder sink behind missing preflight, so
-a future activation slice must replace that placeholder with reviewed
-persistence policy and a reviewed root source for the exact artifact SHA,
-including the owner-controlled canonical root passed to the fixed path helper,
-the chosen retention/rotation limits, the reviewed export key source/rotation
-policy, and the chosen best-effort-vs-durable authorization/in-flight
-semantics. The mount now
+default-off mount still supplies
+`PerClawVpnT1PreflightEvidence::missing`, so a future activation slice must add
+reviewed evidence loading for the exact artifact SHA, bind the
+owner-controlled canonical root value to that evidence, and decide the final
+retention/rotation limits, reviewed export key source/rotation policy, and
+best-effort-vs-durable authorization/in-flight semantics. The mount now
 injects that backend through the same T1 caller gate, but the production path
 still supplies
 `PerClawVpnT1PreflightEvidence::missing`, so even with the T1 dev env present it

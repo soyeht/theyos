@@ -75,9 +75,10 @@ use crate::claw_vpn_macos_utun::ClawVpnMacosUtunDevice;
 use crate::claw_vpn_packet_pump::ClawVpnPacketInterface;
 use crate::claw_vpn_t1_caller::ClawVpnT1CallerStatus;
 use crate::claw_vpn_t1_relay_stream_router::{
-    ClawVpnT1RelayStreamAuditSink, ClawVpnT1RelayStreamBoxedRouter,
+    ClawVpnT1AuditSinkError, ClawVpnT1RelayStreamAuditSink, ClawVpnT1RelayStreamBoxedRouter,
     ClawVpnT1RelayStreamBuildInputs, ClawVpnT1RelayStreamLaunchRuntime,
     ClawVpnT1RelayStreamRouterParts, assemble_claw_vpn_t1_relay_stream_router,
+    claw_vpn_t1_canonical_audit_log_path, claw_vpn_t1_spooled_jsonl_audit_sink,
 };
 use crate::claw_vpn_target_session_router::{
     ClawVpnTargetSessionRouterLaunchError, ClawVpnTargetSessionRouterWiring,
@@ -112,6 +113,7 @@ const RELAY_STREAM_CLAWSITE_BACKEND_ENV: &str = "THEYOS_RELAY_STREAM_CLAWSITE_BA
 const RELAY_STREAM_RESOURCE_ENV: &str = "THEYOS_RELAY_STREAM_RESOURCE";
 
 const CLAW_VPN_T1_TARGET_SESSION_IO_TIMEOUT: Duration = Duration::from_secs(5);
+const CLAW_VPN_T1_AUDIT_ROOT_ENV: &str = "THEYOS_CLAW_VPN_T1_AUDIT_ROOT";
 #[cfg(target_os = "linux")]
 const CLAW_VPN_T1_LINUX_TUN_NAME: &str = "clawvpn0";
 const CLAW_VPN_LINUX_IP_TOOL_PATH: &str = "/sbin/ip";
@@ -427,8 +429,46 @@ fn assemble_macos_t1_ip_tunnel_router()
     )
 }
 
+#[derive(Debug, thiserror::Error)]
+enum ClawVpnT1MountedAuditSinkError {
+    #[error("claw vpn t1 audit root env missing")]
+    MissingRoot,
+
+    #[error("claw vpn t1 audit path unavailable")]
+    Path(#[source] io::Error),
+
+    #[error("claw vpn t1 audit sink unavailable")]
+    Sink(#[source] ClawVpnT1AuditSinkError),
+}
+
 fn t1_open_audit_sink() -> ClawVpnT1RelayStreamAuditSink {
-    Box::new(|_event| Ok(()))
+    match t1_spooled_audit_sink_from_env() {
+        Ok(sink) => sink,
+        Err(error) => {
+            tracing::warn!(
+                stage = "claw_share.relay_stream.mount.claw_vpn_t1_audit_sink_unavailable",
+                error = ?error,
+                "per-Claw VPN T1 audit sink remains unavailable"
+            );
+            Box::new(|_event| Err("claw-vpn-t1-audit-sink-unavailable"))
+        }
+    }
+}
+
+fn t1_spooled_audit_sink_from_env()
+-> Result<ClawVpnT1RelayStreamAuditSink, ClawVpnT1MountedAuditSinkError> {
+    let root = std::env::var_os(CLAW_VPN_T1_AUDIT_ROOT_ENV)
+        .map(PathBuf::from)
+        .ok_or(ClawVpnT1MountedAuditSinkError::MissingRoot)?;
+    t1_spooled_audit_sink_from_root(root)
+}
+
+fn t1_spooled_audit_sink_from_root(
+    root: impl AsRef<Path>,
+) -> Result<ClawVpnT1RelayStreamAuditSink, ClawVpnT1MountedAuditSinkError> {
+    let audit_path =
+        claw_vpn_t1_canonical_audit_log_path(root).map_err(ClawVpnT1MountedAuditSinkError::Path)?;
+    claw_vpn_t1_spooled_jsonl_audit_sink(&audit_path).map_err(ClawVpnT1MountedAuditSinkError::Sink)
 }
 
 fn enabled_claw_vpn_t1_wiring_config() -> ClawVpnRuntimeWiringConfig {
@@ -761,6 +801,7 @@ mod tests {
     use super::*;
 
     use std::ffi::OsString;
+    use std::os::unix::fs::PermissionsExt;
     use std::sync::Mutex;
 
     use crate::claw_share_relay_stream_offer_store::relay_stream_offer_store_path;
@@ -772,6 +813,9 @@ mod tests {
         CLAW_VPN_DIAL_ENV, CLAW_VPN_IPV4_POOL_ENV, CLAW_VPN_LIVE_ENV,
         CLAW_VPN_MAX_SESSIONS_PER_CLAW_ENV, CLAW_VPN_MAX_SESSIONS_PER_MEMBER_CLAW_ENV,
         CLAW_VPN_RELAY_ENDPOINT_ENV,
+    };
+    use crate::claw_vpn_t1_relay_stream_router::{
+        CLAW_VPN_T1_AUDIT_LOG_DIRECTORY_NAME, CLAW_VPN_T1_AUDIT_LOG_FILE_NAME,
     };
 
     static CLAW_VPN_T1_TEST_ENV_LOCK: Mutex<()> = Mutex::new(());
@@ -893,6 +937,70 @@ mod tests {
             parse_resource(Some("garbage")),
             Err(RelayStreamResourceEnvError::Invalid)
         );
+    }
+
+    #[test]
+    fn t1_mount_audit_sink_missing_root_rejects_before_sink_creation() {
+        let _lock = CLAW_VPN_T1_TEST_ENV_LOCK.lock().unwrap();
+        let _audit_root = set_t1_test_env(CLAW_VPN_T1_AUDIT_ROOT_ENV, None);
+        assert!(matches!(
+            t1_spooled_audit_sink_from_env(),
+            Err(ClawVpnT1MountedAuditSinkError::MissingRoot)
+        ));
+    }
+
+    #[test]
+    fn t1_mount_audit_sink_uses_canonical_root_and_spooled_log() {
+        let _lock = CLAW_VPN_T1_TEST_ENV_LOCK.lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(dir.path())
+            .unwrap()
+            .join("audit-root");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let _audit_root = set_t1_test_env(CLAW_VPN_T1_AUDIT_ROOT_ENV, Some(root.to_str().unwrap()));
+
+        let _sink = t1_spooled_audit_sink_from_env().unwrap();
+
+        let audit_path = root
+            .join(CLAW_VPN_T1_AUDIT_LOG_DIRECTORY_NAME)
+            .join(CLAW_VPN_T1_AUDIT_LOG_FILE_NAME);
+        assert_eq!(
+            std::fs::metadata(audit_path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+    }
+
+    #[test]
+    fn mounted_t1_iptunnel_router_missing_preflight_does_not_create_audit_log() {
+        let _lock = CLAW_VPN_T1_TEST_ENV_LOCK.lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(dir.path())
+            .unwrap()
+            .join("audit-root");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let _audit_root = set_t1_test_env(CLAW_VPN_T1_AUDIT_ROOT_ENV, Some(root.to_str().unwrap()));
+        let _live = set_t1_test_env(CLAW_VPN_LIVE_ENV, Some("1"));
+        let _dial = set_t1_test_env(CLAW_VPN_DIAL_ENV, None);
+        let _endpoint = set_t1_test_env(
+            CLAW_VPN_RELAY_ENDPOINT_ENV,
+            Some("relay-stream://127.0.0.1:49152"),
+        );
+        let _pool = set_t1_test_env(CLAW_VPN_IPV4_POOL_ENV, Some("198.18.0.0/24"));
+        let _per_member = set_t1_test_env(CLAW_VPN_MAX_SESSIONS_PER_MEMBER_CLAW_ENV, None);
+        let _per_claw = set_t1_test_env(CLAW_VPN_MAX_SESSIONS_PER_CLAW_ENV, None);
+
+        let router = build_mounted_ip_tunnel_router_from_t1_gate();
+
+        assert!(matches!(
+            router,
+            RelayStreamMountedIpTunnelRouter::Unavailable(_)
+        ));
+        let audit_path = root
+            .join(CLAW_VPN_T1_AUDIT_LOG_DIRECTORY_NAME)
+            .join(CLAW_VPN_T1_AUDIT_LOG_FILE_NAME);
+        assert!(!audit_path.exists());
     }
 
     #[test]
