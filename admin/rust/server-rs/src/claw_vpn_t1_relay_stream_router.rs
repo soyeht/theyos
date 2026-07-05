@@ -2366,4 +2366,87 @@ mod tests {
         ));
         assert_eq!(parts_built.load(Ordering::SeqCst), 0);
     }
+
+    #[tokio::test]
+    async fn t1_relay_stream_router_present_preflight_writes_spooled_audit_log() {
+        let parts_built = Arc::new(AtomicUsize::new(0));
+        let build_count = Arc::new(AtomicUsize::new(0));
+        let launch_count = Arc::new(AtomicUsize::new(0));
+        let (_dir, root) = t1_canonical_owner_only_audit_root();
+        let audit_path = claw_vpn_t1_canonical_audit_log_path(&root).unwrap();
+        let audit_sink = claw_vpn_t1_spooled_jsonl_audit_sink(&audit_path).unwrap();
+
+        let status = assemble_claw_vpn_t1_relay_stream_router::<FakeInterface, _, _, _, _, _>(
+            || Ok(Some(live_config())),
+            || PerClawVpnT1PreflightEvidence::new(true, true, true),
+            {
+                let parts_built = Arc::clone(&parts_built);
+                let build_count = Arc::clone(&build_count);
+                let launch_count = Arc::clone(&launch_count);
+                move |_config| {
+                    parts_built.fetch_add(1, Ordering::SeqCst);
+                    ClawVpnT1RelayStreamRouterParts::new(
+                        enabled_runtime_config(),
+                        Duration::from_secs(1),
+                        {
+                            let build_count = Arc::clone(&build_count);
+                            move |
+                                _config: &ClawVpnDevConfig,
+                                _target: &RelayStreamIpTunnelTarget,
+                                _context: ClawVpnRuntimeWiringContext,
+                                relay: ClawVpnRelayStream<StdUnixStream>,
+                            | -> io::Result<ClawVpnT1RelayStreamWiringInputs<FakeInterface>> {
+                                build_count.fetch_add(1, Ordering::SeqCst);
+                                Ok(inputs(FakeInterface::empty(), relay))
+                            }
+                        },
+                        {
+                            let launch_count = Arc::clone(&launch_count);
+                            move |_wiring: ClawVpnTargetSessionRouterWiring<FakeInterface>| {
+                                launch_count.fetch_add(1, Ordering::SeqCst);
+                                Ok::<(), crate::claw_vpn_target_session_router::ClawVpnTargetSessionRouterLaunchError>(
+                                    (),
+                                )
+                            }
+                        },
+                        audit_sink,
+                    )
+                }
+            },
+        );
+        let (_mode, router) = status
+            .into_ready()
+            .expect("present Live preflight must build the T1 router");
+
+        let _session = router
+            .open_ip_tunnel(target("member-alpha", "claw-alpha"))
+            .await
+            .unwrap();
+
+        let body = read_audit_file_until(&audit_path, "SessionOpened");
+        assert!(body.contains("\"schema\":\"claw_vpn_t1_audit_v1\""));
+        assert!(body.contains("\"action\":\"SessionOpen\""));
+        assert!(body.contains("\"reason\":\"SessionOpened\""));
+        assert!(body.contains("\"session_id_present\":true"));
+        assert!(body.contains("member_id_hash"));
+        assert!(body.contains("device_pub_hash"));
+        assert!(body.contains("claw_id_hash"));
+        assert!(!body.contains("member-alpha"));
+        assert!(!body.contains("claw-alpha"));
+        assert_eq!(parts_built.load(Ordering::SeqCst), 1);
+        assert_eq!(build_count.load(Ordering::SeqCst), 1);
+        assert_eq!(launch_count.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            std::fs::metadata(audit_path.parent().unwrap())
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+        assert_eq!(
+            std::fs::metadata(&audit_path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+    }
 }
