@@ -546,9 +546,10 @@ Access between members/devices and claws is explicitly many-to-many:
   backend. The backend also delivers the typed `SessionOpen` audit event to a
   caller-supplied sink and fails closed if that sink rejects before runtime
   inputs or launcher execution; on that reject path it also delivers the
-  rollback `SessionClose` event to the same sink on a best-effort basis. The
-  current mount sink is only a reviewed placeholder behind missing preflight,
-  not live audit persistence. A reviewed spooled JSONL helper exists in the T1
+  rollback `SessionClose` event to the same sink on a best-effort basis. Missing
+  preflight still leaves the mounted sink fail-closed, and valid draft evidence
+  only selects the reviewed spooled sink; it is not live audit persistence or
+  activation authorization. A reviewed spooled JSONL helper exists in the T1
   router module for the activation slice; it writes redacted JSONL, forces
   owner-only log-file permissions, flushes and `sync_data`s each accepted event
   in its worker, rotates before writing a record that would exceed the reviewed
@@ -563,23 +564,25 @@ Access between members/devices and claws is explicitly many-to-many:
   these helpers outside the T1 router module. The router module also has a
   reviewed fixed audit-log path selector that requires an absolute canonical
   euid-owned `0700` root and appends the fixed
-  `claw-vpn-t1-audit/audit.jsonl` suffix. The default-off mount wires the local
-  audit sink builder only behind missing preflight, and the startup wiring
-  module has a reviewed SHA-bound evidence record parser/loader that remains
-  unused by the mount and binary and is source-guarded outside
-  `startup_wiring`. The record includes non-empty references to the owner
-  authorization, rollback artifact, hardware evidence pack, and audit export
-  policy through the offline validator, while the Rust loader consumes only the
-  reviewed runtime evidence fields. The future activation review must connect
-  that evidence record to the mount gate, bind the evidence `audit_root` to the
-  sink path, confirm the reviewed retention/rotation constants remain
-  acceptable for the exact run, verify export key
-  source/rotation/retention/destination content, and decide the final
-  best-effort-vs-durable
-  authorization/in-flight semantics. The environment-backed mount still
-  supplies missing preflight
-  evidence, so `Disabled`/invalid/missing-preflight/`Dial` paths all fall back
-  to the unavailable `IpTunnel` router before building runtime inputs, opening
+  `claw-vpn-t1-audit/audit.jsonl` suffix. The default-off mount draft now reads
+  a private SHA-bound evidence record from
+  `THEYOS_CLAW_VPN_T1_PREFLIGHT_EVIDENCE_RECORD` after the common config gate,
+  uses only the current-build loader, binds the record's `audit_root` to the
+  fixed path selector, and opens the log through the spooled sink. Missing,
+  stale, invalid, incomplete, or wrong-SHA evidence still yields missing
+  preflight and keeps `IpTunnel` unavailable; invalid audit-root configuration
+  yields the fail-closed sink before build inputs or launcher execution. The
+  offline private-record validator also requires non-empty references to the
+  owner authorization, rollback artifact, hardware evidence pack, and audit
+  export policy; the Rust loader consumes only the reviewed runtime evidence
+  fields and does not consume the audit export policy. This draft wiring does
+  not satisfy the activation gate by itself: the activation review must still
+  verify real owner/rollback/hardware references, the owner-controlled
+  canonical root, final retention/rotation limits, reviewed export key
+  source/rotation/retention/destination content, and the final
+  best-effort-vs-durable authorization/in-flight semantics.
+  `Disabled`/invalid/missing-preflight/`Dial` paths still fall back to the
+  unavailable `IpTunnel` router before building runtime inputs, opening
   TUN/utun, installing routes, spawning the launcher, or running the packet
   pump. This is the reviewed mount wiring shape, not T1 execution.
   Exit: T1–T4 green on dev hosts.
