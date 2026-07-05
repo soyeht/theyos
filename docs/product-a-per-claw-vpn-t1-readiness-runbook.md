@@ -234,10 +234,14 @@ The wiring PR that follows this runbook must show, before merge:
   directory after rotation metadata changes. The T1 router module may also
   provide a reviewed HMAC-SHA-256 export redactor for off-host/shared audit
   export that emits keyed subject hashes instead of local pseudonymous hashes.
+  It may also provide a reviewed fixed audit-log path selector that accepts
+  only an absolute, canonical, current-user-owned, mode `0700` root directory
+  and appends the fixed `claw-vpn-t1-audit/audit.jsonl` suffix.
   The current default-off mount may keep a placeholder sink only while missing
   preflight makes it unreachable, and a live activation slice must replace it
   with reviewed persistence policy and safe path selection for the exact
-  artifact SHA, including a fixed owner-controlled location, final
+  artifact SHA, including the source of the owner-controlled canonical root,
+  final
   retention/rotation limits, reviewed export key source/rotation, and the
   chosen best-effort-vs-durable authorization/in-flight semantics;
 - no raw `TunnelFrame`, packet bytes, interface name, file descriptor, local

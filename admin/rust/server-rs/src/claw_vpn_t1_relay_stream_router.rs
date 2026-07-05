@@ -18,7 +18,7 @@ use std::marker::PhantomData;
 use std::mem::MaybeUninit;
 use std::os::fd::{AsRawFd, FromRawFd, RawFd};
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::os::unix::net::UnixStream as StdUnixStream;
 use std::path::{Component, Path, PathBuf};
 use std::pin::Pin;
@@ -80,6 +80,8 @@ pub const CLAW_VPN_T1_AUDIT_SINK_QUEUE_CAPACITY: usize = 128;
 pub const CLAW_VPN_T1_AUDIT_LOG_ROTATE_BYTES: u64 = 1_048_576;
 pub const CLAW_VPN_T1_AUDIT_LOG_RETAINED_FILES: usize = 4;
 pub const CLAW_VPN_T1_AUDIT_EXPORT_HMAC_KEY_BYTES: usize = 32;
+pub const CLAW_VPN_T1_AUDIT_LOG_DIRECTORY_NAME: &str = "claw-vpn-t1-audit";
+pub const CLAW_VPN_T1_AUDIT_LOG_FILE_NAME: &str = "audit.jsonl";
 pub type ClawVpnT1RelayStreamBoxedRouter<I> = ClawVpnT1RelayStreamIpTunnelRouter<
     I,
     ClawVpnT1RelayStreamBuildInputs<I>,
@@ -128,6 +130,14 @@ pub fn claw_vpn_t1_spooled_jsonl_audit_sink(
     path: impl Into<PathBuf>,
 ) -> Result<ClawVpnT1RelayStreamAuditSink, ClawVpnT1AuditSinkError> {
     claw_vpn_t1_spooled_jsonl_audit_sink_with_capacity(path, CLAW_VPN_T1_AUDIT_SINK_QUEUE_CAPACITY)
+}
+
+pub fn claw_vpn_t1_canonical_audit_log_path(root: impl AsRef<Path>) -> io::Result<PathBuf> {
+    let root = root.as_ref();
+    validate_claw_vpn_t1_canonical_audit_root(root)?;
+    Ok(root
+        .join(CLAW_VPN_T1_AUDIT_LOG_DIRECTORY_NAME)
+        .join(CLAW_VPN_T1_AUDIT_LOG_FILE_NAME))
 }
 
 fn claw_vpn_t1_spooled_jsonl_audit_sink_with_capacity(
@@ -199,6 +209,64 @@ where
                 }
             }
         })
+}
+
+fn validate_claw_vpn_t1_canonical_audit_root(root: &Path) -> io::Result<()> {
+    if !root.is_absolute() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "claw vpn t1 audit root must be absolute",
+        ));
+    }
+    for component in root.components() {
+        match component {
+            Component::Prefix(_) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "claw vpn t1 audit root must be a unix path",
+                ));
+            }
+            Component::RootDir => {}
+            Component::CurDir | Component::ParentDir => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "claw vpn t1 audit root must be canonical",
+                ));
+            }
+            Component::Normal(component) => {
+                claw_vpn_t1_path_component_cstring(component)?;
+            }
+        }
+    }
+
+    let metadata = std::fs::symlink_metadata(root)?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "claw vpn t1 audit root must be a real directory",
+        ));
+    }
+    let canonical = std::fs::canonicalize(root)?;
+    if canonical != root {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "claw vpn t1 audit root must be canonical",
+        ));
+    }
+    if metadata.uid() != claw_vpn_t1_current_euid() {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "claw vpn t1 audit root must be owned by current user",
+        ));
+    }
+    let mode = metadata.mode() & 0o7777;
+    if mode != 0o700 {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "claw vpn t1 audit root must be mode 0700",
+        ));
+    }
+    Ok(())
 }
 
 fn ensure_claw_vpn_t1_audit_parent(parent: &Path) -> io::Result<File> {
@@ -1344,6 +1412,103 @@ mod tests {
         assert!(!key_debug.contains("A5"));
         assert!(!key_debug.contains("a5"));
         assert!(!key_debug.contains("165"));
+    }
+
+    fn t1_canonical_owner_only_audit_root() -> (tempfile::TempDir, PathBuf) {
+        let dir = t1_audit_sink_test_tempdir();
+        let root = dir.path().join("canonical-root");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let canonical = root.canonicalize().unwrap();
+        (dir, canonical)
+    }
+
+    #[test]
+    fn t1_audit_log_path_uses_fixed_suffix_under_canonical_owner_root() {
+        let (_dir, root) = t1_canonical_owner_only_audit_root();
+        let audit_path = claw_vpn_t1_canonical_audit_log_path(&root).unwrap();
+
+        assert_eq!(
+            audit_path,
+            root.join(CLAW_VPN_T1_AUDIT_LOG_DIRECTORY_NAME)
+                .join(CLAW_VPN_T1_AUDIT_LOG_FILE_NAME)
+        );
+
+        let event = t1_open_audit_event_for_member("member-fixed-path");
+        let line = claw_vpn_t1_redacted_audit_jsonl(&event);
+        let sink = claw_vpn_t1_spooled_jsonl_audit_sink(&audit_path).unwrap();
+        sink(event).unwrap();
+
+        let body = read_audit_file_until(&audit_path, &line);
+        assert!(body.contains(&line));
+        assert_eq!(
+            std::fs::metadata(audit_path.parent().unwrap())
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+        assert_eq!(
+            std::fs::metadata(&audit_path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+    }
+
+    #[test]
+    fn t1_audit_log_path_rejects_relative_root() {
+        let error = claw_vpn_t1_canonical_audit_log_path("target").unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn t1_audit_log_path_rejects_parent_dir_components() {
+        let (_dir, root) = t1_canonical_owner_only_audit_root();
+        let noncanonical = root.join("..").join(root.file_name().unwrap());
+        let error = claw_vpn_t1_canonical_audit_log_path(&noncanonical).unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn t1_audit_log_path_rejects_symlink_ancestor() {
+        let dir = t1_audit_sink_test_tempdir();
+        let base = dir.path().canonicalize().unwrap();
+        let target_parent = base.join("target-parent");
+        let real_root = target_parent.join("root");
+        std::fs::create_dir(&target_parent).unwrap();
+        std::fs::create_dir(&real_root).unwrap();
+        std::fs::set_permissions(&real_root, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let link_parent = base.join("link-parent");
+        std::os::unix::fs::symlink(&target_parent, &link_parent).unwrap();
+        let root_via_link = link_parent.join("root");
+
+        let error = claw_vpn_t1_canonical_audit_log_path(root_via_link).unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn t1_audit_log_path_rejects_file_root() {
+        let dir = t1_audit_sink_test_tempdir();
+        let root_file = dir.path().join("root-file");
+        std::fs::write(&root_file, b"not a directory").unwrap();
+        let root_file = root_file.canonicalize().unwrap();
+
+        let error = claw_vpn_t1_canonical_audit_log_path(root_file).unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn t1_audit_log_path_rejects_shared_root_directory() {
+        let (_dir, root) = t1_canonical_owner_only_audit_root();
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let error = claw_vpn_t1_canonical_audit_log_path(root).unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
     }
 
     #[test]

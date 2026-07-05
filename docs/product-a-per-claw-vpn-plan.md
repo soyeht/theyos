@@ -156,17 +156,22 @@ to the validated parent fd with `O_NOFOLLOW`, and creates or requires a real,
 current-user-owned, mode `0700` final parent directory for the log file. The
 router module also provides a reviewed keyed export redactor that derives
 off-host subject identifiers with HMAC-SHA-256 and does not emit the local
-pseudonymous subject hashes. These remain helpers for the future activation
-slice, not the mounted sink or an active export path. The source guard
-tripwires those helpers, their public types, and their constants outside the T1
-router module so future wiring into the mount or export caller reopens review.
+pseudonymous subject hashes. It also provides a reviewed fixed audit-log path
+selector that accepts only an absolute, canonical, current-user-owned, mode
+`0700` root directory and appends the fixed
+`claw-vpn-t1-audit/audit.jsonl` suffix. These remain helpers for the future
+activation slice, not the mounted sink or an active export path. The source
+guard tripwires those helpers, their public types, and their constants outside
+the T1 router module so future wiring into the mount or export caller reopens
+review.
 The current
 default-off mount supplies only a placeholder sink behind missing preflight, so
 a future activation slice must replace that placeholder with reviewed
-persistence policy and safe path selection for the exact artifact SHA,
-including a fixed owner-controlled location, the chosen retention/rotation
-limits, the reviewed export key source/rotation policy, and the chosen
-best-effort-vs-durable authorization/in-flight semantics. The mount now
+persistence policy and a reviewed root source for the exact artifact SHA,
+including the owner-controlled canonical root passed to the fixed path helper,
+the chosen retention/rotation limits, the reviewed export key source/rotation
+policy, and the chosen best-effort-vs-durable authorization/in-flight
+semantics. The mount now
 injects that backend through the same T1 caller gate, but the production path
 still supplies
 `PerClawVpnT1PreflightEvidence::missing`, so even with the T1 dev env present it
@@ -544,11 +549,14 @@ Access between members/devices and claws is explicitly many-to-many:
   parent directory. The router module also has a reviewed HMAC-SHA-256 export
   redactor that emits keyed subject hashes instead of the local pseudonymous
   hashes for future off-host/shared audit export. The source guard tripwires
-  these helpers outside the T1 router module, but they are not wired into the
-  mount or export caller until that exact SHA-bound live-run review; fixed safe
-  path location, final retention/rotation limits, export key source/rotation,
-  and the final best-effort-vs-durable authorization/in-flight semantics still
-  belong to that activation review. The
+  these helpers outside the T1 router module. The router module also has a
+  reviewed fixed audit-log path selector that requires an absolute canonical
+  euid-owned `0700` root and appends the fixed
+  `claw-vpn-t1-audit/audit.jsonl` suffix. None of these helpers are wired into
+  the mount or export caller until that exact SHA-bound live-run review; the
+  activation root source, final retention/rotation limits, export key
+  source/rotation, and the final best-effort-vs-durable
+  authorization/in-flight semantics still belong to that activation review. The
   environment-backed mount still supplies missing preflight
   evidence, so `Disabled`/invalid/missing-preflight/`Dial` paths all fall back
   to the unavailable `IpTunnel` router before building runtime inputs, opening

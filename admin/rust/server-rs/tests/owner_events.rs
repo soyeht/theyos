@@ -4475,13 +4475,16 @@ fn product_a_per_claw_vpn_dev_config_remains_default_off_and_unwired() {
                 || line.contains("claw_vpn_t1_caller");
             let references_t1_relay_stream_audit_sink = line
                 .contains("claw_vpn_t1_spooled_jsonl_audit_sink")
+                || line.contains("claw_vpn_t1_canonical_audit_log_path")
                 || line.contains("claw_vpn_t1_keyed_audit_export_jsonl")
                 || line.contains("ClawVpnT1AuditExportHmacKey")
                 || line.contains("ClawVpnT1AuditSinkError")
                 || line.contains("CLAW_VPN_T1_AUDIT_SINK_QUEUE_CAPACITY")
                 || line.contains("CLAW_VPN_T1_AUDIT_LOG_ROTATE_BYTES")
                 || line.contains("CLAW_VPN_T1_AUDIT_LOG_RETAINED_FILES")
-                || line.contains("CLAW_VPN_T1_AUDIT_EXPORT_HMAC_KEY_BYTES");
+                || line.contains("CLAW_VPN_T1_AUDIT_EXPORT_HMAC_KEY_BYTES")
+                || line.contains("CLAW_VPN_T1_AUDIT_LOG_DIRECTORY_NAME")
+                || line.contains("CLAW_VPN_T1_AUDIT_LOG_FILE_NAME");
             let references_target_session_runtime_bridge = line
                 .contains("ClawVpnTargetSessionRuntime")
                 || line.contains("claw_vpn_target_session_runtime");
