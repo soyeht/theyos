@@ -2449,4 +2449,97 @@ mod tests {
             0o600
         );
     }
+
+    #[tokio::test]
+    async fn t1_relay_stream_router_present_preflight_rejects_failed_audit_sink() {
+        let parts_built = Arc::new(AtomicUsize::new(0));
+        let build_count = Arc::new(AtomicUsize::new(0));
+        let launch_count = Arc::new(AtomicUsize::new(0));
+        let audit_count = Arc::new(AtomicUsize::new(0));
+        let status = assemble_claw_vpn_t1_relay_stream_router::<FakeInterface, _, _, _, _, _>(
+            || Ok(Some(live_config())),
+            || PerClawVpnT1PreflightEvidence::new(true, true, true),
+            {
+                let parts_built = Arc::clone(&parts_built);
+                let build_count = Arc::clone(&build_count);
+                let launch_count = Arc::clone(&launch_count);
+                let audit_count = Arc::clone(&audit_count);
+                move |_config| {
+                    parts_built.fetch_add(1, Ordering::SeqCst);
+                    ClawVpnT1RelayStreamRouterParts::new(
+                        enabled_runtime_config(),
+                        Duration::from_secs(1),
+                        {
+                            let build_count = Arc::clone(&build_count);
+                            move |
+                                _config: &ClawVpnDevConfig,
+                                _target: &RelayStreamIpTunnelTarget,
+                                _context: ClawVpnRuntimeWiringContext,
+                                relay: ClawVpnRelayStream<StdUnixStream>,
+                            | -> io::Result<ClawVpnT1RelayStreamWiringInputs<FakeInterface>> {
+                                build_count.fetch_add(1, Ordering::SeqCst);
+                                Ok(inputs(FakeInterface::empty(), relay))
+                            }
+                        },
+                        {
+                            let launch_count = Arc::clone(&launch_count);
+                            move |_wiring: ClawVpnTargetSessionRouterWiring<FakeInterface>| {
+                                launch_count.fetch_add(1, Ordering::SeqCst);
+                                Ok::<(), crate::claw_vpn_target_session_router::ClawVpnTargetSessionRouterLaunchError>(
+                                    (),
+                                )
+                            }
+                        },
+                        {
+                            let audit_count = Arc::clone(&audit_count);
+                            Box::new(move |event: ClawVpnAuditEvent| {
+                                let index = audit_count.fetch_add(1, Ordering::SeqCst);
+                                match index {
+                                    0 => {
+                                        assert_eq!(event.action(), ClawVpnAuditAction::SessionOpen);
+                                        assert_eq!(
+                                            event.reason(),
+                                            ClawVpnAuditReason::SessionOpened
+                                        );
+                                        Err("claw-vpn-t1-audit-open-failed")
+                                    }
+                                    1 => {
+                                        assert_eq!(
+                                            event.action(),
+                                            ClawVpnAuditAction::SessionClose
+                                        );
+                                        assert_eq!(
+                                            event.reason(),
+                                            ClawVpnAuditReason::SessionClosed
+                                        );
+                                        Ok(())
+                                    }
+                                    _ => unreachable!(),
+                                }
+                            })
+                        },
+                    )
+                }
+            },
+        );
+        let (_mode, router) = status
+            .into_ready()
+            .expect("present Live preflight must build the T1 router");
+
+        let error = match router
+            .open_ip_tunnel(target("member-alpha", "claw-alpha"))
+            .await
+        {
+            Ok(_) => panic!("audit sink failure must reject the T1 target session"),
+            Err(error) => error,
+        };
+
+        assert!(
+            matches!(error, DataTunnelError::TargetUnavailable(reason) if reason == "claw-vpn-t1-audit-open-failed")
+        );
+        assert_eq!(parts_built.load(Ordering::SeqCst), 1);
+        assert_eq!(audit_count.load(Ordering::SeqCst), 2);
+        assert_eq!(build_count.load(Ordering::SeqCst), 0);
+        assert_eq!(launch_count.load(Ordering::SeqCst), 0);
+    }
 }
