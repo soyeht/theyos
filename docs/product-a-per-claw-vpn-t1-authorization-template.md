@@ -62,18 +62,37 @@ the fd-relative `O_NOFOLLOW` traversal.
 The activation PR must verify that each reference points to the real reviewed
 artifact it names; the loader only checks that the references are non-empty and
 that the SHA, scope, production flag, booleans, and audit-root shape are valid.
-Before opening the activation PR, validate the private record locally without
-printing its values:
+Before opening the activation PR, prepare and validate the private record
+locally without printing its values:
 
 ```sh
+scripts/prepare-t1-preflight-evidence-record.py \
+  <exact-40-hex-artifact-sha>
+
 scripts/validate-t1-preflight-evidence-record.py \
   <exact-40-hex-artifact-sha> \
   .env.t1-preflight-evidence.json \
   --check-root-dir
 ```
 
+The prepare helper creates or updates the private draft and audit root, then
+prints only status plus missing field names such as `owner_authorization_ref`,
+`rollback_ref`, and `hardware_evidence_ref`. It does not print private ref
+values, it does not verify the referenced artifacts, and it does not authorize
+activation.
+
 The `.env.t1-preflight-evidence.json` file name is ignored by the repository's
 `.gitignore`; keep the filled record private.
+
+Before asking for any activation review, run the non-live local default-off
+bundle:
+
+```sh
+scripts/check-t1-preflight-default-off.py
+```
+
+That bundle only runs Python helper/validator tests and Rust default-off tests;
+it does not open TUN/utun, install routes, launch runtime, or touch production.
 
 ## Rollback Readiness
 
