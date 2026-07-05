@@ -54,6 +54,8 @@ def canonical_private_audit_root(path: str) -> str:
 
 def write_private_record(path: str, record: dict[str, object]) -> None:
     output = Path(path)
+    output.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    os.chmod(output.parent, 0o700)
     if output.exists():
         os.chmod(output, 0o600)
 

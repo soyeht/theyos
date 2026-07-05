@@ -199,6 +199,35 @@ class PrepareT1PreflightEvidenceRecordTests(unittest.TestCase):
             self.assertEqual(0o600, stat.S_IMODE(os.lstat(record_path).st_mode))
             self.assertEqual([], list(tmpdir.glob(".private-evidence.json.tmp-*")))
 
+    def test_creates_private_record_parent_directory_with_restricted_mode(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmpdir = Path(tmp)
+            record_dir = tmpdir / "private-records"
+            record_path = record_dir / "private-evidence.json"
+            audit_root = tmpdir / "audit-root"
+
+            proc = self.run_prepare("--record", str(record_path), "--audit-root", str(audit_root))
+
+            self.assertEqual(0, proc.returncode, proc.stderr)
+            self.assertTrue(record_path.exists())
+            self.assertEqual(0o700, stat.S_IMODE(os.lstat(record_dir).st_mode))
+            self.assertEqual(0o600, stat.S_IMODE(os.lstat(record_path).st_mode))
+
+    def test_restricts_existing_private_record_parent_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmpdir = Path(tmp)
+            record_dir = tmpdir / "private-records"
+            record_dir.mkdir(mode=0o755)
+            os.chmod(record_dir, 0o755)
+            record_path = record_dir / "private-evidence.json"
+            audit_root = tmpdir / "audit-root"
+
+            proc = self.run_prepare("--record", str(record_path), "--audit-root", str(audit_root))
+
+            self.assertEqual(0, proc.returncode, proc.stderr)
+            self.assertEqual(0o700, stat.S_IMODE(os.lstat(record_dir).st_mode))
+            self.assertEqual(0o600, stat.S_IMODE(os.lstat(record_path).st_mode))
+
 
 if __name__ == "__main__":
     unittest.main()
