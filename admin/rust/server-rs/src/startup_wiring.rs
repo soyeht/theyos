@@ -152,6 +152,25 @@ pub fn load_per_claw_vpn_t1_preflight_evidence_record(
     parse_per_claw_vpn_t1_preflight_evidence_record(&json, expected_artifact_sha)
 }
 
+pub fn load_per_claw_vpn_t1_preflight_evidence_record_for_current_build(
+    path: impl AsRef<Path>,
+) -> Result<PerClawVpnT1PreflightEvidenceBundle, PerClawVpnT1PreflightEvidenceLoadError> {
+    load_per_claw_vpn_t1_preflight_evidence_record_for_build_sha(
+        path,
+        theyos_server_build_git_sha(),
+    )
+}
+
+fn load_per_claw_vpn_t1_preflight_evidence_record_for_build_sha(
+    path: impl AsRef<Path>,
+    build_git_sha: Option<&str>,
+) -> Result<PerClawVpnT1PreflightEvidenceBundle, PerClawVpnT1PreflightEvidenceLoadError> {
+    let Some(expected_artifact_sha) = build_git_sha else {
+        return Err(PerClawVpnT1PreflightEvidenceLoadError::InvalidArtifactSha);
+    };
+    load_per_claw_vpn_t1_preflight_evidence_record(path, expected_artifact_sha)
+}
+
 pub fn parse_per_claw_vpn_t1_preflight_evidence_record(
     json: &str,
     expected_artifact_sha: &str,
@@ -665,6 +684,53 @@ mod tests {
                 mode: ClawVpnDevMode::Live
             }
         );
+    }
+
+    #[test]
+    fn t1_preflight_evidence_record_loads_for_current_build_when_sha_available() {
+        let Some(artifact_sha) = theyos_server_build_git_sha() else {
+            return;
+        };
+        let audit_root = "/tmp/t1-evidence-root";
+        let json =
+            t1_preflight_evidence_json(artifact_sha, false, "rollback-artifact-alpha", audit_root);
+
+        let tempdir = tempfile::tempdir().unwrap();
+        let evidence_path = tempdir.path().join("evidence.json");
+        std::fs::write(&evidence_path, json).unwrap();
+
+        let bundle =
+            load_per_claw_vpn_t1_preflight_evidence_record_for_current_build(&evidence_path)
+                .unwrap();
+
+        assert!(bundle.evidence().has_owner_authorization());
+        assert!(bundle.evidence().has_rollback());
+        assert!(bundle.evidence().has_hardware_t1_t4());
+        assert_eq!(bundle.audit_root(), Path::new(audit_root));
+    }
+
+    #[test]
+    fn t1_preflight_evidence_record_rejects_unknown_current_build_sha() {
+        let artifact_sha = "0123456789abcdef0123456789abcdef01234567";
+        let json = t1_preflight_evidence_json(
+            artifact_sha,
+            false,
+            "rollback-artifact-alpha",
+            "/tmp/t1-evidence-root",
+        );
+
+        let tempdir = tempfile::tempdir().unwrap();
+        let evidence_path = tempdir.path().join("evidence.json");
+        std::fs::write(&evidence_path, json).unwrap();
+
+        let error =
+            load_per_claw_vpn_t1_preflight_evidence_record_for_build_sha(&evidence_path, None)
+                .expect_err("unknown build SHA must not load evidence");
+
+        assert!(matches!(
+            error,
+            PerClawVpnT1PreflightEvidenceLoadError::InvalidArtifactSha
+        ));
     }
 
     #[test]
