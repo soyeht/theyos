@@ -213,14 +213,30 @@ fn claw_vpn_t1_audit_log_file_name(path: &Path) -> io::Result<CString> {
     claw_vpn_t1_path_component_cstring(file_name)
 }
 
-fn open_claw_vpn_t1_audit_log_file(parent_dir: &File, file_name: &CString) -> io::Result<File> {
+fn open_claw_vpn_t1_audit_log_file(
+    parent_dir: &impl AsRawFd,
+    file_name: &CString,
+) -> io::Result<File> {
     let file = open_claw_vpn_t1_audit_file_at(parent_dir.as_raw_fd(), file_name)?;
     file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
     Ok(file)
 }
 
-struct ClawVpnT1RotatingAuditLog {
-    parent_dir: File,
+trait ClawVpnT1AuditParentDir: AsRawFd + Send {
+    fn sync_audit_dir(&self) -> io::Result<()>;
+}
+
+impl ClawVpnT1AuditParentDir for File {
+    fn sync_audit_dir(&self) -> io::Result<()> {
+        self.sync_all()
+    }
+}
+
+struct ClawVpnT1RotatingAuditLog<P = File>
+where
+    P: ClawVpnT1AuditParentDir,
+{
+    parent_dir: P,
     file_name: CString,
     file: File,
     current_len: u64,
@@ -228,9 +244,23 @@ struct ClawVpnT1RotatingAuditLog {
     retained_files: usize,
 }
 
-impl ClawVpnT1RotatingAuditLog {
+impl ClawVpnT1RotatingAuditLog<File> {
     fn open(
         parent_dir: File,
+        file_name: CString,
+        rotate_bytes: u64,
+        retained_files: usize,
+    ) -> io::Result<Self> {
+        Self::open_with_parent(parent_dir, file_name, rotate_bytes, retained_files)
+    }
+}
+
+impl<P> ClawVpnT1RotatingAuditLog<P>
+where
+    P: ClawVpnT1AuditParentDir,
+{
+    fn open_with_parent(
+        parent_dir: P,
         file_name: CString,
         rotate_bytes: u64,
         retained_files: usize,
@@ -260,12 +290,16 @@ impl ClawVpnT1RotatingAuditLog {
             self.retained_files,
         )?;
         self.file = open_claw_vpn_t1_audit_log_file(&self.parent_dir, &self.file_name)?;
+        self.parent_dir.sync_audit_dir()?;
         self.current_len = 0;
         Ok(())
     }
 }
 
-impl ClawVpnT1AuditLogWriter for ClawVpnT1RotatingAuditLog {
+impl<P> ClawVpnT1AuditLogWriter for ClawVpnT1RotatingAuditLog<P>
+where
+    P: ClawVpnT1AuditParentDir,
+{
     fn write_audit_record(&mut self, record: &[u8]) -> io::Result<()> {
         let record_len = record.len() as u64;
         if record_len > self.rotate_bytes {
@@ -1118,6 +1152,28 @@ mod tests {
         }
     }
 
+    struct TrackingAuditParentDir {
+        file: File,
+        sync_count: Arc<AtomicUsize>,
+        fail_sync: bool,
+    }
+
+    impl AsRawFd for TrackingAuditParentDir {
+        fn as_raw_fd(&self) -> RawFd {
+            self.file.as_raw_fd()
+        }
+    }
+
+    impl ClawVpnT1AuditParentDir for TrackingAuditParentDir {
+        fn sync_audit_dir(&self) -> io::Result<()> {
+            self.sync_count.fetch_add(1, Ordering::SeqCst);
+            if self.fail_sync {
+                return Err(io::Error::other("parent dir sync failed"));
+            }
+            self.file.sync_all()
+        }
+    }
+
     #[tokio::test]
     async fn t1_spooled_audit_sink_writes_redacted_jsonl_without_raw_target_ids() {
         let build_count = Arc::new(AtomicUsize::new(0));
@@ -1236,6 +1292,49 @@ mod tests {
             Err("claw-vpn-t1-audit-sink-unavailable")
         );
         assert_eq!(std::fs::read_to_string(&audit_path).unwrap(), "");
+    }
+
+    #[test]
+    fn t1_spooled_audit_sink_rejects_after_parent_dir_sync_failure() {
+        let dir = t1_audit_sink_test_tempdir();
+        let audit_path = dir.path().join("audit").join("audit.jsonl");
+        let parent_dir = ensure_claw_vpn_t1_audit_parent(audit_path.parent().unwrap()).unwrap();
+        let sync_count = Arc::new(AtomicUsize::new(0));
+        let first = t1_open_audit_event_for_member("member-parent-sync-one");
+        let second = t1_open_audit_event_for_member("member-parent-sync-two");
+        let first_line = claw_vpn_t1_redacted_audit_jsonl(&first);
+        let second_line = claw_vpn_t1_redacted_audit_jsonl(&second);
+        let rotate_bytes = first_line.len() as u64 + 1;
+        let writer = ClawVpnT1RotatingAuditLog::open_with_parent(
+            TrackingAuditParentDir {
+                file: parent_dir,
+                sync_count: Arc::clone(&sync_count),
+                fail_sync: true,
+            },
+            claw_vpn_t1_audit_log_file_name(&audit_path).unwrap(),
+            rotate_bytes,
+            1,
+        )
+        .unwrap();
+        let (sender, receiver) = sync_channel(4);
+        let healthy = Arc::new(AtomicBool::new(true));
+        let handle =
+            spawn_claw_vpn_t1_audit_worker(writer, receiver, Arc::clone(&healthy)).unwrap();
+
+        claw_vpn_t1_try_enqueue_audit_event(&sender, &healthy, first).unwrap();
+        claw_vpn_t1_try_enqueue_audit_event(&sender, &healthy, second).unwrap();
+        handle.join().unwrap();
+
+        assert_eq!(sync_count.load(Ordering::SeqCst), 1);
+        assert!(!healthy.load(Ordering::SeqCst));
+        assert_eq!(
+            claw_vpn_t1_try_enqueue_audit_event(&sender, &healthy, t1_open_audit_event_for_test()),
+            Err("claw-vpn-t1-audit-sink-unavailable")
+        );
+        let rotated_path = audit_path.with_file_name("audit.jsonl.1");
+        assert!(read_audit_file_until(&rotated_path, &first_line).contains(&first_line));
+        let active = std::fs::read_to_string(&audit_path).unwrap_or_default();
+        assert!(!active.contains(&second_line));
     }
 
     #[test]
