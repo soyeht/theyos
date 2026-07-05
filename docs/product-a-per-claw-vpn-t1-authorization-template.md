@@ -62,6 +62,18 @@ the fd-relative `O_NOFOLLOW` traversal.
 The activation PR must verify that each reference points to the real reviewed
 artifact it names; the loader only checks that the references are non-empty and
 that the SHA, scope, production flag, booleans, and audit-root shape are valid.
+Before opening the activation PR, validate the private record locally without
+printing its values:
+
+```sh
+scripts/validate-t1-preflight-evidence-record.py \
+  <exact-40-hex-artifact-sha> \
+  .env.t1-preflight-evidence.json \
+  --check-root-dir
+```
+
+The `.env.t1-preflight-evidence.json` file name is ignored by the repository's
+`.gitignore`; keep the filled record private.
 
 ## Rollback Readiness
 
