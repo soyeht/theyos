@@ -95,6 +95,10 @@ class PrepareT1PreflightEvidenceRecordTests(unittest.TestCase):
 
             self.assertEqual(0, proc.returncode, proc.stderr)
             self.assertNotIn("record remains incomplete", proc.stdout)
+            self.assertIn(
+                "INFO: refs are present, but activation still must verify their reviewed contents",
+                proc.stdout,
+            )
             record = self.read_record(record_path)
             self.assertEqual([], validator.validate_record(record, ARTIFACT_SHA, check_root_dir=True))
 

@@ -147,6 +147,8 @@ def main() -> int:
     print("OK: private audit root is present with mode 0700")
     if not (owner_ref and rollback_ref and hardware_ref):
         print("INFO: record remains incomplete until all private refs are supplied")
+    else:
+        print("INFO: refs are present, but activation still must verify their reviewed contents")
     return 0
 
 
