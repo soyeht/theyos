@@ -4518,6 +4518,13 @@ fn product_a_per_claw_vpn_dev_config_remains_default_off_and_unwired() {
             let references_t1_preflight_gate = line.contains("PerClawVpnT1PreflightEvidence")
                 || line.contains("per_claw_vpn_startup_gate_with_preflight")
                 || line.contains("PreflightEvidencePresent");
+            let references_t1_preflight_evidence_record = line
+                .contains("load_per_claw_vpn_t1_preflight_evidence_record")
+                || line.contains("parse_per_claw_vpn_t1_preflight_evidence_record")
+                || line.contains("PerClawVpnT1PreflightEvidenceBundle")
+                || line.contains("PerClawVpnT1PreflightEvidenceLoadError")
+                || line.contains("PER_CLAW_VPN_T1_PREFLIGHT_EVIDENCE_SCHEMA")
+                || line.contains("per_claw_vpn_t1_preflight_evidence_v1");
             let allowed_tun_packet_interface_adapter = (in_linux_tun_module
                 || in_macos_utun_module)
                 && line.contains("ClawVpnPacketInterface")
@@ -4674,6 +4681,8 @@ fn product_a_per_claw_vpn_dev_config_remains_default_off_and_unwired() {
                 in_t1_relay_stream_router_module && references_t1_preflight_gate;
             let allowed_relay_stream_mount_preflight_gate =
                 in_relay_stream_mount_module && references_t1_preflight_gate;
+            let allowed_startup_wiring_preflight_evidence_record =
+                in_startup_wiring_module && references_t1_preflight_evidence_record;
             let allowed_t1_caller_target_session_router =
                 in_t1_caller_module && references_target_session_router_adapter;
             let allowed_t1_relay_stream_router_t1_caller_gate =
@@ -4771,6 +4780,8 @@ fn product_a_per_claw_vpn_dev_config_remains_default_off_and_unwired() {
                     && !allowed_t1_relay_stream_router_preflight_gate
                     && !allowed_relay_stream_mount_preflight_gate
                     && references_t1_preflight_gate)
+                || (!allowed_startup_wiring_preflight_evidence_record
+                    && references_t1_preflight_evidence_record)
                 || (!in_runtime_module
                     && !in_wiring_module
                     && !(in_target_session_router_module && in_target_session_router_tests)

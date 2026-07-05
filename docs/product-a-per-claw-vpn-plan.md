@@ -171,10 +171,18 @@ broader wiring reopens review.
 The current
 default-off mount still supplies
 `PerClawVpnT1PreflightEvidence::missing`, so a future activation slice must add
-reviewed evidence loading for the exact artifact SHA, bind the
-owner-controlled canonical root value to that evidence, and decide the final
-retention/rotation limits, reviewed export key source/rotation policy, and
-best-effort-vs-durable authorization/in-flight semantics. The mount now
+reviewed wiring from the SHA-bound evidence record to the mount gate, bind the
+owner-controlled canonical root value from that evidence to the audit sink, and
+decide the final retention/rotation limits, reviewed export key source/rotation
+policy, and best-effort-vs-durable authorization/in-flight semantics. The
+startup wiring module now has a reviewed parser/loader for a
+`per_claw_vpn_t1_preflight_evidence_v1` JSON record that requires an exact
+40-hex artifact SHA match, `dev-host T1-T4 only` scope, production activation
+set to false, owner/rollback/hardware booleans, non-empty references to the
+owner authorization, rollback artifact, and hardware evidence pack, and an
+absolute normal `audit_root`; that helper is not called by the mount or the
+server binary in the default path, and the source guard tripwires those evidence
+record symbols outside `startup_wiring`. The mount now
 injects that backend through the same T1 caller gate, but the production path
 still supplies
 `PerClawVpnT1PreflightEvidence::missing`, so even with the T1 dev env present it
@@ -183,7 +191,7 @@ installing routes, building runtime inputs, spawning the launcher, or running
 the packet pump. The source guard has a narrowly scoped mount exception for this
 reviewed wiring and continues to tripwire the same symbols anywhere else.
 There is still no
-checked-in evidence loader or authorized product/default path that can make the
+authorized product/default path that calls the evidence loader or can make the
 T1 mount backend ready, no runtime/bin that opens a TUN/utun interface in a
 default path, no route installation or packet pump execution in default
 bootstrap, no storage-backed session registry, iOS Packet
@@ -555,12 +563,18 @@ Access between members/devices and claws is explicitly many-to-many:
   these helpers outside the T1 router module. The router module also has a
   reviewed fixed audit-log path selector that requires an absolute canonical
   euid-owned `0700` root and appends the fixed
-  `claw-vpn-t1-audit/audit.jsonl` suffix. None of these helpers are wired into
-  the mount or export caller until that exact SHA-bound live-run review; the
-  activation root source, final retention/rotation limits, export key
-  source/rotation, and the final best-effort-vs-durable
-  authorization/in-flight semantics still belong to that activation review. The
-  environment-backed mount still supplies missing preflight
+  `claw-vpn-t1-audit/audit.jsonl` suffix. The default-off mount wires the local
+  audit sink builder only behind missing preflight, and the startup wiring
+  module has a reviewed SHA-bound evidence record parser/loader that remains
+  unused by the mount and binary and is source-guarded outside
+  `startup_wiring`. The record includes non-empty references to the owner
+  authorization, rollback artifact, and hardware evidence pack. The
+  future activation review must connect that evidence record to the mount gate,
+  bind the evidence `audit_root` to the sink path, choose final
+  retention/rotation limits, choose export key source/rotation, and decide the
+  final best-effort-vs-durable
+  authorization/in-flight semantics. The environment-backed mount still
+  supplies missing preflight
   evidence, so `Disabled`/invalid/missing-preflight/`Dial` paths all fall back
   to the unavailable `IpTunnel` router before building runtime inputs, opening
   TUN/utun, installing routes, spawning the launcher, or running the packet

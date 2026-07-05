@@ -1,6 +1,8 @@
 //! Small startup wiring helpers kept in the library so the binary's boot
 //! path can be tested without launching the full server.
 
+use std::io;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use crate::apns_push::{self, HouseCreatedTransport};
@@ -66,6 +68,143 @@ impl PerClawVpnT1PreflightEvidence {
     pub const fn has_hardware_t1_t4(self) -> bool {
         self.hardware_t1_t4
     }
+}
+
+pub const PER_CLAW_VPN_T1_PREFLIGHT_EVIDENCE_SCHEMA: &str = "per_claw_vpn_t1_preflight_evidence_v1";
+const PER_CLAW_VPN_T1_PREFLIGHT_SCOPE_DEV_T1_T4: &str = "dev-host T1-T4 only";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PerClawVpnT1PreflightEvidenceBundle {
+    evidence: PerClawVpnT1PreflightEvidence,
+    audit_root: PathBuf,
+}
+
+impl PerClawVpnT1PreflightEvidenceBundle {
+    #[must_use]
+    pub fn evidence(&self) -> PerClawVpnT1PreflightEvidence {
+        self.evidence
+    }
+
+    #[must_use]
+    pub fn audit_root(&self) -> &Path {
+        &self.audit_root
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum PerClawVpnT1PreflightEvidenceLoadError {
+    #[error("per-Claw VPN T1 preflight evidence read failed")]
+    Read(#[source] io::Error),
+
+    #[error("per-Claw VPN T1 preflight evidence parse failed")]
+    Parse(#[source] serde_json::Error),
+
+    #[error("per-Claw VPN T1 preflight evidence schema is invalid")]
+    InvalidSchema,
+
+    #[error("per-Claw VPN T1 preflight evidence scope is invalid")]
+    InvalidScope,
+
+    #[error("per-Claw VPN T1 preflight evidence artifact SHA is invalid")]
+    InvalidArtifactSha,
+
+    #[error("per-Claw VPN T1 preflight evidence artifact SHA mismatch")]
+    ArtifactShaMismatch,
+
+    #[error("per-Claw VPN T1 preflight evidence cannot authorize production")]
+    ProductionActivationRequested,
+
+    #[error("per-Claw VPN T1 preflight evidence reference is missing")]
+    MissingEvidenceReference,
+
+    #[error("per-Claw VPN T1 preflight evidence audit root is invalid")]
+    InvalidAuditRoot,
+}
+
+#[derive(serde::Deserialize)]
+struct PerClawVpnT1PreflightEvidenceRecord {
+    schema: String,
+    artifact_sha: String,
+    scope: String,
+    production_activation: bool,
+    #[serde(flatten)]
+    gates: PerClawVpnT1PreflightEvidenceRecordGates,
+    owner_authorization_ref: String,
+    rollback_ref: String,
+    hardware_evidence_ref: String,
+    audit_root: PathBuf,
+}
+
+#[derive(serde::Deserialize)]
+struct PerClawVpnT1PreflightEvidenceRecordGates {
+    owner_authorization: bool,
+    rollback: bool,
+    hardware_t1_t4: bool,
+}
+
+pub fn load_per_claw_vpn_t1_preflight_evidence_record(
+    path: impl AsRef<Path>,
+    expected_artifact_sha: &str,
+) -> Result<PerClawVpnT1PreflightEvidenceBundle, PerClawVpnT1PreflightEvidenceLoadError> {
+    let json =
+        std::fs::read_to_string(path).map_err(PerClawVpnT1PreflightEvidenceLoadError::Read)?;
+    parse_per_claw_vpn_t1_preflight_evidence_record(&json, expected_artifact_sha)
+}
+
+pub fn parse_per_claw_vpn_t1_preflight_evidence_record(
+    json: &str,
+    expected_artifact_sha: &str,
+) -> Result<PerClawVpnT1PreflightEvidenceBundle, PerClawVpnT1PreflightEvidenceLoadError> {
+    if !is_full_git_sha(expected_artifact_sha) {
+        return Err(PerClawVpnT1PreflightEvidenceLoadError::InvalidArtifactSha);
+    }
+    let record: PerClawVpnT1PreflightEvidenceRecord =
+        serde_json::from_str(json).map_err(PerClawVpnT1PreflightEvidenceLoadError::Parse)?;
+    if record.schema != PER_CLAW_VPN_T1_PREFLIGHT_EVIDENCE_SCHEMA {
+        return Err(PerClawVpnT1PreflightEvidenceLoadError::InvalidSchema);
+    }
+    if record.scope != PER_CLAW_VPN_T1_PREFLIGHT_SCOPE_DEV_T1_T4 {
+        return Err(PerClawVpnT1PreflightEvidenceLoadError::InvalidScope);
+    }
+    if record.production_activation {
+        return Err(PerClawVpnT1PreflightEvidenceLoadError::ProductionActivationRequested);
+    }
+    if record.owner_authorization_ref.trim().is_empty()
+        || record.rollback_ref.trim().is_empty()
+        || record.hardware_evidence_ref.trim().is_empty()
+    {
+        return Err(PerClawVpnT1PreflightEvidenceLoadError::MissingEvidenceReference);
+    }
+    if !is_full_git_sha(&record.artifact_sha) {
+        return Err(PerClawVpnT1PreflightEvidenceLoadError::InvalidArtifactSha);
+    }
+    if record.artifact_sha != expected_artifact_sha {
+        return Err(PerClawVpnT1PreflightEvidenceLoadError::ArtifactShaMismatch);
+    }
+    if !record.audit_root.is_absolute() || has_non_normal_path_component(&record.audit_root) {
+        return Err(PerClawVpnT1PreflightEvidenceLoadError::InvalidAuditRoot);
+    }
+    Ok(PerClawVpnT1PreflightEvidenceBundle {
+        evidence: PerClawVpnT1PreflightEvidence {
+            owner_authorization: record.gates.owner_authorization,
+            rollback: record.gates.rollback,
+            hardware_t1_t4: record.gates.hardware_t1_t4,
+        },
+        audit_root: record.audit_root,
+    })
+}
+
+fn is_full_git_sha(value: &str) -> bool {
+    value.len() == 40 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn has_non_normal_path_component(path: &Path) -> bool {
+    path.components().any(|component| {
+        !matches!(
+            component,
+            std::path::Component::RootDir | std::path::Component::Normal(_)
+        )
+    })
 }
 
 /// Install the production `house_created` APNs transport from environment.
@@ -422,6 +561,173 @@ mod tests {
                 mode: ClawVpnDevMode::Dial
             }
         );
+    }
+
+    fn t1_preflight_evidence_json(
+        artifact_sha: &str,
+        production_activation: bool,
+        rollback_ref: &str,
+        audit_root: &str,
+    ) -> String {
+        serde_json::json!({
+            "schema": PER_CLAW_VPN_T1_PREFLIGHT_EVIDENCE_SCHEMA,
+            "artifact_sha": artifact_sha,
+            "scope": "dev-host T1-T4 only",
+            "production_activation": production_activation,
+            "owner_authorization": true,
+            "owner_authorization_ref": "owner-authorization-alpha",
+            "rollback": true,
+            "rollback_ref": rollback_ref,
+            "hardware_t1_t4": true,
+            "hardware_evidence_ref": "evidence-pack-t1-t4-alpha",
+            "audit_root": audit_root,
+        })
+        .to_string()
+    }
+
+    #[test]
+    fn t1_preflight_evidence_record_loads_sha_bound_dev_evidence() {
+        let artifact_sha = "0123456789abcdef0123456789abcdef01234567";
+        let audit_root = "/tmp/t1-evidence-root";
+        let json =
+            t1_preflight_evidence_json(artifact_sha, false, "rollback-artifact-alpha", audit_root);
+
+        let tempdir = tempfile::tempdir().unwrap();
+        let evidence_path = tempdir.path().join("evidence.json");
+        std::fs::write(&evidence_path, json).unwrap();
+
+        let bundle =
+            load_per_claw_vpn_t1_preflight_evidence_record(&evidence_path, artifact_sha).unwrap();
+
+        assert!(bundle.evidence().has_owner_authorization());
+        assert!(bundle.evidence().has_rollback());
+        assert!(bundle.evidence().has_hardware_t1_t4());
+        assert_eq!(bundle.audit_root(), Path::new(audit_root));
+
+        let config = ClawVpnDevConfig::from_values(
+            Some("1"),
+            None,
+            Some("relay-stream://127.0.0.1:49152"),
+            Some("198.18.0.0/24"),
+            None,
+            None,
+        )
+        .unwrap()
+        .unwrap();
+        let status =
+            per_claw_vpn_startup_gate_with_preflight(|| Ok(Some(config)), || bundle.evidence());
+
+        assert_eq!(
+            status,
+            PerClawVpnStartupStatus::PreflightEvidencePresent {
+                mode: ClawVpnDevMode::Live
+            }
+        );
+    }
+
+    #[test]
+    fn t1_preflight_evidence_record_rejects_wrong_artifact_sha() {
+        let expected_sha = "0123456789abcdef0123456789abcdef01234567";
+        let record_sha = "abcdef0123456789abcdef0123456789abcdef01";
+        let json = t1_preflight_evidence_json(
+            record_sha,
+            false,
+            "rollback-artifact-alpha",
+            "/tmp/t1-evidence-root",
+        );
+
+        let error = parse_per_claw_vpn_t1_preflight_evidence_record(&json, expected_sha)
+            .expect_err("stale evidence must not load");
+
+        assert!(matches!(
+            error,
+            PerClawVpnT1PreflightEvidenceLoadError::ArtifactShaMismatch
+        ));
+    }
+
+    #[test]
+    fn t1_preflight_evidence_record_rejects_schema_and_scope_drift() {
+        let artifact_sha = "0123456789abcdef0123456789abcdef01234567";
+        let base_json = t1_preflight_evidence_json(
+            artifact_sha,
+            false,
+            "rollback-artifact-alpha",
+            "/tmp/t1-evidence-root",
+        );
+
+        let mut record: serde_json::Value = serde_json::from_str(&base_json).unwrap();
+        record["schema"] = serde_json::json!("per_claw_vpn_t1_preflight_evidence_v2");
+        let error =
+            parse_per_claw_vpn_t1_preflight_evidence_record(&record.to_string(), artifact_sha)
+                .expect_err("schema drift must not load");
+        assert!(matches!(
+            error,
+            PerClawVpnT1PreflightEvidenceLoadError::InvalidSchema
+        ));
+
+        let mut record: serde_json::Value = serde_json::from_str(&base_json).unwrap();
+        record["scope"] = serde_json::json!("production");
+        let error =
+            parse_per_claw_vpn_t1_preflight_evidence_record(&record.to_string(), artifact_sha)
+                .expect_err("scope drift must not load");
+        assert!(matches!(
+            error,
+            PerClawVpnT1PreflightEvidenceLoadError::InvalidScope
+        ));
+    }
+
+    #[test]
+    fn t1_preflight_evidence_record_rejects_production_scope() {
+        let artifact_sha = "0123456789abcdef0123456789abcdef01234567";
+        let json = t1_preflight_evidence_json(
+            artifact_sha,
+            true,
+            "rollback-artifact-alpha",
+            "/tmp/t1-evidence-root",
+        );
+
+        let error = parse_per_claw_vpn_t1_preflight_evidence_record(&json, artifact_sha)
+            .expect_err("production activation must not load as T1 evidence");
+
+        assert!(matches!(
+            error,
+            PerClawVpnT1PreflightEvidenceLoadError::ProductionActivationRequested
+        ));
+    }
+
+    #[test]
+    fn t1_preflight_evidence_record_rejects_missing_evidence_reference() {
+        let artifact_sha = "0123456789abcdef0123456789abcdef01234567";
+        let json = t1_preflight_evidence_json(artifact_sha, false, "", "/tmp/t1-evidence-root");
+
+        let error = parse_per_claw_vpn_t1_preflight_evidence_record(&json, artifact_sha)
+            .expect_err("evidence references must be present");
+
+        assert!(matches!(
+            error,
+            PerClawVpnT1PreflightEvidenceLoadError::MissingEvidenceReference
+        ));
+    }
+
+    #[test]
+    fn t1_preflight_evidence_record_rejects_unsafe_audit_root() {
+        let artifact_sha = "0123456789abcdef0123456789abcdef01234567";
+        for audit_root in ["relative/root", "/tmp/../tmp/t1-evidence-root"] {
+            let json = t1_preflight_evidence_json(
+                artifact_sha,
+                false,
+                "rollback-artifact-alpha",
+                audit_root,
+            );
+
+            let error = parse_per_claw_vpn_t1_preflight_evidence_record(&json, artifact_sha)
+                .expect_err("unsafe audit root must not load");
+
+            assert!(matches!(
+                error,
+                PerClawVpnT1PreflightEvidenceLoadError::InvalidAuditRoot
+            ));
+        }
     }
 
     #[test]

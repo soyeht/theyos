@@ -241,9 +241,17 @@ The wiring PR that follows this runbook must show, before merge:
   builder that reads `THEYOS_CLAW_VPN_T1_AUDIT_ROOT`, validates the root with
   the fixed path selector, and opens the log through the fd-relative
   `O_NOFOLLOW` traversal. Missing or invalid root configuration must fail
-  closed, and a live activation slice must still add reviewed evidence loading
-  for the exact artifact SHA, bind the owner-controlled canonical root value to
-  that evidence, decide final retention/rotation limits, review export key
+  closed. The startup wiring module may include a reviewed
+  `per_claw_vpn_t1_preflight_evidence_v1` JSON record parser/loader that is
+  SHA-bound to one exact artifact, rejects production activation, carries the
+  owner/rollback/hardware booleans, requires non-empty references to the owner
+  authorization, rollback artifact, and hardware evidence pack, and binds an
+  absolute normal audit-root path into the parsed evidence bundle. That loader
+  is not authorization by itself, remains source-guarded outside
+  `startup_wiring`, and must remain unused by the mount until the activation
+  slice connects it to the gate. A live activation slice must still wire that
+  record into the mount, bind the owner-controlled canonical root value to the
+  audit sink path, decide final retention/rotation limits, review export key
   source/rotation, and choose the best-effort-vs-durable authorization/in-flight
   semantics;
 - no raw `TunnelFrame`, packet bytes, interface name, file descriptor, local
