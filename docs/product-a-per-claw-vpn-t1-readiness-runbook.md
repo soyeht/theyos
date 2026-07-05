@@ -13,6 +13,9 @@ copy/paste artifact for the authorization record, rollback readiness, hardware
 evidence pack, SHA-bound preflight evidence record, and stop record. The
 template is not authorization by itself; it only becomes evidence when filled
 for the exact artifact SHA by the owner and reviewed with the hardware pack.
+Use `docs/product-a-per-claw-vpn-t1-activation-pr-gate-checklist.md` as the
+activation PR review checklist before any mount-to-gate wiring is merged or
+used for a live dev-host T1-T4 run.
 
 The code gates that must already be present in `main` are:
 
