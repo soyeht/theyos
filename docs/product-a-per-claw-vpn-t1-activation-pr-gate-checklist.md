@@ -33,8 +33,16 @@ below has explicit review evidence for the exact PR head and commit SHA.
   post-failure rollback is not sufficient.
 - Hardware evidence pack reference for T1-T4 on dev hosts, using neutral
   aliases and documentation-safe addresses.
+- Hardware evidence pack shape validation with
+  `scripts/validate-t1-hardware-evidence-pack.py <sha> <pack> --expected-pr <number>`.
+  This only proves the pack is complete-shaped for review; it does not replace
+  content verification of the referenced owner, rollback, hardware, or run
+  evidence.
 - Private preflight evidence JSON that validates with
-  `scripts/validate-t1-preflight-evidence-record.py <sha> <record> --check-root-dir`.
+  `scripts/validate-t1-preflight-evidence-record.py <sha> <record> --check-root-dir --check-hardware-pack --expected-pr <number>`.
+  The hardware pack check follows the private `hardware_evidence_ref` path
+  without printing it; it is still a shape/privacy check, not content
+  attestation.
 - Clean `scripts/check-t1-preflight-default-off.py` result on the base before
   the activation diff is reviewed. The bundle must include the direct audit
   carry filters for durability/rotation (`t1_spooled_audit_sink`), fixed

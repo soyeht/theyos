@@ -4,11 +4,13 @@
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import json
 import os
 import stat
 import sys
-from pathlib import PurePosixPath
+from pathlib import Path, PurePosixPath
+from types import ModuleType
 
 
 SCHEMA = "per_claw_vpn_t1_preflight_evidence_v1"
@@ -19,6 +21,7 @@ REQUIRED_REFS = (
     "rollback_ref",
     "hardware_evidence_ref",
 )
+HARDWARE_PACK_VALIDATOR = Path(__file__).with_name("validate-t1-hardware-evidence-pack.py")
 
 
 def is_full_git_sha(value: object) -> bool:
@@ -102,6 +105,36 @@ def validate_record(record: object, expected_sha: str, check_root_dir: bool) -> 
     return errors
 
 
+def load_hardware_pack_validator() -> ModuleType:
+    spec = importlib.util.spec_from_file_location("validate_t1_hardware_evidence_pack", HARDWARE_PACK_VALIDATOR)
+    if spec is None or spec.loader is None:
+        raise RuntimeError("hardware evidence pack validator unavailable")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def validate_hardware_evidence_ref(record: dict[str, object], expected_sha: str, expected_pr: int | None) -> list[str]:
+    hardware_ref = record.get("hardware_evidence_ref")
+    if not isinstance(hardware_ref, str) or not hardware_ref.strip() or is_template_placeholder(hardware_ref):
+        return []
+
+    try:
+        markdown = Path(hardware_ref).read_text(encoding="utf-8")
+    except UnicodeDecodeError:
+        return ["hardware_evidence_ref pack is not valid UTF-8"]
+    except OSError as error:
+        return [f"hardware_evidence_ref pack could not be read: {error.__class__.__name__}"]
+
+    try:
+        validator = load_hardware_pack_validator()
+    except RuntimeError:
+        return ["hardware_evidence_ref pack validator is unavailable"]
+
+    pack_errors = validator.validate_pack(markdown, expected_sha, expected_pr)
+    return [f"hardware_evidence_ref pack: {error}" for error in pack_errors]
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(
         description=(
@@ -116,6 +149,12 @@ def main() -> int:
         action="store_true",
         help="also require audit_root to exist, be current-user-owned, non-symlink, and mode 0700",
     )
+    parser.add_argument(
+        "--check-hardware-pack",
+        action="store_true",
+        help="also validate the private hardware_evidence_ref pack shape without printing its path or values",
+    )
+    parser.add_argument("--expected-pr", type=int, help="expected activation PR number for --check-hardware-pack")
     args = parser.parse_args()
 
     try:
@@ -129,6 +168,8 @@ def main() -> int:
         return 2
 
     errors = validate_record(record, args.expected_artifact_sha, args.check_root_dir)
+    if not errors and args.check_hardware_pack:
+        errors.extend(validate_hardware_evidence_ref(record, args.expected_artifact_sha, args.expected_pr))
     if errors:
         for error in errors:
             print(f"ERROR: {error}", file=sys.stderr)

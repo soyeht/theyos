@@ -147,6 +147,30 @@ Evidence must include negative observations, not only successful packet output:
 - no real hostnames, account names, device names, LAN IPs, tailnet IPs, relay
   endpoints, secrets, or local file paths in public evidence.
 
+Before binding the hardware pack into the private preflight record, run:
+
+```sh
+scripts/validate-t1-hardware-evidence-pack.py \
+  <exact-40-hex-artifact-sha> \
+  <private-hardware-evidence-pack> \
+  --expected-pr <number>
+```
+
+After the pack path is stored in the private preflight evidence record, rerun:
+
+```sh
+scripts/validate-t1-preflight-evidence-record.py \
+  <exact-40-hex-artifact-sha> \
+  .env.t1-preflight-evidence.json \
+  --check-root-dir \
+  --check-hardware-pack \
+  --expected-pr <number>
+```
+
+The validator is an offline shape check for completeness and privacy-safe
+review structure. It does not replace the human content verification required
+by the activation checklist.
+
 ## Stop Conditions
 
 Stop immediately and rollback if any of the following occurs:
