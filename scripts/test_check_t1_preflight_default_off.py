@@ -27,6 +27,8 @@ class CheckT1PreflightDefaultOffTests(unittest.TestCase):
             [
                 "prepare-helper-tests",
                 "validator-tests",
+                "owner-authorization-validator-tests",
+                "rollback-evidence-validator-tests",
                 "hardware-evidence-pack-validator-tests",
                 "source-guard",
                 "mount-audit-sink",
@@ -43,16 +45,18 @@ class CheckT1PreflightDefaultOffTests(unittest.TestCase):
         commands = [" ".join(check.command) for check in checks]
         self.assertIn("scripts/test_prepare_t1_preflight_evidence_record.py", commands[0])
         self.assertIn("scripts/test_validate_t1_preflight_evidence_record.py", commands[1])
-        self.assertIn("scripts/test_validate_t1_hardware_evidence_pack.py", commands[2])
-        self.assertIn("product_a_per_claw_vpn_dev_config_remains_default_off_and_unwired", commands[3])
-        self.assertIn("t1_mount_audit_sink", commands[4])
-        self.assertIn("t1_spooled_audit_sink", commands[5])
-        self.assertIn("t1_audit_log_path", commands[6])
-        self.assertIn("t1_audit_export_jsonl", commands[7])
-        self.assertIn("mounted_t1_iptunnel_router", commands[8])
-        self.assertIn("-p friend-cli-rs", commands[9])
-        self.assertIn("rejects_iptunnel_before_connecting", commands[9])
-        self.assertIn("-p t1-iptunnel-dev-runner-rs", commands[10])
+        self.assertIn("scripts/test_validate_t1_owner_authorization.py", commands[2])
+        self.assertIn("scripts/test_validate_t1_rollback_evidence.py", commands[3])
+        self.assertIn("scripts/test_validate_t1_hardware_evidence_pack.py", commands[4])
+        self.assertIn("product_a_per_claw_vpn_dev_config_remains_default_off_and_unwired", commands[5])
+        self.assertIn("t1_mount_audit_sink", commands[6])
+        self.assertIn("t1_spooled_audit_sink", commands[7])
+        self.assertIn("t1_audit_log_path", commands[8])
+        self.assertIn("t1_audit_export_jsonl", commands[9])
+        self.assertIn("mounted_t1_iptunnel_router", commands[10])
+        self.assertIn("-p friend-cli-rs", commands[11])
+        self.assertIn("rejects_iptunnel_before_connecting", commands[11])
+        self.assertIn("-p t1-iptunnel-dev-runner-rs", commands[12])
         for command in commands:
             self.assertNotIn("run_until_stopped", command)
             self.assertNotIn("build_runtime", command)

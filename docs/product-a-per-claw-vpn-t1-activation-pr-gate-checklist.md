@@ -29,8 +29,16 @@ below has explicit review evidence for the exact PR head and commit SHA.
 - Exact PR number, commit SHA, and build artifact hash.
 - Owner authorization record for the same PR and commit SHA, with
   `production_activation=false` and scope `dev-host T1-T4 only`.
+- Owner authorization shape validation with
+  `scripts/validate-t1-owner-authorization.py <sha> <owner-record> --expected-pr <number>`.
+  This proves only that the private record is complete-shaped and privacy-safe
+  to review; it is not owner authorization by itself.
 - Prebuilt rollback artifact reference for the same commit SHA; build-local or
   post-failure rollback is not sufficient.
+- Rollback evidence shape validation with
+  `scripts/validate-t1-rollback-evidence.py <sha> <rollback-record> --expected-pr <number>`.
+  This proves only that rollback material is complete-shaped for review; it
+  does not prove the restore artifact or operation is correct.
 - Hardware evidence pack reference for T1-T4 on dev hosts, using neutral
   aliases and documentation-safe addresses.
 - Hardware evidence pack shape validation with
@@ -39,10 +47,10 @@ below has explicit review evidence for the exact PR head and commit SHA.
   content verification of the referenced owner, rollback, hardware, or run
   evidence.
 - Private preflight evidence JSON that validates with
-  `scripts/validate-t1-preflight-evidence-record.py <sha> <record> --check-root-dir --check-hardware-pack --expected-pr <number>`.
-  The hardware pack check follows the private `hardware_evidence_ref` path
-  without printing it; it is still a shape/privacy check, not content
-  attestation.
+  `scripts/validate-t1-preflight-evidence-record.py <sha> <record> --check-root-dir --check-private-refs --expected-pr <number>`.
+  The private-ref check follows `owner_authorization_ref`, `rollback_ref`, and
+  `hardware_evidence_ref` without printing paths or values; it is still a
+  shape/privacy check, not content attestation.
 - Clean `scripts/check-t1-preflight-default-off.py` result on the base before
   the activation diff is reviewed. The bundle must include the direct audit
   carry filters for durability/rotation (`t1_spooled_audit_sink`), fixed
