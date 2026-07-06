@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 import os
 import subprocess
 import sys
@@ -36,6 +37,25 @@ def valid_record(audit_root: str = "/private/t1-audit-root") -> dict[str, object
         "hardware_evidence_ref": "hardware-evidence-ref",
         "audit_root": audit_root,
     }
+
+
+def valid_hardware_pack() -> str:
+    return f"""# T1-T4 Hardware Evidence Pack
+
+PR #286
+artifact_sha: {ARTIFACT_SHA}
+scope: dev-host T1-T4 only
+production_activation=false
+
+- [x] Owner authorization reviewed for this exact PR and artifact SHA.
+- [x] Prebuilt rollback artifact is available and selected for restore.
+- [x] Reference content verification completed for owner, rollback, and hardware refs.
+- [x] T1 interface evidence captured with before, during, and after snapshots.
+- [x] T2 live validation evidence captured on dev host.
+- [x] T3 cleanup and stop evidence captured.
+- [x] T4 rollback evidence captured.
+- [x] Production excluded and not touched.
+"""
 
 
 class ValidateT1PreflightEvidenceRecordTests(unittest.TestCase):
@@ -134,6 +154,102 @@ class ValidateT1PreflightEvidenceRecordTests(unittest.TestCase):
             self.assertIn("ERROR: could not read evidence record: FileNotFoundError", proc.stderr)
             self.assertFalse(str(missing_record) in proc.stderr, "stderr leaked record path")
             self.assertFalse(missing_record.name in proc.stderr, "stderr leaked record file name")
+
+    def test_cli_check_hardware_pack_accepts_valid_private_pack(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmpdir = Path(tmp)
+            audit_root = tmpdir / "audit-root"
+            audit_root.mkdir(mode=0o700)
+            hardware_pack = tmpdir / "private-hardware-evidence.md"
+            hardware_pack.write_text(valid_hardware_pack(), encoding="utf-8")
+            record_path = tmpdir / "private-evidence-record.json"
+            record = valid_record(os.path.realpath(audit_root))
+            record["hardware_evidence_ref"] = str(hardware_pack)
+            record_path.write_text(json.dumps(record), encoding="utf-8")
+
+            proc = subprocess.run(
+                [
+                    sys.executable,
+                    str(SCRIPT),
+                    ARTIFACT_SHA,
+                    str(record_path),
+                    "--check-root-dir",
+                    "--check-hardware-pack",
+                    "--expected-pr",
+                    "286",
+                ],
+                check=False,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            self.assertEqual(0, proc.returncode, proc.stderr)
+            self.assertIn("OK: T1 preflight evidence record validates", proc.stdout)
+
+    def test_cli_check_hardware_pack_fails_without_echoing_private_path(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmpdir = Path(tmp)
+            audit_root = tmpdir / "audit-root"
+            audit_root.mkdir(mode=0o700)
+            hardware_pack = tmpdir / "private-hardware-evidence.md"
+            hardware_pack.write_text(valid_hardware_pack().replace("- [x] T4 rollback", "- [ ] T4 rollback"), encoding="utf-8")
+            record_path = tmpdir / "private-evidence-record.json"
+            record = valid_record(os.path.realpath(audit_root))
+            record["hardware_evidence_ref"] = str(hardware_pack)
+            record_path.write_text(json.dumps(record), encoding="utf-8")
+
+            proc = subprocess.run(
+                [
+                    sys.executable,
+                    str(SCRIPT),
+                    ARTIFACT_SHA,
+                    str(record_path),
+                    "--check-root-dir",
+                    "--check-hardware-pack",
+                    "--expected-pr",
+                    "286",
+                ],
+                check=False,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            self.assertEqual(1, proc.returncode)
+            self.assertIn("ERROR: hardware_evidence_ref pack: hardware evidence pack must not contain unchecked checklist items", proc.stderr)
+            self.assertFalse(str(hardware_pack) in proc.stderr, "stderr leaked hardware pack path")
+            self.assertFalse(hardware_pack.name in proc.stderr, "stderr leaked hardware pack file name")
+
+    def test_cli_check_hardware_pack_missing_file_does_not_echo_private_path(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmpdir = Path(tmp)
+            audit_root = tmpdir / "audit-root"
+            audit_root.mkdir(mode=0o700)
+            missing_pack = tmpdir / "private-hardware-evidence.md"
+            record_path = tmpdir / "private-evidence-record.json"
+            record = valid_record(os.path.realpath(audit_root))
+            record["hardware_evidence_ref"] = str(missing_pack)
+            record_path.write_text(json.dumps(record), encoding="utf-8")
+
+            proc = subprocess.run(
+                [
+                    sys.executable,
+                    str(SCRIPT),
+                    ARTIFACT_SHA,
+                    str(record_path),
+                    "--check-root-dir",
+                    "--check-hardware-pack",
+                    "--expected-pr",
+                    "286",
+                ],
+                check=False,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            self.assertEqual(1, proc.returncode)
+            self.assertIn("ERROR: hardware_evidence_ref pack could not be read: FileNotFoundError", proc.stderr)
+            self.assertFalse(str(missing_pack) in proc.stderr, "stderr leaked hardware pack path")
+            self.assertFalse(missing_pack.name in proc.stderr, "stderr leaked hardware pack file name")
 
 
 if __name__ == "__main__":

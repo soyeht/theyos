@@ -72,7 +72,9 @@ scripts/prepare-t1-preflight-evidence-record.py \
 scripts/validate-t1-preflight-evidence-record.py \
   <exact-40-hex-artifact-sha> \
   .env.t1-preflight-evidence.json \
-  --check-root-dir
+  --check-root-dir \
+  --check-hardware-pack \
+  --expected-pr <number>
 ```
 
 The prepare helper creates or updates the private draft and audit root, then
@@ -145,6 +147,25 @@ Negative observations required for the evidence pack:
 - no raw `TunnelFrame` payload bytes in logs;
 - no real hostnames, account names, device names, LAN IPs, tailnet IPs, relay
   endpoints, secrets, local paths, or packet/frame payloads in public evidence.
+
+Before using the hardware pack as `hardware_evidence_ref`, validate its shape
+without printing private values:
+
+```sh
+scripts/validate-t1-hardware-evidence-pack.py \
+  <exact-40-hex-artifact-sha> \
+  <private-hardware-evidence-pack> \
+  --expected-pr <number>
+```
+
+Then keep the same private path in `hardware_evidence_ref` and rerun the
+preflight evidence validator with `--check-hardware-pack`. That chained check
+does not print the pack path or values; it only proves the referenced private
+pack is complete-shaped for review.
+
+This validator checks the pack is complete-shaped for review. It does not prove
+the referenced artifacts are real or correct; reviewers must still verify the
+content of the owner, rollback, hardware, and run evidence before activation.
 
 ## Stop Record
 

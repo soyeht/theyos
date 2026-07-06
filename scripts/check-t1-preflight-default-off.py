@@ -40,6 +40,10 @@ def build_checks(skip_python: bool, skip_rust: bool) -> list[Check]:
             (
                 python_check("prepare-helper-tests", "scripts/test_prepare_t1_preflight_evidence_record.py"),
                 python_check("validator-tests", "scripts/test_validate_t1_preflight_evidence_record.py"),
+                python_check(
+                    "hardware-evidence-pack-validator-tests",
+                    "scripts/test_validate_t1_hardware_evidence_pack.py",
+                ),
             )
         )
     if not skip_rust:
