@@ -91,8 +91,11 @@ bundle:
 scripts/check-t1-preflight-default-off.py
 ```
 
-That bundle only runs Python helper/validator tests and Rust default-off tests;
-it does not open TUN/utun, install routes, launch runtime, or touch production.
+That bundle only runs Python helper/validator tests, Rust default-off tests,
+audit sink carry tests for durability/rotation/fixed-path/HMAC export,
+the `friend-cli` `IpTunnel` rejection tests, and the dev-runner offline offer
+validator; it does not open TUN/utun, install routes, launch runtime, or touch
+production.
 
 ## Rollback Readiness
 

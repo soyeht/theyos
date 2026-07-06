@@ -4875,6 +4875,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "t1-iptunnel-dev-runner-rs"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "household-rs",
+]
+
+[[package]]
 name = "tap"
 version = "1.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"

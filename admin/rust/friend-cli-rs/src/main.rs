@@ -1684,11 +1684,27 @@ mod tests {
         expected_path: RelayStreamExpectedPath,
         not_after: u64,
     ) -> RelayStreamOfferContract {
+        mint_offer_with_resource(
+            owner,
+            credential,
+            RelayStreamResource::Pty,
+            expected_path,
+            not_after,
+        )
+    }
+
+    fn mint_offer_with_resource(
+        owner: &P256Keypair,
+        credential: &GuestCredential,
+        resource: RelayStreamResource,
+        expected_path: RelayStreamExpectedPath,
+        not_after: u64,
+    ) -> RelayStreamOfferContract {
         mint_relay_stream_offer(
             RelayStreamOfferMintInput {
                 rendezvous_token: RendezvousToken::try_new(vec![0x42; 16]).unwrap(),
                 credential,
-                resource: RelayStreamResource::Pty,
+                resource,
                 expected_path,
                 relay_endpoint: "relay-stream://127.0.0.1:49152".to_string(),
                 claw_static_pub: RelayStreamClawStaticPublicKey::try_new([0x33; 32]).unwrap(),
@@ -1839,6 +1855,78 @@ mod tests {
         assert!(!parse_dial_flag(Some("false")));
         assert!(!parse_dial_flag(Some("")));
         assert!(!parse_dial_flag(None));
+    }
+
+    #[test]
+    fn relay_stream_client_rejects_iptunnel_before_connecting() {
+        assert!(ensure_relay_stream_client_resource_supported(RelayStreamResource::Pty).is_ok());
+        assert!(
+            ensure_relay_stream_client_resource_supported(RelayStreamResource::ClawSite).is_ok()
+        );
+
+        let error = ensure_relay_stream_client_resource_supported(RelayStreamResource::IpTunnel)
+            .expect_err("IpTunnel must stay unsupported until a reviewed dev runner exists");
+        assert!(
+            error
+                .to_string()
+                .contains("relay_stream IpTunnel payload is not implemented in this client"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn relay_stream_device_dial_rejects_iptunnel_before_connecting() {
+        let owner = offer_kp(0x11);
+        let guest = offer_kp(0x33);
+        let credential = offer_credential(&owner, &guest.public());
+        let offer = mint_offer_with_resource(
+            &owner,
+            &credential,
+            RelayStreamResource::IpTunnel,
+            RelayStreamExpectedPath::RelayStream,
+            OFFER_NOW + 60,
+        );
+
+        let error = dial_relay_stream(&offer, &guest, &credential, OFFER_NOW)
+            .await
+            .expect_err("IpTunnel must fail before relay connection");
+        assert!(
+            error
+                .to_string()
+                .contains("relay_stream IpTunnel payload is not implemented in this client"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn relay_stream_group_dial_rejects_iptunnel_before_connecting() {
+        let owner = offer_kp(0x11);
+        let device = offer_kp(0x33);
+        let offer = mint_relay_stream_group_offer(
+            RendezvousToken::try_new(vec![0x42; 16]).unwrap(),
+            SlotId([0x99; 16]),
+            "g".to_string(),
+            "g_a".to_string(),
+            device.public(),
+            "claw_alpha".to_string(),
+            RelayStreamResource::IpTunnel,
+            "relay-stream://127.0.0.1:49152".to_string(),
+            RelayStreamClawStaticPublicKey::try_new([0x33; 32]).unwrap(),
+            OFFER_NOW + 60,
+            OFFER_NOW,
+            &owner as &dyn IdentityKey,
+        )
+        .expect("mint group IpTunnel offer");
+
+        let error = dial_relay_stream_offer_session(&offer, &device, OFFER_NOW)
+            .await
+            .expect_err("IpTunnel must fail before relay connection");
+        assert!(
+            error
+                .to_string()
+                .contains("relay_stream IpTunnel payload is not implemented in this client"),
+            "unexpected error: {error}"
+        );
     }
 
     // Minimal data-tunnel target that just exists long enough for the client to

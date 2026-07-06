@@ -4341,6 +4341,19 @@ fn product_a_per_claw_vpn_dev_config_remains_default_off_and_unwired() {
             "per-Claw VPN relay-stream mount must not load or synthesize present T1 preflight evidence: {forbidden_preflight_token}"
         );
     }
+    for forbidden_audit_export_token in [
+        "claw_vpn_t1_keyed_audit_export_jsonl",
+        "ClawVpnT1AuditExportHmacKey",
+        "CLAW_VPN_T1_AUDIT_EXPORT_HMAC_KEY_BYTES",
+        "member_id_keyed_hash",
+        "device_pub_keyed_hash",
+        "claw_id_keyed_hash",
+    ] {
+        assert!(
+            !relay_stream_mount_source.contains(forbidden_audit_export_token),
+            "per-Claw VPN relay-stream mount must not wire T1 off-host audit export symbols: {forbidden_audit_export_token}"
+        );
+    }
 
     let mut violations = Vec::new();
     for path in sources {

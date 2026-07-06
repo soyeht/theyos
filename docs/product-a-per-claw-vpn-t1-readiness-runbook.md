@@ -16,6 +16,9 @@ for the exact artifact SHA by the owner and reviewed with the hardware pack.
 Use `docs/product-a-per-claw-vpn-t1-activation-pr-gate-checklist.md` as the
 activation PR review checklist before any mount-to-gate wiring is merged or
 used for a live dev-host T1-T4 run.
+Use `docs/product-a-per-claw-vpn-t1-pre-e2e-carry-evidence.md` to confirm the
+non-live audit sink, path, export, default-off, and client-boundary carries still
+have direct test evidence before asking for E2E review.
 
 The code gates that must already be present in `main` are:
 

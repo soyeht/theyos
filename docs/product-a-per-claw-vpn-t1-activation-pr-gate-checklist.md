@@ -5,6 +5,10 @@ preflight evidence into the mount. It is not authorization by itself, does not
 permit a T1 live-run, and does not replace the readiness runbook or the owner
 authorization record.
 
+Before using this checklist, confirm the non-live carry evidence in
+`docs/product-a-per-claw-vpn-t1-pre-e2e-carry-evidence.md` still matches the
+current code and bundle.
+
 Use neutral aliases only in public text. Keep real hostnames, account names,
 device names, IPs, relay endpoints, local paths, packet bytes, logs, screenshots
 with identifiers, secrets, keys, and raw evidence in ignored local files or a
@@ -32,7 +36,10 @@ below has explicit review evidence for the exact PR head and commit SHA.
 - Private preflight evidence JSON that validates with
   `scripts/validate-t1-preflight-evidence-record.py <sha> <record> --check-root-dir`.
 - Clean `scripts/check-t1-preflight-default-off.py` result on the base before
-  the activation diff is reviewed.
+  the activation diff is reviewed. The bundle must include the direct audit
+  carry filters for durability/rotation (`t1_spooled_audit_sink`), fixed
+  path/canonical-root validation (`t1_audit_log_path`), and HMAC/keyed export
+  redaction (`t1_audit_export_jsonl`), not only the mount-level smoke.
 
 ## Reference Content Verification
 
@@ -57,6 +64,10 @@ reference points to the artifact it names.
   must be bound to the reviewed owner-controlled root for the same artifact.
 - The audit log open path must keep the fixed suffix selector, canonical root
   validation, fd-relative traversal, and `O_NOFOLLOW` protections.
+- The reviewed audit sink durability and retention behavior must stay in force:
+  each accepted record is flushed and `sync_data`ed, rotation occurs before the
+  reviewed byte cap is exceeded, the parent directory is synced after rotation
+  metadata changes, and only the bounded retained files are kept.
 - The source guard is expected to trip when mount-to-gate wiring appears. Any
   guard relaxation must be narrow, named, and limited to the reviewed caller and
   evidence symbols.

@@ -25,10 +25,10 @@ def python_check(name: str, script: str) -> Check:
     return Check(name, (sys.executable, script), REPO_ROOT)
 
 
-def rust_check(name: str, *cargo_args: str) -> Check:
+def rust_check(name: str, package: str, *cargo_args: str) -> Check:
     return Check(
         name,
-        ("cargo", "test", "-p", "server-rs", "--manifest-path", RUST_MANIFEST, *cargo_args),
+        ("cargo", "test", "-p", package, "--manifest-path", RUST_MANIFEST, *cargo_args),
         REPO_ROOT,
     )
 
@@ -47,14 +47,59 @@ def build_checks(skip_python: bool, skip_rust: bool) -> list[Check]:
             (
                 rust_check(
                     "source-guard",
+                    "server-rs",
                     "--test",
                     "owner_events",
                     "product_a_per_claw_vpn_dev_config_remains_default_off_and_unwired",
                     "--",
                     "--nocapture",
                 ),
-                rust_check("mount-audit-sink", "--lib", "t1_mount_audit_sink", "--", "--nocapture"),
-                rust_check("mounted-t1-missing-preflight", "--lib", "mounted_t1_iptunnel_router", "--", "--nocapture"),
+                rust_check("mount-audit-sink", "server-rs", "--lib", "t1_mount_audit_sink", "--", "--nocapture"),
+                rust_check(
+                    "audit-sink-durability-rotation",
+                    "server-rs",
+                    "--lib",
+                    "t1_spooled_audit_sink",
+                    "--",
+                    "--nocapture",
+                ),
+                rust_check(
+                    "audit-log-fixed-path",
+                    "server-rs",
+                    "--lib",
+                    "t1_audit_log_path",
+                    "--",
+                    "--nocapture",
+                ),
+                rust_check(
+                    "audit-export-hmac",
+                    "server-rs",
+                    "--lib",
+                    "t1_audit_export_jsonl",
+                    "--",
+                    "--nocapture",
+                ),
+                rust_check(
+                    "mounted-t1-missing-preflight",
+                    "server-rs",
+                    "--lib",
+                    "mounted_t1_iptunnel_router",
+                    "--",
+                    "--nocapture",
+                ),
+                rust_check(
+                    "friend-cli-iptunnel-reject",
+                    "friend-cli-rs",
+                    "rejects_iptunnel_before_connecting",
+                    "--",
+                    "--nocapture",
+                ),
+                rust_check(
+                    "t1-iptunnel-dev-runner-validate",
+                    "t1-iptunnel-dev-runner-rs",
+                    "--",
+                    "--nocapture",
+                ),
             )
         )
     return checks

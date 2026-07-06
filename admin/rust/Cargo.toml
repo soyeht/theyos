@@ -17,6 +17,7 @@ members = [
     "server-rs",
     "store-rs",
     "terminal-rs",
+    "t1-iptunnel-dev-runner-rs",
     "rootfsbuilder-rs",
     "launcher-rs",
     "soyeht-rs",

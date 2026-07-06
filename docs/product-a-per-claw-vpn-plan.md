@@ -167,7 +167,10 @@ Missing or invalid root configuration yields a fail-closed sink, and the builder
 remains unreachable while the mount supplies missing T1 preflight. The source
 guard tripwires those helpers, their public types, and their constants outside
 the T1 router module and the reviewed mount use, so future export caller or
-broader wiring reopens review.
+broader wiring reopens review. The local default-off check bundle now includes
+direct filters for those carries (`t1_spooled_audit_sink`, `t1_audit_log_path`,
+and `t1_audit_export_jsonl`) so a future E2E review does not rely only on
+mount-level smoke coverage.
 The current
 default-off mount still supplies
 `PerClawVpnT1PreflightEvidence::missing`, so a future activation slice must add
@@ -570,9 +573,9 @@ Access between members/devices and claws is explicitly many-to-many:
   `startup_wiring`. The record includes non-empty references to the owner
   authorization, rollback artifact, and hardware evidence pack. The
   future activation review must connect that evidence record to the mount gate,
-  bind the evidence `audit_root` to the sink path, choose final
-  retention/rotation limits, choose export key source/rotation, and decide the
-  final best-effort-vs-durable
+  bind the evidence `audit_root` to the sink path, confirm the reviewed
+  retention/rotation constants remain acceptable for the exact run, choose
+  export key source/rotation, and decide the final best-effort-vs-durable
   authorization/in-flight semantics. The environment-backed mount still
   supplies missing preflight
   evidence, so `Disabled`/invalid/missing-preflight/`Dial` paths all fall back

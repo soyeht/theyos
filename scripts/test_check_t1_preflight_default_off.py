@@ -29,7 +29,12 @@ class CheckT1PreflightDefaultOffTests(unittest.TestCase):
                 "validator-tests",
                 "source-guard",
                 "mount-audit-sink",
+                "audit-sink-durability-rotation",
+                "audit-log-fixed-path",
+                "audit-export-hmac",
                 "mounted-t1-missing-preflight",
+                "friend-cli-iptunnel-reject",
+                "t1-iptunnel-dev-runner-validate",
             ],
             [check.name for check in checks],
         )
@@ -39,11 +44,19 @@ class CheckT1PreflightDefaultOffTests(unittest.TestCase):
         self.assertIn("scripts/test_validate_t1_preflight_evidence_record.py", commands[1])
         self.assertIn("product_a_per_claw_vpn_dev_config_remains_default_off_and_unwired", commands[2])
         self.assertIn("t1_mount_audit_sink", commands[3])
-        self.assertIn("mounted_t1_iptunnel_router", commands[4])
+        self.assertIn("t1_spooled_audit_sink", commands[4])
+        self.assertIn("t1_audit_log_path", commands[5])
+        self.assertIn("t1_audit_export_jsonl", commands[6])
+        self.assertIn("mounted_t1_iptunnel_router", commands[7])
+        self.assertIn("-p friend-cli-rs", commands[8])
+        self.assertIn("rejects_iptunnel_before_connecting", commands[8])
+        self.assertIn("-p t1-iptunnel-dev-runner-rs", commands[9])
         for command in commands:
             self.assertNotIn("run_until_stopped", command)
             self.assertNotIn("build_runtime", command)
             self.assertNotIn("Soyeht.app", command)
+            self.assertNotIn("Soyeht Dev.app", command)
+            self.assertNotIn("cargo run", command)
 
     def test_dry_run_prints_commands_without_running_subprocesses(self) -> None:
         stdout = io.StringIO()

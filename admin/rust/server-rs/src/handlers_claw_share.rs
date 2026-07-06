@@ -2202,7 +2202,7 @@ mod tests {
 mod relay_offer_tests {
     use super::*;
 
-    use std::net::{IpAddr, SocketAddr};
+    use std::net::SocketAddr;
 
     use household_rs::household_mesh_log::{
         build_claw_site_published_event, build_group_claw_grant_event, build_group_created_event,
@@ -2247,8 +2247,8 @@ mod relay_offer_tests {
     #[cfg(feature = "dev_claw_share_mint")]
     #[test]
     fn dev_endpoint_gate_requires_loopback_and_both_flags() {
-        let lo = "127.0.0.1".parse::<IpAddr>().unwrap();
-        let public = "8.8.8.8".parse::<IpAddr>().unwrap();
+        let lo = "127.0.0.1".parse::<std::net::IpAddr>().unwrap();
+        let public = "8.8.8.8".parse::<std::net::IpAddr>().unwrap();
         assert!(dev_endpoint_allowed(lo, Some("1"), Some("1")));
         assert!(!dev_endpoint_allowed(public, Some("1"), Some("1"))); // non-loopback
         assert!(!dev_endpoint_allowed(lo, None, Some("1"))); // mint flag unset
