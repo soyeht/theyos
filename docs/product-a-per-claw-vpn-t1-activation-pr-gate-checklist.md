@@ -51,6 +51,11 @@ below has explicit review evidence for the exact PR head and commit SHA.
   The private-ref check follows `owner_authorization_ref`, `rollback_ref`,
   `hardware_evidence_ref`, and `audit_export_policy_ref` without printing paths
   or values; it is still a shape/privacy check, not content attestation.
+- Private gate status check with
+  `scripts/check-t1-private-gate-status.py <sha> <record> --check-root-dir --check-private-refs --expected-pr <number>`.
+  This is an operator-facing status report only: it names missing or invalid
+  fields without printing private paths or values, and it does not replace the
+  full validator or content review.
 - Clean `scripts/check-t1-preflight-default-off.py` result on the base before
   the activation diff is reviewed. The bundle must include the direct audit
   carry filters for durability/rotation (`t1_spooled_audit_sink`), fixed
