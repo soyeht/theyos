@@ -30,6 +30,7 @@ def valid_record(audit_root: str) -> dict[str, object]:
         "rollback_ref": "rollback-ref",
         "hardware_evidence_ref": "hardware-evidence-ref",
         "audit_export_policy_ref": "audit-export-policy-ref",
+        "device_session_config_ref": "device-session-config-ref",
         "audit_root": audit_root,
     }
 
@@ -114,17 +115,34 @@ production_activation=false
 """
 
 
+def device_session_config() -> str:
+    return """{
+  "schema": "t1-dev-runner-device-session-v1",
+  "scope": "dev-host T1-T4 only",
+  "production_activation": false,
+  "platform": "macos",
+  "local_side": "device",
+  "device_ipv4": "198.18.0.1",
+  "claw_ipv4": "198.18.0.2",
+  "claw_route_prefix_len": 32,
+  "mtu": 1280
+}
+"""
+
+
 def write_private_artifacts(tmpdir: Path) -> dict[str, Path]:
     paths = {
         "owner_authorization_ref": tmpdir / "private-owner-authorization.md",
         "rollback_ref": tmpdir / "private-rollback-evidence.md",
         "hardware_evidence_ref": tmpdir / "private-hardware-evidence.md",
         "audit_export_policy_ref": tmpdir / "private-audit-export-policy.md",
+        "device_session_config_ref": tmpdir / "private-device-session-config.json",
     }
     paths["owner_authorization_ref"].write_text(owner_authorization(), encoding="utf-8")
     paths["rollback_ref"].write_text(rollback_evidence(), encoding="utf-8")
     paths["hardware_evidence_ref"].write_text(hardware_pack(), encoding="utf-8")
     paths["audit_export_policy_ref"].write_text(audit_export_policy(), encoding="utf-8")
+    paths["device_session_config_ref"].write_text(device_session_config(), encoding="utf-8")
     return paths
 
 
@@ -157,6 +175,7 @@ class CheckT1PrivateGateStatusTests(unittest.TestCase):
             self.assertIn("OK_PRIVATE_REF: rollback_ref", proc.stdout)
             self.assertIn("OK_PRIVATE_REF: hardware_evidence_ref", proc.stdout)
             self.assertIn("OK_PRIVATE_REF: audit_export_policy_ref", proc.stdout)
+            self.assertIn("OK_PRIVATE_REF: device_session_config_ref", proc.stdout)
             self.assertFalse(str(record_path) in proc.stdout + proc.stderr)
             self.assertFalse("private-owner-authorization.md" in proc.stdout + proc.stderr)
 
@@ -167,8 +186,10 @@ class CheckT1PrivateGateStatusTests(unittest.TestCase):
             audit_root.mkdir(mode=0o700)
             rollback_record = tmpdir / "private-rollback-evidence.md"
             audit_export_record = tmpdir / "private-audit-export-policy.md"
+            device_config = tmpdir / "private-device-session-config.json"
             rollback_record.write_text(rollback_evidence(), encoding="utf-8")
             audit_export_record.write_text(audit_export_policy(), encoding="utf-8")
+            device_config.write_text(device_session_config(), encoding="utf-8")
             record = valid_record(os.path.realpath(audit_root))
             record["owner_authorization"] = False
             record["hardware_t1_t4"] = False
@@ -176,6 +197,7 @@ class CheckT1PrivateGateStatusTests(unittest.TestCase):
             record["hardware_evidence_ref"] = ""
             record["rollback_ref"] = str(rollback_record)
             record["audit_export_policy_ref"] = str(audit_export_record)
+            record["device_session_config_ref"] = str(device_config)
             record_path = tmpdir / "private-evidence-record.json"
             record_path.write_text(json.dumps(record), encoding="utf-8")
 
@@ -190,6 +212,7 @@ class CheckT1PrivateGateStatusTests(unittest.TestCase):
             self.assertFalse(record_path.name in proc.stderr)
             self.assertFalse("INVALID_PRIVATE_REF: rollback_ref" in proc.stderr)
             self.assertFalse("INVALID_PRIVATE_REF: audit_export_policy_ref" in proc.stderr)
+            self.assertFalse("INVALID_PRIVATE_REF: device_session_config_ref" in proc.stderr)
 
     def test_invalid_private_ref_reports_field_without_echoing_path(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -212,6 +235,29 @@ class CheckT1PrivateGateStatusTests(unittest.TestCase):
             self.assertIn("INVALID_PRIVATE_REF: owner_authorization_ref", proc.stderr)
             self.assertFalse(str(private_paths["owner_authorization_ref"]) in proc.stderr)
             self.assertFalse(private_paths["owner_authorization_ref"].name in proc.stderr)
+
+    def test_invalid_device_session_config_reports_field_without_echoing_path_or_value(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmpdir = Path(tmp)
+            audit_root = tmpdir / "audit-root"
+            audit_root.mkdir(mode=0o700)
+            private_paths = write_private_artifacts(tmpdir)
+            private_paths["device_session_config_ref"].write_text(
+                device_session_config().replace('"device_ipv4": "198.18.0.1"', '"device_ipv4": "SECRET-DEVICE-IP"'),
+                encoding="utf-8",
+            )
+            record = valid_record(os.path.realpath(audit_root))
+            record.update({field: str(path) for field, path in private_paths.items()})
+            record_path = tmpdir / "private-evidence-record.json"
+            record_path.write_text(json.dumps(record), encoding="utf-8")
+
+            proc = self.run_script(record_path, "--check-root-dir", "--check-private-refs", "--expected-pr", "286")
+
+            self.assertEqual(1, proc.returncode)
+            self.assertIn("INVALID_PRIVATE_REF: device_session_config_ref", proc.stderr)
+            self.assertFalse("SECRET-DEVICE-IP" in proc.stderr)
+            self.assertFalse(str(private_paths["device_session_config_ref"]) in proc.stderr)
+            self.assertFalse(private_paths["device_session_config_ref"].name in proc.stderr)
 
     def test_record_sha_mismatch_reports_field_without_echoing_record_path(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

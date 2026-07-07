@@ -21,11 +21,13 @@ REQUIRED_REFS = (
     "rollback_ref",
     "hardware_evidence_ref",
     "audit_export_policy_ref",
+    "device_session_config_ref",
 )
 OWNER_AUTHORIZATION_VALIDATOR = Path(__file__).with_name("validate-t1-owner-authorization.py")
 ROLLBACK_EVIDENCE_VALIDATOR = Path(__file__).with_name("validate-t1-rollback-evidence.py")
 HARDWARE_PACK_VALIDATOR = Path(__file__).with_name("validate-t1-hardware-evidence-pack.py")
 AUDIT_EXPORT_POLICY_VALIDATOR = Path(__file__).with_name("validate-t1-audit-export-policy.py")
+DEVICE_SESSION_CONFIG_VALIDATOR = Path(__file__).with_name("validate-t1-device-session-config.py")
 
 
 def is_full_git_sha(value: object) -> bool:
@@ -195,6 +197,27 @@ def validate_audit_export_policy_ref(record: dict[str, object], expected_sha: st
     return [f"audit_export_policy_ref policy: {error}" for error in policy_errors]
 
 
+def validate_device_session_config_ref(record: dict[str, object]) -> list[str]:
+    json_text, error = read_private_ref(record, "device_session_config_ref")
+    if error is not None:
+        return [error.replace("artifact", "config")]
+    if json_text is None:
+        return []
+
+    try:
+        validator = load_sibling_validator("validate_t1_device_session_config", DEVICE_SESSION_CONFIG_VALIDATOR)
+    except RuntimeError:
+        return ["device_session_config_ref config validator is unavailable"]
+
+    try:
+        config = json.loads(json_text)
+    except json.JSONDecodeError:
+        return ["device_session_config_ref config is not valid JSON"]
+
+    config_errors = validator.validate_device_session_config(config)
+    return [f"device_session_config_ref config: {error}" for error in config_errors]
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(
         description=(
@@ -229,13 +252,18 @@ def main() -> int:
         action="store_true",
         help=(
             "also validate owner_authorization_ref, rollback_ref, hardware_evidence_ref, "
-            "and audit_export_policy_ref shapes"
+            "audit_export_policy_ref, and device_session_config_ref shapes"
         ),
     )
     parser.add_argument(
         "--check-audit-export-policy",
         action="store_true",
         help="also validate the private audit_export_policy_ref shape without printing its path or values",
+    )
+    parser.add_argument(
+        "--check-device-session-config",
+        action="store_true",
+        help="also validate the private device_session_config_ref shape without printing its path or values",
     )
     parser.add_argument("--expected-pr", type=int, help="expected activation PR number for chained private artifact checks")
     args = parser.parse_args()
@@ -260,6 +288,8 @@ def main() -> int:
             errors.extend(validate_hardware_evidence_ref(record, args.expected_artifact_sha, args.expected_pr))
         if args.check_audit_export_policy or args.check_private_refs:
             errors.extend(validate_audit_export_policy_ref(record, args.expected_artifact_sha, args.expected_pr))
+        if args.check_device_session_config or args.check_private_refs:
+            errors.extend(validate_device_session_config_ref(record))
     if errors:
         for error in errors:
             print(f"ERROR: {error}", file=sys.stderr)

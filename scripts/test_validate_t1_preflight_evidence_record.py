@@ -36,6 +36,7 @@ def valid_record(audit_root: str = "/private/t1-audit-root") -> dict[str, object
         "hardware_t1_t4": True,
         "hardware_evidence_ref": "hardware-evidence-ref",
         "audit_export_policy_ref": "audit-export-policy-ref",
+        "device_session_config_ref": "device-session-config-ref",
         "audit_root": audit_root,
     }
 
@@ -120,6 +121,21 @@ production_activation=false
 """
 
 
+def valid_device_session_config() -> str:
+    return """{
+  "schema": "t1-dev-runner-device-session-v1",
+  "scope": "dev-host T1-T4 only",
+  "production_activation": false,
+  "platform": "macos",
+  "local_side": "device",
+  "device_ipv4": "198.18.0.1",
+  "claw_ipv4": "198.18.0.2",
+  "claw_route_prefix_len": 32,
+  "mtu": 1280
+}
+"""
+
+
 class ValidateT1PreflightEvidenceRecordTests(unittest.TestCase):
     def assert_validation_error(self, record: object, expected_error: str) -> None:
         errors = validator.validate_record(record, ARTIFACT_SHA, check_root_dir=False)
@@ -150,10 +166,12 @@ class ValidateT1PreflightEvidenceRecordTests(unittest.TestCase):
             ("rollback_ref", "", "rollback_ref must be a non-empty string"),
             ("hardware_evidence_ref", None, "hardware_evidence_ref must be a non-empty string"),
             ("audit_export_policy_ref", None, "audit_export_policy_ref must be a non-empty string"),
+            ("device_session_config_ref", None, "device_session_config_ref must be a non-empty string"),
             ("owner_authorization_ref", "<owner-authorization-record-ref>", "owner_authorization_ref must not be a template placeholder"),
             ("rollback_ref", " <prebuilt-rollback-artifact-ref> ", "rollback_ref must not be a template placeholder"),
             ("hardware_evidence_ref", "<sanitized-t1-t4-evidence-pack-ref>", "hardware_evidence_ref must not be a template placeholder"),
             ("audit_export_policy_ref", "<audit-export-policy-ref>", "audit_export_policy_ref must not be a template placeholder"),
+            ("device_session_config_ref", "<device-session-config-ref>", "device_session_config_ref must not be a template placeholder"),
         )
         for field, value, expected_error in cases:
             with self.subTest(field=field):
@@ -324,16 +342,19 @@ class ValidateT1PreflightEvidenceRecordTests(unittest.TestCase):
             rollback_record = tmpdir / "private-rollback-evidence.md"
             hardware_pack = tmpdir / "private-hardware-evidence.md"
             audit_export_policy = tmpdir / "private-audit-export-policy.md"
+            device_session_config = tmpdir / "private-device-session-config.json"
             owner_record.write_text(valid_owner_authorization(), encoding="utf-8")
             rollback_record.write_text(valid_rollback_evidence(), encoding="utf-8")
             hardware_pack.write_text(valid_hardware_pack(), encoding="utf-8")
             audit_export_policy.write_text(valid_audit_export_policy(), encoding="utf-8")
+            device_session_config.write_text(valid_device_session_config(), encoding="utf-8")
             record_path = tmpdir / "private-evidence-record.json"
             record = valid_record(os.path.realpath(audit_root))
             record["owner_authorization_ref"] = str(owner_record)
             record["rollback_ref"] = str(rollback_record)
             record["hardware_evidence_ref"] = str(hardware_pack)
             record["audit_export_policy_ref"] = str(audit_export_policy)
+            record["device_session_config_ref"] = str(device_session_config)
             record_path.write_text(json.dumps(record), encoding="utf-8")
 
             proc = subprocess.run(
@@ -364,16 +385,19 @@ class ValidateT1PreflightEvidenceRecordTests(unittest.TestCase):
             rollback_record = tmpdir / "private-rollback-evidence.md"
             hardware_pack = tmpdir / "private-hardware-evidence.md"
             audit_export_policy = tmpdir / "private-audit-export-policy.md"
+            device_session_config = tmpdir / "private-device-session-config.json"
             owner_record.write_text(valid_owner_authorization().replace("production_activation=false", "production_activation=true"), encoding="utf-8")
             rollback_record.write_text(valid_rollback_evidence(), encoding="utf-8")
             hardware_pack.write_text(valid_hardware_pack(), encoding="utf-8")
             audit_export_policy.write_text(valid_audit_export_policy(), encoding="utf-8")
+            device_session_config.write_text(valid_device_session_config(), encoding="utf-8")
             record_path = tmpdir / "private-evidence-record.json"
             record = valid_record(os.path.realpath(audit_root))
             record["owner_authorization_ref"] = str(owner_record)
             record["rollback_ref"] = str(rollback_record)
             record["hardware_evidence_ref"] = str(hardware_pack)
             record["audit_export_policy_ref"] = str(audit_export_policy)
+            record["device_session_config_ref"] = str(device_session_config)
             record_path.write_text(json.dumps(record), encoding="utf-8")
 
             proc = subprocess.run(
@@ -406,15 +430,18 @@ class ValidateT1PreflightEvidenceRecordTests(unittest.TestCase):
             missing_rollback = tmpdir / "private-rollback-evidence.md"
             hardware_pack = tmpdir / "private-hardware-evidence.md"
             audit_export_policy = tmpdir / "private-audit-export-policy.md"
+            device_session_config = tmpdir / "private-device-session-config.json"
             owner_record.write_text(valid_owner_authorization(), encoding="utf-8")
             hardware_pack.write_text(valid_hardware_pack(), encoding="utf-8")
             audit_export_policy.write_text(valid_audit_export_policy(), encoding="utf-8")
+            device_session_config.write_text(valid_device_session_config(), encoding="utf-8")
             record_path = tmpdir / "private-evidence-record.json"
             record = valid_record(os.path.realpath(audit_root))
             record["owner_authorization_ref"] = str(owner_record)
             record["rollback_ref"] = str(missing_rollback)
             record["hardware_evidence_ref"] = str(hardware_pack)
             record["audit_export_policy_ref"] = str(audit_export_policy)
+            record["device_session_config_ref"] = str(device_session_config)
             record_path.write_text(json.dumps(record), encoding="utf-8")
 
             proc = subprocess.run(
@@ -447,6 +474,7 @@ class ValidateT1PreflightEvidenceRecordTests(unittest.TestCase):
             rollback_record = tmpdir / "private-rollback-evidence.md"
             hardware_pack = tmpdir / "private-hardware-evidence.md"
             audit_export_policy = tmpdir / "private-audit-export-policy.md"
+            device_session_config = tmpdir / "private-device-session-config.json"
             owner_record.write_text(valid_owner_authorization(), encoding="utf-8")
             rollback_record.write_text(
                 valid_rollback_evidence().replace("production_activation=false", "production_activation=true"),
@@ -454,12 +482,14 @@ class ValidateT1PreflightEvidenceRecordTests(unittest.TestCase):
             )
             hardware_pack.write_text(valid_hardware_pack(), encoding="utf-8")
             audit_export_policy.write_text(valid_audit_export_policy(), encoding="utf-8")
+            device_session_config.write_text(valid_device_session_config(), encoding="utf-8")
             record_path = tmpdir / "private-evidence-record.json"
             record = valid_record(os.path.realpath(audit_root))
             record["owner_authorization_ref"] = str(owner_record)
             record["rollback_ref"] = str(rollback_record)
             record["hardware_evidence_ref"] = str(hardware_pack)
             record["audit_export_policy_ref"] = str(audit_export_policy)
+            record["device_session_config_ref"] = str(device_session_config)
             record_path.write_text(json.dumps(record), encoding="utf-8")
 
             proc = subprocess.run(
@@ -492,6 +522,7 @@ class ValidateT1PreflightEvidenceRecordTests(unittest.TestCase):
             rollback_record = tmpdir / "private-rollback-evidence.md"
             hardware_pack = tmpdir / "private-hardware-evidence.md"
             audit_export_policy = tmpdir / "private-audit-export-policy.md"
+            device_session_config = tmpdir / "private-device-session-config.json"
             owner_record.write_text(valid_owner_authorization(), encoding="utf-8")
             rollback_record.write_text(valid_rollback_evidence(), encoding="utf-8")
             hardware_pack.write_text(
@@ -499,12 +530,14 @@ class ValidateT1PreflightEvidenceRecordTests(unittest.TestCase):
                 encoding="utf-8",
             )
             audit_export_policy.write_text(valid_audit_export_policy(), encoding="utf-8")
+            device_session_config.write_text(valid_device_session_config(), encoding="utf-8")
             record_path = tmpdir / "private-evidence-record.json"
             record = valid_record(os.path.realpath(audit_root))
             record["owner_authorization_ref"] = str(owner_record)
             record["rollback_ref"] = str(rollback_record)
             record["hardware_evidence_ref"] = str(hardware_pack)
             record["audit_export_policy_ref"] = str(audit_export_policy)
+            record["device_session_config_ref"] = str(device_session_config)
             record_path.write_text(json.dumps(record), encoding="utf-8")
 
             proc = subprocess.run(
@@ -540,15 +573,18 @@ class ValidateT1PreflightEvidenceRecordTests(unittest.TestCase):
             rollback_record = tmpdir / "private-rollback-evidence.md"
             hardware_pack = tmpdir / "private-hardware-evidence.md"
             missing_policy = tmpdir / "private-audit-export-policy.md"
+            device_session_config = tmpdir / "private-device-session-config.json"
             owner_record.write_text(valid_owner_authorization(), encoding="utf-8")
             rollback_record.write_text(valid_rollback_evidence(), encoding="utf-8")
             hardware_pack.write_text(valid_hardware_pack(), encoding="utf-8")
+            device_session_config.write_text(valid_device_session_config(), encoding="utf-8")
             record_path = tmpdir / "private-evidence-record.json"
             record = valid_record(os.path.realpath(audit_root))
             record["owner_authorization_ref"] = str(owner_record)
             record["rollback_ref"] = str(rollback_record)
             record["hardware_evidence_ref"] = str(hardware_pack)
             record["audit_export_policy_ref"] = str(missing_policy)
+            record["device_session_config_ref"] = str(device_session_config)
             record_path.write_text(json.dumps(record), encoding="utf-8")
 
             proc = subprocess.run(
@@ -581,6 +617,7 @@ class ValidateT1PreflightEvidenceRecordTests(unittest.TestCase):
             rollback_record = tmpdir / "private-rollback-evidence.md"
             hardware_pack = tmpdir / "private-hardware-evidence.md"
             audit_export_policy = tmpdir / "private-audit-export-policy.md"
+            device_session_config = tmpdir / "private-device-session-config.json"
             owner_record.write_text(valid_owner_authorization(), encoding="utf-8")
             rollback_record.write_text(valid_rollback_evidence(), encoding="utf-8")
             hardware_pack.write_text(valid_hardware_pack(), encoding="utf-8")
@@ -588,12 +625,14 @@ class ValidateT1PreflightEvidenceRecordTests(unittest.TestCase):
                 valid_audit_export_policy().replace("production_activation=false", "production_activation=true"),
                 encoding="utf-8",
             )
+            device_session_config.write_text(valid_device_session_config(), encoding="utf-8")
             record_path = tmpdir / "private-evidence-record.json"
             record = valid_record(os.path.realpath(audit_root))
             record["owner_authorization_ref"] = str(owner_record)
             record["rollback_ref"] = str(rollback_record)
             record["hardware_evidence_ref"] = str(hardware_pack)
             record["audit_export_policy_ref"] = str(audit_export_policy)
+            record["device_session_config_ref"] = str(device_session_config)
             record_path.write_text(json.dumps(record), encoding="utf-8")
 
             proc = subprocess.run(
@@ -616,6 +655,102 @@ class ValidateT1PreflightEvidenceRecordTests(unittest.TestCase):
             self.assertIn("ERROR: audit_export_policy_ref policy: production_activation must be false", proc.stderr)
             self.assertFalse(str(audit_export_policy) in proc.stderr, "stderr leaked audit export policy path")
             self.assertFalse(audit_export_policy.name in proc.stderr, "stderr leaked audit export policy file name")
+
+    def test_cli_check_private_refs_rejects_missing_device_session_config_without_echoing_private_path(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmpdir = Path(tmp)
+            audit_root = tmpdir / "audit-root"
+            audit_root.mkdir(mode=0o700)
+            owner_record = tmpdir / "private-owner-authorization.md"
+            rollback_record = tmpdir / "private-rollback-evidence.md"
+            hardware_pack = tmpdir / "private-hardware-evidence.md"
+            audit_export_policy = tmpdir / "private-audit-export-policy.md"
+            missing_config = tmpdir / "private-device-session-config.json"
+            owner_record.write_text(valid_owner_authorization(), encoding="utf-8")
+            rollback_record.write_text(valid_rollback_evidence(), encoding="utf-8")
+            hardware_pack.write_text(valid_hardware_pack(), encoding="utf-8")
+            audit_export_policy.write_text(valid_audit_export_policy(), encoding="utf-8")
+            record_path = tmpdir / "private-evidence-record.json"
+            record = valid_record(os.path.realpath(audit_root))
+            record["owner_authorization_ref"] = str(owner_record)
+            record["rollback_ref"] = str(rollback_record)
+            record["hardware_evidence_ref"] = str(hardware_pack)
+            record["audit_export_policy_ref"] = str(audit_export_policy)
+            record["device_session_config_ref"] = str(missing_config)
+            record_path.write_text(json.dumps(record), encoding="utf-8")
+
+            proc = subprocess.run(
+                [
+                    sys.executable,
+                    str(SCRIPT),
+                    ARTIFACT_SHA,
+                    str(record_path),
+                    "--check-root-dir",
+                    "--check-private-refs",
+                    "--expected-pr",
+                    "286",
+                ],
+                check=False,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            self.assertEqual(1, proc.returncode)
+            self.assertIn("ERROR: device_session_config_ref config could not be read: FileNotFoundError", proc.stderr)
+            self.assertFalse(str(missing_config) in proc.stderr, "stderr leaked device session config path")
+            self.assertFalse(missing_config.name in proc.stderr, "stderr leaked device session config file name")
+
+    def test_cli_check_private_refs_rejects_invalid_device_session_config_without_echoing_private_path(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmpdir = Path(tmp)
+            audit_root = tmpdir / "audit-root"
+            audit_root.mkdir(mode=0o700)
+            owner_record = tmpdir / "private-owner-authorization.md"
+            rollback_record = tmpdir / "private-rollback-evidence.md"
+            hardware_pack = tmpdir / "private-hardware-evidence.md"
+            audit_export_policy = tmpdir / "private-audit-export-policy.md"
+            device_session_config = tmpdir / "private-device-session-config.json"
+            owner_record.write_text(valid_owner_authorization(), encoding="utf-8")
+            rollback_record.write_text(valid_rollback_evidence(), encoding="utf-8")
+            hardware_pack.write_text(valid_hardware_pack(), encoding="utf-8")
+            audit_export_policy.write_text(valid_audit_export_policy(), encoding="utf-8")
+            device_session_config.write_text(
+                valid_device_session_config().replace('"device_ipv4": "198.18.0.1"', '"device_ipv4": "SECRET-DEVICE-IP"'),
+                encoding="utf-8",
+            )
+            record_path = tmpdir / "private-evidence-record.json"
+            record = valid_record(os.path.realpath(audit_root))
+            record["owner_authorization_ref"] = str(owner_record)
+            record["rollback_ref"] = str(rollback_record)
+            record["hardware_evidence_ref"] = str(hardware_pack)
+            record["audit_export_policy_ref"] = str(audit_export_policy)
+            record["device_session_config_ref"] = str(device_session_config)
+            record_path.write_text(json.dumps(record), encoding="utf-8")
+
+            proc = subprocess.run(
+                [
+                    sys.executable,
+                    str(SCRIPT),
+                    ARTIFACT_SHA,
+                    str(record_path),
+                    "--check-root-dir",
+                    "--check-private-refs",
+                    "--expected-pr",
+                    "286",
+                ],
+                check=False,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            self.assertEqual(1, proc.returncode)
+            self.assertIn(
+                "ERROR: device_session_config_ref config: dev session config device_ipv4 must be a valid IPv4 address",
+                proc.stderr,
+            )
+            self.assertFalse("SECRET-DEVICE-IP" in proc.stderr, "stderr leaked device session config value")
+            self.assertFalse(str(device_session_config) in proc.stderr, "stderr leaked device session config path")
+            self.assertFalse(device_session_config.name in proc.stderr, "stderr leaked device session config file name")
 
 
 if __name__ == "__main__":

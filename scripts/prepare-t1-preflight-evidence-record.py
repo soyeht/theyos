@@ -50,6 +50,7 @@ def missing_private_ref_fields(
     rollback_ref: str,
     hardware_ref: str,
     audit_export_policy_ref: str,
+    device_session_config_ref: str,
 ) -> list[str]:
     missing: list[str] = []
     if not owner_ref:
@@ -60,6 +61,8 @@ def missing_private_ref_fields(
         missing.append("hardware_evidence_ref")
     if not audit_export_policy_ref:
         missing.append("audit_export_policy_ref")
+    if not device_session_config_ref:
+        missing.append("device_session_config_ref")
     return missing
 
 
@@ -130,6 +133,7 @@ def main() -> int:
     parser.add_argument("--rollback-ref", help="private rollback artifact reference")
     parser.add_argument("--hardware-ref", help="private T1-T4 hardware evidence reference")
     parser.add_argument("--audit-export-policy-ref", help="private audit export policy reference")
+    parser.add_argument("--device-session-config-ref", help="private Device-side session config reference")
     args = parser.parse_args()
 
     if not is_full_git_sha(args.artifact_sha):
@@ -143,6 +147,10 @@ def main() -> int:
     audit_export_policy_ref = select_private_ref(
         args.audit_export_policy_ref,
         existing.get("audit_export_policy_ref"),
+    )
+    device_session_config_ref = select_private_ref(
+        args.device_session_config_ref,
+        existing.get("device_session_config_ref"),
     )
     audit_root = canonical_private_audit_root(args.audit_root)
 
@@ -158,6 +166,7 @@ def main() -> int:
         "rollback_ref": rollback_ref,
         "hardware_evidence_ref": hardware_ref,
         "audit_export_policy_ref": audit_export_policy_ref,
+        "device_session_config_ref": device_session_config_ref,
         "audit_root": audit_root,
     }
     write_private_record(args.record, record)
@@ -174,6 +183,7 @@ def main() -> int:
         rollback_ref,
         hardware_ref,
         audit_export_policy_ref,
+        device_session_config_ref,
     )
     if missing_refs:
         print("INFO: record remains incomplete until all private refs are supplied")

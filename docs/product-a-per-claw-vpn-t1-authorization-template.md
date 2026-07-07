@@ -57,6 +57,7 @@ the fd-relative `O_NOFOLLOW` traversal.
   "rollback_ref": "<prebuilt-rollback-artifact-ref>",
   "hardware_evidence_ref": "<sanitized-t1-t4-evidence-pack-ref>",
   "audit_export_policy_ref": "<audit-export-policy-ref>",
+  "device_session_config_ref": "<device-session-config-ref>",
   "audit_root": "<private-absolute-normal-0700-audit-root>"
 }
 ```
@@ -66,6 +67,8 @@ artifact it names; the loader only checks that the references are non-empty and
 that the SHA, scope, production flag, booleans, and audit-root shape are valid.
 `audit_export_policy_ref` is followed by the offline validator for shape/privacy
 review; it is not an authorization to export audit data off host.
+`device_session_config_ref` is followed by the offline Device-side config
+validator for shape/privacy review; it is not route/interface execution.
 Before opening the activation PR, prepare and validate the private record
 locally without printing its values:
 
@@ -88,6 +91,9 @@ scripts/validate-t1-audit-export-policy.py \
   <private-audit-export-policy> \
   --expected-pr <number>
 
+scripts/validate-t1-device-session-config.py \
+  <private-device-session-config>
+
 scripts/validate-t1-preflight-evidence-record.py \
   <exact-40-hex-artifact-sha> \
   .env.t1-preflight-evidence.json \
@@ -98,9 +104,9 @@ scripts/validate-t1-preflight-evidence-record.py \
 
 The prepare helper creates or updates the private draft and audit root, then
 prints only status plus missing field names such as `owner_authorization_ref`,
-`rollback_ref`, `hardware_evidence_ref`, and `audit_export_policy_ref`. It does
-not print private ref values, it does not verify the referenced artifacts, and
-it does not authorize activation.
+`rollback_ref`, `hardware_evidence_ref`, `audit_export_policy_ref`, and
+`device_session_config_ref`. It does not print private ref values, it does not
+verify the referenced artifacts, and it does not authorize activation.
 
 The `.env.t1-preflight-evidence.json` file name is ignored by the repository's
 `.gitignore`; keep the filled record private.
@@ -178,10 +184,11 @@ scripts/validate-t1-hardware-evidence-pack.py \
 ```
 
 Then keep the same private paths in `owner_authorization_ref`, `rollback_ref`,
-`hardware_evidence_ref`, and `audit_export_policy_ref`, and rerun the preflight
-evidence validator with `--check-private-refs`. That chained check does not
-print private paths or values; it only proves the referenced private artifacts
-are complete-shaped for review.
+`hardware_evidence_ref`, `audit_export_policy_ref`, and
+`device_session_config_ref`, and rerun the preflight evidence validator with
+`--check-private-refs`. That chained check does not print private paths or
+values; it only proves the referenced private artifacts are complete-shaped for
+review.
 
 These validators check that the private artifacts are complete-shaped for
 review. They do not prove the referenced artifacts are real or correct;
