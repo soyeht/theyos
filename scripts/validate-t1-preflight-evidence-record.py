@@ -20,10 +20,12 @@ REQUIRED_REFS = (
     "owner_authorization_ref",
     "rollback_ref",
     "hardware_evidence_ref",
+    "audit_export_policy_ref",
 )
 OWNER_AUTHORIZATION_VALIDATOR = Path(__file__).with_name("validate-t1-owner-authorization.py")
 ROLLBACK_EVIDENCE_VALIDATOR = Path(__file__).with_name("validate-t1-rollback-evidence.py")
 HARDWARE_PACK_VALIDATOR = Path(__file__).with_name("validate-t1-hardware-evidence-pack.py")
+AUDIT_EXPORT_POLICY_VALIDATOR = Path(__file__).with_name("validate-t1-audit-export-policy.py")
 
 
 def is_full_git_sha(value: object) -> bool:
@@ -177,6 +179,22 @@ def validate_hardware_evidence_ref(record: dict[str, object], expected_sha: str,
     return [f"hardware_evidence_ref pack: {error}" for error in pack_errors]
 
 
+def validate_audit_export_policy_ref(record: dict[str, object], expected_sha: str, expected_pr: int | None) -> list[str]:
+    markdown, error = read_private_ref(record, "audit_export_policy_ref")
+    if error is not None:
+        return [error.replace("artifact", "policy")]
+    if markdown is None:
+        return []
+
+    try:
+        validator = load_sibling_validator("validate_t1_audit_export_policy", AUDIT_EXPORT_POLICY_VALIDATOR)
+    except RuntimeError:
+        return ["audit_export_policy_ref policy validator is unavailable"]
+
+    policy_errors = validator.validate_audit_export_policy(markdown, expected_sha, expected_pr)
+    return [f"audit_export_policy_ref policy: {error}" for error in policy_errors]
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(
         description=(
@@ -209,7 +227,15 @@ def main() -> int:
     parser.add_argument(
         "--check-private-refs",
         action="store_true",
-        help="also validate owner_authorization_ref, rollback_ref, and hardware_evidence_ref shapes",
+        help=(
+            "also validate owner_authorization_ref, rollback_ref, hardware_evidence_ref, "
+            "and audit_export_policy_ref shapes"
+        ),
+    )
+    parser.add_argument(
+        "--check-audit-export-policy",
+        action="store_true",
+        help="also validate the private audit_export_policy_ref shape without printing its path or values",
     )
     parser.add_argument("--expected-pr", type=int, help="expected activation PR number for chained private artifact checks")
     args = parser.parse_args()
@@ -232,6 +258,8 @@ def main() -> int:
             errors.extend(validate_rollback_ref(record, args.expected_artifact_sha, args.expected_pr))
         if args.check_hardware_pack or args.check_private_refs:
             errors.extend(validate_hardware_evidence_ref(record, args.expected_artifact_sha, args.expected_pr))
+        if args.check_audit_export_policy or args.check_private_refs:
+            errors.extend(validate_audit_export_policy_ref(record, args.expected_artifact_sha, args.expected_pr))
     if errors:
         for error in errors:
             print(f"ERROR: {error}", file=sys.stderr)

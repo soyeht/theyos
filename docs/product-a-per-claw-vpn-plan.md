@@ -183,9 +183,11 @@ startup wiring module now has a reviewed parser/loader for a
 40-hex artifact SHA match, `dev-host T1-T4 only` scope, production activation
 set to false, owner/rollback/hardware booleans, non-empty references to the
 owner authorization, rollback artifact, and hardware evidence pack, and an
-absolute normal `audit_root`; that helper is not called by the mount or the
-server binary in the default path, and the source guard tripwires those evidence
-record symbols outside `startup_wiring`. The mount now
+absolute normal `audit_root`; the offline private-record validator also
+requires and follows `audit_export_policy_ref` as a shape/privacy gate for the
+same artifact. That helper is not called by the mount or the server binary in
+the default path, and the source guard tripwires those evidence record symbols
+outside `startup_wiring`. The mount now
 injects that backend through the same T1 caller gate, but the production path
 still supplies
 `PerClawVpnT1PreflightEvidence::missing`, so even with the T1 dev env present it
@@ -571,11 +573,14 @@ Access between members/devices and claws is explicitly many-to-many:
   module has a reviewed SHA-bound evidence record parser/loader that remains
   unused by the mount and binary and is source-guarded outside
   `startup_wiring`. The record includes non-empty references to the owner
-  authorization, rollback artifact, and hardware evidence pack. The
-  future activation review must connect that evidence record to the mount gate,
-  bind the evidence `audit_root` to the sink path, confirm the reviewed
-  retention/rotation constants remain acceptable for the exact run, choose
-  export key source/rotation, and decide the final best-effort-vs-durable
+  authorization, rollback artifact, hardware evidence pack, and audit export
+  policy through the offline validator, while the Rust loader consumes only the
+  reviewed runtime evidence fields. The future activation review must connect
+  that evidence record to the mount gate, bind the evidence `audit_root` to the
+  sink path, confirm the reviewed retention/rotation constants remain
+  acceptable for the exact run, verify export key
+  source/rotation/retention/destination content, and decide the final
+  best-effort-vs-durable
   authorization/in-flight semantics. The environment-backed mount still
   supplies missing preflight
   evidence, so `Disabled`/invalid/missing-preflight/`Dial` paths all fall back
