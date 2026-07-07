@@ -40,6 +40,14 @@ name = "relay_stream_relay_dev"
 path = "src/bin/relay_stream_relay_dev.rs"
 required-features = ["dev_claw_share_mint"]
 
+# Dev-only two-ended T1 IpTunnel Phase 0 claw responder. This target is absent
+# from default/product builds; it is a standalone dev binary that supplies
+# dev-scoped preflight only after explicit runtime acks.
+[[bin]]
+name = "t1_iptunnel_claw_dev"
+path = "src/bin/t1_iptunnel_claw_dev.rs"
+required-features = ["dev_t1_datapath"]
+
 [dependencies]
 # Async runtime + HTTP framework
 tokio       = { workspace = true }
@@ -165,6 +173,11 @@ failure-injection = []
 # owner-authorization BYPASS fixture: production/release builds MUST NOT enable
 # it; without this feature the handler and its route do not exist.
 dev_claw_share_mint = []
+
+# Dev-only per-Claw VPN T1 datapath runner wiring. This compiles standalone
+# Fase 0 helpers and never changes the production mount, which remains gated by
+# the real #281 preflight record.
+dev_t1_datapath = ["dev_claw_share_mint"]
 
 # macOS-only FFI bindings to Apple's dns_sd.h system header. Used by
 # `bonjour_impl_dns_sd.rs` to publish/browse via `mDNSResponder` (the

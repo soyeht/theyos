@@ -3830,6 +3830,7 @@ fn product_a_per_claw_vpn_dev_config_remains_default_off_and_unwired() {
     let relay_stream_mount_path = server_src_dir.join("claw_share_relay_stream_mount.rs");
     let relay_stream_target_router_path =
         server_src_dir.join("claw_share_relay_stream_target_router.rs");
+    let t1_phase0_dev_bin_path = server_src_dir.join("bin").join("t1_iptunnel_claw_dev.rs");
     let runtime_path = server_src_dir.join("claw_vpn_runtime.rs");
     let wiring_path = server_src_dir.join("claw_vpn_wiring.rs");
     let startup_wiring_path = server_src_dir.join("startup_wiring.rs");
@@ -4357,6 +4358,9 @@ fn product_a_per_claw_vpn_dev_config_remains_default_off_and_unwired() {
 
     let mut violations = Vec::new();
     for path in sources {
+        if path == t1_phase0_dev_bin_path {
+            continue;
+        }
         let source = fs::read_to_string(&path)
             .unwrap_or_else(|e| panic!("read per-Claw VPN runtime source {}: {e}", path.display()));
         let lines = source.lines().collect::<Vec<_>>();
@@ -4864,6 +4868,73 @@ fn product_a_per_claw_vpn_dev_config_remains_default_off_and_unwired() {
         "per-Claw VPN symbols/TUN/utun wiring must stay out of e2e-rs despite its server-rs dev-dependency:\n{}",
         e2e_violations.join("\n")
     );
+}
+
+#[test]
+fn t1_phase0_dev_datapath_bypass_is_feature_gated_and_not_mounted() {
+    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let cargo_toml_path = manifest_dir.join("Cargo.toml");
+    let cargo_toml = fs::read_to_string(&cargo_toml_path)
+        .unwrap_or_else(|e| panic!("read server Cargo.toml {}: {e}", cargo_toml_path.display()));
+    let bin_target = r#"[[bin]]
+name = "t1_iptunnel_claw_dev"
+path = "src/bin/t1_iptunnel_claw_dev.rs"
+required-features = ["dev_t1_datapath"]"#;
+    assert!(
+        cargo_toml.contains(bin_target),
+        "T1 Phase 0 claw dev bypass must be absent from default/product builds"
+    );
+    assert!(
+        cargo_toml.contains(r#"dev_t1_datapath = ["dev_claw_share_mint"]"#),
+        "T1 Phase 0 dev datapath feature must be explicit and opt-in"
+    );
+
+    let bin_path = manifest_dir.join("src/bin/t1_iptunnel_claw_dev.rs");
+    let bin_source = fs::read_to_string(&bin_path)
+        .unwrap_or_else(|e| panic!("read T1 Phase 0 dev bin {}: {e}", bin_path.display()));
+    for required_token in [
+        "PerClawVpnT1PreflightEvidence::new(true, true, true)",
+        "THEYOS_T1_DEV_DATAPATH",
+        "THEYOS_FORCE_SOFTWARE_KEYS",
+        "dev-host T1-T4 only; no production activation",
+        "dev-host public relay dial allowed; no production activation",
+        "runner_tun_opened=false",
+        "runner_route_installed=false",
+        "runner_packet_pump_started=false",
+    ] {
+        assert!(
+            bin_source.contains(required_token),
+            "T1 Phase 0 dev bin must retain hard dev-only guard token: {required_token}"
+        );
+    }
+    assert!(
+        !bin_source.contains("/Applications/Soyeht.app")
+            && !bin_source.contains("com.soyeht.mac")
+            && !bin_source.contains(":8091"),
+        "T1 Phase 0 dev bin must not reference production app/state endpoints"
+    );
+
+    let mount_path = manifest_dir.join("src/claw_share_relay_stream_mount.rs");
+    let mount_source = fs::read_to_string(&mount_path)
+        .unwrap_or_else(|e| panic!("read relay-stream mount {}: {e}", mount_path.display()));
+    assert_eq!(
+        mount_source
+            .matches("PerClawVpnT1PreflightEvidence::missing")
+            .count(),
+        2,
+        "production mount must keep both platform T1 gates hardcoded missing"
+    );
+    for forbidden_token in [
+        "PerClawVpnT1PreflightEvidence::new",
+        "dev_t1_datapath",
+        "THEYOS_T1_DEV_DATAPATH",
+        "THEYOS_FORCE_SOFTWARE_KEYS",
+    ] {
+        assert!(
+            !mount_source.contains(forbidden_token),
+            "production mount must not contain the T1 Phase 0 dev bypass token: {forbidden_token}"
+        );
+    }
 }
 
 #[test]

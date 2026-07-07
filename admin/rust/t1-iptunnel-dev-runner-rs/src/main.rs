@@ -23,7 +23,9 @@ use household_rs::claw_share_relay_stream_contract::{
     RelayStreamAudience, RelayStreamExpectedPath, RelayStreamOfferContract, RelayStreamResource,
 };
 use household_rs::claw_share_relay_stream_endpoint::parse_relay_endpoint;
-use household_rs::claw_share_relay_stream_noise::RelayStreamNoiseFramed;
+use household_rs::claw_share_relay_stream_noise::{
+    RelayStreamNoiseAsyncStream, RelayStreamNoiseFramed,
+};
 use household_rs::claw_share_rendezvous_hello::{RendezvousHello, RendezvousRole};
 use household_rs::claw_vpn::ClawVpnSessionAddrs;
 use household_rs::keys::{IdentityKey, P256Keypair};
@@ -32,6 +34,12 @@ use serde_json::{Map, Value};
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 
 const DEV_HOST_ACK: &str = "dev-host T1-T4 only; no production activation";
+#[cfg(feature = "dev_t1_datapath")]
+const DEV_DATAPATH_ENV: &str = "THEYOS_T1_DEV_DATAPATH";
+#[cfg(feature = "dev_t1_datapath")]
+const DEV_SOFTWARE_KEYS_ENV: &str = "THEYOS_FORCE_SOFTWARE_KEYS";
+#[cfg(feature = "dev_t1_datapath")]
+const DEV_PUBLIC_RELAY_ACK: &str = "dev-host public relay dial allowed; no production activation";
 const DEV_RUNNER_SESSION_CONFIG_SCHEMA: &str = "t1-dev-runner-device-session-v1";
 const DEV_RUNNER_SESSION_CONFIG_SCOPE: &str = "dev-host T1-T4 only";
 const DEV_RUNNER_CLAW_ROUTE_PREFIX_LEN: u8 = 32;
@@ -82,6 +90,32 @@ enum Command {
         /// Exact acknowledgement required before any network dial.
         #[arg(long)]
         dev_host_ack: String,
+    },
+    /// Owner-present dev-only run path for Device-side T1 datapath validation.
+    ///
+    /// This command is compiled only with `--features dev_t1_datapath`. It is
+    /// still default-off at runtime and requires explicit dev env gates before
+    /// any interface is opened.
+    #[cfg(feature = "dev_t1_datapath")]
+    RunDeviceDatapath {
+        /// Canonical CBOR `RelayStreamOfferContract` file.
+        #[arg(long)]
+        offer_file: PathBuf,
+        /// File containing the 64-hex dev device secret scalar. The value is
+        /// never printed.
+        #[arg(long)]
+        device_secret_file: PathBuf,
+        /// Private JSON Device-side session config file. Paths and values are
+        /// never printed.
+        #[arg(long)]
+        config_file: PathBuf,
+        /// Exact acknowledgement required before any datapath action.
+        #[arg(long)]
+        dev_host_ack: String,
+        /// Second acknowledgement required only when the offer relay endpoint is
+        /// non-loopback.
+        #[arg(long)]
+        allow_public_relay_ack: Option<String>,
     },
 }
 
@@ -441,11 +475,13 @@ where
     Ok(session_ack)
 }
 
-async fn open_iptunnel_session(
+type OpenedIpTunnelStream = RelayStreamNoiseAsyncStream<tokio::net::TcpStream>;
+
+async fn connect_open_iptunnel_session(
     offer: &RelayStreamOfferContract,
     device_key: &P256Keypair,
     now_unix: u64,
-) -> Result<DevRunnerSessionAck> {
+) -> Result<(DevRunnerSessionAck, OpenedIpTunnelStream)> {
     validate_open_session_inputs(offer, device_key)?;
     let (host, port) = parse_relay_endpoint(&offer.payload.relay_endpoint)
         .context("validate relay endpoint shape")?;
@@ -481,7 +517,348 @@ async fn open_iptunnel_session(
     .await
     .context("relay_stream Noise handshake")?;
     let mut stream = framed.into_async_stream();
-    authenticate_open_iptunnel_session(&mut stream, offer, device_key, now_unix).await
+    let session_ack =
+        authenticate_open_iptunnel_session(&mut stream, offer, device_key, now_unix).await?;
+    Ok((session_ack, stream))
+}
+
+async fn open_iptunnel_session(
+    offer: &RelayStreamOfferContract,
+    device_key: &P256Keypair,
+    now_unix: u64,
+) -> Result<DevRunnerSessionAck> {
+    let (session_ack, _stream) = connect_open_iptunnel_session(offer, device_key, now_unix).await?;
+    Ok(session_ack)
+}
+
+#[cfg(feature = "dev_t1_datapath")]
+mod dev_datapath {
+    use std::io;
+    use std::net::{IpAddr, Ipv4Addr};
+    use std::os::unix::net::UnixStream as StdUnixStream;
+    use std::time::Duration;
+
+    use anyhow::{Result, anyhow, bail};
+    use household_rs::claw_share_data_tunnel::{
+        TargetSession, TunnelFrame, recv_frame, send_frame,
+    };
+    use household_rs::claw_share_relay_stream_contract::RelayStreamAudience;
+    use household_rs::claw_vpn::{
+        ClawVpnAcl, ClawVpnAclKey, ClawVpnAgentCore, ClawVpnAgentSessionCore, ClawVpnDatapathSide,
+        ClawVpnIpv4Pool, ClawVpnSessionRegistry,
+    };
+    use server_rs::claw_vpn_interface_route_plan::{
+        ClawVpnInterfaceName, ClawVpnInterfaceRoutePlatform, ClawVpnInterfaceRouteToolPaths,
+    };
+    #[cfg(target_os = "linux")]
+    use server_rs::claw_vpn_linux_tun::{
+        ClawVpnLinuxTunConfig, ClawVpnLinuxTunDevice, ClawVpnLinuxTunName,
+    };
+    #[cfg(target_os = "macos")]
+    use server_rs::claw_vpn_macos_utun::ClawVpnMacosUtunDevice;
+    use server_rs::claw_vpn_relay_stream::ClawVpnRelayStream;
+    use server_rs::claw_vpn_target_session_runtime::{
+        ClawVpnTargetSessionRuntimeError, assemble_claw_vpn_target_session_runtime,
+    };
+    use server_rs::claw_vpn_wiring::{
+        ClawVpnRuntimeWiringConfig, ClawVpnRuntimeWiringContext, ClawVpnRuntimeWiringInputs,
+    };
+    use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+
+    use super::{
+        DEV_DATAPATH_ENV, DEV_PUBLIC_RELAY_ACK, DEV_SOFTWARE_KEYS_ENV, OpenedIpTunnelStream,
+        RelayStreamOfferContract, ValidatedDevRunnerSessionConfig, connect_open_iptunnel_session,
+        parse_relay_endpoint, validate_dev_host_ack,
+    };
+    use household_rs::keys::{IdentityKey, P256Keypair};
+
+    const DEV_DEVICE_POOL_NETWORK: Ipv4Addr = Ipv4Addr::new(198, 18, 0, 0);
+    const DEV_DEVICE_POOL_PREFIX_LEN: u8 = 24;
+    const DEV_TARGET_SESSION_IO_TIMEOUT: Duration = Duration::from_secs(5);
+    #[cfg(target_os = "linux")]
+    const DEV_LINUX_TUN_NAME: &str = "clawvpn0";
+    const LINUX_IP_TOOL_PATH: &str = "/sbin/ip";
+    const MACOS_IFCONFIG_TOOL_PATH: &str = "/sbin/ifconfig";
+    const MACOS_ROUTE_TOOL_PATH: &str = "/sbin/route";
+    const PIPE_CHUNK: usize = 16 * 1024;
+
+    #[cfg(target_os = "linux")]
+    type DevPacketInterface = ClawVpnLinuxTunDevice;
+    #[cfg(target_os = "macos")]
+    type DevPacketInterface = ClawVpnMacosUtunDevice;
+
+    pub(super) fn validate_dev_datapath_runtime_gates(
+        offer: &RelayStreamOfferContract,
+        dev_host_ack: &str,
+        allow_public_relay_ack: Option<&str>,
+    ) -> Result<()> {
+        validate_dev_datapath_runtime_gates_with_env(
+            offer,
+            dev_host_ack,
+            allow_public_relay_ack,
+            |name| std::env::var(name).ok(),
+        )
+    }
+
+    pub(super) fn validate_dev_datapath_runtime_gates_with_env(
+        offer: &RelayStreamOfferContract,
+        dev_host_ack: &str,
+        allow_public_relay_ack: Option<&str>,
+        get_env: impl Fn(&str) -> Option<String>,
+    ) -> Result<()> {
+        validate_dev_host_ack(dev_host_ack)?;
+        require_env_enabled(DEV_DATAPATH_ENV, &get_env)?;
+        require_env_enabled(DEV_SOFTWARE_KEYS_ENV, &get_env)?;
+        validate_loopback_relay_endpoint_or_ack(offer, allow_public_relay_ack)?;
+        Ok(())
+    }
+
+    fn require_env_enabled(name: &str, get_env: &impl Fn(&str) -> Option<String>) -> Result<()> {
+        match get_env(name) {
+            Some(value) if value.trim() == "1" => Ok(()),
+            _ => bail!("{name} must be set to 1 for dev-host T1 datapath"),
+        }
+    }
+
+    fn validate_loopback_relay_endpoint_or_ack(
+        offer: &RelayStreamOfferContract,
+        allow_public_relay_ack: Option<&str>,
+    ) -> Result<()> {
+        let (host, _port) = parse_relay_endpoint(&offer.payload.relay_endpoint)
+            .map_err(|_| anyhow!("dev relay endpoint invalid"))?;
+        let ip = host
+            .parse::<IpAddr>()
+            .map_err(|_| anyhow!("dev relay endpoint must use an IP host"))?;
+        if ip.is_loopback() {
+            return Ok(());
+        }
+        if matches!(allow_public_relay_ack, Some(value) if value == DEV_PUBLIC_RELAY_ACK) {
+            return Ok(());
+        }
+        bail!("non-loopback relay requires explicit dev public relay acknowledgement");
+    }
+
+    fn validate_host_platform(config: &ValidatedDevRunnerSessionConfig) -> Result<()> {
+        #[cfg(target_os = "linux")]
+        {
+            if !matches!(
+                config.platform,
+                super::DevRunnerSessionConfigPlatform::Linux
+            ) {
+                bail!("dev session config platform does not match this host");
+            }
+        }
+        #[cfg(target_os = "macos")]
+        {
+            if !matches!(
+                config.platform,
+                super::DevRunnerSessionConfigPlatform::Macos
+            ) {
+                bail!("dev session config platform does not match this host");
+            }
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        {
+            let _ = config;
+            bail!("dev-host T1 datapath supports only linux and macos hosts");
+        }
+        Ok(())
+    }
+
+    fn device_session_core(
+        offer: &RelayStreamOfferContract,
+        device_key: &P256Keypair,
+        config: &ValidatedDevRunnerSessionConfig,
+    ) -> Result<ClawVpnAgentSessionCore> {
+        let RelayStreamAudience::Group { member_id, .. } = offer.payload.audience() else {
+            bail!("IpTunnel offer must be member-scoped group audience");
+        };
+        let key = ClawVpnAclKey::try_new(
+            member_id,
+            device_key.public(),
+            offer.payload.claw_id.clone(),
+        )
+        .map_err(|_| anyhow!("dev datapath acl key invalid"))?;
+        let mut acl = ClawVpnAcl::new();
+        acl.grant(key.clone());
+        let pool = ClawVpnIpv4Pool::try_new(DEV_DEVICE_POOL_NETWORK, DEV_DEVICE_POOL_PREFIX_LEN)
+            .map_err(|_| anyhow!("dev datapath IPv4 pool invalid"))?;
+        let mut core = ClawVpnAgentCore::new(
+            ClawVpnDatapathSide::Device,
+            ClawVpnSessionRegistry::new(acl, pool),
+        );
+        let (session, _open_event) = core.open_with_audit(&key);
+        let session = session.map_err(|_| anyhow!("dev datapath session open failed"))?;
+        if session.addrs() != config.addrs {
+            bail!("dev session config IPv4 pair does not match dev datapath pool");
+        }
+        core.into_session_core(session.id())
+            .map_err(|_| anyhow!("dev datapath session core missing"))
+    }
+
+    fn enabled_runtime_config() -> ClawVpnRuntimeWiringConfig {
+        let defaults = ClawVpnRuntimeWiringConfig::default();
+        ClawVpnRuntimeWiringConfig::new(
+            true,
+            defaults.runtime_step_budget(),
+            defaults.driver_budget(),
+        )
+    }
+
+    fn route_tool_paths() -> io::Result<ClawVpnInterfaceRouteToolPaths> {
+        ClawVpnInterfaceRouteToolPaths::try_new(
+            LINUX_IP_TOOL_PATH,
+            MACOS_IFCONFIG_TOOL_PATH,
+            MACOS_ROUTE_TOOL_PATH,
+        )
+        .map_err(|error| io::Error::other(format!("{error:?}")))
+    }
+
+    #[cfg(target_os = "linux")]
+    fn build_inputs(
+        _config: &ValidatedDevRunnerSessionConfig,
+        _context: ClawVpnRuntimeWiringContext,
+        relay: ClawVpnRelayStream<StdUnixStream>,
+    ) -> io::Result<ClawVpnRuntimeWiringInputs<DevPacketInterface, ClawVpnRelayStream<StdUnixStream>>>
+    {
+        let tun_name = ClawVpnLinuxTunName::new(DEV_LINUX_TUN_NAME)
+            .map_err(|error| io::Error::other(error.to_string()))?;
+        let device = ClawVpnLinuxTunDevice::open(&ClawVpnLinuxTunConfig::new(tun_name))?;
+        let interface_name = ClawVpnInterfaceName::new(device.name().as_str())
+            .map_err(|error| io::Error::other(format!("{error:?}")))?;
+        Ok(ClawVpnRuntimeWiringInputs {
+            route_platform: ClawVpnInterfaceRoutePlatform::Linux,
+            interface_name,
+            route_tool_paths: route_tool_paths()?,
+            interface: device,
+            relay,
+        })
+    }
+
+    #[cfg(target_os = "macos")]
+    fn build_inputs(
+        _config: &ValidatedDevRunnerSessionConfig,
+        _context: ClawVpnRuntimeWiringContext,
+        relay: ClawVpnRelayStream<StdUnixStream>,
+    ) -> io::Result<ClawVpnRuntimeWiringInputs<DevPacketInterface, ClawVpnRelayStream<StdUnixStream>>>
+    {
+        let device = ClawVpnMacosUtunDevice::open()?;
+        let interface_name = ClawVpnInterfaceName::new(device.name().as_str())
+            .map_err(|error| io::Error::other(format!("{error:?}")))?;
+        Ok(ClawVpnRuntimeWiringInputs {
+            route_platform: ClawVpnInterfaceRoutePlatform::Macos,
+            interface_name,
+            route_tool_paths: route_tool_paths()?,
+            interface: device,
+            relay,
+        })
+    }
+
+    fn map_runtime_error(error: &ClawVpnTargetSessionRuntimeError<io::Error>) -> anyhow::Error {
+        match error {
+            ClawVpnTargetSessionRuntimeError::Session(_) => {
+                anyhow!("dev datapath session core failed")
+            }
+            ClawVpnTargetSessionRuntimeError::TargetSessionRelay(_) => {
+                anyhow!("dev datapath target-session relay failed")
+            }
+            ClawVpnTargetSessionRuntimeError::Inputs(_) => {
+                anyhow!("dev datapath runtime inputs failed")
+            }
+        }
+    }
+
+    async fn pipe_target_session_to_tunnel<S>(
+        stream: S,
+        mut target_session: TargetSession,
+    ) -> Result<()>
+    where
+        S: AsyncRead + AsyncWrite + Unpin,
+    {
+        let (mut tunnel_r, mut tunnel_w) = tokio::io::split(stream);
+        let mut buf = vec![0u8; PIPE_CHUNK];
+        loop {
+            tokio::select! {
+                read = target_session.reader.read(&mut buf) => {
+                    match read {
+                        Ok(0) | Err(_) => {
+                            let _ = send_frame(&mut tunnel_w, &TunnelFrame::Close).await;
+                            return Ok(());
+                        }
+                        Ok(n) => send_frame(&mut tunnel_w, &TunnelFrame::Data(buf[..n].to_vec())).await
+                            .map_err(|error| anyhow!("dev datapath tunnel write failed: {error}"))?,
+                    }
+                }
+                frame = recv_frame(&mut tunnel_r) => {
+                    match frame.map_err(|error| anyhow!("dev datapath tunnel read failed: {error}"))? {
+                        TunnelFrame::Data(packet) => {
+                            target_session.writer.write_all(&packet).await
+                                .map_err(|_| anyhow!("dev datapath target write failed"))?;
+                            target_session.writer.flush().await
+                                .map_err(|_| anyhow!("dev datapath target flush failed"))?;
+                        }
+                        TunnelFrame::Window(_) | TunnelFrame::Resize { .. } => {}
+                        TunnelFrame::Close => {
+                            let _ = target_session.writer.shutdown().await;
+                            return Ok(());
+                        }
+                        TunnelFrame::Error(_) => bail!("dev datapath peer returned target error"),
+                        TunnelFrame::Exit(_) => return Ok(()),
+                        TunnelFrame::Health(_) | TunnelFrame::Open => {
+                            bail!("dev datapath peer sent unexpected control frame");
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    pub(super) async fn run_device_datapath(
+        offer: &RelayStreamOfferContract,
+        device_key: &P256Keypair,
+        config: &ValidatedDevRunnerSessionConfig,
+        now_unix: u64,
+    ) -> Result<()> {
+        validate_host_platform(config)?;
+        let session_core = device_session_core(offer, device_key, config)?;
+        let (session_ack, stream): (super::DevRunnerSessionAck, OpenedIpTunnelStream) =
+            connect_open_iptunnel_session(offer, device_key, now_unix).await?;
+
+        let runtime = assemble_claw_vpn_target_session_runtime(
+            enabled_runtime_config(),
+            DEV_TARGET_SESSION_IO_TIMEOUT,
+            move || session_core,
+            |context, relay| build_inputs(config, context, relay),
+        )
+        .map_err(|error| map_runtime_error(&error))?;
+        let Some(runtime) = runtime else {
+            bail!("dev datapath runtime disabled");
+        };
+        let (target_session, mut wiring) = runtime.into_parts();
+        let runtime_handle = tokio::task::spawn_blocking(move || -> Result<()> {
+            wiring
+                .run_until_stopped()
+                .map(|_report| ())
+                .map_err(|error| anyhow!("dev datapath runtime stopped: {error:?}"))
+        });
+
+        println!(
+            "OK: dev IpTunnel datapath started \
+             (runner_session_ack_ok=true, runner_ack_mtu={}, \
+             runner_session_id_present={}, runner_mesh_ipv6_present={}, \
+             runner_tun_opened=true, runner_route_installed=true, \
+             runner_packet_pump_started=true)",
+            session_ack.mtu(),
+            session_ack.session_id_present(),
+            session_ack.mesh_ipv6_present()
+        );
+        let pipe_result = pipe_target_session_to_tunnel(stream, target_session).await;
+        let runtime_result = runtime_handle
+            .await
+            .map_err(|_| anyhow!("dev datapath runtime join failed"))?;
+        pipe_result?;
+        runtime_result
+    }
 }
 
 #[tokio::main]
@@ -531,6 +908,25 @@ async fn main() -> Result<()> {
                 session_ack.mesh_ipv6_present()
             );
         }
+        #[cfg(feature = "dev_t1_datapath")]
+        Command::RunDeviceDatapath {
+            offer_file,
+            device_secret_file,
+            config_file,
+            dev_host_ack,
+            allow_public_relay_ack,
+        } => {
+            let offer = read_iptunnel_offer_file(&offer_file)?;
+            dev_datapath::validate_dev_datapath_runtime_gates(
+                &offer,
+                &dev_host_ack,
+                allow_public_relay_ack.as_deref(),
+            )?;
+            let config = validate_session_config_file(&config_file)?;
+            let device_key = read_device_secret_file(&device_secret_file)?;
+            dev_datapath::run_device_datapath(&offer, &device_key, &config, current_unix()?)
+                .await?;
+        }
     }
     Ok(())
 }
@@ -538,7 +934,6 @@ async fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     use household_rs::claw_share::{GuestCredential, SlotId};
     use household_rs::claw_share_data_tunnel::{
@@ -553,6 +948,7 @@ mod tests {
     use household_rs::ids::derive_household_id;
     use household_rs::keys::{IdentityKey, P256Keypair, P256PublicKey};
     use household_rs::person_cert::derive_person_id;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use tokio::io::AsyncWriteExt;
 
     use super::*;
@@ -1095,9 +1491,24 @@ mod tests {
         assert_eq!(opens.load(Ordering::SeqCst), 0);
     }
 
+    fn source_without_dev_datapath_module(source: &str) -> String {
+        let Some(start) = source.find("#[cfg(feature = \"dev_t1_datapath\")]\nmod dev_datapath")
+        else {
+            return source.to_string();
+        };
+        let Some(end) = source[start..].find("#[tokio::main]") else {
+            return source.to_string();
+        };
+        let end = start + end;
+        let mut bounded = String::new();
+        bounded.push_str(&source[..start]);
+        bounded.push_str(&source[end..]);
+        bounded
+    }
+
     #[test]
     fn source_keeps_session_open_boundary_bounded() {
-        let source = include_str!("main.rs");
+        let source = source_without_dev_datapath_module(include_str!("main.rs"));
         assert!(source.contains("OpenSession"));
         assert!(source.contains(DEV_HOST_ACK));
         for forbidden in [
@@ -1115,5 +1526,70 @@ mod tests {
                 "dev session opener must not cross into TUN/route/app control: {forbidden}"
             );
         }
+    }
+
+    #[cfg(feature = "dev_t1_datapath")]
+    #[test]
+    fn dev_datapath_runtime_gates_are_default_off_and_no_value_echo() {
+        let (offer, _device) = member_iptunnel_offer();
+
+        let error = dev_datapath::validate_dev_datapath_runtime_gates_with_env(
+            &offer,
+            DEV_HOST_ACK,
+            None,
+            |_| None,
+        )
+        .expect_err("datapath env gate is required");
+        assert!(error.to_string().contains(DEV_DATAPATH_ENV));
+
+        let error = dev_datapath::validate_dev_datapath_runtime_gates_with_env(
+            &offer,
+            DEV_HOST_ACK,
+            None,
+            |name| (name == DEV_DATAPATH_ENV).then(|| "1".to_string()),
+        )
+        .expect_err("software key env gate is required");
+        assert!(error.to_string().contains(DEV_SOFTWARE_KEYS_ENV));
+
+        let error = dev_datapath::validate_dev_datapath_runtime_gates_with_env(
+            &offer,
+            "partial acknowledgement",
+            None,
+            |name| {
+                matches!(name, DEV_DATAPATH_ENV | DEV_SOFTWARE_KEYS_ENV).then(|| "1".to_string())
+            },
+        )
+        .expect_err("exact dev host ack is required");
+        assert!(error.to_string().contains("acknowledgement"));
+    }
+
+    #[cfg(feature = "dev_t1_datapath")]
+    #[test]
+    fn dev_datapath_non_loopback_requires_second_ack_without_endpoint_echo() {
+        let (mut offer, _device) = member_iptunnel_offer();
+        offer.payload.relay_endpoint = "relay-stream://203.0.113.10:49152".to_string();
+        let env = |name: &str| {
+            matches!(name, DEV_DATAPATH_ENV | DEV_SOFTWARE_KEYS_ENV).then(|| "1".to_string())
+        };
+
+        let error = dev_datapath::validate_dev_datapath_runtime_gates_with_env(
+            &offer,
+            DEV_HOST_ACK,
+            None,
+            env,
+        )
+        .expect_err("non-loopback relay needs second ack");
+        let message = error.to_string();
+        assert!(message.contains("non-loopback relay"));
+        assert!(!message.contains("203.0.113.10"));
+        assert!(
+            dev_datapath::validate_dev_datapath_runtime_gates_with_env(
+                &offer,
+                DEV_HOST_ACK,
+                Some(DEV_PUBLIC_RELAY_ACK),
+                env,
+            )
+            .is_ok()
+        );
     }
 }
