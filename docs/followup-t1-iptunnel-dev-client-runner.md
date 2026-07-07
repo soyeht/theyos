@@ -11,8 +11,10 @@ The server-side T1 mount wiring remains gated by the activation checklist. The
 available guest/client CLI still rejects `IpTunnel` before connecting; a
 separate dev-only runner boundary validates member-scoped `IpTunnel` offer
 shape offline and has an explicit dev-host `open-session` step for the
-relay/data-tunnel session-open seam. It still deliberately does not open
-TUN/utun, install routes, run a packet pump, or touch production.
+relay/data-tunnel session-open seam. The runner still deliberately does not
+implement the local TUN/utun, route install, packet pump, or production-app
+control path. A target open against an activated dev host remains a gated
+T1-T4 validation step, not a production activation path.
 
 A PTY or ClawSite smoke proves the existing relay-stream/data-tunnel transport;
 it does not prove T1-T4 per-Claw VPN behavior because it does not open a
@@ -27,7 +29,10 @@ cleanup.
 - `t1-iptunnel-dev-runner` implements offline `validate-offer --offer-file ...`
   shape validation plus explicit `open-session` auth/open validation. The
   session-open command requires an exact dev-host/no-production acknowledgement
-  and a private device-secret file; it prints only boolean status.
+  and a private device-secret file; it prints only boolean status. It may ask
+  an activated dev host to open the reviewed `IpTunnel` target, so it must stay
+  under the dev-host activation gate even though the runner itself has no local
+  interface/route/packet-pump implementation.
 - A relay-stream offer with `resource=IpTunnel` is rejected by the client-side
   resource guard before any relay connection. This is covered for both the
   credential-backed Device dial path and the credential-less Group/Public offer
@@ -44,7 +49,7 @@ cleanup.
   can explicitly authenticate/open the `IpTunnel` data-tunnel session.
 - **Fails:** there is not yet a reviewed dev client or runner that can obtain
   the VPN session parameters, open macOS `utun`, install the single claw host
-  route, pump packets, and clean everything up.
+  route, pump packets, and clean everything up on the client side.
 
 ## Likely causes
 

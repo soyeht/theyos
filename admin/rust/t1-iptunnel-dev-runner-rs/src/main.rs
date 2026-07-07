@@ -2,8 +2,10 @@
 //!
 //! This binary is a dev-host tool only. The `validate-offer` command remains
 //! offline. The `open-session` command can explicitly authenticate and open an
-//! `IpTunnel` data-tunnel session, but it still does not open a tunnel
-//! interface, install routes, spawn a packet pump, or touch production apps.
+//! `IpTunnel` data-tunnel session, but this runner still does not implement a
+//! local tunnel interface, route install, packet pump, or production-app
+//! control path. A target open against an activated dev host remains a gated
+//! T1-T4 validation step, not a production activation path.
 
 use std::path::PathBuf;
 
@@ -46,9 +48,9 @@ enum Command {
     },
     /// Explicitly authenticate and open a dev-host `IpTunnel` session.
     ///
-    /// This does not open a tunnel interface, install routes, run a packet
-    /// pump, or touch production apps. It only proves the relay/data-tunnel
-    /// session-open step for a reviewed runner flow.
+    /// This runner does not implement a local tunnel interface, install local
+    /// routes, run a packet pump, or touch production apps. It only proves the
+    /// relay/data-tunnel session-open step for a reviewed dev-host flow.
     OpenSession {
         /// Canonical CBOR `RelayStreamOfferContract` file.
         #[arg(long)]
@@ -282,7 +284,8 @@ async fn main() -> Result<()> {
             println!(
                 "OK: dev IpTunnel session opened \
                  (auth_ok=true, health_ok=true, stream_open=true, \
-                 tun_opened=false, route_installed=false, packet_pump_started=false)"
+                 runner_tun_opened=false, runner_route_installed=false, \
+                 runner_packet_pump_started=false)"
             );
         }
     }
@@ -291,7 +294,14 @@ async fn main() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
     use household_rs::claw_share::{GuestCredential, SlotId};
+    use household_rs::claw_share_data_tunnel::{
+        ClawTargetRouter, DataTunnelError, DataTunnelSession, TargetSession, credential_hash,
+        serve_connection_io_with_auth_deadline,
+    };
     use household_rs::claw_share_relay_stream_contract::{
         RelayStreamClawStaticPublicKey, RelayStreamOfferMintInput, mint_relay_stream_group_offer,
         mint_relay_stream_offer, mint_relay_stream_public_offer,
@@ -300,6 +310,7 @@ mod tests {
     use household_rs::ids::derive_household_id;
     use household_rs::keys::{IdentityKey, P256Keypair, P256PublicKey};
     use household_rs::person_cert::derive_person_id;
+    use tokio::io::AsyncWriteExt;
 
     use super::*;
 
@@ -351,6 +362,85 @@ mod tests {
         )
         .expect("member IpTunnel offer");
         (offer, device)
+    }
+
+    struct TestSession;
+
+    impl DataTunnelSession for TestSession {
+        fn session_id(&self) -> String {
+            "session-alpha".to_string()
+        }
+
+        fn mesh_ipv6(&self) -> String {
+            "fd00::1".to_string()
+        }
+    }
+
+    struct CountingRouter {
+        opens: Arc<AtomicUsize>,
+    }
+
+    impl ClawTargetRouter for CountingRouter {
+        async fn open(&self, _target_id: &str) -> Result<TargetSession, DataTunnelError> {
+            self.opens.fetch_add(1, Ordering::SeqCst);
+            let (client, mut target) = tokio::io::duplex(64);
+            tokio::spawn(async move {
+                let _ = target.shutdown().await;
+            });
+            Ok(TargetSession::from_stream(client))
+        }
+    }
+
+    async fn run_scripted_data_tunnel_server(
+        server: tokio::io::DuplexStream,
+        offer: RelayStreamOfferContract,
+        expect_auth_success: bool,
+        opens: Arc<AtomicUsize>,
+    ) -> Result<(), DataTunnelError> {
+        let expected_cbor = offer.payload.to_canonical_bytes().expect("offer cbor");
+        let verify_called = Arc::new(AtomicBool::new(false));
+        let verify_called_for_closure = Arc::clone(&verify_called);
+        let verify = move |envelope: &household_rs::claw_share_data_tunnel::AuthEnvelope,
+                           now_unix: u64| {
+            verify_called_for_closure.store(true, Ordering::SeqCst);
+            if !expect_auth_success {
+                return Err(DataTunnelError::TokenRejected(
+                    "synthetic-reject".to_string(),
+                ));
+            }
+            if envelope.credential_cbor != expected_cbor {
+                return Err(DataTunnelError::Rejected(
+                    "unexpected-offer-payload".to_string(),
+                ));
+            }
+            let expected_hash = credential_hash(&envelope.credential_cbor);
+            envelope
+                .token
+                .verify(&offer.payload.guest_device_pub, &expected_hash, now_unix)?;
+            if envelope.token.endpoint != offer.payload.relay_endpoint {
+                return Err(DataTunnelError::TokenRejected(
+                    "endpoint-mismatch".to_string(),
+                ));
+            }
+            if envelope.token.target_id != offer.payload.claw_id {
+                return Err(DataTunnelError::TokenRejected(
+                    "target-mismatch".to_string(),
+                ));
+            }
+            Ok(TestSession)
+        };
+        let router = CountingRouter { opens };
+        let result = serve_connection_io_with_auth_deadline(
+            server,
+            NOW,
+            verify,
+            &router,
+            |_session: &TestSession| false,
+            std::time::Duration::from_secs(1),
+        )
+        .await;
+        assert!(verify_called.load(Ordering::SeqCst));
+        result
     }
 
     #[test]
@@ -478,6 +568,53 @@ mod tests {
         token
             .verify(&device.public(), &token.credential_hash, NOW)
             .expect("token verifies with offer device");
+    }
+
+    #[tokio::test]
+    async fn open_session_sequence_authenticates_health_checks_and_opens_stream() {
+        let (offer, device) = member_iptunnel_offer();
+        let (mut client, server) = tokio::io::duplex(16 * 1024);
+        let opens = Arc::new(AtomicUsize::new(0));
+        let server_opens = Arc::clone(&opens);
+        let server_offer = offer.clone();
+        let server_task = tokio::spawn(async move {
+            run_scripted_data_tunnel_server(server, server_offer, true, server_opens).await
+        });
+
+        authenticate_open_iptunnel_session(&mut client, &offer, &device, NOW)
+            .await
+            .expect("auth + health + open succeed");
+        assert_eq!(opens.load(Ordering::SeqCst), 1);
+        server_task.abort();
+        assert!(server_task.await.unwrap_err().is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn open_session_rejects_tunnel_ack_rejected_before_opening_stream() {
+        let (offer, device) = member_iptunnel_offer();
+        let (mut client, server) = tokio::io::duplex(16 * 1024);
+        let opens = Arc::new(AtomicUsize::new(0));
+        let server_opens = Arc::clone(&opens);
+        let server_offer = offer.clone();
+        let server_task = tokio::spawn(async move {
+            run_scripted_data_tunnel_server(server, server_offer, false, server_opens).await
+        });
+
+        let error = authenticate_open_iptunnel_session(&mut client, &offer, &device, NOW)
+            .await
+            .expect_err("rejected ack fails closed");
+        assert!(error.to_string().contains("synthetic-reject"));
+        drop(client);
+
+        let server_result = tokio::time::timeout(std::time::Duration::from_secs(1), server_task)
+            .await
+            .expect("server exits")
+            .expect("server task joins");
+        assert!(matches!(
+            server_result,
+            Err(DataTunnelError::TokenRejected(reason)) if reason == "synthetic-reject"
+        ));
+        assert_eq!(opens.load(Ordering::SeqCst), 0);
     }
 
     #[test]
