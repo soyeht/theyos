@@ -880,6 +880,37 @@ mod tests {
     }
 
     #[test]
+    fn session_config_rejects_invalid_schema_scope_platform_and_mtu() {
+        let bad_schema = valid_session_config_json().replace(
+            DEV_RUNNER_SESSION_CONFIG_SCHEMA,
+            "t1-dev-runner-device-session-v0",
+        );
+        let error =
+            validate_session_config_bytes(bad_schema.as_bytes()).expect_err("schema rejected");
+        assert!(error.to_string().contains("schema invalid"));
+
+        let bad_scope =
+            valid_session_config_json().replace(DEV_RUNNER_SESSION_CONFIG_SCOPE, "dev-host");
+        let error =
+            validate_session_config_bytes(bad_scope.as_bytes()).expect_err("scope rejected");
+        assert!(error.to_string().contains("scope invalid"));
+
+        let bad_platform =
+            valid_session_config_json().replace(r#""platform": "macos""#, r#""platform": "ios""#);
+        let error =
+            validate_session_config_bytes(bad_platform.as_bytes()).expect_err("platform rejected");
+        assert!(error.to_string().contains("platform invalid"));
+
+        for invalid_mtu in [1279, 9001] {
+            let bad_mtu = valid_session_config_json()
+                .replace(r#""mtu": 1280"#, &format!(r#""mtu": {invalid_mtu}"#));
+            let error =
+                validate_session_config_bytes(bad_mtu.as_bytes()).expect_err("mtu rejected");
+            assert!(error.to_string().contains("mtu invalid"));
+        }
+    }
+
+    #[test]
     fn device_secret_rejects_non_ascii_without_echoing_secret() {
         let mut secret = "11".repeat(31);
         secret.push('\u{00e9}');
