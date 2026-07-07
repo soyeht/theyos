@@ -27,6 +27,8 @@ use household_rs::claw_share_relay_stream_noise::{
     RelayStreamNoiseAsyncStream, RelayStreamNoiseFramed,
 };
 use household_rs::claw_share_rendezvous_hello::{RendezvousHello, RendezvousRole};
+#[cfg(feature = "dev_t1_datapath")]
+use household_rs::claw_vpn::ClawVpnIpv4Pool;
 use household_rs::claw_vpn::ClawVpnSessionAddrs;
 use household_rs::keys::{IdentityKey, P256Keypair};
 use rand::RngCore;
@@ -117,6 +119,33 @@ enum Command {
         #[arg(long)]
         allow_public_relay_ack: Option<String>,
     },
+    /// Generate a reviewed dev-host Device-side session config file.
+    ///
+    /// This command is compiled only with `--features dev_t1_datapath`. It emits
+    /// a `t1-dev-runner-device-session-v1` config by reusing the real per-Claw
+    /// VPN IPv4 allocator to derive the address pair, so an operator does not
+    /// hand-author it. It does not open a local tunnel interface, install local
+    /// routes, run a packet pump, connect to a relay, or touch production apps.
+    /// The derived IPv4 values are never printed.
+    #[cfg(feature = "dev_t1_datapath")]
+    GenDeviceConfig {
+        /// Host platform the emitted config targets.
+        #[arg(long, value_enum)]
+        platform: GenDeviceConfigPlatformArg,
+        /// Doc-safe IPv4 pool network in CIDR form. Defaults to the RFC2544
+        /// benchmarking doc range; RFC1918/CGNAT/reserved pools are refused.
+        #[arg(long, default_value = "198.18.0.0/24")]
+        pool_network: String,
+        /// Session index used to derive the point-to-point address pair.
+        #[arg(long, default_value_t = 0)]
+        session_index: u32,
+        /// Inner MTU written to the config (1280..=9000).
+        #[arg(long, default_value_t = 1400)]
+        mtu: u16,
+        /// Output path for the generated private config file.
+        #[arg(long)]
+        out: PathBuf,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -126,6 +155,26 @@ struct ValidatedIpTunnelOffer;
 enum DevRunnerSessionConfigPlatform {
     Linux,
     Macos,
+}
+
+/// CLI value for the `gen-device-config --platform` argument.
+#[cfg(feature = "dev_t1_datapath")]
+#[derive(Debug, Clone, Copy, clap::ValueEnum)]
+enum GenDeviceConfigPlatformArg {
+    #[value(name = "linux")]
+    Linux,
+    #[value(name = "macos")]
+    Macos,
+}
+
+#[cfg(feature = "dev_t1_datapath")]
+impl From<GenDeviceConfigPlatformArg> for DevRunnerSessionConfigPlatform {
+    fn from(value: GenDeviceConfigPlatformArg) -> Self {
+        match value {
+            GenDeviceConfigPlatformArg::Linux => Self::Linux,
+            GenDeviceConfigPlatformArg::Macos => Self::Macos,
+        }
+    }
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -529,6 +578,68 @@ async fn open_iptunnel_session(
 ) -> Result<DevRunnerSessionAck> {
     let (session_ack, _stream) = connect_open_iptunnel_session(offer, device_key, now_unix).await?;
     Ok(session_ack)
+}
+
+#[cfg(feature = "dev_t1_datapath")]
+fn dev_runner_platform_str(platform: DevRunnerSessionConfigPlatform) -> &'static str {
+    match platform {
+        DevRunnerSessionConfigPlatform::Linux => "linux",
+        DevRunnerSessionConfigPlatform::Macos => "macos",
+    }
+}
+
+/// Parse a `host/prefix` IPv4 CIDR without echoing its value on error.
+#[cfg(feature = "dev_t1_datapath")]
+fn parse_pool_cidr(cidr: &str) -> Result<(Ipv4Addr, u8)> {
+    let (network, prefix) = cidr
+        .split_once('/')
+        .ok_or_else(|| anyhow!("pool network must be an IPv4 host/prefix CIDR"))?;
+    let network = network
+        .parse::<Ipv4Addr>()
+        .map_err(|_| anyhow!("pool network must be a valid IPv4 address"))?;
+    let prefix_len = prefix
+        .parse::<u8>()
+        .map_err(|_| anyhow!("pool network prefix must be an integer"))?;
+    Ok((network, prefix_len))
+}
+
+/// Emit a `t1-dev-runner-device-session-v1` config as pretty JSON bytes.
+///
+/// The device/claw address pair is derived only by reusing the real
+/// `ClawVpnIpv4Pool` allocator; this never hand-computes addresses. The pool is
+/// admitted through `ClawVpnIpv4Pool::try_new`, so RFC1918/CGNAT/reserved pools
+/// fail closed here with a static error before any config is produced.
+#[cfg(feature = "dev_t1_datapath")]
+fn generate_device_session_config_bytes(
+    platform: DevRunnerSessionConfigPlatform,
+    pool_network: Ipv4Addr,
+    pool_prefix_len: u8,
+    session_index: u32,
+    mtu: u16,
+) -> Result<Vec<u8>> {
+    if !(1280..=9000).contains(&mtu) {
+        bail!("dev session config mtu invalid");
+    }
+    let pool = ClawVpnIpv4Pool::try_new(pool_network, pool_prefix_len)
+        .map_err(|_| anyhow!("dev session config pool rejected"))?;
+    let addrs = pool
+        .allocate_pair(session_index)
+        .map_err(|_| anyhow!("dev session config pool allocation failed"))?;
+
+    let config = serde_json::json!({
+        "schema": DEV_RUNNER_SESSION_CONFIG_SCHEMA,
+        "scope": DEV_RUNNER_SESSION_CONFIG_SCOPE,
+        "production_activation": false,
+        "platform": dev_runner_platform_str(platform),
+        "local_side": "device",
+        "device_ipv4": addrs.device().to_string(),
+        "claw_ipv4": addrs.claw().to_string(),
+        "claw_route_prefix_len": DEV_RUNNER_CLAW_ROUTE_PREFIX_LEN,
+        "mtu": mtu,
+    });
+    let mut bytes = serde_json::to_vec_pretty(&config).context("encode dev session config json")?;
+    bytes.push(b'\n');
+    Ok(bytes)
 }
 
 #[cfg(feature = "dev_t1_datapath")]
@@ -984,6 +1095,33 @@ async fn main() -> Result<()> {
             let device_key = read_device_secret_file(&device_secret_file)?;
             dev_datapath::run_device_datapath(&offer, &device_key, &config, current_unix()?)
                 .await?;
+        }
+        #[cfg(feature = "dev_t1_datapath")]
+        Command::GenDeviceConfig {
+            platform,
+            pool_network,
+            session_index,
+            mtu,
+            out,
+        } => {
+            let (network, prefix_len) = parse_pool_cidr(&pool_network)?;
+            let bytes = generate_device_session_config_bytes(
+                platform.into(),
+                network,
+                prefix_len,
+                session_index,
+                mtu,
+            )?;
+            // Fail closed: re-run the runner's own validator on the emitted bytes
+            // so a generated file always round-trips before it is written.
+            validate_session_config_bytes(&bytes)?;
+            std::fs::write(&out, &bytes).context("write dev session config file")?;
+            println!(
+                "OK: dev IpTunnel session config generated \
+                 (schema_valid=true, scope_valid=true, production_activation=false, \
+                 local_side_device=true, claw_route_prefix_len=32, \
+                 runner_config_written=true)"
+            );
         }
     }
     Ok(())
@@ -2196,5 +2334,109 @@ mod tests {
         ) -> Vec<JoinHandle<Result<(), String>>> {
             std::mem::take(&mut *handles.lock().expect("runtime handles lock"))
         }
+    }
+
+    #[cfg(feature = "dev_t1_datapath")]
+    #[test]
+    fn generated_device_config_round_trips_through_runner_validator() {
+        let bytes = generate_device_session_config_bytes(
+            DevRunnerSessionConfigPlatform::Linux,
+            Ipv4Addr::new(198, 18, 0, 0),
+            24,
+            0,
+            1400,
+        )
+        .expect("doc-range pool generates a config");
+
+        let config = validate_session_config_bytes(&bytes).expect("generated config validates");
+        assert!(config.device_ipv4_present());
+        assert!(config.claw_ipv4_present());
+        assert_eq!(config.claw_route_prefix_len(), 32);
+        assert_eq!(config.mtu(), 1400);
+
+        // Addresses come straight from ClawVpnIpv4Pool::allocate_pair
+        // (device = network + 1, claw = device + 1) for session index 0.
+        let text = String::from_utf8(bytes).expect("config is utf8");
+        assert!(text.contains("\"device_ipv4\": \"198.18.0.1\""));
+        assert!(text.contains("\"claw_ipv4\": \"198.18.0.2\""));
+        assert!(text.contains("\"platform\": \"linux\""));
+        assert!(text.contains("\"local_side\": \"device\""));
+        assert!(text.contains("\"production_activation\": false"));
+    }
+
+    #[cfg(feature = "dev_t1_datapath")]
+    #[test]
+    fn generated_device_config_derives_distinct_pair_per_session_index() {
+        let bytes = generate_device_session_config_bytes(
+            DevRunnerSessionConfigPlatform::Macos,
+            Ipv4Addr::new(198, 18, 0, 0),
+            24,
+            1,
+            1400,
+        )
+        .expect("session index 1 generates a config");
+        validate_session_config_bytes(&bytes).expect("generated config validates");
+
+        // Session index 1 -> device = network + 1 + 2*1, claw = device + 1.
+        let text = String::from_utf8(bytes).expect("config is utf8");
+        assert!(text.contains("\"device_ipv4\": \"198.18.0.3\""));
+        assert!(text.contains("\"claw_ipv4\": \"198.18.0.4\""));
+        assert!(text.contains("\"platform\": \"macos\""));
+    }
+
+    #[cfg(feature = "dev_t1_datapath")]
+    #[test]
+    fn generated_device_config_rejects_rfc1918_pool_without_echoing_it() {
+        let error = generate_device_session_config_bytes(
+            DevRunnerSessionConfigPlatform::Linux,
+            Ipv4Addr::new(10, 0, 0, 0),
+            24,
+            0,
+            1400,
+        )
+        .expect_err("rfc1918 pool must be rejected");
+        let message = format!("{error:#}");
+        assert!(message.contains("pool rejected"));
+        assert!(!message.contains("10.0.0.0"));
+    }
+
+    #[cfg(feature = "dev_t1_datapath")]
+    #[test]
+    fn generated_device_config_rejects_cgnat_pool() {
+        let error = generate_device_session_config_bytes(
+            DevRunnerSessionConfigPlatform::Linux,
+            Ipv4Addr::new(100, 64, 0, 0),
+            24,
+            0,
+            1400,
+        )
+        .expect_err("cgnat pool must be rejected");
+        assert!(error.to_string().contains("pool rejected"));
+    }
+
+    #[cfg(feature = "dev_t1_datapath")]
+    #[test]
+    fn generated_device_config_rejects_out_of_range_mtu() {
+        for bad_mtu in [1279u16, 9001u16] {
+            let error = generate_device_session_config_bytes(
+                DevRunnerSessionConfigPlatform::Linux,
+                Ipv4Addr::new(198, 18, 0, 0),
+                24,
+                0,
+                bad_mtu,
+            )
+            .expect_err("out-of-range mtu must be rejected");
+            assert!(error.to_string().contains("mtu invalid"));
+        }
+    }
+
+    #[cfg(feature = "dev_t1_datapath")]
+    #[test]
+    fn pool_cidr_parses_network_and_prefix() {
+        let (network, prefix_len) = parse_pool_cidr("198.18.0.0/24").expect("valid cidr parses");
+        assert_eq!(network, Ipv4Addr::new(198, 18, 0, 0));
+        assert_eq!(prefix_len, 24);
+        assert!(parse_pool_cidr("198.18.0.0").is_err());
+        assert!(parse_pool_cidr("not-an-ip/24").is_err());
     }
 }
