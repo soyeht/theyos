@@ -14,10 +14,13 @@ shape offline and has an explicit dev-host `open-session` step for the
 relay/data-tunnel session-open seam. That session-open step now validates the
 server `TunnelAck` metadata shape and reports only redacted/presence status; it
 still does not treat the placeholder mesh address as VPN routing config. The
-runner still deliberately does not implement the local TUN/utun, route install,
-packet pump, or production-app control path. A target open against an activated
-dev host remains a gated T1-T4 validation step, not a production activation
-path.
+runner also has an offline `validate-session-config` command for a reviewed
+Device-side config artifact: it validates scope/no-production, platform,
+Device-side local role, the private device/claw IPv4 pair, the single claw
+`/32`, and MTU without printing the private address values. It still
+deliberately does not implement the local TUN/utun, route install, packet pump,
+or production-app control path. A target open against an activated dev host
+remains a gated T1-T4 validation step, not a production activation path.
 
 A PTY or ClawSite smoke proves the existing relay-stream/data-tunnel transport;
 it does not prove T1-T4 per-Claw VPN behavior because it does not open a
@@ -30,7 +33,8 @@ cleanup.
   out of scope.
 - Current `friend-cli` package deliberately has no L3 VPN dependency.
 - `t1-iptunnel-dev-runner` implements offline `validate-offer --offer-file ...`
-  shape validation plus explicit `open-session` auth/open validation. The
+  shape validation, offline `validate-session-config --config-file ...` private
+  config validation, plus explicit `open-session` auth/open validation. The
   session-open command requires an exact dev-host/no-production acknowledgement
   and a private device-secret file; it validates the returned session ack and
   prints only booleans plus non-sensitive MTU. It may ask an activated dev host
@@ -52,20 +56,22 @@ cleanup.
   member-scoped Group `IpTunnel` offers are accepted as future runner input and
   can explicitly authenticate/open the `IpTunnel` data-tunnel session while
   validating the ack metadata without printing the raw session id or mesh
-  placeholder.
+  placeholder. It can also validate a reviewed Device-side session config
+  artifact offline without printing the private IPv4 values.
 - **Fails:** there is not yet a reviewed dev client or runner that can obtain
   the VPN session parameters, open macOS `utun`, install the single claw host
   route, pump packets, and clean everything up on the client side. The current
-  ack metadata is a relay/data-tunnel session-open proof, not the final
-  Device-side VPN route/interface configuration.
+  ack metadata is a relay/data-tunnel session-open proof, and the config
+  validator is only an offline shape check; neither one opens the final
+  Device-side VPN route/interface path.
 
 ## Likely causes
 
 1. `friend-cli` intentionally excludes L3 VPN dependencies, so enabling
    `IpTunnel` there is not a one-line resource-guard change.
 2. The current dev runner stops at data-tunnel session-open and has only
-   redacted ack-metadata validation, not a reviewed VPN session configuration,
-   interface, route, or packet-pump step.
+   redacted ack-metadata validation plus offline config shape validation, not
+   an interface, route, or packet-pump step.
 3. The current data-tunnel open path does not hand the client a reviewed VPN
    session configuration object with the Device-side address/session material
    needed by a packet runner.
@@ -85,8 +91,10 @@ Required properties:
 2. Authenticate the existing data tunnel without logging credentials, tokens, or
    local infrastructure values. **Done for explicit session-open only.**
 3. Obtain or derive a reviewed Device-side VPN session configuration; do not
-   infer it from untrusted string fields. **Not done. Current runner validates
-   only the authenticated session ack metadata and does not route on it.**
+   infer it from untrusted string fields. **Partially done for offline private
+   config shape validation only. The runner still does not derive, trust, or
+   route on session ack fields, and it does not apply the config to an
+   interface or route.**
 4. Open only a dev-host TUN/utun interface, with explicit stop authority and
    cleanup.
 5. Install only a single claw `/32` host route, never a default route, LAN route,
