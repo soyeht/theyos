@@ -107,6 +107,11 @@ prints only status plus missing field names such as `owner_authorization_ref`,
 `rollback_ref`, `hardware_evidence_ref`, `audit_export_policy_ref`, and
 `device_session_config_ref`. It does not print private ref values, it does not
 verify the referenced artifacts, and it does not authorize activation.
+When the existing private draft names a different artifact SHA, the helper does
+not preserve existing private refs by default; provide refreshed `--owner-ref`,
+`--rollback-ref`, `--hardware-ref`, `--audit-export-policy-ref`, and
+`--device-session-config-ref` values for the new SHA after those artifacts have
+been reviewed.
 
 The `.env.t1-preflight-evidence.json` file name is ignored by the repository's
 `.gitignore`; keep the filled record private.
