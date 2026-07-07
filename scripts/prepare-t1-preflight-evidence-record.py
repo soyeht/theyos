@@ -16,6 +16,13 @@ SCHEMA = "per_claw_vpn_t1_preflight_evidence_v1"
 SCOPE = "dev-host T1-T4 only"
 DEFAULT_RECORD = ".env.t1-preflight-evidence.json"
 DEFAULT_AUDIT_ROOT = ".run/t1-audit-root"
+PRIVATE_REF_FIELDS = (
+    "owner_authorization_ref",
+    "rollback_ref",
+    "hardware_evidence_ref",
+    "audit_export_policy_ref",
+    "device_session_config_ref",
+)
 
 
 def is_full_git_sha(value: object) -> bool:
@@ -39,10 +46,21 @@ def keep_real_ref(value: object) -> str:
     return ""
 
 
-def select_private_ref(provided: str | None, existing: object) -> str:
+def select_private_ref(provided: str | None, existing: object, *, preserve_existing: bool) -> str:
     if provided is not None:
         return keep_real_ref(provided)
+    if not preserve_existing:
+        return ""
     return keep_real_ref(existing)
+
+
+def record_artifact_sha_changed(existing: dict[str, object], artifact_sha: str) -> bool:
+    existing_sha = existing.get("artifact_sha")
+    return (
+        isinstance(existing_sha, str)
+        and bool(existing_sha.strip())
+        and existing_sha.lower() != artifact_sha.lower()
+    )
 
 
 def missing_private_ref_fields(
@@ -141,16 +159,32 @@ def main() -> int:
         return 1
 
     existing = load_existing_record(args.record)
-    owner_ref = select_private_ref(args.owner_ref, existing.get("owner_authorization_ref"))
-    rollback_ref = select_private_ref(args.rollback_ref, existing.get("rollback_ref"))
-    hardware_ref = select_private_ref(args.hardware_ref, existing.get("hardware_evidence_ref"))
+    artifact_sha_changed = record_artifact_sha_changed(existing, args.artifact_sha)
+    preserve_existing_refs = not artifact_sha_changed
+    owner_ref = select_private_ref(
+        args.owner_ref,
+        existing.get("owner_authorization_ref"),
+        preserve_existing=preserve_existing_refs,
+    )
+    rollback_ref = select_private_ref(
+        args.rollback_ref,
+        existing.get("rollback_ref"),
+        preserve_existing=preserve_existing_refs,
+    )
+    hardware_ref = select_private_ref(
+        args.hardware_ref,
+        existing.get("hardware_evidence_ref"),
+        preserve_existing=preserve_existing_refs,
+    )
     audit_export_policy_ref = select_private_ref(
         args.audit_export_policy_ref,
         existing.get("audit_export_policy_ref"),
+        preserve_existing=preserve_existing_refs,
     )
     device_session_config_ref = select_private_ref(
         args.device_session_config_ref,
         existing.get("device_session_config_ref"),
+        preserve_existing=preserve_existing_refs,
     )
     audit_root = canonical_private_audit_root(args.audit_root)
 
@@ -185,6 +219,8 @@ def main() -> int:
         audit_export_policy_ref,
         device_session_config_ref,
     )
+    if artifact_sha_changed:
+        print("INFO: existing private refs were not preserved because artifact_sha changed")
     if missing_refs:
         print("INFO: record remains incomplete until all private refs are supplied")
         print(f"INFO: missing private refs: {', '.join(missing_refs)}")

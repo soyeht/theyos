@@ -28,6 +28,7 @@ validator = importlib.util.module_from_spec(VALIDATOR_SPEC)
 VALIDATOR_SPEC.loader.exec_module(validator)
 
 ARTIFACT_SHA = "0123456789abcdef0123456789abcdef01234567"
+STALE_ARTIFACT_SHA = "fedcba9876543210fedcba9876543210fedcba98"
 
 
 class PrepareT1PreflightEvidenceRecordTests(unittest.TestCase):
@@ -146,6 +147,93 @@ class PrepareT1PreflightEvidenceRecordTests(unittest.TestCase):
             self.assertEqual("audit-export-policy-ref", record["audit_export_policy_ref"])
             self.assertEqual("device-session-config-ref", record["device_session_config_ref"])
             self.assertIn("INFO: missing private refs: rollback_ref", proc.stdout)
+
+    def test_does_not_preserve_existing_refs_when_artifact_sha_changes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmpdir = Path(tmp)
+            record_path = tmpdir / "private-evidence.json"
+            audit_root = tmpdir / "audit-root"
+            stale_refs = {
+                "owner_authorization_ref": "owner-private-ref",
+                "rollback_ref": "rollback-private-ref",
+                "hardware_evidence_ref": "hardware-private-ref",
+                "audit_export_policy_ref": "audit-export-policy-private-ref",
+                "device_session_config_ref": "device-session-config-private-ref",
+            }
+            record_path.write_text(
+                json.dumps({"artifact_sha": STALE_ARTIFACT_SHA, **stale_refs}),
+                encoding="utf-8",
+            )
+
+            proc = self.run_prepare("--record", str(record_path), "--audit-root", str(audit_root))
+
+            self.assertEqual(0, proc.returncode, proc.stderr)
+            self.assertIn("INFO: existing private refs were not preserved because artifact_sha changed", proc.stdout)
+            self.assertIn(
+                (
+                    "INFO: missing private refs: owner_authorization_ref, rollback_ref, "
+                    "hardware_evidence_ref, audit_export_policy_ref, device_session_config_ref"
+                ),
+                proc.stdout,
+            )
+            record = self.read_record(record_path)
+            self.assertEqual(ARTIFACT_SHA, record["artifact_sha"])
+            self.assertIs(record["owner_authorization"], False)
+            self.assertIs(record["rollback"], False)
+            self.assertIs(record["hardware_t1_t4"], False)
+            for field in prepare.PRIVATE_REF_FIELDS:
+                self.assertEqual("", record[field])
+            combined_output = proc.stdout + proc.stderr
+            for stale_ref in stale_refs.values():
+                self.assertNotIn(stale_ref, combined_output)
+
+    def test_explicit_refs_are_kept_when_artifact_sha_changes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmpdir = Path(tmp)
+            record_path = tmpdir / "private-evidence.json"
+            audit_root = tmpdir / "audit-root"
+            record_path.write_text(
+                json.dumps(
+                    {
+                        "artifact_sha": STALE_ARTIFACT_SHA,
+                        "owner_authorization_ref": "stale-owner-ref",
+                        "rollback_ref": "stale-rollback-ref",
+                        "hardware_evidence_ref": "stale-hardware-ref",
+                        "audit_export_policy_ref": "stale-audit-export-policy-ref",
+                        "device_session_config_ref": "stale-device-session-config-ref",
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            proc = self.run_prepare(
+                "--record",
+                str(record_path),
+                "--audit-root",
+                str(audit_root),
+                "--owner-ref",
+                "owner-review-ref",
+                "--rollback-ref",
+                "rollback-artifact-ref",
+                "--hardware-ref",
+                "hardware-evidence-ref",
+                "--audit-export-policy-ref",
+                "audit-export-policy-ref",
+                "--device-session-config-ref",
+                "device-session-config-ref",
+            )
+
+            self.assertEqual(0, proc.returncode, proc.stderr)
+            self.assertIn("INFO: existing private refs were not preserved because artifact_sha changed", proc.stdout)
+            record = self.read_record(record_path)
+            self.assertIs(record["owner_authorization"], True)
+            self.assertIs(record["rollback"], True)
+            self.assertIs(record["hardware_t1_t4"], True)
+            self.assertEqual("owner-review-ref", record["owner_authorization_ref"])
+            self.assertEqual("rollback-artifact-ref", record["rollback_ref"])
+            self.assertEqual("hardware-evidence-ref", record["hardware_evidence_ref"])
+            self.assertEqual("audit-export-policy-ref", record["audit_export_policy_ref"])
+            self.assertEqual("device-session-config-ref", record["device_session_config_ref"])
 
     def test_cli_does_not_echo_private_values(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
