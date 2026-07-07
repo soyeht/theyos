@@ -1,17 +1,29 @@
 //! Dev-only Product A T1 `IpTunnel` runner boundary.
 //!
-//! This binary intentionally implements only offline offer validation for now.
-//! It does not connect to a relay, open a tunnel interface, install routes,
-//! spawn a packet pump, or touch production apps.
+//! This binary is a dev-host tool only. The `validate-offer` command remains
+//! offline. The `open-session` command can explicitly authenticate and open an
+//! `IpTunnel` data-tunnel session, but it still does not open a tunnel
+//! interface, install routes, spawn a packet pump, or touch production apps.
 
 use std::path::PathBuf;
 
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
+use household_rs::claw_share_data_tunnel::{
+    HEALTH_PROBE, SessionAuthToken, TunnelAck, client_authenticate, client_health,
+    client_open_stream,
+};
 use household_rs::claw_share_relay_stream_contract::{
     RelayStreamAudience, RelayStreamExpectedPath, RelayStreamOfferContract, RelayStreamResource,
 };
 use household_rs::claw_share_relay_stream_endpoint::parse_relay_endpoint;
+use household_rs::claw_share_relay_stream_noise::RelayStreamNoiseFramed;
+use household_rs::claw_share_rendezvous_hello::{RendezvousHello, RendezvousRole};
+use household_rs::keys::{IdentityKey, P256Keypair};
+use rand::RngCore;
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
+
+const DEV_HOST_ACK: &str = "dev-host T1-T4 only; no production activation";
 
 #[derive(Parser, Debug)]
 #[command(
@@ -32,6 +44,23 @@ enum Command {
         #[arg(long)]
         offer_file: PathBuf,
     },
+    /// Explicitly authenticate and open a dev-host `IpTunnel` session.
+    ///
+    /// This does not open a tunnel interface, install routes, run a packet
+    /// pump, or touch production apps. It only proves the relay/data-tunnel
+    /// session-open step for a reviewed runner flow.
+    OpenSession {
+        /// Canonical CBOR `RelayStreamOfferContract` file.
+        #[arg(long)]
+        offer_file: PathBuf,
+        /// File containing the 64-hex dev device secret scalar. The value is
+        /// never printed.
+        #[arg(long)]
+        device_secret_file: PathBuf,
+        /// Exact acknowledgement required before any network dial.
+        #[arg(long)]
+        dev_host_ack: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -40,6 +69,14 @@ struct ValidatedIpTunnelOffer;
 fn validate_iptunnel_offer_file(path: &PathBuf) -> Result<ValidatedIpTunnelOffer> {
     let bytes = std::fs::read(path).context("read IpTunnel offer file")?;
     validate_iptunnel_offer_bytes(&bytes)
+}
+
+fn read_iptunnel_offer_file(path: &PathBuf) -> Result<RelayStreamOfferContract> {
+    let bytes = std::fs::read(path).context("read IpTunnel offer file")?;
+    let offer = RelayStreamOfferContract::from_canonical_bytes(&bytes)
+        .context("decode relay_stream offer")?;
+    validate_iptunnel_offer(&offer)?;
+    Ok(offer)
 }
 
 fn validate_iptunnel_offer_bytes(bytes: &[u8]) -> Result<ValidatedIpTunnelOffer> {
@@ -78,7 +115,151 @@ fn validate_iptunnel_offer(offer: &RelayStreamOfferContract) -> Result<Validated
     Ok(ValidatedIpTunnelOffer)
 }
 
-fn main() -> Result<()> {
+fn validate_dev_host_ack(value: &str) -> Result<()> {
+    if value == DEV_HOST_ACK {
+        return Ok(());
+    }
+    bail!("dev-host acknowledgement is required");
+}
+
+fn device_secret_from_hex(hex: &str) -> Result<P256Keypair> {
+    let hex = hex.trim();
+    if hex.len() != 64 {
+        bail!("device secret must be 64 hex chars");
+    }
+    let mut scalar = [0u8; 32];
+    for (index, byte) in scalar.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(&hex[index * 2..index * 2 + 2], 16)
+            .context("device secret is not valid hex")?;
+    }
+    P256Keypair::from_secret_scalar(&scalar).context("derive dev device key")
+}
+
+fn read_device_secret_file(path: &PathBuf) -> Result<P256Keypair> {
+    let value = std::fs::read_to_string(path).context("read dev device secret file")?;
+    device_secret_from_hex(&value)
+}
+
+fn validate_open_session_inputs(
+    offer: &RelayStreamOfferContract,
+    device_key: &P256Keypair,
+) -> Result<()> {
+    validate_iptunnel_offer(offer)?;
+    if offer.payload.guest_device_pub != device_key.public() {
+        bail!("device secret does not match the IpTunnel offer");
+    }
+    Ok(())
+}
+
+fn current_unix() -> Result<u64> {
+    Ok(std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .context("system clock before unix epoch")?
+        .as_secs())
+}
+
+fn build_iptunnel_session_auth(
+    offer: &RelayStreamOfferContract,
+    device_key: &P256Keypair,
+    now_unix: u64,
+    nonce: Vec<u8>,
+) -> Result<(Vec<u8>, SessionAuthToken)> {
+    let offer_cbor = offer
+        .payload
+        .to_canonical_bytes()
+        .context("encode IpTunnel offer payload")?;
+    let token = SessionAuthToken::sign(
+        format!("t1-iptunnel-dev-runner-{}-{now_unix}", std::process::id()),
+        &offer_cbor,
+        offer.payload.relay_endpoint.clone(),
+        offer.payload.claw_id.clone(),
+        nonce,
+        now_unix + 60,
+        device_key as &dyn IdentityKey,
+    )
+    .context("mint IpTunnel session auth token")?;
+    Ok((offer_cbor, token))
+}
+
+async fn authenticate_open_iptunnel_session<T>(
+    stream: &mut T,
+    offer: &RelayStreamOfferContract,
+    device_key: &P256Keypair,
+    now_unix: u64,
+) -> Result<()>
+where
+    T: AsyncRead + AsyncWrite + Unpin,
+{
+    let mut nonce = vec![0u8; 16];
+    rand::rngs::OsRng.fill_bytes(&mut nonce);
+    let (offer_cbor, token) = build_iptunnel_session_auth(offer, device_key, now_unix, nonce)?;
+
+    match client_authenticate(stream, &offer_cbor, token)
+        .await
+        .context("IpTunnel session authenticate")?
+    {
+        TunnelAck::Ok { .. } => {}
+        TunnelAck::Rejected { reason } => bail!("IpTunnel session auth rejected: {reason}"),
+    }
+
+    let echo = client_health(stream, HEALTH_PROBE)
+        .await
+        .context("IpTunnel session health probe")?;
+    if echo != HEALTH_PROBE {
+        bail!("IpTunnel session health echo mismatch");
+    }
+
+    client_open_stream(stream)
+        .await
+        .context("IpTunnel session open")?;
+    Ok(())
+}
+
+async fn open_iptunnel_session(
+    offer: &RelayStreamOfferContract,
+    device_key: &P256Keypair,
+    now_unix: u64,
+) -> Result<()> {
+    validate_open_session_inputs(offer, device_key)?;
+    let (host, port) = parse_relay_endpoint(&offer.payload.relay_endpoint)
+        .context("validate relay endpoint shape")?;
+
+    let mut stream = match tokio::time::timeout(
+        std::time::Duration::from_secs(4),
+        tokio::net::TcpStream::connect((host.as_str(), port)),
+    )
+    .await
+    {
+        Ok(Ok(stream)) => stream,
+        Ok(Err(error)) => return Err(error).context("connect to relay_stream relay"),
+        Err(_) => bail!("connect to relay_stream relay timed out"),
+    };
+
+    let hello = RendezvousHello::new(
+        RendezvousRole::Guest,
+        offer.payload.rendezvous_token.clone(),
+    );
+    stream
+        .write_all(&hello.encode())
+        .await
+        .context("send rendezvous hello")?;
+    stream.flush().await.context("flush rendezvous hello")?;
+
+    let framed = RelayStreamNoiseFramed::initiator_handshake(
+        stream,
+        offer,
+        &offer.signer_pub,
+        &device_key.public(),
+        now_unix,
+    )
+    .await
+    .context("relay_stream Noise handshake")?;
+    let mut stream = framed.into_async_stream();
+    authenticate_open_iptunnel_session(&mut stream, offer, device_key, now_unix).await
+}
+
+#[tokio::main]
+async fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
         Command::ValidateOffer { offer_file } => {
@@ -87,6 +268,21 @@ fn main() -> Result<()> {
                 "OK: dev IpTunnel offer shape validated \
                  (group_present=true, member_present=true, claw_present=true, \
                  endpoint_shape_valid=true)"
+            );
+        }
+        Command::OpenSession {
+            offer_file,
+            device_secret_file,
+            dev_host_ack,
+        } => {
+            validate_dev_host_ack(&dev_host_ack)?;
+            let offer = read_iptunnel_offer_file(&offer_file)?;
+            let device_key = read_device_secret_file(&device_secret_file)?;
+            open_iptunnel_session(&offer, &device_key, current_unix()?).await?;
+            println!(
+                "OK: dev IpTunnel session opened \
+                 (auth_ok=true, health_ok=true, stream_open=true, \
+                 tun_opened=false, route_installed=false, packet_pump_started=false)"
             );
         }
     }
@@ -136,10 +332,10 @@ mod tests {
         .expect("guest credential")
     }
 
-    fn member_iptunnel_offer() -> RelayStreamOfferContract {
+    fn member_iptunnel_offer() -> (RelayStreamOfferContract, P256Keypair) {
         let owner = key(0x11);
         let device = key(0x33);
-        mint_relay_stream_group_offer(
+        let offer = mint_relay_stream_group_offer(
             rendezvous_token(),
             SlotId([0x99; 16]),
             "group-alpha".to_string(),
@@ -153,12 +349,13 @@ mod tests {
             NOW,
             &owner as &dyn IdentityKey,
         )
-        .expect("member IpTunnel offer")
+        .expect("member IpTunnel offer");
+        (offer, device)
     }
 
     #[test]
     fn accepts_member_scoped_iptunnel_offer_shape() {
-        let offer = member_iptunnel_offer();
+        let (offer, _device) = member_iptunnel_offer();
         let validated = validate_iptunnel_offer_bytes(&offer.to_canonical_bytes().unwrap())
             .expect("member-scoped IpTunnel offer accepted");
 
@@ -237,7 +434,7 @@ mod tests {
 
     #[test]
     fn rejects_invalid_relay_endpoint_shape() {
-        let mut offer = member_iptunnel_offer();
+        let (mut offer, _device) = member_iptunnel_offer();
         offer.payload.relay_endpoint = "https://127.0.0.1:49152".to_string();
 
         let error = validate_iptunnel_offer(&offer).expect_err("endpoint scheme rejected");
@@ -245,10 +442,50 @@ mod tests {
     }
 
     #[test]
-    fn source_stays_offline_and_non_live() {
+    fn open_session_requires_exact_dev_host_ack() {
+        assert!(validate_dev_host_ack(DEV_HOST_ACK).is_ok());
+        let error = validate_dev_host_ack("dev-host T1-T4 only").expect_err("partial ack rejected");
+        assert!(error.to_string().contains("acknowledgement"));
+    }
+
+    #[test]
+    fn open_session_rejects_device_key_mismatch_before_dial() {
+        let (offer, _device) = member_iptunnel_offer();
+        let wrong_device = key(0x44);
+
+        let error = validate_open_session_inputs(&offer, &wrong_device)
+            .expect_err("wrong device key must be rejected");
+
+        assert!(error.to_string().contains("does not match"));
+    }
+
+    #[test]
+    fn open_session_token_binds_offer_hash_endpoint_and_claw() {
+        let (offer, device) = member_iptunnel_offer();
+        let nonce = vec![0x55; 16];
+
+        let (offer_cbor, token) = build_iptunnel_session_auth(&offer, &device, NOW, nonce.clone())
+            .expect("session token");
+
+        assert_eq!(
+            token.credential_hash,
+            household_rs::claw_share_data_tunnel::credential_hash(&offer_cbor)
+        );
+        assert_eq!(token.endpoint, offer.payload.relay_endpoint);
+        assert_eq!(token.target_id, offer.payload.claw_id);
+        assert_eq!(token.nonce, nonce);
+        assert_eq!(token.expires_at, NOW + 60);
+        token
+            .verify(&device.public(), &token.credential_hash, NOW)
+            .expect("token verifies with offer device");
+    }
+
+    #[test]
+    fn source_keeps_session_open_boundary_bounded() {
         let source = include_str!("main.rs");
+        assert!(source.contains("OpenSession"));
+        assert!(source.contains(DEV_HOST_ACK));
         for forbidden in [
-            concat!("Tcp", "Stream"),
             concat!("std::process::", "Command"),
             concat!("/dev/", "tun"),
             concat!("u", "tun"),
@@ -260,7 +497,7 @@ mod tests {
         ] {
             assert!(
                 !source.contains(forbidden),
-                "dev offer validator must stay offline and non-live: {forbidden}"
+                "dev session opener must not cross into TUN/route/app control: {forbidden}"
             );
         }
     }

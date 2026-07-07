@@ -9,9 +9,10 @@ under the activation gate checklist.
 
 The server-side T1 mount wiring remains gated by the activation checklist. The
 available guest/client CLI still rejects `IpTunnel` before connecting; a
-separate dev-only runner boundary now validates member-scoped `IpTunnel` offer
-shape offline but deliberately does not connect, open TUN/utun, install routes,
-run a packet pump, or touch production.
+separate dev-only runner boundary validates member-scoped `IpTunnel` offer
+shape offline and has an explicit dev-host `open-session` step for the
+relay/data-tunnel session-open seam. It still deliberately does not open
+TUN/utun, install routes, run a packet pump, or touch production.
 
 A PTY or ClawSite smoke proves the existing relay-stream/data-tunnel transport;
 it does not prove T1-T4 per-Claw VPN behavior because it does not open a
@@ -23,8 +24,10 @@ cleanup.
 - Dev-host validation only. Production and `/Applications/Soyeht.app` remain
   out of scope.
 - Current `friend-cli` package deliberately has no L3 VPN dependency.
-- `t1-iptunnel-dev-runner` currently implements only offline
-  `validate-offer --offer-file ...` shape validation.
+- `t1-iptunnel-dev-runner` implements offline `validate-offer --offer-file ...`
+  shape validation plus explicit `open-session` auth/open validation. The
+  session-open command requires an exact dev-host/no-production acknowledgement
+  and a private device-secret file; it prints only boolean status.
 - A relay-stream offer with `resource=IpTunnel` is rejected by the client-side
   resource guard before any relay connection. This is covered for both the
   credential-backed Device dial path and the credential-less Group/Public offer
@@ -37,18 +40,18 @@ cleanup.
   smoke tests. The current client also has
   regression coverage proving `IpTunnel` is rejected before TCP connect in both
   supported relay-stream dial paths. The dev runner validates that only
-  member-scoped Group `IpTunnel` offers are accepted as future runner input.
-- **Fails:** there is not yet a reviewed dev client or runner that can
-  authenticate the relay transport, obtain the VPN session parameters, open macOS
-  `utun`, install the single claw host route, pump packets, and clean everything
-  up.
+  member-scoped Group `IpTunnel` offers are accepted as future runner input and
+  can explicitly authenticate/open the `IpTunnel` data-tunnel session.
+- **Fails:** there is not yet a reviewed dev client or runner that can obtain
+  the VPN session parameters, open macOS `utun`, install the single claw host
+  route, pump packets, and clean everything up.
 
 ## Likely causes
 
 1. `friend-cli` intentionally excludes L3 VPN dependencies, so enabling
    `IpTunnel` there is not a one-line resource-guard change.
-2. The current dev runner stops at offline offer validation and has no reviewed
-   transport, VPN session configuration, interface, route, or packet-pump step.
+2. The current dev runner stops at data-tunnel session-open and has no reviewed
+   VPN session configuration, interface, route, or packet-pump step.
 3. The current data-tunnel open path does not hand the client a reviewed VPN
    session configuration object with the Device-side address/session material
    needed by a packet runner.
@@ -64,9 +67,9 @@ silently repurpose `friend-cli`.
 Required properties:
 
 1. Consume a reviewed, member-scoped `IpTunnel` relay-stream offer. **Done for
-   offline shape validation only.**
+   offline shape validation and explicit session-open only.**
 2. Authenticate the existing data tunnel without logging credentials, tokens, or
-   local infrastructure values.
+   local infrastructure values. **Done for explicit session-open only.**
 3. Obtain or derive a reviewed Device-side VPN session configuration; do not
    infer it from untrusted string fields.
 4. Open only a dev-host TUN/utun interface, with explicit stop authority and
