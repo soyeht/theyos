@@ -7,7 +7,7 @@
 //! control path. A target open against an activated dev host remains a gated
 //! T1-T4 validation step, not a production activation path.
 
-use std::path::PathBuf;
+use std::{fmt, net::Ipv6Addr, path::PathBuf};
 
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
@@ -68,6 +68,38 @@ enum Command {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ValidatedIpTunnelOffer;
 
+#[derive(Clone, PartialEq, Eq)]
+struct DevRunnerSessionAck {
+    mesh_ipv6: Ipv6Addr,
+    mtu: u16,
+    session_id: String,
+}
+
+impl fmt::Debug for DevRunnerSessionAck {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("DevRunnerSessionAck")
+            .field("mesh_ipv6", &"<redacted>")
+            .field("mtu", &self.mtu)
+            .field("session_id", &"<redacted>")
+            .field("session_id_present", &self.session_id_present())
+            .finish()
+    }
+}
+
+impl DevRunnerSessionAck {
+    fn mtu(&self) -> u16 {
+        self.mtu
+    }
+
+    fn mesh_ipv6_present(&self) -> bool {
+        !self.mesh_ipv6.is_unspecified()
+    }
+
+    fn session_id_present(&self) -> bool {
+        !self.session_id.is_empty()
+    }
+}
+
 fn validate_iptunnel_offer_file(path: &PathBuf) -> Result<ValidatedIpTunnelOffer> {
     let bytes = std::fs::read(path).context("read IpTunnel offer file")?;
     validate_iptunnel_offer_bytes(&bytes)
@@ -122,6 +154,43 @@ fn validate_dev_host_ack(value: &str) -> Result<()> {
         return Ok(());
     }
     bail!("dev-host acknowledgement is required");
+}
+
+fn validate_session_ack(ack: TunnelAck) -> Result<DevRunnerSessionAck> {
+    let (mesh_ipv6, mtu, session_id) = match ack {
+        TunnelAck::Ok {
+            mesh_ipv6,
+            mtu,
+            session_id,
+        } => (mesh_ipv6, mtu, session_id),
+        TunnelAck::Rejected { reason } => bail!("IpTunnel session auth rejected: {reason}"),
+    };
+
+    if session_id.trim().is_empty()
+        || session_id.trim() != session_id
+        || !session_id
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_'))
+    {
+        bail!("IpTunnel session ack session id invalid");
+    }
+
+    let mesh_ipv6 = mesh_ipv6
+        .parse::<Ipv6Addr>()
+        .context("IpTunnel session ack mesh address invalid")?;
+    if mesh_ipv6.is_unspecified() || mesh_ipv6.is_multicast() {
+        bail!("IpTunnel session ack mesh address invalid");
+    }
+
+    if !(1280..=9000).contains(&mtu) {
+        bail!("IpTunnel session ack mtu invalid");
+    }
+
+    Ok(DevRunnerSessionAck {
+        mesh_ipv6,
+        mtu,
+        session_id,
+    })
 }
 
 fn device_secret_from_hex(hex: &str) -> Result<P256Keypair> {
@@ -188,7 +257,7 @@ async fn authenticate_open_iptunnel_session<T>(
     offer: &RelayStreamOfferContract,
     device_key: &P256Keypair,
     now_unix: u64,
-) -> Result<()>
+) -> Result<DevRunnerSessionAck>
 where
     T: AsyncRead + AsyncWrite + Unpin,
 {
@@ -196,13 +265,11 @@ where
     rand::rngs::OsRng.fill_bytes(&mut nonce);
     let (offer_cbor, token) = build_iptunnel_session_auth(offer, device_key, now_unix, nonce)?;
 
-    match client_authenticate(stream, &offer_cbor, token)
-        .await
-        .context("IpTunnel session authenticate")?
-    {
-        TunnelAck::Ok { .. } => {}
-        TunnelAck::Rejected { reason } => bail!("IpTunnel session auth rejected: {reason}"),
-    }
+    let session_ack = validate_session_ack(
+        client_authenticate(stream, &offer_cbor, token)
+            .await
+            .context("IpTunnel session authenticate")?,
+    )?;
 
     let echo = client_health(stream, HEALTH_PROBE)
         .await
@@ -214,14 +281,14 @@ where
     client_open_stream(stream)
         .await
         .context("IpTunnel session open")?;
-    Ok(())
+    Ok(session_ack)
 }
 
 async fn open_iptunnel_session(
     offer: &RelayStreamOfferContract,
     device_key: &P256Keypair,
     now_unix: u64,
-) -> Result<()> {
+) -> Result<DevRunnerSessionAck> {
     validate_open_session_inputs(offer, device_key)?;
     let (host, port) = parse_relay_endpoint(&offer.payload.relay_endpoint)
         .context("validate relay endpoint shape")?;
@@ -280,12 +347,17 @@ async fn main() -> Result<()> {
             validate_dev_host_ack(&dev_host_ack)?;
             let offer = read_iptunnel_offer_file(&offer_file)?;
             let device_key = read_device_secret_file(&device_secret_file)?;
-            open_iptunnel_session(&offer, &device_key, current_unix()?).await?;
+            let session_ack = open_iptunnel_session(&offer, &device_key, current_unix()?).await?;
             println!(
                 "OK: dev IpTunnel session opened \
                  (auth_ok=true, health_ok=true, stream_open=true, \
+                 runner_session_ack_ok=true, runner_ack_mtu={}, \
+                 runner_session_id_present={}, runner_mesh_ipv6_present={}, \
                  runner_tun_opened=false, runner_route_installed=false, \
-                 runner_packet_pump_started=false)"
+                 runner_packet_pump_started=false)",
+                session_ack.mtu(),
+                session_ack.session_id_present(),
+                session_ack.mesh_ipv6_present()
             );
         }
     }
@@ -364,15 +436,35 @@ mod tests {
         (offer, device)
     }
 
-    struct TestSession;
+    #[derive(Clone)]
+    struct TestSession {
+        session_id: &'static str,
+        mesh_ipv6: &'static str,
+    }
+
+    impl TestSession {
+        fn valid() -> Self {
+            Self {
+                session_id: "session-alpha",
+                mesh_ipv6: "fd00::1",
+            }
+        }
+
+        fn invalid_mesh() -> Self {
+            Self {
+                session_id: "session-alpha",
+                mesh_ipv6: "SECRET-MESH",
+            }
+        }
+    }
 
     impl DataTunnelSession for TestSession {
         fn session_id(&self) -> String {
-            "session-alpha".to_string()
+            self.session_id.to_string()
         }
 
         fn mesh_ipv6(&self) -> String {
-            "fd00::1".to_string()
+            self.mesh_ipv6.to_string()
         }
     }
 
@@ -395,11 +487,13 @@ mod tests {
         server: tokio::io::DuplexStream,
         offer: RelayStreamOfferContract,
         expect_auth_success: bool,
+        session: TestSession,
         opens: Arc<AtomicUsize>,
     ) -> Result<(), DataTunnelError> {
         let expected_cbor = offer.payload.to_canonical_bytes().expect("offer cbor");
         let verify_called = Arc::new(AtomicBool::new(false));
         let verify_called_for_closure = Arc::clone(&verify_called);
+        let verify_session = session.clone();
         let verify = move |envelope: &household_rs::claw_share_data_tunnel::AuthEnvelope,
                            now_unix: u64| {
             verify_called_for_closure.store(true, Ordering::SeqCst);
@@ -427,7 +521,7 @@ mod tests {
                     "target-mismatch".to_string(),
                 ));
             }
-            Ok(TestSession)
+            Ok(verify_session.clone())
         };
         let router = CountingRouter { opens };
         let result = serve_connection_io_with_auth_deadline(
@@ -587,6 +681,44 @@ mod tests {
             .expect("token verifies with offer device");
     }
 
+    #[test]
+    fn session_ack_debug_redacts_mesh_and_session_id() {
+        let ack = validate_session_ack(TunnelAck::Ok {
+            mesh_ipv6: "fd00::1".to_string(),
+            mtu: 1280,
+            session_id: "secret-session".to_string(),
+        })
+        .expect("ack validates");
+
+        let debug = format!("{ack:?}");
+        assert!(debug.contains("session_id_present"));
+        assert!(debug.contains("mtu"));
+        assert!(!debug.contains("fd00::1"));
+        assert!(!debug.contains("secret-session"));
+    }
+
+    #[test]
+    fn session_ack_rejects_invalid_values_without_echoing_them() {
+        let error = validate_session_ack(TunnelAck::Ok {
+            mesh_ipv6: "SECRET-MESH".to_string(),
+            mtu: 1280,
+            session_id: "session-alpha".to_string(),
+        })
+        .expect_err("bad mesh address rejected");
+        let message = format!("{error:#}");
+
+        assert!(message.contains("IpTunnel session ack mesh address invalid"));
+        assert!(!message.contains("SECRET-MESH"));
+
+        let error = validate_session_ack(TunnelAck::Ok {
+            mesh_ipv6: "fd00::1".to_string(),
+            mtu: 0,
+            session_id: "session-alpha".to_string(),
+        })
+        .expect_err("bad mtu rejected");
+        assert!(error.to_string().contains("session ack mtu invalid"));
+    }
+
     #[tokio::test]
     async fn open_session_sequence_authenticates_health_checks_and_opens_stream() {
         let (offer, device) = member_iptunnel_offer();
@@ -595,15 +727,59 @@ mod tests {
         let server_opens = Arc::clone(&opens);
         let server_offer = offer.clone();
         let server_task = tokio::spawn(async move {
-            run_scripted_data_tunnel_server(server, server_offer, true, server_opens).await
+            run_scripted_data_tunnel_server(
+                server,
+                server_offer,
+                true,
+                TestSession::valid(),
+                server_opens,
+            )
+            .await
         });
 
-        authenticate_open_iptunnel_session(&mut client, &offer, &device, NOW)
+        let session_ack = authenticate_open_iptunnel_session(&mut client, &offer, &device, NOW)
             .await
             .expect("auth + health + open succeed");
+        assert_eq!(session_ack.mtu(), 1280);
+        assert!(session_ack.session_id_present());
+        assert!(session_ack.mesh_ipv6_present());
         assert_eq!(opens.load(Ordering::SeqCst), 1);
         server_task.abort();
         assert!(server_task.await.unwrap_err().is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn open_session_rejects_invalid_session_ack_before_opening_stream() {
+        let (offer, device) = member_iptunnel_offer();
+        let (mut client, server) = tokio::io::duplex(16 * 1024);
+        let opens = Arc::new(AtomicUsize::new(0));
+        let server_opens = Arc::clone(&opens);
+        let server_offer = offer.clone();
+        let server_task = tokio::spawn(async move {
+            run_scripted_data_tunnel_server(
+                server,
+                server_offer,
+                true,
+                TestSession::invalid_mesh(),
+                server_opens,
+            )
+            .await
+        });
+
+        let error = authenticate_open_iptunnel_session(&mut client, &offer, &device, NOW)
+            .await
+            .expect_err("invalid ack fails closed");
+        let message = format!("{error:#}");
+        assert!(message.contains("IpTunnel session ack mesh address invalid"));
+        assert!(!message.contains("SECRET-MESH"));
+        drop(client);
+
+        let server_result = tokio::time::timeout(std::time::Duration::from_secs(1), server_task)
+            .await
+            .expect("server exits")
+            .expect("server task joins");
+        assert!(server_result.is_ok());
+        assert_eq!(opens.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]
@@ -614,7 +790,14 @@ mod tests {
         let server_opens = Arc::clone(&opens);
         let server_offer = offer.clone();
         let server_task = tokio::spawn(async move {
-            run_scripted_data_tunnel_server(server, server_offer, false, server_opens).await
+            run_scripted_data_tunnel_server(
+                server,
+                server_offer,
+                false,
+                TestSession::valid(),
+                server_opens,
+            )
+            .await
         });
 
         let error = authenticate_open_iptunnel_session(&mut client, &offer, &device, NOW)
