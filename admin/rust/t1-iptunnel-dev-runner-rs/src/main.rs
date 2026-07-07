@@ -126,7 +126,7 @@ fn validate_dev_host_ack(value: &str) -> Result<()> {
 
 fn device_secret_from_hex(hex: &str) -> Result<P256Keypair> {
     let hex = hex.trim();
-    if hex.len() != 64 {
+    if hex.len() != 64 || !hex.is_ascii() {
         bail!("device secret must be 64 hex chars");
     }
     let mut scalar = [0u8; 32];
@@ -536,6 +536,23 @@ mod tests {
         assert!(validate_dev_host_ack(DEV_HOST_ACK).is_ok());
         let error = validate_dev_host_ack("dev-host T1-T4 only").expect_err("partial ack rejected");
         assert!(error.to_string().contains("acknowledgement"));
+    }
+
+    #[test]
+    fn device_secret_rejects_non_ascii_without_echoing_secret() {
+        let mut secret = "11".repeat(31);
+        secret.push('\u{00e9}');
+        assert_eq!(secret.len(), 64);
+
+        let error = match device_secret_from_hex(&secret) {
+            Ok(_) => panic!("non-ascii secret accepted"),
+            Err(error) => error,
+        };
+        let message = format!("{error:#}");
+
+        assert!(message.contains("device secret must be 64 hex chars"));
+        assert!(!message.contains(&secret));
+        assert!(!message.contains('\u{00e9}'));
     }
 
     #[test]
