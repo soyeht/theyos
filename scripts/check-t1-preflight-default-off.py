@@ -52,6 +52,10 @@ def build_checks(skip_python: bool, skip_rust: bool) -> list[Check]:
                     "hardware-evidence-pack-validator-tests",
                     "scripts/test_validate_t1_hardware_evidence_pack.py",
                 ),
+                python_check(
+                    "audit-export-policy-validator-tests",
+                    "scripts/test_validate_t1_audit_export_policy.py",
+                ),
             )
         )
     if not skip_rust:

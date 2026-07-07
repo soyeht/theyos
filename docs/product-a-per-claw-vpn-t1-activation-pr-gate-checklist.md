@@ -56,6 +56,12 @@ below has explicit review evidence for the exact PR head and commit SHA.
   carry filters for durability/rotation (`t1_spooled_audit_sink`), fixed
   path/canonical-root validation (`t1_audit_log_path`), and HMAC/keyed export
   redaction (`t1_audit_export_jsonl`), not only the mount-level smoke.
+- If any off-host audit export is proposed, audit export policy shape
+  validation with
+  `scripts/validate-t1-audit-export-policy.py <sha> <policy> --expected-pr <number>`.
+  This proves only that the export policy is complete-shaped and privacy-safe to
+  review; it does not prove the export key source, rotation operation, retention
+  operation, or destination review is correct.
 
 ## Reference Content Verification
 
@@ -92,7 +98,7 @@ reference points to the artifact it names.
   modules, and loader-symbol confinement remain review items.
 - Export/HMAC code must remain unwired to off-host export unless the same PR
   also carries a reviewed export-key source, rotation policy, retention policy,
-  and privacy review.
+  privacy review, and clean audit export policy shape validation.
 
 ## Runtime and Product Gates
 
