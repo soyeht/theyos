@@ -7,9 +7,13 @@
 //! control path. A target open against an activated dev host remains a gated
 //! T1-T4 validation step, not a production activation path.
 
-use std::{fmt, net::Ipv6Addr, path::PathBuf};
+use std::{
+    fmt,
+    net::{Ipv4Addr, Ipv6Addr},
+    path::PathBuf,
+};
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use clap::{Parser, Subcommand};
 use household_rs::claw_share_data_tunnel::{
     HEALTH_PROBE, SessionAuthToken, TunnelAck, client_authenticate, client_health,
@@ -21,11 +25,16 @@ use household_rs::claw_share_relay_stream_contract::{
 use household_rs::claw_share_relay_stream_endpoint::parse_relay_endpoint;
 use household_rs::claw_share_relay_stream_noise::RelayStreamNoiseFramed;
 use household_rs::claw_share_rendezvous_hello::{RendezvousHello, RendezvousRole};
+use household_rs::claw_vpn::ClawVpnSessionAddrs;
 use household_rs::keys::{IdentityKey, P256Keypair};
 use rand::RngCore;
+use serde_json::{Map, Value};
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 
 const DEV_HOST_ACK: &str = "dev-host T1-T4 only; no production activation";
+const DEV_RUNNER_SESSION_CONFIG_SCHEMA: &str = "t1-dev-runner-device-session-v1";
+const DEV_RUNNER_SESSION_CONFIG_SCOPE: &str = "dev-host T1-T4 only";
+const DEV_RUNNER_CLAW_ROUTE_PREFIX_LEN: u8 = 32;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -45,6 +54,17 @@ enum Command {
         /// Canonical CBOR `RelayStreamOfferContract` file.
         #[arg(long)]
         offer_file: PathBuf,
+    },
+    /// Validate reviewed Device-side session config shape without opening datapath.
+    ///
+    /// This command only validates a private config file for a future dev-host
+    /// run. It does not open a local interface, install routes, run a packet
+    /// pump, connect to a relay, or touch production apps.
+    ValidateSessionConfig {
+        /// Private JSON Device-side session config file. Paths and values are
+        /// never printed.
+        #[arg(long)]
+        config_file: PathBuf,
     },
     /// Explicitly authenticate and open a dev-host `IpTunnel` session.
     ///
@@ -67,6 +87,50 @@ enum Command {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ValidatedIpTunnelOffer;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DevRunnerSessionConfigPlatform {
+    Linux,
+    Macos,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+struct ValidatedDevRunnerSessionConfig {
+    platform: DevRunnerSessionConfigPlatform,
+    addrs: ClawVpnSessionAddrs,
+    claw_route_prefix_len: u8,
+    mtu: u16,
+}
+
+impl fmt::Debug for ValidatedDevRunnerSessionConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ValidatedDevRunnerSessionConfig")
+            .field("platform", &self.platform)
+            .field("device_ipv4", &"<redacted>")
+            .field("claw_ipv4", &"<redacted>")
+            .field("claw_route_prefix_len", &self.claw_route_prefix_len)
+            .field("mtu", &self.mtu)
+            .finish_non_exhaustive()
+    }
+}
+
+impl ValidatedDevRunnerSessionConfig {
+    fn mtu(&self) -> u16 {
+        self.mtu
+    }
+
+    fn claw_route_prefix_len(&self) -> u8 {
+        self.claw_route_prefix_len
+    }
+
+    fn device_ipv4_present(&self) -> bool {
+        !self.addrs.device().is_unspecified()
+    }
+
+    fn claw_ipv4_present(&self) -> bool {
+        !self.addrs.claw().is_unspecified()
+    }
+}
 
 #[derive(Clone, PartialEq, Eq)]
 struct DevRunnerSessionAck {
@@ -147,6 +211,99 @@ fn validate_iptunnel_offer(offer: &RelayStreamOfferContract) -> Result<Validated
     parse_relay_endpoint(&offer.payload.relay_endpoint).context("validate relay endpoint shape")?;
 
     Ok(ValidatedIpTunnelOffer)
+}
+
+fn validate_session_config_file(path: &PathBuf) -> Result<ValidatedDevRunnerSessionConfig> {
+    let bytes = std::fs::read(path).context("read dev session config file")?;
+    validate_session_config_bytes(&bytes)
+}
+
+fn validate_session_config_bytes(bytes: &[u8]) -> Result<ValidatedDevRunnerSessionConfig> {
+    let value: Value = serde_json::from_slice(bytes).context("decode dev session config json")?;
+    let Some(object) = value.as_object() else {
+        bail!("dev session config must be a JSON object");
+    };
+
+    let schema = required_string(object, "schema")?;
+    if schema != DEV_RUNNER_SESSION_CONFIG_SCHEMA {
+        bail!("dev session config schema invalid");
+    }
+    let scope = required_string(object, "scope")?;
+    if scope != DEV_RUNNER_SESSION_CONFIG_SCOPE {
+        bail!("dev session config scope invalid");
+    }
+    if required_bool(object, "production_activation")? {
+        bail!("dev session config production_activation must be false");
+    }
+
+    let platform = match required_string(object, "platform")? {
+        "linux" => DevRunnerSessionConfigPlatform::Linux,
+        "macos" => DevRunnerSessionConfigPlatform::Macos,
+        _ => bail!("dev session config platform invalid"),
+    };
+    if required_string(object, "local_side")? != "device" {
+        bail!("dev session config local_side must be device");
+    }
+
+    let claw_route_prefix_len = required_u8(object, "claw_route_prefix_len")?;
+    if claw_route_prefix_len != DEV_RUNNER_CLAW_ROUTE_PREFIX_LEN {
+        bail!("dev session config claw_route_prefix_len must be 32");
+    }
+    let mtu = required_u16(object, "mtu")?;
+    if !(1280..=9000).contains(&mtu) {
+        bail!("dev session config mtu invalid");
+    }
+
+    let device_ipv4 = parse_config_ipv4(required_string(object, "device_ipv4")?, "device_ipv4")?;
+    let claw_ipv4 = parse_config_ipv4(required_string(object, "claw_ipv4")?, "claw_ipv4")?;
+    let addrs = ClawVpnSessionAddrs::try_new(device_ipv4, claw_ipv4)
+        .context("dev session config IPv4 pair invalid")?;
+
+    Ok(ValidatedDevRunnerSessionConfig {
+        platform,
+        addrs,
+        claw_route_prefix_len,
+        mtu,
+    })
+}
+
+fn required_string<'a>(object: &'a Map<String, Value>, field: &str) -> Result<&'a str> {
+    let Some(value) = object.get(field).and_then(Value::as_str) else {
+        bail!("dev session config {field} must be a non-empty string");
+    };
+    if value.trim().is_empty() || value.trim() != value {
+        bail!("dev session config {field} must be a non-empty string");
+    }
+    Ok(value)
+}
+
+fn required_bool(object: &Map<String, Value>, field: &str) -> Result<bool> {
+    object
+        .get(field)
+        .and_then(Value::as_bool)
+        .ok_or_else(|| anyhow!("dev session config {field} must be a boolean"))
+}
+
+fn required_u16(object: &Map<String, Value>, field: &str) -> Result<u16> {
+    let value = object
+        .get(field)
+        .and_then(Value::as_u64)
+        .ok_or_else(|| anyhow!("dev session config {field} must be an integer"))?;
+    u16::try_from(value).map_err(|_| anyhow!("dev session config {field} must be an integer"))
+}
+
+fn required_u8(object: &Map<String, Value>, field: &str) -> Result<u8> {
+    let value = object
+        .get(field)
+        .and_then(Value::as_u64)
+        .ok_or_else(|| anyhow!("dev session config {field} must be an integer"))?;
+    u8::try_from(value).map_err(|_| anyhow!("dev session config {field} must be an integer"))
+}
+
+fn parse_config_ipv4(value: &str, field: &str) -> Result<Ipv4Addr> {
+    value
+        .parse::<Ipv4Addr>()
+        .map_err(|_| anyhow!("dev session config {field} must be a valid IPv4 address"))
 }
 
 fn validate_dev_host_ack(value: &str) -> Result<()> {
@@ -339,6 +496,20 @@ async fn main() -> Result<()> {
                  endpoint_shape_valid=true)"
             );
         }
+        Command::ValidateSessionConfig { config_file } => {
+            let config = validate_session_config_file(&config_file)?;
+            println!(
+                "OK: dev IpTunnel session config shape validated \
+                 (device_ipv4_present={}, claw_ipv4_present={}, \
+                 claw_route_prefix_len={}, runner_config_mtu={}, \
+                 runner_tun_opened=false, runner_route_installed=false, \
+                 runner_packet_pump_started=false)",
+                config.device_ipv4_present(),
+                config.claw_ipv4_present(),
+                config.claw_route_prefix_len(),
+                config.mtu()
+            );
+        }
         Command::OpenSession {
             offer_file,
             device_secret_file,
@@ -394,6 +565,22 @@ mod tests {
 
     fn claw_static_pub() -> RelayStreamClawStaticPublicKey {
         RelayStreamClawStaticPublicKey::try_new([0x33; 32]).expect("claw static key")
+    }
+
+    fn valid_session_config_json() -> String {
+        format!(
+            r#"{{
+                "schema": "{DEV_RUNNER_SESSION_CONFIG_SCHEMA}",
+                "scope": "{DEV_RUNNER_SESSION_CONFIG_SCOPE}",
+                "production_activation": false,
+                "platform": "macos",
+                "local_side": "device",
+                "device_ipv4": "198.18.0.1",
+                "claw_ipv4": "198.18.0.2",
+                "claw_route_prefix_len": 32,
+                "mtu": 1280
+            }}"#
+        )
     }
 
     fn rendezvous_token() -> RendezvousToken {
@@ -630,6 +817,97 @@ mod tests {
         assert!(validate_dev_host_ack(DEV_HOST_ACK).is_ok());
         let error = validate_dev_host_ack("dev-host T1-T4 only").expect_err("partial ack rejected");
         assert!(error.to_string().contains("acknowledgement"));
+    }
+
+    #[test]
+    fn validates_reviewed_session_config_shape_without_echoing_addresses() {
+        let config = validate_session_config_bytes(valid_session_config_json().as_bytes())
+            .expect("valid config");
+
+        assert!(config.device_ipv4_present());
+        assert!(config.claw_ipv4_present());
+        assert_eq!(config.claw_route_prefix_len(), 32);
+        assert_eq!(config.mtu(), 1280);
+
+        let debug = format!("{config:?}");
+        assert!(debug.contains("claw_route_prefix_len"));
+        assert!(debug.contains("mtu"));
+        assert!(!debug.contains("198.18.0.1"));
+        assert!(!debug.contains("198.18.0.2"));
+    }
+
+    #[test]
+    fn session_config_rejects_invalid_values_without_echoing_them() {
+        let bad_address = valid_session_config_json().replace("198.18.0.1", "SECRET-DEVICE-IP");
+        let error = validate_session_config_bytes(bad_address.as_bytes())
+            .expect_err("bad address rejected");
+        let message = format!("{error:#}");
+        assert!(message.contains("device_ipv4 must be a valid IPv4 address"));
+        assert!(!message.contains("SECRET-DEVICE-IP"));
+
+        let broad_route = valid_session_config_json().replace(
+            r#""claw_route_prefix_len": 32"#,
+            r#""claw_route_prefix_len": 24"#,
+        );
+        let error = validate_session_config_bytes(broad_route.as_bytes())
+            .expect_err("broad route rejected");
+        assert!(
+            error
+                .to_string()
+                .contains("claw_route_prefix_len must be 32")
+        );
+    }
+
+    #[test]
+    fn session_config_stays_non_production_device_side_only() {
+        let prod_config = valid_session_config_json().replace(
+            r#""production_activation": false"#,
+            r#""production_activation": true"#,
+        );
+        let error = validate_session_config_bytes(prod_config.as_bytes())
+            .expect_err("production activation rejected");
+        assert!(
+            error
+                .to_string()
+                .contains("production_activation must be false")
+        );
+
+        let claw_side = valid_session_config_json()
+            .replace(r#""local_side": "device""#, r#""local_side": "claw""#);
+        let error = validate_session_config_bytes(claw_side.as_bytes())
+            .expect_err("non-device local side rejected");
+        assert!(error.to_string().contains("local_side must be device"));
+    }
+
+    #[test]
+    fn session_config_rejects_invalid_schema_scope_platform_and_mtu() {
+        let bad_schema = valid_session_config_json().replace(
+            DEV_RUNNER_SESSION_CONFIG_SCHEMA,
+            "t1-dev-runner-device-session-v0",
+        );
+        let error =
+            validate_session_config_bytes(bad_schema.as_bytes()).expect_err("schema rejected");
+        assert!(error.to_string().contains("schema invalid"));
+
+        let bad_scope =
+            valid_session_config_json().replace(DEV_RUNNER_SESSION_CONFIG_SCOPE, "dev-host");
+        let error =
+            validate_session_config_bytes(bad_scope.as_bytes()).expect_err("scope rejected");
+        assert!(error.to_string().contains("scope invalid"));
+
+        let bad_platform =
+            valid_session_config_json().replace(r#""platform": "macos""#, r#""platform": "ios""#);
+        let error =
+            validate_session_config_bytes(bad_platform.as_bytes()).expect_err("platform rejected");
+        assert!(error.to_string().contains("platform invalid"));
+
+        for invalid_mtu in [1279, 9001] {
+            let bad_mtu = valid_session_config_json()
+                .replace(r#""mtu": 1280"#, &format!(r#""mtu": {invalid_mtu}"#));
+            let error =
+                validate_session_config_bytes(bad_mtu.as_bytes()).expect_err("mtu rejected");
+            assert!(error.to_string().contains("mtu invalid"));
+        }
     }
 
     #[test]
