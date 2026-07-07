@@ -60,6 +60,7 @@ must include all fields below, using neutral aliases in public text:
 |---|---|
 | Artifact | Exact PR number and commit SHA to test |
 | Scope | `dev-host T1-T4 only`; production explicitly excluded |
+| Production activation | `production_activation=false` |
 | Topology | Neutral aliases for engine, claw, device, relay, and member |
 | Time window | Start and end time for the test window |
 | Operator | Person responsible for starting, stopping, and rolling back |
@@ -71,6 +72,16 @@ must include all fields below, using neutral aliases in public text:
 If the authorization omits any field, the test is not authorized. If the
 artifact SHA changes, the authorization expires and must be reissued for the
 new SHA.
+
+Before using the authorization record as `owner_authorization_ref`, validate
+its shape without printing private values:
+
+```sh
+scripts/validate-t1-owner-authorization.py \
+  <exact-40-hex-artifact-sha> \
+  <private-owner-authorization-record> \
+  --expected-pr <number>
+```
 
 The startup preflight status is only a classifier for these gates. A
 `PreflightEvidencePresent` status means the caller supplied evidence for review;
@@ -108,6 +119,16 @@ Rollback success criteria:
 If rollback leaves an interface, route, session, or unhealthy dev engine, stop
 the run and record the failure as a blocker. Do not retry activation in the same
 window.
+
+Before using the rollback material as `rollback_ref`, validate its shape without
+printing private values:
+
+```sh
+scripts/validate-t1-rollback-evidence.py \
+  <exact-40-hex-artifact-sha> \
+  <private-rollback-evidence-record> \
+  --expected-pr <number>
+```
 
 ## Hardware Evidence Pack
 
@@ -163,13 +184,13 @@ scripts/validate-t1-preflight-evidence-record.py \
   <exact-40-hex-artifact-sha> \
   .env.t1-preflight-evidence.json \
   --check-root-dir \
-  --check-hardware-pack \
+  --check-private-refs \
   --expected-pr <number>
 ```
 
-The validator is an offline shape check for completeness and privacy-safe
-review structure. It does not replace the human content verification required
-by the activation checklist.
+The validator chain is an offline shape check for completeness and privacy-safe
+review structure across owner, rollback, and hardware refs. It does not replace
+the human content verification required by the activation checklist.
 
 ## Stop Conditions
 

@@ -17,6 +17,7 @@ identifiers, or logs containing real identifiers into this file or a PR.
 |---|---|
 | Artifact | PR `<number>`, commit `<sha>`, build artifact hash `<hash>` |
 | Scope | `dev-host T1-T4 only`; production explicitly excluded |
+| Production activation | `production_activation=false` |
 | Topology | Engine-dev `<engine-alpha>`, Claw-A `<claw-alpha>`, Device-D `<device-alpha>`, Relay-R `<relay-alpha>`, Member-M1 `<member-alpha>` |
 | Time window | `<UTC start>` through `<UTC end>` |
 | Operator | `<operator-alpha>` |
@@ -69,11 +70,21 @@ locally without printing its values:
 scripts/prepare-t1-preflight-evidence-record.py \
   <exact-40-hex-artifact-sha>
 
+scripts/validate-t1-owner-authorization.py \
+  <exact-40-hex-artifact-sha> \
+  <private-owner-authorization-record> \
+  --expected-pr <number>
+
+scripts/validate-t1-rollback-evidence.py \
+  <exact-40-hex-artifact-sha> \
+  <private-rollback-evidence-record> \
+  --expected-pr <number>
+
 scripts/validate-t1-preflight-evidence-record.py \
   <exact-40-hex-artifact-sha> \
   .env.t1-preflight-evidence.json \
   --check-root-dir \
-  --check-hardware-pack \
+  --check-private-refs \
   --expected-pr <number>
 ```
 
@@ -93,11 +104,11 @@ bundle:
 scripts/check-t1-preflight-default-off.py
 ```
 
-That bundle only runs Python helper/validator tests, Rust default-off tests,
-audit sink carry tests for durability/rotation/fixed-path/HMAC export,
-the `friend-cli` `IpTunnel` rejection tests, and the dev-runner offline offer
-validator; it does not open TUN/utun, install routes, launch runtime, or touch
-production.
+That bundle only runs Python helper/validator tests for the private owner,
+rollback, preflight, and hardware shapes, Rust default-off tests, audit sink
+carry tests for durability/rotation/fixed-path/HMAC export, the `friend-cli`
+`IpTunnel` rejection tests, and the dev-runner offline offer validator; it does
+not open TUN/utun, install routes, launch runtime, or touch production.
 
 ## Rollback Readiness
 
@@ -158,14 +169,16 @@ scripts/validate-t1-hardware-evidence-pack.py \
   --expected-pr <number>
 ```
 
-Then keep the same private path in `hardware_evidence_ref` and rerun the
-preflight evidence validator with `--check-hardware-pack`. That chained check
-does not print the pack path or values; it only proves the referenced private
-pack is complete-shaped for review.
+Then keep the same private paths in `owner_authorization_ref`, `rollback_ref`,
+and `hardware_evidence_ref`, and rerun the preflight evidence validator with
+`--check-private-refs`. That chained check does not print private paths or
+values; it only proves the referenced private artifacts are complete-shaped for
+review.
 
-This validator checks the pack is complete-shaped for review. It does not prove
-the referenced artifacts are real or correct; reviewers must still verify the
-content of the owner, rollback, hardware, and run evidence before activation.
+These validators check that the private artifacts are complete-shaped for
+review. They do not prove the referenced artifacts are real or correct;
+reviewers must still verify the content of the owner, rollback, hardware, and
+run evidence before activation.
 
 ## Stop Record
 

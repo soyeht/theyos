@@ -21,6 +21,8 @@ REQUIRED_REFS = (
     "rollback_ref",
     "hardware_evidence_ref",
 )
+OWNER_AUTHORIZATION_VALIDATOR = Path(__file__).with_name("validate-t1-owner-authorization.py")
+ROLLBACK_EVIDENCE_VALIDATOR = Path(__file__).with_name("validate-t1-rollback-evidence.py")
 HARDWARE_PACK_VALIDATOR = Path(__file__).with_name("validate-t1-hardware-evidence-pack.py")
 
 
@@ -105,29 +107,69 @@ def validate_record(record: object, expected_sha: str, check_root_dir: bool) -> 
     return errors
 
 
-def load_hardware_pack_validator() -> ModuleType:
-    spec = importlib.util.spec_from_file_location("validate_t1_hardware_evidence_pack", HARDWARE_PACK_VALIDATOR)
+def load_sibling_validator(module_name: str, path: Path) -> ModuleType:
+    spec = importlib.util.spec_from_file_location(module_name, path)
     if spec is None or spec.loader is None:
-        raise RuntimeError("hardware evidence pack validator unavailable")
+        raise RuntimeError("validator unavailable")
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
 
 
-def validate_hardware_evidence_ref(record: dict[str, object], expected_sha: str, expected_pr: int | None) -> list[str]:
-    hardware_ref = record.get("hardware_evidence_ref")
-    if not isinstance(hardware_ref, str) or not hardware_ref.strip() or is_template_placeholder(hardware_ref):
+def read_private_ref(record: dict[str, object], field: str) -> tuple[str | None, str | None]:
+    ref = record.get(field)
+    if not isinstance(ref, str) or not ref.strip() or is_template_placeholder(ref):
+        return None, None
+
+    try:
+        return Path(ref).read_text(encoding="utf-8"), None
+    except UnicodeDecodeError:
+        return None, f"{field} artifact is not valid UTF-8"
+    except OSError as error:
+        return None, f"{field} artifact could not be read: {error.__class__.__name__}"
+
+
+def validate_owner_authorization_ref(record: dict[str, object], expected_sha: str, expected_pr: int | None) -> list[str]:
+    markdown, error = read_private_ref(record, "owner_authorization_ref")
+    if error is not None:
+        return [error]
+    if markdown is None:
         return []
 
     try:
-        markdown = Path(hardware_ref).read_text(encoding="utf-8")
-    except UnicodeDecodeError:
-        return ["hardware_evidence_ref pack is not valid UTF-8"]
-    except OSError as error:
-        return [f"hardware_evidence_ref pack could not be read: {error.__class__.__name__}"]
+        validator = load_sibling_validator("validate_t1_owner_authorization", OWNER_AUTHORIZATION_VALIDATOR)
+    except RuntimeError:
+        return ["owner_authorization_ref artifact validator is unavailable"]
+
+    artifact_errors = validator.validate_owner_authorization(markdown, expected_sha, expected_pr)
+    return [f"owner_authorization_ref artifact: {error}" for error in artifact_errors]
+
+
+def validate_rollback_ref(record: dict[str, object], expected_sha: str, expected_pr: int | None) -> list[str]:
+    markdown, error = read_private_ref(record, "rollback_ref")
+    if error is not None:
+        return [error]
+    if markdown is None:
+        return []
 
     try:
-        validator = load_hardware_pack_validator()
+        validator = load_sibling_validator("validate_t1_rollback_evidence", ROLLBACK_EVIDENCE_VALIDATOR)
+    except RuntimeError:
+        return ["rollback_ref artifact validator is unavailable"]
+
+    artifact_errors = validator.validate_rollback_evidence(markdown, expected_sha, expected_pr)
+    return [f"rollback_ref artifact: {error}" for error in artifact_errors]
+
+
+def validate_hardware_evidence_ref(record: dict[str, object], expected_sha: str, expected_pr: int | None) -> list[str]:
+    markdown, error = read_private_ref(record, "hardware_evidence_ref")
+    if error is not None:
+        return [error.replace("artifact", "pack")]
+    if markdown is None:
+        return []
+
+    try:
+        validator = load_sibling_validator("validate_t1_hardware_evidence_pack", HARDWARE_PACK_VALIDATOR)
     except RuntimeError:
         return ["hardware_evidence_ref pack validator is unavailable"]
 
@@ -154,7 +196,22 @@ def main() -> int:
         action="store_true",
         help="also validate the private hardware_evidence_ref pack shape without printing its path or values",
     )
-    parser.add_argument("--expected-pr", type=int, help="expected activation PR number for --check-hardware-pack")
+    parser.add_argument(
+        "--check-owner-authorization",
+        action="store_true",
+        help="also validate the private owner_authorization_ref shape without printing its path or values",
+    )
+    parser.add_argument(
+        "--check-rollback",
+        action="store_true",
+        help="also validate the private rollback_ref shape without printing its path or values",
+    )
+    parser.add_argument(
+        "--check-private-refs",
+        action="store_true",
+        help="also validate owner_authorization_ref, rollback_ref, and hardware_evidence_ref shapes",
+    )
+    parser.add_argument("--expected-pr", type=int, help="expected activation PR number for chained private artifact checks")
     args = parser.parse_args()
 
     try:
@@ -168,8 +225,13 @@ def main() -> int:
         return 2
 
     errors = validate_record(record, args.expected_artifact_sha, args.check_root_dir)
-    if not errors and args.check_hardware_pack:
-        errors.extend(validate_hardware_evidence_ref(record, args.expected_artifact_sha, args.expected_pr))
+    if not errors:
+        if args.check_owner_authorization or args.check_private_refs:
+            errors.extend(validate_owner_authorization_ref(record, args.expected_artifact_sha, args.expected_pr))
+        if args.check_rollback or args.check_private_refs:
+            errors.extend(validate_rollback_ref(record, args.expected_artifact_sha, args.expected_pr))
+        if args.check_hardware_pack or args.check_private_refs:
+            errors.extend(validate_hardware_evidence_ref(record, args.expected_artifact_sha, args.expected_pr))
     if errors:
         for error in errors:
             print(f"ERROR: {error}", file=sys.stderr)
