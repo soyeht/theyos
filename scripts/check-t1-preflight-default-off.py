@@ -57,6 +57,10 @@ def build_checks(skip_python: bool, skip_rust: bool) -> list[Check]:
                     "audit-export-policy-validator-tests",
                     "scripts/test_validate_t1_audit_export_policy.py",
                 ),
+                python_check(
+                    "device-session-config-validator-tests",
+                    "scripts/test_validate_t1_device_session_config.py",
+                ),
             )
         )
     if not skip_rust:

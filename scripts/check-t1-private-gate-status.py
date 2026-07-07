@@ -18,6 +18,7 @@ REF_FIELDS = (
     "rollback_ref",
     "hardware_evidence_ref",
     "audit_export_policy_ref",
+    "device_session_config_ref",
 )
 
 
@@ -73,11 +74,20 @@ def private_ref_status(
 ) -> tuple[list[str], list[str]]:
     ok: list[str] = []
     errors: list[str] = []
+
+    def check_device_session_config(
+        checked_record: dict[str, object],
+        _expected_sha: str,
+        _expected_pr: int | None,
+    ) -> list[str]:
+        return validator.validate_device_session_config_ref(checked_record)
+
     ref_checks = (
         ("owner_authorization_ref", validator.validate_owner_authorization_ref),
         ("rollback_ref", validator.validate_rollback_ref),
         ("hardware_evidence_ref", validator.validate_hardware_evidence_ref),
         ("audit_export_policy_ref", validator.validate_audit_export_policy_ref),
+        ("device_session_config_ref", check_device_session_config),
     )
     for field, check in ref_checks:
         if not is_present_ref(record.get(field), validator):

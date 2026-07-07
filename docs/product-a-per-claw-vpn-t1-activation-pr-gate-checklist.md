@@ -49,8 +49,9 @@ below has explicit review evidence for the exact PR head and commit SHA.
 - Private preflight evidence JSON that validates with
   `scripts/validate-t1-preflight-evidence-record.py <sha> <record> --check-root-dir --check-private-refs --expected-pr <number>`.
   The private-ref check follows `owner_authorization_ref`, `rollback_ref`,
-  `hardware_evidence_ref`, and `audit_export_policy_ref` without printing paths
-  or values; it is still a shape/privacy check, not content attestation.
+  `hardware_evidence_ref`, `audit_export_policy_ref`, and
+  `device_session_config_ref` without printing paths or values; it is still a
+  shape/privacy check, not content attestation.
 - Private gate status check with
   `scripts/check-t1-private-gate-status.py <sha> <record> --check-root-dir --check-private-refs --expected-pr <number>`.
   This is an operator-facing status report only: it names missing or invalid
@@ -67,6 +68,11 @@ below has explicit review evidence for the exact PR head and commit SHA.
   This proves only that the export policy is complete-shaped and privacy-safe to
   review; it does not prove the export key source, rotation operation, retention
   operation, or destination review is correct.
+- Device-side session config shape validation, either directly with
+  `scripts/validate-t1-device-session-config.py <config>` or through
+  `--check-private-refs` on the private preflight record. This proves only that
+  the config artifact is complete-shaped for review, with private IPv4 values
+  redacted; it does not apply interface or route configuration.
 
 ## Reference Content Verification
 
@@ -81,6 +87,8 @@ only that the reference string is non-empty or non-placeholder:
   same artifact.
 - `audit_export_policy_ref` points to the reviewed off-host audit export policy
   for the same artifact.
+- `device_session_config_ref` points to the reviewed Device-side session config
+  artifact for the same dev-host validation scope.
 
 The Rust loader and offline validator are shape checks. They do not prove that a
 reference points to the artifact it names.

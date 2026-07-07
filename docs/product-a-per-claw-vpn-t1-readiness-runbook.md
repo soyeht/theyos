@@ -186,7 +186,16 @@ scripts/validate-t1-audit-export-policy.py \
   --expected-pr <number>
 ```
 
-After the pack path is stored in the private preflight evidence record, rerun:
+Before binding the Device-side session config into the private preflight record,
+run:
+
+```sh
+scripts/validate-t1-device-session-config.py \
+  <private-device-session-config>
+```
+
+After the private ref paths are stored in the private preflight evidence record,
+rerun:
 
 ```sh
 scripts/validate-t1-preflight-evidence-record.py \
@@ -198,9 +207,9 @@ scripts/validate-t1-preflight-evidence-record.py \
 ```
 
 The validator chain is an offline shape check for completeness and privacy-safe
-review structure across owner, rollback, hardware, and audit-export-policy refs.
-It does not replace the human content verification required by the activation
-checklist.
+review structure across owner, rollback, hardware, audit-export-policy, and
+Device-side session config refs. It does not replace the human content
+verification required by the activation checklist.
 
 ## Stop Conditions
 
@@ -309,10 +318,12 @@ The wiring PR that follows this runbook must show, before merge:
   authorization, rollback artifact, and hardware evidence pack, and binds an
   absolute normal audit-root path into the parsed evidence bundle. The offline
   private-record validator also requires and follows `audit_export_policy_ref`
-  as a shape/privacy gate for the same artifact. That loader is not
-  authorization by itself, remains source-guarded outside `startup_wiring`, and
-  must remain unused by the mount until the activation slice connects it to the
-  gate. A live activation slice must still wire that record into the mount,
+  and `device_session_config_ref` as shape/privacy gates for the same artifact.
+  The Rust loader/runtime does not consume those Python-side refs or apply the
+  Device-side config. That loader is not authorization by itself, remains
+  source-guarded outside `startup_wiring`, and must remain unused by the mount
+  until the activation slice connects it to the gate. A live activation slice
+  must still wire that record into the mount,
   bind the owner-controlled canonical root value to the
   audit sink path, decide final retention/rotation limits, review export key
   source/rotation, and choose the best-effort-vs-durable authorization/in-flight
