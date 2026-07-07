@@ -4914,6 +4914,49 @@ required-features = ["dev_t1_datapath"]"#;
         "T1 Phase 0 dev bin must not reference production app/state endpoints"
     );
 
+    let rust_workspace_dir = manifest_dir
+        .parent()
+        .expect("server-rs manifest has a Rust workspace parent");
+    let runner_cargo_toml_path = rust_workspace_dir
+        .join("t1-iptunnel-dev-runner-rs")
+        .join("Cargo.toml");
+    let runner_cargo_toml = fs::read_to_string(&runner_cargo_toml_path).unwrap_or_else(|e| {
+        panic!(
+            "read runner Cargo.toml {}: {e}",
+            runner_cargo_toml_path.display()
+        )
+    });
+    assert!(
+        runner_cargo_toml.contains(r#"dev_t1_datapath = ["dep:server-rs"]"#),
+        "T1 Phase 0 device-side dev datapath must be an explicit opt-in runner feature"
+    );
+
+    let runner_source_path = rust_workspace_dir
+        .join("t1-iptunnel-dev-runner-rs")
+        .join("src/main.rs");
+    let runner_source = fs::read_to_string(&runner_source_path)
+        .unwrap_or_else(|e| panic!("read runner source {}: {e}", runner_source_path.display()));
+    for required_token in [
+        "#[cfg(feature = \"dev_t1_datapath\")]\n    RunDeviceDatapath",
+        "#[cfg(feature = \"dev_t1_datapath\")]\nmod dev_datapath",
+        "#[cfg(feature = \"dev_t1_datapath\")]\n        Command::RunDeviceDatapath",
+        "THEYOS_T1_DEV_DATAPATH",
+        "THEYOS_FORCE_SOFTWARE_KEYS",
+        "dev-host T1-T4 only; no production activation",
+        "dev-host public relay dial allowed; no production activation",
+    ] {
+        assert!(
+            runner_source.contains(required_token),
+            "T1 Phase 0 runner must retain hard dev-only guard token: {required_token}"
+        );
+    }
+    assert!(
+        !runner_source.contains("/Applications/Soyeht.app")
+            && !runner_source.contains("com.soyeht.mac")
+            && !runner_source.contains(":8091"),
+        "T1 Phase 0 runner must not reference production app/state endpoints"
+    );
+
     let mount_path = manifest_dir.join("src/claw_share_relay_stream_mount.rs");
     let mount_source = fs::read_to_string(&mount_path)
         .unwrap_or_else(|e| panic!("read relay-stream mount {}: {e}", mount_path.display()));
