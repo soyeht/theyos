@@ -48,17 +48,17 @@ below has explicit review evidence for the exact PR head and commit SHA.
   evidence.
 - Private preflight evidence JSON that validates with
   `scripts/validate-t1-preflight-evidence-record.py <sha> <record> --check-root-dir --check-private-refs --expected-pr <number>`.
-  The private-ref check follows `owner_authorization_ref`, `rollback_ref`, and
-  `hardware_evidence_ref` without printing paths or values; it is still a
-  shape/privacy check, not content attestation.
+  The private-ref check follows `owner_authorization_ref`, `rollback_ref`,
+  `hardware_evidence_ref`, and `audit_export_policy_ref` without printing paths
+  or values; it is still a shape/privacy check, not content attestation.
 - Clean `scripts/check-t1-preflight-default-off.py` result on the base before
   the activation diff is reviewed. The bundle must include the direct audit
   carry filters for durability/rotation (`t1_spooled_audit_sink`), fixed
   path/canonical-root validation (`t1_audit_log_path`), and HMAC/keyed export
   redaction (`t1_audit_export_jsonl`), not only the mount-level smoke.
-- If any off-host audit export is proposed, audit export policy shape
-  validation with
-  `scripts/validate-t1-audit-export-policy.py <sha> <policy> --expected-pr <number>`.
+- Audit export policy shape validation, either directly with
+  `scripts/validate-t1-audit-export-policy.py <sha> <policy> --expected-pr <number>`
+  or through `--check-private-refs` on the private preflight record.
   This proves only that the export policy is complete-shaped and privacy-safe to
   review; it does not prove the export key source, rotation operation, retention
   operation, or destination review is correct.
@@ -74,6 +74,8 @@ only that the reference string is non-empty or non-placeholder:
   operation.
 - `hardware_evidence_ref` points to the reviewed T1-T4 evidence pack for the
   same artifact.
+- `audit_export_policy_ref` points to the reviewed off-host audit export policy
+  for the same artifact.
 
 The Rust loader and offline validator are shape checks. They do not prove that a
 reference points to the artifact it names.

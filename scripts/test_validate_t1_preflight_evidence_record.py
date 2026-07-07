@@ -35,6 +35,7 @@ def valid_record(audit_root: str = "/private/t1-audit-root") -> dict[str, object
         "rollback_ref": "rollback-ref",
         "hardware_t1_t4": True,
         "hardware_evidence_ref": "hardware-evidence-ref",
+        "audit_export_policy_ref": "audit-export-policy-ref",
         "audit_root": audit_root,
     }
 
@@ -99,6 +100,26 @@ production_activation=false
 """
 
 
+def valid_audit_export_policy() -> str:
+    return f"""# T1 Audit Export Policy
+
+PR #286
+artifact_sha: {ARTIFACT_SHA}
+scope: dev-host T1-T4 only
+production_activation=false
+
+- [x] HMAC-SHA-256 keyed export is required for every off-host audit export record.
+- [x] Reviewed export key source is documented privately and contains no key bytes.
+- [x] Export key rotation policy is defined before any off-host export.
+- [x] Export key retention and retirement policy is defined before any off-host export.
+- [x] Export JSONL data retention policy is bounded and documented.
+- [x] Raw member/device/claw subject identifiers are omitted from off-host export.
+- [x] Local pseudonymous hash values are omitted from off-host export.
+- [x] Off-host export destination review is required before transfer.
+- [x] Production excluded and not touched.
+"""
+
+
 class ValidateT1PreflightEvidenceRecordTests(unittest.TestCase):
     def assert_validation_error(self, record: object, expected_error: str) -> None:
         errors = validator.validate_record(record, ARTIFACT_SHA, check_root_dir=False)
@@ -128,9 +149,11 @@ class ValidateT1PreflightEvidenceRecordTests(unittest.TestCase):
             ("owner_authorization_ref", " ", "owner_authorization_ref must be a non-empty string"),
             ("rollback_ref", "", "rollback_ref must be a non-empty string"),
             ("hardware_evidence_ref", None, "hardware_evidence_ref must be a non-empty string"),
+            ("audit_export_policy_ref", None, "audit_export_policy_ref must be a non-empty string"),
             ("owner_authorization_ref", "<owner-authorization-record-ref>", "owner_authorization_ref must not be a template placeholder"),
             ("rollback_ref", " <prebuilt-rollback-artifact-ref> ", "rollback_ref must not be a template placeholder"),
             ("hardware_evidence_ref", "<sanitized-t1-t4-evidence-pack-ref>", "hardware_evidence_ref must not be a template placeholder"),
+            ("audit_export_policy_ref", "<audit-export-policy-ref>", "audit_export_policy_ref must not be a template placeholder"),
         )
         for field, value, expected_error in cases:
             with self.subTest(field=field):
@@ -300,14 +323,17 @@ class ValidateT1PreflightEvidenceRecordTests(unittest.TestCase):
             owner_record = tmpdir / "private-owner-authorization.md"
             rollback_record = tmpdir / "private-rollback-evidence.md"
             hardware_pack = tmpdir / "private-hardware-evidence.md"
+            audit_export_policy = tmpdir / "private-audit-export-policy.md"
             owner_record.write_text(valid_owner_authorization(), encoding="utf-8")
             rollback_record.write_text(valid_rollback_evidence(), encoding="utf-8")
             hardware_pack.write_text(valid_hardware_pack(), encoding="utf-8")
+            audit_export_policy.write_text(valid_audit_export_policy(), encoding="utf-8")
             record_path = tmpdir / "private-evidence-record.json"
             record = valid_record(os.path.realpath(audit_root))
             record["owner_authorization_ref"] = str(owner_record)
             record["rollback_ref"] = str(rollback_record)
             record["hardware_evidence_ref"] = str(hardware_pack)
+            record["audit_export_policy_ref"] = str(audit_export_policy)
             record_path.write_text(json.dumps(record), encoding="utf-8")
 
             proc = subprocess.run(
@@ -337,14 +363,17 @@ class ValidateT1PreflightEvidenceRecordTests(unittest.TestCase):
             owner_record = tmpdir / "private-owner-authorization.md"
             rollback_record = tmpdir / "private-rollback-evidence.md"
             hardware_pack = tmpdir / "private-hardware-evidence.md"
+            audit_export_policy = tmpdir / "private-audit-export-policy.md"
             owner_record.write_text(valid_owner_authorization().replace("production_activation=false", "production_activation=true"), encoding="utf-8")
             rollback_record.write_text(valid_rollback_evidence(), encoding="utf-8")
             hardware_pack.write_text(valid_hardware_pack(), encoding="utf-8")
+            audit_export_policy.write_text(valid_audit_export_policy(), encoding="utf-8")
             record_path = tmpdir / "private-evidence-record.json"
             record = valid_record(os.path.realpath(audit_root))
             record["owner_authorization_ref"] = str(owner_record)
             record["rollback_ref"] = str(rollback_record)
             record["hardware_evidence_ref"] = str(hardware_pack)
+            record["audit_export_policy_ref"] = str(audit_export_policy)
             record_path.write_text(json.dumps(record), encoding="utf-8")
 
             proc = subprocess.run(
@@ -376,13 +405,16 @@ class ValidateT1PreflightEvidenceRecordTests(unittest.TestCase):
             owner_record = tmpdir / "private-owner-authorization.md"
             missing_rollback = tmpdir / "private-rollback-evidence.md"
             hardware_pack = tmpdir / "private-hardware-evidence.md"
+            audit_export_policy = tmpdir / "private-audit-export-policy.md"
             owner_record.write_text(valid_owner_authorization(), encoding="utf-8")
             hardware_pack.write_text(valid_hardware_pack(), encoding="utf-8")
+            audit_export_policy.write_text(valid_audit_export_policy(), encoding="utf-8")
             record_path = tmpdir / "private-evidence-record.json"
             record = valid_record(os.path.realpath(audit_root))
             record["owner_authorization_ref"] = str(owner_record)
             record["rollback_ref"] = str(missing_rollback)
             record["hardware_evidence_ref"] = str(hardware_pack)
+            record["audit_export_policy_ref"] = str(audit_export_policy)
             record_path.write_text(json.dumps(record), encoding="utf-8")
 
             proc = subprocess.run(
@@ -414,17 +446,20 @@ class ValidateT1PreflightEvidenceRecordTests(unittest.TestCase):
             owner_record = tmpdir / "private-owner-authorization.md"
             rollback_record = tmpdir / "private-rollback-evidence.md"
             hardware_pack = tmpdir / "private-hardware-evidence.md"
+            audit_export_policy = tmpdir / "private-audit-export-policy.md"
             owner_record.write_text(valid_owner_authorization(), encoding="utf-8")
             rollback_record.write_text(
                 valid_rollback_evidence().replace("production_activation=false", "production_activation=true"),
                 encoding="utf-8",
             )
             hardware_pack.write_text(valid_hardware_pack(), encoding="utf-8")
+            audit_export_policy.write_text(valid_audit_export_policy(), encoding="utf-8")
             record_path = tmpdir / "private-evidence-record.json"
             record = valid_record(os.path.realpath(audit_root))
             record["owner_authorization_ref"] = str(owner_record)
             record["rollback_ref"] = str(rollback_record)
             record["hardware_evidence_ref"] = str(hardware_pack)
+            record["audit_export_policy_ref"] = str(audit_export_policy)
             record_path.write_text(json.dumps(record), encoding="utf-8")
 
             proc = subprocess.run(
@@ -456,17 +491,20 @@ class ValidateT1PreflightEvidenceRecordTests(unittest.TestCase):
             owner_record = tmpdir / "private-owner-authorization.md"
             rollback_record = tmpdir / "private-rollback-evidence.md"
             hardware_pack = tmpdir / "private-hardware-evidence.md"
+            audit_export_policy = tmpdir / "private-audit-export-policy.md"
             owner_record.write_text(valid_owner_authorization(), encoding="utf-8")
             rollback_record.write_text(valid_rollback_evidence(), encoding="utf-8")
             hardware_pack.write_text(
                 valid_hardware_pack().replace("- [x] T4 rollback", "- [ ] T4 rollback"),
                 encoding="utf-8",
             )
+            audit_export_policy.write_text(valid_audit_export_policy(), encoding="utf-8")
             record_path = tmpdir / "private-evidence-record.json"
             record = valid_record(os.path.realpath(audit_root))
             record["owner_authorization_ref"] = str(owner_record)
             record["rollback_ref"] = str(rollback_record)
             record["hardware_evidence_ref"] = str(hardware_pack)
+            record["audit_export_policy_ref"] = str(audit_export_policy)
             record_path.write_text(json.dumps(record), encoding="utf-8")
 
             proc = subprocess.run(
@@ -492,6 +530,92 @@ class ValidateT1PreflightEvidenceRecordTests(unittest.TestCase):
             )
             self.assertFalse(str(hardware_pack) in proc.stderr, "stderr leaked hardware pack path")
             self.assertFalse(hardware_pack.name in proc.stderr, "stderr leaked hardware pack file name")
+
+    def test_cli_check_private_refs_rejects_missing_audit_export_policy_without_echoing_private_path(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmpdir = Path(tmp)
+            audit_root = tmpdir / "audit-root"
+            audit_root.mkdir(mode=0o700)
+            owner_record = tmpdir / "private-owner-authorization.md"
+            rollback_record = tmpdir / "private-rollback-evidence.md"
+            hardware_pack = tmpdir / "private-hardware-evidence.md"
+            missing_policy = tmpdir / "private-audit-export-policy.md"
+            owner_record.write_text(valid_owner_authorization(), encoding="utf-8")
+            rollback_record.write_text(valid_rollback_evidence(), encoding="utf-8")
+            hardware_pack.write_text(valid_hardware_pack(), encoding="utf-8")
+            record_path = tmpdir / "private-evidence-record.json"
+            record = valid_record(os.path.realpath(audit_root))
+            record["owner_authorization_ref"] = str(owner_record)
+            record["rollback_ref"] = str(rollback_record)
+            record["hardware_evidence_ref"] = str(hardware_pack)
+            record["audit_export_policy_ref"] = str(missing_policy)
+            record_path.write_text(json.dumps(record), encoding="utf-8")
+
+            proc = subprocess.run(
+                [
+                    sys.executable,
+                    str(SCRIPT),
+                    ARTIFACT_SHA,
+                    str(record_path),
+                    "--check-root-dir",
+                    "--check-private-refs",
+                    "--expected-pr",
+                    "286",
+                ],
+                check=False,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            self.assertEqual(1, proc.returncode)
+            self.assertIn("ERROR: audit_export_policy_ref policy could not be read: FileNotFoundError", proc.stderr)
+            self.assertFalse(str(missing_policy) in proc.stderr, "stderr leaked audit export policy path")
+            self.assertFalse(missing_policy.name in proc.stderr, "stderr leaked audit export policy file name")
+
+    def test_cli_check_private_refs_rejects_invalid_audit_export_policy_without_echoing_private_path(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmpdir = Path(tmp)
+            audit_root = tmpdir / "audit-root"
+            audit_root.mkdir(mode=0o700)
+            owner_record = tmpdir / "private-owner-authorization.md"
+            rollback_record = tmpdir / "private-rollback-evidence.md"
+            hardware_pack = tmpdir / "private-hardware-evidence.md"
+            audit_export_policy = tmpdir / "private-audit-export-policy.md"
+            owner_record.write_text(valid_owner_authorization(), encoding="utf-8")
+            rollback_record.write_text(valid_rollback_evidence(), encoding="utf-8")
+            hardware_pack.write_text(valid_hardware_pack(), encoding="utf-8")
+            audit_export_policy.write_text(
+                valid_audit_export_policy().replace("production_activation=false", "production_activation=true"),
+                encoding="utf-8",
+            )
+            record_path = tmpdir / "private-evidence-record.json"
+            record = valid_record(os.path.realpath(audit_root))
+            record["owner_authorization_ref"] = str(owner_record)
+            record["rollback_ref"] = str(rollback_record)
+            record["hardware_evidence_ref"] = str(hardware_pack)
+            record["audit_export_policy_ref"] = str(audit_export_policy)
+            record_path.write_text(json.dumps(record), encoding="utf-8")
+
+            proc = subprocess.run(
+                [
+                    sys.executable,
+                    str(SCRIPT),
+                    ARTIFACT_SHA,
+                    str(record_path),
+                    "--check-root-dir",
+                    "--check-private-refs",
+                    "--expected-pr",
+                    "286",
+                ],
+                check=False,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            self.assertEqual(1, proc.returncode)
+            self.assertIn("ERROR: audit_export_policy_ref policy: production_activation must be false", proc.stderr)
+            self.assertFalse(str(audit_export_policy) in proc.stderr, "stderr leaked audit export policy path")
+            self.assertFalse(audit_export_policy.name in proc.stderr, "stderr leaked audit export policy file name")
 
 
 if __name__ == "__main__":

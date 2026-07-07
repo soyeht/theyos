@@ -45,7 +45,12 @@ def select_private_ref(provided: str | None, existing: object) -> str:
     return keep_real_ref(existing)
 
 
-def missing_private_ref_fields(owner_ref: str, rollback_ref: str, hardware_ref: str) -> list[str]:
+def missing_private_ref_fields(
+    owner_ref: str,
+    rollback_ref: str,
+    hardware_ref: str,
+    audit_export_policy_ref: str,
+) -> list[str]:
     missing: list[str] = []
     if not owner_ref:
         missing.append("owner_authorization_ref")
@@ -53,6 +58,8 @@ def missing_private_ref_fields(owner_ref: str, rollback_ref: str, hardware_ref: 
         missing.append("rollback_ref")
     if not hardware_ref:
         missing.append("hardware_evidence_ref")
+    if not audit_export_policy_ref:
+        missing.append("audit_export_policy_ref")
     return missing
 
 
@@ -122,6 +129,7 @@ def main() -> int:
     parser.add_argument("--owner-ref", help="private owner authorization reference")
     parser.add_argument("--rollback-ref", help="private rollback artifact reference")
     parser.add_argument("--hardware-ref", help="private T1-T4 hardware evidence reference")
+    parser.add_argument("--audit-export-policy-ref", help="private audit export policy reference")
     args = parser.parse_args()
 
     if not is_full_git_sha(args.artifact_sha):
@@ -132,6 +140,10 @@ def main() -> int:
     owner_ref = select_private_ref(args.owner_ref, existing.get("owner_authorization_ref"))
     rollback_ref = select_private_ref(args.rollback_ref, existing.get("rollback_ref"))
     hardware_ref = select_private_ref(args.hardware_ref, existing.get("hardware_evidence_ref"))
+    audit_export_policy_ref = select_private_ref(
+        args.audit_export_policy_ref,
+        existing.get("audit_export_policy_ref"),
+    )
     audit_root = canonical_private_audit_root(args.audit_root)
 
     record = {
@@ -145,6 +157,7 @@ def main() -> int:
         "owner_authorization_ref": owner_ref,
         "rollback_ref": rollback_ref,
         "hardware_evidence_ref": hardware_ref,
+        "audit_export_policy_ref": audit_export_policy_ref,
         "audit_root": audit_root,
     }
     write_private_record(args.record, record)
@@ -156,7 +169,12 @@ def main() -> int:
 
     print("OK: private T1 preflight evidence draft updated")
     print("OK: private audit root is present with mode 0700")
-    missing_refs = missing_private_ref_fields(owner_ref, rollback_ref, hardware_ref)
+    missing_refs = missing_private_ref_fields(
+        owner_ref,
+        rollback_ref,
+        hardware_ref,
+        audit_export_policy_ref,
+    )
     if missing_refs:
         print("INFO: record remains incomplete until all private refs are supplied")
         print(f"INFO: missing private refs: {', '.join(missing_refs)}")

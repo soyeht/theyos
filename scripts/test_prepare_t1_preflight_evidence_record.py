@@ -58,7 +58,10 @@ class PrepareT1PreflightEvidenceRecordTests(unittest.TestCase):
             self.assertIn("OK: private T1 preflight evidence draft updated", proc.stdout)
             self.assertIn("INFO: record remains incomplete until all private refs are supplied", proc.stdout)
             self.assertIn(
-                "INFO: missing private refs: owner_authorization_ref, rollback_ref, hardware_evidence_ref",
+                (
+                    "INFO: missing private refs: owner_authorization_ref, rollback_ref, "
+                    "hardware_evidence_ref, audit_export_policy_ref"
+                ),
                 proc.stdout,
             )
 
@@ -73,6 +76,7 @@ class PrepareT1PreflightEvidenceRecordTests(unittest.TestCase):
             self.assertEqual("", record["owner_authorization_ref"])
             self.assertEqual("", record["rollback_ref"])
             self.assertEqual("", record["hardware_evidence_ref"])
+            self.assertEqual("", record["audit_export_policy_ref"])
             self.assertEqual(os.path.realpath(audit_root), record["audit_root"])
             self.assertEqual(0o600, stat.S_IMODE(os.lstat(record_path).st_mode))
             self.assertEqual(0o700, stat.S_IMODE(os.lstat(audit_root).st_mode))
@@ -95,6 +99,8 @@ class PrepareT1PreflightEvidenceRecordTests(unittest.TestCase):
                 "rollback-artifact-ref",
                 "--hardware-ref",
                 "hardware-evidence-ref",
+                "--audit-export-policy-ref",
+                "audit-export-policy-ref",
             )
 
             self.assertEqual(0, proc.returncode, proc.stderr)
@@ -117,6 +123,7 @@ class PrepareT1PreflightEvidenceRecordTests(unittest.TestCase):
                         "owner_authorization_ref": "owner-review-ref",
                         "rollback_ref": "<prebuilt-rollback-artifact-ref>",
                         "hardware_evidence_ref": "hardware-evidence-ref",
+                        "audit_export_policy_ref": "audit-export-policy-ref",
                     }
                 ),
                 encoding="utf-8",
@@ -132,6 +139,7 @@ class PrepareT1PreflightEvidenceRecordTests(unittest.TestCase):
             self.assertEqual("owner-review-ref", record["owner_authorization_ref"])
             self.assertEqual("", record["rollback_ref"])
             self.assertEqual("hardware-evidence-ref", record["hardware_evidence_ref"])
+            self.assertEqual("audit-export-policy-ref", record["audit_export_policy_ref"])
             self.assertIn("INFO: missing private refs: rollback_ref", proc.stdout)
 
     def test_cli_does_not_echo_private_values(self) -> None:
@@ -145,6 +153,7 @@ class PrepareT1PreflightEvidenceRecordTests(unittest.TestCase):
                 "owner-private-ref",
                 "rollback-private-ref",
                 "hardware-private-ref",
+                "audit-export-policy-private-ref",
             )
 
             proc = self.run_prepare(
@@ -158,6 +167,8 @@ class PrepareT1PreflightEvidenceRecordTests(unittest.TestCase):
                 private_values[3],
                 "--hardware-ref",
                 private_values[4],
+                "--audit-export-policy-ref",
+                private_values[5],
             )
 
             self.assertEqual(0, proc.returncode, proc.stderr)
