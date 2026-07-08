@@ -667,8 +667,9 @@ mod dev_datapath {
     };
     #[cfg(target_os = "macos")]
     use server_rs::claw_vpn_macos_utun::ClawVpnMacosUtunDevice;
-    use server_rs::claw_vpn_packet_pump::ClawVpnPacketInterface;
+    use server_rs::claw_vpn_packet_pump::{ClawVpnPacketInterface, ClawVpnPacketPumpLoopStopReason};
     use server_rs::claw_vpn_relay_stream::ClawVpnRelayStream;
+    use server_rs::claw_vpn_runtime::ClawVpnRuntimeReport;
     use server_rs::claw_vpn_target_session_runtime::{
         ClawVpnTargetSessionRuntimeError, assemble_claw_vpn_target_session_runtime,
     };
@@ -880,6 +881,17 @@ mod dev_datapath {
         }
     }
 
+    /// Redacted, static label for a pump stop reason. The `IoError` arm ignores
+    /// the embedded error so an io error can never leak an address, endpoint, or
+    /// path into the datapath's stopped-summary evidence line.
+    pub(super) fn stop_reason_label(reason: &ClawVpnPacketPumpLoopStopReason) -> &'static str {
+        match reason {
+            ClawVpnPacketPumpLoopStopReason::DriverStopped => "driver_stopped",
+            ClawVpnPacketPumpLoopStopReason::StepBudgetExhausted => "step_budget_exhausted",
+            ClawVpnPacketPumpLoopStopReason::IoError { .. } => "io_error",
+        }
+    }
+
     async fn pipe_target_session_to_tunnel<S>(
         stream: S,
         mut target_session: TargetSession,
@@ -957,10 +969,9 @@ mod dev_datapath {
             bail!("dev datapath runtime disabled");
         };
         let (target_session, mut wiring) = runtime.into_parts();
-        let runtime_handle = tokio::task::spawn_blocking(move || -> Result<()> {
+        let runtime_handle = tokio::task::spawn_blocking(move || -> Result<ClawVpnRuntimeReport> {
             wiring
                 .run_until_stopped()
-                .map(|_report| ())
                 .map_err(|error| anyhow!("dev datapath runtime stopped: {error:?}"))
         });
 
@@ -975,11 +986,31 @@ mod dev_datapath {
             session_ack.mesh_ipv6_present()
         );
         let pipe_result = pipe_target_session_to_tunnel(stream, target_session).await;
-        let runtime_result = runtime_handle
+        let runtime_report = runtime_handle
             .await
-            .map_err(|_| anyhow!("dev datapath runtime join failed"))?;
+            .map_err(|_| anyhow!("dev datapath runtime join failed"))??;
         pipe_result?;
-        runtime_result
+
+        // Authoritative pump/teardown evidence (redacted): plain integer counters
+        // plus a STATIC stop-reason label. No session id / mesh / endpoint is
+        // printed, and the stop reason is reduced to a &'static str so an embedded
+        // io error can never leak an address, endpoint, or path into this line.
+        let pump_stats = runtime_report.pump_report().stats();
+        println!(
+            "OK: dev IpTunnel datapath stopped \
+             (runner_interface_to_relay_forwarded={}, \
+             runner_interface_to_relay_dropped={}, \
+             runner_relay_to_interface_forwarded={}, \
+             runner_relay_to_interface_dropped={}, \
+             runner_total_steps={}, runner_stop_reason={})",
+            pump_stats.interface_to_relay_forwarded(),
+            pump_stats.interface_to_relay_dropped(),
+            pump_stats.relay_to_interface_forwarded(),
+            pump_stats.relay_to_interface_dropped(),
+            pump_stats.total_steps(),
+            stop_reason_label(runtime_report.pump_report().stop_reason()),
+        );
+        Ok(())
     }
 
     pub(super) async fn run_device_datapath(
@@ -1786,6 +1817,35 @@ mod tests {
             )
             .is_ok()
         );
+    }
+
+    #[cfg(feature = "dev_t1_datapath")]
+    #[test]
+    fn datapath_stop_reason_label_is_static_and_never_echoes_error_detail() {
+        use server_rs::claw_vpn_packet_pump::{
+            ClawVpnPacketPumpDirection, ClawVpnPacketPumpError, ClawVpnPacketPumpLoopStopReason,
+        };
+
+        assert_eq!(
+            dev_datapath::stop_reason_label(&ClawVpnPacketPumpLoopStopReason::DriverStopped),
+            "driver_stopped"
+        );
+        assert_eq!(
+            dev_datapath::stop_reason_label(&ClawVpnPacketPumpLoopStopReason::StepBudgetExhausted),
+            "step_budget_exhausted"
+        );
+        // The IoError variant must reduce to a static label that cannot carry the
+        // embedded io error's message (which could otherwise leak an endpoint/path).
+        let io_reason = ClawVpnPacketPumpLoopStopReason::IoError {
+            direction: ClawVpnPacketPumpDirection::InterfaceToRelay,
+            error: ClawVpnPacketPumpError::RelayRead {
+                source: std::io::Error::other("SECRET-ENDPOINT-198.51.100.7:49152"),
+            },
+        };
+        let label = dev_datapath::stop_reason_label(&io_reason);
+        assert_eq!(label, "io_error");
+        assert!(!label.contains("SECRET-ENDPOINT"));
+        assert!(!label.contains("198.51.100.7"));
     }
 
     #[cfg(feature = "dev_t1_datapath")]

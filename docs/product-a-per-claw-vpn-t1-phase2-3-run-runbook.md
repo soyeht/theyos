@@ -45,7 +45,6 @@ the record shape (Phase 3 tooling) — none of those touch a host.
 | Pin | Value |
 |---|---|
 | Dev-host ack | `dev-host T1-T4 only; no production activation` |
-| Public-relay ack (only if the relay endpoint is non-loopback) | `dev-host public relay dial allowed; no production activation` |
 | Required env | `THEYOS_T1_DEV_DATAPATH=1` and `THEYOS_FORCE_SOFTWARE_KEYS=1` |
 | Loopback relay endpoint | `127.0.0.1:49152` |
 | IPv4 pool (doc range, RFC 2544) | `198.18.0.0/24` (device `.1`, claw `.2` for session index 0) |
@@ -67,20 +66,23 @@ It wires the four dev bins so both ends meet at the same rendezvous slot:
 
 ### Step 0 — build the dev bins (no host mutation)
 
+Run every command from the repo root. Build with the feature into
+`admin/rust/target/debug`:
+
 ```sh
-cd admin/rust
-cargo build --features dev_t1_datapath \
+cargo build --manifest-path admin/rust/Cargo.toml --features dev_t1_datapath \
   -p server-rs --bin t1_iptunnel_claw_dev --bin relay_stream_relay_dev
-cargo build --features dev_t1_datapath -p t1-iptunnel-dev-runner-rs
+cargo build --manifest-path admin/rust/Cargo.toml --features dev_t1_datapath \
+  -p t1-iptunnel-dev-runner-rs
 ```
 
-Point the script at the built binaries with `--bin-dir` (defaults documented in
-the script header).
+The examples below pass `--bin-dir admin/rust/target/debug` so the script uses
+these debug bins (its default looks under `target/release`).
 
 ### Step 1 — generate the Device session config (no host mutation)
 
 ```sh
-target/debug/t1-iptunnel-dev-runner gen-device-config \
+admin/rust/target/debug/t1-iptunnel-dev-runner gen-device-config \
   --platform "$(uname | tr '[:upper:]' '[:lower:]' | sed 's/darwin/macos/')" \
   --pool-network 198.18.0.0/24 \
   --out /path/to/private/device-session.json
@@ -94,6 +96,7 @@ the private address values are never printed. Keep the file private (it is a
 
 ```sh
 scripts/run-t1-dev-datapath.sh --dry-run \
+  --bin-dir admin/rust/target/debug \
   --claw-id <claw-id> --guest-device-pub <64-hex> \
   --device-secret-file /path/to/private/device-secret.hex \
   --config-file /path/to/private/device-session.json
@@ -112,15 +115,19 @@ or config files are written). Review the printed plan against the pins above.
 export THEYOS_T1_DEV_DATAPATH=1
 export THEYOS_FORCE_SOFTWARE_KEYS=1
 scripts/run-t1-dev-datapath.sh --execute \
+  --bin-dir admin/rust/target/debug \
   --claw-id <claw-id> --guest-device-pub <64-hex> \
   --device-secret-file /path/to/private/device-secret.hex \
   --config-file /path/to/private/device-session.json
 ```
 
 `--execute` is refused (non-zero) unless both envs and the exact dev-host ack are
-present, and the `prod_guard` passes. For an off-loopback dev relay (e.g. a
-Tailscale-transport checkpoint), also pass the public-relay ack; otherwise keep
-the loopback endpoint.
+present, and the `prod_guard` passes. This runbook covers the **loopback** relay
+path only (`127.0.0.1:49152`). An off-loopback dev relay (e.g. a
+Tailscale-transport checkpoint) needs the runner's second public-relay ack, which
+the Item C script does not yet expose or gate before launch; that variant is
+deferred — see
+[`followup-t1-orchestration-off-loopback-relay-ack.md`](followup-t1-orchestration-off-loopback-relay-ack.md).
 
 ## T1–T4 observation checklist (what to capture)
 
@@ -140,9 +147,12 @@ prints a startup line `OK: dev IpTunnel datapath started (... runner_route_insta
 That line reports the *plan* at datapath start — `runner_route_installed=true` is
 printed before the asynchronous route install is confirmed. **Do not** use it as
 route evidence. The authoritative route/interface evidence is the T1/T3 system
-snapshots above; the authoritative pump/teardown evidence is the runtime's final
-report (forwarded/dropped counts, stop reason) captured from the run's own
-output/logs. Treat the startup booleans only as a "datapath started" marker.
+snapshots above; the authoritative pump/teardown evidence is the runner's
+**end-of-run** line `OK: dev IpTunnel datapath stopped (runner_interface_to_relay_forwarded=… runner_relay_to_interface_forwarded=… runner_total_steps=… runner_stop_reason=…)`,
+captured from the run's own stdout. That line carries only integer counters and a
+static stop-reason label (`driver_stopped` / `step_budget_exhausted` / `io_error`)
+— never a session id, mesh address, or endpoint. Treat the startup booleans only
+as a "datapath started" marker.
 
 **No value echo.** Public evidence must not contain real hostnames, account or
 device names, LAN/tailnet IPs, relay endpoints, secrets, local file paths, or
