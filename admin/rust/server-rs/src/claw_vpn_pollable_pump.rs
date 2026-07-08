@@ -263,8 +263,10 @@ impl ClawVpnPollablePump {
 
     /// One non-blocking pass over both directions. Returns `Ok(true)` if any
     /// byte moved or any policy decision was made, `Ok(false)` if everything
-    /// was idle, `Err(reason)` on a fatal condition.
-    fn service_once(
+    /// was idle, `Err(reason)` on a fatal condition. Exposed to the crate so a
+    /// two-ended test can interleave two pumps deterministically without
+    /// threads or a real `poll()`.
+    pub(crate) fn service_once(
         &mut self,
         interface: &mut impl ClawVpnPollablePacketInterface,
         relay: &mut impl ClawVpnPollablePacketRelay,
@@ -454,20 +456,28 @@ mod tests {
         }
     }
 
-    fn session_core_and_addrs() -> (ClawVpnAgentSessionCore, ClawVpnSessionAddrs) {
-        let key =
-            ClawVpnAclKey::try_new("member-m1", P256Keypair::generate().public(), "claw-a").unwrap();
+    fn build_session_core(
+        side: ClawVpnDatapathSide,
+    ) -> (ClawVpnAgentSessionCore, ClawVpnSessionAddrs) {
+        // Fixed key so the device and claw sides of the two-ended test resolve
+        // to the same session and matching addresses.
+        let member_key = P256Keypair::from_secret_scalar(&[0x33; 32]).unwrap();
+        let key = ClawVpnAclKey::try_new("member-m1", member_key.public(), "claw-a").unwrap();
         let mut acl = ClawVpnAcl::new();
         assert!(acl.grant(key.clone()));
         let pool = ClawVpnIpv4Pool::try_new(Ipv4Addr::new(198, 18, 0, 0), 24).unwrap();
         let registry = ClawVpnSessionRegistry::new(acl, pool);
-        let mut core = ClawVpnAgentCore::new(ClawVpnDatapathSide::Device, registry);
+        let mut core = ClawVpnAgentCore::new(side, registry);
         let (session, open_event) = core.open_with_audit(&key);
         let session = session.unwrap();
         assert_eq!(open_event.reason(), ClawVpnAuditReason::SessionOpened);
         let addrs = session.addrs();
         let session_core = core.into_session_core(session.id()).unwrap();
         (session_core, addrs)
+    }
+
+    fn session_core_and_addrs() -> (ClawVpnAgentSessionCore, ClawVpnSessionAddrs) {
+        build_session_core(ClawVpnDatapathSide::Device)
     }
 
     fn ipv4_packet(src: Ipv4Addr, dst: Ipv4Addr) -> Vec<u8> {
@@ -537,6 +547,11 @@ mod tests {
             set_nonblocking(control.as_raw_fd());
             (Self { pump }, control)
         }
+
+        fn from_stream(pump: UnixStream) -> Self {
+            set_nonblocking(pump.as_raw_fd());
+            Self { pump }
+        }
     }
 
     impl io::Read for TestRelay {
@@ -564,11 +579,10 @@ mod tests {
     fn drain_frames(mut stream: &UnixStream) -> Vec<TunnelFrame> {
         let mut reader = ClawVpnNonblockingFrameReader::new();
         let mut frames = Vec::new();
-        loop {
-            match reader.poll_read(&mut stream).expect("relay decode") {
-                ClawVpnFrameReadProgress::Frame(frame) => frames.push(frame),
-                ClawVpnFrameReadProgress::Advanced | ClawVpnFrameReadProgress::Idle => break,
-            }
+        while let ClawVpnFrameReadProgress::Frame(frame) =
+            reader.poll_read(&mut stream).expect("relay decode")
+        {
+            frames.push(frame);
         }
         frames
     }
@@ -761,6 +775,61 @@ mod tests {
             iface_control.recv(&mut buf).unwrap(),
             20,
             "one packet delivered to the interface"
+        );
+    }
+
+    // (8) Two-ended, end-to-end, asymmetric: a device pump and a claw pump
+    // wired back-to-back over a real relay socketpair forward both ways (2 one
+    // direction, 1 the other) with counters > 1 and no IoError — the case the
+    // old symmetric-preload two-ended test could not exercise.
+    #[test]
+    fn two_ended_asymmetric_forwards_both_ways() {
+        let (device_core, addrs) = build_session_core(ClawVpnDatapathSide::Device);
+        let (claw_core, _claw_addrs) = build_session_core(ClawVpnDatapathSide::Claw);
+        let mut device_pump = ClawVpnPollablePump::new(device_core);
+        let mut claw_pump = ClawVpnPollablePump::new(claw_core);
+
+        let (mut device_iface, device_ctl) = TestInterface::pair();
+        let (mut claw_iface, claw_ctl) = TestInterface::pair();
+        let (relay_a, relay_b) = UnixStream::pair().unwrap();
+        let mut device_relay = TestRelay::from_stream(relay_a);
+        let mut claw_relay = TestRelay::from_stream(relay_b);
+
+        for _ in 0..2 {
+            device_ctl
+                .send(&ipv4_packet(addrs.device(), addrs.claw()))
+                .unwrap();
+        }
+        claw_ctl
+            .send(&ipv4_packet(addrs.claw(), addrs.device()))
+            .unwrap();
+
+        let mut device_stats = ClawVpnPollablePumpStats::default();
+        let mut claw_stats = ClawVpnPollablePumpStats::default();
+        for _ in 0..400 {
+            device_pump
+                .service_once(&mut device_iface, &mut device_relay, &mut device_stats)
+                .expect("device pump never fatal");
+            claw_pump
+                .service_once(&mut claw_iface, &mut claw_relay, &mut claw_stats)
+                .expect("claw pump never fatal");
+        }
+
+        assert_eq!(device_stats.interface_to_relay_forwarded(), 2);
+        assert_eq!(device_stats.relay_to_interface_forwarded(), 1);
+        assert_eq!(claw_stats.interface_to_relay_forwarded(), 1);
+        assert_eq!(claw_stats.relay_to_interface_forwarded(), 2);
+
+        let mut buf = [0u8; 2048];
+        assert_eq!(
+            claw_ctl.recv(&mut buf).unwrap(),
+            20,
+            "a device→claw packet arrived at the claw edge"
+        );
+        assert_eq!(
+            device_ctl.recv(&mut buf).unwrap(),
+            20,
+            "the claw→device packet arrived at the device edge"
         );
     }
 }

@@ -390,7 +390,6 @@ mod tests {
 
     #[test]
     fn reader_treats_eof_mid_frame_as_fatal() {
-        let wire = encode_on_wire(&sample_frame());
         // Serve all but the last byte, then EOF (Ok(0)).
         struct EofAfter {
             chunk: Vec<u8>,
@@ -407,6 +406,8 @@ mod tests {
                 Ok(n)
             }
         }
+
+        let wire = encode_on_wire(&sample_frame());
         let mut reader = ClawVpnNonblockingFrameReader::new();
         let mut source = EofAfter {
             chunk: wire[..wire.len() - 1].to_vec(),
