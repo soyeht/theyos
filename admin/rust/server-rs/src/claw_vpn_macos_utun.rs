@@ -211,7 +211,13 @@ fn write_utun_ipv4_packet_nonblocking(
     let frame = encode_utun_ipv4_frame(packet)?;
     match writer.write(&frame) {
         Ok(n) if n == frame.len() => Ok(true),
-        Ok(0) => Ok(false),
+        // A non-empty frame accepted as zero bytes is not `WouldBlock`
+        // backpressure — it is a write-zero anomaly. Keep it fatal so the R->I
+        // direction fails closed instead of quietly retrying (@safia).
+        Ok(0) => Err(io::Error::new(
+            io::ErrorKind::WriteZero,
+            "utun accepted zero bytes of a packet (not backpressure)",
+        )),
         Ok(_) => Err(io::Error::other(
             "utun accepted only part of a packet (non-atomic write)",
         )),

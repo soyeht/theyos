@@ -222,18 +222,16 @@ fn read_linux_tun_packet_nonblocking(
     buf: &mut [u8],
 ) -> io::Result<Option<usize>> {
     for _ in 0..LINUX_TUN_NONBLOCKING_SKIP_LIMIT {
-        match reader.read(buf) {
+        let read = match reader.read(buf) {
             Ok(0) => return Ok(None),
-            Ok(n) => {
-                if buf.first().map(|byte| byte >> 4) == Some(4) {
-                    return Ok(Some(n));
-                }
-                // Non-IPv4 packet — skip it and try the next this cycle.
-                continue;
-            }
+            Ok(n) => n,
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Ok(None),
             Err(error) => return Err(error),
+        };
+        if buf.first().map(|byte| byte >> 4) == Some(4) {
+            return Ok(Some(read));
         }
+        // Non-IPv4 packet — fall through to skip it and read the next this cycle.
     }
     // Too many consecutive non-IPv4 packets this cycle — yield; resume next poll.
     Ok(None)
@@ -248,7 +246,13 @@ fn write_linux_tun_packet_nonblocking(
 ) -> io::Result<bool> {
     match writer.write(packet) {
         Ok(n) if n == packet.len() => Ok(true),
-        Ok(0) => Ok(false),
+        // A non-empty packet accepted as zero bytes is not `WouldBlock`
+        // backpressure — it is a write-zero anomaly. Keep it fatal so the R->I
+        // direction fails closed instead of quietly retrying (@safia).
+        Ok(0) => Err(io::Error::new(
+            io::ErrorKind::WriteZero,
+            "linux tun accepted zero bytes of a packet (not backpressure)",
+        )),
         Ok(_) => Err(io::Error::other(
             "linux tun accepted only part of a packet (non-atomic write)",
         )),
