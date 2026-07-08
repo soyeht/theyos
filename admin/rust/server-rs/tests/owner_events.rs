@@ -4564,6 +4564,7 @@ fn product_a_per_claw_vpn_dev_config_remains_default_off_and_unwired() {
                 && (line.contains("ClawVpnPacketInterface")
                     || line.contains("ClawVpnPollablePacketInterface"))
                 && !line.contains("ClawVpnPacketPump")
+                && !line.contains("ClawVpnPollablePump")
                 && !line.contains("ClawVpnPacketRelay")
                 && !line.contains("ClawVpnPacketPumpLoop");
             let allowed_relay_stream_packet_relay_adapter = in_relay_stream_module
@@ -4575,6 +4576,7 @@ fn product_a_per_claw_vpn_dev_config_remains_default_off_and_unwired() {
                 && (line.contains("ClawVpnPacketRelay")
                     || line.contains("ClawVpnPollablePacketRelay"))
                 && !line.contains("ClawVpnPacketPump")
+                && !line.contains("ClawVpnPollablePump")
                 && !line.contains("ClawVpnPacketInterface")
                 && !line.contains("ClawVpnPacketPumpLoop");
             let allowed_target_session_relay_stream_adapter =
@@ -4593,6 +4595,7 @@ fn product_a_per_claw_vpn_dev_config_remains_default_off_and_unwired() {
                 && (((line.contains("ClawVpnPacketInterface")
                     || line.contains("ClawVpnPollablePacketInterface"))
                     && !line.contains("ClawVpnPacketPump")
+                    && !line.contains("ClawVpnPollablePump")
                     && !line.contains("ClawVpnPacketRelay")
                     && !line.contains("ClawVpnPacketPumpLoop"))
                     || in_target_session_runtime_tests);
