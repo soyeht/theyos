@@ -1989,7 +1989,14 @@ mod tests {
                 let config =
                     validate_session_config_bytes(device_config_json().as_bytes()).expect("config");
                 let addrs = config.addrs;
-                let device_packet = ipv4_packet(addrs.device(), addrs.claw());
+                // Two DISTINCT device packets (distinct IPv4 identification field,
+                // still valid IPv4 that passes the session policy) so the claw-edge
+                // assertion below cannot be false-greened by an accidental frame
+                // duplication (@alaine).
+                let mut device_packet_1 = ipv4_packet(addrs.device(), addrs.claw());
+                device_packet_1[4..6].copy_from_slice(&0xA1u16.to_be_bytes());
+                let mut device_packet_2 = ipv4_packet(addrs.device(), addrs.claw());
+                device_packet_2[4..6].copy_from_slice(&0xA2u16.to_be_bytes());
                 let claw_packet = ipv4_packet(addrs.claw(), addrs.device());
                 let claw_runtime_handles: ClawRuntimeHandles =
                     Arc::new(Mutex::new(Vec::new()));
@@ -2054,14 +2061,14 @@ mod tests {
 
                 let (device_iface, device_peer) =
                     PollableMockInterface::paired().expect("device interface pair");
-                // Asymmetric, off the old symmetric 1-each preload: the device
-                // side bursts TWO packets while the claw side sends ONE, so both
+                // Asymmetric, off the old symmetric 1-each preload: the device side
+                // bursts TWO distinct packets while the claw side sends ONE, so both
                 // pollable pumps must forward uneven traffic without stalling.
                 device_peer
-                    .send(&device_packet)
+                    .send(&device_packet_1)
                     .expect("inject the first device packet");
                 device_peer
-                    .send(&device_packet)
+                    .send(&device_packet_2)
                     .expect("inject the second device packet");
                 let device_datapath_outcome = dev_datapath::run_device_datapath_with_test_inputs(
                     &offer,
@@ -2119,22 +2126,28 @@ mod tests {
                 while let Ok(n) = claw_peer.recv(&mut claw_buf) {
                     claw_received.push(claw_buf[..n].to_vec());
                 }
-                // Both pollable pumps forwarded uneven traffic without stalling: the
-                // device interface got the single claw packet, and the claw interface
-                // got BOTH device packets (authoritative count > 1 — the case a
-                // symmetric 1-each preload would have masked).
-                assert!(
-                    device_received.contains(&claw_packet),
-                    "device interface must receive the claw packet from the pollable datapath"
+                // Both pollable pumps forwarded uneven traffic without stalling. The
+                // claw interface got EXACTLY the two DISTINCT device packets (not a
+                // duplicated single frame — the false-green a symmetric 1-each preload
+                // would have masked), and the device interface got exactly the one
+                // claw packet. Exact counts + distinct identity, no extra.
+                assert_eq!(
+                    device_received,
+                    vec![claw_packet.clone()],
+                    "device interface must receive exactly the one claw packet, got {} packet(s)",
+                    device_received.len()
                 );
-                let claw_device_packets = claw_received
-                    .iter()
-                    .filter(|packet| *packet == &device_packet)
-                    .count();
                 assert!(
-                    claw_device_packets >= 2,
-                    "claw interface must receive BOTH device packets (asymmetric burst), \
-                     got {claw_device_packets}"
+                    claw_received.contains(&device_packet_1)
+                        && claw_received.contains(&device_packet_2),
+                    "claw interface must receive BOTH distinct device packets"
+                );
+                assert_eq!(
+                    claw_received.len(),
+                    2,
+                    "claw interface must receive exactly the two device packets (no dup/extra), \
+                     got {}",
+                    claw_received.len()
                 );
             })
             .await
