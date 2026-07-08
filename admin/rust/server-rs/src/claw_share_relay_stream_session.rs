@@ -56,8 +56,12 @@ impl RelayStreamOfferSession {
         for b in &hash {
             let _ = write!(session_id, "{b:02x}");
         }
+        // The `c1a0` hextet is a stable, human-recognizable "claw" label rendered
+        // in VALID hex. The earlier `c1aw` spelling is not a hex hextet, so it does
+        // not parse as an IPv6 address — and the T1 IpTunnel guest's session-ack
+        // check parses this field strictly. Placeholder only, never routed.
         let mesh_ipv6 = format!(
-            "fd00:c1aw::{:02x}{:02x}:{:02x}{:02x}:{:02x}{:02x}:{:02x}{:02x}",
+            "fd00:c1a0::{:02x}{:02x}:{:02x}{:02x}:{:02x}{:02x}:{:02x}{:02x}",
             hash[0], hash[1], hash[2], hash[3], hash[4], hash[5], hash[6], hash[7],
         );
         Ok(Self {
@@ -338,8 +342,14 @@ mod tests {
         assert_eq!(s1.session_id(), s2.session_id());
         // Non-truncated mesh_ipv6: 4 hextet groups after `::` (8 hash bytes) vs the
         // Device path's 2 groups — 6 colons total.
-        assert!(s1.mesh_ipv6().starts_with("fd00:c1aw::"));
+        assert!(s1.mesh_ipv6().starts_with("fd00:c1a0::"));
         assert_eq!(s1.mesh_ipv6().matches(':').count(), 6);
+        // Regression guard: the mesh placeholder MUST parse as a real IPv6 address.
+        // The T1 IpTunnel guest rejects a malformed session-ack mesh address, so an
+        // invalid-hex placeholder (e.g. the earlier `c1aw`) would break the datapath.
+        s1.mesh_ipv6()
+            .parse::<std::net::Ipv6Addr>()
+            .expect("mesh_ipv6 placeholder must be a valid IPv6 address");
         // Different offer → different session id.
         let other = RelayStreamOfferSession::from_offer(&public_offer(now + 60)).unwrap();
         assert_ne!(s1.session_id(), other.session_id());

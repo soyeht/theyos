@@ -556,6 +556,7 @@ mod dev_datapath {
     };
     #[cfg(target_os = "macos")]
     use server_rs::claw_vpn_macos_utun::ClawVpnMacosUtunDevice;
+    use server_rs::claw_vpn_packet_pump::ClawVpnPacketInterface;
     use server_rs::claw_vpn_relay_stream::ClawVpnRelayStream;
     use server_rs::claw_vpn_target_session_runtime::{
         ClawVpnTargetSessionRuntimeError, assemble_claw_vpn_target_session_runtime,
@@ -813,22 +814,32 @@ mod dev_datapath {
         }
     }
 
-    pub(super) async fn run_device_datapath(
+    async fn run_device_datapath_with_inputs<I>(
         offer: &RelayStreamOfferContract,
         device_key: &P256Keypair,
         config: &ValidatedDevRunnerSessionConfig,
         now_unix: u64,
-    ) -> Result<()> {
+        runtime_config: ClawVpnRuntimeWiringConfig,
+        io_timeout: Duration,
+        build_runtime_inputs: impl FnOnce(
+            &ValidatedDevRunnerSessionConfig,
+            ClawVpnRuntimeWiringContext,
+            ClawVpnRelayStream<StdUnixStream>,
+        ) -> io::Result<ClawVpnRuntimeWiringInputs<I, ClawVpnRelayStream<StdUnixStream>>>,
+    ) -> Result<()>
+    where
+        I: ClawVpnPacketInterface + Send + 'static,
+    {
         validate_host_platform(config)?;
         let session_core = device_session_core(offer, device_key, config)?;
         let (session_ack, stream): (super::DevRunnerSessionAck, OpenedIpTunnelStream) =
             connect_open_iptunnel_session(offer, device_key, now_unix).await?;
 
         let runtime = assemble_claw_vpn_target_session_runtime(
-            enabled_runtime_config(),
-            DEV_TARGET_SESSION_IO_TIMEOUT,
+            runtime_config,
+            io_timeout,
             move || session_core,
-            |context, relay| build_inputs(config, context, relay),
+            |context, relay| build_runtime_inputs(config, context, relay),
         )
         .map_err(|error| map_runtime_error(&error))?;
         let Some(runtime) = runtime else {
@@ -858,6 +869,53 @@ mod dev_datapath {
             .map_err(|_| anyhow!("dev datapath runtime join failed"))?;
         pipe_result?;
         runtime_result
+    }
+
+    pub(super) async fn run_device_datapath(
+        offer: &RelayStreamOfferContract,
+        device_key: &P256Keypair,
+        config: &ValidatedDevRunnerSessionConfig,
+        now_unix: u64,
+    ) -> Result<()> {
+        run_device_datapath_with_inputs(
+            offer,
+            device_key,
+            config,
+            now_unix,
+            enabled_runtime_config(),
+            DEV_TARGET_SESSION_IO_TIMEOUT,
+            build_inputs,
+        )
+        .await
+    }
+
+    #[cfg(test)]
+    pub(super) async fn run_device_datapath_with_test_inputs<I>(
+        offer: &RelayStreamOfferContract,
+        device_key: &P256Keypair,
+        config: &ValidatedDevRunnerSessionConfig,
+        now_unix: u64,
+        runtime_config: ClawVpnRuntimeWiringConfig,
+        io_timeout: Duration,
+        build_runtime_inputs: impl FnOnce(
+            &ValidatedDevRunnerSessionConfig,
+            ClawVpnRuntimeWiringContext,
+            ClawVpnRelayStream<StdUnixStream>,
+        ) -> io::Result<ClawVpnRuntimeWiringInputs<I, ClawVpnRelayStream<StdUnixStream>>>,
+    ) -> Result<()>
+    where
+        I: ClawVpnPacketInterface + Send + 'static,
+    {
+        run_device_datapath_with_inputs(
+            offer,
+            device_key,
+            config,
+            now_unix,
+            runtime_config,
+            io_timeout,
+            build_runtime_inputs,
+        )
+        .await
     }
 }
 
@@ -1312,9 +1370,8 @@ mod tests {
         secret.push('\u{00e9}');
         assert_eq!(secret.len(), 64);
 
-        let error = match device_secret_from_hex(&secret) {
-            Ok(_) => panic!("non-ascii secret accepted"),
-            Err(error) => error,
+        let Err(error) = device_secret_from_hex(&secret) else {
+            panic!("non-ascii secret accepted");
         };
         let message = format!("{error:#}");
 
@@ -1591,5 +1648,553 @@ mod tests {
             )
             .is_ok()
         );
+    }
+
+    #[cfg(feature = "dev_t1_datapath")]
+    mod dev_datapath_two_end_integration {
+        use super::*;
+
+        use std::collections::{BTreeMap, VecDeque};
+        use std::net::{Ipv4Addr, SocketAddr};
+        use std::path::PathBuf;
+        use std::sync::{Arc, Mutex};
+        use std::time::Duration;
+
+        use household_rs::LoadedIdentity;
+        use household_rs::claw_share::{ClawShareSlotStore, SLOT_ID_LEN};
+        use household_rs::claw_share_data_tunnel::ReplayGuard;
+        use household_rs::household_mesh_log::{
+            MeshLogStore, MeshMembership, ProjectedGroup, ProjectedMemberDevice, ProjectedState,
+        };
+        use household_rs::household_record::HouseholdRecord;
+        use household_rs::ids::{derive_household_id, derive_machine_id};
+        use household_rs::machine_cert::{MachineCert, Platform, SignOptions};
+        use server_rs::claw_share_relay_stream_admission::RelayStreamAdmission;
+        use server_rs::claw_share_relay_stream_issuer_trust::{
+            RelayStreamIssuerTrust, RelayStreamTrustContext,
+        };
+        use server_rs::claw_share_relay_stream_noise::generate_relay_stream_noise_static_keypair;
+        use server_rs::claw_share_relay_stream_responder_params::RelayStreamResponderParams;
+        use server_rs::claw_share_relay_stream_responder_reverse_connect::{
+            RelayStreamResponderReverseConnectConfig,
+            serve_relay_stream_responder_reverse_connect_binding,
+        };
+        use server_rs::claw_share_relay_stream_reverse_connect_binding::bind_relay_stream_reverse_connect_with_ip_tunnel_router;
+        use server_rs::claw_share_relay_stream_target_router::RelayStreamIpTunnelUnavailableRouter;
+        use server_rs::claw_share_relay_stream_trust_context_health::{
+            RelayStreamTrustContextRefreshPolicy, RelayStreamTrustContextRuntime,
+        };
+        use server_rs::claw_share_relay_stream_abuse::RelayAbuseConfig;
+        use server_rs::claw_share_rendezvous_stream_relay_listener::{
+            RendezvousStreamRelayListenerConfig, serve_rendezvous_stream_relay,
+        };
+        use server_rs::claw_vpn_dev_config::ClawVpnDevConfig;
+        use server_rs::claw_vpn_interface_route_plan::{
+            ClawVpnInterfaceName, ClawVpnInterfaceRoutePlatform, ClawVpnInterfaceRouteToolPaths,
+        };
+        use server_rs::claw_vpn_packet_pump::{
+            ClawVpnPacketInterface, ClawVpnPacketPumpProductionDriverBudget,
+        };
+        use server_rs::claw_vpn_runtime::ClawVpnRuntimeStepBudget;
+        use server_rs::claw_vpn_t1_relay_stream_router::{
+            ClawVpnT1RelayStreamAuditSink, ClawVpnT1RelayStreamBuildInputs,
+            ClawVpnT1RelayStreamLaunchRuntime, ClawVpnT1RelayStreamRouterParts,
+            assemble_claw_vpn_t1_relay_stream_router,
+        };
+        use server_rs::claw_vpn_target_session_router::{
+            ClawVpnTargetSessionRouterLaunchError, ClawVpnTargetSessionRouterWiring,
+        };
+        use server_rs::claw_vpn_wiring::{
+            ClawVpnRuntimeWiringConfig, ClawVpnRuntimeWiringInputs,
+        };
+        use server_rs::household_state::HouseholdState;
+        use server_rs::startup_wiring::PerClawVpnT1PreflightEvidence;
+        use tokio::net::TcpListener;
+        use tokio::task::JoinHandle;
+
+        const GROUP_ID: &str = "group-alpha";
+        const GROUP_NAME: &str = "Group Alpha";
+        const MEMBER_ID: &str = "member-alpha";
+        const MEMBER_NPUB: &str = "member-alpha";
+        const CLAW_ID: &str = "claw-alpha";
+        const IPV4_POOL: &str = "198.18.0.0/24";
+
+        // Factored out to satisfy clippy::type_complexity — the runtime handle
+        // list is threaded through several two-ended-test helpers.
+        type ClawRuntimeHandles = Arc<Mutex<Vec<JoinHandle<Result<(), String>>>>>;
+
+        #[derive(Clone, Default)]
+        struct MockPacketInterface {
+            reads: Arc<Mutex<VecDeque<Vec<u8>>>>,
+            writes: Arc<Mutex<Vec<Vec<u8>>>>,
+        }
+
+        impl MockPacketInterface {
+            fn with_packets(packets: Vec<Vec<u8>>, writes: Arc<Mutex<Vec<Vec<u8>>>>) -> Self {
+                Self {
+                    reads: Arc::new(Mutex::new(VecDeque::from(packets))),
+                    writes,
+                }
+            }
+        }
+
+        impl ClawVpnPacketInterface for MockPacketInterface {
+            fn read_packet(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                let packet = self
+                    .reads
+                    .lock()
+                    .expect("mock packet reads lock")
+                    .pop_front()
+                    .unwrap_or_default();
+                let len = packet.len().min(buf.len());
+                buf[..len].copy_from_slice(&packet[..len]);
+                Ok(len)
+            }
+
+            fn write_packet(&mut self, packet: &[u8]) -> std::io::Result<()> {
+                self.writes
+                    .lock()
+                    .expect("mock packet writes lock")
+                    .push(packet.to_vec());
+                Ok(())
+            }
+        }
+
+        #[tokio::test]
+        async fn dev_datapath_two_ends_forward_packets_over_loopback_relay_without_tun() {
+            tokio::time::timeout(Duration::from_secs(10), async {
+                let (relay_addr, relay_handle) = spawn_test_relay().await;
+                let relay_endpoint = relay_endpoint_uri(relay_addr);
+                let owner = key(0x11);
+                let device = key(0x33);
+                let root = key(0xAA);
+                let noise_keypair = generate_relay_stream_noise_static_keypair()
+                    .expect("generate responder noise keypair");
+                let offer = mint_relay_stream_group_offer(
+                    rendezvous_token(),
+                    SlotId([0x99; SLOT_ID_LEN]),
+                    GROUP_ID.to_string(),
+                    MEMBER_ID.to_string(),
+                    device.public(),
+                    CLAW_ID.to_string(),
+                    RelayStreamResource::IpTunnel,
+                    relay_endpoint.clone(),
+                    noise_keypair.public_key().clone(),
+                    NOW + 600,
+                    NOW,
+                    &owner as &dyn IdentityKey,
+                )
+                .expect("mint group IpTunnel offer");
+                let config =
+                    validate_session_config_bytes(device_config_json().as_bytes()).expect("config");
+                let addrs = config.addrs;
+                let device_packet = ipv4_packet(addrs.device(), addrs.claw());
+                let claw_packet = ipv4_packet(addrs.claw(), addrs.device());
+                let device_writes = Arc::new(Mutex::new(Vec::new()));
+                let claw_writes = Arc::new(Mutex::new(Vec::new()));
+                let claw_runtime_handles: ClawRuntimeHandles =
+                    Arc::new(Mutex::new(Vec::new()));
+
+                dev_datapath::validate_dev_datapath_runtime_gates_with_env(
+                    &offer,
+                    DEV_HOST_ACK,
+                    None,
+                    |name| {
+                        matches!(name, DEV_DATAPATH_ENV | DEV_SOFTWARE_KEYS_ENV)
+                            .then(|| "1".to_string())
+                    },
+                )
+                .expect("runtime gates pass with explicit test env");
+
+                let record = household_record(&root, &owner.public());
+                let cert = machine_cert(&root, &owner.public());
+                let projection = group_projection(&offer.payload.guest_device_pub);
+                let trust = RelayStreamIssuerTrust::new({
+                    let record = record.clone();
+                    let cert = cert.clone();
+                    let projection = projection.clone();
+                    move || RelayStreamTrustContext {
+                        record: record.clone(),
+                        cert: cert.clone(),
+                        projection: projection.clone(),
+                    }
+                });
+                let params = RelayStreamResponderParams {
+                    bind_addr: relay_addr,
+                    auth_deadline: Duration::from_secs(2),
+                    idle_timeout: Duration::from_secs(30),
+                    admission: admission(&root, &owner, &record, &cert).await,
+                    noise_keypair,
+                };
+                let claw_router = claw_router(
+                    &relay_endpoint,
+                    &MockPacketInterface::with_packets(
+                        vec![claw_packet.clone()],
+                        Arc::clone(&claw_writes),
+                    ),
+                    &claw_runtime_handles,
+                );
+                let binding = bind_relay_stream_reverse_connect_with_ip_tunnel_router(
+                    Arc::new(offer.clone()),
+                    trust,
+                    record.hh_id.clone(),
+                    Arc::new(ClawShareSlotStore::new()),
+                    Arc::new(ReplayGuard::new()),
+                    RelayStreamIpTunnelUnavailableRouter,
+                    RelayStreamIpTunnelUnavailableRouter,
+                    claw_router,
+                    || NOW,
+                );
+                let claw_task = tokio::spawn(async move {
+                    serve_relay_stream_responder_reverse_connect_binding(
+                        reverse_config(relay_addr),
+                        &binding,
+                        &params,
+                        NOW,
+                    )
+                    .await
+                });
+
+                dev_datapath::run_device_datapath_with_test_inputs(
+                    &offer,
+                    &device,
+                    &config,
+                    NOW,
+                    bounded_runtime_config(2),
+                    Duration::from_secs(2),
+                    {
+                        let device_writes = Arc::clone(&device_writes);
+                        let device_packet = device_packet.clone();
+                        move |_config, context, relay| {
+                            assert_eq!(context.addrs(), addrs);
+                            Ok(mock_runtime_inputs(
+                                MockPacketInterface::with_packets(
+                                    vec![device_packet.clone()],
+                                    Arc::clone(&device_writes),
+                                ),
+                                relay,
+                            ))
+                        }
+                    },
+                )
+                .await
+                .expect("guest datapath exits cleanly");
+
+                claw_task
+                    .await
+                    .expect("claw task joins")
+                    .expect("claw responder exits cleanly");
+                for handle in drain_runtime_handles(&claw_runtime_handles) {
+                    handle
+                        .await
+                        .expect("claw runtime task joins")
+                        .expect("claw runtime exits cleanly");
+                }
+                relay_handle.abort();
+
+                assert!(
+                    device_writes
+                        .lock()
+                        .expect("device writes lock")
+                        .contains(&claw_packet),
+                    "device mock interface must receive the claw packet"
+                );
+                assert!(
+                    claw_writes
+                        .lock()
+                        .expect("claw writes lock")
+                        .contains(&device_packet),
+                    "claw mock interface must receive the device packet"
+                );
+            })
+            .await
+            .expect("two-ended no-net datapath test is bounded");
+        }
+
+        async fn spawn_test_relay() -> (SocketAddr, JoinHandle<()>) {
+            let listener = TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind loopback relay");
+            let addr = listener.local_addr().expect("relay addr");
+            let config = RendezvousStreamRelayListenerConfig {
+                hello_timeout: Duration::from_secs(1),
+                token_ttl: Duration::from_secs(30),
+                max_pending: 8,
+                max_active_connections: 8,
+                reaper_interval: Duration::from_millis(50),
+                splice_idle_timeout: Duration::from_secs(3),
+                splice_max_lifetime: Duration::from_secs(10),
+                abuse: RelayAbuseConfig::default(),
+            };
+            (addr, serve_rendezvous_stream_relay(listener, config))
+        }
+
+        fn relay_endpoint_uri(addr: SocketAddr) -> String {
+            format!("relay-stream://{}:{}", addr.ip(), addr.port())
+        }
+
+        fn reverse_config(relay_addr: SocketAddr) -> RelayStreamResponderReverseConnectConfig {
+            RelayStreamResponderReverseConnectConfig {
+                relay_addr,
+                connect_timeout: Duration::from_secs(2),
+                hello_timeout: Duration::from_secs(2),
+                allow_non_loopback_relay_addr: false,
+            }
+        }
+
+        fn device_config_json() -> String {
+            format!(
+                r#"{{
+                    "schema": "{DEV_RUNNER_SESSION_CONFIG_SCHEMA}",
+                    "scope": "{DEV_RUNNER_SESSION_CONFIG_SCOPE}",
+                    "production_activation": false,
+                    "platform": "{}",
+                    "local_side": "device",
+                    "device_ipv4": "198.18.0.1",
+                    "claw_ipv4": "198.18.0.2",
+                    "claw_route_prefix_len": 32,
+                    "mtu": 1280
+                }}"#,
+                host_platform_name()
+            )
+        }
+
+        fn host_platform_name() -> &'static str {
+            #[cfg(target_os = "linux")]
+            {
+                "linux"
+            }
+            #[cfg(target_os = "macos")]
+            {
+                "macos"
+            }
+            #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+            {
+                "unsupported"
+            }
+        }
+
+        fn household_record(root: &P256Keypair, owner_pub: &P256PublicKey) -> HouseholdRecord {
+            HouseholdRecord {
+                version: HouseholdRecord::SCHEMA_VERSION,
+                hh_id: derive_household_id(&root.public()),
+                hh_pub: root.public(),
+                name: "claw-dev".to_string(),
+                created_at: NOW,
+                shamir_k: 1,
+                shamir_n: 1,
+                members: vec![derive_machine_id(owner_pub)],
+                is_follower: false,
+            }
+        }
+
+        fn machine_cert(root: &P256Keypair, owner_pub: &P256PublicKey) -> MachineCert {
+            MachineCert::sign(
+                root,
+                owner_pub,
+                &SignOptions {
+                    hh_id: derive_household_id(&root.public()),
+                    hostname: "claw-dev-mac-alpha".to_string(),
+                    platform: Platform::Macos,
+                    joined_at: NOW,
+                },
+            )
+            .expect("sign machine cert")
+        }
+
+        fn group_projection(member_device_pub: &P256PublicKey) -> ProjectedState {
+            let mut projection = ProjectedState::default();
+            projection.groups.insert(
+                GROUP_ID.to_string(),
+                ProjectedGroup {
+                    group_id: GROUP_ID.to_string(),
+                    name: GROUP_NAME.to_string(),
+                    members: BTreeMap::from([(MEMBER_ID.to_string(), MeshMembership::Active)]),
+                    member_labels: BTreeMap::new(),
+                    granted_claws: BTreeMap::from([(CLAW_ID.to_string(), MeshMembership::Active)]),
+                    revision: 1,
+                },
+            );
+            projection.member_devices.insert(
+                MEMBER_ID.to_string(),
+                BTreeMap::from([(
+                    member_device_pub.as_bytes().to_vec(),
+                    ProjectedMemberDevice {
+                        participant_npub: MEMBER_NPUB.to_string(),
+                        status: MeshMembership::Active,
+                    },
+                )]),
+            );
+            projection
+        }
+
+        async fn admission(
+            root: &P256Keypair,
+            owner: &P256Keypair,
+            record: &HouseholdRecord,
+            cert: &MachineCert,
+        ) -> RelayStreamAdmission {
+            let household = HouseholdState::loaded(Arc::new(LoadedIdentity {
+                record: record.clone(),
+                cert: cert.clone(),
+                hh_priv: None,
+                m_priv: Box::new(key_from_public_seed(owner)),
+                backing: "software",
+            }));
+            let _ = root;
+            let policy = RelayStreamTrustContextRefreshPolicy::new(Duration::from_secs(3_600), 3)
+                .expect("trust refresh policy");
+            let runtime =
+                RelayStreamTrustContextRuntime::load(&household, &MeshLogStore::new(), NOW, policy)
+                    .await
+                    .expect("load trust runtime");
+            RelayStreamAdmission::new(Arc::new(runtime))
+        }
+
+        fn key_from_public_seed(owner: &P256Keypair) -> P256Keypair {
+            if owner.public() == key(0x11).public() {
+                key(0x11)
+            } else {
+                key(0x12)
+            }
+        }
+
+        fn claw_router(
+            relay_endpoint: &str,
+            interface: &MockPacketInterface,
+            runtime_handles: &ClawRuntimeHandles,
+        ) -> server_rs::claw_vpn_t1_relay_stream_router::ClawVpnT1RelayStreamBoxedRouter<
+            MockPacketInterface,
+        > {
+            let endpoint = relay_endpoint.to_string();
+            let status = assemble_claw_vpn_t1_relay_stream_router(
+                move || {
+                    ClawVpnDevConfig::from_values(
+                        Some("1"),
+                        None,
+                        Some(endpoint.as_str()),
+                        Some(IPV4_POOL),
+                        Some("1"),
+                        Some("1"),
+                    )
+                },
+                || PerClawVpnT1PreflightEvidence::new(true, true, true),
+                |_config| {
+                    ClawVpnT1RelayStreamRouterParts::new(
+                        bounded_runtime_config(2),
+                        Duration::from_secs(2),
+                        claw_build_inputs(interface.clone()),
+                        claw_runtime_launcher(Arc::clone(runtime_handles)),
+                        noop_audit_sink(),
+                    )
+                },
+            );
+            status
+                .into_ready()
+                .map(|(_mode, router)| router)
+                .expect("dev T1 router ready")
+        }
+
+        fn claw_build_inputs(
+            interface: MockPacketInterface,
+        ) -> ClawVpnT1RelayStreamBuildInputs<MockPacketInterface> {
+            Box::new(move |_config, _target, _context, relay| {
+                Ok(mock_runtime_inputs(interface.clone(), relay))
+            })
+        }
+
+        fn claw_runtime_launcher(
+            runtime_handles: ClawRuntimeHandles,
+        ) -> ClawVpnT1RelayStreamLaunchRuntime<MockPacketInterface> {
+            Box::new(move |mut wiring: ClawVpnTargetSessionRouterWiring<MockPacketInterface>| {
+                let handle = tokio::task::spawn_blocking(move || {
+                    wiring
+                        .run_until_stopped()
+                        .map(|_report| ())
+                        .map_err(|error| format!("{error:?}"))
+                });
+                runtime_handles
+                    .lock()
+                    .expect("runtime handles lock")
+                    .push(handle);
+                Ok::<(), ClawVpnTargetSessionRouterLaunchError>(())
+            })
+        }
+
+        fn noop_audit_sink() -> ClawVpnT1RelayStreamAuditSink {
+            Box::new(|_event| Ok(()))
+        }
+
+        fn bounded_runtime_config(max_steps: usize) -> ClawVpnRuntimeWiringConfig {
+            ClawVpnRuntimeWiringConfig::new(
+                true,
+                ClawVpnRuntimeStepBudget::new(max_steps).expect("runtime step budget"),
+                ClawVpnPacketPumpProductionDriverBudget::new(
+                    max_steps,
+                    Duration::from_secs(5),
+                    max_steps,
+                    Duration::from_secs(1),
+                )
+                .expect("driver budget"),
+            )
+        }
+
+        fn mock_runtime_inputs(
+            interface: MockPacketInterface,
+            relay: server_rs::claw_vpn_relay_stream::ClawVpnRelayStream<
+                std::os::unix::net::UnixStream,
+            >,
+        ) -> ClawVpnRuntimeWiringInputs<
+            MockPacketInterface,
+            server_rs::claw_vpn_relay_stream::ClawVpnRelayStream<
+                std::os::unix::net::UnixStream,
+            >,
+        > {
+            ClawVpnRuntimeWiringInputs {
+                route_platform: host_route_platform(),
+                interface_name: ClawVpnInterfaceName::new("t1mock0").expect("interface name"),
+                route_tool_paths: true_tool_paths(),
+                interface,
+                relay,
+            }
+        }
+
+        fn host_route_platform() -> ClawVpnInterfaceRoutePlatform {
+            #[cfg(target_os = "linux")]
+            {
+                ClawVpnInterfaceRoutePlatform::Linux
+            }
+            #[cfg(target_os = "macos")]
+            {
+                ClawVpnInterfaceRoutePlatform::Macos
+            }
+            #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+            {
+                panic!("T1 dev datapath test supports only linux/macos")
+            }
+        }
+
+        fn true_tool_paths() -> ClawVpnInterfaceRouteToolPaths {
+            let path = PathBuf::from("/usr/bin/true");
+            ClawVpnInterfaceRouteToolPaths::try_new(&path, &path, &path)
+                .expect("true tool paths")
+        }
+
+        fn ipv4_packet(src: Ipv4Addr, dst: Ipv4Addr) -> Vec<u8> {
+            let mut packet = vec![0u8; 20];
+            packet[0] = 0x45;
+            packet[2..4].copy_from_slice(&20u16.to_be_bytes());
+            packet[8] = 64;
+            packet[9] = 6;
+            packet[12..16].copy_from_slice(&src.octets());
+            packet[16..20].copy_from_slice(&dst.octets());
+            packet
+        }
+
+        fn drain_runtime_handles(
+            handles: &ClawRuntimeHandles,
+        ) -> Vec<JoinHandle<Result<(), String>>> {
+            std::mem::take(&mut *handles.lock().expect("runtime handles lock"))
+        }
     }
 }
