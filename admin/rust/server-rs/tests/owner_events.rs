@@ -3814,6 +3814,7 @@ fn product_a_per_claw_vpn_dev_config_remains_default_off_and_unwired() {
     let config_path = server_src_dir.join("claw_vpn_dev_config.rs");
     let interface_route_plan_path = server_src_dir.join("claw_vpn_interface_route_plan.rs");
     let packet_pump_path = server_src_dir.join("claw_vpn_packet_pump.rs");
+    let pollable_pump_path = server_src_dir.join("claw_vpn_pollable_pump.rs");
     let relay_stream_path = server_src_dir.join("claw_vpn_relay_stream.rs");
     let t1_caller_path = server_src_dir.join("claw_vpn_t1_caller.rs");
     let t1_relay_stream_router_path = server_src_dir.join("claw_vpn_t1_relay_stream_router.rs");
@@ -3860,6 +3861,10 @@ fn product_a_per_claw_vpn_dev_config_remains_default_off_and_unwired() {
     assert!(
         sources.iter().any(|path| path == &packet_pump_path),
         "per-Claw VPN source guard must include server-rs/src/claw_vpn_packet_pump.rs"
+    );
+    assert!(
+        sources.iter().any(|path| path == &pollable_pump_path),
+        "per-Claw VPN source guard must include server-rs/src/claw_vpn_pollable_pump.rs"
     );
     assert!(
         sources.iter().any(|path| path == &relay_stream_path),
@@ -4369,6 +4374,11 @@ fn product_a_per_claw_vpn_dev_config_remains_default_off_and_unwired() {
         } else {
             None
         };
+        let pollable_pump_test_span = if path == pollable_pump_path {
+            Some(rust_test_module_span("pollable pump", &lines))
+        } else {
+            None
+        };
         let runtime_test_span = if path == runtime_path {
             Some(rust_test_module_span("runtime coordinator", &lines))
         } else {
@@ -4406,6 +4416,8 @@ fn product_a_per_claw_vpn_dev_config_remains_default_off_and_unwired() {
                 path == lib_path && line.trim() == "pub mod claw_vpn_interface_route_plan;";
             let packet_pump_module_export =
                 path == lib_path && line.trim() == "pub mod claw_vpn_packet_pump;";
+            let pollable_pump_module_export =
+                path == lib_path && line.trim() == "pub mod claw_vpn_pollable_pump;";
             let relay_stream_module_export =
                 path == lib_path && line.trim() == "pub mod claw_vpn_relay_stream;";
             let target_session_relay_module_export =
@@ -4429,6 +4441,7 @@ fn product_a_per_claw_vpn_dev_config_remains_default_off_and_unwired() {
             let in_config_module = path == config_path;
             let in_interface_route_plan_module = path == interface_route_plan_path;
             let in_packet_pump_module = path == packet_pump_path;
+            let in_pollable_pump_module = path == pollable_pump_path;
             let in_relay_stream_module = path == relay_stream_path;
             let in_t1_caller_module = path == t1_caller_path;
             let in_t1_relay_stream_router_module = path == t1_relay_stream_router_path;
@@ -4451,6 +4464,8 @@ fn product_a_per_claw_vpn_dev_config_remains_default_off_and_unwired() {
             let in_macos_utun_module = path == macos_utun_path;
             let in_packet_pump_tests = in_packet_pump_module
                 && matches!(packet_pump_test_span, Some((start, end)) if index >= start && index <= end);
+            let in_pollable_pump_tests = in_pollable_pump_module
+                && matches!(pollable_pump_test_span, Some((start, end)) if index >= start && index <= end);
             let in_runtime_tests = in_runtime_module
                 && matches!(runtime_test_span, Some((start, end)) if index >= start && index <= end);
             let in_wiring_tests = in_wiring_module
@@ -4480,7 +4495,9 @@ fn product_a_per_claw_vpn_dev_config_remains_default_off_and_unwired() {
             let references_packet_pump = line.contains("ClawVpnPacketPump")
                 || line.contains("ClawVpnPacketInterface")
                 || line.contains("ClawVpnPacketRelay")
-                || line.contains("claw_vpn_packet_pump");
+                || line.contains("claw_vpn_packet_pump")
+                || line.contains("ClawVpnPollablePump")
+                || line.contains("claw_vpn_pollable_pump");
             let references_relay_stream_adapter =
                 line.contains("ClawVpnRelayStream") || line.contains("claw_vpn_relay_stream");
             let references_target_session_relay_adapter = line
@@ -4661,6 +4678,12 @@ fn product_a_per_claw_vpn_dev_config_remains_default_off_and_unwired() {
                     && (line.contains("ClawVpnAgentSessionCore")
                         || line.contains("ClawVpnAuditEvent")
                         || line.contains("ClawVpnDatapathSide")));
+            let allowed_pollable_pump_datapath_runtime = in_pollable_pump_tests
+                || (in_pollable_pump_module
+                    && !references_disallowed_packet_pump_datapath_runtime
+                    && (line.contains("ClawVpnAgentSessionCore")
+                        || line.contains("ClawVpnAuditEvent")
+                        || line.contains("ClawVpnDatapathSide")));
             let allowed_runtime_datapath_runtime = in_runtime_tests;
             let allowed_wiring_datapath_runtime = in_wiring_tests
                 || (in_wiring_module
@@ -4719,6 +4742,7 @@ fn product_a_per_claw_vpn_dev_config_remains_default_off_and_unwired() {
             let allowed_relay_stream_mount_macos_utun =
                 in_relay_stream_mount_module && references_macos_utun;
             if (!allowed_packet_pump_datapath_runtime
+                && !allowed_pollable_pump_datapath_runtime
                 && !allowed_runtime_datapath_runtime
                 && !allowed_wiring_datapath_runtime
                 && !allowed_target_session_runtime_datapath
@@ -4742,9 +4766,11 @@ fn product_a_per_claw_vpn_dev_config_remains_default_off_and_unwired() {
                     && !interface_route_plan_module_export
                     && references_interface_route_plan)
                 || (!in_packet_pump_module
+                    && !in_pollable_pump_module
                     && !in_runtime_module
                     && !in_wiring_module
                     && !packet_pump_module_export
+                    && !pollable_pump_module_export
                     && !allowed_tun_packet_interface_adapter
                     && !allowed_relay_stream_packet_relay_adapter
                     && !allowed_target_session_relay_packet_relay_adapter
