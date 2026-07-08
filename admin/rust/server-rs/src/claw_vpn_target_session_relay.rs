@@ -8,13 +8,15 @@
 //! `ClawVpnRelayStream` frame adapter.
 
 use std::fmt;
-use std::io;
+use std::io::{self, Read, Write};
+use std::os::fd::{AsRawFd, RawFd};
 use std::os::unix::net::UnixStream as StdUnixStream;
 use std::time::Duration;
 
 use household_rs::claw_share_data_tunnel::TargetSession;
 use tokio::net::UnixStream as TokioUnixStream;
 
+use crate::claw_vpn_pollable_pump::ClawVpnPollablePacketRelay;
 use crate::claw_vpn_relay_stream::ClawVpnRelayStream;
 
 pub struct ClawVpnTargetSessionRelayPair {
@@ -46,6 +48,58 @@ impl ClawVpnTargetSessionRelayPair {
     #[must_use]
     pub fn into_parts(self) -> (TargetSession, ClawVpnRelayStream<StdUnixStream>) {
         (self.target_session, self.relay)
+    }
+
+    /// Pollable variant for the non-blocking datapath: the relay side is set
+    /// `O_NONBLOCK` (no blocking read/write timeout) and returned as a raw
+    /// byte-stream relay the pollable pump drives through its own stateful
+    /// codec. The target side stays the async `TargetSession` for the tunnel
+    /// pipe.
+    pub fn new_pollable() -> io::Result<(TargetSession, ClawVpnPollableTargetSessionRelay)> {
+        let (target_side, relay_side) = StdUnixStream::pair()?;
+        relay_side.set_nonblocking(true)?;
+        target_side.set_nonblocking(true)?;
+        let target_stream = TokioUnixStream::from_std(target_side)?;
+        Ok((
+            TargetSession::from_stream(target_stream),
+            ClawVpnPollableTargetSessionRelay { stream: relay_side },
+        ))
+    }
+}
+
+/// The relay side of a pollable target-session socketpair: a raw non-blocking
+/// byte stream the pollable pump drives through its stateful frame codec.
+pub struct ClawVpnPollableTargetSessionRelay {
+    stream: StdUnixStream,
+}
+
+impl fmt::Debug for ClawVpnPollableTargetSessionRelay {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ClawVpnPollableTargetSessionRelay")
+            .field("fd", &"<redacted>")
+            .finish()
+    }
+}
+
+impl Read for ClawVpnPollableTargetSessionRelay {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        self.stream.read(buf)
+    }
+}
+
+impl Write for ClawVpnPollableTargetSessionRelay {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.stream.write(buf)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.stream.flush()
+    }
+}
+
+impl ClawVpnPollablePacketRelay for ClawVpnPollableTargetSessionRelay {
+    fn relay_fd(&self) -> RawFd {
+        self.stream.as_raw_fd()
     }
 }
 
