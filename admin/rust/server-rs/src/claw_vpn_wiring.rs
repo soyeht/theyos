@@ -21,9 +21,24 @@ use crate::claw_vpn_packet_pump::{
     ClawVpnPacketInterface, ClawVpnPacketPump, ClawVpnPacketPumpProductionDriver,
     ClawVpnPacketPumpProductionDriverBudget, ClawVpnPacketPumpSystemClock, ClawVpnPacketRelay,
 };
+use crate::claw_vpn_pollable_pump::{
+    ClawVpnPollablePacketInterface, ClawVpnPollablePacketRelay, ClawVpnPollablePump,
+    ClawVpnPollablePumpBudget,
+};
 use crate::claw_vpn_runtime::{
+    ClawVpnPollableRuntime, ClawVpnPollableRuntimeError, ClawVpnPollableRuntimeReport,
     ClawVpnRuntime, ClawVpnRuntimeError, ClawVpnRuntimeReport, ClawVpnRuntimeStepBudget,
 };
+
+/// Poll timeout (ms) for the pollable datapath — how long each readiness poll
+/// waits before counting as an idle cycle. Active forwarding returns early.
+const CLAW_VPN_POLLABLE_POLL_TIMEOUT_MS: i32 = 250;
+/// Consecutive idle polls before the pollable datapath tears down cleanly
+/// (≈ timeout × this ≈ 10s of no traffic in either direction).
+const CLAW_VPN_POLLABLE_MAX_IDLE_POLLS: usize = 40;
+/// Consecutive polls a single frame may stay partially transferred before the
+/// pollable datapath treats it as a stalled peer (fatal).
+const CLAW_VPN_POLLABLE_MAX_PARTIAL_FRAME_POLLS: usize = 40;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct ClawVpnRuntimeWiringConfig {
@@ -82,6 +97,25 @@ impl ClawVpnRuntimeWiringConfig {
     #[must_use]
     pub fn driver_budget(self) -> ClawVpnPacketPumpProductionDriverBudget {
         self.driver_budget
+    }
+
+    /// Budget for the non-blocking pollable datapath. Reuses the configured
+    /// step cap; the poll timeout and idle/partial-frame bounds are the
+    /// pollable-specific defaults (idle teardown ≈ timeout × idle-polls).
+    ///
+    /// # Panics
+    /// Never in practice: the timeout/idle/partial-frame constants and the
+    /// already-validated step budget are all in range for
+    /// [`ClawVpnPollablePumpBudget::new`].
+    #[must_use]
+    pub fn pollable_pump_budget(self) -> ClawVpnPollablePumpBudget {
+        ClawVpnPollablePumpBudget::new(
+            CLAW_VPN_POLLABLE_POLL_TIMEOUT_MS,
+            CLAW_VPN_POLLABLE_MAX_IDLE_POLLS,
+            CLAW_VPN_POLLABLE_MAX_PARTIAL_FRAME_POLLS,
+            self.runtime_step_budget.max_steps(),
+        )
+        .expect("default pollable pump budget is valid")
     }
 }
 
@@ -167,6 +201,43 @@ where
     }
 }
 
+/// Non-blocking pollable datapath assembly: the readiness-driven pump variant of
+/// [`ClawVpnRuntimeWiring`]. Holds no production driver — the pollable pump owns
+/// its own budget through [`ClawVpnPollableRuntime`].
+pub struct ClawVpnPollableRuntimeWiring<I, R> {
+    runtime: ClawVpnPollableRuntime,
+    route_executor: ClawVpnInterfaceRouteExecutor,
+    interface: I,
+    relay: R,
+}
+
+impl<I, R> fmt::Debug for ClawVpnPollableRuntimeWiring<I, R> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ClawVpnPollableRuntimeWiring")
+            .field("runtime", &"<redacted>")
+            .field("route_executor", &"<redacted>")
+            .field("interface", &"<redacted>")
+            .field("relay", &"<redacted>")
+            .finish()
+    }
+}
+
+impl<I, R> ClawVpnPollableRuntimeWiring<I, R>
+where
+    I: ClawVpnPollablePacketInterface,
+    R: ClawVpnPollablePacketRelay,
+{
+    pub fn run_until_stopped(
+        &mut self,
+    ) -> Result<ClawVpnPollableRuntimeReport, ClawVpnPollableRuntimeError> {
+        self.runtime.run_until_stopped(
+            &mut self.route_executor,
+            &mut self.interface,
+            &mut self.relay,
+        )
+    }
+}
+
 #[derive(thiserror::Error)]
 pub enum ClawVpnRuntimeWiringError {
     #[error("claw vpn runtime wiring session is not active")]
@@ -240,6 +311,45 @@ where
     }))
 }
 
+/// Assemble the non-blocking pollable datapath. Mirrors
+/// [`assemble_claw_vpn_runtime_wiring`] but builds a [`ClawVpnPollablePump`] +
+/// [`ClawVpnPollableRuntime`]; the interface/relay must implement the pollable
+/// (`O_NONBLOCK`) traits. Returns `None` when the datapath is disabled.
+pub fn assemble_claw_vpn_pollable_runtime_wiring<I, R>(
+    config: ClawVpnRuntimeWiringConfig,
+    session_core: ClawVpnAgentSessionCore,
+    build_inputs: impl FnOnce(ClawVpnRuntimeWiringContext) -> ClawVpnRuntimeWiringInputs<I, R>,
+) -> Result<Option<ClawVpnPollableRuntimeWiring<I, R>>, ClawVpnRuntimeWiringError>
+where
+    I: ClawVpnPollablePacketInterface,
+    R: ClawVpnPollablePacketRelay,
+{
+    if !config.enabled() {
+        return Ok(None);
+    }
+
+    let route_side = route_side_for_datapath(session_core.local_side());
+    let addrs = session_core.addrs()?;
+    let inputs = build_inputs(ClawVpnRuntimeWiringContext { route_side, addrs });
+    let route_plan = crate::claw_vpn_interface_route_plan::ClawVpnInterfaceRoutePlan::new(
+        inputs.route_platform,
+        inputs.interface_name,
+        addrs,
+        route_side,
+    );
+    let pollable_pump = ClawVpnPollablePump::new(session_core);
+    let runtime =
+        ClawVpnPollableRuntime::new(route_plan, pollable_pump, config.pollable_pump_budget());
+    let route_executor = ClawVpnInterfaceRouteExecutor::new(inputs.route_tool_paths);
+
+    Ok(Some(ClawVpnPollableRuntimeWiring {
+        runtime,
+        route_executor,
+        interface: inputs.interface,
+        relay: inputs.relay,
+    }))
+}
+
 pub fn try_assemble_claw_vpn_runtime_wiring_deferred<I, R, E>(
     config: ClawVpnRuntimeWiringConfig,
     build_session_core: impl FnOnce() -> ClawVpnAgentSessionCore,
@@ -279,6 +389,49 @@ where
         interface: inputs.interface,
         relay: inputs.relay,
         driver,
+    }))
+}
+
+/// Deferred (lazy session-core) assembly of the non-blocking pollable datapath —
+/// the pollable-pump variant of [`try_assemble_claw_vpn_runtime_wiring_deferred`].
+pub fn try_assemble_claw_vpn_pollable_runtime_wiring_deferred<I, R, E>(
+    config: ClawVpnRuntimeWiringConfig,
+    build_session_core: impl FnOnce() -> ClawVpnAgentSessionCore,
+    build_inputs: impl FnOnce(
+        ClawVpnRuntimeWiringContext,
+    ) -> Result<ClawVpnRuntimeWiringInputs<I, R>, E>,
+) -> Result<Option<ClawVpnPollableRuntimeWiring<I, R>>, ClawVpnRuntimeWiringBuildError<E>>
+where
+    I: ClawVpnPollablePacketInterface,
+    R: ClawVpnPollablePacketRelay,
+{
+    if !config.enabled() {
+        return Ok(None);
+    }
+
+    let session_core = build_session_core();
+    let route_side = route_side_for_datapath(session_core.local_side());
+    let addrs = session_core
+        .addrs()
+        .map_err(ClawVpnRuntimeWiringBuildError::Session)?;
+    let inputs = build_inputs(ClawVpnRuntimeWiringContext { route_side, addrs })
+        .map_err(ClawVpnRuntimeWiringBuildError::Inputs)?;
+    let route_plan = crate::claw_vpn_interface_route_plan::ClawVpnInterfaceRoutePlan::new(
+        inputs.route_platform,
+        inputs.interface_name,
+        addrs,
+        route_side,
+    );
+    let pollable_pump = ClawVpnPollablePump::new(session_core);
+    let runtime =
+        ClawVpnPollableRuntime::new(route_plan, pollable_pump, config.pollable_pump_budget());
+    let route_executor = ClawVpnInterfaceRouteExecutor::new(inputs.route_tool_paths);
+
+    Ok(Some(ClawVpnPollableRuntimeWiring {
+        runtime,
+        route_executor,
+        interface: inputs.interface,
+        relay: inputs.relay,
     }))
 }
 

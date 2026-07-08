@@ -4561,8 +4561,10 @@ fn product_a_per_claw_vpn_dev_config_remains_default_off_and_unwired() {
                 || line.contains("per_claw_vpn_t1_preflight_evidence_v1");
             let allowed_tun_packet_interface_adapter = (in_linux_tun_module
                 || in_macos_utun_module)
-                && line.contains("ClawVpnPacketInterface")
+                && (line.contains("ClawVpnPacketInterface")
+                    || line.contains("ClawVpnPollablePacketInterface"))
                 && !line.contains("ClawVpnPacketPump")
+                && !line.contains("ClawVpnPollablePump")
                 && !line.contains("ClawVpnPacketRelay")
                 && !line.contains("ClawVpnPacketPumpLoop");
             let allowed_relay_stream_packet_relay_adapter = in_relay_stream_module
@@ -4571,8 +4573,10 @@ fn product_a_per_claw_vpn_dev_config_remains_default_off_and_unwired() {
                 && !line.contains("ClawVpnPacketInterface")
                 && !line.contains("ClawVpnPacketPumpLoop");
             let allowed_target_session_relay_packet_relay_adapter = in_target_session_relay_module
-                && line.contains("ClawVpnPacketRelay")
+                && (line.contains("ClawVpnPacketRelay")
+                    || line.contains("ClawVpnPollablePacketRelay"))
                 && !line.contains("ClawVpnPacketPump")
+                && !line.contains("ClawVpnPollablePump")
                 && !line.contains("ClawVpnPacketInterface")
                 && !line.contains("ClawVpnPacketPumpLoop");
             let allowed_target_session_relay_stream_adapter =
@@ -4588,8 +4592,10 @@ fn product_a_per_claw_vpn_dev_config_remains_default_off_and_unwired() {
             let allowed_target_session_router_runtime_bridge =
                 in_target_session_router_module && references_target_session_runtime_bridge;
             let allowed_target_session_runtime_packet_interface = in_target_session_runtime_module
-                && ((line.contains("ClawVpnPacketInterface")
+                && (((line.contains("ClawVpnPacketInterface")
+                    || line.contains("ClawVpnPollablePacketInterface"))
                     && !line.contains("ClawVpnPacketPump")
+                    && !line.contains("ClawVpnPollablePump")
                     && !line.contains("ClawVpnPacketRelay")
                     && !line.contains("ClawVpnPacketPumpLoop"))
                     || in_target_session_runtime_tests);

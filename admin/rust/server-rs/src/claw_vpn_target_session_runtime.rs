@@ -15,11 +15,15 @@ use household_rs::claw_share_data_tunnel::TargetSession;
 use household_rs::claw_vpn::{ClawVpnAgentSessionCore, ClawVpnSessionFrameError};
 
 use crate::claw_vpn_packet_pump::ClawVpnPacketInterface;
+use crate::claw_vpn_pollable_pump::ClawVpnPollablePacketInterface;
 use crate::claw_vpn_relay_stream::ClawVpnRelayStream;
-use crate::claw_vpn_target_session_relay::ClawVpnTargetSessionRelayPair;
+use crate::claw_vpn_target_session_relay::{
+    ClawVpnPollableTargetSessionRelay, ClawVpnTargetSessionRelayPair,
+};
 use crate::claw_vpn_wiring::{
-    ClawVpnRuntimeWiring, ClawVpnRuntimeWiringBuildError, ClawVpnRuntimeWiringConfig,
-    ClawVpnRuntimeWiringContext, ClawVpnRuntimeWiringInputs,
+    ClawVpnPollableRuntimeWiring, ClawVpnRuntimeWiring, ClawVpnRuntimeWiringBuildError,
+    ClawVpnRuntimeWiringConfig, ClawVpnRuntimeWiringContext, ClawVpnRuntimeWiringInputs,
+    try_assemble_claw_vpn_pollable_runtime_wiring_deferred,
     try_assemble_claw_vpn_runtime_wiring_deferred,
 };
 
@@ -126,6 +130,92 @@ where
         ));
     };
     Ok(Some(ClawVpnTargetSessionRuntime {
+        target_session,
+        wiring,
+    }))
+}
+
+/// Non-blocking pollable variant of [`ClawVpnTargetSessionRuntime`]. Holds the
+/// pollable wiring over an `O_NONBLOCK` relay side; the interface is expected to
+/// have been set non-blocking by its builder.
+pub struct ClawVpnPollableTargetSessionRuntime<I> {
+    target_session: TargetSession,
+    wiring: ClawVpnPollableRuntimeWiring<I, ClawVpnPollableTargetSessionRelay>,
+}
+
+impl<I> fmt::Debug for ClawVpnPollableTargetSessionRuntime<I> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ClawVpnPollableTargetSessionRuntime")
+            .field("target_session", &"<redacted>")
+            .field("wiring", &self.wiring)
+            .finish()
+    }
+}
+
+impl<I> ClawVpnPollableTargetSessionRuntime<I> {
+    #[must_use]
+    pub fn into_parts(
+        self,
+    ) -> (
+        TargetSession,
+        ClawVpnPollableRuntimeWiring<I, ClawVpnPollableTargetSessionRelay>,
+    ) {
+        (self.target_session, self.wiring)
+    }
+}
+
+/// Assemble the non-blocking pollable datapath bridge: creates the `O_NONBLOCK`
+/// target-session socketpair via [`ClawVpnTargetSessionRelayPair::new_pollable`]
+/// and hands the relay side to `build_inputs`. Mirrors
+/// [`assemble_claw_vpn_target_session_runtime`] for the pollable pump.
+pub fn assemble_claw_vpn_pollable_target_session_runtime<I, E>(
+    config: ClawVpnRuntimeWiringConfig,
+    build_session_core: impl FnOnce() -> ClawVpnAgentSessionCore,
+    build_inputs: impl FnOnce(
+        ClawVpnRuntimeWiringContext,
+        ClawVpnPollableTargetSessionRelay,
+    ) -> Result<
+        ClawVpnRuntimeWiringInputs<I, ClawVpnPollableTargetSessionRelay>,
+        E,
+    >,
+) -> Result<Option<ClawVpnPollableTargetSessionRuntime<I>>, ClawVpnTargetSessionRuntimeError<E>>
+where
+    I: ClawVpnPollablePacketInterface,
+{
+    if !config.enabled() {
+        return Ok(None);
+    }
+
+    let mut target_session = None;
+    let wiring = match try_assemble_claw_vpn_pollable_runtime_wiring_deferred(
+        config,
+        build_session_core,
+        |context| {
+            let (session, relay) = ClawVpnTargetSessionRelayPair::new_pollable()
+                .map_err(TargetSessionRuntimeInputError::TargetSessionRelay)?;
+            target_session = Some(session);
+            build_inputs(context, relay).map_err(TargetSessionRuntimeInputError::Inputs)
+        },
+    ) {
+        Ok(None) => return Ok(None),
+        Ok(Some(wiring)) => wiring,
+        Err(ClawVpnRuntimeWiringBuildError::Session(error)) => {
+            return Err(ClawVpnTargetSessionRuntimeError::Session(error));
+        }
+        Err(ClawVpnRuntimeWiringBuildError::Inputs(
+            TargetSessionRuntimeInputError::TargetSessionRelay(error),
+        )) => return Err(ClawVpnTargetSessionRuntimeError::TargetSessionRelay(error)),
+        Err(ClawVpnRuntimeWiringBuildError::Inputs(TargetSessionRuntimeInputError::Inputs(
+            error,
+        ))) => return Err(ClawVpnTargetSessionRuntimeError::Inputs(error)),
+    };
+
+    let Some(target_session) = target_session else {
+        return Err(ClawVpnTargetSessionRuntimeError::TargetSessionRelay(
+            io::Error::other("target session relay was not built"),
+        ));
+    };
+    Ok(Some(ClawVpnPollableTargetSessionRuntime {
         target_session,
         wiring,
     }))

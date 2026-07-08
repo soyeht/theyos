@@ -8,11 +8,15 @@ use std::fmt;
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::mem::MaybeUninit;
-use std::os::fd::AsRawFd;
+use std::os::fd::{AsRawFd, RawFd};
 
 use crate::claw_vpn_packet_pump::ClawVpnPacketInterface;
+use crate::claw_vpn_pollable_pump::ClawVpnPollablePacketInterface;
 
 const LINUX_TUN_DEVICE: &str = "/dev/net/tun";
+/// Bounded run of non-IPv4 packets to skip within one non-blocking read before
+/// yielding — never fatal, never a forwarded packet.
+const LINUX_TUN_NONBLOCKING_SKIP_LIMIT: usize = 16;
 const LINUX_IFNAMSIZ: usize = 16;
 const LINUX_TUNSETIFF: libc::Ioctl = 0x4004_54ca;
 const LINUX_IFF_TUN: libc::c_short = 0x0001;
@@ -166,6 +170,39 @@ impl ClawVpnLinuxTunDevice {
     pub fn write_packet(&mut self, packet: &[u8]) -> io::Result<()> {
         self.file.write_all(packet)
     }
+
+    /// Put the TUN fd into non-blocking mode for the pollable datapath. Not done
+    /// by `open()` — the blocking `ClawVpnPacketInterface` path is unchanged.
+    #[allow(unsafe_code)]
+    pub fn set_nonblocking(&self) -> io::Result<()> {
+        let fd = self.file.as_raw_fd();
+        // SAFETY: `fd` is the open TUN file owned by `self`; fcntl only reads and
+        // sets the file-status flags.
+        unsafe {
+            let flags = libc::fcntl(fd, libc::F_GETFL);
+            if flags < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            if libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) < 0 {
+                return Err(io::Error::last_os_error());
+            }
+        }
+        Ok(())
+    }
+}
+
+impl ClawVpnPollablePacketInterface for ClawVpnLinuxTunDevice {
+    fn interface_fd(&self) -> RawFd {
+        self.file.as_raw_fd()
+    }
+
+    fn read_packet_nonblocking(&mut self, buf: &mut [u8]) -> io::Result<Option<usize>> {
+        read_linux_tun_packet_nonblocking(&mut self.file, buf)
+    }
+
+    fn write_packet_nonblocking(&mut self, packet: &[u8]) -> io::Result<bool> {
+        write_linux_tun_packet_nonblocking(&mut self.file, packet)
+    }
 }
 
 impl ClawVpnPacketInterface for ClawVpnLinuxTunDevice {
@@ -175,6 +212,52 @@ impl ClawVpnPacketInterface for ClawVpnLinuxTunDevice {
 
     fn write_packet(&mut self, packet: &[u8]) -> io::Result<()> {
         self.file.write_all(packet)
+    }
+}
+
+/// Non-blocking TUN read for the pollable datapath. `WouldBlock` and a bounded
+/// run of non-IPv4 packets both return `None` — never a transfer, never fatal.
+fn read_linux_tun_packet_nonblocking(
+    reader: &mut impl Read,
+    buf: &mut [u8],
+) -> io::Result<Option<usize>> {
+    for _ in 0..LINUX_TUN_NONBLOCKING_SKIP_LIMIT {
+        let read = match reader.read(buf) {
+            Ok(0) => return Ok(None),
+            Ok(n) => n,
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        if buf.first().map(|byte| byte >> 4) == Some(4) {
+            return Ok(Some(read));
+        }
+        // Non-IPv4 packet — fall through to skip it and read the next this cycle.
+    }
+    // Too many consecutive non-IPv4 packets this cycle — yield; resume next poll.
+    Ok(None)
+}
+
+/// Non-blocking TUN write for the pollable datapath. TUN writes are
+/// packet-atomic: `Ok(true)` = the whole packet crossed; `Ok(false)` =
+/// `WouldBlock`. A partial write would corrupt the tunnel, so it is fatal.
+fn write_linux_tun_packet_nonblocking(
+    writer: &mut impl Write,
+    packet: &[u8],
+) -> io::Result<bool> {
+    match writer.write(packet) {
+        Ok(n) if n == packet.len() => Ok(true),
+        // A non-empty packet accepted as zero bytes is not `WouldBlock`
+        // backpressure — it is a write-zero anomaly. Keep it fatal so the R->I
+        // direction fails closed instead of quietly retrying (@safia).
+        Ok(0) => Err(io::Error::new(
+            io::ErrorKind::WriteZero,
+            "linux tun accepted zero bytes of a packet (not backpressure)",
+        )),
+        Ok(_) => Err(io::Error::other(
+            "linux tun accepted only part of a packet (non-atomic write)",
+        )),
+        Err(error) if error.kind() == io::ErrorKind::WouldBlock => Ok(false),
+        Err(error) => Err(error),
     }
 }
 

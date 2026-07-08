@@ -14,6 +14,10 @@ use crate::claw_vpn_packet_pump::{
     ClawVpnPacketInterface, ClawVpnPacketPump, ClawVpnPacketPumpLoopDriver,
     ClawVpnPacketPumpLoopReport, ClawVpnPacketPumpLoopStopReason, ClawVpnPacketRelay,
 };
+use crate::claw_vpn_pollable_pump::{
+    ClawVpnPollablePacketInterface, ClawVpnPollablePacketRelay, ClawVpnPollablePump,
+    ClawVpnPollablePumpBudget, ClawVpnPollablePumpReport, ClawVpnPollablePumpStopReason,
+};
 
 pub const CLAW_VPN_RUNTIME_MAX_PACKET_PUMP_STEPS: usize = 4096;
 
@@ -194,6 +198,127 @@ impl ClawVpnRuntime {
             }
             Ok(()) => Ok(ClawVpnRuntimeReport { pump_report }),
             Err(source) => Err(ClawVpnRuntimeError::RouteCleanup {
+                pump_report,
+                source,
+            }),
+        }
+    }
+}
+
+/// End-of-run report for the non-blocking pollable datapath.
+pub struct ClawVpnPollableRuntimeReport {
+    pump_report: ClawVpnPollablePumpReport,
+}
+
+impl fmt::Debug for ClawVpnPollableRuntimeReport {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ClawVpnPollableRuntimeReport")
+            .field("pump_report", &self.pump_report)
+            .finish()
+    }
+}
+
+impl ClawVpnPollableRuntimeReport {
+    #[must_use]
+    pub fn pump_report(&self) -> &ClawVpnPollablePumpReport {
+        &self.pump_report
+    }
+}
+
+pub enum ClawVpnPollableRuntimeError {
+    RouteSetup {
+        source: ClawVpnInterfaceRouteExecutionError,
+    },
+    PacketPump {
+        pump_report: ClawVpnPollablePumpReport,
+    },
+    RouteCleanup {
+        pump_report: ClawVpnPollablePumpReport,
+        source: ClawVpnInterfaceRouteExecutionError,
+    },
+}
+
+impl fmt::Debug for ClawVpnPollableRuntimeError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::RouteSetup { .. } => f
+                .debug_struct("ClawVpnPollableRuntimeError::RouteSetup")
+                .field("source", &"<redacted>")
+                .finish(),
+            Self::PacketPump { pump_report } => f
+                .debug_struct("ClawVpnPollableRuntimeError::PacketPump")
+                .field("pump_report", pump_report)
+                .finish(),
+            Self::RouteCleanup { pump_report, .. } => f
+                .debug_struct("ClawVpnPollableRuntimeError::RouteCleanup")
+                .field("pump_report", pump_report)
+                .field("source", &"<redacted>")
+                .finish(),
+        }
+    }
+}
+
+/// Lifecycle coordinator for the non-blocking pollable datapath: applies routes,
+/// runs the readiness-driven pump, and always cleans up routes. Mirrors
+/// [`ClawVpnRuntime`] but drives [`ClawVpnPollablePump`]. A clean stop
+/// (idle/step budget) yields a report; a fatal stop (partial-frame/IoError)
+/// yields an error — cleanup runs on every path.
+pub struct ClawVpnPollableRuntime {
+    route_plan: ClawVpnInterfaceRoutePlan,
+    pollable_pump: ClawVpnPollablePump,
+    budget: ClawVpnPollablePumpBudget,
+}
+
+impl fmt::Debug for ClawVpnPollableRuntime {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ClawVpnPollableRuntime")
+            .field("route_plan", &"<redacted>")
+            .field("pollable_pump", &"<redacted>")
+            .field("budget", &self.budget)
+            .finish()
+    }
+}
+
+impl ClawVpnPollableRuntime {
+    #[must_use]
+    pub fn new(
+        route_plan: ClawVpnInterfaceRoutePlan,
+        pollable_pump: ClawVpnPollablePump,
+        budget: ClawVpnPollablePumpBudget,
+    ) -> Self {
+        Self {
+            route_plan,
+            pollable_pump,
+            budget,
+        }
+    }
+
+    pub fn run_until_stopped(
+        &mut self,
+        route_controller: &mut impl ClawVpnRuntimeRouteController,
+        interface: &mut impl ClawVpnPollablePacketInterface,
+        relay: &mut impl ClawVpnPollablePacketRelay,
+    ) -> Result<ClawVpnPollableRuntimeReport, ClawVpnPollableRuntimeError> {
+        route_controller
+            .apply_routes(&self.route_plan)
+            .map_err(|source| ClawVpnPollableRuntimeError::RouteSetup { source })?;
+
+        let pump_report = self
+            .pollable_pump
+            .run_until_stopped(interface, relay, &self.budget);
+
+        let pump_stopped_fatal = matches!(
+            pump_report.stop_reason,
+            ClawVpnPollablePumpStopReason::PartialFrameStalled
+                | ClawVpnPollablePumpStopReason::IoError { .. }
+        );
+
+        match route_controller.cleanup_routes(&self.route_plan) {
+            Ok(()) if pump_stopped_fatal => {
+                Err(ClawVpnPollableRuntimeError::PacketPump { pump_report })
+            }
+            Ok(()) => Ok(ClawVpnPollableRuntimeReport { pump_report }),
+            Err(source) => Err(ClawVpnPollableRuntimeError::RouteCleanup {
                 pump_report,
                 source,
             }),

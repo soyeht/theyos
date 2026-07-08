@@ -646,8 +646,6 @@ fn generate_device_session_config_bytes(
 mod dev_datapath {
     use std::io;
     use std::net::{IpAddr, Ipv4Addr};
-    use std::os::unix::net::UnixStream as StdUnixStream;
-    use std::time::Duration;
 
     use anyhow::{Result, anyhow, bail};
     use household_rs::claw_share_data_tunnel::{
@@ -667,11 +665,13 @@ mod dev_datapath {
     };
     #[cfg(target_os = "macos")]
     use server_rs::claw_vpn_macos_utun::ClawVpnMacosUtunDevice;
-    use server_rs::claw_vpn_packet_pump::{ClawVpnPacketInterface, ClawVpnPacketPumpLoopStopReason};
-    use server_rs::claw_vpn_relay_stream::ClawVpnRelayStream;
-    use server_rs::claw_vpn_runtime::ClawVpnRuntimeReport;
+    use server_rs::claw_vpn_pollable_pump::{
+        ClawVpnPollablePacketInterface, ClawVpnPollablePumpStopReason,
+    };
+    use server_rs::claw_vpn_runtime::ClawVpnPollableRuntimeReport;
+    use server_rs::claw_vpn_target_session_relay::ClawVpnPollableTargetSessionRelay;
     use server_rs::claw_vpn_target_session_runtime::{
-        ClawVpnTargetSessionRuntimeError, assemble_claw_vpn_target_session_runtime,
+        ClawVpnTargetSessionRuntimeError, assemble_claw_vpn_pollable_target_session_runtime,
     };
     use server_rs::claw_vpn_wiring::{
         ClawVpnRuntimeWiringConfig, ClawVpnRuntimeWiringContext, ClawVpnRuntimeWiringInputs,
@@ -687,7 +687,6 @@ mod dev_datapath {
 
     const DEV_DEVICE_POOL_NETWORK: Ipv4Addr = Ipv4Addr::new(198, 18, 0, 0);
     const DEV_DEVICE_POOL_PREFIX_LEN: u8 = 24;
-    const DEV_TARGET_SESSION_IO_TIMEOUT: Duration = Duration::from_secs(5);
     #[cfg(target_os = "linux")]
     const DEV_LINUX_TUN_NAME: &str = "clawvpn0";
     const LINUX_IP_TOOL_PATH: &str = "/sbin/ip";
@@ -831,12 +830,13 @@ mod dev_datapath {
     fn build_inputs(
         _config: &ValidatedDevRunnerSessionConfig,
         _context: ClawVpnRuntimeWiringContext,
-        relay: ClawVpnRelayStream<StdUnixStream>,
-    ) -> io::Result<ClawVpnRuntimeWiringInputs<DevPacketInterface, ClawVpnRelayStream<StdUnixStream>>>
+        relay: ClawVpnPollableTargetSessionRelay,
+    ) -> io::Result<ClawVpnRuntimeWiringInputs<DevPacketInterface, ClawVpnPollableTargetSessionRelay>>
     {
         let tun_name = ClawVpnLinuxTunName::new(DEV_LINUX_TUN_NAME)
             .map_err(|error| io::Error::other(error.to_string()))?;
         let device = ClawVpnLinuxTunDevice::open(&ClawVpnLinuxTunConfig::new(tun_name))?;
+        device.set_nonblocking()?;
         let interface_name = ClawVpnInterfaceName::new(device.name().as_str())
             .map_err(|error| io::Error::other(format!("{error:?}")))?;
         Ok(ClawVpnRuntimeWiringInputs {
@@ -852,10 +852,11 @@ mod dev_datapath {
     fn build_inputs(
         _config: &ValidatedDevRunnerSessionConfig,
         _context: ClawVpnRuntimeWiringContext,
-        relay: ClawVpnRelayStream<StdUnixStream>,
-    ) -> io::Result<ClawVpnRuntimeWiringInputs<DevPacketInterface, ClawVpnRelayStream<StdUnixStream>>>
+        relay: ClawVpnPollableTargetSessionRelay,
+    ) -> io::Result<ClawVpnRuntimeWiringInputs<DevPacketInterface, ClawVpnPollableTargetSessionRelay>>
     {
         let device = ClawVpnMacosUtunDevice::open()?;
+        device.set_nonblocking()?;
         let interface_name = ClawVpnInterfaceName::new(device.name().as_str())
             .map_err(|error| io::Error::other(format!("{error:?}")))?;
         Ok(ClawVpnRuntimeWiringInputs {
@@ -884,11 +885,12 @@ mod dev_datapath {
     /// Redacted, static label for a pump stop reason. The `IoError` arm ignores
     /// the embedded error so an io error can never leak an address, endpoint, or
     /// path into the datapath's stopped-summary evidence line.
-    pub(super) fn stop_reason_label(reason: &ClawVpnPacketPumpLoopStopReason) -> &'static str {
+    pub(super) fn stop_reason_label(reason: &ClawVpnPollablePumpStopReason) -> &'static str {
         match reason {
-            ClawVpnPacketPumpLoopStopReason::DriverStopped => "driver_stopped",
-            ClawVpnPacketPumpLoopStopReason::StepBudgetExhausted => "step_budget_exhausted",
-            ClawVpnPacketPumpLoopStopReason::IoError { .. } => "io_error",
+            ClawVpnPollablePumpStopReason::IdleBudgetExhausted => "idle_budget_exhausted",
+            ClawVpnPollablePumpStopReason::StepBudgetExhausted => "step_budget_exhausted",
+            ClawVpnPollablePumpStopReason::PartialFrameStalled => "partial_frame_stalled",
+            ClawVpnPollablePumpStopReason::IoError { .. } => "io_error",
         }
     }
 
@@ -943,24 +945,22 @@ mod dev_datapath {
         config: &ValidatedDevRunnerSessionConfig,
         now_unix: u64,
         runtime_config: ClawVpnRuntimeWiringConfig,
-        io_timeout: Duration,
         build_runtime_inputs: impl FnOnce(
             &ValidatedDevRunnerSessionConfig,
             ClawVpnRuntimeWiringContext,
-            ClawVpnRelayStream<StdUnixStream>,
-        ) -> io::Result<ClawVpnRuntimeWiringInputs<I, ClawVpnRelayStream<StdUnixStream>>>,
+            ClawVpnPollableTargetSessionRelay,
+        ) -> io::Result<ClawVpnRuntimeWiringInputs<I, ClawVpnPollableTargetSessionRelay>>,
     ) -> Result<()>
     where
-        I: ClawVpnPacketInterface + Send + 'static,
+        I: ClawVpnPollablePacketInterface + Send + 'static,
     {
         validate_host_platform(config)?;
         let session_core = device_session_core(offer, device_key, config)?;
         let (session_ack, stream): (super::DevRunnerSessionAck, OpenedIpTunnelStream) =
             connect_open_iptunnel_session(offer, device_key, now_unix).await?;
 
-        let runtime = assemble_claw_vpn_target_session_runtime(
+        let runtime = assemble_claw_vpn_pollable_target_session_runtime(
             runtime_config,
-            io_timeout,
             move || session_core,
             |context, relay| build_runtime_inputs(config, context, relay),
         )
@@ -969,11 +969,12 @@ mod dev_datapath {
             bail!("dev datapath runtime disabled");
         };
         let (target_session, mut wiring) = runtime.into_parts();
-        let runtime_handle = tokio::task::spawn_blocking(move || -> Result<ClawVpnRuntimeReport> {
-            wiring
-                .run_until_stopped()
-                .map_err(|error| anyhow!("dev datapath runtime stopped: {error:?}"))
-        });
+        let runtime_handle =
+            tokio::task::spawn_blocking(move || -> Result<ClawVpnPollableRuntimeReport> {
+                wiring
+                    .run_until_stopped()
+                    .map_err(|error| anyhow!("dev datapath runtime stopped: {error:?}"))
+            });
 
         println!(
             "OK: dev IpTunnel datapath started \
@@ -995,20 +996,19 @@ mod dev_datapath {
         // plus a STATIC stop-reason label. No session id / mesh / endpoint is
         // printed, and the stop reason is reduced to a &'static str so an embedded
         // io error can never leak an address, endpoint, or path into this line.
-        let pump_stats = runtime_report.pump_report().stats();
+        let pump_report = runtime_report.pump_report();
         println!(
             "OK: dev IpTunnel datapath stopped \
              (runner_interface_to_relay_forwarded={}, \
              runner_interface_to_relay_dropped={}, \
              runner_relay_to_interface_forwarded={}, \
              runner_relay_to_interface_dropped={}, \
-             runner_total_steps={}, runner_stop_reason={})",
-            pump_stats.interface_to_relay_forwarded(),
-            pump_stats.interface_to_relay_dropped(),
-            pump_stats.relay_to_interface_forwarded(),
-            pump_stats.relay_to_interface_dropped(),
-            pump_stats.total_steps(),
-            stop_reason_label(runtime_report.pump_report().stop_reason()),
+             runner_stop_reason={})",
+            pump_report.stats.interface_to_relay_forwarded(),
+            pump_report.stats.interface_to_relay_dropped(),
+            pump_report.stats.relay_to_interface_forwarded(),
+            pump_report.stats.relay_to_interface_dropped(),
+            stop_reason_label(&pump_report.stop_reason),
         );
         Ok(())
     }
@@ -1025,7 +1025,6 @@ mod dev_datapath {
             config,
             now_unix,
             enabled_runtime_config(),
-            DEV_TARGET_SESSION_IO_TIMEOUT,
             build_inputs,
         )
         .await
@@ -1038,15 +1037,14 @@ mod dev_datapath {
         config: &ValidatedDevRunnerSessionConfig,
         now_unix: u64,
         runtime_config: ClawVpnRuntimeWiringConfig,
-        io_timeout: Duration,
         build_runtime_inputs: impl FnOnce(
             &ValidatedDevRunnerSessionConfig,
             ClawVpnRuntimeWiringContext,
-            ClawVpnRelayStream<StdUnixStream>,
-        ) -> io::Result<ClawVpnRuntimeWiringInputs<I, ClawVpnRelayStream<StdUnixStream>>>,
+            ClawVpnPollableTargetSessionRelay,
+        ) -> io::Result<ClawVpnRuntimeWiringInputs<I, ClawVpnPollableTargetSessionRelay>>,
     ) -> Result<()>
     where
-        I: ClawVpnPacketInterface + Send + 'static,
+        I: ClawVpnPollablePacketInterface + Send + 'static,
     {
         run_device_datapath_with_inputs(
             offer,
@@ -1054,7 +1052,6 @@ mod dev_datapath {
             config,
             now_unix,
             runtime_config,
-            io_timeout,
             build_runtime_inputs,
         )
         .await
@@ -1822,30 +1819,31 @@ mod tests {
     #[cfg(feature = "dev_t1_datapath")]
     #[test]
     fn datapath_stop_reason_label_is_static_and_never_echoes_error_detail() {
-        use server_rs::claw_vpn_packet_pump::{
-            ClawVpnPacketPumpDirection, ClawVpnPacketPumpError, ClawVpnPacketPumpLoopStopReason,
+        use server_rs::claw_vpn_pollable_pump::{
+            ClawVpnPollablePumpDirection, ClawVpnPollablePumpStopReason,
         };
 
         assert_eq!(
-            dev_datapath::stop_reason_label(&ClawVpnPacketPumpLoopStopReason::DriverStopped),
-            "driver_stopped"
+            dev_datapath::stop_reason_label(&ClawVpnPollablePumpStopReason::IdleBudgetExhausted),
+            "idle_budget_exhausted"
         );
         assert_eq!(
-            dev_datapath::stop_reason_label(&ClawVpnPacketPumpLoopStopReason::StepBudgetExhausted),
+            dev_datapath::stop_reason_label(&ClawVpnPollablePumpStopReason::StepBudgetExhausted),
             "step_budget_exhausted"
         );
-        // The IoError variant must reduce to a static label that cannot carry the
-        // embedded io error's message (which could otherwise leak an endpoint/path).
-        let io_reason = ClawVpnPacketPumpLoopStopReason::IoError {
-            direction: ClawVpnPacketPumpDirection::InterfaceToRelay,
-            error: ClawVpnPacketPumpError::RelayRead {
-                source: std::io::Error::other("SECRET-ENDPOINT-198.51.100.7:49152"),
-            },
+        assert_eq!(
+            dev_datapath::stop_reason_label(&ClawVpnPollablePumpStopReason::PartialFrameStalled),
+            "partial_frame_stalled"
+        );
+        // The IoError variant must reduce to a static label. The pollable stop
+        // reason carries only an `io::ErrorKind` (no source string), so nothing
+        // an endpoint/path could ride on can reach this evidence line.
+        let io_reason = ClawVpnPollablePumpStopReason::IoError {
+            direction: ClawVpnPollablePumpDirection::InterfaceToRelay,
+            kind: std::io::ErrorKind::ConnectionReset,
         };
         let label = dev_datapath::stop_reason_label(&io_reason);
         assert_eq!(label, "io_error");
-        assert!(!label.contains("SECRET-ENDPOINT"));
-        assert!(!label.contains("198.51.100.7"));
     }
 
     #[cfg(feature = "dev_t1_datapath")]
@@ -1893,7 +1891,11 @@ mod tests {
         use server_rs::claw_vpn_packet_pump::{
             ClawVpnPacketInterface, ClawVpnPacketPumpProductionDriverBudget,
         };
+        use server_rs::claw_vpn_pollable_pump::ClawVpnPollablePacketInterface;
         use server_rs::claw_vpn_runtime::ClawVpnRuntimeStepBudget;
+        use server_rs::claw_vpn_target_session_relay::ClawVpnPollableTargetSessionRelay;
+        use std::os::fd::{AsRawFd, RawFd};
+        use std::os::unix::net::UnixDatagram;
         use server_rs::claw_vpn_t1_relay_stream_router::{
             ClawVpnT1RelayStreamAuditSink, ClawVpnT1RelayStreamBuildInputs,
             ClawVpnT1RelayStreamLaunchRuntime, ClawVpnT1RelayStreamRouterParts,
@@ -1958,6 +1960,46 @@ mod tests {
             }
         }
 
+        /// Real-fd device interface mock for the pollable datapath: the pump
+        /// `poll()`s a `UnixDatagram` end. The paired peer injects inbound
+        /// packets (`send`) and drains what the pump wrote (`recv`) — no fd-less
+        /// pre-load, so the pump's own forwarding is what moves each packet.
+        struct PollableMockInterface {
+            stream: UnixDatagram,
+        }
+
+        impl PollableMockInterface {
+            fn paired() -> std::io::Result<(Self, UnixDatagram)> {
+                let (pump_side, peer) = UnixDatagram::pair()?;
+                pump_side.set_nonblocking(true)?;
+                peer.set_nonblocking(true)?;
+                Ok((Self { stream: pump_side }, peer))
+            }
+        }
+
+        impl ClawVpnPollablePacketInterface for PollableMockInterface {
+            fn interface_fd(&self) -> RawFd {
+                self.stream.as_raw_fd()
+            }
+
+            fn read_packet_nonblocking(&mut self, buf: &mut [u8]) -> std::io::Result<Option<usize>> {
+                match self.stream.recv(buf) {
+                    Ok(n) => Ok(Some(n)),
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => Ok(None),
+                    Err(error) => Err(error),
+                }
+            }
+
+            fn write_packet_nonblocking(&mut self, packet: &[u8]) -> std::io::Result<bool> {
+                match self.stream.send(packet) {
+                    Ok(n) if n == packet.len() => Ok(true),
+                    Ok(_) => Ok(false),
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => Ok(false),
+                    Err(error) => Err(error),
+                }
+            }
+        }
+
         #[tokio::test]
         async fn dev_datapath_two_ends_forward_packets_over_loopback_relay_without_tun() {
             tokio::time::timeout(Duration::from_secs(10), async {
@@ -1988,7 +2030,6 @@ mod tests {
                 let addrs = config.addrs;
                 let device_packet = ipv4_packet(addrs.device(), addrs.claw());
                 let claw_packet = ipv4_packet(addrs.claw(), addrs.device());
-                let device_writes = Arc::new(Mutex::new(Vec::new()));
                 let claw_writes = Arc::new(Mutex::new(Vec::new()));
                 let claw_runtime_handles: ClawRuntimeHandles =
                     Arc::new(Mutex::new(Vec::new()));
@@ -2053,30 +2094,37 @@ mod tests {
                     .await
                 });
 
-                dev_datapath::run_device_datapath_with_test_inputs(
+                let (device_iface, device_peer) =
+                    PollableMockInterface::paired().expect("device interface pair");
+                device_peer
+                    .send(&device_packet)
+                    .expect("inject the device packet into the device interface");
+                let device_datapath_outcome = dev_datapath::run_device_datapath_with_test_inputs(
                     &offer,
                     &device,
                     &config,
                     NOW,
-                    bounded_runtime_config(2),
-                    Duration::from_secs(2),
-                    {
-                        let device_writes = Arc::clone(&device_writes);
-                        let device_packet = device_packet.clone();
-                        move |_config, context, relay| {
-                            assert_eq!(context.addrs(), addrs);
-                            Ok(mock_runtime_inputs(
-                                MockPacketInterface::with_packets(
-                                    vec![device_packet.clone()],
-                                    Arc::clone(&device_writes),
-                                ),
-                                relay,
-                            ))
-                        }
+                    bounded_runtime_config(16),
+                    move |_config, context, relay| {
+                        assert_eq!(context.addrs(), addrs);
+                        Ok(device_pollable_runtime_inputs(device_iface, relay))
                     },
                 )
-                .await
-                .expect("guest datapath exits cleanly");
+                .await;
+                // The pollable device pump forwards BOTH directions, then the claw
+                // responder closes the tunnel at end-of-exchange — which the device
+                // pump correctly surfaces as a fatal relay EOF (the same relay-EOF
+                // semantics #300 proves). A clean stop or that end-of-exchange EOF is
+                // acceptable; the authoritative proof is packet delivery, below. Any
+                // OTHER failure is a real regression.
+                if let Err(error) = &device_datapath_outcome {
+                    let detail = format!("{error:?}");
+                    assert!(
+                        detail.contains("UnexpectedEof"),
+                        "device datapath must stop cleanly or on the end-of-exchange relay EOF, \
+                         got: {detail}"
+                    );
+                }
 
                 claw_task
                     .await
@@ -2090,12 +2138,14 @@ mod tests {
                 }
                 relay_handle.abort();
 
+                let mut device_received = Vec::new();
+                let mut device_buf = vec![0u8; 2048];
+                while let Ok(n) = device_peer.recv(&mut device_buf) {
+                    device_received.push(device_buf[..n].to_vec());
+                }
                 assert!(
-                    device_writes
-                        .lock()
-                        .expect("device writes lock")
-                        .contains(&claw_packet),
-                    "device mock interface must receive the claw packet"
+                    device_received.contains(&claw_packet),
+                    "device interface must receive the claw packet from the pollable datapath"
                 );
                 assert!(
                     claw_writes
@@ -2344,10 +2394,22 @@ mod tests {
             >,
         ) -> ClawVpnRuntimeWiringInputs<
             MockPacketInterface,
-            server_rs::claw_vpn_relay_stream::ClawVpnRelayStream<
-                std::os::unix::net::UnixStream,
-            >,
+            server_rs::claw_vpn_relay_stream::ClawVpnRelayStream<std::os::unix::net::UnixStream>,
         > {
+            ClawVpnRuntimeWiringInputs {
+                route_platform: host_route_platform(),
+                interface_name: ClawVpnInterfaceName::new("t1mock0").expect("interface name"),
+                route_tool_paths: true_tool_paths(),
+                interface,
+                relay,
+            }
+        }
+
+        fn device_pollable_runtime_inputs(
+            interface: PollableMockInterface,
+            relay: ClawVpnPollableTargetSessionRelay,
+        ) -> ClawVpnRuntimeWiringInputs<PollableMockInterface, ClawVpnPollableTargetSessionRelay>
+        {
             ClawVpnRuntimeWiringInputs {
                 route_platform: host_route_platform(),
                 interface_name: ClawVpnInterfaceName::new("t1mock0").expect("interface name"),

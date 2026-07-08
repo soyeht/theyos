@@ -8,14 +8,19 @@ use std::fmt;
 use std::fs::File;
 use std::io::{self, Read, Write};
 use std::mem;
-use std::os::fd::{AsRawFd, FromRawFd};
+use std::os::fd::{AsRawFd, FromRawFd, RawFd};
 
 use crate::claw_vpn_packet_pump::ClawVpnPacketInterface;
+use crate::claw_vpn_pollable_pump::ClawVpnPollablePacketInterface;
 
 const MACOS_UTUN_CONTROL_NAME: &str = "com.apple.net.utun_control";
 const MACOS_UTUN_MAX_NAME_LEN: usize = libc::IFNAMSIZ - 1;
 const MACOS_UTUN_ADDRESS_FAMILY_HEADER_LEN: usize = 4;
 const MACOS_UTUN_MAX_IPV4_PACKET_LEN: usize = u16::MAX as usize;
+/// Bounded run of non-IPv4 utun frames (macOS emits IPv6/NDP on the interface)
+/// to skip within one non-blocking read before yielding — never fatal, never a
+/// forwarded packet.
+const MACOS_UTUN_NONBLOCKING_SKIP_LIMIT: usize = 16;
 
 #[derive(Clone, PartialEq, Eq, Hash)]
 pub struct ClawVpnMacosUtunName {
@@ -100,6 +105,40 @@ impl ClawVpnMacosUtunDevice {
     pub fn write_packet(&mut self, packet: &[u8]) -> io::Result<()> {
         write_utun_ipv4_packet(&mut self.file, packet)
     }
+
+    /// Put the utun fd into non-blocking mode for the pollable datapath. Not
+    /// done by `open()` — the blocking `ClawVpnPacketInterface` path is
+    /// unchanged; only the pollable wiring calls this.
+    #[allow(unsafe_code)]
+    pub fn set_nonblocking(&self) -> io::Result<()> {
+        let fd = self.file.as_raw_fd();
+        // SAFETY: `fd` is the open utun control socket owned by `self`; fcntl
+        // only reads and sets the file-status flags.
+        unsafe {
+            let flags = libc::fcntl(fd, libc::F_GETFL);
+            if flags < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            if libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) < 0 {
+                return Err(io::Error::last_os_error());
+            }
+        }
+        Ok(())
+    }
+}
+
+impl ClawVpnPollablePacketInterface for ClawVpnMacosUtunDevice {
+    fn interface_fd(&self) -> RawFd {
+        self.file.as_raw_fd()
+    }
+
+    fn read_packet_nonblocking(&mut self, buf: &mut [u8]) -> io::Result<Option<usize>> {
+        read_utun_ipv4_packet_nonblocking(&mut self.file, buf)
+    }
+
+    fn write_packet_nonblocking(&mut self, packet: &[u8]) -> io::Result<bool> {
+        write_utun_ipv4_packet_nonblocking(&mut self.file, packet)
+    }
 }
 
 impl ClawVpnPacketInterface for ClawVpnMacosUtunDevice {
@@ -121,6 +160,70 @@ fn read_utun_ipv4_packet(reader: &mut impl Read, buf: &mut [u8]) -> io::Result<u
 fn write_utun_ipv4_packet(file: &mut impl Write, packet: &[u8]) -> io::Result<()> {
     let frame = encode_utun_ipv4_frame(packet)?;
     file.write_all(&frame)
+}
+
+/// Non-blocking utun read for the pollable datapath. `WouldBlock` and a bounded
+/// run of non-IPv4 frames (macOS IPv6/NDP noise) both return `None` — never a
+/// transfer, never fatal. A malformed frame or a real I/O error stays fatal.
+fn read_utun_ipv4_packet_nonblocking(
+    reader: &mut impl Read,
+    buf: &mut [u8],
+) -> io::Result<Option<usize>> {
+    for _ in 0..MACOS_UTUN_NONBLOCKING_SKIP_LIMIT {
+        let mut framed =
+            vec![0; MACOS_UTUN_ADDRESS_FAMILY_HEADER_LEN + MACOS_UTUN_MAX_IPV4_PACKET_LEN];
+        let frame_len = match reader.read(&mut framed) {
+            Ok(0) => return Ok(None),
+            Ok(n) => n,
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        if frame_len < MACOS_UTUN_ADDRESS_FAMILY_HEADER_LEN {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "utun frame is missing the address-family header",
+            ));
+        }
+        let family = u32::from_be_bytes(
+            framed[..MACOS_UTUN_ADDRESS_FAMILY_HEADER_LEN]
+                .try_into()
+                .expect("utun address-family header has fixed length"),
+        );
+        if family != libc::AF_INET as u32 {
+            // Non-IPv4 (IPv6/NDP) — skip it and try the next frame this cycle.
+            continue;
+        }
+        return decode_utun_ipv4_frame(&framed[..frame_len], buf).map(Some);
+    }
+    // Too many consecutive non-IPv4 frames this cycle — yield; resume next poll.
+    Ok(None)
+}
+
+/// Non-blocking utun write for the pollable datapath. utun writes are
+/// packet-atomic: `Ok(true)` = the whole frame crossed; `Ok(false)` =
+/// `WouldBlock` (retry the same packet). A partial write would corrupt the
+/// tunnel, so it is fatal — this proves the atomicity assumption rather than
+/// silently assuming it.
+fn write_utun_ipv4_packet_nonblocking(
+    writer: &mut impl Write,
+    packet: &[u8],
+) -> io::Result<bool> {
+    let frame = encode_utun_ipv4_frame(packet)?;
+    match writer.write(&frame) {
+        Ok(n) if n == frame.len() => Ok(true),
+        // A non-empty frame accepted as zero bytes is not `WouldBlock`
+        // backpressure — it is a write-zero anomaly. Keep it fatal so the R->I
+        // direction fails closed instead of quietly retrying (@safia).
+        Ok(0) => Err(io::Error::new(
+            io::ErrorKind::WriteZero,
+            "utun accepted zero bytes of a packet (not backpressure)",
+        )),
+        Ok(_) => Err(io::Error::other(
+            "utun accepted only part of a packet (non-atomic write)",
+        )),
+        Err(error) if error.kind() == io::ErrorKind::WouldBlock => Ok(false),
+        Err(error) => Err(error),
+    }
 }
 
 fn encode_utun_ipv4_frame(packet: &[u8]) -> io::Result<Vec<u8>> {
