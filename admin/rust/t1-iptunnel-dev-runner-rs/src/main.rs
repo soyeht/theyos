@@ -2090,10 +2090,12 @@ mod tests {
                 // OTHER failure is a real regression.
                 if let Err(error) = &device_datapath_outcome {
                     let detail = format!("{error:?}");
+                    // Accept ONLY the end-of-exchange relay EOF — not a route-cleanup
+                    // failure that happens to stringify an EOF pump report (@brianna).
                     assert!(
-                        detail.contains("UnexpectedEof"),
-                        "device datapath must stop cleanly or on the end-of-exchange relay EOF, \
-                         got: {detail}"
+                        detail.contains("UnexpectedEof") && !detail.contains("RouteCleanup"),
+                        "device datapath must stop cleanly or on the end-of-exchange relay EOF \
+                         (never a route-cleanup failure), got: {detail}"
                     );
                 }
 
@@ -2107,10 +2109,12 @@ mod tests {
                     // relay EOF. A clean stop or that end-of-exchange EOF is fine;
                     // the delivery assertions below are the authoritative proof.
                     if let Err(detail) = handle.await.expect("claw runtime task joins") {
+                        // Accept ONLY the end-of-exchange relay EOF — not a route-cleanup
+                        // failure that stringifies an EOF pump report (@brianna).
                         assert!(
-                            detail.contains("UnexpectedEof"),
-                            "claw runtime must stop cleanly or on the end-of-exchange relay EOF, \
-                             got: {detail}"
+                            detail.contains("UnexpectedEof") && !detail.contains("RouteCleanup"),
+                            "claw runtime must stop cleanly or on the end-of-exchange relay EOF \
+                             (never a route-cleanup failure), got: {detail}"
                         );
                     }
                 }
