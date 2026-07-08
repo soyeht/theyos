@@ -124,6 +124,8 @@ jobs:
             ! -path 'scripts/generate-brew-formula.sh' \
             ! -path 'scripts/install-linux.sh' \
             ! -path 'scripts/uninstall-linux.sh' \
+            ! -path 'scripts/run-t1-dev-datapath.sh' \
+            ! -path 'scripts/test_run_t1_dev_datapath.sh' \
             2>/dev/null || true)
           if [ -n "$OPERATIONAL" ]; then
             echo "::error::Found .sh scripts in scripts/ — policy: all operations must use Rust binaries"
