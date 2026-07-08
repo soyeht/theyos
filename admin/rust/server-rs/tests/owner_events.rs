@@ -4582,8 +4582,10 @@ fn product_a_per_claw_vpn_dev_config_remains_default_off_and_unwired() {
             let allowed_target_session_relay_stream_adapter =
                 in_target_session_relay_module && references_relay_stream_adapter;
             let allowed_target_session_router_packet_interface = in_target_session_router_module
-                && ((line.contains("ClawVpnPacketInterface")
+                && (((line.contains("ClawVpnPacketInterface")
+                    || line.contains("ClawVpnPollablePacketInterface"))
                     && !line.contains("ClawVpnPacketPump")
+                    && !line.contains("ClawVpnPollablePump")
                     && !line.contains("ClawVpnPacketRelay")
                     && !line.contains("ClawVpnPacketPumpLoop"))
                     || in_target_session_router_tests);
@@ -4603,9 +4605,15 @@ fn product_a_per_claw_vpn_dev_config_remains_default_off_and_unwired() {
                 in_target_session_runtime_module && references_relay_stream_adapter;
             let allowed_target_session_runtime_relay_pair =
                 in_target_session_runtime_module && references_target_session_relay_adapter;
+            let allowed_target_session_router_relay_pair =
+                in_target_session_router_module && references_target_session_relay_adapter;
+            let allowed_t1_relay_stream_router_relay_pair =
+                in_t1_relay_stream_router_module && references_target_session_relay_adapter;
             let allowed_t1_relay_stream_router_packet_interface = in_t1_relay_stream_router_module
-                && ((line.contains("ClawVpnPacketInterface")
+                && (((line.contains("ClawVpnPacketInterface")
+                    || line.contains("ClawVpnPollablePacketInterface"))
                     && !line.contains("ClawVpnPacketPump")
+                    && !line.contains("ClawVpnPollablePump")
                     && !line.contains("ClawVpnPacketRelay")
                     && !line.contains("ClawVpnPacketPumpLoop"))
                     || in_t1_relay_stream_router_tests);
@@ -4795,6 +4803,8 @@ fn product_a_per_claw_vpn_dev_config_remains_default_off_and_unwired() {
                 || (!in_target_session_relay_module
                     && !target_session_relay_module_export
                     && !allowed_target_session_runtime_relay_pair
+                    && !allowed_target_session_router_relay_pair
+                    && !allowed_t1_relay_stream_router_relay_pair
                     && references_target_session_relay_adapter)
                 || (!in_target_session_router_module
                     && !allowed_t1_caller_target_session_router

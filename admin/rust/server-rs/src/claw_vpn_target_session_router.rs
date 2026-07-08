@@ -13,9 +13,13 @@ use std::os::unix::net::UnixStream as StdUnixStream;
 use household_rs::claw_share_data_tunnel::{ClawTargetRouter, DataTunnelError, TargetSession};
 
 use crate::claw_vpn_packet_pump::ClawVpnPacketInterface;
+use crate::claw_vpn_pollable_pump::ClawVpnPollablePacketInterface;
 use crate::claw_vpn_relay_stream::ClawVpnRelayStream;
-use crate::claw_vpn_target_session_runtime::ClawVpnTargetSessionRuntime;
-use crate::claw_vpn_wiring::ClawVpnRuntimeWiring;
+use crate::claw_vpn_target_session_relay::ClawVpnPollableTargetSessionRelay;
+use crate::claw_vpn_target_session_runtime::{
+    ClawVpnPollableTargetSessionRuntime, ClawVpnTargetSessionRuntime,
+};
+use crate::claw_vpn_wiring::{ClawVpnPollableRuntimeWiring, ClawVpnRuntimeWiring};
 
 pub type ClawVpnTargetSessionRouterBuildResult<I> =
     Result<Option<ClawVpnTargetSessionRuntime<I>>, ClawVpnTargetSessionRouterBuildError>;
@@ -83,6 +87,72 @@ where
         let (target_session, wiring) = runtime.into_parts();
         (self.launch_runtime)(wiring)
             .map_err(|_| target_unavailable("claw-vpn-target-session-runtime-launch-failed"))?;
+        Ok(target_session)
+    }
+}
+
+pub type ClawVpnPollableTargetSessionRouterBuildResult<I> =
+    Result<Option<ClawVpnPollableTargetSessionRuntime<I>>, ClawVpnTargetSessionRouterBuildError>;
+
+pub type ClawVpnPollableTargetSessionRouterWiring<I> =
+    ClawVpnPollableRuntimeWiring<I, ClawVpnPollableTargetSessionRelay>;
+
+/// Pollable (non-blocking) variant of [`ClawVpnTargetSessionRouter`]: builds a
+/// [`ClawVpnPollableTargetSessionRuntime`] and launches the pollable wiring so
+/// the Claw responder runs the readiness-driven pump instead of the blocking
+/// strict-alternating one.
+pub struct ClawVpnPollableTargetSessionRouter<I, BuildRuntime, LaunchRuntime> {
+    build_runtime: BuildRuntime,
+    launch_runtime: LaunchRuntime,
+    _interface: PhantomData<fn() -> I>,
+}
+
+impl<I, BuildRuntime, LaunchRuntime>
+    ClawVpnPollableTargetSessionRouter<I, BuildRuntime, LaunchRuntime>
+{
+    #[must_use]
+    pub fn new(build_runtime: BuildRuntime, launch_runtime: LaunchRuntime) -> Self {
+        Self {
+            build_runtime,
+            launch_runtime,
+            _interface: PhantomData,
+        }
+    }
+}
+
+impl<I, BuildRuntime, LaunchRuntime> fmt::Debug
+    for ClawVpnPollableTargetSessionRouter<I, BuildRuntime, LaunchRuntime>
+{
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ClawVpnPollableTargetSessionRouter")
+            .field("build_runtime", &"<redacted>")
+            .field("launch_runtime", &"<redacted>")
+            .finish()
+    }
+}
+
+impl<I, BuildRuntime, LaunchRuntime> ClawTargetRouter
+    for ClawVpnPollableTargetSessionRouter<I, BuildRuntime, LaunchRuntime>
+where
+    I: ClawVpnPollablePacketInterface + Send + 'static,
+    BuildRuntime: Fn(&str) -> ClawVpnPollableTargetSessionRouterBuildResult<I> + Send + Sync,
+    LaunchRuntime: Fn(ClawVpnPollableTargetSessionRouterWiring<I>) -> ClawVpnTargetSessionRouterLaunchResult
+        + Send
+        + Sync,
+{
+    async fn open(&self, target_id: &str) -> Result<TargetSession, DataTunnelError> {
+        let Some(runtime) = (self.build_runtime)(target_id).map_err(|_| {
+            target_unavailable("claw-vpn-pollable-target-session-runtime-unavailable")
+        })?
+        else {
+            return Err(target_unavailable(
+                "claw-vpn-pollable-target-session-runtime-disabled",
+            ));
+        };
+        let (target_session, wiring) = runtime.into_parts();
+        (self.launch_runtime)(wiring).map_err(|_| {
+            target_unavailable("claw-vpn-pollable-target-session-runtime-launch-failed")
+        })?;
         Ok(target_session)
     }
 }

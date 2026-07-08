@@ -43,13 +43,17 @@ use crate::claw_share_relay_stream_target_router::{
 };
 use crate::claw_vpn_dev_config::{ClawVpnDevConfig, ClawVpnDevConfigError};
 use crate::claw_vpn_packet_pump::ClawVpnPacketInterface;
+use crate::claw_vpn_pollable_pump::ClawVpnPollablePacketInterface;
 use crate::claw_vpn_relay_stream::ClawVpnRelayStream;
 use crate::claw_vpn_t1_caller::{ClawVpnT1CallerStatus, assemble_claw_vpn_t1_caller};
+use crate::claw_vpn_target_session_relay::ClawVpnPollableTargetSessionRelay;
 use crate::claw_vpn_target_session_router::{
-    ClawVpnTargetSessionRouterLaunchResult, ClawVpnTargetSessionRouterWiring,
+    ClawVpnPollableTargetSessionRouterWiring, ClawVpnTargetSessionRouterLaunchResult,
+    ClawVpnTargetSessionRouterWiring,
 };
 use crate::claw_vpn_target_session_runtime::{
-    ClawVpnTargetSessionRuntimeError, assemble_claw_vpn_target_session_runtime,
+    ClawVpnTargetSessionRuntimeError, assemble_claw_vpn_pollable_target_session_runtime,
+    assemble_claw_vpn_target_session_runtime,
 };
 use crate::claw_vpn_wiring::{
     ClawVpnRuntimeWiringConfig, ClawVpnRuntimeWiringContext, ClawVpnRuntimeWiringInputs,
@@ -1106,6 +1110,263 @@ where
             config.clone(),
             parts.runtime_config,
             parts.io_timeout,
+            parts.build_inputs,
+            parts.launch_runtime,
+            parts.audit_sink,
+        )
+    })
+}
+
+// ---- Pollable (non-blocking) T1 relay-stream responder ----
+//
+// Parallel to the blocking router above: identical admission, session-open/audit,
+// and gate, but it launches the readiness-driven pollable pump so the Claw
+// responder no longer stalls on an idle direction. The blocking router stays for
+// the inert prod mount; only the dev claw responder is switched to this variant.
+// No `io_timeout` — the pollable relay side is `O_NONBLOCK` (`new_pollable`).
+
+pub type ClawVpnPollableT1RelayStreamWiringInputs<I> =
+    ClawVpnRuntimeWiringInputs<I, ClawVpnPollableTargetSessionRelay>;
+pub type ClawVpnPollableT1RelayStreamBuildInputs<I> = Box<
+    dyn Fn(
+            &ClawVpnDevConfig,
+            &RelayStreamIpTunnelTarget,
+            ClawVpnRuntimeWiringContext,
+            ClawVpnPollableTargetSessionRelay,
+        ) -> io::Result<ClawVpnPollableT1RelayStreamWiringInputs<I>>
+        + Send
+        + Sync,
+>;
+pub type ClawVpnPollableT1RelayStreamLaunchRuntime<I> = Box<
+    dyn Fn(ClawVpnPollableTargetSessionRouterWiring<I>) -> ClawVpnTargetSessionRouterLaunchResult
+        + Send
+        + Sync,
+>;
+pub type ClawVpnPollableT1RelayStreamBoxedRouter<I> = ClawVpnPollableT1RelayStreamIpTunnelRouter<
+    I,
+    ClawVpnPollableT1RelayStreamBuildInputs<I>,
+    ClawVpnPollableT1RelayStreamLaunchRuntime<I>,
+>;
+
+pub struct ClawVpnPollableT1RelayStreamRouterParts<I, BuildInputs, LaunchRuntime> {
+    runtime_config: ClawVpnRuntimeWiringConfig,
+    build_inputs: BuildInputs,
+    launch_runtime: LaunchRuntime,
+    audit_sink: ClawVpnT1RelayStreamAuditSink,
+    _interface: PhantomData<fn() -> I>,
+}
+
+impl<I, BuildInputs, LaunchRuntime> fmt::Debug
+    for ClawVpnPollableT1RelayStreamRouterParts<I, BuildInputs, LaunchRuntime>
+{
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ClawVpnPollableT1RelayStreamRouterParts")
+            .field("runtime_config", &self.runtime_config)
+            .field("build_inputs", &"<redacted>")
+            .field("launch_runtime", &"<redacted>")
+            .field("audit_sink", &"<redacted>")
+            .finish()
+    }
+}
+
+impl<I, BuildInputs, LaunchRuntime>
+    ClawVpnPollableT1RelayStreamRouterParts<I, BuildInputs, LaunchRuntime>
+{
+    #[must_use]
+    pub fn new(
+        runtime_config: ClawVpnRuntimeWiringConfig,
+        build_inputs: BuildInputs,
+        launch_runtime: LaunchRuntime,
+        audit_sink: ClawVpnT1RelayStreamAuditSink,
+    ) -> Self {
+        Self {
+            runtime_config,
+            build_inputs,
+            launch_runtime,
+            audit_sink,
+            _interface: PhantomData,
+        }
+    }
+}
+
+pub struct ClawVpnPollableT1RelayStreamIpTunnelRouter<I, BuildInputs, LaunchRuntime> {
+    config: ClawVpnDevConfig,
+    runtime_config: ClawVpnRuntimeWiringConfig,
+    build_inputs: BuildInputs,
+    launch_runtime: LaunchRuntime,
+    audit_sink: ClawVpnT1RelayStreamAuditSink,
+    admission: Arc<Mutex<ClawVpnT1RelayStreamAdmission>>,
+    _interface: PhantomData<fn() -> I>,
+}
+
+impl<I, BuildInputs, LaunchRuntime> fmt::Debug
+    for ClawVpnPollableT1RelayStreamIpTunnelRouter<I, BuildInputs, LaunchRuntime>
+{
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ClawVpnPollableT1RelayStreamIpTunnelRouter")
+            .field("config", &self.config)
+            .field("runtime_config", &self.runtime_config)
+            .field("build_inputs", &"<redacted>")
+            .field("launch_runtime", &"<redacted>")
+            .field("audit_sink", &"<redacted>")
+            .field("admission", &"<redacted>")
+            .finish()
+    }
+}
+
+impl<I, BuildInputs, LaunchRuntime>
+    ClawVpnPollableT1RelayStreamIpTunnelRouter<I, BuildInputs, LaunchRuntime>
+{
+    #[must_use]
+    fn new(
+        config: ClawVpnDevConfig,
+        runtime_config: ClawVpnRuntimeWiringConfig,
+        build_inputs: BuildInputs,
+        launch_runtime: LaunchRuntime,
+        audit_sink: ClawVpnT1RelayStreamAuditSink,
+    ) -> Self {
+        Self::with_admission(
+            config,
+            runtime_config,
+            build_inputs,
+            launch_runtime,
+            audit_sink,
+            Arc::new(Mutex::new(ClawVpnT1RelayStreamAdmission::default())),
+        )
+    }
+
+    #[must_use]
+    fn with_admission(
+        config: ClawVpnDevConfig,
+        runtime_config: ClawVpnRuntimeWiringConfig,
+        build_inputs: BuildInputs,
+        launch_runtime: LaunchRuntime,
+        audit_sink: ClawVpnT1RelayStreamAuditSink,
+        admission: Arc<Mutex<ClawVpnT1RelayStreamAdmission>>,
+    ) -> Self {
+        Self {
+            config,
+            runtime_config,
+            build_inputs,
+            launch_runtime,
+            audit_sink,
+            admission,
+            _interface: PhantomData,
+        }
+    }
+}
+
+impl<I, BuildInputs, LaunchRuntime> RelayStreamIpTunnelRouter
+    for ClawVpnPollableT1RelayStreamIpTunnelRouter<I, BuildInputs, LaunchRuntime>
+where
+    I: ClawVpnPollablePacketInterface + Send + 'static,
+    BuildInputs: Fn(
+            &ClawVpnDevConfig,
+            &RelayStreamIpTunnelTarget,
+            ClawVpnRuntimeWiringContext,
+            ClawVpnPollableTargetSessionRelay,
+        ) -> io::Result<ClawVpnPollableT1RelayStreamWiringInputs<I>>
+        + Send
+        + Sync,
+    LaunchRuntime: Fn(ClawVpnPollableTargetSessionRouterWiring<I>) -> ClawVpnTargetSessionRouterLaunchResult
+        + Send
+        + Sync,
+{
+    async fn open_ip_tunnel(
+        &self,
+        target: RelayStreamIpTunnelTarget,
+    ) -> Result<TargetSession, DataTunnelError> {
+        let key = ClawVpnAclKey::try_new(
+            target.member_id().to_string(),
+            target.member_device_pub().clone(),
+            target.claw_id().to_string(),
+        )
+        .map_err(|_| target_unavailable("claw-vpn-t1-acl-key-invalid"))?;
+        let permit = {
+            let mut admission = self
+                .admission
+                .lock()
+                .map_err(|_| target_unavailable("claw-vpn-t1-admission-lock-poisoned"))?;
+            admission
+                .reserve(
+                    &key,
+                    self.config.max_sessions_per_member_claw(),
+                    self.config.max_sessions_per_claw(),
+                )
+                .map_err(target_unavailable)?;
+            ClawVpnT1RelayStreamAdmissionPermit {
+                admission: Arc::clone(&self.admission),
+                key: key.clone(),
+            }
+        };
+
+        let mut acl = ClawVpnAcl::new();
+        acl.grant(key.clone());
+        let registry = ClawVpnSessionRegistry::with_limits(
+            acl,
+            self.config.ipv4_pool(),
+            self.config.max_sessions_per_member_claw(),
+            self.config.max_sessions_per_claw(),
+        )
+        .map_err(|_| target_unavailable("claw-vpn-t1-session-registry-invalid"))?;
+        let mut core = ClawVpnAgentCore::new(ClawVpnDatapathSide::Claw, registry);
+        let (session, open_event) = core.open_with_audit(&key);
+        let session = session.map_err(|_| target_unavailable("claw-vpn-t1-session-open-failed"))?;
+        let session_id = session.id();
+        if let Err(reason) = (self.audit_sink)(open_event) {
+            let (_closed, close_event) = core.close_with_audit(session_id);
+            let _ = (self.audit_sink)(close_event);
+            return Err(target_unavailable(reason));
+        }
+        let session_core = core
+            .into_session_core(session_id)
+            .map_err(|_| target_unavailable("claw-vpn-t1-session-core-missing"))?;
+        let config = &self.config;
+        let build_inputs = &self.build_inputs;
+        let runtime = assemble_claw_vpn_pollable_target_session_runtime(
+            self.runtime_config,
+            move || session_core,
+            |context, relay| build_inputs(config, &target, context, relay),
+        )
+        .map_err(|error| map_runtime_error(&error))?;
+        let Some(runtime) = runtime else {
+            return Err(target_unavailable("claw-vpn-t1-runtime-disabled"));
+        };
+        let (target_session, wiring) = runtime.into_parts();
+        (self.launch_runtime)(wiring)
+            .map_err(|_| target_unavailable("claw-vpn-t1-runtime-launch-failed"))?;
+        Ok(attach_admission_permit(target_session, permit))
+    }
+}
+
+#[must_use = "inspect the T1 relay-stream router gate status before mounting IpTunnel"]
+pub fn assemble_claw_vpn_pollable_t1_relay_stream_router<
+    I,
+    LoadConfig,
+    LoadPreflight,
+    BuildRouterParts,
+    BuildInputs,
+    LaunchRuntime,
+>(
+    load_config: LoadConfig,
+    load_preflight: LoadPreflight,
+    build_router_parts: BuildRouterParts,
+) -> ClawVpnT1CallerStatus<ClawVpnPollableT1RelayStreamIpTunnelRouter<I, BuildInputs, LaunchRuntime>>
+where
+    LoadConfig: FnOnce() -> Result<Option<ClawVpnDevConfig>, ClawVpnDevConfigError>,
+    LoadPreflight: FnOnce() -> PerClawVpnT1PreflightEvidence,
+    BuildRouterParts: FnOnce(
+        &ClawVpnDevConfig,
+    )
+        -> ClawVpnPollableT1RelayStreamRouterParts<I, BuildInputs, LaunchRuntime>,
+    BuildInputs: Send + Sync,
+    LaunchRuntime: Send + Sync,
+{
+    assemble_claw_vpn_t1_caller(load_config, load_preflight, move |config| {
+        let parts = build_router_parts(config);
+        ClawVpnPollableT1RelayStreamIpTunnelRouter::new(
+            config.clone(),
+            parts.runtime_config,
             parts.build_inputs,
             parts.launch_runtime,
             parts.audit_sink,
