@@ -110,20 +110,28 @@ fi
 # ---------------------------------------------------------------------------
 # 3. fail-closed production guard (env AND args)
 # ---------------------------------------------------------------------------
-assert_exit 3 "prod guard: SOYEHT_ENGINE=com.soyeht.engine (env)" \
-    env SOYEHT_ENGINE=com.soyeht.engine bash "$SCRIPT"
-assert_exit 3 "prod guard: arg contains 8091" \
-    bash "$SCRIPT" --claw-id host8091
-assert_exit 3 "prod guard: arg contains the prod app bundle" \
-    bash "$SCRIPT" --config-file /Applications/Soyeht.app/cfg.json
-assert_exit 3 "prod guard: SOYEHT_ENGINE=com.soyeht.mac (env)" \
-    env SOYEHT_ENGINE=com.soyeht.mac bash "$SCRIPT"
+# Production-indicator fixtures are fragment-assembled so THIS test file, like
+# the script under test, carries no contiguous production identifier (the
+# section-5 self-check enforces that on both files).
+PROD_ENGINE="com.soyeht.""engine"
+PROD_MAC="com.soyeht.""mac"
+PROD_APP="Soyeht"".app"
+PROD_PORT="80""91"
+
+assert_exit 3 "prod guard: prod engine label in env" \
+    env "SOYEHT_ENGINE=$PROD_ENGINE" bash "$SCRIPT"
+assert_exit 3 "prod guard: prod port in arg" \
+    bash "$SCRIPT" --claw-id "host$PROD_PORT"
+assert_exit 3 "prod guard: prod app bundle in arg" \
+    bash "$SCRIPT" --config-file "/Applications/$PROD_APP/cfg.json"
+assert_exit 3 "prod guard: prod mac bundle in env" \
+    env "SOYEHT_ENGINE=$PROD_MAC" bash "$SCRIPT"
 
 # dev-profile spellings (.dev) are accepted (guard passes -> dry-run exit 0)
-assert_exit 0 "dev profile allowed: com.soyeht.engine.dev" \
-    env SOYEHT_ENGINE=com.soyeht.engine.dev bash "$SCRIPT"
-assert_exit 0 "dev profile allowed: com.soyeht.mac.dev" \
-    env SOYEHT_ENGINE=com.soyeht.mac.dev bash "$SCRIPT"
+assert_exit 0 "dev profile allowed: engine .dev suffix" \
+    env "SOYEHT_ENGINE=$PROD_ENGINE.dev" bash "$SCRIPT"
+assert_exit 0 "dev profile allowed: mac .dev suffix" \
+    env "SOYEHT_ENGINE=$PROD_MAC.dev" bash "$SCRIPT"
 
 # ---------------------------------------------------------------------------
 # 4. --execute is refused without the dev acks/envs, and never launches a bin.
@@ -145,18 +153,28 @@ assert_exit 5 "--execute with gates but missing inputs fails closed pre-launch" 
         --bin-dir /nonexistent/bindir
 
 # ---------------------------------------------------------------------------
-# 5. dev-only source: no contiguous production identifiers in the script
+# 5. dev-only source: no contiguous production identifier in EITHER file,
+#    across 4 families (app bundle, engine port, mac bundle id, engine label).
+#    Patterns reuse the fragment-assembled $PROD_* strings, so this check embeds
+#    no contiguous prod literal either.
 # ---------------------------------------------------------------------------
-if grep -Fq 'Soyeht.app' "$SCRIPT"; then
-    bad "script must not contain the contiguous prod app literal"
-else
-    ok "script contains no contiguous prod app literal"
-fi
-if grep -Fq '8091' "$SCRIPT"; then
-    bad "script must not contain the contiguous prod port literal"
-else
-    ok "script contains no contiguous prod port literal"
-fi
+check_no_prod_literal() {
+    local target="$1" tname
+    tname="$(basename "$target")"
+    local entry name literal
+    for entry in "app bundle=$PROD_APP" "engine port=$PROD_PORT" \
+                 "mac bundle=$PROD_MAC" "engine label=$PROD_ENGINE"; do
+        name="${entry%%=*}"
+        literal="${entry#*=}"
+        if grep -Fq "$literal" "$target"; then
+            bad "$tname must not contain the contiguous prod $name literal"
+        else
+            ok "$tname has no contiguous prod $name literal"
+        fi
+    done
+}
+check_no_prod_literal "$SCRIPT"
+check_no_prod_literal "${BASH_SOURCE[0]}"
 
 # ---------------------------------------------------------------------------
 echo
