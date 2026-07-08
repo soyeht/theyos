@@ -417,3 +417,350 @@ fn poll_two(
         return Err(error);
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::claw_vpn_nonblocking_frame::ClawVpnNonblockingFrameReader;
+    use household_rs::claw_share_data_tunnel::TunnelFrame;
+    use household_rs::claw_vpn::{
+        ClawVpnAcl, ClawVpnAclKey, ClawVpnAgentCore, ClawVpnAuditReason, ClawVpnDatapathSide,
+        ClawVpnIpv4Pool, ClawVpnSessionAddrs, ClawVpnSessionRegistry,
+    };
+    use household_rs::keys::{IdentityKey, P256Keypair};
+    use std::net::Ipv4Addr;
+    use std::os::unix::io::AsRawFd;
+    use std::os::unix::net::{UnixDatagram, UnixStream};
+
+    // Tiny budgets so tests idle out in well under a second.
+    fn test_budget() -> ClawVpnPollablePumpBudget {
+        ClawVpnPollablePumpBudget {
+            poll_timeout_ms: 5,
+            max_idle_polls: 4,
+            max_partial_frame_polls: 4,
+            max_steps: 10_000,
+        }
+    }
+
+    #[allow(unsafe_code)]
+    fn set_nonblocking(fd: RawFd) {
+        // SAFETY: `fd` is an open socket owned by the test; fcntl only reads and
+        // sets the file-status flags.
+        unsafe {
+            let flags = libc::fcntl(fd, libc::F_GETFL);
+            assert!(flags >= 0, "F_GETFL failed");
+            let rc = libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
+            assert!(rc >= 0, "F_SETFL O_NONBLOCK failed");
+        }
+    }
+
+    fn session_core_and_addrs() -> (ClawVpnAgentSessionCore, ClawVpnSessionAddrs) {
+        let key =
+            ClawVpnAclKey::try_new("member-m1", P256Keypair::generate().public(), "claw-a").unwrap();
+        let mut acl = ClawVpnAcl::new();
+        assert!(acl.grant(key.clone()));
+        let pool = ClawVpnIpv4Pool::try_new(Ipv4Addr::new(198, 18, 0, 0), 24).unwrap();
+        let registry = ClawVpnSessionRegistry::new(acl, pool);
+        let mut core = ClawVpnAgentCore::new(ClawVpnDatapathSide::Device, registry);
+        let (session, open_event) = core.open_with_audit(&key);
+        let session = session.unwrap();
+        assert_eq!(open_event.reason(), ClawVpnAuditReason::SessionOpened);
+        let addrs = session.addrs();
+        let session_core = core.into_session_core(session.id()).unwrap();
+        (session_core, addrs)
+    }
+
+    fn ipv4_packet(src: Ipv4Addr, dst: Ipv4Addr) -> Vec<u8> {
+        let len = 20usize;
+        let mut packet = vec![0u8; len];
+        packet[0] = 0x45;
+        packet[2..4].copy_from_slice(&u16::try_from(len).unwrap().to_be_bytes());
+        packet[8] = 64;
+        packet[9] = 6;
+        packet[12..16].copy_from_slice(&src.octets());
+        packet[16..20].copy_from_slice(&dst.octets());
+        packet
+    }
+
+    fn frame_wire(frame: &TunnelFrame) -> Vec<u8> {
+        let payload = frame.encode();
+        let mut wire = u32::try_from(payload.len()).unwrap().to_be_bytes().to_vec();
+        wire.extend_from_slice(&payload);
+        wire
+    }
+
+    /// A packet-atomic interface over a `SOCK_DGRAM` socketpair. The pump owns
+    /// one end; the test's `control` end injects and captures packets.
+    struct TestInterface {
+        pump: UnixDatagram,
+    }
+
+    impl TestInterface {
+        fn pair() -> (Self, UnixDatagram) {
+            let (pump, control) = UnixDatagram::pair().unwrap();
+            set_nonblocking(pump.as_raw_fd());
+            set_nonblocking(control.as_raw_fd());
+            (Self { pump }, control)
+        }
+    }
+
+    impl ClawVpnPollablePacketInterface for TestInterface {
+        fn interface_fd(&self) -> RawFd {
+            self.pump.as_raw_fd()
+        }
+        fn read_packet_nonblocking(&mut self, buf: &mut [u8]) -> io::Result<Option<usize>> {
+            match self.pump.recv(buf) {
+                Ok(n) => Ok(Some(n)),
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => Ok(None),
+                Err(error) => Err(error),
+            }
+        }
+        fn write_packet_nonblocking(&mut self, packet: &[u8]) -> io::Result<bool> {
+            match self.pump.send(packet) {
+                Ok(_) => Ok(true),
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => Ok(false),
+                Err(error) => Err(error),
+            }
+        }
+    }
+
+    /// A byte-stream relay over a real `SOCK_STREAM` socketpair. The pump owns
+    /// one end; the test's `control` end sends and receives framed bytes.
+    struct TestRelay {
+        pump: UnixStream,
+    }
+
+    impl TestRelay {
+        fn pair() -> (Self, UnixStream) {
+            let (pump, control) = UnixStream::pair().unwrap();
+            set_nonblocking(pump.as_raw_fd());
+            set_nonblocking(control.as_raw_fd());
+            (Self { pump }, control)
+        }
+    }
+
+    impl io::Read for TestRelay {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            self.pump.read(buf)
+        }
+    }
+
+    impl io::Write for TestRelay {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            io::Write::write(&mut self.pump, buf)
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            io::Write::flush(&mut self.pump)
+        }
+    }
+
+    impl ClawVpnPollablePacketRelay for TestRelay {
+        fn relay_fd(&self) -> RawFd {
+            self.pump.as_raw_fd()
+        }
+    }
+
+    /// Drain all framed bytes waiting on a stream into decoded frames.
+    fn drain_frames(mut stream: &UnixStream) -> Vec<TunnelFrame> {
+        let mut reader = ClawVpnNonblockingFrameReader::new();
+        let mut frames = Vec::new();
+        loop {
+            match reader.poll_read(&mut stream).expect("relay decode") {
+                ClawVpnFrameReadProgress::Frame(frame) => frames.push(frame),
+                ClawVpnFrameReadProgress::Advanced | ClawVpnFrameReadProgress::Idle => break,
+            }
+        }
+        frames
+    }
+
+    // (1) The core T2 fix: interface→relay bursts forward while relay→interface
+    // is idle — the old pump died here on the idle relay read.
+    #[test]
+    fn forwards_interface_to_relay_bursts_while_relay_is_idle() {
+        let (core, addrs) = session_core_and_addrs();
+        let mut pump = ClawVpnPollablePump::new(core);
+        let (mut interface, iface_control) = TestInterface::pair();
+        let (mut relay, relay_control) = TestRelay::pair();
+
+        for _ in 0..3 {
+            iface_control
+                .send(&ipv4_packet(addrs.device(), addrs.claw()))
+                .unwrap();
+        }
+
+        let report = pump.run_until_stopped(&mut interface, &mut relay, &test_budget());
+
+        assert_eq!(report.stats.interface_to_relay_forwarded(), 3);
+        assert_eq!(report.stats.interface_to_relay_dropped(), 0);
+        assert_eq!(report.stats.relay_to_interface_forwarded(), 0);
+        assert!(
+            matches!(
+                report.stop_reason,
+                ClawVpnPollablePumpStopReason::IdleBudgetExhausted
+            ),
+            "idle relay must NOT be fatal (old-pump regression): {:?}",
+            report.stop_reason
+        );
+        assert_eq!(drain_frames(&relay_control).len(), 3, "3 frames on the relay");
+    }
+
+    // (2) The reverse: relay→interface bursts deliver while interface is idle.
+    #[test]
+    fn forwards_relay_to_interface_bursts_while_interface_is_idle() {
+        let (core, addrs) = session_core_and_addrs();
+        let mut pump = ClawVpnPollablePump::new(core);
+        let (mut interface, iface_control) = TestInterface::pair();
+        let (mut relay, mut relay_control) = TestRelay::pair();
+
+        for _ in 0..2 {
+            let frame = TunnelFrame::Data(ipv4_packet(addrs.claw(), addrs.device()));
+            io::Write::write_all(&mut relay_control, &frame_wire(&frame)).unwrap();
+        }
+
+        let report = pump.run_until_stopped(&mut interface, &mut relay, &test_budget());
+
+        assert_eq!(report.stats.relay_to_interface_forwarded(), 2);
+        assert_eq!(report.stats.relay_to_interface_dropped(), 0);
+        assert_eq!(report.stats.interface_to_relay_forwarded(), 0);
+        assert!(matches!(
+            report.stop_reason,
+            ClawVpnPollablePumpStopReason::IdleBudgetExhausted
+        ));
+        let mut buf = [0u8; 2048];
+        let n = iface_control.recv(&mut buf).unwrap();
+        assert_eq!(n, 20, "a delivered packet arrived on the interface");
+    }
+
+    // (3) No traffic → clean, bounded idle teardown (not a spin, not fatal).
+    #[test]
+    fn idle_datapath_stops_on_idle_budget() {
+        let (core, _addrs) = session_core_and_addrs();
+        let mut pump = ClawVpnPollablePump::new(core);
+        let (mut interface, _iface_control) = TestInterface::pair();
+        let (mut relay, _relay_control) = TestRelay::pair();
+
+        let report = pump.run_until_stopped(&mut interface, &mut relay, &test_budget());
+
+        assert_eq!(report.stats.interface_to_relay_forwarded(), 0);
+        assert_eq!(report.stats.relay_to_interface_forwarded(), 0);
+        assert!(matches!(
+            report.stop_reason,
+            ClawVpnPollablePumpStopReason::IdleBudgetExhausted
+        ));
+    }
+
+    // (4) A genuine relay EOF (peer closed) stays fatal.
+    #[test]
+    fn relay_eof_is_fatal() {
+        let (core, _addrs) = session_core_and_addrs();
+        let mut pump = ClawVpnPollablePump::new(core);
+        let (mut interface, _iface_control) = TestInterface::pair();
+        let (mut relay, relay_control) = TestRelay::pair();
+
+        drop(relay_control); // peer hangs up
+
+        let report = pump.run_until_stopped(&mut interface, &mut relay, &test_budget());
+
+        assert!(
+            matches!(
+                report.stop_reason,
+                ClawVpnPollablePumpStopReason::IoError {
+                    direction: ClawVpnPollablePumpDirection::RelayToInterface,
+                    ..
+                }
+            ),
+            "closed relay must be a fatal IoError: {:?}",
+            report.stop_reason
+        );
+    }
+
+    // (5) A per-packet policy reject is a counted drop that does NOT stop the pump.
+    #[test]
+    fn policy_drop_does_not_stop_the_pump() {
+        let (core, addrs) = session_core_and_addrs();
+        let mut pump = ClawVpnPollablePump::new(core);
+        let (mut interface, iface_control) = TestInterface::pair();
+        let (mut relay, _relay_control) = TestRelay::pair();
+
+        // Spoofed source (claw→device on the device's interface-read arm).
+        iface_control
+            .send(&ipv4_packet(addrs.claw(), addrs.device()))
+            .unwrap();
+
+        let report = pump.run_until_stopped(&mut interface, &mut relay, &test_budget());
+
+        assert_eq!(report.stats.interface_to_relay_dropped(), 1);
+        assert_eq!(report.stats.interface_to_relay_forwarded(), 0);
+        assert!(
+            matches!(
+                report.stop_reason,
+                ClawVpnPollablePumpStopReason::IdleBudgetExhausted
+            ),
+            "a policy drop must not stop the pump: {:?}",
+            report.stop_reason
+        );
+    }
+
+    // (6) A relay frame that starts but stops advancing is fatal on its own
+    // budget (distinct from plain idle).
+    #[test]
+    fn stalled_partial_relay_frame_is_fatal() {
+        let (core, _addrs) = session_core_and_addrs();
+        let mut pump = ClawVpnPollablePump::new(core);
+        let (mut interface, _iface_control) = TestInterface::pair();
+        let (mut relay, mut relay_control) = TestRelay::pair();
+
+        // Two of the four length-prefix bytes, then never the rest.
+        io::Write::write_all(&mut relay_control, &[0x00, 0x00]).unwrap();
+
+        let report = pump.run_until_stopped(&mut interface, &mut relay, &test_budget());
+
+        assert!(
+            matches!(
+                report.stop_reason,
+                ClawVpnPollablePumpStopReason::PartialFrameStalled
+            ),
+            "a stalled partial frame must be fatal, not treated as plain idle: {:?}",
+            report.stop_reason
+        );
+    }
+
+    // (7) Asymmetric bidirectional traffic (2 one way, 1 the other) forwards
+    // both ways with authoritative counters > 1 and no IoError — the case the
+    // old symmetric-preload test could not exercise.
+    #[test]
+    fn forwards_asymmetric_bidirectional_traffic() {
+        let (core, addrs) = session_core_and_addrs();
+        let mut pump = ClawVpnPollablePump::new(core);
+        let (mut interface, iface_control) = TestInterface::pair();
+        let (mut relay, mut relay_control) = TestRelay::pair();
+
+        for _ in 0..2 {
+            iface_control
+                .send(&ipv4_packet(addrs.device(), addrs.claw()))
+                .unwrap();
+        }
+        let frame = TunnelFrame::Data(ipv4_packet(addrs.claw(), addrs.device()));
+        io::Write::write_all(&mut relay_control, &frame_wire(&frame)).unwrap();
+
+        let report = pump.run_until_stopped(&mut interface, &mut relay, &test_budget());
+
+        assert_eq!(report.stats.interface_to_relay_forwarded(), 2);
+        assert_eq!(report.stats.relay_to_interface_forwarded(), 1);
+        assert!(
+            matches!(
+                report.stop_reason,
+                ClawVpnPollablePumpStopReason::IdleBudgetExhausted
+            ),
+            "asymmetric bidirectional must forward both ways then idle out: {:?}",
+            report.stop_reason
+        );
+        assert_eq!(drain_frames(&relay_control).len(), 2, "two frames on the relay");
+        let mut buf = [0u8; 2048];
+        assert_eq!(
+            iface_control.recv(&mut buf).unwrap(),
+            20,
+            "one packet delivered to the interface"
+        );
+    }
+}
