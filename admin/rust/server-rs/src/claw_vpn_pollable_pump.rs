@@ -109,10 +109,12 @@ pub enum ClawVpnPollablePumpStopReason {
     StepBudgetExhausted,
     /// A relay frame stopped advancing mid-frame past its budget — fatal.
     PartialFrameStalled,
-    /// A fatal I/O error on one arm (EOF/reset/write/decode/oversized).
+    /// A fatal I/O error on one arm (EOF/reset/write/decode/oversized). Only the
+    /// static `ErrorKind` category is kept — never the raw error — so the report
+    /// type cannot carry an endpoint/path/byte value.
     IoError {
         direction: ClawVpnPollablePumpDirection,
-        error: io::Error,
+        kind: io::ErrorKind,
     },
 }
 
@@ -122,12 +124,12 @@ impl fmt::Debug for ClawVpnPollablePumpStopReason {
             Self::IdleBudgetExhausted => f.write_str("IdleBudgetExhausted"),
             Self::StepBudgetExhausted => f.write_str("StepBudgetExhausted"),
             Self::PartialFrameStalled => f.write_str("PartialFrameStalled"),
-            // Deliberately drop the embedded error so no endpoint/path/byte
-            // detail can leak through the report.
-            Self::IoError { direction, .. } => f
+            // The kind is a static category (e.g. UnexpectedEof); no raw error
+            // is stored, so nothing can leak an endpoint/path/byte value.
+            Self::IoError { direction, kind } => f
                 .debug_struct("IoError")
                 .field("direction", direction)
-                .field("error", &"<redacted>")
+                .field("kind", kind)
                 .finish(),
         }
     }
@@ -138,15 +140,37 @@ impl fmt::Debug for ClawVpnPollablePumpStopReason {
 /// approximate wall-clock as `budget * poll_timeout`.
 #[derive(Debug, Clone, Copy)]
 pub struct ClawVpnPollablePumpBudget {
-    /// `poll()` timeout in milliseconds for one idle wait.
-    pub poll_timeout_ms: i32,
-    /// Consecutive non-progress iterations before a clean idle stop.
-    pub max_idle_polls: usize,
-    /// Consecutive non-progress iterations while mid-frame before a fatal
-    /// partial-frame stop.
-    pub max_partial_frame_polls: usize,
-    /// Absolute backstop on total iterations.
-    pub max_steps: usize,
+    poll_timeout_ms: i32,
+    max_idle_polls: usize,
+    max_partial_frame_polls: usize,
+    max_steps: usize,
+}
+
+impl ClawVpnPollablePumpBudget {
+    /// Construct a budget, rejecting values that would break the bounded /
+    /// no-stall contract: a negative `poll()` timeout (would block forever) or
+    /// any zero budget (would never stop).
+    #[must_use]
+    pub fn new(
+        poll_timeout_ms: i32,
+        max_idle_polls: usize,
+        max_partial_frame_polls: usize,
+        max_steps: usize,
+    ) -> Option<Self> {
+        if poll_timeout_ms < 0
+            || max_idle_polls == 0
+            || max_partial_frame_polls == 0
+            || max_steps == 0
+        {
+            return None;
+        }
+        Some(Self {
+            poll_timeout_ms,
+            max_idle_polls,
+            max_partial_frame_polls,
+            max_steps,
+        })
+    }
 }
 
 /// The end-of-run report: authoritative counters plus the stop reason.
@@ -220,7 +244,9 @@ impl ClawVpnPollablePump {
                 Err(reason) => return report(stats, reason),
             }
 
-            // No progress this iteration — advance the budgets.
+            // No progress this iteration — advance the budgets. While a relay
+            // frame is mid-flight, a no-progress stall is a partial-frame stall
+            // (fatal), never plain idle — regardless of the budget sizes.
             if self.relay_reader.is_mid_frame() {
                 mid_frame_polls += 1;
                 if mid_frame_polls >= budget.max_partial_frame_polls {
@@ -228,10 +254,10 @@ impl ClawVpnPollablePump {
                 }
             } else {
                 mid_frame_polls = 0;
-            }
-            idle_polls += 1;
-            if idle_polls >= budget.max_idle_polls {
-                return report(stats, ClawVpnPollablePumpStopReason::IdleBudgetExhausted);
+                idle_polls += 1;
+                if idle_polls >= budget.max_idle_polls {
+                    return report(stats, ClawVpnPollablePumpStopReason::IdleBudgetExhausted);
+                }
             }
 
             // Wait (bounded) for either fd to become ready before retrying.
@@ -252,10 +278,7 @@ impl ClawVpnPollablePump {
             ) {
                 return report(
                     stats,
-                    ClawVpnPollablePumpStopReason::IoError {
-                        direction: ClawVpnPollablePumpDirection::RelayToInterface,
-                        error,
-                    },
+                    io_error(ClawVpnPollablePumpDirection::RelayToInterface, error),
                 );
             }
         }
@@ -274,13 +297,17 @@ impl ClawVpnPollablePump {
     ) -> Result<bool, ClawVpnPollablePumpStopReason> {
         let mut progress = false;
 
-        // (1) Flush queued I→R frames out to the relay.
+        // (1) Flush queued I→R frames out to the relay. `forwarded` is counted
+        // here, on delivery (a whole frame crossing the fd), NOT at enqueue — a
+        // frame that never flushes is never reported as forwarded.
         if self.relay_writer.has_pending() {
             match self.relay_writer.poll_flush(relay) {
-                Ok(n) => {
-                    if n > 0 {
+                Ok(flushed) => {
+                    if flushed.bytes > 0 {
                         progress = true;
                     }
+                    stats.interface_to_relay_forwarded +=
+                        u64::try_from(flushed.frames_delivered).unwrap_or(u64::MAX);
                 }
                 Err(error) => {
                     return Err(io_error(ClawVpnPollablePumpDirection::InterfaceToRelay, error));
@@ -311,15 +338,16 @@ impl ClawVpnPollablePump {
                         .core
                         .frame_from_interface_with_audit(&self.interface_read_buf[..n]);
                     match frame {
-                        Ok(frame) => match self.relay_writer.enqueue(&frame) {
-                            Ok(()) => stats.interface_to_relay_forwarded += 1,
-                            Err(error) => {
+                        // Accepted: queue it. `forwarded` is counted on delivery
+                        // in step (1), not here — enqueue is not yet a transfer.
+                        Ok(frame) => {
+                            if let Err(error) = self.relay_writer.enqueue(&frame) {
                                 return Err(io_error(
                                     ClawVpnPollablePumpDirection::InterfaceToRelay,
                                     error,
                                 ));
                             }
-                        },
+                        }
                         Err(_) => stats.interface_to_relay_dropped += 1,
                     }
                 }
@@ -362,11 +390,18 @@ fn report(
     ClawVpnPollablePumpReport { stats, stop_reason }
 }
 
+// Takes the error by value on purpose: reducing it to a static `ErrorKind`
+// consumes it here, so a caller cannot format the raw `io::Error` afterward
+// (a no-value-echo enforcement, not just a style choice).
+#[allow(clippy::needless_pass_by_value)]
 fn io_error(
     direction: ClawVpnPollablePumpDirection,
     error: io::Error,
 ) -> ClawVpnPollablePumpStopReason {
-    ClawVpnPollablePumpStopReason::IoError { direction, error }
+    ClawVpnPollablePumpStopReason::IoError {
+        direction,
+        kind: error.kind(),
+    }
 }
 
 fn readiness_events(readable: bool, writable: bool) -> libc::c_short {
@@ -408,7 +443,9 @@ fn poll_two(
         // duration of the call; `poll` only reads `fd`/`events` and writes
         // `revents`.
         let nfds = libc::nfds_t::try_from(fds.len()).expect("exactly two pollfds");
-        let rc = unsafe { libc::poll(fds.as_mut_ptr(), nfds, timeout_ms) };
+        // Defense in depth: never pass a negative timeout to poll(2) (which
+        // would wait forever) even though the budget constructor rejects it.
+        let rc = unsafe { libc::poll(fds.as_mut_ptr(), nfds, timeout_ms.max(0)) };
         if rc >= 0 {
             return Ok(());
         }
@@ -436,12 +473,7 @@ mod tests {
 
     // Tiny budgets so tests idle out in well under a second.
     fn test_budget() -> ClawVpnPollablePumpBudget {
-        ClawVpnPollablePumpBudget {
-            poll_timeout_ms: 5,
-            max_idle_polls: 4,
-            max_partial_frame_polls: 4,
-            max_steps: 10_000,
-        }
+        ClawVpnPollablePumpBudget::new(5, 4, 4, 10_000).expect("valid budget")
     }
 
     #[allow(unsafe_code)]
@@ -481,15 +513,36 @@ mod tests {
     }
 
     fn ipv4_packet(src: Ipv4Addr, dst: Ipv4Addr) -> Vec<u8> {
+        ipv4_packet_tagged(src, dst, 0)
+    }
+
+    /// Like [`ipv4_packet`] but stamps a distinct byte in the IP identification
+    /// field (offset 4) — the session policy does not inspect it, so distinct
+    /// tags let a test assert exact per-packet payloads and ordering rather
+    /// than only counts.
+    fn ipv4_packet_tagged(src: Ipv4Addr, dst: Ipv4Addr, tag: u8) -> Vec<u8> {
         let len = 20usize;
         let mut packet = vec![0u8; len];
         packet[0] = 0x45;
         packet[2..4].copy_from_slice(&u16::try_from(len).unwrap().to_be_bytes());
+        packet[4] = tag;
         packet[8] = 64;
         packet[9] = 6;
         packet[12..16].copy_from_slice(&src.octets());
         packet[16..20].copy_from_slice(&dst.octets());
         packet
+    }
+
+    /// Extract the payload bytes of a sequence of `Data` frames, panicking on
+    /// any other frame type — so a test can compare the exact sequence.
+    fn data_payloads(frames: &[TunnelFrame]) -> Vec<Vec<u8>> {
+        frames
+            .iter()
+            .map(|frame| match frame {
+                TunnelFrame::Data(bytes) => bytes.clone(),
+                other => panic!("expected a Data frame, got {other:?}"),
+            })
+            .collect()
     }
 
     fn frame_wire(frame: &TunnelFrame) -> Vec<u8> {
@@ -596,10 +649,11 @@ mod tests {
         let (mut interface, iface_control) = TestInterface::pair();
         let (mut relay, relay_control) = TestRelay::pair();
 
-        for _ in 0..3 {
-            iface_control
-                .send(&ipv4_packet(addrs.device(), addrs.claw()))
-                .unwrap();
+        let packets: Vec<Vec<u8>> = (1..=3)
+            .map(|tag| ipv4_packet_tagged(addrs.device(), addrs.claw(), tag))
+            .collect();
+        for packet in &packets {
+            iface_control.send(packet).unwrap();
         }
 
         let report = pump.run_until_stopped(&mut interface, &mut relay, &test_budget());
@@ -615,7 +669,11 @@ mod tests {
             "idle relay must NOT be fatal (old-pump regression): {:?}",
             report.stop_reason
         );
-        assert_eq!(drain_frames(&relay_control).len(), 3, "3 frames on the relay");
+        assert_eq!(
+            data_payloads(&drain_frames(&relay_control)),
+            packets,
+            "exact frame sequence and payloads on the relay"
+        );
     }
 
     // (2) The reverse: relay→interface bursts deliver while interface is idle.
@@ -626,8 +684,11 @@ mod tests {
         let (mut interface, iface_control) = TestInterface::pair();
         let (mut relay, mut relay_control) = TestRelay::pair();
 
-        for _ in 0..2 {
-            let frame = TunnelFrame::Data(ipv4_packet(addrs.claw(), addrs.device()));
+        let packets: Vec<Vec<u8>> = (1..=2)
+            .map(|tag| ipv4_packet_tagged(addrs.claw(), addrs.device(), tag))
+            .collect();
+        for packet in &packets {
+            let frame = TunnelFrame::Data(packet.clone());
             io::Write::write_all(&mut relay_control, &frame_wire(&frame)).unwrap();
         }
 
@@ -640,9 +701,21 @@ mod tests {
             report.stop_reason,
             ClawVpnPollablePumpStopReason::IdleBudgetExhausted
         ));
+        for expected in &packets {
+            let mut buf = [0u8; 2048];
+            let n = iface_control.recv(&mut buf).unwrap();
+            assert_eq!(
+                &buf[..n],
+                expected.as_slice(),
+                "exact packet delivered to the interface"
+            );
+        }
         let mut buf = [0u8; 2048];
-        let n = iface_control.recv(&mut buf).unwrap();
-        assert_eq!(n, 20, "a delivered packet arrived on the interface");
+        assert_eq!(
+            iface_control.recv(&mut buf).unwrap_err().kind(),
+            io::ErrorKind::WouldBlock,
+            "no extra packet delivered"
+        );
     }
 
     // (3) No traffic → clean, bounded idle teardown (not a spin, not fatal).
@@ -749,13 +822,15 @@ mod tests {
         let (mut interface, iface_control) = TestInterface::pair();
         let (mut relay, mut relay_control) = TestRelay::pair();
 
-        for _ in 0..2 {
-            iface_control
-                .send(&ipv4_packet(addrs.device(), addrs.claw()))
-                .unwrap();
+        let i2r: Vec<Vec<u8>> = (1..=2)
+            .map(|tag| ipv4_packet_tagged(addrs.device(), addrs.claw(), tag))
+            .collect();
+        for packet in &i2r {
+            iface_control.send(packet).unwrap();
         }
-        let frame = TunnelFrame::Data(ipv4_packet(addrs.claw(), addrs.device()));
-        io::Write::write_all(&mut relay_control, &frame_wire(&frame)).unwrap();
+        let r2i = ipv4_packet_tagged(addrs.claw(), addrs.device(), 9);
+        io::Write::write_all(&mut relay_control, &frame_wire(&TunnelFrame::Data(r2i.clone())))
+            .unwrap();
 
         let report = pump.run_until_stopped(&mut interface, &mut relay, &test_budget());
 
@@ -769,12 +844,18 @@ mod tests {
             "asymmetric bidirectional must forward both ways then idle out: {:?}",
             report.stop_reason
         );
-        assert_eq!(drain_frames(&relay_control).len(), 2, "two frames on the relay");
-        let mut buf = [0u8; 2048];
         assert_eq!(
-            iface_control.recv(&mut buf).unwrap(),
-            20,
-            "one packet delivered to the interface"
+            data_payloads(&drain_frames(&relay_control)),
+            i2r,
+            "exact I→R frame sequence on the relay"
+        );
+        let mut buf = [0u8; 2048];
+        let n = iface_control.recv(&mut buf).unwrap();
+        assert_eq!(&buf[..n], r2i.as_slice(), "exact R→I packet on the interface");
+        assert_eq!(
+            iface_control.recv(&mut buf).unwrap_err().kind(),
+            io::ErrorKind::WouldBlock,
+            "no extra packet delivered"
         );
     }
 
@@ -795,14 +876,14 @@ mod tests {
         let mut device_relay = TestRelay::from_stream(relay_a);
         let mut claw_relay = TestRelay::from_stream(relay_b);
 
-        for _ in 0..2 {
-            device_ctl
-                .send(&ipv4_packet(addrs.device(), addrs.claw()))
-                .unwrap();
+        let d2c: Vec<Vec<u8>> = (1..=2)
+            .map(|tag| ipv4_packet_tagged(addrs.device(), addrs.claw(), tag))
+            .collect();
+        for packet in &d2c {
+            device_ctl.send(packet).unwrap();
         }
-        claw_ctl
-            .send(&ipv4_packet(addrs.claw(), addrs.device()))
-            .unwrap();
+        let c2d = ipv4_packet_tagged(addrs.claw(), addrs.device(), 9);
+        claw_ctl.send(&c2d).unwrap();
 
         let mut device_stats = ClawVpnPollablePumpStats::default();
         let mut claw_stats = ClawVpnPollablePumpStats::default();
@@ -820,16 +901,121 @@ mod tests {
         assert_eq!(claw_stats.interface_to_relay_forwarded(), 1);
         assert_eq!(claw_stats.relay_to_interface_forwarded(), 2);
 
+        for expected in &d2c {
+            let mut buf = [0u8; 2048];
+            let n = claw_ctl.recv(&mut buf).unwrap();
+            assert_eq!(
+                &buf[..n],
+                expected.as_slice(),
+                "exact device→claw packet at the claw edge"
+            );
+        }
         let mut buf = [0u8; 2048];
         assert_eq!(
-            claw_ctl.recv(&mut buf).unwrap(),
-            20,
-            "a device→claw packet arrived at the claw edge"
+            claw_ctl.recv(&mut buf).unwrap_err().kind(),
+            io::ErrorKind::WouldBlock,
+            "no extra at the claw edge"
+        );
+        let n = device_ctl.recv(&mut buf).unwrap();
+        assert_eq!(
+            &buf[..n],
+            c2d.as_slice(),
+            "exact claw→device packet at the device edge"
         );
         assert_eq!(
-            device_ctl.recv(&mut buf).unwrap(),
-            20,
-            "the claw→device packet arrived at the device edge"
+            device_ctl.recv(&mut buf).unwrap_err().kind(),
+            io::ErrorKind::WouldBlock,
+            "no extra at the device edge"
+        );
+    }
+
+    /// A relay whose reads and writes always report `WouldBlock` — models a
+    /// relay that never drains. Holds a real socketpair only so `poll()` has a
+    /// valid fd; the peer is kept alive so reads are `WouldBlock`, not EOF.
+    struct StallRelay {
+        pump: UnixStream,
+        _peer: UnixStream,
+    }
+
+    impl StallRelay {
+        fn new() -> Self {
+            let (pump, peer) = UnixStream::pair().unwrap();
+            set_nonblocking(pump.as_raw_fd());
+            set_nonblocking(peer.as_raw_fd());
+            Self { pump, _peer: peer }
+        }
+    }
+
+    impl io::Read for StallRelay {
+        fn read(&mut self, _buf: &mut [u8]) -> io::Result<usize> {
+            Err(io::Error::from(io::ErrorKind::WouldBlock))
+        }
+    }
+
+    impl io::Write for StallRelay {
+        fn write(&mut self, _buf: &[u8]) -> io::Result<usize> {
+            Err(io::Error::from(io::ErrorKind::WouldBlock))
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl ClawVpnPollablePacketRelay for StallRelay {
+        fn relay_fd(&self) -> RawFd {
+            self.pump.as_raw_fd()
+        }
+    }
+
+    // (9) A frame accepted by policy and queued but never delivered (relay never
+    // drains) must NOT be counted as forwarded — forwarding is delivery, not
+    // enqueue.
+    #[test]
+    fn queued_but_undelivered_frame_is_not_counted_forwarded() {
+        let (core, addrs) = session_core_and_addrs();
+        let mut pump = ClawVpnPollablePump::new(core);
+        let (mut interface, iface_control) = TestInterface::pair();
+        let mut relay = StallRelay::new();
+
+        iface_control
+            .send(&ipv4_packet(addrs.device(), addrs.claw()))
+            .unwrap();
+
+        let report = pump.run_until_stopped(&mut interface, &mut relay, &test_budget());
+
+        assert_eq!(
+            report.stats.interface_to_relay_forwarded(),
+            0,
+            "a queued-but-undelivered frame must not be reported as forwarded"
+        );
+        assert!(matches!(
+            report.stop_reason,
+            ClawVpnPollablePumpStopReason::IdleBudgetExhausted
+        ));
+    }
+
+    // (10) A stalled partial frame is fatal (PartialFrameStalled) even when the
+    // idle budget is SMALLER than the partial-frame budget — a mid-frame stall
+    // must never be reported as a clean idle stop.
+    #[test]
+    fn mid_frame_stall_beats_a_smaller_idle_budget() {
+        let (core, _addrs) = session_core_and_addrs();
+        let mut pump = ClawVpnPollablePump::new(core);
+        let (mut interface, _iface_control) = TestInterface::pair();
+        let (mut relay, mut relay_control) = TestRelay::pair();
+
+        io::Write::write_all(&mut relay_control, &[0x00, 0x00]).unwrap();
+
+        let budget = ClawVpnPollablePumpBudget::new(5, 2, 20, 10_000).expect("valid budget");
+        let report = pump.run_until_stopped(&mut interface, &mut relay, &budget);
+
+        assert!(
+            matches!(
+                report.stop_reason,
+                ClawVpnPollablePumpStopReason::PartialFrameStalled
+            ),
+            "mid-frame stall must be PartialFrameStalled even with a smaller idle budget: {:?}",
+            report.stop_reason
         );
     }
 }

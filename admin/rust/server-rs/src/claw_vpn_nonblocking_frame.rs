@@ -21,6 +21,7 @@
 
 use household_rs::claw_share_data_tunnel::{MAX_FRAME_LEN, TunnelFrame};
 use std::collections::VecDeque;
+use std::fmt;
 use std::io::{self, Read, Write};
 
 /// Bound on bytes buffered by the writer before it applies backpressure. A
@@ -47,7 +48,6 @@ fn queue_full_error() -> io::Error {
     io::Error::other("relay write queue is full")
 }
 
-#[derive(Debug)]
 enum ReadState {
     /// Accumulating the 4-byte big-endian length prefix.
     Len { buf: [u8; 4], filled: usize },
@@ -69,9 +69,23 @@ pub enum ClawVpnFrameReadProgress {
 }
 
 /// Stateful non-blocking reader for length-prefixed [`TunnelFrame`]s.
-#[derive(Debug)]
 pub struct ClawVpnNonblockingFrameReader {
     state: ReadState,
+}
+
+impl fmt::Debug for ClawVpnNonblockingFrameReader {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // Structural state only — never the buffered payload bytes.
+        let (state, filled, len) = match &self.state {
+            ReadState::Len { filled, .. } => ("Len", *filled, 4usize),
+            ReadState::Payload { payload, filled } => ("Payload", *filled, payload.len()),
+        };
+        f.debug_struct("ClawVpnNonblockingFrameReader")
+            .field("state", &state)
+            .field("filled", &filled)
+            .field("len", &len)
+            .finish_non_exhaustive()
+    }
 }
 
 impl Default for ClawVpnNonblockingFrameReader {
@@ -179,17 +193,39 @@ fn idle_or_advanced(advanced: bool) -> ClawVpnFrameReadProgress {
 /// are serialized into a pending byte queue so a partial write never loses a
 /// frame; the queue is bounded so a stalled peer applies backpressure instead
 /// of growing memory without limit.
-#[derive(Debug, Default)]
+/// Progress from one [`ClawVpnNonblockingFrameWriter::poll_flush`] call: bytes
+/// written and, distinctly, the number of frames whose final byte crossed to
+/// the fd this call. The pump counts a frame as forwarded only on delivery
+/// (`frames_delivered`), never at enqueue.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ClawVpnFlushProgress {
+    pub bytes: usize,
+    pub frames_delivered: usize,
+}
+
+#[derive(Default)]
 pub struct ClawVpnNonblockingFrameWriter {
     pending: VecDeque<u8>,
+    /// Wire length (4 + payload) of each not-yet-fully-flushed frame, in order.
+    frame_lengths: VecDeque<usize>,
+    /// Bytes of the current front frame already flushed.
+    front_flushed: usize,
+}
+
+impl fmt::Debug for ClawVpnNonblockingFrameWriter {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // Counts only — never the buffered payload bytes.
+        f.debug_struct("ClawVpnNonblockingFrameWriter")
+            .field("pending_bytes", &self.pending.len())
+            .field("pending_frames", &self.frame_lengths.len())
+            .finish_non_exhaustive()
+    }
 }
 
 impl ClawVpnNonblockingFrameWriter {
     #[must_use]
     pub fn new() -> Self {
-        Self {
-            pending: VecDeque::new(),
-        }
+        Self::default()
     }
 
     /// `true` while bytes remain to flush.
@@ -219,8 +255,10 @@ impl ClawVpnNonblockingFrameWriter {
             return Err(queue_full_error());
         }
         let len = u32::try_from(payload.len()).map_err(|_| oversized_error())?;
+        let wire_len = 4 + payload.len();
         self.pending.extend(len.to_be_bytes());
         self.pending.extend(payload);
+        self.frame_lengths.push_back(wire_len);
         Ok(())
     }
 
@@ -230,21 +268,44 @@ impl ClawVpnNonblockingFrameWriter {
     ///
     /// - `Ok(n)` — flushed `n` bytes; check [`Self::has_pending`] for more.
     /// - `Err(_)` — fatal write error (including a zero-length accept).
-    pub fn poll_flush(&mut self, writer: &mut impl Write) -> io::Result<usize> {
-        let mut flushed = 0;
+    pub fn poll_flush(&mut self, writer: &mut impl Write) -> io::Result<ClawVpnFlushProgress> {
+        let mut progress = ClawVpnFlushProgress::default();
         while !self.pending.is_empty() {
             let front = self.pending.as_slices().0;
             match writer.write(front) {
                 Ok(0) => return Err(write_zero_error()),
                 Ok(n) => {
                     self.pending.drain(..n);
-                    flushed += n;
+                    progress.bytes += n;
+                    self.advance_frame_boundaries(n, &mut progress.frames_delivered);
                 }
-                Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Ok(flushed),
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Ok(progress),
                 Err(error) => return Err(error),
             }
         }
-        Ok(flushed)
+        Ok(progress)
+    }
+
+    /// Advance `front_flushed` / pop completed frames as `flushed` bytes leave
+    /// the front of the queue, counting each frame whose final byte crossed.
+    fn advance_frame_boundaries(&mut self, flushed: usize, frames_delivered: &mut usize) {
+        let mut remaining = flushed;
+        while remaining > 0 {
+            let front_len = *self
+                .frame_lengths
+                .front()
+                .expect("frame_lengths tracks every pending byte");
+            let needed = front_len - self.front_flushed;
+            if remaining >= needed {
+                *frames_delivered += 1;
+                self.frame_lengths.pop_front();
+                self.front_flushed = 0;
+                remaining -= needed;
+            } else {
+                self.front_flushed += remaining;
+                remaining = 0;
+            }
+        }
     }
 }
 
@@ -427,14 +488,58 @@ mod tests {
         writer.enqueue(&frame).expect("enqueue");
         assert!(writer.has_pending());
         let mut sink = ThrottledWriter::new(3);
+        let mut delivered = 0;
         for _ in 0..(wire.len() + 4) {
-            writer.poll_flush(&mut sink).expect("no fatal write error");
+            delivered += writer
+                .poll_flush(&mut sink)
+                .expect("no fatal write error")
+                .frames_delivered;
             if !writer.has_pending() {
                 break;
             }
         }
         assert!(!writer.has_pending(), "fully flushed");
         assert_eq!(sink.accepted, wire, "bytes on the wire match the frame exactly");
+        assert_eq!(delivered, 1, "exactly one frame delivered, counted on completion");
+    }
+
+    #[test]
+    fn writer_reports_no_delivery_until_frame_completes() {
+        // A sink that accepts up to `budget` bytes total, then WouldBlock — the
+        // frame's last byte never crosses, so no delivery is counted. This is
+        // the fail-closed check against forwarding overclaim: bytes may leave
+        // but a frame is "forwarded" only when it fully crosses.
+        struct StallAfter {
+            budget: usize,
+        }
+        impl Write for StallAfter {
+            fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+                if self.budget == 0 {
+                    return Err(io::Error::from(io::ErrorKind::WouldBlock));
+                }
+                let n = buf.len().min(self.budget);
+                self.budget -= n;
+                Ok(n)
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let frame = sample_frame();
+        let wire = encode_on_wire(&frame);
+        let mut writer = ClawVpnNonblockingFrameWriter::new();
+        writer.enqueue(&frame).expect("enqueue");
+        let mut sink = StallAfter {
+            budget: wire.len() - 1,
+        };
+        let progress = writer.poll_flush(&mut sink).expect("partial write ok");
+        assert_eq!(progress.bytes, wire.len() - 1, "partial bytes went out");
+        assert_eq!(
+            progress.frames_delivered, 0,
+            "an incomplete frame is NOT counted as delivered"
+        );
+        assert!(writer.has_pending(), "the final byte is still queued");
     }
 
     #[test]
