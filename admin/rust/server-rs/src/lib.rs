@@ -57,6 +57,7 @@ pub mod claw_vpn_linux_tun;
 pub mod claw_vpn_macos_utun;
 pub mod claw_vpn_nonblocking_frame;
 pub mod claw_vpn_packet_pump;
+pub mod claw_vpn_pollable_pump;
 pub mod claw_vpn_relay_stream;
 pub mod claw_vpn_runtime;
 pub mod claw_vpn_t1_caller;

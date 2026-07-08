@@ -44,7 +44,7 @@ fn write_zero_error() -> io::Error {
 }
 
 fn queue_full_error() -> io::Error {
-    io::Error::new(io::ErrorKind::Other, "relay write queue is full")
+    io::Error::other("relay write queue is full")
 }
 
 #[derive(Debug)]
