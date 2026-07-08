@@ -54,14 +54,14 @@ use server_rs::claw_vpn_linux_tun::{
 };
 #[cfg(target_os = "macos")]
 use server_rs::claw_vpn_macos_utun::ClawVpnMacosUtunDevice;
-use server_rs::claw_vpn_packet_pump::ClawVpnPacketInterface;
+use server_rs::claw_vpn_pollable_pump::ClawVpnPollablePacketInterface;
 use server_rs::claw_vpn_t1_relay_stream_router::{
-    ClawVpnT1RelayStreamAuditSink, ClawVpnT1RelayStreamBoxedRouter,
-    ClawVpnT1RelayStreamBuildInputs, ClawVpnT1RelayStreamLaunchRuntime,
-    ClawVpnT1RelayStreamRouterParts, assemble_claw_vpn_t1_relay_stream_router,
+    ClawVpnPollableT1RelayStreamBoxedRouter, ClawVpnPollableT1RelayStreamBuildInputs,
+    ClawVpnPollableT1RelayStreamLaunchRuntime, ClawVpnPollableT1RelayStreamRouterParts,
+    ClawVpnT1RelayStreamAuditSink, assemble_claw_vpn_pollable_t1_relay_stream_router,
 };
 use server_rs::claw_vpn_target_session_router::{
-    ClawVpnTargetSessionRouterLaunchError, ClawVpnTargetSessionRouterWiring,
+    ClawVpnPollableTargetSessionRouterWiring, ClawVpnTargetSessionRouterLaunchError,
 };
 use server_rs::claw_vpn_wiring::{ClawVpnRuntimeWiringConfig, ClawVpnRuntimeWiringInputs};
 use server_rs::household_state::HouseholdState;
@@ -86,7 +86,6 @@ const DEV_MAX_SESSIONS: &str = "1";
 const DEFAULT_RELAY_ENDPOINT: &str = "127.0.0.1:49152";
 const DEFAULT_OFFER_OUT: &str = "t1-iptunnel-offer.cbor";
 const DEFAULT_OFFER_TTL_SECS: u64 = 600;
-const TARGET_SESSION_IO_TIMEOUT: Duration = Duration::from_secs(5);
 const LINUX_IP_TOOL_PATH: &str = "/sbin/ip";
 #[cfg(target_os = "linux")]
 const LINUX_TUN_NAME: &str = "clawvpn-dev0";
@@ -384,11 +383,12 @@ fn route_tool_paths() -> std::io::Result<ClawVpnInterfaceRouteToolPaths> {
 }
 
 #[cfg(target_os = "linux")]
-fn t1_build_inputs() -> ClawVpnT1RelayStreamBuildInputs<ClawVpnLinuxTunDevice> {
+fn t1_build_inputs() -> ClawVpnPollableT1RelayStreamBuildInputs<ClawVpnLinuxTunDevice> {
     Box::new(|_config, _target, _context, relay| {
         let tun_name = ClawVpnLinuxTunName::new(LINUX_TUN_NAME)
             .map_err(|error| std::io::Error::other(error.to_string()))?;
         let device = ClawVpnLinuxTunDevice::open(&ClawVpnLinuxTunConfig::new(tun_name))?;
+        device.set_nonblocking()?;
         let interface_name = ClawVpnInterfaceName::new(device.name().as_str())
             .map_err(|error| std::io::Error::other(format!("{error:?}")))?;
         Ok(ClawVpnRuntimeWiringInputs {
@@ -402,9 +402,10 @@ fn t1_build_inputs() -> ClawVpnT1RelayStreamBuildInputs<ClawVpnLinuxTunDevice> {
 }
 
 #[cfg(target_os = "macos")]
-fn t1_build_inputs() -> ClawVpnT1RelayStreamBuildInputs<ClawVpnMacosUtunDevice> {
+fn t1_build_inputs() -> ClawVpnPollableT1RelayStreamBuildInputs<ClawVpnMacosUtunDevice> {
     Box::new(|_config, _target, _context, relay| {
         let device = ClawVpnMacosUtunDevice::open()?;
+        device.set_nonblocking()?;
         let interface_name = ClawVpnInterfaceName::new(device.name().as_str())
             .map_err(|error| std::io::Error::other(format!("{error:?}")))?;
         Ok(ClawVpnRuntimeWiringInputs {
@@ -417,11 +418,11 @@ fn t1_build_inputs() -> ClawVpnT1RelayStreamBuildInputs<ClawVpnMacosUtunDevice> 
     })
 }
 
-fn t1_runtime_launcher<I>() -> ClawVpnT1RelayStreamLaunchRuntime<I>
+fn t1_runtime_launcher<I>() -> ClawVpnPollableT1RelayStreamLaunchRuntime<I>
 where
-    I: ClawVpnPacketInterface + Send + 'static,
+    I: ClawVpnPollablePacketInterface + Send + 'static,
 {
-    Box::new(|mut wiring: ClawVpnTargetSessionRouterWiring<I>| {
+    Box::new(|mut wiring: ClawVpnPollableTargetSessionRouterWiring<I>| {
         tokio::task::spawn_blocking(move || {
             if wiring.run_until_stopped().is_err() {
                 eprintln!("t1 claw dev: datapath runtime stopped");
@@ -440,15 +441,16 @@ type DevPacketInterface = ClawVpnLinuxTunDevice;
 #[cfg(target_os = "macos")]
 type DevPacketInterface = ClawVpnMacosUtunDevice;
 
-fn dev_t1_router(relay_endpoint: &str) -> ClawVpnT1RelayStreamBoxedRouter<DevPacketInterface> {
+fn dev_t1_router(
+    relay_endpoint: &str,
+) -> ClawVpnPollableT1RelayStreamBoxedRouter<DevPacketInterface> {
     let endpoint = relay_endpoint.to_string();
-    let status = assemble_claw_vpn_t1_relay_stream_router(
+    let status = assemble_claw_vpn_pollable_t1_relay_stream_router(
         move || dev_claw_vpn_config(&endpoint),
         || PerClawVpnT1PreflightEvidence::new(true, true, true),
         |_config| {
-            ClawVpnT1RelayStreamRouterParts::new(
+            ClawVpnPollableT1RelayStreamRouterParts::new(
                 enabled_t1_wiring_config(),
-                TARGET_SESSION_IO_TIMEOUT,
                 t1_build_inputs(),
                 t1_runtime_launcher(),
                 no_op_audit_sink(),

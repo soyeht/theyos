@@ -1850,7 +1850,7 @@ mod tests {
     mod dev_datapath_two_end_integration {
         use super::*;
 
-        use std::collections::{BTreeMap, VecDeque};
+        use std::collections::BTreeMap;
         use std::net::{Ipv4Addr, SocketAddr};
         use std::path::PathBuf;
         use std::sync::{Arc, Mutex};
@@ -1888,21 +1888,19 @@ mod tests {
         use server_rs::claw_vpn_interface_route_plan::{
             ClawVpnInterfaceName, ClawVpnInterfaceRoutePlatform, ClawVpnInterfaceRouteToolPaths,
         };
-        use server_rs::claw_vpn_packet_pump::{
-            ClawVpnPacketInterface, ClawVpnPacketPumpProductionDriverBudget,
-        };
+        use server_rs::claw_vpn_packet_pump::ClawVpnPacketPumpProductionDriverBudget;
         use server_rs::claw_vpn_pollable_pump::ClawVpnPollablePacketInterface;
         use server_rs::claw_vpn_runtime::ClawVpnRuntimeStepBudget;
         use server_rs::claw_vpn_target_session_relay::ClawVpnPollableTargetSessionRelay;
         use std::os::fd::{AsRawFd, RawFd};
         use std::os::unix::net::UnixDatagram;
         use server_rs::claw_vpn_t1_relay_stream_router::{
-            ClawVpnT1RelayStreamAuditSink, ClawVpnT1RelayStreamBuildInputs,
-            ClawVpnT1RelayStreamLaunchRuntime, ClawVpnT1RelayStreamRouterParts,
-            assemble_claw_vpn_t1_relay_stream_router,
+            ClawVpnPollableT1RelayStreamBuildInputs, ClawVpnPollableT1RelayStreamLaunchRuntime,
+            ClawVpnPollableT1RelayStreamRouterParts, ClawVpnT1RelayStreamAuditSink,
+            assemble_claw_vpn_pollable_t1_relay_stream_router,
         };
         use server_rs::claw_vpn_target_session_router::{
-            ClawVpnTargetSessionRouterLaunchError, ClawVpnTargetSessionRouterWiring,
+            ClawVpnPollableTargetSessionRouterWiring, ClawVpnTargetSessionRouterLaunchError,
         };
         use server_rs::claw_vpn_wiring::{
             ClawVpnRuntimeWiringConfig, ClawVpnRuntimeWiringInputs,
@@ -1922,43 +1920,6 @@ mod tests {
         // Factored out to satisfy clippy::type_complexity — the runtime handle
         // list is threaded through several two-ended-test helpers.
         type ClawRuntimeHandles = Arc<Mutex<Vec<JoinHandle<Result<(), String>>>>>;
-
-        #[derive(Clone, Default)]
-        struct MockPacketInterface {
-            reads: Arc<Mutex<VecDeque<Vec<u8>>>>,
-            writes: Arc<Mutex<Vec<Vec<u8>>>>,
-        }
-
-        impl MockPacketInterface {
-            fn with_packets(packets: Vec<Vec<u8>>, writes: Arc<Mutex<Vec<Vec<u8>>>>) -> Self {
-                Self {
-                    reads: Arc::new(Mutex::new(VecDeque::from(packets))),
-                    writes,
-                }
-            }
-        }
-
-        impl ClawVpnPacketInterface for MockPacketInterface {
-            fn read_packet(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-                let packet = self
-                    .reads
-                    .lock()
-                    .expect("mock packet reads lock")
-                    .pop_front()
-                    .unwrap_or_default();
-                let len = packet.len().min(buf.len());
-                buf[..len].copy_from_slice(&packet[..len]);
-                Ok(len)
-            }
-
-            fn write_packet(&mut self, packet: &[u8]) -> std::io::Result<()> {
-                self.writes
-                    .lock()
-                    .expect("mock packet writes lock")
-                    .push(packet.to_vec());
-                Ok(())
-            }
-        }
 
         /// Real-fd device interface mock for the pollable datapath: the pump
         /// `poll()`s a `UnixDatagram` end. The paired peer injects inbound
@@ -2028,9 +1989,15 @@ mod tests {
                 let config =
                     validate_session_config_bytes(device_config_json().as_bytes()).expect("config");
                 let addrs = config.addrs;
-                let device_packet = ipv4_packet(addrs.device(), addrs.claw());
+                // Two DISTINCT device packets (distinct IPv4 identification field,
+                // still valid IPv4 that passes the session policy) so the claw-edge
+                // assertion below cannot be false-greened by an accidental frame
+                // duplication (@alaine).
+                let mut device_packet_1 = ipv4_packet(addrs.device(), addrs.claw());
+                device_packet_1[4..6].copy_from_slice(&0xA1u16.to_be_bytes());
+                let mut device_packet_2 = ipv4_packet(addrs.device(), addrs.claw());
+                device_packet_2[4..6].copy_from_slice(&0xA2u16.to_be_bytes());
                 let claw_packet = ipv4_packet(addrs.claw(), addrs.device());
-                let claw_writes = Arc::new(Mutex::new(Vec::new()));
                 let claw_runtime_handles: ClawRuntimeHandles =
                     Arc::new(Mutex::new(Vec::new()));
 
@@ -2065,14 +2032,12 @@ mod tests {
                     admission: admission(&root, &owner, &record, &cert).await,
                     noise_keypair,
                 };
-                let claw_router = claw_router(
-                    &relay_endpoint,
-                    &MockPacketInterface::with_packets(
-                        vec![claw_packet.clone()],
-                        Arc::clone(&claw_writes),
-                    ),
-                    &claw_runtime_handles,
-                );
+                let (claw_iface, claw_peer) =
+                    PollableMockInterface::paired().expect("claw interface pair");
+                claw_peer
+                    .send(&claw_packet)
+                    .expect("inject the claw packet into the claw interface");
+                let claw_router = claw_router(&relay_endpoint, claw_iface, &claw_runtime_handles);
                 let binding = bind_relay_stream_reverse_connect_with_ip_tunnel_router(
                     Arc::new(offer.clone()),
                     trust,
@@ -2096,9 +2061,15 @@ mod tests {
 
                 let (device_iface, device_peer) =
                     PollableMockInterface::paired().expect("device interface pair");
+                // Asymmetric, off the old symmetric 1-each preload: the device side
+                // bursts TWO distinct packets while the claw side sends ONE, so both
+                // pollable pumps must forward uneven traffic without stalling.
                 device_peer
-                    .send(&device_packet)
-                    .expect("inject the device packet into the device interface");
+                    .send(&device_packet_1)
+                    .expect("inject the first device packet");
+                device_peer
+                    .send(&device_packet_2)
+                    .expect("inject the second device packet");
                 let device_datapath_outcome = dev_datapath::run_device_datapath_with_test_inputs(
                     &offer,
                     &device,
@@ -2107,7 +2078,7 @@ mod tests {
                     bounded_runtime_config(16),
                     move |_config, context, relay| {
                         assert_eq!(context.addrs(), addrs);
-                        Ok(device_pollable_runtime_inputs(device_iface, relay))
+                        Ok(pollable_runtime_inputs(device_iface, relay))
                     },
                 )
                 .await;
@@ -2119,10 +2090,12 @@ mod tests {
                 // OTHER failure is a real regression.
                 if let Err(error) = &device_datapath_outcome {
                     let detail = format!("{error:?}");
+                    // Accept ONLY the end-of-exchange relay EOF — not a route-cleanup
+                    // failure that happens to stringify an EOF pump report (@brianna).
                     assert!(
-                        detail.contains("UnexpectedEof"),
-                        "device datapath must stop cleanly or on the end-of-exchange relay EOF, \
-                         got: {detail}"
+                        detail.contains("UnexpectedEof") && !detail.contains("RouteCleanup"),
+                        "device datapath must stop cleanly or on the end-of-exchange relay EOF \
+                         (never a route-cleanup failure), got: {detail}"
                     );
                 }
 
@@ -2131,10 +2104,19 @@ mod tests {
                     .expect("claw task joins")
                     .expect("claw responder exits cleanly");
                 for handle in drain_runtime_handles(&claw_runtime_handles) {
-                    handle
-                        .await
-                        .expect("claw runtime task joins")
-                        .expect("claw runtime exits cleanly");
+                    // Like the device side: the claw pollable pump forwards, then
+                    // sees the device close the tunnel at end-of-exchange as a fatal
+                    // relay EOF. A clean stop or that end-of-exchange EOF is fine;
+                    // the delivery assertions below are the authoritative proof.
+                    if let Err(detail) = handle.await.expect("claw runtime task joins") {
+                        // Accept ONLY the end-of-exchange relay EOF — not a route-cleanup
+                        // failure that stringifies an EOF pump report (@brianna).
+                        assert!(
+                            detail.contains("UnexpectedEof") && !detail.contains("RouteCleanup"),
+                            "claw runtime must stop cleanly or on the end-of-exchange relay EOF \
+                             (never a route-cleanup failure), got: {detail}"
+                        );
+                    }
                 }
                 relay_handle.abort();
 
@@ -2143,16 +2125,33 @@ mod tests {
                 while let Ok(n) = device_peer.recv(&mut device_buf) {
                     device_received.push(device_buf[..n].to_vec());
                 }
-                assert!(
-                    device_received.contains(&claw_packet),
-                    "device interface must receive the claw packet from the pollable datapath"
+                let mut claw_received = Vec::new();
+                let mut claw_buf = vec![0u8; 2048];
+                while let Ok(n) = claw_peer.recv(&mut claw_buf) {
+                    claw_received.push(claw_buf[..n].to_vec());
+                }
+                // Both pollable pumps forwarded uneven traffic without stalling. The
+                // claw interface got EXACTLY the two DISTINCT device packets (not a
+                // duplicated single frame — the false-green a symmetric 1-each preload
+                // would have masked), and the device interface got exactly the one
+                // claw packet. Exact counts + distinct identity, no extra.
+                assert_eq!(
+                    device_received,
+                    vec![claw_packet.clone()],
+                    "device interface must receive exactly the one claw packet, got {} packet(s)",
+                    device_received.len()
                 );
                 assert!(
-                    claw_writes
-                        .lock()
-                        .expect("claw writes lock")
-                        .contains(&device_packet),
-                    "claw mock interface must receive the device packet"
+                    claw_received.contains(&device_packet_1)
+                        && claw_received.contains(&device_packet_2),
+                    "claw interface must receive BOTH distinct device packets"
+                );
+                assert_eq!(
+                    claw_received.len(),
+                    2,
+                    "claw interface must receive exactly the two device packets (no dup/extra), \
+                     got {}",
+                    claw_received.len()
                 );
             })
             .await
@@ -2309,13 +2308,14 @@ mod tests {
 
         fn claw_router(
             relay_endpoint: &str,
-            interface: &MockPacketInterface,
+            interface: PollableMockInterface,
             runtime_handles: &ClawRuntimeHandles,
-        ) -> server_rs::claw_vpn_t1_relay_stream_router::ClawVpnT1RelayStreamBoxedRouter<
-            MockPacketInterface,
+        ) -> server_rs::claw_vpn_t1_relay_stream_router::ClawVpnPollableT1RelayStreamBoxedRouter<
+            PollableMockInterface,
         > {
             let endpoint = relay_endpoint.to_string();
-            let status = assemble_claw_vpn_t1_relay_stream_router(
+            let runtime_handles = Arc::clone(runtime_handles);
+            let status = assemble_claw_vpn_pollable_t1_relay_stream_router(
                 move || {
                     ClawVpnDevConfig::from_values(
                         Some("1"),
@@ -2327,12 +2327,11 @@ mod tests {
                     )
                 },
                 || PerClawVpnT1PreflightEvidence::new(true, true, true),
-                |_config| {
-                    ClawVpnT1RelayStreamRouterParts::new(
-                        bounded_runtime_config(2),
-                        Duration::from_secs(2),
-                        claw_build_inputs(interface.clone()),
-                        claw_runtime_launcher(Arc::clone(runtime_handles)),
+                move |_config| {
+                    ClawVpnPollableT1RelayStreamRouterParts::new(
+                        bounded_runtime_config(16),
+                        claw_build_inputs(interface),
+                        claw_runtime_launcher(runtime_handles),
                         noop_audit_sink(),
                     )
                 },
@@ -2340,33 +2339,44 @@ mod tests {
             status
                 .into_ready()
                 .map(|(_mode, router)| router)
-                .expect("dev T1 router ready")
+                .expect("dev T1 pollable router ready")
         }
 
         fn claw_build_inputs(
-            interface: MockPacketInterface,
-        ) -> ClawVpnT1RelayStreamBuildInputs<MockPacketInterface> {
+            interface: PollableMockInterface,
+        ) -> ClawVpnPollableT1RelayStreamBuildInputs<PollableMockInterface> {
+            // The pollable interface holds a non-Clone UnixDatagram, and the
+            // build closure is `Fn`; move it in behind a take-once cell (one
+            // session per test open).
+            let interface = Mutex::new(Some(interface));
             Box::new(move |_config, _target, _context, relay| {
-                Ok(mock_runtime_inputs(interface.clone(), relay))
+                let interface = interface
+                    .lock()
+                    .expect("claw interface lock")
+                    .take()
+                    .ok_or_else(|| std::io::Error::other("claw interface already consumed"))?;
+                Ok(pollable_runtime_inputs(interface, relay))
             })
         }
 
         fn claw_runtime_launcher(
             runtime_handles: ClawRuntimeHandles,
-        ) -> ClawVpnT1RelayStreamLaunchRuntime<MockPacketInterface> {
-            Box::new(move |mut wiring: ClawVpnTargetSessionRouterWiring<MockPacketInterface>| {
-                let handle = tokio::task::spawn_blocking(move || {
-                    wiring
-                        .run_until_stopped()
-                        .map(|_report| ())
-                        .map_err(|error| format!("{error:?}"))
-                });
-                runtime_handles
-                    .lock()
-                    .expect("runtime handles lock")
-                    .push(handle);
-                Ok::<(), ClawVpnTargetSessionRouterLaunchError>(())
-            })
+        ) -> ClawVpnPollableT1RelayStreamLaunchRuntime<PollableMockInterface> {
+            Box::new(
+                move |mut wiring: ClawVpnPollableTargetSessionRouterWiring<PollableMockInterface>| {
+                    let handle = tokio::task::spawn_blocking(move || {
+                        wiring
+                            .run_until_stopped()
+                            .map(|_report| ())
+                            .map_err(|error| format!("{error:?}"))
+                    });
+                    runtime_handles
+                        .lock()
+                        .expect("runtime handles lock")
+                        .push(handle);
+                    Ok::<(), ClawVpnTargetSessionRouterLaunchError>(())
+                },
+            )
         }
 
         fn noop_audit_sink() -> ClawVpnT1RelayStreamAuditSink {
@@ -2387,25 +2397,7 @@ mod tests {
             )
         }
 
-        fn mock_runtime_inputs(
-            interface: MockPacketInterface,
-            relay: server_rs::claw_vpn_relay_stream::ClawVpnRelayStream<
-                std::os::unix::net::UnixStream,
-            >,
-        ) -> ClawVpnRuntimeWiringInputs<
-            MockPacketInterface,
-            server_rs::claw_vpn_relay_stream::ClawVpnRelayStream<std::os::unix::net::UnixStream>,
-        > {
-            ClawVpnRuntimeWiringInputs {
-                route_platform: host_route_platform(),
-                interface_name: ClawVpnInterfaceName::new("t1mock0").expect("interface name"),
-                route_tool_paths: true_tool_paths(),
-                interface,
-                relay,
-            }
-        }
-
-        fn device_pollable_runtime_inputs(
+        fn pollable_runtime_inputs(
             interface: PollableMockInterface,
             relay: ClawVpnPollableTargetSessionRelay,
         ) -> ClawVpnRuntimeWiringInputs<PollableMockInterface, ClawVpnPollableTargetSessionRelay>
