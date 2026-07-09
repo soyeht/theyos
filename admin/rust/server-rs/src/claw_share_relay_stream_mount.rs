@@ -471,7 +471,7 @@ fn t1_preflight_evidence_bundle_from_env() -> Option<PerClawVpnT1PreflightEviden
         Err(error) => {
             tracing::warn!(
                 stage = "claw_share.relay_stream.mount.claw_vpn_t1_preflight_evidence_unavailable",
-                error = ?error,
+                error = %error,
                 "per-Claw VPN T1 evidence record did not validate for this build"
             );
             None
@@ -502,7 +502,7 @@ fn t1_open_audit_sink_from_preflight(
         Err(error) => {
             tracing::warn!(
                 stage = "claw_share.relay_stream.mount.claw_vpn_t1_audit_sink_unavailable",
-                error = ?error,
+                error = %error,
                 "per-Claw VPN T1 audit sink remains unavailable"
             );
             Box::new(|_event| Err("claw-vpn-t1-audit-sink-unavailable"))
