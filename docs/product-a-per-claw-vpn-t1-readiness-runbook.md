@@ -308,10 +308,12 @@ The wiring PR that follows this runbook must show, before merge:
   only an absolute, canonical, current-user-owned, mode `0700` root directory
   and appends the fixed `claw-vpn-t1-audit/audit.jsonl` suffix.
   The current default-off mount may include a reviewed post-gate audit sink
-  builder that reads `THEYOS_CLAW_VPN_T1_AUDIT_ROOT`, validates the root with
-  the fixed path selector, and opens the log through the fd-relative
-  `O_NOFOLLOW` traversal. Missing or invalid root configuration must fail
-  closed. The startup wiring module may include a reviewed
+  builder that reads the private preflight evidence record from
+  `THEYOS_CLAW_VPN_T1_PREFLIGHT_EVIDENCE_RECORD`, binds the `audit_root` from
+  that SHA-bound record to the fixed path selector, and opens the log through
+  the fd-relative `O_NOFOLLOW` traversal. Missing or invalid evidence must keep
+  T1 preflight missing; invalid root configuration must fail closed. The startup
+  wiring module may include a reviewed
   `per_claw_vpn_t1_preflight_evidence_v1` JSON record parser/loader that is
   SHA-bound to one exact artifact, rejects production activation, carries the
   owner/rollback/hardware booleans, requires non-empty references to the owner
@@ -321,11 +323,11 @@ The wiring PR that follows this runbook must show, before merge:
   and `device_session_config_ref` as shape/privacy gates for the same artifact.
   The Rust loader/runtime does not consume those Python-side refs or apply the
   Device-side config. That loader is not authorization by itself, remains
-  source-guarded outside `startup_wiring`, and must remain unused by the mount
-  until the activation slice connects it to the gate. A live activation slice
-  must still wire that record into the mount,
-  bind the owner-controlled canonical root value to the
-  audit sink path, decide final retention/rotation limits, review export key
+  source-guarded outside `startup_wiring` and the reviewed mount call, and only
+  a valid private record for the current build may produce present preflight. A
+  live activation run must still verify the record contents, bind the
+  owner-controlled canonical root value to the audit sink path, decide final
+  retention/rotation limits, review export key
   source/rotation, and choose the best-effort-vs-durable authorization/in-flight
   semantics;
 - no raw `TunnelFrame`, packet bytes, interface name, file descriptor, local

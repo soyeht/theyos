@@ -154,29 +154,26 @@ parent components with fd-relative `openat`/`mkdirat`, rejects
 parent/intermediate symlinks and `..` components, opens the log file relative
 to the validated parent fd with `O_NOFOLLOW`, and creates or requires a real,
 current-user-owned, mode `0700` final parent directory for the log file. The
-router module also provides a reviewed keyed export redactor that derives
-off-host subject identifiers with HMAC-SHA-256 and does not emit the local
-pseudonymous subject hashes. It also provides a reviewed fixed audit-log path
-selector that accepts only an absolute, canonical, current-user-owned, mode
-`0700` root directory and appends the fixed
-`claw-vpn-t1-audit/audit.jsonl` suffix. The default-off mount now has a
-reviewed post-gate audit sink builder that reads the owner-controlled root from
-`THEYOS_CLAW_VPN_T1_AUDIT_ROOT`, validates it with the fixed path selector, and
-opens the log through the spooled sink's fd-relative `O_NOFOLLOW` traversal.
-Missing or invalid root configuration yields a fail-closed sink, and the builder
-remains unreachable while the mount supplies missing T1 preflight. The source
-guard tripwires those helpers, their public types, and their constants outside
-the T1 router module and the reviewed mount use, so future export caller or
-broader wiring reopens review. The local default-off check bundle now includes
-direct filters for those carries (`t1_spooled_audit_sink`, `t1_audit_log_path`,
-and `t1_audit_export_jsonl`) so a future E2E review does not rely only on
-mount-level smoke coverage.
-The current
-default-off mount still supplies
-`PerClawVpnT1PreflightEvidence::missing`, so a future activation slice must add
-reviewed wiring from the SHA-bound evidence record to the mount gate, bind the
-owner-controlled canonical root value from that evidence to the audit sink, and
-decide the final retention/rotation limits, reviewed export key source/rotation
+default-off mount draft now has a reviewed post-gate audit sink builder that
+reads the private preflight evidence record from
+`THEYOS_CLAW_VPN_T1_PREFLIGHT_EVIDENCE_RECORD`, binds the
+owner-controlled `audit_root` from that SHA-bound record to the fixed path
+selector, and opens the log through the spooled sink's fd-relative `O_NOFOLLOW`
+traversal. Missing, invalid, stale, or incomplete evidence yields missing T1
+preflight and keeps the mounted router unavailable; invalid audit-root
+configuration yields a fail-closed sink. The source guard tripwires those
+helpers, their public types, and their constants outside the T1 router module
+and the reviewed mount use, so future export caller or broader wiring reopens
+review. The local default-off check bundle now includes direct filters for
+those carries (`t1_spooled_audit_sink`, `t1_audit_log_path`, and
+`t1_audit_export_jsonl`) so a future E2E review does not rely only on
+mount-level smoke coverage. The draft mount wiring now calls the SHA-bound
+evidence loader only after the config gate, but only a valid private record for
+the current build can produce present preflight; absent, invalid, stale, or
+incomplete evidence still falls back to
+`PerClawVpnT1PreflightEvidence::missing`. Activation review must still verify
+the real owner/rollback/hardware references, the owner-controlled canonical
+root, final retention/rotation limits, reviewed export key source/rotation
 policy, and best-effort-vs-durable authorization/in-flight semantics. The
 startup wiring module now has a reviewed parser/loader for a
 `per_claw_vpn_t1_preflight_evidence_v1` JSON record that requires an exact
@@ -187,24 +184,20 @@ absolute normal `audit_root`; the offline private-record validator also
 requires and follows `audit_export_policy_ref` and `device_session_config_ref`
 as shape/privacy gates for the same artifact. The Rust loader/runtime does not
 consume those Python-side refs, export audit data, or apply Device-side session
-config. That helper is not called by the mount or the server binary in the
-default path, and the source guard tripwires those evidence record symbols
-outside `startup_wiring`. The mount now
-injects that backend through the same T1 caller gate, but the production path
-still supplies
-`PerClawVpnT1PreflightEvidence::missing`, so even with the T1 dev env present it
-falls back to `RelayStreamIpTunnelUnavailableRouter` before opening TUN/utun,
-installing routes, building runtime inputs, spawning the launcher, or running
-the packet pump. The source guard has a narrowly scoped mount exception for this
-reviewed wiring and continues to tripwire the same symbols anywhere else.
-There is still no
-authorized product/default path that calls the evidence loader or can make the
-T1 mount backend ready, no runtime/bin that opens a TUN/utun interface in a
-default path, no route installation or packet pump execution in default
-bootstrap, no storage-backed session registry, iOS Packet
-Tunnel, or product activation. Runtime/product activation remains default-off by
-construction, and every activation step (deploy, flag flip, shipping) is a
-separate, explicitly owner-authorized decision. The guest-kernel prerequisite is
+config. The source guard tripwires those evidence record symbols outside
+`startup_wiring` and the reviewed mount loader call. The mount now injects that
+backend through the same T1 caller gate. Without a valid current-build evidence
+record, even with the T1 dev env present, it falls back to
+`RelayStreamIpTunnelUnavailableRouter` before opening TUN/utun, installing
+routes, building runtime inputs, spawning the launcher, or running the packet
+pump. The source guard has a narrowly scoped mount exception for this reviewed
+wiring and continues to tripwire the same symbols anywhere else. There is still
+no authorized product live-run: production activation, deploy, flag flip,
+shipping, and any E2E that exercises the live T1 datapath remain separate,
+explicitly owner-authorized decisions. Default bootstrap without valid private
+evidence still cannot open a TUN/utun interface, install routes, execute the
+packet pump, create a storage-backed session registry, run an iOS Packet Tunnel,
+or activate product behavior. The guest-kernel prerequisite is
 different from the inert runtime helpers: it changes the default
 `firecracker-kernel` build artifact used by future Linux installs/builds, so it
 requires Linux/Nix build validation before merge even though it does not
@@ -553,9 +546,10 @@ Access between members/devices and claws is explicitly many-to-many:
   backend. The backend also delivers the typed `SessionOpen` audit event to a
   caller-supplied sink and fails closed if that sink rejects before runtime
   inputs or launcher execution; on that reject path it also delivers the
-  rollback `SessionClose` event to the same sink on a best-effort basis. The
-  current mount sink is only a reviewed placeholder behind missing preflight,
-  not live audit persistence. A reviewed spooled JSONL helper exists in the T1
+  rollback `SessionClose` event to the same sink on a best-effort basis. Missing
+  preflight still leaves the mounted sink fail-closed, and valid draft evidence
+  only selects the reviewed spooled sink; it is not live audit persistence or
+  activation authorization. A reviewed spooled JSONL helper exists in the T1
   router module for the activation slice; it writes redacted JSONL, forces
   owner-only log-file permissions, flushes and `sync_data`s each accepted event
   in its worker, rotates before writing a record that would exceed the reviewed
@@ -570,23 +564,25 @@ Access between members/devices and claws is explicitly many-to-many:
   these helpers outside the T1 router module. The router module also has a
   reviewed fixed audit-log path selector that requires an absolute canonical
   euid-owned `0700` root and appends the fixed
-  `claw-vpn-t1-audit/audit.jsonl` suffix. The default-off mount wires the local
-  audit sink builder only behind missing preflight, and the startup wiring
-  module has a reviewed SHA-bound evidence record parser/loader that remains
-  unused by the mount and binary and is source-guarded outside
-  `startup_wiring`. The record includes non-empty references to the owner
-  authorization, rollback artifact, hardware evidence pack, and audit export
-  policy through the offline validator, while the Rust loader consumes only the
-  reviewed runtime evidence fields. The future activation review must connect
-  that evidence record to the mount gate, bind the evidence `audit_root` to the
-  sink path, confirm the reviewed retention/rotation constants remain
-  acceptable for the exact run, verify export key
-  source/rotation/retention/destination content, and decide the final
-  best-effort-vs-durable
-  authorization/in-flight semantics. The environment-backed mount still
-  supplies missing preflight
-  evidence, so `Disabled`/invalid/missing-preflight/`Dial` paths all fall back
-  to the unavailable `IpTunnel` router before building runtime inputs, opening
+  `claw-vpn-t1-audit/audit.jsonl` suffix. The default-off mount draft now reads
+  a private SHA-bound evidence record from
+  `THEYOS_CLAW_VPN_T1_PREFLIGHT_EVIDENCE_RECORD` after the common config gate,
+  uses only the current-build loader, binds the record's `audit_root` to the
+  fixed path selector, and opens the log through the spooled sink. Missing,
+  stale, invalid, incomplete, or wrong-SHA evidence still yields missing
+  preflight and keeps `IpTunnel` unavailable; invalid audit-root configuration
+  yields the fail-closed sink before build inputs or launcher execution. The
+  offline private-record validator also requires non-empty references to the
+  owner authorization, rollback artifact, hardware evidence pack, and audit
+  export policy; the Rust loader consumes only the reviewed runtime evidence
+  fields and does not consume the audit export policy. This draft wiring does
+  not satisfy the activation gate by itself: the activation review must still
+  verify real owner/rollback/hardware references, the owner-controlled
+  canonical root, final retention/rotation limits, reviewed export key
+  source/rotation/retention/destination content, and the final
+  best-effort-vs-durable authorization/in-flight semantics.
+  `Disabled`/invalid/missing-preflight/`Dial` paths still fall back to the
+  unavailable `IpTunnel` router before building runtime inputs, opening
   TUN/utun, installing routes, spawning the launcher, or running the packet
   pump. This is the reviewed mount wiring shape, not T1 execution.
   Exit: T1–T4 green on dev hosts.

@@ -23,9 +23,11 @@
 //! `FileKeystore` (live keychain hardening later); handles live in a `OnceLock`
 //! rather than a graceful `AppState` holder.
 
+use std::cell::RefCell;
 use std::io;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
@@ -62,7 +64,7 @@ use crate::claw_share_relay_stream_runtime::{
 use crate::claw_share_relay_stream_target_router::{
     RelayStreamIpTunnelRouter, RelayStreamIpTunnelTarget, RelayStreamIpTunnelUnavailableRouter,
 };
-use crate::claw_vpn_dev_config::ClawVpnDevConfig;
+use crate::claw_vpn_dev_config::{ClawVpnDevConfig, ClawVpnDevConfigError};
 use crate::claw_vpn_interface_route_plan::{
     ClawVpnInterfaceName, ClawVpnInterfaceRoutePlatform, ClawVpnInterfaceRouteToolPaths,
 };
@@ -85,7 +87,10 @@ use crate::claw_vpn_target_session_router::{
 };
 use crate::claw_vpn_wiring::{ClawVpnRuntimeWiringConfig, ClawVpnRuntimeWiringInputs};
 use crate::household_state::HouseholdState;
-use crate::startup_wiring::PerClawVpnT1PreflightEvidence;
+use crate::startup_wiring::{
+    PerClawVpnT1PreflightEvidence, PerClawVpnT1PreflightEvidenceBundle,
+    load_per_claw_vpn_t1_preflight_evidence_record_for_current_build,
+};
 
 /// Env var that opts the `relay_stream` live path IN. Absent or non-truthy = OFF.
 const RELAY_STREAM_LIVE_ENV: &str = "THEYOS_RELAY_STREAM_LIVE";
@@ -113,7 +118,8 @@ const RELAY_STREAM_CLAWSITE_BACKEND_ENV: &str = "THEYOS_RELAY_STREAM_CLAWSITE_BA
 const RELAY_STREAM_RESOURCE_ENV: &str = "THEYOS_RELAY_STREAM_RESOURCE";
 
 const CLAW_VPN_T1_TARGET_SESSION_IO_TIMEOUT: Duration = Duration::from_secs(5);
-const CLAW_VPN_T1_AUDIT_ROOT_ENV: &str = "THEYOS_CLAW_VPN_T1_AUDIT_ROOT";
+const CLAW_VPN_T1_PREFLIGHT_EVIDENCE_RECORD_ENV: &str =
+    "THEYOS_CLAW_VPN_T1_PREFLIGHT_EVIDENCE_RECORD";
 #[cfg(target_os = "linux")]
 const CLAW_VPN_T1_LINUX_TUN_NAME: &str = "clawvpn0";
 const CLAW_VPN_LINUX_IP_TOOL_PATH: &str = "/sbin/ip";
@@ -396,34 +402,54 @@ fn build_mounted_ip_tunnel_router_from_t1_gate() -> RelayStreamMountedIpTunnelRo
 #[cfg(target_os = "linux")]
 fn assemble_linux_t1_ip_tunnel_router()
 -> ClawVpnT1CallerStatus<ClawVpnT1RelayStreamBoxedRouter<ClawVpnLinuxTunDevice>> {
-    assemble_claw_vpn_t1_relay_stream_router(
+    assemble_t1_ip_tunnel_router(
         ClawVpnDevConfig::from_env,
-        PerClawVpnT1PreflightEvidence::missing,
-        |_config| {
-            ClawVpnT1RelayStreamRouterParts::new(
-                enabled_claw_vpn_t1_wiring_config(),
-                CLAW_VPN_T1_TARGET_SESSION_IO_TIMEOUT,
-                linux_t1_build_inputs(),
-                t1_runtime_launcher(),
-                t1_open_audit_sink(),
-            )
-        },
+        t1_preflight_evidence_bundle_from_env,
+        linux_t1_build_inputs(),
+        t1_runtime_launcher(),
     )
 }
 
 #[cfg(target_os = "macos")]
 fn assemble_macos_t1_ip_tunnel_router()
 -> ClawVpnT1CallerStatus<ClawVpnT1RelayStreamBoxedRouter<ClawVpnMacosUtunDevice>> {
-    assemble_claw_vpn_t1_relay_stream_router(
+    assemble_t1_ip_tunnel_router(
         ClawVpnDevConfig::from_env,
-        PerClawVpnT1PreflightEvidence::missing,
-        |_config| {
+        t1_preflight_evidence_bundle_from_env,
+        macos_t1_build_inputs(),
+        t1_runtime_launcher(),
+    )
+}
+
+fn assemble_t1_ip_tunnel_router<I, LoadConfig, LoadEvidence>(
+    load_config: LoadConfig,
+    load_evidence_bundle: LoadEvidence,
+    build_inputs: ClawVpnT1RelayStreamBuildInputs<I>,
+    launch_runtime: ClawVpnT1RelayStreamLaunchRuntime<I>,
+) -> ClawVpnT1CallerStatus<ClawVpnT1RelayStreamBoxedRouter<I>>
+where
+    LoadConfig: FnOnce() -> Result<Option<ClawVpnDevConfig>, ClawVpnDevConfigError>,
+    LoadEvidence: FnOnce() -> Option<PerClawVpnT1PreflightEvidenceBundle>,
+{
+    let evidence_bundle = Rc::new(RefCell::new(None));
+    let preflight_bundle = Rc::clone(&evidence_bundle);
+    let sink_bundle = Rc::clone(&evidence_bundle);
+    assemble_claw_vpn_t1_relay_stream_router(
+        load_config,
+        move || {
+            let bundle = load_evidence_bundle();
+            let preflight = t1_preflight_evidence_or_missing(bundle.as_ref());
+            *preflight_bundle.borrow_mut() = bundle;
+            preflight
+        },
+        move |_config| {
+            let bundle = sink_bundle.borrow();
             ClawVpnT1RelayStreamRouterParts::new(
                 enabled_claw_vpn_t1_wiring_config(),
                 CLAW_VPN_T1_TARGET_SESSION_IO_TIMEOUT,
-                macos_t1_build_inputs(),
-                t1_runtime_launcher(),
-                t1_open_audit_sink(),
+                build_inputs,
+                launch_runtime,
+                t1_open_audit_sink_from_preflight(bundle.as_ref()),
             )
         },
     )
@@ -431,9 +457,6 @@ fn assemble_macos_t1_ip_tunnel_router()
 
 #[derive(Debug, thiserror::Error)]
 enum ClawVpnT1MountedAuditSinkError {
-    #[error("claw vpn t1 audit root env missing")]
-    MissingRoot,
-
     #[error("claw vpn t1 audit path unavailable")]
     Path(#[source] io::Error),
 
@@ -441,8 +464,40 @@ enum ClawVpnT1MountedAuditSinkError {
     Sink(#[source] ClawVpnT1AuditSinkError),
 }
 
-fn t1_open_audit_sink() -> ClawVpnT1RelayStreamAuditSink {
-    match t1_spooled_audit_sink_from_env() {
+fn t1_preflight_evidence_bundle_from_env() -> Option<PerClawVpnT1PreflightEvidenceBundle> {
+    let record_path = std::env::var_os(CLAW_VPN_T1_PREFLIGHT_EVIDENCE_RECORD_ENV)?;
+    match load_per_claw_vpn_t1_preflight_evidence_record_for_current_build(record_path) {
+        Ok(bundle) => Some(bundle),
+        Err(error) => {
+            tracing::warn!(
+                stage = "claw_share.relay_stream.mount.claw_vpn_t1_preflight_evidence_unavailable",
+                error = ?error,
+                "per-Claw VPN T1 evidence record did not validate for this build"
+            );
+            None
+        }
+    }
+}
+
+fn t1_preflight_evidence_or_missing(
+    bundle: Option<&PerClawVpnT1PreflightEvidenceBundle>,
+) -> PerClawVpnT1PreflightEvidence {
+    bundle.map_or_else(PerClawVpnT1PreflightEvidence::missing, |bundle| {
+        bundle.evidence()
+    })
+}
+
+fn t1_open_audit_sink_from_preflight(
+    bundle: Option<&PerClawVpnT1PreflightEvidenceBundle>,
+) -> ClawVpnT1RelayStreamAuditSink {
+    let Some(bundle) = bundle else {
+        tracing::warn!(
+            stage = "claw_share.relay_stream.mount.claw_vpn_t1_audit_sink_unavailable",
+            "per-Claw VPN T1 evidence record is missing; audit sink remains unavailable"
+        );
+        return Box::new(|_event| Err("claw-vpn-t1-audit-sink-unavailable"));
+    };
+    match t1_spooled_audit_sink_from_root(bundle.audit_root()) {
         Ok(sink) => sink,
         Err(error) => {
             tracing::warn!(
@@ -453,14 +508,6 @@ fn t1_open_audit_sink() -> ClawVpnT1RelayStreamAuditSink {
             Box::new(|_event| Err("claw-vpn-t1-audit-sink-unavailable"))
         }
     }
-}
-
-fn t1_spooled_audit_sink_from_env()
--> Result<ClawVpnT1RelayStreamAuditSink, ClawVpnT1MountedAuditSinkError> {
-    let root = std::env::var_os(CLAW_VPN_T1_AUDIT_ROOT_ENV)
-        .map(PathBuf::from)
-        .ok_or(ClawVpnT1MountedAuditSinkError::MissingRoot)?;
-    t1_spooled_audit_sink_from_root(root)
 }
 
 fn t1_spooled_audit_sink_from_root(
@@ -800,13 +847,15 @@ pub enum RelayStreamMountError {
 mod tests {
     use super::*;
 
+    use std::cell::Cell;
     use std::ffi::OsString;
     use std::os::unix::fs::PermissionsExt;
-    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
 
     use crate::claw_share_relay_stream_offer_store::relay_stream_offer_store_path;
     use crate::claw_share_relay_stream_test_support::{
-        attacker_signer, data_tunnel_credential, now_unix, owner_signer,
+        attacker_signer, data_tunnel_credential, guest_pub, now_unix, owner_signer,
         relay_stream_household_state, relay_stream_issuer_trust,
     };
     use crate::claw_vpn_dev_config::{
@@ -816,6 +865,9 @@ mod tests {
     };
     use crate::claw_vpn_t1_relay_stream_router::{
         CLAW_VPN_T1_AUDIT_LOG_DIRECTORY_NAME, CLAW_VPN_T1_AUDIT_LOG_FILE_NAME,
+    };
+    use crate::startup_wiring::{
+        PER_CLAW_VPN_T1_PREFLIGHT_EVIDENCE_SCHEMA, theyos_server_build_git_sha,
     };
 
     static CLAW_VPN_T1_TEST_ENV_LOCK: Mutex<()> = Mutex::new(());
@@ -939,14 +991,145 @@ mod tests {
         );
     }
 
+    fn t1_preflight_evidence_json(artifact_sha: &str, audit_root: &Path) -> String {
+        serde_json::json!({
+            "schema": PER_CLAW_VPN_T1_PREFLIGHT_EVIDENCE_SCHEMA,
+            "artifact_sha": artifact_sha,
+            "scope": "dev-host T1-T4 only",
+            "production_activation": false,
+            "owner_authorization": true,
+            "owner_authorization_ref": "owner-authorization-alpha",
+            "rollback": true,
+            "rollback_ref": "rollback-artifact-alpha",
+            "hardware_t1_t4": true,
+            "hardware_evidence_ref": "evidence-pack-t1-t4-alpha",
+            "audit_root": audit_root.to_str().unwrap(),
+        })
+        .to_string()
+    }
+
+    fn write_t1_preflight_evidence_record(
+        dir: &Path,
+        artifact_sha: &str,
+        audit_root: &Path,
+    ) -> PathBuf {
+        let record_path = dir.join("t1-preflight-evidence.json");
+        std::fs::write(
+            &record_path,
+            t1_preflight_evidence_json(artifact_sha, audit_root),
+        )
+        .unwrap();
+        record_path
+    }
+
+    fn write_t1_preflight_evidence_record_body(dir: &Path, name: &str, body: String) -> PathBuf {
+        let record_path = dir.join(name);
+        std::fs::write(&record_path, body).unwrap();
+        record_path
+    }
+
+    fn set_mounted_t1_live_test_env(record_path: Option<&str>) -> Vec<TestEnvRestore> {
+        vec![
+            set_t1_test_env(CLAW_VPN_T1_PREFLIGHT_EVIDENCE_RECORD_ENV, record_path),
+            set_t1_test_env(CLAW_VPN_LIVE_ENV, Some("1")),
+            set_t1_test_env(CLAW_VPN_DIAL_ENV, None),
+            set_t1_test_env(
+                CLAW_VPN_RELAY_ENDPOINT_ENV,
+                Some("relay-stream://127.0.0.1:49152"),
+            ),
+            set_t1_test_env(CLAW_VPN_IPV4_POOL_ENV, Some("198.18.0.0/24")),
+            set_t1_test_env(CLAW_VPN_MAX_SESSIONS_PER_MEMBER_CLAW_ENV, None),
+            set_t1_test_env(CLAW_VPN_MAX_SESSIONS_PER_CLAW_ENV, None),
+        ]
+    }
+
+    struct TestPacketInterface;
+
+    impl ClawVpnPacketInterface for TestPacketInterface {
+        fn read_packet(&mut self, _buf: &mut [u8]) -> io::Result<usize> {
+            panic!("test packet interface must not read packets");
+        }
+
+        fn write_packet(&mut self, _packet: &[u8]) -> io::Result<()> {
+            panic!("test packet interface must not write packets");
+        }
+    }
+
+    fn counting_t1_build_inputs(
+        build_count: Arc<AtomicUsize>,
+    ) -> ClawVpnT1RelayStreamBuildInputs<TestPacketInterface> {
+        Box::new(move |_config, _target, _context, _relay| {
+            build_count.fetch_add(1, Ordering::SeqCst);
+            panic!("test T1 build inputs must not be called")
+        })
+    }
+
+    fn counting_t1_runtime_launcher(
+        launch_count: Arc<AtomicUsize>,
+    ) -> ClawVpnT1RelayStreamLaunchRuntime<TestPacketInterface> {
+        Box::new(move |_wiring| {
+            launch_count.fetch_add(1, Ordering::SeqCst);
+            panic!("test T1 runtime launcher must not be called")
+        })
+    }
+
+    fn t1_target_for_mount_test() -> RelayStreamIpTunnelTarget {
+        RelayStreamIpTunnelTarget::new_for_test(
+            "group-alpha",
+            "member-alpha",
+            guest_pub(),
+            "claw-alpha",
+        )
+    }
+
     #[test]
-    fn t1_mount_audit_sink_missing_root_rejects_before_sink_creation() {
+    fn t1_mount_missing_evidence_keeps_preflight_missing() {
         let _lock = CLAW_VPN_T1_TEST_ENV_LOCK.lock().unwrap();
-        let _audit_root = set_t1_test_env(CLAW_VPN_T1_AUDIT_ROOT_ENV, None);
-        assert!(matches!(
-            t1_spooled_audit_sink_from_env(),
-            Err(ClawVpnT1MountedAuditSinkError::MissingRoot)
-        ));
+        let _record = set_t1_test_env(CLAW_VPN_T1_PREFLIGHT_EVIDENCE_RECORD_ENV, None);
+        let evidence = t1_preflight_evidence_or_missing(None);
+
+        assert!(!evidence.has_owner_authorization());
+        assert!(!evidence.has_rollback());
+        assert!(!evidence.has_hardware_t1_t4());
+    }
+
+    #[test]
+    fn t1_mount_does_not_load_evidence_when_config_disabled_or_invalid() {
+        let disabled_loads = Rc::new(Cell::new(0));
+        let disabled_build_count = Arc::new(AtomicUsize::new(0));
+        let disabled_launch_count = Arc::new(AtomicUsize::new(0));
+        let disabled_loads_for_closure = Rc::clone(&disabled_loads);
+        let disabled = assemble_t1_ip_tunnel_router(
+            || Ok(None),
+            move || {
+                disabled_loads_for_closure.set(disabled_loads_for_closure.get() + 1);
+                None
+            },
+            counting_t1_build_inputs(Arc::clone(&disabled_build_count)),
+            counting_t1_runtime_launcher(Arc::clone(&disabled_launch_count)),
+        );
+        assert!(matches!(disabled, ClawVpnT1CallerStatus::Disabled));
+        assert_eq!(disabled_loads.get(), 0);
+        assert_eq!(disabled_build_count.load(Ordering::SeqCst), 0);
+        assert_eq!(disabled_launch_count.load(Ordering::SeqCst), 0);
+
+        let invalid_loads = Rc::new(Cell::new(0));
+        let invalid_build_count = Arc::new(AtomicUsize::new(0));
+        let invalid_launch_count = Arc::new(AtomicUsize::new(0));
+        let invalid_loads_for_closure = Rc::clone(&invalid_loads);
+        let invalid = assemble_t1_ip_tunnel_router(
+            || ClawVpnDevConfig::from_values(Some("1"), Some("1"), None, None, None, None),
+            move || {
+                invalid_loads_for_closure.set(invalid_loads_for_closure.get() + 1);
+                None
+            },
+            counting_t1_build_inputs(Arc::clone(&invalid_build_count)),
+            counting_t1_runtime_launcher(Arc::clone(&invalid_launch_count)),
+        );
+        assert!(matches!(invalid, ClawVpnT1CallerStatus::InvalidConfig));
+        assert_eq!(invalid_loads.get(), 0);
+        assert_eq!(invalid_build_count.load(Ordering::SeqCst), 0);
+        assert_eq!(invalid_launch_count.load(Ordering::SeqCst), 0);
     }
 
     #[test]
@@ -958,9 +1141,8 @@ mod tests {
             .join("audit-root");
         std::fs::create_dir(&root).unwrap();
         std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
-        let _audit_root = set_t1_test_env(CLAW_VPN_T1_AUDIT_ROOT_ENV, Some(root.to_str().unwrap()));
 
-        let _sink = t1_spooled_audit_sink_from_env().unwrap();
+        let _sink = t1_spooled_audit_sink_from_root(&root).unwrap();
 
         let audit_path = root
             .join(CLAW_VPN_T1_AUDIT_LOG_DIRECTORY_NAME)
@@ -980,7 +1162,7 @@ mod tests {
             .join("audit-root");
         std::fs::create_dir(&root).unwrap();
         std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
-        let _audit_root = set_t1_test_env(CLAW_VPN_T1_AUDIT_ROOT_ENV, Some(root.to_str().unwrap()));
+        let _record = set_t1_test_env(CLAW_VPN_T1_PREFLIGHT_EVIDENCE_RECORD_ENV, None);
         let _live = set_t1_test_env(CLAW_VPN_LIVE_ENV, Some("1"));
         let _dial = set_t1_test_env(CLAW_VPN_DIAL_ENV, None);
         let _endpoint = set_t1_test_env(
@@ -1004,17 +1186,155 @@ mod tests {
     }
 
     #[test]
+    fn mounted_t1_iptunnel_router_rejects_missing_stale_and_incomplete_evidence_records() {
+        let Some(artifact_sha) = theyos_server_build_git_sha() else {
+            return;
+        };
+        let _lock = CLAW_VPN_T1_TEST_ENV_LOCK.lock().unwrap();
+        let stale_sha = if artifact_sha == "0000000000000000000000000000000000000000" {
+            "1111111111111111111111111111111111111111"
+        } else {
+            "0000000000000000000000000000000000000000"
+        };
+
+        fn assert_unavailable_for_record(name: &str, record_path: &Path) {
+            let _env = set_mounted_t1_live_test_env(record_path.to_str());
+            let router = build_mounted_ip_tunnel_router_from_t1_gate();
+            assert!(
+                matches!(router, RelayStreamMountedIpTunnelRouter::Unavailable(_)),
+                "{name} evidence must keep mounted T1 unavailable"
+            );
+        }
+
+        let missing_dir = tempfile::tempdir().unwrap();
+        assert_unavailable_for_record(
+            "missing",
+            &missing_dir
+                .path()
+                .join("missing-t1-preflight-evidence.json"),
+        );
+
+        let stale_dir = tempfile::tempdir().unwrap();
+        let stale_root = std::fs::canonicalize(stale_dir.path())
+            .unwrap()
+            .join("audit-root");
+        std::fs::create_dir(&stale_root).unwrap();
+        std::fs::set_permissions(&stale_root, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let stale_path =
+            write_t1_preflight_evidence_record(stale_dir.path(), stale_sha, &stale_root);
+        assert_unavailable_for_record("stale", &stale_path);
+
+        let incomplete_dir = tempfile::tempdir().unwrap();
+        let incomplete_root = std::fs::canonicalize(incomplete_dir.path())
+            .unwrap()
+            .join("audit-root");
+        std::fs::create_dir(&incomplete_root).unwrap();
+        std::fs::set_permissions(&incomplete_root, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let incomplete_body = serde_json::json!({
+            "schema": PER_CLAW_VPN_T1_PREFLIGHT_EVIDENCE_SCHEMA,
+            "artifact_sha": artifact_sha,
+            "scope": "dev-host T1-T4 only",
+            "production_activation": false,
+            "owner_authorization": true,
+            "owner_authorization_ref": "owner-authorization-alpha",
+            "rollback": false,
+            "rollback_ref": "",
+            "hardware_t1_t4": true,
+            "hardware_evidence_ref": "evidence-pack-t1-t4-alpha",
+            "audit_root": incomplete_root.to_str().unwrap(),
+        })
+        .to_string();
+        let incomplete_path = write_t1_preflight_evidence_record_body(
+            incomplete_dir.path(),
+            "incomplete-t1-preflight-evidence.json",
+            incomplete_body,
+        );
+        assert_unavailable_for_record("incomplete", &incomplete_path);
+    }
+
+    #[test]
+    fn mounted_t1_iptunnel_router_uses_sha_bound_evidence_audit_root() {
+        let Some(artifact_sha) = theyos_server_build_git_sha() else {
+            return;
+        };
+        let _lock = CLAW_VPN_T1_TEST_ENV_LOCK.lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(dir.path())
+            .unwrap()
+            .join("audit-root");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let record_path = write_t1_preflight_evidence_record(dir.path(), artifact_sha, &root);
+
+        let _env = set_mounted_t1_live_test_env(Some(record_path.to_str().unwrap()));
+
+        let router = build_mounted_ip_tunnel_router_from_t1_gate();
+
+        #[cfg(target_os = "linux")]
+        assert!(matches!(
+            router,
+            RelayStreamMountedIpTunnelRouter::T1Linux(_)
+        ));
+        #[cfg(target_os = "macos")]
+        assert!(matches!(
+            router,
+            RelayStreamMountedIpTunnelRouter::T1Macos(_)
+        ));
+        let audit_path = root
+            .join(CLAW_VPN_T1_AUDIT_LOG_DIRECTORY_NAME)
+            .join(CLAW_VPN_T1_AUDIT_LOG_FILE_NAME);
+        assert_eq!(
+            std::fs::metadata(audit_path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+    }
+
+    #[tokio::test]
+    async fn mounted_t1_iptunnel_router_rejects_invalid_audit_root_before_build_or_launch() {
+        let Some(artifact_sha) = theyos_server_build_git_sha() else {
+            return;
+        };
+        let _lock = CLAW_VPN_T1_TEST_ENV_LOCK.lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(dir.path())
+            .unwrap()
+            .join("audit-root");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let record_path = write_t1_preflight_evidence_record(dir.path(), artifact_sha, &root);
+        let _env = set_mounted_t1_live_test_env(Some(record_path.to_str().unwrap()));
+        let build_count = Arc::new(AtomicUsize::new(0));
+        let launch_count = Arc::new(AtomicUsize::new(0));
+        let status = assemble_t1_ip_tunnel_router(
+            ClawVpnDevConfig::from_env,
+            t1_preflight_evidence_bundle_from_env,
+            counting_t1_build_inputs(Arc::clone(&build_count)),
+            counting_t1_runtime_launcher(Arc::clone(&launch_count)),
+        );
+        let Some((_mode, router)) = status.into_ready() else {
+            panic!(
+                "valid preflight evidence with invalid audit root must still assemble the gated router"
+            );
+        };
+
+        let error = match router.open_ip_tunnel(t1_target_for_mount_test()).await {
+            Ok(_) => panic!("invalid audit root must fail closed before opening T1"),
+            Err(error) => error,
+        };
+
+        assert!(matches!(
+            error,
+            DataTunnelError::TargetUnavailable(reason)
+                if reason == "claw-vpn-t1-audit-sink-unavailable"
+        ));
+        assert_eq!(build_count.load(Ordering::SeqCst), 0);
+        assert_eq!(launch_count.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
     fn mounted_t1_iptunnel_router_remains_unavailable_without_preflight_evidence() {
         let _lock = CLAW_VPN_T1_TEST_ENV_LOCK.lock().unwrap();
-        let _live = set_t1_test_env(CLAW_VPN_LIVE_ENV, Some("1"));
-        let _dial = set_t1_test_env(CLAW_VPN_DIAL_ENV, None);
-        let _endpoint = set_t1_test_env(
-            CLAW_VPN_RELAY_ENDPOINT_ENV,
-            Some("relay-stream://127.0.0.1:49152"),
-        );
-        let _pool = set_t1_test_env(CLAW_VPN_IPV4_POOL_ENV, Some("198.18.0.0/24"));
-        let _per_member = set_t1_test_env(CLAW_VPN_MAX_SESSIONS_PER_MEMBER_CLAW_ENV, None);
-        let _per_claw = set_t1_test_env(CLAW_VPN_MAX_SESSIONS_PER_CLAW_ENV, None);
+        let _env = set_mounted_t1_live_test_env(None);
 
         let router = build_mounted_ip_tunnel_router_from_t1_gate();
 
@@ -1027,15 +1347,7 @@ mod tests {
     #[test]
     fn mounted_t1_iptunnel_router_factory_reuses_process_router() {
         let _lock = CLAW_VPN_T1_TEST_ENV_LOCK.lock().unwrap();
-        let _live = set_t1_test_env(CLAW_VPN_LIVE_ENV, Some("1"));
-        let _dial = set_t1_test_env(CLAW_VPN_DIAL_ENV, None);
-        let _endpoint = set_t1_test_env(
-            CLAW_VPN_RELAY_ENDPOINT_ENV,
-            Some("relay-stream://127.0.0.1:49152"),
-        );
-        let _pool = set_t1_test_env(CLAW_VPN_IPV4_POOL_ENV, Some("198.18.0.0/24"));
-        let _per_member = set_t1_test_env(CLAW_VPN_MAX_SESSIONS_PER_MEMBER_CLAW_ENV, None);
-        let _per_claw = set_t1_test_env(CLAW_VPN_MAX_SESSIONS_PER_CLAW_ENV, None);
+        let _env = set_mounted_t1_live_test_env(None);
 
         let first = mounted_ip_tunnel_router_from_t1_gate();
         let second = mounted_ip_tunnel_router_from_t1_gate();

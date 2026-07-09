@@ -4330,21 +4330,46 @@ fn product_a_per_claw_vpn_dev_config_remains_default_off_and_unwired() {
                 relay_stream_mount_path.display()
             )
         });
+    let relay_stream_mount_lines = relay_stream_mount_source.lines().collect::<Vec<_>>();
+    let relay_stream_mount_test_span =
+        rust_test_module_span("relay-stream mount", &relay_stream_mount_lines);
+    let relay_stream_mount_non_test_source = relay_stream_mount_lines
+        .iter()
+        .enumerate()
+        .filter_map(|(index, line)| {
+            (index < relay_stream_mount_test_span.0 || index > relay_stream_mount_test_span.1)
+                .then_some(*line)
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
     assert_eq!(
         relay_stream_mount_source
             .matches("PerClawVpnT1PreflightEvidence::missing")
             .count(),
-        2,
-        "per-Claw VPN relay-stream mount must keep both platform T1 gates hardcoded to missing preflight"
+        1,
+        "per-Claw VPN relay-stream mount must keep exactly one fail-closed missing-preflight fallback"
+    );
+    assert_eq!(
+        relay_stream_mount_source
+            .matches("load_per_claw_vpn_t1_preflight_evidence_record_for_current_build(")
+            .count(),
+        1,
+        "per-Claw VPN relay-stream mount must bind evidence through the reviewed current-build SHA loader"
     );
     for forbidden_preflight_token in [
         "PerClawVpnT1PreflightEvidence::new",
         "PreflightEvidencePresent",
         "per_claw_vpn_startup_gate_with_preflight",
+        "load_per_claw_vpn_t1_preflight_evidence_record(",
+        "load_per_claw_vpn_t1_preflight_evidence_record_for_build_sha",
+        "parse_per_claw_vpn_t1_preflight_evidence_record",
+        "PerClawVpnT1PreflightEvidenceLoadError",
+        "PER_CLAW_VPN_T1_PREFLIGHT_EVIDENCE_SCHEMA",
+        "per_claw_vpn_t1_preflight_evidence_v1",
     ] {
         assert!(
-            !relay_stream_mount_source.contains(forbidden_preflight_token),
-            "per-Claw VPN relay-stream mount must not load or synthesize present T1 preflight evidence: {forbidden_preflight_token}"
+            !relay_stream_mount_non_test_source.contains(forbidden_preflight_token),
+            "per-Claw VPN relay-stream mount must not use unreviewed T1 preflight evidence symbols: {forbidden_preflight_token}"
         );
     }
     for forbidden_audit_export_token in [
@@ -4476,10 +4501,13 @@ fn product_a_per_claw_vpn_dev_config_remains_default_off_and_unwired() {
                 && matches!(target_session_runtime_test_span, Some((start, end)) if index >= start && index <= end);
             let in_t1_relay_stream_router_tests = in_t1_relay_stream_router_module
                 && matches!(t1_relay_stream_router_test_span, Some((start, end)) if index >= start && index <= end);
+            let in_relay_stream_mount_tests = in_relay_stream_mount_module
+                && index >= relay_stream_mount_test_span.0
+                && index <= relay_stream_mount_test_span.1;
             let line_without_allowed_relay_stream_mount_audit_root_env =
                 if in_relay_stream_mount_module {
-                    line.replace("CLAW_VPN_T1_AUDIT_ROOT_ENV", "")
-                        .replace("THEYOS_CLAW_VPN_T1_AUDIT_ROOT", "")
+                    line.replace("CLAW_VPN_T1_PREFLIGHT_EVIDENCE_RECORD_ENV", "")
+                        .replace("THEYOS_CLAW_VPN_T1_PREFLIGHT_EVIDENCE_RECORD", "")
                 } else {
                     (*line).to_owned()
                 };
@@ -4528,17 +4556,13 @@ fn product_a_per_claw_vpn_dev_config_remains_default_off_and_unwired() {
                 || line.contains("CLAW_VPN_T1_AUDIT_LOG_RETAINED_FILES")
                 || line.contains("CLAW_VPN_T1_AUDIT_EXPORT_HMAC_KEY_BYTES")
                 || line.contains("CLAW_VPN_T1_AUDIT_LOG_DIRECTORY_NAME")
-                || line.contains("CLAW_VPN_T1_AUDIT_LOG_FILE_NAME")
-                || line.contains("CLAW_VPN_T1_AUDIT_ROOT_ENV")
-                || line.contains("THEYOS_CLAW_VPN_T1_AUDIT_ROOT");
+                || line.contains("CLAW_VPN_T1_AUDIT_LOG_FILE_NAME");
             let references_t1_relay_stream_mount_audit_sink = line
                 .contains("claw_vpn_t1_spooled_jsonl_audit_sink")
                 || line.contains("claw_vpn_t1_canonical_audit_log_path")
                 || line.contains("ClawVpnT1AuditSinkError")
                 || line.contains("CLAW_VPN_T1_AUDIT_LOG_DIRECTORY_NAME")
-                || line.contains("CLAW_VPN_T1_AUDIT_LOG_FILE_NAME")
-                || line.contains("CLAW_VPN_T1_AUDIT_ROOT_ENV")
-                || line.contains("THEYOS_CLAW_VPN_T1_AUDIT_ROOT");
+                || line.contains("CLAW_VPN_T1_AUDIT_LOG_FILE_NAME");
             let references_target_session_runtime_bridge = line
                 .contains("ClawVpnTargetSessionRuntime")
                 || line.contains("claw_vpn_target_session_runtime");
@@ -4737,6 +4761,10 @@ fn product_a_per_claw_vpn_dev_config_remains_default_off_and_unwired() {
                 in_relay_stream_mount_module && references_t1_preflight_gate;
             let allowed_startup_wiring_preflight_evidence_record =
                 in_startup_wiring_module && references_t1_preflight_evidence_record;
+            let allowed_relay_stream_mount_preflight_evidence_record = in_relay_stream_mount_module
+                && (line
+                    .contains("load_per_claw_vpn_t1_preflight_evidence_record_for_current_build")
+                    || line.contains("PerClawVpnT1PreflightEvidenceBundle"));
             let allowed_t1_caller_target_session_router =
                 in_t1_caller_module && references_target_session_router_adapter;
             let allowed_t1_relay_stream_router_t1_caller_gate =
@@ -4840,6 +4868,8 @@ fn product_a_per_claw_vpn_dev_config_remains_default_off_and_unwired() {
                     && !allowed_relay_stream_mount_preflight_gate
                     && references_t1_preflight_gate)
                 || (!allowed_startup_wiring_preflight_evidence_record
+                    && !allowed_relay_stream_mount_preflight_evidence_record
+                    && !in_relay_stream_mount_tests
                     && references_t1_preflight_evidence_record)
                 || (!in_runtime_module
                     && !in_wiring_module
@@ -5006,8 +5036,15 @@ required-features = ["dev_t1_datapath"]"#;
         mount_source
             .matches("PerClawVpnT1PreflightEvidence::missing")
             .count(),
-        2,
-        "production mount must keep both platform T1 gates hardcoded missing"
+        1,
+        "production mount must keep exactly one fail-closed T1 fallback after the reviewed #286 current-build gate is wired"
+    );
+    assert_eq!(
+        mount_source
+            .matches("load_per_claw_vpn_t1_preflight_evidence_record_for_current_build(")
+            .count(),
+        1,
+        "production mount must load #286 evidence only through the reviewed current-build SHA gate"
     );
     for forbidden_token in [
         "PerClawVpnT1PreflightEvidence::new",
