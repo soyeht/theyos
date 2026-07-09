@@ -160,6 +160,14 @@ fn shared_state_with_claw_store(claw_store: claw_rs::ClawStore) -> SharedState {
     let locks_dir = tempfile::TempDir::new().expect("locks dir");
     let locks_path = locks_dir.path().to_path_buf();
     std::mem::forget(locks_dir);
+    let mobile_mesh_dir = tempfile::TempDir::new().expect("mobile mesh tempdir");
+    let mobile_claw_vpn_mesh =
+        household_rs::claw_vpn_mobile_mesh_store::ClawVpnMobileMeshStore::new(
+            mobile_mesh_dir.path(),
+            600,
+        )
+        .expect("mobile mesh store");
+    std::mem::forget(mobile_mesh_dir);
 
     Arc::new(AppState {
         sessions,
@@ -173,6 +181,7 @@ fn shared_state_with_claw_store(claw_store: claw_rs::ClawStore) -> SharedState {
         mobile_tokens: Arc::new(server_rs::mobile_token::MobileTokenStore::new()),
         mobile_sessions: server_rs::mobile_token::MobileSessionDb::open(":memory:")
             .expect("mobile session db"),
+        mobile_claw_vpn_mesh,
         claw_store,
         theyos_dir: theyos_path,
         locks_dir: locks_path,
@@ -258,6 +267,10 @@ fn mobile_router(state: SharedState) -> Router {
         .route(
             "/api/v1/mobile/resource-options",
             get(handlers_mobile::handle_resource_options),
+        )
+        .route(
+            "/api/v1/mobile/claw-vpn/status",
+            get(handlers_mobile::handle_mobile_claw_vpn_status),
         )
         .route(
             "/api/v1/mobile/users",
@@ -1284,6 +1297,52 @@ async fn admin_metadata_routes_require_admin_session_and_match_mobile_shapes() {
     .await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(admin_users, mobile_users);
+}
+
+#[tokio::test]
+async fn mobile_claw_vpn_status_is_mobile_authed_and_count_only() {
+    let state = shared_state();
+    let path = "/api/v1/mobile/claw-vpn/status";
+    let (status, _bytes, body) = request(
+        mobile_router(Arc::clone(&state)),
+        Method::GET,
+        path,
+        Vec::new(),
+        None,
+    )
+    .await;
+    assert_fixture_body(
+        status,
+        &body,
+        StatusCode::UNAUTHORIZED,
+        "mobile_missing_auth",
+    );
+
+    let token = mobile_token_for_role(&state, "mobile-vpn-status-member", UserRole::User);
+    let (status, _bytes, body) = request(
+        mobile_router(state),
+        Method::GET,
+        path,
+        Vec::new(),
+        Some(format!("Bearer {token}")),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["product"], "product_a_mobile_claw_vpn");
+    assert_eq!(body["mode"], "mesh_c_status_only");
+    assert_eq!(body["production_activation"], false);
+    assert_eq!(body["state"], "not_configured");
+    assert_eq!(body["snapshot_present"], false);
+    for count_key in [
+        "enrolled_device_count",
+        "available_claw_count",
+        "grant_count",
+        "offer_count",
+        "session_count",
+    ] {
+        assert_eq!(body[count_key], 0);
+    }
 }
 
 #[tokio::test]

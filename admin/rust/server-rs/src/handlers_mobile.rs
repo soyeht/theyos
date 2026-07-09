@@ -23,6 +23,12 @@ use core_rs::{
     availability::ClawAvailability,
     error::{ApiError, blocking},
 };
+use household_rs::{
+    claw_vpn_mobile_mesh_store::{
+        ClawVpnMobileMeshStoreError, ClawVpnMobileMeshStoreErrorKind, ClawVpnMobileMeshStoreStatus,
+    },
+    claw_vpn_mobile_state::ClawVpnMobileMeshError,
+};
 use percent_encoding::{AsciiSet, CONTROLS, utf8_percent_encode};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -173,6 +179,21 @@ struct ResourceOptionsResponse {
     disk_gb: ResourceOptionRange,
 }
 
+#[derive(Debug, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+struct MobileClawVpnStatusResponse {
+    product: &'static str,
+    mode: &'static str,
+    production_activation: bool,
+    state: &'static str,
+    snapshot_present: bool,
+    enrolled_device_count: usize,
+    available_claw_count: usize,
+    grant_count: usize,
+    offer_count: usize,
+    session_count: usize,
+}
+
 fn build_resource_option_range(
     label: &'static str,
     min: u32,
@@ -227,6 +248,69 @@ fn resource_options_capacity_response(cap_err: &crate::capacity::CapacityError) 
         })),
     )
         .into_response()
+}
+
+fn mobile_claw_vpn_status_response(
+    status: ClawVpnMobileMeshStoreStatus,
+) -> MobileClawVpnStatusResponse {
+    MobileClawVpnStatusResponse {
+        product: "product_a_mobile_claw_vpn",
+        mode: "mesh_c_status_only",
+        production_activation: false,
+        state: if status.snapshot_present() {
+            "configured"
+        } else {
+            "not_configured"
+        },
+        snapshot_present: status.snapshot_present(),
+        enrolled_device_count: status.enrolled_device_count(),
+        available_claw_count: status.available_claw_count(),
+        grant_count: status.grant_count(),
+        offer_count: status.offer_count(),
+        session_count: status.session_count(),
+    }
+}
+
+fn mobile_claw_vpn_status_error(error: ClawVpnMobileMeshStoreError) -> ApiError {
+    tracing::warn!(
+        operation = error.operation(),
+        kind = mobile_mesh_store_error_kind_label(error.kind()),
+        storage_kind = error.storage_kind().unwrap_or("none"),
+        model_error = error
+            .model_error()
+            .map_or("none", mobile_mesh_model_error_label),
+        "mobile Claw VPN mesh status unavailable"
+    );
+    ApiError::service_unavailable("mobile Claw VPN mesh status unavailable")
+}
+
+fn mobile_mesh_store_error_kind_label(kind: ClawVpnMobileMeshStoreErrorKind) -> &'static str {
+    match kind {
+        ClawVpnMobileMeshStoreErrorKind::Storage => "storage",
+        ClawVpnMobileMeshStoreErrorKind::Model => "model",
+    }
+}
+
+fn mobile_mesh_model_error_label(error: ClawVpnMobileMeshError) -> &'static str {
+    match error {
+        ClawVpnMobileMeshError::EmptyId => "empty_id",
+        ClawVpnMobileMeshError::InvalidId => "invalid_id",
+        ClawVpnMobileMeshError::ZeroOfferTtl => "zero_offer_ttl",
+        ClawVpnMobileMeshError::TimeOverflow => "time_overflow",
+        ClawVpnMobileMeshError::IdExhausted => "id_exhausted",
+        ClawVpnMobileMeshError::DeviceNotEnrolled => "device_not_enrolled",
+        ClawVpnMobileMeshError::ClawUnavailable => "claw_unavailable",
+        ClawVpnMobileMeshError::Unauthorized => "unauthorized",
+        ClawVpnMobileMeshError::UnknownOffer => "unknown_offer",
+        ClawVpnMobileMeshError::OfferExpired => "offer_expired",
+        ClawVpnMobileMeshError::OfferAlreadyConsumed => "offer_already_consumed",
+        ClawVpnMobileMeshError::Revoked => "revoked",
+        ClawVpnMobileMeshError::SelectedClawMismatch => "selected_claw_mismatch",
+        ClawVpnMobileMeshError::UnknownSession => "unknown_session",
+        ClawVpnMobileMeshError::UnsupportedSnapshotSchema => "unsupported_snapshot_schema",
+        ClawVpnMobileMeshError::DuplicateSnapshotEntry => "duplicate_snapshot_entry",
+        ClawVpnMobileMeshError::InvalidSnapshotCounter => "invalid_snapshot_counter",
+    }
 }
 
 /// Detect the best host for the QR code based on available network channels.
@@ -511,6 +595,31 @@ pub async fn handle_mobile_status(
 ) -> Result<Response, ApiError> {
     let _username = extract_mobile_bearer(&state, &headers)?;
     Ok(StatusCode::NO_CONTENT.into_response())
+}
+
+/// `GET /api/v1/mobile/claw-vpn/status`
+///
+/// Mobile-authenticated. Returns a redacted, count-only status view of the
+/// Product A mobile per-Claw VPN Mesh-C store. This endpoint does not grant
+/// ACLs, mint offers, open relay sessions, or mutate host networking.
+///
+/// # Errors
+///
+/// Returns 401 if not authenticated, or 503 if the persisted mesh state cannot
+/// be read or validated.
+#[tracing::instrument(skip_all)]
+pub async fn handle_mobile_claw_vpn_status(
+    State(state): State<SharedState>,
+    headers: axum::http::HeaderMap,
+) -> Result<Response, ApiError> {
+    let _username = extract_mobile_bearer(&state, &headers)?;
+    let store = state.mobile_claw_vpn_mesh.clone();
+    let status = blocking(move || store.status().map_err(mobile_claw_vpn_status_error)).await??;
+    Ok((
+        StatusCode::OK,
+        Json(mobile_claw_vpn_status_response(status)),
+    )
+        .into_response())
 }
 
 /// `GET /api/v1/mobile/instances`
@@ -1807,5 +1916,76 @@ mod tests {
             "insufficient CPU: minimum supported is 1, but only 0 available"
         );
         assert_eq!(err.retry_after_secs, RESOURCE_OPTIONS_RETRY_AFTER_SECS);
+    }
+
+    #[test]
+    fn mobile_claw_vpn_status_reports_not_configured_without_snapshot() {
+        let td = tempfile::tempdir().unwrap();
+        let store =
+            household_rs::claw_vpn_mobile_mesh_store::ClawVpnMobileMeshStore::new(td.path(), 600)
+                .unwrap();
+
+        let response = mobile_claw_vpn_status_response(store.status().unwrap());
+
+        assert_eq!(
+            response,
+            MobileClawVpnStatusResponse {
+                product: "product_a_mobile_claw_vpn",
+                mode: "mesh_c_status_only",
+                production_activation: false,
+                state: "not_configured",
+                snapshot_present: false,
+                enrolled_device_count: 0,
+                available_claw_count: 0,
+                grant_count: 0,
+                offer_count: 0,
+                session_count: 0,
+            }
+        );
+    }
+
+    #[test]
+    fn mobile_claw_vpn_status_reports_count_only_configured_mesh() {
+        let td = tempfile::tempdir().unwrap();
+        let store =
+            household_rs::claw_vpn_mobile_mesh_store::ClawVpnMobileMeshStore::new(td.path(), 600)
+                .unwrap();
+        let member =
+            household_rs::claw_vpn_mobile_state::ClawVpnMobileMemberId::try_new("member-alpha")
+                .unwrap();
+        let device =
+            household_rs::claw_vpn_mobile_state::ClawVpnMobileDeviceId::try_new("device-alpha")
+                .unwrap();
+        let claw = household_rs::claw_vpn_mobile_state::ClawVpnMobileClawId::try_new("claw-alpha")
+            .unwrap();
+        let grant = household_rs::claw_vpn_mobile_state::ClawVpnMobileAclGrant::new(
+            member,
+            device.clone(),
+            claw.clone(),
+        );
+
+        assert!(store.owner_approved_enroll_device(device).unwrap());
+        assert!(store.set_claw_available(claw).unwrap());
+        assert!(store.owner_approved_grant(grant.clone()).unwrap());
+        let offer = store.mint_offer(&grant, 100).unwrap();
+        let _session = store.consume_offer(offer, &grant, 101).unwrap();
+
+        let response = mobile_claw_vpn_status_response(store.status().unwrap());
+
+        assert_eq!(
+            response,
+            MobileClawVpnStatusResponse {
+                product: "product_a_mobile_claw_vpn",
+                mode: "mesh_c_status_only",
+                production_activation: false,
+                state: "configured",
+                snapshot_present: true,
+                enrolled_device_count: 1,
+                available_claw_count: 1,
+                grant_count: 1,
+                offer_count: 1,
+                session_count: 1,
+            }
+        );
     }
 }

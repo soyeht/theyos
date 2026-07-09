@@ -246,6 +246,14 @@ impl TestFixture {
         for name in core_rs::manifest::all_names() {
             claw_store.mark_ready(name).expect("mark ready");
         }
+        let mobile_mesh_dir = tempfile::TempDir::new().expect("mobile mesh tempdir");
+        let mobile_claw_vpn_mesh =
+            household_rs::claw_vpn_mobile_mesh_store::ClawVpnMobileMeshStore::new(
+                mobile_mesh_dir.path(),
+                600,
+            )
+            .expect("mobile mesh store");
+        std::mem::forget(mobile_mesh_dir);
 
         let state = Arc::new(AppState {
             sessions,
@@ -259,6 +267,7 @@ impl TestFixture {
             mobile_tokens: Arc::new(server_rs::mobile_token::MobileTokenStore::new()),
             mobile_sessions: server_rs::mobile_token::MobileSessionDb::open(":memory:")
                 .expect("mobile session db"),
+            mobile_claw_vpn_mesh,
             claw_store,
             theyos_dir: std::path::PathBuf::from("/tmp/theyos-test"),
             locks_dir: std::path::PathBuf::from("/tmp/theyos-test-locks"),
