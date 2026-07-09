@@ -10,7 +10,7 @@
 use std::{
     fmt,
     net::{Ipv4Addr, Ipv6Addr},
-    path::PathBuf,
+    path::{Path, PathBuf},
 };
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -30,7 +30,7 @@ use household_rs::claw_share_rendezvous_hello::{RendezvousHello, RendezvousRole}
 #[cfg(feature = "dev_t1_datapath")]
 use household_rs::claw_vpn::ClawVpnIpv4Pool;
 use household_rs::claw_vpn::ClawVpnSessionAddrs;
-use household_rs::keys::{IdentityKey, P256Keypair};
+use household_rs::keys::{IdentityKey, P256Keypair, P256PublicKey};
 use rand::RngCore;
 use serde_json::{Map, Value};
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
@@ -92,6 +92,21 @@ enum Command {
         /// Exact acknowledgement required before any network dial.
         #[arg(long)]
         dev_host_ack: String,
+    },
+    /// Generate a dev-host Device keypair for a T1 run.
+    ///
+    /// Writes the private 64-hex P-256 secret scalar to `--secret-out` (mode
+    /// `0600`, refused if the path exists) and prints the matching 66-hex SEC1
+    /// `guest-device-pub`. The secret scalar is NEVER printed. The printed
+    /// public key is the value to pass to the serving claw's
+    /// `--guest-device-pub`; the runner re-checks that it corresponds to this
+    /// secret at session open. This opens no interface, dials no relay, and does
+    /// not touch production apps.
+    GenDeviceKeypair {
+        /// Output path for the private 64-hex device secret scalar. Refused if
+        /// the file already exists; the value is never printed.
+        #[arg(long)]
+        secret_out: PathBuf,
     },
     /// Owner-present dev-only run path for Device-side T1 datapath validation.
     ///
@@ -449,6 +464,99 @@ fn device_secret_from_hex(hex: &str) -> Result<P256Keypair> {
 fn read_device_secret_file(path: &PathBuf) -> Result<P256Keypair> {
     let value = std::fs::read_to_string(path).context("read dev device secret file")?;
     device_secret_from_hex(&value)
+}
+
+/// The public result of `gen-device-keypair`. Deliberately carries only PUBLIC
+/// material: the secret scalar is written to disk and never returned or logged.
+struct GeneratedDeviceKeypair {
+    guest_device_pub_hex: String,
+}
+
+/// Lowercase-hex encode (paired with the runner's hand-rolled hex decode).
+fn encode_lower_hex(bytes: &[u8]) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        let _ = write!(out, "{byte:02x}");
+    }
+    out
+}
+
+/// Decode an even-length ASCII hex string (no `0x` prefix) into bytes.
+fn decode_lower_hex(hex: &str) -> Result<Vec<u8>> {
+    let hex = hex.trim();
+    if hex.len() % 2 != 0 || !hex.is_ascii() {
+        bail!("value is not even-length ascii hex");
+    }
+    (0..hex.len() / 2)
+        .map(|index| {
+            u8::from_str_radix(&hex[index * 2..index * 2 + 2], 16).context("value is not valid hex")
+        })
+        .collect()
+}
+
+/// Write a private secret file with `0600` permissions, refusing to overwrite an
+/// existing path. The content is secret and is never logged; the path is not
+/// echoed on error.
+fn write_private_secret_file(path: &Path, secret_hex: &str) -> Result<()> {
+    use std::io::Write as _;
+    use std::os::unix::fs::OpenOptionsExt as _;
+
+    let mut file = match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)
+    {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            bail!("device secret file already exists; refusing to overwrite");
+        }
+        Err(error) => return Err(error).context("create device secret file"),
+    };
+    file.write_all(secret_hex.as_bytes())
+        .context("write device secret file")?;
+    file.write_all(b"\n").context("write device secret file")?;
+    file.flush().context("flush device secret file")?;
+    Ok(())
+}
+
+/// Generate a fresh software P-256 device keypair, write its 64-hex secret scalar
+/// to `secret_out` (mode `0600`, refused if the path exists), and return the
+/// matching 66-hex SEC1 `guest-device-pub`.
+///
+/// Fail-closed BEFORE writing: the secret is round-tripped through the runner's
+/// own [`device_secret_from_hex`] reader and must re-derive the emitted public
+/// key, and the emitted public key must pass the same
+/// [`P256PublicKey::from_bytes`] SEC1 check the serving claw applies. On any
+/// mismatch nothing is written.
+fn generate_device_keypair_to_file(secret_out: &Path) -> Result<GeneratedDeviceKeypair> {
+    let keypair = P256Keypair::generate();
+    let secret_scalar = keypair
+        .as_software_secret()
+        .ok_or_else(|| anyhow!("generated device keypair is not software-backed"))?;
+    let secret_hex = encode_lower_hex(secret_scalar);
+    let public_key = keypair.public();
+    let guest_device_pub_hex = encode_lower_hex(public_key.as_bytes());
+
+    // Fail closed before writing anything: the secret must re-derive its own
+    // public key through the exact reader the runner uses at session open, and
+    // the emitted public key must satisfy the serving claw's SEC1 decoder.
+    let rederived =
+        device_secret_from_hex(&secret_hex).context("generated device secret failed to derive")?;
+    if rederived.public() != public_key {
+        bail!("generated device secret does not derive its own public key");
+    }
+    let decoded_pub =
+        decode_lower_hex(&guest_device_pub_hex).context("emitted guest-device-pub is not hex")?;
+    P256PublicKey::from_bytes(&decoded_pub)
+        .map_err(|_| anyhow!("emitted guest-device-pub failed SEC1 validation"))?;
+
+    write_private_secret_file(secret_out, &secret_hex)?;
+
+    Ok(GeneratedDeviceKeypair {
+        guest_device_pub_hex,
+    })
 }
 
 fn validate_open_session_inputs(
@@ -1084,6 +1192,20 @@ async fn main() -> Result<()> {
                 config.mtu()
             );
         }
+        Command::GenDeviceKeypair { secret_out } => {
+            let generated = generate_device_keypair_to_file(&secret_out)?;
+            // The secret scalar is never printed — only written to secret_out at
+            // mode 0600. The public key is public material, safe to print, and is
+            // the value the operator passes to the serving claw's
+            // --guest-device-pub.
+            println!(
+                "OK: dev device keypair generated \
+                 (secret_written=true, secret_file_mode=0600, secret_printed=false, \
+                 guest_device_pub_len={}, secret_roundtrip_ok=true, pub_sec1_ok=true)",
+                generated.guest_device_pub_hex.len()
+            );
+            println!("guest-device-pub: {}", generated.guest_device_pub_hex);
+        }
         Command::OpenSession {
             offer_file,
             device_secret_file,
@@ -1178,6 +1300,124 @@ mod tests {
     use super::*;
 
     const NOW: u64 = 1_800_000_000;
+
+    /// A unique temp path that is removed on drop — avoids a `tempfile` dev-dep.
+    struct TempSecretPath(std::path::PathBuf);
+
+    impl TempSecretPath {
+        fn new(tag: &str) -> Self {
+            use std::sync::atomic::AtomicU64;
+            static COUNTER: AtomicU64 = AtomicU64::new(0);
+            let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
+            let path = std::env::temp_dir().join(format!(
+                "t1-gen-device-keypair-{}-{unique}-{tag}.hex",
+                std::process::id()
+            ));
+            let _ = std::fs::remove_file(&path);
+            Self(path)
+        }
+
+        fn path(&self) -> &std::path::Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TempSecretPath {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+
+    #[test]
+    fn hex_roundtrips() {
+        let bytes = [0x00u8, 0x02, 0xab, 0xff, 0x10];
+        assert_eq!(encode_lower_hex(&bytes), "0002abff10");
+        assert_eq!(decode_lower_hex("0002abff10").expect("valid"), bytes.to_vec());
+    }
+
+    #[test]
+    fn decode_lower_hex_rejects_malformed() {
+        assert!(decode_lower_hex("abc").is_err(), "odd length rejected");
+        assert!(decode_lower_hex("zz").is_err(), "non-hex rejected");
+        assert_eq!(decode_lower_hex("02af").expect("valid"), vec![0x02, 0xaf]);
+    }
+
+    #[test]
+    fn gen_device_keypair_writes_0600_secret_and_matching_66hex_pub() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let secret_path = TempSecretPath::new("match");
+        let generated =
+            generate_device_keypair_to_file(secret_path.path()).expect("keypair generation");
+
+        // Emitted guest-device-pub is a 66-hex SEC1-compressed key (02/03 tag).
+        assert_eq!(generated.guest_device_pub_hex.len(), 66);
+        assert!(
+            generated.guest_device_pub_hex.starts_with("02")
+                || generated.guest_device_pub_hex.starts_with("03"),
+            "pub must carry a SEC1 compressed tag"
+        );
+
+        // Secret file is owner-only 0600 and holds a 64-hex scalar.
+        let mode = std::fs::metadata(secret_path.path())
+            .expect("secret file exists")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600, "secret file must be mode 0600");
+        let secret_contents = std::fs::read_to_string(secret_path.path()).expect("read secret");
+        assert_eq!(secret_contents.trim().len(), 64, "secret is 64-hex");
+
+        // The written secret re-derives EXACTLY the emitted public key, through
+        // the same reader + SEC1 decoder the run path uses.
+        let rederived = device_secret_from_hex(secret_contents.trim())
+            .expect("secret re-reads via the runner's own reader");
+        let decoded_pub = decode_lower_hex(&generated.guest_device_pub_hex).expect("pub decodes");
+        let claw_pub = P256PublicKey::from_bytes(&decoded_pub)
+            .expect("pub passes the serving claw's SEC1 decoder");
+        assert_eq!(
+            rederived.public(),
+            claw_pub,
+            "device secret and guest-device-pub must be a matched keypair"
+        );
+    }
+
+    #[test]
+    fn gen_device_keypair_refuses_to_overwrite_existing_secret() {
+        let secret_path = TempSecretPath::new("nooverwrite");
+        std::fs::write(secret_path.path(), "preexisting-do-not-clobber")
+            .expect("seed a pre-existing file");
+
+        let Err(error) = generate_device_keypair_to_file(secret_path.path()) else {
+            panic!("must refuse to overwrite an existing secret file");
+        };
+        assert!(
+            format!("{error:?}").contains("refusing to overwrite"),
+            "error must name the no-clobber refusal, got: {error:?}"
+        );
+        // The pre-existing content is untouched (fail closed, no partial write).
+        assert_eq!(
+            std::fs::read_to_string(secret_path.path()).expect("read secret"),
+            "preexisting-do-not-clobber"
+        );
+    }
+
+    #[test]
+    fn gen_device_keypair_produces_fresh_distinct_keys() {
+        let first_path = TempSecretPath::new("distinct-a");
+        let second_path = TempSecretPath::new("distinct-b");
+        let first = generate_device_keypair_to_file(first_path.path()).expect("first keypair");
+        let second = generate_device_keypair_to_file(second_path.path()).expect("second keypair");
+        assert_ne!(
+            first.guest_device_pub_hex, second.guest_device_pub_hex,
+            "each generation must draw fresh randomness"
+        );
+        assert_ne!(
+            std::fs::read_to_string(first_path.path()).expect("read a"),
+            std::fs::read_to_string(second_path.path()).expect("read b"),
+            "secrets must differ too"
+        );
+    }
 
     fn key(seed: u8) -> P256Keypair {
         P256Keypair::from_secret_scalar(&[seed; 32]).expect("p256 keypair")
