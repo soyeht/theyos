@@ -46,6 +46,7 @@ pub mod claw_share_relay_stream_noise;
 pub mod claw_share_rendezvous_hello;
 pub mod claw_share_rendezvous_token;
 pub mod claw_vpn;
+pub mod claw_vpn_mobile_mesh_store;
 pub mod claw_vpn_mobile_state;
 pub mod emoji_code;
 pub mod error;
