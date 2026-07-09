@@ -11,10 +11,11 @@ use std::path::PathBuf;
 
 use crate::claw_vpn_mobile_state::{
     ClawVpnMobileAclGrant, ClawVpnMobileClawId, ClawVpnMobileDeviceId, ClawVpnMobileMesh,
-    ClawVpnMobileMeshError, ClawVpnMobileMeshRevocation, ClawVpnMobileOfferId,
+    ClawVpnMobileMeshError, ClawVpnMobileMeshRevocation, ClawVpnMobileOfferToken,
     ClawVpnMobileSessionId,
 };
 use crate::storage;
+use rand::RngCore;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ClawVpnMobileMeshStoreErrorKind {
@@ -253,22 +254,27 @@ impl ClawVpnMobileMeshStore {
         self.update("owner_approved_revoke", |mesh| Ok(mesh.revoke(grant)))
     }
 
-    pub fn mint_offer(
+    pub fn mint_offer_token(
         &self,
         grant: &ClawVpnMobileAclGrant,
         now_unix: u64,
-    ) -> Result<ClawVpnMobileOfferId, ClawVpnMobileMeshStoreError> {
-        self.update("mint_offer", |mesh| mesh.mint_offer(grant, now_unix))
+    ) -> Result<ClawVpnMobileOfferToken, ClawVpnMobileMeshStoreError> {
+        let token = generate_offer_token()
+            .map_err(|source| ClawVpnMobileMeshStoreError::model("mint_offer_token", source))?;
+        self.update("mint_offer_token", |mesh| {
+            mesh.mint_offer_with_token(grant, now_unix, token.clone())?;
+            Ok(token)
+        })
     }
 
-    pub fn consume_offer(
+    pub fn consume_offer_token(
         &self,
-        offer_id: ClawVpnMobileOfferId,
+        token: &ClawVpnMobileOfferToken,
         grant: &ClawVpnMobileAclGrant,
         now_unix: u64,
     ) -> Result<ClawVpnMobileSessionId, ClawVpnMobileMeshStoreError> {
-        self.update("consume_offer", |mesh| {
-            mesh.consume_offer(offer_id, grant, now_unix)
+        self.update("consume_offer_token", |mesh| {
+            mesh.consume_offer_token(token, grant, now_unix)
         })
     }
 
@@ -290,6 +296,12 @@ impl ClawVpnMobileMeshStore {
         self.save(&mesh)?;
         Ok(result)
     }
+}
+
+fn generate_offer_token() -> Result<ClawVpnMobileOfferToken, ClawVpnMobileMeshError> {
+    let mut bytes = [0_u8; 16];
+    rand::rngs::OsRng.fill_bytes(&mut bytes);
+    ClawVpnMobileOfferToken::try_new(hex::encode(bytes))
 }
 
 fn status_from_mesh(
@@ -337,8 +349,8 @@ mod tests {
         assert!(store.owner_approved_enroll_device(device()).unwrap());
         assert!(store.set_claw_available(claw()).unwrap());
         assert!(store.owner_approved_grant(grant.clone()).unwrap());
-        let offer = store.mint_offer(&grant, 10).unwrap();
-        let session = store.consume_offer(offer, &grant, 20).unwrap();
+        let offer_token = store.mint_offer_token(&grant, 10).unwrap();
+        let session = store.consume_offer_token(&offer_token, &grant, 20).unwrap();
 
         let status = store.status().unwrap();
         assert!(status.snapshot_present());
@@ -350,7 +362,7 @@ mod tests {
         assert!(store.load().unwrap().has_active_session(session));
         assert_eq!(
             store
-                .consume_offer(offer, &grant, 21)
+                .consume_offer_token(&offer_token, &grant, 21)
                 .unwrap_err()
                 .model_error(),
             Some(ClawVpnMobileMeshError::OfferAlreadyConsumed)
@@ -365,9 +377,9 @@ mod tests {
 
         assert!(store.owner_approved_enroll_device(device()).unwrap());
         assert!(store.set_claw_available(claw()).unwrap());
-        let err = store.mint_offer(&grant, 10).unwrap_err();
+        let err = store.mint_offer_token(&grant, 10).unwrap_err();
         assert_eq!(err.kind(), ClawVpnMobileMeshStoreErrorKind::Model);
-        assert_eq!(err.operation(), "mint_offer");
+        assert_eq!(err.operation(), "mint_offer_token");
         assert_eq!(
             err.model_error(),
             Some(ClawVpnMobileMeshError::Unauthorized)
@@ -375,12 +387,12 @@ mod tests {
         assert_eq!(store.status().unwrap().offer_count(), 0);
 
         assert!(store.owner_approved_grant(grant.clone()).unwrap());
-        let offer = store.mint_offer(&grant, 20).unwrap();
-        let session = store.consume_offer(offer, &grant, 21).unwrap();
+        let offer_token = store.mint_offer_token(&grant, 20).unwrap();
+        let session = store.consume_offer_token(&offer_token, &grant, 21).unwrap();
         assert!(store.load().unwrap().has_active_session(session));
         assert_eq!(
             store
-                .consume_offer(offer, &grant, 22)
+                .consume_offer_token(&offer_token, &grant, 22)
                 .unwrap_err()
                 .model_error(),
             Some(ClawVpnMobileMeshError::OfferAlreadyConsumed)
@@ -416,8 +428,8 @@ mod tests {
         assert!(store.owner_approved_enroll_device(device()).unwrap());
         assert!(store.set_claw_available(claw()).unwrap());
         assert!(store.owner_approved_grant(grant.clone()).unwrap());
-        let offer = store.mint_offer(&grant, 10).unwrap();
-        let session = store.consume_offer(offer, &grant, 20).unwrap();
+        let offer_token = store.mint_offer_token(&grant, 10).unwrap();
+        let session = store.consume_offer_token(&offer_token, &grant, 20).unwrap();
         assert!(store.load().unwrap().has_active_session(session));
 
         let revocation = store.owner_approved_revoke(&grant).unwrap();
@@ -440,7 +452,7 @@ mod tests {
         assert!(!debug.contains("claw-alpha"));
         assert!(!debug.contains(td.path().to_string_lossy().as_ref()));
 
-        let err = store.mint_offer(&grant, 10).unwrap_err();
+        let err = store.mint_offer_token(&grant, 10).unwrap_err();
         let display = err.to_string();
         let debug = format!("{err:?}");
         assert_eq!(display, "Product A mobile VPN mesh store operation failed");

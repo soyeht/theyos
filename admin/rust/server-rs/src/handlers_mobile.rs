@@ -29,7 +29,7 @@ use household_rs::{
     },
     claw_vpn_mobile_state::{
         ClawVpnMobileAclGrant, ClawVpnMobileClawId, ClawVpnMobileDeviceId, ClawVpnMobileMemberId,
-        ClawVpnMobileMeshError,
+        ClawVpnMobileMeshError, ClawVpnMobileOfferToken,
     },
 };
 use percent_encoding::{AsciiSet, CONTROLS, utf8_percent_encode};
@@ -221,6 +221,26 @@ pub struct MobileClawVpnAclGrantRequest {
     claw: String,
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct MobileClawVpnOfferRequest {
+    #[serde(rename = "device_id")]
+    device: String,
+    #[serde(rename = "claw_id")]
+    claw: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct MobileClawVpnSessionRequest {
+    #[serde(rename = "device_id")]
+    device: String,
+    #[serde(rename = "claw_id")]
+    claw: String,
+    #[serde(rename = "offer_token")]
+    offer: String,
+}
+
 #[derive(Debug, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 struct MobileClawVpnOwnerMutationResponse {
@@ -231,6 +251,27 @@ struct MobileClawVpnOwnerMutationResponse {
     changed: bool,
     revoked_offer_count: usize,
     closed_session_count: usize,
+    status: MobileClawVpnStatusResponse,
+}
+
+#[derive(Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+struct MobileClawVpnOfferResponse {
+    product: &'static str,
+    mode: &'static str,
+    production_activation: bool,
+    operation: &'static str,
+    offer_token: String,
+    status: MobileClawVpnStatusResponse,
+}
+
+#[derive(Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+struct MobileClawVpnSessionResponse {
+    product: &'static str,
+    mode: &'static str,
+    production_activation: bool,
+    operation: &'static str,
     status: MobileClawVpnStatusResponse,
 }
 
@@ -319,6 +360,53 @@ fn mobile_claw_vpn_store_error(
     error: ClawVpnMobileMeshStoreError,
     public_message: &'static str,
 ) -> ApiError {
+    mobile_claw_vpn_log_store_error(&error, public_message);
+    ApiError::service_unavailable(public_message)
+}
+
+fn mobile_claw_vpn_offer_store_error(
+    error: ClawVpnMobileMeshStoreError,
+    public_message: &'static str,
+) -> ApiError {
+    mobile_claw_vpn_log_store_error(&error, public_message);
+    match error.kind() {
+        ClawVpnMobileMeshStoreErrorKind::Storage => ApiError::service_unavailable(public_message),
+        ClawVpnMobileMeshStoreErrorKind::Model => match error.model_error() {
+            Some(ClawVpnMobileMeshError::EmptyId | ClawVpnMobileMeshError::InvalidId) => {
+                ApiError::bad_request("invalid mobile Claw VPN mesh request")
+            }
+            Some(
+                ClawVpnMobileMeshError::DeviceNotEnrolled
+                | ClawVpnMobileMeshError::Unauthorized
+                | ClawVpnMobileMeshError::SelectedClawMismatch,
+            ) => ApiError::forbidden("mobile Claw VPN offer action denied"),
+            Some(ClawVpnMobileMeshError::ClawUnavailable) => {
+                ApiError::conflict("mobile Claw VPN offer action unavailable")
+            }
+            Some(
+                ClawVpnMobileMeshError::UnknownOffer
+                | ClawVpnMobileMeshError::OfferExpired
+                | ClawVpnMobileMeshError::OfferAlreadyConsumed
+                | ClawVpnMobileMeshError::Revoked,
+            ) => ApiError::gone("mobile Claw VPN offer unavailable"),
+            Some(
+                ClawVpnMobileMeshError::ZeroOfferTtl
+                | ClawVpnMobileMeshError::TimeOverflow
+                | ClawVpnMobileMeshError::IdExhausted
+                | ClawVpnMobileMeshError::UnknownSession
+                | ClawVpnMobileMeshError::UnsupportedSnapshotSchema
+                | ClawVpnMobileMeshError::DuplicateSnapshotEntry
+                | ClawVpnMobileMeshError::InvalidSnapshotCounter,
+            )
+            | None => ApiError::service_unavailable(public_message),
+        },
+    }
+}
+
+fn mobile_claw_vpn_log_store_error(
+    error: &ClawVpnMobileMeshStoreError,
+    public_message: &'static str,
+) {
     tracing::warn!(
         operation = error.operation(),
         kind = mobile_mesh_store_error_kind_label(error.kind()),
@@ -328,7 +416,6 @@ fn mobile_claw_vpn_store_error(
             .map_or("none", mobile_mesh_model_error_label),
         public_message
     );
-    ApiError::service_unavailable(public_message)
 }
 
 fn mobile_mesh_store_error_kind_label(kind: ClawVpnMobileMeshStoreErrorKind) -> &'static str {
@@ -386,6 +473,37 @@ fn mobile_claw_vpn_acl_grant(
     ))
 }
 
+fn mobile_claw_vpn_offer_grant(
+    username: String,
+    req: MobileClawVpnOfferRequest,
+) -> Result<ClawVpnMobileAclGrant, ApiError> {
+    Ok(ClawVpnMobileAclGrant::new(
+        mobile_claw_vpn_member_id(username)?,
+        mobile_claw_vpn_device_id(req.device)?,
+        mobile_claw_vpn_claw_id(req.claw)?,
+    ))
+}
+
+fn mobile_claw_vpn_session_grant(
+    username: String,
+    req: &MobileClawVpnSessionRequest,
+) -> Result<ClawVpnMobileAclGrant, ApiError> {
+    Ok(ClawVpnMobileAclGrant::new(
+        mobile_claw_vpn_member_id(username)?,
+        mobile_claw_vpn_device_id(req.device.clone())?,
+        mobile_claw_vpn_claw_id(req.claw.clone())?,
+    ))
+}
+
+fn mobile_claw_vpn_offer_token(value: String) -> Result<ClawVpnMobileOfferToken, ApiError> {
+    ClawVpnMobileOfferToken::try_new(value).map_err(mobile_claw_vpn_request_error)
+}
+
+fn mobile_claw_vpn_now_unix() -> Result<u64, ApiError> {
+    crate::time_util::unix_now_secs_checked("mobile_claw_vpn_mesh_offer.now")
+        .ok_or_else(|| ApiError::service_unavailable("mobile Claw VPN clock unavailable"))
+}
+
 fn mobile_claw_vpn_owner_mutation_response(
     operation: &'static str,
     changed: bool,
@@ -401,6 +519,34 @@ fn mobile_claw_vpn_owner_mutation_response(
         changed,
         revoked_offer_count,
         closed_session_count,
+        status: mobile_claw_vpn_status_response(status),
+    }
+}
+
+fn mobile_claw_vpn_offer_response(
+    operation: &'static str,
+    offer_token: &ClawVpnMobileOfferToken,
+    status: ClawVpnMobileMeshStoreStatus,
+) -> MobileClawVpnOfferResponse {
+    MobileClawVpnOfferResponse {
+        product: "product_a_mobile_claw_vpn",
+        mode: "mesh_c_offer_control",
+        production_activation: false,
+        operation,
+        offer_token: offer_token.public_token().to_string(),
+        status: mobile_claw_vpn_status_response(status),
+    }
+}
+
+fn mobile_claw_vpn_session_response(
+    operation: &'static str,
+    status: ClawVpnMobileMeshStoreStatus,
+) -> MobileClawVpnSessionResponse {
+    MobileClawVpnSessionResponse {
+        product: "product_a_mobile_claw_vpn",
+        mode: "mesh_c_offer_control",
+        production_activation: false,
+        operation,
         status: mobile_claw_vpn_status_response(status),
     }
 }
@@ -710,6 +856,91 @@ pub async fn handle_mobile_claw_vpn_status(
     Ok((
         StatusCode::OK,
         Json(mobile_claw_vpn_status_response(status)),
+    )
+        .into_response())
+}
+
+/// `POST /api/v1/mobile/claw-vpn/offers`
+///
+/// Mobile-authenticated. Mints one Mesh-C offer for the authenticated member,
+/// Device-D, and selected Claw only after the persisted owner-approved ACL,
+/// device enrollment, Claw availability, and revocation state are checked by
+/// the store model. This does not open relay sessions or mutate host networking.
+///
+/// # Errors
+///
+/// Returns 401 without a valid mobile bearer, 400 for invalid redacted
+/// identifiers, 403/409/410 for fail-closed Mesh-C denies, or 503 for storage
+/// and clock failures.
+#[tracing::instrument(skip_all)]
+pub async fn handle_mobile_claw_vpn_mint_offer(
+    State(state): State<SharedState>,
+    headers: axum::http::HeaderMap,
+    Json(req): Json<MobileClawVpnOfferRequest>,
+) -> Result<Response, ApiError> {
+    let username = extract_mobile_bearer(&state, &headers)?;
+    let grant = mobile_claw_vpn_offer_grant(username, req)?;
+    let now_unix = mobile_claw_vpn_now_unix()?;
+    let store = state.mobile_claw_vpn_mesh.clone();
+    let (offer_token, status) = blocking(move || {
+        let offer_token = store.mint_offer_token(&grant, now_unix).map_err(|error| {
+            mobile_claw_vpn_offer_store_error(error, "mobile Claw VPN offer action failed")
+        })?;
+        let status = store.status().map_err(|error| {
+            mobile_claw_vpn_offer_store_error(error, "mobile Claw VPN offer action failed")
+        })?;
+        Ok::<_, ApiError>((offer_token, status))
+    })
+    .await??;
+    Ok((
+        StatusCode::OK,
+        Json(mobile_claw_vpn_offer_response(
+            "mint_offer",
+            &offer_token,
+            status,
+        )),
+    )
+        .into_response())
+}
+
+/// `POST /api/v1/mobile/claw-vpn/sessions`
+///
+/// Mobile-authenticated. Consumes a Mesh-C offer for the authenticated member,
+/// Device-D, and selected Claw. The offer remains single-use and TTL-bound in
+/// the persisted model. This creates only a Mesh-C session record; it does not
+/// open a relay, TUN/utun, route, or `NetworkExtension` tunnel.
+///
+/// # Errors
+///
+/// Returns 401 without a valid mobile bearer, 400 for invalid redacted
+/// identifiers, 403/409/410 for fail-closed Mesh-C denies, or 503 for storage
+/// and clock failures.
+#[tracing::instrument(skip_all)]
+pub async fn handle_mobile_claw_vpn_consume_offer(
+    State(state): State<SharedState>,
+    headers: axum::http::HeaderMap,
+    Json(req): Json<MobileClawVpnSessionRequest>,
+) -> Result<Response, ApiError> {
+    let username = extract_mobile_bearer(&state, &headers)?;
+    let grant = mobile_claw_vpn_session_grant(username, &req)?;
+    let offer_token = mobile_claw_vpn_offer_token(req.offer)?;
+    let now_unix = mobile_claw_vpn_now_unix()?;
+    let store = state.mobile_claw_vpn_mesh.clone();
+    let status = blocking(move || {
+        store
+            .consume_offer_token(&offer_token, &grant, now_unix)
+            .map_err(|error| {
+                mobile_claw_vpn_offer_store_error(error, "mobile Claw VPN offer action failed")
+            })?;
+        let status = store.status().map_err(|error| {
+            mobile_claw_vpn_offer_store_error(error, "mobile Claw VPN offer action failed")
+        })?;
+        Ok::<_, ApiError>(status)
+    })
+    .await??;
+    Ok((
+        StatusCode::OK,
+        Json(mobile_claw_vpn_session_response("consume_offer", status)),
     )
         .into_response())
 }
@@ -2233,8 +2464,10 @@ mod tests {
         assert!(store.owner_approved_enroll_device(device).unwrap());
         assert!(store.set_claw_available(claw).unwrap());
         assert!(store.owner_approved_grant(grant.clone()).unwrap());
-        let offer = store.mint_offer(&grant, 100).unwrap();
-        let _session = store.consume_offer(offer, &grant, 101).unwrap();
+        let offer_token = store.mint_offer_token(&grant, 100).unwrap();
+        let _session = store
+            .consume_offer_token(&offer_token, &grant, 101)
+            .unwrap();
 
         let response = mobile_claw_vpn_status_response(store.status().unwrap());
 
