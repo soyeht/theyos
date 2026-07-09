@@ -899,6 +899,25 @@ async fn main() {
             "/instances/{id}/qr-token",
             post(handlers_mobile::handle_generate_qr_token),
         )
+        // Product A mobile Claw VPN Mesh-C owner/admin actions. These mutate
+        // only the persisted Mesh-C model; they do not mint usable offers,
+        // open relay sessions, or touch host networking.
+        .route(
+            "/mobile/claw-vpn/owner/enroll-device",
+            post(handlers_mobile::handle_admin_mobile_claw_vpn_enroll_device),
+        )
+        .route(
+            "/mobile/claw-vpn/owner/claw-availability",
+            post(handlers_mobile::handle_admin_mobile_claw_vpn_set_claw_availability),
+        )
+        .route(
+            "/mobile/claw-vpn/owner/grant",
+            post(handlers_mobile::handle_admin_mobile_claw_vpn_grant),
+        )
+        .route(
+            "/mobile/claw-vpn/owner/revoke-grant",
+            post(handlers_mobile::handle_admin_mobile_claw_vpn_revoke_grant),
+        )
         // Mobile — Continue on iPhone (any authed user, for own workspaces)
         .route(
             "/mobile/continue-qr",

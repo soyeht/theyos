@@ -27,7 +27,10 @@ use household_rs::{
     claw_vpn_mobile_mesh_store::{
         ClawVpnMobileMeshStoreError, ClawVpnMobileMeshStoreErrorKind, ClawVpnMobileMeshStoreStatus,
     },
-    claw_vpn_mobile_state::ClawVpnMobileMeshError,
+    claw_vpn_mobile_state::{
+        ClawVpnMobileAclGrant, ClawVpnMobileClawId, ClawVpnMobileDeviceId, ClawVpnMobileMemberId,
+        ClawVpnMobileMeshError,
+    },
 };
 use percent_encoding::{AsciiSet, CONTROLS, utf8_percent_encode};
 use serde::{Deserialize, Serialize};
@@ -194,6 +197,43 @@ struct MobileClawVpnStatusResponse {
     session_count: usize,
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct MobileClawVpnDeviceRequest {
+    device_id: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct MobileClawVpnClawAvailabilityRequest {
+    claw_id: String,
+    available: bool,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct MobileClawVpnAclGrantRequest {
+    #[serde(rename = "member_id")]
+    member: String,
+    #[serde(rename = "device_id")]
+    device: String,
+    #[serde(rename = "claw_id")]
+    claw: String,
+}
+
+#[derive(Debug, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+struct MobileClawVpnOwnerMutationResponse {
+    product: &'static str,
+    mode: &'static str,
+    production_activation: bool,
+    operation: &'static str,
+    changed: bool,
+    revoked_offer_count: usize,
+    closed_session_count: usize,
+    status: MobileClawVpnStatusResponse,
+}
+
 fn build_resource_option_range(
     label: &'static str,
     min: u32,
@@ -272,6 +312,13 @@ fn mobile_claw_vpn_status_response(
 }
 
 fn mobile_claw_vpn_status_error(error: ClawVpnMobileMeshStoreError) -> ApiError {
+    mobile_claw_vpn_store_error(error, "mobile Claw VPN mesh status unavailable")
+}
+
+fn mobile_claw_vpn_store_error(
+    error: ClawVpnMobileMeshStoreError,
+    public_message: &'static str,
+) -> ApiError {
     tracing::warn!(
         operation = error.operation(),
         kind = mobile_mesh_store_error_kind_label(error.kind()),
@@ -279,9 +326,9 @@ fn mobile_claw_vpn_status_error(error: ClawVpnMobileMeshStoreError) -> ApiError 
         model_error = error
             .model_error()
             .map_or("none", mobile_mesh_model_error_label),
-        "mobile Claw VPN mesh status unavailable"
+        public_message
     );
-    ApiError::service_unavailable("mobile Claw VPN mesh status unavailable")
+    ApiError::service_unavailable(public_message)
 }
 
 fn mobile_mesh_store_error_kind_label(kind: ClawVpnMobileMeshStoreErrorKind) -> &'static str {
@@ -310,6 +357,51 @@ fn mobile_mesh_model_error_label(error: ClawVpnMobileMeshError) -> &'static str 
         ClawVpnMobileMeshError::UnsupportedSnapshotSchema => "unsupported_snapshot_schema",
         ClawVpnMobileMeshError::DuplicateSnapshotEntry => "duplicate_snapshot_entry",
         ClawVpnMobileMeshError::InvalidSnapshotCounter => "invalid_snapshot_counter",
+    }
+}
+
+fn mobile_claw_vpn_request_error(_error: ClawVpnMobileMeshError) -> ApiError {
+    ApiError::bad_request("invalid mobile Claw VPN mesh request")
+}
+
+fn mobile_claw_vpn_member_id(value: String) -> Result<ClawVpnMobileMemberId, ApiError> {
+    ClawVpnMobileMemberId::try_new(value).map_err(mobile_claw_vpn_request_error)
+}
+
+fn mobile_claw_vpn_device_id(value: String) -> Result<ClawVpnMobileDeviceId, ApiError> {
+    ClawVpnMobileDeviceId::try_new(value).map_err(mobile_claw_vpn_request_error)
+}
+
+fn mobile_claw_vpn_claw_id(value: String) -> Result<ClawVpnMobileClawId, ApiError> {
+    ClawVpnMobileClawId::try_new(value).map_err(mobile_claw_vpn_request_error)
+}
+
+fn mobile_claw_vpn_acl_grant(
+    req: MobileClawVpnAclGrantRequest,
+) -> Result<ClawVpnMobileAclGrant, ApiError> {
+    Ok(ClawVpnMobileAclGrant::new(
+        mobile_claw_vpn_member_id(req.member)?,
+        mobile_claw_vpn_device_id(req.device)?,
+        mobile_claw_vpn_claw_id(req.claw)?,
+    ))
+}
+
+fn mobile_claw_vpn_owner_mutation_response(
+    operation: &'static str,
+    changed: bool,
+    revoked_offer_count: usize,
+    closed_session_count: usize,
+    status: ClawVpnMobileMeshStoreStatus,
+) -> MobileClawVpnOwnerMutationResponse {
+    MobileClawVpnOwnerMutationResponse {
+        product: "product_a_mobile_claw_vpn",
+        mode: "mesh_c_owner_admin",
+        production_activation: false,
+        operation,
+        changed,
+        revoked_offer_count,
+        closed_session_count,
+        status: mobile_claw_vpn_status_response(status),
     }
 }
 
@@ -618,6 +710,180 @@ pub async fn handle_mobile_claw_vpn_status(
     Ok((
         StatusCode::OK,
         Json(mobile_claw_vpn_status_response(status)),
+    )
+        .into_response())
+}
+
+/// `POST /api/v1/mobile/claw-vpn/owner/enroll-device`
+///
+/// Admin-authenticated owner action. Persists Device-D enrollment in Mesh-C.
+/// This does not grant ACLs, mint offers, open relay sessions, or mutate host
+/// networking.
+///
+/// # Errors
+///
+/// Returns 403 for non-admin users, 400 for invalid redacted identifiers, or
+/// 503 if the persisted mesh state cannot be read or written.
+#[tracing::instrument(skip_all)]
+pub async fn handle_admin_mobile_claw_vpn_enroll_device(
+    State(state): State<SharedState>,
+    AdminUser(_auth): AdminUser,
+    Json(req): Json<MobileClawVpnDeviceRequest>,
+) -> Result<Response, ApiError> {
+    let device = mobile_claw_vpn_device_id(req.device_id)?;
+    let store = state.mobile_claw_vpn_mesh.clone();
+    let (changed, status) = blocking(move || {
+        let changed = store
+            .owner_approved_enroll_device(device)
+            .map_err(|error| {
+                mobile_claw_vpn_store_error(error, "mobile Claw VPN owner action failed")
+            })?;
+        let status = store.status().map_err(|error| {
+            mobile_claw_vpn_store_error(error, "mobile Claw VPN owner action failed")
+        })?;
+        Ok::<_, ApiError>((changed, status))
+    })
+    .await??;
+    Ok((
+        StatusCode::OK,
+        Json(mobile_claw_vpn_owner_mutation_response(
+            "enroll_device",
+            changed,
+            0,
+            0,
+            status,
+        )),
+    )
+        .into_response())
+}
+
+/// `POST /api/v1/mobile/claw-vpn/owner/claw-availability`
+///
+/// Admin-authenticated owner/operator action. Updates Mesh-C responder
+/// availability only; it does not start a responder or mutate TUN/utun/routes.
+///
+/// # Errors
+///
+/// Returns 403 for non-admin users, 400 for invalid redacted identifiers, or
+/// 503 if the persisted mesh state cannot be read or written.
+#[tracing::instrument(skip_all)]
+pub async fn handle_admin_mobile_claw_vpn_set_claw_availability(
+    State(state): State<SharedState>,
+    AdminUser(_auth): AdminUser,
+    Json(req): Json<MobileClawVpnClawAvailabilityRequest>,
+) -> Result<Response, ApiError> {
+    let available = req.available;
+    let claw = mobile_claw_vpn_claw_id(req.claw_id)?;
+    let store = state.mobile_claw_vpn_mesh.clone();
+    let (changed, status) = blocking(move || {
+        let changed = if available {
+            store.set_claw_available(claw).map_err(|error| {
+                mobile_claw_vpn_store_error(error, "mobile Claw VPN owner action failed")
+            })?
+        } else {
+            store.set_claw_unavailable(&claw).map_err(|error| {
+                mobile_claw_vpn_store_error(error, "mobile Claw VPN owner action failed")
+            })?
+        };
+        let status = store.status().map_err(|error| {
+            mobile_claw_vpn_store_error(error, "mobile Claw VPN owner action failed")
+        })?;
+        Ok::<_, ApiError>((changed, status))
+    })
+    .await??;
+    Ok((
+        StatusCode::OK,
+        Json(mobile_claw_vpn_owner_mutation_response(
+            if available {
+                "set_claw_available"
+            } else {
+                "set_claw_unavailable"
+            },
+            changed,
+            0,
+            0,
+            status,
+        )),
+    )
+        .into_response())
+}
+
+/// `POST /api/v1/mobile/claw-vpn/owner/grant`
+///
+/// Admin-authenticated owner action. Persists the ACL relation for one member,
+/// one Device-D, and one selected Claw. It does not mint a usable offer.
+///
+/// # Errors
+///
+/// Returns 403 for non-admin users, 400 for invalid redacted identifiers, or
+/// 503 if the persisted mesh state cannot be read or written.
+#[tracing::instrument(skip_all)]
+pub async fn handle_admin_mobile_claw_vpn_grant(
+    State(state): State<SharedState>,
+    AdminUser(_auth): AdminUser,
+    Json(req): Json<MobileClawVpnAclGrantRequest>,
+) -> Result<Response, ApiError> {
+    let grant = mobile_claw_vpn_acl_grant(req)?;
+    let store = state.mobile_claw_vpn_mesh.clone();
+    let (changed, status) = blocking(move || {
+        let changed = store.owner_approved_grant(grant).map_err(|error| {
+            mobile_claw_vpn_store_error(error, "mobile Claw VPN owner action failed")
+        })?;
+        let status = store.status().map_err(|error| {
+            mobile_claw_vpn_store_error(error, "mobile Claw VPN owner action failed")
+        })?;
+        Ok::<_, ApiError>((changed, status))
+    })
+    .await??;
+    Ok((
+        StatusCode::OK,
+        Json(mobile_claw_vpn_owner_mutation_response(
+            "grant", changed, 0, 0, status,
+        )),
+    )
+        .into_response())
+}
+
+/// `POST /api/v1/mobile/claw-vpn/owner/revoke-grant`
+///
+/// Admin-authenticated owner action. Revokes one ACL relation and closes only
+/// sessions minted for that relation. It does not touch any host interface or
+/// route.
+///
+/// # Errors
+///
+/// Returns 403 for non-admin users, 400 for invalid redacted identifiers, or
+/// 503 if the persisted mesh state cannot be read or written.
+#[tracing::instrument(skip_all)]
+pub async fn handle_admin_mobile_claw_vpn_revoke_grant(
+    State(state): State<SharedState>,
+    AdminUser(_auth): AdminUser,
+    Json(req): Json<MobileClawVpnAclGrantRequest>,
+) -> Result<Response, ApiError> {
+    let grant = mobile_claw_vpn_acl_grant(req)?;
+    let store = state.mobile_claw_vpn_mesh.clone();
+    let (revocation, status) = blocking(move || {
+        let revocation = store.owner_approved_revoke(&grant).map_err(|error| {
+            mobile_claw_vpn_store_error(error, "mobile Claw VPN owner action failed")
+        })?;
+        let status = store.status().map_err(|error| {
+            mobile_claw_vpn_store_error(error, "mobile Claw VPN owner action failed")
+        })?;
+        Ok::<_, ApiError>((revocation, status))
+    })
+    .await??;
+    let changed = revocation.grant_removed()
+        || revocation.revoked_offer_count() > 0
+        || revocation.closed_session_count() > 0;
+    Ok((
+        StatusCode::OK,
+        Json(mobile_claw_vpn_owner_mutation_response(
+            "revoke_grant",
+            changed,
+            revocation.revoked_offer_count(),
+            revocation.closed_session_count(),
+            status,
+        )),
     )
         .into_response())
 }
