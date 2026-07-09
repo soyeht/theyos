@@ -67,6 +67,9 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 use vmrunner_common_rs::VmCreateResourceSpec;
 use vmrunner_rs::VmRunner;
 
+const MOBILE_CLAW_VPN_OFFER_TTL_SECS_ENV: &str = "THEYOS_MOBILE_CLAW_VPN_OFFER_TTL_SECS";
+const DEFAULT_MOBILE_CLAW_VPN_OFFER_TTL_SECS: u64 = 10 * 60;
+
 /// Set `Cache-Control` headers for static assets and SPA HTML responses.
 ///
 /// - `/assets/*` → `public, max-age=31536000, immutable` (content-hashed filenames)
@@ -355,6 +358,19 @@ async fn main() {
         MobileSessionDb::open(&mobile_session_db).expect("Failed to open mobile session DB");
     info!("Mobile session DB: {}", mobile_session_db);
 
+    let household_state_dir = server_rs::household_bootstrap::resolve_household_state_dir();
+    let mobile_claw_vpn_offer_ttl_secs = mobile_claw_vpn_offer_ttl_secs_from_env();
+    let mobile_claw_vpn_mesh =
+        household_rs::claw_vpn_mobile_mesh_store::ClawVpnMobileMeshStore::new(
+            household_state_dir,
+            mobile_claw_vpn_offer_ttl_secs,
+        )
+        .expect("Failed to initialize mobile Claw VPN mesh store");
+    info!(
+        "Mobile Claw VPN mesh store: initialized (offer_ttl={}s)",
+        mobile_claw_vpn_offer_ttl_secs
+    );
+
     // ─── Full shared state ────────────────────────────────────────────────────
 
     let state: SharedState = Arc::new(AppState {
@@ -368,6 +384,7 @@ async fn main() {
         vm_runner,
         mobile_tokens,
         mobile_sessions,
+        mobile_claw_vpn_mesh,
         claw_store,
         theyos_dir,
         locks_dir,
@@ -945,6 +962,10 @@ async fn main() {
             "/resource-options",
             get(handlers_mobile::handle_resource_options),
         )
+        .route(
+            "/claw-vpn/status",
+            get(handlers_mobile::handle_mobile_claw_vpn_status),
+        )
         .merge(claw_store_routes::mobile_nested_routes())
         .with_state(Arc::clone(&state));
 
@@ -1087,4 +1108,12 @@ fn flow_config_from_env(sqlite_db: &str) -> FlowConfig {
             .unwrap_or(30),
         store_db_path: sqlite_db.to_string(),
     }
+}
+
+fn mobile_claw_vpn_offer_ttl_secs_from_env() -> u64 {
+    std::env::var(MOBILE_CLAW_VPN_OFFER_TTL_SECS_ENV)
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|secs| *secs > 0)
+        .unwrap_or(DEFAULT_MOBILE_CLAW_VPN_OFFER_TTL_SECS)
 }

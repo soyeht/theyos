@@ -8,6 +8,7 @@ use crate::handlers_llm::ProxyClient;
 use crate::mobile_token::{MobileSessionDb, MobileTokenStore};
 use crate::ratelimit::Limiter;
 use executor_rs::Executor;
+use household_rs::claw_vpn_mobile_mesh_store::ClawVpnMobileMeshStore;
 use jobs_rs::Store as JobsStore;
 use session_rs::SessionStore;
 use std::path::PathBuf;
@@ -56,6 +57,10 @@ pub struct AppState {
     pub mobile_tokens: Arc<MobileTokenStore>,
     /// SQLite-backed mobile session store (persistent across restarts).
     pub mobile_sessions: MobileSessionDb,
+    /// Persisted Product A mobile per-Claw VPN Mesh-C model. This is API-adjacent
+    /// state only; owner-sensitive mutations stay behind explicit owner-approved
+    /// store methods.
+    pub mobile_claw_vpn_mesh: ClawVpnMobileMeshStore,
 
     // ── Phase 6: Claw Store ────────────────────────────────────────────────
     /// Dynamic per-host claw install state (ready / installing / `not_installed`).
