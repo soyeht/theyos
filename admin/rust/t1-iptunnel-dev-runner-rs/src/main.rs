@@ -499,8 +499,9 @@ fn decode_lower_hex(hex: &str) -> Result<Vec<u8>> {
 /// existing path. The content is secret and is never logged; the path is not
 /// echoed on error.
 fn write_private_secret_file(path: &Path, secret_hex: &str) -> Result<()> {
+    use std::fs::Permissions;
     use std::io::Write as _;
-    use std::os::unix::fs::OpenOptionsExt as _;
+    use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
 
     let mut file = match std::fs::OpenOptions::new()
         .write(true)
@@ -514,6 +515,11 @@ fn write_private_secret_file(path: &Path, secret_hex: &str) -> Result<()> {
         }
         Err(error) => return Err(error).context("create device secret file"),
     };
+    // Force exactly 0600 regardless of the caller's umask (the create mode above
+    // is umask-filtered; fchmod is not), so the reported mode is literal and the
+    // run can always read the secret back. create_new still guarantees no-clobber.
+    file.set_permissions(Permissions::from_mode(0o600))
+        .context("set device secret file permissions")?;
     file.write_all(secret_hex.as_bytes())
         .context("write device secret file")?;
     file.write_all(b"\n").context("write device secret file")?;
