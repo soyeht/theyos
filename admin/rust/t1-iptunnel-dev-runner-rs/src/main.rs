@@ -1414,14 +1414,12 @@ mod tests {
         let second_path = TempSecretPath::new("distinct-b");
         let first = generate_device_keypair_to_file(first_path.path()).expect("first keypair");
         let second = generate_device_keypair_to_file(second_path.path()).expect("second keypair");
+        // Distinct PUBLIC keys prove fresh randomness without ever reading the
+        // secret files back: a distinct-secret assertion would print the real
+        // secrets to the test log on failure, which a secret helper must never do.
         assert_ne!(
             first.guest_device_pub_hex, second.guest_device_pub_hex,
             "each generation must draw fresh randomness"
-        );
-        assert_ne!(
-            std::fs::read_to_string(first_path.path()).expect("read a"),
-            std::fs::read_to_string(second_path.path()).expect("read b"),
-            "secrets must differ too"
         );
     }
 
