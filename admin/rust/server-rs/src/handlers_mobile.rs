@@ -1014,20 +1014,26 @@ pub async fn handle_admin_mobile_claw_vpn_set_claw_availability(
     let available = req.available;
     let claw = mobile_claw_vpn_claw_id(req.claw_id)?;
     let store = state.mobile_claw_vpn_mesh.clone();
-    let (changed, status) = blocking(move || {
-        let changed = if available {
-            store.set_claw_available(claw).map_err(|error| {
+    let (changed, revoked_offer_count, closed_session_count, status) = blocking(move || {
+        let (changed, revoked_offer_count, closed_session_count) = if available {
+            let changed = store.set_claw_available(claw).map_err(|error| {
                 mobile_claw_vpn_store_error(error, "mobile Claw VPN owner action failed")
-            })?
+            })?;
+            (changed, 0, 0)
         } else {
-            store.set_claw_unavailable(&claw).map_err(|error| {
+            let change = store.set_claw_unavailable(&claw).map_err(|error| {
                 mobile_claw_vpn_store_error(error, "mobile Claw VPN owner action failed")
-            })?
+            })?;
+            (
+                change.changed(),
+                change.revoked_offer_count(),
+                change.closed_session_count(),
+            )
         };
         let status = store.status().map_err(|error| {
             mobile_claw_vpn_store_error(error, "mobile Claw VPN owner action failed")
         })?;
-        Ok::<_, ApiError>((changed, status))
+        Ok::<_, ApiError>((changed, revoked_offer_count, closed_session_count, status))
     })
     .await??;
     Ok((
@@ -1039,8 +1045,8 @@ pub async fn handle_admin_mobile_claw_vpn_set_claw_availability(
                 "set_claw_unavailable"
             },
             changed,
-            0,
-            0,
+            revoked_offer_count,
+            closed_session_count,
             status,
         )),
     )

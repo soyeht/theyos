@@ -1673,6 +1673,82 @@ async fn mobile_claw_vpn_owner_routes_require_admin_and_are_count_only() {
 }
 
 #[tokio::test]
+async fn mobile_claw_vpn_owner_unavailability_closes_matching_sessions() {
+    let state = shared_state();
+    let availability_path = "/api/v1/mobile/claw-vpn/owner/claw-availability";
+    let admin_cookie =
+        admin_session_cookie_for_role(&state, "mesh-availability-admin", UserRole::Admin);
+    let grant = household_rs::claw_vpn_mobile_state::ClawVpnMobileAclGrant::new(
+        household_rs::claw_vpn_mobile_state::ClawVpnMobileMemberId::try_new("member-alpha")
+            .expect("member id"),
+        household_rs::claw_vpn_mobile_state::ClawVpnMobileDeviceId::try_new("device-alpha")
+            .expect("device id"),
+        household_rs::claw_vpn_mobile_state::ClawVpnMobileClawId::try_new("claw-alpha")
+            .expect("claw id"),
+    );
+    assert!(
+        state
+            .mobile_claw_vpn_mesh
+            .owner_approved_enroll_device(
+                household_rs::claw_vpn_mobile_state::ClawVpnMobileDeviceId::try_new("device-alpha")
+                    .expect("device id"),
+            )
+            .unwrap()
+    );
+    assert!(
+        state
+            .mobile_claw_vpn_mesh
+            .set_claw_available(
+                household_rs::claw_vpn_mobile_state::ClawVpnMobileClawId::try_new("claw-alpha")
+                    .expect("claw id"),
+            )
+            .unwrap()
+    );
+    assert!(
+        state
+            .mobile_claw_vpn_mesh
+            .owner_approved_grant(grant.clone())
+            .unwrap()
+    );
+    let consumed_offer_token = state
+        .mobile_claw_vpn_mesh
+        .mint_offer_token(&grant, 100)
+        .expect("mint consumed offer");
+    let _rendezvous_token = state
+        .mobile_claw_vpn_mesh
+        .consume_offer_token(&consumed_offer_token, &grant, 101)
+        .expect("consume offer");
+    let _minted_offer = state
+        .mobile_claw_vpn_mesh
+        .mint_offer_token(&grant, 102)
+        .expect("mint pending offer");
+
+    let (status, _bytes, body) = request_with_cookie(
+        admin_auth_router(Arc::clone(&state)),
+        Method::POST,
+        availability_path,
+        json!({"claw_id":"claw-alpha","available":false})
+            .to_string()
+            .into_bytes(),
+        Some(admin_cookie),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_mobile_claw_vpn_owner_mutation_body(
+        &body,
+        "set_claw_unavailable",
+        true,
+        1,
+        1,
+        [1, 0, 1, 2, 0],
+    );
+    assert_eq!(
+        state.mobile_claw_vpn_mesh.status().unwrap().session_count(),
+        0
+    );
+}
+
+#[tokio::test]
 async fn mobile_claw_vpn_offer_routes_are_auth_scoped_single_use_and_count_only() {
     let state = shared_state();
     let offer_path = "/api/v1/mobile/claw-vpn/offers";

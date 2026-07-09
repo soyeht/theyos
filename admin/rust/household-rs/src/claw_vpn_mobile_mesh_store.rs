@@ -9,10 +9,11 @@
 use std::fmt;
 use std::path::PathBuf;
 
+use crate::claw_share_rendezvous_token::RendezvousToken;
 use crate::claw_vpn_mobile_state::{
-    ClawVpnMobileAclGrant, ClawVpnMobileClawId, ClawVpnMobileDeviceId, ClawVpnMobileMesh,
-    ClawVpnMobileMeshError, ClawVpnMobileMeshRevocation, ClawVpnMobileOfferToken,
-    ClawVpnMobileRendezvousToken, ClawVpnMobileSessionId,
+    ClawVpnMobileAclGrant, ClawVpnMobileClawAvailabilityChange, ClawVpnMobileClawId,
+    ClawVpnMobileDeviceId, ClawVpnMobileMesh, ClawVpnMobileMeshError, ClawVpnMobileMeshRevocation,
+    ClawVpnMobileOfferToken, ClawVpnMobileRendezvousToken, ClawVpnMobileSessionId,
 };
 use crate::storage;
 use rand::RngCore;
@@ -234,7 +235,7 @@ impl ClawVpnMobileMeshStore {
     pub fn set_claw_unavailable(
         &self,
         claw: &ClawVpnMobileClawId,
-    ) -> Result<bool, ClawVpnMobileMeshStoreError> {
+    ) -> Result<ClawVpnMobileClawAvailabilityChange, ClawVpnMobileMeshStoreError> {
         self.update("set_claw_unavailable", |mesh| {
             Ok(mesh.set_claw_unavailable(claw))
         })
@@ -279,6 +280,18 @@ impl ClawVpnMobileMeshStore {
             mesh.consume_offer_token(token, grant, now_unix, rendezvous_token.clone())?;
             Ok(rendezvous_token)
         })
+    }
+
+    pub fn authorize_rendezvous_token(
+        &self,
+        token: &ClawVpnMobileRendezvousToken,
+        grant: &ClawVpnMobileAclGrant,
+    ) -> Result<RendezvousToken, ClawVpnMobileMeshStoreError> {
+        let mesh = self.load()?;
+        mesh.authorize_rendezvous_token(token, grant)
+            .map_err(|source| {
+                ClawVpnMobileMeshStoreError::model("authorize_rendezvous_token", source)
+            })
     }
 
     pub fn close_session(
@@ -383,6 +396,38 @@ mod tests {
                 .unwrap_err()
                 .model_error(),
             Some(ClawVpnMobileMeshError::OfferAlreadyConsumed)
+        );
+    }
+
+    #[test]
+    fn store_authorizes_rendezvous_only_while_grant_is_ready() {
+        let td = tempfile::tempdir().unwrap();
+        let store = ClawVpnMobileMeshStore::new(td.path(), 60).unwrap();
+        let grant = grant();
+        assert!(store.owner_approved_enroll_device(device()).unwrap());
+        assert!(store.set_claw_available(claw()).unwrap());
+        assert!(store.owner_approved_grant(grant.clone()).unwrap());
+        let offer_token = store.mint_offer_token(&grant, 10).unwrap();
+        let rendezvous_token = store.consume_offer_token(&offer_token, &grant, 20).unwrap();
+
+        assert_eq!(
+            store
+                .authorize_rendezvous_token(&rendezvous_token, &grant)
+                .unwrap()
+                .len(),
+            16
+        );
+        let unavailable = store.set_claw_unavailable(&claw()).unwrap();
+        assert!(unavailable.changed());
+        assert_eq!(unavailable.closed_session_count(), 1);
+        assert_eq!(store.status().unwrap().session_count(), 0);
+        let err = store
+            .authorize_rendezvous_token(&rendezvous_token, &grant)
+            .unwrap_err();
+        assert_eq!(err.operation(), "authorize_rendezvous_token");
+        assert_eq!(
+            err.model_error(),
+            Some(ClawVpnMobileMeshError::ClawUnavailable)
         );
     }
 
