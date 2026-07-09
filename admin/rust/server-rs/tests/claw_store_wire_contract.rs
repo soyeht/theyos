@@ -646,14 +646,26 @@ fn assert_mobile_claw_vpn_offer_body(body: &Value, counts: [u64; 5]) -> String {
 
 fn assert_mobile_claw_vpn_session_body(body: &Value, counts: [u64; 5]) {
     let object = body.as_object().expect("session body object");
-    assert_eq!(object.len(), 5, "session response must stay minimal");
+    assert_eq!(object.len(), 6, "session response must stay minimal");
     assert_eq!(body["product"], "product_a_mobile_claw_vpn");
     assert_eq!(body["mode"], "mesh_c_offer_control");
     assert_eq!(body["production_activation"], false);
     assert_eq!(body["operation"], "consume_offer");
+    let rendezvous_token = body["rendezvous_token"]
+        .as_str()
+        .expect("rendezvous_token string token");
+    assert_eq!(
+        rendezvous_token.len(),
+        32,
+        "rendezvous_token must be 128-bit hex"
+    );
+    assert!(
+        rendezvous_token.chars().all(|ch| ch.is_ascii_hexdigit()),
+        "rendezvous_token must stay hex"
+    );
     assert!(
         !object.contains_key("session_id"),
-        "session id stays internal until there is an opaque session capability"
+        "sequential session id stays internal; public handle is the opaque rendezvous token"
     );
     assert_mobile_claw_vpn_status_counts(&body["status"], counts);
 }

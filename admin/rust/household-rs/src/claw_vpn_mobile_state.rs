@@ -11,8 +11,11 @@ use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
-pub const CLAW_VPN_MOBILE_MESH_SNAPSHOT_SCHEMA_VERSION: u16 = 2;
+use crate::claw_share_rendezvous_token::RendezvousToken;
+
+pub const CLAW_VPN_MOBILE_MESH_SNAPSHOT_SCHEMA_VERSION: u16 = 3;
 const CLAW_VPN_MOBILE_MESH_PRE_OFFER_TOKEN_SCHEMA_VERSION: u16 = 1;
+const CLAW_VPN_MOBILE_MESH_PRE_RENDEZVOUS_TOKEN_SCHEMA_VERSION: u16 = 2;
 
 /// Redacted public status labels exposed to UI, audit summaries, and tests.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -462,6 +465,36 @@ impl ClawVpnMobileOfferToken {
     }
 }
 
+/// Redacted bearer capability for one mobile Claw VPN relay rendezvous.
+#[derive(Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct ClawVpnMobileRendezvousToken(String);
+
+impl fmt::Debug for ClawVpnMobileRendezvousToken {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("ClawVpnMobileRendezvousToken(<redacted>)")
+    }
+}
+
+impl ClawVpnMobileRendezvousToken {
+    pub fn try_new(value: impl Into<String>) -> Result<Self, ClawVpnMobileMeshError> {
+        let value = value.into();
+        if value.len() != 32 || !value.chars().all(|ch| ch.is_ascii_hexdigit()) {
+            return Err(ClawVpnMobileMeshError::InvalidId);
+        }
+        Ok(Self(value))
+    }
+
+    #[must_use]
+    pub fn public_token(&self) -> &str {
+        &self.0
+    }
+
+    pub fn relay_token(&self) -> Result<RendezvousToken, ClawVpnMobileMeshError> {
+        let bytes = hex::decode(&self.0).map_err(|_| ClawVpnMobileMeshError::InvalidId)?;
+        RendezvousToken::try_new(bytes).map_err(|_| ClawVpnMobileMeshError::InvalidId)
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 enum ClawVpnMobileOfferState {
     Minted,
@@ -491,12 +524,14 @@ impl fmt::Debug for ClawVpnMobileOffer {
 #[derive(Clone, PartialEq, Eq)]
 struct ClawVpnMobileSession {
     grant: ClawVpnMobileAclGrant,
+    rendezvous_token: ClawVpnMobileRendezvousToken,
 }
 
 impl fmt::Debug for ClawVpnMobileSession {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("ClawVpnMobileSession")
             .field("grant", &"<redacted>")
+            .field("rendezvous_token", &"<redacted>")
             .finish()
     }
 }
@@ -526,6 +561,7 @@ impl fmt::Debug for ClawVpnMobileOfferSnapshot {
 struct ClawVpnMobileSessionSnapshot {
     id: ClawVpnMobileSessionId,
     grant: ClawVpnMobileAclGrant,
+    rendezvous_token: ClawVpnMobileRendezvousToken,
 }
 
 impl fmt::Debug for ClawVpnMobileSessionSnapshot {
@@ -533,6 +569,7 @@ impl fmt::Debug for ClawVpnMobileSessionSnapshot {
         f.debug_struct("ClawVpnMobileSessionSnapshot")
             .field("id", &self.id)
             .field("grant", &"<redacted>")
+            .field("rendezvous_token", &"<redacted>")
             .finish()
     }
 }
@@ -731,8 +768,16 @@ impl ClawVpnMobileMesh {
         offer_id: ClawVpnMobileOfferId,
         grant: &ClawVpnMobileAclGrant,
         now_unix: u64,
+        rendezvous_token: ClawVpnMobileRendezvousToken,
     ) -> Result<ClawVpnMobileSessionId, ClawVpnMobileMeshError> {
         self.check_grant_ready(grant)?;
+        if self
+            .sessions
+            .values()
+            .any(|session| session.rendezvous_token == rendezvous_token)
+        {
+            return Err(ClawVpnMobileMeshError::DuplicateSnapshotEntry);
+        }
         let offer = self
             .offers
             .get_mut(&offer_id)
@@ -760,6 +805,7 @@ impl ClawVpnMobileMesh {
             session_id,
             ClawVpnMobileSession {
                 grant: grant.clone(),
+                rendezvous_token,
             },
         );
         Ok(session_id)
@@ -770,13 +816,14 @@ impl ClawVpnMobileMesh {
         token: &ClawVpnMobileOfferToken,
         grant: &ClawVpnMobileAclGrant,
         now_unix: u64,
+        rendezvous_token: ClawVpnMobileRendezvousToken,
     ) -> Result<ClawVpnMobileSessionId, ClawVpnMobileMeshError> {
         let offer_id = self
             .offers
             .iter()
             .find_map(|(offer_id, offer)| (&offer.token == token).then_some(*offer_id))
             .ok_or(ClawVpnMobileMeshError::UnknownOffer)?;
-        self.consume_offer(offer_id, grant, now_unix)
+        self.consume_offer(offer_id, grant, now_unix, rendezvous_token)
     }
 
     pub fn close_session(
@@ -825,6 +872,7 @@ impl ClawVpnMobileMesh {
             .map(|(id, session)| ClawVpnMobileSessionSnapshot {
                 id: *id,
                 grant: session.grant.clone(),
+                rendezvous_token: session.rendezvous_token.clone(),
             })
             .collect();
         sessions.sort_by_key(|session| session.id.0);
@@ -846,14 +894,20 @@ impl ClawVpnMobileMesh {
     ) -> Result<Self, ClawVpnMobileMeshError> {
         let is_pre_offer_token_snapshot =
             snapshot.schema_version == CLAW_VPN_MOBILE_MESH_PRE_OFFER_TOKEN_SCHEMA_VERSION;
+        let is_pre_rendezvous_token_snapshot =
+            snapshot.schema_version == CLAW_VPN_MOBILE_MESH_PRE_RENDEZVOUS_TOKEN_SCHEMA_VERSION;
         if snapshot.schema_version != CLAW_VPN_MOBILE_MESH_SNAPSHOT_SCHEMA_VERSION
             && !is_pre_offer_token_snapshot
+            && !is_pre_rendezvous_token_snapshot
         {
             return Err(ClawVpnMobileMeshError::UnsupportedSnapshotSchema);
         }
         if is_pre_offer_token_snapshot
             && (!snapshot.offers.is_empty() || !snapshot.sessions.is_empty())
         {
+            return Err(ClawVpnMobileMeshError::UnsupportedSnapshotSchema);
+        }
+        if is_pre_rendezvous_token_snapshot && !snapshot.sessions.is_empty() {
             return Err(ClawVpnMobileMeshError::UnsupportedSnapshotSchema);
         }
         let mut mesh = Self::new(snapshot.offer_ttl_secs)?;
@@ -901,15 +955,20 @@ impl ClawVpnMobileMesh {
             }
         }
         let mut max_session_id = 0_u64;
+        let mut rendezvous_tokens = HashSet::new();
         for session in snapshot.sessions {
             max_session_id = max_session_id.max(session.id.0);
             mesh.check_grant_ready(&session.grant)?;
+            if !rendezvous_tokens.insert(session.rendezvous_token.clone()) {
+                return Err(ClawVpnMobileMeshError::DuplicateSnapshotEntry);
+            }
             if mesh
                 .sessions
                 .insert(
                     session.id,
                     ClawVpnMobileSession {
                         grant: session.grant,
+                        rendezvous_token: session.rendezvous_token,
                     },
                 )
                 .is_some()
@@ -1044,6 +1103,20 @@ mod tests {
 
     fn offer_token(value: u64) -> ClawVpnMobileOfferToken {
         ClawVpnMobileOfferToken::try_new(format!("{value:032x}")).unwrap()
+    }
+
+    fn rendezvous_token(value: u64) -> ClawVpnMobileRendezvousToken {
+        ClawVpnMobileRendezvousToken::try_new(format!("{value:032x}")).unwrap()
+    }
+
+    fn consume_offer(
+        mesh: &mut ClawVpnMobileMesh,
+        offer_id: ClawVpnMobileOfferId,
+        grant: &ClawVpnMobileAclGrant,
+        now_unix: u64,
+        token: u64,
+    ) -> Result<ClawVpnMobileSessionId, ClawVpnMobileMeshError> {
+        mesh.consume_offer(offer_id, grant, now_unix, rendezvous_token(token))
     }
 
     fn mint_offer(
@@ -1242,12 +1315,12 @@ mod tests {
         let grant = grant_for(claw_m());
         let mut mesh = ready_mesh(&grant);
         let first_offer = mint_offer(&mut mesh, &grant, 10, 1).unwrap();
-        let first_session = mesh.consume_offer(first_offer, &grant, 20).unwrap();
+        let first_session = consume_offer(&mut mesh, first_offer, &grant, 20, 1).unwrap();
 
         assert!(mesh.has_active_session(first_session));
         assert_eq!(mesh.active_session_count(), 1);
         assert_eq!(
-            mesh.consume_offer(first_offer, &grant, 21),
+            consume_offer(&mut mesh, first_offer, &grant, 21, 2),
             Err(ClawVpnMobileMeshError::OfferAlreadyConsumed)
         );
 
@@ -1259,9 +1332,25 @@ mod tests {
         );
 
         let second_offer = mint_offer(&mut mesh, &grant, 22, 2).unwrap();
-        let second_session = mesh.consume_offer(second_offer, &grant, 23).unwrap();
+        let second_session = consume_offer(&mut mesh, second_offer, &grant, 23, 2).unwrap();
         assert!(mesh.has_active_session(second_session));
         assert_ne!(first_session, second_session);
+    }
+
+    #[test]
+    fn mobile_mesh_rejects_reused_rendezvous_token() {
+        let grant = grant_for(claw_m());
+        let mut mesh = ready_mesh(&grant);
+        let first_offer = mint_offer(&mut mesh, &grant, 10, 1).unwrap();
+        let second_offer = mint_offer(&mut mesh, &grant, 11, 2).unwrap();
+        let first_session = consume_offer(&mut mesh, first_offer, &grant, 20, 1).unwrap();
+
+        assert!(mesh.has_active_session(first_session));
+        assert_eq!(
+            consume_offer(&mut mesh, second_offer, &grant, 21, 1),
+            Err(ClawVpnMobileMeshError::DuplicateSnapshotEntry)
+        );
+        assert_eq!(mesh.active_session_count(), 1);
     }
 
     #[test]
@@ -1270,7 +1359,7 @@ mod tests {
         let mut expired_mesh = ready_mesh(&grant);
         let expired_offer = mint_offer(&mut expired_mesh, &grant, 10, 1).unwrap();
         assert_eq!(
-            expired_mesh.consume_offer(expired_offer, &grant, 70),
+            consume_offer(&mut expired_mesh, expired_offer, &grant, 70, 1),
             Err(ClawVpnMobileMeshError::OfferExpired)
         );
         assert_eq!(expired_mesh.active_session_count(), 0);
@@ -1282,7 +1371,7 @@ mod tests {
         assert_eq!(revocation.revoked_offer_count(), 1);
         assert_eq!(revocation.closed_session_count(), 0);
         assert_eq!(
-            revoked_mesh.consume_offer(revoked_offer, &grant, 20),
+            consume_offer(&mut revoked_mesh, revoked_offer, &grant, 20, 1),
             Err(ClawVpnMobileMeshError::Unauthorized)
         );
         assert_eq!(revoked_mesh.active_session_count(), 0);
@@ -1296,14 +1385,14 @@ mod tests {
 
         assert!(mesh.set_claw_unavailable(&claw_m()));
         assert_eq!(
-            mesh.consume_offer(stale_offer, &grant, 20),
+            consume_offer(&mut mesh, stale_offer, &grant, 20, 1),
             Err(ClawVpnMobileMeshError::ClawUnavailable)
         );
         assert_eq!(mesh.active_session_count(), 0);
 
         assert!(mesh.set_claw_available(claw_m()));
         let fresh_offer = mint_offer(&mut mesh, &grant, 21, 2).unwrap();
-        let session = mesh.consume_offer(fresh_offer, &grant, 22).unwrap();
+        let session = consume_offer(&mut mesh, fresh_offer, &grant, 22, 2).unwrap();
         assert!(mesh.has_active_session(session));
     }
 
@@ -1312,7 +1401,7 @@ mod tests {
         let grant = grant_for(claw_m());
         let mut mesh = ready_mesh(&grant);
         let consumed_offer = mint_offer(&mut mesh, &grant, 10, 1).unwrap();
-        let session = mesh.consume_offer(consumed_offer, &grant, 20).unwrap();
+        let session = consume_offer(&mut mesh, consumed_offer, &grant, 20, 1).unwrap();
         let snapshot = mesh.snapshot();
 
         assert_eq!(
@@ -1338,11 +1427,11 @@ mod tests {
 
         assert!(restored.has_active_session(session));
         assert_eq!(
-            restored.consume_offer(consumed_offer, &grant, 21),
+            consume_offer(&mut restored, consumed_offer, &grant, 21, 2),
             Err(ClawVpnMobileMeshError::OfferAlreadyConsumed)
         );
         let fresh_offer = mint_offer(&mut restored, &grant, 22, 2).unwrap();
-        let fresh_session = restored.consume_offer(fresh_offer, &grant, 23).unwrap();
+        let fresh_session = consume_offer(&mut restored, fresh_offer, &grant, 23, 2).unwrap();
         assert_ne!(session, fresh_session);
         assert!(restored.has_active_session(fresh_session));
     }
@@ -1368,7 +1457,7 @@ mod tests {
 
         let mut active_mesh = ready_mesh(&grant);
         let active_offer = mint_offer(&mut active_mesh, &grant, 10, 1).unwrap();
-        let _session = active_mesh.consume_offer(active_offer, &grant, 20).unwrap();
+        let _session = consume_offer(&mut active_mesh, active_offer, &grant, 20, 1).unwrap();
         let mut active_v1 = active_mesh.snapshot();
         active_v1.schema_version = CLAW_VPN_MOBILE_MESH_PRE_OFFER_TOKEN_SCHEMA_VERSION;
         assert_eq!(
@@ -1378,11 +1467,38 @@ mod tests {
     }
 
     #[test]
+    fn mobile_mesh_snapshot_v2_migrates_only_without_active_sessions() {
+        let grant = grant_for(claw_m());
+        let mut offer_mesh = ready_mesh(&grant);
+        let _offer = mint_offer(&mut offer_mesh, &grant, 10, 1).unwrap();
+        let mut pre_rendezvous = offer_mesh.snapshot();
+        pre_rendezvous.schema_version = CLAW_VPN_MOBILE_MESH_PRE_RENDEZVOUS_TOKEN_SCHEMA_VERSION;
+
+        let restored = ClawVpnMobileMesh::from_snapshot(pre_rendezvous).unwrap();
+        let migrated = restored.snapshot();
+        assert_eq!(
+            migrated.schema_version(),
+            CLAW_VPN_MOBILE_MESH_SNAPSHOT_SCHEMA_VERSION
+        );
+        assert_eq!(migrated.offer_count(), 1);
+        assert_eq!(migrated.session_count(), 0);
+
+        let active_offer = mint_offer(&mut offer_mesh, &grant, 20, 2).unwrap();
+        let _session = consume_offer(&mut offer_mesh, active_offer, &grant, 21, 1).unwrap();
+        let mut active_v2 = offer_mesh.snapshot();
+        active_v2.schema_version = CLAW_VPN_MOBILE_MESH_PRE_RENDEZVOUS_TOKEN_SCHEMA_VERSION;
+        assert_eq!(
+            ClawVpnMobileMesh::from_snapshot(active_v2),
+            Err(ClawVpnMobileMeshError::UnsupportedSnapshotSchema)
+        );
+    }
+
+    #[test]
     fn mobile_mesh_snapshot_restore_rejects_active_state_without_ready_grant() {
         let grant = grant_for(claw_m());
         let mut session_mesh = ready_mesh(&grant);
         let offer = mint_offer(&mut session_mesh, &grant, 10, 1).unwrap();
-        let _session = session_mesh.consume_offer(offer, &grant, 20).unwrap();
+        let _session = consume_offer(&mut session_mesh, offer, &grant, 20, 1).unwrap();
         let mut missing_grant_session = session_mesh.snapshot();
         missing_grant_session.grants.clear();
         assert_eq!(
@@ -1415,7 +1531,7 @@ mod tests {
         assert!(mesh.set_claw_available(claw_l()));
         assert!(mesh.grant(grant_l));
         let offer_m = mint_offer(&mut mesh, &grant_m, 10, 1).unwrap();
-        let _session_m = mesh.consume_offer(offer_m, &grant_m, 20).unwrap();
+        let _session_m = consume_offer(&mut mesh, offer_m, &grant_m, 20, 1).unwrap();
         let _offer_l = mint_offer(&mut mesh, &grant_for(claw_l()), 30, 2).unwrap();
         let snapshot = mesh.snapshot();
         let encoded = crate::cbor::to_canonical_vec(&snapshot).unwrap();
@@ -1437,7 +1553,7 @@ mod tests {
         let grant = grant_for(claw_m());
         let mut mesh = ready_mesh(&grant);
         let offer = mint_offer(&mut mesh, &grant, 10, 1).unwrap();
-        let session = mesh.consume_offer(offer, &grant, 20).unwrap();
+        let session = consume_offer(&mut mesh, offer, &grant, 20, 1).unwrap();
 
         let mut duplicate = mesh.snapshot();
         duplicate.enrolled_devices.push(device());
@@ -1503,10 +1619,10 @@ mod tests {
         let offer_for_m = mint_offer(&mut mesh, &grant_m, 10, 1).unwrap();
 
         assert_eq!(
-            mesh.consume_offer(offer_for_m, &grant_l, 20),
+            consume_offer(&mut mesh, offer_for_m, &grant_l, 20, 1),
             Err(ClawVpnMobileMeshError::SelectedClawMismatch)
         );
-        let session = mesh.consume_offer(offer_for_m, &grant_m, 21).unwrap();
+        let session = consume_offer(&mut mesh, offer_for_m, &grant_m, 21, 1).unwrap();
         assert!(mesh.has_active_session(session));
     }
 
@@ -1520,8 +1636,8 @@ mod tests {
 
         let offer_m = mint_offer(&mut mesh, &grant_m, 10, 1).unwrap();
         let offer_l = mint_offer(&mut mesh, &grant_l, 10, 2).unwrap();
-        let session_m = mesh.consume_offer(offer_m, &grant_m, 20).unwrap();
-        let session_l = mesh.consume_offer(offer_l, &grant_l, 20).unwrap();
+        let session_m = consume_offer(&mut mesh, offer_m, &grant_m, 20, 1).unwrap();
+        let session_l = consume_offer(&mut mesh, offer_l, &grant_l, 20, 2).unwrap();
 
         let revocation = mesh.revoke(&grant_m);
         assert!(revocation.grant_removed());

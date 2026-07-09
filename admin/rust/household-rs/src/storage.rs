@@ -1281,6 +1281,7 @@ mod tests {
         use crate::claw_vpn_mobile_state::{
             ClawVpnMobileAclGrant, ClawVpnMobileClawId, ClawVpnMobileDeviceId,
             ClawVpnMobileMemberId, ClawVpnMobileMesh, ClawVpnMobileOfferToken,
+            ClawVpnMobileRendezvousToken,
         };
 
         let td = tempdir().unwrap();
@@ -1294,9 +1295,13 @@ mod tests {
         assert!(mesh.grant(grant.clone()));
         let offer_token =
             ClawVpnMobileOfferToken::try_new("0123456789abcdef0123456789abcdef").unwrap();
+        let rendezvous_token =
+            ClawVpnMobileRendezvousToken::try_new("abcdef0123456789abcdef0123456789").unwrap();
         mesh.mint_offer_with_token(&grant, 10, offer_token.clone())
             .unwrap();
-        let session = mesh.consume_offer_token(&offer_token, &grant, 20).unwrap();
+        let session = mesh
+            .consume_offer_token(&offer_token, &grant, 20, rendezvous_token)
+            .unwrap();
 
         let snapshot = mesh.snapshot();
         write_claw_vpn_mobile_mesh_snapshot(td.path(), &snapshot).unwrap();

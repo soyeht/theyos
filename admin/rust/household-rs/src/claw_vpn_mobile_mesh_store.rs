@@ -12,7 +12,7 @@ use std::path::PathBuf;
 use crate::claw_vpn_mobile_state::{
     ClawVpnMobileAclGrant, ClawVpnMobileClawId, ClawVpnMobileDeviceId, ClawVpnMobileMesh,
     ClawVpnMobileMeshError, ClawVpnMobileMeshRevocation, ClawVpnMobileOfferToken,
-    ClawVpnMobileSessionId,
+    ClawVpnMobileRendezvousToken, ClawVpnMobileSessionId,
 };
 use crate::storage;
 use rand::RngCore;
@@ -272,9 +272,12 @@ impl ClawVpnMobileMeshStore {
         token: &ClawVpnMobileOfferToken,
         grant: &ClawVpnMobileAclGrant,
         now_unix: u64,
-    ) -> Result<ClawVpnMobileSessionId, ClawVpnMobileMeshStoreError> {
+    ) -> Result<ClawVpnMobileRendezvousToken, ClawVpnMobileMeshStoreError> {
+        let rendezvous_token = generate_session_rendezvous_token()
+            .map_err(|source| ClawVpnMobileMeshStoreError::model("consume_offer_token", source))?;
         self.update("consume_offer_token", |mesh| {
-            mesh.consume_offer_token(token, grant, now_unix)
+            mesh.consume_offer_token(token, grant, now_unix, rendezvous_token.clone())?;
+            Ok(rendezvous_token)
         })
     }
 
@@ -302,6 +305,13 @@ fn generate_offer_token() -> Result<ClawVpnMobileOfferToken, ClawVpnMobileMeshEr
     let mut bytes = [0_u8; 16];
     rand::rngs::OsRng.fill_bytes(&mut bytes);
     ClawVpnMobileOfferToken::try_new(hex::encode(bytes))
+}
+
+fn generate_session_rendezvous_token()
+-> Result<ClawVpnMobileRendezvousToken, ClawVpnMobileMeshError> {
+    let mut bytes = [0_u8; 16];
+    rand::rngs::OsRng.fill_bytes(&mut bytes);
+    ClawVpnMobileRendezvousToken::try_new(hex::encode(bytes))
 }
 
 fn status_from_mesh(
@@ -350,7 +360,15 @@ mod tests {
         assert!(store.set_claw_available(claw()).unwrap());
         assert!(store.owner_approved_grant(grant.clone()).unwrap());
         let offer_token = store.mint_offer_token(&grant, 10).unwrap();
-        let session = store.consume_offer_token(&offer_token, &grant, 20).unwrap();
+        let rendezvous_token = store.consume_offer_token(&offer_token, &grant, 20).unwrap();
+        assert_eq!(rendezvous_token.public_token().len(), 32);
+        assert!(
+            rendezvous_token
+                .public_token()
+                .chars()
+                .all(|ch| ch.is_ascii_hexdigit())
+        );
+        assert_eq!(rendezvous_token.relay_token().unwrap().len(), 16);
 
         let status = store.status().unwrap();
         assert!(status.snapshot_present());
@@ -359,7 +377,6 @@ mod tests {
         assert_eq!(status.grant_count(), 1);
         assert_eq!(status.offer_count(), 1);
         assert_eq!(status.session_count(), 1);
-        assert!(store.load().unwrap().has_active_session(session));
         assert_eq!(
             store
                 .consume_offer_token(&offer_token, &grant, 21)
@@ -388,8 +405,9 @@ mod tests {
 
         assert!(store.owner_approved_grant(grant.clone()).unwrap());
         let offer_token = store.mint_offer_token(&grant, 20).unwrap();
-        let session = store.consume_offer_token(&offer_token, &grant, 21).unwrap();
-        assert!(store.load().unwrap().has_active_session(session));
+        let rendezvous_token = store.consume_offer_token(&offer_token, &grant, 21).unwrap();
+        assert_eq!(rendezvous_token.public_token().len(), 32);
+        assert_eq!(store.status().unwrap().session_count(), 1);
         assert_eq!(
             store
                 .consume_offer_token(&offer_token, &grant, 22)
@@ -429,13 +447,13 @@ mod tests {
         assert!(store.set_claw_available(claw()).unwrap());
         assert!(store.owner_approved_grant(grant.clone()).unwrap());
         let offer_token = store.mint_offer_token(&grant, 10).unwrap();
-        let session = store.consume_offer_token(&offer_token, &grant, 20).unwrap();
-        assert!(store.load().unwrap().has_active_session(session));
+        let rendezvous_token = store.consume_offer_token(&offer_token, &grant, 20).unwrap();
+        assert_eq!(rendezvous_token.public_token().len(), 32);
+        assert_eq!(store.status().unwrap().session_count(), 1);
 
         let revocation = store.owner_approved_revoke(&grant).unwrap();
         assert!(revocation.grant_removed());
         assert_eq!(revocation.closed_session_count(), 1);
-        assert!(!store.load().unwrap().has_active_session(session));
         let status = store.status().unwrap();
         assert_eq!(status.grant_count(), 0);
         assert_eq!(status.session_count(), 0);

@@ -29,7 +29,7 @@ use household_rs::{
     },
     claw_vpn_mobile_state::{
         ClawVpnMobileAclGrant, ClawVpnMobileClawId, ClawVpnMobileDeviceId, ClawVpnMobileMemberId,
-        ClawVpnMobileMeshError, ClawVpnMobileOfferToken,
+        ClawVpnMobileMeshError, ClawVpnMobileOfferToken, ClawVpnMobileRendezvousToken,
     },
 };
 use percent_encoding::{AsciiSet, CONTROLS, utf8_percent_encode};
@@ -272,6 +272,7 @@ struct MobileClawVpnSessionResponse {
     mode: &'static str,
     production_activation: bool,
     operation: &'static str,
+    rendezvous_token: String,
     status: MobileClawVpnStatusResponse,
 }
 
@@ -540,6 +541,7 @@ fn mobile_claw_vpn_offer_response(
 
 fn mobile_claw_vpn_session_response(
     operation: &'static str,
+    rendezvous_token: &ClawVpnMobileRendezvousToken,
     status: ClawVpnMobileMeshStoreStatus,
 ) -> MobileClawVpnSessionResponse {
     MobileClawVpnSessionResponse {
@@ -547,6 +549,7 @@ fn mobile_claw_vpn_session_response(
         mode: "mesh_c_offer_control",
         production_activation: false,
         operation,
+        rendezvous_token: rendezvous_token.public_token().to_string(),
         status: mobile_claw_vpn_status_response(status),
     }
 }
@@ -907,8 +910,9 @@ pub async fn handle_mobile_claw_vpn_mint_offer(
 ///
 /// Mobile-authenticated. Consumes a Mesh-C offer for the authenticated member,
 /// Device-D, and selected Claw. The offer remains single-use and TTL-bound in
-/// the persisted model. This creates only a Mesh-C session record; it does not
-/// open a relay, TUN/utun, route, or `NetworkExtension` tunnel.
+/// the persisted model. This creates only a Mesh-C session record plus an
+/// opaque relay rendezvous capability; it does not open a relay, TUN/utun,
+/// route, or `NetworkExtension` tunnel.
 ///
 /// # Errors
 ///
@@ -926,8 +930,8 @@ pub async fn handle_mobile_claw_vpn_consume_offer(
     let offer_token = mobile_claw_vpn_offer_token(req.offer)?;
     let now_unix = mobile_claw_vpn_now_unix()?;
     let store = state.mobile_claw_vpn_mesh.clone();
-    let status = blocking(move || {
-        store
+    let (rendezvous_token, status) = blocking(move || {
+        let rendezvous_token = store
             .consume_offer_token(&offer_token, &grant, now_unix)
             .map_err(|error| {
                 mobile_claw_vpn_offer_store_error(error, "mobile Claw VPN offer action failed")
@@ -935,12 +939,16 @@ pub async fn handle_mobile_claw_vpn_consume_offer(
         let status = store.status().map_err(|error| {
             mobile_claw_vpn_offer_store_error(error, "mobile Claw VPN offer action failed")
         })?;
-        Ok::<_, ApiError>(status)
+        Ok::<_, ApiError>((rendezvous_token, status))
     })
     .await??;
     Ok((
         StatusCode::OK,
-        Json(mobile_claw_vpn_session_response("consume_offer", status)),
+        Json(mobile_claw_vpn_session_response(
+            "consume_offer",
+            &rendezvous_token,
+            status,
+        )),
     )
         .into_response())
 }
