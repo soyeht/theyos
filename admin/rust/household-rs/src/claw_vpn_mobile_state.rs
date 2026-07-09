@@ -9,6 +9,10 @@
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 
+use serde::{Deserialize, Serialize};
+
+pub const CLAW_VPN_MOBILE_MESH_SNAPSHOT_SCHEMA_VERSION: u16 = 1;
+
 /// Redacted public status labels exposed to UI, audit summaries, and tests.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ClawVpnMobilePublicStatus {
@@ -325,7 +329,7 @@ pub fn transition_mesh_session(
 }
 
 /// Opaque, redacted member identifier for the pure mobile Mesh-C model.
-#[derive(Clone, PartialEq, Eq, Hash)]
+#[derive(Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ClawVpnMobileMemberId(String);
 
 impl fmt::Debug for ClawVpnMobileMemberId {
@@ -341,7 +345,7 @@ impl ClawVpnMobileMemberId {
 }
 
 /// Opaque, redacted device identifier for the pure mobile Mesh-C model.
-#[derive(Clone, PartialEq, Eq, Hash)]
+#[derive(Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ClawVpnMobileDeviceId(String);
 
 impl fmt::Debug for ClawVpnMobileDeviceId {
@@ -357,7 +361,7 @@ impl ClawVpnMobileDeviceId {
 }
 
 /// Opaque, redacted Claw identifier for the pure mobile Mesh-C model.
-#[derive(Clone, PartialEq, Eq, Hash)]
+#[derive(Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ClawVpnMobileClawId(String);
 
 impl fmt::Debug for ClawVpnMobileClawId {
@@ -373,7 +377,7 @@ impl ClawVpnMobileClawId {
 }
 
 /// Pure ACL relation for one mobile Device-D and one selected Claw.
-#[derive(Clone, PartialEq, Eq, Hash)]
+#[derive(Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ClawVpnMobileAclGrant {
     member: ClawVpnMobileMemberId,
     device: ClawVpnMobileDeviceId,
@@ -406,7 +410,7 @@ impl ClawVpnMobileAclGrant {
 }
 
 /// Redacted opaque offer id.
-#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ClawVpnMobileOfferId(u64);
 
 impl fmt::Debug for ClawVpnMobileOfferId {
@@ -416,7 +420,7 @@ impl fmt::Debug for ClawVpnMobileOfferId {
 }
 
 /// Redacted opaque active-session id.
-#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ClawVpnMobileSessionId(u64);
 
 impl fmt::Debug for ClawVpnMobileSessionId {
@@ -425,7 +429,7 @@ impl fmt::Debug for ClawVpnMobileSessionId {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 enum ClawVpnMobileOfferState {
     Minted,
     Consumed,
@@ -459,6 +463,105 @@ impl fmt::Debug for ClawVpnMobileSession {
         f.debug_struct("ClawVpnMobileSession")
             .field("grant", &"<redacted>")
             .finish()
+    }
+}
+
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct ClawVpnMobileOfferSnapshot {
+    id: ClawVpnMobileOfferId,
+    grant: ClawVpnMobileAclGrant,
+    expires_at: u64,
+    state: ClawVpnMobileOfferState,
+}
+
+impl fmt::Debug for ClawVpnMobileOfferSnapshot {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ClawVpnMobileOfferSnapshot")
+            .field("id", &self.id)
+            .field("grant", &"<redacted>")
+            .field("expires_at", &self.expires_at)
+            .field("state", &self.state)
+            .finish()
+    }
+}
+
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct ClawVpnMobileSessionSnapshot {
+    id: ClawVpnMobileSessionId,
+    grant: ClawVpnMobileAclGrant,
+}
+
+impl fmt::Debug for ClawVpnMobileSessionSnapshot {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ClawVpnMobileSessionSnapshot")
+            .field("id", &self.id)
+            .field("grant", &"<redacted>")
+            .finish()
+    }
+}
+
+/// Canonical storage/API snapshot for the pure mobile Mesh-C model.
+///
+/// The snapshot may contain real identifiers once wired to storage. Debug is
+/// intentionally count-only so diagnostic output cannot echo ids.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClawVpnMobileMeshSnapshot {
+    schema_version: u16,
+    offer_ttl_secs: u64,
+    next_offer_id: u64,
+    next_session_id: u64,
+    enrolled_devices: Vec<ClawVpnMobileDeviceId>,
+    available_claws: Vec<ClawVpnMobileClawId>,
+    grants: Vec<ClawVpnMobileAclGrant>,
+    offers: Vec<ClawVpnMobileOfferSnapshot>,
+    sessions: Vec<ClawVpnMobileSessionSnapshot>,
+}
+
+impl fmt::Debug for ClawVpnMobileMeshSnapshot {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ClawVpnMobileMeshSnapshot")
+            .field("schema_version", &self.schema_version)
+            .field("offer_ttl_secs", &self.offer_ttl_secs)
+            .field("next_offer_id", &"<redacted>")
+            .field("next_session_id", &"<redacted>")
+            .field("enrolled_devices", &self.enrolled_devices.len())
+            .field("available_claws", &self.available_claws.len())
+            .field("grants", &self.grants.len())
+            .field("offers", &self.offers.len())
+            .field("sessions", &self.sessions.len())
+            .finish()
+    }
+}
+
+impl ClawVpnMobileMeshSnapshot {
+    #[must_use]
+    pub fn schema_version(&self) -> u16 {
+        self.schema_version
+    }
+
+    #[must_use]
+    pub fn enrolled_device_count(&self) -> usize {
+        self.enrolled_devices.len()
+    }
+
+    #[must_use]
+    pub fn available_claw_count(&self) -> usize {
+        self.available_claws.len()
+    }
+
+    #[must_use]
+    pub fn grant_count(&self) -> usize {
+        self.grants.len()
+    }
+
+    #[must_use]
+    pub fn offer_count(&self) -> usize {
+        self.offers.len()
+    }
+
+    #[must_use]
+    pub fn session_count(&self) -> usize {
+        self.sessions.len()
     }
 }
 
@@ -640,6 +743,119 @@ impl ClawVpnMobileMesh {
         self.sessions.len()
     }
 
+    #[must_use]
+    pub fn snapshot(&self) -> ClawVpnMobileMeshSnapshot {
+        let mut enrolled_devices: Vec<_> = self.enrolled_devices.iter().cloned().collect();
+        enrolled_devices.sort_by(|left, right| left.0.cmp(&right.0));
+        let mut available_claws: Vec<_> = self.available_claws.iter().cloned().collect();
+        available_claws.sort_by(|left, right| left.0.cmp(&right.0));
+        let mut grants: Vec<_> = self.grants.iter().cloned().collect();
+        grants.sort_by(compare_grants);
+        let mut offers: Vec<_> = self
+            .offers
+            .iter()
+            .map(|(id, offer)| ClawVpnMobileOfferSnapshot {
+                id: *id,
+                grant: offer.grant.clone(),
+                expires_at: offer.expires_at,
+                state: offer.state,
+            })
+            .collect();
+        offers.sort_by_key(|offer| offer.id.0);
+        let mut sessions: Vec<_> = self
+            .sessions
+            .iter()
+            .map(|(id, session)| ClawVpnMobileSessionSnapshot {
+                id: *id,
+                grant: session.grant.clone(),
+            })
+            .collect();
+        sessions.sort_by_key(|session| session.id.0);
+        ClawVpnMobileMeshSnapshot {
+            schema_version: CLAW_VPN_MOBILE_MESH_SNAPSHOT_SCHEMA_VERSION,
+            offer_ttl_secs: self.offer_ttl_secs,
+            next_offer_id: self.next_offer_id,
+            next_session_id: self.next_session_id,
+            enrolled_devices,
+            available_claws,
+            grants,
+            offers,
+            sessions,
+        }
+    }
+
+    pub fn from_snapshot(
+        snapshot: ClawVpnMobileMeshSnapshot,
+    ) -> Result<Self, ClawVpnMobileMeshError> {
+        if snapshot.schema_version != CLAW_VPN_MOBILE_MESH_SNAPSHOT_SCHEMA_VERSION {
+            return Err(ClawVpnMobileMeshError::UnsupportedSnapshotSchema);
+        }
+        let mut mesh = Self::new(snapshot.offer_ttl_secs)?;
+        mesh.next_offer_id = snapshot.next_offer_id;
+        mesh.next_session_id = snapshot.next_session_id;
+        for device in snapshot.enrolled_devices {
+            if !mesh.enrolled_devices.insert(device) {
+                return Err(ClawVpnMobileMeshError::DuplicateSnapshotEntry);
+            }
+        }
+        for claw in snapshot.available_claws {
+            if !mesh.available_claws.insert(claw) {
+                return Err(ClawVpnMobileMeshError::DuplicateSnapshotEntry);
+            }
+        }
+        for grant in snapshot.grants {
+            if !mesh.grants.insert(grant) {
+                return Err(ClawVpnMobileMeshError::DuplicateSnapshotEntry);
+            }
+        }
+        let mut max_offer_id = 0_u64;
+        for offer in snapshot.offers {
+            max_offer_id = max_offer_id.max(offer.id.0);
+            if offer.state == ClawVpnMobileOfferState::Minted {
+                mesh.check_grant_ready(&offer.grant)?;
+            }
+            if mesh
+                .offers
+                .insert(
+                    offer.id,
+                    ClawVpnMobileOffer {
+                        grant: offer.grant,
+                        expires_at: offer.expires_at,
+                        state: offer.state,
+                    },
+                )
+                .is_some()
+            {
+                return Err(ClawVpnMobileMeshError::DuplicateSnapshotEntry);
+            }
+        }
+        let mut max_session_id = 0_u64;
+        for session in snapshot.sessions {
+            max_session_id = max_session_id.max(session.id.0);
+            mesh.check_grant_ready(&session.grant)?;
+            if mesh
+                .sessions
+                .insert(
+                    session.id,
+                    ClawVpnMobileSession {
+                        grant: session.grant,
+                    },
+                )
+                .is_some()
+            {
+                return Err(ClawVpnMobileMeshError::DuplicateSnapshotEntry);
+            }
+        }
+        if mesh.next_offer_id == 0
+            || mesh.next_session_id == 0
+            || mesh.next_offer_id <= max_offer_id
+            || mesh.next_session_id <= max_session_id
+        {
+            return Err(ClawVpnMobileMeshError::InvalidSnapshotCounter);
+        }
+        Ok(mesh)
+    }
+
     fn check_grant_ready(
         &self,
         grant: &ClawVpnMobileAclGrant,
@@ -655,6 +871,17 @@ impl ClawVpnMobileMesh {
         }
         Ok(())
     }
+}
+
+fn compare_grants(
+    left: &ClawVpnMobileAclGrant,
+    right: &ClawVpnMobileAclGrant,
+) -> std::cmp::Ordering {
+    left.member
+        .0
+        .cmp(&right.member.0)
+        .then_with(|| left.device.0.cmp(&right.device.0))
+        .then_with(|| left.claw.0.cmp(&right.claw.0))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -697,6 +924,9 @@ pub enum ClawVpnMobileMeshError {
     Revoked,
     SelectedClawMismatch,
     UnknownSession,
+    UnsupportedSnapshotSchema,
+    DuplicateSnapshotEntry,
+    InvalidSnapshotCounter,
 }
 
 impl fmt::Display for ClawVpnMobileMeshError {
@@ -991,6 +1221,159 @@ mod tests {
         let fresh_offer = mesh.mint_offer(&grant, 21).unwrap();
         let session = mesh.consume_offer(fresh_offer, &grant, 22).unwrap();
         assert!(mesh.has_active_session(session));
+    }
+
+    #[test]
+    fn mobile_mesh_snapshot_roundtrips_without_reopening_consumed_offer() {
+        let grant = grant_for(claw_m());
+        let mut mesh = ready_mesh(&grant);
+        let consumed_offer = mesh.mint_offer(&grant, 10).unwrap();
+        let session = mesh.consume_offer(consumed_offer, &grant, 20).unwrap();
+        let snapshot = mesh.snapshot();
+
+        assert_eq!(snapshot.schema_version(), 1);
+        assert_eq!(snapshot.enrolled_device_count(), 1);
+        assert_eq!(snapshot.available_claw_count(), 1);
+        assert_eq!(snapshot.grant_count(), 1);
+        assert_eq!(snapshot.offer_count(), 1);
+        assert_eq!(snapshot.session_count(), 1);
+
+        let debug = format!("{snapshot:?}");
+        assert!(!debug.contains("member-alpha"));
+        assert!(!debug.contains("device-alpha"));
+        assert!(!debug.contains("claw-m"));
+        assert!(debug.contains("<redacted>"));
+
+        let encoded = crate::cbor::to_canonical_vec(&snapshot).unwrap();
+        let decoded: ClawVpnMobileMeshSnapshot =
+            crate::cbor::from_canonical_slice(&encoded).unwrap();
+        let mut restored = ClawVpnMobileMesh::from_snapshot(decoded).unwrap();
+
+        assert!(restored.has_active_session(session));
+        assert_eq!(
+            restored.consume_offer(consumed_offer, &grant, 21),
+            Err(ClawVpnMobileMeshError::OfferAlreadyConsumed)
+        );
+        let fresh_offer = restored.mint_offer(&grant, 22).unwrap();
+        let fresh_session = restored.consume_offer(fresh_offer, &grant, 23).unwrap();
+        assert_ne!(session, fresh_session);
+        assert!(restored.has_active_session(fresh_session));
+    }
+
+    #[test]
+    fn mobile_mesh_snapshot_restore_rejects_active_state_without_ready_grant() {
+        let grant = grant_for(claw_m());
+        let mut session_mesh = ready_mesh(&grant);
+        let offer = session_mesh.mint_offer(&grant, 10).unwrap();
+        let _session = session_mesh.consume_offer(offer, &grant, 20).unwrap();
+        let mut missing_grant_session = session_mesh.snapshot();
+        missing_grant_session.grants.clear();
+        assert_eq!(
+            ClawVpnMobileMesh::from_snapshot(missing_grant_session),
+            Err(ClawVpnMobileMeshError::Unauthorized)
+        );
+
+        let mut minted_mesh = ready_mesh(&grant);
+        let _offer = minted_mesh.mint_offer(&grant, 10).unwrap();
+        let mut missing_grant_offer = minted_mesh.snapshot();
+        missing_grant_offer.grants.clear();
+        assert_eq!(
+            ClawVpnMobileMesh::from_snapshot(missing_grant_offer),
+            Err(ClawVpnMobileMeshError::Unauthorized)
+        );
+
+        let mut unavailable_claw_offer = minted_mesh.snapshot();
+        unavailable_claw_offer.available_claws.clear();
+        assert_eq!(
+            ClawVpnMobileMesh::from_snapshot(unavailable_claw_offer),
+            Err(ClawVpnMobileMeshError::ClawUnavailable)
+        );
+    }
+
+    #[test]
+    fn mobile_mesh_snapshot_encoding_is_canonical_across_insertion_order() {
+        let grant_m = grant_for(claw_m());
+        let grant_l = grant_for(claw_l());
+        let mut mesh = ready_mesh(&grant_m);
+        assert!(mesh.set_claw_available(claw_l()));
+        assert!(mesh.grant(grant_l));
+        let offer_m = mesh.mint_offer(&grant_m, 10).unwrap();
+        let _session_m = mesh.consume_offer(offer_m, &grant_m, 20).unwrap();
+        let _offer_l = mesh.mint_offer(&grant_for(claw_l()), 30).unwrap();
+        let snapshot = mesh.snapshot();
+        let encoded = crate::cbor::to_canonical_vec(&snapshot).unwrap();
+
+        let mut reversed = snapshot.clone();
+        reversed.enrolled_devices.reverse();
+        reversed.available_claws.reverse();
+        reversed.grants.reverse();
+        reversed.offers.reverse();
+        reversed.sessions.reverse();
+        let restored = ClawVpnMobileMesh::from_snapshot(reversed).unwrap();
+        let reencoded = crate::cbor::to_canonical_vec(&restored.snapshot()).unwrap();
+
+        assert_eq!(encoded, reencoded);
+    }
+
+    #[test]
+    fn mobile_mesh_snapshot_rejects_duplicate_and_stale_counters() {
+        let grant = grant_for(claw_m());
+        let mut mesh = ready_mesh(&grant);
+        let offer = mesh.mint_offer(&grant, 10).unwrap();
+        let session = mesh.consume_offer(offer, &grant, 20).unwrap();
+
+        let mut duplicate = mesh.snapshot();
+        duplicate.enrolled_devices.push(device());
+        assert_eq!(
+            ClawVpnMobileMesh::from_snapshot(duplicate),
+            Err(ClawVpnMobileMeshError::DuplicateSnapshotEntry)
+        );
+
+        let mut duplicate_offer = mesh.snapshot();
+        duplicate_offer
+            .offers
+            .push(duplicate_offer.offers.first().unwrap().clone());
+        assert_eq!(
+            ClawVpnMobileMesh::from_snapshot(duplicate_offer),
+            Err(ClawVpnMobileMeshError::DuplicateSnapshotEntry)
+        );
+
+        let mut duplicate_session = mesh.snapshot();
+        duplicate_session
+            .sessions
+            .push(duplicate_session.sessions.first().unwrap().clone());
+        assert_eq!(
+            ClawVpnMobileMesh::from_snapshot(duplicate_session),
+            Err(ClawVpnMobileMeshError::DuplicateSnapshotEntry)
+        );
+
+        let mut zero_offer_counter = mesh.snapshot();
+        zero_offer_counter.next_offer_id = 0;
+        assert_eq!(
+            ClawVpnMobileMesh::from_snapshot(zero_offer_counter),
+            Err(ClawVpnMobileMeshError::InvalidSnapshotCounter)
+        );
+
+        let mut zero_session_counter = mesh.snapshot();
+        zero_session_counter.next_session_id = 0;
+        assert_eq!(
+            ClawVpnMobileMesh::from_snapshot(zero_session_counter),
+            Err(ClawVpnMobileMeshError::InvalidSnapshotCounter)
+        );
+
+        let mut stale_offer_counter = mesh.snapshot();
+        stale_offer_counter.next_offer_id = offer.0;
+        assert_eq!(
+            ClawVpnMobileMesh::from_snapshot(stale_offer_counter),
+            Err(ClawVpnMobileMeshError::InvalidSnapshotCounter)
+        );
+
+        let mut stale_session_counter = mesh.snapshot();
+        stale_session_counter.next_session_id = session.0;
+        assert_eq!(
+            ClawVpnMobileMesh::from_snapshot(stale_session_counter),
+            Err(ClawVpnMobileMeshError::InvalidSnapshotCounter)
+        );
     }
 
     #[test]
