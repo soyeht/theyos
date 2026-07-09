@@ -8,6 +8,7 @@
 #   * the fail-closed production guard refuses prod indicators in env AND args;
 #   * dev-profile spellings (.dev suffix) are accepted;
 #   * --execute without the dev acks/envs is refused before touching any bin;
+#   * --execute refuses a malformed --guest-device-pub (wrong length/tag) before launch;
 #   * the script contains no contiguous production identifiers (dev-only source).
 #
 # Usage:
@@ -134,21 +135,48 @@ assert_exit 0 "dev profile allowed: mac .dev suffix" \
     env "SOYEHT_ENGINE=$PROD_MAC.dev" bash "$SCRIPT"
 
 # ---------------------------------------------------------------------------
-# 4. --execute is refused without the dev acks/envs, and never launches a bin.
+# 4. --execute fail-closed gates: dev acks/envs, the guest-device-pub format,
+#    and missing inputs/bins are all refused before any bin is launched.
 #    Point --bin-dir at a nonexistent dir so even a bug cannot launch anything.
 # ---------------------------------------------------------------------------
+# A format-valid guest-device-pub: 66 hex chars with a SEC1 02/03 tag. (Not a
+# real curve point -- the script validates shape only; the bin does the crypto.)
+ZEROS64="$(printf '%064d' 0)"
+VALID_PUB="03${ZEROS64}"
+# The classic mistake the format gate catches: the 64-hex device SECRET scalar
+# pasted into --guest-device-pub (a valid pubkey is 66 hex, not 64).
+SECRET_LEN_PUB="${ZEROS64}"
+# 66 hex chars but not a SEC1 compressed tag (04 is uncompressed/invalid here).
+WRONG_TAG_PUB="04${ZEROS64}"
+
 assert_exit 4 "--execute without dev env gates is refused" \
     env -u THEYOS_T1_DEV_DATAPATH -u THEYOS_FORCE_SOFTWARE_KEYS \
         bash "$SCRIPT" --execute \
-        --guest-device-pub deadbeef \
+        --guest-device-pub "$VALID_PUB" \
         --device-secret-file /nonexistent/secret.hex \
         --bin-dir /nonexistent/bindir
 
-# even WITH env gates, missing inputs/bins fail closed (exit 5) before launch
+# the guest-device-pub format gate (exit 5) fires before any bin is touched
+assert_exit 5 "--execute with a 64-hex secret mis-pasted as guest-device-pub is refused" \
+    env THEYOS_T1_DEV_DATAPATH=1 THEYOS_FORCE_SOFTWARE_KEYS=1 \
+        bash "$SCRIPT" --execute \
+        --guest-device-pub "$SECRET_LEN_PUB" \
+        --device-secret-file /nonexistent/secret.hex \
+        --bin-dir /nonexistent/bindir
+
+assert_exit 5 "--execute with a wrong-tag guest-device-pub is refused" \
+    env THEYOS_T1_DEV_DATAPATH=1 THEYOS_FORCE_SOFTWARE_KEYS=1 \
+        bash "$SCRIPT" --execute \
+        --guest-device-pub "$WRONG_TAG_PUB" \
+        --device-secret-file /nonexistent/secret.hex \
+        --bin-dir /nonexistent/bindir
+
+# even WITH env gates AND a well-formed pub, missing inputs/bins fail closed
+# (exit 5) before launch
 assert_exit 5 "--execute with gates but missing inputs fails closed pre-launch" \
     env THEYOS_T1_DEV_DATAPATH=1 THEYOS_FORCE_SOFTWARE_KEYS=1 \
         bash "$SCRIPT" --execute \
-        --guest-device-pub deadbeef \
+        --guest-device-pub "$VALID_PUB" \
         --device-secret-file /nonexistent/secret.hex \
         --bin-dir /nonexistent/bindir
 

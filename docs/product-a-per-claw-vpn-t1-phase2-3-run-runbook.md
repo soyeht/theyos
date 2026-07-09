@@ -79,6 +79,26 @@ cargo build --manifest-path admin/rust/Cargo.toml --features dev_t1_datapath \
 The examples below pass `--bin-dir admin/rust/target/debug` so the script uses
 these debug bins (its default looks under `target/release`).
 
+### Step 0 — generate the Device keypair (no host mutation)
+
+The Device needs a P-256 keypair: the runner reads the private **64-hex** secret
+scalar from `--device-secret-file`, and the serving claw needs the matching
+**66-hex** SEC1-compressed public key as `--guest-device-pub`. Generate both with
+one command — it writes the secret at mode `0600` (never printing it) and prints
+only the public key:
+
+```sh
+admin/rust/target/debug/t1-iptunnel-dev-runner gen-device-keypair \
+  --secret-out /path/to/private/device-secret.hex
+# → prints: guest-device-pub: <66-hex>   (public; copy into --guest-device-pub below)
+```
+
+This fails closed: before writing, it round-trips the secret through the runner's
+own reader and confirms it re-derives the printed key, and it refuses to
+overwrite an existing `--secret-out`. Copy the printed `guest-device-pub` into the
+`--guest-device-pub` argument in the steps below, and keep `device-secret.hex`
+private (it is the `device_secret_file` for the run).
+
 ### Step 1 — generate the Device session config (no host mutation)
 
 ```sh
@@ -97,7 +117,7 @@ the private address values are never printed. Keep the file private (it is a
 ```sh
 scripts/run-t1-dev-datapath.sh --dry-run \
   --bin-dir admin/rust/target/debug \
-  --claw-id <claw-id> --guest-device-pub <64-hex> \
+  --claw-id <claw-id> --guest-device-pub <66-hex> \
   --device-secret-file /path/to/private/device-secret.hex \
   --config-file /path/to/private/device-session.json
 ```
@@ -116,7 +136,7 @@ export THEYOS_T1_DEV_DATAPATH=1
 export THEYOS_FORCE_SOFTWARE_KEYS=1
 scripts/run-t1-dev-datapath.sh --execute \
   --bin-dir admin/rust/target/debug \
-  --claw-id <claw-id> --guest-device-pub <64-hex> \
+  --claw-id <claw-id> --guest-device-pub <66-hex> \
   --device-secret-file /path/to/private/device-secret.hex \
   --config-file /path/to/private/device-session.json
 ```

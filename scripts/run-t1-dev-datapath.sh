@@ -22,7 +22,7 @@
 # Usage:
 #   ./scripts/run-t1-dev-datapath.sh [--dry-run]            # default: dry-run
 #   ./scripts/run-t1-dev-datapath.sh --execute \
-#       --claw-id <id> --guest-device-pub <hex> \
+#       --claw-id <id> --guest-device-pub <66-hex> \
 #       --device-secret-file <path> [--platform linux|macos] \
 #       [--offer-file <path>] [--config-file <path>] \
 #       [--pool-network 198.18.0.0/24] [--relay-endpoint 127.0.0.1:49152] \
@@ -217,7 +217,19 @@ require_execute_gates() {
     [ -n "$DEV_HOST_ACK" ] \
         || die "--execute requires the dev-host acknowledgement" 4
 
-    [ -n "$GUEST_DEVICE_PUB" ] || die "--execute requires --guest-device-pub <hex>" 5
+    [ -n "$GUEST_DEVICE_PUB" ] || die "--execute requires --guest-device-pub <66-hex>" 5
+    # A valid guest-device-pub is a 33-byte SEC1-compressed P-256 key: 66 hex
+    # chars with an 02/03 tag. Fail fast so a mis-copied value (e.g. the 64-hex
+    # device secret) cannot reach the claw as a fatal decode mid-run.
+    [ "${#GUEST_DEVICE_PUB}" -eq 66 ] \
+        || die "--guest-device-pub must be 66 hex chars (33-byte SEC1 key), got ${#GUEST_DEVICE_PUB}" 5
+    case "$GUEST_DEVICE_PUB" in
+        02* | 03*) ;;
+        *) die "--guest-device-pub must start with the SEC1 compressed tag 02 or 03" 5 ;;
+    esac
+    case "$GUEST_DEVICE_PUB" in
+        *[!0-9a-fA-F]*) die "--guest-device-pub must be hex" 5 ;;
+    esac
     [ -n "$DEVICE_SECRET_FILE" ] || die "--execute requires --device-secret-file <path>" 5
     [ -f "$DEVICE_SECRET_FILE" ] || die "device secret file not found: $DEVICE_SECRET_FILE" 5
     [ -x "$BIN_DIR/$RELAY_BIN" ] || die "relay bin not found/executable: $BIN_DIR/$RELAY_BIN" 5
