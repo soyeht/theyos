@@ -985,6 +985,14 @@ async fn main() {
             "/claw-vpn/status",
             get(handlers_mobile::handle_mobile_claw_vpn_status),
         )
+        .route(
+            "/claw-vpn/offers",
+            post(handlers_mobile::handle_mobile_claw_vpn_mint_offer),
+        )
+        .route(
+            "/claw-vpn/sessions",
+            post(handlers_mobile::handle_mobile_claw_vpn_consume_offer),
+        )
         .merge(claw_store_routes::mobile_nested_routes())
         .with_state(Arc::clone(&state));
 

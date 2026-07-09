@@ -11,7 +11,7 @@ use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
-pub const CLAW_VPN_MOBILE_MESH_SNAPSHOT_SCHEMA_VERSION: u16 = 1;
+pub const CLAW_VPN_MOBILE_MESH_SNAPSHOT_SCHEMA_VERSION: u16 = 2;
 
 /// Redacted public status labels exposed to UI, audit summaries, and tests.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -429,6 +429,42 @@ impl fmt::Debug for ClawVpnMobileSessionId {
     }
 }
 
+impl ClawVpnMobileSessionId {
+    #[must_use]
+    pub fn public_token(self) -> u64 {
+        self.0
+    }
+}
+
+/// Redacted bearer capability for one mobile Claw VPN offer.
+#[derive(Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct ClawVpnMobileOfferToken(String);
+
+impl fmt::Debug for ClawVpnMobileOfferToken {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("ClawVpnMobileOfferToken(<redacted>)")
+    }
+}
+
+impl ClawVpnMobileOfferToken {
+    pub fn try_new(value: impl Into<String>) -> Result<Self, ClawVpnMobileMeshError> {
+        let value = value.into();
+        if value.len() != 32 || !value.chars().all(|ch| ch.is_ascii_hexdigit()) {
+            return Err(ClawVpnMobileMeshError::InvalidId);
+        }
+        Ok(Self(value))
+    }
+
+    fn from_internal_counter(value: u64) -> Self {
+        Self(format!("{value:032x}"))
+    }
+
+    #[must_use]
+    pub fn public_token(&self) -> &str {
+        &self.0
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 enum ClawVpnMobileOfferState {
     Minted,
@@ -439,6 +475,7 @@ enum ClawVpnMobileOfferState {
 #[derive(Clone, PartialEq, Eq)]
 struct ClawVpnMobileOffer {
     grant: ClawVpnMobileAclGrant,
+    token: ClawVpnMobileOfferToken,
     expires_at: u64,
     state: ClawVpnMobileOfferState,
 }
@@ -447,6 +484,7 @@ impl fmt::Debug for ClawVpnMobileOffer {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("ClawVpnMobileOffer")
             .field("grant", &"<redacted>")
+            .field("token", &"<redacted>")
             .field("expires_at", &self.expires_at)
             .field("state", &self.state)
             .finish()
@@ -470,6 +508,7 @@ impl fmt::Debug for ClawVpnMobileSession {
 struct ClawVpnMobileOfferSnapshot {
     id: ClawVpnMobileOfferId,
     grant: ClawVpnMobileAclGrant,
+    token: ClawVpnMobileOfferToken,
     expires_at: u64,
     state: ClawVpnMobileOfferState,
 }
@@ -479,6 +518,7 @@ impl fmt::Debug for ClawVpnMobileOfferSnapshot {
         f.debug_struct("ClawVpnMobileOfferSnapshot")
             .field("id", &self.id)
             .field("grant", &"<redacted>")
+            .field("token", &"<redacted>")
             .field("expires_at", &self.expires_at)
             .field("state", &self.state)
             .finish()
@@ -664,7 +704,20 @@ impl ClawVpnMobileMesh {
         grant: &ClawVpnMobileAclGrant,
         now_unix: u64,
     ) -> Result<ClawVpnMobileOfferId, ClawVpnMobileMeshError> {
+        let token = ClawVpnMobileOfferToken::from_internal_counter(self.next_offer_id);
+        self.mint_offer_with_token(grant, now_unix, token)
+    }
+
+    pub fn mint_offer_with_token(
+        &mut self,
+        grant: &ClawVpnMobileAclGrant,
+        now_unix: u64,
+        token: ClawVpnMobileOfferToken,
+    ) -> Result<ClawVpnMobileOfferId, ClawVpnMobileMeshError> {
         self.check_grant_ready(grant)?;
+        if self.offers.values().any(|offer| offer.token == token) {
+            return Err(ClawVpnMobileMeshError::DuplicateSnapshotEntry);
+        }
         let expires_at = now_unix
             .checked_add(self.offer_ttl_secs)
             .ok_or(ClawVpnMobileMeshError::TimeOverflow)?;
@@ -677,6 +730,7 @@ impl ClawVpnMobileMesh {
             offer_id,
             ClawVpnMobileOffer {
                 grant: grant.clone(),
+                token,
                 expires_at,
                 state: ClawVpnMobileOfferState::Minted,
             },
@@ -723,6 +777,20 @@ impl ClawVpnMobileMesh {
         Ok(session_id)
     }
 
+    pub fn consume_offer_token(
+        &mut self,
+        token: &ClawVpnMobileOfferToken,
+        grant: &ClawVpnMobileAclGrant,
+        now_unix: u64,
+    ) -> Result<ClawVpnMobileSessionId, ClawVpnMobileMeshError> {
+        let offer_id = self
+            .offers
+            .iter()
+            .find_map(|(offer_id, offer)| (&offer.token == token).then_some(*offer_id))
+            .ok_or(ClawVpnMobileMeshError::UnknownOffer)?;
+        self.consume_offer(offer_id, grant, now_unix)
+    }
+
     pub fn close_session(
         &mut self,
         session_id: ClawVpnMobileSessionId,
@@ -757,6 +825,7 @@ impl ClawVpnMobileMesh {
             .map(|(id, offer)| ClawVpnMobileOfferSnapshot {
                 id: *id,
                 grant: offer.grant.clone(),
+                token: offer.token.clone(),
                 expires_at: offer.expires_at,
                 state: offer.state,
             })
@@ -809,10 +878,14 @@ impl ClawVpnMobileMesh {
             }
         }
         let mut max_offer_id = 0_u64;
+        let mut offer_tokens = HashSet::new();
         for offer in snapshot.offers {
             max_offer_id = max_offer_id.max(offer.id.0);
             if offer.state == ClawVpnMobileOfferState::Minted {
                 mesh.check_grant_ready(&offer.grant)?;
+            }
+            if !offer_tokens.insert(offer.token.clone()) {
+                return Err(ClawVpnMobileMeshError::DuplicateSnapshotEntry);
             }
             if mesh
                 .offers
@@ -820,6 +893,7 @@ impl ClawVpnMobileMesh {
                     offer.id,
                     ClawVpnMobileOffer {
                         grant: offer.grant,
+                        token: offer.token,
                         expires_at: offer.expires_at,
                         state: offer.state,
                     },
@@ -1231,7 +1305,10 @@ mod tests {
         let session = mesh.consume_offer(consumed_offer, &grant, 20).unwrap();
         let snapshot = mesh.snapshot();
 
-        assert_eq!(snapshot.schema_version(), 1);
+        assert_eq!(
+            snapshot.schema_version(),
+            CLAW_VPN_MOBILE_MESH_SNAPSHOT_SCHEMA_VERSION
+        );
         assert_eq!(snapshot.enrolled_device_count(), 1);
         assert_eq!(snapshot.available_claw_count(), 1);
         assert_eq!(snapshot.grant_count(), 1);
@@ -1431,6 +1508,9 @@ mod tests {
         assert!(!debug.contains("device-secret"));
         assert!(!debug.contains("claw-secret"));
         assert!(debug.contains("<redacted>"));
+        let token = ClawVpnMobileOfferToken::try_new("0123456789abcdef0123456789abcdef").unwrap();
+        assert_eq!(format!("{token:?}"), "ClawVpnMobileOfferToken(<redacted>)");
+        assert!(!format!("{token:?}").contains(token.public_token()));
 
         assert_eq!(
             ClawVpnMobileMeshError::Unauthorized.to_string(),

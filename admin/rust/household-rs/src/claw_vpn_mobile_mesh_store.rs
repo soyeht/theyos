@@ -12,9 +12,10 @@ use std::path::PathBuf;
 use crate::claw_vpn_mobile_state::{
     ClawVpnMobileAclGrant, ClawVpnMobileClawId, ClawVpnMobileDeviceId, ClawVpnMobileMesh,
     ClawVpnMobileMeshError, ClawVpnMobileMeshRevocation, ClawVpnMobileOfferId,
-    ClawVpnMobileSessionId,
+    ClawVpnMobileOfferToken, ClawVpnMobileSessionId,
 };
 use crate::storage;
+use rand::RngCore;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ClawVpnMobileMeshStoreErrorKind {
@@ -261,6 +262,19 @@ impl ClawVpnMobileMeshStore {
         self.update("mint_offer", |mesh| mesh.mint_offer(grant, now_unix))
     }
 
+    pub fn mint_offer_token(
+        &self,
+        grant: &ClawVpnMobileAclGrant,
+        now_unix: u64,
+    ) -> Result<ClawVpnMobileOfferToken, ClawVpnMobileMeshStoreError> {
+        let token = generate_offer_token()
+            .map_err(|source| ClawVpnMobileMeshStoreError::model("mint_offer_token", source))?;
+        self.update("mint_offer_token", |mesh| {
+            mesh.mint_offer_with_token(grant, now_unix, token.clone())?;
+            Ok(token)
+        })
+    }
+
     pub fn consume_offer(
         &self,
         offer_id: ClawVpnMobileOfferId,
@@ -269,6 +283,17 @@ impl ClawVpnMobileMeshStore {
     ) -> Result<ClawVpnMobileSessionId, ClawVpnMobileMeshStoreError> {
         self.update("consume_offer", |mesh| {
             mesh.consume_offer(offer_id, grant, now_unix)
+        })
+    }
+
+    pub fn consume_offer_token(
+        &self,
+        token: &ClawVpnMobileOfferToken,
+        grant: &ClawVpnMobileAclGrant,
+        now_unix: u64,
+    ) -> Result<ClawVpnMobileSessionId, ClawVpnMobileMeshStoreError> {
+        self.update("consume_offer_token", |mesh| {
+            mesh.consume_offer_token(token, grant, now_unix)
         })
     }
 
@@ -290,6 +315,12 @@ impl ClawVpnMobileMeshStore {
         self.save(&mesh)?;
         Ok(result)
     }
+}
+
+fn generate_offer_token() -> Result<ClawVpnMobileOfferToken, ClawVpnMobileMeshError> {
+    let mut bytes = [0_u8; 16];
+    rand::rngs::OsRng.fill_bytes(&mut bytes);
+    ClawVpnMobileOfferToken::try_new(hex::encode(bytes))
 }
 
 fn status_from_mesh(
