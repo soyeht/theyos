@@ -5036,8 +5036,15 @@ required-features = ["dev_t1_datapath"]"#;
         mount_source
             .matches("PerClawVpnT1PreflightEvidence::missing")
             .count(),
-        2,
-        "production mount must keep both platform T1 gates hardcoded missing"
+        1,
+        "production mount must keep exactly one fail-closed T1 fallback after the reviewed #286 current-build gate is wired"
+    );
+    assert_eq!(
+        mount_source
+            .matches("load_per_claw_vpn_t1_preflight_evidence_record_for_current_build(")
+            .count(),
+        1,
+        "production mount must load #286 evidence only through the reviewed current-build SHA gate"
     );
     for forbidden_token in [
         "PerClawVpnT1PreflightEvidence::new",
