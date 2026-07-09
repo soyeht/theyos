@@ -139,6 +139,28 @@ pub fn household_auth_state_path(state_dir: &Path) -> PathBuf {
     household_dir(state_dir).join("household_auth_state.cbor")
 }
 
+#[must_use]
+pub fn claw_vpn_mobile_mesh_path(state_dir: &Path) -> PathBuf {
+    household_dir(state_dir).join("claw_vpn_mobile_mesh.cbor")
+}
+
+pub fn write_claw_vpn_mobile_mesh_snapshot(
+    state_dir: &Path,
+    snapshot: &crate::claw_vpn_mobile_state::ClawVpnMobileMeshSnapshot,
+) -> Result<(), StorageError> {
+    atomic_write_cbor(&claw_vpn_mobile_mesh_path(state_dir), snapshot)
+}
+
+pub fn read_claw_vpn_mobile_mesh_snapshot(
+    state_dir: &Path,
+) -> Result<Option<crate::claw_vpn_mobile_state::ClawVpnMobileMeshSnapshot>, StorageError> {
+    read_optional_cbor(&claw_vpn_mobile_mesh_path(state_dir))
+}
+
+pub fn delete_claw_vpn_mobile_mesh_snapshot(state_dir: &Path) -> Result<(), StorageError> {
+    delete_optional_file(&claw_vpn_mobile_mesh_path(state_dir))
+}
+
 /// Path to the Phase 3 finalize-intent preservation marker.
 ///
 /// Written by `owner_approve_handler` before it launches the finalize
@@ -1252,6 +1274,55 @@ mod tests {
         atomic_write_cbor(&path, &value).unwrap();
         let back: Option<Tiny> = read_optional_cbor(&path).unwrap();
         assert_eq!(Some(value), back);
+    }
+
+    #[test]
+    fn claw_vpn_mobile_mesh_snapshot_round_trip_is_private_file() {
+        use crate::claw_vpn_mobile_state::{
+            ClawVpnMobileAclGrant, ClawVpnMobileClawId, ClawVpnMobileDeviceId,
+            ClawVpnMobileMemberId, ClawVpnMobileMesh,
+        };
+
+        let td = tempdir().unwrap();
+        let member = ClawVpnMobileMemberId::try_new("member-alpha").unwrap();
+        let device = ClawVpnMobileDeviceId::try_new("device-alpha").unwrap();
+        let claw = ClawVpnMobileClawId::try_new("claw-alpha").unwrap();
+        let grant = ClawVpnMobileAclGrant::new(member, device.clone(), claw.clone());
+        let mut mesh = ClawVpnMobileMesh::new(60).unwrap();
+        assert!(mesh.enroll_device(device));
+        assert!(mesh.set_claw_available(claw));
+        assert!(mesh.grant(grant.clone()));
+        let offer = mesh.mint_offer(&grant, 10).unwrap();
+        let session = mesh.consume_offer(offer, &grant, 20).unwrap();
+
+        let snapshot = mesh.snapshot();
+        write_claw_vpn_mobile_mesh_snapshot(td.path(), &snapshot).unwrap();
+        let path = claw_vpn_mobile_mesh_path(td.path());
+        assert_eq!(
+            path.file_name().and_then(std::ffi::OsStr::to_str),
+            Some("claw_vpn_mobile_mesh.cbor")
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+
+        let loaded = read_claw_vpn_mobile_mesh_snapshot(td.path())
+            .unwrap()
+            .unwrap();
+        let restored = ClawVpnMobileMesh::from_snapshot(loaded).unwrap();
+        assert!(restored.has_active_session(session));
+
+        delete_claw_vpn_mobile_mesh_snapshot(td.path()).unwrap();
+        assert!(
+            read_claw_vpn_mobile_mesh_snapshot(td.path())
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
