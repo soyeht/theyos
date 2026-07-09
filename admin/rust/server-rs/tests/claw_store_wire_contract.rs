@@ -1320,7 +1320,7 @@ async fn mobile_claw_vpn_status_is_mobile_authed_and_count_only() {
 
     let token = mobile_token_for_role(&state, "mobile-vpn-status-member", UserRole::User);
     let (status, _bytes, body) = request(
-        mobile_router(state),
+        mobile_router(Arc::clone(&state)),
         Method::GET,
         path,
         Vec::new(),
@@ -1343,6 +1343,68 @@ async fn mobile_claw_vpn_status_is_mobile_authed_and_count_only() {
     ] {
         assert_eq!(body[count_key], 0);
     }
+
+    let member =
+        household_rs::claw_vpn_mobile_state::ClawVpnMobileMemberId::try_new("member-alpha")
+            .expect("member id");
+    let device =
+        household_rs::claw_vpn_mobile_state::ClawVpnMobileDeviceId::try_new("device-alpha")
+            .expect("device id");
+    let claw = household_rs::claw_vpn_mobile_state::ClawVpnMobileClawId::try_new("claw-alpha")
+        .expect("claw id");
+    let grant = household_rs::claw_vpn_mobile_state::ClawVpnMobileAclGrant::new(
+        member,
+        device.clone(),
+        claw.clone(),
+    );
+    assert!(
+        state
+            .mobile_claw_vpn_mesh
+            .owner_approved_enroll_device(device)
+            .expect("enroll device")
+    );
+    assert!(
+        state
+            .mobile_claw_vpn_mesh
+            .set_claw_available(claw)
+            .expect("set claw available")
+    );
+    assert!(
+        state
+            .mobile_claw_vpn_mesh
+            .owner_approved_grant(grant.clone())
+            .expect("owner grant")
+    );
+    let offer = state
+        .mobile_claw_vpn_mesh
+        .mint_offer(&grant, 100)
+        .expect("mint offer");
+    let _session = state
+        .mobile_claw_vpn_mesh
+        .consume_offer(offer, &grant, 101)
+        .expect("consume offer");
+
+    let (status, _bytes, body) = request(
+        mobile_router(Arc::clone(&state)),
+        Method::GET,
+        path,
+        Vec::new(),
+        Some(format!("Bearer {token}")),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body.as_object().expect("status response object").len(), 10);
+    assert_eq!(body["product"], "product_a_mobile_claw_vpn");
+    assert_eq!(body["mode"], "mesh_c_status_only");
+    assert_eq!(body["production_activation"], false);
+    assert_eq!(body["state"], "configured");
+    assert_eq!(body["snapshot_present"], true);
+    assert_eq!(body["enrolled_device_count"], 1);
+    assert_eq!(body["available_claw_count"], 1);
+    assert_eq!(body["grant_count"], 1);
+    assert_eq!(body["offer_count"], 1);
+    assert_eq!(body["session_count"], 1);
 }
 
 #[tokio::test]
