@@ -183,14 +183,15 @@ impl ClawVpnMobileMeshStore {
         }
     }
 
-    pub fn save(&self, mesh: &ClawVpnMobileMesh) -> Result<(), ClawVpnMobileMeshStoreError> {
+    fn save(&self, mesh: &ClawVpnMobileMesh) -> Result<(), ClawVpnMobileMeshStoreError> {
         storage::write_claw_vpn_mobile_mesh_snapshot(&self.state_dir, &mesh.snapshot())
             .map_err(|source| ClawVpnMobileMeshStoreError::storage("save", &source))
     }
 
-    pub fn delete_snapshot(&self) -> Result<(), ClawVpnMobileMeshStoreError> {
-        storage::delete_claw_vpn_mobile_mesh_snapshot(&self.state_dir)
-            .map_err(|source| ClawVpnMobileMeshStoreError::storage("delete", &source))
+    pub fn owner_approved_delete_snapshot(&self) -> Result<(), ClawVpnMobileMeshStoreError> {
+        storage::delete_claw_vpn_mobile_mesh_snapshot(&self.state_dir).map_err(|source| {
+            ClawVpnMobileMeshStoreError::storage("owner_approved_delete_snapshot", &source)
+        })
     }
 
     pub fn status(&self) -> Result<ClawVpnMobileMeshStoreStatus, ClawVpnMobileMeshStoreError> {
@@ -384,6 +385,27 @@ mod tests {
                 .model_error(),
             Some(ClawVpnMobileMeshError::OfferAlreadyConsumed)
         );
+    }
+
+    #[test]
+    fn store_update_error_after_in_memory_mutation_does_not_persist() {
+        let td = tempfile::tempdir().unwrap();
+        let store = ClawVpnMobileMeshStore::new(td.path(), 60).unwrap();
+
+        let err = store
+            .update::<()>("test_mutating_error", |mesh| {
+                assert!(mesh.enroll_device(device()));
+                Err(ClawVpnMobileMeshError::Unauthorized)
+            })
+            .unwrap_err();
+
+        assert_eq!(err.kind(), ClawVpnMobileMeshStoreErrorKind::Model);
+        assert_eq!(err.operation(), "test_mutating_error");
+        assert_eq!(
+            err.model_error(),
+            Some(ClawVpnMobileMeshError::Unauthorized)
+        );
+        assert!(!store.status().unwrap().snapshot_present());
     }
 
     #[test]
