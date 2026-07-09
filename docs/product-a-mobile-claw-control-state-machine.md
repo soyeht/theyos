@@ -120,25 +120,31 @@ without owner input.
    state is not valid.
 4. `Mesh-C` mints a single-use, TTL-bound `IpTunnel` offer for exactly the
    selected Claw and Device-D identity.
-5. `Claw-*` and `Device-D` both dial `Relay-R` outbound.
-6. `Relay-R` pairs the rendezvous slot and blindly splices bytes.
-7. Both endpoints verify offer/session binding, ACL, revocation, and selected
+5. `Mesh-C` authorizes the session rendezvous capability only after rechecking
+   session binding, ACL, revocation, selected-Claw identity, and Claw
+   availability.
+6. `Claw-*` and `Device-D` both dial `Relay-R` outbound.
+7. `Relay-R` pairs the rendezvous slot and blindly splices bytes.
+8. Both endpoints verify offer/session binding, ACL, revocation, and selected
    Claw identity.
-8. Immediately before any interface/route open, `Claw-*` rechecks the same
+9. Immediately before any interface/route open, `Claw-*` rechecks the same
    binding, ACL, revocation, selected-Claw identity, and responder profile.
-9. `Device-D` installs only the selected Claw route.
-10. `Claw-*` opens only the selected responder interface/route scope.
-11. Packet pump starts.
-12. Soyeht control channel uses the in-tunnel endpoint for the selected Claw.
-13. Disconnect, revoke, failure, relay close, or owner action tears down both
+10. `Device-D` installs only the selected Claw route.
+11. `Claw-*` opens only the selected responder interface/route scope.
+12. Packet pump starts.
+13. Soyeht control channel uses the in-tunnel endpoint for the selected Claw.
+14. Disconnect, revoke, failure, relay close, or owner action tears down both
     sides and removes interface/route/process state.
 
-Route installation and `connected` status happen only after step 7 succeeds.
+Route installation and `connected` status happen only after step 8 succeeds.
 
 ## Fail-closed Rules
 
 - Missing ACL, expired offer, stale offer, stale session, or revoked state denies
   before relay dial where possible.
+- A rendezvous capability is not enough by itself: use before `Relay-R` dial
+  must revalidate session binding, ACL, revocation, selected-Claw identity, and
+  Claw availability.
 - Invalid offer/session/ACL/selected-Claw binding denies before route install.
 - Any Packet Tunnel setup failure removes partial route/interface state.
 - Relay failure never falls back to Tailscale, LAN, or relay data channels.
