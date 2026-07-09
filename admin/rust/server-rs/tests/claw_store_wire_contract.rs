@@ -644,17 +644,18 @@ fn assert_mobile_claw_vpn_offer_body(body: &Value, counts: [u64; 5]) -> String {
     offer_token.to_string()
 }
 
-fn assert_mobile_claw_vpn_session_body(body: &Value, counts: [u64; 5]) -> u64 {
+fn assert_mobile_claw_vpn_session_body(body: &Value, counts: [u64; 5]) {
     let object = body.as_object().expect("session body object");
-    assert_eq!(object.len(), 6, "session response must stay minimal");
+    assert_eq!(object.len(), 5, "session response must stay minimal");
     assert_eq!(body["product"], "product_a_mobile_claw_vpn");
     assert_eq!(body["mode"], "mesh_c_offer_control");
     assert_eq!(body["production_activation"], false);
     assert_eq!(body["operation"], "consume_offer");
-    let session_id = body["session_id"].as_u64().expect("session_id token");
-    assert!(session_id > 0, "session_id token must be nonzero");
+    assert!(
+        !object.contains_key("session_id"),
+        "session id stays internal until there is an opaque session capability"
+    );
     assert_mobile_claw_vpn_status_counts(&body["status"], counts);
-    session_id
 }
 
 fn claw_list_item<'a>(body: &'a Value, name: &str) -> &'a Value {
@@ -1485,13 +1486,13 @@ async fn mobile_claw_vpn_status_is_mobile_authed_and_count_only() {
             .owner_approved_grant(grant.clone())
             .expect("owner grant")
     );
-    let offer = state
+    let offer_token = state
         .mobile_claw_vpn_mesh
-        .mint_offer(&grant, 100)
+        .mint_offer_token(&grant, 100)
         .expect("mint offer");
     let _session = state
         .mobile_claw_vpn_mesh
-        .consume_offer(offer, &grant, 101)
+        .consume_offer_token(&offer_token, &grant, 101)
         .expect("consume offer");
 
     let (status, _bytes, body) = request(
@@ -1634,17 +1635,17 @@ async fn mobile_claw_vpn_owner_routes_require_admin_and_are_count_only() {
         household_rs::claw_vpn_mobile_state::ClawVpnMobileClawId::try_new("claw-alpha")
             .expect("claw id"),
     );
-    let consumed_offer = state
+    let consumed_offer_token = state
         .mobile_claw_vpn_mesh
-        .mint_offer(&grant, 100)
+        .mint_offer_token(&grant, 100)
         .expect("mint consumed offer");
     let _session = state
         .mobile_claw_vpn_mesh
-        .consume_offer(consumed_offer, &grant, 101)
+        .consume_offer_token(&consumed_offer_token, &grant, 101)
         .expect("consume offer");
     let _minted_offer = state
         .mobile_claw_vpn_mesh
-        .mint_offer(&grant, 102)
+        .mint_offer_token(&grant, 102)
         .expect("mint pending offer");
 
     let (status, _bytes, body) = request_with_cookie(
@@ -1791,7 +1792,7 @@ async fn mobile_claw_vpn_offer_routes_are_auth_scoped_single_use_and_count_only(
     )
     .await;
     assert_eq!(status, StatusCode::OK);
-    let _session_id = assert_mobile_claw_vpn_session_body(&body, [1, 1, 1, 1, 1]);
+    assert_mobile_claw_vpn_session_body(&body, [1, 1, 1, 1, 1]);
 
     let member_token = mobile_session_for_existing_user(&state, "member-alpha");
     let (status, _bytes, body) = request(

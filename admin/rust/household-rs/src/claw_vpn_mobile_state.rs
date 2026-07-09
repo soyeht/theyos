@@ -12,6 +12,7 @@ use std::fmt;
 use serde::{Deserialize, Serialize};
 
 pub const CLAW_VPN_MOBILE_MESH_SNAPSHOT_SCHEMA_VERSION: u16 = 2;
+const CLAW_VPN_MOBILE_MESH_PRE_OFFER_TOKEN_SCHEMA_VERSION: u16 = 1;
 
 /// Redacted public status labels exposed to UI, audit summaries, and tests.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -455,10 +456,6 @@ impl ClawVpnMobileOfferToken {
         Ok(Self(value))
     }
 
-    fn from_internal_counter(value: u64) -> Self {
-        Self(format!("{value:032x}"))
-    }
-
     #[must_use]
     pub fn public_token(&self) -> &str {
         &self.0
@@ -699,15 +696,6 @@ impl ClawVpnMobileMesh {
         }
     }
 
-    pub fn mint_offer(
-        &mut self,
-        grant: &ClawVpnMobileAclGrant,
-        now_unix: u64,
-    ) -> Result<ClawVpnMobileOfferId, ClawVpnMobileMeshError> {
-        let token = ClawVpnMobileOfferToken::from_internal_counter(self.next_offer_id);
-        self.mint_offer_with_token(grant, now_unix, token)
-    }
-
     pub fn mint_offer_with_token(
         &mut self,
         grant: &ClawVpnMobileAclGrant,
@@ -738,7 +726,7 @@ impl ClawVpnMobileMesh {
         Ok(offer_id)
     }
 
-    pub fn consume_offer(
+    fn consume_offer(
         &mut self,
         offer_id: ClawVpnMobileOfferId,
         grant: &ClawVpnMobileAclGrant,
@@ -856,7 +844,16 @@ impl ClawVpnMobileMesh {
     pub fn from_snapshot(
         snapshot: ClawVpnMobileMeshSnapshot,
     ) -> Result<Self, ClawVpnMobileMeshError> {
-        if snapshot.schema_version != CLAW_VPN_MOBILE_MESH_SNAPSHOT_SCHEMA_VERSION {
+        let is_pre_offer_token_snapshot =
+            snapshot.schema_version == CLAW_VPN_MOBILE_MESH_PRE_OFFER_TOKEN_SCHEMA_VERSION;
+        if snapshot.schema_version != CLAW_VPN_MOBILE_MESH_SNAPSHOT_SCHEMA_VERSION
+            && !is_pre_offer_token_snapshot
+        {
+            return Err(ClawVpnMobileMeshError::UnsupportedSnapshotSchema);
+        }
+        if is_pre_offer_token_snapshot
+            && (!snapshot.offers.is_empty() || !snapshot.sessions.is_empty())
+        {
             return Err(ClawVpnMobileMeshError::UnsupportedSnapshotSchema);
         }
         let mut mesh = Self::new(snapshot.offer_ttl_secs)?;
@@ -1045,6 +1042,19 @@ mod tests {
         ClawVpnMobileAclGrant::new(member(), device(), claw)
     }
 
+    fn offer_token(value: u64) -> ClawVpnMobileOfferToken {
+        ClawVpnMobileOfferToken::try_new(format!("{value:032x}")).unwrap()
+    }
+
+    fn mint_offer(
+        mesh: &mut ClawVpnMobileMesh,
+        grant: &ClawVpnMobileAclGrant,
+        now_unix: u64,
+        token: u64,
+    ) -> Result<ClawVpnMobileOfferId, ClawVpnMobileMeshError> {
+        mesh.mint_offer_with_token(grant, now_unix, offer_token(token))
+    }
+
     fn ready_mesh(grant: &ClawVpnMobileAclGrant) -> ClawVpnMobileMesh {
         let mut mesh = ClawVpnMobileMesh::new(60).unwrap();
         assert!(mesh.enroll_device(device()));
@@ -1208,22 +1218,22 @@ mod tests {
         let mut mesh = ClawVpnMobileMesh::new(60).unwrap();
 
         assert_eq!(
-            mesh.mint_offer(&grant, 10),
+            mint_offer(&mut mesh, &grant, 10, 1),
             Err(ClawVpnMobileMeshError::DeviceNotEnrolled)
         );
         assert!(mesh.enroll_device(device()));
         assert_eq!(
-            mesh.mint_offer(&grant, 10),
+            mint_offer(&mut mesh, &grant, 10, 1),
             Err(ClawVpnMobileMeshError::ClawUnavailable)
         );
         assert!(mesh.set_claw_available(claw_m()));
         assert_eq!(
-            mesh.mint_offer(&grant, 10),
+            mint_offer(&mut mesh, &grant, 10, 1),
             Err(ClawVpnMobileMeshError::Unauthorized)
         );
         assert!(mesh.grant(grant.clone()));
 
-        let offer = mesh.mint_offer(&grant, 10).unwrap();
+        let offer = mint_offer(&mut mesh, &grant, 10, 1).unwrap();
         assert_eq!(format!("{offer:?}"), "ClawVpnMobileOfferId(<redacted>)");
     }
 
@@ -1231,7 +1241,7 @@ mod tests {
     fn mobile_mesh_offer_is_single_use_and_second_connection_needs_new_offer() {
         let grant = grant_for(claw_m());
         let mut mesh = ready_mesh(&grant);
-        let first_offer = mesh.mint_offer(&grant, 10).unwrap();
+        let first_offer = mint_offer(&mut mesh, &grant, 10, 1).unwrap();
         let first_session = mesh.consume_offer(first_offer, &grant, 20).unwrap();
 
         assert!(mesh.has_active_session(first_session));
@@ -1248,7 +1258,7 @@ mod tests {
             Err(ClawVpnMobileMeshError::UnknownSession)
         );
 
-        let second_offer = mesh.mint_offer(&grant, 22).unwrap();
+        let second_offer = mint_offer(&mut mesh, &grant, 22, 2).unwrap();
         let second_session = mesh.consume_offer(second_offer, &grant, 23).unwrap();
         assert!(mesh.has_active_session(second_session));
         assert_ne!(first_session, second_session);
@@ -1258,7 +1268,7 @@ mod tests {
     fn mobile_mesh_expired_and_revoked_offers_do_not_start_sessions() {
         let grant = grant_for(claw_m());
         let mut expired_mesh = ready_mesh(&grant);
-        let expired_offer = expired_mesh.mint_offer(&grant, 10).unwrap();
+        let expired_offer = mint_offer(&mut expired_mesh, &grant, 10, 1).unwrap();
         assert_eq!(
             expired_mesh.consume_offer(expired_offer, &grant, 70),
             Err(ClawVpnMobileMeshError::OfferExpired)
@@ -1266,7 +1276,7 @@ mod tests {
         assert_eq!(expired_mesh.active_session_count(), 0);
 
         let mut revoked_mesh = ready_mesh(&grant);
-        let revoked_offer = revoked_mesh.mint_offer(&grant, 10).unwrap();
+        let revoked_offer = mint_offer(&mut revoked_mesh, &grant, 10, 1).unwrap();
         let revocation = revoked_mesh.revoke(&grant);
         assert!(revocation.grant_removed());
         assert_eq!(revocation.revoked_offer_count(), 1);
@@ -1282,7 +1292,7 @@ mod tests {
     fn mobile_mesh_claw_unavailable_after_mint_denies_consumption() {
         let grant = grant_for(claw_m());
         let mut mesh = ready_mesh(&grant);
-        let stale_offer = mesh.mint_offer(&grant, 10).unwrap();
+        let stale_offer = mint_offer(&mut mesh, &grant, 10, 1).unwrap();
 
         assert!(mesh.set_claw_unavailable(&claw_m()));
         assert_eq!(
@@ -1292,7 +1302,7 @@ mod tests {
         assert_eq!(mesh.active_session_count(), 0);
 
         assert!(mesh.set_claw_available(claw_m()));
-        let fresh_offer = mesh.mint_offer(&grant, 21).unwrap();
+        let fresh_offer = mint_offer(&mut mesh, &grant, 21, 2).unwrap();
         let session = mesh.consume_offer(fresh_offer, &grant, 22).unwrap();
         assert!(mesh.has_active_session(session));
     }
@@ -1301,7 +1311,7 @@ mod tests {
     fn mobile_mesh_snapshot_roundtrips_without_reopening_consumed_offer() {
         let grant = grant_for(claw_m());
         let mut mesh = ready_mesh(&grant);
-        let consumed_offer = mesh.mint_offer(&grant, 10).unwrap();
+        let consumed_offer = mint_offer(&mut mesh, &grant, 10, 1).unwrap();
         let session = mesh.consume_offer(consumed_offer, &grant, 20).unwrap();
         let snapshot = mesh.snapshot();
 
@@ -1331,17 +1341,47 @@ mod tests {
             restored.consume_offer(consumed_offer, &grant, 21),
             Err(ClawVpnMobileMeshError::OfferAlreadyConsumed)
         );
-        let fresh_offer = restored.mint_offer(&grant, 22).unwrap();
+        let fresh_offer = mint_offer(&mut restored, &grant, 22, 2).unwrap();
         let fresh_session = restored.consume_offer(fresh_offer, &grant, 23).unwrap();
         assert_ne!(session, fresh_session);
         assert!(restored.has_active_session(fresh_session));
     }
 
     #[test]
+    fn mobile_mesh_snapshot_v1_migrates_only_inactive_mesh_state() {
+        let grant = grant_for(claw_m());
+        let mesh = ready_mesh(&grant);
+        let mut inactive_v1 = mesh.snapshot();
+        inactive_v1.schema_version = CLAW_VPN_MOBILE_MESH_PRE_OFFER_TOKEN_SCHEMA_VERSION;
+
+        let restored = ClawVpnMobileMesh::from_snapshot(inactive_v1).unwrap();
+        let migrated = restored.snapshot();
+        assert_eq!(
+            migrated.schema_version(),
+            CLAW_VPN_MOBILE_MESH_SNAPSHOT_SCHEMA_VERSION
+        );
+        assert_eq!(migrated.enrolled_device_count(), 1);
+        assert_eq!(migrated.available_claw_count(), 1);
+        assert_eq!(migrated.grant_count(), 1);
+        assert_eq!(migrated.offer_count(), 0);
+        assert_eq!(migrated.session_count(), 0);
+
+        let mut active_mesh = ready_mesh(&grant);
+        let active_offer = mint_offer(&mut active_mesh, &grant, 10, 1).unwrap();
+        let _session = active_mesh.consume_offer(active_offer, &grant, 20).unwrap();
+        let mut active_v1 = active_mesh.snapshot();
+        active_v1.schema_version = CLAW_VPN_MOBILE_MESH_PRE_OFFER_TOKEN_SCHEMA_VERSION;
+        assert_eq!(
+            ClawVpnMobileMesh::from_snapshot(active_v1),
+            Err(ClawVpnMobileMeshError::UnsupportedSnapshotSchema)
+        );
+    }
+
+    #[test]
     fn mobile_mesh_snapshot_restore_rejects_active_state_without_ready_grant() {
         let grant = grant_for(claw_m());
         let mut session_mesh = ready_mesh(&grant);
-        let offer = session_mesh.mint_offer(&grant, 10).unwrap();
+        let offer = mint_offer(&mut session_mesh, &grant, 10, 1).unwrap();
         let _session = session_mesh.consume_offer(offer, &grant, 20).unwrap();
         let mut missing_grant_session = session_mesh.snapshot();
         missing_grant_session.grants.clear();
@@ -1351,7 +1391,7 @@ mod tests {
         );
 
         let mut minted_mesh = ready_mesh(&grant);
-        let _offer = minted_mesh.mint_offer(&grant, 10).unwrap();
+        let _offer = mint_offer(&mut minted_mesh, &grant, 10, 1).unwrap();
         let mut missing_grant_offer = minted_mesh.snapshot();
         missing_grant_offer.grants.clear();
         assert_eq!(
@@ -1374,9 +1414,9 @@ mod tests {
         let mut mesh = ready_mesh(&grant_m);
         assert!(mesh.set_claw_available(claw_l()));
         assert!(mesh.grant(grant_l));
-        let offer_m = mesh.mint_offer(&grant_m, 10).unwrap();
+        let offer_m = mint_offer(&mut mesh, &grant_m, 10, 1).unwrap();
         let _session_m = mesh.consume_offer(offer_m, &grant_m, 20).unwrap();
-        let _offer_l = mesh.mint_offer(&grant_for(claw_l()), 30).unwrap();
+        let _offer_l = mint_offer(&mut mesh, &grant_for(claw_l()), 30, 2).unwrap();
         let snapshot = mesh.snapshot();
         let encoded = crate::cbor::to_canonical_vec(&snapshot).unwrap();
 
@@ -1396,7 +1436,7 @@ mod tests {
     fn mobile_mesh_snapshot_rejects_duplicate_and_stale_counters() {
         let grant = grant_for(claw_m());
         let mut mesh = ready_mesh(&grant);
-        let offer = mesh.mint_offer(&grant, 10).unwrap();
+        let offer = mint_offer(&mut mesh, &grant, 10, 1).unwrap();
         let session = mesh.consume_offer(offer, &grant, 20).unwrap();
 
         let mut duplicate = mesh.snapshot();
@@ -1460,7 +1500,7 @@ mod tests {
         let mut mesh = ready_mesh(&grant_m);
         assert!(mesh.set_claw_available(claw_l()));
         assert!(mesh.grant(grant_l.clone()));
-        let offer_for_m = mesh.mint_offer(&grant_m, 10).unwrap();
+        let offer_for_m = mint_offer(&mut mesh, &grant_m, 10, 1).unwrap();
 
         assert_eq!(
             mesh.consume_offer(offer_for_m, &grant_l, 20),
@@ -1478,8 +1518,8 @@ mod tests {
         assert!(mesh.set_claw_available(claw_l()));
         assert!(mesh.grant(grant_l.clone()));
 
-        let offer_m = mesh.mint_offer(&grant_m, 10).unwrap();
-        let offer_l = mesh.mint_offer(&grant_l, 10).unwrap();
+        let offer_m = mint_offer(&mut mesh, &grant_m, 10, 1).unwrap();
+        let offer_l = mint_offer(&mut mesh, &grant_l, 10, 2).unwrap();
         let session_m = mesh.consume_offer(offer_m, &grant_m, 20).unwrap();
         let session_l = mesh.consume_offer(offer_l, &grant_l, 20).unwrap();
 
@@ -1501,7 +1541,7 @@ mod tests {
         assert!(mesh.enroll_device(device));
         assert!(mesh.set_claw_available(claw));
         assert!(mesh.grant(grant.clone()));
-        let offer = mesh.mint_offer(&grant, 10).unwrap();
+        let offer = mint_offer(&mut mesh, &grant, 10, 1).unwrap();
 
         let debug = format!("{grant:?} {mesh:?} {offer:?}");
         assert!(!debug.contains("member-secret"));

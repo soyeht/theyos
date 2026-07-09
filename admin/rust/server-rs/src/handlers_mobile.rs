@@ -272,7 +272,6 @@ struct MobileClawVpnSessionResponse {
     mode: &'static str,
     production_activation: bool,
     operation: &'static str,
-    session_id: u64,
     status: MobileClawVpnStatusResponse,
 }
 
@@ -541,7 +540,6 @@ fn mobile_claw_vpn_offer_response(
 
 fn mobile_claw_vpn_session_response(
     operation: &'static str,
-    session_id: household_rs::claw_vpn_mobile_state::ClawVpnMobileSessionId,
     status: ClawVpnMobileMeshStoreStatus,
 ) -> MobileClawVpnSessionResponse {
     MobileClawVpnSessionResponse {
@@ -549,7 +547,6 @@ fn mobile_claw_vpn_session_response(
         mode: "mesh_c_offer_control",
         production_activation: false,
         operation,
-        session_id: session_id.public_token(),
         status: mobile_claw_vpn_status_response(status),
     }
 }
@@ -929,8 +926,8 @@ pub async fn handle_mobile_claw_vpn_consume_offer(
     let offer_token = mobile_claw_vpn_offer_token(req.offer)?;
     let now_unix = mobile_claw_vpn_now_unix()?;
     let store = state.mobile_claw_vpn_mesh.clone();
-    let (session_id, status) = blocking(move || {
-        let session_id = store
+    let status = blocking(move || {
+        store
             .consume_offer_token(&offer_token, &grant, now_unix)
             .map_err(|error| {
                 mobile_claw_vpn_offer_store_error(error, "mobile Claw VPN offer action failed")
@@ -938,16 +935,12 @@ pub async fn handle_mobile_claw_vpn_consume_offer(
         let status = store.status().map_err(|error| {
             mobile_claw_vpn_offer_store_error(error, "mobile Claw VPN offer action failed")
         })?;
-        Ok::<_, ApiError>((session_id, status))
+        Ok::<_, ApiError>(status)
     })
     .await??;
     Ok((
         StatusCode::OK,
-        Json(mobile_claw_vpn_session_response(
-            "consume_offer",
-            session_id,
-            status,
-        )),
+        Json(mobile_claw_vpn_session_response("consume_offer", status)),
     )
         .into_response())
 }
@@ -2471,8 +2464,10 @@ mod tests {
         assert!(store.owner_approved_enroll_device(device).unwrap());
         assert!(store.set_claw_available(claw).unwrap());
         assert!(store.owner_approved_grant(grant.clone()).unwrap());
-        let offer = store.mint_offer(&grant, 100).unwrap();
-        let _session = store.consume_offer(offer, &grant, 101).unwrap();
+        let offer_token = store.mint_offer_token(&grant, 100).unwrap();
+        let _session = store
+            .consume_offer_token(&offer_token, &grant, 101)
+            .unwrap();
 
         let response = mobile_claw_vpn_status_response(store.status().unwrap());
 

@@ -1280,7 +1280,7 @@ mod tests {
     fn claw_vpn_mobile_mesh_snapshot_round_trip_is_private_file() {
         use crate::claw_vpn_mobile_state::{
             ClawVpnMobileAclGrant, ClawVpnMobileClawId, ClawVpnMobileDeviceId,
-            ClawVpnMobileMemberId, ClawVpnMobileMesh,
+            ClawVpnMobileMemberId, ClawVpnMobileMesh, ClawVpnMobileOfferToken,
         };
 
         let td = tempdir().unwrap();
@@ -1292,8 +1292,11 @@ mod tests {
         assert!(mesh.enroll_device(device));
         assert!(mesh.set_claw_available(claw));
         assert!(mesh.grant(grant.clone()));
-        let offer = mesh.mint_offer(&grant, 10).unwrap();
-        let session = mesh.consume_offer(offer, &grant, 20).unwrap();
+        let offer_token =
+            ClawVpnMobileOfferToken::try_new("0123456789abcdef0123456789abcdef").unwrap();
+        mesh.mint_offer_with_token(&grant, 10, offer_token.clone())
+            .unwrap();
+        let session = mesh.consume_offer_token(&offer_token, &grant, 20).unwrap();
 
         let snapshot = mesh.snapshot();
         write_claw_vpn_mobile_mesh_snapshot(td.path(), &snapshot).unwrap();
