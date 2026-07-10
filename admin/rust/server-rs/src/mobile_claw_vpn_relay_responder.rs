@@ -12,6 +12,7 @@ use std::fmt;
 use crate::mobile_claw_vpn_relay_dial_config::{
     MobileClawVpnRendezvousRelayDialConfig, MobileClawVpnRendezvousRelayDialError,
 };
+use crate::mobile_claw_vpn_relay_responder_config::MobileClawVpnRelayResponderConfig;
 use household_rs::{
     claw_share_rendezvous_hello::{RendezvousHello, RendezvousRole},
     claw_vpn_mobile_mesh_store::{ClawVpnMobileMeshStore, ClawVpnMobileMeshStoreError},
@@ -47,7 +48,7 @@ impl MobileClawVpnRendezvousResponderPreflight {
 /// The caller must provide `claw` from local responder identity/configuration,
 /// not from network input. This helper is intentionally not wired to a handler
 /// or production relay path yet.
-pub fn mobile_claw_vpn_rendezvous_responder_preflight(
+fn mobile_claw_vpn_rendezvous_responder_preflight(
     store: &ClawVpnMobileMeshStore,
     rendezvous_token: &ClawVpnMobileRendezvousToken,
     claw: &ClawVpnMobileClawId,
@@ -55,19 +56,55 @@ pub fn mobile_claw_vpn_rendezvous_responder_preflight(
     MobileClawVpnRendezvousResponderPreflight::claw(store, rendezvous_token, claw)
 }
 
-/// Builds relay-visible `Claw` hello bytes after revalidating the active Mesh-C
-/// session for the locally trusted Claw responder identity.
+#[derive(PartialEq, Eq)]
+pub enum MobileClawVpnRendezvousResponderPreflightError {
+    ResponderNotConfigured,
+    AuthorizationFailed,
+}
+
+impl MobileClawVpnRendezvousResponderPreflightError {
+    #[must_use]
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::ResponderNotConfigured => "responder_not_configured",
+            Self::AuthorizationFailed => "authorization_failed",
+        }
+    }
+}
+
+impl fmt::Debug for MobileClawVpnRendezvousResponderPreflightError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("MobileClawVpnRendezvousResponderPreflightError")
+            .field("kind", &self.kind())
+            .finish()
+    }
+}
+
+impl fmt::Display for MobileClawVpnRendezvousResponderPreflightError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("mobile Claw VPN rendezvous responder preflight failed")
+    }
+}
+
+impl std::error::Error for MobileClawVpnRendezvousResponderPreflightError {}
+
+/// Prepares a relay-visible `Claw` hello using the local responder identity
+/// config as the only public source of the selected Claw identity.
 ///
-/// The caller must provide `claw` from local responder identity/configuration,
-/// not from network input. This helper is intentionally not wired to a handler
-/// or socket path yet.
-pub fn mobile_claw_vpn_rendezvous_responder_preflight_hello_bytes(
+/// Missing local identity keeps the responder inert. This helper intentionally
+/// does not accept a Claw identity from network input, and it is not wired to a
+/// handler or socket path yet.
+pub fn mobile_claw_vpn_rendezvous_responder_preflight_from_config(
     store: &ClawVpnMobileMeshStore,
     rendezvous_token: &ClawVpnMobileRendezvousToken,
-    claw: &ClawVpnMobileClawId,
-) -> Result<Vec<u8>, ClawVpnMobileMeshStoreError> {
+    config: &MobileClawVpnRelayResponderConfig,
+) -> Result<MobileClawVpnRendezvousResponderPreflight, MobileClawVpnRendezvousResponderPreflightError>
+{
+    let claw = config
+        .claw()
+        .ok_or(MobileClawVpnRendezvousResponderPreflightError::ResponderNotConfigured)?;
     mobile_claw_vpn_rendezvous_responder_preflight(store, rendezvous_token, claw)
-        .map(MobileClawVpnRendezvousResponderPreflight::into_hello_bytes)
+        .map_err(|_error| MobileClawVpnRendezvousResponderPreflightError::AuthorizationFailed)
 }
 
 #[derive(PartialEq, Eq)]
@@ -218,13 +255,13 @@ mod tests {
     fn mobile_claw_vpn_responder_preflight_builds_claw_hello_after_revalidation() {
         let (_td, store, rendezvous_token) = ready_store();
 
-        let hello_bytes = mobile_claw_vpn_rendezvous_responder_preflight_hello_bytes(
+        let preflight = mobile_claw_vpn_rendezvous_responder_preflight(
             &store,
             &rendezvous_token,
             &claw_alpha(),
         )
         .unwrap();
-        let decoded = RendezvousHello::decode(&hello_bytes).unwrap();
+        let decoded = RendezvousHello::decode(&preflight.into_hello_bytes()).unwrap();
 
         assert_eq!(decoded.role, RendezvousRole::Claw);
         assert_eq!(decoded.token, rendezvous_token.relay_token().unwrap());
@@ -235,18 +272,79 @@ mod tests {
         let (_td, store, rendezvous_token) = ready_store();
         assert!(store.set_claw_available(claw_beta()).unwrap());
 
-        let error = mobile_claw_vpn_rendezvous_responder_preflight_hello_bytes(
+        let error = match mobile_claw_vpn_rendezvous_responder_preflight(
             &store,
             &rendezvous_token,
             &claw_beta(),
-        )
-        .unwrap_err();
+        ) {
+            Ok(_preflight) => panic!("wrong Claw must not produce preflight"),
+            Err(error) => error,
+        };
 
         assert_eq!(error.operation(), "authorize_rendezvous_token_for_claw");
         assert_eq!(
             error.model_error(),
             Some(ClawVpnMobileMeshError::SelectedClawMismatch)
         );
+    }
+
+    #[test]
+    fn mobile_claw_vpn_responder_preflight_uses_local_configured_claw() {
+        let (_td, store, rendezvous_token) = ready_store();
+        let config =
+            MobileClawVpnRelayResponderConfig::from_values(Some("true"), Some("claw-alpha"))
+                .unwrap();
+
+        let preflight = mobile_claw_vpn_rendezvous_responder_preflight_from_config(
+            &store,
+            &rendezvous_token,
+            &config,
+        )
+        .unwrap();
+        let decoded = RendezvousHello::decode(&preflight.into_hello_bytes()).unwrap();
+
+        assert_eq!(decoded.role, RendezvousRole::Claw);
+        assert_eq!(decoded.token, rendezvous_token.relay_token().unwrap());
+    }
+
+    #[test]
+    fn mobile_claw_vpn_responder_preflight_from_config_is_default_inert() {
+        let (_td, store, rendezvous_token) = ready_store();
+
+        let error = match mobile_claw_vpn_rendezvous_responder_preflight_from_config(
+            &store,
+            &rendezvous_token,
+            &MobileClawVpnRelayResponderConfig::default(),
+        ) {
+            Ok(_preflight) => panic!("default responder config must not produce preflight"),
+            Err(error) => error,
+        };
+
+        assert_eq!(error.kind(), "responder_not_configured");
+        assert!(!format!("{error:?}").contains("claw-alpha"));
+        assert!(!error.to_string().contains("claw-alpha"));
+    }
+
+    #[test]
+    fn mobile_claw_vpn_responder_preflight_from_config_denies_wrong_local_claw() {
+        let (_td, store, rendezvous_token) = ready_store();
+        assert!(store.set_claw_available(claw_beta()).unwrap());
+        let config =
+            MobileClawVpnRelayResponderConfig::from_values(Some("true"), Some("claw-beta"))
+                .unwrap();
+
+        let error = match mobile_claw_vpn_rendezvous_responder_preflight_from_config(
+            &store,
+            &rendezvous_token,
+            &config,
+        ) {
+            Ok(_preflight) => panic!("wrong local Claw must not produce preflight"),
+            Err(error) => error,
+        };
+
+        assert_eq!(error.kind(), "authorization_failed");
+        assert!(!format!("{error:?}").contains("claw-beta"));
+        assert!(!error.to_string().contains("claw-beta"));
     }
 
     #[tokio::test]
