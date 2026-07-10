@@ -13,6 +13,7 @@ use crate::mobile_claw_vpn_relay_dial_config::{
     MobileClawVpnRendezvousRelayDialConfig, MobileClawVpnRendezvousRelayDialError,
 };
 use crate::mobile_claw_vpn_relay_responder_config::MobileClawVpnRelayResponderConfig;
+use crate::state::AppState;
 use household_rs::{
     claw_share_rendezvous_hello::{RendezvousHello, RendezvousRole},
     claw_vpn_mobile_mesh_store::{ClawVpnMobileMeshStore, ClawVpnMobileMeshStoreError},
@@ -94,7 +95,7 @@ impl std::error::Error for MobileClawVpnRendezvousResponderPreflightError {}
 /// Missing local identity keeps the responder inert. This helper intentionally
 /// does not accept a Claw identity from network input, and it is not wired to a
 /// handler or socket path yet.
-pub fn mobile_claw_vpn_rendezvous_responder_preflight_from_config(
+fn mobile_claw_vpn_rendezvous_responder_preflight_from_config(
     store: &ClawVpnMobileMeshStore,
     rendezvous_token: &ClawVpnMobileRendezvousToken,
     config: &MobileClawVpnRelayResponderConfig,
@@ -105,6 +106,24 @@ pub fn mobile_claw_vpn_rendezvous_responder_preflight_from_config(
         .ok_or(MobileClawVpnRendezvousResponderPreflightError::ResponderNotConfigured)?;
     mobile_claw_vpn_rendezvous_responder_preflight(store, rendezvous_token, claw)
         .map_err(|_error| MobileClawVpnRendezvousResponderPreflightError::AuthorizationFailed)
+}
+
+/// Prepares a relay-visible `Claw` hello using the `AppState` responder config
+/// as the public source of local Claw identity.
+///
+/// This helper intentionally does not accept Claw identity from a caller. Future
+/// wiring should pass the process `AppState` directly rather than constructing a
+/// responder config from request data.
+pub fn mobile_claw_vpn_rendezvous_responder_preflight_from_state(
+    state: &AppState,
+    rendezvous_token: &ClawVpnMobileRendezvousToken,
+) -> Result<MobileClawVpnRendezvousResponderPreflight, MobileClawVpnRendezvousResponderPreflightError>
+{
+    mobile_claw_vpn_rendezvous_responder_preflight_from_config(
+        &state.mobile_claw_vpn_mesh,
+        rendezvous_token,
+        &state.mobile_claw_vpn_relay_responder,
+    )
 }
 
 #[derive(PartialEq, Eq)]
