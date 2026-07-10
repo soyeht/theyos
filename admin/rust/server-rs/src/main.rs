@@ -32,6 +32,7 @@ use server_rs::health;
 use server_rs::install_worker;
 use server_rs::jobs_worker;
 use server_rs::mobile_claw_vpn_relay_dial_config::MobileClawVpnRendezvousRelayDialConfig;
+use server_rs::mobile_claw_vpn_relay_responder_config::MobileClawVpnRelayResponderConfig;
 use server_rs::mobile_token::{MobileSessionDb, MobileTokenStore};
 use server_rs::public_sites;
 use server_rs::state::{AppState, SharedState};
@@ -377,6 +378,12 @@ async fn main() {
         "Mobile Claw VPN relay dial: initialized (configured={})",
         mobile_claw_vpn_relay_dial.is_configured()
     );
+    let mobile_claw_vpn_relay_responder = MobileClawVpnRelayResponderConfig::from_env()
+        .expect("Failed to initialize mobile Claw VPN relay responder config");
+    info!(
+        "Mobile Claw VPN relay responder: initialized (configured={})",
+        mobile_claw_vpn_relay_responder.is_configured()
+    );
 
     // ─── Full shared state ────────────────────────────────────────────────────
 
@@ -393,6 +400,7 @@ async fn main() {
         mobile_sessions,
         mobile_claw_vpn_mesh,
         mobile_claw_vpn_relay_dial,
+        mobile_claw_vpn_relay_responder,
         claw_store,
         theyos_dir,
         locks_dir,
