@@ -5,6 +5,7 @@
 //! Phase 3: terminal manager, PTY manager, VM runner, log store.
 
 use crate::handlers_llm::ProxyClient;
+use crate::mobile_claw_vpn_relay_dial_config::MobileClawVpnRendezvousRelayDialConfig;
 use crate::mobile_token::{MobileSessionDb, MobileTokenStore};
 use crate::ratelimit::Limiter;
 use executor_rs::Executor;
@@ -61,6 +62,9 @@ pub struct AppState {
     /// state only; owner-sensitive mutations stay behind explicit owner-approved
     /// store methods.
     pub mobile_claw_vpn_mesh: ClawVpnMobileMeshStore,
+    /// Default-off Relay-R dial target config for mobile Claw VPN rendezvous
+    /// preflight. Missing relay address keeps the handler on an inert sink.
+    pub mobile_claw_vpn_relay_dial: MobileClawVpnRendezvousRelayDialConfig,
 
     // ── Phase 6: Claw Store ────────────────────────────────────────────────
     /// Dynamic per-host claw install state (ready / installing / `not_installed`).

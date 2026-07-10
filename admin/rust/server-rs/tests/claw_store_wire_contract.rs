@@ -1,6 +1,7 @@
 use std::{
     net::SocketAddr,
     sync::{Arc, Mutex},
+    time::Duration,
 };
 
 use axum::{
@@ -27,6 +28,7 @@ use core_rs::{
 use executor_rs::{Executor, FlowConfig};
 use household_rs::{
     BootstrapOpts, HouseholdAuthState, KeyBackingPolicy, PersonCert,
+    claw_share_rendezvous_hello::{RendezvousHello, RendezvousRole},
     keys::{IdentityKey, P256Keypair},
     person_cert::SignOwnerOptions,
     pop::RequestSigningContext,
@@ -40,6 +42,7 @@ use server_rs::{
     handlers_instances, handlers_mobile, handlers_terminal,
     household_attach_token::{HouseholdAttachScope, HouseholdAttachTokenStore},
     household_state::HouseholdState,
+    mobile_claw_vpn_relay_dial_config::MobileClawVpnRendezvousRelayDialConfig,
     ratelimit::Limiter,
     responses::{ClawDetailResponse, ClawJobResponse, ClawListItemResponse, ListResponse},
     state::{AppState, SharedState},
@@ -47,6 +50,7 @@ use server_rs::{
 use session_rs::SessionStore;
 use store_rs::{InstanceDb, NewInstance, UserRole};
 use terminal_rs::pty::PtyManager;
+use tokio::{io::AsyncReadExt, net::TcpListener, time::timeout};
 use tower::ServiceExt;
 use vmrunner_rs::VmRunner;
 
@@ -103,6 +107,16 @@ fn shared_state() -> SharedState {
 }
 
 fn shared_state_with_claw_store(claw_store: claw_rs::ClawStore) -> SharedState {
+    shared_state_with_claw_store_and_mobile_relay_dial(
+        claw_store,
+        MobileClawVpnRendezvousRelayDialConfig::default(),
+    )
+}
+
+fn shared_state_with_claw_store_and_mobile_relay_dial(
+    claw_store: claw_rs::ClawStore,
+    mobile_claw_vpn_relay_dial: MobileClawVpnRendezvousRelayDialConfig,
+) -> SharedState {
     let _env_guard = ENV_LOCK
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -182,6 +196,7 @@ fn shared_state_with_claw_store(claw_store: claw_rs::ClawStore) -> SharedState {
         mobile_sessions: server_rs::mobile_token::MobileSessionDb::open(":memory:")
             .expect("mobile session db"),
         mobile_claw_vpn_mesh,
+        mobile_claw_vpn_relay_dial,
         claw_store,
         theyos_dir: theyos_path,
         locks_dir: locks_path,
@@ -2057,6 +2072,90 @@ async fn mobile_claw_vpn_offer_routes_are_auth_scoped_single_use_and_count_only(
     let status_after_unavailable = state.mobile_claw_vpn_mesh.status().unwrap();
     assert_eq!(status_after_unavailable.available_claw_count(), 0);
     assert_eq!(status_after_unavailable.session_count(), 0);
+}
+
+#[tokio::test]
+async fn mobile_claw_vpn_rendezvous_authorize_uses_state_relay_dial_config() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let relay_addr = listener.local_addr().unwrap();
+    let relay_addr_text = relay_addr.to_string();
+    let relay_dial = MobileClawVpnRendezvousRelayDialConfig::from_values(
+        Some(&relay_addr_text),
+        None,
+        Some("1"),
+        Some("1"),
+    )
+    .unwrap();
+    let state =
+        shared_state_with_claw_store_and_mobile_relay_dial(default_claw_store(), relay_dial);
+
+    let accepted = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut hello_bytes = Vec::new();
+        stream.read_to_end(&mut hello_bytes).await.unwrap();
+        hello_bytes
+    });
+
+    let member =
+        household_rs::claw_vpn_mobile_state::ClawVpnMobileMemberId::try_new("member-alpha")
+            .expect("member id");
+    let device =
+        household_rs::claw_vpn_mobile_state::ClawVpnMobileDeviceId::try_new("device-alpha")
+            .expect("device id");
+    let claw = household_rs::claw_vpn_mobile_state::ClawVpnMobileClawId::try_new("claw-alpha")
+        .expect("claw id");
+    let grant = household_rs::claw_vpn_mobile_state::ClawVpnMobileAclGrant::new(
+        member,
+        device.clone(),
+        claw.clone(),
+    );
+    assert!(
+        state
+            .mobile_claw_vpn_mesh
+            .owner_approved_enroll_device(device)
+            .unwrap()
+    );
+    assert!(state.mobile_claw_vpn_mesh.set_claw_available(claw).unwrap());
+    assert!(
+        state
+            .mobile_claw_vpn_mesh
+            .owner_approved_grant(grant.clone())
+            .unwrap()
+    );
+    let offer_token = state
+        .mobile_claw_vpn_mesh
+        .mint_offer_token(&grant, 100)
+        .unwrap();
+    let rendezvous_token = state
+        .mobile_claw_vpn_mesh
+        .consume_offer_token(&offer_token, &grant, 101)
+        .unwrap();
+
+    let member_token = mobile_session_for_existing_user(&state, "member-alpha");
+    let (status, _bytes, body) = request(
+        mobile_router(Arc::clone(&state)),
+        Method::POST,
+        "/api/v1/mobile/claw-vpn/rendezvous/authorize",
+        json!({
+            "device_id":"device-alpha",
+            "claw_id":"claw-alpha",
+            "rendezvous_token":rendezvous_token.public_token()
+        })
+        .to_string()
+        .into_bytes(),
+        Some(format!("Bearer {member_token}")),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_mobile_claw_vpn_rendezvous_authorize_body(&body, [1, 1, 1, 1, 1]);
+
+    let hello_bytes = timeout(Duration::from_secs(1), accepted)
+        .await
+        .unwrap()
+        .unwrap();
+    let decoded = RendezvousHello::decode(&hello_bytes).unwrap();
+    assert_eq!(decoded.role, RendezvousRole::Guest);
+    assert_eq!(decoded.token, rendezvous_token.relay_token().unwrap());
 }
 
 #[tokio::test]
