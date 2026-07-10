@@ -20,7 +20,12 @@ use std::fmt::Write as _;
 #[derive(Deserialize)]
 struct Vectors {
     owner_approval_context_v2: Vec<OwnerApprovalCase>,
+}
+
+#[derive(Deserialize)]
+struct MobileVectors {
     mobile_claw_vpn_dev_e2e_execution_tuple_v1: Vec<MobileExecutionCase>,
+    owner_approval_context_v2: Vec<OwnerApprovalCase>,
 }
 
 #[derive(Deserialize)]
@@ -96,6 +101,19 @@ struct OwnerApprovalInput {
 fn vectors() -> Vectors {
     serde_json::from_str(include_str!("data/owner_approval_v2_vectors.json"))
         .expect("owner_approval_v2_vectors.json must be valid JSON")
+}
+
+fn mobile_vectors() -> MobileVectors {
+    serde_json::from_str(include_str!(
+        "../../../contracts/mobile-claw-vpn/v1/owner_approval_v2_execution_vectors.json"
+    ))
+    .expect("authoritative mobile owner approval fixture must be valid JSON")
+}
+
+fn owner_approval_cases() -> Vec<OwnerApprovalCase> {
+    let mut cases = vectors().owner_approval_context_v2;
+    cases.extend(mobile_vectors().owner_approval_context_v2);
+    cases
 }
 
 fn hex(bytes: &[u8]) -> String {
@@ -211,7 +229,7 @@ fn context_for(case: &OwnerApprovalCase) -> OwnerApprovalContextV2 {
             .mobile_claw_vpn_execution_tuple_id
             .as_deref()
             .expect("mobile execution tuple id");
-        let fixture = vectors();
+        let fixture = mobile_vectors();
         let tuple_case = fixture
             .mobile_claw_vpn_dev_e2e_execution_tuple_v1
             .iter()
@@ -487,7 +505,7 @@ fn context_for(case: &OwnerApprovalCase) -> OwnerApprovalContextV2 {
 
 #[test]
 fn mobile_claw_vpn_execution_tuple_canonical_bytes_and_hash_match_fixture() {
-    for case in vectors().mobile_claw_vpn_dev_e2e_execution_tuple_v1 {
+    for case in mobile_vectors().mobile_claw_vpn_dev_e2e_execution_tuple_v1 {
         let execution = execution_for(&case);
         assert_eq!(
             hex(&execution
@@ -508,7 +526,7 @@ fn mobile_claw_vpn_execution_tuple_canonical_bytes_and_hash_match_fixture() {
 
 #[test]
 fn owner_approval_v2_canonical_bytes_and_challenge_match_fixture() {
-    for case in vectors().owner_approval_context_v2 {
+    for case in owner_approval_cases() {
         let ctx = context_for(&case);
         assert_eq!(
             hex(&ctx.to_canonical_bytes().expect("canonical bytes")),
@@ -527,7 +545,7 @@ fn owner_approval_v2_canonical_bytes_and_challenge_match_fixture() {
 
 #[test]
 fn owner_approval_v2_optional_fields_are_omitted_not_null() {
-    for case in vectors().owner_approval_context_v2 {
+    for case in owner_approval_cases() {
         let canonical = context_for(&case)
             .to_canonical_bytes()
             .expect("canonical bytes");

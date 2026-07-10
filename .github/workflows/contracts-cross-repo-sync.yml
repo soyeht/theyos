@@ -1,14 +1,12 @@
 name: Cross-Repo Contract Sync
 
-# Constitution V enforcement: contract markdown files shared between theyos
-# and soyeht-ios must not drift silently. This workflow detects drift by
-# scanning soyeht-ios contract mirrors and diffing them against the CURRENT
-# theyos@HEAD source-of-truth (not the pinned hash in the mirror header).
-# The pinned hash is preserved as audit metadata (when the mirror was last
-# synced), but the enforced invariant is: mirror == theyos@HEAD.
+# Constitution V enforcement: contracts shared between theyos and soyeht-ios
+# must not drift silently. Markdown mirrors are compared against CURRENT
+# theyos@HEAD. The mobile owner-approval fixture is additionally checked as an
+# exact byte-for-byte vendor at both the iOS pin and current theyos HEAD.
 #
-# Triggers: all PRs to main, plus pushes to 005-soyeht-onboarding where
-# contracts are developed.
+# Triggers: all PRs to main, source changes pushed to main, and onboarding
+# contract changes on 005-soyeht-onboarding.
 # Passes silently when no mirrors are registered yet.
 
 on:
@@ -17,9 +15,11 @@ on:
       - main
   push:
     branches:
+      - main
       - "005-soyeht-onboarding"
     paths:
       - "specs/005-soyeht-onboarding/contracts/**"
+      - "admin/contracts/mobile-claw-vpn/v1/owner_approval_v2_execution_vectors.json"
       - ".github/workflows/contracts-cross-repo-sync.yml"
   workflow_dispatch:
 
@@ -42,6 +42,69 @@ jobs:
           repository: soyeht/soyeht-ios
           path: soyeht-ios
           token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Verify mobile owner-approval fixture ownership
+        shell: bash
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+        run: |
+          set -euo pipefail
+
+          SOURCE_REL="admin/contracts/mobile-claw-vpn/v1/owner_approval_v2_execution_vectors.json"
+          SOURCE="theyos/${SOURCE_REL}"
+          VENDOR="soyeht-ios/Packages/SoyehtCore/Tests/SoyehtCoreTests/Fixtures/mobile-claw-vpn/v1/owner_approval_v2_execution_vectors.json"
+          PIN_FILE="soyeht-ios/scripts/cross-repo-contract.sha"
+
+          if [[ ! -f "${SOURCE}" ]]; then
+            echo "::error file=${SOURCE_REL}::authoritative mobile owner-approval fixture is missing"
+            exit 1
+          fi
+
+          # Ordered bootstrap: the source must land in theyos before iOS can
+          # vendor and pin it. Missing vendor is allowed only while this exact
+          # source path is new relative to the event's base commit.
+          if [[ ! -f "${VENDOR}" ]]; then
+            if [[ "${BASE_SHA}" =~ ^[0-9a-f]{40}$ ]] \
+              && [[ "${BASE_SHA}" != "0000000000000000000000000000000000000000" ]]; then
+              git -C theyos fetch --no-tags --depth=1 origin "${BASE_SHA}"
+              if ! git -C theyos cat-file -e "${BASE_SHA}:${SOURCE_REL}" 2>/dev/null; then
+                echo "Bootstrap: authoritative fixture is new; land theyos before the iOS vendor/pin."
+                exit 0
+              fi
+            fi
+            echo "::error::iOS vendor missing for existing theyos fixture: ${VENDOR#soyeht-ios/}"
+            exit 1
+          fi
+
+          if [[ ! -f "${PIN_FILE}" ]]; then
+            echo "::error::iOS cross-repo pin is missing"
+            exit 1
+          fi
+          PIN="$(grep -vE '^[[:space:]]*#' "${PIN_FILE}" | tr -d '[:space:]')"
+          if [[ ! "${PIN}" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::iOS cross-repo pin must be one lowercase 40-hex commit"
+            exit 1
+          fi
+
+          git -C theyos fetch --no-tags --depth=1 origin "${PIN}"
+          PINNED_SOURCE="$(mktemp)"
+          trap 'rm -f "${PINNED_SOURCE}"' EXIT
+          if ! git -C theyos show "${PIN}:${SOURCE_REL}" > "${PINNED_SOURCE}"; then
+            echo "::error::iOS pin ${PIN} does not contain ${SOURCE_REL}"
+            exit 1
+          fi
+
+          if ! cmp -s "${PINNED_SOURCE}" "${VENDOR}"; then
+            echo "::error::iOS vendor differs from its pinned theyos source ${PIN}"
+            diff -u "${PINNED_SOURCE}" "${VENDOR}" || true
+            exit 1
+          fi
+          if ! cmp -s "${SOURCE}" "${VENDOR}"; then
+            echo "::error::theyos HEAD changed without a matching landed iOS vendor"
+            diff -u "${SOURCE}" "${VENDOR}" || true
+            exit 1
+          fi
+          echo "✓ authoritative fixture matches iOS vendor at pin ${PIN} and theyos HEAD"
 
       - name: Scan and diff contract mirrors
         shell: bash
