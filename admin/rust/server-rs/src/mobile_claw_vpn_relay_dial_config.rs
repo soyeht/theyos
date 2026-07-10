@@ -29,7 +29,7 @@ pub const DEFAULT_MOBILE_CLAW_VPN_RELAY_DIAL_HELLO_TIMEOUT: Duration = Duration:
 pub const MAX_MOBILE_CLAW_VPN_RELAY_DIAL_TIMEOUT: Duration = Duration::from_secs(30);
 const RELAY_PEER_IDENTITY_SHA256_LEN: usize = 32;
 const RELAY_PEER_IDENTITY_SHA256_HEX_LEN: usize = RELAY_PEER_IDENTITY_SHA256_LEN * 2;
-const RELAY_AUTH_CHALLENGE_LEN: usize = 32;
+pub(crate) const RELAY_AUTH_CHALLENGE_LEN: usize = 32;
 const RELAY_AUTH_SIGNING_CONTEXT: &[u8] = b"theyos-mobile-claw-vpn-rendezvous-relay-auth-v1";
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -171,8 +171,8 @@ impl MobileClawVpnRendezvousRelayDialConfig {
     /// non-loopback relay peer.
     ///
     /// This does not authenticate the peer by itself. It only consumes the
-    /// opaque authenticated-peer capability that a future relay-auth seam must
-    /// produce after cryptographically proving the peer identity.
+    /// opaque authenticated-peer capability produced only after the relay-auth
+    /// handshake cryptographically proves the peer identity.
     pub fn relay_auth_proof_for_authenticated_non_loopback_peer(
         self,
         authenticated_peer: &MobileClawVpnRendezvousAuthenticatedRelayPeer,
@@ -219,9 +219,9 @@ impl MobileClawVpnRendezvousRelayDialConfig {
 /// Opaque result of cryptographically authenticating a rendezvous relay peer.
 ///
 /// This type is deliberately separate from configuration. Possessing a relay
-/// address or expected identity does not create one; a future relay-auth seam
-/// must mint it only after the peer proves possession of the configured relay
-/// identity key.
+/// address or expected identity does not create one; relay-auth code must mint
+/// it only after the peer proves possession of the configured relay identity
+/// key.
 #[derive(PartialEq, Eq)]
 pub struct MobileClawVpnRendezvousAuthenticatedRelayPeer {
     relay_addr: SocketAddr,
@@ -320,6 +320,17 @@ impl MobileClawVpnRendezvousRelayAuthChallenge {
         relay_auth_signing_bytes(self, relay_addr, relay_public_key)
     }
 
+    #[must_use]
+    pub(crate) fn nonce_bytes(&self) -> &[u8; RELAY_AUTH_CHALLENGE_LEN] {
+        &self.nonce
+    }
+
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn from_nonce_bytes(nonce: [u8; RELAY_AUTH_CHALLENGE_LEN]) -> Self {
+        Self { nonce }
+    }
+
     #[cfg(test)]
     fn new_for_test(nonce: [u8; RELAY_AUTH_CHALLENGE_LEN]) -> Self {
         Self { nonce }
@@ -338,7 +349,7 @@ impl fmt::Debug for MobileClawVpnRendezvousRelayAuthChallenge {
 /// Opaque identity of the authenticated rendezvous relay peer.
 ///
 /// This is a configuration-side expectation, not proof by itself. The future
-/// relay-auth seam must derive this identity cryptographically from the peer and
+/// relay-auth code must derive this identity cryptographically from the peer and
 /// mint a proof bound to both this identity and the target address.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct MobileClawVpnRendezvousRelayPeerIdentity {
@@ -373,11 +384,10 @@ impl fmt::Debug for MobileClawVpnRendezvousRelayPeerIdentity {
 /// Proof that a non-loopback rendezvous relay peer was authenticated before a
 /// token-bearing hello is written.
 ///
-/// This is intentionally opaque and has no production constructor yet. Until a
-/// future relay-auth seam can produce this proof after authenticating the peer,
-/// non-loopback token-bearing dials remain fail-closed with
-/// `relay_auth_required`. A proof authorizes only the exact relay address and
-/// configured peer identity it was minted for.
+/// This is intentionally opaque and is minted only from an authenticated relay
+/// peer capability. Without that proof, non-loopback token-bearing dials remain
+/// fail-closed with `relay_auth_required`. A proof authorizes only the exact
+/// relay address and configured peer identity it was minted for.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct MobileClawVpnRendezvousRelayAuthProof {
     relay_addr: SocketAddr,
