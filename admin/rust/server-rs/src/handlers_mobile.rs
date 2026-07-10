@@ -2690,6 +2690,188 @@ mod tests {
     }
 
     #[test]
+    fn mobile_claw_vpn_api_shapes_match_contract_fixture() {
+        let contract: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../contracts/mobile-claw-vpn/v1/api_shapes.json"
+        ))
+        .expect("mobile Claw VPN API shape fixture must parse");
+        assert_eq!(contract["contract"], "product-a-mobile-claw-vpn-api-shapes");
+        assert_eq!(contract["version"], 1);
+
+        let requests = contract["requests"]
+            .as_object()
+            .expect("requests fixture must be object");
+        assert_eq!(
+            requests
+                .keys()
+                .cloned()
+                .collect::<std::collections::BTreeSet<_>>(),
+            ["authorize_rendezvous", "consume_offer", "mint_offer"]
+                .into_iter()
+                .map(str::to_string)
+                .collect::<std::collections::BTreeSet<_>>()
+        );
+        let assert_request_keys = |id: &str, body: &serde_json::Value, expected: &[&str]| {
+            let object = body
+                .as_object()
+                .expect("request fixture body must be object");
+            assert_eq!(
+                object
+                    .keys()
+                    .cloned()
+                    .collect::<std::collections::BTreeSet<_>>(),
+                expected
+                    .iter()
+                    .copied()
+                    .map(str::to_string)
+                    .collect::<std::collections::BTreeSet<_>>(),
+                "{id} request must keep the exact public wire shape"
+            );
+            assert!(
+                !object.contains_key("member_id"),
+                "{id} request must keep member server-derived"
+            );
+        };
+        assert_request_keys(
+            "mint_offer",
+            &requests["mint_offer"],
+            &["claw_id", "device_id"],
+        );
+        assert_request_keys(
+            "consume_offer",
+            &requests["consume_offer"],
+            &["claw_id", "device_id", "offer_token"],
+        );
+        assert_request_keys(
+            "authorize_rendezvous",
+            &requests["authorize_rendezvous"],
+            &["claw_id", "device_id", "rendezvous_token"],
+        );
+
+        let mint_request: MobileClawVpnOfferRequest =
+            serde_json::from_value(requests["mint_offer"].clone()).unwrap();
+        assert_eq!(mint_request.device, "device-alpha");
+        assert_eq!(mint_request.claw, "claw-alpha");
+
+        let consume_request: MobileClawVpnSessionRequest =
+            serde_json::from_value(requests["consume_offer"].clone()).unwrap();
+        assert_eq!(consume_request.device, "device-alpha");
+        assert_eq!(consume_request.claw, "claw-alpha");
+        assert_eq!(consume_request.offer, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+
+        let rendezvous_request: MobileClawVpnRendezvousAuthorizeRequest =
+            serde_json::from_value(requests["authorize_rendezvous"].clone()).unwrap();
+        assert_eq!(rendezvous_request.device, "device-alpha");
+        assert_eq!(rendezvous_request.claw, "claw-alpha");
+        assert_eq!(
+            rendezvous_request.rendezvous,
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+        );
+
+        let td = tempfile::tempdir().unwrap();
+        let store =
+            household_rs::claw_vpn_mobile_mesh_store::ClawVpnMobileMeshStore::new(td.path(), 600)
+                .unwrap();
+        let status_not_configured = store.status().unwrap();
+        let member =
+            household_rs::claw_vpn_mobile_state::ClawVpnMobileMemberId::try_new("member-alpha")
+                .unwrap();
+        let device =
+            household_rs::claw_vpn_mobile_state::ClawVpnMobileDeviceId::try_new("device-alpha")
+                .unwrap();
+        let claw = household_rs::claw_vpn_mobile_state::ClawVpnMobileClawId::try_new("claw-alpha")
+            .unwrap();
+        let grant = household_rs::claw_vpn_mobile_state::ClawVpnMobileAclGrant::new(
+            member,
+            device.clone(),
+            claw.clone(),
+        );
+        assert!(store.owner_approved_enroll_device(device).unwrap());
+        assert!(store.set_claw_available(claw).unwrap());
+        assert!(store.owner_approved_grant(grant.clone()).unwrap());
+        let offer_token = household_rs::claw_vpn_mobile_state::ClawVpnMobileOfferToken::try_new(
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        )
+        .unwrap();
+        let rendezvous_token =
+            household_rs::claw_vpn_mobile_state::ClawVpnMobileRendezvousToken::try_new(
+                "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            )
+            .unwrap();
+        let persisted_offer = store.mint_offer_token(&grant, 100).unwrap();
+        let offer_count_status = store.status().unwrap();
+        let _persisted_session = store
+            .consume_offer_token(&persisted_offer, &grant, 101)
+            .unwrap();
+        let session_count_status = store.status().unwrap();
+
+        let responses = contract["responses"]
+            .as_object()
+            .expect("responses fixture must be object");
+        assert_eq!(
+            responses
+                .keys()
+                .cloned()
+                .collect::<std::collections::BTreeSet<_>>(),
+            [
+                "authorize_rendezvous",
+                "consume_offer",
+                "mint_offer",
+                "status_configured",
+                "status_not_configured",
+            ]
+            .into_iter()
+            .map(str::to_string)
+            .collect::<std::collections::BTreeSet<_>>()
+        );
+
+        assert_eq!(
+            serde_json::to_value(mobile_claw_vpn_status_response(status_not_configured)).unwrap(),
+            responses["status_not_configured"]
+        );
+        assert_eq!(
+            serde_json::to_value(mobile_claw_vpn_status_response(session_count_status)).unwrap(),
+            responses["status_configured"]
+        );
+
+        let mint_response = serde_json::to_value(mobile_claw_vpn_offer_response(
+            "mint_offer",
+            &offer_token,
+            offer_count_status,
+        ))
+        .unwrap();
+        assert_eq!(mint_response, responses["mint_offer"]);
+
+        let consume_response = serde_json::to_value(mobile_claw_vpn_session_response(
+            "consume_offer",
+            &rendezvous_token,
+            session_count_status,
+        ))
+        .unwrap();
+        assert_eq!(consume_response, responses["consume_offer"]);
+        assert!(
+            !consume_response
+                .as_object()
+                .expect("consume response must be object")
+                .contains_key("session_id"),
+            "consume response must keep session id internal"
+        );
+
+        let rendezvous_response =
+            serde_json::to_value(mobile_claw_vpn_rendezvous_authorize_response(
+                "authorize_rendezvous",
+                session_count_status,
+            ))
+            .unwrap();
+        assert_eq!(rendezvous_response, responses["authorize_rendezvous"]);
+        let rendezvous_object = rendezvous_response
+            .as_object()
+            .expect("rendezvous response must be object");
+        assert!(!rendezvous_object.contains_key("rendezvous_token"));
+        assert!(!rendezvous_object.contains_key("session_id"));
+    }
+
+    #[test]
     fn mobile_claw_vpn_rendezvous_dial_preflight_builds_guest_hello_after_revalidation() {
         let td = tempfile::tempdir().unwrap();
         let store =
