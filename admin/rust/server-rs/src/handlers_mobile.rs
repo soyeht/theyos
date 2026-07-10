@@ -241,6 +241,17 @@ pub struct MobileClawVpnSessionRequest {
     offer: String,
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct MobileClawVpnRendezvousAuthorizeRequest {
+    #[serde(rename = "device_id")]
+    device: String,
+    #[serde(rename = "claw_id")]
+    claw: String,
+    #[serde(rename = "rendezvous_token")]
+    rendezvous: String,
+}
+
 #[derive(Debug, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 struct MobileClawVpnOwnerMutationResponse {
@@ -273,6 +284,17 @@ struct MobileClawVpnSessionResponse {
     production_activation: bool,
     operation: &'static str,
     rendezvous_token: String,
+    status: MobileClawVpnStatusResponse,
+}
+
+#[derive(Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+struct MobileClawVpnRendezvousAuthorizeResponse {
+    product: &'static str,
+    mode: &'static str,
+    production_activation: bool,
+    operation: &'static str,
+    authorized: bool,
     status: MobileClawVpnStatusResponse,
 }
 
@@ -404,6 +426,45 @@ fn mobile_claw_vpn_offer_store_error(
     }
 }
 
+fn mobile_claw_vpn_rendezvous_store_error(
+    error: ClawVpnMobileMeshStoreError,
+    public_message: &'static str,
+) -> ApiError {
+    mobile_claw_vpn_log_store_error(&error, public_message);
+    match error.kind() {
+        ClawVpnMobileMeshStoreErrorKind::Storage => ApiError::service_unavailable(public_message),
+        ClawVpnMobileMeshStoreErrorKind::Model => match error.model_error() {
+            Some(ClawVpnMobileMeshError::EmptyId | ClawVpnMobileMeshError::InvalidId) => {
+                ApiError::bad_request("invalid mobile Claw VPN mesh request")
+            }
+            Some(
+                ClawVpnMobileMeshError::DeviceNotEnrolled
+                | ClawVpnMobileMeshError::Unauthorized
+                | ClawVpnMobileMeshError::SelectedClawMismatch,
+            ) => ApiError::forbidden("mobile Claw VPN rendezvous denied"),
+            Some(ClawVpnMobileMeshError::ClawUnavailable) => {
+                ApiError::conflict("mobile Claw VPN rendezvous unavailable")
+            }
+            Some(
+                ClawVpnMobileMeshError::UnknownOffer
+                | ClawVpnMobileMeshError::UnknownSession
+                | ClawVpnMobileMeshError::OfferExpired
+                | ClawVpnMobileMeshError::OfferAlreadyConsumed
+                | ClawVpnMobileMeshError::Revoked,
+            ) => ApiError::gone("mobile Claw VPN rendezvous unavailable"),
+            Some(
+                ClawVpnMobileMeshError::ZeroOfferTtl
+                | ClawVpnMobileMeshError::TimeOverflow
+                | ClawVpnMobileMeshError::IdExhausted
+                | ClawVpnMobileMeshError::UnsupportedSnapshotSchema
+                | ClawVpnMobileMeshError::DuplicateSnapshotEntry
+                | ClawVpnMobileMeshError::InvalidSnapshotCounter,
+            )
+            | None => ApiError::service_unavailable(public_message),
+        },
+    }
+}
+
 fn mobile_claw_vpn_log_store_error(
     error: &ClawVpnMobileMeshStoreError,
     public_message: &'static str,
@@ -496,8 +557,25 @@ fn mobile_claw_vpn_session_grant(
     ))
 }
 
+fn mobile_claw_vpn_rendezvous_grant(
+    username: String,
+    req: &MobileClawVpnRendezvousAuthorizeRequest,
+) -> Result<ClawVpnMobileAclGrant, ApiError> {
+    Ok(ClawVpnMobileAclGrant::new(
+        mobile_claw_vpn_member_id(username)?,
+        mobile_claw_vpn_device_id(req.device.clone())?,
+        mobile_claw_vpn_claw_id(req.claw.clone())?,
+    ))
+}
+
 fn mobile_claw_vpn_offer_token(value: String) -> Result<ClawVpnMobileOfferToken, ApiError> {
     ClawVpnMobileOfferToken::try_new(value).map_err(mobile_claw_vpn_request_error)
+}
+
+fn mobile_claw_vpn_rendezvous_token(
+    value: String,
+) -> Result<ClawVpnMobileRendezvousToken, ApiError> {
+    ClawVpnMobileRendezvousToken::try_new(value).map_err(mobile_claw_vpn_request_error)
 }
 
 fn mobile_claw_vpn_now_unix() -> Result<u64, ApiError> {
@@ -550,6 +628,20 @@ fn mobile_claw_vpn_session_response(
         production_activation: false,
         operation,
         rendezvous_token: rendezvous_token.public_token().to_string(),
+        status: mobile_claw_vpn_status_response(status),
+    }
+}
+
+fn mobile_claw_vpn_rendezvous_authorize_response(
+    operation: &'static str,
+    status: ClawVpnMobileMeshStoreStatus,
+) -> MobileClawVpnRendezvousAuthorizeResponse {
+    MobileClawVpnRendezvousAuthorizeResponse {
+        product: "product_a_mobile_claw_vpn",
+        mode: "mesh_c_rendezvous_preflight",
+        production_activation: false,
+        operation,
+        authorized: true,
         status: mobile_claw_vpn_status_response(status),
     }
 }
@@ -947,6 +1039,52 @@ pub async fn handle_mobile_claw_vpn_consume_offer(
         Json(mobile_claw_vpn_session_response(
             "consume_offer",
             &rendezvous_token,
+            status,
+        )),
+    )
+        .into_response())
+}
+
+/// `POST /api/v1/mobile/claw-vpn/rendezvous/authorize`
+///
+/// Mobile-authenticated. Revalidates an existing Mesh-C rendezvous capability
+/// for the authenticated member, Device-D, and selected Claw before any future
+/// relay dial. This is a read-only preflight: it does not return the decoded
+/// relay token, open relay sessions, install routes, or mutate host networking.
+///
+/// # Errors
+///
+/// Returns 401 without a valid mobile bearer, 400 for invalid redacted
+/// identifiers or token shape, 403/409/410 for fail-closed Mesh-C denies, or
+/// 503 for storage failures.
+#[tracing::instrument(skip_all)]
+pub async fn handle_mobile_claw_vpn_authorize_rendezvous(
+    State(state): State<SharedState>,
+    headers: axum::http::HeaderMap,
+    Json(req): Json<MobileClawVpnRendezvousAuthorizeRequest>,
+) -> Result<Response, ApiError> {
+    let username = extract_mobile_bearer(&state, &headers)?;
+    let grant = mobile_claw_vpn_rendezvous_grant(username, &req)?;
+    let rendezvous_token = mobile_claw_vpn_rendezvous_token(req.rendezvous)?;
+    let store = state.mobile_claw_vpn_mesh.clone();
+    let status = blocking(move || {
+        let _relay_token = store
+            .authorize_rendezvous_token(&rendezvous_token, &grant)
+            .map_err(|error| {
+                mobile_claw_vpn_rendezvous_store_error(
+                    error,
+                    "mobile Claw VPN rendezvous unavailable",
+                )
+            })?;
+        store.status().map_err(|error| {
+            mobile_claw_vpn_rendezvous_store_error(error, "mobile Claw VPN rendezvous unavailable")
+        })
+    })
+    .await??;
+    Ok((
+        StatusCode::OK,
+        Json(mobile_claw_vpn_rendezvous_authorize_response(
+            "authorize_rendezvous",
             status,
         )),
     )
