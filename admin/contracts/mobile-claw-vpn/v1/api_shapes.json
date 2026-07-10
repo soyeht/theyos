@@ -1,0 +1,104 @@
+{
+  "contract": "product-a-mobile-claw-vpn-api-shapes",
+  "version": 1,
+  "comment": "Source-of-truth JSON fixture for the mobile Claw VPN Mesh-C control-plane API. Values are neutral aliases or synthetic capability tokens only. The fixture pins public wire shapes: mobile request bodies do not carry member_id, consume returns rendezvous_token and never session_id, and all responses remain count/label-only outside product-necessary capability tokens.",
+  "requests": {
+    "mint_offer": {
+      "device_id": "device-alpha",
+      "claw_id": "claw-alpha"
+    },
+    "consume_offer": {
+      "device_id": "device-alpha",
+      "claw_id": "claw-alpha",
+      "offer_token": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    },
+    "authorize_rendezvous": {
+      "device_id": "device-alpha",
+      "claw_id": "claw-alpha",
+      "rendezvous_token": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+    }
+  },
+  "responses": {
+    "status_not_configured": {
+      "product": "product_a_mobile_claw_vpn",
+      "mode": "mesh_c_status_only",
+      "production_activation": false,
+      "state": "not_configured",
+      "snapshot_present": false,
+      "enrolled_device_count": 0,
+      "available_claw_count": 0,
+      "grant_count": 0,
+      "offer_count": 0,
+      "session_count": 0
+    },
+    "status_configured": {
+      "product": "product_a_mobile_claw_vpn",
+      "mode": "mesh_c_status_only",
+      "production_activation": false,
+      "state": "configured",
+      "snapshot_present": true,
+      "enrolled_device_count": 1,
+      "available_claw_count": 1,
+      "grant_count": 1,
+      "offer_count": 1,
+      "session_count": 1
+    },
+    "mint_offer": {
+      "product": "product_a_mobile_claw_vpn",
+      "mode": "mesh_c_offer_control",
+      "production_activation": false,
+      "operation": "mint_offer",
+      "offer_token": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "status": {
+        "product": "product_a_mobile_claw_vpn",
+        "mode": "mesh_c_status_only",
+        "production_activation": false,
+        "state": "configured",
+        "snapshot_present": true,
+        "enrolled_device_count": 1,
+        "available_claw_count": 1,
+        "grant_count": 1,
+        "offer_count": 1,
+        "session_count": 0
+      }
+    },
+    "consume_offer": {
+      "product": "product_a_mobile_claw_vpn",
+      "mode": "mesh_c_offer_control",
+      "production_activation": false,
+      "operation": "consume_offer",
+      "rendezvous_token": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "status": {
+        "product": "product_a_mobile_claw_vpn",
+        "mode": "mesh_c_status_only",
+        "production_activation": false,
+        "state": "configured",
+        "snapshot_present": true,
+        "enrolled_device_count": 1,
+        "available_claw_count": 1,
+        "grant_count": 1,
+        "offer_count": 1,
+        "session_count": 1
+      }
+    },
+    "authorize_rendezvous": {
+      "product": "product_a_mobile_claw_vpn",
+      "mode": "mesh_c_rendezvous_preflight",
+      "production_activation": false,
+      "operation": "authorize_rendezvous",
+      "authorized": true,
+      "status": {
+        "product": "product_a_mobile_claw_vpn",
+        "mode": "mesh_c_status_only",
+        "production_activation": false,
+        "state": "configured",
+        "snapshot_present": true,
+        "enrolled_device_count": 1,
+        "available_claw_count": 1,
+        "grant_count": 1,
+        "offer_count": 1,
+        "session_count": 1
+      }
+    }
+  }
+}
