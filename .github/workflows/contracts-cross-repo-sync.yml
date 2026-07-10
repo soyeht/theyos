@@ -60,19 +60,41 @@ jobs:
             exit 1
           fi
 
+          TMP_DIR="$(mktemp -d)"
+          trap 'rm -rf "${TMP_DIR}"' EXIT
+          BASE_HAS_SOURCE=0
+          if [[ "${BASE_SHA}" =~ ^[0-9a-f]{40}$ ]] \
+            && [[ "${BASE_SHA}" != "0000000000000000000000000000000000000000" ]]; then
+            git -C theyos fetch --no-tags --depth=1 origin "${BASE_SHA}"
+            if git -C theyos cat-file -e "${BASE_SHA}:${SOURCE_REL}" 2>/dev/null; then
+              BASE_HAS_SOURCE=1
+              git -C theyos show "${BASE_SHA}:${SOURCE_REL}" > "${TMP_DIR}/base-source"
+              if ! cmp -s "${TMP_DIR}/base-source" "${SOURCE}"; then
+                echo "::error::mobile owner-approval V1 is immutable; add a new versioned fixture"
+                diff -u "${TMP_DIR}/base-source" "${SOURCE}" || true
+                exit 1
+              fi
+            fi
+          fi
+
           # Ordered bootstrap: the source must land in theyos before iOS can
           # vendor and pin it. Missing vendor is allowed only while this exact
           # source path is new relative to the event's base commit.
           if [[ ! -f "${VENDOR}" ]]; then
             if [[ "${BASE_SHA}" =~ ^[0-9a-f]{40}$ ]] \
-              && [[ "${BASE_SHA}" != "0000000000000000000000000000000000000000" ]]; then
-              git -C theyos fetch --no-tags --depth=1 origin "${BASE_SHA}"
-              if ! git -C theyos cat-file -e "${BASE_SHA}:${SOURCE_REL}" 2>/dev/null; then
-                echo "Bootstrap: authoritative fixture is new; land theyos before the iOS vendor/pin."
-                exit 0
-              fi
+              && [[ "${BASE_SHA}" != "0000000000000000000000000000000000000000" ]] \
+              && [[ "${BASE_HAS_SOURCE}" == "0" ]]; then
+              echo "Bootstrap: authoritative fixture is new; land theyos before the iOS vendor/pin."
+              exit 0
             fi
             echo "::error::iOS vendor missing for existing theyos fixture: ${VENDOR#soyeht-ios/}"
+            exit 1
+          fi
+
+          if [[ "${BASE_SHA}" =~ ^[0-9a-f]{40}$ ]] \
+            && [[ "${BASE_SHA}" != "0000000000000000000000000000000000000000" ]] \
+            && [[ "${BASE_HAS_SOURCE}" == "0" ]]; then
+            echo "::error::iOS vendor landed before the authoritative theyos source"
             exit 1
           fi
 
@@ -87,8 +109,7 @@ jobs:
           fi
 
           git -C theyos fetch --no-tags --depth=1 origin "${PIN}"
-          PINNED_SOURCE="$(mktemp)"
-          trap 'rm -f "${PINNED_SOURCE}"' EXIT
+          PINNED_SOURCE="${TMP_DIR}/pinned-source"
           if ! git -C theyos show "${PIN}:${SOURCE_REL}" > "${PINNED_SOURCE}"; then
             echo "::error::iOS pin ${PIN} does not contain ${SOURCE_REL}"
             exit 1
