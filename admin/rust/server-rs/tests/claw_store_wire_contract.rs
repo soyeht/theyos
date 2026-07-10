@@ -43,6 +43,10 @@ use server_rs::{
     household_attach_token::{HouseholdAttachScope, HouseholdAttachTokenStore},
     household_state::HouseholdState,
     mobile_claw_vpn_relay_dial_config::MobileClawVpnRendezvousRelayDialConfig,
+    mobile_claw_vpn_relay_responder::{
+        mobile_claw_vpn_rendezvous_responder_preflight_from_state,
+        mobile_claw_vpn_write_rendezvous_responder_hello,
+    },
     mobile_claw_vpn_relay_responder_config::MobileClawVpnRelayResponderConfig,
     ratelimit::Limiter,
     responses::{ClawDetailResponse, ClawJobResponse, ClawListItemResponse, ListResponse},
@@ -235,6 +239,90 @@ fn mobile_claw_vpn_relay_responder_config_reaches_app_state_when_configured() {
         &household_rs::claw_vpn_mobile_state::ClawVpnMobileClawId::try_new("claw-alpha").unwrap()
     );
     assert!(!format!("{:?}", state.mobile_claw_vpn_relay_responder).contains("claw-alpha"));
+}
+
+#[test]
+fn mobile_claw_vpn_responder_preflight_from_state_is_default_inert() {
+    let state = shared_state();
+    let rendezvous_token =
+        household_rs::claw_vpn_mobile_state::ClawVpnMobileRendezvousToken::try_new(
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        )
+        .unwrap();
+
+    let error = match mobile_claw_vpn_rendezvous_responder_preflight_from_state(
+        &state,
+        &rendezvous_token,
+    ) {
+        Ok(_preflight) => panic!("default responder config must not produce preflight"),
+        Err(error) => error,
+    };
+
+    assert_eq!(error.kind(), "responder_not_configured");
+    assert!(!format!("{error:?}").contains("aaaaaaaa"));
+    assert!(!error.to_string().contains("aaaaaaaa"));
+}
+
+#[tokio::test]
+async fn mobile_claw_vpn_responder_preflight_from_state_uses_configured_identity() {
+    let responder_config =
+        MobileClawVpnRelayResponderConfig::from_values(Some("true"), Some("claw-alpha")).unwrap();
+    let state = shared_state_with_claw_store_and_mobile_configs(
+        default_claw_store(),
+        MobileClawVpnRendezvousRelayDialConfig::default(),
+        responder_config,
+    );
+
+    let member =
+        household_rs::claw_vpn_mobile_state::ClawVpnMobileMemberId::try_new("member-alpha")
+            .expect("member id");
+    let device =
+        household_rs::claw_vpn_mobile_state::ClawVpnMobileDeviceId::try_new("device-alpha")
+            .expect("device id");
+    let claw = household_rs::claw_vpn_mobile_state::ClawVpnMobileClawId::try_new("claw-alpha")
+        .expect("claw id");
+    let grant = household_rs::claw_vpn_mobile_state::ClawVpnMobileAclGrant::new(
+        member,
+        device.clone(),
+        claw.clone(),
+    );
+    assert!(
+        state
+            .mobile_claw_vpn_mesh
+            .owner_approved_enroll_device(device)
+            .unwrap()
+    );
+    assert!(state.mobile_claw_vpn_mesh.set_claw_available(claw).unwrap());
+    assert!(
+        state
+            .mobile_claw_vpn_mesh
+            .owner_approved_grant(grant.clone())
+            .unwrap()
+    );
+    let offer_token = state
+        .mobile_claw_vpn_mesh
+        .mint_offer_token(&grant, 100)
+        .unwrap();
+    let rendezvous_token = state
+        .mobile_claw_vpn_mesh
+        .consume_offer_token(&offer_token, &grant, 101)
+        .unwrap();
+
+    let preflight =
+        mobile_claw_vpn_rendezvous_responder_preflight_from_state(&state, &rendezvous_token)
+            .unwrap();
+    let (mut writer, mut reader) = tokio::io::duplex(1024);
+    mobile_claw_vpn_write_rendezvous_responder_hello(&mut writer, preflight)
+        .await
+        .unwrap();
+    drop(writer);
+
+    let mut hello_bytes = Vec::new();
+    reader.read_to_end(&mut hello_bytes).await.unwrap();
+    let decoded = RendezvousHello::decode(&hello_bytes).unwrap();
+
+    assert_eq!(decoded.role, RendezvousRole::Claw);
+    assert_eq!(decoded.token, rendezvous_token.relay_token().unwrap());
 }
 
 fn admin_router(state: SharedState) -> Router {
