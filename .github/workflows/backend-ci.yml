@@ -4,6 +4,7 @@ on:
   push:
     paths:
       - "admin/rust/**"
+      - "admin/contracts/mobile-claw-vpn/v1/owner_approval_v2_execution_vectors.json"
       - ".env.example"
       - "install-nixos"
       - "nix/**"
@@ -13,6 +14,7 @@ on:
   pull_request:
     paths:
       - "admin/rust/**"
+      - "admin/contracts/mobile-claw-vpn/v1/owner_approval_v2_execution_vectors.json"
       - ".env.example"
       - "install-nixos"
       - "nix/**"

@@ -1,0 +1,70 @@
+{
+  "contract": "soyeht-mobile-claw-vpn-owner-approval-v2-cross-language",
+  "version": 1,
+  "about": [
+    "Authoritative Rust/Swift golden vectors for the DEV-only mobile Claw VPN execution tuple.",
+    "Rust consumes this source file directly; iOS vendors an exact byte-for-byte copy guarded by CI.",
+    "The fixture pins deterministic CBOR, the tuple execution hash, and the transitive OwnerApprovalV2 challenge.",
+    "This v1 fixture is immutable after both repositories land it; incompatible changes require a new versioned fixture."
+  ],
+  "format": {
+    "execution_hash_domain_ascii_nul": "soyeht-mobile-claw-vpn-dev-e2e-execution-v1\\0",
+    "execution_sha256_hex": "SHA-256(execution_hash_domain_ascii_nul || canonical execution tuple CBOR bytes)",
+    "challenge_domain_ascii_nul": "soyeht-owner-approval-v2\\0",
+    "challenge_sha256_hex": "SHA-256(challenge_domain_ascii_nul || canonical owner approval context CBOR bytes)",
+    "canonical_cbor": "RFC 8949 4.2.1 deterministic map encoding; text keys are ordered by their encoded bytes.",
+    "none_fields": "Optional fields are omitted, never encoded as null.",
+    "byte_fields": ["engine_audience", "source_artifact_git_sha1", "execution_manifest_sha256", "device_binding", "execution_claim_sha256", "server_nonce", "mobile_claw_vpn_execution_hash", "replay_nonce"],
+    "owner_operation": "mobile-claw-vpn-dev-e2e-execute"
+  },
+  "mobile_claw_vpn_dev_e2e_execution_tuple_v1": [
+    {
+      "id": "mobile_claw_vpn_dev_e2e_device_d_claw_m",
+      "input": {
+        "v": 1,
+        "purpose": "mobile-claw-vpn-dev-e2e-execution",
+        "op": "mobile-claw-vpn-dev-e2e-execute",
+        "hh_id": "hh_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "engine_audience_hex": "9090909090909090909090909090909090909090909090909090909090909090",
+        "member_id": "member-alpha",
+        "attempt_id": "11111111-1111-4111-8111-111111111111",
+        "readiness_run_id": "22222222-2222-4222-8222-222222222222",
+        "source_artifact_git_sha1_hex": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "execution_manifest_sha256_hex": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "device_binding_hex": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+        "execution_run_id": "33333333-3333-4333-8333-333333333333",
+        "execution_claim_sha256_hex": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+        "bundle_id": "com.soyeht.app.dev",
+        "device_id": "device-alpha",
+        "claw_id": "claw-alpha",
+        "device_alias": "Device-D",
+        "claw_alias": "Claw-M",
+        "issued_at": 1000,
+        "expires_at": 1060,
+        "server_nonce_hex": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+      },
+      "canonical_cbor_hex": "b5617601626f70781f6d6f62696c652d636c61772d76706e2d6465762d6532652d657865637574656568685f6964783768685f6161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616167636c61775f69646a636c61772d616c70686167707572706f736578216d6f62696c652d636c61772d76706e2d6465762d6532652d657865637574696f6e6962756e646c655f696472636f6d2e736f796568742e6170702e646576696465766963655f69646c6465766963652d616c706861696973737565645f61741903e8696d656d6265725f69646c6d656d6265722d616c7068616a617474656d70745f6964782431313131313131312d313131312d343131312d383131312d3131313131313131313131316a636c61775f616c69617366436c61772d4d6a657870697265735f61741904246c6465766963655f616c696173684465766963652d446c7365727665725f6e6f6e63655820eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee6e6465766963655f62696e64696e675820cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc6f656e67696e655f61756469656e63655820909090909090909090909090909090909090909090909090909090909090909070657865637574696f6e5f72756e5f6964782433333333333333332d333333332d343333332d383333332d3333333333333333333333337072656164696e6573735f72756e5f6964782432323232323232322d323232322d343232322d383232322d32323232323232323232323276657865637574696f6e5f636c61696d5f7368613235365820dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd7818736f757263655f61727469666163745f6769745f7368613154aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa7819657865637574696f6e5f6d616e69666573745f7368613235365820bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "execution_sha256_hex": "37c94336e6d56d15e54f26996d94f630c182f75949b253e71ea8874953587302"
+    }
+  ],
+  "owner_approval_context_v2": [
+    {
+      "id": "mobile_claw_vpn_dev_e2e_execute",
+      "input": {
+        "v": 2,
+        "purpose": "owner-approval-v2",
+        "op": "mobile-claw-vpn-dev-e2e-execute",
+        "hh_id": "hh_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "owner_p_id": "p_owner-alpha",
+        "mobile_claw_vpn_execution_tuple_id": "mobile_claw_vpn_dev_e2e_device_d_claw_m",
+        "capabilities": ["mobile-claw-vpn-dev-e2e-execute"],
+        "issued_at": 1000,
+        "expires_at": 1060,
+        "replay_nonce_hex": "f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0"
+      },
+      "canonical_cbor_hex": "aa617602626f70781f6d6f62696c652d636c61772d76706e2d6465762d6532652d657865637574656568685f6964783768685f6161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616167707572706f7365716f776e65722d617070726f76616c2d7632696973737565645f61741903e86a657870697265735f61741904246a6f776e65725f705f69646d705f6f776e65722d616c7068616c6361706162696c697469657381781f6d6f62696c652d636c61772d76706e2d6465762d6532652d657865637574656c7265706c61795f6e6f6e63655820f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0781e6d6f62696c655f636c61775f76706e5f657865637574696f6e5f68617368582037c94336e6d56d15e54f26996d94f630c182f75949b253e71ea8874953587302",
+      "challenge_sha256_hex": "6edac2509d2b802c8de77f984b57dd1ce2871dea9257cb51a078b79c38af5366",
+      "omitted_fields": ["cursor", "m_id", "addr", "transport", "ttl_unix", "nonce", "join_request_hash", "target_credential_id", "authority_head_sequence", "authority_head_hash", "pre_active_credential_count", "recovery_head_sequence", "recovery_head_hash", "new_credential_binding_hash"]
+    }
+  ]
+}

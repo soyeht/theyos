@@ -7,9 +7,10 @@
 use household_rs::ids::{HouseholdId, MachineId};
 use household_rs::machine_cert::PersonId;
 use household_rs::owner_approval_v2::{
-    AddCredentialContextInput, OwnerApprovalContextV2, OwnerOperation,
-    PairMachineApprovalContextInput, ProvisionRecoveryCodeContextInput,
-    RecoverCredentialContextInput, RecoveryAuthorityHeadInput,
+    AddCredentialContextInput, MobileClawVpnDevE2eApprovalContextInput,
+    MobileClawVpnDevE2eExecutionTupleInput, MobileClawVpnDevE2eExecutionTupleV1,
+    OwnerApprovalContextV2, OwnerOperation, PairMachineApprovalContextInput,
+    ProvisionRecoveryCodeContextInput, RecoverCredentialContextInput, RecoveryAuthorityHeadInput,
 };
 use household_rs::pair_machine::JoinTransport;
 use serde::Deserialize;
@@ -19,6 +20,45 @@ use std::fmt::Write as _;
 #[derive(Deserialize)]
 struct Vectors {
     owner_approval_context_v2: Vec<OwnerApprovalCase>,
+}
+
+#[derive(Deserialize)]
+struct MobileVectors {
+    mobile_claw_vpn_dev_e2e_execution_tuple_v1: Vec<MobileExecutionCase>,
+    owner_approval_context_v2: Vec<OwnerApprovalCase>,
+}
+
+#[derive(Deserialize)]
+struct MobileExecutionCase {
+    id: String,
+    input: MobileExecutionInput,
+    canonical_cbor_hex: String,
+    execution_sha256_hex: String,
+}
+
+#[derive(Deserialize)]
+struct MobileExecutionInput {
+    v: u8,
+    purpose: String,
+    op: String,
+    hh_id: String,
+    engine_audience_hex: String,
+    member_id: String,
+    attempt_id: String,
+    readiness_run_id: String,
+    source_artifact_git_sha1_hex: String,
+    execution_manifest_sha256_hex: String,
+    device_binding_hex: String,
+    execution_run_id: String,
+    execution_claim_sha256_hex: String,
+    bundle_id: String,
+    device_id: String,
+    claw_id: String,
+    device_alias: String,
+    claw_alias: String,
+    issued_at: u64,
+    expires_at: u64,
+    server_nonce_hex: String,
 }
 
 #[derive(Deserialize)]
@@ -33,6 +73,7 @@ struct OwnerApprovalCase {
 
 #[derive(Deserialize)]
 struct OwnerApprovalInput {
+    v: u8,
     purpose: String,
     op: String,
     hh_id: String,
@@ -50,6 +91,7 @@ struct OwnerApprovalInput {
     recovery_head_sequence: Option<u64>,
     recovery_head_hash_hex: Option<String>,
     new_credential_binding_hash_hex: Option<String>,
+    mobile_claw_vpn_execution_tuple_id: Option<String>,
     capabilities: Vec<String>,
     issued_at: u64,
     expires_at: u64,
@@ -59,6 +101,19 @@ struct OwnerApprovalInput {
 fn vectors() -> Vectors {
     serde_json::from_str(include_str!("data/owner_approval_v2_vectors.json"))
         .expect("owner_approval_v2_vectors.json must be valid JSON")
+}
+
+fn mobile_vectors() -> MobileVectors {
+    serde_json::from_str(include_str!(
+        "../../../contracts/mobile-claw-vpn/v1/owner_approval_v2_execution_vectors.json"
+    ))
+    .expect("authoritative mobile owner approval fixture must be valid JSON")
+}
+
+fn owner_approval_cases() -> Vec<OwnerApprovalCase> {
+    let mut cases = vectors().owner_approval_context_v2;
+    cases.extend(mobile_vectors().owner_approval_context_v2);
+    cases
 }
 
 fn hex(bytes: &[u8]) -> String {
@@ -94,8 +149,60 @@ fn operation(value: &str) -> OwnerOperation {
         "provision-recovery-code" => OwnerOperation::ProvisionRecoveryCode,
         "add-credential" => OwnerOperation::AddCredential,
         "recover-credential" => OwnerOperation::RecoverCredential,
+        "mobile-claw-vpn-dev-e2e-execute" => OwnerOperation::MobileClawVpnDevE2eExecute,
         other => panic!("unknown operation in fixture: {other}"),
     }
+}
+
+fn execution_for(case: &MobileExecutionCase) -> MobileClawVpnDevE2eExecutionTupleV1 {
+    let input = &case.input;
+    assert_eq!(input.v, 1, "{}: tuple version drifted", case.id);
+    assert_eq!(
+        input.purpose, "mobile-claw-vpn-dev-e2e-execution",
+        "{}: tuple purpose drifted",
+        case.id
+    );
+    assert_eq!(
+        input.op, "mobile-claw-vpn-dev-e2e-execute",
+        "{}: tuple operation drifted",
+        case.id
+    );
+    assert_eq!(
+        input.bundle_id, "com.soyeht.app.dev",
+        "{}: tuple bundle drifted",
+        case.id
+    );
+    MobileClawVpnDevE2eExecutionTupleV1::new(MobileClawVpnDevE2eExecutionTupleInput {
+        hh_id: HouseholdId::parse(input.hh_id.clone()).expect("fixture hh_id must parse"),
+        engine_audience: unhex_array_32("engine_audience", &input.engine_audience_hex),
+        member_id: input.member_id.clone(),
+        attempt_id: input.attempt_id.clone(),
+        readiness_run_id: input.readiness_run_id.clone(),
+        source_artifact_git_sha1: {
+            let bytes = unhex(&input.source_artifact_git_sha1_hex);
+            assert_eq!(bytes.len(), 20, "source_artifact_git_sha1 must be 20 bytes");
+            let mut output = [0u8; 20];
+            output.copy_from_slice(&bytes);
+            output
+        },
+        execution_manifest_sha256: unhex_array_32(
+            "execution_manifest_sha256",
+            &input.execution_manifest_sha256_hex,
+        ),
+        device_binding: unhex_array_32("device_binding", &input.device_binding_hex),
+        execution_run_id: input.execution_run_id.clone(),
+        execution_claim_sha256: unhex_array_32(
+            "execution_claim_sha256",
+            &input.execution_claim_sha256_hex,
+        ),
+        device_id: input.device_id.clone(),
+        claw_id: input.claw_id.clone(),
+        device_alias: input.device_alias.clone(),
+        claw_alias: input.claw_alias.clone(),
+        issued_at: input.issued_at,
+        expires_at: input.expires_at,
+        server_nonce: unhex_array_32("server_nonce", &input.server_nonce_hex),
+    })
 }
 
 fn transport(value: &str) -> JoinTransport {
@@ -116,6 +223,104 @@ fn context_for(case: &OwnerApprovalCase) -> OwnerApprovalContextV2 {
     let hh_id = HouseholdId::parse(input.hh_id.clone()).expect("fixture hh_id must parse");
     let owner_p_id = PersonId(input.owner_p_id.clone());
     let replay_nonce = ByteBuf::from(unhex(&input.replay_nonce_hex));
+
+    if input.op == "mobile-claw-vpn-dev-e2e-execute" {
+        let tuple_id = input
+            .mobile_claw_vpn_execution_tuple_id
+            .as_deref()
+            .expect("mobile execution tuple id");
+        let fixture = mobile_vectors();
+        let tuple_case = fixture
+            .mobile_claw_vpn_dev_e2e_execution_tuple_v1
+            .iter()
+            .find(|tuple| tuple.id == tuple_id)
+            .expect("referenced mobile execution tuple");
+        let execution = execution_for(tuple_case);
+        assert_eq!(input.v, 2, "{}: context version drifted", case.id);
+        assert_eq!(
+            input.hh_id,
+            execution.hh_id.as_str(),
+            "{}: household drifted",
+            case.id
+        );
+        assert_eq!(
+            input.capabilities,
+            ["mobile-claw-vpn-dev-e2e-execute"],
+            "{}: capability drifted",
+            case.id
+        );
+        assert_eq!(
+            input.issued_at, execution.issued_at,
+            "{}: issued_at drifted",
+            case.id
+        );
+        assert_eq!(
+            input.expires_at, execution.expires_at,
+            "{}: expires_at drifted",
+            case.id
+        );
+        assert!(input.cursor.is_none(), "{}: cursor must be absent", case.id);
+        assert!(input.m_id.is_none(), "{}: m_id must be absent", case.id);
+        assert!(input.addr.is_none(), "{}: addr must be absent", case.id);
+        assert!(
+            input.transport.is_none(),
+            "{}: transport must be absent",
+            case.id
+        );
+        assert!(
+            input.ttl_unix.is_none(),
+            "{}: ttl_unix must be absent",
+            case.id
+        );
+        assert!(
+            input.nonce_hex.is_none(),
+            "{}: nonce must be absent",
+            case.id
+        );
+        assert!(
+            input.join_request_hash_hex.is_none(),
+            "{}: join_request_hash must be absent",
+            case.id
+        );
+        assert!(
+            input.authority_head_sequence.is_none(),
+            "{}: authority_head_sequence must be absent",
+            case.id
+        );
+        assert!(
+            input.authority_head_hash_hex.is_none(),
+            "{}: authority_head_hash must be absent",
+            case.id
+        );
+        assert!(
+            input.pre_active_credential_count.is_none(),
+            "{}: pre_active_credential_count must be absent",
+            case.id
+        );
+        assert!(
+            input.recovery_head_sequence.is_none(),
+            "{}: recovery_head_sequence must be absent",
+            case.id
+        );
+        assert!(
+            input.recovery_head_hash_hex.is_none(),
+            "{}: recovery_head_hash must be absent",
+            case.id
+        );
+        assert!(
+            input.new_credential_binding_hash_hex.is_none(),
+            "{}: new_credential_binding_hash must be absent",
+            case.id
+        );
+        return OwnerApprovalContextV2::mobile_claw_vpn_dev_e2e_execute(
+            MobileClawVpnDevE2eApprovalContextInput {
+                owner_p_id,
+                execution: &execution,
+                replay_nonce: unhex_array_32("replay_nonce", &input.replay_nonce_hex),
+            },
+        )
+        .expect("mobile execution context");
+    }
 
     if input.op == "pair-machine-approve" {
         return OwnerApprovalContextV2::pair_machine_approve(PairMachineApprovalContextInput {
@@ -260,7 +465,7 @@ fn context_for(case: &OwnerApprovalCase) -> OwnerApprovalContextV2 {
     }
 
     OwnerApprovalContextV2 {
-        version: 2,
+        version: input.v,
         purpose: input.purpose.clone(),
         op: operation(&input.op),
         hh_id,
@@ -290,6 +495,7 @@ fn context_for(case: &OwnerApprovalCase) -> OwnerApprovalContextV2 {
         recovery_head_sequence: None,
         recovery_head_hash: None,
         new_credential_binding_hash: None,
+        mobile_claw_vpn_execution_hash: None,
         capabilities: input.capabilities.clone(),
         issued_at: input.issued_at,
         expires_at: input.expires_at,
@@ -298,8 +504,29 @@ fn context_for(case: &OwnerApprovalCase) -> OwnerApprovalContextV2 {
 }
 
 #[test]
+fn mobile_claw_vpn_execution_tuple_canonical_bytes_and_hash_match_fixture() {
+    for case in mobile_vectors().mobile_claw_vpn_dev_e2e_execution_tuple_v1 {
+        let execution = execution_for(&case);
+        assert_eq!(
+            hex(&execution
+                .to_canonical_bytes()
+                .expect("canonical tuple bytes")),
+            case.canonical_cbor_hex,
+            "{}: canonical execution tuple CBOR drifted",
+            case.id
+        );
+        assert_eq!(
+            hex(&execution.execution_hash().expect("execution hash")),
+            case.execution_sha256_hex,
+            "{}: execution tuple hash drifted",
+            case.id
+        );
+    }
+}
+
+#[test]
 fn owner_approval_v2_canonical_bytes_and_challenge_match_fixture() {
-    for case in vectors().owner_approval_context_v2 {
+    for case in owner_approval_cases() {
         let ctx = context_for(&case);
         assert_eq!(
             hex(&ctx.to_canonical_bytes().expect("canonical bytes")),
@@ -318,10 +545,7 @@ fn owner_approval_v2_canonical_bytes_and_challenge_match_fixture() {
 
 #[test]
 fn owner_approval_v2_optional_fields_are_omitted_not_null() {
-    for case in vectors().owner_approval_context_v2 {
-        if case.omitted_fields.is_empty() {
-            continue;
-        }
+    for case in owner_approval_cases() {
         let canonical = context_for(&case)
             .to_canonical_bytes()
             .expect("canonical bytes");
@@ -341,6 +565,15 @@ fn owner_approval_v2_optional_fields_are_omitted_not_null() {
             assert!(
                 !keys.iter().any(|key| key == omitted),
                 "{}: optional field {omitted} was encoded",
+                case.id
+            );
+        }
+        if case.input.op != "mobile-claw-vpn-dev-e2e-execute" {
+            assert!(
+                !keys
+                    .iter()
+                    .any(|key| key == "mobile_claw_vpn_execution_hash"),
+                "{}: legacy context encoded mobile execution hash",
                 case.id
             );
         }
