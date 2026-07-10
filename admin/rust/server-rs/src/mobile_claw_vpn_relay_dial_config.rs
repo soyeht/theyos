@@ -119,6 +119,18 @@ impl MobileClawVpnRendezvousRelayDialConfig {
         Ok(self)
     }
 
+    pub(crate) fn validate_for_token_bearing_dial(
+        self,
+    ) -> Result<Self, MobileClawVpnRendezvousRelayDialError> {
+        let config = self.validate_for_dial()?;
+        if let Some(relay_addr) = config.relay_addr {
+            if !relay_addr.ip().is_loopback() {
+                return Err(MobileClawVpnRendezvousRelayDialError::RelayAuthRequired);
+            }
+        }
+        Ok(config)
+    }
+
     fn validate_config(self) -> Result<Self, MobileClawVpnRendezvousRelayDialConfigError> {
         if let Some(relay_addr) = self.relay_addr {
             if !self.allow_non_loopback_relay_addr && !relay_addr.ip().is_loopback() {
@@ -246,6 +258,7 @@ pub enum MobileClawVpnRendezvousRelayDialError {
     DialFailed,
     HelloTimeout,
     HelloWriteFailed,
+    RelayAuthRequired,
 }
 
 impl MobileClawVpnRendezvousRelayDialError {
@@ -260,6 +273,7 @@ impl MobileClawVpnRendezvousRelayDialError {
             Self::DialFailed => "dial_failed",
             Self::HelloTimeout => "hello_timeout",
             Self::HelloWriteFailed => "hello_write_failed",
+            Self::RelayAuthRequired => "relay_auth_required",
         }
     }
 }
@@ -354,6 +368,24 @@ mod tests {
         .unwrap();
         assert!(config.allow_non_loopback_relay_addr);
         assert!(!format!("{config:?}").contains("198.51.100.10"));
+    }
+
+    #[test]
+    fn mobile_claw_vpn_relay_dial_token_bearing_non_loopback_requires_relay_auth() {
+        let config = MobileClawVpnRendezvousRelayDialConfig::from_values(
+            Some("198.51.100.10:49152"),
+            Some("true"),
+            None,
+            None,
+        )
+        .unwrap();
+
+        let error = config.validate_for_token_bearing_dial().unwrap_err();
+
+        assert_eq!(error.kind(), "relay_auth_required");
+        assert!(!format!("{config:?}").contains("198.51.100.10"));
+        assert!(!format!("{error:?}").contains("198.51.100.10"));
+        assert!(!error.to_string().contains("198.51.100.10"));
     }
 
     #[test]
