@@ -184,12 +184,13 @@ where
 ///
 /// This helper does not resolve its own endpoint, read environment, expose a
 /// handler, or install any host networking. Non-loopback relay addresses remain
-/// disabled unless the caller supplied a config with the explicit opt-in bit.
+/// disabled for token-bearing hello writes until a future relay-auth seam proves
+/// the peer before this helper writes the hello.
 pub async fn mobile_claw_vpn_dial_rendezvous_relay_and_write_responder_hello(
     config: MobileClawVpnRendezvousRelayDialConfig,
     preflight: MobileClawVpnRendezvousResponderPreflight,
 ) -> Result<(), MobileClawVpnRendezvousRelayDialError> {
-    let config = config.validate_for_dial()?;
+    let config = config.validate_for_token_bearing_dial()?;
     if let Some(relay_addr) = config.relay_addr {
         let mut stream = timeout(config.connect_timeout, TcpStream::connect(relay_addr))
             .await
@@ -568,6 +569,32 @@ mod tests {
                 .unwrap_err();
 
         assert_eq!(error.kind(), "non_loopback_relay_addr");
+        assert!(!format!("{config:?}").contains("198.51.100.10"));
+        assert!(!format!("{error:?}").contains("198.51.100.10"));
+        assert!(!error.to_string().contains("198.51.100.10"));
+    }
+
+    #[tokio::test]
+    async fn mobile_claw_vpn_responder_relay_dial_requires_auth_before_non_loopback_hello() {
+        let preflight = MobileClawVpnRendezvousResponderPreflight {
+            hello: RendezvousHello::new(
+                RendezvousRole::Claw,
+                RendezvousToken::try_new(vec![0x44; 16]).unwrap(),
+            ),
+        };
+        let config = MobileClawVpnRendezvousRelayDialConfig {
+            relay_addr: Some("198.51.100.10:49152".parse().unwrap()),
+            connect_timeout: Duration::from_secs(1),
+            hello_timeout: Duration::from_secs(1),
+            allow_non_loopback_relay_addr: true,
+        };
+
+        let error =
+            mobile_claw_vpn_dial_rendezvous_relay_and_write_responder_hello(config, preflight)
+                .await
+                .unwrap_err();
+
+        assert_eq!(error.kind(), "relay_auth_required");
         assert!(!format!("{config:?}").contains("198.51.100.10"));
         assert!(!format!("{error:?}").contains("198.51.100.10"));
         assert!(!error.to_string().contains("198.51.100.10"));
