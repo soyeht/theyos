@@ -1,20 +1,26 @@
 //! Internal Claw-responder rendezvous preflight for mobile Claw VPN.
 //!
-//! This module does not open sockets, spawn Relay-R, install TUN/utun routes,
-//! expose handlers, or mutate host networking. It only turns a Mesh-C-authorized
-//! Claw-side rendezvous capability into the relay-visible `Claw` hello bytes or
-//! writes those bytes to a caller-provided stream.
+//! This module does not expose handlers, read startup configuration, spawn
+//! Relay-R, install TUN/utun routes, or mutate host networking. It turns a
+//! Mesh-C-authorized Claw-side rendezvous capability into a relay-visible
+//! `Claw` hello preflight, then writes that preflight to a caller-provided
+//! stream or to an explicitly configured relay dial target. The default config
+//! stays inert and writes to a sink.
 
 use std::fmt;
 
+use crate::mobile_claw_vpn_relay_dial_config::{
+    MobileClawVpnRendezvousRelayDialConfig, MobileClawVpnRendezvousRelayDialError,
+};
 use household_rs::{
     claw_share_rendezvous_hello::{RendezvousHello, RendezvousRole},
     claw_vpn_mobile_mesh_store::{ClawVpnMobileMeshStore, ClawVpnMobileMeshStoreError},
     claw_vpn_mobile_state::{ClawVpnMobileClawId, ClawVpnMobileRendezvousToken},
 };
 use tokio::io::{AsyncWrite, AsyncWriteExt};
+use tokio::{net::TcpStream, time::timeout};
 
-struct MobileClawVpnRendezvousResponderPreflight {
+pub struct MobileClawVpnRendezvousResponderPreflight {
     hello: RendezvousHello,
 }
 
@@ -35,7 +41,21 @@ impl MobileClawVpnRendezvousResponderPreflight {
     }
 }
 
-/// Builds a relay-visible `Claw` hello after revalidating the active Mesh-C
+/// Prepares a relay-visible `Claw` hello after revalidating the active Mesh-C
+/// session for the locally trusted Claw responder identity.
+///
+/// The caller must provide `claw` from local responder identity/configuration,
+/// not from network input. This helper is intentionally not wired to a handler
+/// or production relay path yet.
+pub fn mobile_claw_vpn_rendezvous_responder_preflight(
+    store: &ClawVpnMobileMeshStore,
+    rendezvous_token: &ClawVpnMobileRendezvousToken,
+    claw: &ClawVpnMobileClawId,
+) -> Result<MobileClawVpnRendezvousResponderPreflight, ClawVpnMobileMeshStoreError> {
+    MobileClawVpnRendezvousResponderPreflight::claw(store, rendezvous_token, claw)
+}
+
+/// Builds relay-visible `Claw` hello bytes after revalidating the active Mesh-C
 /// session for the locally trusted Claw responder identity.
 ///
 /// The caller must provide `claw` from local responder identity/configuration,
@@ -46,13 +66,12 @@ pub fn mobile_claw_vpn_rendezvous_responder_preflight_hello_bytes(
     rendezvous_token: &ClawVpnMobileRendezvousToken,
     claw: &ClawVpnMobileClawId,
 ) -> Result<Vec<u8>, ClawVpnMobileMeshStoreError> {
-    MobileClawVpnRendezvousResponderPreflight::claw(store, rendezvous_token, claw)
+    mobile_claw_vpn_rendezvous_responder_preflight(store, rendezvous_token, claw)
         .map(MobileClawVpnRendezvousResponderPreflight::into_hello_bytes)
 }
 
 #[derive(PartialEq, Eq)]
 pub enum MobileClawVpnRendezvousResponderWriteError {
-    Authorization(ClawVpnMobileMeshStoreError),
     HelloWriteFailed,
 }
 
@@ -60,16 +79,7 @@ impl MobileClawVpnRendezvousResponderWriteError {
     #[must_use]
     pub fn kind(&self) -> &'static str {
         match self {
-            Self::Authorization(_) => "authorization_failed",
             Self::HelloWriteFailed => "hello_write_failed",
-        }
-    }
-
-    #[must_use]
-    pub fn authorization_error(&self) -> Option<&ClawVpnMobileMeshStoreError> {
-        match self {
-            Self::Authorization(error) => Some(error),
-            Self::HelloWriteFailed => None,
         }
     }
 }
@@ -90,22 +100,18 @@ impl fmt::Display for MobileClawVpnRendezvousResponderWriteError {
 
 impl std::error::Error for MobileClawVpnRendezvousResponderWriteError {}
 
-/// Writes the relay-visible `Claw` hello after revalidating the active Mesh-C
-/// session for the locally trusted Claw responder identity.
+/// Writes a pre-authorized relay-visible `Claw` hello.
 ///
 /// The caller supplies the stream. This helper does not open sockets, choose a
-/// relay endpoint, or expose the hello bytes to a public response.
+/// relay endpoint, access Mesh-C storage, or expose the hello bytes to a public
+/// response.
 pub async fn mobile_claw_vpn_write_rendezvous_responder_hello<W>(
     writer: &mut W,
-    store: &ClawVpnMobileMeshStore,
-    rendezvous_token: &ClawVpnMobileRendezvousToken,
-    claw: &ClawVpnMobileClawId,
+    preflight: MobileClawVpnRendezvousResponderPreflight,
 ) -> Result<(), MobileClawVpnRendezvousResponderWriteError>
 where
     W: AsyncWrite + Unpin,
 {
-    let preflight = MobileClawVpnRendezvousResponderPreflight::claw(store, rendezvous_token, claw)
-        .map_err(MobileClawVpnRendezvousResponderWriteError::Authorization)?;
     let hello_bytes = preflight.into_hello_bytes();
     writer
         .write_all(&hello_bytes)
@@ -117,6 +123,42 @@ where
         .map_err(|_error| MobileClawVpnRendezvousResponderWriteError::HelloWriteFailed)
 }
 
+/// Writes a pre-authorized `Claw` hello to an explicitly configured relay dial
+/// target, or to an inert sink when no relay target is configured.
+///
+/// This helper does not resolve its own endpoint, read environment, expose a
+/// handler, or install any host networking. Non-loopback relay addresses remain
+/// disabled unless the caller supplied a config with the explicit opt-in bit.
+pub async fn mobile_claw_vpn_dial_rendezvous_relay_and_write_responder_hello(
+    config: MobileClawVpnRendezvousRelayDialConfig,
+    preflight: MobileClawVpnRendezvousResponderPreflight,
+) -> Result<(), MobileClawVpnRendezvousRelayDialError> {
+    let config = config.validate_for_dial()?;
+    if let Some(relay_addr) = config.relay_addr {
+        let mut stream = timeout(config.connect_timeout, TcpStream::connect(relay_addr))
+            .await
+            .map_err(|_| MobileClawVpnRendezvousRelayDialError::ConnectTimeout)?
+            .map_err(|_error| MobileClawVpnRendezvousRelayDialError::DialFailed)?;
+        timeout(
+            config.hello_timeout,
+            mobile_claw_vpn_write_rendezvous_responder_hello(&mut stream, preflight),
+        )
+        .await
+        .map_err(|_| MobileClawVpnRendezvousRelayDialError::HelloTimeout)?
+        .map_err(|_error| MobileClawVpnRendezvousRelayDialError::HelloWriteFailed)?;
+        return Ok(());
+    }
+
+    let mut sink = tokio::io::sink();
+    timeout(
+        config.hello_timeout,
+        mobile_claw_vpn_write_rendezvous_responder_hello(&mut sink, preflight),
+    )
+    .await
+    .map_err(|_| MobileClawVpnRendezvousRelayDialError::HelloTimeout)?
+    .map_err(|_error| MobileClawVpnRendezvousRelayDialError::HelloWriteFailed)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -124,13 +166,15 @@ mod tests {
     use std::{
         pin::Pin,
         task::{Context, Poll},
+        time::Duration,
     };
 
     use household_rs::claw_share_rendezvous_hello::RendezvousRole;
+    use household_rs::claw_share_rendezvous_token::RendezvousToken;
     use household_rs::claw_vpn_mobile_state::{
         ClawVpnMobileAclGrant, ClawVpnMobileDeviceId, ClawVpnMobileMemberId, ClawVpnMobileMeshError,
     };
-    use tokio::io::AsyncReadExt;
+    use tokio::{io::AsyncReadExt, net::TcpListener};
 
     fn member() -> ClawVpnMobileMemberId {
         ClawVpnMobileMemberId::try_new("member-alpha").unwrap()
@@ -208,16 +252,17 @@ mod tests {
     #[tokio::test]
     async fn mobile_claw_vpn_responder_preflight_writes_claw_hello_to_stream() {
         let (_td, store, rendezvous_token) = ready_store();
-        let (mut writer, mut reader) = tokio::io::duplex(1024);
-
-        mobile_claw_vpn_write_rendezvous_responder_hello(
-            &mut writer,
+        let preflight = mobile_claw_vpn_rendezvous_responder_preflight(
             &store,
             &rendezvous_token,
             &claw_alpha(),
         )
-        .await
         .unwrap();
+        let (mut writer, mut reader) = tokio::io::duplex(1024);
+
+        mobile_claw_vpn_write_rendezvous_responder_hello(&mut writer, preflight)
+            .await
+            .unwrap();
         drop(writer);
 
         let mut bytes = Vec::new();
@@ -260,23 +305,23 @@ mod tests {
         assert!(store.set_claw_available(claw_beta()).unwrap());
         let mut writer = PanicOnWrite;
 
-        let error = mobile_claw_vpn_write_rendezvous_responder_hello(
-            &mut writer,
+        let error = match mobile_claw_vpn_rendezvous_responder_preflight(
             &store,
             &rendezvous_token,
             &claw_beta(),
-        )
-        .await
-        .unwrap_err();
+        ) {
+            Ok(preflight) => {
+                mobile_claw_vpn_write_rendezvous_responder_hello(&mut writer, preflight)
+                    .await
+                    .unwrap();
+                panic!("wrong Claw must not produce a writable preflight");
+            }
+            Err(error) => error,
+        };
 
-        assert_eq!(error.kind(), "authorization_failed");
-        let auth_error = error.authorization_error().unwrap();
+        assert_eq!(error.operation(), "authorize_rendezvous_token_for_claw");
         assert_eq!(
-            auth_error.operation(),
-            "authorize_rendezvous_token_for_claw"
-        );
-        assert_eq!(
-            auth_error.model_error(),
+            error.model_error(),
             Some(ClawVpnMobileMeshError::SelectedClawMismatch)
         );
         assert!(!format!("{error:?}").contains("claw-beta"));
@@ -314,20 +359,100 @@ mod tests {
         }
 
         let (_td, store, rendezvous_token) = ready_store();
-        let mut writer = FailingWriter;
-
-        let error = mobile_claw_vpn_write_rendezvous_responder_hello(
-            &mut writer,
+        let preflight = mobile_claw_vpn_rendezvous_responder_preflight(
             &store,
             &rendezvous_token,
             &claw_alpha(),
         )
-        .await
-        .unwrap_err();
+        .unwrap();
+        let mut writer = FailingWriter;
+
+        let error = mobile_claw_vpn_write_rendezvous_responder_hello(&mut writer, preflight)
+            .await
+            .unwrap_err();
 
         assert_eq!(error.kind(), "hello_write_failed");
-        assert!(error.authorization_error().is_none());
         assert!(!format!("{error:?}").contains("203.0.113.10"));
         assert!(!error.to_string().contains("203.0.113.10"));
+    }
+
+    #[tokio::test]
+    async fn mobile_claw_vpn_responder_relay_dial_writes_claw_hello_to_loopback_socket() {
+        let (_td, store, rendezvous_token) = ready_store();
+        let preflight = mobile_claw_vpn_rendezvous_responder_preflight(
+            &store,
+            &rendezvous_token,
+            &claw_alpha(),
+        )
+        .unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let relay_addr = listener.local_addr().unwrap();
+        let accepted = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut hello_bytes = Vec::new();
+            stream.read_to_end(&mut hello_bytes).await.unwrap();
+            hello_bytes
+        });
+        let config = MobileClawVpnRendezvousRelayDialConfig {
+            relay_addr: Some(relay_addr),
+            connect_timeout: Duration::from_secs(1),
+            hello_timeout: Duration::from_secs(1),
+            allow_non_loopback_relay_addr: false,
+        };
+
+        mobile_claw_vpn_dial_rendezvous_relay_and_write_responder_hello(config, preflight)
+            .await
+            .unwrap();
+        let hello_bytes = timeout(Duration::from_secs(1), accepted)
+            .await
+            .unwrap()
+            .unwrap();
+        let decoded = RendezvousHello::decode(&hello_bytes).unwrap();
+
+        assert_eq!(decoded.role, RendezvousRole::Claw);
+        assert_eq!(decoded.token, rendezvous_token.relay_token().unwrap());
+    }
+
+    #[tokio::test]
+    async fn mobile_claw_vpn_responder_relay_dial_default_stays_inert() {
+        let preflight = MobileClawVpnRendezvousResponderPreflight {
+            hello: RendezvousHello::new(
+                RendezvousRole::Claw,
+                RendezvousToken::try_new(vec![0x42; 16]).unwrap(),
+            ),
+        };
+
+        mobile_claw_vpn_dial_rendezvous_relay_and_write_responder_hello(
+            MobileClawVpnRendezvousRelayDialConfig::default(),
+            preflight,
+        )
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn mobile_claw_vpn_responder_relay_dial_rejects_non_loopback_without_echo() {
+        let preflight = MobileClawVpnRendezvousResponderPreflight {
+            hello: RendezvousHello::new(
+                RendezvousRole::Claw,
+                RendezvousToken::try_new(vec![0x43; 16]).unwrap(),
+            ),
+        };
+        let config = MobileClawVpnRendezvousRelayDialConfig {
+            relay_addr: Some("198.51.100.10:49152".parse().unwrap()),
+            connect_timeout: Duration::from_secs(1),
+            hello_timeout: Duration::from_secs(1),
+            allow_non_loopback_relay_addr: false,
+        };
+
+        let error =
+            mobile_claw_vpn_dial_rendezvous_relay_and_write_responder_hello(config, preflight)
+                .await
+                .unwrap_err();
+
+        assert_eq!(error.kind(), "non_loopback_relay_addr");
+        assert!(!format!("{config:?}").contains("198.51.100.10"));
+        assert!(!format!("{error:?}").contains("198.51.100.10"));
+        assert!(!error.to_string().contains("198.51.100.10"));
     }
 }
