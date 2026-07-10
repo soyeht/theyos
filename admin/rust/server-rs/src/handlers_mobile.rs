@@ -2711,15 +2711,42 @@ mod tests {
                 .map(str::to_string)
                 .collect::<std::collections::BTreeSet<_>>()
         );
-        for (id, body) in requests {
+        let assert_request_keys = |id: &str, body: &serde_json::Value, expected: &[&str]| {
+            let object = body
+                .as_object()
+                .expect("request fixture body must be object");
+            assert_eq!(
+                object
+                    .keys()
+                    .cloned()
+                    .collect::<std::collections::BTreeSet<_>>(),
+                expected
+                    .iter()
+                    .copied()
+                    .map(str::to_string)
+                    .collect::<std::collections::BTreeSet<_>>(),
+                "{id} request must keep the exact public wire shape"
+            );
             assert!(
-                !body
-                    .as_object()
-                    .expect("request fixture body must be object")
-                    .contains_key("member_id"),
+                !object.contains_key("member_id"),
                 "{id} request must keep member server-derived"
             );
-        }
+        };
+        assert_request_keys(
+            "mint_offer",
+            &requests["mint_offer"],
+            &["claw_id", "device_id"],
+        );
+        assert_request_keys(
+            "consume_offer",
+            &requests["consume_offer"],
+            &["claw_id", "device_id", "offer_token"],
+        );
+        assert_request_keys(
+            "authorize_rendezvous",
+            &requests["authorize_rendezvous"],
+            &["claw_id", "device_id", "rendezvous_token"],
+        );
 
         let mint_request: MobileClawVpnOfferRequest =
             serde_json::from_value(requests["mint_offer"].clone()).unwrap();
