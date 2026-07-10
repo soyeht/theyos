@@ -121,10 +121,13 @@ impl MobileClawVpnRendezvousRelayDialConfig {
 
     pub(crate) fn validate_for_token_bearing_dial(
         self,
+        relay_auth: Option<&MobileClawVpnRendezvousRelayAuthProof>,
     ) -> Result<Self, MobileClawVpnRendezvousRelayDialError> {
         let config = self.validate_for_dial()?;
         if let Some(relay_addr) = config.relay_addr {
-            if !relay_addr.ip().is_loopback() {
+            if !relay_addr.ip().is_loopback()
+                && !relay_auth.is_some_and(|proof| proof.authorizes(relay_addr))
+            {
                 return Err(MobileClawVpnRendezvousRelayDialError::RelayAuthRequired);
             }
         }
@@ -143,6 +146,38 @@ impl MobileClawVpnRendezvousRelayDialConfig {
         validate_deadline(self.connect_timeout)?;
         validate_deadline(self.hello_timeout)?;
         Ok(self)
+    }
+}
+
+/// Proof that a non-loopback rendezvous relay peer was authenticated before a
+/// token-bearing hello is written.
+///
+/// This is intentionally opaque and has no production constructor yet. Until a
+/// future relay-auth seam can produce this proof after authenticating the peer,
+/// non-loopback token-bearing dials remain fail-closed with
+/// `relay_auth_required`.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct MobileClawVpnRendezvousRelayAuthProof {
+    relay_addr: SocketAddr,
+}
+
+impl MobileClawVpnRendezvousRelayAuthProof {
+    fn authorizes(self, relay_addr: SocketAddr) -> bool {
+        self.relay_addr == relay_addr
+    }
+
+    #[cfg(test)]
+    fn new_for_test(relay_addr: SocketAddr) -> Self {
+        Self { relay_addr }
+    }
+}
+
+impl fmt::Debug for MobileClawVpnRendezvousRelayAuthProof {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("MobileClawVpnRendezvousRelayAuthProof")
+            .field("kind", &"relay_peer_authenticated")
+            .field("relay_addr", &"<redacted>")
+            .finish()
     }
 }
 
@@ -380,12 +415,54 @@ mod tests {
         )
         .unwrap();
 
-        let error = config.validate_for_token_bearing_dial().unwrap_err();
+        let error = config.validate_for_token_bearing_dial(None).unwrap_err();
 
         assert_eq!(error.kind(), "relay_auth_required");
         assert!(!format!("{config:?}").contains("198.51.100.10"));
         assert!(!format!("{error:?}").contains("198.51.100.10"));
         assert!(!error.to_string().contains("198.51.100.10"));
+    }
+
+    #[test]
+    fn mobile_claw_vpn_relay_auth_proof_allows_non_loopback_token_bearing_dial() {
+        let relay_addr = "198.51.100.10:49152".parse().unwrap();
+        let config = MobileClawVpnRendezvousRelayDialConfig::from_values(
+            Some("198.51.100.10:49152"),
+            Some("true"),
+            None,
+            None,
+        )
+        .unwrap();
+        let proof = MobileClawVpnRendezvousRelayAuthProof::new_for_test(relay_addr);
+
+        let validated = config
+            .validate_for_token_bearing_dial(Some(&proof))
+            .unwrap();
+
+        assert_eq!(validated.relay_addr, config.relay_addr);
+        assert!(!format!("{proof:?}").contains("198.51.100.10"));
+    }
+
+    #[test]
+    fn mobile_claw_vpn_relay_auth_proof_is_bound_to_relay_addr() {
+        let config = MobileClawVpnRendezvousRelayDialConfig::from_values(
+            Some("198.51.100.10:49152"),
+            Some("true"),
+            None,
+            None,
+        )
+        .unwrap();
+        let proof = MobileClawVpnRendezvousRelayAuthProof::new_for_test(
+            "198.51.100.11:49152".parse().unwrap(),
+        );
+
+        let error = config
+            .validate_for_token_bearing_dial(Some(&proof))
+            .unwrap_err();
+
+        assert_eq!(error.kind(), "relay_auth_required");
+        assert!(!format!("{proof:?}").contains("198.51.100.11"));
+        assert!(!format!("{error:?}").contains("198.51.100.10"));
     }
 
     #[test]

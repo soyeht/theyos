@@ -10,7 +10,8 @@
 use std::fmt;
 
 use crate::mobile_claw_vpn_relay_dial_config::{
-    MobileClawVpnRendezvousRelayDialConfig, MobileClawVpnRendezvousRelayDialError,
+    MobileClawVpnRendezvousRelayAuthProof, MobileClawVpnRendezvousRelayDialConfig,
+    MobileClawVpnRendezvousRelayDialError,
 };
 use crate::mobile_claw_vpn_relay_responder_config::MobileClawVpnRelayResponderConfig;
 use crate::state::AppState;
@@ -184,13 +185,14 @@ where
 ///
 /// This helper does not resolve its own endpoint, read environment, expose a
 /// handler, or install any host networking. Non-loopback relay addresses remain
-/// disabled for token-bearing hello writes until a future relay-auth seam proves
-/// the peer before this helper writes the hello.
+/// disabled for token-bearing hello writes unless the caller supplies a
+/// relay-auth proof produced by a future peer-authentication seam.
 pub async fn mobile_claw_vpn_dial_rendezvous_relay_and_write_responder_hello(
     config: MobileClawVpnRendezvousRelayDialConfig,
     preflight: MobileClawVpnRendezvousResponderPreflight,
+    relay_auth: Option<&MobileClawVpnRendezvousRelayAuthProof>,
 ) -> Result<(), MobileClawVpnRendezvousRelayDialError> {
-    let config = config.validate_for_token_bearing_dial()?;
+    let config = config.validate_for_token_bearing_dial(relay_auth)?;
     if let Some(relay_addr) = config.relay_addr {
         let mut stream = timeout(config.connect_timeout, TcpStream::connect(relay_addr))
             .await
@@ -518,7 +520,7 @@ mod tests {
             allow_non_loopback_relay_addr: false,
         };
 
-        mobile_claw_vpn_dial_rendezvous_relay_and_write_responder_hello(config, preflight)
+        mobile_claw_vpn_dial_rendezvous_relay_and_write_responder_hello(config, preflight, None)
             .await
             .unwrap();
         let hello_bytes = timeout(Duration::from_secs(1), accepted)
@@ -543,6 +545,7 @@ mod tests {
         mobile_claw_vpn_dial_rendezvous_relay_and_write_responder_hello(
             MobileClawVpnRendezvousRelayDialConfig::default(),
             preflight,
+            None,
         )
         .await
         .unwrap();
@@ -563,10 +566,11 @@ mod tests {
             allow_non_loopback_relay_addr: false,
         };
 
-        let error =
-            mobile_claw_vpn_dial_rendezvous_relay_and_write_responder_hello(config, preflight)
-                .await
-                .unwrap_err();
+        let error = mobile_claw_vpn_dial_rendezvous_relay_and_write_responder_hello(
+            config, preflight, None,
+        )
+        .await
+        .unwrap_err();
 
         assert_eq!(error.kind(), "non_loopback_relay_addr");
         assert!(!format!("{config:?}").contains("198.51.100.10"));
@@ -589,10 +593,11 @@ mod tests {
             allow_non_loopback_relay_addr: true,
         };
 
-        let error =
-            mobile_claw_vpn_dial_rendezvous_relay_and_write_responder_hello(config, preflight)
-                .await
-                .unwrap_err();
+        let error = mobile_claw_vpn_dial_rendezvous_relay_and_write_responder_hello(
+            config, preflight, None,
+        )
+        .await
+        .unwrap_err();
 
         assert_eq!(error.kind(), "relay_auth_required");
         assert!(!format!("{config:?}").contains("198.51.100.10"));
