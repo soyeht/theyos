@@ -2204,6 +2204,7 @@ async fn mobile_claw_vpn_rendezvous_authorize_uses_state_relay_dial_config() {
         None,
         Some("1"),
         Some("1"),
+        None,
     )
     .unwrap();
     let state =

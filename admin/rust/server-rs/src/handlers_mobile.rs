@@ -3039,6 +3039,7 @@ mod tests {
             connect_timeout: Duration::from_secs(1),
             hello_timeout: Duration::from_secs(1),
             allow_non_loopback_relay_addr: false,
+            relay_peer_identity: None,
         };
 
         mobile_claw_vpn_dial_rendezvous_relay_and_write_guest_hello(config, preflight, None)
@@ -3079,6 +3080,7 @@ mod tests {
             connect_timeout: Duration::from_secs(1),
             hello_timeout: Duration::from_secs(1),
             allow_non_loopback_relay_addr: false,
+            relay_peer_identity: None,
         };
 
         let error =
@@ -3102,6 +3104,7 @@ mod tests {
             connect_timeout: Duration::from_secs(1),
             hello_timeout: Duration::from_secs(1),
             allow_non_loopback_relay_addr: true,
+            relay_peer_identity: None,
         };
 
         let error =
