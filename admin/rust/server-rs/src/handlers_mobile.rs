@@ -38,6 +38,7 @@ use household_rs::{
 use percent_encoding::{AsciiSet, CONTROLS, utf8_percent_encode};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use tokio::io::{AsyncWrite, AsyncWriteExt};
 use vmrunner_common_rs::VmCreateResourceSpec;
 
 const DEEP_LINK_QUERY_VALUE_SET: &AsciiSet = &CONTROLS
@@ -674,6 +675,18 @@ fn mobile_claw_vpn_rendezvous_dial_preflight(
     Ok(MobileClawVpnRendezvousDialPreflight::guest(relay_token))
 }
 
+async fn mobile_claw_vpn_write_rendezvous_guest_hello<W>(
+    writer: &mut W,
+    dial_preflight: MobileClawVpnRendezvousDialPreflight,
+) -> std::io::Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
+    let hello_bytes = dial_preflight.into_hello_bytes();
+    writer.write_all(&hello_bytes).await?;
+    writer.flush().await
+}
+
 /// Detect the best host for the QR code based on available network channels.
 ///
 /// Priority: Cloudflare (public) > Tailscale (private) > LAN > localhost.
@@ -1095,7 +1108,7 @@ pub async fn handle_mobile_claw_vpn_authorize_rendezvous(
     let grant = mobile_claw_vpn_rendezvous_grant(username, &req)?;
     let rendezvous_token = mobile_claw_vpn_rendezvous_token(req.rendezvous)?;
     let store = state.mobile_claw_vpn_mesh.clone();
-    let status = blocking(move || {
+    let (dial_preflight, status) = blocking(move || {
         let dial_preflight = mobile_claw_vpn_rendezvous_dial_preflight(
             &store,
             &rendezvous_token,
@@ -1104,12 +1117,18 @@ pub async fn handle_mobile_claw_vpn_authorize_rendezvous(
         .map_err(|error| {
             mobile_claw_vpn_rendezvous_store_error(error, "mobile Claw VPN rendezvous unavailable")
         })?;
-        let _hello_bytes = dial_preflight.into_hello_bytes();
-        store.status().map_err(|error| {
+        let status = store.status().map_err(|error| {
             mobile_claw_vpn_rendezvous_store_error(error, "mobile Claw VPN rendezvous unavailable")
-        })
+        })?;
+        Ok::<_, ApiError>((dial_preflight, status))
     })
     .await??;
+    let mut hello_writer = tokio::io::sink();
+    mobile_claw_vpn_write_rendezvous_guest_hello(&mut hello_writer, dial_preflight)
+        .await
+        .map_err(|_error| {
+            ApiError::service_unavailable("mobile Claw VPN rendezvous unavailable")
+        })?;
     Ok((
         StatusCode::OK,
         Json(mobile_claw_vpn_rendezvous_authorize_response(
@@ -2379,6 +2398,7 @@ pub async fn handle_mobile_uninstall_claw(
 mod tests {
     use super::*;
     use core_rs::network_detect::{CaddyStatus, ChannelStatus, NetworkStatus};
+    use tokio::io::AsyncReadExt;
 
     fn make_channel(channel_type: &str, detected: bool) -> ChannelStatus {
         ChannelStatus {
@@ -2700,6 +2720,51 @@ mod tests {
         let preflight =
             mobile_claw_vpn_rendezvous_dial_preflight(&store, &rendezvous_token, &grant).unwrap();
         let decoded = RendezvousHello::decode(&preflight.into_hello_bytes()).unwrap();
+
+        assert_eq!(decoded.role, RendezvousRole::Guest);
+        assert_eq!(decoded.token, rendezvous_token.relay_token().unwrap());
+    }
+
+    #[tokio::test]
+    async fn mobile_claw_vpn_rendezvous_dial_preflight_writes_guest_hello_to_stream() {
+        let td = tempfile::tempdir().unwrap();
+        let store =
+            household_rs::claw_vpn_mobile_mesh_store::ClawVpnMobileMeshStore::new(td.path(), 600)
+                .unwrap();
+        let member =
+            household_rs::claw_vpn_mobile_state::ClawVpnMobileMemberId::try_new("member-alpha")
+                .unwrap();
+        let device =
+            household_rs::claw_vpn_mobile_state::ClawVpnMobileDeviceId::try_new("device-alpha")
+                .unwrap();
+        let claw = household_rs::claw_vpn_mobile_state::ClawVpnMobileClawId::try_new("claw-alpha")
+            .unwrap();
+        let grant = household_rs::claw_vpn_mobile_state::ClawVpnMobileAclGrant::new(
+            member,
+            device.clone(),
+            claw.clone(),
+        );
+
+        assert!(store.owner_approved_enroll_device(device).unwrap());
+        assert!(store.set_claw_available(claw).unwrap());
+        assert!(store.owner_approved_grant(grant.clone()).unwrap());
+        let offer_token = store.mint_offer_token(&grant, 100).unwrap();
+        let rendezvous_token = store
+            .consume_offer_token(&offer_token, &grant, 101)
+            .unwrap();
+
+        let preflight =
+            mobile_claw_vpn_rendezvous_dial_preflight(&store, &rendezvous_token, &grant).unwrap();
+        let (mut writer, mut reader) = tokio::io::duplex(1024);
+
+        mobile_claw_vpn_write_rendezvous_guest_hello(&mut writer, preflight)
+            .await
+            .unwrap();
+        drop(writer);
+
+        let mut hello_bytes = Vec::new();
+        reader.read_to_end(&mut hello_bytes).await.unwrap();
+        let decoded = RendezvousHello::decode(&hello_bytes).unwrap();
 
         assert_eq!(decoded.role, RendezvousRole::Guest);
         assert_eq!(decoded.token, rendezvous_token.relay_token().unwrap());
