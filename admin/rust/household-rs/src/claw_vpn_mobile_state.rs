@@ -868,6 +868,30 @@ impl ClawVpnMobileMesh {
         token.relay_token()
     }
 
+    /// Authorizes Claw-responder use of an active rendezvous token.
+    ///
+    /// The caller must provide the selected Claw identity from local trusted
+    /// responder context, not from a public request body.
+    pub fn authorize_rendezvous_token_for_claw(
+        &self,
+        token: &ClawVpnMobileRendezvousToken,
+        claw: &ClawVpnMobileClawId,
+    ) -> Result<RendezvousToken, ClawVpnMobileMeshError> {
+        if !self.available_claws.contains(claw) {
+            return Err(ClawVpnMobileMeshError::ClawUnavailable);
+        }
+        let session = self
+            .sessions
+            .values()
+            .find(|session| &session.rendezvous_token == token)
+            .ok_or(ClawVpnMobileMeshError::UnknownSession)?;
+        if &session.grant.claw != claw {
+            return Err(ClawVpnMobileMeshError::SelectedClawMismatch);
+        }
+        self.check_grant_ready(&session.grant)?;
+        token.relay_token()
+    }
+
     pub fn close_session(
         &mut self,
         session_id: ClawVpnMobileSessionId,
@@ -1494,6 +1518,39 @@ mod tests {
         assert_eq!(unavailable.closed_session_count(), 1);
         assert_eq!(
             mesh.authorize_rendezvous_token(&token, &grant_m),
+            Err(ClawVpnMobileMeshError::ClawUnavailable)
+        );
+    }
+
+    #[test]
+    fn mobile_mesh_authorizes_claw_rendezvous_only_for_selected_claw_session() {
+        let grant_m = grant_for(claw_m());
+        let grant_l = grant_for(claw_l());
+        let mut mesh = ready_mesh(&grant_m);
+        assert!(mesh.set_claw_available(claw_l()));
+        assert!(mesh.grant(grant_l));
+        let offer = mint_offer(&mut mesh, &grant_m, 10, 1).unwrap();
+        let _session = consume_offer(&mut mesh, offer, &grant_m, 20, 1).unwrap();
+        let token = rendezvous_token(1);
+
+        let relay_token = mesh
+            .authorize_rendezvous_token_for_claw(&token, &claw_m())
+            .expect("matching Claw session token authorizes");
+        assert_eq!(relay_token.len(), 16);
+        assert_eq!(
+            mesh.authorize_rendezvous_token_for_claw(&token, &claw_l()),
+            Err(ClawVpnMobileMeshError::SelectedClawMismatch)
+        );
+        assert_eq!(
+            mesh.authorize_rendezvous_token_for_claw(&rendezvous_token(2), &claw_m()),
+            Err(ClawVpnMobileMeshError::UnknownSession)
+        );
+
+        let unavailable = mesh.set_claw_unavailable(&claw_m());
+        assert!(unavailable.changed());
+        assert_eq!(unavailable.closed_session_count(), 1);
+        assert_eq!(
+            mesh.authorize_rendezvous_token_for_claw(&token, &claw_m()),
             Err(ClawVpnMobileMeshError::ClawUnavailable)
         );
     }
