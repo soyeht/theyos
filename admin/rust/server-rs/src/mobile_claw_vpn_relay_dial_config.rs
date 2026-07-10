@@ -157,6 +157,35 @@ impl MobileClawVpnRendezvousRelayDialConfig {
         Ok(config)
     }
 
+    /// Mints a token-bearing dial proof from an already-authenticated
+    /// non-loopback relay peer.
+    ///
+    /// This does not authenticate the peer by itself. It only consumes the
+    /// opaque authenticated-peer capability that a future relay-auth seam must
+    /// produce after cryptographically proving the peer identity.
+    pub fn relay_auth_proof_for_authenticated_non_loopback_peer(
+        self,
+        authenticated_peer: &MobileClawVpnRendezvousAuthenticatedRelayPeer,
+    ) -> Result<MobileClawVpnRendezvousRelayAuthProof, MobileClawVpnRendezvousRelayDialError> {
+        let config = self.validate_for_dial()?;
+        let Some(relay_addr) = config.relay_addr else {
+            return Err(MobileClawVpnRendezvousRelayDialError::RelayAuthRequired);
+        };
+        if relay_addr.ip().is_loopback() {
+            return Err(MobileClawVpnRendezvousRelayDialError::RelayAuthRequired);
+        }
+        let Some(relay_peer_identity) = config.relay_peer_identity else {
+            return Err(MobileClawVpnRendezvousRelayDialError::RelayAuthRequired);
+        };
+        if !authenticated_peer.authorizes(relay_addr, relay_peer_identity) {
+            return Err(MobileClawVpnRendezvousRelayDialError::RelayAuthRequired);
+        }
+        Ok(MobileClawVpnRendezvousRelayAuthProof {
+            relay_addr,
+            relay_peer_identity,
+        })
+    }
+
     fn validate_config(self) -> Result<Self, MobileClawVpnRendezvousRelayDialConfigError> {
         if self.relay_addr.is_none() && self.relay_peer_identity.is_some() {
             return Err(
@@ -174,6 +203,49 @@ impl MobileClawVpnRendezvousRelayDialConfig {
         validate_deadline(self.connect_timeout)?;
         validate_deadline(self.hello_timeout)?;
         Ok(self)
+    }
+}
+
+/// Opaque result of cryptographically authenticating a rendezvous relay peer.
+///
+/// This type is deliberately separate from configuration. Possessing a relay
+/// address or expected identity does not create one; a future relay-auth seam
+/// must mint it only after the peer proves possession of the configured relay
+/// identity key.
+#[derive(PartialEq, Eq)]
+pub struct MobileClawVpnRendezvousAuthenticatedRelayPeer {
+    relay_addr: SocketAddr,
+    relay_peer_identity: MobileClawVpnRendezvousRelayPeerIdentity,
+}
+
+impl MobileClawVpnRendezvousAuthenticatedRelayPeer {
+    fn authorizes(
+        &self,
+        relay_addr: SocketAddr,
+        relay_peer_identity: MobileClawVpnRendezvousRelayPeerIdentity,
+    ) -> bool {
+        self.relay_addr == relay_addr && self.relay_peer_identity == relay_peer_identity
+    }
+
+    #[cfg(test)]
+    fn new_for_test(
+        relay_addr: SocketAddr,
+        relay_peer_identity: MobileClawVpnRendezvousRelayPeerIdentity,
+    ) -> Self {
+        Self {
+            relay_addr,
+            relay_peer_identity,
+        }
+    }
+}
+
+impl fmt::Debug for MobileClawVpnRendezvousAuthenticatedRelayPeer {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("MobileClawVpnRendezvousAuthenticatedRelayPeer")
+            .field("kind", &"relay_peer_authenticated")
+            .field("relay_addr", &"<redacted>")
+            .field("relay_peer_identity", &"<redacted>")
+            .finish()
     }
 }
 
@@ -659,6 +731,117 @@ mod tests {
         assert_eq!(error.kind(), "relay_auth_required");
         assert!(!format!("{proof:?}").contains(PEER_IDENTITY_B));
         assert!(!format!("{error:?}").contains(PEER_IDENTITY_A));
+    }
+
+    #[test]
+    fn mobile_claw_vpn_relay_auth_proof_mints_from_authenticated_peer() {
+        let relay_addr = "198.51.100.10:49152".parse().unwrap();
+        let config = MobileClawVpnRendezvousRelayDialConfig::from_values(
+            Some("198.51.100.10:49152"),
+            Some("true"),
+            None,
+            None,
+            Some(PEER_IDENTITY_A),
+        )
+        .unwrap();
+        let authenticated_peer = MobileClawVpnRendezvousAuthenticatedRelayPeer::new_for_test(
+            relay_addr,
+            config.relay_peer_identity.unwrap(),
+        );
+        let peer_debug = format!("{authenticated_peer:?}");
+
+        let proof = config
+            .relay_auth_proof_for_authenticated_non_loopback_peer(&authenticated_peer)
+            .unwrap();
+        let validated = config
+            .validate_for_token_bearing_dial(Some(&proof))
+            .unwrap();
+
+        assert_eq!(validated.relay_addr, config.relay_addr);
+        assert_eq!(validated.relay_peer_identity, config.relay_peer_identity);
+        assert!(!peer_debug.contains("198.51.100.10"));
+        assert!(!peer_debug.contains(PEER_IDENTITY_A));
+        assert!(!format!("{proof:?}").contains("198.51.100.10"));
+        assert!(!format!("{proof:?}").contains(PEER_IDENTITY_A));
+    }
+
+    #[test]
+    fn mobile_claw_vpn_relay_auth_proof_mint_requires_configured_peer_identity() {
+        let relay_addr = "198.51.100.10:49152".parse().unwrap();
+        let config = MobileClawVpnRendezvousRelayDialConfig::from_values(
+            Some("198.51.100.10:49152"),
+            Some("true"),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        let peer_identity = parse_optional_relay_peer_identity(Some(PEER_IDENTITY_A))
+            .unwrap()
+            .unwrap();
+        let authenticated_peer =
+            MobileClawVpnRendezvousAuthenticatedRelayPeer::new_for_test(relay_addr, peer_identity);
+
+        let error = config
+            .relay_auth_proof_for_authenticated_non_loopback_peer(&authenticated_peer)
+            .unwrap_err();
+
+        assert_eq!(error.kind(), "relay_auth_required");
+        assert!(!format!("{config:?}").contains("198.51.100.10"));
+        assert!(!format!("{error:?}").contains("198.51.100.10"));
+        assert!(!error.to_string().contains(PEER_IDENTITY_A));
+    }
+
+    #[test]
+    fn mobile_claw_vpn_relay_auth_proof_mint_is_bound_to_authenticated_addr() {
+        let config = MobileClawVpnRendezvousRelayDialConfig::from_values(
+            Some("198.51.100.10:49152"),
+            Some("true"),
+            None,
+            None,
+            Some(PEER_IDENTITY_A),
+        )
+        .unwrap();
+        let authenticated_peer = MobileClawVpnRendezvousAuthenticatedRelayPeer::new_for_test(
+            "198.51.100.11:49152".parse().unwrap(),
+            config.relay_peer_identity.unwrap(),
+        );
+        let peer_debug = format!("{authenticated_peer:?}");
+
+        let error = config
+            .relay_auth_proof_for_authenticated_non_loopback_peer(&authenticated_peer)
+            .unwrap_err();
+
+        assert_eq!(error.kind(), "relay_auth_required");
+        assert!(!peer_debug.contains("198.51.100.11"));
+        assert!(!format!("{error:?}").contains("198.51.100.10"));
+        assert!(!error.to_string().contains(PEER_IDENTITY_A));
+    }
+
+    #[test]
+    fn mobile_claw_vpn_relay_auth_proof_mint_is_bound_to_authenticated_identity() {
+        let relay_addr = "198.51.100.10:49152".parse().unwrap();
+        let config = MobileClawVpnRendezvousRelayDialConfig::from_values(
+            Some("198.51.100.10:49152"),
+            Some("true"),
+            None,
+            None,
+            Some(PEER_IDENTITY_A),
+        )
+        .unwrap();
+        let other_identity = parse_optional_relay_peer_identity(Some(PEER_IDENTITY_B))
+            .unwrap()
+            .unwrap();
+        let authenticated_peer =
+            MobileClawVpnRendezvousAuthenticatedRelayPeer::new_for_test(relay_addr, other_identity);
+
+        let error = config
+            .relay_auth_proof_for_authenticated_non_loopback_peer(&authenticated_peer)
+            .unwrap_err();
+
+        assert_eq!(error.kind(), "relay_auth_required");
+        assert!(!format!("{error:?}").contains(PEER_IDENTITY_A));
+        assert!(!error.to_string().contains(PEER_IDENTITY_B));
     }
 
     #[test]
