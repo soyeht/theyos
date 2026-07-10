@@ -28,6 +28,7 @@ use server_rs::household_attach_token::{
 };
 use server_rs::household_state::HouseholdState;
 use server_rs::mobile_claw_vpn_relay_dial_config::MobileClawVpnRendezvousRelayDialConfig;
+use server_rs::mobile_claw_vpn_relay_responder_config::MobileClawVpnRelayResponderConfig;
 use server_rs::ratelimit::Limiter;
 use server_rs::state::{AppState, SharedState};
 use session_rs::SessionStore;
@@ -270,6 +271,7 @@ fn shared_state() -> SharedState {
             .expect("mobile session db"),
         mobile_claw_vpn_mesh,
         mobile_claw_vpn_relay_dial: MobileClawVpnRendezvousRelayDialConfig::default(),
+        mobile_claw_vpn_relay_responder: MobileClawVpnRelayResponderConfig::default(),
         claw_store: claw_rs::ClawStore::new(&claw_path).expect("claw store"),
         theyos_dir: std::path::PathBuf::from("/tmp/theyos-test"),
         locks_dir: std::path::PathBuf::from("/tmp/theyos-test-locks"),

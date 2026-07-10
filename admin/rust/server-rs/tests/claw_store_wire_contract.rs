@@ -43,6 +43,7 @@ use server_rs::{
     household_attach_token::{HouseholdAttachScope, HouseholdAttachTokenStore},
     household_state::HouseholdState,
     mobile_claw_vpn_relay_dial_config::MobileClawVpnRendezvousRelayDialConfig,
+    mobile_claw_vpn_relay_responder_config::MobileClawVpnRelayResponderConfig,
     ratelimit::Limiter,
     responses::{ClawDetailResponse, ClawJobResponse, ClawListItemResponse, ListResponse},
     state::{AppState, SharedState},
@@ -116,6 +117,18 @@ fn shared_state_with_claw_store(claw_store: claw_rs::ClawStore) -> SharedState {
 fn shared_state_with_claw_store_and_mobile_relay_dial(
     claw_store: claw_rs::ClawStore,
     mobile_claw_vpn_relay_dial: MobileClawVpnRendezvousRelayDialConfig,
+) -> SharedState {
+    shared_state_with_claw_store_and_mobile_configs(
+        claw_store,
+        mobile_claw_vpn_relay_dial,
+        MobileClawVpnRelayResponderConfig::default(),
+    )
+}
+
+fn shared_state_with_claw_store_and_mobile_configs(
+    claw_store: claw_rs::ClawStore,
+    mobile_claw_vpn_relay_dial: MobileClawVpnRendezvousRelayDialConfig,
+    mobile_claw_vpn_relay_responder: MobileClawVpnRelayResponderConfig,
 ) -> SharedState {
     let _env_guard = ENV_LOCK
         .lock()
@@ -197,12 +210,31 @@ fn shared_state_with_claw_store_and_mobile_relay_dial(
             .expect("mobile session db"),
         mobile_claw_vpn_mesh,
         mobile_claw_vpn_relay_dial,
+        mobile_claw_vpn_relay_responder,
         claw_store,
         theyos_dir: theyos_path,
         locks_dir: locks_path,
         capacity_lock: tokio::sync::Mutex::new(()),
         llm_proxy_client: server_rs::handlers_llm::ProxyClient::from_env(),
     })
+}
+
+#[test]
+fn mobile_claw_vpn_relay_responder_config_reaches_app_state_when_configured() {
+    let responder_config =
+        MobileClawVpnRelayResponderConfig::from_values(Some("true"), Some("claw-alpha")).unwrap();
+    let state = shared_state_with_claw_store_and_mobile_configs(
+        default_claw_store(),
+        MobileClawVpnRendezvousRelayDialConfig::default(),
+        responder_config,
+    );
+
+    assert!(state.mobile_claw_vpn_relay_responder.is_configured());
+    assert_eq!(
+        state.mobile_claw_vpn_relay_responder.claw().unwrap(),
+        &household_rs::claw_vpn_mobile_state::ClawVpnMobileClawId::try_new("claw-alpha").unwrap()
+    );
+    assert!(!format!("{:?}", state.mobile_claw_vpn_relay_responder).contains("claw-alpha"));
 }
 
 fn admin_router(state: SharedState) -> Router {
