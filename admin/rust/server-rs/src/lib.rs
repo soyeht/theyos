@@ -107,6 +107,7 @@ pub mod jobs_worker;
 pub mod lease_reaper;
 pub mod macos_local_caller_auth;
 pub mod macos_local_registration_listener;
+pub mod mobile_claw_vpn_relay_dial_config;
 pub mod mobile_token;
 pub mod nonce_cache;
 pub mod owner_cert_auth;

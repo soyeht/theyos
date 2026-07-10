@@ -40,6 +40,7 @@ use server_rs::{
         handle_create_conversation, handle_delete_conversation, handle_list_conversations,
         handle_rename_conversation,
     },
+    mobile_claw_vpn_relay_dial_config::MobileClawVpnRendezvousRelayDialConfig,
     public_sites::public_site_gateway,
     ratelimit::Limiter,
     state::{AppState, SharedState},
@@ -268,6 +269,7 @@ impl TestFixture {
             mobile_sessions: server_rs::mobile_token::MobileSessionDb::open(":memory:")
                 .expect("mobile session db"),
             mobile_claw_vpn_mesh,
+            mobile_claw_vpn_relay_dial: MobileClawVpnRendezvousRelayDialConfig::default(),
             claw_store,
             theyos_dir: std::path::PathBuf::from("/tmp/theyos-test"),
             locks_dir: std::path::PathBuf::from("/tmp/theyos-test-locks"),
