@@ -4,7 +4,15 @@
 //! Mesh-C state, open sockets, write relay hellos, start Relay-R, install
 //! routes, or mutate host networking.
 
-use std::{fmt, net::SocketAddr, time::Duration};
+use std::{
+    fmt,
+    net::{IpAddr, SocketAddr},
+    time::Duration,
+};
+
+use household_rs::keys::{P256PublicKey, P256Signature, verify_signature};
+use rand::{RngCore, rngs::OsRng};
+use sha2::{Digest, Sha256};
 
 pub const MOBILE_CLAW_VPN_RELAY_DIAL_ADDR_ENV: &str = "THEYOS_MOBILE_CLAW_VPN_RELAY_DIAL_ADDR";
 pub const MOBILE_CLAW_VPN_RELAY_DIAL_ALLOW_NON_LOOPBACK_ENV: &str =
@@ -21,6 +29,8 @@ pub const DEFAULT_MOBILE_CLAW_VPN_RELAY_DIAL_HELLO_TIMEOUT: Duration = Duration:
 pub const MAX_MOBILE_CLAW_VPN_RELAY_DIAL_TIMEOUT: Duration = Duration::from_secs(30);
 const RELAY_PEER_IDENTITY_SHA256_LEN: usize = 32;
 const RELAY_PEER_IDENTITY_SHA256_HEX_LEN: usize = RELAY_PEER_IDENTITY_SHA256_LEN * 2;
+const RELAY_AUTH_CHALLENGE_LEN: usize = 32;
+const RELAY_AUTH_SIGNING_CONTEXT: &[u8] = b"theyos-mobile-claw-vpn-rendezvous-relay-auth-v1";
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct MobileClawVpnRendezvousRelayDialConfig {
@@ -219,6 +229,35 @@ pub struct MobileClawVpnRendezvousAuthenticatedRelayPeer {
 }
 
 impl MobileClawVpnRendezvousAuthenticatedRelayPeer {
+    /// Verifies a relay proof-of-possession signature and returns an
+    /// authenticated-peer capability bound to the exact socket address and
+    /// identity key that produced it.
+    ///
+    /// This deliberately does not read configuration and does not mint a dial
+    /// proof. The caller must still pass the returned capability through
+    /// [`MobileClawVpnRendezvousRelayDialConfig::relay_auth_proof_for_authenticated_non_loopback_peer`],
+    /// which compares the verified peer identity to the locally configured
+    /// expectation before allowing token-bearing non-loopback dials.
+    pub fn from_signed_challenge(
+        relay_addr: SocketAddr,
+        relay_public_key: &P256PublicKey,
+        challenge: &MobileClawVpnRendezvousRelayAuthChallenge,
+        signature: &P256Signature,
+    ) -> Result<Self, MobileClawVpnRendezvousRelayDialError> {
+        if relay_addr.ip().is_loopback() {
+            return Err(MobileClawVpnRendezvousRelayDialError::RelayAuthRequired);
+        }
+        let signing_bytes = challenge.signing_bytes(relay_addr, relay_public_key);
+        verify_signature(relay_public_key, &signing_bytes, signature)
+            .map_err(|_| MobileClawVpnRendezvousRelayDialError::RelayAuthRequired)?;
+        Ok(Self {
+            relay_addr,
+            relay_peer_identity: MobileClawVpnRendezvousRelayPeerIdentity::from_relay_public_key(
+                relay_public_key,
+            ),
+        })
+    }
+
     fn authorizes(
         &self,
         relay_addr: SocketAddr,
@@ -249,6 +288,53 @@ impl fmt::Debug for MobileClawVpnRendezvousAuthenticatedRelayPeer {
     }
 }
 
+/// Fresh challenge bytes that the relay peer must sign before a token-bearing
+/// non-loopback dial can be authorized.
+///
+/// The challenge is not secret, but its bytes are redacted to avoid accidental
+/// copy/paste into logs and tickets. The production relay-auth handshake must
+/// generate a fresh challenge for each peer authentication attempt.
+pub struct MobileClawVpnRendezvousRelayAuthChallenge {
+    nonce: [u8; RELAY_AUTH_CHALLENGE_LEN],
+}
+
+impl MobileClawVpnRendezvousRelayAuthChallenge {
+    #[must_use]
+    pub fn generate() -> Self {
+        let mut nonce = [0_u8; RELAY_AUTH_CHALLENGE_LEN];
+        OsRng.fill_bytes(&mut nonce);
+        Self { nonce }
+    }
+
+    /// Returns the exact domain-separated bytes a relay identity key must sign.
+    ///
+    /// The transcript binds the proof to the target socket address, challenge,
+    /// and relay public key. A signature produced for one address cannot be
+    /// replayed to authenticate another address.
+    #[must_use]
+    pub fn signing_bytes(
+        &self,
+        relay_addr: SocketAddr,
+        relay_public_key: &P256PublicKey,
+    ) -> Vec<u8> {
+        relay_auth_signing_bytes(self, relay_addr, relay_public_key)
+    }
+
+    #[cfg(test)]
+    fn new_for_test(nonce: [u8; RELAY_AUTH_CHALLENGE_LEN]) -> Self {
+        Self { nonce }
+    }
+}
+
+impl fmt::Debug for MobileClawVpnRendezvousRelayAuthChallenge {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("MobileClawVpnRendezvousRelayAuthChallenge")
+            .field("kind", &"relay_auth_challenge")
+            .field("nonce", &"<redacted>")
+            .finish()
+    }
+}
+
 /// Opaque identity of the authenticated rendezvous relay peer.
 ///
 /// This is a configuration-side expectation, not proof by itself. The future
@@ -257,6 +343,22 @@ impl fmt::Debug for MobileClawVpnRendezvousAuthenticatedRelayPeer {
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct MobileClawVpnRendezvousRelayPeerIdentity {
     sha256: [u8; RELAY_PEER_IDENTITY_SHA256_LEN],
+}
+
+impl MobileClawVpnRendezvousRelayPeerIdentity {
+    /// Derives the config-side relay peer identity from the authenticated relay
+    /// public key bytes.
+    ///
+    /// This is not authorization by itself. It is the stable identity value that
+    /// configuration stores and that an authenticated-peer capability must match
+    /// before a non-loopback token-bearing dial is allowed.
+    #[must_use]
+    pub fn from_relay_public_key(relay_public_key: &P256PublicKey) -> Self {
+        let digest = Sha256::digest(relay_public_key.as_bytes());
+        let mut sha256 = [0_u8; RELAY_PEER_IDENTITY_SHA256_LEN];
+        sha256.copy_from_slice(&digest);
+        Self { sha256 }
+    }
 }
 
 impl fmt::Debug for MobileClawVpnRendezvousRelayPeerIdentity {
@@ -340,6 +442,38 @@ fn parse_optional_relay_addr(
     raw.parse::<SocketAddr>()
         .map(Some)
         .map_err(|_| MobileClawVpnRendezvousRelayDialConfigError::InvalidRelayAddr)
+}
+
+fn relay_auth_signing_bytes(
+    challenge: &MobileClawVpnRendezvousRelayAuthChallenge,
+    relay_addr: SocketAddr,
+    relay_public_key: &P256PublicKey,
+) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(
+        RELAY_AUTH_SIGNING_CONTEXT.len()
+            + 1
+            + 1
+            + 16
+            + 2
+            + RELAY_AUTH_CHALLENGE_LEN
+            + P256PublicKey::LEN,
+    );
+    bytes.extend_from_slice(RELAY_AUTH_SIGNING_CONTEXT);
+    bytes.push(0);
+    match relay_addr.ip() {
+        IpAddr::V4(ip) => {
+            bytes.push(4);
+            bytes.extend_from_slice(&ip.octets());
+        }
+        IpAddr::V6(ip) => {
+            bytes.push(6);
+            bytes.extend_from_slice(&ip.octets());
+        }
+    }
+    bytes.extend_from_slice(&relay_addr.port().to_be_bytes());
+    bytes.extend_from_slice(&challenge.nonce);
+    bytes.extend_from_slice(relay_public_key.as_bytes());
+    bytes
 }
 
 fn parse_bool(raw: Option<&str>) -> Result<bool, MobileClawVpnRendezvousRelayDialConfigError> {
@@ -523,6 +657,7 @@ impl std::error::Error for MobileClawVpnRendezvousRelayDialError {}
 #[cfg(test)]
 mod tests {
     use super::*;
+    use household_rs::keys::{IdentityKey, P256Keypair};
 
     const PEER_IDENTITY_A: &str =
         "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
@@ -842,6 +977,183 @@ mod tests {
         assert_eq!(error.kind(), "relay_auth_required");
         assert!(!format!("{error:?}").contains(PEER_IDENTITY_A));
         assert!(!error.to_string().contains(PEER_IDENTITY_B));
+    }
+
+    #[test]
+    fn mobile_claw_vpn_relay_auth_peer_verifies_signed_challenge_and_mints_proof() {
+        let relay_addr = "198.51.100.10:49152".parse().unwrap();
+        let relay_key = P256Keypair::generate();
+        let relay_public_key = relay_key.public();
+        let relay_peer_identity =
+            MobileClawVpnRendezvousRelayPeerIdentity::from_relay_public_key(&relay_public_key);
+        let config = MobileClawVpnRendezvousRelayDialConfig {
+            relay_addr: Some(relay_addr),
+            connect_timeout: DEFAULT_MOBILE_CLAW_VPN_RELAY_DIAL_CONNECT_TIMEOUT,
+            hello_timeout: DEFAULT_MOBILE_CLAW_VPN_RELAY_DIAL_HELLO_TIMEOUT,
+            allow_non_loopback_relay_addr: true,
+            relay_peer_identity: Some(relay_peer_identity),
+        };
+        let challenge = MobileClawVpnRendezvousRelayAuthChallenge::new_for_test([0xA1; 32]);
+        let signature = relay_key
+            .sign(&challenge.signing_bytes(relay_addr, &relay_public_key))
+            .unwrap();
+
+        let authenticated_peer =
+            MobileClawVpnRendezvousAuthenticatedRelayPeer::from_signed_challenge(
+                relay_addr,
+                &relay_public_key,
+                &challenge,
+                &signature,
+            )
+            .unwrap();
+        let proof = config
+            .relay_auth_proof_for_authenticated_non_loopback_peer(&authenticated_peer)
+            .unwrap();
+        let validated = config
+            .validate_for_token_bearing_dial(Some(&proof))
+            .unwrap();
+
+        assert_eq!(validated.relay_addr, Some(relay_addr));
+        assert_eq!(validated.relay_peer_identity, Some(relay_peer_identity));
+        assert!(!format!("{challenge:?}").contains("a1a1"));
+        assert!(!format!("{authenticated_peer:?}").contains("198.51.100.10"));
+        assert!(!format!("{proof:?}").contains("198.51.100.10"));
+    }
+
+    #[test]
+    fn mobile_claw_vpn_relay_auth_peer_rejects_signature_from_wrong_key_without_echo() {
+        let relay_addr = "198.51.100.10:49152".parse().unwrap();
+        let relay_key = P256Keypair::generate();
+        let relay_public_key = relay_key.public();
+        let attacker_key = P256Keypair::generate();
+        let challenge = MobileClawVpnRendezvousRelayAuthChallenge::new_for_test([0xB2; 32]);
+        let signature = attacker_key
+            .sign(&challenge.signing_bytes(relay_addr, &relay_public_key))
+            .unwrap();
+        let public_key_hex = hex::encode(relay_public_key.as_bytes());
+
+        let error = MobileClawVpnRendezvousAuthenticatedRelayPeer::from_signed_challenge(
+            relay_addr,
+            &relay_public_key,
+            &challenge,
+            &signature,
+        )
+        .unwrap_err();
+
+        assert_eq!(error.kind(), "relay_auth_required");
+        assert!(!format!("{error:?}").contains("198.51.100.10"));
+        assert!(!format!("{error:?}").contains(&public_key_hex));
+        assert!(!error.to_string().contains("198.51.100.10"));
+    }
+
+    #[test]
+    fn mobile_claw_vpn_relay_auth_peer_signature_is_bound_to_relay_addr() {
+        let signed_addr = "198.51.100.10:49152".parse().unwrap();
+        let attempted_addr = "198.51.100.11:49152".parse().unwrap();
+        let relay_key = P256Keypair::generate();
+        let relay_public_key = relay_key.public();
+        let challenge = MobileClawVpnRendezvousRelayAuthChallenge::new_for_test([0xC3; 32]);
+        let signature = relay_key
+            .sign(&challenge.signing_bytes(signed_addr, &relay_public_key))
+            .unwrap();
+
+        let error = MobileClawVpnRendezvousAuthenticatedRelayPeer::from_signed_challenge(
+            attempted_addr,
+            &relay_public_key,
+            &challenge,
+            &signature,
+        )
+        .unwrap_err();
+
+        assert_eq!(error.kind(), "relay_auth_required");
+        assert!(!format!("{error:?}").contains("198.51.100.11"));
+        assert!(!error.to_string().contains("198.51.100.10"));
+    }
+
+    #[test]
+    fn mobile_claw_vpn_relay_auth_peer_signature_is_bound_to_challenge_nonce() {
+        let relay_addr = "198.51.100.10:49152".parse().unwrap();
+        let relay_key = P256Keypair::generate();
+        let relay_public_key = relay_key.public();
+        let signed_challenge = MobileClawVpnRendezvousRelayAuthChallenge::new_for_test([0x11; 32]);
+        let attempted_challenge =
+            MobileClawVpnRendezvousRelayAuthChallenge::new_for_test([0x22; 32]);
+        let signature = relay_key
+            .sign(&signed_challenge.signing_bytes(relay_addr, &relay_public_key))
+            .unwrap();
+
+        let error = MobileClawVpnRendezvousAuthenticatedRelayPeer::from_signed_challenge(
+            relay_addr,
+            &relay_public_key,
+            &attempted_challenge,
+            &signature,
+        )
+        .unwrap_err();
+
+        assert_eq!(error.kind(), "relay_auth_required");
+        assert!(!format!("{signed_challenge:?}").contains("1111"));
+        assert!(!format!("{attempted_challenge:?}").contains("2222"));
+        assert!(!format!("{error:?}").contains("198.51.100.10"));
+        assert!(!error.to_string().contains("198.51.100.10"));
+    }
+
+    #[test]
+    fn mobile_claw_vpn_relay_auth_peer_rejects_loopback_minting() {
+        let relay_addr = "127.0.0.1:49152".parse().unwrap();
+        let relay_key = P256Keypair::generate();
+        let relay_public_key = relay_key.public();
+        let challenge = MobileClawVpnRendezvousRelayAuthChallenge::new_for_test([0xD4; 32]);
+        let signature = relay_key
+            .sign(&challenge.signing_bytes(relay_addr, &relay_public_key))
+            .unwrap();
+
+        let error = MobileClawVpnRendezvousAuthenticatedRelayPeer::from_signed_challenge(
+            relay_addr,
+            &relay_public_key,
+            &challenge,
+            &signature,
+        )
+        .unwrap_err();
+
+        assert_eq!(error.kind(), "relay_auth_required");
+        assert!(!format!("{error:?}").contains("127.0.0.1"));
+    }
+
+    #[test]
+    fn mobile_claw_vpn_relay_auth_peer_identity_is_derived_from_signing_key() {
+        let relay_addr = "198.51.100.10:49152".parse().unwrap();
+        let expected_key = P256Keypair::generate();
+        let expected_identity =
+            MobileClawVpnRendezvousRelayPeerIdentity::from_relay_public_key(&expected_key.public());
+        let config = MobileClawVpnRendezvousRelayDialConfig {
+            relay_addr: Some(relay_addr),
+            connect_timeout: DEFAULT_MOBILE_CLAW_VPN_RELAY_DIAL_CONNECT_TIMEOUT,
+            hello_timeout: DEFAULT_MOBILE_CLAW_VPN_RELAY_DIAL_HELLO_TIMEOUT,
+            allow_non_loopback_relay_addr: true,
+            relay_peer_identity: Some(expected_identity),
+        };
+        let attacker_key = P256Keypair::generate();
+        let attacker_public_key = attacker_key.public();
+        let challenge = MobileClawVpnRendezvousRelayAuthChallenge::new_for_test([0xE5; 32]);
+        let signature = attacker_key
+            .sign(&challenge.signing_bytes(relay_addr, &attacker_public_key))
+            .unwrap();
+
+        let authenticated_peer =
+            MobileClawVpnRendezvousAuthenticatedRelayPeer::from_signed_challenge(
+                relay_addr,
+                &attacker_public_key,
+                &challenge,
+                &signature,
+            )
+            .unwrap();
+        let error = config
+            .relay_auth_proof_for_authenticated_non_loopback_peer(&authenticated_peer)
+            .unwrap_err();
+
+        assert_eq!(error.kind(), "relay_auth_required");
+        assert!(!format!("{error:?}").contains("198.51.100.10"));
+        assert!(!error.to_string().contains(PEER_IDENTITY_A));
     }
 
     #[test]
