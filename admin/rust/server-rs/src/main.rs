@@ -993,6 +993,10 @@ async fn main() {
             "/claw-vpn/sessions",
             post(handlers_mobile::handle_mobile_claw_vpn_consume_offer),
         )
+        .route(
+            "/claw-vpn/rendezvous/authorize",
+            post(handlers_mobile::handle_mobile_claw_vpn_authorize_rendezvous),
+        )
         .merge(claw_store_routes::mobile_nested_routes())
         .with_state(Arc::clone(&state));
 

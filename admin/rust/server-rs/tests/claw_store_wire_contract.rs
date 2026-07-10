@@ -297,6 +297,10 @@ fn mobile_router(state: SharedState) -> Router {
             post(handlers_mobile::handle_mobile_claw_vpn_consume_offer),
         )
         .route(
+            "/api/v1/mobile/claw-vpn/rendezvous/authorize",
+            post(handlers_mobile::handle_mobile_claw_vpn_authorize_rendezvous),
+        )
+        .route(
             "/api/v1/mobile/users",
             get(handlers_mobile::handle_mobile_users),
         )
@@ -644,7 +648,7 @@ fn assert_mobile_claw_vpn_offer_body(body: &Value, counts: [u64; 5]) -> String {
     offer_token.to_string()
 }
 
-fn assert_mobile_claw_vpn_session_body(body: &Value, counts: [u64; 5]) {
+fn assert_mobile_claw_vpn_session_body(body: &Value, counts: [u64; 5]) -> String {
     let object = body.as_object().expect("session body object");
     assert_eq!(object.len(), 6, "session response must stay minimal");
     assert_eq!(body["product"], "product_a_mobile_claw_vpn");
@@ -666,6 +670,30 @@ fn assert_mobile_claw_vpn_session_body(body: &Value, counts: [u64; 5]) {
     assert!(
         !object.contains_key("session_id"),
         "sequential session id stays internal; public handle is the opaque rendezvous token"
+    );
+    assert_mobile_claw_vpn_status_counts(&body["status"], counts);
+    rendezvous_token.to_string()
+}
+
+fn assert_mobile_claw_vpn_rendezvous_authorize_body(body: &Value, counts: [u64; 5]) {
+    let object = body.as_object().expect("rendezvous authorize body object");
+    assert_eq!(
+        object.len(),
+        6,
+        "rendezvous authorize response must stay minimal"
+    );
+    assert_eq!(body["product"], "product_a_mobile_claw_vpn");
+    assert_eq!(body["mode"], "mesh_c_rendezvous_preflight");
+    assert_eq!(body["production_activation"], false);
+    assert_eq!(body["operation"], "authorize_rendezvous");
+    assert_eq!(body["authorized"], true);
+    assert!(
+        !object.contains_key("rendezvous_token"),
+        "relay rendezvous token is server-side only after preflight"
+    );
+    assert!(
+        !object.contains_key("session_id"),
+        "sequential session id stays internal"
     );
     assert_mobile_claw_vpn_status_counts(&body["status"], counts);
 }
@@ -1753,6 +1781,7 @@ async fn mobile_claw_vpn_offer_routes_are_auth_scoped_single_use_and_count_only(
     let state = shared_state();
     let offer_path = "/api/v1/mobile/claw-vpn/offers";
     let session_path = "/api/v1/mobile/claw-vpn/sessions";
+    let rendezvous_path = "/api/v1/mobile/claw-vpn/rendezvous/authorize";
     let offer_body = json!({"device_id":"device-alpha","claw_id":"claw-alpha"})
         .to_string()
         .into_bytes();
@@ -1880,7 +1909,95 @@ async fn mobile_claw_vpn_offer_routes_are_auth_scoped_single_use_and_count_only(
     )
     .await;
     assert_eq!(status, StatusCode::OK);
-    assert_mobile_claw_vpn_session_body(&body, [1, 1, 1, 1, 1]);
+    let rendezvous_token = assert_mobile_claw_vpn_session_body(&body, [1, 1, 1, 1, 1]);
+
+    let rendezvous_body = json!({
+        "device_id":"device-alpha",
+        "claw_id":"claw-alpha",
+        "rendezvous_token":rendezvous_token
+    })
+    .to_string()
+    .into_bytes();
+
+    let (status, _bytes, body) = request(
+        mobile_router(Arc::clone(&state)),
+        Method::POST,
+        rendezvous_path,
+        rendezvous_body.clone(),
+        None,
+    )
+    .await;
+    assert_fixture_body(
+        status,
+        &body,
+        StatusCode::UNAUTHORIZED,
+        "mobile_missing_auth",
+    );
+
+    let (status, _bytes, body) = request(
+        mobile_router(Arc::clone(&state)),
+        Method::POST,
+        rendezvous_path,
+        rendezvous_body.clone(),
+        Some(format!("Bearer {other_token}")),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(body["error"], "mobile Claw VPN rendezvous denied");
+    assert_eq!(body["code"], "FORBIDDEN");
+    assert_eq!(body.as_object().expect("error object").len(), 2);
+
+    let member_token = mobile_session_for_existing_user(&state, "member-alpha");
+    let (status, _bytes, body) = request(
+        mobile_router(Arc::clone(&state)),
+        Method::POST,
+        rendezvous_path,
+        rendezvous_body.clone(),
+        Some(format!("Bearer {member_token}")),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_mobile_claw_vpn_rendezvous_authorize_body(&body, [1, 1, 1, 1, 1]);
+
+    let member_token = mobile_session_for_existing_user(&state, "member-alpha");
+    let (status, _bytes, body) = request(
+        mobile_router(Arc::clone(&state)),
+        Method::POST,
+        rendezvous_path,
+        json!({
+            "device_id":"device-alpha",
+            "claw_id":"claw-alpha",
+            "rendezvous_token":"00000000000000000000000000000000"
+        })
+        .to_string()
+        .into_bytes(),
+        Some(format!("Bearer {member_token}")),
+    )
+    .await;
+    assert_eq!(status, StatusCode::GONE);
+    assert_eq!(body["error"], "mobile Claw VPN rendezvous unavailable");
+    assert_eq!(body["code"], "GONE");
+    assert_eq!(body.as_object().expect("error object").len(), 2);
+
+    let member_token = mobile_session_for_existing_user(&state, "member-alpha");
+    let (status, _bytes, body) = request(
+        mobile_router(Arc::clone(&state)),
+        Method::POST,
+        rendezvous_path,
+        json!({
+            "device_id":"device-alpha",
+            "claw_id":"claw-alpha",
+            "rendezvous_token":" "
+        })
+        .to_string()
+        .into_bytes(),
+        Some(format!("Bearer {member_token}")),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body["error"], "invalid mobile Claw VPN mesh request");
+    assert_eq!(body["code"], "INVALID_INPUT");
+    assert_eq!(body.as_object().expect("error object").len(), 2);
 
     let member_token = mobile_session_for_existing_user(&state, "member-alpha");
     let (status, _bytes, body) = request(
@@ -1914,6 +2031,32 @@ async fn mobile_claw_vpn_offer_routes_are_auth_scoped_single_use_and_count_only(
     assert_eq!(body["error"], "invalid mobile Claw VPN mesh request");
     assert_eq!(body["code"], "INVALID_INPUT");
     assert_eq!(body.as_object().expect("error object").len(), 2);
+
+    let unavailable_claw =
+        household_rs::claw_vpn_mobile_state::ClawVpnMobileClawId::try_new("claw-alpha")
+            .expect("claw id");
+    let unavailable = state
+        .mobile_claw_vpn_mesh
+        .set_claw_unavailable(&unavailable_claw)
+        .expect("mark claw unavailable");
+    assert!(unavailable.changed());
+    assert_eq!(unavailable.closed_session_count(), 1);
+    let member_token = mobile_session_for_existing_user(&state, "member-alpha");
+    let (status, _bytes, body) = request(
+        mobile_router(Arc::clone(&state)),
+        Method::POST,
+        rendezvous_path,
+        rendezvous_body,
+        Some(format!("Bearer {member_token}")),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(body["error"], "mobile Claw VPN rendezvous unavailable");
+    assert_eq!(body["code"], "CONFLICT");
+    assert_eq!(body.as_object().expect("error object").len(), 2);
+    let status_after_unavailable = state.mobile_claw_vpn_mesh.status().unwrap();
+    assert_eq!(status_after_unavailable.available_claw_count(), 0);
+    assert_eq!(status_after_unavailable.session_count(), 0);
 }
 
 #[tokio::test]
