@@ -13,6 +13,10 @@ on:
   pull_request:
     branches:
       - main
+    paths:
+      - "specs/005-soyeht-onboarding/contracts/**"
+      - "admin/contracts/mobile-claw-vpn/v1/owner_approval_v2_execution_vectors.json"
+      - ".github/workflows/contracts-cross-repo-sync.yml"
   push:
     branches:
       - main
