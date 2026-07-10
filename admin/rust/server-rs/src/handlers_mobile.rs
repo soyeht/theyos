@@ -7,6 +7,8 @@
 //!   GET  /api/v1/mobile/instances          (mobile-authed — lists instances)
 //!   POST /api/v1/mobile/logout             (mobile-authed — revokes session)
 
+use std::{fmt, net::SocketAddr, time::Duration};
+
 use crate::auth::{AdminUser, AuthUser};
 use crate::claw_store_service;
 use crate::handlers_instances::require_instance;
@@ -38,7 +40,11 @@ use household_rs::{
 use percent_encoding::{AsciiSet, CONTROLS, utf8_percent_encode};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use tokio::io::{AsyncWrite, AsyncWriteExt};
+use tokio::{
+    io::{AsyncWrite, AsyncWriteExt},
+    net::TcpStream,
+    time::timeout,
+};
 use vmrunner_common_rs::VmCreateResourceSpec;
 
 const DEEP_LINK_QUERY_VALUE_SET: &AsciiSet = &CONTROLS
@@ -305,6 +311,105 @@ struct MobileClawVpnRendezvousAuthorizeResponse {
 struct MobileClawVpnRendezvousDialPreflight {
     hello: RendezvousHello,
 }
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct MobileClawVpnRendezvousRelayDialConfig {
+    relay_addr: Option<SocketAddr>,
+    connect_timeout: Duration,
+    hello_timeout: Duration,
+    allow_non_loopback_relay_addr: bool,
+}
+
+impl Default for MobileClawVpnRendezvousRelayDialConfig {
+    fn default() -> Self {
+        Self {
+            relay_addr: None,
+            connect_timeout: Duration::from_secs(5),
+            hello_timeout: Duration::from_secs(5),
+            allow_non_loopback_relay_addr: false,
+        }
+    }
+}
+
+impl fmt::Debug for MobileClawVpnRendezvousRelayDialConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let relay_addr = if self.relay_addr.is_some() {
+            "Some(<redacted>)"
+        } else {
+            "None"
+        };
+        f.debug_struct("MobileClawVpnRendezvousRelayDialConfig")
+            .field("relay_addr", &relay_addr)
+            .field("connect_timeout", &self.connect_timeout)
+            .field("hello_timeout", &self.hello_timeout)
+            .field(
+                "allow_non_loopback_relay_addr",
+                &self.allow_non_loopback_relay_addr,
+            )
+            .finish()
+    }
+}
+
+impl MobileClawVpnRendezvousRelayDialConfig {
+    fn validate(self) -> Result<Self, MobileClawVpnRendezvousRelayDialError> {
+        if let Some(relay_addr) = self.relay_addr {
+            if !self.allow_non_loopback_relay_addr && !relay_addr.ip().is_loopback() {
+                return Err(MobileClawVpnRendezvousRelayDialError::NonLoopbackRelayAddr);
+            }
+            if relay_addr.port() == 0 {
+                return Err(MobileClawVpnRendezvousRelayDialError::InvalidRelayAddrPort);
+            }
+        }
+        if self.connect_timeout.is_zero() {
+            return Err(MobileClawVpnRendezvousRelayDialError::InvalidDeadline);
+        }
+        if self.hello_timeout.is_zero() {
+            return Err(MobileClawVpnRendezvousRelayDialError::InvalidDeadline);
+        }
+        Ok(self)
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum MobileClawVpnRendezvousRelayDialError {
+    NonLoopbackRelayAddr,
+    InvalidRelayAddrPort,
+    InvalidDeadline,
+    ConnectTimeout,
+    DialFailed,
+    HelloTimeout,
+    HelloWriteFailed,
+}
+
+impl MobileClawVpnRendezvousRelayDialError {
+    fn kind(self) -> &'static str {
+        match self {
+            Self::NonLoopbackRelayAddr => "non_loopback_relay_addr",
+            Self::InvalidRelayAddrPort => "invalid_relay_addr_port",
+            Self::InvalidDeadline => "invalid_deadline",
+            Self::ConnectTimeout => "connect_timeout",
+            Self::DialFailed => "dial_failed",
+            Self::HelloTimeout => "hello_timeout",
+            Self::HelloWriteFailed => "hello_write_failed",
+        }
+    }
+}
+
+impl fmt::Debug for MobileClawVpnRendezvousRelayDialError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("MobileClawVpnRendezvousRelayDialError")
+            .field("kind", &self.kind())
+            .finish()
+    }
+}
+
+impl fmt::Display for MobileClawVpnRendezvousRelayDialError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("mobile Claw VPN rendezvous relay dial failed")
+    }
+}
+
+impl std::error::Error for MobileClawVpnRendezvousRelayDialError {}
 
 impl MobileClawVpnRendezvousDialPreflight {
     fn guest(relay_token: RendezvousToken) -> Self {
@@ -685,6 +790,36 @@ where
     let hello_bytes = dial_preflight.into_hello_bytes();
     writer.write_all(&hello_bytes).await?;
     writer.flush().await
+}
+
+async fn mobile_claw_vpn_dial_rendezvous_relay_and_write_guest_hello(
+    config: MobileClawVpnRendezvousRelayDialConfig,
+    dial_preflight: MobileClawVpnRendezvousDialPreflight,
+) -> Result<(), MobileClawVpnRendezvousRelayDialError> {
+    let config = config.validate()?;
+    if let Some(relay_addr) = config.relay_addr {
+        let mut stream = timeout(config.connect_timeout, TcpStream::connect(relay_addr))
+            .await
+            .map_err(|_| MobileClawVpnRendezvousRelayDialError::ConnectTimeout)?
+            .map_err(|_error| MobileClawVpnRendezvousRelayDialError::DialFailed)?;
+        timeout(
+            config.hello_timeout,
+            mobile_claw_vpn_write_rendezvous_guest_hello(&mut stream, dial_preflight),
+        )
+        .await
+        .map_err(|_| MobileClawVpnRendezvousRelayDialError::HelloTimeout)?
+        .map_err(|_error| MobileClawVpnRendezvousRelayDialError::HelloWriteFailed)?;
+        return Ok(());
+    }
+
+    let mut sink = tokio::io::sink();
+    timeout(
+        config.hello_timeout,
+        mobile_claw_vpn_write_rendezvous_guest_hello(&mut sink, dial_preflight),
+    )
+    .await
+    .map_err(|_| MobileClawVpnRendezvousRelayDialError::HelloTimeout)?
+    .map_err(|_error| MobileClawVpnRendezvousRelayDialError::HelloWriteFailed)
 }
 
 /// Detect the best host for the QR code based on available network channels.
@@ -1123,12 +1258,12 @@ pub async fn handle_mobile_claw_vpn_authorize_rendezvous(
         Ok::<_, ApiError>((dial_preflight, status))
     })
     .await??;
-    let mut hello_writer = tokio::io::sink();
-    mobile_claw_vpn_write_rendezvous_guest_hello(&mut hello_writer, dial_preflight)
-        .await
-        .map_err(|_error| {
-            ApiError::service_unavailable("mobile Claw VPN rendezvous unavailable")
-        })?;
+    mobile_claw_vpn_dial_rendezvous_relay_and_write_guest_hello(
+        MobileClawVpnRendezvousRelayDialConfig::default(),
+        dial_preflight,
+    )
+    .await
+    .map_err(|_error| ApiError::service_unavailable("mobile Claw VPN rendezvous unavailable"))?;
     Ok((
         StatusCode::OK,
         Json(mobile_claw_vpn_rendezvous_authorize_response(
@@ -2398,7 +2533,7 @@ pub async fn handle_mobile_uninstall_claw(
 mod tests {
     use super::*;
     use core_rs::network_detect::{CaddyStatus, ChannelStatus, NetworkStatus};
-    use tokio::io::AsyncReadExt;
+    use tokio::{io::AsyncReadExt, net::TcpListener, time::timeout};
 
     fn make_channel(channel_type: &str, detected: bool) -> ChannelStatus {
         ChannelStatus {
@@ -2950,5 +3085,99 @@ mod tests {
 
         assert_eq!(decoded.role, RendezvousRole::Guest);
         assert_eq!(decoded.token, rendezvous_token.relay_token().unwrap());
+    }
+
+    #[tokio::test]
+    async fn mobile_claw_vpn_rendezvous_relay_dial_writes_guest_hello_to_loopback_socket() {
+        let td = tempfile::tempdir().unwrap();
+        let store =
+            household_rs::claw_vpn_mobile_mesh_store::ClawVpnMobileMeshStore::new(td.path(), 600)
+                .unwrap();
+        let member =
+            household_rs::claw_vpn_mobile_state::ClawVpnMobileMemberId::try_new("member-alpha")
+                .unwrap();
+        let device =
+            household_rs::claw_vpn_mobile_state::ClawVpnMobileDeviceId::try_new("device-alpha")
+                .unwrap();
+        let claw = household_rs::claw_vpn_mobile_state::ClawVpnMobileClawId::try_new("claw-alpha")
+            .unwrap();
+        let grant = household_rs::claw_vpn_mobile_state::ClawVpnMobileAclGrant::new(
+            member,
+            device.clone(),
+            claw.clone(),
+        );
+
+        assert!(store.owner_approved_enroll_device(device).unwrap());
+        assert!(store.set_claw_available(claw).unwrap());
+        assert!(store.owner_approved_grant(grant.clone()).unwrap());
+        let offer_token = store.mint_offer_token(&grant, 100).unwrap();
+        let rendezvous_token = store
+            .consume_offer_token(&offer_token, &grant, 101)
+            .unwrap();
+        let preflight =
+            mobile_claw_vpn_rendezvous_dial_preflight(&store, &rendezvous_token, &grant).unwrap();
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let relay_addr = listener.local_addr().unwrap();
+        let accepted = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut hello_bytes = Vec::new();
+            stream.read_to_end(&mut hello_bytes).await.unwrap();
+            hello_bytes
+        });
+        let config = MobileClawVpnRendezvousRelayDialConfig {
+            relay_addr: Some(relay_addr),
+            connect_timeout: Duration::from_secs(1),
+            hello_timeout: Duration::from_secs(1),
+            allow_non_loopback_relay_addr: false,
+        };
+
+        mobile_claw_vpn_dial_rendezvous_relay_and_write_guest_hello(config, preflight)
+            .await
+            .unwrap();
+        let hello_bytes = timeout(Duration::from_secs(1), accepted)
+            .await
+            .unwrap()
+            .unwrap();
+        let decoded = RendezvousHello::decode(&hello_bytes).unwrap();
+
+        assert_eq!(decoded.role, RendezvousRole::Guest);
+        assert_eq!(decoded.token, rendezvous_token.relay_token().unwrap());
+    }
+
+    #[tokio::test]
+    async fn mobile_claw_vpn_rendezvous_relay_dial_default_stays_inert() {
+        let preflight = MobileClawVpnRendezvousDialPreflight::guest(
+            RendezvousToken::try_new(vec![0x42; 16]).unwrap(),
+        );
+
+        mobile_claw_vpn_dial_rendezvous_relay_and_write_guest_hello(
+            MobileClawVpnRendezvousRelayDialConfig::default(),
+            preflight,
+        )
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn mobile_claw_vpn_rendezvous_relay_dial_rejects_non_loopback_without_echo() {
+        let preflight = MobileClawVpnRendezvousDialPreflight::guest(
+            RendezvousToken::try_new(vec![0x43; 16]).unwrap(),
+        );
+        let config = MobileClawVpnRendezvousRelayDialConfig {
+            relay_addr: Some("198.51.100.10:49152".parse().unwrap()),
+            connect_timeout: Duration::from_secs(1),
+            hello_timeout: Duration::from_secs(1),
+            allow_non_loopback_relay_addr: false,
+        };
+
+        let error = mobile_claw_vpn_dial_rendezvous_relay_and_write_guest_hello(config, preflight)
+            .await
+            .unwrap_err();
+
+        assert_eq!(error.kind(), "non_loopback_relay_addr");
+        assert!(!format!("{config:?}").contains("198.51.100.10"));
+        assert!(!format!("{error:?}").contains("198.51.100.10"));
+        assert!(!error.to_string().contains("198.51.100.10"));
     }
 }
