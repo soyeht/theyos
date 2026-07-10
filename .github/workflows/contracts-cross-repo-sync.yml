@@ -5,8 +5,8 @@ name: Cross-Repo Contract Sync
 # theyos@HEAD. The mobile owner-approval fixture is additionally checked as an
 # exact byte-for-byte vendor at both the iOS pin and current theyos HEAD.
 #
-# Triggers: all PRs to main, source changes pushed to main, and onboarding
-# contract changes on 005-soyeht-onboarding.
+# Triggers: relevant contract PRs to main, source changes pushed to main, and
+# onboarding contract changes on 005-soyeht-onboarding.
 # Passes silently when no mirrors are registered yet.
 
 on:
@@ -55,45 +55,72 @@ jobs:
           set -euo pipefail
 
           SOURCE_REL="admin/contracts/mobile-claw-vpn/v1/owner_approval_v2_execution_vectors.json"
-          SOURCE="theyos/${SOURCE_REL}"
-          VENDOR="soyeht-ios/Packages/SoyehtCore/Tests/SoyehtCoreTests/Fixtures/mobile-claw-vpn/v1/owner_approval_v2_execution_vectors.json"
-          PIN_FILE="soyeht-ios/scripts/cross-repo-contract.sha"
-
-          if [[ ! -f "${SOURCE}" ]]; then
-            echo "::error file=${SOURCE_REL}::authoritative mobile owner-approval fixture is missing"
-            exit 1
-          fi
+          VENDOR_REL="Packages/SoyehtCore/Tests/SoyehtCoreTests/Fixtures/mobile-claw-vpn/v1/owner_approval_v2_execution_vectors.json"
+          PIN_REL="scripts/cross-repo-contract.sha"
 
           TMP_DIR="$(mktemp -d)"
           trap 'rm -rf "${TMP_DIR}"' EXIT
+
+          HEAD_SHA="$(git -C theyos rev-parse HEAD)"
+          HEAD_ENTRY="$(git -C theyos ls-tree "${HEAD_SHA}" -- "${SOURCE_REL}")"
+          if [[ -z "${HEAD_ENTRY}" ]]; then
+            echo "::error file=${SOURCE_REL}::authoritative mobile owner-approval fixture is missing"
+            exit 1
+          fi
+          read -r HEAD_MODE HEAD_TYPE HEAD_OBJECT _ <<< "${HEAD_ENTRY}"
+          if [[ "${HEAD_MODE}" != "100644" || "${HEAD_TYPE}" != "blob" ]]; then
+            echo "::error file=${SOURCE_REL}::authoritative fixture must be a regular 100644 Git blob"
+            exit 1
+          fi
+          HEAD_SOURCE="${TMP_DIR}/head-source"
+          git -C theyos cat-file blob "${HEAD_OBJECT}" > "${HEAD_SOURCE}"
+
           BASE_HAS_SOURCE=0
           if [[ "${BASE_SHA}" =~ ^[0-9a-f]{40}$ ]] \
             && [[ "${BASE_SHA}" != "0000000000000000000000000000000000000000" ]]; then
             git -C theyos fetch --no-tags --depth=1 origin "${BASE_SHA}"
-            if git -C theyos cat-file -e "${BASE_SHA}:${SOURCE_REL}" 2>/dev/null; then
+            BASE_ENTRY="$(git -C theyos ls-tree "${BASE_SHA}" -- "${SOURCE_REL}")"
+            if [[ -n "${BASE_ENTRY}" ]]; then
               BASE_HAS_SOURCE=1
-              git -C theyos show "${BASE_SHA}:${SOURCE_REL}" > "${TMP_DIR}/base-source"
-              if ! cmp -s "${TMP_DIR}/base-source" "${SOURCE}"; then
+              read -r BASE_MODE BASE_TYPE BASE_OBJECT _ <<< "${BASE_ENTRY}"
+              if [[ "${BASE_MODE}" != "100644" || "${BASE_TYPE}" != "blob" ]]; then
+                echo "::error file=${SOURCE_REL}::base fixture must be a regular 100644 Git blob"
+                exit 1
+              fi
+              BASE_SOURCE="${TMP_DIR}/base-source"
+              git -C theyos cat-file blob "${BASE_OBJECT}" > "${BASE_SOURCE}"
+              if ! cmp -s "${BASE_SOURCE}" "${HEAD_SOURCE}"; then
                 echo "::error::mobile owner-approval V1 is immutable; add a new versioned fixture"
-                diff -u "${TMP_DIR}/base-source" "${SOURCE}" || true
+                diff -u "${BASE_SOURCE}" "${HEAD_SOURCE}" || true
                 exit 1
               fi
             fi
           fi
 
+          IOS_HEAD_SHA="$(git -C soyeht-ios rev-parse HEAD)"
+          VENDOR_ENTRY="$(git -C soyeht-ios ls-tree "${IOS_HEAD_SHA}" -- "${VENDOR_REL}")"
+
           # Ordered bootstrap: the source must land in theyos before iOS can
           # vendor and pin it. Missing vendor is allowed only while this exact
           # source path is new relative to the event's base commit.
-          if [[ ! -f "${VENDOR}" ]]; then
+          if [[ -z "${VENDOR_ENTRY}" ]]; then
             if [[ "${BASE_SHA}" =~ ^[0-9a-f]{40}$ ]] \
               && [[ "${BASE_SHA}" != "0000000000000000000000000000000000000000" ]] \
               && [[ "${BASE_HAS_SOURCE}" == "0" ]]; then
               echo "Bootstrap: authoritative fixture is new; land theyos before the iOS vendor/pin."
               exit 0
             fi
-            echo "::error::iOS vendor missing for existing theyos fixture: ${VENDOR#soyeht-ios/}"
+            echo "::error::iOS vendor missing for existing theyos fixture: ${VENDOR_REL}"
             exit 1
           fi
+
+          read -r VENDOR_MODE VENDOR_TYPE VENDOR_OBJECT _ <<< "${VENDOR_ENTRY}"
+          if [[ "${VENDOR_MODE}" != "100644" || "${VENDOR_TYPE}" != "blob" ]]; then
+            echo "::error file=${VENDOR_REL}::iOS vendor must be a regular 100644 Git blob"
+            exit 1
+          fi
+          VENDOR_SOURCE="${TMP_DIR}/vendor-source"
+          git -C soyeht-ios cat-file blob "${VENDOR_OBJECT}" > "${VENDOR_SOURCE}"
 
           if [[ "${BASE_SHA}" =~ ^[0-9a-f]{40}$ ]] \
             && [[ "${BASE_SHA}" != "0000000000000000000000000000000000000000" ]] \
@@ -102,11 +129,19 @@ jobs:
             exit 1
           fi
 
-          if [[ ! -f "${PIN_FILE}" ]]; then
+          PIN_ENTRY="$(git -C soyeht-ios ls-tree "${IOS_HEAD_SHA}" -- "${PIN_REL}")"
+          if [[ -z "${PIN_ENTRY}" ]]; then
             echo "::error::iOS cross-repo pin is missing"
             exit 1
           fi
-          PIN="$(grep -vE '^[[:space:]]*#' "${PIN_FILE}" | tr -d '[:space:]')"
+          read -r PIN_MODE PIN_TYPE PIN_OBJECT _ <<< "${PIN_ENTRY}"
+          if [[ "${PIN_MODE}" != "100644" || "${PIN_TYPE}" != "blob" ]]; then
+            echo "::error file=${PIN_REL}::iOS cross-repo pin must be a regular 100644 Git blob"
+            exit 1
+          fi
+          PIN_SOURCE="${TMP_DIR}/pin-source"
+          git -C soyeht-ios cat-file blob "${PIN_OBJECT}" > "${PIN_SOURCE}"
+          PIN="$(grep -vE '^[[:space:]]*#' "${PIN_SOURCE}" | tr -d '[:space:]')"
           if [[ ! "${PIN}" =~ ^[0-9a-f]{40}$ ]]; then
             echo "::error::iOS cross-repo pin must be one lowercase 40-hex commit"
             exit 1
@@ -114,19 +149,26 @@ jobs:
 
           git -C theyos fetch --no-tags --depth=1 origin "${PIN}"
           PINNED_SOURCE="${TMP_DIR}/pinned-source"
-          if ! git -C theyos show "${PIN}:${SOURCE_REL}" > "${PINNED_SOURCE}"; then
+          PINNED_ENTRY="$(git -C theyos ls-tree "${PIN}" -- "${SOURCE_REL}")"
+          if [[ -z "${PINNED_ENTRY}" ]]; then
             echo "::error::iOS pin ${PIN} does not contain ${SOURCE_REL}"
             exit 1
           fi
-
-          if ! cmp -s "${PINNED_SOURCE}" "${VENDOR}"; then
-            echo "::error::iOS vendor differs from its pinned theyos source ${PIN}"
-            diff -u "${PINNED_SOURCE}" "${VENDOR}" || true
+          read -r PINNED_MODE PINNED_TYPE PINNED_OBJECT _ <<< "${PINNED_ENTRY}"
+          if [[ "${PINNED_MODE}" != "100644" || "${PINNED_TYPE}" != "blob" ]]; then
+            echo "::error::fixture at iOS pin ${PIN} must be a regular 100644 Git blob"
             exit 1
           fi
-          if ! cmp -s "${SOURCE}" "${VENDOR}"; then
+          git -C theyos cat-file blob "${PINNED_OBJECT}" > "${PINNED_SOURCE}"
+
+          if ! cmp -s "${PINNED_SOURCE}" "${VENDOR_SOURCE}"; then
+            echo "::error::iOS vendor differs from its pinned theyos source ${PIN}"
+            diff -u "${PINNED_SOURCE}" "${VENDOR_SOURCE}" || true
+            exit 1
+          fi
+          if ! cmp -s "${HEAD_SOURCE}" "${VENDOR_SOURCE}"; then
             echo "::error::theyos HEAD changed without a matching landed iOS vendor"
-            diff -u "${SOURCE}" "${VENDOR}" || true
+            diff -u "${HEAD_SOURCE}" "${VENDOR_SOURCE}" || true
             exit 1
           fi
           echo "✓ authoritative fixture matches iOS vendor at pin ${PIN} and theyos HEAD"
