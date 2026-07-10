@@ -1126,9 +1126,12 @@ pub async fn handle_mobile_claw_vpn_consume_offer(
 /// `POST /api/v1/mobile/claw-vpn/rendezvous/authorize`
 ///
 /// Mobile-authenticated. Revalidates an existing Mesh-C rendezvous capability
-/// for the authenticated member, Device-D, and selected Claw before any future
-/// relay dial. This is a read-only preflight: it does not return the decoded
-/// relay token, open relay sessions, install routes, or mutate host networking.
+/// for the authenticated member, Device-D, and selected Claw, then writes a
+/// relay-visible Guest hello when a relay dial target is configured. The
+/// default config has no relay target and stays inert; non-loopback targets
+/// remain blocked with `relay_auth_required` until a future relay-auth seam
+/// proves the peer. The response does not return the decoded relay token, relay
+/// endpoint, session identifier, routes, or any host-networking mutation.
 ///
 /// # Errors
 ///
