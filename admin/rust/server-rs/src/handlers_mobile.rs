@@ -24,8 +24,11 @@ use core_rs::{
     error::{ApiError, blocking},
 };
 use household_rs::{
+    claw_share_rendezvous_hello::{RendezvousHello, RendezvousRole},
+    claw_share_rendezvous_token::RendezvousToken,
     claw_vpn_mobile_mesh_store::{
-        ClawVpnMobileMeshStoreError, ClawVpnMobileMeshStoreErrorKind, ClawVpnMobileMeshStoreStatus,
+        ClawVpnMobileMeshStore, ClawVpnMobileMeshStoreError, ClawVpnMobileMeshStoreErrorKind,
+        ClawVpnMobileMeshStoreStatus,
     },
     claw_vpn_mobile_state::{
         ClawVpnMobileAclGrant, ClawVpnMobileClawId, ClawVpnMobileDeviceId, ClawVpnMobileMemberId,
@@ -296,6 +299,22 @@ struct MobileClawVpnRendezvousAuthorizeResponse {
     operation: &'static str,
     authorized: bool,
     status: MobileClawVpnStatusResponse,
+}
+
+struct MobileClawVpnRendezvousDialPreflight {
+    hello: RendezvousHello,
+}
+
+impl MobileClawVpnRendezvousDialPreflight {
+    fn guest(relay_token: RendezvousToken) -> Self {
+        Self {
+            hello: RendezvousHello::new(RendezvousRole::Guest, relay_token),
+        }
+    }
+
+    fn into_hello_bytes(self) -> Vec<u8> {
+        self.hello.encode()
+    }
 }
 
 fn build_resource_option_range(
@@ -644,6 +663,15 @@ fn mobile_claw_vpn_rendezvous_authorize_response(
         authorized: true,
         status: mobile_claw_vpn_status_response(status),
     }
+}
+
+fn mobile_claw_vpn_rendezvous_dial_preflight(
+    store: &ClawVpnMobileMeshStore,
+    rendezvous_token: &ClawVpnMobileRendezvousToken,
+    grant: &ClawVpnMobileAclGrant,
+) -> Result<MobileClawVpnRendezvousDialPreflight, ClawVpnMobileMeshStoreError> {
+    let relay_token = store.authorize_rendezvous_token(rendezvous_token, grant)?;
+    Ok(MobileClawVpnRendezvousDialPreflight::guest(relay_token))
 }
 
 /// Detect the best host for the QR code based on available network channels.
@@ -1068,14 +1096,15 @@ pub async fn handle_mobile_claw_vpn_authorize_rendezvous(
     let rendezvous_token = mobile_claw_vpn_rendezvous_token(req.rendezvous)?;
     let store = state.mobile_claw_vpn_mesh.clone();
     let status = blocking(move || {
-        let _relay_token = store
-            .authorize_rendezvous_token(&rendezvous_token, &grant)
-            .map_err(|error| {
-                mobile_claw_vpn_rendezvous_store_error(
-                    error,
-                    "mobile Claw VPN rendezvous unavailable",
-                )
-            })?;
+        let dial_preflight = mobile_claw_vpn_rendezvous_dial_preflight(
+            &store,
+            &rendezvous_token,
+            &grant,
+        )
+        .map_err(|error| {
+            mobile_claw_vpn_rendezvous_store_error(error, "mobile Claw VPN rendezvous unavailable")
+        })?;
+        let _hello_bytes = dial_preflight.into_hello_bytes();
         store.status().map_err(|error| {
             mobile_claw_vpn_rendezvous_store_error(error, "mobile Claw VPN rendezvous unavailable")
         })
@@ -2638,5 +2667,41 @@ mod tests {
                 session_count: 1,
             }
         );
+    }
+
+    #[test]
+    fn mobile_claw_vpn_rendezvous_dial_preflight_builds_guest_hello_after_revalidation() {
+        let td = tempfile::tempdir().unwrap();
+        let store =
+            household_rs::claw_vpn_mobile_mesh_store::ClawVpnMobileMeshStore::new(td.path(), 600)
+                .unwrap();
+        let member =
+            household_rs::claw_vpn_mobile_state::ClawVpnMobileMemberId::try_new("member-alpha")
+                .unwrap();
+        let device =
+            household_rs::claw_vpn_mobile_state::ClawVpnMobileDeviceId::try_new("device-alpha")
+                .unwrap();
+        let claw = household_rs::claw_vpn_mobile_state::ClawVpnMobileClawId::try_new("claw-alpha")
+            .unwrap();
+        let grant = household_rs::claw_vpn_mobile_state::ClawVpnMobileAclGrant::new(
+            member,
+            device.clone(),
+            claw.clone(),
+        );
+
+        assert!(store.owner_approved_enroll_device(device).unwrap());
+        assert!(store.set_claw_available(claw).unwrap());
+        assert!(store.owner_approved_grant(grant.clone()).unwrap());
+        let offer_token = store.mint_offer_token(&grant, 100).unwrap();
+        let rendezvous_token = store
+            .consume_offer_token(&offer_token, &grant, 101)
+            .unwrap();
+
+        let preflight =
+            mobile_claw_vpn_rendezvous_dial_preflight(&store, &rendezvous_token, &grant).unwrap();
+        let decoded = RendezvousHello::decode(&preflight.into_hello_bytes()).unwrap();
+
+        assert_eq!(decoded.role, RendezvousRole::Guest);
+        assert_eq!(decoded.token, rendezvous_token.relay_token().unwrap());
     }
 }
