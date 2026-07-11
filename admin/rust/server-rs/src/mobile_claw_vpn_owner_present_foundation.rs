@@ -24,7 +24,7 @@ use household_rs::{
 use rand::{CryptoRng, RngCore, rngs::OsRng};
 use sha2::{Digest, Sha256};
 use subtle::{Choice, ConditionallySelectable, ConstantTimeEq};
-use zeroize::{Zeroize, ZeroizeOnDrop};
+use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
 const CONFIG_DIGEST_DOMAIN: &[u8] = b"theyos-mobile-claw-vpn-owner-present-config-v1\0";
 const MEMBER_SCOPE_DOMAIN: &[u8] = b"theyos-mobile-claw-vpn-owner-present-member-v1\0";
@@ -919,38 +919,43 @@ impl FinishingClaim {
         if !binding.matches(&current) {
             return Err(FoundationError::Rejected);
         }
-        let ttl_deadline = now
-            .monotonic
-            .checked_add(ttl)
-            .ok_or(FoundationError::InvalidDeadline)?;
-        let proof_deadline = inner.entries[index].deadline.min(ttl_deadline);
-
         for _ in 0..MAX_RANDOM_ATTEMPTS {
-            let mut secret = [0u8; OPAQUE_SECRET_LEN];
-            rng.fill_bytes(&mut secret);
-            if bool::from(secret.ct_eq(&[0; OPAQUE_SECRET_LEN])) {
-                secret.zeroize();
-                continue;
-            }
-            let token_hash = domain_hash(PROOF_TOKEN_HASH_DOMAIN, &secret);
-            if inner
+            let mut secret = Zeroizing::new([0u8; OPAQUE_SECRET_LEN]);
+            rng.fill_bytes(secret.as_mut());
+            let zero_secret = bool::from(secret.ct_eq(&[0; OPAQUE_SECRET_LEN]));
+            let token_hash = domain_hash(PROOF_TOKEN_HASH_DOMAIN, secret.as_ref());
+            let collision = inner
                 .lookup_hash_ct(LookupKind::AnyProofToken, &token_hash)
                 .index
-                .is_some()
-            {
-                secret.zeroize();
-                continue;
-            }
+                .is_some();
             let EntryState::Finishing { binding } = &inner.entries[index].state else {
-                secret.zeroize();
                 return Err(FoundationError::Rejected);
             };
             let binding = binding.clone();
+
+            // Entropy acquisition, hashing, and the bounded collision scan can
+            // all be preempted. Re-sample both clocks under the same mutex and
+            // enforce signed expiry immediately before every transition or
+            // retry.
+            let transition_now = self.store.clock.read()?;
+            inner.observe_clock(transition_now)?;
+            inner.entries[index].expire_live_at(transition_now)?;
+            if zero_secret || collision {
+                continue;
+            }
+            if !matches!(inner.entries[index].state, EntryState::Finishing { .. }) {
+                return Err(FoundationError::Rejected);
+            }
+            let ttl_deadline = transition_now
+                .monotonic
+                .checked_add(ttl)
+                .ok_or(FoundationError::InvalidDeadline)?;
+            let proof_deadline = inner.entries[index].deadline.min(ttl_deadline);
             inner.entries[index].deadline = proof_deadline;
             inner.entries[index].transition(EntryState::ProofIssued { binding })?;
             inner.entries[index].proof_token_hash = Some(token_hash);
             self.active = false;
-            return Ok(ProofToken(secret));
+            return Ok(ProofToken(*secret));
         }
         Err(FoundationError::EntropyCollision)
     }
@@ -1459,6 +1464,69 @@ mod tests {
             Ok(state.reading)
         }
     }
+
+    #[derive(Clone, Copy)]
+    struct RngStep {
+        byte: u8,
+        wall_advance: Duration,
+        monotonic_advance: Duration,
+    }
+
+    struct ClockAdvancingRng {
+        clock: ManualClock,
+        steps: Vec<RngStep>,
+        next_step: usize,
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl ClockAdvancingRng {
+        fn new(clock: ManualClock, steps: Vec<RngStep>, calls: Arc<AtomicUsize>) -> Self {
+            Self {
+                clock,
+                steps,
+                next_step: 0,
+                calls,
+            }
+        }
+
+        fn fill_from_next_step(&mut self, dest: &mut [u8]) {
+            let step = self.steps[self.next_step];
+            self.next_step += 1;
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            if !step.wall_advance.is_zero() {
+                self.clock.advance_wall(step.wall_advance);
+            }
+            if !step.monotonic_advance.is_zero() {
+                self.clock.advance_monotonic(step.monotonic_advance);
+            }
+            dest.fill(step.byte);
+        }
+    }
+
+    impl RngCore for ClockAdvancingRng {
+        fn next_u32(&mut self) -> u32 {
+            let mut bytes = [0u8; 4];
+            self.fill_from_next_step(&mut bytes);
+            u32::from_le_bytes(bytes)
+        }
+
+        fn next_u64(&mut self) -> u64 {
+            let mut bytes = [0u8; 8];
+            self.fill_from_next_step(&mut bytes);
+            u64::from_le_bytes(bytes)
+        }
+
+        fn fill_bytes(&mut self, dest: &mut [u8]) {
+            self.fill_from_next_step(dest);
+        }
+
+        fn try_fill_bytes(&mut self, dest: &mut [u8]) -> Result<(), rand::Error> {
+            self.fill_bytes(dest);
+            Ok(())
+        }
+    }
+
+    impl CryptoRng for ClockAdvancingRng {}
 
     fn config() -> TrustedConfig {
         TrustedConfig::try_new(TrustedConfigInput {
@@ -2483,6 +2551,160 @@ mod tests {
             Err(FoundationError::Expired)
         ));
         assert_eq!(observed_consume_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn rng_wall_or_monotonic_advance_cannot_cross_proof_issue_deadline() {
+        let (wall_store, wall_clock) = store_with_clock(limits(4, 2));
+        let wall_binding =
+            BindingFixture::with_times("member-alpha", ClawSelector::ClawM, 0xa0, 1_000, 1_001);
+        let (_, wall_challenge) = pending(&wall_store, &wall_binding, 0xa1);
+        let wall_claim = wall_store
+            .claim_finishing(&wall_challenge, &wall_binding.caller())
+            .unwrap();
+        let wall_calls = Arc::new(AtomicUsize::new(0));
+        let mut wall_rng = ClockAdvancingRng::new(
+            wall_clock,
+            vec![RngStep {
+                byte: 0xa2,
+                wall_advance: Duration::from_secs(1),
+                monotonic_advance: Duration::ZERO,
+            }],
+            wall_calls.clone(),
+        );
+        assert!(matches!(
+            wall_claim.issue_proof_with_rng(
+                Duration::from_secs(20),
+                |permit| wall_binding.fresh(permit),
+                &mut wall_rng,
+            ),
+            Err(FoundationError::Expired)
+        ));
+        assert_eq!(wall_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(wall_store.status().unwrap().proof_issued, 0);
+        assert_eq!(wall_store.status().unwrap().burned, 1);
+
+        let (monotonic_store, monotonic_clock) = store_with_clock(limits(4, 2));
+        let monotonic_binding = BindingFixture::new("member-alpha", ClawSelector::ClawM, 0xa3);
+        let reservation = monotonic_store
+            .reserve(&monotonic_binding.caller(), Duration::from_secs(1))
+            .unwrap();
+        let monotonic_challenge = ChallengeHandle::from_server_random([0xa4; 32]).unwrap();
+        monotonic_store
+            .commit_pending(
+                &reservation,
+                &monotonic_challenge,
+                monotonic_binding.start(),
+            )
+            .unwrap();
+        let monotonic_claim = monotonic_store
+            .claim_finishing(&monotonic_challenge, &monotonic_binding.caller())
+            .unwrap();
+        let monotonic_calls = Arc::new(AtomicUsize::new(0));
+        let mut monotonic_rng = ClockAdvancingRng::new(
+            monotonic_clock,
+            vec![RngStep {
+                byte: 0xa5,
+                wall_advance: Duration::ZERO,
+                monotonic_advance: Duration::from_secs(1),
+            }],
+            monotonic_calls.clone(),
+        );
+        assert!(matches!(
+            monotonic_claim.issue_proof_with_rng(
+                Duration::from_secs(20),
+                |permit| monotonic_binding.fresh(permit),
+                &mut monotonic_rng,
+            ),
+            Err(FoundationError::Expired)
+        ));
+        assert_eq!(monotonic_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(monotonic_store.status().unwrap().proof_issued, 0);
+        assert_eq!(monotonic_store.status().unwrap().burned, 1);
+
+        let (live_store, live_clock) = store_with_clock(limits(4, 2));
+        let live_binding =
+            BindingFixture::with_times("member-alpha", ClawSelector::ClawM, 0xac, 1_000, 1_002);
+        let (_, live_challenge) = pending(&live_store, &live_binding, 0xad);
+        let live_claim = live_store
+            .claim_finishing(&live_challenge, &live_binding.caller())
+            .unwrap();
+        let live_calls = Arc::new(AtomicUsize::new(0));
+        let mut live_rng = ClockAdvancingRng::new(
+            live_clock,
+            vec![RngStep {
+                byte: 0xae,
+                wall_advance: Duration::from_millis(500),
+                monotonic_advance: Duration::from_millis(500),
+            }],
+            live_calls.clone(),
+        );
+        let live_token = live_claim
+            .issue_proof_with_rng(
+                Duration::from_secs(20),
+                |permit| live_binding.fresh(permit),
+                &mut live_rng,
+            )
+            .unwrap();
+        assert_eq!(live_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(live_store.status().unwrap().proof_issued, 1);
+        assert_eq!(live_store.status().unwrap().burned, 0);
+        drop(live_token);
+    }
+
+    #[test]
+    fn collision_retry_rechecks_expiry_after_every_rng_fill() {
+        let (store, clock) = store_with_clock(limits(8, 4));
+        let existing = BindingFixture::new("member-alpha", ClawSelector::ClawM, 0xa6);
+        let existing_token = issued(&store, &existing, 0xa7);
+        let collision_secret = [0xa8; OPAQUE_SECRET_LEN];
+        let collision_hash = domain_hash(PROOF_TOKEN_HASH_DOMAIN, &collision_secret);
+        {
+            let mut inner = store.lock_operation().unwrap();
+            let existing_entry = inner
+                .entries
+                .iter_mut()
+                .find(|entry| matches!(entry.state, EntryState::ProofIssued { .. }))
+                .unwrap();
+            existing_entry.proof_token_hash = Some(collision_hash);
+        }
+        drop(existing_token);
+
+        let expiring =
+            BindingFixture::with_times("member-beta", ClawSelector::ClawL, 0xa9, 1_000, 1_001);
+        let (_, challenge) = pending(&store, &expiring, 0xaa);
+        let claim = store
+            .claim_finishing(&challenge, &expiring.caller())
+            .unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut rng = ClockAdvancingRng::new(
+            clock,
+            vec![
+                RngStep {
+                    byte: 0xa8,
+                    wall_advance: Duration::ZERO,
+                    monotonic_advance: Duration::ZERO,
+                },
+                RngStep {
+                    byte: 0xab,
+                    wall_advance: Duration::from_secs(2),
+                    monotonic_advance: Duration::ZERO,
+                },
+            ],
+            calls.clone(),
+        );
+        assert!(matches!(
+            claim.issue_proof_with_rng(
+                Duration::from_secs(20),
+                |permit| expiring.fresh(permit),
+                &mut rng,
+            ),
+            Err(FoundationError::Expired)
+        ));
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        let status = store.status().unwrap();
+        assert_eq!(status.proof_issued, 1);
+        assert_eq!(status.burned, 1);
     }
 
     #[test]
