@@ -1,0 +1,67 @@
+{
+  "contract": "soyeht-mobile-claw-vpn-owner-present-webauthn-state-v1",
+  "version": 1,
+  "scope": "rust-test-only-public-verification-state",
+  "about": [
+    "Backend-only verification state for the owner-present success-wire assertions.",
+    "This file is not vendored cross-repository and its representation may track the pinned Rust WebAuthn library.",
+    "It contains public credential material only; no authenticator private key is stored.",
+    "It installs no runtime, handler, route, client, RP state store, or effect path."
+  ],
+  "states": [
+    {
+      "assertion_id": "assertion-claw-m-challenge-a",
+      "authentication_state": {
+        "allow_backup_eligible_upgrade": false,
+        "appid": null,
+        "challenge": [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32],
+        "credentials": [
+          {
+            "attestation": {"data": "Self_", "metadata": "None"},
+            "attestation_format": "packed",
+            "backup_eligible": false,
+            "backup_state": false,
+            "counter": 0,
+            "cred": {
+              "key": {"EC_EC2": {"curve": "SECP256R1", "x": "Xq30QG75t8yMk2FYwp53cqaLSIkn85fsR5v8DIaRJoo", "y": "Mj4T2XekwmxG0UugA1A8qDt8IYJ-OOaZdNmKjakye9o"}},
+              "type_": "ES256"
+            },
+            "cred_id": "zwk_F8lFDhf9agSntWx2Y5EKkG_Yngf22QXyJleQVrc",
+            "extensions": {"appid": "NotRequested", "cred_props": "Ignored", "cred_protect": "Ignored", "hmac_create_secret": "NotRequested"},
+            "registration_policy": "required",
+            "transports": null,
+            "user_verified": true
+          }
+        ],
+        "policy": "required"
+      }
+    },
+    {
+      "assertion_id": "assertion-claw-l-challenge-a",
+      "authentication_state": {
+        "allow_backup_eligible_upgrade": false,
+        "appid": null,
+        "challenge": [33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64],
+        "credentials": [
+          {
+            "attestation": {"data": "Self_", "metadata": "None"},
+            "attestation_format": "packed",
+            "backup_eligible": false,
+            "backup_state": false,
+            "counter": 0,
+            "cred": {
+              "key": {"EC_EC2": {"curve": "SECP256R1", "x": "Xq30QG75t8yMk2FYwp53cqaLSIkn85fsR5v8DIaRJoo", "y": "Mj4T2XekwmxG0UugA1A8qDt8IYJ-OOaZdNmKjakye9o"}},
+              "type_": "ES256"
+            },
+            "cred_id": "zwk_F8lFDhf9agSntWx2Y5EKkG_Yngf22QXyJleQVrc",
+            "extensions": {"appid": "NotRequested", "cred_props": "Ignored", "cred_protect": "Ignored", "hmac_create_secret": "NotRequested"},
+            "registration_policy": "required",
+            "transports": null,
+            "user_verified": true
+          }
+        ],
+        "policy": "required"
+      }
+    }
+  ]
+}

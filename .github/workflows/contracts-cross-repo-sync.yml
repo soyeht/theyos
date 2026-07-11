@@ -16,6 +16,11 @@ on:
     paths:
       - "specs/005-soyeht-onboarding/contracts/**"
       - "admin/contracts/mobile-claw-vpn/v1/owner_approval_v2_execution_vectors.json"
+      - "admin/contracts/mobile-claw-vpn/v1/api_shapes.json"
+      - "admin/contracts/mobile-claw-vpn/v1/owner_present_success_wire_v1.json"
+      - "admin/contracts/owner-approval/v2/owner_approval_v2_assertion_fields_v1.json"
+      - ".github/scripts/check-mobile-claw-vpn-owner-present-contracts.sh"
+      - ".github/scripts/test-mobile-claw-vpn-owner-present-contracts.sh"
       - ".github/workflows/contracts-cross-repo-sync.yml"
   push:
     branches:
@@ -24,6 +29,11 @@ on:
     paths:
       - "specs/005-soyeht-onboarding/contracts/**"
       - "admin/contracts/mobile-claw-vpn/v1/owner_approval_v2_execution_vectors.json"
+      - "admin/contracts/mobile-claw-vpn/v1/api_shapes.json"
+      - "admin/contracts/mobile-claw-vpn/v1/owner_present_success_wire_v1.json"
+      - "admin/contracts/owner-approval/v2/owner_approval_v2_assertion_fields_v1.json"
+      - ".github/scripts/check-mobile-claw-vpn-owner-present-contracts.sh"
+      - ".github/scripts/test-mobile-claw-vpn-owner-present-contracts.sh"
       - ".github/workflows/contracts-cross-repo-sync.yml"
   workflow_dispatch:
 
@@ -172,6 +182,15 @@ jobs:
             exit 1
           fi
           echo "✓ authoritative fixture matches iOS vendor at pin ${PIN} and theyos HEAD"
+
+      - name: Verify owner-present dependency graph ownership
+        shell: bash
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+        run: |
+          bash theyos/.github/scripts/test-mobile-claw-vpn-owner-present-contracts.sh
+          bash theyos/.github/scripts/check-mobile-claw-vpn-owner-present-contracts.sh \
+            theyos soyeht-ios "${BASE_SHA}"
 
       - name: Scan and diff contract mirrors
         shell: bash

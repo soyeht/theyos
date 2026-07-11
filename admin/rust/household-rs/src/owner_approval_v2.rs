@@ -285,8 +285,9 @@ pub struct OwnerApprovalContextV2 {
     pub recovery_head_hash: Option<ByteBuf>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub new_credential_binding_hash: Option<ByteBuf>,
-    /// Required only for `MobileClawVpnDevE2eExecute`. The normal owner-v2
-    /// challenge signs the canonical context containing this tuple hash.
+    /// Required only for `MobileClawVpnDevE2eExecute`. The RP challenge is
+    /// random. The server binds it to the stored canonical
+    /// context containing this tuple hash and requires exact context equality.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mobile_claw_vpn_execution_hash: Option<ByteBuf>,
     pub capabilities: Vec<String>,
