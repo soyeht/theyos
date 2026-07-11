@@ -97,6 +97,19 @@ grep -Fq "production server binary cannot be built with DEV/test features" \
   "${TMP_ROOT}/dev-feature.log"
 echo "PASS release_dev_feature_refused"
 
+CARGO_TARGET_DIR="${SHARED_TARGET}" \
+  cargo build \
+    --manifest-path "${REPO_ROOT}/admin/rust/Cargo.toml" \
+    --locked \
+    --release \
+    --package theyos-engine-build-rs \
+    >/dev/null
+BUILD_TOOL_BIN="${SHARED_TARGET}/release/theyos-engine-build"
+if [ ! -x "${BUILD_TOOL_BIN}" ]; then
+  echo "error: canonical build helper was not produced" >&2
+  exit 1
+fi
+
 if CROSS_CONTAINER_OPTS='--volume=/tmp/untrusted:/claws:ro' \
     PHASE0_TARGET="${HOST_TARGET}" \
     PHASE0_BUILD_TOOL=cargo \
@@ -108,11 +121,6 @@ fi
 grep -Fq "CROSS_CONTAINER_OPTS must be unset" "${TMP_ROOT}/cross-env.log"
 echo "PASS external_cross_container_opts_refused"
 
-BUILD_TOOL_BIN="${SHARED_TARGET}/release/theyos-engine-build"
-if [ ! -x "${BUILD_TOOL_BIN}" ]; then
-  echo "error: canonical build helper was not produced by the env tooth" >&2
-  exit 1
-fi
 if CARGO_TARGET_AARCH64_APPLE_DARWIN_RUSTFLAGS='--cfg feature="dev_t1_datapath" --cfg feature="dev_claw_share_mint" -C debug-assertions=yes' \
     CARGO_TARGET_DIR="${SHARED_TARGET}" \
     "${BUILD_TOOL_BIN}" build "${HOST_TARGET}" cargo \
