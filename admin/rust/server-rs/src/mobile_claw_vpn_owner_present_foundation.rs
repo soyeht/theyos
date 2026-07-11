@@ -7,6 +7,8 @@
 
 use std::{
     fmt,
+    marker::PhantomData,
+    rc::Rc,
     sync::{Arc, Mutex, MutexGuard},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -240,7 +242,7 @@ impl OwnerAuthoritySnapshot {
 }
 
 #[derive(Clone)]
-struct PendingBinding {
+struct StoredBinding {
     member_scope: MemberScope,
     config_generation: u64,
     config_digest: [u8; 32],
@@ -253,9 +255,9 @@ struct PendingBinding {
     expires_at_unix_seconds: u64,
 }
 
-impl fmt::Debug for PendingBinding {
+impl fmt::Debug for StoredBinding {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("PendingBinding")
+        f.debug_struct("StoredBinding")
             .field("member", &"<redacted>")
             .field("config_generation", &self.config_generation)
             .field("config", &"<redacted>")
@@ -266,7 +268,7 @@ impl fmt::Debug for PendingBinding {
     }
 }
 
-impl PendingBinding {
+impl StoredBinding {
     fn from_trusted_state(
         member_id: &str,
         selection: &ConfigSelection,
@@ -347,14 +349,81 @@ impl PendingBinding {
             && self.context_canonical.as_ref() == other.context_canonical.as_ref()
     }
 
-    fn caller_scope(&self) -> CallerScope {
-        CallerScope {
-            member_scope: self.member_scope.clone(),
-        }
-    }
-
     fn matches_caller(&self, caller: &CallerScope) -> bool {
         bool::from(self.member_scope.ct_eq_choice(&caller.member_scope))
+    }
+}
+
+// Start state is consumed when the pending record is committed. It cannot be
+// retained and replayed as point-of-use freshness evidence.
+struct StartServerBinding {
+    stored: StoredBinding,
+}
+
+impl StartServerBinding {
+    fn from_trusted_state(
+        member_id: &str,
+        selection: &ConfigSelection,
+        tuple: &MobileClawVpnDevE2eExecutionTupleV1,
+        context: &OwnerApprovalContextV2,
+        authority: &OwnerAuthoritySnapshot,
+    ) -> Result<Self, FoundationError> {
+        Ok(Self {
+            stored: StoredBinding::from_trusted_state(
+                member_id, selection, tuple, context, authority,
+            )?,
+        })
+    }
+}
+
+struct PointOfUseMarker;
+
+// The mutable marker makes the permit lexical: it cannot outlive the one
+// synchronous rederivation invocation that received it. The remaining fields
+// bind that invocation to one concrete store entry and authenticated member.
+struct PointOfUsePermit<'permit> {
+    _invocation: &'permit mut PointOfUseMarker,
+    _not_send_or_sync: PhantomData<Rc<()>>,
+    store_identity: usize,
+    entry_id: u64,
+    member_scope: MemberScope,
+}
+
+struct FreshServerBinding<'permit> {
+    stored: StoredBinding,
+    permit: PointOfUsePermit<'permit>,
+}
+
+impl<'permit> FreshServerBinding<'permit> {
+    fn from_trusted_state(
+        permit: PointOfUsePermit<'permit>,
+        member_id: &str,
+        selection: &ConfigSelection,
+        tuple: &MobileClawVpnDevE2eExecutionTupleV1,
+        context: &OwnerApprovalContextV2,
+        authority: &OwnerAuthoritySnapshot,
+    ) -> Result<Self, FoundationError> {
+        let stored =
+            StoredBinding::from_trusted_state(member_id, selection, tuple, context, authority)?;
+        if !bool::from(stored.member_scope.ct_eq_choice(&permit.member_scope)) {
+            return Err(FoundationError::Rejected);
+        }
+        Ok(Self { stored, permit })
+    }
+
+    fn into_stored_for(
+        self,
+        store_identity: usize,
+        entry_id: u64,
+        member_scope: &MemberScope,
+    ) -> Result<StoredBinding, FoundationError> {
+        if self.permit.store_identity != store_identity
+            || self.permit.entry_id != entry_id
+            || !bool::from(self.permit.member_scope.ct_eq_choice(member_scope))
+        {
+            return Err(FoundationError::Rejected);
+        }
+        Ok(self.stored)
     }
 }
 
@@ -365,6 +434,14 @@ impl PendingBinding {
 #[derive(Clone)]
 struct CallerScope {
     member_scope: MemberScope,
+}
+
+impl CallerScope {
+    fn from_server_derived_member(member_id: &str) -> Result<Self, FoundationError> {
+        Ok(Self {
+            member_scope: MemberScope::from_server_derived(member_id)?,
+        })
+    }
 }
 
 impl fmt::Debug for CallerScope {
@@ -452,41 +529,15 @@ impl fmt::Debug for ProofToken {
     }
 }
 
-// This value proves only that a legitimate member irreversibly consumed the
-// token. It is not authority: server-derived config, tuple, context, and owner
-// state must still match before it can become a revalidated capability.
-#[must_use = "a consumed token must be revalidated against current server state"]
-struct ConsumedCapability {
-    binding: PendingBinding,
-}
-
-impl fmt::Debug for ConsumedCapability {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str("ConsumedCapability(<redacted>)")
-    }
-}
-
-impl ConsumedCapability {
-    fn revalidate(
-        self,
-        current: &PendingBinding,
-    ) -> Result<RevalidatedCapability, FoundationError> {
-        if !self.binding.matches(current) {
-            return Err(FoundationError::Rejected);
-        }
-        Ok(RevalidatedCapability {
-            binding: self.binding,
-        })
-    }
-}
-
 // Only this post-tombstone type may feed the later Mesh transaction. It is
 // deliberately still not a Mesh freshness proof: the transaction must check
 // member_devices, the full (member, device, claw) grant, and availability
 // under the shared Mesh lock.
 #[must_use = "a revalidated capability must be consumed by the later transaction"]
 struct RevalidatedCapability {
-    binding: PendingBinding,
+    binding: StoredBinding,
+    deadline: Instant,
+    signed_wall_expiry: Duration,
 }
 
 impl fmt::Debug for RevalidatedCapability {
@@ -543,24 +594,28 @@ impl CapabilityStore {
         Ok((inner, reading))
     }
 
+    fn identity(&self) -> usize {
+        Arc::as_ptr(&self.inner).cast::<()>() as usize
+    }
+
     fn reserve(
         &self,
-        member_scope: MemberScope,
+        caller: &CallerScope,
         ttl: Duration,
     ) -> Result<ReservationHandle, FoundationError> {
         let mut rng = OsRng;
-        self.reserve_with_rng(member_scope, ttl, &mut rng)
+        self.reserve_with_rng(caller, ttl, &mut rng)
     }
 
     fn reserve_with_rng<R: CryptoRng + RngCore>(
         &self,
-        member_scope: MemberScope,
+        caller: &CallerScope,
         ttl: Duration,
         rng: &mut R,
     ) -> Result<ReservationHandle, FoundationError> {
         let (mut inner, now) = self.lock_at_current_time()?;
-        inner.prune_expired(now.monotonic);
-        inner.validate_reservation_capacity(&member_scope, ttl)?;
+        inner.prune_expired(now);
+        inner.validate_reservation_capacity(&caller.member_scope, ttl)?;
         let deadline = now
             .monotonic
             .checked_add(ttl)
@@ -589,11 +644,12 @@ impl CapabilityStore {
             }
             inner.entries.push(StoreEntry {
                 entry_id,
-                member_scope,
+                member_scope: caller.member_scope.clone(),
                 reservation_hash,
                 challenge_hash: None,
                 proof_token_hash: None,
                 deadline,
+                signed_wall_expiry: None,
                 state: EntryState::Reserved,
             });
             return Ok(ReservationHandle(secret));
@@ -604,7 +660,7 @@ impl CapabilityStore {
     fn release_reserved(&self, reservation: &ReservationHandle) -> Result<(), FoundationError> {
         let target = domain_hash(RESERVATION_HASH_DOMAIN, &reservation.0);
         let (mut inner, now) = self.lock_at_current_time()?;
-        inner.prune_expired(now.monotonic);
+        inner.prune_expired(now);
         let lookup = inner.lookup_hash_ct(LookupKind::Reserved, &target);
         let index = lookup.unique_index()?;
         inner.entries.swap_remove(index);
@@ -615,12 +671,13 @@ impl CapabilityStore {
         &self,
         reservation: &ReservationHandle,
         challenge: &ChallengeHandle,
-        binding: PendingBinding,
+        binding: StartServerBinding,
     ) -> Result<(), FoundationError> {
+        let binding = binding.stored;
         let reservation_hash = domain_hash(RESERVATION_HASH_DOMAIN, &reservation.0);
         let challenge_hash = domain_hash(CHALLENGE_HASH_DOMAIN, &challenge.0);
         let (mut inner, now) = self.lock_at_current_time()?;
-        inner.prune_expired(now.monotonic);
+        inner.prune_expired(now);
         let lookup = inner.lookup_hash_ct(LookupKind::Reserved, &reservation_hash);
         let index = lookup.unique_index()?;
         if !bool::from(
@@ -650,8 +707,9 @@ impl CapabilityStore {
         {
             return Err(FoundationError::Rejected);
         }
-        inner.entries[index].deadline = pending_deadline;
         inner.entries[index].transition(EntryState::Pending { binding })?;
+        inner.entries[index].deadline = pending_deadline;
+        inner.entries[index].signed_wall_expiry = Some(signed_expires_at);
         inner.entries[index].challenge_hash = Some(challenge_hash);
         Ok(())
     }
@@ -663,13 +721,10 @@ impl CapabilityStore {
     ) -> Result<FinishingClaim, FoundationError> {
         let challenge_hash = domain_hash(CHALLENGE_HASH_DOMAIN, &challenge.0);
         let (mut inner, now) = self.lock_at_current_time()?;
-        inner.prune_expired(now.monotonic);
+        inner.prune_expired(now);
         let lookup = inner.lookup_hash_ct(LookupKind::PendingChallenge, &challenge_hash);
         let index = lookup.unique_index()?;
-        if now.monotonic >= inner.entries[index].deadline {
-            inner.entries[index].transition(EntryState::Burned)?;
-            return Err(FoundationError::Expired);
-        }
+        inner.entries[index].expire_live_at(now)?;
         let EntryState::Pending {
             binding: stored, ..
         } = &inner.entries[index].state
@@ -681,10 +736,12 @@ impl CapabilityStore {
         }
         let binding = stored.clone();
         let entry_id = inner.entries[index].entry_id;
+        let member_scope = stored.member_scope.clone();
         inner.entries[index].transition(EntryState::Finishing { binding })?;
         Ok(FinishingClaim {
             store: self.clone(),
             entry_id,
+            member_scope,
             active: true,
         })
     }
@@ -692,39 +749,75 @@ impl CapabilityStore {
     // Taking ownership makes the caller surrender the bearer value even on a
     // rejected attempt; `ProofToken` zeroizes its plaintext in `Drop`.
     #[allow(clippy::needless_pass_by_value)]
-    fn consume_proof(
+    fn consume_proof<F>(
         &self,
         token: ProofToken,
         caller: &CallerScope,
-    ) -> Result<ConsumedCapability, FoundationError> {
+        rederive: F,
+    ) -> Result<RevalidatedCapability, FoundationError>
+    where
+        F: for<'permit> FnOnce(
+            PointOfUsePermit<'permit>,
+        ) -> Result<FreshServerBinding<'permit>, FoundationError>,
+    {
         let token_hash = domain_hash(PROOF_TOKEN_HASH_DOMAIN, token.as_bytes());
-        let (mut inner, now) = self.lock_at_current_time()?;
-        inner.prune_expired(now.monotonic);
-        let lookup = inner.lookup_hash_ct(LookupKind::ProofToken, &token_hash);
-        let index = lookup.unique_index()?;
-        let EntryState::ProofIssued {
-            binding: stored, ..
-        } = &inner.entries[index].state
-        else {
-            return Err(FoundationError::Rejected);
+        let (stored, entry_id, member_scope, deadline, signed_wall_expiry) = {
+            let (mut inner, now) = self.lock_at_current_time()?;
+            inner.prune_expired(now);
+            let lookup = inner.lookup_hash_ct(LookupKind::ProofToken, &token_hash);
+            let index = lookup.unique_index()?;
+            inner.entries[index].expire_live_at(now)?;
+            let EntryState::ProofIssued {
+                binding: stored, ..
+            } = &inner.entries[index].state
+            else {
+                return Err(FoundationError::Rejected);
+            };
+            if !stored.matches_caller(caller) {
+                return Err(FoundationError::Rejected);
+            }
+            let stored = stored.clone();
+            let entry_id = inner.entries[index].entry_id;
+            let member_scope = stored.member_scope.clone();
+            let deadline = inner.entries[index].deadline;
+            let signed_wall_expiry = inner.entries[index].signed_wall_expiry;
+            inner.entries[index].transition(EntryState::Burned)?;
+            (stored, entry_id, member_scope, deadline, signed_wall_expiry)
         };
-        if !stored.matches_caller(caller) {
+        let signed_wall_expiry = signed_wall_expiry.ok_or(FoundationError::InvalidDeadline)?;
+
+        let mut invocation = PointOfUseMarker;
+        let fresh = rederive(PointOfUsePermit {
+            _invocation: &mut invocation,
+            _not_send_or_sync: PhantomData,
+            store_identity: self.identity(),
+            entry_id,
+            member_scope: member_scope.clone(),
+        })?;
+        let current = fresh.into_stored_for(self.identity(), entry_id, &member_scope)?;
+        if !stored.matches(&current) {
             return Err(FoundationError::Rejected);
         }
-        let binding = stored.clone();
-        inner.entries[index].transition(EntryState::Burned)?;
-        Ok(ConsumedCapability { binding })
+        let (_inner, now) = self.lock_at_current_time()?;
+        if now.monotonic >= deadline || now.wall >= signed_wall_expiry {
+            return Err(FoundationError::Expired);
+        }
+        Ok(RevalidatedCapability {
+            binding: stored,
+            deadline,
+            signed_wall_expiry,
+        })
     }
 
     fn status(&self) -> Result<StoreStatus, FoundationError> {
         let (mut inner, now) = self.lock_at_current_time()?;
-        inner.prune_expired(now.monotonic);
+        inner.prune_expired(now);
         Ok(inner.status())
     }
 
     fn prune_expired(&self) -> Result<(), FoundationError> {
         let (mut inner, now) = self.lock_at_current_time()?;
-        inner.prune_expired(now.monotonic);
+        inner.prune_expired(now);
         Ok(())
     }
 
@@ -751,6 +844,7 @@ impl CapabilityStore {
 struct FinishingClaim {
     store: CapabilityStore,
     entry_id: u64,
+    member_scope: MemberScope,
     active: bool,
 }
 
@@ -761,38 +855,68 @@ impl fmt::Debug for FinishingClaim {
 }
 
 impl FinishingClaim {
-    fn issue_proof(
-        self,
-        expected: &PendingBinding,
-        ttl: Duration,
-    ) -> Result<ProofToken, FoundationError> {
+    fn issue_proof<F>(self, ttl: Duration, rederive: F) -> Result<ProofToken, FoundationError>
+    where
+        F: for<'permit> FnOnce(
+            PointOfUsePermit<'permit>,
+        ) -> Result<FreshServerBinding<'permit>, FoundationError>,
+    {
         let mut rng = OsRng;
-        self.issue_proof_with_rng(expected, ttl, &mut rng)
+        self.issue_proof_with_rng(ttl, rederive, &mut rng)
     }
 
-    fn issue_proof_with_rng<R: CryptoRng + RngCore>(
+    fn issue_proof_with_rng<F, R>(
         mut self,
-        expected: &PendingBinding,
         ttl: Duration,
+        rederive: F,
         rng: &mut R,
-    ) -> Result<ProofToken, FoundationError> {
-        let (mut inner, now) = self.store.lock_at_current_time()?;
-        if ttl.is_zero() || ttl > inner.limits.max_proof_ttl {
-            return Err(FoundationError::InvalidDeadline);
+    ) -> Result<ProofToken, FoundationError>
+    where
+        F: for<'permit> FnOnce(
+            PointOfUsePermit<'permit>,
+        ) -> Result<FreshServerBinding<'permit>, FoundationError>,
+        R: CryptoRng + RngCore,
+    {
+        {
+            let (mut inner, now) = self.store.lock_at_current_time()?;
+            if ttl.is_zero() || ttl > inner.limits.max_proof_ttl {
+                return Err(FoundationError::InvalidDeadline);
+            }
+            let index = inner
+                .entries
+                .iter()
+                .position(|entry| entry.entry_id == self.entry_id)
+                .ok_or(FoundationError::Rejected)?;
+            inner.entries[index].expire_live_at(now)?;
+            if !matches!(inner.entries[index].state, EntryState::Finishing { .. }) {
+                return Err(FoundationError::Rejected);
+            }
         }
+
+        let mut invocation = PointOfUseMarker;
+        let fresh = rederive(PointOfUsePermit {
+            _invocation: &mut invocation,
+            _not_send_or_sync: PhantomData,
+            store_identity: self.store.identity(),
+            entry_id: self.entry_id,
+            member_scope: self.member_scope.clone(),
+        })?;
+        let current =
+            fresh.into_stored_for(self.store.identity(), self.entry_id, &self.member_scope)?;
+
+        // This second sample is the point-of-transition check. Even a
+        // synchronous trusted-state read may cross signed expiry.
+        let (mut inner, now) = self.store.lock_at_current_time()?;
         let index = inner
             .entries
             .iter()
             .position(|entry| entry.entry_id == self.entry_id)
             .ok_or(FoundationError::Rejected)?;
-        if now.monotonic >= inner.entries[index].deadline {
-            inner.entries[index].transition(EntryState::Burned)?;
-            return Err(FoundationError::Expired);
-        }
+        inner.entries[index].expire_live_at(now)?;
         let EntryState::Finishing { binding } = &inner.entries[index].state else {
             return Err(FoundationError::Rejected);
         };
-        if !binding.matches(expected) {
+        if !binding.matches(&current) {
             return Err(FoundationError::Rejected);
         }
         let ttl_deadline = now
@@ -887,23 +1011,28 @@ impl StoreInner {
         Ok(())
     }
 
-    fn prune_expired(&mut self, now: Instant) {
+    fn prune_expired(&mut self, now: ClockReading) {
         let mut retained = Vec::with_capacity(self.entries.len());
         for mut entry in self.entries.drain(..) {
-            if now < entry.deadline {
-                retained.push(entry);
-                continue;
-            }
             match entry.state {
-                EntryState::Pending { .. }
-                | EntryState::Finishing { .. }
-                | EntryState::ProofIssued { .. } => {
-                    let _ = entry.transition(EntryState::Burned);
-                    entry.deadline = now;
+                EntryState::Burned if now.monotonic <= entry.deadline => {
                     retained.push(entry);
                 }
-                EntryState::Burned if now <= entry.deadline => retained.push(entry),
-                EntryState::Reserved | EntryState::Burned => {}
+                EntryState::Burned => {}
+                EntryState::Reserved if now.monotonic >= entry.deadline => {}
+                EntryState::Pending { .. }
+                | EntryState::Finishing { .. }
+                | EntryState::ProofIssued { .. }
+                    if entry.is_live_expired(now) =>
+                {
+                    let _ = entry.transition(EntryState::Burned);
+                    entry.deadline = now.monotonic;
+                    retained.push(entry);
+                }
+                EntryState::Reserved
+                | EntryState::Pending { .. }
+                | EntryState::Finishing { .. }
+                | EntryState::ProofIssued { .. } => retained.push(entry),
             }
         }
         self.entries = retained;
@@ -960,14 +1089,15 @@ struct StoreEntry {
     challenge_hash: Option<[u8; 32]>,
     proof_token_hash: Option<[u8; 32]>,
     deadline: Instant,
+    signed_wall_expiry: Option<Duration>,
     state: EntryState,
 }
 
 enum EntryState {
     Reserved,
-    Pending { binding: PendingBinding },
-    Finishing { binding: PendingBinding },
-    ProofIssued { binding: PendingBinding },
+    Pending { binding: StoredBinding },
+    Finishing { binding: StoredBinding },
+    ProofIssued { binding: StoredBinding },
     Burned,
 }
 
@@ -1027,6 +1157,38 @@ enum LookupKind {
 }
 
 impl StoreEntry {
+    fn is_live_expired(&self, now: ClockReading) -> bool {
+        match self.state {
+            EntryState::Reserved => now.monotonic >= self.deadline,
+            EntryState::Pending { .. }
+            | EntryState::Finishing { .. }
+            | EntryState::ProofIssued { .. } => {
+                now.monotonic >= self.deadline
+                    || self
+                        .signed_wall_expiry
+                        .is_none_or(|expiry| now.wall >= expiry)
+            }
+            EntryState::Burned => false,
+        }
+    }
+
+    fn expire_live_at(&mut self, now: ClockReading) -> Result<(), FoundationError> {
+        if !self.is_live_expired(now) {
+            return Ok(());
+        }
+        match self.state {
+            EntryState::Reserved => Err(FoundationError::Expired),
+            EntryState::Pending { .. }
+            | EntryState::Finishing { .. }
+            | EntryState::ProofIssued { .. } => {
+                self.transition(EntryState::Burned)?;
+                self.deadline = now.monotonic;
+                Err(FoundationError::Expired)
+            }
+            EntryState::Burned => Err(FoundationError::Rejected),
+        }
+    }
+
     fn transition(&mut self, next: EntryState) -> Result<(), FoundationError> {
         if !self.state.kind().can_transition_to(next.kind()) {
             return Err(FoundationError::InvalidTransition);
@@ -1199,6 +1361,7 @@ fn domain_hash(domain: &[u8], value: &[u8]) -> [u8; 32] {
 mod tests {
     use std::{
         panic::{AssertUnwindSafe, catch_unwind},
+        sync::atomic::{AtomicUsize, Ordering},
         thread,
     };
 
@@ -1263,6 +1426,16 @@ mod tests {
             state.reading.wall = state.reading.wall.checked_add(duration).unwrap();
         }
 
+        fn advance_monotonic(&self, duration: Duration) {
+            let mut state = self.state.lock().unwrap();
+            state.reading.monotonic = state.reading.monotonic.checked_add(duration).unwrap();
+        }
+
+        fn advance_wall(&self, duration: Duration) {
+            let mut state = self.state.lock().unwrap();
+            state.reading.wall = state.reading.wall.checked_add(duration).unwrap();
+        }
+
         fn regress(&self, duration: Duration) {
             let mut state = self.state.lock().unwrap();
             state.reading.monotonic = state.reading.monotonic.checked_sub(duration).unwrap();
@@ -1324,78 +1497,156 @@ mod tests {
         HouseholdId::parse(format!("hh_{}", "a".repeat(52))).unwrap()
     }
 
-    fn binding(member_id: &str, selector: ClawSelector, marker: u8) -> PendingBinding {
-        binding_with_times(member_id, selector, marker, 1_000, 1_060)
-    }
-
-    fn binding_with_times(
-        member_id: &str,
+    #[derive(Clone)]
+    struct BindingFixture {
+        member_id: String,
         selector: ClawSelector,
-        marker: u8,
+        tuple_marker: u8,
+        replay_marker: u8,
+        config_generation: u64,
+        authority_head_sequence: u64,
+        authority_head_marker: u8,
+        credential_marker: u8,
         issued_at: u64,
         expires_at: u64,
-    ) -> PendingBinding {
-        let config = config();
-        let selection = config.resolve(selector);
-        let tuple =
-            MobileClawVpnDevE2eExecutionTupleV1::new(MobileClawVpnDevE2eExecutionTupleInput {
-                hh_id: household_id(),
-                engine_audience: [marker; 32],
+    }
+
+    impl BindingFixture {
+        fn new(member_id: &str, selector: ClawSelector, marker: u8) -> Self {
+            Self::with_times(member_id, selector, marker, 1_000, 1_060)
+        }
+
+        fn with_times(
+            member_id: &str,
+            selector: ClawSelector,
+            marker: u8,
+            issued_at: u64,
+            expires_at: u64,
+        ) -> Self {
+            Self {
                 member_id: member_id.to_string(),
-                attempt_id: "11111111-1111-4111-8111-111111111111".to_string(),
-                readiness_run_id: "22222222-2222-4222-8222-222222222222".to_string(),
-                source_artifact_git_sha1: [0x33; 20],
-                execution_manifest_sha256: [0x44; 32],
-                device_binding: [0x55; 32],
-                execution_run_id: "33333333-3333-4333-8333-333333333333".to_string(),
-                execution_claim_sha256: [0x66; 32],
-                device_id: selection.device_id.clone(),
-                claw_id: selection.claw_id.clone(),
-                device_alias: "Device-D".to_string(),
-                claw_alias: selector.as_str().to_string(),
+                selector,
+                tuple_marker: marker,
+                replay_marker: 0xaa,
+                config_generation: 7,
+                authority_head_sequence: 9,
+                authority_head_marker: 0x88,
+                credential_marker: 0x99,
                 issued_at,
                 expires_at,
-                server_nonce: [0x77; 32],
-            });
-        let authority = OwnerAuthoritySnapshot {
-            owner_p_id: PersonId("p_owner-alpha".to_string()),
-            head_sequence: 9,
-            head_hash: [0x88; 32],
-            credential_set_digest: [0x99; 32],
-        };
-        let context = OwnerApprovalContextV2::mobile_claw_vpn_dev_e2e_execute(
-            MobileClawVpnDevE2eApprovalContextInput {
-                owner_p_id: authority.owner_p_id.clone(),
-                execution: &tuple,
-                replay_nonce: [0xaa; 32],
-            },
-        )
-        .unwrap();
-        PendingBinding::from_trusted_state(member_id, &selection, &tuple, &context, &authority)
+            }
+        }
+
+        fn trusted_parts(
+            &self,
+        ) -> (
+            ConfigSelection,
+            MobileClawVpnDevE2eExecutionTupleV1,
+            OwnerApprovalContextV2,
+            OwnerAuthoritySnapshot,
+        ) {
+            let config = TrustedConfig::try_new(TrustedConfigInput {
+                generation: self.config_generation,
+                bundle_id: MOBILE_CLAW_VPN_DEV_E2E_BUNDLE_ID,
+                device_id: "device-alpha",
+                claw_m_id: "claw-m-alpha",
+                claw_l_id: "claw-l-alpha",
+            })
+            .unwrap();
+            let selection = config.resolve(self.selector);
+            let tuple =
+                MobileClawVpnDevE2eExecutionTupleV1::new(MobileClawVpnDevE2eExecutionTupleInput {
+                    hh_id: household_id(),
+                    engine_audience: [self.tuple_marker; 32],
+                    member_id: self.member_id.clone(),
+                    attempt_id: "11111111-1111-4111-8111-111111111111".to_string(),
+                    readiness_run_id: "22222222-2222-4222-8222-222222222222".to_string(),
+                    source_artifact_git_sha1: [0x33; 20],
+                    execution_manifest_sha256: [0x44; 32],
+                    device_binding: [0x55; 32],
+                    execution_run_id: "33333333-3333-4333-8333-333333333333".to_string(),
+                    execution_claim_sha256: [0x66; 32],
+                    device_id: selection.device_id.clone(),
+                    claw_id: selection.claw_id.clone(),
+                    device_alias: "Device-D".to_string(),
+                    claw_alias: self.selector.as_str().to_string(),
+                    issued_at: self.issued_at,
+                    expires_at: self.expires_at,
+                    server_nonce: [0x77; 32],
+                });
+            let authority = OwnerAuthoritySnapshot {
+                owner_p_id: PersonId("p_owner-alpha".to_string()),
+                head_sequence: self.authority_head_sequence,
+                head_hash: [self.authority_head_marker; 32],
+                credential_set_digest: [self.credential_marker; 32],
+            };
+            let context = OwnerApprovalContextV2::mobile_claw_vpn_dev_e2e_execute(
+                MobileClawVpnDevE2eApprovalContextInput {
+                    owner_p_id: authority.owner_p_id.clone(),
+                    execution: &tuple,
+                    replay_nonce: [self.replay_marker; 32],
+                },
+            )
+            .unwrap();
+            (selection, tuple, context, authority)
+        }
+
+        fn start(&self) -> StartServerBinding {
+            let (selection, tuple, context, authority) = self.trusted_parts();
+            StartServerBinding::from_trusted_state(
+                &self.member_id,
+                &selection,
+                &tuple,
+                &context,
+                &authority,
+            )
             .unwrap()
+        }
+
+        fn fresh<'permit>(
+            &self,
+            permit: PointOfUsePermit<'permit>,
+        ) -> Result<FreshServerBinding<'permit>, FoundationError> {
+            let (selection, tuple, context, authority) = self.trusted_parts();
+            FreshServerBinding::from_trusted_state(
+                permit,
+                &self.member_id,
+                &selection,
+                &tuple,
+                &context,
+                &authority,
+            )
+        }
+
+        fn stored(&self) -> StoredBinding {
+            self.start().stored
+        }
+
+        fn caller(&self) -> CallerScope {
+            CallerScope::from_server_derived_member(&self.member_id).unwrap()
+        }
     }
 
     fn pending(
         store: &CapabilityStore,
-        binding: &PendingBinding,
+        fixture: &BindingFixture,
         challenge_byte: u8,
     ) -> (ReservationHandle, ChallengeHandle) {
-        let reservation = store
-            .reserve(binding.member_scope.clone(), Duration::from_secs(60))
-            .unwrap();
+        let caller = fixture.caller();
+        let reservation = store.reserve(&caller, Duration::from_secs(60)).unwrap();
         let challenge = ChallengeHandle::from_server_random([challenge_byte; 32]).unwrap();
         store
-            .commit_pending(&reservation, &challenge, binding.clone())
+            .commit_pending(&reservation, &challenge, fixture.start())
             .unwrap();
         (reservation, challenge)
     }
 
-    fn issued(store: &CapabilityStore, binding: &PendingBinding, challenge_byte: u8) -> ProofToken {
-        let (_, challenge) = pending(store, binding, challenge_byte);
+    fn issued(store: &CapabilityStore, fixture: &BindingFixture, challenge_byte: u8) -> ProofToken {
+        let (_, challenge) = pending(store, fixture, challenge_byte);
         store
-            .claim_finishing(&challenge, &binding.caller_scope())
+            .claim_finishing(&challenge, &fixture.caller())
             .unwrap()
-            .issue_proof(binding, Duration::from_secs(20))
+            .issue_proof(Duration::from_secs(20), |permit| fixture.fresh(permit))
             .unwrap()
     }
 
@@ -1564,7 +1815,7 @@ mod tests {
         }
 
         assert!(
-            PendingBinding::from_trusted_state(
+            StoredBinding::from_trusted_state(
                 "member-beta",
                 &selection,
                 &tuple,
@@ -1575,7 +1826,7 @@ mod tests {
         );
         let wrong_selection = config.resolve(ClawSelector::ClawL);
         assert!(
-            PendingBinding::from_trusted_state(
+            StoredBinding::from_trusted_state(
                 "member-alpha",
                 &wrong_selection,
                 &tuple,
@@ -1589,7 +1840,7 @@ mod tests {
             ..authority.clone()
         };
         assert!(
-            PendingBinding::from_trusted_state(
+            StoredBinding::from_trusted_state(
                 "member-alpha",
                 &selection,
                 &tuple,
@@ -1628,22 +1879,30 @@ mod tests {
         }
 
         let store = test_store(limits(8, 4));
-        let binding = binding("member-alpha", ClawSelector::ClawM, 0x10);
+        let binding = BindingFixture::new("member-alpha", ClawSelector::ClawM, 0x10);
         let reservation = store
-            .reserve(binding.member_scope.clone(), Duration::from_secs(60))
+            .reserve(&binding.caller(), Duration::from_secs(60))
             .unwrap();
+        assert_eq!(
+            store.lock_operation().unwrap().entries[0].signed_wall_expiry,
+            None
+        );
         assert_eq!(store.status().unwrap().reserved, 1);
         store.release_reserved(&reservation).unwrap();
         assert_eq!(store.status().unwrap().total, 0);
 
         let (reservation, challenge) = pending(&store, &binding, 0x11);
+        assert_eq!(
+            store.lock_operation().unwrap().entries[0].signed_wall_expiry,
+            Some(Duration::from_secs(1_060))
+        );
         assert_eq!(store.status().unwrap().pending, 1);
         assert_eq!(
             store.release_reserved(&reservation),
             Err(FoundationError::Rejected)
         );
         let claim = store
-            .claim_finishing(&challenge, &binding.caller_scope())
+            .claim_finishing(&challenge, &binding.caller())
             .unwrap();
         assert_eq!(store.status().unwrap().finishing, 1);
         drop(claim);
@@ -1656,7 +1915,7 @@ mod tests {
             }
         );
         assert!(matches!(
-            store.claim_finishing(&challenge, &binding.caller_scope()),
+            store.claim_finishing(&challenge, &binding.caller()),
             Err(FoundationError::Rejected)
         ));
     }
@@ -1665,22 +1924,22 @@ mod tests {
     fn finishing_drop_explicit_error_and_unwind_burn_synchronously() {
         for mode in ["drop", "explicit", "panic"] {
             let store = test_store(limits(4, 2));
-            let binding = binding("member-alpha", ClawSelector::ClawM, 0x20);
+            let binding = BindingFixture::new("member-alpha", ClawSelector::ClawM, 0x20);
             let (_, challenge) = pending(&store, &binding, 0x21);
             match mode {
                 "drop" => drop(
                     store
-                        .claim_finishing(&challenge, &binding.caller_scope())
+                        .claim_finishing(&challenge, &binding.caller())
                         .unwrap(),
                 ),
                 "explicit" => store
-                    .claim_finishing(&challenge, &binding.caller_scope())
+                    .claim_finishing(&challenge, &binding.caller())
                     .unwrap()
                     .burn(),
                 "panic" => {
                     let unwind = catch_unwind(AssertUnwindSafe(|| {
                         let _claim = store
-                            .claim_finishing(&challenge, &binding.caller_scope())
+                            .claim_finishing(&challenge, &binding.caller())
                             .unwrap();
                         panic!("synthetic unwind");
                     }));
@@ -1695,16 +1954,72 @@ mod tests {
     }
 
     #[test]
+    fn point_of_use_rederivation_error_and_panic_burn_outside_store_lock() {
+        for mode in ["error", "panic"] {
+            let store = test_store(limits(4, 2));
+            let binding = BindingFixture::new("member-alpha", ClawSelector::ClawM, 0x21);
+            let (_, challenge) = pending(&store, &binding, 0x22);
+            let claim = store
+                .claim_finishing(&challenge, &binding.caller())
+                .unwrap();
+            match mode {
+                "error" => assert!(matches!(
+                    claim.issue_proof(Duration::from_secs(20), |_permit| {
+                        Err(FoundationError::InvalidBinding)
+                    }),
+                    Err(FoundationError::InvalidBinding)
+                )),
+                "panic" => {
+                    let unwind = catch_unwind(AssertUnwindSafe(|| {
+                        let _ = claim.issue_proof(Duration::from_secs(20), |_permit| {
+                            panic!("synthetic trusted-state panic")
+                        });
+                    }));
+                    assert!(unwind.is_err());
+                }
+                _ => unreachable!(),
+            }
+            assert!(
+                store.inner.lock().is_ok(),
+                "closure must run outside the mutex"
+            );
+            assert_eq!(store.status().unwrap().burned, 1);
+        }
+    }
+
+    #[test]
+    fn point_of_use_permit_is_bound_to_the_claimed_entry() {
+        let store = test_store(limits(4, 2));
+        let binding = BindingFixture::new("member-alpha", ClawSelector::ClawM, 0x23);
+        let (_, challenge) = pending(&store, &binding, 0x24);
+        let claim = store
+            .claim_finishing(&challenge, &binding.caller())
+            .unwrap();
+        assert!(matches!(
+            claim.issue_proof(Duration::from_secs(20), |mut permit| {
+                permit.entry_id = permit.entry_id.checked_add(1).unwrap();
+                binding.fresh(permit)
+            }),
+            Err(FoundationError::Rejected)
+        ));
+        assert_eq!(store.status().unwrap().burned, 1);
+    }
+
+    #[test]
     fn panic_while_store_lock_is_held_still_burns_before_unwind_returns() {
         let store = test_store(limits(4, 2));
-        let binding = binding("member-alpha", ClawSelector::ClawM, 0x22);
+        let binding = BindingFixture::new("member-alpha", ClawSelector::ClawM, 0x22);
         let (_, challenge) = pending(&store, &binding, 0x23);
         let unwind = catch_unwind(AssertUnwindSafe(|| {
             let claim = store
-                .claim_finishing(&challenge, &binding.caller_scope())
+                .claim_finishing(&challenge, &binding.caller())
                 .unwrap();
             let mut rng = PanicRng;
-            let _ = claim.issue_proof_with_rng(&binding, Duration::from_secs(20), &mut rng);
+            let _ = claim.issue_proof_with_rng(
+                Duration::from_secs(20),
+                |permit| binding.fresh(permit),
+                &mut rng,
+            );
         }));
         assert!(unwind.is_err());
         let inner = match store.inner.lock() {
@@ -1718,14 +2033,14 @@ mod tests {
     #[test]
     fn clock_failure_after_finishing_claim_burns_synchronously() {
         let (store, clock) = store_with_clock(limits(4, 2));
-        let binding = binding("member-alpha", ClawSelector::ClawM, 0x24);
+        let binding = BindingFixture::new("member-alpha", ClawSelector::ClawM, 0x24);
         let (_, challenge) = pending(&store, &binding, 0x25);
         let claim = store
-            .claim_finishing(&challenge, &binding.caller_scope())
+            .claim_finishing(&challenge, &binding.caller())
             .unwrap();
         clock.set_fail_reads(true);
         assert!(matches!(
-            claim.issue_proof(&binding, Duration::from_secs(20)),
+            claim.issue_proof(Duration::from_secs(20), |permit| binding.fresh(permit)),
             Err(FoundationError::InvalidClock)
         ));
         clock.set_fail_reads(false);
@@ -1737,14 +2052,14 @@ mod tests {
     #[test]
     fn clock_regression_after_finishing_claim_burns_synchronously() {
         let (store, clock) = store_with_clock(limits(4, 2));
-        let binding = binding("member-alpha", ClawSelector::ClawM, 0x26);
+        let binding = BindingFixture::new("member-alpha", ClawSelector::ClawM, 0x26);
         let (_, challenge) = pending(&store, &binding, 0x27);
         let claim = store
-            .claim_finishing(&challenge, &binding.caller_scope())
+            .claim_finishing(&challenge, &binding.caller())
             .unwrap();
         clock.regress(Duration::from_secs(1));
         assert!(matches!(
-            claim.issue_proof(&binding, Duration::from_secs(20)),
+            claim.issue_proof(Duration::from_secs(20), |permit| binding.fresh(permit)),
             Err(FoundationError::ClockRegressed)
         ));
         clock.advance(Duration::from_secs(1));
@@ -1756,14 +2071,14 @@ mod tests {
     #[test]
     fn wrong_member_preserves_but_finish_freshness_mismatch_burns() {
         let store = test_store(limits(8, 4));
-        let expected = binding("member-alpha", ClawSelector::ClawM, 0x30);
-        let wrong_member = binding("member-beta", ClawSelector::ClawM, 0x30);
+        let expected = BindingFixture::new("member-alpha", ClawSelector::ClawM, 0x30);
+        let wrong_member = BindingFixture::new("member-beta", ClawSelector::ClawM, 0x30);
         let mut wrong_head = expected.clone();
-        wrong_head.authority_digest[0] ^= 1;
+        wrong_head.authority_head_sequence += 1;
         let (_, challenge) = pending(&store, &expected, 0x31);
 
         assert!(matches!(
-            store.claim_finishing(&challenge, &wrong_member.caller_scope()),
+            store.claim_finishing(&challenge, &wrong_member.caller()),
             Err(FoundationError::Rejected)
         ));
         assert_eq!(
@@ -1776,12 +2091,20 @@ mod tests {
         );
 
         let claim = store
-            .claim_finishing(&challenge, &expected.caller_scope())
+            .claim_finishing(&challenge, &expected.caller())
             .unwrap();
+        let closure_calls = Arc::new(AtomicUsize::new(0));
+        let calls = closure_calls.clone();
+        let status_store = store.clone();
         assert!(matches!(
-            claim.issue_proof(&wrong_head, Duration::from_secs(20)),
+            claim.issue_proof(Duration::from_secs(20), move |permit| {
+                calls.fetch_add(1, Ordering::SeqCst);
+                assert_eq!(status_store.status().unwrap().finishing, 1);
+                wrong_head.fresh(permit)
+            }),
             Err(FoundationError::Rejected)
         ));
+        assert_eq!(closure_calls.load(Ordering::SeqCst), 1);
         let status = store.status().unwrap();
         assert_eq!(status.pending, 0);
         assert_eq!(status.proof_issued, 0);
@@ -1790,25 +2113,33 @@ mod tests {
 
     #[test]
     fn wrong_member_preserves_proof_but_legitimate_consume_burns_before_freshness_checks() {
-        for drift in ["config", "tuple", "context", "authority"] {
+        for drift in ["config", "tuple", "context", "authority", "credential"] {
             let store = test_store(limits(8, 4));
-            let expected = binding("member-alpha", ClawSelector::ClawM, 0x32);
-            let wrong_member = binding("member-beta", ClawSelector::ClawM, 0x32);
+            let expected = BindingFixture::new("member-alpha", ClawSelector::ClawM, 0x32);
+            let wrong_member = BindingFixture::new("member-beta", ClawSelector::ClawM, 0x32);
             let mut current = expected.clone();
             match drift {
-                "config" => current.config_digest[0] ^= 1,
-                "tuple" => current.tuple_digest[0] ^= 1,
-                "context" => current.context_digest[0] ^= 1,
-                "authority" => current.authority_digest[0] ^= 1,
+                "config" => current.config_generation += 1,
+                "tuple" => current.tuple_marker ^= 1,
+                "context" => current.replay_marker ^= 1,
+                "authority" => current.authority_head_sequence += 1,
+                "credential" => current.credential_marker ^= 1,
                 _ => unreachable!(),
             }
+            assert!(!expected.stored().matches(&current.stored()));
             let token = issued(&store, &expected, 0x33);
             let duplicate = ProofToken(*token.as_bytes());
 
+            let wrong_calls = Arc::new(AtomicUsize::new(0));
+            let observed_wrong_calls = wrong_calls.clone();
             assert!(matches!(
-                store.consume_proof(duplicate, &wrong_member.caller_scope()),
+                store.consume_proof(duplicate, &wrong_member.caller(), move |_permit| {
+                    wrong_calls.fetch_add(1, Ordering::SeqCst);
+                    panic!("wrong-member must not receive a point-of-use permit")
+                }),
                 Err(FoundationError::Rejected)
             ));
+            assert_eq!(observed_wrong_calls.load(Ordering::SeqCst), 0);
             assert_eq!(
                 store.status().unwrap(),
                 StoreStatus {
@@ -1818,11 +2149,12 @@ mod tests {
                 }
             );
 
-            let consumed = store.consume_proof(token, &current.caller_scope()).unwrap();
-            assert!(consumed.binding.matches(&expected));
-            assert!(!consumed.binding.matches(&current));
+            let status_store = store.clone();
             assert!(matches!(
-                consumed.revalidate(&current),
+                store.consume_proof(token, &expected.caller(), move |permit| {
+                    assert_eq!(status_store.status().unwrap().burned, 1);
+                    current.fresh(permit)
+                }),
                 Err(FoundationError::Rejected)
             ));
             let status = store.status().unwrap();
@@ -1834,12 +2166,12 @@ mod tests {
     #[test]
     fn proof_is_hash_only_single_use_and_response_loss_cannot_reissue() {
         let store = test_store(limits(8, 4));
-        let binding = binding("member-alpha", ClawSelector::ClawM, 0x40);
+        let binding = BindingFixture::new("member-alpha", ClawSelector::ClawM, 0x40);
         let (_, challenge) = pending(&store, &binding, 0x41);
         let token = store
-            .claim_finishing(&challenge, &binding.caller_scope())
+            .claim_finishing(&challenge, &binding.caller())
             .unwrap()
-            .issue_proof(&binding, Duration::from_secs(20))
+            .issue_proof(Duration::from_secs(20), |permit| binding.fresh(permit))
             .unwrap();
         let raw = *token.as_bytes();
         let expected_hash = domain_hash(PROOF_TOKEN_HASH_DOMAIN, &raw);
@@ -1857,7 +2189,7 @@ mod tests {
 
         drop(token);
         assert!(matches!(
-            store.claim_finishing(&challenge, &binding.caller_scope()),
+            store.claim_finishing(&challenge, &binding.caller()),
             Err(FoundationError::Rejected)
         ));
         assert_eq!(store.status().unwrap().proof_issued, 1);
@@ -1866,34 +2198,50 @@ mod tests {
     #[test]
     fn same_token_concurrency_has_exactly_one_atomic_consumer() {
         let store = test_store(limits(8, 4));
-        let binding = binding("member-alpha", ClawSelector::ClawM, 0x50);
+        let binding = BindingFixture::new("member-alpha", ClawSelector::ClawM, 0x50);
         let token = issued(&store, &binding, 0x51);
         let raw = *token.as_bytes();
         drop(token);
 
+        let calls = Arc::new(AtomicUsize::new(0));
         let left_store = store.clone();
-        let left_scope = binding.caller_scope();
-        let left = thread::spawn(move || left_store.consume_proof(ProofToken(raw), &left_scope));
+        let left_scope = binding.caller();
+        let left_binding = binding.clone();
+        let left_calls = calls.clone();
+        let left = thread::spawn(move || {
+            left_store.consume_proof(ProofToken(raw), &left_scope, move |permit| {
+                left_calls.fetch_add(1, Ordering::SeqCst);
+                left_binding.fresh(permit)
+            })
+        });
         let right_store = store.clone();
-        let right_scope = binding.caller_scope();
-        let right = thread::spawn(move || right_store.consume_proof(ProofToken(raw), &right_scope));
+        let right_scope = binding.caller();
+        let right_binding = binding.clone();
+        let right_calls = calls.clone();
+        let right = thread::spawn(move || {
+            right_store.consume_proof(ProofToken(raw), &right_scope, move |permit| {
+                right_calls.fetch_add(1, Ordering::SeqCst);
+                right_binding.fresh(permit)
+            })
+        });
         let successes =
             usize::from(left.join().unwrap().is_ok()) + usize::from(right.join().unwrap().is_ok());
         assert_eq!(successes, 1);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
         assert_eq!(store.status().unwrap().burned, 1);
     }
 
     #[test]
     fn duplicate_challenge_is_rejected_before_and_after_first_claim() {
         let store = test_store(limits(8, 4));
-        let first = binding("member-alpha", ClawSelector::ClawM, 0x60);
-        let second = binding("member-beta", ClawSelector::ClawL, 0x61);
+        let first = BindingFixture::new("member-alpha", ClawSelector::ClawM, 0x60);
+        let second = BindingFixture::new("member-beta", ClawSelector::ClawL, 0x61);
         let (_, challenge) = pending(&store, &first, 0x62);
         let reservation = store
-            .reserve(second.member_scope.clone(), Duration::from_secs(60))
+            .reserve(&second.caller(), Duration::from_secs(60))
             .unwrap();
         assert_eq!(
-            store.commit_pending(&reservation, &challenge, second),
+            store.commit_pending(&reservation, &challenge, second.start()),
             Err(FoundationError::Rejected)
         );
         let status = store.status().unwrap();
@@ -1901,20 +2249,13 @@ mod tests {
         assert_eq!(status.reserved, 1);
         store.release_reserved(&reservation).unwrap();
 
-        drop(
-            store
-                .claim_finishing(&challenge, &first.caller_scope())
-                .unwrap(),
-        );
+        drop(store.claim_finishing(&challenge, &first.caller()).unwrap());
+        let replacement = BindingFixture::new("member-beta", ClawSelector::ClawL, 0x63);
         let reservation = store
-            .reserve(
-                binding("member-beta", ClawSelector::ClawL, 0x63).member_scope,
-                Duration::from_secs(60),
-            )
+            .reserve(&replacement.caller(), Duration::from_secs(60))
             .unwrap();
-        let replacement = binding("member-beta", ClawSelector::ClawL, 0x63);
         assert_eq!(
-            store.commit_pending(&reservation, &challenge, replacement),
+            store.commit_pending(&reservation, &challenge, replacement.start()),
             Err(FoundationError::Rejected)
         );
         assert_eq!(store.status().unwrap().burned, 1);
@@ -1924,28 +2265,28 @@ mod tests {
     #[test]
     fn quotas_deadlines_expiry_and_restart_are_fail_closed() {
         let (store, clock) = store_with_clock(limits(2, 1));
-        let alpha = binding("member-alpha", ClawSelector::ClawM, 0x70);
-        let beta = binding("member-beta", ClawSelector::ClawL, 0x71);
+        let alpha = BindingFixture::new("member-alpha", ClawSelector::ClawM, 0x70);
+        let beta = BindingFixture::new("member-beta", ClawSelector::ClawL, 0x71);
         let alpha_reservation = store
-            .reserve(alpha.member_scope.clone(), Duration::from_secs(10))
+            .reserve(&alpha.caller(), Duration::from_secs(10))
             .unwrap();
         assert!(matches!(
-            store.reserve(alpha.member_scope.clone(), Duration::from_secs(10)),
+            store.reserve(&alpha.caller(), Duration::from_secs(10)),
             Err(FoundationError::MemberFull)
         ));
         let beta_reservation = store
-            .reserve(beta.member_scope.clone(), Duration::from_secs(10))
+            .reserve(&beta.caller(), Duration::from_secs(10))
             .unwrap();
         assert!(matches!(
             store.reserve(
-                MemberScope::from_server_derived("member-gamma").unwrap(),
-                Duration::from_secs(10)
+                &CallerScope::from_server_derived_member("member-gamma").unwrap(),
+                Duration::from_secs(10),
             ),
             Err(FoundationError::StoreFull)
         ));
         assert_eq!(store.status().unwrap().total, 2);
         assert!(matches!(
-            store.reserve(alpha.member_scope.clone(), Duration::MAX),
+            store.reserve(&alpha.caller(), Duration::MAX),
             Err(FoundationError::InvalidDeadline)
         ));
 
@@ -1967,16 +2308,16 @@ mod tests {
     #[test]
     fn finishing_expiry_burns_before_cleanup_can_remove_it() {
         let (store, clock) = store_with_clock(limits(4, 2));
-        let binding = binding("member-alpha", ClawSelector::ClawM, 0x80);
+        let binding = BindingFixture::new("member-alpha", ClawSelector::ClawM, 0x80);
         let reservation = store
-            .reserve(binding.member_scope.clone(), Duration::from_secs(1))
+            .reserve(&binding.caller(), Duration::from_secs(1))
             .unwrap();
         let challenge = ChallengeHandle::from_server_random([0x81; 32]).unwrap();
         store
-            .commit_pending(&reservation, &challenge, binding.clone())
+            .commit_pending(&reservation, &challenge, binding.start())
             .unwrap();
         let claim = store
-            .claim_finishing(&challenge, &binding.caller_scope())
+            .claim_finishing(&challenge, &binding.caller())
             .unwrap();
         clock.advance(Duration::from_secs(1));
         store.prune_expired().unwrap();
@@ -1991,11 +2332,12 @@ mod tests {
     #[test]
     fn signed_expiry_clamps_reservation_and_rejects_exact_expiry() {
         let (store, clock) = store_with_clock(limits(4, 2));
-        let binding = binding_with_times("member-alpha", ClawSelector::ClawM, 0x82, 1_000, 1_001);
+        let binding =
+            BindingFixture::with_times("member-alpha", ClawSelector::ClawM, 0x82, 1_000, 1_001);
         let (_, challenge) = pending(&store, &binding, 0x83);
         clock.advance(Duration::from_secs(1));
         assert!(matches!(
-            store.claim_finishing(&challenge, &binding.caller_scope()),
+            store.claim_finishing(&challenge, &binding.caller()),
             Err(FoundationError::Rejected)
         ));
         let status = store.status().unwrap();
@@ -2003,22 +2345,178 @@ mod tests {
         assert_eq!(status.burned, 1);
 
         let exact_store = test_store(limits(4, 2));
-        let exact = binding_with_times("member-alpha", ClawSelector::ClawM, 0x84, 999, 1_000);
+        let exact =
+            BindingFixture::with_times("member-alpha", ClawSelector::ClawM, 0x84, 999, 1_000);
         let reservation = exact_store
-            .reserve(exact.member_scope.clone(), Duration::from_secs(60))
+            .reserve(&exact.caller(), Duration::from_secs(60))
             .unwrap();
         let challenge = ChallengeHandle::from_server_random([0x85; 32]).unwrap();
         assert!(matches!(
-            exact_store.commit_pending(&reservation, &challenge, exact),
+            exact_store.commit_pending(&reservation, &challenge, exact.start()),
             Err(FoundationError::Expired)
         ));
         assert_eq!(exact_store.status().unwrap().reserved, 1);
     }
 
     #[test]
+    fn wall_only_expiry_burns_every_live_phase_without_rederivation() {
+        let (pending_store, pending_clock) = store_with_clock(limits(4, 2));
+        let pending_binding =
+            BindingFixture::with_times("member-alpha", ClawSelector::ClawM, 0x90, 1_000, 1_001);
+        let (_, pending_challenge) = pending(&pending_store, &pending_binding, 0x91);
+        pending_clock.advance_wall(Duration::from_secs(1));
+        assert!(matches!(
+            pending_store.claim_finishing(&pending_challenge, &pending_binding.caller()),
+            Err(FoundationError::Rejected | FoundationError::Expired)
+        ));
+        assert_eq!(pending_store.status().unwrap().burned, 1);
+
+        let (finishing_store, finishing_clock) = store_with_clock(limits(4, 2));
+        let finishing_binding =
+            BindingFixture::with_times("member-alpha", ClawSelector::ClawM, 0x92, 1_000, 1_001);
+        let (_, finishing_challenge) = pending(&finishing_store, &finishing_binding, 0x93);
+        let claim = finishing_store
+            .claim_finishing(&finishing_challenge, &finishing_binding.caller())
+            .unwrap();
+        finishing_clock.advance_wall(Duration::from_secs(1));
+        let finishing_calls = Arc::new(AtomicUsize::new(0));
+        let observed_finishing_calls = finishing_calls.clone();
+        assert!(matches!(
+            claim.issue_proof(Duration::from_secs(20), move |_permit| {
+                finishing_calls.fetch_add(1, Ordering::SeqCst);
+                panic!("expired Finishing must not rederive trusted state")
+            }),
+            Err(FoundationError::Expired)
+        ));
+        assert_eq!(observed_finishing_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(finishing_store.status().unwrap().burned, 1);
+
+        let (proof_store, proof_clock) = store_with_clock(limits(4, 2));
+        let proof_binding =
+            BindingFixture::with_times("member-alpha", ClawSelector::ClawM, 0x94, 1_000, 1_001);
+        let token = issued(&proof_store, &proof_binding, 0x95);
+        proof_clock.advance_wall(Duration::from_secs(2));
+        let proof_calls = Arc::new(AtomicUsize::new(0));
+        let observed_proof_calls = proof_calls.clone();
+        assert!(matches!(
+            proof_store.consume_proof(token, &proof_binding.caller(), move |_permit| {
+                proof_calls.fetch_add(1, Ordering::SeqCst);
+                panic!("expired ProofIssued must not rederive trusted state")
+            }),
+            Err(FoundationError::Rejected | FoundationError::Expired)
+        ));
+        assert_eq!(observed_proof_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(proof_store.status().unwrap().burned, 1);
+    }
+
+    #[test]
+    fn monotonic_only_deadline_burns_pending_and_proof_with_wall_frozen() {
+        let (pending_store, pending_clock) = store_with_clock(limits(4, 2));
+        let pending_binding = BindingFixture::new("member-alpha", ClawSelector::ClawM, 0x96);
+        let reservation = pending_store
+            .reserve(&pending_binding.caller(), Duration::from_secs(1))
+            .unwrap();
+        let challenge = ChallengeHandle::from_server_random([0x97; 32]).unwrap();
+        pending_store
+            .commit_pending(&reservation, &challenge, pending_binding.start())
+            .unwrap();
+        pending_clock.advance_monotonic(Duration::from_secs(1));
+        assert!(matches!(
+            pending_store.claim_finishing(&challenge, &pending_binding.caller()),
+            Err(FoundationError::Rejected | FoundationError::Expired)
+        ));
+        assert_eq!(pending_store.status().unwrap().burned, 1);
+
+        let (proof_store, proof_clock) = store_with_clock(limits(4, 2));
+        let proof_binding = BindingFixture::new("member-alpha", ClawSelector::ClawM, 0x98);
+        let token = issued(&proof_store, &proof_binding, 0x99);
+        proof_clock.advance_monotonic(Duration::from_secs(20));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let observed_calls = calls.clone();
+        assert!(matches!(
+            proof_store.consume_proof(token, &proof_binding.caller(), move |_permit| {
+                calls.fetch_add(1, Ordering::SeqCst);
+                panic!("expired ProofIssued must not rederive trusted state")
+            }),
+            Err(FoundationError::Rejected | FoundationError::Expired)
+        ));
+        assert_eq!(observed_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(proof_store.status().unwrap().burned, 1);
+    }
+
+    #[test]
+    fn expiry_crossed_inside_rederivation_burns_before_proof_or_effect() {
+        let (finish_store, finish_clock) = store_with_clock(limits(4, 2));
+        let finish_binding =
+            BindingFixture::with_times("member-alpha", ClawSelector::ClawM, 0x9a, 1_000, 1_001);
+        let (_, challenge) = pending(&finish_store, &finish_binding, 0x9b);
+        let claim = finish_store
+            .claim_finishing(&challenge, &finish_binding.caller())
+            .unwrap();
+        let finish_calls = Arc::new(AtomicUsize::new(0));
+        let observed_finish_calls = finish_calls.clone();
+        assert!(matches!(
+            claim.issue_proof(Duration::from_secs(20), move |permit| {
+                finish_calls.fetch_add(1, Ordering::SeqCst);
+                finish_clock.advance_wall(Duration::from_secs(1));
+                finish_binding.fresh(permit)
+            }),
+            Err(FoundationError::Expired)
+        ));
+        assert_eq!(observed_finish_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(finish_store.status().unwrap().burned, 1);
+
+        let (consume_store, consume_clock) = store_with_clock(limits(4, 2));
+        let consume_binding =
+            BindingFixture::with_times("member-alpha", ClawSelector::ClawM, 0x9c, 1_000, 1_001);
+        let token = issued(&consume_store, &consume_binding, 0x9d);
+        let consume_calls = Arc::new(AtomicUsize::new(0));
+        let observed_consume_calls = consume_calls.clone();
+        let consume_status_store = consume_store.clone();
+        assert!(matches!(
+            consume_store.consume_proof(token, &consume_binding.caller(), move |permit| {
+                consume_calls.fetch_add(1, Ordering::SeqCst);
+                assert_eq!(consume_status_store.status().unwrap().burned, 1);
+                consume_clock.advance_wall(Duration::from_secs(1));
+                consume_binding.fresh(permit)
+            }),
+            Err(FoundationError::Expired)
+        ));
+        assert_eq!(observed_consume_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn replay_after_tombstone_cleanup_never_rederives_or_revives() {
+        let (store, clock) = store_with_clock(limits(4, 2));
+        let binding = BindingFixture::new("member-alpha", ClawSelector::ClawM, 0x9e);
+        let token = issued(&store, &binding, 0x9f);
+        let raw = *token.as_bytes();
+        let _revalidated = store
+            .consume_proof(token, &binding.caller(), |permit| binding.fresh(permit))
+            .unwrap();
+        assert_eq!(store.status().unwrap().burned, 1);
+
+        clock.advance_wall(Duration::from_secs(60));
+        clock.advance_monotonic(Duration::from_secs(21));
+        store.prune_expired().unwrap();
+        assert_eq!(store.status().unwrap().total, 0);
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let observed_calls = calls.clone();
+        assert!(matches!(
+            store.consume_proof(ProofToken(raw), &binding.caller(), move |_permit| {
+                calls.fetch_add(1, Ordering::SeqCst);
+                panic!("an absent tombstone must not mint a point-of-use permit")
+            }),
+            Err(FoundationError::Rejected)
+        ));
+        assert_eq!(observed_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
     fn regressed_clock_after_proof_issue_never_revives_or_extends_it() {
         let (store, clock) = store_with_clock(limits(4, 2));
-        let binding = binding("member-alpha", ClawSelector::ClawM, 0x86);
+        let binding = BindingFixture::new("member-alpha", ClawSelector::ClawM, 0x86);
         let token = issued(&store, &binding, 0x87);
         let raw = *token.as_bytes();
 
@@ -2026,7 +2524,9 @@ mod tests {
         assert_eq!(store.status().unwrap().proof_issued, 1);
         clock.regress(Duration::from_secs(1));
         assert!(matches!(
-            store.consume_proof(ProofToken(raw), &binding.caller_scope()),
+            store.consume_proof(ProofToken(raw), &binding.caller(), |permit| {
+                binding.fresh(permit)
+            }),
             Err(FoundationError::ClockRegressed)
         ));
 
@@ -2034,7 +2534,7 @@ mod tests {
         assert_eq!(store.status().unwrap().proof_issued, 1);
         clock.advance(Duration::from_secs(15));
         assert!(matches!(
-            store.consume_proof(token, &binding.caller_scope()),
+            store.consume_proof(token, &binding.caller(), |permit| binding.fresh(permit)),
             Err(FoundationError::Rejected)
         ));
         let status = store.status().unwrap();
@@ -2046,9 +2546,9 @@ mod tests {
     fn constant_time_lookup_visits_every_bounded_entry() {
         let store = test_store(limits(8, 8));
         let bindings = [
-            binding("member-alpha", ClawSelector::ClawM, 0x90),
-            binding("member-beta", ClawSelector::ClawL, 0x91),
-            binding("member-gamma", ClawSelector::ClawM, 0x92),
+            BindingFixture::new("member-alpha", ClawSelector::ClawM, 0x90),
+            BindingFixture::new("member-beta", ClawSelector::ClawL, 0x91),
+            BindingFixture::new("member-gamma", ClawSelector::ClawM, 0x92),
         ];
         let mut hashes = Vec::new();
         for (binding, challenge_byte) in bindings.iter().zip([0xa0, 0xa1, 0xa2]) {
@@ -2066,15 +2566,14 @@ mod tests {
     #[test]
     fn consumed_token_hash_remains_reserved_until_tombstone_expiry() {
         let store = test_store(limits(4, 2));
-        let binding = binding("member-alpha", ClawSelector::ClawM, 0xb0);
+        let binding = BindingFixture::new("member-alpha", ClawSelector::ClawM, 0xb0);
         let token = issued(&store, &binding, 0xb1);
         let token_hash = domain_hash(PROOF_TOKEN_HASH_DOMAIN, token.as_bytes());
         let revalidated = store
-            .consume_proof(token, &binding.caller_scope())
-            .unwrap()
-            .revalidate(&binding)
+            .consume_proof(token, &binding.caller(), |permit| binding.fresh(permit))
             .unwrap();
-        assert!(revalidated.binding.matches(&binding));
+        assert!(revalidated.binding.matches(&binding.stored()));
+        assert!(revalidated.signed_wall_expiry > Duration::from_secs(1_000));
         let inner = store.lock_operation().unwrap();
         let lookup = inner.lookup_hash_ct(LookupKind::AnyProofToken, &token_hash);
         assert!(lookup.index.is_some());
