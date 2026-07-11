@@ -4004,141 +4004,54 @@ fn product_a_per_claw_vpn_dev_config_remains_default_off_and_unwired() {
             lib_path.display()
         )
     });
-    let lib_lines = lib_source.lines().collect::<Vec<_>>();
-    let mut interface_route_plan_exports = 0usize;
-    let mut interface_route_plan_export_is_unconditional = false;
-    let mut packet_pump_exports = 0usize;
-    let mut packet_pump_export_is_unconditional = false;
-    let mut relay_stream_exports = 0usize;
-    let mut relay_stream_export_is_unconditional = false;
-    let mut t1_caller_exports = 0usize;
-    let mut t1_caller_export_is_unconditional = false;
-    let mut t1_relay_stream_router_exports = 0usize;
-    let mut t1_relay_stream_router_export_is_unconditional = false;
-    let mut target_session_relay_exports = 0usize;
-    let mut target_session_relay_export_is_unconditional = false;
-    let mut target_session_router_exports = 0usize;
-    let mut target_session_router_export_is_unconditional = false;
-    let mut target_session_runtime_exports = 0usize;
-    let mut target_session_runtime_export_is_unconditional = false;
-    let mut runtime_exports = 0usize;
-    let mut runtime_export_is_unconditional = false;
-    let mut wiring_exports = 0usize;
-    let mut wiring_export_is_unconditional = false;
-    let mut linux_tun_exports = 0usize;
-    let mut linux_tun_export_is_linux_only = false;
-    let mut macos_utun_exports = 0usize;
-    let mut macos_utun_export_is_macos_only = false;
-    for (index, line) in lib_lines.iter().enumerate() {
-        if line.trim() == "pub mod claw_vpn_interface_route_plan;" {
-            interface_route_plan_exports += 1;
-            interface_route_plan_export_is_unconditional =
-                index == 0 || !lib_lines[index - 1].trim().starts_with("#[cfg");
-        }
-        if line.trim() == "pub mod claw_vpn_packet_pump;" {
-            packet_pump_exports += 1;
-            packet_pump_export_is_unconditional =
-                index == 0 || !lib_lines[index - 1].trim().starts_with("#[cfg");
-        }
-        if line.trim() == "pub mod claw_vpn_relay_stream;" {
-            relay_stream_exports += 1;
-            relay_stream_export_is_unconditional =
-                index == 0 || !lib_lines[index - 1].trim().starts_with("#[cfg");
-        }
-        if line.trim() == "pub mod claw_vpn_t1_caller;" {
-            t1_caller_exports += 1;
-            t1_caller_export_is_unconditional =
-                index == 0 || !lib_lines[index - 1].trim().starts_with("#[cfg");
-        }
-        if line.trim() == "pub mod claw_vpn_t1_relay_stream_router;" {
-            t1_relay_stream_router_exports += 1;
-            t1_relay_stream_router_export_is_unconditional =
-                index == 0 || !lib_lines[index - 1].trim().starts_with("#[cfg");
-        }
-        if line.trim() == "pub mod claw_vpn_target_session_relay;" {
-            target_session_relay_exports += 1;
-            target_session_relay_export_is_unconditional =
-                index == 0 || !lib_lines[index - 1].trim().starts_with("#[cfg");
-        }
-        if line.trim() == "pub mod claw_vpn_target_session_router;" {
-            target_session_router_exports += 1;
-            target_session_router_export_is_unconditional =
-                index == 0 || !lib_lines[index - 1].trim().starts_with("#[cfg");
-        }
-        if line.trim() == "pub mod claw_vpn_target_session_runtime;" {
-            target_session_runtime_exports += 1;
-            target_session_runtime_export_is_unconditional =
-                index == 0 || !lib_lines[index - 1].trim().starts_with("#[cfg");
-        }
-        if line.trim() == "pub mod claw_vpn_runtime;" {
-            runtime_exports += 1;
-            runtime_export_is_unconditional =
-                index == 0 || !lib_lines[index - 1].trim().starts_with("#[cfg");
-        }
-        if line.trim() == "pub mod claw_vpn_wiring;" {
-            wiring_exports += 1;
-            wiring_export_is_unconditional =
-                index == 0 || !lib_lines[index - 1].trim().starts_with("#[cfg");
-        }
-        if line.trim() == "pub mod claw_vpn_linux_tun;" {
-            linux_tun_exports += 1;
-            linux_tun_export_is_linux_only =
-                index > 0 && lib_lines[index - 1].trim() == "#[cfg(target_os = \"linux\")]";
-        }
-        if line.trim() == "pub mod claw_vpn_macos_utun;" {
-            macos_utun_exports += 1;
-            macos_utun_export_is_macos_only =
-                index > 0 && lib_lines[index - 1].trim() == "#[cfg(target_os = \"macos\")]";
-        }
+    let lib_lines = lib_source.lines().map(str::trim).collect::<Vec<_>>();
+    let dev_only_cfg = "#[cfg(any(test, feature = \"dev_t1_datapath\"))]";
+    for module in [
+        "pub mod claw_vpn_interface_route_plan;",
+        "pub mod claw_vpn_packet_pump;",
+        "pub mod claw_vpn_relay_stream;",
+        "pub mod claw_vpn_t1_caller;",
+        "pub mod claw_vpn_t1_relay_stream_router;",
+        "pub mod claw_vpn_target_session_relay;",
+        "pub mod claw_vpn_target_session_router;",
+        "pub mod claw_vpn_target_session_runtime;",
+        "pub mod claw_vpn_runtime;",
+        "pub mod claw_vpn_wiring;",
+    ] {
+        let matches = lib_lines
+            .iter()
+            .enumerate()
+            .filter(|(_, line)| **line == module)
+            .collect::<Vec<_>>();
+        assert_eq!(matches.len(), 1, "{module} must have exactly one export");
+        let (index, _) = matches[0];
+        assert!(
+            index > 0 && lib_lines[index - 1] == dev_only_cfg,
+            "{module} must compile only for tests or the explicit DEV datapath feature"
+        );
     }
-    assert!(
-        interface_route_plan_exports == 1 && interface_route_plan_export_is_unconditional,
-        "per-Claw VPN interface route planner/executor module must have exactly one unconditional export until an explicit tunnel-runtime slice"
-    );
-    assert!(
-        packet_pump_exports == 1 && packet_pump_export_is_unconditional,
-        "per-Claw VPN packet pump module must have exactly one unconditional export"
-    );
-    assert!(
-        relay_stream_exports == 1 && relay_stream_export_is_unconditional,
-        "per-Claw VPN relay stream adapter module must have exactly one unconditional export"
-    );
-    assert!(
-        t1_caller_exports == 1 && t1_caller_export_is_unconditional,
-        "per-Claw VPN T1 caller gate module must have exactly one unconditional export"
-    );
-    assert!(
-        t1_relay_stream_router_exports == 1 && t1_relay_stream_router_export_is_unconditional,
-        "per-Claw VPN T1 relay-stream router module must have exactly one unconditional export"
-    );
-    assert!(
-        target_session_relay_exports == 1 && target_session_relay_export_is_unconditional,
-        "per-Claw VPN target-session relay adapter module must have exactly one unconditional export"
-    );
-    assert!(
-        target_session_router_exports == 1 && target_session_router_export_is_unconditional,
-        "per-Claw VPN target-session router adapter module must have exactly one unconditional export"
-    );
-    assert!(
-        target_session_runtime_exports == 1 && target_session_runtime_export_is_unconditional,
-        "per-Claw VPN target-session runtime bridge module must have exactly one unconditional export"
-    );
-    assert!(
-        runtime_exports == 1 && runtime_export_is_unconditional,
-        "per-Claw VPN runtime coordinator module must have exactly one unconditional export"
-    );
-    assert!(
-        wiring_exports == 1 && wiring_export_is_unconditional,
-        "per-Claw VPN runtime wiring assembly module must have exactly one unconditional export"
-    );
-    assert!(
-        linux_tun_exports == 1 && linux_tun_export_is_linux_only,
-        "per-Claw VPN Linux TUN module must have exactly one Linux-only export until an explicit tunnel-runtime slice"
-    );
-    assert!(
-        macos_utun_exports == 1 && macos_utun_export_is_macos_only,
-        "per-Claw VPN macOS utun module must have exactly one macOS-only export until an explicit tunnel-runtime slice"
-    );
+    for (module, required_cfg) in [
+        (
+            "pub mod claw_vpn_linux_tun;",
+            "#[cfg(all(any(test, feature = \"dev_t1_datapath\"), target_os = \"linux\"))]",
+        ),
+        (
+            "pub mod claw_vpn_macos_utun;",
+            "#[cfg(all(any(test, feature = \"dev_t1_datapath\"), target_os = \"macos\"))]",
+        ),
+    ] {
+        let matches = lib_lines
+            .iter()
+            .enumerate()
+            .filter(|(_, line)| **line == module)
+            .collect::<Vec<_>>();
+        assert_eq!(matches.len(), 1, "{module} must have exactly one export");
+        let (index, _) = matches[0];
+        assert!(
+            index > 0 && lib_lines[index - 1] == required_cfg,
+            "{module} must be both DEV/test-only and target-specific"
+        );
+    }
 
     fn rust_guard_lexer_unsupported_reason(lines: &[&str]) -> Option<String> {
         for (line_index, line) in lines.iter().enumerate() {
@@ -5046,15 +4959,26 @@ required-features = ["dev_t1_datapath"]"#;
         1,
         "production mount must load #286 evidence only through the reviewed current-build SHA gate"
     );
+    for required_token in [
+        "#[cfg(not(any(test, feature = \"dev_t1_datapath\")))]",
+        "assemble_relay_stream_live(inputs, config)",
+        "#[cfg(any(test, feature = \"dev_t1_datapath\"))]",
+        "assemble_relay_stream_live_with_ip_tunnel_router(",
+        "IP_TUNNEL_RESOURCE_COMPILED",
+    ] {
+        assert!(
+            mount_source.contains(required_token),
+            "production mount must retain the Phase 0 compile-out branch: {required_token}"
+        );
+    }
     for forbidden_token in [
         "PerClawVpnT1PreflightEvidence::new",
-        "dev_t1_datapath",
         "THEYOS_T1_DEV_DATAPATH",
         "THEYOS_FORCE_SOFTWARE_KEYS",
     ] {
         assert!(
             !mount_source.contains(forbidden_token),
-            "production mount must not contain the T1 Phase 0 dev bypass token: {forbidden_token}"
+            "Phase 0 mount must not contain a runtime DEV bypass token: {forbidden_token}"
         );
     }
 }

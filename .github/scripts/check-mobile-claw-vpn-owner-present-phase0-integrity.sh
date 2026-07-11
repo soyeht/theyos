@@ -48,6 +48,7 @@ PROTECTED_PATHS=(
   ".github/scripts/test-mobile-claw-vpn-owner-present-contracts.sh"
   ".github/workflows/contracts-cross-repo-sync.yml"
   "admin/contracts/mobile-claw-vpn/v1/owner_present_wire_authority_status_v1.json"
+  "admin/contracts/mobile-claw-vpn/v1/owner_present_phase0_artifact_boundary_v1.tsv"
 )
 
 for path in "${PROTECTED_PATHS[@]}"; do

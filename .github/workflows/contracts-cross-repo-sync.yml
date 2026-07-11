@@ -19,6 +19,7 @@ on:
       - "admin/contracts/mobile-claw-vpn/v1/api_shapes.json"
       - "admin/contracts/mobile-claw-vpn/v1/owner_present_success_wire_v1.json"
       - "admin/contracts/mobile-claw-vpn/v1/owner_present_wire_authority_status_v1.json"
+      - "admin/contracts/mobile-claw-vpn/v1/owner_present_phase0_artifact_boundary_v1.tsv"
       - "admin/contracts/owner-approval/v2/owner_approval_v2_assertion_fields_v1.json"
       - ".github/scripts/check-mobile-claw-vpn-owner-present-contracts.sh"
       - ".github/scripts/test-mobile-claw-vpn-owner-present-contracts.sh"
@@ -33,6 +34,7 @@ on:
       - "admin/contracts/mobile-claw-vpn/v1/api_shapes.json"
       - "admin/contracts/mobile-claw-vpn/v1/owner_present_success_wire_v1.json"
       - "admin/contracts/mobile-claw-vpn/v1/owner_present_wire_authority_status_v1.json"
+      - "admin/contracts/mobile-claw-vpn/v1/owner_present_phase0_artifact_boundary_v1.tsv"
       - "admin/contracts/owner-approval/v2/owner_approval_v2_assertion_fields_v1.json"
       - ".github/scripts/check-mobile-claw-vpn-owner-present-contracts.sh"
       - ".github/scripts/test-mobile-claw-vpn-owner-present-contracts.sh"
@@ -47,13 +49,13 @@ jobs:
 
     steps:
       - name: Checkout theyos
-        uses: actions/checkout@v5
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
         with:
           path: theyos
 
       # Checkout soyeht-ios (public read — uses GITHUB_TOKEN for API rate limits).
       - name: Checkout soyeht-ios
-        uses: actions/checkout@v5
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
         with:
           repository: soyeht/soyeht-ios
           path: soyeht-ios

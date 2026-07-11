@@ -9,12 +9,36 @@
     "theyos_path": "admin/contracts/mobile-claw-vpn/v1/owner_present_success_wire_v1.json",
     "ios_path": "Packages/SoyehtCore/Tests/SoyehtCoreTests/Fixtures/mobile-claw-vpn/v1/owner_present_success_wire_v1.json",
     "prior_authoritative_sha256": "ff9ad533567e29261ecbd8e11e84e9490f1829bd4d2e5b50fe8783dc82b000d1",
-    "historical_sha256": "a9eb0fdce49fde3ce8b85ceeb5e9356145a8a1040eca5221b315ee8fd4ea2ed7",
+    "historical_sha256": "55fe55c6f1985103f21e679c5e6227646035e4d03da3e75193cfc9d1eeb45f8f",
     "status": "historical-test-only-non-authoritative",
     "prohibited_production_authority": [
       "proof_token",
       "proof-bearing mint request",
       "owner_present_runtime_activation_v1"
+    ]
+  },
+  "retired_api_shapes": {
+    "theyos_path": "admin/contracts/mobile-claw-vpn/v1/api_shapes.json",
+    "ios_path": "Packages/SoyehtCore/Tests/SoyehtCoreTests/Fixtures/mobile-claw-vpn/v1/api_shapes.json",
+    "status": "historical-test-only-non-authoritative",
+    "prior_authoritative_sha256": "7d31e66fd6172c9e7340455e73d0c2b06629b491442428a14c53edd45f49b7a6",
+    "historical_sha256": "6482badfe02f220e5954ddf0f73385a622d317ba7b9b9d1063562724574f33b4",
+    "prohibited_production_authority": [
+      "client-held offer_token",
+      "client-held rendezvous_token",
+      "V1 mint_offer request",
+      "V1 consume_offer request",
+      "V1 authorize_rendezvous request"
+    ]
+  },
+  "phase0_artifact_boundary": {
+    "theyos_path": "admin/contracts/mobile-claw-vpn/v1/owner_present_phase0_artifact_boundary_v1.tsv",
+    "sha256": "7952cc7a67f5580f6475d779395448c420ceefd7e25f72341f81cdf940e2c587",
+    "staged_product": "theyos-engine",
+    "required_published_targets": [
+      "x86_64-unknown-linux-musl",
+      "aarch64-unknown-linux-musl",
+      "aarch64-apple-darwin"
     ]
   },
   "phase1_blocker": {
@@ -31,6 +55,7 @@
   },
   "notes": [
     "The V1 success fixture remains only as immutable cross-language regression evidence.",
+    "The V1 api_shapes dependency is historical regression evidence and is not a source of truth for Phase 1.",
     "Neither owner_present_error_wire_v1 nor a V1 activation marker authorizes runtime, client, handler, issuer, or route wiring.",
     "Phase 1 requires a separately reviewed V2 contract and cannot be opened by this status object."
   ]

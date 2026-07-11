@@ -15,7 +15,7 @@ anyhow = "1"
 rand = "0.8"
 serde_json = { workspace = true }
 tokio = { workspace = true }
-server-rs = { workspace = true, optional = true }
+server-rs = { workspace = true, optional = true, features = ["dev_t1_datapath"] }
 
 [features]
 default = []

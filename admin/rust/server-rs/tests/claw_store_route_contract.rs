@@ -79,6 +79,10 @@ fn main_source() -> &'static str {
     include_str!("../src/main.rs")
 }
 
+fn mobile_api_routes_source() -> &'static str {
+    include_str!("../src/mobile_api_routes.rs")
+}
+
 fn household_bootstrap_source() -> &'static str {
     include_str!("../src/household_bootstrap.rs")
 }
@@ -130,6 +134,9 @@ fn source_slice(mount: &Mount) -> &'static str {
         ("admin/rust/server-rs/src/claw_store_routes.rs", slice) => {
             function_slice(claw_store_routes_source(), slice)
         }
+        ("admin/rust/server-rs/src/mobile_api_routes.rs", "routes") => {
+            function_slice(mobile_api_routes_source(), "routes")
+        }
         ("admin/rust/server-rs/src/main.rs", "main_api_rest") => between(
             main_source(),
             "let api_rest = Router::new()",
@@ -140,16 +147,6 @@ fn source_slice(mount: &Mount) -> &'static str {
             "let api_streaming = Router::new()",
             "let api_rest = Router::new()",
         ),
-        ("admin/rust/server-rs/src/main.rs", "main_mobile_api") => between(
-            main_source(),
-            "let mobile_api = Router::new()",
-            "let app = Router::new()",
-        ),
-        ("admin/rust/server-rs/src/main.rs", "main_app_mobile_direct") => between(
-            main_source(),
-            "// Mobile claw install/uninstall/availability",
-            ".nest(\"/api/v1/mobile\", mobile_api)",
-        ),
         ("admin/rust/server-rs/src/household_bootstrap.rs", "household_claws_router") => between(
             household_bootstrap_source(),
             "let claws_router = shared_state.map(|state| {",
@@ -157,6 +154,16 @@ fn source_slice(mount: &Mount) -> &'static str {
         ),
         other => panic!("unknown mount source/slice: {other:?}"),
     }
+}
+
+#[test]
+fn production_main_mounts_the_canonical_mobile_router_once() {
+    let mount = ".merge(mobile_api_routes::routes(&state))";
+    assert_eq!(
+        main_source().matches(mount).count(),
+        1,
+        "production main must mount the shared mobile route graph exactly once"
+    );
 }
 
 fn operation_variant(operation: &str) -> &'static str {

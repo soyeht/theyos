@@ -333,9 +333,9 @@ package_soyeht_mac() {
     mkdir -p "${helpers_dir}"
 
     info "Building app engine helpers for macOS arm64 (engine version: ${version})..."
+    "${SCRIPT_DIR}/build-theyos-engine.sh" aarch64-apple-darwin cargo >/dev/null
     (cd "${REPO_ROOT}/admin/rust" && cargo build --release \
         --target aarch64-apple-darwin \
-        -p server-rs \
         -p soyeht-rs \
         -p store-rs \
         -p terminal-rs \
@@ -352,8 +352,9 @@ package_soyeht_mac() {
         info "  + ${dest_name}"
     }
 
-    # Binary name is `server` per server-rs/Cargo.toml [[bin]] config.
-    copy_helper "server" "theyos-engine"
+    # Canonical alias: server-rs/server is the shipped theyos-engine.
+    "${SCRIPT_DIR}/stage-theyos-engine.sh" \
+        "${target_dir}" "${helpers_dir}/theyos-engine"
     copy_helper "theyos-ssh" "theyos-ssh"
     copy_helper "store-ipc" "store-ipc"
     copy_helper "terminal-ipc" "terminal-ipc"
@@ -481,9 +482,9 @@ package_engine_linux() {
 
         info "Building server-rs for ${rust_target}..."
         if command -v cross &>/dev/null; then
-            (cd "${rust_dir}" && cross build -p server-rs --release --target "${rust_target}")
+            "${SCRIPT_DIR}/build-theyos-engine.sh" "${rust_target}" cross >/dev/null
         else
-            (cd "${rust_dir}" && cargo build -p server-rs --release --target "${rust_target}")
+            "${SCRIPT_DIR}/build-theyos-engine.sh" "${rust_target}" cargo >/dev/null
         fi
 
         info "Building soyeht CLI for ${rust_target}..."
@@ -494,11 +495,7 @@ package_engine_linux() {
         fi
 
         # Binary name is `server` per server-rs/Cargo.toml [[bin]] config.
-        local engine_src="${rust_dir}/target/${rust_target}/release/server"
         local soyeht_src="${rust_dir}/target/${rust_target}/release/soyeht"
-        if [ ! -f "${engine_src}" ]; then
-            error "server binary not found at: ${engine_src} (expected from server-rs crate)"
-        fi
         if [ ! -f "${soyeht_src}" ]; then
             error "soyeht CLI not found at: ${soyeht_src} (expected from soyeht-rs crate)"
         fi
@@ -508,7 +505,8 @@ package_engine_linux() {
         local stage="${dist_base}/.linux-stage-${arch}"
         rm -rf "${stage}"
         mkdir -p "${stage}"
-        cp "${engine_src}" "${stage}/theyos-engine"
+        "${SCRIPT_DIR}/stage-theyos-engine.sh" \
+            "${rust_dir}/target/${rust_target}/release" "${stage}/theyos-engine"
         cp "${soyeht_src}" "${stage}/soyeht"
         cp "${REPO_ROOT}/scripts/uninstall-linux.sh" "${stage}/uninstall-linux.sh"
         chmod +x "${stage}/soyeht" "${stage}/uninstall-linux.sh"

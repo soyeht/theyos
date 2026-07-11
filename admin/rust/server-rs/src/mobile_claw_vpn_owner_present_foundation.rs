@@ -14,7 +14,6 @@ use std::{
 };
 
 use household_rs::{
-    claw_vpn_mobile_state::{ClawVpnMobileClawId, ClawVpnMobileDeviceId, ClawVpnMobileMemberId},
     machine_cert::PersonId,
     owner_approval_v2::{
         MOBILE_CLAW_VPN_DEV_E2E_BUNDLE_ID, MOBILE_CLAW_VPN_DEV_E2E_MAX_APPROVAL_TTL_SECS,
@@ -198,8 +197,7 @@ impl fmt::Debug for MemberScope {
 
 impl MemberScope {
     fn from_server_derived(member_id: &str) -> Result<Self, FoundationError> {
-        ClawVpnMobileMemberId::try_new(member_id.to_string())
-            .map_err(|_| FoundationError::InvalidBinding)?;
+        validate_phase0_id(member_id).map_err(|_| FoundationError::InvalidBinding)?;
         Ok(Self(domain_hash(MEMBER_SCOPE_DOMAIN, member_id.as_bytes())))
     }
 
@@ -1323,14 +1321,17 @@ fn validate_config_id(value: &str, kind: ConfigIdKind) -> Result<(), FoundationE
             ConfigIdKind::Claw => "claw_id",
         }));
     }
-    match kind {
-        ConfigIdKind::Device => ClawVpnMobileDeviceId::try_new(value.to_string())
-            .map(|_| ())
-            .map_err(|_| FoundationError::InvalidConfig("device_id")),
-        ConfigIdKind::Claw => ClawVpnMobileClawId::try_new(value.to_string())
-            .map(|_| ())
-            .map_err(|_| FoundationError::InvalidConfig("claw_id")),
+    validate_phase0_id(value).map_err(|_| match kind {
+        ConfigIdKind::Device => FoundationError::InvalidConfig("device_id"),
+        ConfigIdKind::Claw => FoundationError::InvalidConfig("claw_id"),
+    })
+}
+
+fn validate_phase0_id(value: &str) -> Result<(), ()> {
+    if value.is_empty() || value.trim() != value {
+        return Err(());
     }
+    Ok(())
 }
 
 fn config_digest(input: &TrustedConfigInput<'_>) -> Result<[u8; 32], FoundationError> {

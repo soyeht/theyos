@@ -4,6 +4,9 @@
 //! re-verifies them against the expected owner on read. Guest/relay paths do not
 //! write raw contracts here; normal writes go through `mint_relay_stream_offer`.
 //! Owner-key CRL/revocation remains a consumer boundary outside this module.
+//!
+//! In the Phase 0 production artifact, `IpTunnel` is a compiled-out resource:
+//! writes fail and persisted entries are pruned before they can reach the pool.
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -32,6 +35,7 @@ const RELAY_STREAM_OFFER_STORE_FILE: &str = "claw_share_relay_stream_offers.cbor
 /// `(slot_id, resource)` key replaces in place and is never capped.
 const MAX_RELAY_STREAM_OFFERS: usize = 4096;
 const MAX_RELAY_STREAM_OFFERS_PER_CLAW: usize = 64;
+pub const IP_TUNNEL_RESOURCE_COMPILED: bool = cfg!(any(test, feature = "dev_t1_datapath"));
 
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -113,7 +117,9 @@ impl RelayStreamOfferStore {
         let mut pruned = false;
         for entry in persisted.offers {
             let computed_key = Self::key_for_offer(&entry.offer);
-            if entry.key != computed_key {
+            if entry.key != computed_key
+                || !resource_enabled_for_build(entry.offer.payload.resource)
+            {
                 pruned = true;
                 continue;
             }
@@ -135,6 +141,7 @@ impl RelayStreamOfferStore {
         owner_key: &dyn IdentityKey,
         trust: &RelayStreamIssuerTrust,
     ) -> Result<RelayStreamOfferContract, RelayStreamOfferStoreError> {
+        require_resource_enabled(input.resource)?;
         let now_unix = input.now_unix;
         let offer = mint_relay_stream_offer(input, owner_key)?;
         trust.verify_offer(&offer, now_unix)?;
@@ -155,6 +162,7 @@ impl RelayStreamOfferStore {
         trust: &RelayStreamIssuerTrust,
         now_unix: u64,
     ) -> Result<RelayStreamOfferContract, RelayStreamOfferStoreError> {
+        require_resource_enabled(offer.payload.resource)?;
         trust.verify_offer(&offer, now_unix)?;
         let key = Self::key_for_offer(&offer);
         // Fail-closed caps apply only to a NEW key — re-minting the same
@@ -195,7 +203,10 @@ impl RelayStreamOfferStore {
     fn prune_inactive(&mut self, trust: &RelayStreamIssuerTrust, now_unix: u64) {
         let mut drop_keys = Vec::new();
         for (key, offer) in &self.offers {
-            if *key != Self::key_for_offer(offer) || trust.verify_offer(offer, now_unix).is_err() {
+            if *key != Self::key_for_offer(offer)
+                || !resource_enabled_for_build(offer.payload.resource)
+                || trust.verify_offer(offer, now_unix).is_err()
+            {
                 drop_keys.push(key.clone());
             }
         }
@@ -212,6 +223,12 @@ impl RelayStreamOfferStore {
         now_unix: u64,
     ) -> Result<Option<RelayStreamOfferContract>, RelayStreamOfferStoreError> {
         let key = RelayStreamOfferStoreKey::new(slot_id.clone(), resource);
+        if !resource_enabled_for_build(resource) {
+            if self.offers.remove(&key).is_some() {
+                self.persist()?;
+            }
+            return Ok(None);
+        }
         let Some(offer) = self.offers.get(&key).cloned() else {
             return Ok(None);
         };
@@ -245,7 +262,9 @@ impl RelayStreamOfferStore {
         for (key, offer) in &self.offers {
             // Defensive: a persisted key that no longer derives from the offer
             // (corruption/tamper) is pruned, exactly as on load.
-            if *key != Self::key_for_offer(offer) {
+            if *key != Self::key_for_offer(offer)
+                || !resource_enabled_for_build(offer.payload.resource)
+            {
                 prune_keys.push(key.clone());
                 continue;
             }
@@ -326,6 +345,30 @@ impl RelayStreamOfferStore {
     }
 }
 
+fn resource_enabled_for_policy(resource: RelayStreamResource, ip_tunnel_compiled: bool) -> bool {
+    resource != RelayStreamResource::IpTunnel || ip_tunnel_compiled
+}
+
+fn resource_enabled_for_build(resource: RelayStreamResource) -> bool {
+    resource_enabled_for_policy(resource, IP_TUNNEL_RESOURCE_COMPILED)
+}
+
+/// Executable artifact probe used by the Phase 0 attestation command.
+#[must_use]
+pub(crate) fn phase0_ip_tunnel_store_accepts_resource() -> bool {
+    resource_enabled_for_build(RelayStreamResource::IpTunnel)
+}
+
+fn require_resource_enabled(
+    resource: RelayStreamResource,
+) -> Result<(), RelayStreamOfferStoreError> {
+    if resource_enabled_for_build(resource) {
+        Ok(())
+    } else {
+        Err(RelayStreamOfferStoreError::ResourceCompiledOut)
+    }
+}
+
 #[must_use]
 pub fn relay_stream_offer_store_path(state_dir: &Path) -> PathBuf {
     household_rs::storage::household_dir(state_dir).join(RELAY_STREAM_OFFER_STORE_FILE)
@@ -356,6 +399,9 @@ fn ensure_parent_owner_only(path: &Path) -> Result<(), RelayStreamOfferStoreErro
 
 #[derive(Debug, Error)]
 pub enum RelayStreamOfferStoreError {
+    #[error("relay stream IpTunnel resource is compiled out of this artifact")]
+    ResourceCompiledOut,
+
     #[error("unsupported relay stream offer store version: {0}")]
     VersionUnsupported(u8),
 
@@ -403,6 +449,19 @@ pub(crate) fn write_raw_offers_for_test(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn phase0_policy_rejects_ip_tunnel_before_any_store_mutation() {
+        assert!(!resource_enabled_for_policy(
+            RelayStreamResource::IpTunnel,
+            false
+        ));
+        assert!(resource_enabled_for_policy(RelayStreamResource::Pty, false));
+        assert!(resource_enabled_for_policy(
+            RelayStreamResource::ClawSite,
+            false
+        ));
+    }
     use household_rs::claw_share::GuestCredential;
     use household_rs::claw_share::SlotId;
     use household_rs::household_mesh_log::{

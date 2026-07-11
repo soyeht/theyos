@@ -1,7 +1,6 @@
 use std::{
     net::SocketAddr,
     sync::{Arc, Mutex},
-    time::Duration,
 };
 
 use axum::{
@@ -28,7 +27,6 @@ use core_rs::{
 use executor_rs::{Executor, FlowConfig};
 use household_rs::{
     BootstrapOpts, HouseholdAuthState, KeyBackingPolicy, PersonCert,
-    claw_share_rendezvous_hello::{RendezvousHello, RendezvousRole},
     keys::{IdentityKey, P256Keypair},
     person_cert::SignOwnerOptions,
     pop::RequestSigningContext,
@@ -42,12 +40,7 @@ use server_rs::{
     handlers_instances, handlers_mobile, handlers_terminal,
     household_attach_token::{HouseholdAttachScope, HouseholdAttachTokenStore},
     household_state::HouseholdState,
-    mobile_claw_vpn_relay_dial_config::MobileClawVpnRendezvousRelayDialConfig,
-    mobile_claw_vpn_relay_responder::{
-        mobile_claw_vpn_rendezvous_responder_preflight_from_state,
-        mobile_claw_vpn_write_rendezvous_responder_hello,
-    },
-    mobile_claw_vpn_relay_responder_config::MobileClawVpnRelayResponderConfig,
+    mobile_api_routes,
     ratelimit::Limiter,
     responses::{ClawDetailResponse, ClawJobResponse, ClawListItemResponse, ListResponse},
     state::{AppState, SharedState},
@@ -55,7 +48,6 @@ use server_rs::{
 use session_rs::SessionStore;
 use store_rs::{InstanceDb, NewInstance, UserRole};
 use terminal_rs::pty::PtyManager;
-use tokio::{io::AsyncReadExt, net::TcpListener, time::timeout};
 use tower::ServiceExt;
 use vmrunner_rs::VmRunner;
 
@@ -112,28 +104,6 @@ fn shared_state() -> SharedState {
 }
 
 fn shared_state_with_claw_store(claw_store: claw_rs::ClawStore) -> SharedState {
-    shared_state_with_claw_store_and_mobile_relay_dial(
-        claw_store,
-        MobileClawVpnRendezvousRelayDialConfig::default(),
-    )
-}
-
-fn shared_state_with_claw_store_and_mobile_relay_dial(
-    claw_store: claw_rs::ClawStore,
-    mobile_claw_vpn_relay_dial: MobileClawVpnRendezvousRelayDialConfig,
-) -> SharedState {
-    shared_state_with_claw_store_and_mobile_configs(
-        claw_store,
-        mobile_claw_vpn_relay_dial,
-        MobileClawVpnRelayResponderConfig::default(),
-    )
-}
-
-fn shared_state_with_claw_store_and_mobile_configs(
-    claw_store: claw_rs::ClawStore,
-    mobile_claw_vpn_relay_dial: MobileClawVpnRendezvousRelayDialConfig,
-    mobile_claw_vpn_relay_responder: MobileClawVpnRelayResponderConfig,
-) -> SharedState {
     let _env_guard = ENV_LOCK
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -191,15 +161,6 @@ fn shared_state_with_claw_store_and_mobile_configs(
     let locks_dir = tempfile::TempDir::new().expect("locks dir");
     let locks_path = locks_dir.path().to_path_buf();
     std::mem::forget(locks_dir);
-    let mobile_mesh_dir = tempfile::TempDir::new().expect("mobile mesh tempdir");
-    let mobile_claw_vpn_mesh =
-        household_rs::claw_vpn_mobile_mesh_store::ClawVpnMobileMeshStore::new(
-            mobile_mesh_dir.path(),
-            600,
-        )
-        .expect("mobile mesh store");
-    std::mem::forget(mobile_mesh_dir);
-
     Arc::new(AppState {
         sessions,
         jobs,
@@ -212,117 +173,12 @@ fn shared_state_with_claw_store_and_mobile_configs(
         mobile_tokens: Arc::new(server_rs::mobile_token::MobileTokenStore::new()),
         mobile_sessions: server_rs::mobile_token::MobileSessionDb::open(":memory:")
             .expect("mobile session db"),
-        mobile_claw_vpn_mesh,
-        mobile_claw_vpn_relay_dial,
-        mobile_claw_vpn_relay_responder,
         claw_store,
         theyos_dir: theyos_path,
         locks_dir: locks_path,
         capacity_lock: tokio::sync::Mutex::new(()),
         llm_proxy_client: server_rs::handlers_llm::ProxyClient::from_env(),
     })
-}
-
-#[test]
-fn mobile_claw_vpn_relay_responder_config_reaches_app_state_when_configured() {
-    let responder_config =
-        MobileClawVpnRelayResponderConfig::from_values(Some("true"), Some("claw-alpha")).unwrap();
-    let state = shared_state_with_claw_store_and_mobile_configs(
-        default_claw_store(),
-        MobileClawVpnRendezvousRelayDialConfig::default(),
-        responder_config,
-    );
-
-    assert!(state.mobile_claw_vpn_relay_responder.is_configured());
-    assert_eq!(
-        state.mobile_claw_vpn_relay_responder.claw().unwrap(),
-        &household_rs::claw_vpn_mobile_state::ClawVpnMobileClawId::try_new("claw-alpha").unwrap()
-    );
-    assert!(!format!("{:?}", state.mobile_claw_vpn_relay_responder).contains("claw-alpha"));
-}
-
-#[test]
-fn mobile_claw_vpn_responder_preflight_from_state_is_default_inert() {
-    let state = shared_state();
-    let rendezvous_token =
-        household_rs::claw_vpn_mobile_state::ClawVpnMobileRendezvousToken::try_new(
-            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-        )
-        .unwrap();
-
-    let error = match mobile_claw_vpn_rendezvous_responder_preflight_from_state(
-        &state,
-        &rendezvous_token,
-    ) {
-        Ok(_preflight) => panic!("default responder config must not produce preflight"),
-        Err(error) => error,
-    };
-
-    assert_eq!(error.kind(), "responder_not_configured");
-    assert!(!format!("{error:?}").contains("aaaaaaaa"));
-    assert!(!error.to_string().contains("aaaaaaaa"));
-}
-
-#[tokio::test]
-async fn mobile_claw_vpn_responder_preflight_from_state_uses_configured_identity() {
-    let responder_config =
-        MobileClawVpnRelayResponderConfig::from_values(Some("true"), Some("claw-alpha")).unwrap();
-    let state = shared_state_with_claw_store_and_mobile_configs(
-        default_claw_store(),
-        MobileClawVpnRendezvousRelayDialConfig::default(),
-        responder_config,
-    );
-
-    let member =
-        household_rs::claw_vpn_mobile_state::ClawVpnMobileMemberId::try_new("member-alpha")
-            .expect("member id");
-    let device =
-        household_rs::claw_vpn_mobile_state::ClawVpnMobileDeviceId::try_new("device-alpha")
-            .expect("device id");
-    let claw = household_rs::claw_vpn_mobile_state::ClawVpnMobileClawId::try_new("claw-alpha")
-        .expect("claw id");
-    let grant = household_rs::claw_vpn_mobile_state::ClawVpnMobileAclGrant::new(
-        member,
-        device.clone(),
-        claw.clone(),
-    );
-    assert!(
-        state
-            .mobile_claw_vpn_mesh
-            .owner_approved_enroll_device(device)
-            .unwrap()
-    );
-    assert!(state.mobile_claw_vpn_mesh.set_claw_available(claw).unwrap());
-    assert!(
-        state
-            .mobile_claw_vpn_mesh
-            .owner_approved_grant(grant.clone())
-            .unwrap()
-    );
-    let offer_token = state
-        .mobile_claw_vpn_mesh
-        .mint_offer_token(&grant, 100)
-        .unwrap();
-    let rendezvous_token = state
-        .mobile_claw_vpn_mesh
-        .consume_offer_token(&offer_token, &grant, 101)
-        .unwrap();
-
-    let preflight =
-        mobile_claw_vpn_rendezvous_responder_preflight_from_state(&state, &rendezvous_token)
-            .unwrap();
-    let (mut writer, mut reader) = tokio::io::duplex(1024);
-    mobile_claw_vpn_write_rendezvous_responder_hello(&mut writer, preflight)
-        .await
-        .unwrap();
-    drop(writer);
-
-    let mut hello_bytes = Vec::new();
-    reader.read_to_end(&mut hello_bytes).await.unwrap();
-    let decoded = RendezvousHello::decode(&hello_bytes).unwrap();
-
-    assert_eq!(decoded.role, RendezvousRole::Claw);
-    assert_eq!(decoded.token, rendezvous_token.relay_token().unwrap());
 }
 
 fn admin_router(state: SharedState) -> Router {
@@ -352,22 +208,6 @@ fn admin_auth_router(state: SharedState) -> Router {
         )
         .route("/api/v1/users", get(handlers_mobile::handle_admin_users))
         .route(
-            "/api/v1/mobile/claw-vpn/owner/enroll-device",
-            post(handlers_mobile::handle_admin_mobile_claw_vpn_enroll_device),
-        )
-        .route(
-            "/api/v1/mobile/claw-vpn/owner/claw-availability",
-            post(handlers_mobile::handle_admin_mobile_claw_vpn_set_claw_availability),
-        )
-        .route(
-            "/api/v1/mobile/claw-vpn/owner/grant",
-            post(handlers_mobile::handle_admin_mobile_claw_vpn_grant),
-        )
-        .route(
-            "/api/v1/mobile/claw-vpn/owner/revoke-grant",
-            post(handlers_mobile::handle_admin_mobile_claw_vpn_revoke_grant),
-        )
-        .route(
             "/api/v1/instances",
             post(handlers_instances::handle_create_instance_body),
         )
@@ -389,57 +229,7 @@ fn admin_auth_router(state: SharedState) -> Router {
 }
 
 fn mobile_router(state: SharedState) -> Router {
-    Router::new()
-        .route(
-            "/api/v1/mobile/claws",
-            get(handlers_mobile::handle_mobile_claws),
-        )
-        .route(
-            "/api/v1/mobile/claws/{name}/availability",
-            get(handlers_mobile::handle_mobile_claw_availability),
-        )
-        .route(
-            "/api/v1/mobile/claws/{name}/install",
-            post(handlers_mobile::handle_mobile_install_claw),
-        )
-        .route(
-            "/api/v1/mobile/claws/{name}/uninstall",
-            post(handlers_mobile::handle_mobile_uninstall_claw),
-        )
-        .route(
-            "/api/v1/mobile/instances",
-            get(handlers_mobile::handle_mobile_instances)
-                .post(handlers_mobile::handle_mobile_create_instance),
-        )
-        .route(
-            "/api/v1/mobile/instances/{id}/status",
-            get(handlers_mobile::handle_mobile_instance_status),
-        )
-        .route(
-            "/api/v1/mobile/resource-options",
-            get(handlers_mobile::handle_resource_options),
-        )
-        .route(
-            "/api/v1/mobile/claw-vpn/status",
-            get(handlers_mobile::handle_mobile_claw_vpn_status),
-        )
-        .route(
-            "/api/v1/mobile/claw-vpn/offers",
-            post(handlers_mobile::handle_mobile_claw_vpn_mint_offer),
-        )
-        .route(
-            "/api/v1/mobile/claw-vpn/sessions",
-            post(handlers_mobile::handle_mobile_claw_vpn_consume_offer),
-        )
-        .route(
-            "/api/v1/mobile/claw-vpn/rendezvous/authorize",
-            post(handlers_mobile::handle_mobile_claw_vpn_authorize_rendezvous),
-        )
-        .route(
-            "/api/v1/mobile/users",
-            get(handlers_mobile::handle_mobile_users),
-        )
-        .with_state(state)
+    mobile_api_routes::routes(&state)
 }
 
 struct HouseholdFixture {
@@ -708,129 +498,6 @@ fn assert_users_envelope_shape(body: &Value) {
             "role must be admin or user"
         );
     }
-}
-
-fn assert_mobile_claw_vpn_owner_mutation_body(
-    body: &Value,
-    operation: &str,
-    changed: bool,
-    revoked_offer_count: u64,
-    closed_session_count: u64,
-    counts: [u64; 5],
-) {
-    let object = body.as_object().expect("owner mutation body object");
-    assert_eq!(object.len(), 8, "owner mutation response must stay flat");
-    assert_eq!(body["product"], "product_a_mobile_claw_vpn");
-    assert_eq!(body["mode"], "mesh_c_owner_admin");
-    assert_eq!(body["production_activation"], false);
-    assert_eq!(body["operation"], operation);
-    assert_eq!(body["changed"], changed);
-    assert_eq!(body["revoked_offer_count"], revoked_offer_count);
-    assert_eq!(body["closed_session_count"], closed_session_count);
-
-    let status = &body["status"];
-    assert_eq!(
-        status.as_object().expect("nested status object").len(),
-        10,
-        "nested status must stay count-only"
-    );
-    assert_eq!(status["product"], "product_a_mobile_claw_vpn");
-    assert_eq!(status["mode"], "mesh_c_status_only");
-    assert_eq!(status["production_activation"], false);
-    assert_eq!(status["state"], "configured");
-    assert_eq!(status["snapshot_present"], true);
-    assert_eq!(status["enrolled_device_count"], counts[0]);
-    assert_eq!(status["available_claw_count"], counts[1]);
-    assert_eq!(status["grant_count"], counts[2]);
-    assert_eq!(status["offer_count"], counts[3]);
-    assert_eq!(status["session_count"], counts[4]);
-}
-
-fn assert_mobile_claw_vpn_status_counts(status: &Value, counts: [u64; 5]) {
-    assert_eq!(
-        status.as_object().expect("nested status object").len(),
-        10,
-        "nested status must stay count-only"
-    );
-    assert_eq!(status["product"], "product_a_mobile_claw_vpn");
-    assert_eq!(status["mode"], "mesh_c_status_only");
-    assert_eq!(status["production_activation"], false);
-    assert_eq!(status["state"], "configured");
-    assert_eq!(status["snapshot_present"], true);
-    assert_eq!(status["enrolled_device_count"], counts[0]);
-    assert_eq!(status["available_claw_count"], counts[1]);
-    assert_eq!(status["grant_count"], counts[2]);
-    assert_eq!(status["offer_count"], counts[3]);
-    assert_eq!(status["session_count"], counts[4]);
-}
-
-fn assert_mobile_claw_vpn_offer_body(body: &Value, counts: [u64; 5]) -> String {
-    let object = body.as_object().expect("offer body object");
-    assert_eq!(object.len(), 6, "offer response must stay minimal");
-    assert_eq!(body["product"], "product_a_mobile_claw_vpn");
-    assert_eq!(body["mode"], "mesh_c_offer_control");
-    assert_eq!(body["production_activation"], false);
-    assert_eq!(body["operation"], "mint_offer");
-    let offer_token = body["offer_token"]
-        .as_str()
-        .expect("offer_token string token");
-    assert_eq!(offer_token.len(), 32, "offer_token must be 128-bit hex");
-    assert!(
-        offer_token.chars().all(|ch| ch.is_ascii_hexdigit()),
-        "offer_token must stay hex"
-    );
-    assert_mobile_claw_vpn_status_counts(&body["status"], counts);
-    offer_token.to_string()
-}
-
-fn assert_mobile_claw_vpn_session_body(body: &Value, counts: [u64; 5]) -> String {
-    let object = body.as_object().expect("session body object");
-    assert_eq!(object.len(), 6, "session response must stay minimal");
-    assert_eq!(body["product"], "product_a_mobile_claw_vpn");
-    assert_eq!(body["mode"], "mesh_c_offer_control");
-    assert_eq!(body["production_activation"], false);
-    assert_eq!(body["operation"], "consume_offer");
-    let rendezvous_token = body["rendezvous_token"]
-        .as_str()
-        .expect("rendezvous_token string token");
-    assert_eq!(
-        rendezvous_token.len(),
-        32,
-        "rendezvous_token must be 128-bit hex"
-    );
-    assert!(
-        rendezvous_token.chars().all(|ch| ch.is_ascii_hexdigit()),
-        "rendezvous_token must stay hex"
-    );
-    assert!(
-        !object.contains_key("session_id"),
-        "sequential session id stays internal; public handle is the opaque rendezvous token"
-    );
-    assert_mobile_claw_vpn_status_counts(&body["status"], counts);
-    rendezvous_token.to_string()
-}
-
-fn assert_mobile_claw_vpn_rendezvous_authorize_body(body: &Value, counts: [u64; 5]) {
-    let object = body.as_object().expect("rendezvous authorize body object");
-    assert_eq!(
-        object.len(),
-        6,
-        "rendezvous authorize response must stay minimal"
-    );
-    assert_eq!(body["product"], "product_a_mobile_claw_vpn");
-    assert_eq!(body["mode"], "mesh_c_rendezvous_preflight");
-    assert_eq!(body["production_activation"], false);
-    assert_eq!(body["operation"], "authorize_rendezvous");
-    assert_eq!(body["authorized"], true);
-    assert!(
-        !object.contains_key("rendezvous_token"),
-        "relay rendezvous token is server-side only after preflight"
-    );
-    assert!(
-        !object.contains_key("session_id"),
-        "sequential session id stays internal"
-    );
-    assert_mobile_claw_vpn_status_counts(&body["status"], counts);
 }
 
 fn claw_list_item<'a>(body: &'a Value, name: &str) -> &'a Value {
@@ -1586,13 +1253,32 @@ async fn admin_metadata_routes_require_admin_session_and_match_mobile_shapes() {
 }
 
 #[tokio::test]
-async fn mobile_claw_vpn_status_is_mobile_authed_and_count_only() {
+async fn mobile_claw_vpn_phase0_exposes_only_authenticated_unavailable_status() {
     let state = shared_state();
-    let path = "/api/v1/mobile/claw-vpn/status";
+    let status_path = "/api/v1/mobile/claw-vpn/status";
+    let artifact_contract = server_rs::mobile_claw_vpn_phase0::artifact_contract();
+    assert_eq!(artifact_contract["authority"], "none");
+    assert_eq!(
+        artifact_contract["generic_ip_tunnel_backend_compiled"],
+        false
+    );
+    assert_eq!(
+        artifact_contract["generic_ip_tunnel_store_accepts_resource"],
+        false
+    );
+    assert_eq!(
+        artifact_contract["generic_ip_tunnel_env_accepts_resource"],
+        false
+    );
+    assert_eq!(
+        artifact_contract["product_a_routes"],
+        serde_json::json!(["/claw-vpn/status"])
+    );
+
     let (status, _bytes, body) = request(
         mobile_router(Arc::clone(&state)),
         Method::GET,
-        path,
+        status_path,
         Vec::new(),
         None,
     )
@@ -1604,679 +1290,60 @@ async fn mobile_claw_vpn_status_is_mobile_authed_and_count_only() {
         "mobile_missing_auth",
     );
 
-    let token = mobile_token_for_role(&state, "mobile-vpn-status-member", UserRole::User);
+    let token = mobile_token_for_role(&state, "phase0-member", UserRole::User);
     let (status, _bytes, body) = request(
         mobile_router(Arc::clone(&state)),
         Method::GET,
-        path,
+        status_path,
         Vec::new(),
         Some(format!("Bearer {token}")),
     )
     .await;
-
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["product"], "product_a_mobile_claw_vpn");
-    assert_eq!(body["mode"], "mesh_c_status_only");
+    assert_eq!(body["phase"], "phase0_compile_out");
     assert_eq!(body["production_activation"], false);
-    assert_eq!(body["state"], "not_configured");
-    assert_eq!(body["snapshot_present"], false);
-    for count_key in [
-        "enrolled_device_count",
-        "available_claw_count",
-        "grant_count",
-        "offer_count",
-        "session_count",
+    assert_eq!(body["state"], "unavailable");
+    assert_eq!(body.as_object().expect("Phase 0 status object").len(), 4);
+}
+
+#[tokio::test]
+async fn mobile_claw_vpn_phase0_mutation_routes_are_absent() {
+    let state = shared_state();
+    let token = mobile_token_for_role(&state, "phase0-member", UserRole::User);
+    for path in [
+        "/api/v1/mobile/claw-vpn/offers",
+        "/api/v1/mobile/claw-vpn/sessions",
+        "/api/v1/mobile/claw-vpn/rendezvous/authorize",
     ] {
-        assert_eq!(body[count_key], 0);
+        let (status, _bytes, _body) = request(
+            mobile_router(Arc::clone(&state)),
+            Method::POST,
+            path,
+            b"{}".to_vec(),
+            Some(format!("Bearer {token}")),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{path}");
     }
 
-    let member =
-        household_rs::claw_vpn_mobile_state::ClawVpnMobileMemberId::try_new("member-alpha")
-            .expect("member id");
-    let device =
-        household_rs::claw_vpn_mobile_state::ClawVpnMobileDeviceId::try_new("device-alpha")
-            .expect("device id");
-    let claw = household_rs::claw_vpn_mobile_state::ClawVpnMobileClawId::try_new("claw-alpha")
-        .expect("claw id");
-    let grant = household_rs::claw_vpn_mobile_state::ClawVpnMobileAclGrant::new(
-        member,
-        device.clone(),
-        claw.clone(),
-    );
-    assert!(
-        state
-            .mobile_claw_vpn_mesh
-            .owner_approved_enroll_device(device)
-            .expect("enroll device")
-    );
-    assert!(
-        state
-            .mobile_claw_vpn_mesh
-            .set_claw_available(claw)
-            .expect("set claw available")
-    );
-    assert!(
-        state
-            .mobile_claw_vpn_mesh
-            .owner_approved_grant(grant.clone())
-            .expect("owner grant")
-    );
-    let offer_token = state
-        .mobile_claw_vpn_mesh
-        .mint_offer_token(&grant, 100)
-        .expect("mint offer");
-    let _session = state
-        .mobile_claw_vpn_mesh
-        .consume_offer_token(&offer_token, &grant, 101)
-        .expect("consume offer");
-
-    let (status, _bytes, body) = request(
-        mobile_router(Arc::clone(&state)),
-        Method::GET,
-        path,
-        Vec::new(),
-        Some(format!("Bearer {token}")),
-    )
-    .await;
-
-    assert_eq!(status, StatusCode::OK);
-    assert_eq!(body.as_object().expect("status response object").len(), 10);
-    assert_eq!(body["product"], "product_a_mobile_claw_vpn");
-    assert_eq!(body["mode"], "mesh_c_status_only");
-    assert_eq!(body["production_activation"], false);
-    assert_eq!(body["state"], "configured");
-    assert_eq!(body["snapshot_present"], true);
-    assert_eq!(body["enrolled_device_count"], 1);
-    assert_eq!(body["available_claw_count"], 1);
-    assert_eq!(body["grant_count"], 1);
-    assert_eq!(body["offer_count"], 1);
-    assert_eq!(body["session_count"], 1);
-}
-
-#[tokio::test]
-async fn mobile_claw_vpn_owner_routes_require_admin_and_are_count_only() {
-    let state = shared_state();
-    let enroll_path = "/api/v1/mobile/claw-vpn/owner/enroll-device";
-    let availability_path = "/api/v1/mobile/claw-vpn/owner/claw-availability";
-    let grant_path = "/api/v1/mobile/claw-vpn/owner/grant";
-    let revoke_path = "/api/v1/mobile/claw-vpn/owner/revoke-grant";
-    let enroll_body = json!({"device_id":"device-alpha"}).to_string().into_bytes();
-
-    let (status, _bytes, body) = request_with_cookie(
-        admin_auth_router(Arc::clone(&state)),
-        Method::POST,
-        enroll_path,
-        enroll_body.clone(),
-        None,
-    )
-    .await;
-    assert_fixture_body(
-        status,
-        &body,
-        StatusCode::UNAUTHORIZED,
-        "admin_auth_unauthorized",
-    );
-
-    let member_cookie = admin_session_cookie_for_role(&state, "mesh-owner-member", UserRole::User);
-    let (status, _bytes, body) = request_with_cookie(
-        admin_auth_router(Arc::clone(&state)),
-        Method::POST,
-        enroll_path,
-        enroll_body.clone(),
-        Some(member_cookie),
-    )
-    .await;
-    assert_fixture_body(status, &body, StatusCode::FORBIDDEN, "admin_required");
-
-    let member_bearer = mobile_token_for_role(&state, "mesh-owner-mobile-member", UserRole::User);
-    let (status, _bytes, body) = request(
-        admin_auth_router(Arc::clone(&state)),
-        Method::POST,
-        enroll_path,
-        enroll_body.clone(),
-        Some(format!("Bearer {member_bearer}")),
-    )
-    .await;
-    assert_fixture_body(status, &body, StatusCode::FORBIDDEN, "admin_required");
-
-    let admin_cookie = admin_session_cookie_for_role(&state, "mesh-owner-admin", UserRole::Admin);
-    let (status, _bytes, body) = request_with_cookie(
-        admin_auth_router(Arc::clone(&state)),
-        Method::POST,
-        enroll_path,
-        json!({"device_id":" "}).to_string().into_bytes(),
-        Some(admin_cookie.clone()),
-    )
-    .await;
-    assert_eq!(status, StatusCode::BAD_REQUEST);
-    assert_eq!(body["error"], "invalid mobile Claw VPN mesh request");
-    assert_eq!(body["code"], "INVALID_INPUT");
-    assert_eq!(body.as_object().expect("error object").len(), 2);
-
-    let (status, _bytes, body) = request_with_cookie(
-        admin_auth_router(Arc::clone(&state)),
-        Method::POST,
-        enroll_path,
-        enroll_body,
-        Some(admin_cookie.clone()),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK);
-    assert_mobile_claw_vpn_owner_mutation_body(&body, "enroll_device", true, 0, 0, [1, 0, 0, 0, 0]);
-
-    let (status, _bytes, body) = request_with_cookie(
-        admin_auth_router(Arc::clone(&state)),
-        Method::POST,
-        availability_path,
-        json!({"claw_id":"claw-alpha","available":true})
-            .to_string()
-            .into_bytes(),
-        Some(admin_cookie.clone()),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK);
-    assert_mobile_claw_vpn_owner_mutation_body(
-        &body,
-        "set_claw_available",
-        true,
-        0,
-        0,
-        [1, 1, 0, 0, 0],
-    );
-
-    let grant_body = json!({
-        "member_id":"member-alpha",
-        "device_id":"device-alpha",
-        "claw_id":"claw-alpha"
-    })
-    .to_string()
-    .into_bytes();
-    let (status, _bytes, body) = request_with_cookie(
-        admin_auth_router(Arc::clone(&state)),
-        Method::POST,
-        grant_path,
-        grant_body.clone(),
-        Some(admin_cookie.clone()),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK);
-    assert_mobile_claw_vpn_owner_mutation_body(&body, "grant", true, 0, 0, [1, 1, 1, 0, 0]);
-
-    let grant = household_rs::claw_vpn_mobile_state::ClawVpnMobileAclGrant::new(
-        household_rs::claw_vpn_mobile_state::ClawVpnMobileMemberId::try_new("member-alpha")
-            .expect("member id"),
-        household_rs::claw_vpn_mobile_state::ClawVpnMobileDeviceId::try_new("device-alpha")
-            .expect("device id"),
-        household_rs::claw_vpn_mobile_state::ClawVpnMobileClawId::try_new("claw-alpha")
-            .expect("claw id"),
-    );
-    let consumed_offer_token = state
-        .mobile_claw_vpn_mesh
-        .mint_offer_token(&grant, 100)
-        .expect("mint consumed offer");
-    let _session = state
-        .mobile_claw_vpn_mesh
-        .consume_offer_token(&consumed_offer_token, &grant, 101)
-        .expect("consume offer");
-    let _minted_offer = state
-        .mobile_claw_vpn_mesh
-        .mint_offer_token(&grant, 102)
-        .expect("mint pending offer");
-
-    let (status, _bytes, body) = request_with_cookie(
-        admin_auth_router(Arc::clone(&state)),
-        Method::POST,
-        revoke_path,
-        grant_body,
-        Some(admin_cookie),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK);
-    assert_mobile_claw_vpn_owner_mutation_body(&body, "revoke_grant", true, 1, 1, [1, 1, 0, 2, 0]);
-}
-
-#[tokio::test]
-async fn mobile_claw_vpn_owner_unavailability_closes_matching_sessions() {
-    let state = shared_state();
-    let availability_path = "/api/v1/mobile/claw-vpn/owner/claw-availability";
-    let admin_cookie =
-        admin_session_cookie_for_role(&state, "mesh-availability-admin", UserRole::Admin);
-    let grant = household_rs::claw_vpn_mobile_state::ClawVpnMobileAclGrant::new(
-        household_rs::claw_vpn_mobile_state::ClawVpnMobileMemberId::try_new("member-alpha")
-            .expect("member id"),
-        household_rs::claw_vpn_mobile_state::ClawVpnMobileDeviceId::try_new("device-alpha")
-            .expect("device id"),
-        household_rs::claw_vpn_mobile_state::ClawVpnMobileClawId::try_new("claw-alpha")
-            .expect("claw id"),
-    );
-    assert!(
-        state
-            .mobile_claw_vpn_mesh
-            .owner_approved_enroll_device(
-                household_rs::claw_vpn_mobile_state::ClawVpnMobileDeviceId::try_new("device-alpha")
-                    .expect("device id"),
-            )
-            .unwrap()
-    );
-    assert!(
-        state
-            .mobile_claw_vpn_mesh
-            .set_claw_available(
-                household_rs::claw_vpn_mobile_state::ClawVpnMobileClawId::try_new("claw-alpha")
-                    .expect("claw id"),
-            )
-            .unwrap()
-    );
-    assert!(
-        state
-            .mobile_claw_vpn_mesh
-            .owner_approved_grant(grant.clone())
-            .unwrap()
-    );
-    let consumed_offer_token = state
-        .mobile_claw_vpn_mesh
-        .mint_offer_token(&grant, 100)
-        .expect("mint consumed offer");
-    let _rendezvous_token = state
-        .mobile_claw_vpn_mesh
-        .consume_offer_token(&consumed_offer_token, &grant, 101)
-        .expect("consume offer");
-    let _minted_offer = state
-        .mobile_claw_vpn_mesh
-        .mint_offer_token(&grant, 102)
-        .expect("mint pending offer");
-
-    let (status, _bytes, body) = request_with_cookie(
-        admin_auth_router(Arc::clone(&state)),
-        Method::POST,
-        availability_path,
-        json!({"claw_id":"claw-alpha","available":false})
-            .to_string()
-            .into_bytes(),
-        Some(admin_cookie),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK);
-    assert_mobile_claw_vpn_owner_mutation_body(
-        &body,
-        "set_claw_unavailable",
-        true,
-        1,
-        1,
-        [1, 0, 1, 2, 0],
-    );
-    assert_eq!(
-        state.mobile_claw_vpn_mesh.status().unwrap().session_count(),
-        0
-    );
-}
-
-#[tokio::test]
-async fn mobile_claw_vpn_offer_routes_are_auth_scoped_single_use_and_count_only() {
-    let state = shared_state();
-    let offer_path = "/api/v1/mobile/claw-vpn/offers";
-    let session_path = "/api/v1/mobile/claw-vpn/sessions";
-    let rendezvous_path = "/api/v1/mobile/claw-vpn/rendezvous/authorize";
-    let offer_body = json!({"device_id":"device-alpha","claw_id":"claw-alpha"})
-        .to_string()
-        .into_bytes();
-
-    let (status, _bytes, body) = request(
-        mobile_router(Arc::clone(&state)),
-        Method::POST,
-        offer_path,
-        offer_body.clone(),
-        None,
-    )
-    .await;
-    assert_fixture_body(
-        status,
-        &body,
-        StatusCode::UNAUTHORIZED,
-        "mobile_missing_auth",
-    );
-
-    let other_token = mobile_token_for_role(&state, "member-beta", UserRole::User);
-    let (status, _bytes, body) = request(
-        mobile_router(Arc::clone(&state)),
-        Method::POST,
-        offer_path,
-        offer_body.clone(),
-        Some(format!("Bearer {other_token}")),
-    )
-    .await;
-    assert_eq!(status, StatusCode::FORBIDDEN);
-    assert_eq!(body["error"], "mobile Claw VPN offer action denied");
-    assert_eq!(body["code"], "FORBIDDEN");
-    assert_eq!(body.as_object().expect("error object").len(), 2);
-    assert_eq!(
-        state.mobile_claw_vpn_mesh.status().unwrap().offer_count(),
-        0
-    );
-
-    let member =
-        household_rs::claw_vpn_mobile_state::ClawVpnMobileMemberId::try_new("member-alpha")
-            .expect("member id");
-    let device =
-        household_rs::claw_vpn_mobile_state::ClawVpnMobileDeviceId::try_new("device-alpha")
-            .expect("device id");
-    let claw = household_rs::claw_vpn_mobile_state::ClawVpnMobileClawId::try_new("claw-alpha")
-        .expect("claw id");
-    let grant = household_rs::claw_vpn_mobile_state::ClawVpnMobileAclGrant::new(
-        member,
-        device.clone(),
-        claw.clone(),
-    );
-    assert!(
-        state
-            .mobile_claw_vpn_mesh
-            .owner_approved_enroll_device(device)
-            .unwrap()
-    );
-    assert!(state.mobile_claw_vpn_mesh.set_claw_available(claw).unwrap());
-    assert!(
-        state
-            .mobile_claw_vpn_mesh
-            .owner_approved_grant(grant)
-            .unwrap()
-    );
-
-    let member_token = mobile_token_for_role(&state, "member-alpha", UserRole::User);
-    let (status, _bytes, body) = request(
-        mobile_router(Arc::clone(&state)),
-        Method::POST,
-        offer_path,
-        json!({"device_id":" ","claw_id":"claw-alpha"})
-            .to_string()
-            .into_bytes(),
-        Some(format!("Bearer {member_token}")),
-    )
-    .await;
-    assert_eq!(status, StatusCode::BAD_REQUEST);
-    assert_eq!(body["error"], "invalid mobile Claw VPN mesh request");
-    assert_eq!(body["code"], "INVALID_INPUT");
-    assert_eq!(body.as_object().expect("error object").len(), 2);
-
-    let member_token = mobile_session_for_existing_user(&state, "member-alpha");
-    let (status, _bytes, body) = request(
-        mobile_router(Arc::clone(&state)),
-        Method::POST,
-        offer_path,
-        offer_body,
-        Some(format!("Bearer {member_token}")),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK);
-    let offer_token = assert_mobile_claw_vpn_offer_body(&body, [1, 1, 1, 1, 0]);
-
-    let (status, _bytes, body) = request(
-        mobile_router(Arc::clone(&state)),
-        Method::POST,
-        session_path,
-        json!({"device_id":"device-alpha","claw_id":"claw-alpha","offer_token":offer_token})
-            .to_string()
-            .into_bytes(),
-        Some(format!("Bearer {other_token}")),
-    )
-    .await;
-    assert_eq!(status, StatusCode::FORBIDDEN);
-    assert_eq!(body["error"], "mobile Claw VPN offer action denied");
-    assert_eq!(body["code"], "FORBIDDEN");
-    assert_eq!(body.as_object().expect("error object").len(), 2);
-    let status_after_cross_member_deny = state.mobile_claw_vpn_mesh.status().unwrap();
-    assert_eq!(status_after_cross_member_deny.offer_count(), 1);
-    assert_eq!(status_after_cross_member_deny.session_count(), 0);
-
-    let member_token = mobile_session_for_existing_user(&state, "member-alpha");
-    let consume_body = json!({
-        "device_id":"device-alpha",
-        "claw_id":"claw-alpha",
-        "offer_token":offer_token
-    })
-    .to_string()
-    .into_bytes();
-    let (status, _bytes, body) = request(
-        mobile_router(Arc::clone(&state)),
-        Method::POST,
-        session_path,
-        consume_body.clone(),
-        Some(format!("Bearer {member_token}")),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK);
-    let rendezvous_token = assert_mobile_claw_vpn_session_body(&body, [1, 1, 1, 1, 1]);
-
-    let rendezvous_body = json!({
-        "device_id":"device-alpha",
-        "claw_id":"claw-alpha",
-        "rendezvous_token":rendezvous_token
-    })
-    .to_string()
-    .into_bytes();
-
-    let (status, _bytes, body) = request(
-        mobile_router(Arc::clone(&state)),
-        Method::POST,
-        rendezvous_path,
-        rendezvous_body.clone(),
-        None,
-    )
-    .await;
-    assert_fixture_body(
-        status,
-        &body,
-        StatusCode::UNAUTHORIZED,
-        "mobile_missing_auth",
-    );
-
-    let (status, _bytes, body) = request(
-        mobile_router(Arc::clone(&state)),
-        Method::POST,
-        rendezvous_path,
-        rendezvous_body.clone(),
-        Some(format!("Bearer {other_token}")),
-    )
-    .await;
-    assert_eq!(status, StatusCode::FORBIDDEN);
-    assert_eq!(body["error"], "mobile Claw VPN rendezvous denied");
-    assert_eq!(body["code"], "FORBIDDEN");
-    assert_eq!(body.as_object().expect("error object").len(), 2);
-
-    let member_token = mobile_session_for_existing_user(&state, "member-alpha");
-    let (status, _bytes, body) = request(
-        mobile_router(Arc::clone(&state)),
-        Method::POST,
-        rendezvous_path,
-        rendezvous_body.clone(),
-        Some(format!("Bearer {member_token}")),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK);
-    assert_mobile_claw_vpn_rendezvous_authorize_body(&body, [1, 1, 1, 1, 1]);
-
-    let member_token = mobile_session_for_existing_user(&state, "member-alpha");
-    let (status, _bytes, body) = request(
-        mobile_router(Arc::clone(&state)),
-        Method::POST,
-        rendezvous_path,
-        json!({
-            "device_id":"device-alpha",
-            "claw_id":"claw-alpha",
-            "rendezvous_token":"00000000000000000000000000000000"
-        })
-        .to_string()
-        .into_bytes(),
-        Some(format!("Bearer {member_token}")),
-    )
-    .await;
-    assert_eq!(status, StatusCode::GONE);
-    assert_eq!(body["error"], "mobile Claw VPN rendezvous unavailable");
-    assert_eq!(body["code"], "GONE");
-    assert_eq!(body.as_object().expect("error object").len(), 2);
-
-    let member_token = mobile_session_for_existing_user(&state, "member-alpha");
-    let (status, _bytes, body) = request(
-        mobile_router(Arc::clone(&state)),
-        Method::POST,
-        rendezvous_path,
-        json!({
-            "device_id":"device-alpha",
-            "claw_id":"claw-alpha",
-            "rendezvous_token":" "
-        })
-        .to_string()
-        .into_bytes(),
-        Some(format!("Bearer {member_token}")),
-    )
-    .await;
-    assert_eq!(status, StatusCode::BAD_REQUEST);
-    assert_eq!(body["error"], "invalid mobile Claw VPN mesh request");
-    assert_eq!(body["code"], "INVALID_INPUT");
-    assert_eq!(body.as_object().expect("error object").len(), 2);
-
-    let member_token = mobile_session_for_existing_user(&state, "member-alpha");
-    let (status, _bytes, body) = request(
-        mobile_router(Arc::clone(&state)),
-        Method::POST,
-        session_path,
-        consume_body,
-        Some(format!("Bearer {member_token}")),
-    )
-    .await;
-    assert_eq!(status, StatusCode::GONE);
-    assert_eq!(body["error"], "mobile Claw VPN offer unavailable");
-    assert_eq!(body["code"], "GONE");
-    assert_eq!(body.as_object().expect("error object").len(), 2);
-    let status_after_replay = state.mobile_claw_vpn_mesh.status().unwrap();
-    assert_eq!(status_after_replay.offer_count(), 1);
-    assert_eq!(status_after_replay.session_count(), 1);
-
-    let member_token = mobile_session_for_existing_user(&state, "member-alpha");
-    let (status, _bytes, body) = request(
-        mobile_router(Arc::clone(&state)),
-        Method::POST,
-        session_path,
-        json!({"device_id":"device-alpha","claw_id":"claw-alpha","offer_token":" "})
-            .to_string()
-            .into_bytes(),
-        Some(format!("Bearer {member_token}")),
-    )
-    .await;
-    assert_eq!(status, StatusCode::BAD_REQUEST);
-    assert_eq!(body["error"], "invalid mobile Claw VPN mesh request");
-    assert_eq!(body["code"], "INVALID_INPUT");
-    assert_eq!(body.as_object().expect("error object").len(), 2);
-
-    let unavailable_claw =
-        household_rs::claw_vpn_mobile_state::ClawVpnMobileClawId::try_new("claw-alpha")
-            .expect("claw id");
-    let unavailable = state
-        .mobile_claw_vpn_mesh
-        .set_claw_unavailable(&unavailable_claw)
-        .expect("mark claw unavailable");
-    assert!(unavailable.changed());
-    assert_eq!(unavailable.closed_session_count(), 1);
-    let member_token = mobile_session_for_existing_user(&state, "member-alpha");
-    let (status, _bytes, body) = request(
-        mobile_router(Arc::clone(&state)),
-        Method::POST,
-        rendezvous_path,
-        rendezvous_body,
-        Some(format!("Bearer {member_token}")),
-    )
-    .await;
-    assert_eq!(status, StatusCode::CONFLICT);
-    assert_eq!(body["error"], "mobile Claw VPN rendezvous unavailable");
-    assert_eq!(body["code"], "CONFLICT");
-    assert_eq!(body.as_object().expect("error object").len(), 2);
-    let status_after_unavailable = state.mobile_claw_vpn_mesh.status().unwrap();
-    assert_eq!(status_after_unavailable.available_claw_count(), 0);
-    assert_eq!(status_after_unavailable.session_count(), 0);
-}
-
-#[tokio::test]
-async fn mobile_claw_vpn_rendezvous_authorize_uses_state_relay_dial_config() {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let relay_addr = listener.local_addr().unwrap();
-    let relay_addr_text = relay_addr.to_string();
-    let relay_dial = MobileClawVpnRendezvousRelayDialConfig::from_values(
-        Some(&relay_addr_text),
-        None,
-        Some("1"),
-        Some("1"),
-        None,
-    )
-    .unwrap();
-    let state =
-        shared_state_with_claw_store_and_mobile_relay_dial(default_claw_store(), relay_dial);
-
-    let accepted = tokio::spawn(async move {
-        let (mut stream, _) = listener.accept().await.unwrap();
-        let mut hello_bytes = Vec::new();
-        stream.read_to_end(&mut hello_bytes).await.unwrap();
-        hello_bytes
-    });
-
-    let member =
-        household_rs::claw_vpn_mobile_state::ClawVpnMobileMemberId::try_new("member-alpha")
-            .expect("member id");
-    let device =
-        household_rs::claw_vpn_mobile_state::ClawVpnMobileDeviceId::try_new("device-alpha")
-            .expect("device id");
-    let claw = household_rs::claw_vpn_mobile_state::ClawVpnMobileClawId::try_new("claw-alpha")
-        .expect("claw id");
-    let grant = household_rs::claw_vpn_mobile_state::ClawVpnMobileAclGrant::new(
-        member,
-        device.clone(),
-        claw.clone(),
-    );
-    assert!(
-        state
-            .mobile_claw_vpn_mesh
-            .owner_approved_enroll_device(device)
-            .unwrap()
-    );
-    assert!(state.mobile_claw_vpn_mesh.set_claw_available(claw).unwrap());
-    assert!(
-        state
-            .mobile_claw_vpn_mesh
-            .owner_approved_grant(grant.clone())
-            .unwrap()
-    );
-    let offer_token = state
-        .mobile_claw_vpn_mesh
-        .mint_offer_token(&grant, 100)
-        .unwrap();
-    let rendezvous_token = state
-        .mobile_claw_vpn_mesh
-        .consume_offer_token(&offer_token, &grant, 101)
-        .unwrap();
-
-    let member_token = mobile_session_for_existing_user(&state, "member-alpha");
-    let (status, _bytes, body) = request(
-        mobile_router(Arc::clone(&state)),
-        Method::POST,
-        "/api/v1/mobile/claw-vpn/rendezvous/authorize",
-        json!({
-            "device_id":"device-alpha",
-            "claw_id":"claw-alpha",
-            "rendezvous_token":rendezvous_token.public_token()
-        })
-        .to_string()
-        .into_bytes(),
-        Some(format!("Bearer {member_token}")),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK);
-    assert_mobile_claw_vpn_rendezvous_authorize_body(&body, [1, 1, 1, 1, 1]);
-
-    let hello_bytes = timeout(Duration::from_secs(1), accepted)
-        .await
-        .unwrap()
-        .unwrap();
-    let decoded = RendezvousHello::decode(&hello_bytes).unwrap();
-    assert_eq!(decoded.role, RendezvousRole::Guest);
-    assert_eq!(decoded.token, rendezvous_token.relay_token().unwrap());
+    let admin_cookie = admin_session_cookie_for_role(&state, "phase0-admin", UserRole::Admin);
+    for path in [
+        "/api/v1/mobile/claw-vpn/owner/enroll-device",
+        "/api/v1/mobile/claw-vpn/owner/claw-availability",
+        "/api/v1/mobile/claw-vpn/owner/grant",
+        "/api/v1/mobile/claw-vpn/owner/revoke-grant",
+    ] {
+        let (status, _bytes, _body) = request_with_cookie(
+            admin_auth_router(Arc::clone(&state)),
+            Method::POST,
+            path,
+            b"{}".to_vec(),
+            Some(admin_cookie.clone()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{path}");
+    }
 }
 
 #[tokio::test]

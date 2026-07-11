@@ -34,9 +34,9 @@
       "id": "mobile_claw_vpn_api_shapes_v1",
       "theyos_path": "admin/contracts/mobile-claw-vpn/v1/api_shapes.json",
       "ios_path": "Packages/SoyehtCore/Tests/SoyehtCoreTests/Fixtures/mobile-claw-vpn/v1/api_shapes.json",
-      "sha256": "7d31e66fd6172c9e7340455e73d0c2b06629b491442428a14c53edd45f49b7a6",
+      "sha256": "6482badfe02f220e5954ddf0f73385a622d317ba7b9b9d1063562724574f33b4",
       "used_for": [
-        "configured_count_only_status"
+        "historical_configured_count_only_status"
       ]
     }
   ],

@@ -42,9 +42,9 @@ const ASSERTION_FIELDS_FIXTURE_SHA256: &str =
 const WEBAUTHN_STATE_FIXTURE_SHA256: &str =
     "8224d194871c919c2876bceb3cc0aacc3d122891b924675c55e43ea269177fd9";
 const API_SHAPES_FIXTURE_SHA256: &str =
-    "7d31e66fd6172c9e7340455e73d0c2b06629b491442428a14c53edd45f49b7a6";
+    "6482badfe02f220e5954ddf0f73385a622d317ba7b9b9d1063562724574f33b4";
 const SUCCESS_FIXTURE_SHA256: &str =
-    "a9eb0fdce49fde3ce8b85ceeb5e9356145a8a1040eca5221b315ee8fd4ea2ed7";
+    "55fe55c6f1985103f21e679c5e6227646035e4d03da3e75193cfc9d1eeb45f8f";
 
 const EXPECTED_RP_ID: &str = "owner.dev.example.test";
 const EXPECTED_RP_ORIGIN: &str = "https://owner.dev.example.test/";
@@ -1267,6 +1267,25 @@ fn success_fixture_metadata_dependencies_and_endpoint_profiles_are_closed() {
     );
     assert_eq!(authority_status["phase"], "phase0-compile-out");
     assert_eq!(authority_status["authority"], "none");
+    assert_eq!(
+        authority_status["phase0_artifact_boundary"]["staged_product"],
+        "theyos-engine"
+    );
+    assert_eq!(
+        authority_status["phase0_artifact_boundary"]["required_published_targets"]
+            .as_array()
+            .unwrap()
+            .len(),
+        3
+    );
+    assert_eq!(
+        authority_status["retired_api_shapes"]["status"],
+        "historical-test-only-non-authoritative"
+    );
+    assert_eq!(
+        authority_status["retired_api_shapes"]["theyos_path"],
+        "admin/contracts/mobile-claw-vpn/v1/api_shapes.json"
+    );
     assert_eq!(
         authority_status["retired_wire"]["status"],
         "historical-test-only-non-authoritative"

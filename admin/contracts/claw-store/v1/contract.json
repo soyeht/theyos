@@ -370,8 +370,8 @@
       "auth_kind": "mobile_bearer_admin",
       "handler": "handlers_mobile::handle_mobile_create_instance",
       "mount": {
-        "file": "admin/rust/server-rs/src/main.rs",
-        "slice": "main_mobile_api",
+        "file": "admin/rust/server-rs/src/mobile_api_routes.rs",
+        "slice": "routes",
         "route_literal": "/instances",
         "method_helper": "post"
       },
@@ -389,8 +389,8 @@
       "auth_kind": "mobile_bearer",
       "handler": "handlers_mobile::handle_mobile_instance_status",
       "mount": {
-        "file": "admin/rust/server-rs/src/main.rs",
-        "slice": "main_mobile_api",
+        "file": "admin/rust/server-rs/src/mobile_api_routes.rs",
+        "slice": "routes",
         "route_literal": "/instances/{id}/status",
         "method_helper": "get"
       },

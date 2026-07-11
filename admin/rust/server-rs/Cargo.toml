@@ -160,6 +160,8 @@ terminal-rs  = { workspace = true }
 vmrunner-rs  = { workspace = true }
 
 [features]
+default = []
+
 # Phase 3 failure-injection harness (T063/T064). Enabling this feature
 # compiles in `tokio::sync::Notify`-driven crash points used by
 # `e2e-rs/tests/phase3_atomic_rollback.rs`. Production builds MUST NOT

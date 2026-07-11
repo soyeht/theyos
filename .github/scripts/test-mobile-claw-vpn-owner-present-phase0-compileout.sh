@@ -1,143 +1,65 @@
 #!/usr/bin/env bash
-# Hermetic mutation tests for the Phase 0 production compile-out authority.
+# Mutations for the structural Phase 0 build boundary.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-CHECKER="${SCRIPT_DIR}/check-mobile-claw-vpn-owner-present-phase0-compileout.sh"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
+CHECKER_REL=".github/scripts/check-mobile-claw-vpn-owner-present-phase0-compileout.sh"
+BOUNDARY_REL="admin/contracts/mobile-claw-vpn/v1/owner_present_phase0_artifact_boundary_v1.tsv"
 TMP_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/theyos-owner-present-phase0-test.XXXXXX")"
 trap 'rm -rf "${TMP_ROOT}"' EXIT
 
-sha256_file() {
-  if command -v sha256sum >/dev/null 2>&1; then
-    sha256sum "$1" | awk '{print $1}'
-  else
-    shasum -a 256 "$1" | awk '{print $1}'
-  fi
+HOST_TARGET="$(rustc -vV | sed -n 's/^host: //p')"
+SHARED_TARGET="${TMP_ROOT}/target"
+
+clone_head() {
+  local destination="$1"
+  git clone --quiet --shared --no-checkout "${REPO_ROOT}" "${destination}"
+  git -C "${destination}" checkout --quiet "$(git -C "${REPO_ROOT}" rev-parse HEAD)"
+  git -C "${destination}" config user.name "phase0-compileout-test"
+  git -C "${destination}" config user.email "phase0-compileout@example.invalid"
 }
 
-write_repo() {
-  local root="$1" mode="${2:-closed}"
-  mkdir -p \
-    "${root}/admin/rust/server-rs/src" \
-    "${root}/admin/contracts/mobile-claw-vpn/v1"
-
-  cat > "${root}/admin/rust/Cargo.toml" <<'EOF'
-[workspace]
-members = ["server-rs"]
-resolver = "2"
-EOF
-
-  cat > "${root}/admin/rust/server-rs/Cargo.toml" <<'EOF'
-[package]
-name = "server-rs"
-version = "0.0.0"
-edition = "2021"
-
-[lib]
-name = "server_rs"
-path = "src/lib.rs"
-
-[[bin]]
-name = "server"
-path = "src/main.rs"
-
-[features]
-default = []
-owner-phase1 = []
-EOF
-
-  case "${mode}" in
-    closed)
-      cat > "${root}/admin/rust/server-rs/src/lib.rs" <<'EOF'
-#[cfg(test)]
-#[allow(dead_code)]
-mod mobile_claw_vpn_owner_present_foundation;
-
-pub fn run() {}
-EOF
-      ;;
-    module)
-      cat > "${root}/admin/rust/server-rs/src/lib.rs" <<'EOF'
-#[allow(dead_code)]
-mod mobile_claw_vpn_owner_present_foundation;
-
-pub fn run() {}
-EOF
-      ;;
-    default_feature)
-      cat > "${root}/admin/rust/server-rs/src/lib.rs" <<'EOF'
-#[cfg(any(test, feature = "owner-phase1"))]
-#[allow(dead_code)]
-mod mobile_claw_vpn_owner_present_foundation;
-
-pub fn run() {}
-EOF
-      perl -0pi -e 's/default = \[\]/default = ["owner-phase1"]/' \
-        "${root}/admin/rust/server-rs/Cargo.toml"
-      ;;
-    *)
-      echo "unknown fixture mode: ${mode}" >&2
-      exit 1
-      ;;
-  esac
-
-  cat > "${root}/admin/rust/server-rs/src/mobile_claw_vpn_owner_present_foundation.rs" <<'EOF'
-pub fn owner_present_probe() -> &'static str {
-    "mesh_c_owner_present_offer_control"
-}
-EOF
-
-  cat > "${root}/admin/rust/server-rs/src/main.rs" <<'EOF'
-fn main() {
-    server_rs::run();
-}
-EOF
-
-  cat > "${root}/admin/contracts/mobile-claw-vpn/v1/owner_present_success_wire_v1.json" <<'EOF'
-{"contract":"soyeht-mobile-claw-vpn-owner-present-success-wire-v1","version":1,"authority_status":"historical-test-only-non-authoritative"}
-EOF
-  local historical_sha
-  historical_sha="$(sha256_file \
-    "${root}/admin/contracts/mobile-claw-vpn/v1/owner_present_success_wire_v1.json")"
-  cat > "${root}/admin/contracts/mobile-claw-vpn/v1/owner_present_wire_authority_status_v1.json" <<EOF
-{
-  "contract": "soyeht-mobile-claw-vpn-owner-present-wire-authority-status-v1",
-  "version": 1,
-  "phase": "phase0-compile-out",
-  "authority": "none",
-  "retired_wire": {
-    "theyos_path": "admin/contracts/mobile-claw-vpn/v1/owner_present_success_wire_v1.json",
-    "historical_sha256": "${historical_sha}",
-    "status": "historical-test-only-non-authoritative",
-    "prohibited_production_authority": [
-      "proof_token",
-      "proof-bearing mint request",
-      "owner_present_runtime_activation_v1"
-    ]
-  },
-  "phase1_blocker": {
-    "minimum_wire_version": 2,
-    "required_shape": "server-held-finish-consume-mint"
-  }
-}
-EOF
-
-  cargo generate-lockfile \
-    --manifest-path "${root}/admin/rust/Cargo.toml" \
-    >/dev/null
-
-  git -C "${root}" init --quiet
-  git -C "${root}" config user.name "phase0-compileout-test"
-  git -C "${root}" config user.email "phase0-compileout@example.invalid"
-  git -C "${root}" add .
-  git -C "${root}" commit --quiet -m fixture
+commit_mutation() {
+  local root="$1" label="$2"
+  git -C "${root}" add -A
+  git -C "${root}" commit --quiet -m "${label}"
 }
 
-expect_failure() {
-  local label="$1" expected="$2" mode="${3:-closed}"
-  local root="${TMP_ROOT}/${label}"
-  write_repo "${root}" "${mode}"
-  if "${CHECKER}" "${root}" >"${TMP_ROOT}/${label}.log" 2>&1; then
+refresh_boundary_entry() {
+  local root="$1" path="$2"
+  local manifest="${root}/${BOUNDARY_REL}"
+  local oid tmp="${manifest}.tmp"
+  oid="$(git -C "${root}" hash-object "${path}")"
+  awk -F '\t' -v OFS='\t' -v path="${path}" -v oid="${oid}" '
+    $3 == path { $2 = oid; found = 1 }
+    { print }
+    END { if (!found) exit 2 }
+  ' "${manifest}" > "${tmp}"
+  mv "${tmp}" "${manifest}"
+
+  local digest status status_tmp
+  digest="$(
+    if command -v sha256sum >/dev/null 2>&1; then
+      sha256sum "${manifest}" | awk '{print $1}'
+    else
+      shasum -a 256 "${manifest}" | awk '{print $1}'
+    fi
+  )"
+  status="${root}/admin/contracts/mobile-claw-vpn/v1/owner_present_wire_authority_status_v1.json"
+  status_tmp="${status}.tmp"
+  jq --arg digest "${digest}" \
+    '.phase0_artifact_boundary.sha256 = $digest' \
+    "${status}" > "${status_tmp}"
+  mv "${status_tmp}" "${status}"
+}
+
+expect_checker_failure() {
+  local label="$1" expected="$2" root="$3"
+  if PHASE0_TARGET="${HOST_TARGET}" \
+      PHASE0_BUILD_TOOL=cargo \
+      PHASE0_CARGO_TARGET_DIR="${SHARED_TARGET}" \
+      "${root}/${CHECKER_REL}" "${root}" >"${TMP_ROOT}/${label}.log" 2>&1; then
     echo "error: checker accepted ${label}" >&2
     exit 1
   fi
@@ -149,59 +71,89 @@ expect_failure() {
   echo "PASS ${label}_refused"
 }
 
-closed="${TMP_ROOT}/closed"
-write_repo "${closed}"
-"${CHECKER}" "${closed}" >/dev/null
-echo "PASS production_compileout"
-
-expect_failure module_in_production \
-  "owner-present foundation entered the production dependency graph" \
-  module
-
-expect_failure default_feature_crossing \
-  "owner-present foundation entered the production dependency graph" \
-  default_feature
-
-route="${TMP_ROOT}/route"
-write_repo "${route}"
-cat > "${route}/admin/rust/server-rs/src/main.rs" <<'EOF'
-fn main() {
-    println!("/api/v1/mobile/claw-vpn/owner-present/start");
-}
-EOF
-git -C "${route}" add .
-git -C "${route}" commit --quiet -m route
-if "${CHECKER}" "${route}" >"${TMP_ROOT}/route.log" 2>&1; then
-  echo "error: checker accepted owner-present route" >&2
+if CARGO_TARGET_DIR="${SHARED_TARGET}" \
+    cargo check \
+      --manifest-path "${REPO_ROOT}/admin/rust/Cargo.toml" \
+      --locked \
+      --release \
+      --package server-rs \
+      --bin server \
+      --features dev_t1_datapath \
+      >"${TMP_ROOT}/dev-feature.log" 2>&1; then
+  echo "error: release server accepted dev_t1_datapath" >&2
   exit 1
 fi
-grep -Fq "production theyos-engine contains forbidden Phase 0 marker" "${TMP_ROOT}/route.log"
-echo "PASS route_artifact_refused"
+grep -Fq "production server binary cannot be built with DEV/test features" \
+  "${TMP_ROOT}/dev-feature.log"
+echo "PASS release_dev_feature_refused"
+
+module_crossing="${TMP_ROOT}/module-crossing"
+clone_head "${module_crossing}"
+perl -0pi -e \
+  's/#\[cfg\(any\(test, feature = "dev_t1_datapath"\)\)\]\npub mod claw_vpn_packet_pump;/pub mod claw_vpn_packet_pump;/' \
+  "${module_crossing}/admin/rust/server-rs/src/lib.rs"
+refresh_boundary_entry "${module_crossing}" "admin/rust/server-rs/src/lib.rs"
+commit_mutation "${module_crossing}" module-crossing
+expect_checker_failure module_crossing \
+  "retired owner-present effect source entered the ${HOST_TARGET} production graph: claw_vpn_packet_pump.rs" \
+  "${module_crossing}"
+
+composer_crossing="${TMP_ROOT}/composer-crossing"
+clone_head "${composer_crossing}"
+perl -0pi -e \
+  's/\.merge\(mobile_claw_vpn_phase0::routes\(\)\)/.route("\/claw-vpn\/hidden", get(mobile_claw_vpn_phase0::handle_status))\n        .merge(mobile_claw_vpn_phase0::routes())/' \
+  "${composer_crossing}/admin/rust/server-rs/src/mobile_api_routes.rs"
+commit_mutation "${composer_crossing}" composer-crossing
+expect_checker_failure composer_crossing \
+  "signed Phase 0 boundary object differs from ${BOUNDARY_REL}" \
+  "${composer_crossing}"
+
+store_open="${TMP_ROOT}/store-open"
+clone_head "${store_open}"
+perl -0pi -e \
+  's/pub const IP_TUNNEL_RESOURCE_COMPILED: bool = cfg!\(any\(test, feature = "dev_t1_datapath"\)\);/pub const IP_TUNNEL_RESOURCE_COMPILED: bool = true;/' \
+  "${store_open}/admin/rust/server-rs/src/claw_share_relay_stream_offer_store.rs"
+commit_mutation "${store_open}" store-open
+expect_checker_failure generic_ip_tunnel_store \
+  "signed Phase 0 boundary object differs from ${BOUNDARY_REL}" \
+  "${store_open}"
+
+build_cfg="${TMP_ROOT}/build-cfg"
+clone_head "${build_cfg}"
+perl -0pi -e \
+  's/emit_build_git_sha\(\);/emit_build_git_sha();\n    println!("cargo:rustc-cfg=owner_present_hidden");/' \
+  "${build_cfg}/admin/rust/server-rs/build.rs"
+commit_mutation "${build_cfg}" build-cfg
+expect_checker_failure build_cfg_crossing \
+  "signed Phase 0 boundary object differs from ${BOUNDARY_REL}" \
+  "${build_cfg}"
+
+recipe_drift="${TMP_ROOT}/recipe-drift"
+clone_head "${recipe_drift}"
+perl -0pi -e \
+  's/--no-default-features/--features dev_t1_datapath/' \
+  "${recipe_drift}/scripts/build-theyos-engine.sh"
+commit_mutation "${recipe_drift}" recipe-drift
+expect_checker_failure release_recipe_drift \
+  "signed Phase 0 boundary object differs from ${BOUNDARY_REL}" \
+  "${recipe_drift}"
 
 marker="${TMP_ROOT}/marker"
-write_repo "${marker}"
+clone_head "${marker}"
 printf '%s\n' '{"contract":"activation"}' > \
   "${marker}/admin/contracts/mobile-claw-vpn/v1/owner_present_runtime_activation_v1.json"
-git -C "${marker}" add .
-git -C "${marker}" commit --quiet -m marker
-if "${CHECKER}" "${marker}" >"${TMP_ROOT}/marker.log" 2>&1; then
-  echo "error: checker accepted activation marker" >&2
-  exit 1
-fi
-grep -Fq "Phase 0 forbids an owner-present activation marker" "${TMP_ROOT}/marker.log"
-echo "PASS activation_marker_refused"
+commit_mutation "${marker}" marker
+expect_checker_failure activation_marker \
+  "Phase 0 forbids an owner-present activation marker" \
+  "${marker}"
 
 status_open="${TMP_ROOT}/status-open"
-write_repo "${status_open}"
+clone_head "${status_open}"
 perl -0pi -e 's/"authority": "none"/"authority": "v1"/' \
   "${status_open}/admin/contracts/mobile-claw-vpn/v1/owner_present_wire_authority_status_v1.json"
-git -C "${status_open}" add .
-git -C "${status_open}" commit --quiet -m status-open
-if "${CHECKER}" "${status_open}" >"${TMP_ROOT}/status-open.log" 2>&1; then
-  echo "error: checker accepted V1 as production authority" >&2
-  exit 1
-fi
-grep -Fq "Phase 0 authority status is invalid" "${TMP_ROOT}/status-open.log"
-echo "PASS v1_authority_refused"
+commit_mutation "${status_open}" status-open
+expect_checker_failure v1_authority \
+  "Phase 0 authority status is invalid" \
+  "${status_open}"
 
-echo "Owner-present Phase 0 compile-out mutation matrix passed."
+echo "Owner-present Phase 0 structural mutation matrix passed."

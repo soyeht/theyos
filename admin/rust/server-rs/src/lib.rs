@@ -50,21 +50,33 @@ pub mod claw_share_rendezvous_stream_relay_status;
 pub mod claw_store_routes;
 pub mod claw_store_service;
 pub mod claw_vpn_dev_config;
+#[cfg(any(test, feature = "dev_t1_datapath"))]
 pub mod claw_vpn_interface_route_plan;
-#[cfg(target_os = "linux")]
+#[cfg(all(any(test, feature = "dev_t1_datapath"), target_os = "linux"))]
 pub mod claw_vpn_linux_tun;
-#[cfg(target_os = "macos")]
+#[cfg(all(any(test, feature = "dev_t1_datapath"), target_os = "macos"))]
 pub mod claw_vpn_macos_utun;
+#[cfg(any(test, feature = "dev_t1_datapath"))]
 pub mod claw_vpn_nonblocking_frame;
+#[cfg(any(test, feature = "dev_t1_datapath"))]
 pub mod claw_vpn_packet_pump;
+#[cfg(any(test, feature = "dev_t1_datapath"))]
 pub mod claw_vpn_pollable_pump;
+#[cfg(any(test, feature = "dev_t1_datapath"))]
 pub mod claw_vpn_relay_stream;
+#[cfg(any(test, feature = "dev_t1_datapath"))]
 pub mod claw_vpn_runtime;
+#[cfg(any(test, feature = "dev_t1_datapath"))]
 pub mod claw_vpn_t1_caller;
+#[cfg(any(test, feature = "dev_t1_datapath"))]
 pub mod claw_vpn_t1_relay_stream_router;
+#[cfg(any(test, feature = "dev_t1_datapath"))]
 pub mod claw_vpn_target_session_relay;
+#[cfg(any(test, feature = "dev_t1_datapath"))]
 pub mod claw_vpn_target_session_router;
+#[cfg(any(test, feature = "dev_t1_datapath"))]
 pub mod claw_vpn_target_session_runtime;
+#[cfg(any(test, feature = "dev_t1_datapath"))]
 pub mod claw_vpn_wiring;
 pub mod cloudflare_admin;
 pub mod cloudflare_api;
@@ -107,10 +119,8 @@ pub mod jobs_worker;
 pub mod lease_reaper;
 pub mod macos_local_caller_auth;
 pub mod macos_local_registration_listener;
-pub mod mobile_claw_vpn_relay_auth;
-pub mod mobile_claw_vpn_relay_dial_config;
-pub mod mobile_claw_vpn_relay_responder;
-pub mod mobile_claw_vpn_relay_responder_config;
+pub mod mobile_api_routes;
+pub mod mobile_claw_vpn_phase0;
 // Phase 0 compiles the owner-present model only into this crate's unit tests.
 // Phase 1 must introduce a separately reviewed production target and wiring.
 #[cfg(test)]

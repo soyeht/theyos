@@ -35,18 +35,18 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v5
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
 
       - name: Setup Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@5a814b2e0f75e492da42a3c1227d52112e4dac50 # 1.92.0
         with:
           targets: x86_64-unknown-linux-musl
 
       - name: Install cross
-        run: cargo install cross --git https://github.com/cross-rs/cross --locked
+        run: cargo install cross --version 0.2.5 --locked
 
       - name: Cache Rust dependencies
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
           workspaces: "admin/rust -> target"
           shared-key: "release-linux-x86_64"
@@ -54,11 +54,11 @@ jobs:
       - name: Build (release)
         run: |
           export CLAWS_MANIFEST_YML="$PWD/claws/manifest.yml"
+          ./scripts/build-theyos-engine.sh x86_64-unknown-linux-musl cross
           cross build \
             --manifest-path admin/rust/Cargo.toml \
             --target x86_64-unknown-linux-musl \
             --release \
-            -p server-rs \
             -p soyeht-rs \
             -p vmrunner-rs \
             -p store-rs \
@@ -78,7 +78,7 @@ jobs:
           BINARY_DIR="target/x86_64-unknown-linux-musl/release"
           BINARY="$BINARY_DIR/server"
           TARBALL="$OUTDIR/theyos-engine-${CARGO_VERSION}-linux-x86_64.tar.gz"
-          cp "$BINARY_DIR/server" "$STAGE/theyos-engine"
+          ../../scripts/stage-theyos-engine.sh "$BINARY_DIR" "$STAGE/theyos-engine"
           cp "$BINARY_DIR/soyeht" "$STAGE/soyeht"
           cp "$BINARY_DIR/vmrunner_ipc" "$STAGE/vmrunner_ipc"
           cp "$BINARY_DIR/fc-ssh" "$STAGE/fc-ssh"
@@ -102,12 +102,12 @@ jobs:
           docker run --rm \
             -v "$(pwd)/$BINARY:/engine" \
             --entrypoint /engine \
-            alpine:3.20 \
+            alpine:3.20@sha256:d9e853e87e55526f6b2917df91a2115c36dd7c696a35be12163d44e6e2a4b6bc \
             --version
           docker run --rm \
             -v "$(pwd)/target/x86_64-unknown-linux-musl/release/soyeht:/soyeht" \
             --entrypoint /soyeht \
-            alpine:3.20 \
+            alpine:3.20@sha256:d9e853e87e55526f6b2917df91a2115c36dd7c696a35be12163d44e6e2a4b6bc \
             uninstall --help
           echo "Smoke test passed: x86_64 binary --version exit 0"
 
@@ -139,18 +139,18 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v5
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
 
       - name: Setup Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@5a814b2e0f75e492da42a3c1227d52112e4dac50 # 1.92.0
         with:
           targets: aarch64-unknown-linux-musl
 
       - name: Install cross
-        run: cargo install cross --git https://github.com/cross-rs/cross --locked
+        run: cargo install cross --version 0.2.5 --locked
 
       - name: Cache Rust dependencies
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
           workspaces: "admin/rust -> target"
           shared-key: "release-linux-aarch64"
@@ -158,11 +158,11 @@ jobs:
       - name: Cross-compile (release)
         run: |
           export CLAWS_MANIFEST_YML="$PWD/claws/manifest.yml"
+          ./scripts/build-theyos-engine.sh aarch64-unknown-linux-musl cross
           cross build \
             --manifest-path admin/rust/Cargo.toml \
             --target aarch64-unknown-linux-musl \
             --release \
-            -p server-rs \
             -p soyeht-rs \
             -p vmrunner-rs \
             -p store-rs \
@@ -182,7 +182,7 @@ jobs:
           BINARY_DIR="target/aarch64-unknown-linux-musl/release"
           BINARY="$BINARY_DIR/server"
           TARBALL="$OUTDIR/theyos-engine-${CARGO_VERSION}-linux-aarch64.tar.gz"
-          cp "$BINARY_DIR/server" "$STAGE/theyos-engine"
+          ../../scripts/stage-theyos-engine.sh "$BINARY_DIR" "$STAGE/theyos-engine"
           cp "$BINARY_DIR/soyeht" "$STAGE/soyeht"
           cp "$BINARY_DIR/vmrunner_ipc" "$STAGE/vmrunner_ipc"
           cp "$BINARY_DIR/fc-ssh" "$STAGE/fc-ssh"
@@ -198,7 +198,7 @@ jobs:
           echo "version=$CARGO_VERSION" >> "$GITHUB_ENV"
 
       - name: Setup QEMU (aarch64 emulation)
-        uses: docker/setup-qemu-action@v3
+        uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3
         with:
           platforms: arm64
 
@@ -211,12 +211,12 @@ jobs:
           docker run --rm --platform linux/arm64 \
             -v "$(pwd)/$BINARY:/engine" \
             --entrypoint /engine \
-            alpine:3.20 \
+            alpine:3.20@sha256:d9e853e87e55526f6b2917df91a2115c36dd7c696a35be12163d44e6e2a4b6bc \
             --version
           docker run --rm --platform linux/arm64 \
             -v "$(pwd)/target/aarch64-unknown-linux-musl/release/soyeht:/soyeht" \
             --entrypoint /soyeht \
-            alpine:3.20 \
+            alpine:3.20@sha256:d9e853e87e55526f6b2917df91a2115c36dd7c696a35be12163d44e6e2a4b6bc \
             uninstall --help
           echo "Smoke test passed: aarch64 binary --version exit 0"
 

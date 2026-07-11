@@ -19,6 +19,7 @@ PROTECTED_PATHS=(
   ".github/scripts/test-mobile-claw-vpn-owner-present-contracts.sh"
   ".github/workflows/contracts-cross-repo-sync.yml"
   "admin/contracts/mobile-claw-vpn/v1/owner_present_wire_authority_status_v1.json"
+  "admin/contracts/mobile-claw-vpn/v1/owner_present_phase0_artifact_boundary_v1.tsv"
 )
 
 mkdir -p "${REPO}"
@@ -76,6 +77,13 @@ git -C "${REPO}" restore --source="${HEAD_OK}" -- \
 printf '%s\n' '{"authority":"v1"}' > \
   "${REPO}/admin/contracts/mobile-claw-vpn/v1/owner_present_wire_authority_status_v1.json"
 expect_failure authority_status_changed \
+  "protected Phase 0 authority differs from trusted base"
+
+git -C "${REPO}" restore --source="${HEAD_OK}" -- \
+  "admin/contracts/mobile-claw-vpn/v1/owner_present_wire_authority_status_v1.json"
+printf '%s\n' '100644 deadbeef invalid' > \
+  "${REPO}/admin/contracts/mobile-claw-vpn/v1/owner_present_phase0_artifact_boundary_v1.tsv"
+expect_failure boundary_manifest_changed \
   "protected Phase 0 authority differs from trusted base"
 
 echo "Phase 0 authority integrity mutation matrix passed."

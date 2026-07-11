@@ -1,8 +1,8 @@
 name: Owner-Present Phase 0 Compile-Out
 
-# This is an artifact/build-graph authority, not a source-keyword scanner.
-# It runs for every PR and every main push so path-filter truncation cannot
-# suppress the Phase 0 proof.
+# The artifact jobs use the same canonical recipe as the three release paths.
+# This is a target/build-graph proof plus an executable artifact contract; the
+# strings pass remains only an auxiliary tripwire.
 on:
   pull_request:
     branches:
@@ -16,8 +16,8 @@ permissions:
   contents: read
 
 jobs:
-  phase0-compileout:
-    name: Owner-present production compile-out
+  structural-boundary:
+    name: Owner-present structural boundary
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -26,10 +26,152 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Exercise compile-out mutations
+      - name: Setup pinned Rust toolchain
+        uses: dtolnay/rust-toolchain@5a814b2e0f75e492da42a3c1227d52112e4dac50 # 1.92.0
+
+      - name: Exercise structural mutations
         shell: bash
         run: bash .github/scripts/test-mobile-claw-vpn-owner-present-phase0-compileout.sh
 
-      - name: Build and verify production artifact
+      - name: Test the exact Phase 0 route composer
+        working-directory: admin/rust
+        run: |
+          cargo test --locked -p server-rs mobile_claw_vpn_phase0
+          cargo test --locked -p server-rs --test claw_store_wire_contract phase0_
+
+  published-artifact:
+    name: Published artifact (${{ matrix.target }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            tool: cross
+            direct: "1"
+          - os: ubuntu-latest
+            target: aarch64-unknown-linux-musl
+            tool: cross
+            direct: "0"
+          - os: macos-15
+            target: aarch64-apple-darwin
+            tool: cargo
+            direct: "1"
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    steps:
+      - name: Checkout theyos
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
+        with:
+          persist-credentials: false
+
+      - name: Setup pinned Rust toolchain
+        uses: dtolnay/rust-toolchain@5a814b2e0f75e492da42a3c1227d52112e4dac50 # 1.92.0
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install pinned cross
+        if: matrix.tool == 'cross'
+        run: cargo install cross --version 0.2.5 --locked
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          workspaces: "admin/rust -> target"
+          shared-key: "owner-present-phase0-${{ matrix.target }}"
+
+      - name: Build, inspect, stage, and attest
         shell: bash
-        run: bash .github/scripts/check-mobile-claw-vpn-owner-present-phase0-compileout.sh
+        env:
+          PHASE0_TARGET: ${{ matrix.target }}
+          PHASE0_BUILD_TOOL: ${{ matrix.tool }}
+          PHASE0_CARGO_TARGET_DIR: ${{ github.workspace }}/admin/rust/target
+          PHASE0_RUN_ARTIFACT_DIRECT: ${{ matrix.direct }}
+          PHASE0_ATTESTATION_OUT: ${{ runner.temp }}/phase0-attestation-${{ matrix.target }}.json
+          PHASE0_STAGED_ENGINE_OUT: ${{ runner.temp }}/theyos-engine-${{ matrix.target }}
+        run: |
+          bash .github/scripts/check-mobile-claw-vpn-owner-present-phase0-compileout.sh
+          jq -e --arg target "${PHASE0_TARGET}" '
+            .published_target == true
+            and .target == $target
+            and .server_equals_theyos_engine == true
+            and .owner_present_authority == "none"
+          ' "${PHASE0_ATTESTATION_OUT}"
+
+      - name: Enable aarch64 emulation
+        if: matrix.target == 'aarch64-unknown-linux-musl'
+        uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3
+        with:
+          platforms: arm64
+
+      - name: Execute the aarch64 published artifact contract
+        if: matrix.target == 'aarch64-unknown-linux-musl'
+        shell: bash
+        run: |
+          docker run --rm --platform linux/arm64 \
+            -v "${RUNNER_TEMP}/theyos-engine-${{ matrix.target }}:/engine:ro" \
+            --entrypoint /engine \
+            alpine:3.20@sha256:d9e853e87e55526f6b2917df91a2115c36dd7c696a35be12163d44e6e2a4b6bc \
+            --owner-present-phase0-contract \
+            | jq -e '
+                .authority == "none"
+                and .production_activation == false
+                and .generic_ip_tunnel_backend_compiled == false
+                and .generic_ip_tunnel_store_accepts_resource == false
+                and .generic_ip_tunnel_env_accepts_resource == false
+                and .product_a_routes == ["/claw-vpn/status"]
+              '
+
+      - name: Publish Phase 0 attestation
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: owner-present-phase0-${{ matrix.target }}
+          path: |
+            ${{ runner.temp }}/phase0-attestation-${{ matrix.target }}.json
+            ${{ runner.temp }}/theyos-engine-${{ matrix.target }}
+          if-no-files-found: error
+          retention-days: 30
+
+  attest-published-artifact:
+    name: Attest published artifact (${{ matrix.target }})
+    if: github.event_name == 'push'
+    needs: published-artifact
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - x86_64-unknown-linux-musl
+          - aarch64-unknown-linux-musl
+          - aarch64-apple-darwin
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    steps:
+      - name: Download the inspected engine and manifest
+        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
+        with:
+          name: owner-present-phase0-${{ matrix.target }}
+          path: subject
+
+      - name: Verify the attestation subject
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          manifest="subject/phase0-attestation-${TARGET}.json"
+          engine="subject/theyos-engine-${TARGET}"
+          test -f "$manifest"
+          test -f "$engine"
+          test "$(jq -r '.source_sha' "$manifest")" = "$GITHUB_SHA"
+          test "$(jq -r '.target' "$manifest")" = "$TARGET"
+          test "$(jq -r '.published_target' "$manifest")" = "true"
+          test "$(sha256sum "$engine" | awk '{print $1}')" = \
+            "$(jq -r '.theyos_engine_sha256' "$manifest")"
+
+      - name: Sign GitHub build provenance
+        uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a # v3
+        with:
+          subject-path: subject/theyos-engine-${{ matrix.target }}

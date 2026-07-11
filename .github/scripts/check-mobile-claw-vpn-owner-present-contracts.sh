@@ -13,8 +13,12 @@ CONTRACT_SOURCE_REL="admin/contracts/mobile-claw-vpn/v1/owner_present_success_wi
 CONTRACT_VENDOR_REL="Packages/SoyehtCore/Tests/SoyehtCoreTests/Fixtures/mobile-claw-vpn/v1/owner_present_success_wire_v1.json"
 STATUS_SOURCE_REL="admin/contracts/mobile-claw-vpn/v1/owner_present_wire_authority_status_v1.json"
 STATUS_VENDOR_REL="Packages/SoyehtCore/Tests/SoyehtCoreTests/Fixtures/mobile-claw-vpn/v1/owner_present_wire_authority_status_v1.json"
+BOUNDARY_REL="admin/contracts/mobile-claw-vpn/v1/owner_present_phase0_artifact_boundary_v1.tsv"
 RETIREMENT_PRIOR_SHA256="ff9ad533567e29261ecbd8e11e84e9490f1829bd4d2e5b50fe8783dc82b000d1"
-RETIREMENT_HISTORICAL_SHA256="a9eb0fdce49fde3ce8b85ceeb5e9356145a8a1040eca5221b315ee8fd4ea2ed7"
+RETIREMENT_HISTORICAL_SHA256="55fe55c6f1985103f21e679c5e6227646035e4d03da3e75193cfc9d1eeb45f8f"
+API_SHAPES_SOURCE_REL="admin/contracts/mobile-claw-vpn/v1/api_shapes.json"
+API_SHAPES_PRIOR_SHA256="7d31e66fd6172c9e7340455e73d0c2b06629b491442428a14c53edd45f49b7a6"
+API_SHAPES_HISTORICAL_SHA256="6482badfe02f220e5954ddf0f73385a622d317ba7b9b9d1063562724574f33b4"
 if [[ "${OWNER_PRESENT_CONTRACT_GUARD_LOCAL_TEST:-0}" == "1" ]]; then
   RETIREMENT_PRIOR_SHA256="${OWNER_PRESENT_RETIREMENT_PRIOR_SHA256:?local prior digest is required}"
   RETIREMENT_HISTORICAL_SHA256="${OWNER_PRESENT_RETIREMENT_HISTORICAL_SHA256:?local historical digest is required}"
@@ -66,16 +70,39 @@ if ! materialize_regular_blob \
   echo "::error file=${STATUS_SOURCE_REL}::authoritative wire status is missing"
   exit 1
 fi
+HEAD_BOUNDARY="${TMP_DIR}/head-boundary"
+if ! materialize_regular_blob \
+  "${THEYOS_DIR}" "${HEAD_SHA}" "${BOUNDARY_REL}" "${HEAD_BOUNDARY}" \
+  "signed Phase 0 artifact boundary"; then
+  echo "::error file=${BOUNDARY_REL}::signed Phase 0 artifact boundary is missing"
+  exit 1
+fi
 if [[ "$(jq -r '.contract' "${HEAD_STATUS}")" != \
     "soyeht-mobile-claw-vpn-owner-present-wire-authority-status-v1" \
   || "$(jq -r '.phase' "${HEAD_STATUS}")" != "phase0-compile-out" \
   || "$(jq -r '.authority' "${HEAD_STATUS}")" != "none" \
   || "$(jq -r '.retired_wire.status' "${HEAD_STATUS}")" != \
     "historical-test-only-non-authoritative" \
+  || "$(jq -r '.retired_api_shapes.status' "${HEAD_STATUS}")" != \
+    "historical-test-only-non-authoritative" \
+  || "$(jq -r '.retired_api_shapes.theyos_path' "${HEAD_STATUS}")" != \
+    "admin/contracts/mobile-claw-vpn/v1/api_shapes.json" \
+  || "$(jq -r '.retired_api_shapes.prior_authoritative_sha256' "${HEAD_STATUS}")" != \
+    "${API_SHAPES_PRIOR_SHA256}" \
+  || "$(jq -r '.retired_api_shapes.historical_sha256' "${HEAD_STATUS}")" != \
+    "${API_SHAPES_HISTORICAL_SHA256}" \
   || "$(jq -r '.retired_wire.prior_authoritative_sha256' "${HEAD_STATUS}")" != \
     "${RETIREMENT_PRIOR_SHA256}" \
   || "$(jq -r '.retired_wire.historical_sha256' "${HEAD_STATUS}")" != \
     "${RETIREMENT_HISTORICAL_SHA256}" \
+  || "$(jq -r '.phase0_artifact_boundary.theyos_path' "${HEAD_STATUS}")" != \
+    "${BOUNDARY_REL}" \
+  || "$(jq -r '.phase0_artifact_boundary.sha256' "${HEAD_STATUS}")" != \
+    "$(sha256_file "${HEAD_BOUNDARY}")" \
+  || "$(jq -r '.phase0_artifact_boundary.staged_product' "${HEAD_STATUS}")" != \
+    "theyos-engine" \
+  || "$(jq -r '.phase0_artifact_boundary.required_published_targets | sort | join(",")' "${HEAD_STATUS}")" != \
+    "aarch64-apple-darwin,aarch64-unknown-linux-musl,x86_64-unknown-linux-musl" \
   || "$(jq -r '.phase1_blocker.minimum_wire_version' "${HEAD_STATUS}")" != "2" \
   || "$(jq -r '.phase1_blocker.required_shape' "${HEAD_STATUS}")" != \
     "server-held-finish-consume-mint" \
@@ -183,6 +210,10 @@ for pair in "${PAIRS[@]}"; do
           && "$(sha256_file "${base_source}")" == "${RETIREMENT_PRIOR_SHA256}" \
           && "$(sha256_file "${head_source}")" == "${RETIREMENT_HISTORICAL_SHA256}" ]]; then
           source_retirement=1
+        elif [[ "${source_rel}" == "${API_SHAPES_SOURCE_REL}" \
+          && "$(sha256_file "${base_source}")" == "${API_SHAPES_PRIOR_SHA256}" \
+          && "$(sha256_file "${head_source}")" == "${API_SHAPES_HISTORICAL_SHA256}" ]]; then
+          source_retirement=1
         else
           echo "::error file=${source_rel}::pinned V1 dependency is immutable; add a new version"
           diff -u "${base_source}" "${head_source}" || true
@@ -195,6 +226,14 @@ for pair in "${PAIRS[@]}"; do
     if ! grep -Fq "${source_rel}" "${BASE_WORKFLOW}"; then
       registration_new=1
     fi
+  fi
+
+  declared_sha="$(jq -r --arg source "${source_rel}" \
+    '.dependencies[]? | select(.theyos_path == $source) | (.sha256 // empty)' \
+    "${HEAD_CONTRACT}")"
+  if [[ -n "${declared_sha}" && "${declared_sha}" != "$(sha256_file "${head_source}")" ]]; then
+    echo "::error file=${CONTRACT_SOURCE_REL}::declared dependency digest differs from ${source_rel}"
+    exit 1
   fi
 
   vendor_source="${TMP_DIR}/vendor-${INDEX}"

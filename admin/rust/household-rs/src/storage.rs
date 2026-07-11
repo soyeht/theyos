@@ -140,10 +140,12 @@ pub fn household_auth_state_path(state_dir: &Path) -> PathBuf {
 }
 
 #[must_use]
+#[cfg(test)]
 pub fn claw_vpn_mobile_mesh_path(state_dir: &Path) -> PathBuf {
     household_dir(state_dir).join("claw_vpn_mobile_mesh.cbor")
 }
 
+#[cfg(test)]
 pub fn write_claw_vpn_mobile_mesh_snapshot(
     state_dir: &Path,
     snapshot: &crate::claw_vpn_mobile_state::ClawVpnMobileMeshSnapshot,
@@ -151,12 +153,14 @@ pub fn write_claw_vpn_mobile_mesh_snapshot(
     atomic_write_cbor(&claw_vpn_mobile_mesh_path(state_dir), snapshot)
 }
 
+#[cfg(test)]
 pub fn read_claw_vpn_mobile_mesh_snapshot(
     state_dir: &Path,
 ) -> Result<Option<crate::claw_vpn_mobile_state::ClawVpnMobileMeshSnapshot>, StorageError> {
     read_optional_cbor(&claw_vpn_mobile_mesh_path(state_dir))
 }
 
+#[cfg(test)]
 pub fn delete_claw_vpn_mobile_mesh_snapshot(state_dir: &Path) -> Result<(), StorageError> {
     delete_optional_file(&claw_vpn_mobile_mesh_path(state_dir))
 }

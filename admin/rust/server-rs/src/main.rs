@@ -15,6 +15,16 @@
 //! | `FIRECRACKER_CTL`           | `fc-ssh`                 | PTY + terminal command control path |
 //! | (executor env vars)         | —                        | Forwarded to executor::FlowConfig   |
 
+#[cfg(all(
+    not(debug_assertions),
+    any(
+        feature = "dev_t1_datapath",
+        feature = "dev_claw_share_mint",
+        feature = "failure-injection"
+    )
+))]
+compile_error!("the production server binary cannot be built with DEV/test features");
+
 use server_rs::auth;
 use server_rs::claw_store_routes;
 use server_rs::cloudflare_admin;
@@ -31,8 +41,8 @@ use server_rs::handlers_terminal_attachments;
 use server_rs::health;
 use server_rs::install_worker;
 use server_rs::jobs_worker;
-use server_rs::mobile_claw_vpn_relay_dial_config::MobileClawVpnRendezvousRelayDialConfig;
-use server_rs::mobile_claw_vpn_relay_responder_config::MobileClawVpnRelayResponderConfig;
+use server_rs::mobile_api_routes;
+use server_rs::mobile_claw_vpn_phase0;
 use server_rs::mobile_token::{MobileSessionDb, MobileTokenStore};
 use server_rs::public_sites;
 use server_rs::state::{AppState, SharedState};
@@ -68,9 +78,6 @@ use tracing::info;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 use vmrunner_common_rs::VmCreateResourceSpec;
 use vmrunner_rs::VmRunner;
-
-const MOBILE_CLAW_VPN_OFFER_TTL_SECS_ENV: &str = "THEYOS_MOBILE_CLAW_VPN_OFFER_TTL_SECS";
-const DEFAULT_MOBILE_CLAW_VPN_OFFER_TTL_SECS: u64 = 10 * 60;
 
 /// Set `Cache-Control` headers for static assets and SPA HTML responses.
 ///
@@ -177,6 +184,14 @@ async fn main() {
         println!("{}", env!("CARGO_PKG_VERSION"));
         std::process::exit(0);
     }
+    if argv.len() >= 2 && argv[1] == "--owner-present-phase0-contract" {
+        println!(
+            "{}",
+            serde_json::to_string(&mobile_claw_vpn_phase0::artifact_contract())
+                .expect("Phase 0 artifact contract must serialize")
+        );
+        std::process::exit(0);
+    }
     if argv.len() >= 2 && argv[1] == "install" {
         let exit_code = server_rs::install_cli::run(&argv[2..]).await;
         std::process::exit(exit_code);
@@ -200,6 +215,7 @@ async fn main() {
     // before the main `cfg.addr` listener at `axum::serve()` near EOF, so
     // iPhone onboarding via Bonjour discovery is unaffected.
     let _push_status = server_rs::startup_wiring::install_house_created_push_transport_from_env();
+    #[cfg(feature = "dev_t1_datapath")]
     let _claw_vpn_status = server_rs::startup_wiring::per_claw_vpn_startup_gate_from_env();
 
     // ─── Shared state construction ────────────────────────────────────────────
@@ -360,31 +376,6 @@ async fn main() {
         MobileSessionDb::open(&mobile_session_db).expect("Failed to open mobile session DB");
     info!("Mobile session DB: {}", mobile_session_db);
 
-    let household_state_dir = server_rs::household_bootstrap::resolve_household_state_dir();
-    let mobile_claw_vpn_offer_ttl_secs = mobile_claw_vpn_offer_ttl_secs_from_env();
-    let mobile_claw_vpn_mesh =
-        household_rs::claw_vpn_mobile_mesh_store::ClawVpnMobileMeshStore::new(
-            household_state_dir,
-            mobile_claw_vpn_offer_ttl_secs,
-        )
-        .expect("Failed to initialize mobile Claw VPN mesh store");
-    info!(
-        "Mobile Claw VPN mesh store: initialized (offer_ttl={}s)",
-        mobile_claw_vpn_offer_ttl_secs
-    );
-    let mobile_claw_vpn_relay_dial = MobileClawVpnRendezvousRelayDialConfig::from_env()
-        .expect("Failed to initialize mobile Claw VPN relay dial config");
-    info!(
-        "Mobile Claw VPN relay dial: initialized (configured={})",
-        mobile_claw_vpn_relay_dial.is_configured()
-    );
-    let mobile_claw_vpn_relay_responder = MobileClawVpnRelayResponderConfig::from_env()
-        .expect("Failed to initialize mobile Claw VPN relay responder config");
-    info!(
-        "Mobile Claw VPN relay responder: initialized (configured={})",
-        mobile_claw_vpn_relay_responder.is_configured()
-    );
-
     // ─── Full shared state ────────────────────────────────────────────────────
 
     let state: SharedState = Arc::new(AppState {
@@ -398,9 +389,6 @@ async fn main() {
         vm_runner,
         mobile_tokens,
         mobile_sessions,
-        mobile_claw_vpn_mesh,
-        mobile_claw_vpn_relay_dial,
-        mobile_claw_vpn_relay_responder,
         claw_store,
         theyos_dir,
         locks_dir,
@@ -915,25 +903,6 @@ async fn main() {
             "/instances/{id}/qr-token",
             post(handlers_mobile::handle_generate_qr_token),
         )
-        // Product A mobile Claw VPN Mesh-C owner/admin actions. These mutate
-        // only the persisted Mesh-C model; they do not mint usable offers,
-        // open relay sessions, or touch host networking.
-        .route(
-            "/mobile/claw-vpn/owner/enroll-device",
-            post(handlers_mobile::handle_admin_mobile_claw_vpn_enroll_device),
-        )
-        .route(
-            "/mobile/claw-vpn/owner/claw-availability",
-            post(handlers_mobile::handle_admin_mobile_claw_vpn_set_claw_availability),
-        )
-        .route(
-            "/mobile/claw-vpn/owner/grant",
-            post(handlers_mobile::handle_admin_mobile_claw_vpn_grant),
-        )
-        .route(
-            "/mobile/claw-vpn/owner/revoke-grant",
-            post(handlers_mobile::handle_admin_mobile_claw_vpn_revoke_grant),
-        )
         // Mobile — Continue on iPhone (any authed user, for own workspaces)
         .route(
             "/mobile/continue-qr",
@@ -972,50 +941,6 @@ async fn main() {
 
     // ─── Full router ─────────────────────────────────────────────────────────
 
-    // ─── Mobile API routes (own auth via Bearer token) ──────────────────────
-    // Nested at /api/v1/mobile — routes here omit the /mobile/ prefix.
-    let mobile_api = Router::new()
-        .route("/auth", post(handlers_mobile::handle_mobile_auth))
-        .route("/pair", post(handlers_mobile::handle_pair))
-        .route("/status", get(handlers_mobile::handle_mobile_status))
-        .route(
-            "/instances",
-            get(handlers_mobile::handle_mobile_instances)
-                .post(handlers_mobile::handle_mobile_create_instance),
-        )
-        .route(
-            "/instances/{id}/status",
-            get(handlers_mobile::handle_mobile_instance_status),
-        )
-        .route("/logout", post(handlers_mobile::handle_mobile_logout))
-        .route("/users", get(handlers_mobile::handle_mobile_users))
-        .route(
-            "/server-info",
-            get(handlers_mobile::handle_mobile_server_info),
-        )
-        .route(
-            "/resource-options",
-            get(handlers_mobile::handle_resource_options),
-        )
-        .route(
-            "/claw-vpn/status",
-            get(handlers_mobile::handle_mobile_claw_vpn_status),
-        )
-        .route(
-            "/claw-vpn/offers",
-            post(handlers_mobile::handle_mobile_claw_vpn_mint_offer),
-        )
-        .route(
-            "/claw-vpn/sessions",
-            post(handlers_mobile::handle_mobile_claw_vpn_consume_offer),
-        )
-        .route(
-            "/claw-vpn/rendezvous/authorize",
-            post(handlers_mobile::handle_mobile_claw_vpn_authorize_rendezvous),
-        )
-        .merge(claw_store_routes::mobile_nested_routes())
-        .with_state(Arc::clone(&state));
-
     let app = Router::new()
         .route(
             "/health",
@@ -1048,11 +973,7 @@ async fn main() {
             "/api/v1/mobile/pair-token",
             post(handlers_mobile::handle_pair_token).with_state(Arc::clone(&state)),
         )
-        // Mobile claw install/uninstall/availability — registered directly to
-        // avoid axum nest routing conflict with parameterized paths under
-        // /api/v1/mobile.
-        .merge(claw_store_routes::mobile_direct_routes(Arc::clone(&state)))
-        .nest("/api/v1/mobile", mobile_api)
+        .merge(mobile_api_routes::routes(&state))
         .nest("/api/v1", api)
         .fallback_service(spa_service)
         .layer(DefaultBodyLimit::max(1024 * 1024)) // 1 MB global body limit
@@ -1155,12 +1076,4 @@ fn flow_config_from_env(sqlite_db: &str) -> FlowConfig {
             .unwrap_or(30),
         store_db_path: sqlite_db.to_string(),
     }
-}
-
-fn mobile_claw_vpn_offer_ttl_secs_from_env() -> u64 {
-    std::env::var(MOBILE_CLAW_VPN_OFFER_TTL_SECS_ENV)
-        .ok()
-        .and_then(|v| v.parse::<u64>().ok())
-        .filter(|secs| *secs > 0)
-        .unwrap_or(DEFAULT_MOBILE_CLAW_VPN_OFFER_TTL_SECS)
 }

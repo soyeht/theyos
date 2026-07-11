@@ -5,12 +5,9 @@
 //! Phase 3: terminal manager, PTY manager, VM runner, log store.
 
 use crate::handlers_llm::ProxyClient;
-use crate::mobile_claw_vpn_relay_dial_config::MobileClawVpnRendezvousRelayDialConfig;
-use crate::mobile_claw_vpn_relay_responder_config::MobileClawVpnRelayResponderConfig;
 use crate::mobile_token::{MobileSessionDb, MobileTokenStore};
 use crate::ratelimit::Limiter;
 use executor_rs::Executor;
-use household_rs::claw_vpn_mobile_mesh_store::ClawVpnMobileMeshStore;
 use jobs_rs::Store as JobsStore;
 use session_rs::SessionStore;
 use std::path::PathBuf;
@@ -59,18 +56,6 @@ pub struct AppState {
     pub mobile_tokens: Arc<MobileTokenStore>,
     /// SQLite-backed mobile session store (persistent across restarts).
     pub mobile_sessions: MobileSessionDb,
-    /// Persisted Product A mobile per-Claw VPN Mesh-C model. This is API-adjacent
-    /// state only; owner-sensitive mutations stay behind explicit owner-approved
-    /// store methods.
-    pub mobile_claw_vpn_mesh: ClawVpnMobileMeshStore,
-    /// Default-off Relay-R dial target config for mobile Claw VPN rendezvous
-    /// preflight. Missing relay address keeps the handler on an inert sink.
-    pub mobile_claw_vpn_relay_dial: MobileClawVpnRendezvousRelayDialConfig,
-    /// Default-off local Claw responder identity config. Missing identity keeps
-    /// the Claw responder unwired; when configured, the identity must come from
-    /// local startup configuration rather than request input.
-    pub mobile_claw_vpn_relay_responder: MobileClawVpnRelayResponderConfig,
-
     // ── Phase 6: Claw Store ────────────────────────────────────────────────
     /// Dynamic per-host claw install state (ready / installing / `not_installed`).
     pub claw_store: claw_rs::ClawStore,

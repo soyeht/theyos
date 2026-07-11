@@ -11,6 +11,7 @@ trap 'rm -rf "${TMP_DIR}"' EXIT
 SOURCE_ROOT="admin/contracts/mobile-claw-vpn/v1"
 CONTRACT_REL="${SOURCE_ROOT}/owner_present_success_wire_v1.json"
 STATUS_REL="${SOURCE_ROOT}/owner_present_wire_authority_status_v1.json"
+BOUNDARY_REL="${SOURCE_ROOT}/owner_present_phase0_artifact_boundary_v1.tsv"
 WORKFLOW_REL=".github/workflows/contracts-cross-repo-sync.yml"
 PIN_REL="scripts/cross-repo-contract.sha"
 VENDOR_ROOT="Packages/SoyehtCore/Tests/SoyehtCoreTests/Fixtures/guard-test"
@@ -69,6 +70,9 @@ write_sources() {
 JSON
   local contract_sha
   contract_sha="$(sha256_file "${repo}/${CONTRACT_REL}")"
+  printf '%s\n' '# synthetic-phase0-boundary' > "${repo}/${BOUNDARY_REL}"
+  local boundary_sha
+  boundary_sha="$(sha256_file "${repo}/${BOUNDARY_REL}")"
   cat > "${repo}/${STATUS_REL}" <<JSON
 {
   "contract": "soyeht-mobile-claw-vpn-owner-present-wire-authority-status-v1",
@@ -78,6 +82,22 @@ JSON
     "prior_authoritative_sha256": "${contract_sha}",
     "historical_sha256": "${contract_sha}",
     "status": "historical-test-only-non-authoritative"
+  },
+  "retired_api_shapes": {
+    "theyos_path": "admin/contracts/mobile-claw-vpn/v1/api_shapes.json",
+    "status": "historical-test-only-non-authoritative",
+    "prior_authoritative_sha256": "7d31e66fd6172c9e7340455e73d0c2b06629b491442428a14c53edd45f49b7a6",
+    "historical_sha256": "6482badfe02f220e5954ddf0f73385a622d317ba7b9b9d1063562724574f33b4"
+  },
+  "phase0_artifact_boundary": {
+    "theyos_path": "${BOUNDARY_REL}",
+    "sha256": "${boundary_sha}",
+    "staged_product": "theyos-engine",
+    "required_published_targets": [
+      "x86_64-unknown-linux-musl",
+      "aarch64-unknown-linux-musl",
+      "aarch64-apple-darwin"
+    ]
   },
   "phase1_blocker": {
     "minimum_wire_version": 2,
@@ -97,6 +117,7 @@ paths:
   - "${SOURCE_ROOT}/guard_dep_three.json"
   - "${CONTRACT_REL}"
   - "${STATUS_REL}"
+  - "${BOUNDARY_REL}"
 EOF
 }
 
