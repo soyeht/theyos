@@ -60,6 +60,9 @@ const UNSAFE_BUILD_ENV_SUFFIX: [&str; 8] = [
     "_RANLIB",
 ];
 
+const TRACKED_PKG_CONFIG_PATH: &str =
+    "/nix/store/wr6qvslzqrd3rsf2mw0ssxwmyi2sqjdh-openssl-3.4.2-dev/lib/pkgconfig";
+
 const REPO_INPUT_OVERRIDE_ENV: [&str; 3] = [
     "CLAWS_MANIFEST_YML",
     "CLAWS_CATALOG_JSON",
@@ -153,6 +156,7 @@ fn build_engine(target: &str, build_tool: &str) -> Result<(), String> {
     let (repo_root, rust_root) = workspace_paths()?;
     reject_ancestor_cargo_configs(&repo_root)?;
     reject_cargo_home_config()?;
+    validate_tracked_pkg_config_path()?;
     let expected_rust = expected_rust_version(&rust_root.join("rust-toolchain.toml"))?;
     let actual_rust = command_stdout(Command::new("rustc").current_dir(&rust_root).arg("-V"))?
         .split_whitespace()
@@ -266,7 +270,7 @@ fn build_engine(target: &str, build_tool: &str) -> Result<(), String> {
 }
 
 fn is_unsafe_build_env(name: &str) -> bool {
-    if name == "CARGO_TARGET_DIR" {
+    if matches!(name, "CARGO_TARGET_DIR" | "PKG_CONFIG_PATH") {
         return false;
     }
     UNSAFE_BUILD_ENV.contains(&name)
@@ -276,6 +280,17 @@ fn is_unsafe_build_env(name: &str) -> bool {
         || UNSAFE_BUILD_ENV_SUFFIX
             .iter()
             .any(|suffix| name.ends_with(suffix))
+}
+
+fn validate_tracked_pkg_config_path() -> Result<(), String> {
+    if let Some(value) = env::var_os("PKG_CONFIG_PATH")
+        && value != TRACKED_PKG_CONFIG_PATH
+    {
+        return Err(
+            "PKG_CONFIG_PATH differs from the frozen admin/rust/.cargo/config.toml".to_owned(),
+        );
+    }
+    Ok(())
 }
 
 fn shell_word(value: &str) -> String {
@@ -515,5 +530,6 @@ mod tests {
         }
         assert!(!is_unsafe_build_env("CARGO_HOME"));
         assert!(!is_unsafe_build_env("CARGO_TARGET_DIR"));
+        assert!(!is_unsafe_build_env("PKG_CONFIG_PATH"));
     }
 }
