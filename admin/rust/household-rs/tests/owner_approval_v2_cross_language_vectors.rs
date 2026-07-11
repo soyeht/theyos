@@ -15,7 +15,13 @@ use household_rs::owner_approval_v2::{
 use household_rs::pair_machine::JoinTransport;
 use serde::Deserialize;
 use serde_bytes::ByteBuf;
+use sha2::{Digest, Sha256};
 use std::fmt::Write as _;
+
+const MOBILE_OWNER_APPROVAL_V1_FIXTURE: &str =
+    include_str!("../../../contracts/mobile-claw-vpn/v1/owner_approval_v2_execution_vectors.json");
+const MOBILE_OWNER_APPROVAL_V1_FIXTURE_SHA256: &str =
+    "c47ebb5d9f9a1309e45647dedcdcb20fd7abd47a46e6f31f5541d8f2711c316c";
 
 #[derive(Deserialize)]
 struct Vectors {
@@ -104,10 +110,8 @@ fn vectors() -> Vectors {
 }
 
 fn mobile_vectors() -> MobileVectors {
-    serde_json::from_str(include_str!(
-        "../../../contracts/mobile-claw-vpn/v1/owner_approval_v2_execution_vectors.json"
-    ))
-    .expect("authoritative mobile owner approval fixture must be valid JSON")
+    serde_json::from_str(MOBILE_OWNER_APPROVAL_V1_FIXTURE)
+        .expect("authoritative mobile owner approval fixture must be valid JSON")
 }
 
 fn owner_approval_cases() -> Vec<OwnerApprovalCase> {
@@ -501,6 +505,15 @@ fn context_for(case: &OwnerApprovalCase) -> OwnerApprovalContextV2 {
         expires_at: input.expires_at,
         replay_nonce,
     }
+}
+
+#[test]
+fn mobile_claw_vpn_owner_approval_v1_fixture_sha256_is_immutable() {
+    assert_eq!(
+        hex(&Sha256::digest(MOBILE_OWNER_APPROVAL_V1_FIXTURE.as_bytes())),
+        MOBILE_OWNER_APPROVAL_V1_FIXTURE_SHA256,
+        "V1 fixture is immutable; add a new versioned fixture instead"
+    );
 }
 
 #[test]
