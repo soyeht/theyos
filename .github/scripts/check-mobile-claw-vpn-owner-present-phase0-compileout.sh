@@ -159,6 +159,12 @@ for path in \
   require_blob "${path}"
 done
 
+if git -C "${THEYOS_DIR}" cat-file -e \
+    "${HEAD_SHA}:admin/rust/theyos-engine-build-rs/build.rs" 2>/dev/null; then
+  echo "::error::the canonical engine build tool must not have a build.rs codegen seam"
+  exit 1
+fi
+
 EXPECTED_BUILD_SCRIPTS="${TMP_ROOT}/expected-build-scripts.txt"
 ACTUAL_BUILD_SCRIPTS="${TMP_ROOT}/actual-build-scripts.txt"
 printf '%s\n' \
@@ -234,12 +240,6 @@ if ! grep -Fq "phase0_engine_sha256" "${SNAPSHOT}/.github/workflows/release-linu
   echo "::error::release provenance does not bind the verified engine to the published package"
   exit 1
 fi
-if git -C "${THEYOS_DIR}" cat-file -e \
-    "${HEAD_SHA}:admin/rust/theyos-engine-build-rs/build.rs" 2>/dev/null; then
-  echo "::error::the canonical engine build tool must not have a build.rs codegen seam"
-  exit 1
-fi
-
 for retired_path in \
   "admin/rust/server-rs/src/mobile_claw_vpn_relay_auth.rs" \
   "admin/rust/server-rs/src/mobile_claw_vpn_relay_dial_config.rs" \
