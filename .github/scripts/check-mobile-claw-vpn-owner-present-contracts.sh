@@ -122,7 +122,9 @@ if [[ "$(jq -r '.contract' "${HEAD_STATUS}")" != \
   || "$(jq -r '.phase0_artifact_boundary.policy_change_control' "${HEAD_STATUS}")" != \
     "explicit-owner-approved-versioned-transition" \
   || "$(jq -r '.phase0_artifact_boundary.object_identity_update' "${HEAD_STATUS}")" != \
-    "per-reviewed-commit-attestation" \
+    "per-reviewed-commit-revalidation" \
+  || "$(jq -r '.phase0_artifact_boundary.object_identity_authority' "${HEAD_STATUS}")" != \
+    "commit-bound-evidence-not-independent-approval" \
   || "$(jq -r '.phase0_artifact_boundary.release_provenance' "${HEAD_STATUS}")" != \
     "checker-on-release-subject-and-final-package-attestation" \
   || "$(jq -r '.phase0_artifact_boundary.staged_product' "${HEAD_STATUS}")" != \

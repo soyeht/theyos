@@ -328,6 +328,9 @@ package_soyeht_mac() {
 
     local version
     if [ -n "${THEYOS_RELEASE:-}" ]; then
+        if [ -z "${PHASE0_EXPECTED_UNSIGNED_ENGINE_SHA256:-}" ]; then
+            error "THEYOS_RELEASE requires PHASE0_EXPECTED_UNSIGNED_ENGINE_SHA256"
+        fi
         # Release path: require an exact tag. Fails early if actions/checkout
         # did not fetch tags or HEAD is not tagged — avoids shipping "dev" builds.
         version=$(git -C "${REPO_ROOT}" describe --tags --exact-match 2>/dev/null) || \

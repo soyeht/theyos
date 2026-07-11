@@ -24,6 +24,9 @@ PROTECTED_PATHS=(
   "admin/rust/.cargo/config.toml"
   "admin/rust/Cross.toml"
   "admin/rust/rust-toolchain.toml"
+  "admin/rust/core-rs/build.rs"
+  "admin/rust/household-rs/build.rs"
+  "admin/rust/server-rs/build.rs"
   "admin/rust/theyos-engine-build-rs/Cargo.toml"
   "admin/rust/theyos-engine-build-rs/src/main.rs"
   "scripts/make.sh"
@@ -101,6 +104,12 @@ expect_failure checker_noop "protected Phase 0 authority differs from trusted ba
 
 git -C "${REPO}" restore --source="${HEAD_OK}" -- \
   ".github/scripts/check-mobile-claw-vpn-owner-present-phase0-compileout.sh"
+printf '%s\n' 'fn main() { println!("cargo:rustc-cfg=owner_present_hidden"); }' > \
+  "${REPO}/admin/rust/server-rs/build.rs"
+expect_failure build_script_changed "protected Phase 0 authority differs from trusted base"
+
+git -C "${REPO}" restore --source="${HEAD_OK}" -- \
+  "admin/rust/server-rs/build.rs"
 rm "${REPO}/.github/workflows/owner-present-phase0-compileout.yml"
 expect_failure workflow_deleted "protected Phase 0 authority object is missing"
 

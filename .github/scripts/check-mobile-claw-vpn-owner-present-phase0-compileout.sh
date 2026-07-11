@@ -5,7 +5,8 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DEFAULT_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
-THEYOS_DIR="${1:-${DEFAULT_ROOT}}"
+THEYOS_DIR_INPUT="${1:-${DEFAULT_ROOT}}"
+THEYOS_DIR="$(cd "${THEYOS_DIR_INPUT}" && pwd -P)"
 TARGET="${PHASE0_TARGET:-$(rustc -vV | sed -n 's/^host: //p')}"
 BUILD_TOOL="${PHASE0_BUILD_TOOL:-cargo}"
 HOST_TARGET="$(rustc -vV | sed -n 's/^host: //p')"
@@ -158,6 +159,48 @@ for path in \
   require_blob "${path}"
 done
 
+EXPECTED_BUILD_SCRIPTS="${TMP_ROOT}/expected-build-scripts.txt"
+ACTUAL_BUILD_SCRIPTS="${TMP_ROOT}/actual-build-scripts.txt"
+printf '%s\n' \
+  "admin/rust/core-rs/build.rs" \
+  "admin/rust/household-rs/build.rs" \
+  "admin/rust/server-rs/build.rs" \
+  | LC_ALL=C sort > "${EXPECTED_BUILD_SCRIPTS}"
+: > "${ACTUAL_BUILD_SCRIPTS}"
+while IFS= read -r -d '' path; do
+  case "${path}" in
+    */build.rs) printf '%s\n' "${path}" >> "${ACTUAL_BUILD_SCRIPTS}" ;;
+  esac
+done < <(git -C "${THEYOS_DIR}" ls-tree -r -z --name-only "${HEAD_SHA}" -- admin/rust)
+LC_ALL=C sort -o "${ACTUAL_BUILD_SCRIPTS}" "${ACTUAL_BUILD_SCRIPTS}"
+if ! cmp -s "${EXPECTED_BUILD_SCRIPTS}" "${ACTUAL_BUILD_SCRIPTS}"; then
+  echo "::error::Phase 0 permits exactly the three reviewed in-repo Rust build scripts"
+  exit 1
+fi
+
+METADATA_JSON="${TMP_ROOT}/cargo-metadata.json"
+cargo metadata \
+  --manifest-path "${SNAPSHOT}/admin/rust/Cargo.toml" \
+  --locked \
+  --format-version 1 \
+  > "${METADATA_JSON}"
+if ! jq -e '
+    all(.packages[] | select(.source == null); .manifest_path | contains("\n") | not)
+  ' "${METADATA_JSON}" >/dev/null; then
+  echo "::error::local Cargo manifest paths must be single-line UTF-8 paths"
+  exit 1
+fi
+while IFS= read -r manifest_path; do
+  manifest_dir="$(cd "$(dirname "${manifest_path}")" && pwd -P)"
+  case "${manifest_dir}/" in
+    "${SNAPSHOT}/admin/rust/"*) ;;
+    *)
+      echo "::error file=${manifest_path}::local Cargo dependency escapes the closed admin/rust tree"
+      exit 1
+      ;;
+  esac
+done < <(jq -r '.packages[] | select(.source == null) | .manifest_path' "${METADATA_JSON}")
+
 BOUNDARY_MANIFEST="${TMP_ROOT}/phase0-boundary.tsv"
 git -C "${THEYOS_DIR}" cat-file blob "${HEAD_SHA}:${BOUNDARY_REL}" > "${BOUNDARY_MANIFEST}"
 validate_boundary_manifest "${BOUNDARY_MANIFEST}"
@@ -237,7 +280,9 @@ if [[ "$(jq -r '.contract' "${AUTHORITY_STATUS}")" != \
   || "$(jq -r '.phase0_artifact_boundary.policy_change_control' "${AUTHORITY_STATUS}")" != \
     "explicit-owner-approved-versioned-transition" \
   || "$(jq -r '.phase0_artifact_boundary.object_identity_update' "${AUTHORITY_STATUS}")" != \
-    "per-reviewed-commit-attestation" \
+    "per-reviewed-commit-revalidation" \
+  || "$(jq -r '.phase0_artifact_boundary.object_identity_authority' "${AUTHORITY_STATUS}")" != \
+    "commit-bound-evidence-not-independent-approval" \
   || "$(jq -r '.phase0_artifact_boundary.release_provenance' "${AUTHORITY_STATUS}")" != \
     "checker-on-release-subject-and-final-package-attestation" \
   || "$(jq -r '.phase0_artifact_boundary.staged_product' "${AUTHORITY_STATUS}")" != \

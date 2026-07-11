@@ -5,8 +5,26 @@ use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 
-const UNSAFE_BUILD_ENV: [&str; 9] = [
+const UNSAFE_BUILD_ENV: [&str; 27] = [
+    "AR",
+    "BINDGEN_EXTRA_CLANG_ARGS",
+    "CC",
+    "CFLAGS",
+    "CPP",
+    "CPPFLAGS",
+    "CXX",
+    "CXXFLAGS",
+    "DEVELOPER_DIR",
+    "DOCKER_OPTS",
+    "LD",
+    "LDFLAGS",
+    "MACOSX_DEPLOYMENT_TARGET",
+    "PKG_CONFIG_PATH",
+    "RANLIB",
     "RUSTFLAGS",
+    "RUSTDOCFLAGS",
+    "RUSTUP_TOOLCHAIN",
+    "SDKROOT",
     "CARGO_ENCODED_RUSTFLAGS",
     "RUSTC_WRAPPER",
     "RUSTC_WORKSPACE_WRAPPER",
@@ -15,6 +33,31 @@ const UNSAFE_BUILD_ENV: [&str; 9] = [
     "CARGO_BUILD_RUSTC",
     "CARGO_BUILD_RUSTFLAGS",
     "CARGO_BUILD_TARGET",
+];
+
+const UNSAFE_BUILD_ENV_PREFIX: [&str; 11] = [
+    "AR_",
+    "CARGO_BUILD_",
+    "CARGO_PROFILE_",
+    "CARGO_TARGET_",
+    "CC_",
+    "CFLAGS_",
+    "CROSS_",
+    "CXX_",
+    "CXXFLAGS_",
+    "LDFLAGS_",
+    "PKG_CONFIG_",
+];
+
+const UNSAFE_BUILD_ENV_SUFFIX: [&str; 8] = [
+    "_AR",
+    "_CC",
+    "_CFLAGS",
+    "_CXX",
+    "_CXXFLAGS",
+    "_LD",
+    "_LDFLAGS",
+    "_RANLIB",
 ];
 
 const REPO_INPUT_OVERRIDE_ENV: [&str; 3] = [
@@ -98,8 +141,9 @@ fn build_engine(target: &str, build_tool: &str) -> Result<(), String> {
             "unsupported theyos-engine build tool: {build_tool}"
         ));
     }
-    for name in UNSAFE_BUILD_ENV {
-        if env::var_os(name).is_some_and(|value| !value.is_empty()) {
+    for (name, value) in env::vars_os() {
+        let name = name.to_string_lossy();
+        if is_unsafe_build_env(&name) && !value.is_empty() {
             return Err(format!(
                 "{name} must be unset for the canonical theyos-engine build"
             ));
@@ -108,6 +152,7 @@ fn build_engine(target: &str, build_tool: &str) -> Result<(), String> {
 
     let (repo_root, rust_root) = workspace_paths()?;
     reject_ancestor_cargo_configs(&repo_root)?;
+    reject_cargo_home_config()?;
     let expected_rust = expected_rust_version(&rust_root.join("rust-toolchain.toml"))?;
     let actual_rust = command_stdout(Command::new("rustc").current_dir(&rust_root).arg("-V"))?
         .split_whitespace()
@@ -164,6 +209,28 @@ fn build_engine(target: &str, build_tool: &str) -> Result<(), String> {
     for name in REPO_INPUT_OVERRIDE_ENV {
         build.env_remove(name);
     }
+    if build_tool == "cross" {
+        let claws_dir = repo_root.join("claws").canonicalize().map_err(|error| {
+            format!(
+                "failed to resolve canonical Claw manifest directory {}: {error}",
+                repo_root.join("claws").display()
+            )
+        })?;
+        if !claws_dir.join("manifest.yml").is_file() {
+            return Err(format!(
+                "canonical Claw manifest is missing: {}",
+                claws_dir.join("manifest.yml").display()
+            ));
+        }
+        let claws_dir = claws_dir
+            .to_str()
+            .ok_or("canonical Claw manifest path is not valid Unicode")?;
+        let mount = shell_word(&format!("--volume={claws_dir}:/claws:ro"));
+        build.env(
+            "CROSS_CONTAINER_OPTS",
+            format!("{mount} --env=CLAWS_CATALOG_JSON=/tmp/theyos-claws-catalog.json"),
+        );
+    }
     let status = build
         .status()
         .map_err(|error| format!("failed to launch {build_tool}: {error}"))?;
@@ -198,6 +265,30 @@ fn build_engine(target: &str, build_tool: &str) -> Result<(), String> {
     Ok(())
 }
 
+fn is_unsafe_build_env(name: &str) -> bool {
+    if name == "CARGO_TARGET_DIR" {
+        return false;
+    }
+    UNSAFE_BUILD_ENV.contains(&name)
+        || UNSAFE_BUILD_ENV_PREFIX
+            .iter()
+            .any(|prefix| name.starts_with(prefix))
+        || UNSAFE_BUILD_ENV_SUFFIX
+            .iter()
+            .any(|suffix| name.ends_with(suffix))
+}
+
+fn shell_word(value: &str) -> String {
+    if value
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || b"%+,-./:=@_".contains(&byte))
+    {
+        value.to_owned()
+    } else {
+        format!("'{}'", value.replace('\'', "'\\''"))
+    }
+}
+
 fn reject_ancestor_cargo_configs(repo_root: &Path) -> Result<(), String> {
     for relative in [
         ".cargo/config",
@@ -209,6 +300,25 @@ fn reject_ancestor_cargo_configs(repo_root: &Path) -> Result<(), String> {
         if fs::symlink_metadata(&path).is_ok() {
             return Err(format!(
                 "canonical theyos-engine build forbids ancestor Cargo config: {relative}"
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn reject_cargo_home_config() -> Result<(), String> {
+    let cargo_home = env::var_os("CARGO_HOME")
+        .map(PathBuf::from)
+        .or_else(|| env::var_os("HOME").map(|home| PathBuf::from(home).join(".cargo")));
+    let Some(cargo_home) = cargo_home else {
+        return Ok(());
+    };
+    for name in ["config", "config.toml"] {
+        let path = cargo_home.join(name);
+        if fs::symlink_metadata(&path).is_ok() {
+            return Err(format!(
+                "canonical theyos-engine build forbids Cargo home config: {}",
+                path.display()
             ));
         }
     }
@@ -372,5 +482,38 @@ fn files_equal(left: &Path, right: &Path) -> Result<bool, String> {
         if left_read == 0 {
             return Ok(true);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{is_unsafe_build_env, shell_word};
+
+    #[test]
+    fn shell_word_preserves_container_option_as_one_argument() {
+        assert_eq!(
+            shell_word("--volume=/tmp/with space/claws:/claws:ro"),
+            "'--volume=/tmp/with space/claws:/claws:ro'"
+        );
+        assert_eq!(
+            shell_word("--volume=/tmp/owner's/claws:/claws:ro"),
+            "'--volume=/tmp/owner'\\''s/claws:/claws:ro'"
+        );
+    }
+
+    #[test]
+    fn build_environment_rejects_target_and_toolchain_overrides() {
+        for name in [
+            "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_RUSTFLAGS",
+            "AARCH64_UNKNOWN_LINUX_MUSL_CC",
+            "CROSS_CONFIG",
+            "DOCKER_OPTS",
+            "MACOSX_DEPLOYMENT_TARGET",
+            "PKG_CONFIG_AARCH64_UNKNOWN_LINUX_MUSL",
+        ] {
+            assert!(is_unsafe_build_env(name), "missed {name}");
+        }
+        assert!(!is_unsafe_build_env("CARGO_HOME"));
+        assert!(!is_unsafe_build_env("CARGO_TARGET_DIR"));
     }
 }

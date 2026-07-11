@@ -97,6 +97,17 @@ grep -Fq "production server binary cannot be built with DEV/test features" \
   "${TMP_ROOT}/dev-feature.log"
 echo "PASS release_dev_feature_refused"
 
+if CROSS_CONTAINER_OPTS='--volume=/tmp/untrusted:/claws:ro' \
+    PHASE0_TARGET="${HOST_TARGET}" \
+    PHASE0_BUILD_TOOL=cargo \
+    PHASE0_CARGO_TARGET_DIR="${SHARED_TARGET}" \
+    "${REPO_ROOT}/${CHECKER_REL}" >"${TMP_ROOT}/cross-env.log" 2>&1; then
+  echo "error: canonical build accepted external CROSS_CONTAINER_OPTS" >&2
+  exit 1
+fi
+grep -Fq "CROSS_CONTAINER_OPTS must be unset" "${TMP_ROOT}/cross-env.log"
+echo "PASS external_cross_container_opts_refused"
+
 module_crossing="${TMP_ROOT}/module-crossing"
 clone_head "${module_crossing}"
 perl -0pi -e \
@@ -177,6 +188,43 @@ commit_mutation "${build_tool_codegen}" build-tool-codegen
 expect_checker_failure build_tool_codegen \
   "canonical engine build tool must not have a build.rs codegen seam" \
   "${build_tool_codegen}"
+
+new_build_script="${TMP_ROOT}/new-build-script"
+clone_head "${new_build_script}"
+mkdir -p "${new_build_script}/admin/rust/server-rs/generated"
+printf '%s\n' 'fn main() { println!("cargo:rustc-cfg=owner_present_hidden"); }' > \
+  "${new_build_script}/admin/rust/server-rs/generated/build.rs"
+refresh_boundary_tree_entry "${new_build_script}" "admin/rust"
+commit_mutation "${new_build_script}" new-build-script
+expect_checker_failure new_build_script \
+  "Phase 0 permits exactly the three reviewed in-repo Rust build scripts" \
+  "${new_build_script}"
+
+external_path_dependency="${TMP_ROOT}/external-path-dependency"
+clone_head "${external_path_dependency}"
+mkdir -p "${external_path_dependency}/outside-phase0/src"
+printf '%s\n' \
+  '[package]' \
+  'name = "outside-phase0"' \
+  'version = "0.1.0"' \
+  'edition = "2024"' \
+  > "${external_path_dependency}/outside-phase0/Cargo.toml"
+printf '%s\n' 'pub const OWNER_PRESENT_HIDDEN: bool = true;' > \
+  "${external_path_dependency}/outside-phase0/src/lib.rs"
+cat >> "${external_path_dependency}/admin/rust/server-rs/Cargo.toml" <<'TOML'
+
+[dependencies.outside-phase0]
+path = "../../../outside-phase0"
+TOML
+(
+  cd "${external_path_dependency}/admin/rust"
+  cargo generate-lockfile --quiet
+)
+refresh_boundary_tree_entry "${external_path_dependency}" "admin/rust"
+commit_mutation "${external_path_dependency}" external-path-dependency
+expect_checker_failure external_path_dependency \
+  "local Cargo dependency escapes the closed admin/rust tree" \
+  "${external_path_dependency}"
 
 ancestor_cargo_config="${TMP_ROOT}/ancestor-cargo-config"
 clone_head "${ancestor_cargo_config}"
