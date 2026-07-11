@@ -22,14 +22,8 @@ PROTECTED_PATHS=(
   ".github/workflows/release-macos.yml"
   "admin/contracts/mobile-claw-vpn/v1/owner_present_wire_authority_status_v1.json"
   "admin/rust/.cargo/config.toml"
-  "admin/rust/Cargo.lock"
-  "admin/rust/Cargo.toml"
   "admin/rust/Cross.toml"
   "admin/rust/rust-toolchain.toml"
-  "admin/rust/core-rs/build.rs"
-  "admin/rust/household-rs/build.rs"
-  "admin/rust/server-rs/build.rs"
-  "admin/rust/server-rs/Cargo.toml"
   "admin/rust/theyos-engine-build-rs/Cargo.toml"
   "admin/rust/theyos-engine-build-rs/src/main.rs"
   "scripts/make.sh"
@@ -69,6 +63,19 @@ PHASE0_INTEGRITY_LOCAL_TEST=1 \
   "${CHECKER}" "${REPO}" "${BASE}" "${HEAD_OK}" 0 >/dev/null
 git -C "${REPO}" switch --quiet "${BRANCH}"
 echo "PASS per_commit_boundary_identity_update"
+
+mkdir -p "${REPO}/admin/rust/server-rs/src"
+printf '%s\n' 'reviewed-lock-update' > "${REPO}/admin/rust/Cargo.lock"
+printf '%s\n' 'pub const REVIEWED_SOURCE: bool = true;' > \
+  "${REPO}/admin/rust/server-rs/src/lib.rs"
+git -C "${REPO}" add -A
+git -C "${REPO}" commit --quiet -m reviewed-build-input-update
+HEAD_OK="$(git -C "${REPO}" rev-parse HEAD)"
+git -C "${REPO}" switch --quiet --detach "${BASE}"
+PHASE0_INTEGRITY_LOCAL_TEST=1 \
+  "${CHECKER}" "${REPO}" "${BASE}" "${HEAD_OK}" 0 >/dev/null
+git -C "${REPO}" switch --quiet "${BRANCH}"
+echo "PASS per_commit_build_input_update"
 
 expect_failure() {
   local label="$1" expected="$2"
