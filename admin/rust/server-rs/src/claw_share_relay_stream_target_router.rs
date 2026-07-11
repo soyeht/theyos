@@ -7,11 +7,15 @@
 //! higher-level consumer boundary and is not faked here.
 
 use std::fmt;
+#[cfg(any(test, feature = "dev_t1_datapath"))]
 use std::future::Future;
+#[cfg(not(any(test, feature = "dev_t1_datapath")))]
+use std::marker::PhantomData;
 use std::sync::Arc;
 
 use household_rs::claw_share::{ClawShareSlotStore, SlotState};
 use household_rs::claw_share_data_tunnel::{ClawTargetRouter, DataTunnelError, TargetSession};
+#[cfg(any(test, feature = "dev_t1_datapath"))]
 use household_rs::keys::P256PublicKey;
 
 use crate::claw_share_relay_stream_contract::{
@@ -32,9 +36,13 @@ pub struct RelayStreamOfferTargetRouter<P, S, I = RelayStreamIpTunnelUnavailable
     gate: RelayStreamOfferTargetGate,
     pty_router: P,
     clawsite_router: S,
+    #[cfg(any(test, feature = "dev_t1_datapath"))]
     ip_tunnel_router: I,
+    #[cfg(not(any(test, feature = "dev_t1_datapath")))]
+    phase0_router: PhantomData<fn() -> I>,
 }
 
+#[cfg(any(test, feature = "dev_t1_datapath"))]
 #[derive(Clone, PartialEq, Eq)]
 pub struct RelayStreamIpTunnelTarget {
     group_id: String,
@@ -43,6 +51,7 @@ pub struct RelayStreamIpTunnelTarget {
     claw_id: String,
 }
 
+#[cfg(any(test, feature = "dev_t1_datapath"))]
 impl RelayStreamIpTunnelTarget {
     #[cfg(test)]
     pub(crate) fn new_for_test(
@@ -80,6 +89,7 @@ impl RelayStreamIpTunnelTarget {
     }
 }
 
+#[cfg(any(test, feature = "dev_t1_datapath"))]
 impl fmt::Debug for RelayStreamIpTunnelTarget {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("RelayStreamIpTunnelTarget")
@@ -91,6 +101,7 @@ impl fmt::Debug for RelayStreamIpTunnelTarget {
     }
 }
 
+#[cfg(any(test, feature = "dev_t1_datapath"))]
 pub trait RelayStreamIpTunnelRouter: Send + Sync {
     fn open_ip_tunnel(
         &self,
@@ -107,6 +118,7 @@ impl ClawTargetRouter for RelayStreamIpTunnelUnavailableRouter {
     }
 }
 
+#[cfg(any(test, feature = "dev_t1_datapath"))]
 impl RelayStreamIpTunnelRouter for RelayStreamIpTunnelUnavailableRouter {
     async fn open_ip_tunnel(
         &self,
@@ -116,6 +128,7 @@ impl RelayStreamIpTunnelRouter for RelayStreamIpTunnelUnavailableRouter {
     }
 }
 
+#[cfg(any(test, feature = "dev_t1_datapath"))]
 impl<T> RelayStreamIpTunnelRouter for Arc<T>
 where
     T: RelayStreamIpTunnelRouter + ?Sized,
@@ -148,6 +161,7 @@ impl RelayStreamOfferTargetGate {
         self.offer.payload.resource
     }
 
+    #[cfg(any(test, feature = "dev_t1_datapath"))]
     pub(crate) fn validate_ip_tunnel_target(
         &self,
         target_id: &str,
@@ -305,18 +319,19 @@ impl<P, S> RelayStreamOfferTargetRouter<P, S> {
         clawsite_router: S,
         now_unix: impl Fn() -> u64 + Send + Sync + 'static,
     ) -> Self {
-        Self::new_with_ip_tunnel_router(
-            offer,
-            trust,
-            slots,
+        Self {
+            gate: RelayStreamOfferTargetGate::new(offer, trust, slots, now_unix),
             pty_router,
             clawsite_router,
-            RelayStreamIpTunnelUnavailableRouter,
-            now_unix,
-        )
+            #[cfg(any(test, feature = "dev_t1_datapath"))]
+            ip_tunnel_router: RelayStreamIpTunnelUnavailableRouter,
+            #[cfg(not(any(test, feature = "dev_t1_datapath")))]
+            phase0_router: PhantomData,
+        }
     }
 }
 
+#[cfg(any(test, feature = "dev_t1_datapath"))]
 impl<P, S, I> RelayStreamOfferTargetRouter<P, S, I> {
     #[must_use]
     pub fn new_with_ip_tunnel_router(
@@ -335,30 +350,24 @@ impl<P, S, I> RelayStreamOfferTargetRouter<P, S, I> {
             ip_tunnel_router,
         }
     }
-
-    fn validate_offer_target_for_resource(
-        &self,
-        target_id: &str,
-        expected_resource: RelayStreamResource,
-    ) -> Result<(), DataTunnelError> {
-        self.gate
-            .validate_target_for_resource(target_id, expected_resource)
-    }
 }
 
 impl<P, S, I> fmt::Debug for RelayStreamOfferTargetRouter<P, S, I> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         // Curated view: the offer gate and routers are redacted, so the remaining
         // fields are omitted.
-        f.debug_struct("RelayStreamOfferTargetRouter")
+        let mut debug = f.debug_struct("RelayStreamOfferTargetRouter");
+        debug
             .field("gate", &self.gate)
             .field("pty_router", &"redacted")
-            .field("clawsite_router", &"redacted")
-            .field("ip_tunnel_router", &"redacted")
-            .finish_non_exhaustive()
+            .field("clawsite_router", &"redacted");
+        #[cfg(any(test, feature = "dev_t1_datapath"))]
+        debug.field("ip_tunnel_router", &"redacted");
+        debug.finish_non_exhaustive()
     }
 }
 
+#[cfg(any(test, feature = "dev_t1_datapath"))]
 impl<P, S, I> ClawTargetRouter for RelayStreamOfferTargetRouter<P, S, I>
 where
     P: ClawTargetRouter,
@@ -368,16 +377,43 @@ where
     async fn open(&self, target_id: &str) -> Result<TargetSession, DataTunnelError> {
         match self.gate.resource() {
             RelayStreamResource::Pty => {
-                self.validate_offer_target_for_resource(target_id, RelayStreamResource::Pty)?;
+                self.gate
+                    .validate_target_for_resource(target_id, RelayStreamResource::Pty)?;
                 self.pty_router.open(target_id).await
             }
             RelayStreamResource::ClawSite => {
-                self.validate_offer_target_for_resource(target_id, RelayStreamResource::ClawSite)?;
+                self.gate
+                    .validate_target_for_resource(target_id, RelayStreamResource::ClawSite)?;
                 self.clawsite_router.open(target_id).await
             }
             RelayStreamResource::IpTunnel => {
                 let target = self.gate.validate_ip_tunnel_target(target_id)?;
                 self.ip_tunnel_router.open_ip_tunnel(target).await
+            }
+        }
+    }
+}
+
+#[cfg(not(any(test, feature = "dev_t1_datapath")))]
+impl<P, S> ClawTargetRouter for RelayStreamOfferTargetRouter<P, S>
+where
+    P: ClawTargetRouter,
+    S: ClawTargetRouter,
+{
+    async fn open(&self, target_id: &str) -> Result<TargetSession, DataTunnelError> {
+        match self.gate.resource() {
+            RelayStreamResource::Pty => {
+                self.gate
+                    .validate_target_for_resource(target_id, RelayStreamResource::Pty)?;
+                self.pty_router.open(target_id).await
+            }
+            RelayStreamResource::ClawSite => {
+                self.gate
+                    .validate_target_for_resource(target_id, RelayStreamResource::ClawSite)?;
+                self.clawsite_router.open(target_id).await
+            }
+            RelayStreamResource::IpTunnel => {
+                Err(target_unavailable("relay-stream-iptunnel-compiled-out"))
             }
         }
     }

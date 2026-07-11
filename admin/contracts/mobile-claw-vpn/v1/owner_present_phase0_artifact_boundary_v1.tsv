@@ -1,58 +1,6 @@
 # theyos-owner-present-phase0-artifact-boundary-v1
-# mode<TAB>git-blob-oid<TAB>path
-100644	a96bb26357cbf69b4c025cd912a0d48b5ff7481b	admin/rust/.cargo/config.toml
-100644	bc37aa15bd3628599066669eda25f3b68892e152	admin/rust/Cross.toml
-100644	5c58923d943078ab0206466fc0c840e9db0e2518	admin/rust/Cargo.lock
-100644	dc97227dc26ef8a812a1aa6206df9972325ee323	admin/rust/Cargo.toml
-100644	f8a1d023157ead214b33102a4850969904e7ec0f	admin/rust/rust-toolchain.toml
-100644	d7bfb5d7e35de419f20393b5d614f6f0768aa8aa	admin/rust/core-rs/build.rs
-100644	82a00936b2904af81d9e6b3a1c38b5cdb44942b3	admin/rust/household-rs/Cargo.toml
-100644	a92626caa1b0d69b9dae22cd7ab78084513a8b81	admin/rust/household-rs/build.rs
-100644	6a143c552cea4b91612c37f77e6ca540115efc61	admin/rust/household-rs/data/emoji-security-code-wordlist.csv
-100644	d8be0b2afcfbc16a6fcb783d5da90b39c7435aff	admin/rust/household-rs/src/lib.rs
-100644	f132efe7d4dffd1058557ac3f0e45f1659f7aa8c	admin/rust/household-rs/src/storage.rs
-100644	ae3d3d60b6dea0457286baf1b7aa01d2cbb9c447	admin/rust/household-rs/src/claw_share_relay_stream_contract.rs
-100644	d2caa1bde61daf03cc02159da14247fbdf1511be	admin/rust/household-rs/src/claw_share_data_tunnel.rs
-100644	33229e881c7c34ff0f6de3e5a85dd28e5a5aa1b8	admin/rust/household-rs/src/claw_share.rs
-100644	44fee3d933759e909de0a0be0400c5651295fef1	admin/rust/household-rs/src/household_mesh_log.rs
-100644	7063ec5a0b407bc74ff1a542597ac7464275c287	admin/rust/server-rs/Cargo.toml
-100644	65a94379cd2244a52ae2193de290a87ac3d6c0aa	admin/rust/server-rs/build.rs
-100644	48df9f2d6a27d3eebef7bad71b3ab33fd746a0b9	admin/rust/server-rs/src/lib.rs
-100644	d1bbf5932a2099f9d2978bd3ed1529edd9de2c9b	admin/rust/server-rs/src/main.rs
-100644	c3780ddeee8472caef9d4538eff3389000bfaf46	admin/rust/server-rs/src/mobile_api_routes.rs
-100644	884e4b624576f6099f28fd097080c6ca0a1e0ee2	admin/rust/server-rs/src/mobile_claw_vpn_phase0.rs
-100644	8b13fd89ebe5c33731830579bffad9b36e955128	admin/rust/server-rs/src/handlers_mobile.rs
-100644	001c51463e9fa3da67a18c5fca05183a5e2c00a7	admin/rust/server-rs/src/state.rs
-100644	99b75778fbd06c7051b1ddee635b921340df9d26	admin/rust/server-rs/src/claw_store_routes.rs
-100644	0b3216d3da0fbd0823f36a0f2739fe4aed3dd5c6	admin/rust/server-rs/src/claw_share_data_tunnel_listener.rs
-100644	8b638758f2aa075c2f65c5acbe21f2edcfa0e650	admin/rust/server-rs/src/claw_share_relay_stream_abuse.rs
-100644	84ced8bfab6f4acaf0ff93cac7fecb854374ae3d	admin/rust/server-rs/src/claw_share_relay_stream_admission.rs
-100644	cfc5ee8fcb89cfd801971af2b5ddf0e4c23d7f2b	admin/rust/server-rs/src/claw_share_relay_stream_contract.rs
-100644	d4e8395e59a0626a36cd0e7c96fede02e7348a17	admin/rust/server-rs/src/claw_share_relay_stream_issuer_trust.rs
-100644	ed858b1679685ec436bd5a49292715160b44cb40	admin/rust/server-rs/src/claw_share_relay_stream_mount.rs
-100644	9007abafd8a329e8ed3748f37400cd792e7ba27b	admin/rust/server-rs/src/claw_share_relay_stream_noise.rs
-100644	4b129f8e35893d41f18e0ec3f9c3f1991f5f674f	admin/rust/server-rs/src/claw_share_relay_stream_noise_keystore.rs
-100644	18a857bdf0cf50850bfb1e10df340d89a55d2741	admin/rust/server-rs/src/claw_share_relay_stream_offer_store.rs
-100644	4844c36e8bba5ab7663470e3d7548a9d658201bb	admin/rust/server-rs/src/claw_share_relay_stream_provision.rs
-100644	f52d6a2139fc319d0f55a336a67117a5ba7cee84	admin/rust/server-rs/src/claw_share_relay_stream_public_relay_config.rs
-100644	bd108b3779d230ac3606e0d57b9100f40e524792	admin/rust/server-rs/src/claw_share_relay_stream_responder.rs
-100644	8067998321a3e5c9949cf404e1536dcec3ba0fad	admin/rust/server-rs/src/claw_share_relay_stream_responder_config.rs
-100644	bab0416349978ac3bcb3ad1d781f6f14c541f313	admin/rust/server-rs/src/claw_share_relay_stream_responder_params.rs
-100644	0aa3051252cf8ec955b81daebb509f82196f6168	admin/rust/server-rs/src/claw_share_relay_stream_responder_reverse_connect.rs
-100644	4eb8369293be4302dfae94d2c51dd795c4cca4f0	admin/rust/server-rs/src/claw_share_relay_stream_responder_server.rs
-100644	7de745126a07c09349e30b2c999a77f72e1d972f	admin/rust/server-rs/src/claw_share_relay_stream_reverse_connect_binding.rs
-100644	107617e9295d90854a3240d828f1c1e4ef7a1f5b	admin/rust/server-rs/src/claw_share_relay_stream_reverse_connect_pool.rs
-100644	d582b72d042ca4e8ca778a8975b8213e533546e4	admin/rust/server-rs/src/claw_share_relay_stream_runtime.rs
-100644	9aec236dcd7bd87b4ad919eb3ecbe352beae7e87	admin/rust/server-rs/src/claw_share_relay_stream_session.rs
-100644	9020b8539a13dcdf2fceb15a6546c89bce7813cd	admin/rust/server-rs/src/claw_share_relay_stream_target_router.rs
-100644	129664fcd377a9c6cba6594fed8b4abce1c573d9	admin/rust/server-rs/src/claw_share_relay_stream_trust_context_cache.rs
-100644	b889c4818759e1f6c686446bfb448c81be3cba2b	admin/rust/server-rs/src/claw_share_relay_stream_trust_context_health.rs
-100644	dc29e7c00924fc799623aa752c50016af45ee66f	admin/rust/server-rs/src/claw_share_relay_stream_trust_refresh_driver.rs
-100644	de7496689bbed50cf99118a14ce60feea0052db9	admin/rust/server-rs/tests/claw_store_route_contract.rs
-100644	eea308c4938b196d787b71947cb6e243140ae153	admin/rust/server-rs/tests/claw_store_wire_contract.rs
-100755	70b8d30d446e8dc860e3d363b7069dd7215f90bb	scripts/build-theyos-engine.sh
-100755	fa29f7db58bdcdd7515daf6e4afbf5301895cd14	scripts/stage-theyos-engine.sh
-100755	18cedae51dd01b3d9b30628e9bc00934ebfcc540	scripts/make.sh
-100644	c2615e9221b8652f6a884090ae1564f99f5b6996	.github/workflows/release-linux.yml
-100644	34a24216484632fa1c40b9e4baa303b50206ff1e	.github/workflows/release-macos.yml
-100644	7fa3b0d3d0cb090898eb9e5107ba60bd40356523	claws/manifest.yml
+# mode<TAB>git-object-type<TAB>git-object-oid<TAB>closed-subtree
+040000	tree	202894f77bf3c73c1db72ef82663aed676159507	.github
+040000	tree	1d27dd31f9c7a848ba4a3b6025ac7580fb7123b2	admin/rust
+040000	tree	0f4cb4b436ef7d67e4e024cf1bf67d50ed2d6d53	claws
+040000	tree	36c613d62ac7ae0d7f5a1451e9fa52f98a1abe9e	scripts

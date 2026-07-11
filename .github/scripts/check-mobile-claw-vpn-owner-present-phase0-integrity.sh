@@ -47,8 +47,21 @@ PROTECTED_PATHS=(
   ".github/scripts/check-mobile-claw-vpn-owner-present-contracts.sh"
   ".github/scripts/test-mobile-claw-vpn-owner-present-contracts.sh"
   ".github/workflows/contracts-cross-repo-sync.yml"
+  ".github/workflows/release-linux.yml"
+  ".github/workflows/release-macos.yml"
   "admin/contracts/mobile-claw-vpn/v1/owner_present_wire_authority_status_v1.json"
-  "admin/contracts/mobile-claw-vpn/v1/owner_present_phase0_artifact_boundary_v1.tsv"
+  "admin/rust/.cargo/config.toml"
+  "admin/rust/Cargo.lock"
+  "admin/rust/Cargo.toml"
+  "admin/rust/Cross.toml"
+  "admin/rust/rust-toolchain.toml"
+  "admin/rust/core-rs/build.rs"
+  "admin/rust/household-rs/build.rs"
+  "admin/rust/server-rs/build.rs"
+  "admin/rust/server-rs/Cargo.toml"
+  "admin/rust/theyos-engine-build-rs/Cargo.toml"
+  "admin/rust/theyos-engine-build-rs/src/main.rs"
+  "scripts/make.sh"
 )
 
 for path in "${PROTECTED_PATHS[@]}"; do

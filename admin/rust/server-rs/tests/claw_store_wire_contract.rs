@@ -1259,6 +1259,10 @@ async fn mobile_claw_vpn_phase0_exposes_only_authenticated_unavailable_status() 
     let artifact_contract = server_rs::mobile_claw_vpn_phase0::artifact_contract();
     assert_eq!(artifact_contract["authority"], "none");
     assert_eq!(
+        artifact_contract["generic_ip_tunnel_router_seam_compiled"],
+        false
+    );
+    assert_eq!(
         artifact_contract["generic_ip_tunnel_backend_compiled"],
         false
     );
@@ -1271,7 +1275,7 @@ async fn mobile_claw_vpn_phase0_exposes_only_authenticated_unavailable_status() 
         false
     );
     assert_eq!(
-        artifact_contract["product_a_routes"],
+        artifact_contract["declared_product_a_routes"],
         serde_json::json!(["/claw-vpn/status"])
     );
 
@@ -1327,19 +1331,18 @@ async fn mobile_claw_vpn_phase0_mutation_routes_are_absent() {
         assert_eq!(status, StatusCode::NOT_FOUND, "{path}");
     }
 
-    let admin_cookie = admin_session_cookie_for_role(&state, "phase0-admin", UserRole::Admin);
     for path in [
         "/api/v1/mobile/claw-vpn/owner/enroll-device",
         "/api/v1/mobile/claw-vpn/owner/claw-availability",
         "/api/v1/mobile/claw-vpn/owner/grant",
         "/api/v1/mobile/claw-vpn/owner/revoke-grant",
     ] {
-        let (status, _bytes, _body) = request_with_cookie(
-            admin_auth_router(Arc::clone(&state)),
+        let (status, _bytes, _body) = request(
+            mobile_router(Arc::clone(&state)),
             Method::POST,
             path,
             b"{}".to_vec(),
-            Some(admin_cookie.clone()),
+            Some(format!("Bearer {token}")),
         )
         .await;
         assert_eq!(status, StatusCode::NOT_FOUND, "{path}");

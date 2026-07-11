@@ -55,6 +55,23 @@ sha256_file() {
   fi
 }
 
+validate_boundary_descriptor() {
+  local manifest="$1" count=0 mode type oid path
+  local roots="${TMP_DIR}/boundary-roots"
+  : > "${roots}"
+  while IFS=$'\t' read -r mode type oid path; do
+    [[ -z "${mode}" || "${mode}" == \#* ]] && continue
+    if [[ "${mode}" != "040000" || "${type}" != "tree" \
+      || ! "${oid}" =~ ^[0-9a-f]{40}$ ]]; then
+      return 1
+    fi
+    printf '%s\n' "${path}" >> "${roots}"
+    count=$((count + 1))
+  done < "${manifest}"
+  [[ "${count}" -eq 4 ]] \
+    && [[ "$(sort -u "${roots}" | tr '\n' ',')" == ".github,admin/rust,claws,scripts," ]]
+}
+
 HEAD_CONTRACT="${TMP_DIR}/head-contract"
 if ! materialize_regular_blob \
   "${THEYOS_DIR}" "${HEAD_SHA}" "${CONTRACT_SOURCE_REL}" "${HEAD_CONTRACT}" \
@@ -62,7 +79,6 @@ if ! materialize_regular_blob \
   echo "::error file=${CONTRACT_SOURCE_REL}::historical success fixture is missing"
   exit 1
 fi
-
 HEAD_STATUS="${TMP_DIR}/head-status"
 if ! materialize_regular_blob \
   "${THEYOS_DIR}" "${HEAD_SHA}" "${STATUS_SOURCE_REL}" "${HEAD_STATUS}" \
@@ -75,6 +91,10 @@ if ! materialize_regular_blob \
   "${THEYOS_DIR}" "${HEAD_SHA}" "${BOUNDARY_REL}" "${HEAD_BOUNDARY}" \
   "signed Phase 0 artifact boundary"; then
   echo "::error file=${BOUNDARY_REL}::signed Phase 0 artifact boundary is missing"
+  exit 1
+fi
+if ! validate_boundary_descriptor "${HEAD_BOUNDARY}"; then
+  echo "::error file=${BOUNDARY_REL}::Phase 0 boundary descriptor is not the complete closed-root policy"
   exit 1
 fi
 if [[ "$(jq -r '.contract' "${HEAD_STATUS}")" != \
@@ -97,8 +117,14 @@ if [[ "$(jq -r '.contract' "${HEAD_STATUS}")" != \
     "${RETIREMENT_HISTORICAL_SHA256}" \
   || "$(jq -r '.phase0_artifact_boundary.theyos_path' "${HEAD_STATUS}")" != \
     "${BOUNDARY_REL}" \
-  || "$(jq -r '.phase0_artifact_boundary.sha256' "${HEAD_STATUS}")" != \
-    "$(sha256_file "${HEAD_BOUNDARY}")" \
+  || "$(jq -r '.phase0_artifact_boundary.format' "${HEAD_STATUS}")" != \
+    "closed-git-subtrees-v1" \
+  || "$(jq -r '.phase0_artifact_boundary.policy_change_control' "${HEAD_STATUS}")" != \
+    "explicit-owner-approved-versioned-transition" \
+  || "$(jq -r '.phase0_artifact_boundary.object_identity_update' "${HEAD_STATUS}")" != \
+    "per-reviewed-commit-attestation" \
+  || "$(jq -r '.phase0_artifact_boundary.release_provenance' "${HEAD_STATUS}")" != \
+    "checker-on-release-subject-and-final-package-attestation" \
   || "$(jq -r '.phase0_artifact_boundary.staged_product' "${HEAD_STATUS}")" != \
     "theyos-engine" \
   || "$(jq -r '.phase0_artifact_boundary.required_published_targets | sort | join(",")' "${HEAD_STATUS}")" != \

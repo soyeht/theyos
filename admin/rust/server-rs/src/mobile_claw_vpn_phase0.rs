@@ -39,7 +39,9 @@ pub fn artifact_contract() -> serde_json::Value {
         "phase": "phase0_compile_out",
         "production_activation": false,
         "mobile_route_prefix": "/api/v1/mobile",
-        "product_a_routes": [STATUS_PATH],
+        "declared_product_a_routes": [STATUS_PATH],
+        "generic_ip_tunnel_router_seam_compiled":
+            cfg!(any(test, feature = "dev_t1_datapath")),
         "generic_ip_tunnel_backend_compiled":
             crate::claw_share_relay_stream_offer_store::IP_TUNNEL_RESOURCE_COMPILED,
         "generic_ip_tunnel_store_accepts_resource":
@@ -89,7 +91,11 @@ mod tests {
         let value = artifact_contract();
         assert_eq!(value["authority"], "none");
         assert_eq!(value["production_activation"], false);
-        assert_eq!(value["product_a_routes"], serde_json::json!([STATUS_PATH]));
+        assert_eq!(
+            value["declared_product_a_routes"],
+            serde_json::json!([STATUS_PATH])
+        );
+        assert_eq!(value["generic_ip_tunnel_router_seam_compiled"], true);
         assert_eq!(
             value["generic_ip_tunnel_backend_compiled"],
             crate::claw_share_relay_stream_offer_store::IP_TUNNEL_RESOURCE_COMPILED

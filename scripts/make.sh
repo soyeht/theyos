@@ -18,6 +18,15 @@ info() { echo "${GREEN}[INFO]${NC} $1"; }
 warn() { echo "${YELLOW}[WARN]${NC} $1"; }
 error() { echo "${RED}[ERROR]${NC} $1"; exit 1; }
 
+run_engine_build_tool() {
+    cargo run \
+        --manifest-path "${RUST_DIR}/Cargo.toml" \
+        --locked \
+        --release \
+        --package theyos-engine-build-rs \
+        -- "$@"
+}
+
 # Detect platform
 detect_platform() {
     case "$(uname -s)" in
@@ -333,7 +342,7 @@ package_soyeht_mac() {
     mkdir -p "${helpers_dir}"
 
     info "Building app engine helpers for macOS arm64 (engine version: ${version})..."
-    "${SCRIPT_DIR}/build-theyos-engine.sh" aarch64-apple-darwin cargo >/dev/null
+    run_engine_build_tool build aarch64-apple-darwin cargo >/dev/null
     (cd "${REPO_ROOT}/admin/rust" && cargo build --release \
         --target aarch64-apple-darwin \
         -p soyeht-rs \
@@ -353,8 +362,15 @@ package_soyeht_mac() {
     }
 
     # Canonical alias: server-rs/server is the shipped theyos-engine.
-    "${SCRIPT_DIR}/stage-theyos-engine.sh" \
-        "${target_dir}" "${helpers_dir}/theyos-engine"
+    run_engine_build_tool stage "${target_dir}" "${helpers_dir}/theyos-engine"
+    if [ -n "${PHASE0_EXPECTED_UNSIGNED_ENGINE_SHA256:-}" ]; then
+        local staged_engine_sha256
+        staged_engine_sha256=$(shasum -a 256 "${helpers_dir}/theyos-engine" | awk '{print $1}')
+        if [ "${staged_engine_sha256}" != "${PHASE0_EXPECTED_UNSIGNED_ENGINE_SHA256}" ]; then
+            error "unsigned staged theyos-engine differs from the Phase 0 verified subject"
+        fi
+        info "  + unsigned theyos-engine matches Phase 0 subject"
+    fi
     copy_helper "theyos-ssh" "theyos-ssh"
     copy_helper "store-ipc" "store-ipc"
     copy_helper "terminal-ipc" "terminal-ipc"
@@ -482,9 +498,9 @@ package_engine_linux() {
 
         info "Building server-rs for ${rust_target}..."
         if command -v cross &>/dev/null; then
-            "${SCRIPT_DIR}/build-theyos-engine.sh" "${rust_target}" cross >/dev/null
+            run_engine_build_tool build "${rust_target}" cross >/dev/null
         else
-            "${SCRIPT_DIR}/build-theyos-engine.sh" "${rust_target}" cargo >/dev/null
+            run_engine_build_tool build "${rust_target}" cargo >/dev/null
         fi
 
         info "Building soyeht CLI for ${rust_target}..."
@@ -505,7 +521,7 @@ package_engine_linux() {
         local stage="${dist_base}/.linux-stage-${arch}"
         rm -rf "${stage}"
         mkdir -p "${stage}"
-        "${SCRIPT_DIR}/stage-theyos-engine.sh" \
+        run_engine_build_tool stage \
             "${rust_dir}/target/${rust_target}/release" "${stage}/theyos-engine"
         cp "${soyeht_src}" "${stage}/soyeht"
         cp "${REPO_ROOT}/scripts/uninstall-linux.sh" "${stage}/uninstall-linux.sh"

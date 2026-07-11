@@ -35,6 +35,8 @@ on:
 permissions:
   contents: write        # gh release create + commit formula back to main
   pull-requests: write   # gh pr create + gh pr merge --admin for formula update
+  id-token: write        # signed provenance for the exact published tarball
+  attestations: write
 
 jobs:
   release-macos:
@@ -50,6 +52,7 @@ jobs:
         uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
         with:
           fetch-depth: 0
+          ref: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.tag || github.ref }}
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@5a814b2e0f75e492da42a3c1227d52112e4dac50 # 1.92.0
@@ -75,6 +78,29 @@ jobs:
             exit 1
           fi
           echo "TAG=$TAG matches Cargo version. OK."
+
+      - name: Verify and stage the unsigned Phase 0 engine
+        id: phase0
+        run: |
+          set -e
+          cargo test \
+            --manifest-path admin/rust/Cargo.toml \
+            --locked \
+            --package server-rs \
+            --test claw_store_wire_contract \
+            mobile_claw_vpn_phase0_ \
+            -- --test-threads=1
+          PHASE0_ATTESTATION="$RUNNER_TEMP/phase0-attestation-aarch64-apple-darwin.json"
+          PHASE0_ENGINE="$RUNNER_TEMP/theyos-engine-aarch64-apple-darwin-unsigned"
+          PHASE0_TARGET=aarch64-apple-darwin \
+          PHASE0_BUILD_TOOL=cargo \
+          PHASE0_CARGO_TARGET_DIR="$GITHUB_WORKSPACE/admin/rust/target" \
+          PHASE0_RUN_ARTIFACT_DIRECT=1 \
+          PHASE0_ATTESTATION_OUT="$PHASE0_ATTESTATION" \
+          PHASE0_STAGED_ENGINE_OUT="$PHASE0_ENGINE" \
+            bash .github/scripts/check-mobile-claw-vpn-owner-present-phase0-compileout.sh
+          echo "attestation=$PHASE0_ATTESTATION" >> "$GITHUB_OUTPUT"
+          echo "unsigned_sha256=$(jq -r '.theyos_engine_sha256' "$PHASE0_ATTESTATION")" >> "$GITHUB_OUTPUT"
 
       - name: Import Developer ID cert into ephemeral keychain
         env:
@@ -110,6 +136,7 @@ jobs:
           APPLE_ID: ${{ secrets.APPLE_ID }}
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
           APPLE_ID_APP_PASSWORD: ${{ secrets.APPLE_ID_APP_PASSWORD }}
+          PHASE0_EXPECTED_UNSIGNED_ENGINE_SHA256: ${{ steps.phase0.outputs.unsigned_sha256 }}
         run: |
           set -e
           ./scripts/make.sh package-soyeht-mac
@@ -153,10 +180,24 @@ jobs:
           # <root>/dist/dist/macos-arm64/... whose parent doesn't exist.
           (cd "$HELPERS_DIR" && tar czf "$GITHUB_WORKSPACE/$TARBALL_PATH" .)
           SHA256=$(shasum -a 256 "$TARBALL_PATH" | awk '{print $1}')
+          SIGNED_ENGINE_SHA256=$(shasum -a 256 "$HELPERS_DIR/theyos-engine" | awk '{print $1}')
+          PHASE0_ATTESTATION="${{ steps.phase0.outputs.attestation }}"
+          RELEASE_PROVENANCE="dist/macos-arm64/theyos-engine-${CARGO_VERSION}-macos-arm64.provenance.json"
+          jq -n -S \
+            --arg schema "theyos-engine-release-provenance-v1" \
+            --arg source_sha "$(git rev-parse HEAD)" \
+            --arg target "aarch64-apple-darwin" \
+            --arg unsigned_engine_sha256 "${{ steps.phase0.outputs.unsigned_sha256 }}" \
+            --arg signed_engine_sha256 "$SIGNED_ENGINE_SHA256" \
+            --arg phase0_attestation_sha256 "$(shasum -a 256 "$PHASE0_ATTESTATION" | awk '{print $1}')" \
+            --arg package_sha256 "$SHA256" \
+            '{schema:$schema,source_sha:$source_sha,target:$target,phase0_unsigned_engine_sha256:$unsigned_engine_sha256,published_signed_engine_sha256:$signed_engine_sha256,phase0_attestation_sha256:$phase0_attestation_sha256,published_package_sha256:$package_sha256}' \
+            > "$RELEASE_PROVENANCE"
           echo "version=$CARGO_VERSION" >> "$GITHUB_OUTPUT"
           echo "tarball_path=$TARBALL_PATH" >> "$GITHUB_OUTPUT"
           echo "tarball_name=$(basename "$TARBALL_PATH")" >> "$GITHUB_OUTPUT"
           echo "sha256=$SHA256" >> "$GITHUB_OUTPUT"
+          echo "release_provenance=$RELEASE_PROVENANCE" >> "$GITHUB_OUTPUT"
 
       - name: Verify Developer ID signature on a sample binary
         # Smoke check that the bytes Apple notarized are the bytes inside
@@ -168,6 +209,8 @@ jobs:
           # don't match the cert chain, we're shipping broken artifacts.
           mkdir -p /tmp/verify
           tar xzf "${{ steps.tarball.outputs.tarball_path }}" -C /tmp/verify ./theyos-engine
+          test "$(shasum -a 256 /tmp/verify/theyos-engine | awk '{print $1}')" = \
+            "$(jq -r '.published_signed_engine_sha256' '${{ steps.tarball.outputs.release_provenance }}')"
           codesign --verify --verbose=4 /tmp/verify/theyos-engine
           # Confirm Developer ID + hardened runtime + stable identifier.
           codesign -dv --verbose=4 /tmp/verify/theyos-engine 2>&1 | tee /tmp/verify/codesign-info.txt
@@ -185,6 +228,11 @@ jobs:
           }
           echo "OK: signature verified."
 
+      - name: Attest the published macOS package
+        uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a # v3
+        with:
+          subject-path: ${{ steps.tarball.outputs.tarball_path }}
+
       - name: Create GitHub Release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -192,11 +240,13 @@ jobs:
           set -e
           NOTES="Automated release. See commit history and PRs merged into main since the previous tag for change details. macOS engine SHA256: \`${{ steps.tarball.outputs.sha256 }}\`"
           ASSET="${{ steps.tarball.outputs.tarball_path }}#theyos-engine-${{ steps.tarball.outputs.version }}-macos-arm64.tar.gz"
+          PROVENANCE="${{ steps.tarball.outputs.release_provenance }}#theyos-engine-${{ steps.tarball.outputs.version }}-macos-arm64.provenance.json"
+          PHASE0="${{ steps.phase0.outputs.attestation }}#theyos-engine-${{ steps.tarball.outputs.version }}-macos-arm64.phase0.json"
           if gh release view "$TAG" >/dev/null 2>&1; then
-            gh release upload "$TAG" "$ASSET" --clobber
+            gh release upload "$TAG" "$ASSET" "$PROVENANCE" "$PHASE0" --clobber
             gh release edit "$TAG" --title "$TAG" --notes "$NOTES"
           else
-            gh release create "$TAG" --title "$TAG" --notes "$NOTES" "$ASSET"
+            gh release create "$TAG" --title "$TAG" --notes "$NOTES" "$ASSET" "$PROVENANCE" "$PHASE0"
           fi
 
       - name: Regenerate Homebrew formula

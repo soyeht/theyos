@@ -22,6 +22,8 @@ on:
 
 permissions:
   contents: write
+  id-token: write
+  attestations: write
 
 jobs:
   build-linux-x86_64:
@@ -36,6 +38,9 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.tag || github.ref }}
+          persist-credentials: false
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@5a814b2e0f75e492da42a3c1227d52112e4dac50 # 1.92.0
@@ -53,8 +58,25 @@ jobs:
 
       - name: Build (release)
         run: |
-          export CLAWS_MANIFEST_YML="$PWD/claws/manifest.yml"
-          ./scripts/build-theyos-engine.sh x86_64-unknown-linux-musl cross
+          cargo test \
+            --manifest-path admin/rust/Cargo.toml \
+            --locked \
+            --package server-rs \
+            --test claw_store_wire_contract \
+            mobile_claw_vpn_phase0_ \
+            -- --test-threads=1
+          PHASE0_ATTESTATION="$RUNNER_TEMP/phase0-attestation-x86_64-unknown-linux-musl.json"
+          PHASE0_ENGINE="$GITHUB_WORKSPACE/admin/rust/dist/.linux-stage-x86_64/theyos-engine"
+          mkdir -p "$(dirname "$PHASE0_ENGINE")"
+          PHASE0_TARGET=x86_64-unknown-linux-musl \
+          PHASE0_BUILD_TOOL=cross \
+          PHASE0_CARGO_TARGET_DIR="$GITHUB_WORKSPACE/admin/rust/target" \
+          PHASE0_RUN_ARTIFACT_DIRECT=1 \
+          PHASE0_ATTESTATION_OUT="$PHASE0_ATTESTATION" \
+          PHASE0_STAGED_ENGINE_OUT="$PHASE0_ENGINE" \
+            bash .github/scripts/check-mobile-claw-vpn-owner-present-phase0-compileout.sh
+          echo "phase0_attestation=$PHASE0_ATTESTATION" >> "$GITHUB_ENV"
+          echo "phase0_engine=$PHASE0_ENGINE" >> "$GITHUB_ENV"
           cross build \
             --manifest-path admin/rust/Cargo.toml \
             --target x86_64-unknown-linux-musl \
@@ -73,12 +95,13 @@ jobs:
           OUTDIR="dist/linux-x86_64"
           STAGE="dist/.linux-stage-x86_64"
           mkdir -p "$OUTDIR"
-          rm -rf "$STAGE"
           mkdir -p "$STAGE"
           BINARY_DIR="target/x86_64-unknown-linux-musl/release"
           BINARY="$BINARY_DIR/server"
           TARBALL="$OUTDIR/theyos-engine-${CARGO_VERSION}-linux-x86_64.tar.gz"
-          ../../scripts/stage-theyos-engine.sh "$BINARY_DIR" "$STAGE/theyos-engine"
+          test -x "$STAGE/theyos-engine"
+          test "$(sha256sum "$STAGE/theyos-engine" | awk '{print $1}')" = \
+            "$(jq -r '.theyos_engine_sha256' "$phase0_attestation")"
           cp "$BINARY_DIR/soyeht" "$STAGE/soyeht"
           cp "$BINARY_DIR/vmrunner_ipc" "$STAGE/vmrunner_ipc"
           cp "$BINARY_DIR/fc-ssh" "$STAGE/fc-ssh"
@@ -90,17 +113,34 @@ jobs:
           printf '%s\n' "$CARGO_VERSION" > "$STAGE/engine-version.txt"
           tar czf "$TARBALL" -C "$STAGE" .
           sha256sum "$TARBALL" > "${TARBALL}.sha256"
+          RELEASE_PROVENANCE="$OUTDIR/theyos-engine-${CARGO_VERSION}-linux-x86_64.provenance.json"
+          jq -n -S \
+            --arg schema "theyos-engine-release-provenance-v1" \
+            --arg source_sha "$(git -C ../.. rev-parse HEAD)" \
+            --arg target "x86_64-unknown-linux-musl" \
+            --arg engine_sha256 "$(sha256sum "$STAGE/theyos-engine" | awk '{print $1}')" \
+            --arg phase0_attestation_sha256 "$(sha256sum "$phase0_attestation" | awk '{print $1}')" \
+            --arg package_sha256 "$(sha256sum "$TARBALL" | awk '{print $1}')" \
+            '{schema:$schema,source_sha:$source_sha,target:$target,phase0_engine_sha256:$engine_sha256,phase0_attestation_sha256:$phase0_attestation_sha256,published_package_sha256:$package_sha256}' \
+            > "$RELEASE_PROVENANCE"
           echo "tarball=$TARBALL" >> "$GITHUB_ENV"
+          echo "release_provenance=$RELEASE_PROVENANCE" >> "$GITHUB_ENV"
           echo "version=$CARGO_VERSION" >> "$GITHUB_ENV"
 
       - name: Smoke-test binary (static musl, x86_64)
         working-directory: admin/rust
         run: |
           set -e
-          BINARY="target/x86_64-unknown-linux-musl/release/server"
+          VERIFY_DIR="$RUNNER_TEMP/verify-linux-x86_64"
+          rm -rf "$VERIFY_DIR"
+          mkdir -p "$VERIFY_DIR"
+          tar xzf "$tarball" -C "$VERIFY_DIR" ./theyos-engine
+          BINARY="$VERIFY_DIR/theyos-engine"
+          test "$(sha256sum "$BINARY" | awk '{print $1}')" = \
+            "$(jq -r '.theyos_engine_sha256' "$phase0_attestation")"
           # --version exits 0 immediately — proves ELF loads, argv is parsed, no linker fault.
           docker run --rm \
-            -v "$(pwd)/$BINARY:/engine" \
+            -v "$BINARY:/engine:ro" \
             --entrypoint /engine \
             alpine:3.20@sha256:d9e853e87e55526f6b2917df91a2115c36dd7c696a35be12163d44e6e2a4b6bc \
             --version
@@ -110,6 +150,11 @@ jobs:
             alpine:3.20@sha256:d9e853e87e55526f6b2917df91a2115c36dd7c696a35be12163d44e6e2a4b6bc \
             uninstall --help
           echo "Smoke test passed: x86_64 binary --version exit 0"
+
+      - name: Attest the published Linux package
+        uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a # v3
+        with:
+          subject-path: admin/rust/${{ env.tarball }}
 
       - name: Upload to GitHub Release
         env:
@@ -126,6 +171,8 @@ jobs:
           gh release upload "$TAG" \
             "admin/rust/${{ env.tarball }}#theyos-engine-${{ env.version }}-linux-x86_64.tar.gz" \
             "admin/rust/${{ env.tarball }}.sha256#theyos-engine-${{ env.version }}-linux-x86_64.tar.gz.sha256" \
+            "admin/rust/${{ env.release_provenance }}#theyos-engine-${{ env.version }}-linux-x86_64.provenance.json" \
+            "${{ env.phase0_attestation }}#theyos-engine-${{ env.version }}-linux-x86_64.phase0.json" \
             --clobber
 
   build-linux-aarch64:
@@ -140,6 +187,9 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.tag || github.ref }}
+          persist-credentials: false
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@5a814b2e0f75e492da42a3c1227d52112e4dac50 # 1.92.0
@@ -157,8 +207,25 @@ jobs:
 
       - name: Cross-compile (release)
         run: |
-          export CLAWS_MANIFEST_YML="$PWD/claws/manifest.yml"
-          ./scripts/build-theyos-engine.sh aarch64-unknown-linux-musl cross
+          cargo test \
+            --manifest-path admin/rust/Cargo.toml \
+            --locked \
+            --package server-rs \
+            --test claw_store_wire_contract \
+            mobile_claw_vpn_phase0_ \
+            -- --test-threads=1
+          PHASE0_ATTESTATION="$RUNNER_TEMP/phase0-attestation-aarch64-unknown-linux-musl.json"
+          PHASE0_ENGINE="$GITHUB_WORKSPACE/admin/rust/dist/.linux-stage-aarch64/theyos-engine"
+          mkdir -p "$(dirname "$PHASE0_ENGINE")"
+          PHASE0_TARGET=aarch64-unknown-linux-musl \
+          PHASE0_BUILD_TOOL=cross \
+          PHASE0_CARGO_TARGET_DIR="$GITHUB_WORKSPACE/admin/rust/target" \
+          PHASE0_RUN_ARTIFACT_DIRECT=0 \
+          PHASE0_ATTESTATION_OUT="$PHASE0_ATTESTATION" \
+          PHASE0_STAGED_ENGINE_OUT="$PHASE0_ENGINE" \
+            bash .github/scripts/check-mobile-claw-vpn-owner-present-phase0-compileout.sh
+          echo "phase0_attestation=$PHASE0_ATTESTATION" >> "$GITHUB_ENV"
+          echo "phase0_engine=$PHASE0_ENGINE" >> "$GITHUB_ENV"
           cross build \
             --manifest-path admin/rust/Cargo.toml \
             --target aarch64-unknown-linux-musl \
@@ -177,12 +244,13 @@ jobs:
           OUTDIR="dist/linux-aarch64"
           STAGE="dist/.linux-stage-aarch64"
           mkdir -p "$OUTDIR"
-          rm -rf "$STAGE"
           mkdir -p "$STAGE"
           BINARY_DIR="target/aarch64-unknown-linux-musl/release"
           BINARY="$BINARY_DIR/server"
           TARBALL="$OUTDIR/theyos-engine-${CARGO_VERSION}-linux-aarch64.tar.gz"
-          ../../scripts/stage-theyos-engine.sh "$BINARY_DIR" "$STAGE/theyos-engine"
+          test -x "$STAGE/theyos-engine"
+          test "$(sha256sum "$STAGE/theyos-engine" | awk '{print $1}')" = \
+            "$(jq -r '.theyos_engine_sha256' "$phase0_attestation")"
           cp "$BINARY_DIR/soyeht" "$STAGE/soyeht"
           cp "$BINARY_DIR/vmrunner_ipc" "$STAGE/vmrunner_ipc"
           cp "$BINARY_DIR/fc-ssh" "$STAGE/fc-ssh"
@@ -194,7 +262,18 @@ jobs:
           printf '%s\n' "$CARGO_VERSION" > "$STAGE/engine-version.txt"
           tar czf "$TARBALL" -C "$STAGE" .
           sha256sum "$TARBALL" > "${TARBALL}.sha256"
+          RELEASE_PROVENANCE="$OUTDIR/theyos-engine-${CARGO_VERSION}-linux-aarch64.provenance.json"
+          jq -n -S \
+            --arg schema "theyos-engine-release-provenance-v1" \
+            --arg source_sha "$(git -C ../.. rev-parse HEAD)" \
+            --arg target "aarch64-unknown-linux-musl" \
+            --arg engine_sha256 "$(sha256sum "$STAGE/theyos-engine" | awk '{print $1}')" \
+            --arg phase0_attestation_sha256 "$(sha256sum "$phase0_attestation" | awk '{print $1}')" \
+            --arg package_sha256 "$(sha256sum "$TARBALL" | awk '{print $1}')" \
+            '{schema:$schema,source_sha:$source_sha,target:$target,phase0_engine_sha256:$engine_sha256,phase0_attestation_sha256:$phase0_attestation_sha256,published_package_sha256:$package_sha256}' \
+            > "$RELEASE_PROVENANCE"
           echo "tarball=$TARBALL" >> "$GITHUB_ENV"
+          echo "release_provenance=$RELEASE_PROVENANCE" >> "$GITHUB_ENV"
           echo "version=$CARGO_VERSION" >> "$GITHUB_ENV"
 
       - name: Setup QEMU (aarch64 emulation)
@@ -206,10 +285,16 @@ jobs:
         working-directory: admin/rust
         run: |
           set -e
-          BINARY="target/aarch64-unknown-linux-musl/release/server"
+          VERIFY_DIR="$RUNNER_TEMP/verify-linux-aarch64"
+          rm -rf "$VERIFY_DIR"
+          mkdir -p "$VERIFY_DIR"
+          tar xzf "$tarball" -C "$VERIFY_DIR" ./theyos-engine
+          BINARY="$VERIFY_DIR/theyos-engine"
+          test "$(sha256sum "$BINARY" | awk '{print $1}')" = \
+            "$(jq -r '.theyos_engine_sha256' "$phase0_attestation")"
           # --version exits 0 immediately — proves ELF loads, argv is parsed, no linker fault.
           docker run --rm --platform linux/arm64 \
-            -v "$(pwd)/$BINARY:/engine" \
+            -v "$BINARY:/engine:ro" \
             --entrypoint /engine \
             alpine:3.20@sha256:d9e853e87e55526f6b2917df91a2115c36dd7c696a35be12163d44e6e2a4b6bc \
             --version
@@ -219,6 +304,11 @@ jobs:
             alpine:3.20@sha256:d9e853e87e55526f6b2917df91a2115c36dd7c696a35be12163d44e6e2a4b6bc \
             uninstall --help
           echo "Smoke test passed: aarch64 binary --version exit 0"
+
+      - name: Attest the published Linux package
+        uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a # v3
+        with:
+          subject-path: admin/rust/${{ env.tarball }}
 
       - name: Upload to GitHub Release
         env:
@@ -235,4 +325,6 @@ jobs:
           gh release upload "$TAG" \
             "admin/rust/${{ env.tarball }}#theyos-engine-${{ env.version }}-linux-aarch64.tar.gz" \
             "admin/rust/${{ env.tarball }}.sha256#theyos-engine-${{ env.version }}-linux-aarch64.tar.gz.sha256" \
+            "admin/rust/${{ env.release_provenance }}#theyos-engine-${{ env.version }}-linux-aarch64.provenance.json" \
+            "${{ env.phase0_attestation }}#theyos-engine-${{ env.version }}-linux-aarch64.phase0.json" \
             --clobber

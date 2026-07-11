@@ -18,8 +18,21 @@ PROTECTED_PATHS=(
   ".github/scripts/check-mobile-claw-vpn-owner-present-contracts.sh"
   ".github/scripts/test-mobile-claw-vpn-owner-present-contracts.sh"
   ".github/workflows/contracts-cross-repo-sync.yml"
+  ".github/workflows/release-linux.yml"
+  ".github/workflows/release-macos.yml"
   "admin/contracts/mobile-claw-vpn/v1/owner_present_wire_authority_status_v1.json"
-  "admin/contracts/mobile-claw-vpn/v1/owner_present_phase0_artifact_boundary_v1.tsv"
+  "admin/rust/.cargo/config.toml"
+  "admin/rust/Cargo.lock"
+  "admin/rust/Cargo.toml"
+  "admin/rust/Cross.toml"
+  "admin/rust/rust-toolchain.toml"
+  "admin/rust/core-rs/build.rs"
+  "admin/rust/household-rs/build.rs"
+  "admin/rust/server-rs/build.rs"
+  "admin/rust/server-rs/Cargo.toml"
+  "admin/rust/theyos-engine-build-rs/Cargo.toml"
+  "admin/rust/theyos-engine-build-rs/src/main.rs"
+  "scripts/make.sh"
 )
 
 mkdir -p "${REPO}"
@@ -44,6 +57,18 @@ PHASE0_INTEGRITY_LOCAL_TEST=1 \
   "${CHECKER}" "${REPO}" "${BASE}" "${HEAD_OK}" 0 >/dev/null
 git -C "${REPO}" switch --quiet "${BRANCH}"
 echo "PASS unrelated_change"
+
+mkdir -p "${REPO}/admin/contracts/mobile-claw-vpn/v1"
+printf '%s\n' '040000 tree 0123456789012345678901234567890123456789 admin/rust' > \
+  "${REPO}/admin/contracts/mobile-claw-vpn/v1/owner_present_phase0_artifact_boundary_v1.tsv"
+git -C "${REPO}" add -A
+git -C "${REPO}" commit --quiet -m boundary-identity-update
+HEAD_OK="$(git -C "${REPO}" rev-parse HEAD)"
+git -C "${REPO}" switch --quiet --detach "${BASE}"
+PHASE0_INTEGRITY_LOCAL_TEST=1 \
+  "${CHECKER}" "${REPO}" "${BASE}" "${HEAD_OK}" 0 >/dev/null
+git -C "${REPO}" switch --quiet "${BRANCH}"
+echo "PASS per_commit_boundary_identity_update"
 
 expect_failure() {
   local label="$1" expected="$2"
@@ -81,9 +106,15 @@ expect_failure authority_status_changed \
 
 git -C "${REPO}" restore --source="${HEAD_OK}" -- \
   "admin/contracts/mobile-claw-vpn/v1/owner_present_wire_authority_status_v1.json"
-printf '%s\n' '100644 deadbeef invalid' > \
-  "${REPO}/admin/contracts/mobile-claw-vpn/v1/owner_present_phase0_artifact_boundary_v1.tsv"
-expect_failure boundary_manifest_changed \
+printf '%s\n' 'run: true' > "${REPO}/.github/workflows/release-linux.yml"
+expect_failure release_recipe_changed \
+  "protected Phase 0 authority differs from trusted base"
+
+git -C "${REPO}" restore --source="${HEAD_OK}" -- \
+  ".github/workflows/release-linux.yml"
+printf '%s\n' 'fn main() {}' > \
+  "${REPO}/admin/rust/theyos-engine-build-rs/src/main.rs"
+expect_failure engine_build_tool_changed \
   "protected Phase 0 authority differs from trusted base"
 
 echo "Phase 0 authority integrity mutation matrix passed."

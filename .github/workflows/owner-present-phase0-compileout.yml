@@ -40,7 +40,7 @@ jobs:
           cargo test --locked -p server-rs --test claw_store_wire_contract phase0_
 
   published-artifact:
-    name: Published artifact (${{ matrix.target }})
+    name: Published-target candidate (${{ matrix.target }})
     strategy:
       fail-fast: false
       matrix:
@@ -116,10 +116,11 @@ jobs:
             | jq -e '
                 .authority == "none"
                 and .production_activation == false
+                and .generic_ip_tunnel_router_seam_compiled == false
                 and .generic_ip_tunnel_backend_compiled == false
                 and .generic_ip_tunnel_store_accepts_resource == false
                 and .generic_ip_tunnel_env_accepts_resource == false
-                and .product_a_routes == ["/claw-vpn/status"]
+                and .declared_product_a_routes == ["/claw-vpn/status"]
               '
 
       - name: Publish Phase 0 attestation
@@ -133,7 +134,7 @@ jobs:
           retention-days: 30
 
   attest-published-artifact:
-    name: Attest published artifact (${{ matrix.target }})
+    name: Attest Phase 0 candidate (${{ matrix.target }})
     if: github.event_name == 'push'
     needs: published-artifact
     strategy:

@@ -28,17 +28,21 @@ MANIFEST_REL="admin/rust/Cargo.toml"
 MARKER_REL="admin/contracts/mobile-claw-vpn/v1/owner_present_runtime_activation_v1.json"
 HISTORICAL_WIRE_REL="admin/contracts/mobile-claw-vpn/v1/owner_present_success_wire_v1.json"
 AUTHORITY_STATUS_REL="admin/contracts/mobile-claw-vpn/v1/owner_present_wire_authority_status_v1.json"
-STAGE_REL="scripts/stage-theyos-engine.sh"
-BUILD_REL="scripts/build-theyos-engine.sh"
+BUILD_TOOL_MANIFEST_REL="admin/rust/theyos-engine-build-rs/Cargo.toml"
+BUILD_TOOL_SOURCE_REL="admin/rust/theyos-engine-build-rs/src/main.rs"
 BOUNDARY_REL="admin/contracts/mobile-claw-vpn/v1/owner_present_phase0_artifact_boundary_v1.tsv"
 
 HEAD_SHA="$(git -C "${THEYOS_DIR}" rev-parse HEAD)"
 HEAD_TREE="$(git -C "${THEYOS_DIR}" rev-parse "${HEAD_SHA}^{tree}")"
 TMP_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/theyos-owner-present-phase0.XXXXXX")"
 trap 'rm -rf "${TMP_ROOT}"' EXIT
-SNAPSHOT="${TMP_ROOT}/source"
-TARGET_DIR="${PHASE0_CARGO_TARGET_DIR:-${SNAPSHOT}/admin/rust/target-phase0}"
-mkdir -p "${SNAPSHOT}"
+SNAPSHOT="${THEYOS_DIR}"
+TARGET_DIR="${PHASE0_CARGO_TARGET_DIR:-${SNAPSHOT}/admin/rust/target}"
+
+if [[ -n "$(git -C "${THEYOS_DIR}" status --porcelain --untracked-files=all)" ]]; then
+  echo "::error::Phase 0 checker requires a clean checkout of the exact head object"
+  exit 1
+fi
 
 require_blob() {
   local path="$1" expected_mode="${2:-100644}"
@@ -65,18 +69,24 @@ sha256_file() {
 
 validate_boundary_manifest() {
   local manifest="${1}" seen_paths="${TMP_ROOT}/boundary-paths.txt"
-  local mode oid path entry expected count=0
+  local mode type oid path entry expected count=0
   : > "${seen_paths}"
 
-  while IFS=$'\t' read -r mode oid path; do
+  while IFS=$'\t' read -r mode type oid path; do
     [[ -z "${mode}" || "${mode}" == \#* ]] && continue
-    if [[ ! "${mode}" =~ ^100(644|755)$ \
+    if [[ ! "${mode}" =~ ^(040000|100644|100755)$ \
+      || ! "${type}" =~ ^(blob|tree)$ \
       || ! "${oid}" =~ ^[0-9a-f]{40}$ \
       || -z "${path}" \
       || "${path}" == /* \
       || "${path}" == *"../"* \
       || "${path}" == *$'\n'* ]]; then
       echo "::error file=${BOUNDARY_REL}::invalid signed Phase 0 boundary entry"
+      exit 1
+    fi
+    if [[ ( "${mode}" == "040000" && "${type}" != "tree" ) \
+      || ( "${mode}" != "040000" && "${type}" != "blob" ) ]]; then
+      echo "::error file=${BOUNDARY_REL}::signed Phase 0 boundary mode/type mismatch"
       exit 1
     fi
     if grep -Fqx -- "${path}" "${seen_paths}"; then
@@ -88,7 +98,7 @@ validate_boundary_manifest() {
     entry="$(git -C "${THEYOS_DIR}" ls-tree \
       --format='%(objectmode)%x09%(objecttype)%x09%(objectname)' \
       "${HEAD_SHA}" -- "${path}")"
-    expected="${mode}"$'\t'"blob"$'\t'"${oid}"
+    expected="${mode}"$'\t'"${type}"$'\t'"${oid}"
     if [[ "${entry}" != "${expected}" ]]; then
       echo "::error file=${path}::signed Phase 0 boundary object differs from ${BOUNDARY_REL}"
       exit 1
@@ -96,25 +106,16 @@ validate_boundary_manifest() {
     count=$((count + 1))
   done < "${manifest}"
 
-  if [[ "${count}" -ne 56 ]]; then
-    echo "::error file=${BOUNDARY_REL}::signed Phase 0 boundary must contain exactly 56 objects"
+  if [[ "${count}" -ne 4 ]]; then
+    echo "::error file=${BOUNDARY_REL}::signed Phase 0 boundary must contain exactly four closed subtrees"
     exit 1
   fi
 
   for path in \
-    "admin/rust/server-rs/src/main.rs" \
-    "admin/rust/server-rs/src/mobile_api_routes.rs" \
-    "admin/rust/server-rs/src/mobile_claw_vpn_phase0.rs" \
-    "admin/rust/server-rs/src/claw_share_relay_stream_mount.rs" \
-    "admin/rust/server-rs/src/claw_share_relay_stream_offer_store.rs" \
-    "admin/rust/server-rs/src/claw_share_relay_stream_runtime.rs" \
-    "admin/rust/server-rs/src/claw_share_relay_stream_target_router.rs" \
-    "admin/rust/server-rs/tests/claw_store_route_contract.rs" \
-    "admin/rust/server-rs/tests/claw_store_wire_contract.rs" \
-    "scripts/build-theyos-engine.sh" \
-    "scripts/stage-theyos-engine.sh" \
-    ".github/workflows/release-linux.yml" \
-    ".github/workflows/release-macos.yml"; do
+    ".github" \
+    "admin/rust" \
+    "claws" \
+    "scripts"; do
     if ! grep -Fqx -- "${path}" "${seen_paths}"; then
       echo "::error file=${BOUNDARY_REL}::required Phase 0 boundary path is absent: ${path}"
       exit 1
@@ -145,6 +146,8 @@ for path in \
   "admin/rust/server-rs/src/claw_store_routes.rs" \
   "admin/rust/server-rs/src/state.rs" \
   "admin/rust/server-rs/src/handlers_mobile.rs" \
+  "${BUILD_TOOL_MANIFEST_REL}" \
+  "${BUILD_TOOL_SOURCE_REL}" \
   "${FOUNDATION_REL}" \
   "${PHASE0_REL}" \
   "admin/contracts/mobile-claw-vpn/v1/api_shapes.json" \
@@ -154,12 +157,45 @@ for path in \
   "${BOUNDARY_REL}"; do
   require_blob "${path}"
 done
-require_blob "${STAGE_REL}" 100755
-require_blob "${BUILD_REL}" 100755
 
 BOUNDARY_MANIFEST="${TMP_ROOT}/phase0-boundary.tsv"
 git -C "${THEYOS_DIR}" cat-file blob "${HEAD_SHA}:${BOUNDARY_REL}" > "${BOUNDARY_MANIFEST}"
 validate_boundary_manifest "${BOUNDARY_MANIFEST}"
+
+RELEASE_CHECKER_REL=".github/scripts/check-mobile-claw-vpn-owner-present-phase0-compileout.sh"
+if [[ "$(grep -Fc "${RELEASE_CHECKER_REL}" "${SNAPSHOT}/.github/workflows/release-linux.yml")" -ne 2 \
+  || "$(grep -Fc "${RELEASE_CHECKER_REL}" "${SNAPSHOT}/.github/workflows/release-macos.yml")" -ne 1 ]]; then
+  echo "::error::every theyos-engine release target must run the Phase 0 checker on its own subject"
+  exit 1
+fi
+if [[ "$(grep -Fc "mobile_claw_vpn_phase0_" "${SNAPSHOT}/.github/workflows/release-linux.yml")" -ne 2 \
+  || "$(grep -Fc "mobile_claw_vpn_phase0_" "${SNAPSHOT}/.github/workflows/release-macos.yml")" -ne 1 ]]; then
+  echo "::error::every release target must exercise the exact Phase 0 route composer"
+  exit 1
+fi
+for release_path in \
+  ".github/workflows/release-linux.yml" \
+  ".github/workflows/release-macos.yml"; do
+  if ! grep -Fq \
+      "actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a" \
+      "${SNAPSHOT}/${release_path}"; then
+    echo "::error file=${release_path}::published package provenance attestation is missing"
+    exit 1
+  fi
+done
+if ! grep -Fq "phase0_engine_sha256" "${SNAPSHOT}/.github/workflows/release-linux.yml" \
+  || ! grep -Fq "published_signed_engine_sha256" \
+    "${SNAPSHOT}/.github/workflows/release-macos.yml" \
+  || ! grep -Fq "PHASE0_EXPECTED_UNSIGNED_ENGINE_SHA256" \
+    "${SNAPSHOT}/scripts/make.sh"; then
+  echo "::error::release provenance does not bind the verified engine to the published package"
+  exit 1
+fi
+if git -C "${THEYOS_DIR}" cat-file -e \
+    "${HEAD_SHA}:admin/rust/theyos-engine-build-rs/build.rs" 2>/dev/null; then
+  echo "::error::the canonical engine build tool must not have a build.rs codegen seam"
+  exit 1
+fi
 
 for retired_path in \
   "admin/rust/server-rs/src/mobile_claw_vpn_relay_auth.rs" \
@@ -176,8 +212,6 @@ if git -C "${THEYOS_DIR}" cat-file -e "${HEAD_SHA}:${MARKER_REL}" 2>/dev/null; t
   echo "::error file=${MARKER_REL}::Phase 0 forbids an owner-present activation marker"
   exit 1
 fi
-
-git -C "${THEYOS_DIR}" archive --format=tar "${HEAD_SHA}" | tar -xf - -C "${SNAPSHOT}"
 
 HISTORICAL_WIRE="${SNAPSHOT}/${HISTORICAL_WIRE_REL}"
 AUTHORITY_STATUS="${SNAPSHOT}/${AUTHORITY_STATUS_REL}"
@@ -198,8 +232,14 @@ if [[ "$(jq -r '.contract' "${AUTHORITY_STATUS}")" != \
     "$(sha256_file "${SNAPSHOT}/admin/contracts/mobile-claw-vpn/v1/api_shapes.json")" \
   || "$(jq -r '.phase0_artifact_boundary.theyos_path' "${AUTHORITY_STATUS}")" != \
     "${BOUNDARY_REL}" \
-  || "$(jq -r '.phase0_artifact_boundary.sha256' "${AUTHORITY_STATUS}")" != \
-    "$(sha256_file "${SNAPSHOT}/${BOUNDARY_REL}")" \
+  || "$(jq -r '.phase0_artifact_boundary.format' "${AUTHORITY_STATUS}")" != \
+    "closed-git-subtrees-v1" \
+  || "$(jq -r '.phase0_artifact_boundary.policy_change_control' "${AUTHORITY_STATUS}")" != \
+    "explicit-owner-approved-versioned-transition" \
+  || "$(jq -r '.phase0_artifact_boundary.object_identity_update' "${AUTHORITY_STATUS}")" != \
+    "per-reviewed-commit-attestation" \
+  || "$(jq -r '.phase0_artifact_boundary.release_provenance' "${AUTHORITY_STATUS}")" != \
+    "checker-on-release-subject-and-final-package-attestation" \
   || "$(jq -r '.phase0_artifact_boundary.staged_product' "${AUTHORITY_STATUS}")" != \
     "theyos-engine" \
   || "$(jq -r '.phase0_artifact_boundary.required_published_targets | sort | join(",")' "${AUTHORITY_STATUS}")" != \
@@ -232,16 +272,25 @@ for forbidden_authority in \
   fi
 done
 
-if rg -n \
+if grep -ERn \
+  --include='*.rs' \
   'pub (async )?fn handle_(admin_)?mobile_claw_vpn_(mint|consume|authorize|enroll|set|grant|revoke)' \
   "${SNAPSHOT}/admin/rust/server-rs/src" >/dev/null; then
   echo "::error::Phase 0 production source exports a retired Mobile Claw VPN effect handler"
   exit 1
 fi
 
-THEYOS_BUILD_GIT_SHA="${HEAD_SHA}" \
-CARGO_TARGET_DIR="${TARGET_DIR}" \
-  "${SNAPSHOT}/${BUILD_REL}" "${TARGET}" "${BUILD_TOOL}" >/dev/null
+(
+  cd "${SNAPSHOT}/admin/rust"
+  THEYOS_BUILD_GIT_SHA="${HEAD_SHA}" \
+  CARGO_TARGET_DIR="${TARGET_DIR}" \
+    cargo run \
+      --manifest-path Cargo.toml \
+      --locked \
+      --release \
+      --package theyos-engine-build-rs \
+      -- build "${TARGET}" "${BUILD_TOOL}" >/dev/null
+)
 
 BINARY_DIR="${TARGET_DIR}/${TARGET}/release"
 BINARY="${BINARY_DIR}/server"
@@ -256,7 +305,15 @@ if [[ ! -f "${DEPFILE}" ]]; then
   exit 1
 fi
 
-"${SNAPSHOT}/${STAGE_REL}" "${BINARY_DIR}" "${STAGED_ENGINE}"
+(
+  cd "${SNAPSHOT}/admin/rust"
+  cargo run \
+    --manifest-path Cargo.toml \
+    --locked \
+    --release \
+    --package theyos-engine-build-rs \
+    -- stage "${BINARY_DIR}" "${STAGED_ENGINE}"
+)
 if ! cmp -s "${BINARY}" "${STAGED_ENGINE}"; then
   echo "::error::staged theyos-engine is not byte-identical to server-rs/server"
   exit 1
@@ -311,11 +368,12 @@ if [[ "${TARGET}" == "${HOST_TARGET}" || "${PHASE0_RUN_ARTIFACT_DIRECT:-0}" == "
       "theyos-owner-present-phase0-artifact-contract-v1" \
     || "$(jq -r '.authority' "${CONTRACT_JSON}")" != "none" \
     || "$(jq -r '.production_activation' "${CONTRACT_JSON}")" != "false" \
+    || "$(jq -r '.generic_ip_tunnel_router_seam_compiled' "${CONTRACT_JSON}")" != "false" \
     || "$(jq -r '.generic_ip_tunnel_backend_compiled' "${CONTRACT_JSON}")" != "false" \
     || "$(jq -r '.generic_ip_tunnel_store_accepts_resource' "${CONTRACT_JSON}")" != "false" \
     || "$(jq -r '.generic_ip_tunnel_env_accepts_resource' "${CONTRACT_JSON}")" != "false" \
-    || "$(jq -r '.product_a_routes | length' "${CONTRACT_JSON}")" != "1" \
-    || "$(jq -r '.product_a_routes[0]' "${CONTRACT_JSON}")" != \
+    || "$(jq -r '.declared_product_a_routes | length' "${CONTRACT_JSON}")" != "1" \
+    || "$(jq -r '.declared_product_a_routes[0]' "${CONTRACT_JSON}")" != \
       "/claw-vpn/status" ]]; then
     echo "::error::published theyos-engine Phase 0 artifact contract is not status-only"
     exit 1
@@ -333,11 +391,23 @@ while IFS= read -r forbidden; do
   fi
 done <<'FORBIDDEN'
 /api/v1/mobile/claw-vpn/owner-present/
+/api/v1/mobile/claw-vpn/offers
+/api/v1/mobile/claw-vpn/sessions
+/api/v1/mobile/claw-vpn/rendezvous/authorize
+/api/v1/mobile/claw-vpn/owner/enroll-device
+/api/v1/mobile/claw-vpn/owner/claw-availability
+/api/v1/mobile/claw-vpn/owner/grant
+/api/v1/mobile/claw-vpn/owner/revoke-grant
 mesh_c_owner_present_offer_control
 RevalidatedCapability
 ConsumedCapability
 PointOfUsePermit
 owner_approval_consumed
+RelayStreamIpTunnelRouter
+RelayStreamIpTunnelTarget
+new_with_ip_tunnel_router
+bind_relay_stream_reverse_connect_with_ip_tunnel_router
+assemble_relay_stream_live_with_ip_tunnel_router
 FORBIDDEN
 
 NORMALIZED_DEPFILE="${TMP_ROOT}/server.normalized.d"
@@ -375,8 +445,8 @@ jq -n -S \
   --arg server_manifest_sha256 "$(sha256_file "${SNAPSHOT}/admin/rust/server-rs/Cargo.toml")" \
   --arg server_build_rs_sha256 "$(sha256_file "${SNAPSHOT}/admin/rust/server-rs/build.rs")" \
   --arg boundary_manifest_sha256 "$(sha256_file "${SNAPSHOT}/${BOUNDARY_REL}")" \
-  --arg build_recipe_sha256 "$(sha256_file "${SNAPSHOT}/${BUILD_REL}")" \
-  --arg stage_recipe_sha256 "$(sha256_file "${SNAPSHOT}/${STAGE_REL}")" \
+  --arg engine_build_tool_manifest_sha256 "$(sha256_file "${SNAPSHOT}/${BUILD_TOOL_MANIFEST_REL}")" \
+  --arg engine_build_tool_source_sha256 "$(sha256_file "${SNAPSHOT}/${BUILD_TOOL_SOURCE_REL}")" \
   --arg depfile_sha256 "$(sha256_file "${NORMALIZED_DEPFILE}")" \
   --arg server_sha256 "$(sha256_file "${BINARY}")" \
   --arg theyos_engine_sha256 "$(sha256_file "${STAGED_ENGINE}")" \
@@ -404,8 +474,8 @@ jq -n -S \
     server_manifest_sha256: $server_manifest_sha256,
     server_build_rs_sha256: $server_build_rs_sha256,
     boundary_manifest_sha256: $boundary_manifest_sha256,
-    build_recipe_sha256: $build_recipe_sha256,
-    stage_recipe_sha256: $stage_recipe_sha256,
+    engine_build_tool_manifest_sha256: $engine_build_tool_manifest_sha256,
+    engine_build_tool_source_sha256: $engine_build_tool_source_sha256,
     depfile_sha256: $depfile_sha256,
     server_sha256: $server_sha256,
     theyos_engine_sha256: $theyos_engine_sha256,

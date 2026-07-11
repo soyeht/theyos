@@ -70,9 +70,13 @@ write_sources() {
 JSON
   local contract_sha
   contract_sha="$(sha256_file "${repo}/${CONTRACT_REL}")"
-  printf '%s\n' '# synthetic-phase0-boundary' > "${repo}/${BOUNDARY_REL}"
-  local boundary_sha
-  boundary_sha="$(sha256_file "${repo}/${BOUNDARY_REL}")"
+  cat > "${repo}/${BOUNDARY_REL}" <<'TSV'
+# synthetic-phase0-boundary
+040000	tree	1111111111111111111111111111111111111111	.github
+040000	tree	2222222222222222222222222222222222222222	admin/rust
+040000	tree	3333333333333333333333333333333333333333	claws
+040000	tree	4444444444444444444444444444444444444444	scripts
+TSV
   cat > "${repo}/${STATUS_REL}" <<JSON
 {
   "contract": "soyeht-mobile-claw-vpn-owner-present-wire-authority-status-v1",
@@ -91,7 +95,10 @@ JSON
   },
   "phase0_artifact_boundary": {
     "theyos_path": "${BOUNDARY_REL}",
-    "sha256": "${boundary_sha}",
+    "format": "closed-git-subtrees-v1",
+    "policy_change_control": "explicit-owner-approved-versioned-transition",
+    "object_identity_update": "per-reviewed-commit-attestation",
+    "release_provenance": "checker-on-release-subject-and-final-package-attestation",
     "staged_product": "theyos-engine",
     "required_published_targets": [
       "x86_64-unknown-linux-musl",

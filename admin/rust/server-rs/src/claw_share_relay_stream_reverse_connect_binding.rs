@@ -24,8 +24,10 @@ use household_rs::ids::HouseholdId;
 use crate::claw_share_relay_stream_contract::RelayStreamOfferContract;
 use crate::claw_share_relay_stream_issuer_trust::RelayStreamIssuerTrust;
 use crate::claw_share_relay_stream_responder::ResponderDataTunnelDeps;
+#[cfg(any(test, feature = "dev_t1_datapath"))]
+use crate::claw_share_relay_stream_target_router::RelayStreamIpTunnelRouter;
 use crate::claw_share_relay_stream_target_router::{
-    RelayStreamIpTunnelRouter, RelayStreamIpTunnelUnavailableRouter, RelayStreamOfferTargetRouter,
+    RelayStreamIpTunnelUnavailableRouter, RelayStreamOfferTargetRouter,
 };
 
 /// One offer bound to its target router and data-tunnel deps for a single
@@ -74,19 +76,19 @@ where
     P: ClawTargetRouter,
     S: ClawTargetRouter,
 {
-    bind_relay_stream_reverse_connect_with_ip_tunnel_router(
-        offer,
-        trust,
-        household_id,
-        slots,
-        replay,
+    let router = RelayStreamOfferTargetRouter::new(
+        (*offer).clone(),
+        trust.clone(),
+        Arc::clone(&slots),
         pty_router,
         clawsite_router,
-        RelayStreamIpTunnelUnavailableRouter,
         now_unix,
-    )
+    );
+    let deps = ResponderDataTunnelDeps::new(household_id, Arc::clone(&slots), replay, router);
+    RelayStreamReverseConnectBinding { offer, trust, deps }
 }
 
+#[cfg(any(test, feature = "dev_t1_datapath"))]
 #[allow(clippy::too_many_arguments, clippy::needless_pass_by_value)]
 pub fn bind_relay_stream_reverse_connect_with_ip_tunnel_router<P, S, I>(
     offer: Arc<RelayStreamOfferContract>,
