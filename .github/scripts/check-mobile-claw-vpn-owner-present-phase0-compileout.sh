@@ -102,7 +102,7 @@ done
 
 EXPECTED_RUST="$(sed -n 's/^channel = "\([^"]*\)"/\1/p' \
   "${THEYOS_DIR}/admin/rust/rust-toolchain.toml")"
-RUSTC_VERBOSE="$(rustc -vV)"
+RUSTC_VERBOSE="$(cd "${THEYOS_DIR}/admin/rust" && rustc -vV)"
 ACTUAL_RUST="$(printf '%s\n' "${RUSTC_VERBOSE}" | sed -n 's/^release: //p')"
 RUSTC_HOST="$(printf '%s\n' "${RUSTC_VERBOSE}" | sed -n 's/^host: //p')"
 if [[ -z "${EXPECTED_RUST}" || "${ACTUAL_RUST}" != "${EXPECTED_RUST}" ]]; then
