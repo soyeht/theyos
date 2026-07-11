@@ -111,6 +111,10 @@ pub mod mobile_claw_vpn_relay_auth;
 pub mod mobile_claw_vpn_relay_dial_config;
 pub mod mobile_claw_vpn_relay_responder;
 pub mod mobile_claw_vpn_relay_responder_config;
+// This foundation is intentionally unreachable outside its own module until
+// the separately reviewed owner-present wiring slice changes its visibility.
+#[allow(dead_code)]
+mod mobile_claw_vpn_owner_present_foundation;
 pub mod mobile_token;
 pub mod nonce_cache;
 pub mod owner_cert_auth;
