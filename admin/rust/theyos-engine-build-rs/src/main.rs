@@ -233,11 +233,9 @@ fn build_engine(target: &str, build_tool: &str) -> Result<(), String> {
         let claws_dir = claws_dir
             .to_str()
             .ok_or("canonical Claw manifest path is not valid Unicode")?;
-        let mount = shell_word(&format!("--volume={claws_dir}:/claws:ro"));
-        build.env(
-            "CROSS_CONTAINER_OPTS",
-            format!("{mount} --env=CLAWS_CATALOG_JSON=/tmp/theyos-claws-catalog.json"),
-        );
+        build
+            .env_remove("PKG_CONFIG_PATH")
+            .env("CROSS_CONTAINER_OPTS", cross_container_opts(claws_dir));
     }
     let status = build
         .status()
@@ -322,6 +320,14 @@ fn shell_word(value: &str) -> String {
     } else {
         format!("'{}'", value.replace('\'', "'\\''"))
     }
+}
+
+fn cross_container_opts(claws_dir: &str) -> String {
+    let mount = shell_word(&format!("--volume={claws_dir}:/claws:ro"));
+    format!(
+        "{mount} --env=CLAWS_CATALOG_JSON=/tmp/theyos-claws-catalog.json \
+         --env=PKG_CONFIG_PATH="
+    )
 }
 
 fn reject_ancestor_cargo_configs(repo_root: &Path) -> Result<(), String> {
@@ -523,7 +529,7 @@ fn files_equal(left: &Path, right: &Path) -> Result<bool, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{is_unsafe_build_env, shell_word};
+    use super::{cross_container_opts, is_unsafe_build_env, shell_word};
 
     #[test]
     fn shell_word_preserves_container_option_as_one_argument() {
@@ -553,5 +559,15 @@ mod tests {
         assert!(!is_unsafe_build_env("CARGO_TARGET_DIR"));
         assert!(!is_unsafe_build_env("PKG_CONFIG_PATH"));
         assert!(!is_unsafe_build_env("RUSTUP_TOOLCHAIN"));
+    }
+
+    #[test]
+    fn cross_options_mount_only_canonical_inputs_and_clear_host_pkg_config() {
+        assert_eq!(
+            cross_container_opts("/repo/claws"),
+            "--volume=/repo/claws:/claws:ro \
+             --env=CLAWS_CATALOG_JSON=/tmp/theyos-claws-catalog.json \
+             --env=PKG_CONFIG_PATH="
+        );
     }
 }
