@@ -108,6 +108,38 @@ fi
 grep -Fq "CROSS_CONTAINER_OPTS must be unset" "${TMP_ROOT}/cross-env.log"
 echo "PASS external_cross_container_opts_refused"
 
+BUILD_TOOL_BIN="${SHARED_TARGET}/release/theyos-engine-build"
+if [ ! -x "${BUILD_TOOL_BIN}" ]; then
+  echo "error: canonical build helper was not produced by the env tooth" >&2
+  exit 1
+fi
+if CARGO_TARGET_AARCH64_APPLE_DARWIN_RUSTFLAGS='--cfg feature="dev_t1_datapath" --cfg feature="dev_claw_share_mint" -C debug-assertions=yes' \
+    CARGO_TARGET_DIR="${SHARED_TARGET}" \
+    "${BUILD_TOOL_BIN}" build "${HOST_TARGET}" cargo \
+    >"${TMP_ROOT}/target-rustflags.log" 2>&1; then
+  echo "error: canonical build accepted target-specific Rust flags" >&2
+  exit 1
+fi
+grep -Fq \
+  "CARGO_TARGET_AARCH64_APPLE_DARWIN_RUSTFLAGS must be unset" \
+  "${TMP_ROOT}/target-rustflags.log"
+echo "PASS target_specific_rustflags_refused"
+
+UNTRUSTED_CARGO_HOME="${TMP_ROOT}/untrusted-cargo-home"
+mkdir -p "${UNTRUSTED_CARGO_HOME}"
+printf '%s\n' '[build]' 'rustflags = ["--cfg", "owner_present_hidden"]' > \
+  "${UNTRUSTED_CARGO_HOME}/config.toml"
+if CARGO_HOME="${UNTRUSTED_CARGO_HOME}" \
+    CARGO_TARGET_DIR="${SHARED_TARGET}" \
+    "${BUILD_TOOL_BIN}" build "${HOST_TARGET}" cargo \
+    >"${TMP_ROOT}/cargo-home-config.log" 2>&1; then
+  echo "error: canonical build accepted a Cargo home config" >&2
+  exit 1
+fi
+grep -Fq "canonical theyos-engine build forbids Cargo home config" \
+  "${TMP_ROOT}/cargo-home-config.log"
+echo "PASS cargo_home_config_refused"
+
 module_crossing="${TMP_ROOT}/module-crossing"
 clone_head "${module_crossing}"
 perl -0pi -e \
@@ -234,6 +266,16 @@ commit_mutation "${ancestor_cargo_config}" ancestor-cargo-config
 expect_checker_failure ancestor_cargo_config \
   "canonical theyos-engine build forbids ancestor Cargo config" \
   "${ancestor_cargo_config}"
+
+workspace_cargo_alias="${TMP_ROOT}/workspace-cargo-alias"
+clone_head "${workspace_cargo_alias}"
+printf '%s\n' '[net]' 'retry = 2' > \
+  "${workspace_cargo_alias}/admin/rust/.cargo/config"
+refresh_boundary_tree_entry "${workspace_cargo_alias}" "admin/rust"
+commit_mutation "${workspace_cargo_alias}" workspace-cargo-alias
+expect_checker_failure workspace_cargo_alias \
+  "canonical theyos-engine build forbids ancestor Cargo config: admin/rust/.cargo/config" \
+  "${workspace_cargo_alias}"
 
 recipe_drift="${TMP_ROOT}/recipe-drift"
 clone_head "${recipe_drift}"

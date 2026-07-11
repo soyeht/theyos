@@ -330,6 +330,7 @@ fn reject_ancestor_cargo_configs(repo_root: &Path) -> Result<(), String> {
         ".cargo/config.toml",
         "admin/.cargo/config",
         "admin/.cargo/config.toml",
+        "admin/rust/.cargo/config",
     ] {
         let path = repo_root.join(relative);
         if fs::symlink_metadata(&path).is_ok() {

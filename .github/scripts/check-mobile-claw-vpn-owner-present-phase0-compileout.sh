@@ -68,6 +68,63 @@ sha256_file() {
   fi
 }
 
+is_unsafe_parent_build_env() {
+  local name="$1"
+  case "${name}" in
+    CARGO_TARGET_DIR|PKG_CONFIG_PATH|RUSTUP_TOOLCHAIN) return 1 ;;
+    AR|BINDGEN_EXTRA_CLANG_ARGS|CC|CFLAGS|CPP|CPPFLAGS|CXX|CXXFLAGS|\
+    DEVELOPER_DIR|DOCKER_OPTS|LD|LDFLAGS|MACOSX_DEPLOYMENT_TARGET|RANLIB|\
+    RUSTFLAGS|RUSTDOCFLAGS|SDKROOT|CARGO_ENCODED_RUSTFLAGS|RUSTC|RUSTDOC|\
+    RUSTC_WRAPPER|RUSTC_WORKSPACE_WRAPPER|CARGO_BUILD_*|CARGO_PROFILE_*|\
+    CARGO_TARGET_*|CROSS_*|AR_*|CC_*|CFLAGS_*|CXX_*|CXXFLAGS_*|\
+    LDFLAGS_*|PKG_CONFIG_*|*_AR|*_CC|*_CFLAGS|*_CXX|*_CXXFLAGS|*_LD|\
+    *_LDFLAGS|*_RANLIB) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+while IFS= read -r name; do
+  if is_unsafe_parent_build_env "${name}" && [[ -n "${!name}" ]]; then
+    echo "::error::${name} must be unset for the canonical theyos-engine build"
+    exit 1
+  fi
+done < <(compgen -e)
+
+CARGO_HOME_DIR="${CARGO_HOME:-${HOME:?HOME is required for the canonical build}/.cargo}"
+for cargo_home_config in \
+  "${CARGO_HOME_DIR}/config" \
+  "${CARGO_HOME_DIR}/config.toml"; do
+  if [[ -e "${cargo_home_config}" || -L "${cargo_home_config}" ]]; then
+    echo "::error::canonical theyos-engine build forbids Cargo home config: ${cargo_home_config}"
+    exit 1
+  fi
+done
+
+EXPECTED_RUST="$(sed -n 's/^channel = "\([^"]*\)"/\1/p' \
+  "${THEYOS_DIR}/admin/rust/rust-toolchain.toml")"
+RUSTC_VERBOSE="$(rustc -vV)"
+ACTUAL_RUST="$(printf '%s\n' "${RUSTC_VERBOSE}" | sed -n 's/^release: //p')"
+RUSTC_HOST="$(printf '%s\n' "${RUSTC_VERBOSE}" | sed -n 's/^host: //p')"
+if [[ -z "${EXPECTED_RUST}" || "${ACTUAL_RUST}" != "${EXPECTED_RUST}" ]]; then
+  echo "::error::canonical theyos-engine build requires the pinned Rust toolchain"
+  exit 1
+fi
+if [[ -n "${RUSTUP_TOOLCHAIN:-}" \
+  && "${RUSTUP_TOOLCHAIN}" != "${EXPECTED_RUST}" \
+  && "${RUSTUP_TOOLCHAIN}" != "${EXPECTED_RUST}-${RUSTC_HOST}" ]]; then
+  echo "::error::RUSTUP_TOOLCHAIN must select the pinned toolchain"
+  exit 1
+fi
+TRACKED_PKG_CONFIG_PATH="$(sed -n \
+  's/^PKG_CONFIG_PATH = "\([^"]*\)"/\1/p' \
+  "${THEYOS_DIR}/admin/rust/.cargo/config.toml")"
+if [[ -z "${TRACKED_PKG_CONFIG_PATH}" \
+  || ( -n "${PKG_CONFIG_PATH:-}" \
+    && "${PKG_CONFIG_PATH}" != "${TRACKED_PKG_CONFIG_PATH}" ) ]]; then
+  echo "::error::PKG_CONFIG_PATH differs from the frozen workspace Cargo config"
+  exit 1
+fi
+
 validate_boundary_manifest() {
   local manifest="${1}" seen_paths="${TMP_ROOT}/boundary-paths.txt"
   local mode type oid path entry expected count=0
@@ -157,6 +214,19 @@ for path in \
   "${AUTHORITY_STATUS_REL}" \
   "${BOUNDARY_REL}"; do
   require_blob "${path}"
+done
+
+for prohibited_config in \
+  ".cargo/config" \
+  ".cargo/config.toml" \
+  "admin/.cargo/config" \
+  "admin/.cargo/config.toml" \
+  "admin/rust/.cargo/config"; do
+  if git -C "${THEYOS_DIR}" cat-file -e \
+      "${HEAD_SHA}:${prohibited_config}" 2>/dev/null; then
+    echo "::error::canonical theyos-engine build forbids ancestor Cargo config: ${prohibited_config}"
+    exit 1
+  fi
 done
 
 if git -C "${THEYOS_DIR}" cat-file -e \
