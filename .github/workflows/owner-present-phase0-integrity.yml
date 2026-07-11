@@ -1,0 +1,36 @@
+name: Owner-Present Phase 0 Authority Integrity
+
+# The trusted base workflow reads PR objects but never checks out or executes
+# code from the PR head.
+on:
+  pull_request_target:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  base-owned-integrity:
+    name: Owner-present base-owned integrity
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout trusted base
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Compare protected authority objects
+        shell: bash
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          bash .github/scripts/test-mobile-claw-vpn-owner-present-phase0-integrity.sh
+          bash .github/scripts/check-mobile-claw-vpn-owner-present-phase0-integrity.sh \
+            "${GITHUB_WORKSPACE}" "${BASE_SHA}" "${HEAD_SHA}" "${PR_NUMBER}"

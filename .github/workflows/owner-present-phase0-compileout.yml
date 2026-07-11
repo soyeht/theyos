@@ -1,0 +1,35 @@
+name: Owner-Present Phase 0 Compile-Out
+
+# This is an artifact/build-graph authority, not a source-keyword scanner.
+# It runs for every PR and every main push so path-filter truncation cannot
+# suppress the Phase 0 proof.
+on:
+  pull_request:
+    branches:
+      - main
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  phase0-compileout:
+    name: Owner-present production compile-out
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout theyos
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
+        with:
+          persist-credentials: false
+
+      - name: Exercise compile-out mutations
+        shell: bash
+        run: bash .github/scripts/test-mobile-claw-vpn-owner-present-phase0-compileout.sh
+
+      - name: Build and verify production artifact
+        shell: bash
+        run: bash .github/scripts/check-mobile-claw-vpn-owner-present-phase0-compileout.sh

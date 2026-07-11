@@ -1,0 +1,37 @@
+{
+  "contract": "soyeht-mobile-claw-vpn-owner-present-wire-authority-status-v1",
+  "version": 1,
+  "phase": "phase0-compile-out",
+  "authority": "none",
+  "retired_wire": {
+    "contract": "soyeht-mobile-claw-vpn-owner-present-success-wire-v1",
+    "version": 1,
+    "theyos_path": "admin/contracts/mobile-claw-vpn/v1/owner_present_success_wire_v1.json",
+    "ios_path": "Packages/SoyehtCore/Tests/SoyehtCoreTests/Fixtures/mobile-claw-vpn/v1/owner_present_success_wire_v1.json",
+    "prior_authoritative_sha256": "ff9ad533567e29261ecbd8e11e84e9490f1829bd4d2e5b50fe8783dc82b000d1",
+    "historical_sha256": "a9eb0fdce49fde3ce8b85ceeb5e9356145a8a1040eca5221b315ee8fd4ea2ed7",
+    "status": "historical-test-only-non-authoritative",
+    "prohibited_production_authority": [
+      "proof_token",
+      "proof-bearing mint request",
+      "owner_present_runtime_activation_v1"
+    ]
+  },
+  "phase1_blocker": {
+    "minimum_wire_version": 2,
+    "required_shape": "server-held-finish-consume-mint",
+    "client_receives": [
+      "non-authoritative operation handle",
+      "count-only status"
+    ],
+    "client_must_not_receive": [
+      "bearer whose possession authorizes mint",
+      "proof_token"
+    ]
+  },
+  "notes": [
+    "The V1 success fixture remains only as immutable cross-language regression evidence.",
+    "Neither owner_present_error_wire_v1 nor a V1 activation marker authorizes runtime, client, handler, issuer, or route wiring.",
+    "Phase 1 requires a separately reviewed V2 contract and cannot be opened by this status object."
+  ]
+}

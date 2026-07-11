@@ -10,10 +10,20 @@ trap 'rm -rf "${TMP_DIR}"' EXIT
 
 SOURCE_ROOT="admin/contracts/mobile-claw-vpn/v1"
 CONTRACT_REL="${SOURCE_ROOT}/owner_present_success_wire_v1.json"
+STATUS_REL="${SOURCE_ROOT}/owner_present_wire_authority_status_v1.json"
 WORKFLOW_REL=".github/workflows/contracts-cross-repo-sync.yml"
 PIN_REL="scripts/cross-repo-contract.sha"
 VENDOR_ROOT="Packages/SoyehtCore/Tests/SoyehtCoreTests/Fixtures/guard-test"
 CONTRACT_VENDOR_REL="Packages/SoyehtCore/Tests/SoyehtCoreTests/Fixtures/mobile-claw-vpn/v1/owner_present_success_wire_v1.json"
+STATUS_VENDOR_REL="Packages/SoyehtCore/Tests/SoyehtCoreTests/Fixtures/mobile-claw-vpn/v1/owner_present_wire_authority_status_v1.json"
+
+sha256_file() {
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$1" | awk '{print $1}'
+  else
+    shasum -a 256 "$1" | awk '{print $1}'
+  fi
+}
 
 new_repo() {
   local repo="$1"
@@ -40,6 +50,7 @@ write_sources() {
   printf '%s\n' '{"fixture":"three"}' > "${repo}/${SOURCE_ROOT}/guard_dep_three.json"
   cat > "${repo}/${CONTRACT_REL}" <<'JSON'
 {
+  "authority_status": "historical-test-only-non-authoritative",
   "dependencies": [
     {
       "theyos_path": "admin/contracts/mobile-claw-vpn/v1/guard_dep_one.json",
@@ -56,6 +67,24 @@ write_sources() {
   ]
 }
 JSON
+  local contract_sha
+  contract_sha="$(sha256_file "${repo}/${CONTRACT_REL}")"
+  cat > "${repo}/${STATUS_REL}" <<JSON
+{
+  "contract": "soyeht-mobile-claw-vpn-owner-present-wire-authority-status-v1",
+  "phase": "phase0-compile-out",
+  "authority": "none",
+  "retired_wire": {
+    "prior_authoritative_sha256": "${contract_sha}",
+    "historical_sha256": "${contract_sha}",
+    "status": "historical-test-only-non-authoritative"
+  },
+  "phase1_blocker": {
+    "minimum_wire_version": 2,
+    "required_shape": "server-held-finish-consume-mint"
+  }
+}
+JSON
 }
 
 write_workflow() {
@@ -67,6 +96,7 @@ paths:
   - "${SOURCE_ROOT}/guard_dep_two.json"
   - "${SOURCE_ROOT}/guard_dep_three.json"
   - "${CONTRACT_REL}"
+  - "${STATUS_REL}"
 EOF
 }
 
@@ -85,6 +115,7 @@ write_vendors() {
   if [[ "${include_contract}" == "1" ]]; then
     mkdir -p "${ios}/$(dirname "${CONTRACT_VENDOR_REL}")"
     cp "${theyos}/${CONTRACT_REL}" "${ios}/${CONTRACT_VENDOR_REL}"
+    cp "${theyos}/${STATUS_REL}" "${ios}/${STATUS_VENDOR_REL}"
   fi
 }
 
@@ -131,6 +162,10 @@ EXACT_IOS="${TMP_DIR}/exact-ios"
 new_repo "${EXACT_THEYOS}"
 new_repo "${EXACT_IOS}"
 write_sources "${EXACT_THEYOS}"
+TEST_CONTRACT_SHA="$(sha256_file "${EXACT_THEYOS}/${CONTRACT_REL}")"
+export OWNER_PRESENT_CONTRACT_GUARD_LOCAL_TEST=1
+export OWNER_PRESENT_RETIREMENT_PRIOR_SHA256="${TEST_CONTRACT_SHA}"
+export OWNER_PRESENT_RETIREMENT_HISTORICAL_SHA256="${TEST_CONTRACT_SHA}"
 write_workflow "${EXACT_THEYOS}"
 EXACT_BASE="$(commit_all "${EXACT_THEYOS}" "registered sources")"
 write_vendors "${EXACT_THEYOS}" "${EXACT_IOS}"
@@ -161,6 +196,44 @@ cp "${NEW_THEYOS}/${SOURCE_ROOT}/guard_dep_one.json" \
 commit_all "${NEW_IOS}" "vendor before authority" >/dev/null
 expect_fail vendor_before_source "vendor exists before its new authoritative source lands" \
   "${CHECKER}" "${NEW_THEYOS}" "${NEW_IOS}" "${NEW_BASE}"
+
+# The one-time V1 retirement may change only the exact historical contract
+# metadata while the prior byte-identical iOS vendor remains pinned. The new
+# authority-status source must land before its vendor.
+RETIRE_THEYOS="${TMP_DIR}/retire-theyos"
+RETIRE_IOS="${TMP_DIR}/retire-ios"
+new_repo "${RETIRE_THEYOS}"
+new_repo "${RETIRE_IOS}"
+write_sources "${RETIRE_THEYOS}"
+perl -0pi -e \
+  's/historical-test-only-non-authoritative/legacy-authoritative/' \
+  "${RETIRE_THEYOS}/${CONTRACT_REL}"
+write_vendors "${RETIRE_THEYOS}" "${RETIRE_IOS}"
+rm "${RETIRE_IOS}/${STATUS_VENDOR_REL}"
+rm "${RETIRE_IOS}/${CONTRACT_VENDOR_REL}"
+rm "${RETIRE_IOS}/${VENDOR_ROOT}/guard_dep_two.json"
+rm "${RETIRE_THEYOS}/${STATUS_REL}"
+write_workflow "${RETIRE_THEYOS}"
+grep -v "${STATUS_REL}" "${RETIRE_THEYOS}/${WORKFLOW_REL}" > \
+  "${RETIRE_THEYOS}/${WORKFLOW_REL}.tmp"
+mv "${RETIRE_THEYOS}/${WORKFLOW_REL}.tmp" "${RETIRE_THEYOS}/${WORKFLOW_REL}"
+RETIRE_BASE="$(commit_all "${RETIRE_THEYOS}" "authoritative V1 base")"
+write_pin "${RETIRE_IOS}" "${RETIRE_BASE}"
+commit_all "${RETIRE_IOS}" "prior V1 vendor" >/dev/null
+RETIRE_PRIOR_SHA="$(sha256_file "${RETIRE_THEYOS}/${CONTRACT_REL}")"
+
+write_sources "${RETIRE_THEYOS}"
+write_workflow "${RETIRE_THEYOS}"
+RETIRE_HISTORICAL_SHA="$(sha256_file "${RETIRE_THEYOS}/${CONTRACT_REL}")"
+jq --arg prior "${RETIRE_PRIOR_SHA}" \
+  '.retired_wire.prior_authoritative_sha256 = $prior' \
+  "${RETIRE_THEYOS}/${STATUS_REL}" > "${RETIRE_THEYOS}/${STATUS_REL}.tmp"
+mv "${RETIRE_THEYOS}/${STATUS_REL}.tmp" "${RETIRE_THEYOS}/${STATUS_REL}"
+commit_all "${RETIRE_THEYOS}" "retire V1 authority" >/dev/null
+expect_pass retirement_bootstrap \
+  env OWNER_PRESENT_RETIREMENT_PRIOR_SHA256="${RETIRE_PRIOR_SHA}" \
+    OWNER_PRESENT_RETIREMENT_HISTORICAL_SHA256="${RETIRE_HISTORICAL_SHA}" \
+  "${CHECKER}" "${RETIRE_THEYOS}" "${RETIRE_IOS}" "${RETIRE_BASE}"
 
 # Existing sources first registered by this change require already-landed,
 # pin-equal vendors. Logging drift is never a successful bootstrap state.
@@ -245,8 +318,14 @@ write_pin "${PATH_IOS}" "${EXACT_BASE}"
 commit_all "${PATH_IOS}" "restore landed pin" >/dev/null
 perl -0pi -e 's#admin/contracts/mobile-claw-vpn/v1/guard_dep_one\.json#../escape.json#' \
   "${PATH_THEYOS}/${CONTRACT_REL}"
+PATH_CONTRACT_SHA="$(sha256_file "${PATH_THEYOS}/${CONTRACT_REL}")"
+jq --arg sha "${PATH_CONTRACT_SHA}" \
+  '.retired_wire.historical_sha256 = $sha' \
+  "${PATH_THEYOS}/${STATUS_REL}" > "${PATH_THEYOS}/${STATUS_REL}.tmp"
+mv "${PATH_THEYOS}/${STATUS_REL}.tmp" "${PATH_THEYOS}/${STATUS_REL}"
 commit_all "${PATH_THEYOS}" "unsafe dependency path" >/dev/null
 expect_fail unsafe_path "unsafe cross-repo dependency path" \
+  env OWNER_PRESENT_RETIREMENT_HISTORICAL_SHA256="${PATH_CONTRACT_SHA}" \
   "${CHECKER}" "${PATH_THEYOS}" "${PATH_IOS}" "${EXACT_BASE}"
 
 echo "Owner-present ODB guard mutation matrix passed."

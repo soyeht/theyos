@@ -23,6 +23,9 @@ use webauthn_rs_core::{WebauthnCore, proto::AuthenticationState};
 
 const SUCCESS_FIXTURE: &str =
     include_str!("../../../contracts/mobile-claw-vpn/v1/owner_present_success_wire_v1.json");
+const AUTHORITY_STATUS_FIXTURE: &str = include_str!(
+    "../../../contracts/mobile-claw-vpn/v1/owner_present_wire_authority_status_v1.json"
+);
 const EXECUTION_FIXTURE: &str =
     include_str!("../../../contracts/mobile-claw-vpn/v1/owner_approval_v2_execution_vectors.json");
 const ASSERTION_FIELDS_FIXTURE: &str =
@@ -41,7 +44,7 @@ const WEBAUTHN_STATE_FIXTURE_SHA256: &str =
 const API_SHAPES_FIXTURE_SHA256: &str =
     "7d31e66fd6172c9e7340455e73d0c2b06629b491442428a14c53edd45f49b7a6";
 const SUCCESS_FIXTURE_SHA256: &str =
-    "ff9ad533567e29261ecbd8e11e84e9490f1829bd4d2e5b50fe8783dc82b000d1";
+    "a9eb0fdce49fde3ce8b85ceeb5e9356145a8a1040eca5221b315ee8fd4ea2ed7";
 
 const EXPECTED_RP_ID: &str = "owner.dev.example.test";
 const EXPECTED_RP_ORIGIN: &str = "https://owner.dev.example.test/";
@@ -1256,6 +1259,30 @@ fn raw_negative_goldens(fixture: &Fixture) -> BTreeMap<&'static str, Vec<u8>> {
 #[test]
 fn success_fixture_metadata_dependencies_and_endpoint_profiles_are_closed() {
     let fixture = fixture();
+    let success_json: Value = serde_json::from_str(SUCCESS_FIXTURE).unwrap();
+    let authority_status: Value = serde_json::from_str(AUTHORITY_STATUS_FIXTURE).unwrap();
+    assert_eq!(
+        success_json["authority_status"],
+        "historical-test-only-non-authoritative"
+    );
+    assert_eq!(authority_status["phase"], "phase0-compile-out");
+    assert_eq!(authority_status["authority"], "none");
+    assert_eq!(
+        authority_status["retired_wire"]["status"],
+        "historical-test-only-non-authoritative"
+    );
+    assert_eq!(
+        authority_status["retired_wire"]["historical_sha256"],
+        SUCCESS_FIXTURE_SHA256
+    );
+    assert_eq!(
+        authority_status["phase1_blocker"]["minimum_wire_version"],
+        2
+    );
+    assert_eq!(
+        authority_status["phase1_blocker"]["required_shape"],
+        "server-held-finish-consume-mint"
+    );
     assert_eq!(
         fixture.contract,
         "soyeht-mobile-claw-vpn-owner-present-success-wire-v1"
@@ -1273,7 +1300,7 @@ fn success_fixture_metadata_dependencies_and_endpoint_profiles_are_closed() {
         fixture
             .about
             .iter()
-            .any(|line| line.contains("owner_present_error_wire_v1.json"))
+            .any(|line| line.contains("not an implementation authority"))
     );
     assert_eq!(fixture.dependencies.len(), 3);
     assert_eq!(fixture.server_selector_bindings.len(), 2);
@@ -1409,7 +1436,7 @@ fn success_fixture_metadata_dependencies_and_endpoint_profiles_are_closed() {
         fixture
             .format
             .proof_token
-            .contains("never enters summary, UI, debug, or logs")
+            .contains("forbidden as production authority")
     );
     assert!(fixture.format.run_claims.contains("never authorize"));
     assert!(fixture.format.run_claims.contains("mismatch must burn"));
@@ -1435,7 +1462,7 @@ fn success_fixture_metadata_dependencies_and_endpoint_profiles_are_closed() {
         fixture
             .format
             .error_contract
-            .contains("no handler or client may land")
+            .contains("does not authorize any handler")
     );
     assert_eq!(
         fixture
@@ -2163,7 +2190,7 @@ fn collect_rs_sources(path: &Path, output: &mut String) {
 }
 
 #[test]
-fn success_contract_is_pre_effect_and_the_durable_runtime_gate_is_registered() {
+fn success_contract_is_pre_effect_and_the_phase0_compileout_gate_is_registered() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
     let repo = root.join("../../..");
     assert!(
@@ -2171,6 +2198,21 @@ fn success_contract_is_pre_effect_and_the_durable_runtime_gate_is_registered() {
             .join("../../contracts/mobile-claw-vpn/v1/owner_present_runtime_activation_v1.json")
             .exists()
     );
+    assert!(
+        root.join("../../contracts/mobile-claw-vpn/v1/owner_present_wire_authority_status_v1.json")
+            .is_file(),
+        "Phase 0 authority status must be registered"
+    );
+    for retired_gate in [
+        ".github/scripts/check-mobile-claw-vpn-owner-present-runtime-gate.sh",
+        ".github/scripts/test-mobile-claw-vpn-owner-present-runtime-gate.sh",
+        ".github/workflows/owner-present-runtime-gate.yml",
+    ] {
+        assert!(
+            !repo.join(retired_gate).exists(),
+            "V1 runtime gate must remain retired: {retired_gate}"
+        );
+    }
     let mut sources = String::new();
     collect_rs_sources(&root.join("src"), &mut sources);
     for forbidden in [
@@ -2186,12 +2228,16 @@ fn success_contract_is_pre_effect_and_the_durable_runtime_gate_is_registered() {
         );
     }
     let lib = fs::read_to_string(root.join("src/lib.rs")).unwrap();
-    assert!(lib.contains("mod mobile_claw_vpn_owner_present_foundation;"));
+    assert!(lib.contains(
+        "#[cfg(test)]\n#[allow(dead_code)]\nmod mobile_claw_vpn_owner_present_foundation;"
+    ));
     assert!(!lib.contains("pub mod mobile_claw_vpn_owner_present_foundation;"));
 
     for script in [
-        ".github/scripts/check-mobile-claw-vpn-owner-present-runtime-gate.sh",
-        ".github/scripts/test-mobile-claw-vpn-owner-present-runtime-gate.sh",
+        ".github/scripts/check-mobile-claw-vpn-owner-present-phase0-compileout.sh",
+        ".github/scripts/test-mobile-claw-vpn-owner-present-phase0-compileout.sh",
+        ".github/scripts/check-mobile-claw-vpn-owner-present-phase0-integrity.sh",
+        ".github/scripts/test-mobile-claw-vpn-owner-present-phase0-integrity.sh",
     ] {
         assert!(
             repo.join(script).is_file(),
@@ -2199,15 +2245,34 @@ fn success_contract_is_pre_effect_and_the_durable_runtime_gate_is_registered() {
         );
     }
     let workflow =
-        fs::read_to_string(repo.join(".github/workflows/owner-present-runtime-gate.yml"))
-            .expect("runtime-gate workflow");
+        fs::read_to_string(repo.join(".github/workflows/owner-present-phase0-compileout.yml"))
+            .expect("phase0-compileout workflow");
     for required in [
-        "admin/rust/server-rs/src/**",
-        "admin/rust/household-rs/src/**",
-        "check-mobile-claw-vpn-owner-present-runtime-gate.sh",
-        "test-mobile-claw-vpn-owner-present-runtime-gate.sh",
+        "pull_request:",
+        "push:",
+        "check-mobile-claw-vpn-owner-present-phase0-compileout.sh",
+        "test-mobile-claw-vpn-owner-present-phase0-compileout.sh",
     ] {
         assert!(workflow.contains(required), "workflow misses {required}");
+    }
+    assert!(
+        !workflow.contains("paths:"),
+        "the authoritative compile-out job must run for every PR and main push"
+    );
+    let integrity_workflow =
+        fs::read_to_string(repo.join(".github/workflows/owner-present-phase0-integrity.yml"))
+            .expect("phase0-integrity workflow");
+    for required in [
+        "pull_request_target:",
+        "permissions:",
+        "contents: read",
+        "persist-credentials: false",
+        "check-mobile-claw-vpn-owner-present-phase0-integrity.sh",
+    ] {
+        assert!(
+            integrity_workflow.contains(required),
+            "integrity workflow misses {required}"
+        );
     }
     let contracts_workflow =
         fs::read_to_string(repo.join(".github/workflows/contracts-cross-repo-sync.yml"))
@@ -2215,8 +2280,8 @@ fn success_contract_is_pre_effect_and_the_durable_runtime_gate_is_registered() {
     for runtime_only in [
         "admin/rust/server-rs/src/**",
         "admin/rust/household-rs/src/**",
-        "check-mobile-claw-vpn-owner-present-runtime-gate.sh",
-        "test-mobile-claw-vpn-owner-present-runtime-gate.sh",
+        "check-mobile-claw-vpn-owner-present-phase0-compileout.sh",
+        "test-mobile-claw-vpn-owner-present-phase0-compileout.sh",
     ] {
         assert!(
             !contracts_workflow.contains(runtime_only),
