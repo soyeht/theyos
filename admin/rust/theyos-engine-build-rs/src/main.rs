@@ -5,7 +5,7 @@ use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 
-const UNSAFE_BUILD_ENV: [&str; 27] = [
+const UNSAFE_BUILD_ENV: [&str; 26] = [
     "AR",
     "BINDGEN_EXTRA_CLANG_ARGS",
     "CC",
@@ -23,7 +23,6 @@ const UNSAFE_BUILD_ENV: [&str; 27] = [
     "RANLIB",
     "RUSTFLAGS",
     "RUSTDOCFLAGS",
-    "RUSTUP_TOOLCHAIN",
     "SDKROOT",
     "CARGO_ENCODED_RUSTFLAGS",
     "RUSTC_WRAPPER",
@@ -158,16 +157,21 @@ fn build_engine(target: &str, build_tool: &str) -> Result<(), String> {
     reject_cargo_home_config()?;
     validate_tracked_pkg_config_path()?;
     let expected_rust = expected_rust_version(&rust_root.join("rust-toolchain.toml"))?;
-    let actual_rust = command_stdout(Command::new("rustc").current_dir(&rust_root).arg("-V"))?
-        .split_whitespace()
-        .nth(1)
-        .ok_or("rustc -V returned an unexpected value")?
-        .to_owned();
+    let rustc_verbose = command_stdout(Command::new("rustc").current_dir(&rust_root).arg("-vV"))?;
+    let actual_rust = rustc_verbose
+        .lines()
+        .find_map(|line| line.strip_prefix("release: "))
+        .ok_or("rustc -vV did not report a release")?;
+    let host = rustc_verbose
+        .lines()
+        .find_map(|line| line.strip_prefix("host: "))
+        .ok_or("rustc -vV did not report a host")?;
     if actual_rust != expected_rust {
         return Err(format!(
             "production theyos-engine requires rustc {expected_rust}, found {actual_rust}"
         ));
     }
+    validate_rustup_toolchain(&expected_rust, host)?;
 
     let source_sha = match env::var("THEYOS_BUILD_GIT_SHA") {
         Ok(value) => value,
@@ -289,6 +293,22 @@ fn validate_tracked_pkg_config_path() -> Result<(), String> {
         return Err(
             "PKG_CONFIG_PATH differs from the frozen admin/rust/.cargo/config.toml".to_owned(),
         );
+    }
+    Ok(())
+}
+
+fn validate_rustup_toolchain(expected_rust: &str, host: &str) -> Result<(), String> {
+    let Some(value) = env::var_os("RUSTUP_TOOLCHAIN") else {
+        return Ok(());
+    };
+    let value = value
+        .to_str()
+        .ok_or("RUSTUP_TOOLCHAIN must be valid Unicode")?;
+    let expected_host_toolchain = format!("{expected_rust}-{host}");
+    if value != expected_rust && value != expected_host_toolchain {
+        return Err(format!(
+            "RUSTUP_TOOLCHAIN must select the pinned {expected_rust} toolchain for {host}"
+        ));
     }
     Ok(())
 }
@@ -531,5 +551,6 @@ mod tests {
         assert!(!is_unsafe_build_env("CARGO_HOME"));
         assert!(!is_unsafe_build_env("CARGO_TARGET_DIR"));
         assert!(!is_unsafe_build_env("PKG_CONFIG_PATH"));
+        assert!(!is_unsafe_build_env("RUSTUP_TOOLCHAIN"));
     }
 }
