@@ -1259,7 +1259,7 @@ async fn mobile_claw_vpn_phase0_exposes_only_authenticated_unavailable_status() 
     let artifact_contract = server_rs::mobile_claw_vpn_phase0::artifact_contract();
     assert_eq!(artifact_contract["authority"], "none");
     assert_eq!(
-        artifact_contract["generic_ip_tunnel_router_seam_compiled"],
+        artifact_contract["third_target_injection_seam_compiled"],
         false
     );
     assert_eq!(

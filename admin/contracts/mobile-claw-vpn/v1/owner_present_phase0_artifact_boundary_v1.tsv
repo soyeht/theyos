@@ -1,6 +1,6 @@
 # theyos-owner-present-phase0-artifact-boundary-v1
 # mode<TAB>git-object-type<TAB>git-object-oid<TAB>closed-subtree
-040000	tree	202894f77bf3c73c1db72ef82663aed676159507	.github
-040000	tree	1d27dd31f9c7a848ba4a3b6025ac7580fb7123b2	admin/rust
+040000	tree	e798ee2a721e1eaddaef52bca5de0291c8bba954	.github
+040000	tree	4a8c708be7961be6bf125388ab9c984fcf732d0e	admin/rust
 040000	tree	0f4cb4b436ef7d67e4e024cf1bf67d50ed2d6d53	claws
 040000	tree	36c613d62ac7ae0d7f5a1451e9fa52f98a1abe9e	scripts

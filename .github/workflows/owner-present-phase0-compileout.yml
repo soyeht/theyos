@@ -116,7 +116,7 @@ jobs:
             | jq -e '
                 .authority == "none"
                 and .production_activation == false
-                and .generic_ip_tunnel_router_seam_compiled == false
+                and .third_target_injection_seam_compiled == false
                 and .generic_ip_tunnel_backend_compiled == false
                 and .generic_ip_tunnel_store_accepts_resource == false
                 and .generic_ip_tunnel_env_accepts_resource == false

@@ -368,7 +368,7 @@ if [[ "${TARGET}" == "${HOST_TARGET}" || "${PHASE0_RUN_ARTIFACT_DIRECT:-0}" == "
       "theyos-owner-present-phase0-artifact-contract-v1" \
     || "$(jq -r '.authority' "${CONTRACT_JSON}")" != "none" \
     || "$(jq -r '.production_activation' "${CONTRACT_JSON}")" != "false" \
-    || "$(jq -r '.generic_ip_tunnel_router_seam_compiled' "${CONTRACT_JSON}")" != "false" \
+    || "$(jq -r '.third_target_injection_seam_compiled' "${CONTRACT_JSON}")" != "false" \
     || "$(jq -r '.generic_ip_tunnel_backend_compiled' "${CONTRACT_JSON}")" != "false" \
     || "$(jq -r '.generic_ip_tunnel_store_accepts_resource' "${CONTRACT_JSON}")" != "false" \
     || "$(jq -r '.generic_ip_tunnel_env_accepts_resource' "${CONTRACT_JSON}")" != "false" \

@@ -40,7 +40,7 @@ pub fn artifact_contract() -> serde_json::Value {
         "production_activation": false,
         "mobile_route_prefix": "/api/v1/mobile",
         "declared_product_a_routes": [STATUS_PATH],
-        "generic_ip_tunnel_router_seam_compiled":
+        "third_target_injection_seam_compiled":
             cfg!(any(test, feature = "dev_t1_datapath")),
         "generic_ip_tunnel_backend_compiled":
             crate::claw_share_relay_stream_offer_store::IP_TUNNEL_RESOURCE_COMPILED,
@@ -95,7 +95,7 @@ mod tests {
             value["declared_product_a_routes"],
             serde_json::json!([STATUS_PATH])
         );
-        assert_eq!(value["generic_ip_tunnel_router_seam_compiled"], true);
+        assert_eq!(value["third_target_injection_seam_compiled"], true);
         assert_eq!(
             value["generic_ip_tunnel_backend_compiled"],
             crate::claw_share_relay_stream_offer_store::IP_TUNNEL_RESOURCE_COMPILED
