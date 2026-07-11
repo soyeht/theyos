@@ -7,7 +7,10 @@
 use crate::{handlers_mobile::extract_mobile_bearer, state::SharedState};
 use axum::{
     Json, Router,
+    extract::Request,
     extract::State,
+    http::StatusCode,
+    middleware,
     response::{IntoResponse, Response},
     routing::get,
 };
@@ -15,6 +18,8 @@ use core_rs::error::ApiError;
 use serde::Serialize;
 
 pub const STATUS_PATH: &str = "/claw-vpn/status";
+pub const PRODUCT_A_HTTP_ROOT: &str = "/api/v1/mobile/claw-vpn";
+pub const PRODUCT_A_STATUS_PATH: &str = "/api/v1/mobile/claw-vpn/status";
 
 #[derive(Serialize)]
 struct Phase0Status {
@@ -27,6 +32,43 @@ struct Phase0Status {
 /// Complete Product A route set shipped in Phase 0.
 pub fn routes() -> Router<SharedState> {
     Router::new().route(STATUS_PATH, get(handle_status))
+}
+
+/// Close the complete production app outside every route, fallback, and
+/// middleware layer. Retired V1 mutation requests never reach an inner
+/// service, even if a generic middleware could otherwise intercept them.
+pub fn close_production_app(app: Router) -> Router {
+    app.layer(middleware::from_fn(reject_retired_mutation_path))
+}
+
+async fn reject_retired_mutation_path(req: Request, next: middleware::Next) -> Response {
+    let path = req.uri().path();
+    let is_product_a_path = path == PRODUCT_A_HTTP_ROOT
+        || path
+            .strip_prefix(PRODUCT_A_HTTP_ROOT)
+            .is_some_and(|suffix| suffix.starts_with('/'));
+    if is_product_a_path && path != PRODUCT_A_STATUS_PATH {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    next.run(req).await
+}
+
+/// The only Axum serve choke-point permitted in the production `server`
+/// graph. It applies the Phase 0 namespace boundary at bind time, after every
+/// route, fallback, and middleware supplied by the caller.
+#[macro_export]
+macro_rules! phase0_axum_serve {
+    ($listener:expr, $router:expr) => {{
+        let router = $crate::mobile_claw_vpn_phase0::close_production_app($router);
+        ::axum::serve($listener, router)
+    }};
+    ($listener:expr, $router:expr, connect_info = $connect_info:ty) => {{
+        let router = $crate::mobile_claw_vpn_phase0::close_production_app($router);
+        ::axum::serve(
+            $listener,
+            router.into_make_service_with_connect_info::<$connect_info>(),
+        )
+    }};
 }
 
 /// Machine-readable contract emitted by the production artifact's

@@ -116,8 +116,10 @@ fn ready_posture_doc_matches_plain_http_listener_contract() {
         "\nasync fn bind_allowed_target",
     );
     assert!(
-        spawn_body.contains("TcpListener") && spawn_body.contains("axum::serve"),
-        "household listener must keep the documented plaintext TcpListener + axum::serve contract, or update docs/tests with the transport migration"
+        spawn_body.contains("TcpListener")
+            && spawn_body.contains("phase0_axum_serve!")
+            && spawn_body.contains("connect_info = SocketAddr"),
+        "household listener must keep plaintext TCP behind the Phase 0 HTTP serve choke-point, or update docs/tests with the transport migration"
     );
 
     let bootstrap = read_src("handlers_bootstrap.rs");

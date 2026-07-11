@@ -35,12 +35,14 @@ use jobs_rs::Store as JobsStore;
 use serde_json::{Value, json};
 use server_rs::{
     auth::{SESSION_COOKIE, require_auth},
-    claw_store_service, handlers_claws, handlers_household_claws,
+    claw_store_service,
+    config::Config,
+    handlers_claws, handlers_household_claws,
     handlers_household_claws::HouseholdClawsState,
     handlers_instances, handlers_mobile, handlers_terminal,
     household_attach_token::{HouseholdAttachScope, HouseholdAttachTokenStore},
     household_state::HouseholdState,
-    mobile_api_routes,
+    mobile_api_routes, production_app,
     ratelimit::Limiter,
     responses::{ClawDetailResponse, ClawJobResponse, ClawListItemResponse, ListResponse},
     state::{AppState, SharedState},
@@ -52,6 +54,40 @@ use tower::ServiceExt;
 use vmrunner_rs::VmRunner;
 
 static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+const LEGACY_PRODUCT_A_MUTATION_PATHS: [&str; 7] = [
+    "/api/v1/mobile/claw-vpn/offers",
+    "/api/v1/mobile/claw-vpn/sessions",
+    "/api/v1/mobile/claw-vpn/rendezvous/authorize",
+    "/api/v1/mobile/claw-vpn/owner/enroll-device",
+    "/api/v1/mobile/claw-vpn/owner/claw-availability",
+    "/api/v1/mobile/claw-vpn/owner/grant",
+    "/api/v1/mobile/claw-vpn/owner/revoke-grant",
+];
+
+fn retired_product_a_mutation_paths() -> Vec<String> {
+    let historical_wire: Value = serde_json::from_str(include_str!(
+        "../../../contracts/mobile-claw-vpn/v1/owner_present_success_wire_v1.json"
+    ))
+    .expect("historical owner-present V1 wire must parse");
+    let endpoint_profiles = historical_wire["endpoint_profiles"]
+        .as_object()
+        .expect("historical owner-present endpoint profiles");
+    let mut paths = LEGACY_PRODUCT_A_MUTATION_PATHS
+        .into_iter()
+        .map(str::to_owned)
+        .chain(endpoint_profiles.values().map(|profile| {
+            profile["path"]
+                .as_str()
+                .expect("historical owner-present endpoint path")
+                .to_owned()
+        }))
+        .collect::<Vec<_>>();
+    paths.sort();
+    paths.dedup();
+    assert_eq!(paths.len(), 10, "complete retired Product A path set");
+    paths
+}
 
 fn contract_fixtures() -> &'static serde_json::Map<String, Value> {
     static FIXTURES: std::sync::OnceLock<serde_json::Map<String, Value>> =
@@ -1315,15 +1351,38 @@ async fn mobile_claw_vpn_phase0_exposes_only_authenticated_unavailable_status() 
 async fn mobile_claw_vpn_phase0_mutation_routes_are_absent() {
     let state = shared_state();
     let token = mobile_token_for_role(&state, "phase0-member", UserRole::User);
-    for path in [
-        "/api/v1/mobile/claw-vpn/offers",
-        "/api/v1/mobile/claw-vpn/sessions",
-        "/api/v1/mobile/claw-vpn/rendezvous/authorize",
-    ] {
+    for path in retired_product_a_mutation_paths() {
         let (status, _bytes, _body) = request(
             mobile_router(Arc::clone(&state)),
             Method::POST,
-            path,
+            &path,
+            b"{}".to_vec(),
+            Some(format!("Bearer {token}")),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{path}");
+    }
+}
+
+#[tokio::test]
+async fn mobile_claw_vpn_phase0_complete_production_app_rejects_mutation_routes() {
+    let state = shared_state();
+    let token = mobile_token_for_role(&state, "phase0-member", UserRole::User);
+    let web_dir = tempfile::tempdir().expect("production app web dir");
+    std::fs::write(web_dir.path().join("index.html"), "<html></html>")
+        .expect("production app index");
+    let config = Config {
+        addr: "127.0.0.1:0".parse().expect("test listen address"),
+        web_dir: web_dir.path().to_string_lossy().into_owned(),
+        frontend_origin: "http://localhost:5173".to_owned(),
+    };
+    let app = production_app::compose(&state, &config);
+
+    for path in retired_product_a_mutation_paths() {
+        let (status, _bytes, _body) = request(
+            app.clone(),
+            Method::POST,
+            &path,
             b"{}".to_vec(),
             Some(format!("Bearer {token}")),
         )
@@ -1331,20 +1390,31 @@ async fn mobile_claw_vpn_phase0_mutation_routes_are_absent() {
         assert_eq!(status, StatusCode::NOT_FOUND, "{path}");
     }
 
-    for path in [
-        "/api/v1/mobile/claw-vpn/owner/enroll-device",
-        "/api/v1/mobile/claw-vpn/owner/claw-availability",
-        "/api/v1/mobile/claw-vpn/owner/grant",
-        "/api/v1/mobile/claw-vpn/owner/revoke-grant",
-    ] {
-        let (status, _bytes, _body) = request(
-            mobile_router(Arc::clone(&state)),
-            Method::POST,
-            path,
-            b"{}".to_vec(),
-            Some(format!("Bearer {token}")),
-        )
-        .await;
+    let (status, _bytes, _body) = request(
+        app,
+        Method::POST,
+        "/api/v1/mobile/claw-vpn/future-mutation",
+        b"{}".to_vec(),
+        Some(format!("Bearer {token}")),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn mobile_claw_vpn_phase0_outer_boundary_precedes_arbitrary_inner_routes() {
+    let paths = retired_product_a_mutation_paths()
+        .into_iter()
+        .chain(["/api/v1/mobile/claw-vpn/future-mutation".to_owned()])
+        .collect::<Vec<_>>();
+    let inner = paths.iter().fold(Router::new(), |router, path| {
+        router.route(path, post(|| async { StatusCode::OK }))
+    });
+    let app = server_rs::mobile_claw_vpn_phase0::close_production_app(inner);
+
+    for path in paths {
+        let (status, _bytes, _body) =
+            request(app.clone(), Method::POST, &path, Vec::new(), None).await;
         assert_eq!(status, StatusCode::NOT_FOUND, "{path}");
     }
 }

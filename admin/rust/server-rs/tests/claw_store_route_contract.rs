@@ -79,6 +79,10 @@ fn main_source() -> &'static str {
     include_str!("../src/main.rs")
 }
 
+fn production_app_source() -> &'static str {
+    include_str!("../src/production_app.rs")
+}
+
 fn mobile_api_routes_source() -> &'static str {
     include_str!("../src/mobile_api_routes.rs")
 }
@@ -137,13 +141,13 @@ fn source_slice(mount: &Mount) -> &'static str {
         ("admin/rust/server-rs/src/mobile_api_routes.rs", "routes") => {
             function_slice(mobile_api_routes_source(), "routes")
         }
-        ("admin/rust/server-rs/src/main.rs", "main_api_rest") => between(
-            main_source(),
+        ("admin/rust/server-rs/src/production_app.rs", "production_api_rest") => between(
+            production_app_source(),
             "let api_rest = Router::new()",
             "let api_uploads = Router::new()",
         ),
-        ("admin/rust/server-rs/src/main.rs", "main_api_streaming") => between(
-            main_source(),
+        ("admin/rust/server-rs/src/production_app.rs", "production_api_streaming") => between(
+            production_app_source(),
             "let api_streaming = Router::new()",
             "let api_rest = Router::new()",
         ),
@@ -158,11 +162,18 @@ fn source_slice(mount: &Mount) -> &'static str {
 
 #[test]
 fn production_main_mounts_the_canonical_mobile_router_once() {
-    let mount = ".merge(mobile_api_routes::routes(&state))";
+    let mount = ".merge(mobile_api_routes::routes(state))";
     assert_eq!(
-        main_source().matches(mount).count(),
+        production_app_source().matches(mount).count(),
         1,
-        "production main must mount the shared mobile route graph exactly once"
+        "production app must mount the shared mobile route graph exactly once"
+    );
+    assert_eq!(
+        main_source()
+            .matches("server_rs::production_app::compose(&state, &cfg)")
+            .count(),
+        1,
+        "production main must delegate to the complete app composer exactly once"
     );
 }
 
@@ -578,7 +589,7 @@ fn websocket_routes_pin_stream_auth_and_attach_token_guards() {
         Some("admin_auth_unauthorized")
     );
 
-    let main = main_source();
+    let main = production_app_source();
     assert!(
         main.contains(".merge(api_streaming)") && main.contains("require_auth"),
         "admin PTY websocket routes must stay under require_auth"

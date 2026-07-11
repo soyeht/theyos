@@ -1,4 +1,5 @@
 use std::env;
+use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufReader, Read, Write};
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
@@ -66,6 +67,19 @@ const REPO_INPUT_OVERRIDE_ENV: [&str; 3] = [
     "CLAWS_MANIFEST_YML",
     "CLAWS_CATALOG_JSON",
     "THEYOS_EMOJI_WORDLIST",
+];
+
+const CANONICAL_CHILD_ENV: [&str; 10] = [
+    "HOME",
+    "CARGO_HOME",
+    "RUSTUP_HOME",
+    "TMPDIR",
+    "PATH",
+    "LC_ALL",
+    "LANG",
+    "RUSTUP_TOOLCHAIN",
+    "CARGO_TARGET_DIR",
+    "CARGO_NET_OFFLINE",
 ];
 
 fn main() -> ExitCode {
@@ -156,8 +170,11 @@ fn build_engine(target: &str, build_tool: &str) -> Result<(), String> {
     reject_ancestor_cargo_configs(&repo_root)?;
     reject_cargo_home_config()?;
     validate_tracked_pkg_config_path()?;
+    let canonical_env = canonical_child_environment()?;
     let expected_rust = expected_rust_version(&rust_root.join("rust-toolchain.toml"))?;
-    let rustc_verbose = command_stdout(Command::new("rustc").current_dir(&rust_root).arg("-vV"))?;
+    let mut rustc = Command::new("rustc");
+    apply_canonical_environment(&mut rustc, &canonical_env);
+    let rustc_verbose = command_stdout(rustc.current_dir(&rust_root).arg("-vV"))?;
     let actual_rust = rustc_verbose
         .lines()
         .find_map(|line| line.strip_prefix("release: "))
@@ -173,18 +190,8 @@ fn build_engine(target: &str, build_tool: &str) -> Result<(), String> {
     }
     validate_rustup_toolchain(&expected_rust, host)?;
 
-    let source_sha = match env::var("THEYOS_BUILD_GIT_SHA") {
-        Ok(value) => value,
-        Err(env::VarError::NotPresent) => command_stdout(
-            Command::new("git")
-                .arg("-C")
-                .arg(&repo_root)
-                .args(["rev-parse", "HEAD"]),
-        )?,
-        Err(env::VarError::NotUnicode(_)) => {
-            return Err("THEYOS_BUILD_GIT_SHA must be valid Unicode".to_owned());
-        }
-    };
+    let source_sha = env::var("THEYOS_BUILD_GIT_SHA")
+        .map_err(|_| "THEYOS_BUILD_GIT_SHA must be supplied by the canonical caller")?;
     if source_sha.len() != 40
         || !source_sha
             .bytes()
@@ -194,6 +201,7 @@ fn build_engine(target: &str, build_tool: &str) -> Result<(), String> {
     }
 
     let mut build = Command::new(build_tool);
+    apply_canonical_environment(&mut build, &canonical_env);
     build
         .current_dir(&rust_root)
         .args([
@@ -284,6 +292,74 @@ fn is_unsafe_build_env(name: &str) -> bool {
             .any(|suffix| name.ends_with(suffix))
 }
 
+fn canonical_child_environment() -> Result<Vec<(OsString, OsString)>, String> {
+    if env::var("THEYOS_PHASE0_CLEAN_ENV").as_deref() != Ok("1") {
+        return Err("canonical theyos-engine build requires an env-cleared caller".to_owned());
+    }
+
+    let mut values = Vec::with_capacity(CANONICAL_CHILD_ENV.len());
+    for name in CANONICAL_CHILD_ENV {
+        let value = env::var_os(name)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| format!("canonical build environment is missing {name}"))?;
+        values.push((OsString::from(name), value));
+    }
+
+    for name in [
+        "HOME",
+        "CARGO_HOME",
+        "RUSTUP_HOME",
+        "TMPDIR",
+        "CARGO_TARGET_DIR",
+    ] {
+        let value = values
+            .iter()
+            .find_map(|(candidate, value)| (candidate == name).then_some(value))
+            .ok_or_else(|| format!("canonical build environment is missing {name}"))?;
+        if !Path::new(value).is_absolute() {
+            return Err(format!(
+                "canonical build environment requires absolute {name}"
+            ));
+        }
+    }
+
+    let path = values
+        .iter()
+        .find_map(|(candidate, value)| (candidate == "PATH").then_some(value))
+        .and_then(|value| value.to_str())
+        .ok_or("canonical PATH must be valid Unicode")?;
+    if path
+        .split(':')
+        .any(|entry| entry.is_empty() || !Path::new(entry).is_absolute())
+    {
+        return Err("canonical PATH must contain only absolute, non-empty entries".to_owned());
+    }
+
+    for name in ["LC_ALL", "LANG"] {
+        let value = values
+            .iter()
+            .find_map(|(candidate, value)| (candidate == name).then_some(value))
+            .and_then(|value| value.to_str());
+        if value != Some("C") {
+            return Err(format!("canonical build environment requires {name}=C"));
+        }
+    }
+    let offline = values
+        .iter()
+        .find_map(|(candidate, value)| (candidate == "CARGO_NET_OFFLINE").then_some(value))
+        .and_then(|value| value.to_str());
+    if offline != Some("true") {
+        return Err("canonical build environment requires Cargo offline mode".to_owned());
+    }
+
+    Ok(values)
+}
+
+fn apply_canonical_environment(command: &mut Command, values: &[(OsString, OsString)]) {
+    command.env_clear();
+    command.envs(values.iter().map(|(name, value)| (name, value)));
+}
+
 fn validate_tracked_pkg_config_path() -> Result<(), String> {
     if let Some(value) = env::var_os("PKG_CONFIG_PATH")
         && value != TRACKED_PKG_CONFIG_PATH
@@ -344,6 +420,18 @@ fn reject_ancestor_cargo_configs(repo_root: &Path) -> Result<(), String> {
                 "canonical theyos-engine build forbids ancestor Cargo config: {relative}"
             ));
         }
+    }
+    let mut ancestor = repo_root.parent();
+    while let Some(directory) = ancestor {
+        for relative in [".cargo/config", ".cargo/config.toml"] {
+            if fs::symlink_metadata(directory.join(relative)).is_ok() {
+                return Err(
+                    "canonical theyos-engine build forbids Cargo config above the repository"
+                        .to_owned(),
+                );
+            }
+        }
+        ancestor = directory.parent();
     }
     Ok(())
 }
@@ -529,7 +617,12 @@ fn files_equal(left: &Path, right: &Path) -> Result<bool, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{cross_container_opts, is_unsafe_build_env, shell_word};
+    use std::ffi::OsString;
+    use std::process::Command;
+
+    use super::{
+        apply_canonical_environment, cross_container_opts, is_unsafe_build_env, shell_word,
+    };
 
     #[test]
     fn shell_word_preserves_container_option_as_one_argument() {
@@ -568,6 +661,35 @@ mod tests {
             "--volume=/repo/claws:/claws:ro \
              --env=CLAWS_CATALOG_JSON=/tmp/theyos-claws-catalog.json \
              --env=PKG_CONFIG_PATH="
+        );
+    }
+
+    #[test]
+    fn child_process_environment_is_positive_allowlist() {
+        let allowed = vec![
+            (OsString::from("PATH"), OsString::from("/usr/bin:/bin")),
+            (OsString::from("CARGO_NET_OFFLINE"), OsString::from("true")),
+        ];
+        let mut command = Command::new("env");
+        command.env("OPENSSL_DIR", "/tmp/untrusted-openssl");
+        command.env("LD_PRELOAD", "/tmp/untrusted-preload.so");
+        apply_canonical_environment(&mut command, &allowed);
+
+        let explicit: Vec<_> = command
+            .get_envs()
+            .map(|(name, value)| {
+                (
+                    name.to_string_lossy().into_owned(),
+                    value.map(|entry| entry.to_string_lossy().into_owned()),
+                )
+            })
+            .collect();
+        assert_eq!(
+            explicit,
+            vec![
+                ("CARGO_NET_OFFLINE".to_owned(), Some("true".to_owned())),
+                ("PATH".to_owned(), Some("/usr/bin:/bin".to_owned())),
+            ]
         );
     }
 }

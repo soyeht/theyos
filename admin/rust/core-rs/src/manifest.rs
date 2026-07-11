@@ -10,8 +10,10 @@
 
 use serde::{Deserialize, Serialize};
 
-#[path = "generated_manifest.rs"]
-mod generated_manifest;
+#[allow(clippy::unreadable_literal, dead_code)]
+mod generated_manifest {
+    include!(concat!(env!("OUT_DIR"), "/generated_manifest.rs"));
+}
 
 /// Install pipeline progression tier.
 ///

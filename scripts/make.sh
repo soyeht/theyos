@@ -19,12 +19,49 @@ warn() { echo "${YELLOW}[WARN]${NC} $1"; }
 error() { echo "${RED}[ERROR]${NC} $1"; exit 1; }
 
 run_engine_build_tool() {
-    cargo run \
+    local system_home="${HOME:?HOME is required}"
+    local cargo_home="${PHASE0_CARGO_HOME:-${system_home}/.cargo}"
+    local rustup_home="${PHASE0_RUSTUP_HOME:-${system_home}/.rustup}"
+    for cargo_config in "${cargo_home}/config" "${cargo_home}/config.toml"; do
+        if [ -e "${cargo_config}" ] || [ -L "${cargo_config}" ]; then
+            error "canonical theyos-engine build forbids Cargo home config"
+        fi
+    done
+    local cargo_bin
+    cargo_bin="$(command -v cargo)"
+    local canonical_path
+    canonical_path="$(dirname "${cargo_bin}"):${cargo_home}/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin"
+    local clean_root
+    clean_root="$(mktemp -d "${TMPDIR:-/tmp}/theyos-engine-build.XXXXXX")"
+    local expected_rust
+    expected_rust="$(sed -n 's/^channel = "\([^"]*\)"/\1/p' "${RUST_DIR}/rust-toolchain.toml")"
+    local source_sha
+    source_sha="$(git -C "${REPO_ROOT}" rev-parse HEAD)"
+
+    mkdir -p "${clean_root}/home" "${clean_root}/tmp"
+    local status=0
+    env -i \
+        HOME="${clean_root}/home" \
+        CARGO_HOME="${cargo_home}" \
+        RUSTUP_HOME="${rustup_home}" \
+        TMPDIR="${clean_root}/tmp" \
+        PATH="${canonical_path}" \
+        LC_ALL=C \
+        LANG=C \
+        RUSTUP_TOOLCHAIN="${expected_rust}" \
+        CARGO_TARGET_DIR="${RUST_DIR}/target" \
+        CARGO_NET_OFFLINE=true \
+        THEYOS_PHASE0_CLEAN_ENV=1 \
+        THEYOS_BUILD_GIT_SHA="${source_sha}" \
+        "${cargo_bin}" run \
         --manifest-path "${RUST_DIR}/Cargo.toml" \
         --locked \
+        --offline \
         --release \
         --package theyos-engine-build-rs \
-        -- "$@"
+        -- "$@" || status=$?
+    rm -rf "${clean_root}"
+    return "${status}"
 }
 
 # Detect platform

@@ -96,6 +96,9 @@ jobs:
             and .target == $target
             and .server_equals_theyos_engine == true
             and .owner_present_authority == "none"
+            and .build_environment_policy == "env-clear-positive-allowlist-v1"
+            and .cargo_source_policy == "local-admin-rust-or-canonical-crates-io-v1"
+            and .cargo_net_offline == true
           ' "${PHASE0_ATTESTATION_OUT}"
 
       - name: Enable aarch64 emulation

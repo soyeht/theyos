@@ -131,6 +131,7 @@ pub mod nonce_cache;
 pub mod owner_cert_auth;
 pub mod owner_webauthn_recovery_consume_rate_limit;
 pub mod pair_machine_local;
+pub mod production_app;
 pub mod public_sites;
 pub mod ratelimit;
 pub mod reconcile;

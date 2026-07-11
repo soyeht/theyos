@@ -11,6 +11,15 @@ trap 'rm -rf "${TMP_ROOT}"' EXIT
 
 HOST_TARGET="$(rustc -vV | sed -n 's/^host: //p')"
 SHARED_TARGET="${TMP_ROOT}/target"
+CHECKER_CARGO_HOME="${TMP_ROOT}/cargo-home"
+SYSTEM_CARGO_HOME="${CARGO_HOME:-${HOME}/.cargo}"
+mkdir -p "${CHECKER_CARGO_HOME}"
+for cache_entry in registry git; do
+  if [[ -e "${SYSTEM_CARGO_HOME}/${cache_entry}" ]]; then
+    ln -s "${SYSTEM_CARGO_HOME}/${cache_entry}" \
+      "${CHECKER_CARGO_HOME}/${cache_entry}"
+  fi
+done
 
 clone_head() {
   local destination="$1"
@@ -45,6 +54,7 @@ expect_checker_failure() {
   local label="$1" expected="$2" root="$3"
   if PHASE0_TARGET="${HOST_TARGET}" \
       PHASE0_BUILD_TOOL=cargo \
+      PHASE0_CARGO_HOME="${CHECKER_CARGO_HOME}" \
       PHASE0_CARGO_TARGET_DIR="${SHARED_TARGET}" \
       "${root}/${CHECKER_REL}" "${root}" >"${TMP_ROOT}/${label}.log" 2>&1; then
     echo "error: checker accepted ${label}" >&2
@@ -75,6 +85,35 @@ expect_route_test_failure() {
   if ! grep -Fq "mobile_claw_vpn_phase0_mutation_routes_are_absent" \
       "${TMP_ROOT}/${label}.log"; then
     echo "error: ${label} did not fail in the real Phase 0 route composer test" >&2
+    cat "${TMP_ROOT}/${label}.log" >&2
+    exit 1
+  fi
+  echo "PASS ${label}_refused"
+}
+
+run_complete_route_test() {
+  local root="$1" log="$2"
+  CARGO_TARGET_DIR="${SHARED_TARGET}" \
+    cargo test \
+      --manifest-path "${root}/admin/rust/Cargo.toml" \
+      --locked \
+      --package server-rs \
+      --test claw_store_wire_contract \
+      mobile_claw_vpn_phase0_complete_production_app_rejects_mutation_routes \
+      -- --test-threads=1 \
+      >"${log}" 2>&1
+}
+
+expect_complete_route_test_failure() {
+  local label="$1" root="$2"
+  if run_complete_route_test "${root}" "${TMP_ROOT}/${label}.log"; then
+    echo "error: complete production app accepted ${label}" >&2
+    exit 1
+  fi
+  if ! grep -Fq \
+      "mobile_claw_vpn_phase0_complete_production_app_rejects_mutation_routes" \
+      "${TMP_ROOT}/${label}.log"; then
+    echo "error: ${label} did not fail in the complete production app test" >&2
     cat "${TMP_ROOT}/${label}.log" >&2
     exit 1
   fi
@@ -113,6 +152,7 @@ fi
 if CROSS_CONTAINER_OPTS='--volume=/tmp/untrusted:/claws:ro' \
     PHASE0_TARGET="${HOST_TARGET}" \
     PHASE0_BUILD_TOOL=cargo \
+    PHASE0_CARGO_HOME="${CHECKER_CARGO_HOME}" \
     PHASE0_CARGO_TARGET_DIR="${SHARED_TARGET}" \
     "${REPO_ROOT}/${CHECKER_REL}" >"${TMP_ROOT}/cross-env.log" 2>&1; then
   echo "error: canonical build accepted external CROSS_CONTAINER_OPTS" >&2
@@ -178,6 +218,59 @@ refresh_boundary_tree_entry "${composer_route_crossing}" "admin/rust"
 commit_mutation "${composer_route_crossing}" composer-route-crossing
 expect_route_test_failure composer_route_crossing "${composer_route_crossing}"
 
+middleware_interception="${TMP_ROOT}/middleware-interception"
+clone_head "${middleware_interception}"
+perl -0pi -e \
+  's/(pub async fn public_site_gateway\(\n    State\(state\): State<SharedState>,\n    req: Request<Body>,\n    next: Next,\n\) -> Response \{)/$1\n    if req.uri().path().starts_with("\/api\/v1\/mobile\/claw-vpn\/")\n        \&\& req.uri().path() != "\/api\/v1\/mobile\/claw-vpn\/status"\n    {\n        return StatusCode::OK.into_response();\n    }/' \
+  "${middleware_interception}/admin/rust/server-rs/src/public_sites.rs"
+if ! run_complete_route_test \
+    "${middleware_interception}" \
+    "${TMP_ROOT}/middleware-interception-closed.log"; then
+  echo "error: outer Phase 0 guard did not precede middleware interception" >&2
+  cat "${TMP_ROOT}/middleware-interception-closed.log" >&2
+  exit 1
+fi
+echo "PASS middleware_interception_blocked_before_effect"
+perl -0pi -e \
+  's/mobile_claw_vpn_phase0::close_production_app\(app\)/app/' \
+  "${middleware_interception}/admin/rust/server-rs/src/production_app.rs"
+expect_complete_route_test_failure middleware_without_outer_guard "${middleware_interception}"
+
+while IFS='|' read -r listener_label listener_source; do
+  listener_bypass="${TMP_ROOT}/${listener_label}"
+  clone_head "${listener_bypass}"
+  perl -0pi -e \
+    's/(?:server_rs|crate)::phase0_axum_serve!/axum::serve/' \
+    "${listener_bypass}/${listener_source}"
+  refresh_boundary_tree_entry "${listener_bypass}" "admin/rust"
+  commit_mutation "${listener_bypass}" "${listener_label}"
+  expect_checker_failure "${listener_label}" \
+    "published HTTP listener must use the Phase 0 serve choke-point" \
+    "${listener_bypass}"
+done <<'LISTENERS'
+main_listener_bypass|admin/rust/server-rs/src/main.rs
+household_listener_bypass|admin/rust/server-rs/src/household_listener.rs
+macos_local_listener_bypass|admin/rust/server-rs/src/macos_local_registration_listener.rs
+install_listener_bypass|admin/rust/server-rs/src/install_cli.rs
+LISTENERS
+
+new_unclosed_listener="${TMP_ROOT}/new-unclosed-listener"
+clone_head "${new_unclosed_listener}"
+cat >> "${new_unclosed_listener}/admin/rust/server-rs/src/handlers_misc.rs" <<'RUST'
+
+pub async fn phase0_unclosed_http_listener(
+    listener: tokio::net::TcpListener,
+    router: axum::Router,
+) {
+    let _ = axum::serve(listener, router).await;
+}
+RUST
+refresh_boundary_tree_entry "${new_unclosed_listener}" "admin/rust"
+commit_mutation "${new_unclosed_listener}" new-unclosed-listener
+expect_checker_failure new_unclosed_listener \
+  "production HTTP listeners must use the Phase 0 serve choke-point" \
+  "${new_unclosed_listener}"
+
 linked_module_crossing="${TMP_ROOT}/linked-module-crossing"
 clone_head "${linked_module_crossing}"
 printf '%s\n' \
@@ -196,7 +289,7 @@ printf '%s\n' \
 refresh_boundary_tree_entry "${linked_ip_tunnel_seam}" "admin/rust"
 commit_mutation "${linked_ip_tunnel_seam}" linked-ip-tunnel-seam
 expect_checker_failure linked_ip_tunnel_seam \
-  "canonical theyos-engine build failed" \
+  'unresolved import `crate::claw_share_relay_stream_target_router::RelayStreamIpTunnelRouter`' \
   "${linked_ip_tunnel_seam}"
 
 store_open="${TMP_ROOT}/store-open"
@@ -240,6 +333,139 @@ expect_checker_failure new_build_script \
   "Phase 0 permits exactly the three reviewed in-repo Rust build scripts" \
   "${new_build_script}"
 
+custom_named_build_script="${TMP_ROOT}/custom-named-build-script"
+clone_head "${custom_named_build_script}"
+perl -0pi -e 's/(publish = false\n)/$1build = "phase0_codegen.rs"\n/' \
+  "${custom_named_build_script}/admin/rust/theyos-engine-build-rs/Cargo.toml"
+printf '%s\n' 'fn main() { println!("cargo:rustc-cfg=owner_present_hidden"); }' > \
+  "${custom_named_build_script}/admin/rust/theyos-engine-build-rs/phase0_codegen.rs"
+refresh_boundary_tree_entry "${custom_named_build_script}" "admin/rust"
+commit_mutation "${custom_named_build_script}" custom-named-build-script
+expect_checker_failure custom_named_build_script \
+  "Cargo metadata custom-build targets differ from the three reviewed build scripts" \
+  "${custom_named_build_script}"
+
+local_proc_macro="${TMP_ROOT}/local-proc-macro"
+clone_head "${local_proc_macro}"
+mkdir -p "${local_proc_macro}/admin/rust/phase0-proc-macro/src"
+cat > "${local_proc_macro}/admin/rust/phase0-proc-macro/Cargo.toml" <<'TOML'
+[package]
+name = "phase0-proc-macro"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+proc-macro = true
+TOML
+cat > "${local_proc_macro}/admin/rust/phase0-proc-macro/src/lib.rs" <<'RUST'
+extern crate proc_macro;
+
+use proc_macro::TokenStream;
+
+#[proc_macro]
+pub fn phase0_hidden(input: TokenStream) -> TokenStream {
+    input
+}
+RUST
+perl -0pi -e \
+  's/(    "theyos-engine-build-rs",\n)/$1    "phase0-proc-macro",\n/' \
+  "${local_proc_macro}/admin/rust/Cargo.toml"
+cat >> "${local_proc_macro}/admin/rust/server-rs/Cargo.toml" <<'TOML'
+
+[dependencies.phase0-proc-macro]
+path = "../phase0-proc-macro"
+TOML
+(
+  cd "${local_proc_macro}/admin/rust"
+  cargo generate-lockfile --quiet
+)
+refresh_boundary_tree_entry "${local_proc_macro}" "admin/rust"
+commit_mutation "${local_proc_macro}" local-proc-macro
+expect_checker_failure local_proc_macro \
+  "Phase 0 forbids local proc-macro codegen targets" \
+  "${local_proc_macro}"
+
+external_include="${TMP_ROOT}/external-include"
+clone_head "${external_include}"
+printf '%s\n' 'external compile input' > \
+  "${external_include}/docs/phase0 external input.txt"
+cat >> "${external_include}/admin/rust/server-rs/src/handlers_misc.rs" <<'RUST'
+
+pub const PHASE0_EXTERNAL_INCLUDE: &str =
+    include_str!("../../../../docs/phase0 external input.txt");
+RUST
+refresh_boundary_tree_entry "${external_include}" "admin/rust"
+commit_mutation "${external_include}" external-include
+expect_checker_failure external_include \
+  "production depfile input escapes the four closed Git subtrees" \
+  "${external_include}"
+
+manifest_override="${TMP_ROOT}/manifest-override"
+clone_head "${manifest_override}"
+cat >> "${manifest_override}/admin/rust/Cargo.toml" <<'TOML'
+
+[patch.crates-io]
+serde = { version = "=1.0.228" }
+TOML
+refresh_boundary_tree_entry "${manifest_override}" "admin/rust"
+commit_mutation "${manifest_override}" manifest-override
+expect_checker_failure manifest_override \
+  "Phase 0 forbids Cargo override table(s): patch" \
+  "${manifest_override}"
+
+cargo_config_override="${TMP_ROOT}/cargo-config-override"
+clone_head "${cargo_config_override}"
+cat >> "${cargo_config_override}/admin/rust/.cargo/config.toml" <<'TOML'
+
+[build]
+rustflags = ["--cfg", "owner_present_hidden"]
+TOML
+refresh_boundary_tree_entry "${cargo_config_override}" "admin/rust"
+commit_mutation "${cargo_config_override}" cargo-config-override
+expect_checker_failure cargo_config_override \
+  "Phase 0 permits only the frozen PKG_CONFIG_PATH Cargo environment entry" \
+  "${cargo_config_override}"
+
+cross_pre_build="${TMP_ROOT}/cross-pre-build"
+clone_head "${cross_pre_build}"
+perl -0pi -e \
+  's/pre-build = \[\]/pre-build = ["printf owner-present-hidden"]/' \
+  "${cross_pre_build}/admin/rust/Cross.toml"
+refresh_boundary_tree_entry "${cross_pre_build}" "admin/rust"
+commit_mutation "${cross_pre_build}" cross-pre-build
+expect_checker_failure cross_pre_build \
+  "Phase 0 forbids Cross pre-build commands" \
+  "${cross_pre_build}"
+
+git_source_dependency="${TMP_ROOT}/git-source-dependency"
+clone_head "${git_source_dependency}"
+perl -0pi -e \
+  's~source = "registry\+https://github.com/rust-lang/crates.io-index"~source = "git+file:///tmp/phase0-source#0000000000000000000000000000000000000000"~' \
+  "${git_source_dependency}/admin/rust/Cargo.lock"
+refresh_boundary_tree_entry "${git_source_dependency}" "admin/rust"
+commit_mutation "${git_source_dependency}" git-source-dependency
+expect_checker_failure git_source_dependency \
+  "Phase 0 forbids non-canonical Cargo source" \
+  "${git_source_dependency}"
+
+environment_clear_removed="${TMP_ROOT}/environment-clear-removed"
+clone_head "${environment_clear_removed}"
+perl -0pi -e 's/    command\.env_clear\(\);/    \/\/ mutation removed env_clear/' \
+  "${environment_clear_removed}/admin/rust/theyos-engine-build-rs/src/main.rs"
+if CARGO_TARGET_DIR="${SHARED_TARGET}" \
+    cargo test \
+      --manifest-path "${environment_clear_removed}/admin/rust/Cargo.toml" \
+      --locked \
+      --package theyos-engine-build-rs \
+      child_process_environment_is_positive_allowlist \
+      >"${TMP_ROOT}/environment-clear-removed.log" 2>&1; then
+  echo "error: helper tests accepted removal of env_clear" >&2
+  exit 1
+fi
+grep -Fq "child_process_environment_is_positive_allowlist" \
+  "${TMP_ROOT}/environment-clear-removed.log"
+echo "PASS environment_clear_removal_refused"
+
 external_path_dependency="${TMP_ROOT}/external-path-dependency"
 clone_head "${external_path_dependency}"
 mkdir -p "${external_path_dependency}/outside-phase0/src"
@@ -274,6 +500,18 @@ commit_mutation "${ancestor_cargo_config}" ancestor-cargo-config
 expect_checker_failure ancestor_cargo_config \
   "canonical theyos-engine build forbids ancestor Cargo config" \
   "${ancestor_cargo_config}"
+
+above_repo_cargo_config_root="${TMP_ROOT}/above-repo-cargo-config"
+mkdir -p \
+  "${above_repo_cargo_config_root}/checkout" \
+  "${above_repo_cargo_config_root}/.cargo"
+above_repo_cargo_config="${above_repo_cargo_config_root}/checkout/repo"
+clone_head "${above_repo_cargo_config}"
+printf '%s\n' '[build]' 'rustflags = ["--cfg", "owner_present_hidden"]' > \
+  "${above_repo_cargo_config_root}/.cargo/config.toml"
+expect_checker_failure above_repo_cargo_config \
+  "canonical theyos-engine build forbids Cargo config above the repository" \
+  "${above_repo_cargo_config}"
 
 workspace_cargo_alias="${TMP_ROOT}/workspace-cargo-alias"
 clone_head "${workspace_cargo_alias}"

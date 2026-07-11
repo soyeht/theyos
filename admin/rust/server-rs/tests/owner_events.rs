@@ -5200,7 +5200,8 @@ fn owner_webauthn_registration_local_source_guards_fail_closed_boundary() {
     assert!(listener_source.contains("UnixListener"));
     assert!(listener_source.contains("LOCAL_PEERTOKEN"));
     assert!(listener_source.contains("MacosLocalPeerConnectInfo"));
-    assert!(listener_source.contains("into_make_service_with_connect_info"));
+    assert!(listener_source.contains("phase0_axum_serve!"));
+    assert!(listener_source.contains("connect_info = MacosLocalPeerConnectInfo"));
     assert!(listener_source.contains("Permissions::from_mode(0o700)"));
     assert!(!listener_source.contains("TcpListener"));
     assert!(!auth_source.contains("localhost"));
@@ -9920,7 +9921,24 @@ async fn owner_webauthn_registration_does_not_flip_pair_machine_policy() {
         timestamp,
     );
 
-    let (status, _headers, resp_bytes) = post_cbor(router, &uri, body, Some(&person)).await;
+    let auth = pop_header_for(&person, "POST", &uri, timestamp, &body);
+    let resp = router
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(uri)
+                .header(header::AUTHORIZATION, auth)
+                .header(header::CONTENT_TYPE, "application/cbor")
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = resp.status();
+    let resp_bytes = to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap()
+        .to_vec();
 
     assert_eq!(status, StatusCode::OK);
     let ack: OwnerApprovalAck = household_rs::cbor::from_canonical_slice(&resp_bytes).unwrap();
