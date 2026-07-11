@@ -1,0 +1,30 @@
+{
+  "contract": "soyeht-owner-approval-v2-assertion-fields-v1",
+  "version": 1,
+  "scope": "immutable-test-assertion-byte-fields",
+  "about": [
+    "Minimal cross-repository fixture for WebAuthn assertion wire fields used by owner-approval contract tests.",
+    "The context is deliberately excluded and must be supplied by the protocol-specific canonical context under test.",
+    "Rust-only RP verification state is deliberately excluded so this contract does not own a library-internal representation.",
+    "This file does not authorize production credentials. It installs no runtime, handler, client, or effect path.",
+    "This V1 file is immutable after both repositories land it; incompatible additions require a new versioned fixture."
+  ],
+  "assertions": [
+    {
+      "id": "assertion-claw-m-challenge-a",
+      "credential_id_hex": "cf093f17c9450e17fd6a04a7b56c7663910a906fd89e07f6d905f226579056b7",
+      "authenticator_data_hex": "405118ddea28b1e17e0798552d74ec3b1f6aecaf4743f398c22c2b082b6553580500000001",
+      "client_data_json_hex": "7b2274797065223a22776562617574686e2e676574222c226368616c6c656e6765223a2241514944424155474277674a4367734d4451345045424553457851564668635947526f6248423065487941222c226f726967696e223a2268747470733a2f2f6f776e65722e6465762e6578616d706c652e746573742f222c22746f6b656e42696e64696e67223a6e756c6c7d",
+      "signature_hex": "3045022028ac2661d005928f89656ec0151251066db32f06589c055b38cf894f5a0f592a022100c88cf628cd9e25ccbff842f34c90fdeb4f9a75bb11d01081d343481c735e92d9",
+      "user_handle_hex": null
+    },
+    {
+      "id": "assertion-claw-l-challenge-a",
+      "credential_id_hex": "cf093f17c9450e17fd6a04a7b56c7663910a906fd89e07f6d905f226579056b7",
+      "authenticator_data_hex": "405118ddea28b1e17e0798552d74ec3b1f6aecaf4743f398c22c2b082b6553580500000002",
+      "client_data_json_hex": "7b2274797065223a22776562617574686e2e676574222c226368616c6c656e6765223a224953496a4a43556d4a7967704b6973734c5334764d4445794d7a51314e6a63344f546f375044302d503041222c226f726967696e223a2268747470733a2f2f6f776e65722e6465762e6578616d706c652e746573742f222c22746f6b656e42696e64696e67223a6e756c6c7d",
+      "signature_hex": "3046022100b0787a5f4b95afa7b7efeb14b00bb7334cc782fdbbc6398e6799aaa968b4db5c022100a12607c9aa454adbe5bf20fbfc1cd95f9695882c02af6d36edb7495d4f6522ea",
+      "user_handle_hex": null
+    }
+  ]
+}
