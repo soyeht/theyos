@@ -3,93 +3,66 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-CHECKER="${SCRIPT_DIR}/check-mobile-claw-vpn-owner-present-phase0-integrity.sh"
+CHECKER_SOURCE="${SCRIPT_DIR}/check-mobile-claw-vpn-owner-present-phase0-integrity.sh"
+WORKFLOW_SOURCE="${SCRIPT_DIR}/../workflows/owner-present-phase0-integrity.yml"
 TMP_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/theyos-phase0-integrity-test.XXXXXX")"
 trap 'rm -rf "${TMP_ROOT}"' EXIT
 REPO="${TMP_ROOT}/repo"
+POLICY_REL=".github/owner-present-phase0-protected-objects-v1.tsv"
 
-PROTECTED_PATHS=(
-  ".github/scripts/check-mobile-claw-vpn-owner-present-phase0-compileout.sh"
-  ".github/scripts/test-mobile-claw-vpn-owner-present-phase0-compileout.sh"
-  ".github/workflows/owner-present-phase0-compileout.yml"
-  ".github/scripts/check-mobile-claw-vpn-owner-present-phase0-integrity.sh"
-  ".github/scripts/test-mobile-claw-vpn-owner-present-phase0-integrity.sh"
-  ".github/workflows/owner-present-phase0-integrity.yml"
-  ".github/scripts/check-mobile-claw-vpn-owner-present-contracts.sh"
-  ".github/scripts/test-mobile-claw-vpn-owner-present-contracts.sh"
-  ".github/workflows/contracts-cross-repo-sync.yml"
-  ".github/workflows/release-linux.yml"
-  ".github/workflows/release-macos.yml"
-  "admin/contracts/mobile-claw-vpn/v1/owner_present_wire_authority_status_v1.json"
-  "admin/rust/.cargo/config.toml"
-  "admin/rust/Cross.toml"
-  "admin/rust/rust-toolchain.toml"
-  "admin/rust/core-rs/build.rs"
-  "admin/rust/household-rs/build.rs"
-  "admin/rust/server-rs/build.rs"
-  "admin/rust/theyos-engine-build-rs/Cargo.toml"
-  "admin/rust/theyos-engine-build-rs/src/main.rs"
-  "scripts/make.sh"
-)
-
-mkdir -p "${REPO}"
+mkdir -p \
+  "${REPO}/.github/scripts" \
+  "${REPO}/.github/workflows" \
+  "${REPO}/protected"
 git -C "${REPO}" init --quiet
 git -C "${REPO}" config user.name "phase0-integrity-test"
 git -C "${REPO}" config user.email "phase0-integrity@example.invalid"
-for path in "${PROTECTED_PATHS[@]}"; do
-  mkdir -p "${REPO}/$(dirname "${path}")"
-  printf 'protected:%s\n' "${path}" > "${REPO}/${path}"
-done
+cp "${CHECKER_SOURCE}" \
+  "${REPO}/.github/scripts/check-mobile-claw-vpn-owner-present-phase0-integrity.sh"
+cp "${BASH_SOURCE[0]}" \
+  "${REPO}/.github/scripts/test-mobile-claw-vpn-owner-present-phase0-integrity.sh"
+cp "${WORKFLOW_SOURCE}" \
+  "${REPO}/.github/workflows/owner-present-phase0-integrity.yml"
+printf '%s\n' 'frozen-v1' > "${REPO}/protected/frozen.txt"
+FROZEN_OID="$(git -C "${REPO}" hash-object -w "${REPO}/protected/frozen.txt")"
+printf '%s\n' 'future-v1' > "${TMP_ROOT}/future.txt"
+FUTURE_OID="$(git -C "${REPO}" hash-object -w "${TMP_ROOT}/future.txt")"
+{
+  printf '# mode\ttype\toid\ttransition\tpath\n'
+  printf '100644\tblob\t%s\tfrozen\tprotected/frozen.txt\n' "${FROZEN_OID}"
+  for index in $(seq 1 9); do
+    printf '100644\tblob\t%s\tland-exact\tprotected/future-%s.txt\n' \
+      "${FUTURE_OID}" "${index}"
+  done
+} > "${REPO}/${POLICY_REL}"
 git -C "${REPO}" add .
 git -C "${REPO}" commit --quiet -m base
 BASE="$(git -C "${REPO}" rev-parse HEAD)"
 BRANCH="$(git -C "${REPO}" branch --show-current)"
 
-printf '%s\n' "unrelated" > "${REPO}/unrelated.txt"
+for index in $(seq 1 9); do
+  cp "${TMP_ROOT}/future.txt" "${REPO}/protected/future-${index}.txt"
+done
+printf '%s\n' unrelated > "${REPO}/unrelated.txt"
 git -C "${REPO}" add .
-git -C "${REPO}" commit --quiet -m unrelated
+git -C "${REPO}" commit --quiet -m exact-landing
 HEAD_OK="$(git -C "${REPO}" rev-parse HEAD)"
 git -C "${REPO}" switch --quiet --detach "${BASE}"
 PHASE0_INTEGRITY_LOCAL_TEST=1 \
-  "${CHECKER}" "${REPO}" "${BASE}" "${HEAD_OK}" 0 >/dev/null
+  "${REPO}/.github/scripts/check-mobile-claw-vpn-owner-present-phase0-integrity.sh" \
+  "${REPO}" "${BASE}" "${HEAD_OK}" 0 >/dev/null
 git -C "${REPO}" switch --quiet "${BRANCH}"
-echo "PASS unrelated_change"
-
-mkdir -p "${REPO}/admin/contracts/mobile-claw-vpn/v1"
-printf '%s\n' '040000 tree 0123456789012345678901234567890123456789 admin/rust' > \
-  "${REPO}/admin/contracts/mobile-claw-vpn/v1/owner_present_phase0_artifact_boundary_v1.tsv"
-git -C "${REPO}" add -A
-git -C "${REPO}" commit --quiet -m boundary-identity-update
-HEAD_OK="$(git -C "${REPO}" rev-parse HEAD)"
-git -C "${REPO}" switch --quiet --detach "${BASE}"
-PHASE0_INTEGRITY_LOCAL_TEST=1 \
-  "${CHECKER}" "${REPO}" "${BASE}" "${HEAD_OK}" 0 >/dev/null
-git -C "${REPO}" switch --quiet "${BRANCH}"
-echo "PASS per_commit_boundary_identity_update"
-
-mkdir -p "${REPO}/admin/rust/server-rs/src"
-printf '%s\n' 'reviewed-lock-update' > "${REPO}/admin/rust/Cargo.lock"
-printf '%s\n' 'pub const REVIEWED_SOURCE: bool = true;' > \
-  "${REPO}/admin/rust/server-rs/src/lib.rs"
-git -C "${REPO}" add -A
-git -C "${REPO}" commit --quiet -m reviewed-build-input-update
-HEAD_OK="$(git -C "${REPO}" rev-parse HEAD)"
-git -C "${REPO}" switch --quiet --detach "${BASE}"
-PHASE0_INTEGRITY_LOCAL_TEST=1 \
-  "${CHECKER}" "${REPO}" "${BASE}" "${HEAD_OK}" 0 >/dev/null
-git -C "${REPO}" switch --quiet "${BRANCH}"
-echo "PASS per_commit_build_input_update"
+echo "PASS exact_policy_landing"
 
 expect_failure() {
   local label="$1" expected="$2"
-  local head
   git -C "${REPO}" add -A
   git -C "${REPO}" commit --quiet -m "${label}"
-  head="$(git -C "${REPO}" rev-parse HEAD)"
+  local head="$(git -C "${REPO}" rev-parse HEAD)"
   git -C "${REPO}" switch --quiet --detach "${BASE}"
   if PHASE0_INTEGRITY_LOCAL_TEST=1 \
-    "${CHECKER}" "${REPO}" "${BASE}" "${head}" 0 \
-    >"${TMP_ROOT}/${label}.log" 2>&1; then
+      "${REPO}/.github/scripts/check-mobile-claw-vpn-owner-present-phase0-integrity.sh" \
+      "${REPO}" "${BASE}" "${head}" 0 >"${TMP_ROOT}/${label}.log" 2>&1; then
     echo "error: integrity checker accepted ${label}" >&2
     exit 1
   fi
@@ -98,39 +71,24 @@ expect_failure() {
   echo "PASS ${label}_refused"
 }
 
+printf '%s\n' tampered > "${REPO}/protected/future-1.txt"
+expect_failure payload_tamper "protected Phase 0 object differs from base-owned policy"
+git -C "${REPO}" restore --source="${HEAD_OK}" -- "protected/future-1.txt"
+
+rm "${REPO}/protected/future-2.txt"
+expect_failure missing_land_exact "protected Phase 0 object differs from base-owned policy"
+git -C "${REPO}" restore --source="${HEAD_OK}" -- "protected/future-2.txt"
+
+printf '%s\n' tampered > "${REPO}/protected/frozen.txt"
+expect_failure frozen_tamper "protected Phase 0 object differs from base-owned policy"
+git -C "${REPO}" restore --source="${HEAD_OK}" -- "protected/frozen.txt"
+
+printf '%s\n' '# changed' >> "${REPO}/${POLICY_REL}"
+expect_failure policy_tamper "base-owned integrity root differs from trusted base"
+git -C "${REPO}" restore --source="${HEAD_OK}" -- "${POLICY_REL}"
+
 printf '%s\n' 'exit 0' > \
-  "${REPO}/.github/scripts/check-mobile-claw-vpn-owner-present-phase0-compileout.sh"
-expect_failure checker_noop "protected Phase 0 authority differs from trusted base"
+  "${REPO}/.github/scripts/check-mobile-claw-vpn-owner-present-phase0-integrity.sh"
+expect_failure checker_tamper "base-owned integrity root differs from trusted base"
 
-git -C "${REPO}" restore --source="${HEAD_OK}" -- \
-  ".github/scripts/check-mobile-claw-vpn-owner-present-phase0-compileout.sh"
-printf '%s\n' 'fn main() { println!("cargo:rustc-cfg=owner_present_hidden"); }' > \
-  "${REPO}/admin/rust/server-rs/build.rs"
-expect_failure build_script_changed "protected Phase 0 authority differs from trusted base"
-
-git -C "${REPO}" restore --source="${HEAD_OK}" -- \
-  "admin/rust/server-rs/build.rs"
-rm "${REPO}/.github/workflows/owner-present-phase0-compileout.yml"
-expect_failure workflow_deleted "protected Phase 0 authority object is missing"
-
-git -C "${REPO}" restore --source="${HEAD_OK}" -- \
-  ".github/workflows/owner-present-phase0-compileout.yml"
-printf '%s\n' '{"authority":"v1"}' > \
-  "${REPO}/admin/contracts/mobile-claw-vpn/v1/owner_present_wire_authority_status_v1.json"
-expect_failure authority_status_changed \
-  "protected Phase 0 authority differs from trusted base"
-
-git -C "${REPO}" restore --source="${HEAD_OK}" -- \
-  "admin/contracts/mobile-claw-vpn/v1/owner_present_wire_authority_status_v1.json"
-printf '%s\n' 'run: true' > "${REPO}/.github/workflows/release-linux.yml"
-expect_failure release_recipe_changed \
-  "protected Phase 0 authority differs from trusted base"
-
-git -C "${REPO}" restore --source="${HEAD_OK}" -- \
-  ".github/workflows/release-linux.yml"
-printf '%s\n' 'fn main() {}' > \
-  "${REPO}/admin/rust/theyos-engine-build-rs/src/main.rs"
-expect_failure engine_build_tool_changed \
-  "protected Phase 0 authority differs from trusted base"
-
-echo "Phase 0 authority integrity mutation matrix passed."
+echo "Phase 0 base-owned policy mutation matrix passed."
