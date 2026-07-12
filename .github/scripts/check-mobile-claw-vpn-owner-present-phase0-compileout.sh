@@ -679,8 +679,8 @@ for nix_binding in \
   'flake_lock_sha256' \
   '--no-default-features' \
   'third_target_injection_seam_compiled'; do
-  if ! grep -Fq "${nix_binding}" "${SNAPSHOT}/.github/workflows/owner-present-phase0-nix-runtime.yml" \
-    && ! grep -Fq "${nix_binding}" "${SNAPSHOT}/nix/packages/rust-workspace.nix"; then
+  if ! grep -Fq -- "${nix_binding}" "${SNAPSHOT}/.github/workflows/owner-present-phase0-nix-runtime.yml" \
+    && ! grep -Fq -- "${nix_binding}" "${SNAPSHOT}/nix/packages/rust-workspace.nix"; then
     echo "::error::Nix runtime Phase 0 binding is missing: ${nix_binding}"
     exit 1
   fi
