@@ -230,6 +230,9 @@ fn build_engine(target: &str, build_tool: &str) -> Result<(), String> {
     }
     let mut build = Command::new(build_tool);
     apply_canonical_environment(&mut build, &canonical_env);
+    let target_root = target_root_for(&rust_root)?;
+    fs::create_dir_all(target_root.join("phase0-generated"))
+        .map_err(|error| format!("failed to create Phase 0 generated output directory: {error}"))?;
     build
         .current_dir(&rust_root)
         .args(&build_args)
@@ -239,7 +242,16 @@ fn build_engine(target: &str, build_tool: &str) -> Result<(), String> {
     for name in REPO_INPUT_OVERRIDE_ENV {
         build.env_remove(name);
     }
-    let target_root = target_root_for(&rust_root)?;
+    build
+        .env("CLAWS_MANIFEST_YML", repo_root.join("claws/manifest.yml"))
+        .env(
+            "CLAWS_CATALOG_JSON",
+            target_root.join("phase0-generated/claws-catalog.json"),
+        )
+        .env(
+            "THEYOS_EMOJI_WORDLIST",
+            rust_root.join("household-rs/data/emoji-security-code-wordlist.csv"),
+        );
     let status = if build_tool == "cross" {
         run_container_build(
             target,
@@ -521,6 +533,10 @@ fn run_container_build(
             "THEYOS_PHASE0_CLEAN_ENV=1",
             "--env",
             "CLAWS_CATALOG_JSON=/target/phase0-generated/claws-catalog.json",
+            "--env",
+            "CLAWS_MANIFEST_YML=/claws/manifest.yml",
+            "--env",
+            "THEYOS_EMOJI_WORDLIST=/project/admin/rust/household-rs/data/emoji-security-code-wordlist.csv",
             "--env",
             &format!("RUSTUP_TOOLCHAIN={rust_version}"),
             "--env",
