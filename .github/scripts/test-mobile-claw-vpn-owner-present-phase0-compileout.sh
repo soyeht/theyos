@@ -272,7 +272,7 @@ RUST
 refresh_boundary_tree_entry "${new_unclosed_listener}" "admin/rust"
 commit_mutation "${new_unclosed_listener}" new-unclosed-listener
 expect_checker_failure new_unclosed_listener \
-  "production HTTP listeners must use the Phase 0 serve choke-point" \
+  "use of a disallowed method \\`axum::serve\\`" \
   "${new_unclosed_listener}"
 
 linked_module_crossing="${TMP_ROOT}/linked-module-crossing"
