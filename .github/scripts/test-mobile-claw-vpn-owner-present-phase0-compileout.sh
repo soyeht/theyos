@@ -23,6 +23,7 @@ clone_head() {
 }
 
 prepare_empty_authority_inputs() {
+  chmod -R u+w "${SHARED_TARGET}" "${CHECKER_CARGO_HOME}" 2>/dev/null || true
   rm -rf "${SHARED_TARGET}" "${CHECKER_CARGO_HOME}"
   mkdir -p "${SHARED_TARGET}" "${CHECKER_CARGO_HOME}"
 }
