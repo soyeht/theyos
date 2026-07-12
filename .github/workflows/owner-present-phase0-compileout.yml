@@ -70,22 +70,13 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
-      - name: Install pinned cross
-        if: matrix.tool == 'cross'
-        run: cargo install cross --version 0.2.5 --locked
-
-      - name: Cache Rust dependencies
-        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
-        with:
-          workspaces: "admin/rust -> target"
-          shared-key: "owner-present-phase0-${{ matrix.target }}"
-
       - name: Build, inspect, stage, and attest
         shell: bash
         env:
           PHASE0_TARGET: ${{ matrix.target }}
           PHASE0_BUILD_TOOL: ${{ matrix.tool }}
           PHASE0_CARGO_TARGET_DIR: ${{ github.workspace }}/admin/rust/target
+          PHASE0_CARGO_HOME: ${{ runner.temp }}/phase0-cargo-home-${{ matrix.target }}
           PHASE0_RUN_ARTIFACT_DIRECT: ${{ matrix.direct }}
           PHASE0_ATTESTATION_OUT: ${{ runner.temp }}/phase0-attestation-${{ matrix.target }}.json
           PHASE0_STAGED_ENGINE_OUT: ${{ runner.temp }}/theyos-engine-${{ matrix.target }}
@@ -98,7 +89,8 @@ jobs:
             and .owner_present_authority == "none"
             and .build_environment_policy == "env-clear-positive-allowlist-v1"
             and .cargo_source_policy == "local-admin-rust-or-canonical-crates-io-v1"
-            and .cargo_net_offline == true
+            and .cargo_fetch_network == true
+            and .post_fetch_build_offline == true
           ' "${PHASE0_ATTESTATION_OUT}"
 
       - name: Enable aarch64 emulation

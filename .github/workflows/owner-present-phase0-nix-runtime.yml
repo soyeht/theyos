@@ -1,0 +1,98 @@
+name: Owner-Present Phase 0 Nix Runtime
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  nix-runtime:
+    name: Nix runtime Phase 0 contract
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout exact source
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
+        with:
+          persist-credentials: false
+
+      - name: Install pinned Nix
+        uses: cachix/install-nix-action@v27
+
+      - name: Verify locked Nix inputs and build runtime
+        id: build
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -f flake.lock
+          test -f nix/packages/rust-workspace.nix
+          OUT_PATH="$(nix build .#theyos-runtime --no-link --print-out-paths)"
+          test -x "$OUT_PATH/bin/server"
+          test -x "$OUT_PATH/bin/theyos-llm-proxy"
+          test "$(sha256sum flake.lock | awk '{print $1}')" = \
+            "$(jq -r '.flake_lock_sha256' "$OUT_PATH/phase0-runtime-manifest.json")"
+          "$OUT_PATH/bin/server" --owner-present-phase0-contract \
+            | jq -e '
+              .authority == "none"
+              and .production_activation == false
+              and .third_target_injection_seam_compiled == false
+              and .generic_ip_tunnel_backend_compiled == false
+              and .generic_ip_tunnel_store_accepts_resource == false
+              and .generic_ip_tunnel_env_accepts_resource == false
+              and .declared_product_a_routes == ["/claw-vpn/status"]
+            ' >/dev/null
+          "$OUT_PATH/bin/theyos-llm-proxy" --owner-present-phase0-contract \
+            | jq -e '
+              .authority == "none"
+              and .production_activation == false
+              and .allowed_requests == [
+                {"method":"GET","path":"/api/v1/mobile/claw-vpn/status"},
+                {"method":"HEAD","path":"/api/v1/mobile/claw-vpn/status"}
+              ]
+            ' >/dev/null
+          nix path-info --recursive --json "$OUT_PATH" > phase0-nix-store-closure.json
+          CLOSURE_SHA256="$(sha256sum phase0-nix-store-closure.json | awk '{print $1}')"
+          jq -S --arg closure_sha256 "$CLOSURE_SHA256" \
+            '. + {nix_store_closure_manifest_sha256:$closure_sha256}' \
+            "$OUT_PATH/phase0-runtime-manifest.json" > phase0-runtime-manifest.json
+          STAGE="$RUNNER_TEMP/phase0-nix-runtime"
+          rm -rf "$STAGE"
+          mkdir -p "$STAGE"
+          cp -a "$OUT_PATH" "$STAGE/runtime"
+          cp phase0-runtime-manifest.json phase0-nix-store-closure.json "$STAGE/"
+          tar -C "$STAGE" -czf phase0-nix-runtime.tar.gz .
+
+      - name: Upload Nix runtime subject
+        uses: actions/upload-artifact@v4
+        with:
+          name: owner-present-phase0-nix-runtime
+          path: |
+            phase0-nix-runtime.tar.gz
+            phase0-runtime-manifest.json
+            phase0-nix-store-closure.json
+          if-no-files-found: error
+
+  attest-nix-runtime:
+    name: Attest final Nix runtime subject
+    if: github.event_name == 'push'
+    needs: nix-runtime
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    steps:
+      - name: Download final Nix subject
+        uses: actions/download-artifact@v4
+        with:
+          name: owner-present-phase0-nix-runtime
+
+      - name: Attest final Nix subject
+        uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a
+        with:
+          subject-path: phase0-nix-runtime.tar.gz

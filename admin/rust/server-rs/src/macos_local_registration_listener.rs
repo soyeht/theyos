@@ -86,7 +86,7 @@ pub fn spawn_macos_local_registration_listener(
     let listener = UnixListener::bind(&socket_path)?;
     tokio::spawn(async move {
         if let Err(e) =
-            crate::phase0_axum_serve!(listener, router, connect_info = MacosLocalPeerConnectInfo)
+            core_rs::phase0_axum_serve!(listener, router, connect_info = MacosLocalPeerConnectInfo)
                 .await
         {
             warn!(

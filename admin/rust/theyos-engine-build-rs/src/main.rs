@@ -60,8 +60,7 @@ const UNSAFE_BUILD_ENV_SUFFIX: [&str; 8] = [
     "_RANLIB",
 ];
 
-const TRACKED_PKG_CONFIG_PATH: &str =
-    "/nix/store/wr6qvslzqrd3rsf2mw0ssxwmyi2sqjdh-openssl-3.4.2-dev/lib/pkgconfig";
+const TRACKED_PKG_CONFIG_PATH: &str = "";
 
 const REPO_INPUT_OVERRIDE_ENV: [&str; 3] = [
     "CLAWS_MANIFEST_YML",
@@ -81,6 +80,9 @@ const CANONICAL_CHILD_ENV: [&str; 10] = [
     "CARGO_TARGET_DIR",
     "CARGO_NET_OFFLINE",
 ];
+
+const X86_64_MUSL_IMAGE: &str = "ghcr.io/cross-rs/x86_64-unknown-linux-musl:0.2.5@sha256:77db671d8356a64ae72a3e1415e63f547f26d374fbe3c4762c1cd36c7eac7b99";
+const AARCH64_MUSL_IMAGE: &str = "ghcr.io/cross-rs/aarch64-unknown-linux-musl:0.2.5@sha256:702154f52b2d8091671aa2c84d5582d849f949977228c735ff8462f93cc0e1e4";
 
 fn main() -> ExitCode {
     match run() {
@@ -200,61 +202,117 @@ fn build_engine(target: &str, build_tool: &str) -> Result<(), String> {
         return Err("THEYOS_BUILD_GIT_SHA must be a full lowercase Git SHA".to_owned());
     }
 
+    let mut build_args = vec![
+        "build",
+        "--quiet",
+        "--manifest-path",
+        "Cargo.toml",
+        "--locked",
+        "--release",
+        "--target",
+        target,
+        "--no-default-features",
+        "--package",
+        "server-rs",
+        "--package",
+        "llm-proxy-rs",
+        "--package",
+        "soyeht-rs",
+        "--package",
+        "store-rs",
+        "--package",
+        "terminal-rs",
+    ];
+    if target.ends_with("-apple-darwin") {
+        build_args.extend(["--package", "vmrunner-macos-rs"]);
+    } else {
+        build_args.extend(["--package", "vmrunner-rs", "--package", "imagebuilder-rs"]);
+    }
     let mut build = Command::new(build_tool);
     apply_canonical_environment(&mut build, &canonical_env);
     build
         .current_dir(&rust_root)
-        .args([
-            "build",
-            "--quiet",
-            "--manifest-path",
-            "Cargo.toml",
-            "--locked",
-            "--release",
-            "--target",
-            target,
-            "--package",
-            "server-rs",
-            "--bin",
-            "server",
-            "--no-default-features",
-        ])
+        .args(&build_args)
         .env("THEYOS_BUILD_GIT_SHA", &source_sha)
         .env("CARGO_INCREMENTAL", "0")
         .env("CARGO_PROFILE_RELEASE_DEBUG_ASSERTIONS", "false");
     for name in REPO_INPUT_OVERRIDE_ENV {
         build.env_remove(name);
     }
-    if build_tool == "cross" {
-        let claws_dir = repo_root.join("claws").canonicalize().map_err(|error| {
-            format!(
-                "failed to resolve canonical Claw manifest directory {}: {error}",
-                repo_root.join("claws").display()
-            )
-        })?;
-        if !claws_dir.join("manifest.yml").is_file() {
-            return Err(format!(
-                "canonical Claw manifest is missing: {}",
-                claws_dir.join("manifest.yml").display()
-            ));
-        }
-        let claws_dir = claws_dir
-            .to_str()
-            .ok_or("canonical Claw manifest path is not valid Unicode")?;
+    let target_root = target_root_for(&rust_root)?;
+    let status = if build_tool == "cross" {
+        run_container_build(
+            target,
+            &repo_root,
+            &target_root_for(&rust_root)?,
+            &canonical_env,
+            &source_sha,
+            &build_args,
+        )?
+    } else {
         build
-            .env_remove("PKG_CONFIG_PATH")
-            .env("CROSS_CONTAINER_OPTS", cross_container_opts(claws_dir));
-    }
-    let status = build
-        .status()
-        .map_err(|error| format!("failed to launch {build_tool}: {error}"))?;
+            .status()
+            .map_err(|error| format!("failed to launch {build_tool}: {error}"))?
+    };
     if !status.success() {
         return Err(format!(
             "canonical theyos-engine build failed for {target} with {build_tool}"
         ));
     }
 
-    let target_root = env::var_os("CARGO_TARGET_DIR").map_or_else(
+    let release_dir = target_root.join(target).join("release");
+    let binary = release_dir.join("server");
+    let depfile = release_dir.join("server.d");
+    let proxy_binary = release_dir.join("theyos-llm-proxy");
+    let proxy_depfile = release_dir.join("theyos-llm-proxy.d");
+    require_executable_regular_file(&binary)?;
+    if !depfile.is_file() {
+        return Err(format!(
+            "canonical theyos-engine build did not produce depfile: {}",
+            depfile.display()
+        ));
+    }
+    require_executable_regular_file(&proxy_binary)?;
+    if !proxy_depfile.is_file() {
+        return Err(format!(
+            "canonical theyos-engine build did not produce proxy depfile: {}",
+            proxy_depfile.display()
+        ));
+    }
+    let published_helpers: &[&str] = if target.ends_with("-apple-darwin") {
+        &[
+            "vmrunner_macos_ipc",
+            "store-ipc",
+            "terminal-ipc",
+            "theyos-ssh",
+            "theyos-provision-inject",
+        ]
+    } else {
+        &[
+            "soyeht",
+            "vmrunner_ipc",
+            "fc-ssh",
+            "store-ipc",
+            "terminal-ipc",
+            "imagebuilder",
+        ]
+    };
+    for helper in published_helpers {
+        let helper_binary = release_dir.join(helper);
+        require_executable_regular_file(&helper_binary)?;
+        if !release_dir.join(format!("{helper}.d")).is_file() {
+            return Err(format!(
+                "canonical theyos-engine build did not produce helper depfile: {}",
+                release_dir.join(format!("{helper}.d")).display()
+            ));
+        }
+    }
+    println!("{}", binary.display());
+    Ok(())
+}
+
+fn target_root_for(rust_root: &Path) -> Result<PathBuf, String> {
+    Ok(env::var_os("CARGO_TARGET_DIR").map_or_else(
         || rust_root.join("target"),
         |value| {
             let path = PathBuf::from(value);
@@ -264,19 +322,7 @@ fn build_engine(target: &str, build_tool: &str) -> Result<(), String> {
                 rust_root.join(path)
             }
         },
-    );
-    let release_dir = target_root.join(target).join("release");
-    let binary = release_dir.join("server");
-    let depfile = release_dir.join("server.d");
-    require_executable_regular_file(&binary)?;
-    if !depfile.is_file() {
-        return Err(format!(
-            "canonical theyos-engine build did not produce depfile: {}",
-            depfile.display()
-        ));
-    }
-    println!("{}", binary.display());
-    Ok(())
+    ))
 }
 
 fn is_unsafe_build_env(name: &str) -> bool {
@@ -387,23 +433,133 @@ fn validate_rustup_toolchain(expected_rust: &str, host: &str) -> Result<(), Stri
     Ok(())
 }
 
-fn shell_word(value: &str) -> String {
-    if value
-        .bytes()
-        .all(|byte| byte.is_ascii_alphanumeric() || b"%+,-./:=@_".contains(&byte))
-    {
-        value.to_owned()
-    } else {
-        format!("'{}'", value.replace('\'', "'\\''"))
+fn phase0_image(target: &str) -> Result<&'static str, String> {
+    match target {
+        "x86_64-unknown-linux-musl" => Ok(X86_64_MUSL_IMAGE),
+        "aarch64-unknown-linux-musl" => Ok(AARCH64_MUSL_IMAGE),
+        _ => Err(format!("no pinned Phase 0 OCI image exists for {target}")),
     }
 }
 
-fn cross_container_opts(claws_dir: &str) -> String {
-    let mount = shell_word(&format!("--volume={claws_dir}:/claws:ro"));
-    format!(
-        "{mount} --env=CLAWS_CATALOG_JSON=/tmp/theyos-claws-catalog.json \
-         --env=PKG_CONFIG_PATH="
-    )
+fn run_container_build(
+    target: &str,
+    repo_root: &Path,
+    target_root: &Path,
+    canonical_env: &[(OsString, OsString)],
+    source_sha: &str,
+    build_args: &[&str],
+) -> Result<std::process::ExitStatus, String> {
+    let docker = executable_from_path("docker")?;
+    let image = phase0_image(target)?;
+    let cargo_home = canonical_value(canonical_env, "CARGO_HOME")?;
+    let rustup_home = canonical_value(canonical_env, "RUSTUP_HOME")?;
+    let rust_version = canonical_value(canonical_env, "RUSTUP_TOOLCHAIN")?;
+    let platform = if target.starts_with("aarch64-") {
+        Some("linux/arm64")
+    } else {
+        None
+    };
+
+    let mut command = Command::new(docker);
+    command.args([
+        "run",
+        "--rm",
+        "--network",
+        "none",
+        "--read-only",
+        "--cap-drop",
+        "ALL",
+        "--security-opt",
+        "no-new-privileges",
+    ]);
+    if let Some(platform) = platform {
+        command.args(["--platform", platform]);
+    }
+    command
+        .args([
+            "--mount",
+            &format!(
+                "type=bind,src={},dst=/project,readonly",
+                repo_root.display()
+            ),
+            "--mount",
+            &format!("type=bind,src={},dst=/target", target_root.display()),
+            "--mount",
+            &format!("type=bind,src={},dst=/phase0-cargo,readonly", cargo_home),
+            "--mount",
+            &format!("type=bind,src={},dst=/phase0-rustup,readonly", rustup_home),
+            "--mount",
+            &format!(
+                "type=bind,src={},dst=/claws,readonly",
+                repo_root.join("claws").display()
+            ),
+            "--tmpfs",
+            "/tmp:rw,nosuid,nodev",
+            "--tmpfs",
+            "/phase0-home:rw,nosuid,nodev",
+            "--workdir",
+            "/project/admin/rust",
+            "--env",
+            "HOME=/phase0-home",
+            "--env",
+            "CARGO_HOME=/phase0-cargo",
+            "--env",
+            "RUSTUP_HOME=/phase0-rustup",
+            "--env",
+            "CARGO_TARGET_DIR=/target",
+            "--env",
+            "CARGO_NET_OFFLINE=true",
+            "--env",
+            "CARGO_INCREMENTAL=0",
+            "--env",
+            "CARGO_PROFILE_RELEASE_DEBUG_ASSERTIONS=false",
+            "--env",
+            "PKG_CONFIG_PATH=",
+            "--env",
+            "PATH=/usr/local/cargo/bin:/usr/local/bin:/usr/bin:/bin",
+            "--env",
+            "THEYOS_PHASE0_CLEAN_ENV=1",
+            "--env",
+            "CLAWS_CATALOG_JSON=/target/phase0-generated/claws-catalog.json",
+            "--env",
+            &format!("RUSTUP_TOOLCHAIN={rust_version}"),
+            "--env",
+            &format!("THEYOS_BUILD_GIT_SHA={source_sha}"),
+            image,
+            "cargo",
+        ])
+        .args(build_args);
+    command
+        .status()
+        .map_err(|error| format!("failed to launch direct OCI Phase 0 build: {error}"))
+}
+
+fn canonical_value(values: &[(OsString, OsString)], name: &str) -> Result<String, String> {
+    values
+        .iter()
+        .find_map(|(candidate, value)| {
+            (candidate == name).then(|| value.to_string_lossy().into_owned())
+        })
+        .ok_or_else(|| format!("canonical build environment is missing {name}"))
+}
+
+fn executable_from_path(name: &str) -> Result<PathBuf, String> {
+    let path = env::var_os("PATH").ok_or("canonical PATH is missing")?;
+    for directory in env::split_paths(&path) {
+        let candidate = directory.join(name);
+        if candidate.is_file()
+            && candidate
+                .metadata()
+                .is_ok_and(|metadata| metadata.permissions().mode() & 0o111 != 0)
+        {
+            return candidate
+                .canonicalize()
+                .map_err(|error| format!("failed to resolve {name}: {error}"));
+        }
+    }
+    Err(format!(
+        "canonical PATH does not contain executable: {name}"
+    ))
 }
 
 fn reject_ancestor_cargo_configs(repo_root: &Path) -> Result<(), String> {
@@ -620,21 +776,7 @@ mod tests {
     use std::ffi::OsString;
     use std::process::Command;
 
-    use super::{
-        apply_canonical_environment, cross_container_opts, is_unsafe_build_env, shell_word,
-    };
-
-    #[test]
-    fn shell_word_preserves_container_option_as_one_argument() {
-        assert_eq!(
-            shell_word("--volume=/tmp/with space/claws:/claws:ro"),
-            "'--volume=/tmp/with space/claws:/claws:ro'"
-        );
-        assert_eq!(
-            shell_word("--volume=/tmp/owner's/claws:/claws:ro"),
-            "'--volume=/tmp/owner'\\''s/claws:/claws:ro'"
-        );
-    }
+    use super::{apply_canonical_environment, is_unsafe_build_env};
 
     #[test]
     fn build_environment_rejects_target_and_toolchain_overrides() {
@@ -652,16 +794,6 @@ mod tests {
         assert!(!is_unsafe_build_env("CARGO_TARGET_DIR"));
         assert!(!is_unsafe_build_env("PKG_CONFIG_PATH"));
         assert!(!is_unsafe_build_env("RUSTUP_TOOLCHAIN"));
-    }
-
-    #[test]
-    fn cross_options_mount_only_canonical_inputs_and_clear_host_pkg_config() {
-        assert_eq!(
-            cross_container_opts("/repo/claws"),
-            "--volume=/repo/claws:/claws:ro \
-             --env=CLAWS_CATALOG_JSON=/tmp/theyos-claws-catalog.json \
-             --env=PKG_CONFIG_PATH="
-        );
     }
 
     #[test]

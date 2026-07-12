@@ -33,16 +33,21 @@
   },
   "phase0_artifact_boundary": {
     "theyos_path": "admin/contracts/mobile-claw-vpn/v1/owner_present_phase0_artifact_boundary_v1.tsv",
-    "format": "closed-git-subtrees-v1",
+    "format": "closed-git-inputs-v2",
     "policy_change_control": "explicit-owner-approved-versioned-transition",
     "object_identity_update": "per-reviewed-commit-revalidation",
     "object_identity_authority": "commit-bound-evidence-not-independent-approval",
     "release_provenance": "checker-on-release-subject-and-final-package-attestation",
-    "staged_product": "theyos-engine",
+    "staged_products": [
+      "nix-theyos-runtime",
+      "theyos-engine",
+      "theyos-llm-proxy"
+    ],
     "required_published_targets": [
       "x86_64-unknown-linux-musl",
       "aarch64-unknown-linux-musl",
-      "aarch64-apple-darwin"
+      "aarch64-apple-darwin",
+      "nix-theyos-runtime-x86_64-linux"
     ]
   },
   "phase1_blocker": {

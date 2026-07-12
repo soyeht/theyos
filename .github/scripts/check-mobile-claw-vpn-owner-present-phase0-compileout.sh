@@ -22,14 +22,33 @@ BOUNDARY_REL="admin/contracts/mobile-claw-vpn/v1/owner_present_phase0_artifact_b
 HEAD_SHA="$(git -C "${THEYOS_DIR}" rev-parse HEAD)"
 HEAD_TREE="$(git -C "${THEYOS_DIR}" rev-parse "${HEAD_SHA}^{tree}")"
 TMP_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/theyos-owner-present-phase0.XXXXXX")"
-trap 'rm -rf "${TMP_ROOT}"' EXIT
-SNAPSHOT="${THEYOS_DIR}"
-TARGET_DIR="${PHASE0_CARGO_TARGET_DIR:-${SNAPSHOT}/admin/rust/target}"
+trap 'chmod -R u+w "${TMP_ROOT}" 2>/dev/null || true; rm -rf "${TMP_ROOT}"' EXIT
 
 if [[ -n "$(git -C "${THEYOS_DIR}" status --porcelain --untracked-files=all)" ]]; then
   echo "::error::Phase 0 checker requires a clean checkout of the exact head object"
   exit 1
 fi
+
+SNAPSHOT="${TMP_ROOT}/source"
+mkdir -p "${SNAPSHOT}"
+git -C "${THEYOS_DIR}" archive --format=tar "${HEAD_SHA}" \
+  | tar -xf - -C "${SNAPSHOT}"
+SNAPSHOT="$(cd "${SNAPSHOT}" && pwd -P)"
+chmod -R a-w "${SNAPSHOT}"
+TARGET_DIR="${PHASE0_CARGO_TARGET_DIR:-${TMP_ROOT}/target}"
+
+if [[ -e "${TARGET_DIR}" && -n "$(find "${TARGET_DIR}" -mindepth 1 -print -quit 2>/dev/null)" ]]; then
+  echo "::error::canonical Cargo target directory must be empty before the authority build"
+  exit 1
+fi
+mkdir -p "${TARGET_DIR}"
+TARGET_DIR="$(cd "${TARGET_DIR}" && pwd -P)"
+case "${TARGET_DIR}/" in
+  "${SNAPSHOT}/"*)
+    echo "::error::canonical Cargo target directory must be outside the ODB snapshot"
+    exit 1
+    ;;
+esac
 
 require_blob() {
   local path="$1" expected_mode="${2:-100644}"
@@ -42,6 +61,26 @@ require_blob() {
   read -r mode type _ <<< "${entry}"
   if [[ "${mode}" != "${expected_mode}" || "${type}" != "blob" ]]; then
     echo "::error file=${path}::Phase 0 input must be a regular ${expected_mode} Git blob"
+    exit 1
+  fi
+  local expected_oid actual_oid
+  expected_oid="$(git -C "${THEYOS_DIR}" ls-tree "${HEAD_SHA}" -- "${path}" | awk '{print $3}')"
+  actual_oid="$(git -C "${THEYOS_DIR}" hash-object --no-filters "${SNAPSHOT}/${path}")"
+  if [[ "${actual_oid}" != "${expected_oid}" ]]; then
+    echo "::error file=${path}::ODB snapshot bytes differ from ${HEAD_SHA}"
+    exit 1
+  fi
+}
+
+verify_snapshot_matches_odb() {
+  local verification_snapshot="${TMP_ROOT}/source-verification"
+  rm -rf "${verification_snapshot}"
+  mkdir -p "${verification_snapshot}"
+  git -C "${THEYOS_DIR}" archive --format=tar "${HEAD_SHA}" \
+    | tar -xf - -C "${verification_snapshot}"
+  if ! diff -qr "${SNAPSHOT}" "${verification_snapshot}" >/dev/null; then
+    echo "::error::build mutated the ODB-derived source snapshot"
+    diff -qr "${SNAPSHOT}" "${verification_snapshot}" || true
     exit 1
   fi
 }
@@ -91,8 +130,8 @@ while IFS= read -r name; do
   fi
 done < <(compgen -e)
 
-SYSTEM_HOME="${HOME:?HOME is required to locate the pinned toolchain and Cargo cache}"
-CARGO_HOME_DIR="${PHASE0_CARGO_HOME:-${SYSTEM_HOME}/.cargo}"
+SYSTEM_HOME="${HOME:?HOME is required to locate the pinned toolchain}"
+CARGO_HOME_DIR="${PHASE0_CARGO_HOME:-${TMP_ROOT}/cargo-home}"
 RUSTUP_HOME_DIR="${PHASE0_RUSTUP_HOME:-${SYSTEM_HOME}/.rustup}"
 if [[ "${CARGO_HOME_DIR}" != /* || "${RUSTUP_HOME_DIR}" != /* ]]; then
   echo "::error::canonical Cargo and rustup homes must be absolute paths"
@@ -121,7 +160,7 @@ while [[ "${ancestor_dir}" != "/" ]]; do
 done
 
 EXPECTED_RUST="$(sed -n 's/^channel = "\([^"]*\)"/\1/p' \
-  "${THEYOS_DIR}/admin/rust/rust-toolchain.toml")"
+  "${SNAPSHOT}/admin/rust/rust-toolchain.toml")"
 if [[ -z "${EXPECTED_RUST}" ]]; then
   echo "::error::canonical Rust toolchain pin is missing"
   exit 1
@@ -134,12 +173,25 @@ if [[ ! -x "${ENV_BIN}" ]]; then
 fi
 CARGO_BIN="$(resolve_executable cargo)"
 RUSTC_BIN="$(resolve_executable rustc)"
-BUILD_TOOL_BIN="$(resolve_executable "${BUILD_TOOL}")"
+if [[ "${BUILD_TOOL}" == "cross" ]]; then
+  BUILD_TOOL_BIN="$(resolve_executable docker)"
+else
+  BUILD_TOOL_BIN="$(resolve_executable "${BUILD_TOOL}")"
+fi
 PYTHON_BIN="$(resolve_executable python3)"
 CANONICAL_PATH="$(dirname "${RUSTC_BIN}"):$(dirname "${CARGO_BIN}"):$(dirname "${BUILD_TOOL_BIN}"):$(dirname "${PYTHON_BIN}"):/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin"
 CLEAN_HOME="${TMP_ROOT}/home"
 CLEAN_TMP="${TMP_ROOT}/tmp"
+if [[ -e "${CARGO_HOME_DIR}" && -n "$(find "${CARGO_HOME_DIR}" -mindepth 1 -print -quit 2>/dev/null)" ]]; then
+  echo "::error::canonical Cargo home must be empty before the authority build"
+  exit 1
+fi
 mkdir -p "${CLEAN_HOME}" "${CLEAN_TMP}" "${TARGET_DIR}"
+mkdir -p "${CARGO_HOME_DIR}"
+if find "${CARGO_HOME_DIR}" -type l -print -quit 2>/dev/null | grep -q .; then
+  echo "::error::canonical Cargo home may not contain symlinks"
+  exit 1
+fi
 
 run_clean_online() {
   "${ENV_BIN}" -i \
@@ -160,7 +212,7 @@ run_clean() {
   run_clean_online CARGO_NET_OFFLINE=true "$@"
 }
 
-RUSTC_VERBOSE="$(cd "${THEYOS_DIR}/admin/rust" && run_clean_online "${RUSTC_BIN}" -vV)"
+RUSTC_VERBOSE="$(cd "${SNAPSHOT}/admin/rust" && run_clean_online "${RUSTC_BIN}" -vV)"
 ACTUAL_RUST="$(printf '%s\n' "${RUSTC_VERBOSE}" | sed -n 's/^release: //p')"
 RUSTC_HOST="$(printf '%s\n' "${RUSTC_VERBOSE}" | sed -n 's/^host: //p')"
 if [[ -z "${EXPECTED_RUST}" || "${ACTUAL_RUST}" != "${EXPECTED_RUST}" ]]; then
@@ -184,9 +236,9 @@ esac
 
 TRACKED_PKG_CONFIG_PATH="$(sed -n \
   's/^PKG_CONFIG_PATH = "\([^"]*\)"/\1/p' \
-  "${THEYOS_DIR}/admin/rust/.cargo/config.toml")"
-if [[ -z "${TRACKED_PKG_CONFIG_PATH}" ]]; then
-  echo "::error::frozen workspace Cargo config must pin PKG_CONFIG_PATH"
+  "${SNAPSHOT}/admin/rust/.cargo/config.toml")"
+if ! grep -Fq 'PKG_CONFIG_PATH = ""' "${SNAPSHOT}/admin/rust/.cargo/config.toml"; then
+  echo "::error::frozen workspace Cargo config must leave PKG_CONFIG_PATH empty"
   exit 1
 fi
 
@@ -229,8 +281,8 @@ validate_boundary_manifest() {
     count=$((count + 1))
   done < "${manifest}"
 
-  if [[ "${count}" -ne 4 ]]; then
-    echo "::error file=${BOUNDARY_REL}::signed Phase 0 boundary must contain exactly four closed subtrees"
+  if [[ "${count}" -ne 7 ]]; then
+    echo "::error file=${BOUNDARY_REL}::signed Phase 0 boundary must contain exactly seven closed inputs"
     exit 1
   fi
 
@@ -238,6 +290,9 @@ validate_boundary_manifest() {
     ".github" \
     "admin/rust" \
     "claws" \
+    "flake.lock" \
+    "flake.nix" \
+    "nix" \
     "scripts"; do
     if ! grep -Fqx -- "${path}" "${seen_paths}"; then
       echo "::error file=${BOUNDARY_REL}::required Phase 0 boundary path is absent: ${path}"
@@ -252,6 +307,7 @@ for path in \
   "${MANIFEST_REL}" \
   "admin/rust/Cargo.lock" \
   "admin/rust/rust-toolchain.toml" \
+  "admin/rust/clippy.toml" \
   "admin/rust/household-rs/Cargo.toml" \
   "admin/rust/household-rs/build.rs" \
   "admin/rust/household-rs/data/emoji-security-code-wordlist.csv" \
@@ -270,6 +326,9 @@ for path in \
   "admin/rust/server-rs/src/claw_store_routes.rs" \
   "admin/rust/server-rs/src/state.rs" \
   "admin/rust/server-rs/src/handlers_mobile.rs" \
+  "admin/rust/core-rs/src/product_a_phase0.rs" \
+  "flake.lock" \
+  "flake.nix" \
   "${BUILD_TOOL_MANIFEST_REL}" \
   "${BUILD_TOOL_SOURCE_REL}" \
   "${FOUNDATION_REL}" \
@@ -418,6 +477,11 @@ run_clean_online "${CARGO_BIN}" fetch \
   --manifest-path "${SNAPSHOT}/admin/rust/Cargo.toml" \
   --locked \
   --quiet
+if find "${CARGO_HOME_DIR}" -type l -print -quit 2>/dev/null | grep -q .; then
+  echo "::error::Cargo fetch created a symlink in the authority Cargo home"
+  exit 1
+fi
+chmod -R a-w "${CARGO_HOME_DIR}"
 
 METADATA_JSON="${TMP_ROOT}/cargo-metadata.json"
 run_clean "${CARGO_BIN}" metadata \
@@ -541,8 +605,10 @@ for listener_source in \
   "admin/rust/server-rs/src/main.rs" \
   "admin/rust/server-rs/src/household_listener.rs" \
   "admin/rust/server-rs/src/macos_local_registration_listener.rs" \
-  "admin/rust/server-rs/src/install_cli.rs"; do
-  if [[ "$(grep -Fc 'phase0_axum_serve!' "${SNAPSHOT}/${listener_source}")" -ne 1 ]]; then
+  "admin/rust/server-rs/src/install_cli.rs" \
+  "admin/rust/llm-proxy-rs/src/bin/theyos-llm-proxy.rs" \
+  "admin/rust/server-rs/src/bin/relay_stream_public_relay.rs"; do
+  if [[ "$(grep -Fc 'core_rs::phase0_axum_serve!' "${SNAPSHOT}/${listener_source}")" -ne 1 ]]; then
     echo "::error file=${listener_source}::published HTTP listener must use the Phase 0 serve choke-point"
     exit 1
   fi
@@ -559,6 +625,18 @@ run_clean "${CARGO_BIN}" test \
   -- \
   --test-threads=1 \
   >/dev/null
+
+(
+  cd "${SNAPSHOT}/admin/rust"
+  run_clean "${CARGO_BIN}" clippy \
+    --locked \
+    --offline \
+    --package server-rs \
+    --bin server \
+    --package llm-proxy-rs \
+    --bin theyos-llm-proxy \
+    -- -D warnings -D clippy::disallowed_methods
+)
 
 RELEASE_CHECKER_REL=".github/scripts/check-mobile-claw-vpn-owner-present-phase0-compileout.sh"
 if [[ "$(grep -Fc "${RELEASE_CHECKER_REL}" "${SNAPSHOT}/.github/workflows/release-linux.yml")" -ne 2 \
@@ -589,6 +667,38 @@ if ! grep -Fq "phase0_engine_sha256" "${SNAPSHOT}/.github/workflows/release-linu
   echo "::error::release provenance does not bind the verified engine to the published package"
   exit 1
 fi
+for nix_binding in \
+  'nix build .#theyos-runtime' \
+  'nix path-info --recursive --json' \
+  'phase0-nix-store-closure.json' \
+  'flake_lock_sha256' \
+  '--no-default-features' \
+  'third_target_injection_seam_compiled'; do
+  if ! grep -Fq "${nix_binding}" "${SNAPSHOT}/.github/workflows/owner-present-phase0-nix-runtime.yml" \
+    && ! grep -Fq "${nix_binding}" "${SNAPSHOT}/nix/packages/rust-workspace.nix"; then
+    echo "::error::Nix runtime Phase 0 binding is missing: ${nix_binding}"
+    exit 1
+  fi
+done
+if grep -Eq 'permissions:|id-token: write|attestations: write' \
+    "${SNAPSHOT}/.github/workflows/owner-present-phase0-nix-runtime.yml" \
+  && ! grep -Fq 'if: github.event_name == '\''push'\''' \
+    "${SNAPSHOT}/.github/workflows/owner-present-phase0-nix-runtime.yml"; then
+  echo "::error::Nix attestation credentials must be isolated to a push-only job"
+  exit 1
+fi
+while IFS= read -r workflow_path; do
+  workflow_name="$(basename "${workflow_path}")"
+  if grep -Eq 'contents:[[:space:]]*write|actions/attest-build-provenance@|secrets\.APPLE_' \
+      "${workflow_path}" \
+    && [[ "${workflow_name}" != "release-linux.yml" \
+      && "${workflow_name}" != "release-macos.yml" \
+      && "${workflow_name}" != "owner-present-phase0-compileout.yml" \
+      && "${workflow_name}" != "owner-present-phase0-nix-runtime.yml" ]]; then
+    echo "::error file=.github/workflows/${workflow_name}::unclassified workflow can publish, attest, or consume release credentials"
+    exit 1
+  fi
+done < <(find "${SNAPSHOT}/.github/workflows" -maxdepth 1 -type f \( -name '*.yml' -o -name '*.yaml' \) -print)
 for retired_path in \
   "admin/rust/server-rs/src/mobile_claw_vpn_relay_auth.rs" \
   "admin/rust/server-rs/src/mobile_claw_vpn_relay_dial_config.rs" \
@@ -625,7 +735,7 @@ if [[ "$(jq -r '.contract' "${AUTHORITY_STATUS}")" != \
   || "$(jq -r '.phase0_artifact_boundary.theyos_path' "${AUTHORITY_STATUS}")" != \
     "${BOUNDARY_REL}" \
   || "$(jq -r '.phase0_artifact_boundary.format' "${AUTHORITY_STATUS}")" != \
-    "closed-git-subtrees-v1" \
+    "closed-git-inputs-v2" \
   || "$(jq -r '.phase0_artifact_boundary.policy_change_control' "${AUTHORITY_STATUS}")" != \
     "explicit-owner-approved-versioned-transition" \
   || "$(jq -r '.phase0_artifact_boundary.object_identity_update' "${AUTHORITY_STATUS}")" != \
@@ -634,10 +744,10 @@ if [[ "$(jq -r '.contract' "${AUTHORITY_STATUS}")" != \
     "commit-bound-evidence-not-independent-approval" \
   || "$(jq -r '.phase0_artifact_boundary.release_provenance' "${AUTHORITY_STATUS}")" != \
     "checker-on-release-subject-and-final-package-attestation" \
-  || "$(jq -r '.phase0_artifact_boundary.staged_product' "${AUTHORITY_STATUS}")" != \
-    "theyos-engine" \
+  || "$(jq -r '.phase0_artifact_boundary.staged_products | sort | join(",")' "${AUTHORITY_STATUS}")" != \
+    "nix-theyos-runtime,theyos-engine,theyos-llm-proxy" \
   || "$(jq -r '.phase0_artifact_boundary.required_published_targets | sort | join(",")' "${AUTHORITY_STATUS}")" != \
-    "aarch64-apple-darwin,aarch64-unknown-linux-musl,x86_64-unknown-linux-musl" \
+    "aarch64-apple-darwin,aarch64-unknown-linux-musl,nix-theyos-runtime-x86_64-linux,x86_64-unknown-linux-musl" \
   || "$(jq -r '.phase1_blocker.minimum_wire_version' "${AUTHORITY_STATUS}")" != "2" \
   || "$(jq -r '.phase1_blocker.required_shape' "${AUTHORITY_STATUS}")" != \
     "server-held-finish-consume-mint" ]]; then
@@ -686,10 +796,13 @@ fi
       --package theyos-engine-build-rs \
       -- build "${TARGET}" "${BUILD_TOOL}" >/dev/null
 )
+verify_snapshot_matches_odb
 
 BINARY_DIR="${TARGET_DIR}/${TARGET}/release"
 BINARY="${BINARY_DIR}/server"
 DEPFILE="${BINARY_DIR}/server.d"
+PROXY_BINARY="${BINARY_DIR}/theyos-llm-proxy"
+PROXY_DEPFILE="${BINARY_DIR}/theyos-llm-proxy.d"
 STAGED_ENGINE="${PHASE0_STAGED_ENGINE_OUT:-${TMP_ROOT}/theyos-engine}"
 if [[ ! -x "${BINARY}" ]]; then
   echo "::error::release server binary was not produced for ${TARGET}"
@@ -699,6 +812,23 @@ if [[ ! -f "${DEPFILE}" ]]; then
   echo "::error::release server dependency graph was not produced for ${TARGET}"
   exit 1
 fi
+if [[ ! -x "${PROXY_BINARY}" || ! -f "${PROXY_DEPFILE}" ]]; then
+  echo "::error::release theyos-llm-proxy binary and depfile were not produced for ${TARGET}"
+  exit 1
+fi
+if [[ "${TARGET}" == *-apple-darwin ]]; then
+  PUBLISHED_HELPERS=(vmrunner_macos_ipc store-ipc terminal-ipc theyos-ssh theyos-provision-inject)
+else
+  PUBLISHED_HELPERS=(soyeht vmrunner_ipc fc-ssh store-ipc terminal-ipc imagebuilder)
+fi
+DEPFILES=("${DEPFILE}" "${PROXY_DEPFILE}")
+for helper in "${PUBLISHED_HELPERS[@]}"; do
+  if [[ ! -x "${BINARY_DIR}/${helper}" || ! -f "${BINARY_DIR}/${helper}.d" ]]; then
+    echo "::error::published helper and depfile are missing for ${TARGET}: ${helper}"
+    exit 1
+  fi
+  DEPFILES+=("${BINARY_DIR}/${helper}.d")
+done
 
 (
   cd "${SNAPSHOT}/admin/rust"
@@ -714,54 +844,24 @@ if ! cmp -s "${BINARY}" "${STAGED_ENGINE}"; then
   echo "::error::staged theyos-engine is not byte-identical to server-rs/server"
   exit 1
 fi
+verify_snapshot_matches_odb
 
 REPO_DEP_INPUTS="${TMP_ROOT}/repo-dep-inputs.nul"
 if ! run_clean "${PYTHON_BIN}" - \
-    "${DEPFILE}" \
     "${SNAPSHOT}" \
-    "${TARGET_DIR}" > "${REPO_DEP_INPUTS}" <<'PY'; then
+    "${TARGET_DIR}" \
+    "${CARGO_HOME_DIR}" \
+    "${RUSTUP_HOME_DIR}" \
+    "${DEPFILES[@]}" > "${REPO_DEP_INPUTS}" <<'PY'; then
 import os
 import pathlib
 import sys
 
-depfile = pathlib.Path(sys.argv[1])
-snapshot = pathlib.Path(sys.argv[2]).resolve()
-target_dir = pathlib.Path(sys.argv[3]).resolve()
-data = depfile.read_bytes().replace(b"\\\r\n", b"").replace(b"\\\n", b"")
-
-escaped = False
-separator = None
-for index, byte in enumerate(data):
-    if escaped:
-        escaped = False
-    elif byte == 0x5C:
-        escaped = True
-    elif byte == 0x3A:
-        separator = index
-        break
-if separator is None:
-    print("::error::Rust depfile has no target separator", file=sys.stderr)
-    raise SystemExit(1)
-
-tokens = []
-token = bytearray()
-escaped = False
-for byte in data[separator + 1:]:
-    if escaped:
-        token.append(byte)
-        escaped = False
-    elif byte == 0x5C:
-        escaped = True
-    elif byte in b" \t\r\n":
-        if token:
-            tokens.append(bytes(token))
-            token.clear()
-    else:
-        token.append(byte)
-if escaped:
-    token.append(0x5C)
-if token:
-    tokens.append(bytes(token))
+snapshot = pathlib.Path(sys.argv[1]).resolve()
+target_dir = pathlib.Path(sys.argv[2]).resolve()
+cargo_home = pathlib.Path(sys.argv[3]).resolve()
+rustup_home = pathlib.Path(sys.argv[4]).resolve()
+depfiles = [pathlib.Path(value) for value in sys.argv[5:]]
 
 def relative_to(path, root):
     try:
@@ -769,39 +869,82 @@ def relative_to(path, root):
     except ValueError:
         return None
 
-repo_inputs = set()
-for raw in tokens:
-    try:
-        text = raw.decode("utf-8")
-    except UnicodeDecodeError:
-        print("::error::Rust depfile contains a non-UTF-8 path", file=sys.stderr)
+def depfile_tokens(depfile):
+    data = depfile.read_bytes().replace(b"\\\r\n", b"").replace(b"\\\n", b"")
+    escaped = False
+    separator = None
+    for index, byte in enumerate(data):
+        if escaped:
+            escaped = False
+        elif byte == 0x5C:
+            escaped = True
+        elif byte == 0x3A:
+            separator = index
+            break
+    if separator is None:
+        print(f"::error::Rust depfile has no target separator: {depfile}", file=sys.stderr)
         raise SystemExit(1)
-    path = pathlib.Path(text)
-    if not path.is_absolute():
-        path = snapshot / "admin/rust" / path
-    normalized = pathlib.Path(os.path.normpath(path))
+    tokens = []
+    token = bytearray()
+    escaped = False
+    for byte in data[separator + 1:]:
+        if escaped:
+            token.append(byte)
+            escaped = False
+        elif byte == 0x5C:
+            escaped = True
+        elif byte in b" \t\r\n":
+            if token:
+                tokens.append(bytes(token))
+                token.clear()
+        else:
+            token.append(byte)
+    if escaped:
+        token.append(0x5C)
+    if token:
+        tokens.append(bytes(token))
+    return tokens
 
-    if relative_to(normalized, target_dir) is not None:
-        continue
-
-    relative = relative_to(normalized, snapshot)
-    if relative is None:
-        relative = relative_to(normalized, pathlib.Path("/project"))
-    if relative is None:
-        claws_relative = relative_to(normalized, pathlib.Path("/claws"))
-        if claws_relative is not None:
-            relative = pathlib.Path("claws") / claws_relative
-    if relative is None:
-        continue
-    relative_text = relative.as_posix()
-    if (
-        relative_text in {".git/HEAD", ".git/packed-refs"}
-        or relative_text.startswith(".git/refs/heads/")
-    ):
-        continue
-    if relative_text.startswith("admin/rust/target/"):
-        continue
-    repo_inputs.add(relative_text)
+allowed_system_roots = tuple(pathlib.Path(root) for root in (
+    "/usr", "/bin", "/sbin", "/lib", "/lib64", "/System",
+    "/Library/Developer", "/Applications/Xcode.app", "/opt/homebrew",
+))
+repo_inputs = set()
+for depfile in depfiles:
+    for raw in depfile_tokens(depfile):
+        try:
+            text = raw.decode("utf-8")
+        except UnicodeDecodeError:
+            print("::error::Rust depfile contains a non-UTF-8 path", file=sys.stderr)
+            raise SystemExit(1)
+        path = pathlib.Path(text)
+        if not path.is_absolute():
+            path = snapshot / "admin/rust" / path
+        normalized = pathlib.Path(os.path.normpath(path))
+        if relative_to(normalized, target_dir) is not None:
+            continue
+        relative = relative_to(normalized, snapshot)
+        if relative is None:
+            relative = relative_to(normalized, pathlib.Path("/project"))
+        if relative is None:
+            claws_relative = relative_to(normalized, pathlib.Path("/claws"))
+            if claws_relative is not None:
+                relative = pathlib.Path("claws") / claws_relative
+        if relative is None and relative_to(normalized, cargo_home) is not None:
+            continue
+        if relative is None and relative_to(normalized, rustup_home) is not None:
+            continue
+        if relative is None and any(relative_to(normalized, root) is not None for root in allowed_system_roots):
+            continue
+        if relative is None:
+            print(f"::error::Rust depfile input is outside modeled immutable roots: {normalized}", file=sys.stderr)
+            raise SystemExit(1)
+        relative_text = relative.as_posix()
+        if relative_text in {".git/HEAD", ".git/packed-refs"} or relative_text.startswith(".git/refs/heads/"):
+            continue
+        if relative_text.startswith("admin/rust/target/"):
+            continue
+        repo_inputs.add(relative_text)
 
 if not repo_inputs:
     print("::error::Rust depfile contains no repository inputs", file=sys.stderr)
@@ -816,7 +959,7 @@ fi
 repo_dep_count=0
 while IFS= read -r -d '' repo_input; do
   case "${repo_input}" in
-    .github/*|admin/rust/*|claws/*|scripts/*) ;;
+    .github/*|admin/rust/*|claws/*|nix/*|scripts/*|flake.nix|flake.lock) ;;
     *)
       echo "::error file=${repo_input}::production depfile input escapes the four closed Git subtrees"
       exit 1
@@ -824,7 +967,8 @@ while IFS= read -r -d '' repo_input; do
   esac
   require_blob "${repo_input}"
   if [[ "${repo_input}" == *.rs \
-    && "${repo_input}" != "${PHASE0_REL}" ]] \
+    && "${repo_input}" != "${PHASE0_REL}" \
+    && "${repo_input}" != "admin/rust/core-rs/src/product_a_phase0.rs" ]] \
     && grep -Eq 'axum[[:space:]]*::[[:space:]]*serve[[:space:]]*\(' \
       "${SNAPSHOT}/${repo_input}"; then
     echo "::error file=${repo_input}::production HTTP listeners must use the Phase 0 serve choke-point"
@@ -852,6 +996,7 @@ for required_source in \
     exit 1
   fi
 done
+for depfile in "${DEPFILES[@]}"; do
 for forbidden_source in \
   "mobile_claw_vpn_owner_present_foundation.rs" \
   "claw_vpn_mobile_mesh_store.rs" \
@@ -874,10 +1019,11 @@ for forbidden_source in \
   "mobile_claw_vpn_relay_dial_config.rs" \
   "mobile_claw_vpn_relay_responder.rs" \
   "mobile_claw_vpn_relay_responder_config.rs"; do
-  if grep -Fq "${forbidden_source}" "${DEPFILE}"; then
+  if grep -Fq "${forbidden_source}" "${depfile}"; then
     echo "::error::retired owner-present effect source entered the ${TARGET} production graph: ${forbidden_source}"
     exit 1
   fi
+done
 done
 
 if [[ "${TARGET}" == "${HOST_TARGET}" || "${PHASE0_RUN_ARTIFACT_DIRECT:-0}" == "1" ]]; then
@@ -895,6 +1041,21 @@ if [[ "${TARGET}" == "${HOST_TARGET}" || "${PHASE0_RUN_ARTIFACT_DIRECT:-0}" == "
     || "$(jq -r '.declared_product_a_routes[0]' "${CONTRACT_JSON}")" != \
       "/claw-vpn/status" ]]; then
     echo "::error::published theyos-engine Phase 0 artifact contract is not status-only"
+    exit 1
+  fi
+  PROXY_CONTRACT_JSON="${TMP_ROOT}/llm-proxy-artifact-contract.json"
+  "${PROXY_BINARY}" --owner-present-phase0-contract > "${PROXY_CONTRACT_JSON}"
+  if ! jq -e '
+      .schema == "theyos-product-a-phase0-http-boundary-v1"
+      and .component == "theyos-llm-proxy"
+      and .authority == "none"
+      and .production_activation == false
+      and .allowed_requests == [
+        {"method":"GET","path":"/api/v1/mobile/claw-vpn/status"},
+        {"method":"HEAD","path":"/api/v1/mobile/claw-vpn/status"}
+      ]
+    ' "${PROXY_CONTRACT_JSON}" >/dev/null; then
+    echo "::error::published theyos-llm-proxy Phase 0 contract is not GET/HEAD status-only"
     exit 1
   fi
 fi
@@ -929,6 +1090,38 @@ bind_relay_stream_reverse_connect_with_ip_tunnel_router
 assemble_relay_stream_live_with_ip_tunnel_router
 FORBIDDEN
 
+PUBLISHED_EXECUTABLES_JSON="${TMP_ROOT}/published-executables.json"
+jq -n '{}' > "${PUBLISHED_EXECUTABLES_JSON}"
+record_published_executable() {
+  local name="$1" path="$2" classification="$3" next
+  next="${TMP_ROOT}/published-executables.next.json"
+  jq -S --arg name "${name}" --arg sha256 "$(sha256_file "${path}")" \
+    --arg classification "${classification}" \
+    '. + {($name): {sha256: $sha256, classification: $classification}}' \
+    "${PUBLISHED_EXECUTABLES_JSON}" > "${next}"
+  mv "${next}" "${PUBLISHED_EXECUTABLES_JSON}"
+}
+
+for executable in "${PROXY_BINARY}" "${BINARY_DIR}/${PUBLISHED_HELPERS[@]}"; do
+  if [[ ! -x "${executable}" ]]; then
+    echo "::error::published executable is missing: ${executable}"
+    exit 1
+  fi
+  helper_strings="${TMP_ROOT}/$(basename "${executable}").strings"
+  LC_ALL=C strings "${executable}" > "${helper_strings}"
+  if grep -Eiq \
+      'RevalidatedCapability|ConsumedCapability|PointOfUsePermit|/api/v1/mobile/claw-vpn/(owner-present|owner|offers|sessions|rendezvous)' \
+      "${helper_strings}"; then
+    echo "::error::published executable contains a Product A authority marker: ${executable}"
+    exit 1
+  fi
+done
+record_published_executable "theyos-engine" "${BINARY}" "phase0-engine-contract"
+record_published_executable "theyos-llm-proxy" "${PROXY_BINARY}" "shared-http-get-head-status-boundary"
+for helper in "${PUBLISHED_HELPERS[@]}"; do
+  record_published_executable "${helper}" "${BINARY_DIR}/${helper}" "out-of-process-helper-no-server-rs-dependency"
+done
+
 NORMALIZED_DEPFILE="${TMP_ROOT}/server.normalized.d"
 sed \
   -e "s#${SNAPSHOT}#\$SOURCE#g" \
@@ -956,6 +1149,7 @@ jq -n -S \
   --arg cargo_config_sha256 "$(sha256_file "${SNAPSHOT}/admin/rust/.cargo/config.toml")" \
   --arg cross_config_sha256 "$(sha256_file "${SNAPSHOT}/admin/rust/Cross.toml")" \
   --arg cargo_lock_sha256 "$(sha256_file "${SNAPSHOT}/admin/rust/Cargo.lock")" \
+  --arg flake_lock_sha256 "$(sha256_file "${SNAPSHOT}/flake.lock")" \
   --arg cargo_workspace_sha256 "$(sha256_file "${SNAPSHOT}/admin/rust/Cargo.toml")" \
   --arg claws_manifest_sha256 "$(sha256_file "${SNAPSHOT}/claws/manifest.yml")" \
   --arg core_build_rs_sha256 "$(sha256_file "${SNAPSHOT}/admin/rust/core-rs/build.rs")" \
@@ -968,8 +1162,10 @@ jq -n -S \
   --arg engine_build_tool_manifest_sha256 "$(sha256_file "${SNAPSHOT}/${BUILD_TOOL_MANIFEST_REL}")" \
   --arg engine_build_tool_source_sha256 "$(sha256_file "${SNAPSHOT}/${BUILD_TOOL_SOURCE_REL}")" \
   --arg depfile_sha256 "$(sha256_file "${NORMALIZED_DEPFILE}")" \
+  --arg proxy_depfile_sha256 "$(sha256_file "${PROXY_DEPFILE}")" \
   --arg server_sha256 "$(sha256_file "${BINARY}")" \
   --arg theyos_engine_sha256 "$(sha256_file "${STAGED_ENGINE}")" \
+  --argjson published_executables "$(cat "${PUBLISHED_EXECUTABLES_JSON}")" \
   --arg xcode_version "${XCODE_VERSION}" \
   --arg macos_sdk_version "${MACOS_SDK_VERSION}" \
   --argjson published_target "${PUBLISHED_TARGET}" \
@@ -986,6 +1182,7 @@ jq -n -S \
     cargo_config_sha256: $cargo_config_sha256,
     cross_config_sha256: $cross_config_sha256,
     cargo_lock_sha256: $cargo_lock_sha256,
+    flake_lock_sha256: $flake_lock_sha256,
     cargo_workspace_sha256: $cargo_workspace_sha256,
     claws_manifest_sha256: $claws_manifest_sha256,
     core_build_rs_sha256: $core_build_rs_sha256,
@@ -998,8 +1195,10 @@ jq -n -S \
     engine_build_tool_manifest_sha256: $engine_build_tool_manifest_sha256,
     engine_build_tool_source_sha256: $engine_build_tool_source_sha256,
     depfile_sha256: $depfile_sha256,
+    proxy_depfile_sha256: $proxy_depfile_sha256,
     server_sha256: $server_sha256,
     theyos_engine_sha256: $theyos_engine_sha256,
+    published_executables: $published_executables,
     xcode_version: $xcode_version,
     macos_sdk_version: $macos_sdk_version,
     published_target: $published_target,
@@ -1009,7 +1208,8 @@ jq -n -S \
     cargo_features: [],
     build_environment_policy: "env-clear-positive-allowlist-v1",
     cargo_source_policy: "local-admin-rust-or-canonical-crates-io-v1",
-    cargo_net_offline: true,
+    cargo_fetch_network: true,
+    post_fetch_build_offline: true,
     custom_build_targets: [
       "admin/rust/core-rs/build.rs",
       "admin/rust/household-rs/build.rs",

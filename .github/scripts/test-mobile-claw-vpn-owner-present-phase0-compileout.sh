@@ -12,14 +12,7 @@ trap 'rm -rf "${TMP_ROOT}"' EXIT
 HOST_TARGET="$(rustc -vV | sed -n 's/^host: //p')"
 SHARED_TARGET="${TMP_ROOT}/target"
 CHECKER_CARGO_HOME="${TMP_ROOT}/cargo-home"
-SYSTEM_CARGO_HOME="${CARGO_HOME:-${HOME}/.cargo}"
 mkdir -p "${CHECKER_CARGO_HOME}"
-for cache_entry in registry git; do
-  if [[ -e "${SYSTEM_CARGO_HOME}/${cache_entry}" ]]; then
-    ln -s "${SYSTEM_CARGO_HOME}/${cache_entry}" \
-      "${CHECKER_CARGO_HOME}/${cache_entry}"
-  fi
-done
 
 clone_head() {
   local destination="$1"
@@ -27,6 +20,11 @@ clone_head() {
   git -C "${destination}" checkout --quiet "$(git -C "${REPO_ROOT}" rev-parse HEAD)"
   git -C "${destination}" config user.name "phase0-compileout-test"
   git -C "${destination}" config user.email "phase0-compileout@example.invalid"
+}
+
+prepare_empty_authority_inputs() {
+  rm -rf "${SHARED_TARGET}" "${CHECKER_CARGO_HOME}"
+  mkdir -p "${SHARED_TARGET}" "${CHECKER_CARGO_HOME}"
 }
 
 commit_mutation() {
@@ -52,6 +50,7 @@ refresh_boundary_tree_entry() {
 
 expect_checker_failure() {
   local label="$1" expected="$2" root="$3"
+  prepare_empty_authority_inputs
   if PHASE0_TARGET="${HOST_TARGET}" \
       PHASE0_BUILD_TOOL=cargo \
       PHASE0_CARGO_HOME="${CHECKER_CARGO_HOME}" \
@@ -240,7 +239,7 @@ while IFS='|' read -r listener_label listener_source; do
   listener_bypass="${TMP_ROOT}/${listener_label}"
   clone_head "${listener_bypass}"
   perl -0pi -e \
-    's/(?:server_rs|crate)::phase0_axum_serve!/axum::serve/' \
+    's/core_rs::phase0_axum_serve!/axum::serve/' \
     "${listener_bypass}/${listener_source}"
   refresh_boundary_tree_entry "${listener_bypass}" "admin/rust"
   commit_mutation "${listener_bypass}" "${listener_label}"
@@ -252,6 +251,8 @@ main_listener_bypass|admin/rust/server-rs/src/main.rs
 household_listener_bypass|admin/rust/server-rs/src/household_listener.rs
 macos_local_listener_bypass|admin/rust/server-rs/src/macos_local_registration_listener.rs
 install_listener_bypass|admin/rust/server-rs/src/install_cli.rs
+llm_proxy_listener_bypass|admin/rust/llm-proxy-rs/src/bin/theyos-llm-proxy.rs
+relay_public_listener_bypass|admin/rust/server-rs/src/bin/relay_stream_public_relay.rs
 LISTENERS
 
 new_unclosed_listener="${TMP_ROOT}/new-unclosed-listener"
@@ -305,11 +306,11 @@ expect_checker_failure generic_ip_tunnel_store \
 build_cfg="${TMP_ROOT}/build-cfg"
 clone_head "${build_cfg}"
 perl -0pi -e \
-  's/emit_build_git_sha\(\);/emit_build_git_sha();\n    println!("cargo:rustc-cfg=owner_present_hidden");/' \
+  's/emit_build_git_sha\(\);/emit_build_git_sha();\n    println!("cargo:rustc-cfg=owner_present_hidden");\n    let source = std::path::PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap()).join("src/handlers_misc.rs");\n    let bytes = std::fs::read(&source).unwrap();\n    if std::fs::write(&source, &bytes).is_ok() { panic!("Phase 0 source snapshot was writable"); }/' \
   "${build_cfg}/admin/rust/server-rs/build.rs"
 commit_mutation "${build_cfg}" build-cfg
 expect_checker_failure build_cfg_crossing \
-  "signed Phase 0 boundary object differs from ${BOUNDARY_REL}" \
+  "Phase 0 source snapshot was writable" \
   "${build_cfg}"
 
 build_tool_codegen="${TMP_ROOT}/build-tool-codegen"
@@ -399,6 +400,21 @@ commit_mutation "${external_include}" external-include
 expect_checker_failure external_include \
   "production depfile input escapes the four closed Git subtrees" \
   "${external_include}"
+
+absolute_external_include="${TMP_ROOT}/absolute-external-include"
+clone_head "${absolute_external_include}"
+ambient_input="${TMP_ROOT}/ambient-compile-input.txt"
+printf '%s\n' 'ambient input must never be an authority' > "${ambient_input}"
+cat >> "${absolute_external_include}/admin/rust/server-rs/src/handlers_misc.rs" <<RUST
+
+pub const PHASE0_ABSOLUTE_EXTERNAL_INCLUDE: &[u8] =
+    include_bytes!("${ambient_input}");
+RUST
+refresh_boundary_tree_entry "${absolute_external_include}" "admin/rust"
+commit_mutation "${absolute_external_include}" absolute-external-include
+expect_checker_failure absolute_external_include \
+  "Rust depfile input is outside modeled immutable roots" \
+  "${absolute_external_include}"
 
 manifest_override="${TMP_ROOT}/manifest-override"
 clone_head "${manifest_override}"
@@ -543,6 +559,26 @@ commit_mutation "${release_subject_bypass}" release-subject-bypass
 expect_checker_failure release_subject_bypass \
   "every theyos-engine release target must run the Phase 0 checker on its own subject" \
   "${release_subject_bypass}"
+
+alternate_publisher="${TMP_ROOT}/alternate-publisher"
+clone_head "${alternate_publisher}"
+cat > "${alternate_publisher}/.github/workflows/release-alt.yml" <<'YAML'
+name: Unclassified publisher
+on:
+  workflow_dispatch:
+permissions:
+  contents: write
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo forbidden
+YAML
+refresh_boundary_tree_entry "${alternate_publisher}" ".github"
+commit_mutation "${alternate_publisher}" alternate-publisher
+expect_checker_failure alternate_publisher \
+  "unclassified workflow can publish, attest, or consume release credentials" \
+  "${alternate_publisher}"
 
 marker="${TMP_ROOT}/marker"
 clone_head "${marker}"

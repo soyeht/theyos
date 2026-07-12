@@ -1,22 +1,10 @@
 # Cross.toml — cross-rs configuration for Linux cross-compilation.
 #
-# Used by `cross build --target <triple>` in make.sh and CI.
-# Install: cargo install cross --git https://github.com/cross-rs/cross
-#
-# Targets: x86_64-unknown-linux-gnu, aarch64-unknown-linux-gnu
-# Both pin to glibc 2.31 (Ubuntu 20.04 LTS minimum, Debian 11+).
-#
-# Rationale (R4 in research.md): `cross` provides Docker-based toolchains
-# that handle glibc version pinning without requiring zig-cc or native runners.
+# The authority recipe invokes the pinned OCI images directly; no Cross CLI or
+# arbitrary pre-build hook is part of the production path.
 
 [build]
 pre-build = []
-
-[target.x86_64-unknown-linux-gnu]
-image = "ghcr.io/cross-rs/x86_64-unknown-linux-gnu:main"
-
-[target.aarch64-unknown-linux-gnu]
-image = "ghcr.io/cross-rs/aarch64-unknown-linux-gnu:main"
 
 # Phase 0 production images are immutable OCI index digests for cross 0.2.5.
 [target.x86_64-unknown-linux-musl]

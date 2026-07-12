@@ -4,6 +4,7 @@
 { pkgs, craneLib, packageName ? "theyos-admin", excludedMembers ? [ "vmrunner-macos-rs" ] }:
 
 let
+  flakeLockSha256 = builtins.hashFile "sha256" ../../flake.lock;
   # Use crane's cleanCargoSource plus extra filters for non-Rust assets that
   # crates pull in via include_str!:
   #   - .html files (e.g. server-rs/.../privacy.html)
@@ -42,13 +43,15 @@ let
     version = "0.1.1";
 
     cargoExtraArgs = pkgs.lib.concatStringsSep " " (
-      [ "--workspace" ]
+      [ "--workspace" "--no-default-features" ]
       ++ map (member: "--exclude ${member}") excludedMembers
     );
 
     # Native build inputs (available at build time).
     nativeBuildInputs = with pkgs; [
       pkg-config
+      jq
+      binutils
       # ring (via russh) needs a C compiler and perl for its build script
       perl
     ];
@@ -72,6 +75,11 @@ let
     # without this the relative include_str! path escapes the sandbox.
     THEYOS_EMOJI_WORDLIST = emojiWordlistSrc;
 
+    # The repository Cargo config deliberately leaves this empty so a Nix
+    # host path cannot leak into OCI/release builds. Nix supplies the real
+    # target-aware pkg-config root here.
+    PKG_CONFIG_PATH = "${pkgs.openssl.dev}/lib/pkgconfig";
+
     # Contract tests expect admin/contracts/ at ../../contracts/ relative to
     # each crate's CARGO_MANIFEST_DIR. In the Nix sandbox the workspace is at
     # /build/source/, so tests look for /build/contracts/.
@@ -87,6 +95,49 @@ in
   # Phase 2: build the workspace itself (uses cached deps).
   craneLib.buildPackage (commonArgs // {
     cargoArtifacts = depsOnly;
+
+    postInstall = ''
+      mkdir -p "$out/bin"
+      for executable in server theyos-llm-proxy soyeht vmrunner_ipc fc-ssh store-ipc terminal-ipc imagebuilder; do
+        if [ -x "target/release/$executable" ]; then
+          install -m 0755 "target/release/$executable" "$out/bin/$executable"
+        fi
+      done
+      test -x "$out/bin/server"
+      test -x "$out/bin/theyos-llm-proxy"
+      for executable in "$out"/bin/*; do
+        if strings "$executable" | grep -Eiq \
+          'RevalidatedCapability|ConsumedCapability|PointOfUsePermit|owner_present|/api/v1/mobile/claw-vpn/(owner|offers|sessions|rendezvous)'; then
+          echo "Phase 0 marker found in $executable" >&2
+          exit 1
+        fi
+      done
+      server_contract="$($out/bin/server --owner-present-phase0-contract)"
+      proxy_contract="$($out/bin/theyos-llm-proxy --owner-present-phase0-contract)"
+      echo "$server_contract" | jq -e '
+        .authority == "none"
+        and .production_activation == false
+        and .third_target_injection_seam_compiled == false
+        and .generic_ip_tunnel_backend_compiled == false
+        and .generic_ip_tunnel_store_accepts_resource == false
+        and .generic_ip_tunnel_env_accepts_resource == false
+        and .declared_product_a_routes == ["/claw-vpn/status"]
+      ' >/dev/null
+      echo "$proxy_contract" | jq -e '
+        .authority == "none"
+        and .production_activation == false
+        and .allowed_requests == [
+          {"method":"GET","path":"/api/v1/mobile/claw-vpn/status"},
+          {"method":"HEAD","path":"/api/v1/mobile/claw-vpn/status"}
+        ]
+      ' >/dev/null
+      jq -n -S \
+        --arg flake_lock_sha256 "${flakeLockSha256}" \
+        --arg server_sha256 "$(sha256sum "$out/bin/server" | cut -d' ' -f1)" \
+        --arg proxy_sha256 "$(sha256sum "$out/bin/theyos-llm-proxy" | cut -d' ' -f1)" \
+        '{schema:"theyos-phase0-nix-runtime-manifest-v1",flake_lock_sha256:$flake_lock_sha256,executables:{server:$server_sha256,theyos_llm_proxy:$proxy_sha256},owner_present_authority:"none",production_activation:false}' \
+        > "$out/phase0-runtime-manifest.json"
+    '';
 
     # Skip tests that assume a normal Linux filesystem (fail in Nix sandbox):
     #   - which_binary_finds_sh: /bin/sh doesn't exist in sandbox

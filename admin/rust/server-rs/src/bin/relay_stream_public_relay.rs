@@ -118,7 +118,7 @@ async fn spawn_status_server(
         "relay_stream public relay status listening on {local_addr} (loopback, bearer-token auth)"
     );
     Ok(tokio::spawn(async move {
-        axum::serve(listener, app)
+        core_rs::phase0_axum_serve!(listener, app)
             .await
             .map_err(|error| io::Error::other(format!("status server failed: {error}")))
     }))

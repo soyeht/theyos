@@ -180,7 +180,7 @@ fn spawn_listener_task(
         let shutdown = async move {
             let _ = shutdown_rx.await;
         };
-        if let Err(e) = crate::phase0_axum_serve!(listener, router, connect_info = SocketAddr)
+        if let Err(e) = core_rs::phase0_axum_serve!(listener, router, connect_info = SocketAddr)
             .with_graceful_shutdown(shutdown)
             .await
         {

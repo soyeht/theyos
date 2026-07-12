@@ -1345,6 +1345,26 @@ async fn mobile_claw_vpn_phase0_exposes_only_authenticated_unavailable_status() 
     assert_eq!(body["production_activation"], false);
     assert_eq!(body["state"], "unavailable");
     assert_eq!(body.as_object().expect("Phase 0 status object").len(), 4);
+
+    for method in [
+        Method::POST,
+        Method::PUT,
+        Method::PATCH,
+        Method::DELETE,
+        Method::OPTIONS,
+    ] {
+        let (status, _bytes, _body) = request(
+            server_rs::mobile_claw_vpn_phase0::close_production_app(mobile_router(Arc::clone(
+                &state,
+            ))),
+            method,
+            status_path,
+            b"{}".to_vec(),
+            Some(format!("Bearer {token}")),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
 }
 
 #[tokio::test]

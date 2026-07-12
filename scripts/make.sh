@@ -251,7 +251,8 @@ codesign_macos_binaries() {
 #
 # Skipped (with info-level log) when:
 # - THEYOS_CODESIGN_IDENTITY is unset (ad-hoc binaries can't be notarized)
-# - APPLE_ID / APPLE_TEAM_ID / APPLE_ID_APP_PASSWORD env vars aren't all set
+# - APPLE_NOTARY_KEY_P8 / APPLE_NOTARY_KEY_ID / APPLE_NOTARY_ISSUER_ID env vars
+#   aren't all set
 notarize_macos() {
     if [ "${PLATFORM}" != "macos-arm64" ] && [ "${PLATFORM}" != "macos-intel" ]; then
         return 0
@@ -260,8 +261,8 @@ notarize_macos() {
         info "Skipping notarization (THEYOS_CODESIGN_IDENTITY unset; ad-hoc binaries can't be notarized)"
         return 0
     fi
-    if [ -z "${APPLE_ID:-}" ] || [ -z "${APPLE_TEAM_ID:-}" ] || [ -z "${APPLE_ID_APP_PASSWORD:-}" ]; then
-        warn "Skipping notarization: APPLE_ID / APPLE_TEAM_ID / APPLE_ID_APP_PASSWORD must all be set"
+    if [ -z "${APPLE_NOTARY_KEY_P8:-}" ] || [ -z "${APPLE_NOTARY_KEY_ID:-}" ] || [ -z "${APPLE_NOTARY_ISSUER_ID:-}" ]; then
+        warn "Skipping notarization: APPLE_NOTARY_KEY_P8 / APPLE_NOTARY_KEY_ID / APPLE_NOTARY_ISSUER_ID must all be set"
         warn "  Expected for tagged release builds; safe to skip on local dev."
         return 0
     fi
@@ -275,9 +276,9 @@ notarize_macos() {
 
     info "Submitting to Apple notarytool (typically 1-3 minutes)..."
     xcrun notarytool submit "${zip_path}" \
-        --apple-id "${APPLE_ID}" \
-        --team-id "${APPLE_TEAM_ID}" \
-        --password "${APPLE_ID_APP_PASSWORD}" \
+        --key "${APPLE_NOTARY_KEY_P8}" \
+        --key-id "${APPLE_NOTARY_KEY_ID}" \
+        --issuer "${APPLE_NOTARY_ISSUER_ID}" \
         --wait
 
     rm -f "${zip_path}"
@@ -478,18 +479,18 @@ package_soyeht_mac() {
     # have the Developer ID cert in their trust store. Gracefully no-ops when any
     # Apple credential is absent (dev workflow / CI without secrets).
     if [ -n "${sign_id}" ] \
-        && [ -n "${APPLE_ID:-}" ] \
-        && [ -n "${APPLE_TEAM_ID:-}" ] \
-        && [ -n "${APPLE_ID_APP_PASSWORD:-}" ]; then
+        && [ -n "${APPLE_NOTARY_KEY_P8:-}" ] \
+        && [ -n "${APPLE_NOTARY_KEY_ID:-}" ] \
+        && [ -n "${APPLE_NOTARY_ISSUER_ID:-}" ]; then
         local notarize_zip="${REPO_ROOT}/.notarize-soyeht-engine.zip"
         rm -f "${notarize_zip}"
         info "Creating notarization ZIP: ${notarize_zip}"
         ditto -c -k --keepParent "${helpers_dir}" "${notarize_zip}"
         info "Submitting to Apple notarytool (typically 1-3 minutes)..."
         xcrun notarytool submit "${notarize_zip}" \
-            --apple-id "${APPLE_ID}" \
-            --team-id "${APPLE_TEAM_ID}" \
-            --password "${APPLE_ID_APP_PASSWORD}" \
+            --key "${APPLE_NOTARY_KEY_P8}" \
+            --key-id "${APPLE_NOTARY_KEY_ID}" \
+            --issuer "${APPLE_NOTARY_ISSUER_ID}" \
             --wait
         rm -f "${notarize_zip}"
         # Staple the Gatekeeper ticket to the app bundle so offline validation works.
@@ -521,9 +522,9 @@ package_soyeht_mac() {
 #   theyos-engine-<version>-linux-<arch>.tar.gz
 #   theyos-engine-<version>-linux-<arch>.tar.gz.sha256
 #
-# Requires cross-compilation toolchains. On macOS with Docker installed,
-# uses cross (cargo install cross). On Linux, uses cargo with the target
-# toolchain installed.
+# Requires explicitly provisioned target toolchains. The Phase 0 release
+# workflow uses its pinned OCI recipe and this helper never discovers an
+# ambient Cross CLI.
 package_engine_linux() {
     local version
     version=$(git -C "${REPO_ROOT}" describe --tags --always 2>/dev/null || echo "dev")
@@ -537,18 +538,10 @@ package_engine_linux() {
         local pkg_name="theyos-engine-${version}-linux-${arch}"
 
         info "Building server-rs for ${rust_target}..."
-        if command -v cross &>/dev/null; then
-            run_engine_build_tool build "${rust_target}" cross >/dev/null
-        else
-            run_engine_build_tool build "${rust_target}" cargo >/dev/null
-        fi
+        run_engine_build_tool build "${rust_target}" cross >/dev/null
 
         info "Building soyeht CLI for ${rust_target}..."
-        if command -v cross &>/dev/null; then
-            (cd "${rust_dir}" && cross build -p soyeht-rs --bin soyeht --release --target "${rust_target}")
-        else
-            (cd "${rust_dir}" && cargo build -p soyeht-rs --bin soyeht --release --target "${rust_target}")
-        fi
+        (cd "${rust_dir}" && cargo build -p soyeht-rs --bin soyeht --release --target "${rust_target}")
 
         # Binary name is `server` per server-rs/Cargo.toml [[bin]] config.
         local soyeht_src="${rust_dir}/target/${rust_target}/release/soyeht"

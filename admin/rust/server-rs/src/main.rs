@@ -597,7 +597,7 @@ async fn main() {
 
     info!("Listening on {}", cfg.addr);
 
-    server_rs::phase0_axum_serve!(listener, app)
+    core_rs::phase0_axum_serve!(listener, app)
         .with_graceful_shutdown(server_rs::shutdown::shutdown_signal())
         .await
         .expect("Server error");

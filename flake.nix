@@ -25,7 +25,7 @@
           packageName = "theyos-runtime";
           # imagebuilder-rs is included: install_worker spawns it on-demand
           # when a user installs a tier=available claw that needs build-from-plan.
-          excludedMembers = [ "vmrunner-macos-rs" "e2e-rs" ];
+          excludedMembers = [ "vmrunner-macos-rs" "e2e-rs" "t1-iptunnel-dev-runner-rs" ];
         };
         theyosBuilder = import ./nix/packages/rust-workspace.nix {
           inherit pkgs craneLib;

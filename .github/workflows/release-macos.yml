@@ -1,293 +1,274 @@
 name: Release (macOS)
 
-# Triggered on `v*` tag pushes (e.g. `v0.1.6`, `v0.1.7`, ...).
-# Builds + Developer-ID-signs + notarizes the macOS tarball, creates the
-# GitHub Release, and commits the regenerated Homebrew formula back to main.
-#
-# Prereqs (one-time, manual):
-# 1. Add Repository Secrets at Settings → Secrets and variables → Actions:
-#    - APPLE_DEVELOPER_ID_P12_BASE64       (base64-encoded .p12 export of the
-#                                           Developer ID Application cert)
-#    - APPLE_DEVELOPER_ID_P12_PASSWORD     (password used during .p12 export)
-#    - APPLE_ID                             (caio's Apple ID email)
-#    - APPLE_ID_APP_PASSWORD                (app-specific password from
-#                                           appleid.apple.com)
-#    - APPLE_TEAM_ID                        (10-char Team identifier)
-#    - APPLE_CODESIGN_IDENTITY              (e.g. "Developer ID Application:
-#                                           Caio Salgado (TEAM_ID)")
-# 2. Cargo workspace version must match the tag — `generate-brew-formula.sh`
-#    reads the version from `admin/rust/soyeht-rs/Cargo.toml`. Tag `v0.1.6`
-#    requires Cargo at `0.1.6`. See `docs/release-pipeline.md`.
-#
-# See `~/.claude/plans/giggly-knitting-meadow.md` for the design doc this
-# workflow implements.
-
+# Release authority is tag-only. A tag must already be an ancestor of main;
+# workflow_dispatch is intentionally absent so a branch ref cannot be paired
+# with a different tag input.
 on:
   push:
     tags:
       - "v*"
-  workflow_dispatch:
-    inputs:
-      tag:
-        description: "Tag to release (e.g. v0.1.6). Must already exist on a commit."
-        required: true
 
 permissions:
-  contents: write        # gh release create + commit formula back to main
-  pull-requests: write   # gh pr create + gh pr merge --admin for formula update
-  id-token: write        # signed provenance for the exact published tarball
-  attestations: write
+  contents: read
 
 jobs:
-  release-macos:
-    name: Build, sign, notarize, release
+  build-unsigned-macos:
+    name: Build and attest unsigned macOS subjects
     runs-on: macos-15
     timeout-minutes: 60
-
     env:
-      TAG: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.tag || github.ref_name }}
+      TAG: ${{ github.ref_name }}
+      PHASE0_TARGET: aarch64-apple-darwin
+      PHASE0_BUILD_TOOL: cargo
+      PHASE0_ATTESTATION: ${{ runner.temp }}/phase0-attestation-aarch64-apple-darwin.json
+      PHASE0_ENGINE: ${{ runner.temp }}/theyos-engine-aarch64-apple-darwin
 
     steps:
-      - name: Checkout (full history for tag)
-        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+      - name: Checkout exact tag
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
         with:
           fetch-depth: 0
-          ref: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.tag || github.ref }}
+          persist-credentials: false
 
-      - name: Setup Rust
-        uses: dtolnay/rust-toolchain@5a814b2e0f75e492da42a3c1227d52112e4dac50 # 1.92.0
+      - name: Verify attested source identity
+        run: |
+          set -euo pipefail
+          test "$GITHUB_REF_TYPE" = tag
+          test "$TAG" = "$GITHUB_REF_NAME"
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          git fetch --no-tags origin main:refs/remotes/origin/main
+          git merge-base --is-ancestor "$GITHUB_SHA" origin/main
 
-      - name: Cache Rust dependencies
-        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - name: Setup pinned Rust
+        uses: dtolnay/rust-toolchain@5a814b2e0f75e492da42a3c1227d52112e4dac50
         with:
-          workspaces: "admin/rust -> target"
-          # Different cache scope from PR builds — release builds are
-          # release-profile, distinct from the Backend CI's debug-profile cache.
-          shared-key: "release"
+          targets: aarch64-apple-darwin
 
-      - name: Verify tag matches Cargo.toml version
-        # generate-brew-formula.sh:37 reads the version from Cargo.toml; the
-        # release URL is built from that version. Tag and Cargo must agree.
+      - name: Verify tag matches Cargo version
         run: |
-          CARGO_VERSION=$(grep '^version' admin/rust/soyeht-rs/Cargo.toml | sed 's/version = "\(.*\)"/\1/')
-          EXPECTED_TAG="v${CARGO_VERSION}"
-          if [ "$TAG" != "$EXPECTED_TAG" ]; then
-            echo "::error::Tag ($TAG) does not match Cargo version ($EXPECTED_TAG)."
-            echo "Update admin/rust/soyeht-rs/Cargo.toml + the rest of the workspace"
-            echo "to $CARGO_VERSION before tagging, or retag to $EXPECTED_TAG."
-            exit 1
-          fi
-          echo "TAG=$TAG matches Cargo version. OK."
+          set -euo pipefail
+          version="$(sed -n 's/^version = "\(.*\)"/\1/p' admin/rust/soyeht-rs/Cargo.toml | head -1)"
+          test "$TAG" = "v$version"
 
-      - name: Verify and stage the unsigned Phase 0 engine
-        id: phase0
+      - name: Build, inspect, and attest unsigned subjects
+        shell: bash
+        env:
+          PHASE0_CARGO_TARGET_DIR: ${{ runner.temp }}/phase0-target
+          PHASE0_CARGO_HOME: ${{ runner.temp }}/phase0-cargo-home
+          PHASE0_RUN_ARTIFACT_DIRECT: "1"
+          PHASE0_ATTESTATION_OUT: ${{ runner.temp }}/phase0-attestation-aarch64-apple-darwin.json
+          PHASE0_STAGED_ENGINE_OUT: ${{ runner.temp }}/theyos-engine-aarch64-apple-darwin
         run: |
-          set -e
-          cargo test \
-            --manifest-path admin/rust/Cargo.toml \
-            --locked \
-            --package server-rs \
-            --test claw_store_wire_contract \
-            mobile_claw_vpn_phase0_ \
+          set -euo pipefail
+          rm -rf "$PHASE0_CARGO_TARGET_DIR" "$PHASE0_CARGO_HOME"
+          mkdir -p "$PHASE0_CARGO_TARGET_DIR" "$PHASE0_CARGO_HOME"
+          cargo test --manifest-path admin/rust/Cargo.toml --locked \
+            --package server-rs --test claw_store_wire_contract mobile_claw_vpn_phase0_ \
             -- --test-threads=1
-          PHASE0_ATTESTATION="$RUNNER_TEMP/phase0-attestation-aarch64-apple-darwin.json"
-          PHASE0_ENGINE="$RUNNER_TEMP/theyos-engine-aarch64-apple-darwin-unsigned"
-          PHASE0_TARGET=aarch64-apple-darwin \
-          PHASE0_BUILD_TOOL=cargo \
-          PHASE0_CARGO_TARGET_DIR="$GITHUB_WORKSPACE/admin/rust/target" \
-          PHASE0_RUN_ARTIFACT_DIRECT=1 \
-          PHASE0_ATTESTATION_OUT="$PHASE0_ATTESTATION" \
-          PHASE0_STAGED_ENGINE_OUT="$PHASE0_ENGINE" \
-            bash .github/scripts/check-mobile-claw-vpn-owner-present-phase0-compileout.sh
-          echo "attestation=$PHASE0_ATTESTATION" >> "$GITHUB_OUTPUT"
-          echo "unsigned_sha256=$(jq -r '.theyos_engine_sha256' "$PHASE0_ATTESTATION")" >> "$GITHUB_OUTPUT"
+          bash .github/scripts/check-mobile-claw-vpn-owner-present-phase0-compileout.sh
 
-      - name: Import Developer ID cert into ephemeral keychain
+      - name: Package exact unsigned subjects
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="$(sed -n 's/^version = "\(.*\)"/\1/p' admin/rust/soyeht-rs/Cargo.toml | head -1)"
+          stage="$RUNNER_TEMP/macos-unsigned/stage"
+          rm -rf "$RUNNER_TEMP/macos-unsigned"
+          mkdir -p "$stage"
+          binary_dir="$RUNNER_TEMP/phase0-target/aarch64-apple-darwin/release"
+          cp "$PHASE0_ENGINE" "$stage/theyos-engine"
+          for executable in vmrunner_macos_ipc store-ipc terminal-ipc theyos-ssh theyos-provision-inject; do
+            cp "$binary_dir/$executable" "$stage/$executable"
+          done
+          cp scripts/entitlements/vmrunner-macos.entitlements "$stage/vmrunner-macos.entitlements"
+          printf '%s\n' "$version" > "$stage/engine-version.txt"
+          cp "$PHASE0_ATTESTATION" "$stage/phase0-build-attestation.json"
+          for executable in theyos-engine vmrunner_macos_ipc store-ipc terminal-ipc theyos-ssh theyos-provision-inject; do
+            actual="$(shasum -a 256 "$stage/$executable" | awk '{print $1}')"
+            expected="$(jq -r --arg executable "$executable" '.published_executables[$executable].sha256' "$PHASE0_ATTESTATION")"
+            test "$actual" = "$expected"
+          done
+          jq -S \
+            --arg schema "theyos-phase0-published-package-manifest-v1" \
+            --arg version "$version" \
+            --arg phase0_attestation_sha256 "$(shasum -a 256 "$PHASE0_ATTESTATION" | awk '{print $1}')" \
+            --argjson names '["theyos-engine","vmrunner_macos_ipc","store-ipc","terminal-ipc","theyos-ssh","theyos-provision-inject"]' \
+            '{schema:$schema,version:$version,source_sha,source_tree,target,phase0_attestation_sha256:$phase0_attestation_sha256,executables:(.published_executables | with_entries(select(.key as $key | $names | index($key))) | with_entries(.value = {unsigned_sha256:.value.sha256,classification:.value.classification}))}' \
+            "$PHASE0_ATTESTATION" > "$stage/phase0-package-manifest.json"
+          tar -C "$stage" -czf "$RUNNER_TEMP/macos-unsigned/theyos-engine-$version-macos-arm64-unsigned.tar.gz" .
+
+      - name: Upload unsigned subject only
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-unsigned-phase0-subject
+          path: ${{ runner.temp }}/macos-unsigned
+          if-no-files-found: error
+
+  sign-and-publish-macos:
+    name: Sign, notarize, and publish final macOS subject
+    needs: build-unsigned-macos
+    runs-on: macos-15
+    timeout-minutes: 45
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    env:
+      TAG: ${{ github.ref_name }}
+      CODESIGN_IDENTITY: ${{ secrets.APPLE_CODESIGN_IDENTITY }}
+      NOTARY_KEY_ID: ${{ secrets.APPLE_NOTARY_KEY_ID }}
+      NOTARY_ISSUER_ID: ${{ secrets.APPLE_NOTARY_ISSUER_ID }}
+
+    steps:
+      - name: Download unsigned subject
+        uses: actions/download-artifact@v4
+        with:
+          name: macos-unsigned-phase0-subject
+          path: unsigned
+
+      - name: Verify unsigned subject and import signing certificate
         env:
           P12_BASE64: ${{ secrets.APPLE_DEVELOPER_ID_P12_BASE64 }}
           P12_PASSWORD: ${{ secrets.APPLE_DEVELOPER_ID_P12_PASSWORD }}
+        shell: bash
         run: |
-          set -e
-          # Random password for the ephemeral keychain — value never leaves
-          # this step. The keychain is destroyed at the end of the job.
-          KEYCHAIN_PASSWORD=$(openssl rand -base64 24)
-          security create-keychain -p "$KEYCHAIN_PASSWORD" build.keychain
-          security default-keychain -s build.keychain
-          security unlock-keychain -p "$KEYCHAIN_PASSWORD" build.keychain
-          security set-keychain-settings -lut 7200 build.keychain
-          # Decode and import the cert.
-          echo "$P12_BASE64" | base64 --decode > /tmp/cert.p12
-          security import /tmp/cert.p12 -k build.keychain -P "$P12_PASSWORD" -A \
-            -t cert -f pkcs12
-          security set-key-partition-list -S apple-tool:,apple: \
-            -s -k "$KEYCHAIN_PASSWORD" build.keychain
-          rm -f /tmp/cert.p12
-          # Sanity check: the identity should now be visible to codesign.
-          security find-identity -v -p codesigning build.keychain
+          set -euo pipefail
+          stage="unsigned/stage"
+          test -x "$stage/theyos-engine"
+          test -f "$stage/phase0-build-attestation.json"
+          test -f "$stage/phase0-package-manifest.json"
+          while IFS=$'\t' read -r executable expected; do
+            test -n "$executable"
+            test "$(shasum -a 256 "$stage/$executable" | awk '{print $1}')" = "$expected"
+          done < <(jq -r '.executables | to_entries[] | [.key,.value.unsigned_sha256] | @tsv' "$stage/phase0-package-manifest.json")
+          KEYCHAIN_PASSWORD="$(openssl rand -base64 24)"
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$RUNNER_TEMP/build.keychain"
+          security default-keychain -s "$RUNNER_TEMP/build.keychain"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$RUNNER_TEMP/build.keychain"
+          security set-keychain-settings -lut 1800 "$RUNNER_TEMP/build.keychain"
+          printf '%s' "$P12_BASE64" | base64 --decode > "$RUNNER_TEMP/cert.p12"
+          security import "$RUNNER_TEMP/cert.p12" -k "$RUNNER_TEMP/build.keychain" -P "$P12_PASSWORD" -A -t cert -f pkcs12
+          security set-key-partition-list -S apple-tool:,apple: -s -k "$KEYCHAIN_PASSWORD" "$RUNNER_TEMP/build.keychain"
+          rm -f "$RUNNER_TEMP/cert.p12"
 
-      - name: Build engine for Soyeht.app (package-soyeht-mac)
-        # T082/T086: builds server-rs for arm64, codesigns with Developer ID,
-        # writes engine-version.txt sentinel, stages into
-        # dist/macos-arm64/Soyeht.app/Contents/Helpers/. The Sparkle appcast.xml
-        # and DMG wrapping are owned by the agente-front iOS build pipeline.
-        env:
-          THEYOS_RELEASE: "1"
-          THEYOS_CODESIGN_IDENTITY: ${{ secrets.APPLE_CODESIGN_IDENTITY }}
-          APPLE_ID: ${{ secrets.APPLE_ID }}
-          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
-          APPLE_ID_APP_PASSWORD: ${{ secrets.APPLE_ID_APP_PASSWORD }}
-          PHASE0_EXPECTED_UNSIGNED_ENGINE_SHA256: ${{ steps.phase0.outputs.unsigned_sha256 }}
+      - name: Sign only downloaded unsigned subjects
+        shell: bash
         run: |
-          set -e
-          ./scripts/make.sh package-soyeht-mac
-
-      - name: Verify engine-version.txt sentinel (FR-030)
-        # CI gate: engine-version.txt must match the git tag being released.
-        run: |
-          set -e
-          SENTINEL="dist/macos-arm64/Soyeht.app/Contents/Helpers/engine-version.txt"
-          if [ ! -f "$SENTINEL" ]; then
-            echo "::error::engine-version.txt not found at $SENTINEL"
-            exit 1
-          fi
-          ENGINE_VERSION=$(cat "$SENTINEL")
-          if [ "$ENGINE_VERSION" != "$TAG" ] && [ "$ENGINE_VERSION" != "${TAG#v}" ]; then
-            echo "engine-version.txt contains '$ENGINE_VERSION'; TAG is '$TAG'. Continuing (git describe may include extra commit info on non-tag builds)."
-          fi
-          echo "engine-version.txt: $ENGINE_VERSION"
-
-      - name: Package engine helpers tar.gz for release upload
-        id: tarball
-        run: |
-          set -e
-          CARGO_VERSION=$(grep '^version' admin/rust/soyeht-rs/Cargo.toml | sed 's/version = "\(.*\)"/\1/')
-          HELPERS_DIR="dist/macos-arm64/Soyeht.app/Contents/Helpers"
-          TARBALL_PATH="dist/macos-arm64/theyos-engine-${CARGO_VERSION}-macos-arm64.tar.gz"
-          for required in theyos-engine vmrunner_macos_ipc store-ipc terminal-ipc theyos-ssh theyos-provision-inject; do
-            if [ ! -x "$HELPERS_DIR/$required" ]; then
-              echo "::error::required executable helper missing from release bundle: $required"
-              exit 1
+          set -euo pipefail
+          stage="unsigned/stage"
+          codesign_one() {
+            local name="$1" identifier="$2"
+            local args=(--force --options runtime --timestamp --identifier "$identifier" --sign "$CODESIGN_IDENTITY")
+            if [ "$name" = vmrunner_macos_ipc ]; then
+              args+=(--entitlements "$stage/vmrunner-macos.entitlements")
             fi
+            codesign "${args[@]}" "$stage/$name"
+            codesign --verify --strict --verbose=2 "$stage/$name"
+          }
+          codesign_one theyos-engine com.soyeht.theyos.theyos-engine
+          codesign_one theyos-ssh com.soyeht.theyos.theyos-ssh
+          codesign_one store-ipc com.soyeht.theyos.store-ipc
+          codesign_one terminal-ipc com.soyeht.theyos.terminal-ipc
+          codesign_one vmrunner_macos_ipc com.soyeht.theyos.vmrunner_macos_ipc
+          codesign_one theyos-provision-inject com.soyeht.theyos.theyos-provision-inject
+
+      - name: Notarize signed subject
+        env:
+          NOTARY_KEY_BASE64: ${{ secrets.APPLE_NOTARY_KEY_P8_BASE64 }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          printf '%s' "$NOTARY_KEY_BASE64" | base64 --decode > "$RUNNER_TEMP/notary-key.p8"
+          chmod 600 "$RUNNER_TEMP/notary-key.p8"
+          ditto -c -k --keepParent unsigned/stage "$RUNNER_TEMP/theyos-macos-notarize.zip"
+          xcrun notarytool submit "$RUNNER_TEMP/theyos-macos-notarize.zip" \
+            --key "$RUNNER_TEMP/notary-key.p8" \
+            --key-id "$NOTARY_KEY_ID" \
+            --issuer "$NOTARY_ISSUER_ID" \
+            --wait
+          rm -f "$RUNNER_TEMP/notary-key.p8" "$RUNNER_TEMP/theyos-macos-notarize.zip"
+
+      - name: Package and bind final signed bytes
+        id: package
+        shell: bash
+        run: |
+          set -euo pipefail
+          stage="unsigned/stage"
+          version="$(cat "$stage/engine-version.txt")"
+          for executable in theyos-engine vmrunner_macos_ipc store-ipc terminal-ipc theyos-ssh theyos-provision-inject; do
+            signed="$(shasum -a 256 "$stage/$executable" | awk '{print $1}')"
+            jq -S --arg executable "$executable" --arg signed "$signed" \
+              '.executables[$executable].signed_sha256 = $signed' \
+              "$stage/phase0-package-manifest.json" > "$stage/phase0-package-manifest.next.json"
+            mv "$stage/phase0-package-manifest.next.json" "$stage/phase0-package-manifest.json"
           done
-          if [ ! -f "$HELPERS_DIR/engine-version.txt" ]; then
-            echo "::error::engine-version.txt missing from release bundle"
-            exit 1
-          fi
-          # Build the tarball using absolute destination path. The previous
-          # `(cd HELPERS_DIR && tar czf "../../../../$TARBALL_PATH" .)` was
-          # off-by-one — 4× `..` from Helpers/ lands at <root>/dist/, then
-          # appending TARBALL_PATH (also starting with dist/) yielded
-          # <root>/dist/dist/macos-arm64/... whose parent doesn't exist.
-          (cd "$HELPERS_DIR" && tar czf "$GITHUB_WORKSPACE/$TARBALL_PATH" .)
-          SHA256=$(shasum -a 256 "$TARBALL_PATH" | awk '{print $1}')
-          SIGNED_ENGINE_SHA256=$(shasum -a 256 "$HELPERS_DIR/theyos-engine" | awk '{print $1}')
-          PHASE0_ATTESTATION="${{ steps.phase0.outputs.attestation }}"
-          RELEASE_PROVENANCE="dist/macos-arm64/theyos-engine-${CARGO_VERSION}-macos-arm64.provenance.json"
+          tar -C "$stage" -czf "theyos-engine-$version-macos-arm64.tar.gz" .
+          package_sha256="$(shasum -a 256 "theyos-engine-$version-macos-arm64.tar.gz" | awk '{print $1}')"
           jq -n -S \
-            --arg schema "theyos-engine-release-provenance-v1" \
-            --arg source_sha "$(git rev-parse HEAD)" \
-            --arg target "aarch64-apple-darwin" \
-            --arg unsigned_engine_sha256 "${{ steps.phase0.outputs.unsigned_sha256 }}" \
-            --arg signed_engine_sha256 "$SIGNED_ENGINE_SHA256" \
-            --arg phase0_attestation_sha256 "$(shasum -a 256 "$PHASE0_ATTESTATION" | awk '{print $1}')" \
-            --arg package_sha256 "$SHA256" \
-            '{schema:$schema,source_sha:$source_sha,target:$target,phase0_unsigned_engine_sha256:$unsigned_engine_sha256,published_signed_engine_sha256:$signed_engine_sha256,phase0_attestation_sha256:$phase0_attestation_sha256,published_package_sha256:$package_sha256}' \
-            > "$RELEASE_PROVENANCE"
-          echo "version=$CARGO_VERSION" >> "$GITHUB_OUTPUT"
-          echo "tarball_path=$TARBALL_PATH" >> "$GITHUB_OUTPUT"
-          echo "tarball_name=$(basename "$TARBALL_PATH")" >> "$GITHUB_OUTPUT"
-          echo "sha256=$SHA256" >> "$GITHUB_OUTPUT"
-          echo "release_provenance=$RELEASE_PROVENANCE" >> "$GITHUB_OUTPUT"
+            --arg schema "theyos-engine-release-provenance-v2" \
+            --arg source_sha "$(jq -r '.source_sha' "$stage/phase0-build-attestation.json")" \
+            --arg source_tree "$(jq -r '.source_tree' "$stage/phase0-build-attestation.json")" \
+            --arg phase0_manifest_sha256 "$(shasum -a 256 "$stage/phase0-package-manifest.json" | awk '{print $1}')" \
+            --arg published_signed_engine_sha256 "$(shasum -a 256 "$stage/theyos-engine" | awk '{print $1}')" \
+            --arg package_sha256 "$package_sha256" \
+            '{schema:$schema,source_sha:$source_sha,source_tree:$source_tree,phase0_package_manifest_sha256:$phase0_manifest_sha256,published_signed_engine_sha256:$published_signed_engine_sha256,final_package_sha256:$package_sha256,signing_job_has_source_checkout:false,signing_job_runs_cargo:false}' \
+            > "theyos-engine-$version-macos-arm64.provenance.json"
 
-      - name: Verify Developer ID signature on a sample binary
-        # Smoke check that the bytes Apple notarized are the bytes inside
-        # the tarball (no re-signing happened between).
-        run: |
-          set -e
-          # Extract one binary out of the tarball into a scratch dir and
-          # codesign-verify it. The tarball is what we ship; if its bytes
-          # don't match the cert chain, we're shipping broken artifacts.
-          mkdir -p /tmp/verify
-          tar xzf "${{ steps.tarball.outputs.tarball_path }}" -C /tmp/verify ./theyos-engine
-          test "$(shasum -a 256 /tmp/verify/theyos-engine | awk '{print $1}')" = \
-            "$(jq -r '.published_signed_engine_sha256' '${{ steps.tarball.outputs.release_provenance }}')"
-          codesign --verify --verbose=4 /tmp/verify/theyos-engine
-          # Confirm Developer ID + hardened runtime + stable identifier.
-          codesign -dv --verbose=4 /tmp/verify/theyos-engine 2>&1 | tee /tmp/verify/codesign-info.txt
-          grep -q 'Authority=Developer ID Application' /tmp/verify/codesign-info.txt || {
-            echo "::error::theyos-engine binary missing Developer ID Application authority"
-            exit 1
-          }
-          grep -q 'Identifier=com.soyeht.theyos.theyos-engine' /tmp/verify/codesign-info.txt || {
-            echo "::error::theyos-engine binary missing explicit identifier com.soyeht.theyos.theyos-engine"
-            exit 1
-          }
-          grep -q 'flags=0x10000(runtime)' /tmp/verify/codesign-info.txt || {
-            echo "::error::server binary missing hardened runtime flag"
-            exit 1
-          }
-          echo "OK: signature verified."
-
-      - name: Attest the published macOS package
-        uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a # v3
+      - name: Attest final signed package
+        uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a
         with:
-          subject-path: ${{ steps.tarball.outputs.tarball_path }}
+          subject-path: theyos-engine-*-macos-arm64.tar.gz
 
-      - name: Create GitHub Release
+      - name: Publish final package
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
         run: |
-          set -e
-          NOTES="Automated release. See commit history and PRs merged into main since the previous tag for change details. macOS engine SHA256: \`${{ steps.tarball.outputs.sha256 }}\`"
-          ASSET="${{ steps.tarball.outputs.tarball_path }}#theyos-engine-${{ steps.tarball.outputs.version }}-macos-arm64.tar.gz"
-          PROVENANCE="${{ steps.tarball.outputs.release_provenance }}#theyos-engine-${{ steps.tarball.outputs.version }}-macos-arm64.provenance.json"
-          PHASE0="${{ steps.phase0.outputs.attestation }}#theyos-engine-${{ steps.tarball.outputs.version }}-macos-arm64.phase0.json"
+          set -euo pipefail
+          version="$(cat unsigned/stage/engine-version.txt)"
+          package="theyos-engine-$version-macos-arm64.tar.gz"
+          provenance="theyos-engine-$version-macos-arm64.provenance.json"
+          phase0="unsigned/stage/phase0-build-attestation.json"
           if gh release view "$TAG" >/dev/null 2>&1; then
-            gh release upload "$TAG" "$ASSET" "$PROVENANCE" "$PHASE0" --clobber
-            gh release edit "$TAG" --title "$TAG" --notes "$NOTES"
+            gh release upload "$TAG" "$package" "$provenance" "$phase0#theyos-engine-$version-macos-arm64.phase0.json" --clobber
           else
-            gh release create "$TAG" --title "$TAG" --notes "$NOTES" "$ASSET" "$PROVENANCE" "$PHASE0"
+            gh release create "$TAG" --title "$TAG" --notes "Automated release. Final macOS package SHA256: $(shasum -a 256 "$package" | awk '{print $1}')" \
+              "$package" "$provenance" "$phase0#theyos-engine-$version-macos-arm64.phase0.json"
           fi
 
-      - name: Regenerate Homebrew formula
-        env:
-          # generate-brew-formula.sh has hit ArgumentError on US-ASCII before;
-          # forcing UTF-8 prevents the regression (memory: prior v0.1.5 release).
-          LANG: en_US.UTF-8
-          LC_ALL: en_US.UTF-8
-        run: |
-          set -e
-          ./scripts/generate-brew-formula.sh
+      - name: Cleanup signing keychain
+        if: always()
+        run: security delete-keychain "$RUNNER_TEMP/build.keychain" 2>/dev/null || true
 
-      - name: Open PR for regenerated formula + auto-merge
+  update-homebrew-formula:
+    name: Update Homebrew formula through a normal PR
+    needs: sign-and-publish-macos
+    runs-on: macos-15
+    permissions:
+      contents: write
+      pull-requests: write
+    env:
+      TAG: ${{ github.ref_name }}
+    steps:
+      - name: Checkout main for formula generation
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
+        with:
+          ref: main
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Generate formula
+        run: ./scripts/generate-brew-formula.sh
+      - name: Open formula PR
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          set -e
-          # main has branch protection requiring PR + status checks; a direct
-          # `git push origin main` from the workflow is rejected with GH006.
-          # Use a per-release branch + PR + admin merge instead. Same merge
-          # outcome as a direct push, but routed through the protected-branch
-          # gate the way GitHub expects.
-          git config user.name "theyos-release-bot"
-          git config user.email "release@soyeht.invalid"
-          BRANCH="release/formula-${TAG}"
-          git checkout -b "$BRANCH"
+          set -euo pipefail
+          git config user.name theyos-release-bot
+          git config user.email release@soyeht.invalid
+          branch="release/formula-$TAG"
+          git checkout -B "$branch" origin/main
           git add homebrew/Formula/theyos.rb
-          if git diff --cached --quiet; then
-            echo "Formula already up-to-date; nothing to commit."
-            exit 0
-          fi
-          git commit -m "release: update brew formula for $TAG (sha256 ${{ steps.tarball.outputs.sha256 }}) [skip ci]"
-          git push origin "$BRANCH"
-          gh pr create \
-            --base main \
-            --head "$BRANCH" \
-            --title "release: update brew formula for $TAG" \
-            --body "Auto-generated by \`release-macos.yml\` after the $TAG tarball was signed + notarized + uploaded to the GitHub Release. SHA256: \`${{ steps.tarball.outputs.sha256 }}\`. [skip ci]"
-          gh pr merge "$BRANCH" --merge --admin --delete-branch
-
-      - name: Cleanup ephemeral keychain
-        if: always()
-        run: |
-          security delete-keychain build.keychain 2>/dev/null || true
+          if git diff --cached --quiet; then exit 0; fi
+          git commit -m "release: update brew formula for $TAG"
+          git push origin "$branch"
+          gh pr create --base main --head "$branch" --title "release: update brew formula for $TAG" --body "Generated after the signed and notarized $TAG package was published."

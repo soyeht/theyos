@@ -457,7 +457,7 @@ async fn run_pair_machine(
     });
     let listener_handle = tokio::spawn(async move {
         if let Err(e) =
-            crate::phase0_axum_serve!(listener, router, connect_info = std::net::SocketAddr).await
+            core_rs::phase0_axum_serve!(listener, router, connect_info = std::net::SocketAddr).await
         {
             warn!(stage = "pair_machine.listener_exited", error = %e);
         }

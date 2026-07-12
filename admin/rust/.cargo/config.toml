@@ -1,4 +1,4 @@
-# NixOS: OpenSSL dev package location for crates that link against libssl (e.g. ssh2).
-# This avoids requiring nix-shell for cargo build.
+# The authority recipe must not carry a host-specific Nix store path into
+# cross/OCI builds. Nix supplies its own target-aware value explicitly.
 [env]
-PKG_CONFIG_PATH = "/nix/store/wr6qvslzqrd3rsf2mw0ssxwmyi2sqjdh-openssl-3.4.2-dev/lib/pkgconfig"
+PKG_CONFIG_PATH = ""

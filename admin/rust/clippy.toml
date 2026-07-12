@@ -1,0 +1,7 @@
+# The Phase 0 serve choke-point is the only production HTTP bind primitive.
+# Keep this file base-owned and run it with -D clippy::disallowed_methods.
+disallowed-methods = [
+  "axum::serve",
+  "hyper::server::conn::http1::Builder::serve_connection",
+  "hyper::server::conn::http2::Builder::serve_connection",
+]

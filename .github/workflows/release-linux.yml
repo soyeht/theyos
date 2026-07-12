@@ -1,7 +1,7 @@
 name: Release (Linux)
 
 # Triggered alongside release-macos.yml on `v*` tag pushes.
-# Builds Linux engine binaries for x86_64 and aarch64 via `cross`,
+# Builds Linux engine binaries for x86_64 and aarch64 via the pinned OCI recipe,
 # packages each into tar.gz + sha256, and uploads to the GitHub Release.
 #
 # Smoke-tests the binary boots in a minimal Alpine container.
@@ -14,11 +14,6 @@ on:
   push:
     tags:
       - "v*"
-  workflow_dispatch:
-    inputs:
-      tag:
-        description: "Tag to release (e.g. v0.1.10). Must already exist."
-        required: true
 
 permissions:
   contents: write
@@ -32,29 +27,28 @@ jobs:
     timeout-minutes: 45
 
     env:
-      TAG: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.tag || github.ref_name }}
+      TAG: ${{ github.ref_name }}
       CARGO_TARGET: x86_64-unknown-linux-musl
 
     steps:
       - name: Checkout
         uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
         with:
-          ref: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.tag || github.ref }}
+          ref: ${{ github.ref }}
           persist-credentials: false
+
+      - name: Verify landed tag ancestry
+        run: |
+          set -euo pipefail
+          test "$GITHUB_REF_TYPE" = tag
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          git fetch --no-tags origin main:refs/remotes/origin/main
+          git merge-base --is-ancestor "$GITHUB_SHA" origin/main
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@5a814b2e0f75e492da42a3c1227d52112e4dac50 # 1.92.0
         with:
           targets: x86_64-unknown-linux-musl
-
-      - name: Install cross
-        run: cargo install cross --version 0.2.5 --locked
-
-      - name: Cache Rust dependencies
-        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
-        with:
-          workspaces: "admin/rust -> target"
-          shared-key: "release-linux-x86_64"
 
       - name: Build (release)
         run: |
@@ -71,21 +65,13 @@ jobs:
           PHASE0_TARGET=x86_64-unknown-linux-musl \
           PHASE0_BUILD_TOOL=cross \
           PHASE0_CARGO_TARGET_DIR="$GITHUB_WORKSPACE/admin/rust/target" \
+          PHASE0_CARGO_HOME="$RUNNER_TEMP/phase0-cargo-home-x86_64" \
           PHASE0_RUN_ARTIFACT_DIRECT=1 \
           PHASE0_ATTESTATION_OUT="$PHASE0_ATTESTATION" \
           PHASE0_STAGED_ENGINE_OUT="$PHASE0_ENGINE" \
             bash .github/scripts/check-mobile-claw-vpn-owner-present-phase0-compileout.sh
           echo "phase0_attestation=$PHASE0_ATTESTATION" >> "$GITHUB_ENV"
           echo "phase0_engine=$PHASE0_ENGINE" >> "$GITHUB_ENV"
-          cross build \
-            --manifest-path admin/rust/Cargo.toml \
-            --target x86_64-unknown-linux-musl \
-            --release \
-            -p soyeht-rs \
-            -p vmrunner-rs \
-            -p store-rs \
-            -p terminal-rs \
-            -p imagebuilder-rs
 
       - name: Package + sha256
         working-directory: admin/rust
@@ -181,29 +167,28 @@ jobs:
     timeout-minutes: 60
 
     env:
-      TAG: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.tag || github.ref_name }}
+      TAG: ${{ github.ref_name }}
       CARGO_TARGET: aarch64-unknown-linux-musl
 
     steps:
       - name: Checkout
         uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
         with:
-          ref: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.tag || github.ref }}
+          ref: ${{ github.ref }}
           persist-credentials: false
+
+      - name: Verify landed tag ancestry
+        run: |
+          set -euo pipefail
+          test "$GITHUB_REF_TYPE" = tag
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          git fetch --no-tags origin main:refs/remotes/origin/main
+          git merge-base --is-ancestor "$GITHUB_SHA" origin/main
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@5a814b2e0f75e492da42a3c1227d52112e4dac50 # 1.92.0
         with:
           targets: aarch64-unknown-linux-musl
-
-      - name: Install cross
-        run: cargo install cross --version 0.2.5 --locked
-
-      - name: Cache Rust dependencies
-        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
-        with:
-          workspaces: "admin/rust -> target"
-          shared-key: "release-linux-aarch64"
 
       - name: Cross-compile (release)
         run: |
@@ -220,21 +205,13 @@ jobs:
           PHASE0_TARGET=aarch64-unknown-linux-musl \
           PHASE0_BUILD_TOOL=cross \
           PHASE0_CARGO_TARGET_DIR="$GITHUB_WORKSPACE/admin/rust/target" \
+          PHASE0_CARGO_HOME="$RUNNER_TEMP/phase0-cargo-home-aarch64" \
           PHASE0_RUN_ARTIFACT_DIRECT=0 \
           PHASE0_ATTESTATION_OUT="$PHASE0_ATTESTATION" \
           PHASE0_STAGED_ENGINE_OUT="$PHASE0_ENGINE" \
             bash .github/scripts/check-mobile-claw-vpn-owner-present-phase0-compileout.sh
           echo "phase0_attestation=$PHASE0_ATTESTATION" >> "$GITHUB_ENV"
           echo "phase0_engine=$PHASE0_ENGINE" >> "$GITHUB_ENV"
-          cross build \
-            --manifest-path admin/rust/Cargo.toml \
-            --target aarch64-unknown-linux-musl \
-            --release \
-            -p soyeht-rs \
-            -p vmrunner-rs \
-            -p store-rs \
-            -p terminal-rs \
-            -p imagebuilder-rs
 
       - name: Package + sha256
         working-directory: admin/rust
