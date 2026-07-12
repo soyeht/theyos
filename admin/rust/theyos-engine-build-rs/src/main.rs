@@ -608,10 +608,10 @@ fn reject_ancestor_cargo_configs(repo_root: &Path) -> Result<(), String> {
     while let Some(directory) = ancestor {
         for relative in [".cargo/config", ".cargo/config.toml"] {
             if fs::symlink_metadata(directory.join(relative)).is_ok() {
-                return Err(
-                    "canonical theyos-engine build forbids Cargo config above the repository"
-                        .to_owned(),
-                );
+                return Err(format!(
+                    "canonical theyos-engine build forbids Cargo config above the repository: {}",
+                    directory.join(relative).display()
+                ));
             }
         }
         ancestor = directory.parent();
