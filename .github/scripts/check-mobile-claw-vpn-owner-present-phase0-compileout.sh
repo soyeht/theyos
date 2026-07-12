@@ -188,6 +188,8 @@ if [[ -e "${CARGO_HOME_DIR}" && -n "$(find "${CARGO_HOME_DIR}" -mindepth 1 -prin
 fi
 mkdir -p "${CLEAN_HOME}" "${CLEAN_TMP}" "${TARGET_DIR}"
 mkdir -p "${CARGO_HOME_DIR}"
+GENERATED_OUTPUT_DIR="${TARGET_DIR}/phase0-generated"
+mkdir -p "${GENERATED_OUTPUT_DIR}"
 if find "${CARGO_HOME_DIR}" -type l -print -quit 2>/dev/null | grep -q .; then
   echo "::error::canonical Cargo home may not contain symlinks"
   exit 1
@@ -204,6 +206,9 @@ run_clean_online() {
     LANG=C \
     RUSTUP_TOOLCHAIN="${EXPECTED_RUST}" \
     CARGO_TARGET_DIR="${TARGET_DIR}" \
+    CLAWS_MANIFEST_YML="${SNAPSHOT}/claws/manifest.yml" \
+    CLAWS_CATALOG_JSON="${GENERATED_OUTPUT_DIR}/claws-catalog.json" \
+    THEYOS_EMOJI_WORDLIST="${SNAPSHOT}/admin/rust/household-rs/data/emoji-security-code-wordlist.csv" \
     THEYOS_PHASE0_CLEAN_ENV=1 \
     "$@"
 }
