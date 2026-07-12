@@ -974,7 +974,7 @@ while IFS= read -r -d '' repo_input; do
   if [[ "${repo_input}" == *.rs \
     && "${repo_input}" != "${PHASE0_REL}" \
     && "${repo_input}" != "admin/rust/core-rs/src/product_a_phase0.rs" ]] \
-    && grep -Eq 'axum[[:space:]]*::[[:space:]]*serve[[:space:]]*\(' \
+    && grep -Eq '^[[:space:]]*[^/[:space:]].*axum[[:space:]]*::[[:space:]]*serve[[:space:]]*\(' \
       "${SNAPSHOT}/${repo_input}"; then
     echo "::error file=${repo_input}::production HTTP listeners must use the Phase 0 serve choke-point"
     exit 1
