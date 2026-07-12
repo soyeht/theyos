@@ -13,6 +13,13 @@ HOST_TARGET="$(rustc -vV | sed -n 's/^host: //p')"
 SHARED_TARGET="${TMP_ROOT}/target"
 CHECKER_CARGO_HOME="${TMP_ROOT}/cargo-home"
 mkdir -p "${CHECKER_CARGO_HOME}"
+if [[ "${HOST_TARGET}" == *-apple-darwin ]]; then
+  PHASE0_EXPECTED_XCODE_VERSION="${PHASE0_EXPECTED_XCODE_VERSION:-$(xcodebuild -version | sed -n 's/^Xcode //p')}"
+  PHASE0_EXPECTED_XCODE_BUILD="${PHASE0_EXPECTED_XCODE_BUILD:-$(xcodebuild -version | sed -n 's/^Build version //p')}"
+  PHASE0_EXPECTED_MACOS_SDK_VERSION="${PHASE0_EXPECTED_MACOS_SDK_VERSION:-$(xcrun --sdk macosx --show-sdk-version)}"
+  export PHASE0_EXPECTED_XCODE_VERSION PHASE0_EXPECTED_XCODE_BUILD \
+    PHASE0_EXPECTED_MACOS_SDK_VERSION
+fi
 
 clone_head() {
   local destination="$1"
@@ -309,12 +316,12 @@ expect_checker_failure generic_ip_tunnel_store \
 build_cfg="${TMP_ROOT}/build-cfg"
 clone_head "${build_cfg}"
 perl -0pi -e \
-  's#emit_build_git_sha\(\);#emit_build_git_sha();\n    println!("cargo:rustc-cfg=owner_present_hidden");\n    let source = std::path::PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap()).join("src/handlers_misc.rs");\n    let bytes = std::fs::read(&source).unwrap();\n    if std::fs::write(&source, &bytes).is_ok() { panic!("Phase 0 source snapshot was writable"); }#' \
+  's#emit_build_git_sha\(\);#emit_build_git_sha();\n    println!("cargo:rustc-cfg=owner_present_hidden");\n    let source = std::path::PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap()).join("src/handlers_misc.rs");\n    let bytes = std::fs::read(&source).unwrap();\n    match std::fs::write(&source, &bytes) {\n        Ok(()) => panic!("Phase 0 source snapshot was writable"),\n        Err(error) => panic!("Phase 0 source mutation was blocked: {error}"),\n    }#' \
   "${build_cfg}/admin/rust/server-rs/build.rs"
 refresh_boundary_tree_entry "${build_cfg}" "admin/rust"
 commit_mutation "${build_cfg}" build-cfg
 expect_checker_failure build_cfg_crossing \
-  "Phase 0 source snapshot was writable" \
+  "Phase 0 source mutation was blocked" \
   "${build_cfg}"
 
 build_tool_codegen="${TMP_ROOT}/build-tool-codegen"

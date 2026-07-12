@@ -97,6 +97,11 @@ jobs:
           cp "../../scripts/uninstall-linux.sh" "$STAGE/uninstall-linux.sh"
           chmod +x "$STAGE/soyeht" "$STAGE/uninstall-linux.sh"
           printf '%s\n' "$CARGO_VERSION" > "$STAGE/engine-version.txt"
+          for executable in theyos-engine soyeht vmrunner_ipc fc-ssh store-ipc terminal-ipc imagebuilder; do
+            actual="$(sha256sum "$STAGE/$executable" | awk '{print $1}')"
+            expected="$(jq -r --arg executable "$executable" '.published_executables[$executable].sha256' "$phase0_attestation")"
+            test "$actual" = "$expected"
+          done
           tar czf "$TARBALL" -C "$STAGE" .
           sha256sum "$TARBALL" > "${TARBALL}.sha256"
           RELEASE_PROVENANCE="$OUTDIR/theyos-engine-${CARGO_VERSION}-linux-x86_64.provenance.json"
@@ -105,9 +110,10 @@ jobs:
             --arg source_sha "$(git -C ../.. rev-parse HEAD)" \
             --arg target "x86_64-unknown-linux-musl" \
             --arg engine_sha256 "$(sha256sum "$STAGE/theyos-engine" | awk '{print $1}')" \
+            --arg published_executables_sha256 "$(jq -S '.published_executables' "$phase0_attestation" | sha256sum | awk '{print $1}')" \
             --arg phase0_attestation_sha256 "$(sha256sum "$phase0_attestation" | awk '{print $1}')" \
             --arg package_sha256 "$(sha256sum "$TARBALL" | awk '{print $1}')" \
-            '{schema:$schema,source_sha:$source_sha,target:$target,phase0_engine_sha256:$engine_sha256,phase0_attestation_sha256:$phase0_attestation_sha256,published_package_sha256:$package_sha256}' \
+            '{schema:$schema,source_sha:$source_sha,target:$target,phase0_engine_sha256:$engine_sha256,published_executables_sha256:$published_executables_sha256,phase0_attestation_sha256:$phase0_attestation_sha256,published_package_sha256:$package_sha256}' \
             > "$RELEASE_PROVENANCE"
           echo "tarball=$TARBALL" >> "$GITHUB_ENV"
           echo "release_provenance=$RELEASE_PROVENANCE" >> "$GITHUB_ENV"
@@ -237,6 +243,11 @@ jobs:
           cp "../../scripts/uninstall-linux.sh" "$STAGE/uninstall-linux.sh"
           chmod +x "$STAGE/soyeht" "$STAGE/uninstall-linux.sh"
           printf '%s\n' "$CARGO_VERSION" > "$STAGE/engine-version.txt"
+          for executable in theyos-engine soyeht vmrunner_ipc fc-ssh store-ipc terminal-ipc imagebuilder; do
+            actual="$(sha256sum "$STAGE/$executable" | awk '{print $1}')"
+            expected="$(jq -r --arg executable "$executable" '.published_executables[$executable].sha256' "$phase0_attestation")"
+            test "$actual" = "$expected"
+          done
           tar czf "$TARBALL" -C "$STAGE" .
           sha256sum "$TARBALL" > "${TARBALL}.sha256"
           RELEASE_PROVENANCE="$OUTDIR/theyos-engine-${CARGO_VERSION}-linux-aarch64.provenance.json"
@@ -245,9 +256,10 @@ jobs:
             --arg source_sha "$(git -C ../.. rev-parse HEAD)" \
             --arg target "aarch64-unknown-linux-musl" \
             --arg engine_sha256 "$(sha256sum "$STAGE/theyos-engine" | awk '{print $1}')" \
+            --arg published_executables_sha256 "$(jq -S '.published_executables' "$phase0_attestation" | sha256sum | awk '{print $1}')" \
             --arg phase0_attestation_sha256 "$(sha256sum "$phase0_attestation" | awk '{print $1}')" \
             --arg package_sha256 "$(sha256sum "$TARBALL" | awk '{print $1}')" \
-            '{schema:$schema,source_sha:$source_sha,target:$target,phase0_engine_sha256:$engine_sha256,phase0_attestation_sha256:$phase0_attestation_sha256,published_package_sha256:$package_sha256}' \
+            '{schema:$schema,source_sha:$source_sha,target:$target,phase0_engine_sha256:$engine_sha256,published_executables_sha256:$published_executables_sha256,phase0_attestation_sha256:$phase0_attestation_sha256,published_package_sha256:$package_sha256}' \
             > "$RELEASE_PROVENANCE"
           echo "tarball=$TARBALL" >> "$GITHUB_ENV"
           echo "release_provenance=$RELEASE_PROVENANCE" >> "$GITHUB_ENV"

@@ -22,7 +22,15 @@ BOUNDARY_REL="admin/contracts/mobile-claw-vpn/v1/owner_present_phase0_artifact_b
 HEAD_SHA="$(git -C "${THEYOS_DIR}" rev-parse HEAD)"
 HEAD_TREE="$(git -C "${THEYOS_DIR}" rev-parse "${HEAD_SHA}^{tree}")"
 TMP_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/theyos-owner-present-phase0.XXXXXX")"
-trap 'chmod -R u+w "${TMP_ROOT}" 2>/dev/null || true; rm -rf "${TMP_ROOT}"' EXIT
+SNAPSHOT_ROOT_OWNED=0
+cleanup() {
+  if [[ "${SNAPSHOT_ROOT_OWNED}" -eq 1 ]]; then
+    sudo -n chown -R "$(id -u):$(id -g)" "${TMP_ROOT}" 2>/dev/null || true
+  fi
+  chmod -R u+w "${TMP_ROOT}" 2>/dev/null || true
+  rm -rf "${TMP_ROOT}"
+}
+trap cleanup EXIT
 
 if [[ -n "$(git -C "${THEYOS_DIR}" status --porcelain --untracked-files=all)" ]]; then
   echo "::error::Phase 0 checker requires a clean checkout of the exact head object"
@@ -35,6 +43,23 @@ git -C "${THEYOS_DIR}" archive --format=tar "${HEAD_SHA}" \
   | tar -xf - -C "${SNAPSHOT}"
 SNAPSHOT="$(cd "${SNAPSHOT}" && pwd -P)"
 chmod -R a-w "${SNAPSHOT}"
+
+# The musl authority build gets an OS-enforced read-only bind mount in the
+# pinned OCI image. Native authority builds use a root-owned snapshot so the
+# build user cannot chmod it writable from a build.rs or proc-macro. A plain
+# chmod is deliberately not accepted as the provenance boundary.
+if [[ "${BUILD_TOOL}" != "cross" ]]; then
+  if ! command -v sudo >/dev/null 2>&1 \
+    || ! sudo -n chown -R 0:0 "${SNAPSHOT}"; then
+    echo "::error::native Phase 0 authority requires a root-owned immutable source snapshot"
+    exit 1
+  fi
+  if [[ -w "${SNAPSHOT}/admin/rust/Cargo.toml" ]]; then
+    echo "::error::native Phase 0 source snapshot is still writable after ownership hardening"
+    exit 1
+  fi
+  SNAPSHOT_ROOT_OWNED=1
+fi
 TARGET_DIR="${PHASE0_CARGO_TARGET_DIR:-${TMP_ROOT}/target}"
 
 if [[ -e "${TARGET_DIR}" && -n "$(find "${TARGET_DIR}" -mindepth 1 -print -quit 2>/dev/null)" ]]; then
@@ -238,6 +263,32 @@ case "${TARGET}:${BUILD_TOOL}" in
     exit 1
     ;;
 esac
+
+XCODE_VERSION=""
+XCODE_BUILD=""
+MACOS_SDK_VERSION=""
+EXPECTED_XCODE_VERSION="${PHASE0_EXPECTED_XCODE_VERSION:-}"
+EXPECTED_XCODE_BUILD="${PHASE0_EXPECTED_XCODE_BUILD:-}"
+EXPECTED_MACOS_SDK_VERSION="${PHASE0_EXPECTED_MACOS_SDK_VERSION:-}"
+if [[ "${TARGET}" == *-apple-darwin ]]; then
+  if [[ -z "${EXPECTED_XCODE_VERSION}" || -z "${EXPECTED_XCODE_BUILD}" \
+    || -z "${EXPECTED_MACOS_SDK_VERSION}" ]]; then
+    echo "::error::macOS Phase 0 authority requires frozen Xcode and SDK identities"
+    exit 1
+  fi
+  XCODE_VERSION="$(xcodebuild -version)"
+  XCODE_BUILD="$(printf '%s\n' "${XCODE_VERSION}" | sed -n 's/^Build version //p')"
+  XCODE_VERSION="$(printf '%s\n' "${XCODE_VERSION}" | sed -n 's/^Xcode //p')"
+  MACOS_SDK_VERSION="$(xcrun --sdk macosx --show-sdk-version)"
+  if [[ "${XCODE_VERSION}" != "${EXPECTED_XCODE_VERSION}" \
+    || "${XCODE_BUILD}" != "${EXPECTED_XCODE_BUILD}" \
+    || "${MACOS_SDK_VERSION}" != "${EXPECTED_MACOS_SDK_VERSION}" ]]; then
+    echo "::error::macOS Phase 0 toolchain identity differs from the frozen Xcode/SDK policy"
+    echo "::error::expected Xcode=${EXPECTED_XCODE_VERSION} build=${EXPECTED_XCODE_BUILD} SDK=${EXPECTED_MACOS_SDK_VERSION}"
+    echo "::error::actual Xcode=${XCODE_VERSION} build=${XCODE_BUILD} SDK=${MACOS_SDK_VERSION}"
+    exit 1
+  fi
+fi
 
 TRACKED_PKG_CONFIG_PATH="$(sed -n \
   's/^PKG_CONFIG_PATH = "\([^"]*\)"/\1/p' \
@@ -665,6 +716,8 @@ for release_path in \
   fi
 done
 if ! grep -Fq "phase0_engine_sha256" "${SNAPSHOT}/.github/workflows/release-linux.yml" \
+  || ! grep -Fq "published_executables_sha256" \
+    "${SNAPSHOT}/.github/workflows/release-linux.yml" \
   || ! grep -Fq "published_signed_engine_sha256" \
     "${SNAPSHOT}/.github/workflows/release-macos.yml" \
   || ! grep -Fq "PHASE0_EXPECTED_UNSIGNED_ENGINE_SHA256" \
@@ -672,6 +725,26 @@ if ! grep -Fq "phase0_engine_sha256" "${SNAPSHOT}/.github/workflows/release-linu
   echo "::error::release provenance does not bind the verified engine to the published package"
   exit 1
 fi
+release_macos_signing_job="$(sed -n '/^  sign-and-publish-macos:/,/^  update-homebrew-formula:/p' \
+  "${SNAPSHOT}/.github/workflows/release-macos.yml")"
+if grep -Eq 'actions/checkout@|cargo[[:space:]]|run_engine_build_tool|scripts/make\.sh' \
+    <<< "${release_macos_signing_job}"; then
+  echo "::error::macOS signing job must consume only the unsigned subject and never checkout or compile source"
+  exit 1
+fi
+for mac_toolchain_file in \
+  "${SNAPSHOT}/.github/workflows/owner-present-phase0-compileout.yml" \
+  "${SNAPSHOT}/.github/workflows/release-macos.yml"; do
+  for mac_toolchain_pin in \
+    'PHASE0_EXPECTED_XCODE_VERSION: "26.5"' \
+    'PHASE0_EXPECTED_XCODE_BUILD: "17F42"' \
+    'PHASE0_EXPECTED_MACOS_SDK_VERSION: "26.5"'; do
+    if ! grep -Fq -- "${mac_toolchain_pin}" "${mac_toolchain_file}"; then
+      echo "::error file=${mac_toolchain_file}::frozen Xcode/SDK identity is missing"
+      exit 1
+    fi
+  done
+done
 for nix_binding in \
   'nix build .#theyos-runtime' \
   'nix path-info --recursive --json' \
@@ -1140,12 +1213,6 @@ sed \
 
 ATTESTATION_OUT="${PHASE0_ATTESTATION_OUT:-${TMP_ROOT}/phase0-attestation-${TARGET}.json}"
 mkdir -p "$(dirname "${ATTESTATION_OUT}")"
-XCODE_VERSION=""
-MACOS_SDK_VERSION=""
-if [[ "${TARGET}" == *-apple-darwin ]]; then
-  XCODE_VERSION="$(xcodebuild -version)"
-  MACOS_SDK_VERSION="$(xcrun --sdk macosx --show-sdk-version)"
-fi
 jq -n -S \
   --arg schema "theyos-owner-present-phase0-artifact-attestation-v1" \
   --arg source_sha "${HEAD_SHA}" \
@@ -1177,7 +1244,11 @@ jq -n -S \
   --arg theyos_engine_sha256 "$(sha256_file "${STAGED_ENGINE}")" \
   --argjson published_executables "$(cat "${PUBLISHED_EXECUTABLES_JSON}")" \
   --arg xcode_version "${XCODE_VERSION}" \
+  --arg xcode_build "${XCODE_BUILD}" \
+  --arg expected_xcode_version "${EXPECTED_XCODE_VERSION}" \
+  --arg expected_xcode_build "${EXPECTED_XCODE_BUILD}" \
   --arg macos_sdk_version "${MACOS_SDK_VERSION}" \
+  --arg expected_macos_sdk_version "${EXPECTED_MACOS_SDK_VERSION}" \
   --argjson published_target "${PUBLISHED_TARGET}" \
   '{
     schema: $schema,
@@ -1210,7 +1281,11 @@ jq -n -S \
     theyos_engine_sha256: $theyos_engine_sha256,
     published_executables: $published_executables,
     xcode_version: $xcode_version,
+    xcode_build: $xcode_build,
+    expected_xcode_version: $expected_xcode_version,
+    expected_xcode_build: $expected_xcode_build,
     macos_sdk_version: $macos_sdk_version,
+    expected_macos_sdk_version: $expected_macos_sdk_version,
     published_target: $published_target,
     server_equals_theyos_engine: true,
     owner_present_authority: "none",

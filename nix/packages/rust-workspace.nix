@@ -131,11 +131,28 @@ in
           {"method":"HEAD","path":"/api/v1/mobile/claw-vpn/status"}
         ]
       ' >/dev/null
+      executables_json='{}'
+      for executable in "$out"/bin/*; do
+        test -f "$executable"
+        test -x "$executable"
+        name="$(basename "$executable")"
+        case "$name" in
+          server) classification="phase0-contract-server" ;;
+          theyos-llm-proxy) classification="phase0-contract-http-boundary" ;;
+          *) classification="phase0-helper-marker-and-closure-scan" ;;
+        esac
+        sha256="$(sha256sum "$executable" | cut -d' ' -f1)"
+        executables_json="$(jq -c \
+          --arg name "$name" \
+          --arg sha256 "$sha256" \
+          --arg classification "$classification" \
+          '. + {($name): {sha256:$sha256,classification:$classification}}' \
+          <<< "$executables_json")"
+      done
       jq -n -S \
         --arg flake_lock_sha256 "${flakeLockSha256}" \
-        --arg server_sha256 "$(sha256sum "$out/bin/server" | cut -d' ' -f1)" \
-        --arg proxy_sha256 "$(sha256sum "$out/bin/theyos-llm-proxy" | cut -d' ' -f1)" \
-        '{schema:"theyos-phase0-nix-runtime-manifest-v1",flake_lock_sha256:$flake_lock_sha256,executables:{server:$server_sha256,theyos_llm_proxy:$proxy_sha256},owner_present_authority:"none",production_activation:false}' \
+        --argjson executables "$executables_json" \
+        '{schema:"theyos-phase0-nix-runtime-manifest-v1",flake_lock_sha256:$flake_lock_sha256,executables:$executables,owner_present_authority:"none",production_activation:false,artifact_contract:"all-published-nix-executables-v1"}' \
         > "$out/phase0-runtime-manifest.json"
     '';
 

@@ -22,7 +22,7 @@ jobs:
           persist-credentials: false
 
       - name: Install pinned Nix
-        uses: cachix/install-nix-action@v27
+        uses: cachix/install-nix-action@ba0dd844c9180cbf77aa72a116d6fbc515d0e87b # v27
 
       - name: Verify locked Nix inputs and build runtime
         id: build
@@ -34,8 +34,26 @@ jobs:
           OUT_PATH="$(nix build .#theyos-runtime --no-link --print-out-paths)"
           test -x "$OUT_PATH/bin/server"
           test -x "$OUT_PATH/bin/theyos-llm-proxy"
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          SOURCE_TREE="$(git rev-parse HEAD^{tree})"
           test "$(sha256sum flake.lock | awk '{print $1}')" = \
             "$(jq -r '.flake_lock_sha256' "$OUT_PATH/phase0-runtime-manifest.json")"
+          jq -e '
+            .artifact_contract == "all-published-nix-executables-v1"
+            and (.executables | type == "object" and has("server") and has("theyos-llm-proxy"))
+            and all(.executables[]; (.sha256 | test("^[0-9a-f]{64}$")))
+          ' "$OUT_PATH/phase0-runtime-manifest.json" >/dev/null
+          while IFS=$'\t' read -r executable expected classification; do
+            case "$executable" in
+              ''|*/*|*..*)
+                echo "invalid Nix runtime executable name: $executable" >&2
+                exit 1
+                ;;
+            esac
+            test -x "$OUT_PATH/bin/$executable"
+            test "$(sha256sum "$OUT_PATH/bin/$executable" | awk '{print $1}')" = "$expected"
+            test -n "$classification"
+          done < <(jq -r '.executables | to_entries[] | [.key,.value.sha256,.value.classification] | @tsv' "$OUT_PATH/phase0-runtime-manifest.json")
           "$OUT_PATH/bin/server" --owner-present-phase0-contract \
             | jq -e '
               .authority == "none"
@@ -57,8 +75,11 @@ jobs:
             ' >/dev/null
           nix path-info --recursive --json "$OUT_PATH" > phase0-nix-store-closure.json
           CLOSURE_SHA256="$(sha256sum phase0-nix-store-closure.json | awk '{print $1}')"
-          jq -S --arg closure_sha256 "$CLOSURE_SHA256" \
-            '. + {nix_store_closure_manifest_sha256:$closure_sha256}' \
+          jq -S \
+            --arg source_sha "$GITHUB_SHA" \
+            --arg source_tree "$SOURCE_TREE" \
+            --arg closure_sha256 "$CLOSURE_SHA256" \
+            '. + {source_sha:$source_sha,source_tree:$source_tree,nix_store_closure_manifest_sha256:$closure_sha256}' \
             "$OUT_PATH/phase0-runtime-manifest.json" > phase0-runtime-manifest.json
           STAGE="$RUNNER_TEMP/phase0-nix-runtime"
           rm -rf "$STAGE"
@@ -68,7 +89,7 @@ jobs:
           tar -C "$STAGE" -czf phase0-nix-runtime.tar.gz .
 
       - name: Upload Nix runtime subject
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: owner-present-phase0-nix-runtime
           path: |
@@ -88,11 +109,11 @@ jobs:
       attestations: write
     steps:
       - name: Download final Nix subject
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           name: owner-present-phase0-nix-runtime
 
       - name: Attest final Nix subject
-        uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a
+        uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a # v3
         with:
           subject-path: phase0-nix-runtime.tar.gz

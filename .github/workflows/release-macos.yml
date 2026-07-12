@@ -22,6 +22,9 @@ jobs:
       PHASE0_BUILD_TOOL: cargo
       PHASE0_ATTESTATION: ${{ runner.temp }}/phase0-attestation-aarch64-apple-darwin.json
       PHASE0_ENGINE: ${{ runner.temp }}/theyos-engine-aarch64-apple-darwin
+      PHASE0_EXPECTED_XCODE_VERSION: "26.5"
+      PHASE0_EXPECTED_XCODE_BUILD: "17F42"
+      PHASE0_EXPECTED_MACOS_SDK_VERSION: "26.5"
 
     steps:
       - name: Checkout exact tag
@@ -98,7 +101,7 @@ jobs:
           tar -C "$stage" -czf "$RUNNER_TEMP/macos-unsigned/theyos-engine-$version-macos-arm64-unsigned.tar.gz" .
 
       - name: Upload unsigned subject only
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: macos-unsigned-phase0-subject
           path: ${{ runner.temp }}/macos-unsigned
@@ -121,7 +124,7 @@ jobs:
 
     steps:
       - name: Download unsigned subject
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           name: macos-unsigned-phase0-subject
           path: unsigned
@@ -137,6 +140,11 @@ jobs:
           test -x "$stage/theyos-engine"
           test -f "$stage/phase0-build-attestation.json"
           test -f "$stage/phase0-package-manifest.json"
+          jq -e '
+            .expected_xcode_version == "26.5"
+            and .expected_xcode_build == "17F42"
+            and .expected_macos_sdk_version == "26.5"
+          ' "$stage/phase0-build-attestation.json" >/dev/null
           while IFS=$'\t' read -r executable expected; do
             test -n "$executable"
             test "$(shasum -a 256 "$stage/$executable" | awk '{print $1}')" = "$expected"
