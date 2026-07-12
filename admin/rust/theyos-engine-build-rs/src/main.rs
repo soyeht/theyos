@@ -464,8 +464,18 @@ fn run_container_build(
     let docker = executable_from_path("docker")?;
     let image = phase0_image(target)?;
     let cargo_home = canonical_value(canonical_env, "CARGO_HOME")?;
-    let rustup_home = canonical_value(canonical_env, "RUSTUP_HOME")?;
     let rust_version = canonical_value(canonical_env, "RUSTUP_TOOLCHAIN")?;
+    let cargo_toolchain = resolve_toolchain_binary("cargo", canonical_env)?;
+    let rustc_toolchain = resolve_toolchain_binary("rustc", canonical_env)?;
+    let toolchain_bin = cargo_toolchain
+        .parent()
+        .ok_or("canonical cargo toolchain has no bin directory")?;
+    if rustc_toolchain.parent() != Some(toolchain_bin) {
+        return Err("canonical cargo and rustc must come from the same toolchain".to_owned());
+    }
+    let toolchain_root = toolchain_bin
+        .parent()
+        .ok_or("canonical Rust toolchain has no root directory")?;
     let platform = if target.starts_with("aarch64-") {
         Some("linux/arm64")
     } else {
@@ -499,7 +509,10 @@ fn run_container_build(
             "--mount",
             &format!("type=bind,src={},dst=/phase0-cargo,readonly", cargo_home),
             "--mount",
-            &format!("type=bind,src={},dst=/phase0-rustup,readonly", rustup_home),
+            &format!(
+                "type=bind,src={},dst=/phase0-toolchain,readonly",
+                toolchain_root.display()
+            ),
             "--mount",
             &format!(
                 "type=bind,src={},dst=/claws,readonly",
@@ -509,6 +522,8 @@ fn run_container_build(
             "/tmp:rw,nosuid,nodev",
             "--tmpfs",
             "/phase0-home:rw,nosuid,nodev",
+            "--tmpfs",
+            "/phase0-rustup:rw,nosuid,nodev",
             "--tmpfs",
             "/.cargo:rw,nosuid,nodev",
             "--workdir",
@@ -530,7 +545,11 @@ fn run_container_build(
             "--env",
             "PKG_CONFIG_PATH=",
             "--env",
-            "PATH=/usr/local/cargo/bin:/usr/local/bin:/usr/bin:/bin",
+            "PATH=/phase0-toolchain/bin:/usr/local/bin:/usr/bin:/bin",
+            "--env",
+            "RUSTC=/phase0-toolchain/bin/rustc",
+            "--env",
+            "RUSTDOC=/phase0-toolchain/bin/rustdoc",
             "--env",
             "THEYOS_PHASE0_CLEAN_ENV=1",
             "--env",
@@ -544,7 +563,7 @@ fn run_container_build(
             "--env",
             &format!("THEYOS_BUILD_GIT_SHA={source_sha}"),
             image,
-            "cargo",
+            "/phase0-toolchain/bin/cargo",
         ])
         .args(build_args);
     if let Some(host) = env::var_os("PHASE0_DOCKER_HOST") {
@@ -568,6 +587,24 @@ fn canonical_value(values: &[(OsString, OsString)], name: &str) -> Result<String
             (candidate == name).then(|| value.to_string_lossy().into_owned())
         })
         .ok_or_else(|| format!("canonical build environment is missing {name}"))
+}
+
+fn resolve_toolchain_binary(
+    name: &str,
+    canonical_env: &[(OsString, OsString)],
+) -> Result<PathBuf, String> {
+    let rustup = executable_from_path("rustup")?;
+    let mut command = Command::new(rustup);
+    apply_canonical_environment(&mut command, canonical_env);
+    let output = command_stdout(command.arg("which").arg(name))?;
+    let path = PathBuf::from(output);
+    if !path.is_absolute() || !path.is_file() || path.is_symlink() {
+        return Err(format!(
+            "rustup resolved {name} to a non-regular absolute executable"
+        ));
+    }
+    path.canonicalize()
+        .map_err(|error| format!("failed to canonicalize rustup {name}: {error}"))
 }
 
 fn executable_from_path(name: &str) -> Result<PathBuf, String> {

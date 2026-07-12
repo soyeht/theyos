@@ -1025,6 +1025,11 @@ for depfile in depfiles:
             continue
         if relative is None and relative_to(normalized, rustup_home) is not None:
             continue
+        if relative is None and any(
+            relative_to(normalized, pathlib.Path(root)) is not None
+            for root in ("/phase0-cargo", "/phase0-rustup", "/phase0-toolchain")
+        ):
+            continue
         if relative is None and any(relative_to(normalized, root) is not None for root in allowed_system_roots):
             continue
         if relative is None:
