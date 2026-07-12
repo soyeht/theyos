@@ -27,6 +27,9 @@ cleanup() {
   if [[ "${SNAPSHOT_ROOT_OWNED}" -eq 1 ]]; then
     sudo -n chown -R "$(id -u):$(id -g)" "${TMP_ROOT}" 2>/dev/null || true
   fi
+  if [[ -n "${CARGO_HOME_DIR:-}" && -e "${CARGO_HOME_DIR}" ]]; then
+    chmod -R u+w "${CARGO_HOME_DIR}" 2>/dev/null || true
+  fi
   chmod -R u+w "${TMP_ROOT}" 2>/dev/null || true
   rm -rf "${TMP_ROOT}"
 }
