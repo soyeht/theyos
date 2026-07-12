@@ -233,7 +233,7 @@ if find "${CARGO_HOME_DIR}" -type l -print -quit 2>/dev/null | grep -q .; then
 fi
 
 run_clean_online() {
-  "${ENV_BIN}" -i \
+  local -a clean_env=(
     HOME="${CLEAN_HOME}" \
     CARGO_HOME="${CARGO_HOME_DIR}" \
     RUSTUP_HOME="${RUSTUP_HOME_DIR}" \
@@ -246,9 +246,12 @@ run_clean_online() {
     CLAWS_MANIFEST_YML="${SNAPSHOT}/claws/manifest.yml" \
     CLAWS_CATALOG_JSON="${GENERATED_OUTPUT_DIR}/claws-catalog.json" \
     THEYOS_EMOJI_WORDLIST="${SNAPSHOT}/admin/rust/household-rs/data/emoji-security-code-wordlist.csv" \
-    THEYOS_PHASE0_CLEAN_ENV=1 \
-    "${LOCAL_DOCKER_ENV[@]}" \
-    "$@"
+    THEYOS_PHASE0_CLEAN_ENV=1
+  )
+  if (( ${#LOCAL_DOCKER_ENV[@]} > 0 )); then
+    clean_env+=("${LOCAL_DOCKER_ENV[@]}")
+  fi
+  "${ENV_BIN}" -i "${clean_env[@]}" "$@"
 }
 
 run_clean() {
