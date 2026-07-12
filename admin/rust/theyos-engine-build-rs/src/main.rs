@@ -509,6 +509,8 @@ fn run_container_build(
             "/tmp:rw,nosuid,nodev",
             "--tmpfs",
             "/phase0-home:rw,nosuid,nodev",
+            "--tmpfs",
+            "/.cargo:rw,nosuid,nodev",
             "--workdir",
             "/project/admin/rust",
             "--env",
