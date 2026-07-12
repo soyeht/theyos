@@ -309,7 +309,7 @@ expect_checker_failure generic_ip_tunnel_store \
 build_cfg="${TMP_ROOT}/build-cfg"
 clone_head "${build_cfg}"
 perl -0pi -e \
-  's/emit_build_git_sha\(\);/emit_build_git_sha();\n    println!("cargo:rustc-cfg=owner_present_hidden");\n    let source = std::path::PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap()).join("src/handlers_misc.rs");\n    let bytes = std::fs::read(&source).unwrap();\n    if std::fs::write(&source, &bytes).is_ok() { panic!("Phase 0 source snapshot was writable"); }/' \
+  's#emit_build_git_sha\(\);#emit_build_git_sha();\n    println!("cargo:rustc-cfg=owner_present_hidden");\n    let source = std::path::PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap()).join("src/handlers_misc.rs");\n    let bytes = std::fs::read(&source).unwrap();\n    if std::fs::write(&source, &bytes).is_ok() { panic!("Phase 0 source snapshot was writable"); }#' \
   "${build_cfg}/admin/rust/server-rs/build.rs"
 commit_mutation "${build_cfg}" build-cfg
 expect_checker_failure build_cfg_crossing \
