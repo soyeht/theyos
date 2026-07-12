@@ -207,6 +207,15 @@ PYTHON_BIN="$(resolve_executable python3)"
 CANONICAL_PATH="$(dirname "${RUSTC_BIN}"):$(dirname "${CARGO_BIN}"):$(dirname "${BUILD_TOOL_BIN}"):$(dirname "${PYTHON_BIN}"):/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin"
 CLEAN_HOME="${TMP_ROOT}/home"
 CLEAN_TMP="${TMP_ROOT}/tmp"
+LOCAL_DOCKER_ENV=()
+if [[ -n "${PHASE0_DOCKER_HOST:-}" ]]; then
+  if [[ "${PHASE0_LOCAL_DIAGNOSTIC:-0}" != "1" \
+    || "${PHASE0_DOCKER_HOST}" != unix:///* ]]; then
+    echo "::error::DOCKER_HOST is forbidden; only an explicit local Unix-socket diagnostic override is accepted"
+    exit 1
+  fi
+  LOCAL_DOCKER_ENV=("PHASE0_DOCKER_HOST=${PHASE0_DOCKER_HOST}")
+fi
 if [[ -e "${CARGO_HOME_DIR}" && -n "$(find "${CARGO_HOME_DIR}" -mindepth 1 -print -quit 2>/dev/null)" ]]; then
   echo "::error::canonical Cargo home must be empty before the authority build"
   exit 1
@@ -235,6 +244,7 @@ run_clean_online() {
     CLAWS_CATALOG_JSON="${GENERATED_OUTPUT_DIR}/claws-catalog.json" \
     THEYOS_EMOJI_WORDLIST="${SNAPSHOT}/admin/rust/household-rs/data/emoji-security-code-wordlist.csv" \
     THEYOS_PHASE0_CLEAN_ENV=1 \
+    "${LOCAL_DOCKER_ENV[@]}" \
     "$@"
 }
 

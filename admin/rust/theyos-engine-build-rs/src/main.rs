@@ -545,6 +545,15 @@ fn run_container_build(
             "cargo",
         ])
         .args(build_args);
+    if let Some(host) = env::var_os("PHASE0_DOCKER_HOST") {
+        let host = host
+            .to_str()
+            .ok_or("PHASE0_DOCKER_HOST must be valid Unicode")?;
+        if !host.starts_with("unix:///") {
+            return Err("PHASE0_DOCKER_HOST must be a Unix socket URL".to_owned());
+        }
+        command.env("DOCKER_HOST", host);
+    }
     command
         .status()
         .map_err(|error| format!("failed to launch direct OCI Phase 0 build: {error}"))
