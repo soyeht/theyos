@@ -1107,7 +1107,8 @@ record_published_executable() {
   mv "${next}" "${PUBLISHED_EXECUTABLES_JSON}"
 }
 
-for executable in "${PROXY_BINARY}" "${BINARY_DIR}/${PUBLISHED_HELPERS[@]}"; do
+scan_published_executable() {
+  local executable="$1"
   if [[ ! -x "${executable}" ]]; then
     echo "::error::published executable is missing: ${executable}"
     exit 1
@@ -1120,6 +1121,10 @@ for executable in "${PROXY_BINARY}" "${BINARY_DIR}/${PUBLISHED_HELPERS[@]}"; do
     echo "::error::published executable contains a Product A authority marker: ${executable}"
     exit 1
   fi
+}
+scan_published_executable "${PROXY_BINARY}"
+for helper in "${PUBLISHED_HELPERS[@]}"; do
+  scan_published_executable "${BINARY_DIR}/${helper}"
 done
 record_published_executable "theyos-engine" "${BINARY}" "phase0-engine-contract"
 record_published_executable "theyos-llm-proxy" "${PROXY_BINARY}" "shared-http-get-head-status-boundary"
