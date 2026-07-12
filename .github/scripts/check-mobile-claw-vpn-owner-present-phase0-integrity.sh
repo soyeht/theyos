@@ -1,0 +1,98 @@
+#!/usr/bin/env bash
+# Base-owned integrity check for the Phase 0 compile-out authority.
+set -euo pipefail
+
+REPO="${1:?usage: $0 REPO BASE_SHA HEAD_SHA PR_NUMBER}"
+BASE_SHA="${2:?usage: $0 REPO BASE_SHA HEAD_SHA PR_NUMBER}"
+HEAD_SHA="${3:?usage: $0 REPO BASE_SHA HEAD_SHA PR_NUMBER}"
+PR_NUMBER="${4:-0}"
+POLICY_REL=".github/owner-present-phase0-protected-objects-v1.tsv"
+SELF_PATHS=(
+  ".github/scripts/check-mobile-claw-vpn-owner-present-phase0-integrity.sh"
+  ".github/scripts/test-mobile-claw-vpn-owner-present-phase0-integrity.sh"
+  ".github/workflows/owner-present-phase0-integrity.yml"
+  "${POLICY_REL}"
+)
+
+if [[ ! "${BASE_SHA}" =~ ^[0-9a-f]{40}$ || ! "${HEAD_SHA}" =~ ^[0-9a-f]{40}$ ]]; then
+  echo "::error::base and head must be full lowercase Git SHAs"
+  exit 1
+fi
+if [[ "$(git -C "${REPO}" rev-parse HEAD)" != "${BASE_SHA}" ]]; then
+  echo "::error::integrity checker must execute from the trusted base SHA"
+  exit 1
+fi
+
+if [[ "${PHASE0_INTEGRITY_LOCAL_TEST:-0}" != "1" ]]; then
+  if [[ ! "${PR_NUMBER}" =~ ^[1-9][0-9]*$ ]]; then
+    echo "::error::pull request number is invalid"
+    exit 1
+  fi
+  : "${GITHUB_TOKEN:?GITHUB_TOKEN is required for the base-owned PR object fetch}"
+  AUTH_HEADER="$(printf 'x-access-token:%s' "${GITHUB_TOKEN}" | base64 | tr -d '\n')"
+  git -C "${REPO}" \
+    -c "http.extraheader=AUTHORIZATION: basic ${AUTH_HEADER}" \
+    fetch --no-tags origin \
+    "refs/pull/${PR_NUMBER}/head:refs/remotes/phase0-integrity/head"
+  unset AUTH_HEADER
+  FETCHED="$(git -C "${REPO}" rev-parse refs/remotes/phase0-integrity/head)"
+  if [[ "${FETCHED}" != "${HEAD_SHA}" ]]; then
+    echo "::error::fetched PR head does not match the event head SHA"
+    exit 1
+  fi
+else
+  git -C "${REPO}" cat-file -e "${HEAD_SHA}^{commit}"
+fi
+
+for path in "${SELF_PATHS[@]}"; do
+  base_entry="$(git -C "${REPO}" ls-tree "${BASE_SHA}" -- "${path}")"
+  head_entry="$(git -C "${REPO}" ls-tree "${HEAD_SHA}" -- "${path}")"
+  if [[ -z "${base_entry}" || "${head_entry}" != "${base_entry}" ]]; then
+    echo "::error file=${path}::base-owned integrity root differs from trusted base"
+    exit 1
+  fi
+done
+
+POLICY="$(mktemp "${TMPDIR:-/tmp}/phase0-protected-objects.XXXXXX")"
+trap 'rm -f "${POLICY}"' EXIT
+git -C "${REPO}" cat-file blob "${BASE_SHA}:${POLICY_REL}" > "${POLICY}"
+count=0
+while IFS=$'\t' read -r mode type oid transition path extra; do
+  [[ -z "${mode}" || "${mode}" == \#* ]] && continue
+  if [[ -n "${extra:-}" \
+    || ! "${mode}" =~ ^(100644|100755)$ \
+    || "${type}" != "blob" \
+    || ! "${oid}" =~ ^[0-9a-f]{40}$ \
+    || ! "${transition}" =~ ^(frozen|land-exact)$ \
+    || -z "${path}" \
+    || "${path}" == /* \
+    || "${path}" == *"../"* ]]; then
+    echo "::error file=${POLICY_REL}::invalid protected-object policy entry"
+    exit 1
+  fi
+  expected="${mode}"$'\t'"${type}"$'\t'"${oid}"
+  head_entry="$(git -C "${REPO}" ls-tree \
+    --format='%(objectmode)%x09%(objecttype)%x09%(objectname)' \
+    "${HEAD_SHA}" -- "${path}")"
+  if [[ "${head_entry}" != "${expected}" ]]; then
+    echo "::error file=${path}::protected Phase 0 object differs from base-owned policy"
+    exit 1
+  fi
+  if [[ "${transition}" == "frozen" ]]; then
+    base_entry="$(git -C "${REPO}" ls-tree \
+      --format='%(objectmode)%x09%(objecttype)%x09%(objectname)' \
+      "${BASE_SHA}" -- "${path}")"
+    if [[ "${base_entry}" != "${expected}" ]]; then
+      echo "::error file=${path}::frozen Phase 0 object differs from trusted base policy"
+      exit 1
+    fi
+  fi
+  count=$((count + 1))
+done < "${POLICY}"
+
+if [[ "${count}" -lt 10 ]]; then
+  echo "::error file=${POLICY_REL}::protected-object policy is unexpectedly small"
+  exit 1
+fi
+
+echo "Phase 0 authority matches the trusted base-owned object policy."
