@@ -148,6 +148,7 @@ if [ ! -x "${BUILD_TOOL_BIN}" ]; then
   exit 1
 fi
 
+prepare_empty_authority_inputs
 if CROSS_CONTAINER_OPTS='--volume=/tmp/untrusted:/claws:ro' \
     PHASE0_TARGET="${HOST_TARGET}" \
     PHASE0_BUILD_TOOL=cargo \
