@@ -135,14 +135,15 @@ grep -Fq "production server binary cannot be built with DEV/test features" \
   "${TMP_ROOT}/dev-feature.log"
 echo "PASS release_dev_feature_refused"
 
-CARGO_TARGET_DIR="${SHARED_TARGET}" \
+BUILD_TOOL_TARGET="${TMP_ROOT}/build-tool-target"
+CARGO_TARGET_DIR="${BUILD_TOOL_TARGET}" \
   cargo build \
     --manifest-path "${REPO_ROOT}/admin/rust/Cargo.toml" \
     --locked \
     --release \
     --package theyos-engine-build-rs \
     >/dev/null
-BUILD_TOOL_BIN="${SHARED_TARGET}/release/theyos-engine-build"
+BUILD_TOOL_BIN="${BUILD_TOOL_TARGET}/release/theyos-engine-build"
 if [ ! -x "${BUILD_TOOL_BIN}" ]; then
   echo "error: canonical build helper was not produced" >&2
   exit 1
