@@ -602,7 +602,7 @@ jobs:
 YAML
 commit_mutation "${alternate_publisher}" alternate-publisher
 expect_checker_failure alternate_publisher \
-  "unclassified workflow can publish, attest, or consume release credentials" \
+  ".github/workflows contains an unclassified publisher or attestation workflow" \
   "${alternate_publisher}"
 
 marker="${TMP_ROOT}/marker"
