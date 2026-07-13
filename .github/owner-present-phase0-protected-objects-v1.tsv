@@ -1,14 +1,14 @@
 # mode	type	oid	transition	path
-100755	blob	3fe3b13728fd91e5ae7b9ed6e0cc21f2c5159e5e	land-exact	.github/scripts/check-mobile-claw-vpn-owner-present-contracts.sh
-100755	blob	fa4deff3fe15ca0e1338c1cbb213f20392517bfb	land-exact	.github/scripts/check-mobile-claw-vpn-owner-present-phase0-compileout.sh
-100755	blob	096e0757e8101785c69da294c46a59cacf3d9192	land-exact	.github/scripts/test-mobile-claw-vpn-owner-present-contracts.sh
-100755	blob	a4f6453e529727c6443f14912e56089ccf6c6326	land-exact	.github/scripts/test-mobile-claw-vpn-owner-present-phase0-compileout.sh
+100755	blob	f63aefb91c4a0a95d7463ddd57873743357ac80a	land-exact	.github/scripts/check-mobile-claw-vpn-owner-present-contracts.sh
+100755	blob	5d2aba577a13cf0fe01d4cfb7859dcf944f9327a	land-exact	.github/scripts/check-mobile-claw-vpn-owner-present-phase0-compileout.sh
+100755	blob	262ee978366b8aa1d54e194301925a9d99e8b29a	land-exact	.github/scripts/test-mobile-claw-vpn-owner-present-contracts.sh
+100755	blob	759620adc6b0953e287c6109ff3afb2ebf839b6a	land-exact	.github/scripts/test-mobile-claw-vpn-owner-present-phase0-compileout.sh
 100644	blob	d0b9229e4fe5744cb2c072ce690b29039bafc450	land-exact	.github/workflows/contracts-cross-repo-sync.yml
 100644	blob	4dace548a5ea6a4d3f1da5ed6c7d9730002bc10d	land-exact	.github/workflows/owner-present-phase0-compileout.yml
 100644	blob	8ae5db96e0e72d21e829c8a582b2b74520c2ee2c	land-exact	.github/workflows/owner-present-phase0-nix-runtime.yml
 100644	blob	b5204b326715e1e07c53b4864abee19f2280aa0b	land-exact	.github/workflows/release-linux.yml
 100644	blob	d92c7bc90443f3a864d6c18806d7301a441f2757	land-exact	.github/workflows/release-macos.yml
-100644	blob	73f5b1d896155259db3aa1aa84e7d065645bf23c	land-exact	admin/contracts/mobile-claw-vpn/v1/owner_present_wire_authority_status_v1.json
+100644	blob	0a01ce7586ad7e547c6d2a417480e4dda03200d1	land-exact	admin/contracts/mobile-claw-vpn/v1/owner_present_wire_authority_status_v1.json
 100644	blob	42fa6a42c33535a3fded0a0e4210a80e3791b660	land-exact	admin/rust/.cargo/config.toml
 100644	blob	4cff2a1b3f165bbaa928e3d58d6c3d505be4c147	land-exact	admin/rust/Cross.toml
 100644	blob	a03ce9608c6081a596dbf51b7134b78ed68d3cd6	land-exact	admin/rust/clippy.toml
@@ -24,5 +24,5 @@
 100644	blob	a9d12674061e28e666d7bf35bff3479f715a102d	land-exact	nix/module.nix
 100644	blob	3b0aa0722bd015c688bfe351ca794794073753ea	land-exact	nix/modules/llm-proxy.nix
 100644	blob	b232c2ab10abec37a7685772c24fd4f217e6c870	land-exact	nix/packages/rust-workspace.nix
-100755	blob	192e38df4ed5b8c26b0098719c6f0b48577e2c9f	land-exact	scripts/make.sh
+100755	blob	3a3c0e7dd3c3c1160682e95fc0ce19d0689e8256	land-exact	scripts/make.sh
 100644	blob	f47d954fdd6a61451ca24583f58e44a884fb51e5	land-exact	flake.lock
