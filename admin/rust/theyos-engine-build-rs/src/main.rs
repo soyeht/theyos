@@ -529,7 +529,10 @@ fn run_container_build(
                 repo_root.display()
             ),
             "--mount",
-            &format!("type=bind,src={},dst=/target,rw", target_root.display()),
+            &format!(
+                "type=bind,src={},dst=/target,readonly=false",
+                target_root.display()
+            ),
             "--mount",
             &format!("type=bind,src={cargo_home},dst=/phase0-cargo,readonly"),
             "--mount",
