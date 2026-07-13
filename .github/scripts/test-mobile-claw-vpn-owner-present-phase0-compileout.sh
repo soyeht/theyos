@@ -436,8 +436,7 @@ expect_checker_failure allow_alias_escape \
 
 absolute_external_include="${TMP_ROOT}/absolute-external-include"
 clone_head "${absolute_external_include}"
-ambient_input="${TMP_ROOT}/ambient-compile-input.txt"
-printf '%s\n' 'ambient input must never be an authority' > "${ambient_input}"
+ambient_input="/etc/hosts"
 cat >> "${absolute_external_include}/admin/rust/server-rs/src/handlers_misc.rs" <<RUST
 
 pub const PHASE0_ABSOLUTE_EXTERNAL_INCLUDE: &[u8] =
