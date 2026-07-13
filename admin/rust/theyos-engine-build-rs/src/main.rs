@@ -6,7 +6,7 @@ use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 
-const UNSAFE_BUILD_ENV: [&str; 26] = [
+const UNSAFE_BUILD_ENV: [&str; 28] = [
     "AR",
     "BINDGEN_EXTRA_CLANG_ARGS",
     "CC",
@@ -33,10 +33,13 @@ const UNSAFE_BUILD_ENV: [&str; 26] = [
     "CARGO_BUILD_RUSTC",
     "CARGO_BUILD_RUSTFLAGS",
     "CARGO_BUILD_TARGET",
+    "QEMU_LD_PREFIX",
+    "RUST_TEST_THREADS",
 ];
 
-const UNSAFE_BUILD_ENV_PREFIX: [&str; 11] = [
+const UNSAFE_BUILD_ENV_PREFIX: [&str; 12] = [
     "AR_",
+    "BINDGEN_EXTRA_CLANG_ARGS_",
     "CARGO_BUILD_",
     "CARGO_PROFILE_",
     "CARGO_TARGET_",
@@ -183,7 +186,7 @@ fn build_engine(target: &str, build_tool: &str) -> Result<(), String> {
     reject_ancestor_cargo_configs(&repo_root)?;
     reject_cargo_home_config()?;
     validate_tracked_pkg_config_path()?;
-    let canonical_env = canonical_child_environment()?;
+    let canonical_env = canonical_child_environment(target)?;
     let expected_rust = expected_rust_version(&rust_root.join("rust-toolchain.toml"))?;
     let mut rustc = Command::new("rustc");
     apply_canonical_environment(&mut rustc, &canonical_env);
@@ -357,32 +360,62 @@ fn canonical_cross_target_environment(target: &str, name: &str, value: &OsStr) -
     let Some(value) = value.to_str() else {
         return false;
     };
+    canonical_cross_target_environment_entries(target)
+        .iter()
+        .any(|(expected_name, expected_value)| *expected_name == name && *expected_value == value)
+}
+
+const X86_64_MUSL_ENVIRONMENT: [(&str, &str); 8] = [
+    (
+        "CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER",
+        "x86_64-linux-musl-gcc",
+    ),
+    (
+        "CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_RUNNER",
+        "/qemu-runner x86_64",
+    ),
+    (
+        "BINDGEN_EXTRA_CLANG_ARGS_x86_64_unknown_linux_musl",
+        "--sysroot=/usr/local/x86_64-linux-musl",
+    ),
+    ("CC_x86_64_unknown_linux_musl", "x86_64-linux-musl-gcc"),
+    ("CXX_x86_64_unknown_linux_musl", "x86_64-linux-musl-g++"),
+    ("CROSS_MUSL_SYSROOT", "/usr/local/x86_64-linux-musl"),
+    ("QEMU_LD_PREFIX", "/usr/local/x86_64-linux-musl"),
+    ("RUST_TEST_THREADS", "1"),
+];
+
+const AARCH64_MUSL_ENVIRONMENT: [(&str, &str); 8] = [
+    (
+        "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER",
+        "aarch64-linux-musl-gcc.sh",
+    ),
+    (
+        "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_RUNNER",
+        "/qemu-runner aarch64",
+    ),
+    (
+        "BINDGEN_EXTRA_CLANG_ARGS_aarch64_unknown_linux_musl",
+        "--sysroot=/usr/local/aarch64-linux-musl",
+    ),
+    ("CC_aarch64_unknown_linux_musl", "aarch64-linux-musl-gcc"),
+    ("CXX_aarch64_unknown_linux_musl", "aarch64-linux-musl-g++"),
+    ("CROSS_MUSL_SYSROOT", "/usr/local/aarch64-linux-musl"),
+    ("QEMU_LD_PREFIX", "/usr/local/aarch64-linux-musl"),
+    ("RUST_TEST_THREADS", "1"),
+];
+
+fn canonical_cross_target_environment_entries(
+    target: &str,
+) -> &'static [(&'static str, &'static str)] {
     match target {
-        "x86_64-unknown-linux-musl" => matches!(
-            (name, value),
-            (
-                "CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER",
-                "x86_64-linux-musl-gcc"
-            ) | (
-                "CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_RUNNER",
-                "/qemu-runner x86_64"
-            )
-        ),
-        "aarch64-unknown-linux-musl" => matches!(
-            (name, value),
-            (
-                "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER",
-                "aarch64-linux-musl-gcc.sh"
-            ) | (
-                "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_RUNNER",
-                "/qemu-runner aarch64"
-            )
-        ),
-        _ => false,
+        "x86_64-unknown-linux-musl" => &X86_64_MUSL_ENVIRONMENT,
+        "aarch64-unknown-linux-musl" => &AARCH64_MUSL_ENVIRONMENT,
+        _ => &[],
     }
 }
 
-fn canonical_child_environment() -> Result<Vec<(OsString, OsString)>, String> {
+fn canonical_child_environment(target: &str) -> Result<Vec<(OsString, OsString)>, String> {
     if env::var("THEYOS_PHASE0_CLEAN_ENV").as_deref() != Ok("1") {
         return Err("canonical theyos-engine build requires an env-cleared caller".to_owned());
     }
@@ -404,6 +437,21 @@ fn canonical_child_environment() -> Result<Vec<(OsString, OsString)>, String> {
             }
             values.push((OsString::from(name), value));
         }
+    }
+
+    for (name, expected_value) in canonical_cross_target_environment_entries(target) {
+        let Some(actual_value) = env::var_os(name).filter(|value| !value.is_empty()) else {
+            if *name == "RUST_TEST_THREADS" {
+                continue;
+            }
+            return Err(format!("canonical build environment is missing {name}"));
+        };
+        if actual_value != OsStr::new(expected_value) {
+            return Err(format!(
+                "canonical build environment has non-canonical {name}"
+            ));
+        }
+        values.push((OsString::from(name), OsString::from(expected_value)));
     }
 
     for name in [
@@ -711,6 +759,7 @@ mod tests {
         for name in [
             "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_RUSTFLAGS",
             "AARCH64_UNKNOWN_LINUX_MUSL_CC",
+            "BINDGEN_EXTRA_CLANG_ARGS_AARCH64_UNKNOWN_LINUX_MUSL",
             "CROSS_CONFIG",
             "DOCKER_OPTS",
             "MACOSX_DEPLOYMENT_TARGET",
@@ -736,6 +785,43 @@ mod tests {
             "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_RUNNER",
             OsStr::new("/qemu-runner aarch64")
         ));
+        for (name, value) in [
+            (
+                "BINDGEN_EXTRA_CLANG_ARGS_x86_64_unknown_linux_musl",
+                "--sysroot=/usr/local/x86_64-linux-musl",
+            ),
+            ("CC_x86_64_unknown_linux_musl", "x86_64-linux-musl-gcc"),
+            ("CXX_x86_64_unknown_linux_musl", "x86_64-linux-musl-g++"),
+            ("CROSS_MUSL_SYSROOT", "/usr/local/x86_64-linux-musl"),
+            ("QEMU_LD_PREFIX", "/usr/local/x86_64-linux-musl"),
+        ] {
+            assert!(canonical_cross_target_environment(
+                "x86_64-unknown-linux-musl",
+                name,
+                OsStr::new(value)
+            ));
+        }
+        for (name, value) in [
+            (
+                "BINDGEN_EXTRA_CLANG_ARGS_aarch64_unknown_linux_musl",
+                "--sysroot=/usr/local/aarch64-linux-musl",
+            ),
+            ("CC_aarch64_unknown_linux_musl", "aarch64-linux-musl-gcc"),
+            ("CXX_aarch64_unknown_linux_musl", "aarch64-linux-musl-g++"),
+            ("CROSS_MUSL_SYSROOT", "/usr/local/aarch64-linux-musl"),
+            ("QEMU_LD_PREFIX", "/usr/local/aarch64-linux-musl"),
+        ] {
+            assert!(canonical_cross_target_environment(
+                "aarch64-unknown-linux-musl",
+                name,
+                OsStr::new(value)
+            ));
+        }
+        assert!(is_unsafe_build_env(
+            "BINDGEN_EXTRA_CLANG_ARGS_x86_64_unknown_linux_musl"
+        ));
+        assert!(is_unsafe_build_env("QEMU_LD_PREFIX"));
+        assert!(is_unsafe_build_env("RUST_TEST_THREADS"));
         assert!(!canonical_cross_target_environment(
             "aarch64-unknown-linux-musl",
             "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER",
@@ -745,6 +831,16 @@ mod tests {
             "x86_64-unknown-linux-musl",
             "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER",
             OsStr::new("aarch64-linux-musl-gcc.sh")
+        ));
+        assert!(!canonical_cross_target_environment(
+            "x86_64-unknown-linux-musl",
+            "CC_x86_64_unknown_linux_musl",
+            OsStr::new("/tmp/attacker-cc")
+        ));
+        assert!(!canonical_cross_target_environment(
+            "aarch64-unknown-linux-musl",
+            "CROSS_MUSL_SYSROOT",
+            OsStr::new("/tmp/attacker-sysroot")
         ));
     }
 

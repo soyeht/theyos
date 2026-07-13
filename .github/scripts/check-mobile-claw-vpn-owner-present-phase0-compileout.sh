@@ -216,8 +216,25 @@ sha256_stream() {
 # Hash the complete build-relevant toolchain closure before invoking any
 # rustup/rustc/cargo binary. Documentation is intentionally excluded; the
 # compiler closure is the executable, sysroot, linker, and target-spec roots.
+toolchain_component_manifest() {
+  local root="$1" component="$2" path relative
+  /usr/bin/find "${root}/${component}" \( -type f -o -type l \) -print \
+    | LC_ALL=C /usr/bin/sort \
+    | while IFS= read -r path; do
+        relative="${path#"${root}/"}"
+        if [[ -L "${path}" ]]; then
+          printf 'l\t%s\t%s\n' "${relative}" "$(/usr/bin/readlink "${path}")"
+        elif [[ -f "${path}" ]]; then
+          printf 'f\t%s\t%s\n' "${relative}" "$(sha256_file "${path}")"
+        else
+          echo "::error::pinned Rust toolchain closure contains a non-regular input: ${relative}" >&2
+          return 1
+        fi
+      done
+}
+
 toolchain_closure_sha256() {
-  local root="$1" component path relative
+  local root="$1" component
   local -a components=(bin etc lib libexec)
   for component in "${components[@]}"; do
     [[ -d "${root}/${component}" && ! -L "${root}/${component}" ]] || {
@@ -225,21 +242,19 @@ toolchain_closure_sha256() {
       return 1
     }
   done
-  {
-    for component in "${components[@]}"; do
-      /usr/bin/find "${root}/${component}" \( -type f -o -type l \) -print
-    done
-  } | LC_ALL=C /usr/bin/sort | while IFS= read -r path; do
-    relative="${path#"${root}/"}"
-    if [[ -L "${path}" ]]; then
-      printf 'l\t%s\t%s\n' "${relative}" "$(/usr/bin/readlink "${path}")"
-    elif [[ -f "${path}" ]]; then
-      printf 'f\t%s\t%s\n' "${relative}" "$(sha256_file "${path}")"
-    else
-      echo "::error::pinned Rust toolchain closure contains a non-regular input: ${relative}" >&2
-      return 1
-    fi
+  for component in "${components[@]}"; do
+    toolchain_component_manifest "${root}" "${component}"
   done | sha256_stream
+}
+
+toolchain_closure_component_summary() {
+  local root="$1" component count digest
+  local -a components=(bin etc lib libexec)
+  for component in "${components[@]}"; do
+    count="$(/usr/bin/find "${root}/${component}" \( -type f -o -type l \) -print | /usr/bin/wc -l | /usr/bin/tr -d ' ')"
+    digest="$(toolchain_component_manifest "${root}" "${component}" | sha256_stream)"
+    printf '%s[count=%s,sha256=%s] ' "${component}" "${count}" "${digest}"
+  done
 }
 
 host_toolchain_triple() {
@@ -358,6 +373,8 @@ for toolchain_binary in "${CARGO_BIN}" "${RUSTC_BIN}"; do
   }
 done
 TOOLCHAIN_CLOSURE_SHA256="$(toolchain_closure_sha256 "${TOOLCHAIN_ROOT}")"
+TOOLCHAIN_CLOSURE_COMPONENT_SUMMARY="$(toolchain_closure_component_summary "${TOOLCHAIN_ROOT}")"
+echo "::notice::Phase 0 toolchain closure target=${TARGET:-unset} ${TOOLCHAIN_CLOSURE_COMPONENT_SUMMARY}"
 if [[ "${BUILD_TOOL}" == "cross" ]]; then
   BUILD_TOOL_BIN="$(resolve_fixed_executable /usr/bin/docker)"
 else
@@ -553,6 +570,13 @@ if [[ "${BUILD_TOOL}" == "cross" ]]; then
       CROSS_LINKER_ENV_VALUE="x86_64-linux-musl-gcc"
       CROSS_RUNNER_ENV_NAME="CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_RUNNER"
       CROSS_RUNNER_ENV_VALUE="/qemu-runner x86_64"
+      CROSS_BINDGEN_ENV_NAME="BINDGEN_EXTRA_CLANG_ARGS_x86_64_unknown_linux_musl"
+      CROSS_BINDGEN_ENV_VALUE="--sysroot=/usr/local/x86_64-linux-musl"
+      CROSS_CC_ENV_NAME="CC_x86_64_unknown_linux_musl"
+      CROSS_CC_ENV_VALUE="x86_64-linux-musl-gcc"
+      CROSS_CXX_ENV_NAME="CXX_x86_64_unknown_linux_musl"
+      CROSS_CXX_ENV_VALUE="x86_64-linux-musl-g++"
+      CROSS_SYSROOT_ENV_VALUE="/usr/local/x86_64-linux-musl"
       ;;
     aarch64-unknown-linux-musl)
       CROSS_IMAGE="ghcr.io/cross-rs/aarch64-unknown-linux-musl:0.2.5@sha256:702154f52b2d8091671aa2c84d5582d849f949977228c735ff8462f93cc0e1e4"
@@ -560,6 +584,13 @@ if [[ "${BUILD_TOOL}" == "cross" ]]; then
       CROSS_LINKER_ENV_VALUE="aarch64-linux-musl-gcc.sh"
       CROSS_RUNNER_ENV_NAME="CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_RUNNER"
       CROSS_RUNNER_ENV_VALUE="/qemu-runner aarch64"
+      CROSS_BINDGEN_ENV_NAME="BINDGEN_EXTRA_CLANG_ARGS_aarch64_unknown_linux_musl"
+      CROSS_BINDGEN_ENV_VALUE="--sysroot=/usr/local/aarch64-linux-musl"
+      CROSS_CC_ENV_NAME="CC_aarch64_unknown_linux_musl"
+      CROSS_CC_ENV_VALUE="aarch64-linux-musl-gcc"
+      CROSS_CXX_ENV_NAME="CXX_aarch64_unknown_linux_musl"
+      CROSS_CXX_ENV_VALUE="aarch64-linux-musl-g++"
+      CROSS_SYSROOT_ENV_VALUE="/usr/local/aarch64-linux-musl"
       ;;
     *)
       echo "::error::no pinned OCI image exists for ${TARGET}"
@@ -607,6 +638,12 @@ if [[ "${BUILD_TOOL}" == "cross" ]]; then
       --env CARGO_INCREMENTAL=0 \
       --env "${CROSS_LINKER_ENV_NAME}=${CROSS_LINKER_ENV_VALUE}" \
       --env "${CROSS_RUNNER_ENV_NAME}=${CROSS_RUNNER_ENV_VALUE}" \
+      --env "${CROSS_BINDGEN_ENV_NAME}=${CROSS_BINDGEN_ENV_VALUE}" \
+      --env "${CROSS_CC_ENV_NAME}=${CROSS_CC_ENV_VALUE}" \
+      --env "${CROSS_CXX_ENV_NAME}=${CROSS_CXX_ENV_VALUE}" \
+      --env "CROSS_MUSL_SYSROOT=${CROSS_SYSROOT_ENV_VALUE}" \
+      --env "QEMU_LD_PREFIX=${CROSS_SYSROOT_ENV_VALUE}" \
+      --env RUST_TEST_THREADS=1 \
       --env PKG_CONFIG_PATH= \
       --env PATH=/phase0-toolchain/bin:/usr/local/bin:/usr/bin:/bin \
       --env RUSTUP_TOOLCHAIN="${EXPECTED_RUST}" \
