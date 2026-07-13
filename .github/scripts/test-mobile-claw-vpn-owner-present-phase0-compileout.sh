@@ -258,7 +258,11 @@ if [[ -s "${GIT_WRAPPER_LOG}" ]]; then
   cat "${GIT_WRAPPER_LOG}" >&2
   exit 1
 fi
-grep -Fq "unsupported Phase 0 target/build-tool pair" "${TMP_ROOT}/path-git.log"
+if ! grep -Fq "unsupported Phase 0 target/build-tool pair" "${TMP_ROOT}/path-git.log"; then
+  echo "error: PATH Git injection test reported an unexpected reason" >&2
+  cat "${TMP_ROOT}/path-git.log" >&2
+  exit 1
+fi
 echo "PASS path_git_injection_ignored"
 
 if [[ -x /usr/bin/docker ]]; then

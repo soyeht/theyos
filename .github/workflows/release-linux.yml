@@ -56,7 +56,7 @@ jobs:
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@5a814b2e0f75e492da42a3c1227d52112e4dac50 # 1.92.0
         with:
-          targets: x86_64-unknown-linux-musl
+          targets: x86_64-unknown-linux-musl,aarch64-unknown-linux-musl
 
       - name: Build (release)
         run: |
@@ -200,7 +200,7 @@ jobs:
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@5a814b2e0f75e492da42a3c1227d52112e4dac50 # 1.92.0
         with:
-          targets: aarch64-unknown-linux-musl
+          targets: x86_64-unknown-linux-musl,aarch64-unknown-linux-musl
 
       - name: Cross-compile (release)
         run: |

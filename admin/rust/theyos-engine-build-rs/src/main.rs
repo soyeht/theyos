@@ -1,5 +1,5 @@
 use std::env;
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufReader, Read, Write};
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
@@ -169,7 +169,10 @@ fn build_engine(target: &str, build_tool: &str) -> Result<(), String> {
     }
     for (name, value) in env::vars_os() {
         let name = name.to_string_lossy();
-        if is_unsafe_build_env(&name) && !value.is_empty() {
+        if is_unsafe_build_env(&name)
+            && !value.is_empty()
+            && !canonical_cross_target_environment(target, &name, &value)
+        {
             return Err(format!(
                 "{name} must be unset for the canonical theyos-engine build"
             ));
@@ -348,6 +351,35 @@ fn is_unsafe_build_env(name: &str) -> bool {
         || UNSAFE_BUILD_ENV_SUFFIX
             .iter()
             .any(|suffix| name.ends_with(suffix))
+}
+
+fn canonical_cross_target_environment(target: &str, name: &str, value: &OsStr) -> bool {
+    let Some(value) = value.to_str() else {
+        return false;
+    };
+    match target {
+        "x86_64-unknown-linux-musl" => matches!(
+            (name, value),
+            (
+                "CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER",
+                "x86_64-linux-musl-gcc"
+            ) | (
+                "CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_RUNNER",
+                "/qemu-runner x86_64"
+            )
+        ),
+        "aarch64-unknown-linux-musl" => matches!(
+            (name, value),
+            (
+                "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER",
+                "aarch64-linux-musl-gcc.sh"
+            ) | (
+                "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_RUNNER",
+                "/qemu-runner aarch64"
+            )
+        ),
+        _ => false,
+    }
 }
 
 fn canonical_child_environment() -> Result<Vec<(OsString, OsString)>, String> {
@@ -667,10 +699,12 @@ fn files_equal(left: &Path, right: &Path) -> Result<bool, String> {
 
 #[cfg(test)]
 mod tests {
-    use std::ffi::OsString;
+    use std::ffi::{OsStr, OsString};
     use std::process::Command;
 
-    use super::{apply_canonical_environment, is_unsafe_build_env};
+    use super::{
+        apply_canonical_environment, canonical_cross_target_environment, is_unsafe_build_env,
+    };
 
     #[test]
     fn build_environment_rejects_target_and_toolchain_overrides() {
@@ -688,6 +722,30 @@ mod tests {
         assert!(!is_unsafe_build_env("CARGO_TARGET_DIR"));
         assert!(!is_unsafe_build_env("PKG_CONFIG_PATH"));
         assert!(!is_unsafe_build_env("RUSTUP_TOOLCHAIN"));
+    }
+
+    #[test]
+    fn cross_target_environment_accepts_only_image_defaults() {
+        assert!(canonical_cross_target_environment(
+            "x86_64-unknown-linux-musl",
+            "CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER",
+            OsStr::new("x86_64-linux-musl-gcc")
+        ));
+        assert!(canonical_cross_target_environment(
+            "aarch64-unknown-linux-musl",
+            "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_RUNNER",
+            OsStr::new("/qemu-runner aarch64")
+        ));
+        assert!(!canonical_cross_target_environment(
+            "aarch64-unknown-linux-musl",
+            "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER",
+            OsStr::new("/tmp/attacker-linker")
+        ));
+        assert!(!canonical_cross_target_environment(
+            "x86_64-unknown-linux-musl",
+            "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER",
+            OsStr::new("aarch64-linux-musl-gcc.sh")
+        ));
     }
 
     #[test]

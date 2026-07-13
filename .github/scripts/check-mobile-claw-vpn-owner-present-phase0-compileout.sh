@@ -549,9 +549,17 @@ if [[ "${BUILD_TOOL}" == "cross" ]]; then
   case "${TARGET}" in
     x86_64-unknown-linux-musl)
       CROSS_IMAGE="ghcr.io/cross-rs/x86_64-unknown-linux-musl:0.2.5@sha256:77db671d8356a64ae72a3e1415e63f547f26d374fbe3c4762c1cd36c7eac7b99"
+      CROSS_LINKER_ENV_NAME="CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER"
+      CROSS_LINKER_ENV_VALUE="x86_64-linux-musl-gcc"
+      CROSS_RUNNER_ENV_NAME="CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_RUNNER"
+      CROSS_RUNNER_ENV_VALUE="/qemu-runner x86_64"
       ;;
     aarch64-unknown-linux-musl)
       CROSS_IMAGE="ghcr.io/cross-rs/aarch64-unknown-linux-musl:0.2.5@sha256:702154f52b2d8091671aa2c84d5582d849f949977228c735ff8462f93cc0e1e4"
+      CROSS_LINKER_ENV_NAME="CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER"
+      CROSS_LINKER_ENV_VALUE="aarch64-linux-musl-gcc.sh"
+      CROSS_RUNNER_ENV_NAME="CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_RUNNER"
+      CROSS_RUNNER_ENV_VALUE="/qemu-runner aarch64"
       ;;
     *)
       echo "::error::no pinned OCI image exists for ${TARGET}"
@@ -597,6 +605,8 @@ if [[ "${BUILD_TOOL}" == "cross" ]]; then
       --env CARGO_TARGET_DIR=/target \
       --env "CARGO_NET_OFFLINE=${offline}" \
       --env CARGO_INCREMENTAL=0 \
+      --env "${CROSS_LINKER_ENV_NAME}=${CROSS_LINKER_ENV_VALUE}" \
+      --env "${CROSS_RUNNER_ENV_NAME}=${CROSS_RUNNER_ENV_VALUE}" \
       --env PKG_CONFIG_PATH= \
       --env PATH=/phase0-toolchain/bin:/usr/local/bin:/usr/bin:/bin \
       --env RUSTUP_TOOLCHAIN="${EXPECTED_RUST}" \
