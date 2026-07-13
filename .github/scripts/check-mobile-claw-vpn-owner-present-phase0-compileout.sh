@@ -36,13 +36,13 @@ if [[ -n "$(git -C "${THEYOS_DIR}" status --porcelain --untracked-files=all)" ]]
   exit 1
 fi
 
-SNAPSHOT="${TMP_ROOT}/source"
+SNAPSHOT_PARENT="${TMP_ROOT}/snapshot-parent"
+SNAPSHOT="${SNAPSHOT_PARENT}/source"
 mkdir -p "${SNAPSHOT}"
 git -C "${THEYOS_DIR}" archive --format=tar "${HEAD_SHA}" \
   | tar -xf - -C "${SNAPSHOT}"
 SNAPSHOT="$(cd "${SNAPSHOT}" && pwd -P)"
 chmod -R a-w "${SNAPSHOT}"
-SNAPSHOT_PARENT="$(dirname "${SNAPSHOT}")"
 
 # The authority build receives only the signed closed-input roots. The full
 # ODB snapshot remains available for policy checks, but it is never mounted as
