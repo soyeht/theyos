@@ -17,7 +17,7 @@
       "host_toolchain": "x86_64-unknown-linux-gnu",
       "toolchain_root": "1.92.0-x86_64-unknown-linux-gnu",
       "toolchain_closure_components": ["bin", "etc", "lib", "libexec"],
-      "toolchain_closure_sha256": "13cf378a3e8ed2241e58be7519d0b411b6be39c5073d2325efc0631e2f32f718",
+      "toolchain_closure_sha256": "03f5ef2aa1e9fe4b264d3e46c79b759617b770eefe08193ee5716b54bd2d139b",
       "rustc_sha256": "028fd60b0e0add5505c661cd3ccde91393d615c8729bd95d94ab1e91409b36a1",
       "cargo_sha256": "310fa46c7903259368c0df3dbb3f4f52759563f3c9ce53b500404b7741fb6860"
     },
@@ -26,7 +26,7 @@
       "host_toolchain": "x86_64-unknown-linux-gnu",
       "toolchain_root": "1.92.0-x86_64-unknown-linux-gnu",
       "toolchain_closure_components": ["bin", "etc", "lib", "libexec"],
-      "toolchain_closure_sha256": "3be6522cbb61349be1fa32a435cab083962eaa3f6310fe7149b84a693bbc07a4",
+      "toolchain_closure_sha256": "8b53b47895e794388b60f1fce29fb8f61026324584ed93f92b6bdb62fe90def1",
       "rustc_sha256": "028fd60b0e0add5505c661cd3ccde91393d615c8729bd95d94ab1e91409b36a1",
       "cargo_sha256": "310fa46c7903259368c0df3dbb3f4f52759563f3c9ce53b500404b7741fb6860"
     }
