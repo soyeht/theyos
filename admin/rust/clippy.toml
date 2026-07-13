@@ -3,7 +3,7 @@
 disallowed-methods = [
   "axum::serve",
   "hyper::server::conn::http1::Builder::serve_connection",
-  "hyper::server::conn::http1::Builder::serve_connection_with_upgrades",
   "hyper::server::conn::http2::Builder::serve_connection",
   "hyper_util::server::conn::auto::Builder::serve_connection",
+  "hyper_util::server::conn::auto::Builder::serve_connection_with_upgrades",
 ]

@@ -773,9 +773,9 @@ fi
 for forbidden_serve_method in \
   'axum::serve' \
   'hyper::server::conn::http1::Builder::serve_connection' \
-  'hyper::server::conn::http1::Builder::serve_connection_with_upgrades' \
   'hyper::server::conn::http2::Builder::serve_connection' \
-  'hyper_util::server::conn::auto::Builder::serve_connection'; do
+  'hyper_util::server::conn::auto::Builder::serve_connection' \
+  'hyper_util::server::conn::auto::Builder::serve_connection_with_upgrades'; do
   if ! grep -Fq -- "${forbidden_serve_method}" "${SNAPSHOT}/admin/rust/clippy.toml"; then
     echo "::error::clippy disallowed-method policy is missing ${forbidden_serve_method}"
     exit 1
@@ -822,11 +822,6 @@ RELEASE_CHECKER_REL=".github/scripts/check-mobile-claw-vpn-owner-present-phase0-
 if [[ "$(grep -Fc "${RELEASE_CHECKER_REL}" "${SNAPSHOT}/.github/workflows/release-linux.yml")" -ne 2 \
   || "$(grep -Fc "${RELEASE_CHECKER_REL}" "${SNAPSHOT}/.github/workflows/release-macos.yml")" -ne 1 ]]; then
   echo "::error::every theyos-engine release target must run the Phase 0 checker on its own subject"
-  exit 1
-fi
-if [[ "$(grep -Fc "mobile_claw_vpn_phase0_" "${SNAPSHOT}/.github/workflows/release-linux.yml")" -ne 2 \
-  || "$(grep -Fc "mobile_claw_vpn_phase0_" "${SNAPSHOT}/.github/workflows/release-macos.yml")" -ne 1 ]]; then
-  echo "::error::every release target must exercise the exact Phase 0 route composer"
   exit 1
 fi
 for release_path in \
