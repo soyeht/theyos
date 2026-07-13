@@ -8,7 +8,7 @@
       "host_toolchain": "aarch64-apple-darwin",
       "toolchain_root": "1.92.0-aarch64-apple-darwin",
       "toolchain_closure_components": ["bin", "etc", "lib", "libexec"],
-      "toolchain_closure_sha256": "915ba62b0d224f6f86b21246f523f987dba96a94c3756fed193451aa4c62c692",
+      "toolchain_closure_sha256": "b80016b6070393061d64d3fcb943d1714130c30ad2262d432ee829addb6433be",
       "rustc_sha256": "12cab30aa9890d54445e29149a1e82d18fbe457de12801bd11bbe7e5e7fe33a0",
       "cargo_sha256": "03e381389f5b7b8e695a744362f3866478f99034b2cf2df6afd4d42cfdab6f67"
     },
