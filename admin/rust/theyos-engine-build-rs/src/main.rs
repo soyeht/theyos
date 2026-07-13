@@ -2,7 +2,7 @@ use std::env;
 use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufReader, Read, Write};
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 
@@ -501,6 +501,9 @@ fn run_container_build(
     let toolchain_root = toolchain_bin
         .parent()
         .ok_or("canonical Rust toolchain has no root directory")?;
+    let target_metadata = fs::metadata(target_root)
+        .map_err(|error| format!("failed to inspect the writable target directory: {error}"))?;
+    let container_user = format!("{}:{}", target_metadata.uid(), target_metadata.gid());
     // The pinned cross images and the host Rust toolchain are amd64. The
     // target linker inside each image produces musl/aarch64 output; the
     // container itself must not require an x86 toolchain under arm emulation.
@@ -517,6 +520,8 @@ fn run_container_build(
         "ALL",
         "--security-opt",
         "no-new-privileges",
+        "--user",
+        &container_user,
     ]);
     if let Some(platform) = platform {
         command.args(["--platform", platform]);
