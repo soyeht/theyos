@@ -276,6 +276,7 @@ fi
 run_clean_online() {
   local sandbox_profile=""
   local -a sandbox_command=()
+  local -a command_args=("$@")
   if [[ "${BUILD_TOOL}" != "cross" ]]; then
     sandbox_profile="${NATIVE_BUILD_SANDBOX}"
     if [[ "${PHASE0_CARGO_FETCH_PHASE:-0}" == "1" ]]; then
@@ -299,6 +300,10 @@ run_clean_online() {
     THEYOS_EMOJI_WORDLIST="${SNAPSHOT}/admin/rust/household-rs/data/emoji-security-code-wordlist.csv" \
     THEYOS_PHASE0_CLEAN_ENV=1
   )
+  while (( ${#command_args[@]} > 0 )) && [[ "${command_args[0]}" == *=* ]]; do
+    clean_env+=("${command_args[0]}")
+    command_args=("${command_args[@]:1}")
+  done
   if (( ${#LOCAL_DOCKER_ENV[@]} > 0 )); then
     clean_env+=("${LOCAL_DOCKER_ENV[@]}")
   fi
@@ -307,9 +312,9 @@ run_clean_online() {
     clean_env+=("DEVELOPER_DIR=${EXPECTED_DEVELOPER_DIR}")
   fi
   if (( ${#sandbox_command[@]} > 0 )); then
-    "${ENV_BIN}" -i "${clean_env[@]}" "${sandbox_command[@]}" "$@"
+    "${ENV_BIN}" -i "${clean_env[@]}" "${sandbox_command[@]}" "${command_args[@]}"
   else
-    "${ENV_BIN}" -i "${clean_env[@]}" "$@"
+    "${ENV_BIN}" -i "${clean_env[@]}" "${command_args[@]}"
   fi
 }
 
