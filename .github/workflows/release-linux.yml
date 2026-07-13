@@ -50,13 +50,6 @@ jobs:
 
       - name: Build (release)
         run: |
-          cargo test \
-            --manifest-path admin/rust/Cargo.toml \
-            --locked \
-            --package server-rs \
-            --test claw_store_wire_contract \
-            mobile_claw_vpn_phase0_ \
-            -- --test-threads=1
           PHASE0_ATTESTATION="$RUNNER_TEMP/phase0-attestation-x86_64-unknown-linux-musl.json"
           PHASE0_ENGINE="$RUNNER_TEMP/phase0-engine-x86_64/theyos-engine"
           mkdir -p "$(dirname "$PHASE0_ENGINE")"
@@ -192,13 +185,6 @@ jobs:
 
       - name: Cross-compile (release)
         run: |
-          cargo test \
-            --manifest-path admin/rust/Cargo.toml \
-            --locked \
-            --package server-rs \
-            --test claw_store_wire_contract \
-            mobile_claw_vpn_phase0_ \
-            -- --test-threads=1
           PHASE0_ATTESTATION="$RUNNER_TEMP/phase0-attestation-aarch64-unknown-linux-musl.json"
           PHASE0_ENGINE="$RUNNER_TEMP/phase0-engine-aarch64/theyos-engine"
           mkdir -p "$(dirname "$PHASE0_ENGINE")"

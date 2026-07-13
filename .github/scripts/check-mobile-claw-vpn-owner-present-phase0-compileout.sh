@@ -302,7 +302,8 @@ run_clean_online() {
   if (( ${#LOCAL_DOCKER_ENV[@]} > 0 )); then
     clean_env+=("${LOCAL_DOCKER_ENV[@]}")
   fi
-  if [[ "${TARGET:-}" == *-apple-darwin ]]; then
+  if [[ "${PHASE0_TARGET:-${TARGET:-}}" == *-apple-darwin \
+    && -n "${EXPECTED_DEVELOPER_DIR:-}" ]]; then
     clean_env+=("DEVELOPER_DIR=${EXPECTED_DEVELOPER_DIR}")
   fi
   if (( ${#sandbox_command[@]} > 0 )); then
