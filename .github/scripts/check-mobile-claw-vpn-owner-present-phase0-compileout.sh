@@ -642,10 +642,11 @@ if find "${CARGO_HOME_DIR}" -type l -print -quit 2>/dev/null | grep -q .; then
   echo "::error::Cargo fetch created a symlink in the authority Cargo home"
   exit 1
 fi
-# Cargo may lazily create registry cache directories during offline metadata
-# resolution even after fetch. Create that non-source skeleton while the fetch
-# sandbox is active, then freeze the complete Cargo home before build scripts run.
-mkdir -p "${CARGO_HOME_DIR}/registry/cache"
+# Cargo may lazily create the sparse crates.io cache directory during offline
+# metadata resolution even after fetch. Create that non-source skeleton before
+# freezing the complete Cargo home; the fetch already verified its contents.
+CRATES_IO_REGISTRY_ID="index.crates.io-1949cf8c6b5b557f"
+mkdir -p "${CARGO_HOME_DIR}/registry/cache/${CRATES_IO_REGISTRY_ID}"
 for registry_index in "${CARGO_HOME_DIR}/registry/index"/*; do
   if [[ -d "${registry_index}" ]]; then
     mkdir -p "${CARGO_HOME_DIR}/registry/cache/$(basename "${registry_index}")"
