@@ -191,7 +191,11 @@ for docker_override in \
     echo "error: canonical build accepted external ${docker_name}" >&2
     exit 1
   fi
-  grep -Fq "${docker_name} must be unset" "${TMP_ROOT}/${docker_name}.log"
+  if ! grep -Fq "${docker_name} must be unset" "${TMP_ROOT}/${docker_name}.log"; then
+    echo "error: ${docker_name} refusal reported an unexpected reason" >&2
+    cat "${TMP_ROOT}/${docker_name}.log" >&2
+    exit 1
+  fi
   echo "PASS ${docker_name}_refused"
 done
 
@@ -205,7 +209,11 @@ if PHASE0_RUSTUP_HOME="${UNTRUSTED_RUSTUP_HOME}" \
   echo "error: canonical build accepted caller-selected PHASE0_RUSTUP_HOME" >&2
   exit 1
 fi
-grep -Fq "PHASE0_RUSTUP_HOME must be unset" "${TMP_ROOT}/rustup-home.log"
+if ! grep -Fq "PHASE0_RUSTUP_HOME must be unset" "${TMP_ROOT}/rustup-home.log"; then
+  echo "error: PHASE0_RUSTUP_HOME refusal reported an unexpected reason" >&2
+  cat "${TMP_ROOT}/rustup-home.log" >&2
+  exit 1
+fi
 echo "PASS phase0_rustup_home_refused"
 
 FAKE_TOOL_BIN="${TMP_ROOT}/fake-tool-bin"
