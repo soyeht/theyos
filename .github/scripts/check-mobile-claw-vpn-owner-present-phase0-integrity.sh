@@ -49,6 +49,11 @@ validate_transition_common() {
       and .owner_authorization.owner_review.required_repository_permission == "admin"
       and .owner_authorization.owner_review.binds_to == "exact-arm-head-sha"
       and .owner_authorization.owner_review.latest_review_only == true
+      and (.owner_authorization.merge_point | type == "object")
+      and .owner_authorization.merge_point.provider == "github"
+      and .owner_authorization.merge_point.mode == "required-merge-group-revalidation"
+      and .owner_authorization.merge_point.requires_current_permission == true
+      and .owner_authorization.merge_point.direct_merge == "rejected-by-base-owned-arm-check"
       and .owner_authorization.canary == "arm-then-consume-merge-blocked-and-allowed"
       and .owner_authorization.anti_replay == "base-sha-expected-head-tree-generation-one-shot-consumption"' \
     "${file}" >/dev/null || die_transition "transition authorization metadata is invalid"
@@ -81,8 +86,110 @@ load_allowed_paths() {
     || die_transition "transition allowed path set must be sorted and unique"
 }
 
+verify_merge_group_candidate() {
+  local event_file group_base group_head group_tree merge_pulls_file page page_file page_count
+  local group_count matching_count candidate_tree_file candidate_tree
+  if [[ "${PHASE0_INTEGRITY_LOCAL_TEST:-0}" == "1" ]]; then
+    [[ "${PHASE0_INTEGRITY_REQUIRE_MERGE_GROUP:-0}" == "1" ]] || return 0
+    [[ "${PHASE0_INTEGRITY_MERGE_GROUP:-0}" == "1" ]] \
+      || die_transition "owner authorization is valid only during a merge-group revalidation"
+    event_file="${PHASE0_INTEGRITY_MERGE_GROUP_JSON:-}"
+    [[ -n "${event_file}" && -f "${event_file}" ]] \
+      || die_transition "local transition test must provide a merge-group fixture"
+    merge_pulls_file="${TRANSITION_DIR}/merge-group-pulls.json"
+    jq -e '.pull_requests | type == "array"' "${event_file}" >/dev/null \
+      || die_transition "local merge-group fixture pull request set is invalid"
+    jq -c '.pull_requests' "${event_file}" >"${merge_pulls_file}"
+  else
+    [[ "${GITHUB_EVENT_NAME:-}" == "merge_group" ]] \
+      || die_transition "owner authorization is valid only during a merge-group revalidation"
+    [[ "${PHASE0_INTEGRITY_MERGE_GROUP:-0}" == "1" ]] \
+      || die_transition "merge-group revalidation marker is missing"
+    event_file="${GITHUB_EVENT_PATH:-}"
+    [[ -n "${event_file}" && -f "${event_file}" ]] \
+      || die_transition "GitHub merge-group event payload is missing"
+    : "${GITHUB_TOKEN:?GITHUB_TOKEN is required for merge-group revalidation}"
+    [[ "${GITHUB_REPOSITORY:-}" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] \
+      || die_transition "repository identity is invalid for merge-group revalidation"
+    merge_pulls_file="${TRANSITION_DIR}/merge-group-pulls.json"
+    page=1
+    while :; do
+      page_file="${TRANSITION_DIR}/merge-group-pulls-${page}.json"
+      group_head="$(jq -er '.merge_group.head_sha' "${event_file}")" \
+        || die_transition "merge-group head SHA is missing"
+      /usr/bin/curl --fail --silent --show-error --location --max-time 20 \
+        -H 'Accept: application/vnd.github+json' \
+        -H 'X-GitHub-Api-Version: 2022-11-28' \
+        -H "Authorization: Bearer ${GITHUB_TOKEN}" \
+        "https://api.github.com/repos/${GITHUB_REPOSITORY}/commits/${group_head}/pulls?per_page=100&page=${page}" \
+        >"${page_file}" \
+        || die_transition "could not fetch the pull requests in the merge group"
+      jq -e 'type == "array"' "${page_file}" >/dev/null \
+        || die_transition "merge-group pull request response is not a JSON array"
+      page_count="$(jq -er 'length' "${page_file}")" \
+        || die_transition "merge-group pull request page length is invalid"
+      (( page_count <= 100 )) \
+        || die_transition "GitHub returned more than the documented merge-group page size"
+      (( page_count < 100 )) && break
+      (( page >= 1000 )) \
+        && die_transition "merge-group pull request pagination exceeded the fail-closed limit"
+      page=$((page + 1))
+    done
+    jq -s 'add' "${TRANSITION_DIR}"/merge-group-pulls-*.json >"${merge_pulls_file}" \
+      || die_transition "could not combine the merge-group pull request history"
+  fi
+
+  group_base="$(jq -er '.merge_group.base_sha' "${event_file}")" \
+    || die_transition "merge-group base SHA is missing"
+  group_head="$(jq -er '.merge_group.head_sha' "${event_file}")" \
+    || die_transition "merge-group head SHA is missing"
+  group_tree="$(jq -er '.merge_group.head_commit.tree_id' "${event_file}")" \
+    || die_transition "merge-group head tree OID is missing"
+  valid_sha "${group_base}" \
+    || die_transition "merge-group base SHA is invalid"
+  valid_sha "${group_head}" \
+    || die_transition "merge-group head SHA is invalid"
+  valid_sha "${group_tree}" \
+    || die_transition "merge-group head tree OID is invalid"
+  [[ "${group_base}" == "${BASE_SHA}" ]] \
+    || die_transition "merge-group base SHA does not match the trusted checker base"
+  [[ "${PHASE0_INTEGRITY_MERGE_GROUP_BASE_SHA:-${group_base}}" == "${group_base}" ]] \
+    || die_transition "merge-group base SHA marker does not match the event"
+  [[ "${PHASE0_INTEGRITY_MERGE_GROUP_SHA:-${group_head}}" == "${group_head}" ]] \
+    || die_transition "merge-group head SHA marker does not match the event"
+
+  group_count="$(jq -er 'length' "${merge_pulls_file}")" \
+    || die_transition "merge-group pull request set is invalid"
+  (( group_count == 1 )) \
+    || die_transition "owner-authorized arm must be the sole pull request in its merge group"
+  matching_count="$(jq -er --arg number "${PR_NUMBER}" --arg head "${HEAD_SHA}" --arg base "${BASE_SHA}" \
+    '[ .[] | select((.number | tostring) == $number and .head.sha == $head and .base.sha == $base) ] | length' \
+    "${merge_pulls_file}")" \
+    || die_transition "merge-group pull request identity is invalid"
+  [[ "${matching_count}" == "1" ]] \
+    || die_transition "merge-group does not contain the exact pull request head under review"
+
+  if [[ "${PHASE0_INTEGRITY_LOCAL_TEST:-0}" == "1" ]]; then
+    candidate_tree="${group_tree}"
+  else
+    candidate_tree_file="${TRANSITION_DIR}/merge-group-candidate-commit.json"
+    /usr/bin/curl --fail --silent --show-error --location --max-time 20 \
+      -H 'Accept: application/vnd.github+json' \
+      -H 'X-GitHub-Api-Version: 2022-11-28' \
+      -H "Authorization: Bearer ${GITHUB_TOKEN}" \
+      "https://api.github.com/repos/${GITHUB_REPOSITORY}/commits/${HEAD_SHA}" \
+      >"${candidate_tree_file}" \
+      || die_transition "could not fetch the merge-group candidate commit"
+    candidate_tree="$(jq -er '.commit.tree.sha' "${candidate_tree_file}")" \
+      || die_transition "merge-group candidate commit tree OID is missing"
+  fi
+  [[ "${candidate_tree}" == "${group_tree}" ]] \
+    || die_transition "merge-group tree does not match the exact arm pull request head"
+}
+
 verify_owner_approval() {
   local reviews_file="" reviews_dir page page_file page_count latest_review reviewer_login permission_file
+  verify_merge_group_candidate
   if [[ "${PHASE0_INTEGRITY_LOCAL_TEST:-0}" == "1" ]]; then
     reviews_file="${PHASE0_INTEGRITY_OWNER_REVIEW_JSON:-}"
     [[ -n "${reviews_file}" && -f "${reviews_file}" ]] \

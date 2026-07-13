@@ -40,6 +40,12 @@ cat > "${REPO}/${TRANSITION_AUTH_REL}" <<'JSON'
       "binds_to": "exact-arm-head-sha",
       "latest_review_only": true
     },
+    "merge_point": {
+      "provider": "github",
+      "mode": "required-merge-group-revalidation",
+      "requires_current_permission": true,
+      "direct_merge": "rejected-by-base-owned-arm-check"
+    },
     "canary": "arm-then-consume-merge-blocked-and-allowed",
     "anti_replay": "base-sha-expected-head-tree-generation-one-shot-consumption"
   }
@@ -123,6 +129,12 @@ cat > "${REPO}/${TRANSITION_AUTH_REL}" <<JSON
       "binds_to": "exact-arm-head-sha",
       "latest_review_only": true
     },
+    "merge_point": {
+      "provider": "github",
+      "mode": "required-merge-group-revalidation",
+      "requires_current_permission": true,
+      "direct_merge": "rejected-by-base-owned-arm-check"
+    },
     "canary": "arm-then-consume-merge-blocked-and-allowed",
     "anti_replay": "base-sha-expected-head-tree-generation-one-shot-consumption"
   }
@@ -157,6 +169,54 @@ PHASE0_INTEGRITY_OWNER_REVIEW_JSON="${OWNER_REVIEW_JSON}" \
   "${REPO}" "${HEAD_OK}" "${ARM_HEAD}" 0 >/dev/null
 git -C "${REPO}" switch --quiet "${BRANCH}"
 echo "PASS transition_arm"
+
+MERGE_GROUP_JSON="${TMP_ROOT}/merge-group.json"
+cat > "${MERGE_GROUP_JSON}" <<JSON
+{
+  "merge_group": {
+    "base_sha": "${HEAD_OK}",
+    "head_sha": "${ARM_HEAD}",
+    "head_commit": {"tree_id": "${TRANSITION_TREE_OID}"}
+  },
+  "pull_requests": [
+    {
+      "number": 1,
+      "head": {"sha": "${ARM_HEAD}"},
+      "base": {"sha": "${HEAD_OK}"}
+    }
+  ]
+}
+JSON
+git -C "${REPO}" switch --quiet --detach "${HEAD_OK}"
+if PHASE0_INTEGRITY_LOCAL_TEST=1 \
+    PHASE0_INTEGRITY_REQUIRE_MERGE_GROUP=1 \
+    PHASE0_INTEGRITY_OWNER_REVIEW_JSON="${OWNER_REVIEW_JSON}" \
+    "${REPO}/.github/scripts/check-mobile-claw-vpn-owner-present-phase0-integrity.sh" \
+    "${REPO}" "${HEAD_OK}" "${ARM_HEAD}" 1 \
+    >"${TMP_ROOT}/direct-arm-without-merge-group.log" 2>&1; then
+  echo "error: integrity checker accepted an arm outside a merge-group revalidation" >&2
+  exit 1
+fi
+grep -Fq "owner authorization is valid only during a merge-group revalidation" \
+  "${TMP_ROOT}/direct-arm-without-merge-group.log" \
+  || { cat "${TMP_ROOT}/direct-arm-without-merge-group.log" >&2; exit 1; }
+git -C "${REPO}" switch --quiet "${BRANCH}"
+echo "PASS direct_arm_without_merge_group_refused"
+
+git -C "${REPO}" switch --quiet --detach "${HEAD_OK}"
+if ! PHASE0_INTEGRITY_LOCAL_TEST=1 \
+    PHASE0_INTEGRITY_REQUIRE_MERGE_GROUP=1 \
+    PHASE0_INTEGRITY_MERGE_GROUP=1 \
+    PHASE0_INTEGRITY_MERGE_GROUP_JSON="${MERGE_GROUP_JSON}" \
+    PHASE0_INTEGRITY_OWNER_REVIEW_JSON="${OWNER_REVIEW_JSON}" \
+    "${REPO}/.github/scripts/check-mobile-claw-vpn-owner-present-phase0-integrity.sh" \
+    "${REPO}" "${HEAD_OK}" "${ARM_HEAD}" 1 \
+    >"${TMP_ROOT}/merge-group-arm.log" 2>&1; then
+  cat "${TMP_ROOT}/merge-group-arm.log" >&2
+  exit 1
+fi
+git -C "${REPO}" switch --quiet "${BRANCH}"
+echo "PASS merge_group_arm_revalidation"
 
 cat > "${OWNER_REVIEW_JSON}" <<JSON
 [
