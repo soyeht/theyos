@@ -17,7 +17,7 @@
       "host_toolchain": "x86_64-unknown-linux-gnu",
       "toolchain_root": "1.92.0-x86_64-unknown-linux-gnu",
       "toolchain_closure_components": ["bin", "etc", "lib", "libexec"],
-      "toolchain_closure_sha256": "80a689adbe581f4240f989a72499ff17d61ad4b502aae4ecf2eb58eb85c968d5",
+      "toolchain_closure_sha256": "13cf378a3e8ed2241e58be7519d0b411b6be39c5073d2325efc0631e2f32f718",
       "rustc_sha256": "028fd60b0e0add5505c661cd3ccde91393d615c8729bd95d94ab1e91409b36a1",
       "cargo_sha256": "310fa46c7903259368c0df3dbb3f4f52759563f3c9ce53b500404b7741fb6860"
     },

@@ -9,6 +9,11 @@ THEYOS_DIR_INPUT="${1:-${DEFAULT_ROOT}}"
 THEYOS_DIR="$(cd "${THEYOS_DIR_INPUT}" && pwd -P)"
 BUILD_TOOL="${PHASE0_BUILD_TOOL:-cargo}"
 
+if [[ -n "${PHASE0_RUSTUP_HOME:-}" ]]; then
+  echo "::error::PHASE0_RUSTUP_HOME must be unset for the canonical theyos-engine build"
+  exit 1
+fi
+
 resolve_fixed_executable() {
   local candidate="$1" resolved candidate_dir candidate_base current target target_dir depth
   if [[ "${candidate}" != /* || ! -x "${candidate}" ]]; then
@@ -592,7 +597,6 @@ if [[ "${BUILD_TOOL}" == "cross" ]]; then
       --env CARGO_TARGET_DIR=/target \
       --env "CARGO_NET_OFFLINE=${offline}" \
       --env CARGO_INCREMENTAL=0 \
-      --env CARGO_PROFILE_RELEASE_DEBUG_ASSERTIONS=false \
       --env PKG_CONFIG_PATH= \
       --env PATH=/phase0-toolchain/bin:/usr/local/bin:/usr/bin:/bin \
       --env RUSTUP_TOOLCHAIN="${EXPECTED_RUST}" \
