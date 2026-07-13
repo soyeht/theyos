@@ -581,7 +581,6 @@ clone_head "${release_subject_bypass}"
 perl -0pi -e \
   's#bash \.github/scripts/check-mobile-claw-vpn-owner-present-phase0-compileout\.sh#true#g' \
   "${release_subject_bypass}/.github/workflows/release-linux.yml"
-refresh_boundary_tree_entry "${release_subject_bypass}" ".github"
 commit_mutation "${release_subject_bypass}" release-subject-bypass
 expect_checker_failure release_subject_bypass \
   "every theyos-engine release target must run the Phase 0 checker on its own subject" \
@@ -601,7 +600,6 @@ jobs:
     steps:
       - run: echo forbidden
 YAML
-refresh_boundary_tree_entry "${alternate_publisher}" ".github"
 commit_mutation "${alternate_publisher}" alternate-publisher
 expect_checker_failure alternate_publisher \
   "unclassified workflow can publish, attest, or consume release credentials" \
