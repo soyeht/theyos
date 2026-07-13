@@ -9,8 +9,8 @@
 100644	blob	b5204b326715e1e07c53b4864abee19f2280aa0b	land-exact	.github/workflows/release-linux.yml
 100644	blob	d92c7bc90443f3a864d6c18806d7301a441f2757	land-exact	.github/workflows/release-macos.yml
 100644	blob	73f5b1d896155259db3aa1aa84e7d065645bf23c	land-exact	admin/contracts/mobile-claw-vpn/v1/owner_present_wire_authority_status_v1.json
-100644	blob	9763e3a2a0b8760765109615c1f8cd6ad7d42813	land-exact	admin/contracts/mobile-claw-vpn/v1/owner_present_phase0_artifact_boundary_v1.tsv
-100644	blob	7cf7a9f6e69d989752b13dc0afd9d91b0713937e	land-exact	admin/rust/Cargo.toml
+100644	blob	c46b7dbd5f5ad7889f6236f9a66ff771698df6fb	land-exact	admin/contracts/mobile-claw-vpn/v1/owner_present_phase0_artifact_boundary_v1.tsv
+100644	blob	ac2040f83346e1aba2cc0b0ad48b84958fb0efd2	land-exact	admin/rust/Cargo.toml
 100644	blob	42fa6a42c33535a3fded0a0e4210a80e3791b660	land-exact	admin/rust/.cargo/config.toml
 100644	blob	4cff2a1b3f165bbaa928e3d58d6c3d505be4c147	land-exact	admin/rust/Cross.toml
 100644	blob	a03ce9608c6081a596dbf51b7134b78ed68d3cd6	land-exact	admin/rust/clippy.toml
