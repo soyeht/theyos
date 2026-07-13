@@ -200,12 +200,12 @@ for docker_override in \
 done
 
 UNTRUSTED_RUSTUP_HOME="${TMP_ROOT}/untrusted-rustup-home"
-if PHASE0_RUSTUP_HOME="${UNTRUSTED_RUSTUP_HOME}" \
+if env -u CARGO_HOME -u RUSTUP_HOME \
+    PHASE0_RUSTUP_HOME="${UNTRUSTED_RUSTUP_HOME}" \
     PHASE0_TARGET="${HOST_TARGET}" \
     PHASE0_BUILD_TOOL=cargo \
     PHASE0_CARGO_TARGET_DIR="${SHARED_TARGET}" \
-    env -u CARGO_HOME -u RUSTUP_HOME \
-      "${REPO_ROOT}/${CHECKER_REL}" >"${TMP_ROOT}/rustup-home.log" 2>&1; then
+    "${REPO_ROOT}/${CHECKER_REL}" >"${TMP_ROOT}/rustup-home.log" 2>&1; then
   echo "error: canonical build accepted caller-selected PHASE0_RUSTUP_HOME" >&2
   exit 1
 fi
