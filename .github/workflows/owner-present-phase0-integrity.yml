@@ -6,6 +6,16 @@ on:
   pull_request_target:
     branches:
       - main
+    types:
+      - opened
+      - synchronize
+      - reopened
+      - ready_for_review
+  pull_request_review:
+    types:
+      - submitted
+      - edited
+      - dismissed
 
 permissions:
   contents: read

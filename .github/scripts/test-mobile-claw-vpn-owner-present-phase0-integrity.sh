@@ -31,12 +31,12 @@ cat > "${REPO}/${TRANSITION_AUTH_REL}" <<'JSON'
   "state": "unarmed",
   "generation": 0,
   "owner_authorization": {
-    "mode": "github-owner-review-exact-arm-commit",
+    "mode": "github-repository-admin-review-exact-arm-commit",
     "requires_owner_review": true,
     "requires_required_integrity_check": true,
     "owner_review": {
       "provider": "github",
-      "required_author_association": "OWNER",
+      "required_repository_permission": "admin",
       "binds_to": "exact-arm-head-sha",
       "latest_review_only": true
     },
@@ -114,12 +114,12 @@ cat > "${REPO}/${TRANSITION_AUTH_REL}" <<JSON
     "protected/future-1.txt"
   ],
   "owner_authorization": {
-    "mode": "github-owner-review-exact-arm-commit",
+    "mode": "github-repository-admin-review-exact-arm-commit",
     "requires_owner_review": true,
     "requires_required_integrity_check": true,
     "owner_review": {
       "provider": "github",
-      "required_author_association": "OWNER",
+      "required_repository_permission": "admin",
       "binds_to": "exact-arm-head-sha",
       "latest_review_only": true
     },
@@ -141,8 +141,9 @@ OWNER_REVIEW_JSON="${TMP_ROOT}/owner-review.json"
 cat > "${OWNER_REVIEW_JSON}" <<JSON
 [
   {
-    "user": {"id": 1},
-    "author_association": "OWNER",
+    "user": {"id": 1, "login": "reviewer"},
+    "author_association": "MEMBER",
+    "repository_permission": "admin",
     "state": "APPROVED",
     "commit_id": "${ARM_HEAD}",
     "submitted_at": "2026-01-01T00:00:00Z"
@@ -160,8 +161,9 @@ echo "PASS transition_arm"
 cat > "${OWNER_REVIEW_JSON}" <<JSON
 [
   {
-    "user": {"id": 1},
+    "user": {"id": 1, "login": "reviewer"},
     "author_association": "MEMBER",
+    "repository_permission": "write",
     "state": "APPROVED",
     "commit_id": "${ARM_HEAD}",
     "submitted_at": "2026-01-01T00:00:00Z"
@@ -177,15 +179,16 @@ if PHASE0_INTEGRITY_LOCAL_TEST=1 \
   echo "error: integrity checker accepted a non-owner transition review" >&2
   exit 1
 fi
-grep -Fq "exact arm commit lacks a current approved GitHub owner review" \
+grep -Fq "exact arm commit lacks a current approved GitHub repository-admin review" \
   "${TMP_ROOT}/owner-review-non-owner.log" \
   || { cat "${TMP_ROOT}/owner-review-non-owner.log" >&2; exit 1; }
 git -C "${REPO}" switch --quiet "${BRANCH}"
 echo "PASS owner_review_non_owner_refused"
 
 jq -n --arg head "${ARM_HEAD}" '[range(0; 101) | {
-  user: {id: 1},
-  author_association: "OWNER",
+  user: {id: 1, login: "reviewer"},
+  author_association: "MEMBER",
+  repository_permission: "admin",
   state: (if . == 100 then "CHANGES_REQUESTED" else "APPROVED" end),
   commit_id: $head,
   submitted_at: (("000" + (.|tostring))[-3:])
@@ -199,7 +202,7 @@ if PHASE0_INTEGRITY_LOCAL_TEST=1 \
   echo "error: integrity checker accepted a stale owner approval after a later rejection" >&2
   exit 1
 fi
-grep -Fq "exact arm commit lacks a current approved GitHub owner review" \
+grep -Fq "exact arm commit lacks a current approved GitHub repository-admin review" \
   "${TMP_ROOT}/owner-review-pagination.log" \
   || { cat "${TMP_ROOT}/owner-review-pagination.log" >&2; exit 1; }
 git -C "${REPO}" switch --quiet "${BRANCH}"
@@ -216,8 +219,9 @@ ARM_WEAKEN_HEAD="$(git -C "${ARM_WEAKEN_PLAN}" rev-parse HEAD)"
 cat > "${OWNER_REVIEW_JSON}" <<JSON
 [
   {
-    "user": {"id": 1},
-    "author_association": "OWNER",
+    "user": {"id": 1, "login": "reviewer"},
+    "author_association": "MEMBER",
+    "repository_permission": "admin",
     "state": "APPROVED",
     "commit_id": "${ARM_WEAKEN_HEAD}",
     "submitted_at": "2026-01-01T00:00:00Z"

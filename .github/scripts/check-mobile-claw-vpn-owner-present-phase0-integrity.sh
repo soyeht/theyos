@@ -17,7 +17,7 @@ SELF_PATHS=(
 )
 
 TRANSITION_CONTRACT="soyeht-owner-present-proof-machinery-transition-v1"
-OWNER_REVIEW_ASSOCIATION="OWNER"
+OWNER_REVIEW_PERMISSION="admin"
 
 die_transition() {
   echo "::error file=${TRANSITION_AUTH_REL}::$1"
@@ -41,12 +41,12 @@ validate_transition_common() {
     '.contract == $contract
       and .version == 1
       and (.owner_authorization | type == "object")
-      and .owner_authorization.mode == "github-owner-review-exact-arm-commit"
+        and .owner_authorization.mode == "github-repository-admin-review-exact-arm-commit"
       and .owner_authorization.requires_owner_review == true
       and .owner_authorization.requires_required_integrity_check == true
       and (.owner_authorization.owner_review | type == "object")
       and .owner_authorization.owner_review.provider == "github"
-      and .owner_authorization.owner_review.required_author_association == "OWNER"
+      and .owner_authorization.owner_review.required_repository_permission == "admin"
       and .owner_authorization.owner_review.binds_to == "exact-arm-head-sha"
       and .owner_authorization.owner_review.latest_review_only == true
       and .owner_authorization.canary == "arm-then-consume-merge-blocked-and-allowed"
@@ -82,7 +82,7 @@ load_allowed_paths() {
 }
 
 verify_owner_approval() {
-  local reviews_file="" reviews_dir page page_file page_count
+  local reviews_file="" reviews_dir page page_file page_count latest_review reviewer_login permission_file
   if [[ "${PHASE0_INTEGRITY_LOCAL_TEST:-0}" == "1" ]]; then
     reviews_file="${PHASE0_INTEGRITY_OWNER_REVIEW_JSON:-}"
     [[ -n "${reviews_file}" && -f "${reviews_file}" ]] \
@@ -121,23 +121,43 @@ verify_owner_approval() {
       || die_transition "could not combine the complete GitHub review history"
   fi
 
-  jq -e \
-    --arg head "${HEAD_SHA}" \
-    --arg association "${OWNER_REVIEW_ASSOCIATION}" \
-    'type == "array"
-      and ([ .[]
-        | select((.user | type) == "object")
-        | select((.user.id | type) == "number")
-        | select(.author_association == $association)
-        | select(.state == "APPROVED" or .state == "DISMISSED" or .state == "CHANGES_REQUESTED")
-      ]
-      | group_by(.user.id)
-      | map(max_by(.submitted_at // ""))
-      | any(.[]; .state == "APPROVED"
-        and .commit_id == $head
-        and .author_association == $association))' \
-    "${reviews_file}" >/dev/null \
-    || die_transition "exact arm commit lacks a current approved GitHub owner review"
+  jq -e 'type == "array"' "${reviews_file}" >/dev/null \
+    || die_transition "complete GitHub owner review history is not a JSON array"
+  while IFS= read -r latest_review; do
+    [[ -n "${latest_review}" ]] || continue
+    if [[ "$(jq -r '.state' <<<"${latest_review}")" != "APPROVED" \
+      || "$(jq -r '.commit_id' <<<"${latest_review}")" != "${HEAD_SHA}" ]]; then
+      continue
+    fi
+    reviewer_login="$(jq -r '.user.login // empty' <<<"${latest_review}")"
+    [[ "${reviewer_login}" =~ ^[A-Za-z0-9-]+$ ]] || continue
+    if [[ "${PHASE0_INTEGRITY_LOCAL_TEST:-0}" == "1" ]]; then
+      [[ "$(jq -r '.repository_permission // empty' <<<"${latest_review}")" == "${OWNER_REVIEW_PERMISSION}" ]] \
+        && return 0
+      continue
+    fi
+    permission_file="${TRANSITION_DIR}/permission-${reviewer_login}.json"
+    /usr/bin/curl --fail --silent --show-error --location --max-time 20 \
+      -H 'Accept: application/vnd.github+json' \
+      -H 'X-GitHub-Api-Version: 2022-11-28' \
+      -H "Authorization: Bearer ${GITHUB_TOKEN}" \
+      "https://api.github.com/repos/${GITHUB_REPOSITORY}/collaborators/${reviewer_login}/permission" \
+      >"${permission_file}" \
+      || die_transition "could not verify GitHub repository permission for the arm reviewer"
+    jq -e --arg permission "${OWNER_REVIEW_PERMISSION}" \
+      '.permission == $permission' "${permission_file}" >/dev/null \
+      && return 0
+  done < <(
+    jq -c '[ .[]
+      | select((.user | type) == "object")
+      | select((.user.id | type) == "number")
+      | select(.state == "APPROVED" or .state == "DISMISSED" or .state == "CHANGES_REQUESTED")
+    ]
+    | group_by(.user.id)
+    | map(max_by(.submitted_at // ""))
+    | .[]' "${reviews_file}"
+  )
+  die_transition "exact arm commit lacks a current approved GitHub repository-admin review"
 }
 
 path_is_allowed() {

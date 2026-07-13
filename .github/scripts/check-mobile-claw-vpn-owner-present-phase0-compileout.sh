@@ -60,6 +60,7 @@ BUILD_TOOL_MANIFEST_REL="admin/rust/theyos-engine-build-rs/Cargo.toml"
 BUILD_TOOL_SOURCE_REL="admin/rust/theyos-engine-build-rs/src/main.rs"
 BOUNDARY_REL="admin/contracts/mobile-claw-vpn/v1/owner_present_phase0_artifact_boundary_v1.tsv"
 FORBIDDEN_MARKERS_REL="admin/rust/phase0-forbidden-markers.txt"
+TOOLCHAIN_POLICY_REL=".github/owner-present-phase0-toolchain-v1.json"
 
 HEAD_SHA="$(git -C "${THEYOS_DIR}" rev-parse HEAD)"
 HEAD_TREE="$(git -C "${THEYOS_DIR}" rev-parse "${HEAD_SHA}^{tree}")"
@@ -216,6 +217,13 @@ resolve_toolchain_executable() {
     echo "::error::rustup returned an invalid ${name} toolchain executable"
     exit 1
   }
+  case "${resolved}" in
+    "${RUSTUP_HOME_DIR}/toolchains/${EXPECTED_RUST}-"*/bin/${name}) ;;
+    *)
+      echo "::error::rustup selected ${name} outside the frozen Rust toolchain root"
+      exit 1
+      ;;
+  esac
   printf '%s\n' "${resolved}"
 }
 
@@ -437,17 +445,6 @@ fi
 HOST_TARGET="${RUSTC_HOST}"
 TARGET="${PHASE0_TARGET:-${HOST_TARGET}}"
 PUBLISHED_TARGET=true
-RUSTC_TOOLCHAIN_BIN="$(run_clean "${RUSTUP_BIN}" which rustc)"
-CARGO_TOOLCHAIN_BIN="$(run_clean "${RUSTUP_BIN}" which cargo)"
-for toolchain_binary in "${RUSTC_TOOLCHAIN_BIN}" "${CARGO_TOOLCHAIN_BIN}"; do
-  if [[ ! -f "${toolchain_binary}" || -L "${toolchain_binary}" ]]; then
-    echo "::error::rustup resolved a non-regular toolchain executable"
-    exit 1
-  fi
-done
-RUSTC_TOOLCHAIN_SHA256="$(sha256_file "${RUSTC_TOOLCHAIN_BIN}")"
-CARGO_TOOLCHAIN_SHA256="$(sha256_file "${CARGO_TOOLCHAIN_BIN}")"
-
 case "${TARGET}:${BUILD_TOOL}" in
   x86_64-unknown-linux-musl:cross | \
   aarch64-unknown-linux-musl:cross | \
@@ -458,6 +455,39 @@ case "${TARGET}:${BUILD_TOOL}" in
     exit 1
     ;;
 esac
+RUSTC_TOOLCHAIN_BIN="$(run_clean "${RUSTUP_BIN}" which rustc)"
+CARGO_TOOLCHAIN_BIN="$(run_clean "${RUSTUP_BIN}" which cargo)"
+for toolchain_binary in "${RUSTC_TOOLCHAIN_BIN}" "${CARGO_TOOLCHAIN_BIN}"; do
+  if [[ ! -f "${toolchain_binary}" || -L "${toolchain_binary}" ]]; then
+    echo "::error::rustup resolved a non-regular toolchain executable"
+    exit 1
+  fi
+done
+RUSTC_TOOLCHAIN_SHA256="$(sha256_file "${RUSTC_TOOLCHAIN_BIN}")"
+CARGO_TOOLCHAIN_SHA256="$(sha256_file "${CARGO_TOOLCHAIN_BIN}")"
+TOOLCHAIN_POLICY_SHA256="$(sha256_file "${SNAPSHOT}/${TOOLCHAIN_POLICY_REL}")"
+if ! jq -e \
+  --arg release "${EXPECTED_RUST}" \
+  --arg target "${TARGET}" \
+  --arg host_toolchain "${RUSTC_HOST}" \
+  --arg build_tool "${BUILD_TOOL}" \
+  --arg rustc_sha256 "${RUSTC_TOOLCHAIN_SHA256}" \
+  --arg cargo_sha256 "${CARGO_TOOLCHAIN_SHA256}" \
+  '.schema == "theyos-owner-present-phase0-toolchain-v1"
+   and .version == 1
+   and .rust_release == $release
+   and (.targets | type == "object")
+   and (.targets[$target] | type == "object")
+   and .targets[$target].host_toolchain == $host_toolchain
+   and .targets[$target].build_tool == $build_tool
+   and .targets[$target].rustc_sha256 == $rustc_sha256
+   and .targets[$target].cargo_sha256 == $cargo_sha256
+   and ([.targets | keys[]] | sort | length == 3)
+   and ([.targets | keys[]] | sort == ["aarch64-apple-darwin", "aarch64-unknown-linux-musl", "x86_64-unknown-linux-musl"])' \
+  "${SNAPSHOT}/${TOOLCHAIN_POLICY_REL}" >/dev/null; then
+  echo "::error::selected Rust/Cargo binaries do not match the base-owned Phase 0 toolchain policy"
+  exit 1
+fi
 
 if [[ "${BUILD_TOOL}" == "cross" ]]; then
   if [[ "$(uname -s)" != "Linux" ]]; then
@@ -719,7 +749,8 @@ for path in \
   "claws/manifest.yml" \
   "${HISTORICAL_WIRE_REL}" \
   "${AUTHORITY_STATUS_REL}" \
-  "${BOUNDARY_REL}"; do
+  "${BOUNDARY_REL}" \
+  "${TOOLCHAIN_POLICY_REL}"; do
   require_blob "${path}"
 done
 
@@ -1767,6 +1798,8 @@ jq -n -S \
   --arg cargo "${ATTESTATION_CARGO_VERSION}" \
   --arg rustc_toolchain_sha256 "${RUSTC_TOOLCHAIN_SHA256}" \
   --arg cargo_toolchain_sha256 "${CARGO_TOOLCHAIN_SHA256}" \
+  --arg toolchain_policy_sha256 "${TOOLCHAIN_POLICY_SHA256}" \
+  --arg toolchain_policy_target "${TARGET}" \
   --arg python "$(run_clean "${PYTHON_BIN}" --version 2>&1)" \
   --arg cargo_config_sha256 "$(sha256_file "${SNAPSHOT}/admin/rust/.cargo/config.toml")" \
   --arg cross_config_sha256 "$(sha256_file "${SNAPSHOT}/admin/rust/Cross.toml")" \
@@ -1808,6 +1841,8 @@ jq -n -S \
     cargo: $cargo,
     rustc_toolchain_sha256: $rustc_toolchain_sha256,
     cargo_toolchain_sha256: $cargo_toolchain_sha256,
+    toolchain_policy_sha256: $toolchain_policy_sha256,
+    toolchain_policy_target: $toolchain_policy_target,
     python: $python,
     cargo_config_sha256: $cargo_config_sha256,
     cross_config_sha256: $cross_config_sha256,

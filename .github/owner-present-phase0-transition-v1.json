@@ -4,12 +4,12 @@
   "state": "unarmed",
   "generation": 0,
   "owner_authorization": {
-    "mode": "github-owner-review-exact-arm-commit",
+    "mode": "github-repository-admin-review-exact-arm-commit",
     "requires_owner_review": true,
     "requires_required_integrity_check": true,
     "owner_review": {
       "provider": "github",
-      "required_author_association": "OWNER",
+      "required_repository_permission": "admin",
       "binds_to": "exact-arm-head-sha",
       "latest_review_only": true
     },

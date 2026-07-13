@@ -107,6 +107,8 @@ jobs:
             and .post_fetch_build_offline == true
             and (.rustc_toolchain_sha256 | test("^[0-9a-f]{64}$"))
             and (.cargo_toolchain_sha256 | test("^[0-9a-f]{64}$"))
+            and (.toolchain_policy_sha256 | test("^[0-9a-f]{64}$"))
+            and .toolchain_policy_target == $target
             and (if $target == "aarch64-apple-darwin"
                  then .expected_xcode_version == "16.4"
                    and .expected_xcode_build == "16F6"
