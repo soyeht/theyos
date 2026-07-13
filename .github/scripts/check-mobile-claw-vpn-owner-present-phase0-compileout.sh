@@ -770,6 +770,30 @@ if [[ "$(grep -Fc '#[allow(clippy::disallowed_methods)]' "${CLIPPY_ALLOW_FILE}")
   echo "::error::only the two reviewed Phase 0 wrapper sites may allow disallowed HTTP methods"
   exit 1
 fi
+if ! awk '
+  /#\[allow\(clippy::disallowed_methods\)\]/ { pending = 1; next }
+  pending && /pub fn serve</ { serve += 1; pending = 0; next }
+  pending && /pub fn serve_with_connect_info</ { connect = 1; pending = 0; next }
+  pending && NF { pending = 0 }
+  END { exit !(serve == 1 && connect == 1) }
+' "${CLIPPY_ALLOW_FILE}"; then
+  echo "::error::Phase 0 disallowed-method allowances must be adjacent to the two reviewed wrapper functions"
+  exit 1
+fi
+expected_clippy_methods=$(printf '%s\n' \
+  'axum::serve' \
+  'hyper::server::conn::http1::Builder::serve_connection' \
+  'hyper::server::conn::http2::Builder::serve_connection' \
+  'hyper_util::server::conn::auto::Builder::serve_connection' \
+  'hyper_util::server::conn::auto::Builder::serve_connection_with_upgrades')
+actual_clippy_methods="$({
+  sed -n '/^disallowed-methods[[:space:]]*=[[:space:]]*\[/,/^\]/p' \
+    "${SNAPSHOT}/admin/rust/clippy.toml"
+} | sed -n 's/^[[:space:]]*"\([^"]*\)"[[:space:]]*,\{0,1\}[[:space:]]*$/\1/p')"
+if [[ "${actual_clippy_methods}" != "${expected_clippy_methods}" ]]; then
+  echo "::error file=admin/rust/clippy.toml::disallowed-method policy differs from the reviewed exact set"
+  exit 1
+fi
 for forbidden_serve_method in \
   'axum::serve' \
   'hyper::server::conn::http1::Builder::serve_connection' \

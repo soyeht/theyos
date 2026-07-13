@@ -107,7 +107,7 @@ in
       test -x "$out/bin/theyos-llm-proxy"
       for executable in "$out"/bin/*; do
         if strings "$executable" | grep -Eiq \
-          'RevalidatedCapability|ConsumedCapability|PointOfUsePermit|owner_present|/api/v1/mobile/claw-vpn/(owner|offers|sessions|rendezvous)'; then
+          'RevalidatedCapability|ConsumedCapability|PointOfUsePermit|owner_present|owner_approval_consumed|mesh_c_owner_present_offer_control|RelayStreamIpTunnelRouter|RelayStreamIpTunnelTarget|new_with_ip_tunnel_router|bind_relay_stream_reverse_connect_with_ip_tunnel_router|/api/v1/mobile/claw-vpn/(owner-present|owner|offers|sessions|rendezvous)'; then
           echo "Phase 0 marker found in $executable" >&2
           exit 1
         fi

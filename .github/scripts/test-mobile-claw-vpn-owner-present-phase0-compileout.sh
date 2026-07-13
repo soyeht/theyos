@@ -410,8 +410,23 @@ RUST
 refresh_boundary_tree_entry "${external_include}" "admin/rust"
 commit_mutation "${external_include}" external-include
 expect_checker_failure external_include \
-  "production depfile input escapes the four closed Git subtrees" \
+  "canonical theyos-engine build failed for ${HOST_TARGET} with cargo" \
   "${external_include}"
+
+allow_alias_escape="${TMP_ROOT}/allow-alias-escape"
+clone_head "${allow_alias_escape}"
+cat >> "${allow_alias_escape}/admin/rust/server-rs/src/handlers_misc.rs" <<'RUST'
+
+#[allow(clippy::disallowed_methods)]
+fn phase0_unreviewed_allow_alias() {
+    let _ = axum::serve;
+}
+RUST
+refresh_boundary_tree_entry "${allow_alias_escape}" "admin/rust"
+commit_mutation "${allow_alias_escape}" allow-alias-escape
+expect_checker_failure allow_alias_escape \
+  "only the two reviewed Phase 0 wrapper sites may allow disallowed HTTP methods" \
+  "${allow_alias_escape}"
 
 absolute_external_include="${TMP_ROOT}/absolute-external-include"
 clone_head "${absolute_external_include}"
