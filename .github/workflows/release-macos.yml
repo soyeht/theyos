@@ -25,6 +25,7 @@ jobs:
       PHASE0_EXPECTED_XCODE_VERSION: "26.5"
       PHASE0_EXPECTED_XCODE_BUILD: "17F42"
       PHASE0_EXPECTED_MACOS_SDK_VERSION: "26.5"
+      PHASE0_EXPECTED_DEVELOPER_DIR: /Applications/Xcode.app/Contents/Developer
 
     steps:
       - name: Checkout exact tag
@@ -50,14 +51,14 @@ jobs:
       - name: Verify tag matches Cargo version
         run: |
           set -euo pipefail
-          version="$(sed -n 's/^version = "\(.*\)"/\1/p' admin/rust/soyeht-rs/Cargo.toml | head -1)"
+          version="$(git show "$GITHUB_SHA:admin/rust/soyeht-rs/Cargo.toml" | sed -n 's/^version = "\(.*\)"/\1/p' | head -1)"
           test "$TAG" = "v$version"
 
       - name: Build, inspect, and attest unsigned subjects
         shell: bash
         env:
           PHASE0_CARGO_TARGET_DIR: ${{ runner.temp }}/phase0-target
-          PHASE0_CARGO_HOME: ${{ runner.temp }}/phase0-cargo-home
+          PHASE0_CARGO_HOME: ${{ runner.temp }}/phase0-cargo-home/home
           PHASE0_RUN_ARTIFACT_DIRECT: "1"
           PHASE0_ATTESTATION_OUT: ${{ runner.temp }}/phase0-attestation-aarch64-apple-darwin.json
           PHASE0_STAGED_ENGINE_OUT: ${{ runner.temp }}/theyos-engine-aarch64-apple-darwin
@@ -83,7 +84,7 @@ jobs:
           for executable in vmrunner_macos_ipc store-ipc terminal-ipc theyos-ssh theyos-provision-inject; do
             cp "$binary_dir/$executable" "$stage/$executable"
           done
-          cp scripts/entitlements/vmrunner-macos.entitlements "$stage/vmrunner-macos.entitlements"
+          git show "$GITHUB_SHA:scripts/entitlements/vmrunner-macos.entitlements" > "$stage/vmrunner-macos.entitlements"
           printf '%s\n' "$version" > "$stage/engine-version.txt"
           cp "$PHASE0_ATTESTATION" "$stage/phase0-build-attestation.json"
           for executable in theyos-engine vmrunner_macos_ipc store-ipc terminal-ipc theyos-ssh theyos-provision-inject; do
@@ -95,8 +96,9 @@ jobs:
             --arg schema "theyos-phase0-published-package-manifest-v1" \
             --arg version "$version" \
             --arg phase0_attestation_sha256 "$(shasum -a 256 "$PHASE0_ATTESTATION" | awk '{print $1}')" \
+            --arg entitlements_sha256 "$(shasum -a 256 "$stage/vmrunner-macos.entitlements" | awk '{print $1}')" \
             --argjson names '["theyos-engine","vmrunner_macos_ipc","store-ipc","terminal-ipc","theyos-ssh","theyos-provision-inject"]' \
-            '{schema:$schema,version:$version,source_sha,source_tree,target,phase0_attestation_sha256:$phase0_attestation_sha256,executables:(.published_executables | with_entries(select(.key as $key | $names | index($key))) | with_entries(.value = {unsigned_sha256:.value.sha256,classification:.value.classification}))}' \
+            '{schema:$schema,version:$version,source_sha,source_tree,target,phase0_attestation_sha256:$phase0_attestation_sha256,executables:(.published_executables | with_entries(select(.key as $key | $names | index($key))) | with_entries(.value = {unsigned_sha256:.value.sha256,classification:.value.classification})),package_files:{"vmrunner-macos.entitlements":{unsigned_sha256:$entitlements_sha256,classification:"codesign-input-entitlements"}}}' \
             "$PHASE0_ATTESTATION" > "$stage/phase0-package-manifest.json"
           tar -C "$stage" -czf "$RUNNER_TEMP/macos-unsigned/theyos-engine-$version-macos-arm64-unsigned.tar.gz" .
 
@@ -144,11 +146,15 @@ jobs:
             .expected_xcode_version == "26.5"
             and .expected_xcode_build == "17F42"
             and .expected_macos_sdk_version == "26.5"
+            and .developer_dir == "/Applications/Xcode.app/Contents/Developer"
+            and .macos_sdk_path == "/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX26.5.sdk"
           ' "$stage/phase0-build-attestation.json" >/dev/null
           while IFS=$'\t' read -r executable expected; do
             test -n "$executable"
             test "$(shasum -a 256 "$stage/$executable" | awk '{print $1}')" = "$expected"
           done < <(jq -r '.executables | to_entries[] | [.key,.value.unsigned_sha256] | @tsv' "$stage/phase0-package-manifest.json")
+          test "$(shasum -a 256 "$stage/vmrunner-macos.entitlements" | awk '{print $1}')" = \
+            "$(jq -r '.package_files["vmrunner-macos.entitlements"].unsigned_sha256' "$stage/phase0-package-manifest.json")"
           KEYCHAIN_PASSWORD="$(openssl rand -base64 24)"
           security create-keychain -p "$KEYCHAIN_PASSWORD" "$RUNNER_TEMP/build.keychain"
           security default-keychain -s "$RUNNER_TEMP/build.keychain"

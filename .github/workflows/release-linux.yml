@@ -16,9 +16,7 @@ on:
       - "v*"
 
 permissions:
-  contents: write
-  id-token: write
-  attestations: write
+  contents: read
 
 jobs:
   build-linux-x86_64:
@@ -60,12 +58,12 @@ jobs:
             mobile_claw_vpn_phase0_ \
             -- --test-threads=1
           PHASE0_ATTESTATION="$RUNNER_TEMP/phase0-attestation-x86_64-unknown-linux-musl.json"
-          PHASE0_ENGINE="$GITHUB_WORKSPACE/admin/rust/dist/.linux-stage-x86_64/theyos-engine"
+          PHASE0_ENGINE="$RUNNER_TEMP/phase0-engine-x86_64/theyos-engine"
           mkdir -p "$(dirname "$PHASE0_ENGINE")"
           PHASE0_TARGET=x86_64-unknown-linux-musl \
           PHASE0_BUILD_TOOL=cross \
-          PHASE0_CARGO_TARGET_DIR="$GITHUB_WORKSPACE/admin/rust/target" \
-          PHASE0_CARGO_HOME="$RUNNER_TEMP/phase0-cargo-home-x86_64" \
+          PHASE0_CARGO_TARGET_DIR="$RUNNER_TEMP/phase0-target-x86_64" \
+          PHASE0_CARGO_HOME="$RUNNER_TEMP/phase0-cargo-home-x86_64/home" \
           PHASE0_RUN_ARTIFACT_DIRECT=1 \
           PHASE0_ATTESTATION_OUT="$PHASE0_ATTESTATION" \
           PHASE0_STAGED_ENGINE_OUT="$PHASE0_ENGINE" \
@@ -77,14 +75,15 @@ jobs:
         working-directory: admin/rust
         run: |
           set -e
-          CARGO_VERSION=$(grep '^version' soyeht-rs/Cargo.toml | sed 's/version = "\(.*\)"/\1/')
-          OUTDIR="dist/linux-x86_64"
-          STAGE="dist/.linux-stage-x86_64"
+          CARGO_VERSION=$(git show "$GITHUB_SHA:admin/rust/soyeht-rs/Cargo.toml" | sed -n 's/^version = "\(.*\)"/\1/p' | head -1)
+          OUTDIR="$RUNNER_TEMP/linux-package-x86_64"
+          STAGE="$OUTDIR/stage"
           mkdir -p "$OUTDIR"
           mkdir -p "$STAGE"
-          BINARY_DIR="target/x86_64-unknown-linux-musl/release"
+          BINARY_DIR="$RUNNER_TEMP/phase0-target-x86_64/x86_64-unknown-linux-musl/release"
           BINARY="$BINARY_DIR/server"
           TARBALL="$OUTDIR/theyos-engine-${CARGO_VERSION}-linux-x86_64.tar.gz"
+          cp "$phase0_engine" "$STAGE/theyos-engine"
           test -x "$STAGE/theyos-engine"
           test "$(sha256sum "$STAGE/theyos-engine" | awk '{print $1}')" = \
             "$(jq -r '.theyos_engine_sha256' "$phase0_attestation")"
@@ -94,7 +93,7 @@ jobs:
           cp "$BINARY_DIR/store-ipc" "$STAGE/store-ipc"
           cp "$BINARY_DIR/terminal-ipc" "$STAGE/terminal-ipc"
           cp "$BINARY_DIR/imagebuilder" "$STAGE/imagebuilder"
-          cp "../../scripts/uninstall-linux.sh" "$STAGE/uninstall-linux.sh"
+          git show "$GITHUB_SHA:scripts/uninstall-linux.sh" > "$STAGE/uninstall-linux.sh"
           chmod +x "$STAGE/soyeht" "$STAGE/uninstall-linux.sh"
           printf '%s\n' "$CARGO_VERSION" > "$STAGE/engine-version.txt"
           for executable in theyos-engine soyeht vmrunner_ipc fc-ssh store-ipc terminal-ipc imagebuilder; do
@@ -102,6 +101,11 @@ jobs:
             expected="$(jq -r --arg executable "$executable" '.published_executables[$executable].sha256' "$phase0_attestation")"
             test "$actual" = "$expected"
           done
+          uninstall_sha256="$(sha256sum "$STAGE/uninstall-linux.sh" | awk '{print $1}')"
+          jq -n -S \
+            --arg sha256 "$uninstall_sha256" \
+            '{schema:"theyos-phase0-package-files-v1",files:{"uninstall-linux.sh":{sha256:$sha256,classification:"published-installer-script-no-owner-authority"}}}' \
+            > "$STAGE/phase0-package-files.json"
           tar czf "$TARBALL" -C "$STAGE" .
           sha256sum "$TARBALL" > "${TARBALL}.sha256"
           RELEASE_PROVENANCE="$OUTDIR/theyos-engine-${CARGO_VERSION}-linux-x86_64.provenance.json"
@@ -112,9 +116,15 @@ jobs:
             --arg engine_sha256 "$(sha256sum "$STAGE/theyos-engine" | awk '{print $1}')" \
             --arg published_executables_sha256 "$(jq -S '.published_executables' "$phase0_attestation" | sha256sum | awk '{print $1}')" \
             --arg phase0_attestation_sha256 "$(sha256sum "$phase0_attestation" | awk '{print $1}')" \
+            --arg package_files_sha256 "$(sha256sum "$STAGE/phase0-package-files.json" | awk '{print $1}')" \
             --arg package_sha256 "$(sha256sum "$TARBALL" | awk '{print $1}')" \
-            '{schema:$schema,source_sha:$source_sha,target:$target,phase0_engine_sha256:$engine_sha256,published_executables_sha256:$published_executables_sha256,phase0_attestation_sha256:$phase0_attestation_sha256,published_package_sha256:$package_sha256}' \
+            '{schema:$schema,source_sha:$source_sha,target:$target,phase0_engine_sha256:$engine_sha256,published_executables_sha256:$published_executables_sha256,phase0_attestation_sha256:$phase0_attestation_sha256,package_files_sha256:$package_files_sha256,published_package_sha256:$package_sha256}' \
             > "$RELEASE_PROVENANCE"
+          SUBJECT_DIR="$RUNNER_TEMP/linux-phase0-subject-x86_64"
+          rm -rf "$SUBJECT_DIR"
+          mkdir -p "$SUBJECT_DIR"
+          cp "$TARBALL" "$TARBALL.sha256" "$RELEASE_PROVENANCE" "$phase0_attestation" "$SUBJECT_DIR/"
+          echo "subject_dir=$SUBJECT_DIR" >> "$GITHUB_ENV"
           echo "tarball=$TARBALL" >> "$GITHUB_ENV"
           echo "release_provenance=$RELEASE_PROVENANCE" >> "$GITHUB_ENV"
           echo "version=$CARGO_VERSION" >> "$GITHUB_ENV"
@@ -137,35 +147,19 @@ jobs:
             alpine:3.20@sha256:d9e853e87e55526f6b2917df91a2115c36dd7c696a35be12163d44e6e2a4b6bc \
             --version
           docker run --rm \
-            -v "$(pwd)/target/x86_64-unknown-linux-musl/release/soyeht:/soyeht" \
+            -v "$RUNNER_TEMP/phase0-target-x86_64/x86_64-unknown-linux-musl/release/soyeht:/soyeht:ro" \
             --entrypoint /soyeht \
             alpine:3.20@sha256:d9e853e87e55526f6b2917df91a2115c36dd7c696a35be12163d44e6e2a4b6bc \
             uninstall --help
           echo "Smoke test passed: x86_64 binary --version exit 0"
 
-      - name: Attest the published Linux package
-        uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a # v3
+      - name: Upload unsigned Linux subject
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          subject-path: admin/rust/${{ env.tarball }}
-
-      - name: Upload to GitHub Release
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          for i in $(seq 1 90); do
-            if gh release view "$TAG" >/dev/null 2>&1; then
-              break
-            fi
-            echo "Waiting for GitHub Release $TAG to be created by release-macos.yml ($i/90)..."
-            sleep 10
-          done
-          gh release view "$TAG" >/dev/null
-          gh release upload "$TAG" \
-            "admin/rust/${{ env.tarball }}#theyos-engine-${{ env.version }}-linux-x86_64.tar.gz" \
-            "admin/rust/${{ env.tarball }}.sha256#theyos-engine-${{ env.version }}-linux-x86_64.tar.gz.sha256" \
-            "admin/rust/${{ env.release_provenance }}#theyos-engine-${{ env.version }}-linux-x86_64.provenance.json" \
-            "${{ env.phase0_attestation }}#theyos-engine-${{ env.version }}-linux-x86_64.phase0.json" \
-            --clobber
+          name: linux-phase0-x86_64
+          path: ${{ env.subject_dir }}
+          if-no-files-found: error
+          retention-days: 30
 
   build-linux-aarch64:
     name: Build Linux (aarch64)
@@ -206,12 +200,12 @@ jobs:
             mobile_claw_vpn_phase0_ \
             -- --test-threads=1
           PHASE0_ATTESTATION="$RUNNER_TEMP/phase0-attestation-aarch64-unknown-linux-musl.json"
-          PHASE0_ENGINE="$GITHUB_WORKSPACE/admin/rust/dist/.linux-stage-aarch64/theyos-engine"
+          PHASE0_ENGINE="$RUNNER_TEMP/phase0-engine-aarch64/theyos-engine"
           mkdir -p "$(dirname "$PHASE0_ENGINE")"
           PHASE0_TARGET=aarch64-unknown-linux-musl \
           PHASE0_BUILD_TOOL=cross \
-          PHASE0_CARGO_TARGET_DIR="$GITHUB_WORKSPACE/admin/rust/target" \
-          PHASE0_CARGO_HOME="$RUNNER_TEMP/phase0-cargo-home-aarch64" \
+          PHASE0_CARGO_TARGET_DIR="$RUNNER_TEMP/phase0-target-aarch64" \
+          PHASE0_CARGO_HOME="$RUNNER_TEMP/phase0-cargo-home-aarch64/home" \
           PHASE0_RUN_ARTIFACT_DIRECT=0 \
           PHASE0_ATTESTATION_OUT="$PHASE0_ATTESTATION" \
           PHASE0_STAGED_ENGINE_OUT="$PHASE0_ENGINE" \
@@ -223,14 +217,15 @@ jobs:
         working-directory: admin/rust
         run: |
           set -e
-          CARGO_VERSION=$(grep '^version' soyeht-rs/Cargo.toml | sed 's/version = "\(.*\)"/\1/')
-          OUTDIR="dist/linux-aarch64"
-          STAGE="dist/.linux-stage-aarch64"
+          CARGO_VERSION=$(git show "$GITHUB_SHA:admin/rust/soyeht-rs/Cargo.toml" | sed -n 's/^version = "\(.*\)"/\1/p' | head -1)
+          OUTDIR="$RUNNER_TEMP/linux-package-aarch64"
+          STAGE="$OUTDIR/stage"
           mkdir -p "$OUTDIR"
           mkdir -p "$STAGE"
-          BINARY_DIR="target/aarch64-unknown-linux-musl/release"
+          BINARY_DIR="$RUNNER_TEMP/phase0-target-aarch64/aarch64-unknown-linux-musl/release"
           BINARY="$BINARY_DIR/server"
           TARBALL="$OUTDIR/theyos-engine-${CARGO_VERSION}-linux-aarch64.tar.gz"
+          cp "$phase0_engine" "$STAGE/theyos-engine"
           test -x "$STAGE/theyos-engine"
           test "$(sha256sum "$STAGE/theyos-engine" | awk '{print $1}')" = \
             "$(jq -r '.theyos_engine_sha256' "$phase0_attestation")"
@@ -240,7 +235,7 @@ jobs:
           cp "$BINARY_DIR/store-ipc" "$STAGE/store-ipc"
           cp "$BINARY_DIR/terminal-ipc" "$STAGE/terminal-ipc"
           cp "$BINARY_DIR/imagebuilder" "$STAGE/imagebuilder"
-          cp "../../scripts/uninstall-linux.sh" "$STAGE/uninstall-linux.sh"
+          git show "$GITHUB_SHA:scripts/uninstall-linux.sh" > "$STAGE/uninstall-linux.sh"
           chmod +x "$STAGE/soyeht" "$STAGE/uninstall-linux.sh"
           printf '%s\n' "$CARGO_VERSION" > "$STAGE/engine-version.txt"
           for executable in theyos-engine soyeht vmrunner_ipc fc-ssh store-ipc terminal-ipc imagebuilder; do
@@ -248,6 +243,11 @@ jobs:
             expected="$(jq -r --arg executable "$executable" '.published_executables[$executable].sha256' "$phase0_attestation")"
             test "$actual" = "$expected"
           done
+          uninstall_sha256="$(sha256sum "$STAGE/uninstall-linux.sh" | awk '{print $1}')"
+          jq -n -S \
+            --arg sha256 "$uninstall_sha256" \
+            '{schema:"theyos-phase0-package-files-v1",files:{"uninstall-linux.sh":{sha256:$sha256,classification:"published-installer-script-no-owner-authority"}}}' \
+            > "$STAGE/phase0-package-files.json"
           tar czf "$TARBALL" -C "$STAGE" .
           sha256sum "$TARBALL" > "${TARBALL}.sha256"
           RELEASE_PROVENANCE="$OUTDIR/theyos-engine-${CARGO_VERSION}-linux-aarch64.provenance.json"
@@ -258,9 +258,15 @@ jobs:
             --arg engine_sha256 "$(sha256sum "$STAGE/theyos-engine" | awk '{print $1}')" \
             --arg published_executables_sha256 "$(jq -S '.published_executables' "$phase0_attestation" | sha256sum | awk '{print $1}')" \
             --arg phase0_attestation_sha256 "$(sha256sum "$phase0_attestation" | awk '{print $1}')" \
+            --arg package_files_sha256 "$(sha256sum "$STAGE/phase0-package-files.json" | awk '{print $1}')" \
             --arg package_sha256 "$(sha256sum "$TARBALL" | awk '{print $1}')" \
-            '{schema:$schema,source_sha:$source_sha,target:$target,phase0_engine_sha256:$engine_sha256,published_executables_sha256:$published_executables_sha256,phase0_attestation_sha256:$phase0_attestation_sha256,published_package_sha256:$package_sha256}' \
+            '{schema:$schema,source_sha:$source_sha,target:$target,phase0_engine_sha256:$engine_sha256,published_executables_sha256:$published_executables_sha256,phase0_attestation_sha256:$phase0_attestation_sha256,package_files_sha256:$package_files_sha256,published_package_sha256:$package_sha256}' \
             > "$RELEASE_PROVENANCE"
+          SUBJECT_DIR="$RUNNER_TEMP/linux-phase0-subject-aarch64"
+          rm -rf "$SUBJECT_DIR"
+          mkdir -p "$SUBJECT_DIR"
+          cp "$TARBALL" "$TARBALL.sha256" "$RELEASE_PROVENANCE" "$phase0_attestation" "$SUBJECT_DIR/"
+          echo "subject_dir=$SUBJECT_DIR" >> "$GITHUB_ENV"
           echo "tarball=$TARBALL" >> "$GITHUB_ENV"
           echo "release_provenance=$RELEASE_PROVENANCE" >> "$GITHUB_ENV"
           echo "version=$CARGO_VERSION" >> "$GITHUB_ENV"
@@ -288,32 +294,74 @@ jobs:
             alpine:3.20@sha256:d9e853e87e55526f6b2917df91a2115c36dd7c696a35be12163d44e6e2a4b6bc \
             --version
           docker run --rm --platform linux/arm64 \
-            -v "$(pwd)/target/aarch64-unknown-linux-musl/release/soyeht:/soyeht" \
+            -v "$RUNNER_TEMP/phase0-target-aarch64/aarch64-unknown-linux-musl/release/soyeht:/soyeht:ro" \
             --entrypoint /soyeht \
             alpine:3.20@sha256:d9e853e87e55526f6b2917df91a2115c36dd7c696a35be12163d44e6e2a4b6bc \
             uninstall --help
           echo "Smoke test passed: aarch64 binary --version exit 0"
 
-      - name: Attest the published Linux package
+      - name: Upload unsigned Linux subject
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: linux-phase0-aarch64
+          path: ${{ env.subject_dir }}
+          if-no-files-found: error
+          retention-days: 30
+
+  publish-linux:
+    name: Attest and publish Linux subjects (${{ matrix.target }})
+    if: github.event_name == 'push'
+    needs:
+      - build-linux-x86_64
+      - build-linux-aarch64
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64
+            artifact: linux-phase0-x86_64
+          - target: aarch64
+            artifact: linux-phase0-aarch64
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+      - name: Download immutable Linux subject
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: subject
+
+      - name: Verify subject before publication
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          tarball="$(find subject -maxdepth 1 -name '*.tar.gz' -type f -print -quit)"
+          provenance="$(find subject -maxdepth 1 -name '*.provenance.json' -type f -print -quit)"
+          phase0="$(find subject -maxdepth 1 -name 'phase0-attestation-*.json' -type f -print -quit)"
+          test -n "$tarball" -a -n "$provenance" -a -n "$phase0"
+          test "$(jq -r '.source_sha' "$provenance")" = "$GITHUB_SHA"
+          test "$(jq -r '.published_package_sha256' "$provenance")" = "$(sha256sum "$tarball" | awk '{print $1}')"
+          test "$(jq -r '.source_sha' "$phase0")" = "$GITHUB_SHA"
+
+      - name: Attest final Linux package
         uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a # v3
         with:
-          subject-path: admin/rust/${{ env.tarball }}
+          subject-path: subject/*.tar.gz
 
-      - name: Upload to GitHub Release
+      - name: Upload final Linux package
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
         run: |
+          set -euo pipefail
           for i in $(seq 1 90); do
-            if gh release view "$TAG" >/dev/null 2>&1; then
-              break
-            fi
-            echo "Waiting for GitHub Release $TAG to be created by release-macos.yml ($i/90)..."
+            if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then break; fi
             sleep 10
           done
-          gh release view "$TAG" >/dev/null
-          gh release upload "$TAG" \
-            "admin/rust/${{ env.tarball }}#theyos-engine-${{ env.version }}-linux-aarch64.tar.gz" \
-            "admin/rust/${{ env.tarball }}.sha256#theyos-engine-${{ env.version }}-linux-aarch64.tar.gz.sha256" \
-            "admin/rust/${{ env.release_provenance }}#theyos-engine-${{ env.version }}-linux-aarch64.provenance.json" \
-            "${{ env.phase0_attestation }}#theyos-engine-${{ env.version }}-linux-aarch64.phase0.json" \
-            --clobber
+          gh release view "$GITHUB_REF_NAME" >/dev/null
+          gh release upload "$GITHUB_REF_NAME" subject/* --clobber

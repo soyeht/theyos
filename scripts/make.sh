@@ -379,22 +379,46 @@ package_soyeht_mac() {
 
     local helpers_dir="${REPO_ROOT}/dist/macos-arm64/Soyeht.app/Contents/Helpers"
     local target_dir="${REPO_ROOT}/admin/rust/target/aarch64-apple-darwin/release"
-    local entitlements="${SCRIPT_DIR}/entitlements/vmrunner-macos.entitlements"
+    local unsigned_stage="${PHASE0_UNSIGNED_STAGE_DIR:-}"
+    local package_manifest=""
+    if [ -n "${THEYOS_RELEASE:-}" ]; then
+        if [ -z "${unsigned_stage}" ] || [ -z "${PHASE0_EXPECTED_UNSIGNED_PACKAGE_MANIFEST_SHA256:-}" ]; then
+            error "THEYOS_RELEASE requires PHASE0_UNSIGNED_STAGE_DIR and PHASE0_EXPECTED_UNSIGNED_PACKAGE_MANIFEST_SHA256"
+        fi
+        package_manifest="${unsigned_stage}/phase0-package-manifest.json"
+        if [ ! -f "${package_manifest}" ]; then
+            error "Phase 0 unsigned package manifest is missing: ${package_manifest}"
+        fi
+        local package_manifest_sha256
+        package_manifest_sha256=$(shasum -a 256 "${package_manifest}" | awk '{print $1}')
+        if [ "${package_manifest_sha256}" != "${PHASE0_EXPECTED_UNSIGNED_PACKAGE_MANIFEST_SHA256}" ]; then
+            error "unsigned macOS package manifest differs from the Phase 0 verified subject"
+        fi
+    fi
+    local source_dir="${target_dir}"
+    if [ -n "${unsigned_stage}" ]; then
+        source_dir="${unsigned_stage}"
+    fi
+    local entitlements="${source_dir}/vmrunner-macos.entitlements"
     mkdir -p "${helpers_dir}"
 
-    info "Building app engine helpers for macOS arm64 (engine version: ${version})..."
-    run_engine_build_tool build aarch64-apple-darwin cargo >/dev/null
-    (cd "${REPO_ROOT}/admin/rust" && cargo build --release \
-        --target aarch64-apple-darwin \
-        -p soyeht-rs \
-        -p store-rs \
-        -p terminal-rs \
-        -p vmrunner-macos-rs)
+    if [ -n "${unsigned_stage}" ]; then
+        info "Using the prebuilt Phase 0 unsigned macOS subject (no Cargo/build scripts in release packaging)"
+    else
+        info "Building app engine helpers for macOS arm64 (engine version: ${version})..."
+        run_engine_build_tool build aarch64-apple-darwin cargo >/dev/null
+        (cd "${REPO_ROOT}/admin/rust" && cargo build --release \
+            --target aarch64-apple-darwin \
+            -p soyeht-rs \
+            -p store-rs \
+            -p terminal-rs \
+            -p vmrunner-macos-rs)
+    fi
 
     copy_helper() {
         local source_name="$1"
         local dest_name="$2"
-        local source_path="${target_dir}/${source_name}"
+        local source_path="${source_dir}/${source_name}"
         if [ ! -f "${source_path}" ]; then
             error "required helper binary not found at: ${source_path}"
         fi
@@ -403,7 +427,11 @@ package_soyeht_mac() {
     }
 
     # Canonical alias: server-rs/server is the shipped theyos-engine.
-    run_engine_build_tool stage "${target_dir}" "${helpers_dir}/theyos-engine"
+    if [ -n "${unsigned_stage}" ]; then
+        copy_helper "theyos-engine" "theyos-engine"
+    else
+        run_engine_build_tool stage "${target_dir}" "${helpers_dir}/theyos-engine"
+    fi
     if [ -n "${PHASE0_EXPECTED_UNSIGNED_ENGINE_SHA256:-}" ]; then
         local staged_engine_sha256
         staged_engine_sha256=$(shasum -a 256 "${helpers_dir}/theyos-engine" | awk '{print $1}')
@@ -423,12 +451,22 @@ package_soyeht_mac() {
     # tarball without it. Soyeht.app rejects bundles missing this binary.
     copy_helper "theyos-provision-inject" "theyos-provision-inject"
 
+    if [ -n "${unsigned_stage}" ]; then
+        while IFS=$'\t' read -r helper expected; do
+            actual=$(shasum -a 256 "${helpers_dir}/${helper}" | awk '{print $1}')
+            if [ "${actual}" != "${expected}" ]; then
+                error "unsigned helper differs from the Phase 0 package manifest: ${helper}"
+            fi
+        done < <(jq -r '.executables | to_entries[] | [.key,.value.unsigned_sha256] | @tsv' "${package_manifest}")
+    fi
+
     printf '%s' "${version}" > "${helpers_dir}/engine-version.txt"
     info "  + engine-version.txt (${version})"
 
     if [ ! -f "${entitlements}" ]; then
         error "Entitlements file not found: ${entitlements}"
     fi
+    cp "${entitlements}" "${helpers_dir}/vmrunner-macos.entitlements"
 
     sign_helper() {
         local bin="$1"

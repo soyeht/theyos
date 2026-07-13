@@ -11,14 +11,15 @@ trap 'chmod -R u+w "${TMP_ROOT}" 2>/dev/null || true; rm -rf "${TMP_ROOT}"' EXIT
 
 HOST_TARGET="$(rustc -vV | sed -n 's/^host: //p')"
 SHARED_TARGET="${TMP_ROOT}/target"
-CHECKER_CARGO_HOME="${TMP_ROOT}/cargo-home"
+CHECKER_CARGO_HOME="${TMP_ROOT}/cargo-home/home"
 mkdir -p "${CHECKER_CARGO_HOME}"
 if [[ "${HOST_TARGET}" == *-apple-darwin ]]; then
   PHASE0_EXPECTED_XCODE_VERSION="${PHASE0_EXPECTED_XCODE_VERSION:-$(xcodebuild -version | sed -n 's/^Xcode //p')}"
   PHASE0_EXPECTED_XCODE_BUILD="${PHASE0_EXPECTED_XCODE_BUILD:-$(xcodebuild -version | sed -n 's/^Build version //p')}"
   PHASE0_EXPECTED_MACOS_SDK_VERSION="${PHASE0_EXPECTED_MACOS_SDK_VERSION:-$(xcrun --sdk macosx --show-sdk-version)}"
+  PHASE0_EXPECTED_DEVELOPER_DIR="${PHASE0_EXPECTED_DEVELOPER_DIR:-$(xcode-select -p)}"
   export PHASE0_EXPECTED_XCODE_VERSION PHASE0_EXPECTED_XCODE_BUILD \
-    PHASE0_EXPECTED_MACOS_SDK_VERSION
+    PHASE0_EXPECTED_MACOS_SDK_VERSION PHASE0_EXPECTED_DEVELOPER_DIR
 fi
 
 clone_head() {

@@ -28,6 +28,8 @@ jobs:
 
       - name: Setup pinned Rust toolchain
         uses: dtolnay/rust-toolchain@5a814b2e0f75e492da42a3c1227d52112e4dac50 # 1.92.0
+        with:
+          components: clippy
 
       - name: Exercise structural mutations
         shell: bash
@@ -68,21 +70,29 @@ jobs:
       - name: Setup pinned Rust toolchain
         uses: dtolnay/rust-toolchain@5a814b2e0f75e492da42a3c1227d52112e4dac50 # 1.92.0
         with:
+          components: clippy
           targets: ${{ matrix.target }}
+
+      - name: Enable aarch64 emulation
+        if: matrix.target == 'aarch64-unknown-linux-musl'
+        uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3
+        with:
+          platforms: arm64
 
       - name: Build, inspect, stage, and attest
         shell: bash
         env:
           PHASE0_TARGET: ${{ matrix.target }}
           PHASE0_BUILD_TOOL: ${{ matrix.tool }}
-          PHASE0_CARGO_TARGET_DIR: ${{ github.workspace }}/admin/rust/target
-          PHASE0_CARGO_HOME: ${{ runner.temp }}/phase0-cargo-home-${{ matrix.target }}
+          PHASE0_CARGO_TARGET_DIR: ${{ runner.temp }}/phase0-target-${{ matrix.target }}
+          PHASE0_CARGO_HOME: ${{ runner.temp }}/phase0-cargo-home-${{ matrix.target }}/home
           PHASE0_RUN_ARTIFACT_DIRECT: ${{ matrix.direct }}
           PHASE0_ATTESTATION_OUT: ${{ runner.temp }}/phase0-attestation-${{ matrix.target }}.json
           PHASE0_STAGED_ENGINE_OUT: ${{ runner.temp }}/theyos-engine-${{ matrix.target }}
           PHASE0_EXPECTED_XCODE_VERSION: "26.5"
           PHASE0_EXPECTED_XCODE_BUILD: "17F42"
           PHASE0_EXPECTED_MACOS_SDK_VERSION: "26.5"
+          PHASE0_EXPECTED_DEVELOPER_DIR: "/Applications/Xcode.app/Contents/Developer"
         run: |
           bash .github/scripts/check-mobile-claw-vpn-owner-present-phase0-compileout.sh
           jq -e --arg target "${PHASE0_TARGET}" '
@@ -94,18 +104,16 @@ jobs:
             and .cargo_source_policy == "local-admin-rust-or-canonical-crates-io-v1"
             and .cargo_fetch_network == true
             and .post_fetch_build_offline == true
+            and (.rustc_toolchain_sha256 | test("^[0-9a-f]{64}$"))
+            and (.cargo_toolchain_sha256 | test("^[0-9a-f]{64}$"))
             and (if $target == "aarch64-apple-darwin"
                  then .expected_xcode_version == "26.5"
                    and .expected_xcode_build == "17F42"
                    and .expected_macos_sdk_version == "26.5"
+                   and .developer_dir == "/Applications/Xcode.app/Contents/Developer"
+                   and .macos_sdk_path == "/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX26.5.sdk"
                  else true end)
           ' "${PHASE0_ATTESTATION_OUT}"
-
-      - name: Enable aarch64 emulation
-        if: matrix.target == 'aarch64-unknown-linux-musl'
-        uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3
-        with:
-          platforms: arm64
 
       - name: Execute the aarch64 published artifact contract
         if: matrix.target == 'aarch64-unknown-linux-musl'

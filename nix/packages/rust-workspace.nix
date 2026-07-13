@@ -111,6 +111,15 @@ in
           echo "Phase 0 marker found in $executable" >&2
           exit 1
         fi
+        name="$(basename "$executable")"
+        depfile="target/release/$name.d"
+        test -f "$depfile"
+        if [ "$name" != server ] && [ "$name" != theyos-llm-proxy ]; then
+          if grep -Eiq 'server-rs/src|llm-proxy-rs/src|mobile_claw_vpn|product_a_phase0' "$depfile"; then
+            echo "Phase 0 helper depfile reaches an authority source: $name" >&2
+            exit 1
+          fi
+        fi
       done
       server_contract="$($out/bin/server --owner-present-phase0-contract)"
       proxy_contract="$($out/bin/theyos-llm-proxy --owner-present-phase0-contract)"
@@ -139,14 +148,16 @@ in
         case "$name" in
           server) classification="phase0-contract-server" ;;
           theyos-llm-proxy) classification="phase0-contract-http-boundary" ;;
-          *) classification="phase0-helper-marker-and-closure-scan" ;;
+          *) classification="phase0-helper-depfile-and-marker-closure-v1" ;;
         esac
         sha256="$(sha256sum "$executable" | cut -d' ' -f1)"
+        depfile_sha256="$(sha256sum "target/release/$name.d" | cut -d' ' -f1)"
         executables_json="$(jq -c \
           --arg name "$name" \
           --arg sha256 "$sha256" \
+          --arg depfile_sha256 "$depfile_sha256" \
           --arg classification "$classification" \
-          '. + {($name): {sha256:$sha256,classification:$classification}}' \
+          '. + {($name): {sha256:$sha256,depfile_sha256:$depfile_sha256,classification:$classification}}' \
           <<< "$executables_json")"
       done
       jq -n -S \

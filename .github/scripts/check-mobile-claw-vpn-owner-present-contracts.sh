@@ -61,15 +61,28 @@ validate_boundary_descriptor() {
   : > "${roots}"
   while IFS=$'\t' read -r mode type oid path; do
     [[ -z "${mode}" || "${mode}" == \#* ]] && continue
-    if [[ "${mode}" != "040000" || "${type}" != "tree" \
+    case "${path}" in
+      admin/rust|claws|nix|scripts)
+        expected_mode="040000"
+        expected_type="tree"
+        ;;
+      flake.lock|flake.nix)
+        expected_mode="100644"
+        expected_type="blob"
+        ;;
+      *)
+        return 1
+        ;;
+    esac
+    if [[ "${mode}" != "${expected_mode}" || "${type}" != "${expected_type}" \
       || ! "${oid}" =~ ^[0-9a-f]{40}$ ]]; then
       return 1
     fi
     printf '%s\n' "${path}" >> "${roots}"
     count=$((count + 1))
   done < "${manifest}"
-  [[ "${count}" -eq 4 ]] \
-    && [[ "$(sort -u "${roots}" | tr '\n' ',')" == ".github,admin/rust,claws,scripts," ]]
+  [[ "${count}" -eq 6 ]] \
+    && [[ "$(sort -u "${roots}" | tr '\n' ',')" == "admin/rust,claws,flake.lock,flake.nix,nix,scripts," ]]
 }
 
 HEAD_CONTRACT="${TMP_DIR}/head-contract"
@@ -118,7 +131,7 @@ if [[ "$(jq -r '.contract' "${HEAD_STATUS}")" != \
   || "$(jq -r '.phase0_artifact_boundary.theyos_path' "${HEAD_STATUS}")" != \
     "${BOUNDARY_REL}" \
   || "$(jq -r '.phase0_artifact_boundary.format' "${HEAD_STATUS}")" != \
-    "closed-git-subtrees-v1" \
+    "closed-git-inputs-v2" \
   || "$(jq -r '.phase0_artifact_boundary.policy_change_control' "${HEAD_STATUS}")" != \
     "explicit-owner-approved-versioned-transition" \
   || "$(jq -r '.phase0_artifact_boundary.object_identity_update' "${HEAD_STATUS}")" != \
@@ -127,10 +140,10 @@ if [[ "$(jq -r '.contract' "${HEAD_STATUS}")" != \
     "commit-bound-evidence-not-independent-approval" \
   || "$(jq -r '.phase0_artifact_boundary.release_provenance' "${HEAD_STATUS}")" != \
     "checker-on-release-subject-and-final-package-attestation" \
-  || "$(jq -r '.phase0_artifact_boundary.staged_product' "${HEAD_STATUS}")" != \
-    "theyos-engine" \
+  || "$(jq -r '.phase0_artifact_boundary.staged_products | sort | join(",")' "${HEAD_STATUS}")" != \
+    "nix-theyos-runtime,theyos-engine,theyos-llm-proxy" \
   || "$(jq -r '.phase0_artifact_boundary.required_published_targets | sort | join(",")' "${HEAD_STATUS}")" != \
-    "aarch64-apple-darwin,aarch64-unknown-linux-musl,x86_64-unknown-linux-musl" \
+    "aarch64-apple-darwin,aarch64-unknown-linux-musl,nix-theyos-runtime-x86_64-linux,x86_64-unknown-linux-musl" \
   || "$(jq -r '.phase1_blocker.minimum_wire_version' "${HEAD_STATUS}")" != "2" \
   || "$(jq -r '.phase1_blocker.required_shape' "${HEAD_STATUS}")" != \
     "server-held-finish-consume-mint" \

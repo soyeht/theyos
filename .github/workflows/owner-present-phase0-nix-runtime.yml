@@ -31,7 +31,10 @@ jobs:
           set -euo pipefail
           test -f flake.lock
           test -f nix/packages/rust-workspace.nix
-          OUT_PATH="$(nix build .#theyos-runtime --no-link --print-out-paths)"
+          export NIX_CONFIG=$'experimental-features = nix-command flakes\n'
+          nix flake archive --json --no-write-lock-file . > phase0-nix-input-closure.json
+          export NIX_CONFIG=$'experimental-features = nix-command flakes\nsubstituters =\ntrusted-public-keys =\n'
+          OUT_PATH="$(nix build --offline --no-link --no-write-lock-file .#theyos-runtime --print-out-paths)"
           test -x "$OUT_PATH/bin/server"
           test -x "$OUT_PATH/bin/theyos-llm-proxy"
           test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
@@ -75,17 +78,19 @@ jobs:
             ' >/dev/null
           nix path-info --recursive --json "$OUT_PATH" > phase0-nix-store-closure.json
           CLOSURE_SHA256="$(sha256sum phase0-nix-store-closure.json | awk '{print $1}')"
+          INPUT_CLOSURE_SHA256="$(sha256sum phase0-nix-input-closure.json | awk '{print $1}')"
           jq -S \
             --arg source_sha "$GITHUB_SHA" \
             --arg source_tree "$SOURCE_TREE" \
             --arg closure_sha256 "$CLOSURE_SHA256" \
-            '. + {source_sha:$source_sha,source_tree:$source_tree,nix_store_closure_manifest_sha256:$closure_sha256}' \
+            --arg input_closure_sha256 "$INPUT_CLOSURE_SHA256" \
+            '. + {source_sha:$source_sha,source_tree:$source_tree,nix_store_closure_manifest_sha256:$closure_sha256,nix_input_closure_manifest_sha256:$input_closure_sha256,nix_build_offline:true,nix_substituters_closed:true}' \
             "$OUT_PATH/phase0-runtime-manifest.json" > phase0-runtime-manifest.json
           STAGE="$RUNNER_TEMP/phase0-nix-runtime"
           rm -rf "$STAGE"
           mkdir -p "$STAGE"
           cp -a "$OUT_PATH" "$STAGE/runtime"
-          cp phase0-runtime-manifest.json phase0-nix-store-closure.json "$STAGE/"
+          cp phase0-runtime-manifest.json phase0-nix-input-closure.json phase0-nix-store-closure.json "$STAGE/"
           tar -C "$STAGE" -czf phase0-nix-runtime.tar.gz .
 
       - name: Upload Nix runtime subject
@@ -95,6 +100,7 @@ jobs:
           path: |
             phase0-nix-runtime.tar.gz
             phase0-runtime-manifest.json
+            phase0-nix-input-closure.json
             phase0-nix-store-closure.json
           if-no-files-found: error
 

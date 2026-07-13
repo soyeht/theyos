@@ -81,6 +81,8 @@ const CANONICAL_CHILD_ENV: [&str; 10] = [
     "CARGO_NET_OFFLINE",
 ];
 
+const OPTIONAL_CHILD_ENV: [&str; 2] = ["DEVELOPER_DIR", "PHASE0_BUILD_SOURCE_ROOT"];
+
 const X86_64_MUSL_IMAGE: &str = "ghcr.io/cross-rs/x86_64-unknown-linux-musl:0.2.5@sha256:77db671d8356a64ae72a3e1415e63f547f26d374fbe3c4762c1cd36c7eac7b99";
 const AARCH64_MUSL_IMAGE: &str = "ghcr.io/cross-rs/aarch64-unknown-linux-musl:0.2.5@sha256:702154f52b2d8091671aa2c84d5582d849f949977228c735ff8462f93cc0e1e4";
 
@@ -134,15 +136,24 @@ fn usage() -> String {
 }
 
 fn workspace_paths() -> Result<(PathBuf, PathBuf), String> {
-    let rust_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .ok_or("build tool manifest has no workspace parent")?
-        .to_path_buf();
-    let repo_root = rust_root
-        .parent()
-        .and_then(Path::parent)
-        .ok_or("Rust workspace has no repository parent")?
-        .to_path_buf();
+    let repo_root = env::var_os("PHASE0_BUILD_SOURCE_ROOT").map_or_else(
+        || {
+            let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+            manifest_dir
+                .parent()
+                .and_then(Path::parent)
+                .and_then(Path::parent)
+                .map_or_else(
+                    || PathBuf::from(env!("CARGO_MANIFEST_DIR")),
+                    Path::to_path_buf,
+                )
+        },
+        PathBuf::from,
+    );
+    let rust_root = repo_root.join("admin/rust");
+    if !repo_root.is_absolute() || !rust_root.is_dir() {
+        return Err("Phase 0 build source root must contain admin/rust".to_owned());
+    }
     Ok((repo_root, rust_root))
 }
 
@@ -230,7 +241,7 @@ fn build_engine(target: &str, build_tool: &str) -> Result<(), String> {
     }
     let mut build = Command::new(build_tool);
     apply_canonical_environment(&mut build, &canonical_env);
-    let target_root = target_root_for(&rust_root)?;
+    let target_root = target_root_for(&rust_root);
     fs::create_dir_all(target_root.join("phase0-generated"))
         .map_err(|error| format!("failed to create Phase 0 generated output directory: {error}"))?;
     build
@@ -256,7 +267,7 @@ fn build_engine(target: &str, build_tool: &str) -> Result<(), String> {
         run_container_build(
             target,
             &repo_root,
-            &target_root_for(&rust_root)?,
+            &target_root_for(&rust_root),
             &canonical_env,
             &source_sha,
             &build_args,
@@ -323,8 +334,8 @@ fn build_engine(target: &str, build_tool: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn target_root_for(rust_root: &Path) -> Result<PathBuf, String> {
-    Ok(env::var_os("CARGO_TARGET_DIR").map_or_else(
+fn target_root_for(rust_root: &Path) -> PathBuf {
+    env::var_os("CARGO_TARGET_DIR").map_or_else(
         || rust_root.join("target"),
         |value| {
             let path = PathBuf::from(value);
@@ -334,11 +345,14 @@ fn target_root_for(rust_root: &Path) -> Result<PathBuf, String> {
                 rust_root.join(path)
             }
         },
-    ))
+    )
 }
 
 fn is_unsafe_build_env(name: &str) -> bool {
-    if matches!(name, "CARGO_TARGET_DIR" | "PKG_CONFIG_PATH") {
+    if matches!(
+        name,
+        "CARGO_TARGET_DIR" | "PKG_CONFIG_PATH" | "DEVELOPER_DIR"
+    ) {
         return false;
     }
     UNSAFE_BUILD_ENV.contains(&name)
@@ -361,6 +375,17 @@ fn canonical_child_environment() -> Result<Vec<(OsString, OsString)>, String> {
             .filter(|value| !value.is_empty())
             .ok_or_else(|| format!("canonical build environment is missing {name}"))?;
         values.push((OsString::from(name), value));
+    }
+
+    for name in OPTIONAL_CHILD_ENV {
+        if let Some(value) = env::var_os(name).filter(|value| !value.is_empty()) {
+            if !Path::new(&value).is_absolute() {
+                return Err(format!(
+                    "canonical build environment requires absolute {name}"
+                ));
+            }
+            values.push((OsString::from(name), value));
+        }
     }
 
     for name in [
@@ -476,11 +501,10 @@ fn run_container_build(
     let toolchain_root = toolchain_bin
         .parent()
         .ok_or("canonical Rust toolchain has no root directory")?;
-    let platform = if target.starts_with("aarch64-") {
-        Some("linux/arm64")
-    } else {
-        None
-    };
+    // The pinned cross images and the host Rust toolchain are amd64. The
+    // target linker inside each image produces musl/aarch64 output; the
+    // container itself must not require an x86 toolchain under arm emulation.
+    let platform = Some("linux/amd64");
 
     let mut command = Command::new(docker);
     command.args([
@@ -507,7 +531,7 @@ fn run_container_build(
             "--mount",
             &format!("type=bind,src={},dst=/target", target_root.display()),
             "--mount",
-            &format!("type=bind,src={},dst=/phase0-cargo,readonly", cargo_home),
+            &format!("type=bind,src={cargo_home},dst=/phase0-cargo,readonly"),
             "--mount",
             &format!(
                 "type=bind,src={},dst=/phase0-toolchain,readonly",

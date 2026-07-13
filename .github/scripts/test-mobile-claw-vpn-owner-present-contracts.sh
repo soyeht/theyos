@@ -72,9 +72,11 @@ JSON
   contract_sha="$(sha256_file "${repo}/${CONTRACT_REL}")"
   cat > "${repo}/${BOUNDARY_REL}" <<'TSV'
 # synthetic-phase0-boundary
-040000	tree	1111111111111111111111111111111111111111	.github
 040000	tree	2222222222222222222222222222222222222222	admin/rust
 040000	tree	3333333333333333333333333333333333333333	claws
+100644	blob	5555555555555555555555555555555555555555	flake.lock
+100644	blob	6666666666666666666666666666666666666666	flake.nix
+040000	tree	7777777777777777777777777777777777777777	nix
 040000	tree	4444444444444444444444444444444444444444	scripts
 TSV
   cat > "${repo}/${STATUS_REL}" <<JSON
@@ -95,16 +97,21 @@ TSV
   },
   "phase0_artifact_boundary": {
     "theyos_path": "${BOUNDARY_REL}",
-    "format": "closed-git-subtrees-v1",
+    "format": "closed-git-inputs-v2",
     "policy_change_control": "explicit-owner-approved-versioned-transition",
     "object_identity_update": "per-reviewed-commit-revalidation",
     "object_identity_authority": "commit-bound-evidence-not-independent-approval",
     "release_provenance": "checker-on-release-subject-and-final-package-attestation",
-    "staged_product": "theyos-engine",
+    "staged_products": [
+      "nix-theyos-runtime",
+      "theyos-engine",
+      "theyos-llm-proxy"
+    ],
     "required_published_targets": [
       "x86_64-unknown-linux-musl",
       "aarch64-unknown-linux-musl",
-      "aarch64-apple-darwin"
+      "aarch64-apple-darwin",
+      "nix-theyos-runtime-x86_64-linux"
     ]
   },
   "phase1_blocker": {

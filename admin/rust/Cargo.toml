@@ -39,6 +39,7 @@ unsafe_code = "warn"
 [workspace.lints.clippy]
 all      = { level = "warn", priority = -1 }
 pedantic = { level = "warn", priority = -1 }
+disallowed_methods = "deny"
 
 # Pedantic lints that the codebase has historically not enforced and that
 # are noisy on existing public surface. Re-allowed at workspace level.

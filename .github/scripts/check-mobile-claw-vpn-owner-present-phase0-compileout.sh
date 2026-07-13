@@ -22,11 +22,7 @@ BOUNDARY_REL="admin/contracts/mobile-claw-vpn/v1/owner_present_phase0_artifact_b
 HEAD_SHA="$(git -C "${THEYOS_DIR}" rev-parse HEAD)"
 HEAD_TREE="$(git -C "${THEYOS_DIR}" rev-parse "${HEAD_SHA}^{tree}")"
 TMP_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/theyos-owner-present-phase0.XXXXXX")"
-SNAPSHOT_ROOT_OWNED=0
 cleanup() {
-  if [[ "${SNAPSHOT_ROOT_OWNED}" -eq 1 ]]; then
-    sudo -n chown -R "$(id -u):$(id -g)" "${TMP_ROOT}" 2>/dev/null || true
-  fi
   if [[ -n "${CARGO_HOME_DIR:-}" && -e "${CARGO_HOME_DIR}" ]]; then
     chmod -R u+w "${CARGO_HOME_DIR}" 2>/dev/null || true
   fi
@@ -46,22 +42,30 @@ git -C "${THEYOS_DIR}" archive --format=tar "${HEAD_SHA}" \
   | tar -xf - -C "${SNAPSHOT}"
 SNAPSHOT="$(cd "${SNAPSHOT}" && pwd -P)"
 chmod -R a-w "${SNAPSHOT}"
+SNAPSHOT_PARENT="$(dirname "${SNAPSHOT}")"
+
+# The authority build receives only the signed closed-input roots. The full
+# ODB snapshot remains available for policy checks, but it is never mounted as
+# the Cargo workspace, so an include!/build script cannot read an undeclared
+# repository file and influence generated output.
+BUILD_SOURCE_PARENT="${TMP_ROOT}/build-source-parent"
+BUILD_SNAPSHOT="${BUILD_SOURCE_PARENT}/source"
+mkdir -p "${BUILD_SNAPSHOT}"
+git -C "${THEYOS_DIR}" archive --format=tar "${HEAD_SHA}" \
+  admin/rust claws flake.lock flake.nix nix scripts \
+  | tar -xf - -C "${BUILD_SNAPSHOT}"
+BUILD_SNAPSHOT="$(cd "${BUILD_SNAPSHOT}" && pwd -P)"
+chmod -R a-w "${BUILD_SNAPSHOT}"
 
 # The musl authority build gets an OS-enforced read-only bind mount in the
-# pinned OCI image. Native authority builds use a root-owned snapshot so the
-# build user cannot chmod it writable from a build.rs or proc-macro. A plain
-# chmod is deliberately not accepted as the provenance boundary.
+# pinned OCI image. Native macOS authority builds use sandbox-exec to deny
+# writes to the snapshot and Cargo/Rustup homes for every child process. A
+# chmod/root-ownership check alone is deliberately not accepted as provenance.
 if [[ "${BUILD_TOOL}" != "cross" ]]; then
-  if ! command -v sudo >/dev/null 2>&1 \
-    || ! sudo -n chown -R 0:0 "${SNAPSHOT}"; then
-    echo "::error::native Phase 0 authority requires a root-owned immutable source snapshot"
+  if [[ "$(uname -s)" != "Darwin" || ! -x /usr/bin/sandbox-exec ]]; then
+    echo "::error::native Phase 0 authority requires the macOS sandbox-exec write boundary"
     exit 1
   fi
-  if [[ -w "${SNAPSHOT}/admin/rust/Cargo.toml" ]]; then
-    echo "::error::native Phase 0 source snapshot is still writable after ownership hardening"
-    exit 1
-  fi
-  SNAPSHOT_ROOT_OWNED=1
 fi
 TARGET_DIR="${PHASE0_CARGO_TARGET_DIR:-${TMP_ROOT}/target}"
 
@@ -76,8 +80,11 @@ case "${TARGET_DIR}/" in
     echo "::error::canonical Cargo target directory must be outside the ODB snapshot"
     exit 1
     ;;
+  "${THEYOS_DIR}/"*)
+    echo "::error::canonical Cargo target directory must be outside the mutable checkout"
+    exit 1
+    ;;
 esac
-
 require_blob() {
   local path="$1" expected_mode="${2:-100644}"
   local entry mode type
@@ -159,12 +166,18 @@ while IFS= read -r name; do
 done < <(compgen -e)
 
 SYSTEM_HOME="${HOME:?HOME is required to locate the pinned toolchain}"
-CARGO_HOME_DIR="${PHASE0_CARGO_HOME:-${TMP_ROOT}/cargo-home}"
+CARGO_HOME_DIR="${PHASE0_CARGO_HOME:-${TMP_ROOT}/cargo-home/home}"
 RUSTUP_HOME_DIR="${PHASE0_RUSTUP_HOME:-${SYSTEM_HOME}/.rustup}"
 if [[ "${CARGO_HOME_DIR}" != /* || "${RUSTUP_HOME_DIR}" != /* ]]; then
   echo "::error::canonical Cargo and rustup homes must be absolute paths"
   exit 1
 fi
+case "${CARGO_HOME_DIR}/" in
+  "${TARGET_DIR}/"*|"${THEYOS_DIR}/"*|"${SNAPSHOT}/"*)
+    echo "::error::canonical Cargo home must be isolated from the target, checkout, and ODB snapshot"
+    exit 1
+    ;;
+esac
 for cargo_home_config in \
   "${CARGO_HOME_DIR}/config" \
   "${CARGO_HOME_DIR}/config.toml"; do
@@ -201,13 +214,14 @@ if [[ ! -x "${ENV_BIN}" ]]; then
 fi
 CARGO_BIN="$(resolve_executable cargo)"
 RUSTC_BIN="$(resolve_executable rustc)"
+RUSTUP_BIN="$(resolve_executable rustup)"
 if [[ "${BUILD_TOOL}" == "cross" ]]; then
   BUILD_TOOL_BIN="$(resolve_executable docker)"
 else
   BUILD_TOOL_BIN="$(resolve_executable "${BUILD_TOOL}")"
 fi
 PYTHON_BIN="$(resolve_executable python3)"
-CANONICAL_PATH="$(dirname "${RUSTC_BIN}"):$(dirname "${CARGO_BIN}"):$(dirname "${BUILD_TOOL_BIN}"):$(dirname "${PYTHON_BIN}"):/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin"
+CANONICAL_PATH="$(dirname "${RUSTC_BIN}"):$(dirname "${CARGO_BIN}"):$(dirname "${RUSTUP_BIN}"):$(dirname "${BUILD_TOOL_BIN}"):$(dirname "${PYTHON_BIN}"):/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin"
 CLEAN_HOME="${TMP_ROOT}/home"
 CLEAN_TMP="${TMP_ROOT}/tmp"
 LOCAL_DOCKER_ENV=()
@@ -232,7 +246,43 @@ if find "${CARGO_HOME_DIR}" -type l -print -quit 2>/dev/null | grep -q .; then
   exit 1
 fi
 
+NATIVE_FETCH_SANDBOX="${TMP_ROOT}/native-fetch.sb"
+NATIVE_BUILD_SANDBOX="${TMP_ROOT}/native-build.sb"
+CARGO_HOME_PARENT="$(dirname "${CARGO_HOME_DIR}")"
+if [[ "${BUILD_TOOL}" != "cross" ]]; then
+  printf '%s\n' \
+    '(version 1)' \
+    '(allow default)' \
+    "(deny file-write* (subpath \"${SNAPSHOT_PARENT}\"))" \
+    "(deny file-write* (subpath \"${BUILD_SOURCE_PARENT}\"))" \
+    "(deny file-write* (subpath \"${SNAPSHOT}\"))" \
+    "(deny file-write* (subpath \"${THEYOS_DIR}\"))" \
+    "(deny file-write* (subpath \"${SYSTEM_HOME}\"))" \
+    > "${NATIVE_FETCH_SANDBOX}"
+  printf '%s\n' \
+    '(version 1)' \
+    '(allow default)' \
+    "(deny file-write* (subpath \"${SNAPSHOT_PARENT}\"))" \
+    "(deny file-write* (subpath \"${BUILD_SOURCE_PARENT}\"))" \
+    "(deny file-write* (subpath \"${SNAPSHOT}\"))" \
+    "(deny file-write* (subpath \"${THEYOS_DIR}\"))" \
+    "(deny file-write* (subpath \"${SYSTEM_HOME}\"))" \
+    "(deny file-write* (subpath \"${CARGO_HOME_PARENT}\"))" \
+    "(deny file-write* (subpath \"${CARGO_HOME_DIR}\"))" \
+    "(deny file-write* (subpath \"${RUSTUP_HOME_DIR}\"))" \
+    > "${NATIVE_BUILD_SANDBOX}"
+fi
+
 run_clean_online() {
+  local sandbox_profile=""
+  local -a sandbox_command=()
+  if [[ "${BUILD_TOOL}" != "cross" ]]; then
+    sandbox_profile="${NATIVE_BUILD_SANDBOX}"
+    if [[ "${PHASE0_CARGO_FETCH_PHASE:-0}" == "1" ]]; then
+      sandbox_profile="${NATIVE_FETCH_SANDBOX}"
+    fi
+    sandbox_command=(/usr/bin/sandbox-exec -f "${sandbox_profile}")
+  fi
   local -a clean_env=(
     HOME="${CLEAN_HOME}" \
     CARGO_HOME="${CARGO_HOME_DIR}" \
@@ -243,6 +293,7 @@ run_clean_online() {
     LANG=C \
     RUSTUP_TOOLCHAIN="${EXPECTED_RUST}" \
     CARGO_TARGET_DIR="${TARGET_DIR}" \
+    PHASE0_BUILD_SOURCE_ROOT="${BUILD_SNAPSHOT}" \
     CLAWS_MANIFEST_YML="${SNAPSHOT}/claws/manifest.yml" \
     CLAWS_CATALOG_JSON="${GENERATED_OUTPUT_DIR}/claws-catalog.json" \
     THEYOS_EMOJI_WORDLIST="${SNAPSHOT}/admin/rust/household-rs/data/emoji-security-code-wordlist.csv" \
@@ -251,7 +302,14 @@ run_clean_online() {
   if (( ${#LOCAL_DOCKER_ENV[@]} > 0 )); then
     clean_env+=("${LOCAL_DOCKER_ENV[@]}")
   fi
-  "${ENV_BIN}" -i "${clean_env[@]}" "$@"
+  if [[ "${TARGET:-}" == *-apple-darwin ]]; then
+    clean_env+=("DEVELOPER_DIR=${EXPECTED_DEVELOPER_DIR}")
+  fi
+  if (( ${#sandbox_command[@]} > 0 )); then
+    "${ENV_BIN}" -i "${clean_env[@]}" "${sandbox_command[@]}" "$@"
+  else
+    "${ENV_BIN}" -i "${clean_env[@]}" "$@"
+  fi
 }
 
 run_clean() {
@@ -268,6 +326,16 @@ fi
 HOST_TARGET="${RUSTC_HOST}"
 TARGET="${PHASE0_TARGET:-${HOST_TARGET}}"
 PUBLISHED_TARGET=true
+RUSTC_TOOLCHAIN_BIN="$(run_clean "${RUSTUP_BIN}" which rustc)"
+CARGO_TOOLCHAIN_BIN="$(run_clean "${RUSTUP_BIN}" which cargo)"
+for toolchain_binary in "${RUSTC_TOOLCHAIN_BIN}" "${CARGO_TOOLCHAIN_BIN}"; do
+  if [[ ! -f "${toolchain_binary}" || -L "${toolchain_binary}" ]]; then
+    echo "::error::rustup resolved a non-regular toolchain executable"
+    exit 1
+  fi
+done
+RUSTC_TOOLCHAIN_SHA256="$(sha256_file "${RUSTC_TOOLCHAIN_BIN}")"
+CARGO_TOOLCHAIN_SHA256="$(sha256_file "${CARGO_TOOLCHAIN_BIN}")"
 
 case "${TARGET}:${BUILD_TOOL}" in
   x86_64-unknown-linux-musl:cross | \
@@ -283,25 +351,41 @@ esac
 XCODE_VERSION=""
 XCODE_BUILD=""
 MACOS_SDK_VERSION=""
+MACOS_SDK_PATH=""
 EXPECTED_XCODE_VERSION="${PHASE0_EXPECTED_XCODE_VERSION:-}"
 EXPECTED_XCODE_BUILD="${PHASE0_EXPECTED_XCODE_BUILD:-}"
 EXPECTED_MACOS_SDK_VERSION="${PHASE0_EXPECTED_MACOS_SDK_VERSION:-}"
+EXPECTED_DEVELOPER_DIR="${PHASE0_EXPECTED_DEVELOPER_DIR:-}"
 if [[ "${TARGET}" == *-apple-darwin ]]; then
   if [[ -z "${EXPECTED_XCODE_VERSION}" || -z "${EXPECTED_XCODE_BUILD}" \
-    || -z "${EXPECTED_MACOS_SDK_VERSION}" ]]; then
+    || -z "${EXPECTED_MACOS_SDK_VERSION}" || -z "${EXPECTED_DEVELOPER_DIR}" \
+    || "${EXPECTED_DEVELOPER_DIR}" != /* ]]; then
     echo "::error::macOS Phase 0 authority requires frozen Xcode and SDK identities"
     exit 1
   fi
-  XCODE_VERSION="$(xcodebuild -version)"
+  if [[ ! -d "${EXPECTED_DEVELOPER_DIR}" ]]; then
+    echo "::error::frozen DEVELOPER_DIR does not exist: ${EXPECTED_DEVELOPER_DIR}"
+    exit 1
+  fi
+  selected_developer_dir="$(DEVELOPER_DIR="${EXPECTED_DEVELOPER_DIR}" xcode-select -p)"
+  if [[ "${selected_developer_dir}" != "${EXPECTED_DEVELOPER_DIR}" ]]; then
+    echo "::error::xcode-select did not resolve the frozen DEVELOPER_DIR"
+    exit 1
+  fi
+  XCODE_VERSION="$(DEVELOPER_DIR="${EXPECTED_DEVELOPER_DIR}" xcodebuild -version)"
   XCODE_BUILD="$(printf '%s\n' "${XCODE_VERSION}" | sed -n 's/^Build version //p')"
   XCODE_VERSION="$(printf '%s\n' "${XCODE_VERSION}" | sed -n 's/^Xcode //p')"
-  MACOS_SDK_VERSION="$(xcrun --sdk macosx --show-sdk-version)"
+  MACOS_SDK_PATH="$(DEVELOPER_DIR="${EXPECTED_DEVELOPER_DIR}" xcrun --sdk macosx --show-sdk-path)"
+  MACOS_SDK_VERSION="$(DEVELOPER_DIR="${EXPECTED_DEVELOPER_DIR}" xcrun --sdk macosx --show-sdk-version)"
+  expected_sdk_path="${EXPECTED_DEVELOPER_DIR}/Platforms/MacOSX.platform/Developer/SDKs/MacOSX${EXPECTED_MACOS_SDK_VERSION}.sdk"
   if [[ "${XCODE_VERSION}" != "${EXPECTED_XCODE_VERSION}" \
     || "${XCODE_BUILD}" != "${EXPECTED_XCODE_BUILD}" \
-    || "${MACOS_SDK_VERSION}" != "${EXPECTED_MACOS_SDK_VERSION}" ]]; then
+    || "${MACOS_SDK_VERSION}" != "${EXPECTED_MACOS_SDK_VERSION}" \
+    || "${MACOS_SDK_PATH}" != "${expected_sdk_path}" ]]; then
     echo "::error::macOS Phase 0 toolchain identity differs from the frozen Xcode/SDK policy"
     echo "::error::expected Xcode=${EXPECTED_XCODE_VERSION} build=${EXPECTED_XCODE_BUILD} SDK=${EXPECTED_MACOS_SDK_VERSION}"
     echo "::error::actual Xcode=${XCODE_VERSION} build=${XCODE_BUILD} SDK=${MACOS_SDK_VERSION}"
+    echo "::error::expected SDK path=${expected_sdk_path} actual=${MACOS_SDK_PATH}"
     exit 1
   fi
 fi
@@ -353,13 +437,12 @@ validate_boundary_manifest() {
     count=$((count + 1))
   done < "${manifest}"
 
-  if [[ "${count}" -ne 7 ]]; then
-    echo "::error file=${BOUNDARY_REL}::signed Phase 0 boundary must contain exactly seven closed inputs"
+  if [[ "${count}" -ne 6 ]]; then
+    echo "::error file=${BOUNDARY_REL}::signed Phase 0 boundary must contain exactly six closed inputs"
     exit 1
   fi
 
   for path in \
-    ".github" \
     "admin/rust" \
     "claws" \
     "flake.lock" \
@@ -545,7 +628,7 @@ fi
 
 # Fetch only after the lockfile and manifests prove that no git/alternate
 # source can be contacted. Every subsequent Cargo operation is offline.
-run_clean_online "${CARGO_BIN}" fetch \
+PHASE0_CARGO_FETCH_PHASE=1 run_clean_online "${CARGO_BIN}" fetch \
   --manifest-path "${SNAPSHOT}/admin/rust/Cargo.toml" \
   --locked \
   --quiet
@@ -673,6 +756,25 @@ if [[ "$(grep -Fc 'server_rs::production_app::compose(&state, &cfg)' \
   echo "::error::production server must use the single Phase 0-closed complete app composer"
   exit 1
 fi
+CLIPPY_ALLOW_FILE="${SNAPSHOT}/admin/rust/core-rs/src/product_a_phase0.rs"
+if [[ "$(grep -Fc '#[allow(clippy::disallowed_methods)]' "${CLIPPY_ALLOW_FILE}")" -ne 2 ]] \
+  || grep -RIl --include='*.rs' '#\[allow(clippy::disallowed_methods)\]' \
+       "${SNAPSHOT}/admin/rust" \
+       | grep -Fvqx -- "${CLIPPY_ALLOW_FILE}"; then
+  echo "::error::only the two reviewed Phase 0 wrapper sites may allow disallowed HTTP methods"
+  exit 1
+fi
+for forbidden_serve_method in \
+  'axum::serve' \
+  'hyper::server::conn::http1::Builder::serve_connection' \
+  'hyper::server::conn::http1::Builder::serve_connection_with_upgrades' \
+  'hyper::server::conn::http2::Builder::serve_connection' \
+  'hyper_util::server::conn::auto::Builder::serve_connection'; do
+  if ! grep -Fq -- "${forbidden_serve_method}" "${SNAPSHOT}/admin/rust/clippy.toml"; then
+    echo "::error::clippy disallowed-method policy is missing ${forbidden_serve_method}"
+    exit 1
+  fi
+done
 for listener_source in \
   "admin/rust/server-rs/src/main.rs" \
   "admin/rust/server-rs/src/household_listener.rs" \
@@ -741,6 +843,15 @@ if ! grep -Fq "phase0_engine_sha256" "${SNAPSHOT}/.github/workflows/release-linu
   echo "::error::release provenance does not bind the verified engine to the published package"
   exit 1
 fi
+for release_subject_binding in \
+  'PHASE0_UNSIGNED_STAGE_DIR' \
+  'PHASE0_EXPECTED_UNSIGNED_PACKAGE_MANIFEST_SHA256' \
+  'no Cargo/build scripts in release packaging'; do
+  if ! grep -Fq -- "${release_subject_binding}" "${SNAPSHOT}/scripts/make.sh"; then
+    echo "::error::macOS app packaging is missing the unsigned-subject-only binding: ${release_subject_binding}"
+    exit 1
+  fi
+done
 release_macos_signing_job="$(sed -n '/^  sign-and-publish-macos:/,/^  update-homebrew-formula:/p' \
   "${SNAPSHOT}/.github/workflows/release-macos.yml")"
 if grep -Eq 'actions/checkout@|cargo[[:space:]]|run_engine_build_tool|scripts/make\.sh' \
@@ -764,7 +875,13 @@ done
 for nix_binding in \
   'nix build .#theyos-runtime' \
   'nix path-info --recursive --json' \
+  'nix flake archive --json' \
+  '--offline --no-link --no-write-lock-file' \
   'phase0-nix-store-closure.json' \
+  'phase0-nix-input-closure.json' \
+  'nix_input_closure_manifest_sha256' \
+  'nix_build_offline' \
+  'nix_substituters_closed' \
   'flake_lock_sha256' \
   '--no-default-features' \
   'third_target_injection_seam_compiled'; do
@@ -774,11 +891,38 @@ for nix_binding in \
     exit 1
   fi
 done
+if ! grep -Fq 'phase0-helper-depfile-and-marker-closure-v1' \
+    "${SNAPSHOT}/nix/packages/rust-workspace.nix"; then
+  echo "::error::Nix helper outputs must carry a depfile/source closure classification"
+  exit 1
+fi
 if grep -Eq 'permissions:|id-token: write|attestations: write' \
     "${SNAPSHOT}/.github/workflows/owner-present-phase0-nix-runtime.yml" \
   && ! grep -Fq 'if: github.event_name == '\''push'\''' \
     "${SNAPSHOT}/.github/workflows/owner-present-phase0-nix-runtime.yml"; then
   echo "::error::Nix attestation credentials must be isolated to a push-only job"
+  exit 1
+fi
+KNOWN_WORKFLOWS="${TMP_ROOT}/known-workflows.txt"
+ACTUAL_WORKFLOWS="${TMP_ROOT}/actual-workflows.txt"
+printf '%s\n' \
+  backend-ci.yml \
+  claw-store-contract-ci.yml \
+  contracts-cross-repo-sync.yml \
+  frontend-ci.yml \
+  homebrew-smoke-macos.yml \
+  owner-present-phase0-compileout.yml \
+  owner-present-phase0-integrity.yml \
+  owner-present-phase0-nix-runtime.yml \
+  release-linux.yml \
+  release-macos.yml \
+  | LC_ALL=C sort > "${KNOWN_WORKFLOWS}"
+find "${SNAPSHOT}/.github/workflows" -maxdepth 1 -type f \
+  \( -name '*.yml' -o -name '*.yaml' \) -exec basename {} \; \
+  | LC_ALL=C sort > "${ACTUAL_WORKFLOWS}"
+if ! cmp -s "${KNOWN_WORKFLOWS}" "${ACTUAL_WORKFLOWS}"; then
+  echo "::error::.github/workflows contains an unclassified publisher or attestation workflow"
+  diff -u "${KNOWN_WORKFLOWS}" "${ACTUAL_WORKFLOWS}" || true
   exit 1
 fi
 while IFS= read -r workflow_path; do
@@ -943,6 +1087,7 @@ verify_snapshot_matches_odb
 REPO_DEP_INPUTS="${TMP_ROOT}/repo-dep-inputs.nul"
 if ! run_clean "${PYTHON_BIN}" - \
     "${SNAPSHOT}" \
+    "${BUILD_SNAPSHOT}" \
     "${TARGET_DIR}" \
     "${CARGO_HOME_DIR}" \
     "${RUSTUP_HOME_DIR}" \
@@ -952,10 +1097,11 @@ import pathlib
 import sys
 
 snapshot = pathlib.Path(sys.argv[1]).resolve()
-target_dir = pathlib.Path(sys.argv[2]).resolve()
-cargo_home = pathlib.Path(sys.argv[3]).resolve()
-rustup_home = pathlib.Path(sys.argv[4]).resolve()
-depfiles = [pathlib.Path(value) for value in sys.argv[5:]]
+build_snapshot = pathlib.Path(sys.argv[2]).resolve()
+target_dir = pathlib.Path(sys.argv[3]).resolve()
+cargo_home = pathlib.Path(sys.argv[4]).resolve()
+rustup_home = pathlib.Path(sys.argv[5]).resolve()
+depfiles = [pathlib.Path(value) for value in sys.argv[6:]]
 
 def relative_to(path, root):
     try:
@@ -999,10 +1145,6 @@ def depfile_tokens(depfile):
         tokens.append(bytes(token))
     return tokens
 
-allowed_system_roots = tuple(pathlib.Path(root) for root in (
-    "/usr", "/bin", "/sbin", "/lib", "/lib64", "/System",
-    "/Library/Developer", "/Applications/Xcode.app", "/opt/homebrew",
-))
 repo_inputs = set()
 for depfile in depfiles:
     for raw in depfile_tokens(depfile):
@@ -1019,6 +1161,8 @@ for depfile in depfiles:
             continue
         relative = relative_to(normalized, snapshot)
         if relative is None:
+            relative = relative_to(normalized, build_snapshot)
+        if relative is None:
             relative = relative_to(normalized, pathlib.Path("/project"))
         if relative is None:
             claws_relative = relative_to(normalized, pathlib.Path("/claws"))
@@ -1033,10 +1177,11 @@ for depfile in depfiles:
             for root in ("/phase0-cargo", "/phase0-rustup", "/phase0-toolchain")
         ):
             continue
-        if relative is None and any(relative_to(normalized, root) is not None for root in allowed_system_roots):
-            continue
         if relative is None:
-            print(f"::error::Rust depfile input is outside modeled immutable roots: {normalized}", file=sys.stderr)
+            print(
+                f"::error::Rust depfile input is outside the modeled immutable roots: {normalized}",
+                file=sys.stderr,
+            )
             raise SystemExit(1)
         relative_text = relative.as_posix()
         if relative_text in {".git/HEAD", ".git/packed-refs"} or relative_text.startswith(".git/refs/heads/"):
@@ -1058,9 +1203,9 @@ fi
 repo_dep_count=0
 while IFS= read -r -d '' repo_input; do
   case "${repo_input}" in
-    .github/*|admin/rust/*|claws/*|nix/*|scripts/*|flake.nix|flake.lock) ;;
+    admin/rust/*|claws/*|nix/*|scripts/*|flake.nix|flake.lock) ;;
     *)
-      echo "::error file=${repo_input}::production depfile input escapes the four closed Git subtrees"
+      echo "::error file=${repo_input}::production depfile input escapes the six closed Git inputs"
       exit 1
       ;;
   esac
@@ -1243,6 +1388,8 @@ jq -n -S \
   --arg build_tool_version "$(run_clean "${BUILD_TOOL_BIN}" -V)" \
   --arg rustc "$(run_clean "${RUSTC_BIN}" -Vv)" \
   --arg cargo "$(run_clean "${CARGO_BIN}" -V)" \
+  --arg rustc_toolchain_sha256 "${RUSTC_TOOLCHAIN_SHA256}" \
+  --arg cargo_toolchain_sha256 "${CARGO_TOOLCHAIN_SHA256}" \
   --arg python "$(run_clean "${PYTHON_BIN}" --version 2>&1)" \
   --arg cargo_config_sha256 "$(sha256_file "${SNAPSHOT}/admin/rust/.cargo/config.toml")" \
   --arg cross_config_sha256 "$(sha256_file "${SNAPSHOT}/admin/rust/Cross.toml")" \
@@ -1270,6 +1417,8 @@ jq -n -S \
   --arg expected_xcode_build "${EXPECTED_XCODE_BUILD}" \
   --arg macos_sdk_version "${MACOS_SDK_VERSION}" \
   --arg expected_macos_sdk_version "${EXPECTED_MACOS_SDK_VERSION}" \
+  --arg developer_dir "${EXPECTED_DEVELOPER_DIR}" \
+  --arg macos_sdk_path "${MACOS_SDK_PATH}" \
   --argjson published_target "${PUBLISHED_TARGET}" \
   '{
     schema: $schema,
@@ -1280,6 +1429,8 @@ jq -n -S \
     build_tool_version: $build_tool_version,
     rustc: $rustc,
     cargo: $cargo,
+    rustc_toolchain_sha256: $rustc_toolchain_sha256,
+    cargo_toolchain_sha256: $cargo_toolchain_sha256,
     python: $python,
     cargo_config_sha256: $cargo_config_sha256,
     cross_config_sha256: $cross_config_sha256,
@@ -1307,6 +1458,8 @@ jq -n -S \
     expected_xcode_build: $expected_xcode_build,
     macos_sdk_version: $macos_sdk_version,
     expected_macos_sdk_version: $expected_macos_sdk_version,
+    developer_dir: $developer_dir,
+    macos_sdk_path: $macos_sdk_path,
     published_target: $published_target,
     server_equals_theyos_engine: true,
     owner_present_authority: "none",
