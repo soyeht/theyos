@@ -18,6 +18,7 @@ AUTHORITY_STATUS_REL="admin/contracts/mobile-claw-vpn/v1/owner_present_wire_auth
 BUILD_TOOL_MANIFEST_REL="admin/rust/theyos-engine-build-rs/Cargo.toml"
 BUILD_TOOL_SOURCE_REL="admin/rust/theyos-engine-build-rs/src/main.rs"
 BOUNDARY_REL="admin/contracts/mobile-claw-vpn/v1/owner_present_phase0_artifact_boundary_v1.tsv"
+FORBIDDEN_MARKERS_REL="admin/rust/phase0-forbidden-markers.txt"
 
 HEAD_SHA="$(git -C "${THEYOS_DIR}" rev-parse HEAD)"
 HEAD_TREE="$(git -C "${THEYOS_DIR}" rev-parse "${HEAD_SHA}^{tree}")"
@@ -438,6 +439,7 @@ if [[ "${BUILD_TOOL}" == "cross" ]]; then
       --env RUSTC=/phase0-toolchain/bin/rustc \
       --env RUSTDOC=/phase0-toolchain/bin/rustdoc \
       --env RUSTUP_TOOLCHAIN="${EXPECTED_RUST}" \
+      --env "PHASE0_EXPECTED_RUST=${EXPECTED_RUST}" \
       --env THEYOS_PHASE0_CLEAN_ENV=1 \
       --env PHASE0_BUILD_SOURCE_ROOT=/project \
       --env CLAWS_MANIFEST_YML=/claws/manifest.yml \
@@ -482,7 +484,7 @@ if [[ "${BUILD_TOOL}" == "cross" ]]; then
     assert_read_only /project
     assert_read_only /phase0-cargo
     assert_read_only /phase0-toolchain
-    /phase0-toolchain/bin/rustc -vV | grep -Fq "release: ${EXPECTED_RUST}"
+    /phase0-toolchain/bin/rustc -vV | grep -Fq "release: ${PHASE0_EXPECTED_RUST}"
     if chmod u+w /project/admin/rust/server-rs/src/main.rs 2>/dev/null; then
       echo "Phase 0 source mount was writable" >&2
       exit 1
@@ -1084,6 +1086,7 @@ fi
 for release_subject_binding in \
   'PHASE0_UNSIGNED_STAGE_DIR' \
   'PHASE0_EXPECTED_UNSIGNED_PACKAGE_MANIFEST_SHA256' \
+  'PHASE0_EXPECTED_PHASE0_ATTESTATION_SHA256' \
   'no Cargo/build scripts in release packaging'; do
   if ! grep -Fq -- "${release_subject_binding}" "${SNAPSHOT}/scripts/make.sh"; then
     echo "::error::macOS app packaging is missing the unsigned-subject-only binding: ${release_subject_binding}"
@@ -1132,6 +1135,12 @@ done
 if ! grep -Fq 'phase0-helper-depfile-and-marker-closure-v1' \
     "${SNAPSHOT}/nix/packages/rust-workspace.nix"; then
   echo "::error::Nix helper outputs must carry a depfile/source closure classification"
+  exit 1
+fi
+if ! grep -Fq 'phase0-forbidden-markers.txt' \
+    "${SNAPSHOT}/nix/packages/rust-workspace.nix" \
+  || [[ ! -s "${SNAPSHOT}/${FORBIDDEN_MARKERS_REL}" ]]; then
+  echo "::error::Nix and Cargo Phase 0 marker checks must share a tracked marker source"
   exit 1
 fi
 if grep -Eq 'permissions:|id-token: write|attestations: write' \
@@ -1574,32 +1583,17 @@ fi
 # Auxiliary tripwire only. Structural absence above is the authority.
 STRINGS_OUT="${TMP_ROOT}/server.strings"
 LC_ALL=C strings "${BINARY}" > "${STRINGS_OUT}"
+if [[ ! -s "${SNAPSHOT}/${FORBIDDEN_MARKERS_REL}" ]]; then
+  echo "::error file=${FORBIDDEN_MARKERS_REL}::Phase 0 forbidden-marker source is missing"
+  exit 1
+fi
 while IFS= read -r forbidden; do
   [[ -z "${forbidden}" ]] && continue
   if grep -Fqi -- "${forbidden}" "${STRINGS_OUT}"; then
     echo "::error::production theyos-engine contains auxiliary Phase 0 tripwire: ${forbidden}"
     exit 1
   fi
-done <<'FORBIDDEN'
-/api/v1/mobile/claw-vpn/owner-present/
-/api/v1/mobile/claw-vpn/offers
-/api/v1/mobile/claw-vpn/sessions
-/api/v1/mobile/claw-vpn/rendezvous/authorize
-/api/v1/mobile/claw-vpn/owner/enroll-device
-/api/v1/mobile/claw-vpn/owner/claw-availability
-/api/v1/mobile/claw-vpn/owner/grant
-/api/v1/mobile/claw-vpn/owner/revoke-grant
-mesh_c_owner_present_offer_control
-RevalidatedCapability
-ConsumedCapability
-PointOfUsePermit
-owner_approval_consumed
-RelayStreamIpTunnelRouter
-RelayStreamIpTunnelTarget
-new_with_ip_tunnel_router
-bind_relay_stream_reverse_connect_with_ip_tunnel_router
-assemble_relay_stream_live_with_ip_tunnel_router
-FORBIDDEN
+done < "${SNAPSHOT}/${FORBIDDEN_MARKERS_REL}"
 
 PUBLISHED_EXECUTABLES_JSON="${TMP_ROOT}/published-executables.json"
 jq -n '{}' > "${PUBLISHED_EXECUTABLES_JSON}"

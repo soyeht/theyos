@@ -364,6 +364,19 @@ package_soyeht_mac() {
         error "package-soyeht-mac requires macos-arm64 — binary is aarch64 and output goes to dist/macos-arm64/ (current platform: ${PLATFORM})"
     fi
 
+    local sign_id="${THEYOS_CODESIGN_IDENTITY:-}"
+    local has_notary_credentials="${APPLE_NOTARY_KEY_P8:-}${APPLE_NOTARY_KEY_ID:-}${APPLE_NOTARY_ISSUER_ID:-}"
+    if [ -n "${sign_id}" ] || [ -n "${has_notary_credentials}" ]; then
+        if [ -z "${THEYOS_RELEASE:-}" ]; then
+            error "real macOS signing/notarization requires THEYOS_RELEASE and a Phase 0 unsigned subject"
+        fi
+        if [ -z "${PHASE0_UNSIGNED_STAGE_DIR:-}" ] || \
+            [ -z "${PHASE0_EXPECTED_UNSIGNED_PACKAGE_MANIFEST_SHA256:-}" ] || \
+            [ -z "${PHASE0_EXPECTED_PHASE0_ATTESTATION_SHA256:-}" ]; then
+            error "real macOS signing/notarization requires the complete Phase 0 subject binding"
+        fi
+    fi
+
     local version
     if [ -n "${THEYOS_RELEASE:-}" ]; then
         if [ -z "${PHASE0_EXPECTED_UNSIGNED_ENGINE_SHA256:-}" ]; then
@@ -381,9 +394,12 @@ package_soyeht_mac() {
     local target_dir="${REPO_ROOT}/admin/rust/target/aarch64-apple-darwin/release"
     local unsigned_stage="${PHASE0_UNSIGNED_STAGE_DIR:-}"
     local package_manifest=""
+    local phase0_manifest_verified=0
     if [ -n "${THEYOS_RELEASE:-}" ]; then
-        if [ -z "${unsigned_stage}" ] || [ -z "${PHASE0_EXPECTED_UNSIGNED_PACKAGE_MANIFEST_SHA256:-}" ]; then
-            error "THEYOS_RELEASE requires PHASE0_UNSIGNED_STAGE_DIR and PHASE0_EXPECTED_UNSIGNED_PACKAGE_MANIFEST_SHA256"
+        if [ -z "${unsigned_stage}" ] || \
+            [ -z "${PHASE0_EXPECTED_UNSIGNED_PACKAGE_MANIFEST_SHA256:-}" ] || \
+            [ -z "${PHASE0_EXPECTED_PHASE0_ATTESTATION_SHA256:-}" ]; then
+            error "THEYOS_RELEASE requires the complete Phase 0 unsigned subject binding"
         fi
         package_manifest="${unsigned_stage}/phase0-package-manifest.json"
         if [ ! -f "${package_manifest}" ]; then
@@ -393,6 +409,13 @@ package_soyeht_mac() {
         package_manifest_sha256=$(shasum -a 256 "${package_manifest}" | awk '{print $1}')
         if [ "${package_manifest_sha256}" != "${PHASE0_EXPECTED_UNSIGNED_PACKAGE_MANIFEST_SHA256}" ]; then
             error "unsigned macOS package manifest differs from the Phase 0 verified subject"
+        fi
+        local attestation_sha256 manifest_attestation_sha256
+        attestation_sha256=$(shasum -a 256 "${unsigned_stage}/phase0-build-attestation.json" | awk '{print $1}')
+        manifest_attestation_sha256=$(jq -r '.phase0_attestation_sha256 // empty' "${package_manifest}")
+        if [ "${attestation_sha256}" != "${PHASE0_EXPECTED_PHASE0_ATTESTATION_SHA256}" ] || \
+            [ "${manifest_attestation_sha256}" != "${attestation_sha256}" ]; then
+            error "unsigned package manifest is not bound to the verified Phase 0 attestation"
         fi
         if ! jq -e '
             (.executables | keys | sort) == [
@@ -408,6 +431,7 @@ package_soyeht_mac() {
         ' "${package_manifest}" >/dev/null; then
             error "unsigned macOS package manifest does not describe the exact app subject"
         fi
+        phase0_manifest_verified=1
     fi
     local source_dir="${target_dir}"
     if [ -n "${unsigned_stage}" ]; then
@@ -517,7 +541,11 @@ package_soyeht_mac() {
         info "  ✓ ${bin} signed"
     }
 
-    local sign_id="${THEYOS_CODESIGN_IDENTITY:-}"
+    if [ -n "${sign_id}" ] || [ -n "${has_notary_credentials}" ]; then
+        if [ "${phase0_manifest_verified}" -ne 1 ]; then
+            error "real macOS signing/notarization is not allowed without a verified Phase 0 subject"
+        fi
+    fi
     if [ -n "${sign_id}" ]; then
         info "Codesigning Soyeht app helpers with Developer ID: ${sign_id}"
     else

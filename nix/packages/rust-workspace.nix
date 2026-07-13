@@ -19,6 +19,7 @@ let
       || (builtins.match ".*\\.html$" path != null)
       || (builtins.match ".*\\.sh$" path != null)
       || (builtins.match ".*\\.json$" path != null)
+      || (builtins.match ".*phase0-forbidden-markers\\.txt$" path != null)
       || (builtins.match ".*/assets/.*" path != null);
   };
 
@@ -28,6 +29,10 @@ let
 
   # core-rs/build.rs reads this to generate the claw catalog at compile time.
   manifestSrc = ../../claws/manifest.yml;
+
+  # Keep the Nix marker tripwire byte-identical to the Cargo authority checker.
+  # Structural depfile and contract checks remain authoritative.
+  forbiddenMarkersSrc = ../../admin/rust/phase0-forbidden-markers.txt;
 
   # household-rs/build.rs reads this to embed the emoji-security-code
   # wordlist CSV. The CSV lives inside admin/rust/household-rs/data/ so
@@ -124,11 +129,13 @@ in
       test -x "$out/bin/server"
       test -x "$out/bin/theyos-llm-proxy"
       for executable in "$out"/bin/*; do
-        if strings "$executable" | grep -Eiq \
-          'RevalidatedCapability|ConsumedCapability|PointOfUsePermit|owner_present|owner_approval_consumed|mesh_c_owner_present_offer_control|RelayStreamIpTunnelRouter|RelayStreamIpTunnelTarget|new_with_ip_tunnel_router|bind_relay_stream_reverse_connect_with_ip_tunnel_router|/api/v1/mobile/claw-vpn/(owner-present|owner|offers|sessions|rendezvous)'; then
-          echo "Phase 0 marker found in $executable" >&2
-          exit 1
-        fi
+        while IFS= read -r forbidden; do
+          test -n "$forbidden" || continue
+          if strings "$executable" | grep -Fqi -- "$forbidden"; then
+            echo "Phase 0 marker found in $executable: $forbidden" >&2
+            exit 1
+          fi
+        done < "${forbiddenMarkersSrc}"
         name="$(basename "$executable")"
         depfile="target/release/$name.d"
         test -f "$depfile"
