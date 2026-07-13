@@ -69,7 +69,14 @@ if [[ "${BUILD_TOOL}" != "cross" ]]; then
     exit 1
   fi
 fi
-TARGET_DIR="${PHASE0_CARGO_TARGET_DIR:-${TMP_ROOT}/target}"
+# Native macOS Cargo writes stay inside the sandbox-owned temp root. Cross
+# builds keep the caller target because it is mounted explicitly read-write in
+# the pinned OCI container; only the verified staged outputs leave the sandbox.
+if [[ "${BUILD_TOOL}" == "cross" ]]; then
+  TARGET_DIR="${PHASE0_CARGO_TARGET_DIR:-${TMP_ROOT}/target}"
+else
+  TARGET_DIR="${TMP_ROOT}/target"
+fi
 
 if [[ -e "${TARGET_DIR}" && -n "$(find "${TARGET_DIR}" -mindepth 1 -print -quit 2>/dev/null)" ]]; then
   echo "::error::canonical Cargo target directory must be empty before the authority build"
@@ -1410,6 +1417,19 @@ record_published_executable "theyos-llm-proxy" "${PROXY_BINARY}" "shared-http-ge
 for helper in "${PUBLISHED_HELPERS[@]}"; do
   record_published_executable "${helper}" "${BINARY_DIR}/${helper}" "out-of-process-helper-no-server-rs-dependency"
 done
+
+STAGED_BINARIES_OUT="${PHASE0_STAGED_BINARIES_OUT:-}"
+if [[ -n "${STAGED_BINARIES_OUT}" ]]; then
+  if [[ "${STAGED_BINARIES_OUT}" != /* || "${STAGED_BINARIES_OUT}" == *".."* ]]; then
+    echo "::error::staged executable output must be an absolute safe path"
+    exit 1
+  fi
+  rm -rf "${STAGED_BINARIES_OUT}"
+  mkdir -p "${STAGED_BINARIES_OUT}"
+  for executable in "${PUBLISHED_HELPERS[@]}"; do
+    cp -p "${BINARY_DIR}/${executable}" "${STAGED_BINARIES_OUT}/${executable}"
+  done
+fi
 
 NORMALIZED_DEPFILE="${TMP_ROOT}/server.normalized.d"
 sed \
