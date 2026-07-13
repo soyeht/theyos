@@ -1,8 +1,8 @@
 # theyos-owner-present-phase0-artifact-boundary-v1
 # mode<TAB>git-object-type<TAB>git-object-oid<TAB>closed-input
-040000	tree	5a6bf52b93cd3a6e9351890fdcb221b83e164d48	admin/rust
+040000	tree	3f4321d1f75065df405dc4595f13fadb0f9b0e80	admin/rust
 040000	tree	0f4cb4b436ef7d67e4e024cf1bf67d50ed2d6d53	claws
 100644	blob	f47d954fdd6a61451ca24583f58e44a884fb51e5	flake.lock
 100644	blob	1c5001db8e71d27dcdfb96df67f6577b872dbf98	flake.nix
-040000	tree	29dc094422c6d750db96070ee5aaa49e9831bddf	nix
-040000	tree	35214bc0c7609cf5e84e7ec505ff0918c74b03c5	scripts
+040000	tree	abd694bc02e3886646dfc0e69c48fc59ecacc224	nix
+040000	tree	90e98ad64fdec30da384a099e950d727bc7ec471	scripts
