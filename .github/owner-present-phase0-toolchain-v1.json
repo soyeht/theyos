@@ -8,7 +8,7 @@
       "host_toolchain": "aarch64-apple-darwin",
       "toolchain_root": "1.92.0-aarch64-apple-darwin",
       "toolchain_closure_components": ["bin", "etc", "lib", "libexec"],
-      "toolchain_closure_sha256": "77eb1191037d30e2e60105cf15e0a426c5c7cb71b04911fbaace9de512df8a09",
+      "toolchain_closure_sha256": "b80016b6070393061d64d3fcb943d1714130c30ad2262d432ee829addb6433be",
       "rustc_sha256": "12cab30aa9890d54445e29149a1e82d18fbe457de12801bd11bbe7e5e7fe33a0",
       "cargo_sha256": "03e381389f5b7b8e695a744362f3866478f99034b2cf2df6afd4d42cfdab6f67"
     },
@@ -17,7 +17,7 @@
       "host_toolchain": "x86_64-unknown-linux-gnu",
       "toolchain_root": "1.92.0-x86_64-unknown-linux-gnu",
       "toolchain_closure_components": ["bin", "etc", "lib", "libexec"],
-      "toolchain_closure_sha256": "56f6fa5f90d23adcf6f5bca26ad4213eb4001cdcc19c113370ff7f3a3ff0ba0a",
+      "toolchain_closure_sha256": "80a689adbe581f4240f989a72499ff17d61ad4b502aae4ecf2eb58eb85c968d5",
       "rustc_sha256": "028fd60b0e0add5505c661cd3ccde91393d615c8729bd95d94ab1e91409b36a1",
       "cargo_sha256": "310fa46c7903259368c0df3dbb3f4f52759563f3c9ce53b500404b7741fb6860"
     },
@@ -26,7 +26,7 @@
       "host_toolchain": "x86_64-unknown-linux-gnu",
       "toolchain_root": "1.92.0-x86_64-unknown-linux-gnu",
       "toolchain_closure_components": ["bin", "etc", "lib", "libexec"],
-      "toolchain_closure_sha256": "35812233f1554091d6603a8a501ac971e121a98550de2c2efdef5f177b704cfe",
+      "toolchain_closure_sha256": "8b53b47895e794388b60f1fce29fb8f61026324584ed93f92b6bdb62fe90def1",
       "rustc_sha256": "028fd60b0e0add5505c661cd3ccde91393d615c8729bd95d94ab1e91409b36a1",
       "cargo_sha256": "310fa46c7903259368c0df3dbb3f4f52759563f3c9ce53b500404b7741fb6860"
     }
