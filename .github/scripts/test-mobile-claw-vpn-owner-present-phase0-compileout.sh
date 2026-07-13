@@ -440,7 +440,7 @@ RUST
 refresh_boundary_tree_entry "${absolute_external_include}" "admin/rust"
 commit_mutation "${absolute_external_include}" absolute-external-include
 expect_checker_failure absolute_external_include \
-  "Rust depfile input is outside modeled immutable roots" \
+  "Rust depfile input is outside the modeled immutable roots" \
   "${absolute_external_include}"
 
 manifest_override="${TMP_ROOT}/manifest-override"
