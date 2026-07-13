@@ -200,7 +200,8 @@ if PHASE0_RUSTUP_HOME="${UNTRUSTED_RUSTUP_HOME}" \
     PHASE0_TARGET="${HOST_TARGET}" \
     PHASE0_BUILD_TOOL=cargo \
     PHASE0_CARGO_TARGET_DIR="${SHARED_TARGET}" \
-    run_checker "${REPO_ROOT}/${CHECKER_REL}" >"${TMP_ROOT}/rustup-home.log" 2>&1; then
+    env -u CARGO_HOME -u RUSTUP_HOME \
+      "${REPO_ROOT}/${CHECKER_REL}" >"${TMP_ROOT}/rustup-home.log" 2>&1; then
   echo "error: canonical build accepted caller-selected PHASE0_RUSTUP_HOME" >&2
   exit 1
 fi
