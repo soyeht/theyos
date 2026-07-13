@@ -888,9 +888,9 @@ for mac_toolchain_file in \
   "${SNAPSHOT}/.github/workflows/owner-present-phase0-compileout.yml" \
   "${SNAPSHOT}/.github/workflows/release-macos.yml"; do
   for mac_toolchain_pin in \
-    'PHASE0_EXPECTED_XCODE_VERSION: "26.5"' \
-    'PHASE0_EXPECTED_XCODE_BUILD: "17F42"' \
-    'PHASE0_EXPECTED_MACOS_SDK_VERSION: "26.5"'; do
+    'PHASE0_EXPECTED_XCODE_VERSION: "16.4"' \
+    'PHASE0_EXPECTED_XCODE_BUILD: "16F6"' \
+    'PHASE0_EXPECTED_MACOS_SDK_VERSION: "15.5"'; do
     if ! grep -Fq -- "${mac_toolchain_pin}" "${mac_toolchain_file}"; then
       echo "::error file=${mac_toolchain_file}::frozen Xcode/SDK identity is missing"
       exit 1

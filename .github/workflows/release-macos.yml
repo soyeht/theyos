@@ -22,10 +22,10 @@ jobs:
       PHASE0_BUILD_TOOL: cargo
       PHASE0_ATTESTATION: ${{ runner.temp }}/phase0-attestation-aarch64-apple-darwin.json
       PHASE0_ENGINE: ${{ runner.temp }}/theyos-engine-aarch64-apple-darwin
-      PHASE0_EXPECTED_XCODE_VERSION: "26.5"
-      PHASE0_EXPECTED_XCODE_BUILD: "17F42"
-      PHASE0_EXPECTED_MACOS_SDK_VERSION: "26.5"
-      PHASE0_EXPECTED_DEVELOPER_DIR: /Applications/Xcode.app/Contents/Developer
+      PHASE0_EXPECTED_XCODE_VERSION: "16.4"
+      PHASE0_EXPECTED_XCODE_BUILD: "16F6"
+      PHASE0_EXPECTED_MACOS_SDK_VERSION: "15.5"
+      PHASE0_EXPECTED_DEVELOPER_DIR: /Applications/Xcode_16.4.app/Contents/Developer
 
     steps:
       - name: Checkout exact tag
@@ -140,11 +140,11 @@ jobs:
           test -f "$stage/phase0-build-attestation.json"
           test -f "$stage/phase0-package-manifest.json"
           jq -e '
-            .expected_xcode_version == "26.5"
-            and .expected_xcode_build == "17F42"
-            and .expected_macos_sdk_version == "26.5"
-            and .developer_dir == "/Applications/Xcode.app/Contents/Developer"
-            and .macos_sdk_path == "/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX26.5.sdk"
+            .expected_xcode_version == "16.4"
+            and .expected_xcode_build == "16F6"
+            and .expected_macos_sdk_version == "15.5"
+            and .developer_dir == "/Applications/Xcode_16.4.app/Contents/Developer"
+            and .macos_sdk_path == "/Applications/Xcode_16.4.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX15.5.sdk"
           ' "$stage/phase0-build-attestation.json" >/dev/null
           while IFS=$'\t' read -r executable expected; do
             test -n "$executable"
