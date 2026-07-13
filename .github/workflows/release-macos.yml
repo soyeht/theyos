@@ -58,15 +58,15 @@ jobs:
       - name: Build, inspect, and attest unsigned subjects
         shell: bash
         env:
+          CARGO_HOME: ""
           PHASE0_CARGO_TARGET_DIR: ${{ runner.temp }}/phase0-target
-          PHASE0_CARGO_HOME: ${{ runner.temp }}/phase0-cargo-home/home
           PHASE0_RUN_ARTIFACT_DIRECT: "1"
           PHASE0_ATTESTATION_OUT: ${{ runner.temp }}/phase0-attestation-aarch64-apple-darwin.json
           PHASE0_STAGED_ENGINE_OUT: ${{ runner.temp }}/theyos-engine-aarch64-apple-darwin
         run: |
           set -euo pipefail
-          rm -rf "$PHASE0_CARGO_TARGET_DIR" "$PHASE0_CARGO_HOME"
-          mkdir -p "$PHASE0_CARGO_TARGET_DIR" "$PHASE0_CARGO_HOME"
+          rm -rf "$PHASE0_CARGO_TARGET_DIR"
+          mkdir -p "$PHASE0_CARGO_TARGET_DIR"
           bash .github/scripts/check-mobile-claw-vpn-owner-present-phase0-compileout.sh
 
       - name: Package exact unsigned subjects

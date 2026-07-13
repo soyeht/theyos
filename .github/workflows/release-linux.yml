@@ -53,10 +53,9 @@ jobs:
           PHASE0_ATTESTATION="$RUNNER_TEMP/phase0-attestation-x86_64-unknown-linux-musl.json"
           PHASE0_ENGINE="$RUNNER_TEMP/phase0-engine-x86_64/theyos-engine"
           mkdir -p "$(dirname "$PHASE0_ENGINE")"
-          PHASE0_TARGET=x86_64-unknown-linux-musl \
+          env -u CARGO_HOME PHASE0_TARGET=x86_64-unknown-linux-musl \
           PHASE0_BUILD_TOOL=cross \
           PHASE0_CARGO_TARGET_DIR="$RUNNER_TEMP/phase0-target-x86_64" \
-          PHASE0_CARGO_HOME="$RUNNER_TEMP/phase0-cargo-home-x86_64/home" \
           PHASE0_RUN_ARTIFACT_DIRECT=1 \
           PHASE0_ATTESTATION_OUT="$PHASE0_ATTESTATION" \
           PHASE0_STAGED_ENGINE_OUT="$PHASE0_ENGINE" \
@@ -188,10 +187,9 @@ jobs:
           PHASE0_ATTESTATION="$RUNNER_TEMP/phase0-attestation-aarch64-unknown-linux-musl.json"
           PHASE0_ENGINE="$RUNNER_TEMP/phase0-engine-aarch64/theyos-engine"
           mkdir -p "$(dirname "$PHASE0_ENGINE")"
-          PHASE0_TARGET=aarch64-unknown-linux-musl \
+          env -u CARGO_HOME PHASE0_TARGET=aarch64-unknown-linux-musl \
           PHASE0_BUILD_TOOL=cross \
           PHASE0_CARGO_TARGET_DIR="$RUNNER_TEMP/phase0-target-aarch64" \
-          PHASE0_CARGO_HOME="$RUNNER_TEMP/phase0-cargo-home-aarch64/home" \
           PHASE0_RUN_ARTIFACT_DIRECT=0 \
           PHASE0_ATTESTATION_OUT="$PHASE0_ATTESTATION" \
           PHASE0_STAGED_ENGINE_OUT="$PHASE0_ENGINE" \

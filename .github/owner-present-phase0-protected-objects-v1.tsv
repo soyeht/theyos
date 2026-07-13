@@ -5,10 +5,10 @@
 100755	blob	32af9684193fb0ec8286f9cdb038c6e081404f44	land-exact	.github/scripts/test-mobile-claw-vpn-owner-present-contracts.sh
 100755	blob	b288310f1402d1f4b31d436c58084ab2d9965997	land-exact	.github/scripts/test-mobile-claw-vpn-owner-present-phase0-compileout.sh
 100644	blob	d0b9229e4fe5744cb2c072ce690b29039bafc450	land-exact	.github/workflows/contracts-cross-repo-sync.yml
-100644	blob	4dace548a5ea6a4d3f1da5ed6c7d9730002bc10d	land-exact	.github/workflows/owner-present-phase0-compileout.yml
+100644	blob	5e781beafa3b7d54152aa8beda2aadd71503b018	land-exact	.github/workflows/owner-present-phase0-compileout.yml
 100644	blob	8ae5db96e0e72d21e829c8a582b2b74520c2ee2c	land-exact	.github/workflows/owner-present-phase0-nix-runtime.yml
-100644	blob	b5204b326715e1e07c53b4864abee19f2280aa0b	land-exact	.github/workflows/release-linux.yml
-100644	blob	d92c7bc90443f3a864d6c18806d7301a441f2757	land-exact	.github/workflows/release-macos.yml
+100644	blob	648806022e2c6b38880d951ff5ef71e6e42ac3fd	land-exact	.github/workflows/release-linux.yml
+100644	blob	3332c335f8b87726314ffff9558a4bacc9f9eca2	land-exact	.github/workflows/release-macos.yml
 100644	blob	22d5bb6a2bccf756f2e481dec4ac4015ed955ef8	land-exact	admin/contracts/mobile-claw-vpn/v1/owner_present_wire_authority_status_v1.json
 100644	blob	42fa6a42c33535a3fded0a0e4210a80e3791b660	land-exact	admin/rust/.cargo/config.toml
 100644	blob	4cff2a1b3f165bbaa928e3d58d6c3d505be4c147	land-exact	admin/rust/Cross.toml
@@ -25,5 +25,5 @@
 100644	blob	a9d12674061e28e666d7bf35bff3479f715a102d	land-exact	nix/module.nix
 100644	blob	3b0aa0722bd015c688bfe351ca794794073753ea	land-exact	nix/modules/llm-proxy.nix
 100644	blob	b232c2ab10abec37a7685772c24fd4f217e6c870	land-exact	nix/packages/rust-workspace.nix
-100755	blob	20c2e52372624ca7922fee28a420ea6e39ac8a45	land-exact	scripts/make.sh
+100755	blob	964153c255ef7d554ff6d2c431bf10e415ebf75d	land-exact	scripts/make.sh
 100644	blob	f47d954fdd6a61451ca24583f58e44a884fb51e5	land-exact	flake.lock

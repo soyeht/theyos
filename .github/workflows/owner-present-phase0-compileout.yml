@@ -83,10 +83,10 @@ jobs:
       - name: Build, inspect, stage, and attest
         shell: bash
         env:
+          CARGO_HOME: ""
           PHASE0_TARGET: ${{ matrix.target }}
           PHASE0_BUILD_TOOL: ${{ matrix.tool }}
           PHASE0_CARGO_TARGET_DIR: ${{ runner.temp }}/phase0-target-${{ matrix.target }}
-          PHASE0_CARGO_HOME: ${{ runner.temp }}/phase0-cargo-home-${{ matrix.target }}/home
           PHASE0_RUN_ARTIFACT_DIRECT: ${{ matrix.direct }}
           PHASE0_ATTESTATION_OUT: ${{ runner.temp }}/phase0-attestation-${{ matrix.target }}.json
           PHASE0_STAGED_ENGINE_OUT: ${{ runner.temp }}/theyos-engine-${{ matrix.target }}

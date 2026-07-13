@@ -643,15 +643,13 @@ package_engine_linux() {
         info "Building the Phase 0 authority subject for ${rust_target}..."
         local authority_root="${dist_base}/.phase0-authority-${arch}"
         local authority_target="${authority_root}/target"
-        local authority_cargo_home="${authority_root}/cargo/home"
         local authority_attestation="${authority_root}/attestation.json"
         local authority_engine="${authority_root}/theyos-engine"
         rm -rf "${authority_root}"
-        mkdir -p "${authority_target}" "${authority_cargo_home}"
+        mkdir -p "${authority_target}"
         PHASE0_TARGET="${rust_target}" \
         PHASE0_BUILD_TOOL=cross \
         PHASE0_CARGO_TARGET_DIR="${authority_target}" \
-        PHASE0_CARGO_HOME="${authority_cargo_home}" \
         PHASE0_RUN_ARTIFACT_DIRECT=1 \
         PHASE0_ATTESTATION_OUT="${authority_attestation}" \
         PHASE0_STAGED_ENGINE_OUT="${authority_engine}" \
