@@ -874,7 +874,7 @@ for mac_toolchain_file in \
   done
 done
 for nix_binding in \
-  'nix build .#theyos-runtime' \
+  '.#theyos-runtime' \
   'nix path-info --recursive --json' \
   'nix flake archive --json' \
   '--offline --no-link --no-write-lock-file' \
