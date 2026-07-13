@@ -55,7 +55,10 @@ BUILD_SOURCE_PARENT="${TMP_ROOT}/build-source-parent"
 BUILD_SNAPSHOT="${BUILD_SOURCE_PARENT}/source"
 mkdir -p "${BUILD_SNAPSHOT}"
 git -C "${THEYOS_DIR}" archive --format=tar "${HEAD_SHA}" \
-  admin/rust claws flake.lock flake.nix nix scripts \
+  admin/rust \
+  admin/contracts/claw-store/v1/contract.json \
+  admin/contracts/mobile-claw-vpn/v1/owner_present_success_wire_v1.json \
+  claws flake.lock flake.nix nix scripts \
   | tar -xf - -C "${BUILD_SNAPSHOT}"
 BUILD_SNAPSHOT="$(cd "${BUILD_SNAPSHOT}" && pwd -P)"
 chmod -R a-w "${BUILD_SNAPSHOT}"
@@ -135,7 +138,10 @@ verify_build_snapshot_matches_odb() {
   rm -rf "${verification_snapshot}"
   mkdir -p "${verification_snapshot}"
   git -C "${THEYOS_DIR}" archive --format=tar "${HEAD_SHA}" \
-    admin/rust claws flake.lock flake.nix nix scripts \
+    admin/rust \
+    admin/contracts/claw-store/v1/contract.json \
+    admin/contracts/mobile-claw-vpn/v1/owner_present_success_wire_v1.json \
+    claws flake.lock flake.nix nix scripts \
     | tar -xf - -C "${verification_snapshot}"
   if ! diff -qr "${BUILD_SNAPSHOT}" "${verification_snapshot}" >/dev/null; then
     echo "::error::build mutated the closed-input source snapshot"
@@ -581,13 +587,15 @@ validate_boundary_manifest() {
     count=$((count + 1))
   done < "${manifest}"
 
-  if [[ "${count}" -ne 6 ]]; then
-    echo "::error file=${BOUNDARY_REL}::signed Phase 0 boundary must contain exactly six closed inputs"
+  if [[ "${count}" -ne 8 ]]; then
+    echo "::error file=${BOUNDARY_REL}::signed Phase 0 boundary must contain exactly eight closed inputs"
     exit 1
   fi
 
   for path in \
     "admin/rust" \
+    "admin/contracts/claw-store/v1/contract.json" \
+    "admin/contracts/mobile-claw-vpn/v1/owner_present_success_wire_v1.json" \
     "claws" \
     "flake.lock" \
     "flake.nix" \
@@ -1479,9 +1487,11 @@ fi
 repo_dep_count=0
 while IFS= read -r -d '' repo_input; do
   case "${repo_input}" in
-    admin/rust/*|claws/*|nix/*|scripts/*|flake.nix|flake.lock) ;;
-    *)
-      echo "::error file=${repo_input}::production depfile input escapes the six closed Git inputs"
+    admin/rust/*|nix/*|scripts/*|flake.nix|flake.lock|\
+    admin/contracts/claw-store/v1/contract.json|\
+    admin/contracts/mobile-claw-vpn/v1/owner_present_success_wire_v1.json) ;;
+  *)
+      echo "::error file=${repo_input}::production depfile input escapes the eight closed Git inputs"
       exit 1
       ;;
   esac
