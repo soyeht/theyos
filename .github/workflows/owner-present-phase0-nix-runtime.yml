@@ -29,29 +29,51 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          assert_equal() {
+            local label="$1" expected="$2" actual="$3"
+            if [[ "$expected" != "$actual" ]]; then
+              echo "Phase 0 Nix assertion failed: $label" >&2
+              printf 'expected=%s\nactual=%s\n' "$expected" "$actual" >&2
+              exit 1
+            fi
+          }
+          assert_executable() {
+            local path="$1"
+            if [[ ! -x "$path" ]]; then
+              echo "Phase 0 Nix executable missing or not executable: $path" >&2
+              exit 1
+            fi
+          }
           test -f flake.lock
           test -f nix/packages/rust-workspace.nix
           export NIX_CONFIG=$'experimental-features = nix-command flakes\n'
           nix flake archive --json --no-write-lock-file . > phase0-nix-input-closure.json
           ONLINE_OUT_PATH="$(nix build --no-link --no-write-lock-file .#theyos-runtime --print-out-paths)"
+          echo "Phase 0 Nix online output: ${ONLINE_OUT_PATH}"
           # The root output is built locally and is therefore not expected to
           # carry a binary-cache signature. Verify NAR/content integrity here;
           # cache trust is a separate concern from this source-bound build.
           nix store verify --recursive --no-trust "$ONLINE_OUT_PATH"
           export NIX_CONFIG=$'experimental-features = nix-command flakes\nsubstituters =\ntrusted-public-keys =\n'
           OUT_PATH="$(nix build --offline --no-link --no-write-lock-file .#theyos-runtime --print-out-paths)"
-          test "$OUT_PATH" = "$ONLINE_OUT_PATH"
-          test -x "$OUT_PATH/bin/server"
-          test -x "$OUT_PATH/bin/theyos-llm-proxy"
-          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          echo "Phase 0 Nix offline output: ${OUT_PATH}"
+          assert_equal "online/offline output path" "$ONLINE_OUT_PATH" "$OUT_PATH"
+          assert_executable "$OUT_PATH/bin/server"
+          assert_executable "$OUT_PATH/bin/theyos-llm-proxy"
+          assert_equal "checkout SHA" "$GITHUB_SHA" "$(git rev-parse HEAD)"
           SOURCE_TREE="$(git rev-parse HEAD^{tree})"
-          test "$(sha256sum flake.lock | awk '{print $1}')" = \
+          assert_equal "flake.lock hash" \
+            "$(sha256sum flake.lock | awk '{print $1}')" \
             "$(jq -r '.flake_lock_sha256' "$OUT_PATH/phase0-runtime-manifest.json")"
-          jq -e '
-            .artifact_contract == "all-published-nix-executables-v1"
-            and (.executables | type == "object" and has("server") and has("theyos-llm-proxy"))
-            and all(.executables[]; (.sha256 | test("^[0-9a-f]{64}$")))
-          ' "$OUT_PATH/phase0-runtime-manifest.json" >/dev/null
+          if ! jq -e '
+              .artifact_contract == "all-published-nix-executables-v1"
+              and (.executables | type == "object" and has("server") and has("theyos-llm-proxy"))
+              and all(.executables[]; (.sha256 | test("^[0-9a-f]{64}$")))
+            ' "$OUT_PATH/phase0-runtime-manifest.json" >/dev/null; then
+            echo "Phase 0 Nix runtime manifest contract failed:" >&2
+            jq . "$OUT_PATH/phase0-runtime-manifest.json" >&2
+            exit 1
+          fi
           while IFS=$'\t' read -r executable expected classification; do
             case "$executable" in
               ''|*/*|*..*)
@@ -59,29 +81,41 @@ jobs:
                 exit 1
                 ;;
             esac
-            test -x "$OUT_PATH/bin/$executable"
-            test "$(sha256sum "$OUT_PATH/bin/$executable" | awk '{print $1}')" = "$expected"
-            test -n "$classification"
+            assert_executable "$OUT_PATH/bin/$executable"
+            assert_equal "${executable} hash" "$expected" \
+              "$(sha256sum "$OUT_PATH/bin/$executable" | awk '{print $1}')"
+            if [[ -z "$classification" ]]; then
+              echo "Phase 0 Nix executable classification is empty: $executable" >&2
+              exit 1
+            fi
           done < <(jq -r '.executables | to_entries[] | [.key,.value.sha256,.value.classification] | @tsv' "$OUT_PATH/phase0-runtime-manifest.json")
-          "$OUT_PATH/bin/server" --owner-present-phase0-contract \
-            | jq -e '
-              .authority == "none"
-              and .production_activation == false
-              and .third_target_injection_seam_compiled == false
+          SERVER_CONTRACT="$("$OUT_PATH/bin/server" --owner-present-phase0-contract)"
+          if ! jq -e '
+            .authority == "none"
+            and .production_activation == false
+            and .third_target_injection_seam_compiled == false
               and .generic_ip_tunnel_backend_compiled == false
               and .generic_ip_tunnel_store_accepts_resource == false
-              and .generic_ip_tunnel_env_accepts_resource == false
-              and .declared_product_a_routes == ["/claw-vpn/status"]
-            ' >/dev/null
-          "$OUT_PATH/bin/theyos-llm-proxy" --owner-present-phase0-contract \
-            | jq -e '
-              .authority == "none"
-              and .production_activation == false
-              and .allowed_requests == [
+            and .generic_ip_tunnel_env_accepts_resource == false
+            and .declared_product_a_routes == ["/claw-vpn/status"]
+            ' <<<"$SERVER_CONTRACT" >/dev/null; then
+            echo "Phase 0 Nix server contract failed:" >&2
+            printf '%s\n' "$SERVER_CONTRACT" >&2
+            exit 1
+          fi
+          PROXY_CONTRACT="$("$OUT_PATH/bin/theyos-llm-proxy" --owner-present-phase0-contract)"
+          if ! jq -e '
+            .authority == "none"
+            and .production_activation == false
+            and .allowed_requests == [
                 {"method":"GET","path":"/api/v1/mobile/claw-vpn/status"},
-                {"method":"HEAD","path":"/api/v1/mobile/claw-vpn/status"}
-              ]
-            ' >/dev/null
+              {"method":"HEAD","path":"/api/v1/mobile/claw-vpn/status"}
+            ]
+            ' <<<"$PROXY_CONTRACT" >/dev/null; then
+            echo "Phase 0 Nix proxy contract failed:" >&2
+            printf '%s\n' "$PROXY_CONTRACT" >&2
+            exit 1
+          fi
           nix path-info --recursive --json "$OUT_PATH" > phase0-nix-store-closure.json
           CLOSURE_SHA256="$(sha256sum phase0-nix-store-closure.json | awk '{print $1}')"
           INPUT_CLOSURE_SHA256="$(sha256sum phase0-nix-input-closure.json | awk '{print $1}')"
