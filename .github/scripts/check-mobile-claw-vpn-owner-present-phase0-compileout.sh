@@ -175,10 +175,12 @@ is_unsafe_parent_build_env() {
   case "${name}" in
     CARGO_TARGET_DIR|PKG_CONFIG_PATH|RUSTUP_TOOLCHAIN) return 1 ;;
     AR|BINDGEN_EXTRA_CLANG_ARGS|CC|CFLAGS|CPP|CPPFLAGS|CXX|CXXFLAGS|\
-    DEVELOPER_DIR|DOCKER_OPTS|LD|LDFLAGS|MACOSX_DEPLOYMENT_TARGET|RANLIB|\
+    DEVELOPER_DIR|DOCKER_*|HTTP_PROXY|HTTPS_PROXY|ALL_PROXY|NO_PROXY|\
+    http_proxy|https_proxy|all_proxy|no_proxy|DOCKER_OPTS|LD|LDFLAGS|\
+    MACOSX_DEPLOYMENT_TARGET|RANLIB|\
     RUSTFLAGS|RUSTDOCFLAGS|SDKROOT|CARGO_ENCODED_RUSTFLAGS|RUSTC|RUSTDOC|\
     RUSTC_WRAPPER|RUSTC_WORKSPACE_WRAPPER|CARGO_BUILD_*|CARGO_PROFILE_*|\
-    CARGO_TARGET_*|CROSS_*|AR_*|CC_*|CFLAGS_*|CXX_*|CXXFLAGS_*|\
+    CARGO_TARGET_*|CROSS_*|CROSS_CONTAINER_OPTS|AR_*|CC_*|CFLAGS_*|CXX_*|CXXFLAGS_*|\
     LDFLAGS_*|PKG_CONFIG_*|*_AR|*_CC|*_CFLAGS|*_CXX|*_CXXFLAGS|*_LD|\
     *_LDFLAGS|*_RANLIB) return 0 ;;
     *) return 1 ;;
@@ -256,6 +258,7 @@ PYTHON_BIN="$(resolve_executable python3)"
 CANONICAL_PATH="$(dirname "${RUSTC_BIN}"):$(dirname "${CARGO_BIN}"):$(dirname "${RUSTUP_BIN}"):$(dirname "${BUILD_TOOL_BIN}"):$(dirname "${PYTHON_BIN}"):/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin"
 CLEAN_HOME="${TMP_ROOT}/home"
 CLEAN_TMP="${TMP_ROOT}/tmp"
+DOCKER_CONFIG_DIR="${TMP_ROOT}/docker-config"
 LOCAL_DOCKER_ENV=()
 if [[ -n "${PHASE0_DOCKER_HOST:-}" ]]; then
   if [[ "${PHASE0_LOCAL_DIAGNOSTIC:-0}" != "1" \
@@ -271,6 +274,7 @@ if [[ -e "${CARGO_HOME_DIR}" && -n "$(find "${CARGO_HOME_DIR}" -mindepth 1 -prin
 fi
 mkdir -p "${CLEAN_HOME}" "${CLEAN_TMP}" "${TARGET_DIR}"
 mkdir -p "${CARGO_HOME_DIR}"
+mkdir -p "${DOCKER_CONFIG_DIR}"
 GENERATED_OUTPUT_DIR="${TARGET_DIR}/phase0-generated"
 mkdir -p "${GENERATED_OUTPUT_DIR}"
 if find "${CARGO_HOME_DIR}" -type l -print -quit 2>/dev/null | grep -q .; then
@@ -416,7 +420,12 @@ if [[ "${BUILD_TOOL}" == "cross" ]]; then
     else
       cargo_home_mount+=",readonly=false"
     fi
-    "${BUILD_TOOL_BIN}" run \
+    "${ENV_BIN}" -i \
+      HOME="${CLEAN_HOME}" \
+      TMPDIR="${CLEAN_TMP}" \
+      PATH="${CANONICAL_PATH}" \
+      DOCKER_CONFIG="${DOCKER_CONFIG_DIR}" \
+      "${BUILD_TOOL_BIN}" run \
       --rm \
       --platform linux/amd64 \
       --network "${network_mode}" \
@@ -1228,7 +1237,7 @@ if [[ "$(jq -r '.contract' "${AUTHORITY_STATUS}")" != \
   || "$(jq -r '.phase0_artifact_boundary.format' "${AUTHORITY_STATUS}")" != \
     "closed-git-inputs-v2" \
   || "$(jq -r '.phase0_artifact_boundary.policy_change_control' "${AUTHORITY_STATUS}")" != \
-    "explicit-owner-approved-versioned-transition" \
+    "base-owned-proof-machinery-commit-bound-inputs" \
   || "$(jq -r '.phase0_artifact_boundary.object_identity_update' "${AUTHORITY_STATUS}")" != \
     "per-reviewed-commit-revalidation" \
   || "$(jq -r '.phase0_artifact_boundary.object_identity_authority' "${AUTHORITY_STATUS}")" != \

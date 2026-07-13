@@ -136,7 +136,7 @@ if [[ "$(jq -r '.contract' "${HEAD_STATUS}")" != \
   || "$(jq -r '.phase0_artifact_boundary.format' "${HEAD_STATUS}")" != \
     "closed-git-inputs-v2" \
   || "$(jq -r '.phase0_artifact_boundary.policy_change_control' "${HEAD_STATUS}")" != \
-    "explicit-owner-approved-versioned-transition" \
+    "base-owned-proof-machinery-commit-bound-inputs" \
   || "$(jq -r '.phase0_artifact_boundary.object_identity_update' "${HEAD_STATUS}")" != \
     "per-reviewed-commit-revalidation" \
   || "$(jq -r '.phase0_artifact_boundary.object_identity_authority' "${HEAD_STATUS}")" != \

@@ -100,7 +100,7 @@ TSV
   "phase0_artifact_boundary": {
     "theyos_path": "${BOUNDARY_REL}",
     "format": "closed-git-inputs-v2",
-    "policy_change_control": "explicit-owner-approved-versioned-transition",
+    "policy_change_control": "base-owned-proof-machinery-commit-bound-inputs",
     "object_identity_update": "per-reviewed-commit-revalidation",
     "object_identity_authority": "commit-bound-evidence-not-independent-approval",
     "release_provenance": "checker-on-release-subject-and-final-package-attestation",

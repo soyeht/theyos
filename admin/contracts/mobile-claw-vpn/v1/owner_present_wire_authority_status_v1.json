@@ -34,7 +34,7 @@
   "phase0_artifact_boundary": {
     "theyos_path": "admin/contracts/mobile-claw-vpn/v1/owner_present_phase0_artifact_boundary_v1.tsv",
     "format": "closed-git-inputs-v2",
-    "policy_change_control": "explicit-owner-approved-versioned-transition",
+    "policy_change_control": "base-owned-proof-machinery-commit-bound-inputs",
     "object_identity_update": "per-reviewed-commit-revalidation",
     "object_identity_authority": "commit-bound-evidence-not-independent-approval",
     "release_provenance": "checker-on-release-subject-and-final-package-attestation",
@@ -63,6 +63,8 @@
     ]
   },
   "notes": [
+    "The base-owned policy freezes proof machinery; build inputs and the boundary descriptor are revalidated per reviewed commit and are not independent approval.",
+    "Changing proof machinery requires a separately reviewed owner-authorized bootstrap transition.",
     "The V1 success fixture remains only as immutable cross-language regression evidence.",
     "The V1 api_shapes dependency is historical regression evidence and is not a source of truth for Phase 1.",
     "Neither owner_present_error_wire_v1 nor a V1 activation marker authorizes runtime, client, handler, issuer, or route wiring.",

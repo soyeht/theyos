@@ -168,6 +168,18 @@ codesign_macos_binaries() {
         return 0
     fi
 
+    # The legacy `package` command builds from the ambient workspace and has
+    # no Phase 0 subject manifest. Keep it useful for ad-hoc development, but
+    # make it impossible for that path to create a real signed/notarized
+    # artifact. Production signing is only available through
+    # `package-soyeht-mac`, which verifies the complete Phase 0 subject first.
+    if [ -n "${THEYOS_CODESIGN_IDENTITY:-}" ] || \
+        [ -n "${APPLE_NOTARY_KEY_P8:-}" ] || \
+        [ -n "${APPLE_NOTARY_KEY_ID:-}" ] || \
+        [ -n "${APPLE_NOTARY_ISSUER_ID:-}" ]; then
+        error "legacy package cannot perform real macOS signing/notarization; use package-soyeht-mac with a verified Phase 0 subject"
+    fi
+
     local stage_dir="${REPO_ROOT}/.deploy-staging/${PLATFORM}"
     local entitlements="${SCRIPT_DIR}/entitlements/vmrunner-macos.entitlements"
 
@@ -256,6 +268,12 @@ codesign_macos_binaries() {
 notarize_macos() {
     if [ "${PLATFORM}" != "macos-arm64" ] && [ "${PLATFORM}" != "macos-intel" ]; then
         return 0
+    fi
+    if [ -n "${THEYOS_CODESIGN_IDENTITY:-}" ] || \
+        [ -n "${APPLE_NOTARY_KEY_P8:-}" ] || \
+        [ -n "${APPLE_NOTARY_KEY_ID:-}" ] || \
+        [ -n "${APPLE_NOTARY_ISSUER_ID:-}" ]; then
+        error "legacy package cannot notarize an ambient build; use package-soyeht-mac with a verified Phase 0 subject"
     fi
     if [ -z "${THEYOS_CODESIGN_IDENTITY:-}" ]; then
         info "Skipping notarization (THEYOS_CODESIGN_IDENTITY unset; ad-hoc binaries can't be notarized)"

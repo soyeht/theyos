@@ -177,6 +177,24 @@ fi
 grep -Fq "CROSS_CONTAINER_OPTS must be unset" "${TMP_ROOT}/cross-env.log"
 echo "PASS external_cross_container_opts_refused"
 
+for docker_override in \
+  "DOCKER_HOST=tcp://127.0.0.1:1" \
+  "DOCKER_CONTEXT=untrusted-context" \
+  "DOCKER_CONFIG=${TMP_ROOT}/untrusted-docker-config"; do
+  docker_name="${docker_override%%=*}"
+  if env "${docker_override}" \
+      PHASE0_TARGET="${MUTATION_TARGET}" \
+      PHASE0_BUILD_TOOL="${MUTATION_BUILD_TOOL}" \
+      PHASE0_CARGO_HOME="${CHECKER_CARGO_HOME}" \
+      PHASE0_CARGO_TARGET_DIR="${SHARED_TARGET}" \
+      "${REPO_ROOT}/${CHECKER_REL}" >"${TMP_ROOT}/${docker_name}.log" 2>&1; then
+    echo "error: canonical build accepted external ${docker_name}" >&2
+    exit 1
+  fi
+  grep -Fq "${docker_name} must be unset" "${TMP_ROOT}/${docker_name}.log"
+  echo "PASS ${docker_name}_refused"
+done
+
 if CARGO_TARGET_AARCH64_APPLE_DARWIN_RUSTFLAGS='--cfg feature="dev_t1_datapath" --cfg feature="dev_claw_share_mint" -C debug-assertions=yes' \
     CARGO_TARGET_DIR="${SHARED_TARGET}" \
     "${BUILD_TOOL_BIN}" build "${HOST_TARGET}" cargo \
