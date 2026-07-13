@@ -635,6 +635,8 @@ if [[ "${BUILD_TOOL}" == "cross" ]]; then
       --env RUSTUP_HOME=/phase0-rustup \
       --env CARGO_TARGET_DIR=/target \
       --env TMPDIR=/tmp \
+      --env LC_ALL=C \
+      --env LANG=C \
       --env "CARGO_NET_OFFLINE=${offline}" \
       --env CARGO_INCREMENTAL=0 \
       --env "${CROSS_LINKER_ENV_NAME}=${CROSS_LINKER_ENV_VALUE}" \
