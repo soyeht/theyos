@@ -116,6 +116,11 @@ in
         test -x "target/release/$executable"
         install -m 0755 "target/release/$executable" "$out/bin/$executable"
       done
+    '';
+
+    # Nix fixup may strip or otherwise normalize ELF outputs after postInstall.
+    # The Phase 0 manifest must describe the final bytes that leave the store.
+    postFixup = ''
       test -x "$out/bin/server"
       test -x "$out/bin/theyos-llm-proxy"
       for executable in "$out"/bin/*; do
