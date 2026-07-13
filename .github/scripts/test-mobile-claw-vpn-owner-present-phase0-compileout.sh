@@ -209,6 +209,11 @@ for fake_tool in rustc rustup docker; do
     > "${FAKE_TOOL_BIN}/${fake_tool}"
   chmod 755 "${FAKE_TOOL_BIN}/${fake_tool}"
 done
+GIT_WRAPPER_LOG="${TMP_ROOT}/ambient-git-invoked.log"
+printf '%s\n' '#!/bin/sh' \
+  'printf "%s\\n" ambient-git-invoked >> "${GIT_WRAPPER_LOG}"' \
+  'exec /usr/bin/git "$@"' > "${FAKE_TOOL_BIN}/git"
+chmod 755 "${FAKE_TOOL_BIN}/git"
 if PATH="${FAKE_TOOL_BIN}:${PATH}" \
     PHASE0_TARGET=unsupported-phase0-target \
     PHASE0_BUILD_TOOL=cargo \
@@ -224,6 +229,23 @@ if grep -Eq 'fake-(rustc|rustup|docker)' "${TMP_ROOT}/path-tools.log"; then
 fi
 grep -Fq "unsupported Phase 0 target/build-tool pair" "${TMP_ROOT}/path-tools.log"
 echo "PASS path_tool_injection_ignored"
+
+if PATH="${FAKE_TOOL_BIN}:${PATH}" \
+    PHASE0_TARGET=unsupported-phase0-target \
+    PHASE0_BUILD_TOOL=cargo \
+    PHASE0_CARGO_TARGET_DIR="${SHARED_TARGET}" \
+    GIT_WRAPPER_LOG="${GIT_WRAPPER_LOG}" \
+    "${REPO_ROOT}/${CHECKER_REL}" >"${TMP_ROOT}/path-git.log" 2>&1; then
+  echo "error: canonical build accepted an unsupported target with a PATH Git wrapper" >&2
+  exit 1
+fi
+if [[ -s "${GIT_WRAPPER_LOG}" ]]; then
+  echo "error: canonical source selection executed a PATH-provided Git wrapper" >&2
+  cat "${GIT_WRAPPER_LOG}" >&2
+  exit 1
+fi
+grep -Fq "unsupported Phase 0 target/build-tool pair" "${TMP_ROOT}/path-git.log"
+echo "PASS path_git_injection_ignored"
 
 if [[ -x /usr/bin/docker ]]; then
   if PATH="${FAKE_TOOL_BIN}:${PATH}" \

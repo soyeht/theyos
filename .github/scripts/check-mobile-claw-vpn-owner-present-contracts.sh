@@ -153,7 +153,7 @@ if [[ "$(jq -r '.contract' "${HEAD_STATUS}")" != \
     "base-owned-integrity-checker" \
   || "$(jq -r '.proof_machinery_transition.state' "${HEAD_STATUS}")" != "unarmed" \
   || "$(jq -r '.proof_machinery_transition.arming' "${HEAD_STATUS}")" != \
-    "owner-reviewed-commit-changes-only-transition-auth-and-policy" \
+    "github-owner-review-on-exact-arm-commit" \
   || "$(jq -r '.proof_machinery_transition.consumption' "${HEAD_STATUS}")" != \
     "one-shot-exact-tree-and-policy-oid-removes-transition-auth" \
   || "$(jq -r '.proof_machinery_transition.canary' "${HEAD_STATUS}")" != \

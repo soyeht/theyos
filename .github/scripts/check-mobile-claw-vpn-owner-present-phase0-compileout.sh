@@ -9,6 +9,47 @@ THEYOS_DIR_INPUT="${1:-${DEFAULT_ROOT}}"
 THEYOS_DIR="$(cd "${THEYOS_DIR_INPUT}" && pwd -P)"
 BUILD_TOOL="${PHASE0_BUILD_TOOL:-cargo}"
 
+resolve_fixed_executable() {
+  local candidate="$1" resolved candidate_dir candidate_base current target target_dir depth
+  if [[ "${candidate}" != /* || ! -x "${candidate}" ]]; then
+    echo "::error::canonical Phase 0 tool is unavailable at its fixed absolute path: ${candidate}"
+    exit 1
+  fi
+  candidate_dir="${candidate%/*}"
+  candidate_base="${candidate##*/}"
+  current="$(cd "${candidate_dir}" && pwd -P)/${candidate_base}"
+  for depth in 1 2 3 4 5 6 7 8; do
+    if [[ ! -L "${current}" ]]; then
+      [[ -x "${current}" && -f "${current}" ]] || {
+        echo "::error::canonical Phase 0 tool resolved to a non-regular executable: ${candidate}"
+        exit 1
+      }
+      printf '%s\n' "${candidate}"
+      return 0
+    fi
+    target="$(/usr/bin/readlink "${current}")"
+    [[ -n "${target}" ]] || {
+      echo "::error::canonical Phase 0 tool has an unreadable symlink: ${candidate}"
+      exit 1
+    }
+    if [[ "${target}" == /* ]]; then
+      current="${target}"
+    else
+      target_dir="${current%/*}"
+      current="${target_dir}/${target}"
+    fi
+    current="$(cd "${current%/*}" && pwd -P)/${current##*/}"
+  done
+  echo "::error::canonical Phase 0 tool symlink chain is too deep: ${candidate}"
+  exit 1
+}
+
+# Resolve source/archive primitives before any HEAD, status, or snapshot
+# operation. A caller-controlled PATH must never choose the ODB authority.
+GIT_BIN="$(resolve_fixed_executable /usr/bin/git)"
+TAR_BIN="$(resolve_fixed_executable /usr/bin/tar)"
+git() { "${GIT_BIN}" "$@"; }
+
 FOUNDATION_REL="admin/rust/server-rs/src/mobile_claw_vpn_owner_present_foundation.rs"
 PHASE0_REL="admin/rust/server-rs/src/mobile_claw_vpn_phase0.rs"
 MANIFEST_REL="admin/rust/Cargo.toml"
@@ -43,7 +84,7 @@ SNAPSHOT_PARENT="${TMP_ROOT}/snapshot-parent"
 SNAPSHOT="${SNAPSHOT_PARENT}/source"
 mkdir -p "${SNAPSHOT}"
 git -C "${THEYOS_DIR}" archive --format=tar "${HEAD_SHA}" \
-  | tar -xf - -C "${SNAPSHOT}"
+  | "${TAR_BIN}" -xf - -C "${SNAPSHOT}"
 SNAPSHOT="$(cd "${SNAPSHOT}" && pwd -P)"
 chmod -R a-w "${SNAPSHOT}"
 
@@ -59,7 +100,7 @@ git -C "${THEYOS_DIR}" archive --format=tar "${HEAD_SHA}" \
   admin/contracts/claw-store/v1/contract.json \
   admin/contracts/mobile-claw-vpn/v1/owner_present_success_wire_v1.json \
   claws flake.lock flake.nix nix scripts \
-  | tar -xf - -C "${BUILD_SNAPSHOT}"
+  | "${TAR_BIN}" -xf - -C "${BUILD_SNAPSHOT}"
 BUILD_SNAPSHOT="$(cd "${BUILD_SNAPSHOT}" && pwd -P)"
 chmod -R a-w "${BUILD_SNAPSHOT}"
 
@@ -125,7 +166,7 @@ verify_snapshot_matches_odb() {
   rm -rf "${verification_snapshot}"
   mkdir -p "${verification_snapshot}"
   git -C "${THEYOS_DIR}" archive --format=tar "${HEAD_SHA}" \
-    | tar -xf - -C "${verification_snapshot}"
+    | "${TAR_BIN}" -xf - -C "${verification_snapshot}"
   if ! diff -qr "${SNAPSHOT}" "${verification_snapshot}" >/dev/null; then
     echo "::error::build mutated the ODB-derived source snapshot"
     diff -qr "${SNAPSHOT}" "${verification_snapshot}" || true
@@ -142,7 +183,7 @@ verify_build_snapshot_matches_odb() {
     admin/contracts/claw-store/v1/contract.json \
     admin/contracts/mobile-claw-vpn/v1/owner_present_success_wire_v1.json \
     claws flake.lock flake.nix nix scripts \
-    | tar -xf - -C "${verification_snapshot}"
+    | "${TAR_BIN}" -xf - -C "${verification_snapshot}"
   if ! diff -qr "${BUILD_SNAPSHOT}" "${verification_snapshot}" >/dev/null; then
     echo "::error::build mutated the closed-input source snapshot"
     diff -qr "${BUILD_SNAPSHOT}" "${verification_snapshot}" || true
@@ -156,41 +197,6 @@ sha256_file() {
   else
     /usr/bin/shasum -a 256 "$1" | /usr/bin/awk '{print $1}'
   fi
-}
-
-resolve_fixed_executable() {
-  local candidate="$1" resolved candidate_dir candidate_base current target target_dir depth
-  if [[ "${candidate}" != /* || ! -x "${candidate}" ]]; then
-    echo "::error::canonical Phase 0 tool is unavailable at its fixed absolute path: ${candidate}"
-    exit 1
-  fi
-  candidate_dir="${candidate%/*}"
-  candidate_base="${candidate##*/}"
-  current="$(cd "${candidate_dir}" && pwd -P)/${candidate_base}"
-  for depth in 1 2 3 4 5 6 7 8; do
-    if [[ ! -L "${current}" ]]; then
-      [[ -x "${current}" && -f "${current}" ]] || {
-        echo "::error::canonical Phase 0 tool resolved to a non-regular executable: ${candidate}"
-        exit 1
-      }
-      printf '%s\n' "${candidate}"
-      return 0
-    fi
-    target="$(/usr/bin/readlink "${current}")"
-    [[ -n "${target}" ]] || {
-      echo "::error::canonical Phase 0 tool has an unreadable symlink: ${candidate}"
-      exit 1
-    }
-    if [[ "${target}" == /* ]]; then
-      current="${target}"
-    else
-      target_dir="${current%/*}"
-      current="${target_dir}/${target}"
-    fi
-    current="$(cd "${current%/*}" && pwd -P)/${current##*/}"
-  done
-  echo "::error::canonical Phase 0 tool symlink chain is too deep: ${candidate}"
-  exit 1
 }
 
 resolve_toolchain_executable() {
@@ -1314,7 +1320,7 @@ if [[ "$(jq -r '.contract' "${AUTHORITY_STATUS}")" != \
     "base-owned-integrity-checker" \
   || "$(jq -r '.proof_machinery_transition.state' "${AUTHORITY_STATUS}")" != "unarmed" \
   || "$(jq -r '.proof_machinery_transition.arming' "${AUTHORITY_STATUS}")" != \
-    "owner-reviewed-commit-changes-only-transition-auth-and-policy" \
+    "github-owner-review-on-exact-arm-commit" \
   || "$(jq -r '.proof_machinery_transition.consumption' "${AUTHORITY_STATUS}")" != \
     "one-shot-exact-tree-and-policy-oid-removes-transition-auth" \
   || "$(jq -r '.proof_machinery_transition.canary' "${AUTHORITY_STATUS}")" != \

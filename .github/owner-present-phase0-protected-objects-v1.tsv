@@ -1,15 +1,15 @@
 # mode	type	oid	transition	path
-100644	blob	b0266df92b61738dd3be22cde25fc1eaaff55f65	versioned-transition	.github/owner-present-phase0-transition-v1.json
-100755	blob	e3cadb5e9df65759bf3e0409acf260e5b618e3b2	land-exact	.github/scripts/check-mobile-claw-vpn-owner-present-contracts.sh
-100755	blob	23513493eb7316e955a920184fe0e46177ab4a8b	land-exact	.github/scripts/check-mobile-claw-vpn-owner-present-phase0-compileout.sh
-100755	blob	32af9684193fb0ec8286f9cdb038c6e081404f44	land-exact	.github/scripts/test-mobile-claw-vpn-owner-present-contracts.sh
-100755	blob	b288310f1402d1f4b31d436c58084ab2d9965997	land-exact	.github/scripts/test-mobile-claw-vpn-owner-present-phase0-compileout.sh
+100644	blob	8e8dce61adeb03913c1d0d826bfce07b9bbd1467	versioned-transition	.github/owner-present-phase0-transition-v1.json
+100755	blob	1d903e9af9dcdafc3493145d92d93c4921ea2509	land-exact	.github/scripts/check-mobile-claw-vpn-owner-present-contracts.sh
+100755	blob	47f59dde085899b0528937b3939da222f105fedf	land-exact	.github/scripts/check-mobile-claw-vpn-owner-present-phase0-compileout.sh
+100755	blob	49c66ea7576b68ad8d96c4cfb44716ed671e8dd4	land-exact	.github/scripts/test-mobile-claw-vpn-owner-present-contracts.sh
+100755	blob	103fc929e36eea46ebbf5c5ee46d20eb7f309078	land-exact	.github/scripts/test-mobile-claw-vpn-owner-present-phase0-compileout.sh
 100644	blob	d0b9229e4fe5744cb2c072ce690b29039bafc450	land-exact	.github/workflows/contracts-cross-repo-sync.yml
 100644	blob	5e781beafa3b7d54152aa8beda2aadd71503b018	land-exact	.github/workflows/owner-present-phase0-compileout.yml
 100644	blob	8ae5db96e0e72d21e829c8a582b2b74520c2ee2c	land-exact	.github/workflows/owner-present-phase0-nix-runtime.yml
 100644	blob	648806022e2c6b38880d951ff5ef71e6e42ac3fd	land-exact	.github/workflows/release-linux.yml
 100644	blob	3332c335f8b87726314ffff9558a4bacc9f9eca2	land-exact	.github/workflows/release-macos.yml
-100644	blob	22d5bb6a2bccf756f2e481dec4ac4015ed955ef8	land-exact	admin/contracts/mobile-claw-vpn/v1/owner_present_wire_authority_status_v1.json
+100644	blob	1d5286bb205d86c48b5898313cfb2060b68333e0	land-exact	admin/contracts/mobile-claw-vpn/v1/owner_present_wire_authority_status_v1.json
 100644	blob	42fa6a42c33535a3fded0a0e4210a80e3791b660	land-exact	admin/rust/.cargo/config.toml
 100644	blob	4cff2a1b3f165bbaa928e3d58d6c3d505be4c147	land-exact	admin/rust/Cross.toml
 100644	blob	a03ce9608c6081a596dbf51b7134b78ed68d3cd6	land-exact	admin/rust/clippy.toml

@@ -31,9 +31,15 @@ cat > "${REPO}/${TRANSITION_AUTH_REL}" <<'JSON'
   "state": "unarmed",
   "generation": 0,
   "owner_authorization": {
-    "mode": "protected-base-owner-arming-commit",
+    "mode": "github-owner-review-exact-arm-commit",
     "requires_owner_review": true,
     "requires_required_integrity_check": true,
+    "owner_review": {
+      "provider": "github",
+      "required_author_association": "OWNER",
+      "binds_to": "exact-arm-head-sha",
+      "latest_review_only": true
+    },
     "canary": "arm-then-consume-merge-blocked-and-allowed",
     "anti_replay": "base-sha-expected-head-tree-generation-one-shot-consumption"
   }
@@ -108,9 +114,15 @@ cat > "${REPO}/${TRANSITION_AUTH_REL}" <<JSON
     "protected/future-1.txt"
   ],
   "owner_authorization": {
-    "mode": "protected-base-owner-arming-commit",
+    "mode": "github-owner-review-exact-arm-commit",
     "requires_owner_review": true,
     "requires_required_integrity_check": true,
+    "owner_review": {
+      "provider": "github",
+      "required_author_association": "OWNER",
+      "binds_to": "exact-arm-head-sha",
+      "latest_review_only": true
+    },
     "canary": "arm-then-consume-merge-blocked-and-allowed",
     "anti_replay": "base-sha-expected-head-tree-generation-one-shot-consumption"
   }
@@ -125,12 +137,84 @@ git -C "${REPO}" add "${TRANSITION_AUTH_REL}"
 git -C "${REPO}" add "${POLICY_REL}"
 git -C "${REPO}" commit --quiet -m transition-arm
 ARM_HEAD="$(git -C "${REPO}" rev-parse HEAD)"
+OWNER_REVIEW_JSON="${TMP_ROOT}/owner-review.json"
+cat > "${OWNER_REVIEW_JSON}" <<JSON
+[
+  {
+    "user": {"id": 1},
+    "author_association": "OWNER",
+    "state": "APPROVED",
+    "commit_id": "${ARM_HEAD}",
+    "submitted_at": "2026-01-01T00:00:00Z"
+  }
+]
+JSON
 git -C "${REPO}" switch --quiet --detach "${HEAD_OK}"
 PHASE0_INTEGRITY_LOCAL_TEST=1 \
+PHASE0_INTEGRITY_OWNER_REVIEW_JSON="${OWNER_REVIEW_JSON}" \
   "${REPO}/.github/scripts/check-mobile-claw-vpn-owner-present-phase0-integrity.sh" \
   "${REPO}" "${HEAD_OK}" "${ARM_HEAD}" 0 >/dev/null
 git -C "${REPO}" switch --quiet "${BRANCH}"
 echo "PASS transition_arm"
+
+cat > "${OWNER_REVIEW_JSON}" <<JSON
+[
+  {
+    "user": {"id": 1},
+    "author_association": "MEMBER",
+    "state": "APPROVED",
+    "commit_id": "${ARM_HEAD}",
+    "submitted_at": "2026-01-01T00:00:00Z"
+  }
+]
+JSON
+git -C "${REPO}" switch --quiet --detach "${HEAD_OK}"
+if PHASE0_INTEGRITY_LOCAL_TEST=1 \
+    PHASE0_INTEGRITY_OWNER_REVIEW_JSON="${OWNER_REVIEW_JSON}" \
+    "${REPO}/.github/scripts/check-mobile-claw-vpn-owner-present-phase0-integrity.sh" \
+    "${REPO}" "${HEAD_OK}" "${ARM_HEAD}" 0 \
+    >"${TMP_ROOT}/owner-review-non-owner.log" 2>&1; then
+  echo "error: integrity checker accepted a non-owner transition review" >&2
+  exit 1
+fi
+grep -Fq "exact arm commit lacks a current approved GitHub owner review" \
+  "${TMP_ROOT}/owner-review-non-owner.log" \
+  || { cat "${TMP_ROOT}/owner-review-non-owner.log" >&2; exit 1; }
+git -C "${REPO}" switch --quiet "${BRANCH}"
+echo "PASS owner_review_non_owner_refused"
+
+ARM_WEAKEN_PLAN="${TMP_ROOT}/transition-arm-weakening"
+git clone --quiet --shared "${REPO}" "${ARM_WEAKEN_PLAN}"
+git -C "${ARM_WEAKEN_PLAN}" switch --quiet --detach "${ARM_HEAD}"
+printf '100644\tblob\t0000000000000000000000000000000000000000\tland-exact\tprotected/unscoped.txt\n' \
+  >>"${ARM_WEAKEN_PLAN}/${POLICY_REL}"
+git -C "${ARM_WEAKEN_PLAN}" add "${POLICY_REL}"
+git -C "${ARM_WEAKEN_PLAN}" commit --quiet -m transition-arm-policy-weakening
+ARM_WEAKEN_HEAD="$(git -C "${ARM_WEAKEN_PLAN}" rev-parse HEAD)"
+cat > "${OWNER_REVIEW_JSON}" <<JSON
+[
+  {
+    "user": {"id": 1},
+    "author_association": "OWNER",
+    "state": "APPROVED",
+    "commit_id": "${ARM_WEAKEN_HEAD}",
+    "submitted_at": "2026-01-01T00:00:00Z"
+  }
+]
+JSON
+git -C "${ARM_WEAKEN_PLAN}" switch --quiet --detach "${HEAD_OK}"
+if PHASE0_INTEGRITY_LOCAL_TEST=1 \
+    PHASE0_INTEGRITY_OWNER_REVIEW_JSON="${OWNER_REVIEW_JSON}" \
+    "${ARM_WEAKEN_PLAN}/.github/scripts/check-mobile-claw-vpn-owner-present-phase0-integrity.sh" \
+    "${ARM_WEAKEN_PLAN}" "${HEAD_OK}" "${ARM_WEAKEN_HEAD}" 0 \
+    >"${TMP_ROOT}/arm-policy-weakening.log" 2>&1; then
+  echo "error: integrity checker accepted an arm policy weakening" >&2
+  exit 1
+fi
+grep -Fq "arming transition may only update the authorization OID in the base policy" \
+  "${TMP_ROOT}/arm-policy-weakening.log" \
+  || { cat "${TMP_ROOT}/arm-policy-weakening.log" >&2; exit 1; }
+echo "PASS arm_policy_weakening_refused"
 
 awk -F '\t' -v OFS='\t' -v auth="${TRANSITION_AUTH_REL}" \
   '$5 != auth { print }' \

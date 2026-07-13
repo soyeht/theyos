@@ -17,6 +17,7 @@ SELF_PATHS=(
 )
 
 TRANSITION_CONTRACT="soyeht-owner-present-proof-machinery-transition-v1"
+OWNER_REVIEW_ASSOCIATION="OWNER"
 
 die_transition() {
   echo "::error file=${TRANSITION_AUTH_REL}::$1"
@@ -40,9 +41,14 @@ validate_transition_common() {
     '.contract == $contract
       and .version == 1
       and (.owner_authorization | type == "object")
-      and .owner_authorization.mode == "protected-base-owner-arming-commit"
+      and .owner_authorization.mode == "github-owner-review-exact-arm-commit"
       and .owner_authorization.requires_owner_review == true
       and .owner_authorization.requires_required_integrity_check == true
+      and (.owner_authorization.owner_review | type == "object")
+      and .owner_authorization.owner_review.provider == "github"
+      and .owner_authorization.owner_review.required_author_association == "OWNER"
+      and .owner_authorization.owner_review.binds_to == "exact-arm-head-sha"
+      and .owner_authorization.owner_review.latest_review_only == true
       and .owner_authorization.canary == "arm-then-consume-merge-blocked-and-allowed"
       and .owner_authorization.anti_replay == "base-sha-expected-head-tree-generation-one-shot-consumption"' \
     "${file}" >/dev/null || die_transition "transition authorization metadata is invalid"
@@ -75,6 +81,47 @@ load_allowed_paths() {
     || die_transition "transition allowed path set must be sorted and unique"
 }
 
+verify_owner_approval() {
+  local reviews_file=""
+  if [[ "${PHASE0_INTEGRITY_LOCAL_TEST:-0}" == "1" ]]; then
+    reviews_file="${PHASE0_INTEGRITY_OWNER_REVIEW_JSON:-}"
+    [[ -n "${reviews_file}" && -f "${reviews_file}" ]] \
+      || die_transition "local transition test must provide an owner review fixture"
+  else
+    : "${GITHUB_TOKEN:?GITHUB_TOKEN is required for owner review verification}"
+    [[ "${PR_NUMBER}" =~ ^[1-9][0-9]*$ ]] \
+      || die_transition "pull request number is invalid for owner review verification"
+    [[ "${GITHUB_REPOSITORY:-}" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] \
+      || die_transition "repository identity is invalid for owner review verification"
+    reviews_file="$(mktemp "${TRANSITION_DIR}/reviews.XXXXXX")"
+    curl --fail --silent --show-error --location --max-time 20 \
+      -H 'Accept: application/vnd.github+json' \
+      -H 'X-GitHub-Api-Version: 2022-11-28' \
+      -H "Authorization: Bearer ${GITHUB_TOKEN}" \
+      "https://api.github.com/repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}/reviews?per_page=100" \
+      >"${reviews_file}" \
+      || die_transition "could not fetch the trusted GitHub review record"
+  fi
+
+  jq -e \
+    --arg head "${HEAD_SHA}" \
+    --arg association "${OWNER_REVIEW_ASSOCIATION}" \
+    'type == "array"
+      and ([ .[]
+        | select((.user | type) == "object")
+        | select((.user.id | type) == "number")
+        | select(.author_association == $association)
+        | select(.state == "APPROVED" or .state == "DISMISSED" or .state == "CHANGES_REQUESTED")
+      ]
+      | group_by(.user.id)
+      | map(max_by(.submitted_at // ""))
+      | any(.[]; .state == "APPROVED"
+        and .commit_id == $head
+        and .author_association == $association))' \
+    "${reviews_file}" >/dev/null \
+    || die_transition "exact arm commit lacks a current approved GitHub owner review"
+}
+
 path_is_allowed() {
   local candidate="$1"
   local allowed
@@ -90,6 +137,25 @@ changed_paths_match() {
   expected="$(printf '%s\n' "${TRANSITION_AUTH_REL}" "${ALLOWED_PATHS[@]}" | sort -u)"
   [[ "${actual}" == "${expected}" ]] \
     || die_transition "transition changed-path set does not match its exact authorization scope"
+}
+
+arm_policy_matches_base() {
+  local base_policy head_policy expected_policy head_auth_oid
+  base_policy="$(mktemp "${TRANSITION_DIR}/base-policy.XXXXXX")"
+  head_policy="$(mktemp "${TRANSITION_DIR}/head-policy.XXXXXX")"
+  expected_policy="$(mktemp "${TRANSITION_DIR}/expected-arm-policy.XXXXXX")"
+  git -C "${REPO}" cat-file blob "${BASE_SHA}:${POLICY_REL}" >"${base_policy}"
+  git -C "${REPO}" cat-file blob "${HEAD_SHA}:${POLICY_REL}" >"${head_policy}" \
+    || die_transition "arming transition policy is missing"
+  head_auth_oid="$(git -C "${REPO}" rev-parse "${HEAD_SHA}:${TRANSITION_AUTH_REL}" 2>/dev/null || true)"
+  [[ "${head_auth_oid}" =~ ^[0-9a-f]{40}$ ]] \
+    || die_transition "arming transition authorization blob is invalid"
+  awk -F '\t' -v OFS='\t' \
+    -v auth="${TRANSITION_AUTH_REL}" -v oid="${head_auth_oid}" \
+    '$5 == auth { $3 = oid } { print }' \
+    "${base_policy}" >"${expected_policy}"
+  cmp -s "${expected_policy}" "${head_policy}" \
+    || die_transition "arming transition may only update the authorization OID in the base policy"
 }
 
 if [[ ! "${BASE_SHA}" =~ ^[0-9a-f]{40}$ || ! "${HEAD_SHA}" =~ ^[0-9a-f]{40}$ ]]; then
@@ -171,6 +237,8 @@ if [[ "${HEAD_STATE}" == "armed" && ( "${BASE_STATE}" == "absent" || "${BASE_STA
   expected="$(printf '%s\n' "${TRANSITION_AUTH_REL}" "${POLICY_REL}" | sort -u)"
   [[ "${actual}" == "${expected}" ]] \
     || die_transition "arming commit may change only the transition authorization and policy objects"
+  arm_policy_matches_base
+  verify_owner_approval
   TRANSITION_MODE="arm"
 elif [[ "${BASE_STATE}" == "armed" && "${HEAD_STATE}" == "absent" ]]; then
   load_allowed_paths "${BASE_AUTH}"
