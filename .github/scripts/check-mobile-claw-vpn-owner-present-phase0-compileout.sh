@@ -194,37 +194,67 @@ verify_build_snapshot_matches_odb() {
 
 sha256_file() {
   if [[ -x /usr/bin/sha256sum ]]; then
-    /usr/bin/sha256sum "$1" | /usr/bin/awk '{print $1}'
+    PATH=/usr/bin:/bin /usr/bin/sha256sum "$1" | /usr/bin/awk '{print $1}'
   else
-    /usr/bin/shasum -a 256 "$1" | /usr/bin/awk '{print $1}'
+    PATH=/usr/bin:/bin /usr/bin/shasum -a 256 "$1" | /usr/bin/awk '{print $1}'
   fi
 }
 
-resolve_toolchain_executable() {
-  local name="$1" resolved
-  resolved="$(${ENV_BIN} -i \
-    HOME="${SYSTEM_HOME}" \
-    RUSTUP_HOME="${RUSTUP_HOME_DIR}" \
-    PATH="$(dirname "${RUSTUP_BIN}"):/usr/bin:/bin" \
-    RUSTUP_TOOLCHAIN="${EXPECTED_RUST}" \
-    "${RUSTUP_BIN}" which "${name}")"
-  if [[ "${resolved}" != /* || ! -x "${resolved}" || -L "${resolved}" ]]; then
-    echo "::error::rustup returned a non-regular absolute ${name} toolchain executable"
-    exit 1
+sha256_stream() {
+  if [[ -x /usr/bin/sha256sum ]]; then
+    PATH=/usr/bin:/bin /usr/bin/sha256sum | /usr/bin/awk '{print $1}'
+  else
+    PATH=/usr/bin:/bin /usr/bin/shasum -a 256 | /usr/bin/awk '{print $1}'
   fi
-  resolved="$(cd "$(dirname "${resolved}")" && pwd -P)/$(basename "${resolved}")"
-  [[ -x "${resolved}" && -f "${resolved}" && ! -L "${resolved}" ]] || {
-    echo "::error::rustup returned an invalid ${name} toolchain executable"
-    exit 1
-  }
-  case "${resolved}" in
-    "${RUSTUP_HOME_DIR}/toolchains/${EXPECTED_RUST}-"*/bin/${name}) ;;
+}
+
+# Hash the complete build-relevant toolchain closure before invoking any
+# rustup/rustc/cargo binary. Documentation is intentionally excluded; the
+# compiler closure is the executable, sysroot, linker, and target-spec roots.
+toolchain_closure_sha256() {
+  local root="$1" component path relative
+  local -a components=(bin etc lib libexec)
+  for component in "${components[@]}"; do
+    [[ -d "${root}/${component}" && ! -L "${root}/${component}" ]] || {
+      echo "::error::pinned Rust toolchain closure is missing ${component}" >&2
+      return 1
+    }
+  done
+  {
+    for component in "${components[@]}"; do
+      /usr/bin/find "${root}/${component}" \( -type f -o -type l \) -print
+    done
+  } | LC_ALL=C /usr/bin/sort | while IFS= read -r path; do
+    relative="${path#"${root}/"}"
+    if [[ -L "${path}" ]]; then
+      printf 'l\t%s\t%s\n' "${relative}" "$(/usr/bin/readlink "${path}")"
+    elif [[ -f "${path}" ]]; then
+      printf 'f\t%s\t%s\n' "${relative}" "$(sha256_file "${path}")"
+    else
+      echo "::error::pinned Rust toolchain closure contains a non-regular input: ${relative}" >&2
+      return 1
+    fi
+  done | sha256_stream
+}
+
+host_toolchain_triple() {
+  if [[ "${BUILD_TOOL}" == "cross" ]]; then
+    printf '%s\n' "x86_64-unknown-linux-gnu"
+    return 0
+  fi
+  case "${PHASE0_TARGET:-}" in
+    aarch64-apple-darwin) printf '%s\n' "aarch64-apple-darwin" ;;
     *)
-      echo "::error::rustup selected ${name} outside the frozen Rust toolchain root"
-      exit 1
+      case "$(/usr/bin/uname -s):$(/usr/bin/uname -m)" in
+        Darwin:arm64) printf '%s\n' "aarch64-apple-darwin" ;;
+        Linux:x86_64) printf '%s\n' "x86_64-unknown-linux-gnu" ;;
+        *)
+          echo "::error::cannot derive the frozen host Rust toolchain triple" >&2
+          return 1
+          ;;
+      esac
       ;;
   esac
-  printf '%s\n' "${resolved}"
 }
 
 is_unsafe_parent_build_env() {
@@ -307,9 +337,22 @@ if [[ ! -x "${ENV_BIN}" ]]; then
   echo "::error::canonical environment launcher is unavailable: ${ENV_BIN}"
   exit 1
 fi
-RUSTUP_BIN="$(resolve_fixed_executable "${SYSTEM_HOME}/.cargo/bin/rustup")"
-CARGO_BIN="$(resolve_toolchain_executable cargo)"
-RUSTC_BIN="$(resolve_toolchain_executable rustc)"
+HOST_TOOLCHAIN_TRIPLE="$(host_toolchain_triple)"
+TOOLCHAIN_ROOT_REL="${EXPECTED_RUST}-${HOST_TOOLCHAIN_TRIPLE}"
+TOOLCHAIN_ROOT="${RUSTUP_HOME_DIR}/toolchains/${TOOLCHAIN_ROOT_REL}"
+[[ -d "${TOOLCHAIN_ROOT}" && ! -L "${TOOLCHAIN_ROOT}" ]] || {
+  echo "::error::the frozen Rust toolchain root is unavailable: ${TOOLCHAIN_ROOT_REL}"
+  exit 1
+}
+CARGO_BIN="${TOOLCHAIN_ROOT}/bin/cargo"
+RUSTC_BIN="${TOOLCHAIN_ROOT}/bin/rustc"
+for toolchain_binary in "${CARGO_BIN}" "${RUSTC_BIN}"; do
+  [[ -x "${toolchain_binary}" && -f "${toolchain_binary}" && ! -L "${toolchain_binary}" ]] || {
+    echo "::error::the frozen Rust toolchain executable is not a regular file"
+    exit 1
+  }
+done
+TOOLCHAIN_CLOSURE_SHA256="$(toolchain_closure_sha256 "${TOOLCHAIN_ROOT}")"
 if [[ "${BUILD_TOOL}" == "cross" ]]; then
   BUILD_TOOL_BIN="$(resolve_fixed_executable /usr/bin/docker)"
 else
@@ -331,7 +374,7 @@ if ! "${PYTHON_BIN}" -c 'import tomllib' >/dev/null 2>&1; then
     >&2
   exit 1
 fi
-CANONICAL_PATH="$(dirname "${RUSTC_BIN}"):$(dirname "${CARGO_BIN}"):$(dirname "${RUSTUP_BIN}"):$(dirname "${BUILD_TOOL_BIN}"):$(dirname "${PYTHON_BIN}"):/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+CANONICAL_PATH="$(dirname "${RUSTC_BIN}"):$(dirname "${CARGO_BIN}"):$(dirname "${BUILD_TOOL_BIN}"):$(dirname "${PYTHON_BIN}"):/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
 CLEAN_HOME="${TMP_ROOT}/home"
 CLEAN_TMP="${TMP_ROOT}/tmp"
 DOCKER_CONFIG_DIR="${TMP_ROOT}/docker-config"
@@ -435,14 +478,7 @@ run_clean() {
   run_clean_online CARGO_NET_OFFLINE=true "$@"
 }
 
-RUSTC_VERBOSE="$(cd "${SNAPSHOT}/admin/rust" && run_clean_online "${RUSTC_BIN}" -vV)"
-ACTUAL_RUST="$(printf '%s\n' "${RUSTC_VERBOSE}" | sed -n 's/^release: //p')"
-RUSTC_HOST="$(printf '%s\n' "${RUSTC_VERBOSE}" | sed -n 's/^host: //p')"
-if [[ -z "${EXPECTED_RUST}" || "${ACTUAL_RUST}" != "${EXPECTED_RUST}" ]]; then
-  echo "::error::canonical theyos-engine build requires the pinned Rust toolchain"
-  exit 1
-fi
-HOST_TARGET="${RUSTC_HOST}"
+HOST_TARGET="${HOST_TOOLCHAIN_TRIPLE}"
 TARGET="${PHASE0_TARGET:-${HOST_TARGET}}"
 PUBLISHED_TARGET=true
 case "${TARGET}:${BUILD_TOOL}" in
@@ -455,22 +491,18 @@ case "${TARGET}:${BUILD_TOOL}" in
     exit 1
     ;;
 esac
-RUSTC_TOOLCHAIN_BIN="$(run_clean "${RUSTUP_BIN}" which rustc)"
-CARGO_TOOLCHAIN_BIN="$(run_clean "${RUSTUP_BIN}" which cargo)"
-for toolchain_binary in "${RUSTC_TOOLCHAIN_BIN}" "${CARGO_TOOLCHAIN_BIN}"; do
-  if [[ ! -f "${toolchain_binary}" || -L "${toolchain_binary}" ]]; then
-    echo "::error::rustup resolved a non-regular toolchain executable"
-    exit 1
-  fi
-done
+RUSTC_TOOLCHAIN_BIN="${RUSTC_BIN}"
+CARGO_TOOLCHAIN_BIN="${CARGO_BIN}"
 RUSTC_TOOLCHAIN_SHA256="$(sha256_file "${RUSTC_TOOLCHAIN_BIN}")"
 CARGO_TOOLCHAIN_SHA256="$(sha256_file "${CARGO_TOOLCHAIN_BIN}")"
 TOOLCHAIN_POLICY_SHA256="$(sha256_file "${SNAPSHOT}/${TOOLCHAIN_POLICY_REL}")"
 if ! jq -e \
   --arg release "${EXPECTED_RUST}" \
   --arg target "${TARGET}" \
-  --arg host_toolchain "${RUSTC_HOST}" \
+  --arg host_toolchain "${HOST_TARGET}" \
   --arg build_tool "${BUILD_TOOL}" \
+  --arg toolchain_root "${TOOLCHAIN_ROOT_REL}" \
+  --arg toolchain_closure_sha256 "${TOOLCHAIN_CLOSURE_SHA256}" \
   --arg rustc_sha256 "${RUSTC_TOOLCHAIN_SHA256}" \
   --arg cargo_sha256 "${CARGO_TOOLCHAIN_SHA256}" \
   '.schema == "theyos-owner-present-phase0-toolchain-v1"
@@ -480,6 +512,9 @@ if ! jq -e \
    and (.targets[$target] | type == "object")
    and .targets[$target].host_toolchain == $host_toolchain
    and .targets[$target].build_tool == $build_tool
+   and .targets[$target].toolchain_root == $toolchain_root
+   and .targets[$target].toolchain_closure_components == ["bin", "etc", "lib", "libexec"]
+   and .targets[$target].toolchain_closure_sha256 == $toolchain_closure_sha256
    and .targets[$target].rustc_sha256 == $rustc_sha256
    and .targets[$target].cargo_sha256 == $cargo_sha256
    and ([.targets | keys[]] | sort | length == 3)
@@ -489,8 +524,17 @@ if ! jq -e \
   exit 1
 fi
 
+RUSTC_VERBOSE="$(cd "${SNAPSHOT}/admin/rust" && run_clean_online "${RUSTC_BIN}" -vV)"
+ACTUAL_RUST="$(printf '%s\n' "${RUSTC_VERBOSE}" | sed -n 's/^release: //p')"
+RUSTC_HOST="$(printf '%s\n' "${RUSTC_VERBOSE}" | sed -n 's/^host: //p')"
+if [[ -z "${EXPECTED_RUST}" || "${ACTUAL_RUST}" != "${EXPECTED_RUST}" \
+  || "${RUSTC_HOST}" != "${HOST_TOOLCHAIN_TRIPLE}" ]]; then
+  echo "::error::canonical theyos-engine build requires the frozen Rust toolchain closure"
+  exit 1
+fi
+
 if [[ "${BUILD_TOOL}" == "cross" ]]; then
-  if [[ "$(uname -s)" != "Linux" ]]; then
+  if [[ "$(/usr/bin/uname -s)" != "Linux" ]]; then
     echo "::error::cross Phase 0 authority must run on Linux so the pinned OCI toolchain is executable"
     exit 1
   fi
@@ -506,7 +550,6 @@ if [[ "${BUILD_TOOL}" == "cross" ]]; then
       exit 1
       ;;
   esac
-  TOOLCHAIN_ROOT="$(cd "$(dirname "${RUSTC_TOOLCHAIN_BIN}")/.." && pwd -P)"
   CROSS_CONTAINER_USER="$(id -u):$(id -g)"
 
   run_cross_container() {
@@ -537,7 +580,7 @@ if [[ "${BUILD_TOOL}" == "cross" ]]; then
       --mount "type=bind,src=${TOOLCHAIN_ROOT},dst=/phase0-toolchain,readonly" \
       --mount "type=bind,src=${BUILD_SNAPSHOT}/claws,dst=/claws,readonly" \
       --workdir /project/admin/rust \
-      --tmpfs /tmp:rw,nosuid,nodev \
+      --tmpfs /tmp:rw,exec,nosuid,nodev \
       --tmpfs /phase0-home:rw,nosuid,nodev \
       --tmpfs /phase0-rustup:rw,nosuid,nodev \
       --env HOME=/phase0-home \
@@ -559,6 +602,7 @@ if [[ "${BUILD_TOOL}" == "cross" ]]; then
       --env THEYOS_BUILD_GIT_SHA="${HEAD_SHA}" \
       --env "PHASE0_EXPECTED_RUSTC_TOOLCHAIN_SHA256=${RUSTC_TOOLCHAIN_SHA256}" \
       --env "PHASE0_EXPECTED_CARGO_TOOLCHAIN_SHA256=${CARGO_TOOLCHAIN_SHA256}" \
+      --env "PHASE0_EXPECTED_TOOLCHAIN_CLOSURE_SHA256=${TOOLCHAIN_CLOSURE_SHA256}" \
       "${CROSS_IMAGE}" \
       "$@"
   }
@@ -578,6 +622,26 @@ if [[ "${BUILD_TOOL}" == "cross" ]]; then
   run_cross_authority /bin/sh -eu -c '
     test "$(sha256sum /phase0-toolchain/bin/rustc | cut -d " " -f1)" = "${PHASE0_EXPECTED_RUSTC_TOOLCHAIN_SHA256}"
     test "$(sha256sum /phase0-toolchain/bin/cargo | cut -d " " -f1)" = "${PHASE0_EXPECTED_CARGO_TOOLCHAIN_SHA256}"
+    toolchain_closure_sha256() {
+      root="$1"
+      for component in bin etc lib libexec; do
+        test -d "${root}/${component}" && test ! -L "${root}/${component}"
+      done
+      {
+        for component in bin etc lib libexec; do
+          find "${root}/${component}" \( -type f -o -type l \) -print
+        done
+      } | LC_ALL=C sort | while IFS= read -r path; do
+        relative="${path#"${root}/"}"
+        if test -L "${path}"; then
+          printf "l\\t%s\\t%s\\n" "${relative}" "$(readlink "${path}")"
+        else
+          test -f "${path}"
+          printf "f\\t%s\\t%s\\n" "${relative}" "$(sha256sum "${path}" | cut -d " " -f1)"
+        fi
+      done | sha256sum | cut -d " " -f1
+    }
+    test "$(toolchain_closure_sha256 /phase0-toolchain)" = "${PHASE0_EXPECTED_TOOLCHAIN_CLOSURE_SHA256}"
     mount_options() {
       if command -v findmnt >/dev/null 2>&1; then
         findmnt -no OPTIONS "$1"
@@ -1798,6 +1862,8 @@ jq -n -S \
   --arg cargo "${ATTESTATION_CARGO_VERSION}" \
   --arg rustc_toolchain_sha256 "${RUSTC_TOOLCHAIN_SHA256}" \
   --arg cargo_toolchain_sha256 "${CARGO_TOOLCHAIN_SHA256}" \
+  --arg toolchain_root "${TOOLCHAIN_ROOT_REL}" \
+  --arg toolchain_closure_sha256 "${TOOLCHAIN_CLOSURE_SHA256}" \
   --arg toolchain_policy_sha256 "${TOOLCHAIN_POLICY_SHA256}" \
   --arg toolchain_policy_target "${TARGET}" \
   --arg python "$(run_clean "${PYTHON_BIN}" --version 2>&1)" \
@@ -1841,6 +1907,8 @@ jq -n -S \
     cargo: $cargo,
     rustc_toolchain_sha256: $rustc_toolchain_sha256,
     cargo_toolchain_sha256: $cargo_toolchain_sha256,
+    toolchain_root: $toolchain_root,
+    toolchain_closure_sha256: $toolchain_closure_sha256,
     toolchain_policy_sha256: $toolchain_policy_sha256,
     toolchain_policy_target: $toolchain_policy_target,
     python: $python,

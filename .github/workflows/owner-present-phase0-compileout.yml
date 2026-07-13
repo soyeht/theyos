@@ -34,7 +34,9 @@ jobs:
 
       - name: Exercise structural mutations
         shell: bash
-        run: bash .github/scripts/test-mobile-claw-vpn-owner-present-phase0-compileout.sh
+        run: |
+          env -u CARGO_HOME -u RUSTUP_HOME -u PHASE0_RUSTUP_HOME \
+            bash .github/scripts/test-mobile-claw-vpn-owner-present-phase0-compileout.sh
 
       - name: Test the exact Phase 0 route composer
         working-directory: admin/rust
@@ -95,7 +97,8 @@ jobs:
           PHASE0_EXPECTED_MACOS_SDK_VERSION: "15.5"
           PHASE0_EXPECTED_DEVELOPER_DIR: "/Applications/Xcode_16.4.app/Contents/Developer"
         run: |
-          bash .github/scripts/check-mobile-claw-vpn-owner-present-phase0-compileout.sh
+          env -u CARGO_HOME -u RUSTUP_HOME -u PHASE0_RUSTUP_HOME \
+            bash .github/scripts/check-mobile-claw-vpn-owner-present-phase0-compileout.sh
           jq -e --arg target "${PHASE0_TARGET}" '
             .published_target == true
             and .target == $target
@@ -107,6 +110,8 @@ jobs:
             and .post_fetch_build_offline == true
             and (.rustc_toolchain_sha256 | test("^[0-9a-f]{64}$"))
             and (.cargo_toolchain_sha256 | test("^[0-9a-f]{64}$"))
+            and (.toolchain_closure_sha256 | test("^[0-9a-f]{64}$"))
+            and (.toolchain_root | test("^1\\.92\\.0-[0-9a-z-]+$"))
             and (.toolchain_policy_sha256 | test("^[0-9a-f]{64}$"))
             and .toolchain_policy_target == $target
             and (if $target == "aarch64-apple-darwin"

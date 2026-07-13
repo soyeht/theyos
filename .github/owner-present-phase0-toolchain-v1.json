@@ -6,18 +6,27 @@
     "aarch64-apple-darwin": {
       "build_tool": "cargo",
       "host_toolchain": "aarch64-apple-darwin",
+      "toolchain_root": "1.92.0-aarch64-apple-darwin",
+      "toolchain_closure_components": ["bin", "etc", "lib", "libexec"],
+      "toolchain_closure_sha256": "78cc247f27533a0a7f3587e835925ee859f42960453c2a27c1127d70901f89b1",
       "rustc_sha256": "12cab30aa9890d54445e29149a1e82d18fbe457de12801bd11bbe7e5e7fe33a0",
       "cargo_sha256": "03e381389f5b7b8e695a744362f3866478f99034b2cf2df6afd4d42cfdab6f67"
     },
     "aarch64-unknown-linux-musl": {
       "build_tool": "cross",
       "host_toolchain": "x86_64-unknown-linux-gnu",
+      "toolchain_root": "1.92.0-x86_64-unknown-linux-gnu",
+      "toolchain_closure_components": ["bin", "etc", "lib", "libexec"],
+      "toolchain_closure_sha256": "403ccdedc6fc20713e5c84cc39ad2a76f47307a17974b56113fa5e25af5c8363",
       "rustc_sha256": "028fd60b0e0add5505c661cd3ccde91393d615c8729bd95d94ab1e91409b36a1",
       "cargo_sha256": "310fa46c7903259368c0df3dbb3f4f52759563f3c9ce53b500404b7741fb6860"
     },
     "x86_64-unknown-linux-musl": {
       "build_tool": "cross",
       "host_toolchain": "x86_64-unknown-linux-gnu",
+      "toolchain_root": "1.92.0-x86_64-unknown-linux-gnu",
+      "toolchain_closure_components": ["bin", "etc", "lib", "libexec"],
+      "toolchain_closure_sha256": "403ccdedc6fc20713e5c84cc39ad2a76f47307a17974b56113fa5e25af5c8363",
       "rustc_sha256": "028fd60b0e0add5505c661cd3ccde91393d615c8729bd95d94ab1e91409b36a1",
       "cargo_sha256": "310fa46c7903259368c0df3dbb3f4f52759563f3c9ce53b500404b7741fb6860"
     }

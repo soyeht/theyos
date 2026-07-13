@@ -34,6 +34,10 @@ clone_head() {
   git -C "${destination}" config user.email "phase0-compileout@example.invalid"
 }
 
+run_checker() {
+  env -u CARGO_HOME -u RUSTUP_HOME -u PHASE0_RUSTUP_HOME "$@"
+}
+
 prepare_empty_authority_inputs() {
   chmod -R u+w "${SHARED_TARGET}" 2>/dev/null || true
   rm -rf "${SHARED_TARGET}"
@@ -67,7 +71,7 @@ expect_checker_failure() {
   if PHASE0_TARGET="${MUTATION_TARGET}" \
       PHASE0_BUILD_TOOL="${MUTATION_BUILD_TOOL}" \
       PHASE0_CARGO_TARGET_DIR="${SHARED_TARGET}" \
-      "${root}/${CHECKER_REL}" "${root}" >"${TMP_ROOT}/${label}.log" 2>&1; then
+      run_checker "${root}/${CHECKER_REL}" "${root}" >"${TMP_ROOT}/${label}.log" 2>&1; then
     echo "error: checker accepted ${label}" >&2
     exit 1
   fi
@@ -166,7 +170,7 @@ if CROSS_CONTAINER_OPTS='--volume=/tmp/untrusted:/claws:ro' \
     PHASE0_TARGET="${MUTATION_TARGET}" \
     PHASE0_BUILD_TOOL="${MUTATION_BUILD_TOOL}" \
     PHASE0_CARGO_TARGET_DIR="${SHARED_TARGET}" \
-    "${REPO_ROOT}/${CHECKER_REL}" >"${TMP_ROOT}/cross-env.log" 2>&1; then
+    run_checker "${REPO_ROOT}/${CHECKER_REL}" >"${TMP_ROOT}/cross-env.log" 2>&1; then
   echo "error: canonical build accepted external CROSS_CONTAINER_OPTS" >&2
   exit 1
 fi
@@ -182,7 +186,7 @@ for docker_override in \
       PHASE0_TARGET="${MUTATION_TARGET}" \
       PHASE0_BUILD_TOOL="${MUTATION_BUILD_TOOL}" \
       PHASE0_CARGO_TARGET_DIR="${SHARED_TARGET}" \
-      "${REPO_ROOT}/${CHECKER_REL}" >"${TMP_ROOT}/${docker_name}.log" 2>&1; then
+      run_checker "${REPO_ROOT}/${CHECKER_REL}" >"${TMP_ROOT}/${docker_name}.log" 2>&1; then
     echo "error: canonical build accepted external ${docker_name}" >&2
     exit 1
   fi
@@ -195,7 +199,7 @@ if PHASE0_RUSTUP_HOME="${UNTRUSTED_RUSTUP_HOME}" \
     PHASE0_TARGET="${HOST_TARGET}" \
     PHASE0_BUILD_TOOL=cargo \
     PHASE0_CARGO_TARGET_DIR="${SHARED_TARGET}" \
-    "${REPO_ROOT}/${CHECKER_REL}" >"${TMP_ROOT}/rustup-home.log" 2>&1; then
+    run_checker "${REPO_ROOT}/${CHECKER_REL}" >"${TMP_ROOT}/rustup-home.log" 2>&1; then
   echo "error: canonical build accepted caller-selected PHASE0_RUSTUP_HOME" >&2
   exit 1
 fi
@@ -218,7 +222,7 @@ if PATH="${FAKE_TOOL_BIN}:${PATH}" \
     PHASE0_TARGET=unsupported-phase0-target \
     PHASE0_BUILD_TOOL=cargo \
     PHASE0_CARGO_TARGET_DIR="${SHARED_TARGET}" \
-    "${REPO_ROOT}/${CHECKER_REL}" >"${TMP_ROOT}/path-tools.log" 2>&1; then
+    run_checker "${REPO_ROOT}/${CHECKER_REL}" >"${TMP_ROOT}/path-tools.log" 2>&1; then
   echo "error: canonical build accepted an unsupported target" >&2
   exit 1
 fi
@@ -235,7 +239,7 @@ if PATH="${FAKE_TOOL_BIN}:${PATH}" \
     PHASE0_BUILD_TOOL=cargo \
     PHASE0_CARGO_TARGET_DIR="${SHARED_TARGET}" \
     GIT_WRAPPER_LOG="${GIT_WRAPPER_LOG}" \
-    "${REPO_ROOT}/${CHECKER_REL}" >"${TMP_ROOT}/path-git.log" 2>&1; then
+    run_checker "${REPO_ROOT}/${CHECKER_REL}" >"${TMP_ROOT}/path-git.log" 2>&1; then
   echo "error: canonical build accepted an unsupported target with a PATH Git wrapper" >&2
   exit 1
 fi
@@ -252,7 +256,7 @@ if [[ -x /usr/bin/docker ]]; then
       PHASE0_TARGET=unsupported-phase0-target \
       PHASE0_BUILD_TOOL=cross \
       PHASE0_CARGO_TARGET_DIR="${SHARED_TARGET}" \
-      "${REPO_ROOT}/${CHECKER_REL}" >"${TMP_ROOT}/path-docker.log" 2>&1; then
+      run_checker "${REPO_ROOT}/${CHECKER_REL}" >"${TMP_ROOT}/path-docker.log" 2>&1; then
     echo "error: canonical cross build accepted an unsupported target" >&2
     exit 1
   fi

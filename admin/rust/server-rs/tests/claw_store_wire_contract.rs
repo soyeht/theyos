@@ -111,7 +111,20 @@ fn fixture(id: &str) -> &'static Value {
 }
 
 fn fake_ipc_bin() -> String {
-    let dir = tempfile::TempDir::new().expect("tempdir");
+    // Cross runs mount /tmp as a hardened tmpfs. Keep executable test helpers
+    // under the writable Cargo target mount instead, while retaining the
+    // native fallback for ordinary host tests.
+    let dir = std::env::var_os("CARGO_TARGET_DIR")
+        .map(std::path::PathBuf::from)
+        .map(|target| target.join("phase0-test-fixtures"))
+        .map(|root| {
+            std::fs::create_dir_all(&root).expect("test fixture root");
+            tempfile::Builder::new()
+                .prefix("fake-ipc-")
+                .tempdir_in(root)
+                .expect("target fixture tempdir")
+        })
+        .unwrap_or_else(|| tempfile::TempDir::new().expect("tempdir"));
     let path = dir.path().join("fake-ipc.sh");
     std::fs::write(
         &path,

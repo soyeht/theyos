@@ -44,7 +44,7 @@ cat > "${REPO}/${TRANSITION_AUTH_REL}" <<'JSON'
       "provider": "github",
       "mode": "required-merge-group-revalidation",
       "requires_current_permission": true,
-      "direct_merge": "rejected-by-base-owned-arm-check"
+    "direct_merge": "rejected-by-required-merge-queue-ruleset"
     },
     "canary": "arm-then-consume-merge-blocked-and-allowed",
     "anti_replay": "base-sha-expected-head-tree-generation-one-shot-consumption"
@@ -133,7 +133,7 @@ cat > "${REPO}/${TRANSITION_AUTH_REL}" <<JSON
       "provider": "github",
       "mode": "required-merge-group-revalidation",
       "requires_current_permission": true,
-      "direct_merge": "rejected-by-base-owned-arm-check"
+      "direct_merge": "rejected-by-required-merge-queue-ruleset"
     },
     "canary": "arm-then-consume-merge-blocked-and-allowed",
     "anti_replay": "base-sha-expected-head-tree-generation-one-shot-consumption"

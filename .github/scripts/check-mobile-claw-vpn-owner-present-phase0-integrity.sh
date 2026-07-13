@@ -53,7 +53,7 @@ validate_transition_common() {
       and .owner_authorization.merge_point.provider == "github"
       and .owner_authorization.merge_point.mode == "required-merge-group-revalidation"
       and .owner_authorization.merge_point.requires_current_permission == true
-      and .owner_authorization.merge_point.direct_merge == "rejected-by-base-owned-arm-check"
+      and .owner_authorization.merge_point.direct_merge == "rejected-by-required-merge-queue-ruleset"
       and .owner_authorization.canary == "arm-then-consume-merge-blocked-and-allowed"
       and .owner_authorization.anti_replay == "base-sha-expected-head-tree-generation-one-shot-consumption"' \
     "${file}" >/dev/null || die_transition "transition authorization metadata is invalid"
@@ -189,7 +189,28 @@ verify_merge_group_candidate() {
 
 verify_owner_approval() {
   local reviews_file="" reviews_dir page page_file page_count latest_review reviewer_login permission_file
-  verify_merge_group_candidate
+  # A normal pull-request/review run establishes eligibility for the queue. The
+  # merge_group run is the authority point and repeats this check against the
+  # exact candidate immediately before merge. Requiring merge_group here on a
+  # PR would make the required check circular: GitHub cannot enqueue a PR
+  # until its required checks pass, but merge_group only exists after enqueue.
+  if [[ "${PHASE0_INTEGRITY_LOCAL_TEST:-0}" == "1" ]]; then
+    if [[ "${PHASE0_INTEGRITY_REQUIRE_MERGE_GROUP:-0}" == "1" ]]; then
+      verify_merge_group_candidate
+    fi
+  else
+    case "${GITHUB_EVENT_NAME:-}" in
+      merge_group)
+        verify_merge_group_candidate
+        ;;
+      pull_request_target|pull_request_review)
+        : # eligibility check; final authorization is merge_group-only
+        ;;
+      *)
+        die_transition "owner authorization requires a trusted pull-request or merge-group event"
+        ;;
+    esac
+  fi
   if [[ "${PHASE0_INTEGRITY_LOCAL_TEST:-0}" == "1" ]]; then
     reviews_file="${PHASE0_INTEGRITY_OWNER_REVIEW_JSON:-}"
     [[ -n "${reviews_file}" && -f "${reviews_file}" ]] \
