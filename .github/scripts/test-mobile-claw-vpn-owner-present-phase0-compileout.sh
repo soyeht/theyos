@@ -244,6 +244,7 @@ fi
 grep -Fq "unsupported Phase 0 target/build-tool pair" "${TMP_ROOT}/path-tools.log"
 echo "PASS path_tool_injection_ignored"
 
+prepare_empty_authority_inputs
 if PATH="${FAKE_TOOL_BIN}:${PATH}" \
     PHASE0_TARGET=unsupported-phase0-target \
     PHASE0_BUILD_TOOL=cross \
@@ -266,6 +267,7 @@ fi
 echo "PASS path_git_injection_ignored"
 
 if [[ -x /usr/bin/docker ]]; then
+  prepare_empty_authority_inputs
   if PATH="${FAKE_TOOL_BIN}:${PATH}" \
       PHASE0_TARGET=unsupported-phase0-target \
       PHASE0_BUILD_TOOL=cross \
