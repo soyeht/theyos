@@ -10,6 +10,12 @@ TMP_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/theyos-owner-present-phase0-test.XXXXXX")
 trap 'chmod -R u+w "${TMP_ROOT}" 2>/dev/null || true; rm -rf "${TMP_ROOT}"' EXIT
 
 HOST_TARGET="$(rustc -vV | sed -n 's/^host: //p')"
+MUTATION_TARGET="${HOST_TARGET}"
+MUTATION_BUILD_TOOL=cargo
+if [[ "${HOST_TARGET}" != *-apple-darwin ]]; then
+  MUTATION_TARGET=x86_64-unknown-linux-musl
+  MUTATION_BUILD_TOOL=cross
+fi
 SHARED_TARGET="${TMP_ROOT}/target"
 CHECKER_CARGO_HOME="${TMP_ROOT}/cargo-home/home"
 mkdir -p "${CHECKER_CARGO_HOME}"
@@ -60,8 +66,8 @@ refresh_boundary_tree_entry() {
 expect_checker_failure() {
   local label="$1" expected="$2" root="$3"
   prepare_empty_authority_inputs
-  if PHASE0_TARGET="${HOST_TARGET}" \
-      PHASE0_BUILD_TOOL=cargo \
+  if PHASE0_TARGET="${MUTATION_TARGET}" \
+      PHASE0_BUILD_TOOL="${MUTATION_BUILD_TOOL}" \
       PHASE0_CARGO_HOME="${CHECKER_CARGO_HOME}" \
       PHASE0_CARGO_TARGET_DIR="${SHARED_TARGET}" \
       "${root}/${CHECKER_REL}" "${root}" >"${TMP_ROOT}/${label}.log" 2>&1; then
@@ -160,8 +166,8 @@ fi
 
 prepare_empty_authority_inputs
 if CROSS_CONTAINER_OPTS='--volume=/tmp/untrusted:/claws:ro' \
-    PHASE0_TARGET=x86_64-unknown-linux-musl \
-    PHASE0_BUILD_TOOL=cross \
+    PHASE0_TARGET="${MUTATION_TARGET}" \
+    PHASE0_BUILD_TOOL="${MUTATION_BUILD_TOOL}" \
     PHASE0_CARGO_HOME="${CHECKER_CARGO_HOME}" \
     PHASE0_CARGO_TARGET_DIR="${SHARED_TARGET}" \
     "${REPO_ROOT}/${CHECKER_REL}" >"${TMP_ROOT}/cross-env.log" 2>&1; then
