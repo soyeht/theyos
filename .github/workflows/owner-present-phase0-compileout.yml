@@ -30,6 +30,7 @@ jobs:
         uses: dtolnay/rust-toolchain@5a814b2e0f75e492da42a3c1227d52112e4dac50 # 1.92.0
         with:
           components: clippy
+          targets: x86_64-unknown-linux-musl
 
       - name: Exercise structural mutations
         shell: bash
