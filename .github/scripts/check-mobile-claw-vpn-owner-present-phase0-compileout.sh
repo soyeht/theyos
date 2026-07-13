@@ -1494,7 +1494,7 @@ fi
 repo_dep_count=0
 while IFS= read -r -d '' repo_input; do
   case "${repo_input}" in
-    admin/rust/*|nix/*|scripts/*|flake.nix|flake.lock|\
+    admin/rust/*|claws/*|nix/*|scripts/*|flake.nix|flake.lock|\
     admin/contracts/claw-store/v1/contract.json|\
     admin/contracts/mobile-claw-vpn/v1/owner_present_success_wire_v1.json) ;;
   *)
