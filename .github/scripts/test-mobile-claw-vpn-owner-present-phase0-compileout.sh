@@ -212,7 +212,7 @@ perl -0pi -e \
 refresh_boundary_tree_entry "${module_crossing}" "admin/rust"
 commit_mutation "${module_crossing}" module-crossing
 expect_checker_failure module_crossing \
-  "retired owner-present effect source entered the ${HOST_TARGET} production graph: claw_vpn_packet_pump.rs" \
+  "retired owner-present effect source entered the ${MUTATION_TARGET} production graph: claw_vpn_packet_pump.rs" \
   "${module_crossing}"
 
 composer_crossing="${TMP_ROOT}/composer-crossing"

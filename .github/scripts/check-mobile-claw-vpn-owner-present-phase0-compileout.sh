@@ -642,6 +642,16 @@ if find "${CARGO_HOME_DIR}" -type l -print -quit 2>/dev/null | grep -q .; then
   echo "::error::Cargo fetch created a symlink in the authority Cargo home"
   exit 1
 fi
+# Cargo may lazily create registry cache directories during offline metadata
+# resolution even after fetch. Create that non-source skeleton while the fetch
+# sandbox is active, then freeze the complete Cargo home before build scripts run.
+mkdir -p "${CARGO_HOME_DIR}/registry/cache"
+for registry_index in "${CARGO_HOME_DIR}/registry/index"/*; do
+  if [[ -d "${registry_index}" ]]; then
+    mkdir -p "${CARGO_HOME_DIR}/registry/cache/$(basename "${registry_index}")"
+  fi
+done
+touch "${CARGO_HOME_DIR}/.package-cache"
 chmod -R a-w "${CARGO_HOME_DIR}"
 
 METADATA_JSON="${TMP_ROOT}/cargo-metadata.json"
