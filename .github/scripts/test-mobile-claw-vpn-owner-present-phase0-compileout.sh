@@ -182,11 +182,12 @@ for docker_override in \
   "DOCKER_CONTEXT=untrusted-context" \
   "DOCKER_CONFIG=${TMP_ROOT}/untrusted-docker-config"; do
   docker_name="${docker_override%%=*}"
-  if env "${docker_override}" \
+  if env -u CARGO_HOME -u RUSTUP_HOME -u PHASE0_RUSTUP_HOME \
+      "${docker_override}" \
       PHASE0_TARGET="${MUTATION_TARGET}" \
       PHASE0_BUILD_TOOL="${MUTATION_BUILD_TOOL}" \
       PHASE0_CARGO_TARGET_DIR="${SHARED_TARGET}" \
-      run_checker "${REPO_ROOT}/${CHECKER_REL}" >"${TMP_ROOT}/${docker_name}.log" 2>&1; then
+      "${REPO_ROOT}/${CHECKER_REL}" >"${TMP_ROOT}/${docker_name}.log" 2>&1; then
     echo "error: canonical build accepted external ${docker_name}" >&2
     exit 1
   fi
