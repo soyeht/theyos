@@ -183,6 +183,28 @@ grep -Fq "exact arm commit lacks a current approved GitHub owner review" \
 git -C "${REPO}" switch --quiet "${BRANCH}"
 echo "PASS owner_review_non_owner_refused"
 
+jq -n --arg head "${ARM_HEAD}" '[range(0; 101) | {
+  user: {id: 1},
+  author_association: "OWNER",
+  state: (if . == 100 then "CHANGES_REQUESTED" else "APPROVED" end),
+  commit_id: $head,
+  submitted_at: (("000" + (.|tostring))[-3:])
+}]' >"${OWNER_REVIEW_JSON}"
+git -C "${REPO}" switch --quiet --detach "${HEAD_OK}"
+if PHASE0_INTEGRITY_LOCAL_TEST=1 \
+    PHASE0_INTEGRITY_OWNER_REVIEW_JSON="${OWNER_REVIEW_JSON}" \
+    "${REPO}/.github/scripts/check-mobile-claw-vpn-owner-present-phase0-integrity.sh" \
+    "${REPO}" "${HEAD_OK}" "${ARM_HEAD}" 0 \
+    >"${TMP_ROOT}/owner-review-pagination.log" 2>&1; then
+  echo "error: integrity checker accepted a stale owner approval after a later rejection" >&2
+  exit 1
+fi
+grep -Fq "exact arm commit lacks a current approved GitHub owner review" \
+  "${TMP_ROOT}/owner-review-pagination.log" \
+  || { cat "${TMP_ROOT}/owner-review-pagination.log" >&2; exit 1; }
+git -C "${REPO}" switch --quiet "${BRANCH}"
+echo "PASS owner_review_pagination_refused"
+
 ARM_WEAKEN_PLAN="${TMP_ROOT}/transition-arm-weakening"
 git clone --quiet --shared "${REPO}" "${ARM_WEAKEN_PLAN}"
 git -C "${ARM_WEAKEN_PLAN}" switch --quiet --detach "${ARM_HEAD}"

@@ -82,7 +82,7 @@ load_allowed_paths() {
 }
 
 verify_owner_approval() {
-  local reviews_file=""
+  local reviews_file="" reviews_dir page page_file page_count
   if [[ "${PHASE0_INTEGRITY_LOCAL_TEST:-0}" == "1" ]]; then
     reviews_file="${PHASE0_INTEGRITY_OWNER_REVIEW_JSON:-}"
     [[ -n "${reviews_file}" && -f "${reviews_file}" ]] \
@@ -93,14 +93,32 @@ verify_owner_approval() {
       || die_transition "pull request number is invalid for owner review verification"
     [[ "${GITHUB_REPOSITORY:-}" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] \
       || die_transition "repository identity is invalid for owner review verification"
+    reviews_dir="${TRANSITION_DIR}/review-pages"
+    mkdir -p "${reviews_dir}"
+    page=1
+    while :; do
+      page_file="${reviews_dir}/page-${page}.json"
+      /usr/bin/curl --fail --silent --show-error --location --max-time 20 \
+        -H 'Accept: application/vnd.github+json' \
+        -H 'X-GitHub-Api-Version: 2022-11-28' \
+        -H "Authorization: Bearer ${GITHUB_TOKEN}" \
+        "https://api.github.com/repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}/reviews?per_page=100&page=${page}" \
+        >"${page_file}" \
+        || die_transition "could not fetch the trusted GitHub review page"
+      jq -e 'type == "array"' "${page_file}" >/dev/null \
+        || die_transition "GitHub owner review page is not a JSON array"
+      page_count="$(jq -er 'length' "${page_file}")" \
+        || die_transition "GitHub owner review page length is invalid"
+      (( page_count <= 100 )) \
+        || die_transition "GitHub returned more than the documented review page size"
+      (( page_count < 100 )) && break
+      (( page >= 1000 )) \
+        && die_transition "GitHub owner review pagination exceeded the fail-closed limit"
+      page=$((page + 1))
+    done
     reviews_file="$(mktemp "${TRANSITION_DIR}/reviews.XXXXXX")"
-    curl --fail --silent --show-error --location --max-time 20 \
-      -H 'Accept: application/vnd.github+json' \
-      -H 'X-GitHub-Api-Version: 2022-11-28' \
-      -H "Authorization: Bearer ${GITHUB_TOKEN}" \
-      "https://api.github.com/repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}/reviews?per_page=100" \
-      >"${reviews_file}" \
-      || die_transition "could not fetch the trusted GitHub review record"
+    jq -s 'add' "${reviews_dir}"/page-*.json >"${reviews_file}" \
+      || die_transition "could not combine the complete GitHub review history"
   fi
 
   jq -e \
