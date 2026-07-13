@@ -40,6 +40,7 @@ store-rs      = { workspace = true }
 ureq          = { workspace = true }
 webauthn-rs  = { workspace = true }
 webauthn-rs-core = { workspace = true }
+openssl      = { workspace = true }
 rustls-webpki = { workspace = true }
 rustls-pki-types = { workspace = true }
 x509-parser = { workspace = true }
