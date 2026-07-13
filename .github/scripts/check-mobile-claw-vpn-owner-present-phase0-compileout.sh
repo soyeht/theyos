@@ -305,7 +305,18 @@ else
   }
   BUILD_TOOL_BIN="${CARGO_BIN}"
 fi
-PYTHON_BIN="$(resolve_fixed_executable /usr/bin/python3)"
+if [[ -x /opt/homebrew/bin/python3 ]]; then
+  PYTHON_BIN="$(resolve_fixed_executable /opt/homebrew/bin/python3)"
+elif [[ -x /usr/local/bin/python3 ]]; then
+  PYTHON_BIN="$(resolve_fixed_executable /usr/local/bin/python3)"
+else
+  PYTHON_BIN="$(resolve_fixed_executable /usr/bin/python3)"
+fi
+if ! "${PYTHON_BIN}" -c 'import tomllib' >/dev/null 2>&1; then
+  echo "::error::canonical Phase 0 Python must provide the frozen tomllib parser" \
+    >&2
+  exit 1
+fi
 CANONICAL_PATH="$(dirname "${RUSTC_BIN}"):$(dirname "${CARGO_BIN}"):$(dirname "${RUSTUP_BIN}"):$(dirname "${BUILD_TOOL_BIN}"):$(dirname "${PYTHON_BIN}"):/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
 CLEAN_HOME="${TMP_ROOT}/home"
 CLEAN_TMP="${TMP_ROOT}/tmp"
