@@ -394,6 +394,20 @@ package_soyeht_mac() {
         if [ "${package_manifest_sha256}" != "${PHASE0_EXPECTED_UNSIGNED_PACKAGE_MANIFEST_SHA256}" ]; then
             error "unsigned macOS package manifest differs from the Phase 0 verified subject"
         fi
+        if ! jq -e '
+            (.executables | keys | sort) == [
+                "store-ipc",
+                "terminal-ipc",
+                "theyos-engine",
+                "theyos-provision-inject",
+                "theyos-ssh",
+                "vmrunner_macos_ipc"
+            ]
+            and (.package_files["vmrunner-macos.entitlements"].unsigned_sha256
+              | test("^[0-9a-f]{64}$"))
+        ' "${package_manifest}" >/dev/null; then
+            error "unsigned macOS package manifest does not describe the exact app subject"
+        fi
     fi
     local source_dir="${target_dir}"
     if [ -n "${unsigned_stage}" ]; then
@@ -458,6 +472,11 @@ package_soyeht_mac() {
                 error "unsigned helper differs from the Phase 0 package manifest: ${helper}"
             fi
         done < <(jq -r '.executables | to_entries[] | [.key,.value.unsigned_sha256] | @tsv' "${package_manifest}")
+        expected_entitlements=$(jq -r '.package_files["vmrunner-macos.entitlements"].unsigned_sha256' "${package_manifest}")
+        actual_entitlements=$(shasum -a 256 "${entitlements}" | awk '{print $1}')
+        if [ "${actual_entitlements}" != "${expected_entitlements}" ]; then
+            error "unsigned macOS entitlements differ from the Phase 0 package manifest"
+        fi
     fi
 
     printf '%s' "${version}" > "${helpers_dir}/engine-version.txt"
