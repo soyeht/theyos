@@ -520,7 +520,10 @@ if ! jq -e \
    and ([.targets | keys[]] | sort | length == 3)
    and ([.targets | keys[]] | sort == ["aarch64-apple-darwin", "aarch64-unknown-linux-musl", "x86_64-unknown-linux-musl"])' \
   "${SNAPSHOT}/${TOOLCHAIN_POLICY_REL}" >/dev/null; then
-  echo "::error::selected Rust/Cargo binaries do not match the base-owned Phase 0 toolchain policy"
+  expected_rustc_sha256="$(jq -r --arg target "${TARGET}" '.targets[$target].rustc_sha256' "${SNAPSHOT}/${TOOLCHAIN_POLICY_REL}")"
+  expected_cargo_sha256="$(jq -r --arg target "${TARGET}" '.targets[$target].cargo_sha256' "${SNAPSHOT}/${TOOLCHAIN_POLICY_REL}")"
+  expected_closure_sha256="$(jq -r --arg target "${TARGET}" '.targets[$target].toolchain_closure_sha256' "${SNAPSHOT}/${TOOLCHAIN_POLICY_REL}")"
+  echo "::error::selected Phase 0 toolchain policy mismatch target=${TARGET} actual_rustc=${RUSTC_TOOLCHAIN_SHA256} expected_rustc=${expected_rustc_sha256} actual_cargo=${CARGO_TOOLCHAIN_SHA256} expected_cargo=${expected_cargo_sha256} actual_closure=${TOOLCHAIN_CLOSURE_SHA256} expected_closure=${expected_closure_sha256}"
   exit 1
 fi
 
