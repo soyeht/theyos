@@ -1,0 +1,13 @@
+{
+  "contract": "soyeht-owner-present-proof-machinery-transition-v1",
+  "version": 1,
+  "state": "unarmed",
+  "generation": 0,
+  "owner_authorization": {
+    "mode": "protected-base-owner-arming-commit",
+    "requires_owner_review": true,
+    "requires_required_integrity_check": true,
+    "canary": "arm-then-consume-merge-blocked-and-allowed",
+    "anti_replay": "base-sha-expected-head-tree-generation-one-shot-consumption"
+  }
+}

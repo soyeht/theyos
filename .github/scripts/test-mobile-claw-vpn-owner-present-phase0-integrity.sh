@@ -9,6 +9,7 @@ TMP_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/theyos-phase0-integrity-test.XXXXXX")"
 trap 'rm -rf "${TMP_ROOT}"' EXIT
 REPO="${TMP_ROOT}/repo"
 POLICY_REL=".github/owner-present-phase0-protected-objects-v1.tsv"
+TRANSITION_AUTH_REL=".github/owner-present-phase0-transition-v1.json"
 
 mkdir -p \
   "${REPO}/.github/scripts" \
@@ -23,12 +24,30 @@ cp "${BASH_SOURCE[0]}" \
   "${REPO}/.github/scripts/test-mobile-claw-vpn-owner-present-phase0-integrity.sh"
 cp "${WORKFLOW_SOURCE}" \
   "${REPO}/.github/workflows/owner-present-phase0-integrity.yml"
+cat > "${REPO}/${TRANSITION_AUTH_REL}" <<'JSON'
+{
+  "contract": "soyeht-owner-present-proof-machinery-transition-v1",
+  "version": 1,
+  "state": "unarmed",
+  "generation": 0,
+  "owner_authorization": {
+    "mode": "protected-base-owner-arming-commit",
+    "requires_owner_review": true,
+    "requires_required_integrity_check": true,
+    "canary": "arm-then-consume-merge-blocked-and-allowed",
+    "anti_replay": "base-sha-expected-head-tree-generation-one-shot-consumption"
+  }
+}
+JSON
+TRANSITION_AUTH_OID="$(git -C "${REPO}" hash-object -w "${REPO}/${TRANSITION_AUTH_REL}")"
 printf '%s\n' 'frozen-v1' > "${REPO}/protected/frozen.txt"
 FROZEN_OID="$(git -C "${REPO}" hash-object -w "${REPO}/protected/frozen.txt")"
 printf '%s\n' 'future-v1' > "${TMP_ROOT}/future.txt"
 FUTURE_OID="$(git -C "${REPO}" hash-object -w "${TMP_ROOT}/future.txt")"
 {
   printf '# mode\ttype\toid\ttransition\tpath\n'
+  printf '100644\tblob\t%s\tversioned-transition\t%s\n' \
+    "${TRANSITION_AUTH_OID}" "${TRANSITION_AUTH_REL}"
   printf '100644\tblob\t%s\tfrozen\tprotected/frozen.txt\n' "${FROZEN_OID}"
   for index in $(seq 1 9); do
     printf '100644\tblob\t%s\tland-exact\tprotected/future-%s.txt\n' \
@@ -54,6 +73,113 @@ PHASE0_INTEGRITY_LOCAL_TEST=1 \
 git -C "${REPO}" switch --quiet "${BRANCH}"
 echo "PASS exact_policy_landing"
 
+# The transition protocol is two-phase: an owner-reviewed arm commit changes
+# only the authorization object, then a later commit consumes it by matching
+# the exact authorized tree/policy and removing the one-shot object.
+TRANSITION_PLAN="${TMP_ROOT}/transition-plan"
+git clone --quiet --shared "${REPO}" "${TRANSITION_PLAN}"
+git -C "${TRANSITION_PLAN}" switch --quiet --detach "${HEAD_OK}"
+awk -F '\t' -v OFS='\t' -v auth="${TRANSITION_AUTH_REL}" \
+  '$5 != auth { print }' \
+  "${TRANSITION_PLAN}/${POLICY_REL}" > "${TRANSITION_PLAN}/${POLICY_REL}.tmp"
+mv "${TRANSITION_PLAN}/${POLICY_REL}.tmp" "${TRANSITION_PLAN}/${POLICY_REL}"
+rm "${TRANSITION_PLAN}/${TRANSITION_AUTH_REL}"
+printf '%s\n' transition-v1 > "${TRANSITION_PLAN}/protected/future-1.txt"
+TRANSITION_FUTURE_OID="$(git -C "${TRANSITION_PLAN}" hash-object -w "${TRANSITION_PLAN}/protected/future-1.txt")"
+awk -F '\t' -v OFS='\t' -v path="protected/future-1.txt" -v oid="${TRANSITION_FUTURE_OID}" \
+  '$5 == path { $3 = oid } { print }' \
+  "${TRANSITION_PLAN}/${POLICY_REL}" > "${TRANSITION_PLAN}/${POLICY_REL}.tmp"
+mv "${TRANSITION_PLAN}/${POLICY_REL}.tmp" "${TRANSITION_PLAN}/${POLICY_REL}"
+git -C "${TRANSITION_PLAN}" add -A
+TRANSITION_TREE_OID="$(git -C "${TRANSITION_PLAN}" write-tree)"
+TRANSITION_POLICY_OID="$(git -C "${TRANSITION_PLAN}" rev-parse "${TRANSITION_TREE_OID}:${POLICY_REL}")"
+git -C "${REPO}" switch --quiet "${BRANCH}"
+cat > "${REPO}/${TRANSITION_AUTH_REL}" <<JSON
+{
+  "contract": "soyeht-owner-present-proof-machinery-transition-v1",
+  "version": 1,
+  "state": "armed",
+  "generation": 1,
+  "armed_from_base_sha": "${HEAD_OK}",
+  "expected_head_tree_oid": "${TRANSITION_TREE_OID}",
+  "expected_policy_blob_oid": "${TRANSITION_POLICY_OID}",
+  "allowed_paths": [
+    "${POLICY_REL}",
+    "protected/future-1.txt"
+  ],
+  "owner_authorization": {
+    "mode": "protected-base-owner-arming-commit",
+    "requires_owner_review": true,
+    "requires_required_integrity_check": true,
+    "canary": "arm-then-consume-merge-blocked-and-allowed",
+    "anti_replay": "base-sha-expected-head-tree-generation-one-shot-consumption"
+  }
+}
+JSON
+ARM_AUTH_OID="$(git -C "${REPO}" hash-object -w "${REPO}/${TRANSITION_AUTH_REL}")"
+awk -F '\t' -v OFS='\t' -v auth="${TRANSITION_AUTH_REL}" -v oid="${ARM_AUTH_OID}" \
+  '$5 == auth { $3 = oid } { print }' \
+  "${REPO}/${POLICY_REL}" > "${REPO}/${POLICY_REL}.tmp"
+mv "${REPO}/${POLICY_REL}.tmp" "${REPO}/${POLICY_REL}"
+git -C "${REPO}" add "${TRANSITION_AUTH_REL}"
+git -C "${REPO}" add "${POLICY_REL}"
+git -C "${REPO}" commit --quiet -m transition-arm
+ARM_HEAD="$(git -C "${REPO}" rev-parse HEAD)"
+git -C "${REPO}" switch --quiet --detach "${HEAD_OK}"
+PHASE0_INTEGRITY_LOCAL_TEST=1 \
+  "${REPO}/.github/scripts/check-mobile-claw-vpn-owner-present-phase0-integrity.sh" \
+  "${REPO}" "${HEAD_OK}" "${ARM_HEAD}" 0 >/dev/null
+git -C "${REPO}" switch --quiet "${BRANCH}"
+echo "PASS transition_arm"
+
+awk -F '\t' -v OFS='\t' -v auth="${TRANSITION_AUTH_REL}" \
+  '$5 != auth { print }' \
+  "${REPO}/${POLICY_REL}" > "${REPO}/${POLICY_REL}.tmp"
+mv "${REPO}/${POLICY_REL}.tmp" "${REPO}/${POLICY_REL}"
+rm "${REPO}/${TRANSITION_AUTH_REL}"
+printf '%s\n' transition-v1 > "${REPO}/protected/future-1.txt"
+awk -F '\t' -v OFS='\t' -v path="protected/future-1.txt" -v oid="${TRANSITION_FUTURE_OID}" \
+  '$5 == path { $3 = oid } { print }' \
+  "${REPO}/${POLICY_REL}" > "${REPO}/${POLICY_REL}.tmp"
+mv "${REPO}/${POLICY_REL}.tmp" "${REPO}/${POLICY_REL}"
+git -C "${REPO}" add -A
+git -C "${REPO}" commit --quiet -m transition-consume
+TRANSITION_HEAD="$(git -C "${REPO}" rev-parse HEAD)"
+[[ "$(git -C "${REPO}" rev-parse "${TRANSITION_HEAD}^{tree}")" == "${TRANSITION_TREE_OID}" ]] \
+  || { echo "error: transition test tree changed unexpectedly" >&2; exit 1; }
+git -C "${REPO}" switch --quiet --detach "${ARM_HEAD}"
+PHASE0_INTEGRITY_LOCAL_TEST=1 \
+  "${REPO}/.github/scripts/check-mobile-claw-vpn-owner-present-phase0-integrity.sh" \
+  "${REPO}" "${ARM_HEAD}" "${TRANSITION_HEAD}" 0 \
+  >"${TMP_ROOT}/transition-consume.log" 2>&1 || {
+    cat "${TMP_ROOT}/transition-consume.log" >&2
+    exit 1
+  }
+git -C "${REPO}" switch --quiet "${BRANCH}"
+echo "PASS transition_consume"
+
+printf '%s\n' replayed > "${REPO}/protected/future-2.txt"
+git -C "${REPO}" add -A
+git -C "${REPO}" commit --quiet -m transition-replay
+REPLAY_HEAD="$(git -C "${REPO}" rev-parse HEAD)"
+git -C "${REPO}" switch --quiet --detach "${TRANSITION_HEAD}"
+if PHASE0_INTEGRITY_LOCAL_TEST=1 \
+    "${REPO}/.github/scripts/check-mobile-claw-vpn-owner-present-phase0-integrity.sh" \
+    "${REPO}" "${TRANSITION_HEAD}" "${REPLAY_HEAD}" 0 \
+    >"${TMP_ROOT}/transition-replay.log" 2>&1; then
+  echo "error: integrity checker accepted a replay after transition consumption" >&2
+  exit 1
+fi
+if ! grep -Fq "protected Phase 0 object differs from base-owned policy" \
+  "${TMP_ROOT}/transition-replay.log"; then
+  cat "${TMP_ROOT}/transition-replay.log" >&2
+  exit 1
+fi
+git -C "${REPO}" switch --quiet --detach "${HEAD_OK}"
+git -C "${REPO}" branch --force --quiet "${BRANCH}" "${HEAD_OK}"
+git -C "${REPO}" switch --quiet "${BRANCH}"
+echo "PASS transition_replay_refused"
+
 expect_failure() {
   local label="$1" expected="$2"
   git -C "${REPO}" add -A
@@ -66,7 +192,10 @@ expect_failure() {
     echo "error: integrity checker accepted ${label}" >&2
     exit 1
   fi
-  grep -Fq "${expected}" "${TMP_ROOT}/${label}.log"
+  if ! grep -Fq "${expected}" "${TMP_ROOT}/${label}.log"; then
+    cat "${TMP_ROOT}/${label}.log" >&2
+    exit 1
+  fi
   git -C "${REPO}" switch --quiet "${BRANCH}"
   echo "PASS ${label}_refused"
 }
