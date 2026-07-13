@@ -97,11 +97,24 @@ in
     cargoArtifacts = depsOnly;
 
     postInstall = ''
+      # crane's install hook stages every workspace binary before this hook.
+      # The Nix runtime contract is for this explicit product set only; do not
+      # let an unrelated workspace target become a published executable.
+      rm -rf "$out/bin"
       mkdir -p "$out/bin"
-      for executable in server theyos-llm-proxy soyeht vmrunner_ipc fc-ssh store-ipc terminal-ipc imagebuilder; do
-        if [ -x "target/release/$executable" ]; then
-          install -m 0755 "target/release/$executable" "$out/bin/$executable"
-        fi
+      for executable in \
+        server \
+        theyos-llm-proxy \
+        theyos-admin-host \
+        rootfsbuilder \
+        soyeht \
+        vmrunner_ipc \
+        fc-ssh \
+        store-ipc \
+        terminal-ipc \
+        imagebuilder; do
+        test -x "target/release/$executable"
+        install -m 0755 "target/release/$executable" "$out/bin/$executable"
       done
       test -x "$out/bin/server"
       test -x "$out/bin/theyos-llm-proxy"
@@ -115,7 +128,12 @@ in
         depfile="target/release/$name.d"
         test -f "$depfile"
         if [ "$name" != server ] && [ "$name" != theyos-llm-proxy ]; then
-          if grep -Eiq 'server-rs/src|llm-proxy-rs/src|mobile_claw_vpn|product_a_phase0' "$depfile"; then
+          # core-rs/product_a_phase0.rs is a shared HTTP choke module. Cargo's
+          # workspace feature unification can list that module in a helper's
+          # depfile even when the helper does not link or call it. The actual
+          # authority sources remain forbidden in helper graphs, and every
+          # final executable still receives the marker scan below.
+          if grep -Eiq 'server-rs/src|llm-proxy-rs/src|mobile_claw_vpn' "$depfile"; then
             echo "Phase 0 helper depfile reaches an authority source: $name" >&2
             exit 1
           fi

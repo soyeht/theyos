@@ -1088,7 +1088,8 @@ BINARY="${BINARY_DIR}/server"
 DEPFILE="${BINARY_DIR}/server.d"
 PROXY_BINARY="${BINARY_DIR}/theyos-llm-proxy"
 PROXY_DEPFILE="${BINARY_DIR}/theyos-llm-proxy.d"
-STAGED_ENGINE="${PHASE0_STAGED_ENGINE_OUT:-${TMP_ROOT}/theyos-engine}"
+STAGED_ENGINE_OUT="${PHASE0_STAGED_ENGINE_OUT:-${TMP_ROOT}/theyos-engine}"
+STAGED_ENGINE="${TMP_ROOT}/theyos-engine"
 if [[ ! -x "${BINARY}" ]]; then
   echo "::error::release server binary was not produced for ${TARGET}"
   exit 1
@@ -1129,6 +1130,10 @@ if ! cmp -s "${BINARY}" "${STAGED_ENGINE}"; then
   echo "::error::staged theyos-engine is not byte-identical to server-rs/server"
   exit 1
 fi
+if [[ "${STAGED_ENGINE_OUT}" != "${STAGED_ENGINE}" ]]; then
+  mkdir -p "$(dirname "${STAGED_ENGINE_OUT}")"
+  cp -p "${STAGED_ENGINE}" "${STAGED_ENGINE_OUT}"
+fi
 verify_snapshot_matches_odb
 
 REPO_DEP_INPUTS="${TMP_ROOT}/repo-dep-inputs.nul"
@@ -1138,6 +1143,7 @@ if ! run_clean "${PYTHON_BIN}" - \
     "${TARGET_DIR}" \
     "${CARGO_HOME_DIR}" \
     "${RUSTUP_HOME_DIR}" \
+    "${BUILD_TOOL}" \
     "${DEPFILES[@]}" > "${REPO_DEP_INPUTS}" <<'PY'; then
 import os
 import pathlib
@@ -1148,7 +1154,8 @@ build_snapshot = pathlib.Path(sys.argv[2]).resolve()
 target_dir = pathlib.Path(sys.argv[3]).resolve()
 cargo_home = pathlib.Path(sys.argv[4]).resolve()
 rustup_home = pathlib.Path(sys.argv[5]).resolve()
-depfiles = [pathlib.Path(value) for value in sys.argv[6:]]
+build_tool = sys.argv[6]
+depfiles = [pathlib.Path(value) for value in sys.argv[7:]]
 
 def relative_to(path, root):
     try:
@@ -1211,6 +1218,12 @@ for depfile in depfiles:
             relative = relative_to(normalized, build_snapshot)
         if relative is None:
             relative = relative_to(normalized, pathlib.Path("/project"))
+        if relative is None and build_tool == "cross":
+            # The pinned OCI recipe mounts the writable Cargo target at this
+            # stable container path. It is generated output, never a source
+            # input, so it must be ignored just like the host target path.
+            if relative_to(normalized, pathlib.Path("/target")) is not None:
+                continue
         if relative is None:
             claws_relative = relative_to(normalized, pathlib.Path("/claws"))
             if claws_relative is not None:
