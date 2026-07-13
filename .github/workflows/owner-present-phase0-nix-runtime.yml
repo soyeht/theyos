@@ -34,7 +34,10 @@ jobs:
           export NIX_CONFIG=$'experimental-features = nix-command flakes\n'
           nix flake archive --json --no-write-lock-file . > phase0-nix-input-closure.json
           ONLINE_OUT_PATH="$(nix build --no-link --no-write-lock-file .#theyos-runtime --print-out-paths)"
-          nix store verify --recursive "$ONLINE_OUT_PATH"
+          # The root output is built locally and is therefore not expected to
+          # carry a binary-cache signature. Verify NAR/content integrity here;
+          # cache trust is a separate concern from this source-bound build.
+          nix store verify --recursive --no-trust "$ONLINE_OUT_PATH"
           export NIX_CONFIG=$'experimental-features = nix-command flakes\nsubstituters =\ntrusted-public-keys =\n'
           OUT_PATH="$(nix build --offline --no-link --no-write-lock-file .#theyos-runtime --print-out-paths)"
           test "$OUT_PATH" = "$ONLINE_OUT_PATH"
