@@ -1,6 +1,5 @@
 # theyos-owner-present-phase0-artifact-boundary-v1
 # mode<TAB>git-object-type<TAB>git-object-oid<TAB>closed-input
-040000	tree	2e3809f610dcfd9f0b26cf922c527f38d71e34ef	.github
 040000	tree	5a6bf52b93cd3a6e9351890fdcb221b83e164d48	admin/rust
 040000	tree	0f4cb4b436ef7d67e4e024cf1bf67d50ed2d6d53	claws
 100644	blob	f47d954fdd6a61451ca24583f58e44a884fb51e5	flake.lock
