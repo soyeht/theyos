@@ -147,6 +147,19 @@ if [[ "$(jq -r '.contract' "${HEAD_STATUS}")" != \
     "nix-theyos-runtime,theyos-engine,theyos-llm-proxy" \
   || "$(jq -r '.phase0_artifact_boundary.required_published_targets | sort | join(",")' "${HEAD_STATUS}")" != \
     "aarch64-apple-darwin,aarch64-unknown-linux-musl,nix-theyos-runtime-x86_64-linux,x86_64-unknown-linux-musl" \
+  || "$(jq -r '.proof_machinery_transition.protocol' "${HEAD_STATUS}")" != \
+    "soyeht-owner-present-proof-machinery-transition-v1" \
+  || "$(jq -r '.proof_machinery_transition.authority' "${HEAD_STATUS}")" != \
+    "base-owned-integrity-checker" \
+  || "$(jq -r '.proof_machinery_transition.state' "${HEAD_STATUS}")" != "unarmed" \
+  || "$(jq -r '.proof_machinery_transition.arming' "${HEAD_STATUS}")" != \
+    "owner-reviewed-commit-changes-only-transition-auth-and-policy" \
+  || "$(jq -r '.proof_machinery_transition.consumption' "${HEAD_STATUS}")" != \
+    "one-shot-exact-tree-and-policy-oid-removes-transition-auth" \
+  || "$(jq -r '.proof_machinery_transition.canary' "${HEAD_STATUS}")" != \
+    "arm-then-consume-merge-blocked-and-allowed" \
+  || "$(jq -r '.proof_machinery_transition.anti_replay' "${HEAD_STATUS}")" != \
+    "base-sha-expected-head-tree-generation-one-shot-consumption" \
   || "$(jq -r '.phase1_blocker.minimum_wire_version' "${HEAD_STATUS}")" != "2" \
   || "$(jq -r '.phase1_blocker.required_shape' "${HEAD_STATUS}")" != \
     "server-held-finish-consume-mint" \

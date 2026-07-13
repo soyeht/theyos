@@ -1310,6 +1310,19 @@ if [[ "$(jq -r '.contract' "${AUTHORITY_STATUS}")" != \
     "nix-theyos-runtime,theyos-engine,theyos-llm-proxy" \
   || "$(jq -r '.phase0_artifact_boundary.required_published_targets | sort | join(",")' "${AUTHORITY_STATUS}")" != \
     "aarch64-apple-darwin,aarch64-unknown-linux-musl,nix-theyos-runtime-x86_64-linux,x86_64-unknown-linux-musl" \
+  || "$(jq -r '.proof_machinery_transition.protocol' "${AUTHORITY_STATUS}")" != \
+    "soyeht-owner-present-proof-machinery-transition-v1" \
+  || "$(jq -r '.proof_machinery_transition.authority' "${AUTHORITY_STATUS}")" != \
+    "base-owned-integrity-checker" \
+  || "$(jq -r '.proof_machinery_transition.state' "${AUTHORITY_STATUS}")" != "unarmed" \
+  || "$(jq -r '.proof_machinery_transition.arming' "${AUTHORITY_STATUS}")" != \
+    "owner-reviewed-commit-changes-only-transition-auth-and-policy" \
+  || "$(jq -r '.proof_machinery_transition.consumption' "${AUTHORITY_STATUS}")" != \
+    "one-shot-exact-tree-and-policy-oid-removes-transition-auth" \
+  || "$(jq -r '.proof_machinery_transition.canary' "${AUTHORITY_STATUS}")" != \
+    "arm-then-consume-merge-blocked-and-allowed" \
+  || "$(jq -r '.proof_machinery_transition.anti_replay' "${AUTHORITY_STATUS}")" != \
+    "base-sha-expected-head-tree-generation-one-shot-consumption" \
   || "$(jq -r '.phase1_blocker.minimum_wire_version' "${AUTHORITY_STATUS}")" != "2" \
   || "$(jq -r '.phase1_blocker.required_shape' "${AUTHORITY_STATUS}")" != \
     "server-held-finish-consume-mint" ]]; then

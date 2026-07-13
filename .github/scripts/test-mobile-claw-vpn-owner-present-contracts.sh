@@ -116,6 +116,15 @@ TSV
       "nix-theyos-runtime-x86_64-linux"
     ]
   },
+  "proof_machinery_transition": {
+    "protocol": "soyeht-owner-present-proof-machinery-transition-v1",
+    "authority": "base-owned-integrity-checker",
+    "state": "unarmed",
+    "arming": "owner-reviewed-commit-changes-only-transition-auth-and-policy",
+    "consumption": "one-shot-exact-tree-and-policy-oid-removes-transition-auth",
+    "canary": "arm-then-consume-merge-blocked-and-allowed",
+    "anti_replay": "base-sha-expected-head-tree-generation-one-shot-consumption"
+  },
   "phase1_blocker": {
     "minimum_wire_version": 2,
     "required_shape": "server-held-finish-consume-mint"
