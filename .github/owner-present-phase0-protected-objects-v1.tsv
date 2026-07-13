@@ -1,29 +1,29 @@
-# mode\ttype\toid\ttransition\tpath
-100755\tblob\t54f0201aa2c3f8a5cacfbc07b34c361730477a72\tland-exact\t.github/scripts/check-mobile-claw-vpn-owner-present-contracts.sh
-100755\tblob\t6cc01dc9b6028ef123b1353b4a054e8c7412da97\tland-exact\t.github/scripts/check-mobile-claw-vpn-owner-present-phase0-compileout.sh
-100755\tblob\td3fce1b7d5625c16db0204629944884faccc53d0\tland-exact\t.github/scripts/test-mobile-claw-vpn-owner-present-contracts.sh
-100755\tblob\t32ac47c601af4a8269926e985b9184978c2f5638\tland-exact\t.github/scripts/test-mobile-claw-vpn-owner-present-phase0-compileout.sh
-100644\tblob\td0b9229e4fe5744cb2c072ce690b29039bafc450\tland-exact\t.github/workflows/contracts-cross-repo-sync.yml
-100644\tblob\tc4641554fd0c4809eed31b038dc7f1bdbd002373\tland-exact\t.github/workflows/owner-present-phase0-compileout.yml
-100644\tblob\t6205f6ac1bdd0ad3522caa5d5011ca539724e54d\tland-exact\t.github/workflows/owner-present-phase0-nix-runtime.yml
-100644\tblob\tb5204b326715e1e07c53b4864abee19f2280aa0b\tland-exact\t.github/workflows/release-linux.yml
-100644\tblob\t89f14655c9b4c9621c998e23582a74a753962d7c\tland-exact\t.github/workflows/release-macos.yml
-100644\tblob\t73f5b1d896155259db3aa1aa84e7d065645bf23c\tland-exact\tadmin/contracts/mobile-claw-vpn/v1/owner_present_wire_authority_status_v1.json
-100644\tblob\tbb87caaec4c0828b8253b847d112609c277f23f1\tland-exact\tadmin/contracts/mobile-claw-vpn/v1/owner_present_phase0_artifact_boundary_v1.tsv
-100644\tblob\t7cf7a9f6e69d989752b13dc0afd9d91b0713937e\tland-exact\tadmin/rust/Cargo.toml
-100644\tblob\t42fa6a42c33535a3fded0a0e4210a80e3791b660\tland-exact\tadmin/rust/.cargo/config.toml
-100644\tblob\t4cff2a1b3f165bbaa928e3d58d6c3d505be4c147\tland-exact\tadmin/rust/Cross.toml
-100644\tblob\ta03ce9608c6081a596dbf51b7134b78ed68d3cd6\tland-exact\tadmin/rust/clippy.toml
-100644\tblob\te5be3ad599931acb339f39dc82a00a9e7a5325db\tland-exact\tadmin/rust/core-rs/build.rs
-100644\tblob\t0fe1712b90f77a0487cf92ebc33356a9e908430f\tland-exact\tadmin/rust/core-rs/src/product_a_phase0.rs
-100644\tblob\ta92626caa1b0d69b9dae22cd7ab78084513a8b81\tland-exact\tadmin/rust/household-rs/build.rs
-100644\tblob\tf8a1d023157ead214b33102a4850969904e7ec0f\tland-exact\tadmin/rust/rust-toolchain.toml
-100644\tblob\t65a94379cd2244a52ae2193de290a87ac3d6c0aa\tland-exact\tadmin/rust/server-rs/build.rs
-100644\tblob\ta6866f82bb45673ddad428217655e653d33d85d3\tland-exact\tadmin/rust/theyos-engine-build-rs/Cargo.toml
-100644\tblob\t5d5f3f66152ee0dc2ea21c963b1ab56944f1be65\tland-exact\tadmin/rust/theyos-engine-build-rs/src/main.rs
-100644\tblob\t1c5001db8e71d27dcdfb96df67f6577b872dbf98\tland-exact\tflake.nix
-100644\tblob\ta9d12674061e28e666d7bf35bff3479f715a102d\tland-exact\tnix/module.nix
-100644\tblob\t3b0aa0722bd015c688bfe351ca794794073753ea\tland-exact\tnix/modules/llm-proxy.nix
-100644\tblob\tec896b6b2f0e610735627b538856a49e8e98eec4\tland-exact\tnix/packages/rust-workspace.nix
-100755\tblob\t73b5411b2a6374569ab55b5447c4949405938c8c\tland-exact\tscripts/make.sh
-100644\tblob\tf47d954fdd6a61451ca24583f58e44a884fb51e5\tland-exact\tflake.lock
+# mode	type	oid	transition	path
+100755	blob	54f0201aa2c3f8a5cacfbc07b34c361730477a72	land-exact	.github/scripts/check-mobile-claw-vpn-owner-present-contracts.sh
+100755	blob	6cc01dc9b6028ef123b1353b4a054e8c7412da97	land-exact	.github/scripts/check-mobile-claw-vpn-owner-present-phase0-compileout.sh
+100755	blob	d3fce1b7d5625c16db0204629944884faccc53d0	land-exact	.github/scripts/test-mobile-claw-vpn-owner-present-contracts.sh
+100755	blob	32ac47c601af4a8269926e985b9184978c2f5638	land-exact	.github/scripts/test-mobile-claw-vpn-owner-present-phase0-compileout.sh
+100644	blob	d0b9229e4fe5744cb2c072ce690b29039bafc450	land-exact	.github/workflows/contracts-cross-repo-sync.yml
+100644	blob	c4641554fd0c4809eed31b038dc7f1bdbd002373	land-exact	.github/workflows/owner-present-phase0-compileout.yml
+100644	blob	6205f6ac1bdd0ad3522caa5d5011ca539724e54d	land-exact	.github/workflows/owner-present-phase0-nix-runtime.yml
+100644	blob	b5204b326715e1e07c53b4864abee19f2280aa0b	land-exact	.github/workflows/release-linux.yml
+100644	blob	89f14655c9b4c9621c998e23582a74a753962d7c	land-exact	.github/workflows/release-macos.yml
+100644	blob	73f5b1d896155259db3aa1aa84e7d065645bf23c	land-exact	admin/contracts/mobile-claw-vpn/v1/owner_present_wire_authority_status_v1.json
+100644	blob	bb87caaec4c0828b8253b847d112609c277f23f1	land-exact	admin/contracts/mobile-claw-vpn/v1/owner_present_phase0_artifact_boundary_v1.tsv
+100644	blob	7cf7a9f6e69d989752b13dc0afd9d91b0713937e	land-exact	admin/rust/Cargo.toml
+100644	blob	42fa6a42c33535a3fded0a0e4210a80e3791b660	land-exact	admin/rust/.cargo/config.toml
+100644	blob	4cff2a1b3f165bbaa928e3d58d6c3d505be4c147	land-exact	admin/rust/Cross.toml
+100644	blob	a03ce9608c6081a596dbf51b7134b78ed68d3cd6	land-exact	admin/rust/clippy.toml
+100644	blob	e5be3ad599931acb339f39dc82a00a9e7a5325db	land-exact	admin/rust/core-rs/build.rs
+100644	blob	0fe1712b90f77a0487cf92ebc33356a9e908430f	land-exact	admin/rust/core-rs/src/product_a_phase0.rs
+100644	blob	a92626caa1b0d69b9dae22cd7ab78084513a8b81	land-exact	admin/rust/household-rs/build.rs
+100644	blob	f8a1d023157ead214b33102a4850969904e7ec0f	land-exact	admin/rust/rust-toolchain.toml
+100644	blob	65a94379cd2244a52ae2193de290a87ac3d6c0aa	land-exact	admin/rust/server-rs/build.rs
+100644	blob	a6866f82bb45673ddad428217655e653d33d85d3	land-exact	admin/rust/theyos-engine-build-rs/Cargo.toml
+100644	blob	5d5f3f66152ee0dc2ea21c963b1ab56944f1be65	land-exact	admin/rust/theyos-engine-build-rs/src/main.rs
+100644	blob	1c5001db8e71d27dcdfb96df67f6577b872dbf98	land-exact	flake.nix
+100644	blob	a9d12674061e28e666d7bf35bff3479f715a102d	land-exact	nix/module.nix
+100644	blob	3b0aa0722bd015c688bfe351ca794794073753ea	land-exact	nix/modules/llm-proxy.nix
+100644	blob	ec896b6b2f0e610735627b538856a49e8e98eec4	land-exact	nix/packages/rust-workspace.nix
+100755	blob	73b5411b2a6374569ab55b5447c4949405938c8c	land-exact	scripts/make.sh
+100644	blob	f47d954fdd6a61451ca24583f58e44a884fb51e5	land-exact	flake.lock
