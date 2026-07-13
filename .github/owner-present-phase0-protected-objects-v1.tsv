@@ -1,8 +1,8 @@
 # mode	type	oid	transition	path
 100755	blob	54f0201aa2c3f8a5cacfbc07b34c361730477a72	land-exact	.github/scripts/check-mobile-claw-vpn-owner-present-contracts.sh
-100755	blob	98dcbc1d8be45c5ad34dd2a0e0ab7c0fe3152c4b	land-exact	.github/scripts/check-mobile-claw-vpn-owner-present-phase0-compileout.sh
+100755	blob	117654ad91fde7be0adacbce3c286b24edacb491	land-exact	.github/scripts/check-mobile-claw-vpn-owner-present-phase0-compileout.sh
 100755	blob	d3fce1b7d5625c16db0204629944884faccc53d0	land-exact	.github/scripts/test-mobile-claw-vpn-owner-present-contracts.sh
-100755	blob	c49f5623a0cd335d719363b9d424cacf69c2eaf1	land-exact	.github/scripts/test-mobile-claw-vpn-owner-present-phase0-compileout.sh
+100755	blob	47cd5f713661bf9bcd560ce8f5e9a40abe72cd7a	land-exact	.github/scripts/test-mobile-claw-vpn-owner-present-phase0-compileout.sh
 100644	blob	d0b9229e4fe5744cb2c072ce690b29039bafc450	land-exact	.github/workflows/contracts-cross-repo-sync.yml
 100644	blob	4181152737369e272fe9143a9650e58e5bfc533b	land-exact	.github/workflows/owner-present-phase0-compileout.yml
 100644	blob	05f2d2722a056e912ff10809a6ed462278f1797d	land-exact	.github/workflows/owner-present-phase0-nix-runtime.yml
@@ -20,7 +20,7 @@
 100644	blob	f8a1d023157ead214b33102a4850969904e7ec0f	land-exact	admin/rust/rust-toolchain.toml
 100644	blob	65a94379cd2244a52ae2193de290a87ac3d6c0aa	land-exact	admin/rust/server-rs/build.rs
 100644	blob	a6866f82bb45673ddad428217655e653d33d85d3	land-exact	admin/rust/theyos-engine-build-rs/Cargo.toml
-100644	blob	5d5f3f66152ee0dc2ea21c963b1ab56944f1be65	land-exact	admin/rust/theyos-engine-build-rs/src/main.rs
+100644	blob	b6d7939fe0e251410dec64ce4ab5856db4ddc502	land-exact	admin/rust/theyos-engine-build-rs/src/main.rs
 100644	blob	1c5001db8e71d27dcdfb96df67f6577b872dbf98	land-exact	flake.nix
 100644	blob	a9d12674061e28e666d7bf35bff3479f715a102d	land-exact	nix/module.nix
 100644	blob	3b0aa0722bd015c688bfe351ca794794073753ea	land-exact	nix/modules/llm-proxy.nix
