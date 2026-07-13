@@ -66,6 +66,8 @@ validate_boundary_descriptor() {
         expected_mode="040000"
         expected_type="tree"
         ;;
+      admin/contracts/claw-store/v1/contract.json|\
+      admin/contracts/mobile-claw-vpn/v1/owner_present_success_wire_v1.json|\
       flake.lock|flake.nix)
         expected_mode="100644"
         expected_type="blob"
@@ -81,8 +83,9 @@ validate_boundary_descriptor() {
     printf '%s\n' "${path}" >> "${roots}"
     count=$((count + 1))
   done < "${manifest}"
-  [[ "${count}" -eq 6 ]] \
-    && [[ "$(sort -u "${roots}" | tr '\n' ',')" == "admin/rust,claws,flake.lock,flake.nix,nix,scripts," ]]
+  [[ "${count}" -eq 8 ]] \
+    && [[ "$(sort -u "${roots}" | tr '\n' ',')" == \
+      "admin/contracts/claw-store/v1/contract.json,admin/contracts/mobile-claw-vpn/v1/owner_present_success_wire_v1.json,admin/rust,claws,flake.lock,flake.nix,nix,scripts," ]]
 }
 
 HEAD_CONTRACT="${TMP_DIR}/head-contract"

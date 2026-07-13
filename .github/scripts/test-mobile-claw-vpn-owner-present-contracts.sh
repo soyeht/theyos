@@ -72,6 +72,8 @@ JSON
   contract_sha="$(sha256_file "${repo}/${CONTRACT_REL}")"
   cat > "${repo}/${BOUNDARY_REL}" <<'TSV'
 # synthetic-phase0-boundary
+100644	blob	1111111111111111111111111111111111111111	admin/contracts/claw-store/v1/contract.json
+100644	blob	8888888888888888888888888888888888888888	admin/contracts/mobile-claw-vpn/v1/owner_present_success_wire_v1.json
 040000	tree	2222222222222222222222222222222222222222	admin/rust
 040000	tree	3333333333333333333333333333333333333333	claws
 100644	blob	5555555555555555555555555555555555555555	flake.lock
