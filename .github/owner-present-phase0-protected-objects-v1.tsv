@@ -1,7 +1,7 @@
 # mode	type	oid	transition	path
 100644	blob	b0266df92b61738dd3be22cde25fc1eaaff55f65	versioned-transition	.github/owner-present-phase0-transition-v1.json
 100755	blob	e3cadb5e9df65759bf3e0409acf260e5b618e3b2	land-exact	.github/scripts/check-mobile-claw-vpn-owner-present-contracts.sh
-100755	blob	1522b7f26d354261d2b6883af3cbcb71dd3698e7	land-exact	.github/scripts/check-mobile-claw-vpn-owner-present-phase0-compileout.sh
+100755	blob	23513493eb7316e955a920184fe0e46177ab4a8b	land-exact	.github/scripts/check-mobile-claw-vpn-owner-present-phase0-compileout.sh
 100755	blob	32af9684193fb0ec8286f9cdb038c6e081404f44	land-exact	.github/scripts/test-mobile-claw-vpn-owner-present-contracts.sh
 100755	blob	b288310f1402d1f4b31d436c58084ab2d9965997	land-exact	.github/scripts/test-mobile-claw-vpn-owner-present-phase0-compileout.sh
 100644	blob	d0b9229e4fe5744cb2c072ce690b29039bafc450	land-exact	.github/workflows/contracts-cross-repo-sync.yml

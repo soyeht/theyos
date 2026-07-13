@@ -1096,8 +1096,7 @@ if [[ "${BUILD_TOOL}" == "cross" ]]; then
     --no-default-features \
     mobile_claw_vpn_phase0_ \
     -- \
-    --test-threads=1 \
-    >/dev/null
+    --test-threads=1
 
   run_cross_authority /phase0-toolchain/bin/cargo clippy \
     --manifest-path /project/admin/rust/Cargo.toml \
@@ -1118,8 +1117,7 @@ else
     --no-default-features \
     mobile_claw_vpn_phase0_ \
     -- \
-    --test-threads=1 \
-    >/dev/null
+    --test-threads=1
 
   (
     cd "${SNAPSHOT}/admin/rust"
