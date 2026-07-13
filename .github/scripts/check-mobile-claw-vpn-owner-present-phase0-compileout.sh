@@ -21,7 +21,9 @@ BOUNDARY_REL="admin/contracts/mobile-claw-vpn/v1/owner_present_phase0_artifact_b
 
 HEAD_SHA="$(git -C "${THEYOS_DIR}" rev-parse HEAD)"
 HEAD_TREE="$(git -C "${THEYOS_DIR}" rev-parse "${HEAD_SHA}^{tree}")"
-TMP_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/theyos-owner-present-phase0.XXXXXX")"
+# Keep authority inputs outside runner-managed work directories. macOS
+# sandbox-exec treats those paths differently from a fresh OS temp directory.
+TMP_ROOT="$(mktemp -d "/tmp/theyos-owner-present-phase0.XXXXXX")"
 cleanup() {
   if [[ -n "${CARGO_HOME_DIR:-}" && -e "${CARGO_HOME_DIR}" ]]; then
     chmod -R u+w "${CARGO_HOME_DIR}" 2>/dev/null || true
@@ -166,7 +168,9 @@ while IFS= read -r name; do
 done < <(compgen -e)
 
 SYSTEM_HOME="${HOME:?HOME is required to locate the pinned toolchain}"
-CARGO_HOME_DIR="${PHASE0_CARGO_HOME:-${TMP_ROOT}/cargo-home/home}"
+# A caller-supplied Cargo home is a cache, not an authority input. Always use
+# a fresh per-run home so registry sources are fetched and frozen here.
+CARGO_HOME_DIR="${TMP_ROOT}/cargo-home/home"
 RUSTUP_HOME_DIR="${PHASE0_RUSTUP_HOME:-${SYSTEM_HOME}/.rustup}"
 if [[ "${CARGO_HOME_DIR}" != /* || "${RUSTUP_HOME_DIR}" != /* ]]; then
   echo "::error::canonical Cargo and rustup homes must be absolute paths"
