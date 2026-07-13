@@ -594,14 +594,25 @@ package_engine_linux() {
         local dist_dir="${dist_base}/linux-${arch}"
         local pkg_name="theyos-engine-${version}-linux-${arch}"
 
-        info "Building server-rs for ${rust_target}..."
-        run_engine_build_tool build "${rust_target}" cross >/dev/null
-
-        info "Building soyeht CLI for ${rust_target}..."
-        (cd "${rust_dir}" && cargo build -p soyeht-rs --bin soyeht --release --target "${rust_target}")
+        info "Building the Phase 0 authority subject for ${rust_target}..."
+        local authority_root="${dist_base}/.phase0-authority-${arch}"
+        local authority_target="${authority_root}/target"
+        local authority_cargo_home="${authority_root}/cargo/home"
+        local authority_attestation="${authority_root}/attestation.json"
+        local authority_engine="${authority_root}/theyos-engine"
+        rm -rf "${authority_root}"
+        mkdir -p "${authority_target}" "${authority_cargo_home}"
+        PHASE0_TARGET="${rust_target}" \
+        PHASE0_BUILD_TOOL=cross \
+        PHASE0_CARGO_TARGET_DIR="${authority_target}" \
+        PHASE0_CARGO_HOME="${authority_cargo_home}" \
+        PHASE0_RUN_ARTIFACT_DIRECT=1 \
+        PHASE0_ATTESTATION_OUT="${authority_attestation}" \
+        PHASE0_STAGED_ENGINE_OUT="${authority_engine}" \
+            bash "${REPO_ROOT}/.github/scripts/check-mobile-claw-vpn-owner-present-phase0-compileout.sh"
 
         # Binary name is `server` per server-rs/Cargo.toml [[bin]] config.
-        local soyeht_src="${rust_dir}/target/${rust_target}/release/soyeht"
+        local soyeht_src="${authority_target}/${rust_target}/release/soyeht"
         if [ ! -f "${soyeht_src}" ]; then
             error "soyeht CLI not found at: ${soyeht_src} (expected from soyeht-rs crate)"
         fi
@@ -611,8 +622,7 @@ package_engine_linux() {
         local stage="${dist_base}/.linux-stage-${arch}"
         rm -rf "${stage}"
         mkdir -p "${stage}"
-        run_engine_build_tool stage \
-            "${rust_dir}/target/${rust_target}/release" "${stage}/theyos-engine"
+        cp "${authority_engine}" "${stage}/theyos-engine"
         cp "${soyeht_src}" "${stage}/soyeht"
         cp "${REPO_ROOT}/scripts/uninstall-linux.sh" "${stage}/uninstall-linux.sh"
         chmod +x "${stage}/soyeht" "${stage}/uninstall-linux.sh"
@@ -622,6 +632,7 @@ package_engine_linux() {
         (cd "${stage}" && tar czf "${tarball}" .)
         sha256sum "${tarball}" > "${tarball}.sha256"
         rm -rf "${stage}"
+        rm -rf "${authority_root}"
 
         info "  ✓ ${tarball}"
         info "  ✓ ${tarball}.sha256"

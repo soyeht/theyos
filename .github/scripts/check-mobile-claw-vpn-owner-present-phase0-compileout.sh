@@ -129,6 +129,20 @@ verify_snapshot_matches_odb() {
   fi
 }
 
+verify_build_snapshot_matches_odb() {
+  local verification_snapshot="${TMP_ROOT}/build-source-verification"
+  rm -rf "${verification_snapshot}"
+  mkdir -p "${verification_snapshot}"
+  git -C "${THEYOS_DIR}" archive --format=tar "${HEAD_SHA}" \
+    admin/rust claws flake.lock flake.nix nix scripts \
+    | tar -xf - -C "${verification_snapshot}"
+  if ! diff -qr "${BUILD_SNAPSHOT}" "${verification_snapshot}" >/dev/null; then
+    echo "::error::build mutated the closed-input source snapshot"
+    diff -qr "${BUILD_SNAPSHOT}" "${verification_snapshot}" || true
+    exit 1
+  fi
+}
+
 sha256_file() {
   if command -v sha256sum >/dev/null 2>&1; then
     sha256sum "$1" | awk '{print $1}'
@@ -281,6 +295,7 @@ if [[ "${BUILD_TOOL}" != "cross" ]]; then
     "(deny file-write* (subpath \"${CARGO_HOME_PARENT}\"))" \
     "(deny file-write* (subpath \"${CARGO_HOME_DIR}\"))" \
     "(deny file-write* (subpath \"${RUSTUP_HOME_DIR}\"))" \
+    '(deny network*)' \
     > "${NATIVE_BUILD_SANDBOX}"
 fi
 
@@ -364,6 +379,116 @@ case "${TARGET}:${BUILD_TOOL}" in
     exit 1
     ;;
 esac
+
+if [[ "${BUILD_TOOL}" == "cross" ]]; then
+  if [[ "$(uname -s)" != "Linux" ]]; then
+    echo "::error::cross Phase 0 authority must run on Linux so the pinned OCI toolchain is executable"
+    exit 1
+  fi
+  case "${TARGET}" in
+    x86_64-unknown-linux-musl)
+      CROSS_IMAGE="ghcr.io/cross-rs/x86_64-unknown-linux-musl:0.2.5@sha256:77db671d8356a64ae72a3e1415e63f547f26d374fbe3c4762c1cd36c7eac7b99"
+      ;;
+    aarch64-unknown-linux-musl)
+      CROSS_IMAGE="ghcr.io/cross-rs/aarch64-unknown-linux-musl:0.2.5@sha256:702154f52b2d8091671aa2c84d5582d849f949977228c735ff8462f93cc0e1e4"
+      ;;
+    *)
+      echo "::error::no pinned OCI image exists for ${TARGET}"
+      exit 1
+      ;;
+  esac
+  TOOLCHAIN_ROOT="$(cd "$(dirname "${RUSTC_TOOLCHAIN_BIN}")/.." && pwd -P)"
+  CROSS_CONTAINER_USER="$(id -u):$(id -g)"
+
+  run_cross_container() {
+    local network_mode="$1" offline="$2" cargo_home_mode="$3"
+    shift 3
+    local cargo_home_mount="type=bind,src=${CARGO_HOME_DIR},dst=/phase0-cargo"
+    if [[ "${cargo_home_mode}" == "ro" ]]; then
+      cargo_home_mount+=",readonly"
+    else
+      cargo_home_mount+=",readonly=false"
+    fi
+    "${BUILD_TOOL_BIN}" run \
+      --rm \
+      --platform linux/amd64 \
+      --network "${network_mode}" \
+      --read-only \
+      --cap-drop ALL \
+      --security-opt no-new-privileges \
+      --user "${CROSS_CONTAINER_USER}" \
+      --mount "type=bind,src=${BUILD_SNAPSHOT},dst=/project,readonly" \
+      --mount "type=bind,src=${TARGET_DIR},dst=/target,readonly=false" \
+      --mount "${cargo_home_mount}" \
+      --mount "type=bind,src=${TOOLCHAIN_ROOT},dst=/phase0-toolchain,readonly" \
+      --mount "type=bind,src=${BUILD_SNAPSHOT}/claws,dst=/claws,readonly" \
+      --workdir /project/admin/rust \
+      --tmpfs /tmp:rw,nosuid,nodev \
+      --tmpfs /phase0-home:rw,nosuid,nodev \
+      --tmpfs /phase0-rustup:rw,nosuid,nodev \
+      --env HOME=/phase0-home \
+      --env CARGO_HOME=/phase0-cargo \
+      --env RUSTUP_HOME=/phase0-rustup \
+      --env CARGO_TARGET_DIR=/target \
+      --env "CARGO_NET_OFFLINE=${offline}" \
+      --env CARGO_INCREMENTAL=0 \
+      --env CARGO_PROFILE_RELEASE_DEBUG_ASSERTIONS=false \
+      --env PKG_CONFIG_PATH= \
+      --env PATH=/phase0-toolchain/bin:/usr/local/bin:/usr/bin:/bin \
+      --env RUSTC=/phase0-toolchain/bin/rustc \
+      --env RUSTDOC=/phase0-toolchain/bin/rustdoc \
+      --env RUSTUP_TOOLCHAIN="${EXPECTED_RUST}" \
+      --env THEYOS_PHASE0_CLEAN_ENV=1 \
+      --env PHASE0_BUILD_SOURCE_ROOT=/project \
+      --env CLAWS_MANIFEST_YML=/claws/manifest.yml \
+      --env CLAWS_CATALOG_JSON=/target/phase0-generated/claws-catalog.json \
+      --env THEYOS_EMOJI_WORDLIST=/project/admin/rust/household-rs/data/emoji-security-code-wordlist.csv \
+      --env THEYOS_BUILD_GIT_SHA="${HEAD_SHA}" \
+      --env "PHASE0_EXPECTED_RUSTC_TOOLCHAIN_SHA256=${RUSTC_TOOLCHAIN_SHA256}" \
+      --env "PHASE0_EXPECTED_CARGO_TOOLCHAIN_SHA256=${CARGO_TOOLCHAIN_SHA256}" \
+      "${CROSS_IMAGE}" \
+      "$@"
+  }
+
+  run_cross_fetch() {
+    run_cross_container bridge false rw \
+      /phase0-toolchain/bin/cargo fetch \
+      --manifest-path /project/admin/rust/Cargo.toml \
+      --locked \
+      --quiet
+  }
+
+  run_cross_authority() {
+    run_cross_container none true ro "$@"
+  }
+
+  run_cross_authority /bin/sh -eu -c '
+    test "$(sha256sum /phase0-toolchain/bin/rustc | cut -d " " -f1)" = "${PHASE0_EXPECTED_RUSTC_TOOLCHAIN_SHA256}"
+    test "$(sha256sum /phase0-toolchain/bin/cargo | cut -d " " -f1)" = "${PHASE0_EXPECTED_CARGO_TOOLCHAIN_SHA256}"
+    mount_options() {
+      if command -v findmnt >/dev/null 2>&1; then
+        findmnt -no OPTIONS "$1"
+      else
+        awk -v mountpoint="$1" '\''$5 == mountpoint { print $6; exit }'\'' /proc/self/mountinfo
+      fi
+    }
+    assert_read_only() {
+      options="$(mount_options "$1")"
+      case ",${options}," in
+        *,ro,*) ;;
+        *) echo "Phase 0 authority mount is not read-only: $1 ($options)" >&2; exit 1 ;;
+      esac
+    }
+    assert_read_only /project
+    assert_read_only /phase0-cargo
+    assert_read_only /phase0-toolchain
+    /phase0-toolchain/bin/rustc -vV | grep -Fq "release: ${EXPECTED_RUST}"
+    if chmod u+w /project/admin/rust/server-rs/src/main.rs 2>/dev/null; then
+      echo "Phase 0 source mount was writable" >&2
+      exit 1
+    fi
+  '
+fi
 
 XCODE_VERSION=""
 XCODE_BUILD=""
@@ -644,11 +769,18 @@ PY
 fi
 
 # Fetch only after the lockfile and manifests prove that no git/alternate
-# source can be contacted. Every subsequent Cargo operation is offline.
-PHASE0_CARGO_FETCH_PHASE=1 run_clean_online "${CARGO_BIN}" fetch \
-  --manifest-path "${SNAPSHOT}/admin/rust/Cargo.toml" \
-  --locked \
-  --quiet
+# source can be contacted. Cross fetch is the only Cargo operation allowed
+# outside the offline authority container; it mounts the build snapshot
+# read-only and cannot execute build scripts. All metadata, tests, clippy,
+# and the production build run later in the networkless authority container.
+if [[ "${BUILD_TOOL}" == "cross" ]]; then
+  run_cross_fetch
+else
+  PHASE0_CARGO_FETCH_PHASE=1 run_clean_online "${CARGO_BIN}" fetch \
+    --manifest-path "${SNAPSHOT}/admin/rust/Cargo.toml" \
+    --locked \
+    --quiet
+fi
 if find "${CARGO_HOME_DIR}" -type l -print -quit 2>/dev/null | grep -q .; then
   echo "::error::Cargo fetch created a symlink in the authority Cargo home"
   exit 1
@@ -667,14 +799,49 @@ touch "${CARGO_HOME_DIR}/.package-cache"
 chmod -R a-w "${CARGO_HOME_DIR}"
 
 METADATA_JSON="${TMP_ROOT}/cargo-metadata.json"
-run_clean "${CARGO_BIN}" metadata \
-  --manifest-path "${SNAPSHOT}/admin/rust/Cargo.toml" \
-  --locked \
-  --offline \
-  --format-version 1 \
-  > "${METADATA_JSON}"
+METADATA_ROOT="${SNAPSHOT}"
+if [[ "${BUILD_TOOL}" == "cross" ]]; then
+  METADATA_ROOT="${BUILD_SNAPSHOT}"
+  RAW_METADATA_JSON="${TMP_ROOT}/cargo-metadata-raw.json"
+  run_cross_authority /phase0-toolchain/bin/cargo metadata \
+    --manifest-path /project/admin/rust/Cargo.toml \
+    --locked \
+    --offline \
+    --format-version 1 \
+    > "${RAW_METADATA_JSON}"
+  run_clean "${PYTHON_BIN}" - "${RAW_METADATA_JSON}" "${METADATA_JSON}" "${BUILD_SNAPSHOT}" <<'PY'
+import json
+import pathlib
+import sys
+
+source = json.loads(pathlib.Path(sys.argv[1]).read_text())
+root = sys.argv[3]
+
+def rewrite(value):
+    if isinstance(value, str):
+        if value == "/project":
+            return root
+        if value.startswith("/project/"):
+            return root + value[len("/project"):]
+        return value
+    if isinstance(value, list):
+        return [rewrite(item) for item in value]
+    if isinstance(value, dict):
+        return {key: rewrite(item) for key, item in value.items()}
+    return value
+
+pathlib.Path(sys.argv[2]).write_text(json.dumps(rewrite(source), sort_keys=True))
+PY
+else
+  run_clean "${CARGO_BIN}" metadata \
+    --manifest-path "${SNAPSHOT}/admin/rust/Cargo.toml" \
+    --locked \
+    --offline \
+    --format-version 1 \
+    > "${METADATA_JSON}"
+fi
 if ! jq -e \
-  --arg root "${SNAPSHOT}/admin/rust" \
+  --arg root "${METADATA_ROOT}/admin/rust" \
   --arg registry "${CANONICAL_REGISTRY_SOURCE}" '
     .version == 1
     and .workspace_root == $root
@@ -702,20 +869,20 @@ fi
 while IFS= read -r manifest_path; do
   canonical_manifest="$(cd "$(dirname "${manifest_path}")" && pwd -P)/$(basename "${manifest_path}")"
   case "${canonical_manifest}" in
-    "${SNAPSHOT}/admin/rust/"*) ;;
+    "${METADATA_ROOT}/admin/rust/"*) ;;
     *)
       echo "::error file=${manifest_path}::local Cargo dependency escapes the closed admin/rust tree"
       exit 1
       ;;
   esac
-  manifest_rel="${canonical_manifest#"${SNAPSHOT}/"}"
+  manifest_rel="${canonical_manifest#"${METADATA_ROOT}/"}"
   require_blob "${manifest_rel}"
 done < <(jq -r '.packages[] | select(.source == null) | .manifest_path' "${METADATA_JSON}")
 
 while IFS= read -r dependency_path; do
   canonical_dependency="$(cd "${dependency_path}" && pwd -P)"
   case "${canonical_dependency}/" in
-    "${SNAPSHOT}/admin/rust/"*) ;;
+    "${METADATA_ROOT}/admin/rust/"*) ;;
     *)
       echo "::error file=${dependency_path}::local Cargo dependency path escapes the closed admin/rust tree"
       exit 1
@@ -732,13 +899,13 @@ done < <(jq -r '
 while IFS= read -r target_path; do
   canonical_target="$(cd "$(dirname "${target_path}")" && pwd -P)/$(basename "${target_path}")"
   case "${canonical_target}" in
-    "${SNAPSHOT}/admin/rust/"*) ;;
+    "${METADATA_ROOT}/admin/rust/"*) ;;
     *)
       echo "::error file=${target_path}::local Cargo target source escapes the closed admin/rust tree"
       exit 1
       ;;
   esac
-  target_rel="${canonical_target#"${SNAPSHOT}/"}"
+  target_rel="${canonical_target#"${METADATA_ROOT}/"}"
   require_blob "${target_rel}"
 done < <(jq -r '.packages[] | select(.source == null) | .targets[].src_path' "${METADATA_JSON}")
 
@@ -752,7 +919,7 @@ jq -r '
 ' "${METADATA_JSON}" \
   | while IFS= read -r custom_build; do
       canonical_build="$(cd "$(dirname "${custom_build}")" && pwd -P)/$(basename "${custom_build}")"
-      printf '%s\n' "${canonical_build#"${SNAPSHOT}/"}"
+      printf '%s\n' "${canonical_build#"${METADATA_ROOT}/"}"
     done \
   | LC_ALL=C sort > "${ACTUAL_CUSTOM_BUILDS}"
 if ! cmp -s "${EXPECTED_BUILD_SCRIPTS}" "${ACTUAL_CUSTOM_BUILDS}"; then
@@ -840,21 +1007,21 @@ for listener_source in \
   fi
 done
 
-run_clean "${CARGO_BIN}" test \
-  --manifest-path "${SNAPSHOT}/admin/rust/Cargo.toml" \
-  --locked \
-  --offline \
-  --package server-rs \
-  --test claw_store_wire_contract \
-  --no-default-features \
-  mobile_claw_vpn_phase0_ \
-  -- \
-  --test-threads=1 \
-  >/dev/null
+if [[ "${BUILD_TOOL}" == "cross" ]]; then
+  run_cross_authority /phase0-toolchain/bin/cargo test \
+    --manifest-path /project/admin/rust/Cargo.toml \
+    --locked \
+    --offline \
+    --package server-rs \
+    --test claw_store_wire_contract \
+    --no-default-features \
+    mobile_claw_vpn_phase0_ \
+    -- \
+    --test-threads=1 \
+    >/dev/null
 
-(
-  cd "${SNAPSHOT}/admin/rust"
-  run_clean "${CARGO_BIN}" clippy \
+  run_cross_authority /phase0-toolchain/bin/cargo clippy \
+    --manifest-path /project/admin/rust/Cargo.toml \
     --locked \
     --offline \
     --package server-rs \
@@ -862,7 +1029,31 @@ run_clean "${CARGO_BIN}" test \
     --package llm-proxy-rs \
     --bin theyos-llm-proxy \
     -- -D warnings -D clippy::disallowed_methods
-)
+else
+  run_clean "${CARGO_BIN}" test \
+    --manifest-path "${SNAPSHOT}/admin/rust/Cargo.toml" \
+    --locked \
+    --offline \
+    --package server-rs \
+    --test claw_store_wire_contract \
+    --no-default-features \
+    mobile_claw_vpn_phase0_ \
+    -- \
+    --test-threads=1 \
+    >/dev/null
+
+  (
+    cd "${SNAPSHOT}/admin/rust"
+    run_clean "${CARGO_BIN}" clippy \
+      --locked \
+      --offline \
+      --package server-rs \
+      --bin server \
+      --package llm-proxy-rs \
+      --bin theyos-llm-proxy \
+      -- -D warnings -D clippy::disallowed_methods
+  )
+fi
 
 RELEASE_CHECKER_REL=".github/scripts/check-mobile-claw-vpn-owner-present-phase0-compileout.sh"
 if [[ "$(grep -Fc "${RELEASE_CHECKER_REL}" "${SNAPSHOT}/.github/workflows/release-linux.yml")" -ne 2 \
@@ -1069,19 +1260,30 @@ if grep -ERn \
   exit 1
 fi
 
-(
-  cd "${SNAPSHOT}/admin/rust"
-  run_clean \
-    THEYOS_BUILD_GIT_SHA="${HEAD_SHA}" \
-    "${CARGO_BIN}" run \
-      --manifest-path Cargo.toml \
-      --locked \
-      --offline \
-      --release \
-      --package theyos-engine-build-rs \
-      -- build "${TARGET}" "${BUILD_TOOL}" >/dev/null
-)
+if [[ "${BUILD_TOOL}" == "cross" ]]; then
+  run_cross_authority /phase0-toolchain/bin/cargo run \
+    --manifest-path /project/admin/rust/Cargo.toml \
+    --locked \
+    --offline \
+    --release \
+    --package theyos-engine-build-rs \
+    -- build "${TARGET}" cargo >/dev/null
+else
+  (
+    cd "${SNAPSHOT}/admin/rust"
+    run_clean \
+      THEYOS_BUILD_GIT_SHA="${HEAD_SHA}" \
+      "${CARGO_BIN}" run \
+        --manifest-path Cargo.toml \
+        --locked \
+        --offline \
+        --release \
+        --package theyos-engine-build-rs \
+        -- build "${TARGET}" "${BUILD_TOOL}" >/dev/null
+  )
+fi
 verify_snapshot_matches_odb
+verify_build_snapshot_matches_odb
 
 BINARY_DIR="${TARGET_DIR}/${TARGET}/release"
 BINARY="${BINARY_DIR}/server"
@@ -1116,16 +1318,20 @@ for helper in "${PUBLISHED_HELPERS[@]}"; do
   DEPFILES+=("${BINARY_DIR}/${helper}.d")
 done
 
-(
-  cd "${SNAPSHOT}/admin/rust"
-  run_clean "${CARGO_BIN}" run \
-    --manifest-path Cargo.toml \
-    --locked \
-    --offline \
-    --release \
-    --package theyos-engine-build-rs \
-    -- stage "${BINARY_DIR}" "${STAGED_ENGINE}"
-)
+if [[ "${BUILD_TOOL}" == "cross" ]]; then
+  cp -p "${BINARY}" "${STAGED_ENGINE}"
+else
+  (
+    cd "${SNAPSHOT}/admin/rust"
+    run_clean "${CARGO_BIN}" run \
+      --manifest-path Cargo.toml \
+      --locked \
+      --offline \
+      --release \
+      --package theyos-engine-build-rs \
+      -- stage "${BINARY_DIR}" "${STAGED_ENGINE}"
+  )
+fi
 if ! cmp -s "${BINARY}" "${STAGED_ENGINE}"; then
   echo "::error::staged theyos-engine is not byte-identical to server-rs/server"
   exit 1
@@ -1135,6 +1341,7 @@ if [[ "${STAGED_ENGINE_OUT}" != "${STAGED_ENGINE}" ]]; then
   cp -p "${STAGED_ENGINE}" "${STAGED_ENGINE_OUT}"
 fi
 verify_snapshot_matches_odb
+verify_build_snapshot_matches_odb
 
 REPO_DEP_INPUTS="${TMP_ROOT}/repo-dep-inputs.nul"
 if ! run_clean "${PYTHON_BIN}" - \
@@ -1452,6 +1659,13 @@ sed \
 
 ATTESTATION_OUT="${PHASE0_ATTESTATION_OUT:-${TMP_ROOT}/phase0-attestation-${TARGET}.json}"
 mkdir -p "$(dirname "${ATTESTATION_OUT}")"
+if [[ "${BUILD_TOOL}" == "cross" ]]; then
+  ATTESTATION_RUSTC_VERSION="$(run_cross_authority /phase0-toolchain/bin/rustc -Vv)"
+  ATTESTATION_CARGO_VERSION="$(run_cross_authority /phase0-toolchain/bin/cargo -V)"
+else
+  ATTESTATION_RUSTC_VERSION="$(run_clean "${RUSTC_BIN}" -Vv)"
+  ATTESTATION_CARGO_VERSION="$(run_clean "${CARGO_BIN}" -V)"
+fi
 jq -n -S \
   --arg schema "theyos-owner-present-phase0-artifact-attestation-v1" \
   --arg source_sha "${HEAD_SHA}" \
@@ -1459,8 +1673,8 @@ jq -n -S \
   --arg target "${TARGET}" \
   --arg build_tool "${BUILD_TOOL}" \
   --arg build_tool_version "$(run_clean "${BUILD_TOOL_BIN}" -V)" \
-  --arg rustc "$(run_clean "${RUSTC_BIN}" -Vv)" \
-  --arg cargo "$(run_clean "${CARGO_BIN}" -V)" \
+  --arg rustc "${ATTESTATION_RUSTC_VERSION}" \
+  --arg cargo "${ATTESTATION_CARGO_VERSION}" \
   --arg rustc_toolchain_sha256 "${RUSTC_TOOLCHAIN_SHA256}" \
   --arg cargo_toolchain_sha256 "${CARGO_TOOLCHAIN_SHA256}" \
   --arg python "$(run_clean "${PYTHON_BIN}" --version 2>&1)" \

@@ -2,7 +2,7 @@ use std::env;
 use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufReader, Read, Write};
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 
@@ -83,9 +83,6 @@ const CANONICAL_CHILD_ENV: [&str; 10] = [
 
 const OPTIONAL_CHILD_ENV: [&str; 2] = ["DEVELOPER_DIR", "PHASE0_BUILD_SOURCE_ROOT"];
 
-const X86_64_MUSL_IMAGE: &str = "ghcr.io/cross-rs/x86_64-unknown-linux-musl:0.2.5@sha256:77db671d8356a64ae72a3e1415e63f547f26d374fbe3c4762c1cd36c7eac7b99";
-const AARCH64_MUSL_IMAGE: &str = "ghcr.io/cross-rs/aarch64-unknown-linux-musl:0.2.5@sha256:702154f52b2d8091671aa2c84d5582d849f949977228c735ff8462f93cc0e1e4";
-
 fn main() -> ExitCode {
     match run() {
         Ok(()) => ExitCode::SUCCESS,
@@ -132,7 +129,7 @@ fn run() -> Result<(), String> {
 }
 
 fn usage() -> String {
-    "usage: theyos-engine-build build TARGET [cargo|cross]\n       theyos-engine-build stage SOURCE_RELEASE_DIR DESTINATION".to_owned()
+    "usage: theyos-engine-build build TARGET [cargo]\n       theyos-engine-build stage SOURCE_RELEASE_DIR DESTINATION".to_owned()
 }
 
 fn workspace_paths() -> Result<(PathBuf, PathBuf), String> {
@@ -165,9 +162,9 @@ fn build_engine(target: &str, build_tool: &str) -> Result<(), String> {
     {
         return Err(format!("invalid Rust target triple: {target}"));
     }
-    if !matches!(build_tool, "cargo" | "cross") {
+    if build_tool != "cargo" {
         return Err(format!(
-            "unsupported theyos-engine build tool: {build_tool}"
+            "unsupported theyos-engine build tool: {build_tool}; cross must be launched by the Phase 0 OCI authority"
         ));
     }
     for (name, value) in env::vars_os() {
@@ -263,20 +260,9 @@ fn build_engine(target: &str, build_tool: &str) -> Result<(), String> {
             "THEYOS_EMOJI_WORDLIST",
             rust_root.join("household-rs/data/emoji-security-code-wordlist.csv"),
         );
-    let status = if build_tool == "cross" {
-        run_container_build(
-            target,
-            &repo_root,
-            &target_root_for(&rust_root),
-            &canonical_env,
-            &source_sha,
-            &build_args,
-        )?
-    } else {
-        build
-            .status()
-            .map_err(|error| format!("failed to launch {build_tool}: {error}"))?
-    };
+    let status = build
+        .status()
+        .map_err(|error| format!("failed to launch {build_tool}: {error}"))?;
     if !status.success() {
         return Err(format!(
             "canonical theyos-engine build failed for {target} with {build_tool}"
@@ -468,194 +454,6 @@ fn validate_rustup_toolchain(expected_rust: &str, host: &str) -> Result<(), Stri
         ));
     }
     Ok(())
-}
-
-fn phase0_image(target: &str) -> Result<&'static str, String> {
-    match target {
-        "x86_64-unknown-linux-musl" => Ok(X86_64_MUSL_IMAGE),
-        "aarch64-unknown-linux-musl" => Ok(AARCH64_MUSL_IMAGE),
-        _ => Err(format!("no pinned Phase 0 OCI image exists for {target}")),
-    }
-}
-
-fn run_container_build(
-    target: &str,
-    repo_root: &Path,
-    target_root: &Path,
-    canonical_env: &[(OsString, OsString)],
-    source_sha: &str,
-    build_args: &[&str],
-) -> Result<std::process::ExitStatus, String> {
-    let docker = executable_from_path("docker")?;
-    let image = phase0_image(target)?;
-    let cargo_home = canonical_value(canonical_env, "CARGO_HOME")?;
-    let rust_version = canonical_value(canonical_env, "RUSTUP_TOOLCHAIN")?;
-    let cargo_toolchain = resolve_toolchain_binary("cargo", canonical_env)?;
-    let rustc_toolchain = resolve_toolchain_binary("rustc", canonical_env)?;
-    let toolchain_bin = cargo_toolchain
-        .parent()
-        .ok_or("canonical cargo toolchain has no bin directory")?;
-    if rustc_toolchain.parent() != Some(toolchain_bin) {
-        return Err("canonical cargo and rustc must come from the same toolchain".to_owned());
-    }
-    let toolchain_root = toolchain_bin
-        .parent()
-        .ok_or("canonical Rust toolchain has no root directory")?;
-    let target_metadata = fs::metadata(target_root)
-        .map_err(|error| format!("failed to inspect the writable target directory: {error}"))?;
-    let container_user = format!("{}:{}", target_metadata.uid(), target_metadata.gid());
-    // The pinned cross images and the host Rust toolchain are amd64. The
-    // target linker inside each image produces musl/aarch64 output; the
-    // container itself must not require an x86 toolchain under arm emulation.
-    let platform = Some("linux/amd64");
-
-    let mut command = Command::new(docker);
-    command.args([
-        "run",
-        "--rm",
-        "--network",
-        "none",
-        "--read-only",
-        "--cap-drop",
-        "ALL",
-        "--security-opt",
-        "no-new-privileges",
-        "--user",
-        &container_user,
-    ]);
-    if let Some(platform) = platform {
-        command.args(["--platform", platform]);
-    }
-    command
-        .args([
-            "--mount",
-            &format!(
-                "type=bind,src={},dst=/project,readonly",
-                repo_root.display()
-            ),
-            "--mount",
-            &format!(
-                "type=bind,src={},dst=/target,readonly=false",
-                target_root.display()
-            ),
-            "--mount",
-            &format!("type=bind,src={cargo_home},dst=/phase0-cargo,readonly"),
-            "--mount",
-            &format!(
-                "type=bind,src={},dst=/phase0-toolchain,readonly",
-                toolchain_root.display()
-            ),
-            "--mount",
-            &format!(
-                "type=bind,src={},dst=/claws,readonly",
-                repo_root.join("claws").display()
-            ),
-            "--tmpfs",
-            "/tmp:rw,nosuid,nodev",
-            "--tmpfs",
-            "/phase0-home:rw,nosuid,nodev",
-            "--tmpfs",
-            "/phase0-rustup:rw,nosuid,nodev",
-            "--tmpfs",
-            "/.cargo:rw,nosuid,nodev",
-            "--workdir",
-            "/project/admin/rust",
-            "--env",
-            "HOME=/phase0-home",
-            "--env",
-            "CARGO_HOME=/phase0-cargo",
-            "--env",
-            "RUSTUP_HOME=/phase0-rustup",
-            "--env",
-            "CARGO_TARGET_DIR=/target",
-            "--env",
-            "CARGO_NET_OFFLINE=true",
-            "--env",
-            "CARGO_INCREMENTAL=0",
-            "--env",
-            "CARGO_PROFILE_RELEASE_DEBUG_ASSERTIONS=false",
-            "--env",
-            "PKG_CONFIG_PATH=",
-            "--env",
-            "PATH=/phase0-toolchain/bin:/usr/local/bin:/usr/bin:/bin",
-            "--env",
-            "RUSTC=/phase0-toolchain/bin/rustc",
-            "--env",
-            "RUSTDOC=/phase0-toolchain/bin/rustdoc",
-            "--env",
-            "THEYOS_PHASE0_CLEAN_ENV=1",
-            "--env",
-            "CLAWS_CATALOG_JSON=/target/phase0-generated/claws-catalog.json",
-            "--env",
-            "CLAWS_MANIFEST_YML=/claws/manifest.yml",
-            "--env",
-            "THEYOS_EMOJI_WORDLIST=/project/admin/rust/household-rs/data/emoji-security-code-wordlist.csv",
-            "--env",
-            &format!("RUSTUP_TOOLCHAIN={rust_version}"),
-            "--env",
-            &format!("THEYOS_BUILD_GIT_SHA={source_sha}"),
-            image,
-            "/phase0-toolchain/bin/cargo",
-        ])
-        .args(build_args);
-    if let Some(host) = env::var_os("PHASE0_DOCKER_HOST") {
-        let host = host
-            .to_str()
-            .ok_or("PHASE0_DOCKER_HOST must be valid Unicode")?;
-        if !host.starts_with("unix:///") {
-            return Err("PHASE0_DOCKER_HOST must be a Unix socket URL".to_owned());
-        }
-        command.env("DOCKER_HOST", host);
-    }
-    command
-        .status()
-        .map_err(|error| format!("failed to launch direct OCI Phase 0 build: {error}"))
-}
-
-fn canonical_value(values: &[(OsString, OsString)], name: &str) -> Result<String, String> {
-    values
-        .iter()
-        .find_map(|(candidate, value)| {
-            (candidate == name).then(|| value.to_string_lossy().into_owned())
-        })
-        .ok_or_else(|| format!("canonical build environment is missing {name}"))
-}
-
-fn resolve_toolchain_binary(
-    name: &str,
-    canonical_env: &[(OsString, OsString)],
-) -> Result<PathBuf, String> {
-    let rustup = executable_from_path("rustup")?;
-    let mut command = Command::new(rustup);
-    apply_canonical_environment(&mut command, canonical_env);
-    let output = command_stdout(command.arg("which").arg(name))?;
-    let path = PathBuf::from(output);
-    if !path.is_absolute() || !path.is_file() || path.is_symlink() {
-        return Err(format!(
-            "rustup resolved {name} to a non-regular absolute executable"
-        ));
-    }
-    path.canonicalize()
-        .map_err(|error| format!("failed to canonicalize rustup {name}: {error}"))
-}
-
-fn executable_from_path(name: &str) -> Result<PathBuf, String> {
-    let path = env::var_os("PATH").ok_or("canonical PATH is missing")?;
-    for directory in env::split_paths(&path) {
-        let candidate = directory.join(name);
-        if candidate.is_file()
-            && candidate
-                .metadata()
-                .is_ok_and(|metadata| metadata.permissions().mode() & 0o111 != 0)
-        {
-            return candidate
-                .canonicalize()
-                .map_err(|error| format!("failed to resolve {name}: {error}"));
-        }
-    }
-    Err(format!(
-        "canonical PATH does not contain executable: {name}"
-    ))
 }
 
 fn reject_ancestor_cargo_configs(repo_root: &Path) -> Result<(), String> {
