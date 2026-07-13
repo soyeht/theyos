@@ -1267,16 +1267,19 @@ fn success_fixture_metadata_dependencies_and_endpoint_profiles_are_closed() {
     );
     assert_eq!(authority_status["phase"], "phase0-compile-out");
     assert_eq!(authority_status["authority"], "none");
-    assert_eq!(
-        authority_status["phase0_artifact_boundary"]["staged_product"],
-        "theyos-engine"
+    assert!(
+        authority_status["phase0_artifact_boundary"]["staged_products"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|product| product == "theyos-engine")
     );
     assert_eq!(
         authority_status["phase0_artifact_boundary"]["required_published_targets"]
             .as_array()
             .unwrap()
             .len(),
-        3
+        4
     );
     assert_eq!(
         authority_status["retired_api_shapes"]["status"],
