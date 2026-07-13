@@ -33,8 +33,11 @@ jobs:
           test -f nix/packages/rust-workspace.nix
           export NIX_CONFIG=$'experimental-features = nix-command flakes\n'
           nix flake archive --json --no-write-lock-file . > phase0-nix-input-closure.json
+          ONLINE_OUT_PATH="$(nix build --no-link --no-write-lock-file .#theyos-runtime --print-out-paths)"
+          nix store verify --recursive "$ONLINE_OUT_PATH"
           export NIX_CONFIG=$'experimental-features = nix-command flakes\nsubstituters =\ntrusted-public-keys =\n'
           OUT_PATH="$(nix build --offline --no-link --no-write-lock-file .#theyos-runtime --print-out-paths)"
+          test "$OUT_PATH" = "$ONLINE_OUT_PATH"
           test -x "$OUT_PATH/bin/server"
           test -x "$OUT_PATH/bin/theyos-llm-proxy"
           test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
@@ -84,7 +87,7 @@ jobs:
             --arg source_tree "$SOURCE_TREE" \
             --arg closure_sha256 "$CLOSURE_SHA256" \
             --arg input_closure_sha256 "$INPUT_CLOSURE_SHA256" \
-            '. + {source_sha:$source_sha,source_tree:$source_tree,nix_store_closure_manifest_sha256:$closure_sha256,nix_input_closure_manifest_sha256:$input_closure_sha256,nix_build_offline:true,nix_substituters_closed:true}' \
+            '. + {source_sha:$source_sha,source_tree:$source_tree,nix_store_closure_manifest_sha256:$closure_sha256,nix_input_closure_manifest_sha256:$input_closure_sha256,nix_build_mode:"online-prefetch-offline-revalidation",nix_build_offline:true,nix_substituters_closed:true}' \
             "$OUT_PATH/phase0-runtime-manifest.json" > phase0-runtime-manifest.json
           STAGE="$RUNNER_TEMP/phase0-nix-runtime"
           rm -rf "$STAGE"
