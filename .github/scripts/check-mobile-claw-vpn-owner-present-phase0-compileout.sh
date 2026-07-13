@@ -442,8 +442,6 @@ if [[ "${BUILD_TOOL}" == "cross" ]]; then
       --env CARGO_PROFILE_RELEASE_DEBUG_ASSERTIONS=false \
       --env PKG_CONFIG_PATH= \
       --env PATH=/phase0-toolchain/bin:/usr/local/bin:/usr/bin:/bin \
-      --env RUSTC=/phase0-toolchain/bin/rustc \
-      --env RUSTDOC=/phase0-toolchain/bin/rustdoc \
       --env RUSTUP_TOOLCHAIN="${EXPECTED_RUST}" \
       --env "PHASE0_EXPECTED_RUST=${EXPECTED_RUST}" \
       --env THEYOS_PHASE0_CLEAN_ENV=1 \
