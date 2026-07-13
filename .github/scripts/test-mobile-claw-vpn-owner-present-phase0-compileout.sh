@@ -160,8 +160,8 @@ fi
 
 prepare_empty_authority_inputs
 if CROSS_CONTAINER_OPTS='--volume=/tmp/untrusted:/claws:ro' \
-    PHASE0_TARGET="${HOST_TARGET}" \
-    PHASE0_BUILD_TOOL=cargo \
+    PHASE0_TARGET=x86_64-unknown-linux-musl \
+    PHASE0_BUILD_TOOL=cross \
     PHASE0_CARGO_HOME="${CHECKER_CARGO_HOME}" \
     PHASE0_CARGO_TARGET_DIR="${SHARED_TARGET}" \
     "${REPO_ROOT}/${CHECKER_REL}" >"${TMP_ROOT}/cross-env.log" 2>&1; then
