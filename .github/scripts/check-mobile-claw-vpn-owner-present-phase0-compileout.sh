@@ -151,23 +151,66 @@ verify_build_snapshot_matches_odb() {
 }
 
 sha256_file() {
-  if command -v sha256sum >/dev/null 2>&1; then
-    sha256sum "$1" | awk '{print $1}'
+  if [[ -x /usr/bin/sha256sum ]]; then
+    /usr/bin/sha256sum "$1" | /usr/bin/awk '{print $1}'
   else
-    shasum -a 256 "$1" | awk '{print $1}'
+    /usr/bin/shasum -a 256 "$1" | /usr/bin/awk '{print $1}'
   fi
 }
 
-resolve_executable() {
-  local name="$1" resolved
-  resolved="$(command -v "${name}" 2>/dev/null || true)"
-  if [[ -z "${resolved}" || "${resolved}" != /* || ! -x "${resolved}" ]]; then
-    echo "::error::canonical Phase 0 tool is unavailable as an absolute executable: ${name}"
+resolve_fixed_executable() {
+  local candidate="$1" resolved candidate_dir candidate_base current target target_dir depth
+  if [[ "${candidate}" != /* || ! -x "${candidate}" ]]; then
+    echo "::error::canonical Phase 0 tool is unavailable at its fixed absolute path: ${candidate}"
     exit 1
   fi
-  printf '%s/%s\n' \
-    "$(cd "$(dirname "${resolved}")" && pwd -P)" \
-    "$(basename "${resolved}")"
+  candidate_dir="${candidate%/*}"
+  candidate_base="${candidate##*/}"
+  current="$(cd "${candidate_dir}" && pwd -P)/${candidate_base}"
+  for depth in 1 2 3 4 5 6 7 8; do
+    if [[ ! -L "${current}" ]]; then
+      [[ -x "${current}" && -f "${current}" ]] || {
+        echo "::error::canonical Phase 0 tool resolved to a non-regular executable: ${candidate}"
+        exit 1
+      }
+      printf '%s\n' "${candidate}"
+      return 0
+    fi
+    target="$(/usr/bin/readlink "${current}")"
+    [[ -n "${target}" ]] || {
+      echo "::error::canonical Phase 0 tool has an unreadable symlink: ${candidate}"
+      exit 1
+    }
+    if [[ "${target}" == /* ]]; then
+      current="${target}"
+    else
+      target_dir="${current%/*}"
+      current="${target_dir}/${target}"
+    fi
+    current="$(cd "${current%/*}" && pwd -P)/${current##*/}"
+  done
+  echo "::error::canonical Phase 0 tool symlink chain is too deep: ${candidate}"
+  exit 1
+}
+
+resolve_toolchain_executable() {
+  local name="$1" resolved
+  resolved="$(${ENV_BIN} -i \
+    HOME="${SYSTEM_HOME}" \
+    RUSTUP_HOME="${RUSTUP_HOME_DIR}" \
+    PATH="$(dirname "${RUSTUP_BIN}"):/usr/bin:/bin" \
+    RUSTUP_TOOLCHAIN="${EXPECTED_RUST}" \
+    "${RUSTUP_BIN}" which "${name}")"
+  if [[ "${resolved}" != /* || ! -x "${resolved}" || -L "${resolved}" ]]; then
+    echo "::error::rustup returned a non-regular absolute ${name} toolchain executable"
+    exit 1
+  fi
+  resolved="$(cd "$(dirname "${resolved}")" && pwd -P)/$(basename "${resolved}")"
+  [[ -x "${resolved}" && -f "${resolved}" && ! -L "${resolved}" ]] || {
+    echo "::error::rustup returned an invalid ${name} toolchain executable"
+    exit 1
+  }
+  printf '%s\n' "${resolved}"
 }
 
 is_unsafe_parent_build_env() {
@@ -181,7 +224,7 @@ is_unsafe_parent_build_env() {
     RUSTFLAGS|RUSTDOCFLAGS|SDKROOT|CARGO_ENCODED_RUSTFLAGS|RUSTC|RUSTDOC|\
     RUSTC_WRAPPER|RUSTC_WORKSPACE_WRAPPER|CARGO_BUILD_*|CARGO_PROFILE_*|\
     CARGO_TARGET_*|CROSS_*|CROSS_CONTAINER_OPTS|AR_*|CC_*|CFLAGS_*|CXX_*|CXXFLAGS_*|\
-    LDFLAGS_*|PKG_CONFIG_*|*_AR|*_CC|*_CFLAGS|*_CXX|*_CXXFLAGS|*_LD|\
+    LDFLAGS_*|PKG_CONFIG_*|CARGO_HOME|RUSTUP_HOME|PHASE0_RUSTUP_HOME|*_AR|*_CC|*_CFLAGS|*_CXX|*_CXXFLAGS|*_LD|\
     *_LDFLAGS|*_RANLIB) return 0 ;;
     *) return 1 ;;
   esac
@@ -198,10 +241,14 @@ while IFS= read -r name; do
 done < <(compgen -e)
 
 SYSTEM_HOME="${HOME:?HOME is required to locate the pinned toolchain}"
+if [[ -n "${PHASE0_RUSTUP_HOME:-}" || -n "${RUSTUP_HOME:-}" || -n "${CARGO_HOME:-}" ]]; then
+  echo "::error::caller-selected Cargo/rustup homes are forbidden; use the fixed runner toolchain roots"
+  exit 1
+fi
 # A caller-supplied Cargo home is a cache, not an authority input. Always use
 # a fresh per-run home so registry sources are fetched and frozen here.
 CARGO_HOME_DIR="${TMP_ROOT}/cargo-home/home"
-RUSTUP_HOME_DIR="${PHASE0_RUSTUP_HOME:-${SYSTEM_HOME}/.rustup}"
+RUSTUP_HOME_DIR="${SYSTEM_HOME}/.rustup"
 if [[ "${CARGO_HOME_DIR}" != /* || "${RUSTUP_HOME_DIR}" != /* ]]; then
   echo "::error::canonical Cargo and rustup homes must be absolute paths"
   exit 1
@@ -246,16 +293,20 @@ if [[ ! -x "${ENV_BIN}" ]]; then
   echo "::error::canonical environment launcher is unavailable: ${ENV_BIN}"
   exit 1
 fi
-CARGO_BIN="$(resolve_executable cargo)"
-RUSTC_BIN="$(resolve_executable rustc)"
-RUSTUP_BIN="$(resolve_executable rustup)"
+RUSTUP_BIN="$(resolve_fixed_executable "${SYSTEM_HOME}/.cargo/bin/rustup")"
+CARGO_BIN="$(resolve_toolchain_executable cargo)"
+RUSTC_BIN="$(resolve_toolchain_executable rustc)"
 if [[ "${BUILD_TOOL}" == "cross" ]]; then
-  BUILD_TOOL_BIN="$(resolve_executable docker)"
+  BUILD_TOOL_BIN="$(resolve_fixed_executable /usr/bin/docker)"
 else
-  BUILD_TOOL_BIN="$(resolve_executable "${BUILD_TOOL}")"
+  [[ "${BUILD_TOOL}" == "cargo" ]] || {
+    echo "::error::unsupported Phase 0 build tool: ${BUILD_TOOL}"
+    exit 1
+  }
+  BUILD_TOOL_BIN="${CARGO_BIN}"
 fi
-PYTHON_BIN="$(resolve_executable python3)"
-CANONICAL_PATH="$(dirname "${RUSTC_BIN}"):$(dirname "${CARGO_BIN}"):$(dirname "${RUSTUP_BIN}"):$(dirname "${BUILD_TOOL_BIN}"):$(dirname "${PYTHON_BIN}"):/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin"
+PYTHON_BIN="$(resolve_fixed_executable /usr/bin/python3)"
+CANONICAL_PATH="$(dirname "${RUSTC_BIN}"):$(dirname "${CARGO_BIN}"):$(dirname "${RUSTUP_BIN}"):$(dirname "${BUILD_TOOL_BIN}"):$(dirname "${PYTHON_BIN}"):/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
 CLEAN_HOME="${TMP_ROOT}/home"
 CLEAN_TMP="${TMP_ROOT}/tmp"
 DOCKER_CONFIG_DIR="${TMP_ROOT}/docker-config"

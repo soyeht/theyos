@@ -17,8 +17,6 @@ if [[ "${HOST_TARGET}" != *-apple-darwin ]]; then
   MUTATION_BUILD_TOOL=cross
 fi
 SHARED_TARGET="${TMP_ROOT}/target"
-CHECKER_CARGO_HOME="${TMP_ROOT}/cargo-home/home"
-mkdir -p "${CHECKER_CARGO_HOME}"
 if [[ "${HOST_TARGET}" == *-apple-darwin ]]; then
   PHASE0_EXPECTED_XCODE_VERSION="${PHASE0_EXPECTED_XCODE_VERSION:-$(xcodebuild -version | sed -n 's/^Xcode //p')}"
   PHASE0_EXPECTED_XCODE_BUILD="${PHASE0_EXPECTED_XCODE_BUILD:-$(xcodebuild -version | sed -n 's/^Build version //p')}"
@@ -37,9 +35,9 @@ clone_head() {
 }
 
 prepare_empty_authority_inputs() {
-  chmod -R u+w "${SHARED_TARGET}" "${CHECKER_CARGO_HOME}" 2>/dev/null || true
-  rm -rf "${SHARED_TARGET}" "${CHECKER_CARGO_HOME}"
-  mkdir -p "${SHARED_TARGET}" "${CHECKER_CARGO_HOME}"
+  chmod -R u+w "${SHARED_TARGET}" 2>/dev/null || true
+  rm -rf "${SHARED_TARGET}"
+  mkdir -p "${SHARED_TARGET}"
 }
 
 commit_mutation() {
@@ -68,7 +66,6 @@ expect_checker_failure() {
   prepare_empty_authority_inputs
   if PHASE0_TARGET="${MUTATION_TARGET}" \
       PHASE0_BUILD_TOOL="${MUTATION_BUILD_TOOL}" \
-      PHASE0_CARGO_HOME="${CHECKER_CARGO_HOME}" \
       PHASE0_CARGO_TARGET_DIR="${SHARED_TARGET}" \
       "${root}/${CHECKER_REL}" "${root}" >"${TMP_ROOT}/${label}.log" 2>&1; then
     echo "error: checker accepted ${label}" >&2
@@ -168,7 +165,6 @@ prepare_empty_authority_inputs
 if CROSS_CONTAINER_OPTS='--volume=/tmp/untrusted:/claws:ro' \
     PHASE0_TARGET="${MUTATION_TARGET}" \
     PHASE0_BUILD_TOOL="${MUTATION_BUILD_TOOL}" \
-    PHASE0_CARGO_HOME="${CHECKER_CARGO_HOME}" \
     PHASE0_CARGO_TARGET_DIR="${SHARED_TARGET}" \
     "${REPO_ROOT}/${CHECKER_REL}" >"${TMP_ROOT}/cross-env.log" 2>&1; then
   echo "error: canonical build accepted external CROSS_CONTAINER_OPTS" >&2
@@ -185,7 +181,6 @@ for docker_override in \
   if env "${docker_override}" \
       PHASE0_TARGET="${MUTATION_TARGET}" \
       PHASE0_BUILD_TOOL="${MUTATION_BUILD_TOOL}" \
-      PHASE0_CARGO_HOME="${CHECKER_CARGO_HOME}" \
       PHASE0_CARGO_TARGET_DIR="${SHARED_TARGET}" \
       "${REPO_ROOT}/${CHECKER_REL}" >"${TMP_ROOT}/${docker_name}.log" 2>&1; then
     echo "error: canonical build accepted external ${docker_name}" >&2
@@ -194,6 +189,61 @@ for docker_override in \
   grep -Fq "${docker_name} must be unset" "${TMP_ROOT}/${docker_name}.log"
   echo "PASS ${docker_name}_refused"
 done
+
+UNTRUSTED_RUSTUP_HOME="${TMP_ROOT}/untrusted-rustup-home"
+if PHASE0_RUSTUP_HOME="${UNTRUSTED_RUSTUP_HOME}" \
+    PHASE0_TARGET="${HOST_TARGET}" \
+    PHASE0_BUILD_TOOL=cargo \
+    PHASE0_CARGO_TARGET_DIR="${SHARED_TARGET}" \
+    "${REPO_ROOT}/${CHECKER_REL}" >"${TMP_ROOT}/rustup-home.log" 2>&1; then
+  echo "error: canonical build accepted caller-selected PHASE0_RUSTUP_HOME" >&2
+  exit 1
+fi
+grep -Fq "PHASE0_RUSTUP_HOME must be unset" "${TMP_ROOT}/rustup-home.log"
+echo "PASS phase0_rustup_home_refused"
+
+FAKE_TOOL_BIN="${TMP_ROOT}/fake-tool-bin"
+mkdir -p "${FAKE_TOOL_BIN}"
+for fake_tool in rustc rustup docker; do
+  printf '%s\n' '#!/bin/sh' "echo fake-${fake_tool} >&2" 'exit 99' \
+    > "${FAKE_TOOL_BIN}/${fake_tool}"
+  chmod 755 "${FAKE_TOOL_BIN}/${fake_tool}"
+done
+if PATH="${FAKE_TOOL_BIN}:${PATH}" \
+    PHASE0_TARGET=unsupported-phase0-target \
+    PHASE0_BUILD_TOOL=cargo \
+    PHASE0_CARGO_TARGET_DIR="${SHARED_TARGET}" \
+    "${REPO_ROOT}/${CHECKER_REL}" >"${TMP_ROOT}/path-tools.log" 2>&1; then
+  echo "error: canonical build accepted an unsupported target" >&2
+  exit 1
+fi
+if grep -Eq 'fake-(rustc|rustup|docker)' "${TMP_ROOT}/path-tools.log"; then
+  echo "error: canonical tool selection executed a PATH-provided stub" >&2
+  cat "${TMP_ROOT}/path-tools.log" >&2
+  exit 1
+fi
+grep -Fq "unsupported Phase 0 target/build-tool pair" "${TMP_ROOT}/path-tools.log"
+echo "PASS path_tool_injection_ignored"
+
+if [[ -x /usr/bin/docker ]]; then
+  if PATH="${FAKE_TOOL_BIN}:${PATH}" \
+      PHASE0_TARGET=unsupported-phase0-target \
+      PHASE0_BUILD_TOOL=cross \
+      PHASE0_CARGO_TARGET_DIR="${SHARED_TARGET}" \
+      "${REPO_ROOT}/${CHECKER_REL}" >"${TMP_ROOT}/path-docker.log" 2>&1; then
+    echo "error: canonical cross build accepted an unsupported target" >&2
+    exit 1
+  fi
+  if grep -Eq 'fake-(rustc|rustup|docker)' "${TMP_ROOT}/path-docker.log"; then
+    echo "error: canonical Docker/toolchain selection executed a PATH-provided stub" >&2
+    cat "${TMP_ROOT}/path-docker.log" >&2
+    exit 1
+  fi
+  grep -Fq "unsupported Phase 0 target/build-tool pair" "${TMP_ROOT}/path-docker.log"
+  echo "PASS path_docker_injection_ignored"
+else
+  echo "PASS path_docker_injection_ignored (fixed Docker path unavailable on this host)"
+fi
 
 if CARGO_TARGET_AARCH64_APPLE_DARWIN_RUSTFLAGS='--cfg feature="dev_t1_datapath" --cfg feature="dev_claw_share_mint" -C debug-assertions=yes' \
     CARGO_TARGET_DIR="${SHARED_TARGET}" \

@@ -1,4 +1,4 @@
-#!/usr/bin/env sh
+#!/usr/bin/env bash
 # theyOS build script - Unified build for macOS
 # This script compiles all Rust binaries for the current platform
 
