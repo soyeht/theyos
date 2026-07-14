@@ -130,10 +130,22 @@ fn slirp_add_hostfwd_with_retry(
             continue;
         }
 
-        if response.contains("\"error\"") {
+        let value = match serde_json::from_str::<serde_json::Value>(&response) {
+            Ok(value) => value,
+            Err(error) => {
+                last_err = format!("api: invalid JSON response: {error}");
+                if cleanup_partial_on_retry {
+                    ensure_hostfwd_reconciled_before_retry(api_sock, host_port, guest_port)?;
+                }
+                continue;
+            }
+        };
+
+        if let Some(error) = json_error_value(&value) {
+            let error_text = error.to_string();
             // slirp4netns can briefly report this while TAP setup is still
             // completing; treat it as transient and retry with backoff.
-            if response.contains("slirp_add_hostfwd failed") {
+            if error_text.contains("slirp_add_hostfwd failed") {
                 last_err = format!("api: {response}");
                 if cleanup_partial_on_retry {
                     ensure_hostfwd_reconciled_before_retry(api_sock, host_port, guest_port)?;
@@ -145,17 +157,21 @@ fn slirp_add_hostfwd_with_retry(
             )));
         }
 
-        // Parse the ID from {"return":{"id": N}}
-        let fwd_id = parse_hostfwd_id(&response);
-        if fwd_id < 0 {
-            last_err = format!("api: invalid add_hostfwd response: {response}");
-            tracing::warn!("[vmrunner] slirp add_hostfwd returned an invalid response: {response}");
-            if cleanup_partial_on_retry {
-                ensure_hostfwd_reconciled_before_retry(api_sock, host_port, guest_port)?;
+        // Parse the ID from {"return":{"id": N}} using the decoded JSON
+        // value so escaped error keys cannot bypass the success check.
+        match parse_hostfwd_id_value(&value) {
+            Ok(fwd_id) => return Ok(fwd_id),
+            Err(reason) => {
+                last_err = format!("api: invalid add_hostfwd response: {reason}: {response}");
+                tracing::warn!(
+                    "[vmrunner] slirp add_hostfwd returned an invalid response: {response}"
+                );
+                if cleanup_partial_on_retry {
+                    ensure_hostfwd_reconciled_before_retry(api_sock, host_port, guest_port)?;
+                }
+                continue;
             }
-            continue;
         }
-        return Ok(fwd_id);
     }
 
     Err(VmError::Other(format!(
@@ -183,11 +199,44 @@ fn ensure_hostfwd_reconciled_before_retry(
     }
 }
 
+fn json_error_value(value: &serde_json::Value) -> Option<&serde_json::Value> {
+    value.get("error").or_else(|| {
+        value
+            .get("return")
+            .and_then(serde_json::Value::as_object)
+            .and_then(|return_body| return_body.get("error"))
+    })
+}
+
+fn parse_hostfwd_id_value(value: &serde_json::Value) -> Result<i64, &'static str> {
+    let return_body = value
+        .get("return")
+        .and_then(serde_json::Value::as_object)
+        .ok_or("missing return object")?;
+    if return_body.contains_key("error") {
+        return Err("return object contains an error");
+    }
+    let id = return_body
+        .get("id")
+        .and_then(serde_json::Value::as_i64)
+        .ok_or("missing integer return id")?;
+    if id < 0 {
+        return Err("return id is negative");
+    }
+    Ok(id)
+}
+
 /// Parse `{"return":{"id": N}}` → N, or -1 on failure.
 fn parse_hostfwd_id(response: &str) -> i64 {
     serde_json::from_str::<serde_json::Value>(response)
         .ok()
-        .and_then(|v| v["return"]["id"].as_i64())
+        .and_then(|value| {
+            if json_error_value(&value).is_some() {
+                None
+            } else {
+                parse_hostfwd_id_value(&value).ok()
+            }
+        })
         .unwrap_or(-1)
 }
 
@@ -410,6 +459,36 @@ fn parse_list_hostfwd_response(response: &str) -> Result<Vec<(i64, u16, u16)>, &
             .map(|e| (e.id, e.host_port, e.guest_port))
             .collect()
     };
+
+    let value = serde_json::from_str::<serde_json::Value>(response)
+        .map_err(|_| "list_hostfwd response is not valid JSON")?;
+    let top_level_error = value
+        .as_object()
+        .is_some_and(|object| object.contains_key("error"));
+    let wrapped_error = value
+        .get("return")
+        .and_then(serde_json::Value::as_object)
+        .is_some_and(|object| object.contains_key("error"));
+    if top_level_error || wrapped_error {
+        return Err("list_hostfwd response contains an error");
+    }
+    let object = value
+        .as_object()
+        .ok_or("list_hostfwd response must be an object")?;
+    let has_direct_entries = object.contains_key("entries");
+    let has_wrapped_response = object.contains_key("return");
+    if has_direct_entries == has_wrapped_response {
+        return Err("list_hostfwd response must use exactly one format");
+    }
+    if has_wrapped_response
+        && value
+            .get("return")
+            .and_then(serde_json::Value::as_object)
+            .and_then(|return_body| return_body.get("entries"))
+            .is_none()
+    {
+        return Err("wrapped list_hostfwd response is missing entries");
+    }
 
     // Try the actual slirp4netns format first: {"entries":[...]}
     if let Ok(r) = serde_json::from_str::<DirectResponse>(response) {
@@ -993,6 +1072,71 @@ mod tests {
     }
 
     #[test]
+    fn add_hostfwd_refuses_retry_when_direct_list_error_has_entries() {
+        let mock = MockSlirp::new();
+        mock.queue_add_response("");
+        for _ in 0..6 {
+            mock.queue_list_response(r#"{"error":{"desc":"list failed"},"entries":[]}"#);
+        }
+
+        let result = slirp_add_hostfwd_quick(&mock.sock_path, 22990, 22);
+        assert!(
+            result.is_err(),
+            "ambiguous direct list error must not permit a retry"
+        );
+        let cmds = mock.received_commands();
+        assert_eq!(
+            cmds.iter().filter(|c| *c == "add_hostfwd").count(),
+            1,
+            "direct list error must prevent a second add; got: {cmds:?}"
+        );
+    }
+
+    #[test]
+    fn add_hostfwd_refuses_retry_when_wrapped_list_error_has_entries() {
+        let mock = MockSlirp::new();
+        mock.queue_add_response("");
+        for _ in 0..6 {
+            mock.queue_list_response(r#"{"return":{"error":{"desc":"list failed"},"entries":[]}}"#);
+        }
+
+        let result = slirp_add_hostfwd_quick(&mock.sock_path, 22989, 22);
+        assert!(
+            result.is_err(),
+            "ambiguous wrapped list error must not permit a retry"
+        );
+        let cmds = mock.received_commands();
+        assert_eq!(
+            cmds.iter().filter(|c| *c == "add_hostfwd").count(),
+            1,
+            "wrapped list error must prevent a second add; got: {cmds:?}"
+        );
+    }
+
+    #[test]
+    fn add_hostfwd_refuses_retry_when_list_formats_are_combined() {
+        let mock = MockSlirp::new();
+        mock.queue_add_response("");
+        for _ in 0..6 {
+            mock.queue_list_response(
+                r#"{"entries":[],"return":{"entries":[{"id":1,"host_port":22999,"guest_port":22}]}}"#,
+            );
+        }
+
+        let result = slirp_add_hostfwd_quick(&mock.sock_path, 22988, 22);
+        assert!(
+            result.is_err(),
+            "combined list formats must not permit a retry"
+        );
+        let cmds = mock.received_commands();
+        assert_eq!(
+            cmds.iter().filter(|c| *c == "add_hostfwd").count(),
+            1,
+            "combined list formats must prevent a second add; got: {cmds:?}"
+        );
+    }
+
+    #[test]
     fn add_hostfwd_succeeds_on_first_try() {
         // Happy path: no retries needed.
         let mock = MockSlirp::new();
@@ -1023,6 +1167,26 @@ mod tests {
     }
 
     #[test]
+    fn add_hostfwd_rejects_error_with_return_id() {
+        for response in [
+            r#"{"error":{"desc":"failed"},"return":{"id":1}}"#,
+            r#"{"\u0065rror":{"desc":"failed"},"return":{"id":1}}"#,
+        ] {
+            let mock = MockSlirp::new();
+            mock.queue_add_response(response);
+
+            let result = slirp_add_hostfwd_quick(&mock.sock_path, 22987, 22);
+            assert!(result.is_err(), "error response must not become success");
+            let cmds = mock.received_commands();
+            assert_eq!(
+                cmds.iter().filter(|c| *c == "add_hostfwd").count(),
+                1,
+                "error response must not trigger a second add; got: {cmds:?}"
+            );
+        }
+    }
+
+    #[test]
     fn parse_hostfwd_id_from_return() {
         assert_eq!(parse_hostfwd_id(r#"{"return":{"id": 42}}"#), 42);
     }
@@ -1032,6 +1196,18 @@ mod tests {
         assert_eq!(parse_hostfwd_id("{}"), -1);
         assert_eq!(parse_hostfwd_id("garbage"), -1);
         assert_eq!(parse_hostfwd_id(""), -1);
+    }
+
+    #[test]
+    fn parse_hostfwd_id_rejects_error_with_return() {
+        assert_eq!(
+            parse_hostfwd_id(r#"{"error":{"desc":"failed"},"return":{"id":1}}"#),
+            -1
+        );
+        assert_eq!(
+            parse_hostfwd_id(r#"{"\u0065rror":{"desc":"failed"},"return":{"id":1}}"#),
+            -1
+        );
     }
 
     #[test]
@@ -1071,5 +1247,24 @@ mod tests {
         assert!(parse_list_hostfwd_response("not json").is_err());
         assert!(parse_list_hostfwd_response("").is_err());
         assert!(parse_list_hostfwd_response("{}").is_err());
+    }
+
+    #[test]
+    fn parse_list_error_with_entries_is_rejected() {
+        assert!(
+            parse_list_hostfwd_response(r#"{"error":{"desc":"list failed"},"entries":[]}"#)
+                .is_err()
+        );
+        assert!(
+            parse_list_hostfwd_response(
+                r#"{"return":{"error":{"desc":"list failed"},"entries":[]}}"#
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn parse_list_combined_formats_are_rejected() {
+        assert!(parse_list_hostfwd_response(r#"{"entries":[],"return":{"entries":[]}}"#).is_err());
     }
 }
