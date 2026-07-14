@@ -176,10 +176,18 @@ impl InstanceEnv {
             if value.is_empty() {
                 return Ok(None);
             }
-            value
+            // Unix signal APIs take signed i32 PIDs: 0 targets the caller's
+            // process group and values above i32::MAX can become negative.
+            let pid = value
                 .parse::<u32>()
-                .map(Some)
-                .map_err(|e| VmError::InvalidEnvFile(format!("bad {k} PID {value:?}: {e}")))
+                .map_err(|e| VmError::InvalidEnvFile(format!("bad {k} PID {value:?}: {e}")))?;
+            if !(1..=i32::MAX as u32).contains(&pid) {
+                return Err(VmError::InvalidEnvFile(format!(
+                    "bad {k} PID {value:?}: Unix PIDs must be in 1..={}",
+                    i32::MAX
+                )));
+            }
+            Ok(Some(pid))
         };
 
         let container = get("CONTAINER_NAME")?;
@@ -464,6 +472,68 @@ mod tests {
             error.contains("FIRECRACKER_PID") && error.contains("bad"),
             "invalid PID must fail closed: {error}"
         );
+    }
+
+    fn write_env_with_pids(dir: &Path, firecracker_pid: &str, slirp_pid: &str) {
+        write_env(
+            dir,
+            &format!(
+                "CONTAINER_NAME=picoclaw-test\n\
+                 CUSTOMER_NAME=test\n\
+                 CLAW_TYPE=picoclaw\n\
+                 PORT=35000\n\
+                 SSH_PORT=22002\n\
+                 FIRECRACKER_PID={firecracker_pid}\n\
+                 SLIRP_PID={slirp_pid}\n"
+            ),
+        );
+    }
+
+    fn assert_firecracker_pid_is_rejected(value: &str) {
+        let tmp = TempDir::new().unwrap();
+        write_env_with_pids(tmp.path(), value, "");
+
+        let error = InstanceEnv::load_unchecked(tmp.path())
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("FIRECRACKER_PID") && error.contains("Unix PIDs must be"),
+            "unsafe PID {value:?} must fail closed: {error}"
+        );
+    }
+
+    #[test]
+    fn pid_zero_is_rejected() {
+        assert_firecracker_pid_is_rejected("0");
+    }
+
+    #[test]
+    fn pid_i32_max_is_accepted() {
+        let tmp = TempDir::new().unwrap();
+        write_env_with_pids(tmp.path(), "2147483647", "");
+
+        let env = InstanceEnv::load_unchecked(tmp.path()).unwrap();
+        assert_eq!(env.firecracker_pid, Some(i32::MAX as u32));
+    }
+
+    #[test]
+    fn pid_above_i32_max_is_rejected() {
+        assert_firecracker_pid_is_rejected("2147483648");
+    }
+
+    #[test]
+    fn pid_u32_max_is_rejected() {
+        assert_firecracker_pid_is_rejected("4294967295");
+    }
+
+    #[test]
+    fn ordinary_pids_are_accepted_for_both_processes() {
+        let tmp = TempDir::new().unwrap();
+        write_env_with_pids(tmp.path(), "54321", "54322");
+
+        let env = InstanceEnv::load_unchecked(tmp.path()).unwrap();
+        assert_eq!(env.firecracker_pid, Some(54321));
+        assert_eq!(env.slirp_pid, Some(54322));
     }
 
     #[test]

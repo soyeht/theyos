@@ -420,6 +420,95 @@ fn do_cleanup_with_ops(
 mod tests {
     use super::*;
     use std::fs;
+    #[cfg(unix)]
+    use std::process::{Child, Command};
+    #[cfg(unix)]
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    #[cfg(unix)]
+    use std::time::{Duration, Instant};
+
+    #[cfg(unix)]
+    static FORCE_KILL_ATTEMPTS: AtomicUsize = AtomicUsize::new(0);
+
+    #[cfg(unix)]
+    struct TestChild {
+        child: Child,
+    }
+
+    #[cfg(unix)]
+    impl TestChild {
+        fn pid(&self) -> u32 {
+            self.child.id()
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for TestChild {
+        fn drop(&mut self) {
+            if matches!(self.child.try_wait(), Ok(None)) {
+                let _ = self.child.kill();
+                let _ = self.child.wait();
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    fn spawn_test_child(ignore_term: bool) -> TestChild {
+        use std::os::unix::process::CommandExt;
+
+        let mut command = Command::new("/bin/sh");
+        if ignore_term {
+            command.args(["-c", "trap '' TERM; exec /bin/sleep 30"]);
+        } else {
+            command.args(["-c", "exec /bin/sleep 30"]);
+        }
+        // Give the child its own process group so the cleanup path may safely
+        // exercise its real process-group signals without affecting this test.
+        command.process_group(0);
+
+        TestChild {
+            child: command.spawn().expect("spawn controlled sleep child"),
+        }
+    }
+
+    #[cfg(unix)]
+    fn pid_exists(pid: u32) -> bool {
+        let pid = i32::try_from(pid).expect("child PID must fit i32");
+        // SAFETY: kill(pid, 0) only probes existence; pid came from Child::id.
+        unsafe { libc::kill(pid, 0) == 0 }
+    }
+
+    #[cfg(unix)]
+    fn wait_until_pid_exists(pid: u32) {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < deadline {
+            if pid_exists(pid) {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        panic!("controlled child PID {pid} never became observable");
+    }
+
+    #[cfg(unix)]
+    fn wait_until_pid_is_esrch(pid: u32) {
+        let pid = i32::try_from(pid).expect("child PID must fit i32");
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < deadline {
+            // SAFETY: kill(pid, 0) only probes existence; pid came from Child::id.
+            let result = unsafe { libc::kill(pid, 0) };
+            if result == -1 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH) {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        panic!("controlled child PID {pid} did not reach ESRCH before timeout");
+    }
+
+    #[cfg(unix)]
+    fn count_force_kill(_: u32) {
+        FORCE_KILL_ATTEMPTS.fetch_add(1, Ordering::SeqCst);
+    }
 
     // ── CreateGuard ────────────────────────────────────────────────────────
 
@@ -500,6 +589,72 @@ mod tests {
         assert!(
             !instance_dir.exists(),
             "directory should be removed even with bogus PIDs"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cleanup_kills_real_child_and_rechecks_until_esrch() {
+        let dir = tempfile::tempdir().unwrap();
+        let instance_dir = dir.path().join("test-instance");
+        fs::create_dir(&instance_dir).unwrap();
+        let child = spawn_test_child(false);
+        let pid = child.pid();
+        wait_until_pid_exists(pid);
+
+        assert!(
+            do_cleanup(&instance_dir, Some(pid), None),
+            "verified cleanup must remove the instance directory"
+        );
+        wait_until_pid_is_esrch(pid);
+        assert!(
+            !instance_dir.exists(),
+            "the directory must be removed only after the real child is gone"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cleanup_quarantines_real_term_ignoring_survivor_after_force_attempts() {
+        let dir = tempfile::tempdir().unwrap();
+        let instance_dir = dir.path().join("_warm-picoclaw-0");
+        fs::create_dir(&instance_dir).unwrap();
+        let child = spawn_test_child(true);
+        let pid = child.pid();
+        wait_until_pid_exists(pid);
+        let force_before = FORCE_KILL_ATTEMPTS.load(Ordering::SeqCst);
+
+        let removed = do_cleanup_with_ops(
+            &instance_dir,
+            Some(pid),
+            None,
+            CleanupOps {
+                is_pid_running,
+                persist_marker: persist_hostfwd_uncertain_marker,
+                kill_pid,
+                kill_pgrp,
+                kill_pid_force: count_force_kill,
+                kill_pgrp_force: count_force_kill,
+                reap_pid,
+                sleep: simulated_sleep,
+            },
+        );
+
+        assert!(!removed, "a real survivor must block directory removal");
+        assert!(
+            FORCE_KILL_ATTEMPTS.load(Ordering::SeqCst) >= force_before + 2,
+            "the force-kill hooks must be reached after TERM is ignored"
+        );
+        assert!(
+            pid_exists(pid),
+            "the real child must still be observed alive"
+        );
+        assert!(instance_dir.exists(), "survivor evidence must be preserved");
+        assert!(
+            instance_dir
+                .join(crate::instance_env::HOSTFWD_UNCERTAIN_MARKER)
+                .exists(),
+            "the survivor path must retain its quarantine marker"
         );
     }
 
