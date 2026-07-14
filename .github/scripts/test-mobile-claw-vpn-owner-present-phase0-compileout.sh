@@ -241,7 +241,11 @@ if grep -Eq 'fake-(rustc|rustup|docker)' "${TMP_ROOT}/path-tools.log"; then
   cat "${TMP_ROOT}/path-tools.log" >&2
   exit 1
 fi
-grep -Fq "unsupported Phase 0 build tool: unsupported" "${TMP_ROOT}/path-tools.log"
+if ! grep -Fq "unsupported Phase 0 build tool: unsupported" "${TMP_ROOT}/path-tools.log"; then
+  echo "error: PATH tool injection test reported an unexpected reason" >&2
+  cat "${TMP_ROOT}/path-tools.log" >&2
+  exit 1
+fi
 echo "PASS path_tool_injection_ignored"
 
 prepare_empty_authority_inputs
