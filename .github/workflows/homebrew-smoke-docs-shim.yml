@@ -1,0 +1,33 @@
+# Required-check shim for PRs that do not touch install/packaging paths.
+#
+# homebrew-smoke-macos.yml only triggers on the paths listed below, but its
+# "Install/Uninstall Smoke" job is a REQUIRED status check on main. A PR
+# touching none of those paths (docs-only, QA-only, ...) leaves the
+# required check in "Expected" forever (this blocked PR #343). Same
+# documented workaround as backend-ci-docs-shim.yml:
+# https://docs.github.com/en/pull-requests/collaborating-with-pull-requests/collaborating-on-repositories-with-code-quality-features/troubleshooting-required-status-checks#handling-skipped-but-required-checks
+#
+# KEEP `paths-ignore` BYTE-IDENTICAL to `on.pull_request.paths` in
+# homebrew-smoke-macos.yml.
+name: Homebrew Smoke (docs-only shim)
+
+on:
+  pull_request:
+    paths-ignore:
+      - "admin/rust/**"
+      - "admin/web/**"
+      - ".env.example"
+      - "homebrew/Formula/theyos.rb"
+      - "nix/**"
+      - "scripts/generate-brew-formula.sh"
+      - "tests/nixos-install/**"
+      - ".github/workflows/homebrew-smoke-macos.yml"
+
+jobs:
+  brew-smoke:
+    name: "Install/Uninstall Smoke"
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: No install/packaging paths changed
+        run: echo "No install/packaging paths changed — the real job lives in homebrew-smoke-macos.yml"

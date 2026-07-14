@@ -126,6 +126,7 @@ async fn main() {
     // before the main `cfg.addr` Axum listener near EOF, so
     // iPhone onboarding via Bonjour discovery is unaffected.
     let _push_status = server_rs::startup_wiring::install_house_created_push_transport_from_env();
+    let _tickle_status = server_rs::startup_wiring::install_owner_event_tickle_transport_from_env();
     #[cfg(feature = "dev_t1_datapath")]
     let _claw_vpn_status = server_rs::startup_wiring::per_claw_vpn_startup_gate_from_env();
 

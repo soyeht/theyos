@@ -1,0 +1,51 @@
+# Required-check shims for PRs that do not touch backend paths.
+#
+# backend-ci.yml only triggers on the paths listed below, but three of its
+# jobs are REQUIRED status checks on main. A PR touching none of those
+# paths (docs-only, QA-only, ...) leaves the required checks in
+# "Expected" forever and the PR can never merge without an admin bypass
+# (this blocked PR #343). This file is GitHub's documented workaround:
+# https://docs.github.com/en/pull-requests/collaborating-with-pull-requests/collaborating-on-repositories-with-code-quality-features/troubleshooting-required-status-checks#handling-skipped-but-required-checks
+#
+# KEEP `paths-ignore` BYTE-IDENTICAL to `on.pull_request.paths` in
+# backend-ci.yml. If the lists drift the failure mode is safe (a PR class
+# where neither workflow reports, blocking the PR again) but annoying.
+name: Backend CI (docs-only shim)
+
+on:
+  pull_request:
+    paths-ignore:
+      - "admin/rust/**"
+      - "admin/contracts/mobile-claw-vpn/v1/**"
+      - "admin/contracts/owner-approval/v2/**"
+      - ".env.example"
+      - "install-nixos"
+      - "nix/**"
+      - "tests/install-nixos-test.sh"
+      - "tests/nixos-install/**"
+      - ".github/workflows/backend-ci.yml"
+
+jobs:
+  build-and-test-linux:
+    name: "Build & Test (Rust / Linux)"
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: No backend paths changed
+        run: echo "No backend paths changed — the real job lives in backend-ci.yml"
+
+  build-and-test-macos:
+    name: "Build & Test (Rust / macOS)"
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: No backend paths changed
+        run: echo "No backend paths changed — the real job lives in backend-ci.yml"
+
+  no-bash-policy:
+    name: "No-Bash Policy Check"
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: No backend paths changed
+        run: echo "No backend paths changed — the real job lives in backend-ci.yml"

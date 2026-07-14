@@ -2,6 +2,7 @@
 
 pub mod apns_dispatcher;
 pub mod apns_push;
+pub mod apns_tickle_transport;
 pub mod artifact_installer;
 pub mod artifact_resolver;
 pub mod auth;
