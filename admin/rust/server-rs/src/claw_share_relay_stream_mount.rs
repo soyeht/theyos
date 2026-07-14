@@ -17,18 +17,26 @@
 //! It announces nothing public: no advertise, no inbound listener bind, no
 //! claim-ack, no guest/iOS. With an empty offer store, ON is a serving no-op.
 //!
+//! Phase 0 production builds compile out the `IpTunnel` backend and reject that
+//! resource at provisioning. The real TUN/utun path exists only for unit tests
+//! or the explicit `dev_t1_datapath` targets; PTY and `ClawSite` remain unchanged.
+//!
 //! Carries (out of scope here): the `relay_stream` mount uses its OWN
 //! `ReplayGuard` (unify with the direct data-tunnel listener pre-live); `ClawSite`
 //! has no real endpoint yet (placeholder fail-closed); the Noise key uses a
 //! `FileKeystore` (live keychain hardening later); handles live in a `OnceLock`
 //! rather than a graceful `AppState` holder.
 
+#[cfg(any(test, feature = "dev_t1_datapath"))]
 use std::cell::RefCell;
+#[cfg(any(test, feature = "dev_t1_datapath"))]
 use std::io;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
+#[cfg(any(test, feature = "dev_t1_datapath"))]
 use std::rc::Rc;
 use std::sync::{Arc, OnceLock};
+#[cfg(any(test, feature = "dev_t1_datapath"))]
 use std::time::Duration;
 
 use household_rs::claw_share::{ClawShareSlotStore, GuestCredential};
@@ -57,36 +65,48 @@ use crate::claw_share_relay_stream_provision::{
     RelayStreamProvisionError, provision_relay_stream_group_offer, provision_relay_stream_offer,
     provision_relay_stream_public_offer,
 };
+#[cfg(not(any(test, feature = "dev_t1_datapath")))]
+use crate::claw_share_relay_stream_runtime::assemble_relay_stream_live;
+#[cfg(any(test, feature = "dev_t1_datapath"))]
+use crate::claw_share_relay_stream_runtime::assemble_relay_stream_live_with_ip_tunnel_router;
 use crate::claw_share_relay_stream_runtime::{
     RelayStreamLiveConfig, RelayStreamLiveError, RelayStreamLiveHandles, RelayStreamLiveInputs,
-    assemble_relay_stream_live_with_ip_tunnel_router,
 };
+#[cfg(any(test, feature = "dev_t1_datapath"))]
 use crate::claw_share_relay_stream_target_router::{
     RelayStreamIpTunnelRouter, RelayStreamIpTunnelTarget, RelayStreamIpTunnelUnavailableRouter,
 };
+#[cfg(any(test, feature = "dev_t1_datapath"))]
 use crate::claw_vpn_dev_config::{ClawVpnDevConfig, ClawVpnDevConfigError};
+#[cfg(any(test, feature = "dev_t1_datapath"))]
 use crate::claw_vpn_interface_route_plan::{
     ClawVpnInterfaceName, ClawVpnInterfaceRoutePlatform, ClawVpnInterfaceRouteToolPaths,
 };
-#[cfg(target_os = "linux")]
+#[cfg(all(any(test, feature = "dev_t1_datapath"), target_os = "linux"))]
 use crate::claw_vpn_linux_tun::{
     ClawVpnLinuxTunConfig, ClawVpnLinuxTunDevice, ClawVpnLinuxTunName,
 };
-#[cfg(target_os = "macos")]
+#[cfg(all(any(test, feature = "dev_t1_datapath"), target_os = "macos"))]
 use crate::claw_vpn_macos_utun::ClawVpnMacosUtunDevice;
+#[cfg(any(test, feature = "dev_t1_datapath"))]
 use crate::claw_vpn_packet_pump::ClawVpnPacketInterface;
+#[cfg(any(test, feature = "dev_t1_datapath"))]
 use crate::claw_vpn_t1_caller::ClawVpnT1CallerStatus;
+#[cfg(any(test, feature = "dev_t1_datapath"))]
 use crate::claw_vpn_t1_relay_stream_router::{
     ClawVpnT1AuditSinkError, ClawVpnT1RelayStreamAuditSink, ClawVpnT1RelayStreamBoxedRouter,
     ClawVpnT1RelayStreamBuildInputs, ClawVpnT1RelayStreamLaunchRuntime,
     ClawVpnT1RelayStreamRouterParts, assemble_claw_vpn_t1_relay_stream_router,
     claw_vpn_t1_canonical_audit_log_path, claw_vpn_t1_spooled_jsonl_audit_sink,
 };
+#[cfg(any(test, feature = "dev_t1_datapath"))]
 use crate::claw_vpn_target_session_router::{
     ClawVpnTargetSessionRouterLaunchError, ClawVpnTargetSessionRouterWiring,
 };
+#[cfg(any(test, feature = "dev_t1_datapath"))]
 use crate::claw_vpn_wiring::{ClawVpnRuntimeWiringConfig, ClawVpnRuntimeWiringInputs};
 use crate::household_state::HouseholdState;
+#[cfg(any(test, feature = "dev_t1_datapath"))]
 use crate::startup_wiring::{
     PerClawVpnT1PreflightEvidence, PerClawVpnT1PreflightEvidenceBundle,
     load_per_claw_vpn_t1_preflight_evidence_record_for_current_build,
@@ -114,16 +134,21 @@ const RELAY_STREAM_DEV_ALLOW_PUBLIC_RELAY_DIAL_ENV: &str =
 const RELAY_STREAM_CLAWSITE_BACKEND_ENV: &str = "THEYOS_RELAY_STREAM_CLAWSITE_BACKEND";
 
 /// Env var selecting the resource a provisioned offer is minted for: `pty`
-/// (default), `clawsite`, or reserved `ip_tunnel`.
+/// (default), `clawsite`, or DEV/test-only `ip_tunnel`.
 const RELAY_STREAM_RESOURCE_ENV: &str = "THEYOS_RELAY_STREAM_RESOURCE";
 
+#[cfg(any(test, feature = "dev_t1_datapath"))]
 const CLAW_VPN_T1_TARGET_SESSION_IO_TIMEOUT: Duration = Duration::from_secs(5);
+#[cfg(any(test, feature = "dev_t1_datapath"))]
 const CLAW_VPN_T1_PREFLIGHT_EVIDENCE_RECORD_ENV: &str =
     "THEYOS_CLAW_VPN_T1_PREFLIGHT_EVIDENCE_RECORD";
-#[cfg(target_os = "linux")]
+#[cfg(all(any(test, feature = "dev_t1_datapath"), target_os = "linux"))]
 const CLAW_VPN_T1_LINUX_TUN_NAME: &str = "clawvpn0";
+#[cfg(any(test, feature = "dev_t1_datapath"))]
 const CLAW_VPN_LINUX_IP_TOOL_PATH: &str = "/sbin/ip";
+#[cfg(any(test, feature = "dev_t1_datapath"))]
 const CLAW_VPN_MACOS_IFCONFIG_TOOL_PATH: &str = "/sbin/ifconfig";
+#[cfg(any(test, feature = "dev_t1_datapath"))]
 const CLAW_VPN_MACOS_ROUTE_TOOL_PATH: &str = "/sbin/route";
 
 /// The single source for the relay address (`host:port`). The provisioned offer
@@ -144,6 +169,7 @@ static LIVE_HANDLES: OnceLock<RelayStreamLiveHandles> = OnceLock::new();
 ///
 /// The runtime calls its router factory per binding/worker. Caching the mounted
 /// router here keeps T1 admission state shared across those factory calls.
+#[cfg(any(test, feature = "dev_t1_datapath"))]
 static MOUNTED_IP_TUNNEL_ROUTER: OnceLock<Arc<RelayStreamMountedIpTunnelRouter>> = OnceLock::new();
 
 /// `ClawSite` target router.
@@ -162,6 +188,7 @@ pub struct RelayStreamClawSiteRouter {
     backend_addr: Option<String>,
 }
 
+#[cfg(any(test, feature = "dev_t1_datapath"))]
 enum RelayStreamMountedIpTunnelRouter {
     Unavailable(RelayStreamIpTunnelUnavailableRouter),
     #[cfg(target_os = "linux")]
@@ -170,6 +197,7 @@ enum RelayStreamMountedIpTunnelRouter {
     T1Macos(Box<ClawVpnT1RelayStreamBoxedRouter<ClawVpnMacosUtunDevice>>),
 }
 
+#[cfg(any(test, feature = "dev_t1_datapath"))]
 impl RelayStreamIpTunnelRouter for RelayStreamMountedIpTunnelRouter {
     async fn open_ip_tunnel(
         &self,
@@ -217,17 +245,38 @@ pub enum RelayStreamResourceEnvError {
 }
 
 /// Resource a provisioned offer is minted for. Missing value defaults to `Pty`;
-/// recognized values select the matching signed resource. Unknown values fail
-/// closed so a typo never mints a broader/different capability.
-fn parse_resource(value: Option<&str>) -> Result<RelayStreamResource, RelayStreamResourceEnvError> {
+/// recognized values select the matching signed resource. `ip_tunnel` is
+/// rejected by the Phase 0 production build even when explicitly requested.
+/// Unknown values fail closed so a typo never mints a broader capability.
+fn parse_resource_for_policy(
+    value: Option<&str>,
+    ip_tunnel_compiled: bool,
+) -> Result<RelayStreamResource, RelayStreamResourceEnvError> {
     match value.map(str::trim) {
         None | Some("" | "pty" | "Pty" | "PTY") => Ok(RelayStreamResource::Pty),
         Some("clawsite" | "ClawSite" | "CLAWSITE") => Ok(RelayStreamResource::ClawSite),
         Some("ip_tunnel" | "iptunnel" | "IpTunnel" | "IPTUNNEL") => {
-            Ok(RelayStreamResource::IpTunnel)
+            if ip_tunnel_compiled {
+                Ok(RelayStreamResource::IpTunnel)
+            } else {
+                Err(RelayStreamResourceEnvError::Invalid)
+            }
         }
         Some(_) => Err(RelayStreamResourceEnvError::Invalid),
     }
+}
+
+fn parse_resource(value: Option<&str>) -> Result<RelayStreamResource, RelayStreamResourceEnvError> {
+    parse_resource_for_policy(
+        value,
+        crate::claw_share_relay_stream_offer_store::IP_TUNNEL_RESOURCE_COMPILED,
+    )
+}
+
+/// Executable artifact probe used by the Phase 0 attestation command.
+#[must_use]
+pub(crate) fn phase0_ip_tunnel_env_accepts_resource() -> bool {
+    parse_resource(Some("IpTunnel")).is_ok()
 }
 
 fn relay_stream_resource_from_env() -> Result<RelayStreamResource, RelayStreamResourceEnvError> {
@@ -350,14 +399,22 @@ async fn mount_relay_stream_live(
         now_unix,
     };
 
-    Ok(assemble_relay_stream_live_with_ip_tunnel_router(
-        inputs,
-        config,
-        Arc::new(mounted_ip_tunnel_router_from_t1_gate),
-    )
-    .await?)
+    #[cfg(any(test, feature = "dev_t1_datapath"))]
+    {
+        return Ok(assemble_relay_stream_live_with_ip_tunnel_router(
+            inputs,
+            config,
+            Arc::new(mounted_ip_tunnel_router_from_t1_gate),
+        )
+        .await?);
+    }
+    #[cfg(not(any(test, feature = "dev_t1_datapath")))]
+    {
+        Ok(assemble_relay_stream_live(inputs, config).await?)
+    }
 }
 
+#[cfg(any(test, feature = "dev_t1_datapath"))]
 fn mounted_ip_tunnel_router_from_t1_gate() -> Arc<RelayStreamMountedIpTunnelRouter> {
     Arc::clone(
         MOUNTED_IP_TUNNEL_ROUTER
@@ -365,6 +422,7 @@ fn mounted_ip_tunnel_router_from_t1_gate() -> Arc<RelayStreamMountedIpTunnelRout
     )
 }
 
+#[cfg(any(test, feature = "dev_t1_datapath"))]
 fn build_mounted_ip_tunnel_router_from_t1_gate() -> RelayStreamMountedIpTunnelRouter {
     #[cfg(target_os = "linux")]
     {
@@ -399,7 +457,7 @@ fn build_mounted_ip_tunnel_router_from_t1_gate() -> RelayStreamMountedIpTunnelRo
     RelayStreamMountedIpTunnelRouter::Unavailable(RelayStreamIpTunnelUnavailableRouter)
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(all(any(test, feature = "dev_t1_datapath"), target_os = "linux"))]
 fn assemble_linux_t1_ip_tunnel_router()
 -> ClawVpnT1CallerStatus<ClawVpnT1RelayStreamBoxedRouter<ClawVpnLinuxTunDevice>> {
     assemble_t1_ip_tunnel_router(
@@ -410,7 +468,7 @@ fn assemble_linux_t1_ip_tunnel_router()
     )
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(all(any(test, feature = "dev_t1_datapath"), target_os = "macos"))]
 fn assemble_macos_t1_ip_tunnel_router()
 -> ClawVpnT1CallerStatus<ClawVpnT1RelayStreamBoxedRouter<ClawVpnMacosUtunDevice>> {
     assemble_t1_ip_tunnel_router(
@@ -421,6 +479,7 @@ fn assemble_macos_t1_ip_tunnel_router()
     )
 }
 
+#[cfg(any(test, feature = "dev_t1_datapath"))]
 fn assemble_t1_ip_tunnel_router<I, LoadConfig, LoadEvidence>(
     load_config: LoadConfig,
     load_evidence_bundle: LoadEvidence,
@@ -455,6 +514,7 @@ where
     )
 }
 
+#[cfg(any(test, feature = "dev_t1_datapath"))]
 #[derive(Debug, thiserror::Error)]
 enum ClawVpnT1MountedAuditSinkError {
     #[error("claw vpn t1 audit path unavailable")]
@@ -464,6 +524,7 @@ enum ClawVpnT1MountedAuditSinkError {
     Sink(#[source] ClawVpnT1AuditSinkError),
 }
 
+#[cfg(any(test, feature = "dev_t1_datapath"))]
 fn t1_preflight_evidence_bundle_from_env() -> Option<PerClawVpnT1PreflightEvidenceBundle> {
     let record_path = std::env::var_os(CLAW_VPN_T1_PREFLIGHT_EVIDENCE_RECORD_ENV)?;
     match load_per_claw_vpn_t1_preflight_evidence_record_for_current_build(record_path) {
@@ -479,6 +540,7 @@ fn t1_preflight_evidence_bundle_from_env() -> Option<PerClawVpnT1PreflightEviden
     }
 }
 
+#[cfg(any(test, feature = "dev_t1_datapath"))]
 fn t1_preflight_evidence_or_missing(
     bundle: Option<&PerClawVpnT1PreflightEvidenceBundle>,
 ) -> PerClawVpnT1PreflightEvidence {
@@ -487,6 +549,7 @@ fn t1_preflight_evidence_or_missing(
     })
 }
 
+#[cfg(any(test, feature = "dev_t1_datapath"))]
 fn t1_open_audit_sink_from_preflight(
     bundle: Option<&PerClawVpnT1PreflightEvidenceBundle>,
 ) -> ClawVpnT1RelayStreamAuditSink {
@@ -510,6 +573,7 @@ fn t1_open_audit_sink_from_preflight(
     }
 }
 
+#[cfg(any(test, feature = "dev_t1_datapath"))]
 fn t1_spooled_audit_sink_from_root(
     root: impl AsRef<Path>,
 ) -> Result<ClawVpnT1RelayStreamAuditSink, ClawVpnT1MountedAuditSinkError> {
@@ -518,6 +582,7 @@ fn t1_spooled_audit_sink_from_root(
     claw_vpn_t1_spooled_jsonl_audit_sink(&audit_path).map_err(ClawVpnT1MountedAuditSinkError::Sink)
 }
 
+#[cfg(any(test, feature = "dev_t1_datapath"))]
 fn enabled_claw_vpn_t1_wiring_config() -> ClawVpnRuntimeWiringConfig {
     let defaults = ClawVpnRuntimeWiringConfig::default();
     ClawVpnRuntimeWiringConfig::new(
@@ -527,7 +592,7 @@ fn enabled_claw_vpn_t1_wiring_config() -> ClawVpnRuntimeWiringConfig {
     )
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(all(any(test, feature = "dev_t1_datapath"), target_os = "linux"))]
 fn linux_t1_build_inputs() -> ClawVpnT1RelayStreamBuildInputs<ClawVpnLinuxTunDevice> {
     Box::new(|_config, _target, _context, relay| {
         let tun_name = ClawVpnLinuxTunName::new(CLAW_VPN_T1_LINUX_TUN_NAME)
@@ -545,7 +610,7 @@ fn linux_t1_build_inputs() -> ClawVpnT1RelayStreamBuildInputs<ClawVpnLinuxTunDev
     })
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(all(any(test, feature = "dev_t1_datapath"), target_os = "macos"))]
 fn macos_t1_build_inputs() -> ClawVpnT1RelayStreamBuildInputs<ClawVpnMacosUtunDevice> {
     Box::new(|_config, _target, _context, relay| {
         let device = ClawVpnMacosUtunDevice::open()?;
@@ -561,6 +626,7 @@ fn macos_t1_build_inputs() -> ClawVpnT1RelayStreamBuildInputs<ClawVpnMacosUtunDe
     })
 }
 
+#[cfg(any(test, feature = "dev_t1_datapath"))]
 fn claw_vpn_route_tool_paths() -> io::Result<ClawVpnInterfaceRouteToolPaths> {
     ClawVpnInterfaceRouteToolPaths::try_new(
         CLAW_VPN_LINUX_IP_TOOL_PATH,
@@ -570,6 +636,7 @@ fn claw_vpn_route_tool_paths() -> io::Result<ClawVpnInterfaceRouteToolPaths> {
     .map_err(|error| io::Error::other(format!("{error:?}")))
 }
 
+#[cfg(any(test, feature = "dev_t1_datapath"))]
 fn t1_runtime_launcher<I>() -> ClawVpnT1RelayStreamLaunchRuntime<I>
 where
     I: ClawVpnPacketInterface + Send + 'static,
@@ -846,6 +913,22 @@ pub enum RelayStreamMountError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn phase0_policy_rejects_ip_tunnel_before_mount_or_router_selection() {
+        assert_eq!(
+            parse_resource_for_policy(Some("IpTunnel"), false),
+            Err(RelayStreamResourceEnvError::Invalid)
+        );
+        assert_eq!(
+            parse_resource_for_policy(Some("pty"), false),
+            Ok(RelayStreamResource::Pty)
+        );
+        assert_eq!(
+            parse_resource_for_policy(Some("clawsite"), false),
+            Ok(RelayStreamResource::ClawSite)
+        );
+    }
 
     use std::cell::Cell;
     use std::ffi::OsString;

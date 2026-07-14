@@ -18,13 +18,29 @@ use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
 async fn main() -> ExitCode {
+    let argv: Vec<String> = std::env::args().collect();
+    if argv.len() >= 2 && argv[1] == "--owner-present-phase0-contract" {
+        println!(
+            "{}",
+            serde_json::json!({
+                "schema": "theyos-product-a-phase0-http-boundary-v1",
+                "component": "theyos-llm-proxy",
+                "authority": "none",
+                "production_activation": false,
+                "allowed_requests": [
+                    {"method": "GET", "path": "/api/v1/mobile/claw-vpn/status"},
+                    {"method": "HEAD", "path": "/api/v1/mobile/claw-vpn/status"}
+                ]
+            })
+        );
+        return ExitCode::SUCCESS;
+    }
     init_tracing();
 
     // CLI subcommands. The proxy binary is the operator's one entry point —
     // it serves traffic, AND it manages credentials so operators don't need
     // a second tool just to write a secret. Anything other than the (no-arg)
     // server-mode case is handled before the server starts.
-    let argv: Vec<String> = std::env::args().collect();
     if argv.len() >= 2 {
         match argv[1].as_str() {
             "set-credential" => return run_set_credential(&argv[2..]),
@@ -122,7 +138,7 @@ async fn main() -> ExitCode {
     });
 
     let app = router(state);
-    if let Err(e) = axum::serve(listener, app).await {
+    if let Err(e) = core_rs::phase0_axum_serve!(listener, app).await {
         tracing::error!(error = %e, "axum::serve exited");
         return ExitCode::from(4);
     }

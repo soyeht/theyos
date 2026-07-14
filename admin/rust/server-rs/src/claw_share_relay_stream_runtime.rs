@@ -32,12 +32,16 @@ use crate::claw_share_relay_stream_responder_params::{
 use crate::claw_share_relay_stream_responder_reverse_connect::{
     RelayStreamResponderReverseConnectConfig, RelayStreamResponderReverseConnectError,
 };
+#[cfg(not(any(test, feature = "dev_t1_datapath")))]
+use crate::claw_share_relay_stream_reverse_connect_binding::bind_relay_stream_reverse_connect;
+#[cfg(any(test, feature = "dev_t1_datapath"))]
 use crate::claw_share_relay_stream_reverse_connect_binding::bind_relay_stream_reverse_connect_with_ip_tunnel_router;
 use crate::claw_share_relay_stream_reverse_connect_pool::{
     RelayStreamOfferResyncDriverHandle, RelayStreamReverseConnectBindingBuildError,
     RelayStreamReverseConnectBindingFactory, RelayStreamReverseConnectPoolConfig,
     RelayStreamReverseConnectPoolError, spawn_relay_stream_offer_resync_driver,
 };
+#[cfg(any(test, feature = "dev_t1_datapath"))]
 use crate::claw_share_relay_stream_target_router::{
     RelayStreamIpTunnelRouter, RelayStreamIpTunnelUnavailableRouter,
 };
@@ -169,14 +173,91 @@ where
     P: ClawTargetRouter + 'static,
     S: ClawTargetRouter + 'static,
 {
-    assemble_relay_stream_live_with_ip_tunnel_router(
-        inputs,
-        config,
-        Arc::new(|| RelayStreamIpTunnelUnavailableRouter),
-    )
-    .await
+    #[cfg(any(test, feature = "dev_t1_datapath"))]
+    {
+        return assemble_relay_stream_live_with_ip_tunnel_router(
+            inputs,
+            config,
+            Arc::new(|| RelayStreamIpTunnelUnavailableRouter),
+        )
+        .await;
+    }
+
+    #[cfg(not(any(test, feature = "dev_t1_datapath")))]
+    assemble_relay_stream_live_phase0(inputs, config).await
 }
 
+#[cfg(not(any(test, feature = "dev_t1_datapath")))]
+async fn assemble_relay_stream_live_phase0<P, S>(
+    inputs: RelayStreamLiveInputs<'_, P, S>,
+    config: RelayStreamLiveConfig,
+) -> Result<Option<RelayStreamLiveHandles>, RelayStreamLiveError>
+where
+    P: ClawTargetRouter + 'static,
+    S: ClawTargetRouter + 'static,
+{
+    if !config.enabled {
+        return Ok(None);
+    }
+
+    let reverse_connect = config.reverse_connect.validate()?;
+    let pool_config = config.pool.validate()?;
+    let now = (inputs.now_unix)();
+    let trust_runtime = Arc::new(
+        RelayStreamTrustContextRuntime::load(
+            &inputs.household,
+            inputs.mesh_log.as_ref(),
+            now,
+            config.trust_policy,
+        )
+        .await?,
+    );
+    let admission = RelayStreamAdmission::new(Arc::clone(&trust_runtime));
+    let trust = admission.admit(now)?;
+    let params = Arc::new(
+        assemble_relay_stream_responder_params(
+            &config.responder,
+            inputs.keystore_backend,
+            admission.clone(),
+        )
+        .await?,
+    );
+    let binding_factory = build_binding_factory_phase0(
+        admission,
+        inputs.household_id,
+        Arc::clone(&inputs.slots),
+        Arc::clone(&inputs.replay),
+        Arc::clone(&inputs.pty_router_factory),
+        Arc::clone(&inputs.clawsite_router_factory),
+        Arc::clone(&inputs.now_unix),
+    );
+    let refresh_driver = spawn_relay_stream_trust_refresh_driver(
+        Arc::clone(&trust_runtime),
+        inputs.household,
+        Arc::clone(&inputs.mesh_log),
+        config.trust_refresh,
+        Arc::clone(&inputs.refresh_trigger),
+        Arc::clone(&inputs.now_unix),
+    )?;
+    let resync_driver = spawn_relay_stream_offer_resync_driver(
+        inputs.state_dir,
+        trust,
+        config.resync_tick,
+        pool_config,
+        reverse_connect,
+        params,
+        binding_factory,
+        inputs.now_unix,
+    )?;
+
+    Ok(Some(RelayStreamLiveHandles {
+        trust_runtime,
+        refresh_driver,
+        resync_driver,
+    }))
+}
+
+#[cfg(any(test, feature = "dev_t1_datapath"))]
 pub async fn assemble_relay_stream_live_with_ip_tunnel_router<P, S, I>(
     inputs: RelayStreamLiveInputs<'_, P, S>,
     config: RelayStreamLiveConfig,
@@ -256,6 +337,43 @@ where
     }))
 }
 
+#[cfg(not(any(test, feature = "dev_t1_datapath")))]
+#[allow(clippy::too_many_arguments)]
+fn build_binding_factory_phase0<P, S>(
+    admission: RelayStreamAdmission,
+    household_id: HouseholdId,
+    slots: Arc<ClawShareSlotStore>,
+    replay: Arc<ReplayGuard>,
+    pty_router_factory: Arc<dyn Fn() -> P + Send + Sync>,
+    clawsite_router_factory: Arc<dyn Fn() -> S + Send + Sync>,
+    now_unix: Arc<dyn Fn() -> u64 + Send + Sync>,
+) -> Arc<RelayStreamReverseConnectBindingFactory<P, S>>
+where
+    P: ClawTargetRouter + 'static,
+    S: ClawTargetRouter + 'static,
+{
+    Arc::new(move |offer: Arc<RelayStreamOfferContract>, now| {
+        if offer.payload.not_after <= now {
+            return Err(RelayStreamReverseConnectBindingBuildError::Expired);
+        }
+        let trust = admission.admit(now).map_err(|error| {
+            RelayStreamReverseConnectBindingBuildError::Unhealthy(error.to_string())
+        })?;
+        let router_clock = Arc::clone(&now_unix);
+        Ok(bind_relay_stream_reverse_connect(
+            offer,
+            trust,
+            household_id.clone(),
+            Arc::clone(&slots),
+            Arc::clone(&replay),
+            pty_router_factory(),
+            clawsite_router_factory(),
+            move || router_clock(),
+        ))
+    })
+}
+
+#[cfg(any(test, feature = "dev_t1_datapath"))]
 #[allow(clippy::too_many_arguments)]
 fn build_binding_factory<P, S, I>(
     admission: RelayStreamAdmission,

@@ -1,4 +1,4 @@
-#!/usr/bin/env sh
+#!/usr/bin/env bash
 # theyOS build script - Unified build for macOS
 # This script compiles all Rust binaries for the current platform
 
@@ -17,6 +17,52 @@ NC='\033[0m' # No Color
 info() { echo "${GREEN}[INFO]${NC} $1"; }
 warn() { echo "${YELLOW}[WARN]${NC} $1"; }
 error() { echo "${RED}[ERROR]${NC} $1"; exit 1; }
+
+run_engine_build_tool() {
+    local system_home="${HOME:?HOME is required}"
+    local cargo_home="${PHASE0_CARGO_HOME:-${system_home}/.cargo}"
+    local rustup_home="${PHASE0_RUSTUP_HOME:-${system_home}/.rustup}"
+    for cargo_config in "${cargo_home}/config" "${cargo_home}/config.toml"; do
+        if [ -e "${cargo_config}" ] || [ -L "${cargo_config}" ]; then
+            error "canonical theyos-engine build forbids Cargo home config"
+        fi
+    done
+    local cargo_bin
+    cargo_bin="$(command -v cargo)"
+    local canonical_path
+    canonical_path="$(dirname "${cargo_bin}"):${cargo_home}/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin"
+    local clean_root
+    clean_root="$(mktemp -d "${TMPDIR:-/tmp}/theyos-engine-build.XXXXXX")"
+    local expected_rust
+    expected_rust="$(sed -n 's/^channel = "\([^"]*\)"/\1/p' "${RUST_DIR}/rust-toolchain.toml")"
+    local source_sha
+    source_sha="$(git -C "${REPO_ROOT}" rev-parse HEAD)"
+
+    mkdir -p "${clean_root}/home" "${clean_root}/tmp"
+    local status=0
+    env -i \
+        HOME="${clean_root}/home" \
+        CARGO_HOME="${cargo_home}" \
+        RUSTUP_HOME="${rustup_home}" \
+        TMPDIR="${clean_root}/tmp" \
+        PATH="${canonical_path}" \
+        LC_ALL=C \
+        LANG=C \
+        RUSTUP_TOOLCHAIN="${expected_rust}" \
+        CARGO_TARGET_DIR="${RUST_DIR}/target" \
+        CARGO_NET_OFFLINE=true \
+        THEYOS_PHASE0_CLEAN_ENV=1 \
+        THEYOS_BUILD_GIT_SHA="${source_sha}" \
+        "${cargo_bin}" run \
+        --manifest-path "${RUST_DIR}/Cargo.toml" \
+        --locked \
+        --offline \
+        --release \
+        --package theyos-engine-build-rs \
+        -- "$@" || status=$?
+    rm -rf "${clean_root}"
+    return "${status}"
+}
 
 # Detect platform
 detect_platform() {
@@ -122,6 +168,18 @@ codesign_macos_binaries() {
         return 0
     fi
 
+    # The legacy `package` command builds from the ambient workspace and has
+    # no Phase 0 subject manifest. Keep it useful for ad-hoc development, but
+    # make it impossible for that path to create a real signed/notarized
+    # artifact. Production signing is only available through
+    # `package-soyeht-mac`, which verifies the complete Phase 0 subject first.
+    if [ -n "${THEYOS_CODESIGN_IDENTITY:-}" ] || \
+        [ -n "${APPLE_NOTARY_KEY_P8:-}" ] || \
+        [ -n "${APPLE_NOTARY_KEY_ID:-}" ] || \
+        [ -n "${APPLE_NOTARY_ISSUER_ID:-}" ]; then
+        error "legacy package cannot perform real macOS signing/notarization; use package-soyeht-mac with a verified Phase 0 subject"
+    fi
+
     local stage_dir="${REPO_ROOT}/.deploy-staging/${PLATFORM}"
     local entitlements="${SCRIPT_DIR}/entitlements/vmrunner-macos.entitlements"
 
@@ -205,17 +263,24 @@ codesign_macos_binaries() {
 #
 # Skipped (with info-level log) when:
 # - THEYOS_CODESIGN_IDENTITY is unset (ad-hoc binaries can't be notarized)
-# - APPLE_ID / APPLE_TEAM_ID / APPLE_ID_APP_PASSWORD env vars aren't all set
+# - APPLE_NOTARY_KEY_P8 / APPLE_NOTARY_KEY_ID / APPLE_NOTARY_ISSUER_ID env vars
+#   aren't all set
 notarize_macos() {
     if [ "${PLATFORM}" != "macos-arm64" ] && [ "${PLATFORM}" != "macos-intel" ]; then
         return 0
+    fi
+    if [ -n "${THEYOS_CODESIGN_IDENTITY:-}" ] || \
+        [ -n "${APPLE_NOTARY_KEY_P8:-}" ] || \
+        [ -n "${APPLE_NOTARY_KEY_ID:-}" ] || \
+        [ -n "${APPLE_NOTARY_ISSUER_ID:-}" ]; then
+        error "legacy package cannot notarize an ambient build; use package-soyeht-mac with a verified Phase 0 subject"
     fi
     if [ -z "${THEYOS_CODESIGN_IDENTITY:-}" ]; then
         info "Skipping notarization (THEYOS_CODESIGN_IDENTITY unset; ad-hoc binaries can't be notarized)"
         return 0
     fi
-    if [ -z "${APPLE_ID:-}" ] || [ -z "${APPLE_TEAM_ID:-}" ] || [ -z "${APPLE_ID_APP_PASSWORD:-}" ]; then
-        warn "Skipping notarization: APPLE_ID / APPLE_TEAM_ID / APPLE_ID_APP_PASSWORD must all be set"
+    if [ -z "${APPLE_NOTARY_KEY_P8:-}" ] || [ -z "${APPLE_NOTARY_KEY_ID:-}" ] || [ -z "${APPLE_NOTARY_ISSUER_ID:-}" ]; then
+        warn "Skipping notarization: APPLE_NOTARY_KEY_P8 / APPLE_NOTARY_KEY_ID / APPLE_NOTARY_ISSUER_ID must all be set"
         warn "  Expected for tagged release builds; safe to skip on local dev."
         return 0
     fi
@@ -229,9 +294,9 @@ notarize_macos() {
 
     info "Submitting to Apple notarytool (typically 1-3 minutes)..."
     xcrun notarytool submit "${zip_path}" \
-        --apple-id "${APPLE_ID}" \
-        --team-id "${APPLE_TEAM_ID}" \
-        --password "${APPLE_ID_APP_PASSWORD}" \
+        --key "${APPLE_NOTARY_KEY_P8}" \
+        --key-id "${APPLE_NOTARY_KEY_ID}" \
+        --issuer "${APPLE_NOTARY_ISSUER_ID}" \
         --wait
 
     rm -f "${zip_path}"
@@ -317,8 +382,24 @@ package_soyeht_mac() {
         error "package-soyeht-mac requires macos-arm64 — binary is aarch64 and output goes to dist/macos-arm64/ (current platform: ${PLATFORM})"
     fi
 
+    local sign_id="${THEYOS_CODESIGN_IDENTITY:-}"
+    local has_notary_credentials="${APPLE_NOTARY_KEY_P8:-}${APPLE_NOTARY_KEY_ID:-}${APPLE_NOTARY_ISSUER_ID:-}"
+    if [ -n "${sign_id}" ] || [ -n "${has_notary_credentials}" ]; then
+        if [ -z "${THEYOS_RELEASE:-}" ]; then
+            error "real macOS signing/notarization requires THEYOS_RELEASE and a Phase 0 unsigned subject"
+        fi
+        if [ -z "${PHASE0_UNSIGNED_STAGE_DIR:-}" ] || \
+            [ -z "${PHASE0_EXPECTED_UNSIGNED_PACKAGE_MANIFEST_SHA256:-}" ] || \
+            [ -z "${PHASE0_EXPECTED_PHASE0_ATTESTATION_SHA256:-}" ]; then
+            error "real macOS signing/notarization requires the complete Phase 0 subject binding"
+        fi
+    fi
+
     local version
     if [ -n "${THEYOS_RELEASE:-}" ]; then
+        if [ -z "${PHASE0_EXPECTED_UNSIGNED_ENGINE_SHA256:-}" ]; then
+            error "THEYOS_RELEASE requires PHASE0_EXPECTED_UNSIGNED_ENGINE_SHA256"
+        fi
         # Release path: require an exact tag. Fails early if actions/checkout
         # did not fetch tags or HEAD is not tagged — avoids shipping "dev" builds.
         version=$(git -C "${REPO_ROOT}" describe --tags --exact-match 2>/dev/null) || \
@@ -329,22 +410,71 @@ package_soyeht_mac() {
 
     local helpers_dir="${REPO_ROOT}/dist/macos-arm64/Soyeht.app/Contents/Helpers"
     local target_dir="${REPO_ROOT}/admin/rust/target/aarch64-apple-darwin/release"
-    local entitlements="${SCRIPT_DIR}/entitlements/vmrunner-macos.entitlements"
+    local unsigned_stage="${PHASE0_UNSIGNED_STAGE_DIR:-}"
+    local package_manifest=""
+    local phase0_manifest_verified=0
+    if [ -n "${THEYOS_RELEASE:-}" ]; then
+        if [ -z "${unsigned_stage}" ] || \
+            [ -z "${PHASE0_EXPECTED_UNSIGNED_PACKAGE_MANIFEST_SHA256:-}" ] || \
+            [ -z "${PHASE0_EXPECTED_PHASE0_ATTESTATION_SHA256:-}" ]; then
+            error "THEYOS_RELEASE requires the complete Phase 0 unsigned subject binding"
+        fi
+        package_manifest="${unsigned_stage}/phase0-package-manifest.json"
+        if [ ! -f "${package_manifest}" ]; then
+            error "Phase 0 unsigned package manifest is missing: ${package_manifest}"
+        fi
+        local package_manifest_sha256
+        package_manifest_sha256=$(shasum -a 256 "${package_manifest}" | awk '{print $1}')
+        if [ "${package_manifest_sha256}" != "${PHASE0_EXPECTED_UNSIGNED_PACKAGE_MANIFEST_SHA256}" ]; then
+            error "unsigned macOS package manifest differs from the Phase 0 verified subject"
+        fi
+        local attestation_sha256 manifest_attestation_sha256
+        attestation_sha256=$(shasum -a 256 "${unsigned_stage}/phase0-build-attestation.json" | awk '{print $1}')
+        manifest_attestation_sha256=$(jq -r '.phase0_attestation_sha256 // empty' "${package_manifest}")
+        if [ "${attestation_sha256}" != "${PHASE0_EXPECTED_PHASE0_ATTESTATION_SHA256}" ] || \
+            [ "${manifest_attestation_sha256}" != "${attestation_sha256}" ]; then
+            error "unsigned package manifest is not bound to the verified Phase 0 attestation"
+        fi
+        if ! jq -e '
+            (.executables | keys | sort) == [
+                "store-ipc",
+                "terminal-ipc",
+                "theyos-engine",
+                "theyos-provision-inject",
+                "theyos-ssh",
+                "vmrunner_macos_ipc"
+            ]
+            and (.package_files["vmrunner-macos.entitlements"].unsigned_sha256
+              | test("^[0-9a-f]{64}$"))
+        ' "${package_manifest}" >/dev/null; then
+            error "unsigned macOS package manifest does not describe the exact app subject"
+        fi
+        phase0_manifest_verified=1
+    fi
+    local source_dir="${target_dir}"
+    if [ -n "${unsigned_stage}" ]; then
+        source_dir="${unsigned_stage}"
+    fi
+    local entitlements="${source_dir}/vmrunner-macos.entitlements"
     mkdir -p "${helpers_dir}"
 
-    info "Building app engine helpers for macOS arm64 (engine version: ${version})..."
-    (cd "${REPO_ROOT}/admin/rust" && cargo build --release \
-        --target aarch64-apple-darwin \
-        -p server-rs \
-        -p soyeht-rs \
-        -p store-rs \
-        -p terminal-rs \
-        -p vmrunner-macos-rs)
+    if [ -n "${unsigned_stage}" ]; then
+        info "Using the prebuilt Phase 0 unsigned macOS subject (no Cargo/build scripts in release packaging)"
+    else
+        info "Building app engine helpers for macOS arm64 (engine version: ${version})..."
+        run_engine_build_tool build aarch64-apple-darwin cargo >/dev/null
+        (cd "${REPO_ROOT}/admin/rust" && cargo build --release \
+            --target aarch64-apple-darwin \
+            -p soyeht-rs \
+            -p store-rs \
+            -p terminal-rs \
+            -p vmrunner-macos-rs)
+    fi
 
     copy_helper() {
         local source_name="$1"
         local dest_name="$2"
-        local source_path="${target_dir}/${source_name}"
+        local source_path="${source_dir}/${source_name}"
         if [ ! -f "${source_path}" ]; then
             error "required helper binary not found at: ${source_path}"
         fi
@@ -352,8 +482,20 @@ package_soyeht_mac() {
         info "  + ${dest_name}"
     }
 
-    # Binary name is `server` per server-rs/Cargo.toml [[bin]] config.
-    copy_helper "server" "theyos-engine"
+    # Canonical alias: server-rs/server is the shipped theyos-engine.
+    if [ -n "${unsigned_stage}" ]; then
+        copy_helper "theyos-engine" "theyos-engine"
+    else
+        run_engine_build_tool stage "${target_dir}" "${helpers_dir}/theyos-engine"
+    fi
+    if [ -n "${PHASE0_EXPECTED_UNSIGNED_ENGINE_SHA256:-}" ]; then
+        local staged_engine_sha256
+        staged_engine_sha256=$(shasum -a 256 "${helpers_dir}/theyos-engine" | awk '{print $1}')
+        if [ "${staged_engine_sha256}" != "${PHASE0_EXPECTED_UNSIGNED_ENGINE_SHA256}" ]; then
+            error "unsigned staged theyos-engine differs from the Phase 0 verified subject"
+        fi
+        info "  + unsigned theyos-engine matches Phase 0 subject"
+    fi
     copy_helper "theyos-ssh" "theyos-ssh"
     copy_helper "store-ipc" "store-ipc"
     copy_helper "terminal-ipc" "terminal-ipc"
@@ -365,12 +507,27 @@ package_soyeht_mac() {
     # tarball without it. Soyeht.app rejects bundles missing this binary.
     copy_helper "theyos-provision-inject" "theyos-provision-inject"
 
+    if [ -n "${unsigned_stage}" ]; then
+        while IFS=$'\t' read -r helper expected; do
+            actual=$(shasum -a 256 "${helpers_dir}/${helper}" | awk '{print $1}')
+            if [ "${actual}" != "${expected}" ]; then
+                error "unsigned helper differs from the Phase 0 package manifest: ${helper}"
+            fi
+        done < <(jq -r '.executables | to_entries[] | [.key,.value.unsigned_sha256] | @tsv' "${package_manifest}")
+        expected_entitlements=$(jq -r '.package_files["vmrunner-macos.entitlements"].unsigned_sha256' "${package_manifest}")
+        actual_entitlements=$(shasum -a 256 "${entitlements}" | awk '{print $1}')
+        if [ "${actual_entitlements}" != "${expected_entitlements}" ]; then
+            error "unsigned macOS entitlements differ from the Phase 0 package manifest"
+        fi
+    fi
+
     printf '%s' "${version}" > "${helpers_dir}/engine-version.txt"
     info "  + engine-version.txt (${version})"
 
     if [ ! -f "${entitlements}" ]; then
         error "Entitlements file not found: ${entitlements}"
     fi
+    cp "${entitlements}" "${helpers_dir}/vmrunner-macos.entitlements"
 
     sign_helper() {
         local bin="$1"
@@ -402,7 +559,11 @@ package_soyeht_mac() {
         info "  ✓ ${bin} signed"
     }
 
-    local sign_id="${THEYOS_CODESIGN_IDENTITY:-}"
+    if [ -n "${sign_id}" ] || [ -n "${has_notary_credentials}" ]; then
+        if [ "${phase0_manifest_verified}" -ne 1 ]; then
+            error "real macOS signing/notarization is not allowed without a verified Phase 0 subject"
+        fi
+    fi
     if [ -n "${sign_id}" ]; then
         info "Codesigning Soyeht app helpers with Developer ID: ${sign_id}"
     else
@@ -421,18 +582,18 @@ package_soyeht_mac() {
     # have the Developer ID cert in their trust store. Gracefully no-ops when any
     # Apple credential is absent (dev workflow / CI without secrets).
     if [ -n "${sign_id}" ] \
-        && [ -n "${APPLE_ID:-}" ] \
-        && [ -n "${APPLE_TEAM_ID:-}" ] \
-        && [ -n "${APPLE_ID_APP_PASSWORD:-}" ]; then
+        && [ -n "${APPLE_NOTARY_KEY_P8:-}" ] \
+        && [ -n "${APPLE_NOTARY_KEY_ID:-}" ] \
+        && [ -n "${APPLE_NOTARY_ISSUER_ID:-}" ]; then
         local notarize_zip="${REPO_ROOT}/.notarize-soyeht-engine.zip"
         rm -f "${notarize_zip}"
         info "Creating notarization ZIP: ${notarize_zip}"
         ditto -c -k --keepParent "${helpers_dir}" "${notarize_zip}"
         info "Submitting to Apple notarytool (typically 1-3 minutes)..."
         xcrun notarytool submit "${notarize_zip}" \
-            --apple-id "${APPLE_ID}" \
-            --team-id "${APPLE_TEAM_ID}" \
-            --password "${APPLE_ID_APP_PASSWORD}" \
+            --key "${APPLE_NOTARY_KEY_P8}" \
+            --key-id "${APPLE_NOTARY_KEY_ID}" \
+            --issuer "${APPLE_NOTARY_ISSUER_ID}" \
             --wait
         rm -f "${notarize_zip}"
         # Staple the Gatekeeper ticket to the app bundle so offline validation works.
@@ -464,9 +625,9 @@ package_soyeht_mac() {
 #   theyos-engine-<version>-linux-<arch>.tar.gz
 #   theyos-engine-<version>-linux-<arch>.tar.gz.sha256
 #
-# Requires cross-compilation toolchains. On macOS with Docker installed,
-# uses cross (cargo install cross). On Linux, uses cargo with the target
-# toolchain installed.
+# Requires explicitly provisioned target toolchains. The Phase 0 release
+# workflow uses its pinned OCI recipe and this helper never discovers an
+# ambient Cross CLI.
 package_engine_linux() {
     local version
     version=$(git -C "${REPO_ROOT}" describe --tags --always 2>/dev/null || echo "dev")
@@ -479,26 +640,23 @@ package_engine_linux() {
         local dist_dir="${dist_base}/linux-${arch}"
         local pkg_name="theyos-engine-${version}-linux-${arch}"
 
-        info "Building server-rs for ${rust_target}..."
-        if command -v cross &>/dev/null; then
-            (cd "${rust_dir}" && cross build -p server-rs --release --target "${rust_target}")
-        else
-            (cd "${rust_dir}" && cargo build -p server-rs --release --target "${rust_target}")
-        fi
-
-        info "Building soyeht CLI for ${rust_target}..."
-        if command -v cross &>/dev/null; then
-            (cd "${rust_dir}" && cross build -p soyeht-rs --bin soyeht --release --target "${rust_target}")
-        else
-            (cd "${rust_dir}" && cargo build -p soyeht-rs --bin soyeht --release --target "${rust_target}")
-        fi
+        info "Building the Phase 0 authority subject for ${rust_target}..."
+        local authority_root="${dist_base}/.phase0-authority-${arch}"
+        local authority_target="${authority_root}/target"
+        local authority_attestation="${authority_root}/attestation.json"
+        local authority_engine="${authority_root}/theyos-engine"
+        rm -rf "${authority_root}"
+        mkdir -p "${authority_target}"
+        PHASE0_TARGET="${rust_target}" \
+        PHASE0_BUILD_TOOL=cross \
+        PHASE0_CARGO_TARGET_DIR="${authority_target}" \
+        PHASE0_RUN_ARTIFACT_DIRECT=1 \
+        PHASE0_ATTESTATION_OUT="${authority_attestation}" \
+        PHASE0_STAGED_ENGINE_OUT="${authority_engine}" \
+            bash "${REPO_ROOT}/.github/scripts/check-mobile-claw-vpn-owner-present-phase0-compileout.sh"
 
         # Binary name is `server` per server-rs/Cargo.toml [[bin]] config.
-        local engine_src="${rust_dir}/target/${rust_target}/release/server"
-        local soyeht_src="${rust_dir}/target/${rust_target}/release/soyeht"
-        if [ ! -f "${engine_src}" ]; then
-            error "server binary not found at: ${engine_src} (expected from server-rs crate)"
-        fi
+        local soyeht_src="${authority_target}/${rust_target}/release/soyeht"
         if [ ! -f "${soyeht_src}" ]; then
             error "soyeht CLI not found at: ${soyeht_src} (expected from soyeht-rs crate)"
         fi
@@ -508,7 +666,7 @@ package_engine_linux() {
         local stage="${dist_base}/.linux-stage-${arch}"
         rm -rf "${stage}"
         mkdir -p "${stage}"
-        cp "${engine_src}" "${stage}/theyos-engine"
+        cp "${authority_engine}" "${stage}/theyos-engine"
         cp "${soyeht_src}" "${stage}/soyeht"
         cp "${REPO_ROOT}/scripts/uninstall-linux.sh" "${stage}/uninstall-linux.sh"
         chmod +x "${stage}/soyeht" "${stage}/uninstall-linux.sh"
@@ -518,6 +676,7 @@ package_engine_linux() {
         (cd "${stage}" && tar czf "${tarball}" .)
         sha256sum "${tarball}" > "${tarball}.sha256"
         rm -rf "${stage}"
+        rm -rf "${authority_root}"
 
         info "  ✓ ${tarball}"
         info "  ✓ ${tarball}.sha256"

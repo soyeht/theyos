@@ -17,6 +17,7 @@ members = [
     "server-rs",
     "store-rs",
     "terminal-rs",
+    "theyos-engine-build-rs",
     "t1-iptunnel-dev-runner-rs",
     "rootfsbuilder-rs",
     "launcher-rs",
@@ -38,6 +39,7 @@ unsafe_code = "warn"
 [workspace.lints.clippy]
 all      = { level = "warn", priority = -1 }
 pedantic = { level = "warn", priority = -1 }
+disallowed_methods = "deny"
 
 # Pedantic lints that the codebase has historically not enforced and that
 # are noisy on existing public surface. Re-allowed at workspace level.
@@ -61,6 +63,7 @@ tracing-subscriber  = { version = "0.3", features = ["env-filter", "json"] }
 rusqlite    = { version = "0.32", features = ["bundled"] }
 ureq        = { version = "2", features = ["json"] }
 reqwest     = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls", "http2"] }
+openssl     = { version = "0.10", features = ["vendored"] }
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
 toml        = "0.8"
 bytes       = "1"

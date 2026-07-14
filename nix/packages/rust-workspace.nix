@@ -4,6 +4,7 @@
 { pkgs, craneLib, packageName ? "theyos-admin", excludedMembers ? [ "vmrunner-macos-rs" ] }:
 
 let
+  flakeLockSha256 = builtins.hashFile "sha256" ../../flake.lock;
   # Use crane's cleanCargoSource plus extra filters for non-Rust assets that
   # crates pull in via include_str!:
   #   - .html files (e.g. server-rs/.../privacy.html)
@@ -18,6 +19,7 @@ let
       || (builtins.match ".*\\.html$" path != null)
       || (builtins.match ".*\\.sh$" path != null)
       || (builtins.match ".*\\.json$" path != null)
+      || (builtins.match ".*phase0-forbidden-markers\\.txt$" path != null)
       || (builtins.match ".*/assets/.*" path != null);
   };
 
@@ -27,6 +29,10 @@ let
 
   # core-rs/build.rs reads this to generate the claw catalog at compile time.
   manifestSrc = ../../claws/manifest.yml;
+
+  # Keep the Nix marker tripwire byte-identical to the Cargo authority checker.
+  # Structural depfile and contract checks remain authoritative.
+  forbiddenMarkersSrc = ../../admin/rust/phase0-forbidden-markers.txt;
 
   # household-rs/build.rs reads this to embed the emoji-security-code
   # wordlist CSV. The CSV lives inside admin/rust/household-rs/data/ so
@@ -42,13 +48,15 @@ let
     version = "0.1.1";
 
     cargoExtraArgs = pkgs.lib.concatStringsSep " " (
-      [ "--workspace" ]
+      [ "--workspace" "--no-default-features" ]
       ++ map (member: "--exclude ${member}") excludedMembers
     );
 
     # Native build inputs (available at build time).
     nativeBuildInputs = with pkgs; [
       pkg-config
+      jq
+      binutils
       # ring (via russh) needs a C compiler and perl for its build script
       perl
     ];
@@ -72,6 +80,11 @@ let
     # without this the relative include_str! path escapes the sandbox.
     THEYOS_EMOJI_WORDLIST = emojiWordlistSrc;
 
+    # The repository Cargo config deliberately leaves this empty so a Nix
+    # host path cannot leak into OCI/release builds. Nix supplies the real
+    # target-aware pkg-config root here.
+    PKG_CONFIG_PATH = "${pkgs.openssl.dev}/lib/pkgconfig";
+
     # Contract tests expect admin/contracts/ at ../../contracts/ relative to
     # each crate's CARGO_MANIFEST_DIR. In the Nix sandbox the workspace is at
     # /build/source/, so tests look for /build/contracts/.
@@ -87,6 +100,102 @@ in
   # Phase 2: build the workspace itself (uses cached deps).
   craneLib.buildPackage (commonArgs // {
     cargoArtifacts = depsOnly;
+
+    postInstall = ''
+      # crane's install hook stages every workspace binary before this hook.
+      # The Nix runtime contract is for this explicit product set only; do not
+      # let an unrelated workspace target become a published executable.
+      rm -rf "$out/bin"
+      mkdir -p "$out/bin"
+      for executable in \
+        server \
+        theyos-llm-proxy \
+        theyos-admin-host \
+        rootfsbuilder \
+        soyeht \
+        vmrunner_ipc \
+        fc-ssh \
+        store-ipc \
+        terminal-ipc \
+        imagebuilder; do
+        test -x "target/release/$executable"
+        install -m 0755 "target/release/$executable" "$out/bin/$executable"
+      done
+    '';
+
+    # Nix fixup may strip or otherwise normalize ELF outputs after postInstall.
+    # The Phase 0 manifest must describe the final bytes that leave the store.
+    postFixup = ''
+      test -x "$out/bin/server"
+      test -x "$out/bin/theyos-llm-proxy"
+      for executable in "$out"/bin/*; do
+        while IFS= read -r forbidden; do
+          test -n "$forbidden" || continue
+          if strings "$executable" | grep -Fqi -- "$forbidden"; then
+            echo "Phase 0 marker found in $executable: $forbidden" >&2
+            exit 1
+          fi
+        done < "${forbiddenMarkersSrc}"
+        name="$(basename "$executable")"
+        depfile="target/release/$name.d"
+        test -f "$depfile"
+        if [ "$name" != server ] && [ "$name" != theyos-llm-proxy ]; then
+          # core-rs/product_a_phase0.rs is a shared HTTP choke module. Cargo's
+          # workspace feature unification can list that module in a helper's
+          # depfile even when the helper does not link or call it. The actual
+          # authority sources remain forbidden in helper graphs, and every
+          # final executable still receives the marker scan below.
+          if grep -Eiq 'server-rs/src|llm-proxy-rs/src|mobile_claw_vpn' "$depfile"; then
+            echo "Phase 0 helper depfile reaches an authority source: $name" >&2
+            exit 1
+          fi
+        fi
+      done
+      server_contract="$($out/bin/server --owner-present-phase0-contract)"
+      proxy_contract="$($out/bin/theyos-llm-proxy --owner-present-phase0-contract)"
+      echo "$server_contract" | jq -e '
+        .authority == "none"
+        and .production_activation == false
+        and .third_target_injection_seam_compiled == false
+        and .generic_ip_tunnel_backend_compiled == false
+        and .generic_ip_tunnel_store_accepts_resource == false
+        and .generic_ip_tunnel_env_accepts_resource == false
+        and .declared_product_a_routes == ["/claw-vpn/status"]
+      ' >/dev/null
+      echo "$proxy_contract" | jq -e '
+        .authority == "none"
+        and .production_activation == false
+        and .allowed_requests == [
+          {"method":"GET","path":"/api/v1/mobile/claw-vpn/status"},
+          {"method":"HEAD","path":"/api/v1/mobile/claw-vpn/status"}
+        ]
+      ' >/dev/null
+      executables_json='{}'
+      for executable in "$out"/bin/*; do
+        test -f "$executable"
+        test -x "$executable"
+        name="$(basename "$executable")"
+        case "$name" in
+          server) classification="phase0-contract-server" ;;
+          theyos-llm-proxy) classification="phase0-contract-http-boundary" ;;
+          *) classification="phase0-helper-depfile-and-marker-closure-v1" ;;
+        esac
+        sha256="$(sha256sum "$executable" | cut -d' ' -f1)"
+        depfile_sha256="$(sha256sum "target/release/$name.d" | cut -d' ' -f1)"
+        executables_json="$(jq -c \
+          --arg name "$name" \
+          --arg sha256 "$sha256" \
+          --arg depfile_sha256 "$depfile_sha256" \
+          --arg classification "$classification" \
+          '. + {($name): {sha256:$sha256,depfile_sha256:$depfile_sha256,classification:$classification}}' \
+          <<< "$executables_json")"
+      done
+      jq -n -S \
+        --arg flake_lock_sha256 "${flakeLockSha256}" \
+        --argjson executables "$executables_json" \
+        '{schema:"theyos-phase0-nix-runtime-manifest-v1",flake_lock_sha256:$flake_lock_sha256,executables:$executables,owner_present_authority:"none",production_activation:false,artifact_contract:"all-published-nix-executables-v1"}' \
+        > "$out/phase0-runtime-manifest.json"
+    '';
 
     # Skip tests that assume a normal Linux filesystem (fail in Nix sandbox):
     #   - which_binary_finds_sh: /bin/sh doesn't exist in sandbox

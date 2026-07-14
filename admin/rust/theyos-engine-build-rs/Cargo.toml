@@ -1,0 +1,12 @@
+[package]
+name = "theyos-engine-build-rs"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[[bin]]
+name = "theyos-engine-build"
+path = "src/main.rs"
+
+[lints]
+workspace = true

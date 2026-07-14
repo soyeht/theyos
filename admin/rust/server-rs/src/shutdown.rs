@@ -7,8 +7,8 @@
 use crate::config;
 use tracing::info;
 
-/// Resolves when SIGINT or SIGTERM arrives. Pass to `axum::serve(...)
-/// .with_graceful_shutdown(shutdown_signal())` to drain in-flight requests.
+/// Resolves when SIGINT or SIGTERM arrives. Pass to the Axum server's
+/// graceful-shutdown hook to drain in-flight requests.
 ///
 /// # Panics
 ///

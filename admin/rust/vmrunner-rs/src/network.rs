@@ -20,8 +20,10 @@ use crate::error::VmError;
 /// exponential back-off. slirp4netns occasionally has a brief unavailability
 /// window after the API socket appears but before TAP is fully ready.
 ///
-/// Returns the hostfwd ID assigned by slirp4netns (or -1 if the response
-/// couldn't be parsed).
+/// Returns the hostfwd ID assigned by slirp4netns. Empty, malformed, or
+/// unreadable responses are retried and eventually returned as errors. If a
+/// cleanup cannot be verified after an ambiguous response, the error is
+/// `VmError::HostfwdUncertain`; the owning VM must not be reused.
 pub(crate) fn slirp_add_hostfwd(
     api_sock: &Path,
     host_port: u16,
@@ -30,9 +32,9 @@ pub(crate) fn slirp_add_hostfwd(
     // App-port mappings (host_port == guest_port) have shown longer
     // stabilization windows than the SSH forward in heavily loaded runs.
     let max_retries = if host_port == guest_port { 40 } else { 20 };
-    // Always attempt cleanup between retries. If a previous add_hostfwd
-    // partially created the mapping, subsequent retries will hit "duplicate"
-    // errors from libslirp. The remove is best-effort (ignored on error).
+    // Always attempt verified cleanup between retries. If a previous
+    // add_hostfwd partially created the mapping, subsequent retries will hit
+    // "duplicate" errors from libslirp; an unverified cleanup aborts instead.
     slirp_add_hostfwd_with_retry(
         api_sock,
         host_port,
@@ -106,23 +108,65 @@ fn slirp_add_hostfwd_with_retry(
         // shutdown(SHUT_WR) after sending the request before it sends a response.
         if let Err(e) = writeln!(stream, "{payload}") {
             last_err = format!("write: {e}");
+            if cleanup_partial_on_retry {
+                ensure_hostfwd_reconciled_before_retry(api_sock, host_port, guest_port)?;
+            }
             continue;
         }
         stream.shutdown(Shutdown::Write).ok();
 
         let mut response = String::new();
-        stream.read_to_string(&mut response).ok();
+        if let Err(e) = stream.read_to_string(&mut response) {
+            last_err = format!("read: {e}");
+            if cleanup_partial_on_retry {
+                ensure_hostfwd_reconciled_before_retry(api_sock, host_port, guest_port)?;
+            }
+            continue;
+        }
 
-        if response.contains("\"error\"") {
+        if response.trim().is_empty() {
+            last_err = "read: empty response".to_string();
+            if cleanup_partial_on_retry {
+                ensure_hostfwd_reconciled_before_retry(api_sock, host_port, guest_port)?;
+            }
+            continue;
+        }
+
+        let value = match parse_json_without_duplicate_keys(&response) {
+            Ok(value) => value,
+            Err(error) => {
+                last_err = format!("api: invalid JSON response: {error}");
+                if cleanup_partial_on_retry {
+                    ensure_hostfwd_reconciled_before_retry(api_sock, host_port, guest_port)?;
+                }
+                continue;
+            }
+        };
+
+        if let Some(error) = json_error_value(&value) {
+            let error_text = error.to_string();
+            let reported_id = hostfwd_id_for_cleanup(&value);
+            let cleanup_verified = if cleanup_partial_on_retry {
+                if let Some(fwd_id) = reported_id {
+                    slirp_remove_hostfwd_verified(api_sock, host_port, guest_port, fwd_id)
+                } else {
+                    ensure_hostfwd_reconciled_before_retry(api_sock, host_port, guest_port).is_ok()
+                }
+            } else {
+                false
+            };
+            if !cleanup_verified {
+                let id_context = reported_id
+                    .map(|id| format!(" with id={id}"))
+                    .unwrap_or_default();
+                return Err(VmError::HostfwdUncertain(format!(
+                    "slirp API add_hostfwd error{id_context}; cleanup could not be verified: {response}"
+                )));
+            }
             // slirp4netns can briefly report this while TAP setup is still
             // completing; treat it as transient and retry with backoff.
-            if response.contains("slirp_add_hostfwd failed") {
+            if error_text.contains("slirp_add_hostfwd failed") {
                 last_err = format!("api: {response}");
-                if cleanup_partial_on_retry {
-                    // Best-effort cleanup in case the previous attempt partially
-                    // created this mapping and subsequent retries hit a duplicate.
-                    let _ = slirp_remove_hostfwd(api_sock, host_port, guest_port);
-                }
                 continue;
             }
             return Err(VmError::Other(format!(
@@ -130,14 +174,20 @@ fn slirp_add_hostfwd_with_retry(
             )));
         }
 
-        // Parse the ID from {"return":{"id": N}}
-        let fwd_id = parse_hostfwd_id(&response);
-        if fwd_id < 0 {
-            tracing::warn!(
-                "[vmrunner] slirp add_hostfwd succeeded but could not parse id from: {response}"
-            );
+        // Parse the ID from {"return":{"id": N}} using the decoded JSON
+        // value so escaped error keys cannot bypass the success check.
+        match parse_hostfwd_id_value(&value) {
+            Ok(fwd_id) => return Ok(fwd_id),
+            Err(reason) => {
+                last_err = format!("api: invalid add_hostfwd response: {reason}: {response}");
+                tracing::warn!(
+                    "[vmrunner] slirp add_hostfwd returned an invalid response: {response}"
+                );
+                if cleanup_partial_on_retry {
+                    ensure_hostfwd_reconciled_before_retry(api_sock, host_port, guest_port)?;
+                }
+            }
         }
-        return Ok(fwd_id);
     }
 
     Err(VmError::Other(format!(
@@ -145,26 +195,210 @@ fn slirp_add_hostfwd_with_retry(
     )))
 }
 
+/// Reconcile a possibly-applied add before retrying it.
+///
+/// An add request may be applied by slirp4netns before the client observes an
+/// empty, malformed, or failed response. Retrying without a valid list/remove
+/// cycle can leave the old binding in place or create a duplicate. Refuse to
+/// retry unless the matching mapping is absent from a successful list response.
+fn ensure_hostfwd_reconciled_before_retry(
+    api_sock: &Path,
+    host_port: u16,
+    guest_port: u16,
+) -> Result<(), VmError> {
+    if slirp_remove_hostfwd_verified(api_sock, host_port, guest_port, -1) {
+        Ok(())
+    } else {
+        Err(VmError::HostfwdUncertain(format!(
+            "slirp API add_hostfwd: refusing retry because cleanup of host_port={host_port} guest_port={guest_port} could not be verified"
+        )))
+    }
+}
+
+/// Deserialize a JSON response while rejecting duplicate object members.
+///
+/// `serde_json::Value` otherwise uses last-member-wins semantics. That would
+/// let a response such as `{"return":{"error":...},"return":{"id":1}}`
+/// hide an earlier error and turn an ambiguous slirp response into success.
+fn parse_json_without_duplicate_keys(response: &str) -> Result<serde_json::Value, String> {
+    serde_json::from_str::<StrictJsonValue>(response)
+        .map(|value| value.0)
+        .map_err(|error| error.to_string())
+}
+
+struct StrictJsonValue(serde_json::Value);
+
+impl<'de> serde::Deserialize<'de> for StrictJsonValue {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        use serde::de::{self, MapAccess, SeqAccess, Visitor};
+
+        struct StrictJsonVisitor;
+
+        impl<'de> Visitor<'de> for StrictJsonVisitor {
+            type Value = serde_json::Value;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("a JSON value without duplicate object members")
+            }
+
+            fn visit_bool<E>(self, value: bool) -> Result<Self::Value, E>
+            where
+                E: de::Error,
+            {
+                Ok(serde_json::Value::Bool(value))
+            }
+
+            fn visit_i64<E>(self, value: i64) -> Result<Self::Value, E>
+            where
+                E: de::Error,
+            {
+                Ok(serde_json::Value::Number(value.into()))
+            }
+
+            fn visit_u64<E>(self, value: u64) -> Result<Self::Value, E>
+            where
+                E: de::Error,
+            {
+                Ok(serde_json::Value::Number(value.into()))
+            }
+
+            fn visit_f64<E>(self, value: f64) -> Result<Self::Value, E>
+            where
+                E: de::Error,
+            {
+                serde_json::Number::from_f64(value)
+                    .map(serde_json::Value::Number)
+                    .ok_or_else(|| E::custom("non-finite JSON number"))
+            }
+
+            fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+            where
+                E: de::Error,
+            {
+                Ok(serde_json::Value::String(value.to_owned()))
+            }
+
+            fn visit_string<E>(self, value: String) -> Result<Self::Value, E>
+            where
+                E: de::Error,
+            {
+                Ok(serde_json::Value::String(value))
+            }
+
+            fn visit_none<E>(self) -> Result<Self::Value, E>
+            where
+                E: de::Error,
+            {
+                Ok(serde_json::Value::Null)
+            }
+
+            fn visit_unit<E>(self) -> Result<Self::Value, E>
+            where
+                E: de::Error,
+            {
+                Ok(serde_json::Value::Null)
+            }
+
+            fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
+            where
+                A: SeqAccess<'de>,
+            {
+                let mut values = Vec::new();
+                while let Some(value) = sequence.next_element::<StrictJsonValue>()? {
+                    values.push(value.0);
+                }
+                Ok(serde_json::Value::Array(values))
+            }
+
+            fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+            where
+                A: MapAccess<'de>,
+            {
+                let mut object = serde_json::Map::new();
+                while let Some(key) = map.next_key::<String>()? {
+                    let value = map.next_value::<StrictJsonValue>()?.0;
+                    if object.insert(key.clone(), value).is_some() {
+                        return Err(de::Error::custom(format!(
+                            "duplicate JSON object key: {key}"
+                        )));
+                    }
+                }
+                Ok(serde_json::Value::Object(object))
+            }
+        }
+
+        deserializer
+            .deserialize_any(StrictJsonVisitor)
+            .map(StrictJsonValue)
+    }
+}
+
+fn json_error_value(value: &serde_json::Value) -> Option<&serde_json::Value> {
+    value.get("error").or_else(|| {
+        value
+            .get("return")
+            .and_then(serde_json::Value::as_object)
+            .and_then(|return_body| return_body.get("error"))
+    })
+}
+
+fn hostfwd_id_for_cleanup(value: &serde_json::Value) -> Option<i64> {
+    value
+        .get("return")
+        .and_then(serde_json::Value::as_object)
+        .and_then(|return_body| return_body.get("id"))
+        .and_then(serde_json::Value::as_i64)
+        .filter(|id| *id >= 0)
+}
+
+fn parse_hostfwd_id_value(value: &serde_json::Value) -> Result<i64, &'static str> {
+    let return_body = value
+        .get("return")
+        .and_then(serde_json::Value::as_object)
+        .ok_or("missing return object")?;
+    if return_body.contains_key("error") {
+        return Err("return object contains an error");
+    }
+    let id = return_body
+        .get("id")
+        .and_then(serde_json::Value::as_i64)
+        .ok_or("missing integer return id")?;
+    if id < 0 {
+        return Err("return id is negative");
+    }
+    Ok(id)
+}
+
 /// Parse `{"return":{"id": N}}` → N, or -1 on failure.
+#[cfg(test)]
 fn parse_hostfwd_id(response: &str) -> i64 {
-    serde_json::from_str::<serde_json::Value>(response)
+    parse_json_without_duplicate_keys(response)
         .ok()
-        .and_then(|v| v["return"]["id"].as_i64())
+        .and_then(|value| {
+            if json_error_value(&value).is_some() {
+                None
+            } else {
+                parse_hostfwd_id_value(&value).ok()
+            }
+        })
         .unwrap_or(-1)
 }
 
 /// Remove a TCP port-forward via the slirp4netns API socket.
 ///
 /// Lists current hostfwd entries, finds those matching `host_port` + `guest_port`,
-/// and removes each by ID (the correct API format). Best-effort: errors are
-/// logged but not propagated (slirp cleans up on exit).
-#[allow(clippy::unnecessary_wraps)]
+/// removes each by ID (the correct API format), and verifies a valid follow-up
+/// list response contains no matching entry. Transport and response errors are
+/// propagated so callers cannot mistake an unverified cleanup for success.
 pub(crate) fn slirp_remove_hostfwd(
     api_sock: &Path,
     host_port: u16,
     guest_port: u16,
 ) -> Result<(), VmError> {
-    let entries = slirp_list_hostfwd(api_sock);
+    let entries = slirp_list_hostfwd(api_sock)?;
     let matching: Vec<i64> = entries
         .iter()
         .filter(|(_, hp, gp)| *hp == host_port && *gp == guest_port)
@@ -179,14 +413,24 @@ pub(crate) fn slirp_remove_hostfwd(
     }
 
     for id in matching {
-        let _ = slirp_remove_hostfwd_by_id(api_sock, id);
+        slirp_remove_hostfwd_by_id(api_sock, id)?;
+    }
+
+    let remaining = slirp_list_hostfwd(api_sock)?;
+    if remaining
+        .iter()
+        .any(|(_, hp, gp)| *hp == host_port && *gp == guest_port)
+    {
+        return Err(VmError::Other(format!(
+            "slirp remove_hostfwd: matching host_port={host_port} guest_port={guest_port} remains after removal"
+        )));
     }
     Ok(())
 }
 
 /// Remove a TCP port-forward and verify it was actually removed.
 ///
-/// Unlike the best-effort `slirp_remove_hostfwd`, this function confirms
+/// This function confirms
 /// removal by re-listing entries after each attempt. Retries up to 3 times
 /// if the entry persists. This is critical for temporary hostfwds in pool
 /// fill, where a leaked port poisons subsequent `pick_ssh_port` calls.
@@ -203,20 +447,35 @@ pub(crate) fn slirp_remove_hostfwd_verified(
 ) -> bool {
     for attempt in 0..3 {
         // Try removal by ID first (preferred), fall back to port-match.
-        if fwd_id >= 0 {
-            let _ = slirp_remove_hostfwd_by_id(api_sock, fwd_id);
+        let remove_result = if fwd_id >= 0 {
+            slirp_remove_hostfwd_by_id(api_sock, fwd_id)
         } else {
-            let _ = slirp_remove_hostfwd(api_sock, host_port, guest_port);
+            slirp_remove_hostfwd(api_sock, host_port, guest_port)
+        };
+        let remove_succeeded = remove_result.is_ok();
+        if let Err(e) = remove_result {
+            tracing::warn!(
+                "[vmrunner] slirp remove_hostfwd_verified: cleanup attempt {attempt} failed: {e}"
+            );
         }
 
         // Verify: list entries and check if the port is gone.
         // The API is synchronous so no sleep is needed between remove and list.
-        let remaining = slirp_list_hostfwd(api_sock);
+        let remaining = match slirp_list_hostfwd(api_sock) {
+            Ok(entries) => entries,
+            Err(e) => {
+                tracing::warn!(
+                    "[vmrunner] slirp remove_hostfwd_verified: list verification failed on attempt {attempt}: {e}"
+                );
+                std::thread::sleep(Duration::from_millis(100));
+                continue;
+            }
+        };
         let still_present = remaining
             .iter()
             .any(|(_, hp, gp)| *hp == host_port && *gp == guest_port);
 
-        if !still_present {
+        if remove_succeeded && !still_present {
             if attempt > 0 {
                 tracing::info!(
                     "[vmrunner] slirp remove_hostfwd_verified: port {host_port} removed after {attempt} retries"
@@ -257,41 +516,59 @@ pub(crate) fn slirp_remove_hostfwd_by_id(api_sock: &Path, id: i64) -> Result<(),
     stream.shutdown(Shutdown::Write).ok();
 
     let mut response = String::new();
-    stream.read_to_string(&mut response).ok();
+    stream
+        .read_to_string(&mut response)
+        .map_err(|e| VmError::Other(format!("slirp remove_hostfwd(id={id}) read: {e}")))?;
     tracing::info!("[vmrunner] slirp remove_hostfwd(id={id}) response: {response}");
 
-    if response.contains("\"error\"") {
-        tracing::warn!("[vmrunner] slirp remove_hostfwd(id={id}) error: {response}");
+    let value = parse_json_without_duplicate_keys(&response).map_err(|e| {
+        VmError::Other(format!(
+            "slirp remove_hostfwd(id={id}) invalid response: {e}"
+        ))
+    })?;
+    if json_error_value(&value).is_some() {
+        return Err(VmError::Other(format!(
+            "slirp remove_hostfwd(id={id}) API error: {response}"
+        )));
+    }
+    if !value
+        .get("return")
+        .is_some_and(serde_json::Value::is_object)
+    {
+        return Err(VmError::Other(format!(
+            "slirp remove_hostfwd(id={id}) missing return object"
+        )));
     }
     Ok(())
 }
 
 /// List current hostfwd entries via the slirp4netns API.
 ///
-/// Returns `Vec<(id, host_port, guest_port)>`. Returns empty vec on any error
-/// (infallible — used internally by `slirp_remove_hostfwd`).
-pub(crate) fn slirp_list_hostfwd(api_sock: &Path) -> Vec<(i64, u16, u16)> {
+/// Returns `Vec<(id, host_port, guest_port)>` or an error for any transport or
+/// response-shape failure. Cleanup must distinguish a valid empty list from a
+/// failed list request; treating both as empty can falsely claim a binding was
+/// removed.
+pub(crate) fn slirp_list_hostfwd(api_sock: &Path) -> Result<Vec<(i64, u16, u16)>, VmError> {
     use std::io::{Read, Write};
     use std::os::unix::net::UnixStream;
 
     let payload = r#"{"execute":"list_hostfwd"}"#;
 
-    let Ok(mut stream) = UnixStream::connect(api_sock) else {
-        return Vec::new();
-    };
+    let mut stream = UnixStream::connect(api_sock)
+        .map_err(|e| VmError::Other(format!("slirp list_hostfwd connect: {e}")))?;
     stream.set_read_timeout(Some(Duration::from_secs(5))).ok();
     stream.set_write_timeout(Some(Duration::from_secs(5))).ok();
-    if writeln!(stream, "{payload}").is_err() {
-        return Vec::new();
-    }
+    writeln!(stream, "{payload}")
+        .map_err(|e| VmError::Other(format!("slirp list_hostfwd write: {e}")))?;
     stream.shutdown(Shutdown::Write).ok();
 
     let mut response = String::new();
-    stream.read_to_string(&mut response).ok();
+    stream
+        .read_to_string(&mut response)
+        .map_err(|e| VmError::Other(format!("slirp list_hostfwd read: {e}")))?;
 
-    // Parse {"return":{"entries":[{"id":N,"proto":"tcp","host_addr":"...","host_port":N,"guest_addr":"...","guest_port":N}, ...]}}
-    // Minimal parsing without serde_json: split on each "id" occurrence.
     parse_list_hostfwd_response(&response)
+        .map_err(|e| VmError::Other(format!("slirp list_hostfwd invalid response: {e}")))
 }
 
 /// Parse the `list_hostfwd` response into (id, `host_port`, `guest_port`) tuples.
@@ -299,7 +576,7 @@ pub(crate) fn slirp_list_hostfwd(api_sock: &Path) -> Vec<(i64, u16, u16)> {
 /// slirp4netns returns `{"entries":[...]}` (no `"return"` wrapper).
 /// For robustness, we also accept the `{"return":{"entries":[...]}}` format
 /// in case future versions change the response shape.
-fn parse_list_hostfwd_response(response: &str) -> Vec<(i64, u16, u16)> {
+fn parse_list_hostfwd_response(response: &str) -> Result<Vec<(i64, u16, u16)>, &'static str> {
     #[derive(serde::Deserialize)]
     struct HostfwdEntry {
         id: i64,
@@ -330,16 +607,46 @@ fn parse_list_hostfwd_response(response: &str) -> Vec<(i64, u16, u16)> {
             .collect()
     };
 
+    let value = parse_json_without_duplicate_keys(response)
+        .map_err(|_| "list_hostfwd response is not valid JSON")?;
+    let top_level_error = value
+        .as_object()
+        .is_some_and(|object| object.contains_key("error"));
+    let wrapped_error = value
+        .get("return")
+        .and_then(serde_json::Value::as_object)
+        .is_some_and(|object| object.contains_key("error"));
+    if top_level_error || wrapped_error {
+        return Err("list_hostfwd response contains an error");
+    }
+    let object = value
+        .as_object()
+        .ok_or("list_hostfwd response must be an object")?;
+    let has_direct_entries = object.contains_key("entries");
+    let has_wrapped_response = object.contains_key("return");
+    if has_direct_entries == has_wrapped_response {
+        return Err("list_hostfwd response must use exactly one format");
+    }
+    if has_wrapped_response
+        && value
+            .get("return")
+            .and_then(serde_json::Value::as_object)
+            .and_then(|return_body| return_body.get("entries"))
+            .is_none()
+    {
+        return Err("wrapped list_hostfwd response is missing entries");
+    }
+
     // Try the actual slirp4netns format first: {"entries":[...]}
     if let Ok(r) = serde_json::from_str::<DirectResponse>(response) {
-        return to_tuples(r.entries);
+        return Ok(to_tuples(r.entries));
     }
     // Fall back to wrapped format: {"return":{"entries":[...]}}
     if let Ok(r) = serde_json::from_str::<WrappedResponse>(response) {
-        return to_tuples(r.ret.entries);
+        return Ok(to_tuples(r.ret.entries));
     }
 
-    Vec::new()
+    Err("expected direct or wrapped entries response")
 }
 
 /// Wait until the slirp4netns API socket is actually ready to accept commands.
@@ -522,11 +829,20 @@ mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex};
 
+    #[derive(Clone)]
+    enum MockResponse {
+        Text(String),
+        Raw(Vec<u8>),
+    }
+
     /// A mock slirp4netns server that records all received commands.
     struct MockSlirp {
         sock_path: PathBuf,
         messages: Arc<Mutex<Vec<String>>>,
-        add_responses: Arc<Mutex<Vec<String>>>,
+        add_responses: Arc<Mutex<Vec<MockResponse>>>,
+        list_responses: Arc<Mutex<Vec<String>>>,
+        remove_responses: Arc<Mutex<Vec<String>>>,
+        active_hostfwds: Arc<Mutex<Vec<(i64, u16, u16)>>>,
         shutdown: Arc<AtomicBool>,
         _dir: tempfile::TempDir,
     }
@@ -540,11 +856,17 @@ mod tests {
             listener.set_nonblocking(true).expect("set_nonblocking");
 
             let messages: Arc<Mutex<Vec<String>>> = Arc::default();
-            let add_responses: Arc<Mutex<Vec<String>>> = Arc::default();
+            let add_responses: Arc<Mutex<Vec<MockResponse>>> = Arc::default();
+            let list_responses: Arc<Mutex<Vec<String>>> = Arc::default();
+            let remove_responses: Arc<Mutex<Vec<String>>> = Arc::default();
+            let active_hostfwds: Arc<Mutex<Vec<(i64, u16, u16)>>> = Arc::default();
             let shutdown: Arc<AtomicBool> = Arc::default();
 
             let msgs = messages.clone();
-            let resps = add_responses.clone();
+            let add_resps = add_responses.clone();
+            let list_resps = list_responses.clone();
+            let remove_resps = remove_responses.clone();
+            let active = active_hostfwds.clone();
             let stop = shutdown.clone();
 
             std::thread::spawn(move || {
@@ -562,8 +884,10 @@ mod tests {
                                 continue;
                             }
 
-                            let execute = serde_json::from_str::<serde_json::Value>(&request)
-                                .ok()
+                            let request_json =
+                                serde_json::from_str::<serde_json::Value>(&request).ok();
+                            let execute = request_json
+                                .as_ref()
                                 .and_then(|v| v["execute"].as_str().map(String::from))
                                 .unwrap_or_default();
 
@@ -571,22 +895,92 @@ mod tests {
 
                             let response = match execute.as_str() {
                                 "add_hostfwd" => {
-                                    let mut q = resps.lock().unwrap();
+                                    let host_port = request_json
+                                        .as_ref()
+                                        .and_then(|v| v["arguments"]["host_port"].as_u64())
+                                        .unwrap_or_default()
+                                        as u16;
+                                    let guest_port = request_json
+                                        .as_ref()
+                                        .and_then(|v| v["arguments"]["guest_port"].as_u64())
+                                        .unwrap_or_default()
+                                        as u16;
+                                    let id = next_id;
+                                    next_id += 1;
+                                    active.lock().unwrap().push((id, host_port, guest_port));
+                                    let mut q = add_resps.lock().unwrap();
                                     if let Some(r) = q.first().cloned() {
                                         q.remove(0);
                                         r
                                     } else {
-                                        let id = next_id;
-                                        next_id += 1;
-                                        format!(r#"{{"return":{{"id":{id}}}}}"#)
+                                        MockResponse::Text(format!(r#"{{"return":{{"id":{id}}}}}"#))
                                     }
                                 }
-                                "remove_hostfwd" => r#"{"return":{}}"#.to_string(),
-                                "list_hostfwd" => r#"{"entries":[]}"#.to_string(),
-                                _ => r#"{"error":{"desc":"unknown"}}"#.to_string(),
+                                "remove_hostfwd" => {
+                                    let mut q = remove_resps.lock().unwrap();
+                                    let response = if q.is_empty() {
+                                        r#"{"return":{}}"#.to_string()
+                                    } else {
+                                        q.remove(0)
+                                    };
+                                    let removal_succeeded =
+                                        serde_json::from_str::<serde_json::Value>(&response)
+                                            .ok()
+                                            .is_some_and(|value| {
+                                                value.get("error").is_none()
+                                                    && value
+                                                        .get("return")
+                                                        .is_some_and(serde_json::Value::is_object)
+                                            });
+                                    if removal_succeeded {
+                                        if let Some(id) = request_json
+                                            .as_ref()
+                                            .and_then(|v| v["arguments"]["id"].as_i64())
+                                        {
+                                            active
+                                                .lock()
+                                                .unwrap()
+                                                .retain(|(entry_id, _, _)| *entry_id != id);
+                                        }
+                                    }
+                                    MockResponse::Text(response)
+                                }
+                                "list_hostfwd" => {
+                                    let mut q = list_resps.lock().unwrap();
+                                    if let Some(r) = q.first().cloned() {
+                                        q.remove(0);
+                                        MockResponse::Text(r)
+                                    } else {
+                                        let entries: Vec<serde_json::Value> = active
+                                            .lock()
+                                            .unwrap()
+                                            .iter()
+                                            .map(|(id, host_port, guest_port)| {
+                                                serde_json::json!({
+                                                    "id": id,
+                                                    "host_port": host_port,
+                                                    "guest_port": guest_port,
+                                                })
+                                            })
+                                            .collect();
+                                        MockResponse::Text(
+                                            serde_json::json!({"entries": entries}).to_string(),
+                                        )
+                                    }
+                                }
+                                _ => MockResponse::Text(
+                                    r#"{"error":{"desc":"unknown"}}"#.to_string(),
+                                ),
                             };
 
-                            let _ = write!(stream, "{response}");
+                            match response {
+                                MockResponse::Text(response) => {
+                                    let _ = stream.write_all(response.as_bytes());
+                                }
+                                MockResponse::Raw(response) => {
+                                    let _ = stream.write_all(&response);
+                                }
+                            }
                         }
                         Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                             std::thread::sleep(Duration::from_millis(10));
@@ -600,6 +994,9 @@ mod tests {
                 sock_path,
                 messages,
                 add_responses,
+                list_responses,
+                remove_responses,
+                active_hostfwds,
                 shutdown,
                 _dir: dir,
             }
@@ -609,7 +1006,32 @@ mod tests {
             self.add_responses
                 .lock()
                 .unwrap()
+                .push(MockResponse::Text(response.to_string()));
+        }
+
+        fn queue_add_raw_response(&self, response: &[u8]) {
+            self.add_responses
+                .lock()
+                .unwrap()
+                .push(MockResponse::Raw(response.to_vec()));
+        }
+
+        fn queue_list_response(&self, response: &str) {
+            self.list_responses
+                .lock()
+                .unwrap()
                 .push(response.to_string());
+        }
+
+        fn queue_remove_response(&self, response: &str) {
+            self.remove_responses
+                .lock()
+                .unwrap()
+                .push(response.to_string());
+        }
+
+        fn active_hostfwd_count(&self) -> usize {
+            self.active_hostfwds.lock().unwrap().len()
         }
 
         fn received_commands(&self) -> Vec<String> {
@@ -652,6 +1074,10 @@ mod tests {
             cmds.iter().filter(|c| *c == "add_hostfwd").count() >= 2,
             "should retry add_hostfwd at least once; got: {cmds:?}"
         );
+        assert!(
+            cmds.contains(&"remove_hostfwd".to_string()),
+            "retry must remove the applied partial mapping before adding again; got: {cmds:?}"
+        );
     }
 
     #[test]
@@ -670,6 +1096,209 @@ mod tests {
             cmds.contains(&"list_hostfwd".to_string()),
             "cleanup_partial should call list_hostfwd; got: {cmds:?}"
         );
+        assert!(
+            cmds.contains(&"remove_hostfwd".to_string()),
+            "cleanup_partial should remove the applied partial mapping; got: {cmds:?}"
+        );
+    }
+
+    #[test]
+    fn add_hostfwd_retries_empty_response() {
+        let mock = MockSlirp::new();
+        mock.queue_add_response("");
+
+        let result = slirp_add_hostfwd_quick(&mock.sock_path, 22995, 22);
+        assert_eq!(result.unwrap(), 2, "empty response must not be success");
+
+        let cmds = mock.received_commands();
+        assert!(
+            cmds.iter().filter(|c| *c == "add_hostfwd").count() >= 2,
+            "empty response should trigger an add_hostfwd retry; got: {cmds:?}"
+        );
+        assert!(
+            cmds.contains(&"remove_hostfwd".to_string()),
+            "empty response must be reconciled before retry; got: {cmds:?}"
+        );
+        assert_eq!(
+            mock.active_hostfwd_count(),
+            1,
+            "cleanup must leave only the successful retry binding"
+        );
+    }
+
+    #[test]
+    fn add_hostfwd_retries_read_error_after_verified_cleanup() {
+        let mock = MockSlirp::new();
+        mock.queue_add_raw_response(&[0xff]);
+
+        let result = slirp_add_hostfwd_quick(&mock.sock_path, 22994, 22);
+        assert_eq!(
+            result.unwrap(),
+            2,
+            "read error must retry only after cleanup"
+        );
+
+        let cmds = mock.received_commands();
+        assert_eq!(
+            cmds.iter().filter(|c| *c == "add_hostfwd").count(),
+            2,
+            "read error should cause exactly one retry; got: {cmds:?}"
+        );
+        assert!(
+            cmds.contains(&"remove_hostfwd".to_string()),
+            "read error must be reconciled before retry; got: {cmds:?}"
+        );
+    }
+
+    #[test]
+    fn add_hostfwd_retries_malformed_response_after_verified_cleanup() {
+        let mock = MockSlirp::new();
+        mock.queue_add_response(r#"{"return":{"id":"not-an-id"}}"#);
+
+        let result = slirp_add_hostfwd_quick(&mock.sock_path, 22993, 22);
+        assert_eq!(
+            result.unwrap(),
+            2,
+            "malformed response must retry after cleanup"
+        );
+
+        let cmds = mock.received_commands();
+        assert_eq!(
+            cmds.iter().filter(|c| *c == "add_hostfwd").count(),
+            2,
+            "malformed response should cause exactly one retry; got: {cmds:?}"
+        );
+        assert!(
+            cmds.contains(&"remove_hostfwd".to_string()),
+            "malformed response must be reconciled before retry; got: {cmds:?}"
+        );
+    }
+
+    #[test]
+    fn add_hostfwd_refuses_retry_when_cleanup_list_fails() {
+        let mock = MockSlirp::new();
+        mock.queue_add_response("");
+        for _ in 0..6 {
+            mock.queue_list_response("not json");
+        }
+
+        let result = slirp_add_hostfwd_quick(&mock.sock_path, 22992, 22);
+        assert!(
+            result.is_err(),
+            "ambiguous add must fail when cleanup cannot be verified"
+        );
+        assert!(
+            matches!(&result, Err(VmError::HostfwdUncertain(_))),
+            "unverified cleanup must be a typed uncertain-hostfwd outcome: {result:?}"
+        );
+
+        let cmds = mock.received_commands();
+        assert_eq!(
+            cmds.iter().filter(|c| *c == "add_hostfwd").count(),
+            1,
+            "cleanup failure must prevent a second add; got: {cmds:?}"
+        );
+        assert_eq!(
+            mock.active_hostfwd_count(),
+            1,
+            "unverified cleanup must be handed to the VM teardown path, not treated as an empty state"
+        );
+    }
+
+    #[test]
+    fn add_hostfwd_refuses_retry_when_cleanup_remove_fails() {
+        let mock = MockSlirp::new();
+        mock.queue_add_response("");
+        for _ in 0..3 {
+            mock.queue_remove_response(r#"{"error":{"desc":"remove failed"}}"#);
+        }
+
+        let result = slirp_add_hostfwd_quick(&mock.sock_path, 22991, 22);
+        assert!(
+            result.is_err(),
+            "ambiguous add must fail when removal cannot be verified"
+        );
+        assert!(
+            matches!(&result, Err(VmError::HostfwdUncertain(_))),
+            "unverified removal must be a typed uncertain-hostfwd outcome: {result:?}"
+        );
+
+        let cmds = mock.received_commands();
+        assert_eq!(
+            cmds.iter().filter(|c| *c == "add_hostfwd").count(),
+            1,
+            "removal failure must prevent a second add; got: {cmds:?}"
+        );
+        assert_eq!(
+            mock.active_hostfwd_count(),
+            1,
+            "unverified removal must be handed to the VM teardown path, not treated as an empty state"
+        );
+    }
+
+    #[test]
+    fn add_hostfwd_refuses_retry_when_direct_list_error_has_entries() {
+        let mock = MockSlirp::new();
+        mock.queue_add_response("");
+        for _ in 0..6 {
+            mock.queue_list_response(r#"{"error":{"desc":"list failed"},"entries":[]}"#);
+        }
+
+        let result = slirp_add_hostfwd_quick(&mock.sock_path, 22990, 22);
+        assert!(
+            result.is_err(),
+            "ambiguous direct list error must not permit a retry"
+        );
+        let cmds = mock.received_commands();
+        assert_eq!(
+            cmds.iter().filter(|c| *c == "add_hostfwd").count(),
+            1,
+            "direct list error must prevent a second add; got: {cmds:?}"
+        );
+    }
+
+    #[test]
+    fn add_hostfwd_refuses_retry_when_wrapped_list_error_has_entries() {
+        let mock = MockSlirp::new();
+        mock.queue_add_response("");
+        for _ in 0..6 {
+            mock.queue_list_response(r#"{"return":{"error":{"desc":"list failed"},"entries":[]}}"#);
+        }
+
+        let result = slirp_add_hostfwd_quick(&mock.sock_path, 22989, 22);
+        assert!(
+            result.is_err(),
+            "ambiguous wrapped list error must not permit a retry"
+        );
+        let cmds = mock.received_commands();
+        assert_eq!(
+            cmds.iter().filter(|c| *c == "add_hostfwd").count(),
+            1,
+            "wrapped list error must prevent a second add; got: {cmds:?}"
+        );
+    }
+
+    #[test]
+    fn add_hostfwd_refuses_retry_when_list_formats_are_combined() {
+        let mock = MockSlirp::new();
+        mock.queue_add_response("");
+        for _ in 0..6 {
+            mock.queue_list_response(
+                r#"{"entries":[],"return":{"entries":[{"id":1,"host_port":22999,"guest_port":22}]}}"#,
+            );
+        }
+
+        let result = slirp_add_hostfwd_quick(&mock.sock_path, 22988, 22);
+        assert!(
+            result.is_err(),
+            "combined list formats must not permit a retry"
+        );
+        let cmds = mock.received_commands();
+        assert_eq!(
+            cmds.iter().filter(|c| *c == "add_hostfwd").count(),
+            1,
+            "combined list formats must prevent a second add; got: {cmds:?}"
+        );
     }
 
     #[test]
@@ -687,7 +1316,8 @@ mod tests {
     #[test]
     fn add_hostfwd_returns_error_on_non_transient_failure() {
         // A non-transient error (not "slirp_add_hostfwd failed") should
-        // return immediately without retries.
+        // return immediately without retries, but only after proving that the
+        // request did not leave a mapping behind.
         let mock = MockSlirp::new();
         mock.queue_add_response(r#"{"error":{"desc":"some permanent error"}}"#);
 
@@ -696,10 +1326,91 @@ mod tests {
 
         let cmds = mock.received_commands();
         assert_eq!(
-            cmds,
-            vec!["add_hostfwd"],
-            "should not retry on non-transient error"
+            cmds.iter().filter(|c| *c == "add_hostfwd").count(),
+            1,
+            "should not retry on non-transient error: {cmds:?}"
         );
+        assert!(
+            cmds.contains(&"remove_hostfwd".to_string()),
+            "must reconcile a non-transient error before returning: {cmds:?}"
+        );
+        assert_eq!(
+            mock.active_hostfwd_count(),
+            0,
+            "permanent add error must reconcile the mapping before returning"
+        );
+    }
+
+    #[test]
+    fn add_hostfwd_non_transient_error_without_verified_cleanup_is_uncertain() {
+        let mock = MockSlirp::new();
+        mock.queue_add_response(r#"{"error":{"desc":"some permanent error"}}"#);
+        for _ in 0..6 {
+            mock.queue_list_response("not json");
+        }
+
+        let result = slirp_add_hostfwd_quick(&mock.sock_path, 22985, 22);
+        assert!(
+            matches!(result, Err(VmError::HostfwdUncertain(_))),
+            "unverified permanent error must be handed to teardown: {result:?}"
+        );
+        assert_eq!(
+            mock.active_hostfwd_count(),
+            1,
+            "unverified cleanup must not be represented as an ordinary permanent error"
+        );
+    }
+
+    #[test]
+    fn add_hostfwd_rejects_duplicate_return_members() {
+        let mock = MockSlirp::new();
+        mock.queue_add_response(r#"{"return":{"error":{"desc":"failed"}},"return":{"id":1}}"#);
+        mock.queue_add_response(r#"{"error":{"desc":"some permanent error"}}"#);
+
+        let result = slirp_add_hostfwd_quick(&mock.sock_path, 22984, 22);
+        assert!(
+            result.is_err(),
+            "duplicate response members must not be accepted"
+        );
+        let cmds = mock.received_commands();
+        assert!(
+            cmds.contains(&"remove_hostfwd".to_string()),
+            "duplicate response must be reconciled before retry or failure: {cmds:?}"
+        );
+        assert_eq!(
+            mock.active_hostfwd_count(),
+            0,
+            "duplicate response must be reconciled before the final error"
+        );
+    }
+
+    #[test]
+    fn add_hostfwd_rejects_error_with_return_id() {
+        for response in [
+            r#"{"error":{"desc":"failed"},"return":{"id":1}}"#,
+            r#"{"\u0065rror":{"desc":"failed"},"return":{"id":1}}"#,
+        ] {
+            let mock = MockSlirp::new();
+            mock.queue_add_response(response);
+
+            let result = slirp_add_hostfwd_quick(&mock.sock_path, 22987, 22);
+            assert!(result.is_err(), "error response must not become success");
+            let cmds = mock.received_commands();
+            assert_eq!(
+                cmds.iter().filter(|c| *c == "add_hostfwd").count(),
+                1,
+                "error response must not trigger a second add; got: {cmds:?}"
+            );
+            assert!(
+                cmds.contains(&"remove_hostfwd".to_string()),
+                "error response with an id must be reconciled; got: {cmds:?}"
+            );
+            assert_eq!(
+                mock.active_hostfwd_count(),
+                0,
+                "error response with an id must not leave a hostfwd active"
+            );
+        }
     }
 
     #[test]
@@ -715,13 +1426,25 @@ mod tests {
     }
 
     #[test]
+    fn parse_hostfwd_id_rejects_error_with_return() {
+        assert_eq!(
+            parse_hostfwd_id(r#"{"error":{"desc":"failed"},"return":{"id":1}}"#),
+            -1
+        );
+        assert_eq!(
+            parse_hostfwd_id(r#"{"\u0065rror":{"desc":"failed"},"return":{"id":1}}"#),
+            -1
+        );
+    }
+
+    #[test]
     fn parse_list_direct_format() {
         // slirp4netns actual format: {"entries":[...]}
         let response = r#"{"entries":[
             {"id":0,"proto":"tcp","host_addr":"127.0.0.1","host_port":22003,"guest_addr":"10.0.2.100","guest_port":22},
             {"id":1,"proto":"tcp","host_addr":"127.0.0.1","host_port":18800,"guest_addr":"10.0.2.100","guest_port":18800}
         ]}"#;
-        let result = parse_list_hostfwd_response(response);
+        let result = parse_list_hostfwd_response(response).expect("valid direct list response");
         assert_eq!(result.len(), 2);
         assert_eq!(result[0], (0, 22003, 22));
         assert_eq!(result[1], (1, 18800, 18800));
@@ -731,7 +1454,7 @@ mod tests {
     fn parse_list_wrapped_format() {
         // Alternative format: {"return":{"entries":[...]}}
         let response = r#"{"return":{"entries":[{"id":5,"proto":"tcp","host_addr":"127.0.0.1","host_port":22006,"guest_addr":"10.0.2.100","guest_port":22}]}}"#;
-        let result = parse_list_hostfwd_response(response);
+        let result = parse_list_hostfwd_response(response).expect("valid wrapped list response");
         assert_eq!(result.len(), 1);
         assert_eq!(result[0], (5, 22006, 22));
     }
@@ -739,13 +1462,36 @@ mod tests {
     #[test]
     fn parse_list_empty_entries() {
         let response = r#"{"entries":[]}"#;
-        assert!(parse_list_hostfwd_response(response).is_empty());
+        assert!(
+            parse_list_hostfwd_response(response)
+                .expect("valid empty list response")
+                .is_empty()
+        );
     }
 
     #[test]
     fn parse_list_invalid_json() {
-        assert!(parse_list_hostfwd_response("not json").is_empty());
-        assert!(parse_list_hostfwd_response("").is_empty());
-        assert!(parse_list_hostfwd_response("{}").is_empty());
+        assert!(parse_list_hostfwd_response("not json").is_err());
+        assert!(parse_list_hostfwd_response("").is_err());
+        assert!(parse_list_hostfwd_response("{}").is_err());
+    }
+
+    #[test]
+    fn parse_list_error_with_entries_is_rejected() {
+        assert!(
+            parse_list_hostfwd_response(r#"{"error":{"desc":"list failed"},"entries":[]}"#)
+                .is_err()
+        );
+        assert!(
+            parse_list_hostfwd_response(
+                r#"{"return":{"error":{"desc":"list failed"},"entries":[]}}"#
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn parse_list_combined_formats_are_rejected() {
+        assert!(parse_list_hostfwd_response(r#"{"entries":[],"return":{"entries":[]}}"#).is_err());
     }
 }

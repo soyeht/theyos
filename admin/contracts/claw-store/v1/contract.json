@@ -148,8 +148,8 @@
       "auth_kind": "admin_session",
       "handler": "handlers_instances::handle_create_instance_body",
       "mount": {
-        "file": "admin/rust/server-rs/src/main.rs",
-        "slice": "main_api_rest",
+        "file": "admin/rust/server-rs/src/production_app.rs",
+        "slice": "production_api_rest",
         "route_literal": "/instances",
         "method_helper": "post"
       },
@@ -166,8 +166,8 @@
       "auth_kind": "admin_session",
       "handler": "handlers_instances::handle_instance_status",
       "mount": {
-        "file": "admin/rust/server-rs/src/main.rs",
-        "slice": "main_api_rest",
+        "file": "admin/rust/server-rs/src/production_app.rs",
+        "slice": "production_api_rest",
         "route_literal": "/instances/{id}/status",
         "method_helper": "get"
       },
@@ -185,8 +185,8 @@
       "auth_kind": "admin_session",
       "handler": "handlers_instances::handle_stop_instance",
       "mount": {
-        "file": "admin/rust/server-rs/src/main.rs",
-        "slice": "main_api_rest",
+        "file": "admin/rust/server-rs/src/production_app.rs",
+        "slice": "production_api_rest",
         "route_literal": "/instances/{id}/stop",
         "method_helper": "post"
       },
@@ -204,8 +204,8 @@
       "auth_kind": "admin_session",
       "handler": "handlers_instances::handle_restart_instance",
       "mount": {
-        "file": "admin/rust/server-rs/src/main.rs",
-        "slice": "main_api_rest",
+        "file": "admin/rust/server-rs/src/production_app.rs",
+        "slice": "production_api_rest",
         "route_literal": "/instances/{id}/restart",
         "method_helper": "post"
       },
@@ -223,8 +223,8 @@
       "auth_kind": "admin_session",
       "handler": "handlers_instances::handle_rebuild_instance",
       "mount": {
-        "file": "admin/rust/server-rs/src/main.rs",
-        "slice": "main_api_rest",
+        "file": "admin/rust/server-rs/src/production_app.rs",
+        "slice": "production_api_rest",
         "route_literal": "/instances/{id}/rebuild",
         "method_helper": "post"
       },
@@ -242,8 +242,8 @@
       "auth_kind": "admin_session",
       "handler": "handlers_instances::handle_delete_instance",
       "mount": {
-        "file": "admin/rust/server-rs/src/main.rs",
-        "slice": "main_api_rest",
+        "file": "admin/rust/server-rs/src/production_app.rs",
+        "slice": "production_api_rest",
         "route_literal": "/instances/{id}",
         "method_helper": "delete"
       },
@@ -261,8 +261,8 @@
       "auth_kind": "admin_session",
       "handler": "handlers_terminal::handle_list_conversations",
       "mount": {
-        "file": "admin/rust/server-rs/src/main.rs",
-        "slice": "main_api_rest",
+        "file": "admin/rust/server-rs/src/production_app.rs",
+        "slice": "production_api_rest",
         "route_literal": "/terminals/{container}/workspaces",
         "method_helper": "get"
       },
@@ -279,8 +279,8 @@
       "auth_kind": "admin_session",
       "handler": "handlers_terminal::handle_create_conversation",
       "mount": {
-        "file": "admin/rust/server-rs/src/main.rs",
-        "slice": "main_api_rest",
+        "file": "admin/rust/server-rs/src/production_app.rs",
+        "slice": "production_api_rest",
         "route_literal": "/terminals/{container}/workspaces",
         "method_helper": "post"
       },
@@ -297,8 +297,8 @@
       "auth_kind": "admin_session",
       "handler": "handlers_terminal::handle_rename_conversation",
       "mount": {
-        "file": "admin/rust/server-rs/src/main.rs",
-        "slice": "main_api_rest",
+        "file": "admin/rust/server-rs/src/production_app.rs",
+        "slice": "production_api_rest",
         "route_literal": "/terminals/{container}/workspaces/{id}",
         "method_helper": "patch"
       },
@@ -315,8 +315,8 @@
       "auth_kind": "admin_session",
       "handler": "handlers_terminal::handle_delete_conversation",
       "mount": {
-        "file": "admin/rust/server-rs/src/main.rs",
-        "slice": "main_api_rest",
+        "file": "admin/rust/server-rs/src/production_app.rs",
+        "slice": "production_api_rest",
         "route_literal": "/terminals/{container}/workspaces/{id}",
         "method_helper": "delete"
       },
@@ -334,8 +334,8 @@
       "auth_kind": "admin_stream_auth",
       "handler": "handlers_terminal::handle_terminal_pty",
       "mount": {
-        "file": "admin/rust/server-rs/src/main.rs",
-        "slice": "main_api_streaming",
+        "file": "admin/rust/server-rs/src/production_app.rs",
+        "slice": "production_api_streaming",
         "route_literal": "/terminals/{container}/pty",
         "method_helper": "get"
       },
@@ -370,8 +370,8 @@
       "auth_kind": "mobile_bearer_admin",
       "handler": "handlers_mobile::handle_mobile_create_instance",
       "mount": {
-        "file": "admin/rust/server-rs/src/main.rs",
-        "slice": "main_mobile_api",
+        "file": "admin/rust/server-rs/src/mobile_api_routes.rs",
+        "slice": "routes",
         "route_literal": "/instances",
         "method_helper": "post"
       },
@@ -389,8 +389,8 @@
       "auth_kind": "mobile_bearer",
       "handler": "handlers_mobile::handle_mobile_instance_status",
       "mount": {
-        "file": "admin/rust/server-rs/src/main.rs",
-        "slice": "main_mobile_api",
+        "file": "admin/rust/server-rs/src/mobile_api_routes.rs",
+        "slice": "routes",
         "route_literal": "/instances/{id}/status",
         "method_helper": "get"
       },

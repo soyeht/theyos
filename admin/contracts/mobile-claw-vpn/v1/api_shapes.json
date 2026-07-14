@@ -1,7 +1,9 @@
 {
   "contract": "product-a-mobile-claw-vpn-api-shapes",
   "version": 1,
-  "comment": "Source-of-truth JSON fixture for the mobile Claw VPN Mesh-C control-plane API. Values are neutral aliases or synthetic capability tokens only. The fixture pins public wire shapes: mobile request bodies do not carry member_id, consume returns rendezvous_token and never session_id, and all responses remain count/label-only outside product-necessary capability tokens.",
+  "authority_status": "historical-test-only-non-authoritative",
+  "superseded_for_implementation_by": "a separately reviewed V2 server-held wire contract",
+  "comment": "Historical V1 regression fixture for the retired client-held mobile Claw VPN Mesh-C control-plane API. Values are neutral aliases or synthetic tokens only. These request/response shapes must never authorize a production client, handler, issuer, route, or effect; Phase 1 requires a separately reviewed server-held V2 contract.",
   "requests": {
     "mint_offer": {
       "device_id": "device-alpha",

@@ -40,5 +40,8 @@ pub mod time;
 
 pub mod network_detect;
 
+#[cfg(feature = "http")]
+pub mod product_a_phase0;
+
 #[cfg(target_os = "macos")]
 pub mod macos_logging;

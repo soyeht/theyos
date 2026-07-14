@@ -23,7 +23,7 @@ use crate::claw_share_relay_stream_responder::{
 };
 use crate::claw_share_relay_stream_responder_params::RelayStreamResponderParams;
 use crate::claw_share_relay_stream_reverse_connect_binding::RelayStreamReverseConnectBinding;
-use crate::claw_share_relay_stream_target_router::RelayStreamIpTunnelRouter;
+use crate::claw_share_relay_stream_target_router::RelayStreamOfferTargetRouter;
 use crate::claw_share_rendezvous_stream_relay::{RendezvousHello, RendezvousRole};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -171,7 +171,7 @@ where
     T: AsyncRead + AsyncWrite + Unpin,
     P: ClawTargetRouter,
     S: ClawTargetRouter,
-    I: RelayStreamIpTunnelRouter,
+    RelayStreamOfferTargetRouter<P, S, I>: ClawTargetRouter,
 {
     serve_relay_stream_responder_reverse_connected_with_trust(
         stream,
@@ -198,7 +198,7 @@ pub async fn serve_relay_stream_responder_reverse_connect_binding<P, S, I>(
 where
     P: ClawTargetRouter,
     S: ClawTargetRouter,
-    I: RelayStreamIpTunnelRouter,
+    RelayStreamOfferTargetRouter<P, S, I>: ClawTargetRouter,
 {
     let config = config.validate()?;
     let stream = timeout(

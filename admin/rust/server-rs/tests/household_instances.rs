@@ -27,8 +27,6 @@ use server_rs::household_attach_token::{
     HOUSEHOLD_ATTACH_TOKEN_TTL, HouseholdAttachScope, HouseholdAttachTokenStore,
 };
 use server_rs::household_state::HouseholdState;
-use server_rs::mobile_claw_vpn_relay_dial_config::MobileClawVpnRendezvousRelayDialConfig;
-use server_rs::mobile_claw_vpn_relay_responder_config::MobileClawVpnRelayResponderConfig;
 use server_rs::ratelimit::Limiter;
 use server_rs::state::{AppState, SharedState};
 use session_rs::SessionStore;
@@ -248,15 +246,6 @@ fn shared_state() -> SharedState {
     let claw_dir = tempfile::TempDir::new().expect("claw tempdir");
     let claw_path = claw_dir.path().join("installed_claws.json");
     std::mem::forget(claw_dir);
-    let mobile_mesh_dir = tempfile::TempDir::new().expect("mobile mesh tempdir");
-    let mobile_claw_vpn_mesh =
-        household_rs::claw_vpn_mobile_mesh_store::ClawVpnMobileMeshStore::new(
-            mobile_mesh_dir.path(),
-            600,
-        )
-        .expect("mobile mesh store");
-    std::mem::forget(mobile_mesh_dir);
-
     Arc::new(AppState {
         sessions,
         jobs,
@@ -269,9 +258,6 @@ fn shared_state() -> SharedState {
         mobile_tokens: Arc::new(server_rs::mobile_token::MobileTokenStore::new()),
         mobile_sessions: server_rs::mobile_token::MobileSessionDb::open(":memory:")
             .expect("mobile session db"),
-        mobile_claw_vpn_mesh,
-        mobile_claw_vpn_relay_dial: MobileClawVpnRendezvousRelayDialConfig::default(),
-        mobile_claw_vpn_relay_responder: MobileClawVpnRelayResponderConfig::default(),
         claw_store: claw_rs::ClawStore::new(&claw_path).expect("claw store"),
         theyos_dir: std::path::PathBuf::from("/tmp/theyos-test"),
         locks_dir: std::path::PathBuf::from("/tmp/theyos-test-locks"),

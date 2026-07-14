@@ -31,7 +31,7 @@ use crate::claw_share_relay_stream_responder_reverse_connect::{
 };
 use crate::claw_share_relay_stream_reverse_connect_binding::RelayStreamReverseConnectBinding;
 use crate::claw_share_relay_stream_target_router::{
-    RelayStreamIpTunnelRouter, RelayStreamIpTunnelUnavailableRouter,
+    RelayStreamIpTunnelUnavailableRouter, RelayStreamOfferTargetRouter,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -181,7 +181,7 @@ pub fn spawn_relay_stream_reverse_connect_pool<P, S, I>(
 where
     P: ClawTargetRouter + 'static,
     S: ClawTargetRouter + 'static,
-    I: RelayStreamIpTunnelRouter + 'static,
+    RelayStreamOfferTargetRouter<P, S, I>: ClawTargetRouter + 'static,
 {
     let config = config.validate()?;
     let semaphore = Arc::new(Semaphore::new(config.max_total_connections));
@@ -232,7 +232,7 @@ async fn run_offer_worker<P, S, I>(
 ) where
     P: ClawTargetRouter + 'static,
     S: ClawTargetRouter + 'static,
-    I: RelayStreamIpTunnelRouter + 'static,
+    RelayStreamOfferTargetRouter<P, S, I>: ClawTargetRouter + 'static,
 {
     let mut failure_backoff = config.backoff.min;
     loop {
@@ -346,7 +346,7 @@ fn spawn_offer_worker<P, S, I>(
 where
     P: ClawTargetRouter + 'static,
     S: ClawTargetRouter + 'static,
-    I: RelayStreamIpTunnelRouter + 'static,
+    RelayStreamOfferTargetRouter<P, S, I>: ClawTargetRouter + 'static,
 {
     let config = ctx.config;
     let reverse_config = ctx.reverse_config;
@@ -377,7 +377,7 @@ fn resync_offers<P, S, I>(ctx: &ResyncContext<P, S, I>)
 where
     P: ClawTargetRouter + 'static,
     S: ClawTargetRouter + 'static,
-    I: RelayStreamIpTunnelRouter + 'static,
+    RelayStreamOfferTargetRouter<P, S, I>: ClawTargetRouter + 'static,
 {
     let now = (ctx.now_unix)();
     // CRITICAL: re-load from disk every tick. The claim path opens its own store,
@@ -472,7 +472,7 @@ async fn resync_loop<P, S, I>(
 ) where
     P: ClawTargetRouter + 'static,
     S: ClawTargetRouter + 'static,
-    I: RelayStreamIpTunnelRouter + 'static,
+    RelayStreamOfferTargetRouter<P, S, I>: ClawTargetRouter + 'static,
 {
     let trigger = Arc::clone(&ctx.resync_trigger());
     loop {
@@ -595,7 +595,7 @@ pub fn spawn_relay_stream_offer_resync_driver<P, S, I>(
 where
     P: ClawTargetRouter + 'static,
     S: ClawTargetRouter + 'static,
-    I: RelayStreamIpTunnelRouter + 'static,
+    RelayStreamOfferTargetRouter<P, S, I>: ClawTargetRouter + 'static,
 {
     let config = config.validate()?;
     let worker_cancelled = Arc::new(AtomicBool::new(false));

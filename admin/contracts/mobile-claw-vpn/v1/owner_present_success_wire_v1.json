@@ -2,11 +2,13 @@
   "contract": "soyeht-mobile-claw-vpn-owner-present-success-wire-v1",
   "version": 1,
   "scope": "success-wire-only-pre-effect",
+  "authority_status": "historical-test-only-non-authoritative",
+  "superseded_for_implementation_by": "a separately reviewed V2 server-held wire contract",
   "about": [
-    "Authoritative success-envelope contract for the DEV-only mobile Claw VPN owner-present ceremony.",
-    "This fixture defines bytes and boundary metadata only. It installs no route, handler, runtime, RP, adapter, or effect path.",
-    "The separate owner_present_error_wire_v1.json contract must be landed and pinned in both repositories before any handler or client may implement these paths.",
-    "This V1 file is immutable after both repositories land it; incompatible changes require a new versioned fixture."
+    "Historical success-envelope golden for the abandoned client-held V1 mobile Claw VPN owner-present ceremony.",
+    "This immutable fixture is test-only evidence and is not an implementation authority. It installs no route, handler, runtime, RP, adapter, or effect path.",
+    "The V1 proof_token, proof-bearing mint request, error wire, and activation marker must never authorize a production handler, client, issuer, or route.",
+    "Phase 1 is blocked until a separately reviewed V2 contract keeps finish, capability consumption, and mint server-side and gives the client no bearer whose possession authorizes mint."
   ],
   "dependencies": [
     {
@@ -32,9 +34,9 @@
       "id": "mobile_claw_vpn_api_shapes_v1",
       "theyos_path": "admin/contracts/mobile-claw-vpn/v1/api_shapes.json",
       "ios_path": "Packages/SoyehtCore/Tests/SoyehtCoreTests/Fixtures/mobile-claw-vpn/v1/api_shapes.json",
-      "sha256": "7d31e66fd6172c9e7340455e73d0c2b06629b491442428a14c53edd45f49b7a6",
+      "sha256": "6482badfe02f220e5954ddf0f73385a622d317ba7b9b9d1063562724574f33b4",
       "used_for": [
-        "configured_count_only_status"
+        "historical_configured_count_only_status"
       ]
     }
   ],
@@ -49,11 +51,11 @@
       "proof_token"
     ],
     "challenge_id": "Exactly 16 server-random bytes encoded as 32 lowercase hexadecimal characters. It is the only public challenge handle.",
-    "proof_token": "Exactly 32 opaque random bytes encoded as a CBOR byte string. It is adapter-only, never enters summary, UI, debug, or logs, and is not a RevalidatedCapability.",
+    "proof_token": "Historical V1-only field: exactly 32 opaque random bytes encoded as a CBOR byte string. It is forbidden as production authority and must never be wired into a client or server.",
     "run_claims": "Caller-supplied DEV correlation claims. StartResponse copies claw_alias and run_claims byte-for-byte from its explicitly referenced StartRequest into a server-owned execution template, resolves claw_id only through server_selector_bindings, recomputes the execution hash/context, and the client must require exact equality before the owner gesture. They never authorize member, household, owner, device, Claw, config, enrollment, ACL, audience, bundle, times, or nonces. If a trusted readiness provider lands later, any mismatch must burn rather than fall back to these claims.",
     "owner_credential_allowlist": "options.publicKey.allowCredentials is nonempty and derived exclusively from the owner's server-side enrollment for the trusted RP; no request field may influence it.",
     "webauthn_binding": "options.publicKey.challenge is a random RP challenge and is not context.challengeDigest. The server binds challenge_id one-to-one to the stored context, consumes it at finish, and requires stored, submitted, and reconstructed contexts to be byte-identical.",
-    "error_contract": "Out of scope. Authority-sensitive failures must eventually share one opaque, indistinguishable form; no handler or client may land until owner_present_error_wire_v1.json is authoritative and cross-repo pinned."
+    "error_contract": "Historical V1-only dependency. Landing or pinning owner_present_error_wire_v1.json does not authorize any handler, client, issuer, route, or effect."
   },
   "endpoint_profiles": {
     "start": {

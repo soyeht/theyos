@@ -1235,7 +1235,7 @@ pub async fn post_teardown(State(state): State<BootstrapHandlerState>, body: Byt
     // revert happen automatically on next boot. Exit is delayed 100 ms to allow
     // the response to flush. Not compiled in test builds: process::exit kills
     // the test binary when teardown_contract tests call this handler in-process.
-    // Full graceful shutdown via axum::serve(...).with_graceful_shutdown() is
+    // Full graceful shutdown through the Axum server is
     // tracked as future work (T091).
     #[cfg(not(test))]
     tokio::spawn(async {

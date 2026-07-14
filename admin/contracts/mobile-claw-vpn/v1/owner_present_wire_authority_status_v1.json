@@ -1,0 +1,82 @@
+{
+  "contract": "soyeht-mobile-claw-vpn-owner-present-wire-authority-status-v1",
+  "version": 1,
+  "phase": "phase0-compile-out",
+  "authority": "none",
+  "retired_wire": {
+    "contract": "soyeht-mobile-claw-vpn-owner-present-success-wire-v1",
+    "version": 1,
+    "theyos_path": "admin/contracts/mobile-claw-vpn/v1/owner_present_success_wire_v1.json",
+    "ios_path": "Packages/SoyehtCore/Tests/SoyehtCoreTests/Fixtures/mobile-claw-vpn/v1/owner_present_success_wire_v1.json",
+    "prior_authoritative_sha256": "ff9ad533567e29261ecbd8e11e84e9490f1829bd4d2e5b50fe8783dc82b000d1",
+    "historical_sha256": "55fe55c6f1985103f21e679c5e6227646035e4d03da3e75193cfc9d1eeb45f8f",
+    "status": "historical-test-only-non-authoritative",
+    "prohibited_production_authority": [
+      "proof_token",
+      "proof-bearing mint request",
+      "owner_present_runtime_activation_v1"
+    ]
+  },
+  "retired_api_shapes": {
+    "theyos_path": "admin/contracts/mobile-claw-vpn/v1/api_shapes.json",
+    "ios_path": "Packages/SoyehtCore/Tests/SoyehtCoreTests/Fixtures/mobile-claw-vpn/v1/api_shapes.json",
+    "status": "historical-test-only-non-authoritative",
+    "prior_authoritative_sha256": "7d31e66fd6172c9e7340455e73d0c2b06629b491442428a14c53edd45f49b7a6",
+    "historical_sha256": "6482badfe02f220e5954ddf0f73385a622d317ba7b9b9d1063562724574f33b4",
+    "prohibited_production_authority": [
+      "client-held offer_token",
+      "client-held rendezvous_token",
+      "V1 mint_offer request",
+      "V1 consume_offer request",
+      "V1 authorize_rendezvous request"
+    ]
+  },
+  "phase0_artifact_boundary": {
+    "theyos_path": "admin/contracts/mobile-claw-vpn/v1/owner_present_phase0_artifact_boundary_v1.tsv",
+    "format": "closed-git-inputs-v2",
+    "policy_change_control": "base-owned-proof-machinery-commit-bound-inputs",
+    "object_identity_update": "per-reviewed-commit-revalidation",
+    "object_identity_authority": "commit-bound-evidence-not-independent-approval",
+    "release_provenance": "checker-on-release-subject-and-final-package-attestation",
+    "staged_products": [
+      "nix-theyos-runtime",
+      "theyos-engine",
+      "theyos-llm-proxy"
+    ],
+    "required_published_targets": [
+      "x86_64-unknown-linux-musl",
+      "aarch64-unknown-linux-musl",
+      "aarch64-apple-darwin",
+      "nix-theyos-runtime-x86_64-linux"
+    ]
+  },
+  "proof_machinery_transition": {
+    "protocol": "soyeht-owner-present-proof-machinery-transition-v1",
+    "authority": "base-owned-integrity-checker",
+    "state": "unarmed",
+    "arming": "github-owner-review-on-exact-arm-commit",
+    "consumption": "one-shot-exact-tree-and-policy-oid-removes-transition-auth",
+    "canary": "arm-then-consume-merge-blocked-and-allowed",
+    "anti_replay": "base-sha-expected-head-tree-generation-one-shot-consumption"
+  },
+  "phase1_blocker": {
+    "minimum_wire_version": 2,
+    "required_shape": "server-held-finish-consume-mint",
+    "client_receives": [
+      "non-authoritative operation handle",
+      "count-only status"
+    ],
+    "client_must_not_receive": [
+      "bearer whose possession authorizes mint",
+      "proof_token"
+    ]
+  },
+  "notes": [
+    "The base-owned policy freezes proof machinery; declarative Cargo inputs and the boundary descriptor are revalidated per reviewed commit and are not independent approval.",
+    "Changing proof machinery requires the executable base-owned transition protocol: an owner-reviewed arm commit, an exact authorized tree/policy consume commit, one-shot removal, and the required integrity canary.",
+    "The V1 success fixture remains only as immutable cross-language regression evidence.",
+    "The V1 api_shapes dependency is historical regression evidence and is not a source of truth for Phase 1.",
+    "Neither owner_present_error_wire_v1 nor a V1 activation marker authorizes runtime, client, handler, issuer, or route wiring.",
+    "Phase 1 requires a separately reviewed V2 contract and cannot be opened by this status object."
+  ]
+}

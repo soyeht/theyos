@@ -180,12 +180,9 @@ fn spawn_listener_task(
         let shutdown = async move {
             let _ = shutdown_rx.await;
         };
-        if let Err(e) = axum::serve(
-            listener,
-            router.into_make_service_with_connect_info::<SocketAddr>(),
-        )
-        .with_graceful_shutdown(shutdown)
-        .await
+        if let Err(e) = core_rs::phase0_axum_serve!(listener, router, connect_info = SocketAddr)
+            .with_graceful_shutdown(shutdown)
+            .await
         {
             warn!(
                 stage = "household_listener.serve_failed",
