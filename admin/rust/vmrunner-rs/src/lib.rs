@@ -639,10 +639,16 @@ impl VmRunner {
     /// Returns an error if the instance directory cannot be removed.
     pub fn delete(&self, container: &str) -> Result<(), VmError> {
         let instance_dir = self.env.state_dir.join(container);
-        // Stop first; ignore "not found" errors (idempotent)
+        // Stop first; ignore only "not found" (idempotent). A quarantined
+        // instance is loaded through the cleanup-only path, and a failed stop
+        // must prevent deleting the directory while a VM may still survive.
         match InstanceEnv::load(&instance_dir) {
             Ok(mut inst) => {
-                let _ = self.stop_vm(&mut inst);
+                self.stop_vm(&mut inst)?;
+            }
+            Err(VmError::HostfwdUncertain(_)) => {
+                let mut inst = InstanceEnv::load_unchecked(&instance_dir)?;
+                self.stop_vm(&mut inst)?;
             }
             Err(VmError::InstanceNotFound(_)) => {}
             Err(e) => return Err(e),
@@ -861,12 +867,17 @@ impl VmRunner {
                 tracing::error!(
                     "[vmrunner] public hostfwd state is uncertain for {container}; stopping VM before returning"
                 );
-                if let Err(stop_error) = self.stop_vm(&mut inst) {
-                    tracing::error!(
-                        "[vmrunner] failed to stop VM {container} after uncertain hostfwd state: {stop_error}"
-                    );
-                }
-                return Err(e);
+                return match self.stop_vm(&mut inst) {
+                    Ok(()) => Err(e),
+                    Err(stop_error) => {
+                        tracing::error!(
+                            "[vmrunner] failed to prove VM {container} stopped after uncertain hostfwd state: {stop_error}"
+                        );
+                        Err(VmError::HostfwdUncertain(format!(
+                            "{e}; VM teardown was not verified: {stop_error}"
+                        )))
+                    }
+                };
             }
             Err(e) => return Err(e),
         }
@@ -2474,6 +2485,10 @@ wait $!
                     kill_pid_force(slirp_pid);
                 }
             }
+            // Give SIGKILL a short, bounded window to become observable before
+            // declaring teardown complete. The kill helpers intentionally do
+            // not hide their return values behind a false success here.
+            std::thread::sleep(Duration::from_millis(100));
         }
 
         // Reap zombie children. The original Child handles were dropped after
@@ -2486,20 +2501,34 @@ wait $!
             reap_pid(slirp_pid);
         }
 
+        let fc_survives = inst.firecracker_pid.is_some_and(is_pid_running);
+        let slirp_survives = inst.slirp_pid.is_some_and(is_pid_running);
+        if fc_survives || slirp_survives {
+            let survivors =
+                format!("firecracker_survives={fc_survives}, slirp_survives={slirp_survives}");
+            let marker_result = inst.mark_hostfwd_uncertain(&survivors);
+            let save_result = inst.save();
+            let persistence_error = marker_result
+                .err()
+                .or_else(|| save_result.err())
+                .map(|error| format!("; quarantine persistence failed: {error}"))
+                .unwrap_or_default();
+            return Err(VmError::HostfwdUncertain(format!(
+                "VM teardown did not prove all processes stopped ({survivors}){persistence_error}"
+            )));
+        }
+
         let _ = fs::remove_file(&inst.firecracker_sock);
         let _ = fs::remove_file(&inst.slirp_api_sock);
 
-        // Save if any PID was present — even if the process was already dead,
-        // we need to persist the cleared state so restart()/rebuild() after
-        // reboot doesn't see stale PIDs.
-        let had_pids = inst.firecracker_pid.is_some() || inst.slirp_pid.is_some();
-
+        // Persist the cleared state so restart()/rebuild() after reboot cannot
+        // see stale PIDs. A previous quarantine is cleared only after this
+        // post-condition has been proven.
         inst.firecracker_pid = None;
         inst.slirp_pid = None;
+        inst.clear_hostfwd_uncertain()?;
 
-        if had_pids {
-            inst.save()?;
-        }
+        inst.save()?;
         Ok(())
     }
 
@@ -2625,6 +2654,25 @@ wait $!
 
             let mut inst = match InstanceEnv::load(&dir) {
                 Ok(i) => i,
+                Err(VmError::HostfwdUncertain(_)) => {
+                    let mut quarantined = match InstanceEnv::load_unchecked(&dir) {
+                        Ok(i) => i,
+                        Err(e) => {
+                            tracing::warn!(
+                                "[vmrunner-sweep] cannot load quarantined instance.env for {name}: {e}"
+                            );
+                            continue;
+                        }
+                    };
+                    if let Err(e) = self.stop_vm(&mut quarantined) {
+                        tracing::warn!(
+                            "[vmrunner-sweep] quarantined instance {name} still needs teardown: {e}"
+                        );
+                    } else {
+                        report.instances_cleaned += 1;
+                    }
+                    continue;
+                }
                 Err(e) => {
                     tracing::warn!("[vmrunner-sweep] cannot load instance.env for {name}: {e}");
                     continue;

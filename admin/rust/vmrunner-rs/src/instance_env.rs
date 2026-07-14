@@ -12,6 +12,8 @@ use std::path::{Path, PathBuf};
 
 use crate::error::VmError;
 
+const HOSTFWD_UNCERTAIN_MARKER: &str = ".hostfwd-uncertain";
+
 /// All persistent state for a single Firecracker VM instance.
 #[derive(Debug, Clone, PartialEq)]
 pub struct InstanceEnv {
@@ -72,6 +74,22 @@ impl InstanceEnv {
     ///
     /// Returns an error if the file cannot be read or required keys are missing.
     pub fn load(instance_dir: &Path) -> Result<Self, VmError> {
+        if instance_dir.join(HOSTFWD_UNCERTAIN_MARKER).exists() {
+            return Err(VmError::HostfwdUncertain(format!(
+                "instance {} is quarantined after an unverified hostfwd teardown",
+                instance_dir.display()
+            )));
+        }
+
+        Self::load_unchecked(instance_dir)
+    }
+
+    /// Load an instance even when its persistent quarantine marker is set.
+    ///
+    /// This is restricted to cleanup paths that must be able to stop/delete a
+    /// quarantined instance. Normal lifecycle operations must use `load()` so
+    /// an uncertain VM cannot be reused accidentally.
+    pub(crate) fn load_unchecked(instance_dir: &Path) -> Result<Self, VmError> {
         let env_path = instance_dir.join("instance.env");
         let content = fs::read_to_string(&env_path).map_err(|e| {
             VmError::InstanceNotFound(format!("cannot read {}: {e}", env_path.display()))
@@ -139,6 +157,33 @@ impl InstanceEnv {
             slirp_log,
             customer_dir,
         })
+    }
+
+    /// Persist a quarantine marker that prevents normal lifecycle reuse.
+    pub(crate) fn mark_hostfwd_uncertain(&self, reason: &str) -> Result<(), VmError> {
+        fs::write(
+            self.instance_dir.join(HOSTFWD_UNCERTAIN_MARKER),
+            format!("{reason}\n"),
+        )
+        .map_err(|e| {
+            VmError::Io(format!(
+                "write hostfwd quarantine marker {}: {e}",
+                self.instance_dir.join(HOSTFWD_UNCERTAIN_MARKER).display()
+            ))
+        })
+    }
+
+    /// Remove a quarantine marker after all tracked processes have stopped.
+    pub(crate) fn clear_hostfwd_uncertain(&self) -> Result<(), VmError> {
+        let marker = self.instance_dir.join(HOSTFWD_UNCERTAIN_MARKER);
+        match fs::remove_file(&marker) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(VmError::Io(format!(
+                "remove hostfwd quarantine marker {}: {e}",
+                marker.display()
+            ))),
+        }
     }
 
     /// Save the current state to `<instance_dir>/instance.env`.
@@ -302,5 +347,35 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let result = InstanceEnv::load(tmp.path());
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn quarantined_instance_cannot_be_loaded_for_reuse() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        write_env(
+            dir,
+            "CONTAINER_NAME=picoclaw-test\n\
+             CUSTOMER_NAME=test\n\
+             CLAW_TYPE=picoclaw\n\
+             PORT=35000\n\
+             SSH_PORT=22001\n\
+             FIRECRACKER_PID=\n\
+             SLIRP_PID=\n",
+        );
+        fs::write(
+            dir.join(HOSTFWD_UNCERTAIN_MARKER),
+            "teardown not verified\n",
+        )
+        .unwrap();
+
+        assert!(matches!(
+            InstanceEnv::load(dir),
+            Err(VmError::HostfwdUncertain(_))
+        ));
+        assert!(
+            InstanceEnv::load_unchecked(dir).is_ok(),
+            "cleanup-only loading must remain possible"
+        );
     }
 }
