@@ -818,7 +818,9 @@ impl VmRunner {
     /// # Errors
     ///
     /// Returns an error if the instance is not running or the slirp API rejects
-    /// the host forward.
+    /// the host forward. `VmError::HostfwdUncertain` is a distinct safety
+    /// outcome: an ambiguous add may have installed a mapping, so this method
+    /// stops the VM before returning and callers must not reuse it.
     pub fn ensure_public_hostfwd(
         &self,
         container: &str,
@@ -826,7 +828,7 @@ impl VmRunner {
         guest_port: u16,
     ) -> Result<(), VmError> {
         let instance_dir = self.env.state_dir.join(container);
-        let inst = InstanceEnv::load(&instance_dir)?;
+        let mut inst = InstanceEnv::load(&instance_dir)?;
 
         match inst.slirp_pid {
             Some(pid) if is_pid_running(pid) => {}
@@ -853,7 +855,21 @@ impl VmRunner {
             return Ok(());
         }
 
-        let _ = slirp_add_hostfwd(&inst.slirp_api_sock, host_port, guest_port)?;
+        match slirp_add_hostfwd(&inst.slirp_api_sock, host_port, guest_port) {
+            Ok(_) => {}
+            Err(e @ VmError::HostfwdUncertain(_)) => {
+                tracing::error!(
+                    "[vmrunner] public hostfwd state is uncertain for {container}; stopping VM before returning"
+                );
+                if let Err(stop_error) = self.stop_vm(&mut inst) {
+                    tracing::error!(
+                        "[vmrunner] failed to stop VM {container} after uncertain hostfwd state: {stop_error}"
+                    );
+                }
+                return Err(e);
+            }
+            Err(e) => return Err(e),
+        }
         tracing::info!(
             "[vmrunner] public hostfwd added: {container} 127.0.0.1:{host_port} -> guest:{guest_port}"
         );
@@ -1969,6 +1985,20 @@ wait $!
 
     // ── Warm pool ──────────────────────────────────────────────────────────
 
+    /// Publish a warm entry only after the temporary hostfwd check completed.
+    ///
+    /// Keeping the Result at the storage boundary makes it impossible for a
+    /// future fill branch to turn an add or cleanup failure into a warm slot.
+    fn store_warm_entry_after_fill(
+        pool: &mut crate::warm_pool::WarmPool,
+        mut entry: crate::warm_pool::WarmEntry,
+        binary_present: Result<bool, VmError>,
+    ) -> Result<(), VmError> {
+        entry.binary_present = binary_present?;
+        pool.store(entry);
+        Ok(())
+    }
+
     /// Fill a warm pool slot for the given claw type.
     ///
     /// Creates a pool VM named `_warm-<claw_type>-0`, runs through `prepare_rootfs`
@@ -2106,7 +2136,7 @@ wait $!
         // claim time doesn't need an SSH round-trip for the install check.
         let t_ssh = std::time::Instant::now();
         let ssh_check_timeout = 30;
-        let binary_present = {
+        let binary_present: Result<bool, VmError> = {
             let (temp_port, _temp_port_reservation) = cid::pick_ssh_port(&self.env.state_dir)?;
             // Add temporary hostfwd
             let temp_hostfwd = slirp_add_hostfwd(&inst.slirp_api_sock, temp_port, 22);
@@ -2129,41 +2159,44 @@ wait $!
                             // claw that needs to download packages.
                             let dns_cmd = "getent hosts github.com 2>/dev/null || nslookup github.com 2>/dev/null";
                             let dns_ok = ssh.exec(dns_cmd).await.is_ok();
-                            if !dns_ok {
-                                tracing::warn!(
-                                    "[vmrunner-pool] pool VM for {claw_type} has no DNS — discarding"
-                                );
-                                // Still must remove the temp hostfwd before bailing out.
-                                if !slirp_remove_hostfwd_verified(
-                                    &inst.slirp_api_sock,
-                                    temp_port,
-                                    22,
-                                    fwd_id,
-                                ) {
-                                    tracing::error!(
-                                        "[vmrunner-pool] WARN: temp hostfwd on port {temp_port} could not be verified removed for {claw_type} (DNS fail path)"
-                                    );
-                                }
-                                // fill_guard RAII will kill FC/slirp and remove the dir.
-                                return Err(VmError::Other(format!(
-                                    "pool VM DNS check failed for {claw_type}: cannot resolve github.com"
-                                )));
-                            }
-                            tracing::info!("[vmrunner-pool] DNS check passed for {claw_type}");
-
-                            // Remove the temporary hostfwd with verification.
-                            // A leaked hostfwd poisons the SSH port pool.
-                            if !slirp_remove_hostfwd_verified(
+                            let cleanup_verified = slirp_remove_hostfwd_verified(
                                 &inst.slirp_api_sock,
                                 temp_port,
                                 22,
                                 fwd_id,
-                            ) {
-                                tracing::error!(
-                                    "[vmrunner-pool] WARN: temp hostfwd on port {temp_port} could not be verified removed for {claw_type}"
+                            );
+                            if dns_ok {
+                                tracing::info!("[vmrunner-pool] DNS check passed for {claw_type}");
+
+                                // A leaked hostfwd poisons the SSH port pool.
+                                if cleanup_verified {
+                                    Ok(present)
+                                } else {
+                                    tracing::error!(
+                                        "[vmrunner-pool] temp hostfwd on port {temp_port} could not be verified removed for {claw_type}; aborting fill so PoolFillGuard tears down the VM"
+                                    );
+                                    Err(VmError::HostfwdUncertain(format!(
+                                        "pool VM {claw_type} temporary hostfwd cleanup was not verified after successful SSH/DNS checks"
+                                    )))
+                                }
+                            } else {
+                                tracing::warn!(
+                                    "[vmrunner-pool] pool VM for {claw_type} has no DNS — discarding"
                                 );
+                                if cleanup_verified {
+                                    // fill_guard RAII will kill FC/slirp and remove the dir.
+                                    Err(VmError::Other(format!(
+                                        "pool VM DNS check failed for {claw_type}: cannot resolve github.com"
+                                    )))
+                                } else {
+                                    tracing::error!(
+                                        "[vmrunner-pool] temp hostfwd on port {temp_port} could not be verified removed for {claw_type} (DNS fail path); aborting fill so PoolFillGuard tears down the VM"
+                                    );
+                                    Err(VmError::HostfwdUncertain(format!(
+                                        "pool VM {claw_type} temporary hostfwd cleanup was not verified after DNS failure"
+                                    )))
+                                }
                             }
-                            present
                         }
                         Err(e) => {
                             tracing::warn!(
@@ -2172,25 +2205,32 @@ wait $!
                             // The hostfwd was successfully added but SSH
                             // failed — we must still remove the hostfwd to
                             // avoid leaking a bound port on the host.
-                            if !slirp_remove_hostfwd_verified(
+                            if slirp_remove_hostfwd_verified(
                                 &inst.slirp_api_sock,
                                 temp_port,
                                 22,
                                 fwd_id,
                             ) {
+                                Ok(false)
+                            } else {
                                 tracing::error!(
-                                    "[vmrunner-pool] WARN: temp hostfwd on port {temp_port} could not be verified removed for {claw_type} (SSH fail path)"
+                                    "[vmrunner-pool] temp hostfwd on port {temp_port} could not be verified removed for {claw_type} (SSH fail path); aborting fill so PoolFillGuard tears down the VM"
                                 );
+                                Err(VmError::HostfwdUncertain(format!(
+                                    "pool VM {claw_type} temporary hostfwd cleanup was not verified after SSH failure"
+                                )))
                             }
-                            false
                         }
                     }
                 }
                 Err(e) => {
                     tracing::warn!(
-                        "[vmrunner-pool] temp hostfwd failed for {claw_type}: {e}, skipping binary check"
+                        "[vmrunner-pool] temp hostfwd failed for {claw_type}; aborting fill so PoolFillGuard tears down the VM: {e}"
                     );
-                    false
+                    // Any add error is terminal for a pool fill. Even a
+                    // non-ambiguous error must not publish a VM whose port
+                    // state was not established and verified as empty.
+                    Err(e)
                 }
             }
         };
@@ -2199,14 +2239,17 @@ wait $!
             container: container.clone(),
             claw_type: claw_type.to_string(),
             inst,
-            binary_present,
+            binary_present: false,
         };
 
         {
             let mut pool = global_pool()
                 .lock()
                 .map_err(|_| VmError::Other("warm pool mutex poisoned".into()))?;
-            pool.store(entry);
+            // Every hostfwd add/cleanup failure reaches this helper as an Err.
+            // Only a VM whose temporary mapping was verified absent is stored;
+            // otherwise PoolFillGuard tears it down on return.
+            Self::store_warm_entry_after_fill(&mut pool, entry, binary_present)?;
         }
 
         // Disarm fill guard — slot is warm and stored in the pool.
@@ -2852,6 +2895,57 @@ mod tests {
     fn collect_used_ssh_ports_nonexistent_dir() {
         let ports = collect_used_ssh_ports(Path::new("/nonexistent/state/dir"));
         assert!(ports.is_empty());
+    }
+
+    #[test]
+    fn pool_fill_errors_never_publish_a_slot() {
+        use crate::warm_pool::{WarmEntry, WarmPool};
+
+        let outcomes = [
+            VmError::Other("add_hostfwd failed".into()),
+            VmError::HostfwdUncertain("SSH cleanup was not verified".into()),
+            VmError::HostfwdUncertain("successful cleanup was not verified".into()),
+        ];
+
+        for (index, error) in outcomes.into_iter().enumerate() {
+            let claw_type = format!("pool-error-{index}");
+            let container = WarmPool::container_name(&claw_type, 0);
+            let entry = WarmEntry {
+                container: container.clone(),
+                claw_type: claw_type.clone(),
+                inst: InstanceEnv {
+                    container: container.clone(),
+                    customer: container.clone(),
+                    claw_type: claw_type.clone(),
+                    host_port: 0,
+                    ssh_port: core_rs::guest_net::SSH_HOST_PORT_RANGE_START,
+                    firecracker_pid: None,
+                    slirp_pid: None,
+                    instance_dir: std::path::PathBuf::from("/tmp/phase0-pool-error"),
+                    rootfs_path: std::path::PathBuf::from("/tmp/phase0-pool-error/rootfs.ext4"),
+                    firecracker_sock: std::path::PathBuf::from(
+                        "/tmp/phase0-pool-error/firecracker.sock",
+                    ),
+                    slirp_api_sock: std::path::PathBuf::from(
+                        "/tmp/phase0-pool-error/slirp-api.sock",
+                    ),
+                    serial_log: std::path::PathBuf::from("/tmp/phase0-pool-error/serial.log"),
+                    slirp_log: std::path::PathBuf::from("/tmp/phase0-pool-error/slirp.log"),
+                    customer_dir: String::new(),
+                },
+                binary_present: false,
+            };
+            let mut pool = WarmPool::default();
+
+            let result = VmRunner::store_warm_entry_after_fill(&mut pool, entry, Err(error));
+
+            assert!(result.is_err(), "fill outcome must remain an error");
+            assert_eq!(
+                pool.slot_state(&claw_type),
+                "empty",
+                "failed fill must not publish a warm slot"
+            );
+        }
     }
 
     #[test]

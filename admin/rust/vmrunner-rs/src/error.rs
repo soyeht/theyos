@@ -260,6 +260,11 @@ pub enum VmError {
     )]
     NoFreeSshPort,
 
+    /// The slirp host-forward state may be unknown after an ambiguous API
+    /// response. The owning VM must be discarded rather than reused.
+    #[error("hostfwd state is uncertain: {0}")]
+    HostfwdUncertain(String),
+
     #[error("{0}")]
     Other(String),
 }

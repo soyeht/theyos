@@ -21,7 +21,9 @@ use crate::error::VmError;
 /// window after the API socket appears but before TAP is fully ready.
 ///
 /// Returns the hostfwd ID assigned by slirp4netns. Empty, malformed, or
-/// unreadable responses are retried and eventually returned as errors.
+/// unreadable responses are retried and eventually returned as errors. If a
+/// cleanup cannot be verified after an ambiguous response, the error is
+/// `VmError::HostfwdUncertain`; the owning VM must not be reused.
 pub(crate) fn slirp_add_hostfwd(
     api_sock: &Path,
     host_port: u16,
@@ -143,11 +145,19 @@ fn slirp_add_hostfwd_with_retry(
 
         if let Some(error) = json_error_value(&value) {
             let error_text = error.to_string();
+            let reported_id = hostfwd_id_for_cleanup(&value);
+            if let Some(fwd_id) = reported_id {
+                if !slirp_remove_hostfwd_verified(api_sock, host_port, guest_port, fwd_id) {
+                    return Err(VmError::HostfwdUncertain(format!(
+                        "slirp API add_hostfwd error with id={fwd_id}; cleanup could not be verified: {response}"
+                    )));
+                }
+            }
             // slirp4netns can briefly report this while TAP setup is still
             // completing; treat it as transient and retry with backoff.
             if error_text.contains("slirp_add_hostfwd failed") {
                 last_err = format!("api: {response}");
-                if cleanup_partial_on_retry {
+                if cleanup_partial_on_retry && reported_id.is_none() {
                     ensure_hostfwd_reconciled_before_retry(api_sock, host_port, guest_port)?;
                 }
                 continue;
@@ -169,7 +179,6 @@ fn slirp_add_hostfwd_with_retry(
                 if cleanup_partial_on_retry {
                     ensure_hostfwd_reconciled_before_retry(api_sock, host_port, guest_port)?;
                 }
-                continue;
             }
         }
     }
@@ -193,7 +202,7 @@ fn ensure_hostfwd_reconciled_before_retry(
     if slirp_remove_hostfwd_verified(api_sock, host_port, guest_port, -1) {
         Ok(())
     } else {
-        Err(VmError::Other(format!(
+        Err(VmError::HostfwdUncertain(format!(
             "slirp API add_hostfwd: refusing retry because cleanup of host_port={host_port} guest_port={guest_port} could not be verified"
         )))
     }
@@ -206,6 +215,15 @@ fn json_error_value(value: &serde_json::Value) -> Option<&serde_json::Value> {
             .and_then(serde_json::Value::as_object)
             .and_then(|return_body| return_body.get("error"))
     })
+}
+
+fn hostfwd_id_for_cleanup(value: &serde_json::Value) -> Option<i64> {
+    value
+        .get("return")
+        .and_then(serde_json::Value::as_object)
+        .and_then(|return_body| return_body.get("id"))
+        .and_then(serde_json::Value::as_i64)
+        .filter(|id| *id >= 0)
 }
 
 fn parse_hostfwd_id_value(value: &serde_json::Value) -> Result<i64, &'static str> {
@@ -227,6 +245,7 @@ fn parse_hostfwd_id_value(value: &serde_json::Value) -> Result<i64, &'static str
 }
 
 /// Parse `{"return":{"id": N}}` → N, or -1 on failure.
+#[cfg(test)]
 fn parse_hostfwd_id(response: &str) -> i64 {
     serde_json::from_str::<serde_json::Value>(response)
         .ok()
@@ -1040,12 +1059,21 @@ mod tests {
             result.is_err(),
             "ambiguous add must fail when cleanup cannot be verified"
         );
+        assert!(
+            matches!(&result, Err(VmError::HostfwdUncertain(_))),
+            "unverified cleanup must be a typed uncertain-hostfwd outcome: {result:?}"
+        );
 
         let cmds = mock.received_commands();
         assert_eq!(
             cmds.iter().filter(|c| *c == "add_hostfwd").count(),
             1,
             "cleanup failure must prevent a second add; got: {cmds:?}"
+        );
+        assert_eq!(
+            mock.active_hostfwd_count(),
+            1,
+            "unverified cleanup must be handed to the VM teardown path, not treated as an empty state"
         );
     }
 
@@ -1062,12 +1090,21 @@ mod tests {
             result.is_err(),
             "ambiguous add must fail when removal cannot be verified"
         );
+        assert!(
+            matches!(&result, Err(VmError::HostfwdUncertain(_))),
+            "unverified removal must be a typed uncertain-hostfwd outcome: {result:?}"
+        );
 
         let cmds = mock.received_commands();
         assert_eq!(
             cmds.iter().filter(|c| *c == "add_hostfwd").count(),
             1,
             "removal failure must prevent a second add; got: {cmds:?}"
+        );
+        assert_eq!(
+            mock.active_hostfwd_count(),
+            1,
+            "unverified removal must be handed to the VM teardown path, not treated as an empty state"
         );
     }
 
@@ -1182,6 +1219,15 @@ mod tests {
                 cmds.iter().filter(|c| *c == "add_hostfwd").count(),
                 1,
                 "error response must not trigger a second add; got: {cmds:?}"
+            );
+            assert!(
+                cmds.contains(&"remove_hostfwd".to_string()),
+                "error response with an id must be reconciled; got: {cmds:?}"
+            );
+            assert_eq!(
+                mock.active_hostfwd_count(),
+                0,
+                "error response with an id must not leave a hostfwd active"
             );
         }
     }
