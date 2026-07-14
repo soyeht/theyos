@@ -20,8 +20,8 @@ use crate::error::VmError;
 /// exponential back-off. slirp4netns occasionally has a brief unavailability
 /// window after the API socket appears but before TAP is fully ready.
 ///
-/// Returns the hostfwd ID assigned by slirp4netns (or -1 if the response
-/// couldn't be parsed).
+/// Returns the hostfwd ID assigned by slirp4netns. Empty, malformed, or
+/// unreadable responses are retried and eventually returned as errors.
 pub(crate) fn slirp_add_hostfwd(
     api_sock: &Path,
     host_port: u16,
@@ -111,7 +111,21 @@ fn slirp_add_hostfwd_with_retry(
         stream.shutdown(Shutdown::Write).ok();
 
         let mut response = String::new();
-        stream.read_to_string(&mut response).ok();
+        if let Err(e) = stream.read_to_string(&mut response) {
+            last_err = format!("read: {e}");
+            if cleanup_partial_on_retry {
+                let _ = slirp_remove_hostfwd(api_sock, host_port, guest_port);
+            }
+            continue;
+        }
+
+        if response.trim().is_empty() {
+            last_err = "read: empty response".to_string();
+            if cleanup_partial_on_retry {
+                let _ = slirp_remove_hostfwd(api_sock, host_port, guest_port);
+            }
+            continue;
+        }
 
         if response.contains("\"error\"") {
             // slirp4netns can briefly report this while TAP setup is still
@@ -133,9 +147,12 @@ fn slirp_add_hostfwd_with_retry(
         // Parse the ID from {"return":{"id": N}}
         let fwd_id = parse_hostfwd_id(&response);
         if fwd_id < 0 {
-            tracing::warn!(
-                "[vmrunner] slirp add_hostfwd succeeded but could not parse id from: {response}"
-            );
+            last_err = format!("api: invalid add_hostfwd response: {response}");
+            tracing::warn!("[vmrunner] slirp add_hostfwd returned an invalid response: {response}");
+            if cleanup_partial_on_retry {
+                let _ = slirp_remove_hostfwd(api_sock, host_port, guest_port);
+            }
+            continue;
         }
         return Ok(fwd_id);
     }
@@ -669,6 +686,21 @@ mod tests {
         assert!(
             cmds.contains(&"list_hostfwd".to_string()),
             "cleanup_partial should call list_hostfwd; got: {cmds:?}"
+        );
+    }
+
+    #[test]
+    fn add_hostfwd_retries_empty_response() {
+        let mock = MockSlirp::new();
+        mock.queue_add_response("");
+
+        let result = slirp_add_hostfwd_quick(&mock.sock_path, 22995, 22);
+        assert_eq!(result.unwrap(), 1, "empty response must not be success");
+
+        let cmds = mock.received_commands();
+        assert!(
+            cmds.iter().filter(|c| *c == "add_hostfwd").count() >= 2,
+            "empty response should trigger an add_hostfwd retry; got: {cmds:?}"
         );
     }
 
