@@ -115,6 +115,13 @@ chmod -R a-w "${BUILD_SNAPSHOT}"
 # pinned OCI image. Native macOS authority builds use sandbox-exec to deny
 # writes to the snapshot and Cargo/Rustup homes for every child process. A
 # chmod/root-ownership check alone is deliberately not accepted as provenance.
+case "${BUILD_TOOL}" in
+  cargo|cross) ;;
+  *)
+    echo "::error::unsupported Phase 0 build tool: ${BUILD_TOOL}"
+    exit 1
+    ;;
+esac
 if [[ "${BUILD_TOOL}" != "cross" ]]; then
   if [[ "$(uname -s)" != "Darwin" || ! -x /usr/bin/sandbox-exec ]]; then
     echo "::error::native Phase 0 authority requires the macOS sandbox-exec write boundary"
