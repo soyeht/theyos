@@ -30,6 +30,45 @@ if ! grep -Fq \
   echo "error: published-target workflow must accept pinned Rust triples with underscores" >&2
   exit 1
 fi
+workflow_job_runner_temp_refs() {
+  awk '
+    /^  [A-Za-z0-9_-]+:$/ { in_job = 1; job = $0; next }
+    in_job && /^    steps:$/ { in_job = 0; next }
+    in_job && /\$\{\{[[:space:]]*runner\.temp[[:space:]]*\}\}/ {
+      print job ":" NR ":" $0
+    }
+  ' "$1"
+}
+release_macos_workflow="${REPO_ROOT}/.github/workflows/release-macos.yml"
+if [[ -n "$(workflow_job_runner_temp_refs "${release_macos_workflow}")" ]]; then
+  echo "error: release-macos uses runner.temp in job-level env" >&2
+  exit 1
+fi
+release_macos_context_mutation="${TMP_ROOT}/release-macos-runner-context.yml"
+cp "${release_macos_workflow}" "${release_macos_context_mutation}"
+perl -0pi -e \
+  's/(    env:\n)/$1      TEST_RUNNER_TEMP: "\$\{\{ runner.temp \}\}"\n/' \
+  "${release_macos_context_mutation}"
+if [[ -z "$(workflow_job_runner_temp_refs "${release_macos_context_mutation}")" ]]; then
+  echo "error: release workflow runner context canary did not detect job-level runner.temp" >&2
+  exit 1
+fi
+if ! grep -Fq 'runner.temp is unavailable in job-level env' \
+    "${REPO_ROOT}/${CHECKER_REL}"; then
+  echo "error: compileout checker lacks the release workflow context validator" >&2
+  exit 1
+fi
+release_macos_formula_job="$(sed -n '/^  update-homebrew-formula:/,$p' "${release_macos_workflow}")"
+formula_auth_setup_line="$(grep -nF 'gh auth setup-git' <<<"${release_macos_formula_job}" \
+  | head -1 | cut -d: -f1 || true)"
+formula_push_line="$(grep -nF 'git push origin' <<<"${release_macos_formula_job}" \
+  | head -1 | cut -d: -f1 || true)"
+if [[ -z "${formula_auth_setup_line}" || -z "${formula_push_line}" \
+  || "${formula_auth_setup_line}" -ge "${formula_push_line}" ]]; then
+  echo "error: formula push lacks GitHub CLI credential setup" >&2
+  exit 1
+fi
+echo "PASS release_workflow_context_and_push_auth_contract"
 if [[ "${HOST_TARGET}" == *-apple-darwin ]]; then
   PHASE0_EXPECTED_XCODE_VERSION="${PHASE0_EXPECTED_XCODE_VERSION:-$(xcodebuild -version | sed -n 's/^Xcode //p')}"
   PHASE0_EXPECTED_XCODE_BUILD="${PHASE0_EXPECTED_XCODE_BUILD:-$(xcodebuild -version | sed -n 's/^Build version //p')}"

@@ -1371,6 +1371,41 @@ if ! grep -Fq "phase0_engine_sha256" "${SNAPSHOT}/.github/workflows/release-linu
   echo "::error::release provenance does not bind the verified engine to the published package"
   exit 1
 fi
+release_macos_job_runner_temp_refs="$({
+  awk '
+    /^  [A-Za-z0-9_-]+:$/ { in_job = 1; job = $0; next }
+    in_job && /^    steps:$/ { in_job = 0; next }
+    in_job && /\$\{\{[[:space:]]*runner\.temp[[:space:]]*\}\}/ {
+      print job ":" NR ":" $0
+    }
+  ' "${SNAPSHOT}/.github/workflows/release-macos.yml"
+} || true)"
+if [[ -n "${release_macos_job_runner_temp_refs}" ]]; then
+  echo "::error file=.github/workflows/release-macos.yml::runner.temp is unavailable in job-level env; resolve RUNNER_TEMP at step runtime"
+  printf '%s\n' "${release_macos_job_runner_temp_refs}" >&2
+  exit 1
+fi
+for release_macos_runtime_binding in \
+  'PHASE0_ATTESTATION=%s\n' \
+  'PHASE0_ENGINE=%s\n' \
+  'PHASE0_STAGED_BINARIES_OUT=%s\n'; do
+  if ! grep -Fq -- "${release_macos_runtime_binding}" \
+      "${SNAPSHOT}/.github/workflows/release-macos.yml"; then
+    echo "::error file=.github/workflows/release-macos.yml::macOS release path must be assigned from RUNNER_TEMP at step runtime"
+    exit 1
+  fi
+done
+release_macos_formula_job="$(sed -n '/^  update-homebrew-formula:/,$p' \
+  "${SNAPSHOT}/.github/workflows/release-macos.yml")"
+formula_auth_setup_line="$(grep -nF 'gh auth setup-git' <<<"${release_macos_formula_job}" \
+  | head -1 | cut -d: -f1 || true)"
+formula_push_line="$(grep -nF 'git push origin' <<<"${release_macos_formula_job}" \
+  | head -1 | cut -d: -f1 || true)"
+if [[ -z "${formula_auth_setup_line}" || -z "${formula_push_line}" \
+  || "${formula_auth_setup_line}" -ge "${formula_push_line}" ]]; then
+  echo "::error file=.github/workflows/release-macos.yml::Homebrew formula push must configure GitHub CLI credentials before git push"
+  exit 1
+fi
 for release_subject_binding in \
   'PHASE0_UNSIGNED_STAGE_DIR' \
   'PHASE0_EXPECTED_UNSIGNED_PACKAGE_MANIFEST_SHA256' \

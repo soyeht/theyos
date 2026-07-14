@@ -843,7 +843,7 @@ impl VmRunner {
         }
 
         slirp_wait_ready(&inst.slirp_api_sock, Duration::from_secs(5))?;
-        let existing = slirp_list_hostfwd(&inst.slirp_api_sock)
+        let existing = slirp_list_hostfwd(&inst.slirp_api_sock)?
             .into_iter()
             .any(|(_, hp, gp)| hp == host_port && gp == guest_port);
         if existing {
