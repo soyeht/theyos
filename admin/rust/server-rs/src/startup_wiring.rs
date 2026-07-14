@@ -5,6 +5,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use crate::apns_dispatcher::{self, ApnsTransport};
 use crate::apns_push::{self, HouseCreatedTransport};
 use crate::claw_vpn_dev_config::{ClawVpnDevConfig, ClawVpnDevConfigError, ClawVpnDevMode};
 use crate::setup_beacon::SetupBeaconParams;
@@ -250,6 +251,19 @@ pub fn install_house_created_push_transport_from_env() -> PushTransportStartupSt
     )
 }
 
+/// Install the production silent owner-event APNS tickle transport from
+/// environment. Missing or invalid APNS environment returns `Skipped` so the
+/// server remains usable without background push.
+pub fn install_owner_event_tickle_transport_from_env() -> PushTransportStartupStatus {
+    install_owner_event_tickle_transport_with(
+        || {
+            crate::apns_tickle_transport::A2TickleTransport::from_env()
+                .map(|transport| Arc::new(transport) as Arc<dyn ApnsTransport>)
+        },
+        apns_dispatcher::install_transport,
+    )
+}
+
 pub fn install_house_created_push_transport_with<Load, Install>(
     load: Load,
     install: Install,
@@ -271,6 +285,31 @@ where
         PushTransportStartupStatus::Installed
     } else {
         tracing::info!(stage = "apns.push.transport_already_installed");
+        PushTransportStartupStatus::AlreadyInstalled
+    }
+}
+
+pub fn install_owner_event_tickle_transport_with<Load, Install>(
+    load: Load,
+    install: Install,
+) -> PushTransportStartupStatus
+where
+    Load: FnOnce() -> Option<Arc<dyn ApnsTransport>>,
+    Install: FnOnce(Arc<dyn ApnsTransport>) -> Result<(), Arc<dyn ApnsTransport>>,
+{
+    let Some(transport) = load() else {
+        tracing::info!(
+            stage = "apns.tickle.transport_skipped",
+            "THEYOS_APNS_KEY_PATH/_KEY_ID/_TEAM_ID/_TOPIC not all set or invalid - owner-event APNS tickle will no-op"
+        );
+        return PushTransportStartupStatus::Skipped;
+    };
+
+    if let Ok(()) = install(transport) {
+        tracing::info!(stage = "apns.tickle.transport_installed");
+        PushTransportStartupStatus::Installed
+    } else {
+        tracing::info!(stage = "apns.tickle.transport_already_installed");
         PushTransportStartupStatus::AlreadyInstalled
     }
 }
@@ -426,6 +465,7 @@ mod tests {
     use std::sync::Mutex;
 
     struct FakeTransport;
+    struct FakeTickleTransport;
 
     impl HouseCreatedTransport for FakeTransport {
         fn topic(&self) -> &'static str {
@@ -437,6 +477,21 @@ mod tests {
             _token_hex: &'a str,
             _json_body: &'a str,
         ) -> Pin<Box<dyn Future<Output = Result<(), apns_push::DispatchAttemptError>> + Send + 'a>>
+        {
+            Box::pin(async { Ok(()) })
+        }
+    }
+
+    impl ApnsTransport for FakeTickleTransport {
+        fn topic(&self) -> &'static str {
+            "com.soyeht.app"
+        }
+
+        fn send<'a>(
+            &'a self,
+            _push_token: &'a [u8],
+            _body: &'a [u8],
+        ) -> Pin<Box<dyn Future<Output = Result<(), apns_dispatcher::ApnsError>> + Send + 'a>>
         {
             Box::pin(async { Ok(()) })
         }
@@ -472,6 +527,42 @@ mod tests {
     fn push_transport_wiring_reports_already_installed() {
         let status = install_house_created_push_transport_with(
             || Some(Arc::new(FakeTransport) as Arc<dyn HouseCreatedTransport>),
+            Err,
+        );
+
+        assert_eq!(status, PushTransportStartupStatus::AlreadyInstalled);
+    }
+
+    #[test]
+    fn tickle_transport_wiring_installs_when_loader_returns_transport() {
+        let installed = Mutex::new(false);
+        let status = install_owner_event_tickle_transport_with(
+            || Some(Arc::new(FakeTickleTransport) as Arc<dyn ApnsTransport>),
+            |transport| {
+                assert_eq!(transport.topic(), "com.soyeht.app");
+                *installed.lock().unwrap() = true;
+                Ok(())
+            },
+        );
+
+        assert_eq!(status, PushTransportStartupStatus::Installed);
+        assert!(*installed.lock().unwrap());
+    }
+
+    #[test]
+    fn tickle_transport_wiring_gracefully_skips_without_env_transport() {
+        let status = install_owner_event_tickle_transport_with(
+            || None,
+            |_| panic!("installer must not be called when loader returns None"),
+        );
+
+        assert_eq!(status, PushTransportStartupStatus::Skipped);
+    }
+
+    #[test]
+    fn tickle_transport_wiring_reports_already_installed() {
+        let status = install_owner_event_tickle_transport_with(
+            || Some(Arc::new(FakeTickleTransport) as Arc<dyn ApnsTransport>),
             Err,
         );
 

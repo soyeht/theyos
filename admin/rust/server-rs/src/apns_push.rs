@@ -19,6 +19,7 @@ pub const APNS_PUSH_KEY_PATH_ENV: &str = "THEYOS_APNS_KEY_PATH";
 pub const APNS_PUSH_KEY_ID_ENV: &str = "THEYOS_APNS_KEY_ID";
 pub const APNS_PUSH_TEAM_ID_ENV: &str = "THEYOS_APNS_TEAM_ID";
 pub const APNS_PUSH_TOPIC_ENV: &str = "THEYOS_APNS_TOPIC";
+pub const APNS_PUSH_ENVIRONMENT_ENV: &str = "THEYOS_APNS_ENVIRONMENT";
 
 /// Shared kill-switch with the Phase 3 dispatcher. When set to `1`,
 /// [`dispatch_fire_and_forget`] logs at info level and returns early without
@@ -194,7 +195,7 @@ impl A2Transport {
             })
             .ok()?;
 
-        let config = a2::ClientConfig::new(a2::Endpoint::Production);
+        let config = a2::ClientConfig::new(apns_endpoint_from_env());
         let client = a2::Client::token(&mut key_file, key_id, team_id, config)
             .map_err(|e| tracing::error!(stage = "apns.push.client_init_failed", error = %e))
             .ok()?;
@@ -203,6 +204,18 @@ impl A2Transport {
         // satisfy the `NotificationOptions<'static>` lifetime requirement.
         let topic: &'static str = Box::leak(topic_str.into_boxed_str());
         Some(Self { client, topic })
+    }
+}
+
+#[must_use]
+pub fn apns_endpoint_from_env() -> a2::Endpoint {
+    match std::env::var(APNS_PUSH_ENVIRONMENT_ENV)
+        .unwrap_or_else(|_| "production".to_string())
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "development" | "sandbox" => a2::Endpoint::Sandbox,
+        _ => a2::Endpoint::Production,
     }
 }
 
