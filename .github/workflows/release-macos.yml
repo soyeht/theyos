@@ -57,6 +57,7 @@ jobs:
       - name: Setup pinned Rust
         uses: dtolnay/rust-toolchain@5a814b2e0f75e492da42a3c1227d52112e4dac50
         with:
+          components: clippy
           targets: aarch64-apple-darwin
 
       - name: Verify tag matches Cargo version

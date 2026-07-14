@@ -8,8 +8,8 @@
 100644	blob	d0b9229e4fe5744cb2c072ce690b29039bafc450	land-exact	.github/workflows/contracts-cross-repo-sync.yml
 100644	blob	d04520e86b5d65d66ec3ea77c76a52f72d1a0ac0	land-exact	.github/workflows/owner-present-phase0-compileout.yml
 100644	blob	8ae5db96e0e72d21e829c8a582b2b74520c2ee2c	land-exact	.github/workflows/owner-present-phase0-nix-runtime.yml
-100644	blob	7ea2a88071b96de15365482795781001e4869c91	land-exact	.github/workflows/release-linux.yml
-100644	blob	7b8f7f13d60b1ba38df7dac24ec436105cfbe2fa	land-exact	.github/workflows/release-macos.yml
+100644	blob	f93fa2df44909f30ff5b6289badcdc4f30fe8348	land-exact	.github/workflows/release-linux.yml
+100644	blob	ccc7f6539bcb048bbc2fa1aadb587a65393525b7	land-exact	.github/workflows/release-macos.yml
 100644	blob	1d5286bb205d86c48b5898313cfb2060b68333e0	land-exact	admin/contracts/mobile-claw-vpn/v1/owner_present_wire_authority_status_v1.json
 100644	blob	42fa6a42c33535a3fded0a0e4210a80e3791b660	land-exact	admin/rust/.cargo/config.toml
 100644	blob	4cff2a1b3f165bbaa928e3d58d6c3d505be4c147	land-exact	admin/rust/Cross.toml

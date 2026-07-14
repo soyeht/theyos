@@ -390,4 +390,92 @@ printf '%s\n' 'exit 0' > \
   "${REPO}/.github/scripts/check-mobile-claw-vpn-owner-present-phase0-integrity.sh"
 expect_failure checker_tamper "base-owned integrity root differs from trusted base"
 
+# Exercise the real bootstrap-to-payload handoff failure mode: a bootstrap
+# policy must not pin a future frozen blob while the bootstrap tree still
+# contains an older blob. The payload may repair the tree, but the handoff
+# checker must reject the pair until the bootstrap carries the pinned blob.
+HANDOFF_REPO="${TMP_ROOT}/bootstrap-payload-handoff"
+mkdir -p "${HANDOFF_REPO}/.github/scripts" \
+  "${HANDOFF_REPO}/.github/workflows" "${HANDOFF_REPO}/protected"
+git -C "${HANDOFF_REPO}" init --quiet
+git -C "${HANDOFF_REPO}" config user.name "phase0-integrity-handoff-test"
+git -C "${HANDOFF_REPO}" config user.email "phase0-integrity-handoff@example.invalid"
+cp "${CHECKER_SOURCE}" \
+  "${HANDOFF_REPO}/.github/scripts/check-mobile-claw-vpn-owner-present-phase0-integrity.sh"
+cp "${BASH_SOURCE[0]}" \
+  "${HANDOFF_REPO}/.github/scripts/test-mobile-claw-vpn-owner-present-phase0-integrity.sh"
+cp "${WORKFLOW_SOURCE}" \
+  "${HANDOFF_REPO}/.github/workflows/owner-present-phase0-integrity.yml"
+cat > "${HANDOFF_REPO}/${TRANSITION_AUTH_REL}" <<'JSON'
+{
+  "contract": "soyeht-owner-present-proof-machinery-transition-v1",
+  "version": 1,
+  "state": "unarmed",
+  "generation": 0,
+  "owner_authorization": {
+    "mode": "github-repository-admin-review-exact-arm-commit",
+    "requires_owner_review": true,
+    "requires_required_integrity_check": true,
+    "owner_review": {
+      "provider": "github",
+      "required_repository_permission": "admin",
+      "binds_to": "exact-arm-head-sha",
+      "latest_review_only": true
+    },
+    "merge_point": {
+      "provider": "github",
+      "mode": "required-merge-group-revalidation",
+      "requires_current_permission": true,
+      "direct_merge": "rejected-by-required-merge-queue-ruleset"
+    },
+    "canary": "arm-then-consume-merge-blocked-and-allowed",
+    "anti_replay": "base-sha-expected-head-tree-generation-one-shot-consumption"
+  }
+}
+JSON
+HANDOFF_AUTH_OID="$(git -C "${HANDOFF_REPO}" hash-object -w \
+  "${HANDOFF_REPO}/${TRANSITION_AUTH_REL}")"
+printf '%s\n' 'bootstrap-frozen-v1' > "${HANDOFF_REPO}/protected/frozen.txt"
+printf '%s\n' 'payload-frozen-v2' > "${TMP_ROOT}/handoff-future-frozen.txt"
+HANDOFF_FUTURE_FROZEN_OID="$(git -C "${HANDOFF_REPO}" hash-object -w \
+  "${TMP_ROOT}/handoff-future-frozen.txt")"
+printf '%s\n' 'land-exact-v1' > "${TMP_ROOT}/handoff-land.txt"
+HANDOFF_LAND_OID="$(git -C "${HANDOFF_REPO}" hash-object -w \
+  "${TMP_ROOT}/handoff-land.txt")"
+for index in $(seq 1 9); do
+  cp "${TMP_ROOT}/handoff-land.txt" \
+    "${HANDOFF_REPO}/protected/future-${index}.txt"
+done
+{
+  printf '# mode\ttype\toid\ttransition\tpath\n'
+  printf '100644\tblob\t%s\tversioned-transition\t%s\n' \
+    "${HANDOFF_AUTH_OID}" "${TRANSITION_AUTH_REL}"
+  printf '100644\tblob\t%s\tfrozen\tprotected/frozen.txt\n' \
+    "${HANDOFF_FUTURE_FROZEN_OID}"
+  for index in $(seq 1 9); do
+    printf '100644\tblob\t%s\tland-exact\tprotected/future-%s.txt\n' \
+      "${HANDOFF_LAND_OID}" "${index}"
+  done
+} > "${HANDOFF_REPO}/${POLICY_REL}"
+git -C "${HANDOFF_REPO}" add .
+git -C "${HANDOFF_REPO}" commit --quiet -m bootstrap
+HANDOFF_BASE="$(git -C "${HANDOFF_REPO}" rev-parse HEAD)"
+cp "${TMP_ROOT}/handoff-future-frozen.txt" \
+  "${HANDOFF_REPO}/protected/frozen.txt"
+git -C "${HANDOFF_REPO}" add protected/frozen.txt
+git -C "${HANDOFF_REPO}" commit --quiet -m payload
+HANDOFF_HEAD="$(git -C "${HANDOFF_REPO}" rev-parse HEAD)"
+git -C "${HANDOFF_REPO}" switch --quiet --detach "${HANDOFF_BASE}"
+if PHASE0_INTEGRITY_LOCAL_TEST=1 \
+    "${HANDOFF_REPO}/.github/scripts/check-mobile-claw-vpn-owner-present-phase0-integrity.sh" \
+    "${HANDOFF_REPO}" "${HANDOFF_BASE}" "${HANDOFF_HEAD}" 0 \
+    >"${TMP_ROOT}/bootstrap-payload-handoff.log" 2>&1; then
+  echo "error: bootstrap-to-payload handoff accepted a stale frozen object" >&2
+  exit 1
+fi
+grep -Fq "frozen Phase 0 object differs from trusted base policy" \
+  "${TMP_ROOT}/bootstrap-payload-handoff.log" \
+  || { cat "${TMP_ROOT}/bootstrap-payload-handoff.log" >&2; exit 1; }
+echo "PASS bootstrap_payload_handoff_refused"
+
 echo "Phase 0 base-owned policy mutation matrix passed."
