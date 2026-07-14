@@ -50,6 +50,14 @@ pub enum BootstrapErrorCode {
     InvitationNotRecognized,
     /// The setup invitation has expired.
     InvitationExpired,
+    /// A pair-device reissue is unavailable in the current bootstrap state.
+    ReissueUnavailable,
+    /// The household identity required for pair-device reissue is unavailable.
+    IdentityUnavailable,
+    /// The owner is already paired to the household.
+    AlreadyPaired,
+    /// A pair-device window is already open and must not be replaced.
+    WindowStillOpen,
     /// Teardown was requested but there is no household to tear down.
     NoHouseholdToTeardown,
     /// Internal server error.
@@ -93,6 +101,10 @@ impl BootstrapErrorCode {
             Self::HouseholdNotInitialized => "household_not_initialized",
             Self::InvitationNotRecognized => "invitation_not_recognized",
             Self::InvitationExpired => "invitation_expired",
+            Self::ReissueUnavailable => "reissue_unavailable",
+            Self::IdentityUnavailable => "identity_unavailable",
+            Self::AlreadyPaired => "already_paired",
+            Self::WindowStillOpen => "window_still_open",
             Self::NoHouseholdToTeardown => "no_household_to_teardown",
             Self::InternalError => "internal_error",
             Self::KeygenFailed => "keygen_failed",
@@ -121,6 +133,10 @@ impl BootstrapErrorCode {
             "household_not_initialized" => Self::HouseholdNotInitialized,
             "invitation_not_recognized" => Self::InvitationNotRecognized,
             "invitation_expired" => Self::InvitationExpired,
+            "reissue_unavailable" => Self::ReissueUnavailable,
+            "identity_unavailable" => Self::IdentityUnavailable,
+            "already_paired" => Self::AlreadyPaired,
+            "window_still_open" => Self::WindowStillOpen,
             "no_household_to_teardown" => Self::NoHouseholdToTeardown,
             "internal_error" => Self::InternalError,
             "keygen_failed" => Self::KeygenFailed,
@@ -134,7 +150,7 @@ impl BootstrapErrorCode {
     }
 
     /// Every concrete (non-`Unknown`) code, for exhaustiveness tests + fixtures.
-    pub const ALL: [Self; 20] = [
+    pub const ALL: [Self; 24] = [
         Self::InvalidCbor,
         Self::InvalidRequest,
         Self::InvalidName,
@@ -147,6 +163,10 @@ impl BootstrapErrorCode {
         Self::HouseholdNotInitialized,
         Self::InvitationNotRecognized,
         Self::InvitationExpired,
+        Self::ReissueUnavailable,
+        Self::IdentityUnavailable,
+        Self::AlreadyPaired,
+        Self::WindowStillOpen,
         Self::NoHouseholdToTeardown,
         Self::InternalError,
         Self::KeygenFailed,
@@ -219,6 +239,10 @@ mod tests {
                 | BootstrapErrorCode::HouseholdNotInitialized
                 | BootstrapErrorCode::InvitationNotRecognized
                 | BootstrapErrorCode::InvitationExpired
+                | BootstrapErrorCode::ReissueUnavailable
+                | BootstrapErrorCode::IdentityUnavailable
+                | BootstrapErrorCode::AlreadyPaired
+                | BootstrapErrorCode::WindowStillOpen
                 | BootstrapErrorCode::NoHouseholdToTeardown
                 | BootstrapErrorCode::InternalError
                 | BootstrapErrorCode::KeygenFailed
@@ -230,6 +254,6 @@ mod tests {
                 BootstrapErrorCode::Unknown => panic!("ALL must not contain Unknown"),
             }
         }
-        assert_eq!(BootstrapErrorCode::ALL.len(), 20);
+        assert_eq!(BootstrapErrorCode::ALL.len(), 24);
     }
 }

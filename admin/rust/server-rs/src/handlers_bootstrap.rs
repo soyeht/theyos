@@ -958,7 +958,7 @@ pub async fn post_pair_device_reissue(
         );
         return cbor_error(
             StatusCode::NOT_FOUND,
-            "reissue_unavailable",
+            BootstrapErrorCode::ReissueUnavailable.as_str(),
             None,
             Some(current_bs.as_str()),
         );
@@ -972,7 +972,7 @@ pub async fn post_pair_device_reissue(
         );
         return cbor_error(
             StatusCode::NOT_FOUND,
-            "identity_unavailable",
+            BootstrapErrorCode::IdentityUnavailable.as_str(),
             None,
             Some(current_bs.as_str()),
         );
@@ -988,7 +988,12 @@ pub async fn post_pair_device_reissue(
             stage = "pair_device.reissue.rejected",
             reason = "owner_already_paired",
         );
-        return cbor_error(StatusCode::NOT_FOUND, "already_paired", None, None);
+        return cbor_error(
+            StatusCode::NOT_FOUND,
+            BootstrapErrorCode::AlreadyPaired.as_str(),
+            None,
+            None,
+        );
     }
     {
         let now = crate::time_util::unix_now_secs_checked("pair_device.reissue.clock").unwrap_or(0);
@@ -1004,7 +1009,12 @@ pub async fn post_pair_device_reissue(
                     stage = "pair_device.reissue.rejected",
                     reason = "owner_already_paired_on_disk",
                 );
-                return cbor_error(StatusCode::NOT_FOUND, "already_paired", None, None);
+                return cbor_error(
+                    StatusCode::NOT_FOUND,
+                    BootstrapErrorCode::AlreadyPaired.as_str(),
+                    None,
+                    None,
+                );
             }
             Ok(Ok(None)) => {}
             Ok(Err(e)) => {
@@ -1014,14 +1024,24 @@ pub async fn post_pair_device_reissue(
                 );
                 // Fail closed — an unreadable auth state is indistinguishable
                 // from a paired owner for the purposes of this recovery route.
-                return cbor_error(StatusCode::NOT_FOUND, "already_paired", None, None);
+                return cbor_error(
+                    StatusCode::NOT_FOUND,
+                    BootstrapErrorCode::AlreadyPaired.as_str(),
+                    None,
+                    None,
+                );
             }
             Err(e) => {
                 tracing::error!(
                     stage = "pair_device.reissue.owner_auth_task_failed",
                     error = %e,
                 );
-                return cbor_error(StatusCode::NOT_FOUND, "already_paired", None, None);
+                return cbor_error(
+                    StatusCode::NOT_FOUND,
+                    BootstrapErrorCode::AlreadyPaired.as_str(),
+                    None,
+                    None,
+                );
             }
         }
     }
@@ -1031,10 +1051,13 @@ pub async fn post_pair_device_reissue(
     // must wait for the current window to expire (or it must already be
     // expired/missing → `current_token` returns `None`).
     if state.pair_device_window.current_token().await.is_some() {
-        tracing::warn!(stage = "pair_device.reissue.rejected", reason = "window_still_open");
+        tracing::warn!(
+            stage = "pair_device.reissue.rejected",
+            reason = "window_still_open"
+        );
         return cbor_error(
             StatusCode::CONFLICT,
-            "window_still_open",
+            BootstrapErrorCode::WindowStillOpen.as_str(),
             None,
             Some(current_bs.as_str()),
         );
@@ -1064,7 +1087,7 @@ pub async fn post_pair_device_reissue(
             tracing::warn!(stage = "pair_device.reissue.mint_failed", error = %e);
             return cbor_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                "internal_error",
+                BootstrapErrorCode::InternalError.as_str(),
                 None,
                 None,
             );
