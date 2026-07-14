@@ -229,7 +229,7 @@ printf '%s\n' '#!/bin/sh' \
   'exec /usr/bin/git "$@"' > "${FAKE_TOOL_BIN}/git"
 chmod 755 "${FAKE_TOOL_BIN}/git"
 if PATH="${FAKE_TOOL_BIN}:${PATH}" \
-    PHASE0_TARGET="${HOST_TARGET}" \
+    PHASE0_TARGET="${MUTATION_TARGET}" \
     PHASE0_BUILD_TOOL=unsupported \
     PHASE0_CARGO_TARGET_DIR="${SHARED_TARGET}" \
     run_checker "${REPO_ROOT}/${CHECKER_REL}" >"${TMP_ROOT}/path-tools.log" 2>&1; then
@@ -246,7 +246,7 @@ echo "PASS path_tool_injection_ignored"
 
 prepare_empty_authority_inputs
 if PATH="${FAKE_TOOL_BIN}:${PATH}" \
-    PHASE0_TARGET="${HOST_TARGET}" \
+    PHASE0_TARGET="${MUTATION_TARGET}" \
     PHASE0_BUILD_TOOL=unsupported \
     PHASE0_CARGO_TARGET_DIR="${SHARED_TARGET}" \
     GIT_WRAPPER_LOG="${GIT_WRAPPER_LOG}" \
