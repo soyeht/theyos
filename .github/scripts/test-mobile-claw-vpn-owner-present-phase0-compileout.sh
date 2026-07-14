@@ -266,14 +266,15 @@ if ! grep -Fq "unsupported Phase 0 build tool: unsupported" "${TMP_ROOT}/path-gi
 fi
 echo "PASS path_git_injection_ignored"
 
-if [[ -x /usr/bin/docker ]]; then
+if [[ -x /usr/bin/docker && "${HOST_TARGET}" != *-apple-darwin ]]; then
   prepare_empty_authority_inputs
   if PATH="${FAKE_TOOL_BIN}:${PATH}" \
-      PHASE0_TARGET="${HOST_TARGET}" \
-      PHASE0_BUILD_TOOL=unsupported \
+      PHASE0_TARGET=x86_64-unknown-linux-musl \
+      PHASE0_BUILD_TOOL=cross \
+      PHASE0_DOCKER_HOST=tcp://127.0.0.1:1 \
       PHASE0_CARGO_TARGET_DIR="${SHARED_TARGET}" \
       run_checker "${REPO_ROOT}/${CHECKER_REL}" >"${TMP_ROOT}/path-docker.log" 2>&1; then
-    echo "error: canonical build accepted an unsupported build tool" >&2
+    echo "error: canonical build accepted an external Docker authority" >&2
     exit 1
   fi
   if grep -Eq 'fake-(rustc|rustup|docker)' "${TMP_ROOT}/path-docker.log"; then
@@ -281,7 +282,7 @@ if [[ -x /usr/bin/docker ]]; then
     cat "${TMP_ROOT}/path-docker.log" >&2
     exit 1
   fi
-  grep -Fq "unsupported Phase 0 build tool: unsupported" "${TMP_ROOT}/path-docker.log"
+  grep -Fq "DOCKER_HOST is forbidden" "${TMP_ROOT}/path-docker.log"
   echo "PASS path_docker_injection_ignored"
 else
   echo "PASS path_docker_injection_ignored (fixed Docker path unavailable on this host)"
