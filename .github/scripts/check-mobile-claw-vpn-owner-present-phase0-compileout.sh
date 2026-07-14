@@ -66,6 +66,7 @@ BUILD_TOOL_SOURCE_REL="admin/rust/theyos-engine-build-rs/src/main.rs"
 BOUNDARY_REL="admin/contracts/mobile-claw-vpn/v1/owner_present_phase0_artifact_boundary_v1.tsv"
 FORBIDDEN_MARKERS_REL="admin/rust/phase0-forbidden-markers.txt"
 TOOLCHAIN_POLICY_REL=".github/owner-present-phase0-toolchain-v1.json"
+TOOLCHAIN_CLOSURE_POLICY_ID="rustup-package-payload-v1-excluding-bookkeeping-v1"
 
 HEAD_SHA="$(git -C "${THEYOS_DIR}" rev-parse HEAD)"
 HEAD_TREE="$(git -C "${THEYOS_DIR}" rev-parse "${HEAD_SHA}^{tree}")"
@@ -216,12 +217,40 @@ sha256_stream() {
 # Hash the complete build-relevant toolchain closure before invoking any
 # rustup/rustc/cargo binary. Documentation is intentionally excluded; the
 # compiler closure is the executable, sysroot, linker, and target-spec roots.
+# rustup also writes a small, target-dependent bookkeeping set under
+# lib/rustlib. Those files describe installation state, not compiler inputs;
+# their contents changed between otherwise identical runners. Exclude only
+# the exact bookkeeping names for the selected host/target components and
+# keep every other path in the closure.
+is_rustup_bookkeeping_path() {
+  local relative="$1"
+  case "${relative}" in
+    lib/rustlib/components|\
+    lib/rustlib/multirust-channel-manifest.toml|\
+    lib/rustlib/multirust-config.toml|\
+    lib/rustlib/rust-installer-version|\
+    "lib/rustlib/manifest-cargo-${HOST_TOOLCHAIN_TRIPLE}"|\
+    "lib/rustlib/manifest-clippy-preview-${HOST_TOOLCHAIN_TRIPLE}"|\
+    "lib/rustlib/manifest-rustc-${HOST_TOOLCHAIN_TRIPLE}"|\
+    "lib/rustlib/manifest-rust-std-${HOST_TOOLCHAIN_TRIPLE}"|\
+    "lib/rustlib/manifest-rust-std-${PHASE0_TARGET:-${HOST_TOOLCHAIN_TRIPLE}}")
+      return 0
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
 toolchain_component_manifest() {
   local root="$1" component="$2" path relative
   /usr/bin/find "${root}/${component}" \( -type f -o -type l \) -print \
     | LC_ALL=C /usr/bin/sort \
     | while IFS= read -r path; do
         relative="${path#"${root}/"}"
+        if is_rustup_bookkeeping_path "${relative}"; then
+          continue
+        fi
         if [[ -L "${path}" ]]; then
           printf 'l\t%s\t%s\n' "${relative}" "$(/usr/bin/readlink "${path}")"
         elif [[ -f "${path}" ]]; then
@@ -251,8 +280,10 @@ toolchain_closure_component_summary() {
   local root="$1" component count digest
   local -a components=(bin etc lib libexec)
   for component in "${components[@]}"; do
-    count="$(/usr/bin/find "${root}/${component}" \( -type f -o -type l \) -print | /usr/bin/wc -l | /usr/bin/tr -d ' ')"
-    digest="$(toolchain_component_manifest "${root}" "${component}" | sha256_stream)"
+    local manifest
+    manifest="$(toolchain_component_manifest "${root}" "${component}")"
+    count="$(printf '%s\n' "${manifest}" | /usr/bin/grep -c . || true)"
+    digest="$(printf '%s\n' "${manifest}" | sha256_stream)"
     printf '%s[count=%s,sha256=%s] ' "${component}" "${count}" "${digest}"
   done
 }
@@ -525,6 +556,7 @@ if ! jq -e \
   --arg build_tool "${BUILD_TOOL}" \
   --arg toolchain_root "${TOOLCHAIN_ROOT_REL}" \
   --arg toolchain_closure_sha256 "${TOOLCHAIN_CLOSURE_SHA256}" \
+  --arg toolchain_closure_policy "${TOOLCHAIN_CLOSURE_POLICY_ID}" \
   --arg rustc_sha256 "${RUSTC_TOOLCHAIN_SHA256}" \
   --arg cargo_sha256 "${CARGO_TOOLCHAIN_SHA256}" \
   '.schema == "theyos-owner-present-phase0-toolchain-v1"
@@ -535,6 +567,7 @@ if ! jq -e \
    and .targets[$target].host_toolchain == $host_toolchain
    and .targets[$target].build_tool == $build_tool
    and .targets[$target].toolchain_root == $toolchain_root
+   and .toolchain_closure_policy == $toolchain_closure_policy
    and .targets[$target].toolchain_closure_components == ["bin", "etc", "lib", "libexec"]
    and .targets[$target].toolchain_closure_sha256 == $toolchain_closure_sha256
    and .targets[$target].rustc_sha256 == $rustc_sha256
@@ -651,6 +684,8 @@ if [[ "${BUILD_TOOL}" == "cross" ]]; then
       --env PATH=/phase0-toolchain/bin:/usr/local/bin:/usr/bin:/bin \
       --env RUSTUP_TOOLCHAIN="${EXPECTED_RUST}" \
       --env "PHASE0_EXPECTED_RUST=${EXPECTED_RUST}" \
+      --env "PHASE0_EXPECTED_HOST_TOOLCHAIN=${HOST_TARGET}" \
+      --env "PHASE0_EXPECTED_TARGET=${TARGET}" \
       --env THEYOS_PHASE0_CLEAN_ENV=1 \
       --env PHASE0_BUILD_SOURCE_ROOT=/project \
       --env CLAWS_MANIFEST_YML=/claws/manifest.yml \
@@ -690,6 +725,19 @@ if [[ "${BUILD_TOOL}" == "cross" ]]; then
         done
       } | LC_ALL=C sort | while IFS= read -r path; do
         relative="${path#"${root}/"}"
+        case "${relative}" in
+          lib/rustlib/components|\
+          lib/rustlib/multirust-channel-manifest.toml|\
+          lib/rustlib/multirust-config.toml|\
+          lib/rustlib/rust-installer-version|\
+          "lib/rustlib/manifest-cargo-${PHASE0_EXPECTED_HOST_TOOLCHAIN}"|\
+          "lib/rustlib/manifest-clippy-preview-${PHASE0_EXPECTED_HOST_TOOLCHAIN}"|\
+          "lib/rustlib/manifest-rustc-${PHASE0_EXPECTED_HOST_TOOLCHAIN}"|\
+          "lib/rustlib/manifest-rust-std-${PHASE0_EXPECTED_HOST_TOOLCHAIN}"|\
+          "lib/rustlib/manifest-rust-std-${PHASE0_EXPECTED_TARGET}")
+            continue
+            ;;
+        esac
         if test -L "${path}"; then
           printf "l\\t%s\\t%s\\n" "${relative}" "$(readlink "${path}")"
         else
@@ -1921,6 +1969,7 @@ jq -n -S \
   --arg cargo_toolchain_sha256 "${CARGO_TOOLCHAIN_SHA256}" \
   --arg toolchain_root "${TOOLCHAIN_ROOT_REL}" \
   --arg toolchain_closure_sha256 "${TOOLCHAIN_CLOSURE_SHA256}" \
+  --arg toolchain_closure_policy "${TOOLCHAIN_CLOSURE_POLICY_ID}" \
   --arg toolchain_policy_sha256 "${TOOLCHAIN_POLICY_SHA256}" \
   --arg toolchain_policy_target "${TARGET}" \
   --arg python "$(run_clean "${PYTHON_BIN}" --version 2>&1)" \
@@ -1966,6 +2015,7 @@ jq -n -S \
     cargo_toolchain_sha256: $cargo_toolchain_sha256,
     toolchain_root: $toolchain_root,
     toolchain_closure_sha256: $toolchain_closure_sha256,
+    toolchain_closure_policy: $toolchain_closure_policy,
     toolchain_policy_sha256: $toolchain_policy_sha256,
     toolchain_policy_target: $toolchain_policy_target,
     python: $python,

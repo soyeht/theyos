@@ -1,6 +1,7 @@
 {
   "schema": "theyos-owner-present-phase0-toolchain-v1",
   "version": 1,
+  "toolchain_closure_policy": "rustup-package-payload-v1-excluding-bookkeeping-v1",
   "rust_release": "1.92.0",
   "targets": {
     "aarch64-apple-darwin": {
@@ -17,7 +18,7 @@
       "host_toolchain": "x86_64-unknown-linux-gnu",
       "toolchain_root": "1.92.0-x86_64-unknown-linux-gnu",
       "toolchain_closure_components": ["bin", "etc", "lib", "libexec"],
-      "toolchain_closure_sha256": "03f5ef2aa1e9fe4b264d3e46c79b759617b770eefe08193ee5716b54bd2d139b",
+      "toolchain_closure_sha256": "3713323a88297147997269f3bd0821baffb00d60e72970f4060d457fa64f95b8",
       "rustc_sha256": "028fd60b0e0add5505c661cd3ccde91393d615c8729bd95d94ab1e91409b36a1",
       "cargo_sha256": "310fa46c7903259368c0df3dbb3f4f52759563f3c9ce53b500404b7741fb6860"
     },
@@ -26,7 +27,7 @@
       "host_toolchain": "x86_64-unknown-linux-gnu",
       "toolchain_root": "1.92.0-x86_64-unknown-linux-gnu",
       "toolchain_closure_components": ["bin", "etc", "lib", "libexec"],
-      "toolchain_closure_sha256": "8b53b47895e794388b60f1fce29fb8f61026324584ed93f92b6bdb62fe90def1",
+      "toolchain_closure_sha256": "5e6cc0aea7240ea2e10ddd3163f2c7c0d37d84db6c04552cc3ee430793204b7c",
       "rustc_sha256": "028fd60b0e0add5505c661cd3ccde91393d615c8729bd95d94ab1e91409b36a1",
       "cargo_sha256": "310fa46c7903259368c0df3dbb3f4f52759563f3c9ce53b500404b7741fb6860"
     }

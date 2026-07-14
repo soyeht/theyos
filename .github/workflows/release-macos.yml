@@ -77,7 +77,8 @@ jobs:
           set -euo pipefail
           rm -rf "$PHASE0_CARGO_TARGET_DIR"
           mkdir -p "$PHASE0_CARGO_TARGET_DIR"
-          bash .github/scripts/check-mobile-claw-vpn-owner-present-phase0-compileout.sh
+          env -u CARGO_HOME -u RUSTUP_HOME -u PHASE0_RUSTUP_HOME \
+            bash .github/scripts/check-mobile-claw-vpn-owner-present-phase0-compileout.sh
 
       - name: Package exact unsigned subjects
         shell: bash
