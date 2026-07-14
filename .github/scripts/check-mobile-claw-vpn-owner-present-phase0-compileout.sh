@@ -1476,10 +1476,12 @@ fi
 KNOWN_WORKFLOWS="${TMP_ROOT}/known-workflows.txt"
 ACTUAL_WORKFLOWS="${TMP_ROOT}/actual-workflows.txt"
 printf '%s\n' \
+  backend-ci-docs-shim.yml \
   backend-ci.yml \
   claw-store-contract-ci.yml \
   contracts-cross-repo-sync.yml \
   frontend-ci.yml \
+  homebrew-smoke-docs-shim.yml \
   homebrew-smoke-macos.yml \
   owner-present-phase0-compileout.yml \
   owner-present-phase0-integrity.yml \
