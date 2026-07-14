@@ -229,11 +229,11 @@ printf '%s\n' '#!/bin/sh' \
   'exec /usr/bin/git "$@"' > "${FAKE_TOOL_BIN}/git"
 chmod 755 "${FAKE_TOOL_BIN}/git"
 if PATH="${FAKE_TOOL_BIN}:${PATH}" \
-    PHASE0_TARGET=unsupported-phase0-target \
-    PHASE0_BUILD_TOOL=cross \
+    PHASE0_TARGET="${HOST_TARGET}" \
+    PHASE0_BUILD_TOOL=unsupported \
     PHASE0_CARGO_TARGET_DIR="${SHARED_TARGET}" \
     run_checker "${REPO_ROOT}/${CHECKER_REL}" >"${TMP_ROOT}/path-tools.log" 2>&1; then
-  echo "error: canonical build accepted an unsupported target" >&2
+  echo "error: canonical build accepted an unsupported build tool" >&2
   exit 1
 fi
 if grep -Eq 'fake-(rustc|rustup|docker)' "${TMP_ROOT}/path-tools.log"; then
@@ -241,17 +241,17 @@ if grep -Eq 'fake-(rustc|rustup|docker)' "${TMP_ROOT}/path-tools.log"; then
   cat "${TMP_ROOT}/path-tools.log" >&2
   exit 1
 fi
-grep -Fq "unsupported Phase 0 target/build-tool pair" "${TMP_ROOT}/path-tools.log"
+grep -Fq "unsupported Phase 0 build tool: unsupported" "${TMP_ROOT}/path-tools.log"
 echo "PASS path_tool_injection_ignored"
 
 prepare_empty_authority_inputs
 if PATH="${FAKE_TOOL_BIN}:${PATH}" \
-    PHASE0_TARGET=unsupported-phase0-target \
-    PHASE0_BUILD_TOOL=cross \
+    PHASE0_TARGET="${HOST_TARGET}" \
+    PHASE0_BUILD_TOOL=unsupported \
     PHASE0_CARGO_TARGET_DIR="${SHARED_TARGET}" \
     GIT_WRAPPER_LOG="${GIT_WRAPPER_LOG}" \
     run_checker "${REPO_ROOT}/${CHECKER_REL}" >"${TMP_ROOT}/path-git.log" 2>&1; then
-  echo "error: canonical build accepted an unsupported target with a PATH Git wrapper" >&2
+  echo "error: canonical build accepted an unsupported build tool with a PATH Git wrapper" >&2
   exit 1
 fi
 if [[ -s "${GIT_WRAPPER_LOG}" ]]; then
@@ -259,7 +259,7 @@ if [[ -s "${GIT_WRAPPER_LOG}" ]]; then
   cat "${GIT_WRAPPER_LOG}" >&2
   exit 1
 fi
-if ! grep -Fq "unsupported Phase 0 target/build-tool pair" "${TMP_ROOT}/path-git.log"; then
+if ! grep -Fq "unsupported Phase 0 build tool: unsupported" "${TMP_ROOT}/path-git.log"; then
   echo "error: PATH Git injection test reported an unexpected reason" >&2
   cat "${TMP_ROOT}/path-git.log" >&2
   exit 1
@@ -269,11 +269,11 @@ echo "PASS path_git_injection_ignored"
 if [[ -x /usr/bin/docker ]]; then
   prepare_empty_authority_inputs
   if PATH="${FAKE_TOOL_BIN}:${PATH}" \
-      PHASE0_TARGET=unsupported-phase0-target \
-      PHASE0_BUILD_TOOL=cross \
+      PHASE0_TARGET="${HOST_TARGET}" \
+      PHASE0_BUILD_TOOL=unsupported \
       PHASE0_CARGO_TARGET_DIR="${SHARED_TARGET}" \
       run_checker "${REPO_ROOT}/${CHECKER_REL}" >"${TMP_ROOT}/path-docker.log" 2>&1; then
-    echo "error: canonical cross build accepted an unsupported target" >&2
+    echo "error: canonical build accepted an unsupported build tool" >&2
     exit 1
   fi
   if grep -Eq 'fake-(rustc|rustup|docker)' "${TMP_ROOT}/path-docker.log"; then
@@ -281,7 +281,7 @@ if [[ -x /usr/bin/docker ]]; then
     cat "${TMP_ROOT}/path-docker.log" >&2
     exit 1
   fi
-  grep -Fq "unsupported Phase 0 target/build-tool pair" "${TMP_ROOT}/path-docker.log"
+  grep -Fq "unsupported Phase 0 build tool: unsupported" "${TMP_ROOT}/path-docker.log"
   echo "PASS path_docker_injection_ignored"
 else
   echo "PASS path_docker_injection_ignored (fixed Docker path unavailable on this host)"
