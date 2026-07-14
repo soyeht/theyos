@@ -68,6 +68,22 @@ if [[ -z "${formula_auth_setup_line}" || -z "${formula_push_line}" \
   echo "error: formula push lacks GitHub CLI credential setup" >&2
   exit 1
 fi
+formula_auth_home="${TMP_ROOT}/formula-auth-home"
+mkdir -p "${formula_auth_home}/gh"
+if ! env -u GH_TOKEN \
+    HOME="${formula_auth_home}" \
+    GH_CONFIG_DIR="${formula_auth_home}/gh" \
+    GH_TOKEN=phase0-dry-run-token \
+    gh auth setup-git >/dev/null 2>&1; then
+  echo "error: gh auth setup-git dry-run failed" >&2
+  exit 1
+fi
+if ! env HOME="${formula_auth_home}" \
+    git config --global --get-all 'credential.https://github.com.helper' \
+    | grep -Fq 'gh auth git-credential'; then
+  echo "error: gh auth setup-git did not install the GitHub credential helper" >&2
+  exit 1
+fi
 echo "PASS release_workflow_context_and_push_auth_contract"
 if [[ "${HOST_TARGET}" == *-apple-darwin ]]; then
   PHASE0_EXPECTED_XCODE_VERSION="${PHASE0_EXPECTED_XCODE_VERSION:-$(xcodebuild -version | sed -n 's/^Xcode //p')}"
