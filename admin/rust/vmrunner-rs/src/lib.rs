@@ -65,7 +65,7 @@ use crate::create_guard::{ClaimGuard, CreateGuard, PoolFillGuard};
 use crate::error::VmError;
 use crate::firecracker_api::FirecrackerClient;
 use crate::installer::{InstallerConfig, get_installer};
-use crate::instance_env::InstanceEnv;
+use crate::instance_env::{InstanceEnv, persist_hostfwd_uncertain_marker};
 use crate::network::{
     claw_data_base_dir, home_dir, is_pid_running, kill_pgrp, kill_pgrp_force, kill_pid,
     kill_pid_force, reap_pid, resolve_slirp4netns, slirp_add_hostfwd, slirp_list_hostfwd,
@@ -370,6 +370,82 @@ pub struct VmRunner {
     pub env: VmEnv,
 }
 
+/// Owns child processes while `start_vm` is still establishing a running
+/// instance. The outer create/pool guards cannot learn these PIDs until the
+/// async function returns, so ownership must begin inside `start_vm` itself.
+struct StartedVmGuard<'a> {
+    runner: &'a VmRunner,
+    inst: InstanceEnv,
+    committed: bool,
+}
+
+impl<'a> StartedVmGuard<'a> {
+    fn new(runner: &'a VmRunner, inst: &InstanceEnv) -> Self {
+        Self {
+            runner,
+            inst: inst.clone(),
+            committed: false,
+        }
+    }
+
+    fn already_running(runner: &'a VmRunner, inst: &InstanceEnv) -> Self {
+        Self {
+            runner,
+            inst: inst.clone(),
+            committed: true,
+        }
+    }
+
+    fn set_fc_pid(&mut self, pid: u32) {
+        self.inst.firecracker_pid = Some(pid);
+    }
+
+    fn set_slirp_pid(&mut self, pid: u32) {
+        self.inst.slirp_pid = Some(pid);
+    }
+
+    fn firecracker_pid(&self) -> Option<u32> {
+        self.inst.firecracker_pid
+    }
+
+    fn slirp_pid(&self) -> Option<u32> {
+        self.inst.slirp_pid
+    }
+
+    /// Transfer responsibility to the caller's lifecycle guard.
+    fn commit(mut self) {
+        self.committed = true;
+    }
+}
+
+impl Drop for StartedVmGuard<'_> {
+    fn drop(&mut self) {
+        if self.committed {
+            return;
+        }
+
+        let quarantine_error = VmRunner::quarantine_before_teardown(
+            &self.inst,
+            "start_vm failed before startup ownership was committed",
+        )
+        .err();
+        let stop_error = self.runner.stop_vm(&mut self.inst).err();
+
+        if let Some(error) = quarantine_error {
+            tracing::error!(
+                "[vmrunner-start-guard] quarantine persistence failed for {}: {error}",
+                self.inst.container
+            );
+        }
+        if let Some(error) = stop_error {
+            tracing::error!(
+                "[vmrunner-start-guard] startup teardown was not verified for {}: {error}",
+                self.inst.container
+            );
+        }
+    }
+}
+
 impl VmRunner {
     /// Build from environment variables.
     ///
@@ -513,21 +589,25 @@ impl VmRunner {
         timer.start_phase("start_vm");
 
         // ── 7. Start VM ────────────────────────────────────────────────────
-        self.start_vm(
-            &mut inst,
-            false,
-            false,
-            resources.cpu_cores,
-            resources.ram_mb,
-        )
-        .await?;
+        let started_guard = self
+            .start_vm(
+                &mut inst,
+                false,
+                false,
+                resources.cpu_cores,
+                resources.ram_mb,
+            )
+            .await?;
         // Register PIDs in the guard so rollback can kill them if later steps fail.
-        if let Some(pid) = inst.firecracker_pid {
+        if let Some(pid) = started_guard.firecracker_pid() {
             guard.set_fc_pid(pid);
         }
-        if let Some(pid) = inst.slirp_pid {
+        if let Some(pid) = started_guard.slirp_pid() {
             guard.set_slirp_pid(pid);
         }
+        // Durable PID state has been handed to the outer guard before the
+        // next await, so cancellation cannot strand startup-owned children.
+        started_guard.commit();
         timer.start_phase("wait_ssh");
 
         // ── 8. Bootstrap claw agent ────────────────────────────────────────
@@ -682,14 +762,15 @@ impl VmRunner {
         // restore. This preserves the instance's modified rootfs. Snapshot restore
         // would load the seed's kernel memory (stale dentry/inode cache) over the
         // instance's modified disk, causing ext4 corruption.
-        self.start_vm(
-            &mut inst,
-            false,
-            true,
-            DEFAULT_CREATE_CPU_CORES,
-            DEFAULT_CREATE_RAM_MB,
-        )
-        .await?;
+        let started_guard = self
+            .start_vm(
+                &mut inst,
+                false,
+                true,
+                DEFAULT_CREATE_CPU_CORES,
+                DEFAULT_CREATE_RAM_MB,
+            )
+            .await?;
 
         let ssh =
             SshSession::wait_for_ssh(inst.ssh_port, &self.env.ssh_key, self.env.ssh_wait_tries)
@@ -699,6 +780,8 @@ impl VmRunner {
         let cfg = vm_config_from_instance(&inst);
         write_bashrc(&ssh, &cfg).await;
         restart_claw_agent_best_effort(&ssh, &inst.claw_type).await;
+
+        started_guard.commit();
 
         tracing::info!("[vmrunner] restarted {container} (kernel boot, rootfs preserved)");
         Ok(())
@@ -737,14 +820,15 @@ impl VmRunner {
 
         // Fresh rootfs was just copied — snapshot restore is safe here because
         // the disk matches the seed's state that mem.snapshot was taken from.
-        self.start_vm(
-            &mut inst,
-            false,
-            false,
-            DEFAULT_CREATE_CPU_CORES,
-            DEFAULT_CREATE_RAM_MB,
-        )
-        .await?;
+        let started_guard = self
+            .start_vm(
+                &mut inst,
+                false,
+                false,
+                DEFAULT_CREATE_CPU_CORES,
+                DEFAULT_CREATE_RAM_MB,
+            )
+            .await?;
 
         let ssh =
             SshSession::wait_for_ssh(inst.ssh_port, &self.env.ssh_key, self.env.ssh_wait_tries)
@@ -752,6 +836,8 @@ impl VmRunner {
         let cfg = vm_config_from_instance(&inst);
         write_bashrc(&ssh, &cfg).await;
         restart_claw_agent_best_effort(&ssh, &inst.claw_type).await;
+
+        started_guard.commit();
 
         tracing::info!("[vmrunner] rebuilt {container} with fresh rootfs");
         Ok(())
@@ -867,14 +953,27 @@ impl VmRunner {
                 tracing::error!(
                     "[vmrunner] public hostfwd state is uncertain for {container}; stopping VM before returning"
                 );
+                let quarantine_error = Self::quarantine_before_teardown(
+                    &inst,
+                    "ambiguous public hostfwd response; teardown pending",
+                )
+                .err();
                 return match self.stop_vm(&mut inst) {
-                    Ok(()) => Err(e),
+                    Ok(()) => match quarantine_error {
+                        Some(quarantine_error) => Err(VmError::HostfwdUncertain(format!(
+                            "{e}; teardown verified but quarantine persistence failed: {quarantine_error}"
+                        ))),
+                        None => Err(e),
+                    },
                     Err(stop_error) => {
                         tracing::error!(
                             "[vmrunner] failed to prove VM {container} stopped after uncertain hostfwd state: {stop_error}"
                         );
+                        let quarantine_detail = quarantine_error
+                            .map(|error| format!("; quarantine persistence also failed: {error}"))
+                            .unwrap_or_default();
                         Err(VmError::HostfwdUncertain(format!(
-                            "{e}; VM teardown was not verified: {stop_error}"
+                            "{e}; VM teardown was not verified: {stop_error}{quarantine_detail}"
                         )))
                     }
                 };
@@ -1521,7 +1620,7 @@ impl VmRunner {
         force_kernel_boot: bool,
         cpu_cores: u32,
         ram_mb: u32,
-    ) -> Result<(), VmError> {
+    ) -> Result<StartedVmGuard<'_>, VmError> {
         let log_prefix = if pool_mode {
             "[vmrunner-pool]"
         } else {
@@ -1538,7 +1637,7 @@ impl VmRunner {
             if let Some(pid) = inst.firecracker_pid {
                 if is_pid_running(pid) {
                     tracing::info!("{log_prefix} instance already running: {}", inst.container);
-                    return Ok(());
+                    return Ok(StartedVmGuard::already_running(self, inst));
                 }
             }
         }
@@ -1758,6 +1857,7 @@ wait $!
         };
 
         let t_unshare_spawn = std::time::Instant::now();
+        let mut startup_guard = StartedVmGuard::new(self, inst);
         // SAFETY: pre_exec runs between fork() and exec(); only async-signal-safe
         // functions may be called. libc::setsid() is AS-safe (POSIX.1-2008 §2.4.3,
         // signal-safety(7)). No heap allocation or Rust runtime state is touched.
@@ -1786,6 +1886,11 @@ wait $!
 
         let fc_pid = child.id();
         inst.firecracker_pid = Some(fc_pid);
+        startup_guard.set_fc_pid(fc_pid);
+        // Persist ownership immediately after spawn. Any later failure can be
+        // recovered by an outer guard or startup sweep even before this
+        // function returns the PID to its caller.
+        inst.save()?;
         tracing::info!(
             "{timing_prefix} start_vm.unshare_spawn: {}ms",
             t_unshare_spawn.elapsed().as_millis()
@@ -1916,6 +2021,8 @@ wait $!
 
         let slirp_pid = slirp_child.id();
         inst.slirp_pid = Some(slirp_pid);
+        startup_guard.set_slirp_pid(slirp_pid);
+        inst.save()?;
         tracing::info!(
             "{timing_prefix} start_vm.slirp_spawn: {}ms",
             t_slirp_spawn.elapsed().as_millis()
@@ -1972,9 +2079,6 @@ wait $!
         // not be processing requests yet).
         slirp_wait_ready(&inst.slirp_api_sock, Duration::from_secs(30))?;
 
-        // Save PIDs so cleanup can kill processes even if later steps fail.
-        inst.save()?;
-
         if pool_mode {
             // Pool mode: no hostfwds yet — ports are added by claim_from_pool().
             tracing::info!(
@@ -1991,7 +2095,10 @@ wait $!
             );
         }
 
-        Ok(())
+        // Return the still-armed guard. The caller must either adopt the
+        // durable PIDs into its own guard or retain this guard through its
+        // post-start work before committing it.
+        Ok(startup_guard)
     }
 
     // ── Warm pool ──────────────────────────────────────────────────────────
@@ -2041,11 +2148,15 @@ wait $!
         // If an old warm VM is still running (e.g. from a previous backend restart),
         // clean it up first.
         if instance_dir.join("instance.env").exists() {
-            if let Ok(mut old_inst) = InstanceEnv::load(&instance_dir) {
-                tracing::info!("[vmrunner-pool] cleaning up stale pool VM {container}");
-                let _ = self.stop_vm(&mut old_inst);
-            }
-            let _ = fs::remove_dir_all(&instance_dir);
+            let mut old_inst = InstanceEnv::load_unchecked(&instance_dir)?;
+            tracing::info!("[vmrunner-pool] cleaning up stale pool VM {container}");
+            self.stop_vm(&mut old_inst)?;
+            fs::remove_dir_all(&instance_dir).map_err(|e| {
+                VmError::Io(format!(
+                    "remove stale pool VM directory {}: {e}",
+                    instance_dir.display()
+                ))
+            })?;
             // Let process teardown settle before immediately recreating the slot.
             tokio::time::sleep(Duration::from_millis(500)).await;
         }
@@ -2102,26 +2213,28 @@ wait $!
         // Start VM without port forwards — the FC process runs, VM is booted/restored,
         // but no slirp hostfwds are added yet. Ports are added at claim time.
         let t_start = std::time::Instant::now();
-        self.start_vm(
-            &mut inst,
-            true,
-            false,
-            DEFAULT_CREATE_CPU_CORES,
-            DEFAULT_CREATE_RAM_MB,
-        )
-        .await?;
+        let started_guard = self
+            .start_vm(
+                &mut inst,
+                true,
+                false,
+                DEFAULT_CREATE_CPU_CORES,
+                DEFAULT_CREATE_RAM_MB,
+            )
+            .await?;
         tracing::info!(
             "[vmrunner-pool] start_vm(pool_mode) done in {}ms",
             t_start.elapsed().as_millis()
         );
 
         // Register PIDs in the fill guard so rollback can kill them.
-        if let Some(pid) = inst.firecracker_pid {
+        if let Some(pid) = started_guard.firecracker_pid() {
             fill_guard.set_fc_pid(pid);
         }
-        if let Some(pid) = inst.slirp_pid {
+        if let Some(pid) = started_guard.slirp_pid() {
             fill_guard.set_slirp_pid(pid);
         }
+        started_guard.commit();
 
         // Verify FC is still alive after start.
         if let Some(pid) = inst.firecracker_pid {
@@ -2521,15 +2634,23 @@ wait $!
         let _ = fs::remove_file(&inst.firecracker_sock);
         let _ = fs::remove_file(&inst.slirp_api_sock);
 
-        // Persist the cleared state so restart()/rebuild() after reboot cannot
-        // see stale PIDs. A previous quarantine is cleared only after this
-        // post-condition has been proven.
+        // Persist the cleared state durably before removing quarantine. If
+        // save fails or the process crashes here, the marker remains and the
+        // unchecked startup path can retry cleanup without allowing reuse.
         inst.firecracker_pid = None;
         inst.slirp_pid = None;
-        inst.clear_hostfwd_uncertain()?;
-
         inst.save()?;
+        inst.clear_hostfwd_uncertain()?;
         Ok(())
+    }
+
+    /// Persist the no-reuse marker before any teardown signal is sent.
+    ///
+    /// This is deliberately separate from `stop_vm`: ambiguous hostfwd
+    /// callers invoke it first, so a crash between detection and teardown
+    /// cannot leave an apparently reusable instance on disk.
+    fn quarantine_before_teardown(inst: &InstanceEnv, reason: &str) -> Result<(), VmError> {
+        inst.mark_hostfwd_uncertain(reason)
     }
 
     /// Verify that a freshly-booted VM is actually usable.
@@ -2619,24 +2740,46 @@ wait $!
 
             // Warm pool VMs from a previous backend process are always stale —
             // the in-memory pool state was lost when the old process exited.
-            // Kill processes and remove directory unconditionally.
+            // Kill processes and remove the directory only after teardown is
+            // verified. A quarantine marker must never be treated as a reason
+            // to discard the evidence before the survivor is gone.
             if name.starts_with("_warm-") {
                 if env_path.exists() {
-                    if let Ok(inst) = InstanceEnv::load(&dir) {
-                        tracing::warn!(
-                            "[vmrunner-sweep] killing stale warm-pool VM {name} \
-                             (fc_pid={:?}, slirp_pid={:?})",
-                            inst.firecracker_pid,
-                            inst.slirp_pid,
-                        );
-                        create_guard::do_cleanup(&dir, inst.firecracker_pid, inst.slirp_pid);
-                    } else {
-                        let _ = fs::remove_dir_all(&dir);
+                    match InstanceEnv::load_unchecked(&dir) {
+                        Ok(mut inst) => {
+                            tracing::warn!(
+                                "[vmrunner-sweep] killing stale warm-pool VM {name} \
+                                 (fc_pid={:?}, slirp_pid={:?})",
+                                inst.firecracker_pid,
+                                inst.slirp_pid,
+                            );
+                            match self.stop_vm(&mut inst) {
+                                Ok(()) => match fs::remove_dir_all(&dir) {
+                                    Ok(()) => report.instances_cleaned += 1,
+                                    Err(e) => tracing::warn!(
+                                        "[vmrunner-sweep] failed to remove stopped warm dir {name}: {e}"
+                                    ),
+                                },
+                                Err(e) => tracing::warn!(
+                                    "[vmrunner-sweep] preserving warm dir {name} until teardown is verified: {e}"
+                                ),
+                            }
+                        }
+                        Err(e) => {
+                            let marker_error = persist_hostfwd_uncertain_marker(
+                                &dir,
+                                "instance.env could not be parsed; process ownership requires recovery",
+                            )
+                            .err();
+                            tracing::warn!(
+                                "[vmrunner-sweep] preserving warm dir {name}; cannot load state for cleanup: {e}; marker_error={marker_error:?}"
+                            );
+                        }
                     }
                 } else {
                     let _ = fs::remove_dir_all(&dir);
+                    report.dirs_removed += 1;
                 }
-                report.instances_cleaned += 1;
                 continue;
             }
 
@@ -2751,7 +2894,7 @@ wait $!
             pool.drain_all()
         };
 
-        let mut drained = entries.len();
+        let mut drained = 0;
 
         // 3. Kill processes and remove directories for warm entries.
         for entry in &entries {
@@ -2762,7 +2905,14 @@ wait $!
                 entry.inst.slirp_pid,
             );
             let dir = self.env.state_dir.join(&entry.container);
-            create_guard::do_cleanup(&dir, entry.inst.firecracker_pid, entry.inst.slirp_pid);
+            if create_guard::do_cleanup(&dir, entry.inst.firecracker_pid, entry.inst.slirp_pid) {
+                drained += 1;
+            } else {
+                tracing::error!(
+                    "[vmrunner-drain] preserving warm-pool VM {} because teardown was not verified",
+                    entry.container
+                );
+            }
         }
 
         // 4. Safety net: sweep _warm-* directories on disk that may not be in
@@ -2787,12 +2937,39 @@ wait $!
                     continue;
                 }
                 tracing::info!("[vmrunner-drain] cleaning up orphaned warm dir: {name}");
-                if let Ok(inst) = InstanceEnv::load(&path) {
-                    create_guard::do_cleanup(&path, inst.firecracker_pid, inst.slirp_pid);
+                if let Ok(inst) = InstanceEnv::load_unchecked(&path) {
+                    if create_guard::do_cleanup(&path, inst.firecracker_pid, inst.slirp_pid) {
+                        drained += 1;
+                    } else {
+                        tracing::error!(
+                            "[vmrunner-drain] preserving orphaned warm dir {name} because teardown was not verified"
+                        );
+                    }
+                } else if !path.join("instance.env").exists()
+                    && !path
+                        .join(crate::instance_env::HOSTFWD_UNCERTAIN_MARKER)
+                        .exists()
+                {
+                    // A fill can leave an empty warm directory before the
+                    // first durable instance.env save. No child ownership has
+                    // been established in that state, so it is safe to remove.
+                    if let Err(e) = fs::remove_dir_all(&path) {
+                        tracing::warn!(
+                            "[vmrunner-drain] failed to remove empty warm dir {name}: {e}"
+                        );
+                    } else {
+                        drained += 1;
+                    }
                 } else {
-                    let _ = fs::remove_dir_all(&path);
+                    let marker_error = persist_hostfwd_uncertain_marker(
+                        &path,
+                        "instance.env could not be parsed during warm-pool drain",
+                    )
+                    .err();
+                    tracing::error!(
+                        "[vmrunner-drain] preserving warm dir {name}; state cannot be loaded and process ownership is unverified; marker_error={marker_error:?}"
+                    );
                 }
-                drained += 1;
             }
         }
 
@@ -3459,6 +3636,62 @@ mod tests {
     }
 
     #[test]
+    fn sweep_orphans_tears_down_quarantined_warm_dir_before_removal() {
+        let tmp = TempDir::new().unwrap();
+        let state_dir = tmp.path();
+        let warm_dir = state_dir.join("_warm-picoclaw-0");
+        write_full_instance_env(&warm_dir, "_warm-picoclaw-0", "", "");
+        fs::write(
+            warm_dir.join(crate::instance_env::HOSTFWD_UNCERTAIN_MARKER),
+            "ambiguous hostfwd response\n",
+        )
+        .unwrap();
+
+        let runner = test_runner(state_dir, tmp.path());
+        let report = runner.sweep_orphans();
+
+        assert_eq!(report.instances_cleaned, 1);
+        assert!(
+            !warm_dir.exists(),
+            "a quarantined warm dir may be removed only after verified teardown"
+        );
+    }
+
+    #[test]
+    fn sweep_orphans_preserves_invalid_warm_state() {
+        let tmp = TempDir::new().unwrap();
+        let state_dir = tmp.path();
+        let warm_dir = state_dir.join("_warm-picoclaw-0");
+        fs::create_dir_all(&warm_dir).unwrap();
+        fs::write(
+            warm_dir.join("instance.env"),
+            "CONTAINER_NAME=_warm-picoclaw-0\n\
+             CUSTOMER_NAME=_warm-picoclaw-0\n\
+             CLAW_TYPE=picoclaw\n\
+             PORT=0\n\
+             SSH_PORT=22002\n\
+             FIRECRACKER_PID=not-a-pid\n\
+             SLIRP_PID=\n",
+        )
+        .unwrap();
+
+        let runner = test_runner(state_dir, tmp.path());
+        let report = runner.sweep_orphans();
+
+        assert_eq!(report.instances_cleaned, 0);
+        assert!(
+            warm_dir.exists(),
+            "invalid warm state must be preserved for recovery"
+        );
+        assert!(
+            warm_dir
+                .join(crate::instance_env::HOSTFWD_UNCERTAIN_MARKER)
+                .exists(),
+            "invalid warm state must be quarantined"
+        );
+    }
+
+    #[test]
     fn sweep_orphans_preserves_instance_env_for_dead_instances() {
         let tmp = TempDir::new().unwrap();
         let state_dir = tmp.path();
@@ -3569,6 +3802,59 @@ mod tests {
             "instance.env must survive"
         );
         assert!(inst_dir.join("rootfs.ext4").exists(), "rootfs must survive");
+    }
+
+    #[test]
+    fn uncertain_teardown_persists_marker_before_stop() {
+        let tmp = TempDir::new().unwrap();
+        let state_dir = tmp.path();
+        let inst_dir = state_dir.join("picoclaw-uncertain-order");
+        write_full_instance_env(&inst_dir, "picoclaw-uncertain-order", "", "");
+
+        let inst = InstanceEnv::load_unchecked(&inst_dir).unwrap();
+        VmRunner::quarantine_before_teardown(&inst, "ambiguous hostfwd response; teardown pending")
+            .unwrap();
+
+        assert!(
+            inst_dir
+                .join(crate::instance_env::HOSTFWD_UNCERTAIN_MARKER)
+                .exists(),
+            "the no-reuse marker must exist before teardown begins"
+        );
+        assert!(
+            matches!(
+                InstanceEnv::load(&inst_dir),
+                Err(VmError::HostfwdUncertain(_))
+            ),
+            "normal lifecycle loads must refuse the quarantined instance"
+        );
+    }
+
+    #[test]
+    fn stop_vm_keeps_quarantine_when_stopped_state_save_fails() {
+        let tmp = TempDir::new().unwrap();
+        let state_dir = tmp.path();
+        let inst_dir = state_dir.join("picoclaw-save-failure");
+        write_full_instance_env(&inst_dir, "picoclaw-save-failure", "", "");
+
+        let runner = test_runner(state_dir, tmp.path());
+        let mut inst = InstanceEnv::load_unchecked(&inst_dir).unwrap();
+        VmRunner::quarantine_before_teardown(&inst, "ambiguous hostfwd response; teardown pending")
+            .unwrap();
+
+        fs::remove_file(inst_dir.join("instance.env")).unwrap();
+        fs::create_dir(inst_dir.join("instance.env")).unwrap();
+
+        assert!(
+            runner.stop_vm(&mut inst).is_err(),
+            "state persistence failure must be surfaced"
+        );
+        assert!(
+            inst_dir
+                .join(crate::instance_env::HOSTFWD_UNCERTAIN_MARKER)
+                .exists(),
+            "quarantine must remain when durable stopped state was not saved"
+        );
     }
 
     #[tokio::test]

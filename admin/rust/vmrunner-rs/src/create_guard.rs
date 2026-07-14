@@ -34,7 +34,10 @@
 use std::path::{Path, PathBuf};
 
 use crate::error::DiagnosticLogs;
-use crate::network::{kill_pgrp, kill_pgrp_force, kill_pid, kill_pid_force, reap_pid};
+use crate::instance_env::{InstanceEnv, persist_hostfwd_uncertain_marker};
+use crate::network::{
+    is_pid_running, kill_pgrp, kill_pgrp_force, kill_pid, kill_pid_force, reap_pid,
+};
 
 // ── CreateGuard ────────────────────────────────────────────────────────────
 
@@ -102,7 +105,12 @@ impl Drop for CreateGuard {
                 "[vmrunner-guard] Rolling back failed create: {}",
                 self.instance_dir.display()
             );
-            do_cleanup(&self.instance_dir, self.fc_pid, self.slirp_pid);
+            if !do_cleanup(&self.instance_dir, self.fc_pid, self.slirp_pid) {
+                tracing::error!(
+                    "[vmrunner-guard] failed to verify cleanup for {}; quarantine preserved",
+                    self.instance_dir.display()
+                );
+            }
         }
     }
 }
@@ -164,7 +172,12 @@ impl Drop for ClaimGuard {
                 "[vmrunner-guard] Rolling back failed pool claim: {}",
                 self.instance_dir.display()
             );
-            do_cleanup(&self.instance_dir, self.fc_pid, self.slirp_pid);
+            if !do_cleanup(&self.instance_dir, self.fc_pid, self.slirp_pid) {
+                tracing::error!(
+                    "[vmrunner-guard] failed to verify cleanup for {}; quarantine preserved",
+                    self.instance_dir.display()
+                );
+            }
         }
     }
 }
@@ -223,42 +236,156 @@ impl Drop for PoolFillGuard {
                 "[vmrunner-guard] Rolling back failed pool fill: {}",
                 self.pool_dir.display()
             );
-            do_cleanup(&self.pool_dir, self.fc_pid, self.slirp_pid);
+            if !do_cleanup(&self.pool_dir, self.fc_pid, self.slirp_pid) {
+                tracing::error!(
+                    "[vmrunner-guard] failed to verify warm-pool cleanup for {}; quarantine preserved",
+                    self.pool_dir.display()
+                );
+            }
         }
     }
 }
 
 // ── Shared cleanup logic ──────────────────────────────────────────────────
 
-pub fn do_cleanup(instance_dir: &Path, fc_pid: Option<u32>, slirp_pid: Option<u32>) {
+#[derive(Clone, Copy)]
+struct CleanupOps {
+    is_pid_running: fn(u32) -> bool,
+    persist_marker: fn(&Path, &str) -> Result<(), crate::error::VmError>,
+    kill_pid: fn(u32),
+    kill_pgrp: fn(u32),
+    kill_pid_force: fn(u32),
+    kill_pgrp_force: fn(u32),
+    reap_pid: fn(u32),
+    sleep: fn(std::time::Duration),
+}
+
+fn real_cleanup_ops() -> CleanupOps {
+    CleanupOps {
+        is_pid_running,
+        persist_marker: persist_hostfwd_uncertain_marker,
+        kill_pid,
+        kill_pgrp,
+        kill_pid_force,
+        kill_pgrp_force,
+        reap_pid,
+        sleep: std::thread::sleep,
+    }
+}
+
+/// Kill a VM and remove its directory only after all tracked processes are
+/// observed dead. Returns `true` only when the directory was removed.
+#[must_use]
+pub fn do_cleanup(instance_dir: &Path, fc_pid: Option<u32>, slirp_pid: Option<u32>) -> bool {
+    do_cleanup_with_ops(instance_dir, fc_pid, slirp_pid, real_cleanup_ops())
+}
+
+fn do_cleanup_with_ops(
+    instance_dir: &Path,
+    requested_fc_pid: Option<u32>,
+    requested_slirp_pid: Option<u32>,
+    ops: CleanupOps,
+) -> bool {
+    // The caller may not have received the PIDs yet when an async start path
+    // fails. Recover the durable values before touching the directory so an
+    // outer guard cannot erase a live VM with `None, None`.
+    let env_path = instance_dir.join("instance.env");
+    let (fc_pid, slirp_pid, state_error) = match InstanceEnv::load_unchecked(instance_dir) {
+        Ok(inst) => (
+            requested_fc_pid.or(inst.firecracker_pid()),
+            requested_slirp_pid.or(inst.slirp_pid()),
+            None,
+        ),
+        Err(error) if env_path.exists() => {
+            // A present but malformed state file is evidence that ownership is
+            // not fully recoverable. Kill only caller-supplied PIDs, then keep
+            // the directory for a process-level/startup recovery path instead
+            // of treating malformed fields as `None` and deleting evidence.
+            tracing::error!(
+                "[vmrunner-guard] cannot parse {}: {error}; preserving state until ownership is recovered",
+                env_path.display()
+            );
+            (requested_fc_pid, requested_slirp_pid, Some(error))
+        }
+        Err(_) => (requested_fc_pid, requested_slirp_pid, None),
+    };
+
+    // The marker is the first persistent side effect. If the backend dies
+    // after this point, startup cleanup will preserve the directory and use
+    // the unchecked loader to prove teardown before deleting it.
+    let quarantine_error = if instance_dir.exists() {
+        (ops.persist_marker)(instance_dir, "cleanup in progress").err()
+    } else {
+        None
+    };
+    if let Some(error) = &quarantine_error {
+        tracing::error!(
+            "[vmrunner-guard] cannot persist quarantine marker for {}: {error}; continuing teardown and preserving any survivor evidence",
+            instance_dir.display()
+        );
+    }
+
     // 1. Kill slirp first (it depends on FC's network namespace)
     if let Some(pid) = slirp_pid {
-        kill_pid(pid);
+        (ops.kill_pid)(pid);
     }
 
     // 2. Kill FC process group (SIGTERM, then SIGKILL if needed)
     if let Some(pid) = fc_pid {
-        kill_pgrp(pid);
-        kill_pid(pid);
-        std::thread::sleep(std::time::Duration::from_millis(200));
-        kill_pgrp_force(pid);
-        kill_pid_force(pid);
+        (ops.kill_pgrp)(pid);
+        (ops.kill_pid)(pid);
+        (ops.sleep)(std::time::Duration::from_millis(200));
+        (ops.kill_pgrp_force)(pid);
+        (ops.kill_pid_force)(pid);
     }
 
     // Also SIGKILL slirp if still alive
     if let Some(pid) = slirp_pid {
-        kill_pid_force(pid);
+        (ops.kill_pid_force)(pid);
     }
+
+    (ops.sleep)(std::time::Duration::from_millis(100));
 
     // 2b. Reap zombie children so they don't linger as <defunct> processes.
     // The original Child handle was dropped after spawn (only the PID was kept),
     // so these processes become zombies when they exit. waitpid(WNOHANG)
     // collects the exit status without blocking. No-op if not our child.
     if let Some(pid) = fc_pid {
-        reap_pid(pid);
+        (ops.reap_pid)(pid);
     }
     if let Some(pid) = slirp_pid {
-        reap_pid(pid);
+        (ops.reap_pid)(pid);
+    }
+
+    let fc_survives = fc_pid.is_some_and(ops.is_pid_running);
+    let slirp_survives = slirp_pid.is_some_and(ops.is_pid_running);
+    if fc_survives || slirp_survives {
+        let persistence_detail = quarantine_error
+            .map(|error| format!("; quarantine persistence also failed: {error}"))
+            .unwrap_or_default();
+        tracing::error!(
+            "[vmrunner-guard] preserving {} because teardown is unverified (firecracker_survives={fc_survives}, slirp_survives={slirp_survives}){persistence_detail}",
+            instance_dir.display(),
+        );
+        return false;
+    }
+
+    if let Some(error) = state_error {
+        let persistence_detail = quarantine_error
+            .map(|marker_error| format!("; quarantine persistence also failed: {marker_error}"))
+            .unwrap_or_default();
+        tracing::error!(
+            "[vmrunner-guard] preserving {} because instance state was not parseable: {error}{persistence_detail}",
+            instance_dir.display()
+        );
+        return false;
+    }
+
+    if let Some(error) = quarantine_error {
+        tracing::warn!(
+            "[vmrunner-guard] teardown verified for {} despite quarantine persistence failure: {error}",
+            instance_dir.display()
+        );
     }
 
     // 3. Remove socket files (best-effort — they're inside instance_dir anyway)
@@ -274,14 +401,18 @@ pub fn do_cleanup(instance_dir: &Path, fc_pid: Option<u32>, slirp_pid: Option<u3
                     "[vmrunner-guard] Cleaned up instance dir: {}",
                     instance_dir.display()
                 );
+                true
             }
             Err(e) => {
                 tracing::error!(
                     "[vmrunner-guard] Failed to remove instance dir {}: {e}",
                     instance_dir.display()
                 );
+                false
             }
         }
+    } else {
+        true
     }
 }
 
@@ -487,6 +618,132 @@ mod tests {
         assert!(
             !pool_dir.exists(),
             "pool dir should be removed even with bogus PIDs"
+        );
+    }
+
+    fn simulated_survivor(_: u32) -> bool {
+        true
+    }
+
+    fn simulated_stopped(_: u32) -> bool {
+        false
+    }
+
+    fn simulated_noop(_: u32) {}
+
+    fn simulated_sleep(_: std::time::Duration) {}
+
+    fn simulated_marker_failure(_: &Path, _: &str) -> Result<(), crate::error::VmError> {
+        Err(crate::error::VmError::Io("simulated marker failure".into()))
+    }
+
+    #[test]
+    fn cleanup_preserves_quarantine_evidence_when_process_survives() {
+        let dir = tempfile::tempdir().unwrap();
+        let instance_dir = dir.path().join("_warm-picoclaw-0");
+        fs::create_dir(&instance_dir).unwrap();
+
+        let removed = do_cleanup_with_ops(
+            &instance_dir,
+            Some(4242),
+            None,
+            CleanupOps {
+                is_pid_running: simulated_survivor,
+                persist_marker: persist_hostfwd_uncertain_marker,
+                kill_pid: simulated_noop,
+                kill_pgrp: simulated_noop,
+                kill_pid_force: simulated_noop,
+                kill_pgrp_force: simulated_noop,
+                reap_pid: simulated_noop,
+                sleep: simulated_sleep,
+            },
+        );
+
+        assert!(
+            !removed,
+            "a surviving process must prevent directory removal"
+        );
+        assert!(instance_dir.exists(), "survivor evidence must be preserved");
+        assert!(
+            instance_dir
+                .join(crate::instance_env::HOSTFWD_UNCERTAIN_MARKER)
+                .exists(),
+            "cleanup must quarantine before attempting teardown"
+        );
+    }
+
+    #[test]
+    fn cleanup_still_tears_down_when_marker_persistence_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let instance_dir = dir.path().join("_warm-picoclaw-0");
+        fs::create_dir(&instance_dir).unwrap();
+
+        let removed = do_cleanup_with_ops(
+            &instance_dir,
+            Some(4243),
+            None,
+            CleanupOps {
+                is_pid_running: simulated_stopped,
+                persist_marker: simulated_marker_failure,
+                kill_pid: simulated_noop,
+                kill_pgrp: simulated_noop,
+                kill_pid_force: simulated_noop,
+                kill_pgrp_force: simulated_noop,
+                reap_pid: simulated_noop,
+                sleep: simulated_sleep,
+            },
+        );
+
+        assert!(
+            removed,
+            "marker failure must not suppress teardown when all processes are dead"
+        );
+        assert!(
+            !instance_dir.exists(),
+            "verified teardown may remove evidence after marker failure"
+        );
+    }
+
+    #[test]
+    fn cleanup_preserves_unparseable_state_instead_of_dropping_pids() {
+        let dir = tempfile::tempdir().unwrap();
+        let instance_dir = dir.path().join("_warm-picoclaw-0");
+        fs::create_dir(&instance_dir).unwrap();
+        fs::write(
+            instance_dir.join("instance.env"),
+            "CONTAINER_NAME=picoclaw-test\n\
+             CUSTOMER_NAME=test\n\
+             CLAW_TYPE=picoclaw\n\
+             PORT=35000\n\
+             SSH_PORT=22002\n\
+             FIRECRACKER_PID=not-a-pid\n\
+             SLIRP_PID=\n",
+        )
+        .unwrap();
+
+        let removed = do_cleanup_with_ops(
+            &instance_dir,
+            None,
+            None,
+            CleanupOps {
+                is_pid_running: simulated_stopped,
+                persist_marker: persist_hostfwd_uncertain_marker,
+                kill_pid: simulated_noop,
+                kill_pgrp: simulated_noop,
+                kill_pid_force: simulated_noop,
+                kill_pgrp_force: simulated_noop,
+                reap_pid: simulated_noop,
+                sleep: simulated_sleep,
+            },
+        );
+
+        assert!(!removed, "unparseable state must never be treated as empty");
+        assert!(instance_dir.exists(), "unparseable state must be preserved");
+        assert!(
+            instance_dir
+                .join(crate::instance_env::HOSTFWD_UNCERTAIN_MARKER)
+                .exists(),
+            "unparseable state must be quarantined before recovery"
         );
     }
 }

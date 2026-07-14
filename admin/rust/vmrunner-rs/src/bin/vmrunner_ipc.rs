@@ -545,11 +545,16 @@ fn handle_warm_pool_status(params: &Value) -> Response {
         );
         if let Some(ref sd) = state_dir {
             let dir = sd.join(&entry.container);
-            vmrunner_rs::create_guard::do_cleanup(
+            if !vmrunner_rs::create_guard::do_cleanup(
                 &dir,
                 entry.inst.firecracker_pid(),
                 entry.inst.slirp_pid(),
-            );
+            ) {
+                tracing::error!(
+                    "[vmrunner-pool-status] preserving {} because teardown was not verified",
+                    entry.container
+                );
+            }
         }
     }
 
