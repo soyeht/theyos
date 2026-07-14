@@ -151,6 +151,29 @@ expect_checker_failure() {
   echo "PASS ${label}_refused"
 }
 
+expect_checker_failure_any() {
+  local label="$1" root="$2"
+  shift 2
+  prepare_empty_authority_inputs
+  if PHASE0_TARGET="${MUTATION_TARGET}" \
+      PHASE0_BUILD_TOOL="${MUTATION_BUILD_TOOL}" \
+      PHASE0_CARGO_TARGET_DIR="${SHARED_TARGET}" \
+      run_checker "${root}/${CHECKER_REL}" "${root}" >"${TMP_ROOT}/${label}.log" 2>&1; then
+    echo "error: checker accepted ${label}" >&2
+    exit 1
+  fi
+  local expected
+  for expected in "$@"; do
+    if grep -Fq -- "${expected}" "${TMP_ROOT}/${label}.log"; then
+      echo "PASS ${label}_refused"
+      return
+    fi
+  done
+  echo "error: ${label} missed all expected reasons: $*" >&2
+  cat "${TMP_ROOT}/${label}.log" >&2
+  exit 1
+}
+
 expect_route_test_failure() {
   local label="$1" root="$2"
   if CARGO_TARGET_DIR="${SHARED_TARGET}" \
@@ -719,9 +742,11 @@ TOML
 )
 refresh_boundary_tree_entry "${external_path_dependency}" "admin/rust"
 commit_mutation "${external_path_dependency}" external-path-dependency
-expect_checker_failure external_path_dependency \
+expect_checker_failure_any external_path_dependency \
+  "${external_path_dependency}" \
   "local Cargo dependency escapes the closed admin/rust tree" \
-  "${external_path_dependency}"
+  "local Cargo dependency path escapes the closed admin/rust tree" \
+  'failed to read `/project/outside-phase0/Cargo.toml`'
 
 ancestor_cargo_config="${TMP_ROOT}/ancestor-cargo-config"
 clone_head "${ancestor_cargo_config}"
