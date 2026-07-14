@@ -5,6 +5,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 CHECKER_REL=".github/scripts/check-mobile-claw-vpn-owner-present-phase0-compileout.sh"
+WORKFLOW_REL=".github/workflows/owner-present-phase0-compileout.yml"
 BOUNDARY_REL="admin/contracts/mobile-claw-vpn/v1/owner_present_phase0_artifact_boundary_v1.tsv"
 TMP_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/theyos-owner-present-phase0-test.XXXXXX")"
 trap 'chmod -R u+w "${TMP_ROOT}" 2>/dev/null || true; rm -rf "${TMP_ROOT}"' EXIT
@@ -17,6 +18,18 @@ if [[ "${HOST_TARGET}" != *-apple-darwin ]]; then
   MUTATION_BUILD_TOOL=cross
 fi
 SHARED_TARGET="${TMP_ROOT}/target"
+if ! grep -Fq \
+    'build_tool_version "$(run_clean "${BUILD_TOOL_BIN}" --version)"' \
+    "${REPO_ROOT}/${CHECKER_REL}"; then
+  echo "error: cross attestation must query the Docker CLI with --version" >&2
+  exit 1
+fi
+if ! grep -Fq \
+    'test("^1\\.92\\.0-[0-9a-z_-]+$")' \
+    "${REPO_ROOT}/${WORKFLOW_REL}"; then
+  echo "error: published-target workflow must accept pinned Rust triples with underscores" >&2
+  exit 1
+fi
 if [[ "${HOST_TARGET}" == *-apple-darwin ]]; then
   PHASE0_EXPECTED_XCODE_VERSION="${PHASE0_EXPECTED_XCODE_VERSION:-$(xcodebuild -version | sed -n 's/^Xcode //p')}"
   PHASE0_EXPECTED_XCODE_BUILD="${PHASE0_EXPECTED_XCODE_BUILD:-$(xcodebuild -version | sed -n 's/^Build version //p')}"

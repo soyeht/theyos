@@ -1969,7 +1969,7 @@ jq -n -S \
   --arg source_tree "${HEAD_TREE}" \
   --arg target "${TARGET}" \
   --arg build_tool "${BUILD_TOOL}" \
-  --arg build_tool_version "$(run_clean "${BUILD_TOOL_BIN}" -V)" \
+  --arg build_tool_version "$(run_clean "${BUILD_TOOL_BIN}" --version)" \
   --arg rustc "${ATTESTATION_RUSTC_VERSION}" \
   --arg cargo "${ATTESTATION_CARGO_VERSION}" \
   --arg rustc_toolchain_sha256 "${RUSTC_TOOLCHAIN_SHA256}" \
