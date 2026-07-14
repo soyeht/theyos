@@ -1055,7 +1055,9 @@ pub async fn post_pair_device_reissue(
     // Mint on the SHARED Arc for liveness (so the daemon's /pair-device/*
     // routes serve the same nonce), then render via the extracted URI path
     // — same TTL clamp as the CLI `--reissue-pair-qr` flow.
-    let ttl = crate::install_cli::pair_device_ttl_from_env();
+    let ttl = Duration::from_secs(crate::household_bootstrap::pair_window_ttl_secs_from_env(
+        "THEYOS_PAIR_DEVICE_TTL_SECS",
+    ));
     let token = match state.pair_device_window.mint_token(ttl, None).await {
         Ok(t) => t,
         Err(e) => {
@@ -2850,7 +2852,9 @@ mod tests {
         // pair_qr_uri.
         let logged_hh_id = hh_id.clone();
         let logged_stage = "pair_device.reissue.opened";
-        let logged_ttl_secs = crate::install_cli::pair_device_ttl_from_env().as_secs();
+        let logged_ttl_secs = crate::household_bootstrap::pair_window_ttl_secs_from_env(
+            "THEYOS_PAIR_DEVICE_TTL_SECS",
+        );
         let logged_expires = body.expires_at_unix;
         let log_line = format!(
             "stage={logged_stage} hh_id={logged_hh_id} ttl_secs={logged_ttl_secs} expires_at_unix={logged_expires}"

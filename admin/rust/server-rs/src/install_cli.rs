@@ -217,27 +217,6 @@ fn print_usage() {
     );
 }
 
-/// Read the pair-device QR window TTL from the environment, clamped to the
-/// documented `60..=3600` range with a 5-minute production default.
-///
-/// Production default is 5 minutes — short enough that a leaked QR doesn't
-/// sit valid in chat logs / screenshots for hours. Operators running
-/// validation pass overrides via `THEYOS_PAIR_DEVICE_TTL_SECS` to handle
-/// manual / appium-driven walks through the Welcome carousel, permission
-/// alerts, and Face ID, which routinely exceed the 5-minute window during e2e
-/// sessions. The clamp bounds keep accidental absurd values from weakening
-/// prod beyond the documented threat surface.
-///
-/// Shared by the CLI `--reissue-pair-qr` path and the in-process engine
-/// reissue route so both honor the same env override + clamp.
-pub(crate) fn pair_device_ttl_from_env() -> Duration {
-    Duration::from_secs(
-        crate::household_bootstrap::pair_window_ttl_secs_from_env(
-            "THEYOS_PAIR_DEVICE_TTL_SECS",
-        ),
-    )
-}
-
 /// Mint a fresh owner pair-device token on a persistent [`PairDeviceWindow`]
 /// rooted at `state_dir`, and render the canonical
 /// `soyeht://household/pair-device?…` URI.
@@ -257,7 +236,9 @@ pub(crate) async fn mint_pair_device_uri(
     household_name: Option<&str>,
     host_fallback: Option<String>,
 ) -> Result<(String, u64), String> {
-    let ttl = pair_device_ttl_from_env();
+    let ttl = Duration::from_secs(crate::household_bootstrap::pair_window_ttl_secs_from_env(
+        "THEYOS_PAIR_DEVICE_TTL_SECS",
+    ));
     let window = PairDeviceWindow::with_persistence(state_dir.to_path_buf());
     let token = window
         .mint_token(ttl, None)
@@ -298,7 +279,9 @@ async fn emit_fresh_pair_device_window(
     info!(
         stage = "pair_device_window.opened",
         source = "install",
-        ttl_secs = pair_device_ttl_from_env().as_secs(),
+        ttl_secs = crate::household_bootstrap::pair_window_ttl_secs_from_env(
+            "THEYOS_PAIR_DEVICE_TTL_SECS",
+        ),
         expires_at_unix = expires_at_unix,
         host_fallback = host_fallback.as_deref().unwrap_or(""),
     );
