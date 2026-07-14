@@ -4,7 +4,7 @@
 100755	blob	1d903e9af9dcdafc3493145d92d93c4921ea2509	land-exact	.github/scripts/check-mobile-claw-vpn-owner-present-contracts.sh
 100755	blob	37fc87204b102cec2a3669d8a6c170b9b720fda8	land-exact	.github/scripts/check-mobile-claw-vpn-owner-present-phase0-compileout.sh
 100755	blob	49c66ea7576b68ad8d96c4cfb44716ed671e8dd4	land-exact	.github/scripts/test-mobile-claw-vpn-owner-present-contracts.sh
-100755	blob	a2fdc9b026b69b135cf25062a5939b06321b8076	land-exact	.github/scripts/test-mobile-claw-vpn-owner-present-phase0-compileout.sh
+100755	blob	dd0b102f4eaf745fa5efa92a4ddac5388a5bad60	land-exact	.github/scripts/test-mobile-claw-vpn-owner-present-phase0-compileout.sh
 100644	blob	d0b9229e4fe5744cb2c072ce690b29039bafc450	land-exact	.github/workflows/contracts-cross-repo-sync.yml
 100644	blob	7e5ff189b8b840e82f8ca02342a7473c75d11769	land-exact	.github/workflows/owner-present-phase0-compileout.yml
 100644	blob	8ae5db96e0e72d21e829c8a582b2b74520c2ee2c	land-exact	.github/workflows/owner-present-phase0-nix-runtime.yml

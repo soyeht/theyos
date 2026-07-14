@@ -544,7 +544,7 @@ RUST
 refresh_boundary_tree_entry "${external_include}" "admin/rust"
 commit_mutation "${external_include}" external-include
 expect_checker_failure external_include \
-  "canonical theyos-engine build failed for ${MUTATION_TARGET} with ${MUTATION_BUILD_TOOL}" \
+  "couldn't read \`server-rs/src/../../../../docs/phase0 external input.txt\`" \
   "${external_include}"
 
 allow_alias_escape="${TMP_ROOT}/allow-alias-escape"
