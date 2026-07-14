@@ -223,8 +223,8 @@ fn print_usage() {
 /// Production default is 5 minutes — short enough that a leaked QR doesn't
 /// sit valid in chat logs / screenshots for hours. Operators running
 /// validation pass overrides via `THEYOS_PAIR_DEVICE_TTL_SECS` to handle
-/// manual / appium-driven walks through Welcome carousel + permission alerts
-/// + Face ID, which routinely exceed the 5-minute window during e2e
+/// manual / appium-driven walks through the Welcome carousel, permission
+/// alerts, and Face ID, which routinely exceed the 5-minute window during e2e
 /// sessions. The clamp bounds keep accidental absurd values from weakening
 /// prod beyond the documented threat surface.
 ///
