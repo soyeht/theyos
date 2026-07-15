@@ -270,6 +270,8 @@ echo "PASS owner_review_pagination_refused"
 
 ARM_WEAKEN_PLAN="${TMP_ROOT}/transition-arm-weakening"
 git clone --quiet --shared "${REPO}" "${ARM_WEAKEN_PLAN}"
+git -C "${ARM_WEAKEN_PLAN}" config user.name "phase0-integrity-test"
+git -C "${ARM_WEAKEN_PLAN}" config user.email "phase0-integrity@example.invalid"
 git -C "${ARM_WEAKEN_PLAN}" switch --quiet --detach "${ARM_HEAD}"
 printf '100644\tblob\t0000000000000000000000000000000000000000\tland-exact\tprotected/unscoped.txt\n' \
   >>"${ARM_WEAKEN_PLAN}/${POLICY_REL}"
