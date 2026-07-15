@@ -72,7 +72,7 @@ base64      = "0.22"
 sha2        = "0.10"
 hmac        = "0.12"
 libc        = "0.2"
-russh       = { version = "0.59", default-features = false, features = ["flate2", "ring", "rsa"] }
+russh       = { version = "0.60.3", default-features = false, features = ["flate2", "ring", "rsa"] }
 async-trait = "0.1"
 hyperlocal  = { version = "0.9", default-features = false, features = ["client"] }
 http-body-util = "0.1"
