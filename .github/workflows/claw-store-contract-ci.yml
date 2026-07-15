@@ -8,6 +8,7 @@ on:
       - "admin/rust/server-rs/tests/claw_store_route_contract.rs"
       - "admin/rust/server-rs/tests/claw_store_wire_contract.rs"
       - "admin/rust/server-rs/tests/household_contract_cross_check.rs"
+      - "tests/owner-present-phase0-authority-pin-flow.sh"
       - ".github/workflows/claw-store-contract-ci.yml"
   pull_request:
     paths:
@@ -16,6 +17,7 @@ on:
       - "admin/rust/server-rs/tests/claw_store_route_contract.rs"
       - "admin/rust/server-rs/tests/claw_store_wire_contract.rs"
       - "admin/rust/server-rs/tests/household_contract_cross_check.rs"
+      - "tests/owner-present-phase0-authority-pin-flow.sh"
       - ".github/workflows/claw-store-contract-ci.yml"
   workflow_dispatch:
 
@@ -48,3 +50,36 @@ jobs:
 
       - name: Household docs projection
         run: cargo test -p server-rs --test household_contract_cross_check --manifest-path admin/rust/Cargo.toml
+
+  phase0-authority-pin-regression:
+    name: Phase 0 authority pin regression
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Isolate Phase 0 Rust toolchain
+        shell: bash
+        run: |
+          phase0_home="${RUNNER_TEMP}/phase0-rust-home"
+          rm -rf "${phase0_home}"
+          install -d -m 700 "${phase0_home}"
+          printf 'HOME=%s\n' "${phase0_home}" >> "${GITHUB_ENV}"
+          printf 'RUSTUP_HOME=%s/.rustup\n' "${phase0_home}" >> "${GITHUB_ENV}"
+          printf 'CARGO_HOME=%s/.cargo\n' "${phase0_home}" >> "${GITHUB_ENV}"
+
+      - name: Setup pinned Rust toolchain
+        uses: dtolnay/rust-toolchain@5a814b2e0f75e492da42a3c1227d52112e4dac50
+        with:
+          components: clippy
+          targets: x86_64-unknown-linux-musl
+
+      - name: Exercise Phase 0 authority pins from outside the protected root
+        shell: bash
+        env:
+          PHASE0_AUTHORITY_PIN_REQUIRE_STRUCTURAL: "1"
+        run: |
+          env -u CARGO_HOME -u RUSTUP_HOME -u PHASE0_RUSTUP_HOME \
+            bash tests/owner-present-phase0-authority-pin-flow.sh
