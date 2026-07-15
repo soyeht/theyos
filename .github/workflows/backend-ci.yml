@@ -33,6 +33,39 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v5
+      - name: Reclaim runner disk before Rust build
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "::group::Disk diagnostics before cleanup"
+          df -h /
+          for path in /usr/local/lib/android /usr/share/dotnet /opt/ghc; do
+            if [ -e "$path" ]; then
+              sudo du -sh "$path"
+            fi
+          done
+          if docker info >/dev/null 2>&1; then
+            docker system df
+          else
+            echo "Docker daemon unavailable; skipping Docker diagnostics"
+          fi
+          echo "::endgroup::"
+
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc
+          if docker info >/dev/null 2>&1; then
+            docker system prune --all --force --volumes
+          fi
+          sudo apt-get clean
+          sudo rm -rf /var/lib/apt/lists/*
+
+          echo "::group::Disk diagnostics after cleanup"
+          df -h /
+          if docker info >/dev/null 2>&1; then
+            docker system df
+          else
+            echo "Docker daemon unavailable; skipping Docker diagnostics"
+          fi
+          echo "::endgroup::"
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
         with:
