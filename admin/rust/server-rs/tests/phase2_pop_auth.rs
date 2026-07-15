@@ -9,6 +9,7 @@ use household_rs::person_cert::SignOwnerOptions;
 use household_rs::pop::RequestSigningContext;
 use household_rs::{BootstrapOpts, HouseholdAuthState, KeyBackingPolicy, PersonCert};
 use server_rs::handlers_household;
+use server_rs::handlers_household::MachinesRouterState;
 use server_rs::household_auth::SoyehtPoP;
 use server_rs::household_state::HouseholdState;
 use tower::ServiceExt;
@@ -143,4 +144,195 @@ async fn snapshot_accepts_valid_pop_and_rejects_wrong_path() {
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
+
+/// Build a router serving `/api/v1/household/machines` plus the persisted
+/// household state on disk (the `TempDir` is returned so its lifetime spans the
+/// test — the handler reads `machine_certs/<m_id>.cbor` from it).
+fn machines_fixture() -> (Router, P256Keypair, tempfile::TempDir, household_rs::LoadedIdentity) {
+    let td = tempfile::tempdir().unwrap();
+    let identity = household_rs::bootstrap_or_load(
+        td.path(),
+        BootstrapOpts {
+            household_name: "Sample Home".into(),
+            hostname_label: Some("Mac Studio".into()),
+        },
+        KeyBackingPolicy::ForceSoftware,
+    )
+    .unwrap();
+    let person = P256Keypair::generate();
+    let cert = PersonCert::sign_owner(
+        identity
+            .hh_priv
+            .as_deref()
+            .expect("hh_priv present in single-machine household"),
+        SignOwnerOptions {
+            hh_id: identity.record.hh_id.clone(),
+            p_pub: person.public(),
+            display_name: "Owner".into(),
+            issued_at: identity.record.created_at,
+        },
+    )
+    .unwrap();
+    let auth = HouseholdAuthState::new(&identity.record, cert);
+    let household = HouseholdState::loaded_with_owner_auth(
+        Arc::new(identity_for_state(&identity)),
+        Some(Arc::new(auth)),
+    );
+    let app = Router::new()
+        .route(
+            "/api/v1/household/machines",
+            get(handlers_household::machines),
+        )
+        .with_state(MachinesRouterState {
+            household,
+            state_dir: td.path().to_path_buf(),
+        });
+    (app, person, td, identity)
+}
+
+async fn body_string(resp: axum::response::Response) -> String {
+    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    String::from_utf8(bytes.to_vec()).unwrap()
+}
+
+#[tokio::test]
+async fn machines_owner_auth_ok_returns_self_machine() {
+    let (app, person, td, identity) = machines_fixture();
+    let now = unix_now();
+    let valid = pop_header(&person, "/api/v1/household/machines", now, b"");
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/household/machines")
+                .header(header::AUTHORIZATION, valid)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let raw = body_string(resp).await;
+    let json: serde_json::Value = serde_json::from_str(&raw).unwrap();
+
+    assert_eq!(json["v"], 1);
+    assert_eq!(json["hh_id"], identity.record.hh_id.to_string());
+
+    let expected_self =
+        household_rs::storage::read_self_m_id(td.path()).unwrap().unwrap();
+    assert_eq!(expected_self, identity.cert.m_id.to_string());
+    assert_eq!(json["self_m_id"], expected_self);
+
+    let machines = json["machines"].as_array().unwrap();
+    let self_entry = machines
+        .iter()
+        .find(|m| m["is_self"] == true)
+        .expect("self machine entry present");
+    assert_eq!(self_entry["machine_id"], expected_self);
+    assert_eq!(
+        self_entry["machine_pub"],
+        hex::encode(identity.cert.m_pub.as_bytes())
+    );
+    assert_eq!(self_entry["host_label"], "Mac Studio");
+    let expected_platform = serde_json::to_value(&identity.cert.platform).unwrap();
+    assert_eq!(self_entry["platform"], expected_platform);
+    assert_eq!(self_entry["joined_at"], identity.cert.joined_at);
+    assert_eq!(
+        self_entry["capabilities"],
+        serde_json::json!(["engine", "pty", "clawsite"])
+    );
+}
+
+#[tokio::test]
+async fn machines_no_auth_denied() {
+    let (app, _person, _td, _identity) = machines_fixture();
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/household/machines")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn machines_non_owner_pop_denied() {
+    let (app, _owner, _td, _identity) = machines_fixture();
+    let now = unix_now();
+    // PoP signed by a key that is NOT the household owner.
+    let stranger = P256Keypair::generate();
+    let forged = pop_header(&stranger, "/api/v1/household/machines", now, b"");
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/household/machines")
+                .header(header::AUTHORIZATION, forged)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn machines_wrong_path_pop_denied() {
+    let (app, person, _td, _identity) = machines_fixture();
+    let now = unix_now();
+    // PoP bound to a different path → signature won't verify for /machines.
+    let wrong_path = pop_header(&person, "/api/v1/household/other", now, b"");
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/household/machines")
+                .header(header::AUTHORIZATION, wrong_path)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn machines_response_has_no_secret_fields() {
+    let (app, person, _td, _identity) = machines_fixture();
+    let now = unix_now();
+    let valid = pop_header(&person, "/api/v1/household/machines", now, b"");
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/household/machines")
+                .header(header::AUTHORIZATION, valid)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let raw = body_string(resp).await;
+    for forbidden in [
+        "signature",
+        "priv",
+        "secret",
+        "shard",
+        "token",
+        "addr",
+        "port",
+        "endpoint",
+        "hh_priv",
+        "m_priv",
+    ] {
+        assert!(
+            !raw.contains(forbidden),
+            "machines response leaked forbidden token `{forbidden}`: {raw}"
+        );
+    }
 }

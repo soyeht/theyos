@@ -11,6 +11,7 @@ use axum::{
 };
 use base64::{Engine as _, engine::general_purpose::STANDARD as B64};
 use serde::Serialize;
+use std::path::PathBuf;
 
 use crate::household_auth;
 use crate::household_state::HouseholdState;
@@ -97,6 +98,167 @@ pub async fn snapshot(
         v: 1,
         hh_id: owner_auth.hh_id.to_string(),
         owner_p_id: owner_auth.owner_person_cert.p_id.0.clone(),
+    })
+    .into_response()
+}
+
+/// Combined router state for the owner-authed machines list: the in-memory
+/// household identity (for the `PoP` gate, same as `snapshot`) plus the on-disk
+/// `state_dir` needed to read `machine_certs/<m_id>.cbor`.
+#[derive(Clone)]
+pub struct MachinesRouterState {
+    pub household: HouseholdState,
+    pub state_dir: PathBuf,
+}
+
+#[derive(Serialize)]
+struct MachineEntry {
+    machine_id: String,
+    /// Hex of the 33-byte SEC1 PUBLIC key — never secret.
+    machine_pub: String,
+    host_label: String,
+    platform: &'static str,
+    is_self: bool,
+    capabilities: Vec<&'static str>,
+    joined_at: u64,
+}
+
+#[derive(Serialize)]
+struct MachinesResponse {
+    v: u8,
+    hh_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    self_m_id: Option<String>,
+    machines: Vec<MachineEntry>,
+}
+
+fn platform_str(p: &household_rs::Platform) -> &'static str {
+    match p {
+        household_rs::Platform::Macos => "macos",
+        household_rs::Platform::LinuxNix => "linux-nix",
+        household_rs::Platform::LinuxOther => "linux-other",
+    }
+}
+
+/// `GET /api/v1/household/machines` — owner-authed list of the household's own
+/// machine certs (the base/self engine machine included). Same `PoP` gate as
+/// `snapshot` (`Operation::ClawsList`); a ±60s timestamp-tolerance gate, no
+/// nonce cache. Returns identity-only fields; NEVER any secret, signature, or
+/// native endpoint. Guest/no-auth → 401. Each cert is hh_id-filtered AND
+/// signature-verified against the household root before it is served, so a
+/// tampered/foreign cert file is never returned.
+pub async fn machines(
+    State(state): State<MachinesRouterState>,
+    method: Method,
+    uri: Uri,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let path_and_query = uri
+        .path_and_query()
+        .map_or_else(|| uri.path().to_string(), |pq| pq.as_str().to_string());
+    let Some(now) = time_util::unix_now_secs_checked("household.machines.clock") else {
+        return StatusCode::UNAUTHORIZED.into_response();
+    };
+    // Identical owner-auth gate to `snapshot`.
+    let Ok(owner_auth) = household_auth::authorize_request(
+        &state.household,
+        &headers,
+        &method,
+        &path_and_query,
+        &body,
+        household_rs::caveats::Operation::ClawsList,
+        now,
+    )
+    .await
+    else {
+        return StatusCode::UNAUTHORIZED.into_response();
+    };
+
+    // Household root pubkey + hh_id for per-cert verification. The loaded
+    // identity is the same source `authorize_request` verifies against.
+    let Some(identity) = state.household.current().await else {
+        return StatusCode::UNAUTHORIZED.into_response();
+    };
+    let hh_pub = &identity.record.hh_pub;
+    let expected_hh_id = &identity.record.hh_id;
+
+    let self_m_id = match household_rs::storage::read_self_m_id(&state.state_dir) {
+        Ok(opt) => opt,
+        Err(e) => {
+            tracing::warn!(stage = "household.machines.self_m_id_read_failed", error = %e);
+            None
+        }
+    };
+
+    let certs_dir = household_rs::storage::machine_certs_dir(&state.state_dir);
+    let mut machines: Vec<MachineEntry> = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(&certs_dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|s| s.to_str()) != Some("cbor") {
+                continue; // skip .staged / non-cert files
+            }
+            let cert: household_rs::MachineCert =
+                match household_rs::storage::read_optional_cbor(&path) {
+                    Ok(Some(c)) => c,
+                    Ok(None) => continue,
+                    Err(e) => {
+                        tracing::warn!(
+                            stage = "household.machines.cert_decode_failed",
+                            path = %path.display(),
+                            error = %e,
+                        );
+                        continue;
+                    }
+                };
+            // SECURITY: only serve certs that belong to THIS household AND
+            // verify under the household root key. Skip (fail-soft) otherwise.
+            if &cert.hh_id != expected_hh_id {
+                tracing::warn!(
+                    stage = "household.machines.cert_foreign_hh",
+                    path = %path.display(),
+                );
+                continue;
+            }
+            if cert.verify(hh_pub).is_err() {
+                tracing::warn!(
+                    stage = "household.machines.cert_verify_failed",
+                    path = %path.display(),
+                );
+                continue;
+            }
+            let m_id = cert.m_id.to_string();
+            let is_self = self_m_id.as_deref() == Some(m_id.as_str());
+            machines.push(MachineEntry {
+                machine_id: m_id,
+                machine_pub: hex::encode(cert.m_pub.as_bytes()),
+                host_label: cert.hostname.clone(),
+                platform: platform_str(&cert.platform),
+                is_self,
+                capabilities: vec!["engine", "pty", "clawsite"],
+                joined_at: cert.joined_at,
+            });
+        }
+    }
+    machines.sort_by(|a, b| {
+        b.is_self
+            .cmp(&a.is_self)
+            .then_with(|| a.machine_id.cmp(&b.machine_id))
+    });
+
+    tracing::info!(
+        stage = "household.machines.served",
+        hh_id = %owner_auth.hh_id,
+        count = machines.len(),
+        has_self = self_m_id.is_some(),
+    );
+
+    Json(MachinesResponse {
+        v: 1,
+        hh_id: owner_auth.hh_id.to_string(),
+        self_m_id,
+        machines,
     })
     .into_response()
 }
