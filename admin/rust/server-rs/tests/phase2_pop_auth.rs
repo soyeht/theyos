@@ -237,7 +237,8 @@ async fn machines_owner_auth_ok_returns_self_machine() {
         hex::encode(identity.cert.m_pub.as_bytes())
     );
     assert_eq!(self_entry["host_label"], "Mac Studio");
-    assert_eq!(self_entry["platform"], "macos");
+    let expected_platform = serde_json::to_value(&identity.cert.platform).unwrap();
+    assert_eq!(self_entry["platform"], expected_platform);
     assert_eq!(self_entry["joined_at"], identity.cert.joined_at);
     assert_eq!(
         self_entry["capabilities"],
