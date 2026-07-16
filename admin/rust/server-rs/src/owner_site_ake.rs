@@ -110,7 +110,13 @@ mod harness {
     use rand::{RngCore, rngs::OsRng};
     use serde::{Deserialize, Serialize, de::DeserializeOwned};
     use sha2::{Digest, Sha256};
-    use snow::{Builder, HandshakeState, params::NoiseParams};
+    use snow::{
+        Builder, HandshakeState,
+        params::{
+            BaseChoice, CipherChoice, DHChoice, HandshakeChoice, HandshakeModifierList,
+            HandshakePattern, HashChoice, NoiseParams,
+        },
+    };
     use zeroize::{Zeroize, Zeroizing};
 
     use super::{OwnerSiteAkeProvider, OwnerSiteResource, SocketAddr};
@@ -133,6 +139,10 @@ mod harness {
 
     const A2_DOMAIN: &str = "soyeht/owner-site/a2/v1";
     const A2_VERSION: u8 = 1;
+    const A2_NOISE_PROTOCOL_NAME: &str = "Noise_XXa2v1_25519_ChaChaPoly_SHA256";
+    const A2_NOISE_PROLOGUE_LABEL: &str = "noise-prologue";
+    const A2_RECORD_PROFILE: &str = "a2-record-v1";
+    const A2_CHANNEL_BINDING_LABEL: &str = "channel-binding";
     const A2_NETWORK_ID: &str = "owner-site-mesh";
     const A2_ENGINE_KEY_ID: &str = "engine:test.v1";
     const A2_NOW: u64 = 1_000;
@@ -258,6 +268,8 @@ mod harness {
                     expected_machine_key: self.expected_machine_key.clone(),
                     expected_engine_key_id: self.expected_engine_key_id.clone(),
                     action_pop_signatures: Arc::clone(&self.action_pop_signatures),
+                    h_final: None,
+                    channel_binding: None,
                 },
                 frame,
             ))
@@ -286,6 +298,8 @@ mod harness {
         expected_machine_key: P256PublicKey,
         expected_engine_key_id: String,
         action_pop_signatures: Arc<AtomicUsize>,
+        h_final: Option<[u8; 32]>,
+        channel_binding: Option<[u8; 32]>,
     }
 
     impl OwnerSiteAkeClientSession {
@@ -365,6 +379,10 @@ mod harness {
                 .write_message(&payload, &mut noise)
                 .map_err(|_| OwnerSiteAkeFailure::Rejected)?;
             noise.truncate(len);
+            let h_final = final_handshake_hash(&self.handshake)?;
+            let channel_binding = channel_binding(h_final, &m2.channel_id, m2.channel_epoch)?;
+            self.h_final = Some(h_final);
+            self.channel_binding = Some(channel_binding);
             encode_frame(AkeMessageKind::M3, noise)
         }
     }
@@ -754,6 +772,8 @@ mod harness {
                     claimed_binding_id,
                     generation,
                     proof: None,
+                    h_final: None,
+                    channel_binding: None,
                 },
                 frame,
             ))
@@ -796,6 +816,8 @@ mod harness {
         claimed_binding_id: OwnerSiteBindingId,
         generation: OwnerSiteAuthorityGeneration,
         proof: Option<ClientProof>,
+        h_final: Option<[u8; 32]>,
+        channel_binding: Option<[u8; 32]>,
     }
 
     impl OwnerSiteAkeResponderSession {
@@ -864,7 +886,12 @@ mod harness {
                 .effects
                 .challenge_claims
                 .fetch_add(1, Ordering::SeqCst);
+            let h_final = final_handshake_hash(&self.handshake)?;
+            let channel_binding =
+                channel_binding(h_final, &self.m2.channel_id, self.m2.channel_epoch)?;
             self.proof = Some(proof);
+            self.h_final = Some(h_final);
+            self.channel_binding = Some(channel_binding);
             Ok(())
         }
     }
@@ -985,84 +1012,80 @@ mod harness {
         action_pop: Vec<u8>,
     }
 
+    // Every transcript is a fixed-arity CBOR array.  Nested protocol objects
+    // enter the array only as bstr(canonical-CBOR(X)); none is structurally
+    // re-embedded into a signing hash.
     #[derive(Serialize)]
-    struct ServerAuthTranscript<'a> {
-        domain: &'a str,
-        label: &'a str,
-        c1: &'a ClientHello,
-        #[serde(with = "serde_bytes")]
-        engine_ephemeral: &'a [u8],
-        #[serde(with = "serde_bytes")]
-        engine_static: &'a [u8],
-        #[serde(with = "serde_bytes")]
-        machine_certificate_digest: &'a [u8],
-        engine_key_id: &'a str,
-        #[serde(with = "serde_bytes")]
-        channel_id: &'a [u8],
-        channel_epoch: u64,
-        #[serde(with = "serde_bytes")]
-        challenge_id: &'a [u8],
-        #[serde(with = "serde_bytes")]
-        challenge_secret: &'a [u8],
-        authz_epoch: u64,
-        #[serde(with = "serde_bytes")]
-        roster_digest: &'a [u8],
-        fresh_until: u64,
-    }
+    struct ServerAuthTranscript<'a>(
+        &'a str,
+        &'a str,
+        #[serde(with = "serde_bytes")] &'a [u8],
+        #[serde(with = "serde_bytes")] &'a [u8],
+        #[serde(with = "serde_bytes")] &'a [u8],
+        #[serde(with = "serde_bytes")] &'a [u8],
+        &'a str,
+        #[serde(with = "serde_bytes")] &'a [u8],
+        u64,
+        #[serde(with = "serde_bytes")] &'a [u8],
+        #[serde(with = "serde_bytes")] &'a [u8],
+        u64,
+        #[serde(with = "serde_bytes")] &'a [u8],
+        u64,
+    );
 
     #[derive(Serialize)]
-    struct PopBindingTranscript<'a> {
-        domain: &'a str,
-        label: &'a str,
-        #[serde(with = "serde_bytes")]
-        t1: &'a [u8],
-        #[serde(with = "serde_bytes")]
-        device_static: &'a [u8],
-    }
+    struct PopBindingTranscript<'a>(
+        &'a str,
+        &'a str,
+        #[serde(with = "serde_bytes")] &'a [u8],
+        #[serde(with = "serde_bytes")] &'a [u8],
+    );
 
     #[derive(Serialize)]
-    struct DeviceAuthTranscript<'a> {
-        domain: &'a str,
-        label: &'a str,
-        #[serde(with = "serde_bytes")]
-        channel_binding_pre: &'a [u8],
-        #[serde(with = "serde_bytes")]
-        binding_id: &'a [u8],
-        #[serde(with = "serde_bytes")]
-        binding_digest: &'a [u8],
-        participant_npub: &'a str,
-        channel_auth_key_id: &'a str,
-    }
+    struct DeviceAuthTranscript<'a>(
+        &'a str,
+        &'a str,
+        #[serde(with = "serde_bytes")] &'a [u8],
+        #[serde(with = "serde_bytes")] &'a [u8],
+        #[serde(with = "serde_bytes")] &'a [u8],
+        &'a str,
+        &'a str,
+    );
 
     #[derive(Serialize)]
-    struct OwnerActionTranscript<'a> {
-        domain: &'a str,
-        label: &'a str,
-        #[serde(with = "serde_bytes")]
-        channel_binding_pre: &'a [u8],
-        #[serde(with = "serde_bytes")]
-        channel_id: &'a [u8],
-        channel_epoch: u64,
-        #[serde(with = "serde_bytes")]
-        challenge_id: &'a [u8],
-        #[serde(with = "serde_bytes")]
-        challenge_secret: &'a [u8],
-        household_id: &'a str,
-        network_id: &'a str,
-        engine_key_id: &'a str,
-        #[serde(with = "serde_bytes")]
-        binding_id: &'a [u8],
-        #[serde(with = "serde_bytes")]
-        binding_digest: &'a [u8],
-        participant_npub: &'a str,
-        route: &'a str,
-        resource: &'a str,
-        intent: &'a CanonicalIntent,
-        authz_epoch: u64,
-        #[serde(with = "serde_bytes")]
-        roster_digest: &'a [u8],
-        fresh_until: u64,
-    }
+    struct OwnerActionTranscript<'a>(
+        &'a str,
+        &'a str,
+        #[serde(with = "serde_bytes")] &'a [u8],
+        #[serde(with = "serde_bytes")] &'a [u8],
+        u64,
+        #[serde(with = "serde_bytes")] &'a [u8],
+        #[serde(with = "serde_bytes")] &'a [u8],
+        &'a str,
+        &'a str,
+        &'a str,
+        #[serde(with = "serde_bytes")] &'a [u8],
+        #[serde(with = "serde_bytes")] &'a [u8],
+        &'a str,
+        &'a str,
+        &'a str,
+        #[serde(with = "serde_bytes")] &'a [u8],
+        u64,
+        #[serde(with = "serde_bytes")] &'a [u8],
+        u64,
+    );
+
+    #[derive(Serialize)]
+    struct ChannelBindingTranscript<'a>(
+        &'a str,
+        &'a str,
+        u8,
+        &'a str,
+        &'a str,
+        #[serde(with = "serde_bytes")] &'a [u8],
+        #[serde(with = "serde_bytes")] &'a [u8],
+        u64,
+    );
 
     fn encode_frame(kind: AkeMessageKind, noise: Vec<u8>) -> AkeResult<Vec<u8>> {
         if noise.is_empty() || noise.len() > MAX_A2_FRAME_BYTES {
@@ -1107,13 +1130,38 @@ mod harness {
     }
 
     fn noise_params() -> AkeResult<NoiseParams> {
-        "Noise_XX_25519_ChaChaPoly_SHA256"
-            .parse()
+        Ok(NoiseParams::new(
+            A2_NOISE_PROTOCOL_NAME.to_owned(),
+            BaseChoice::Noise,
+            HandshakeChoice {
+                pattern: HandshakePattern::XX,
+                modifiers: HandshakeModifierList { list: Vec::new() },
+            },
+            DHChoice::Curve25519,
+            CipherChoice::ChaChaPoly,
+            HashChoice::SHA256,
+        ))
+    }
+
+    fn a2_noise_prologue() -> AkeResult<Vec<u8>> {
+        encode_canonical(&(
+            A2_DOMAIN,
+            A2_NOISE_PROLOGUE_LABEL,
+            A2_VERSION,
+            A2_RECORD_PROFILE,
+            A2_NOISE_PROTOCOL_NAME,
+        ))
+    }
+
+    fn a2_noise_builder<'a>(prologue: &'a [u8]) -> AkeResult<Builder<'a>> {
+        Builder::new(noise_params()?)
+            .prologue(prologue)
             .map_err(|_| OwnerSiteAkeFailure::Rejected)
     }
 
     fn new_noise_initiator() -> AkeResult<(HandshakeState, [u8; NOISE_PUBLIC_KEY_BYTES])> {
-        let builder = Builder::new(noise_params()?);
+        let prologue = a2_noise_prologue()?;
+        let builder = a2_noise_builder(&prologue)?;
         let mut keypair = builder
             .generate_keypair()
             .map_err(|_| OwnerSiteAkeFailure::Rejected)?;
@@ -1145,7 +1193,8 @@ mod harness {
         static_private: &[u8],
         ephemeral_private: &[u8],
     ) -> AkeResult<HandshakeState> {
-        Builder::new(noise_params()?)
+        let prologue = a2_noise_prologue()?;
+        a2_noise_builder(&prologue)?
             .local_private_key(static_private)
             .map_err(|_| OwnerSiteAkeFailure::Rejected)?
             .fixed_ephemeral_key_for_testing_only(ephemeral_private)
@@ -1177,6 +1226,33 @@ mod harness {
 
     fn sha256(bytes: &[u8]) -> [u8; 32] {
         Sha256::digest(bytes).into()
+    }
+
+    fn final_handshake_hash(handshake: &HandshakeState) -> AkeResult<[u8; 32]> {
+        if !handshake.is_handshake_finished() {
+            return Err(OwnerSiteAkeFailure::Rejected);
+        }
+        array_32(handshake.get_handshake_hash())
+    }
+
+    fn channel_binding(
+        h_final: [u8; 32],
+        channel_id: &[u8],
+        channel_epoch: u64,
+    ) -> AkeResult<[u8; 32]> {
+        if channel_id.len() != OWNER_SITE_CHALLENGE_BYTES || channel_epoch == 0 {
+            return Err(OwnerSiteAkeFailure::Rejected);
+        }
+        hash_canonical(&ChannelBindingTranscript(
+            A2_DOMAIN,
+            A2_CHANNEL_BINDING_LABEL,
+            A2_VERSION,
+            A2_RECORD_PROFILE,
+            A2_NOISE_PROTOCOL_NAME,
+            &h_final,
+            channel_id,
+            channel_epoch,
+        ))
     }
 
     fn random_32() -> [u8; 32] {
@@ -1222,31 +1298,32 @@ mod harness {
         m2: &ServerHello,
     ) -> AkeResult<[u8; 32]> {
         validate_server_hello_lengths(m2)?;
-        hash_canonical(&ServerAuthTranscript {
-            domain: A2_DOMAIN,
-            label: "server-auth",
-            c1,
-            engine_ephemeral: &engine_ephemeral,
-            engine_static: &engine_static,
-            machine_certificate_digest: &machine_certificate_digest,
-            engine_key_id: &m2.engine_key_id,
-            channel_id: &m2.channel_id,
-            channel_epoch: m2.channel_epoch,
-            challenge_id: &m2.challenge_id,
-            challenge_secret: &m2.challenge_secret,
-            authz_epoch: m2.authz_epoch,
-            roster_digest: &m2.roster_digest,
-            fresh_until: m2.fresh_until,
-        })
+        let c1_wire = encode_canonical(c1)?;
+        hash_canonical(&ServerAuthTranscript(
+            A2_DOMAIN,
+            "server-auth",
+            &c1_wire,
+            &engine_ephemeral,
+            &engine_static,
+            &machine_certificate_digest,
+            &m2.engine_key_id,
+            &m2.channel_id,
+            m2.channel_epoch,
+            &m2.challenge_id,
+            &m2.challenge_secret,
+            m2.authz_epoch,
+            &m2.roster_digest,
+            m2.fresh_until,
+        ))
     }
 
     fn pop_binding_pre(t1: [u8; 32], device_static: [u8; 32]) -> AkeResult<[u8; 32]> {
-        hash_canonical(&PopBindingTranscript {
-            domain: A2_DOMAIN,
-            label: "pop-binding",
-            t1: &t1,
-            device_static: &device_static,
-        })
+        hash_canonical(&PopBindingTranscript(
+            A2_DOMAIN,
+            "pop-binding",
+            &t1,
+            &device_static,
+        ))
     }
 
     fn device_auth_hash(
@@ -1256,15 +1333,15 @@ mod harness {
         participant_npub: &str,
         channel_auth_key_id: &OwnerSiteChannelAuthKeyId,
     ) -> AkeResult<[u8; 32]> {
-        hash_canonical(&DeviceAuthTranscript {
-            domain: A2_DOMAIN,
-            label: "D-auth",
-            channel_binding_pre: &channel_binding_pre,
-            binding_id: binding_id.as_bytes(),
-            binding_digest: binding_digest.as_bytes(),
+        hash_canonical(&DeviceAuthTranscript(
+            A2_DOMAIN,
+            "D-auth",
+            &channel_binding_pre,
+            binding_id.as_bytes(),
+            binding_digest.as_bytes(),
             participant_npub,
-            channel_auth_key_id: channel_auth_key_id.as_str(),
-        })
+            channel_auth_key_id.as_str(),
+        ))
     }
 
     fn owner_action_hash(
@@ -1275,27 +1352,28 @@ mod harness {
         binding_digest: OwnerSiteBindingDigest,
         participant_npub: &str,
     ) -> AkeResult<[u8; 32]> {
-        hash_canonical(&OwnerActionTranscript {
-            domain: A2_DOMAIN,
-            label: "owner-action",
-            channel_binding_pre: &channel_binding_pre,
-            channel_id: &m2.channel_id,
-            channel_epoch: m2.channel_epoch,
-            challenge_id: &m2.challenge_id,
-            challenge_secret: &m2.challenge_secret,
-            household_id: &c1.household_id,
-            network_id: &c1.network_id,
-            engine_key_id: &m2.engine_key_id,
-            binding_id: binding_id.as_bytes(),
-            binding_digest: binding_digest.as_bytes(),
+        let intent_wire = encode_canonical(&c1.intent)?;
+        hash_canonical(&OwnerActionTranscript(
+            A2_DOMAIN,
+            "owner-action",
+            &channel_binding_pre,
+            &m2.channel_id,
+            m2.channel_epoch,
+            &m2.challenge_id,
+            &m2.challenge_secret,
+            &c1.household_id,
+            &c1.network_id,
+            &m2.engine_key_id,
+            binding_id.as_bytes(),
+            binding_digest.as_bytes(),
             participant_npub,
-            route: &c1.route,
-            resource: &c1.resource,
-            intent: &c1.intent,
-            authz_epoch: m2.authz_epoch,
-            roster_digest: &m2.roster_digest,
-            fresh_until: m2.fresh_until,
-        })
+            &c1.route,
+            &c1.resource,
+            &intent_wire,
+            m2.authz_epoch,
+            &m2.roster_digest,
+            m2.fresh_until,
+        ))
     }
 
     fn hash_canonical<T: Serialize>(value: &T) -> AkeResult<[u8; 32]> {
@@ -1324,6 +1402,10 @@ mod harness {
             assert_eq!(server.accept_m3(&harness, &m3), Ok(()));
             assert!(harness.recheck_after_claim(&server));
             assert_eq!(fixture.client.action_pop_signature_count(), 1);
+            assert_eq!(client.h_final, server.h_final);
+            assert_eq!(client.channel_binding, server.channel_binding);
+            assert!(server.h_final.is_some());
+            assert!(server.channel_binding.is_some());
             assert_eq!(
                 fixture.effects.snapshot(),
                 OwnerSiteAkeEffectSnapshot {
@@ -1339,6 +1421,172 @@ mod harness {
                 }
             );
             assert!(server.handshake.is_handshake_finished());
+        }
+
+        #[test]
+        fn a2_r1_pretransport_kat_matches_normative_noise_and_binding_bytes() {
+            const P_A2_HEX: &str = "8577736f796568742f6f776e65722d736974652f61322f76316e6e6f6973652d70726f6c6f677565016c61322d7265636f72642d763178244e6f6973655f5858613276315f32353531395f436861436861506f6c795f534841323536";
+            const M1_NOISE_HEX: &str = "052a50773ac8d91773f2dc9662e12f0defe915e415b8a1c8e20a5a3d6ab2b8438377736f796568742f6f776e65722d736974652f61322f7631016a666978747572652d6d31";
+            const M2_NOISE_HEX: &str = "0faa684ed28867b97f4a6a2dee5df8ce974e76b7018e3f22a1c4cf2678570f20cba67692feaaaa374507da9dbdc7300a30fc44f6eaa630956e9c8484be9e98f4ddc176bcfbe2234bf522b19a9273392ca5e63e223895bcd36e89a116d98c933030a7d83465e13bea9663c2f834809b69aeabefd469568a7deb99fb95d3af93f8c70c3a2d9b";
+            const M3_NOISE_HEX: &str = "a1a85eacaa43f76774868e50e96ee8274a6d396adc86e6bf8f2a107f376d2daea8097fdbaf77e360bbceeaa7a3925a729a964f79e8f37079e8b8407ac849fe5b349774fcac9af8636b66c6f1756ec3e9dc5ea354bd16434650c649c45992dc2f1bdd49b61c";
+            const H_FINAL_HEX: &str =
+                "eddd205a011fe812db52153cf09ab4bb3c7d607a3ae68008fd453494abf8b722";
+            const CHANNEL_BINDING_HEX: &str =
+                "5ed521ad95402b2b0ee18f13a8035f1800afe84184d70529e63780fc67cbe13f";
+            const PROTOCOL_NAME_HEX: &str =
+                "4e6f6973655f5858613276315f32353531395f436861436861506f6c795f534841323536";
+
+            let params = noise_params().expect("fixed A2-R1 Noise parameters");
+            assert_eq!(params.name, A2_NOISE_PROTOCOL_NAME);
+            assert_eq!(hex::encode(A2_NOISE_PROTOCOL_NAME), PROTOCOL_NAME_HEX);
+            let prologue = a2_noise_prologue().expect("canonical P_A2");
+            assert_eq!(hex::encode(&prologue), P_A2_HEX);
+
+            let mut device = a2_noise_builder(&prologue)
+                .expect("device A2-R1 builder")
+                .local_private_key(&[0x11; 32])
+                .expect("device static")
+                .fixed_ephemeral_key_for_testing_only(&[0x12; 32])
+                .build_initiator()
+                .expect("device initiator");
+            let mut engine = a2_noise_builder(&prologue)
+                .expect("engine A2-R1 builder")
+                .local_private_key(&[0x21; 32])
+                .expect("engine static")
+                .fixed_ephemeral_key_for_testing_only(&[0x22; 32])
+                .build_responder()
+                .expect("engine responder");
+
+            let m1_payload = encode_canonical(&(A2_DOMAIN, A2_VERSION, "fixture-m1"))
+                .expect("canonical M1 fixture payload");
+            let m2_payload = encode_canonical(&(A2_DOMAIN, A2_VERSION, "fixture-m2"))
+                .expect("canonical M2 fixture payload");
+            let m3_payload = encode_canonical(&(A2_DOMAIN, A2_VERSION, "fixture-m3"))
+                .expect("canonical M3 fixture payload");
+
+            let mut m1 = vec![0u8; MAX_A2_FRAME_BYTES];
+            let m1_len = device
+                .write_message(&m1_payload, &mut m1)
+                .expect("M1 Noise write");
+            m1.truncate(m1_len);
+            assert_eq!(hex::encode(&m1), M1_NOISE_HEX);
+            let mut plaintext = vec![0u8; MAX_A2_FRAME_BYTES];
+            let m1_plaintext = engine
+                .read_message(&m1, &mut plaintext)
+                .expect("M1 Noise read");
+            assert_eq!(&plaintext[..m1_plaintext], m1_payload);
+
+            let mut m2 = vec![0u8; MAX_A2_FRAME_BYTES];
+            let m2_len = engine
+                .write_message(&m2_payload, &mut m2)
+                .expect("M2 Noise write");
+            m2.truncate(m2_len);
+            assert_eq!(hex::encode(&m2), M2_NOISE_HEX);
+            let m2_plaintext = device
+                .read_message(&m2, &mut plaintext)
+                .expect("M2 Noise read");
+            assert_eq!(&plaintext[..m2_plaintext], m2_payload);
+
+            let mut m3 = vec![0u8; MAX_A2_FRAME_BYTES];
+            let m3_len = device
+                .write_message(&m3_payload, &mut m3)
+                .expect("M3 Noise write");
+            m3.truncate(m3_len);
+            assert_eq!(hex::encode(&m3), M3_NOISE_HEX);
+            let m3_plaintext = engine
+                .read_message(&m3, &mut plaintext)
+                .expect("M3 Noise read");
+            assert_eq!(&plaintext[..m3_plaintext], m3_payload);
+
+            assert!(device.is_handshake_finished());
+            assert!(engine.is_handshake_finished());
+            let h_final_device = final_handshake_hash(&device).expect("device H_final");
+            let h_final_engine = final_handshake_hash(&engine).expect("engine H_final");
+            assert_eq!(h_final_device, h_final_engine);
+            assert_eq!(hex::encode(h_final_device), H_FINAL_HEX);
+            let channel_binding =
+                channel_binding(h_final_engine, &[0x10; 32], 7).expect("A2 channel binding");
+            assert_eq!(hex::encode(channel_binding), CHANNEL_BINDING_HEX);
+        }
+
+        #[test]
+        fn a2_r1_prologue_swap_fails_before_an_authenticated_m3() {
+            let prologue = a2_noise_prologue().expect("canonical P_A2");
+            let mut altered_prologue = prologue.clone();
+            altered_prologue[0] ^= 1;
+            let mut device = a2_noise_builder(&prologue)
+                .expect("device builder")
+                .local_private_key(&[0x11; 32])
+                .expect("device static")
+                .fixed_ephemeral_key_for_testing_only(&[0x12; 32])
+                .build_initiator()
+                .expect("device initiator");
+            let mut wrong_engine = a2_noise_builder(&altered_prologue)
+                .expect("wrong-prologue builder")
+                .local_private_key(&[0x21; 32])
+                .expect("engine static")
+                .fixed_ephemeral_key_for_testing_only(&[0x22; 32])
+                .build_responder()
+                .expect("engine responder");
+            let payload = encode_canonical(&(A2_DOMAIN, A2_VERSION, "fixture-m1"))
+                .expect("canonical payload");
+            let mut m1 = vec![0u8; MAX_A2_FRAME_BYTES];
+            let m1_len = device.write_message(&payload, &mut m1).expect("M1 write");
+            m1.truncate(m1_len);
+            let mut plaintext = vec![0u8; MAX_A2_FRAME_BYTES];
+            assert!(wrong_engine.read_message(&m1, &mut plaintext).is_ok());
+            let mut m2 = vec![0u8; MAX_A2_FRAME_BYTES];
+            let m2_len = wrong_engine.write_message(&[], &mut m2).expect("M2 write");
+            m2.truncate(m2_len);
+            assert!(
+                device.read_message(&m2, &mut plaintext).is_err(),
+                "the fixed P_A2 must be mixed before an authenticated M2"
+            );
+        }
+
+        #[test]
+        fn a2_r1_profile_name_swap_fails_before_an_authenticated_m3() {
+            let prologue = a2_noise_prologue().expect("canonical P_A2");
+            let mut device = a2_noise_builder(&prologue)
+                .expect("device builder")
+                .local_private_key(&[0x11; 32])
+                .expect("device static")
+                .fixed_ephemeral_key_for_testing_only(&[0x12; 32])
+                .build_initiator()
+                .expect("device initiator");
+            let wrong_params = NoiseParams::new(
+                "Noise_XXa2v0_25519_ChaChaPoly_SHA256".to_owned(),
+                BaseChoice::Noise,
+                HandshakeChoice {
+                    pattern: HandshakePattern::XX,
+                    modifiers: HandshakeModifierList { list: Vec::new() },
+                },
+                DHChoice::Curve25519,
+                CipherChoice::ChaChaPoly,
+                HashChoice::SHA256,
+            );
+            let mut wrong_engine = Builder::new(wrong_params)
+                .prologue(&prologue)
+                .expect("wrong-profile prologue")
+                .local_private_key(&[0x21; 32])
+                .expect("engine static")
+                .fixed_ephemeral_key_for_testing_only(&[0x22; 32])
+                .build_responder()
+                .expect("engine responder");
+            let payload = encode_canonical(&(A2_DOMAIN, A2_VERSION, "fixture-m1"))
+                .expect("canonical payload");
+            let mut m1 = vec![0u8; MAX_A2_FRAME_BYTES];
+            let m1_len = device.write_message(&payload, &mut m1).expect("M1 write");
+            m1.truncate(m1_len);
+            let mut plaintext = vec![0u8; MAX_A2_FRAME_BYTES];
+            assert!(wrong_engine.read_message(&m1, &mut plaintext).is_ok());
+            let mut m2 = vec![0u8; MAX_A2_FRAME_BYTES];
+            let m2_len = wrong_engine.write_message(&[], &mut m2).expect("M2 write");
+            m2.truncate(m2_len);
+            assert!(
+                device.read_message(&m2, &mut plaintext).is_err(),
+                "the fixed A2-R1 protocol name must be mixed before an authenticated M2"
+            );
         }
 
         #[test]

@@ -332,7 +332,14 @@ fn owner_site_ake_route_is_single_ws_and_stays_pending_without_finished_ack() {
         );
     }
     for required in [
-        "Noise_XX_25519_ChaChaPoly_SHA256",
+        "Noise_XXa2v1_25519_ChaChaPoly_SHA256",
+        "NoiseParams::new(",
+        "a2_noise_prologue",
+        "a2_noise_builder",
+        "bstr(canonical-CBOR(X))",
+        "a2_r1_pretransport_kat_matches_normative_noise_and_binding_bytes",
+        "a2_r1_prologue_swap_fails_before_an_authenticated_m3",
+        "a2_r1_profile_name_swap_fails_before_an_authenticated_m3",
         "soyeht/owner-site/a2/v1",
         "validated pending Finished",
         "claim_after_verified_pop_for_harness",
@@ -343,6 +350,10 @@ fn owner_site_ake_route_is_single_ws_and_stays_pending_without_finished_ack() {
     ] {
         assert!(ake.contains(required), "A2 source must retain `{required}`");
     }
+    assert!(
+        !ake.contains("\"Noise_XX_25519_ChaChaPoly_SHA256\""),
+        "A2 must not silently accept the unprofiled XX protocol name"
+    );
     for forbidden in [
         "struct VerifiedMeshPeer",
         "enum VerifiedMeshPeer",
