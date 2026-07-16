@@ -20,6 +20,11 @@ const HANDLERS_OWNER_EVENTS: &str = include_str!("../src/handlers_owner_events.r
 enum Gate {
     /// PoP-gated: the handler must call `authorize(...)` with this `Operation`.
     Pop(&'static str),
+    /// PoP-gated and additionally requires the shared post-trust peer gate.
+    PopAndPeer {
+        operation: &'static str,
+        peer_gate: &'static str,
+    },
     /// Intentionally NOT a `PoP`-`Operation` caveat — gated by a different,
     /// documented mechanism (this marker substring must be present in the body).
     NonPop(&'static str),
@@ -74,7 +79,10 @@ const HOUSEHOLD_CLAWS_GATES: &[(&str, Gate)] = &[
     ),
     (
         "handle_household_mint_attach_token",
-        Gate::Pop("Operation::ClawsUse"),
+        Gate::PopAndPeer {
+            operation: "Operation::ClawsUse",
+            peer_gate: "terminal_attach_peer_rejection(peer_addr(peer), \"mint_attach_token\").await",
+        },
     ),
     (
         "handle_household_stop_instance",
@@ -92,13 +100,14 @@ const HOUSEHOLD_CLAWS_GATES: &[(&str, Gate)] = &[
         "handle_household_delete_instance",
         Gate::Pop("Operation::ClawsDelete"),
     ),
-    // Non-PoP: the WebSocket terminal PTY upgrade is gated by a peer-address
-    // allowlist + a single-use attach token (minted by
+    // Non-PoP: the WebSocket terminal PTY upgrade is gated by the shared live
+    // exposure/Ready-state peer gate (loopback/Tailnet or verified Mesh) + a
+    // single-use attach token (minted by
     // `handle_household_mint_attach_token`, which IS `ClawsUse`-gated).
     // Intentionally not a PoP-`Operation` caveat.
     (
         "handle_household_terminal_pty",
-        Gate::NonPop("is_terminal_attach_peer_allowed"),
+        Gate::NonPop("terminal_attach_peer_rejection(peer_addr(peer), \"terminal_pty\").await"),
     ),
 ];
 
@@ -157,6 +166,25 @@ fn every_household_claws_handler_enforces_its_caveat() {
                 body.contains("authorize(") && body.contains(op),
                 "{handler} must PoP-authorize {op}"
             ),
+            Gate::PopAndPeer {
+                operation,
+                peer_gate,
+            } => {
+                assert!(
+                    body.contains("authorize(")
+                        && body.contains(operation)
+                        && body.contains(peer_gate),
+                    "{handler} must PoP-authorize {operation} and enforce its shared peer gate `{peer_gate}`"
+                );
+                assert!(
+                    body.find(peer_gate)
+                        .expect("peer gate must be present after assertion")
+                        < body
+                            .find("authorize(")
+                            .expect("PoP authorization must be present after assertion"),
+                    "{handler} must reject the peer before PoP authorization"
+                );
+            }
             Gate::NonPop(marker) => assert!(
                 body.contains(marker),
                 "{handler} must enforce its documented non-PoP gate `{marker}`"

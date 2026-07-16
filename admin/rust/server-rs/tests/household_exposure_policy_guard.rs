@@ -110,9 +110,107 @@ fn bonjour_publishers_filter_targets_through_exposure_policy() {
 fn post_trust_terminal_peer_gate_uses_the_shared_mesh_policy() {
     let claws_source = read_src("handlers_household_claws.rs");
     assert!(
-        claws_source.contains("crate::household_listener::is_post_trust_household_peer_allowed"),
+        claws_source.contains("crate::household_listener::post_trust_household_peer_gate"),
         "terminal attach must share the opt-in mesh peer gate before its existing PoP check"
     );
+    for route_gate in [
+        "terminal_attach_peer_rejection(peer_addr(peer), \"mint_attach_token\").await",
+        "terminal_attach_peer_rejection(peer_addr(peer), \"terminal_pty\").await",
+    ] {
+        assert!(
+            claws_source.contains(route_gate),
+            "each mesh-sensitive terminal route must use the shared peer gate: {route_gate}"
+        );
+    }
+
+    let mint_handler = slice_between(
+        &claws_source,
+        "pub async fn handle_household_mint_attach_token",
+        "\n/// Upgrades a household terminal WebSocket",
+    );
+    assert!(
+        mint_handler
+            .find("terminal_attach_peer_rejection")
+            .expect("mint handler must call the shared peer gate")
+            < mint_handler
+                .find("let authorized")
+                .expect("mint handler must retain its PoP authorization"),
+        "mint must reject the peer before PoP authorization or attach-token effects"
+    );
+
+    let pty_handler = slice_between(
+        &claws_source,
+        "pub async fn handle_household_terminal_pty",
+        "\n/// `PoP`-gates stopping a household-scoped instance",
+    );
+    assert!(
+        pty_handler
+            .find("terminal_attach_peer_rejection")
+            .expect("PTY handler must call the shared peer gate")
+            < pty_handler
+                .rfind("household_terminal_pty")
+                .expect("PTY handler must retain attach-token redemption"),
+        "PTY must reject the peer before attach-token redemption"
+    );
+
+    let listener = read_src("household_listener.rs");
+    let production_gate = slice_between(
+        &listener,
+        "pub(crate) async fn is_post_trust_household_peer_allowed",
+        "\n/// Apply the shared Ready-state source policy",
+    );
+    for required in [
+        "crate::household_bootstrap::global_bootstrap_state()",
+        "bootstrap.read().await",
+        "BootstrapState::Uninitialized",
+    ] {
+        assert!(
+            production_gate.contains(required),
+            "production terminal peer gate must consume the live exposure state: {required}"
+        );
+    }
+    let classified_peer_gate = slice_between(
+        &listener,
+        "fn is_post_trust_household_peer_allowed_with_context",
+        "\nfn is_lan",
+    );
+    assert!(
+        classified_peer_gate.contains("HouseholdExposurePolicy::allows_terminal_attach_peer"),
+        "the live terminal peer state must be evaluated by the shared exposure policy"
+    );
+}
+
+#[test]
+fn mesh_exposure_requires_typed_configuration_verified_ownership_and_prebind_trace() {
+    let listener = read_src("household_listener.rs");
+    for term in [
+        "enum MeshExposureConfig",
+        "enum LocalAddressOwnership",
+        "VerifiedMesh",
+        "struct HouseholdListenerContext",
+        "trait BindAttemptObserver: Send",
+        "fn plan_listener_reconciliation",
+        "observer.before_bind(*attempt)",
+        "MeshExposureInput::from_env()",
+        "quarantined_subnet",
+        "run_post_trust_household_peer_gate",
+    ] {
+        assert!(
+            listener.contains(term),
+            "mesh exposure hardening must retain `{term}`"
+        );
+    }
+    for forbidden in [
+        "configured_mesh_subnet",
+        "classify_with_mesh_subnet",
+        "is_mesh_ip_with_subnet",
+        "ipv4_cidr_contains",
+    ] {
+        assert!(
+            !listener.contains(forbidden),
+            "raw CIDR helper `{forbidden}` must not regain release authority"
+        );
+    }
 }
 
 #[test]
@@ -121,7 +219,12 @@ fn ready_posture_doc_matches_plain_http_listener_contract() {
     for term in [
         "HTTP plaintext",
         "no TLS/rustls",
-        "Ready invariant is loopback + Tailnet only",
+        "Ready invariant is loopback + Tailnet + verified Mesh",
+        "`THEYOS_MESH_SUBNET` is only a validated input",
+        "verified Mesh-interface ownership fact",
+        "must not advertise Mesh addresses through LAN mDNS",
+        "literal `ready`",
+        "before PoP, minting, or token consumption",
         "LAN is only",
         "for onboarding and pre-household discovery",
         "Wildcard binds remain prohibited",

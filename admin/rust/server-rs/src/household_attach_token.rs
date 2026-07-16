@@ -98,6 +98,18 @@ impl HouseholdAttachTokenStore {
         Some(entry.scope)
     }
 
+    /// Number of currently redeemable tokens, without exposing their values.
+    ///
+    /// This is deliberately suitable for route-level health and regression
+    /// checks: a rejected request must not increase this count.
+    #[must_use]
+    pub fn pending_count(&self) -> usize {
+        let now = Instant::now();
+        let mut guard = self.lock_entries();
+        cleanup_expired(&mut guard, now);
+        guard.len()
+    }
+
     fn lock_entries(
         &self,
     ) -> std::sync::MutexGuard<'_, HashMap<String, HouseholdAttachTokenEntry>> {

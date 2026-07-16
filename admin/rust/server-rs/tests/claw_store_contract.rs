@@ -48,6 +48,18 @@ fn handler_body<'a>(source: &'a str, handler: &str) -> &'a str {
     &rest[..end]
 }
 
+fn terminal_peer_rejection_body(source: &str) -> &str {
+    let marker = "async fn terminal_attach_peer_rejection";
+    let start = source
+        .find(marker)
+        .expect("terminal peer rejection helper must exist");
+    let rest = &source[start..];
+    let end = rest
+        .find("\nasync fn household_list_workspaces")
+        .expect("terminal peer rejection helper must end before workspace helpers");
+    &rest[..end]
+}
+
 #[test]
 fn household_claw_contract_routes_are_mounted_with_declared_handlers() {
     let contract = contract();
@@ -96,6 +108,11 @@ fn household_claw_contract_handlers_require_declared_auth() {
         contract.attach_token_header.to_ascii_lowercase(),
         "x-soyeht-household-attach-token"
     );
+    assert!(
+        terminal_peer_rejection_body(handlers)
+            .contains("post_trust_household_peer_gate(peer).await"),
+        "terminal peer rejection must delegate to the shared live exposure gate"
+    );
 
     for route in &contract.routes {
         let body = handler_body(handlers, &route.handler);
@@ -128,9 +145,35 @@ fn household_claw_contract_handlers_require_declared_auth() {
         }
 
         if route.peer_guard {
+            let expected_gate = match route.handler.as_str() {
+                "handle_household_mint_attach_token" => {
+                    "terminal_attach_peer_rejection(peer_addr(peer), \"mint_attach_token\").await"
+                }
+                "handle_household_terminal_pty" => {
+                    "terminal_attach_peer_rejection(peer_addr(peer), \"terminal_pty\").await"
+                }
+                handler => panic!("unexpected peer-gated household handler: {handler}"),
+            };
             assert!(
-                body.contains("is_terminal_attach_peer_allowed"),
-                "{} must keep the peer guard",
+                body.contains(expected_gate),
+                "{} must keep its declared shared peer gate",
+                route.handler
+            );
+            let gate_index = body
+                .find(expected_gate)
+                .expect("declared peer gate must be present after assertion");
+            let first_effect_index = match route.handler.as_str() {
+                "handle_household_mint_attach_token" => body
+                    .find("let authorized")
+                    .expect("mint handler must retain PoP authorization"),
+                "handle_household_terminal_pty" => body
+                    .rfind("household_terminal_pty")
+                    .expect("PTY handler must retain attach-token redemption"),
+                handler => panic!("unexpected peer-gated household handler: {handler}"),
+            };
+            assert!(
+                gate_index < first_effect_index,
+                "{} must reject the peer before its authorization or attach-token effect",
                 route.handler
             );
         }

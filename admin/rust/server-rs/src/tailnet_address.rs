@@ -251,11 +251,9 @@ mod tests {
     #[test]
     fn no_experimental_transport_bleed_in_household_sources() {
         let crate_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
-        let relative_paths = [
+        let ordinary_household_paths = [
             "src/handlers_household_claws.rs",
-            "src/household_listener.rs",
             "src/tailnet_address.rs",
-            "tests/household_instances.rs",
             "tests/claim_setup_invitation_contract.rs",
         ];
         let forbidden_tokens = [
@@ -268,7 +266,11 @@ mod tests {
             ["mesh_", "peer"].concat(),
         ];
 
-        for relative_path in relative_paths {
+        // The ordinary household/route sources remain entirely transport-free.
+        // Mesh classification is deliberately confined to household_listener;
+        // route handlers delegate to its shared gate rather than growing a
+        // second transport authority of their own.
+        for relative_path in ordinary_household_paths {
             let source = std::fs::read_to_string(crate_root.join(relative_path))
                 .unwrap_or_else(|e| panic!("read {relative_path}: {e}"));
             for token in &forbidden_tokens {
@@ -277,6 +279,124 @@ mod tests {
                     "{relative_path} must not reintroduce {token}"
                 );
             }
+        }
+
+        let listener_path = "src/household_listener.rs";
+        let listener = std::fs::read_to_string(crate_root.join(listener_path))
+            .unwrap_or_else(|e| panic!("read {listener_path}: {e}"));
+        for required in [
+            "struct TrustedMeshSubnet",
+            "LocalAddressOwnership::VerifiedMesh",
+            "HouseholdExposurePolicy::allows_terminal_attach_peer",
+            "post_trust_household_peer_gate",
+        ] {
+            assert!(
+                listener.contains(required),
+                "{listener_path} must keep its typed, shared mesh-exposure boundary: {required}"
+            );
+        }
+        // The listener may classify an explicitly reviewed allocation, but it
+        // must remain a bind/exposure boundary rather than acquiring a mesh
+        // runtime, peer management, or guest/share authorization path.
+        for forbidden in [
+            ["n", "vpn"].concat(),
+            ["mesh", "_rs"].concat(),
+            "MeshSupervisor".to_owned(),
+            "THEYOS_MESH_ENABLED".to_owned(),
+            "THEYOS_CLAW_DATA_TUNNEL".to_owned(),
+            "GuestCredential".to_owned(),
+            ["Claw", "ShareBridge"].concat(),
+        ] {
+            assert!(
+                !listener.contains(&forbidden),
+                "{listener_path} must not grow experimental transport/runtime authority: {forbidden}"
+            );
+        }
+
+        let route_test_path = "tests/household_instances.rs";
+        let route_tests = std::fs::read_to_string(crate_root.join(route_test_path))
+            .unwrap_or_else(|e| panic!("read {route_test_path}: {e}"));
+        let unverified_peer_helper = ["unverified_", "mesh", "_peer_addr"].concat();
+        let unverified_peer_literal = ["10.", "44.0.2:41001"].concat();
+        let mint_rejection_test = [
+            "household_attach_token_mint_rejects_unverified_",
+            "mesh",
+            "_peer_before_pop_or_mint",
+        ]
+        .concat();
+        let pty_rejection_test = [
+            "household_terminal_pty_rejects_unverified_",
+            "mesh",
+            "_before_consuming_attach_token",
+        ]
+        .concat();
+        let route_contracts = [
+            format!("fn {unverified_peer_helper}() -> SocketAddr"),
+            format!("\"{unverified_peer_literal}\""),
+            mint_rejection_test.clone(),
+            pty_rejection_test.clone(),
+            "StatusCode::FORBIDDEN".to_owned(),
+            "pending_before".to_owned(),
+        ];
+        for required in &route_contracts {
+            assert!(
+                route_tests.contains(required),
+                "{route_test_path} must retain the real-route unverified-Mesh rejection proof: {required}"
+            );
+        }
+
+        let route_test_body = |test_name: &str| {
+            let marker = format!("async fn {test_name}()");
+            let start = route_tests
+                .find(&marker)
+                .unwrap_or_else(|| panic!("{route_test_path} is missing route test {test_name}"));
+            let remainder = &route_tests[start..];
+            let end = remainder
+                .find("\n#[tokio::test]")
+                .map_or(route_tests.len(), |offset| start + offset);
+            &route_tests[start..end]
+        };
+        let unverified_peer_argument = format!("Some({unverified_peer_helper}())");
+        let mint_body = route_test_body(&mint_rejection_test);
+        for required in [
+            "request_json_without_auth_with_peer(",
+            "request_json_with_peer(",
+            unverified_peer_argument.as_str(),
+            "assert_eq!(unauthenticated_status, StatusCode::FORBIDDEN);",
+            "assert_eq!(status, StatusCode::FORBIDDEN);",
+            "fx.attach_tokens.pending_count(),\n        pending_before,",
+        ] {
+            assert!(
+                mint_body.contains(required),
+                "{mint_rejection_test} must prove route-level 403 before mint effects: {required}"
+            );
+        }
+        let pty_body = route_test_body(&pty_rejection_test);
+        for required in [
+            "get_household_pty_with_peer(",
+            unverified_peer_argument.as_str(),
+            "assert_eq!(status, StatusCode::FORBIDDEN);",
+            "assert_eq!(fx.attach_tokens.pending_count(), pending_before);",
+            "fx.attach_tokens.consume(&minted.token).is_some()",
+        ] {
+            assert!(
+                pty_body.contains(required),
+                "{pty_rejection_test} must prove route-level 403 before token redemption: {required}"
+            );
+        }
+
+        for forbidden in [
+            ["Product", " A"].concat(),
+            ["n", "vpn"].concat(),
+            ["mesh", "_rs"].concat(),
+            "MeshSupervisor".to_owned(),
+            "GuestCredential".to_owned(),
+            ["Claw", "ShareBridge"].concat(),
+        ] {
+            assert!(
+                !route_tests.contains(&forbidden),
+                "{route_test_path} must not gain transport/runtime authority: {forbidden}"
+            );
         }
     }
 }

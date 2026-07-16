@@ -396,21 +396,30 @@ async fn request_json_without_auth(
     path: &str,
     body: serde_json::Value,
 ) -> StatusCode {
+    request_json_without_auth_with_peer(app, method, path, body, Some(allowed_peer_addr())).await
+}
+
+async fn request_json_without_auth_with_peer(
+    app: Router,
+    method: Method,
+    path: &str,
+    body: serde_json::Value,
+    peer: Option<SocketAddr>,
+) -> StatusCode {
     let bytes = if body.is_null() {
         Vec::new()
     } else {
         serde_json::to_vec(&body).unwrap()
     };
+    let mut builder = Request::builder()
+        .method(method)
+        .uri(path)
+        .header(header::CONTENT_TYPE, "application/json");
+    if let Some(peer) = peer {
+        builder = builder.extension(ConnectInfo(peer));
+    }
     let resp = app
-        .oneshot(
-            Request::builder()
-                .method(method)
-                .uri(path)
-                .header(header::CONTENT_TYPE, "application/json")
-                .extension(ConnectInfo(allowed_peer_addr()))
-                .body(Body::from(bytes))
-                .unwrap(),
-        )
+        .oneshot(builder.body(Body::from(bytes)).unwrap())
         .await
         .unwrap();
     resp.status()
@@ -434,8 +443,12 @@ fn allowed_peer_addr() -> SocketAddr {
     "127.0.0.1:41001".parse().unwrap()
 }
 
-fn remote_peer_addr() -> SocketAddr {
-    "192.0.2.10:41001".parse().unwrap()
+fn lan_peer_addr() -> SocketAddr {
+    "192.168.50.10:41001".parse().unwrap()
+}
+
+fn unverified_mesh_peer_addr() -> SocketAddr {
+    "10.44.0.2:41001".parse().unwrap()
 }
 
 fn tailnet_peer_addr() -> SocketAddr {
@@ -685,7 +698,8 @@ async fn household_attach_token_mint_requires_post_trust_peer() {
         .create_conversation("picoclaw-household-alpha", &actor_username, "Dev Workspace")
         .unwrap();
 
-    for peer in [None, Some(remote_peer_addr())] {
+    for peer in [None, Some(lan_peer_addr())] {
+        let pending_before = fx.attach_tokens.pending_count();
         let (status, _) = request_json_with_peer(
             fx.app.clone(),
             &fx.person,
@@ -696,9 +710,15 @@ async fn household_attach_token_mint_requires_post_trust_peer() {
         )
         .await;
         assert_eq!(status, StatusCode::FORBIDDEN, "peer={peer:?}");
+        assert_eq!(
+            fx.attach_tokens.pending_count(),
+            pending_before,
+            "peer source gate must run before attach-token mint: peer={peer:?}"
+        );
     }
 
     for peer in [tailnet_peer_addr(), tailnet_ipv6_peer_addr()] {
+        let pending_before = fx.attach_tokens.pending_count();
         let (status, json) = request_json_with_peer(
             fx.app.clone(),
             &fx.person,
@@ -715,7 +735,55 @@ async fn household_attach_token_mint_requires_post_trust_peer() {
                 .as_str()
                 .is_some_and(|token| !token.is_empty())
         );
+        assert_eq!(fx.attach_tokens.pending_count(), pending_before + 1);
     }
+}
+
+#[tokio::test]
+async fn household_attach_token_mint_rejects_unverified_mesh_peer_before_pop_or_mint() {
+    let fx = fixture();
+    let path = "/api/v1/household/terminals/picoclaw-household-alpha/attach-token";
+    let pending_before = fx.attach_tokens.pending_count();
+    let unauthenticated_status = request_json_without_auth_with_peer(
+        fx.app.clone(),
+        Method::POST,
+        path,
+        serde_json::json!({"workspace_id": "ws-unneeded"}),
+        Some(unverified_mesh_peer_addr()),
+    )
+    .await;
+    assert_eq!(unauthenticated_status, StatusCode::FORBIDDEN);
+    assert_eq!(fx.attach_tokens.pending_count(), pending_before);
+
+    let actor_username = household_rs::derive_person_id(&fx.person.public()).0;
+    insert_instance(
+        &fx.shared.instance_db,
+        "inst-household-alpha",
+        Some(&fx.household_id),
+        Some(&fx.machine_id),
+    );
+    let workspace = fx
+        .shared
+        .instance_db
+        .create_conversation("picoclaw-household-alpha", &actor_username, "Dev Workspace")
+        .unwrap();
+
+    let (status, _) = request_json_with_peer(
+        fx.app,
+        &fx.person,
+        Method::POST,
+        path,
+        serde_json::json!({"workspace_id": workspace.id}),
+        Some(unverified_mesh_peer_addr()),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(
+        fx.attach_tokens.pending_count(),
+        pending_before,
+        "unverified Mesh source must be rejected before PoP or attach-token mint"
+    );
 }
 
 #[tokio::test]
@@ -883,7 +951,7 @@ async fn household_terminal_pty_rejects_missing_bad_expired_or_reused_attach_tok
 }
 
 #[tokio::test]
-async fn household_terminal_pty_requires_post_trust_peer_without_consuming_token() {
+async fn household_terminal_pty_rejects_lan_before_consuming_attach_token() {
     let fx = fixture();
     let actor_username = household_rs::derive_person_id(&fx.person.public()).0;
     insert_instance(
@@ -908,14 +976,16 @@ async fn household_terminal_pty_requires_post_trust_peer_without_consuming_token
         &workspace.id,
         &actor_username,
     ));
+    let pending_before = fx.attach_tokens.pending_count();
     let status = get_household_pty_with_peer(
         fx.app.clone(),
         &path,
         Some(&remote.token),
-        Some(remote_peer_addr()),
+        Some(lan_peer_addr()),
     )
     .await;
     assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(fx.attach_tokens.pending_count(), pending_before);
     assert!(
         fx.attach_tokens.consume(&remote.token).is_some(),
         "peer guard must run before token consume"
@@ -927,11 +997,56 @@ async fn household_terminal_pty_requires_post_trust_peer_without_consuming_token
         &workspace.id,
         &actor_username,
     ));
+    let missing_pending_before = fx.attach_tokens.pending_count();
     let status = get_household_pty_with_peer(fx.app, &path, Some(&missing.token), None).await;
     assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(fx.attach_tokens.pending_count(), missing_pending_before);
     assert!(
         fx.attach_tokens.consume(&missing.token).is_some(),
         "missing ConnectInfo must fail closed before token consume"
+    );
+}
+
+#[tokio::test]
+async fn household_terminal_pty_rejects_unverified_mesh_before_consuming_attach_token() {
+    let fx = fixture();
+    let actor_username = household_rs::derive_person_id(&fx.person.public()).0;
+    insert_instance(
+        &fx.shared.instance_db,
+        "inst-household-alpha",
+        Some(&fx.household_id),
+        Some(&fx.machine_id),
+    );
+    let workspace = fx
+        .shared
+        .instance_db
+        .create_conversation("picoclaw-household-alpha", &actor_username, "Dev Workspace")
+        .unwrap();
+    let path = format!(
+        "/api/v1/household/terminals/picoclaw-household-alpha/pty?session={}&cols=80&rows=24",
+        workspace.id
+    );
+    let minted = fx.attach_tokens.mint(attach_scope(
+        &fx.household_id,
+        "picoclaw-household-alpha",
+        &workspace.id,
+        &actor_username,
+    ));
+    let pending_before = fx.attach_tokens.pending_count();
+
+    let status = get_household_pty_with_peer(
+        fx.app,
+        &path,
+        Some(&minted.token),
+        Some(unverified_mesh_peer_addr()),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(fx.attach_tokens.pending_count(), pending_before);
+    assert!(
+        fx.attach_tokens.consume(&minted.token).is_some(),
+        "unverified Mesh source must be rejected before attach-token consume"
     );
 }
 

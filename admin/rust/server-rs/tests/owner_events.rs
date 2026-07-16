@@ -3656,7 +3656,20 @@ fn household_remote_attach_source_guard_remains_stop_gated() {
         "pub async fn handle_household_mint_attach_token(",
         "/// Upgrades a household terminal WebSocket using a single-use attach token.",
     );
-    assert!(public_mint_attach_token.contains("is_terminal_attach_peer_allowed"));
+    assert!(
+        public_mint_attach_token.contains(
+            "terminal_attach_peer_rejection(peer_addr(peer), \"mint_attach_token\").await"
+        )
+    );
+    assert!(
+        public_mint_attach_token
+            .find("terminal_attach_peer_rejection")
+            .expect("mint peer gate")
+            < public_mint_attach_token
+                .find("let authorized")
+                .expect("mint PoP authorization"),
+        "remote attach mint must reject the peer before PoP authorization"
+    );
     assert!(public_mint_attach_token.contains("Operation::ClawsUse"));
     assert!(public_mint_attach_token.contains("\"mint_attach_token\""));
     assert!(public_mint_attach_token.contains("household_mint_attach_token("));
@@ -3676,8 +3689,30 @@ fn household_remote_attach_source_guard_remains_stop_gated() {
         "pub async fn handle_household_terminal_pty(",
         "/// `PoP`-gates stopping a household-scoped instance.",
     );
-    assert!(public_terminal_pty.contains("is_terminal_attach_peer_allowed"));
+    assert!(
+        public_terminal_pty
+            .contains("terminal_attach_peer_rejection(peer_addr(peer), \"terminal_pty\").await")
+    );
     assert!(public_terminal_pty.contains("household_terminal_pty(&state"));
+    assert!(
+        public_terminal_pty
+            .find("terminal_attach_peer_rejection")
+            .expect("PTY peer gate")
+            < public_terminal_pty
+                .rfind("household_terminal_pty(&state")
+                .expect("PTY attach-token redemption"),
+        "remote PTY must reject the peer before attach-token redemption"
+    );
+
+    let terminal_peer_rejection = source_segment(
+        household_claws,
+        "async fn terminal_attach_peer_rejection(",
+        "async fn household_list_workspaces(",
+    );
+    assert!(
+        terminal_peer_rejection.contains("post_trust_household_peer_gate(peer).await"),
+        "remote attach peer rejection must delegate to the shared live exposure gate"
+    );
 
     let private_terminal_pty = source_segment(
         household_claws,

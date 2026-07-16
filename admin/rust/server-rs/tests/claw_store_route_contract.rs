@@ -562,12 +562,45 @@ fn household_routes_keep_declared_pop_operations() {
         );
         if route.peer_guard {
             assert!(
-                body.contains("is_terminal_attach_peer_allowed"),
-                "{} must keep its declared peer guard",
+                body.contains("terminal_attach_peer_rejection(peer_addr(peer),"),
+                "{} must keep its declared shared peer guard",
                 route.handler
             );
         }
     }
+
+    let peer_gate = between(
+        handlers,
+        "async fn terminal_attach_peer_rejection",
+        "\nasync fn household_list_workspaces",
+    );
+    assert!(
+        peer_gate.contains("post_trust_household_peer_gate(peer).await"),
+        "household terminal routes must delegate their declared peer gate to the shared live exposure policy"
+    );
+
+    let mint = function_slice(handlers, "handle_household_mint_attach_token");
+    let mint_gate = mint
+        .find("terminal_attach_peer_rejection")
+        .expect("attach-token handler must contain the shared peer gate");
+    let mint_authorize = mint
+        .find("let authorized")
+        .expect("attach-token handler must contain household PoP authorization");
+    assert!(
+        mint_gate < mint_authorize,
+        "attach-token peer rejection must precede household PoP authorization"
+    );
+    let pty = function_slice(handlers, "handle_household_terminal_pty");
+    let pty_gate = pty
+        .find("terminal_attach_peer_rejection")
+        .expect("PTY handler must contain the shared peer gate");
+    let pty_redeem = pty
+        .rfind("household_terminal_pty")
+        .expect("PTY handler must delegate to attach-token redemption");
+    assert!(
+        pty_gate < pty_redeem,
+        "PTY peer rejection must precede attach-token redemption"
+    );
 }
 
 #[test]
@@ -627,7 +660,7 @@ fn websocket_routes_pin_stream_auth_and_attach_token_guards() {
         "const HOUSEHOLD_ATTACH_TOKEN_HEADER: &str = \"x-soyeht-household-attach-token\"",
         "fn attach_token_from_headers(headers: &HeaderMap)",
         ".consume(token)",
-        "is_terminal_attach_peer_allowed",
+        "terminal_attach_peer_rejection(peer_addr(peer), \"terminal_pty\").await",
     ] {
         assert!(
             handlers.contains(required),

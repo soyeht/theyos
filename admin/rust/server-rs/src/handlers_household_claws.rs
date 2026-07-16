@@ -548,8 +548,9 @@ pub async fn handle_household_mint_attach_token(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    if !is_terminal_attach_peer_allowed(peer_addr(peer), "mint_attach_token") {
-        return StatusCode::FORBIDDEN.into_response();
+    if let Some(reject) = terminal_attach_peer_rejection(peer_addr(peer), "mint_attach_token").await
+    {
+        return reject;
     }
 
     let authorized = match authorize(
@@ -611,8 +612,8 @@ pub async fn handle_household_terminal_pty(
     headers: HeaderMap,
     ws: WebSocketUpgrade,
 ) -> Response {
-    if !is_terminal_attach_peer_allowed(peer_addr(peer), "terminal_pty") {
-        return StatusCode::FORBIDDEN.into_response();
+    if let Some(reject) = terminal_attach_peer_rejection(peer_addr(peer), "terminal_pty").await {
+        return reject;
     }
 
     forward(household_terminal_pty(&state, &container, q, &headers, ws).await)
@@ -1032,21 +1033,21 @@ fn peer_addr(peer: Option<Extension<ConnectInfo<SocketAddr>>>) -> Option<SocketA
     peer.map(|Extension(ConnectInfo(addr))| addr)
 }
 
-fn is_terminal_attach_peer_allowed(peer: Option<SocketAddr>, stage_suffix: &str) -> bool {
-    if peer.is_some_and(is_terminal_attach_peer_addr_allowed) {
-        return true;
+async fn terminal_attach_peer_rejection(
+    peer: Option<SocketAddr>,
+    stage_suffix: &str,
+) -> Option<Response> {
+    match crate::household_listener::post_trust_household_peer_gate(peer).await {
+        Ok(()) => None,
+        Err(status) => {
+            tracing::warn!(
+                stage = format!("household_claws.{stage_suffix}.peer_rejected"),
+                peer = ?peer,
+                "household terminal attach route rejected non-loopback/non-tailnet/non-verified-mesh peer"
+            );
+            Some(status.into_response())
+        }
     }
-
-    tracing::warn!(
-        stage = format!("household_claws.{stage_suffix}.peer_rejected"),
-        peer = ?peer,
-        "household terminal attach route rejected non-loopback/non-tailnet/non-configured-mesh peer"
-    );
-    false
-}
-
-fn is_terminal_attach_peer_addr_allowed(peer: SocketAddr) -> bool {
-    crate::household_listener::is_post_trust_household_peer_allowed(peer.ip())
 }
 
 async fn household_list_workspaces(
