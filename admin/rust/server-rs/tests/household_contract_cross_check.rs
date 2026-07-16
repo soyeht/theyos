@@ -58,6 +58,7 @@ fn docs_auth_to_contract_auth(auth: &str) -> &'static str {
         "pop" => "household_pop",
         "attach_token" => "household_attach_token",
         "owner_site_pre_effect" => "owner_site_pre_effect",
+        "owner_site_ake" => "owner_site_ake",
         other => panic!("docs household route uses unknown auth kind {other}"),
     }
 }

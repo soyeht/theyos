@@ -191,6 +191,47 @@ fn household_claw_contract_handlers_require_declared_auth() {
                     );
                 }
             }
+            "owner_site_ake" => {
+                assert!(
+                    route.operation.is_none(),
+                    "{} A2 route must not repurpose a current PoP operation",
+                    route.name
+                );
+                let peer_gate = "owner_site_ake_peer_rejection(peer_addr(peer)).await";
+                let provider_gate = "provider.admits_resource(&resource)";
+                let upgrade = ".on_upgrade";
+                assert!(
+                    body.contains(peer_gate)
+                        && body.contains(provider_gate)
+                        && body.contains(upgrade),
+                    "{} must keep the shared peer gate, typed provider gate, and one WS upgrade",
+                    route.handler
+                );
+                assert!(
+                    body.find(peer_gate).expect("A2 peer gate")
+                        < body.find(provider_gate).expect("A2 provider gate")
+                        && body.find(provider_gate).expect("A2 provider gate")
+                            < body.find(upgrade).expect("A2 upgrade"),
+                    "{} must reject before provider admission and WebSocket upgrade",
+                    route.handler
+                );
+                for forbidden in [
+                    "authorize(",
+                    "HouseholdAttachTokenStore",
+                    "GuestCredential",
+                    "relay_stream",
+                    "Hermes",
+                    "TcpStream",
+                    "connect(",
+                    "household_terminal_pty(",
+                ] {
+                    assert!(
+                        !body.contains(forbidden),
+                        "{} A2 handler must not acquire {forbidden}",
+                        route.handler
+                    );
+                }
+            }
             other => panic!("unknown auth kind in contract: {other}"),
         }
 
@@ -204,6 +245,9 @@ fn household_claw_contract_handlers_require_declared_auth() {
                 }
                 "handle_household_owner_site_preflight" => {
                     "owner_site_pre_effect_peer_rejection(peer_addr(peer)).await"
+                }
+                "handle_household_owner_site_ake" => {
+                    "owner_site_ake_peer_rejection(peer_addr(peer)).await"
                 }
                 handler => panic!("unexpected peer-gated household handler: {handler}"),
             };
@@ -225,6 +269,9 @@ fn household_claw_contract_handlers_require_declared_auth() {
                 "handle_household_owner_site_preflight" => body
                     .find("store.pre_effect_admission(&resource)")
                     .expect("owner-site handler must retain typed pre-effect admission"),
+                "handle_household_owner_site_ake" => body
+                    .find("provider.admits_resource(&resource)")
+                    .expect("A2 handler must retain typed provider admission"),
                 handler => panic!("unexpected peer-gated household handler: {handler}"),
             };
             assert!(
@@ -233,6 +280,84 @@ fn household_claw_contract_handlers_require_declared_auth() {
                 route.handler
             );
         }
+    }
+}
+
+#[test]
+fn owner_site_ake_route_is_single_ws_and_stays_pending_without_finished_ack() {
+    let routes = include_str!("../src/claw_store_routes.rs");
+    let bootstrap = include_str!("../src/household_bootstrap.rs");
+    let handlers = include_str!("../src/handlers_household_claws.rs");
+    let ake = include_str!("../src/owner_site_ake.rs");
+    let lib = include_str!("../src/lib.rs");
+
+    let route = contract()
+        .routes
+        .into_iter()
+        .find(|route| route.name == "owner_site_ake")
+        .expect("owner-site A2 route must be declared");
+    assert_eq!(route.auth, "owner_site_ake");
+    assert_eq!(route.method, "GET");
+    assert_eq!(route.path, "/api/v1/household/claws/{name}/owner-site/ake");
+    assert!(route.operation.is_none());
+    assert!(
+        routes.contains("household::OWNER_SITE_AKE")
+            && routes.contains("handle_household_owner_site_ake"),
+        "A2 must remain owned by claw_store_routes::household_routes"
+    );
+    assert!(
+        !bootstrap.contains("owner_site_ake"),
+        "A2 must not add bootstrap lifecycle or production provider wiring"
+    );
+    assert!(
+        lib.contains("pub(crate) mod owner_site_ake;"),
+        "the A2 state machine must remain crate-private server material"
+    );
+
+    let handler = handler_body(handlers, "handle_household_owner_site_ake");
+    assert!(handler.contains("Option<Extension<Arc<OwnerSiteAkeProvider>>>"));
+    assert!(handler.contains("WebSocketUpgrade"));
+    assert!(handler.contains("provider.serve(socket, resource, peer).await"));
+    for forbidden in [
+        "GuestCredential",
+        "relay_stream",
+        "Hermes",
+        "TcpStream",
+        "connect(",
+        "household_attach_token",
+    ] {
+        assert!(
+            !handler.contains(forbidden),
+            "A2 handler must not acquire {forbidden}"
+        );
+    }
+    for required in [
+        "Noise_XX_25519_ChaChaPoly_SHA256",
+        "soyeht/owner-site/a2/v1",
+        "validated pending Finished",
+        "claim_after_verified_pop_for_harness",
+        "post_trust_household_peer_gate(peer)",
+        "certificate.verify(&self.expected_household_key)",
+        "relay_forwarding_splices_only_ake_frames_and_gets_no_success_or_site_bytes",
+        "tombstone_after_consume_burns_challenge_without_a_peer",
+    ] {
+        assert!(ake.contains(required), "A2 source must retain `{required}`");
+    }
+    for forbidden in [
+        "struct VerifiedMeshPeer",
+        "enum VerifiedMeshPeer",
+        "verified_mesh_peers.fetch_add",
+        "into_transport_mode",
+        "server_finished",
+        "ClientFinishedAck",
+        "TcpStream",
+        "connect(",
+        "copy_bidirectional",
+    ] {
+        assert!(
+            !ake.contains(forbidden),
+            "the M1/M2/M3 slice must not acquire deferred `{forbidden}` behavior"
+        );
     }
 }
 

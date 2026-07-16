@@ -107,7 +107,7 @@ fn bonjour_publishers_filter_targets_through_exposure_policy() {
 }
 
 #[test]
-fn post_trust_household_peer_gate_is_shared_by_terminal_and_owner_site_pre_effect_routes() {
+fn post_trust_household_peer_gate_is_shared_by_terminal_and_owner_site_routes() {
     let claws_source = read_src("handlers_household_claws.rs");
     assert!(
         claws_source.contains("crate::household_listener::post_trust_household_peer_gate"),
@@ -117,6 +117,7 @@ fn post_trust_household_peer_gate_is_shared_by_terminal_and_owner_site_pre_effec
         "terminal_attach_peer_rejection(peer_addr(peer), \"mint_attach_token\").await",
         "terminal_attach_peer_rejection(peer_addr(peer), \"terminal_pty\").await",
         "owner_site_pre_effect_peer_rejection(peer_addr(peer)).await",
+        "owner_site_ake_peer_rejection(peer_addr(peer)).await",
     ] {
         assert!(
             claws_source.contains(route_gate),
@@ -157,7 +158,7 @@ fn post_trust_household_peer_gate_is_shared_by_terminal_and_owner_site_pre_effec
     let owner_site_handler = slice_between(
         &claws_source,
         "pub(crate) async fn handle_household_owner_site_preflight",
-        "\n/// `PoP`-gates listing instances",
+        "\n/// Upgrades the one-WebSocket owner-site A2 M1/M2/M3 handshake.",
     );
     assert!(
         owner_site_handler
@@ -167,6 +168,30 @@ fn post_trust_household_peer_gate_is_shared_by_terminal_and_owner_site_pre_effec
                 .find("let Some(Extension(store))")
                 .expect("owner-site pre-effect route must retain fail-closed provider extraction"),
         "owner-site pre-effect route must reject a peer before provider/admission work"
+    );
+
+    let owner_site_ake_handler = slice_between(
+        &claws_source,
+        "pub(crate) async fn handle_household_owner_site_ake",
+        "\n/// `PoP`-gates listing instances",
+    );
+    assert!(
+        owner_site_ake_handler
+            .find("owner_site_ake_peer_rejection")
+            .expect("owner-site A2 route must call the shared peer gate")
+            < owner_site_ake_handler
+                .find("let Some(Extension(provider))")
+                .expect("owner-site A2 route must retain fail-closed provider extraction"),
+        "owner-site A2 route must reject a peer before provider work"
+    );
+    assert!(
+        owner_site_ake_handler
+            .find("provider.admits_resource(&resource)")
+            .expect("A2 typed provider admission must exist")
+            < owner_site_ake_handler
+                .find(".on_upgrade")
+                .expect("A2 must use one WebSocket upgrade"),
+        "owner-site A2 must check the typed provider before upgrading the socket"
     );
 
     let listener = read_src("household_listener.rs");

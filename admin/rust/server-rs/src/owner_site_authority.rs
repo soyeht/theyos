@@ -169,6 +169,11 @@ impl OwnerSiteBindingId {
         }
         Ok(Self(bytes))
     }
+
+    #[must_use]
+    pub(crate) fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
 }
 
 /// Opaque canonical digest of the owner-site binding as committed by a future
@@ -193,6 +198,11 @@ impl OwnerSiteBindingDigest {
             return Err(OwnerSiteAuthorityError::ZeroBindingDigest);
         }
         Ok(Self(bytes))
+    }
+
+    #[must_use]
+    pub(crate) fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
     }
 }
 
@@ -227,6 +237,11 @@ impl OwnerSiteChannelAuthKey {
     pub(crate) fn verifying_key(&self) -> &P256PublicKey {
         &self.public_key
     }
+
+    #[must_use]
+    pub(crate) fn key_id(&self) -> &OwnerSiteChannelAuthKeyId {
+        &self.key_id
+    }
 }
 
 /// Action-PoP P-256 signer in one owner-site binding.
@@ -258,6 +273,11 @@ impl OwnerSiteActionPopKey {
     pub(crate) fn verifying_key(&self) -> &P256PublicKey {
         &self.public_key
     }
+
+    #[must_use]
+    pub(crate) fn key_id(&self) -> &OwnerSiteActionPopKeyId {
+        &self.key_id
+    }
 }
 
 /// Typed key identifier for the P-256 signature that authenticates A2 channel
@@ -270,6 +290,11 @@ impl OwnerSiteChannelAuthKeyId {
     pub(crate) fn injected_for_harness(value: &str) -> Result<Self, OwnerSiteIntentError> {
         Ok(Self(validated_component(value)?))
     }
+
+    #[must_use]
+    pub(crate) fn as_str(&self) -> &str {
+        &self.0
+    }
 }
 
 /// Typed key identifier for the P-256 signature authorizing the final action.
@@ -280,6 +305,11 @@ impl OwnerSiteActionPopKeyId {
     #[cfg(test)]
     pub(crate) fn injected_for_harness(value: &str) -> Result<Self, OwnerSiteIntentError> {
         Ok(Self(validated_component(value)?))
+    }
+
+    #[must_use]
+    pub(crate) fn as_str(&self) -> &str {
+        &self.0
     }
 }
 
@@ -415,6 +445,21 @@ impl OwnerSiteResolvedBinding {
     #[must_use]
     pub(crate) fn action_pop_key(&self) -> &OwnerSiteActionPopKey {
         &self.action_pop
+    }
+
+    #[must_use]
+    pub(crate) fn binding_id(&self) -> OwnerSiteBindingId {
+        self.binding_id
+    }
+
+    #[must_use]
+    pub(crate) fn binding_digest(&self) -> OwnerSiteBindingDigest {
+        self.binding_digest
+    }
+
+    #[must_use]
+    pub(crate) fn participant_npub(&self) -> &str {
+        &self.participant_npub
     }
 
     #[cfg(test)]
@@ -563,6 +608,39 @@ impl OwnerSiteRosterSnapshot {
     #[must_use]
     pub(crate) fn generation(&self) -> OwnerSiteAuthorityGeneration {
         self.generation
+    }
+
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn fresh_until_for_harness(&self) -> u64 {
+        self.fresh_until
+    }
+
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn is_fresh_for_ake_harness(&self, observed_at: u64) -> bool {
+        self.is_fresh_at(observed_at)
+    }
+
+    #[cfg(test)]
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn resolve_for_ake_harness(
+        &self,
+        intent: &OwnerSiteIntent,
+        principal: &OwnerSiteRemotePrincipal,
+        claimed_binding_id: OwnerSiteBindingId,
+        claimed_binding_digest: OwnerSiteBindingDigest,
+        claimed_channel_auth_key_id: &OwnerSiteChannelAuthKeyId,
+        claimed_action_pop_key_id: &OwnerSiteActionPopKeyId,
+    ) -> Option<OwnerSiteResolvedBinding> {
+        self.resolve_exact(
+            intent,
+            principal,
+            claimed_binding_id,
+            claimed_binding_digest,
+            claimed_channel_auth_key_id,
+            claimed_action_pop_key_id,
+        )
     }
 
     #[must_use]

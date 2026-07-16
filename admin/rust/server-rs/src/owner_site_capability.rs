@@ -1,9 +1,10 @@
-//! Pre-effect owner-site capability types.
+//! Staged owner-site capability types.
 //!
 //! This module intentionally stops before proof verification, capability
 //! redemption, authority-provider wiring, or any backend connection. The
-//! separate `owner_site_challenge` and `owner_site_authority` modules now hold
-//! only pre-effect staging types; neither is reachable from production routing.
+//! separate `owner_site_challenge` and `owner_site_authority` modules hold the
+//! staged authority material used by the A2 test harness; neither admits an
+//! owner-site principal from production routing.
 //! In particular, the only admitting capability remains a crate-test fixture,
 //! not a production authority or a bearer wire format.
 
@@ -166,7 +167,19 @@ impl OwnerSitePreAuthIntent {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[allow(dead_code)] // the A2 wire slice constructs this canonical verb
 pub(crate) enum OwnerSiteRequestMethod {
+    Get,
     Post,
+}
+
+#[allow(dead_code)] // consumed by the test-only A2 transcript until a provider is reviewed
+impl OwnerSiteRequestMethod {
+    #[must_use]
+    pub(crate) const fn as_wire(self) -> &'static str {
+        match self {
+            Self::Get => "GET",
+            Self::Post => "POST",
+        }
+    }
 }
 
 /// Server-owned canonical request material committed into the future A2
@@ -178,6 +191,7 @@ pub(crate) struct OwnerSiteCanonicalRequest {
     body_hash: [u8; 32],
 }
 
+#[allow(dead_code)] // consumed by the test-only A2 transcript until a provider is reviewed
 impl OwnerSiteCanonicalRequest {
     #[cfg(test)]
     pub(crate) fn injected_for_harness(
@@ -202,6 +216,21 @@ impl OwnerSiteCanonicalRequest {
             body_hash,
         })
     }
+
+    #[must_use]
+    pub(crate) fn method(&self) -> OwnerSiteRequestMethod {
+        self.method
+    }
+
+    #[must_use]
+    pub(crate) fn route(&self) -> &str {
+        &self.route
+    }
+
+    #[must_use]
+    pub(crate) fn body_hash(&self) -> [u8; 32] {
+        self.body_hash
+    }
 }
 
 /// Exact server-resolved `ClawSite` resource selector.
@@ -213,12 +242,18 @@ pub(crate) struct OwnerSiteResource {
     claw_name: String,
 }
 
+#[allow(dead_code)] // consumed by the test-only A2 transcript until a provider is reviewed
 impl OwnerSiteResource {
     /// Converts the route's claw segment into an opaque resource selector.
     pub(crate) fn from_route_claw(claw_name: &str) -> Result<Self, OwnerSiteIntentError> {
         Ok(Self {
             claw_name: validated_component(claw_name)?,
         })
+    }
+
+    #[must_use]
+    pub(crate) fn as_str(&self) -> &str {
+        &self.claw_name
     }
 }
 

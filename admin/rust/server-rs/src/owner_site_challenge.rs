@@ -1,12 +1,12 @@
-//! Pre-effect A2 challenge types and test-only one-shot table.
+//! A2 challenge types and test-only one-shot table.
 //!
-//! This module reserves the challenge state required by the reviewed A2
-//! profile. It does not mount an endpoint, parse a WebSocket message, construct
-//! a Noise handshake, validate a signature, or expose a byte of a backend.
-//! In particular, its mutable table API is test-only until the later M1/M2/M3
-//! handler can supply the complete A2 context on one verified WebSocket.
+//! This module reserves the challenge state required by the reviewed A2 profile.
+//! It does not mount an endpoint or expose a byte of a backend. Its mutable
+//! table remains test-only while there is no reviewed production authority
+//! provider; the crate-test AKE harness may use it only after it has the full
+//! one-WebSocket M1/M2/M3 context.
 
-#![allow(dead_code)] // deliberately staged, unreachable until the reviewed A2 handler slice
+#![allow(dead_code)] // staged until a reviewed production authority provider exists
 
 #[cfg(test)]
 use std::collections::HashMap;
@@ -30,6 +30,7 @@ use crate::owner_site_authority::{
 #[cfg(test)]
 use crate::owner_site_capability::OwnerSiteIntentError;
 use crate::owner_site_capability::{OwnerSiteIntent, OwnerSitePreAuthIntent};
+use zeroize::{Zeroize, ZeroizeOnDrop};
 
 /// Entropy length for the opaque A2 challenge id and distinct challenge secret.
 pub(crate) const OWNER_SITE_CHALLENGE_BYTES: usize = 32;
@@ -47,6 +48,14 @@ const MAX_OUTSTANDING_OWNER_SITE_CHALLENGES: usize = 16_384;
 #[derive(Clone, Eq, Hash, PartialEq)]
 pub(crate) struct OwnerSiteChallengeId([u8; OWNER_SITE_CHALLENGE_BYTES]);
 
+impl OwnerSiteChallengeId {
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn bytes_for_harness(&self) -> &[u8; OWNER_SITE_CHALLENGE_BYTES] {
+        &self.0
+    }
+}
+
 impl std::fmt::Debug for OwnerSiteChallengeId {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str("OwnerSiteChallengeId(REDACTED)")
@@ -55,8 +64,16 @@ impl std::fmt::Debug for OwnerSiteChallengeId {
 
 /// CSPRNG secret committed to the future `pop_D`. The table never keeps this
 /// value in plaintext; it stores only its SHA-256 digest.
-#[derive(Clone, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq, Zeroize, ZeroizeOnDrop)]
 pub(crate) struct OwnerSiteChallengeSecret([u8; OWNER_SITE_CHALLENGE_BYTES]);
+
+impl OwnerSiteChallengeSecret {
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn bytes_for_harness(&self) -> &[u8; OWNER_SITE_CHALLENGE_BYTES] {
+        &self.0
+    }
+}
 
 impl std::fmt::Debug for OwnerSiteChallengeSecret {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -90,6 +107,12 @@ impl OwnerSiteChannelId {
     pub(crate) fn injected_for_harness(bytes: [u8; 32]) -> Self {
         Self(bytes)
     }
+
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn bytes_for_harness(&self) -> &[u8; 32] {
+        &self.0
+    }
 }
 
 /// Nonzero server-owned channel epoch. Reconnect, restart, rekey, and revoke
@@ -104,6 +127,11 @@ impl OwnerSiteChannelEpoch {
             .map(Self)
             .ok_or(OwnerSiteChallengeError::ZeroChannelEpoch)
     }
+
+    #[must_use]
+    pub(crate) fn get(self) -> u64 {
+        self.0.get()
+    }
 }
 
 /// Canonical `T1` server-auth transcript commitment from A2 `M2`.
@@ -115,6 +143,11 @@ impl OwnerSiteTranscriptT1 {
     #[must_use]
     pub(crate) fn injected_for_harness(bytes: [u8; 32]) -> Self {
         Self(bytes)
+    }
+
+    #[must_use]
+    pub(crate) fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
     }
 }
 
@@ -138,6 +171,16 @@ impl OwnerSiteEngineIdentityCommitment {
             machine_certificate_digest,
             engine_key_id: validated_engine_key_id(engine_key_id)?,
         })
+    }
+
+    #[must_use]
+    pub(crate) fn machine_certificate_digest(&self) -> &[u8; 32] {
+        &self.machine_certificate_digest
+    }
+
+    #[must_use]
+    pub(crate) fn engine_key_id(&self) -> &str {
+        &self.engine_key_id
     }
 }
 
@@ -250,13 +293,26 @@ impl OwnerSiteChallengeClaimScope {
 
 /// Material a future `M2` carries to the client. The final A2 CBOR encoding is
 /// deliberately not implemented in this pre-effect slice.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Debug, Eq, PartialEq)]
 pub(crate) struct OwnerSiteIssuedChallenge {
     challenge_id: OwnerSiteChallengeId,
     challenge_secret: OwnerSiteChallengeSecret,
 }
 
 impl OwnerSiteIssuedChallenge {
+    /// Generates the opaque challenge material before T1 is assembled.  The
+    /// A2 transcript commits both values, so a later atomic table insertion
+    /// receives the completed issue scope rather than accepting caller-chosen
+    /// entropy.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn generated_for_ake_harness() -> Self {
+        Self {
+            challenge_id: random_id(),
+            challenge_secret: random_secret(),
+        }
+    }
+
     #[cfg(test)]
     #[must_use]
     pub(crate) fn id_for_harness(&self) -> &OwnerSiteChallengeId {
@@ -322,6 +378,20 @@ impl OwnerSiteChallengeTable {
         issue: OwnerSiteChallengeIssueScope,
         now_unix: u64,
     ) -> Result<OwnerSiteIssuedChallenge, OwnerSiteChallengeError> {
+        let issued = OwnerSiteIssuedChallenge::generated_for_ake_harness();
+        self.insert_generated_for_harness(issue, &issued, now_unix)?;
+        Ok(issued)
+    }
+
+    /// Inserts CSPRNG material already generated by the A2 responder after it
+    /// has committed that exact material into T1.  This is crate-test-only
+    /// while no reviewed production authority provider can enter the handler.
+    pub(crate) fn insert_generated_for_harness(
+        &self,
+        issue: OwnerSiteChallengeIssueScope,
+        issued: &OwnerSiteIssuedChallenge,
+        now_unix: u64,
+    ) -> Result<(), OwnerSiteChallengeError> {
         let expires_at = now_unix
             .checked_add(OWNER_SITE_CHALLENGE_TTL_SECS)
             .ok_or(OwnerSiteChallengeError::ClockOverflow)?;
@@ -334,27 +404,20 @@ impl OwnerSiteChallengeTable {
             return Err(OwnerSiteChallengeError::CapacityReached);
         }
 
-        loop {
-            let challenge_id = random_id();
-            if entries.contains_key(&challenge_id) {
-                continue;
-            }
-            let challenge_secret = random_secret();
-            let challenge_hash = hash_secret(&challenge_secret);
-            entries.insert(
-                challenge_id.clone(),
-                OwnerSiteChallengeEntry {
-                    challenge_hash,
-                    issue,
-                    expires_at,
-                    state: OwnerSiteChallengeState::Unused,
-                },
-            );
-            return Ok(OwnerSiteIssuedChallenge {
-                challenge_id,
-                challenge_secret,
-            });
+        if entries.contains_key(&issued.challenge_id) {
+            return Err(OwnerSiteChallengeError::CapacityReached);
         }
+        let challenge_hash = hash_secret(&issued.challenge_secret);
+        entries.insert(
+            issued.challenge_id.clone(),
+            OwnerSiteChallengeEntry {
+                challenge_hash,
+                issue,
+                expires_at,
+                state: OwnerSiteChallengeState::Unused,
+            },
+        );
+        Ok(())
     }
 
     /// Atomically removes one exact, unexpired entry after the caller supplies
@@ -376,6 +439,30 @@ impl OwnerSiteChallengeTable {
             || entry.issue != expected.issue
             || !bool::from(entry.challenge_hash.ct_eq(&hash_secret(challenge_secret)))
         {
+            return Err(OwnerSiteChallengeError::ClaimContextMismatch);
+        }
+        entries.remove(challenge_id);
+        Ok(())
+    }
+
+    /// Removes a challenge only after the AKE verifier has proved possession
+    /// of its secret by verifying `pop_D` over the exact local challenge.
+    ///
+    /// The secret is intentionally not echoed in M3: the table retains only
+    /// its hash, while the ephemeral M1/M2/M3 state supplies it to the signed
+    /// transcript verifier before this atomic transition.
+    pub(crate) fn claim_after_verified_pop_for_harness(
+        &self,
+        challenge_id: &OwnerSiteChallengeId,
+        expected: &OwnerSiteChallengeClaimScope,
+        now_unix: u64,
+    ) -> Result<(), OwnerSiteChallengeError> {
+        let mut entries = self.lock_entries()?;
+        entries.retain(|_, entry| entry.expires_at > now_unix);
+        let entry = entries
+            .get(challenge_id)
+            .ok_or(OwnerSiteChallengeError::MissingOrExpired)?;
+        if entry.state != OwnerSiteChallengeState::Unused || entry.issue != expected.issue {
             return Err(OwnerSiteChallengeError::ClaimContextMismatch);
         }
         entries.remove(challenge_id);

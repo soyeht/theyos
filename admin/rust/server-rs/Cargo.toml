@@ -92,6 +92,7 @@ if-addrs        = { workspace = true }
 keystore-rs     = { workspace = true }
 nostr-relay-rs  = { workspace = true }
 snow            = { workspace = true }
+futures-util    = { workspace = true }
 
 # For inlined ratelimit module
 rusqlite        = { workspace = true }

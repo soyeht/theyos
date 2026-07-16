@@ -75,6 +75,9 @@ pub mod household {
     /// PR1 pre-effect owner-site wire. It is fail-closed until a later,
     /// reviewed authority provider is wired; it never exposes a backend.
     pub const OWNER_SITE_PREFLIGHT: &str = "/api/v1/household/claws/{name}/owner-site/preflight";
+    /// A2's one-WebSocket M1/M2/M3 wire.  The route is fail-closed unless a
+    /// separately reviewed owner-site authority provider is installed.
+    pub const OWNER_SITE_AKE: &str = "/api/v1/household/claws/{name}/owner-site/ake";
     pub const CREATE_INSTANCE: &str = "/api/v1/household/instances";
     pub const INSTANCE_STATUS: &str = "/api/v1/household/instances/{id}/status";
     pub const STOP_INSTANCE: &str = "/api/v1/household/instances/{id}/stop";
@@ -111,7 +114,9 @@ impl ClawStoreRouteSpec {
     #[must_use]
     pub fn kind(&self) -> &'static str {
         match self.id {
-            "admin_terminal_pty" | "household_terminal_pty" => KIND_WEBSOCKET_UPGRADE,
+            "admin_terminal_pty" | "household_terminal_pty" | "household_owner_site_ake" => {
+                KIND_WEBSOCKET_UPGRADE
+            }
             _ => KIND_HTTP_JSON,
         }
     }
@@ -438,6 +443,17 @@ pub const ROUTES: &[ClawStoreRouteSpec] = &[
         household_operation: None,
     },
     ClawStoreRouteSpec {
+        id: "household_owner_site_ake",
+        surface: "household",
+        method: METHOD_GET,
+        path_template: household::OWNER_SITE_AKE,
+        mount_file: "admin/rust/server-rs/src/claw_store_routes.rs",
+        mount_slice: "household_routes",
+        route_literal: household::OWNER_SITE_AKE,
+        route_expr: "household::OWNER_SITE_AKE",
+        household_operation: None,
+    },
+    ClawStoreRouteSpec {
         id: "household_list_instances",
         surface: "household",
         method: METHOD_GET,
@@ -648,5 +664,9 @@ pub fn household_routes() -> Router<HouseholdClawsState> {
         .route(
             household::OWNER_SITE_PREFLIGHT,
             post(handlers_household_claws::handle_household_owner_site_preflight),
+        )
+        .route(
+            household::OWNER_SITE_AKE,
+            get(handlers_household_claws::handle_household_owner_site_ake),
         )
 }

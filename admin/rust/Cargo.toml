@@ -106,7 +106,7 @@ x509-parser = "0.16"
 
 # Phase 3 cryptographic primitives (household-rs)
 chacha20poly1305 = { version = "0.10", default-features = false, features = ["alloc", "rand_core"] }
-snow              = { version = "0.10", default-features = false, features = ["std", "use-curve25519", "use-chacha20poly1305", "use-blake2", "use-getrandom"] }
+snow              = { version = "0.10", default-features = false, features = ["std", "use-curve25519", "use-chacha20poly1305", "use-blake2", "use-sha2", "use-getrandom"] }
 vsss-rs          = { version = "5", default-features = false, features = ["std"] }
 
 # Phase 3 push transport (server-rs); gated at runtime by THEYOS_PUSH_DISABLED

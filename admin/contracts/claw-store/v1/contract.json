@@ -570,6 +570,28 @@
       }
     },
     {
+      "id": "household_owner_site_ake",
+      "surface": "household",
+      "method": "GET",
+      "path_template": "/api/v1/household/claws/{name}/owner-site/ake",
+      "kind": "websocket_upgrade",
+      "auth_kind": "owner_site_ake",
+      "household_operation": null,
+      "peer_guard": true,
+      "handler": "handlers_household_claws::handle_household_owner_site_ake",
+      "mount": {
+        "file": "admin/rust/server-rs/src/claw_store_routes.rs",
+        "slice": "household_routes",
+        "route_literal": "/api/v1/household/claws/{name}/owner-site/ake",
+        "method_helper": "get"
+      },
+      "expectations": {
+        "upgrade": { "status": 101, "protocol": "websocket" },
+        "peer_rejected": { "status": 403 },
+        "provider_rejected": { "status": 403 }
+      }
+    },
+    {
       "id": "household_list_instances",
       "surface": "household",
       "method": "GET",

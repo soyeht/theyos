@@ -26,6 +26,7 @@
 //!   POST   /api/v1/household/terminals/{container}/attach-token    → peer + `Operation::ClawsUse`
 //!   GET    /api/v1/household/terminals/{container}/pty             → peer + attach-token gated
 //!   POST   /api/v1/household/claws/{name}/owner-site/preflight     → peer + injected pre-effect capability only
+//!   GET    /api/v1/household/claws/{name}/owner-site/ake           → peer + injected A2 provider only
 //!   POST   /api/v1/household/instances/{id}/stop       → `Operation::ClawsUse`
 //!   POST   /api/v1/household/instances/{id}/restart    → `Operation::ClawsUse`
 //!   POST   /api/v1/household/instances/{id}/rebuild    → `Operation::ClawsUse`
@@ -38,6 +39,7 @@
 use crate::household_attach_token::{HouseholdAttachScope, HouseholdAttachTokenStore};
 use crate::household_auth;
 use crate::household_state::HouseholdState;
+use crate::owner_site_ake::OwnerSiteAkeProvider;
 use crate::owner_site_capability::{OwnerSiteCapabilityStore, OwnerSiteResource};
 use crate::responses::{InstanceResponse, ListResponse};
 use crate::state::SharedState;
@@ -253,6 +255,46 @@ pub(crate) async fn handle_household_owner_site_preflight(
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(_) => StatusCode::FORBIDDEN.into_response(),
     }
+}
+
+/// Upgrades the one-WebSocket owner-site A2 M1/M2/M3 handshake.
+///
+/// A missing provider is deliberately a quiet default deny.  The handler
+/// applies the same live Ready + verified-local-Mesh peer gate before looking
+/// at the provider, parsing a resource, or accepting the WebSocket.  Neither
+/// an address nor `ConnectInfo` is an owner-site principal.
+pub(crate) async fn handle_household_owner_site_ake(
+    Path(name): Path<String>,
+    peer: Option<Extension<ConnectInfo<SocketAddr>>>,
+    headers: HeaderMap,
+    provider: Option<Extension<Arc<OwnerSiteAkeProvider>>>,
+    upgrade: WebSocketUpgrade,
+) -> Response {
+    if let Some(reject) = owner_site_ake_peer_rejection(peer_addr(peer)).await {
+        return reject;
+    }
+
+    // A terminal attach token is never an owner-site A2 credential.
+    if headers.contains_key(HOUSEHOLD_ATTACH_TOKEN_HEADER) {
+        return StatusCode::FORBIDDEN.into_response();
+    }
+
+    let Some(Extension(provider)) = provider else {
+        return StatusCode::FORBIDDEN.into_response();
+    };
+    let Ok(resource) = OwnerSiteResource::from_route_claw(&name) else {
+        return StatusCode::FORBIDDEN.into_response();
+    };
+    if !provider.admits_resource(&resource) {
+        return StatusCode::FORBIDDEN.into_response();
+    }
+
+    let peer = peer_addr(peer);
+    upgrade
+        .on_upgrade(move |socket| async move {
+            provider.serve(socket, resource, peer).await;
+        })
+        .into_response()
 }
 
 /// `PoP`-gates listing instances created for the local engine's household.
@@ -1100,6 +1142,20 @@ async fn owner_site_pre_effect_peer_rejection(peer: Option<SocketAddr>) -> Optio
     }
 }
 
+async fn owner_site_ake_peer_rejection(peer: Option<SocketAddr>) -> Option<Response> {
+    match crate::household_listener::post_trust_household_peer_gate(peer).await {
+        Ok(()) => None,
+        Err(status) => {
+            tracing::warn!(
+                stage = "household_claws.owner_site_ake.peer_rejected",
+                peer = ?peer,
+                "household owner-site A2 route rejected source before provider or WebSocket upgrade"
+            );
+            Some(status.into_response())
+        }
+    }
+}
+
 async fn household_list_workspaces(
     state: &SharedState,
     container: &str,
@@ -1267,12 +1323,22 @@ async fn household_delete_workspace(
 mod tests {
     use super::*;
     use crate::claw_store_routes;
+    use crate::owner_site_ake::{
+        OwnerSiteAkeEffectSnapshot, OwnerSiteAkeFixture, OwnerSiteAkeHarness,
+    };
     use crate::owner_site_authority::{OwnerSiteAuthoritySnapshot, active_authority_fixture};
     use crate::owner_site_capability::{
         OwnerSiteBackend, OwnerSiteCapability, OwnerSiteCapabilityScope, OwnerSiteCapabilityStore,
         OwnerSiteEffectCounters, OwnerSiteEffectSnapshot, OwnerSiteIntent, OwnerSiteResource,
     };
-    use axum::{Extension, Router, body::Body, extract::ConnectInfo, http::Request, routing::post};
+    use axum::{
+        Extension, Router,
+        body::Body,
+        extract::ConnectInfo,
+        http::Request,
+        routing::{get, post},
+    };
+    use axum_test::{TestServer, WsMessage};
     use household_rs::keys::{IdentityKey, P256Keypair};
     use household_rs::{BootstrapOpts, KeyBackingPolicy};
     use std::sync::Arc;
@@ -1306,6 +1372,25 @@ mod tests {
             Some(store) => app.layer(Extension(store)),
             None => app,
         }
+    }
+
+    fn owner_site_ake_route(provider: Option<Arc<OwnerSiteAkeProvider>>) -> Router {
+        let app = Router::new().route(
+            claw_store_routes::household::OWNER_SITE_AKE,
+            get(handle_household_owner_site_ake),
+        );
+        match provider {
+            Some(provider) => app.layer(Extension(provider)),
+            None => app,
+        }
+    }
+
+    fn assert_ake_never_effected(snapshot: &OwnerSiteAkeEffectSnapshot) {
+        assert_eq!(snapshot.verified_peers, 0);
+        assert_eq!(snapshot.mints, 0);
+        assert_eq!(snapshot.consumes, 0);
+        assert_eq!(snapshot.proxy_dials, 0);
+        assert_eq!(snapshot.site_bytes, 0);
     }
 
     async fn owner_site_preflight_request(
@@ -1352,6 +1437,81 @@ mod tests {
             },
             "pre-effect owner-site route must not bind, mint, issue/claim a challenge, dial, or expose bytes"
         );
+    }
+
+    #[tokio::test]
+    async fn owner_site_ake_default_denies_and_unverified_mesh_stops_before_provider() {
+        let path = "/api/v1/household/claws/picoclaw/owner-site/ake";
+        let loopback: SocketAddr = "127.0.0.1:41001".parse().expect("loopback peer");
+        let default_server = TestServer::builder()
+            .http_transport()
+            .build(owner_site_ake_route(None).layer(Extension(ConnectInfo(loopback))))
+            .expect("default-deny A2 test server");
+        let response = default_server.get_websocket(path).await;
+        assert_eq!(response.status_code(), StatusCode::FORBIDDEN);
+
+        let OwnerSiteAkeFixture {
+            provider, effects, ..
+        } = OwnerSiteAkeHarness::fixture_for_harness("picoclaw").expect("A2 fixture");
+        let unverified = SocketAddr::from(([10, 44, 0, 2], 41001));
+        let server = TestServer::builder()
+            .http_transport()
+            .build(
+                owner_site_ake_route(Some(Arc::new(provider)))
+                    .layer(Extension(ConnectInfo(unverified))),
+            )
+            .expect("unverified A2 test server");
+        let response = server.get_websocket(path).await;
+        assert_eq!(response.status_code(), StatusCode::FORBIDDEN);
+        assert_eq!(effects.snapshot().sessions_started, 0);
+        assert_eq!(effects.snapshot().challenge_issues, 0);
+        assert_eq!(effects.snapshot().challenge_claims, 0);
+        assert_ake_never_effected(&effects.snapshot());
+    }
+
+    #[tokio::test]
+    async fn owner_site_ake_uses_one_binary_ws_and_stops_pending_finished() {
+        let OwnerSiteAkeFixture {
+            provider,
+            client,
+            effects,
+        } = OwnerSiteAkeHarness::fixture_for_harness("picoclaw").expect("A2 fixture");
+        let loopback: SocketAddr = "127.0.0.1:41001".parse().expect("loopback peer");
+        let app =
+            owner_site_ake_route(Some(Arc::new(provider))).layer(Extension(ConnectInfo(loopback)));
+        let server = TestServer::builder()
+            .http_transport()
+            .build(app)
+            .expect("A2 WS test server");
+        let path = "/api/v1/household/claws/picoclaw/owner-site/ake";
+        let response = server.get_websocket(path).await;
+        assert_eq!(response.status_code(), StatusCode::SWITCHING_PROTOCOLS);
+        let mut websocket = response.into_websocket().await;
+
+        let (mut client_session, m1) = client.start().expect("M1");
+        websocket.send_message(WsMessage::Binary(m1.into())).await;
+        let m2 = websocket.receive_bytes().await;
+        let m3 = client_session
+            .accept_m2_and_make_m3(&m2)
+            .expect("M3 after authenticated M2");
+        websocket.send_message(WsMessage::Binary(m3.into())).await;
+
+        for _ in 0..128 {
+            if effects.snapshot().validated_pending_finished == 1 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        let snapshot = effects.snapshot();
+        assert_eq!(snapshot.sessions_started, 1);
+        assert_eq!(snapshot.challenge_issues, 1);
+        assert_eq!(snapshot.challenge_claims, 1);
+        assert_eq!(snapshot.validated_pending_finished, 1);
+        assert_ake_never_effected(&snapshot);
+        assert_eq!(client.action_pop_signature_count(), 1);
+        // The server emits no S2/plaintext success in this slice. Dropping the
+        // sole WebSocket ends the ephemeral pending state; there is no second
+        // WebSocket, raw stream, or resumable credential to exercise.
     }
 
     #[tokio::test]

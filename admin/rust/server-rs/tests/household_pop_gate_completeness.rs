@@ -32,6 +32,15 @@ enum Gate {
         peer_gate: &'static str,
         admission: &'static str,
     },
+    /// A2's separate WebSocket route: the same shared peer gate must reject
+    /// before an optional typed provider or WebSocket upgrade.  It is not a
+    /// current PoP/attach-token caveat and cannot create a principal in the
+    /// M1/M2/M3-only slice.
+    OwnerSiteAke {
+        peer_gate: &'static str,
+        provider_gate: &'static str,
+        upgrade: &'static str,
+    },
     /// Intentionally NOT a `PoP`-`Operation` caveat — gated by a different,
     /// documented mechanism (this marker substring must be present in the body).
     NonPop(&'static str),
@@ -96,6 +105,14 @@ const HOUSEHOLD_CLAWS_GATES: &[(&str, Gate)] = &[
         Gate::PreEffectPeer {
             peer_gate: "owner_site_pre_effect_peer_rejection(peer_addr(peer)).await",
             admission: "store.pre_effect_admission(&resource)",
+        },
+    ),
+    (
+        "handle_household_owner_site_ake",
+        Gate::OwnerSiteAke {
+            peer_gate: "owner_site_ake_peer_rejection(peer_addr(peer)).await",
+            provider_gate: "provider.admits_resource(&resource)",
+            upgrade: ".on_upgrade",
         },
     ),
     (
@@ -245,6 +262,38 @@ fn every_household_claws_handler_enforces_its_caveat() {
                     assert!(
                         !body.contains(forbidden),
                         "{handler} PR1 pre-effect wire must not contain {forbidden}"
+                    );
+                }
+            }
+            Gate::OwnerSiteAke {
+                peer_gate,
+                provider_gate,
+                upgrade,
+            } => {
+                assert!(
+                    body.contains(peer_gate)
+                        && body.contains(provider_gate)
+                        && body.contains(upgrade),
+                    "{handler} must enforce peer, typed-provider, and one-WebSocket A2 gates"
+                );
+                assert!(
+                    body.find(peer_gate).expect("A2 peer gate")
+                        < body.find(provider_gate).expect("A2 provider gate")
+                        && body.find(provider_gate).expect("A2 provider gate")
+                            < body.find(upgrade).expect("A2 upgrade"),
+                    "{handler} must reject before provider work and before WebSocket upgrade"
+                );
+                for forbidden in [
+                    "authorize(",
+                    "HouseholdAttachTokenStore",
+                    "GuestCredential",
+                    "relay_stream",
+                    "TcpStream",
+                    "connect(",
+                ] {
+                    assert!(
+                        !body.contains(forbidden),
+                        "{handler} A2 route must not acquire {forbidden}"
                     );
                 }
             }

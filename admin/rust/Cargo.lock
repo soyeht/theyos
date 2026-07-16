@@ -4886,6 +4886,7 @@ dependencies = [
  "core-foundation 0.10.1",
  "core-rs",
  "executor-rs",
+ "futures-util",
  "gethostname",
  "hex",
  "hmac 0.12.1",

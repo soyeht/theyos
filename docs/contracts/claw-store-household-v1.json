@@ -50,6 +50,16 @@
       "peer_guard": true
     },
     {
+      "id": "household_owner_site_ake",
+      "name": "owner_site_ake",
+      "method": "GET",
+      "path": "/api/v1/household/claws/{name}/owner-site/ake",
+      "handler": "handle_household_owner_site_ake",
+      "operation": null,
+      "auth": "owner_site_ake",
+      "peer_guard": true
+    },
+    {
       "id": "household_list_instances",
       "name": "list_instances",
       "method": "GET",
