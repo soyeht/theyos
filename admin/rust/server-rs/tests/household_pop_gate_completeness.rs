@@ -25,6 +25,13 @@ enum Gate {
         operation: &'static str,
         peer_gate: &'static str,
     },
+    /// PR1 owner-site wire: shared live transport gate followed only by an
+    /// inert typed admission. It deliberately has no PoP/challenge/effect
+    /// until the later owner-site slices are reviewed.
+    PreEffectPeer {
+        peer_gate: &'static str,
+        admission: &'static str,
+    },
     /// Intentionally NOT a `PoP`-`Operation` caveat — gated by a different,
     /// documented mechanism (this marker substring must be present in the body).
     NonPop(&'static str),
@@ -85,6 +92,13 @@ const HOUSEHOLD_CLAWS_GATES: &[(&str, Gate)] = &[
         },
     ),
     (
+        "handle_household_owner_site_preflight",
+        Gate::PreEffectPeer {
+            peer_gate: "owner_site_pre_effect_peer_rejection(peer_addr(peer)).await",
+            admission: "store.pre_effect_admission(&resource)",
+        },
+    ),
+    (
         "handle_household_stop_instance",
         Gate::Pop("Operation::ClawsUse"),
     ),
@@ -126,33 +140,49 @@ const OWNER_AUTH_ENROLL_INITIAL_HANDLERS: &[&str] = &[
     "owner_webauthn_registration_finish_handler",
 ];
 
-/// Source of `pub async fn {name}` up to the next top-level fn / test module.
+/// Source of a public or crate-private household handler up to the next top-level fn / test module.
 fn handler_body<'a>(source: &'a str, name: &str) -> &'a str {
-    let marker = format!("pub async fn {name}");
-    let start = source
-        .find(&marker)
+    let markers = [
+        format!("pub async fn {name}"),
+        format!("pub(crate) async fn {name}"),
+    ];
+    let (start, marker) = markers
+        .iter()
+        .filter_map(|marker| source.find(marker).map(|start| (start, marker)))
+        .min_by_key(|(start, _)| *start)
         .unwrap_or_else(|| panic!("handler `{name}` not found in source"));
     let rest = &source[start + marker.len()..];
-    let end = ["\npub async fn ", "\npub fn ", "\n#[cfg(test)]"]
-        .iter()
-        .filter_map(|m| rest.find(m))
-        .min()
-        .unwrap_or(rest.len());
+    let end = [
+        "\npub async fn ",
+        "\npub(crate) async fn ",
+        "\npub fn ",
+        "\n#[cfg(test)]",
+    ]
+    .iter()
+    .filter_map(|m| rest.find(m))
+    .min()
+    .unwrap_or(rest.len());
     &rest[..end]
 }
 
-/// Names of every `pub async fn handle_household_*` in the source.
+/// Names of every externally mounted `handle_household_*` in the source.
 fn household_handler_names(source: &str) -> BTreeSet<String> {
     let mut out = BTreeSet::new();
-    let prefix = "pub async fn ";
-    let needle = "pub async fn handle_household_";
-    let mut from = 0;
-    while let Some(idx) = source[from..].find(needle) {
-        let at = from + idx + prefix.len();
-        from = at;
-        let tail = &source[at..];
-        let end = tail.find('(').unwrap_or(tail.len());
-        out.insert(tail[..end].trim().to_string());
+    for (prefix, needle) in [
+        ("pub async fn ", "pub async fn handle_household_"),
+        (
+            "pub(crate) async fn ",
+            "pub(crate) async fn handle_household_",
+        ),
+    ] {
+        let mut from = 0;
+        while let Some(idx) = source[from..].find(needle) {
+            let at = from + idx + prefix.len();
+            from = at;
+            let tail = &source[at..];
+            let end = tail.find('(').unwrap_or(tail.len());
+            out.insert(tail[..end].trim().to_string());
+        }
     }
     out
 }
@@ -184,6 +214,39 @@ fn every_household_claws_handler_enforces_its_caveat() {
                             .expect("PoP authorization must be present after assertion"),
                     "{handler} must reject the peer before PoP authorization"
                 );
+            }
+            Gate::PreEffectPeer {
+                peer_gate,
+                admission,
+            } => {
+                assert!(
+                    body.contains(peer_gate) && body.contains(admission),
+                    "{handler} must enforce shared peer gate `{peer_gate}` before typed admission `{admission}`"
+                );
+                assert!(
+                    body.find(peer_gate)
+                        .expect("peer gate must be present after assertion")
+                        < body
+                            .find(admission)
+                            .expect("pre-effect admission must be present after assertion"),
+                    "{handler} must reject the peer before pre-effect admission"
+                );
+                assert!(
+                    !body.contains("authorize("),
+                    "{handler} must not pretend a current PoP caveat is owner-site authority"
+                );
+                for forbidden in [
+                    "household_mint_attach_token(",
+                    "household_terminal_pty(",
+                    ".consume(",
+                    "TcpStream",
+                    "connect(",
+                ] {
+                    assert!(
+                        !body.contains(forbidden),
+                        "{handler} PR1 pre-effect wire must not contain {forbidden}"
+                    );
+                }
             }
             Gate::NonPop(marker) => assert!(
                 body.contains(marker),

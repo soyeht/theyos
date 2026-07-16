@@ -40,6 +40,16 @@
       "auth": "pop"
     },
     {
+      "id": "household_owner_site_preflight",
+      "name": "owner_site_preflight",
+      "method": "POST",
+      "path": "/api/v1/household/claws/{name}/owner-site/preflight",
+      "handler": "handle_household_owner_site_preflight",
+      "operation": null,
+      "auth": "owner_site_pre_effect",
+      "peer_guard": true
+    },
+    {
       "id": "household_list_instances",
       "name": "list_instances",
       "method": "GET",

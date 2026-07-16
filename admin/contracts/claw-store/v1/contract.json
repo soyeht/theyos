@@ -549,6 +549,27 @@
       }
     },
     {
+      "id": "household_owner_site_preflight",
+      "surface": "household",
+      "method": "POST",
+      "path_template": "/api/v1/household/claws/{name}/owner-site/preflight",
+      "auth_kind": "owner_site_pre_effect",
+      "household_operation": null,
+      "peer_guard": true,
+      "handler": "handlers_household_claws::handle_household_owner_site_preflight",
+      "mount": {
+        "file": "admin/rust/server-rs/src/claw_store_routes.rs",
+        "slice": "household_routes",
+        "route_literal": "/api/v1/household/claws/{name}/owner-site/preflight",
+        "method_helper": "post"
+      },
+      "expectations": {
+        "pre_effect_admitted": { "status": 204 },
+        "peer_rejected": { "status": 403 },
+        "provider_rejected": { "status": 403 }
+      }
+    },
+    {
       "id": "household_list_instances",
       "surface": "household",
       "method": "GET",

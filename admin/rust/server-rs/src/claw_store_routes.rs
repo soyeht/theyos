@@ -72,6 +72,9 @@ pub mod household {
     pub const AVAILABILITY: &str = "/api/v1/household/claws/{name}/availability";
     pub const INSTALL: &str = "/api/v1/household/claws/{name}/install";
     pub const UNINSTALL: &str = "/api/v1/household/claws/{name}/uninstall";
+    /// PR1 pre-effect owner-site wire. It is fail-closed until a later,
+    /// reviewed authority provider is wired; it never exposes a backend.
+    pub const OWNER_SITE_PREFLIGHT: &str = "/api/v1/household/claws/{name}/owner-site/preflight";
     pub const CREATE_INSTANCE: &str = "/api/v1/household/instances";
     pub const INSTANCE_STATUS: &str = "/api/v1/household/instances/{id}/status";
     pub const STOP_INSTANCE: &str = "/api/v1/household/instances/{id}/stop";
@@ -424,6 +427,17 @@ pub const ROUTES: &[ClawStoreRouteSpec] = &[
         household_operation: Some("claws.delete"),
     },
     ClawStoreRouteSpec {
+        id: "household_owner_site_preflight",
+        surface: "household",
+        method: METHOD_POST,
+        path_template: household::OWNER_SITE_PREFLIGHT,
+        mount_file: "admin/rust/server-rs/src/claw_store_routes.rs",
+        mount_slice: "household_routes",
+        route_literal: household::OWNER_SITE_PREFLIGHT,
+        route_expr: "household::OWNER_SITE_PREFLIGHT",
+        household_operation: None,
+    },
+    ClawStoreRouteSpec {
         id: "household_list_instances",
         surface: "household",
         method: METHOD_GET,
@@ -630,5 +644,9 @@ pub fn household_routes() -> Router<HouseholdClawsState> {
         .route(
             household::UNINSTALL,
             post(handlers_household_claws::handle_household_uninstall_claw),
+        )
+        .route(
+            household::OWNER_SITE_PREFLIGHT,
+            post(handlers_household_claws::handle_household_owner_site_preflight),
         )
 }

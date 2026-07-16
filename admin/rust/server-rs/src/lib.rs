@@ -130,6 +130,7 @@ mod mobile_claw_vpn_owner_present_foundation;
 pub mod mobile_token;
 pub mod nonce_cache;
 pub mod owner_cert_auth;
+pub(crate) mod owner_site_capability;
 pub mod owner_webauthn_recovery_consume_rate_limit;
 pub mod pair_machine_local;
 pub mod production_app;

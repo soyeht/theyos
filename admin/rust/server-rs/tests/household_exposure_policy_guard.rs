@@ -107,19 +107,20 @@ fn bonjour_publishers_filter_targets_through_exposure_policy() {
 }
 
 #[test]
-fn post_trust_terminal_peer_gate_uses_the_shared_mesh_policy() {
+fn post_trust_household_peer_gate_is_shared_by_terminal_and_owner_site_pre_effect_routes() {
     let claws_source = read_src("handlers_household_claws.rs");
     assert!(
         claws_source.contains("crate::household_listener::post_trust_household_peer_gate"),
-        "terminal attach must share the opt-in mesh peer gate before its existing PoP check"
+        "peer-sensitive household routes must share the opt-in mesh peer gate"
     );
     for route_gate in [
         "terminal_attach_peer_rejection(peer_addr(peer), \"mint_attach_token\").await",
         "terminal_attach_peer_rejection(peer_addr(peer), \"terminal_pty\").await",
+        "owner_site_pre_effect_peer_rejection(peer_addr(peer)).await",
     ] {
         assert!(
             claws_source.contains(route_gate),
-            "each mesh-sensitive terminal route must use the shared peer gate: {route_gate}"
+            "each mesh-sensitive household route must use the shared peer gate: {route_gate}"
         );
     }
 
@@ -153,6 +154,21 @@ fn post_trust_terminal_peer_gate_uses_the_shared_mesh_policy() {
         "PTY must reject the peer before attach-token redemption"
     );
 
+    let owner_site_handler = slice_between(
+        &claws_source,
+        "pub(crate) async fn handle_household_owner_site_preflight",
+        "\n/// `PoP`-gates listing instances",
+    );
+    assert!(
+        owner_site_handler
+            .find("owner_site_pre_effect_peer_rejection")
+            .expect("owner-site pre-effect route must call the shared peer gate")
+            < owner_site_handler
+                .find("let Some(Extension(store))")
+                .expect("owner-site pre-effect route must retain fail-closed provider extraction"),
+        "owner-site pre-effect route must reject a peer before provider/admission work"
+    );
+
     let listener = read_src("household_listener.rs");
     let production_gate = slice_between(
         &listener,
@@ -177,6 +193,14 @@ fn post_trust_terminal_peer_gate_uses_the_shared_mesh_policy() {
     assert!(
         classified_peer_gate.contains("HouseholdExposurePolicy::allows_terminal_attach_peer"),
         "the live terminal peer state must be evaluated by the shared exposure policy"
+    );
+    assert!(
+        listener.contains("InterfaceClass::Mesh => state == BootstrapState::Ready"),
+        "the shared policy must require Ready before a verified Mesh peer can pass"
+    );
+    assert!(
+        classified_peer_gate.contains("context.mesh.allows_remote_mesh_peer(ip)"),
+        "the shared policy must require the typed local VerifiedMesh decision before Mesh admission"
     );
 }
 

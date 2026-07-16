@@ -25,6 +25,7 @@
 //!   DELETE /api/v1/household/terminals/{container}/workspaces/{id} → `Operation::ClawsUse`
 //!   POST   /api/v1/household/terminals/{container}/attach-token    → peer + `Operation::ClawsUse`
 //!   GET    /api/v1/household/terminals/{container}/pty             → peer + attach-token gated
+//!   POST   /api/v1/household/claws/{name}/owner-site/preflight     → peer + injected pre-effect capability only
 //!   POST   /api/v1/household/instances/{id}/stop       → `Operation::ClawsUse`
 //!   POST   /api/v1/household/instances/{id}/restart    → `Operation::ClawsUse`
 //!   POST   /api/v1/household/instances/{id}/rebuild    → `Operation::ClawsUse`
@@ -37,6 +38,7 @@
 use crate::household_attach_token::{HouseholdAttachScope, HouseholdAttachTokenStore};
 use crate::household_auth;
 use crate::household_state::HouseholdState;
+use crate::owner_site_capability::{OwnerSiteCapabilityStore, OwnerSiteResource};
 use crate::responses::{InstanceResponse, ListResponse};
 use crate::state::SharedState;
 use crate::time_util;
@@ -217,6 +219,40 @@ pub async fn handle_household_uninstall_claw(
         return rate_limited_response();
     }
     forward(handlers_claws::handle_uninstall_claw(State(state.shared.clone()), Path(name)).await)
+}
+
+/// Admits only the inert PR1 owner-site wire shape.
+///
+/// The production household router never injects an owner-site capability
+/// store in this slice, so this endpoint is fail-closed. No owner-site `PoP`,
+/// challenge, backend connection, or browser byte exists yet.
+pub(crate) async fn handle_household_owner_site_preflight(
+    Path(name): Path<String>,
+    peer: Option<Extension<ConnectInfo<SocketAddr>>>,
+    headers: HeaderMap,
+    provider: Option<Extension<Arc<OwnerSiteCapabilityStore>>>,
+) -> Response {
+    if let Some(reject) = owner_site_pre_effect_peer_rejection(peer_addr(peer)).await {
+        return reject;
+    }
+
+    // A terminal attach token is never an owner-site presentation. Reject it
+    // explicitly rather than silently accepting an unrelated bearer header.
+    if headers.contains_key(HOUSEHOLD_ATTACH_TOKEN_HEADER) {
+        return StatusCode::FORBIDDEN.into_response();
+    }
+
+    let Some(Extension(store)) = provider else {
+        return StatusCode::FORBIDDEN.into_response();
+    };
+    let Ok(resource) = OwnerSiteResource::from_route_claw(&name) else {
+        return StatusCode::FORBIDDEN.into_response();
+    };
+
+    match store.pre_effect_admission(&resource) {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(_) => StatusCode::FORBIDDEN.into_response(),
+    }
 }
 
 /// `PoP`-gates listing instances created for the local engine's household.
@@ -1050,6 +1086,20 @@ async fn terminal_attach_peer_rejection(
     }
 }
 
+async fn owner_site_pre_effect_peer_rejection(peer: Option<SocketAddr>) -> Option<Response> {
+    match crate::household_listener::post_trust_household_peer_gate(peer).await {
+        Ok(()) => None,
+        Err(status) => {
+            tracing::warn!(
+                stage = "household_claws.owner_site_pre_effect.peer_rejected",
+                peer = ?peer,
+                "household owner-site pre-effect route rejected source before capability admission"
+            );
+            Some(status.into_response())
+        }
+    }
+}
+
 async fn household_list_workspaces(
     state: &SharedState,
     container: &str,
@@ -1216,9 +1266,92 @@ async fn household_delete_workspace(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::claw_store_routes;
+    use crate::owner_site_capability::{
+        OwnerSiteAuthoritySnapshot, OwnerSiteBackend, OwnerSiteCapability,
+        OwnerSiteCapabilityScope, OwnerSiteCapabilityStore, OwnerSiteEffectCounters,
+        OwnerSiteEffectSnapshot, OwnerSiteIntent, OwnerSiteRemotePrincipal, OwnerSiteResource,
+    };
+    use axum::{Extension, Router, body::Body, extract::ConnectInfo, http::Request, routing::post};
     use household_rs::keys::{IdentityKey, P256Keypair};
     use household_rs::{BootstrapOpts, KeyBackingPolicy};
     use std::sync::Arc;
+    use tower::ServiceExt;
+
+    fn owner_site_store(
+        claw_name: &str,
+        authority: OwnerSiteAuthoritySnapshot,
+    ) -> (Arc<OwnerSiteCapabilityStore>, Arc<OwnerSiteEffectCounters>) {
+        let resource = OwnerSiteResource::from_route_claw(claw_name).expect("owner-site resource");
+        let intent =
+            OwnerSiteIntent::injected_for_harness("household-alpha", "owner-alpha", resource)
+                .expect("owner-site intent");
+        let backend = OwnerSiteBackend::numeric_loopback(
+            "127.0.0.1:7411".parse().expect("numeric loopback backend"),
+        )
+        .expect("loopback backend");
+        let scope = OwnerSiteCapabilityScope::new(intent, authority, backend);
+        let (store, effects) = OwnerSiteCapabilityStore::injected_for_harness(
+            OwnerSiteCapability::injected_for_harness(scope),
+        );
+        (Arc::new(store), effects)
+    }
+
+    fn owner_site_route(provider: Option<Arc<OwnerSiteCapabilityStore>>) -> Router {
+        let app = Router::new().route(
+            claw_store_routes::household::OWNER_SITE_PREFLIGHT,
+            post(handle_household_owner_site_preflight),
+        );
+        match provider {
+            Some(store) => app.layer(Extension(store)),
+            None => app,
+        }
+    }
+
+    async fn owner_site_preflight_request(
+        app: Router,
+        claw_name: &str,
+        peer: Option<SocketAddr>,
+        attach_token: Option<&str>,
+    ) -> StatusCode {
+        let path = format!("/api/v1/household/claws/{claw_name}/owner-site/preflight");
+        let mut builder = Request::builder().method(Method::POST).uri(path);
+        if let Some(peer) = peer {
+            builder = builder.extension(ConnectInfo(peer));
+        }
+        if let Some(attach_token) = attach_token {
+            builder = builder.header(HOUSEHOLD_ATTACH_TOKEN_HEADER, attach_token);
+        }
+        owner_site_route_response(app, builder).await
+    }
+
+    async fn owner_site_route_response(
+        app: Router,
+        builder: axum::http::request::Builder,
+    ) -> StatusCode {
+        app.oneshot(builder.body(Body::empty()).expect("owner-site request"))
+            .await
+            .expect("owner-site response")
+            .status()
+    }
+
+    fn assert_owner_site_zero_effects(
+        effects: &OwnerSiteEffectCounters,
+        pre_effect_admissions: usize,
+    ) {
+        assert_eq!(
+            effects.snapshot(),
+            OwnerSiteEffectSnapshot {
+                listener_binds: 0,
+                mints: 0,
+                consumes: 0,
+                proxy_dials: 0,
+                site_bytes: 0,
+                pre_effect_admissions,
+            },
+            "PR1 owner-site route must not bind, mint, consume, dial, or expose bytes"
+        );
+    }
 
     #[tokio::test]
     async fn household_scope_uses_loaded_engine_identity_not_caller_identity() {
@@ -1245,5 +1378,140 @@ mod tests {
         assert_eq!(scope.household_id, expected_household_id);
         assert_eq!(scope.household_machine_id, expected_machine_id);
         assert_ne!(scope.household_machine_id, caller_person_id);
+    }
+
+    #[tokio::test]
+    async fn owner_site_pre_effect_route_is_typed_fail_closed_and_zero_effect() {
+        let path_resource = "picoclaw";
+        let loopback: SocketAddr = "127.0.0.1:41001".parse().expect("loopback peer");
+
+        // The production router has no owner-site provider in PR1. A valid
+        // source alone therefore cannot produce a pre-effect admission.
+        let status = owner_site_preflight_request(
+            owner_site_route(None),
+            path_resource,
+            Some(loopback),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+
+        // The production no-extension path above is the real default. This
+        // empty test provider additionally makes its zero-effect observation
+        // explicit without granting a capability.
+        let (absent, absent_effects) = OwnerSiteCapabilityStore::unavailable_for_harness();
+        let absent = Arc::new(absent);
+        let absent_pending = absent.pending_count();
+        let status = owner_site_preflight_request(
+            owner_site_route(Some(Arc::clone(&absent))),
+            path_resource,
+            Some(loopback),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(absent.pending_count(), absent_pending);
+        assert_owner_site_zero_effects(&absent_effects, 1);
+
+        let (stale, stale_effects) =
+            owner_site_store(path_resource, OwnerSiteAuthoritySnapshot::Stale);
+        let stale_pending = stale.pending_count();
+        let status = owner_site_preflight_request(
+            owner_site_route(Some(Arc::clone(&stale))),
+            path_resource,
+            Some(loopback),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(stale.pending_count(), stale_pending);
+        assert_owner_site_zero_effects(&stale_effects, 1);
+
+        let (mismatch, mismatch_effects) =
+            owner_site_store(path_resource, OwnerSiteAuthoritySnapshot::Mismatch);
+        let mismatch_pending = mismatch.pending_count();
+        let status = owner_site_preflight_request(
+            owner_site_route(Some(Arc::clone(&mismatch))),
+            path_resource,
+            Some(loopback),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(mismatch.pending_count(), mismatch_pending);
+        assert_owner_site_zero_effects(&mismatch_effects, 1);
+
+        let principal = OwnerSiteRemotePrincipal::injected_for_harness("peer-alpha")
+            .expect("typed harness principal");
+        let (admitted, effects) = owner_site_store(
+            path_resource,
+            OwnerSiteAuthoritySnapshot::InjectedForHarness(principal),
+        );
+        let admitted_pending = admitted.pending_count();
+
+        // An exact typed capability is the only positive path in PR1. This
+        // loopback case exercises the wire harness only; a Mesh success stays
+        // deferred until the reviewed VerifiedMesh provider exists. The route
+        // still invokes the shared live peer gate before this provider.
+        let status = owner_site_preflight_request(
+            owner_site_route(Some(Arc::clone(&admitted))),
+            path_resource,
+            Some(loopback),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        assert_eq!(admitted.pending_count(), admitted_pending);
+        assert_owner_site_zero_effects(&effects, 1);
+
+        // A different resource cannot use the injected capability.
+        let status = owner_site_preflight_request(
+            owner_site_route(Some(Arc::clone(&admitted))),
+            "otherclaw",
+            Some(loopback),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(admitted.pending_count(), admitted_pending);
+        assert_owner_site_zero_effects(&effects, 2);
+
+        // The shared live gate still wins over the injected capability: neither
+        // an unverified Mesh source nor a missing peer reaches the provider.
+        let unverified = SocketAddr::from(([10, 44, 0, 2], 41001));
+        for peer in [Some(unverified), None] {
+            let status = owner_site_preflight_request(
+                owner_site_route(Some(Arc::clone(&admitted))),
+                path_resource,
+                peer,
+                None,
+            )
+            .await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "peer={peer:?}");
+            assert_eq!(admitted.pending_count(), admitted_pending);
+            assert_owner_site_zero_effects(&effects, 2);
+        }
+
+        // A terminal attach bearer cannot be presented at this route and the
+        // terminal token remains untouched after the rejection.
+        let attach_tokens = HouseholdAttachTokenStore::new();
+        let attach = attach_tokens.mint(HouseholdAttachScope {
+            household_id: "household-alpha".to_string(),
+            container: path_resource.to_string(),
+            session_id: "workspace-alpha".to_string(),
+            actor_person_id: "owner-alpha".to_string(),
+        });
+        let attach_pending = attach_tokens.pending_count();
+        let status = owner_site_preflight_request(
+            owner_site_route(Some(Arc::clone(&admitted))),
+            path_resource,
+            Some(loopback),
+            Some(&attach.token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(attach_tokens.pending_count(), attach_pending);
+        assert_eq!(admitted.pending_count(), admitted_pending);
+        assert_owner_site_zero_effects(&effects, 2);
     }
 }

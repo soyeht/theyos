@@ -35,7 +35,7 @@ use jobs_rs::Store as JobsStore;
 use serde_json::{Value, json};
 use server_rs::{
     auth::{SESSION_COOKIE, require_auth},
-    claw_store_service,
+    claw_store_routes, claw_store_service,
     config::Config,
     handlers_claws, handlers_household_claws,
     handlers_household_claws::HouseholdClawsState,
@@ -328,22 +328,7 @@ fn household_fixture() -> HouseholdFixture {
     };
 
     let app = Router::new()
-        .route(
-            "/api/v1/household/claws",
-            get(handlers_household_claws::handle_household_list_claws),
-        )
-        .route(
-            "/api/v1/household/claws/{name}/availability",
-            get(handlers_household_claws::handle_household_claw_availability),
-        )
-        .route(
-            "/api/v1/household/claws/{name}/install",
-            post(handlers_household_claws::handle_household_install_claw),
-        )
-        .route(
-            "/api/v1/household/claws/{name}/uninstall",
-            post(handlers_household_claws::handle_household_uninstall_claw),
-        )
+        .merge(claw_store_routes::household_routes())
         .route(
             "/api/v1/household/instances",
             get(handlers_household_claws::handle_household_list_instances)
@@ -2223,6 +2208,28 @@ async fn household_attach_token_auth_failure_is_empty_401_when_peer_is_allowed()
         bytes.is_empty(),
         "attach-token auth failure body must stay empty"
     );
+    assert_eq!(body, Value::Null);
+}
+
+#[tokio::test]
+async fn household_owner_site_preflight_is_canonically_mounted_and_default_denied() {
+    let household = household_fixture();
+    let response = household
+        .app
+        .layer(Extension(ConnectInfo(loopback_peer_addr())))
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/api/v1/household/claws/picoclaw/owner-site/preflight")
+                .body(Body::empty())
+                .expect("owner-site request"),
+        )
+        .await
+        .expect("owner-site response");
+    let (status, bytes, body) = response_parts(response).await;
+
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert!(bytes.is_empty(), "default-deny body must stay empty");
     assert_eq!(body, Value::Null);
 }
 
