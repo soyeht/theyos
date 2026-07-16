@@ -284,7 +284,7 @@ fn household_claw_contract_handlers_require_declared_auth() {
 }
 
 #[test]
-fn owner_site_ake_route_is_single_ws_and_stays_pending_without_finished_ack() {
+fn owner_site_ake_route_is_single_ws_record_aead_and_stays_pre_effect_after_c3() {
     let routes = include_str!("../src/claw_store_routes.rs");
     let bootstrap = include_str!("../src/household_bootstrap.rs");
     let handlers = include_str!("../src/handlers_household_claws.rs");
@@ -318,6 +318,24 @@ fn owner_site_ake_route_is_single_ws_and_stays_pending_without_finished_ack() {
     assert!(handler.contains("Option<Extension<Arc<OwnerSiteAkeProvider>>>"));
     assert!(handler.contains("WebSocketUpgrade"));
     assert!(handler.contains("provider.serve(socket, resource, peer).await"));
+    let size_limit = handler
+        .find("max_message_size(OWNER_SITE_AKE_MAX_RECORD_ENVELOPE_BYTES)")
+        .expect("A2 must bound complete WebSocket messages before upgrade");
+    let frame_limit = handler
+        .find("max_frame_size(OWNER_SITE_AKE_MAX_RECORD_ENVELOPE_BYTES)")
+        .expect("A2 must bound WebSocket frames before upgrade");
+    let upgrade = handler
+        .find(".on_upgrade")
+        .expect("A2 must use one WebSocket upgrade");
+    assert!(
+        size_limit < upgrade && frame_limit < upgrade,
+        "A2 record bounds must be installed before the WebSocket is upgraded"
+    );
+    assert_eq!(
+        handler.matches(".on_upgrade").count(),
+        1,
+        "A2 must retain exactly one WebSocket upgrade; no second raw or post-login channel"
+    );
     for forbidden in [
         "GuestCredential",
         "relay_stream",
@@ -338,14 +356,34 @@ fn owner_site_ake_route_is_single_ws_and_stays_pending_without_finished_ack() {
         "a2_noise_builder",
         "bstr(canonical-CBOR(X))",
         "a2_r1_pretransport_kat_matches_normative_noise_and_binding_bytes",
+        "a2_r1_transport_kat_matches_frozen_s2_c3_split_and_inverse_opens",
+        "a2_r1_records_fail_closed_for_tamper_replay_direction_and_context_swaps",
+        "a2_r1_rejects_raw_noncanonical_oversize_and_c3_before_s2",
+        "assert_each_s2_wire_byte_is_terminal",
+        "assert_each_c3_wire_byte_is_terminal",
+        "A2_R1_SEMANTIC_CORPUS_V1_SHA256",
         "a2_r1_prologue_swap_fails_before_an_authenticated_m3",
         "a2_r1_profile_name_swap_fails_before_an_authenticated_m3",
         "soyeht/owner-site/a2/v1",
-        "validated pending Finished",
+        "A2RecordEnvelope",
+        "A2S2Plain",
+        "A2C3Plain",
+        "TransportState",
+        "seal_a2_record",
+        "open_a2_record",
+        "s2_wire_hash",
+        "OwnerSiteAkePendingFinished",
+        "next_a2_binary",
+        "A2_HARNESS_WS_STEP_TIMEOUT",
         "claim_after_verified_pop_for_harness",
+        "pause_after_claim_for_harness",
+        "pause_after_s2_for_harness",
+        "post_claim_recheck_rejections",
+        "post_c3_recheck_rejections",
+        "completed_m3_closures",
         "post_trust_household_peer_gate(peer)",
         "certificate.verify(&self.expected_household_key)",
-        "relay_forwarding_splices_only_ake_frames_and_gets_no_success_or_site_bytes",
+        "relay_forwarding_splices_only_a2_ciphertext_and_gets_no_peer_or_site_bytes",
         "tombstone_after_consume_burns_challenge_without_a_peer",
     ] {
         assert!(ake.contains(required), "A2 source must retain `{required}`");
@@ -354,20 +392,64 @@ fn owner_site_ake_route_is_single_ws_and_stays_pending_without_finished_ack() {
         !ake.contains("\"Noise_XX_25519_ChaChaPoly_SHA256\""),
         "A2 must not silently accept the unprofiled XX protocol name"
     );
+    assert!(
+        handlers.contains("owner_site_ake_uses_one_binary_ws_for_s2_c3_then_closes_pre_effect")
+            && handlers
+                .contains("owner_site_ake_route_real_rejects_raw_c3_and_closes_without_effects")
+            && handlers.contains("owner_site_ake_route_real_c3_timeout_closes_without_effects")
+            && handlers
+                .contains("owner_site_ake_route_real_revoke_after_consume_closes_without_effects")
+            && handlers.contains(
+                "owner_site_ake_route_real_revoke_between_s2_and_c3_closes_without_effects"
+            )
+            && handlers.contains("record-confirmed pre-effect state must emit zero raw bytes")
+            && handlers.contains("revoke must expose no raw site bytes"),
+        "route-real A2 coverage must prove confirmed and both revoke intervals close without site bytes"
+    );
+    let emit_s2 = ake
+        .find("pending.emit_s2()")
+        .expect("A2 must emit the server-finished S2 record");
+    let accept_c3 = ake
+        .find("pending.accept_c3(&c3)")
+        .expect("A2 must accept C3 only through pending record state");
+    let final_recheck = ake
+        .find("self.recheck_pending_finished(&pending)")
+        .expect("A2 must recheck exact authority after C3");
+    assert!(
+        emit_s2 < accept_c3 && accept_c3 < final_recheck,
+        "A2 must preserve S2 -> C3 -> final recheck order on the same WS"
+    );
+    assert!(
+        ake.contains("#[cfg(test)]\n    #[must_use]\n    pub(crate) fn injected_for_harness")
+            && ake.contains("#[cfg(not(test))]")
+            && ake.contains("let _ = socket.close().await;"),
+        "only the test harness may admit A2; production must remain fail-closed and close"
+    );
     for forbidden in [
         "struct VerifiedMeshPeer",
         "enum VerifiedMeshPeer",
-        "verified_mesh_peers.fetch_add",
-        "into_transport_mode",
-        "server_finished",
-        "ClientFinishedAck",
+        "verified_peers.fetch_add",
+        "struct DialPermit",
+        "enum DialPermit",
+        "DialPermit",
         "TcpStream",
         "connect(",
         "copy_bidirectional",
+        "proxy_dials.fetch_add",
+        "site_bytes.fetch_add",
+        "set_receiving_nonce",
+        "StatelessTransportState",
+        "risky-raw-split",
+        "rekey",
+        "rekey_manual",
+        "Hkdf",
+        "HKDF",
+        "chacha20poly1305",
+        "Aead",
     ] {
         assert!(
             !ake.contains(forbidden),
-            "the M1/M2/M3 slice must not acquire deferred `{forbidden}` behavior"
+            "the S2/C3 transport slice must not acquire deferred `{forbidden}` behavior"
         );
     }
 }

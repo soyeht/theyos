@@ -1,16 +1,17 @@
-//! Owner-site A2 M1/M2/M3 handshake seam.
+//! Owner-site A2 handshake and test-only record-confirmation seam.
 //!
 //! The route which reaches this module is intentionally fail-closed in a
 //! production process: no reviewed machine/roster provider is installed yet.
 //! The only admitting provider is a crate-test harness.  That lets this slice
 //! exercise the reviewed A2 wire and ordering without turning a socket address,
-//! a CIDR, or an HTTP header into a remote principal.
+//! a CIDR, or an HTTP header into a remote principal.  The harness can also
+//! exercise the A2-R1 S2/C3 record confirmation, but it still closes before
+//! any peer, dial, proxy, or site-byte effect exists.
 //!
-//! This slice stops after a locally observed `validated pending Finished`
-//! state.  It does not define S2/C3, an exporter, record AEAD, a
-//! `VerifiedMeshPeer`, a backend dial, a proxy, or site bytes.  In particular,
-//! it must never substitute a plaintext success response for the missing
-//! reviewed Finished/Ack profile.
+//! Production remains fail-closed because it has no admitting provider.  In
+//! particular, this module must never substitute a plaintext success response
+//! for A2-R1's encrypted record confirmation, nor manufacture a
+//! `VerifiedMeshPeer`, backend dial, proxy, or site bytes.
 
 use std::net::SocketAddr;
 
@@ -18,6 +19,12 @@ use axum::extract::ws::WebSocket;
 use futures_util::SinkExt;
 
 use crate::owner_site_capability::OwnerSiteResource;
+
+/// Maximum canonical A2-R1 record envelope accepted by the WebSocket boundary.
+///
+/// The envelope is `canonical-CBOR([1, ciphertext])`, where ciphertext is at
+/// most 16,384 bytes including the Noise `ChaChaPoly` tag.
+pub(crate) const OWNER_SITE_AKE_MAX_RECORD_ENVELOPE_BYTES: usize = 16_389;
 
 /// Provider seam for the one-WebSocket A2 handshake.
 ///
@@ -63,10 +70,10 @@ impl OwnerSiteAkeProvider {
         }
     }
 
-    /// Drives only M1/M2/M3 on the accepted WebSocket.
+    /// Drives the test-only A2 handshake and S2/C3 confirmation on one WebSocket.
     ///
-    /// The post-M3 result is intentionally silent and ephemeral until a later
-    /// reviewed S2/C3 record-AEAD profile exists.
+    /// The post-C3 result remains intentionally silent and ephemeral until a
+    /// later reviewed peer-promotion and dial slice exists.
     pub(crate) async fn serve(
         &self,
         socket: WebSocket,
@@ -111,11 +118,15 @@ mod harness {
     use serde::{Deserialize, Serialize, de::DeserializeOwned};
     use sha2::{Digest, Sha256};
     use snow::{
-        Builder, HandshakeState,
+        Builder, HandshakeState, TransportState,
         params::{
             BaseChoice, CipherChoice, DHChoice, HandshakeChoice, HandshakeModifierList,
             HandshakePattern, HashChoice, NoiseParams,
         },
+    };
+    use tokio::{
+        sync::Notify,
+        time::{Duration, Instant, timeout},
     };
     use zeroize::{Zeroize, Zeroizing};
 
@@ -147,6 +158,15 @@ mod harness {
     const A2_ENGINE_KEY_ID: &str = "engine:test.v1";
     const A2_NOW: u64 = 1_000;
     const MAX_A2_FRAME_BYTES: usize = 16 * 1024;
+    const MAX_A2_RECORD_CIPHERTEXT_BYTES: usize = 16_384;
+    const MAX_A2_RECORD_PLAINTEXT_BYTES: usize = 16_368;
+    const MAX_A2_RECORD_ENVELOPE_BYTES: usize = super::OWNER_SITE_AKE_MAX_RECORD_ENVELOPE_BYTES;
+    const A2_RECORD_ENVELOPE_VERSION: u8 = 1;
+    const A2_RECORD_KIND_S2: u8 = 1;
+    const A2_RECORD_KIND_C3: u8 = 2;
+    const A2_DIRECTION_DEVICE_TO_ENGINE: u8 = 0;
+    const A2_DIRECTION_ENGINE_TO_DEVICE: u8 = 1;
+    const A2_HARNESS_WS_STEP_TIMEOUT: Duration = Duration::from_secs(1);
     const NOISE_PUBLIC_KEY_BYTES: usize = 32;
     const P256_SIGNATURE_BYTES: usize = 64;
 
@@ -163,6 +183,11 @@ mod harness {
         challenge_issues: AtomicUsize,
         challenge_claims: AtomicUsize,
         validated_pending_finished: AtomicUsize,
+        post_claim_recheck_rejections: AtomicUsize,
+        s2_records_emitted: AtomicUsize,
+        c3_records_accepted: AtomicUsize,
+        post_c3_recheck_rejections: AtomicUsize,
+        completed_m3_closures: AtomicUsize,
         verified_peers: AtomicUsize,
         mints: AtomicUsize,
         consumes: AtomicUsize,
@@ -176,6 +201,11 @@ mod harness {
         pub(crate) challenge_issues: usize,
         pub(crate) challenge_claims: usize,
         pub(crate) validated_pending_finished: usize,
+        pub(crate) post_claim_recheck_rejections: usize,
+        pub(crate) s2_records_emitted: usize,
+        pub(crate) c3_records_accepted: usize,
+        pub(crate) post_c3_recheck_rejections: usize,
+        pub(crate) completed_m3_closures: usize,
         pub(crate) verified_peers: usize,
         pub(crate) mints: usize,
         pub(crate) consumes: usize,
@@ -191,6 +221,13 @@ mod harness {
                 challenge_issues: self.challenge_issues.load(Ordering::SeqCst),
                 challenge_claims: self.challenge_claims.load(Ordering::SeqCst),
                 validated_pending_finished: self.validated_pending_finished.load(Ordering::SeqCst),
+                post_claim_recheck_rejections: self
+                    .post_claim_recheck_rejections
+                    .load(Ordering::SeqCst),
+                s2_records_emitted: self.s2_records_emitted.load(Ordering::SeqCst),
+                c3_records_accepted: self.c3_records_accepted.load(Ordering::SeqCst),
+                post_c3_recheck_rejections: self.post_c3_recheck_rejections.load(Ordering::SeqCst),
+                completed_m3_closures: self.completed_m3_closures.load(Ordering::SeqCst),
                 verified_peers: self.verified_peers.load(Ordering::SeqCst),
                 mints: self.mints.load(Ordering::SeqCst),
                 consumes: self.consumes.load(Ordering::SeqCst),
@@ -268,6 +305,7 @@ mod harness {
                     expected_machine_key: self.expected_machine_key.clone(),
                     expected_engine_key_id: self.expected_engine_key_id.clone(),
                     action_pop_signatures: Arc::clone(&self.action_pop_signatures),
+                    server_hello: None,
                     h_final: None,
                     channel_binding: None,
                 },
@@ -298,6 +336,7 @@ mod harness {
         expected_machine_key: P256PublicKey,
         expected_engine_key_id: String,
         action_pop_signatures: Arc<AtomicUsize>,
+        server_hello: Option<ServerHello>,
         h_final: Option<[u8; 32]>,
         channel_binding: Option<[u8; 32]>,
     }
@@ -381,9 +420,54 @@ mod harness {
             noise.truncate(len);
             let h_final = final_handshake_hash(&self.handshake)?;
             let channel_binding = channel_binding(h_final, &m2.channel_id, m2.channel_epoch)?;
+            self.server_hello = Some(m2);
             self.h_final = Some(h_final);
             self.channel_binding = Some(channel_binding);
             encode_frame(AkeMessageKind::M3, noise)
+        }
+
+        /// Consumes the post-M3 device state, authenticates the exact S2
+        /// record, then emits C3 on the same standard Noise `TransportState`.
+        /// Consuming `self` makes retrying a failed S2 impossible on this
+        /// channel: an error drops the split state rather than resetting it.
+        pub(crate) fn accept_s2_and_make_c3(self, s2_wire: &[u8]) -> AkeResult<Vec<u8>> {
+            let context = self.record_context()?;
+            let mut transport = self
+                .handshake
+                .into_transport_mode()
+                .map_err(|_| OwnerSiteAkeFailure::Rejected)?;
+            if !transport.is_initiator() {
+                return Err(OwnerSiteAkeFailure::Rejected);
+            }
+            let s2_sequence = transport.receiving_nonce();
+            let s2_payload = open_a2_record(&mut transport, s2_wire, s2_sequence)?;
+            let s2: A2S2Plain = decode_canonical(&s2_payload)?;
+            s2.validate_for(&context, s2_sequence, A2_NOW)?;
+            let hs2 = s2_wire_hash(s2_wire)?;
+
+            let c3_sequence = transport.sending_nonce();
+            let c3_payload = encode_canonical(&context.c3_plain(c3_sequence, hs2))?;
+            seal_a2_record(&mut transport, &c3_payload, c3_sequence)
+        }
+
+        fn record_context(&self) -> AkeResult<A2RecordContext> {
+            let m2 = self
+                .server_hello
+                .as_ref()
+                .ok_or(OwnerSiteAkeFailure::Rejected)?;
+            let context = A2RecordContext {
+                channel_id: array_32(&m2.channel_id)?,
+                channel_epoch: m2.channel_epoch,
+                h_final: self.h_final.ok_or(OwnerSiteAkeFailure::Rejected)?,
+                channel_binding: self.channel_binding.ok_or(OwnerSiteAkeFailure::Rejected)?,
+                binding_id: *self.binding_id.as_bytes(),
+                binding_digest: *self.binding_digest.as_bytes(),
+                authz_epoch: m2.authz_epoch,
+                roster_digest: array_32(&m2.roster_digest)?,
+                fresh_until: m2.fresh_until,
+            };
+            context.validate_at(A2_NOW)?;
+            Ok(context)
         }
     }
 
@@ -397,7 +481,32 @@ mod harness {
         challenges: OwnerSiteChallengeTable,
         next_channel_epoch: AtomicU64,
         revoked_roster: OwnerSiteRosterSnapshot,
+        after_claim_pause: Mutex<Option<Arc<OwnerSiteAkeHarnessPause>>>,
+        after_s2_pause: Mutex<Option<Arc<OwnerSiteAkeHarnessPause>>>,
         effects: Arc<OwnerSiteAkeEffects>,
+    }
+
+    /// Test-only synchronization point used to place a deterministic tombstone
+    /// at either reviewed authority re-read boundary.  It has no production
+    /// equivalent and never grants a deferred transport effect.
+    pub(crate) struct OwnerSiteAkeHarnessPause {
+        reached: Notify,
+        resume: Notify,
+    }
+
+    impl OwnerSiteAkeHarnessPause {
+        async fn wait_for_resume(&self) {
+            self.reached.notify_one();
+            self.resume.notified().await;
+        }
+
+        pub(crate) async fn wait_until_reached(&self) {
+            self.reached.notified().await;
+        }
+
+        pub(crate) fn resume(&self) {
+            self.resume.notify_one();
+        }
     }
 
     struct OwnerSiteAkeHarnessAuthority {
@@ -440,6 +549,25 @@ mod harness {
 
         fn is_fresh(&self) -> bool {
             self.roster.is_fresh_for_ake_harness(A2_NOW)
+        }
+    }
+
+    /// Receives exactly one A2 application message.  Text/close frames, EOF,
+    /// socket errors, or bounded wait expiry are terminal for this single
+    /// WebSocket channel; Ping/Pong remains library control traffic and does
+    /// not extend the bounded application deadline.
+    async fn next_a2_binary(socket: &mut WebSocket) -> Option<Vec<u8>> {
+        let deadline = Instant::now() + A2_HARNESS_WS_STEP_TIMEOUT;
+        loop {
+            let remaining = deadline.checked_duration_since(Instant::now())?;
+            match timeout(remaining, socket.next()).await {
+                Ok(Some(Ok(Message::Binary(bytes)))) => return Some(bytes.to_vec()),
+                Ok(Some(Ok(Message::Ping(_) | Message::Pong(_)))) => {
+                    // Library control traffic is never an A2 record and never
+                    // extends the deadline for the application message.
+                }
+                _ => return None,
+            }
         }
     }
 
@@ -568,6 +696,8 @@ mod harness {
                 challenges: OwnerSiteChallengeTable::new_for_harness(),
                 next_channel_epoch: AtomicU64::new(1),
                 revoked_roster,
+                after_claim_pause: Mutex::new(None),
+                after_s2_pause: Mutex::new(None),
                 effects: Arc::clone(&effects),
             };
             let client = OwnerSiteAkeClient {
@@ -599,6 +729,56 @@ mod harness {
             }
         }
 
+        /// Arms a route-real test pause after the one-shot challenge has been
+        /// claimed and before any live gate or roster re-read. Production has
+        /// no equivalent hook and remains fail-closed.
+        pub(crate) fn pause_after_claim_for_harness(&self) -> Arc<OwnerSiteAkeHarnessPause> {
+            let pause = Arc::new(OwnerSiteAkeHarnessPause {
+                reached: Notify::new(),
+                resume: Notify::new(),
+            });
+            if let Ok(mut slot) = self.after_claim_pause.lock() {
+                *slot = Some(Arc::clone(&pause));
+            }
+            pause
+        }
+
+        /// Arms a route-real pause after encrypted S2 is sent and before C3
+        /// can pass its final exact re-read.  This proves a tombstone in that
+        /// interval cannot promote a peer or create any backend effect.
+        pub(crate) fn pause_after_s2_for_harness(&self) -> Arc<OwnerSiteAkeHarnessPause> {
+            let pause = Arc::new(OwnerSiteAkeHarnessPause {
+                reached: Notify::new(),
+                resume: Notify::new(),
+            });
+            if let Ok(mut slot) = self.after_s2_pause.lock() {
+                *slot = Some(Arc::clone(&pause));
+            }
+            pause
+        }
+
+        async fn wait_at_after_claim_pause_if_armed(&self) {
+            let pause = self
+                .after_claim_pause
+                .lock()
+                .ok()
+                .and_then(|slot| slot.clone());
+            if let Some(pause) = pause {
+                pause.wait_for_resume().await;
+            }
+        }
+
+        async fn wait_at_after_s2_pause_if_armed(&self) {
+            let pause = self
+                .after_s2_pause
+                .lock()
+                .ok()
+                .and_then(|slot| slot.clone());
+            if let Some(pause) = pause {
+                pause.wait_for_resume().await;
+            }
+        }
+
         pub(super) fn admits_resource(&self, resource: &OwnerSiteResource) -> bool {
             self.resource == *resource
                 && self
@@ -615,7 +795,7 @@ mod harness {
             peer: Option<SocketAddr>,
         ) {
             self.effects.sessions_started.fetch_add(1, Ordering::SeqCst);
-            let Some(Ok(Message::Binary(m1))) = socket.next().await else {
+            let Some(m1) = next_a2_binary(&mut socket).await else {
                 let _ = socket.close().await;
                 return;
             };
@@ -624,24 +804,85 @@ mod harness {
                 return;
             };
             if socket.send(Message::Binary(m2.into())).await.is_err() {
+                let _ = socket.close().await;
                 return;
             }
-            let Some(Ok(Message::Binary(m3))) = socket.next().await else {
+            let Some(m3) = next_a2_binary(&mut socket).await else {
                 let _ = socket.close().await;
                 return;
             };
-            if session.accept_m3(self, &m3).is_ok()
+            if session.accept_m3(self, &m3).is_err() {
+                let _ = socket.close().await;
+                return;
+            }
+            self.wait_at_after_claim_pause_if_armed().await;
+            let recheck_context = crate::household_listener::post_trust_household_peer_gate(peer)
+                .await
+                .ok()
+                .and_then(|()| self.rechecked_record_context(&session).ok());
+            let Some(context) = recheck_context else {
+                self.effects
+                    .post_claim_recheck_rejections
+                    .fetch_add(1, Ordering::SeqCst);
+                self.effects
+                    .completed_m3_closures
+                    .fetch_add(1, Ordering::SeqCst);
+                let _ = socket.close().await;
+                return;
+            };
+
+            // PendingFinished is server-local, bound to the already claimed
+            // challenge/session, and still has no peer/capability/dial effect.
+            let Ok(mut pending) = session.into_pending_finished(context) else {
+                self.effects
+                    .post_claim_recheck_rejections
+                    .fetch_add(1, Ordering::SeqCst);
+                self.effects
+                    .completed_m3_closures
+                    .fetch_add(1, Ordering::SeqCst);
+                let _ = socket.close().await;
+                return;
+            };
+            let Ok(s2_wire) = pending.emit_s2() else {
+                self.effects
+                    .completed_m3_closures
+                    .fetch_add(1, Ordering::SeqCst);
+                let _ = socket.close().await;
+                return;
+            };
+            self.effects
+                .validated_pending_finished
+                .fetch_add(1, Ordering::SeqCst);
+            if socket.send(Message::Binary(s2_wire.into())).await.is_err() {
+                let _ = socket.close().await;
+                return;
+            }
+            self.effects
+                .s2_records_emitted
+                .fetch_add(1, Ordering::SeqCst);
+            self.wait_at_after_s2_pause_if_armed().await;
+
+            let c3_accepted = matches!(next_a2_binary(&mut socket).await, Some(c3) if pending.accept_c3(&c3).is_ok());
+            let final_recheck_allowed = c3_accepted
                 && crate::household_listener::post_trust_household_peer_gate(peer)
                     .await
                     .is_ok()
-                && self.recheck_after_claim(&session)
-            {
-                // This state is deliberately server-local and immediately
-                // discarded on close.  There is no S2/C3 response in this PR.
+                && self.recheck_pending_finished(&pending);
+            if final_recheck_allowed {
                 self.effects
-                    .validated_pending_finished
+                    .c3_records_accepted
+                    .fetch_add(1, Ordering::SeqCst);
+            } else if c3_accepted {
+                self.effects
+                    .post_c3_recheck_rejections
                     .fetch_add(1, Ordering::SeqCst);
             }
+            self.effects
+                .completed_m3_closures
+                .fetch_add(1, Ordering::SeqCst);
+            // This transport slice deliberately stops here.  Even a valid C3
+            // produces no VerifiedMeshPeer, capability, dial, proxy, or site
+            // byte until a separately reviewed post-transport slice exists.
             let _ = socket.close().await;
         }
 
@@ -793,16 +1034,64 @@ mod harness {
         }
 
         fn recheck_after_claim(&self, session: &OwnerSiteAkeResponderSession) -> bool {
+            self.rechecked_record_context(session).is_ok()
+        }
+
+        /// Re-reads the same authority snapshot after the one-shot claim and
+        /// returns only an exact server-owned record context.  A changed lease,
+        /// generation, digest, or resolved binding fails closed instead of
+        /// silently rebinding S2 to a newer snapshot.
+        fn rechecked_record_context(
+            &self,
+            session: &OwnerSiteAkeResponderSession,
+        ) -> AkeResult<A2RecordContext> {
+            let Ok(authority) = self.authority.lock() else {
+                return Err(OwnerSiteAkeFailure::Rejected);
+            };
+            if !authority.is_fresh() || authority.roster.generation() != session.generation {
+                return Err(OwnerSiteAkeFailure::Rejected);
+            }
+            let context = session.record_context()?;
+            if authority.roster.generation().authz_epoch() != context.authz_epoch
+                || authority.roster.generation().digest() != context.roster_digest
+                || authority.roster.fresh_until_for_harness() != context.fresh_until
+            {
+                return Err(OwnerSiteAkeFailure::Rejected);
+            }
+            let proof = session
+                .proof
+                .as_ref()
+                .ok_or(OwnerSiteAkeFailure::Rejected)?;
+            let resolved = authority.resolve(&self.intent, proof, session.claimed_binding_id)?;
+            if resolved.binding_id().as_bytes() != &context.binding_id
+                || resolved.binding_digest().as_bytes() != &context.binding_digest
+            {
+                return Err(OwnerSiteAkeFailure::Rejected);
+            }
+            Ok(context)
+        }
+
+        /// The post-C3 re-read uses the same exact snapshot proof carried by
+        /// `PendingFinished`.  This slice still closes rather than promotes a
+        /// peer, but a revoke between S2 and C3 is terminal here already.
+        fn recheck_pending_finished(&self, pending: &OwnerSiteAkePendingFinished) -> bool {
             let Ok(authority) = self.authority.lock() else {
                 return false;
             };
-            session.proof.as_ref().is_some_and(|proof| {
-                authority.is_fresh()
-                    && authority.roster.generation() == session.generation
-                    && authority
-                        .resolve(&self.intent, proof, session.claimed_binding_id)
-                        .is_ok()
-            })
+            if !authority.is_fresh()
+                || authority.roster.generation() != pending.generation
+                || authority.roster.generation().authz_epoch() != pending.context.authz_epoch
+                || authority.roster.generation().digest() != pending.context.roster_digest
+                || authority.roster.fresh_until_for_harness() != pending.context.fresh_until
+            {
+                return false;
+            }
+            authority
+                .resolve(&self.intent, &pending.proof, pending.claimed_binding_id)
+                .is_ok_and(|resolved| {
+                    resolved.binding_id().as_bytes() == &pending.context.binding_id
+                        && resolved.binding_digest().as_bytes() == &pending.context.binding_digest
+                })
         }
     }
 
@@ -894,6 +1183,52 @@ mod harness {
             self.channel_binding = Some(channel_binding);
             Ok(())
         }
+
+        fn record_context(&self) -> AkeResult<A2RecordContext> {
+            let proof = self.proof.as_ref().ok_or(OwnerSiteAkeFailure::Rejected)?;
+            let context = A2RecordContext {
+                channel_id: array_32(&self.m2.channel_id)?,
+                channel_epoch: self.m2.channel_epoch,
+                h_final: self.h_final.ok_or(OwnerSiteAkeFailure::Rejected)?,
+                channel_binding: self.channel_binding.ok_or(OwnerSiteAkeFailure::Rejected)?,
+                binding_id: array_32(&proof.binding_id)?,
+                binding_digest: array_32(&proof.binding_digest)?,
+                authz_epoch: self.m2.authz_epoch,
+                roster_digest: array_32(&self.m2.roster_digest)?,
+                fresh_until: self.m2.fresh_until,
+            };
+            context.validate_at(A2_NOW)?;
+            Ok(context)
+        }
+
+        fn into_pending_finished(
+            self,
+            context: A2RecordContext,
+        ) -> AkeResult<OwnerSiteAkePendingFinished> {
+            if self.h_final != Some(context.h_final)
+                || self.channel_binding != Some(context.channel_binding)
+            {
+                return Err(OwnerSiteAkeFailure::Rejected);
+            }
+            let proof = self.proof.ok_or(OwnerSiteAkeFailure::Rejected)?;
+            let transport = self
+                .handshake
+                .into_transport_mode()
+                .map_err(|_| OwnerSiteAkeFailure::Rejected)?;
+            if transport.is_initiator() {
+                return Err(OwnerSiteAkeFailure::Rejected);
+            }
+            Ok(OwnerSiteAkePendingFinished {
+                transport,
+                context,
+                _ws_bound_issue: self.issue,
+                claimed_binding_id: self.claimed_binding_id,
+                generation: self.generation,
+                proof,
+                s2_wire: Vec::new(),
+                hs2: [0u8; 32],
+            })
+        }
     }
 
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -925,6 +1260,219 @@ mod harness {
 
     struct DecodedAkeFrame {
         noise: Vec<u8>,
+    }
+
+    /// A2-R1 post-M3 WebSocket envelope.  This is deliberately a tuple, so
+    /// canonical CBOR encodes exactly `[1, ciphertext]`; no plaintext record
+    /// kind, direction, nonce, or authorization is visible outside Noise.
+    #[derive(Clone, Deserialize, Eq, PartialEq, Serialize)]
+    struct A2RecordEnvelope(u8, #[serde(with = "serde_bytes")] Vec<u8>);
+
+    /// Fixed 14-field S2 plaintext.  Tuple representation is intentional:
+    /// maps, defaults, optional fields, and unknown fields are not part of
+    /// the A2-R1 record language.
+    #[derive(Clone, Deserialize, Eq, PartialEq, Serialize)]
+    struct A2S2Plain(
+        String,
+        u8,
+        u8,
+        u8,
+        u64,
+        #[serde(with = "serde_bytes")] Vec<u8>,
+        u64,
+        #[serde(with = "serde_bytes")] Vec<u8>,
+        #[serde(with = "serde_bytes")] Vec<u8>,
+        #[serde(with = "serde_bytes")] Vec<u8>,
+        #[serde(with = "serde_bytes")] Vec<u8>,
+        u64,
+        #[serde(with = "serde_bytes")] Vec<u8>,
+        u64,
+    );
+
+    /// Fixed 15-field C3 plaintext.  C3 repeats the authenticated S2 context
+    /// and adds `HS2`, binding the acknowledgement to the exact S2 wire image.
+    #[derive(Clone, Deserialize, Eq, PartialEq, Serialize)]
+    struct A2C3Plain(
+        String,
+        u8,
+        u8,
+        u8,
+        u64,
+        #[serde(with = "serde_bytes")] Vec<u8>,
+        u64,
+        #[serde(with = "serde_bytes")] Vec<u8>,
+        #[serde(with = "serde_bytes")] Vec<u8>,
+        #[serde(with = "serde_bytes")] Vec<u8>,
+        #[serde(with = "serde_bytes")] Vec<u8>,
+        u64,
+        #[serde(with = "serde_bytes")] Vec<u8>,
+        u64,
+        #[serde(with = "serde_bytes")] Vec<u8>,
+    );
+
+    /// Server-owned snapshot that a pending S2/C3 exchange must carry without
+    /// reaccepting any of its values from a client header or socket address.
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    struct A2RecordContext {
+        channel_id: [u8; 32],
+        channel_epoch: u64,
+        h_final: [u8; 32],
+        channel_binding: [u8; 32],
+        binding_id: [u8; 32],
+        binding_digest: [u8; 32],
+        authz_epoch: u64,
+        roster_digest: [u8; 32],
+        fresh_until: u64,
+    }
+
+    impl A2RecordContext {
+        fn validate_at(&self, now: u64) -> AkeResult<()> {
+            if self.channel_epoch == 0 || self.authz_epoch == 0 || self.fresh_until <= now {
+                return Err(OwnerSiteAkeFailure::Rejected);
+            }
+            Ok(())
+        }
+
+        fn s2_plain(&self, sequence: u64) -> A2S2Plain {
+            A2S2Plain(
+                A2_DOMAIN.to_owned(),
+                A2_VERSION,
+                A2_RECORD_KIND_S2,
+                A2_DIRECTION_ENGINE_TO_DEVICE,
+                sequence,
+                self.channel_id.to_vec(),
+                self.channel_epoch,
+                self.h_final.to_vec(),
+                self.channel_binding.to_vec(),
+                self.binding_id.to_vec(),
+                self.binding_digest.to_vec(),
+                self.authz_epoch,
+                self.roster_digest.to_vec(),
+                self.fresh_until,
+            )
+        }
+
+        fn c3_plain(&self, sequence: u64, hs2: [u8; 32]) -> A2C3Plain {
+            A2C3Plain(
+                A2_DOMAIN.to_owned(),
+                A2_VERSION,
+                A2_RECORD_KIND_C3,
+                A2_DIRECTION_DEVICE_TO_ENGINE,
+                sequence,
+                self.channel_id.to_vec(),
+                self.channel_epoch,
+                self.h_final.to_vec(),
+                self.channel_binding.to_vec(),
+                self.binding_id.to_vec(),
+                self.binding_digest.to_vec(),
+                self.authz_epoch,
+                self.roster_digest.to_vec(),
+                self.fresh_until,
+                hs2.to_vec(),
+            )
+        }
+    }
+
+    impl A2S2Plain {
+        fn validate_for(
+            &self,
+            context: &A2RecordContext,
+            sequence: u64,
+            now: u64,
+        ) -> AkeResult<()> {
+            context.validate_at(now)?;
+            if self.0 != A2_DOMAIN
+                || self.1 != A2_VERSION
+                || self.2 != A2_RECORD_KIND_S2
+                || self.3 != A2_DIRECTION_ENGINE_TO_DEVICE
+                || self.4 != sequence
+                || self.5.as_slice() != context.channel_id.as_slice()
+                || self.6 != context.channel_epoch
+                || self.7.as_slice() != context.h_final.as_slice()
+                || self.8.as_slice() != context.channel_binding.as_slice()
+                || self.9.as_slice() != context.binding_id.as_slice()
+                || self.10.as_slice() != context.binding_digest.as_slice()
+                || self.11 != context.authz_epoch
+                || self.12.as_slice() != context.roster_digest.as_slice()
+                || self.13 != context.fresh_until
+            {
+                return Err(OwnerSiteAkeFailure::Rejected);
+            }
+            Ok(())
+        }
+    }
+
+    impl A2C3Plain {
+        fn validate_for(
+            &self,
+            context: &A2RecordContext,
+            sequence: u64,
+            hs2: [u8; 32],
+            now: u64,
+        ) -> AkeResult<()> {
+            context.validate_at(now)?;
+            if self.0 != A2_DOMAIN
+                || self.1 != A2_VERSION
+                || self.2 != A2_RECORD_KIND_C3
+                || self.3 != A2_DIRECTION_DEVICE_TO_ENGINE
+                || self.4 != sequence
+                || self.5.as_slice() != context.channel_id.as_slice()
+                || self.6 != context.channel_epoch
+                || self.7.as_slice() != context.h_final.as_slice()
+                || self.8.as_slice() != context.channel_binding.as_slice()
+                || self.9.as_slice() != context.binding_id.as_slice()
+                || self.10.as_slice() != context.binding_digest.as_slice()
+                || self.11 != context.authz_epoch
+                || self.12.as_slice() != context.roster_digest.as_slice()
+                || self.13 != context.fresh_until
+                || self.14.as_slice() != hs2.as_slice()
+            {
+                return Err(OwnerSiteAkeFailure::Rejected);
+            }
+            Ok(())
+        }
+    }
+
+    /// The server-only, ephemeral state after M3 + consume + re-read.  It is
+    /// deliberately not a peer, capability, or dial permit; dropping it closes
+    /// the only transport state held by this pre-effect test harness.
+    struct OwnerSiteAkePendingFinished {
+        transport: TransportState,
+        context: A2RecordContext,
+        _ws_bound_issue: OwnerSiteChallengeIssueScope,
+        claimed_binding_id: OwnerSiteBindingId,
+        generation: OwnerSiteAuthorityGeneration,
+        proof: ClientProof,
+        s2_wire: Vec<u8>,
+        hs2: [u8; 32],
+    }
+
+    impl OwnerSiteAkePendingFinished {
+        fn emit_s2(&mut self) -> AkeResult<Vec<u8>> {
+            if !self.s2_wire.is_empty() || self.transport.is_initiator() {
+                return Err(OwnerSiteAkeFailure::Rejected);
+            }
+            self.context.validate_at(A2_NOW)?;
+            let sequence = self.transport.sending_nonce();
+            let plaintext = encode_canonical(&self.context.s2_plain(sequence))?;
+            let wire = seal_a2_record(&mut self.transport, &plaintext, sequence)?;
+            self.hs2 = s2_wire_hash(&wire)?;
+            self.s2_wire = wire.clone();
+            Ok(wire)
+        }
+
+        fn accept_c3(&mut self, c3_wire: &[u8]) -> AkeResult<()> {
+            if self.s2_wire.is_empty() || self.transport.is_initiator() {
+                return Err(OwnerSiteAkeFailure::Rejected);
+            }
+            if self.hs2 != s2_wire_hash(&self.s2_wire)? {
+                return Err(OwnerSiteAkeFailure::Rejected);
+            }
+            let sequence = self.transport.receiving_nonce();
+            let plaintext = open_a2_record(&mut self.transport, c3_wire, sequence)?;
+            let c3: A2C3Plain = decode_canonical(&plaintext)?;
+            c3.validate_for(&self.context, sequence, self.hs2, A2_NOW)
+        }
     }
 
     #[derive(Clone, Deserialize, Serialize)]
@@ -1087,6 +1635,16 @@ mod harness {
         u64,
     );
 
+    /// Hash input for `HS2`.  The exact canonical S2 wire is a bstr here,
+    /// never re-decoded/re-encoded before the acknowledgement binds it.
+    #[derive(Serialize)]
+    struct S2WireHashTranscript<'a>(
+        &'a str,
+        &'a str,
+        u8,
+        #[serde(with = "serde_bytes")] &'a [u8],
+    );
+
     fn encode_frame(kind: AkeMessageKind, noise: Vec<u8>) -> AkeResult<Vec<u8>> {
         if noise.is_empty() || noise.len() > MAX_A2_FRAME_BYTES {
             return Err(OwnerSiteAkeFailure::Rejected);
@@ -1111,6 +1669,69 @@ mod harness {
             return Err(OwnerSiteAkeFailure::Rejected);
         }
         Ok(DecodedAkeFrame { noise: frame.noise })
+    }
+
+    /// Seals one fixed-shape A2-R1 record with Snow's stateful split key.
+    /// Snow supplies the mandated empty AD and nonce construction; this helper
+    /// only verifies the sequence before handing it to the state machine.
+    fn seal_a2_record(
+        transport: &mut TransportState,
+        plaintext: &[u8],
+        expected_sequence: u64,
+    ) -> AkeResult<Vec<u8>> {
+        if plaintext.is_empty()
+            || plaintext.len() > MAX_A2_RECORD_PLAINTEXT_BYTES
+            || expected_sequence == u64::MAX
+            || transport.sending_nonce() != expected_sequence
+        {
+            return Err(OwnerSiteAkeFailure::Rejected);
+        }
+        let mut ciphertext = vec![0u8; plaintext.len() + 16];
+        let ciphertext_len = transport
+            .write_message(plaintext, &mut ciphertext)
+            .map_err(|_| OwnerSiteAkeFailure::Rejected)?;
+        ciphertext.truncate(ciphertext_len);
+        if ciphertext.is_empty() || ciphertext.len() > MAX_A2_RECORD_CIPHERTEXT_BYTES {
+            return Err(OwnerSiteAkeFailure::Rejected);
+        }
+        let wire = encode_canonical(&A2RecordEnvelope(A2_RECORD_ENVELOPE_VERSION, ciphertext))?;
+        if wire.len() > MAX_A2_RECORD_ENVELOPE_BYTES {
+            return Err(OwnerSiteAkeFailure::Rejected);
+        }
+        Ok(wire)
+    }
+
+    /// Authenticates and opens exactly one canonical A2-R1 record.  It checks
+    /// the sequence before decryption and returns plaintext only after Snow
+    /// has authenticated the tag under the stateful receiving `CipherState`.
+    fn open_a2_record(
+        transport: &mut TransportState,
+        wire: &[u8],
+        expected_sequence: u64,
+    ) -> AkeResult<Vec<u8>> {
+        if wire.is_empty()
+            || wire.len() > MAX_A2_RECORD_ENVELOPE_BYTES
+            || expected_sequence == u64::MAX
+            || transport.receiving_nonce() != expected_sequence
+        {
+            return Err(OwnerSiteAkeFailure::Rejected);
+        }
+        let envelope: A2RecordEnvelope = decode_canonical(wire)?;
+        if envelope.0 != A2_RECORD_ENVELOPE_VERSION
+            || envelope.1.len() < 16
+            || envelope.1.len() > MAX_A2_RECORD_CIPHERTEXT_BYTES
+        {
+            return Err(OwnerSiteAkeFailure::Rejected);
+        }
+        let mut plaintext = vec![0u8; envelope.1.len()];
+        let plaintext_len = transport
+            .read_message(&envelope.1, &mut plaintext)
+            .map_err(|_| OwnerSiteAkeFailure::Rejected)?;
+        plaintext.truncate(plaintext_len);
+        if plaintext.is_empty() || plaintext.len() > MAX_A2_RECORD_PLAINTEXT_BYTES {
+            return Err(OwnerSiteAkeFailure::Rejected);
+        }
+        Ok(plaintext)
     }
 
     fn encode_canonical<T: Serialize>(value: &T) -> AkeResult<Vec<u8>> {
@@ -1255,6 +1876,15 @@ mod harness {
         ))
     }
 
+    fn s2_wire_hash(s2_wire: &[u8]) -> AkeResult<[u8; 32]> {
+        if s2_wire.is_empty() || s2_wire.len() > MAX_A2_RECORD_ENVELOPE_BYTES {
+            return Err(OwnerSiteAkeFailure::Rejected);
+        }
+        hash_canonical(&S2WireHashTranscript(
+            A2_DOMAIN, "s2-wire", A2_VERSION, s2_wire,
+        ))
+    }
+
     fn random_32() -> [u8; 32] {
         let mut bytes = [0u8; 32];
         OsRng.fill_bytes(&mut bytes);
@@ -1384,8 +2014,443 @@ mod harness {
     mod tests {
         use super::*;
 
+        const A2_R1_SEMANTIC_CORPUS_V1: &str = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../contracts/mobile-claw-vpn/v1/owner_site_a2_r1_semantic_corpus_v1.json"
+        ));
+        const A2_R1_SEMANTIC_CORPUS_V1_SHA256: &str =
+            "dde67030a035928d0a859a19fc7dcf14ea8e8fa54643e9f66302652740548330";
+
+        /// Declarative A2-R1 record shape anchored by the frozen cross-language
+        /// corpus.  Functional tests below must keep this exact envelope,
+        /// direction, sequence, and bounded-size contract.
+        #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+        struct A2R1RecordLayout {
+            envelope_version: u8,
+            s2_kind: u8,
+            s2_direction: u8,
+            s2_sequence: u64,
+            s2_arity: usize,
+            c3_kind: u8,
+            c3_direction: u8,
+            c3_sequence: u64,
+            c3_arity: usize,
+            max_ciphertext_bytes: usize,
+            max_plaintext_bytes: usize,
+            max_envelope_bytes: usize,
+        }
+
+        const A2_R1_RECORD_LAYOUT: A2R1RecordLayout = A2R1RecordLayout {
+            envelope_version: 1,
+            s2_kind: 1,
+            s2_direction: 1,
+            s2_sequence: 0,
+            s2_arity: 14,
+            c3_kind: 2,
+            c3_direction: 0,
+            c3_sequence: 0,
+            c3_arity: 15,
+            max_ciphertext_bytes: 16_384,
+            max_plaintext_bytes: 16_368,
+            max_envelope_bytes: 16_389,
+        };
+
         fn fixture() -> OwnerSiteAkeFixture {
             OwnerSiteAkeHarness::fixture_for_harness("picoclaw").expect("typed A2 fixture")
+        }
+
+        fn frozen_transport_kat() -> serde_json::Value {
+            let corpus: serde_json::Value =
+                serde_json::from_str(A2_R1_SEMANTIC_CORPUS_V1).expect("frozen corpus JSON");
+            corpus["transport_kat_a2_r1"].clone()
+        }
+
+        fn frozen_hex(object: &serde_json::Value, field: &str) -> Vec<u8> {
+            hex::decode(
+                object[field]
+                    .as_str()
+                    .unwrap_or_else(|| panic!("frozen KAT {field} must be hex")),
+            )
+            .unwrap_or_else(|_| panic!("frozen KAT {field} must decode"))
+        }
+
+        fn frozen_u64(object: &serde_json::Value, field: &str) -> u64 {
+            object[field]
+                .as_u64()
+                .unwrap_or_else(|| panic!("frozen KAT {field} must be uint"))
+        }
+
+        fn frozen_record_context(transport: &serde_json::Value) -> A2RecordContext {
+            let channel = &transport["channel_context"];
+            A2RecordContext {
+                channel_id: array_32(&frozen_hex(channel, "channel_id_hex"))
+                    .expect("32-byte frozen channel id"),
+                channel_epoch: frozen_u64(channel, "channel_epoch"),
+                h_final: array_32(&frozen_hex(transport, "h_final_hex"))
+                    .expect("32-byte frozen H_final"),
+                channel_binding: array_32(&frozen_hex(transport, "channel_binding_hex"))
+                    .expect("32-byte frozen CB"),
+                binding_id: array_32(&frozen_hex(channel, "binding_id_hex"))
+                    .expect("32-byte frozen binding id"),
+                binding_digest: array_32(&frozen_hex(channel, "binding_digest_hex"))
+                    .expect("32-byte frozen binding digest"),
+                authz_epoch: frozen_u64(channel, "authz_epoch"),
+                roster_digest: array_32(&frozen_hex(channel, "roster_digest_hex"))
+                    .expect("32-byte frozen roster digest"),
+                fresh_until: frozen_u64(channel, "fresh_until_unix_s"),
+            }
+        }
+
+        fn frozen_transport_pair() -> (TransportState, TransportState, A2RecordContext, u64) {
+            let kat = frozen_transport_kat();
+            let inputs = &kat["synthetic_x25519_private_inputs"];
+            let prologue = frozen_hex(&kat, "p_a2_canonical_cbor_hex");
+            let device_static = frozen_hex(inputs, "device_static_hex");
+            let device_ephemeral = frozen_hex(inputs, "device_ephemeral_hex");
+            let engine_static = frozen_hex(inputs, "engine_static_hex");
+            let engine_ephemeral = frozen_hex(inputs, "engine_ephemeral_hex");
+            let mut device = a2_noise_builder(&prologue)
+                .expect("device builder")
+                .local_private_key(&device_static)
+                .expect("device static")
+                .fixed_ephemeral_key_for_testing_only(&device_ephemeral)
+                .build_initiator()
+                .expect("device initiator");
+            let mut engine = a2_noise_builder(&prologue)
+                .expect("engine builder")
+                .local_private_key(&engine_static)
+                .expect("engine static")
+                .fixed_ephemeral_key_for_testing_only(&engine_ephemeral)
+                .build_responder()
+                .expect("engine responder");
+            let mut plaintext = vec![0u8; MAX_A2_FRAME_BYTES];
+            let exchange = |sender: &mut HandshakeState,
+                            receiver: &mut HandshakeState,
+                            payload: Vec<u8>,
+                            plaintext: &mut Vec<u8>| {
+                let mut noise = vec![0u8; MAX_A2_FRAME_BYTES];
+                let len = sender
+                    .write_message(&payload, &mut noise)
+                    .expect("Noise write");
+                noise.truncate(len);
+                let opened = receiver
+                    .read_message(&noise, plaintext)
+                    .expect("Noise inverse open");
+                assert_eq!(&plaintext[..opened], payload);
+            };
+            exchange(
+                &mut device,
+                &mut engine,
+                frozen_hex(&kat, "m1_payload_canonical_cbor_hex"),
+                &mut plaintext,
+            );
+            exchange(
+                &mut engine,
+                &mut device,
+                frozen_hex(&kat, "m2_payload_canonical_cbor_hex"),
+                &mut plaintext,
+            );
+            exchange(
+                &mut device,
+                &mut engine,
+                frozen_hex(&kat, "m3_payload_canonical_cbor_hex"),
+                &mut plaintext,
+            );
+            let context = frozen_record_context(&kat);
+            assert_eq!(
+                context.h_final,
+                final_handshake_hash(&device).expect("device H_final")
+            );
+            assert_eq!(
+                context.h_final,
+                final_handshake_hash(&engine).expect("engine H_final")
+            );
+            let now = frozen_u64(&kat["channel_context"], "kat_now_unix_s");
+            (
+                device.into_transport_mode().expect("device split"),
+                engine.into_transport_mode().expect("engine split"),
+                context,
+                now,
+            )
+        }
+
+        /// A separate fully completed XX channel used only to prove that an
+        /// S2/C3 ciphertext from one WebSocket cannot be replayed into another
+        /// channel, even when its record plaintext would otherwise be valid.
+        fn independent_transport_pair() -> (TransportState, TransportState) {
+            let prologue = a2_noise_prologue().expect("canonical P_A2");
+            let mut device = a2_noise_builder(&prologue)
+                .expect("independent device builder")
+                .local_private_key(&[0x31; 32])
+                .expect("independent device static")
+                .fixed_ephemeral_key_for_testing_only(&[0x32; 32])
+                .build_initiator()
+                .expect("independent device initiator");
+            let mut engine = a2_noise_builder(&prologue)
+                .expect("independent engine builder")
+                .local_private_key(&[0x41; 32])
+                .expect("independent engine static")
+                .fixed_ephemeral_key_for_testing_only(&[0x42; 32])
+                .build_responder()
+                .expect("independent engine responder");
+            let mut plaintext = vec![0u8; MAX_A2_FRAME_BYTES];
+            let exchange = |sender: &mut HandshakeState,
+                            receiver: &mut HandshakeState,
+                            payload: Vec<u8>,
+                            plaintext: &mut Vec<u8>| {
+                let mut noise = vec![0u8; MAX_A2_FRAME_BYTES];
+                let len = sender
+                    .write_message(&payload, &mut noise)
+                    .expect("independent Noise write");
+                noise.truncate(len);
+                let opened = receiver
+                    .read_message(&noise, plaintext)
+                    .expect("independent Noise inverse open");
+                assert_eq!(&plaintext[..opened], payload);
+            };
+            exchange(
+                &mut device,
+                &mut engine,
+                encode_canonical(&(A2_DOMAIN, A2_VERSION, "independent-m1"))
+                    .expect("independent M1"),
+                &mut plaintext,
+            );
+            exchange(
+                &mut engine,
+                &mut device,
+                encode_canonical(&(A2_DOMAIN, A2_VERSION, "independent-m2"))
+                    .expect("independent M2"),
+                &mut plaintext,
+            );
+            exchange(
+                &mut device,
+                &mut engine,
+                encode_canonical(&(A2_DOMAIN, A2_VERSION, "independent-m3"))
+                    .expect("independent M3"),
+                &mut plaintext,
+            );
+            (
+                device
+                    .into_transport_mode()
+                    .expect("independent device split"),
+                engine
+                    .into_transport_mode()
+                    .expect("independent engine split"),
+            )
+        }
+
+        fn assert_authenticated_s2_context_mutation_is_rejected(
+            mutate: impl FnOnce(&mut A2RecordContext),
+        ) {
+            let (mut device, mut engine, expected, now) = frozen_transport_pair();
+            let mut altered = expected.clone();
+            mutate(&mut altered);
+            let s2_payload = encode_canonical(&altered.s2_plain(0)).expect("altered S2 plaintext");
+            let s2_wire =
+                seal_a2_record(&mut engine, &s2_payload, 0).expect("authenticated altered S2");
+            let received =
+                open_a2_record(&mut device, &s2_wire, 0).expect("S2 tag still authentic");
+            let decoded: A2S2Plain = decode_canonical(&received).expect("canonical altered S2");
+            assert!(
+                decoded.validate_for(&expected, 0, now).is_err(),
+                "an authenticated but mismatched S2 context must be terminal"
+            );
+        }
+
+        fn assert_authenticated_c3_context_mutation_is_rejected(
+            mutate: impl FnOnce(&mut A2RecordContext),
+        ) {
+            let (mut device, mut engine, expected, now) = frozen_transport_pair();
+            let s2_payload = encode_canonical(&expected.s2_plain(0)).expect("canonical S2");
+            let s2_wire = seal_a2_record(&mut engine, &s2_payload, 0).expect("S2 wire");
+            let opened_s2 = open_a2_record(&mut device, &s2_wire, 0).expect("S2 opens");
+            let opened_s2: A2S2Plain = decode_canonical(&opened_s2).expect("canonical S2");
+            opened_s2
+                .validate_for(&expected, 0, now)
+                .expect("S2 exact context");
+
+            let hs2 = s2_wire_hash(&s2_wire).expect("exact S2 hash");
+            let mut altered = expected.clone();
+            mutate(&mut altered);
+            let c3_payload =
+                encode_canonical(&altered.c3_plain(0, hs2)).expect("altered C3 plaintext");
+            let c3_wire =
+                seal_a2_record(&mut device, &c3_payload, 0).expect("authenticated altered C3");
+            let received = open_a2_record(&mut engine, &c3_wire, 0).expect("C3 tag authentic");
+            let decoded: A2C3Plain = decode_canonical(&received).expect("canonical altered C3");
+            assert!(
+                decoded.validate_for(&expected, 0, hs2, now).is_err(),
+                "an authenticated but mismatched C3 context must be terminal"
+            );
+        }
+
+        fn assert_authenticated_s2_shape_mutation_is_rejected(mutate: impl FnOnce(&mut A2S2Plain)) {
+            let (mut device, mut engine, context, now) = frozen_transport_pair();
+            let mut altered = context.s2_plain(0);
+            mutate(&mut altered);
+            let payload = encode_canonical(&altered).expect("authenticated altered S2 plaintext");
+            let wire = seal_a2_record(&mut engine, &payload, 0).expect("authenticated altered S2");
+            let opened = open_a2_record(&mut device, &wire, 0).expect("S2 tag authentic");
+            let decoded: A2S2Plain = decode_canonical(&opened).expect("canonical altered S2");
+            assert!(
+                decoded.validate_for(&context, 0, now).is_err(),
+                "an authenticated S2 shape mutation must be terminal"
+            );
+        }
+
+        fn assert_authenticated_c3_shape_mutation_is_rejected(mutate: impl FnOnce(&mut A2C3Plain)) {
+            let (mut device, mut engine, context, now) = frozen_transport_pair();
+            let s2_payload = encode_canonical(&context.s2_plain(0)).expect("canonical S2");
+            let s2_wire = seal_a2_record(&mut engine, &s2_payload, 0).expect("S2 wire");
+            let opened_s2 = open_a2_record(&mut device, &s2_wire, 0).expect("S2 opens");
+            let opened_s2: A2S2Plain = decode_canonical(&opened_s2).expect("canonical S2");
+            opened_s2
+                .validate_for(&context, 0, now)
+                .expect("S2 exact context");
+
+            let mut altered = context.c3_plain(0, s2_wire_hash(&s2_wire).expect("exact S2 hash"));
+            mutate(&mut altered);
+            let payload = encode_canonical(&altered).expect("authenticated altered C3 plaintext");
+            let wire = seal_a2_record(&mut device, &payload, 0).expect("authenticated altered C3");
+            let opened = open_a2_record(&mut engine, &wire, 0).expect("C3 tag authentic");
+            let decoded: A2C3Plain = decode_canonical(&opened).expect("canonical altered C3");
+            assert!(
+                decoded
+                    .validate_for(
+                        &context,
+                        0,
+                        s2_wire_hash(&s2_wire).expect("exact S2 hash"),
+                        now
+                    )
+                    .is_err(),
+                "an authenticated C3 shape mutation must be terminal"
+            );
+        }
+
+        fn make_authenticated_c3(
+            device: &mut TransportState,
+            engine: &mut TransportState,
+            context: &A2RecordContext,
+            now: u64,
+        ) -> Vec<u8> {
+            let s2_sequence = engine.sending_nonce();
+            let s2_payload =
+                encode_canonical(&context.s2_plain(s2_sequence)).expect("canonical S2");
+            let s2_wire =
+                seal_a2_record(engine, &s2_payload, s2_sequence).expect("authenticated S2");
+            let s2_sequence = device.receiving_nonce();
+            let s2_payload =
+                open_a2_record(device, &s2_wire, s2_sequence).expect("S2 inverse open");
+            let s2: A2S2Plain = decode_canonical(&s2_payload).expect("canonical S2");
+            s2.validate_for(context, s2_sequence, now)
+                .expect("S2 exact context");
+
+            let c3_sequence = device.sending_nonce();
+            let c3_payload = encode_canonical(
+                &context.c3_plain(c3_sequence, s2_wire_hash(&s2_wire).expect("exact S2 hash")),
+            )
+            .expect("canonical C3");
+            seal_a2_record(device, &c3_payload, c3_sequence).expect("authenticated C3")
+        }
+
+        fn assert_each_s2_wire_byte_is_terminal() {
+            let (device, mut engine, context, _) = frozen_transport_pair();
+            let payload = encode_canonical(&context.s2_plain(0)).expect("canonical S2");
+            let wire = seal_a2_record(&mut engine, &payload, 0).expect("frozen S2 wire");
+            for index in 0..wire.len() {
+                let (mut device_for_mutation, _engine_for_mutation, _, _) = frozen_transport_pair();
+                let mut altered = wire.clone();
+                altered[index] ^= 0x01;
+                assert!(
+                    open_a2_record(&mut device_for_mutation, &altered, 0).is_err(),
+                    "S2 byte {index} must be terminal when altered"
+                );
+            }
+            assert_eq!(device.receiving_nonce(), 0);
+        }
+
+        fn assert_each_c3_wire_byte_is_terminal() {
+            let (mut device, mut engine, context, now) = frozen_transport_pair();
+            let wire = make_authenticated_c3(&mut device, &mut engine, &context, now);
+            for index in 0..wire.len() {
+                let (_device_for_mutation, mut engine_for_mutation, _, _) = frozen_transport_pair();
+                let mut altered = wire.clone();
+                altered[index] ^= 0x01;
+                assert!(
+                    open_a2_record(&mut engine_for_mutation, &altered, 0).is_err(),
+                    "C3 byte {index} must be terminal when altered"
+                );
+            }
+            assert_eq!(engine.receiving_nonce(), 0);
+        }
+
+        #[test]
+        fn a2_r1_semantic_corpus_is_frozen_non_authoritative_transport_contract() {
+            assert_eq!(
+                hex::encode(sha256(A2_R1_SEMANTIC_CORPUS_V1.as_bytes())),
+                A2_R1_SEMANTIC_CORPUS_V1_SHA256,
+                "the shared Rust/iOS corpus is a byte-for-byte frozen v1 anchor"
+            );
+
+            let corpus: serde_json::Value =
+                serde_json::from_str(A2_R1_SEMANTIC_CORPUS_V1).expect("valid frozen corpus JSON");
+            assert_eq!(corpus["version"], 1);
+            assert_eq!(
+                corpus["contract"],
+                "soyeht-owner-site-a2-r1-semantic-corpus"
+            );
+            assert_eq!(
+                corpus["authority_status"],
+                "synthetic-test-only-non-authoritative"
+            );
+            assert_eq!(
+                corpus["scope"],
+                "synthetic-test-only-cross-language-witness"
+            );
+
+            assert_eq!(
+                A2_R1_RECORD_LAYOUT,
+                A2R1RecordLayout {
+                    envelope_version: 1,
+                    s2_kind: 1,
+                    s2_direction: 1,
+                    s2_sequence: 0,
+                    s2_arity: 14,
+                    c3_kind: 2,
+                    c3_direction: 0,
+                    c3_sequence: 0,
+                    c3_arity: 15,
+                    max_ciphertext_bytes: 16_384,
+                    max_plaintext_bytes: 16_368,
+                    max_envelope_bytes: 16_389,
+                }
+            );
+
+            let transport = corpus["transport_kat_a2_r1"]
+                .as_object()
+                .expect("frozen transport KAT object");
+            assert_eq!(transport["protocol_name"], A2_NOISE_PROTOCOL_NAME);
+            for field in ["hs2_hex", "s2_wire_hex", "c3_wire_hex"] {
+                let encoded = transport[field]
+                    .as_str()
+                    .expect("frozen KAT fields remain textual fixture input");
+                assert!(
+                    !encoded.is_empty()
+                        && encoded.len() % 2 == 0
+                        && encoded
+                            .bytes()
+                            .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f')),
+                    "{field} must remain lowercase even-length fixture hex"
+                );
+            }
+
+            let pre_c3_effects = corpus["semantic_cases"][0]["pre_c3_expected_effects"]
+                .as_object()
+                .expect("synthetic case fixes pre-C3 effects");
+            assert!(
+                pre_c3_effects.values().all(|value| value == 0),
+                "the transport scaffold cannot turn the synthetic corpus into a peer, dial, proxy, mint, or site-byte effect"
+            );
         }
 
         #[test]
@@ -1413,6 +2478,11 @@ mod harness {
                     challenge_issues: 1,
                     challenge_claims: 1,
                     validated_pending_finished: 0,
+                    post_claim_recheck_rejections: 0,
+                    s2_records_emitted: 0,
+                    c3_records_accepted: 0,
+                    post_c3_recheck_rejections: 0,
+                    completed_m3_closures: 0,
                     verified_peers: 0,
                     mints: 0,
                     consumes: 0,
@@ -1507,6 +2577,461 @@ mod harness {
             let channel_binding =
                 channel_binding(h_final_engine, &[0x10; 32], 7).expect("A2 channel binding");
             assert_eq!(hex::encode(channel_binding), CHANNEL_BINDING_HEX);
+        }
+
+        #[test]
+        fn a2_r1_transport_kat_matches_frozen_s2_c3_split_and_inverse_opens() {
+            let kat = frozen_transport_kat();
+            let inputs = &kat["synthetic_x25519_private_inputs"];
+            let prologue = frozen_hex(&kat, "p_a2_canonical_cbor_hex");
+            assert_eq!(
+                prologue,
+                a2_noise_prologue().expect("fixed A2-R1 prologue"),
+                "the corpus must anchor the only allowed prologue"
+            );
+
+            let mut device = a2_noise_builder(&prologue)
+                .expect("device builder")
+                .local_private_key(&frozen_hex(inputs, "device_static_hex"))
+                .expect("device static")
+                .fixed_ephemeral_key_for_testing_only(&frozen_hex(inputs, "device_ephemeral_hex"))
+                .build_initiator()
+                .expect("device initiator");
+            let mut engine = a2_noise_builder(&prologue)
+                .expect("engine builder")
+                .local_private_key(&frozen_hex(inputs, "engine_static_hex"))
+                .expect("engine static")
+                .fixed_ephemeral_key_for_testing_only(&frozen_hex(inputs, "engine_ephemeral_hex"))
+                .build_responder()
+                .expect("engine responder");
+
+            let m1_payload = frozen_hex(&kat, "m1_payload_canonical_cbor_hex");
+            let m2_payload = frozen_hex(&kat, "m2_payload_canonical_cbor_hex");
+            let m3_payload = frozen_hex(&kat, "m3_payload_canonical_cbor_hex");
+            let mut plaintext = vec![0u8; MAX_A2_FRAME_BYTES];
+
+            let mut m1 = vec![0u8; MAX_A2_FRAME_BYTES];
+            let m1_len = device
+                .write_message(&m1_payload, &mut m1)
+                .expect("M1 write");
+            m1.truncate(m1_len);
+            assert_eq!(m1, frozen_hex(&kat, "m1_noise_hex"));
+            let m1_plaintext = engine.read_message(&m1, &mut plaintext).expect("M1 read");
+            assert_eq!(&plaintext[..m1_plaintext], m1_payload);
+
+            let mut m2 = vec![0u8; MAX_A2_FRAME_BYTES];
+            let m2_len = engine
+                .write_message(&m2_payload, &mut m2)
+                .expect("M2 write");
+            m2.truncate(m2_len);
+            assert_eq!(m2, frozen_hex(&kat, "m2_noise_hex"));
+            let m2_plaintext = device.read_message(&m2, &mut plaintext).expect("M2 read");
+            assert_eq!(&plaintext[..m2_plaintext], m2_payload);
+
+            let mut m3 = vec![0u8; MAX_A2_FRAME_BYTES];
+            let m3_len = device
+                .write_message(&m3_payload, &mut m3)
+                .expect("M3 write");
+            m3.truncate(m3_len);
+            assert_eq!(m3, frozen_hex(&kat, "m3_noise_hex"));
+            let m3_plaintext = engine.read_message(&m3, &mut plaintext).expect("M3 read");
+            assert_eq!(&plaintext[..m3_plaintext], m3_payload);
+
+            let h_final = final_handshake_hash(&engine).expect("finished engine transcript");
+            assert_eq!(
+                h_final,
+                final_handshake_hash(&device).expect("finished device transcript")
+            );
+            assert_eq!(h_final.to_vec(), frozen_hex(&kat, "h_final_hex"));
+            let context = frozen_record_context(&kat);
+            let channel = &kat["channel_context"];
+            context
+                .validate_at(frozen_u64(channel, "kat_now_unix_s"))
+                .expect("fresh frozen KAT context");
+            assert_eq!(context.h_final, h_final);
+            assert_eq!(
+                context.channel_binding,
+                channel_binding(h_final, &context.channel_id, context.channel_epoch)
+                    .expect("frozen channel binding")
+            );
+
+            let mut device_transport = device
+                .into_transport_mode()
+                .expect("standard initiator Noise split");
+            let mut engine_transport = engine
+                .into_transport_mode()
+                .expect("standard responder Noise split");
+            assert!(device_transport.is_initiator());
+            assert!(!engine_transport.is_initiator());
+            assert_eq!(engine_transport.sending_nonce(), 0);
+            assert_eq!(device_transport.receiving_nonce(), 0);
+
+            let s2_sequence = engine_transport.sending_nonce();
+            let s2_plain = context.s2_plain(s2_sequence);
+            let s2_payload = encode_canonical(&s2_plain).expect("canonical S2 plaintext");
+            let s2_wire = seal_a2_record(&mut engine_transport, &s2_payload, s2_sequence)
+                .expect("responder S2 at nonce zero");
+            assert_eq!(s2_wire, frozen_hex(&kat, "s2_wire_hex"));
+            let hs2 = s2_wire_hash(&s2_wire).expect("HS2 over exact S2 wire");
+            assert_eq!(hs2.to_vec(), frozen_hex(&kat, "hs2_hex"));
+            assert_eq!(engine_transport.sending_nonce(), 1);
+
+            let s2_received_sequence = device_transport.receiving_nonce();
+            let server_finished_payload =
+                open_a2_record(&mut device_transport, &s2_wire, s2_received_sequence)
+                    .expect("initiator opens responder S2");
+            let server_finished: A2S2Plain =
+                decode_canonical(&server_finished_payload).expect("canonical authenticated S2");
+            server_finished
+                .validate_for(
+                    &context,
+                    s2_received_sequence,
+                    frozen_u64(channel, "kat_now_unix_s"),
+                )
+                .expect("S2 exact context");
+            assert_eq!(device_transport.receiving_nonce(), 1);
+
+            let c3_sequence = device_transport.sending_nonce();
+            let c3_plain = context.c3_plain(c3_sequence, hs2);
+            let c3_payload = encode_canonical(&c3_plain).expect("canonical C3 plaintext");
+            let c3_wire = seal_a2_record(&mut device_transport, &c3_payload, c3_sequence)
+                .expect("initiator C3 at nonce zero");
+            assert_eq!(c3_wire, frozen_hex(&kat, "c3_wire_hex"));
+            assert_eq!(device_transport.sending_nonce(), 1);
+
+            let c3_received_sequence = engine_transport.receiving_nonce();
+            let client_ack_payload =
+                open_a2_record(&mut engine_transport, &c3_wire, c3_received_sequence)
+                    .expect("responder opens initiator C3");
+            let client_ack: A2C3Plain =
+                decode_canonical(&client_ack_payload).expect("canonical authenticated C3");
+            client_ack
+                .validate_for(
+                    &context,
+                    c3_received_sequence,
+                    hs2,
+                    frozen_u64(channel, "kat_now_unix_s"),
+                )
+                .expect("C3 exact context and HS2");
+            assert_eq!(engine_transport.receiving_nonce(), 1);
+        }
+
+        #[test]
+        fn a2_r1_records_fail_closed_for_tamper_replay_direction_and_context_swaps() {
+            assert_each_s2_wire_byte_is_terminal();
+            assert_each_c3_wire_byte_is_terminal();
+
+            let (mut replay_device, mut replay_engine, replay_context, replay_now) =
+                frozen_transport_pair();
+            let replay_payload =
+                encode_canonical(&replay_context.s2_plain(0)).expect("canonical replay S2");
+            let replay_wire =
+                seal_a2_record(&mut replay_engine, &replay_payload, 0).expect("replay S2 wire");
+            let first_open =
+                open_a2_record(&mut replay_device, &replay_wire, 0).expect("first S2 opens");
+            let first_s2: A2S2Plain = decode_canonical(&first_open).expect("first canonical S2");
+            first_s2
+                .validate_for(&replay_context, 0, replay_now)
+                .expect("first S2 context");
+            assert_eq!(replay_device.receiving_nonce(), 1);
+            assert!(
+                open_a2_record(&mut replay_device, &replay_wire, 1).is_err(),
+                "a replay cannot satisfy the next stateful CipherState nonce"
+            );
+
+            let (wrong_direction_device, mut wrong_direction_engine, direction_context, _) =
+                frozen_transport_pair();
+            let direction_payload =
+                encode_canonical(&direction_context.s2_plain(0)).expect("direction S2");
+            let direction_wire = seal_a2_record(&mut wrong_direction_engine, &direction_payload, 0)
+                .expect("responder S2");
+            assert!(
+                open_a2_record(&mut wrong_direction_engine, &direction_wire, 0).is_err(),
+                "the responder cannot open its own E-to-D record with the D-to-E key"
+            );
+            assert_eq!(wrong_direction_device.receiving_nonce(), 0);
+
+            let (
+                mut c3_wrong_direction_device,
+                mut c3_wrong_direction_engine,
+                c3_direction_context,
+                c3_direction_now,
+            ) = frozen_transport_pair();
+            let c3_wrong_direction_wire = make_authenticated_c3(
+                &mut c3_wrong_direction_device,
+                &mut c3_wrong_direction_engine,
+                &c3_direction_context,
+                c3_direction_now,
+            );
+            let c3_wrong_direction_nonce = c3_wrong_direction_device.receiving_nonce();
+            assert!(
+                open_a2_record(
+                    &mut c3_wrong_direction_device,
+                    &c3_wrong_direction_wire,
+                    c3_wrong_direction_nonce,
+                )
+                .is_err(),
+                "the device cannot open its own D-to-E C3 record with the E-to-D c2 key"
+            );
+            assert_eq!(c3_wrong_direction_engine.receiving_nonce(), 0);
+
+            assert_authenticated_s2_context_mutation_is_rejected(|altered| {
+                altered.h_final[0] ^= 0x01;
+            });
+            assert_authenticated_s2_context_mutation_is_rejected(|altered| {
+                altered.channel_binding[0] ^= 0x01;
+            });
+            assert_authenticated_s2_context_mutation_is_rejected(|altered| {
+                altered.channel_id[0] ^= 0x01;
+            });
+            assert_authenticated_s2_context_mutation_is_rejected(|altered| {
+                altered.binding_id[0] ^= 0x01;
+            });
+            assert_authenticated_s2_context_mutation_is_rejected(|altered| {
+                altered.binding_digest[0] ^= 0x01;
+            });
+            assert_authenticated_s2_context_mutation_is_rejected(|altered| {
+                altered.roster_digest[0] ^= 0x01;
+            });
+            assert_authenticated_s2_context_mutation_is_rejected(|altered| {
+                altered.channel_epoch += 1;
+            });
+            assert_authenticated_s2_context_mutation_is_rejected(|altered| {
+                altered.authz_epoch += 1;
+            });
+            assert_authenticated_s2_context_mutation_is_rejected(|altered| {
+                altered.fresh_until += 1;
+            });
+            assert_authenticated_s2_shape_mutation_is_rejected(|altered| {
+                altered.3 = A2_DIRECTION_DEVICE_TO_ENGINE;
+            });
+            assert_authenticated_s2_shape_mutation_is_rejected(|altered| {
+                altered.4 = 1;
+            });
+
+            assert_authenticated_c3_context_mutation_is_rejected(|altered| {
+                altered.h_final[0] ^= 0x01;
+            });
+            assert_authenticated_c3_context_mutation_is_rejected(|altered| {
+                altered.channel_binding[0] ^= 0x01;
+            });
+            assert_authenticated_c3_context_mutation_is_rejected(|altered| {
+                altered.binding_id[0] ^= 0x01;
+            });
+            assert_authenticated_c3_context_mutation_is_rejected(|altered| {
+                altered.binding_digest[0] ^= 0x01;
+            });
+            assert_authenticated_c3_context_mutation_is_rejected(|altered| {
+                altered.authz_epoch += 1;
+            });
+            assert_authenticated_c3_context_mutation_is_rejected(|altered| {
+                altered.channel_epoch += 1;
+            });
+            assert_authenticated_c3_context_mutation_is_rejected(|altered| {
+                altered.fresh_until += 1;
+            });
+            assert_authenticated_c3_shape_mutation_is_rejected(|altered| {
+                altered.3 = A2_DIRECTION_ENGINE_TO_DEVICE;
+            });
+            assert_authenticated_c3_shape_mutation_is_rejected(|altered| {
+                altered.4 = 1;
+            });
+
+            let (mut c3_device, mut c3_engine, c3_context, c3_now) = frozen_transport_pair();
+            let c3_s2_payload = encode_canonical(&c3_context.s2_plain(0)).expect("C3 S2 plaintext");
+            let c3_s2_wire = seal_a2_record(&mut c3_engine, &c3_s2_payload, 0).expect("C3 S2 wire");
+            let s2_for_c3_payload =
+                open_a2_record(&mut c3_device, &c3_s2_wire, 0).expect("C3 S2 open");
+            let s2_for_c3: A2S2Plain =
+                decode_canonical(&s2_for_c3_payload).expect("C3 S2 canonical");
+            s2_for_c3
+                .validate_for(&c3_context, 0, c3_now)
+                .expect("C3 S2 context");
+            let hs2 = s2_wire_hash(&c3_s2_wire).expect("C3 HS2");
+            let mut altered_hs2 = hs2;
+            altered_hs2[0] ^= 0x01;
+            let c3_payload =
+                encode_canonical(&c3_context.c3_plain(0, altered_hs2)).expect("altered C3");
+            let c3_wire = seal_a2_record(&mut c3_device, &c3_payload, 0).expect("C3 wire");
+            let client_ack_payload = open_a2_record(&mut c3_engine, &c3_wire, 0).expect("C3 open");
+            let client_ack: A2C3Plain =
+                decode_canonical(&client_ack_payload).expect("C3 canonical");
+            assert!(
+                client_ack
+                    .validate_for(&c3_context, 0, hs2, c3_now)
+                    .is_err(),
+                "C3 must acknowledge the exact stored S2 wire hash"
+            );
+
+            let (mut replay_c3_device, mut replay_c3_engine, replay_c3_context, replay_c3_now) =
+                frozen_transport_pair();
+            let replay_c3 = make_authenticated_c3(
+                &mut replay_c3_device,
+                &mut replay_c3_engine,
+                &replay_c3_context,
+                replay_c3_now,
+            );
+            assert!(
+                open_a2_record(&mut replay_c3_engine, &replay_c3, 0).is_ok(),
+                "the first C3 is the expected stateful record"
+            );
+            assert!(
+                open_a2_record(&mut replay_c3_engine, &replay_c3, 1).is_err(),
+                "a C3 replay cannot satisfy the next receiving nonce"
+            );
+
+            let (mut cross_device, mut cross_engine, cross_context, cross_now) =
+                frozen_transport_pair();
+            let cross_c3 = make_authenticated_c3(
+                &mut cross_device,
+                &mut cross_engine,
+                &cross_context,
+                cross_now,
+            );
+            let (_other_device, mut other_engine) = independent_transport_pair();
+            assert!(
+                open_a2_record(&mut other_engine, &cross_c3, 0).is_err(),
+                "a C3 from another completed WebSocket must fail its distinct split key"
+            );
+        }
+
+        #[test]
+        fn a2_r1_rejects_raw_noncanonical_oversize_and_c3_before_s2() {
+            let (mut raw_device, _raw_engine, raw_context, _) = frozen_transport_pair();
+            let raw_plaintext =
+                encode_canonical(&raw_context.s2_plain(0)).expect("raw S2 plaintext");
+            assert!(
+                open_a2_record(&mut raw_device, &raw_plaintext, 0).is_err(),
+                "an unsealed S2 plaintext is never a record envelope"
+            );
+
+            let (mut legacy_device, _legacy_engine, _, _) = frozen_transport_pair();
+            let legacy_ake_frame =
+                encode_frame(AkeMessageKind::M3, vec![0x01]).expect("legacy handshake frame");
+            assert!(
+                open_a2_record(&mut legacy_device, &legacy_ake_frame, 0).is_err(),
+                "the pre-Finished AkeFrame map is not a post-M3 A2 envelope"
+            );
+
+            let (mut noncanonical_device, _noncanonical_engine, _, _) = frozen_transport_pair();
+            let nonminimal_array_length = vec![0x98, 0x02, 0x01, 0x40];
+            assert!(
+                open_a2_record(&mut noncanonical_device, &nonminimal_array_length, 0).is_err(),
+                "non-minimal CBOR array syntax is terminal before decryption"
+            );
+
+            let (mut wrong_version_device, _wrong_version_engine, _, _) = frozen_transport_pair();
+            let wrong_version = encode_canonical(&A2RecordEnvelope(2, vec![0x7f; 16]))
+                .expect("canonical wrong-version envelope");
+            assert!(
+                open_a2_record(&mut wrong_version_device, &wrong_version, 0).is_err(),
+                "only envelope version one is accepted"
+            );
+
+            let (mut extra_arity_device, _extra_arity_engine, _, _) = frozen_transport_pair();
+            let mut extra_arity = vec![0x83, 0x01, 0x50];
+            extra_arity.extend_from_slice(&[0x00; 16]);
+            extra_arity.push(0x00);
+            assert!(
+                open_a2_record(&mut extra_arity_device, &extra_arity, 0).is_err(),
+                "an envelope with an unknown third field is rejected"
+            );
+
+            let (mut short_cipher_device, _short_cipher_engine, _, _) = frozen_transport_pair();
+            let short_ciphertext = encode_canonical(&A2RecordEnvelope(1, vec![0x00; 15]))
+                .expect("canonical short envelope");
+            assert!(
+                open_a2_record(&mut short_cipher_device, &short_ciphertext, 0).is_err(),
+                "a record ciphertext must carry the full ChaChaPoly tag"
+            );
+
+            let (mut empty_cipher_device, _empty_cipher_engine, _, _) = frozen_transport_pair();
+            let empty_ciphertext =
+                encode_canonical(&A2RecordEnvelope(1, Vec::new())).expect("empty envelope");
+            assert!(
+                open_a2_record(&mut empty_cipher_device, &empty_ciphertext, 0).is_err(),
+                "an empty ciphertext envelope is rejected"
+            );
+
+            let (mut oversized_cipher_device, _oversized_cipher_engine, _, _) =
+                frozen_transport_pair();
+            let oversized_ciphertext = encode_canonical(&A2RecordEnvelope(
+                1,
+                vec![0x00; MAX_A2_RECORD_CIPHERTEXT_BYTES + 1],
+            ))
+            .expect("canonical oversized ciphertext envelope");
+            assert!(oversized_ciphertext.len() > MAX_A2_RECORD_ENVELOPE_BYTES);
+            assert!(
+                open_a2_record(&mut oversized_cipher_device, &oversized_ciphertext, 0).is_err(),
+                "a ciphertext above the 16,384-byte bound is rejected at the 16,389-byte envelope frontier"
+            );
+
+            let (mut bounded_device, mut bounded_engine, _bounded_context, _) =
+                frozen_transport_pair();
+            let maximum_plaintext = vec![0x5a; MAX_A2_RECORD_PLAINTEXT_BYTES];
+            let maximum_wire = seal_a2_record(&mut bounded_engine, &maximum_plaintext, 0)
+                .expect("the exact plaintext bound is allowed");
+            assert!(maximum_wire.len() <= MAX_A2_RECORD_ENVELOPE_BYTES);
+            assert_eq!(
+                open_a2_record(&mut bounded_device, &maximum_wire, 0)
+                    .expect("the exact ciphertext bound is allowed"),
+                maximum_plaintext
+            );
+            assert_eq!(bounded_engine.sending_nonce(), 1);
+            assert_eq!(bounded_device.receiving_nonce(), 1);
+            assert!(
+                seal_a2_record(&mut bounded_engine, &[0x01], 0).is_err(),
+                "the caller cannot reuse a sending nonce"
+            );
+            assert!(
+                seal_a2_record(
+                    &mut bounded_engine,
+                    &vec![0x00; MAX_A2_RECORD_PLAINTEXT_BYTES + 1],
+                    1,
+                )
+                .is_err(),
+                "plaintext above 16,368 bytes is rejected before encryption"
+            );
+            assert!(
+                open_a2_record(
+                    &mut bounded_device,
+                    &vec![0x00; MAX_A2_RECORD_ENVELOPE_BYTES + 1],
+                    1,
+                )
+                .is_err(),
+                "a WebSocket payload above 16,389 bytes is rejected before parsing"
+            );
+
+            let fixture = fixture();
+            let harness = fixture
+                .provider
+                .harness_for_test()
+                .expect("test-only A2 harness");
+            let (mut client, m1) = fixture.client.start().expect("M1");
+            let (mut server, m2) = harness.begin_m1(&harness.resource, &m1).expect("M2");
+            let m3 = client.accept_m2_and_make_m3(&m2).expect("M3");
+            assert_eq!(server.accept_m3(&harness, &m3), Ok(()));
+            let context = harness
+                .rechecked_record_context(&server)
+                .expect("exact post-claim context");
+            let mut pending = server
+                .into_pending_finished(context)
+                .expect("server-only pending state");
+            let premature_c3 = encode_canonical(&A2RecordEnvelope(1, vec![0x7f; 16]))
+                .expect("premature C3-shaped envelope");
+            assert!(
+                pending.accept_c3(&premature_c3).is_err(),
+                "C3 before a server-emitted S2 is terminal"
+            );
+            assert!(pending.s2_wire.is_empty());
+            assert_eq!(pending.transport.receiving_nonce(), 0);
+            let effects = fixture.effects.snapshot();
+            assert_eq!(effects.challenge_claims, 1);
+            assert_eq!(effects.verified_peers, 0);
+            assert_eq!(effects.mints, 0);
+            assert_eq!(effects.consumes, 0);
+            assert_eq!(effects.proxy_dials, 0);
+            assert_eq!(effects.site_bytes, 0);
         }
 
         #[test]
@@ -1670,20 +3195,20 @@ mod harness {
         }
 
         #[test]
-        fn relay_forwarding_splices_only_ake_frames_and_gets_no_success_or_site_bytes() {
+        fn relay_forwarding_splices_only_a2_ciphertext_and_gets_no_peer_or_site_bytes() {
             let fixture = fixture();
             let harness = fixture
                 .provider
                 .harness_for_test()
                 .expect("test harness provider");
 
-            // Carrier M forwards the exact three messages but has neither a
-            // signing key nor a transport key. M1 necessarily names the
-            // requested resource; the M2/M3 payloads are Noise protected.
+            // Carrier M forwards the same WebSocket but has neither a signing
+            // key nor a transport key. M1 names the requested resource; M2/M3
+            // and every post-M3 record are Noise protected.
             let (mut device, m1_from_device) = fixture.client.start().expect("M1");
-            let carrier_m1 = m1_from_device.clone();
+            let initial_handshake_for_carrier = m1_from_device.clone();
             let (mut engine, m2_to_carrier) = harness
-                .begin_m1(&harness.resource, &carrier_m1)
+                .begin_m1(&harness.resource, &initial_handshake_for_carrier)
                 .expect("M2 for the same WS");
             assert!(!contains_bytes(&m2_to_carrier, b"npub1owneralpha"));
             assert!(!contains_bytes(&m2_to_carrier, b"challenge_secret"));
@@ -1696,11 +3221,29 @@ mod harness {
             assert!(!contains_bytes(&carrier_m3, b"owner-action"));
 
             assert_eq!(engine.accept_m3(&harness, &carrier_m3), Ok(()));
-            assert!(harness.recheck_after_claim(&engine));
+            let context = harness
+                .rechecked_record_context(&engine)
+                .expect("exact post-claim snapshot");
+            let mut pending = engine
+                .into_pending_finished(context)
+                .expect("server-only pending record state");
+            let s2_to_carrier = pending.emit_s2().expect("encrypted S2");
+            assert!(!contains_bytes(&s2_to_carrier, b"npub1owneralpha"));
+            assert!(!contains_bytes(&s2_to_carrier, b"owner-action"));
+            let c3_from_device = device
+                .accept_s2_and_make_c3(&s2_to_carrier)
+                .expect("device authenticates S2 before C3");
+            let acknowledgement_for_carrier = c3_from_device.clone();
+            assert!(!contains_bytes(
+                &acknowledgement_for_carrier,
+                b"npub1owneralpha"
+            ));
+            assert_eq!(pending.accept_c3(&acknowledgement_for_carrier), Ok(()));
+            assert!(harness.recheck_pending_finished(&pending));
 
-            // There is deliberately no fourth message in this slice: a
-            // splicing carrier obtains no plaintext success, credential,
-            // verified peer, or site byte before the reviewed record layer.
+            // A splicing carrier can move only opaque A2 ciphertext.  This
+            // transport slice still creates no plaintext success, credential,
+            // verified peer, dial, proxy, or site byte after C3.
             let effects = fixture.effects.snapshot();
             assert_eq!(effects.challenge_claims, 1);
             assert_eq!(effects.validated_pending_finished, 0);

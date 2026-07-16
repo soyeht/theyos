@@ -39,7 +39,7 @@
 use crate::household_attach_token::{HouseholdAttachScope, HouseholdAttachTokenStore};
 use crate::household_auth;
 use crate::household_state::HouseholdState;
-use crate::owner_site_ake::OwnerSiteAkeProvider;
+use crate::owner_site_ake::{OWNER_SITE_AKE_MAX_RECORD_ENVELOPE_BYTES, OwnerSiteAkeProvider};
 use crate::owner_site_capability::{OwnerSiteCapabilityStore, OwnerSiteResource};
 use crate::responses::{InstanceResponse, ListResponse};
 use crate::state::SharedState;
@@ -257,7 +257,7 @@ pub(crate) async fn handle_household_owner_site_preflight(
     }
 }
 
-/// Upgrades the one-WebSocket owner-site A2 M1/M2/M3 handshake.
+/// Upgrades the one-WebSocket owner-site A2 M1/M2/M3 handshake and S2/C3 record confirmation.
 ///
 /// A missing provider is deliberately a quiet default deny.  The handler
 /// applies the same live Ready + verified-local-Mesh peer gate before looking
@@ -291,6 +291,8 @@ pub(crate) async fn handle_household_owner_site_ake(
 
     let peer = peer_addr(peer);
     upgrade
+        .max_message_size(OWNER_SITE_AKE_MAX_RECORD_ENVELOPE_BYTES)
+        .max_frame_size(OWNER_SITE_AKE_MAX_RECORD_ENVELOPE_BYTES)
         .on_upgrade(move |socket| async move {
             provider.serve(socket, resource, peer).await;
         })
@@ -1342,6 +1344,7 @@ mod tests {
     use household_rs::keys::{IdentityKey, P256Keypair};
     use household_rs::{BootstrapOpts, KeyBackingPolicy};
     use std::sync::Arc;
+    use tokio::time::{Duration, timeout};
     use tower::ServiceExt;
 
     fn owner_site_store(
@@ -1470,7 +1473,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn owner_site_ake_uses_one_binary_ws_and_stops_pending_finished() {
+    async fn owner_site_ake_uses_one_binary_ws_for_s2_c3_then_closes_pre_effect() {
         let OwnerSiteAkeFixture {
             provider,
             client,
@@ -1496,8 +1499,15 @@ mod tests {
             .expect("M3 after authenticated M2");
         websocket.send_message(WsMessage::Binary(m3.into())).await;
 
+        let s2 = websocket.receive_bytes().await;
+        assert!(!s2.is_empty(), "S2 must be an encrypted A2 record");
+        let c3 = client_session
+            .accept_s2_and_make_c3(&s2)
+            .expect("C3 only after authenticating the exact S2");
+        websocket.send_message(WsMessage::Binary(c3.into())).await;
+
         for _ in 0..128 {
-            if effects.snapshot().validated_pending_finished == 1 {
+            if effects.snapshot().c3_records_accepted == 1 {
                 break;
             }
             tokio::task::yield_now().await;
@@ -1507,11 +1517,264 @@ mod tests {
         assert_eq!(snapshot.challenge_issues, 1);
         assert_eq!(snapshot.challenge_claims, 1);
         assert_eq!(snapshot.validated_pending_finished, 1);
+        assert_eq!(snapshot.post_claim_recheck_rejections, 0);
+        assert_eq!(snapshot.s2_records_emitted, 1);
+        assert_eq!(snapshot.c3_records_accepted, 1);
+        assert_eq!(snapshot.post_c3_recheck_rejections, 0);
+        assert_eq!(snapshot.completed_m3_closures, 1);
         assert_ake_never_effected(&snapshot);
         assert_eq!(client.action_pop_signature_count(), 1);
-        // The server emits no S2/plaintext success in this slice. Dropping the
-        // sole WebSocket ends the ephemeral pending state; there is no second
-        // WebSocket, raw stream, or resumable credential to exercise.
+        // The same WS closes after authenticated C3. There is still no raw
+        // stream, second WebSocket, resumable credential, peer, or site byte.
+        let close = timeout(Duration::from_secs(1), websocket.receive_bytes())
+            .await
+            .expect("post-C3 pre-effect state must close the same WebSocket");
+        assert!(
+            close.is_empty(),
+            "the record-confirmed pre-effect state must emit zero raw bytes"
+        );
+    }
+
+    #[tokio::test]
+    async fn owner_site_ake_route_real_rejects_raw_c3_and_closes_without_effects() {
+        let OwnerSiteAkeFixture {
+            provider,
+            client,
+            effects,
+        } = OwnerSiteAkeHarness::fixture_for_harness("picoclaw").expect("A2 fixture");
+        let loopback: SocketAddr = "127.0.0.1:41001".parse().expect("loopback peer");
+        let app =
+            owner_site_ake_route(Some(Arc::new(provider))).layer(Extension(ConnectInfo(loopback)));
+        let server = TestServer::builder()
+            .http_transport()
+            .build(app)
+            .expect("A2 WS test server");
+        let path = "/api/v1/household/claws/picoclaw/owner-site/ake";
+        let response = server.get_websocket(path).await;
+        assert_eq!(response.status_code(), StatusCode::SWITCHING_PROTOCOLS);
+        let mut websocket = response.into_websocket().await;
+
+        let (mut client_session, m1) = client.start().expect("M1");
+        websocket.send_message(WsMessage::Binary(m1.into())).await;
+        let m2 = websocket.receive_bytes().await;
+        let m3 = client_session
+            .accept_m2_and_make_m3(&m2)
+            .expect("M3 after authenticated M2");
+        websocket.send_message(WsMessage::Binary(m3.into())).await;
+        let s2 = websocket.receive_bytes().await;
+        assert!(
+            !s2.is_empty(),
+            "server reaches the encrypted S2 state first"
+        );
+
+        // A text application message is plaintext, never an A2 record. The
+        // A2 state machine must close rather than parse or downgrade it.
+        websocket
+            .send_message(WsMessage::Text("not-an-a2-record".into()))
+            .await;
+
+        let close = timeout(Duration::from_secs(1), websocket.receive_bytes())
+            .await
+            .expect("malformed C3 must close the same WebSocket");
+        assert!(
+            close.is_empty(),
+            "malformed C3 cannot reveal raw response bytes"
+        );
+        let snapshot = effects.snapshot();
+        assert_eq!(snapshot.sessions_started, 1);
+        assert_eq!(snapshot.challenge_claims, 1);
+        assert_eq!(snapshot.validated_pending_finished, 1);
+        assert_eq!(snapshot.s2_records_emitted, 1);
+        assert_eq!(snapshot.c3_records_accepted, 0);
+        assert_eq!(snapshot.post_c3_recheck_rejections, 0);
+        assert_eq!(snapshot.completed_m3_closures, 1);
+        assert_ake_never_effected(&snapshot);
+    }
+
+    #[tokio::test]
+    async fn owner_site_ake_route_real_c3_timeout_closes_without_effects() {
+        let OwnerSiteAkeFixture {
+            provider,
+            client,
+            effects,
+        } = OwnerSiteAkeHarness::fixture_for_harness("picoclaw").expect("A2 fixture");
+        let loopback: SocketAddr = "127.0.0.1:41001".parse().expect("loopback peer");
+        let app =
+            owner_site_ake_route(Some(Arc::new(provider))).layer(Extension(ConnectInfo(loopback)));
+        let server = TestServer::builder()
+            .http_transport()
+            .build(app)
+            .expect("A2 WS test server");
+        let path = "/api/v1/household/claws/picoclaw/owner-site/ake";
+        let response = server.get_websocket(path).await;
+        assert_eq!(response.status_code(), StatusCode::SWITCHING_PROTOCOLS);
+        let mut websocket = response.into_websocket().await;
+
+        let (mut client_session, m1) = client.start().expect("M1");
+        websocket.send_message(WsMessage::Binary(m1.into())).await;
+        let m2 = websocket.receive_bytes().await;
+        let m3 = client_session
+            .accept_m2_and_make_m3(&m2)
+            .expect("M3 after authenticated M2");
+        websocket.send_message(WsMessage::Binary(m3.into())).await;
+        let s2 = websocket.receive_bytes().await;
+        assert!(
+            !s2.is_empty(),
+            "server reaches PendingFinished before the timeout"
+        );
+
+        let close = timeout(Duration::from_secs(2), websocket.receive_bytes())
+            .await
+            .expect("withheld C3 must expire and close the same WebSocket");
+        assert!(close.is_empty(), "timeout cannot reveal raw response bytes");
+        let snapshot = effects.snapshot();
+        assert_eq!(snapshot.sessions_started, 1);
+        assert_eq!(snapshot.challenge_claims, 1);
+        assert_eq!(snapshot.validated_pending_finished, 1);
+        assert_eq!(snapshot.s2_records_emitted, 1);
+        assert_eq!(snapshot.c3_records_accepted, 0);
+        assert_eq!(snapshot.post_c3_recheck_rejections, 0);
+        assert_eq!(snapshot.completed_m3_closures, 1);
+        assert_ake_never_effected(&snapshot);
+    }
+
+    #[tokio::test]
+    async fn owner_site_ake_route_real_revoke_after_consume_closes_without_effects() {
+        let OwnerSiteAkeFixture {
+            provider,
+            client,
+            effects,
+        } = OwnerSiteAkeHarness::fixture_for_harness("picoclaw").expect("A2 fixture");
+        let harness = provider
+            .harness_for_test()
+            .expect("test-only A2 harness provider");
+        let pause = harness.pause_after_claim_for_harness();
+        let loopback: SocketAddr = "127.0.0.1:41001".parse().expect("loopback peer");
+        let app =
+            owner_site_ake_route(Some(Arc::new(provider))).layer(Extension(ConnectInfo(loopback)));
+        let server = TestServer::builder()
+            .http_transport()
+            .build(app)
+            .expect("A2 WS test server");
+        let path = "/api/v1/household/claws/picoclaw/owner-site/ake";
+        let response = server.get_websocket(path).await;
+        assert_eq!(response.status_code(), StatusCode::SWITCHING_PROTOCOLS);
+        let mut websocket = response.into_websocket().await;
+
+        let (mut client_session, m1) = client.start().expect("M1");
+        websocket.send_message(WsMessage::Binary(m1.into())).await;
+        let m2 = websocket.receive_bytes().await;
+        let m3 = client_session
+            .accept_m2_and_make_m3(&m2)
+            .expect("M3 after authenticated M2");
+        websocket.send_message(WsMessage::Binary(m3.into())).await;
+
+        timeout(Duration::from_secs(1), pause.wait_until_reached())
+            .await
+            .expect("one-shot challenge must be claimed before the re-read");
+        harness.revoke_before_recheck_for_harness();
+        pause.resume();
+
+        for _ in 0..128 {
+            if effects.snapshot().post_claim_recheck_rejections == 1 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        let snapshot = effects.snapshot();
+        assert_eq!(snapshot.sessions_started, 1);
+        assert_eq!(snapshot.challenge_issues, 1);
+        assert_eq!(snapshot.challenge_claims, 1);
+        assert_eq!(snapshot.validated_pending_finished, 0);
+        assert_eq!(snapshot.post_claim_recheck_rejections, 1);
+        assert_eq!(snapshot.s2_records_emitted, 0);
+        assert_eq!(snapshot.c3_records_accepted, 0);
+        assert_eq!(snapshot.post_c3_recheck_rejections, 0);
+        assert_eq!(snapshot.completed_m3_closures, 1);
+        assert_ake_never_effected(&snapshot);
+        assert_eq!(client.action_pop_signature_count(), 1);
+
+        let close = timeout(Duration::from_secs(1), websocket.receive_bytes())
+            .await
+            .expect("revocation must close the same WebSocket");
+        assert!(close.is_empty(), "revocation must emit zero raw bytes");
+    }
+
+    #[tokio::test]
+    async fn owner_site_ake_route_real_revoke_between_s2_and_c3_closes_without_effects() {
+        let OwnerSiteAkeFixture {
+            provider,
+            client,
+            effects,
+        } = OwnerSiteAkeHarness::fixture_for_harness("picoclaw").expect("A2 fixture");
+        let harness = provider
+            .harness_for_test()
+            .expect("test-only A2 harness provider");
+        let pause = harness.pause_after_s2_for_harness();
+        let loopback: SocketAddr = "127.0.0.1:41001".parse().expect("loopback peer");
+        let app =
+            owner_site_ake_route(Some(Arc::new(provider))).layer(Extension(ConnectInfo(loopback)));
+        let server = TestServer::builder()
+            .http_transport()
+            .build(app)
+            .expect("A2 WS test server");
+        let path = "/api/v1/household/claws/picoclaw/owner-site/ake";
+        let response = server.get_websocket(path).await;
+        assert_eq!(response.status_code(), StatusCode::SWITCHING_PROTOCOLS);
+        let mut websocket = response.into_websocket().await;
+
+        let (mut client_session, m1) = client.start().expect("M1");
+        websocket.send_message(WsMessage::Binary(m1.into())).await;
+        let m2 = websocket.receive_bytes().await;
+        let m3 = client_session
+            .accept_m2_and_make_m3(&m2)
+            .expect("M3 after authenticated M2");
+        websocket.send_message(WsMessage::Binary(m3.into())).await;
+        let s2 = websocket.receive_bytes().await;
+        assert!(!s2.is_empty(), "S2 must be encrypted before the pause");
+
+        timeout(Duration::from_secs(1), pause.wait_until_reached())
+            .await
+            .expect("S2 pause must be reached before C3 finalization");
+        let before_c3 = effects.snapshot();
+        assert_eq!(before_c3.validated_pending_finished, 1);
+        assert_eq!(before_c3.s2_records_emitted, 1);
+        assert_eq!(before_c3.c3_records_accepted, 0);
+        assert_eq!(before_c3.verified_peers, 0);
+        assert_eq!(before_c3.mints, 0);
+        assert_eq!(before_c3.consumes, 0);
+        assert_eq!(before_c3.proxy_dials, 0);
+        assert_eq!(before_c3.site_bytes, 0);
+        harness.revoke_before_recheck_for_harness();
+        let c3 = client_session
+            .accept_s2_and_make_c3(&s2)
+            .expect("the device can only acknowledge the received S2");
+        websocket.send_message(WsMessage::Binary(c3.into())).await;
+        pause.resume();
+
+        for _ in 0..128 {
+            if effects.snapshot().post_c3_recheck_rejections == 1 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        let snapshot = effects.snapshot();
+        assert_eq!(snapshot.sessions_started, 1);
+        assert_eq!(snapshot.challenge_issues, 1);
+        assert_eq!(snapshot.challenge_claims, 1);
+        assert_eq!(snapshot.validated_pending_finished, 1);
+        assert_eq!(snapshot.post_claim_recheck_rejections, 0);
+        assert_eq!(snapshot.s2_records_emitted, 1);
+        assert_eq!(snapshot.c3_records_accepted, 0);
+        assert_eq!(snapshot.post_c3_recheck_rejections, 1);
+        assert_eq!(snapshot.completed_m3_closures, 1);
+        assert_ake_never_effected(&snapshot);
+        assert_eq!(client.action_pop_signature_count(), 1);
+
+        let close = timeout(Duration::from_secs(1), websocket.receive_bytes())
+            .await
+            .expect("revoked pending channel must close the same WebSocket");
+        assert!(close.is_empty(), "revoke must expose no raw site bytes");
     }
 
     #[tokio::test]

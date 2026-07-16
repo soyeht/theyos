@@ -158,7 +158,7 @@ fn post_trust_household_peer_gate_is_shared_by_terminal_and_owner_site_routes() 
     let owner_site_handler = slice_between(
         &claws_source,
         "pub(crate) async fn handle_household_owner_site_preflight",
-        "\n/// Upgrades the one-WebSocket owner-site A2 M1/M2/M3 handshake.",
+        "\n/// Upgrades the one-WebSocket owner-site A2 M1/M2/M3 handshake and S2/C3 record confirmation.",
     );
     assert!(
         owner_site_handler
