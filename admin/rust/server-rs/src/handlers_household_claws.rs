@@ -1267,10 +1267,10 @@ async fn household_delete_workspace(
 mod tests {
     use super::*;
     use crate::claw_store_routes;
+    use crate::owner_site_authority::{OwnerSiteAuthoritySnapshot, active_authority_fixture};
     use crate::owner_site_capability::{
-        OwnerSiteAuthoritySnapshot, OwnerSiteBackend, OwnerSiteCapability,
-        OwnerSiteCapabilityScope, OwnerSiteCapabilityStore, OwnerSiteEffectCounters,
-        OwnerSiteEffectSnapshot, OwnerSiteIntent, OwnerSiteRemotePrincipal, OwnerSiteResource,
+        OwnerSiteBackend, OwnerSiteCapability, OwnerSiteCapabilityScope, OwnerSiteCapabilityStore,
+        OwnerSiteEffectCounters, OwnerSiteEffectSnapshot, OwnerSiteIntent, OwnerSiteResource,
     };
     use axum::{Extension, Router, body::Body, extract::ConnectInfo, http::Request, routing::post};
     use household_rs::keys::{IdentityKey, P256Keypair};
@@ -1280,12 +1280,12 @@ mod tests {
 
     fn owner_site_store(
         claw_name: &str,
+        actor_id: &str,
         authority: OwnerSiteAuthoritySnapshot,
     ) -> (Arc<OwnerSiteCapabilityStore>, Arc<OwnerSiteEffectCounters>) {
         let resource = OwnerSiteResource::from_route_claw(claw_name).expect("owner-site resource");
-        let intent =
-            OwnerSiteIntent::injected_for_harness("household-alpha", "owner-alpha", resource)
-                .expect("owner-site intent");
+        let intent = OwnerSiteIntent::injected_for_harness("household-alpha", actor_id, resource)
+            .expect("owner-site intent");
         let backend = OwnerSiteBackend::numeric_loopback(
             "127.0.0.1:7411".parse().expect("numeric loopback backend"),
         )
@@ -1322,17 +1322,16 @@ mod tests {
         if let Some(attach_token) = attach_token {
             builder = builder.header(HOUSEHOLD_ATTACH_TOKEN_HEADER, attach_token);
         }
-        owner_site_route_response(app, builder).await
+        owner_site_route_response(app, builder).await.status()
     }
 
     async fn owner_site_route_response(
         app: Router,
         builder: axum::http::request::Builder,
-    ) -> StatusCode {
+    ) -> Response {
         app.oneshot(builder.body(Body::empty()).expect("owner-site request"))
             .await
             .expect("owner-site response")
-            .status()
     }
 
     fn assert_owner_site_zero_effects(
@@ -1347,9 +1346,11 @@ mod tests {
                 consumes: 0,
                 proxy_dials: 0,
                 site_bytes: 0,
+                challenge_issues: 0,
+                challenge_claims: 0,
                 pre_effect_admissions,
             },
-            "PR1 owner-site route must not bind, mint, consume, dial, or expose bytes"
+            "pre-effect owner-site route must not bind, mint, issue/claim a challenge, dial, or expose bytes"
         );
     }
 
@@ -1413,8 +1414,11 @@ mod tests {
         assert_eq!(absent.pending_count(), absent_pending);
         assert_owner_site_zero_effects(&absent_effects, 1);
 
-        let (stale, stale_effects) =
-            owner_site_store(path_resource, OwnerSiteAuthoritySnapshot::Stale);
+        let (stale, stale_effects) = owner_site_store(
+            path_resource,
+            "owner-alpha",
+            OwnerSiteAuthoritySnapshot::Stale,
+        );
         let stale_pending = stale.pending_count();
         let status = owner_site_preflight_request(
             owner_site_route(Some(Arc::clone(&stale))),
@@ -1427,8 +1431,11 @@ mod tests {
         assert_eq!(stale.pending_count(), stale_pending);
         assert_owner_site_zero_effects(&stale_effects, 1);
 
-        let (mismatch, mismatch_effects) =
-            owner_site_store(path_resource, OwnerSiteAuthoritySnapshot::Mismatch);
+        let (mismatch, mismatch_effects) = owner_site_store(
+            path_resource,
+            "owner-alpha",
+            OwnerSiteAuthoritySnapshot::Mismatch,
+        );
         let mismatch_pending = mismatch.pending_count();
         let status = owner_site_preflight_request(
             owner_site_route(Some(Arc::clone(&mismatch))),
@@ -1441,12 +1448,28 @@ mod tests {
         assert_eq!(mismatch.pending_count(), mismatch_pending);
         assert_owner_site_zero_effects(&mismatch_effects, 1);
 
-        let principal = OwnerSiteRemotePrincipal::injected_for_harness("peer-alpha")
-            .expect("typed harness principal");
-        let (admitted, effects) = owner_site_store(
+        let (revoked, revoked_effects) = owner_site_store(
             path_resource,
-            OwnerSiteAuthoritySnapshot::InjectedForHarness(principal),
+            "owner-alpha",
+            OwnerSiteAuthoritySnapshot::Revoked,
         );
+        let revoked_pending = revoked.pending_count();
+        let status = owner_site_preflight_request(
+            owner_site_route(Some(Arc::clone(&revoked))),
+            path_resource,
+            Some(loopback),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(revoked.pending_count(), revoked_pending);
+        assert_owner_site_zero_effects(&revoked_effects, 1);
+
+        let resource =
+            OwnerSiteResource::from_route_claw(path_resource).expect("owner-site resource");
+        let (actor_id, authority) =
+            active_authority_fixture("household-alpha", resource).expect("typed authority fixture");
+        let (admitted, effects) = owner_site_store(path_resource, &actor_id, authority);
         let admitted_pending = admitted.pending_count();
 
         // An exact typed capability is the only positive path in PR1. This
@@ -1513,5 +1536,28 @@ mod tests {
         assert_eq!(attach_tokens.pending_count(), attach_pending);
         assert_eq!(admitted.pending_count(), admitted_pending);
         assert_owner_site_zero_effects(&effects, 2);
+    }
+
+    #[tokio::test]
+    async fn owner_site_pre_effect_rejections_have_zero_body_and_no_challenge_delta() {
+        let path_resource = "picoclaw";
+        let loopback: SocketAddr = "127.0.0.1:41001".parse().expect("loopback peer");
+        let (store, effects) = OwnerSiteCapabilityStore::unavailable_for_harness();
+        let app = owner_site_route(Some(Arc::new(store)));
+        let path = format!("/api/v1/household/claws/{path_resource}/owner-site/preflight");
+        let response = owner_site_route_response(
+            app,
+            Request::builder()
+                .method(Method::POST)
+                .uri(path)
+                .extension(ConnectInfo(loopback)),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let body = axum::body::to_bytes(response.into_body(), 1_024)
+            .await
+            .expect("forbidden body");
+        assert!(body.is_empty(), "pre-effect denial must expose zero bytes");
+        assert_owner_site_zero_effects(&effects, 1);
     }
 }

@@ -241,6 +241,8 @@ fn owner_site_pre_effect_route_is_router_only_and_capability_sibling() {
     let routes = include_str!("../src/claw_store_routes.rs");
     let bootstrap = include_str!("../src/household_bootstrap.rs");
     let capability = include_str!("../src/owner_site_capability.rs");
+    let authority = include_str!("../src/owner_site_authority.rs");
+    let challenge = include_str!("../src/owner_site_challenge.rs");
     let handlers = include_str!("../src/handlers_household_claws.rs");
     let lib = include_str!("../src/lib.rs");
 
@@ -269,6 +271,11 @@ fn owner_site_pre_effect_route_is_router_only_and_capability_sibling() {
         "owner-site capability types must stay crate-private server-owned material"
     );
     assert!(
+        lib.contains("pub(crate) mod owner_site_authority;")
+            && lib.contains("pub(crate) mod owner_site_challenge;"),
+        "pre-effect A2 authority/challenge shapes must stay crate-private server-owned material"
+    );
+    assert!(
         capability.contains("#[cfg(test)]\n    pub(crate) fn injected_for_harness"),
         "only crate tests may construct an admitting owner-site capability in PR1"
     );
@@ -276,6 +283,15 @@ fn owner_site_pre_effect_route_is_router_only_and_capability_sibling() {
         capability.contains("effects: Arc<OwnerSiteEffectCounters>")
             && capability.contains("self.effects.record_pre_effect_admission()"),
         "the route-real harness counters must be attached to the injected provider"
+    );
+    assert!(
+        capability.contains("challenge_issues: AtomicUsize")
+            && capability.contains("challenge_claims: AtomicUsize"),
+        "the route-real harness must keep explicit zero challenge issue/claim probes"
+    );
+    assert!(
+        !capability.contains("use crate::owner_site_challenge"),
+        "the inert preflight capability must not acquire the A2 challenge table"
     );
 
     let handler = handler_body(handlers, "handle_household_owner_site_preflight");
@@ -292,6 +308,37 @@ fn owner_site_pre_effect_route_is_router_only_and_capability_sibling() {
             !handler.contains(forbidden),
             "owner-site pre-effect handler must not acquire {forbidden}"
         );
+    }
+
+    assert!(
+        !handler.contains("owner_site_challenge"),
+        "the inert preflight handler must not issue or claim an A2 challenge"
+    );
+    assert!(
+        challenge.contains("#[cfg(test)]\npub(crate) struct OwnerSiteChallengeTable")
+            && challenge.contains("Sha256::digest")
+            && challenge.contains("ct_eq"),
+        "the B+C table must be test-only here and retain only a constant-time checked hash"
+    );
+    for source in [authority, challenge] {
+        for forbidden in [
+            "use axum",
+            "TcpStream",
+            "TcpListener",
+            "tokio::net",
+            "GuestCredential",
+            "relay_stream",
+            "Hermes",
+            "household_attach_token",
+            "connect(",
+            "write_all(",
+            "copy_bidirectional",
+        ] {
+            assert!(
+                !source.contains(forbidden),
+                "pre-effect owner-site authority/challenge shapes must not acquire {forbidden}"
+            );
+        }
     }
     for forbidden in [
         "household_attach_token",

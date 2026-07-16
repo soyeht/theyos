@@ -1,12 +1,15 @@
 //! Pre-effect owner-site capability types.
 //!
-//! This module intentionally stops before challenge issuance, proof
-//! verification, consume, authority generation, revocation, or any backend
-//! connection. PR1 only provides the typed server-owned shape that later
-//! slices must extend. In particular, the only admitting capability is a
-//! crate-test fixture, not a production authority or a bearer wire format.
+//! This module intentionally stops before proof verification, capability
+//! redemption, authority-provider wiring, or any backend connection. The
+//! separate `owner_site_challenge` and `owner_site_authority` modules now hold
+//! only pre-effect staging types; neither is reachable from production routing.
+//! In particular, the only admitting capability remains a crate-test fixture,
+//! not a production authority or a bearer wire format.
 
 use std::net::SocketAddr;
+
+use crate::owner_site_authority::OwnerSiteAuthoritySnapshot;
 
 #[cfg(test)]
 use std::sync::{
@@ -21,10 +24,8 @@ use std::sync::{
 /// and actor bindings remain inside this server-owned value.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct OwnerSiteIntent {
-    household_id: String,
+    pre_auth: OwnerSitePreAuthIntent,
     actor_id: String,
-    operation: OwnerSiteOperation,
-    resource: OwnerSiteResource,
 }
 
 impl OwnerSiteIntent {
@@ -35,12 +36,71 @@ impl OwnerSiteIntent {
         actor_id: &str,
         resource: OwnerSiteResource,
     ) -> Result<Self, OwnerSiteIntentError> {
-        Ok(Self {
-            household_id: validated_component(household_id)?,
-            actor_id: validated_component(actor_id)?,
-            operation: OwnerSiteOperation::Open,
+        let request = OwnerSiteCanonicalRequest::injected_for_harness(
+            OwnerSiteRequestMethod::Post,
+            "/api/v1/household/claws/{name}/owner-site/preflight",
+            [0x42; 32],
+        )?;
+        Self::injected_for_harness_with_request(
+            household_id,
+            "owner-site-mesh",
+            actor_id,
             resource,
+            request,
+        )
+    }
+
+    /// Builds the full canonical intent shape for tests that need to exercise
+    /// route/body/network transcript separation.
+    #[cfg(test)]
+    pub(crate) fn injected_for_harness_with_request(
+        household_id: &str,
+        network_id: &str,
+        actor_id: &str,
+        resource: OwnerSiteResource,
+        request: OwnerSiteCanonicalRequest,
+    ) -> Result<Self, OwnerSiteIntentError> {
+        Ok(Self {
+            pre_auth: OwnerSitePreAuthIntent::injected_for_harness(
+                household_id,
+                network_id,
+                resource,
+                request,
+            )?,
+            actor_id: validated_server_identifier(actor_id)?,
         })
+    }
+
+    #[must_use]
+    pub(crate) fn household_id(&self) -> &str {
+        self.pre_auth.household_id()
+    }
+
+    #[must_use]
+    pub(crate) fn actor_id(&self) -> &str {
+        &self.actor_id
+    }
+
+    #[must_use]
+    pub(crate) fn network_id(&self) -> &str {
+        self.pre_auth.network_id()
+    }
+
+    #[must_use]
+    pub(crate) fn resource(&self) -> &OwnerSiteResource {
+        self.pre_auth.resource()
+    }
+
+    #[must_use]
+    #[allow(dead_code)] // carried for the later A2 transcript builder
+    pub(crate) fn request(&self) -> &OwnerSiteCanonicalRequest {
+        self.pre_auth.request()
+    }
+
+    #[must_use]
+    #[allow(dead_code)] // consumed by the future A2 M1/M3 type bridge
+    pub(crate) fn pre_auth(&self) -> &OwnerSitePreAuthIntent {
+        &self.pre_auth
     }
 }
 
@@ -50,6 +110,98 @@ impl OwnerSiteIntent {
 enum OwnerSiteOperation {
     #[cfg(test)]
     Open,
+}
+
+/// Exact intent material that may be known at A2 `M1` before a device actor is
+/// authenticated. It intentionally contains no actor or remote principal.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct OwnerSitePreAuthIntent {
+    household_id: String,
+    network_id: String,
+    operation: OwnerSiteOperation,
+    resource: OwnerSiteResource,
+    request: OwnerSiteCanonicalRequest,
+}
+
+impl OwnerSitePreAuthIntent {
+    #[cfg(test)]
+    pub(crate) fn injected_for_harness(
+        household_id: &str,
+        network_id: &str,
+        resource: OwnerSiteResource,
+        request: OwnerSiteCanonicalRequest,
+    ) -> Result<Self, OwnerSiteIntentError> {
+        Ok(Self {
+            household_id: validated_server_identifier(household_id)?,
+            network_id: validated_component(network_id)?,
+            operation: OwnerSiteOperation::Open,
+            resource,
+            request,
+        })
+    }
+
+    #[must_use]
+    pub(crate) fn household_id(&self) -> &str {
+        &self.household_id
+    }
+
+    #[must_use]
+    pub(crate) fn network_id(&self) -> &str {
+        &self.network_id
+    }
+
+    #[must_use]
+    pub(crate) fn resource(&self) -> &OwnerSiteResource {
+        &self.resource
+    }
+
+    #[must_use]
+    #[allow(dead_code)] // carried for the later A2 transcript builder
+    pub(crate) fn request(&self) -> &OwnerSiteCanonicalRequest {
+        &self.request
+    }
+}
+
+/// Canonical HTTP verb committed into the future A2 transcript.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[allow(dead_code)] // the A2 wire slice constructs this canonical verb
+pub(crate) enum OwnerSiteRequestMethod {
+    Post,
+}
+
+/// Server-owned canonical request material committed into the future A2
+/// transcript. It is not an HTTP parser and has no wire encoding in PR2.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct OwnerSiteCanonicalRequest {
+    method: OwnerSiteRequestMethod,
+    route: String,
+    body_hash: [u8; 32],
+}
+
+impl OwnerSiteCanonicalRequest {
+    #[cfg(test)]
+    pub(crate) fn injected_for_harness(
+        method: OwnerSiteRequestMethod,
+        route: &str,
+        body_hash: [u8; 32],
+    ) -> Result<Self, OwnerSiteIntentError> {
+        if route.is_empty()
+            || route.len() > 256
+            || !route.starts_with('/')
+            || !route.bytes().all(|byte| {
+                byte.is_ascii_lowercase()
+                    || byte.is_ascii_digit()
+                    || matches!(byte, b'/' | b'{' | b'}' | b'-')
+            })
+        {
+            return Err(OwnerSiteIntentError::InvalidRoute);
+        }
+        Ok(Self {
+            method,
+            route: route.to_owned(),
+            body_hash,
+        })
+    }
 }
 
 /// Exact server-resolved `ClawSite` resource selector.
@@ -72,16 +224,36 @@ impl OwnerSiteResource {
 
 /// Rejection for a non-canonical owner-site selector.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[allow(dead_code)] // retained for the staged canonical-request constructor
 pub(crate) enum OwnerSiteIntentError {
     InvalidComponent,
+    InvalidRoute,
 }
 
-fn validated_component(value: &str) -> Result<String, OwnerSiteIntentError> {
+pub(crate) fn validated_component(value: &str) -> Result<String, OwnerSiteIntentError> {
     if value.is_empty()
         || value.len() > 128
         || !value
             .bytes()
             .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+    {
+        return Err(OwnerSiteIntentError::InvalidComponent);
+    }
+    Ok(value.to_owned())
+}
+
+/// Canonical server-owned identity component.
+///
+/// Household and member identifiers use reserved underscore prefixes such as
+/// `hh_` and `g_`; route resource names deliberately continue to use the
+/// stricter [`validated_component`] grammar above.
+#[allow(dead_code)] // invoked by the staged A2 construction path in the next slice
+pub(crate) fn validated_server_identifier(value: &str) -> Result<String, OwnerSiteIntentError> {
+    if value.is_empty()
+        || value.len() > 128
+        || !value.bytes().all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'-' | b'_')
+        })
     {
         return Err(OwnerSiteIntentError::InvalidComponent);
     }
@@ -113,57 +285,6 @@ impl OwnerSiteBackend {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum OwnerSiteBackendError {
     NotLoopback,
-}
-
-/// Opaque remote-principal placeholder for a later reviewed NEX boundary.
-///
-/// It intentionally carries no network address and no roster or revocation
-/// generation. Those authority semantics are parked for later slices.
-#[cfg(test)]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct OwnerSiteRemotePrincipal {
-    opaque_id: String,
-}
-
-#[cfg(test)]
-impl OwnerSiteRemotePrincipal {
-    pub(crate) fn injected_for_harness(opaque_id: &str) -> Result<Self, OwnerSiteIntentError> {
-        Ok(Self {
-            opaque_id: validated_component(opaque_id)?,
-        })
-    }
-}
-
-/// Current authority material observed by the pre-effect capability store.
-///
-/// No production variant can admit in PR1. `InjectedForHarness` is compiled
-/// only into crate tests so a production router cannot acquire a valid
-/// owner-site capability merely by mounting an extension.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) enum OwnerSiteAuthoritySnapshot {
-    #[cfg(test)]
-    Unavailable,
-    #[cfg(test)]
-    Stale,
-    #[cfg(test)]
-    Mismatch,
-    #[cfg(test)]
-    InjectedForHarness(OwnerSiteRemotePrincipal),
-}
-
-impl OwnerSiteAuthoritySnapshot {
-    #[must_use]
-    fn admits_pre_effect(&self) -> bool {
-        #[cfg(test)]
-        {
-            matches!(self, Self::InjectedForHarness(_))
-        }
-        #[cfg(not(test))]
-        {
-            let _ = self;
-            false
-        }
-    }
 }
 
 /// Server-only bindings for one future owner-site capability.
@@ -278,16 +399,20 @@ impl OwnerSiteCapabilityStore {
         // Preserve each future server-owned binding in this pre-effect shape
         // without treating any of them as a current authority substitute.
         let _ = (
-            &capability.scope.intent.household_id,
+            capability.scope.intent.household_id(),
             &capability.scope.intent.actor_id,
-            capability.scope.intent.operation,
+            capability.scope.intent.pre_auth.operation,
             capability.scope.backend.socket,
         );
 
-        if !capability.scope.authority.admits_pre_effect() {
+        if !capability
+            .scope
+            .authority
+            .admits_pre_effect(&capability.scope.intent)
+        {
             return Err(OwnerSitePreEffectRejection::AuthorityUnavailable);
         }
-        if capability.scope.intent.resource != *resource {
+        if capability.scope.intent.resource() != resource {
             return Err(OwnerSitePreEffectRejection::ScopeMismatch);
         }
         Ok(())
@@ -306,7 +431,8 @@ pub(crate) enum OwnerSitePreEffectRejection {
 ///
 /// `pre_effect_admissions` proves that a route request reached the exact
 /// provider under observation. The five effect counters remain zero because
-/// PR1 exposes no API that can bind, mint, consume, dial, or write site bytes.
+/// this pre-effect slice exposes no API that can bind, mint, claim a challenge,
+/// dial, or write site bytes.
 #[cfg(test)]
 #[derive(Debug, Default)]
 pub(crate) struct OwnerSiteEffectCounters {
@@ -315,6 +441,8 @@ pub(crate) struct OwnerSiteEffectCounters {
     consumes: AtomicUsize,
     proxy_dials: AtomicUsize,
     site_bytes: AtomicUsize,
+    challenge_issues: AtomicUsize,
+    challenge_claims: AtomicUsize,
     pre_effect_admissions: AtomicUsize,
 }
 
@@ -326,6 +454,8 @@ pub(crate) struct OwnerSiteEffectSnapshot {
     pub(crate) consumes: usize,
     pub(crate) proxy_dials: usize,
     pub(crate) site_bytes: usize,
+    pub(crate) challenge_issues: usize,
+    pub(crate) challenge_claims: usize,
     pub(crate) pre_effect_admissions: usize,
 }
 
@@ -343,6 +473,8 @@ impl OwnerSiteEffectCounters {
             consumes: self.consumes.load(Ordering::SeqCst),
             proxy_dials: self.proxy_dials.load(Ordering::SeqCst),
             site_bytes: self.site_bytes.load(Ordering::SeqCst),
+            challenge_issues: self.challenge_issues.load(Ordering::SeqCst),
+            challenge_claims: self.challenge_claims.load(Ordering::SeqCst),
             pre_effect_admissions: self.pre_effect_admissions.load(Ordering::SeqCst),
         }
     }
@@ -351,12 +483,12 @@ impl OwnerSiteEffectCounters {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::owner_site_authority::active_authority_fixture;
 
-    fn scope(authority: OwnerSiteAuthoritySnapshot) -> OwnerSiteCapabilityScope {
+    fn scope(actor_id: &str, authority: OwnerSiteAuthoritySnapshot) -> OwnerSiteCapabilityScope {
         let resource = OwnerSiteResource::from_route_claw("picoclaw").expect("resource");
-        let intent =
-            OwnerSiteIntent::injected_for_harness("household-alpha", "owner-alpha", resource)
-                .expect("intent");
+        let intent = OwnerSiteIntent::injected_for_harness("household-alpha", actor_id, resource)
+            .expect("intent");
         let backend =
             OwnerSiteBackend::numeric_loopback("127.0.0.1:7411".parse().expect("loopback"))
                 .expect("loopback backend");
@@ -364,10 +496,11 @@ mod tests {
     }
 
     fn store(
+        actor_id: &str,
         authority: OwnerSiteAuthoritySnapshot,
     ) -> (OwnerSiteCapabilityStore, Arc<OwnerSiteEffectCounters>) {
         OwnerSiteCapabilityStore::injected_for_harness(OwnerSiteCapability::injected_for_harness(
-            scope(authority),
+            scope(actor_id, authority),
         ))
     }
 
@@ -385,9 +518,10 @@ mod tests {
 
     #[test]
     fn pre_effect_admission_is_non_consuming_and_scope_exact() {
-        let principal =
-            OwnerSiteRemotePrincipal::injected_for_harness("peer-alpha").expect("principal");
-        let (store, effects) = store(OwnerSiteAuthoritySnapshot::InjectedForHarness(principal));
+        let resource = OwnerSiteResource::from_route_claw("picoclaw").expect("resource");
+        let (actor_id, authority) =
+            active_authority_fixture("household-alpha", resource).expect("typed authority fixture");
+        let (store, effects) = store(&actor_id, authority);
         let resource = OwnerSiteResource::from_route_claw("picoclaw").expect("resource");
 
         assert_eq!(store.pending_count(), 1);
@@ -405,13 +539,37 @@ mod tests {
     }
 
     #[test]
+    fn resolved_intent_keeps_pre_auth_route_and_body_commitment_exact() {
+        let resource = OwnerSiteResource::from_route_claw("picoclaw").expect("resource");
+        let request = OwnerSiteCanonicalRequest::injected_for_harness(
+            OwnerSiteRequestMethod::Post,
+            "/api/v1/household/claws/{name}/owner-site/preflight",
+            [0x72; 32],
+        )
+        .expect("canonical request");
+        let intent = OwnerSiteIntent::injected_for_harness_with_request(
+            "household-alpha",
+            "owner-site-mesh",
+            "owner-alpha",
+            resource,
+            request,
+        )
+        .expect("intent");
+
+        assert_eq!(intent.request(), intent.pre_auth().request());
+        assert_eq!(intent.network_id(), "owner-site-mesh");
+    }
+
+    #[test]
     fn unavailable_authority_fails_closed_without_mutation() {
         let resource = OwnerSiteResource::from_route_claw("picoclaw").expect("resource");
         for authority in [
             OwnerSiteAuthoritySnapshot::Unavailable,
             OwnerSiteAuthoritySnapshot::Stale,
+            OwnerSiteAuthoritySnapshot::Mismatch,
+            OwnerSiteAuthoritySnapshot::Revoked,
         ] {
-            let (store, effects) = store(authority);
+            let (store, effects) = store("owner-alpha", authority);
             assert_eq!(
                 store.pre_effect_admission(&resource),
                 Err(OwnerSitePreEffectRejection::AuthorityUnavailable)
