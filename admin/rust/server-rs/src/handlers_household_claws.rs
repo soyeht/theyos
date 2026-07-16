@@ -1040,14 +1040,13 @@ fn is_terminal_attach_peer_allowed(peer: Option<SocketAddr>, stage_suffix: &str)
     tracing::warn!(
         stage = format!("household_claws.{stage_suffix}.peer_rejected"),
         peer = ?peer,
-        "household terminal attach route rejected non-loopback/non-tailnet peer"
+        "household terminal attach route rejected non-loopback/non-tailnet/non-configured-mesh peer"
     );
     false
 }
 
 fn is_terminal_attach_peer_addr_allowed(peer: SocketAddr) -> bool {
-    let ip = peer.ip();
-    ip.is_loopback() || crate::tailnet_address::is_tailnet_ip(ip)
+    crate::household_listener::is_post_trust_household_peer_allowed(peer.ip())
 }
 
 async fn household_list_workspaces(

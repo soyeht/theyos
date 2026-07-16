@@ -1,11 +1,13 @@
 //! Household-endpoint listener.
 //!
-//! Binds a fresh axum router to concrete loopback / LAN / Tailnet addresses,
+//! Binds a fresh axum router to concrete loopback / LAN / Tailnet / configured
+//! mesh addresses,
 //! then narrows the live set by [`HouseholdExposurePolicy`]:
 //! - onboarding (`uninitialized`, `ready_for_naming`) allows loopback + LAN +
 //!   Tailnet so first-launch setup can work on the local network;
 //! - post-onboarding (`named_awaiting_pair`, `ready`, `recovering`) allows only
-//!   loopback + Tailnet so the Ready control plane is not exposed over LAN HTTP.
+//!   loopback + Tailnet + configured mesh so the Ready control plane is not
+//!   exposed over LAN HTTP.
 //!
 //! Refuses wildcard `0.0.0.0` / `::` per FR-008. Refreshes the active address
 //! set every 60 s and reconciles state-policy changes every 500 ms.
@@ -23,12 +25,14 @@ use tracing::{info, warn};
 
 const INTERFACE_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
 const POLICY_SYNC_INTERVAL: Duration = Duration::from_millis(500);
+const MESH_SUBNET_ENV: &str = "THEYOS_MESH_SUBNET";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum InterfaceClass {
     Loopback,
     Lan,
     Tailscale,
+    Mesh,
 }
 
 impl InterfaceClass {
@@ -38,7 +42,16 @@ impl InterfaceClass {
             Self::Loopback => "loopback",
             Self::Lan => "lan",
             Self::Tailscale => "tailscale",
+            Self::Mesh => "mesh",
         }
+    }
+
+    /// Bonjour is intentionally limited to local-network discovery and
+    /// Tailnet. A configured mesh address is reachable directly but must not
+    /// leak its /32 through a LAN multicast announcement.
+    #[must_use]
+    pub fn is_bonjour_advertisable(self) -> bool {
+        matches!(self, Self::Lan | Self::Tailscale)
     }
 }
 
@@ -60,7 +73,10 @@ impl HouseholdExposurePolicy {
             BootstrapState::NamedAwaitingPair
             | BootstrapState::Ready
             | BootstrapState::Recovering => {
-                matches!(class, InterfaceClass::Loopback | InterfaceClass::Tailscale)
+                matches!(
+                    class,
+                    InterfaceClass::Loopback | InterfaceClass::Tailscale | InterfaceClass::Mesh
+                )
             }
         }
     }
@@ -73,6 +89,19 @@ impl HouseholdExposurePolicy {
         targets
             .into_iter()
             .filter(|(_, class)| Self::allows(state, *class))
+            .collect()
+    }
+
+    /// Targets that may be advertised through Bonjour after the listener
+    /// policy has allowed them. Mesh addresses remain direct-connect only.
+    #[must_use]
+    pub fn bonjour_targets(
+        state: BootstrapState,
+        targets: impl IntoIterator<Item = (IpAddr, InterfaceClass)>,
+    ) -> Vec<(IpAddr, InterfaceClass)> {
+        Self::allowed_targets(state, targets)
+            .into_iter()
+            .filter(|(_, class)| class.is_bonjour_advertisable())
             .collect()
     }
 }
@@ -99,7 +128,8 @@ pub fn enumerate_bind_targets() -> Vec<(IpAddr, InterfaceClass)> {
             }
             let class = classify(&name, &ip);
             // Skip everything else (public/wireguard) for now — Phase 1 only
-            // supports loopback/LAN/Tailscale per spec.
+            // supports loopback/LAN/Tailscale and explicitly configured mesh
+            // subnets per spec.
             if let Some(class) = class {
                 targets.push((ip, class));
             }
@@ -344,13 +374,77 @@ fn is_link_local(ip: &IpAddr) -> bool {
 }
 
 fn classify(_name: &str, ip: &IpAddr) -> Option<InterfaceClass> {
+    let mesh_subnet = configured_mesh_subnet();
+    classify_with_mesh_subnet(ip, mesh_subnet.as_deref())
+}
+
+fn classify_with_mesh_subnet(ip: &IpAddr, mesh_subnet: Option<&str>) -> Option<InterfaceClass> {
     if crate::tailnet_address::is_tailnet_ip(*ip) {
         return Some(InterfaceClass::Tailscale);
+    }
+    if is_mesh_ip_with_subnet(*ip, mesh_subnet) {
+        return Some(InterfaceClass::Mesh);
     }
     if is_lan(ip) {
         return Some(InterfaceClass::Lan);
     }
     None
+}
+
+fn configured_mesh_subnet() -> Option<String> {
+    std::env::var(MESH_SUBNET_ENV).ok().and_then(|subnet| {
+        let subnet = subnet.trim();
+        (!subnet.is_empty()).then(|| subnet.to_string())
+    })
+}
+
+/// Post-trust peer gate shared by routes that admit a direct remote peer.
+///
+/// Mesh is opt-in: without a valid configured subnet this is exactly the
+/// existing loopback-or-Tailnet gate. Callers must still apply their endpoint
+/// specific owner/PoP authorization after this transport check.
+#[must_use]
+pub(crate) fn is_post_trust_household_peer_allowed(ip: IpAddr) -> bool {
+    let mesh_subnet = configured_mesh_subnet();
+    is_post_trust_household_peer_allowed_with_mesh_subnet(ip, mesh_subnet.as_deref())
+}
+
+fn is_post_trust_household_peer_allowed_with_mesh_subnet(
+    ip: IpAddr,
+    mesh_subnet: Option<&str>,
+) -> bool {
+    ip.is_loopback()
+        || crate::tailnet_address::is_tailnet_ip(ip)
+        || is_mesh_ip_with_subnet(ip, mesh_subnet)
+}
+
+fn is_mesh_ip_with_subnet(ip: IpAddr, mesh_subnet: Option<&str>) -> bool {
+    mesh_subnet.is_some_and(|subnet| ipv4_cidr_contains(&ip, subnet))
+}
+
+fn ipv4_cidr_contains(ip: &IpAddr, cidr: &str) -> bool {
+    let Some((network, prefix_len)) = cidr.split_once('/') else {
+        return false;
+    };
+    let Ok(network) = network.parse::<Ipv4Addr>() else {
+        return false;
+    };
+    let Ok(prefix_len) = prefix_len.parse::<u8>() else {
+        return false;
+    };
+    if prefix_len > 32 {
+        return false;
+    }
+    let IpAddr::V4(ip) = ip else {
+        return false;
+    };
+
+    let mask = if prefix_len == 0 {
+        0
+    } else {
+        u32::MAX << (32 - u32::from(prefix_len))
+    };
+    u32::from(*ip) & mask == u32::from(network) & mask
 }
 
 fn is_lan(ip: &IpAddr) -> bool {
@@ -384,6 +478,83 @@ mod tests {
     fn classify_tailscale_named_non_tailnet_as_lan() {
         let ip: IpAddr = "10.0.0.2".parse().unwrap();
         assert_eq!(classify("tailscale0", &ip), Some(InterfaceClass::Lan));
+    }
+
+    #[test]
+    fn mesh_is_inert_without_an_explicit_subnet() {
+        let ip: IpAddr = "10.77.0.2".parse().unwrap();
+
+        assert_eq!(
+            classify_with_mesh_subnet(&ip, None),
+            Some(InterfaceClass::Lan)
+        );
+    }
+
+    #[test]
+    fn configured_mesh_subnet_is_classified_before_lan() {
+        let mesh_ip: IpAddr = "10.77.0.2".parse().unwrap();
+        let other_lan_ip: IpAddr = "10.78.0.2".parse().unwrap();
+        let tailnet_ip: IpAddr = "100.64.0.2".parse().unwrap();
+
+        assert_eq!(
+            classify_with_mesh_subnet(&mesh_ip, Some("10.77.0.0/16")),
+            Some(InterfaceClass::Mesh)
+        );
+        assert_eq!(
+            classify_with_mesh_subnet(&other_lan_ip, Some("10.77.0.0/16")),
+            Some(InterfaceClass::Lan)
+        );
+        assert_eq!(
+            classify_with_mesh_subnet(&tailnet_ip, Some("100.64.0.0/10")),
+            Some(InterfaceClass::Tailscale)
+        );
+    }
+
+    #[test]
+    fn invalid_mesh_subnet_fails_closed_to_the_existing_lan_class() {
+        let ip: IpAddr = "10.77.0.2".parse().unwrap();
+
+        assert_eq!(
+            classify_with_mesh_subnet(&ip, Some("not-a-cidr")),
+            Some(InterfaceClass::Lan)
+        );
+    }
+
+    #[test]
+    fn mesh_cidr_is_ipv4_only() {
+        let ipv6: IpAddr = "fd00::1".parse().unwrap();
+
+        assert!(!ipv4_cidr_contains(&ipv6, "10.77.0.0/16"));
+    }
+
+    #[test]
+    fn post_trust_peer_gate_keeps_mesh_opt_in_and_lan_rejected() {
+        let loopback: IpAddr = "127.0.0.1".parse().unwrap();
+        let tailnet: IpAddr = "100.64.0.2".parse().unwrap();
+        let mesh: IpAddr = "10.77.0.2".parse().unwrap();
+        let lan: IpAddr = "192.168.1.2".parse().unwrap();
+
+        assert!(is_post_trust_household_peer_allowed_with_mesh_subnet(
+            loopback, None
+        ));
+        assert!(is_post_trust_household_peer_allowed_with_mesh_subnet(
+            tailnet, None
+        ));
+        assert!(!is_post_trust_household_peer_allowed_with_mesh_subnet(
+            mesh, None
+        ));
+        assert!(is_post_trust_household_peer_allowed_with_mesh_subnet(
+            mesh,
+            Some("10.77.0.0/16")
+        ));
+        assert!(!is_post_trust_household_peer_allowed_with_mesh_subnet(
+            lan,
+            Some("10.77.0.0/16")
+        ));
+        assert!(!is_post_trust_household_peer_allowed_with_mesh_subnet(
+            mesh,
+            Some("not-a-cidr")
+        ));
     }
 
     #[test]
@@ -459,11 +630,12 @@ mod tests {
     }
 
     #[test]
-    fn exposure_policy_ready_excludes_lan_and_keeps_loopback_tailnet() {
+    fn exposure_policy_ready_excludes_lan_and_keeps_loopback_tailnet_mesh() {
         let targets = vec![
             (IpAddr::V4(Ipv4Addr::LOCALHOST), InterfaceClass::Loopback),
             ("192.0.2.10".parse().unwrap(), InterfaceClass::Lan),
             ("100.64.0.10".parse().unwrap(), InterfaceClass::Tailscale),
+            ("10.77.0.10".parse().unwrap(), InterfaceClass::Mesh),
         ];
 
         let allowed = HouseholdExposurePolicy::allowed_targets(BootstrapState::Ready, targets);
@@ -472,7 +644,84 @@ mod tests {
             vec![
                 (IpAddr::V4(Ipv4Addr::LOCALHOST), InterfaceClass::Loopback),
                 ("100.64.0.10".parse().unwrap(), InterfaceClass::Tailscale),
+                ("10.77.0.10".parse().unwrap(), InterfaceClass::Mesh),
             ]
+        );
+    }
+
+    #[test]
+    fn mesh_uses_the_same_post_trust_exposure_gate_as_tailscale() {
+        for state in [
+            BootstrapState::NamedAwaitingPair,
+            BootstrapState::Ready,
+            BootstrapState::Recovering,
+        ] {
+            assert_eq!(
+                HouseholdExposurePolicy::allows(state, InterfaceClass::Mesh),
+                HouseholdExposurePolicy::allows(state, InterfaceClass::Tailscale)
+            );
+            assert!(HouseholdExposurePolicy::allows(state, InterfaceClass::Mesh));
+        }
+        for state in [
+            BootstrapState::Uninitialized,
+            BootstrapState::ReadyForNaming,
+        ] {
+            assert!(!HouseholdExposurePolicy::allows(
+                state,
+                InterfaceClass::Mesh
+            ));
+        }
+    }
+
+    #[test]
+    fn bonjour_omits_mesh_even_when_the_listener_allows_it() {
+        let ready_targets = vec![
+            (IpAddr::V4(Ipv4Addr::LOCALHOST), InterfaceClass::Loopback),
+            ("192.168.1.2".parse().unwrap(), InterfaceClass::Lan),
+            ("100.64.0.10".parse().unwrap(), InterfaceClass::Tailscale),
+            ("10.77.0.10".parse().unwrap(), InterfaceClass::Mesh),
+        ];
+
+        assert_eq!(
+            HouseholdExposurePolicy::bonjour_targets(BootstrapState::Ready, ready_targets),
+            vec![("100.64.0.10".parse().unwrap(), InterfaceClass::Tailscale)]
+        );
+
+        let onboarding_targets = vec![
+            ("192.168.1.2".parse().unwrap(), InterfaceClass::Lan),
+            ("100.64.0.10".parse().unwrap(), InterfaceClass::Tailscale),
+            ("10.77.0.10".parse().unwrap(), InterfaceClass::Mesh),
+        ];
+        assert_eq!(
+            HouseholdExposurePolicy::bonjour_targets(
+                BootstrapState::Uninitialized,
+                onboarding_targets
+            ),
+            vec![
+                ("192.168.1.2".parse().unwrap(), InterfaceClass::Lan),
+                ("100.64.0.10".parse().unwrap(), InterfaceClass::Tailscale),
+            ]
+        );
+    }
+
+    #[test]
+    fn mesh_and_tailscale_bind_through_the_same_router_path() {
+        let source = include_str!("household_listener.rs");
+        let bind_start = source
+            .find("async fn bind_allowed_target")
+            .expect("bind_allowed_target not found");
+        let bind_end = source[bind_start..]
+            .find("\nasync fn shutdown_bound_target")
+            .map_or(source.len(), |offset| bind_start + offset);
+        let bind_body = &source[bind_start..bind_end];
+
+        assert!(
+            bind_body.contains("spawn_listener_task(router.clone(), listener, addr, shutdown_rx)"),
+            "every allowed interface class must receive the caller's shared router"
+        );
+        assert!(
+            !bind_body.contains("match class"),
+            "interface class must not select an alternate unauthenticated router"
         );
     }
 
@@ -491,6 +740,7 @@ mod tests {
                 state,
                 InterfaceClass::Tailscale
             ));
+            assert!(HouseholdExposurePolicy::allows(state, InterfaceClass::Mesh));
         }
     }
 

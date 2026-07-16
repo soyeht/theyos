@@ -2,7 +2,7 @@
 //!
 //! These source-level checks pin the architectural boundary: bind/listener
 //! reconciliation and Bonjour publishing must consume `HouseholdExposurePolicy`
-//! instead of re-creating LAN-vs-Tailnet rules locally.
+//! instead of re-creating listener-vs-advertisement rules locally.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -71,8 +71,18 @@ fn bonjour_publishers_filter_targets_through_exposure_policy() {
         "\n    // Spawn a task",
     );
     assert!(
-        household_publish_body.contains("HouseholdExposurePolicy::allowed_targets"),
-        "household Bonjour publisher must filter targets through HouseholdExposurePolicy"
+        household_publish_body.contains("HouseholdExposurePolicy::bonjour_targets"),
+        "household Bonjour publisher must filter targets through the Bonjour exposure policy"
+    );
+
+    let candidate_publish_body = slice_between(
+        &household_source,
+        "pub async fn publish_candidate_joiner_bonjour",
+        "\nimpl HouseholdBonjour",
+    );
+    assert!(
+        candidate_publish_body.contains("is_bonjour_advertisable"),
+        "candidate Bonjour publisher must omit non-advertisable interface classes"
     );
 
     let setup_source = read_src("setup_beacon.rs");
@@ -82,8 +92,26 @@ fn bonjour_publishers_filter_targets_through_exposure_policy() {
         "\nfn unregister_fullnames",
     );
     assert!(
-        setup_publish_body.contains("HouseholdExposurePolicy::allowed_targets"),
-        "setup beacon publisher must filter targets through HouseholdExposurePolicy"
+        setup_publish_body.contains("HouseholdExposurePolicy::bonjour_targets"),
+        "setup beacon publisher must filter targets through the Bonjour exposure policy"
+    );
+    let setup_refresh_body = slice_between(
+        &setup_source,
+        "async fn sync_bound_targets",
+        "\n/// Publish `_soyeht-setup._tcp.`",
+    );
+    assert!(
+        setup_refresh_body.contains("HouseholdExposurePolicy::bonjour_targets"),
+        "setup beacon refresh must keep non-advertisable classes withdrawn"
+    );
+}
+
+#[test]
+fn post_trust_terminal_peer_gate_uses_the_shared_mesh_policy() {
+    let claws_source = read_src("handlers_household_claws.rs");
+    assert!(
+        claws_source.contains("crate::household_listener::is_post_trust_household_peer_allowed"),
+        "terminal attach must share the opt-in mesh peer gate before its existing PoP check"
     );
 }
 

@@ -295,9 +295,9 @@ pub async fn publish_household_bonjour(
     let host = HouseholdBonjour::host_label(&params);
 
     let mut bound = 0usize;
-    let targets = HouseholdExposurePolicy::allowed_targets(exposure_state, targets);
+    let targets = HouseholdExposurePolicy::bonjour_targets(exposure_state, targets);
     for (ip, class) in &targets {
-        if *class == InterfaceClass::Loopback {
+        if !class.is_bonjour_advertisable() {
             continue;
         }
         let spec = backend::ServiceSpec {
@@ -402,7 +402,7 @@ pub async fn publish_household_bonjour(
                 }
             }
             for (ip, class) in &targets_clone {
-                if *class == InterfaceClass::Loopback {
+                if !class.is_bonjour_advertisable() {
                     continue;
                 }
                 let spec = backend::ServiceSpec {
@@ -481,7 +481,7 @@ pub async fn publish_candidate_joiner_bonjour(
 
     let mut bound = 0usize;
     for (ip, class) in &targets {
-        if *class == InterfaceClass::Loopback {
+        if !class.is_bonjour_advertisable() {
             continue;
         }
         let spec = backend::ServiceSpec {

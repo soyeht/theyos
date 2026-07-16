@@ -12,6 +12,8 @@ use server_rs::handlers_household;
 use server_rs::handlers_household::MachinesRouterState;
 use server_rs::household_auth::SoyehtPoP;
 use server_rs::household_state::HouseholdState;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::{TcpListener, TcpStream};
 use tower::ServiceExt;
 
 fn unix_now() -> u64 {
@@ -144,6 +146,29 @@ async fn snapshot_accepts_valid_pop_and_rejects_wrong_path() {
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn shared_listener_router_still_requires_owner_pop_for_snapshot() {
+    let (app, _person, _identity) = fixture();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    let mut client = TcpStream::connect(addr).await.unwrap();
+    client
+        .write_all(
+            b"GET /api/v1/household/snapshot HTTP/1.1\r\nHost: mesh-test\r\nConnection: close\r\n\r\n",
+        )
+        .await
+        .unwrap();
+    let mut response = Vec::new();
+    client.read_to_end(&mut response).await.unwrap();
+    server.abort();
+
+    assert!(response.starts_with(b"HTTP/1.1 401 "));
 }
 
 /// Build a router serving `/api/v1/household/machines` plus the persisted

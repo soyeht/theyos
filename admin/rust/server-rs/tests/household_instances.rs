@@ -670,7 +670,7 @@ async fn household_attach_token_mint_requires_pop_authorization() {
 }
 
 #[tokio::test]
-async fn household_attach_token_mint_requires_loopback_or_tailnet_peer() {
+async fn household_attach_token_mint_requires_post_trust_peer() {
     let fx = fixture();
     let actor_username = household_rs::derive_person_id(&fx.person.public()).0;
     insert_instance(
@@ -883,7 +883,7 @@ async fn household_terminal_pty_rejects_missing_bad_expired_or_reused_attach_tok
 }
 
 #[tokio::test]
-async fn household_terminal_pty_requires_loopback_or_tailnet_peer_without_consuming_token() {
+async fn household_terminal_pty_requires_post_trust_peer_without_consuming_token() {
     let fx = fixture();
     let actor_username = household_rs::derive_person_id(&fx.person.public()).0;
     insert_instance(

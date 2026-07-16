@@ -238,9 +238,9 @@ fn publish_targets(
     source: &'static str,
 ) -> usize {
     let mut bound = 0usize;
-    let targets = HouseholdExposurePolicy::allowed_targets(state, targets.iter().copied());
+    let targets = HouseholdExposurePolicy::bonjour_targets(state, targets.iter().copied());
     for (ip, class) in targets {
-        if class == InterfaceClass::Loopback || fullnames.contains_key(&ip) {
+        if !class.is_bonjour_advertisable() || fullnames.contains_key(&ip) {
             continue;
         }
         let service = backend::ServiceSpec {
@@ -297,10 +297,10 @@ async fn sync_bound_targets(
     spec: &SetupBeaconPublishSpec<'_>,
     state: BootstrapState,
 ) {
-    let policy_targets = HouseholdExposurePolicy::allowed_targets(state, targets);
+    let policy_targets = HouseholdExposurePolicy::bonjour_targets(state, targets);
     let live: HashSet<IpAddr> = policy_targets
         .iter()
-        .filter_map(|(ip, class)| (*class != InterfaceClass::Loopback).then_some(*ip))
+        .filter_map(|(ip, class)| class.is_bonjour_advertisable().then_some(*ip))
         .collect();
     let stale_entries = {
         let mut guard = inner.fullnames.lock().await;
