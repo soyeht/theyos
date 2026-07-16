@@ -822,7 +822,8 @@ mod tests {
     // Used to test retry and cleanup_partial behavior without a real slirp.
     //
     // Each connection handles exactly one JSON command (slirp4netns behavior).
-    // The server thread runs until the socket file is deleted (Drop).
+    // The fixture wakes and joins its blocking listener before releasing the
+    // socket's tempdir, so no worker or request outlives the fixture.
 
     use std::io::{Read, Write as _};
     use std::os::unix::net::UnixListener;
@@ -844,6 +845,8 @@ mod tests {
         remove_responses: Arc<Mutex<Vec<String>>>,
         active_hostfwds: Arc<Mutex<Vec<(i64, u16, u16)>>>,
         shutdown: Arc<AtomicBool>,
+        worker_exited: Arc<AtomicBool>,
+        worker: Option<std::thread::JoinHandle<()>>,
         _dir: tempfile::TempDir,
     }
 
@@ -852,8 +855,6 @@ mod tests {
             let dir = tempfile::tempdir().expect("tempdir");
             let sock_path = dir.path().join("slirp-api.sock");
             let listener = UnixListener::bind(&sock_path).expect("bind mock slirp socket");
-            // Non-blocking accept with short poll so the thread can check shutdown.
-            listener.set_nonblocking(true).expect("set_nonblocking");
 
             let messages: Arc<Mutex<Vec<String>>> = Arc::default();
             let add_responses: Arc<Mutex<Vec<MockResponse>>> = Arc::default();
@@ -861,6 +862,7 @@ mod tests {
             let remove_responses: Arc<Mutex<Vec<String>>> = Arc::default();
             let active_hostfwds: Arc<Mutex<Vec<(i64, u16, u16)>>> = Arc::default();
             let shutdown: Arc<AtomicBool> = Arc::default();
+            let worker_exited: Arc<AtomicBool> = Arc::default();
 
             let msgs = messages.clone();
             let add_resps = add_responses.clone();
@@ -868,10 +870,11 @@ mod tests {
             let remove_resps = remove_responses.clone();
             let active = active_hostfwds.clone();
             let stop = shutdown.clone();
+            let exited = worker_exited.clone();
 
-            std::thread::spawn(move || {
+            let worker = std::thread::spawn(move || {
                 let mut next_id = 1i64;
-                while !stop.load(Ordering::Relaxed) {
+                while !stop.load(Ordering::Acquire) {
                     match listener.accept() {
                         Ok((mut stream, _)) => {
                             stream.set_read_timeout(Some(Duration::from_secs(2))).ok();
@@ -982,12 +985,10 @@ mod tests {
                                 }
                             }
                         }
-                        Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                            std::thread::sleep(Duration::from_millis(10));
-                        }
                         Err(_) => break,
                     }
                 }
+                exited.store(true, Ordering::Release);
             });
 
             MockSlirp {
@@ -998,6 +999,8 @@ mod tests {
                 remove_responses,
                 active_hostfwds,
                 shutdown,
+                worker_exited,
+                worker: Some(worker),
                 _dir: dir,
             }
         }
@@ -1041,7 +1044,14 @@ mod tests {
 
     impl Drop for MockSlirp {
         fn drop(&mut self) {
-            self.shutdown.store(true, Ordering::Relaxed);
+            self.shutdown.store(true, Ordering::Release);
+            // Wake the blocking accept. The server treats this empty
+            // connection as a no-op, observes shutdown on its next loop, and
+            // exits before the TempDir unlinks the socket path.
+            drop(std::os::unix::net::UnixStream::connect(&self.sock_path));
+            if let Some(worker) = self.worker.take() {
+                worker.join().expect("mock slirp server thread panicked");
+            }
         }
     }
 
@@ -1311,6 +1321,47 @@ mod tests {
 
         let cmds = mock.received_commands();
         assert_eq!(cmds, vec!["add_hostfwd"]);
+    }
+
+    #[test]
+    fn mock_slirp_drop_waits_for_server_exit() {
+        let mock = MockSlirp::new();
+        let worker_exited = mock.worker_exited.clone();
+
+        assert!(
+            !worker_exited.load(Ordering::Acquire),
+            "new mock server must still be running"
+        );
+        drop(mock);
+        assert!(
+            worker_exited.load(Ordering::Acquire),
+            "fixture teardown must join its mock server before returning"
+        );
+    }
+
+    #[test]
+    fn mock_slirp_waits_for_request_bytes_after_accept() {
+        let mock = MockSlirp::new();
+        let mut stream = std::os::unix::net::UnixStream::connect(&mock.sock_path)
+            .expect("connect to mock slirp");
+
+        // A listener configured non-blocking can pass that mode to accepted
+        // streams. The mock must wait for this write rather than treating the
+        // transient WouldBlock as an empty request and forcing a retry.
+        std::thread::sleep(Duration::from_millis(30));
+        stream
+            .write_all(
+                br#"{"execute":"add_hostfwd","arguments":{"host_port":22997,"guest_port":22}}"#,
+            )
+            .expect("write request");
+        stream.shutdown(Shutdown::Write).expect("finish request");
+
+        let mut response = String::new();
+        stream
+            .read_to_string(&mut response)
+            .expect("read mock response");
+        assert_eq!(response, r#"{"return":{"id":1}}"#);
+        assert_eq!(mock.received_commands(), vec!["add_hostfwd"]);
     }
 
     #[test]
