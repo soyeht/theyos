@@ -381,6 +381,7 @@ fn owner_site_ake_route_is_single_ws_record_aead_and_stays_pre_effect_after_c3()
         "post_claim_recheck_rejections",
         "post_c3_recheck_rejections",
         "completed_m3_closures",
+        "dial_permits_issued",
         "post_trust_household_peer_gate(peer)",
         "certificate.verify(&self.expected_household_key)",
         "relay_forwarding_splices_only_a2_ciphertext_and_gets_no_peer_or_site_bytes",
@@ -429,6 +430,7 @@ fn owner_site_ake_route_is_single_ws_record_aead_and_stays_pre_effect_after_c3()
         "struct VerifiedMeshPeer",
         "enum VerifiedMeshPeer",
         "verified_peers.fetch_add",
+        "dial_permits_issued.fetch_add",
         "struct DialPermit",
         "enum DialPermit",
         "DialPermit",
@@ -450,6 +452,104 @@ fn owner_site_ake_route_is_single_ws_record_aead_and_stays_pre_effect_after_c3()
         assert!(
             !ake.contains(forbidden),
             "the S2/C3 transport slice must not acquire deferred `{forbidden}` behavior"
+        );
+    }
+}
+
+#[test]
+fn owner_site_promotion_skeleton_is_deny_only_and_unwired() {
+    let promotion = include_str!("../src/owner_site_promotion.rs");
+    let ake = include_str!("../src/owner_site_ake.rs");
+    let handlers = include_str!("../src/handlers_household_claws.rs");
+    let routes = include_str!("../src/claw_store_routes.rs");
+    let bootstrap = include_str!("../src/household_bootstrap.rs");
+    let lib = include_str!("../src/lib.rs");
+
+    for required in [
+        "pub(crate) struct VerifiedMeshPeer(VerifiedMeshPeerSeal);",
+        "pub(crate) struct DialPermit(DialPermitSeal);",
+        "pub(crate) struct OwnerSitePromotedChannel",
+        "pub(crate) struct OwnerSitePromotionRequest(OwnerSitePromotionRequestSeal);",
+        "#[cfg(test)]\nimpl OwnerSitePromotionRequest",
+        "ContractUnavailable",
+        "Err(OwnerSitePromotionRejection::ContractUnavailable)",
+        "promotion_boundary_is_deny_only_before_the_data_plane_contract",
+    ] {
+        assert!(
+            promotion.contains(required),
+            "the inert promotion skeleton must retain `{required}`"
+        );
+    }
+    assert!(
+        promotion.contains("#[derive(Debug, Eq, PartialEq)]\npub(crate) struct VerifiedMeshPeer")
+            && promotion.contains("#[derive(Debug, Eq, PartialEq)]\npub(crate) struct DialPermit"),
+        "peer and permit must remain opaque and non-clonable"
+    );
+    assert_eq!(
+        promotion.matches("VerifiedMeshPeer(").count(),
+        1,
+        "the inert skeleton must not construct a mesh peer"
+    );
+    assert_eq!(
+        promotion.matches("DialPermit(").count(),
+        1,
+        "the inert skeleton must not construct a dial permit"
+    );
+    assert_eq!(
+        promotion.matches("pub(crate) fn").count(),
+        1,
+        "the boundary must expose only its deny-only promotion attempt"
+    );
+    assert!(
+        !promotion.contains("Ok("),
+        "the deny-only skeleton must not report a promotion success"
+    );
+    assert!(
+        lib.contains("pub(crate) mod owner_site_promotion;"),
+        "the promotion boundary must remain an explicit crate-private module"
+    );
+    assert!(
+        !ake.contains("owner_site_promotion") && !handlers.contains("owner_site_promotion"),
+        "the A2 route must still close after C3 without wiring peer promotion"
+    );
+    assert!(
+        !routes.contains("owner_site_promotion"),
+        "peer promotion must not register a route in this inert slice"
+    );
+    assert!(
+        !bootstrap.contains("owner_site_promotion"),
+        "peer promotion must not enter household bootstrap wiring"
+    );
+    for forbidden in [
+        "impl VerifiedMeshPeer",
+        "impl DialPermit",
+        "SocketAddr",
+        "ConnectInfo",
+        "IpAddr",
+        "CIDR",
+        "10.44",
+        "TcpStream",
+        "connect(",
+        "copy_bidirectional",
+        "WebSocket",
+        "Router",
+        "Extension<",
+        "Serialize",
+        "Deserialize",
+        "serde",
+        "GuestCredential",
+        "household_attach_token",
+        "relay_stream",
+        "Hermes",
+        "proxy_dials.fetch_add",
+        "site_bytes.fetch_add",
+        "verified_peers.fetch_add",
+        "dial_permits_issued.fetch_add",
+        "fetch_add",
+    ] {
+        assert!(
+            !promotion.contains(forbidden),
+            "the inert promotion skeleton must not acquire `{forbidden}`"
         );
     }
 }

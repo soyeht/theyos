@@ -1390,6 +1390,7 @@ mod tests {
 
     fn assert_ake_never_effected(snapshot: &OwnerSiteAkeEffectSnapshot) {
         assert_eq!(snapshot.verified_peers, 0);
+        assert_eq!(snapshot.dial_permits_issued, 0);
         assert_eq!(snapshot.mints, 0);
         assert_eq!(snapshot.consumes, 0);
         assert_eq!(snapshot.proxy_dials, 0);
