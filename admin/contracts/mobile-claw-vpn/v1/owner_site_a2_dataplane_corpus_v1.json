@@ -1,0 +1,438 @@
+{
+  "a2_r1_anchor": {
+    "commit": "b201a075884eb1ac77f2b0f6904c38866bbafb5b",
+    "path": "admin/contracts/mobile-claw-vpn/v1/owner_site_a2_r1_semantic_corpus_v1.json",
+    "post_c3_state": {
+      "c3_wire_sha256_hex": "811fb0fd1604b60643b4d195c9d30fdbc6deb96ce1b1302ae14cb8d3ec32bdbe",
+      "channel_binding_hex": "5ed521ad95402b2b0ee18f13a8035f1800afe84184d70529e63780fc67cbe13f",
+      "channel_context": {
+        "authz_epoch": 9,
+        "binding_digest_hex": "2121212121212121212121212121212121212121212121212121212121212121",
+        "binding_id_hex": "2020202020202020202020202020202020202020202020202020202020202020",
+        "channel_epoch": 7,
+        "channel_id_hex": "1010101010101010101010101010101010101010101010101010101010101010",
+        "fresh_until_unix_s": 1700000000,
+        "kat_now_unix_s": 1699999999,
+        "roster_digest_hex": "2222222222222222222222222222222222222222222222222222222222222222"
+      },
+      "h_final_hex": "eddd205a011fe812db52153cf09ab4bb3c7d607a3ae68008fd453494abf8b722",
+      "initial_directional_nonce_after_c3": 1,
+      "protocol_name": "Noise_XXa2v1_25519_ChaChaPoly_SHA256",
+      "s2_wire_sha256_hex": "58d5ff4a790bf0ae9ab009763f65fcdcfbc248a340405fe98d6d079cbf5f0223"
+    },
+    "raw_sha256": "dde67030a035928d0a859a19fc7dcf14ea8e8fa54643e9f66302652740548330"
+  },
+  "about": [
+    "Canonical Rust/iOS synthetic owner-site A2 data-plane corpus. The exact UTF-8 JSON file is compared byte-for-byte and pinned by raw SHA-256 after joint acceptance.",
+    "This corpus is synthetic test material only. It grants no production authority and does not install a provider, peer, DialPermit, route, dial, proxy, or site-byte effect.",
+    "The record continuation begins only after the frozen A2-R1 S2/C3 exchange. It does not rebind a carrier, source address, CIDR, name, ConnectInfo, or transport identity to a principal.",
+    "v1 is immutable after Rust/iOS acceptance. Any change, including formatting, uses a new versioned corpus and raw SHA-256."
+  ],
+  "authority_status": "synthetic-test-only-non-authoritative",
+  "authority_witnesses": {
+    "base_semantic_case_id": "synthetic_owner_active_v1",
+    "expired_lease": {
+      "authoritative_now_unix_s": 1700000000,
+      "expected": "terminal-close-zero-peer-permit-dial-and-site-bytes",
+      "fresh_until_unix_s": 1700000000
+    },
+    "nested_binding_same_epoch_conflicting_digest": {
+      "binding_id_hex": "2020202020202020202020202020202020202020202020202020202020202020",
+      "expected": "terminal-close-zero-peer-permit-dial-and-site-bytes",
+      "nested_binding_generation": {
+        "authz_epoch": 9,
+        "roster_digest_hex": "4242424242424242424242424242424242424242424242424242424242424242"
+      },
+      "snapshot_generation": {
+        "authz_epoch": 9,
+        "roster_digest_hex": "2222222222222222222222222222222222222222222222222222222222222222"
+      }
+    },
+    "nested_tombstone_same_epoch_conflicting_digest": {
+      "binding_id_hex": "2020202020202020202020202020202020202020202020202020202020202020",
+      "expected": "terminal-close-zero-peer-permit-dial-and-site-bytes",
+      "nested_tombstone_generation": {
+        "authz_epoch": 9,
+        "roster_digest_hex": "4242424242424242424242424242424242424242424242424242424242424242"
+      },
+      "snapshot_generation": {
+        "authz_epoch": 9,
+        "roster_digest_hex": "2222222222222222222222222222222222222222222222222222222222222222"
+      }
+    },
+    "provider_absent": {
+      "expected": "terminal-close-zero-peer-permit-dial-and-site-bytes",
+      "provider_present": false
+    },
+    "provider_generation_mismatch": {
+      "expected": "terminal-close-zero-peer-permit-dial-and-site-bytes",
+      "observed_provider_generation": 42,
+      "pending_provider_generation": 41
+    },
+    "provider_stale": {
+      "authoritative_now_unix_s": 1700000000,
+      "expected": "terminal-close-zero-peer-permit-dial-and-site-bytes",
+      "provider_fresh_until_unix_s": 1700000000,
+      "provider_present": true
+    },
+    "ready_gate_loss": {
+      "expected": "terminal-close-zero-peer-permit-dial-and-site-bytes",
+      "ready": false,
+      "verified_mesh_local": true
+    },
+    "revoke_races": {
+      "after_lease_before_each_backend_or_record_syscall": {
+        "expected": {
+          "close_same_websocket": true,
+          "dial_connected": 1,
+          "dial_permit": "invalidated",
+          "dial_started": 1,
+          "new_site_bytes_device_to_engine_after_fence": 0,
+          "new_site_bytes_engine_to_device_after_fence": 0,
+          "verified_mesh_peer": "revoked"
+        },
+        "fence_wins_after": "channel_lease_acquired",
+        "operations": {
+          "device_to_engine": [
+            "record_accept",
+            "backend_write"
+          ],
+          "engine_to_device": [
+            "backend_read",
+            "record_emit"
+          ]
+        }
+      },
+      "after_promotion_before_reserve_dial": {
+        "expected": {
+          "close_same_websocket": true,
+          "dial_connected": 0,
+          "dial_permit": "invalidated",
+          "dial_started": 0,
+          "site_bytes": 0,
+          "verified_mesh_peer": "revoked"
+        },
+        "fence_wins_before": "reserve_dial"
+      },
+      "after_reserve_dial_before_connect": {
+        "expected": {
+          "close_same_websocket": true,
+          "dial_connected": 0,
+          "dial_permit": "invalidated",
+          "dial_started": 0,
+          "site_bytes": 0,
+          "verified_mesh_peer": "revoked"
+        },
+        "fence_wins_before": "connect_start"
+      },
+      "after_s2_before_c3": {
+        "expected": {
+          "close_same_websocket": true,
+          "dial_connected": 0,
+          "dial_permit_issued": 0,
+          "dial_started": 0,
+          "pending": "revoking",
+          "site_bytes": 0,
+          "verified_mesh_peer": 0
+        },
+        "fence_wins_before": "c3_accept"
+      },
+      "before_each_pump_lease": {
+        "expected": {
+          "close_same_websocket": true,
+          "dial_connected": 1,
+          "dial_permit": "invalidated",
+          "dial_started": 1,
+          "new_site_bytes_device_to_engine_after_fence": 0,
+          "new_site_bytes_engine_to_device_after_fence": 0,
+          "verified_mesh_peer": "revoked"
+        },
+        "fence_wins_before": "each-read-or-write-lease"
+      },
+      "before_promotion_cas": {
+        "expected": {
+          "close_same_websocket": true,
+          "dial_connected": 0,
+          "dial_permit_issued": 0,
+          "dial_started": 0,
+          "pending": "revoking",
+          "site_bytes": 0,
+          "verified_mesh_peer": 0
+        },
+        "fence_wins_before": "promotion_cas"
+      },
+      "during_connect": {
+        "expected": {
+          "close_same_websocket": true,
+          "dial_connected": 1,
+          "dial_permit": "invalidated",
+          "dial_started": 1,
+          "returned_socket": "closed-before-pump",
+          "site_bytes": 0,
+          "verified_mesh_peer": "revoked"
+        },
+        "fence_wins_before": "pump_create"
+      }
+    },
+    "snapshot_generation": {
+      "authz_epoch": 9,
+      "roster_digest_hex": "2222222222222222222222222222222222222222222222222222222222222222"
+    },
+    "snapshot_same_epoch_conflicting_digest": {
+      "expected": "terminal-close-zero-peer-permit-dial-and-site-bytes",
+      "observed_generation": {
+        "authz_epoch": 9,
+        "roster_digest_hex": "4242424242424242424242424242424242424242424242424242424242424242"
+      },
+      "pending_generation": {
+        "authz_epoch": 9,
+        "roster_digest_hex": "2222222222222222222222222222222222222222222222222222222222222222"
+      }
+    },
+    "valid_generation_change_is_household_session_barrier": {
+      "during_pump": {
+        "expected": {
+          "close_all_affected_household_channels": true,
+          "dial_connected_before_fence": 1,
+          "dial_permit": "invalidated",
+          "dial_started_before_fence": 1,
+          "new_site_bytes_device_to_engine_after_fence": 0,
+          "new_site_bytes_engine_to_device_after_fence": 0,
+          "verified_mesh_peer": "revoked"
+        },
+        "fence_wins_before": "next-pump-lease"
+      },
+      "hot_refresh_forbidden": true,
+      "next_valid_generation": {
+        "authz_epoch": 10,
+        "roster_digest_hex": "4242424242424242424242424242424242424242424242424242424242424242"
+      },
+      "post_promotion_before_reserve_dial": {
+        "expected": {
+          "close_all_affected_household_channels": true,
+          "dial_connected": 0,
+          "dial_permit": "invalidated",
+          "dial_started": 0,
+          "site_bytes": 0,
+          "verified_mesh_peer": "revoked"
+        },
+        "fence_wins_before": "reserve_dial"
+      },
+      "previous_generation": {
+        "authz_epoch": 9,
+        "roster_digest_hex": "2222222222222222222222222222222222222222222222222222222222222222"
+      },
+      "requires_new_a2": true,
+      "scope": "all household channels dependent on previous_generation"
+    },
+    "verified_mesh_local_gate_loss": {
+      "expected": "terminal-close-zero-peer-permit-dial-and-site-bytes",
+      "ready": true,
+      "verified_mesh_local": false
+    }
+  },
+  "continuation_kat": {
+    "device_to_engine_close": {
+      "direction": 0,
+      "plaintext_canonical_cbor_hex": "8977736f796568742f6f776e65722d736974652f61322f763101040002582010101010101010101010101010101010101010101010101010101010101010100758205ed521ad95402b2b0ee18f13a8035f1800afe84184d70529e63780fc67cbe13f00",
+      "sequence": 2,
+      "tamper_every_raw_wire_byte": "terminal-close",
+      "terminal_branch_after_site_payload_sequence_one": true,
+      "wire_hex": "82015873f54777f0654553857d0b535bd24da2142c4e89d67f6299f8660436ef8011da17712fff28342ac4b8d8aca81919f171a9151994f87785f43e0ebe044bda93f407335aafca33e8ae35281a82d9ece791311944df71cd415253382314ad7292706d44417ebd028f31b4f9ca9e9ba37c696225d2ed",
+      "wire_sha256_hex": "019aab87e5780bbefd6c5e9c962f98c6a33fe6b1efacd7f016002adae91c6314"
+    },
+    "device_to_engine_site_payload": {
+      "direction": 0,
+      "plaintext_canonical_cbor_hex": "8977736f796568742f6f776e65722d736974652f61322f763101030001582010101010101010101010101010101010101010101010101010101010101010100758205ed521ad95402b2b0ee18f13a8035f1800afe84184d70529e63780fc67cbe13f582a73796e7468657469632d6465766963652d746f2d656e67696e652d736974652d7061796c6f61642d7631",
+      "sequence": 1,
+      "tamper_every_raw_wire_byte": "terminal-close",
+      "terminal_branch_after_site_payload_sequence_one": false,
+      "wire_hex": "8201589e65e722168f026c10830ac8ffb32fc8121f1e2e825de26c2d29734a637cdbfcafd5d0d4b42afb384ee6b984d8b286d03c59c5237923365b92e08daa501c22ff297f6b3bcb7db09730a796306ba69872812690cafa1f724e2c9a05e3f79495cd6648e075c342dcf4c71e129ea34d3feacf204e560c5180abbce6ad9ff903bccddff0966d4ed8e2d49d3d26e0e09450820ff2dcad2ef36f319f1ddcb4406fc1",
+      "wire_sha256_hex": "8821290f627e5bc687bbe0a39bf3be5cee8a52a75265a5144996a822dc9581f4"
+    },
+    "engine_to_device_close": {
+      "direction": 1,
+      "plaintext_canonical_cbor_hex": "8977736f796568742f6f776e65722d736974652f61322f763101040102582010101010101010101010101010101010101010101010101010101010101010100758205ed521ad95402b2b0ee18f13a8035f1800afe84184d70529e63780fc67cbe13f00",
+      "sequence": 2,
+      "tamper_every_raw_wire_byte": "terminal-close",
+      "terminal_branch_after_site_payload_sequence_one": true,
+      "wire_hex": "820158735ab926b85127ab44324a55d7e84523a404b51f6a663c09b20d0ddb6f650d26743e79ac5abbde177a837113832ac1a0e9cd4a2786648fe881acbe0df169f0b6e9627d15f3cb7ef9092110f39a30e1821e5a03dca04aec5bc309c74cf1d396576c0516cbf08ec026e6ef6d2f47088eb9b0393181",
+      "wire_sha256_hex": "499dbbf3747f70471de8e4267ed7cf99010515d951894000a2f4df098ccf8728"
+    },
+    "engine_to_device_site_payload": {
+      "direction": 1,
+      "plaintext_canonical_cbor_hex": "8977736f796568742f6f776e65722d736974652f61322f763101030101582010101010101010101010101010101010101010101010101010101010101010100758205ed521ad95402b2b0ee18f13a8035f1800afe84184d70529e63780fc67cbe13f582a73796e7468657469632d656e67696e652d746f2d6465766963652d736974652d7061796c6f61642d7631",
+      "sequence": 1,
+      "tamper_every_raw_wire_byte": "terminal-close",
+      "terminal_branch_after_site_payload_sequence_one": false,
+      "wire_hex": "8201589ebb3fc7b781ccdae270a6ac111a45f95ac0441ef532d261cf973631ce583a760c16e4ae9456d7532e4c1a036280b8aaa3605c6e811c49a1552dfbdd3b59ee7ce924416428ee7cd8fb7ed1049bb85c67ca4868df1ae8875e27eeb1383640682e77089da0175a6fb0ac254b6664ea4ad91384a8a71552e6111f1dc062289976f83c1a76264f5c0986fa1f3c95de50f02547612eb58019723bfab6a01139ad5b",
+      "wire_sha256_hex": "67c4f8094644dbb1473f4a35ade9a5db334fef9dd5b9dc6ec8b857f743798f40"
+    }
+  },
+  "contract": "soyeht-owner-site-a2-r1-dataplane-corpus",
+  "format": {
+    "byte_strings": "All protocol byte fields inside canonical CBOR are bstr. JSON represents fixture bytes as lowercase even-length hexadecimal without a 0x prefix.",
+    "canonical_cbor": "RFC 8949 section 4.2.1 deterministic encoding. Every listed canonical CBOR hex value must decode, re-encode, and compare byte-for-byte before use.",
+    "file_encoding": "UTF-8 JSON. Consumers compare the complete file byte-for-byte and pin the raw SHA-256 externally; they do not reserialize JSON.",
+    "record_envelope": "Every post-Finished WebSocket message is canonical-CBOR([1, ciphertext]); direction, sequence, channel context, and authority never appear outside ciphertext."
+  },
+  "negative_contract": {
+    "client_induced_destination_failures": {
+      "cases": [
+        "client_host",
+        "client_port",
+        "client_dns",
+        "client_connect",
+        "client_url_or_proxy_route"
+      ],
+      "expected": {
+        "close_same_websocket": true,
+        "dial_connected": 0,
+        "dial_permit": "invalidated",
+        "dial_started": 0,
+        "site_bytes": 0,
+        "verified_mesh_peer": "revoked"
+      },
+      "precondition": "Client record data is never interpreted as a backend selector; the server-only numeric loopback table remains the sole destination source."
+    },
+    "per_byte_raw_wire_tamper_terminal": {
+      "post_promotion": [
+        "engine_to_device_site_payload",
+        "device_to_engine_site_payload",
+        "engine_to_device_close",
+        "device_to_engine_close"
+      ],
+      "pre_promotion": [
+        "s2_wire",
+        "c3_wire"
+      ]
+    },
+    "permit_failures": {
+      "cases": [
+        "duplicate_dial_permit",
+        "reused_dial_permit",
+        "dial_permit_wrong_channel",
+        "dial_permit_wrong_scope"
+      ],
+      "expected": {
+        "additional_dial_connected": 0,
+        "additional_dial_started": 0,
+        "close_same_websocket": true,
+        "dial_permit": "invalidated",
+        "new_site_bytes_device_to_engine_after_terminal_fence": 0,
+        "new_site_bytes_engine_to_device_after_terminal_fence": 0,
+        "verified_mesh_peer": "revoked"
+      },
+      "precondition": "The first permitted use belongs to this exact channel; each case attempts a second, transferred, or rebound use and must never start a second backend dial."
+    },
+    "post_promotion_record_failures": {
+      "cases": [
+        "noncanonical_cbor",
+        "wrong_envelope_cardinality",
+        "wrong_envelope_version",
+        "wrong_record_cardinality",
+        "wrong_record_field_type",
+        "wrong_domain",
+        "wrong_record_version",
+        "wrong_kind",
+        "wrong_direction",
+        "own_direction",
+        "wrong_channel_id",
+        "wrong_channel_binding",
+        "wrong_channel_epoch",
+        "seq_not_equal_stateful_nonce",
+        "replay",
+        "sequence_jump",
+        "sequence_rollback",
+        "u64_max_sequence",
+        "invalid_tag",
+        "oversized_plaintext_or_ciphertext",
+        "eof",
+        "post_close_record"
+      ],
+      "expected": {
+        "close_same_websocket": true,
+        "dial_permit": "invalidated",
+        "new_dial_connected_after_terminal_fence": 0,
+        "new_dial_started_after_terminal_fence": 0,
+        "new_site_bytes_device_to_engine_after_terminal_fence": 0,
+        "new_site_bytes_engine_to_device_after_terminal_fence": 0,
+        "verified_mesh_peer": "revoked"
+      },
+      "precondition": "Construct each semantic negative as a valid-AEAD canonical-CBOR plaintext and seal it with the frozen directional TransportState; raw-wire mutation alone normally exercises only tag failure."
+    },
+    "pre_promotion_failures": {
+      "cases": [
+        "provider_absent",
+        "provider_stale",
+        "provider_generation_mismatch",
+        "ready_gate_loss",
+        "verified_mesh_local_gate_loss",
+        "c3_invalid_or_replay",
+        "pending_from_another_ws_channel_or_cb",
+        "site_payload_or_close_before_c3",
+        "plaintext_frame",
+        "raw_ciphertext_without_cbor_envelope",
+        "text_websocket_frame",
+        "second_websocket"
+      ],
+      "expected": {
+        "close_same_websocket": true,
+        "dial_connected": 0,
+        "dial_permit_issued": 0,
+        "dial_started": 0,
+        "site_bytes": 0,
+        "verified_mesh_peer": 0
+      }
+    }
+  },
+  "record_layout": {
+    "ad_hex": "",
+    "close_is_terminal_no_ack_no_resumption": true,
+    "close_schema": [
+      "domain",
+      "version",
+      "kind",
+      "direction",
+      "seq",
+      "channel_id",
+      "channel_epoch",
+      "channel_binding",
+      "close_code"
+    ],
+    "close_vectors_are_alternative_terminal_branches_after_site_payload_sequence_one": true,
+    "directions": {
+      "device_to_engine": 0,
+      "engine_to_device": 1
+    },
+    "domain": "soyeht/owner-site/a2/v1",
+    "envelope_version": 1,
+    "initial_next_sequence_after_c3": 1,
+    "kinds": {
+      "close": 4,
+      "site_payload": 3
+    },
+    "max_ciphertext_bytes": 16384,
+    "max_envelope_bytes": 16389,
+    "max_plaintext_bytes": 16368,
+    "max_site_payload_bstr_bytes_all_valid_u64_contexts": 16251,
+    "max_site_payload_bstr_bytes_fixture_context": 16267,
+    "replay_window": 0,
+    "serialized_plaintext_must_not_exceed_max_plaintext_bytes": true,
+    "site_payload_schema": [
+      "domain",
+      "version",
+      "kind",
+      "direction",
+      "seq",
+      "channel_id",
+      "channel_epoch",
+      "channel_binding",
+      "payload_bstr"
+    ],
+    "u64_max_sequence_is_reserved": true,
+    "version": 1
+  },
+  "scope": "synthetic-test-only-cross-language-dataplane-witness",
+  "version": 1
+}
