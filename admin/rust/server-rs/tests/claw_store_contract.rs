@@ -658,6 +658,33 @@ fn owner_site_pre_effect_route_is_router_only_and_capability_sibling() {
             );
         }
     }
+    assert!(
+        authority.contains("pub(crate) struct PendingFinished {")
+            && authority.contains("pub(crate) struct AuthenticatedConfidentialChannel {")
+            && authority.contains("pub(crate) struct Pending {")
+            && authority.contains("pub(crate) struct Promoted {")
+            && authority.contains("pub(crate) struct Dialing {")
+            && authority.contains("pub(crate) struct Pumping {")
+            && authority.contains("pub(crate) struct Closing {")
+            && authority.contains("pub(crate) struct Revoking {")
+            && authority.contains("pub(crate) struct Closed {")
+            && authority.contains("owner_site_transition_is_allowed")
+            && authority.contains("compare_owner_site_generations"),
+        "the authority sibling must carry the inert Pending/state graph and pure helpers"
+    );
+    for forbidden in [
+        "VerifiedMeshPeer(",
+        "DialPermit(",
+        "fn promote",
+        "impl Promoted",
+        "impl Dialing",
+        "impl Pumping",
+    ] {
+        assert!(
+            !authority.contains(forbidden),
+            "the pre-effect authority must not acquire a promotion path: {forbidden}"
+        );
+    }
     for forbidden in [
         "household_attach_token",
         "GuestCredential",
@@ -687,6 +714,153 @@ fn owner_site_pre_effect_route_is_router_only_and_capability_sibling() {
         assert!(
             !route_slice.contains(forbidden),
             "owner-site registration must not create a listener or discovery side effect: {forbidden}"
+        );
+    }
+}
+
+#[test]
+fn owner_site_pending_finished_is_sealed_inert_and_non_promoting() {
+    let authority = include_str!("../src/owner_site_authority.rs");
+    let start = authority
+        .find("pub(crate) struct PendingFinished {")
+        .expect("production PendingFinished type must exist");
+    let rest = &authority[start..];
+    let declaration_end = rest
+        .find("\n}\n\nimpl std::fmt::Debug for PendingFinished")
+        .expect("PendingFinished must have a custom Debug implementation");
+    let declaration = &rest[..declaration_end + 2];
+    let prefix = &authority[start.saturating_sub(160)..start];
+
+    assert!(
+        !prefix.contains("#[derive("),
+        "PendingFinished must not inherit a derived Debug/Clone/serde path"
+    );
+    for field in [
+        "household: HouseholdId",
+        "exact_resource: OwnerSiteResource",
+        "exact_route: OwnerSiteCanonicalRequest",
+        "machine_cert: MachineCert",
+        "device_binding: MemberDeviceBinding",
+        "principal_d: OwnerSiteRemotePrincipal",
+        "ws_instance: OwnerSiteWebSocketInstance",
+        "channel_id: OwnerSiteChannelId",
+        "channel_epoch: OwnerSiteChannelEpoch",
+        "channel_binding: [u8; 32]",
+        "authz_epoch: NonZeroU64",
+        "roster_digest: [u8; 32]",
+        "fresh_until: u64",
+        "provider_generation: u64",
+        "cancellation_generation: u64",
+    ] {
+        assert!(
+            declaration.contains(field),
+            "PendingFinished must retain private tuple field {field}"
+        );
+    }
+    assert_eq!(
+        declaration
+            .lines()
+            .filter(|line| line.contains(':'))
+            .count(),
+        15,
+        "PendingFinished must contain exactly the complete 15-field tuple"
+    );
+    assert!(
+        declaration
+            .lines()
+            .skip(1)
+            .all(|line| !line.trim_start().starts_with("pub")),
+        "every PendingFinished tuple field must remain private"
+    );
+
+    let pending_impl_start = authority
+        .find("impl PendingFinished {")
+        .expect("PendingFinished implementation must exist");
+    let pending_impl_rest = &authority[pending_impl_start..];
+    let pending_impl_end = pending_impl_rest
+        .find("\n}\n\n/// Non-forgeable app-layer proof")
+        .expect("PendingFinished implementation must end before the channel proof");
+    let pending_impl = &pending_impl_rest[..pending_impl_end + 2];
+    assert!(
+        pending_impl.contains(
+            "#[cfg(test)]\n    #[allow(clippy::too_many_arguments)]\n    pub(crate) fn injected_for_harness("
+        ),
+        "only crate tests may construct PendingFinished in this slice"
+    );
+    for forbidden in [
+        "pub fn ",
+        "pub(crate) fn new",
+        "&mut self",
+        "Serialize",
+        "Deserialize",
+        "Default",
+        "impl Clone",
+        "impl From",
+        "impl TryFrom",
+    ] {
+        assert!(
+            !pending_impl.contains(forbidden),
+            "PendingFinished must not acquire construction or mutation path {forbidden}"
+        );
+    }
+    assert!(
+        authority.contains("formatter.write_str(\"PendingFinished(REDACTED)\")")
+            && authority
+                .contains("formatter.write_str(\"AuthenticatedConfidentialChannel(REDACTED)\")"),
+        "PendingFinished and its channel proof must use custom redacted Debug"
+    );
+    assert_eq!(
+        authority
+            .matches("\npub(crate) struct PendingFinished {")
+            .count(),
+        1,
+        "only the type declaration may name a PendingFinished struct literal"
+    );
+    assert_eq!(
+        authority.matches("\npub(crate) struct Promoted {").count(),
+        1,
+        "Promoted must exist only as a type declaration in this slice"
+    );
+    assert!(
+        authority.contains("pub(crate) struct Promoted {\n    channel: OwnerSitePromotedChannel,"),
+        "Promoted must carry the existing atomic peer/permit carrier without constructing it"
+    );
+    assert_eq!(
+        authority.matches("\npub(crate) struct Dialing {").count(),
+        1,
+        "Dialing must exist only as a type declaration in this slice"
+    );
+    assert_eq!(
+        authority.matches("\npub(crate) struct Pumping {").count(),
+        1,
+        "Pumping must exist only as a type declaration in this slice"
+    );
+    assert!(
+        authority.contains(
+            "#[cfg(test)]\n    pub(crate) fn injected_for_harness(\n        ws_instance: OwnerSiteWebSocketInstance"
+        ),
+        "the channel proof must remain constructible only by crate tests"
+    );
+    for forbidden in [
+        "VerifiedMeshPeer(",
+        "DialPermit(",
+        "fn promote",
+        "impl Promoted",
+        "impl Dialing",
+        "impl Pumping",
+        "use axum",
+        "TcpStream",
+        "TcpListener",
+        "tokio::net",
+        "connect(",
+        "write_all(",
+        "copy_bidirectional",
+        "fn mint",
+        "fn consume",
+    ] {
+        assert!(
+            !authority.contains(forbidden),
+            "the inert Pending graph must not acquire {forbidden}"
         );
     }
 }

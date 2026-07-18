@@ -15,13 +15,17 @@
 
 use std::num::NonZeroU64;
 
-use household_rs::{MemberDeviceBinding, P256PublicKey};
+use household_rs::{HouseholdId, MachineCert, MemberDeviceBinding, P256PublicKey};
 
-use crate::owner_site_capability::{OwnerSiteIntent, OwnerSiteResource};
+use crate::owner_site_capability::{OwnerSiteCanonicalRequest, OwnerSiteIntent, OwnerSiteResource};
 #[cfg(test)]
 use crate::owner_site_capability::{
     OwnerSiteIntentError, validated_component, validated_server_identifier,
 };
+use crate::owner_site_challenge::{
+    OwnerSiteChannelEpoch, OwnerSiteChannelId, OwnerSiteWebSocketInstance,
+};
+use crate::owner_site_promotion::OwnerSitePromotedChannel;
 
 /// Version reserved for the future signed owner-site roster envelope.
 ///
@@ -29,6 +33,282 @@ use crate::owner_site_capability::{
 /// this PR. Keeping the version private to server types prevents a provisional
 /// HTTP or A2 encoding from becoming a protocol commitment.
 pub(crate) const OWNER_SITE_ROSTER_VERSION: u8 = 1;
+
+/// Server-local state after A2 has authenticated both sides and confirmed C3.
+///
+/// This is the complete immutable identity/authority tuple that a later
+/// linearizer must resolve.  It is deliberately not serializable, clonable,
+/// default-constructible, or convertible from another value.  Production has
+/// no constructor in this slice; the only constructor is a synthetic crate
+/// test fixture below.
+pub(crate) struct PendingFinished {
+    household: HouseholdId,
+    exact_resource: OwnerSiteResource,
+    exact_route: OwnerSiteCanonicalRequest,
+    machine_cert: MachineCert,
+    device_binding: MemberDeviceBinding,
+    principal_d: OwnerSiteRemotePrincipal,
+    ws_instance: OwnerSiteWebSocketInstance,
+    channel_id: OwnerSiteChannelId,
+    channel_epoch: OwnerSiteChannelEpoch,
+    channel_binding: [u8; 32],
+    authz_epoch: NonZeroU64,
+    roster_digest: [u8; 32],
+    fresh_until: u64,
+    provider_generation: u64,
+    cancellation_generation: u64,
+}
+
+impl std::fmt::Debug for PendingFinished {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("PendingFinished(REDACTED)")
+    }
+}
+
+impl PendingFinished {
+    #[cfg(test)]
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn injected_for_harness(
+        household: HouseholdId,
+        exact_resource: OwnerSiteResource,
+        exact_route: OwnerSiteCanonicalRequest,
+        machine_cert: MachineCert,
+        device_binding: MemberDeviceBinding,
+        principal_d: OwnerSiteRemotePrincipal,
+        ws_instance: OwnerSiteWebSocketInstance,
+        channel_id: OwnerSiteChannelId,
+        channel_epoch: OwnerSiteChannelEpoch,
+        channel_binding: [u8; 32],
+        authz_epoch: u64,
+        roster_digest: [u8; 32],
+        fresh_until: u64,
+        provider_generation: u64,
+        cancellation_generation: u64,
+    ) -> Result<Self, OwnerSiteAuthorityError> {
+        let authz_epoch =
+            NonZeroU64::new(authz_epoch).ok_or(OwnerSiteAuthorityError::ZeroGeneration)?;
+        Ok(Self {
+            household,
+            exact_resource,
+            exact_route,
+            machine_cert,
+            device_binding,
+            principal_d,
+            ws_instance,
+            channel_id,
+            channel_epoch,
+            channel_binding,
+            authz_epoch,
+            roster_digest,
+            fresh_until,
+            provider_generation,
+            cancellation_generation,
+        })
+    }
+
+    #[must_use]
+    fn generation_vector(&self) -> OwnerSiteGenerationVector {
+        OwnerSiteGenerationVector {
+            authz_epoch: self.authz_epoch.get(),
+            roster_digest: self.roster_digest,
+            provider_generation: self.provider_generation,
+            cancellation_generation: self.cancellation_generation,
+        }
+    }
+}
+
+/// Non-forgeable app-layer proof that one exact A2 channel is authenticated
+/// and confidential.
+///
+/// The type is intentionally defined but not wired to any production session,
+/// mint, route, or promotion boundary in this slice.
+pub(crate) struct AuthenticatedConfidentialChannel {
+    _seal: AuthenticatedConfidentialChannelSeal,
+    ws_instance: OwnerSiteWebSocketInstance,
+    channel_id: OwnerSiteChannelId,
+    channel_epoch: OwnerSiteChannelEpoch,
+    channel_binding: [u8; 32],
+}
+
+struct AuthenticatedConfidentialChannelSeal;
+
+impl std::fmt::Debug for AuthenticatedConfidentialChannel {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("AuthenticatedConfidentialChannel(REDACTED)")
+    }
+}
+
+impl AuthenticatedConfidentialChannel {
+    #[cfg(test)]
+    pub(crate) fn injected_for_harness(
+        ws_instance: OwnerSiteWebSocketInstance,
+        channel_id: OwnerSiteChannelId,
+        channel_epoch: OwnerSiteChannelEpoch,
+        channel_binding: [u8; 32],
+    ) -> Self {
+        Self {
+            _seal: AuthenticatedConfidentialChannelSeal,
+            ws_instance,
+            channel_id,
+            channel_epoch,
+            channel_binding,
+        }
+    }
+
+    #[cfg(test)]
+    #[must_use]
+    fn matches_pending(&self, pending: &PendingFinished) -> bool {
+        self.ws_instance == pending.ws_instance
+            && self.channel_id == pending.channel_id
+            && self.channel_epoch == pending.channel_epoch
+            && self.channel_binding == pending.channel_binding
+    }
+}
+
+/// Type-level representation of a channel waiting for the later linearizer.
+pub(crate) struct Pending {
+    pending_finished: PendingFinished,
+    channel: AuthenticatedConfidentialChannel,
+}
+
+impl Pending {
+    #[cfg(test)]
+    pub(crate) fn injected_for_harness(
+        pending_finished: PendingFinished,
+        channel: AuthenticatedConfidentialChannel,
+    ) -> Result<Self, OwnerSiteAuthorityError> {
+        if !channel.matches_pending(&pending_finished) {
+            return Err(OwnerSiteAuthorityError::ChannelProofMismatch);
+        }
+        Ok(Self {
+            pending_finished,
+            channel,
+        })
+    }
+
+    fn begin_closing(self) -> Closing {
+        Closing { pending: self }
+    }
+}
+
+/// Type-level promoted state.  Its carrier has no construction path here.
+pub(crate) struct Promoted {
+    channel: OwnerSitePromotedChannel,
+}
+
+/// Type-level state after a future single-use permit reserves one backend.
+pub(crate) struct Dialing {
+    promoted: Promoted,
+}
+
+/// Type-level state for a future fenced byte pump.
+pub(crate) struct Pumping {
+    dialing: Dialing,
+}
+
+/// Pure terminal path available to an unpromoted channel in this slice.
+pub(crate) struct Closing {
+    pending: Pending,
+}
+
+impl Closing {
+    fn finish(self) -> Closed {
+        let Self { pending } = self;
+        let Pending {
+            pending_finished,
+            channel,
+        } = pending;
+        let _ = (pending_finished, channel);
+        Closed {
+            _seal: ClosedStateSeal,
+        }
+    }
+}
+
+/// Type-level revoke state reserved for the later persisted linearizer.
+pub(crate) struct Revoking {
+    _seal: RevokingStateSeal,
+}
+
+struct RevokingStateSeal;
+
+/// Idempotent terminal state.  Closing it again cannot recreate authority.
+pub(crate) struct Closed {
+    _seal: ClosedStateSeal,
+}
+
+struct ClosedStateSeal;
+
+impl Closed {
+    #[must_use]
+    fn close(self) -> Self {
+        self
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum OwnerSiteStateKind {
+    Pending,
+    Promoted,
+    Dialing,
+    Pumping,
+    Closing,
+    Revoking,
+    Closed,
+}
+
+/// Pure topology predicate for the deliberately non-promoting first slice.
+#[must_use]
+const fn owner_site_transition_is_allowed(
+    from: OwnerSiteStateKind,
+    to: OwnerSiteStateKind,
+) -> bool {
+    matches!(
+        (from, to),
+        (OwnerSiteStateKind::Pending, OwnerSiteStateKind::Closing)
+            | (
+                OwnerSiteStateKind::Closing
+                    | OwnerSiteStateKind::Closed
+                    | OwnerSiteStateKind::Revoking,
+                OwnerSiteStateKind::Closed
+            )
+    )
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct OwnerSiteGenerationVector {
+    authz_epoch: u64,
+    roster_digest: [u8; 32],
+    provider_generation: u64,
+    cancellation_generation: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum OwnerSiteGenerationComparison {
+    Exact,
+    AuthorityChanged,
+    ProviderChanged,
+    CancellationChanged,
+}
+
+/// Pure generation comparison; it reads no provider, clock, store, or socket.
+#[must_use]
+fn compare_owner_site_generations(
+    expected: OwnerSiteGenerationVector,
+    observed: OwnerSiteGenerationVector,
+) -> OwnerSiteGenerationComparison {
+    if expected.cancellation_generation != observed.cancellation_generation {
+        OwnerSiteGenerationComparison::CancellationChanged
+    } else if expected.authz_epoch != observed.authz_epoch
+        || expected.roster_digest != observed.roster_digest
+    {
+        OwnerSiteGenerationComparison::AuthorityChanged
+    } else if expected.provider_generation != observed.provider_generation {
+        OwnerSiteGenerationComparison::ProviderChanged
+    } else {
+        OwnerSiteGenerationComparison::Exact
+    }
+}
 
 /// Opaque identity expected from the future reviewed connection-principal
 /// boundary.
@@ -815,6 +1095,7 @@ impl OwnerSiteHarnessAuthority {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum OwnerSiteAuthorityError {
     ZeroGeneration,
+    ChannelProofMismatch,
     ZeroBindingId,
     ZeroBindingDigest,
     MemberDeviceBindingRejected,
@@ -910,6 +1191,8 @@ pub(crate) fn active_authority_fixture(
 mod tests {
     use super::*;
     use household_rs::keys::{IdentityKey, P256Keypair};
+    use household_rs::machine_cert::SignOptions;
+    use household_rs::{Platform, derive_household_id};
 
     fn resource() -> OwnerSiteResource {
         OwnerSiteResource::from_route_claw("picoclaw").expect("resource")
@@ -930,6 +1213,174 @@ mod tests {
         let device = P256Keypair::generate();
         MemberDeviceBinding::sign(&member, device.public(), npub.to_string(), 1_000)
             .expect("signed member-device binding")
+    }
+
+    fn pending_finished_fixture() -> (PendingFinished, AuthenticatedConfidentialChannel) {
+        let household_root = P256Keypair::generate();
+        let machine = P256Keypair::generate();
+        let household = derive_household_id(&household_root.public());
+        let machine_cert = MachineCert::sign(
+            &household_root,
+            &machine.public(),
+            &SignOptions {
+                hh_id: household.clone(),
+                hostname: "pending-secret-host".to_owned(),
+                platform: Platform::Macos,
+                joined_at: 1_000,
+            },
+        )
+        .expect("machine certificate");
+        let device_binding = signed_member_device("npub1pendingsecret");
+        let principal_d = OwnerSiteRemotePrincipal::injected_for_harness("npub1pendingsecret")
+            .expect("remote principal");
+        let exact_resource =
+            OwnerSiteResource::from_route_claw("pending-secret-claw").expect("resource");
+        let exact_route =
+            crate::owner_site_capability::OwnerSiteCanonicalRequest::injected_for_harness(
+                crate::owner_site_capability::OwnerSiteRequestMethod::Post,
+                "/api/v1/household/claws/{name}/owner-site/preflight",
+                [0x31; 32],
+            )
+            .expect("canonical route");
+        let ws_instance = OwnerSiteWebSocketInstance::injected_for_harness([0x21; 32]);
+        let channel_id = OwnerSiteChannelId::injected_for_harness([0x22; 32]);
+        let channel_epoch = OwnerSiteChannelEpoch::injected_for_harness(7).expect("channel epoch");
+        let channel_binding = [0x23; 32];
+        let channel = AuthenticatedConfidentialChannel::injected_for_harness(
+            ws_instance,
+            channel_id,
+            channel_epoch,
+            channel_binding,
+        );
+        let pending = PendingFinished::injected_for_harness(
+            household,
+            exact_resource,
+            exact_route,
+            machine_cert,
+            device_binding,
+            principal_d,
+            ws_instance,
+            channel_id,
+            channel_epoch,
+            channel_binding,
+            9,
+            [0x24; 32],
+            1_060,
+            11,
+            13,
+        )
+        .expect("synthetic pending state");
+        (pending, channel)
+    }
+
+    #[test]
+    fn pending_finished_debug_is_redacted_and_does_not_leak_tuple_material() {
+        let (pending, channel) = pending_finished_fixture();
+        let pending_debug = format!("{pending:?}");
+        let channel_debug = format!("{channel:?}");
+
+        assert_eq!(pending_debug, "PendingFinished(REDACTED)");
+        assert_eq!(channel_debug, "AuthenticatedConfidentialChannel(REDACTED)");
+        for secret in [
+            "pending-secret-host",
+            "npub1pendingsecret",
+            "pending-secret-claw",
+            "/api/v1/household/claws",
+        ] {
+            assert!(!pending_debug.contains(secret));
+            assert!(!channel_debug.contains(secret));
+        }
+    }
+
+    #[test]
+    fn generation_comparison_is_pure_and_distinguishes_every_fence() {
+        let (pending, _channel) = pending_finished_fixture();
+        let expected = pending.generation_vector();
+        assert_eq!(
+            compare_owner_site_generations(expected, expected),
+            OwnerSiteGenerationComparison::Exact
+        );
+
+        let authority_changed = OwnerSiteGenerationVector {
+            roster_digest: [0x99; 32],
+            ..expected
+        };
+        assert_eq!(
+            compare_owner_site_generations(expected, authority_changed),
+            OwnerSiteGenerationComparison::AuthorityChanged
+        );
+        let provider_changed = OwnerSiteGenerationVector {
+            provider_generation: expected.provider_generation + 1,
+            ..expected
+        };
+        assert_eq!(
+            compare_owner_site_generations(expected, provider_changed),
+            OwnerSiteGenerationComparison::ProviderChanged
+        );
+        let cancellation_changed = OwnerSiteGenerationVector {
+            cancellation_generation: expected.cancellation_generation + 1,
+            ..expected
+        };
+        assert_eq!(
+            compare_owner_site_generations(expected, cancellation_changed),
+            OwnerSiteGenerationComparison::CancellationChanged
+        );
+    }
+
+    #[test]
+    fn pending_can_only_close_and_promotion_is_unreachable_in_this_slice() {
+        assert!(owner_site_transition_is_allowed(
+            OwnerSiteStateKind::Pending,
+            OwnerSiteStateKind::Closing
+        ));
+        assert!(owner_site_transition_is_allowed(
+            OwnerSiteStateKind::Closing,
+            OwnerSiteStateKind::Closed
+        ));
+        assert!(owner_site_transition_is_allowed(
+            OwnerSiteStateKind::Closed,
+            OwnerSiteStateKind::Closed
+        ));
+        assert!(!owner_site_transition_is_allowed(
+            OwnerSiteStateKind::Pending,
+            OwnerSiteStateKind::Promoted
+        ));
+        assert!(!owner_site_transition_is_allowed(
+            OwnerSiteStateKind::Pending,
+            OwnerSiteStateKind::Dialing
+        ));
+        assert!(!owner_site_transition_is_allowed(
+            OwnerSiteStateKind::Pending,
+            OwnerSiteStateKind::Pumping
+        ));
+
+        // Merely naming the future carrier states proves their types compile;
+        // no value or construction path for any of them exists in this slice.
+        let future_state_types = [
+            std::any::type_name::<Promoted>(),
+            std::any::type_name::<Dialing>(),
+            std::any::type_name::<Pumping>(),
+            std::any::type_name::<Revoking>(),
+        ];
+        assert!(future_state_types.iter().all(|name| !name.is_empty()));
+
+        let (mismatched_pending, _channel) = pending_finished_fixture();
+        let mismatched_channel = AuthenticatedConfidentialChannel::injected_for_harness(
+            mismatched_pending.ws_instance,
+            OwnerSiteChannelId::injected_for_harness([0xff; 32]),
+            mismatched_pending.channel_epoch,
+            mismatched_pending.channel_binding,
+        );
+        assert!(matches!(
+            Pending::injected_for_harness(mismatched_pending, mismatched_channel),
+            Err(OwnerSiteAuthorityError::ChannelProofMismatch)
+        ));
+
+        let (pending_finished, channel) = pending_finished_fixture();
+        let pending = Pending::injected_for_harness(pending_finished, channel)
+            .expect("matching channel proof");
+        let closed = pending.begin_closing().finish();
+        let _still_closed = closed.close();
     }
 
     fn binding(id_fill: u8, enrolled_at: OwnerSiteAuthorityGeneration) -> OwnerSiteRosterBinding {
