@@ -1,5 +1,13 @@
 # Owner-mesh rendezvous — canonical wire encoding (v1)
 
+**Correction (2026-07-21, in-place — supersedes raw-SHA-256 `3c3c45ab…`).** §3's
+printed key-sets were corrected from alphabetical to the actual canonical
+`household_rs::cbor` (RFC 8949 §4.2.1) **length-first** byte order — the encoder's
+true output, not a hand-sorted list. §1 (profile), §6/§8 (budgets), §7 (`err.*`
+taxonomy), and the R0b companion (`9bd608fb`) are **unchanged**; only §3's
+illustrative order (and this note) changed. The prior frozen bytes (`3c3c45ab`)
+are superseded history.
+
 Author: jovian · 2026-07-21 · Verification: verifier ≠ author — @safia re-GO
 (wire security + budget trio + R0b anchor preservation) + @adriana re-ok (B6:
 each err.\* observable and distinct) **before any freeze**. Merge: @kiana.
@@ -88,16 +96,24 @@ informational (R0b §2), not a wire key.
 - Absent by design (I5 — a present one is `err.unknown_frame` at step 6): any
   relay/mode/priority frame such as `RzUseRelay`.
 
-The full sorted key-set per frame (canonical order is a §1 consequence, shown
-for the corpus author):
-- Hello: `{candidates, domain, kind, rendezvous_id, version}`
-- Peer: `{domain, kind, observed_reflexive, peer_candidates, rendezvous_id, version}`
-- Ok / Close: `{domain, kind, rendezvous_id, version}`
+The full canonical key-set per frame — **the byte order the §1 encoder
+(`household_rs::cbor`) actually produces, not a hand-sorted list.** §1 sorts map
+keys by their encoded-key bytes (RFC 8949 §4.2.1), so for these text-string keys
+the **shorter key sorts first** (the `0x60+len` length header byte dominates the
+comparison), then lexicographically within an equal length — this is **not**
+alphabetical order. **§1 / the encoder is the sole authority for ordering; the
+list below is its derived output, never hand-sorted**; a corpus frame in any
+other key order is rejected `err.noncanonical_cbor` (§7.1 #4):
+- Hello: `{kind, domain, version, candidates, rendezvous_id}`
+- Peer: `{kind, domain, version, rendezvous_id, peer_candidates, observed_reflexive}`
+- Ok / Close: `{kind, domain, version, rendezvous_id}`
 
 ## 4. Candidate sub-structure (I4 — exactly three classes)
 
 Each element of `candidates`/`peer_candidates`/`observed_reflexive` is a
-canonical-CBOR map with an integer `class` and class-specific keys. Any other
+canonical-CBOR map with an integer `class` and class-specific keys. Its map-key
+order, like every map, is the §1 encoder's (length-first) output — **not** the
+field order described below, which is for reading only. Any other
 class or extra key is rejected at the border — codec-level extra key is
 `err.unknown_field`; a well-formed-but-disallowed class is the **behavioral**
 `err.candidate_class_denied` (§7). The three classes (R0b §3):
