@@ -422,7 +422,7 @@ dependencies = [
 
 [[package]]
 name = "backup-rs"
-version = "0.1.21"
+version = "0.1.22"
 dependencies = [
  "core-rs",
  "rusqlite",
@@ -916,7 +916,7 @@ checksum = "3a822ea5bc7590f9d40f1ba12c0dc3c2760f3482c6984db1573ad11031420831"
 
 [[package]]
 name = "claw-autoupdate-rs"
-version = "0.1.21"
+version = "0.1.22"
 dependencies = [
  "core-rs",
  "serde",
@@ -926,7 +926,7 @@ dependencies = [
 
 [[package]]
 name = "claw-rs"
-version = "0.1.21"
+version = "0.1.22"
 dependencies = [
  "core-rs",
  "libc",
@@ -1095,7 +1095,7 @@ dependencies = [
 
 [[package]]
 name = "core-rs"
-version = "0.1.21"
+version = "0.1.22"
 dependencies = [
  "axum",
  "base64 0.22.1",
@@ -1529,7 +1529,7 @@ checksum = "1435fa1053d8b2fbbe9be7e97eca7f33d37b28409959813daefc1446a14247f1"
 
 [[package]]
 name = "e2e-rs"
-version = "0.1.21"
+version = "0.1.22"
 dependencies = [
  "axum",
  "base64 0.22.1",
@@ -1724,7 +1724,7 @@ dependencies = [
 
 [[package]]
 name = "executor-rs"
-version = "0.1.21"
+version = "0.1.22"
 dependencies = [
  "core-rs",
  "serde",
@@ -2645,7 +2645,7 @@ dependencies = [
 
 [[package]]
 name = "imagebuilder-rs"
-version = "0.1.21"
+version = "0.1.22"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -2797,7 +2797,7 @@ checksum = "92ecc6618181def0457392ccd0ee51198e065e016d1d527a7ac1b6dc7c1f09d2"
 
 [[package]]
 name = "jobs-rs"
-version = "0.1.21"
+version = "0.1.22"
 dependencies = [
  "core-rs",
  "rusqlite",
@@ -2881,7 +2881,7 @@ dependencies = [
 
 [[package]]
 name = "launcher-rs"
-version = "0.1.21"
+version = "0.1.22"
 dependencies = [
  "core-rs",
  "serde_json",
@@ -4284,7 +4284,7 @@ dependencies = [
 
 [[package]]
 name = "rootfsbuilder-rs"
-version = "0.1.21"
+version = "0.1.22"
 dependencies = [
  "core-rs",
  "tempfile",
@@ -4874,7 +4874,7 @@ dependencies = [
 
 [[package]]
 name = "server-rs"
-version = "0.1.21"
+version = "0.1.22"
 dependencies = [
  "a2",
  "axum",
@@ -4937,7 +4937,7 @@ dependencies = [
 
 [[package]]
 name = "session-rs"
-version = "0.1.21"
+version = "0.1.22"
 dependencies = [
  "base64 0.22.1",
  "core-rs",
@@ -5116,7 +5116,7 @@ dependencies = [
 
 [[package]]
 name = "soyeht-rs"
-version = "0.1.21"
+version = "0.1.22"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -5220,7 +5220,7 @@ dependencies = [
 
 [[package]]
 name = "store-rs"
-version = "0.1.21"
+version = "0.1.22"
 dependencies = [
  "core-rs",
  "rand 0.8.6",
@@ -5309,7 +5309,7 @@ dependencies = [
 
 [[package]]
 name = "terminal-rs"
-version = "0.1.21"
+version = "0.1.22"
 dependencies = [
  "base64 0.22.1",
  "core-rs",
@@ -5901,7 +5901,7 @@ checksum = "8ecb6da28b8a351d773b68d5825ac39017e680750f980f3a1a85cd8dd28a47c1"
 
 [[package]]
 name = "updater-rs"
-version = "0.1.21"
+version = "0.1.22"
 dependencies = [
  "core-rs",
  "tempfile",
@@ -5990,7 +5990,7 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 
 [[package]]
 name = "vmrunner-common-rs"
-version = "0.1.21"
+version = "0.1.22"
 dependencies = [
  "core-rs",
  "serde",
@@ -5999,7 +5999,7 @@ dependencies = [
 
 [[package]]
 name = "vmrunner-macos-rs"
-version = "0.1.21"
+version = "0.1.22"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -6027,7 +6027,7 @@ dependencies = [
 
 [[package]]
 name = "vmrunner-rs"
-version = "0.1.21"
+version = "0.1.22"
 dependencies = [
  "async-trait",
  "base64 0.22.1",

@@ -1,6 +1,6 @@
 [package]
 name = "executor-rs"
-version = "0.1.21"
+version = "0.1.22"
 edition.workspace = true
 rust-version.workspace = true
 description = "Rust executor daemon that runs complete instance lifecycle flows via IPC subprocesses"
