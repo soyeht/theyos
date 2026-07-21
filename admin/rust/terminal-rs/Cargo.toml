@@ -14,6 +14,13 @@ pty-process  = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 base64 = { workspace = true }
+libc = { workspace = true }
+# Direct dep (not just transitive via pty-process) so we can call
+# `ptsname()` (feature = "alloc", not enabled by pty-process itself) to
+# expose the PTY slave device path as session metadata (E5). Version
+# pinned to match the `1.1.4` already resolved in the workspace lockfile
+# via pty-process, so this doesn't pull in a second rustix version.
+rustix = { version = "1.1.4", features = ["pty", "alloc"] }
 
 [dev-dependencies]
 tempfile = { workspace = true }

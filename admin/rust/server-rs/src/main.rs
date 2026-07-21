@@ -502,6 +502,17 @@ async fn main() {
                 if stale_count > 0 {
                     tracing::info!("[maintenance] cleaned up {stale_count} stale PTY session(s)");
                 }
+                // Reclaim conversation logs nobody has reattached to (or
+                // explicitly closed) in a long time — `cleanup_stale` above
+                // only reaps sessions tracked in-memory this run, not a
+                // `conversation_id` nobody has asked for since the last
+                // restart.
+                let orphan_count = st.pty_mgr.gc_orphaned_conversation_logs();
+                if orphan_count > 0 {
+                    tracing::info!(
+                        "[maintenance] garbage-collected {orphan_count} orphaned PTY conversation log(s)"
+                    );
+                }
                 // Expire terminal workspaces idle for >90 days.
                 let st3 = Arc::clone(&st);
                 match tokio::task::spawn_blocking(move || {

@@ -102,12 +102,26 @@ pub fn compose(state: &SharedState, cfg: &Config) -> Router {
     let index_path = format!("{}/index.html", cfg.web_dir);
     let spa_service = ServeDir::new(&cfg.web_dir).not_found_service(ServeFile::new(&index_path));
 
-    let api_streaming = Router::new().route(
-        "/terminals/{container}/pty",
-        get(handlers_terminal::handle_terminal_pty),
-    );
+    let api_streaming = Router::new()
+        .route(
+            "/terminals/{container}/pty",
+            get(handlers_terminal::handle_terminal_pty),
+        )
+        .route(
+            "/terminals/local/{conversation_id}/pty",
+            get(handlers_terminal::handle_local_terminal_pty),
+        );
 
     let api_rest = Router::new()
+        .route(
+            "/terminals/local",
+            get(handlers_terminal::handle_local_terminal_list)
+                .post(handlers_terminal::handle_local_terminal_create),
+        )
+        .route(
+            "/terminals/local/{conversation_id}",
+            axum::routing::delete(handlers_terminal::handle_local_terminal_delete),
+        )
         .route("/auth/logout", post(auth::handle_logout))
         .route("/me", get(auth::handle_me))
         .route("/claw-types", get(handlers_misc::handle_claw_types))

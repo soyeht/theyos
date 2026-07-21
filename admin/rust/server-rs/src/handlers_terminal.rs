@@ -497,6 +497,10 @@ pub struct PtyQuery {
     pub cols: u16,
     #[serde(default)]
     pub rows: u16,
+    /// Opt-in to replaying the entire conversation log on attach instead of
+    /// just the tail (`TAIL_REPLAY_BYTES`). Defaults to `false`.
+    #[serde(default)]
+    pub full_replay: bool,
 }
 
 /// Validate and normalize a raw session query parameter.
@@ -619,7 +623,156 @@ pub(crate) async fn serve_authorized_terminal_pty(
         state: Arc::clone(&state),
         workspace_id: session_id,
     };
-    ws.on_upgrade(move |socket| serve_pty_websocket(socket, sess, cols, rows, ctx))
+    let full_replay = q.full_replay;
+    ws.on_upgrade(move |socket| serve_pty_websocket(socket, sess, cols, rows, full_replay, ctx))
+}
+
+// ── Local (broker-owned) terminals — persistent panes ─────────────────────
+//
+// The Soyeht macOS app routes local pane PTYs through the engine so agent
+// processes survive app restarts/updates. The app resolves argv/cwd/env and
+// the engine only executes. Spawning a local command is host code execution
+// by design: these endpoints are loopback-only and require the same
+// authentication as every other terminal endpoint.
+
+#[derive(Deserialize)]
+pub struct LocalTerminalCreateRequest {
+    pub conversation_id: String,
+    pub argv: Vec<String>,
+    #[serde(default)]
+    pub cwd: Option<String>,
+    #[serde(default)]
+    pub env: Vec<(String, String)>,
+    #[serde(default)]
+    pub cols: u16,
+    #[serde(default)]
+    pub rows: u16,
+}
+
+/// `POST /api/v1/terminals/local` — create (or reattach to) a broker-owned
+/// local PTY session. Idempotent per `conversation_id`: an existing live
+/// session is returned as-is, so app relaunch can blindly re-issue creates.
+/// The response's `reconnected` field tells the two cases apart (`true` =
+/// returned an existing live session; `false` = spawned a new process), so
+/// the caller can say "conversation restored" only when it's actually true.
+pub async fn handle_local_terminal_create(
+    State(state): State<SharedState>,
+    _auth: AuthUser,
+    Json(req): Json<LocalTerminalCreateRequest>,
+) -> Response {
+    if req.argv.is_empty() {
+        return ApiError::bad_request("argv must not be empty").into_response();
+    }
+    let spec = terminal_rs::pty::LocalSpawnSpec {
+        argv: req.argv,
+        cwd: req.cwd.map(std::path::PathBuf::from),
+        env: req.env,
+    };
+    let cols = if req.cols > 0 { req.cols } else { 80 };
+    let rows = if req.rows > 0 { req.rows } else { 24 };
+
+    let pm = Arc::clone(&state.pty_mgr);
+    let conv_id = req.conversation_id.clone();
+    match tokio::task::spawn_blocking(move || pm.start_local(&conv_id, &spec, cols, rows)).await {
+        Ok(Ok((sess, reconnected))) => (
+            StatusCode::OK,
+            Json(json!({
+                "conversation_id": req.conversation_id,
+                "ws_path": format!("/api/v1/terminals/local/{}/pty", req.conversation_id),
+                "slave_tty_path": sess.slave_tty_path(),
+                // True when an existing live session was returned as-is;
+                // false when a new process had to be spawned. Lets the
+                // client say "conversation restored" only when it's true.
+                "reconnected": reconnected,
+            })),
+        )
+            .into_response(),
+        Ok(Err(e)) => ApiError::from(e).into_response(),
+        Err(e) => ApiError::internal(e.to_string()).into_response(),
+    }
+}
+
+/// `GET /api/v1/terminals/local` — lists every broker-owned local session
+/// (live or not-yet-reaped), with the metadata `soyeht-mcp` needs to map a
+/// TTY back to the pane that owns it.
+pub async fn handle_local_terminal_list(State(state): State<SharedState>, _auth: AuthUser) -> Response {
+    let pm = Arc::clone(&state.pty_mgr);
+    match tokio::task::spawn_blocking(move || pm.list_local()).await {
+        Ok(sessions) => {
+            let items: Vec<serde_json::Value> = sessions
+                .iter()
+                .map(|s| {
+                    json!({
+                        "conversation_id": s.conversation_id,
+                        "slave_tty_path": s.slave_tty_path,
+                        "pgid": s.pgid,
+                        "cwd": s.cwd.to_string_lossy(),
+                        "is_connected": s.is_connected,
+                    })
+                })
+                .collect();
+            (
+                StatusCode::OK,
+                Json(json!({"data": items, "has_more": false, "next_cursor": null})),
+            )
+                .into_response()
+        }
+        Err(e) => ApiError::internal(e.to_string()).into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+pub struct LocalPtyQuery {
+    #[serde(default)]
+    cols: u16,
+    #[serde(default)]
+    rows: u16,
+    /// Opt-in to replaying the entire conversation log on attach instead of
+    /// just the tail (`TAIL_REPLAY_BYTES`). Defaults to `false`.
+    #[serde(default)]
+    full_replay: bool,
+}
+
+/// `GET /api/v1/terminals/local/{conversation_id}/pty` — attach a WebSocket
+/// to an existing broker-owned local session (404 if it is not running; the
+/// client must create it first so the spawn spec is always explicit).
+pub async fn handle_local_terminal_pty(
+    State(state): State<SharedState>,
+    _auth: AuthUser,
+    Path(conversation_id): Path<String>,
+    Query(q): Query<LocalPtyQuery>,
+    ws: WebSocketUpgrade,
+) -> Response {
+    let Some(sess) = state.pty_mgr.get_local(&conversation_id) else {
+        return ApiError::not_found("local session not found").into_response();
+    };
+    if sess.is_closed() {
+        return ApiError::not_found("local session has exited").into_response();
+    }
+
+    let cols = if q.cols > 0 { q.cols } else { 80 };
+    let rows = if q.rows > 0 { q.rows } else { 24 };
+    let ctx = PtyWsContext {
+        state: Arc::clone(&state),
+        workspace_id: conversation_id,
+    };
+    let full_replay = q.full_replay;
+    ws.on_upgrade(move |socket| serve_pty_websocket(socket, sess, cols, rows, full_replay, ctx))
+}
+
+/// `DELETE /api/v1/terminals/local/{conversation_id}` — close a broker-owned
+/// session (kills the child, removes the conversation log).
+pub async fn handle_local_terminal_delete(
+    State(state): State<SharedState>,
+    _auth: AuthUser,
+    Path(conversation_id): Path<String>,
+) -> Response {
+    let pm = Arc::clone(&state.pty_mgr);
+    match tokio::task::spawn_blocking(move || pm.close_local(&conversation_id)).await {
+        Ok(Ok(())) => StatusCode::NO_CONTENT.into_response(),
+        Ok(Err(e)) => ApiError::from(e).into_response(),
+        Err(e) => ApiError::internal(e.to_string()).into_response(),
+    }
 }
 
 /// Run a shell command inside a VM via `<ctl> exec <container> <cmd>`.
@@ -662,17 +815,84 @@ const CTL_PREFIX: &[u8] = b"\x00\x01CTL:";
 /// Replay file chunk size streamed over WS.
 const REPLAY_CHUNK: usize = 64 * 1024;
 
-/// v2 WebSocket event loop: stream full conversation log from disk as replay,
-/// then forward live broadcast (de-duplicated by end-offset cursor).
+/// Default replay window on reattach: only the last `TAIL_REPLAY_BYTES` of
+/// the conversation log are streamed, instead of the entire file. A long-
+/// running session's log can reach hundreds of MB; replaying all of it on
+/// every reattach is slow and risks the live-broadcast subscriber (capacity
+/// `BROADCAST_CAP` in `terminal-rs::pty`) lagging before the replay catches
+/// up. Callers that need the full history can opt in with `full_replay=true`.
+const TAIL_REPLAY_BYTES: u64 = 2 * 1024 * 1024;
+
+/// Bound on a single WS frame send (replay or live forward). A stalled or
+/// frozen peer — TCP send buffer never draining — would otherwise block
+/// `socket.send(...).await` indefinitely, holding this task and the PTY log
+/// file descriptor it keeps open for the rest of the session's lifetime.
+const WS_SEND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Sends `msg` on `socket`, bounded by `WS_SEND_TIMEOUT`. Returns `true` on
+/// success; `false` on a send error OR a timeout — callers treat both the
+/// same way a plain `.is_err()` would: the connection is presumed dead.
+async fn send_with_timeout(socket: &mut WebSocket, msg: Message) -> bool {
+    matches!(
+        tokio::time::timeout(WS_SEND_TIMEOUT, socket.send(msg)).await,
+        Ok(Ok(()))
+    )
+}
+
+/// Computes the (possibly clamped) replay window `[replay_from, cursor]`
+/// for a WS reattach. Returns `(replay_from, clamped_cursor)` — the caller
+/// re-binds its `cursor` variable to the second value.
+///
+/// `cursor` is clamped up to `base_offset` FIRST. `cursor` is snapshotted
+/// well before this is called (before a real WS send and a
+/// `replay_guard()` acquire, both genuine await points), so a rotation can
+/// land in that gap and advance `base_offset` past a now-stale `cursor` —
+/// the entire range up to that old snapshot was rotated off disk before it
+/// was ever read. Clamping `cursor` up first keeps every downstream
+/// computation (`replay_from`, the physical seek offset, the remaining
+/// byte count) safe against underflow: clamping `replay_from` alone cannot
+/// simultaneously satisfy `replay_from <= cursor` and
+/// `replay_from >= base_offset` when `cursor < base_offset`, but clamping
+/// `cursor` first collapses both sides to `base_offset` in that case,
+/// yielding a correct (empty) window instead of an inverted one.
+fn compute_replay_window(cursor: u64, base_offset: u64, full_replay: bool) -> (u64, u64) {
+    let cursor = cursor.max(base_offset);
+    let replay_from = if full_replay {
+        base_offset
+    } else {
+        cursor.saturating_sub(TAIL_REPLAY_BYTES).max(base_offset)
+    };
+    (replay_from, cursor)
+}
+
+/// v2 WebSocket event loop: stream a bounded tail of the conversation log
+/// from disk as replay, then forward live broadcast (de-duplicated by
+/// end-offset cursor).
 ///
 /// Flow:
 /// 1. Subscribe to broadcast FIRST (captures live bytes arriving during replay).
 /// 2. Read `cursor = log.size` AFTER subscribing (source of truth).
 /// 3. Send Binary `CTL:replay_start`.
-/// 4. Stream log file asynchronously up to `cursor` bytes, as Binary raw frames.
-/// 5. Send Binary `CTL:replay_done`.
-/// 6. Re-sync: keep streaming from the log if it grew during replay.
-/// 7. Enter live forward loop: drop chunks with `end_offset <= cursor`.
+/// 4. Compute the initial replay window under a brief `log.replay_guard()`
+///    acquire: `replay_from` is `base_offset` when `full_replay` is set or
+///    the log fits within `TAIL_REPLAY_BYTES`; otherwise
+///    `max(cursor - TAIL_REPLAY_BYTES, base_offset)` — history the log has
+///    rotated away is gone even under `full_replay`. When `replay_from > 0`,
+///    send Binary `CTL:replay_truncated` — the client knows history before
+///    that marker was dropped.
+/// 5. Stream log file asynchronously from `replay_from` to `cursor`, one
+///    bounded `REPLAY_CHUNK` at a time (translating to a physical seek
+///    position by subtracting `base_offset`), as Binary raw frames.
+///    `replay_guard()` is re-acquired per chunk (seek+read only) and never
+///    held across the network send, so a slow/frozen peer stalls only its
+///    own reattach, never a concurrent rotation.
+/// 6. Send Binary `CTL:replay_done`.
+/// 7. Re-sync: keep streaming from the log if it grew during replay.
+/// 8. Enter live forward loop: drop chunks with `end_offset <= cursor`.
+///
+/// Every WS send (replay, live forward, control markers, ping) goes through
+/// [`send_with_timeout`], so a stalled/frozen peer cannot hold this task —
+/// and the PTY log file descriptor it keeps open — indefinitely.
 ///
 /// Input handling: JSON Text frames (`input` / `resize` / `init`) processed
 /// concurrently. Writes to the PTY are serialized by `PtySession::write`'s
@@ -683,9 +903,10 @@ async fn serve_pty_websocket(
     sess: Arc<terminal_rs::pty::PtySession>,
     initial_cols: u16,
     initial_rows: u16,
+    full_replay: bool,
     ctx: PtyWsContext,
 ) {
-    use tokio::io::AsyncReadExt;
+    use tokio::io::{AsyncReadExt, AsyncSeekExt};
     use tokio::time::{Duration, interval};
 
     let state = ctx.state;
@@ -711,53 +932,99 @@ async fn serve_pty_websocket(
     let mut marker = Vec::with_capacity(CTL_PREFIX.len() + 12);
     marker.extend_from_slice(CTL_PREFIX);
     marker.extend_from_slice(b"replay_start");
-    if socket.send(Message::Binary(marker.into())).await.is_err() {
+    if !send_with_timeout(&mut socket, Message::Binary(marker.into())).await {
         return;
     }
 
-    // ── Step 4: stream log file 0..cursor (full history up to snapshot) ──
+    // ── Step 4: compute the initial replay window and flag truncation ──
     // Bytes beyond `cursor` are forwarded live via the broadcast channel in
-    // step 7, which drops messages with `end_offset <= cursor` to avoid
-    // duplicates. Previously this block seeked *to* `cursor` and read
-    // `tail - cursor` — which was always zero since `tail` equals the
-    // snapshot at entry — so late-joining clients received no history at all.
-    {
-        let mut reader = match tokio::fs::File::open(log.path()).await {
-            Ok(f) => f,
-            Err(e) => {
-                tracing::error!("[pty-ws] open log for replay: {e}");
-                return;
-            }
-        };
-        let mut remaining = usize::try_from(cursor).unwrap_or(usize::MAX);
-        let mut buf = vec![0u8; REPLAY_CHUNK];
-        while remaining > 0 {
-            let take = remaining.min(buf.len());
-            let n = match reader.read(&mut buf[..take]).await {
-                Ok(0) | Err(_) => {
-                    // Short read or error — let the live loop catch up.
-                    break;
-                }
-                Ok(n) => n,
-            };
-            if socket
-                .send(Message::Binary(buf[..n].to_vec().into()))
-                .await
-                .is_err()
-            {
-                return;
-            }
-            remaining -= n;
+    // step 8, which drops messages with `end_offset <= cursor` to avoid
+    // duplicates. Previously this streamed the entire log (`0..cursor`) on
+    // every reattach — for a long-running session that means replaying
+    // hundreds of MB of history the client already has, and it risks the
+    // broadcast subscriber lagging (fixed capacity) before replay catches up.
+    let (mut pos, replay_to) = {
+        let _guard = log.replay_guard().await;
+        compute_replay_window(cursor, log.base_offset(), full_replay)
+    };
+    cursor = replay_to;
+    if pos > 0 {
+        let mut marker = Vec::with_capacity(CTL_PREFIX.len() + 17);
+        marker.extend_from_slice(CTL_PREFIX);
+        marker.extend_from_slice(b"replay_truncated");
+        if !send_with_timeout(&mut socket, Message::Binary(marker.into())).await {
+            return;
         }
     }
 
-    // ── Step 5: replay_done marker ──
+    // ── Step 5: stream log file pos..replay_to, one bounded chunk at a time ──
+    // `replay_guard()` is acquired fresh for each chunk's seek+read, never
+    // held across the network send: a slow/frozen peer can stall
+    // `socket.send` for up to `WS_SEND_TIMEOUT`, and holding the guard
+    // across that would block `ConversationLog::append`'s rotation for the
+    // same span — one stalled reattach could stall every writer of the
+    // session's live output. `base_offset` is re-read on every iteration
+    // because a rotation can land in the gap between chunks (guard
+    // released for the send) and shift it forward past `pos`; when it
+    // does, `[pos, base_offset)` was dropped by rotation before this loop
+    // reached it — the same tolerated history loss `compute_replay_window`
+    // already accepts up front, just discovered one chunk later. The
+    // reader stays open across iterations: rotation mutates the log file
+    // in place via the same path/inode (see `rotate_file`), so an
+    // already-open fd sees rotated content correctly once re-seeked — only
+    // the guard's scope shrinks to a single seek+read pair.
+    let mut reader = match tokio::fs::File::open(log.path()).await {
+        Ok(f) => f,
+        Err(e) => {
+            tracing::error!("[pty-ws] open log for replay: {e}");
+            return;
+        }
+    };
+    while pos < replay_to {
+        let chunk = {
+            let _guard = log.replay_guard().await;
+            let base_offset = log.base_offset();
+            pos = pos.max(base_offset);
+            if pos >= replay_to {
+                None
+            } else {
+                // Physical file position 0 == logical offset `base_offset`.
+                let phys_from = pos - base_offset;
+                if let Err(e) = reader.seek(std::io::SeekFrom::Start(phys_from)).await {
+                    tracing::error!("[pty-ws] seek log for replay: {e}");
+                    return;
+                }
+                let take = usize::try_from(replay_to - pos)
+                    .unwrap_or(usize::MAX)
+                    .min(REPLAY_CHUNK);
+                let mut buf = vec![0u8; take];
+                match reader.read(&mut buf).await {
+                    Ok(0) | Err(_) => None,
+                    Ok(n) => {
+                        buf.truncate(n);
+                        Some(buf)
+                    }
+                }
+            }
+        };
+        let Some(buf) = chunk else {
+            // Nothing left in the window, or a short read/error — let the
+            // live loop catch up.
+            break;
+        };
+        pos += u64::try_from(buf.len()).unwrap_or(u64::MAX);
+        if !send_with_timeout(&mut socket, Message::Binary(buf.into())).await {
+            return;
+        }
+    }
+
+    // ── Step 6: replay_done marker ──
     let mut marker = Vec::with_capacity(CTL_PREFIX.len() + 11);
     marker.extend_from_slice(CTL_PREFIX);
     marker.extend_from_slice(b"replay_done");
-    let _ = socket.send(Message::Binary(marker.into())).await;
+    let _ = send_with_timeout(&mut socket, Message::Binary(marker.into())).await;
 
-    // ── Step 7: live forward loop + input handling ──
+    // ── Step 8: live forward loop + input handling ──
     let mut ping_ticker = interval(Duration::from_secs(30));
     ping_ticker.tick().await;
     let mut last_pong = tokio::time::Instant::now();
@@ -782,7 +1049,7 @@ async fn serve_pty_websocket(
                         } else {
                             &bytes[..]
                         };
-                        if socket.send(Message::Binary(to_send.to_vec().into())).await.is_err() {
+                        if !send_with_timeout(&mut socket, Message::Binary(to_send.to_vec().into())).await {
                             break;
                         }
                         cursor = end_offset;
@@ -792,14 +1059,14 @@ async fn serve_pty_websocket(
                         let mut m = Vec::with_capacity(CTL_PREFIX.len() + 17);
                         m.extend_from_slice(CTL_PREFIX);
                         m.extend_from_slice(b"subscriber_lagged");
-                        let _ = socket.send(Message::Binary(m.into())).await;
+                        let _ = send_with_timeout(&mut socket, Message::Binary(m.into())).await;
                         break;
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => {
                         let mut m = Vec::with_capacity(CTL_PREFIX.len() + 13);
                         m.extend_from_slice(CTL_PREFIX);
                         m.extend_from_slice(b"session_ended");
-                        let _ = socket.send(Message::Binary(m.into())).await;
+                        let _ = send_with_timeout(&mut socket, Message::Binary(m.into())).await;
                         break;
                     }
                 }
@@ -836,7 +1103,7 @@ async fn serve_pty_websocket(
                     tracing::warn!("[pty-ws] pong timeout (>90s), closing stale connection");
                     break;
                 }
-                if socket.send(Message::Ping(vec![].into())).await.is_err() {
+                if !send_with_timeout(&mut socket, Message::Ping(vec![].into())).await {
                     break;
                 }
             }
@@ -1235,3 +1502,77 @@ finally:
 }
 
 // ─── Unit tests ──────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn compute_replay_window_normal_case_unaffected() {
+        // No rotation raced us: base_offset is well behind cursor, ordinary
+        // tail-replay math applies unchanged.
+        let (replay_from, cursor) = compute_replay_window(10_000_000, 0, false);
+        assert_eq!(cursor, 10_000_000);
+        assert_eq!(replay_from, 10_000_000 - TAIL_REPLAY_BYTES);
+    }
+
+    #[test]
+    fn compute_replay_window_full_replay_starts_at_base_offset() {
+        let (replay_from, cursor) = compute_replay_window(10_000_000, 500, true);
+        assert_eq!(cursor, 10_000_000);
+        assert_eq!(replay_from, 500);
+    }
+
+    #[test]
+    fn compute_replay_window_clamps_stale_cursor_forward_no_underflow() {
+        // Regression (jovian review, fix B): a rotation raced the awaits
+        // between snapshotting `cursor` and acquiring the replay guard,
+        // advancing `base_offset` PAST the stale `cursor`. Naively computing
+        // `cursor.saturating_sub(TAIL).max(base_offset)` would then exceed
+        // `cursor`, underflowing `cursor - replay_from` downstream (panic in
+        // debug, wraparound/duplicate-or-garbage bytes in release).
+        let stale_cursor = 100;
+        let base_offset = 500; // rotated past the stale cursor while we awaited
+        let (replay_from, cursor) = compute_replay_window(stale_cursor, base_offset, false);
+        assert_eq!(cursor, base_offset, "cursor must be clamped forward, never left stale");
+        assert_eq!(replay_from, base_offset);
+        assert!(replay_from <= cursor, "must never underflow cursor - replay_from downstream");
+        assert!(replay_from >= base_offset, "must never underflow replay_from - base_offset (phys_from) downstream");
+    }
+
+    #[test]
+    fn compute_replay_window_clamps_stale_cursor_forward_even_under_full_replay() {
+        let stale_cursor = 100;
+        let base_offset = 500;
+        let (replay_from, cursor) = compute_replay_window(stale_cursor, base_offset, true);
+        assert_eq!(cursor, base_offset);
+        assert_eq!(replay_from, base_offset);
+    }
+
+    #[test]
+    fn compute_replay_window_never_produces_inverted_range() {
+        // Property check across a spread of values: replay_from must always
+        // fall within [base_offset, cursor] — never outside it in either
+        // direction, regardless of how `cursor` and `base_offset` relate.
+        for cursor in [0u64, 1, 500, 999, 1_000, 1_001, 5_000_000] {
+            for base_offset in [0u64, 1, 500, 1_000, 2_000_000] {
+                for full_replay in [false, true] {
+                    let (replay_from, clamped_cursor) =
+                        compute_replay_window(cursor, base_offset, full_replay);
+                    assert!(
+                        clamped_cursor >= base_offset,
+                        "cursor={cursor} base_offset={base_offset} full_replay={full_replay}"
+                    );
+                    assert!(
+                        replay_from <= clamped_cursor,
+                        "cursor={cursor} base_offset={base_offset} full_replay={full_replay}"
+                    );
+                    assert!(
+                        replay_from >= base_offset,
+                        "cursor={cursor} base_offset={base_offset} full_replay={full_replay}"
+                    );
+                }
+            }
+        }
+    }
+}

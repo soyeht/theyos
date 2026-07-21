@@ -123,6 +123,19 @@ pub fn reap_pid(pid: u32) {
     }
 }
 
+/// Send SIGHUP to a process. No-op if pid == 0 (would kill own process group).
+pub fn kill_pid_hup(pid: u32) {
+    if pid == 0 {
+        return;
+    }
+    // SAFETY: `kill(pid, SIGHUP)` is a POSIX syscall. Integer arguments only;
+    // no Rust-managed memory is accessed. pid == 0 is guarded above.
+    #[allow(clippy::cast_possible_wrap)] // NOTE: PIDs > i32::MAX are not valid on Linux
+    unsafe {
+        libc_kill(pid as i32, 1);
+    }
+}
+
 /// Send SIGTERM to a process. No-op if pid == 0 (would kill own process group).
 pub fn kill_pid(pid: u32) {
     if pid == 0 {
@@ -146,6 +159,19 @@ pub fn kill_pid_force(pid: u32) {
     #[allow(clippy::cast_possible_wrap)] // NOTE: PIDs > i32::MAX are not valid on Linux
     unsafe {
         libc_kill(pid as i32, 9);
+    }
+}
+
+/// Send SIGHUP to a process group (negative PID). No-op if pid == 0.
+pub fn kill_pgrp_hup(pid: u32) {
+    if pid == 0 {
+        return;
+    }
+    // SAFETY: `kill(-pid, SIGHUP)` targets the process group. Integer arguments
+    // only; no Rust-managed memory is accessed. pid == 0 is guarded above.
+    #[allow(clippy::cast_possible_wrap)] // NOTE: PIDs > i32::MAX are not valid on Linux
+    unsafe {
+        libc_kill(-(pid as i32), 1);
     }
 }
 
@@ -211,6 +237,25 @@ pub fn getgid() -> u32 {
     // SAFETY: getgid() is a POSIX syscall that takes no arguments and returns
     // a simple integer. No memory safety concerns.
     unsafe { getgid() }
+}
+
+/// Get the calling process's own process group id, via `getpgrp()`.
+///
+/// Used to guard against ever sending a process-group-wide signal
+/// (`kill(-pgid, ...)`) to the CALLER's own process group — e.g. a kill
+/// escalation must refuse to treat a tracked child's `pgid` as
+/// group-signalable if it ever turned out to equal the caller's own pgrp
+/// (which would turn "kill one child's process group" into "kill the
+/// caller and everything else sharing its group").
+#[must_use]
+pub fn own_pgrp() -> u32 {
+    unsafe extern "C" {
+        fn getpgrp() -> i32;
+    }
+    // SAFETY: getpgrp() is a POSIX syscall that takes no arguments and
+    // returns a simple integer. No memory safety concerns.
+    let pgrp = unsafe { getpgrp() };
+    u32::try_from(pgrp).unwrap_or(0)
 }
 
 /// Return a human-readable file/directory size string (e.g. `"42.0M"`, `"1.2G"`).
@@ -411,6 +456,245 @@ pub fn kill_processes_referencing_path(path_fragment: &str) -> usize {
     pids.len()
 }
 
+/// List every pid whose controlling terminal is `tty_path` (e.g.
+/// `/dev/ttys003` on macOS, `/dev/pts/3` on Linux).
+///
+/// Used to snapshot every process attached to a PTY session's slave device
+/// — not just a single tracked child — before a kill escalation, so
+/// grandchildren the caller never directly spawned (e.g. a shell's own
+/// subprocesses) are not left running after the session closes.
+///
+/// Best-effort: returns an empty `Vec` on any failure (bad path, permission,
+/// unsupported platform) rather than erroring. Callers should treat an empty
+/// result as "fall back to whatever pids you already know about", not as
+/// proof nothing is attached.
+#[must_use]
+pub fn list_tty_pids(tty_path: &str) -> Vec<u32> {
+    #[cfg(target_os = "macos")]
+    {
+        macos_list_tty_pids(tty_path)
+    }
+    #[cfg(target_os = "linux")]
+    {
+        linux_list_tty_pids(tty_path)
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        let _ = tty_path;
+        Vec::new()
+    }
+}
+
+/// macOS: `proc_listpids(PROC_TTY_ONLY, <tty rdev>, ...)` — the same
+/// libproc call `lsof`/`ps` use internally to resolve "which processes are
+/// on this tty".
+#[cfg(target_os = "macos")]
+fn macos_list_tty_pids(tty_path: &str) -> Vec<u32> {
+    use std::os::unix::fs::MetadataExt;
+
+    unsafe extern "C" {
+        fn proc_listpids(kind: u32, typeinfo: u32, buffer: *mut i32, buffersize: i32) -> i32;
+    }
+
+    // From <sys/proc_info.h>: PROC_TTY_ONLY selects processes by
+    // controlling-terminal device number (passed as `typeinfo`).
+    const PROC_TTY_ONLY: u32 = 3;
+    // Generous fixed buffer: a terminal session realistically never has
+    // more than a handful of attached processes: simpler than the
+    // call-twice-for-exact-size dance, at the cost of (harmlessly) missing
+    // entries in a pathological case far outside normal use.
+    const MAX_PIDS: usize = 4096;
+
+    let Ok(meta) = std::fs::metadata(tty_path) else {
+        return Vec::new();
+    };
+    let Ok(dev) = u32::try_from(meta.rdev()) else {
+        return Vec::new();
+    };
+
+    let mut buf = vec![0i32; MAX_PIDS];
+    let Ok(buffersize) = i32::try_from(std::mem::size_of_val(buf.as_slice())) else {
+        return Vec::new();
+    };
+    // SAFETY: `buf` has exactly `MAX_PIDS` valid `i32` slots and
+    // `buffersize` is exactly that many bytes, so the kernel can never
+    // write past the end of the allocation. `dev` is a plain device-number
+    // integer, not a pointer — no aliasing/lifetime concerns.
+    let written = unsafe { proc_listpids(PROC_TTY_ONLY, dev, buf.as_mut_ptr(), buffersize) };
+    if written <= 0 {
+        return Vec::new();
+    }
+    // The return value is a BYTE count, not a pid count.
+    let Ok(written) = usize::try_from(written) else {
+        return Vec::new();
+    };
+    let count = (written / std::mem::size_of::<i32>()).min(MAX_PIDS);
+    buf.truncate(count);
+    buf.into_iter()
+        .filter(|&p| p > 0)
+        .filter_map(|p| u32::try_from(p).ok())
+        .collect()
+}
+
+/// Linux: scan `/proc/*/stat` and compare each process's `tty_nr` field
+/// (documented to use the same major/minor packing as a device's `st_rdev`)
+/// against the target tty's device number.
+#[cfg(target_os = "linux")]
+fn linux_list_tty_pids(tty_path: &str) -> Vec<u32> {
+    use std::os::unix::fs::MetadataExt;
+
+    let Ok(meta) = std::fs::metadata(tty_path) else {
+        return Vec::new();
+    };
+    let target_dev = meta.rdev();
+
+    let Ok(proc_dir) = std::fs::read_dir("/proc") else {
+        return Vec::new();
+    };
+
+    let mut pids = Vec::new();
+    for entry in proc_dir.flatten() {
+        let name = entry.file_name();
+        let Ok(pid) = name.to_string_lossy().parse::<u32>() else {
+            continue;
+        };
+        let Ok(content) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
+            continue; // process may have exited between readdir and read
+        };
+        // Format: "<pid> (<comm>) <state> <ppid> <pgrp> <session> <tty_nr> ..."
+        // `comm` can contain spaces/parens, so find the LAST ')' first.
+        let Some(after_comm) = content.rfind(')').map(|i| i + 1) else {
+            continue;
+        };
+        // tty_nr is the 5th whitespace-separated field after the comm field
+        // (state=0, ppid=1, pgrp=2, session=3, tty_nr=4).
+        let Some(tty_nr_str) = content[after_comm..].split_whitespace().nth(4) else {
+            continue;
+        };
+        let Ok(tty_nr) = tty_nr_str.parse::<i64>() else {
+            continue;
+        };
+        let Ok(tty_nr) = u64::try_from(tty_nr) else {
+            continue; // negative/absent tty_nr — no controlling terminal
+        };
+        if tty_nr == target_dev {
+            pids.push(pid);
+        }
+    }
+    pids
+}
+
+/// Opaque identity token for a live process, derived from its start time.
+/// As long as two calls for the SAME pid number return equal `Some`
+/// values, it is guaranteed to be the SAME process — not a different one
+/// that happens to have been assigned that pid number after the original
+/// exited. Returns `None` if the pid doesn't exist or its start time
+/// can't be determined.
+///
+/// Deliberately independent of TTY/session state — unlike re-checking
+/// `list_tty_pids` membership. Once a session's controlling process
+/// exits, the OS's tty-attachment query (`proc_listpids`/`/proc`'s
+/// `tty_nr`) can stop reporting OTHER, still-alive members of that
+/// session as attached to the tty at all (they show up as `??` in `ps`),
+/// so re-verifying "is this pid still on our tty" partway through a kill
+/// escalation is unreliable exactly when it matters most — right after
+/// the first signal round has already started killing session members.
+/// A process's start time has nothing to do with tty/session state, so it
+/// doesn't share that failure mode: it stays queryable for as long as the
+/// process itself is alive, regardless of what happens to its session
+/// leader or controlling terminal.
+#[must_use]
+pub fn process_identity(pid: u32) -> Option<(u64, u64)> {
+    #[cfg(target_os = "macos")]
+    {
+        macos_process_start_time(pid)
+    }
+    #[cfg(target_os = "linux")]
+    {
+        linux_process_start_time(pid)
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        let _ = pid;
+        None
+    }
+}
+
+/// macOS: `proc_pidinfo(pid, PROC_PIDTBSDINFO, ...)` — reads
+/// `pbi_start_tvsec`/`pbi_start_tvusec` (process start time, wall clock)
+/// from `struct proc_bsdinfo`.
+#[cfg(target_os = "macos")]
+fn macos_process_start_time(pid: u32) -> Option<(u64, u64)> {
+    // Mirrors <sys/proc_info.h>'s `struct proc_bsdinfo` field-for-field (in
+    // order, same primitive types) so `#[repr(C)]` gives it an identical
+    // layout — we only ever READ `pbi_start_tvsec`/`pbi_start_tvusec` at
+    // the end, but every preceding field must still be present for the
+    // compiler to place them at the same offsets the kernel writes to.
+    #[repr(C)]
+    struct ProcBsdInfo {
+        pbi_flags: u32,
+        pbi_status: u32,
+        pbi_xstatus: u32,
+        pbi_pid: u32,
+        pbi_ppid: u32,
+        pbi_uid: u32,
+        pbi_gid: u32,
+        pbi_ruid: u32,
+        pbi_rgid: u32,
+        pbi_svuid: u32,
+        pbi_svgid: u32,
+        rfu_1: u32,
+        pbi_comm: [u8; 16],
+        pbi_name: [u8; 32],
+        pbi_nfiles: u32,
+        pbi_pgid: u32,
+        pbi_pjobc: u32,
+        e_tdev: u32,
+        e_tpgid: u32,
+        pbi_nice: i32,
+        pbi_start_tvsec: u64,
+        pbi_start_tvusec: u64,
+    }
+
+    unsafe extern "C" {
+        fn proc_pidinfo(pid: i32, flavor: i32, arg: u64, buffer: *mut ProcBsdInfo, buffersize: i32) -> i32;
+    }
+
+    const PROC_PIDTBSDINFO: i32 = 3;
+
+    let pid_i32 = i32::try_from(pid).ok()?;
+    let size = i32::try_from(std::mem::size_of::<ProcBsdInfo>()).ok()?;
+    let mut info = std::mem::MaybeUninit::<ProcBsdInfo>::uninit();
+    // SAFETY: `info` has exactly `size_of::<ProcBsdInfo>()` bytes available
+    // and `size` is exactly that many bytes, so the kernel can never write
+    // past the end of the allocation. We only treat the buffer as
+    // initialized (`assume_init`) when the kernel reports it wrote the
+    // FULL struct (`written == size`).
+    let written = unsafe { proc_pidinfo(pid_i32, PROC_PIDTBSDINFO, 0, info.as_mut_ptr(), size) };
+    if written != size {
+        return None;
+    }
+    // SAFETY: `written == size` confirms the kernel filled the entire
+    // struct before returning.
+    let info = unsafe { info.assume_init() };
+    Some((info.pbi_start_tvsec, info.pbi_start_tvusec))
+}
+
+/// Linux: `starttime` field (22nd field, in clock ticks since boot) from
+/// `/proc/<pid>/stat` — same parsing style as `linux_list_tty_pids`.
+#[cfg(target_os = "linux")]
+fn linux_process_start_time(pid: u32) -> Option<(u64, u64)> {
+    let content = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let after_comm = content.rfind(')')? + 1;
+    // Fields after "(comm) ": state=0 ppid=1 pgrp=2 session=3 tty_nr=4
+    // tpgid=5 flags=6 minflt=7 cminflt=8 majflt=9 cmajflt=10 utime=11
+    // stime=12 cutime=13 cstime=14 priority=15 nice=16 num_threads=17
+    // itrealvalue=18 starttime=19.
+    let starttime_str = content[after_comm..].split_whitespace().nth(19)?;
+    let starttime: u64 = starttime_str.parse().ok()?;
+    Some((starttime, 0))
+}
+
 // ── Internal FFI ──────────────────────────────────────────────────────────
 
 unsafe fn libc_kill(pid: i32, sig: i32) -> i32 {
@@ -446,8 +730,10 @@ mod tests {
     #[test]
     fn kill_pid_noop_for_zero() {
         // Should not panic or kill own process group
+        kill_pid_hup(0);
         kill_pid(0);
         kill_pid_force(0);
+        kill_pgrp_hup(0);
         kill_pgrp(0);
         kill_pgrp_force(0);
     }
@@ -462,6 +748,11 @@ mod tests {
     #[test]
     fn getgid_returns_value() {
         let _ = getgid();
+    }
+
+    #[test]
+    fn own_pgrp_returns_nonzero() {
+        assert!(own_pgrp() > 0, "a running process always has a process group");
     }
 
     #[test]
@@ -741,5 +1032,44 @@ mod tests {
             let ret = libc::kill(pid, 0);
             assert_eq!(ret, -1, "PID should be gone after reap");
         }
+    }
+
+    #[test]
+    fn list_tty_pids_empty_for_nonexistent_path() {
+        assert!(list_tty_pids("/dev/definitely-not-a-real-tty-path").is_empty());
+    }
+
+    #[test]
+    fn list_tty_pids_empty_for_non_tty_device() {
+        // /dev/null is a real character device but no process has it as a
+        // controlling terminal — proves the call completes and correctly
+        // finds zero matches for a device nothing is attached to as a tty.
+        assert!(list_tty_pids("/dev/null").is_empty());
+    }
+
+    #[test]
+    fn process_identity_is_stable_and_present_for_the_current_process() {
+        let pid = std::process::id();
+        let first = process_identity(pid);
+        assert!(first.is_some(), "a running process must have a determinable identity");
+        let second = process_identity(pid);
+        assert_eq!(first, second, "identity must be stable across repeated calls");
+    }
+
+    #[test]
+    fn process_identity_none_for_nonexistent_pid() {
+        assert_eq!(process_identity(4_294_967), None);
+    }
+
+    #[test]
+    fn process_identity_differs_across_distinct_processes() {
+        // Not a proof against pid reuse (that's the whole point — a reused
+        // pid number is indistinguishable from the original by definition
+        // unless you compare identity), but a sanity check that two
+        // DIFFERENT, concurrently-running processes get different
+        // identities rather than this always returning some constant.
+        let mine = process_identity(std::process::id());
+        let init = process_identity(1);
+        assert_ne!(mine, init, "distinct concurrently-running processes must not collide");
     }
 }
