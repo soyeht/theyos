@@ -189,6 +189,27 @@
       "raw_sha256_hex": "1657dc1374af7b44f231f45f7e9d9b8ae4a7346f80b4e206e40c05117e05c26b"
     }
   ],
+  "codec_shape_witnesses": [
+    {
+      "canonical_duplicate_key_order": [
+        "class",
+        "class"
+      ],
+      "class_agnostic_pre_dispatch": true,
+      "construction": "canonical Hello containing one unknown-class candidate map with the class key repeated twice in canonical encoded-key order",
+      "decoder_status": "decode-success-reencode-byte-identical-duplicate-key",
+      "duplicate_key": "class",
+      "expected_local_error": "err.wrong_shape",
+      "expected_server_frame_hex": "",
+      "expected_terminal": "uniform-silence-until-rendezvous-id-ttl",
+      "id": "duplicate_canonical_class_key",
+      "is_canonical_cbor": true,
+      "precedence_step": 8,
+      "raw_hex": "a5646b696e640166646f6d61696e781f736f796568742f6f776e65722d6d6573682f72656e64657a766f75732f76316776657273696f6e016a63616e6469646174657381a265636c617373186365636c61737318636d72656e64657a766f75735f696450101112131415161718191a1b1c1d1e1f",
+      "raw_length": 116,
+      "raw_sha256_hex": "240dc0c941fc05a576009a2d2e967f825a4e81f73130ae8bb780d7bf8e1b2844"
+    }
+  ],
   "contract": "soyeht-owner-mesh-rendezvous-corpus",
   "format": {
     "byte_strings": "All protocol byte fields are CBOR bstr. JSON writes bytes as lowercase even-length hexadecimal without a 0x prefix.",
@@ -233,15 +254,15 @@
     }
   },
   "frozen_design": {
-    "base_commit": "135c9ce60935ea5d068c2851329846fd39813346",
+    "base_commit": "f7991168c44d0998947c08591938eadeb318156e",
     "companion": {
       "path": "docs/owner-mesh-rendezvous/r0b-protocol-contract-v1.1-final.md",
       "raw_sha256": "9bd608fb4b2687df4d008236049920cf3aa0486c3b67216d4b57f30d089ef87b"
     },
     "wire": {
       "path": "docs/owner-mesh-rendezvous/wire-encoding-v1.md",
-      "raw_bytes": 20711,
-      "raw_sha256": "ad77e58796e8826a3de4723507860681932f7b4955926c56cce62c98ae87d36d"
+      "raw_bytes": 21581,
+      "raw_sha256": "2f59b641eb58f4bf21be4a28e47d78350ff33c0164c1af43940d584f1a88dc64"
     }
   },
   "positive_controls": [
