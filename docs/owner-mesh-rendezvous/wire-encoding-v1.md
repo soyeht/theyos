@@ -195,6 +195,19 @@ unknown kind → `err.version_unsupported` (step 6 < 7). `err.oversized_frame`
 (whole frame > 3072) fires before decode; `err.signed_offer_too_large` (one
 `signed_offer` > 1024 inside an otherwise ≤3072 frame) fires during shape parse.
 
+A **duplicate canonical map key** (two entries in one map whose canonical key
+bytes are equal — e.g. a repeated `class`) is a **validity** error (RFC 8949
+§5.3.1), not a well-formedness one: the item still decodes and, when the duplicate
+is already in canonical order, **re-encodes byte-identical**, so
+`err.noncanonical_cbor` (#4) does **not** catch it. RFC 8949 §5.6 delegates the
+reaction to the protocol; this protocol treats a duplicate canonical key as
+**`err.wrong_shape`** (#8) — a present field with cardinality 2 where ≤ 1 is
+required — **class-agnostic**, rejected at the border **before** any
+class-specific schema dispatch (so it also covers a candidate map of an unknown
+class). It sits at the shape step of the precedence chain (after `#4`) and is
+realized by the parser (the §1 canonical encoder only sorts keys — it does not
+deduplicate).
+
 ### 7.2 Behavioral-only `err.*` (server/client state — NOT byte-frozen)
 
 The frame is byte-valid; rejection depends on state, so the corpus does **not**
