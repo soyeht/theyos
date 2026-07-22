@@ -1,0 +1,469 @@
+{
+  "about": [
+    "Canonical synthetic owner-mesh rendezvous corpus. The exact UTF-8 JSON file is pinned externally by raw SHA-256 after independent acceptance.",
+    "This corpus is data-only, synthetic, and non-authoritative. It grants no production authority and installs no consumer, route, listener, provider, transport, dial, relay, or datapath effect.",
+    "v1 is immutable after acceptance. Any byte or formatting change requires a new version, raw SHA-256, and review."
+  ],
+  "authority_status": "synthetic-test-only-non-authoritative",
+  "behavioral_only": {
+    "declared_without_byte_vectors": [
+      {
+        "id": "err.candidate_class_denied",
+        "reason": "Policy depends on whether an otherwise well-shaped candidate class or endpoint is allowed."
+      },
+      {
+        "id": "err.rendezvous_id_consumed",
+        "reason": "Requires server state proving the identifier was already consumed."
+      },
+      {
+        "id": "err.unknown_rendezvous_id",
+        "reason": "Requires server state proving the identifier was never emitted."
+      },
+      {
+        "id": "err.close_unauthorized",
+        "reason": "Requires transport-session binding state for teardown authorization."
+      },
+      {
+        "id": "err.pairing_full",
+        "reason": "Requires two pairing slots already bound to other transport sessions."
+      },
+      {
+        "id": "err.budget_exhausted",
+        "reason": "Requires accumulated per-session attempt state."
+      },
+      {
+        "id": "err.authority_revoked",
+        "reason": "Requires a revoke or authority-generation fence during an active session."
+      }
+    ],
+    "excluded_cross_layer": {
+      "id": "err.a2_handshake_failed",
+      "no_rendezvous_byte_vector": true,
+      "reason": "This error is born in the end-to-end A2 layer and belongs to the frozen A2 corpus, not this rendezvous codec corpus."
+    },
+    "failure_wire_behavior": "uniform-silence-until-rendezvous-id-ttl",
+    "server_failure_frame_hex": ""
+  },
+  "codec_error_vectors": [
+    {
+      "construction": "3073 raw bytes, one byte over MAX_FRAME_BYTES, rejected before decode",
+      "decoder_status": "not-run-because-raw-size-check-wins",
+      "expected_local_error": "err.oversized_frame",
+      "expected_server_frame_hex": "",
+      "expected_terminal": "uniform-silence-until-rendezvous-id-ttl",
+      "id": "err.oversized_frame",
+      "is_canonical_cbor": false,
+      "precedence_step": 1,
+      "raw_hex": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+      "raw_length": 3073,
+      "raw_sha256_hex": "457f49a7803757934823d6d5307bc2e815336ab76ff1a0d46e5fe25f8c4e860c"
+    },
+    {
+      "construction": "reserved additional-information value in the first byte; not a CBOR item",
+      "decoder_status": "decode-error-invalid-initial-byte",
+      "expected_local_error": "err.malformed_cbor",
+      "expected_server_frame_hex": "",
+      "expected_terminal": "uniform-silence-until-rendezvous-id-ttl",
+      "id": "err.malformed_cbor",
+      "is_canonical_cbor": false,
+      "precedence_step": 2,
+      "raw_hex": "1c",
+      "raw_length": 1,
+      "raw_sha256_hex": "bd4fc42a21f1f860a1030e6eba23d53ecab71bd19297ab6c074381d4ecee0018"
+    },
+    {
+      "construction": "valid Hello prefix truncated by one byte inside the final rendezvous_id bstr",
+      "decoder_status": "decode-error-unexpected-eof",
+      "expected_local_error": "err.truncated_frame",
+      "expected_server_frame_hex": "",
+      "expected_terminal": "uniform-silence-until-rendezvous-id-ttl",
+      "id": "err.truncated_frame",
+      "is_canonical_cbor": false,
+      "precedence_step": 3,
+      "raw_hex": "a5646b696e640166646f6d61696e781f736f796568742f6f776e65722d6d6573682f72656e64657a766f75732f76316776657273696f6e016a63616e6469646174657382a362697044c000020a64706f7274191f9b65636c61737300a365636c617373026c7369676e65645f6f666665725840a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a56e72656c61795f656e64706f696e74a262697044c000021464706f72741901bb6d72656e64657a766f75735f696450101112131415161718191a1b1c1d1e",
+      "raw_length": 241,
+      "raw_sha256_hex": "47c6dc61eb2c2acc453f1eddbebd0c5b2b00d444c748f17e001613d6cf15d7ed"
+    },
+    {
+      "construction": "valid Hello semantics encoded with alphabetically hand-sorted top-level keys instead of encoder-derived length-first order",
+      "decoder_status": "decode-success-reencode-differs",
+      "expected_local_error": "err.noncanonical_cbor",
+      "expected_server_frame_hex": "",
+      "expected_terminal": "uniform-silence-until-rendezvous-id-ttl",
+      "id": "err.noncanonical_cbor",
+      "is_canonical_cbor": false,
+      "precedence_step": 4,
+      "raw_hex": "a56a63616e6469646174657382a362697044c000020a64706f7274191f9b65636c61737300a365636c617373026c7369676e65645f6f666665725840a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a56e72656c61795f656e64706f696e74a262697044c000021464706f72741901bb66646f6d61696e781f736f796568742f6f776e65722d6d6573682f72656e64657a766f75732f7631646b696e64016d72656e64657a766f75735f696450101112131415161718191a1b1c1d1e1f6776657273696f6e01",
+      "raw_length": 242,
+      "raw_sha256_hex": "93e27ce5141acac31d450bf3b6f55f7386c824fd439be411a0d123f556e61964"
+    },
+    {
+      "construction": "canonical Hello with domain soyeht/owner-mesh/rendezvous/v0",
+      "decoder_status": "decode-success-reencode-byte-identical",
+      "expected_local_error": "err.wrong_domain",
+      "expected_server_frame_hex": "",
+      "expected_terminal": "uniform-silence-until-rendezvous-id-ttl",
+      "id": "err.wrong_domain",
+      "is_canonical_cbor": true,
+      "precedence_step": 5,
+      "raw_hex": "a5646b696e640166646f6d61696e781f736f796568742f6f776e65722d6d6573682f72656e64657a766f75732f76306776657273696f6e016a63616e6469646174657381a362697044c000020a64706f7274191f9b65636c617373006d72656e64657a766f75735f696450101112131415161718191a1b1c1d1e1f",
+      "raw_length": 123,
+      "raw_sha256_hex": "8fc75570f43349e1b95cd1c339021a3b5cae768b9a83d9e777243fa9c126cf9c"
+    },
+    {
+      "construction": "canonical Hello with exact-version field set to 2",
+      "decoder_status": "decode-success-reencode-byte-identical",
+      "expected_local_error": "err.version_unsupported",
+      "expected_server_frame_hex": "",
+      "expected_terminal": "uniform-silence-until-rendezvous-id-ttl",
+      "id": "err.version_unsupported",
+      "is_canonical_cbor": true,
+      "precedence_step": 6,
+      "raw_hex": "a5646b696e640166646f6d61696e781f736f796568742f6f776e65722d6d6573682f72656e64657a766f75732f76316776657273696f6e026a63616e6469646174657381a362697044c000020a64706f7274191f9b65636c617373006d72656e64657a766f75735f696450101112131415161718191a1b1c1d1e1f",
+      "raw_length": 123,
+      "raw_sha256_hex": "479c8341040559f877d204c00d9e78243b3149434a1a953625bcc5dc4ac67418"
+    },
+    {
+      "construction": "canonical envelope with unknown kind 99",
+      "decoder_status": "decode-success-reencode-byte-identical",
+      "expected_local_error": "err.unknown_frame",
+      "expected_server_frame_hex": "",
+      "expected_terminal": "uniform-silence-until-rendezvous-id-ttl",
+      "id": "err.unknown_frame",
+      "is_canonical_cbor": true,
+      "precedence_step": 7,
+      "raw_hex": "a5646b696e64186366646f6d61696e781f736f796568742f6f776e65722d6d6573682f72656e64657a766f75732f76316776657273696f6e016a63616e6469646174657381a362697044c000020a64706f7274191f9b65636c617373006d72656e64657a766f75735f696450101112131415161718191a1b1c1d1e1f",
+      "raw_length": 124,
+      "raw_sha256_hex": "effbf7c0dc12279fda07b006dbd2ea8dea3e72c89891865faafd0e3086823c02"
+    },
+    {
+      "construction": "canonical Hello with rendezvous_id encoded as tstr instead of fixed 16-byte bstr",
+      "decoder_status": "decode-success-reencode-byte-identical",
+      "expected_local_error": "err.wrong_shape",
+      "expected_server_frame_hex": "",
+      "expected_terminal": "uniform-silence-until-rendezvous-id-ttl",
+      "id": "err.wrong_shape",
+      "is_canonical_cbor": true,
+      "precedence_step": 8,
+      "raw_hex": "a5646b696e640166646f6d61696e781f736f796568742f6f776e65722d6d6573682f72656e64657a766f75732f76316776657273696f6e016a63616e6469646174657381a362697044c000020a64706f7274191f9b65636c617373006d72656e64657a766f75735f69647073796e7468657469632d7269642d3031",
+      "raw_length": 123,
+      "raw_sha256_hex": "b8561098a7e4b89f5b8f8a7b13afebed386d35bb44e7f0a6dd74aae9b9935115"
+    },
+    {
+      "construction": "canonical otherwise-valid Hello with one extra map key named extra",
+      "decoder_status": "decode-success-reencode-byte-identical",
+      "expected_local_error": "err.unknown_field",
+      "expected_server_frame_hex": "",
+      "expected_terminal": "uniform-silence-until-rendezvous-id-ttl",
+      "id": "err.unknown_field",
+      "is_canonical_cbor": true,
+      "precedence_step": 9,
+      "raw_hex": "a6646b696e64016565787472610066646f6d61696e781f736f796568742f6f776e65722d6d6573682f72656e64657a766f75732f76316776657273696f6e016a63616e6469646174657381a362697044c000020a64706f7274191f9b65636c617373006d72656e64657a766f75735f696450101112131415161718191a1b1c1d1e1f",
+      "raw_length": 130,
+      "raw_sha256_hex": "71e3926848f37e7540ac567eb58b441fd581abe4d8669fb490780efdbfb20434"
+    },
+    {
+      "construction": "canonical Hello with 9 cheap candidates while raw bytes remain within MAX_FRAME_BYTES",
+      "decoder_status": "decode-success-reencode-byte-identical",
+      "expected_local_error": "err.frame_too_large",
+      "expected_server_frame_hex": "",
+      "expected_terminal": "uniform-silence-until-rendezvous-id-ttl",
+      "id": "err.frame_too_large",
+      "is_canonical_cbor": true,
+      "precedence_step": 10,
+      "raw_hex": "a5646b696e640166646f6d61696e781f736f796568742f6f776e65722d6d6573682f72656e64657a766f75732f76316776657273696f6e016a63616e6469646174657389a362697044c000020164706f7274191f4165636c61737300a362697044c000020264706f7274191f4265636c61737300a362697044c000020364706f7274191f4365636c61737300a362697044c000020464706f7274191f4465636c61737300a362697044c000020564706f7274191f4565636c61737300a362697044c000020664706f7274191f4665636c61737300a362697044c000020764706f7274191f4765636c61737300a362697044c000020864706f7274191f4865636c61737300a362697044c000020964706f7274191f4965636c617373006d72656e64657a766f75735f696450101112131415161718191a1b1c1d1e1f",
+      "raw_length": 315,
+      "raw_sha256_hex": "627cd1305fc8e74aacc8f2aa3087bf57b8b5b5d29a9ed3b6863e861db6241183"
+    },
+    {
+      "construction": "canonical Hello within MAX_FRAME_BYTES containing one relay signed_offer bstr of 1025 bytes",
+      "decoder_status": "decode-success-reencode-byte-identical",
+      "expected_local_error": "err.signed_offer_too_large",
+      "expected_server_frame_hex": "",
+      "expected_terminal": "uniform-silence-until-rendezvous-id-ttl",
+      "id": "err.signed_offer_too_large",
+      "is_canonical_cbor": true,
+      "precedence_step": 11,
+      "raw_hex": "a5646b696e640166646f6d61696e781f736f796568742f6f776e65722d6d6573682f72656e64657a766f75732f76316776657273696f6e016a63616e6469646174657381a365636c617373026c7369676e65645f6f66666572590401a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a56e72656c61795f656e64706f696e74a262697044c000021464706f72741901bb6d72656e64657a766f75735f696450101112131415161718191a1b1c1d1e1f",
+      "raw_length": 1180,
+      "raw_sha256_hex": "1657dc1374af7b44f231f45f7e9d9b8ae4a7346f80b4e206e40c05117e05c26b"
+    }
+  ],
+  "contract": "soyeht-owner-mesh-rendezvous-corpus",
+  "format": {
+    "byte_strings": "All protocol byte fields are CBOR bstr. JSON writes bytes as lowercase even-length hexadecimal without a 0x prefix.",
+    "canonical_cbor": "RFC 8949 section 4.2.1 deterministic encoding via household_rs::cbor::to_canonical_vec. Map keys are ordered by the bytewise lexicographic order of their canonical CBOR encodings; for these distinct-length tstr keys this is length-first.",
+    "file_encoding": "UTF-8 JSON with two-space indentation and one trailing newline. Consumers compare complete raw file bytes and pin SHA-256 externally; they do not reserialize JSON.",
+    "map_key_orders": {
+      "candidate_lan_or_reflexive": [
+        "ip",
+        "port",
+        "class"
+      ],
+      "candidate_relay": [
+        "class",
+        "signed_offer",
+        "relay_endpoint"
+      ],
+      "close_or_ok": [
+        "kind",
+        "domain",
+        "version",
+        "rendezvous_id"
+      ],
+      "hello": [
+        "kind",
+        "domain",
+        "version",
+        "candidates",
+        "rendezvous_id"
+      ],
+      "peer": [
+        "kind",
+        "domain",
+        "version",
+        "rendezvous_id",
+        "peer_candidates",
+        "observed_reflexive"
+      ],
+      "relay_endpoint": [
+        "ip",
+        "port"
+      ]
+    }
+  },
+  "frozen_design": {
+    "base_commit": "135c9ce60935ea5d068c2851329846fd39813346",
+    "companion": {
+      "path": "docs/owner-mesh-rendezvous/r0b-protocol-contract-v1.1-final.md",
+      "raw_sha256": "9bd608fb4b2687df4d008236049920cf3aa0486c3b67216d4b57f30d089ef87b"
+    },
+    "wire": {
+      "path": "docs/owner-mesh-rendezvous/wire-encoding-v1.md",
+      "raw_bytes": 20711,
+      "raw_sha256": "ad77e58796e8826a3de4723507860681932f7b4955926c56cce62c98ae87d36d"
+    }
+  },
+  "positive_controls": [
+    {
+      "canonical_cbor_hex": "a5646b696e640166646f6d61696e781f736f796568742f6f776e65722d6d6573682f72656e64657a766f75732f76316776657273696f6e016a63616e6469646174657382a362697044c000020a64706f7274191f9b65636c61737300a365636c617373026c7369676e65645f6f666665725840a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a56e72656c61795f656e64706f696e74a262697044c000021464706f72741901bb6d72656e64657a766f75735f696450101112131415161718191a1b1c1d1e1f",
+      "canonical_round_trip": "decode-reencode-byte-identical",
+      "direction": "device-or-claw-to-server",
+      "id": "rz_hello_valid",
+      "raw_length": 242,
+      "raw_sha256_hex": "3e2b292d5efcd453d78e6fe93832f21298708ce9f192a6b1025e27fc2230c041",
+      "semantic_control": {
+        "candidate_classes": [
+          0,
+          2
+        ],
+        "kind": 1,
+        "rendezvous_id_bytes": 16
+      }
+    },
+    {
+      "canonical_cbor_hex": "a6646b696e640266646f6d61696e781f736f796568742f6f776e65722d6d6573682f72656e64657a766f75732f76316776657273696f6e016d72656e64657a766f75735f696450101112131415161718191a1b1c1d1e1f6f706565725f63616e6469646174657383a362697044c000020b64706f7274191f9b65636c61737300a36269705020010db800000000000000000000001064706f727419c00065636c61737301a365636c617373026c7369676e65645f6f666665725840b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b66e72656c61795f656e64706f696e74a262697044c000021564706f72741901bb726f627365727665645f7265666c6578697665a36269705020010db800000000000000000000001064706f727419c00065636c61737301",
+      "canonical_round_trip": "decode-reencode-byte-identical",
+      "direction": "server-to-device-or-claw",
+      "id": "rz_peer_valid",
+      "raw_length": 338,
+      "raw_sha256_hex": "758004554487c090b04345cdd6b9115f63d16bdfb982335ed94fbf7ea7cd21ab",
+      "semantic_control": {
+        "candidate_classes": [
+          0,
+          1,
+          2
+        ],
+        "kind": 2,
+        "observed_reflexive_class": 1,
+        "rendezvous_id_bytes": 16
+      }
+    },
+    {
+      "canonical_cbor_hex": "a4646b696e640366646f6d61696e781f736f796568742f6f776e65722d6d6573682f72656e64657a766f75732f76316776657273696f6e016d72656e64657a766f75735f696450101112131415161718191a1b1c1d1e1f",
+      "canonical_round_trip": "decode-reencode-byte-identical",
+      "direction": "server-to-device-or-claw",
+      "id": "rz_ok_valid",
+      "raw_length": 87,
+      "raw_sha256_hex": "426ed2b087c568b66ceceb94d7a6715dcc8dab03074df61c82467f28c16d23b8",
+      "semantic_control": {
+        "kind": 3,
+        "only_terminal_server_output": true,
+        "rendezvous_id_bytes": 16
+      }
+    },
+    {
+      "canonical_cbor_hex": "a4646b696e640466646f6d61696e781f736f796568742f6f776e65722d6d6573682f72656e64657a766f75732f76316776657273696f6e016d72656e64657a766f75735f696450101112131415161718191a1b1c1d1e1f",
+      "canonical_round_trip": "decode-reencode-byte-identical",
+      "direction": "bound-participant-to-server",
+      "id": "rz_close_valid",
+      "raw_length": 87,
+      "raw_sha256_hex": "cae23ae10a3837fa527c7947c1b154257b9b09e1d30f9b37fbe01f751e648e30",
+      "semantic_control": {
+        "kind": 4,
+        "never_a_failure_frame": true,
+        "rendezvous_id_bytes": 16,
+        "success_teardown_only": true
+      }
+    },
+    {
+      "canonical_cbor_hex": "a6646b696e640266646f6d61696e781f736f796568742f6f776e65722d6d6573682f72656e64657a766f75732f76316776657273696f6e016d72656e64657a766f75735f696450101112131415161718191a1b1c1d1e1f6f706565725f63616e6469646174657388a362697044c000020164706f7274191f4165636c61737300a362697044c000020264706f7274191f4265636c61737300a362697044c000020364706f7274191f4365636c61737300a362697044c000020464706f7274191f4465636c61737300a362697044c000020564706f7274191f4565636c61737300a362697044c000020664706f7274191f4665636c61737300a365636c617373026c7369676e65645f6f66666572590400a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a56e72656c61795f656e64706f696e74a262697044c000021464706f72741901bba365636c617373026c7369676e65645f6f66666572590400b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b66e72656c61795f656e64706f696e74a262697044c000021564706f72741901bb726f627365727665645f7265666c6578697665a36269705020010db800000000000000000000001064706f727419c00065636c61737301",
+      "canonical_round_trip": "decode-reencode-byte-identical",
+      "direction": "server-to-device-or-claw",
+      "id": "rz_peer_budget_boundary_valid",
+      "raw_length": 2463,
+      "raw_sha256_hex": "1a2bbe162a63500bcbe40950006da7fa128eda76447c81401dc6ac2405f5cdbc",
+      "semantic_control": {
+        "candidate_count": 8,
+        "max_candidates_per_frame": 8,
+        "max_frame_bytes": 3072,
+        "relay_candidate_count": 2,
+        "relay_candidate_limit": 2,
+        "signed_offer_lengths": [
+          1024,
+          1024
+        ],
+        "signed_offer_limit": 1024
+      }
+    }
+  ],
+  "precedence": {
+    "multi_violation_vectors": [
+      {
+        "expected_first_error": "err.oversized_frame",
+        "id": "oversized_and_malformed",
+        "raw_hex": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+        "raw_length": 3073,
+        "raw_sha256_hex": "457f49a7803757934823d6d5307bc2e815336ab76ff1a0d46e5fe25f8c4e860c",
+        "raw_vector_ref": "codec_error_vectors[err.oversized_frame]",
+        "violations_in_precedence_order": [
+          "err.oversized_frame",
+          "err.malformed_cbor"
+        ]
+      },
+      {
+        "expected_first_error": "err.noncanonical_cbor",
+        "id": "noncanonical_and_wrong_domain",
+        "raw_hex": "a56a63616e6469646174657382a362697044c000020a64706f7274191f9b65636c61737300a365636c617373026c7369676e65645f6f666665725840a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a56e72656c61795f656e64706f696e74a262697044c000021464706f72741901bb66646f6d61696e781f736f796568742f6f776e65722d6d6573682f72656e64657a766f75732f7630646b696e64016d72656e64657a766f75735f696450101112131415161718191a1b1c1d1e1f6776657273696f6e01",
+        "raw_length": 242,
+        "raw_sha256_hex": "e1c337860f31e8cc0f6c66a745d67156d72df7029a852cb7302bff8b264e1bd3",
+        "violations_in_precedence_order": [
+          "err.noncanonical_cbor",
+          "err.wrong_domain"
+        ]
+      },
+      {
+        "expected_first_error": "err.wrong_domain",
+        "id": "wrong_domain_and_version",
+        "raw_hex": "a5646b696e640166646f6d61696e781f736f796568742f6f776e65722d6d6573682f72656e64657a766f75732f76306776657273696f6e026a63616e6469646174657381a362697044c000020a64706f7274191f9b65636c617373006d72656e64657a766f75735f696450101112131415161718191a1b1c1d1e1f",
+        "raw_length": 123,
+        "raw_sha256_hex": "2538bc95af63bedcb6cace5da7dc2f6e66ed1b895e8593f3be5648dba3aadb27",
+        "violations_in_precedence_order": [
+          "err.wrong_domain",
+          "err.version_unsupported"
+        ]
+      },
+      {
+        "expected_first_error": "err.version_unsupported",
+        "id": "wrong_version_and_unknown_kind",
+        "raw_hex": "a5646b696e64186366646f6d61696e781f736f796568742f6f776e65722d6d6573682f72656e64657a766f75732f76316776657273696f6e026a63616e6469646174657381a362697044c000020a64706f7274191f9b65636c617373006d72656e64657a766f75735f696450101112131415161718191a1b1c1d1e1f",
+        "raw_length": 124,
+        "raw_sha256_hex": "0f5715fa9d2725a3dbc99ad4b6fe8f3eaab6195d2184d6b1825377b3ada32a65",
+        "violations_in_precedence_order": [
+          "err.version_unsupported",
+          "err.unknown_frame"
+        ]
+      },
+      {
+        "expected_first_error": "err.unknown_frame",
+        "id": "unknown_kind_and_wrong_shape",
+        "raw_hex": "a5646b696e64186366646f6d61696e781f736f796568742f6f776e65722d6d6573682f72656e64657a766f75732f76316776657273696f6e016a63616e6469646174657381a362697044c000020a64706f7274191f9b65636c617373006d72656e64657a766f75735f69647073796e7468657469632d7269642d3031",
+        "raw_length": 124,
+        "raw_sha256_hex": "c01bff28a18933f1f043f276a285769712c72f2770fa3c45f1f650e45b7f526a",
+        "violations_in_precedence_order": [
+          "err.unknown_frame",
+          "err.wrong_shape"
+        ]
+      },
+      {
+        "expected_first_error": "err.wrong_shape",
+        "id": "wrong_shape_and_unknown_field",
+        "raw_hex": "a6646b696e64016565787472610066646f6d61696e781f736f796568742f6f776e65722d6d6573682f72656e64657a766f75732f76316776657273696f6e016a63616e6469646174657381a362697044c000020a64706f7274191f9b65636c617373006d72656e64657a766f75735f69647073796e7468657469632d7269642d3031",
+        "raw_length": 130,
+        "raw_sha256_hex": "6fb311d7f9e1179d63fbc7723adbcd6d236b4523c3d03bde2d79ee416c033a89",
+        "violations_in_precedence_order": [
+          "err.wrong_shape",
+          "err.unknown_field"
+        ]
+      },
+      {
+        "expected_first_error": "err.unknown_field",
+        "id": "unknown_field_and_candidate_count",
+        "raw_hex": "a6646b696e64016565787472610066646f6d61696e781f736f796568742f6f776e65722d6d6573682f72656e64657a766f75732f76316776657273696f6e016a63616e6469646174657389a362697044c000020164706f7274191f4165636c61737300a362697044c000020264706f7274191f4265636c61737300a362697044c000020364706f7274191f4365636c61737300a362697044c000020464706f7274191f4465636c61737300a362697044c000020564706f7274191f4565636c61737300a362697044c000020664706f7274191f4665636c61737300a362697044c000020764706f7274191f4765636c61737300a362697044c000020864706f7274191f4865636c61737300a362697044c000020964706f7274191f4965636c617373006d72656e64657a766f75735f696450101112131415161718191a1b1c1d1e1f",
+        "raw_length": 322,
+        "raw_sha256_hex": "2260dd3c50b1d53994e6487996143bb2d03fa6503f9cf43ef5a38aff4fa95151",
+        "violations_in_precedence_order": [
+          "err.unknown_field",
+          "err.frame_too_large"
+        ]
+      }
+    ],
+    "ordered_checks": [
+      "raw_size",
+      "cbor_decode_malformed",
+      "cbor_decode_truncated",
+      "canonical_reencode",
+      "domain",
+      "version",
+      "kind",
+      "shape",
+      "unknown_field",
+      "candidate_count_or_signed_offer_size"
+    ]
+  },
+  "protocol": {
+    "candidate_classes": {
+      "lan_rfc1918": 0,
+      "reflexive_own_session": 1,
+      "relay_signed_offer": 2
+    },
+    "domain": "soyeht/owner-mesh/rendezvous/v1",
+    "frame_kinds": {
+      "close": 4,
+      "hello": 1,
+      "ok": 3,
+      "peer": 2
+    },
+    "limits": {
+      "max_candidates_per_frame": 8,
+      "max_frame_bytes": 3072,
+      "max_relay_candidates_per_frame": 2,
+      "max_signed_offer_bytes": 1024,
+      "rendezvous_id_bytes": 16,
+      "rendezvous_id_ttl_seconds": 20
+    },
+    "version": 1
+  },
+  "scope": "synthetic-test-only-cross-language-rendezvous-wire-witness",
+  "taxonomy_counts": {
+    "behavioral_declared_without_bytes": 7,
+    "codec_byte_vectors": 11,
+    "cross_layer_excluded": 1,
+    "section_7_2_total": 8
+  },
+  "terminal_contract": {
+    "failure": {
+      "all_codec_and_behavioral_failures": "uniform-silence-until-rendezvous-id-ttl",
+      "rendezvous_id_ttl_seconds": 20,
+      "server_emitted_frame_count": 0,
+      "server_failure_frame_hex": ""
+    },
+    "success": {
+      "close_input_vector_ref": "positive_controls[rz_close_valid]",
+      "close_is_bound_participant_teardown_only": true,
+      "ok_is_only_terminal_server_output": true,
+      "ok_output_vector_ref": "positive_controls[rz_ok_valid]"
+    }
+  },
+  "version": 1
+}
