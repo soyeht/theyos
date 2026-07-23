@@ -28,12 +28,15 @@
 //! to the `ConversationLog` (which also bumps the atomic size counter), and
 //! broadcasts `(end_offset, Arc<[u8]>)` to subscribers.
 //!
-//! Closing a session (`PtySession::close`) kills every process attached to
-//! its TTY — not just the tracked direct child — via an escalation ported
-//! from `soyeht-ios` PR #317's `NativePTY` technique: `SIGHUP` immediately,
-//! `SIGTERM` after 2s if anything survived, `SIGKILL` after another 2s if
-//! still surviving. This runs on a detached background thread, so `close`
-//! itself returns immediately.
+//! Closing a session (`PtySession::close`) kills every terminal-facing
+//! process attached to its TTY — not just the tracked direct child — via an
+//! escalation ported from `soyeht-ios` PR #317's `NativePTY` technique:
+//! `SIGHUP` immediately, `SIGTERM` after 2s if anything survived, `SIGKILL`
+//! after another 2s if still surviving. Pipe/socket-backed helpers are
+//! excluded: MCP servers inherit the controlling TTY but communicate with
+//! their client over private stdio, and die naturally when that client
+//! closes those streams. This runs on a detached background thread, so
+//! `close` itself returns immediately.
 //!
 //! `PtyManager` owns a flat `HashMap<String, Arc<PtySession>>` keyed by
 //! `{container}::{conversation_id}`. PTYs are created lazily on the first WS
@@ -502,11 +505,12 @@ impl PtySession {
         &self.cwd
     }
 
-    /// Kill every process attached to this session's TTY — not just the
-    /// tracked direct child — escalating SIGHUP (now) → SIGTERM (after 2s,
-    /// if anything survived) → SIGKILL (after another 2s, if still
-    /// surviving). Ported from `soyeht-ios` PR #317's `NativePTY` technique
-    /// (a child that ignores HUP/TERM on purpose still dies within ~4s).
+    /// Kill every terminal-facing process attached to this session's TTY —
+    /// not just the tracked direct child — escalating SIGHUP (now) → SIGTERM
+    /// (after 2s, if anything survived) → SIGKILL (after another 2s, if still
+    /// surviving). Pipe/socket-backed helpers are left to their parent/EOF
+    /// lifecycle so an MCP transport cannot be severed independently of its
+    /// live agent client.
     /// Idempotent; returns immediately — the escalation and final reap run
     /// on a detached background thread, so neither an async caller
     /// (`spawn_blocking`) nor the plain OS PTY-read thread ever blocks on
@@ -522,15 +526,26 @@ impl PtySession {
         // captured alongside it, so LATER escalation stages can verify a
         // pid is still the SAME process before re-signaling it — see
         // `TrackedPid` and `signal_survivors`.
-        let tty_pids: Vec<TrackedPid> = core_rs::os::list_tty_pids(&self.slave_tty_path)
+        let mut tty_pids: Vec<TrackedPid> = core_rs::os::list_tty_pids(&self.slave_tty_path)
             .into_iter()
+            // Exclude only a positive non-terminal classification. Inspection
+            // failures preserve the historical fail-closed cleanup behavior.
+            .filter(|pid| {
+                core_rs::os::process_has_terminal_stdio(*pid, &self.slave_tty_path) != Some(false)
+            })
             .filter_map(|p| i32::try_from(p).ok())
             .map(TrackedPid::snapshot)
             .collect();
+        // Always include the session leader. `proc_listpids` can race with
+        // teardown or fail transiently, but close must still terminate and
+        // reap the direct child.
+        if !tty_pids.iter().any(|tracked| tracked.pid == self.pgid) {
+            tty_pids.push(TrackedPid::snapshot(self.pgid));
+        }
         // Immediate — no time has passed for a snapshotted pid to have
         // died and been recycled yet, so no re-verification is needed
         // (unlike the later stages — see spawn_kill_escalation).
-        signal_survivors(self.pgid, &tty_pids, KillStage::Hup, false);
+        signal_survivors(&tty_pids, KillStage::Hup, false);
 
         let child = self
             .child
@@ -538,7 +553,7 @@ impl PtySession {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .take();
         if let Some(child) = child {
-            spawn_kill_escalation(self.pgid, tty_pids, child);
+            spawn_kill_escalation(tty_pids, child);
         }
     }
 }
@@ -567,10 +582,14 @@ impl TrackedPid {
     }
 }
 
-/// Sends `stage`'s signal to the process group `-pgid` and to every pid in
-/// `tty_pids` still alive (skipping a `tty_pids` entry equal to `pgid` —
-/// already covered by the group signal). Returns whether anything was found
-/// alive, so callers can skip later escalation stages once nothing survived.
+/// Sends `stage`'s signal to every pid in `tty_pids` still alive. Returns
+/// whether anything was found alive, so callers can skip later escalation
+/// stages once nothing survived.
+///
+/// This deliberately signals individual terminal-facing jobs instead of the
+/// session's process group. An MCP helper can share its owning agent's process
+/// group while replacing stdin/stdout with private pipes; a group-wide signal
+/// would bypass the classifier that excluded it from `tty_pids`.
 ///
 /// `reverify`: for the LATER escalation stages (SIGTERM, SIGKILL — seconds
 /// after the initial snapshot), a snapshotted individual pid can have
@@ -582,41 +601,17 @@ impl TrackedPid {
 ///
 /// This deliberately does NOT re-check TTY membership (e.g. re-running
 /// `list_tty_pids`) to verify a pid — once a session's controlling process
-/// has been signaled (which the group step above may just have done),
-/// still-alive OTHER members of that session can stop being reported as
-/// attached to the tty at all (the same reason they show up as `??` in
-/// `ps` afterward), making a TTY-membership re-check unreliable exactly
-/// when it matters. Process identity has nothing to do with tty/session
-/// state, so it doesn't share that failure mode.
-///
-/// The group signal itself is unaffected by any of this and needs no
-/// re-verification — a process group id stays allocated (and thus
-/// un-recyclable) as long as it has any member, including a zombie
-/// awaiting reap, so `-pgid` can never silently retarget a reused id the
-/// way a bare positive pid can. Pass `false` for the immediate initial
-/// signal (no time has passed since the snapshot for reuse to occur).
-fn signal_survivors(pgid: i32, tty_pids: &[TrackedPid], stage: KillStage, reverify: bool) -> bool {
+/// has been signaled, still-alive OTHER members of that session can stop being
+/// reported as attached to the tty at all (the same reason they show up as
+/// `??` in `ps` afterward), making a TTY-membership re-check unreliable exactly
+/// when it matters. Process identity has nothing to do with tty/session state,
+/// so it doesn't share that failure mode. Pass `false` for the immediate
+/// initial signal (no time has passed since the snapshot for reuse to occur).
+fn signal_survivors(tty_pids: &[TrackedPid], stage: KillStage, reverify: bool) -> bool {
     let mut any_alive = false;
-    let safe_to_group_signal = is_safe_to_group_signal(pgid, core_rs::os::own_pgrp());
-
-    if safe_to_group_signal {
-        if let Ok(pgid_u32) = u32::try_from(pgid) {
-            if core_rs::os::is_pid_running(pgid_u32) {
-                any_alive = true;
-                match stage {
-                    KillStage::Hup => core_rs::os::kill_pgrp_hup(pgid_u32),
-                    KillStage::Term => core_rs::os::kill_pgrp(pgid_u32),
-                    KillStage::Kill => core_rs::os::kill_pgrp_force(pgid_u32),
-                }
-            }
-        }
-    }
 
     for tracked in tty_pids {
         let member = tracked.pid;
-        if safe_to_group_signal && member == pgid {
-            continue; // already signaled via the process group above
-        }
         let Ok(member_u32) = u32::try_from(member) else {
             continue;
         };
@@ -636,26 +631,6 @@ fn signal_survivors(pgid: i32, tty_pids: &[TrackedPid], stage: KillStage, reveri
     any_alive
 }
 
-/// Whether it is safe to send a process-group-wide signal (`kill(-pgid,
-/// ...)`) for `pgid`. Structurally forbids ever targeting `own_pgrp` (the
-/// CALLER's own process group) or an invalid/init pgid (`<= 1`).
-///
-/// This should be unreachable in practice — `pty-process`'s
-/// `session_leader` setup calls `setsid()` before we ever read `pgid`, so
-/// it is always the child's own new process group, never the engine
-/// daemon's. But if some future refactor of the spawn path ever broke that
-/// invariant and `pgid` ended up equal to the engine's own pgrp, an
-/// unconditional `kill(-pgid, ...)` here would send SIGHUP/SIGTERM/SIGKILL
-/// to the entire production engine and every other session's processes —
-/// on closing a single pane. This guard makes that failure mode
-/// structurally impossible rather than merely unlikely: callers fall back
-/// to signaling only the individually-tracked `tty_pids`, which are already
-/// correctly scoped to this session's TTY via `list_tty_pids`'s
-/// device-number match, independent of whatever `pgid` says.
-fn is_safe_to_group_signal(pgid: i32, own_pgrp: u32) -> bool {
-    pgid > 1 && u32::try_from(pgid) != Ok(own_pgrp)
-}
-
 /// Runs the SIGTERM/SIGKILL escalation stages (2s apart) on a detached
 /// thread, then reaps `child`. `child` is only reaped here — never
 /// unconditionally — because [`PtySession::close`] already took it out of
@@ -668,12 +643,12 @@ fn is_safe_to_group_signal(pgid: i32, own_pgrp: u32) -> bool {
 /// before spawning this) — seconds have passed by then, long enough for a
 /// snapshotted individual pid to have exited and been assigned to an
 /// unrelated process.
-fn spawn_kill_escalation(pgid: i32, tty_pids: Vec<TrackedPid>, mut child: std::process::Child) {
+fn spawn_kill_escalation(tty_pids: Vec<TrackedPid>, mut child: std::process::Child) {
     std::thread::spawn(move || {
         std::thread::sleep(std::time::Duration::from_secs(2));
-        if signal_survivors(pgid, &tty_pids, KillStage::Term, true) {
+        if signal_survivors(&tty_pids, KillStage::Term, true) {
             std::thread::sleep(std::time::Duration::from_secs(2));
-            signal_survivors(pgid, &tty_pids, KillStage::Kill, true);
+            signal_survivors(&tty_pids, KillStage::Kill, true);
         }
         // SIGKILL cannot be ignored, so by now the child — if it was ever
         // going to die from these signals — has already exited; `wait()`
@@ -1562,33 +1537,6 @@ mod tests {
     }
 
     #[test]
-    fn is_safe_to_group_signal_rejects_own_pgrp_and_invalid_values() {
-        let own = 12_345u32;
-        assert!(
-            !is_safe_to_group_signal(12_345, own),
-            "must never target the caller's own process group"
-        );
-        assert!(!is_safe_to_group_signal(0, own), "pgid 0 is invalid");
-        assert!(!is_safe_to_group_signal(1, own), "pgid 1 is init, never a session's own group");
-        assert!(!is_safe_to_group_signal(-5, own), "negative pgid is invalid");
-        assert!(
-            is_safe_to_group_signal(99_999, own),
-            "a genuinely different pgid must still be signalable"
-        );
-    }
-
-    #[test]
-    fn is_safe_to_group_signal_rejects_the_real_running_process_own_pgrp() {
-        // Exercises the actual getpgrp() syscall too, not just the pure
-        // comparison — this is the exact scenario the guard defends
-        // against: `signal_survivors` must never reach `kill_pgrp*` when
-        // `pgid` is this test process's own process group.
-        let own_pgrp = core_rs::os::own_pgrp();
-        let own_pgrp_i32 = i32::try_from(own_pgrp).expect("test process pgrp fits i32");
-        assert!(!is_safe_to_group_signal(own_pgrp_i32, own_pgrp));
-    }
-
-    #[test]
     fn signal_survivors_skips_a_tracked_pid_that_has_exited_since_snapshot() {
         // Regression (jovian review, fix C): a snapshotted individual pid
         // can exit and be assigned to an unrelated process before a LATER
@@ -1611,9 +1559,7 @@ mod tests {
         );
         child.wait().expect("reap true");
 
-        // pgid=0 keeps the group-signal path a no-op (is_pid_running(0) is
-        // never true), isolating the individual-pid path under test.
-        let any_alive = signal_survivors(0, &[tracked], KillStage::Term, true);
+        let any_alive = signal_survivors(&[tracked], KillStage::Term, true);
         assert!(!any_alive, "an exited pid must never be (re-)signaled");
     }
 
