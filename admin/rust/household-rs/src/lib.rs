@@ -66,6 +66,7 @@ pub mod member_identity;
 pub mod owner_approval_v2;
 pub mod owner_auth;
 pub mod owner_events;
+pub mod owner_mesh_rendezvous_codec;
 pub mod owner_webauthn;
 pub mod owner_webauthn_anchor;
 pub mod owner_webauthn_authority;
