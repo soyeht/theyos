@@ -2,9 +2,11 @@
 //!
 //! Before E6, `close_local` only sent `SIGKILL` to the single tracked child
 //! pid. Ported from `soyeht-ios` PR #317's `NativePTY` technique:
-//! `PtySession::close` now snapshots every pid attached to the session's
-//! TTY and escalates `SIGHUP` (immediately) -> `SIGTERM` (after 2s, if
-//! anything survived) -> `SIGKILL` (after another 2s, if still surviving).
+//! `PtySession::close` snapshots every terminal-facing pid attached to the
+//! session's TTY and escalates `SIGHUP` (immediately) -> `SIGTERM` (after
+//! 2s, if anything survived) -> `SIGKILL` (after another 2s, if still
+//! surviving). Helpers whose stdin/stdout are private pipes or sockets are
+//! left to their client/EOF lifecycle.
 //!
 //! This test proves the brief's literal acceptance criterion: a child that
 //! installs `SIG_IGN` for both `SIGHUP` and `SIGTERM` on purpose — so it can
@@ -280,6 +282,41 @@ const FORK_GRANDCHILD_IN_NEW_PGROUP_SCRIPT: &str = "import os, sys, signal, time
      else:\n\
      \x20\x20\x20\x20time.sleep(60)\n";
 
+/// Model an MCP subprocess: it inherits the client's controlling TTY but
+/// replaces stdin/stdout with private pipes while remaining in the client's
+/// process group. It ignores the PTY hangup, records any direct SIGTERM, then
+/// exits normally when killing the terminal-facing parent closes the pipe.
+const FORK_PIPE_STDIO_HELPER_SCRIPT: &str = "import os, sys, signal, time\n\
+     pidfile, pgidfile, signalfile, cleanfile = sys.argv[1:5]\n\
+     stdin_read, stdin_write = os.pipe()\n\
+     stdout_read, stdout_write = os.pipe()\n\
+     child = os.fork()\n\
+     if child == 0:\n\
+     \x20\x20\x20\x20os.close(stdin_write)\n\
+     \x20\x20\x20\x20os.close(stdout_read)\n\
+     \x20\x20\x20\x20os.dup2(stdin_read, 0)\n\
+     \x20\x20\x20\x20os.dup2(stdout_write, 1)\n\
+     \x20\x20\x20\x20os.close(stdin_read)\n\
+     \x20\x20\x20\x20os.close(stdout_write)\n\
+     \x20\x20\x20\x20signal.signal(signal.SIGHUP, signal.SIG_IGN)\n\
+     \x20\x20\x20\x20def record_term(_signum, _frame):\n\
+     \x20\x20\x20\x20\x20\x20\x20\x20with open(signalfile, \"w\") as f:\n\
+     \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20f.write(\"term\")\n\
+     \x20\x20\x20\x20signal.signal(signal.SIGTERM, record_term)\n\
+     \x20\x20\x20\x20with open(pidfile, \"w\") as f:\n\
+     \x20\x20\x20\x20\x20\x20\x20\x20f.write(str(os.getpid()))\n\
+     \x20\x20\x20\x20with open(pgidfile, \"w\") as f:\n\
+     \x20\x20\x20\x20\x20\x20\x20\x20f.write(str(os.getpgrp()))\n\
+     \x20\x20\x20\x20while os.read(0, 4096):\n\
+     \x20\x20\x20\x20\x20\x20\x20\x20pass\n\
+     \x20\x20\x20\x20with open(cleanfile, \"w\") as f:\n\
+     \x20\x20\x20\x20\x20\x20\x20\x20f.write(\"eof\")\n\
+     \x20\x20\x20\x20time.sleep(1)\n\
+     else:\n\
+     \x20\x20\x20\x20os.close(stdin_read)\n\
+     \x20\x20\x20\x20os.close(stdout_write)\n\
+     \x20\x20\x20\x20time.sleep(60)\n";
+
 async fn wait_for_pidfile(path: &std::path::Path) -> i64 {
     for _ in 0..300 {
         if let Ok(content) = std::fs::read_to_string(path) {
@@ -290,6 +327,100 @@ async fn wait_for_pidfile(path: &std::path::Path) -> i64 {
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
     panic!("grandchild never wrote its pid to {}", path.display());
+}
+
+#[tokio::test]
+async fn close_does_not_signal_pipe_stdio_helper_independently_of_its_client() {
+    let (app, state) = fixture();
+    let server = TestServer::builder()
+        .http_transport()
+        .build(app)
+        .expect("test server");
+
+    let marker_dir = tempfile::TempDir::new().expect("marker tempdir");
+    let helper_process_file = marker_dir.path().join("helper.pid");
+    let helper_group_file = marker_dir.path().join("helper.pgid");
+    let signalfile = marker_dir.path().join("helper.signal");
+    let cleanfile = marker_dir.path().join("helper.clean");
+    let conv_id = "conv-e6-pipe-stdio-helper";
+    let create = server
+        .post("/api/v1/terminals/local")
+        .json(&serde_json::json!({
+            "conversation_id": conv_id,
+            "argv": [
+                python3_path(),
+                "-c",
+                FORK_PIPE_STDIO_HELPER_SCRIPT,
+                helper_process_file.to_string_lossy(),
+                helper_group_file.to_string_lossy(),
+                signalfile.to_string_lossy(),
+                cleanfile.to_string_lossy(),
+            ],
+            "cols": 80,
+            "rows": 24,
+        }))
+        .await;
+    assert_eq!(create.status_code(), StatusCode::OK, "{}", create.text());
+
+    wait_for_alive(&state, conv_id).await;
+    let helper_process_id = wait_for_pidfile(&helper_process_file).await;
+    let helper_group_id = wait_for_pidfile(&helper_group_file).await;
+    let list = server.get("/api/v1/terminals/local").await;
+    let list_json: serde_json::Value = list.json();
+    let entry = list_json["data"]
+        .as_array()
+        .expect("data array")
+        .iter()
+        .find(|i| i["conversation_id"] == conv_id)
+        .expect("session must be listed");
+    let slave_tty_path = entry["slave_tty_path"]
+        .as_str()
+        .expect("slave_tty_path must be present");
+    let pgid = entry["pgid"].as_i64().expect("pgid must be an integer");
+    let helper_pid_u32 = u32::try_from(helper_process_id).expect("pid fits u32");
+    assert_eq!(
+        helper_group_id, pgid,
+        "precondition: an MCP helper may share its client's process group"
+    );
+
+    assert!(
+        core_rs::os::list_tty_pids(slave_tty_path).contains(&helper_pid_u32),
+        "precondition: the pipe-backed helper must inherit the controlling TTY"
+    );
+    assert_eq!(
+        core_rs::os::process_has_terminal_stdio(helper_pid_u32, slave_tty_path),
+        Some(false),
+        "private pipe stdio must distinguish the helper from a terminal job"
+    );
+
+    let del = server
+        .delete(&format!("/api/v1/terminals/local/{conv_id}"))
+        .await;
+    assert_eq!(del.status_code(), StatusCode::NO_CONTENT);
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline && pid_exists(helper_process_id) {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let helper_survived = pid_exists(helper_process_id);
+    if helper_survived {
+        let _ = std::process::Command::new("kill")
+            .args(["-KILL", &helper_process_id.to_string()])
+            .status();
+    }
+
+    assert!(
+        !helper_survived,
+        "closing the terminal-facing client must still close the helper's pipe and let it exit"
+    );
+    assert!(
+        !signalfile.exists(),
+        "TTY cleanup must not escalate directly to a pipe-backed MCP-like helper"
+    );
+    assert!(
+        cleanfile.exists(),
+        "the helper must leave through client-pipe EOF, not a direct termination signal"
+    );
 }
 
 #[tokio::test]

@@ -7,6 +7,17 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+#[cfg(target_os = "macos")]
+unsafe extern "C" {
+    fn proc_pidinfo(
+        pid: i32,
+        flavor: i32,
+        arg: u64,
+        buffer: *mut std::ffi::c_void,
+        buffersize: i32,
+    ) -> i32;
+}
+
 /// Resolve the path to `slirp4netns`.
 ///
 /// Strategy (in order):
@@ -485,6 +496,106 @@ pub fn list_tty_pids(tty_path: &str) -> Vec<u32> {
     }
 }
 
+/// Report whether standard input or standard output is terminal-facing.
+///
+/// This is intentionally separate from [`list_tty_pids`]: a subprocess can
+/// inherit its parent's controlling terminal while replacing stdin/stdout
+/// with private pipes or sockets. MCP servers have exactly that shape and
+/// must not be treated as terminal jobs by TTY-wide cleanup.
+///
+/// Returns `None` when the process cannot be inspected. Kill/reap callers
+/// should preserve their historical behavior on `None` and exclude a process
+/// only after a positive `Some(false)` classification.
+#[must_use]
+pub fn process_has_terminal_stdio(pid: u32, tty_path: &str) -> Option<bool> {
+    #[cfg(target_os = "macos")]
+    {
+        let _ = tty_path;
+        macos_process_has_terminal_stdio(pid)
+    }
+    #[cfg(target_os = "linux")]
+    {
+        linux_process_has_terminal_stdio(pid, tty_path)
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        let _ = (pid, tty_path);
+        None
+    }
+}
+
+/// macOS `proc_pidinfo(PROC_PIDLISTFDS)` reports the kernel type of every
+/// open descriptor. PTYs are vnode-backed; MCP stdio is pipe/socket-backed.
+#[cfg(target_os = "macos")]
+fn macos_process_has_terminal_stdio(pid: u32) -> Option<bool> {
+    #[repr(C)]
+    #[derive(Clone, Copy, Default)]
+    struct ProcFdInfo {
+        proc_fd: i32,
+        proc_fdtype: u32,
+    }
+
+    const PROC_PIDLISTFDS: i32 = 1;
+    const PROX_FDTYPE_VNODE: u32 = 1;
+
+    let pid = i32::try_from(pid).ok()?;
+    // SAFETY: a null/zero buffer is the documented size-query form. No
+    // Rust-managed memory is exposed to libproc.
+    let required = unsafe { proc_pidinfo(pid, PROC_PIDLISTFDS, 0, std::ptr::null_mut(), 0) };
+    let required = usize::try_from(required).ok()?;
+    if required == 0 {
+        return None;
+    }
+
+    let entry_size = std::mem::size_of::<ProcFdInfo>();
+    let capacity = required.div_ceil(entry_size).saturating_add(8);
+    let mut descriptors = vec![ProcFdInfo::default(); capacity];
+    let byte_capacity = i32::try_from(std::mem::size_of_val(descriptors.as_slice())).ok()?;
+    // SAFETY: `descriptors` owns `byte_capacity` writable bytes and remains
+    // alive for the duration of the call. libproc returns the byte count
+    // actually initialized.
+    let written = unsafe {
+        proc_pidinfo(
+            pid,
+            PROC_PIDLISTFDS,
+            0,
+            descriptors.as_mut_ptr().cast(),
+            byte_capacity,
+        )
+    };
+    let written = usize::try_from(written).ok()?;
+    if written == 0 {
+        return None;
+    }
+    let count = (written / entry_size).min(descriptors.len());
+    Some(descriptors[..count].iter().any(|descriptor| {
+        matches!(descriptor.proc_fd, libc::STDIN_FILENO | libc::STDOUT_FILENO)
+            && descriptor.proc_fdtype == PROX_FDTYPE_VNODE
+    }))
+}
+
+/// Linux exposes each descriptor as a `/proc/<pid>/fd/<n>` symlink.
+/// Dereferencing it and comparing `st_rdev` with the PTY slave distinguishes
+/// the terminal itself from pipes, sockets, and regular-file redirections.
+#[cfg(target_os = "linux")]
+fn linux_process_has_terminal_stdio(pid: u32, tty_path: &str) -> Option<bool> {
+    use std::os::unix::fs::{FileTypeExt, MetadataExt};
+
+    let tty = std::fs::metadata(tty_path).ok()?;
+    let tty_dev = tty.rdev();
+    let mut inspected = false;
+    for descriptor in [libc::STDIN_FILENO, libc::STDOUT_FILENO] {
+        let Ok(metadata) = std::fs::metadata(format!("/proc/{pid}/fd/{descriptor}")) else {
+            continue;
+        };
+        inspected = true;
+        if metadata.file_type().is_char_device() && metadata.rdev() == tty_dev {
+            return Some(true);
+        }
+    }
+    inspected.then_some(false)
+}
+
 /// macOS: `proc_listpids(PROC_TTY_ONLY, <tty rdev>, ...)` — the same
 /// libproc call `lsof`/`ps` use internally to resolve "which processes are
 /// on this tty".
@@ -656,10 +767,6 @@ fn macos_process_start_time(pid: u32) -> Option<(u64, u64)> {
         pbi_start_tvusec: u64,
     }
 
-    unsafe extern "C" {
-        fn proc_pidinfo(pid: i32, flavor: i32, arg: u64, buffer: *mut ProcBsdInfo, buffersize: i32) -> i32;
-    }
-
     const PROC_PIDTBSDINFO: i32 = 3;
 
     let pid_i32 = i32::try_from(pid).ok()?;
@@ -670,7 +777,8 @@ fn macos_process_start_time(pid: u32) -> Option<(u64, u64)> {
     // past the end of the allocation. We only treat the buffer as
     // initialized (`assume_init`) when the kernel reports it wrote the
     // FULL struct (`written == size`).
-    let written = unsafe { proc_pidinfo(pid_i32, PROC_PIDTBSDINFO, 0, info.as_mut_ptr(), size) };
+    let written =
+        unsafe { proc_pidinfo(pid_i32, PROC_PIDTBSDINFO, 0, info.as_mut_ptr().cast(), size) };
     if written != size {
         return None;
     }
