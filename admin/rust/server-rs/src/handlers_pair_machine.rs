@@ -1010,6 +1010,27 @@ pub async fn local_finalize_handler(
         );
         return unauthenticated_response();
     }
+    // Best-effort: cache every peer's announced tailscale_addr as a
+    // non-authoritative last-known-location hint (see
+    // `household_rs::storage::write_known_peer_addr`). Identity is already
+    // committed above; a cache-write failure here must not surface as a
+    // finalize failure.
+    for peer in &response.peer_list {
+        let Some(addr) = peer.tailscale_addr.as_ref() else {
+            continue;
+        };
+        if let Err(e) = household_rs::storage::write_known_peer_addr(
+            &state.state_dir,
+            &peer.m_id,
+            addr,
+        ) {
+            tracing::warn!(
+                stage = "pair_machine.local_finalize.known_addr_persist_failed",
+                peer_m_id = %peer.m_id,
+                error = %e,
+            );
+        }
+    }
     if let Err(e) = bootstrap_state::persist(&state.state_dir, BootstrapState::Ready) {
         tracing::warn!(
             stage = "pair_machine.local_finalize.bootstrap_state_persist_failed",
@@ -1404,6 +1425,24 @@ pub async fn founder_stage_join_request(
             return Err(FounderStageError);
         }
     };
+
+    // Best-effort: cache the candidate's self-announced address as a
+    // non-authoritative last-known-location hint (see
+    // `household_rs::storage::write_known_peer_addr`). Not part of the
+    // ceremony's crash-safe staged-commit set — a write failure here must
+    // not abort a join the candidate otherwise validated correctly.
+    if let Err(e) = household_rs::storage::write_known_peer_addr(
+        &state.state_dir,
+        candidate_m_id.as_str(),
+        &request.addr,
+    ) {
+        tracing::warn!(
+            stage = "join_request.known_addr_persist_failed",
+            source = source.as_str(),
+            candidate_m_id = %candidate_m_id,
+            error = %e,
+        );
+    }
 
     // ── 9. Append OwnerEvent{type=join-request} ───────────────────────
     let payload = OwnerEventPayload::JoinRequest(JoinRequestPayload {

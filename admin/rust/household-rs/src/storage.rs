@@ -139,6 +139,36 @@ pub fn household_auth_state_path(state_dir: &Path) -> PathBuf {
     household_dir(state_dir).join("household_auth_state.cbor")
 }
 
+/// Path to the last-known-address cache: `m_id -> addr`, populated from
+/// wire fields already exchanged during the Phase 3 join ceremony
+/// (`JoinRequest.addr`, `PeerEntry.tailscale_addr`). Unsigned and not part
+/// of any `MachineCert` — a hit is a hint for an on-demand liveness probe,
+/// never an authority on identity or household membership.
+#[must_use]
+pub fn known_peer_addrs_path(state_dir: &Path) -> PathBuf {
+    household_dir(state_dir).join("known_peer_addrs.cbor")
+}
+
+type KnownPeerAddrs = std::collections::BTreeMap<String, String>;
+
+/// Best-effort persist of `m_id -> addr` into the last-known-address
+/// cache. Read-modify-write over the whole map; callers on the ceremony
+/// path treat a failure here as non-fatal.
+pub fn write_known_peer_addr(state_dir: &Path, m_id: &str, addr: &str) -> Result<(), StorageError> {
+    let path = known_peer_addrs_path(state_dir);
+    let mut map: KnownPeerAddrs = read_optional_cbor(&path)?.unwrap_or_default();
+    map.insert(m_id.to_string(), addr.to_string());
+    atomic_write_cbor(&path, &map)
+}
+
+/// Best-effort lookup of a single cached address. `Ok(None)` covers both
+/// "cache file absent" and "no entry for this `m_id`" — callers must treat
+/// both the same as "unknown", never as an error.
+pub fn read_known_peer_addr(state_dir: &Path, m_id: &str) -> Result<Option<String>, StorageError> {
+    let map: Option<KnownPeerAddrs> = read_optional_cbor(&known_peer_addrs_path(state_dir))?;
+    Ok(map.and_then(|m| m.get(m_id).cloned()))
+}
+
 #[must_use]
 #[cfg(test)]
 pub fn claw_vpn_mobile_mesh_path(state_dir: &Path) -> PathBuf {
@@ -1343,6 +1373,31 @@ mod tests {
         let path = td.path().join("absent.cbor");
         let v: Option<Tiny> = read_optional_cbor(&path).unwrap();
         assert!(v.is_none());
+    }
+
+    #[test]
+    fn known_peer_addr_round_trip_and_absent() {
+        let td = tempdir().unwrap();
+        assert_eq!(read_known_peer_addr(td.path(), "m_abc").unwrap(), None);
+
+        write_known_peer_addr(td.path(), "m_abc", "192.168.1.5:8091").unwrap();
+        assert_eq!(
+            read_known_peer_addr(td.path(), "m_abc").unwrap(),
+            Some("192.168.1.5:8091".to_string())
+        );
+        // An unrelated m_id still reads as unknown.
+        assert_eq!(read_known_peer_addr(td.path(), "m_def").unwrap(), None);
+
+        // A second machine's entry doesn't clobber the first.
+        write_known_peer_addr(td.path(), "m_def", "192.168.1.9:8091").unwrap();
+        assert_eq!(
+            read_known_peer_addr(td.path(), "m_abc").unwrap(),
+            Some("192.168.1.5:8091".to_string())
+        );
+        assert_eq!(
+            read_known_peer_addr(td.path(), "m_def").unwrap(),
+            Some("192.168.1.9:8091".to_string())
+        );
     }
 
     #[test]

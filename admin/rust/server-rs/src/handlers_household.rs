@@ -11,7 +11,7 @@ use axum::{
 };
 use base64::{Engine as _, engine::general_purpose::STANDARD as B64};
 use serde::Serialize;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::household_auth;
 use crate::household_state::HouseholdState;
@@ -119,8 +119,68 @@ struct MachineEntry {
     host_label: String,
     platform: &'static str,
     is_self: bool,
+    online: bool,
     capabilities: Vec<&'static str>,
     joined_at: u64,
+}
+
+/// Timeout for the on-demand `/healthz` liveness probe used by
+/// [`machines`] to fill in `MachineEntry::online` for non-self members.
+const HEALTHZ_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(1500);
+
+/// Rejects loopback/unspecified/link-local literals as probe targets. The
+/// sidecar address comes from a peer's own self-announced `JoinRequest.addr`
+/// (validated only for well-formed `host:port` shape, not IP range) — without
+/// this, a joined-but-malicious peer could plant e.g. `127.0.0.1:<port>` and
+/// turn this founder's own probe into a blind reachability oracle against the
+/// founder's local-only services. Ordinary LAN/Tailscale ranges (the actual
+/// expected target space) are unaffected; non-IP hostnames pass through
+/// unchanged, matching what `validate_join_addr` already accepted at capture
+/// time.
+fn is_safe_probe_host(host: &str) -> bool {
+    match host.parse::<std::net::IpAddr>() {
+        Ok(std::net::IpAddr::V4(v4)) => {
+            !(v4.is_loopback() || v4.is_unspecified() || v4.is_link_local())
+        }
+        Ok(std::net::IpAddr::V6(v6)) => {
+            !(v6.is_loopback() || v6.is_unspecified() || (v6.segments()[0] & 0xffc0) == 0xfe80)
+        }
+        Err(_) => true,
+    }
+}
+
+/// Best-effort liveness probe for a non-self household member. Looks up the
+/// last-known address from the ceremony-populated, non-authoritative
+/// sidecar cache (`household_rs::storage::read_known_peer_addr`) and probes
+/// its unauthenticated `/healthz`. Every failure mode — unknown address,
+/// unsafe target, timeout, connection error, non-2xx — collapses to `false`:
+/// this is a demo-grade presence signal probed synchronously per request,
+/// not a hardened availability guarantee.
+async fn probe_online(client: &reqwest::Client, state_dir: &Path, m_id: &str) -> bool {
+    let Ok(Some(addr)) = household_rs::storage::read_known_peer_addr(state_dir, m_id) else {
+        return false;
+    };
+    let host = addr
+        .strip_prefix('[')
+        .and_then(|rest| rest.split_once("]:"))
+        .map(|(h, _)| h)
+        .or_else(|| addr.rsplit_once(':').map(|(h, _)| h))
+        .unwrap_or(addr.as_str());
+    if !is_safe_probe_host(host) {
+        return false;
+    }
+    probe_healthz(client, &addr).await
+}
+
+/// GET `addr`'s `/healthz` and report whether it answered 2xx within
+/// [`HEALTHZ_PROBE_TIMEOUT`]. Separated from [`probe_online`] so the address
+/// safety gate and the HTTP mechanics can each be tested at their own level.
+async fn probe_healthz(client: &reqwest::Client, addr: &str) -> bool {
+    let url = format!("http://{addr}/healthz");
+    matches!(
+        client.get(&url).timeout(HEALTHZ_PROBE_TIMEOUT).send().await,
+        Ok(resp) if resp.status().is_success()
+    )
 }
 
 #[derive(Serialize)]
@@ -193,6 +253,7 @@ pub async fn machines(
 
     let certs_dir = household_rs::storage::machine_certs_dir(&state.state_dir);
     let mut machines: Vec<MachineEntry> = Vec::new();
+    let http_client = reqwest::Client::new();
     if let Ok(entries) = std::fs::read_dir(&certs_dir) {
         for entry in entries.flatten() {
             let path = entry.path();
@@ -230,12 +291,18 @@ pub async fn machines(
             }
             let m_id = cert.m_id.to_string();
             let is_self = self_m_id.as_deref() == Some(m_id.as_str());
+            let online = if is_self {
+                true
+            } else {
+                probe_online(&http_client, &state.state_dir, &m_id).await
+            };
             machines.push(MachineEntry {
                 machine_id: m_id,
                 machine_pub: hex::encode(cert.m_pub.as_bytes()),
                 host_label: cert.hostname.clone(),
                 platform: platform_str(&cert.platform),
                 is_self,
+                online,
                 capabilities: vec!["engine", "pty", "clawsite"],
                 joined_at: cert.joined_at,
             });
@@ -384,5 +451,92 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    // `probe_online` backs `MachineEntry::online` for non-self machines.
+    // These exercise it directly against the sidecar cache rather than
+    // through the owner-PoP-gated `machines` handler, matching this file's
+    // existing preference for testing the narrowest unit that carries the
+    // behavior (see the `snapshot` 401-reason tests above).
+
+    /// Accepts exactly one TCP connection and replies with a bare
+    /// `200 OK`. The task is detached (not awaited) — it exits on its own
+    /// once the single expected probe request lands.
+    async fn spawn_ok_http_server() -> std::net::SocketAddr {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            if let Ok((mut socket, _)) = listener.accept().await {
+                use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                let mut buf = [0u8; 1024];
+                let _ = socket.read(&mut buf).await;
+                let _ = socket
+                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                    .await;
+            }
+        });
+        addr
+    }
+
+    #[tokio::test]
+    async fn probe_online_false_when_address_unknown() {
+        let td = tempdir().unwrap();
+        let client = reqwest::Client::new();
+        assert!(!probe_online(&client, td.path(), "m_unknown").await);
+    }
+
+    // `probe_online` itself rejects loopback (see `probe_online_false_*_gate`
+    // tests below), so the "a real server answers" case is exercised at the
+    // `probe_healthz` level — the HTTP-GET-and-check-status mechanic is what
+    // this test verifies, not the address safety gate.
+    #[tokio::test]
+    async fn probe_healthz_true_when_server_responds() {
+        let addr = spawn_ok_http_server().await;
+        let client = reqwest::Client::new();
+        assert!(probe_healthz(&client, &addr.to_string()).await);
+    }
+
+    #[test]
+    fn is_safe_probe_host_rejects_loopback_link_local_unspecified() {
+        assert!(!is_safe_probe_host("127.0.0.1"));
+        assert!(!is_safe_probe_host("127.53.0.1"));
+        assert!(!is_safe_probe_host("169.254.1.1"));
+        assert!(!is_safe_probe_host("0.0.0.0"));
+        assert!(!is_safe_probe_host("::1"));
+        assert!(!is_safe_probe_host("::"));
+    }
+
+    #[test]
+    fn is_safe_probe_host_accepts_ordinary_lan_and_tailscale_and_hostnames() {
+        assert!(is_safe_probe_host("192.168.1.42"));
+        assert!(is_safe_probe_host("10.0.0.5"));
+        assert!(is_safe_probe_host("100.83.30.100")); // Tailscale CGNAT range
+        assert!(is_safe_probe_host("some-machine.local"));
+    }
+
+    #[tokio::test]
+    async fn probe_online_false_when_sidecar_address_is_loopback() {
+        let td = tempdir().unwrap();
+        let addr = spawn_ok_http_server().await;
+        // Same server a real probe would reach — but stored under a loopback
+        // literal, which the safety gate must reject before ever dialing it.
+        household_rs::storage::write_known_peer_addr(td.path(), "m_peer", &addr.to_string())
+            .unwrap();
+        assert!(addr.ip().is_loopback());
+        let client = reqwest::Client::new();
+        assert!(!probe_online(&client, td.path(), "m_peer").await);
+    }
+
+    #[tokio::test]
+    async fn probe_online_false_when_known_address_unreachable() {
+        let td = tempdir().unwrap();
+        // Bind then drop to obtain a loopback port nothing is listening on.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+        household_rs::storage::write_known_peer_addr(td.path(), "m_peer", &addr.to_string())
+            .unwrap();
+        let client = reqwest::Client::new();
+        assert!(!probe_online(&client, td.path(), "m_peer").await);
     }
 }
