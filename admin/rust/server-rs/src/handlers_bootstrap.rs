@@ -1063,17 +1063,19 @@ pub async fn post_pair_device_reissue(
         );
     }
 
-    // Resolve a reachable host fallback LAN-first (works with Tailscale OFF),
-    // then fall back to the Tailnet IPv4.
+    // Gate 2 above already fixed `current_bs == NamedAwaitingPair`, and
+    // `HouseholdExposurePolicy::allows` never grants `InterfaceClass::Lan` in
+    // that state (see `household_listener.rs`) — the listener will not be
+    // bound on any LAN address while this route can even be reached. Unlike
+    // the CLI's `--reissue-pair-qr`/first-install path (which mints in states
+    // where LAN *is* allowed and is deliberately LAN-first so it works with
+    // Tailscale OFF), this route must not offer a `host=` fallback the
+    // listener has already withdrawn: Tailnet-only, or no fallback.
     let port: u16 = std::env::var("THEYOS_HOUSEHOLD_PORT")
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(8091);
-    let host = crate::install_cli::pick_addr_for_transport(
-        household_rs::pair_machine::JoinTransport::Lan,
-        port,
-    )
-    .or_else(|| crate::tailnet_address::current_tailnet_ipv4().map(|ip| format!("{ip}:{port}")));
+    let host = crate::tailnet_address::current_tailnet_ipv4().map(|ip| format!("{ip}:{port}"));
 
     // Mint on the SHARED Arc for liveness (so the daemon's /pair-device/*
     // routes serve the same nonce), then render via the extracted URI path
