@@ -9,6 +9,8 @@
 
 mod phase3_support;
 
+use std::net::Ipv4Addr;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use axum::http::{StatusCode, header};
@@ -16,18 +18,29 @@ use household_rs::owner_events::{OwnerEventPayload, OwnerEventType};
 use household_rs::pair_machine::{
     PairMachineState, household_root_sole_path, shamir_self_shard_path,
 };
+use household_rs::storage::read_known_peer_addr;
 use server_rs::bonjour_browser::{JoinerAnnouncement, spawn_bonjour_browser_with_source};
+use server_rs::household_bootstrap::household_port_from_env;
 use tokio::sync::mpsc;
 
 use phase3_support::{
     OWNER_EVENTS_PATH, OwnerApprovalAck, OwnerEventsResponse, assert_machine_cert_layout,
-    assert_record_is_two_member, candidate_harness, cursor_param, founder_harness, get_cbor,
-    post_local_anchor, post_owner_approval,
+    assert_record_is_two_member, candidate_harness, cursor_param,
+    founder_harness_with_tailnet_resolver, get_cbor, post_local_anchor, post_owner_approval,
 };
 
 #[tokio::test]
 async fn phase3_machine_join_lan() {
-    let founder = founder_harness();
+    static FOUNDER_TAILNET_RESOLUTIONS: AtomicUsize = AtomicUsize::new(0);
+
+    #[allow(clippy::unnecessary_wraps)] // `TailnetResolver` is an optional-address seam.
+    fn founder_tailnet_address() -> Option<Ipv4Addr> {
+        FOUNDER_TAILNET_RESOLUTIONS.fetch_add(1, Ordering::Relaxed);
+        Some(Ipv4Addr::new(100, 64, 0, 10))
+    }
+
+    FOUNDER_TAILNET_RESOLUTIONS.store(0, Ordering::Relaxed);
+    let founder = founder_harness_with_tailnet_resolver(founder_tailnet_address);
     let candidate = candidate_harness().await;
 
     let pair_nonce = household_rs::ids::base32_lower_nopad_encode(
@@ -136,6 +149,17 @@ async fn phase3_machine_join_lan() {
     assert_machine_cert_layout(candidate.dir.path(), &m1_id, &m2_id);
     assert_record_is_two_member(founder.dir.path(), &m1_id, &m2_id);
     assert_record_is_two_member(candidate.dir.path(), &m1_id, &m2_id);
+    let expected_founder_addr = format!("100.64.0.10:{}", household_port_from_env());
+    assert_eq!(
+        read_known_peer_addr(candidate.dir.path(), &m1_id).expect("read founder address hint"),
+        Some(expected_founder_addr),
+        "candidate should cache the founder Tailnet hint carried by JoinResponse"
+    );
+    assert_eq!(
+        FOUNDER_TAILNET_RESOLUTIONS.load(Ordering::Relaxed),
+        1,
+        "pending recovery bytes and the final POST must reuse one resolved hint"
+    );
     assert!(!household_root_sole_path(founder.dir.path()).exists());
     assert!(shamir_self_shard_path(founder.dir.path()).exists());
     assert!(shamir_self_shard_path(candidate.dir.path()).exists());

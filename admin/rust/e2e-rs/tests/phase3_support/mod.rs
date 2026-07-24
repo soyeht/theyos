@@ -4,6 +4,7 @@
 pub mod failure_injector;
 
 use std::collections::BTreeMap;
+use std::net::Ipv4Addr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -32,6 +33,7 @@ use server_rs::handlers_pair_machine::{
     pre_household_router,
 };
 use server_rs::household_state::HouseholdState;
+use server_rs::tailnet_address::TailnetResolver;
 use tempfile::TempDir;
 use tokio::net::TcpListener;
 use tower::ServiceExt;
@@ -186,6 +188,16 @@ fn owner_auth_for(identity: &household_rs::LoadedIdentity) -> OwnerHarness {
 }
 
 pub fn founder_harness() -> FounderHarness {
+    fn no_tailnet_address() -> Option<Ipv4Addr> {
+        None
+    }
+
+    founder_harness_with_tailnet_resolver(no_tailnet_address)
+}
+
+pub fn founder_harness_with_tailnet_resolver(
+    founder_tailnet_resolver: TailnetResolver,
+) -> FounderHarness {
     let dir = tempfile::tempdir().expect("m1 tempdir");
     let identity = Arc::new(bootstrap(dir.path(), "studio-m1"));
     let owner = owner_auth_for(&identity);
@@ -215,7 +227,8 @@ pub fn founder_harness() -> FounderHarness {
         dir.path().to_path_buf(),
         KeyBackingPolicy::ForceSoftware,
         Duration::from_millis(50),
-    );
+    )
+    .with_founder_tailnet_resolver(founder_tailnet_resolver);
     let router = Router::new()
         .route(
             JOIN_REQUEST_PATH,

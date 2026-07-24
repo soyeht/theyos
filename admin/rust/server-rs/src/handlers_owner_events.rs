@@ -88,6 +88,7 @@ use crate::owner_webauthn_recovery_consume_rate_limit::{
     RecoveryConsumeRateLimitDecision, check_recovery_consume_attempt,
 };
 use crate::ratelimit::Limiter;
+use crate::tailnet_address::{TailnetResolver, current_tailnet_ipv4};
 use crate::time_util;
 
 const CBOR_CONTENT_TYPE: &str = "application/cbor";
@@ -156,6 +157,11 @@ pub struct OwnerEventsRouterState {
     /// This is absent by default. Production must opt in with the dedicated
     /// Secure/Upgrade rollout plus explicit App Attest verifier configuration.
     pub secure_upgrade_runtime: Option<SecureUpgradeRuntime>,
+    /// Resolver for the founder's own Tailnet IPv4 address.
+    ///
+    /// Production uses the local interface detector. Tests inject a
+    /// documentation-safe address without consulting the host network.
+    pub founder_tailnet_resolver: TailnetResolver,
 }
 
 #[derive(Clone)]
@@ -230,6 +236,7 @@ impl OwnerEventsRouterState {
             recovery_consume_rate_limiter: None,
             macos_local_caller_auth: None,
             secure_upgrade_runtime: None,
+            founder_tailnet_resolver: current_tailnet_ipv4,
         }
     }
 
@@ -288,6 +295,12 @@ impl OwnerEventsRouterState {
             )),
             config,
         });
+        self
+    }
+
+    #[must_use]
+    pub fn with_founder_tailnet_resolver(mut self, resolver: TailnetResolver) -> Self {
+        self.founder_tailnet_resolver = resolver;
         self
     }
 }
@@ -5938,6 +5951,13 @@ pub async fn owner_approve_handler(
         .addr_hint
         .clone()
         .unwrap_or_else(|| window_data.join_request.addr.clone());
+    // Resolve the founder hint exactly once. The same value must feed both
+    // builds below so the crash-recovery JoinResponse remains byte-identical
+    // to the response POSTed to M2.
+    let founder_tailscale_addr = build_founder_tailnet_addr(
+        crate::household_bootstrap::household_port_from_env(),
+        state.founder_tailnet_resolver,
+    );
     // T073: persist the JoinResponse bytes we are about to POST so
     // boot-time `recover_phase3_ceremony` can re-POST them after a
     // crash. `HH_priv` is destroyed during commit, so the
@@ -5950,7 +5970,7 @@ pub async fn owner_approve_handler(
             addr: &addr,
             join_request_cbor: &cached_join_request_bytes,
             founder_cert: &identity.cert,
-            founder_tailscale_addr: None,
+            founder_tailscale_addr: founder_tailscale_addr.clone(),
             push_token_seed: push_token_seed.clone(),
             response_signer: identity.m_priv.as_ref(),
         };
@@ -6064,7 +6084,7 @@ pub async fn owner_approve_handler(
             addr: &addr,
             join_request_cbor: &cached_join_request_bytes,
             founder_cert: &identity_for_finalize.cert,
-            founder_tailscale_addr: None,
+            founder_tailscale_addr,
             push_token_seed,
             response_signer: identity_for_finalize.m_priv.as_ref(),
         };
@@ -6735,6 +6755,10 @@ async fn backoff_or_cancel(cancel_rx: &mut watch::Receiver<bool>) -> bool {
     }
 }
 
+fn build_founder_tailnet_addr(port: u16, resolver: TailnetResolver) -> Option<String> {
+    resolver().map(|ip| format!("{ip}:{port}"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -6744,6 +6768,7 @@ mod tests {
     use household_rs::pair_machine::{
         JoinTransport, PAIR_MACHINE_VERSION, PairMachineApprovalClaim,
     };
+    use std::net::Ipv4Addr;
 
     fn household_id() -> HouseholdId {
         HouseholdId::parse(format!("hh_{}", "a".repeat(52))).unwrap()
@@ -6755,6 +6780,27 @@ mod tests {
 
     fn owner_person_id() -> PersonId {
         PersonId("p_owner-alpha".to_string())
+    }
+
+    #[test]
+    fn founder_tailnet_hint_uses_resolved_ip_and_household_port() {
+        fn resolver() -> Option<Ipv4Addr> {
+            Some(Ipv4Addr::new(100, 64, 0, 10))
+        }
+
+        assert_eq!(
+            build_founder_tailnet_addr(9_091, resolver).as_deref(),
+            Some("100.64.0.10:9091")
+        );
+    }
+
+    #[test]
+    fn founder_tailnet_hint_is_absent_when_resolver_has_no_address() {
+        fn resolver() -> Option<Ipv4Addr> {
+            None
+        }
+
+        assert!(build_founder_tailnet_addr(9_091, resolver).is_none());
     }
 
     fn approval_context(join_request_bytes: &[u8]) -> OwnerApprovalContextV2 {
