@@ -1187,6 +1187,343 @@ pub(crate) fn active_authority_fixture(
     ))
 }
 
+// ===== DP2 Fatia-2: promotion linearizer, one-shot claim, and sealed witness =====
+
+/// Opaque 32-byte one-shot promotion claim, minted by CSPRNG at registration
+/// and never accepted from wire (§4).
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub(crate) struct OwnerSitePromotionClaimId([u8; 32]);
+
+impl std::fmt::Debug for OwnerSitePromotionClaimId {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("OwnerSitePromotionClaimId(REDACTED)")
+    }
+}
+
+impl OwnerSitePromotionClaimId {
+    #[must_use]
+    fn generate() -> Self {
+        use rand::RngCore;
+        let mut bytes = [0u8; 32];
+        rand::rngs::OsRng.fill_bytes(&mut bytes);
+        Self(bytes)
+    }
+
+    #[must_use]
+    fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+}
+
+/// The current authority observation OWNED by the linearizer. Production has no
+/// admitting provider (`owner_site_ake` `admits_resource == false`) and no route
+/// that sets this, so in production it is never populated and the linearizer is
+/// unreachable (K0-PASS doubly inert). Tests populate it via the harness seam.
+#[derive(Clone, Debug)]
+struct OwnerSiteAuthorityObservation {
+    household: String,
+    authz_epoch: u64,
+    roster_digest: [u8; 32],
+    provider_generation: u64,
+    cancellation_generation: u64,
+    household_root: [u8; 33],
+    observed_at: u64,
+}
+
+/// Sealed, move-only promotion witness (§7). Constructible ONLY by the
+/// linearizer, and only after the resolution has been durably persisted. It has
+/// no public/`pub(crate)` constructor, no clone/copy/serde/default, and never
+/// leaves by reusable reference; it owns the material that authorized the
+/// transition and is the sole value that makes `VerifiedMeshPeer`/`DialPermit`
+/// reachable.
+#[allow(dead_code)]
+pub(crate) struct OwnerSitePromotionWitness {
+    pending: Pending,
+    claim: OwnerSitePromotionClaimId,
+    seal: OwnerSitePromotionWitnessSeal,
+}
+
+struct OwnerSitePromotionWitnessSeal;
+
+impl std::fmt::Debug for OwnerSitePromotionWitness {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("OwnerSitePromotionWitness(REDACTED)")
+    }
+}
+
+/// By-ownership promotion input: the full `Pending` plus its claim, sealed
+/// inside the authority module (§4). Never built from a raw tuple; only
+/// `register_pending` constructs it.
+#[allow(dead_code)]
+pub(crate) struct OwnerSitePromotionInput {
+    pending: Pending,
+    claim: OwnerSitePromotionClaimId,
+}
+
+impl std::fmt::Debug for OwnerSitePromotionInput {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("OwnerSitePromotionInput(REDACTED)")
+    }
+}
+
+/// The seven rechecks, each an individually provable outcome (§8).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum OwnerSiteRecheck {
+    AuthorityExact,
+    CancellationFence,
+    ProviderGeneration,
+    Freshness,
+    ChannelIdentity,
+    AuthenticatedIdentity,
+    OneShotClaim,
+}
+
+/// Typed rejection. Every variant fails closed: no witness, peer, or permit,
+/// and no partial state change.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum OwnerSitePromotionRejection {
+    StoreUnavailable,
+    NoLiveAuthority,
+    Recheck(OwnerSiteRecheck),
+    StorePersist,
+    DuplicateRegistration,
+}
+
+impl From<crate::owner_site_resolution_store::OwnerSiteResolutionStoreError>
+    for OwnerSitePromotionRejection
+{
+    fn from(error: crate::owner_site_resolution_store::OwnerSiteResolutionStoreError) -> Self {
+        use crate::owner_site_resolution_store::OwnerSiteResolutionStoreError as StoreError;
+        match error {
+            StoreError::Unavailable => Self::StoreUnavailable,
+            StoreError::DuplicateKey | StoreError::DuplicateClaim => Self::DuplicateRegistration,
+            _ => Self::StorePersist,
+        }
+    }
+}
+
+/// The single synchronized promotion linearizer (§7). Every mutation of the
+/// resolution store and the owned authority observation passes through one
+/// `Mutex`; there are no independent locks whose composition could expose half
+/// a transaction.
+pub(crate) struct OwnerSitePromotionLinearizer {
+    inner: std::sync::Mutex<OwnerSitePromotionLinearizerInner>,
+}
+
+struct OwnerSitePromotionLinearizerInner {
+    store: crate::owner_site_resolution_store::OwnerSiteResolutionStore,
+    authority: Option<OwnerSiteAuthorityObservation>,
+}
+
+/// Derive the resolution key from the sealed `PendingFinished` private fields.
+fn owner_site_resolution_key(
+    pending_finished: &PendingFinished,
+) -> crate::owner_site_resolution_store::OwnerSiteResolutionKeyV1 {
+    crate::owner_site_resolution_store::OwnerSiteResolutionKeyV1 {
+        household: pending_finished.household.0.clone(),
+        ws_instance: *pending_finished.ws_instance.as_bytes(),
+        channel_id: *pending_finished.channel_id.as_bytes(),
+        channel_epoch: pending_finished.channel_epoch.get(),
+        channel_binding: pending_finished.channel_binding,
+    }
+}
+
+impl OwnerSitePromotionLinearizer {
+    /// Open the linearizer over the durable resolution store. No authority is
+    /// observed yet; in production nothing ever populates it.
+    pub(crate) fn open(
+        state_dir: &std::path::Path,
+    ) -> Result<Self, OwnerSitePromotionRejection> {
+        let store =
+            crate::owner_site_resolution_store::OwnerSiteResolutionStore::open(state_dir)?;
+        Ok(Self {
+            inner: std::sync::Mutex::new(OwnerSitePromotionLinearizerInner {
+                store,
+                authority: None,
+            }),
+        })
+    }
+
+    /// TEST-ONLY authority seam. Production has no admitting provider, so this
+    /// is the only path that ever makes the linearizer reachable; it advances
+    /// the durable authority watermark inside the same lock.
+    #[cfg(test)]
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn observe_authority_for_harness(
+        &self,
+        household: &str,
+        authz_epoch: u64,
+        roster_digest: [u8; 32],
+        provider_generation: u64,
+        cancellation_generation: u64,
+        household_root: [u8; 33],
+        observed_at: u64,
+    ) -> Result<(), OwnerSitePromotionRejection> {
+        let mut inner = self.inner.lock().expect("linearizer mutex poisoned");
+        inner.store.observe_authority(
+            household,
+            authz_epoch,
+            roster_digest,
+            provider_generation,
+            cancellation_generation,
+        )?;
+        inner.authority = Some(OwnerSiteAuthorityObservation {
+            household: household.to_string(),
+            authz_epoch,
+            roster_digest,
+            provider_generation,
+            cancellation_generation,
+            household_root,
+            observed_at,
+        });
+        Ok(())
+    }
+
+    /// Register one sealed `Pending` (§7.1): derive its key from private fields,
+    /// mint a CSPRNG claim, persist the `Pending` record, and return an owned
+    /// input. No variant accepts the 15 fields raw.
+    pub(crate) fn register_pending(
+        &self,
+        pending: Pending,
+    ) -> Result<OwnerSitePromotionInput, OwnerSitePromotionRejection> {
+        let mut inner = self.inner.lock().expect("linearizer mutex poisoned");
+        let key = owner_site_resolution_key(&pending.pending_finished);
+        let claim = OwnerSitePromotionClaimId::generate();
+        let pending_finished = &pending.pending_finished;
+        inner.store.register_pending(
+            key,
+            *claim.as_bytes(),
+            pending_finished.authz_epoch.get(),
+            pending_finished.roster_digest,
+            pending_finished.provider_generation,
+            pending_finished.cancellation_generation,
+        )?;
+        Ok(OwnerSitePromotionInput { pending, claim })
+    }
+
+    /// The one atomic promotion path (§7.3–7.9). Runs the seven rechecks inside
+    /// the critical section with no lock release and no `await`, CAS
+    /// `Pending -> Promoted`, consumes the claim, persists, and only then
+    /// produces the sealed witness. Any failure leaves zero carrier/state.
+    pub(crate) fn authorize(
+        &self,
+        input: OwnerSitePromotionInput,
+    ) -> Result<OwnerSitePromotionWitness, OwnerSitePromotionRejection> {
+        let mut inner = self.inner.lock().expect("linearizer mutex poisoned");
+        let OwnerSitePromotionInput { pending, claim } = input;
+        let key = owner_site_resolution_key(&pending.pending_finished);
+        let authority = inner
+            .authority
+            .clone()
+            .ok_or(OwnerSitePromotionRejection::NoLiveAuthority)?;
+        let pending_finished = &pending.pending_finished;
+
+        // (1) Authority exact — captured (household, authz_epoch, roster_digest)
+        // equal the current authority coordinate.
+        if pending_finished.household.0 != authority.household
+            || pending_finished.authz_epoch.get() != authority.authz_epoch
+            || pending_finished.roster_digest != authority.roster_digest
+        {
+            return Err(OwnerSitePromotionRejection::Recheck(
+                OwnerSiteRecheck::AuthorityExact,
+            ));
+        }
+        // (2) Cancellation fence — captured equals current and the durable
+        // watermark has not advanced past it (no later revoke/tombstone).
+        let watermark = inner.store.watermark(
+            &pending_finished.household.0,
+            pending_finished.authz_epoch.get(),
+            pending_finished.roster_digest,
+        );
+        if pending_finished.cancellation_generation != authority.cancellation_generation
+            || watermark.is_some_and(|(_, cancel)| cancel > pending_finished.cancellation_generation)
+        {
+            return Err(OwnerSitePromotionRejection::Recheck(
+                OwnerSiteRecheck::CancellationFence,
+            ));
+        }
+        // (3) Provider generation.
+        if pending_finished.provider_generation != authority.provider_generation {
+            return Err(OwnerSitePromotionRejection::Recheck(
+                OwnerSiteRecheck::ProviderGeneration,
+            ));
+        }
+        // (4) Freshness — not expired at the observed clock.
+        if authority.observed_at >= pending_finished.fresh_until {
+            return Err(OwnerSitePromotionRejection::Recheck(
+                OwnerSiteRecheck::Freshness,
+            ));
+        }
+        // (5) Channel identity (§8.5) — this key resolves to a unique live
+        // (non-Closed) record. Per the store's key-uniqueness invariant a key
+        // maps to at most one record, so "the unique live record" reduces to
+        // "a live record exists". State (Pending vs Promoted/Revoking), claim
+        // belonging, one-shot consumption and saturation are all recheck (7),
+        // enforced by the store `promote` CAS below; a Closed or absent key
+        // fails here.
+        if inner.store.live_record(&key).is_none() {
+            return Err(OwnerSitePromotionRejection::Recheck(
+                OwnerSiteRecheck::ChannelIdentity,
+            ));
+        }
+        // (6) Authenticated identity — machine cert chains to the household root
+        // and the device binding still matches principal_D.
+        if household_rs::machine_cert::verify_against_household_root(
+            &pending_finished.machine_cert,
+            &authority.household_root,
+        )
+        .is_err()
+            || pending_finished.device_binding.participant_npub
+                != pending_finished.principal_d.participant_npub()
+        {
+            return Err(OwnerSitePromotionRejection::Recheck(
+                OwnerSiteRecheck::AuthenticatedIdentity,
+            ));
+        }
+        // (7) One-shot claim — present, belongs to the key, unconsumed. The
+        // store CAS `Pending -> Promoted` + claim-consume is the atomic image.
+        inner
+            .store
+            .promote(&key, claim.as_bytes())
+            .map_err(|_| OwnerSitePromotionRejection::Recheck(OwnerSiteRecheck::OneShotClaim))?;
+
+        // Persistence succeeded; only now is the witness produced.
+        Ok(OwnerSitePromotionWitness {
+            pending,
+            claim,
+            seal: OwnerSitePromotionWitnessSeal,
+        })
+    }
+
+    /// Revoke a promoted channel in the mandatory order (§9): persist the
+    /// cancellation advance and mark `Revoking`, publish the fence and release
+    /// the linearizer without `await`, drain (empty in this slice — no dial or
+    /// pump, so no network I/O is introduced to "demonstrate" it), then reenter
+    /// and confirm `Closed`. The channel is consumed by ownership; its retained
+    /// witness supplies the exact key without a rebind.
+    // The channel is consumed by ownership (§7.11/§9): revoke destroys the
+    // promoted channel so it can never be revoked twice; taking it by value is
+    // the enforcement, even though the body only reads its retained key.
+    #[allow(clippy::needless_pass_by_value)]
+    pub(crate) fn revoke(
+        &self,
+        channel: crate::owner_site_promotion::OwnerSitePromotedChannel,
+        cancellation_generation: u64,
+    ) -> Result<(), OwnerSitePromotionRejection> {
+        let key = owner_site_resolution_key(&channel.witness.pending.pending_finished);
+        {
+            let mut inner = self.inner.lock().expect("linearizer mutex poisoned");
+            inner.store.begin_revoke(&key, cancellation_generation)?;
+        }
+        // Fence published; linearizer released. Drain is empty in this slice.
+        {
+            let mut inner = self.inner.lock().expect("linearizer mutex poisoned");
+            inner.store.confirm_closed(&key)?;
+        }
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1810,5 +2147,274 @@ mod tests {
         assert!(!OwnerSiteAuthoritySnapshot::Stale.admits_pre_effect(&intent));
         assert!(!OwnerSiteAuthoritySnapshot::Mismatch.admits_pre_effect(&intent));
         assert!(!OwnerSiteAuthoritySnapshot::Revoked.admits_pre_effect(&intent));
+    }
+
+    // ===== Fatia-2 linearizer: happy path + individual recheck negatives =====
+
+    #[allow(clippy::type_complexity)]
+    fn linearizer_fixture() -> (
+        tempfile::TempDir,
+        OwnerSitePromotionLinearizer,
+        Pending,
+        String,
+        [u8; 33],
+    ) {
+        let household_root = P256Keypair::generate();
+        let machine = P256Keypair::generate();
+        let household = derive_household_id(&household_root.public());
+        let machine_cert = MachineCert::sign(
+            &household_root,
+            &machine.public(),
+            &SignOptions {
+                hh_id: household.clone(),
+                hostname: "linearizer-host".to_owned(),
+                platform: Platform::Macos,
+                joined_at: 1_000,
+            },
+        )
+        .expect("machine certificate");
+        let device_binding = signed_member_device("npub1linearizer");
+        let principal_d = OwnerSiteRemotePrincipal::injected_for_harness("npub1linearizer")
+            .expect("remote principal");
+        let exact_resource =
+            OwnerSiteResource::from_route_claw("linearizer-claw").expect("resource");
+        let exact_route =
+            crate::owner_site_capability::OwnerSiteCanonicalRequest::injected_for_harness(
+                crate::owner_site_capability::OwnerSiteRequestMethod::Post,
+                "/api/v1/household/claws/{name}/owner-site/preflight",
+                [0x31; 32],
+            )
+            .expect("canonical route");
+        let ws_instance = OwnerSiteWebSocketInstance::injected_for_harness([0x21; 32]);
+        let channel_id = OwnerSiteChannelId::injected_for_harness([0x22; 32]);
+        let channel_epoch = OwnerSiteChannelEpoch::injected_for_harness(7).expect("channel epoch");
+        let channel_binding = [0x23; 32];
+        let channel = AuthenticatedConfidentialChannel::injected_for_harness(
+            ws_instance,
+            channel_id,
+            channel_epoch,
+            channel_binding,
+        );
+        let pending_finished = PendingFinished::injected_for_harness(
+            household.clone(),
+            exact_resource,
+            exact_route,
+            machine_cert,
+            device_binding,
+            principal_d,
+            ws_instance,
+            channel_id,
+            channel_epoch,
+            channel_binding,
+            9,
+            [0x24; 32],
+            1_060,
+            11,
+            13,
+        )
+        .expect("synthetic pending state");
+        let pending = Pending::injected_for_harness(pending_finished, channel).expect("pending");
+        let root = *household_root.public().as_bytes();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let linearizer = OwnerSitePromotionLinearizer::open(dir.path()).expect("open linearizer");
+        (dir, linearizer, pending, household.0, root)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn run_promotion(
+        authz_epoch: u64,
+        roster_digest: [u8; 32],
+        provider_generation: u64,
+        cancellation_generation: u64,
+        household_root: Option<[u8; 33]>,
+        observed_at: u64,
+    ) -> Result<OwnerSitePromotionWitness, OwnerSitePromotionRejection> {
+        let (_dir, linearizer, pending, household, root) = linearizer_fixture();
+        let root = household_root.unwrap_or(root);
+        linearizer
+            .observe_authority_for_harness(
+                &household,
+                authz_epoch,
+                roster_digest,
+                provider_generation,
+                cancellation_generation,
+                root,
+                observed_at,
+            )
+            .expect("observe authority");
+        let input = linearizer.register_pending(pending).expect("register pending");
+        linearizer.authorize(input)
+    }
+
+    #[test]
+    fn fatia2_happy_path_promotes_and_yields_witness() {
+        let result = run_promotion(9, [0x24; 32], 11, 13, None, 1_001);
+        assert!(matches!(result, Ok(_)), "happy path must promote: {result:?}");
+    }
+
+    #[test]
+    fn fatia2_recheck_authority_exact_negative() {
+        assert!(matches!(
+            run_promotion(10, [0x24; 32], 11, 13, None, 1_001),
+            Err(OwnerSitePromotionRejection::Recheck(OwnerSiteRecheck::AuthorityExact))
+        ));
+        assert!(matches!(
+            run_promotion(9, [0x99; 32], 11, 13, None, 1_001),
+            Err(OwnerSitePromotionRejection::Recheck(OwnerSiteRecheck::AuthorityExact))
+        ));
+    }
+
+    #[test]
+    fn fatia2_recheck_cancellation_fence_negative() {
+        assert!(matches!(
+            run_promotion(9, [0x24; 32], 11, 14, None, 1_001),
+            Err(OwnerSitePromotionRejection::Recheck(OwnerSiteRecheck::CancellationFence))
+        ));
+    }
+
+    #[test]
+    fn fatia2_recheck_provider_generation_negative() {
+        assert!(matches!(
+            run_promotion(9, [0x24; 32], 12, 13, None, 1_001),
+            Err(OwnerSitePromotionRejection::Recheck(OwnerSiteRecheck::ProviderGeneration))
+        ));
+    }
+
+    #[test]
+    fn fatia2_recheck_freshness_negative() {
+        assert!(matches!(
+            run_promotion(9, [0x24; 32], 11, 13, None, 1_060),
+            Err(OwnerSitePromotionRejection::Recheck(OwnerSiteRecheck::Freshness))
+        ));
+    }
+
+    #[test]
+    fn fatia2_recheck_authenticated_identity_negative() {
+        let wrong_root = *P256Keypair::generate().public().as_bytes();
+        assert!(matches!(
+            run_promotion(9, [0x24; 32], 11, 13, Some(wrong_root), 1_001),
+            Err(OwnerSitePromotionRejection::Recheck(OwnerSiteRecheck::AuthenticatedIdentity))
+        ));
+    }
+
+    #[test]
+    fn fatia2_authorize_without_observed_authority_fails_closed() {
+        let (_dir, linearizer, pending, _household, _root) = linearizer_fixture();
+        let input = linearizer.register_pending(pending).expect("register pending");
+        assert!(matches!(
+            linearizer.authorize(input),
+            Err(OwnerSitePromotionRejection::NoLiveAuthority)
+        ));
+    }
+
+    #[test]
+    fn fatia2_promote_boundary_yields_promoted_channel() {
+        let (_dir, linearizer, pending, household, root) = linearizer_fixture();
+        linearizer
+            .observe_authority_for_harness(&household, 9, [0x24; 32], 11, 13, root, 1_001)
+            .expect("observe authority");
+        let input = linearizer.register_pending(pending).expect("register pending");
+        let request = crate::owner_site_promotion::OwnerSitePromotionRequest(input);
+        let result =
+            crate::owner_site_promotion::OwnerSitePromotionBoundary::promote(&linearizer, request);
+        assert!(matches!(result, Ok(_)), "promote must yield a channel: {result:?}");
+    }
+
+    #[test]
+    fn fatia2_revoke_promoted_channel_closes() {
+        let (_dir, linearizer, pending, household, root) = linearizer_fixture();
+        linearizer
+            .observe_authority_for_harness(&household, 9, [0x24; 32], 11, 13, root, 1_001)
+            .expect("observe authority");
+        let input = linearizer.register_pending(pending).expect("register pending");
+        let request = crate::owner_site_promotion::OwnerSitePromotionRequest(input);
+        let channel =
+            crate::owner_site_promotion::OwnerSitePromotionBoundary::promote(&linearizer, request)
+                .expect("promote");
+        // Revoke follows the §9 order (persist advance -> Revoking -> release ->
+        // empty drain -> confirm Closed) and consumes the channel by ownership.
+        linearizer.revoke(channel, 14).expect("revoke closes the channel");
+    }
+
+    #[test]
+    fn fatia2_recheck_channel_identity_negative() {
+        let (_dir, linearizer, pending, household, root) = linearizer_fixture();
+        linearizer
+            .observe_authority_for_harness(&household, 9, [0x24; 32], 11, 13, root, 1_001)
+            .expect("observe authority");
+        // The key is never registered, so it has no live record. Rechecks 1-4
+        // pass; recheck (5) rejects with ChannelIdentity and mutates nothing.
+        // (Two live records for one key are unreachable by the store's
+        // key-uniqueness invariant, proved separately in the store tests, so the
+        // absent/Closed case is the sufficient and correct negative.)
+        let key = owner_site_resolution_key(&pending.pending_finished);
+        let input = OwnerSitePromotionInput {
+            pending,
+            claim: OwnerSitePromotionClaimId([0xEE; 32]),
+        };
+        assert!(matches!(
+            linearizer.authorize(input),
+            Err(OwnerSitePromotionRejection::Recheck(
+                OwnerSiteRecheck::ChannelIdentity
+            ))
+        ));
+        // Zero carrier (Err, no witness) and zero mutation: no record was
+        // created and the claim was never registered or consumed.
+        let inner = linearizer.inner.lock().expect("linearizer mutex");
+        assert!(
+            inner.store.live_record(&key).is_none(),
+            "a gate-5 rejection must not create a live record"
+        );
+        assert!(
+            !inner.store.is_claim_present(&[0xEE; 32]),
+            "a gate-5 rejection must not register or consume the claim"
+        );
+    }
+
+    #[test]
+    fn fatia2_recheck_one_shot_claim_negative() {
+        let (_dir, linearizer, pending, household, root) = linearizer_fixture();
+        linearizer
+            .observe_authority_for_harness(&household, 9, [0x24; 32], 11, 13, root, 1_001)
+            .expect("observe authority");
+        let key = owner_site_resolution_key(&pending.pending_finished);
+        // A live `Pending` record exists (recheck 5 passes), but the input's
+        // claim does not belong to the key. Recheck (7)'s store `promote` CAS
+        // rejects it as OneShotClaim, with no witness and no state change.
+        let mut input = linearizer.register_pending(pending).expect("register pending");
+        let registered_claim = *input.claim.as_bytes();
+        input.claim = OwnerSitePromotionClaimId([0xEE; 32]);
+        assert_ne!(
+            [0xEE; 32], registered_claim,
+            "the divergent test claim must differ from the registered claim"
+        );
+        assert!(matches!(
+            linearizer.authorize(input),
+            Err(OwnerSitePromotionRejection::Recheck(
+                OwnerSiteRecheck::OneShotClaim
+            ))
+        ));
+        // Zero carrier (Err, no witness) and zero mutation: the record stays a
+        // live `Pending`, its registered claim is intact, and the divergent
+        // claim was never consumed.
+        let inner = linearizer.inner.lock().expect("linearizer mutex");
+        let record = inner
+            .store
+            .live_record(&key)
+            .expect("the registered record stays live");
+        assert_eq!(
+            record.state(),
+            crate::owner_site_resolution_store::OwnerSiteResolutionState::Pending,
+            "a gate-7 rejection must leave the record Pending"
+        );
+        assert_eq!(
+            record.claim_id(),
+            &registered_claim,
+            "a gate-7 rejection must leave the registered claim intact"
+        );
+        assert!(
+            !inner.store.is_claim_present(&[0xEE; 32]),
+            "the divergent claim must never be consumed"
+        );
     }
 }

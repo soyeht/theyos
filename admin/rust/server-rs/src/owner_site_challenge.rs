@@ -97,6 +97,13 @@ impl OwnerSiteWebSocketInstance {
     }
 }
 
+impl OwnerSiteWebSocketInstance {
+    #[must_use]
+    pub(crate) fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+}
+
 /// CSPRNG server-owned channel id for the future one-WebSocket A2 session.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct OwnerSiteChannelId([u8; 32]);
@@ -111,6 +118,13 @@ impl OwnerSiteChannelId {
     #[cfg(test)]
     #[must_use]
     pub(crate) fn bytes_for_harness(&self) -> &[u8; 32] {
+        &self.0
+    }
+}
+
+impl OwnerSiteChannelId {
+    #[must_use]
+    pub(crate) fn as_bytes(&self) -> &[u8; 32] {
         &self.0
     }
 }

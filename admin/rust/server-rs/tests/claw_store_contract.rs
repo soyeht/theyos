@@ -469,17 +469,28 @@ fn owner_site_promotion_skeleton_is_deny_only_and_unwired() {
         "pub(crate) struct VerifiedMeshPeer(VerifiedMeshPeerSeal);",
         "pub(crate) struct DialPermit(DialPermitSeal);",
         "pub(crate) struct OwnerSitePromotedChannel",
-        "pub(crate) struct OwnerSitePromotionRequest(OwnerSitePromotionRequestSeal);",
-        "#[cfg(test)]\nimpl OwnerSitePromotionRequest",
-        "ContractUnavailable",
-        "Err(OwnerSitePromotionRejection::ContractUnavailable)",
-        "promotion_boundary_is_deny_only_before_the_data_plane_contract",
+        "pub(crate) witness: OwnerSitePromotionWitness,",
+        "pub(crate) struct OwnerSitePromotionRequest(pub(crate) OwnerSitePromotionInput);",
+        "let witness = linearizer.authorize(request.0)?;",
     ] {
         assert!(
             promotion.contains(required),
-            "the inert promotion skeleton must retain `{required}`"
+            "the witness-gated promotion boundary must retain `{required}`"
         );
     }
+    // The carrier seals stay module-private and un-minted from outside.
+    for private_seal in ["struct VerifiedMeshPeerSeal;", "struct DialPermitSeal;"] {
+        assert!(
+            promotion.contains(private_seal),
+            "carrier seal `{private_seal}` must remain module-private"
+        );
+    }
+    // The witness is produced ONLY by the authority linearizer — this module
+    // never names the witness seal, so it cannot forge a witness.
+    assert!(
+        !promotion.contains("OwnerSitePromotionWitnessSeal"),
+        "the witness must be produced by the linearizer, not the boundary"
+    );
     assert!(
         promotion.contains("#[derive(Debug, Eq, PartialEq)]\npub(crate) struct VerifiedMeshPeer")
             && promotion.contains("#[derive(Debug, Eq, PartialEq)]\npub(crate) struct DialPermit"),
@@ -487,22 +498,23 @@ fn owner_site_promotion_skeleton_is_deny_only_and_unwired() {
     );
     assert_eq!(
         promotion.matches("VerifiedMeshPeer(").count(),
-        1,
-        "the inert skeleton must not construct a mesh peer"
+        2,
+        "exactly one mesh-peer construction (declaration + witness-gated body)"
     );
     assert_eq!(
         promotion.matches("DialPermit(").count(),
-        1,
-        "the inert skeleton must not construct a dial permit"
+        2,
+        "exactly one dial-permit construction (declaration + witness-gated body)"
     );
     assert_eq!(
         promotion.matches("pub(crate) fn").count(),
         1,
-        "the boundary must expose only its deny-only promotion attempt"
+        "the boundary must expose only the single promotion path"
     );
-    assert!(
-        !promotion.contains("Ok("),
-        "the deny-only skeleton must not report a promotion success"
+    assert_eq!(
+        promotion.matches("Ok(").count(),
+        1,
+        "promotion success exists exactly once, only in the witness-gated body"
     );
     assert!(
         lib.contains("pub(crate) mod owner_site_promotion;"),
@@ -716,6 +728,154 @@ fn owner_site_pre_effect_route_is_router_only_and_capability_sibling() {
             "owner-site registration must not create a listener or discovery side effect: {forbidden}"
         );
     }
+
+    // ── DP2 Fatia-2 additive coverage (§11): the promotion linearizer + store
+    // are the crate-private, unwired, witness-gated sibling to this route, and
+    // the store persists only a record projection (never the sealed carriers). ──
+    let store = include_str!("../src/owner_site_resolution_store.rs");
+    let promotion = include_str!("../src/owner_site_promotion.rs");
+    let ake = include_str!("../src/owner_site_ake.rs");
+
+    assert!(
+        lib.contains("pub(crate) mod owner_site_resolution_store;"),
+        "the resolution store must be a crate-private module"
+    );
+    assert!(
+        authority.contains("pub(crate) struct OwnerSitePromotionLinearizer {"),
+        "the promotion linearizer lives in the crate-private authority module"
+    );
+    for surface in [routes, bootstrap, handlers, ake] {
+        for wired in [
+            "OwnerSitePromotionLinearizer",
+            "owner_site_resolution_store",
+            "owner_site_promotion",
+        ] {
+            assert!(
+                !surface.contains(wired),
+                "production route/bootstrap/handler/provider must not wire `{wired}`"
+            );
+        }
+    }
+    for source in [store, promotion] {
+        for forbidden in [
+            "connect(",
+            "TcpStream",
+            "TcpListener",
+            "tokio::net",
+            "copy_bidirectional",
+            "write_all(",
+            "relay_stream",
+            "Hermes",
+            "GuestCredential",
+            "household_attach_token",
+            "SocketAddr",
+            "ConnectInfo",
+        ] {
+            assert!(
+                !source.contains(forbidden),
+                "the Fatia-2 store/boundary must stay effect-free: {forbidden}"
+            );
+        }
+    }
+    assert!(
+        promotion.contains("let witness = linearizer.authorize(request.0)?;"),
+        "promotion is reachable only through the linearizer-produced witness"
+    );
+    assert!(
+        store.contains("read_optional_cbor") && store.contains("OwnerSiteResolutionState::Closed"),
+        "the store must recover fail-closed via read_optional_cbor and Closed terminalization"
+    );
+    // Third block: the store persists ONLY the record projection — never the
+    // sealed carriers — and keeps the consumed-claim set and envelope identity.
+    assert!(
+        !store.contains("crate::owner_site_authority")
+            && !store.contains("crate::owner_site_promotion"),
+        "the store must not import the sealed authority/promotion carriers, so it \
+         cannot serialize PendingFinished / witness / VerifiedMeshPeer / DialPermit"
+    );
+    assert!(
+        store.contains("consumed_claims")
+            && store.contains("owner-site-promotion-state")
+            && store.contains("struct OwnerSiteResolutionKeyV1"),
+        "the envelope must carry the consumed-claim set, kind, and resolution key identity"
+    );
+    for negative in [
+        "Serialize for OwnerSitePromotionWitness",
+        "Serialize for OwnerSitePromotionInput",
+        "derive(Clone)]\npub(crate) struct OwnerSitePromotionWitness",
+        "derive(Clone)]\npub(crate) struct OwnerSitePromotionInput",
+    ] {
+        assert!(
+            !authority.contains(negative),
+            "the witness/input must remain move-only and non-serializable: {negative}"
+        );
+    }
+}
+
+#[test]
+fn amendment_a1_challenge_accessors_are_projection_only() {
+    let challenge = include_str!("../src/owner_site_challenge.rs");
+    let authority = include_str!("../src/owner_site_authority.rs");
+
+    // (1)(2) Exactly the two projection getters exist, verbatim, each
+    // `&self -> &[u8; 32]`.
+    for block in [
+        "impl OwnerSiteWebSocketInstance {\n    #[must_use]\n    pub(crate) fn as_bytes(&self) -> &[u8; 32] {\n        &self.0\n    }\n}",
+        "impl OwnerSiteChannelId {\n    #[must_use]\n    pub(crate) fn as_bytes(&self) -> &[u8; 32] {\n        &self.0\n    }\n}",
+    ] {
+        assert!(
+            challenge.contains(block),
+            "the A1 projection getter block must exist verbatim"
+        );
+    }
+    assert_eq!(
+        challenge
+            .matches("impl OwnerSiteWebSocketInstance {\n    #[must_use]\n    pub(crate) fn as_bytes")
+            .count(),
+        1,
+        "exactly one OwnerSiteWebSocketInstance::as_bytes projection getter"
+    );
+    assert_eq!(
+        challenge
+            .matches("impl OwnerSiteChannelId {\n    #[must_use]\n    pub(crate) fn as_bytes")
+            .count(),
+        1,
+        "exactly one OwnerSiteChannelId::as_bytes projection getter"
+    );
+    // (3)(6) No mutable/forging/serde surface was introduced by the delta.
+    for forbidden in [
+        "as_bytes_mut",
+        "Serialize for OwnerSiteWebSocketInstance",
+        "Serialize for OwnerSiteChannelId",
+        "impl Default for OwnerSiteWebSocketInstance",
+        "impl Default for OwnerSiteChannelId",
+        "impl From<[u8; 32]> for OwnerSiteWebSocketInstance",
+        "impl From<[u8; 32]> for OwnerSiteChannelId",
+        "impl TryFrom<[u8; 32]> for OwnerSiteWebSocketInstance",
+        "impl TryFrom<[u8; 32]> for OwnerSiteChannelId",
+    ] {
+        assert!(!challenge.contains(forbidden), "A1 forbids `{forbidden}`");
+    }
+    // (4)(5) The prior test-only surface is untouched: constructors and the
+    // mutation table stay `#[cfg(test)]`, and `bytes_for_harness` remains.
+    assert!(
+        challenge.contains("#[cfg(test)]\n    #[must_use]\n    pub(crate) fn injected_for_harness"),
+        "injected_for_harness constructors stay test-only"
+    );
+    assert!(
+        challenge.contains("#[cfg(test)]\npub(crate) struct OwnerSiteChallengeTable"),
+        "the challenge table stays test-only"
+    );
+    assert!(
+        challenge.contains("pub(crate) fn bytes_for_harness(&self) -> &[u8; 32]"),
+        "the pre-existing test-only accessor is untouched"
+    );
+    // (8) The only consumers of the projections are the resolution-key formation.
+    assert!(
+        authority.contains("ws_instance: *pending_finished.ws_instance.as_bytes(),")
+            && authority.contains("channel_id: *pending_finished.channel_id.as_bytes(),"),
+        "the projections feed only OwnerSiteResolutionKeyV1 formation"
+    );
 }
 
 #[test]

@@ -135,6 +135,7 @@ pub(crate) mod owner_site_authority;
 pub(crate) mod owner_site_capability;
 pub(crate) mod owner_site_challenge;
 pub(crate) mod owner_site_promotion;
+pub(crate) mod owner_site_resolution_store;
 pub mod owner_webauthn_recovery_consume_rate_limit;
 pub mod pair_machine_local;
 pub mod production_app;
