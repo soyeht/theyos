@@ -231,6 +231,10 @@ pub fn router(state: ClawShareRouterState) -> axum::Router {
         .route("/api/v1/claw-share/invites", post(handle_mint_invite))
         .route("/api/v1/claw-share/revoke", post(handle_revoke))
         .route("/api/v1/claw-share/group-op", post(handle_group_op))
+        .route(
+            "/api/v1/claw-share/invite-to-claw",
+            post(handle_invite_to_claw),
+        )
         .route("/api/v1/claw-share/groups", get(handle_list_groups))
         .route(
             "/api/v1/claw-share/relay-offer/challenge",
@@ -1452,6 +1456,29 @@ struct GroupOpRequest {
     op: GroupOp,
 }
 
+/// Request body for `POST /api/v1/claw-share/invite-to-claw` — the ergonomic,
+/// atomic "invite person X to claw Y" product primitive. Canonical CBOR,
+/// `snake_case` keys. It composes the three already-tested owner-signed group
+/// ops so the client makes ONE owner-authed call instead of three raw
+/// `/group-op`s (Create + `AddMember` + `GrantClaw`).
+#[derive(Debug, Deserialize)]
+struct InviteToClawRequest {
+    v: u8,
+    /// The group the guest is invited into. Created with `group_name` when
+    /// absent; an existing group is reused UNCHANGED (never renamed).
+    group_id: String,
+    /// Display name applied ONLY when the group is newly created.
+    group_name: String,
+    /// The guest's derived `member_id` (see `member_identity`). Membership is
+    /// not trust by itself — the owner-signed `GroupMemberAdded` is what makes
+    /// it authoritative.
+    member_id: String,
+    /// Owner-facing display label for the member (UX only, not an authority input).
+    label: String,
+    /// The claw the group is granted access to.
+    claw_id: String,
+}
+
 /// Translate one [`GroupOp`] into the single signed `MeshEvent` it records.
 /// `EnrollMemberDevice` fails closed (`BAD_REQUEST` / `member_binding_invalid`)
 /// if the member's self-signed binding does not verify — `member_id` must derive
@@ -1607,6 +1634,99 @@ async fn handle_group_op(
     // intentionally not wired in this relay/membership subset.
     if let Err(resp) = apply_group_op(&state, &req.op, now).await {
         return resp;
+    }
+
+    StatusCode::NO_CONTENT.into_response()
+}
+
+/// Compose the owner-signed ops for an "invite person to claw" request against
+/// the current projection. `GroupCreated` is included ONLY when the group is
+/// absent (an existing group is reused unchanged, so a re-invite can never
+/// rename or otherwise clobber it); `AddMember` and `GrantClaw` are always
+/// included and are idempotent in the projection (re-adding an Active
+/// member/claw is a no-op). Pure: no I/O, no auth — the handler applies the
+/// result under the owner-PoP gate, so the ops carry no authority on their own.
+fn invite_to_claw_ops(projection: &ProjectedState, req: &InviteToClawRequest) -> Vec<GroupOp> {
+    let mut ops = Vec::with_capacity(3);
+    if !projection.groups.contains_key(&req.group_id) {
+        ops.push(GroupOp::Create {
+            group_id: req.group_id.clone(),
+            name: req.group_name.clone(),
+        });
+    }
+    ops.push(GroupOp::AddMember {
+        group_id: req.group_id.clone(),
+        member_id: req.member_id.clone(),
+        label: req.label.clone(),
+    });
+    ops.push(GroupOp::GrantClaw {
+        group_id: req.group_id.clone(),
+        claw_id: req.claw_id.clone(),
+    });
+    ops
+}
+
+/// `POST /api/v1/claw-share/invite-to-claw` — OWNER-authed. Atomically invites a
+/// guest to one claw by appending the owner-signed events the dial-time gate
+/// (`check_relay_stream_group_membership`) already enforces per request:
+/// `GroupCreated` (only when absent), then `GroupMemberAdded`, then
+/// `GroupClawGranted`.
+///
+/// This adds NO new authority: it is a thin, owner-only composition of the exact
+/// tested `/group-op` primitives (`apply_group_op` -> `group_op_to_event` ->
+/// signed `MeshEvent`), reusing the same `HouseholdInvite` caveat. It is
+/// idempotent and fails CLOSED: a partial append (e.g. member added but the
+/// grant not yet persisted) leaves the guest WITHOUT access, because the gate
+/// requires BOTH an Active membership AND an Active claw grant; re-running the
+/// invite simply completes it.
+async fn handle_invite_to_claw(
+    State(state): State<ClawShareRouterState>,
+    method: Method,
+    uri: Uri,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let now = match SystemTime::now().duration_since(UNIX_EPOCH) {
+        Ok(d) => d.as_secs(),
+        Err(_) => return StatusCode::UNAUTHORIZED.into_response(),
+    };
+    let path_and_query = uri
+        .path_and_query()
+        .map_or_else(|| uri.path().to_string(), |pq| pq.as_str().to_string());
+
+    if household_auth::authorize_request(
+        &state.household,
+        &headers,
+        &method,
+        &path_and_query,
+        &body,
+        Operation::HouseholdInvite,
+        now,
+    )
+    .await
+    .is_err()
+    {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+
+    let req: InviteToClawRequest = match cbor::from_canonical_slice(&body) {
+        Ok(r) => r,
+        Err(_) => return error_response(StatusCode::BAD_REQUEST, "request_malformed", None),
+    };
+    if req.v != 1 {
+        return error_response(StatusCode::BAD_REQUEST, "version_unsupported", None);
+    }
+    if req.group_id.is_empty() || req.member_id.is_empty() || req.claw_id.is_empty() {
+        return error_response(StatusCode::BAD_REQUEST, "invite_field_empty", None);
+    }
+
+    // Read the projection once to decide whether the group must be created; the
+    // owner-PoP gate above is the SOLE authorization for this production path.
+    let ops = invite_to_claw_ops(&state.mesh_log.project(), &req);
+    for op in &ops {
+        if let Err(resp) = apply_group_op(&state, op, now).await {
+            return resp;
+        }
     }
 
     StatusCode::NO_CONTENT.into_response()
@@ -2195,6 +2315,166 @@ mod tests {
             Some("secret_not_64_hex")
         );
         assert!(dev_keypair_from_hex(&"zz".repeat(32)).is_err());
+    }
+
+    // ── Ergonomic invite-to-claw endpoint (front half) ──
+
+    #[test]
+    fn invite_to_claw_ops_creates_group_only_when_absent() {
+        use household_rs::keys::P256Keypair;
+
+        let req = InviteToClawRequest {
+            v: 1,
+            group_id: "g".into(),
+            group_name: "G".into(),
+            member_id: "g_member".into(),
+            label: "phone".into(),
+            claw_id: "claw_a".into(),
+        };
+
+        // Absent group: Create is composed first, then AddMember + GrantClaw.
+        let empty = MeshLogStore::new().project();
+        let ops = invite_to_claw_ops(&empty, &req);
+        assert_eq!(ops.len(), 3);
+        assert!(matches!(ops[0], GroupOp::Create { .. }));
+        assert!(matches!(ops[1], GroupOp::AddMember { .. }));
+        assert!(matches!(ops[2], GroupOp::GrantClaw { .. }));
+
+        // Existing group: Create is skipped (reused unchanged) — only AddMember + GrantClaw.
+        let owner = P256Keypair::generate();
+        let mesh = MeshLogStore::new();
+        log_event(
+            &mesh,
+            &owner as &dyn IdentityKey,
+            1_800_000_100,
+            MeshEvent::GroupCreated {
+                group_id: "g".into(),
+                name: "G".into(),
+            },
+        )
+        .expect("seed group");
+        let ops = invite_to_claw_ops(&mesh.project(), &req);
+        assert_eq!(ops.len(), 2);
+        assert!(matches!(ops[0], GroupOp::AddMember { .. }));
+        assert!(matches!(ops[1], GroupOp::GrantClaw { .. }));
+    }
+
+    #[test]
+    fn invite_to_claw_ops_applied_satisfy_membership_gate() {
+        use household_rs::keys::P256Keypair;
+
+        let owner = P256Keypair::generate();
+        let member = P256Keypair::from_secret_scalar(&[0x55u8; 32]).expect("member scalar");
+        let device = P256Keypair::from_secret_scalar(&[0x33u8; 32]).expect("device scalar");
+        let device_pub = device.public();
+        let binding = MemberDeviceBinding::sign(
+            &member,
+            device_pub.clone(),
+            "participant_npub_hex".into(),
+            1_800_000_000,
+        )
+        .expect("sign binding");
+        let member_id = binding.member_id.clone();
+
+        let mesh = MeshLogStore::new();
+        let now = 1_800_000_100u64;
+        let req = InviteToClawRequest {
+            v: 1,
+            group_id: "g".into(),
+            group_name: "G".into(),
+            member_id: member_id.clone(),
+            label: "phone".into(),
+            claw_id: "claw_a".into(),
+        };
+
+        // Apply the composed invite ops (Create + AddMember + GrantClaw)...
+        for op in invite_to_claw_ops(&mesh.project(), &req) {
+            let event = group_op_to_event(&op).expect("translate");
+            log_event(&mesh, &owner as &dyn IdentityKey, now, event).expect("append");
+        }
+        // ...plus the guest's own self-signed device enrolment (a separate op the
+        // invite does not — and must not — forge on the member's behalf).
+        let enroll = group_op_to_event(&GroupOp::EnrollMemberDevice { binding }).expect("enroll");
+        log_event(&mesh, &owner as &dyn IdentityKey, now, enroll).expect("append enroll");
+
+        let proj = mesh.project();
+        check_relay_stream_group_membership(&proj, "g", &member_id, "claw_a", &device_pub)
+            .expect("invite must authorize the matching member + device + claw");
+
+        // Fail-closed: the GrantClaw is load-bearing — a claw the invite did NOT
+        // grant is rejected for the same member+device.
+        assert!(
+            check_relay_stream_group_membership(&proj, "g", &member_id, "claw_other", &device_pub)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn reinvite_into_existing_group_preserves_name_and_members() {
+        use household_rs::keys::P256Keypair;
+
+        let owner = P256Keypair::generate();
+        let mesh = MeshLogStore::new();
+        let now = 1_800_000_100u64;
+
+        // First invite creates group "g" (name "Family") with member m1.
+        let first = InviteToClawRequest {
+            v: 1,
+            group_id: "g".into(),
+            group_name: "Family".into(),
+            member_id: "g_m1".into(),
+            label: "m1".into(),
+            claw_id: "claw_a".into(),
+        };
+        for op in invite_to_claw_ops(&mesh.project(), &first) {
+            log_event(
+                &mesh,
+                &owner as &dyn IdentityKey,
+                now,
+                group_op_to_event(&op).unwrap(),
+            )
+            .unwrap();
+        }
+
+        // Second invite of m2 into the SAME group carries a DIFFERENT group_name;
+        // because the group already exists, Create is not composed, so the name
+        // is never touched and m1 is preserved.
+        let second = InviteToClawRequest {
+            v: 1,
+            group_id: "g".into(),
+            group_name: "ATTACKER_RENAME".into(),
+            member_id: "g_m2".into(),
+            label: "m2".into(),
+            claw_id: "claw_a".into(),
+        };
+        let ops = invite_to_claw_ops(&mesh.project(), &second);
+        assert!(
+            !ops.iter().any(|op| matches!(op, GroupOp::Create { .. })),
+            "an existing group must never be re-created by a re-invite"
+        );
+        for op in ops {
+            log_event(
+                &mesh,
+                &owner as &dyn IdentityKey,
+                now + 1,
+                group_op_to_event(&op).unwrap(),
+            )
+            .unwrap();
+        }
+
+        let proj = mesh.project();
+        let group = proj.groups.get("g").expect("group exists");
+        assert_eq!(group.name, "Family", "re-invite must not rename the group");
+        assert_eq!(
+            group.members.get("g_m1"),
+            Some(&MeshMembership::Active),
+            "the original member must be preserved"
+        );
+        assert_eq!(
+            group.members.get("g_m2"),
+            Some(&MeshMembership::Active),
+            "the newly invited member must be added"
+        );
     }
 }
 
