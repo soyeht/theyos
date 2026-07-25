@@ -181,6 +181,43 @@ assert_exit 5 "--execute with gates but missing inputs fails closed pre-launch" 
         --bin-dir /nonexistent/bindir
 
 # ---------------------------------------------------------------------------
+# 4b. off-loopback --relay-endpoint: the public-relay ack gate runs before the
+#     bin-existence checks above, so --bin-dir stays nonexistent here too --
+#     even a bug in check ordering could not launch anything real.
+# ---------------------------------------------------------------------------
+NON_LOOPBACK_ENDPOINT="203.0.113.5:49152"
+PUBLIC_RELAY_ACK="dev-host public relay dial allowed; no production activation"
+
+assert_exit 4 "--execute with a non-loopback relay and no public-relay ack is refused pre-launch" \
+    env THEYOS_T1_DEV_DATAPATH=1 THEYOS_FORCE_SOFTWARE_KEYS=1 \
+        bash "$SCRIPT" --execute \
+        --relay-endpoint "$NON_LOOPBACK_ENDPOINT" \
+        --guest-device-pub "$VALID_PUB" \
+        --device-secret-file /nonexistent/secret.hex \
+        --bin-dir /nonexistent/bindir
+
+assert_exit 4 "--execute with a non-loopback relay and a wrong public-relay ack is refused pre-launch" \
+    env THEYOS_T1_DEV_DATAPATH=1 THEYOS_FORCE_SOFTWARE_KEYS=1 \
+        bash "$SCRIPT" --execute \
+        --relay-endpoint "$NON_LOOPBACK_ENDPOINT" \
+        --allow-public-relay-ack "not the ack" \
+        --guest-device-pub "$VALID_PUB" \
+        --device-secret-file /nonexistent/secret.hex \
+        --bin-dir /nonexistent/bindir
+
+# The correct ack clears the new gate (no exit 4) and reaches the next
+# fail-closed check in line (exit 5, missing device secret file) -- proving
+# the off-loopback path is accepted rather than silently still refused.
+assert_exit 5 "--execute with a non-loopback relay and the correct public-relay ack passes the ack gate" \
+    env THEYOS_T1_DEV_DATAPATH=1 THEYOS_FORCE_SOFTWARE_KEYS=1 \
+        bash "$SCRIPT" --execute \
+        --relay-endpoint "$NON_LOOPBACK_ENDPOINT" \
+        --allow-public-relay-ack "$PUBLIC_RELAY_ACK" \
+        --guest-device-pub "$VALID_PUB" \
+        --device-secret-file /nonexistent/secret.hex \
+        --bin-dir /nonexistent/bindir
+
+# ---------------------------------------------------------------------------
 # 5. dev-only source: no contiguous production identifier in EITHER file,
 #    across 4 families (app bundle, engine port, mac bundle id, engine label).
 #    Patterns reuse the fragment-assembled $PROD_* strings, so this check embeds

@@ -26,10 +26,15 @@
 #       --device-secret-file <path> [--platform linux|macos] \
 #       [--offer-file <path>] [--config-file <path>] \
 #       [--pool-network 198.18.0.0/24] [--relay-endpoint 127.0.0.1:49152] \
-#       [--bin-dir <dir>]
+#       [--allow-public-relay-ack <ack>] [--bin-dir <dir>]
 #
 # Real execution additionally requires these to be exported in the environment:
 #   THEYOS_T1_DEV_DATAPATH=1  THEYOS_FORCE_SOFTWARE_KEYS=1
+#
+# --allow-public-relay-ack is required, with the exact acknowledgement string,
+# whenever --relay-endpoint is not loopback (mirrors the runner's own
+# allow_public_relay_ack gate). Fail-closed: a non-loopback --relay-endpoint
+# without the exact ack refuses BEFORE the relay, claw, or runner is launched.
 #
 # Environment:
 #   THEYOS_DIR   Repo root (auto-detected from this script's location)
@@ -39,6 +44,12 @@ set -euo pipefail
 # Exact dev-host acknowledgement string required by both dev bins before any
 # datapath action. Dev reference (contains no production identifier).
 DEV_HOST_ACK="dev-host T1-T4 only; no production activation"
+
+# Exact second acknowledgement required by the claw responder and the device
+# runner only when --relay-endpoint is non-loopback (mirrors
+# admin/rust/server-rs/src/bin/t1_iptunnel_claw_dev.rs and
+# admin/rust/t1-iptunnel-dev-runner-rs/src/main.rs's DEV_PUBLIC_RELAY_ACK).
+DEV_PUBLIC_RELAY_ACK="dev-host public relay dial allowed; no production activation"
 
 # Bin names orchestrated (dev-feature-gated; built separately by the executor).
 RELAY_BIN="relay_stream_relay_dev"
@@ -122,6 +133,7 @@ OFFER_FILE="t1-iptunnel-offer.cbor"
 CONFIG_FILE="t1-device-session-config.json"
 POOL_NETWORK="198.18.0.0/24"
 RELAY_ENDPOINT="127.0.0.1:49152"
+ALLOW_PUBLIC_RELAY_ACK=""
 BIN_DIR=""
 
 THEYOS_DIR="${THEYOS_DIR:-$(cd "$(dirname "$0")/.." && pwd)}"
@@ -154,6 +166,7 @@ parse_args() {
             --config-file) require_value "$1" "$#" "${2:-}"; CONFIG_FILE="$2"; shift 2 ;;
             --pool-network) require_value "$1" "$#" "${2:-}"; POOL_NETWORK="$2"; shift 2 ;;
             --relay-endpoint) require_value "$1" "$#" "${2:-}"; RELAY_ENDPOINT="$2"; shift 2 ;;
+            --allow-public-relay-ack) require_value "$1" "$#" "${2:-}"; ALLOW_PUBLIC_RELAY_ACK="$2"; shift 2 ;;
             --bin-dir) require_value "$1" "$#" "${2:-}"; BIN_DIR="$2"; shift 2 ;;
             -h|--help) usage; exit 0 ;;
             *) die "unknown argument: $1" ;;
@@ -172,12 +185,19 @@ parse_args() {
 }
 
 print_plan() {
+    # Only rendered when set, so the default loopback plan is unchanged.
+    local relay_ack_line=""
+    if [ -n "$ALLOW_PUBLIC_RELAY_ACK" ]; then
+        relay_ack_line="$(printf ' \\\n          --allow-public-relay-ack "%s"' "$ALLOW_PUBLIC_RELAY_ACK")"
+    fi
     cat <<PLAN
 T1 dev-host datapath run - PLANNED COMMANDS (dry-run; nothing launched)
 
   Profile: dev-profile only. Relay is loopback ${RELAY_ENDPOINT}. No production.
   Mode requires --execute + THEYOS_T1_DEV_DATAPATH=1 + THEYOS_FORCE_SOFTWARE_KEYS=1
-  to actually launch anything.
+  to actually launch anything. A non-loopback --relay-endpoint additionally
+  requires --allow-public-relay-ack with the exact acknowledgement, checked
+  before any launch.
 
   [1] relay (loopback blind splicer, launched first, background):
       THEYOS_RELAY_STREAM_RELAY_ENDPOINT=${RELAY_ENDPOINT} \\
@@ -188,7 +208,7 @@ T1 dev-host datapath run - PLANNED COMMANDS (dry-run; nothing launched)
       CLAW_ID=${CLAW_ID} GUEST_DEVICE_PUB=${GUEST_DEVICE_PUB:-<REQUIRED at --execute>} \\
       RELAY_ENDPOINT=${RELAY_ENDPOINT} OFFER_OUT=${OFFER_FILE} \\
         ${BIN_DIR}/${CLAW_BIN} \\
-          --dev-host-ack "${DEV_HOST_ACK}"
+          --dev-host-ack "${DEV_HOST_ACK}"${relay_ack_line}
 
   [3] device session config (derived by the runner's real allocator):
       ${BIN_DIR}/${RUNNER_BIN} gen-device-config \\
@@ -202,8 +222,38 @@ T1 dev-host datapath run - PLANNED COMMANDS (dry-run; nothing launched)
           --offer-file ${OFFER_FILE} \\
           --config-file ${CONFIG_FILE} \\
           --device-secret-file ${DEVICE_SECRET_FILE:-<REQUIRED at --execute>} \\
-          --dev-host-ack "${DEV_HOST_ACK}"
+          --dev-host-ack "${DEV_HOST_ACK}"${relay_ack_line}
 PLAN
+}
+
+# Extract the host part of a host:port or [ipv6]:port relay endpoint string.
+# An unbracketed value with more than one colon (a malformed/ambiguous
+# unbracketed IPv6 literal) is passed through whole rather than guessed at, so
+# it can never accidentally match a loopback pattern below.
+relay_endpoint_host() {
+    case "$1" in
+        \[*\]:*)
+            local rest="${1#\[}"
+            echo "${rest%%\]:*}"
+            ;;
+        *:*:*)
+            echo "$1"
+            ;;
+        *)
+            echo "${1%:*}"
+            ;;
+    esac
+}
+
+# True only for a recognized loopback IP literal (127.0.0.0/8 or ::1), mirroring
+# the runner/claw Rust gate's IpAddr::is_loopback() check. Anything else
+# (another host, a hostname, a malformed value) is treated as non-loopback so
+# the public-relay ack is required -- fail closed, never fail open.
+relay_endpoint_is_loopback() {
+    case "$(relay_endpoint_host "$1")" in
+        127.*|::1) return 0 ;;
+        *) return 1 ;;
+    esac
 }
 
 require_execute_gates() {
@@ -216,6 +266,17 @@ require_execute_gates() {
         || die "--execute requires THEYOS_FORCE_SOFTWARE_KEYS=1 in the environment" 4
     [ -n "$DEV_HOST_ACK" ] \
         || die "--execute requires the dev-host acknowledgement" 4
+
+    # Fail closed BEFORE any launch: a non-loopback --relay-endpoint requires
+    # the exact public-relay ack. This runs ahead of the relay/claw/runner
+    # launches below, so an off-loopback endpoint without the ack never starts
+    # the loopback relay bin or the claw responder either.
+    if ! relay_endpoint_is_loopback "$RELAY_ENDPOINT"; then
+        [ -n "$ALLOW_PUBLIC_RELAY_ACK" ] \
+            || die "--relay-endpoint is non-loopback; --allow-public-relay-ack <ack> is required" 4
+        [ "$ALLOW_PUBLIC_RELAY_ACK" = "$DEV_PUBLIC_RELAY_ACK" ] \
+            || die "--allow-public-relay-ack does not match the required acknowledgement" 4
+    fi
 
     [ -n "$GUEST_DEVICE_PUB" ] || die "--execute requires --guest-device-pub <66-hex>" 5
     # A valid guest-device-pub is a 33-byte SEC1-compressed P-256 key: 66 hex
@@ -255,10 +316,15 @@ execute_run() {
 
     echo "[t1] starting serving claw (self-mints offer -> ${OFFER_FILE})"
     rm -f "$OFFER_FILE"
+    # require_execute_gates already proved: loopback (ack unused downstream) or
+    # non-loopback with ALLOW_PUBLIC_RELAY_ACK == DEV_PUBLIC_RELAY_ACK exactly.
+    # Passing it through unconditionally (even empty, on loopback) needs no
+    # branch here and matches what was already validated pre-launch.
     THEYOS_T1_DEV_DATAPATH=1 THEYOS_FORCE_SOFTWARE_KEYS=1 \
         CLAW_ID="$CLAW_ID" GUEST_DEVICE_PUB="$GUEST_DEVICE_PUB" \
         RELAY_ENDPOINT="$RELAY_ENDPOINT" OFFER_OUT="$OFFER_FILE" \
-        "$BIN_DIR/$CLAW_BIN" --dev-host-ack "$DEV_HOST_ACK" &
+        "$BIN_DIR/$CLAW_BIN" --dev-host-ack "$DEV_HOST_ACK" \
+            --allow-public-relay-ack "$ALLOW_PUBLIC_RELAY_ACK" &
     CLAW_PID="$!"
 
     echo "[t1] waiting for the claw to write ${OFFER_FILE}"
@@ -286,7 +352,8 @@ execute_run() {
             --offer-file "$OFFER_FILE" \
             --config-file "$CONFIG_FILE" \
             --device-secret-file "$DEVICE_SECRET_FILE" \
-            --dev-host-ack "$DEV_HOST_ACK"
+            --dev-host-ack "$DEV_HOST_ACK" \
+            --allow-public-relay-ack "$ALLOW_PUBLIC_RELAY_ACK"
 }
 
 main() {

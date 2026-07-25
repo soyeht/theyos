@@ -142,12 +142,35 @@ scripts/run-t1-dev-datapath.sh --execute \
 ```
 
 `--execute` is refused (non-zero) unless both envs and the exact dev-host ack are
-present, and the `prod_guard` passes. This runbook covers the **loopback** relay
-path only (`127.0.0.1:49152`). An off-loopback dev relay (e.g. a
-Tailscale-transport checkpoint) needs the runner's second public-relay ack, which
-the Item C script does not yet expose or gate before launch; that variant is
-deferred — see
-[`followup-t1-orchestration-off-loopback-relay-ack.md`](followup-t1-orchestration-off-loopback-relay-ack.md).
+present, and the `prod_guard` passes. The default and primary path is the
+**loopback** relay (`127.0.0.1:49152`), shown above.
+
+#### Off-loopback relay checkpoint (optional, e.g. a Tailscale-transport relay)
+
+A non-loopback `--relay-endpoint` additionally requires `--allow-public-relay-ack`
+with the exact second acknowledgement, on both the Step 2 dry-run and the Step 3
+`--execute` run:
+
+```sh
+scripts/run-t1-dev-datapath.sh --execute \
+  --bin-dir admin/rust/target/debug \
+  --claw-id <claw-id> --guest-device-pub <66-hex> \
+  --device-secret-file /path/to/private/device-secret.hex \
+  --config-file /path/to/private/device-session.json \
+  --relay-endpoint <non-loopback-host>:<port> \
+  --allow-public-relay-ack "dev-host public relay dial allowed; no production activation"
+```
+
+The script fails closed **before any launch** (relay, claw, or runner) when
+`--relay-endpoint` is non-loopback and this ack is missing or does not match
+exactly. When present and correct, it is threaded to both the claw responder
+and the device runner, which each independently re-check the same
+non-loopback/ack condition
+(`validate_loopback_relay_endpoint_or_ack` in
+`t1-iptunnel-dev-runner-rs/src/main.rs`, the mirrored check in
+`server-rs/src/bin/t1_iptunnel_claw_dev.rs`) before dialing. See
+[`followup-t1-orchestration-off-loopback-relay-ack.md`](followup-t1-orchestration-off-loopback-relay-ack.md)
+for the history of this gap and its fix.
 
 ## T1–T4 observation checklist (what to capture)
 
