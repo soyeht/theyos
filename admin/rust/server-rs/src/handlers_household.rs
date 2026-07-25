@@ -10,6 +10,7 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use base64::{Engine as _, engine::general_purpose::STANDARD as B64};
+use rand::{RngCore, rngs::OsRng};
 use serde::Serialize;
 use std::path::{Path, PathBuf};
 
@@ -124,9 +125,9 @@ struct MachineEntry {
     joined_at: u64,
 }
 
-/// Timeout for the on-demand `/healthz` liveness probe used by
+/// Timeout for the on-demand challenge/echo reachability probe used by
 /// [`machines`] to fill in `MachineEntry::online` for non-self members.
-const HEALTHZ_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(1500);
+const REACHABILITY_ECHO_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(1500);
 
 /// Rejects loopback/unspecified/link-local literals as probe targets. The
 /// sidecar address comes from a peer's own self-announced `JoinRequest.addr`
@@ -151,11 +152,15 @@ fn is_safe_probe_host(host: &str) -> bool {
 
 /// Best-effort liveness probe for a non-self household member. Looks up the
 /// last-known address from the ceremony-populated, non-authoritative
-/// sidecar cache (`household_rs::storage::read_known_peer_addr`) and probes
-/// its unauthenticated `/healthz`. Every failure mode — unknown address,
-/// unsafe target, timeout, connection error, non-2xx — collapses to `false`:
-/// this is a demo-grade presence signal probed synchronously per request,
-/// not a hardened availability guarantee.
+/// sidecar cache (`household_rs::storage::read_known_peer_addr`), sends a
+/// fresh random challenge to the unauthenticated diagnostic echo endpoint,
+/// and requires the exact bytes back. Every failure mode — unknown address,
+/// unsafe target, random-source failure, timeout, connection error, wrong
+/// status/content type/length/body — collapses to `false`.
+///
+/// This proves only byte reachability. It is not machine identity,
+/// membership, or verified-Mesh authority and must never produce a
+/// `LocalAddressOwnership::VerifiedMesh` fact.
 async fn probe_online(client: &reqwest::Client, state_dir: &Path, m_id: &str) -> bool {
     let Ok(Some(addr)) = household_rs::storage::read_known_peer_addr(state_dir, m_id) else {
         return false;
@@ -169,18 +174,47 @@ async fn probe_online(client: &reqwest::Client, state_dir: &Path, m_id: &str) ->
     if !is_safe_probe_host(host) {
         return false;
     }
-    probe_healthz(client, &addr).await
+    let mut challenge = [0_u8; crate::handlers_bootstrap::REACHABILITY_ECHO_BYTES];
+    if OsRng.try_fill_bytes(&mut challenge).is_err() {
+        return false;
+    }
+    probe_reachability_echo(client, &addr, &challenge).await
 }
 
-/// GET `addr`'s `/healthz` and report whether it answered 2xx within
-/// [`HEALTHZ_PROBE_TIMEOUT`]. Separated from [`probe_online`] so the address
-/// safety gate and the HTTP mechanics can each be tested at their own level.
-async fn probe_healthz(client: &reqwest::Client, addr: &str) -> bool {
-    let url = format!("http://{addr}/healthz");
-    matches!(
-        client.get(&url).timeout(HEALTHZ_PROBE_TIMEOUT).send().await,
-        Ok(resp) if resp.status().is_success()
-    )
+/// POST a fixed-size challenge to `addr` and require the exact echo. Separated
+/// from [`probe_online`] so the address safety gate and HTTP mechanics can be
+/// tested independently.
+async fn probe_reachability_echo(
+    client: &reqwest::Client,
+    addr: &str,
+    challenge: &[u8; crate::handlers_bootstrap::REACHABILITY_ECHO_BYTES],
+) -> bool {
+    let url = format!(
+        "http://{addr}{}",
+        crate::handlers_bootstrap::REACHABILITY_ECHO_PATH
+    );
+    let Ok(response) = client
+        .post(&url)
+        .timeout(REACHABILITY_ECHO_TIMEOUT)
+        .header(reqwest::header::CONTENT_TYPE, "application/octet-stream")
+        .body(challenge.to_vec())
+        .send()
+        .await
+    else {
+        return false;
+    };
+    if response.status() != reqwest::StatusCode::OK
+        || response.content_length()
+            != Some(crate::handlers_bootstrap::REACHABILITY_ECHO_BYTES as u64)
+        || response
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            != Some("application/octet-stream")
+    {
+        return false;
+    }
+    matches!(response.bytes().await, Ok(body) if body.as_ref() == challenge)
 }
 
 #[derive(Serialize)]
@@ -253,7 +287,12 @@ pub async fn machines(
 
     let certs_dir = household_rs::storage::machine_certs_dir(&state.state_dir);
     let mut machines: Vec<MachineEntry> = Vec::new();
-    let http_client = reqwest::Client::new();
+    let Ok(http_client) = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+    else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
     if let Ok(entries) = std::fs::read_dir(&certs_dir) {
         for entry in entries.flatten() {
             let path = entry.path();
@@ -333,7 +372,12 @@ pub async fn machines(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use axum::{Router, body::Body, http::Request, routing::get};
+    use axum::{
+        Router,
+        body::Body,
+        http::Request,
+        routing::{get, post},
+    };
     use household_rs::{BootstrapOpts, KeyBackingPolicy, bootstrap_or_load};
     use std::sync::Arc;
     use tempfile::tempdir;
@@ -459,21 +503,23 @@ mod tests {
     // existing preference for testing the narrowest unit that carries the
     // behavior (see the `snapshot` 401-reason tests above).
 
-    /// Accepts exactly one TCP connection and replies with a bare
-    /// `200 OK`. The task is detached (not awaited) — it exits on its own
-    /// once the single expected probe request lands.
-    async fn spawn_ok_http_server() -> std::net::SocketAddr {
+    /// Spawn the narrow HTTP mechanic used by the production diagnostic
+    /// responder. `tamper=true` changes one byte so the probe must fail.
+    async fn spawn_echo_http_server(tamper: bool) -> std::net::SocketAddr {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
+        let app = Router::new().route(
+            crate::handlers_bootstrap::REACHABILITY_ECHO_PATH,
+            post(move |body: Bytes| async move {
+                let mut echoed = body.to_vec();
+                if tamper && !echoed.is_empty() {
+                    echoed[0] ^= 0xff;
+                }
+                ([(header::CONTENT_TYPE, "application/octet-stream")], echoed)
+            }),
+        );
         tokio::spawn(async move {
-            if let Ok((mut socket, _)) = listener.accept().await {
-                use tokio::io::{AsyncReadExt, AsyncWriteExt};
-                let mut buf = [0u8; 1024];
-                let _ = socket.read(&mut buf).await;
-                let _ = socket
-                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
-                    .await;
-            }
+            let _ = core_rs::phase0_axum_serve!(listener, app).await;
         });
         addr
     }
@@ -486,14 +532,16 @@ mod tests {
     }
 
     // `probe_online` itself rejects loopback (see `probe_online_false_*_gate`
-    // tests below), so the "a real server answers" case is exercised at the
-    // `probe_healthz` level — the HTTP-GET-and-check-status mechanic is what
-    // this test verifies, not the address safety gate.
+    // tests below), so the real HTTP mechanics are exercised directly.
     #[tokio::test]
-    async fn probe_healthz_true_when_server_responds() {
-        let addr = spawn_ok_http_server().await;
+    async fn reachability_probe_requires_the_exact_echo() {
+        let addr = spawn_echo_http_server(false).await;
         let client = reqwest::Client::new();
-        assert!(probe_healthz(&client, &addr.to_string()).await);
+        let challenge = [0x5a; crate::handlers_bootstrap::REACHABILITY_ECHO_BYTES];
+        assert!(probe_reachability_echo(&client, &addr.to_string(), &challenge).await);
+
+        let addr = spawn_echo_http_server(true).await;
+        assert!(!probe_reachability_echo(&client, &addr.to_string(), &challenge).await);
     }
 
     #[test]
@@ -517,7 +565,7 @@ mod tests {
     #[tokio::test]
     async fn probe_online_false_when_sidecar_address_is_loopback() {
         let td = tempdir().unwrap();
-        let addr = spawn_ok_http_server().await;
+        let addr = spawn_echo_http_server(false).await;
         // Same server a real probe would reach — but stored under a loopback
         // literal, which the safety gate must reject before ever dialing it.
         household_rs::storage::write_known_peer_addr(td.path(), "m_peer", &addr.to_string())

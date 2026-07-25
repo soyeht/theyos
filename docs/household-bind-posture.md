@@ -61,6 +61,7 @@ Route and boundary summary:
 | Route family | Boundary |
 | --- | --- |
 | `GET /bootstrap/status`, `GET /health`, `GET /healthz` | No auth by contract; status/liveness only, reachable according to bind posture. |
+| `POST /api/v1/household/reachability/echo` | Ready-only fixed-size diagnostic on loopback/Tailnet; proves byte reachability only and never creates identity, membership, or `VerifiedMesh` authority. |
 | `/bootstrap/*` onboarding routes | No admin session; ceremony-specific state, token, invitation, or local gates. |
 | `POST /bootstrap/pair-machine/local/stage` | Loopback-only and only accepted while uninitialized or ready for naming. |
 | `/pair-machine/local/*` | Pre-household candidate routes; gated by the candidate ceremony state. |

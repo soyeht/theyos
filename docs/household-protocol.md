@@ -853,7 +853,7 @@ Engine sends Apple Push Notifications direct to APNs gateway from the engine pro
 
 ## 16b. Bootstrap endpoints (spec 005-soyeht-onboarding, added 2026-05-10)
 
-The household identity listener runs on port **8091** (configurable via `services.theyos.householdPort` in the NixOS module). All endpoints use CBOR bodies (`Content-Type: application/cbor`).
+The household identity listener runs on port **8091** (configurable via `services.theyos.householdPort` in the NixOS module). Control endpoints use CBOR bodies (`Content-Type: application/cbor`); the diagnostic echo is the explicitly documented octet-stream exception.
 
 ### Bootstrap endpoints table
 
@@ -864,6 +864,7 @@ The household identity listener runs on port **8091** (configurable via `service
 | `POST /bootstrap/teardown` | `contracts/bootstrap-teardown.md` | named_awaiting_pair, ready, recovering | owner cert ECDSA (P-256) |
 | `POST /bootstrap/claim-setup-invitation` | `contracts/setup-invitation.md` | uninitialized | Tailnet IP (100.64.0.0/10 or fc00::/7) |
 | `GET /pair-machine/anchor-handoff` | `contracts/anchor-handoff.md` | ready | Tailnet IP |
+| `POST /api/v1/household/reachability/echo` | fixed 32-byte octet-stream echo; reachability diagnostic only, never identity or `VerifiedMesh` authority | ready | loopback or Tailnet source |
 | `GET /health` | — | any | none |
 
 ### Bonjour setup service (`_soyeht-setup._tcp.`)

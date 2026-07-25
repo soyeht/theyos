@@ -279,6 +279,8 @@ fn ready_posture_doc_matches_plain_http_listener_contract() {
         "Wildcard binds remain prohibited",
         "operator-network boundary",
         "`GET /bootstrap/status`, `GET /health`, `GET /healthz`",
+        "`POST /api/v1/household/reachability/echo`",
+        "proves byte reachability only",
         "No auth by contract",
         "Soyeht-PoP plus the declared `Operation::Claws*` caveat",
         "single-use header token",
@@ -308,6 +310,39 @@ fn ready_posture_doc_matches_plain_http_listener_contract() {
         router_body.contains(".route(\"/bootstrap/status\", get(get_bootstrap_status))"),
         "bootstrap status route must stay explicit in bootstrap_router"
     );
+    assert!(
+        router_body.contains("REACHABILITY_ECHO_PATH")
+            && router_body.contains("post(post_reachability_echo)")
+            && router_body.contains("DefaultBodyLimit::max(REACHABILITY_ECHO_BYTES)"),
+        "diagnostic echo must remain explicit, fixed-size, and independently routed"
+    );
+    let household = read_src("handlers_household.rs");
+    for (file, source) in [
+        ("handlers_bootstrap.rs", bootstrap.as_str()),
+        ("handlers_household.rs", household.as_str()),
+    ] {
+        assert!(
+            source.contains("core_rs::phase0_axum_serve!")
+                && !source.contains("axum::serve("),
+            "{file} test listeners must not bypass the Phase 0 HTTP serve choke-point"
+        );
+    }
+    let echo_contract = slice_between(
+        &bootstrap,
+        "/// `POST /api/v1/household/reachability/echo`",
+        "pub async fn post_reachability_echo",
+    );
+    for required in [
+        "proves only that bytes made a round trip",
+        "never evidence of machine identity",
+        "MUST NOT create a",
+        "`LocalAddressOwnership::VerifiedMesh` fact",
+    ] {
+        assert!(
+            echo_contract.contains(required),
+            "diagnostic echo contract must retain `{required}`"
+        );
+    }
     let status_contract = slice_between(
         &bootstrap,
         "/// `GET /bootstrap/status`",

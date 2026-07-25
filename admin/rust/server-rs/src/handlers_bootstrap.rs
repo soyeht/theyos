@@ -9,6 +9,7 @@
 //! - `POST /bootstrap/initialize`             — mint the casa identity (T025, FR-003)
 //! - `POST /bootstrap/claim-setup-invitation` — iPhone-first scenario B claim (T053, FR-005)
 //! - `GET  /health`                           — liveness probe (T010)
+//! - `POST /api/v1/household/reachability/echo` — Ready-only diagnostic echo
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -18,7 +19,7 @@ use std::time::Instant;
 use axum::{
     Json, Router,
     body::Bytes,
-    extract::{ConnectInfo, State},
+    extract::{ConnectInfo, DefaultBodyLimit, State},
     http::{HeaderMap, HeaderValue, StatusCode, header},
     response::{IntoResponse, Response},
     routing::{get, post},
@@ -46,6 +47,12 @@ use tokio::time::Duration;
 use tracing::info;
 
 use crate::household_state::{HouseholdState, SharedHouseholdIdentity};
+
+/// Diagnostic reachability endpoint shared by the daemon and its peer probe.
+pub const REACHABILITY_ECHO_PATH: &str = "/api/v1/household/reachability/echo";
+/// Fixed challenge size keeps the endpoint non-amplifying and bounds every
+/// request and response independently of the caller.
+pub const REACHABILITY_ECHO_BYTES: usize = 32;
 
 // ── Shared state ──────────────────────────────────────────────────────────────
 
@@ -141,6 +148,10 @@ pub fn bootstrap_router(state: BootstrapHandlerState) -> Router {
         )
         .route("/health", get(get_health))
         .route("/healthz", get(get_health))
+        .route(
+            REACHABILITY_ECHO_PATH,
+            post(post_reachability_echo).layer(DefaultBodyLimit::max(REACHABILITY_ECHO_BYTES)),
+        )
         .with_state(state)
 }
 
@@ -489,6 +500,40 @@ pub async fn get_health(_: State<BootstrapHandlerState>) -> impl IntoResponse {
         platform: current_platform(),
     };
     (StatusCode::OK, Json(body))
+}
+
+/// `POST /api/v1/household/reachability/echo` — diagnostic round-trip probe.
+///
+/// This endpoint proves only that bytes made a round trip to a Ready engine
+/// over loopback or a current Tailnet address. It is deliberately
+/// unauthenticated, fixed-size, non-amplifying, and returns no identity data.
+/// A successful echo is never evidence of machine identity, household
+/// membership, or verified-Mesh ownership and MUST NOT create a
+/// `LocalAddressOwnership::VerifiedMesh` fact.
+pub async fn post_reachability_echo(
+    State(state): State<BootstrapHandlerState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    body: Bytes,
+) -> Response {
+    if *state.bootstrap.read().await != BootstrapState::Ready {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    }
+    if !(peer.ip().is_loopback() || crate::tailnet_address::is_tailnet_ip(peer.ip())) {
+        return StatusCode::FORBIDDEN.into_response();
+    }
+    if body.len() != REACHABILITY_ECHO_BYTES {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
+
+    let mut response = (StatusCode::OK, body).into_response();
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/octet-stream"),
+    );
+    response
+        .headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    response
 }
 
 /// `POST /bootstrap/claim-setup-invitation` — iPhone-first scenario B claim (T053).
@@ -2352,6 +2397,122 @@ mod tests {
         let (status, body) = json_get(app, "/health").await;
         assert_eq!(status, HStatus::OK);
         assert_eq!(body["status"], "ok");
+    }
+
+    fn echo_request(body: Vec<u8>, peer: SocketAddr) -> Request<Body> {
+        let mut request = Request::builder()
+            .method("POST")
+            .uri(REACHABILITY_ECHO_PATH)
+            .body(Body::from(body))
+            .unwrap();
+        request.extensions_mut().insert(ConnectInfo(peer));
+        request
+    }
+
+    #[tokio::test]
+    async fn reachability_echo_is_ready_only_tailnet_or_loopback_and_fixed_size() {
+        let challenge = vec![0x5a; REACHABILITY_ECHO_BYTES];
+        let loopback = SocketAddr::from(([127, 0, 0, 1], 41001));
+        let tailnet = SocketAddr::from(([100, 64, 0, 10], 41002));
+        let lan = SocketAddr::from(([192, 0, 2, 10], 41003));
+
+        let response = bootstrap_router(make_state(BootstrapState::Ready))
+            .oneshot(echo_request(challenge.clone(), loopback))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), HStatus::OK);
+        assert_eq!(
+            response.headers().get(header::CONTENT_TYPE).unwrap(),
+            "application/octet-stream"
+        );
+        assert_eq!(
+            axum::body::to_bytes(response.into_body(), REACHABILITY_ECHO_BYTES)
+                .await
+                .unwrap(),
+            challenge
+        );
+
+        let response = bootstrap_router(make_state(BootstrapState::Ready))
+            .oneshot(echo_request(challenge.clone(), tailnet))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), HStatus::OK);
+
+        let response = bootstrap_router(make_state(BootstrapState::Ready))
+            .oneshot(echo_request(challenge.clone(), lan))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), HStatus::FORBIDDEN);
+
+        let response = bootstrap_router(make_state(BootstrapState::Recovering))
+            .oneshot(echo_request(challenge.clone(), loopback))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), HStatus::SERVICE_UNAVAILABLE);
+
+        let response = bootstrap_router(make_state(BootstrapState::Ready))
+            .oneshot(echo_request(
+                vec![0x5a; REACHABILITY_ECHO_BYTES - 1],
+                loopback,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), HStatus::BAD_REQUEST);
+
+        let response = bootstrap_router(make_state(BootstrapState::Ready))
+            .oneshot(echo_request(
+                vec![0x5a; REACHABILITY_ECHO_BYTES + 1],
+                loopback,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), HStatus::PAYLOAD_TOO_LARGE);
+    }
+
+    async fn spawn_ready_echo_server() -> (SocketAddr, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            core_rs::phase0_axum_serve!(
+                listener,
+                bootstrap_router(make_state(BootstrapState::Ready)),
+                connect_info = SocketAddr
+            )
+            .await
+            .unwrap();
+        });
+        (address, server)
+    }
+
+    #[tokio::test]
+    async fn reachability_echo_round_trips_over_two_real_ready_listeners() {
+        let (machine_a, server_a) = spawn_ready_echo_server().await;
+        let (machine_b, server_b) = spawn_ready_echo_server().await;
+
+        for (destination, fill) in [(machine_b, 0xa1), (machine_a, 0xb2)] {
+            let challenge = vec![fill; REACHABILITY_ECHO_BYTES];
+            let response = reqwest::Client::new()
+                .post(format!("http://{destination}{REACHABILITY_ECHO_PATH}"))
+                .body(challenge.clone())
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                reqwest::StatusCode::OK,
+                "destination={destination}"
+            );
+            assert_eq!(
+                response.bytes().await.unwrap(),
+                challenge,
+                "destination={destination}"
+            );
+        }
+
+        server_a.abort();
+        server_b.abort();
     }
 
     #[tokio::test]
