@@ -1666,6 +1666,29 @@ fn invite_to_claw_ops(projection: &ProjectedState, req: &InviteToClawRequest) ->
     ops
 }
 
+/// Returns the id of an already-Active-granted claw OTHER than `req.claw_id`
+/// when `req.group_id` names an existing group, or `None` when the group is
+/// absent or every Active grant on it is `req.claw_id` itself.
+///
+/// `invite_to_claw` promises "this guest gets exactly one claw" — unlike the
+/// general `/group-op` API, which lets an owner deliberately build multi-claw
+/// groups. A `Some` result means honoring this request would silently widen
+/// the guest's access to a claw the request never named.
+fn invite_to_claw_scope_conflict(
+    projection: &ProjectedState,
+    req: &InviteToClawRequest,
+) -> Option<String> {
+    projection.groups.get(&req.group_id).and_then(|group| {
+        group
+            .granted_claws
+            .iter()
+            .find(|(claw_id, status)| {
+                matches!(status, MeshMembership::Active) && claw_id.as_str() != req.claw_id
+            })
+            .map(|(claw_id, _)| claw_id.clone())
+    })
+}
+
 /// `POST /api/v1/claw-share/invite-to-claw` — OWNER-authed. Atomically invites a
 /// guest to one claw by appending the owner-signed events the dial-time gate
 /// (`check_relay_stream_group_membership`) already enforces per request:
@@ -1722,7 +1745,17 @@ async fn handle_invite_to_claw(
 
     // Read the projection once to decide whether the group must be created; the
     // owner-PoP gate above is the SOLE authorization for this production path.
-    let ops = invite_to_claw_ops(&state.mesh_log.project(), &req);
+    let projection = state.mesh_log.project();
+    if let Some(other_claw_id) = invite_to_claw_scope_conflict(&projection, &req) {
+        return error_response(
+            StatusCode::CONFLICT,
+            "group_scopes_other_claws",
+            Some(&format!(
+                "group_id already grants claw {other_claw_id}; invite_to_claw only extends a group scoped to exactly the requested claw"
+            )),
+        );
+    }
+    let ops = invite_to_claw_ops(&projection, &req);
     for op in &ops {
         if let Err(resp) = apply_group_op(&state, op, now).await {
             return resp;
@@ -2475,6 +2508,116 @@ mod tests {
             Some(&MeshMembership::Active),
             "the newly invited member must be added"
         );
+    }
+
+    #[test]
+    fn scope_conflict_none_when_group_absent() {
+        let req = InviteToClawRequest {
+            v: 1,
+            group_id: "g".into(),
+            group_name: "G".into(),
+            member_id: "g_m1".into(),
+            label: "m1".into(),
+            claw_id: "claw_a".into(),
+        };
+        assert_eq!(
+            invite_to_claw_scope_conflict(&ProjectedState::default(), &req),
+            None
+        );
+    }
+
+    #[test]
+    fn scope_conflict_none_when_group_only_grants_requested_claw() {
+        use household_rs::household_mesh_log::ProjectedGroup;
+
+        let mut projection = ProjectedState::default();
+        projection.groups.insert(
+            "g".to_string(),
+            ProjectedGroup {
+                group_id: "g".to_string(),
+                name: "G".to_string(),
+                members: Default::default(),
+                member_labels: Default::default(),
+                granted_claws: [("claw_a".to_string(), MeshMembership::Active)]
+                    .into_iter()
+                    .collect(),
+                revision: 1,
+            },
+        );
+        let req = InviteToClawRequest {
+            v: 1,
+            group_id: "g".into(),
+            group_name: "G".into(),
+            member_id: "g_m2".into(),
+            label: "m2".into(),
+            claw_id: "claw_a".into(),
+        };
+        // Idempotent re-invite / a second member into the same single-claw
+        // group must still be allowed.
+        assert_eq!(invite_to_claw_scope_conflict(&projection, &req), None);
+    }
+
+    #[test]
+    fn scope_conflict_rejects_group_already_granting_a_different_claw() {
+        use household_rs::household_mesh_log::ProjectedGroup;
+
+        let mut projection = ProjectedState::default();
+        projection.groups.insert(
+            "g".to_string(),
+            ProjectedGroup {
+                group_id: "g".to_string(),
+                name: "G".to_string(),
+                members: Default::default(),
+                member_labels: Default::default(),
+                granted_claws: [("claw_a".to_string(), MeshMembership::Active)]
+                    .into_iter()
+                    .collect(),
+                revision: 1,
+            },
+        );
+        let req = InviteToClawRequest {
+            v: 1,
+            group_id: "g".into(),
+            group_name: "G".into(),
+            member_id: "g_m2".into(),
+            label: "m2".into(),
+            claw_id: "claw_b".into(),
+        };
+        assert_eq!(
+            invite_to_claw_scope_conflict(&projection, &req),
+            Some("claw_a".to_string())
+        );
+    }
+
+    #[test]
+    fn scope_conflict_ignores_revoked_grants() {
+        use household_rs::household_mesh_log::ProjectedGroup;
+
+        let mut projection = ProjectedState::default();
+        projection.groups.insert(
+            "g".to_string(),
+            ProjectedGroup {
+                group_id: "g".to_string(),
+                name: "G".to_string(),
+                members: Default::default(),
+                member_labels: Default::default(),
+                granted_claws: [("claw_a".to_string(), MeshMembership::Removed)]
+                    .into_iter()
+                    .collect(),
+                revision: 1,
+            },
+        );
+        let req = InviteToClawRequest {
+            v: 1,
+            group_id: "g".into(),
+            group_name: "G".into(),
+            member_id: "g_m2".into(),
+            label: "m2".into(),
+            claw_id: "claw_b".into(),
+        };
+        // claw_a's grant was revoked, so it no longer counts as "another claw"
+        // this group is scoped to.
+        assert_eq!(invite_to_claw_scope_conflict(&projection, &req), None);
     }
 }
 
