@@ -1043,6 +1043,16 @@ impl FinalizeAck {
     }
 }
 
+/// Optional response header on M2's `local/finalize` response carrying the
+/// candidate's current Tailnet address.
+///
+/// This stays outside [`FinalizeAck`] so the deterministic 2PC body remains
+/// byte-compatible with older peers. The value is an unsigned,
+/// non-authoritative reachability hint: callers must validate it before
+/// placing it in a liveness cache, and must never use it as identity or
+/// membership authority.
+pub const FINALIZE_CANDIDATE_TAILSCALE_ADDR_HEADER: &str = "x-soyeht-candidate-tailscale-addr";
+
 /// Wire body submitted by the owner iPhone to approve a pending join event.
 #[derive(Clone, Serialize, Deserialize, PartialEq, Eq, Debug)]
 #[serde(deny_unknown_fields)]
@@ -1128,6 +1138,12 @@ pub struct FinalizeWithM2Outcome {
     pub ack: FinalizeAck,
     pub join_response: JoinResponse,
     pub join_response_bytes: Vec<u8>,
+    /// Unsigned, optional reachability hint read from
+    /// [`FINALIZE_CANDIDATE_TAILSCALE_ADDR_HEADER`].
+    ///
+    /// This is surfaced only after the deterministic [`FinalizeAck`] body has
+    /// passed its version, machine-id, and cert-hash checks.
+    pub candidate_tailscale_addr: Option<String>,
 }
 
 pub fn machine_cert_hash(cert: &MachineCert) -> Result<[u8; 32], HouseholdError> {
@@ -1394,6 +1410,9 @@ impl CeremonyTxn {
                     CeremonyError::Http(format!("POST {url}: {other}"))
                 }
             })?;
+        let candidate_tailscale_addr = response
+            .header(FINALIZE_CANDIDATE_TAILSCALE_ADDR_HEADER)
+            .map(str::to_owned);
         let mut ack_bytes = Vec::new();
         response
             .into_reader()
@@ -1424,6 +1443,7 @@ impl CeremonyTxn {
             ack,
             join_response,
             join_response_bytes,
+            candidate_tailscale_addr,
         })
     }
 

@@ -6162,6 +6162,40 @@ pub async fn owner_approve_handler(
         }
     };
     let candidate_cert = txn.candidate_cert().clone();
+    // M2 may return its current Tailnet address as an optional HTTP header.
+    // It is deliberately outside the deterministic FinalizeAck body and is
+    // never identity authority. Accept only a CGNAT IPv4 at the same port M2
+    // signed into its JoinRequest, then cache it as the same best-effort
+    // liveness hint used by the machines endpoint. Persist before the local
+    // destructive commit so an M1 crash after the verified M2 ack can still
+    // recover with the fresher post-Ready location; a stale cache entry alone
+    // cannot create membership or make a machine appear in the list.
+    match validated_candidate_tailnet_addr(
+        finalize.candidate_tailscale_addr.as_deref(),
+        &window_data.join_request.addr,
+    ) {
+        Some(addr) => {
+            if let Err(e) = household_rs::storage::write_known_peer_addr(
+                &state.state_dir,
+                candidate_cert.m_id.as_str(),
+                &addr,
+            ) {
+                tracing::warn!(
+                    stage = "owner_events.approve.candidate_tailnet_hint_persist_failed",
+                    candidate_m_id = %candidate_cert.m_id,
+                    error = %e,
+                );
+            }
+        }
+        None if finalize.candidate_tailscale_addr.is_some() => {
+            tracing::warn!(
+                stage = "owner_events.approve.candidate_tailnet_hint_ignored",
+                candidate_m_id = %candidate_cert.m_id,
+                reason = "not_tailnet_ipv4_or_port_mismatch",
+            );
+        }
+        None => {}
+    }
     // T064: failure-injection crash point — fires immediately after
     // `finalize_with_m2` returns Ok and BEFORE `commit_preserve_on_error`
     // promotes the staged set. A registered Panic models "M1 crash
@@ -6759,6 +6793,20 @@ fn build_founder_tailnet_addr(port: u16, resolver: TailnetResolver) -> Option<St
     resolver().map(|ip| format!("{ip}:{port}"))
 }
 
+fn validated_candidate_tailnet_addr(hint: Option<&str>, signed_join_addr: &str) -> Option<String> {
+    let hinted: std::net::SocketAddr = hint?.parse().ok()?;
+    let signed_join: std::net::SocketAddr = signed_join_addr.parse().ok()?;
+    let std::net::SocketAddr::V4(hinted_v4) = hinted else {
+        return None;
+    };
+    if hinted_v4.port() != signed_join.port()
+        || !crate::tailnet_address::is_tailnet_ipv4(*hinted_v4.ip())
+    {
+        return None;
+    }
+    Some(hinted.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -6780,6 +6828,26 @@ mod tests {
 
     fn owner_person_id() -> PersonId {
         PersonId("p_owner-alpha".to_string())
+    }
+
+    #[test]
+    fn candidate_tailnet_hint_requires_cgnat_and_signed_join_port() {
+        assert_eq!(
+            validated_candidate_tailnet_addr(Some("100.64.0.10:8091"), "192.0.2.10:8091"),
+            Some("100.64.0.10:8091".to_string())
+        );
+        assert_eq!(
+            validated_candidate_tailnet_addr(Some("100.64.0.10:9091"), "192.0.2.10:8091"),
+            None
+        );
+        assert_eq!(
+            validated_candidate_tailnet_addr(Some("192.0.2.20:8091"), "192.0.2.10:8091"),
+            None
+        );
+        assert_eq!(
+            validated_candidate_tailnet_addr(None, "192.0.2.10:8091"),
+            None
+        );
     }
 
     #[test]

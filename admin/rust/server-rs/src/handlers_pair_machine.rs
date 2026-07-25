@@ -27,9 +27,9 @@ use household_rs::owner_events::{
     owner_push_token_path,
 };
 use household_rs::pair_machine::{
-    FinalizeAck, JoinRequest, JoinResponse, PairMachineState, PairMachineWindow,
-    PairMachineWindowSnapshot, join_request_hash, pair_machine_window_path, shamir_self_shard_path,
-    verify_join_request,
+    FINALIZE_CANDIDATE_TAILSCALE_ADDR_HEADER, FinalizeAck, JoinRequest, JoinResponse,
+    PairMachineState, PairMachineWindow, PairMachineWindowSnapshot, join_request_hash,
+    pair_machine_window_path, shamir_self_shard_path, verify_join_request,
 };
 use serde::Serialize;
 use serde_bytes::ByteBuf;
@@ -38,6 +38,7 @@ use crate::bonjour_trust::{DiscoverySource, classify_source};
 use crate::handlers_owner_events;
 use crate::household_auth;
 use crate::household_state::HouseholdState;
+use crate::tailnet_address::{TailnetResolver, current_tailnet_ipv4};
 use crate::time_util;
 
 /// Application content type for every Phase 3 join-request response —
@@ -1086,10 +1087,30 @@ pub async fn local_finalize_handler(
 }
 
 fn finalize_ack_response(cert: &household_rs::MachineCert) -> Response {
+    finalize_ack_response_with_resolver(cert, current_tailnet_ipv4)
+}
+
+fn finalize_ack_response_with_resolver(
+    cert: &household_rs::MachineCert,
+    resolver: TailnetResolver,
+) -> Response {
     let bytes = FinalizeAck::for_machine_cert(cert)
         .and_then(|ack| ack.to_canonical_bytes())
         .unwrap_or_default();
-    cbor_response(StatusCode::OK, bytes)
+    let mut response = cbor_response(StatusCode::OK, bytes);
+    let port = crate::household_bootstrap::household_port_from_env();
+    if let Some(addr) = candidate_tailnet_addr(port, resolver)
+        && let Ok(value) = HeaderValue::from_str(&addr)
+    {
+        response
+            .headers_mut()
+            .insert(FINALIZE_CANDIDATE_TAILSCALE_ADDR_HEADER, value);
+    }
+    response
+}
+
+fn candidate_tailnet_addr(port: u16, resolver: TailnetResolver) -> Option<String> {
+    resolver().map(|ip| format!("{ip}:{port}"))
 }
 
 fn verified_founder_cert_from_peer_list(
@@ -1534,4 +1555,68 @@ fn within_replay_grace(snap: &PairMachineWindowSnapshot, now: u64) -> bool {
     // Grace = TTL + 60 s per R7 / T045.
     let grace_deadline = expiry.saturating_add(60);
     now <= grace_deadline
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::body::to_bytes;
+    use std::net::Ipv4Addr;
+
+    #[test]
+    fn candidate_tailnet_addr_uses_local_resolver_and_household_port() {
+        #[allow(clippy::unnecessary_wraps)]
+        fn tailnet_addr() -> Option<Ipv4Addr> {
+            Some(Ipv4Addr::new(100, 64, 0, 10))
+        }
+
+        assert_eq!(
+            candidate_tailnet_addr(8091, tailnet_addr),
+            Some("100.64.0.10:8091".to_string())
+        );
+    }
+
+    #[test]
+    fn candidate_tailnet_addr_is_absent_without_local_tailnet() {
+        fn no_tailnet_addr() -> Option<Ipv4Addr> {
+            None
+        }
+
+        assert_eq!(candidate_tailnet_addr(8091, no_tailnet_addr), None);
+    }
+
+    #[tokio::test]
+    async fn finalize_response_adds_hint_without_changing_ack_body() {
+        #[allow(clippy::unnecessary_wraps)]
+        fn tailnet_addr() -> Option<Ipv4Addr> {
+            Some(Ipv4Addr::new(100, 64, 0, 10))
+        }
+
+        let state_dir = tempfile::tempdir().unwrap();
+        let identity = household_rs::bootstrap_or_load(
+            state_dir.path(),
+            household_rs::BootstrapOpts {
+                household_name: "Sample Home".to_string(),
+                hostname_label: Some("candidate-alpha".to_string()),
+            },
+            household_rs::KeyBackingPolicy::ForceSoftware,
+        )
+        .unwrap();
+        let expected_ack = FinalizeAck::for_machine_cert(&identity.cert).unwrap();
+        let response = finalize_ack_response_with_resolver(&identity.cert, tailnet_addr);
+        let expected_header = format!(
+            "100.64.0.10:{}",
+            crate::household_bootstrap::household_port_from_env()
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get(FINALIZE_CANDIDATE_TAILSCALE_ADDR_HEADER)
+                .and_then(|value| value.to_str().ok()),
+            Some(expected_header.as_str())
+        );
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let actual_ack: FinalizeAck = household_rs::cbor::from_canonical_slice(&body).unwrap();
+        assert_eq!(actual_ack, expected_ack);
+    }
 }

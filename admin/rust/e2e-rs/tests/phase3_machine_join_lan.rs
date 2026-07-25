@@ -25,7 +25,7 @@ use tokio::sync::mpsc;
 
 use phase3_support::{
     OWNER_EVENTS_PATH, OwnerApprovalAck, OwnerEventsResponse, assert_machine_cert_layout,
-    assert_record_is_two_member, candidate_harness, cursor_param,
+    assert_record_is_two_member, candidate_harness_with_tailnet_hint, cursor_param,
     founder_harness_with_tailnet_resolver, get_cbor, post_local_anchor, post_owner_approval,
 };
 
@@ -41,7 +41,7 @@ async fn phase3_machine_join_lan() {
 
     FOUNDER_TAILNET_RESOLUTIONS.store(0, Ordering::Relaxed);
     let founder = founder_harness_with_tailnet_resolver(founder_tailnet_address);
-    let candidate = candidate_harness().await;
+    let candidate = candidate_harness_with_tailnet_hint(Ipv4Addr::new(100, 64, 0, 20)).await;
 
     let pair_nonce = household_rs::ids::base32_lower_nopad_encode(
         &candidate.prepared.join_request.nonce.as_ref()[..8],
@@ -154,6 +154,18 @@ async fn phase3_machine_join_lan() {
         read_known_peer_addr(candidate.dir.path(), &m1_id).expect("read founder address hint"),
         Some(expected_founder_addr),
         "candidate should cache the founder Tailnet hint carried by JoinResponse"
+    );
+    let candidate_port = candidate
+        .prepared
+        .join_request
+        .addr
+        .parse::<std::net::SocketAddr>()
+        .expect("candidate JoinRequest address")
+        .port();
+    assert_eq!(
+        read_known_peer_addr(founder.dir.path(), &m2_id).expect("read candidate address hint"),
+        Some(format!("100.64.0.20:{candidate_port}")),
+        "founder should replace the LAN ceremony address with M2's post-Ready Tailnet hint"
     );
     assert_eq!(
         FOUNDER_TAILNET_RESOLUTIONS.load(Ordering::Relaxed),

@@ -9,8 +9,11 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use axum::body::{Body, to_bytes};
-use axum::http::{HeaderMap, Method, Request, StatusCode, header};
-use axum::{Router, routing};
+use axum::extract::State;
+use axum::http::{HeaderMap, HeaderValue, Method, Request, StatusCode, header};
+use axum::middleware::Next;
+use axum::response::Response;
+use axum::{Router, middleware, routing};
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD as B64URL};
 use household_rs::keys::{IdentityKey, P256Keypair, P256PublicKey, verify_signature};
 use household_rs::machine_cert::Platform;
@@ -18,8 +21,9 @@ use household_rs::owner_events::{
     OwnerEvent, OwnerEventLog, OwnerEventPayload, OwnerEventType, OwnerEventsBroadcaster,
 };
 use household_rs::pair_machine::{
-    JoinRequest, JoinTransport, OwnerApproval, OwnerApprovalContext, PairMachineWindow,
-    PrepareCandidateOpts, household_root_sole_path, prepare_candidate, shamir_self_shard_path,
+    FINALIZE_CANDIDATE_TAILSCALE_ADDR_HEADER, JoinRequest, JoinTransport, OwnerApproval,
+    OwnerApprovalContext, PairMachineWindow, PrepareCandidateOpts, household_root_sole_path,
+    prepare_candidate, shamir_self_shard_path,
 };
 use household_rs::person_cert::{PersonCert, SignOwnerOptions};
 use household_rs::pop::RequestSigningContext;
@@ -319,6 +323,35 @@ pub fn rebuild_founder_router_from_disk(
 }
 
 pub async fn candidate_harness() -> CandidateHarness {
+    candidate_harness_with_optional_tailnet_hint(JoinTransport::Tailscale, None).await
+}
+
+pub async fn candidate_harness_with_tailnet_hint(ip: Ipv4Addr) -> CandidateHarness {
+    candidate_harness_with_optional_tailnet_hint(JoinTransport::Lan, Some(ip)).await
+}
+
+#[derive(Clone)]
+struct CandidateTailnetHint(HeaderValue);
+
+async fn attach_candidate_tailnet_hint(
+    State(hint): State<CandidateTailnetHint>,
+    request: Request<Body>,
+    next: Next,
+) -> Response {
+    let is_finalize = request.uri().path() == "/pair-machine/local/finalize";
+    let mut response = next.run(request).await;
+    if is_finalize && response.status().is_success() {
+        response
+            .headers_mut()
+            .insert(FINALIZE_CANDIDATE_TAILSCALE_ADDR_HEADER, hint.0.clone());
+    }
+    response
+}
+
+async fn candidate_harness_with_optional_tailnet_hint(
+    transport: JoinTransport,
+    tailnet_ip: Option<Ipv4Addr>,
+) -> CandidateHarness {
     let dir = tempfile::tempdir().expect("m2 tempdir");
     let listener = TcpListener::bind("127.0.0.1:0")
         .await
@@ -330,7 +363,7 @@ pub async fn candidate_harness() -> CandidateHarness {
         &window,
         PrepareCandidateOpts {
             state_dir: dir.path().to_path_buf(),
-            transport: JoinTransport::Tailscale,
+            transport,
             addr: addr.to_string(),
             hostname: "studio-m2".into(),
             platform: Platform::LinuxNix,
@@ -347,6 +380,16 @@ pub async fn candidate_harness() -> CandidateHarness {
         key_policy: KeyBackingPolicy::ForceSoftware,
         bootstrap: None,
     });
+    let router = if let Some(ip) = tailnet_ip {
+        let value = HeaderValue::from_str(&format!("{ip}:{}", addr.port()))
+            .expect("documentation-safe candidate Tailnet hint");
+        router.layer(middleware::from_fn_with_state(
+            CandidateTailnetHint(value),
+            attach_candidate_tailnet_hint,
+        ))
+    } else {
+        router
+    };
     let served_router = router.clone();
     let server = tokio::spawn(async move {
         let _ = axum::serve(listener, served_router).await;
