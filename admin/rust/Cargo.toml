@@ -13,6 +13,7 @@ members = [
     "jobs-rs",
     "keystore-rs",
     "llm-proxy-rs",
+    "m1-household-mesh-smoke-rs",
     "session-rs",
     "server-rs",
     "store-rs",
