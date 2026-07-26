@@ -346,7 +346,7 @@ fn r1a7_enumerates_linked_targets_and_proves_zero_production_callers() {
     let members = workspace_members(&rust_root);
     assert_eq!(members.len(), 26, "workspace member inventory changed");
     let targets = enumerate_workspace_targets(&rust_root, &members);
-    assert_eq!(targets.len(), 192, "Cargo target inventory changed");
+    assert_eq!(targets.len(), 193, "Cargo target inventory changed");
     assert_eq!(
         targets.iter().filter(|target| target.kind == "bin").count(),
         48
@@ -356,7 +356,7 @@ fn r1a7_enumerates_linked_targets_and_proves_zero_production_callers() {
             .iter()
             .filter(|target| target.kind == "test")
             .count(),
-        144
+        145
     );
     assert_eq!(
         targets
@@ -373,6 +373,12 @@ fn r1a7_enumerates_linked_targets_and_proves_zero_production_callers() {
             && target.kind == "bin"
             && target.name == "server-rs"
             && target.path == "server-rs/src/main.rs"
+    }));
+    assert!(targets.iter().any(|target| {
+        target.package == "server-rs"
+            && target.kind == "test"
+            && target.name == "m2a_shared_claw_control_plane_contract"
+            && target.path == "server-rs/tests/m2a_shared_claw_control_plane_contract.rs"
     }));
 
     eprintln!("R1a.7 workspace crates ({}):", members.len());

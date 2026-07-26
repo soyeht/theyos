@@ -734,6 +734,8 @@ mod tests {
     use household_rs::claw_share::{CLAIM_TIMESTAMP_TOLERANCE_SECS, ClaimNonce, ClawShareError};
     use household_rs::household_mesh_log::{
         MeshEvent, MeshMembership, ProjectedGroup, ProjectedMemberDevice,
+        build_group_claw_grant_event, build_group_created_event, build_group_member_add_event,
+        build_member_device_enroll_event,
     };
     use household_rs::ids::derive_household_id;
     use household_rs::keys::{IdentityKey, P256Keypair};
@@ -988,6 +990,182 @@ mod tests {
             .collect(),
         );
         projection
+    }
+
+    fn m2a_mesh_log(
+        bindings: &[&MemberDeviceBinding],
+        owner: &P256Keypair,
+        timestamp: u64,
+    ) -> MeshLogStore {
+        let mesh_log = MeshLogStore::new();
+        let owner_pub = owner.public();
+        mesh_log
+            .append(
+                build_group_created_event(
+                    "m2a_group".to_string(),
+                    "M2-A shared claw control-plane".to_string(),
+                    timestamp,
+                    owner_pub.clone(),
+                    owner,
+                )
+                .expect("sign group creation"),
+            )
+            .expect("append group creation");
+        mesh_log
+            .append(
+                build_group_claw_grant_event(
+                    "m2a_group".to_string(),
+                    "m2a_claw_a".to_string(),
+                    timestamp + 1,
+                    owner_pub.clone(),
+                    owner,
+                )
+                .expect("sign single claw grant"),
+            )
+            .expect("append single claw grant");
+
+        for (index, binding) in bindings.iter().enumerate() {
+            binding.verify().expect("valid member/device binding");
+            let event_timestamp = timestamp + 2 + (index as u64 * 2);
+            mesh_log
+                .append(
+                    build_group_member_add_event(
+                        "m2a_group".to_string(),
+                        binding.member_id.clone(),
+                        format!("M2-A member {index}"),
+                        event_timestamp,
+                        owner_pub.clone(),
+                        owner,
+                    )
+                    .expect("sign member add"),
+                )
+                .expect("append member add");
+            mesh_log
+                .append(
+                    build_member_device_enroll_event(
+                        binding.member_id.clone(),
+                        binding.device_pub.clone(),
+                        binding.participant_npub.clone(),
+                        event_timestamp + 1,
+                        owner_pub.clone(),
+                        owner,
+                    )
+                    .expect("sign device enrollment"),
+                )
+                .expect("append device enrollment");
+        }
+        mesh_log
+    }
+
+    fn m2a_group_claim(
+        binding: &MemberDeviceBinding,
+        device: &P256Keypair,
+        claw_id: &str,
+        nonce_byte: u8,
+        timestamp: u64,
+    ) -> (ClawShareClaim, GroupClaimRequest) {
+        let nonce = ClaimNonce([nonce_byte; 32]);
+        let request = GroupClaimRequest::sign(
+            binding.clone(),
+            "m2a_group".to_string(),
+            claw_id.to_string(),
+            nonce.0.to_vec(),
+            Some(600),
+            device as &dyn IdentityKey,
+        )
+        .expect("matching bound device signs its production group-request PoP");
+        let claim = ClawShareClaim::sign_group(
+            device.public(),
+            nonce,
+            timestamp,
+            request.clone(),
+            device as &dyn IdentityKey,
+        )
+        .expect("matching bound device signs its production group claim");
+        (claim, request)
+    }
+
+    #[test]
+    fn m2a_real_device_pops_bind_two_members_to_claw_a_only() {
+        // M2-A is a control-plane proof: use the production group-claim
+        // verifier through its membership gate, but do not select or mint any
+        // relay resource or transport.
+        let timestamp = 1_800_000_700;
+        let member_one = P256Keypair::from_secret_scalar(&[0x21u8; 32]).unwrap();
+        let device_one = P256Keypair::from_secret_scalar(&[0x31u8; 32]).unwrap();
+        let member_two = P256Keypair::from_secret_scalar(&[0x41u8; 32]).unwrap();
+        let device_two = P256Keypair::from_secret_scalar(&[0x51u8; 32]).unwrap();
+
+        let binding_one = MemberDeviceBinding::sign(
+            &member_one as &dyn IdentityKey,
+            device_one.public(),
+            "m2a_member_one_npub".to_string(),
+            timestamp,
+        )
+        .expect("member one binding");
+        let binding_two = MemberDeviceBinding::sign(
+            &member_two as &dyn IdentityKey,
+            device_two.public(),
+            "m2a_member_two_npub".to_string(),
+            timestamp,
+        )
+        .expect("member two binding");
+        assert_ne!(binding_one.member_id, binding_two.member_id);
+        assert_ne!(binding_one.device_pub, binding_two.device_pub);
+
+        let owner = P256Keypair::from_secret_scalar(&[0x11u8; 32]).unwrap();
+        let mesh_log = m2a_mesh_log(&[&binding_one, &binding_two], &owner, timestamp);
+        let projection = mesh_log.project();
+
+        // Each independently signed production request/claim reaches the real
+        // membership gate and returns the exact bound member, device, and A
+        // claw. Separate nonce tables keep these successes independent.
+        for (binding, device, nonce_byte) in [
+            (&binding_one, &device_one, 0x61u8),
+            (&binding_two, &device_two, 0x62u8),
+        ] {
+            let (claim, request) =
+                m2a_group_claim(binding, device, "m2a_claw_a", nonce_byte, timestamp);
+            let nonces = GroupClaimNonceTable::new();
+            let verified = verify_group_claim(&claim, &request, &projection, &nonces, timestamp)
+                .expect("matching member/device is authorized only for claw A");
+            assert_eq!(verified.member_id, binding.member_id);
+            assert_eq!(verified.device_pub, binding.device_pub);
+            assert_eq!(verified.claw_id, "m2a_claw_a");
+        }
+
+        // A member binding cannot be paired with the other member's device to
+        // make a production-verifiable PoP. Check both directions explicitly.
+        for (binding, other_device) in [(&binding_one, &device_two), (&binding_two, &device_one)] {
+            assert!(matches!(
+                GroupClaimRequest::sign(
+                    binding.clone(),
+                    "m2a_group".to_string(),
+                    "m2a_claw_a".to_string(),
+                    vec![0x70u8; 32],
+                    Some(600),
+                    other_device as &dyn IdentityKey,
+                ),
+                Err(ClawShareError::GroupDeviceKeyMismatch)
+            ));
+        }
+
+        // Fresh claims, requests, and nonce tables reach membership (rather
+        // than failing as a replay) and reject both valid pairs for claw B.
+        for (binding, device, nonce_byte) in [
+            (&binding_one, &device_one, 0x71u8),
+            (&binding_two, &device_two, 0x72u8),
+        ] {
+            let (claim, request) =
+                m2a_group_claim(binding, device, "m2a_claw_b", nonce_byte, timestamp);
+            let nonces = GroupClaimNonceTable::new();
+            assert!(matches!(
+                verify_group_claim(&claim, &request, &projection, &nonces, timestamp),
+                Err(GroupClaimReject::NotAuthorized(
+                    "relay-stream-group-claw-not-granted"
+                ))
+            ));
+        }
     }
 
     #[test]
