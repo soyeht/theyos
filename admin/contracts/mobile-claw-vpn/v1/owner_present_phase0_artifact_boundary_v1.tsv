@@ -1,6 +1,6 @@
 # theyos-owner-present-phase0-artifact-boundary-v1
 # mode<TAB>git-object-type<TAB>git-object-oid<TAB>closed-input
-040000	tree	b08aa2629f3340ae323b854d20bf9298a5a6156b	admin/rust
+040000	tree	2f7bf44a08d4134b808b1c26eb8b0c5505d44b63	admin/rust
 100644	blob	1f145333fe407f49affb50d0d1bcc6581bf75b0f	admin/contracts/claw-store/v1/contract.json
 100644	blob	566444c58b4868907806f62f91038ad070a33e7a	admin/contracts/mobile-claw-vpn/v1/owner_present_success_wire_v1.json
 040000	tree	0f4cb4b436ef7d67e4e024cf1bf67d50ed2d6d53	claws

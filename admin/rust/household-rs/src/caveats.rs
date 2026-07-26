@@ -5,7 +5,7 @@ use std::fmt;
 use serde::{Deserialize, Serialize};
 
 /// Operation namespace carried in `PersonCert` caveats.
-#[derive(Clone, Serialize, Deserialize, PartialEq, Eq, Hash, Debug)]
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 pub enum Operation {
     #[serde(rename = "claws.list")]
     ClawsList,
@@ -23,6 +23,8 @@ pub enum Operation {
     HouseholdRevoke,
     #[serde(rename = "household.add_machine")]
     HouseholdAddMachine,
+    #[serde(rename = "household.add_device")]
+    HouseholdAddDevice,
     #[serde(rename = "owner_auth.enroll_initial")]
     OwnerAuthEnrollInitial,
 }
@@ -39,6 +41,7 @@ impl Operation {
             Self::HouseholdInvite => "household.invite",
             Self::HouseholdRevoke => "household.revoke",
             Self::HouseholdAddMachine => "household.add_machine",
+            Self::HouseholdAddDevice => "household.add_device",
             Self::OwnerAuthEnrollInitial => "owner_auth.enroll_initial",
         }
     }
@@ -63,10 +66,118 @@ impl TryFrom<&str> for Operation {
             "household.invite" => Ok(Self::HouseholdInvite),
             "household.revoke" => Ok(Self::HouseholdRevoke),
             "household.add_machine" => Ok(Self::HouseholdAddMachine),
+            "household.add_device" => Ok(Self::HouseholdAddDevice),
             "owner_auth.enroll_initial" => Ok(Self::OwnerAuthEnrollInitial),
             other => Err(format!("unknown operation {other:?}")),
         }
     }
+}
+
+/// Closed constraint value for R0a narrowing. The outer `Option` on
+/// [`Caveat::constraints`] remains the only `None`; this enum has no `None`.
+/// `machines=[text...]` and `expires_at=u64` keep the legacy CBOR shapes.
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq, Debug)]
+#[serde(untagged)]
+pub enum ConstraintValue {
+    Machines(Vec<String>),
+    ExpiresAt(u64),
+}
+
+/// Closed constraint map. Only the `machines` and `expires_at` keys are valid,
+/// with matching value shapes. Deserialization rejects every other key/shape;
+/// valid legacy `machines` bytes stay byte-exact.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct Constraints(std::collections::BTreeMap<String, ConstraintValue>);
+
+impl Constraints {
+    #[must_use]
+    pub fn as_map(&self) -> &std::collections::BTreeMap<String, ConstraintValue> {
+        &self.0
+    }
+}
+
+impl Serialize for Constraints {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        self.0.serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for Constraints {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct ConstraintsVisitor;
+
+        impl<'de> serde::de::Visitor<'de> for ConstraintsVisitor {
+            type Value = Constraints;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str("a closed constraints map without duplicate keys")
+            }
+
+            fn visit_map<A>(self, mut access: A) -> Result<Self::Value, A::Error>
+            where
+                A: serde::de::MapAccess<'de>,
+            {
+                let mut map = std::collections::BTreeMap::new();
+                while let Some((key, value)) = access.next_entry::<String, ConstraintValue>()? {
+                    if map.insert(key.clone(), value).is_some() {
+                        return Err(serde::de::Error::custom(format!(
+                            "duplicate constraint {key:?}"
+                        )));
+                    }
+                }
+                validate_closed_map(&map).map_err(serde::de::Error::custom)?;
+                Ok(Constraints(map))
+            }
+        }
+
+        deserializer.deserialize_map(ConstraintsVisitor)
+    }
+}
+
+impl TryFrom<std::collections::BTreeMap<String, ConstraintValue>> for Constraints {
+    type Error = String;
+
+    fn try_from(
+        map: std::collections::BTreeMap<String, ConstraintValue>,
+    ) -> Result<Self, Self::Error> {
+        validate_closed_map(&map)?;
+        Ok(Self(map))
+    }
+}
+
+fn validate_closed_map(
+    map: &std::collections::BTreeMap<String, ConstraintValue>,
+) -> Result<(), String> {
+    for (key, value) in map {
+        let valid = matches!(
+            (key.as_str(), value),
+            ("machines", ConstraintValue::Machines(_))
+                | ("expires_at", ConstraintValue::ExpiresAt(_))
+        );
+        if !valid {
+            return Err(format!("invalid constraint {key:?}"));
+        }
+    }
+    Ok(())
+}
+
+/// Closed-scope validation failures (false booleans and malformed Specific).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum ScopeClosedError {
+    #[error("scope all must be true")]
+    AllFalse,
+    #[error("scope owned_by_self must be true")]
+    OwnedBySelfFalse,
+    #[error("specific scope must be non-empty")]
+    SpecificEmpty,
+    #[error("specific scope entries must be ordered and unique")]
+    SpecificNotOrderedUnique,
 }
 
 /// Caveat scope. Owner template only uses `All` for Claw operations and
@@ -89,6 +200,30 @@ impl Scope {
     pub fn is_all(&self) -> bool {
         matches!(self, Self::All { all: true })
     }
+
+    /// Validate the closed R0a scope shape: booleans must be true, Specific
+    /// must be non-empty, ordered, unique, and closed text. This rejects; it
+    /// never normalizes.
+    pub fn validate_closed(&self) -> Result<(), ScopeClosedError> {
+        match self {
+            Self::All { all } if !all => Err(ScopeClosedError::AllFalse),
+            Self::OwnedBySelf { owned_by_self } if !owned_by_self => {
+                Err(ScopeClosedError::OwnedBySelfFalse)
+            }
+            Self::Specific { specific } => validate_specific(specific),
+            Self::All { .. } | Self::OwnedBySelf { .. } => Ok(()),
+        }
+    }
+}
+
+fn validate_specific(values: &[String]) -> Result<(), ScopeClosedError> {
+    if values.is_empty() {
+        return Err(ScopeClosedError::SpecificEmpty);
+    }
+    if !values.windows(2).all(|pair| pair[0] < pair[1]) {
+        return Err(ScopeClosedError::SpecificNotOrderedUnique);
+    }
+    Ok(())
 }
 
 /// `PersonCert` caveat.
@@ -97,9 +232,10 @@ impl Scope {
 pub struct Caveat {
     pub op: Operation,
     pub scope: Option<Scope>,
-    /// Phase 2 owner template has no constraints. Future phases can extend
-    /// this shape under a new validated semantics without changing `PersonCert`.
-    pub constraints: Option<std::collections::BTreeMap<String, Vec<String>>>,
+    /// Phase 2 owner template has no constraints. R0a keeps this outer
+    /// `Option` as the only `None` and closes values to
+    /// `machines=[text...]`/`expires_at=u64` without changing legacy bytes.
+    pub constraints: Option<Constraints>,
 }
 
 impl Caveat {
@@ -151,6 +287,9 @@ pub fn permits(caveats: &[Caveat], op: &Operation) -> bool {
             | Operation::HouseholdRevoke
             | Operation::HouseholdAddMachine
             | Operation::OwnerAuthEnrollInitial => c.scope.is_none(),
+            // R0a: HouseholdAddDevice is granted only by the explicit narrowing
+            // verifier, never by the owner template, capability names, or permits.
+            Operation::HouseholdAddDevice => false,
         }
     })
 }

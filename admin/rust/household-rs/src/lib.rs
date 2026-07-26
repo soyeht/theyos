@@ -33,6 +33,7 @@ pub mod bip39_wordlist;
 pub mod bootstrap;
 pub mod bootstrap_error;
 pub mod bootstrap_state;
+pub mod caveat_narrowing;
 pub mod caveats;
 pub mod cbor;
 pub mod chain;
