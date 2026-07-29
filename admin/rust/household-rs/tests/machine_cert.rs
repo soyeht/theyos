@@ -5,6 +5,7 @@ use household_rs::{
     CertType, IdentityKey, MachineCert, P256Keypair, PersonId, Platform, SubjectId,
     derive_household_id,
 };
+use serde::Deserialize;
 
 fn signed_cert() -> (P256Keypair, P256Keypair, MachineCert) {
     let household = P256Keypair::generate();
@@ -87,6 +88,110 @@ fn non_empty_caveats_are_refused_by_phase1_schema() {
 
     let decoded: Result<MachineCert, _> = cbor::from_canonical_slice(&tampered);
     assert!(decoded.is_err(), "non-empty caveats decoded successfully");
+}
+
+// ---------------------------------------------------------------------------
+// Claw-share MachineCert attestation cross-language vector.
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Deserialize)]
+struct ClawShareAttestationFixture {
+    contract: String,
+    version: u8,
+    about: Vec<String>,
+    root_public_key_sec1_compressed_hex: String,
+    household_id: String,
+    machine_public_key_sec1_compressed_hex: String,
+    machine_id: String,
+    canonical_machine_cert_cbor_hex: String,
+}
+
+fn deterministic_claw_share_cert() -> (P256Keypair, MachineCert) {
+    let root = P256Keypair::from_secret_scalar(&[0x41; 32]).expect("root scalar");
+    let machine = P256Keypair::from_secret_scalar(&[0x42; 32]).expect("machine scalar");
+    let cert = MachineCert::sign(
+        &root,
+        &machine.public(),
+        &SignOptions {
+            hh_id: derive_household_id(&root.public()),
+            hostname: "attested-mac".into(),
+            platform: Platform::Macos,
+            joined_at: 1_800_000_000,
+        },
+    )
+    .expect("sign deterministic cert");
+    (root, cert)
+}
+
+fn claw_share_attestation_fixture() -> ClawShareAttestationFixture {
+    serde_json::from_str(include_str!("data/claw_share_machine_attestation_v1.json"))
+        .expect("machine attestation fixture JSON")
+}
+
+#[test]
+fn claw_share_machine_attestation_vector_is_byte_exact_and_root_verifiable() {
+    let fixture = claw_share_attestation_fixture();
+    assert_eq!(fixture.contract, "claw-share-machine-attestation-v1");
+    assert_eq!(fixture.version, 1);
+    assert!(
+        fixture
+            .about
+            .iter()
+            .any(|line| line.contains("does not prove current roster membership")),
+        "fixture must preserve the provenance-only boundary",
+    );
+
+    let (root, cert) = deterministic_claw_share_cert();
+    cert.verify(&root.public()).expect("root-signed cert");
+    let canonical = cbor::to_canonical_vec(&cert).expect("canonical cert");
+
+    assert_eq!(
+        fixture.root_public_key_sec1_compressed_hex,
+        hex::encode(root.public().as_bytes()),
+    );
+    assert_eq!(fixture.household_id, cert.hh_id.as_str());
+    assert_eq!(
+        fixture.machine_public_key_sec1_compressed_hex,
+        hex::encode(cert.m_pub.as_bytes()),
+    );
+    assert_eq!(fixture.machine_id, cert.m_id.as_str());
+    assert_eq!(
+        fixture.canonical_machine_cert_cbor_hex,
+        hex::encode(&canonical),
+        "canonical MachineCert CBOR drifted; update all cross-language consumers intentionally",
+    );
+
+    let decoded: MachineCert =
+        cbor::from_canonical_slice(&canonical).expect("decode canonical cert");
+    assert_eq!(decoded, cert);
+}
+
+#[test]
+fn tampering_the_published_claw_share_machine_cert_vector_fails_root_verification() {
+    let fixture = claw_share_attestation_fixture();
+    let bytes = hex::decode(fixture.canonical_machine_cert_cbor_hex).expect("fixture hex");
+    let mut cert: MachineCert = cbor::from_canonical_slice(&bytes).expect("fixture cert");
+    let (root, _) = deterministic_claw_share_cert();
+    cert.hostname.push_str("-tampered");
+    assert!(cert.verify(&root.public()).is_err());
+}
+
+#[test]
+#[ignore = "manual fixture regeneration helper; prints public material only"]
+fn print_claw_share_machine_attestation_fixture_fields() {
+    let (root, cert) = deterministic_claw_share_cert();
+    let canonical = cbor::to_canonical_vec(&cert).expect("canonical cert");
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&serde_json::json!({
+            "root_public_key_sec1_compressed_hex": hex::encode(root.public().as_bytes()),
+            "household_id": cert.hh_id.as_str(),
+            "machine_public_key_sec1_compressed_hex": hex::encode(cert.m_pub.as_bytes()),
+            "machine_id": cert.m_id.as_str(),
+            "canonical_machine_cert_cbor_hex": hex::encode(canonical),
+        }))
+        .expect("fixture JSON")
+    );
 }
 
 // ---------------------------------------------------------------------------

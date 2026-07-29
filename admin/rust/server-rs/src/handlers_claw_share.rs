@@ -23,13 +23,16 @@ use axum::{
 use household_rs::caveats::Operation;
 use household_rs::cbor;
 use household_rs::claw_share::{
-    ClawShareClaim, ClawShareError, ClawShareSlotStore, SlotId, TunnelHandle, owner_mint_invite,
+    ClawShareClaim, ClawShareError, ClawShareInvite, ClawShareSlotStore, SlotId, TunnelHandle,
+    owner_mint_invite,
 };
 use household_rs::claw_share_flow::{EngineContext, engine_handle_claim};
 use household_rs::household_mesh_log::{
     LogEntry, MeshEvent, MeshLogStore, MeshMembership, ProjectedState,
 };
+use household_rs::ids::HouseholdId;
 use household_rs::keys::{IdentityKey, P256PublicKey, P256Signature, verify_signature};
+use household_rs::machine_cert::MachineCert;
 use household_rs::member_identity::MemberDeviceBinding;
 use serde::{Deserialize, Serialize};
 
@@ -606,6 +609,64 @@ struct MintInviteResponse {
     uri: String,
     slot_id: serde_bytes::ByteBuf,
     expires_at: u64,
+    /// Canonical CBOR of the currently loaded root-signed [`MachineCert`].
+    ///
+    /// This proves which household machine key signed the invite. It does
+    /// NOT assert that the machine is currently unrevoked; revocation
+    /// currency requires a separate fresh, household-authorized roster.
+    machine_cert: serde_bytes::ByteBuf,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MintMachineAttestationError {
+    CertificateInvalid,
+    HouseholdMismatch,
+    SigningKeyMismatch,
+    InviteHouseholdMismatch,
+    InviteSigningKeyMismatch,
+    Cbor,
+}
+
+/// Verify and encode the currently loaded machine certificate before minting a slot.
+///
+/// Keeping this before [`owner_mint_invite`] makes every attestation failure
+/// side-effect free: no invite slot exists unless the certificate is
+/// root-valid and belongs to the exact household/signing key used by mint.
+fn canonical_machine_attestation(
+    cert: &MachineCert,
+    household_id: &HouseholdId,
+    household_root: &P256PublicKey,
+    signing_key: &P256PublicKey,
+) -> Result<serde_bytes::ByteBuf, MintMachineAttestationError> {
+    cert.verify(household_root)
+        .map_err(|_| MintMachineAttestationError::CertificateInvalid)?;
+    if &cert.hh_id != household_id {
+        return Err(MintMachineAttestationError::HouseholdMismatch);
+    }
+    if &cert.m_pub != signing_key {
+        return Err(MintMachineAttestationError::SigningKeyMismatch);
+    }
+    cbor::to_canonical_vec(cert)
+        .map(serde_bytes::ByteBuf::from)
+        .map_err(|_| MintMachineAttestationError::Cbor)
+}
+
+/// Re-bind the minted invite to the already-verified machine certificate.
+///
+/// This is intentionally repeated after mint rather than relying only on the
+/// current implementation of `owner_mint_invite`: it freezes the response
+/// contract at the boundary where the invite and certificate are paired.
+fn verify_invite_machine_attestation(
+    invite: &ClawShareInvite,
+    cert: &MachineCert,
+) -> Result<(), MintMachineAttestationError> {
+    if invite.hh_id != cert.hh_id {
+        return Err(MintMachineAttestationError::InviteHouseholdMismatch);
+    }
+    if invite.owner_p_pub != cert.m_pub {
+        return Err(MintMachineAttestationError::InviteSigningKeyMismatch);
+    }
+    Ok(())
 }
 
 /// Resolve the relay claim fields for a minted invite, or fail closed with a
@@ -699,6 +760,26 @@ async fn mint_invite_inner(
     let owner_key = identity.m_priv.as_ref();
     let owner_p_id = &owner_auth.owner_person_cert.p_id;
     let hh_id = &identity.record.hh_id;
+    let owner_pub = owner_key.public();
+    let machine_cert = match canonical_machine_attestation(
+        &identity.cert,
+        hh_id,
+        &identity.record.hh_pub,
+        &owner_pub,
+    ) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            tracing::error!(
+                stage = "claw_share.mint.machine_attestation_invalid",
+                ?error
+            );
+            return Err(error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "machine_attestation_invalid",
+                None,
+            ));
+        }
+    };
 
     let ttl_secs = req.ttl_secs.unwrap_or(900);
     // This relay/membership subset uses no overlay: the transport hint defaults
@@ -746,6 +827,22 @@ async fn mint_invite_inner(
         }
     };
 
+    if let Err(error) = verify_invite_machine_attestation(&invite, &identity.cert) {
+        // `owner_mint_invite` inserted the slot. Do not leave it open when the
+        // response-bound attestation invariant fails.
+        let rollback = state.slot_store.revoke(&invite.slot_id, now);
+        tracing::error!(
+            stage = "claw_share.mint.machine_attestation_mismatch",
+            ?error,
+            rollback_ok = rollback.is_ok()
+        );
+        return Err(error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "machine_attestation_mismatch",
+            None,
+        ));
+    }
+
     // Persist the mint event. Slot store + log diverging on a restart
     // would leave the engine in a state where an invite is "live" in
     // RAM but the log thinks it never happened (or vice versa); fail
@@ -777,6 +874,7 @@ async fn mint_invite_inner(
         uri,
         slot_id: serde_bytes::ByteBuf::from(invite.slot_id.as_bytes().to_vec()),
         expires_at: invite.expires_at,
+        machine_cert,
     })
 }
 
@@ -2075,6 +2173,157 @@ fn cbor_response(status: StatusCode, body: Vec<u8>) -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use household_rs::machine_cert::{Platform, SignOptions};
+    use household_rs::{P256Keypair, PersonId, derive_household_id};
+
+    fn machine_attestation_fixture() -> (P256Keypair, P256Keypair, MachineCert) {
+        let household =
+            P256Keypair::from_secret_scalar(&[0x41; 32]).expect("household test scalar");
+        let machine = P256Keypair::from_secret_scalar(&[0x42; 32]).expect("machine test scalar");
+        let cert = MachineCert::sign(
+            &household,
+            &machine.public(),
+            &SignOptions {
+                hh_id: derive_household_id(&household.public()),
+                hostname: "attested-mac".into(),
+                platform: Platform::Macos,
+                joined_at: 1_800_000_000,
+            },
+        )
+        .expect("machine cert");
+        (household, machine, cert)
+    }
+
+    #[test]
+    fn machine_attestation_is_root_verified_and_canonical_cbor_bstr() {
+        let (household, machine, cert) = machine_attestation_fixture();
+        let bytes = canonical_machine_attestation(
+            &cert,
+            &cert.hh_id,
+            &household.public(),
+            &machine.public(),
+        )
+        .expect("valid attestation");
+        let expected = cbor::to_canonical_vec(&cert).expect("canonical cert");
+        assert_eq!(bytes.as_ref(), expected.as_slice());
+
+        let response = MintInviteResponse {
+            v: 1,
+            uri: "soyeht://claw-share/v1?e=test".into(),
+            slot_id: serde_bytes::ByteBuf::from(vec![0x11; 16]),
+            expires_at: 1_800_000_900,
+            machine_cert: bytes,
+        };
+        let encoded = cbor::to_canonical_vec(&response).expect("response CBOR");
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct DecodedResponse {
+            v: u8,
+            uri: String,
+            slot_id: serde_bytes::ByteBuf,
+            expires_at: u64,
+            machine_cert: serde_bytes::ByteBuf,
+        }
+        let decoded: DecodedResponse =
+            cbor::from_canonical_slice(&encoded).expect("response value");
+        assert_eq!(decoded.v, 1);
+        assert_eq!(decoded.uri, "soyeht://claw-share/v1?e=test");
+        assert_eq!(decoded.slot_id.as_ref(), &[0x11; 16]);
+        assert_eq!(decoded.expires_at, 1_800_000_900);
+        assert_eq!(
+            decoded.machine_cert.as_ref(),
+            expected.as_slice(),
+            "machine_cert must be a CBOR byte string containing the byte-exact canonical cert",
+        );
+    }
+
+    #[test]
+    fn machine_attestation_rejects_wrong_root_household_signer_and_tamper() {
+        let (household, machine, cert) = machine_attestation_fixture();
+        let other_household =
+            P256Keypair::from_secret_scalar(&[0x43; 32]).expect("other household scalar");
+        let other_machine =
+            P256Keypair::from_secret_scalar(&[0x44; 32]).expect("other machine scalar");
+
+        assert_eq!(
+            canonical_machine_attestation(
+                &cert,
+                &cert.hh_id,
+                &other_household.public(),
+                &machine.public(),
+            ),
+            Err(MintMachineAttestationError::CertificateInvalid),
+        );
+        assert_eq!(
+            canonical_machine_attestation(
+                &cert,
+                &derive_household_id(&other_household.public()),
+                &household.public(),
+                &machine.public(),
+            ),
+            Err(MintMachineAttestationError::HouseholdMismatch),
+        );
+        assert_eq!(
+            canonical_machine_attestation(
+                &cert,
+                &cert.hh_id,
+                &household.public(),
+                &other_machine.public(),
+            ),
+            Err(MintMachineAttestationError::SigningKeyMismatch),
+        );
+
+        let mut tampered = cert.clone();
+        tampered.hostname = "tampered-mac".into();
+        assert_eq!(
+            canonical_machine_attestation(
+                &tampered,
+                &tampered.hh_id,
+                &household.public(),
+                &machine.public(),
+            ),
+            Err(MintMachineAttestationError::CertificateInvalid),
+        );
+    }
+
+    #[test]
+    fn invite_must_match_attested_household_and_machine_key() {
+        let (_household, machine, cert) = machine_attestation_fixture();
+        let invite = ClawShareInvite::sign(
+            cert.hh_id.clone(),
+            PersonId(format!("p_{}", "a".repeat(52))),
+            machine.public(),
+            "claw-test".into(),
+            SlotId::random(),
+            TunnelHandle::Loopback {
+                channel: "attestation-test".into(),
+            },
+            1_800_000_900,
+            "relay-npub".into(),
+            vec!["wss://relay.invalid".into()],
+            &machine,
+        )
+        .expect("signed invite");
+        verify_invite_machine_attestation(&invite, &cert).expect("matching invite");
+
+        let mut wrong_household = invite.clone();
+        let other_household =
+            P256Keypair::from_secret_scalar(&[0x43; 32]).expect("other household scalar");
+        wrong_household.hh_id = derive_household_id(&other_household.public());
+        assert_eq!(
+            verify_invite_machine_attestation(&wrong_household, &cert),
+            Err(MintMachineAttestationError::InviteHouseholdMismatch),
+        );
+
+        let mut wrong_signer = invite;
+        wrong_signer.owner_p_pub = P256Keypair::from_secret_scalar(&[0x44; 32])
+            .expect("other machine scalar")
+            .public();
+        assert_eq!(
+            verify_invite_machine_attestation(&wrong_signer, &cert),
+            Err(MintMachineAttestationError::InviteSigningKeyMismatch),
+        );
+    }
 
     // ── Relay claim fields: single source of truth + fail closed ──
 
