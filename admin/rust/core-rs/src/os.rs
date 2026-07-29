@@ -510,8 +510,7 @@ pub fn list_tty_pids(tty_path: &str) -> Vec<u32> {
 pub fn process_has_terminal_stdio(pid: u32, tty_path: &str) -> Option<bool> {
     #[cfg(target_os = "macos")]
     {
-        let _ = tty_path;
-        macos_process_has_terminal_stdio(pid)
+        macos_process_has_terminal_stdio(pid, tty_path)
     }
     #[cfg(target_os = "linux")]
     {
@@ -524,10 +523,180 @@ pub fn process_has_terminal_stdio(pid: u32, tty_path: &str) -> Option<bool> {
     }
 }
 
-/// macOS `proc_pidinfo(PROC_PIDLISTFDS)` reports the kernel type of every
-/// open descriptor. PTYs are vnode-backed; MCP stdio is pipe/socket-backed.
+/// One inspected standard descriptor's shape for F1 classification.
 #[cfg(target_os = "macos")]
-fn macos_process_has_terminal_stdio(pid: u32) -> Option<bool> {
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum StdioFd {
+    /// A vnode whose device metadata was read: `(vst_mode, vst_rdev)`.
+    Vnode { mode: u16, rdev: u32 },
+    /// A vnode fd whose per-fd metadata could not be read → fail-open.
+    VnodeUnreadable,
+    /// A non-vnode fd (pipe, socket, …): inspectable, never a terminal.
+    Other,
+}
+
+/// Pure F1 verdict over the observed fd 0 / fd 1 descriptors of one process.
+///
+/// - `Some(true)`  — at least one fd is a character device whose `rdev` equals
+///   `slave_rdev` (terminal-facing on THIS session's slave TTY).
+/// - `Some(false)` — descriptors were inspected and none matched the slave TTY
+///   (regular file, `/dev/null`, a different pty, pipe, or socket).
+/// - `None`        — nothing inspectable, or a vnode fd's metadata was
+///   unreadable: fail-open. `PtySession::close` excludes only `Some(false)`,
+///   so `None` keeps the historical over-kill (include) direction — a real
+///   terminal job is never allowed to evade the reap by a lookup failure.
+#[cfg(target_os = "macos")]
+fn classify_terminal_stdio(observed: &[StdioFd], slave_rdev: u32) -> Option<bool> {
+    const S_IFMT: u16 = 0o17_0000;
+    const S_IFCHR: u16 = 0o02_0000;
+
+    let mut inspected = false;
+    let mut fail_open = false;
+    for fd in observed {
+        match *fd {
+            StdioFd::Vnode { mode, rdev } => {
+                inspected = true;
+                if (mode & S_IFMT) == S_IFCHR && rdev == slave_rdev {
+                    return Some(true);
+                }
+            }
+            StdioFd::VnodeUnreadable => fail_open = true,
+            StdioFd::Other => inspected = true,
+        }
+    }
+    if fail_open {
+        None
+    } else if inspected {
+        Some(false)
+    } else {
+        None
+    }
+}
+
+#[cfg(target_os = "macos")]
+unsafe extern "C" {
+    fn proc_pidfdinfo(
+        pid: i32,
+        fd: i32,
+        flavor: i32,
+        buffer: *mut std::ffi::c_void,
+        buffersize: i32,
+    ) -> i32;
+}
+
+// ABI-faithful mirrors of <sys/proc_info.h>, enough to read
+// `pvi.vi_stat.vst_mode`/`vst_rdev` from a `PROC_PIDFDVNODEINFO` reply. The
+// layout is pinned by the `offset_of!`/`size_of` assertions below — a mismatch
+// is a compile error, so `vst_rdev` can never be read from the wrong offset.
+// Only `vst_mode`/`vst_rdev` are read; the other fields exist for layout.
+#[cfg(target_os = "macos")]
+#[repr(C)]
+#[derive(Clone, Copy)]
+#[allow(dead_code, clippy::struct_field_names)]
+struct ProcFileInfo {
+    fi_openflags: u32,
+    fi_status: u32,
+    fi_offset: i64,
+    fi_type: i32,
+    fi_guardflags: u32,
+}
+
+#[cfg(target_os = "macos")]
+#[repr(C)]
+#[derive(Clone, Copy)]
+#[allow(dead_code, clippy::struct_field_names)]
+struct VinfoStat {
+    vst_dev: u32,
+    vst_mode: u16,
+    vst_nlink: u16,
+    vst_ino: u64,
+    vst_uid: u32,
+    vst_gid: u32,
+    vst_atime: i64,
+    vst_atimensec: i64,
+    vst_mtime: i64,
+    vst_mtimensec: i64,
+    vst_ctime: i64,
+    vst_ctimensec: i64,
+    vst_birthtime: i64,
+    vst_birthtimensec: i64,
+    vst_size: i64,
+    vst_blocks: i64,
+    vst_blksize: i32,
+    vst_flags: u32,
+    vst_gen: u32,
+    vst_rdev: u32,
+    vst_qspare: [i64; 2],
+}
+
+#[cfg(target_os = "macos")]
+#[repr(C)]
+#[derive(Clone, Copy)]
+#[allow(dead_code)]
+struct Fsid {
+    val: [i32; 2],
+}
+
+#[cfg(target_os = "macos")]
+#[repr(C)]
+#[derive(Clone, Copy)]
+#[allow(dead_code, clippy::struct_field_names)]
+struct VnodeInfo {
+    vi_stat: VinfoStat,
+    vi_type: i32,
+    vi_pad: i32,
+    vi_fsid: Fsid,
+}
+
+#[cfg(target_os = "macos")]
+#[repr(C)]
+#[derive(Clone, Copy)]
+#[allow(dead_code)]
+struct VnodeFdInfo {
+    pfi: ProcFileInfo,
+    pvi: VnodeInfo,
+}
+
+#[cfg(target_os = "macos")]
+const _: () = {
+    assert!(std::mem::size_of::<ProcFileInfo>() == 24);
+    assert!(std::mem::size_of::<VinfoStat>() == 136);
+    assert!(std::mem::size_of::<VnodeFdInfo>() == 176);
+    assert!(std::mem::offset_of!(VnodeFdInfo, pvi.vi_stat.vst_mode) == 28);
+    assert!(std::mem::offset_of!(VnodeFdInfo, pvi.vi_stat.vst_rdev) == 140);
+};
+
+/// Read `(vst_mode, vst_rdev)` for one vnode-backed descriptor via
+/// `proc_pidfdinfo(PROC_PIDFDVNODEINFO)`. `None` on any failure (error or short
+/// read) so the caller fails open rather than excluding a real terminal.
+#[cfg(target_os = "macos")]
+fn macos_fd_vnode_stat(pid: i32, fd: i32) -> Option<(u16, u32)> {
+    const PROC_PIDFDVNODEINFO: i32 = 1;
+    // SAFETY: `VnodeFdInfo` is an all-integer `#[repr(C)]` POD; the all-zero
+    // bit pattern is a valid inhabitant.
+    let mut info: VnodeFdInfo = unsafe { std::mem::zeroed() };
+    let size = i32::try_from(std::mem::size_of::<VnodeFdInfo>()).ok()?;
+    // SAFETY: `info` owns exactly `size` writable bytes and outlives the call;
+    // the kernel writes at most `size` bytes and returns the count written.
+    let written =
+        unsafe { proc_pidfdinfo(pid, fd, PROC_PIDFDVNODEINFO, (&raw mut info).cast(), size) };
+    if written < size {
+        return None;
+    }
+    Some((info.pvi.vi_stat.vst_mode, info.pvi.vi_stat.vst_rdev))
+}
+
+/// macOS F1 classifier. A standard descriptor (fd 0 / fd 1) is terminal-facing
+/// only when it is a character device whose `rdev` equals the slave TTY's — the
+/// per-fd device identity, not the coarse "is a vnode" type. `proc_pidinfo(
+/// PROC_PIDLISTFDS)` finds the candidate fds; `proc_pidfdinfo(PROC_PIDFDVNODEINFO)`
+/// reads each vnode fd's device. Regular files, `/dev/null`, and a DIFFERENT pty
+/// are all vnodes but carry a different `rdev`, so they are excluded. Enumeration
+/// failure or unreadable per-fd metadata returns `None` (fail-open include).
+#[cfg(target_os = "macos")]
+fn macos_process_has_terminal_stdio(pid: u32, tty_path: &str) -> Option<bool> {
+    use std::os::unix::fs::MetadataExt;
+
     #[repr(C)]
     #[derive(Clone, Copy, Default)]
     struct ProcFdInfo {
@@ -537,6 +706,10 @@ fn macos_process_has_terminal_stdio(pid: u32) -> Option<bool> {
 
     const PROC_PIDLISTFDS: i32 = 1;
     const PROX_FDTYPE_VNODE: u32 = 1;
+
+    // The slave TTY's device number is the identity every candidate fd is
+    // compared against. If we cannot stat it we cannot decide → fail-open.
+    let slave_rdev = u32::try_from(std::fs::metadata(tty_path).ok()?.rdev()).ok()?;
 
     let pid = i32::try_from(pid).ok()?;
     // SAFETY: a null/zero buffer is the documented size-query form. No
@@ -568,10 +741,23 @@ fn macos_process_has_terminal_stdio(pid: u32) -> Option<bool> {
         return None;
     }
     let count = (written / entry_size).min(descriptors.len());
-    Some(descriptors[..count].iter().any(|descriptor| {
-        matches!(descriptor.proc_fd, libc::STDIN_FILENO | libc::STDOUT_FILENO)
-            && descriptor.proc_fdtype == PROX_FDTYPE_VNODE
-    }))
+
+    // Observe fd 0 / fd 1 only; the verdict is pure (`classify_terminal_stdio`).
+    let mut observed: Vec<StdioFd> = Vec::with_capacity(2);
+    for descriptor in &descriptors[..count] {
+        if !matches!(descriptor.proc_fd, libc::STDIN_FILENO | libc::STDOUT_FILENO) {
+            continue;
+        }
+        if descriptor.proc_fdtype != PROX_FDTYPE_VNODE {
+            observed.push(StdioFd::Other);
+            continue;
+        }
+        observed.push(match macos_fd_vnode_stat(pid, descriptor.proc_fd) {
+            Some((mode, rdev)) => StdioFd::Vnode { mode, rdev },
+            None => StdioFd::VnodeUnreadable,
+        });
+    }
+    classify_terminal_stdio(&observed, slave_rdev)
 }
 
 /// Linux exposes each descriptor as a `/proc/<pid>/fd/<n>` symlink.
@@ -1179,5 +1365,311 @@ mod tests {
         let mine = process_identity(std::process::id());
         let init = process_identity(1);
         assert_ne!(mine, init, "distinct concurrently-running processes must not collide");
+    }
+
+    // ── F1 macOS per-fd rdev classifier — red-first behavioural matrix ──
+    //
+    // Safia rubric A1–A5 / C2–C3 (rubric anchor
+    // safia-ios-pr329-reap-fix-security-lens-2026-07-23.md; readiness
+    // 18b19245…). Each fixture builds a live child whose CONTROLLING tty is
+    // PTY A (so `list_tty_pids(A)` lists it — asserted before classification,
+    // exercising the two-stage reap predicate), then points the child's
+    // stdin/stdout at a chosen backing. The classifier must key on the
+    // per-fd device, not the coarse vnode type.
+    //
+    // RED on the pre-fix classifier (which ignores `tty_path` and returns
+    // `Some(true)` for any vnode fd0/fd1): the regular-file, `/dev/null`, and
+    // different-PTY rows expect `Some(false)` and therefore FAIL until the fix
+    // lands (A4 non-vacuity). Pipe/socket/real-slave rows stay green (C2 / A5).
+    #[cfg(target_os = "macos")]
+    mod macos_f1_per_fd_rdev {
+        use super::super::{list_tty_pids, process_has_terminal_stdio};
+        use std::os::fd::AsRawFd;
+
+        /// Allocate a PTY master/slave pair, returning `(master, slave, slave_path)`.
+        fn open_pty() -> (i32, i32, String) {
+            // SAFETY: standard POSIX pty allocation; every returned fd is
+            // checked `>= 0`. `ptsname` is single-threaded-only, which holds:
+            // the value is consumed immediately on the calling thread.
+            unsafe {
+                let master = libc::posix_openpt(libc::O_RDWR | libc::O_NOCTTY);
+                assert!(master >= 0, "posix_openpt failed");
+                assert_eq!(libc::grantpt(master), 0, "grantpt failed");
+                assert_eq!(libc::unlockpt(master), 0, "unlockpt failed");
+                let name = libc::ptsname(master);
+                assert!(!name.is_null(), "ptsname returned null");
+                let path = std::ffi::CStr::from_ptr(name)
+                    .to_string_lossy()
+                    .into_owned();
+                let cpath = std::ffi::CString::new(path.clone()).unwrap();
+                let slave = libc::open(cpath.as_ptr(), libc::O_RDWR | libc::O_NOCTTY);
+                assert!(slave >= 0, "open slave failed");
+                (master, slave, path)
+            }
+        }
+
+        /// Fork a `sleep 600` whose controlling tty is `ctty_slave`'s device
+        /// and whose stdin/stdout are `fd0`/`fd1`. Returns the child pid.
+        fn spawn_sleeper(ctty_slave: i32, fd0: i32, fd1: i32) -> i32 {
+            // SAFETY: the child path executes only async-signal-safe libc
+            // calls (setsid/ioctl/dup2/execv/_exit) before exec — no Rust
+            // allocation or std runtime — which is sound to run post-`fork`
+            // in a multi-threaded harness.
+            unsafe {
+                let pid = libc::fork();
+                assert!(pid >= 0, "fork failed");
+                if pid == 0 {
+                    libc::setsid();
+                    libc::ioctl(ctty_slave, libc::c_ulong::from(libc::TIOCSCTTY), 0);
+                    libc::dup2(fd0, 0);
+                    libc::dup2(fd1, 1);
+                    let prog = c"/bin/sleep";
+                    let a0 = c"sleep";
+                    let a1 = c"600";
+                    let argv = [a0.as_ptr(), a1.as_ptr(), std::ptr::null()];
+                    libc::execv(prog.as_ptr(), argv.as_ptr());
+                    libc::_exit(127);
+                }
+                pid
+            }
+        }
+
+        /// Poll until `pid` is a member of `slave_path`'s tty (controlling-tty
+        /// set), then a short settle so the post-exec fd table is stable.
+        fn wait_member(slave_path: &str, pid: i32) {
+            for _ in 0..300 {
+                if list_tty_pids(slave_path).contains(&u32::try_from(pid).unwrap()) {
+                    std::thread::sleep(std::time::Duration::from_millis(40));
+                    return;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            panic!("timeout: pid {pid} never joined tty {slave_path}");
+        }
+
+        fn reap(pid: i32) {
+            // SAFETY: best-effort teardown of our own child.
+            unsafe {
+                libc::kill(pid, libc::SIGKILL);
+                let mut status = 0;
+                libc::waitpid(pid, &raw mut status, 0);
+            }
+        }
+
+        fn close_fd(fd: i32) {
+            // SAFETY: closing a fd this test owns.
+            unsafe {
+                libc::close(fd);
+            }
+        }
+
+        #[test]
+        fn regular_file_stdio_is_excluded() {
+            let (m_a, s_a, path_a) = open_pty();
+            let tmp = tempfile::NamedTempFile::new().unwrap();
+            let f = tmp.as_raw_fd();
+            let pid = spawn_sleeper(s_a, f, f);
+            wait_member(&path_a, pid);
+            let verdict = process_has_terminal_stdio(u32::try_from(pid).unwrap(), &path_a);
+            reap(pid);
+            close_fd(s_a);
+            close_fd(m_a);
+            assert_eq!(
+                verdict,
+                Some(false),
+                "regular-file stdin/stdout is not terminal-facing"
+            );
+        }
+
+        #[test]
+        fn dev_null_stdio_is_excluded() {
+            let (m_a, s_a, path_a) = open_pty();
+            // SAFETY: opening /dev/null.
+            let devnull = unsafe { libc::open(c"/dev/null".as_ptr(), libc::O_RDWR) };
+            assert!(devnull >= 0);
+            let pid = spawn_sleeper(s_a, devnull, devnull);
+            wait_member(&path_a, pid);
+            let verdict = process_has_terminal_stdio(u32::try_from(pid).unwrap(), &path_a);
+            reap(pid);
+            close_fd(devnull);
+            close_fd(s_a);
+            close_fd(m_a);
+            // /dev/null IS a char device — proves char-type alone is insufficient.
+            assert_eq!(
+                verdict,
+                Some(false),
+                "/dev/null (char, rdev != slave) is not terminal-facing"
+            );
+        }
+
+        #[test]
+        fn different_pty_is_excluded_for_a_and_included_for_b() {
+            let (m_a, s_a, path_a) = open_pty();
+            let (m_b, s_b, path_b) = open_pty();
+            // controlling tty is A; stdin/stdout point at B's slave.
+            let pid = spawn_sleeper(s_a, s_b, s_b);
+            wait_member(&path_a, pid);
+            let verdict_a = process_has_terminal_stdio(u32::try_from(pid).unwrap(), &path_a);
+            let verdict_b = process_has_terminal_stdio(u32::try_from(pid).unwrap(), &path_b);
+            reap(pid);
+            for fd in [s_a, m_a, s_b, m_b] {
+                close_fd(fd);
+            }
+            assert_eq!(
+                verdict_a,
+                Some(false),
+                "cross-session PTY B on fd0/1 is not terminal-facing for A"
+            );
+            assert_eq!(
+                verdict_b,
+                Some(true),
+                "fd0/1 bound to B's slave IS terminal-facing for B"
+            );
+        }
+
+        #[test]
+        fn pipe_stdio_is_excluded() {
+            let (m_a, s_a, path_a) = open_pty();
+            let mut fds = [0i32; 2];
+            // SAFETY: `fds` has room for the two pipe ends.
+            assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+            let pid = spawn_sleeper(s_a, fds[0], fds[1]);
+            wait_member(&path_a, pid);
+            let verdict = process_has_terminal_stdio(u32::try_from(pid).unwrap(), &path_a);
+            reap(pid);
+            for fd in [fds[0], fds[1], s_a, m_a] {
+                close_fd(fd);
+            }
+            assert_eq!(
+                verdict,
+                Some(false),
+                "pipe stdio (MCP-helper shape) must stay excluded"
+            );
+        }
+
+        #[test]
+        fn socketpair_stdio_is_excluded() {
+            let (m_a, s_a, path_a) = open_pty();
+            let mut sv = [0i32; 2];
+            // SAFETY: `sv` has room for the two socket ends.
+            assert_eq!(
+                unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, sv.as_mut_ptr()) },
+                0
+            );
+            let pid = spawn_sleeper(s_a, sv[0], sv[1]);
+            wait_member(&path_a, pid);
+            let verdict = process_has_terminal_stdio(u32::try_from(pid).unwrap(), &path_a);
+            reap(pid);
+            for fd in [sv[0], sv[1], s_a, m_a] {
+                close_fd(fd);
+            }
+            assert_eq!(verdict, Some(false), "socketpair stdio must stay excluded");
+        }
+
+        #[test]
+        fn real_slave_tty_stdio_is_included() {
+            let (m_a, s_a, path_a) = open_pty();
+            // stdin/stdout ARE A's own slave: the genuine terminal job.
+            let pid = spawn_sleeper(s_a, s_a, s_a);
+            wait_member(&path_a, pid);
+            let verdict = process_has_terminal_stdio(u32::try_from(pid).unwrap(), &path_a);
+            reap(pid);
+            close_fd(s_a);
+            close_fd(m_a);
+            assert_eq!(
+                verdict,
+                Some(true),
+                "a real slave-TTY job stays terminal-classified (A5)"
+            );
+        }
+    }
+
+    // ── F1 pure classifier matrix (deterministic; no syscalls) ──
+    // Exhaustive over Safia A3's rows, including the metadata-unavailable row
+    // (VnodeUnreadable → None) that has no deterministic syscall fixture.
+    #[cfg(target_os = "macos")]
+    mod macos_f1_classify_pure {
+        use super::super::{StdioFd, classify_terminal_stdio};
+
+        const SLAVE: u32 = 0x0123_4567;
+        const S_IFCHR: u16 = 0o02_0000;
+        const S_IFREG: u16 = 0o10_0000;
+
+        fn chr(rdev: u32) -> StdioFd {
+            StdioFd::Vnode {
+                mode: S_IFCHR | 0o620,
+                rdev,
+            }
+        }
+
+        #[test]
+        fn exact_slave_char_included() {
+            assert_eq!(classify_terminal_stdio(&[chr(SLAVE)], SLAVE), Some(true));
+        }
+
+        #[test]
+        fn char_device_with_other_rdev_excluded() {
+            // /dev/null shape: a char device, but a different rdev.
+            assert_eq!(
+                classify_terminal_stdio(&[chr(SLAVE ^ 1)], SLAVE),
+                Some(false)
+            );
+        }
+
+        #[test]
+        fn regular_file_excluded_even_if_rdev_collides() {
+            // Not a char device → excluded regardless of rdev.
+            assert_eq!(
+                classify_terminal_stdio(
+                    &[StdioFd::Vnode {
+                        mode: S_IFREG | 0o644,
+                        rdev: SLAVE
+                    }],
+                    SLAVE
+                ),
+                Some(false)
+            );
+        }
+
+        #[test]
+        fn pipe_or_socket_excluded() {
+            assert_eq!(
+                classify_terminal_stdio(&[StdioFd::Other, StdioFd::Other], SLAVE),
+                Some(false)
+            );
+        }
+
+        #[test]
+        fn nothing_inspectable_is_none_include() {
+            assert_eq!(classify_terminal_stdio(&[], SLAVE), None);
+        }
+
+        #[test]
+        fn unreadable_vnode_is_none_include() {
+            assert_eq!(
+                classify_terminal_stdio(&[StdioFd::VnodeUnreadable], SLAVE),
+                None
+            );
+            assert_eq!(
+                classify_terminal_stdio(&[StdioFd::Other, StdioFd::VnodeUnreadable], SLAVE),
+                None
+            );
+        }
+
+        #[test]
+        fn exact_match_wins_over_unreadable_sibling() {
+            assert_eq!(
+                classify_terminal_stdio(&[StdioFd::VnodeUnreadable, chr(SLAVE)], SLAVE),
+                Some(true)
+            );
+        }
+
+        #[test]
+        fn or_across_two_fds_second_matches() {
+            assert_eq!(
+                classify_terminal_stdio(&[chr(SLAVE ^ 2), chr(SLAVE)], SLAVE),
+                Some(true)
+            );
+        }
     }
 }
