@@ -69,6 +69,21 @@ Responsibilities:
   Claw tunnel address. It must not install a default route by default.
 - The Claw responder is not a LAN router. It accepts only the session peer to
   the selected Claw address and drops everything else fail-closed.
+- **T1 IpTunnel address delivery — RATCHET (placeholder → real):** the Claw
+  responder now emits the guest's REAL, pool-allocated IPv4 address to the
+  iPhone in a dedicated post-Open `NetworkSettings` frame; previously the ack
+  carried a placeholder `mesh_ipv6` explicitly marked "never routed". The auth
+  `TunnelAck` stays address-free on every path (PTY/ClawSite/Device unchanged);
+  the frame is IpTunnel-only, sent after the Open-ack once the real session is
+  allocated. Server-side `build_vpn_mesh_ipv4` enforces the route-scope
+  invariant **fail-closed before the session opens**: the delivered
+  `{addr, prefix_len, peer}` must lie in the pool CIDR `network(addr,
+  prefix_len)` — never `0.0.0.0/0` — with a distinct unicast peer in-prefix. Its
+  `session_id` equals the auth ack's, giving a cross-phase binding; the iPhone
+  FFI independently validates and installs only that CIDR, fail-closing on a
+  default/out-of-scope route, an invalid frame, or a `session_id` mismatch. A
+  real default route / full-tunnel remains a separate authenticated policy
+  decision, never inferred here.
 - All offers and records are SHA/session bound where applicable. Stale offers,
   stale records, stale refs, and revoked ACL entries fail closed.
 - Public logs, docs, PRs, screenshots, and agent messages must contain only

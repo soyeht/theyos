@@ -9,7 +9,9 @@
 use std::collections::BTreeMap;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
+
+use server_rs::claw_share_session_clock::AdmissionInstant;
 
 use household_rs::LoadedIdentity;
 use household_rs::cbor;
@@ -101,11 +103,16 @@ struct Args {
     allow_public_relay_ack: Option<String>,
 }
 
+/// The dev datapath's wall clock, floor-validated and fail-closed.
+///
+/// `unwrap_or(0)` here used to feed both the offer mint and the router: with
+/// `now = 0` every `not_after <= now` is false, so nothing expired. This path
+/// only builds under `dev_t1_datapath`, which is outside the default CI matrix,
+/// so the sentinel was invisible to the normal checks.
 fn now_unix() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_secs())
-        .unwrap_or(0)
+    server_rs::claw_share_session_clock::wall_now_secs("t1_iptunnel_claw_dev.clock").unwrap_or_else(
+        || fatal("system clock is unusable (before the epoch, at it, or below the sanity floor)"),
+    )
 }
 
 fn parse_args() -> Args {
@@ -535,7 +542,7 @@ async fn main() -> std::io::Result<()> {
         RelayStreamIpTunnelUnavailableRouter,
         RelayStreamIpTunnelUnavailableRouter,
         router,
-        now_unix,
+        || Some(now_unix()),
     );
     let config = RelayStreamResponderReverseConnectConfig {
         relay_addr,
@@ -555,7 +562,9 @@ async fn main() -> std::io::Result<()> {
             config,
             &binding,
             &params,
-            now_unix(),
+            AdmissionInstant::capture("t1_iptunnel_claw_dev.admission").unwrap_or_else(|| {
+                fatal("system clock is unusable; refusing to dial")
+            }),
         )
         .await
         {

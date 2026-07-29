@@ -70,7 +70,7 @@ pub fn bind_relay_stream_reverse_connect<P, S>(
     replay: Arc<ReplayGuard>,
     pty_router: P,
     clawsite_router: S,
-    now_unix: impl Fn() -> u64 + Send + Sync + 'static,
+    now_unix: impl Fn() -> Option<u64> + Send + Sync + 'static,
 ) -> RelayStreamReverseConnectBinding<P, S>
 where
     P: ClawTargetRouter,
@@ -99,7 +99,7 @@ pub fn bind_relay_stream_reverse_connect_with_ip_tunnel_router<P, S, I>(
     pty_router: P,
     clawsite_router: S,
     ip_tunnel_router: I,
-    now_unix: impl Fn() -> u64 + Send + Sync + 'static,
+    now_unix: impl Fn() -> Option<u64> + Send + Sync + 'static,
 ) -> RelayStreamReverseConnectBinding<P, S, I>
 where
     P: ClawTargetRouter,
@@ -284,7 +284,7 @@ mod tests {
             Arc::new(ReplayGuard::new()),
             TcpStreamRouter::new(pty_addr),
             TcpStreamRouter::new(site_addr),
-            || NOW,
+            || Some(NOW),
         )
     }
 
@@ -389,7 +389,7 @@ mod tests {
             TcpStreamRouter::new(pty_addr),
             TcpStreamRouter::new(site_addr),
             AckIpTunnelRouter::new(ip_addr),
-            || NOW,
+            || Some(NOW),
         );
 
         let response = open_roundtrip(&binding).await.unwrap();

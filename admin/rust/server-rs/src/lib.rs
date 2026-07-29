@@ -48,6 +48,7 @@ pub mod claw_share_relay_stream_trust_refresh_driver;
 pub mod claw_share_rendezvous_stream_relay;
 pub mod claw_share_rendezvous_stream_relay_listener;
 pub mod claw_share_rendezvous_stream_relay_status;
+pub mod claw_share_session_clock;
 pub mod claw_store_routes;
 pub mod claw_store_service;
 pub mod claw_vpn_dev_config;

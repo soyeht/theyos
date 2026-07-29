@@ -7,7 +7,6 @@
 
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use household_rs::claw_share_data_tunnel::ClawTargetRouter;
 use keystore_rs::KeystoreBackend;
@@ -17,6 +16,7 @@ use tokio::task::JoinHandle;
 
 use crate::claw_share_relay_stream_admission::RelayStreamAdmission;
 use crate::claw_share_relay_stream_contract::RelayStreamOfferContract;
+use crate::claw_share_session_clock::AdmissionInstant;
 use crate::claw_share_relay_stream_responder::{
     ResponderDataTunnelDeps, serve_relay_stream_responder_connection,
 };
@@ -149,10 +149,28 @@ where
                 continue;
             };
 
+            // Clock gate, BEFORE the admission seam and any handshake: capture
+            // the (wall, monotonic) pair ONCE for this connection. `None` means
+            // the wall clock is unusable (before the epoch, at it, or below the
+            // sanity floor), and with a broken clock `not_after` can never be
+            // enforced — so refuse rather than serve fail-open. This same pair
+            // is transported downstream; nothing recaptures an anchor later.
+            let Some(admission_instant) = AdmissionInstant::capture(
+                "claw_share.relay_stream_responder.admission",
+            ) else {
+                tracing::warn!(
+                    stage = "claw_share.relay_stream_responder.clock_rejected",
+                    %peer,
+                    "refusing connection: implausible system clock",
+                );
+                drop(stream);
+                continue;
+            };
+            let accepted_at = admission_instant.wall();
+
             // C4c admission gate: mint a per-connection trust seam only while
             // the runtime is healthy; otherwise refuse to serve fail-closed,
             // before any Noise handshake or data-tunnel authorization.
-            let accepted_at = now_unix();
             let trust = match params.admission.admit(accepted_at) {
                 Ok(trust) => trust,
                 Err(error) => {
@@ -175,7 +193,7 @@ where
                     &offer,
                     &params,
                     &trust,
-                    accepted_at,
+                    admission_instant,
                     &deps,
                 )
                 .await;
@@ -212,12 +230,6 @@ fn validate_runtime_bind_addr(addr: SocketAddr) -> Result<(), RelayStreamRespond
     Ok(())
 }
 
-fn now_unix() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |duration| duration.as_secs())
-}
-
 #[derive(Debug, thiserror::Error)]
 pub enum RelayStreamResponderServerError {
     #[error("relay stream responder max active connections must be greater than zero")]
@@ -245,6 +257,11 @@ pub enum RelayStreamResponderServerError {
 
 #[cfg(test)]
 mod tests {
+    fn now_unix() -> u64 {
+        crate::claw_share_session_clock::wall_now_secs("test")
+            .expect("test host clock must be plausible")
+    }
+
     use super::*;
     use std::time::Duration;
 

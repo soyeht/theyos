@@ -83,7 +83,7 @@ pub fn spawn_relay_stream_trust_refresh_driver(
     mesh_log: Arc<MeshLogStore>,
     config: RelayStreamTrustRefreshConfig,
     trigger: Arc<Notify>,
-    now_unix: Arc<dyn Fn() -> u64 + Send + Sync>,
+    now_unix: Arc<dyn Fn() -> Option<u64> + Send + Sync>,
 ) -> Result<RelayStreamTrustRefreshDriverHandle, RelayStreamTrustRefreshConfigError> {
     if config.tick.is_zero() {
         return Err(RelayStreamTrustRefreshConfigError::TickZero);
@@ -115,7 +115,7 @@ async fn refresh_loop(
     tick: Duration,
     trigger: Arc<Notify>,
     cancel: Arc<Notify>,
-    now_unix: Arc<dyn Fn() -> u64 + Send + Sync>,
+    now_unix: Arc<dyn Fn() -> Option<u64> + Send + Sync>,
 ) {
     loop {
         tokio::select! {
@@ -128,18 +128,28 @@ async fn refresh_loop(
             () = trigger.notified() => {}
         }
 
-        let now = now_unix();
-        if let Err(error) = runtime
-            .refresh_now(&household, mesh_log.as_ref(), now)
-            .await
-        {
+        // A clock failure must make the context unhealthy IMMEDIATELY. Merely
+        // skipping the refresh would leave the last-good context serving until
+        // `max_stale`, i.e. it would look handled while still admitting.
+        let Some(now) = now_unix() else {
+            runtime.mark_clock_unusable();
+            continue;
+        };
+        // Recovery needs BOTH a plausible reading and a green refresh. Clearing
+        // the flag here — before the refresh — would let a failing refresh serve
+        // the last-good context again as soon as the clock came back, which is
+        // the fail-open this flag exists to prevent.
+        match runtime.refresh_now(&household, mesh_log.as_ref(), now).await {
+            Ok(()) => runtime.clear_clock_unusable(),
+            Err(error) => {
             // A failed refresh keeps the last-good context; the runtime's health
             // policy alone decides when to stop serving. Never permissive, never
             // fatal to the driver: log a debug-safe reason and keep running.
-            tracing::debug!(
-                stage = "claw_share.relay_stream.trust_refresh.failed",
-                error = %error,
-            );
+                tracing::debug!(
+                    stage = "claw_share.relay_stream.trust_refresh.failed",
+                    error = %error,
+                );
+            }
         }
     }
 }
@@ -157,6 +167,7 @@ pub enum RelayStreamTrustRefreshConfigError {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::AtomicBool;
     use super::*;
 
     use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -300,10 +311,10 @@ mod tests {
     fn clocked_now(
         clock: Arc<AtomicU64>,
         counter: Arc<AtomicUsize>,
-    ) -> Arc<dyn Fn() -> u64 + Send + Sync> {
+    ) -> Arc<dyn Fn() -> Option<u64> + Send + Sync> {
         Arc::new(move || {
             counter.fetch_add(1, Ordering::SeqCst);
-            clock.load(Ordering::SeqCst)
+            Some(clock.load(Ordering::SeqCst))
         })
     }
 
@@ -512,6 +523,76 @@ mod tests {
         // Driver survived the errors: a further trigger still drives an attempt.
         trigger.notify_one();
         wait_for_refreshes(&counter, 3).await;
+        drop(handle);
+    }
+
+    #[tokio::test]
+    async fn clock_recovery_requires_a_green_refresh_not_just_a_plausible_reading() {
+        // The real driver sequence, which calling `clear_clock_unusable()`
+        // directly cannot prove: an unusable clock marks the context unhealthy;
+        // the clock coming BACK is not enough on its own, because clearing the
+        // flag before a successful refresh would serve the last-good context
+        // again; only a plausible reading AND a green refresh recover.
+        let household = household_with(member_record());
+        let mesh_log = Arc::new(MeshLogStore::new());
+        let runtime = runtime_with(&household, &mesh_log, 20, 5, NOW).await;
+        runtime.issuer_trust_if_healthy(NOW).unwrap();
+
+        // The seam returns `None` until flipped, so the driver sees an unusable
+        // wall clock.
+        let usable = Arc::new(AtomicBool::new(false));
+        let counter = Arc::new(AtomicUsize::new(0));
+        let seam_usable = Arc::clone(&usable);
+        let seam_counter = Arc::clone(&counter);
+        let now_unix: Arc<dyn Fn() -> Option<u64> + Send + Sync> = Arc::new(move || {
+            seam_counter.fetch_add(1, Ordering::SeqCst);
+            seam_usable.load(Ordering::SeqCst).then_some(NOW)
+        });
+
+        let trigger = Arc::new(Notify::new());
+        let handle = spawn_relay_stream_trust_refresh_driver(
+            Arc::clone(&runtime),
+            household.clone(),
+            Arc::clone(&mesh_log),
+            RelayStreamTrustRefreshConfig::new(Duration::from_secs(10)),
+            Arc::clone(&trigger),
+            now_unix,
+        )
+        .unwrap();
+
+        // 1. Unusable clock => unhealthy.
+        trigger.notify_one();
+        wait_until(|| {
+            matches!(
+                runtime.issuer_trust_if_healthy(NOW),
+                Err(RelayStreamTrustContextHealthError::ClockUnusable)
+            )
+        })
+        .await;
+
+        // 2. Clock comes back BUT the refresh fails: must STILL be unusable.
+        //    Clearing the flag before the refresh would wrongly recover here.
+        household.clear().await;
+        usable.store(true, Ordering::SeqCst);
+        let before = counter.load(Ordering::SeqCst);
+        trigger.notify_one();
+        wait_for_refreshes(&counter, before + 1).await;
+        assert!(
+            matches!(
+                runtime.issuer_trust_if_healthy(NOW),
+                Err(RelayStreamTrustContextHealthError::ClockUnusable)
+            ),
+            "a plausible clock with a FAILING refresh must not recover",
+        );
+
+        // 3. Only now, with BOTH a plausible clock and a refresh that succeeds,
+        //    may the runtime serve again.
+        household.set_loaded(identity_with(member_record())).await;
+        let before = counter.load(Ordering::SeqCst);
+        trigger.notify_one();
+        wait_for_refreshes(&counter, before + 1).await;
+        wait_until(|| runtime.issuer_trust_if_healthy(NOW).is_ok()).await;
+
         drop(handle);
     }
 

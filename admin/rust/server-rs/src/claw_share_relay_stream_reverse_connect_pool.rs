@@ -33,6 +33,7 @@ use crate::claw_share_relay_stream_reverse_connect_binding::RelayStreamReverseCo
 use crate::claw_share_relay_stream_target_router::{
     RelayStreamIpTunnelUnavailableRouter, RelayStreamOfferTargetRouter,
 };
+use crate::claw_share_session_clock::AdmissionInstant;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RelayStreamReverseConnectBackoffPolicy {
@@ -176,7 +177,7 @@ pub fn spawn_relay_stream_reverse_connect_pool<P, S, I>(
     params: Arc<RelayStreamResponderParams>,
     offers: Vec<Arc<RelayStreamOfferContract>>,
     binding_factory: Arc<RelayStreamReverseConnectBindingFactory<P, S, I>>,
-    now_unix: Arc<dyn Fn() -> u64 + Send + Sync>,
+    now_unix: Arc<dyn Fn() -> Option<u64> + Send + Sync>,
 ) -> Result<RelayStreamReverseConnectPoolHandle, RelayStreamReverseConnectPoolError>
 where
     P: ClawTargetRouter + 'static,
@@ -226,7 +227,7 @@ async fn run_offer_worker<P, S, I>(
     params: Arc<RelayStreamResponderParams>,
     offer: Arc<RelayStreamOfferContract>,
     binding_factory: Arc<RelayStreamReverseConnectBindingFactory<P, S, I>>,
-    now_unix: Arc<dyn Fn() -> u64 + Send + Sync>,
+    now_unix: Arc<dyn Fn() -> Option<u64> + Send + Sync>,
     semaphore: Arc<Semaphore>,
     cancelled: Arc<AtomicBool>,
 ) where
@@ -240,21 +241,8 @@ async fn run_offer_worker<P, S, I>(
             break;
         }
 
-        let now = now_unix();
-        if offer.payload.not_after <= now {
-            break;
-        }
-
-        let binding = match binding_factory(Arc::clone(&offer), now) {
-            Ok(binding) => binding,
-            Err(RelayStreamReverseConnectBindingBuildError::Expired) => break,
-            Err(RelayStreamReverseConnectBindingBuildError::Unhealthy(_)) => {
-                sleep_backoff(failure_backoff, &cancelled).await;
-                failure_backoff = config.backoff.next_after_failure(failure_backoff);
-                continue;
-            }
-        };
-
+        // Acquire the permit FIRST: this await can be long, and anything we
+        // read before it could be stale by the time we dial.
         let Ok(permit) = Arc::clone(&semaphore).acquire_owned().await else {
             break;
         };
@@ -263,11 +251,39 @@ async fn run_offer_worker<P, S, I>(
             break;
         }
 
+        // Only now sample the clock, anchor-before-wall by construction, and
+        // revalidate the offer against that fresh reading. `None` means the
+        // wall clock is unusable, and with a broken clock expiry cannot be
+        // enforced — the worker stops rather than dialing fail-open.
+        let Some(admission) = AdmissionInstant::capture_with(&*now_unix) else {
+            drop(permit);
+            break;
+        };
+        let now = admission.wall();
+        if offer.payload.not_after <= now {
+            drop(permit);
+            break;
+        }
+
+        let binding = match binding_factory(Arc::clone(&offer), now) {
+            Ok(binding) => binding,
+            Err(RelayStreamReverseConnectBindingBuildError::Expired) => {
+                drop(permit);
+                break;
+            }
+            Err(RelayStreamReverseConnectBindingBuildError::Unhealthy(_)) => {
+                drop(permit);
+                sleep_backoff(failure_backoff, &cancelled).await;
+                failure_backoff = config.backoff.next_after_failure(failure_backoff);
+                continue;
+            }
+        };
+
         let result = serve_relay_stream_responder_reverse_connect_binding(
             reverse_config,
             &binding,
             &params,
-            now,
+            admission,
         )
         .await;
         drop(permit);
@@ -332,7 +348,7 @@ struct ResyncContext<P, S, I> {
     reverse_config: RelayStreamResponderReverseConnectConfig,
     params: Arc<RelayStreamResponderParams>,
     binding_factory: Arc<RelayStreamReverseConnectBindingFactory<P, S, I>>,
-    now_unix: Arc<dyn Fn() -> u64 + Send + Sync>,
+    now_unix: Arc<dyn Fn() -> Option<u64> + Send + Sync>,
     semaphore: Arc<Semaphore>,
     worker_cancelled: Arc<AtomicBool>,
     registry: Arc<Mutex<OfferWorkerRegistry>>,
@@ -379,7 +395,25 @@ where
     S: ClawTargetRouter + 'static,
     RelayStreamOfferTargetRouter<P, S, I>: ClawTargetRouter + 'static,
 {
-    let now = (ctx.now_unix)();
+    // Clock gate for the whole tick. An unusable wall clock cannot judge
+    // `not_after`, so we must not merely return: existing workers would keep
+    // dialing on a stale view. DRAIN them, then let a later tick with a
+    // plausible clock repopulate the registry.
+    let Some(now) = (ctx.now_unix)() else {
+        if let Ok(mut registry) = ctx.registry.lock() {
+            for entry in registry.entries.values() {
+                for handle in &entry.handles {
+                    handle.abort();
+                }
+            }
+            registry.entries.clear();
+        }
+        tracing::warn!(
+            stage = "claw_share.relay_stream.resync.clock_unusable",
+            "wall clock unusable; drained offer workers and skipped resync",
+        );
+        return;
+    };
     // CRITICAL: re-load from disk every tick. The claim path opens its own store,
     // `put_minted` persists and drops it; a load-once in-memory store would never
     // see the claim's write.
@@ -590,7 +624,7 @@ pub fn spawn_relay_stream_offer_resync_driver<P, S, I>(
     reverse_config: RelayStreamResponderReverseConnectConfig,
     params: Arc<RelayStreamResponderParams>,
     binding_factory: Arc<RelayStreamReverseConnectBindingFactory<P, S, I>>,
-    now_unix: Arc<dyn Fn() -> u64 + Send + Sync>,
+    now_unix: Arc<dyn Fn() -> Option<u64> + Send + Sync>,
 ) -> Result<RelayStreamOfferResyncDriverHandle, RelayStreamReverseConnectPoolError>
 where
     P: ClawTargetRouter + 'static,
@@ -858,7 +892,7 @@ mod tests {
                 Arc::new(ReplayGuard::new()),
                 TcpStreamRouter::new(pty_addr.clone()),
                 TcpStreamRouter::new(site_addr.clone()),
-                now_unix,
+                || Some(now_unix()),
             ))
         })
     }
@@ -891,14 +925,14 @@ mod tests {
                 Arc::new(ReplayGuard::new()),
                 TcpStreamRouter::new(pty_addr),
                 TcpStreamRouter::new(site_addr),
-                now_unix,
+                || Some(now_unix()),
             );
             let claw = tokio::spawn(async move {
                 serve_relay_stream_responder_reverse_connect_binding(
                     reverse_config(relay_addr),
                     &binding,
                     &params,
-                    now_unix(),
+                    AdmissionInstant::from_seam_wall(now_unix()).expect("plausible test clock"),
                 )
                 .await
             });
@@ -975,7 +1009,7 @@ mod tests {
                 params,
                 vec![offer],
                 factory,
-                Arc::new(now_unix),
+                Arc::new(|| Some(now_unix())),
             )
             .unwrap();
 
@@ -1034,7 +1068,7 @@ mod tests {
                 params,
                 vec![offer],
                 factory,
-                Arc::new(now_unix),
+                Arc::new(|| Some(now_unix())),
             )
             .unwrap();
 
@@ -1043,6 +1077,53 @@ mod tests {
                     .await
                     .is_err()
             );
+            handle.shutdown();
+            relay_handle.abort();
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn pool_unusable_clock_does_not_build_binding_or_dial() {
+        timeout(Duration::from_secs(2), async {
+            let (relay_addr, mut rx, relay_handle) = spawn_counting_relay().await;
+            let keypair = generate_relay_stream_noise_static_keypair().unwrap();
+            let offer = offer_for_resource(
+                0xB9,
+                RelayStreamResource::Pty,
+                keypair.public_key().clone(),
+                now_unix() + 60,
+            );
+            let params = Arc::new(
+                params_for(
+                    keypair,
+                    Duration::from_millis(100),
+                    relay_stream_admission().await,
+                )
+                .await,
+            );
+            let attempts = Arc::new(AtomicUsize::new(0));
+            let factory = binding_factory(
+                params.admission.clone(),
+                consumed_slots(),
+                "127.0.0.1:1".to_string(),
+                "127.0.0.1:1".to_string(),
+                Arc::clone(&attempts),
+            );
+            let handle = spawn_relay_stream_reverse_connect_pool(
+                pool_config(1, 1),
+                reverse_config(relay_addr),
+                params,
+                vec![offer],
+                factory,
+                Arc::new(|| None),
+            )
+            .unwrap();
+
+            tokio::time::sleep(Duration::from_millis(75)).await;
+            assert_eq!(attempts.load(Ordering::SeqCst), 0);
+            assert!(timeout(Duration::from_millis(75), rx.recv()).await.is_err());
             handle.shutdown();
             relay_handle.abort();
         })
@@ -1087,7 +1168,7 @@ mod tests {
                 params,
                 vec![offer],
                 factory,
-                Arc::new(now_unix),
+                Arc::new(|| Some(now_unix())),
             )
             .unwrap();
 
@@ -1134,7 +1215,7 @@ mod tests {
                 params,
                 vec![offer],
                 factory,
-                Arc::new(now_unix),
+                Arc::new(|| Some(now_unix())),
             )
             .unwrap();
 
@@ -1188,7 +1269,7 @@ mod tests {
                 params,
                 vec![offer],
                 factory,
-                Arc::new(now_unix),
+                Arc::new(|| Some(now_unix())),
             )
             .unwrap();
             let debug = format!("{handle:?}");
@@ -1287,6 +1368,23 @@ mod tests {
             tick: Duration,
             config: RelayStreamReverseConnectPoolConfig,
         ) -> RelayStreamOfferResyncDriverHandle {
+            start_driver_with_clock(
+                state_dir,
+                relay_addr,
+                tick,
+                config,
+                Arc::new(|| Some(now_unix())),
+            )
+            .await
+        }
+
+        async fn start_driver_with_clock(
+            state_dir: &Path,
+            relay_addr: SocketAddr,
+            tick: Duration,
+            config: RelayStreamReverseConnectPoolConfig,
+            now_unix: Arc<dyn Fn() -> Option<u64> + Send + Sync>,
+        ) -> RelayStreamOfferResyncDriverHandle {
             let admission = relay_stream_admission().await;
             let keypair = generate_relay_stream_noise_static_keypair().unwrap();
             let params =
@@ -1304,7 +1402,7 @@ mod tests {
                 reverse_config(relay_addr),
                 params,
                 factory,
-                Arc::new(now_unix),
+                now_unix,
             )
             .unwrap()
         }
@@ -1391,6 +1489,50 @@ mod tests {
 
                 remove_offer(dir.path(), RelayStreamResource::Pty);
                 wait_until(|| handle.offer_count() == 0).await;
+                handle.shutdown();
+                relay.abort();
+            })
+            .await
+            .unwrap();
+        }
+
+        #[tokio::test]
+        async fn resync_unusable_clock_drains_existing_workers() {
+            timeout(Duration::from_secs(5), async {
+                let dir = tempfile::tempdir().unwrap();
+                let (relay_addr, mut rx, relay) = spawn_counting_relay().await;
+                seed_offer(
+                    dir.path(),
+                    rendezvous_token(0x49),
+                    RelayStreamResource::Pty,
+                    now_unix() + 600,
+                );
+                let clock_usable = Arc::new(AtomicBool::new(true));
+                let now_seam: Arc<dyn Fn() -> Option<u64> + Send + Sync> = {
+                    let clock_usable = Arc::clone(&clock_usable);
+                    Arc::new(move || clock_usable.load(Ordering::SeqCst).then(now_unix))
+                };
+                let handle = start_driver_with_clock(
+                    dir.path(),
+                    relay_addr,
+                    Duration::from_secs(30),
+                    pool_config(1, 4),
+                    now_seam,
+                )
+                .await;
+                wait_for_hello_token(&mut rx, &rendezvous_token(0x49)).await;
+                assert_eq!(handle.offer_count(), 1);
+
+                clock_usable.store(false, Ordering::SeqCst);
+                handle.trigger_resync();
+                wait_until(|| handle.offer_count() == 0 && handle.task_count() == 0).await;
+                assert!(
+                    timeout(Duration::from_millis(150), rx.recv())
+                        .await
+                        .is_err(),
+                    "a drained stale worker must not dial again"
+                );
+
                 handle.shutdown();
                 relay.abort();
             })

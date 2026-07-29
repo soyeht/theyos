@@ -1047,6 +1047,25 @@ mod dev_datapath {
                         TunnelFrame::Health(_) | TunnelFrame::Open => {
                             bail!("dev datapath peer sent unexpected control frame");
                         }
+                        TunnelFrame::NetworkSettings(settings) => {
+                            // IpTunnel path: the server delivers the guest's VPN
+                            // interface here (once, right after the Open-ack). This
+                            // dev runner installs no real interface, but it MUST
+                            // consume the frame (never a silent noop) and enforce the
+                            // client-side route-scope invariant, mirroring the iOS
+                            // client: a default route (prefix 0) is rejected fail-closed.
+                            if settings.mesh_ipv4.prefix_len == 0 {
+                                bail!(
+                                    "dev datapath received a default-route (prefix 0) NetworkSettings"
+                                );
+                            }
+                            // Follow the module's address-redaction discipline: log
+                            // only the non-sensitive prefix length.
+                            eprintln!(
+                                "dev datapath: VPN NetworkSettings received (prefix_len={})",
+                                settings.mesh_ipv4.prefix_len
+                            );
+                        }
                     }
                 }
             }

@@ -171,6 +171,7 @@ impl ClawTargetRouter for PtyTargetRouter {
             writer: Box::new(write_pty),
             resize,
             exit,
+            vpn_mesh_ipv4: None,
         })
     }
 }

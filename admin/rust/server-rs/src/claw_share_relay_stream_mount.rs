@@ -366,6 +366,25 @@ async fn mount_relay_stream_live(
     replay: Arc<ReplayGuard>,
     config: RelayStreamLiveConfig,
 ) -> Result<Option<RelayStreamLiveHandles>, RelayStreamMountError> {
+    let now_unix: Arc<dyn Fn() -> Option<u64> + Send + Sync> = Arc::new(|| {
+        crate::claw_share_session_clock::wall_now_secs("claw_share.relay_stream.mount")
+    });
+    mount_relay_stream_live_with_clock(
+        state_dir, household, mesh_log, slots, replay, config, now_unix,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn mount_relay_stream_live_with_clock(
+    state_dir: PathBuf,
+    household: HouseholdState,
+    mesh_log: Arc<MeshLogStore>,
+    slots: Arc<ClawShareSlotStore>,
+    replay: Arc<ReplayGuard>,
+    config: RelayStreamLiveConfig,
+    now_unix: Arc<dyn Fn() -> Option<u64> + Send + Sync>,
+) -> Result<Option<RelayStreamLiveHandles>, RelayStreamMountError> {
     if !config.enabled {
         return Ok(None);
     }
@@ -381,10 +400,12 @@ async fn mount_relay_stream_live(
         .join(RELAY_STREAM_KEYSTORE_SUBDIR);
     let keystore = FileKeystore::new(&keystore_dir, RELAY_STREAM_KEYSTORE_SERVICE);
 
-    let now_unix: Arc<dyn Fn() -> u64 + Send + Sync> = Arc::new(|| {
-        crate::time_util::unix_now_secs_checked("claw_share.relay_stream.mount").unwrap_or(0)
-    });
-
+    // Temporal AUTHORITY seam: `None` means the wall clock is unusable (before
+    // the epoch, exactly at it, or below the sanity floor) and every consumer
+    // must fail closed. Never a sentinel — `unwrap_or(0)` here used to make
+    // `not_after <= now` always false, i.e. nothing ever expired. Deliberately
+    // NOT `time_util::unix_now_secs_checked`, which still returns `Some(0)` at
+    // the epoch despite its name.
     let inputs = RelayStreamLiveInputs {
         state_dir,
         household,
@@ -1467,6 +1488,43 @@ mod tests {
                 .exists()
         );
         assert!(!relay_stream_offer_store_path(dir.path()).exists());
+    }
+
+    #[tokio::test]
+    async fn mount_unusable_clock_fails_before_keystore_or_live_tasks() {
+        let dir = tempfile::tempdir().unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let relay_addr = listener.local_addr().unwrap();
+        drop(listener);
+        let mut config = RelayStreamLiveConfig {
+            enabled: true,
+            ..RelayStreamLiveConfig::default()
+        };
+        config.reverse_connect.relay_addr = relay_addr;
+
+        let error = mount_relay_stream_live_with_clock(
+            dir.path().to_path_buf(),
+            relay_stream_household_state(),
+            Arc::new(MeshLogStore::new()),
+            Arc::new(ClawShareSlotStore::new()),
+            Arc::new(ReplayGuard::new()),
+            config,
+            Arc::new(|| None),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            RelayStreamMountError::Assemble(RelayStreamLiveError::ClockUnusable)
+        ));
+        assert!(!relay_stream_offer_store_path(dir.path()).exists());
+        assert!(
+            !dir.path()
+                .join("claw_share")
+                .join(RELAY_STREAM_KEYSTORE_SUBDIR)
+                .exists()
+        );
     }
 
     #[tokio::test]

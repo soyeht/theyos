@@ -65,6 +65,9 @@ struct HealthState {
     last_success_unix: u64,
     consecutive_failures: u32,
     last_error: Option<String>,
+    /// Set when the wall clock cannot be read plausibly. Freshness is computed
+    /// FROM the clock, so a broken one would otherwise report "fresh" forever.
+    clock_unusable: bool,
 }
 
 /// A trust-context cache plus its serving-health bookkeeping.
@@ -95,6 +98,7 @@ impl RelayStreamTrustContextRuntime {
                 last_success_unix: now_unix,
                 consecutive_failures: 0,
                 last_error: None,
+                clock_unusable: false,
             }),
         })
     }
@@ -135,6 +139,12 @@ impl RelayStreamTrustContextRuntime {
     /// elapsed (fresh) via saturating subtraction, never a panic.
     pub fn ensure_healthy(&self, now_unix: u64) -> Result<(), RelayStreamTrustContextHealthError> {
         let health = self.health.lock().unwrap_or_else(PoisonError::into_inner);
+        // An unusable wall clock invalidates the freshness judgement itself:
+        // `stale_secs` is computed FROM the clock, so a broken one would report
+        // "fresh" forever. Refuse before looking at staleness.
+        if health.clock_unusable {
+            return Err(RelayStreamTrustContextHealthError::ClockUnusable);
+        }
         let stale_secs = now_unix.saturating_sub(health.last_success_unix);
         let max_stale_secs = self.policy.max_stale.as_secs();
         if stale_secs > max_stale_secs {
@@ -150,6 +160,28 @@ impl RelayStreamTrustContextRuntime {
             });
         }
         Ok(())
+    }
+
+    /// Mark the wall clock unusable, making [`Self::ensure_healthy`] fail
+    /// IMMEDIATELY rather than letting the last-good context keep serving until
+    /// `max_stale` — a clock failure must not look handled while still
+    /// admitting.
+    pub fn mark_clock_unusable(&self) {
+        let mut health = self.health.lock().unwrap_or_else(PoisonError::into_inner);
+        if !health.clock_unusable {
+            tracing::warn!(
+                stage = "claw_share.relay_stream.trust_context.clock_unusable",
+                "wall clock unusable; trust context marked unhealthy",
+            );
+        }
+        health.clock_unusable = true;
+    }
+
+    /// Clear the unusable-clock state after a plausible reading, so a recovered
+    /// clock plus a successful refresh can bring the runtime back.
+    pub fn clear_clock_unusable(&self) {
+        let mut health = self.health.lock().unwrap_or_else(PoisonError::into_inner);
+        health.clock_unusable = false;
     }
 
     /// The method the future pool must call before accepting/serving: hand out a
@@ -197,6 +229,10 @@ pub enum RelayStreamTrustContextPolicyError {
 
 #[derive(Debug, thiserror::Error)]
 pub enum RelayStreamTrustContextHealthError {
+    /// The wall clock is unusable, so freshness cannot be judged at all.
+    #[error("relay stream trust context unhealthy: system clock unusable")]
+    ClockUnusable,
+
     #[error(
         "relay stream trust context stale: {stale_secs}s since last refresh exceeds max {max_stale_secs}s"
     )]
@@ -381,6 +417,47 @@ mod tests {
 
         let trust = runtime.issuer_trust_if_healthy(NOW).unwrap();
         trust.verify_offer(&offer(), NOW).unwrap();
+    }
+
+    #[tokio::test]
+    async fn clock_unusable_stops_serving_immediately_not_after_max_stale() {
+        // A clock failure must make the context unhealthy AT ONCE. Merely
+        // skipping the refresh would leave the last-good context serving until
+        // `max_stale` — handled-looking while still admitting.
+        let household = household_with(member_record());
+        let runtime =
+            RelayStreamTrustContextRuntime::load(&household, &MeshLogStore::new(), NOW, policy())
+                .await
+                .unwrap();
+        // Healthy first, at a time well inside `max_stale`.
+        runtime.ensure_healthy(NOW).unwrap();
+
+        runtime.mark_clock_unusable();
+
+        assert!(matches!(
+            runtime.ensure_healthy(NOW),
+            Err(RelayStreamTrustContextHealthError::ClockUnusable)
+        ));
+        // And it must refuse to hand out the trust seam at all.
+        assert!(runtime.issuer_trust_if_healthy(NOW).is_err());
+    }
+
+    #[tokio::test]
+    async fn clock_recovery_restores_serving() {
+        // A plausible reading again must allow recovery, otherwise a transient
+        // clock glitch would permanently wedge the engine.
+        let household = household_with(member_record());
+        let runtime =
+            RelayStreamTrustContextRuntime::load(&household, &MeshLogStore::new(), NOW, policy())
+                .await
+                .unwrap();
+        runtime.mark_clock_unusable();
+        assert!(runtime.ensure_healthy(NOW).is_err());
+
+        runtime.clear_clock_unusable();
+
+        runtime.ensure_healthy(NOW).unwrap();
+        runtime.issuer_trust_if_healthy(NOW).unwrap();
     }
 
     #[tokio::test]

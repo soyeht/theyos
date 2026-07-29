@@ -8,7 +8,7 @@
 
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use household_rs::claw_share_data_tunnel::ClawTargetRouter;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
@@ -18,6 +18,7 @@ use tokio::time::timeout;
 use crate::claw_share_relay_stream_admission::RelayStreamAdmissionError;
 use crate::claw_share_relay_stream_contract::RelayStreamOfferContract;
 use crate::claw_share_relay_stream_issuer_trust::RelayStreamIssuerTrust;
+use crate::claw_share_session_clock::AdmissionInstant;
 use crate::claw_share_relay_stream_responder::{
     RelayStreamResponderError, ResponderDataTunnelDeps, serve_relay_stream_responder_connection,
 };
@@ -72,7 +73,12 @@ where
     R: ClawTargetRouter + Send + Sync,
 {
     let config = config.validate()?;
-    let now = now_unix();
+    // Capture the (wall, monotonic) pair ONCE, before dialing. `None` means the
+    // wall clock is unusable, and with a broken clock `not_after` can never be
+    // enforced — refuse rather than dial fail-open.
+    let admission = capture_admission()
+        .ok_or(RelayStreamResponderReverseConnectError::ClockUnusable)?;
+    let now = admission.wall();
     // Health-before-dial: admit before opening the relay connection so an
     // unhealthy trust runtime never dials. The admitted seam is reused for this
     // connection (no second admit downstream).
@@ -90,7 +96,7 @@ where
     })?;
 
     serve_relay_stream_responder_reverse_connected_with_trust(
-        stream, &offer, &params, &trust, now, &deps, config,
+        stream, &offer, &params, &trust, admission, &deps, config,
     )
     .await
 }
@@ -103,7 +109,7 @@ pub async fn serve_relay_stream_responder_reverse_connected<S, R>(
     stream: S,
     offer: &RelayStreamOfferContract,
     params: &RelayStreamResponderParams,
-    now_unix: u64,
+    admission: AdmissionInstant,
     deps: &ResponderDataTunnelDeps<R>,
     config: RelayStreamResponderReverseConnectConfig,
 ) -> Result<(), RelayStreamResponderReverseConnectError>
@@ -111,9 +117,9 @@ where
     S: AsyncRead + AsyncWrite + Unpin,
     R: ClawTargetRouter,
 {
-    let trust = params.admission.admit(now_unix)?;
+    let trust = params.admission.admit(admission.wall())?;
     serve_relay_stream_responder_reverse_connected_with_trust(
-        stream, offer, params, &trust, now_unix, deps, config,
+        stream, offer, params, &trust, admission, deps, config,
     )
     .await
 }
@@ -129,7 +135,7 @@ pub async fn serve_relay_stream_responder_reverse_connected_with_trust<S, R>(
     offer: &RelayStreamOfferContract,
     params: &RelayStreamResponderParams,
     trust: &RelayStreamIssuerTrust,
-    now_unix: u64,
+    admission: AdmissionInstant,
     deps: &ResponderDataTunnelDeps<R>,
     config: RelayStreamResponderReverseConnectConfig,
 ) -> Result<(), RelayStreamResponderReverseConnectError>
@@ -149,7 +155,7 @@ where
     .map_err(|_| RelayStreamResponderReverseConnectError::HelloTimeout)?
     .map_err(RelayStreamResponderReverseConnectError::HelloWrite)?;
 
-    serve_relay_stream_responder_connection(stream, offer, params, trust, now_unix, deps).await?;
+    serve_relay_stream_responder_connection(stream, offer, params, trust, admission, deps).await?;
     Ok(())
 }
 
@@ -164,7 +170,7 @@ pub async fn serve_relay_stream_responder_reverse_connected_binding<T, P, S, I>(
     stream: T,
     binding: &RelayStreamReverseConnectBinding<P, S, I>,
     params: &RelayStreamResponderParams,
-    now_unix: u64,
+    admission: AdmissionInstant,
     config: RelayStreamResponderReverseConnectConfig,
 ) -> Result<(), RelayStreamResponderReverseConnectError>
 where
@@ -178,7 +184,7 @@ where
         &binding.offer,
         params,
         &binding.trust,
-        now_unix,
+        admission,
         &binding.deps,
         config,
     )
@@ -193,7 +199,7 @@ pub async fn serve_relay_stream_responder_reverse_connect_binding<P, S, I>(
     config: RelayStreamResponderReverseConnectConfig,
     binding: &RelayStreamReverseConnectBinding<P, S, I>,
     params: &RelayStreamResponderParams,
-    now_unix: u64,
+    admission: AdmissionInstant,
 ) -> Result<(), RelayStreamResponderReverseConnectError>
 where
     P: ClawTargetRouter,
@@ -213,7 +219,7 @@ where
     })?;
 
     serve_relay_stream_responder_reverse_connected_binding(
-        stream, binding, params, now_unix, config,
+        stream, binding, params, admission, config,
     )
     .await
 }
@@ -231,10 +237,12 @@ fn validate_relay_addr(
     Ok(())
 }
 
-fn now_unix() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |duration| duration.as_secs())
+/// Capture the admission clock pair for this track.
+///
+/// `None` means the wall clock is unusable (before the epoch, exactly at it, or
+/// below the sanity floor). Callers MUST refuse; never substitute a sentinel.
+fn capture_admission() -> Option<AdmissionInstant> {
+    AdmissionInstant::capture("claw_share.relay_stream_responder.reverse_connect")
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -257,6 +265,9 @@ pub enum RelayStreamResponderReverseConnectError {
         #[source]
         source: std::io::Error,
     },
+
+    #[error("relay stream reverse-connect refused: implausible system clock")]
+    ClockUnusable,
 
     #[error("relay stream reverse-connect hello timed out")]
     HelloTimeout,
@@ -366,7 +377,7 @@ mod tests {
                 &offer,
                 &owner_pub(),
                 &guest_key,
-                now_unix(),
+                crate::claw_share_session_clock::wall_now_secs("test").expect("plausible clock"),
             )
             .await
             .unwrap()
@@ -423,7 +434,7 @@ mod tests {
                     &offer,
                     &owner_pub(),
                     &guest_key,
-                    now_unix(),
+                    crate::claw_share_session_clock::wall_now_secs("test").expect("plausible clock"),
                 ),
             )
             .await;
@@ -469,7 +480,7 @@ mod tests {
                 &offer,
                 &attacker_signer().public(),
                 &guest_key,
-                now_unix(),
+                crate::claw_share_session_clock::wall_now_secs("test").expect("plausible clock"),
             )
             .await;
             assert!(result.is_err());
@@ -524,7 +535,7 @@ mod tests {
                 stream,
                 &offer,
                 &params,
-                now_unix(),
+                capture_admission().expect("test host clock must be plausible"),
                 &deps,
                 RelayStreamResponderReverseConnectConfig {
                     relay_addr: "127.0.0.1:49152".parse().unwrap(),
@@ -564,7 +575,7 @@ mod tests {
         let runtime = RelayStreamTrustContextRuntime::load(
             &relay_stream_household_state(),
             &MeshLogStore::new(),
-            now_unix().saturating_sub(10_000),
+            crate::claw_share_session_clock::wall_now_secs("test").expect("plausible clock").saturating_sub(10_000),
             policy,
         )
         .await

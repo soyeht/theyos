@@ -120,6 +120,60 @@ pub enum TunnelAck {
     Rejected { reason: String },
 }
 
+/// The guest's per-Claw VPN IPv4 interface parameters for the `IpTunnel` path.
+///
+/// ROUTE-SCOPE INVARIANT (contract, enforced server-side and by the iOS FFI):
+/// the ONLY route the client installs is the pool CIDR `network(addr,
+/// prefix_len)` — NEVER a default route (`0.0.0.0/0`). A real default route /
+/// exit-node is a separate authenticated policy decision, never inferred from
+/// these settings. `peer` is a DISTINCT unicast host inside that same prefix.
+#[derive(Serialize, Deserialize, Clone, PartialEq, Eq)]
+pub struct MeshIpv4 {
+    /// The guest's assigned tunnel address, e.g. "10.42.0.2".
+    pub addr: String,
+    /// CIDR prefix length; the client derives the subnet mask and installs a
+    /// route for exactly `network(addr, prefix_len)`, never `0.0.0.0/0`.
+    pub prefix_len: u8,
+    /// The claw-side peer / tunnel-remote address, e.g. "10.42.0.3" — a distinct
+    /// unicast host inside the same prefix.
+    pub peer: String,
+}
+
+impl fmt::Debug for MeshIpv4 {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // Addresses reveal VPN topology; redact like the ack's mesh field.
+        f.debug_struct("MeshIpv4")
+            .field("addr", &"<redacted>")
+            .field("prefix_len", &self.prefix_len)
+            .field("peer", &"<redacted>")
+            .finish()
+    }
+}
+
+/// Server → client typed settings carried in a dedicated post-Open
+/// [`TunnelFrame::NetworkSettings`] frame, `IpTunnel` path only. The auth
+/// [`TunnelAck`] stays address-free for ALL paths (unchanged); the real,
+/// pool-allocated address only exists after `router.open`, so it is delivered
+/// here, after the Open-ack. Consumed entirely by the client FFI before any
+/// packet pump; a missing / duplicated / invalid frame fails the connection
+/// closed before any interface is configured.
+#[derive(Serialize, Deserialize, Clone, PartialEq, Eq)]
+pub struct NetworkSettings {
+    pub mesh_ipv4: MeshIpv4,
+    pub mtu: u16,
+    pub session_id: String,
+}
+
+impl fmt::Debug for NetworkSettings {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("NetworkSettings")
+            .field("mesh_ipv4", &self.mesh_ipv4)
+            .field("mtu", &self.mtu)
+            .field("session_id", &"<redacted>")
+            .finish()
+    }
+}
+
 // ─── Typed data frames (post-auth) ─────────────────────────────────────────────
 
 /// Frame kind byte prefixed to every post-auth payload.
@@ -138,6 +192,9 @@ pub const FRAME_ERROR: u8 = 0x13;
 pub const FRAME_WINDOW: u8 = 0x14;
 pub const FRAME_RESIZE: u8 = 0x15;
 pub const FRAME_EXIT: u8 = 0x16;
+/// `IpTunnel`-only: post-Open server→client per-Claw VPN interface settings.
+/// Body is canonical CBOR of [`NetworkSettings`].
+pub const FRAME_NETWORK_SETTINGS: u8 = 0x17;
 
 /// Typed exit status of an interactive target process.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -200,6 +257,9 @@ pub enum TunnelFrame {
     /// Target process exit (engine → client): the typed exit status, sent
     /// just before the closing [`TunnelFrame::Close`].
     Exit(TargetExit),
+    /// `IpTunnel`-only (engine → client): the per-Claw VPN interface settings,
+    /// sent immediately after the Open-ack. CBOR-encoded body.
+    NetworkSettings(NetworkSettings),
 }
 
 struct RedactedFramePayload {
@@ -252,6 +312,7 @@ impl fmt::Debug for TunnelFrame {
                 .field("rows", rows)
                 .finish(),
             Self::Exit(status) => f.debug_tuple("Exit").field(status).finish(),
+            Self::NetworkSettings(ns) => f.debug_tuple("NetworkSettings").field(ns).finish(),
         }
     }
 }
@@ -288,6 +349,13 @@ impl TunnelFrame {
                 out.push(FRAME_EXIT);
                 out.extend_from_slice(&status.encode());
             }
+            Self::NetworkSettings(ns) => {
+                out.push(FRAME_NETWORK_SETTINGS);
+                // A CBOR encode failure of this small struct is effectively
+                // impossible; on failure the empty body decodes to InvalidFrame
+                // and the connection fails closed (no interface configured).
+                out.extend_from_slice(&cbor::to_canonical_vec(ns).unwrap_or_default());
+            }
         }
         out
     }
@@ -318,6 +386,11 @@ impl TunnelFrame {
                 })
             }
             FRAME_EXIT => Ok(Self::Exit(TargetExit::decode(payload)?)),
+            FRAME_NETWORK_SETTINGS => Ok(Self::NetworkSettings(
+                cbor::from_canonical_slice(payload).map_err(|_| {
+                    DataTunnelError::InvalidFrame("bad network_settings frame".into())
+                })?,
+            )),
             other => Err(DataTunnelError::InvalidFrame(format!(
                 "unknown frame kind {other:#04x}"
             ))),
@@ -670,6 +743,12 @@ pub struct TargetSession {
     pub writer: Box<dyn AsyncWrite + Send + Unpin>,
     pub resize: Box<dyn Fn(u16, u16) -> Result<(), DataTunnelError> + Send>,
     pub exit: std::pin::Pin<Box<dyn std::future::Future<Output = TargetExit> + Send>>,
+    /// `IpTunnel` path only: the guest's real, pool-allocated VPN IPv4 address.
+    /// When `Some`, the serve loop assembles a [`NetworkSettings`] (stamping the
+    /// SAME `session_id` it put in the auth [`TunnelAck`], plus the shared MTU)
+    /// and delivers it in a [`TunnelFrame::NetworkSettings`] frame right after
+    /// the Open-ack. `None` for PTY/ClawSite/Device (no VPN interface, no frame).
+    pub vpn_mesh_ipv4: Option<MeshIpv4>,
 }
 
 impl TargetSession {
@@ -686,7 +765,17 @@ impl TargetSession {
             writer: Box::new(writer),
             resize: Box::new(|_, _| Ok(())),
             exit: Box::pin(std::future::pending()),
+            vpn_mesh_ipv4: None,
         }
+    }
+
+    /// Attach the guest's real pool-allocated VPN IPv4 address (`IpTunnel` path).
+    /// The serve loop turns it into a [`NetworkSettings`] frame immediately after
+    /// the Open-ack; every other path leaves this `None` and sends no such frame.
+    #[must_use]
+    pub fn with_vpn_mesh_ipv4(mut self, mesh_ipv4: MeshIpv4) -> Self {
+        self.vpn_mesh_ipv4 = Some(mesh_ipv4);
+        self
     }
 }
 
@@ -931,11 +1020,29 @@ where
     }
 
     // 3. Open the PERSISTENT interactive target.
+    //
+    // Fence: re-check revocation AFTER Open and BEFORE `router.open`. The client
+    // may sit in the Health loop indefinitely, so authorization can lapse in
+    // that window — and until now the first `is_revoked` call happened only on
+    // the per-`Data` path, i.e. AFTER the target was opened and the Open-ack
+    // (and any `NetworkSettings`) had already been sent. For the Group/Public
+    // audience this predicate is the FULL live gate, so it also covers a wall
+    // clock that became unusable mid-wait. Same static deny as elsewhere; no
+    // new frame, kind, codec, or callback.
+    if is_revoked(&cred) {
+        tracing::debug!(
+            stage = "claw_share.data_tunnel.revoked_before_open",
+            target_id = %short_str(&target_id),
+        );
+        return Err(DataTunnelError::TargetUnavailable("revoked".into()));
+    }
+
     let TargetSession {
         mut reader,
         mut writer,
         resize,
         mut exit,
+        vpn_mesh_ipv4,
     } = match router.open(&target_id).await {
         Ok(t) => t,
         Err(e) => {
@@ -946,6 +1053,30 @@ where
     };
     send_frame(&mut tunnel_w, &TunnelFrame::Open).await?; // stream-ready ack
     tracing::debug!(stage = "claw_share.data_tunnel.open_ack_sent", target_id = %short_str(&target_id));
+
+    // IpTunnel path only: deliver the real, pool-allocated VPN interface settings
+    // in a typed frame IMMEDIATELY after the Open-ack.
+    //
+    // RATCHET (inert -> live): this is the point at which a real, routable IPv4
+    // address first reaches the client. The allocation only exists after
+    // `router.open` (§step 3), which is exactly why it cannot ride the auth
+    // `TunnelAck` — that ack stays address-free for ALL paths. PTY/ClawSite/Device
+    // leave `network_settings` = None and send no such frame (unchanged). A send
+    // failure here just closes the connection: fail-closed, no interface set.
+    if let Some(mesh_ipv4) = vpn_mesh_ipv4 {
+        // Stamp the SAME session_id we put in the auth TunnelAck (cred.session_id()).
+        // The client stored the ack's session_id and fail-closes if this differs —
+        // an explicit cross-phase binding beyond the Noise channel. mtu matches the
+        // ack's, and the address is the real pool allocation (route-scope validated
+        // at the router before it ever reaches here).
+        let settings = NetworkSettings {
+            mesh_ipv4,
+            mtu: 1280,
+            session_id: cred.session_id(),
+        };
+        send_frame(&mut tunnel_w, &TunnelFrame::NetworkSettings(settings)).await?;
+        tracing::debug!(stage = "claw_share.data_tunnel.network_settings_sent", target_id = %short_str(&target_id));
+    }
 
     // 4. Bidirectional interactive pipe, driven from a single task so the two
     //    directions, resize, and process exit share the target without
@@ -1653,6 +1784,48 @@ mod tests {
         assert!(
             after.is_err(),
             "session must be torn down after revocation, got {after:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn revoking_during_health_wait_blocks_open_before_the_target_is_opened() {
+        // The Health→Open window: a client may sit in the Health loop for as
+        // long as it likes, so authorization can lapse in between. Before the
+        // pre-`router.open` fence, the first `is_revoked` call happened only on
+        // the per-`Data` path — i.e. AFTER the target had been opened and the
+        // Open-ack (and, on the IpTunnel path, `NetworkSettings` carrying a real
+        // pool-allocated address) had already been sent.
+        //
+        // Here the slot is revoked while the client is still in Health. The
+        // engine must refuse at Open and never reach the target, so the client
+        // sees the tunnel close INSTEAD of an Open-ack.
+        let store = Arc::new(consumed_store("claw_test"));
+        let addr = spawn_engine(
+            store.clone(),
+            spawn_banner_target().await,
+            Arc::new(ReplayGuard::new()),
+        );
+
+        let cbor = cred_cbor();
+        let mut client = TcpStream::connect(addr).await.unwrap();
+        client_authenticate(&mut client, &cbor, valid_token(b"n-health-revoke"))
+            .await
+            .unwrap();
+
+        // Still pre-Open: exercise the Health loop, proving the session is live
+        // and simply waiting.
+        client_health(&mut client, HEALTH_PROBE).await.unwrap();
+
+        // Authorization lapses in the window.
+        store.revoke(&SLOT, NOW).unwrap();
+
+        // Now ask to Open. The fence must reject before `router.open`.
+        send_frame(&mut client, &TunnelFrame::Open).await.unwrap();
+
+        let after = recv_frame(&mut client).await;
+        assert!(
+            after.is_err(),
+            "Open after revocation must be refused before the target is opened, got {after:?}"
         );
     }
 

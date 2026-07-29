@@ -29,7 +29,7 @@ pub(crate) struct RelayStreamOfferTargetGate {
     offer: RelayStreamOfferContract,
     trust: RelayStreamIssuerTrust,
     slots: Arc<ClawShareSlotStore>,
-    now_unix: Arc<dyn Fn() -> u64 + Send + Sync>,
+    now_unix: Arc<dyn Fn() -> Option<u64> + Send + Sync>,
 }
 
 pub struct RelayStreamOfferTargetRouter<P, S, I = RelayStreamIpTunnelUnavailableRouter> {
@@ -147,7 +147,7 @@ impl RelayStreamOfferTargetGate {
         offer: RelayStreamOfferContract,
         trust: RelayStreamIssuerTrust,
         slots: Arc<ClawShareSlotStore>,
-        now_unix: impl Fn() -> u64 + Send + Sync + 'static,
+        now_unix: impl Fn() -> Option<u64> + Send + Sync + 'static,
     ) -> Self {
         Self {
             offer,
@@ -166,7 +166,12 @@ impl RelayStreamOfferTargetGate {
         &self,
         target_id: &str,
     ) -> Result<RelayStreamIpTunnelTarget, DataTunnelError> {
-        let now = (self.now_unix)();
+        // An unusable wall clock cannot enforce `not_after`, so it can only
+        // DENY. Reuses the existing opaque reason: a broken clock must not be
+        // distinguishable from an invalid offer.
+        let Some(now) = (self.now_unix)() else {
+            return Err(target_unavailable("relay-stream-offer-invalid"));
+        };
         let ctx = self
             .trust
             .verify_offer_with_context(&self.offer, now)
@@ -210,7 +215,11 @@ impl RelayStreamOfferTargetGate {
         target_id: &str,
         expected_resource: RelayStreamResource,
     ) -> Result<(), DataTunnelError> {
-        let now = (self.now_unix)();
+        // Same fail-closed rule as `validate_ip_tunnel_target`: no clock, no
+        // authorization. Opaque reason, no backend reached.
+        let Some(now) = (self.now_unix)() else {
+            return Err(target_unavailable("relay-stream-offer-invalid"));
+        };
         // Authorize the offer's signer as an active household machine issuer on
         // every open, via the live trust source: re-verifies signature + signer,
         // enforces `payload.not_after`, membership, and the directory-device
@@ -317,7 +326,7 @@ impl<P, S> RelayStreamOfferTargetRouter<P, S> {
         slots: Arc<ClawShareSlotStore>,
         pty_router: P,
         clawsite_router: S,
-        now_unix: impl Fn() -> u64 + Send + Sync + 'static,
+        now_unix: impl Fn() -> Option<u64> + Send + Sync + 'static,
     ) -> Self {
         Self {
             gate: RelayStreamOfferTargetGate::new(offer, trust, slots, now_unix),
@@ -341,7 +350,7 @@ impl<P, S, I> RelayStreamOfferTargetRouter<P, S, I> {
         pty_router: P,
         clawsite_router: S,
         ip_tunnel_router: I,
-        now_unix: impl Fn() -> u64 + Send + Sync + 'static,
+        now_unix: impl Fn() -> Option<u64> + Send + Sync + 'static,
     ) -> Self {
         Self {
             gate: RelayStreamOfferTargetGate::new(offer, trust, slots, now_unix),
@@ -697,7 +706,7 @@ mod tests {
             slots,
             TcpStreamRouter::new(pty_addr),
             TcpStreamRouter::new(site_addr),
-            || NOW,
+            || Some(NOW),
         )
     }
 
@@ -705,7 +714,7 @@ mod tests {
         resource: RelayStreamResource,
         slots: Arc<ClawShareSlotStore>,
     ) -> RelayStreamOfferTargetGate {
-        RelayStreamOfferTargetGate::new(offer(resource), trust(), slots, || NOW)
+        RelayStreamOfferTargetGate::new(offer(resource), trust(), slots, || Some(NOW))
     }
 
     // Builds a router over unreachable backends, so a validation failure surfaces
@@ -714,7 +723,7 @@ mod tests {
     fn router_with(
         offer: RelayStreamOfferContract,
         slots: Arc<ClawShareSlotStore>,
-        now_unix: impl Fn() -> u64 + Send + Sync + 'static,
+        now_unix: impl Fn() -> Option<u64> + Send + Sync + 'static,
     ) -> RelayStreamOfferTargetRouter<TcpStreamRouter, TcpStreamRouter> {
         RelayStreamOfferTargetRouter::new(
             offer,
@@ -724,6 +733,49 @@ mod tests {
             TcpStreamRouter::new("127.0.0.1:1"),
             now_unix,
         )
+    }
+
+    #[tokio::test]
+    async fn relay_stream_target_router_denies_when_clock_unusable_without_touching_backend() {
+        // An unusable wall clock cannot enforce `not_after`, so it can only
+        // deny. `router_with` points at an unreachable backend, so resolving to
+        // `TargetUnavailable` proves nothing was dialed. The reason stays the
+        // existing opaque one: a broken clock must not be distinguishable from
+        // an invalid offer.
+        let router = router_with(
+            offer(RelayStreamResource::Pty),
+            consumed_slots(),
+            || None,
+        );
+
+        let error = open_error(&router).await;
+
+        assert!(
+            matches!(error, DataTunnelError::TargetUnavailable(ref reason)
+                if reason == "relay-stream-offer-invalid"),
+            "expected opaque deny, got {error:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn relay_stream_target_router_denies_clock_at_epoch_and_below_floor() {
+        // `Ok(0)` is the SUCCESS branch of `duration_since`, and a merely late
+        // clock weakens expiry proportionally. Both must deny, not just `Err`.
+        for reading in [0_u64, crate::claw_share_session_clock::MIN_PLAUSIBLE_UNIX_SECS - 1] {
+            let router = router_with(
+                offer(RelayStreamResource::Pty),
+                consumed_slots(),
+                move || crate::claw_share_session_clock::plausible_unix_secs(reading),
+            );
+
+            let error = open_error(&router).await;
+
+            assert!(
+                matches!(error, DataTunnelError::TargetUnavailable(ref reason)
+                    if reason == "relay-stream-offer-invalid"),
+                "clock reading {reading} must deny, got {error:?}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -752,7 +804,7 @@ mod tests {
             empty_slots(),
             TcpStreamRouter::new("127.0.0.1:1"),
             TcpStreamRouter::new("127.0.0.1:1"),
-            || NOW,
+            || Some(NOW),
         );
 
         let error = open_error(&router).await;
@@ -772,7 +824,7 @@ mod tests {
             TcpStreamRouter::new("127.0.0.1:1"),
             TcpStreamRouter::new("127.0.0.1:1"),
             AckIpTunnelRouter::new(ip_addr),
-            || NOW,
+            || Some(NOW),
         );
 
         let response = open_and_roundtrip(&router).await.unwrap();
@@ -807,7 +859,7 @@ mod tests {
             RecordingIpTunnelRouter {
                 seen: Arc::clone(&seen),
             },
-            || NOW,
+            || Some(NOW),
         );
 
         let error = open_error(&router).await;
@@ -844,7 +896,7 @@ mod tests {
             group_iptunnel_offer(),
             group_trust(group_projection(true, true, true)),
             empty_slots(),
-            || NOW,
+            || Some(NOW),
         );
         ip_gate.validate_ip_tunnel_target(CLAW_ID).expect(
             "Group-scoped IpTunnel offer should pass the exact resource/member gate before runtime remains fail-closed",
@@ -943,7 +995,7 @@ mod tests {
             empty_slots(), // Group path must NOT consult the slot store.
             TcpStreamRouter::new("127.0.0.1:1"),
             TcpStreamRouter::new(site_addr),
-            || NOW,
+            || Some(NOW),
         )
     }
 
@@ -1003,7 +1055,7 @@ mod tests {
             empty_slots(),
             TcpStreamRouter::new("127.0.0.1:1"),
             TcpStreamRouter::new(site_addr),
-            || NOW,
+            || Some(NOW),
         )
     }
 
@@ -1036,7 +1088,7 @@ mod tests {
             TcpStreamRouter::new("127.0.0.1:1"),
             TcpStreamRouter::new("127.0.0.1:1"),
             AckIpTunnelRouter::new(ip_addr),
-            || NOW,
+            || Some(NOW),
         );
 
         let error = open_error(&router).await;
@@ -1060,7 +1112,7 @@ mod tests {
             TcpStreamRouter::new("127.0.0.1:1"),
             TcpStreamRouter::new("127.0.0.1:1"),
             AckIpTunnelRouter::new(ip_addr),
-            || NOW,
+            || Some(NOW),
         );
 
         let error = open_error(&router).await;
@@ -1186,7 +1238,7 @@ mod tests {
         // NOW + 600. The offer's own expiry gate must reject the open even though
         // the slot has not expired and its signature is untampered.
         let router = router_with(offer(RelayStreamResource::Pty), consumed_slots(), || {
-            NOW + 120
+            Some(NOW + 120)
         });
 
         let error = open_error(&router).await;
@@ -1201,7 +1253,7 @@ mod tests {
         let forged =
             RelayStreamOfferContract::sign(offer(RelayStreamResource::Pty).payload, &attacker())
                 .unwrap();
-        let router = router_with(forged, consumed_slots(), || NOW);
+        let router = router_with(forged, consumed_slots(), || Some(NOW));
 
         let error = open_error(&router).await;
 
@@ -1214,7 +1266,7 @@ mod tests {
     async fn relay_stream_target_router_rejects_tampered_offer_before_backend() {
         let mut tampered = offer(RelayStreamResource::Pty);
         tampered.payload.relay_endpoint = "relay-stream://127.0.0.1:49153".to_string();
-        let router = router_with(tampered, consumed_slots(), || NOW);
+        let router = router_with(tampered, consumed_slots(), || Some(NOW));
 
         let error = open_error(&router).await;
 
@@ -1229,7 +1281,7 @@ mod tests {
             RelayStreamResource::Pty,
             RelayStreamExpectedPath::CommunityRelay,
         );
-        let router = router_with(community_offer, consumed_slots(), || NOW);
+        let router = router_with(community_offer, consumed_slots(), || Some(NOW));
 
         let error = open_error(&router).await;
 
@@ -1249,7 +1301,7 @@ mod tests {
             consumed_slots(),
             TcpStreamRouter::new("127.0.0.1:1"),
             TcpStreamRouter::new("127.0.0.1:1"),
-            || NOW,
+            || Some(NOW),
         );
 
         let error = open_error(&router).await;
@@ -1269,7 +1321,7 @@ mod tests {
             consumed_slots(),
             pty,
             site,
-            || NOW,
+            || Some(NOW),
         );
 
         let debug = format!("{router:?}");
@@ -1316,7 +1368,7 @@ mod tests {
             empty_slots(),
             TcpStreamRouter::new("127.0.0.1:1"),
             TcpStreamRouter::new(site_addr),
-            || NOW,
+            || Some(NOW),
         );
 
         let response = open_and_roundtrip(&router).await.unwrap();
@@ -1341,7 +1393,7 @@ mod tests {
             empty_slots(),                                   // but no consumed slot
             TcpStreamRouter::new("127.0.0.1:1"),
             TcpStreamRouter::new("127.0.0.1:1"),
-            || NOW,
+            || Some(NOW),
         );
 
         let error = open_error(&router).await;
@@ -1363,7 +1415,7 @@ mod tests {
             consumed_slots(), // slot consumed by guest() (would pass the Device gate)
             TcpStreamRouter::new("127.0.0.1:1"),
             TcpStreamRouter::new("127.0.0.1:1"),
-            || NOW,
+            || Some(NOW),
         );
 
         let error = open_error(&router).await;

@@ -7,7 +7,6 @@
 
 use std::fmt;
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use household_rs::claw_share::{ClawShareSlotStore, GuestCredential, SlotState};
 use household_rs::claw_share_data_tunnel::{
@@ -25,6 +24,7 @@ use crate::claw_share_relay_stream_responder_params::RelayStreamResponderParams;
 use crate::claw_share_relay_stream_session::{
     RelayStreamOfferSession, relay_stream_offer_session_revoked, verify_relay_stream_offer_session,
 };
+use crate::claw_share_session_clock::{AdmissionInstant, ClockVerdict, SessionClock};
 
 pub struct ResponderDataTunnelDeps<R> {
     pub household_id: HouseholdId,
@@ -66,13 +66,59 @@ pub async fn serve_relay_stream_responder_connection<S, R>(
     offer: &RelayStreamOfferContract,
     params: &RelayStreamResponderParams,
     trust: &RelayStreamIssuerTrust,
-    now_unix: u64,
+    admission: AdmissionInstant,
     deps: &ResponderDataTunnelDeps<R>,
 ) -> Result<(), RelayStreamResponderError>
 where
     S: AsyncRead + AsyncWrite + Unpin,
     R: ClawTargetRouter,
 {
+    serve_relay_stream_responder_connection_with_live_clock(
+        stream,
+        offer,
+        params,
+        trust,
+        admission,
+        deps,
+        Arc::new(SessionClock::live_now),
+    )
+    .await
+}
+
+type SessionLiveNow =
+    Arc<dyn Fn(&SessionClock) -> Result<u64, ClockVerdict> + Send + Sync + 'static>;
+
+#[allow(clippy::too_many_arguments)]
+async fn serve_relay_stream_responder_connection_with_live_clock<S, R>(
+    stream: S,
+    offer: &RelayStreamOfferContract,
+    params: &RelayStreamResponderParams,
+    trust: &RelayStreamIssuerTrust,
+    admission: AdmissionInstant,
+    deps: &ResponderDataTunnelDeps<R>,
+    live_now: SessionLiveNow,
+) -> Result<(), RelayStreamResponderError>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+    R: ClawTargetRouter,
+{
+    // The SAME admission wall reading feeds the handshake and the auth gate —
+    // no caller reads its own `now`.
+    let now_unix = admission.wall();
+
+    // Dual-clock authority for this session, derived ONCE from the admission
+    // pair and never recaptured. Built BEFORE the Noise handshake so an
+    // admission that has already expired cannot reach it, and re-checked right
+    // after, so the time spent in dial/hello/scheduling cannot carry a stale
+    // admission into Open. Applies to EVERY audience.
+    let clock = SessionClock::admit(
+        admission,
+        offer.payload.not_after,
+        "claw_share.relay_stream.session",
+    )
+    .map_err(|_| RelayStreamResponderError::ClockUnusable)?;
+    live_now(&clock).map_err(|_| RelayStreamResponderError::ClockUnusable)?;
+
     // `trust` is the per-connection seam admitted upstream; this fn never holds
     // a long-lived seam, so the admission health gate is applied per connection.
     let framed = timeout(
@@ -88,15 +134,24 @@ where
     .await
     .map_err(|_| RelayStreamResponderError::HandshakeTimeout)??;
 
+    // The handshake can take up to `auth_deadline`; re-check before Open so a
+    // session whose signed bound passed meanwhile cannot proceed.
+    live_now(&clock).map_err(|_| RelayStreamResponderError::ClockUnusable)?;
+
     let noise_stream = framed.into_async_stream();
 
     match offer.payload.audience() {
-        // Device (1:1 slot): unchanged credential + slot-revoke path.
+        // Device (1:1 slot): credential auth, then slot revocation OR clock
+        // failure. The mid-session predicate includes the clock term, so an
+        // unusable/regressed clock or a passed `not_after` tears a Device
+        // session down like any other audience.
         RelayStreamAudience::Device => {
             let household_id = deps.household_id.clone();
             let auth_slots = Arc::clone(&deps.slots);
             let replay = Arc::clone(&deps.replay);
             let revocation_slots = Arc::clone(&deps.slots);
+            let device_clock = clock.clone();
+            let device_live_now = Arc::clone(&live_now);
             serve_connection_io_with_auth_deadline(
                 noise_stream,
                 now_unix,
@@ -105,6 +160,13 @@ where
                 },
                 &deps.router,
                 move |cred: &GuestCredential| {
+                    // Slot revocation OR clock failure. Without the clock term a
+                    // Device session would survive an unusable/regressed clock
+                    // and a passed `not_after` — the same mid-session fail-open
+                    // the Group/Public path closes.
+                    if device_live_now(&device_clock).is_err() {
+                        return true;
+                    }
                     matches!(
                         revocation_slots
                             .get(&cred.slot_id)
@@ -128,11 +190,12 @@ where
             let verify_replay = Arc::clone(&deps.replay);
             let rev_offer = offer.clone();
             let rev_trust = trust.clone();
-            let clock: Arc<dyn Fn() -> u64 + Send + Sync> = Arc::new(|| {
-                SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .map_or(0, |d| d.as_secs())
-            });
+            let rev_live_now = Arc::clone(&live_now);
+            // Reuses the SAME `clock` built pre-handshake — no recapture, which
+            // would restart the session's life. Previously this closure read the
+            // wall clock with `map_or(0, ..)`, so a host at/before the epoch
+            // produced now = 0 and `relay_stream_offer_session_revoked` never
+            // fired: a broken clock KEPT a live session that should have died.
             serve_connection_io_with_auth_deadline(
                 noise_stream,
                 now_unix,
@@ -141,7 +204,13 @@ where
                 },
                 &deps.router,
                 move |_session: &RelayStreamOfferSession| {
-                    relay_stream_offer_session_revoked(&rev_offer, &rev_trust, clock())
+                    // A clock that cannot be trusted REVOKES: implausible or
+                    // regressed wall, the signed `not_after` passing, the
+                    // monotonic deadline passing, or any overflow.
+                    let Ok(now) = rev_live_now(&clock) else {
+                        return true;
+                    };
+                    relay_stream_offer_session_revoked(&rev_offer, &rev_trust, now)
                 },
                 params.auth_deadline,
             )
@@ -162,11 +231,18 @@ pub enum RelayStreamResponderError {
 
     #[error("relay stream responder data tunnel failed: {0}")]
     DataTunnel(#[from] DataTunnelError),
+
+    /// The wall clock is unusable, or the offer is already expired at
+    /// admission. Refused BEFORE Open: with a broken clock expiry cannot be
+    /// enforced at all, so serving would be fail-open.
+    #[error("relay stream responder refused: implausible clock or expired offer at admission")]
+    ClockUnusable,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::Duration;
 
     use household_rs::cbor;
@@ -215,6 +291,48 @@ mod tests {
         support_data_tunnel_token(TOKEN_AUDIENCE, credential_cbor, nonce)
     }
 
+    fn device_offer_expiring_at(
+        rendezvous_label: u8,
+        keypair: &crate::claw_share_relay_stream_noise::RelayStreamNoiseStaticKeypair,
+        not_after: u64,
+    ) -> RelayStreamOfferContract {
+        let mut offer = relay_stream_offer(rendezvous_token(rendezvous_label), keypair);
+        offer.payload.not_after = not_after;
+        RelayStreamOfferContract::sign(offer.payload, &owner_signer()).unwrap()
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum LiveClockFailure {
+        Unusable,
+        WallRegressed,
+        SignedExpiryPassed,
+    }
+
+    fn controlled_live_now(
+        armed: Arc<AtomicBool>,
+        failure: LiveClockFailure,
+        admitted_at: u64,
+        not_after: u64,
+    ) -> SessionLiveNow {
+        Arc::new(move |clock| {
+            if !armed.load(Ordering::SeqCst) {
+                return clock.live_at_for_test(Some(admitted_at), Duration::ZERO);
+            }
+            match failure {
+                LiveClockFailure::Unusable => {
+                    clock.live_at_for_test(None, Duration::from_millis(1))
+                }
+                LiveClockFailure::WallRegressed => clock.live_at_for_test(
+                    Some(crate::claw_share_session_clock::MIN_PLAUSIBLE_UNIX_SECS + 1),
+                    Duration::from_secs(1),
+                ),
+                LiveClockFailure::SignedExpiryPassed => {
+                    clock.live_at_for_test(Some(not_after), Duration::from_millis(1))
+                }
+            }
+        })
+    }
+
     async fn client_noise_stream(
         stream: tokio::io::DuplexStream,
         offer: &RelayStreamOfferContract,
@@ -252,7 +370,12 @@ mod tests {
             let trust = params.admission.admit(serve_now).unwrap();
 
             let server = serve_relay_stream_responder_connection(
-                server_io, &offer, &params, &trust, serve_now, &deps,
+                server_io,
+                &offer,
+                &params,
+                &trust,
+                AdmissionInstant::from_seam_wall(serve_now).expect("plausible test clock"),
+                &deps,
             );
             let client = async {
                 let mut stream = client_noise_stream(client_io, &offer, serve_now).await;
@@ -302,7 +425,12 @@ mod tests {
             let trust = params.admission.admit(serve_now).unwrap();
 
             let server = serve_relay_stream_responder_connection(
-                server_io, &offer, &params, &trust, serve_now, &deps,
+                server_io,
+                &offer,
+                &params,
+                &trust,
+                AdmissionInstant::from_seam_wall(serve_now).expect("plausible test clock"),
+                &deps,
             );
             let client = async {
                 let mut stream = client_noise_stream(client_io, &offer, serve_now).await;
@@ -349,7 +477,12 @@ mod tests {
             let trust = params.admission.admit(serve_now).unwrap();
 
             let server = serve_relay_stream_responder_connection(
-                server_io, &offer, &params, &trust, serve_now, &deps,
+                server_io,
+                &offer,
+                &params,
+                &trust,
+                AdmissionInstant::from_seam_wall(serve_now).expect("plausible test clock"),
+                &deps,
             );
             let client = async {
                 let mut stream = client_noise_stream(client_io, &offer, serve_now).await;
@@ -405,6 +538,85 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn relay_stream_responder_device_live_clock_failures_tear_down_real_serve() {
+        for (index, failure) in [
+            LiveClockFailure::Unusable,
+            LiveClockFailure::WallRegressed,
+            LiveClockFailure::SignedExpiryPassed,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            timeout(Duration::from_secs(5), async {
+                let keypair = generate_relay_stream_noise_static_keypair().unwrap();
+                let serve_now = now_unix();
+                let not_after = serve_now + 60;
+                let offer = device_offer_expiring_at(
+                    0x76 + u8::try_from(index).unwrap(),
+                    &keypair,
+                    not_after,
+                );
+                let params = params(keypair, Duration::from_secs(3)).await;
+                let deps = data_tunnel_deps(
+                    data_tunnel_store(),
+                    Arc::new(ReplayGuard::new()),
+                    spawn_ack_target().await,
+                );
+                let cbor = cbor::to_canonical_vec(&data_tunnel_credential()).unwrap();
+                let (client_io, server_io) = duplex(64 * 1024);
+                let trust = params.admission.admit(serve_now).unwrap();
+                let armed = Arc::new(AtomicBool::new(false));
+
+                let server = serve_relay_stream_responder_connection_with_live_clock(
+                    server_io,
+                    &offer,
+                    &params,
+                    &trust,
+                    AdmissionInstant::from_seam_wall(serve_now).expect("plausible test clock"),
+                    &deps,
+                    controlled_live_now(Arc::clone(&armed), failure, serve_now, not_after),
+                );
+                let client = async {
+                    let mut stream = client_noise_stream(client_io, &offer, serve_now).await;
+                    assert!(matches!(
+                        client_authenticate(
+                            &mut stream,
+                            &cbor,
+                            data_tunnel_token(&cbor, b"device-live-clock")
+                        )
+                        .await
+                        .unwrap(),
+                        TunnelAck::Ok { .. }
+                    ));
+                    client_open_stream(&mut stream).await.unwrap();
+
+                    armed.store(true, Ordering::SeqCst);
+                    send_frame(
+                        &mut stream,
+                        &TunnelFrame::Data(b"after-clock-failure".to_vec()),
+                    )
+                    .await
+                    .unwrap();
+                    assert!(
+                        recv_frame(&mut stream).await.is_err(),
+                        "{failure:?} must tear down the live Device session"
+                    );
+                };
+
+                let (server_result, ()) = tokio::join!(server, client);
+                assert!(matches!(
+                    server_result,
+                    Err(RelayStreamResponderError::DataTunnel(
+                        DataTunnelError::Rejected(reason)
+                    )) if reason == "slot-revoked"
+                ));
+            })
+            .await
+            .unwrap();
+        }
+    }
+
+    #[tokio::test]
     async fn relay_stream_responder_noise_handshake_times_out_before_auth() {
         timeout(Duration::from_secs(2), async {
             let keypair = generate_relay_stream_noise_static_keypair().unwrap();
@@ -419,7 +631,12 @@ mod tests {
             let serve_now = now_unix();
             let trust = params.admission.admit(serve_now).unwrap();
             let server = serve_relay_stream_responder_connection(
-                server_io, &offer, &params, &trust, serve_now, &deps,
+                server_io,
+                &offer,
+                &params,
+                &trust,
+                AdmissionInstant::from_seam_wall(serve_now).expect("plausible test clock"),
+                &deps,
             );
             let keep_client_open = async move {
                 tokio::time::sleep(Duration::from_millis(200)).await;
@@ -453,7 +670,12 @@ mod tests {
             let trust = params.admission.admit(serve_now).unwrap();
 
             let result = serve_relay_stream_responder_connection(
-                server_io, &offer, &params, &trust, serve_now, &deps,
+                server_io,
+                &offer,
+                &params,
+                &trust,
+                AdmissionInstant::from_seam_wall(serve_now).expect("plausible test clock"),
+                &deps,
             )
             .await;
 
@@ -556,7 +778,12 @@ mod tests {
             let (client_io, server_io) = duplex(64 * 1024);
 
             let server = serve_relay_stream_responder_connection(
-                server_io, &offer, &params, &trust, serve_now, &deps,
+                server_io,
+                &offer,
+                &params,
+                &trust,
+                AdmissionInstant::from_seam_wall(serve_now).expect("plausible test clock"),
+                &deps,
             );
             let client = async {
                 let mut stream = client_noise_stream(client_io, &offer, serve_now).await;
@@ -602,6 +829,110 @@ mod tests {
 
             let (server_result, ()) = tokio::join!(server, client);
             server_result.unwrap();
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn relay_stream_responder_group_iptunnel_clock_failure_tears_down_live_session() {
+        timeout(Duration::from_secs(5), async {
+            let keypair = generate_relay_stream_noise_static_keypair().unwrap();
+            let serve_now = now_unix();
+            let not_after = serve_now + 60;
+            let offer = mint_relay_stream_group_offer(
+                rendezvous_token(0x7b),
+                SlotId([0x9a; 16]),
+                "g".to_string(),
+                "g_a".to_string(),
+                guest_pub(),
+                RELAY_STREAM_CLAW_ID.to_string(),
+                RelayStreamResource::IpTunnel,
+                RELAY_STREAM_ENDPOINT.to_string(),
+                keypair.public_key().clone(),
+                not_after,
+                serve_now,
+                &owner_signer(),
+            )
+            .unwrap();
+            let params = params(keypair, Duration::from_secs(3)).await;
+            let deps = data_tunnel_deps(
+                data_tunnel_store(),
+                Arc::new(ReplayGuard::new()),
+                spawn_ack_target().await,
+            );
+            let projection = group_projection_active();
+            let trust = RelayStreamIssuerTrust::new(move || RelayStreamTrustContext {
+                record: relay_stream_household_record(),
+                cert: relay_stream_machine_cert(),
+                projection: projection.clone(),
+            });
+            let (client_io, server_io) = duplex(64 * 1024);
+            let armed = Arc::new(AtomicBool::new(false));
+
+            let server = serve_relay_stream_responder_connection_with_live_clock(
+                server_io,
+                &offer,
+                &params,
+                &trust,
+                AdmissionInstant::from_seam_wall(serve_now).expect("plausible test clock"),
+                &deps,
+                controlled_live_now(
+                    Arc::clone(&armed),
+                    LiveClockFailure::Unusable,
+                    serve_now,
+                    not_after,
+                ),
+            );
+            let client = async {
+                let mut stream = client_noise_stream(client_io, &offer, serve_now).await;
+                let offer_cbor = offer.payload.to_canonical_bytes().unwrap();
+                let token = SessionAuthToken::sign(
+                    "relay-stream-group-iptunnel-expiry".to_string(),
+                    &offer_cbor,
+                    RELAY_STREAM_ENDPOINT.to_string(),
+                    RELAY_STREAM_CLAW_ID.to_string(),
+                    b"g2".to_vec(),
+                    not_after,
+                    &guest_signer(),
+                )
+                .unwrap();
+                assert!(matches!(
+                    client_authenticate(&mut stream, &offer_cbor, token)
+                        .await
+                        .unwrap(),
+                    TunnelAck::Ok { .. }
+                ));
+                client_open_stream(&mut stream).await.unwrap();
+                send_frame(&mut stream, &TunnelFrame::Data(b"before-expiry".to_vec()))
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    recv_frame(&mut stream).await.unwrap(),
+                    TunnelFrame::Data(b"ACK:before-expiry".to_vec())
+                );
+
+                armed.store(true, Ordering::SeqCst);
+                let write = send_frame(
+                    &mut stream,
+                    &TunnelFrame::Data(b"after-clock-failure".to_vec()),
+                )
+                .await;
+                if write.is_ok() {
+                    assert!(
+                        recv_frame(&mut stream).await.is_err(),
+                        "unusable clock must tear down live Group IpTunnel stream"
+                    );
+                }
+            };
+
+            let (server_result, ()) = tokio::join!(server, client);
+            assert!(matches!(
+                server_result,
+                Err(RelayStreamResponderError::DataTunnel(
+                    DataTunnelError::Rejected(reason)
+                )) if reason == "slot-revoked"
+            ));
         })
         .await
         .unwrap();

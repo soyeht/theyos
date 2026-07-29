@@ -27,10 +27,11 @@ use std::sync::mpsc::{Receiver, SyncSender, TrySendError, sync_channel};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use std::thread;
+use std::net::Ipv4Addr;
 use std::time::Duration;
 
 use hmac::{Hmac, Mac};
-use household_rs::claw_share_data_tunnel::{DataTunnelError, TargetSession};
+use household_rs::claw_share_data_tunnel::{DataTunnelError, MeshIpv4, TargetSession};
 use household_rs::claw_vpn::{
     ClawVpnAcl, ClawVpnAclKey, ClawVpnAgentCore, ClawVpnAuditEvent, ClawVpnDatapathSide,
     ClawVpnSessionRegistry,
@@ -965,6 +966,57 @@ where
     }
 }
 
+/// Build the guest's VPN interface parameters from the real pool allocation,
+/// enforcing the ROUTE-SCOPE INVARIANT (contract with the iOS client): the ONLY
+/// route the client installs is the pool CIDR `network(addr, prefix_len)` —
+/// NEVER a default route (`0.0.0.0/0`, full exit-node capture). Fails CLOSED on
+/// anything that would widen the route:
+///
+/// - `prefix_len` 0 (== `0.0.0.0/0`) or > 32;
+/// - a device or peer address OUTSIDE the pool CIDR;
+/// - a peer equal to the device, or a non-unicast address.
+///
+/// A real default route / exit-node is a separate authenticated policy decision,
+/// never inferred here.
+fn build_vpn_mesh_ipv4(
+    network: Ipv4Addr,
+    prefix_len: u8,
+    device: Ipv4Addr,
+    peer: Ipv4Addr,
+) -> Result<MeshIpv4, &'static str> {
+    if prefix_len == 0 || prefix_len > 32 {
+        return Err("claw-vpn-t1-route-scope-prefix");
+    }
+    if device == peer || !is_unicast_host(device) || !is_unicast_host(peer) {
+        return Err("claw-vpn-t1-route-scope-peer");
+    }
+    // Both hosts MUST live inside the SAME pool CIDR — that CIDR is the only
+    // route the client installs.
+    if !in_same_ipv4_network(network, prefix_len, device)
+        || !in_same_ipv4_network(network, prefix_len, peer)
+    {
+        return Err("claw-vpn-t1-route-scope-cidr");
+    }
+    Ok(MeshIpv4 {
+        addr: device.to_string(),
+        prefix_len,
+        peer: peer.to_string(),
+    })
+}
+
+/// True iff `addr` is in `network/prefix_len`. `prefix_len` is 1..=32 here
+/// (0 is rejected before this is reached, so the route is never `0.0.0.0/0`).
+fn in_same_ipv4_network(network: Ipv4Addr, prefix_len: u8, addr: Ipv4Addr) -> bool {
+    let shift = 32u32.saturating_sub(u32::from(prefix_len));
+    let mask = if shift >= 32 { 0 } else { u32::MAX << shift };
+    (u32::from(network) & mask) == (u32::from(addr) & mask)
+}
+
+/// A routable unicast host (not unspecified / loopback / broadcast / multicast).
+fn is_unicast_host(addr: Ipv4Addr) -> bool {
+    !addr.is_unspecified() && !addr.is_loopback() && !addr.is_broadcast() && !addr.is_multicast()
+}
+
 fn attach_admission_permit(
     session: TargetSession,
     permit: ClawVpnT1RelayStreamAdmissionPermit,
@@ -974,6 +1026,7 @@ fn attach_admission_permit(
         writer,
         resize,
         exit,
+        vpn_mesh_ipv4,
     } = session;
     let permit = Arc::new(permit);
     let resize_permit = Arc::clone(&permit);
@@ -996,6 +1049,7 @@ fn attach_admission_permit(
             drop(exit_permit);
             result
         }),
+        vpn_mesh_ipv4,
     }
 }
 
@@ -1061,6 +1115,27 @@ where
             let _ = (self.audit_sink)(close_event);
             return Err(target_unavailable(reason));
         }
+        // Real, pool-allocated VPN interface for the guest. Validate the route
+        // scope NOW and fail CLOSED (closing the session) before assembling any
+        // runtime: the client installs a route for exactly the pool CIDR, never
+        // 0.0.0.0/0. It is delivered post-Open in a NetworkSettings frame (see the
+        // data-tunnel serve loop). RATCHET: this is where a real routable address
+        // is first minted for the client.
+        let pool = self.config.ipv4_pool();
+        let addrs = session.addrs();
+        let vpn_mesh_ipv4 = match build_vpn_mesh_ipv4(
+            pool.network(),
+            pool.prefix_len(),
+            addrs.device(),
+            addrs.claw(),
+        ) {
+            Ok(mesh) => mesh,
+            Err(reason) => {
+                let (_closed, close_event) = core.close_with_audit(session_id);
+                let _ = (self.audit_sink)(close_event);
+                return Err(target_unavailable(reason));
+            }
+        };
         let session_core = core
             .into_session_core(session_id)
             .map_err(|_| target_unavailable("claw-vpn-t1-session-core-missing"))?;
@@ -1079,7 +1154,7 @@ where
         let (target_session, wiring) = runtime.into_parts();
         (self.launch_runtime)(wiring)
             .map_err(|_| target_unavailable("claw-vpn-t1-runtime-launch-failed"))?;
-        Ok(attach_admission_permit(target_session, permit))
+        Ok(attach_admission_permit(target_session, permit).with_vpn_mesh_ipv4(vpn_mesh_ipv4))
     }
 }
 
@@ -1318,6 +1393,27 @@ where
             let _ = (self.audit_sink)(close_event);
             return Err(target_unavailable(reason));
         }
+        // Real, pool-allocated VPN interface for the guest. Validate the route
+        // scope NOW and fail CLOSED (closing the session) before assembling any
+        // runtime: the client installs a route for exactly the pool CIDR, never
+        // 0.0.0.0/0. It is delivered post-Open in a NetworkSettings frame (see the
+        // data-tunnel serve loop). RATCHET: this is where a real routable address
+        // is first minted for the client.
+        let pool = self.config.ipv4_pool();
+        let addrs = session.addrs();
+        let vpn_mesh_ipv4 = match build_vpn_mesh_ipv4(
+            pool.network(),
+            pool.prefix_len(),
+            addrs.device(),
+            addrs.claw(),
+        ) {
+            Ok(mesh) => mesh,
+            Err(reason) => {
+                let (_closed, close_event) = core.close_with_audit(session_id);
+                let _ = (self.audit_sink)(close_event);
+                return Err(target_unavailable(reason));
+            }
+        };
         let session_core = core
             .into_session_core(session_id)
             .map_err(|_| target_unavailable("claw-vpn-t1-session-core-missing"))?;
@@ -1335,7 +1431,7 @@ where
         let (target_session, wiring) = runtime.into_parts();
         (self.launch_runtime)(wiring)
             .map_err(|_| target_unavailable("claw-vpn-t1-runtime-launch-failed"))?;
-        Ok(attach_admission_permit(target_session, permit))
+        Ok(attach_admission_permit(target_session, permit).with_vpn_mesh_ipv4(vpn_mesh_ipv4))
     }
 }
 
@@ -1406,6 +1502,92 @@ mod tests {
 
     use household_rs::claw_vpn::{ClawVpnAuditAction, ClawVpnAuditReason, ClawVpnAuditSubject};
     use household_rs::keys::{IdentityKey, P256Keypair};
+
+    // ── Route-scope invariant: the per-Claw VPN interface route is EXACTLY the
+    //    pool CIDR, NEVER a default route (0.0.0.0/0). Cross-language contract
+    //    with the iOS client — full exit-node capture is a separate authenticated
+    //    policy decision, never inferred here. (household_listener.rs style.) ──
+
+    #[test]
+    fn build_vpn_mesh_ipv4_scopes_route_to_pool_cidr_never_default() {
+        // A valid pool CIDR + two distinct in-prefix unicast hosts.
+        let network = Ipv4Addr::new(11, 0, 0, 0);
+        let mesh = build_vpn_mesh_ipv4(
+            network,
+            24,
+            Ipv4Addr::new(11, 0, 0, 1),
+            Ipv4Addr::new(11, 0, 0, 2),
+        )
+        .expect("a valid in-CIDR pair is accepted");
+
+        assert_eq!(mesh.prefix_len, 24);
+        assert_ne!(mesh.prefix_len, 0, "the included route must never be 0.0.0.0/0");
+        let addr: Ipv4Addr = mesh.addr.parse().unwrap();
+        let peer: Ipv4Addr = mesh.peer.parse().unwrap();
+        assert_ne!(addr, peer, "peer must be a distinct host");
+        // The ONLY route the client installs is network(addr, prefix_len), and it
+        // equals the pool CIDR — never wider.
+        let mask = u32::MAX << (32 - u32::from(mesh.prefix_len));
+        assert_eq!(
+            u32::from(addr) & mask,
+            u32::from(network),
+            "the included route must equal the pool CIDR, nothing wider"
+        );
+    }
+
+    #[test]
+    fn build_vpn_mesh_ipv4_rejects_default_route_prefix() {
+        let net = Ipv4Addr::new(11, 0, 0, 0);
+        let (dev, peer) = (Ipv4Addr::new(11, 0, 0, 1), Ipv4Addr::new(11, 0, 0, 2));
+        // prefix 0 == 0.0.0.0/0 == full exit-node capture. Rejected fail-closed.
+        assert_eq!(
+            build_vpn_mesh_ipv4(net, 0, dev, peer),
+            Err("claw-vpn-t1-route-scope-prefix")
+        );
+        // >32 is not a valid IPv4 prefix.
+        assert_eq!(
+            build_vpn_mesh_ipv4(net, 33, dev, peer),
+            Err("claw-vpn-t1-route-scope-prefix")
+        );
+    }
+
+    #[test]
+    fn build_vpn_mesh_ipv4_rejects_equal_or_non_unicast_peer() {
+        let net = Ipv4Addr::new(11, 0, 0, 0);
+        let dev = Ipv4Addr::new(11, 0, 0, 1);
+        // device == peer.
+        assert_eq!(
+            build_vpn_mesh_ipv4(net, 24, dev, dev),
+            Err("claw-vpn-t1-route-scope-peer")
+        );
+        // non-unicast peer (loopback / multicast / broadcast / unspecified).
+        for bad in [
+            Ipv4Addr::new(127, 0, 0, 1),
+            Ipv4Addr::new(224, 0, 0, 1),
+            Ipv4Addr::BROADCAST,
+            Ipv4Addr::UNSPECIFIED,
+        ] {
+            assert_eq!(
+                build_vpn_mesh_ipv4(net, 24, dev, bad),
+                Err("claw-vpn-t1-route-scope-peer")
+            );
+        }
+    }
+
+    #[test]
+    fn build_vpn_mesh_ipv4_rejects_addresses_outside_the_pool_cidr() {
+        let net = Ipv4Addr::new(11, 0, 0, 0);
+        // peer outside the /24 CIDR (would widen / misroute).
+        assert_eq!(
+            build_vpn_mesh_ipv4(net, 24, Ipv4Addr::new(11, 0, 0, 1), Ipv4Addr::new(11, 0, 5, 2)),
+            Err("claw-vpn-t1-route-scope-cidr")
+        );
+        // device outside the CIDR.
+        assert_eq!(
+            build_vpn_mesh_ipv4(net, 24, Ipv4Addr::new(11, 0, 5, 1), Ipv4Addr::new(11, 0, 0, 2)),
+            Err("claw-vpn-t1-route-scope-cidr")
+        );
+    }
 
     struct FakeInterface {
         reads: VecDeque<Vec<u8>>,

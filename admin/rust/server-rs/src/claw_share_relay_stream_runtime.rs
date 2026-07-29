@@ -109,7 +109,7 @@ pub struct RelayStreamLiveInputs<'a, P, S> {
     pub pty_router_factory: Arc<dyn Fn() -> P + Send + Sync>,
     pub clawsite_router_factory: Arc<dyn Fn() -> S + Send + Sync>,
     pub refresh_trigger: Arc<Notify>,
-    pub now_unix: Arc<dyn Fn() -> u64 + Send + Sync>,
+    pub now_unix: Arc<dyn Fn() -> Option<u64> + Send + Sync>,
 }
 
 /// Abortable handles for the pieces this skeleton spawns.
@@ -202,7 +202,9 @@ where
 
     let reverse_connect = config.reverse_connect.validate()?;
     let pool_config = config.pool.validate()?;
-    let now = (inputs.now_unix)();
+    let Some(now) = (inputs.now_unix)() else {
+        return Err(RelayStreamLiveError::ClockUnusable);
+    };
     let trust_runtime = Arc::new(
         RelayStreamTrustContextRuntime::load(
             &inputs.household,
@@ -274,7 +276,9 @@ where
 
     let reverse_connect = config.reverse_connect.validate()?;
     let pool_config = config.pool.validate()?;
-    let now = (inputs.now_unix)();
+    let Some(now) = (inputs.now_unix)() else {
+        return Err(RelayStreamLiveError::ClockUnusable);
+    };
     let trust_runtime = Arc::new(
         RelayStreamTrustContextRuntime::load(
             &inputs.household,
@@ -346,7 +350,7 @@ fn build_binding_factory_phase0<P, S>(
     replay: Arc<ReplayGuard>,
     pty_router_factory: Arc<dyn Fn() -> P + Send + Sync>,
     clawsite_router_factory: Arc<dyn Fn() -> S + Send + Sync>,
-    now_unix: Arc<dyn Fn() -> u64 + Send + Sync>,
+    now_unix: Arc<dyn Fn() -> Option<u64> + Send + Sync>,
 ) -> Arc<RelayStreamReverseConnectBindingFactory<P, S>>
 where
     P: ClawTargetRouter + 'static,
@@ -383,7 +387,7 @@ fn build_binding_factory<P, S, I>(
     pty_router_factory: Arc<dyn Fn() -> P + Send + Sync>,
     clawsite_router_factory: Arc<dyn Fn() -> S + Send + Sync>,
     ip_tunnel_router_factory: Arc<dyn Fn() -> I + Send + Sync>,
-    now_unix: Arc<dyn Fn() -> u64 + Send + Sync>,
+    now_unix: Arc<dyn Fn() -> Option<u64> + Send + Sync>,
 ) -> Arc<RelayStreamReverseConnectBindingFactory<P, S, I>>
 where
     P: ClawTargetRouter + 'static,
@@ -414,6 +418,12 @@ where
 
 #[derive(Debug, thiserror::Error)]
 pub enum RelayStreamLiveError {
+    /// The wall clock is unusable (before the epoch, at it, or below the sanity
+    /// floor). Refused before loading trust, admitting, or spawning any task:
+    /// with a broken clock no expiry can be enforced.
+    #[error("relay stream refused: system clock unusable")]
+    ClockUnusable,
+
     #[error("relay stream trust context unavailable: {0}")]
     TrustContext(#[from] RelayStreamTrustContextCacheError),
 
@@ -543,7 +553,7 @@ mod tests {
             pty_router_factory: Arc::new(|| TcpStreamRouter::new("127.0.0.1:1")),
             clawsite_router_factory: Arc::new(|| TcpStreamRouter::new("127.0.0.1:1")),
             refresh_trigger,
-            now_unix: Arc::new(now_unix),
+            now_unix: Arc::new(|| Some(now_unix())),
         }
     }
 
@@ -754,6 +764,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn live_wiring_unusable_clock_fails_before_keystore_or_tasks() {
+        let dir = tempfile::tempdir().unwrap();
+        let backend = backend(&dir);
+        let config = enabled_config(unused_loopback_addr().await);
+        let mut live_inputs = inputs(dir.path(), &backend);
+        live_inputs.now_unix = Arc::new(|| None);
+
+        let error = assemble_relay_stream_live(live_inputs, config)
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, RelayStreamLiveError::ClockUnusable));
+        assert!(
+            !crate::claw_share_relay_stream_offer_store::relay_stream_offer_store_path(dir.path())
+                .exists()
+        );
+        assert!(
+            !backend
+                .path_for(
+                    &RelayStreamNoiseKeyStore::account_for_key_id(
+                        DEFAULT_RELAY_STREAM_NOISE_KEY_ID
+                    )
+                    .unwrap()
+                )
+                .exists()
+        );
+    }
+
+    #[tokio::test]
     async fn live_wiring_top_level_enabled_uses_default_responder_params() {
         let dir = tempfile::tempdir().unwrap();
         let backend = backend(&dir);
@@ -835,7 +874,7 @@ mod tests {
                     opens: Arc::clone(&opens),
                 })
             },
-            Arc::new(now_unix),
+            Arc::new(|| Some(now_unix())),
         );
         let binding = binding_factory(offer, now_unix()).unwrap();
 
