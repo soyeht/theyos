@@ -94,6 +94,182 @@ fn production_only(source: &str) -> String {
     kept.join("\n")
 }
 
+/// The body of a method inside an `impl` block, bounded by the column-4 brace
+/// that closes it.
+///
+/// `struct_block` cannot be used for a method: it stops at the first column-0
+/// `}`, which for a method is the end of the whole `impl`, so every assertion
+/// would leak into neighbouring methods and a "this function contains exactly
+/// one X" claim would be meaningless.
+///
+/// Bounded structurally rather than by brace counting, which string literals
+/// defeat (`format!("{name}.tmp")` appears in this very module). rustfmt puts a
+/// method's closing brace alone on a line at exactly four spaces; every line
+/// nested inside is indented further, so the first `\n    }\n` is the end. The
+/// trailing newline is load-bearing: without it a closure or struct literal
+/// closing as `    })` would match and truncate the body early.
+///
+/// `r0a_d2d_method_body_stops_at_the_method_it_names` pins both directions.
+fn method_body<'a>(source: &'a str, decl: &str) -> &'a str {
+    let start = source
+        .find(decl)
+        .unwrap_or_else(|| panic!("scope guard could not find `{decl}`"));
+    let rest = &source[start..];
+    let end = rest
+        .find("\n    }\n")
+        .unwrap_or_else(|| panic!("`{decl}` must close on a column-4 brace"));
+    &rest[..end]
+}
+
+/// How many times `needle` occurs in `haystack`.
+fn count(haystack: &str, needle: &str) -> usize {
+    haystack.matches(needle).count()
+}
+
+/// Every type that is a once-consumable capability rather than a value.
+///
+/// Duplicating one multiplies an authorization; serializing one turns a
+/// capability into a wire format. Neither may become possible by a later
+/// `#[derive]`.
+const OPAQUE_CAPABILITY_TYPES: [&str; 5] = [
+    "SealedDeviceAdmissionV1",
+    "ConsumedDeviceAdmissionV1",
+    "SealedDevicePairAdmissionV1",
+    "ConsumedDevicePairAdmissionV1",
+    "PairMemberBindingV1",
+];
+
+/// The declaration and body of the pair consume, and nothing else.
+///
+/// Scope is load-bearing. Run over the whole production file, the lazy-output
+/// check below would report an unrelated function's `-> impl Future` as a pair
+/// violation — measuring its neighbours instead of its own surface, and
+/// breaking on code that has nothing to do with this guard.
+///
+/// The declaration is anchored WITHOUT its generics, so a regression that
+/// reintroduces `<T, E>` is still found and scored rather than vanishing into
+/// "declaration not present". Uniqueness is asserted so the scope cannot
+/// silently land on the wrong overload.
+fn pair_consume_surface(production: &str) -> &str {
+    const DECL: &str = "pub fn consume_pair_with_effect";
+    assert_eq!(
+        count(production, DECL),
+        1,
+        "exactly one pair consume entry point must exist"
+    );
+    method_body(production, DECL)
+}
+
+/// Ways the pair effect could hand a deferrable value back to its caller.
+/// Empty means the output is immediate.
+///
+/// Expects the scoped surface from [`pair_consume_surface`], never a whole file.
+fn lazy_output_violations(code: &str) -> Vec<String> {
+    let mut violations = Vec::new();
+
+    // NO type parameters at all. The previous version of this function required
+    // the literal `consume_pair_with_effect<E>` — which pinned the hole open: it
+    // would have REJECTED the fix below, and it only ever mutated the `T` axis,
+    // so the `E` channel was never measured. Both arms are closed now, and the
+    // guard has to say so.
+    if !code.contains("pub fn consume_pair_with_effect(") {
+        violations.push(
+            "consume_pair_with_effect must take no type parameters: any \
+             caller-chosen type in the output is a channel for a deferred value"
+                .to_string(),
+        );
+    }
+    if code.contains("pub fn consume_pair_with_effect<") {
+        violations.push(
+            "consume_pair_with_effect carries a type parameter; `Err(async move { .. })` \
+             defers past the fence exactly as `Ok(..)` would"
+                .to_string(),
+        );
+    }
+    if !code.contains(
+        "effect: impl FnOnce(&ConsumedDevicePairAdmissionV1) -> Result<(), PairEffectFailure>,",
+    ) {
+        violations.push(
+            "the pair effect must return Result<(), PairEffectFailure> — a closed, \
+             fieldless failure type, not a caller-chosen one"
+                .to_string(),
+        );
+    }
+    if !code.contains(") -> Result<(), ConsumePairError> {") {
+        violations
+            .push("the pair consume must return the non-generic ConsumePairError".to_string());
+    }
+    // The generic error surface must not reappear under any spelling.
+    for generic in [
+        "ConsumeError<",
+        "Result<(), E>",
+        "Result<T,",
+        "ConsumePairError<",
+    ] {
+        if code.contains(generic) {
+            violations.push(format!(
+                "generic error/output channel reintroduced: {generic}"
+            ));
+        }
+    }
+    // Belt and braces: no lazily-evaluated output type may appear on the pair
+    // effect's signature under any name.
+    for lazy in ["-> impl Future", "-> impl FnOnce", "-> impl Iterator"] {
+        if code.contains(lazy) {
+            violations.push(format!("effect output may be deferred: {lazy}"));
+        }
+    }
+    violations
+}
+
+/// Ways `opaque` fails to be an opaque, non-duplicable capability, as read from
+/// comment-stripped source. Empty means it holds.
+///
+/// Factored out of the assertion so the check can be run against a deliberately
+/// broken fixture — see `r0a_opacity_check_rejects_a_derived_capability`. A
+/// negative assertion nobody has ever seen fire is indistinguishable from a
+/// needle that cannot match.
+///
+/// This exists because the compile-time alternative does not work: a generic
+/// `fn assert_not_clone<T>() {}` compiles for every `T`, including one that
+/// derives `Clone`, so calling it asserts nothing at all. Rust has no stable
+/// negative trait bound, so the property is pinned at the source level here.
+fn opacity_violations(code: &str, opaque: &str) -> Vec<String> {
+    let mut violations = Vec::new();
+
+    let decl = format!("pub struct {opaque}");
+    let Some(offset) = code.find(&decl) else {
+        violations.push(format!("no declaration `{decl}`"));
+        return violations;
+    };
+    let preceding_line = code[..offset]
+        .lines()
+        .rev()
+        .find(|line| !line.trim().is_empty())
+        .unwrap_or_default();
+    if preceding_line.trim().ends_with(")]") {
+        violations.push(format!("carries a derive attribute: {preceding_line}"));
+    }
+    for forbidden in ["Clone", "Copy", "Default", "Serialize", "Deserialize"] {
+        for form in [
+            format!("impl {forbidden} for {opaque}"),
+            // The derive path, in case the attribute sits on a line that does
+            // not end in `)]` (e.g. a multi-line derive list).
+            format!("#[derive({forbidden})]\npub struct {opaque}"),
+        ] {
+            if code.contains(&form) {
+                violations.push(format!("implements {forbidden}"));
+                break;
+            }
+        }
+    }
+    // Redacted Debug — the fact must not print its own bindings.
+    if !code.contains(&format!("{opaque}(REDACTED)")) {
+        violations.push("Debug is not redacted".to_string());
+    }
+    violations
+}
+
 /// The body of a `struct Name {` declaration, up to the line that closes it.
 ///
 /// Used to scope field-level assertions to the declaration that actually
@@ -335,29 +511,12 @@ fn r0a_d2a_sealed_fact_is_opaque_and_move_only() {
     let admission = read(package_dir().join("src/device_admission.rs"));
     let code = code_only(&admission);
 
-    for opaque in ["SealedDeviceAdmissionV1", "ConsumedDeviceAdmissionV1"] {
-        let decl = format!("pub struct {opaque}");
-        let offset = code
-            .find(&decl)
-            .unwrap_or_else(|| panic!("opaque declaration for {opaque}"));
-        let preceding_line = code[..offset]
-            .lines()
-            .rev()
-            .find(|line| !line.trim().is_empty())
-            .expect("declaration has preceding source");
+    for opaque in OPAQUE_CAPABILITY_TYPES {
+        let violations = opacity_violations(&code, opaque);
         assert!(
-            !preceding_line.trim().ends_with(")]"),
-            "{opaque} must not carry a derive attribute"
+            violations.is_empty(),
+            "{opaque} is not opaque: {violations:?}"
         );
-        for forbidden in ["Clone", "Copy", "Default", "Serialize", "Deserialize"] {
-            assert!(
-                !code.contains(&format!("impl {forbidden} for {opaque}")),
-                "{opaque} must not implement {forbidden}: an admission must not \
-                 be duplicated or turned into a wire format"
-            );
-        }
-        // Redacted Debug — the fact must not print its own bindings.
-        assert!(code.contains(&format!("{opaque}(REDACTED)")));
     }
 
     // Consumed by value, so it cannot be presented twice.
@@ -384,6 +543,534 @@ fn r0a_d2a_sealed_fact_is_opaque_and_move_only() {
     // Produced only by the authority; no public constructor from input.
     assert!(!code.contains("impl SealedDeviceAdmissionV1 {\n    pub fn new("));
     assert!(!code.contains("impl From<") || !code.contains("> for SealedDeviceAdmissionV1"));
+
+    // The pair fact is consumed by value too, and no *public* entry point may
+    // borrow it. The private recheck helpers may.
+    assert!(code.contains("sealed: SealedDevicePairAdmissionV1,"));
+    let lines: Vec<&str> = code.lines().collect();
+    for (index, line) in lines.iter().enumerate() {
+        if !line.contains("sealed: &SealedDevicePairAdmissionV1") {
+            continue;
+        }
+        let owner = lines[..index]
+            .iter()
+            .rev()
+            .find(|candidate| candidate.contains("fn "))
+            .copied()
+            .unwrap_or_default();
+        assert!(
+            !owner.contains("pub fn "),
+            "a public entry point must take the sealed pair by value: {owner}"
+        );
+    }
+}
+
+/// The needle for [`opacity_violations`], in both directions.
+///
+/// `r0a_d2a_sealed_fact_is_opaque_and_move_only` is entirely negative
+/// assertions, so on its own it is indistinguishable from a check whose needles
+/// never match. This runs the same function over source that *is* broken, in
+/// each of the ways that matter, and requires it to complain.
+///
+/// It also stands in for the compile-time check that does not exist: a generic
+/// `fn assert_not_clone<T>() {}` compiles for every `T` — including one that
+/// derives `Clone` — so calling it proves nothing. Rust has no stable negative
+/// trait bound, which is why this property is pinned at the source level.
+#[test]
+fn r0a_opacity_check_rejects_a_derived_capability() {
+    let clean = concat!(
+        "pub struct Capability {\n",
+        "    field: u8,\n",
+        "}\n",
+        "impl std::fmt::Debug for Capability {\n",
+        "    fn fmt(&self, f: &mut Formatter) -> Result {\n",
+        "        f.write_str(\"Capability(REDACTED)\")\n",
+        "    }\n",
+        "}\n",
+    );
+    // Positive control: the check accepts a genuinely opaque type. Without this
+    // the rejections below could all be "rejects everything".
+    assert!(
+        opacity_violations(clean, "Capability").is_empty(),
+        "the check must accept an opaque capability"
+    );
+
+    // 1. A derive attribute on the declaration.
+    let derived = clean.replace(
+        "pub struct Capability {",
+        "#[derive(Clone, Serialize)]\npub struct Capability {",
+    );
+    let violations = opacity_violations(&derived, "Capability");
+    assert!(
+        violations.iter().any(|v| v.contains("derive attribute")),
+        "a derived capability must be rejected: {violations:?}"
+    );
+
+    // 2. A hand-written impl, which carries no attribute to spot.
+    let implemented =
+        format!("{clean}impl Clone for Capability {{\n    fn clone(&self) {{}}\n}}\n");
+    let violations = opacity_violations(&implemented, "Capability");
+    assert!(
+        violations.iter().any(|v| v == "implements Clone"),
+        "a hand-written Clone must be rejected: {violations:?}"
+    );
+
+    // 3. Serialize specifically — the wire-format direction.
+    let serialized = format!("{clean}impl Serialize for Capability {{}}\n");
+    assert!(
+        opacity_violations(&serialized, "Capability")
+            .iter()
+            .any(|v| v == "implements Serialize"),
+        "turning a capability into a wire format must be rejected"
+    );
+
+    // 4. A Debug that is not redacted.
+    let leaky = clean.replace("Capability(REDACTED)", "Capability {:?}");
+    assert!(
+        opacity_violations(&leaky, "Capability")
+            .iter()
+            .any(|v| v.contains("not redacted")),
+        "an unredacted Debug must be rejected"
+    );
+
+    // 5. A type that has been deleted outright still fails rather than passing
+    //    vacuously on "no declaration, no violations".
+    assert!(
+        !opacity_violations(clean, "MissingCapability").is_empty(),
+        "an absent declaration must be a violation, not a silent pass"
+    );
+
+    // And the real list is non-empty, so the loop that uses it cannot pass by
+    // iterating over nothing.
+    assert_eq!(OPAQUE_CAPABILITY_TYPES.len(), 5);
+}
+
+// ─── Fatia D2d — the pair is a primitive, never a composition ───────────────
+
+/// The helper that bounds a method body, pinned in both directions.
+///
+/// Without this the "exactly one lock / exactly one read" claims below could
+/// pass vacuously: an extractor that ran to the end of the `impl` would fold
+/// neighbouring methods in, and one that truncated at a nested `})` would cut
+/// the body short and count zero of everything.
+#[test]
+fn r0a_d2d_method_body_stops_at_the_method_it_names() {
+    let fixture = concat!(
+        "impl Thing {\n",
+        "    pub fn first(&self) -> u8 {\n",
+        "        let closure = || {\n",
+        "            MARKER_NESTED\n",
+        "        };\n",
+        "        Thing::build(Inner {\n",
+        "            field: MARKER_LITERAL,\n",
+        "        })\n",
+        "    }\n",
+        "\n",
+        "    pub fn second(&self) -> u8 {\n",
+        "        MARKER_OUTSIDE\n",
+        "    }\n",
+        "}\n",
+    );
+    let body = method_body(fixture, "pub fn first");
+
+    // 1. Everything nested inside the method is kept — including a closure and
+    //    a struct literal, whose closing lines are what a naive brace scan or a
+    //    `\n    }`-without-newline scan would trip on.
+    assert!(
+        body.contains("MARKER_NESTED"),
+        "nested closure body was cut"
+    );
+    assert!(body.contains("MARKER_LITERAL"), "struct literal was cut");
+
+    // 2. Nothing from the next method leaks in.
+    assert!(
+        !body.contains("MARKER_OUTSIDE"),
+        "the extractor ran past the method it names"
+    );
+    assert!(!body.contains("pub fn second"));
+
+    // 3. And the counter it feeds actually counts.
+    assert_eq!(count(body, "MARKER_NESTED"), 1);
+    assert_eq!(count(fixture, "MARKER_OUTSIDE"), 1);
+    assert_eq!(count(body, "MARKER_OUTSIDE"), 0);
+}
+
+/// The pair surface exists and is a genuine two-device primitive.
+///
+/// A pair assembled from two singular facts cannot prove simultaneity: each
+/// singular consume takes the store lock, checks, and releases it, so a revoke
+/// landing between them leaves both returning success. These assertions are
+/// what stop that shape from reappearing as a "refactor".
+#[test]
+fn r0a_d2d_pair_surface_is_a_primitive_not_a_composition() {
+    let admission = read(package_dir().join("src/device_admission.rs"));
+    let production = production_only(&admission);
+
+    // Arity and shape of the two sanctioned pair entry points.
+    assert!(production.contains("pub fn seal_pair("));
+    assert!(production.contains("pub fn consume_pair_with_effect("));
+    assert!(
+        production.contains("sealed: SealedDevicePairAdmissionV1,"),
+        "the pair fact is taken by value so it cannot be presented twice"
+    );
+    for slot in [
+        "expected_initiator_pub_sec1: &[u8; 33],",
+        "expected_responder_pub_sec1: &[u8; 33],",
+    ] {
+        assert!(
+            production.contains(slot),
+            "consume must be handed BOTH peers, in position: {slot}"
+        );
+    }
+    assert!(
+        !production.contains("effect: impl FnOnce(&Self"),
+        "the effect must not be handed the authority"
+    );
+
+    // No path that builds a pair out of two singular facts, and no lock-free
+    // escape hatch beside the fenced one.
+    for composed in [
+        "> for SealedDevicePairAdmissionV1",
+        "pub fn seal_pair_from",
+        "pub fn pair_from_sealed",
+        "fn compose_pair",
+        "pub fn consume_pair(",
+    ] {
+        assert!(
+            !production.contains(composed),
+            "a pair must never be assembled from singular facts: {composed}"
+        );
+    }
+}
+
+/// The pair effect cannot hand a lazily-evaluated result back to the caller.
+///
+/// A synchronous `FnOnce` is necessary but not sufficient. With a generic
+/// success type the effect can construct a value under the lock and let it run
+/// after it — `Ok(async move { dial().await })` type-checks as `Result<T, E>`,
+/// and the future is polled once the fence is gone. Returned closures and
+/// iterators defer the same way. Fixing the success type to `()` removes the
+/// channel rather than forbidding the pattern by comment.
+///
+/// Measured against the pair consume's own declaration and body only — see
+/// [`pair_consume_surface`]. The needle is proven by
+/// `r0a_d2d_immediate_output_check_rejects_a_generic_effect`.
+#[test]
+fn r0a_d2d_pair_effect_output_is_immediate() {
+    let admission = read(package_dir().join("src/device_admission.rs"));
+    let production = production_only(&admission);
+    let surface = pair_consume_surface(&production);
+
+    // Positive control: the scope really is the pair consume and really is
+    // bounded. Without it, an empty or misplaced scope would score zero
+    // violations and read as a pass.
+    assert!(
+        surface.contains("sealed: SealedDevicePairAdmissionV1,"),
+        "the scoped surface is not the pair consume"
+    );
+    assert!(
+        !surface.contains("pub fn seal_pair("),
+        "the scope leaked into a neighbouring method"
+    );
+
+    let violations = lazy_output_violations(surface);
+    assert!(
+        violations.is_empty(),
+        "the pair effect may not return a deferrable value: {violations:?}"
+    );
+
+    // The residual must stay written down: the return channel is closed, but
+    // arbitrary synchronous code can still enqueue work, so the caller contract
+    // is part of the API surface rather than a hope.
+    assert!(
+        admission.contains("Honest residual"),
+        "the limits of the structural guarantee must remain documented"
+    );
+    assert!(
+        admission.contains("before returning from `effect`"),
+        "the caller contract must remain stated next to the API"
+    );
+}
+
+/// The needle for the check above: every generic output channel must be
+/// rejected — the success arm AND the error arm.
+///
+/// The `T`-only version of this test is what let the real defect ship. It
+/// mutated `<T, E>` to `<E>` and stopped, so the `E` axis was never exercised
+/// and the guard happily certified a signature whose `Err` arm still deferred.
+/// Both axes are fixtures now.
+#[test]
+fn r0a_d2d_immediate_output_check_rejects_a_generic_effect() {
+    // Axis T: generic success type reintroduced "for symmetry" with the
+    // singular surface.
+    let regressed_t = concat!(
+        "    pub fn consume_pair_with_effect<T, E>(\n",
+        "        &self,\n",
+        "        sealed: SealedDevicePairAdmissionV1,\n",
+        "        effect: impl FnOnce(&ConsumedDevicePairAdmissionV1) -> Result<T, E>,\n",
+        "    ) -> Result<T, ConsumeError<E>> {\n",
+        "    }\n",
+    );
+    // Scoped exactly as the real check scopes it, so the needle proof covers
+    // the scoping too and not just the predicate.
+    assert!(
+        !lazy_output_violations(pair_consume_surface(regressed_t)).is_empty(),
+        "the check must reject a generic success type"
+    );
+
+    // Axis E: THE ACTUAL DEFECT. Success pinned to `()`, error left generic.
+    // `Err(async move { .. })` is returned by value after the lock drops and
+    // awaited outside it — the same deferral, through the other arm. The
+    // previous guard ACCEPTED this exact text.
+    let regressed_e = concat!(
+        "    pub fn consume_pair_with_effect<E>(\n",
+        "        &self,\n",
+        "        sealed: SealedDevicePairAdmissionV1,\n",
+        "        effect: impl FnOnce(&ConsumedDevicePairAdmissionV1) -> Result<(), E>,\n",
+        "    ) -> Result<(), ConsumeError<E>> {\n",
+        "    }\n",
+    );
+    let violations = lazy_output_violations(pair_consume_surface(regressed_e));
+    assert!(
+        !violations.is_empty(),
+        "the check must reject a generic ERROR type: pinning only the success \
+         arm moves the deferral channel, it does not close it"
+    );
+    assert!(
+        violations.iter().any(|v| v.contains("type parameter")),
+        "the E-axis rejection must name the type parameter: {violations:?}"
+    );
+
+    // ...and accept the pinned shape, so it is not simply rejecting everything.
+    let pinned = concat!(
+        "    pub fn consume_pair_with_effect(\n",
+        "        &self,\n",
+        "        sealed: SealedDevicePairAdmissionV1,\n",
+        "        effect: impl FnOnce(&ConsumedDevicePairAdmissionV1) -> Result<(), PairEffectFailure>,\n",
+        "    ) -> Result<(), ConsumePairError> {\n",
+        "    }\n",
+    );
+    // A neighbouring function that legitimately returns a lazy value must NOT
+    // be attributed to the pair surface. Unscoped, `-> impl Future` anywhere in
+    // the file would fail this guard on code it does not govern.
+    let with_neighbour = concat!(
+        "    pub fn consume_pair_with_effect(\n",
+        "        &self,\n",
+        "        sealed: SealedDevicePairAdmissionV1,\n",
+        "        effect: impl FnOnce(&ConsumedDevicePairAdmissionV1) -> Result<(), PairEffectFailure>,\n",
+        "    ) -> Result<(), ConsumePairError> {\n",
+        "    }\n",
+        "\n",
+        "    pub fn something_else(&self) -> impl Future<Output = ()> {\n",
+        "        async {}\n",
+        "    }\n",
+    );
+    assert!(
+        lazy_output_violations(pair_consume_surface(with_neighbour)).is_empty(),
+        "a neighbour's lazy return must not be charged to the pair surface"
+    );
+    // ...and the same input IS flagged when the scoping is dropped, which is
+    // what makes the scoping the load-bearing part rather than decoration.
+    assert!(
+        !lazy_output_violations(with_neighbour).is_empty(),
+        "control: unscoped, the neighbour would be charged to the pair surface"
+    );
+
+    assert!(
+        lazy_output_violations(pair_consume_surface(pinned)).is_empty(),
+        "the check must accept the pinned immediate-output shape"
+    );
+}
+
+/// One lock and one live read serve both members — in each pair entry point.
+///
+/// This is the atomicity property stated as something mechanical. A second
+/// `live_snapshot()` inside either body would mean the two members could come
+/// from different authority states, which is exactly the composed hazard
+/// wearing a different name.
+#[test]
+fn r0a_d2d_each_pair_entry_point_takes_one_lock_and_one_snapshot() {
+    let admission = read(package_dir().join("src/device_admission.rs"));
+    let production = production_only(&admission);
+
+    for decl in ["pub fn seal_pair(", "pub fn consume_pair_with_effect("] {
+        let body = method_body(&production, decl);
+
+        // Positive control: the extraction found a real body. Without this the
+        // counts below could both be 0 for the wrong reason.
+        assert!(
+            body.contains("StoreLock::acquire"),
+            "{decl}: extraction found no lock at all"
+        );
+        assert_eq!(
+            count(body, "StoreLock::acquire"),
+            1,
+            "{decl}: exactly one lock acquire"
+        );
+        assert_eq!(
+            count(body, "self.live_snapshot()"),
+            1,
+            "{decl}: exactly one live read must serve BOTH members"
+        );
+        // Neither may delegate to the singular surface.
+        for delegated in ["self.seal(", "self.consume_with_effect("] {
+            assert!(
+                !body.contains(delegated),
+                "{decl}: the pair primitive must not delegate to {delegated}"
+            );
+        }
+    }
+
+    // Order inside the fence: lock, then read, then recheck, then effect.
+    let consume = method_body(&production, "pub fn consume_pair_with_effect(");
+    let lock_at = consume.find("StoreLock::acquire").expect("lock");
+    let read_at = consume.find("self.live_snapshot()").expect("read");
+    let recheck_at = consume
+        .find("Self::recheck_sealed_pair")
+        .expect("pair recheck");
+    let effect_at = consume.find("effect(&consumed)").expect("effect");
+    assert!(
+        lock_at < read_at && read_at < recheck_at && recheck_at < effect_at,
+        "order must be lock -> read -> recheck -> effect; got \
+         {lock_at}/{read_at}/{recheck_at}/{effect_at}"
+    );
+
+    // The per-member helpers are pure: they are handed a snapshot and may not
+    // reach for the store themselves, so both members are provably bound to the
+    // one snapshot their caller read.
+    for helper in [
+        "fn bind_pair_member(",
+        "fn recheck_sealed_pair(",
+        "fn recheck_pair_member(",
+    ] {
+        let body = method_body(&production, helper);
+        assert!(
+            body.contains("snapshot: &DeviceAdmissionSnapshotV1")
+                || body.contains("snapshot: &DeviceAdmissionSnapshotV1,"),
+            "{helper}: must be handed the snapshot, not find its own"
+        );
+        for reaching in ["live_snapshot", "StoreLock::acquire", "fs::read"] {
+            assert!(
+                !body.contains(reaching),
+                "{helper}: a per-member check must not read the store: {reaching}"
+            );
+        }
+    }
+}
+
+/// The single generation lives on the pair, never on a member.
+///
+/// This is the structural half of the atomicity guarantee: there is nowhere to
+/// put a second snapshot, so a pair whose members came from different authority
+/// states is not representable. A `generation` field on the member binding
+/// would re-open exactly that.
+#[test]
+fn r0a_d2d_one_generation_and_one_snapshot_digest_per_pair() {
+    let admission = read(package_dir().join("src/device_admission.rs"));
+    let production = production_only(&admission);
+
+    let member = struct_block(&production, "pub struct PairMemberBindingV1 {");
+    // Positive controls: the block extraction found the right declaration.
+    for present in [
+        "role: PairRole,",
+        "d_id: DeviceId,",
+        "peer_identity_pub_sec1: [u8; 33],",
+    ] {
+        assert!(member.contains(present), "member field missing: {present}");
+    }
+    for per_member in [
+        "generation",
+        "revocation_cursor",
+        "revocation_digest",
+        "snapshot_digest",
+        "hh_root_digest",
+    ] {
+        assert!(
+            !member.contains(per_member),
+            "a per-member `{per_member}` would let the two sides come from \
+             different snapshots — that is the composed hazard, restated"
+        );
+    }
+
+    // ...and the pair carries exactly one of each.
+    let pair = struct_block(&production, "pub struct SealedDevicePairAdmissionV1 {");
+    for (field, decl) in [
+        ("generation", "generation: u64,"),
+        ("revocation_cursor", "revocation_cursor: u64,"),
+        ("revocation_digest", "revocation_digest: [u8; 32],"),
+        ("snapshot_digest", "snapshot_digest: [u8; 32],"),
+    ] {
+        assert_eq!(
+            count(pair, decl),
+            1,
+            "the pair must carry exactly one {field}"
+        );
+    }
+    for side in [
+        "initiator: PairMemberBindingV1,",
+        "responder: PairMemberBindingV1,",
+    ] {
+        assert_eq!(
+            count(pair, side),
+            1,
+            "the pair has exactly two sides: {side}"
+        );
+    }
+}
+
+/// Every pair refusal is attributed to a side.
+///
+/// Two sides can fail the same way. Without the role, a negative test aimed at
+/// the responder can pass because the initiator refused first — a real refusal,
+/// but not the one under test, and a missing responder-side check would hide
+/// behind it.
+#[test]
+fn r0a_d2d_pair_refusals_carry_the_role() {
+    let admission = read(package_dir().join("src/device_admission.rs"));
+    let production = production_only(&admission);
+
+    assert!(production.contains("pub enum PairRole"));
+    for role in ["Initiator,", "Responder,"] {
+        assert!(production.contains(role), "PairRole must keep {role}");
+    }
+    assert!(
+        production.contains("PairMember {\n        role: PairRole,"),
+        "the error surface must carry the role alongside the cause"
+    );
+    assert!(
+        production
+            .contains("pub fn pair_member(&self) -> Option<(PairRole, &DeviceAdmissionError)>"),
+        "a test must be able to assert on (role, cause), not on cause alone"
+    );
+
+    // Both member helpers attribute EVERY refusal they can produce.
+    //
+    // Counted as "error values constructed" against "roles attached", not as
+    // `return Err(...)`: these helpers also refuse through `ok_or_else`, and a
+    // criterion that only saw `return Err(` would score an `ok_or_else` refusal
+    // as absent and pass while it went unattributed. Measured — that miscount
+    // is what this assertion first reported. The `::` is what keeps the
+    // signature's own `DeviceAdmissionError>` out of the count.
+    for helper in ["fn bind_pair_member(", "fn recheck_pair_member("] {
+        let body = method_body(&production, helper);
+        let constructed = count(body, "DeviceAdmissionError::");
+        let attributed = count(body, ".at(role)");
+        assert!(
+            constructed > 0,
+            "{helper}: positive control — it must be able to refuse"
+        );
+        assert_eq!(
+            constructed, attributed,
+            "{helper}: every refusal must name the side ({constructed} \
+             constructed, {attributed} attributed)"
+        );
+    }
+
+    // The point-in-time limit must stay written down next to the pair API too.
+    assert!(
+        admission.contains("invalidate sessions that are already running: a pair"),
+        "the pair's point-in-time semantics must remain documented"
+    );
 }
 
 #[test]

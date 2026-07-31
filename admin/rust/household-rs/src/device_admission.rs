@@ -98,6 +98,40 @@ mod bstr32 {
 #[serde(transparent)]
 pub struct Bytes32(#[serde(with = "bstr32")] pub [u8; 32]);
 
+// ─── Pair roles ─────────────────────────────────────────────────────────────
+
+/// Which side of a device pair a member sits on.
+///
+/// The two sides are **not** interchangeable. A pair fact is sealed for one
+/// ordering and authorizes only that ordering, so a caller cannot present the
+/// responder where the initiator is expected.
+///
+/// The role also travels with every pair refusal. Without it, an initiator-side
+/// and a responder-side failure of the same kind would be the same value, and a
+/// negative test aimed at one side could pass because the *other* side refused
+/// first — the refusal would be real but the test would be vacuous.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+pub enum PairRole {
+    Initiator,
+    Responder,
+}
+
+impl PairRole {
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Initiator => "initiator",
+            Self::Responder => "responder",
+        }
+    }
+}
+
+impl std::fmt::Display for PairRole {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
 // ─── Closed error surface ───────────────────────────────────────────────────
 
 /// Every way this authority can decline. There is no variant that means
@@ -147,6 +181,47 @@ pub enum DeviceAdmissionError {
     StaleSeal,
     #[error("device admission encoding failed")]
     Encoding,
+    /// A pair named one device twice, or named two `d_id`s that resolve to the
+    /// same admitted key. Either way there is no second party, so there is no
+    /// pair to authorize.
+    #[error("a device pair must name two distinct admitted devices")]
+    PairSameDevice,
+    /// One side of a pair refused. The role is carried so the refusal is
+    /// attributable: `cause` alone cannot say which device failed.
+    #[error("pair {role} refused: {cause}")]
+    PairMember {
+        role: PairRole,
+        cause: Box<DeviceAdmissionError>,
+    },
+}
+
+impl DeviceAdmissionError {
+    /// Attribute this refusal to one side of a pair.
+    ///
+    /// Private, and never applied to a [`Self::PairMember`], so the wrapping is
+    /// exactly one level deep and [`Self::pair_member`] is total.
+    fn at(self, role: PairRole) -> Self {
+        debug_assert!(
+            !matches!(self, Self::PairMember { .. }),
+            "a pair refusal is attributed once"
+        );
+        Self::PairMember {
+            role,
+            cause: Box::new(self),
+        }
+    }
+
+    /// The side that refused and why, when this is a pair refusal.
+    ///
+    /// Tests assert on this pair rather than on the bare cause: two sides can
+    /// fail the same way, and only the role distinguishes them.
+    #[must_use]
+    pub fn pair_member(&self) -> Option<(PairRole, &DeviceAdmissionError)> {
+        match self {
+            Self::PairMember { role, cause } => Some((*role, cause)),
+            _ => None,
+        }
+    }
 }
 
 /// Why a `consume_with_effect` call produced nothing.
@@ -552,6 +627,282 @@ impl ConsumedDeviceAdmissionV1 {
 impl std::fmt::Debug for ConsumedDeviceAdmissionV1 {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str("ConsumedDeviceAdmissionV1(REDACTED)")
+    }
+}
+
+// ─── Pair effect outcome — closed, fieldless, non-deferrable ────────────────
+
+/// Why an authorized pair effect did not apply.
+///
+/// **Fieldless on purpose, and this is load-bearing.** Any caller-chosen type
+/// in this position reopens the deferral channel the pair fence exists to
+/// close. It is not enough to pin the *success* type to `()`: the error arm is
+/// returned by value after the lock has dropped, so with a generic `E` a caller
+/// writes
+///
+/// ```text
+/// let r = auth.consume_pair_with_effect(sealed, a, b, now, |_| Err(async move { dial().await }));
+/// if let Err(ConsumePairError::Effect(fut)) = r { fut.await; }   // after the fence
+/// ```
+///
+/// and defers exactly as `Ok(async move { … })` would have — only the arm
+/// changed. Measured against the previous head: that shape compiled and ran,
+/// returning its value after the lock was released. There is no trait bound
+/// that excludes a lazily-evaluated type, and a source guard cannot help
+/// because the type is chosen at the call site in another crate. So the type
+/// itself is closed rather than bounded.
+///
+/// Carrying detail is therefore the caller's own business, on the caller's own
+/// side of the fence: map a private error into one of these variants and log,
+/// wrap, or store the detail before returning.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, thiserror::Error)]
+pub enum PairEffectFailure {
+    /// The effect did not apply. Nothing was changed.
+    #[error("the authorized pair effect did not apply")]
+    NotApplied,
+    /// The caller's own policy declined, after the fence had already passed.
+    #[error("the authorized pair effect was declined by the caller")]
+    Declined,
+    /// The effect applied partially. The caller must reconcile; the authority
+    /// itself is untouched either way, since the fence never writes.
+    #[error("the authorized pair effect applied partially and needs reconciliation")]
+    Incomplete,
+}
+
+/// Why a `consume_pair_with_effect` call produced nothing.
+///
+/// Non-generic in both arms, unlike [`ConsumeError`]. The two arms stay apart
+/// so a caller can never mistake "the authority refused" for "your effect
+/// failed": [`Self::Admission`] means the effect was never invoked at all.
+#[derive(Clone, PartialEq, Eq, Debug, thiserror::Error)]
+pub enum ConsumePairError {
+    /// The fence rejected. `effect` was not called and nothing was authorized.
+    #[error("device pair admission refused: {0}")]
+    Admission(DeviceAdmissionError),
+    /// The fence passed and `effect` itself declined.
+    #[error("authorized pair effect failed: {0}")]
+    Effect(PairEffectFailure),
+}
+
+impl ConsumePairError {
+    fn admission(error: DeviceAdmissionError) -> Self {
+        Self::Admission(error)
+    }
+
+    /// The admission failure, if the fence is what refused.
+    #[must_use]
+    pub fn as_admission(&self) -> Option<&DeviceAdmissionError> {
+        match self {
+            Self::Admission(error) => Some(error),
+            Self::Effect(_) => None,
+        }
+    }
+}
+
+// ─── Sealed device-pair admission fact ──────────────────────────────────────
+
+/// One side of a pair, as read from the authority.
+///
+/// Deliberately carries **no** generation, revocation cursor, revocation
+/// digest, snapshot digest, or root digest. Those live exactly once, on the
+/// pair itself. That absence is the atomicity guarantee expressed in the type:
+/// there is no way to represent a pair whose two members came from different
+/// snapshots, because there is nowhere to put the second snapshot.
+///
+/// Also not `Clone`/`Copy`/`Default`/`Serialize`/`Deserialize`: a member
+/// binding is part of a capability, not a wire format, and copying one would
+/// let a pair be re-assembled out of halves.
+pub struct PairMemberBindingV1 {
+    role: PairRole,
+    d_id: DeviceId,
+    p_id: PersonId,
+    peer_identity_pub_sec1: [u8; 33],
+    device_cert_digest: [u8; 32],
+    person_cert_digest: [u8; 32],
+    narrowing_digest: [u8; 32],
+    person_not_after: Option<u64>,
+}
+
+impl PairMemberBindingV1 {
+    #[must_use]
+    pub fn role(&self) -> PairRole {
+        self.role
+    }
+
+    #[must_use]
+    pub fn d_id(&self) -> &DeviceId {
+        &self.d_id
+    }
+
+    #[must_use]
+    pub fn p_id(&self) -> &PersonId {
+        &self.p_id
+    }
+
+    /// The full 33-byte SEC1 point this side admits. Never truncated to x-only
+    /// and never replaced by a target, endpoint, or router decision (R0a §5).
+    #[must_use]
+    pub fn peer_identity_pub_sec1(&self) -> &[u8; 33] {
+        &self.peer_identity_pub_sec1
+    }
+
+    #[must_use]
+    pub fn person_not_after(&self) -> Option<u64> {
+        self.person_not_after
+    }
+}
+
+impl std::fmt::Debug for PairMemberBindingV1 {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("PairMemberBindingV1(REDACTED)")
+    }
+}
+
+/// A server-local, opaque, once-consumable fact that **two** devices were
+/// admitted together, under one generation, read under one lock.
+///
+/// # Why this is not two singular facts
+///
+/// [`HouseholdDeviceAdmissionAuthorityV1::seal`] and
+/// [`HouseholdDeviceAdmissionAuthorityV1::consume_with_effect`] each authorize
+/// exactly one device. Composing them for two devices is not a weaker version
+/// of this type — it is a different and unsound one:
+///
+/// - **it proves nothing about simultaneity.** Each singular consume takes the
+///   store lock, runs its recheck, and *releases* it. A revoke landing between
+///   the two consumes leaves both of them returning success, so a caller that
+///   treats "A authorized" plus "B authorized" as "the pair is authorized"
+///   authorizes a pair in which one side is already revoked. There is no
+///   instant at which both facts were true.
+/// - **it cannot be fixed by nesting.** Calling the second consume from inside
+///   the first one's effect deadlocks: `flock(2)` binds to the open file
+///   description and every acquire opens a fresh descriptor, so the inner
+///   acquire blocks for the whole [`LOCK_TIMEOUT`] and then fails.
+///
+/// Both are exercised by
+/// `composing_two_singular_admissions_authorizes_a_pair_the_atomic_fence_refuses`
+/// and `nested_singular_consume_deadlocks_rather_than_composing`.
+///
+/// The single `generation` / `revocation_cursor` / `revocation_digest` /
+/// `snapshot_digest` set below is what closes that hole structurally: both
+/// members are read out of one snapshot, so "same generation" is not a check
+/// that can be forgotten — it is the only representable state.
+///
+/// Opacity rules match [`SealedDeviceAdmissionV1`]: not `Clone`, `Copy`,
+/// `Default`, `Serialize`, `Deserialize`, or constructible from any untrusted
+/// input. It is produced only by
+/// [`HouseholdDeviceAdmissionAuthorityV1::seal_pair`] and accepted only by
+/// [`HouseholdDeviceAdmissionAuthorityV1::consume_pair_with_effect`], which
+/// takes it by value so it cannot be presented twice.
+pub struct SealedDevicePairAdmissionV1 {
+    contract_version: u8,
+    hh_id: HouseholdId,
+    hh_root_digest: [u8; 32],
+    initiator: PairMemberBindingV1,
+    responder: PairMemberBindingV1,
+    generation: u64,
+    revocation_cursor: u64,
+    revocation_digest: [u8; 32],
+    snapshot_digest: [u8; 32],
+    verified_at: u64,
+}
+
+impl SealedDevicePairAdmissionV1 {
+    pub const CONTRACT_VERSION: u8 = 1;
+
+    #[must_use]
+    pub fn initiator(&self) -> &PairMemberBindingV1 {
+        &self.initiator
+    }
+
+    #[must_use]
+    pub fn responder(&self) -> &PairMemberBindingV1 {
+        &self.responder
+    }
+
+    #[must_use]
+    pub fn member(&self, role: PairRole) -> &PairMemberBindingV1 {
+        match role {
+            PairRole::Initiator => &self.initiator,
+            PairRole::Responder => &self.responder,
+        }
+    }
+
+    /// The one generation both sides were admitted under.
+    #[must_use]
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    /// The one snapshot digest both sides were read from.
+    #[must_use]
+    pub fn snapshot_digest(&self) -> &[u8; 32] {
+        &self.snapshot_digest
+    }
+
+    #[must_use]
+    pub fn verified_at(&self) -> u64 {
+        self.verified_at
+    }
+}
+
+impl std::fmt::Debug for SealedDevicePairAdmissionV1 {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("SealedDevicePairAdmissionV1(REDACTED)")
+    }
+}
+
+/// Proof that a sealed pair was rechecked against the live authority and
+/// consumed at the same atomic point that authorizes the effect.
+///
+/// The member bindings are **moved** out of the sealed fact rather than copied,
+/// so the sealed pair is destroyed by consuming it. Also opaque and move-only.
+pub struct ConsumedDevicePairAdmissionV1 {
+    initiator: PairMemberBindingV1,
+    responder: PairMemberBindingV1,
+    generation: u64,
+    snapshot_digest: [u8; 32],
+    consumed_at: u64,
+}
+
+impl ConsumedDevicePairAdmissionV1 {
+    #[must_use]
+    pub fn initiator(&self) -> &PairMemberBindingV1 {
+        &self.initiator
+    }
+
+    #[must_use]
+    pub fn responder(&self) -> &PairMemberBindingV1 {
+        &self.responder
+    }
+
+    #[must_use]
+    pub fn member(&self, role: PairRole) -> &PairMemberBindingV1 {
+        match role {
+            PairRole::Initiator => &self.initiator,
+            PairRole::Responder => &self.responder,
+        }
+    }
+
+    #[must_use]
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    #[must_use]
+    pub fn snapshot_digest(&self) -> &[u8; 32] {
+        &self.snapshot_digest
+    }
+
+    #[must_use]
+    pub fn consumed_at(&self) -> u64 {
+        self.consumed_at
+    }
+}
+
+impl std::fmt::Debug for ConsumedDevicePairAdmissionV1 {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("ConsumedDevicePairAdmissionV1(REDACTED)")
     }
 }
 
@@ -1465,6 +1816,329 @@ impl HouseholdDeviceAdmissionAuthorityV1 {
             consumed_at: now,
         })
     }
+
+    // ── Pair seal / recheck ────────────────────────────────────────────────
+
+    /// Seal the fact that **two** distinct devices are admitted together, under
+    /// one generation, read under one lock.
+    ///
+    /// This is the pair primitive, not a convenience wrapper: there is
+    /// deliberately no path that builds a pair out of two
+    /// [`SealedDeviceAdmissionV1`] values. See
+    /// [`SealedDevicePairAdmissionV1`] for why composing the singular surface
+    /// twice is unsound rather than merely weaker.
+    ///
+    /// One [`StoreLock`] acquire and one [`Self::live_snapshot`] read serve both
+    /// members, so "same generation" and "same authority snapshot" hold by
+    /// construction rather than by comparison.
+    ///
+    /// Refusals are attributed to a [`PairRole`], so an initiator-side failure
+    /// and a responder-side failure of the same kind are distinguishable.
+    ///
+    /// Both sides must be listed, `Active`, owned by an unrevoked person, within
+    /// any inherited person limit, and must match the exact 33-byte SEC1 point
+    /// the caller intends to reach. The two must also be genuinely distinct —
+    /// both by `d_id` and by admitted key.
+    pub fn seal_pair(
+        &self,
+        initiator_d_id: &DeviceId,
+        initiator_peer_pub_sec1: &[u8; 33],
+        responder_d_id: &DeviceId,
+        responder_peer_pub_sec1: &[u8; 33],
+        now: u64,
+    ) -> Result<SealedDevicePairAdmissionV1, DeviceAdmissionError> {
+        // A pair of one is not a pair. Checked before the store is touched: it
+        // is a caller contract error, not a fact about the authority.
+        if initiator_d_id == responder_d_id {
+            return Err(DeviceAdmissionError::PairSameDevice);
+        }
+
+        // One lock, one read. Everything below is derived from `snapshot`, so
+        // there is no second observation to disagree with the first.
+        let _lock = StoreLock::acquire(&self.state_dir)?;
+        let snapshot = self.live_snapshot()?;
+
+        let initiator = Self::bind_pair_member(
+            &snapshot,
+            PairRole::Initiator,
+            initiator_d_id,
+            initiator_peer_pub_sec1,
+            now,
+        )?;
+        let responder = Self::bind_pair_member(
+            &snapshot,
+            PairRole::Responder,
+            responder_d_id,
+            responder_peer_pub_sec1,
+            now,
+        )?;
+
+        // Distinct `d_id`s can still resolve to one admitted key if the record
+        // was tampered with. Two names for one key is one party, so it is the
+        // same refusal as naming one device twice.
+        if initiator.peer_identity_pub_sec1 == responder.peer_identity_pub_sec1 {
+            return Err(DeviceAdmissionError::PairSameDevice);
+        }
+
+        Ok(SealedDevicePairAdmissionV1 {
+            contract_version: SealedDevicePairAdmissionV1::CONTRACT_VERSION,
+            hh_id: self.hh_id.clone(),
+            hh_root_digest: self.hh_root_digest,
+            initiator,
+            responder,
+            generation: snapshot.generation(),
+            revocation_cursor: snapshot.record.revocation_cursor,
+            revocation_digest: snapshot.record.revocation_digest.0,
+            snapshot_digest: snapshot.snapshot_digest,
+            verified_at: now,
+        })
+    }
+
+    /// Resolve and validate one side of a pair against an already-read snapshot.
+    ///
+    /// Takes the snapshot by reference and reads nothing else, so both members
+    /// are provably bound to the same authority state.
+    fn bind_pair_member(
+        snapshot: &DeviceAdmissionSnapshotV1,
+        role: PairRole,
+        d_id: &DeviceId,
+        peer_identity_pub_sec1: &[u8; 33],
+        now: u64,
+    ) -> Result<PairMemberBindingV1, DeviceAdmissionError> {
+        let entry = snapshot
+            .entry(d_id)
+            .ok_or_else(|| DeviceAdmissionError::DeviceNotListed.at(role))?;
+        if entry.status != DeviceStatus::Active {
+            return Err(DeviceAdmissionError::DeviceRevoked.at(role));
+        }
+        if snapshot.is_person_revoked(&entry.p_id) {
+            return Err(DeviceAdmissionError::PersonRevoked.at(role));
+        }
+        if entry.person_not_after.is_some_and(|limit| now >= limit) {
+            return Err(DeviceAdmissionError::PersonCertExpired.at(role));
+        }
+        // Direct subject-key equality (R0a §9 D3) over all 33 bytes.
+        if entry.d_pub.as_bytes() != peer_identity_pub_sec1 {
+            return Err(DeviceAdmissionError::PeerIdentityMismatch.at(role));
+        }
+        Ok(PairMemberBindingV1 {
+            role,
+            d_id: d_id.clone(),
+            p_id: entry.p_id.clone(),
+            peer_identity_pub_sec1: *peer_identity_pub_sec1,
+            device_cert_digest: entry.device_cert_digest.0,
+            person_cert_digest: entry.person_cert_digest.0,
+            narrowing_digest: entry.narrowing_digest.0,
+            person_not_after: entry.person_not_after,
+        })
+    }
+
+    /// Consume-time fence for a pair, atomic with the effect it authorizes.
+    ///
+    /// Takes the sealed pair **by value** and moves its member bindings into the
+    /// token handed to `effect`, so one pair fact can authorize exactly one
+    /// effect. Requires byte-exact equality with both peers the caller is about
+    /// to reach, **in position** — a fact sealed for `(A, B)` never authorizes
+    /// the dial `(B, A)`. Then, while holding the store lock, it re-reads the
+    /// live authority once and requires the root, both subjects, every cert and
+    /// narrowing digest, the non-zero generation, the revocation cursor and
+    /// digest, and the whole snapshot digest to be unchanged. `effect` runs
+    /// inside that same lock, so no revoke of *either* side can interleave
+    /// between the recheck and the decision.
+    ///
+    /// Any drift produces no effect and `effect` is never called. The fence
+    /// mutates nothing: a refusal leaves the durable record byte-identical.
+    ///
+    /// # Single use
+    ///
+    /// Single use is enforced by the move, exactly as for the singular fact —
+    /// this is a server-local capability (R0a §4), not a durable ledger entry.
+    /// Consuming does not write, so a restart does not "un-consume" anything;
+    /// it only means a fresh fact must be sealed, which re-runs every check.
+    ///
+    /// # Point-in-time semantics — read this before wiring a caller
+    ///
+    /// This closes the window between *verify* and *the local decision or
+    /// record* of that verification, for both sides at once. It does **not**
+    /// invalidate sessions that are already running: a pair authorized at
+    /// generation `G` keeps running after either side is revoked at `G+1`
+    /// unless something else tears it down. Continuous enforcement over a live
+    /// session is a separate mechanism and is not provided here.
+    ///
+    /// # Why a closure, and why its success type is `()`
+    ///
+    /// A returned guard would be `Send` and could be held across an `.await`,
+    /// pinning the lock behind network I/O. `effect` is a synchronous `FnOnce`,
+    /// so `.await` is *syntactically* impossible inside it, and it receives only
+    /// `&ConsumedDevicePairAdmissionV1` — never `&self` — so the token cannot
+    /// escape the critical section and no locking method can be re-entered.
+    ///
+    /// A synchronous closure is necessary but **not sufficient**. A generic type
+    /// anywhere in the output lets the effect return a *lazy* value and defer
+    /// the real work past the fence:
+    ///
+    /// ```text
+    /// consume_pair_with_effect(sealed, a, b, now, |_| Ok(async move { dial().await }))
+    /// //                                              ^ runs after the lock is gone
+    /// ```
+    ///
+    /// The returned future — or closure, or iterator — is constructed under the
+    /// lock and evaluated after it, so the revocation fence would guard nothing.
+    ///
+    /// **Both arms must be closed, not just the success arm.** Pinning the
+    /// success type to `()` while leaving the error type generic moves the hole
+    /// rather than closing it: `Err(async move { … })` is returned by value once
+    /// the lock has dropped and is awaited outside it, deferring identically.
+    /// That was measured on an earlier revision of this function — the shape
+    /// compiled and ran, producing its value after the lock was released. No
+    /// trait bound excludes a lazily-evaluated type, and no source guard can
+    /// help, because the type would be chosen at a call site in another crate.
+    /// So this signature carries **no type parameters at all**: `()` on success
+    /// and the closed, fieldless [`PairEffectFailure`] on failure.
+    ///
+    /// This is why the pair surface deliberately does not mirror the singular
+    /// [`Self::consume_with_effect`], which keeps `<T, E>`.
+    ///
+    /// # Honest residual
+    ///
+    /// This closes the *return* channel in both arms. It does not close every
+    /// channel: arbitrary synchronous code inside `effect` can still capture
+    /// state and spawn or enqueue work that runs later, and no signature can
+    /// prevent that. The contract for callers is therefore explicit: perform
+    /// the authorized mutation, or record the authorized decision,
+    /// **before returning from `effect`**.
+    ///
+    /// One further channel, named for completeness rather than because it is a
+    /// defect: `panic_any` plus `catch_unwind` still carries a caller-chosen
+    /// `'static` payload out, since `_lock` is released by RAII during the
+    /// unwind. The guarantees above hold as written — they name `Ok` and `Err`
+    /// specifically — the token still cannot escape, and the authority never
+    /// becomes inconsistent because this fence does not write.
+    ///
+    /// What is guaranteed structurally: the token reference cannot escape (the
+    /// borrow is higher-ranked, so it cannot be stored into the fixed return
+    /// type), the lock is held for the whole call, and **no lazily-evaluated
+    /// value can leave through `Ok` or through `Err`.**
+    pub fn consume_pair_with_effect(
+        &self,
+        sealed: SealedDevicePairAdmissionV1,
+        expected_initiator_pub_sec1: &[u8; 33],
+        expected_responder_pub_sec1: &[u8; 33],
+        now: u64,
+        effect: impl FnOnce(&ConsumedDevicePairAdmissionV1) -> Result<(), PairEffectFailure>,
+    ) -> Result<(), ConsumePairError> {
+        // Identity first, in position, and lock-free: a pair sealed for one
+        // ordering must never authorize the swap, however well endpoints,
+        // labels, or hints may match.
+        if sealed.initiator.peer_identity_pub_sec1 != *expected_initiator_pub_sec1 {
+            return Err(ConsumePairError::admission(
+                DeviceAdmissionError::PeerIdentityMismatch.at(PairRole::Initiator),
+            ));
+        }
+        if sealed.responder.peer_identity_pub_sec1 != *expected_responder_pub_sec1 {
+            return Err(ConsumePairError::admission(
+                DeviceAdmissionError::PeerIdentityMismatch.at(PairRole::Responder),
+            ));
+        }
+        if sealed.contract_version != SealedDevicePairAdmissionV1::CONTRACT_VERSION
+            || sealed.hh_id != self.hh_id
+            || sealed.hh_root_digest != self.hh_root_digest
+        {
+            return Err(ConsumePairError::admission(DeviceAdmissionError::StaleSeal));
+        }
+
+        // Everything from here to the end of `effect` is one critical section,
+        // and one live read serves both members.
+        let _lock = StoreLock::acquire(&self.state_dir).map_err(ConsumePairError::admission)?;
+        let snapshot = self.live_snapshot().map_err(ConsumePairError::admission)?;
+        Self::recheck_sealed_pair(&sealed, &snapshot, now).map_err(ConsumePairError::admission)?;
+
+        // The bindings move out of the sealed fact: consuming destroys it.
+        let SealedDevicePairAdmissionV1 {
+            initiator,
+            responder,
+            generation,
+            snapshot_digest,
+            ..
+        } = sealed;
+        let consumed = ConsumedDevicePairAdmissionV1 {
+            initiator,
+            responder,
+            generation,
+            snapshot_digest,
+            consumed_at: now,
+        };
+        effect(&consumed).map_err(ConsumePairError::Effect)
+    }
+
+    /// The §10 recheck for a pair. Pure: it reads the snapshot it is given and
+    /// nothing else, so both sides are rechecked against one authority state.
+    fn recheck_sealed_pair(
+        sealed: &SealedDevicePairAdmissionV1,
+        snapshot: &DeviceAdmissionSnapshotV1,
+        now: u64,
+    ) -> Result<(), DeviceAdmissionError> {
+        // Whole-snapshot fence first. Any change to either member — status,
+        // caveats, key, person revocation — is inside this digest, so this is
+        // what actually catches drift; the per-member recheck below is a closed
+        // backstop, not the primary defence.
+        if snapshot.snapshot_digest != sealed.snapshot_digest
+            || snapshot.generation() != sealed.generation
+            || snapshot.record.revocation_cursor != sealed.revocation_cursor
+            || snapshot.record.revocation_digest.0 != sealed.revocation_digest
+            || snapshot.record.hh_root_digest.0 != sealed.hh_root_digest
+        {
+            return Err(DeviceAdmissionError::StaleSeal);
+        }
+        if sealed.generation == 0 {
+            return Err(DeviceAdmissionError::GenerationZero);
+        }
+
+        Self::recheck_pair_member(&sealed.initiator, snapshot, now)?;
+        Self::recheck_pair_member(&sealed.responder, snapshot, now)?;
+
+        // Two names for one key is one party. Re-asserted here so the property
+        // is enforced at the point of use, not only at the point of sealing.
+        if sealed.initiator.d_id == sealed.responder.d_id
+            || sealed.initiator.peer_identity_pub_sec1 == sealed.responder.peer_identity_pub_sec1
+        {
+            return Err(DeviceAdmissionError::PairSameDevice);
+        }
+        Ok(())
+    }
+
+    /// Recheck one sealed side against the live snapshot.
+    fn recheck_pair_member(
+        member: &PairMemberBindingV1,
+        snapshot: &DeviceAdmissionSnapshotV1,
+        now: u64,
+    ) -> Result<(), DeviceAdmissionError> {
+        let role = member.role;
+        let entry = snapshot
+            .entry(&member.d_id)
+            .ok_or_else(|| DeviceAdmissionError::DeviceNotListed.at(role))?;
+        if entry.status != DeviceStatus::Active {
+            return Err(DeviceAdmissionError::DeviceRevoked.at(role));
+        }
+        if snapshot.is_person_revoked(&entry.p_id) {
+            return Err(DeviceAdmissionError::PersonRevoked.at(role));
+        }
+        if entry.p_id != member.p_id
+            || entry.device_cert_digest.0 != member.device_cert_digest
+            || entry.person_cert_digest.0 != member.person_cert_digest
+            || entry.narrowing_digest.0 != member.narrowing_digest
+            || entry.d_pub.as_bytes() != &member.peer_identity_pub_sec1
+            || entry.person_not_after != member.person_not_after
+        {
+            return Err(DeviceAdmissionError::StaleSeal.at(role));
+        }
+        // Wall-clock revalidation: reachable without any authority change,
+        // because `now` advances on its own.
+        if member.person_not_after.is_some_and(|limit| now >= limit) {
+            return Err(DeviceAdmissionError::PersonCertExpired.at(role));
+        }
+        Ok(())
+    }
 }
 
 fn person_cert_digest(person_cert: &PersonCert) -> Result<[u8; 32], DeviceAdmissionError> {
@@ -1582,7 +2256,7 @@ pub fn owner_person_cert_digest(
 mod tests {
     use super::*;
     use crate::caveats::Caveat;
-    use crate::device_cert::SignOptions;
+    use crate::device_cert::{SignOptions, derive_device_id};
     use crate::ids::derive_household_id;
     use crate::keys::{IdentityKey, P256Keypair};
     use crate::person_cert::SignOwnerOptions;
@@ -3553,5 +4227,1078 @@ mod tests {
             "the entry schema must deny unknown fields at the entry level, not \
              only via the record's canonical byte-compare"
         );
+    }
+
+    // ── D2d: atomic two-device pair admission ──────────────────────────────
+
+    /// Two distinct devices under one household, plus everything needed to
+    /// admit and revoke either of them.
+    ///
+    /// A second person is carried so a person-scoped failure can be aimed at
+    /// exactly one side of a pair: with both devices under one person, a
+    /// person-level refusal would hit whichever side is checked first and a
+    /// test aimed at the other side would pass vacuously.
+    struct PairFixture {
+        _dir: tempfile::TempDir,
+        state_dir: PathBuf,
+        hh: P256Keypair,
+        person_a: P256Keypair,
+        owner_a: PersonCert,
+        person_b: P256Keypair,
+        owner_b: PersonCert,
+        a_key: P256Keypair,
+        a_cert: DeviceCert,
+        b_key: P256Keypair,
+        b_cert: DeviceCert,
+    }
+
+    fn device_cert_for(person: &P256Keypair, device: &P256Keypair, name: &str) -> DeviceCert {
+        DeviceCert::sign(
+            person,
+            SignOptions {
+                p_pub: person.public(),
+                d_pub: device.public(),
+                device_name: name.into(),
+                platform: "ios".into(),
+                added_at: NOW,
+                caveats: None,
+            },
+        )
+        .unwrap()
+    }
+
+    impl PairFixture {
+        /// `b_not_after` bounds the *second* person only, so an expiry can be
+        /// aimed at the responder without touching the initiator.
+        fn build(b_not_after: Option<u64>) -> Self {
+            let dir = tempfile::tempdir().unwrap();
+            let state_dir = dir.path().to_path_buf();
+            let hh = P256Keypair::generate();
+            let person_a = P256Keypair::generate();
+            let person_b = P256Keypair::generate();
+            let owner_a = owner_cert(&hh, &person_a);
+            let mut owner_b = owner_cert(&hh, &person_b);
+            if let Some(limit) = b_not_after {
+                owner_b.not_after = Some(limit);
+                // Re-signed: `not_after` is covered by the household signature,
+                // so an unsigned edit would not survive verification.
+                let signing = owner_b.signing_bytes().unwrap();
+                owner_b.signature = hh.sign(&signing).unwrap();
+            }
+            let a_key = P256Keypair::generate();
+            let b_key = P256Keypair::generate();
+            let a_cert = device_cert_for(&person_a, &a_key, "iPhone 15");
+            let b_cert = device_cert_for(&person_b, &b_key, "iPad Pro");
+            Self {
+                _dir: dir,
+                state_dir,
+                hh,
+                person_a,
+                owner_a,
+                person_b,
+                owner_b,
+                a_key,
+                a_cert,
+                b_key,
+                b_cert,
+            }
+        }
+
+        fn hh_id(&self) -> HouseholdId {
+            derive_household_id(&self.hh.public())
+        }
+
+        fn authority(&self) -> HouseholdDeviceAdmissionAuthorityV1 {
+            HouseholdDeviceAdmissionAuthorityV1::new(
+                &self.state_dir,
+                self.hh_id(),
+                self.hh.public(),
+            )
+        }
+
+        fn a_peer(&self) -> [u8; 33] {
+            *self.a_key.public().as_bytes()
+        }
+
+        fn b_peer(&self) -> [u8; 33] {
+            *self.b_key.public().as_bytes()
+        }
+
+        fn admit(
+            &self,
+            auth: &HouseholdDeviceAdmissionAuthorityV1,
+            owner: &PersonCert,
+            person: &P256Keypair,
+            cert: &DeviceCert,
+            nonce: u8,
+        ) -> Result<MutationOutcome, DeviceAdmissionError> {
+            let generation = auth.live_snapshot()?.generation();
+            let nonce = [nonce; 32];
+            let challenge = add_pop_challenge(
+                &self.hh_id(),
+                generation,
+                cert,
+                &cert.digest().unwrap(),
+                &owner_person_cert_digest(owner)?,
+                &nonce,
+            )?;
+            let pop = person.sign(&challenge).unwrap();
+            auth.admit_device(owner, cert, &pop, &nonce, NOW)
+        }
+
+        fn revoke(
+            &self,
+            auth: &HouseholdDeviceAdmissionAuthorityV1,
+            owner: &PersonCert,
+            person: &P256Keypair,
+            d_id: &DeviceId,
+            nonce: u8,
+        ) -> Result<MutationOutcome, DeviceAdmissionError> {
+            let nonce = [nonce; 32];
+            let challenge = owner_revoke_challenge(&self.hh_id(), d_id, &nonce)?;
+            let pop = person.sign(&challenge).unwrap();
+            auth.revoke_device_as_owner(owner, d_id, &pop, &nonce, NOW)
+        }
+
+        fn revoke_a(
+            &self,
+            auth: &HouseholdDeviceAdmissionAuthorityV1,
+            nonce: u8,
+        ) -> Result<MutationOutcome, DeviceAdmissionError> {
+            self.revoke(
+                auth,
+                &self.owner_a,
+                &self.person_a,
+                &self.a_cert.d_id,
+                nonce,
+            )
+        }
+
+        fn revoke_b(
+            &self,
+            auth: &HouseholdDeviceAdmissionAuthorityV1,
+            nonce: u8,
+        ) -> Result<MutationOutcome, DeviceAdmissionError> {
+            self.revoke(
+                auth,
+                &self.owner_b,
+                &self.person_b,
+                &self.b_cert.d_id,
+                nonce,
+            )
+        }
+
+        fn read_record(&self) -> DeviceAdmissionRecordV1 {
+            decode_record(&fs::read(record_path(&self.state_dir)).unwrap()).unwrap()
+        }
+
+        fn write_record(&self, record: &DeviceAdmissionRecordV1) {
+            fs::write(
+                record_path(&self.state_dir),
+                cbor::to_canonical_vec(record).unwrap(),
+            )
+            .unwrap();
+        }
+
+        fn bytes(&self) -> Vec<u8> {
+            fs::read(record_path(&self.state_dir)).unwrap()
+        }
+    }
+
+    /// A provisioned authority with both devices admitted. Generation is 3:
+    /// provision, admit A, admit B.
+    fn pair_ready(b_not_after: Option<u64>) -> (PairFixture, HouseholdDeviceAdmissionAuthorityV1) {
+        let fx = PairFixture::build(b_not_after);
+        let auth = fx.authority();
+        auth.provision().unwrap();
+        fx.admit(&auth, &fx.owner_a, &fx.person_a, &fx.a_cert, 1)
+            .unwrap();
+        fx.admit(&auth, &fx.owner_b, &fx.person_b, &fx.b_cert, 2)
+            .unwrap();
+        assert_eq!(
+            auth.live_snapshot().unwrap().generation(),
+            3,
+            "the pair fixture must be at a known generation"
+        );
+        (fx, auth)
+    }
+
+    fn seal_ab(
+        fx: &PairFixture,
+        auth: &HouseholdDeviceAdmissionAuthorityV1,
+        now: u64,
+    ) -> Result<SealedDevicePairAdmissionV1, DeviceAdmissionError> {
+        auth.seal_pair(
+            &fx.a_cert.d_id,
+            &fx.a_peer(),
+            &fx.b_cert.d_id,
+            &fx.b_peer(),
+            now,
+        )
+    }
+
+    /// What the pair effect observed, copied out so assertions can run after the
+    /// lock is released.
+    #[derive(Debug)]
+    struct PairProbe {
+        initiator_peer: [u8; 33],
+        responder_peer: [u8; 33],
+        roles: (PairRole, PairRole),
+        generation: u64,
+        snapshot_digest: [u8; 32],
+        consumed_at: u64,
+    }
+
+    /// Consume a pair, recording what the effect saw.
+    ///
+    /// The observation is written into a captured cell rather than returned:
+    /// the effect's success type is `()` on purpose, so that a caller cannot
+    /// hand a lazily-evaluated value back across the fence. This helper is
+    /// therefore also the worked example of the intended caller shape — do the
+    /// work inside, publish nothing deferred.
+    ///
+    /// The effect always succeeds here, so the `Effect` arm is unreachable in
+    /// practice and this surfaces `DeviceAdmissionError` directly, keeping the
+    /// tests about admission rather than plumbing.
+    fn consume_pair_probe(
+        auth: &HouseholdDeviceAdmissionAuthorityV1,
+        sealed: SealedDevicePairAdmissionV1,
+        initiator: &[u8; 33],
+        responder: &[u8; 33],
+        now: u64,
+    ) -> Result<PairProbe, DeviceAdmissionError> {
+        use std::cell::RefCell;
+
+        let observed: RefCell<Option<PairProbe>> = RefCell::new(None);
+        auth.consume_pair_with_effect(sealed, initiator, responder, now, |consumed| {
+            *observed.borrow_mut() = Some(PairProbe {
+                initiator_peer: *consumed.initiator().peer_identity_pub_sec1(),
+                responder_peer: *consumed.responder().peer_identity_pub_sec1(),
+                roles: (consumed.initiator().role(), consumed.responder().role()),
+                generation: consumed.generation(),
+                snapshot_digest: *consumed.snapshot_digest(),
+                consumed_at: consumed.consumed_at(),
+            });
+            Ok(())
+        })
+        .map_err(|error| match error {
+            ConsumePairError::Admission(error) => error,
+            ConsumePairError::Effect(failure) => {
+                panic!("the probe effect never fails, got {failure:?}")
+            }
+        })?;
+        Ok(observed
+            .into_inner()
+            .expect("a successful consume must have run the effect"))
+    }
+
+    #[test]
+    fn seal_pair_then_consume_pair_round_trips() {
+        let (fx, auth) = pair_ready(None);
+        let live = auth.live_snapshot().unwrap();
+
+        let sealed = seal_ab(&fx, &auth, NOW).unwrap();
+        // One generation and one snapshot digest for BOTH sides — the atomicity
+        // claim, read off the fact itself.
+        assert_eq!(sealed.generation(), live.generation());
+        assert_eq!(sealed.snapshot_digest(), live.snapshot_digest());
+        assert_eq!(sealed.verified_at(), NOW);
+        assert_eq!(sealed.initiator().d_id(), &fx.a_cert.d_id);
+        assert_eq!(sealed.responder().d_id(), &fx.b_cert.d_id);
+        assert_eq!(
+            sealed.member(PairRole::Initiator).role(),
+            PairRole::Initiator
+        );
+        assert_eq!(
+            sealed.member(PairRole::Responder).role(),
+            PairRole::Responder
+        );
+
+        let probe = consume_pair_probe(&auth, sealed, &fx.a_peer(), &fx.b_peer(), NOW).unwrap();
+        assert_eq!(probe.initiator_peer, fx.a_peer());
+        assert_eq!(probe.responder_peer, fx.b_peer());
+        assert_eq!(probe.roles, (PairRole::Initiator, PairRole::Responder));
+        assert_eq!(probe.generation, live.generation());
+        assert_eq!(probe.snapshot_digest, *live.snapshot_digest());
+        assert_eq!(probe.consumed_at, NOW);
+    }
+
+    #[test]
+    fn a_pair_must_name_two_distinct_devices() {
+        let (fx, auth) = pair_ready(None);
+
+        // Positive control first: the same fixture DOES seal a genuine pair, so
+        // the refusals below are about sameness and not a broken fixture.
+        assert!(seal_ab(&fx, &auth, NOW).is_ok());
+
+        for (label, d_id, peer) in [
+            ("initiator twice", &fx.a_cert.d_id, fx.a_peer()),
+            ("responder twice", &fx.b_cert.d_id, fx.b_peer()),
+        ] {
+            assert_eq!(
+                auth.seal_pair(d_id, &peer, d_id, &peer, NOW).unwrap_err(),
+                DeviceAdmissionError::PairSameDevice,
+                "{label}: one device named twice is not a pair"
+            );
+        }
+    }
+
+    #[test]
+    fn two_d_ids_that_resolve_to_one_key_are_not_a_pair() {
+        let (fx, auth) = pair_ready(None);
+        // Positive control: distinct keys seal.
+        assert!(seal_ab(&fx, &auth, NOW).is_ok());
+
+        // Tamper so B's entry carries A's admitted key. The two `d_id`s still
+        // differ, so a name-only distinctness check would pass this.
+        let mut record = fx.read_record();
+        record.devices.get_mut(&fx.b_cert.d_id.0).unwrap().d_pub = fx.a_key.public();
+        fx.write_record(&record);
+
+        assert_eq!(
+            auth.seal_pair(
+                &fx.a_cert.d_id,
+                &fx.a_peer(),
+                &fx.b_cert.d_id,
+                &fx.a_peer(),
+                NOW
+            )
+            .unwrap_err(),
+            DeviceAdmissionError::PairSameDevice,
+            "two names for one admitted key is one party, not a pair"
+        );
+    }
+
+    /// The non-vacuity control for every pair refusal.
+    ///
+    /// Each failure kind is produced once on the initiator side and once on the
+    /// responder side, and the assertion is on `(role, cause)` rather than on
+    /// `cause` alone. Without the role, a test aimed at the responder could pass
+    /// because the *initiator* refused first — a real refusal, but not the one
+    /// under test. The paired cases also prove neither side's guard is missing:
+    /// a check present on only one side shows up here as a mismatched role.
+    #[test]
+    fn pair_refusals_name_the_side_that_failed() {
+        #[derive(Clone, Copy, Debug)]
+        enum Break {
+            NotListed,
+            Revoked,
+            PersonRevoked,
+            WrongKey,
+        }
+
+        for kind in [
+            Break::NotListed,
+            Break::Revoked,
+            Break::PersonRevoked,
+            Break::WrongKey,
+        ] {
+            for role in [PairRole::Initiator, PairRole::Responder] {
+                let case = format!("{kind:?}/{role:?}");
+                let (fx, auth) = pair_ready(None);
+
+                // Positive control per case: this fixture seals before it is
+                // broken, so the refusal below is attributable to the break.
+                assert!(seal_ab(&fx, &auth, NOW).is_ok(), "{case}: control");
+
+                let stranger = *P256Keypair::generate().public().as_bytes();
+                let missing = derive_device_id(&P256Keypair::generate().public());
+                let (mut a_id, mut a_peer) = (fx.a_cert.d_id.clone(), fx.a_peer());
+                let (mut b_id, mut b_peer) = (fx.b_cert.d_id.clone(), fx.b_peer());
+
+                let expected = match kind {
+                    Break::NotListed => {
+                        match role {
+                            PairRole::Initiator => a_id = missing,
+                            PairRole::Responder => b_id = missing,
+                        }
+                        DeviceAdmissionError::DeviceNotListed
+                    }
+                    Break::Revoked => {
+                        match role {
+                            PairRole::Initiator => fx.revoke_a(&auth, 7).unwrap(),
+                            PairRole::Responder => fx.revoke_b(&auth, 7).unwrap(),
+                        };
+                        DeviceAdmissionError::DeviceRevoked
+                    }
+                    Break::PersonRevoked => {
+                        // Revoke the person WITHOUT cascading to the device, so
+                        // the person check is what refuses rather than the
+                        // status check that normally fires first. The API always
+                        // cascades, so this state is only reachable by writing
+                        // it — and a record whose cascade is incomplete must
+                        // still fail closed.
+                        let mut record = fx.read_record();
+                        let p_id = match role {
+                            PairRole::Initiator => fx.owner_a.p_id.0.clone(),
+                            PairRole::Responder => fx.owner_b.p_id.0.clone(),
+                        };
+                        record.revoked_persons.insert(p_id);
+                        fx.write_record(&record);
+                        DeviceAdmissionError::PersonRevoked
+                    }
+                    Break::WrongKey => {
+                        match role {
+                            PairRole::Initiator => a_peer = stranger,
+                            PairRole::Responder => b_peer = stranger,
+                        }
+                        DeviceAdmissionError::PeerIdentityMismatch
+                    }
+                };
+
+                let error = auth
+                    .seal_pair(&a_id, &a_peer, &b_id, &b_peer, NOW)
+                    .unwrap_err();
+                assert_eq!(
+                    error.pair_member(),
+                    Some((role, &expected)),
+                    "{case}: the refusal must name the side that failed"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_pair_sealed_before_a_revoke_of_either_side_is_stale_at_consume() {
+        for role in [PairRole::Initiator, PairRole::Responder] {
+            let (fx, auth) = pair_ready(None);
+            let sealed = seal_ab(&fx, &auth, NOW).unwrap();
+
+            match role {
+                PairRole::Initiator => fx.revoke_a(&auth, 9).unwrap(),
+                PairRole::Responder => fx.revoke_b(&auth, 9).unwrap(),
+            };
+
+            assert_eq!(
+                consume_pair_probe(&auth, sealed, &fx.a_peer(), &fx.b_peer(), NOW).unwrap_err(),
+                DeviceAdmissionError::StaleSeal,
+                "{role:?}: revoking either side must invalidate the pair"
+            );
+        }
+    }
+
+    #[test]
+    fn a_pair_is_stale_after_any_unrelated_generation_change() {
+        let (fx, auth) = pair_ready(None);
+        let sealed = seal_ab(&fx, &auth, NOW).unwrap();
+
+        // A third device, unrelated to both members: neither side changed, but
+        // the snapshot the pair was sealed against no longer exists.
+        let third_key = P256Keypair::generate();
+        let third = device_cert_for(&fx.person_a, &third_key, "MacBook");
+        fx.admit(&auth, &fx.owner_a, &fx.person_a, &third, 11)
+            .unwrap();
+
+        assert_eq!(
+            consume_pair_probe(&auth, sealed, &fx.a_peer(), &fx.b_peer(), NOW).unwrap_err(),
+            DeviceAdmissionError::StaleSeal
+        );
+    }
+
+    #[test]
+    fn a_pair_sealed_for_one_ordering_never_authorizes_the_swap() {
+        let (fx, auth) = pair_ready(None);
+
+        // Swapped presentation: the initiator slot is offered the responder key.
+        let sealed = seal_ab(&fx, &auth, NOW).unwrap();
+        let error = consume_pair_probe(&auth, sealed, &fx.b_peer(), &fx.a_peer(), NOW).unwrap_err();
+        assert_eq!(
+            error.pair_member(),
+            Some((
+                PairRole::Initiator,
+                &DeviceAdmissionError::PeerIdentityMismatch
+            )),
+            "a pair sealed for (A, B) must not authorize the dial (B, A)"
+        );
+
+        // Responder slot substituted for a third key, initiator left correct —
+        // so the responder-side check is what refuses.
+        let stranger = *P256Keypair::generate().public().as_bytes();
+        let sealed = seal_ab(&fx, &auth, NOW).unwrap();
+        let error = consume_pair_probe(&auth, sealed, &fx.a_peer(), &stranger, NOW).unwrap_err();
+        assert_eq!(
+            error.pair_member(),
+            Some((
+                PairRole::Responder,
+                &DeviceAdmissionError::PeerIdentityMismatch
+            ))
+        );
+
+        // Control: the correct ordering still consumes, so the two refusals are
+        // about position and not about a fixture that cannot consume at all.
+        let sealed = seal_ab(&fx, &auth, NOW).unwrap();
+        assert!(consume_pair_probe(&auth, sealed, &fx.a_peer(), &fx.b_peer(), NOW).is_ok());
+    }
+
+    /// Wall-clock revalidation is the one member-level fence reachable at
+    /// consume without any authority change: `now` advances on its own, so the
+    /// snapshot digest still matches while the limit has passed.
+    #[test]
+    fn consume_pair_refuses_once_a_members_person_limit_passes() {
+        let limit = NOW + 100;
+        let (fx, auth) = pair_ready(Some(limit));
+
+        // Control: inside the window the pair seals AND consumes.
+        let sealed = seal_ab(&fx, &auth, NOW + 10).unwrap();
+        assert!(
+            consume_pair_probe(&auth, sealed, &fx.a_peer(), &fx.b_peer(), NOW + 10).is_ok(),
+            "inside the window the pair must consume"
+        );
+
+        // Sealed inside the window, consumed past it: nothing on disk moved.
+        let sealed = seal_ab(&fx, &auth, NOW + 10).unwrap();
+        let before = fx.bytes();
+        let error =
+            consume_pair_probe(&auth, sealed, &fx.a_peer(), &fx.b_peer(), limit + 1).unwrap_err();
+        assert_eq!(
+            error.pair_member(),
+            Some((
+                PairRole::Responder,
+                &DeviceAdmissionError::PersonCertExpired
+            )),
+            "only the responder's person is bounded, so only it may expire"
+        );
+        assert_eq!(fx.bytes(), before, "the fence must not write");
+
+        // And a fresh seal past the limit is refused outright, on the same side.
+        let error = seal_ab(&fx, &auth, limit + 1).unwrap_err();
+        assert_eq!(
+            error.pair_member(),
+            Some((
+                PairRole::Responder,
+                &DeviceAdmissionError::PersonCertExpired
+            ))
+        );
+    }
+
+    #[test]
+    fn pair_seal_and_consume_fail_closed_when_the_authority_disappears() {
+        let (fx, auth) = pair_ready(None);
+        let sealed = seal_ab(&fx, &auth, NOW).unwrap();
+        fs::remove_file(record_path(&fx.state_dir)).unwrap();
+
+        assert_eq!(
+            consume_pair_probe(&auth, sealed, &fx.a_peer(), &fx.b_peer(), NOW).unwrap_err(),
+            DeviceAdmissionError::Unavailable
+        );
+        assert_eq!(
+            seal_ab(&fx, &auth, NOW).unwrap_err(),
+            DeviceAdmissionError::Unavailable
+        );
+    }
+
+    #[test]
+    fn pair_seal_fails_closed_on_a_zero_generation_record() {
+        let (fx, auth) = pair_ready(None);
+        let mut record = fx.read_record();
+        record.generation = 0;
+        fx.write_record(&record);
+        assert_eq!(
+            seal_ab(&fx, &auth, NOW).unwrap_err(),
+            DeviceAdmissionError::GenerationZero
+        );
+    }
+
+    #[test]
+    fn a_pair_sealed_under_one_root_is_refused_by_another() {
+        let (fx, auth) = pair_ready(None);
+        let sealed = seal_ab(&fx, &auth, NOW).unwrap();
+
+        // Same directory, same household id, different root key: the sealed
+        // root digest no longer matches the authority being asked.
+        let foreign = HouseholdDeviceAdmissionAuthorityV1::new(
+            &fx.state_dir,
+            fx.hh_id(),
+            P256Keypair::generate().public(),
+        );
+        assert_eq!(
+            consume_pair_probe(&foreign, sealed, &fx.a_peer(), &fx.b_peer(), NOW).unwrap_err(),
+            DeviceAdmissionError::StaleSeal
+        );
+        assert_eq!(
+            seal_ab(&fx, &foreign, NOW).unwrap_err(),
+            DeviceAdmissionError::WrongHousehold
+        );
+    }
+
+    /// The effect must run exactly once on success and never on a refusal.
+    #[test]
+    fn the_pair_effect_runs_exactly_once_and_never_on_a_refusal() {
+        use std::cell::Cell;
+
+        // Success: exactly one invocation.
+        let (fx, auth) = pair_ready(None);
+        let sealed = seal_ab(&fx, &auth, NOW).unwrap();
+        let calls = Cell::new(0u32);
+        auth.consume_pair_with_effect(sealed, &fx.a_peer(), &fx.b_peer(), NOW, |_consumed| {
+            calls.set(calls.get() + 1);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(calls.get(), 1, "the effect must run exactly once");
+
+        // Every refusal shape: zero invocations.
+        let stranger = *P256Keypair::generate().public().as_bytes();
+        for label in ["swapped", "stranger", "revoked", "absent"] {
+            let (fx, auth) = pair_ready(None);
+            let sealed = seal_ab(&fx, &auth, NOW).unwrap();
+            let (initiator, responder) = match label {
+                "swapped" => (fx.b_peer(), fx.a_peer()),
+                "stranger" => (fx.a_peer(), stranger),
+                "revoked" => {
+                    fx.revoke_b(&auth, 5).unwrap();
+                    (fx.a_peer(), fx.b_peer())
+                }
+                _ => {
+                    fs::remove_file(record_path(&fx.state_dir)).unwrap();
+                    (fx.a_peer(), fx.b_peer())
+                }
+            };
+            let calls = Cell::new(0u32);
+            let error = auth
+                .consume_pair_with_effect(sealed, &initiator, &responder, NOW, |_consumed| {
+                    calls.set(calls.get() + 1);
+                    Ok(())
+                })
+                .unwrap_err();
+            assert!(
+                error.as_admission().is_some(),
+                "{label}: the fence must be what refused"
+            );
+            assert_eq!(calls.get(), 0, "{label}: the effect ran despite a refusal");
+        }
+    }
+
+    #[test]
+    fn a_pair_effect_failure_is_distinguishable_from_an_admission_refusal() {
+        let (fx, auth) = pair_ready(None);
+
+        // Every failure the closed type can express stays distinguishable from
+        // an admission refusal, and each round-trips as itself.
+        for failure in [
+            PairEffectFailure::NotApplied,
+            PairEffectFailure::Declined,
+            PairEffectFailure::Incomplete,
+        ] {
+            let sealed = seal_ab(&fx, &auth, NOW).unwrap();
+            let error = auth
+                .consume_pair_with_effect(sealed, &fx.a_peer(), &fx.b_peer(), NOW, |_consumed| {
+                    Err(failure)
+                })
+                .unwrap_err();
+            assert_eq!(error, ConsumePairError::Effect(failure));
+            assert!(
+                error.as_admission().is_none(),
+                "{failure:?}: an effect failure must not read as an admission refusal"
+            );
+        }
+
+        // Control: an admission refusal is the other arm, so the assertions
+        // above are not simply "everything is an Effect".
+        let sealed = seal_ab(&fx, &auth, NOW).unwrap();
+        let stranger = *P256Keypair::generate().public().as_bytes();
+        let error = auth
+            .consume_pair_with_effect(sealed, &stranger, &fx.b_peer(), NOW, |_consumed| Ok(()))
+            .unwrap_err();
+        assert!(error.as_admission().is_some());
+    }
+
+    /// The failure type is closed and fieldless, so nothing lazily-evaluated can
+    /// leave through the `Err` arm.
+    ///
+    /// This is the CFX the independent auditor raised: an earlier revision fixed
+    /// the success type to `()` but left the error type a caller-chosen `E`, and
+    /// `Err(async move { … })` — or `Err(move || …)` — was returned by value
+    /// after the lock dropped and evaluated outside it. Measured against that
+    /// revision: the shape compiled and ran, producing its value with the fence
+    /// already released. Pinning one arm moved the hole rather than closing it.
+    ///
+    /// The property is now a type fact, not a test: `PairEffectFailure` has
+    /// three fieldless variants, so there is no position in the signature where
+    /// a caller-chosen type — lazy or otherwise — can appear. A future, closure,
+    /// or iterator is simply not one of these values, and no `impl` can make it
+    /// one. What is asserted here is that the type really is closed and
+    /// fieldless, which is what makes that argument hold.
+    #[test]
+    fn the_pair_effect_failure_type_is_closed_and_carries_no_payload() {
+        // Fieldless: each variant is a value, constructible with no arguments,
+        // and `Copy` — none of which a deferred computation can be.
+        let all = [
+            PairEffectFailure::NotApplied,
+            PairEffectFailure::Declined,
+            PairEffectFailure::Incomplete,
+        ];
+        let distinct: BTreeSet<String> = all.iter().map(|f| format!("{f:?}")).collect();
+        assert_eq!(distinct.len(), 3, "the variants must stay distinct");
+
+        // `Copy` + `Eq` hold, so the value is plain data with no interior state
+        // to carry a computation.
+        let failure = PairEffectFailure::Declined;
+        let copied = failure;
+        assert_eq!(failure, copied);
+
+        // Every variant carries a distinct, non-empty message, so a caller has
+        // somewhere to put meaning without a payload channel.
+        for failure in all {
+            assert!(
+                !failure.to_string().is_empty(),
+                "{failure:?} has no message"
+            );
+        }
+    }
+
+    /// The pair fence authorizes; it never mutates. A refusal must leave the
+    /// durable record byte-identical and must not publish a projection.
+    #[test]
+    fn the_pair_fence_never_mutates_the_durable_record() {
+        let (fx, auth) = pair_ready(None);
+        let before = fx.bytes();
+        let projection = auth.durable_projection();
+
+        // Success path.
+        let sealed = seal_ab(&fx, &auth, NOW).unwrap();
+        consume_pair_probe(&auth, sealed, &fx.a_peer(), &fx.b_peer(), NOW).unwrap();
+        assert_eq!(fx.bytes(), before, "a successful consume must not write");
+        assert_eq!(
+            auth.durable_projection(),
+            projection,
+            "a successful consume must not move the projection"
+        );
+
+        // Refusal paths.
+        let stranger = *P256Keypair::generate().public().as_bytes();
+        let sealed = seal_ab(&fx, &auth, NOW).unwrap();
+        assert!(consume_pair_probe(&auth, sealed, &stranger, &fx.b_peer(), NOW).is_err());
+        assert_eq!(fx.bytes(), before);
+
+        assert!(
+            auth.seal_pair(
+                &fx.a_cert.d_id,
+                &fx.a_peer(),
+                &fx.a_cert.d_id,
+                &fx.a_peer(),
+                NOW
+            )
+            .is_err()
+        );
+        assert_eq!(fx.bytes(), before, "a refused seal must not write");
+        assert_eq!(auth.durable_projection(), projection);
+    }
+
+    /// R0a §10.10 for a pair: a revoke of *either* side cannot interleave
+    /// between the recheck and the decision it authorizes.
+    #[test]
+    fn a_revoke_of_the_responder_cannot_cross_a_pair_consume_decision() {
+        use std::sync::{Arc, mpsc};
+        use std::time::Duration;
+
+        let (fx, auth) = pair_ready(None);
+        let auth = Arc::new(auth);
+        let sealed = seal_ab(&fx, &auth, NOW).unwrap();
+
+        // Pre-mint the revoke inputs so the revoker thread moves plain data.
+        let nonce = [43u8; 32];
+        let challenge = owner_revoke_challenge(&fx.hh_id(), &fx.b_cert.d_id, &nonce).unwrap();
+        let revoke_pop = fx.person_b.sign(&challenge).unwrap();
+        let owner_b = fx.owner_b.clone();
+        let target = fx.b_cert.d_id.clone();
+
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+
+        let state_dir = fx.state_dir.clone();
+        let a_key = fx.a_cert.d_id.0.clone();
+        let b_key = fx.b_cert.d_id.0.clone();
+        let peers = (fx.a_peer(), fx.b_peer());
+        let consumer_auth = Arc::clone(&auth);
+        let consumer = std::thread::spawn(move || {
+            consumer_auth.consume_pair_with_effect(
+                sealed,
+                &peers.0,
+                &peers.1,
+                NOW,
+                move |consumed| {
+                    entered_tx.send(consumed.generation()).unwrap();
+                    release_rx.recv().unwrap();
+                    // Read the durable record directly: a revoke that crossed
+                    // the decision would already be visible here.
+                    let on_disk =
+                        decode_record(&fs::read(record_path(&state_dir)).unwrap()).unwrap();
+                    assert_eq!(on_disk.generation, 3, "generation moved under the decision");
+                    for key in [&a_key, &b_key] {
+                        assert_eq!(
+                            on_disk.devices.get(key).unwrap().status,
+                            DeviceStatus::Active,
+                            "a revoke crossed the pair decision"
+                        );
+                    }
+                    Ok(())
+                },
+            )
+        });
+
+        // The generation the effect observed arrives over the channel, not as a
+        // return value: the effect's success type is `()` so that nothing
+        // lazily-evaluated can cross the fence.
+        assert_eq!(entered_rx.recv().unwrap(), 3);
+
+        let revoker_auth = Arc::clone(&auth);
+        let revoker = std::thread::spawn(move || {
+            revoker_auth.revoke_device_as_owner(&owner_b, &target, &revoke_pop, &nonce, NOW)
+        });
+
+        // Well inside LOCK_TIMEOUT, and the revoker polls every 10ms, so this is
+        // contention rather than a timeout.
+        std::thread::sleep(Duration::from_millis(250));
+        assert!(
+            !revoker.is_finished(),
+            "the revoke completed while the pair decision was still open"
+        );
+
+        release_tx.send(()).unwrap();
+        consumer.join().unwrap().unwrap();
+
+        // ...and the lock really is released: the revoke lands after.
+        assert_eq!(
+            revoker.join().unwrap().unwrap(),
+            MutationOutcome::Applied { generation: 4 }
+        );
+        assert_eq!(
+            auth.live_snapshot()
+                .unwrap()
+                .entry(&fx.b_cert.d_id)
+                .unwrap()
+                .status,
+            DeviceStatus::Revoked
+        );
+    }
+
+    /// `seal_pair` and `consume_pair_with_effect` really do share one lock: a
+    /// seal cannot observe the authority while a pair decision is open.
+    #[test]
+    fn seal_pair_and_consume_pair_share_one_lock() {
+        use std::sync::{Arc, mpsc};
+        use std::time::Duration;
+
+        let (fx, auth) = pair_ready(None);
+        let auth = Arc::new(auth);
+        let sealed = seal_ab(&fx, &auth, NOW).unwrap();
+
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+
+        let peers = (fx.a_peer(), fx.b_peer());
+        let consumer_auth = Arc::clone(&auth);
+        let consumer = std::thread::spawn(move || {
+            consumer_auth.consume_pair_with_effect(
+                sealed,
+                &peers.0,
+                &peers.1,
+                NOW,
+                move |_consumed| {
+                    entered_tx.send(()).unwrap();
+                    release_rx.recv().unwrap();
+                    Ok(())
+                },
+            )
+        });
+        entered_rx.recv().unwrap();
+
+        let sealer_auth = Arc::clone(&auth);
+        let (a_id, a_peer) = (fx.a_cert.d_id.clone(), fx.a_peer());
+        let (b_id, b_peer) = (fx.b_cert.d_id.clone(), fx.b_peer());
+        let sealer = std::thread::spawn(move || {
+            sealer_auth
+                .seal_pair(&a_id, &a_peer, &b_id, &b_peer, NOW)
+                .map(|sealed| sealed.generation())
+        });
+
+        std::thread::sleep(Duration::from_millis(250));
+        assert!(
+            !sealer.is_finished(),
+            "seal_pair observed the authority while a pair decision held the lock"
+        );
+
+        release_tx.send(()).unwrap();
+        consumer.join().unwrap().unwrap();
+        assert_eq!(sealer.join().unwrap().unwrap(), 3);
+    }
+
+    /// The load-bearing reason this slice exists.
+    ///
+    /// Two singular admissions, each individually correct, compose into a
+    /// "pair" in which one side is already revoked — because each singular
+    /// consume takes the lock, checks, and *releases* it, so nothing binds the
+    /// two decisions to one instant. The atomic fence refuses the same
+    /// situation.
+    #[test]
+    fn composing_two_singular_admissions_authorizes_a_pair_the_atomic_fence_refuses() {
+        // ── the composed path: both singular consumes report success ────────
+        let (fx, auth) = pair_ready(None);
+
+        let sealed_a = auth.seal(&fx.a_cert.d_id, &fx.a_peer(), NOW).unwrap();
+        assert!(
+            consume_probe(&auth, sealed_a, &fx.a_peer(), NOW).is_ok(),
+            "A is authorized at generation 3"
+        );
+
+        // Between the two singular decisions, A is revoked.
+        fx.revoke_a(&auth, 21).unwrap();
+
+        let sealed_b = auth.seal(&fx.b_cert.d_id, &fx.b_peer(), NOW).unwrap();
+        assert!(
+            consume_probe(&auth, sealed_b, &fx.b_peer(), NOW).is_ok(),
+            "B is authorized at generation 4"
+        );
+
+        // Both singular calls succeeded, so a caller composing them holds
+        // "A authorized" and "B authorized" — while A is revoked. There was no
+        // instant at which both were true.
+        assert_eq!(
+            auth.live_snapshot()
+                .unwrap()
+                .entry(&fx.a_cert.d_id)
+                .unwrap()
+                .status,
+            DeviceStatus::Revoked,
+            "the composed path authorized a revoked device as half of a pair"
+        );
+
+        // ── the atomic path refuses the same situation ──────────────────────
+        let (fx, auth) = pair_ready(None);
+        let sealed = seal_ab(&fx, &auth, NOW).unwrap();
+        fx.revoke_a(&auth, 22).unwrap();
+        assert_eq!(
+            consume_pair_probe(&auth, sealed, &fx.a_peer(), &fx.b_peer(), NOW).unwrap_err(),
+            DeviceAdmissionError::StaleSeal,
+            "a pair sealed before the revoke must not consume after it"
+        );
+        // ...and a fresh pair seal names the side that is now gone.
+        assert_eq!(
+            seal_ab(&fx, &auth, NOW).unwrap_err().pair_member(),
+            Some((PairRole::Initiator, &DeviceAdmissionError::DeviceRevoked))
+        );
+    }
+
+    /// The other half of "composition is not an option": nesting the singular
+    /// consumes to force simultaneity deadlocks instead.
+    ///
+    /// `flock(2)` binds to the open file description, and every acquire opens a
+    /// fresh descriptor, so the inner acquire cannot see that this thread
+    /// already holds the lock. It blocks for the whole `LOCK_TIMEOUT` and then
+    /// fails — which is why this test is deliberately slow.
+    #[test]
+    fn nested_singular_consume_deadlocks_rather_than_composing() {
+        use std::sync::Arc;
+
+        let (fx, auth) = pair_ready(None);
+        let auth = Arc::new(auth);
+
+        let sealed_a = auth.seal(&fx.a_cert.d_id, &fx.a_peer(), NOW).unwrap();
+        let sealed_b = auth.seal(&fx.b_cert.d_id, &fx.b_peer(), NOW).unwrap();
+
+        let inner_auth = Arc::clone(&auth);
+        let b_peer = fx.b_peer();
+        let started = Instant::now();
+        let inner = auth
+            .consume_with_effect(sealed_a, &fx.a_peer(), NOW, move |_consumed| {
+                // Still inside the first critical section.
+                Ok::<_, std::convert::Infallible>(consume_probe(
+                    &inner_auth,
+                    sealed_b,
+                    &b_peer,
+                    NOW,
+                ))
+            })
+            .unwrap();
+        assert_eq!(
+            inner.unwrap_err(),
+            DeviceAdmissionError::LockTimeout,
+            "nesting the singular consumes to force simultaneity deadlocks"
+        );
+        assert!(
+            started.elapsed() >= LOCK_TIMEOUT,
+            "the inner acquire must actually have blocked for the full timeout"
+        );
+
+        // The atomic pair surface does the same job without blocking at all.
+        let sealed = seal_ab(&fx, &auth, NOW).unwrap();
+        assert!(consume_pair_probe(&auth, sealed, &fx.a_peer(), &fx.b_peer(), NOW).is_ok());
+    }
+
+    /// Single use, as far as a runtime test can show it: the fact is moved into
+    /// the consume, so the value is gone afterwards and a second presentation
+    /// does not compile.
+    ///
+    /// The *negative* half — that the pair types gain no `Clone`, `Copy`,
+    /// `Default`, `Serialize`, or `Deserialize` — is deliberately NOT asserted
+    /// here. A generic `fn assert_not_clone<T>() {}` compiles for every `T`,
+    /// including one that derives `Clone`, so calling it would prove nothing
+    /// while reading as proof. Rust has no stable negative trait bound, so that
+    /// property is pinned at the source level by
+    /// `r0a_d2a_sealed_fact_is_opaque_and_move_only`, whose needles are
+    /// themselves proven by `r0a_opacity_check_rejects_a_derived_capability`.
+    #[test]
+    fn a_sealed_pair_is_move_only_and_consumed_once() {
+        let (fx, auth) = pair_ready(None);
+        let sealed = seal_ab(&fx, &auth, NOW).unwrap();
+        let probe = consume_pair_probe(&auth, sealed, &fx.a_peer(), &fx.b_peer(), NOW).unwrap();
+        // `sealed` has been moved; a second consume cannot compile.
+        assert_eq!(probe.consumed_at, NOW);
+
+        // A *fresh* fact for the same pair is a different capability and is
+        // accepted — so single use is about the fact, not about the pair.
+        let again = seal_ab(&fx, &auth, NOW).unwrap();
+        assert!(consume_pair_probe(&auth, again, &fx.a_peer(), &fx.b_peer(), NOW).is_ok());
+    }
+
+    #[test]
+    fn pair_debug_output_does_not_leak_the_sealed_fact() {
+        let (fx, auth) = pair_ready(None);
+        let sealed = seal_ab(&fx, &auth, NOW).unwrap();
+
+        let rendered = format!("{sealed:?}");
+        assert_eq!(rendered, "SealedDevicePairAdmissionV1(REDACTED)");
+        assert!(!rendered.contains(&hex::encode(fx.a_peer())));
+        assert!(!rendered.contains(&hex::encode(fx.b_peer())));
+        assert_eq!(
+            format!("{:?}", sealed.initiator()),
+            "PairMemberBindingV1(REDACTED)"
+        );
+
+        auth.consume_pair_with_effect(sealed, &fx.a_peer(), &fx.b_peer(), NOW, |consumed| {
+            let rendered = format!("{consumed:?}");
+            assert_eq!(rendered, "ConsumedDevicePairAdmissionV1(REDACTED)");
+            assert!(!rendered.contains(&hex::encode(fx.a_peer())));
+            assert_eq!(
+                format!("{:?}", consumed.responder()),
+                "PairMemberBindingV1(REDACTED)"
+            );
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn pair_refusals_are_attributed_exactly_once() {
+        let (fx, auth) = pair_ready(None);
+        let missing = derive_device_id(&P256Keypair::generate().public());
+        let error = auth
+            .seal_pair(&missing, &fx.a_peer(), &fx.b_cert.d_id, &fx.b_peer(), NOW)
+            .unwrap_err();
+        let (role, cause) = error.pair_member().expect("a pair refusal is attributed");
+        assert_eq!(role, PairRole::Initiator);
+        assert_eq!(cause, &DeviceAdmissionError::DeviceNotListed);
+        assert!(
+            cause.pair_member().is_none(),
+            "the attribution must be exactly one level deep"
+        );
+        // A pair-level fact is not attributed to a side at all.
+        assert!(
+            DeviceAdmissionError::PairSameDevice.pair_member().is_none(),
+            "PairSameDevice is a property of the pair, not of one member"
+        );
+        assert_eq!(PairRole::Initiator.to_string(), "initiator");
+        assert_eq!(PairRole::Responder.to_string(), "responder");
     }
 }
