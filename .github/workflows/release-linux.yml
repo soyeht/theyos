@@ -1,6 +1,8 @@
 name: Release (Linux)
 
-# Triggered alongside release-macos.yml on `v*` tag pushes.
+# Triggered alongside release-macos.yml on `v*` tag pushes. The manual
+# recovery path publishes the already-built subjects from a named prior run;
+# it never rebuilds a historical tag from the default branch.
 # Builds Linux engine binaries for x86_64 and aarch64 via the pinned OCI recipe,
 # packages each into tar.gz + sha256, and uploads to the GitHub Release.
 #
@@ -14,6 +16,20 @@ on:
   push:
     tags:
       - "v*"
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Existing prerelease tag that owns the recovered assets
+        required: true
+        type: string
+      source_sha:
+        description: Exact commit resolved by release_tag and bound by provenance
+        required: true
+        type: string
+      source_run_id:
+        description: Prior Release Linux run containing the attested subjects
+        required: true
+        type: string
 
 permissions:
   contents: read
@@ -21,6 +37,7 @@ permissions:
 jobs:
   build-linux-x86_64:
     name: Build Linux (x86_64)
+    if: github.event_name == 'push'
     runs-on: ubuntu-latest
     timeout-minutes: 45
 
@@ -166,6 +183,7 @@ jobs:
 
   build-linux-aarch64:
     name: Build Linux (aarch64)
+    if: github.event_name == 'push'
     runs-on: ubuntu-latest
     timeout-minutes: 60
 
@@ -316,7 +334,12 @@ jobs:
 
   publish-linux:
     name: Attest and publish Linux subjects (${{ matrix.target }})
-    if: github.event_name == 'push'
+    if: >-
+      always() &&
+      ((github.event_name == 'push' &&
+        needs.build-linux-x86_64.result == 'success' &&
+        needs.build-linux-aarch64.result == 'success') ||
+       github.event_name == 'workflow_dispatch')
     needs:
       - build-linux-x86_64
       - build-linux-aarch64
@@ -324,37 +347,97 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - target: x86_64
+          - target: x86_64-unknown-linux-musl
             artifact: linux-phase0-x86_64
-          - target: aarch64
+          - target: aarch64-unknown-linux-musl
             artifact: linux-phase0-aarch64
     runs-on: ubuntu-latest
     permissions:
+      actions: read
       contents: write
       id-token: write
       attestations: write
+    env:
+      TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.release_tag || github.ref_name }}
+      SOURCE_SHA: ${{ github.event_name == 'workflow_dispatch' && inputs.source_sha || github.sha }}
+      SOURCE_RUN_ID: ${{ github.event_name == 'workflow_dispatch' && inputs.source_run_id || github.run_id }}
     steps:
       - name: Download immutable Linux subject
+        if: github.event_name == 'push'
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           name: ${{ matrix.artifact }}
           path: subject
 
+      - name: Download immutable Linux recovery subject
+        if: github.event_name == 'workflow_dispatch'
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: subject
+          repository: ${{ github.repository }}
+          run-id: ${{ inputs.source_run_id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
       - name: Verify subject before publication
         shell: bash
         env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
           TARGET: ${{ matrix.target }}
         run: |
           set -euo pipefail
-          tarball="$(find subject -maxdepth 1 -name '*.tar.gz' -type f -print -quit)"
-          provenance="$(find subject -maxdepth 1 -name '*.provenance.json' -type f -print -quit)"
-          phase0="$(find subject -maxdepth 1 -name 'phase0-attestation-*.json' -type f -print -quit)"
-          test -n "$tarball" -a -n "$provenance" -a -n "$phase0"
-          test "$(jq -r '.source_sha' "$provenance")" = "$GITHUB_SHA"
+          [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          [[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$SOURCE_RUN_ID" =~ ^[0-9]+$ ]]
+          test "$(gh api "repos/$GH_REPO/commits/$TAG" --jq .sha)" = "$SOURCE_SHA"
+          if [ "$GITHUB_EVENT_NAME" = workflow_dispatch ]; then
+            test "$(gh release view "$TAG" --json isPrerelease --jq .isPrerelease)" = true
+            gh api "repos/$GH_REPO/actions/runs/$SOURCE_RUN_ID" |
+              jq -e \
+                --arg repository "$GH_REPO" \
+                --arg workflow ".github/workflows/release-linux.yml" \
+                --arg tag "$TAG" \
+                --arg source_sha "$SOURCE_SHA" '
+                  .repository.full_name == $repository
+                  and .path == $workflow
+                  and .event == "push"
+                  and .head_branch == $tag
+                  and .head_sha == $source_sha
+                  and .conclusion == "failure"
+                ' >/dev/null
+          fi
+          version="${TAG#v}"
+          case "$TARGET" in
+            x86_64-unknown-linux-musl) release_arch=x86_64 ;;
+            aarch64-unknown-linux-musl) release_arch=aarch64 ;;
+            *) echo "::error::unsupported Linux release target $TARGET"; exit 1 ;;
+          esac
+          tarball="subject/theyos-engine-$version-linux-$release_arch.tar.gz"
+          checksum="$tarball.sha256"
+          provenance="subject/theyos-engine-$version-linux-$release_arch.provenance.json"
+          phase0="subject/phase0-attestation-$TARGET.json"
+          test -f "$tarball" -a -f "$checksum" -a -f "$provenance" -a -f "$phase0"
+          test "$(find subject -maxdepth 1 -type f | wc -l | tr -d ' ')" = 4
+          test "$(tar -xOzf "$tarball" ./engine-version.txt)" = "$version"
+          test "$(jq -r '.source_sha' "$provenance")" = "$SOURCE_SHA"
+          test "$(jq -r '.target' "$provenance")" = "$TARGET"
           test "$(jq -r '.published_package_sha256' "$provenance")" = "$(sha256sum "$tarball" | awk '{print $1}')"
-          test "$(jq -r '.source_sha' "$phase0")" = "$GITHUB_SHA"
+          test "$(jq -r '.source_sha' "$phase0")" = "$SOURCE_SHA"
+          test "$(jq -r '.target' "$phase0")" = "$TARGET"
+          expected_checksum="$(awk 'NR == 1 { print $1 }' "$checksum")"
+          [[ "$expected_checksum" =~ ^[0-9a-f]{64}$ ]]
+          test "$(wc -l < "$checksum" | tr -d ' ')" = 1
+          test "$expected_checksum" = "$(sha256sum "$tarball" | awk '{print $1}')"
+          if [ "$GITHUB_EVENT_NAME" = workflow_dispatch ]; then
+            # A failed source run proves neither that this subject reached the
+            # attestation step nor that its digest has a valid repository
+            # attestation. Recovery must establish that fact directly.
+            gh attestation verify "$tarball" --repo "$GH_REPO"
+          fi
 
       - name: Attest final Linux package
+        if: github.event_name == 'push'
         uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a # v3
         with:
           subject-path: subject/*.tar.gz
@@ -362,12 +445,15 @@ jobs:
       - name: Upload final Linux package
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
         shell: bash
         run: |
           set -euo pipefail
+          test "$(gh api "repos/$GH_REPO/commits/$TAG" --jq .sha)" = "$SOURCE_SHA"
           for i in $(seq 1 90); do
-            if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then break; fi
+            if gh release view "$TAG" >/dev/null 2>&1; then break; fi
             sleep 10
           done
-          gh release view "$GITHUB_REF_NAME" >/dev/null
-          gh release upload "$GITHUB_REF_NAME" subject/* --clobber
+          gh release view "$TAG" >/dev/null
+          test "$(gh release view "$TAG" --json isPrerelease --jq .isPrerelease)" = true
+          gh release upload "$TAG" subject/* --clobber

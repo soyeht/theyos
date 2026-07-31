@@ -1,5 +1,4 @@
 # mode	type	oid	transition	path
-100644	blob	b008cf5aa152c0596055de545de69e3f16513264	versioned-transition	.github/owner-present-phase0-transition-v1.json
 100644	blob	00b38e713ac387de9bf0353febb5c0b6e2185403	frozen	.github/owner-present-phase0-toolchain-v1.json
 100755	blob	1d903e9af9dcdafc3493145d92d93c4921ea2509	land-exact	.github/scripts/check-mobile-claw-vpn-owner-present-contracts.sh
 100755	blob	9ee7a87fbe2e79573f9334bcb4baee2ab2d037db	land-exact	.github/scripts/check-mobile-claw-vpn-owner-present-phase0-compileout.sh
@@ -8,8 +7,8 @@
 100644	blob	d0b9229e4fe5744cb2c072ce690b29039bafc450	land-exact	.github/workflows/contracts-cross-repo-sync.yml
 100644	blob	7e5ff189b8b840e82f8ca02342a7473c75d11769	land-exact	.github/workflows/owner-present-phase0-compileout.yml
 100644	blob	8ae5db96e0e72d21e829c8a582b2b74520c2ee2c	land-exact	.github/workflows/owner-present-phase0-nix-runtime.yml
-100644	blob	f93fa2df44909f30ff5b6289badcdc4f30fe8348	land-exact	.github/workflows/release-linux.yml
-100644	blob	50fd34d08597f5f78e84e21462aaf96c1e03c193	land-exact	.github/workflows/release-macos.yml
+100644	blob	fa02bad762d03c386fbb27f8a61e6896264a544b	land-exact	.github/workflows/release-linux.yml
+100644	blob	c8aae2072f9e34179ef5ae5a23b28c5c1eafa159	land-exact	.github/workflows/release-macos.yml
 100644	blob	1d5286bb205d86c48b5898313cfb2060b68333e0	land-exact	admin/contracts/mobile-claw-vpn/v1/owner_present_wire_authority_status_v1.json
 100644	blob	42fa6a42c33535a3fded0a0e4210a80e3791b660	land-exact	admin/rust/.cargo/config.toml
 100644	blob	4cff2a1b3f165bbaa928e3d58d6c3d505be4c147	land-exact	admin/rust/Cross.toml

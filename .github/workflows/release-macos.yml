@@ -1,12 +1,27 @@
 name: Release (macOS)
 
-# Release authority is tag-only. A tag must already be an ancestor of main;
-# workflow_dispatch is intentionally absent so a branch ref cannot be paired
-# with a different tag input.
+# Release authority is tag-only. A tag must already be an ancestor of main.
+# The manual recovery path resumes signing from the immutable unsigned subject
+# produced by a named prior tag run; it never rebuilds a historical tag from
+# the default branch.
 on:
   push:
     tags:
       - "v*"
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Existing prerelease tag that owns the recovered assets
+        required: true
+        type: string
+      source_sha:
+        description: Exact commit resolved by release_tag and bound by provenance
+        required: true
+        type: string
+      source_run_id:
+        description: Prior Release macOS run containing the unsigned subject
+        required: true
+        type: string
 
 permissions:
   contents: read
@@ -14,6 +29,7 @@ permissions:
 jobs:
   build-unsigned-macos:
     name: Build and attest unsigned macOS subjects
+    if: github.event_name == 'push'
     runs-on: macos-15
     timeout-minutes: 60
     env:
@@ -124,37 +140,90 @@ jobs:
 
   sign-and-publish-macos:
     name: Sign, notarize, and publish final macOS subject
+    if: >-
+      always() &&
+      ((github.event_name == 'push' &&
+        needs.build-unsigned-macos.result == 'success') ||
+       github.event_name == 'workflow_dispatch')
     needs: build-unsigned-macos
     runs-on: macos-15
     timeout-minutes: 45
     permissions:
+      actions: read
       contents: write
       id-token: write
       attestations: write
     env:
-      TAG: ${{ github.ref_name }}
+      TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.release_tag || github.ref_name }}
+      SOURCE_SHA: ${{ github.event_name == 'workflow_dispatch' && inputs.source_sha || github.sha }}
+      SOURCE_RUN_ID: ${{ github.event_name == 'workflow_dispatch' && inputs.source_run_id || github.run_id }}
       CODESIGN_IDENTITY: ${{ secrets.APPLE_CODESIGN_IDENTITY }}
       NOTARY_KEY_ID: ${{ secrets.APPLE_NOTARY_KEY_ID }}
       NOTARY_ISSUER_ID: ${{ secrets.APPLE_NOTARY_ISSUER_ID }}
 
     steps:
       - name: Download unsigned subject
+        if: github.event_name == 'push'
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           name: macos-unsigned-phase0-subject
           path: unsigned
 
-      - name: Verify unsigned subject and import signing certificate
+      - name: Download unsigned recovery subject
+        if: github.event_name == 'workflow_dispatch'
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: macos-unsigned-phase0-subject
+          path: unsigned
+          repository: ${{ github.repository }}
+          run-id: ${{ inputs.source_run_id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Verify unsigned subject and plan recovery
+        id: recovery
         env:
-          P12_BASE64: ${{ secrets.APPLE_DEVELOPER_ID_P12_BASE64 }}
-          P12_PASSWORD: ${{ secrets.APPLE_DEVELOPER_ID_P12_PASSWORD }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
         shell: bash
         run: |
           set -euo pipefail
           stage="unsigned/stage"
+          [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          [[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$SOURCE_RUN_ID" =~ ^[0-9]+$ ]]
+          test "$(gh api "repos/$GH_REPO/commits/$TAG" --jq .sha)" = "$SOURCE_SHA"
+          if [ "$GITHUB_EVENT_NAME" = workflow_dispatch ]; then
+            test "$(gh release view "$TAG" --json isPrerelease --jq .isPrerelease)" = true
+            gh api "repos/$GH_REPO/actions/runs/$SOURCE_RUN_ID" |
+              jq -e \
+                --arg repository "$GH_REPO" \
+                --arg workflow ".github/workflows/release-macos.yml" \
+                --arg tag "$TAG" \
+                --arg source_sha "$SOURCE_SHA" '
+                  .repository.full_name == $repository
+                  and .path == $workflow
+                  and .event == "push"
+                  and .head_branch == $tag
+                  and .head_sha == $source_sha
+                  and .conclusion == "failure"
+                ' >/dev/null
+          fi
+          # actions/download-artifact recreates regular files without preserving
+          # executable mode. Restore only the six named unsigned subjects; their
+          # bytes are independently bound to the package manifest below.
+          chmod 0755 \
+            "$stage/theyos-engine" \
+            "$stage/vmrunner_macos_ipc" \
+            "$stage/store-ipc" \
+            "$stage/terminal-ipc" \
+            "$stage/theyos-ssh" \
+            "$stage/theyos-provision-inject"
           test -x "$stage/theyos-engine"
           test -f "$stage/phase0-build-attestation.json"
           test -f "$stage/phase0-package-manifest.json"
+          test "$TAG" = "v$(cat "$stage/engine-version.txt")"
+          test "$(jq -r '.source_sha' "$stage/phase0-build-attestation.json")" = "$SOURCE_SHA"
+          test "$(jq -r '.source_sha' "$stage/phase0-package-manifest.json")" = "$SOURCE_SHA"
           jq -e '
             .expected_xcode_version == "16.4"
             and .expected_xcode_build == "16F6"
@@ -162,12 +231,96 @@ jobs:
             and .developer_dir == "/Applications/Xcode_16.4.app/Contents/Developer"
             and .macos_sdk_path == "/Applications/Xcode_16.4.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX15.5.sdk"
           ' "$stage/phase0-build-attestation.json" >/dev/null
+          expected_executable_names='["store-ipc","terminal-ipc","theyos-engine","theyos-provision-inject","theyos-ssh","vmrunner_macos_ipc"]'
+          test "$(jq -er '.executables | length' "$stage/phase0-package-manifest.json")" = 6
+          test "$(jq -cer '.executables | keys | sort' "$stage/phase0-package-manifest.json")" = \
+            "$expected_executable_names"
+          executable_rows="$(
+            jq -er \
+              '.executables | to_entries[] | [.key,.value.unsigned_sha256] | @tsv' \
+              "$stage/phase0-package-manifest.json"
+          )"
+          verified_executables=0
           while IFS=$'\t' read -r executable expected; do
             test -n "$executable"
+            [[ "$expected" =~ ^[0-9a-f]{64}$ ]]
             test "$(shasum -a 256 "$stage/$executable" | awk '{print $1}')" = "$expected"
-          done < <(jq -r '.executables | to_entries[] | [.key,.value.unsigned_sha256] | @tsv' "$stage/phase0-package-manifest.json")
+            verified_executables=$((verified_executables + 1))
+          done <<< "$executable_rows"
+          test "$verified_executables" = 6
           test "$(shasum -a 256 "$stage/vmrunner-macos.entitlements" | awk '{print $1}')" = \
             "$(jq -r '.package_files["vmrunner-macos.entitlements"].unsigned_sha256' "$stage/phase0-package-manifest.json")"
+          version="$(cat "$stage/engine-version.txt")"
+          package="theyos-engine-$version-macos-arm64.tar.gz"
+          provenance="theyos-engine-$version-macos-arm64.provenance.json"
+          reused=false
+          sign=true
+          if [ "$GITHUB_EVENT_NAME" = workflow_dispatch ]; then
+            release_json="$(gh api "repos/$GH_REPO/releases/tags/$TAG")"
+            package_count="$(
+              jq -er --arg name "$package" \
+                '[.assets[] | select(.name == $name)] | length' \
+                <<< "$release_json"
+            )"
+            test "$package_count" = 0 || test "$package_count" = 1
+            if [ "$package_count" = 1 ]; then
+              package_asset_id="$(
+                jq -er --arg name "$package" \
+                  '.assets[] | select(.name == $name) | .id' \
+                  <<< "$release_json"
+              )"
+              gh api \
+                -H "Accept: application/octet-stream" \
+                "repos/$GH_REPO/releases/assets/$package_asset_id" > "$package"
+              gh attestation verify "$package" --repo "$GH_REPO"
+              test "$(tar -xOzf "$package" ./engine-version.txt)" = "$version"
+              tar -xOzf "$package" ./phase0-build-attestation.json > "$RUNNER_TEMP/published-phase0.json"
+              tar -xOzf "$package" ./phase0-package-manifest.json > "$RUNNER_TEMP/published-manifest.json"
+              cmp -s "$RUNNER_TEMP/published-phase0.json" "$stage/phase0-build-attestation.json"
+              test "$(jq -er '.source_sha' "$RUNNER_TEMP/published-phase0.json")" = "$SOURCE_SHA"
+              test "$(jq -er '.source_sha' "$RUNNER_TEMP/published-manifest.json")" = "$SOURCE_SHA"
+              test "$(jq -er '.executables | length' "$RUNNER_TEMP/published-manifest.json")" = 6
+              test "$(jq -cer '.executables | keys | sort' "$RUNNER_TEMP/published-manifest.json")" = \
+                "$expected_executable_names"
+              signed_rows="$(
+                jq -er \
+                  '.executables | to_entries[] | [.key,.value.signed_sha256] | @tsv' \
+                  "$RUNNER_TEMP/published-manifest.json"
+              )"
+              verified_signed_executables=0
+              while IFS=$'\t' read -r executable expected; do
+                test -n "$executable"
+                [[ "$expected" =~ ^[0-9a-f]{64}$ ]]
+                test "$(tar -xOzf "$package" "./$executable" | shasum -a 256 | awk '{print $1}')" = "$expected"
+                verified_signed_executables=$((verified_signed_executables + 1))
+              done <<< "$signed_rows"
+              test "$verified_signed_executables" = 6
+              package_sha256="$(shasum -a 256 "$package" | awk '{print $1}')"
+              jq -n -S \
+                --arg schema "theyos-engine-release-provenance-v2" \
+                --arg source_sha "$(jq -er '.source_sha' "$RUNNER_TEMP/published-phase0.json")" \
+                --arg source_tree "$(jq -er '.source_tree' "$RUNNER_TEMP/published-phase0.json")" \
+                --arg phase0_manifest_sha256 "$(shasum -a 256 "$RUNNER_TEMP/published-manifest.json" | awk '{print $1}')" \
+                --arg published_signed_engine_sha256 "$(tar -xOzf "$package" ./theyos-engine | shasum -a 256 | awk '{print $1}')" \
+                --arg package_sha256 "$package_sha256" \
+                '{schema:$schema,source_sha:$source_sha,source_tree:$source_tree,phase0_package_manifest_sha256:$phase0_manifest_sha256,published_signed_engine_sha256:$published_signed_engine_sha256,final_package_sha256:$package_sha256,signing_job_has_source_checkout:false,signing_job_runs_cargo:false}' \
+                > "$provenance"
+              reused=true
+              sign=false
+            fi
+          fi
+          echo "package=$package" >> "$GITHUB_OUTPUT"
+          echo "reused=$reused" >> "$GITHUB_OUTPUT"
+          echo "sign=$sign" >> "$GITHUB_OUTPUT"
+
+      - name: Import signing certificate
+        if: steps.recovery.outputs.sign == 'true'
+        env:
+          P12_BASE64: ${{ secrets.APPLE_DEVELOPER_ID_P12_BASE64 }}
+          P12_PASSWORD: ${{ secrets.APPLE_DEVELOPER_ID_P12_PASSWORD }}
+        shell: bash
+        run: |
+          set -euo pipefail
           KEYCHAIN_PASSWORD="$(openssl rand -base64 24)"
           security create-keychain -p "$KEYCHAIN_PASSWORD" "$RUNNER_TEMP/build.keychain"
           security default-keychain -s "$RUNNER_TEMP/build.keychain"
@@ -179,6 +332,7 @@ jobs:
           rm -f "$RUNNER_TEMP/cert.p12"
 
       - name: Sign only downloaded unsigned subjects
+        if: steps.recovery.outputs.sign == 'true'
         shell: bash
         run: |
           set -euo pipefail
@@ -200,6 +354,7 @@ jobs:
           codesign_one theyos-provision-inject com.soyeht.theyos.theyos-provision-inject
 
       - name: Notarize signed subject
+        if: steps.recovery.outputs.sign == 'true'
         env:
           NOTARY_KEY_BASE64: ${{ secrets.APPLE_NOTARY_KEY_P8_BASE64 }}
         shell: bash
@@ -216,6 +371,7 @@ jobs:
           rm -f "$RUNNER_TEMP/notary-key.p8" "$RUNNER_TEMP/theyos-macos-notarize.zip"
 
       - name: Package and bind final signed bytes
+        if: steps.recovery.outputs.sign == 'true'
         id: package
         shell: bash
         run: |
@@ -241,14 +397,73 @@ jobs:
             '{schema:$schema,source_sha:$source_sha,source_tree:$source_tree,phase0_package_manifest_sha256:$phase0_manifest_sha256,published_signed_engine_sha256:$published_signed_engine_sha256,final_package_sha256:$package_sha256,signing_job_has_source_checkout:false,signing_job_runs_cargo:false}' \
             > "theyos-engine-$version-macos-arm64.provenance.json"
 
+      - name: Refuse divergent existing recovery assets
+        id: publication
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "$GITHUB_EVENT_NAME" = push ]; then
+            echo "attest=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          version="$(cat unsigned/stage/engine-version.txt)"
+          package="theyos-engine-$version-macos-arm64.tar.gz"
+          provenance="theyos-engine-$version-macos-arm64.provenance.json"
+          phase0="unsigned/stage/phase0-build-attestation.json"
+          release_json="$(gh api "repos/$GH_REPO/releases/tags/$TAG")"
+          test "$(jq -r '.prerelease' <<< "$release_json")" = true
+          missing_assets=0
+          compare_existing_asset() {
+            local local_path="$1" remote_name="$2"
+            local asset_count asset_id existing_path local_sha existing_sha
+            asset_count="$(
+              jq -er --arg name "$remote_name" \
+                '[.assets[] | select(.name == $name)] | length' \
+                <<< "$release_json"
+            )"
+            if [ "$asset_count" = 0 ]; then
+              missing_assets=$((missing_assets + 1))
+              return
+            fi
+            test "$asset_count" = 1
+            asset_id="$(
+              jq -er --arg name "$remote_name" \
+                '.assets[] | select(.name == $name) | .id' \
+                <<< "$release_json"
+            )"
+            existing_path="$RUNNER_TEMP/existing-$remote_name"
+            gh api \
+              -H "Accept: application/octet-stream" \
+              "repos/$GH_REPO/releases/assets/$asset_id" > "$existing_path"
+            local_sha="$(shasum -a 256 "$local_path" | awk '{print $1}')"
+            existing_sha="$(shasum -a 256 "$existing_path" | awk '{print $1}')"
+            if [ "$local_sha" != "$existing_sha" ]; then
+              echo "::error::refusing to replace divergent release asset $remote_name"
+              exit 1
+            fi
+          }
+          compare_existing_asset "$package" "$(basename "$package")"
+          compare_existing_asset "$provenance" "$(basename "$provenance")"
+          compare_existing_asset "$phase0" "theyos-engine-$version-macos-arm64.phase0.json"
+          if [ "${{ steps.recovery.outputs.reused }}" = true ]; then
+            echo "attest=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "attest=true" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Attest final signed package
+        if: steps.publication.outputs.attest == 'true'
         uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a
         with:
-          subject-path: theyos-engine-*-macos-arm64.tar.gz
+          subject-path: ${{ steps.recovery.outputs.package }}
 
       - name: Publish final package
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
         shell: bash
         run: |
           set -euo pipefail
@@ -256,10 +471,58 @@ jobs:
           package="theyos-engine-$version-macos-arm64.tar.gz"
           provenance="theyos-engine-$version-macos-arm64.provenance.json"
           phase0="unsigned/stage/phase0-build-attestation.json"
-          if gh release view "$TAG" >/dev/null 2>&1; then
+          test "$(gh api "repos/$GH_REPO/commits/$TAG" --jq .sha)" = "$SOURCE_SHA"
+          if [ "$GITHUB_EVENT_NAME" = workflow_dispatch ]; then
+            test "$(gh release view "$TAG" --json isPrerelease --jq .isPrerelease)" = true
+            release_json="$(gh api "repos/$GH_REPO/releases/tags/$TAG")"
+            upload_args=()
+            collect_missing_asset() {
+              local local_path="$1" remote_name="$2"
+              local asset_count asset_id existing_path local_sha existing_sha
+              asset_count="$(
+                jq -er --arg name "$remote_name" \
+                  '[.assets[] | select(.name == $name)] | length' \
+                  <<< "$release_json"
+              )"
+              if [ "$asset_count" = 0 ]; then
+                upload_args+=("$local_path#$remote_name")
+                return
+              fi
+              test "$asset_count" = 1
+              asset_id="$(
+                jq -er --arg name "$remote_name" \
+                  '.assets[] | select(.name == $name) | .id' \
+                  <<< "$release_json"
+              )"
+              existing_path="$RUNNER_TEMP/recheck-$remote_name"
+              gh api \
+                -H "Accept: application/octet-stream" \
+                "repos/$GH_REPO/releases/assets/$asset_id" > "$existing_path"
+              local_sha="$(shasum -a 256 "$local_path" | awk '{print $1}')"
+              existing_sha="$(shasum -a 256 "$existing_path" | awk '{print $1}')"
+              if [ "$local_sha" != "$existing_sha" ]; then
+                echo "::error::release asset $remote_name changed after recovery planning"
+                exit 1
+              fi
+            }
+            collect_missing_asset "$package" "$(basename "$package")"
+            collect_missing_asset "$provenance" "$(basename "$provenance")"
+            collect_missing_asset "$phase0" "theyos-engine-$version-macos-arm64.phase0.json"
+            test "$(gh api "repos/$GH_REPO/commits/$TAG" --jq .sha)" = "$SOURCE_SHA"
+            test "$(gh release view "$TAG" --json isPrerelease --jq .isPrerelease)" = true
+            if [ "${#upload_args[@]}" -gt 0 ]; then
+              # Deliberately no --clobber: an asset that appears after the
+              # comparison makes the upload fail closed instead of replacing it.
+              gh release upload "$TAG" "${upload_args[@]}"
+            else
+              echo "All macOS release assets already match; publication is idempotent."
+            fi
+          elif gh release view "$TAG" >/dev/null 2>&1; then
+            test "$(gh release view "$TAG" --json isPrerelease --jq .isPrerelease)" = true
             gh release upload "$TAG" "$package" "$provenance" "$phase0#theyos-engine-$version-macos-arm64.phase0.json" --clobber
           else
-            gh release create "$TAG" --title "$TAG" --notes "Automated release. Final macOS package SHA256: $(shasum -a 256 "$package" | awk '{print $1}')" \
+            test "$GITHUB_EVENT_NAME" = push
+            gh release create "$TAG" --prerelease --latest=false --title "$TAG" --notes "Automated prerelease. Final macOS package SHA256: $(shasum -a 256 "$package" | awk '{print $1}')" \
               "$package" "$provenance" "$phase0#theyos-engine-$version-macos-arm64.phase0.json"
           fi
 
@@ -275,7 +538,7 @@ jobs:
       contents: write
       pull-requests: write
     env:
-      TAG: ${{ github.ref_name }}
+      TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.release_tag || github.ref_name }}
     steps:
       - name: Checkout main for formula generation
         uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
