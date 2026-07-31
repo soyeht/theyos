@@ -188,6 +188,14 @@ fn probe_shared_host(state: &AppState) -> HostProjection {
 /// Firecracker `base_rootfs` env path doesn't exist on a Mac host — using only
 /// `env.base_rootfs.exists()` makes `cold_path_ready` permanently false even
 /// after `init_macos_guest` finishes, which blocks every Linux claw create.
+///
+/// Existence of `disk.img` alone is NOT sufficient: it is written at the
+/// `convert_image` phase, before first boot populates NVRAM, before SSH
+/// validation, and before the per-claw symlinks are created. An init that is
+/// interrupted anywhere after `convert_image` therefore leaves a `disk.img`
+/// that is not bootable as a base. This mirrors `check_macos_base_ready`,
+/// which already requires `phase == "complete"` for the macOS base; the Linux
+/// probe must not be weaker. Unreadable or unparseable state fails closed.
 fn macos_linux_base_disk_exists() -> bool {
     if !cfg!(target_os = "macos") {
         return false;
@@ -196,10 +204,26 @@ fn macos_linux_base_disk_exists() -> bool {
         let home = std::env::var("HOME").unwrap_or_default();
         format!("{home}/Library/Application Support/theyos/vms")
     });
-    std::path::Path::new(&assets)
-        .join("linux-base")
-        .join("disk.img")
-        .exists()
+    linux_base_ready_at(std::path::Path::new(&assets))
+}
+
+/// Directory-parameterized core of the Linux base readiness probe.
+///
+/// Split out from the env-reading wrapper so the policy can be exercised
+/// without mutating `THEYOS_VM_ASSETS_DIR`, which is process-global and is
+/// also owned by `install_worker`'s macOS base test.
+fn linux_base_ready_at(assets: &std::path::Path) -> bool {
+    let base = assets.join("linux-base");
+    if !base.join("disk.img").exists() {
+        return false;
+    }
+    let Ok(content) = std::fs::read_to_string(base.join("init-state.json")) else {
+        return false;
+    };
+    let Ok(state) = serde_json::from_str::<serde_json::Value>(&content) else {
+        return false;
+    };
+    state.get("phase").and_then(|v| v.as_str()) == Some("complete")
 }
 
 /// On macOS, native macOS claw creation uses the initialized
@@ -251,4 +275,108 @@ fn compute_degradations(host: &HostProjection) -> Vec<Degradation> {
         degs.push(Degradation::BaseRootfsMissingButGoldenPresent);
     }
     degs
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Materialize a `linux-base` dir: optional `disk.img`, optional
+    /// `init-state.json` body. Returns the assets root to probe.
+    fn linux_base_fixture(
+        disk: bool,
+        init_state: Option<&[u8]>,
+    ) -> (tempfile::TempDir, std::path::PathBuf) {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let base = tmp.path().join("linux-base");
+        std::fs::create_dir_all(&base).unwrap();
+        if disk {
+            std::fs::write(base.join("disk.img"), b"partial").unwrap();
+        }
+        if let Some(body) = init_state {
+            std::fs::write(base.join("init-state.json"), body).unwrap();
+        }
+        let root = tmp.path().to_path_buf();
+        (tmp, root)
+    }
+
+    /// `disk.img` is created at the `convert_image` phase — long before first
+    /// boot populates NVRAM, before SSH validation, and before the per-claw
+    /// symlinks exist. A disk-only cold-path probe therefore reports "ready"
+    /// for the whole remainder of init, including after an interrupted run.
+    ///
+    /// Observed on a real Dev-host init: the vmrunner process exited during
+    /// `save_base` with `disk.img` present, no claw symlinks, and
+    /// `init-state.json` still at `phase: "save_base"`.
+    ///
+    /// The macOS base already refuses this case via `check_macos_base_ready`,
+    /// which requires `phase == "complete"`. Linux must not be weaker.
+    #[test]
+    fn linux_base_readiness_requires_complete_init_not_just_disk_img() {
+        // (label, disk.img present, init-state.json body, expected ready)
+        let cases: &[(&str, bool, Option<&[u8]>, bool)] = &[
+            // Baseline: a trivially absent base is refused. This does NOT
+            // prove non-vacuity on its own — a probe hardwired to `false`
+            // would also satisfy it. The `phase complete` case below is what
+            // proves the instrument can still say "yes".
+            ("absent disk.img", false, None, false),
+            // Crashed before any state write.
+            ("disk.img, no init-state.json", true, None, false),
+            // The exact observed field interruption.
+            (
+                "disk.img, phase save_base",
+                true,
+                Some(br#"{"phase":"save_base"}"#),
+                false,
+            ),
+            // Mid-init; disk.img already written by convert_image.
+            (
+                "disk.img, phase first_boot",
+                true,
+                Some(br#"{"phase":"first_boot"}"#),
+                false,
+            ),
+            // Malformed state must fail closed, not open.
+            (
+                "disk.img, unparseable state",
+                true,
+                Some(b"not json{"),
+                false,
+            ),
+            // Missing phase field must fail closed.
+            (
+                "disk.img, no phase field",
+                true,
+                Some(br#"{"foo":"bar"}"#),
+                false,
+            ),
+            // Non-vacuity control: a genuinely finished base IS ready. This is
+            // the case that rules out a uniformly-`false` probe, so every
+            // refusal above is a real policy decision.
+            (
+                "disk.img, phase complete",
+                true,
+                Some(br#"{"phase":"complete"}"#),
+                true,
+            ),
+            // Completeness alone is not enough — the disk must still exist.
+            (
+                "phase complete, no disk.img",
+                false,
+                Some(br#"{"phase":"complete"}"#),
+                false,
+            ),
+        ];
+
+        // Collect every mismatch so one failing case does not shadow the rest.
+        let mut failures = vec![];
+        for (label, disk, state, expected) in cases {
+            let (_tmp, root) = linux_base_fixture(*disk, *state);
+            let actual = linux_base_ready_at(&root);
+            if actual != *expected {
+                failures.push(format!("{label}: expected ready={expected}, got {actual}"));
+            }
+        }
+        assert!(failures.is_empty(), "readiness mismatches: {failures:#?}");
+    }
 }
