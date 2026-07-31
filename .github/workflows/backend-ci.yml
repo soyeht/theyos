@@ -120,6 +120,103 @@ jobs:
         # "wired into CI" — keep it true.
         run: bash admin/rust/scripts/lint-apns-payload.sh
 
+  validate-bridge:
+    name: ClawShareBridge (B3-0 slice)
+    runs-on: macos-15
+    timeout-minutes: 30
+
+    # B3-0 scope: validate the Rust↔Swift bridge SOURCE only. No XCFramework
+    # job — this slice ships no binary artifact. The upstream
+    # `claw-share-bridge-xcframework.yml` on `product-a-membership` marked its
+    # artifact job `continue-on-error: true`, so for months it could fail
+    # without failing the workflow, which is exactly how a broken binding step
+    # went unnoticed. A job that cannot fail the build is not a gate; it is
+    # reintroduced in the slice that actually produces the artifact, without
+    # that flag.
+    #
+    # `clippy -D warnings` and `fmt --check` are additions over the source
+    # branch: the base workspace enforces lints (including
+    # `disallowed_methods = "deny"`) that it did not, and porting the crate
+    # surfaced real violations. Gating here keeps them fixed.
+    #
+    # WHY THIS LIVES IN backend-ci.yml AND NOT ITS OWN WORKFLOW FILE.
+    # An earlier revision of this slice shipped `.github/workflows/
+    # claw-share-bridge.yml` with a deliberately asymmetric trigger list
+    # (`push` on the topic branch, `pull_request` on the *base* branches it can
+    # merge into). That file cannot exist: `.github/scripts/check-mobile-claw-
+    # vpn-owner-present-phase0-compileout.sh` classifies `.github/workflows`
+    # against a hardcoded KNOWN_WORKFLOWS list by exact `cmp`, so ANY new
+    # workflow file fails the Phase 0 authority gate — and that script is a
+    # base-owned protected object (`land-exact` in `.github/owner-present-
+    # phase0-protected-objects-v1.tsv`) whose policy the integrity checker
+    # reads from the PR's BASE, so a PR cannot classify itself. Amending it
+    # needs an owner-armed Phase 0 transition.
+    #
+    # Folding the job in here needs no protected-object change, because
+    # `backend-ci.yml` is already classified and is not itself protected. The
+    # audited trigger asymmetry is consciously traded for this workflow's
+    # broader triggers: `admin/rust/**` is a superset of the old path list
+    # (`claw-share-bridge-rs`, `household-rs`, `nostr-relay-rs`, `Cargo.toml`,
+    # `Cargo.lock`), and neither `push` nor `pull_request` is branch-filtered
+    # here, so this runs on strictly MORE events than the standalone file did.
+    # More coverage, not less gate.
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Rust toolchain info
+        working-directory: admin/rust
+        run: rustup show
+
+      # `admin/rust/rust-toolchain.toml` pins 1.92.0 with `profile = "minimal"`
+      # and `components = ["clippy"]` — rustfmt is deliberately NOT in that set,
+      # so `cargo fmt` resolves to nothing and the gate below dies with
+      # "'cargo-fmt' is not installed for the toolchain '1.92.0-...'".
+      # Add the component here rather than widening the toolchain file: that
+      # file is itself a base-owned protected Phase 0 object, and every other
+      # consumer of the pin gets the smaller install. `--toolchain 1.92.0`
+      # keeps the version explicit while letting rustup append the host triple,
+      # so this step is not pinned to the runner's architecture.
+      - name: Install rustfmt for the pinned toolchain
+        working-directory: admin/rust
+        run: rustup component add --toolchain 1.92.0 rustfmt
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: "admin/rust -> target"
+
+      - name: rustfmt
+        working-directory: admin/rust
+        run: cargo fmt -p claw-share-bridge-rs -- --check
+
+      # Default features: proves the crate builds without dragging the
+      # MPL-2.0 uniffi tree into an ordinary workspace build.
+      - name: cargo check (default features)
+        working-directory: admin/rust
+        run: cargo check -p claw-share-bridge-rs
+
+      - name: cargo clippy (default features)
+        working-directory: admin/rust
+        run: cargo clippy -p claw-share-bridge-rs -- -D warnings
+
+      # `--features uniffi`: proves the exported FFI surface still compiles,
+      # which is what the next slice generates Swift bindings from.
+      - name: cargo check (--features uniffi)
+        working-directory: admin/rust
+        run: cargo check -p claw-share-bridge-rs --features uniffi
+
+      - name: cargo clippy (--features uniffi)
+        working-directory: admin/rust
+        run: cargo clippy -p claw-share-bridge-rs --features uniffi -- -D warnings
+
+      # Covers the post-Open NetworkSettings path: the frame is parsed and
+      # surfaced, non-IpTunnel paths stay None, and a wrong/duplicate/pre-
+      # handshake frame fails closed.
+      - name: cargo test
+        working-directory: admin/rust
+        run: cargo test -p claw-share-bridge-rs
+
   no-bash-policy:
     name: No-Bash Policy Check
     runs-on: ubuntu-latest

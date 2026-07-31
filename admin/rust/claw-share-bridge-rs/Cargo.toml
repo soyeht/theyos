@@ -1,0 +1,71 @@
+[package]
+name = "claw-share-bridge-rs"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+
+# Two crate types so the iOS XCFramework can link the static archive
+# while macOS / dev builds can use the dynamic library. UniFFI's Swift
+# bindings consume the static archive on Apple platforms.
+[lib]
+name = "claw_share_bridge_rs"
+path = "src/lib.rs"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+# Library-mode UniFFI binding generator. Gated on the `uniffi` feature
+# via `required-features` so the DEFAULT workspace build never tries to
+# compile it (it needs `uniffi::uniffi_bindgen_main`, which only exists
+# when the optional `uniffi` dep + its `cli` feature are enabled).
+[[bin]]
+name = "uniffi-bindgen"
+path = "src/bin/uniffi-bindgen.rs"
+required-features = ["uniffi"]
+
+[dependencies]
+household-rs   = { workspace = true }
+nostr-relay-rs = { workspace = true }
+
+serde       = { workspace = true }
+serde_bytes = { workspace = true }
+thiserror   = { workspace = true }
+tokio       = { workspace = true }
+tracing     = { workspace = true }
+
+# UniFFI is gated behind a feature so the rest of the workspace builds
+# without pulling in the bindgen toolchain. CI on the dedicated
+# data-plane workflow flips `--features uniffi` to produce the
+# Swift bindings.
+# `cli` provides `uniffi::uniffi_bindgen_main()` for the library-mode
+# `uniffi-bindgen` binary (src/bin/uniffi-bindgen.rs) that generates the
+# Swift bindings. `tokio` matches the async runtime used by the exports.
+#
+# LICENSE SURFACE — this is the ONLY copyleft surface in the workspace,
+# which is otherwise MIT (see /LICENSE). Verified at the pinned versions:
+#   MPL-2.0        uniffi, uniffi_core, uniffi_bindgen, uniffi_macros,
+#                  uniffi_meta, uniffi_checksum_derive, uniffi_testing,
+#                  uniffi_udl
+#   permissive     the remaining ~23 transitive crates it pulls (askama*,
+#                  goblin, scroll*, weedle2, cargo_metadata, camino,
+#                  bincode, toml, textwrap, … — all MIT or MIT/Apache-2.0)
+# MPL-2.0 is file-level copyleft: linking it into an MIT product is fine and
+# no first-party file here becomes MPL-covered. Recorded at the declaration
+# because the repo has no third-party license registry (no NOTICE, no
+# cargo-deny, no about.toml) to record it in — see the slice report.
+#
+# The whole tree enters Cargo.lock, so RustSec/audit tooling sees it, but it
+# only COMPILES under `--features uniffi`; the default workspace build does
+# not build a single one of these crates.
+#
+# Scope note: this is a `[dependencies]` entry only. The upstream crate also
+# carried a `[build-dependencies] uniffi` with the `build` feature, which was
+# dead weight — this crate has no `build.rs` and uses proc-macro scaffolding
+# (`uniffi::setup_scaffolding!`), so nothing consumed it. Dropping it keeps
+# the MPL-2.0 surface to the runtime link only.
+uniffi      = { version = "0.28", optional = true, features = ["tokio", "cli"] }
+
+[features]
+default = []
+uniffi = ["dep:uniffi"]
+
+[lints]
+workspace = true

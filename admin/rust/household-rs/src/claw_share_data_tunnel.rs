@@ -164,6 +164,49 @@ pub struct NetworkSettings {
     pub session_id: String,
 }
 
+/// Private wire mirrors used ONLY by the 0x17 decode path.
+///
+/// `#[serde(deny_unknown_fields)]` is a property of the TYPE, not of a decode
+/// call. Putting it on the public [`NetworkSettings`] / [`MeshIpv4`] would make
+/// it a standing policy for every present and future holder of those types —
+/// the T1 dev runner, the bridge and the iOS FFI all carry them — rather than a
+/// rule of this one frame, and nothing at those sites would signal that the
+/// rule had been inherited.
+///
+/// These private mirrors hold the strictness instead, so it cannot escape
+/// [`TunnelFrame::decode`]. Field names and types match the public structs
+/// exactly, so the two encode to identical canonical bytes and the strict
+/// re-encode comparison means the same thing for both.
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StrictMeshIpv4Wire {
+    addr: String,
+    prefix_len: u8,
+    peer: String,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StrictNetworkSettingsWire {
+    mesh_ipv4: StrictMeshIpv4Wire,
+    mtu: u16,
+    session_id: String,
+}
+
+impl From<StrictNetworkSettingsWire> for NetworkSettings {
+    fn from(wire: StrictNetworkSettingsWire) -> Self {
+        Self {
+            mesh_ipv4: MeshIpv4 {
+                addr: wire.mesh_ipv4.addr,
+                prefix_len: wire.mesh_ipv4.prefix_len,
+                peer: wire.mesh_ipv4.peer,
+            },
+            mtu: wire.mtu,
+            session_id: wire.session_id,
+        }
+    }
+}
+
 impl fmt::Debug for NetworkSettings {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("NetworkSettings")
@@ -386,10 +429,17 @@ impl TunnelFrame {
                 })
             }
             FRAME_EXIT => Ok(Self::Exit(TargetExit::decode(payload)?)),
+            // Strict: this body configures a VPN interface and is consumed
+            // before any packet pump, so only the exact canonical encoding is
+            // admitted. Non-canonical key order, an unmodelled key, or
+            // trailing bytes fail the connection closed before any interface
+            // exists. Every other frame kind keeps the lenient decoder.
             FRAME_NETWORK_SETTINGS => Ok(Self::NetworkSettings(
-                cbor::from_canonical_slice(payload).map_err(|_| {
-                    DataTunnelError::InvalidFrame("bad network_settings frame".into())
-                })?,
+                cbor::from_canonical_slice_strict::<StrictNetworkSettingsWire>(payload)
+                    .map_err(|_| {
+                        DataTunnelError::InvalidFrame("bad network_settings frame".into())
+                    })?
+                    .into(),
             )),
             other => Err(DataTunnelError::InvalidFrame(format!(
                 "unknown frame kind {other:#04x}"
@@ -1105,61 +1155,99 @@ where
     let mut revoke_poll = tokio::time::interval(REVOKE_POLL_INTERVAL);
     revoke_poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
-        tokio::select! {
-            // Revocation watcher: closes an idle (or active) session promptly
-            // once the slot is revoked, independent of inbound `Data` frames.
-            _ = revoke_poll.tick() => {
+        // CANCEL SAFETY (load-bearing; do not inline this back into the
+        // `select!`). `recv_frame` is two sequential `read_exact` awaits — the
+        // 4-byte length prefix, then the body — so it is NOT cancel-safe. When
+        // it was built inline as a `select!` arm it was reconstructed every
+        // turn, which means every sibling win DROPPED it; if it was parked
+        // between the two reads, the prefix bytes were already off the socket
+        // and were lost with the future, and the next read consumed body bytes
+        // as a length. That desynchronises the stream and surfaces to the peer
+        // as `connection closed during frame`.
+        //
+        // Instead the future is built ONCE per inbound frame and pinned here,
+        // then held across the inner loop. A sibling arm winning merely stops
+        // polling it; the partially-read state lives in the future, which is
+        // still alive, so the next turn RESUMES the same read. It is dropped
+        // and rebuilt only after it has produced a value — completion, error,
+        // or idle timeout. Covered by
+        // `sibling_select_arm_cannot_desync_a_partially_read_frame`.
+        //
+        // The sibling arms are cancel-safe by construction and unaffected:
+        // `interval.tick()` and `AsyncReadExt::read` both document that no
+        // progress is lost when they are dropped un-polled.
+        let mut inbound = std::pin::pin!(tokio::time::timeout(
+            STREAM_IDLE_TIMEOUT,
+            recv_frame(&mut tunnel_r)
+        ));
+        let inbound_result = loop {
+            tokio::select! {
+                // Revocation watcher: closes an idle (or active) session promptly
+                // once the slot is revoked, independent of inbound `Data` frames.
+                _ = revoke_poll.tick() => {
+                    if is_revoked(&cred) {
+                        let _ = writer.shutdown().await;
+                        return Err(DataTunnelError::Rejected("slot-revoked".into()));
+                    }
+                }
+                // tunnel → target: resumed, never restarted, across sibling wins.
+                res = &mut inbound => break res,
+                // target → tunnel
+                read = reader.read(&mut rbuf) => {
+                    match read {
+                        Ok(n) if n > 0 => {
+                            send_frame(&mut tunnel_w, &TunnelFrame::Data(rbuf[..n].to_vec())).await?;
+                        }
+                        // End of the target's output: either a clean EOF (`Ok(0)`,
+                        // e.g. a closed socket or macOS PTY) OR a read error — on
+                        // Linux a PTY master returns `EIO` when the child exits
+                        // rather than EOF, so both mean "the target is done".
+                        // Capture the process exit status (if it has one and
+                        // resolves promptly) and propagate it typed before Close.
+                        _ => {
+                            if let Ok(status) = tokio::time::timeout(TARGET_EXIT_GRACE, &mut exit).await {
+                                let _ = send_frame(&mut tunnel_w, &TunnelFrame::Exit(status)).await;
+                            }
+                            let _ = send_frame(&mut tunnel_w, &TunnelFrame::Close).await;
+                            return Ok(());
+                        }
+                    }
+                }
+            }
+        };
+        let Ok(frame) = inbound_result else {
+            return Err(DataTunnelError::Closed("idle-timeout"));
+        };
+        match frame {
+            Ok(TunnelFrame::Data(d)) => {
                 if is_revoked(&cred) {
-                    let _ = writer.shutdown().await;
                     return Err(DataTunnelError::Rejected("slot-revoked".into()));
                 }
+                writer
+                    .write_all(&d)
+                    .await
+                    .map_err(|e| DataTunnelError::Io(e.to_string()))?;
+                writer
+                    .flush()
+                    .await
+                    .map_err(|e| DataTunnelError::Io(e.to_string()))?;
             }
-            // tunnel → target (revocation-checked per Data frame)
-            inbound = tokio::time::timeout(STREAM_IDLE_TIMEOUT, recv_frame(&mut tunnel_r)) => {
-                let Ok(frame) = inbound else {
-                    return Err(DataTunnelError::Closed("idle-timeout"));
-                };
-                match frame {
-                    Ok(TunnelFrame::Data(d)) => {
-                        if is_revoked(&cred) {
-                            return Err(DataTunnelError::Rejected("slot-revoked".into()));
-                        }
-                        writer.write_all(&d).await.map_err(|e| DataTunnelError::Io(e.to_string()))?;
-                        writer.flush().await.map_err(|e| DataTunnelError::Io(e.to_string()))?;
-                    }
-                    // Apply the client's terminal size to the target. Best
-                    // effort: a resize hiccup must not tear down the session.
-                    Ok(TunnelFrame::Resize { cols, rows }) => { let _ = resize(cols, rows); }
-                    Ok(TunnelFrame::Window(_)) => {} // credit ack; await-based backpressure governs
-                    Ok(TunnelFrame::Close) | Err(DataTunnelError::Closed(_)) => {
-                        let _ = writer.shutdown().await;
-                        return Ok(());
-                    }
-                    Ok(_) => return Err(DataTunnelError::InvalidFrame("unexpected frame in stream".into())),
-                    Err(other) => return Err(other),
-                }
+            // Apply the client's terminal size to the target. Best
+            // effort: a resize hiccup must not tear down the session.
+            Ok(TunnelFrame::Resize { cols, rows }) => {
+                let _ = resize(cols, rows);
             }
-            // target → tunnel
-            read = reader.read(&mut rbuf) => {
-                match read {
-                    Ok(n) if n > 0 => {
-                        send_frame(&mut tunnel_w, &TunnelFrame::Data(rbuf[..n].to_vec())).await?;
-                    }
-                    // End of the target's output: either a clean EOF (`Ok(0)`,
-                    // e.g. a closed socket or macOS PTY) OR a read error — on
-                    // Linux a PTY master returns `EIO` when the child exits
-                    // rather than EOF, so both mean "the target is done".
-                    // Capture the process exit status (if it has one and
-                    // resolves promptly) and propagate it typed before Close.
-                    _ => {
-                        if let Ok(status) = tokio::time::timeout(TARGET_EXIT_GRACE, &mut exit).await {
-                            let _ = send_frame(&mut tunnel_w, &TunnelFrame::Exit(status)).await;
-                        }
-                        let _ = send_frame(&mut tunnel_w, &TunnelFrame::Close).await;
-                        return Ok(());
-                    }
-                }
+            Ok(TunnelFrame::Window(_)) => {} // credit ack; await-based backpressure governs
+            Ok(TunnelFrame::Close) | Err(DataTunnelError::Closed(_)) => {
+                let _ = writer.shutdown().await;
+                return Ok(());
             }
+            Ok(_) => {
+                return Err(DataTunnelError::InvalidFrame(
+                    "unexpected frame in stream".into(),
+                ));
+            }
+            Err(other) => return Err(other),
         }
     }
 }
@@ -2060,6 +2148,387 @@ mod tests {
         assert_eq!(
             recv_frame(&mut client).await.unwrap(),
             TunnelFrame::Data(b"ACK:pwd\n".to_vec())
+        );
+    }
+
+    // ─── Cancel-safety of the inbound frame reader ──────────────────────────
+    //
+    // `read_frame` is two sequential `read_exact` awaits: the 4-byte length
+    // prefix, then the body. If the future holding it is DROPPED between them,
+    // the prefix bytes are gone from the socket and the next read interprets
+    // body bytes as a length — the stream desynchronises. The serve loop's
+    // `select!` has two sibling arms (`revoke_poll.tick`, `reader.read`) that
+    // can win at exactly that moment.
+    //
+    // Making that deterministic needs an answer to "has the server consumed the
+    // prefix YET?", which the wire cannot give: a half-read frame produces no
+    // output to synchronise against. `PrefixProbe` creates that observation
+    // point inside the test by intercepting `poll_read` on the SERVER endpoint
+    // and signalling once exactly the prefix has been delivered. No clock, no
+    // sleep, no production API, no new dependency.
+
+    /// Test-only tunnel wrapper that reports when the inbound length prefix has
+    /// been consumed. Counting is armed by the test so the auth/health/open
+    /// frames, which also flow through here, are not mistaken for the frame
+    /// under test.
+    struct PrefixProbe<S> {
+        inner: S,
+        armed: Arc<std::sync::atomic::AtomicBool>,
+        seen: Arc<std::sync::atomic::AtomicUsize>,
+        prefix_consumed: Arc<tokio::sync::Notify>,
+    }
+
+    impl<S: AsyncRead + Unpin> AsyncRead for PrefixProbe<S> {
+        fn poll_read(
+            self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            use std::sync::atomic::Ordering;
+            let me = self.get_mut();
+            let before = buf.filled().len();
+            let polled = std::pin::Pin::new(&mut me.inner).poll_read(cx, buf);
+            if matches!(polled, std::task::Poll::Ready(Ok(()))) {
+                let n = buf.filled().len() - before;
+                if n > 0 && me.armed.load(Ordering::SeqCst) {
+                    let total = me.seen.fetch_add(n, Ordering::SeqCst) + n;
+                    if total >= 4 {
+                        // `notify_one` stores a permit, so the signal is not
+                        // lost if the test has not reached its await yet.
+                        me.prefix_consumed.notify_one();
+                    }
+                }
+            }
+            polled
+        }
+    }
+
+    impl<S: AsyncWrite + Unpin> AsyncWrite for PrefixProbe<S> {
+        fn poll_write(
+            self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+            buf: &[u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            std::pin::Pin::new(&mut self.get_mut().inner).poll_write(cx, buf)
+        }
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::pin::Pin::new(&mut self.get_mut().inner).poll_flush(cx)
+        }
+        fn poll_shutdown(
+            self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::pin::Pin::new(&mut self.get_mut().inner).poll_shutdown(cx)
+        }
+    }
+
+    /// A target that sends a banner on connect, then a second chunk only when
+    /// the test releases it, then echoes `ACK:<bytes>`. The gated second chunk
+    /// is what makes the competing `reader.read` arm fire at a moment the test
+    /// chooses.
+    async fn spawn_gated_target(release: tokio::sync::oneshot::Receiver<()>) -> String {
+        let target = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = target.local_addr().unwrap().to_string();
+        tokio::spawn(async move {
+            let (mut sock, _) = target.accept().await.unwrap();
+            sock.write_all(b"BANNER").await.unwrap();
+            if release.await.is_err() {
+                return;
+            }
+            sock.write_all(b"SECOND").await.unwrap();
+            let mut buf = vec![0u8; 1024];
+            loop {
+                let n = match sock.read(&mut buf).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => n,
+                };
+                let mut reply = b"ACK:".to_vec();
+                reply.extend_from_slice(&buf[..n]);
+                if sock.write_all(&reply).await.is_err() {
+                    break;
+                }
+            }
+        });
+        addr
+    }
+
+    /// A sibling `select!` arm winning while the inbound reader sits BETWEEN the
+    /// length prefix and the body must not cost the connection its framing.
+    ///
+    /// Causality is enforced, not assumed: the test only fires the competing arm
+    /// after `PrefixProbe` has reported that exactly the prefix was consumed, so
+    /// the interleaving under test is the one that actually occurs. Every wait
+    /// is bounded and a lapsed bound fails the test as INCONCLUSIVE rather than
+    /// passing — a timeout is not evidence of either behaviour.
+    #[tokio::test]
+    async fn sibling_select_arm_cannot_desync_a_partially_read_frame() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        const BOUND: Duration = Duration::from_secs(10);
+
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let target_addr = spawn_gated_target(release_rx).await;
+
+        let armed = Arc::new(AtomicBool::new(false));
+        let seen = Arc::new(AtomicUsize::new(0));
+        let prefix_consumed = Arc::new(tokio::sync::Notify::new());
+
+        let (server_raw, mut client) = tokio::io::duplex(64 * 1024);
+        let server = PrefixProbe {
+            inner: server_raw,
+            armed: Arc::clone(&armed),
+            seen: Arc::clone(&seen),
+            prefix_consumed: Arc::clone(&prefix_consumed),
+        };
+
+        let store = Arc::new(consumed_store("claw_test"));
+        let hh = engine_hh();
+        let guard = Arc::new(ReplayGuard::new());
+        let rev_store = Arc::clone(&store);
+        tokio::spawn(async move {
+            let router = TcpStreamRouter::new(target_addr);
+            serve_connection_io(
+                server,
+                NOW,
+                move |e, n| authorize_session(e, &hh, &store, &guard, n),
+                &router,
+                move |cred| {
+                    matches!(
+                        rev_store.get(&cred.slot_id).map(|r| r.state),
+                        Some(SlotState::Revoked { .. })
+                    )
+                },
+            )
+            .await
+        });
+
+        let cbor = cred_cbor();
+        client_authenticate(&mut client, &cbor, valid_token(b"n1"))
+            .await
+            .unwrap();
+        client_open_stream(&mut client).await.unwrap();
+        assert_eq!(
+            recv_frame(&mut client).await.unwrap(),
+            TunnelFrame::Data(b"BANNER".to_vec())
+        );
+
+        // Arm only now: the frames above already went through the probe.
+        armed.store(true, Ordering::SeqCst);
+
+        // A `Data("PING")` frame, split. `encode()` is [kind][body] = 5 bytes,
+        // so the prefix is 5 — the body is withheld, which is what parks the
+        // reader between its two `read_exact` calls.
+        let body = TunnelFrame::Data(b"PING".to_vec()).encode();
+        assert_eq!(
+            body.len(),
+            5,
+            "frame layout changed; the split is no longer mid-frame"
+        );
+        client
+            .write_all(&(u32::try_from(body.len()).unwrap()).to_be_bytes())
+            .await
+            .unwrap();
+        client.flush().await.unwrap();
+
+        // NON-VACUITY: the interleaving only exists if the prefix really landed.
+        tokio::time::timeout(BOUND, prefix_consumed.notified())
+            .await
+            .expect("probe never saw the prefix consumed — the test proves nothing");
+        assert_eq!(
+            seen.load(Ordering::SeqCst),
+            4,
+            "probe must have seen exactly the 4 prefix bytes"
+        );
+
+        // Now let the competing `reader.read` arm win, with the reader parked
+        // mid-frame, and confirm it actually ran by observing its output.
+        release_tx.send(()).unwrap();
+        assert_eq!(
+            tokio::time::timeout(BOUND, recv_frame(&mut client))
+                .await
+                .expect("target chunk never arrived — competing arm did not run")
+                .unwrap(),
+            TunnelFrame::Data(b"SECOND".to_vec())
+        );
+
+        // Deliver the withheld body. Before the fix the prefix is gone, so this
+        // is read as a length (0x11504_94E, past MAX_FRAME_LEN) and the
+        // connection dies; after it, the frame completes and reaches the target.
+        client.write_all(&body).await.unwrap();
+        client.flush().await.unwrap();
+
+        let echoed = tokio::time::timeout(BOUND, recv_frame(&mut client))
+            .await
+            .expect("no verdict within bound — inconclusive, not a pass");
+        assert_eq!(
+            echoed.unwrap(),
+            TunnelFrame::Data(b"ACK:PING".to_vec()),
+            "the partially-read frame must survive a sibling arm winning"
+        );
+    }
+
+    // ─── 0x17 canonical-form admission ──────────────────────────────────────
+    //
+    // The `NetworkSettings` body configures a VPN interface and is consumed
+    // before any packet pump, so the bytes that reach the typed value must be
+    // exactly the ones the encoder would have produced. Three malformed shapes
+    // decode cleanly today: a map whose keys are not in RFC 8949 canonical
+    // order, a map carrying a key the struct does not model, and a well-formed
+    // item followed by trailing bytes inside the same length-delimited frame.
+    //
+    // Every case asserts BOTH halves. The control — that the LENIENT helper
+    // still accepts the mutant — is not decoration: without it a passing
+    // rejection proves nothing, because an unreachable, mistyped or otherwise
+    // broken fixture also "rejects". The control pins that the bytes really do
+    // reach a decoder that currently tolerates them, so the rejection is the
+    // new rule firing and not the fixture failing.
+    //
+    // Bodies are built with the crate's own encoders, never from a
+    // hand-derived hex constant: a hand-written vector would pin my arithmetic
+    // rather than the encoder's behaviour.
+
+    fn network_settings_fixture() -> NetworkSettings {
+        // TEST-NET-1 (RFC 5737) documentation addresses only.
+        NetworkSettings {
+            mesh_ipv4: MeshIpv4 {
+                addr: "192.0.2.2".into(),
+                prefix_len: 24,
+                peer: "192.0.2.3".into(),
+            },
+            mtu: 1280,
+            session_id: "session-alpha_1".into(),
+        }
+    }
+
+    fn network_settings_frame(body: &[u8]) -> Vec<u8> {
+        let mut framed = vec![FRAME_NETWORK_SETTINGS];
+        framed.extend_from_slice(body);
+        framed
+    }
+
+    /// The same three fields emitted in DECLARATION order through raw
+    /// `ciborium`, bypassing the canonicalizing encoder. Declaration order is
+    /// `mesh_ipv4, mtu, session_id`; canonical order is `mtu, mesh_ipv4,
+    /// session_id`. The nested `MeshIpv4` is likewise emitted `addr,
+    /// prefix_len, peer` against a canonical `addr, peer, prefix_len`, so both
+    /// map levels are non-canonical.
+    #[derive(Serialize)]
+    struct NetworkSettingsDeclarationOrder {
+        mesh_ipv4: MeshIpv4,
+        mtu: u16,
+        session_id: String,
+    }
+
+    /// Every modelled field PLUS one the struct does not declare, encoded
+    /// through the canonicalizing encoder. `unknown_extra` sorts last, so the
+    /// first three entries keep their canonical order and no trailing bytes
+    /// exist: the ONLY defect is the extra key.
+    #[derive(Serialize)]
+    struct NetworkSettingsUnknownKey {
+        mesh_ipv4: MeshIpv4,
+        mtu: u16,
+        session_id: String,
+        unknown_extra: bool,
+    }
+
+    #[test]
+    fn network_settings_canonical_body_is_accepted() {
+        let settings = network_settings_fixture();
+        let body = cbor::to_canonical_vec(&settings).expect("canonical encode");
+
+        assert_eq!(
+            TunnelFrame::decode(&network_settings_frame(&body)).expect("canonical body decodes"),
+            TunnelFrame::NetworkSettings(settings),
+        );
+    }
+
+    #[test]
+    fn network_settings_non_canonical_key_order_is_rejected() {
+        let settings = network_settings_fixture();
+        let canonical = cbor::to_canonical_vec(&settings).expect("canonical encode");
+
+        let mut body = Vec::new();
+        ciborium::ser::into_writer(
+            &NetworkSettingsDeclarationOrder {
+                mesh_ipv4: settings.mesh_ipv4.clone(),
+                mtu: settings.mtu,
+                session_id: settings.session_id.clone(),
+            },
+            &mut body,
+        )
+        .expect("declaration-order encode");
+        assert_ne!(
+            body, canonical,
+            "fixture is not actually non-canonical — the mutation did nothing"
+        );
+
+        // CONTROL: the lenient helper accepts these bytes today.
+        assert!(
+            cbor::from_canonical_slice::<NetworkSettings>(&body).is_ok(),
+            "control failed: lenient decode must still accept the mutant"
+        );
+
+        assert!(
+            TunnelFrame::decode(&network_settings_frame(&body)).is_err(),
+            "non-canonical key order must be rejected"
+        );
+    }
+
+    #[test]
+    fn network_settings_unknown_key_is_rejected() {
+        let settings = network_settings_fixture();
+        let body = cbor::to_canonical_vec(&NetworkSettingsUnknownKey {
+            mesh_ipv4: settings.mesh_ipv4.clone(),
+            mtu: settings.mtu,
+            session_id: settings.session_id.clone(),
+            unknown_extra: true,
+        })
+        .expect("unknown-key encode");
+
+        // CONTROL: the PUBLIC type still ignores the unmodelled key, because
+        // the strictness lives on the private wire mirror and not on
+        // `NetworkSettings`. This is the load-bearing scope assertion: it
+        // fails the moment `deny_unknown_fields` migrates onto the public
+        // type and starts binding the dev runner, the bridge and the FFI.
+        assert!(
+            cbor::from_canonical_slice::<NetworkSettings>(&body).is_ok(),
+            "control failed: the public type must NOT carry the 0x17 policy"
+        );
+
+        // The strict helper catches an unmodelled key ON ITS OWN, with no
+        // `deny_unknown_fields` in play: the key does not survive into the
+        // typed value, so the canonical re-encode comes out shorter. The
+        // mirror's attribute and the helper genuinely overlap here rather
+        // than one silently carrying the other.
+        assert!(
+            cbor::from_canonical_slice_strict::<NetworkSettings>(&body).is_err(),
+            "the strict helper must reject an unmodelled key unaided"
+        );
+
+        assert!(
+            TunnelFrame::decode(&network_settings_frame(&body)).is_err(),
+            "an unmodelled key must be rejected"
+        );
+    }
+
+    #[test]
+    fn network_settings_trailing_byte_is_rejected() {
+        let settings = network_settings_fixture();
+        let mut body = cbor::to_canonical_vec(&settings).expect("canonical encode");
+        body.push(0x00);
+
+        // CONTROL: the decoder stops at the end of the item and ignores the
+        // rest of the frame today.
+        assert!(
+            cbor::from_canonical_slice::<NetworkSettings>(&body).is_ok(),
+            "control failed: lenient decode must still accept the mutant"
+        );
+
+        assert!(
+            TunnelFrame::decode(&network_settings_frame(&body)).is_err(),
+            "trailing bytes inside the frame must be rejected"
         );
     }
 }

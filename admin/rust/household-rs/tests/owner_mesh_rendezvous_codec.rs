@@ -344,17 +344,17 @@ fn r1a7_enumerates_linked_targets_and_proves_zero_production_callers() {
     let root = repository_root();
     let rust_root = root.join("admin/rust");
     let members = workspace_members(&rust_root);
-    assert_eq!(members.len(), 27, "workspace member inventory changed");
+    assert_eq!(members.len(), 28, "workspace member inventory changed");
     assert!(
         members
             .iter()
             .any(|member| member == "m1-household-mesh-smoke-rs")
     );
     let targets = enumerate_workspace_targets(&rust_root, &members);
-    assert_eq!(targets.len(), 198, "Cargo target inventory changed");
+    assert_eq!(targets.len(), 199, "Cargo target inventory changed");
     assert_eq!(
         targets.iter().filter(|target| target.kind == "bin").count(),
-        49
+        50
     );
     assert_eq!(
         targets

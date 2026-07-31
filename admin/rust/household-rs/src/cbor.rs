@@ -82,6 +82,50 @@ fn canonical_key_bytes(value: &ciborium::value::Value) -> Result<Vec<u8>, Househ
 }
 
 /// Decode canonical CBOR bytes into a typed value.
+///
+/// This is the LENIENT decoder and it does not verify what its name suggests:
+/// it accepts any well-formed CBOR that deserializes, including maps whose
+/// keys are not in canonical order, keys the target type does not model, and
+/// trailing bytes after the item (`ciborium` stops at the end of the first
+/// item and never checks for EOF). That tolerance is load-bearing for the
+/// callers that read durable at-rest state, so it stays. Callers decoding
+/// UNTRUSTED bytes whose exact form is part of the contract should use
+/// [`from_canonical_slice_strict`].
 pub fn from_canonical_slice<T: DeserializeOwned>(bytes: &[u8]) -> Result<T, HouseholdError> {
     ciborium::de::from_reader(bytes).map_err(|e| HouseholdError::Cbor(format!("decode: {e}")))
+}
+
+/// Decode canonical CBOR bytes into a typed value, admitting ONLY the exact
+/// byte string this crate's encoder would have produced for that value.
+///
+/// Decode, re-encode the TYPED value canonically, and require byte equality
+/// against the whole input. One comparison closes three distinct holes,
+/// because the typed value is a lossy projection of the input:
+///
+/// - non-canonical map key order → re-encoding sorts it, so the bytes differ;
+/// - a key the type does not model → it does not survive into `T`, so the
+///   re-encoded map is shorter;
+/// - trailing bytes → the re-encoded item ends where the item ends.
+///
+/// The `Serialize` bound is what makes that true and is not incidental:
+/// round-tripping through `ciborium::value::Value` instead would PRESERVE an
+/// unmodelled key and silently admit it.
+///
+/// Reserved for untrusted input where the encoding is part of the contract.
+/// It is deliberately NOT the default: applying it to durable at-rest state
+/// would turn any already-persisted non-canonical byte into an unreadable
+/// file, which is a migration decision, not a hardening one.
+pub fn from_canonical_slice_strict<T: Serialize + DeserializeOwned>(
+    bytes: &[u8],
+) -> Result<T, HouseholdError> {
+    let value: T = from_canonical_slice(bytes)?;
+    let re_encoded = to_canonical_vec(&value)?;
+    if re_encoded != bytes {
+        return Err(HouseholdError::Cbor(format!(
+            "non-canonical encoding: {} input bytes vs {} canonical bytes",
+            bytes.len(),
+            re_encoded.len(),
+        )));
+    }
+    Ok(value)
 }

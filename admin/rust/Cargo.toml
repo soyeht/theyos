@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "backup-rs",
     "claw-rs",
+    "claw-share-bridge-rs",
     "core-rs",
     "e2e-rs",
     "executor-rs",

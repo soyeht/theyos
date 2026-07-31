@@ -208,7 +208,7 @@ fn r0a_n_ratchet_names_new_targets() {
     let ratchet_path = ["owner_mesh_", "rendezvous_codec.rs"].concat();
     let r1a7 = read(package_dir().join("tests").join(ratchet_path));
     for needle in [
-        "assert_eq!(targets.len(), 198",
+        "assert_eq!(targets.len(), 199",
         "filter(|target| target.kind == \"test\")",
         "146 + 2 R0a Fatia N + 1 B0a roster-currency",
         "name == \"caveat_narrowing\"",
@@ -282,9 +282,12 @@ fn r0a_d2a_paths_are_limited_and_registered() {
 #[test]
 fn r0a_d2a_tests_stay_inline_and_off_the_cargo_target_ratchet() {
     // Each `household-rs/tests/*.rs` file is its own Cargo target, and R1a.7
-    // pins the workspace target inventory at 198 (149 of them tests) in this
-    // composed inventory: the 197/148 D2a was written against plus the one
-    // B0a roster-currency integration target. D2a still keeps its focused tests
+    // pins the workspace target inventory at 199 (149 of them tests) in this
+    // composed inventory: the 197/148 D2a was written against, plus the one
+    // B0a roster-currency integration target (which is the +1 test), plus the
+    // `claw-share-bridge-rs` workspace member (which is the +1 bin). Both
+    // increments are needed to reach 199 — naming only one of them is how the
+    // total and its explanation drift apart. D2a still keeps its focused tests
     // in `#[cfg(test)] mod tests`, so it contributes nothing to that count; a
     // future slice that wants an integration target has to move the ratchet
     // deliberately rather than by accident.
@@ -295,14 +298,14 @@ fn r0a_d2a_tests_stay_inline_and_off_the_cargo_target_ratchet() {
     ] {
         assert!(
             !package_dir().join(absent).exists(),
-            "D2a adds no Cargo test target; R1a.7 pins 198/149 and none of it \
+            "D2a adds no Cargo test target; R1a.7 pins 199/149 and none of it \
              is D2a's: {absent}"
         );
     }
 
     let ratchet_path = ["owner_mesh_", "rendezvous_codec.rs"].concat();
     let r1a7 = read(package_dir().join("tests").join(ratchet_path));
-    assert!(r1a7.contains("assert_eq!(targets.len(), 198"));
+    assert!(r1a7.contains("assert_eq!(targets.len(), 199"));
     assert!(
         r1a7.contains("149 // 146 + 2 R0a Fatia N + 1 B0a roster-currency integration targets")
     );
