@@ -226,6 +226,25 @@ impl PersonCert {
         hh_pub: &P256PublicKey,
         now: u64,
     ) -> Result<(), HouseholdError> {
+        self.verify_rooted_identity(expected_hh_id, hh_pub, now)?;
+        for op in caveats::owner_caveats().iter().map(|c| c.op.clone()) {
+            if !caveats::permits(&self.caveats, &op) {
+                return Err(HouseholdError::InvalidCert(format!(
+                    "owner caveat missing: {op}"
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// Structural/identity/temporal + root signature verification WITHOUT caveats.
+    /// Used by roster authority core which checks caveats separately.
+    pub(crate) fn verify_rooted_identity(
+        &self,
+        expected_hh_id: &HouseholdId,
+        hh_pub: &P256PublicKey,
+        now: u64,
+    ) -> Result<(), HouseholdError> {
         if self.version != Self::SCHEMA_VERSION {
             return Err(HouseholdError::InvalidCert(format!(
                 "version {} unsupported",
@@ -280,13 +299,6 @@ impl PersonCert {
         }
         if self.not_after.is_some_and(|expires| now >= expires) {
             return Err(HouseholdError::InvalidCert("person cert expired".into()));
-        }
-        for op in caveats::owner_caveats().iter().map(|c| c.op.clone()) {
-            if !caveats::permits(&self.caveats, &op) {
-                return Err(HouseholdError::InvalidCert(format!(
-                    "owner caveat missing: {op}"
-                )));
-            }
         }
         verify_signature(hh_pub, &self.signing_bytes()?, &self.signature)
     }

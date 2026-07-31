@@ -51,6 +51,8 @@ pub mod claw_vpn;
 pub mod claw_vpn_mobile_mesh_store;
 #[cfg(test)]
 pub mod claw_vpn_mobile_state;
+pub mod device_admission;
+pub mod device_cert;
 pub mod emoji_code;
 pub mod error;
 pub mod fingerprint;
@@ -63,6 +65,9 @@ pub mod keys;
 pub mod keys_se;
 pub mod keystore;
 pub mod machine_cert;
+pub mod machine_roster_authority;
+pub mod machine_roster_evidence;
+pub mod machine_roster_store;
 pub mod member_identity;
 pub mod owner_approval_v2;
 pub mod owner_auth;

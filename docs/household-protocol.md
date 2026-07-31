@@ -924,6 +924,379 @@ line). Mirrors the `unavailable_reason_code` pattern used for claw installabilit
 
 ---
 
+## 16c. Machine roster currency endpoint (B0a, added 2026-07-30)
+
+`GET /api/v1/household/roster/currency/{m_id}` answers one question — *what is
+this household's current, durable position on this machine?* — from the roster
+authority in `household-rs::machine_roster_store`. It does not mutate the roster
+chain: it admits no checkpoint, changes no membership, and mints no signature.
+It **does** durably observe/advance the monotonic clock floor used for temporal
+decisions; the first successful no-genesis query may create that floor record.
+Consequently each successful query takes the cross-process roster lock and may
+perform an atomic disk replacement. This is an authenticated temporal-state
+write, not a side-effect-free cache read.
+
+This is **not** the roster evidence endpoint. Evidence and currency partition
+the same underlying store states differently and are specified separately;
+notably, no-genesis and both fork states are *unavailable* outcomes here, while
+the evidence surface reports them as served states. Do not infer one endpoint's
+contract from the other.
+
+### Transport
+
+| Property | Value |
+|---|---|
+| Method / path | `GET /api/v1/household/roster/currency/{m_id}` |
+| Response Content-Type | `application/cbor` |
+| Encoding | Canonical CBOR. The client decodes, re-encodes and byte-compares; a non-canonical response is rejected before it is read. |
+| Auth | Owner `PoP` (`Soyeht-PoP v1`), capability `claws.list` — the same gate as `GET /api/v1/household/machines` — **or** an admitted household device delegated by that owner, selected by the optional `Soyeht-Device-Id` header (see below). |
+| Request body | None. The client sends no request Content-Type and the server does not inspect one. A non-empty body is refused even when correctly signed. |
+| `{m_id}` | Validated as `m_` + 52 base32 chars (`MachineId::parse`) before any store read. |
+
+The household must additionally hold a **strong-tier owner cert with a verified
+provenance** (`owner_auth_tier = "strong"` plus one of the four iOS/iPadOS
+Secure Enclave / App Attest provenances). The roster authority derives its owner
+binding from that cert; a basic-tier owner is refused with
+`invalid_current_owner_authority` before the store is read.
+
+### Delegated device access (D2c)
+
+`Soyeht-Device-Id` is **optional**, and its presence alone selects the caller:
+
+| Header | Authorized as |
+|---|---|
+| absent | The owner, exactly as before. Nothing about the owner path changes. |
+| present | **Device-only, and terminal.** The request is never re-tried as the owner, even if it also carries a valid owner signature, and even if the device id is malformed, unknown, or revoked. |
+
+That asymmetry is the point: a header that could silently fall back to the owner
+would turn an explicit delegation into an escalation.
+
+**The `Soyeht-PoP` wire is unchanged.** It stays `v1:<p_id>:<ts>:<sig>`, the
+`p_id` slot still names the *parent person*, and the signed context is still
+method + path/query + timestamp + body. Only the verifying key differs: the
+server checks the signature against the device's admitted `d_pub`, never the
+person's `p_pub`. A client that already signs owner requests adds one header and
+changes no signing code.
+
+The device is authorized only if the durable admission authority holds it as
+`active` under a non-zero generation, its parent person is not revoked, that
+parent matches both the proof's `p_id` and the live owner cert (including that
+cert's digest), the inherited validity limit has not passed, and the effective
+caveat set permits `claws.list` — the device's own set when it declared one,
+otherwise the verified person's.
+
+| Condition | Status | Body `error` |
+|---|---|---|
+| Any device-side refusal — malformed/unknown/revoked device, revoked person, cross-binding, wrong signature, stale proof, caveat denial | `401` | `unauthenticated` |
+| Device admission authority absent | `503` | `not_initialized` |
+
+The `401` is deliberately **collapsed and non-enumerating**: one class for every
+device-side refusal, so an unauthenticated caller cannot use the status to learn
+which device ids exist or what state they are in. The reason class is recorded
+server-side in tracing only; no `d_id`, `p_id`, key, or path is ever logged.
+`503` is reserved for a genuinely absent authority — a service state, not a
+credential judgement — so a client can distinguish "not set up yet" from
+"refused" without that distinction leaking anything about a specific device.
+
+### Outcomes (200)
+
+Nine outcomes, one closed key set per family. The literals come from
+`PublicCurrencyOutcome::wire_str` in `machine_roster_store.rs` — that mapping is
+the single source of this vocabulary, and nothing else may re-spell it.
+
+| `outcome` | Response keys | Meaning |
+|---|---|---|
+| `active` | `{v, outcome, member}` | Machine is a current member of the accepted roster. |
+| `revoked` | `{v, outcome, tombstone}` | Machine was revoked; the tombstone proves it. |
+| `not_listed` | `{v, outcome}` | Roster is readable and this machine appears nowhere in it. |
+| `unavailable_no_genesis` | `{v, outcome}` | Store provisioned but no genesis checkpoint accepted yet. |
+| `unavailable_checkpoint_stale` | `{v, outcome}` | Accepted checkpoint is outside its temporal envelope. |
+| `unavailable_checkpoint_fork_conflict` | `{v, outcome}` | Terminal checkpoint fork recorded. |
+| `unavailable_event_fork_conflict` | `{v, outcome}` | Terminal event fork recorded. |
+| `unavailable_clock_state` | `{v, outcome}` | Monotonic clock floor unusable; no temporal judgement is possible. |
+| `unavailable_owner_authority` | `{v, outcome}` | Current owner authority does not bind to the chain's owner. |
+
+`v` is `1` in every response.
+
+`member` is the canonical 4-key `MachineRosterMemberV1`: `m_id`, `m_pub`,
+`machine_cert`, `machine_cert_fingerprint`.
+
+`tombstone` is the **complete** canonical 16-key `MachineRosterRevocationV1`:
+`v`, `kind`, `hh_id`, `epoch`, `sequence`, `prev_event_hash`, `m_id`, `m_pub`,
+`machine_cert_fingerprint`, `revoked_at`, `reason`, `cascade`, `owner_p_id`,
+`owner_cert_fingerprint`, `owner_person_cert`, `signature`. It is served whole
+so the client can verify the revocation offline against the household root;
+a trimmed tombstone would be unverifiable and must be rejected on device.
+
+An `unavailable_*` outcome is a statement about the *roster*, not about the
+machine. It must never be collapsed into `not_listed`, which asserts proven
+non-membership.
+
+### Errors (non-200)
+
+Errors are a canonical CBOR envelope with exactly two keys:
+`{v: 1, error: "<literal>"}`.
+
+| Status | `error` | Cause |
+|---|---|---|
+| 401 | `unauthenticated` | Missing, malformed, expired, or non-owner `PoP`. |
+| 400 | `invalid_machine_id` | `{m_id}` is not a well-formed machine id. |
+| 409 | `already_initialized` | A store operation observed an already-initialized state. |
+| 413 | `body_not_allowed` | A request body was supplied. |
+| 503 | `not_initialized` | Roster store not provisioned (or the household unloaded mid-request). |
+| 503 | `lock_timeout` | Roster lock not acquired in time. |
+| 503 | `clock_unavailable` | Server wall clock is before the Unix epoch, so the `PoP` time gate cannot be evaluated. |
+| 500 | `store_io`, `unsafe_file_type`, `temp_already_exists`, `mode_mismatch`, `invalid_path`, `inconsistent_provisioning_state`, `readback_mismatch`, `latch_poisoned`, `invalid_current_owner_authority`, `storage`, `household`, `owner_auth`, `encode_failed`, `internal_error` | Typed store or encoding failure. |
+| 500 | `integrity_*` | Chain integrity failure; one literal per `ChainIntegrityError` variant (`integrity_non_canonical`, `integrity_duplicate_key`, `integrity_unknown_field`, `integrity_null_field`, `integrity_version`, `integrity_household`, `integrity_key_set`, `integrity_checkpoint_decode`, `integrity_checkpoint_signature`, `integrity_owner_certificate`, `integrity_owner_continuity`, `integrity_sequence`, `integrity_hash`, `integrity_projection`, `integrity_fork_reapply`, `integrity_temporal`, `integrity_epoch`). |
+
+Fail-closed: no failure path may fabricate a roster fact. The endpoint either
+serves an authority-derived outcome or an error envelope.
+
+Implementation: `admin/rust/server-rs/src/handlers_household_roster.rs`;
+contract tests in `admin/rust/server-rs/tests/household_roster_currency.rs`.
+
+---
+
+## 16d. Machine roster evidence endpoint (B0b, added 2026-07-30)
+
+`POST /api/v1/household/roster/evidence` answers a different question from
+§16c: *what is this household's whole current roster position, stated by the
+machine that serves it, bound to a nonce I chose?* It is not a per-machine
+query — the request carries no `m_id`, and `invalid_machine_id` never appears
+on this route.
+
+Like currency it performs no roster-chain mutation: it admits no checkpoint,
+changes no membership, and mints no roster signature. And exactly like currency,
+it **does** durably observe and may advance the monotonic clock floor. Every
+served response takes the cross-process roster lock and may perform an atomic
+disk replacement of the floor record; on a no-genesis store the first served
+response may create that record. **Serving evidence is an authenticated
+temporal-state write, not a side-effect-free read.** That is not incidental
+bookkeeping: the floor this call lands on is the `floor_secs` the response
+attests and signs, so the write and the statement are the same act.
+
+Evidence and currency partition the same underlying store states
+**differently**. §16c's nine-outcome table does not apply here and neither
+contract may be inferred from the other.
+
+### Transport
+
+| Property | Value |
+|---|---|
+| Method / path | `POST /api/v1/household/roster/evidence` |
+| Request Content-Type | `application/cbor`, exactly. Absent is as fatal as wrong, and neither is leniently parsed. |
+| Response Content-Type | `application/cbor`, with `Cache-Control: no-store`. |
+| Encoding | Canonical CBOR in both directions. The request is decoded, re-encoded and byte-compared; a decodable but non-canonical request is refused rather than normalized, so the bytes the client signed and the nonce echoed back cannot diverge. |
+| Max request size | 1024 bytes. Evaluated **after** authorization. |
+| Auth | Owner `PoP` (`Soyeht-PoP v1`), capability `claws.list` — **or** an admitted household device delegated by that owner, selected by the optional `Soyeht-Device-Id` header. |
+
+Gate order is fixed: clock → authorization → size → media type → request shape →
+identity → store. Authorization runs before every request-shape complaint, so an
+unauthenticated caller learns only `401` and never whether their body was too
+large, the wrong media type, or malformed. An oversized body with an invalid
+`PoP` is therefore `401`, not `413`.
+
+### Request
+
+Exactly two keys, canonical CBOR:
+
+| Key | Type |
+|---|---|
+| `client_nonce` | `bstr`, exactly 32 bytes |
+| `v` | `1` |
+
+An unrecognised key is a rejection, never something to ignore. A 31- or 33-byte
+nonce, a missing key, a wrong `v`, an indefinite-length map, a non-canonical key
+order, an empty body and a non-map value all collapse to one `400
+invalid_request` — the server never enumerates which shape rule was broken.
+
+The `PoP` signed context is method + path/query + timestamp + body, so a POST
+signature covers the request body and therefore the nonce itself.
+
+### Auth: owner or delegated device (D2c)
+
+The gate is the same `authorize_roster_read` §16c uses, so the owner path is
+byte-identical and the delegated-device rules there apply here unchanged —
+nothing about them is specific to currency. In particular:
+
+| Header | Authorized as |
+|---|---|
+| `Soyeht-Device-Id` absent | The owner. |
+| `Soyeht-Device-Id` present | **Device-only, and terminal.** Never re-tried as the owner, even when the request also carries a valid owner signature, and even if the device id is malformed, unknown, or revoked. |
+
+Every device-side refusal collapses to one non-enumerating `401
+unauthenticated`; only a genuinely absent admission authority is
+distinguishable, as `503 not_initialized`. No `d_id`, `p_id`, key or path is
+ever logged.
+
+### Outcomes (200)
+
+Four literals. They come from `RosterEvidenceOutcome::wire_str` in
+`machine_roster_evidence.rs`, which is the single source of this vocabulary. It
+is deliberately **not** shared with `PublicCurrencyOutcome`: those nine literals
+partition the same store states incompatibly, and a shared enum or helper would
+leak one vocabulary into the other.
+
+| `outcome` | Body | Meaning |
+|---|---|---|
+| `available` | 10 keys, with `snapshot_body` | The chain was read and is attested; `snapshot_body.state_kind` says which state. |
+| `unavailable_clock_state` | 7 keys | Monotonic clock floor unusable; no temporal judgement is possible. |
+| `unavailable_owner_authority` | 7 keys | Current owner authority does not bind to the chain's owner. |
+| `unavailable_checkpoint_stale` | 7 keys | Accepted checkpoint is outside its temporal envelope. |
+
+The repartition against §16c, stated explicitly: **no-genesis and both fork
+states are `unavailable_*` for currency but `available` here**, carried as
+`state_kind` 0, 2 and 3. Per-machine results have no meaning on this surface, so
+currency's `active`, `revoked` and `not_listed` all reduce to `available` with
+`state_kind` 1 — the evidence answer does not depend on any machine identity.
+
+**An `unavailable_*` is a `200`, signed and signer-anchored — not an error
+envelope.** It is a statement the household's own machine puts its name and
+signature to, and a client can verify and retain it. It therefore requires a
+usable signer: if no household identity is loaded there is no signer and the
+answer is `503 not_initialized`; a signing failure is `500 sign_failed`. Neither
+is an `unavailable_*`, because those four literals describe the *roster*, and
+"this machine cannot sign" is not a fact about the roster.
+
+### Response key sets
+
+Two closed key sets. Omitted keys are **absent, not null**; a null or an
+unexpected key is a protocol violation.
+
+**`available` — exactly ten keys:**
+
+| Key | Type |
+|---|---|
+| `client_nonce` | `bstr[32]`, echoed from the request |
+| `full_snapshot_digest` | `bstr[32]` |
+| `outcome` | `"available"` |
+| `signature` | `bstr`, P-256 |
+| `signer_m_id` | text |
+| `signer_machine_cert` | `bstr`, canonical CBOR `MachineCert` |
+| `signer_machine_cert_fingerprint` | `bstr[32]` |
+| `snapshot_body` | **nested CBOR map** (see below) |
+| `state_evidence_digest` | `bstr[32]` |
+| `v` | `1` |
+
+**Every `unavailable_*` — exactly seven keys:** `client_nonce`, `outcome`,
+`signature`, `signer_m_id`, `signer_machine_cert`,
+`signer_machine_cert_fingerprint`, `v`. `snapshot_body`,
+`state_evidence_digest` and `full_snapshot_digest` are **absent**.
+
+Key order on the wire is the canonical CBOR order (by encoded key bytes,
+shortest first), not the order tabulated here.
+
+### `snapshot_body` by `state_kind`
+
+`state_kind` crosses the boundary as a `u8`; the store's internal chain-state
+type is not part of this surface. Four keys are always present — `floor_secs`,
+`hh_id`, `state_kind`, `v` — and checkpoint keys are omitted rather than nulled
+when the state does not have them.
+
+| `state_kind` | Store state | Additional keys |
+|---|---|---|
+| 0 | No genesis accepted | none — exactly `{floor_secs, hh_id, state_kind, v}` |
+| 1 | Accepted chain | `genesis_checkpoint`, `accepted_checkpoint`, plus `predecessor_checkpoint` when one exists |
+| 2 | Checkpoint fork conflict | `genesis_checkpoint`, `accepted_checkpoint`, `conflicting_checkpoint`, plus `predecessor_checkpoint` when one exists |
+| 3 | Event fork conflict | same as 2 |
+
+Checkpoint values are the stored canonical checkpoint blobs, passed through
+unchanged.
+
+### Domains, the two digests, and the floor asymmetry
+
+Two domain separators. **The trailing NUL byte is part of each domain, not a
+typo** — dropping it still hashes and still verifies against itself, and never
+matches the client:
+
+```
+evidence domain:  "soyeht/roster-evidence/v1\x00"
+snapshot domain:  "soyeht/roster-snapshot/v1\x00"
+```
+
+Each digest is `SHA-256(domain ‖ canonical_cbor(body))`, and the two are taken
+over **different preimages**. The difference is exactly `floor_secs`:
+
+| Digest | Domain | Body |
+|---|---|---|
+| `state_evidence_digest` | evidence | the snapshot body **without** `floor_secs` |
+| `full_snapshot_digest` | snapshot | the snapshot body **with** `floor_secs` |
+
+The asymmetry is load-bearing. `state_evidence_digest` names the roster state
+independently of when it was observed, so it is stable across queries that only
+advance the floor; `full_snapshot_digest` binds that same state to the observed
+moment. Swapping the two produces two internally coherent digests of the wrong
+preimages — a server that verifies against itself and that the client rejects
+every time. The `snapshot_body` served on the wire is the **with-floor** body.
+
+### Signature
+
+`signature` is a P-256 signature by the responding machine's identity key over
+
+```
+"soyeht/roster-evidence/v1\x00" ‖ canonical_cbor(unsigned_map)
+```
+
+where `unsigned_map` is the response **minus `signature`**:
+
+- `available` — nine keys: `client_nonce`, `full_snapshot_digest`, `outcome`,
+  `signer_m_id`, `signer_machine_cert`, `signer_machine_cert_fingerprint`,
+  `snapshot_body`, `state_evidence_digest`, `v`.
+- `unavailable_*` — six keys: `client_nonce`, `outcome`, `signer_m_id`,
+  `signer_machine_cert`, `signer_machine_cert_fingerprint`, `v`.
+
+Two properties here fail **silently** if got wrong — each yields a server that
+is internally consistent and that the client rejects:
+
+1. **`snapshot_body` is signed as a nested CBOR map, not as a byte string
+   containing CBOR.** Asserting mere presence cannot tell the two apart. The
+   `bstr` form is a different preimage, and a server built that way verifies
+   against itself.
+2. **When the outcome is `available`, the signature must cover `snapshot_body`
+   and both digests.** Omitting them signs a strictly weaker statement that
+   still verifies.
+
+The response is signer-anchored: `signer_m_id`, the full canonical
+`signer_machine_cert` and its 32-byte fingerprint are all inside the signed map,
+so the statement names its author and carries the household-issued cert that
+author was issued. `client_nonce` is inside the signed map too, binding the
+response to the specific request that asked for it.
+
+### Errors (non-200)
+
+Same canonical two-key envelope as §16c: `{v: 1, error: "<literal>"}`.
+
+| Status | `error` | Cause |
+|---|---|---|
+| 401 | `unauthenticated` | Missing, malformed, expired, or non-owner `PoP`; or any device-side refusal. |
+| 413 | `payload_too_large` | Request body over 1024 bytes. Evaluated after authorization. |
+| 415 | `unsupported_media_type` | Request `Content-Type` absent or not exactly `application/cbor`. |
+| 400 | `invalid_request` | Any malformed request shape, collapsed to one literal. |
+| 409 | `already_initialized` | A store operation observed an already-initialized state. |
+| 503 | `not_initialized` | Roster store not provisioned, device admission authority absent, household unloaded mid-request, or no loaded identity to sign with. |
+| 503 | `lock_timeout` | Roster lock not acquired in time. |
+| 503 | `clock_unavailable` | Server wall clock is before the Unix epoch, so the `PoP` time gate cannot be evaluated. |
+| 500 | `sign_failed` | The response was assembled but could not be signed. |
+| 500 | `encode_failed` | The response could not be canonically encoded. |
+| 500 | `internal_error` | The blocking store task failed to join. |
+| 500 | `store_io`, `unsafe_file_type`, `temp_already_exists`, `mode_mismatch`, `invalid_path`, `inconsistent_provisioning_state`, `readback_mismatch`, `latch_poisoned`, `invalid_current_owner_authority`, `storage`, `household`, `owner_auth` | Typed store failure; same mapping as §16c. |
+| 500 | `integrity_*` | Chain integrity failure; one literal per `ChainIntegrityError` variant, same set as §16c. |
+
+`invalid_machine_id` and `body_not_allowed` are §16c literals and never appear
+here: this route takes no `{m_id}`, and its request body is required rather than
+forbidden.
+
+Fail-closed: no failure path may fabricate a roster fact, and no path may serve
+a `snapshot_body` outside a signed `available` response.
+
+Implementation: `admin/rust/household-rs/src/machine_roster_evidence.rs`
+(domains, digests, signing preimage), `admin/rust/household-rs/src/machine_roster_store.rs`
+(`query_roster_evidence`), `admin/rust/server-rs/src/handlers_household_roster.rs`
+(route and wire); contract tests in
+`admin/rust/server-rs/tests/household_roster_currency.rs`.
+
+---
+
 ## 17. Ratified product decisions (2026-05-06)
 
 All four schema-blocking decisions closed:

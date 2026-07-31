@@ -3447,6 +3447,98 @@ fn assert_passkey_conversion_only_in_local_attested_helper() {
     );
 }
 
+/// Blank out column-zero `#[cfg(test)] mod <name> { … }` regions so the strong
+/// owner minter guard scans only what a release binary actually ships.
+///
+/// `#[cfg(test)]` code is compiled out of release builds by construction, so it
+/// cannot be a production call path; a test fixture that mints an owner cert to
+/// build roster state is not the thing this guard exists to catch.
+///
+/// Three deliberate properties:
+///
+/// - Lines are **blanked, not removed**, so the line numbers the guard reports
+///   stay aligned with the file on disk.
+/// - Only a column-zero `#[cfg(test)]` immediately followed by a column-zero
+///   `mod <name> {` opens a region, and only a column-zero `}` closes it. A
+///   non-block `#[cfg(test)]` item (const, fn, impl) has no column-zero `}` of
+///   its own, so scanning ahead for one would swallow the production code that
+///   follows it.
+/// - Everything else stays in scope. Under-excision is the conservative
+///   direction here: more source is scanned, never less, so the guard cannot
+///   lose teeth through this filter.
+fn runtime_lines_only(source: &str) -> String {
+    let lines: Vec<&str> = source.lines().collect();
+    let mut out: Vec<String> = Vec::with_capacity(lines.len());
+    let mut index = 0usize;
+
+    while index < lines.len() {
+        let opens_test_mod = lines[index] == "#[cfg(test)]"
+            && lines
+                .get(index + 1)
+                .is_some_and(|next| next.starts_with("mod ") && next.ends_with(" {"));
+        if !opens_test_mod {
+            out.push(lines[index].to_string());
+            index += 1;
+            continue;
+        }
+
+        // The attribute and the `mod … {` opener, then every line through the
+        // column-zero `}` that closes the module.
+        out.push(String::new());
+        out.push(String::new());
+        index += 2;
+        while index < lines.len() {
+            let closes_module = lines[index] == "}";
+            out.push(String::new());
+            index += 1;
+            if closes_module {
+                break;
+            }
+        }
+    }
+
+    out.join("\n")
+}
+
+#[test]
+fn runtime_lines_only_keeps_production_minters_and_drops_test_module_ones() {
+    // Without this the guard has no teeth: a real runtime call site must
+    // survive the filter.
+    let production = "fn ship() {\n    PersonCert::sign_owner_with_verified_provenance();\n}\n";
+    assert!(
+        runtime_lines_only(production).contains("sign_owner_with_verified_provenance"),
+        "a minter call outside a test module must survive the filter"
+    );
+
+    let in_test_module = "fn ship() {}\n#[cfg(test)]\nmod tests {\n    fn t() {\n        PersonCert::sign_owner_with_verified_provenance();\n    }\n}\n";
+    assert!(
+        !runtime_lines_only(in_test_module).contains("sign_owner_with_verified_provenance"),
+        "a minter call inside `#[cfg(test)] mod tests` must be excised"
+    );
+
+    // Only `mod` regions may be excised. A `#[cfg(test)]` fn stays in scope.
+    let non_mod_item =
+        "#[cfg(test)]\nfn helper() {\n    PersonCert::sign_owner_with_verified_provenance();\n}\n";
+    assert!(
+        runtime_lines_only(non_mod_item).contains("sign_owner_with_verified_provenance"),
+        "only `#[cfg(test)] mod` regions may be excised"
+    );
+
+    // The end of the region must be the module's closing brace, not EOF —
+    // production code below a test module stays scanned.
+    let after_module = "#[cfg(test)]\nmod tests {\n    fn t() {}\n}\nfn later() {\n    PersonCert::sign_owner_with_verified_provenance();\n}\n";
+    assert!(
+        runtime_lines_only(after_module).contains("sign_owner_with_verified_provenance"),
+        "a minter call below a test module must survive the filter"
+    );
+
+    // Blanking, not deleting: reported line numbers stay aligned with disk.
+    let numbering = "a\n#[cfg(test)]\nmod tests {\n}\nb\n";
+    let filtered = runtime_lines_only(numbering);
+    assert_eq!(filtered.lines().count(), numbering.lines().count());
+    assert_eq!(filtered.lines().nth(4), Some("b"));
+}
+
 fn assert_strong_owner_minter_not_called_from_runtime() {
     let admin_rust_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .parent()
@@ -3508,6 +3600,7 @@ fn assert_strong_owner_minter_not_called_from_runtime() {
     for path in sources {
         let source = fs::read_to_string(&path)
             .unwrap_or_else(|e| panic!("read runtime source {}: {e}", path.display()));
+        let source = runtime_lines_only(&source);
         for (index, line) in source.lines().enumerate() {
             let contains_direct_minter = line.contains("sign_owner_with_verified_provenance");
             if contains_direct_minter {
@@ -11450,4 +11543,515 @@ async fn test_apns_dispatched_when_no_poll() {
     );
     tokio::time::sleep(Duration::from_millis(50)).await;
     assert!(spy.captured().is_empty());
+}
+
+// ─── D2c-1a: device-delegated roster read helper ────────────────────────────
+//
+// Each case is named for the single property it discriminates. They all drive
+// the real `authorize_roster_read`; none stubs the authority.
+
+mod device_roster_read {
+    use super::*;
+    use axum::http::Method;
+    use household_rs::caveats::{Caveat, Operation, Scope};
+    use household_rs::device_admission::{
+        HouseholdDeviceAdmissionAuthorityV1, add_pop_challenge, owner_person_cert_digest,
+        owner_revoke_challenge, person_revoke_challenge,
+    };
+    use household_rs::device_cert::{DeviceCert, SignOptions as DeviceSignOptions};
+    use server_rs::household_auth::{
+        AuthorizedRosterReader, DEVICE_ID_HEADER, RosterReadActor, RosterReadAuthError,
+        authorize_roster_read,
+    };
+
+    const READ_OP: Operation = Operation::ClawsList;
+    const URI: &str = "/api/v1/household/roster/currency/m_test";
+
+    struct Seam {
+        _td: TempDir,
+        state_dir: std::path::PathBuf,
+        state: HouseholdState,
+        owner_person: P256Keypair,
+        owner_cert: PersonCert,
+        device: P256Keypair,
+        cert: DeviceCert,
+        authority: HouseholdDeviceAdmissionAuthorityV1,
+    }
+
+    /// Build a household with an owner whose cert carries the explicit
+    /// `household.add_device` grant, plus a `DeviceCert` with `caveats`.
+    fn seam(device_caveats: Option<Vec<Caveat>>) -> Seam {
+        seam_with(device_caveats, None)
+    }
+
+    fn seam_with(device_caveats: Option<Vec<Caveat>>, person_not_after: Option<u64>) -> Seam {
+        let td = TempDir::new().unwrap();
+        let state_dir = td.path().to_path_buf();
+        let identity = bootstrap(&state_dir);
+        let owner_person = P256Keypair::generate();
+        let hh_priv = identity
+            .hh_priv
+            .as_deref()
+            .expect("hh_priv present in single-machine household");
+        let mut owner_cert = PersonCert::sign_owner(
+            hh_priv,
+            SignOwnerOptions {
+                hh_id: identity.record.hh_id.clone(),
+                p_pub: owner_person.public(),
+                display_name: "Owner".into(),
+                issued_at: identity.record.created_at,
+            },
+        )
+        .unwrap();
+        owner_cert
+            .caveats
+            .push(Caveat::new(Operation::HouseholdAddDevice, None));
+        owner_cert.not_after = person_not_after;
+        let signing = owner_cert.signing_bytes().unwrap();
+        owner_cert.signature = hh_priv.sign(&signing).unwrap();
+
+        let device = P256Keypair::generate();
+        let cert = DeviceCert::sign(
+            &owner_person,
+            DeviceSignOptions {
+                p_pub: owner_person.public(),
+                d_pub: device.public(),
+                device_name: "iPhone 15".into(),
+                platform: "ios".into(),
+                added_at: identity.record.created_at,
+                caveats: device_caveats,
+            },
+        )
+        .unwrap();
+
+        let auth_state = HouseholdAuthState::new(&identity.record, owner_cert.clone());
+        let authority = HouseholdDeviceAdmissionAuthorityV1::new(
+            &state_dir,
+            identity.record.hh_id.clone(),
+            identity.record.hh_pub.clone(),
+        );
+        let state =
+            HouseholdState::loaded_with_owner_auth(Arc::new(identity), Some(Arc::new(auth_state)));
+        Seam {
+            _td: td,
+            state_dir,
+            state,
+            owner_person,
+            owner_cert,
+            device,
+            cert,
+            authority,
+        }
+    }
+
+    fn admit(seam: &Seam, nonce: u8) {
+        seam.authority.provision().unwrap();
+        let generation = seam.authority.live_snapshot().unwrap().generation();
+        let nonce = [nonce; 32];
+        let challenge = add_pop_challenge(
+            &seam.owner_cert.hh_id,
+            generation,
+            &seam.cert,
+            &seam.cert.digest().unwrap(),
+            &owner_person_cert_digest(&seam.owner_cert).unwrap(),
+            &nonce,
+        )
+        .unwrap();
+        let pop = seam.owner_person.sign(&challenge).unwrap();
+        seam.authority
+            .admit_device(&seam.owner_cert, &seam.cert, &pop, &nonce, unix_now())
+            .unwrap();
+    }
+
+    /// A PoP signed by `signer` but carrying `p_id` in the person slot — the
+    /// delegated shape, where the parent person is named and the device signs.
+    fn device_pop_header(signer: &P256Keypair, p_id: &str, uri: &str, timestamp: u64) -> String {
+        let ctx = RequestSigningContext::new("GET", uri, timestamp, b"");
+        let sig = signer.sign(&ctx.canonical_bytes().unwrap()).unwrap();
+        format!(
+            "Soyeht-PoP v1:{}:{}:{}",
+            p_id,
+            timestamp,
+            B64URL.encode(sig.as_bytes())
+        )
+    }
+
+    fn headers(pop: &str, device_id: Option<&str>) -> HeaderMap {
+        let mut map = HeaderMap::new();
+        map.insert(axum::http::header::AUTHORIZATION, pop.parse().unwrap());
+        if let Some(device_id) = device_id {
+            map.insert(DEVICE_ID_HEADER, device_id.parse().unwrap());
+        }
+        map
+    }
+
+    async fn call(
+        seam: &Seam,
+        headers: HeaderMap,
+        now: u64,
+    ) -> Result<AuthorizedRosterReader, RosterReadAuthError> {
+        authorize_roster_read(
+            &seam.state,
+            &seam.state_dir,
+            &headers,
+            &Method::GET,
+            URI,
+            b"",
+            READ_OP,
+            now,
+        )
+        .await
+    }
+
+    fn assert_device_rejected(result: Result<AuthorizedRosterReader, RosterReadAuthError>) {
+        match result {
+            Err(RosterReadAuthError::DeviceUnauthenticated) => {}
+            Err(other) => panic!("expected the collapsed device class, got {other:?}"),
+            Ok(_) => panic!("device request must not be authorized"),
+        }
+    }
+
+    // ── dispatch ───────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn owner_path_is_unchanged_when_the_header_is_absent() {
+        let seam = seam(None);
+        let now = unix_now();
+        let pop = pop_header(&seam.owner_person, URI, now);
+        let reader = call(&seam, headers(&pop, None), now).await.unwrap();
+        assert_eq!(
+            reader.actor,
+            RosterReadActor::Owner {
+                person_id: seam.owner_cert.p_id.0.clone()
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn admitted_device_key_is_authorized() {
+        let seam = seam(None);
+        admit(&seam, 1);
+        let now = unix_now();
+        let pop = device_pop_header(&seam.device, &seam.owner_cert.p_id.0, URI, now);
+        let reader = call(&seam, headers(&pop, Some(&seam.cert.d_id.0)), now)
+            .await
+            .unwrap();
+        match reader.actor {
+            RosterReadActor::Device {
+                device_id,
+                generation,
+            } => {
+                assert_eq!(device_id, seam.cert.d_id);
+                assert!(generation > 0);
+            }
+            other => panic!("expected the device actor, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn header_present_with_owner_signature_never_falls_back_to_owner() {
+        let seam = seam(None);
+        admit(&seam, 1);
+        let now = unix_now();
+        // A perfectly valid OWNER proof, presented with the device header.
+        let pop = pop_header(&seam.owner_person, URI, now);
+        assert_device_rejected(call(&seam, headers(&pop, Some(&seam.cert.d_id.0)), now).await);
+    }
+
+    // ── device identifier ──────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn malformed_device_ids_are_refused_strictly() {
+        let seam = seam(None);
+        admit(&seam, 1);
+        let now = unix_now();
+        let pop = device_pop_header(&seam.device, &seam.owner_cert.p_id.0, URI, now);
+        let good = seam.cert.d_id.0.clone();
+        // Deterministic corruptions: '1' and '8' are outside the RFC-4648
+        // base32 alphabet, so swapping the final character always invalidates.
+        let mut out_of_alphabet_one = good.clone();
+        out_of_alphabet_one.pop();
+        out_of_alphabet_one.push('1');
+        let mut out_of_alphabet_eight = good.clone();
+        out_of_alphabet_eight.pop();
+        out_of_alphabet_eight.push('8');
+        for bad in [
+            String::new(),
+            "d_".to_string(),
+            good[..good.len() - 1].to_string(),
+            format!("{good}a"),
+            good.to_uppercase(),
+            good.replace("d_", "m_"),
+            out_of_alphabet_one,
+            out_of_alphabet_eight,
+        ] {
+            assert_device_rejected(call(&seam, headers(&pop, Some(&bad)), now).await);
+        }
+    }
+
+    #[tokio::test]
+    async fn unknown_device_is_refused() {
+        let seam = seam(None);
+        admit(&seam, 1);
+        let now = unix_now();
+        let stranger = P256Keypair::generate();
+        let stranger_id = household_rs::device_cert::derive_device_id(&stranger.public());
+        let pop = device_pop_header(&stranger, &seam.owner_cert.p_id.0, URI, now);
+        assert_device_rejected(call(&seam, headers(&pop, Some(&stranger_id.0)), now).await);
+    }
+
+    // ── admission state ────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn revoked_device_is_refused() {
+        let seam = seam(None);
+        admit(&seam, 1);
+        let nonce = [2u8; 32];
+        let challenge =
+            owner_revoke_challenge(&seam.owner_cert.hh_id, &seam.cert.d_id, &nonce).unwrap();
+        let pop_sig = seam.owner_person.sign(&challenge).unwrap();
+        seam.authority
+            .revoke_device_as_owner(
+                &seam.owner_cert,
+                &seam.cert.d_id,
+                &pop_sig,
+                &nonce,
+                unix_now(),
+            )
+            .unwrap();
+
+        let now = unix_now();
+        let pop = device_pop_header(&seam.device, &seam.owner_cert.p_id.0, URI, now);
+        assert_device_rejected(call(&seam, headers(&pop, Some(&seam.cert.d_id.0)), now).await);
+    }
+
+    #[tokio::test]
+    async fn revoked_person_cascades_to_refuse_the_device() {
+        let seam = seam(None);
+        admit(&seam, 1);
+        let nonce = [3u8; 32];
+        let challenge =
+            person_revoke_challenge(&seam.owner_cert.hh_id, &seam.owner_cert.p_id, &nonce).unwrap();
+        let pop_sig = seam.owner_person.sign(&challenge).unwrap();
+        seam.authority
+            .revoke_person_as_owner(
+                &seam.owner_cert,
+                &seam.owner_cert.p_id,
+                &pop_sig,
+                &nonce,
+                unix_now(),
+            )
+            .unwrap();
+
+        let now = unix_now();
+        let pop = device_pop_header(&seam.device, &seam.owner_cert.p_id.0, URI, now);
+        assert_device_rejected(call(&seam, headers(&pop, Some(&seam.cert.d_id.0)), now).await);
+    }
+
+    // ── binding ────────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn pop_person_slot_must_equal_the_entry_parent() {
+        let seam = seam(None);
+        admit(&seam, 1);
+        let now = unix_now();
+        let stranger_p_id = household_rs::derive_person_id(&P256Keypair::generate().public()).0;
+        let pop = device_pop_header(&seam.device, &stranger_p_id, URI, now);
+        assert_device_rejected(call(&seam, headers(&pop, Some(&seam.cert.d_id.0)), now).await);
+    }
+
+    #[tokio::test]
+    async fn authority_from_a_foreign_household_root_is_refused() {
+        let seam = seam(None);
+        admit(&seam, 1);
+        // A second, fully valid household presented over the FIRST household's
+        // state dir. Its owner cert verifies under its own root, so the refusal
+        // is attributable to the durable record belonging to another root —
+        // not to a cert or clock failure earlier in the chain.
+        let foreign_seam = self::seam(None);
+        let foreign_state = foreign_seam.state;
+        let now = unix_now();
+        let pop = device_pop_header(&seam.device, &seam.owner_cert.p_id.0, URI, now);
+        let result = authorize_roster_read(
+            &foreign_state,
+            &seam.state_dir,
+            &headers(&pop, Some(&seam.cert.d_id.0)),
+            &Method::GET,
+            URI,
+            b"",
+            READ_OP,
+            now,
+        )
+        .await;
+        assert_device_rejected(result);
+    }
+
+    #[tokio::test]
+    async fn owner_cert_digest_drift_refuses_the_device() {
+        let seam = seam(None);
+        admit(&seam, 1);
+        // Re-mint the owner cert: same person key, different bytes, so the
+        // entry's person_cert_digest no longer matches the live cert.
+        let identity = seam.state.current().await.unwrap();
+        let hh_priv = identity.hh_priv.as_deref().unwrap();
+        let mut drifted = seam.owner_cert.clone();
+        drifted.display_name = "Owner Renamed".into();
+        let signing = drifted.signing_bytes().unwrap();
+        drifted.signature = hh_priv.sign(&signing).unwrap();
+        let drifted_state = HouseholdState::loaded_with_owner_auth(
+            Arc::clone(&identity),
+            Some(Arc::new(HouseholdAuthState::new(&identity.record, drifted))),
+        );
+
+        let now = unix_now();
+        let pop = device_pop_header(&seam.device, &seam.owner_cert.p_id.0, URI, now);
+        let result = authorize_roster_read(
+            &drifted_state,
+            &seam.state_dir,
+            &headers(&pop, Some(&seam.cert.d_id.0)),
+            &Method::GET,
+            URI,
+            b"",
+            READ_OP,
+            now,
+        )
+        .await;
+        assert_device_rejected(result);
+    }
+
+    #[tokio::test]
+    async fn expired_person_limit_refuses_the_device() {
+        // An owner cert that really carries a limit, so the entry inherits one.
+        let limit = unix_now() + 3600;
+        let seam = seam_with(None, Some(limit));
+        admit(&seam, 1);
+        assert_eq!(
+            seam.authority
+                .live_snapshot()
+                .unwrap()
+                .entry(&seam.cert.d_id)
+                .unwrap()
+                .person_not_after,
+            Some(limit),
+            "the entry must inherit the person's effective limit"
+        );
+
+        // Inside the window it authorizes...
+        let inside = limit - 60;
+        let pop = device_pop_header(&seam.device, &seam.owner_cert.p_id.0, URI, inside);
+        assert!(
+            call(&seam, headers(&pop, Some(&seam.cert.d_id.0)), inside)
+                .await
+                .is_ok()
+        );
+
+        // ...and at the limit it does not.
+        let pop = device_pop_header(&seam.device, &seam.owner_cert.p_id.0, URI, limit);
+        assert_device_rejected(call(&seam, headers(&pop, Some(&seam.cert.d_id.0)), limit).await);
+    }
+
+    // ── caveats ────────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn none_caveats_inherit_the_verified_person_set() {
+        let seam = seam(None);
+        admit(&seam, 1);
+        assert!(
+            seam.authority
+                .live_snapshot()
+                .unwrap()
+                .entry(&seam.cert.d_id)
+                .unwrap()
+                .device_caveats
+                .is_none()
+        );
+        let now = unix_now();
+        let pop = device_pop_header(&seam.device, &seam.owner_cert.p_id.0, URI, now);
+        assert!(
+            call(&seam, headers(&pop, Some(&seam.cert.d_id.0)), now)
+                .await
+                .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn empty_caveat_set_grants_nothing() {
+        let seam = seam(Some(Vec::new()));
+        admit(&seam, 1);
+        let now = unix_now();
+        let pop = device_pop_header(&seam.device, &seam.owner_cert.p_id.0, URI, now);
+        assert_device_rejected(call(&seam, headers(&pop, Some(&seam.cert.d_id.0)), now).await);
+    }
+
+    #[tokio::test]
+    async fn restrictive_caveat_set_that_does_not_permit_is_refused() {
+        let seam = seam(Some(vec![Caveat::new(
+            READ_OP,
+            Some(Scope::Specific {
+                specific: vec!["c_one".into()],
+            }),
+        )]));
+        admit(&seam, 1);
+        let now = unix_now();
+        let pop = device_pop_header(&seam.device, &seam.owner_cert.p_id.0, URI, now);
+        assert_device_rejected(call(&seam, headers(&pop, Some(&seam.cert.d_id.0)), now).await);
+    }
+
+    // ── request binding and availability ───────────────────────────────────
+
+    #[tokio::test]
+    async fn signature_is_bound_to_method_path_and_body() {
+        let seam = seam(None);
+        admit(&seam, 1);
+        let now = unix_now();
+        let p_id = seam.owner_cert.p_id.0.clone();
+
+        // Signed for a different path.
+        let other_path = device_pop_header(&seam.device, &p_id, "/api/v1/household/other", now);
+        assert_device_rejected(
+            call(&seam, headers(&other_path, Some(&seam.cert.d_id.0)), now).await,
+        );
+
+        // Signed for GET, presented as POST.
+        let good = device_pop_header(&seam.device, &p_id, URI, now);
+        let result = authorize_roster_read(
+            &seam.state,
+            &seam.state_dir,
+            &headers(&good, Some(&seam.cert.d_id.0)),
+            &Method::POST,
+            URI,
+            b"",
+            READ_OP,
+            now,
+        )
+        .await;
+        assert_device_rejected(result);
+
+        // Signed over an empty body, presented with one.
+        let result = authorize_roster_read(
+            &seam.state,
+            &seam.state_dir,
+            &headers(&good, Some(&seam.cert.d_id.0)),
+            &Method::GET,
+            URI,
+            b"{}",
+            READ_OP,
+            now,
+        )
+        .await;
+        assert_device_rejected(result);
+    }
+
+    #[tokio::test]
+    async fn missing_authority_is_typed_unavailable_not_unauthenticated() {
+        // Provisioned never: the durable object is absent.
+        let seam = seam(None);
+        let now = unix_now();
+        let pop = device_pop_header(&seam.device, &seam.owner_cert.p_id.0, URI, now);
+        match call(&seam, headers(&pop, Some(&seam.cert.d_id.0)), now).await {
+            Err(RosterReadAuthError::AuthorityUnavailable) => {}
+            Err(other) => panic!("expected the unavailable class, got {other:?}"),
+            Ok(_) => panic!("a missing authority must never authorize"),
+        }
+    }
 }

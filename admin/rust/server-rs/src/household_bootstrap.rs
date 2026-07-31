@@ -20,6 +20,7 @@ use crate::handlers_device_pairing;
 use crate::handlers_household;
 use crate::handlers_household_claws;
 use crate::handlers_household_guest_image;
+use crate::handlers_household_roster;
 use crate::handlers_owner_events;
 use crate::handlers_pair_device;
 use crate::handlers_pair_machine;
@@ -619,6 +620,26 @@ pub async fn bootstrap_household(shared_state: Option<SharedState>) {
             state_dir: state_dir.clone(),
         });
 
+    // B0a/B0b: read-only machine roster currency and signed roster evidence,
+    // authorized as the owner **or** as an admitted household device delegated
+    // by that owner (D2c). The same (identity + state_dir) state shape as
+    // `machines`, but the wire is canonical CBOR rather than JSON — see
+    // `handlers_household_roster`. Distinct router so the roster surface can be
+    // mounted/omitted on its own.
+    let roster_router = axum::Router::new()
+        .route(
+            handlers_household_roster::CURRENCY_PATH,
+            axum::routing::get(handlers_household_roster::currency),
+        )
+        .route(
+            handlers_household_roster::EVIDENCE_PATH,
+            axum::routing::post(handlers_household_roster::evidence),
+        )
+        .with_state(handlers_household_roster::RosterRouterState {
+            household: identity_state.clone(),
+            state_dir: state_dir.clone(),
+        });
+
     let pair_router = axum::Router::new()
         .route(
             "/api/v1/household/pair-device/initiate",
@@ -1116,6 +1137,7 @@ pub async fn bootstrap_household(shared_state: Option<SharedState>) {
     let mut household_router = identity_router
         .merge(pair_router)
         .merge(machines_router) // R101
+        .merge(roster_router) // B0a machine roster currency
         .merge(bootstrap_rt)
         .merge(pre_household_rt)
         .merge(guest_image_router)

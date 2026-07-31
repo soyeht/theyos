@@ -95,6 +95,7 @@ pub mod handlers_device_pairing;
 pub mod handlers_household;
 pub mod handlers_household_claws;
 pub mod handlers_household_guest_image;
+pub mod handlers_household_roster;
 pub mod handlers_instances;
 pub mod handlers_invites;
 pub mod handlers_jobs;

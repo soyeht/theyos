@@ -351,7 +351,7 @@ fn r1a7_enumerates_linked_targets_and_proves_zero_production_callers() {
             .any(|member| member == "m1-household-mesh-smoke-rs")
     );
     let targets = enumerate_workspace_targets(&rust_root, &members);
-    assert_eq!(targets.len(), 197, "Cargo target inventory changed");
+    assert_eq!(targets.len(), 198, "Cargo target inventory changed");
     assert_eq!(
         targets.iter().filter(|target| target.kind == "bin").count(),
         49
@@ -361,7 +361,7 @@ fn r1a7_enumerates_linked_targets_and_proves_zero_production_callers() {
             .iter()
             .filter(|target| target.kind == "test")
             .count(),
-        148 // 146 + 2 R0a Fatia N integration targets
+        149 // 146 + 2 R0a Fatia N + 1 B0a roster-currency integration targets
     );
     assert_eq!(
         targets
