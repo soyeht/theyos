@@ -130,14 +130,23 @@ pub async fn run(args: &[String]) -> i32 {
 
     if reissue_pair_qr {
         return match household_rs::try_load_existing(&state_dir, key_policy) {
-            Ok(Some(loaded)) => {
-                emit_fresh_pair_device_window(
-                    &state_dir,
-                    &loaded.record.hh_pub,
-                    Some(&loaded.record.name),
-                )
-                .await
-            }
+            Ok(Some(loaded)) => match household_rs::machine_cert::fingerprint(&loaded.cert) {
+                Ok(m_cert_fp) => {
+                    emit_fresh_pair_device_window(
+                        &state_dir,
+                        &loaded.record.hh_pub,
+                        Some(&loaded.record.name),
+                        &m_cert_fp,
+                    )
+                    .await
+                }
+                // Resolved before any window is minted, so a reissue that
+                // cannot pin leaves the existing window exactly as it was.
+                Err(e) => {
+                    eprintln!("error: cannot fingerprint this machine's cert: {e}");
+                    1
+                }
+            },
             Ok(None) => {
                 eprintln!(
                     "error: --reissue-pair-qr requires an already-bootstrapped install. \
@@ -182,12 +191,21 @@ pub async fn run(args: &[String]) -> i32 {
                         hh_id = %loaded.record.hh_id,
                         name = %loaded.record.name,
                     );
-                    emit_fresh_pair_device_window(
-                        &state_dir,
-                        &loaded.record.hh_pub,
-                        Some(&loaded.record.name),
-                    )
-                    .await
+                    match household_rs::machine_cert::fingerprint(&loaded.cert) {
+                        Ok(m_cert_fp) => {
+                            emit_fresh_pair_device_window(
+                                &state_dir,
+                                &loaded.record.hh_pub,
+                                Some(&loaded.record.name),
+                                &m_cert_fp,
+                            )
+                            .await
+                        }
+                        Err(e) => {
+                            eprintln!("error: cannot fingerprint this machine's cert: {e}");
+                            1
+                        }
+                    }
                 }
                 Err(e) => {
                     household_rs::bootstrap::log_error(&e);
@@ -230,21 +248,34 @@ fn print_usage() {
 /// engine's in-process `POST /bootstrap/pair-device/reissue` route. The
 /// reissue route mints on the SHARED `Arc<PairDeviceWindow>` instead (for
 /// liveness), but renders via the same `to_uri_with_host_and_name` path.
+/// `m_cert_fp` is required and must come from the caller's already-validated
+/// `MachineCert` — the helper deliberately cannot fetch one itself, so no
+/// caller can render a QR off a cert that was merely decodable rather than
+/// admitted.
 pub(crate) async fn mint_pair_device_uri(
     state_dir: &Path,
     hh_pub: &P256PublicKey,
     household_name: Option<&str>,
     host_fallback: Option<String>,
+    m_cert_fp: &[u8; 32],
 ) -> Result<(String, u64), String> {
     let ttl = Duration::from_secs(crate::household_bootstrap::pair_window_ttl_secs_from_env(
         "THEYOS_PAIR_DEVICE_TTL_SECS",
     ));
+    // The fingerprint arrives resolved, so minting is the last fallible step:
+    // this helper persists a window snapshot, and failing after that would
+    // leave a live window behind an error return.
     let window = PairDeviceWindow::with_persistence(state_dir.to_path_buf());
     let token = window
         .mint_token(ttl, None)
         .await
         .map_err(|e| format!("failed to mint pair token: {e}"))?;
-    let uri = token.to_uri_with_host_and_name(hh_pub, host_fallback.as_deref(), household_name);
+    let uri = token.to_uri_with_host_and_name(
+        hh_pub,
+        host_fallback.as_deref(),
+        household_name,
+        m_cert_fp,
+    );
     Ok((uri, token.expires_at_unix))
 }
 
@@ -255,6 +286,7 @@ async fn emit_fresh_pair_device_window(
     state_dir: &Path,
     hh_pub: &P256PublicKey,
     household_name: Option<&str>,
+    m_cert_fp: &[u8; 32],
 ) -> i32 {
     // Resolve a reachable host fallback for the URI so peers whose Bonjour
     // implementation does not interoperate with the engine's mDNS publisher
@@ -267,14 +299,21 @@ async fn emit_fresh_pair_device_window(
     let host_fallback = pick_addr_for_transport(JoinTransport::Lan, port)
         .or_else(|| crate::tailnet_address::current_tailnet_ipv4().map(|ip| format!("{ip}:{port}")));
 
-    let (uri, expires_at_unix) =
-        match mint_pair_device_uri(state_dir, hh_pub, household_name, host_fallback.clone()).await {
-            Ok(pair) => pair,
-            Err(e) => {
-                eprintln!("error: {e}");
-                return 1;
-            }
-        };
+    let (uri, expires_at_unix) = match mint_pair_device_uri(
+        state_dir,
+        hh_pub,
+        household_name,
+        host_fallback.clone(),
+        m_cert_fp,
+    )
+    .await
+    {
+        Ok(pair) => pair,
+        Err(e) => {
+            eprintln!("error: {e}");
+            return 1;
+        }
+    };
 
     info!(
         stage = "pair_device_window.opened",
@@ -750,6 +789,11 @@ mod tests {
     // A throwaway, deterministic household public key for URI-render tests.
     // 33-byte SEC1 compressed point; bootstrap a software-keyed identity in a
     // tempdir to obtain a valid `P256PublicKey` without touching the network.
+    /// Stand-in for a validated machine cert fingerprint. These tests are
+    /// about host/URI shape, not provenance — the real callers derive this
+    /// from `loaded.cert`.
+    const TEST_M_CERT_FP: [u8; 32] = [0x5au8; 32];
+
     fn test_hh_pub() -> P256PublicKey {
         let td = tempfile::tempdir().unwrap();
         let loaded = household_rs::bootstrap_or_load(
@@ -772,7 +816,8 @@ mod tests {
             state_dir.path(),
             &hh_pub,
             Some("Reissue Test Home"),
-            Some("192.168.15.12:8091".to_string()),
+            Some("192.0.2.10:8091".to_string()),
+            &TEST_M_CERT_FP,
         )
         .await
         .expect("mint");
@@ -784,7 +829,7 @@ mod tests {
         assert!(uri.contains("&ttl="), "uri={uri}");
         // host is percent-encoded (the ':' is preserved per the encoder).
         assert!(
-            uri.contains("&host=192.168.15.12:8091"),
+            uri.contains("&host=192.0.2.10:8091"),
             "host fallback must be present: uri={uri}"
         );
 
@@ -802,10 +847,15 @@ mod tests {
     async fn mint_pair_device_uri_omits_host_when_none() {
         let state_dir = tempfile::tempdir().unwrap();
         let hh_pub = test_hh_pub();
-        let (uri, _expires) =
-            mint_pair_device_uri(state_dir.path(), &hh_pub, Some("Reissue Test Home"), None)
-                .await
-                .expect("mint");
+        let (uri, _expires) = mint_pair_device_uri(
+            state_dir.path(),
+            &hh_pub,
+            Some("Reissue Test Home"),
+            None,
+            &TEST_M_CERT_FP,
+        )
+        .await
+        .expect("mint");
         assert!(!uri.contains("&host="), "host must be omitted when None: uri={uri}");
         assert!(uri.contains("v=1") && uri.contains("&nonce="), "uri={uri}");
     }

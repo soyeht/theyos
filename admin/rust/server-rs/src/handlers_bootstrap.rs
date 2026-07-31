@@ -1128,6 +1128,28 @@ pub async fn post_pair_device_reissue(
     let ttl = Duration::from_secs(crate::household_bootstrap::pair_window_ttl_secs_from_env(
         "THEYOS_PAIR_DEVICE_TTL_SECS",
     ));
+    // Derive the fingerprint from the already-validated identity cert BEFORE
+    // minting. Minting first and failing after would leave the window open on
+    // a request that returned an error, and every retry would then bounce off
+    // `window_still_open` until the TTL expired — a failure that wedges the
+    // route instead of leaving it untouched.
+    //
+    // The identity exists and was already validated to reach this point, so a
+    // canonical-encode failure is an internal fault, not `identity_unavailable`
+    // — reporting it as unavailability would tell the caller to wait for a
+    // state that has already arrived.
+    let m_cert_fp = match household_rs::machine_cert::fingerprint(&identity.cert) {
+        Ok(fp) => fp,
+        Err(e) => {
+            tracing::error!(stage = "pair_device.reissue.m_cert_fp_failed", error = %e);
+            return cbor_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                BootstrapErrorCode::InternalError.as_str(),
+                None,
+                None,
+            );
+        }
+    };
     let token = match state.pair_device_window.mint_token(ttl, None).await {
         Ok(t) => t,
         Err(e) => {
@@ -1144,6 +1166,7 @@ pub async fn post_pair_device_reissue(
         &identity.record.hh_pub,
         host.as_deref(),
         Some(&identity.record.name),
+        &m_cert_fp,
     );
 
     tracing::info!(
@@ -2139,6 +2162,26 @@ pub async fn post_initialize(
     let name_persisted = loaded.record.name.clone();
     let machine_id = loaded.cert.m_id.to_string();
 
+    // Fingerprint the cert this bootstrap just validated, before any of the
+    // state transitions below. An encode failure here is a fault, not an
+    // absence: the identity exists and was validated, so it cannot be folded
+    // into "no QR this time". Returning early leaves the install inert —
+    // nothing persisted as NamedAwaitingPair, nothing published to shared
+    // state, no window minted — instead of reporting success with a hollow
+    // `pair_qr_uri` and a machine already advanced past bootstrap.
+    let m_cert_fp = match household_rs::machine_cert::fingerprint(&loaded.cert) {
+        Ok(fp) => fp,
+        Err(e) => {
+            tracing::error!(stage = "bootstrap.m_cert_fp_failed", error = %e);
+            return cbor_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                BootstrapErrorCode::InternalError.as_str(),
+                None,
+                None,
+            );
+        }
+    };
+
     // 5. Advance bootstrap state to named_awaiting_pair.
     {
         let mut bs = state.bootstrap.write().await;
@@ -2156,19 +2199,31 @@ pub async fn post_initialize(
         .await;
 
     // 7. Mint pair-device window and build QR URI.
-    let pair_qr_uri = match state
-        .pair_device_window
-        .mint_token(Duration::from_secs(300), None)
-        .await
-    {
-        Ok(token) => match P256PublicKey::from_bytes(&hh_pub_bytes) {
-            Ok(pub_key) => token.to_uri_with_host_and_name(&pub_key, None, Some(&name_persisted)),
-            Err(_) => String::new(),
-        },
-        Err(e) => {
-            tracing::warn!(stage = "bootstrap.mint_token_failed", error = %e);
-            String::new()
+    //
+    // Both inputs are resolved before minting: a QR we could not pin is not
+    // worth opening a window for, and opening one anyway would leave a token
+    // live behind an empty URI.
+    let pair_qr_uri = match P256PublicKey::from_bytes(&hh_pub_bytes) {
+        Ok(pub_key) => {
+            match state
+                .pair_device_window
+                .mint_token(Duration::from_secs(300), None)
+                .await
+            {
+                Ok(token) => token.to_uri_with_host_and_name(
+                    &pub_key,
+                    None,
+                    Some(&name_persisted),
+                    &m_cert_fp,
+                ),
+                Err(e) => {
+                    tracing::warn!(stage = "bootstrap.mint_token_failed", error = %e);
+                    String::new()
+                }
+            }
         }
+        // Pre-existing degradation for a bad household key, unchanged.
+        Err(_) => String::new(),
     };
 
     // u128→u64 truncation impossible in practice (u64 covers ~585 millennia).
@@ -2295,6 +2350,101 @@ fn platform_model_string() -> Option<String> {
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod m_cert_fp_ordering_guard {
+    /// Body of a top-level `pub async fn <name>(` up to the next column-zero
+    /// `}`. Both producers are column-zero items, so this bounds them exactly
+    /// rather than running to EOF.
+    /// Comments are stripped first. Without that the guard measures its own
+    /// prose: a doc comment naming `NamedAwaitingPair` to explain the ordering
+    /// sits above the code it describes, so a plain substring search finds the
+    /// comment and concludes the state transition happens first. The scan has
+    /// to see what the compiler sees.
+    fn fn_body(source: &str, name: &str) -> String {
+        let needle = format!("\npub async fn {name}(");
+        let start = source
+            .find(&needle)
+            .unwrap_or_else(|| panic!("{name} not found — did it get renamed?"))
+            + 1;
+        let rest = &source[start..];
+        let end = rest
+            .find("\n}\n")
+            .unwrap_or_else(|| panic!("{name} has no column-zero close"));
+        rest[..end]
+            .lines()
+            .map(|line| match line.find("//") {
+                Some(at) => &line[..at],
+                None => line,
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// Offset of `needle`, asserting it occurs exactly once.
+    ///
+    /// A guard that takes the first of several matches silently measures
+    /// whichever one happens to come first, which is how an anchor drifts onto
+    /// the wrong statement without anyone noticing.
+    fn unique_offset(body: &str, needle: &str, ctx: &str) -> usize {
+        let count = body.matches(needle).count();
+        assert_eq!(
+            count, 1,
+            "{ctx}: anchor `{needle}` must occur exactly once, found {count}"
+        );
+        body.find(needle).expect("counted above")
+    }
+
+    /// A fingerprint failure must not leave a minted window behind.
+    ///
+    /// There is no natural seam to inject an encode failure through — the
+    /// input is a `MachineCert` the caller already validated — and adding one
+    /// would mean widening the API purely so a test could reach it. So this
+    /// pins the property that actually prevents the wedge: in both producers
+    /// the fingerprint is resolved *before* anything is minted. If someone
+    /// moves `mint_token` back above it, the failure path silently starts
+    /// leaving live windows behind error responses again, and every retry
+    /// bounces off `window_still_open` until the TTL expires.
+    #[test]
+    fn fingerprint_is_resolved_before_any_window_is_minted() {
+        let source = include_str!("handlers_bootstrap.rs");
+
+        for name in ["post_pair_device_reissue", "post_initialize"] {
+            let body = fn_body(source, name);
+            let fp = unique_offset(&body, "machine_cert::fingerprint(", name);
+            let mint = unique_offset(&body, "mint_token(", name);
+            assert!(
+                fp < mint,
+                "{name}: fingerprint must be resolved before mint_token, \
+                 otherwise a fingerprint fault returns an error while leaving \
+                 the window open"
+            );
+        }
+    }
+
+    /// `post_initialize` must also resolve it before it publishes state.
+    ///
+    /// Returning success with a hollow `pair_qr_uri` after the machine has
+    /// already been advanced to `NamedAwaitingPair` and published to shared
+    /// state is the same wedge one level up: the install looks finished and
+    /// cannot be retried into a good state.
+    #[test]
+    fn post_initialize_resolves_fingerprint_before_publishing_state() {
+        let source = include_str!("handlers_bootstrap.rs");
+        let body = fn_body(source, "post_initialize");
+        let fp = unique_offset(&body, "machine_cert::fingerprint(", "post_initialize");
+        // Executable needles, not bare identifiers: `*bs = BootstrapState::…`
+        // is the assignment that actually advances the state, so the anchor
+        // cannot be satisfied by a mention of the name somewhere else.
+        for later in ["*bs = BootstrapState::NamedAwaitingPair;", ".set_loaded("] {
+            let at = unique_offset(&body, later, "post_initialize");
+            assert!(
+                fp < at,
+                "post_initialize: fingerprint must be resolved before `{later}`"
+            );
+        }
+    }
+}
 
 #[cfg(test)]
 mod tests {

@@ -477,12 +477,13 @@ pub(crate) fn owner_cert_fingerprint(
     Ok(Sha256::digest(&bytes).into())
 }
 
+/// Delegates to [`crate::machine_cert::fingerprint`], which is the single
+/// definition. Recomputing it here would let the roster wire and the
+/// pair-device QR drift apart without any test noticing.
 pub(crate) fn machine_cert_fingerprint(
     cert: &crate::machine_cert::MachineCert,
 ) -> Result<[u8; 32], RosterCryptoError> {
-    use sha2::{Digest, Sha256};
-    let bytes = crate::cbor::to_canonical_vec(cert).map_err(|_| RosterCryptoError::CborEncode)?;
-    Ok(Sha256::digest(&bytes).into())
+    crate::machine_cert::fingerprint(cert).map_err(|_| RosterCryptoError::CborEncode)
 }
 
 // ─── Owner cert decode (private) ────────────────────────────────────────────
@@ -2338,6 +2339,23 @@ mod tests {
             },
         )
         .unwrap()
+    }
+
+    /// The roster wire's `machine_cert_fingerprint` and the pair-device QR's
+    /// `m_cert_fp` must be the same bytes for the same cert. Delegation makes
+    /// that true today; this pins it so a future edit that re-inlines the hash
+    /// here — a different domain separator, a different encoding — fails
+    /// loudly instead of shipping two fingerprints that quietly disagree.
+    #[test]
+    fn roster_and_qr_fingerprints_are_the_same_value() {
+        let root_kp = det_kp(&SCALAR_A);
+        let hh = crate::ids::derive_household_id(&root_kp.public());
+        let m_kp = det_kp(&SCALAR_B);
+        let cert = make_machine_cert(&root_kp, &m_kp.public(), &hh);
+        assert_eq!(
+            machine_cert_fingerprint(&cert).expect("roster fingerprint"),
+            crate::machine_cert::fingerprint(&cert).expect("qr fingerprint"),
+        );
     }
 
     fn owner_cert_bytes(cert: &crate::person_cert::PersonCert) -> Vec<u8> {

@@ -88,6 +88,17 @@ pub async fn initiate(State(state): State<PairDeviceState>) -> Response {
     let Some(identity) = state.household.current().await else {
         return StatusCode::NOT_FOUND.into_response();
     };
+    // Fingerprint the cert this identity was actually loaded and validated
+    // with — not a fresh read of `machine_certs/`, which would only prove that
+    // some file decoded. Deriving it here also keeps the failure inert: this
+    // handler is retrieve-only, so nothing has been minted to leak.
+    let m_cert_fp = match household_rs::machine_cert::fingerprint(&identity.cert) {
+        Ok(fp) => fp,
+        Err(e) => {
+            tracing::warn!(stage = "pair_device.initiate.m_cert_fp_failed", error = %e);
+            return StatusCode::NOT_FOUND.into_response();
+        }
+    };
     let Some(token) = state.window.current_token().await else {
         return StatusCode::NOT_FOUND.into_response();
     };
@@ -96,6 +107,7 @@ pub async fn initiate(State(state): State<PairDeviceState>) -> Response {
             &identity.record.hh_pub,
             None,
             Some(&identity.record.name),
+            &m_cert_fp,
         ),
     })
     .into_response()

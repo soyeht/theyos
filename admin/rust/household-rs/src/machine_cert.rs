@@ -410,6 +410,24 @@ pub fn save_self_cert(
     Ok(())
 }
 
+/// SHA-256 over the canonical CBOR encoding of `cert`.
+///
+/// **The** definition. The roster wire's `machine_cert_fingerprint` /
+/// `signer_machine_cert_fingerprint` and the pair-device QR's `m_cert_fp` are
+/// all this function's output; `machine_roster_authority::machine_cert_fingerprint`
+/// delegates here rather than recomputing, so the surfaces cannot drift apart
+/// silently.
+///
+/// A canonical-encode failure is returned, never folded into a "no value"
+/// case: callers use absence to mean "this machine has no admitted cert",
+/// and an encoding fault is a different thing that must not borrow that
+/// meaning.
+pub fn fingerprint(cert: &MachineCert) -> Result<[u8; 32], HouseholdError> {
+    use sha2::{Digest, Sha256};
+    let bytes = crate::cbor::to_canonical_vec(cert)?;
+    Ok(Sha256::digest(&bytes).into())
+}
+
 fn validate_hostname(s: &str) -> Result<(), HouseholdError> {
     if s.is_empty() {
         return Err(HouseholdError::InvalidCert("hostname empty".into()));

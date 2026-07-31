@@ -178,17 +178,31 @@ impl PairToken {
     /// MAY skip Bonjour browse and connect directly; when absent the device
     /// MUST discover via Bonjour as before. The field is non-critical so
     /// older scanners ignore it without error.
+    /// `m_cert_fp` is the SHA-256 of the canonical CBOR encoding of **this
+    /// machine's admitted `MachineCert`** — the same value the roster wire
+    /// already carries as `machine_cert_fingerprint`, not a second definition.
+    /// It is announced as critical (`crit=m_cert_fp`) so a scanner that does
+    /// not understand it refuses the QR rather than pairing unpinned.
+    ///
+    /// It is a required argument on every entry point, so a producer that
+    /// cannot name an admitted cert fails to compile rather than silently
+    /// emitting an unpinned QR.
     #[must_use]
-    pub fn to_uri(&self, hh_pub: &P256PublicKey) -> String {
-        self.to_uri_with_host(hh_pub, None)
+    pub fn to_uri(&self, hh_pub: &P256PublicKey, m_cert_fp: &[u8; 32]) -> String {
+        self.to_uri_with_host(hh_pub, None, m_cert_fp)
     }
 
     /// As [`Self::to_uri`] but also includes a `host=<addr>:<port>` fallback
     /// query parameter when `host` is `Some`. See [`Self::to_uri`] for the
     /// rationale.
     #[must_use]
-    pub fn to_uri_with_host(&self, hh_pub: &P256PublicKey, host: Option<&str>) -> String {
-        self.to_uri_with_host_and_name(hh_pub, host, None)
+    pub fn to_uri_with_host(
+        &self,
+        hh_pub: &P256PublicKey,
+        host: Option<&str>,
+        m_cert_fp: &[u8; 32],
+    ) -> String {
+        self.to_uri_with_host_and_name(hh_pub, host, None, m_cert_fp)
     }
 
     /// As [`Self::to_uri_with_host`] but also includes the household display
@@ -200,6 +214,7 @@ impl PairToken {
         hh_pub: &P256PublicKey,
         host: Option<&str>,
         household_name: Option<&str>,
+        m_cert_fp: &[u8; 32],
     ) -> String {
         let mut uri = String::from("soyeht://household/pair-device");
         uri.push_str("?v=1");
@@ -209,6 +224,14 @@ impl PairToken {
         uri.push_str(&self.nonce.as_b64());
         uri.push_str("&ttl=");
         uri.push_str(&self.expires_at_unix.to_string());
+        // `B64` is URL_SAFE_NO_PAD, which is what the client re-encodes with;
+        // a padded or otherwise non-canonical form still decodes to the right
+        // 32 bytes but fails its `reencoded == fpValue` check.
+        uri.push_str("&m_cert_fp=");
+        uri.push_str(&B64.encode(m_cert_fp));
+        // Exactly one `crit`, whose value is exactly this field name. The
+        // client compares the whole value, so a comma list is not accepted.
+        uri.push_str("&crit=m_cert_fp");
         if let Some(p) = &self.p_id_hint {
             uri.push_str("&p_id=");
             uri.push_str(&p.0);
@@ -568,11 +591,15 @@ mod tests {
         P256Keypair::generate().public()
     }
 
+    /// Stand-in for an admitted machine cert fingerprint in tests that are not
+    /// about the fingerprint itself.
+    const FAKE_M_CERT_FP: [u8; 32] = [7u8; 32];
+
     #[tokio::test]
     async fn mint_then_consume() {
         let w = PairDeviceWindow::new();
         let token = w.mint_token(Duration::from_secs(60), None).await.unwrap();
-        let uri = token.to_uri(&fake_hh_pub());
+        let uri = token.to_uri(&fake_hh_pub(), &FAKE_M_CERT_FP);
         assert!(uri.starts_with("soyeht://household/pair-device?"));
         assert!(uri.contains("&hh_pub="));
         assert!(uri.contains("&ttl="));
@@ -584,6 +611,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn every_uri_variant_carries_the_critical_machine_cert_fingerprint() {
+        let fp: [u8; 32] = [
+            0x9a, 0x3f, 0x01, 0xff, 0x10, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa,
+            0xbb, 0xcc, 0xdd, 0xee, 0xff, 0x00, 0x12, 0x34, 0x56, 0x78, 0x9a, 0xbc, 0xde, 0xf0,
+            0x0f, 0x1e, 0x2d, 0x3c,
+        ];
+        let w = PairDeviceWindow::new();
+        let token = w.mint_token(Duration::from_secs(60), None).await.unwrap();
+        let hh = fake_hh_pub();
+
+        // Every entry point, not just the widest one: `to_uri` and
+        // `to_uri_with_host` delegate today, but a future edit could give one
+        // of them its own body and silently drop the critical field.
+        // RFC 5737 documentation address — the same one `PairDeviceQR.swift`
+        // uses in its frozen examples. No real or tailnet address in fixtures.
+        const DOC_HOST: &str = "192.0.2.10:8091";
+        assert_ios_pair_device_qr_contract(&token.to_uri(&hh, &fp), &fp);
+        assert_ios_pair_device_qr_contract(&token.to_uri_with_host(&hh, Some(DOC_HOST), &fp), &fp);
+        assert_ios_pair_device_qr_contract(
+            &token.to_uri_with_host_and_name(&hh, Some(DOC_HOST), Some("Home"), &fp),
+            &fp,
+        );
+    }
+
+    #[tokio::test]
     async fn uri_with_host_and_name_percent_encodes_household_name() {
         let w = PairDeviceWindow::new();
         let token = w.mint_token(Duration::from_secs(60), None).await.unwrap();
@@ -591,9 +643,66 @@ mod tests {
             &fake_hh_pub(),
             Some("100.82.47.115:8091"),
             Some("Sample Home"),
+            &FAKE_M_CERT_FP,
         );
         assert!(uri.contains("&host=100.82.47.115:8091"));
         assert!(uri.contains("&house_name=Sample%20Home"));
+    }
+
+    /// Reject exactly what `PairDeviceQR.swift` on soyeht-ios rejects.
+    ///
+    /// Mirrored from the frozen client, not from our own intuition about what
+    /// "carries a fingerprint" ought to mean:
+    ///
+    /// - `m_cert_fp` present exactly once (`duplicateField` otherwise);
+    /// - `crit` present exactly once with value **exactly** `m_cert_fp` — the
+    ///   client tests `critItems.count == 1 && critItems[0].value ==
+    ///   "m_cert_fp"`, so a comma list that merely *contains* it is refused;
+    /// - the value decodes as base64url to exactly 32 bytes;
+    /// - re-encoding those bytes reproduces the query value byte for byte.
+    ///
+    /// That last one is the silent-failure class: a non-canonical encoding
+    /// still decodes to the right 32 bytes, so every server-side assertion
+    /// about "the fingerprint" passes while the device refuses the QR.
+    fn assert_ios_pair_device_qr_contract(uri: &str, expected_fp: &[u8; 32]) {
+        let query = uri.split_once('?').expect("uri has a query").1;
+        let pairs: Vec<(&str, &str)> = query
+            .split('&')
+            .filter_map(|kv| kv.split_once('='))
+            .collect();
+
+        let fps: Vec<&str> = pairs
+            .iter()
+            .filter(|(k, _)| *k == "m_cert_fp")
+            .map(|(_, v)| *v)
+            .collect();
+        assert_eq!(fps.len(), 1, "m_cert_fp must appear exactly once in {uri}");
+
+        let crits: Vec<&str> = pairs
+            .iter()
+            .filter(|(k, _)| *k == "crit")
+            .map(|(_, v)| *v)
+            .collect();
+        assert_eq!(crits.len(), 1, "crit must appear exactly once in {uri}");
+        assert_eq!(
+            crits[0], "m_cert_fp",
+            "crit must be exactly `m_cert_fp`, not a list containing it"
+        );
+
+        let decoded = B64
+            .decode(fps[0])
+            .expect("m_cert_fp must be base64url-decodable");
+        assert_eq!(decoded.len(), 32, "m_cert_fp must decode to 32 bytes");
+        assert_eq!(
+            decoded.as_slice(),
+            expected_fp.as_slice(),
+            "m_cert_fp must carry the admitted machine cert fingerprint"
+        );
+        assert_eq!(
+            B64.encode(&decoded),
+            fps[0],
+            "m_cert_fp must be canonical base64url — the client re-encodes and compares"
+        );
     }
 
     #[tokio::test]

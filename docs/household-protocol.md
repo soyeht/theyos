@@ -560,7 +560,40 @@ soyeht://household/pair-device?
   &nonce=<base64url>
   &p_id=<base64url>           // optional, hint
   &ttl=<unix seconds>
+  &m_cert_fp=<base64url>      // 32-byte SHA-256 of the canonical CBOR of this
+                              //   machine's admitted MachineCert
+  &crit=m_cert_fp             // exactly once, value exactly `m_cert_fp`
+  &host=<host:port>           // optional Bonjour-fallback hint
+  &house_name=<percent-encoded UTF-8>  // optional display name
 ```
+
+**`m_cert_fp` (added 0.1.25, critical).** The scanning device pins the engine
+it is about to pair with. The value is the *same* fingerprint the roster wire
+carries as `machine_cert_fingerprint` / `signer_machine_cert_fingerprint` —
+`SHA-256(canonical CBOR(MachineCert))` — and there is deliberately one
+definition, not one per surface.
+
+Emission rules, all enforced by `PairDeviceQR` on the scanning device:
+
+- `m_cert_fp` appears **exactly once**; a duplicate is rejected.
+- `crit` appears **exactly once** and its value is **exactly** `m_cert_fp`.
+  It is not a comma-separated list: the client compares the whole value, so
+  `crit=m_cert_fp,other` is refused.
+- The value is base64url **without padding**, decoding to exactly 32 bytes.
+- The encoding must be **canonical**: the client re-encodes the decoded bytes
+  and requires the result to equal the query value byte for byte. A
+  non-canonical form that still decodes to the right 32 bytes is rejected.
+
+The fingerprint is derived from the `MachineCert` the engine already loaded
+and validated, never from a fresh read of `machine_certs/`, and never from a
+candidate identity — a producer that cannot name an admitted cert must refuse
+to render rather than emit an unpinned QR. It is resolved **before** the
+pairing window is minted, so a failure leaves no window open behind an error.
+
+Announcing it as critical is what makes this safe to roll forward: a scanner
+that does not understand `m_cert_fp` refuses the QR instead of pairing
+unpinned. The converse is the rollout constraint — a client older than the
+field also refuses, so emission must not precede client support.
 
 Two flows share this URI shape:
 
