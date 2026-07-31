@@ -2,8 +2,12 @@
 
 use axum::http::{HeaderMap, Method, header};
 use household_rs::caveats::{self, Operation};
+use household_rs::device_admission::{
+    DeviceAdmissionError, DeviceStatus, HouseholdDeviceAdmissionAuthorityV1,
+    owner_person_cert_digest,
+};
 use household_rs::pop::RequestSigningContext;
-use household_rs::{HouseholdAuthState, P256Signature, PersonId};
+use household_rs::{DeviceId, HouseholdAuthState, P256Signature, PersonId};
 use std::sync::Arc;
 use subtle::ConstantTimeEq;
 
@@ -538,4 +542,251 @@ fn log_rejected(err: &AuthError) {
         error.kind = ?err,
         "Soyeht-PoP request rejected"
     );
+}
+
+// ─── D2c-1a: device-delegated roster read ───────────────────────────────────
+
+/// Explicit opt-in header for the delegated path. Its presence — not any
+/// property of the proof — is what selects device-only dispatch.
+pub const DEVICE_ID_HEADER: &str = "soyeht-device-id";
+
+/// A `d_` identifier is `d_` plus exactly 52 lowercase RFC-4648 base32 chars
+/// (BLAKE3-256 over the SEC1 key, unpadded). `DeviceId::is_well_formed` only
+/// checks the prefix, which is too loose to route authority on.
+const DEVICE_ID_BODY_LEN: usize = 52;
+
+/// Who the request is authorized as. Both arms carry the same verified owner
+/// auth state, so a caller reads one shape regardless of dispatch.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RosterReadActor {
+    Owner {
+        person_id: String,
+    },
+    Device {
+        device_id: DeviceId,
+        /// Non-zero admission generation the decision was taken against.
+        generation: u64,
+    },
+}
+
+/// The common authorized reader returned by [`authorize_roster_read`].
+#[derive(Clone)]
+pub struct AuthorizedRosterReader {
+    pub owner_auth: Arc<HouseholdAuthState>,
+    pub actor: RosterReadActor,
+}
+
+/// Wire-facing refusal classes.
+///
+/// Every device-side refusal — malformed id, unknown device, revoked device,
+/// revoked person, cross-binding, wrong signature, caveat denial — collapses
+/// into [`Self::DeviceUnauthenticated`] on purpose. Distinguishing them on the
+/// wire would let an unauthenticated caller enumerate which `d_id`s exist and
+/// what state they are in. The reason class stays in `tracing`.
+#[derive(Debug, thiserror::Error)]
+pub enum RosterReadAuthError {
+    /// The header was absent, so the existing owner path ran and refused. Its
+    /// semantics are passed through unchanged.
+    #[error("owner authorization refused: {0}")]
+    Owner(#[from] AuthError),
+    /// The delegated path refused. Deliberately one class.
+    #[error("unauthenticated")]
+    DeviceUnauthenticated,
+    /// The household identity, owner auth, or the durable device-admission
+    /// authority is absent. Distinct from a refusal so the later handler can
+    /// answer "not initialized / temporarily unavailable" rather than 401.
+    #[error("device admission authority unavailable")]
+    AuthorityUnavailable,
+}
+
+/// Authorize a roster-read sibling as **either** the owner **or** an admitted
+/// device, chosen solely by the presence of `Soyeht-Device-Id`.
+///
+/// Header absent: delegates to [`authorize_request`] untouched — same `PoP`
+/// bytes, same semantics, same caveat check.
+///
+/// Header present: device-only. There is **no** owner fallback on any device
+/// failure. A malformed, unknown, revoked or wrongly-signed device id must not
+/// silently succeed as the owner just because the owner's key also signed the
+/// request; that would turn an explicit delegation into an escalation.
+///
+/// The `Soyeht-PoP` header itself is unchanged (`v1:<p_id>:<ts>:<sig>`): the
+/// `p_id` slot still carries the *parent person*, and only the verifying key
+/// changes — `entry.d_pub` instead of `p_pub`. iOS needs no signing change.
+///
+/// `live_snapshot` does blocking file I/O, so it runs inside `spawn_blocking`;
+/// no lock is held across an await and none is held while a body is produced.
+// Deliberately mirrors `authorize_request_with_actor`'s parameter list so the
+// two dispatch arms read identically at the call site, plus the one datum the
+// delegated path genuinely needs (`state_dir`, to rehydrate the authority).
+// Bundling them into a struct would hide that parallel for no safety gain.
+#[allow(clippy::too_many_arguments)]
+pub async fn authorize_roster_read(
+    state: &HouseholdState,
+    state_dir: &std::path::Path,
+    headers: &HeaderMap,
+    method: &Method,
+    path_and_query: &str,
+    body: &[u8],
+    operation: Operation,
+    now: u64,
+) -> Result<AuthorizedRosterReader, RosterReadAuthError> {
+    let Some(raw_device_id) = headers.get(DEVICE_ID_HEADER) else {
+        let authorized = authorize_request_with_actor(
+            state,
+            headers,
+            method,
+            path_and_query,
+            body,
+            operation,
+            now,
+        )
+        .await?;
+        return Ok(AuthorizedRosterReader {
+            owner_auth: authorized.owner_auth,
+            actor: RosterReadActor::Owner {
+                person_id: authorized.actor_person_id,
+            },
+        });
+    };
+
+    // From here the request is device-only. Every failure below is terminal.
+    let device_id = raw_device_id
+        .to_str()
+        .ok()
+        .and_then(parse_strict_device_id)
+        .ok_or_else(|| device_rejected("device_id_malformed"))?;
+
+    let pop = SoyehtPoP::parse(headers).map_err(|_| device_rejected("pop_malformed"))?;
+    if now.abs_diff(pop.timestamp) > TIMESTAMP_TOLERANCE_SECS {
+        return Err(device_rejected("timestamp"));
+    }
+
+    let identity = state
+        .current()
+        .await
+        .ok_or_else(|| authority_unavailable("identity_unavailable"))?;
+    let owner_auth = state
+        .current_owner_auth()
+        .await
+        .ok_or_else(|| authority_unavailable("owner_auth_unavailable"))?;
+    let owner_cert = &owner_auth.owner_person_cert;
+
+    // The owner cert must verify against the *live* root and clock before it is
+    // allowed to stand as the device's parent.
+    owner_cert
+        .verify(&identity.record.hh_id, &identity.record.hh_pub, now)
+        .map_err(|_| device_rejected("owner_cert_rejected"))?;
+
+    let snapshot = {
+        let state_dir = state_dir.to_path_buf();
+        let hh_id = identity.record.hh_id.clone();
+        let hh_pub = identity.record.hh_pub.clone();
+        match tokio::task::spawn_blocking(move || {
+            HouseholdDeviceAdmissionAuthorityV1::new(&state_dir, hh_id, hh_pub).live_snapshot()
+        })
+        .await
+        {
+            Ok(Ok(snapshot)) => snapshot,
+            Ok(Err(DeviceAdmissionError::Unavailable)) => {
+                return Err(authority_unavailable("authority_absent"));
+            }
+            Ok(Err(_)) => return Err(device_rejected("authority_read_rejected")),
+            Err(_) => return Err(authority_unavailable("authority_join_failed")),
+        }
+    };
+
+    if snapshot.generation() == 0 {
+        return Err(device_rejected("generation_zero"));
+    }
+    let entry = snapshot
+        .entry(&device_id)
+        .ok_or_else(|| device_rejected("device_not_listed"))?;
+
+    // Authenticate under the device's own admitted key before acting on any
+    // further field. Never `p_pub` — that is the escalation this path forbids.
+    let ctx = RequestSigningContext::new(method.as_str(), path_and_query, pop.timestamp, body);
+    ctx.verify(&entry.d_pub, &pop.signature)
+        .map_err(|_| device_rejected("signature_rejected"))?;
+
+    if entry.status != DeviceStatus::Active {
+        return Err(device_rejected("device_not_active"));
+    }
+    if snapshot.is_person_revoked(&entry.p_id) {
+        return Err(device_rejected("person_revoked"));
+    }
+    // The proof's person slot, the entry's parent, and the live owner cert must
+    // all name one person, bound to the exact cert the authority admitted under.
+    if !bool::from(entry.p_id.0.as_bytes().ct_eq(pop.p_id.as_bytes())) {
+        return Err(device_rejected("pop_person_mismatch"));
+    }
+    if entry.p_id != owner_cert.p_id {
+        return Err(device_rejected("owner_person_mismatch"));
+    }
+    let owner_digest = owner_person_cert_digest(owner_cert)
+        .map_err(|_| device_rejected("owner_cert_digest_failed"))?;
+    if entry.person_cert_digest.0 != owner_digest {
+        return Err(device_rejected("owner_cert_digest_drift"));
+    }
+    if entry.person_not_after.is_some_and(|limit| now >= limit) {
+        return Err(device_rejected("person_limit_expired"));
+    }
+
+    // Effective caveats: the device's own set when it declared one — including
+    // `Some([])`, which grants nothing — otherwise the verified parent's set.
+    let effective = entry
+        .device_caveats
+        .as_deref()
+        .unwrap_or(&owner_cert.caveats);
+    if !caveats::permits(effective, &operation) {
+        return Err(device_rejected("caveat_rejected"));
+    }
+
+    tracing::info!(
+        stage = "household_auth.device.accepted",
+        operation = %operation,
+    );
+    Ok(AuthorizedRosterReader {
+        owner_auth: Arc::clone(&owner_auth),
+        actor: RosterReadActor::Device {
+            device_id,
+            generation: snapshot.generation(),
+        },
+    })
+}
+
+/// Strict `d_` + exactly 52 lowercase base32 characters. Anything else is not a
+/// device identifier and must not reach the authority as a lookup key.
+fn parse_strict_device_id(raw: &str) -> Option<DeviceId> {
+    let body = raw.strip_prefix("d_")?;
+    if body.len() != DEVICE_ID_BODY_LEN {
+        return None;
+    }
+    if !body
+        .bytes()
+        .all(|b| b.is_ascii_lowercase() || (b'2'..=b'7').contains(&b))
+    {
+        return None;
+    }
+    Some(DeviceId(raw.to_string()))
+}
+
+/// Log the reason *class* only. No `d_id`, `p_id`, key, path, or body ever
+/// reaches a log line from this path.
+fn device_rejected(reason: &'static str) -> RosterReadAuthError {
+    tracing::warn!(
+        stage = "household_auth.device.rejected",
+        reason,
+        "delegated device request rejected"
+    );
+    RosterReadAuthError::DeviceUnauthenticated
+}
+
+fn authority_unavailable(reason: &'static str) -> RosterReadAuthError {
+    tracing::warn!(
+        stage = "household_auth.device.unavailable",
+        reason,
+        "device admission authority unavailable"
+    );
+    RosterReadAuthError::AuthorityUnavailable
 }

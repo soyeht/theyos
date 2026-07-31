@@ -99,6 +99,7 @@ gethostname   = "0.5"
 if-addrs      = "0.10"
 hex           = "0.4"
 percent-encoding = "2"
+fs2           = "0.4"
 webauthn-rs = { version = "0.5.5", default-features = false, features = ["danger-credential-internals"] }
 webauthn-rs-core = { version = "0.5.5" }
 rustls-webpki = { version = "0.103.10", features = ["ring"] }
