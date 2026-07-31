@@ -1,6 +1,6 @@
 [package]
 name = "jobs-rs"
-version = "0.1.24"
+version = "0.1.25"
 edition.workspace = true
 rust-version.workspace = true
 description = "Rust implementation of the theyOS jobs/store — SQLite WAL replacing JSON+flock"

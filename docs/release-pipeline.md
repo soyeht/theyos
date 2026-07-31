@@ -64,11 +64,46 @@ version** (the workflow asserts this and fails fast on mismatch). Use
 the existing helper:
 
 ```sh
-# Bumps every admin/rust/*/Cargo.toml + refreshes Cargo.lock
+# Bumps every release-versioned admin/rust/*/Cargo.toml + refreshes Cargo.lock
 bash /tmp/phase-c-version-bump.sh   # if still around from prior release;
-                                    # otherwise sed all 18 files manually.
+                                    # otherwise bump them by hand — see below.
 cargo build -p server-rs --release
 ```
+
+**What to bump.** Three things, and missing any one of them fails CI:
+
+1. the repo-root `VERSION` file;
+2. every *release-versioned* `admin/rust/*/Cargo.toml`;
+3. `Cargo.lock`, refreshed from those manifests.
+
+The root `VERSION` is easy to forget because it is not a manifest and does not
+live under `admin/rust`. `core-rs`'s
+`manifest::tests::root_version_matches_workspace_crate_version` asserts it
+equals the workspace crate version, so omitting it turns
+`Build & Test (Rust)` red — a required check.
+
+Not all workspace members are on the release train. Bump exactly those already
+carrying the *current* release version, and leave the rest alone:
+
+```sh
+cat VERSION                                     # must move too
+cd admin/rust
+grep -l '^version = "<current>"' */Cargo.toml   # the set to bump
+grep -l '^version = "0.1.0"'     */Cargo.toml   # never touched by a release
+```
+
+Derive the set each time rather than trusting a remembered count — crates get
+added and removed, and a hardcoded number silently goes stale. (This line used
+to say "18 files"; it was 19 by the 0.1.25 release, and the stale number had
+survived at least one release unnoticed.)
+
+Prove the bump by counting rather than reading: zero manifests left at the old
+version, the expected number at the new one, the `0.1.0` set byte-identical to
+what it was before, and the root `VERSION` matching. In `Cargo.lock`, expect
+one version entry per bumped crate — which is one `-old` / `+new` *pair* per
+crate in the diff, so twice that many changed lines — and no other package
+touched. Beware a total that merely looks close: an unrelated dependency can
+sit at the same version by coincidence, so count the diff, not the file.
 
 Land the version bump as a tiny PR on `main` ahead of tagging.
 
