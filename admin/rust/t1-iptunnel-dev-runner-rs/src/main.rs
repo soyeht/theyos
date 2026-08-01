@@ -2147,6 +2147,7 @@ mod tests {
         use server_rs::claw_share_rendezvous_stream_relay_listener::{
             RendezvousStreamRelayListenerConfig, serve_rendezvous_stream_relay,
         };
+        use server_rs::claw_share_session_clock::AdmissionInstant;
         use server_rs::claw_vpn_dev_config::ClawVpnDevConfig;
         use server_rs::claw_vpn_interface_route_plan::{
             ClawVpnInterfaceName, ClawVpnInterfaceRoutePlatform, ClawVpnInterfaceRouteToolPaths,
@@ -2310,14 +2311,21 @@ mod tests {
                     RelayStreamIpTunnelUnavailableRouter,
                     RelayStreamIpTunnelUnavailableRouter,
                     claw_router,
-                    || NOW,
+                    || Some(NOW),
                 );
+                // The fixed synthetic clock is usable by construction, so the seam
+                // returns `Some`. Pairing goes through the public production-ordered
+                // `capture_with`, which anchors BEFORE reading the wall; the
+                // late-anchor `from_seam_wall` seam is `cfg(test)` inside server-rs
+                // and is deliberately not reachable from this crate.
+                let admission =
+                    AdmissionInstant::capture_with(|| Some(NOW)).expect("plausible test clock");
                 let claw_task = tokio::spawn(async move {
                     serve_relay_stream_responder_reverse_connect_binding(
                         reverse_config(relay_addr),
                         &binding,
                         &params,
-                        NOW,
+                        admission,
                     )
                     .await
                 });

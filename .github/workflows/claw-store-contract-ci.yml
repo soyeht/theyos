@@ -42,14 +42,20 @@ jobs:
         with:
           workspaces: "admin/rust -> target"
 
+      # `admin/rust/rust-toolchain.toml` pins 1.92.0, but rustup discovers it from
+      # the CWD, not from `--manifest-path`. Run from the repo root and these three
+      # contract tests silently land on whatever `dtolnay/rust-toolchain@stable`
+      # installed instead of the pin. `cd admin/rust &&` puts the pin back in
+      # scope, matching backend-ci.yml and owner-present-phase0-compileout.yml's
+      # `working-directory: admin/rust`.
       - name: Claw Store route contract
-        run: cargo test -p server-rs --test claw_store_route_contract --manifest-path admin/rust/Cargo.toml
+        run: cd admin/rust && cargo test -p server-rs --test claw_store_route_contract
 
       - name: Claw Store wire contract
-        run: cargo test -p server-rs --test claw_store_wire_contract --manifest-path admin/rust/Cargo.toml
+        run: cd admin/rust && cargo test -p server-rs --test claw_store_wire_contract
 
       - name: Household docs projection
-        run: cargo test -p server-rs --test household_contract_cross_check --manifest-path admin/rust/Cargo.toml
+        run: cd admin/rust && cargo test -p server-rs --test household_contract_cross_check
 
   phase0-authority-pin-regression:
     name: Phase 0 authority pin regression

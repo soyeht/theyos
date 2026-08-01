@@ -78,6 +78,49 @@ jobs:
           workspaces: "admin/rust -> target"
       - name: Clippy (deny warnings)
         run: cd admin/rust && cargo clippy --workspace -- -D warnings 2>&1
+      - name: Clippy (dev datapath feature, all targets)
+        # The workspace clippy above compiles neither this crate's TEST target nor
+        # anything behind `dev_t1_datapath`, and no other job enables that feature.
+        # A caller left broken by the #406 admission-API change therefore reached
+        # main invisibly: the bin test still passed `u64` where the callee now takes
+        # `Option<u64>` and `AdmissionInstant`. This step is the missing coverage.
+        # Proven non-vacuous: this exact command exits 101 at 274f7cf5 and 0 once the
+        # caller is repaired. The test it protects is feature-gated only, with no
+        # target_os gate, so it is real coverage on both runners.
+        run: cd admin/rust && cargo clippy -p t1-iptunnel-dev-runner-rs --all-targets --features dev_t1_datapath --locked -- -D warnings 2>&1
+      - name: Feature surface compiles (all targets)
+        # Closes the CLASS the step above closes one instance of. No job passes
+        # `--all-targets`, and no job enables a non-default feature except
+        # `uniffi`, so every (package, feature) pair is a place a caller can rot
+        # invisibly exactly as the #406 admission-API change did.
+        #
+        # The pair list is DERIVED from `cargo metadata`, never hand-written: a
+        # hand-built list starts wrong (hand-parsing the `[features]` sections
+        # misses `claw-share-bridge-rs/uniffi` and `server-rs/dev_t1_datapath`)
+        # and rots the moment a feature is added. This one cannot fall behind.
+        #
+        # Compile-only on purpose. `cargo clippy --all-targets -- -D warnings`
+        # exits 101 across core-rs/server-rs/vmrunner-rs/e2e-rs on DEFAULT
+        # features today: pre-existing lints in TEST code that CI has never
+        # linted because it never passes `--all-targets`. The variable is
+        # `--all-targets`, not the feature. Linting here would red on day one
+        # for reasons unrelated to the defect; that debt is filed separately.
+        #
+        # Debug profile on purpose: server-rs/src/main.rs carries a
+        # `not(debug_assertions)` compile_error! refusing DEV features in
+        # release, so debug exercises the surface without touching that guard.
+        run: |
+          cd admin/rust
+          cargo metadata --no-deps --format-version 1 \
+            | jq -r '.packages[] | . as $p | ($p.features|keys[]) | select(.!="default") | "\($p.name)\t\(.)"' \
+            | sort >/tmp/feature-surface.tsv
+          rc=0
+          while IFS=$'\t' read -r pkg feat; do
+            echo "::group::check ${pkg} --features ${feat}"
+            cargo check --locked -p "${pkg}" --all-targets --features "${feat}" || { echo "::error::${pkg} fails to compile with --features ${feat}"; rc=1; }
+            echo "::endgroup::"
+          done </tmp/feature-surface.tsv
+          exit $rc
       - name: Build workspace
         run: cd admin/rust && cargo build --workspace 2>&1
       - name: Run tests (serialised)
@@ -109,6 +152,49 @@ jobs:
           workspaces: "admin/rust -> target"
       - name: Clippy (deny warnings)
         run: cd admin/rust && cargo clippy --workspace -- -D warnings 2>&1
+      - name: Clippy (dev datapath feature, all targets)
+        # The workspace clippy above compiles neither this crate's TEST target nor
+        # anything behind `dev_t1_datapath`, and no other job enables that feature.
+        # A caller left broken by the #406 admission-API change therefore reached
+        # main invisibly: the bin test still passed `u64` where the callee now takes
+        # `Option<u64>` and `AdmissionInstant`. This step is the missing coverage.
+        # Proven non-vacuous: this exact command exits 101 at 274f7cf5 and 0 once the
+        # caller is repaired. The test it protects is feature-gated only, with no
+        # target_os gate, so it is real coverage on both runners.
+        run: cd admin/rust && cargo clippy -p t1-iptunnel-dev-runner-rs --all-targets --features dev_t1_datapath --locked -- -D warnings 2>&1
+      - name: Feature surface compiles (all targets)
+        # Closes the CLASS the step above closes one instance of. No job passes
+        # `--all-targets`, and no job enables a non-default feature except
+        # `uniffi`, so every (package, feature) pair is a place a caller can rot
+        # invisibly exactly as the #406 admission-API change did.
+        #
+        # The pair list is DERIVED from `cargo metadata`, never hand-written: a
+        # hand-built list starts wrong (hand-parsing the `[features]` sections
+        # misses `claw-share-bridge-rs/uniffi` and `server-rs/dev_t1_datapath`)
+        # and rots the moment a feature is added. This one cannot fall behind.
+        #
+        # Compile-only on purpose. `cargo clippy --all-targets -- -D warnings`
+        # exits 101 across core-rs/server-rs/vmrunner-rs/e2e-rs on DEFAULT
+        # features today: pre-existing lints in TEST code that CI has never
+        # linted because it never passes `--all-targets`. The variable is
+        # `--all-targets`, not the feature. Linting here would red on day one
+        # for reasons unrelated to the defect; that debt is filed separately.
+        #
+        # Debug profile on purpose: server-rs/src/main.rs carries a
+        # `not(debug_assertions)` compile_error! refusing DEV features in
+        # release, so debug exercises the surface without touching that guard.
+        run: |
+          cd admin/rust
+          cargo metadata --no-deps --format-version 1 \
+            | jq -r '.packages[] | . as $p | ($p.features|keys[]) | select(.!="default") | "\($p.name)\t\(.)"' \
+            | sort >/tmp/feature-surface.tsv
+          rc=0
+          while IFS=$'\t' read -r pkg feat; do
+            echo "::group::check ${pkg} --features ${feat}"
+            cargo check --locked -p "${pkg}" --all-targets --features "${feat}" || { echo "::error::${pkg} fails to compile with --features ${feat}"; rc=1; }
+            echo "::endgroup::"
+          done </tmp/feature-surface.tsv
+          exit $rc
       - name: Build workspace
         run: cd admin/rust && cargo build --workspace 2>&1
       - name: Run tests (serialised)
