@@ -1331,11 +1331,8 @@ fn owner_site_resolution_key(
 impl OwnerSitePromotionLinearizer {
     /// Open the linearizer over the durable resolution store. No authority is
     /// observed yet; in production nothing ever populates it.
-    pub(crate) fn open(
-        state_dir: &std::path::Path,
-    ) -> Result<Self, OwnerSitePromotionRejection> {
-        let store =
-            crate::owner_site_resolution_store::OwnerSiteResolutionStore::open(state_dir)?;
+    pub(crate) fn open(state_dir: &std::path::Path) -> Result<Self, OwnerSitePromotionRejection> {
+        let store = crate::owner_site_resolution_store::OwnerSiteResolutionStore::open(state_dir)?;
         Ok(Self {
             inner: std::sync::Mutex::new(OwnerSitePromotionLinearizerInner {
                 store,
@@ -1436,7 +1433,8 @@ impl OwnerSitePromotionLinearizer {
             pending_finished.roster_digest,
         );
         if pending_finished.cancellation_generation != authority.cancellation_generation
-            || watermark.is_some_and(|(_, cancel)| cancel > pending_finished.cancellation_generation)
+            || watermark
+                .is_some_and(|(_, cancel)| cancel > pending_finished.cancellation_generation)
         {
             return Err(OwnerSitePromotionRejection::Recheck(
                 OwnerSiteRecheck::CancellationFence,
@@ -2242,25 +2240,34 @@ mod tests {
                 observed_at,
             )
             .expect("observe authority");
-        let input = linearizer.register_pending(pending).expect("register pending");
+        let input = linearizer
+            .register_pending(pending)
+            .expect("register pending");
         linearizer.authorize(input)
     }
 
     #[test]
     fn fatia2_happy_path_promotes_and_yields_witness() {
         let result = run_promotion(9, [0x24; 32], 11, 13, None, 1_001);
-        assert!(matches!(result, Ok(_)), "happy path must promote: {result:?}");
+        assert!(
+            matches!(result, Ok(_)),
+            "happy path must promote: {result:?}"
+        );
     }
 
     #[test]
     fn fatia2_recheck_authority_exact_negative() {
         assert!(matches!(
             run_promotion(10, [0x24; 32], 11, 13, None, 1_001),
-            Err(OwnerSitePromotionRejection::Recheck(OwnerSiteRecheck::AuthorityExact))
+            Err(OwnerSitePromotionRejection::Recheck(
+                OwnerSiteRecheck::AuthorityExact
+            ))
         ));
         assert!(matches!(
             run_promotion(9, [0x99; 32], 11, 13, None, 1_001),
-            Err(OwnerSitePromotionRejection::Recheck(OwnerSiteRecheck::AuthorityExact))
+            Err(OwnerSitePromotionRejection::Recheck(
+                OwnerSiteRecheck::AuthorityExact
+            ))
         ));
     }
 
@@ -2268,7 +2275,9 @@ mod tests {
     fn fatia2_recheck_cancellation_fence_negative() {
         assert!(matches!(
             run_promotion(9, [0x24; 32], 11, 14, None, 1_001),
-            Err(OwnerSitePromotionRejection::Recheck(OwnerSiteRecheck::CancellationFence))
+            Err(OwnerSitePromotionRejection::Recheck(
+                OwnerSiteRecheck::CancellationFence
+            ))
         ));
     }
 
@@ -2276,7 +2285,9 @@ mod tests {
     fn fatia2_recheck_provider_generation_negative() {
         assert!(matches!(
             run_promotion(9, [0x24; 32], 12, 13, None, 1_001),
-            Err(OwnerSitePromotionRejection::Recheck(OwnerSiteRecheck::ProviderGeneration))
+            Err(OwnerSitePromotionRejection::Recheck(
+                OwnerSiteRecheck::ProviderGeneration
+            ))
         ));
     }
 
@@ -2284,7 +2295,9 @@ mod tests {
     fn fatia2_recheck_freshness_negative() {
         assert!(matches!(
             run_promotion(9, [0x24; 32], 11, 13, None, 1_060),
-            Err(OwnerSitePromotionRejection::Recheck(OwnerSiteRecheck::Freshness))
+            Err(OwnerSitePromotionRejection::Recheck(
+                OwnerSiteRecheck::Freshness
+            ))
         ));
     }
 
@@ -2293,14 +2306,18 @@ mod tests {
         let wrong_root = *P256Keypair::generate().public().as_bytes();
         assert!(matches!(
             run_promotion(9, [0x24; 32], 11, 13, Some(wrong_root), 1_001),
-            Err(OwnerSitePromotionRejection::Recheck(OwnerSiteRecheck::AuthenticatedIdentity))
+            Err(OwnerSitePromotionRejection::Recheck(
+                OwnerSiteRecheck::AuthenticatedIdentity
+            ))
         ));
     }
 
     #[test]
     fn fatia2_authorize_without_observed_authority_fails_closed() {
         let (_dir, linearizer, pending, _household, _root) = linearizer_fixture();
-        let input = linearizer.register_pending(pending).expect("register pending");
+        let input = linearizer
+            .register_pending(pending)
+            .expect("register pending");
         assert!(matches!(
             linearizer.authorize(input),
             Err(OwnerSitePromotionRejection::NoLiveAuthority)
@@ -2313,11 +2330,16 @@ mod tests {
         linearizer
             .observe_authority_for_harness(&household, 9, [0x24; 32], 11, 13, root, 1_001)
             .expect("observe authority");
-        let input = linearizer.register_pending(pending).expect("register pending");
+        let input = linearizer
+            .register_pending(pending)
+            .expect("register pending");
         let request = crate::owner_site_promotion::OwnerSitePromotionRequest(input);
         let result =
             crate::owner_site_promotion::OwnerSitePromotionBoundary::promote(&linearizer, request);
-        assert!(matches!(result, Ok(_)), "promote must yield a channel: {result:?}");
+        assert!(
+            matches!(result, Ok(_)),
+            "promote must yield a channel: {result:?}"
+        );
     }
 
     #[test]
@@ -2326,14 +2348,18 @@ mod tests {
         linearizer
             .observe_authority_for_harness(&household, 9, [0x24; 32], 11, 13, root, 1_001)
             .expect("observe authority");
-        let input = linearizer.register_pending(pending).expect("register pending");
+        let input = linearizer
+            .register_pending(pending)
+            .expect("register pending");
         let request = crate::owner_site_promotion::OwnerSitePromotionRequest(input);
         let channel =
             crate::owner_site_promotion::OwnerSitePromotionBoundary::promote(&linearizer, request)
                 .expect("promote");
         // Revoke follows the §9 order (persist advance -> Revoking -> release ->
         // empty drain -> confirm Closed) and consumes the channel by ownership.
-        linearizer.revoke(channel, 14).expect("revoke closes the channel");
+        linearizer
+            .revoke(channel, 14)
+            .expect("revoke closes the channel");
     }
 
     #[test]
@@ -2381,7 +2407,9 @@ mod tests {
         // A live `Pending` record exists (recheck 5 passes), but the input's
         // claim does not belong to the key. Recheck (7)'s store `promote` CAS
         // rejects it as OneShotClaim, with no witness and no state change.
-        let mut input = linearizer.register_pending(pending).expect("register pending");
+        let mut input = linearizer
+            .register_pending(pending)
+            .expect("register pending");
         let registered_claim = *input.claim.as_bytes();
         input.claim = OwnerSitePromotionClaimId([0xEE; 32]);
         assert_ne!(

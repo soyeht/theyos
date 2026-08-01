@@ -296,8 +296,9 @@ async fn emit_fresh_pair_device_window(
     // LAN-first: prefer an RFC1918 address (works with Tailscale OFF), then
     // fall back to the Tailnet IPv4.
     let port = crate::household_bootstrap::household_port_from_env();
-    let host_fallback = pick_addr_for_transport(JoinTransport::Lan, port)
-        .or_else(|| crate::tailnet_address::current_tailnet_ipv4().map(|ip| format!("{ip}:{port}")));
+    let host_fallback = pick_addr_for_transport(JoinTransport::Lan, port).or_else(|| {
+        crate::tailnet_address::current_tailnet_ipv4().map(|ip| format!("{ip}:{port}"))
+    });
 
     let (uri, expires_at_unix) = match mint_pair_device_uri(
         state_dir,
@@ -824,7 +825,10 @@ mod tests {
         .await
         .expect("mint");
 
-        assert!(uri.starts_with("soyeht://household/pair-device?"), "uri={uri}");
+        assert!(
+            uri.starts_with("soyeht://household/pair-device?"),
+            "uri={uri}"
+        );
         assert!(uri.contains("v=1"), "uri={uri}");
         assert!(uri.contains("&hh_pub="), "uri={uri}");
         assert!(uri.contains("&nonce="), "uri={uri}");
@@ -858,7 +862,10 @@ mod tests {
         )
         .await
         .expect("mint");
-        assert!(!uri.contains("&host="), "host must be omitted when None: uri={uri}");
+        assert!(
+            !uri.contains("&host="),
+            "host must be omitted when None: uri={uri}"
+        );
         assert!(uri.contains("v=1") && uri.contains("&nonce="), "uri={uri}");
     }
 }

@@ -22,8 +22,8 @@ use crate::claw_vpn_packet_pump::{
     ClawVpnPacketPumpProductionDriverBudget, ClawVpnPacketPumpSystemClock, ClawVpnPacketRelay,
 };
 use crate::claw_vpn_pollable_pump::{
-    ClawVpnPollablePacketInterface, ClawVpnPollablePacketRelay, ClawVpnPollablePump,
-    ClawVpnPollablePumpBudget,
+    ClawVpnPollablePacketInterface, ClawVpnPollablePacketRelay, ClawVpnPollablePumpBudget,
+    new_claw_vpn_pollable_pump,
 };
 use crate::claw_vpn_runtime::{
     ClawVpnPollableRuntime, ClawVpnPollableRuntimeError, ClawVpnPollableRuntimeReport,
@@ -337,7 +337,7 @@ where
         addrs,
         route_side,
     );
-    let pollable_pump = ClawVpnPollablePump::new(session_core);
+    let pollable_pump = new_claw_vpn_pollable_pump(session_core);
     let runtime =
         ClawVpnPollableRuntime::new(route_plan, pollable_pump, config.pollable_pump_budget());
     let route_executor = ClawVpnInterfaceRouteExecutor::new(inputs.route_tool_paths);
@@ -422,7 +422,7 @@ where
         addrs,
         route_side,
     );
-    let pollable_pump = ClawVpnPollablePump::new(session_core);
+    let pollable_pump = new_claw_vpn_pollable_pump(session_core);
     let runtime =
         ClawVpnPollableRuntime::new(route_plan, pollable_pump, config.pollable_pump_budget());
     let route_executor = ClawVpnInterfaceRouteExecutor::new(inputs.route_tool_paths);

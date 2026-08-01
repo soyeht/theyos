@@ -139,12 +139,15 @@ async fn refresh_loop(
         // the flag here — before the refresh — would let a failing refresh serve
         // the last-good context again as soon as the clock came back, which is
         // the fail-open this flag exists to prevent.
-        match runtime.refresh_now(&household, mesh_log.as_ref(), now).await {
+        match runtime
+            .refresh_now(&household, mesh_log.as_ref(), now)
+            .await
+        {
             Ok(()) => runtime.clear_clock_unusable(),
             Err(error) => {
-            // A failed refresh keeps the last-good context; the runtime's health
-            // policy alone decides when to stop serving. Never permissive, never
-            // fatal to the driver: log a debug-safe reason and keep running.
+                // A failed refresh keeps the last-good context; the runtime's health
+                // policy alone decides when to stop serving. Never permissive, never
+                // fatal to the driver: log a debug-safe reason and keep running.
                 tracing::debug!(
                     stage = "claw_share.relay_stream.trust_refresh.failed",
                     error = %error,
@@ -167,8 +170,8 @@ pub enum RelayStreamTrustRefreshConfigError {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::AtomicBool;
     use super::*;
+    use std::sync::atomic::AtomicBool;
 
     use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 

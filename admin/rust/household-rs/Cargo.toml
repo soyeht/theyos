@@ -38,6 +38,10 @@ base64        = { workspace = true }
 core-rs       = { workspace = true }
 keystore-rs   = { workspace = true }
 store-rs      = { workspace = true }
+# S0: the neutral wire mechanics moved out of this crate so the boundary is a
+# dependency edge `cargo check` enforces, not a grep. The edge runs THIS way
+# only — product depends on neutral, never the reverse.
+tunnel-wire-rs = { workspace = true }
 ureq          = { workspace = true }
 webauthn-rs  = { workspace = true }
 webauthn-rs-core = { workspace = true }

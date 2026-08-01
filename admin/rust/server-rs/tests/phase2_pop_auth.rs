@@ -174,7 +174,12 @@ async fn shared_listener_router_still_requires_owner_pop_for_snapshot() {
 /// Build a router serving `/api/v1/household/machines` plus the persisted
 /// household state on disk (the `TempDir` is returned so its lifetime spans the
 /// test — the handler reads `machine_certs/<m_id>.cbor` from it).
-fn machines_fixture() -> (Router, P256Keypair, tempfile::TempDir, household_rs::LoadedIdentity) {
+fn machines_fixture() -> (
+    Router,
+    P256Keypair,
+    tempfile::TempDir,
+    household_rs::LoadedIdentity,
+) {
     let td = tempfile::tempdir().unwrap();
     let identity = household_rs::bootstrap_or_load(
         td.path(),
@@ -246,8 +251,9 @@ async fn machines_owner_auth_ok_returns_self_machine() {
     assert_eq!(json["v"], 1);
     assert_eq!(json["hh_id"], identity.record.hh_id.to_string());
 
-    let expected_self =
-        household_rs::storage::read_self_m_id(td.path()).unwrap().unwrap();
+    let expected_self = household_rs::storage::read_self_m_id(td.path())
+        .unwrap()
+        .unwrap();
     assert_eq!(expected_self, identity.cert.m_id.to_string());
     assert_eq!(json["self_m_id"], expected_self);
 

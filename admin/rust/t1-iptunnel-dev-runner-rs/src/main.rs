@@ -1047,16 +1047,28 @@ mod dev_datapath {
                         TunnelFrame::Health(_) | TunnelFrame::Open => {
                             bail!("dev datapath peer sent unexpected control frame");
                         }
-                        TunnelFrame::NetworkSettings(settings) => {
+                        TunnelFrame::NetworkSettings(sealed) => {
                             // IpTunnel path: the server delivers the guest's VPN
                             // interface here (once, right after the Open-ack). This
                             // dev runner installs no real interface, but it MUST
                             // consume the frame (never a silent noop) and enforce the
                             // client-side route-scope invariant, mirroring the iOS
                             // client: a default route (prefix 0) is rejected fail-closed.
-                            if settings.mesh_ipv4.prefix_len == 0 {
+                            //
+                            // S0: the body is sealed, so it is read through the one
+                            // strict door. Route scope is now checked with the neutral
+                            // rule that travels with the type rather than by an
+                            // open-coded `prefix_len == 0`, so this consumer also
+                            // rejects a peer outside the prefix and a peer equal to
+                            // addr — strictly more than it caught before.
+                            let settings =
+                                household_rs::claw_share_data_tunnel::decode_network_settings_body(
+                                    &sealed,
+                                )
+                                .map_err(|_| anyhow!("dev datapath received a malformed NetworkSettings body"))?;
+                            if let Some(violation) = settings.mesh_ipv4.route_scope_violation() {
                                 bail!(
-                                    "dev datapath received a default-route (prefix 0) NetworkSettings"
+                                    "dev datapath received NetworkSettings violating route scope: {violation}"
                                 );
                             }
                             // Follow the module's address-redaction discipline: log
@@ -1082,7 +1094,9 @@ mod dev_datapath {
             &ValidatedDevRunnerSessionConfig,
             ClawVpnRuntimeWiringContext,
             ClawVpnPollableTargetSessionRelay,
-        ) -> io::Result<ClawVpnRuntimeWiringInputs<I, ClawVpnPollableTargetSessionRelay>>,
+        ) -> io::Result<
+            ClawVpnRuntimeWiringInputs<I, ClawVpnPollableTargetSessionRelay>,
+        >,
     ) -> Result<()>
     where
         I: ClawVpnPollablePacketInterface + Send + 'static,
@@ -1174,7 +1188,9 @@ mod dev_datapath {
             &ValidatedDevRunnerSessionConfig,
             ClawVpnRuntimeWiringContext,
             ClawVpnPollableTargetSessionRelay,
-        ) -> io::Result<ClawVpnRuntimeWiringInputs<I, ClawVpnPollableTargetSessionRelay>>,
+        ) -> io::Result<
+            ClawVpnRuntimeWiringInputs<I, ClawVpnPollableTargetSessionRelay>,
+        >,
     ) -> Result<()>
     where
         I: ClawVpnPollablePacketInterface + Send + 'static,
@@ -1357,7 +1373,10 @@ mod tests {
     fn hex_roundtrips() {
         let bytes = [0x00u8, 0x02, 0xab, 0xff, 0x10];
         assert_eq!(encode_lower_hex(&bytes), "0002abff10");
-        assert_eq!(decode_lower_hex("0002abff10").expect("valid"), bytes.to_vec());
+        assert_eq!(
+            decode_lower_hex("0002abff10").expect("valid"),
+            bytes.to_vec()
+        );
     }
 
     #[test]
@@ -2128,6 +2147,7 @@ mod tests {
         use household_rs::household_record::HouseholdRecord;
         use household_rs::ids::{derive_household_id, derive_machine_id};
         use household_rs::machine_cert::{MachineCert, Platform, SignOptions};
+        use server_rs::claw_share_relay_stream_abuse::RelayAbuseConfig;
         use server_rs::claw_share_relay_stream_admission::RelayStreamAdmission;
         use server_rs::claw_share_relay_stream_issuer_trust::{
             RelayStreamIssuerTrust, RelayStreamTrustContext,
@@ -2143,7 +2163,6 @@ mod tests {
         use server_rs::claw_share_relay_stream_trust_context_health::{
             RelayStreamTrustContextRefreshPolicy, RelayStreamTrustContextRuntime,
         };
-        use server_rs::claw_share_relay_stream_abuse::RelayAbuseConfig;
         use server_rs::claw_share_rendezvous_stream_relay_listener::{
             RendezvousStreamRelayListenerConfig, serve_rendezvous_stream_relay,
         };
@@ -2155,22 +2174,20 @@ mod tests {
         use server_rs::claw_vpn_packet_pump::ClawVpnPacketPumpProductionDriverBudget;
         use server_rs::claw_vpn_pollable_pump::ClawVpnPollablePacketInterface;
         use server_rs::claw_vpn_runtime::ClawVpnRuntimeStepBudget;
-        use server_rs::claw_vpn_target_session_relay::ClawVpnPollableTargetSessionRelay;
-        use std::os::fd::{AsRawFd, RawFd};
-        use std::os::unix::net::UnixDatagram;
         use server_rs::claw_vpn_t1_relay_stream_router::{
             ClawVpnPollableT1RelayStreamBuildInputs, ClawVpnPollableT1RelayStreamLaunchRuntime,
             ClawVpnPollableT1RelayStreamRouterParts, ClawVpnT1RelayStreamAuditSink,
             assemble_claw_vpn_pollable_t1_relay_stream_router,
         };
+        use server_rs::claw_vpn_target_session_relay::ClawVpnPollableTargetSessionRelay;
         use server_rs::claw_vpn_target_session_router::{
             ClawVpnPollableTargetSessionRouterWiring, ClawVpnTargetSessionRouterLaunchError,
         };
-        use server_rs::claw_vpn_wiring::{
-            ClawVpnRuntimeWiringConfig, ClawVpnRuntimeWiringInputs,
-        };
+        use server_rs::claw_vpn_wiring::{ClawVpnRuntimeWiringConfig, ClawVpnRuntimeWiringInputs};
         use server_rs::household_state::HouseholdState;
         use server_rs::startup_wiring::PerClawVpnT1PreflightEvidence;
+        use std::os::fd::{AsRawFd, RawFd};
+        use std::os::unix::net::UnixDatagram;
         use tokio::net::TcpListener;
         use tokio::task::JoinHandle;
 
@@ -2207,7 +2224,10 @@ mod tests {
                 self.stream.as_raw_fd()
             }
 
-            fn read_packet_nonblocking(&mut self, buf: &mut [u8]) -> std::io::Result<Option<usize>> {
+            fn read_packet_nonblocking(
+                &mut self,
+                buf: &mut [u8],
+            ) -> std::io::Result<Option<usize>> {
                 match self.stream.recv(buf) {
                     Ok(n) => Ok(Some(n)),
                     Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => Ok(None),
@@ -2262,8 +2282,7 @@ mod tests {
                 let mut device_packet_2 = ipv4_packet(addrs.device(), addrs.claw());
                 device_packet_2[4..6].copy_from_slice(&0xA2u16.to_be_bytes());
                 let claw_packet = ipv4_packet(addrs.claw(), addrs.device());
-                let claw_runtime_handles: ClawRuntimeHandles =
-                    Arc::new(Mutex::new(Vec::new()));
+                let claw_runtime_handles: ClawRuntimeHandles = Arc::new(Mutex::new(Vec::new()));
 
                 dev_datapath::validate_dev_datapath_runtime_gates_with_env(
                     &offer,
@@ -2583,7 +2602,7 @@ mod tests {
             runtime_handles: &ClawRuntimeHandles,
         ) -> server_rs::claw_vpn_t1_relay_stream_router::ClawVpnPollableT1RelayStreamBoxedRouter<
             PollableMockInterface,
-        > {
+        >{
             let endpoint = relay_endpoint.to_string();
             let runtime_handles = Arc::clone(runtime_handles);
             let status = assemble_claw_vpn_pollable_t1_relay_stream_router(
@@ -2634,7 +2653,9 @@ mod tests {
             runtime_handles: ClawRuntimeHandles,
         ) -> ClawVpnPollableT1RelayStreamLaunchRuntime<PollableMockInterface> {
             Box::new(
-                move |mut wiring: ClawVpnPollableTargetSessionRouterWiring<PollableMockInterface>| {
+                move |mut wiring: ClawVpnPollableTargetSessionRouterWiring<
+                    PollableMockInterface,
+                >| {
                     let handle = tokio::task::spawn_blocking(move || {
                         wiring
                             .run_until_stopped()
@@ -2699,8 +2720,7 @@ mod tests {
 
         fn true_tool_paths() -> ClawVpnInterfaceRouteToolPaths {
             let path = PathBuf::from("/usr/bin/true");
-            ClawVpnInterfaceRouteToolPaths::try_new(&path, &path, &path)
-                .expect("true tool paths")
+            ClawVpnInterfaceRouteToolPaths::try_new(&path, &path, &path).expect("true tool paths")
         }
 
         fn ipv4_packet(src: Ipv4Addr, dst: Ipv4Addr) -> Vec<u8> {

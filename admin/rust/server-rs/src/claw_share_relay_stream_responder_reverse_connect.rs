@@ -18,7 +18,6 @@ use tokio::time::timeout;
 use crate::claw_share_relay_stream_admission::RelayStreamAdmissionError;
 use crate::claw_share_relay_stream_contract::RelayStreamOfferContract;
 use crate::claw_share_relay_stream_issuer_trust::RelayStreamIssuerTrust;
-use crate::claw_share_session_clock::AdmissionInstant;
 use crate::claw_share_relay_stream_responder::{
     RelayStreamResponderError, ResponderDataTunnelDeps, serve_relay_stream_responder_connection,
 };
@@ -26,6 +25,7 @@ use crate::claw_share_relay_stream_responder_params::RelayStreamResponderParams;
 use crate::claw_share_relay_stream_reverse_connect_binding::RelayStreamReverseConnectBinding;
 use crate::claw_share_relay_stream_target_router::RelayStreamOfferTargetRouter;
 use crate::claw_share_rendezvous_stream_relay::{RendezvousHello, RendezvousRole};
+use crate::claw_share_session_clock::AdmissionInstant;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RelayStreamResponderReverseConnectConfig {
@@ -76,8 +76,8 @@ where
     // Capture the (wall, monotonic) pair ONCE, before dialing. `None` means the
     // wall clock is unusable, and with a broken clock `not_after` can never be
     // enforced — refuse rather than dial fail-open.
-    let admission = capture_admission()
-        .ok_or(RelayStreamResponderReverseConnectError::ClockUnusable)?;
+    let admission =
+        capture_admission().ok_or(RelayStreamResponderReverseConnectError::ClockUnusable)?;
     let now = admission.wall();
     // Health-before-dial: admit before opening the relay connection so an
     // unhealthy trust runtime never dials. The admitted seam is reused for this
@@ -434,7 +434,8 @@ mod tests {
                     &offer,
                     &owner_pub(),
                     &guest_key,
-                    crate::claw_share_session_clock::wall_now_secs("test").expect("plausible clock"),
+                    crate::claw_share_session_clock::wall_now_secs("test")
+                        .expect("plausible clock"),
                 ),
             )
             .await;
@@ -575,7 +576,9 @@ mod tests {
         let runtime = RelayStreamTrustContextRuntime::load(
             &relay_stream_household_state(),
             &MeshLogStore::new(),
-            crate::claw_share_session_clock::wall_now_secs("test").expect("plausible clock").saturating_sub(10_000),
+            crate::claw_share_session_clock::wall_now_secs("test")
+                .expect("plausible clock")
+                .saturating_sub(10_000),
             policy,
         )
         .await

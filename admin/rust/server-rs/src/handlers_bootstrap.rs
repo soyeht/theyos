@@ -2873,9 +2873,7 @@ mod tests {
     }
 
     async fn spawn_ready_echo_server() -> (SocketAddr, tokio::task::JoinHandle<()>) {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
             core_rs::phase0_axum_serve!(
@@ -3137,9 +3135,7 @@ mod tests {
     /// the on-disk owner-auth guard resolve against actual files). The
     /// `tempfile::TempDir` is returned so the caller keeps it alive for the
     /// duration of the test.
-    fn make_state_with_identity(
-        bs: BootstrapState,
-    ) -> (BootstrapHandlerState, tempfile::TempDir) {
+    fn make_state_with_identity(bs: BootstrapState) -> (BootstrapHandlerState, tempfile::TempDir) {
         let td = tempfile::tempdir().unwrap();
         let loaded = household_rs::bootstrap_or_load(
             td.path(),
@@ -3216,10 +3212,7 @@ mod tests {
     async fn reissue_loopback_ipv6_proceeds_past_acl() {
         let (state, _td) = make_state_with_identity(BootstrapState::NamedAwaitingPair);
         let app = bootstrap_router(state);
-        let req = reissue_request(SocketAddr::from((
-            std::net::Ipv6Addr::LOCALHOST,
-            12345,
-        )));
+        let req = reissue_request(SocketAddr::from((std::net::Ipv6Addr::LOCALHOST, 12345)));
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), HStatus::OK);
     }
@@ -3366,7 +3359,11 @@ mod tests {
         assert_eq!(body.error, "window_still_open");
         // The existing nonce is untouched.
         let still = window.current_token().await.expect("window still open");
-        assert_eq!(still.nonce.as_b64(), existing_nonce, "nonce must not be re-minted");
+        assert_eq!(
+            still.nonce.as_b64(),
+            existing_nonce,
+            "nonce must not be re-minted"
+        );
     }
 
     #[tokio::test]
@@ -3375,7 +3372,10 @@ mod tests {
         // current_token() becomes Some.
         let (state, _td) = make_state_with_identity(BootstrapState::NamedAwaitingPair);
         let window = Arc::clone(&state.pair_device_window);
-        assert!(window.current_token().await.is_none(), "precondition: no window");
+        assert!(
+            window.current_token().await.is_none(),
+            "precondition: no window"
+        );
         let app = bootstrap_router(state);
         let req = reissue_request(SocketAddr::from(([127, 0, 0, 1], 12345)));
         let resp = app.oneshot(req).await.unwrap();
@@ -3386,7 +3386,14 @@ mod tests {
     #[tokio::test]
     async fn reissue_success_response_shape_and_uri_contents() {
         let (state, _td) = make_state_with_identity(BootstrapState::NamedAwaitingPair);
-        let hh_id = state.household.current().await.unwrap().record.hh_id.to_string();
+        let hh_id = state
+            .household
+            .current()
+            .await
+            .unwrap()
+            .record
+            .hh_id
+            .to_string();
         let window = Arc::clone(&state.pair_device_window);
         let app = bootstrap_router(state);
         let req = reissue_request(SocketAddr::from(([127, 0, 0, 1], 12345)));
@@ -3420,7 +3427,14 @@ mod tests {
     #[tokio::test]
     async fn reissue_log_fields_exclude_nonce_and_uri() {
         let (state, _td) = make_state_with_identity(BootstrapState::NamedAwaitingPair);
-        let hh_id = state.household.current().await.unwrap().record.hh_id.to_string();
+        let hh_id = state
+            .household
+            .current()
+            .await
+            .unwrap()
+            .record
+            .hh_id
+            .to_string();
         let app = bootstrap_router(state);
         let req = reissue_request(SocketAddr::from(([127, 0, 0, 1], 12345)));
         let resp = app.oneshot(req).await.unwrap();

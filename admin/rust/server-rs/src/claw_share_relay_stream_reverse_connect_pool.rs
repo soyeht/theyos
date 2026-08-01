@@ -1,25 +1,48 @@
-//! Testable reverse-connect pool for Product A `relay_stream`.
+//! Product side of the `relay_stream` reverse-connect pool.
 //!
-//! C4e building block. This module keeps reverse-connect attempts parked for a
-//! caller-injected set of offers. It is not product-wired: no offer discovery,
-//! bootstrap, claim ack, iOS, public listener, or app-state refresh loop.
+//! S0 cutover: parking, the global connection cap, the backoff policy, the
+//! cancellation flag, `Drop`-based teardown and the reconcile algorithm now live
+//! in [`tunnel_wire_rs::worker_pool`]. What remains here is everything that was
+//! ever product-specific — the offer store, the trust seam, the admission clock,
+//! the expiry check, the binding and the serve call — behind one attempt
+//! callback.
 //!
-//! Critical invariant: every spawn builds a fresh binding from a fresh admission
-//! (`admit -> bind -> dial -> serve`). The pool never reuses a
-//! `RelayStreamReverseConnectBinding` across attempts, so the per-admission
-//! trust-health gate from C4c remains effective.
+//! Critical invariant, unchanged: every attempt builds a fresh binding from a
+//! fresh admission (`admit -> bind -> dial -> serve`). No
+//! `RelayStreamReverseConnectBinding` is reused across attempts, so the
+//! per-admission trust-health gate from C4c remains effective.
+//!
+//! # Why the callback, and not a factory plus a serve call
+//!
+//! The neutral pool can name neither `RelayStreamReverseConnectBinding` nor
+//! `serve_relay_stream_responder_reverse_connect_binding`, so it cannot build a
+//! binding and then serve it. The two collapse into one callback here — which
+//! also means the router generics `P`/`S`/`I` never cross the boundary, since
+//! they only ever existed to name the binding type.
+//!
+//! # The admission clock stays on this side, and that is load-bearing
+//!
+//! [`AdmissionInstant::capture_with`] samples its monotonic anchor BEFORE
+//! running the wall seam; its own docs call the reverse "the late-anchor bug",
+//! kept out of production by a `#[cfg(test)]`-only constructor. If the neutral
+//! pool held a `now_unix()` seam and passed a time value down, this callback
+//! would anchor AFTER that wall read — a production path on the test-only
+//! anti-pattern. So the capture happens here, first thing, and the pool never
+//! sees a clock.
+//!
+//! The order inside the callback is the pre-extraction worker's, unchanged:
+//! capture the admission, revalidate `not_after` against that fresh reading,
+//! build the binding, serve it.
 
-use std::collections::HashMap;
-use std::fmt;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 
 use household_rs::claw_share_data_tunnel::ClawTargetRouter;
-use tokio::sync::{Notify, Semaphore};
-use tokio::task::JoinHandle;
-use tokio::time::sleep;
+use tunnel_wire_rs::worker_pool::{
+    AttemptOutcome, ItemAttempt, PoolWorkItem, ResyncView, WorkerPoolConfig, WorkerPoolError,
+    spawn_item_resync_driver, spawn_worker_pool,
+};
 
 use crate::claw_share_relay_stream_contract::RelayStreamOfferContract;
 use crate::claw_share_relay_stream_issuer_trust::RelayStreamIssuerTrust;
@@ -35,78 +58,53 @@ use crate::claw_share_relay_stream_target_router::{
 };
 use crate::claw_share_session_clock::AdmissionInstant;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct RelayStreamReverseConnectBackoffPolicy {
-    pub min: Duration,
-    pub max: Duration,
-}
+// Neutral names, re-exported under the spellings this crate already uses. These
+// are claw-named paths to neutral symbols, which is the case the S0 guard's
+// positive control blesses: the property is reachability, not spelling.
+pub use tunnel_wire_rs::worker_pool::{
+    BackoffPolicy as RelayStreamReverseConnectBackoffPolicy,
+    WorkerPoolConfig as RelayStreamReverseConnectPoolConfig,
+    WorkerPoolError as RelayStreamReverseConnectPoolError,
+    WorkerPoolHandle as RelayStreamReverseConnectPoolHandle,
+};
 
-impl RelayStreamReverseConnectBackoffPolicy {
-    pub fn new(min: Duration, max: Duration) -> Result<Self, RelayStreamReverseConnectPoolError> {
-        if min.is_zero() {
-            return Err(RelayStreamReverseConnectPoolError::InvalidBackoff);
-        }
-        if max < min {
-            return Err(RelayStreamReverseConnectPoolError::InvalidBackoff);
-        }
-        Ok(Self { min, max })
-    }
+/// One offer, as a unit of parked work.
+///
+/// A newtype rather than an impl on `RelayStreamOfferContract` directly: the
+/// contract lives in `household-rs` and the trait in `tunnel-wire-rs`, so an
+/// impl here would be an orphan. The wrapper is the local type that makes it
+/// legal, and it carries no behaviour of its own.
+#[derive(PartialEq)]
+pub struct RelayStreamOfferItem(pub RelayStreamOfferContract);
 
-    fn next_after_failure(self, current: Duration) -> Duration {
-        let doubled = current.saturating_mul(2);
-        doubled.min(self.max).max(self.min)
-    }
-}
+impl PoolWorkItem for RelayStreamOfferItem {
+    type Key = RelayStreamOfferStoreKey;
 
-impl Default for RelayStreamReverseConnectBackoffPolicy {
-    fn default() -> Self {
-        Self {
-            min: Duration::from_millis(100),
-            max: Duration::from_secs(5),
-        }
+    fn key(&self) -> Self::Key {
+        RelayStreamOfferStoreKey::new(self.0.payload.slot_id.clone(), self.0.payload.resource)
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct RelayStreamReverseConnectPoolConfig {
-    pub per_offer_parked: usize,
-    pub max_total_connections: usize,
-    pub backoff: RelayStreamReverseConnectBackoffPolicy,
+/// The driver handle with its work-item bound. An alias rather than a bare
+/// re-export so consumers keep naming one type with no generic argument, exactly
+/// as before the extraction.
+pub type RelayStreamOfferResyncDriverHandle =
+    tunnel_wire_rs::worker_pool::ItemResyncDriverHandle<RelayStreamOfferItem>;
+
+/// The product's name for the neutral handle's item count.
+///
+/// An extension trait rather than a rename at the call sites: `offer_count`
+/// appears inside existing ASSERTIONS, and those are the oracle for behaviour
+/// identity across this move. Preserving the spelling keeps them untouched, and
+/// it is the honest name here anyway — every work item in this pool is an offer.
+pub trait RelayStreamOfferResyncDriverHandleExt {
+    fn offer_count(&self) -> usize;
 }
 
-impl RelayStreamReverseConnectPoolConfig {
-    pub fn validate(self) -> Result<Self, RelayStreamReverseConnectPoolError> {
-        if self.per_offer_parked == 0 {
-            return Err(RelayStreamReverseConnectPoolError::InvalidPerOfferParked);
-        }
-        if self.max_total_connections == 0 {
-            return Err(RelayStreamReverseConnectPoolError::InvalidMaxTotalConnections);
-        }
-        RelayStreamReverseConnectBackoffPolicy::new(self.backoff.min, self.backoff.max)?;
-        Ok(self)
+impl RelayStreamOfferResyncDriverHandleExt for RelayStreamOfferResyncDriverHandle {
+    fn offer_count(&self) -> usize {
+        self.item_count()
     }
-}
-
-impl Default for RelayStreamReverseConnectPoolConfig {
-    fn default() -> Self {
-        Self {
-            per_offer_parked: 1,
-            max_total_connections: 16,
-            backoff: RelayStreamReverseConnectBackoffPolicy::default(),
-        }
-    }
-}
-
-#[derive(Debug, thiserror::Error)]
-pub enum RelayStreamReverseConnectPoolError {
-    #[error("relay stream reverse-connect pool per-offer parked must be greater than zero")]
-    InvalidPerOfferParked,
-
-    #[error("relay stream reverse-connect pool max total connections must be greater than zero")]
-    InvalidMaxTotalConnections,
-
-    #[error("relay stream reverse-connect pool backoff is invalid")]
-    InvalidBackoff,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -128,548 +126,207 @@ pub type RelayStreamReverseConnectBindingFactory<P, S, I = RelayStreamIpTunnelUn
         > + Send
         + Sync;
 
-pub struct RelayStreamReverseConnectPoolHandle {
-    cancelled: Arc<AtomicBool>,
-    tasks: Vec<JoinHandle<()>>,
-}
+/// Build the attempt callback the neutral pool parks.
+///
+/// Everything the pre-extraction worker did between acquiring the permit and
+/// returning happens in here, in the same order, and reports back as one of
+/// three neutral outcomes.
+fn offer_attempt<P, S, I>(
+    reverse_config: RelayStreamResponderReverseConnectConfig,
+    params: Arc<RelayStreamResponderParams>,
+    binding_factory: Arc<RelayStreamReverseConnectBindingFactory<P, S, I>>,
+    now_unix: Arc<dyn Fn() -> Option<u64> + Send + Sync>,
+) -> Arc<ItemAttempt<RelayStreamOfferItem>>
+where
+    P: ClawTargetRouter + 'static,
+    S: ClawTargetRouter + 'static,
+    RelayStreamOfferTargetRouter<P, S, I>: ClawTargetRouter + 'static,
+{
+    Arc::new(move |item: Arc<RelayStreamOfferItem>| {
+        let reverse_config = reverse_config;
+        let params = Arc::clone(&params);
+        let binding_factory = Arc::clone(&binding_factory);
+        let now_unix = Arc::clone(&now_unix);
+        Box::pin(async move {
+            // Sample the clock, anchor-before-wall by construction. `None` means
+            // the wall clock is unusable, and with a broken clock expiry cannot
+            // be enforced — stop rather than dialing fail-open.
+            let Some(admission) = AdmissionInstant::capture_with(&*now_unix) else {
+                return AttemptOutcome::Stop;
+            };
+            let now = admission.wall();
+            // Revalidate the offer against that fresh reading.
+            //
+            // BOUND BY `pool_expiry_precheck_runs_before_the_binding_factory`,
+            // which asserts the factory is never invoked for an expired offer.
+            // That is the property this line carries: expiry is caught BEFORE
+            // we build, so a product whose factory forgets expiry still stops.
+            //
+            // An earlier revision of this comment said nothing in the suite
+            // could bite its removal. That was an assertion of an ABSENCE, and
+            // it was wrong — the discriminator was already in the harness, since
+            // `binding_factory` counts attempts before its own expiry check.
+            let offer = Arc::new(item.0.clone());
+            if offer.payload.not_after <= now {
+                return AttemptOutcome::Stop;
+            }
 
-impl RelayStreamReverseConnectPoolHandle {
-    pub fn shutdown(&self) {
-        self.cancelled.store(true, Ordering::SeqCst);
-        for task in &self.tasks {
-            task.abort();
-        }
-    }
+            let binding = match binding_factory(Arc::clone(&offer), now) {
+                Ok(binding) => binding,
+                Err(RelayStreamReverseConnectBindingBuildError::Expired) => {
+                    return AttemptOutcome::Stop;
+                }
+                Err(RelayStreamReverseConnectBindingBuildError::Unhealthy(_)) => {
+                    return AttemptOutcome::Backoff;
+                }
+            };
 
-    #[must_use]
-    pub fn task_count(&self) -> usize {
-        self.tasks.len()
-    }
-}
+            let result = serve_relay_stream_responder_reverse_connect_binding(
+                reverse_config,
+                &binding,
+                &params,
+                admission,
+            )
+            .await;
 
-impl fmt::Debug for RelayStreamReverseConnectPoolHandle {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("RelayStreamReverseConnectPoolHandle")
-            .field("task_count", &self.tasks.len())
-            .field("cancelled", &self.cancelled.load(Ordering::SeqCst))
-            .finish()
-    }
-}
-
-impl Drop for RelayStreamReverseConnectPoolHandle {
-    fn drop(&mut self) {
-        self.cancelled.store(true, Ordering::SeqCst);
-        for task in &self.tasks {
-            task.abort();
-        }
-    }
+            match result {
+                // A clean finish and a handshake timeout both reset the backoff.
+                // Two arms in the pre-extraction worker, merged here because
+                // they now share one expression body rather than two assignment
+                // statements — the effect is identical and both reasons stay
+                // visible.
+                Ok(())
+                | Err(RelayStreamResponderReverseConnectError::Responder(
+                    crate::claw_share_relay_stream_responder::RelayStreamResponderError::HandshakeTimeout,
+                )) => AttemptOutcome::ResetBackoff,
+                Err(_) => AttemptOutcome::Backoff,
+            }
+        }) as tunnel_wire_rs::worker_pool::AttemptFuture
+    })
 }
 
 // Takes the shared `Arc` handles by value: callers hand the pool ownership of
-// one `params`/`binding_factory`/`now_unix` handle, which is then `Arc::clone`d
-// per parked worker. The owned `now_unix` parameter also lets a concrete
-// `Arc<fn()>` unsize-coerce to `Arc<dyn Fn>` at the call site, which an `&Arc`
-// parameter could not.
+// one `params`/`binding_factory`/`now_unix` handle. The owned `now_unix`
+// parameter also lets a concrete `Arc<fn()>` unsize-coerce to `Arc<dyn Fn>` at
+// the call site, which an `&Arc` parameter could not.
 #[allow(clippy::needless_pass_by_value)]
 pub fn spawn_relay_stream_reverse_connect_pool<P, S, I>(
-    config: RelayStreamReverseConnectPoolConfig,
+    config: WorkerPoolConfig,
     reverse_config: RelayStreamResponderReverseConnectConfig,
     params: Arc<RelayStreamResponderParams>,
     offers: Vec<Arc<RelayStreamOfferContract>>,
     binding_factory: Arc<RelayStreamReverseConnectBindingFactory<P, S, I>>,
     now_unix: Arc<dyn Fn() -> Option<u64> + Send + Sync>,
-) -> Result<RelayStreamReverseConnectPoolHandle, RelayStreamReverseConnectPoolError>
+) -> Result<RelayStreamReverseConnectPoolHandle, WorkerPoolError>
 where
     P: ClawTargetRouter + 'static,
     S: ClawTargetRouter + 'static,
     RelayStreamOfferTargetRouter<P, S, I>: ClawTargetRouter + 'static,
 {
-    let config = config.validate()?;
-    let semaphore = Arc::new(Semaphore::new(config.max_total_connections));
-    let cancelled = Arc::new(AtomicBool::new(false));
-    let mut tasks = Vec::new();
-
-    for offer in offers {
-        for _ in 0..config.per_offer_parked {
-            let offer = Arc::clone(&offer);
-            let params = Arc::clone(&params);
-            let binding_factory = Arc::clone(&binding_factory);
-            let now_unix = Arc::clone(&now_unix);
-            let semaphore = Arc::clone(&semaphore);
-            let cancelled = Arc::clone(&cancelled);
-            let task = tokio::spawn(async move {
-                run_offer_worker(
-                    config,
-                    reverse_config,
-                    params,
-                    offer,
-                    binding_factory,
-                    now_unix,
-                    semaphore,
-                    cancelled,
-                )
-                .await;
-            });
-            tasks.push(task);
-        }
-    }
-
-    Ok(RelayStreamReverseConnectPoolHandle { cancelled, tasks })
-}
-
-// Internal per-offer worker: each `Arc` is moved into the spawned task and owned
-// for the worker's lifetime, so the parameters are genuinely consumed rather than
-// bundled into a context struct.
-#[allow(clippy::too_many_arguments)]
-async fn run_offer_worker<P, S, I>(
-    config: RelayStreamReverseConnectPoolConfig,
-    reverse_config: RelayStreamResponderReverseConnectConfig,
-    params: Arc<RelayStreamResponderParams>,
-    offer: Arc<RelayStreamOfferContract>,
-    binding_factory: Arc<RelayStreamReverseConnectBindingFactory<P, S, I>>,
-    now_unix: Arc<dyn Fn() -> Option<u64> + Send + Sync>,
-    semaphore: Arc<Semaphore>,
-    cancelled: Arc<AtomicBool>,
-) where
-    P: ClawTargetRouter + 'static,
-    S: ClawTargetRouter + 'static,
-    RelayStreamOfferTargetRouter<P, S, I>: ClawTargetRouter + 'static,
-{
-    let mut failure_backoff = config.backoff.min;
-    loop {
-        if cancelled.load(Ordering::SeqCst) {
-            break;
-        }
-
-        // Acquire the permit FIRST: this await can be long, and anything we
-        // read before it could be stale by the time we dial.
-        let Ok(permit) = Arc::clone(&semaphore).acquire_owned().await else {
-            break;
-        };
-        if cancelled.load(Ordering::SeqCst) {
-            drop(permit);
-            break;
-        }
-
-        // Only now sample the clock, anchor-before-wall by construction, and
-        // revalidate the offer against that fresh reading. `None` means the
-        // wall clock is unusable, and with a broken clock expiry cannot be
-        // enforced — the worker stops rather than dialing fail-open.
-        let Some(admission) = AdmissionInstant::capture_with(&*now_unix) else {
-            drop(permit);
-            break;
-        };
-        let now = admission.wall();
-        if offer.payload.not_after <= now {
-            drop(permit);
-            break;
-        }
-
-        let binding = match binding_factory(Arc::clone(&offer), now) {
-            Ok(binding) => binding,
-            Err(RelayStreamReverseConnectBindingBuildError::Expired) => {
-                drop(permit);
-                break;
-            }
-            Err(RelayStreamReverseConnectBindingBuildError::Unhealthy(_)) => {
-                drop(permit);
-                sleep_backoff(failure_backoff, &cancelled).await;
-                failure_backoff = config.backoff.next_after_failure(failure_backoff);
-                continue;
-            }
-        };
-
-        let result = serve_relay_stream_responder_reverse_connect_binding(
-            reverse_config,
-            &binding,
-            &params,
-            admission,
-        )
-        .await;
-        drop(permit);
-
-        match result {
-            Ok(()) => failure_backoff = config.backoff.min,
-            Err(RelayStreamResponderReverseConnectError::Responder(
-                crate::claw_share_relay_stream_responder::RelayStreamResponderError::HandshakeTimeout,
-            )) => {
-                failure_backoff = config.backoff.min;
-            }
-            Err(_) => {
-                sleep_backoff(failure_backoff, &cancelled).await;
-                failure_backoff = config.backoff.next_after_failure(failure_backoff);
-            }
-        }
-    }
-}
-
-async fn sleep_backoff(duration: Duration, cancelled: &AtomicBool) {
-    if duration.is_zero() || cancelled.load(Ordering::SeqCst) {
-        return;
-    }
-    tokio::time::sleep(duration).await;
-}
-
-// ─── Dynamic offer re-sync ────────────────────────────────────────────────────
-//
-// The static `spawn_relay_stream_reverse_connect_pool` parks workers for a fixed
-// injected offer set. A live engine, however, provisions offers into the store
-// at claim time AFTER assembly; the re-sync driver re-reads the store on a tick
-// and reconciles workers so those offers are served without a restart.
-//
-// Reconcile is keyed by `(slot_id, resource)` AND offer content: a vanished or
-// expired/revoked key drains its workers; a key whose offer content changed
-// (re-mint -> new rendezvous token / not_after / static key) drains the stale
-// workers and respawns fresh ones, so no worker stays parked with a stale token.
-// All workers share ONE global semaphore, so the connection cap holds across
-// churn. Workers reuse `run_offer_worker`; per-key teardown aborts that key's
-// handles (the held permit is released on drop).
-
-struct OfferWorkerEntry {
-    offer: Arc<RelayStreamOfferContract>,
-    handles: Vec<JoinHandle<()>>,
-}
-
-#[derive(Default)]
-struct OfferWorkerRegistry {
-    entries: HashMap<RelayStreamOfferStoreKey, OfferWorkerEntry>,
-}
-
-fn offer_store_key(offer: &RelayStreamOfferContract) -> RelayStreamOfferStoreKey {
-    RelayStreamOfferStoreKey::new(offer.payload.slot_id.clone(), offer.payload.resource)
-}
-
-/// Everything a resync needs to (re)spawn workers, shared by the initial sync
-/// resync and the tick loop. Cheaply `Arc`-cloned.
-struct ResyncContext<P, S, I> {
-    state_dir: PathBuf,
-    trust: RelayStreamIssuerTrust,
-    config: RelayStreamReverseConnectPoolConfig,
-    reverse_config: RelayStreamResponderReverseConnectConfig,
-    params: Arc<RelayStreamResponderParams>,
-    binding_factory: Arc<RelayStreamReverseConnectBindingFactory<P, S, I>>,
-    now_unix: Arc<dyn Fn() -> Option<u64> + Send + Sync>,
-    semaphore: Arc<Semaphore>,
-    worker_cancelled: Arc<AtomicBool>,
-    registry: Arc<Mutex<OfferWorkerRegistry>>,
-    trigger: Arc<Notify>,
-}
-
-fn spawn_offer_worker<P, S, I>(
-    ctx: &ResyncContext<P, S, I>,
-    offer: Arc<RelayStreamOfferContract>,
-) -> JoinHandle<()>
-where
-    P: ClawTargetRouter + 'static,
-    S: ClawTargetRouter + 'static,
-    RelayStreamOfferTargetRouter<P, S, I>: ClawTargetRouter + 'static,
-{
-    let config = ctx.config;
-    let reverse_config = ctx.reverse_config;
-    let params = Arc::clone(&ctx.params);
-    let binding_factory = Arc::clone(&ctx.binding_factory);
-    let now_unix = Arc::clone(&ctx.now_unix);
-    let semaphore = Arc::clone(&ctx.semaphore);
-    let cancelled = Arc::clone(&ctx.worker_cancelled);
-    tokio::spawn(async move {
-        run_offer_worker(
-            config,
-            reverse_config,
-            params,
-            offer,
-            binding_factory,
-            now_unix,
-            semaphore,
-            cancelled,
-        )
-        .await;
-    })
-}
-
-/// Re-read the store and reconcile the worker registry. Synchronous: it loads,
-/// verifies/prunes via `list_active`, then spawns/aborts tasks (all sync). The
-/// registry mutex is never held across an await.
-fn resync_offers<P, S, I>(ctx: &ResyncContext<P, S, I>)
-where
-    P: ClawTargetRouter + 'static,
-    S: ClawTargetRouter + 'static,
-    RelayStreamOfferTargetRouter<P, S, I>: ClawTargetRouter + 'static,
-{
-    // Clock gate for the whole tick. An unusable wall clock cannot judge
-    // `not_after`, so we must not merely return: existing workers would keep
-    // dialing on a stale view. DRAIN them, then let a later tick with a
-    // plausible clock repopulate the registry.
-    let Some(now) = (ctx.now_unix)() else {
-        if let Ok(mut registry) = ctx.registry.lock() {
-            for entry in registry.entries.values() {
-                for handle in &entry.handles {
-                    handle.abort();
-                }
-            }
-            registry.entries.clear();
-        }
-        tracing::warn!(
-            stage = "claw_share.relay_stream.resync.clock_unusable",
-            "wall clock unusable; drained offer workers and skipped resync",
-        );
-        return;
-    };
-    // CRITICAL: re-load from disk every tick. The claim path opens its own store,
-    // `put_minted` persists and drops it; a load-once in-memory store would never
-    // see the claim's write.
-    let mut store = match RelayStreamOfferStore::load(&ctx.state_dir, &ctx.trust, now) {
-        Ok(store) => store,
-        Err(error) => {
-            tracing::warn!(
-                stage = "claw_share.relay_stream.resync.store_load_failed",
-                error = %error,
-            );
-            return;
-        }
-    };
-    let active = match store.list_active(&ctx.trust, now) {
-        Ok(active) => active,
-        Err(error) => {
-            tracing::warn!(
-                stage = "claw_share.relay_stream.resync.list_active_failed",
-                error = %error,
-            );
-            return;
-        }
-    };
-    let active: HashMap<RelayStreamOfferStoreKey, Arc<RelayStreamOfferContract>> = active
+    let attempt = offer_attempt(reverse_config, params, binding_factory, now_unix);
+    let items = offers
         .into_iter()
-        .map(|offer| (offer_store_key(&offer), Arc::new(offer)))
+        .map(|offer| Arc::new(RelayStreamOfferItem((*offer).clone())))
         .collect();
-
-    let mut registry = match ctx.registry.lock() {
-        Ok(registry) => registry,
-        Err(poisoned) => poisoned.into_inner(),
-    };
-
-    // Drain workers for keys that are no longer active (gone / expired / revoked).
-    registry.entries.retain(|key, entry| {
-        if active.contains_key(key) {
-            true
-        } else {
-            for handle in &entry.handles {
-                handle.abort();
-            }
-            false
-        }
-    });
-
-    for (key, offer) in active {
-        match registry.entries.get_mut(&key) {
-            Some(entry) if entry.offer.as_ref() == offer.as_ref() => {
-                // Same key + same content: reap finished workers and top back up
-                // to `per_offer_parked` (a worker only exits on expiry/cancel).
-                entry.handles.retain(|handle| !handle.is_finished());
-                while entry.handles.len() < ctx.config.per_offer_parked {
-                    entry
-                        .handles
-                        .push(spawn_offer_worker(ctx, Arc::clone(&offer)));
-                }
-            }
-            Some(entry) => {
-                // Same key, different offer: a re-mint/upsert produced a new
-                // token/not_after/static key. Drain the stale workers and respawn
-                // so none stays parked with a stale rendezvous token.
-                for handle in &entry.handles {
-                    handle.abort();
-                }
-                entry.offer = Arc::clone(&offer);
-                entry.handles = (0..ctx.config.per_offer_parked)
-                    .map(|_| spawn_offer_worker(ctx, Arc::clone(&offer)))
-                    .collect();
-            }
-            None => {
-                let handles = (0..ctx.config.per_offer_parked)
-                    .map(|_| spawn_offer_worker(ctx, Arc::clone(&offer)))
-                    .collect();
-                registry.entries.insert(
-                    key,
-                    OfferWorkerEntry {
-                        offer: Arc::clone(&offer),
-                        handles,
-                    },
-                );
-            }
-        }
-    }
+    spawn_worker_pool(config, items, attempt)
 }
 
-async fn resync_loop<P, S, I>(
-    ctx: ResyncContext<P, S, I>,
-    tick: Duration,
-    driver_cancel: Arc<Notify>,
-) where
-    P: ClawTargetRouter + 'static,
-    S: ClawTargetRouter + 'static,
-    RelayStreamOfferTargetRouter<P, S, I>: ClawTargetRouter + 'static,
-{
-    let trigger = Arc::clone(&ctx.resync_trigger());
-    loop {
-        tokio::select! {
-            // Cancellation wins so no extra resync runs after shutdown.
-            biased;
-            () = driver_cancel.notified() => break,
-            () = sleep(tick) => {}
-            () = trigger.notified() => {}
-        }
-        resync_offers(&ctx);
-    }
-    // Graceful stop: cancel + abort every worker so none outlives the driver.
-    ctx.worker_cancelled.store(true, Ordering::SeqCst);
-    if let Ok(registry) = ctx.registry.lock() {
-        for entry in registry.entries.values() {
-            for handle in &entry.handles {
-                handle.abort();
-            }
-        }
-    }
-}
-
-impl<P, S, I> ResyncContext<P, S, I> {
-    fn resync_trigger(&self) -> Arc<Notify> {
-        Arc::clone(&self.trigger)
-    }
-}
-
-/// Abortable handle over the offer re-sync driver and the workers it manages.
+/// Spawn the dynamic offer re-sync driver.
 ///
-/// `shutdown` (and `Drop`) cancel the loop and abort every live worker, so no
-/// task outlives the handle. `offer_count`/`task_count` report the live registry.
-pub struct RelayStreamOfferResyncDriverHandle {
-    worker_cancelled: Arc<AtomicBool>,
-    registry: Arc<Mutex<OfferWorkerRegistry>>,
-    driver_cancel: Arc<Notify>,
-    trigger: Arc<Notify>,
-    task: JoinHandle<()>,
-}
-
-impl RelayStreamOfferResyncDriverHandle {
-    fn stop(&self) {
-        self.worker_cancelled.store(true, Ordering::SeqCst);
-        self.driver_cancel.notify_one();
-        if let Ok(registry) = self.registry.lock() {
-            for entry in registry.entries.values() {
-                for handle in &entry.handles {
-                    handle.abort();
-                }
-            }
-        }
-        self.task.abort();
-    }
-
-    pub fn shutdown(&self) {
-        self.stop();
-    }
-
-    /// Pulse an immediate resync (e.g. a future claim-time hook); the next tick
-    /// would pick the change up regardless.
-    pub fn trigger_resync(&self) {
-        self.trigger.notify_one();
-    }
-
-    #[must_use]
-    pub fn offer_count(&self) -> usize {
-        self.registry
-            .lock()
-            .map_or(0, |registry| registry.entries.len())
-    }
-
-    #[must_use]
-    pub fn task_count(&self) -> usize {
-        self.registry.lock().map_or(0, |registry| {
-            registry
-                .entries
-                .values()
-                .map(|entry| entry.handles.iter().filter(|h| !h.is_finished()).count())
-                .sum()
-        })
-    }
-}
-
-impl fmt::Debug for RelayStreamOfferResyncDriverHandle {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        // Summarized view: the registry, notifiers, and join handle are internal
-        // sync primitives that are not meaningfully printable, so they are
-        // intentionally omitted in favor of the live counts.
-        f.debug_struct("RelayStreamOfferResyncDriverHandle")
-            .field("offer_count", &self.offer_count())
-            .field("task_count", &self.task_count())
-            .field("cancelled", &self.worker_cancelled.load(Ordering::SeqCst))
-            .finish_non_exhaustive()
-    }
-}
-
-impl Drop for RelayStreamOfferResyncDriverHandle {
-    fn drop(&mut self) {
-        self.stop();
-    }
-}
-
-/// Spawn the dynamic offer re-sync driver. Performs an initial SYNCHRONOUS
-/// resync (so the handle's counts are immediately populated), then re-reads the
-/// store and reconciles workers every `tick`. All workers share one global
-/// connection semaphore (`max_total_connections`). Replaces the static pool in
-/// the live path: it both seeds the initial offers and tracks later ones.
-#[allow(clippy::too_many_arguments)]
+/// The store, the trust seam and the clock stay here: the source closure re-reads
+/// from disk every tick and hands the neutral reconcile an opaque item list.
+/// `None` means the wall clock is unusable, which drains rather than coasts —
+/// the same fail-closed shape the pre-extraction driver had.
+///
+/// CRITICAL: re-load from disk every tick. The claim path opens its own store,
+/// `put_minted` persists and drops it; a load-once in-memory store would never
+/// see the claim's write.
+#[allow(clippy::too_many_arguments, clippy::needless_pass_by_value)]
 pub fn spawn_relay_stream_offer_resync_driver<P, S, I>(
     state_dir: PathBuf,
     trust: RelayStreamIssuerTrust,
     tick: Duration,
-    config: RelayStreamReverseConnectPoolConfig,
+    config: WorkerPoolConfig,
     reverse_config: RelayStreamResponderReverseConnectConfig,
     params: Arc<RelayStreamResponderParams>,
     binding_factory: Arc<RelayStreamReverseConnectBindingFactory<P, S, I>>,
     now_unix: Arc<dyn Fn() -> Option<u64> + Send + Sync>,
-) -> Result<RelayStreamOfferResyncDriverHandle, RelayStreamReverseConnectPoolError>
+) -> Result<RelayStreamOfferResyncDriverHandle, WorkerPoolError>
 where
     P: ClawTargetRouter + 'static,
     S: ClawTargetRouter + 'static,
     RelayStreamOfferTargetRouter<P, S, I>: ClawTargetRouter + 'static,
 {
-    let config = config.validate()?;
-    let worker_cancelled = Arc::new(AtomicBool::new(false));
-    let registry = Arc::new(Mutex::new(OfferWorkerRegistry::default()));
-    let driver_cancel = Arc::new(Notify::new());
-    let trigger = Arc::new(Notify::new());
-
-    let ctx = ResyncContext {
-        state_dir,
-        trust,
-        config,
+    let attempt = offer_attempt(
         reverse_config,
         params,
         binding_factory,
-        now_unix,
-        semaphore: Arc::new(Semaphore::new(config.max_total_connections)),
-        worker_cancelled: Arc::clone(&worker_cancelled),
-        registry: Arc::clone(&registry),
-        trigger: Arc::clone(&trigger),
-    };
+        Arc::clone(&now_unix),
+    );
+    let source: Arc<dyn Fn() -> ResyncView<RelayStreamOfferItem> + Send + Sync> =
+        Arc::new(move || {
+            // Clock gate: an unusable wall clock cannot judge `not_after`, so
+            // existing workers must not keep dialing on a view nothing can
+            // vouch for. DRAIN — the one case that does.
+            //
+            // The stage is logged HERE, product-side, because the extraction
+            // moved the drain decision's *effect* to the neutral pool but the
+            // product still owns the reason. It was dropped in the first cut
+            // while both sibling stages survived, which is what made it a slip
+            // rather than a decision: observable telemetry is behaviour, and
+            // this slice's bar is behaviour identity. Stage and message are the
+            // pre-extraction ones verbatim.
+            let Some(now) = (now_unix)() else {
+                tracing::warn!(
+                    stage = "claw_share.relay_stream.resync.clock_unusable",
+                    "wall clock unusable; drained offer workers and skipped resync",
+                );
+                return ResyncView::Drain;
+            };
+            let mut store = match RelayStreamOfferStore::load(&state_dir, &trust, now) {
+                Ok(store) => store,
+                Err(error) => {
+                    tracing::warn!(
+                        stage = "claw_share.relay_stream.resync.store_load_failed",
+                        error = %error,
+                    );
+                    // NOT a drain. The pre-extraction driver logged and returned
+                    // early, leaving workers running on the last good view; a
+                    // transient disk error is not a reason to tear down live
+                    // connections.
+                    return ResyncView::Unchanged;
+                }
+            };
+            let active = match store.list_active(&trust, now) {
+                Ok(active) => active,
+                Err(error) => {
+                    tracing::warn!(
+                        stage = "claw_share.relay_stream.resync.list_active_failed",
+                        error = %error,
+                    );
+                    return ResyncView::Unchanged;
+                }
+            };
+            ResyncView::Items(
+                active
+                    .into_iter()
+                    .map(|offer| Arc::new(RelayStreamOfferItem(offer)))
+                    .collect(),
+            )
+        });
 
-    // Initial synchronous resync: seed workers for the offers already on disk.
-    resync_offers(&ctx);
-
-    let task = tokio::spawn(resync_loop(ctx, tick, Arc::clone(&driver_cancel)));
-
-    Ok(RelayStreamOfferResyncDriverHandle {
-        worker_cancelled,
-        registry,
-        driver_cancel,
-        trigger,
-        task,
-    })
+    spawn_item_resync_driver(tick, config, source, attempt)
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    // S0 cutover: IMPORTS ONLY. `AtomicBool` and `JoinHandle` used to arrive
+    // through `use super::*` from the mechanics that now live in the neutral
+    // crate. Not one assertion below is touched — they are the oracle for
+    // behaviour identity across this move.
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use tokio::task::JoinHandle;
 
     use household_rs::cbor;
     use household_rs::claw_share::{ClawShareSlotStore, SlotRecord, SlotState};
@@ -722,7 +379,7 @@ mod tests {
         max_total_connections: usize,
     ) -> RelayStreamReverseConnectPoolConfig {
         RelayStreamReverseConnectPoolConfig {
-            per_offer_parked,
+            per_item_parked: per_offer_parked,
             max_total_connections,
             backoff: RelayStreamReverseConnectBackoffPolicy::new(
                 Duration::from_millis(25),
@@ -1076,6 +733,75 @@ mod tests {
                 timeout(Duration::from_millis(150), rx.recv())
                     .await
                     .is_err()
+            );
+            handle.shutdown();
+            relay_handle.abort();
+        })
+        .await
+        .unwrap();
+    }
+
+    /// The `not_after` pre-check runs BEFORE the binding factory, and this test
+    /// binds that ordering rather than the outcome.
+    ///
+    /// The sibling test above cannot: the factory reports `Expired` too, so no
+    /// dial happens either way and removing the pre-check leaves it green. The
+    /// discriminator is already in the harness — `binding_factory` increments
+    /// `attempts` at its FIRST line, before its own expiry check. So with the
+    /// pre-check the factory is never reached and `attempts == 0`; without it
+    /// the factory runs and the counter moves. That is the whole difference
+    /// between "expiry is enforced somewhere" and "expiry is enforced before we
+    /// build", which is the property the pre-check exists for — a product whose
+    /// factory forgets expiry still stops.
+    #[tokio::test]
+    async fn pool_expiry_precheck_runs_before_the_binding_factory() {
+        timeout(Duration::from_secs(2), async {
+            let (relay_addr, mut rx, relay_handle) = spawn_counting_relay().await;
+            let keypair = generate_relay_stream_noise_static_keypair().unwrap();
+            let offer = offer_for_resource(
+                0xB4,
+                RelayStreamResource::Pty,
+                keypair.public_key().clone(),
+                now_unix().saturating_sub(1),
+            );
+            let params = Arc::new(
+                params_for(
+                    keypair,
+                    Duration::from_millis(100),
+                    relay_stream_admission().await,
+                )
+                .await,
+            );
+            let attempts = Arc::new(AtomicUsize::new(0));
+            let factory = binding_factory(
+                params.admission.clone(),
+                consumed_slots(),
+                "127.0.0.1:1".to_string(),
+                "127.0.0.1:1".to_string(),
+                Arc::clone(&attempts),
+            );
+            let handle = spawn_relay_stream_reverse_connect_pool(
+                pool_config(1, 1),
+                reverse_config(relay_addr),
+                params,
+                vec![offer],
+                factory,
+                Arc::new(|| Some(now_unix())),
+            )
+            .unwrap();
+
+            // No dial, as the sibling test asserts — the positive control that
+            // the fixture is actually running an expired offer.
+            assert!(
+                timeout(Duration::from_millis(150), rx.recv())
+                    .await
+                    .is_err()
+            );
+            // The load-bearing assertion: the factory was never invoked.
+            assert_eq!(
+                attempts.load(Ordering::SeqCst),
+                0,
+                "expiry must be caught before the binding factory is called"
             );
             handle.shutdown();
             relay_handle.abort();

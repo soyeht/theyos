@@ -322,8 +322,7 @@ fn ready_posture_doc_matches_plain_http_listener_contract() {
         ("handlers_household.rs", household.as_str()),
     ] {
         assert!(
-            source.contains("core_rs::phase0_axum_serve!")
-                && !source.contains("axum::serve("),
+            source.contains("core_rs::phase0_axum_serve!") && !source.contains("axum::serve("),
             "{file} test listeners must not bypass the Phase 0 HTTP serve choke-point"
         );
     }

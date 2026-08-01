@@ -615,7 +615,18 @@ impl ClawSession {
                 // Open-ack, so it lands here, before the target's first output.
                 // Validate + store and keep waiting; a rejection aborts the open
                 // rather than proceeding with an unbound allocation.
-                Ok(dt::TunnelFrame::NetworkSettings(ns)) => {
+                Ok(dt::TunnelFrame::NetworkSettings(sealed)) => {
+                    // S0: the frame body is sealed, so the ONLY way to read it is
+                    // the strict canonical decoder. That is deliberate — the
+                    // strictness used to be unbypassable inside
+                    // `TunnelFrame::decode`, and sealing is what keeps it
+                    // unbypassable now that the struct is product-side.
+                    // Static label: this variant's contract is that the payload
+                    // never echoes an address or a session id, so the decode
+                    // error is NOT stringified into it.
+                    let ns = dt::decode_network_settings_body(&sealed).map_err(|_| {
+                        BridgeError::NetworkSettingsInvalid("malformed body".into())
+                    })?;
                     self.accept_network_settings(ns).await?;
                 }
                 Ok(dt::TunnelFrame::Close) => {
@@ -740,7 +751,14 @@ impl ClawSession {
                 // draining, so on the `IpTunnel` path the settings frame is
                 // still queued and surfaces on the first read. Same validation,
                 // same fail-closed outcome.
-                Ok(dt::TunnelFrame::NetworkSettings(ns)) => {
+                Ok(dt::TunnelFrame::NetworkSettings(sealed)) => {
+                    // Same strict door as the open path; see the note there.
+                    // Static label: this variant's contract is that the payload
+                    // never echoes an address or a session id, so the decode
+                    // error is NOT stringified into it.
+                    let ns = dt::decode_network_settings_body(&sealed).map_err(|_| {
+                        BridgeError::NetworkSettingsInvalid("malformed body".into())
+                    })?;
                     self.accept_network_settings(ns).await?;
                 }
                 Ok(dt::TunnelFrame::Exit(status)) => {

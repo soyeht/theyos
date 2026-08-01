@@ -742,11 +742,7 @@ mod tests {
         // `TargetUnavailable` proves nothing was dialed. The reason stays the
         // existing opaque one: a broken clock must not be distinguishable from
         // an invalid offer.
-        let router = router_with(
-            offer(RelayStreamResource::Pty),
-            consumed_slots(),
-            || None,
-        );
+        let router = router_with(offer(RelayStreamResource::Pty), consumed_slots(), || None);
 
         let error = open_error(&router).await;
 
@@ -761,7 +757,10 @@ mod tests {
     async fn relay_stream_target_router_denies_clock_at_epoch_and_below_floor() {
         // `Ok(0)` is the SUCCESS branch of `duration_since`, and a merely late
         // clock weakens expiry proportionally. Both must deny, not just `Err`.
-        for reading in [0_u64, crate::claw_share_session_clock::MIN_PLAUSIBLE_UNIX_SECS - 1] {
+        for reading in [
+            0_u64,
+            crate::claw_share_session_clock::MIN_PLAUSIBLE_UNIX_SECS - 1,
+        ] {
             let router = router_with(
                 offer(RelayStreamResource::Pty),
                 consumed_slots(),

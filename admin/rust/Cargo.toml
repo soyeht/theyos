@@ -21,6 +21,7 @@ members = [
     "terminal-rs",
     "theyos-engine-build-rs",
     "t1-iptunnel-dev-runner-rs",
+    "tunnel-wire-rs",
     "rootfsbuilder-rs",
     "launcher-rs",
     "soyeht-rs",
@@ -143,6 +144,7 @@ session-rs      = { path = "session-rs" }
 server-rs       = { path = "server-rs" }
 store-rs        = { path = "store-rs" }
 terminal-rs     = { path = "terminal-rs" }
+tunnel-wire-rs  = { path = "tunnel-wire-rs" }
 vmrunner-common-rs = { path = "vmrunner-common-rs" }
 vmrunner-rs     = { path = "vmrunner-rs" }
 vmrunner-macos-rs = { path = "vmrunner-macos-rs" }

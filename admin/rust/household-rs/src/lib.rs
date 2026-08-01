@@ -88,6 +88,12 @@ pub mod secure_upgrade;
 pub mod shamir;
 pub mod shard_at_rest;
 pub mod storage;
+// S0 — the neutral tunnel wire mechanics that used to be `pub mod tunnel_wire`
+// here now live in the `tunnel-wire-rs` crate. Not a rename: while they shared a
+// crate with `claw_vpn`, "neutral" was a convention no instrument could check,
+// and a crate-root `pub use` (there are ten below) reached claw authority
+// without naming it. The dependency edge makes it a property instead.
+// Consumers are unaffected: `claw_share_data_tunnel` re-exports the same names.
 
 pub use bootstrap::{
     AcceptHouseholdConfirmError, AcceptHouseholdJoinChallenge, AcceptHouseholdPrepareOpts,

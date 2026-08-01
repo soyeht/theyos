@@ -240,10 +240,7 @@ fn read_linux_tun_packet_nonblocking(
 /// Non-blocking TUN write for the pollable datapath. TUN writes are
 /// packet-atomic: `Ok(true)` = the whole packet crossed; `Ok(false)` =
 /// `WouldBlock`. A partial write would corrupt the tunnel, so it is fatal.
-fn write_linux_tun_packet_nonblocking(
-    writer: &mut impl Write,
-    packet: &[u8],
-) -> io::Result<bool> {
+fn write_linux_tun_packet_nonblocking(writer: &mut impl Write, packet: &[u8]) -> io::Result<bool> {
     match writer.write(packet) {
         Ok(n) if n == packet.len() => Ok(true),
         // A non-empty packet accepted as zero bytes is not `WouldBlock`

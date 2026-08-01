@@ -1020,11 +1020,9 @@ pub async fn local_finalize_handler(
         let Some(addr) = peer.tailscale_addr.as_ref() else {
             continue;
         };
-        if let Err(e) = household_rs::storage::write_known_peer_addr(
-            &state.state_dir,
-            &peer.m_id,
-            addr,
-        ) {
+        if let Err(e) =
+            household_rs::storage::write_known_peer_addr(&state.state_dir, &peer.m_id, addr)
+        {
             tracing::warn!(
                 stage = "pair_machine.local_finalize.known_addr_persist_failed",
                 peer_m_id = %peer.m_id,

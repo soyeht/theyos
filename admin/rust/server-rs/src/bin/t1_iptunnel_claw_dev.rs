@@ -562,9 +562,8 @@ async fn main() -> std::io::Result<()> {
             config,
             &binding,
             &params,
-            AdmissionInstant::capture("t1_iptunnel_claw_dev.admission").unwrap_or_else(|| {
-                fatal("system clock is unusable; refusing to dial")
-            }),
+            AdmissionInstant::capture("t1_iptunnel_claw_dev.admission")
+                .unwrap_or_else(|| fatal("system clock is unusable; refusing to dial")),
         )
         .await
         {

@@ -58,8 +58,16 @@ pub mod claw_vpn_interface_route_plan;
 pub mod claw_vpn_linux_tun;
 #[cfg(all(any(test, feature = "dev_t1_datapath"), target_os = "macos"))]
 pub mod claw_vpn_macos_utun;
-#[cfg(any(test, feature = "dev_t1_datapath"))]
-pub mod claw_vpn_nonblocking_frame;
+// S0: the nonblocking-frame module moved to `tunnel_wire_rs::frame_stream`.
+// It is byte-stream framing and partial-transfer bookkeeping — mechanics,
+// with no decision about who may do what — so it travels with the wire types
+// it is built on, and the duplicate that briefly existed here is gone.
+//
+// Its `#[cfg]` was deleted WITH it. Leaving the attribute behind is silent: an
+// attribute skips comments and binds to the next ITEM, so the orphan landed
+// on the packet pump module below, which then carried two. Identical
+// conditions made it idempotent and nothing warned — but edit either copy and
+// the module becomes their conjunction.
 #[cfg(any(test, feature = "dev_t1_datapath"))]
 pub mod claw_vpn_packet_pump;
 #[cfg(any(test, feature = "dev_t1_datapath"))]

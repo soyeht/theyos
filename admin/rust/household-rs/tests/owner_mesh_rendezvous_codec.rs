@@ -344,7 +344,16 @@ fn r1a7_enumerates_linked_targets_and_proves_zero_production_callers() {
     let root = repository_root();
     let rust_root = root.join("admin/rust");
     let members = workspace_members(&rust_root);
-    assert_eq!(members.len(), 28, "workspace member inventory changed");
+    // 28 + 1 `tunnel-wire-rs` (S0). Derived, not bumped: the neutral wire crate
+    // is the mechanism for the S0 cross-import boundary — with no dependency
+    // edge to `household-rs`, no `pub use` chain there can make claw authority
+    // resolve from neutral code, which a grep over source text cannot enforce.
+    // Note the asymmetry with `targets` below: `parse_member_manifest` reads
+    // explicit targets only from `[[bin]]`/`[[test]]`/`[[example]]`, so this
+    // crate's single-bracket `[lib]` is invisible to it, and it ships its tests
+    // as inline `mod tests` rather than files under `tests/`. Members therefore
+    // moves by one and targets does not move at all.
+    assert_eq!(members.len(), 29, "workspace member inventory changed");
     assert!(
         members
             .iter()

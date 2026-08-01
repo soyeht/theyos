@@ -830,7 +830,9 @@ fn amendment_a1_challenge_accessors_are_projection_only() {
     }
     assert_eq!(
         challenge
-            .matches("impl OwnerSiteWebSocketInstance {\n    #[must_use]\n    pub(crate) fn as_bytes")
+            .matches(
+                "impl OwnerSiteWebSocketInstance {\n    #[must_use]\n    pub(crate) fn as_bytes"
+            )
             .count(),
         1,
         "exactly one OwnerSiteWebSocketInstance::as_bytes projection getter"

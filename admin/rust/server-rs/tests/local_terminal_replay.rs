@@ -294,7 +294,10 @@ async fn reattach_replays_only_tail_and_marks_truncated() {
     );
     let full = digit_pattern(total_len);
     let expected_tail = &full[total_len - TAIL_REPLAY_BYTES as usize..];
-    assert_eq!(content, expected_tail, "must be the LAST bytes, not any 2 MiB slice");
+    assert_eq!(
+        content, expected_tail,
+        "must be the LAST bytes, not any 2 MiB slice"
+    );
 
     delete_local_session(&server, conv_id).await;
 }
@@ -330,7 +333,11 @@ async fn full_replay_query_param_opts_into_entire_log() {
     ws.close().await;
 
     assert!(!truncated, "full_replay=true must not truncate");
-    assert_eq!(content.len(), total_len, "full_replay=true must transfer the entire log");
+    assert_eq!(
+        content.len(),
+        total_len,
+        "full_replay=true must transfer the entire log"
+    );
     assert_eq!(content, digit_pattern(total_len));
 
     delete_local_session(&server, conv_id).await;

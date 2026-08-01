@@ -695,7 +695,10 @@ pub async fn handle_local_terminal_create(
 /// `GET /api/v1/terminals/local` — lists every broker-owned local session
 /// (live or not-yet-reaped), with the metadata `soyeht-mcp` needs to map a
 /// TTY back to the pane that owns it.
-pub async fn handle_local_terminal_list(State(state): State<SharedState>, _auth: AuthUser) -> Response {
+pub async fn handle_local_terminal_list(
+    State(state): State<SharedState>,
+    _auth: AuthUser,
+) -> Response {
     let pm = Arc::clone(&state.pty_mgr);
     match tokio::task::spawn_blocking(move || pm.list_local()).await {
         Ok(sessions) => {
@@ -1534,10 +1537,19 @@ mod tests {
         let stale_cursor = 100;
         let base_offset = 500; // rotated past the stale cursor while we awaited
         let (replay_from, cursor) = compute_replay_window(stale_cursor, base_offset, false);
-        assert_eq!(cursor, base_offset, "cursor must be clamped forward, never left stale");
+        assert_eq!(
+            cursor, base_offset,
+            "cursor must be clamped forward, never left stale"
+        );
         assert_eq!(replay_from, base_offset);
-        assert!(replay_from <= cursor, "must never underflow cursor - replay_from downstream");
-        assert!(replay_from >= base_offset, "must never underflow replay_from - base_offset (phys_from) downstream");
+        assert!(
+            replay_from <= cursor,
+            "must never underflow cursor - replay_from downstream"
+        );
+        assert!(
+            replay_from >= base_offset,
+            "must never underflow replay_from - base_offset (phys_from) downstream"
+        );
     }
 
     #[test]

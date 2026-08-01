@@ -81,6 +81,10 @@ executor-rs     = { workspace = true }
 
 # Phase 1 cryptographic skeleton
 household-rs    = { workspace = true }
+# S0: the neutral wire mechanics (codec + pollable pump loop). Product depends on
+# neutral; the reverse edge is a cargo cycle, which is what makes the boundary a
+# property rather than a convention.
+tunnel-wire-rs  = { workspace = true }
 mdns-sd         = { workspace = true }
 gethostname     = { workspace = true }
 if-addrs        = { workspace = true }

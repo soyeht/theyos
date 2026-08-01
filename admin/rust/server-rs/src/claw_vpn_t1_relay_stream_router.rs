@@ -16,6 +16,7 @@ use std::io;
 use std::io::Write;
 use std::marker::PhantomData;
 use std::mem::MaybeUninit;
+use std::net::Ipv4Addr;
 use std::os::fd::{AsRawFd, FromRawFd, RawFd};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
@@ -27,7 +28,6 @@ use std::sync::mpsc::{Receiver, SyncSender, TrySendError, sync_channel};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use std::thread;
-use std::net::Ipv4Addr;
 use std::time::Duration;
 
 use hmac::{Hmac, Mac};
@@ -1451,10 +1451,10 @@ pub fn assemble_claw_vpn_pollable_t1_relay_stream_router<
 where
     LoadConfig: FnOnce() -> Result<Option<ClawVpnDevConfig>, ClawVpnDevConfigError>,
     LoadPreflight: FnOnce() -> PerClawVpnT1PreflightEvidence,
-    BuildRouterParts: FnOnce(
-        &ClawVpnDevConfig,
-    )
-        -> ClawVpnPollableT1RelayStreamRouterParts<I, BuildInputs, LaunchRuntime>,
+    BuildRouterParts:
+        FnOnce(
+            &ClawVpnDevConfig,
+        ) -> ClawVpnPollableT1RelayStreamRouterParts<I, BuildInputs, LaunchRuntime>,
     BuildInputs: Send + Sync,
     LaunchRuntime: Send + Sync,
 {
@@ -1521,7 +1521,10 @@ mod tests {
         .expect("a valid in-CIDR pair is accepted");
 
         assert_eq!(mesh.prefix_len, 24);
-        assert_ne!(mesh.prefix_len, 0, "the included route must never be 0.0.0.0/0");
+        assert_ne!(
+            mesh.prefix_len, 0,
+            "the included route must never be 0.0.0.0/0"
+        );
         let addr: Ipv4Addr = mesh.addr.parse().unwrap();
         let peer: Ipv4Addr = mesh.peer.parse().unwrap();
         assert_ne!(addr, peer, "peer must be a distinct host");
@@ -1579,12 +1582,22 @@ mod tests {
         let net = Ipv4Addr::new(11, 0, 0, 0);
         // peer outside the /24 CIDR (would widen / misroute).
         assert_eq!(
-            build_vpn_mesh_ipv4(net, 24, Ipv4Addr::new(11, 0, 0, 1), Ipv4Addr::new(11, 0, 5, 2)),
+            build_vpn_mesh_ipv4(
+                net,
+                24,
+                Ipv4Addr::new(11, 0, 0, 1),
+                Ipv4Addr::new(11, 0, 5, 2)
+            ),
             Err("claw-vpn-t1-route-scope-cidr")
         );
         // device outside the CIDR.
         assert_eq!(
-            build_vpn_mesh_ipv4(net, 24, Ipv4Addr::new(11, 0, 5, 1), Ipv4Addr::new(11, 0, 0, 2)),
+            build_vpn_mesh_ipv4(
+                net,
+                24,
+                Ipv4Addr::new(11, 0, 5, 1),
+                Ipv4Addr::new(11, 0, 0, 2)
+            ),
             Err("claw-vpn-t1-route-scope-cidr")
         );
     }

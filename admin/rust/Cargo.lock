@@ -2460,6 +2460,7 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-test",
+ "tunnel-wire-rs",
  "ureq",
  "vsss-rs",
  "webauthn-authenticator-rs",
@@ -5124,6 +5125,7 @@ dependencies = [
  "tower-http",
  "tracing",
  "tracing-subscriber",
+ "tunnel-wire-rs",
  "ureq",
  "vmrunner-common-rs",
  "vmrunner-rs",
@@ -6061,6 +6063,18 @@ dependencies = [
  "sha1 0.10.6",
  "thiserror 2.0.18",
  "utf-8",
+]
+
+[[package]]
+name = "tunnel-wire-rs"
+version = "0.1.0"
+dependencies = [
+ "ciborium",
+ "libc",
+ "serde",
+ "thiserror 1.0.69",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]

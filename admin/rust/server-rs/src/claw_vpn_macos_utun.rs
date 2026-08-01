@@ -204,10 +204,7 @@ fn read_utun_ipv4_packet_nonblocking(
 /// `WouldBlock` (retry the same packet). A partial write would corrupt the
 /// tunnel, so it is fatal — this proves the atomicity assumption rather than
 /// silently assuming it.
-fn write_utun_ipv4_packet_nonblocking(
-    writer: &mut impl Write,
-    packet: &[u8],
-) -> io::Result<bool> {
+fn write_utun_ipv4_packet_nonblocking(writer: &mut impl Write, packet: &[u8]) -> io::Result<bool> {
     let frame = encode_utun_ipv4_frame(packet)?;
     match writer.write(&frame) {
         Ok(n) if n == frame.len() => Ok(true),

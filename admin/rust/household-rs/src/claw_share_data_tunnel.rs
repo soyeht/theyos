@@ -55,9 +55,9 @@ use crate::claw_share::{ClawShareSlotStore, GuestCredential, SlotState};
 use crate::ids::HouseholdId;
 use crate::keys::{P256PublicKey, P256Signature, verify_signature};
 
-/// Frame size cap. Health probes are tiny; this guards against a peer
-/// announcing an absurd length and forcing a huge allocation.
-pub const MAX_FRAME_LEN: usize = 64 * 1024;
+// The frame-size cap moved to the `tunnel-wire-rs` crate (S0): a length bound is
+// mechanics. Re-exported so consumer imports are unchanged.
+pub use tunnel_wire_rs::tunnel_wire::MAX_FRAME_LEN;
 
 /// Canonical health probe the bridge sends. The server echoes it; the
 /// bridge only advances to `connected` on a byte-exact match.
@@ -120,43 +120,33 @@ pub enum TunnelAck {
     Rejected { reason: String },
 }
 
-/// The guest's per-Claw VPN IPv4 interface parameters for the `IpTunnel` path.
-///
-/// ROUTE-SCOPE INVARIANT (contract, enforced server-side and by the iOS FFI):
-/// the ONLY route the client installs is the pool CIDR `network(addr,
-/// prefix_len)` — NEVER a default route (`0.0.0.0/0`). A real default route /
-/// exit-node is a separate authenticated policy decision, never inferred from
-/// these settings. `peer` is a DISTINCT unicast host inside that same prefix.
-#[derive(Serialize, Deserialize, Clone, PartialEq, Eq)]
-pub struct MeshIpv4 {
-    /// The guest's assigned tunnel address, e.g. "10.42.0.2".
-    pub addr: String,
-    /// CIDR prefix length; the client derives the subnet mask and installs a
-    /// route for exactly `network(addr, prefix_len)`, never `0.0.0.0/0`.
-    pub prefix_len: u8,
-    /// The claw-side peer / tunnel-remote address, e.g. "10.42.0.3" — a distinct
-    /// unicast host inside the same prefix.
-    pub peer: String,
-}
-
-impl fmt::Debug for MeshIpv4 {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        // Addresses reveal VPN topology; redact like the ack's mesh field.
-        f.debug_struct("MeshIpv4")
-            .field("addr", &"<redacted>")
-            .field("prefix_len", &self.prefix_len)
-            .field("peer", &"<redacted>")
-            .finish()
-    }
-}
+// `MeshIpv4` is neutral (S0): `addr` / `prefix_len` / `peer` are topology, not
+// identity, and its `route_scope_violation` travels with it — the design is
+// explicit that extracting the wire shape without the route-scope rule would
+// leave a decoder yielding settings a consumer could install as a default route.
+pub use tunnel_wire_rs::tunnel_wire::{MeshIpv4, NetworkSettingsBody, RouteScopeViolation};
 
 /// Server → client typed settings carried in a dedicated post-Open
 /// [`TunnelFrame::NetworkSettings`] frame, `IpTunnel` path only. The auth
-/// [`TunnelAck`] stays address-free for ALL paths (unchanged); the real,
-/// pool-allocated address only exists after `router.open`, so it is delivered
-/// here, after the Open-ack. Consumed entirely by the client FFI before any
-/// packet pump; a missing / duplicated / invalid frame fails the connection
-/// closed before any interface is configured.
+/// [`TunnelAck`] stays address-free for ALL paths; the real, pool-allocated
+/// address only exists after `router.open`, so it is delivered here, after the
+/// Open-ack. Consumed entirely by the client FFI before any packet pump; a
+/// missing / duplicated / invalid frame fails the connection closed before any
+/// interface is configured.
+///
+/// **This struct is product-side on purpose, and that is a correction.** An
+/// earlier S0 generation moved it into the neutral module because the codec is
+/// byte-identical either way. But `session_id` is stamped by the serve loop to
+/// match the one in the auth ack, and the design classifies that stamping as
+/// authority: *a neutral type may not carry a field whose only legitimate
+/// producer is an authority.* That rule is what expelled [`TunnelAck`]; this
+/// type carries the same field for the same reason. The measurement confirmed
+/// it is identity in use, not transport — `claw-share-bridge-rs` compares
+/// `ns.session_id != expected` as an equality check on identity.
+///
+/// The neutral module therefore owns the 0x17 *frame* and treats the body as
+/// opaque bytes. The wire is unchanged: the body is the same canonical CBOR, and
+/// the frozen vectors keep proving it.
 #[derive(Serialize, Deserialize, Clone, PartialEq, Eq)]
 pub struct NetworkSettings {
     pub mesh_ipv4: MeshIpv4,
@@ -174,9 +164,9 @@ pub struct NetworkSettings {
 /// rule had been inherited.
 ///
 /// These private mirrors hold the strictness instead, so it cannot escape
-/// [`TunnelFrame::decode`]. Field names and types match the public structs
-/// exactly, so the two encode to identical canonical bytes and the strict
-/// re-encode comparison means the same thing for both.
+/// [`decode_network_settings_body`]. Field names and types match the public
+/// structs exactly, so the two encode to identical canonical bytes and the
+/// strict re-encode comparison means the same thing for both.
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct StrictMeshIpv4Wire {
@@ -217,233 +207,85 @@ impl fmt::Debug for NetworkSettings {
     }
 }
 
+/// Canonical CBOR body for a 0x17 frame.
+///
+/// A CBOR encode failure of this small struct is effectively impossible; on
+/// failure the empty body decodes to `InvalidFrame` and the connection fails
+/// closed, with no interface configured — the same fail-closed outcome the
+/// pre-extraction encoder had.
+#[must_use]
+pub fn encode_network_settings_body(settings: &NetworkSettings) -> NetworkSettingsBody {
+    // Byte-for-byte the pre-extraction expression: the fallback is the EMPTY
+    // body, exactly as `to_canonical_vec(..).unwrap_or_default()` produced.
+    NetworkSettingsBody::encode_canonical_or_empty(settings)
+}
+
+/// Strictly decode a 0x17 body.
+///
+/// This body configures a VPN interface and is consumed before any packet pump,
+/// so only the exact canonical encoding is admitted: non-canonical key order, an
+/// unmodelled key, or trailing bytes fail the connection closed before any
+/// interface exists. Every other frame kind keeps the lenient decoder.
+///
+/// This is the product's path, and it is fully strict: an unmodelled key, a
+/// non-canonical key order or trailing bytes all fail here, before any interface
+/// exists.
+///
+/// **It is NOT the only way to read a body, and an earlier revision of this
+/// comment said it was.** [`NetworkSettingsBody::decode_strict`] is generic in a
+/// caller-chosen type, and a structurally universal one — `ciborium::value::Value`
+/// satisfies its bounds — recovers the content, including for a body this
+/// function would reject, because an unmodelled key survives into `Value` and so
+/// the canonical re-encode still matches. What survives for every caller is
+/// canonicity; what does not survive is "only this decoder can read one".
+///
+/// Stated plainly because a comment asserting an unbypassable property that is
+/// bypassable is worse than no comment: the next reader builds on it. The
+/// structural fix is filed as its own slice — Rust has no negative trait bound,
+/// and a sealed one would exclude this crate's own types too.
+pub fn decode_network_settings_body(
+    body: &NetworkSettingsBody,
+) -> Result<NetworkSettings, DataTunnelError> {
+    Ok(body
+        .decode_strict::<StrictNetworkSettingsWire>()
+        .map_err(|_| DataTunnelError::InvalidFrame("bad network_settings frame".into()))?
+        .into())
+}
+
 // ─── Typed data frames (post-auth) ─────────────────────────────────────────────
 
-/// Frame kind byte prefixed to every post-auth payload.
+// Frame opcodes and the typed exit status moved to the `tunnel-wire-rs` crate
+// (S0): they are wire bytes and carry no decision. Re-exported so consumer
+// imports are unchanged.
+pub use tunnel_wire_rs::tunnel_wire::{
+    FRAME_CLOSE, FRAME_DATA, FRAME_ERROR, FRAME_EXIT, FRAME_HEALTH, FRAME_NETWORK_SETTINGS,
+    FRAME_OPEN, FRAME_RESIZE, FRAME_WINDOW, TargetExit,
+};
+
+// The frame codec itself moved to the `tunnel-wire-rs` crate (S0), redaction included
+// — a neutral codec that printed payloads would be a new leak, not a neutral
+// move. `TunnelFrame::decode` now yields the transport-only `WireError`; the
+// `From` impl below lets every existing `?` site keep working unchanged, which
+// is why 156 error sites across 14 files did not have to be touched.
+pub use tunnel_wire_rs::tunnel_wire::{TunnelFrame, WireError};
+
+/// Widen a transport failure into this product's error.
 ///
-/// `Health` is a liveness probe (echoed → tunnel ready). The rest drive a
-/// PERSISTENT bidirectional stream to the target (claw SSH/terminal): the
-/// engine holds one target connection per session and pipes `Data` both
-/// ways until `Close`/`Error`/EOF. `Window` carries a backpressure credit.
-/// `Resize` (client → engine) carries the terminal dimensions; `Exit`
-/// (engine → client) carries the target process's typed exit status.
-pub const FRAME_HEALTH: u8 = 0x01;
-pub const FRAME_OPEN: u8 = 0x10;
-pub const FRAME_DATA: u8 = 0x11;
-pub const FRAME_CLOSE: u8 = 0x12;
-pub const FRAME_ERROR: u8 = 0x13;
-pub const FRAME_WINDOW: u8 = 0x14;
-pub const FRAME_RESIZE: u8 = 0x15;
-pub const FRAME_EXIT: u8 = 0x16;
-/// `IpTunnel`-only: post-Open server→client per-Claw VPN interface settings.
-/// Body is canonical CBOR of [`NetworkSettings`].
-pub const FRAME_NETWORK_SETTINGS: u8 = 0x17;
-
-/// Typed exit status of an interactive target process.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TargetExit {
-    /// Normal exit with this status code.
-    Code(i32),
-    /// Terminated by this signal number.
-    Signal(i32),
-    /// The target ended without a recoverable status (killed/dropped).
-    Lost,
-}
-
-impl TargetExit {
-    const TAG_CODE: u8 = 0x01;
-    const TAG_SIGNAL: u8 = 0x02;
-    const TAG_LOST: u8 = 0x03;
-
-    fn encode(self) -> [u8; 5] {
-        let (tag, val): (u8, i32) = match self {
-            Self::Code(c) => (Self::TAG_CODE, c),
-            Self::Signal(s) => (Self::TAG_SIGNAL, s),
-            Self::Lost => (Self::TAG_LOST, 0),
-        };
-        let v = val.to_be_bytes();
-        [tag, v[0], v[1], v[2], v[3]]
-    }
-
-    fn decode(payload: &[u8]) -> Result<Self, DataTunnelError> {
-        let arr: [u8; 5] = payload
-            .try_into()
-            .map_err(|_| DataTunnelError::InvalidFrame("bad exit frame".into()))?;
-        let val = i32::from_be_bytes([arr[1], arr[2], arr[3], arr[4]]);
-        match arr[0] {
-            Self::TAG_CODE => Ok(Self::Code(val)),
-            Self::TAG_SIGNAL => Ok(Self::Signal(val)),
-            Self::TAG_LOST => Ok(Self::Lost),
-            other => Err(DataTunnelError::InvalidFrame(format!(
-                "unknown exit tag {other:#04x}"
-            ))),
-        }
-    }
-}
-
-#[derive(Clone, PartialEq, Eq)]
-pub enum TunnelFrame {
-    /// Liveness probe / echo.
-    Health(Vec<u8>),
-    /// Open the persistent stream to the session's target.
-    Open,
-    /// Bidirectional stream bytes.
-    Data(Vec<u8>),
-    /// Clean close of the stream (either direction).
-    Close,
-    /// Typed error; payload is a stable reason string.
-    Error(String),
-    /// Backpressure credit: the peer may send up to `n` more bytes.
-    Window(u32),
-    /// Terminal resize (client → engine): the target PTY's column/row count.
-    Resize { cols: u16, rows: u16 },
-    /// Target process exit (engine → client): the typed exit status, sent
-    /// just before the closing [`TunnelFrame::Close`].
-    Exit(TargetExit),
-    /// `IpTunnel`-only (engine → client): the per-Claw VPN interface settings,
-    /// sent immediately after the Open-ack. CBOR-encoded body.
-    NetworkSettings(NetworkSettings),
-}
-
-struct RedactedFramePayload {
-    len: usize,
-}
-
-impl fmt::Debug for RedactedFramePayload {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("Payload")
-            .field("len", &self.len)
-            .field("bytes", &"<redacted>")
-            .finish()
-    }
-}
-
-struct RedactedFrameText {
-    len: usize,
-}
-
-impl fmt::Debug for RedactedFrameText {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("Text")
-            .field("len", &self.len)
-            .field("value", &"<redacted>")
-            .finish()
-    }
-}
-
-impl fmt::Debug for TunnelFrame {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Health(payload) => f
-                .debug_tuple("Health")
-                .field(&RedactedFramePayload { len: payload.len() })
-                .finish(),
-            Self::Open => f.write_str("Open"),
-            Self::Data(payload) => f
-                .debug_tuple("Data")
-                .field(&RedactedFramePayload { len: payload.len() })
-                .finish(),
-            Self::Close => f.write_str("Close"),
-            Self::Error(reason) => f
-                .debug_tuple("Error")
-                .field(&RedactedFrameText { len: reason.len() })
-                .finish(),
-            Self::Window(n) => f.debug_tuple("Window").field(n).finish(),
-            Self::Resize { cols, rows } => f
-                .debug_struct("Resize")
-                .field("cols", cols)
-                .field("rows", rows)
-                .finish(),
-            Self::Exit(status) => f.debug_tuple("Exit").field(status).finish(),
-            Self::NetworkSettings(ns) => f.debug_tuple("NetworkSettings").field(ns).finish(),
-        }
-    }
-}
-
-impl TunnelFrame {
-    #[must_use]
-    pub fn encode(&self) -> Vec<u8> {
-        let mut out = Vec::new();
-        match self {
-            Self::Health(p) => {
-                out.push(FRAME_HEALTH);
-                out.extend_from_slice(p);
-            }
-            Self::Open => out.push(FRAME_OPEN),
-            Self::Data(p) => {
-                out.push(FRAME_DATA);
-                out.extend_from_slice(p);
-            }
-            Self::Close => out.push(FRAME_CLOSE),
-            Self::Error(reason) => {
-                out.push(FRAME_ERROR);
-                out.extend_from_slice(reason.as_bytes());
-            }
-            Self::Window(n) => {
-                out.push(FRAME_WINDOW);
-                out.extend_from_slice(&n.to_be_bytes());
-            }
-            Self::Resize { cols, rows } => {
-                out.push(FRAME_RESIZE);
-                out.extend_from_slice(&cols.to_be_bytes());
-                out.extend_from_slice(&rows.to_be_bytes());
-            }
-            Self::Exit(status) => {
-                out.push(FRAME_EXIT);
-                out.extend_from_slice(&status.encode());
-            }
-            Self::NetworkSettings(ns) => {
-                out.push(FRAME_NETWORK_SETTINGS);
-                // A CBOR encode failure of this small struct is effectively
-                // impossible; on failure the empty body decodes to InvalidFrame
-                // and the connection fails closed (no interface configured).
-                out.extend_from_slice(&cbor::to_canonical_vec(ns).unwrap_or_default());
-            }
-        }
-        out
-    }
-
-    pub fn decode(bytes: &[u8]) -> Result<Self, DataTunnelError> {
-        let (&kind, payload) = bytes
-            .split_first()
-            .ok_or_else(|| DataTunnelError::InvalidFrame("empty frame".into()))?;
-        match kind {
-            FRAME_HEALTH => Ok(Self::Health(payload.to_vec())),
-            FRAME_OPEN => Ok(Self::Open),
-            FRAME_DATA => Ok(Self::Data(payload.to_vec())),
-            FRAME_CLOSE => Ok(Self::Close),
-            FRAME_ERROR => Ok(Self::Error(String::from_utf8_lossy(payload).into_owned())),
-            FRAME_WINDOW => {
-                let arr: [u8; 4] = payload
-                    .try_into()
-                    .map_err(|_| DataTunnelError::InvalidFrame("bad window frame".into()))?;
-                Ok(Self::Window(u32::from_be_bytes(arr)))
-            }
-            FRAME_RESIZE => {
-                let arr: [u8; 4] = payload
-                    .try_into()
-                    .map_err(|_| DataTunnelError::InvalidFrame("bad resize frame".into()))?;
-                Ok(Self::Resize {
-                    cols: u16::from_be_bytes([arr[0], arr[1]]),
-                    rows: u16::from_be_bytes([arr[2], arr[3]]),
-                })
-            }
-            FRAME_EXIT => Ok(Self::Exit(TargetExit::decode(payload)?)),
-            // Strict: this body configures a VPN interface and is consumed
-            // before any packet pump, so only the exact canonical encoding is
-            // admitted. Non-canonical key order, an unmodelled key, or
-            // trailing bytes fail the connection closed before any interface
-            // exists. Every other frame kind keeps the lenient decoder.
-            FRAME_NETWORK_SETTINGS => Ok(Self::NetworkSettings(
-                cbor::from_canonical_slice_strict::<StrictNetworkSettingsWire>(payload)
-                    .map_err(|_| {
-                        DataTunnelError::InvalidFrame("bad network_settings frame".into())
-                    })?
-                    .into(),
-            )),
-            other => Err(DataTunnelError::InvalidFrame(format!(
-                "unknown frame kind {other:#04x}"
-            ))),
+/// The mechanic/authority line runs *inside* the old enum, not around it: the
+/// neutral module owns the framing/I-O arms, and the four authorization arms
+/// (`AuthTimeout`, `Rejected`, `TokenRejected`, `HealthMismatch`) stay here.
+/// Conversion — not a type parameter and not an open payload variant — is what
+/// joins them, so neither side gains a caller-chosen position.
+impl From<WireError> for DataTunnelError {
+    fn from(e: WireError) -> Self {
+        match e {
+            WireError::Io(m) => Self::Io(m),
+            WireError::FrameTooLarge(n) => Self::FrameTooLarge(n),
+            WireError::Closed(w) => Self::Closed(w),
+            WireError::Cbor(m) => Self::Cbor(m),
+            WireError::UnexpectedAck => Self::UnexpectedAck,
+            WireError::InvalidFrame(m) => Self::InvalidFrame(m),
+            WireError::TargetUnavailable(m) => Self::TargetUnavailable(m),
         }
     }
 }
@@ -1124,7 +966,10 @@ where
             mtu: 1280,
             session_id: cred.session_id(),
         };
-        send_frame(&mut tunnel_w, &TunnelFrame::NetworkSettings(settings)).await?;
+        // The product encodes its own body; the neutral frame carries it opaque.
+        // Same canonical CBOR, so the wire is byte-identical.
+        let body = encode_network_settings_body(&settings);
+        send_frame(&mut tunnel_w, &TunnelFrame::NetworkSettings(body)).await?;
         tracing::debug!(stage = "claw_share.data_tunnel.network_settings_sent", target_id = %short_str(&target_id));
     }
 
@@ -1306,7 +1151,8 @@ pub async fn recv_frame<R>(r: &mut R) -> Result<TunnelFrame, DataTunnelError>
 where
     R: AsyncRead + Unpin,
 {
-    TunnelFrame::decode(&read_frame(r, "frame").await?)
+    // `?` is what applies `From<WireError>`; a bare tail expression would not.
+    Ok(TunnelFrame::decode(&read_frame(r, "frame").await?)?)
 }
 
 /// Health probe round-trip; returns the echoed bytes.
@@ -1389,6 +1235,117 @@ mod tests {
 
     fn engine_hh() -> HouseholdId {
         derive_household_id(&owner().public())
+    }
+
+    // ── S0 oracle: frozen claw wire vectors ────────────────────────────────
+    //
+    // These assert the wire bytes of every `TunnelFrame` variant against a
+    // fixture that lives in `tests/data/`, NOT in this file. That separation is
+    // the point: S0 will move this codec into a neutral module, and an oracle
+    // living in the file under test would move with it and could be regenerated
+    // by the very commit it is supposed to judge. The fixture lands in an
+    // EARLIER commit, so its blob belongs to a prior generation and
+    // `git diff --name-only <vectors-commit> <extraction-commit> -- <fixture>`
+    // being empty is a fact about history rather than a promise.
+    //
+    // The vectors were emitted from the live encoder, not hand-written.
+
+    fn s0_wire_vectors() -> Vec<(String, Vec<u8>)> {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/data/s0_claw_wire_vectors_v1.json");
+        let raw = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("S0 wire-vector fixture unreadable at {path:?}: {e}"));
+        let doc: serde_json::Value = serde_json::from_str(&raw).expect("fixture is JSON");
+        let cases = doc["vectors"].as_array().expect("vectors array");
+        assert!(!cases.is_empty(), "the fixture must not be empty");
+        cases
+            .iter()
+            .map(|c| {
+                let name = c["name"].as_str().expect("name").to_string();
+                let bytes = hex_decode(c["hex"].as_str().expect("hex"));
+                (name, bytes)
+            })
+            .collect()
+    }
+
+    fn hex_decode(s: &str) -> Vec<u8> {
+        assert!(s.len().is_multiple_of(2), "hex must be even-length");
+        (0..s.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&s[i..i + 2], 16).expect("hex digit"))
+            .collect()
+    }
+
+    /// Every frozen vector must still decode, and re-encode to the SAME bytes.
+    ///
+    /// This is the byte-equality oracle S0 is measured against. It runs
+    /// identically before and after the neutral extraction; if the move changes
+    /// a single wire byte of claw behaviour, this fails.
+    #[test]
+    fn s0_claw_wire_vectors_round_trip_byte_identical() {
+        let vectors = s0_wire_vectors();
+        assert_eq!(
+            vectors.len(),
+            11,
+            "the frozen set covers every TunnelFrame variant; losing one \
+             silently narrows the oracle"
+        );
+        for (name, bytes) in vectors {
+            let frame = TunnelFrame::decode(&bytes)
+                .unwrap_or_else(|e| panic!("{name}: frozen vector no longer decodes: {e:?}"));
+            let re = frame.encode();
+            assert_eq!(
+                re, bytes,
+                "{name}: re-encoding the frozen vector produced different wire bytes"
+            );
+        }
+    }
+
+    /// Non-vacuity control for the oracle above.
+    ///
+    /// A round-trip test passes trivially if the fixture is empty, if the
+    /// decoder accepts anything, or if `encode` and `decode` are inverses of
+    /// each other while both drifting together. This pins the opcode byte of
+    /// each vector against the `FRAME_*` constants independently of the codec,
+    /// and proves the decoder rejects a corrupted vector.
+    #[test]
+    fn s0_wire_vector_oracle_can_actually_fail() {
+        let vectors = s0_wire_vectors();
+        let expected_opcode: std::collections::BTreeMap<&str, u8> = [
+            ("health", FRAME_HEALTH),
+            ("open", FRAME_OPEN),
+            ("data", FRAME_DATA),
+            ("close", FRAME_CLOSE),
+            ("error", FRAME_ERROR),
+            ("window", FRAME_WINDOW),
+            ("resize", FRAME_RESIZE),
+            ("exit_code", FRAME_EXIT),
+            ("exit_signal", FRAME_EXIT),
+            ("exit_lost", FRAME_EXIT),
+            ("network_settings", FRAME_NETWORK_SETTINGS),
+        ]
+        .into_iter()
+        .collect();
+
+        for (name, bytes) in &vectors {
+            let want = expected_opcode
+                .get(name.as_str())
+                .unwrap_or_else(|| panic!("{name}: vector not covered by the opcode control"));
+            assert_eq!(
+                bytes[0], *want,
+                "{name}: frozen vector's opcode byte drifted from the FRAME_* constant"
+            );
+        }
+
+        // The needle: a corrupted opcode must be rejected, so "it decoded" is
+        // information and not a foregone conclusion.
+        let mut corrupt = vectors[0].1.clone();
+        corrupt[0] = 0xEE;
+        assert!(
+            TunnelFrame::decode(&corrupt).is_err(),
+            "the decoder accepts an unknown opcode; the round-trip oracle would \
+             then pass for the wrong reason"
+        );
     }
 
     #[test]
@@ -2434,14 +2391,46 @@ mod tests {
     }
 
     #[test]
+    // ── S0 relocation notice, for the four 0x17 strictness tests ────────────
+    //
+    // These four are X2's, and they are CHANGED by S0 — declared, not hidden.
+    // They used to assert rejection at `TunnelFrame::decode`, because the strict
+    // mirrors lived beside the codec and the strictness "could not escape" it.
+    // S0 had to move the settings struct product-side: it carries a `session_id`
+    // stamped by the serve loop, and a neutral type may not hold a field whose
+    // only legitimate producer is an authority.
+    //
+    // So the assertion point moves to `decode_network_settings_body`, which is
+    // now the only public way to interpret a sealed `NetworkSettingsBody`. Every
+    // mutant and every positive control is preserved byte for byte; only the
+    // call path changed. The claim "the existing claw tests pass unmodified" is
+    // therefore NOT made for these four — the frozen wire vectors under
+    // `tests/data/`, untouched since an earlier commit, carry the byte-identity
+    // proof instead.
     fn network_settings_canonical_body_is_accepted() {
         let settings = network_settings_fixture();
         let body = cbor::to_canonical_vec(&settings).expect("canonical encode");
 
+        // The frame still decodes, and the sealed body still yields the settings
+        // through the strict door.
+        let frame = TunnelFrame::decode(&network_settings_frame(&body)).expect("frame decodes");
+        let TunnelFrame::NetworkSettings(sealed) = frame else {
+            panic!("expected a NetworkSettings frame");
+        };
         assert_eq!(
-            TunnelFrame::decode(&network_settings_frame(&body)).expect("canonical body decodes"),
-            TunnelFrame::NetworkSettings(settings),
+            decode_network_settings_body(&sealed).expect("canonical body decodes"),
+            settings,
         );
+    }
+
+    /// Helper for the three mutant tests: run a body through the frame and then
+    /// the strict door, which is where rejection now lives.
+    fn strict_decode_via_frame(body: &[u8]) -> Result<NetworkSettings, DataTunnelError> {
+        let frame = TunnelFrame::decode(&network_settings_frame(body))?;
+        let TunnelFrame::NetworkSettings(sealed) = frame else {
+            panic!("expected a NetworkSettings frame");
+        };
+        decode_network_settings_body(&sealed)
     }
 
     #[test]
@@ -2471,7 +2460,7 @@ mod tests {
         );
 
         assert!(
-            TunnelFrame::decode(&network_settings_frame(&body)).is_err(),
+            strict_decode_via_frame(&body).is_err(),
             "non-canonical key order must be rejected"
         );
     }
@@ -2508,7 +2497,7 @@ mod tests {
         );
 
         assert!(
-            TunnelFrame::decode(&network_settings_frame(&body)).is_err(),
+            strict_decode_via_frame(&body).is_err(),
             "an unmodelled key must be rejected"
         );
     }
@@ -2527,7 +2516,7 @@ mod tests {
         );
 
         assert!(
-            TunnelFrame::decode(&network_settings_frame(&body)).is_err(),
+            strict_decode_via_frame(&body).is_err(),
             "trailing bytes inside the frame must be rejected"
         );
     }

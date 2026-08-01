@@ -15,9 +15,9 @@ use std::fs::File;
 use std::future::Future;
 use std::pin::Pin;
 
-use crate::apns_dispatcher::{ApnsError, ApnsTransport, APNS_TOPIC_ENV};
+use crate::apns_dispatcher::{APNS_TOPIC_ENV, ApnsError, ApnsTransport};
 use crate::apns_push::{
-    apns_endpoint_from_env, APNS_PUSH_KEY_ID_ENV, APNS_PUSH_KEY_PATH_ENV, APNS_PUSH_TEAM_ID_ENV,
+    APNS_PUSH_KEY_ID_ENV, APNS_PUSH_KEY_PATH_ENV, APNS_PUSH_TEAM_ID_ENV, apns_endpoint_from_env,
 };
 
 pub struct A2TickleTransport {

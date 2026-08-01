@@ -16,7 +16,6 @@ use tokio::task::JoinHandle;
 
 use crate::claw_share_relay_stream_admission::RelayStreamAdmission;
 use crate::claw_share_relay_stream_contract::RelayStreamOfferContract;
-use crate::claw_share_session_clock::AdmissionInstant;
 use crate::claw_share_relay_stream_responder::{
     ResponderDataTunnelDeps, serve_relay_stream_responder_connection,
 };
@@ -25,6 +24,7 @@ use crate::claw_share_relay_stream_responder_params::{
     RelayStreamResponderParams, RelayStreamResponderParamsError,
     assemble_relay_stream_responder_params,
 };
+use crate::claw_share_session_clock::AdmissionInstant;
 
 const DEFAULT_MAX_ACTIVE_CONNECTIONS: usize = 128;
 
@@ -155,9 +155,9 @@ where
             // sanity floor), and with a broken clock `not_after` can never be
             // enforced — so refuse rather than serve fail-open. This same pair
             // is transported downstream; nothing recaptures an anchor later.
-            let Some(admission_instant) = AdmissionInstant::capture(
-                "claw_share.relay_stream_responder.admission",
-            ) else {
+            let Some(admission_instant) =
+                AdmissionInstant::capture("claw_share.relay_stream_responder.admission")
+            else {
                 tracing::warn!(
                     stage = "claw_share.relay_stream_responder.clock_rejected",
                     %peer,

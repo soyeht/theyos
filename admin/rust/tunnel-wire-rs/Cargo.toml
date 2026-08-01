@@ -1,0 +1,27 @@
+[package]
+name = "tunnel-wire-rs"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+description = "S0 — neutral tunnel wire mechanics, shared by every product"
+
+# The boundary IS this dependency list. `household-rs` holds claw authority and
+# is deliberately absent: with no edge, no `pub use` chain in that crate can make
+# claw authority reachable from here, because the paths do not resolve at all.
+# This is the mechanism the S0 design's layer-3 "reachability" guard needs and
+# that no checker in this repository can supply — see the crate docs in
+# `src/lib.rs`. Adding `household-rs` here is the RED mutant.
+[dependencies]
+ciborium  = { workspace = true }
+# `poll(2)` and the pollfd types for the readiness loop. A syscall wrapper, not
+# an authority.
+libc      = { workspace = true }
+serde     = { workspace = true }
+thiserror = { workspace = true }
+# The parked-worker pool: task spawning, the shared semaphore, the resync tick.
+# Scheduling primitives, not authority.
+tokio     = { workspace = true }
+tracing   = { workspace = true }
+
+[lints]
+workspace = true

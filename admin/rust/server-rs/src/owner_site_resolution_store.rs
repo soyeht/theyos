@@ -395,7 +395,12 @@ impl OwnerSiteResolutionStore {
         if &self.envelope.records[index].claim_id != claim_id {
             return Err(OwnerSiteResolutionStoreError::DuplicateClaim);
         }
-        if self.envelope.consumed_claims.binary_search(claim_id).is_ok() {
+        if self
+            .envelope
+            .consumed_claims
+            .binary_search(claim_id)
+            .is_ok()
+        {
             return Err(OwnerSiteResolutionStoreError::DuplicateClaim);
         }
         if self.envelope.consumed_claims.len() >= MAX_OWNER_SITE_CONSUMED_CLAIMS {
@@ -565,7 +570,8 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let mut s = store(tmp.path());
         assert!(s.live_record(&key(1)).is_none());
-        s.register_pending(key(1), [9; 32], 1, [2; 32], 3, 4).unwrap();
+        s.register_pending(key(1), [9; 32], 1, [2; 32], 3, 4)
+            .unwrap();
         assert_eq!(
             s.live_record(&key(1)).map(OwnerSiteResolutionRecord::state),
             Some(OwnerSiteResolutionState::Pending)
@@ -579,7 +585,8 @@ mod tests {
     fn duplicate_key_and_claim_are_rejected() {
         let tmp = tempfile::tempdir().unwrap();
         let mut s = store(tmp.path());
-        s.register_pending(key(1), [9; 32], 1, [2; 32], 3, 4).unwrap();
+        s.register_pending(key(1), [9; 32], 1, [2; 32], 3, 4)
+            .unwrap();
         assert_eq!(
             s.register_pending(key(1), [8; 32], 1, [2; 32], 3, 4),
             Err(OwnerSiteResolutionStoreError::DuplicateKey)
@@ -594,7 +601,8 @@ mod tests {
     fn promote_consumes_claim_and_is_one_shot() {
         let tmp = tempfile::tempdir().unwrap();
         let mut s = store(tmp.path());
-        s.register_pending(key(1), [9; 32], 1, [2; 32], 3, 4).unwrap();
+        s.register_pending(key(1), [9; 32], 1, [2; 32], 3, 4)
+            .unwrap();
         s.promote(&key(1), &[9; 32]).unwrap();
         assert_eq!(
             s.live_record(&key(1)).map(OwnerSiteResolutionRecord::state),
@@ -612,7 +620,8 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         {
             let mut s = store(tmp.path());
-            s.register_pending(key(1), [9; 32], 1, [2; 32], 3, 4).unwrap();
+            s.register_pending(key(1), [9; 32], 1, [2; 32], 3, 4)
+                .unwrap();
             s.promote(&key(1), &[9; 32]).unwrap();
         }
         // Restart: Promoted must recover as Closed, never live.
@@ -630,7 +639,8 @@ mod tests {
     fn revoke_then_close_is_ordered_and_idempotent() {
         let tmp = tempfile::tempdir().unwrap();
         let mut s = store(tmp.path());
-        s.register_pending(key(1), [9; 32], 1, [2; 32], 3, 4).unwrap();
+        s.register_pending(key(1), [9; 32], 1, [2; 32], 3, 4)
+            .unwrap();
         s.promote(&key(1), &[9; 32]).unwrap();
         s.begin_revoke(&key(1), 5).unwrap();
         assert_eq!(
@@ -668,7 +678,8 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         let tmp = tempfile::tempdir().unwrap();
         let mut s = store(tmp.path());
-        s.register_pending(key(1), [9; 32], 1, [2; 32], 3, 4).unwrap();
+        s.register_pending(key(1), [9; 32], 1, [2; 32], 3, 4)
+            .unwrap();
         let path = OwnerSiteResolutionStore::state_path(tmp.path());
         let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600, "the durable promotion-state file must be 0600");
@@ -689,7 +700,10 @@ mod tests {
         let mut hh = base.clone();
         hh.household = "other-household".to_string();
         for other in [ws, cid, ep, cb, hh] {
-            assert_ne!(base, other, "each key component must change the key identity");
+            assert_ne!(
+                base, other,
+                "each key component must change the key identity"
+            );
         }
     }
 
@@ -697,7 +711,8 @@ mod tests {
     fn commit_write_failure_fails_closed_and_leaves_state_untouched() {
         let tmp = tempfile::tempdir().unwrap();
         let mut s = store(tmp.path());
-        s.register_pending(key(1), [9; 32], 1, [2; 32], 3, 4).unwrap();
+        s.register_pending(key(1), [9; 32], 1, [2; 32], 3, 4)
+            .unwrap();
 
         let before_len = s.envelope.records.len();
         let path = OwnerSiteResolutionStore::state_path(tmp.path());

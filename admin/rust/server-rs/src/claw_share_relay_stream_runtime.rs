@@ -37,9 +37,10 @@ use crate::claw_share_relay_stream_reverse_connect_binding::bind_relay_stream_re
 #[cfg(any(test, feature = "dev_t1_datapath"))]
 use crate::claw_share_relay_stream_reverse_connect_binding::bind_relay_stream_reverse_connect_with_ip_tunnel_router;
 use crate::claw_share_relay_stream_reverse_connect_pool::{
-    RelayStreamOfferResyncDriverHandle, RelayStreamReverseConnectBindingBuildError,
-    RelayStreamReverseConnectBindingFactory, RelayStreamReverseConnectPoolConfig,
-    RelayStreamReverseConnectPoolError, spawn_relay_stream_offer_resync_driver,
+    RelayStreamOfferResyncDriverHandle, RelayStreamOfferResyncDriverHandleExt,
+    RelayStreamReverseConnectBindingBuildError, RelayStreamReverseConnectBindingFactory,
+    RelayStreamReverseConnectPoolConfig, RelayStreamReverseConnectPoolError,
+    spawn_relay_stream_offer_resync_driver,
 };
 #[cfg(any(test, feature = "dev_t1_datapath"))]
 use crate::claw_share_relay_stream_target_router::{
@@ -510,7 +511,7 @@ mod tests {
                 .unwrap(),
             trust_refresh: RelayStreamTrustRefreshConfig::new(Duration::from_millis(100)),
             pool: RelayStreamReverseConnectPoolConfig {
-                per_offer_parked: 1,
+                per_item_parked: 1,
                 max_total_connections: 1,
                 backoff: crate::claw_share_relay_stream_reverse_connect_pool::RelayStreamReverseConnectBackoffPolicy::new(
                     Duration::from_millis(25),

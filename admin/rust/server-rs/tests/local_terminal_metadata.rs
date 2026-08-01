@@ -181,7 +181,10 @@ async fn create_reconnect_and_list_report_session_metadata() {
         .await;
     assert_eq!(first.status_code(), StatusCode::OK, "{}", first.text());
     let first_json: serde_json::Value = first.json();
-    assert_eq!(first_json["reconnected"], false, "fresh spawn must not be reported as reconnected");
+    assert_eq!(
+        first_json["reconnected"], false,
+        "fresh spawn must not be reported as reconnected"
+    );
     let tty_path = first_json["slave_tty_path"]
         .as_str()
         .expect("slave_tty_path must be present on create")
@@ -227,7 +230,10 @@ async fn create_reconnect_and_list_report_session_metadata() {
         "pgid must be a real positive process group id"
     );
     assert!(
-        !entry["cwd"].as_str().expect("cwd must be a string").is_empty(),
+        !entry["cwd"]
+            .as_str()
+            .expect("cwd must be a string")
+            .is_empty(),
         "cwd must be populated"
     );
 
