@@ -301,6 +301,19 @@ impl ArtifactResolver {
             });
         }
 
+        // The requested claw (URL path) is the identity the caller asked for;
+        // the manifest body is data. Nothing downstream re-checks this: the
+        // installer turns `manifest.claw` into `create_dir_all` /
+        // `remove_dir_all` targets. A body that names a different claw than
+        // the request is rejected here, before it can steer the install
+        // directory.
+        if manifest.claw != claw {
+            return Err(ArtifactError::Validation(format!(
+                "manifest claw {:?} does not match requested claw {claw:?}",
+                manifest.claw,
+            )));
+        }
+
         Ok(manifest)
     }
 

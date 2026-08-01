@@ -871,6 +871,9 @@ async fn admin_upsert_provider(
         credential,
     } = body;
     let id = normalize_provider_id(&id)?;
+    if let Some(account) = config.credential_account.as_deref() {
+        validate_credential_account(account)?;
+    }
 
     // Write the credential (if any) BEFORE persisting the profile entry.
     // If we persisted first and the keystore write failed, the profile
@@ -1101,4 +1104,34 @@ fn normalize_provider_id(raw: &str) -> Result<String, ApiError> {
         )));
     }
     Ok(trimmed.to_ascii_lowercase())
+}
+
+/// Reject keystore account names that could collide or escape in the
+/// file backend, whose lossy sanitizer maps `/`, `\` and `\0` all to
+/// `_`. Accounts follow the documented `llm.api_key.<provider>` /
+/// `llm.oauth.<provider>` convention, so we accept `[A-Za-z0-9._-]+`
+/// (same class as provider ids, plus the namespace dot). Unlike
+/// `normalize_provider_id` we never case-fold: an account is a
+/// reference, not a namespace key, and silently rewriting it would be
+/// its own collision source.
+fn validate_credential_account(raw: &str) -> Result<(), ApiError> {
+    if raw.is_empty() {
+        return Err(ApiError(ProxyError::BadRequest(
+            "credential_account must not be empty".into(),
+        )));
+    }
+    if raw.len() > 64 {
+        return Err(ApiError(ProxyError::BadRequest(
+            "credential_account too long (max 64 chars)".into(),
+        )));
+    }
+    if !raw
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.')
+    {
+        return Err(ApiError(ProxyError::BadRequest(
+            "credential_account must match [A-Za-z0-9._-]+".into(),
+        )));
+    }
+    Ok(())
 }

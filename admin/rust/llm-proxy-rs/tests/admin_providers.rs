@@ -490,3 +490,51 @@ async fn no_credential_get_endpoint_exists() {
         );
     }
 }
+
+/// Brother 6: the request body `credential_account` is an arbitrary
+/// client string that reached the keystore verbatim while the sibling
+/// `id` field was validated. Account names become file paths in the
+/// file backend through a lossy sanitizer (`/`, `\`, `\0` all map to
+/// `_`), so malformed accounts must be rejected before `ks.set` /
+/// `ks.delete` ever see them.
+#[tokio::test]
+async fn upsert_provider_rejects_malformed_credential_account() {
+    let tmp = tempfile::tempdir().unwrap();
+    let ks = tempfile::tempdir().unwrap();
+    let (state, keystore) = fixture(tmp.path(), ks.path());
+    let (base, _h) = spawn(state).await;
+
+    for account in [
+        "llm.api_key/../escape",
+        "a/b",
+        "a\\b",
+        "a\0b",
+        "",
+        &"x".repeat(65),
+    ] {
+        let body = serde_json::json!({
+            "id": "prov-mal",
+            "kind": "openai-compat",
+            "base_url": "http://127.0.0.1:2/v1",
+            "credential_account": account,
+            "models": ["model-b"],
+            "credential": "sk-mal"
+        });
+        let resp = reqwest::Client::new()
+            .post(format!("{base}/admin/llm/providers"))
+            .json(&body)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            400,
+            "credential_account {account:?} must be rejected with 400; got {}",
+            resp.status(),
+        );
+        assert!(
+            keystore.get(account).is_err(),
+            "malformed credential_account {account:?} reached the keystore",
+        );
+    }
+}

@@ -681,4 +681,102 @@ mod tests {
             PathBuf::from(fingerprint.as_str())
         );
     }
+
+    /// Brother 8 RED: `resolve(claw)` fetches by the *requested* claw (URL
+    /// path), but `install()` turns the *manifest body* `claw` into
+    /// `create_dir_all` / `remove_dir_all` targets — and nothing compared
+    /// the two. This test publishes a manifest whose `claw` disagrees with
+    /// the requested claw and asserts on the **disk paths** that the flow
+    /// creates (the effect site), not on any returned value.
+    #[test]
+    fn install_never_writes_outside_the_requested_claw_directory() {
+        use sha2::{Digest, Sha256};
+        use std::fmt::Write as _;
+
+        for (body_claw, forbidden_rel) in [
+            ("../escaped", "escaped"),
+            ("attacker", "goldens/attacker"),
+        ] {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let assets_dir = tmp.path().join("assets");
+            fs::create_dir_all(&assets_dir).unwrap();
+
+            // Compress a fake rootfs and hash the compressed bytes (same
+            // recipe as install_happy_path_with_fixture_server).
+            let rootfs_content = b"fake rootfs for the brother-8 red";
+            let mut zst_buf = Vec::new();
+            {
+                let mut encoder = zstd::Encoder::new(&mut zst_buf, 1).unwrap();
+                encoder.write_all(rootfs_content).unwrap();
+                encoder.finish().unwrap();
+            }
+            let digest = Sha256::digest(&zst_buf);
+            let mut sha256_hex = String::with_capacity(64);
+            for b in digest {
+                let _ = write!(sha256_hex, "{b:02x}");
+            }
+
+            // Bind first so the manifest URL can point at this server; then
+            // serve [latest.json, rootfs.ext4.zst] in request order.
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let base_url = format!("http://127.0.0.1:{port}");
+
+            let manifest = ArtifactManifest {
+                manifest_version: 1,
+                claw: body_claw.into(),
+                version: "1.0.0".into(),
+                arch: core_rs::artifact_registry::host_arch(),
+                fingerprint: "e".repeat(64),
+                base_rootfs_version: "v2".into(),
+                sha256: sha256_hex,
+                size_bytes: zst_buf.len() as u64,
+                url: format!("{base_url}/rootfs.ext4.zst"),
+                published_at: "2026-04-01T00:00:00Z".into(),
+                channel: "stable".into(),
+                base_rootfs_sha256: "b".repeat(64),
+                installer_plan_sha256: "c".repeat(64),
+                kernel_sha256: "d".repeat(64),
+                kernel_version: None,
+                firecracker_version: None,
+                runtime_min_version: None,
+            };
+            let bodies: Vec<Vec<u8>> = vec![
+                serde_json::to_string(&manifest).unwrap().into_bytes(),
+                zst_buf,
+            ];
+            std::thread::spawn(move || {
+                for body in bodies {
+                    if let Ok((mut stream, _)) = listener.accept() {
+                        let mut buf = [0u8; 8192];
+                        let _ = std::io::Read::read(&mut stream, &mut buf);
+                        let header = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                            body.len()
+                        );
+                        let _ = std::io::Write::write_all(&mut stream, header.as_bytes());
+                        let _ = std::io::Write::write_all(&mut stream, &body);
+                    }
+                }
+            });
+
+            // Request "victim"; the registry answers with a manifest whose
+            // body names a different claw. If resolve() lets it through,
+            // install() writes to the body's directory.
+            let resolver = super::super::artifact_resolver::ArtifactResolver::new(&base_url);
+            if let Ok(manifest) = resolver.resolve("victim") {
+                let installer = ArtifactInstaller::new(&assets_dir);
+                let _ = installer.install(&manifest, |_, _| {});
+            }
+
+            // Effect site: nothing may exist outside goldens/victim.
+            let forbidden = assets_dir.join(forbidden_rel);
+            assert!(
+                !forbidden.exists(),
+                "manifest body claw {body_claw:?} steered the install outside \
+                 the requested claw directory: {} exists",
+                forbidden.display(),
+            );
+        }
+    }
 }
