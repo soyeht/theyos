@@ -266,6 +266,8 @@ pub async fn stage(
                 port: bonjour_port,
                 host_label: bonjour_host_label,
                 host_dns: gethostname::gethostname().to_string_lossy().into_owned(),
+                // Joiner announcements carry no household engine to dial.
+                tailnet_addr: None,
                 pair_machine_role: Some(PairMachineBonjourRole::Joiner),
                 owner_display_name: String::new(),
                 device_count: 0,

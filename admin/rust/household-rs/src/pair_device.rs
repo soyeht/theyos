@@ -359,7 +359,38 @@ impl PairDeviceWindow {
         p_id_hint: Option<PersonId>,
     ) -> Result<PairToken, String> {
         let token = PairToken::mint(ttl, p_id_hint)?;
-        self.replace_with(token.clone(), ttl).await;
+        let mut guard = self.inner.state.write().await;
+        let short = self.publish_locked(&mut guard, token.clone());
+        drop(guard);
+        let _ = self
+            .inner
+            .notifier
+            .send(PairDeviceWindowState::Open { short_nonce: short });
+        self.spawn_ttl_cleanup(ttl);
+        Ok(token)
+    }
+
+    /// Publish `token` as the live window **and** persist its snapshot without
+    /// releasing the caller's write guard in between. Returns the short nonce
+    /// so the caller can broadcast after dropping the guard.
+    ///
+    /// Splitting these two writes is the bug this exists to prevent.
+    /// [`Self::install_token_from_current_snapshot`] takes this same lock and
+    /// then decides by re-reading the file, so any window in which memory has
+    /// moved on while the file has not lets the snapshot watcher acquire the
+    /// lock, find the file it expects, and reinstall the token that file
+    /// names — leaving memory holding one nonce while the caller returns
+    /// another. Under one guard the watcher can only ever re-read a file that
+    /// already agrees with memory.
+    ///
+    /// Notify and TTL-cleanup deliberately stay *outside*: neither reads the
+    /// snapshot, and `spawn_ttl_cleanup` takes the lock itself.
+    fn publish_locked(
+        &self,
+        guard: &mut tokio::sync::RwLockWriteGuard<'_, Option<PairToken>>,
+        token: PairToken,
+    ) -> String {
+        let short = token.nonce.as_short_b64();
         if let Some(dir) = &self.inner.state_dir {
             if let Err(e) = crate::storage::atomic_write_cbor(
                 &crate::storage::pair_device_window_path(dir),
@@ -373,7 +404,39 @@ impl PairDeviceWindow {
                 let _ = crate::storage::delete_pair_device_window_snapshot(dir);
             }
         }
-        Ok(token)
+        **guard = Some(token);
+        short
+    }
+
+    /// Return the live token if one is open, otherwise mint one — atomically.
+    ///
+    /// [`Self::current_token`] followed by [`Self::mint_token`] is not the
+    /// same operation: between the two calls a second caller can mint, and
+    /// because `mint_token` *replaces* whatever is present, the first
+    /// caller's response then carries a nonce that is already dead. The
+    /// check and the mint therefore share a single write lock, exactly as
+    /// [`Self::install_token_from_current_snapshot`] does.
+    ///
+    /// Returns `(token, minted)` so the caller can distinguish "served the
+    /// window that was already open" from "opened a new one" in its logs.
+    pub async fn get_or_mint(
+        &self,
+        ttl: Duration,
+        p_id_hint: Option<PersonId>,
+    ) -> Result<(PairToken, bool), String> {
+        let mut guard = self.inner.state.write().await;
+        if let Some(live) = guard.as_ref().filter(|t| !t.is_expired()) {
+            return Ok((live.clone(), false));
+        }
+        let token = PairToken::mint(ttl, p_id_hint)?;
+        let short = self.publish_locked(&mut guard, token.clone());
+        drop(guard);
+        let _ = self
+            .inner
+            .notifier
+            .send(PairDeviceWindowState::Open { short_nonce: short });
+        self.spawn_ttl_cleanup(ttl);
+        Ok((token, true))
     }
 
     /// Snapshot of the current open token, if any. Used by
@@ -594,6 +657,140 @@ mod tests {
     /// Stand-in for an admitted machine cert fingerprint in tests that are not
     /// about the fingerprint itself.
     const FAKE_M_CERT_FP: [u8; 32] = [7u8; 32];
+
+    /// Every caller of a freshly-opened window must walk away with the same
+    /// token. `current_token()` on a miss followed by `mint_token()` does not
+    /// give that: the two calls are separate, `mint_token` replaces whatever
+    /// is stored, and both callers then return — leaving one of them holding
+    /// a nonce the window no longer has.
+    ///
+    /// The race is real, not theoretical. The same harness run against the
+    /// two-step sequence observes divergence on the first round, every time
+    /// (measured 2026-07-31, 5/5 runs); that control is not checked in
+    /// because asserting *that a race happens* is inherently flaky. This
+    /// direction is deterministic: `get_or_mint` holds one write lock across
+    /// the check and the mint, so the answer is always one nonce.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn get_or_mint_hands_every_racing_caller_the_same_token() {
+        const RACERS: usize = 64;
+        for round in 0..40 {
+            let w = PairDeviceWindow::new();
+            let barrier = Arc::new(tokio::sync::Barrier::new(RACERS));
+            let mut handles = Vec::with_capacity(RACERS);
+            for _ in 0..RACERS {
+                let w = w.clone();
+                let b = Arc::clone(&barrier);
+                handles.push(tokio::spawn(async move {
+                    b.wait().await;
+                    w.get_or_mint(Duration::from_secs(60), None)
+                        .await
+                        .unwrap()
+                        .0
+                        .nonce
+                        .as_b64()
+                }));
+            }
+            let mut nonces = std::collections::BTreeSet::new();
+            for h in handles {
+                nonces.insert(h.await.unwrap());
+            }
+            assert_eq!(
+                nonces.len(),
+                1,
+                "round {round}: {RACERS} racing callers received {} distinct nonces; \
+                 all but one of those pairing URIs is already dead",
+                nonces.len()
+            );
+        }
+    }
+
+    /// The persistent path has a second racer the 64-caller test above cannot
+    /// see, because that one uses a non-persistent window: the snapshot
+    /// watcher. It calls [`PairDeviceWindow::install_token_from_current_snapshot`],
+    /// which takes the same write lock and then decides by re-reading the
+    /// file. So publishing the new token to memory and writing the file
+    /// afterwards is not enough — the watcher can take the lock in that gap,
+    /// still see the old file, and reinstall the old token, leaving memory and
+    /// the URI this call returns naming different nonces.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn get_or_mint_never_returns_a_token_memory_does_not_hold() {
+        for round in 0..50 {
+            let td = tempfile::tempdir().unwrap();
+            let w = PairDeviceWindow::with_persistence(td.path().to_path_buf());
+
+            // A snapshot on disk with nothing in memory: the state a daemon
+            // restart leaves behind for the watcher to pick up.
+            let stale = PairToken::mint(Duration::from_secs(60), None).unwrap();
+            let path = crate::storage::pair_device_window_path(td.path());
+            crate::storage::atomic_write_cbor(&path, &stale.to_snapshot()).unwrap();
+            let snap: PairDeviceWindowSnapshot =
+                crate::storage::read_optional_cbor(&path).unwrap().unwrap();
+
+            let watcher = {
+                let w = w.clone();
+                tokio::spawn(async move {
+                    let _ = w.install_token_from_current_snapshot(stale, &snap).await;
+                })
+            };
+            let (served, _) = w.get_or_mint(Duration::from_secs(60), None).await.unwrap();
+            watcher.await.unwrap();
+
+            // Whoever won, memory and the answer must name the same token: if
+            // the watcher went first, `get_or_mint` reuses its token; if
+            // `get_or_mint` went first, the watcher re-reads a file that
+            // already moved on and declines. There is no third outcome.
+            let held = w.current_token().await.expect("a window must be open");
+            assert_eq!(
+                held.nonce.as_b64(),
+                served.nonce.as_b64(),
+                "round {round}: returned a URI naming a nonce the window does not hold — \
+                 the snapshot watcher won the gap between the memory write and the file write"
+            );
+        }
+    }
+
+    /// `mint_token` publishes through the same helper, so it inherits the same
+    /// watcher race and is held to the same invariant. Keeping this test
+    /// separate rather than parameterising the one above means the pre-existing
+    /// caller (`post_pair_device_reissue`) keeps its own teeth.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn mint_token_never_returns_a_token_memory_does_not_hold() {
+        for round in 0..50 {
+            let td = tempfile::tempdir().unwrap();
+            let w = PairDeviceWindow::with_persistence(td.path().to_path_buf());
+            let stale = PairToken::mint(Duration::from_secs(60), None).unwrap();
+            let path = crate::storage::pair_device_window_path(td.path());
+            crate::storage::atomic_write_cbor(&path, &stale.to_snapshot()).unwrap();
+            let snap: PairDeviceWindowSnapshot =
+                crate::storage::read_optional_cbor(&path).unwrap().unwrap();
+
+            let watcher = {
+                let w = w.clone();
+                tokio::spawn(async move {
+                    let _ = w.install_token_from_current_snapshot(stale, &snap).await;
+                })
+            };
+            let minted = w.mint_token(Duration::from_secs(60), None).await.unwrap();
+            watcher.await.unwrap();
+
+            let held = w.current_token().await.expect("a window must be open");
+            assert_eq!(
+                held.nonce.as_b64(),
+                minted.nonce.as_b64(),
+                "round {round}: mint_token returned a nonce the window does not hold"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn get_or_mint_reports_whether_it_opened_the_window() {
+        let w = PairDeviceWindow::new();
+        let (first, minted) = w.get_or_mint(Duration::from_secs(60), None).await.unwrap();
+        assert!(minted, "the first call opens the window");
+        let (second, minted_again) = w.get_or_mint(Duration::from_secs(60), None).await.unwrap();
+        assert!(!minted_again, "the second call must reuse, not re-mint");
+        assert_eq!(first.nonce.as_b64(), second.nonce.as_b64());
+    }
 
     #[tokio::test]
     async fn mint_then_consume() {

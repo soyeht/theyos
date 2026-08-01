@@ -313,6 +313,7 @@ async fn accept_household_happy_path_reaches_ready_and_publishes_ready_txt() {
             owner_display_name: String::new(),
             device_count: 1,
             bootstrap_state: "ready".to_string(),
+            tailnet_addr: None,
         },
         None,
         None,

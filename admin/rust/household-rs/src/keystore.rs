@@ -54,9 +54,47 @@ pub fn se_machine_label(m_id: &MachineId) -> String {
 
 /// Phase 1 creates the SE key before the derived `hh_id`/`m_id` exists, so
 /// create and load both use fixed labels for the singleton local identity.
+///
+/// Suffixed with `.dev` under the `SoyehtDev` namespace so the Dev build's
+/// bootstrap identity — and therefore its derived `hh_id`/`m_id` — never
+/// collides with a real installation's on the same machine. Without this,
+/// both profiles resolved the SAME Secure-Enclave-resident root scalar via
+/// this one unparametrised label, so a household created under `SoyehtDev`
+/// and one created under the production `Soyeht` state dir derived the
+/// IDENTICAL household id — deleting one profile's on-disk state and
+/// reinstalling never produced a fresh identity, because the root key survived
+/// in the Secure Enclave under this shared label. The production label is
+/// left byte-for-byte unchanged (see the backward-compat invariants above) —
+/// only Dev gets a new, disposable label; existing production installs keep
+/// resolving their existing SE key exactly as before.
 #[must_use]
 pub fn se_bootstrap_label(which: &str) -> String {
-    format!("com.soyeht.theyos.{which}.bootstrap")
+    let base = format!("com.soyeht.theyos.{which}.bootstrap");
+    if is_dev_state_namespace() {
+        format!("{base}.dev")
+    } else {
+        base
+    }
+}
+
+/// Whether the current process is running against the `SoyehtDev` state
+/// namespace, mirroring `household_bootstrap::macos_local_app_profile_for_state_dir`'s
+/// `THEYOS_DIR`-basename check (kept independent to avoid a cross-crate
+/// dependency for a single string comparison; the two must be changed
+/// together if the namespace convention ever changes).
+fn is_dev_state_namespace() -> bool {
+    std::env::var("THEYOS_DIR")
+        .ok()
+        .and_then(|dir| {
+            let path = std::path::Path::new(&dir);
+            let name = if path.file_name().is_some_and(|n| n == "household-state") {
+                path.parent().and_then(std::path::Path::file_name)
+            } else {
+                path.file_name()
+            };
+            name.map(|n| n == "SoyehtDev")
+        })
+        .unwrap_or(false)
 }
 
 /// File-based fallback keystore for 32-byte cryptographic scalars.

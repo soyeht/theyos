@@ -19,6 +19,7 @@ fn params(role: PairMachineBonjourRole) -> PublishParams {
         owner_display_name: String::new(),
         device_count: 0,
         bootstrap_state: "ready".into(),
+        tailnet_addr: None,
     }
 }
 

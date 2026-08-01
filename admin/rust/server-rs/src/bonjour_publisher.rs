@@ -52,6 +52,19 @@ use crate::household_listener::{HouseholdExposurePolicy, InterfaceClass};
 
 /// Service type per FR-017.
 const SERVICE_TYPE: &str = "_soyeht-household._tcp.local.";
+
+/// The Tailnet address to publish as `tailnet_addr`, taken from the
+/// post-policy bind set so it is always an address the engine is listening
+/// on. IPv4 only: the peer side (`tailnet_addr` in `_soyeht-setup._tcp`)
+/// already speaks the 100.64/10 form, and a literal IPv6 needs bracketing
+/// the browsers do not do today.
+fn advertisable_tailnet_addr(targets: &[(IpAddr, InterfaceClass)]) -> Option<IpAddr> {
+    targets
+        .iter()
+        .find(|(ip, class)| *class == InterfaceClass::Tailscale && ip.is_ipv4())
+        .map(|(ip, _)| *ip)
+}
+
 const SHUTDOWN_WAIT: Duration = Duration::from_secs(2);
 const TXT_RECONCILE_INTERVAL: Duration = Duration::from_secs(1);
 
@@ -100,6 +113,12 @@ pub struct PublishParams {
     /// protocol's perspective: when empty no `host` TXT key is emitted
     /// and the browser falls back to its own inference.
     pub host_dns: String,
+    /// Bound Tailnet address published as TXT key `tailnet_addr`, so a peer
+    /// that shares the tailnet can reach the engine when the mDNS `host`
+    /// name resolves to a LAN address the exposure policy does not bind.
+    /// Filled by [`publish_household_bonjour`] from the post-policy bind
+    /// set; `None` when this machine has no advertisable Tailnet address.
+    pub tailnet_addr: Option<String>,
     pub pair_machine_role: Option<PairMachineBonjourRole>,
 
     // ── FR-012/FR-013 enrichment fields (NEW, additive-only) ─────────────
@@ -143,6 +162,14 @@ impl HouseholdBonjour {
         }
         if !params.m_id.is_empty() {
             txt.insert("m_id".to_string(), params.m_id.clone());
+        }
+        if let Some(addr) = params
+            .tailnet_addr
+            .as_deref()
+            .map(str::trim)
+            .filter(|addr| !addr.is_empty())
+        {
+            txt.insert("tailnet_addr".to_string(), addr.to_string());
         }
         if !params.host_dns.is_empty() {
             txt.insert("host".to_string(), params.host_dns.clone());
@@ -283,6 +310,28 @@ pub async fn publish_household_bonjour(
     let daemon = backend::PublisherHandle::new()?;
     let fullnames: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
 
+    let mut bound = 0usize;
+    let targets = HouseholdExposurePolicy::bonjour_targets(exposure_state, targets);
+
+    // Advertise an address we actually bound.
+    //
+    // The `host` TXT/SRV record is an mDNS name that a LAN peer resolves to
+    // this machine's LAN address. Once the household leaves onboarding the
+    // exposure policy binds only loopback + Tailnet (see
+    // `household_listener`), so that LAN address has no listener: the peer
+    // dials the advertised name and gets connection-refused. Publishing the
+    // bound Tailnet address alongside `host` gives a peer that shares the
+    // tailnet a target the engine is genuinely serving. Derived from
+    // `targets` — the post-policy bind set — so the advertised address can
+    // never drift from the bound one.
+    //
+    // Set on `params` rather than on the built TXT map: the TXT is rebuilt
+    // from `params` by the reconcile loop below (and by the joiner
+    // publisher), so patching one built map would let the field vanish on
+    // the first pairing-state change.
+    let mut params = params;
+    params.tailnet_addr = advertisable_tailnet_addr(&targets).map(|ip| ip.to_string());
+
     // Pre-fill the pairing-state TXTs from the current window snapshot so
     // the very first publish reflects reality, including short nonces.
     let base_txt = HouseholdBonjour::txt_for_state(
@@ -293,9 +342,6 @@ pub async fn publish_household_bonjour(
 
     let instance = HouseholdBonjour::instance_name(&params);
     let host = HouseholdBonjour::host_label(&params);
-
-    let mut bound = 0usize;
-    let targets = HouseholdExposurePolicy::bonjour_targets(exposure_state, targets);
     for (ip, class) in &targets {
         if !class.is_bonjour_advertisable() {
             continue;

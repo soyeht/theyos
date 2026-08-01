@@ -1283,6 +1283,8 @@ async fn publish_household_bonjour_for_identity(
         port,
         host_label,
         host_dns: raw_hostname,
+        // Filled by `publish_household_bonjour` from the post-policy bind set.
+        tailnet_addr: None,
         pair_machine_role: Some(bonjour_publisher::PairMachineBonjourRole::Founder),
         owner_display_name: String::new(), // populated by agente-front after iCloud name is known
         device_count: u32::from(bs_str == "ready"),

@@ -545,6 +545,8 @@ async fn run_pair_machine(
             port: bind_addr.port(),
             host_label: prepared.m_id.to_string(),
             host_dns: gethostname::gethostname().to_string_lossy().into_owned(),
+            // Joiner announcements carry no household engine to dial.
+            tailnet_addr: None,
             pair_machine_role: Some(PairMachineBonjourRole::Joiner),
             owner_display_name: String::new(),
             device_count: 0,

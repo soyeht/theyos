@@ -146,6 +146,10 @@ pub fn bootstrap_router(state: BootstrapHandlerState) -> Router {
             "/bootstrap/pair-device/reissue",
             post(post_pair_device_reissue),
         )
+        .route(
+            "/bootstrap/pair-device-uri",
+            get(get_bootstrap_pair_device_uri),
+        )
         .route("/health", get(get_health))
         .route("/healthz", get(get_health))
         .route(
@@ -977,6 +981,18 @@ struct ReissueResponse {
     expires_at_unix: u64,
 }
 
+#[derive(Serialize)]
+struct PairDeviceUriResponse {
+    #[serde(rename = "v")]
+    version: u8,
+    house_name: String,
+    host_label: String,
+    hh_id: String,
+    hh_pub: ByteBuf,
+    pair_device_uri: String,
+    expires_at: u64,
+}
+
 pub async fn post_pair_device_reissue(
     State(state): State<BootstrapHandlerState>,
     ConnectInfo(peer): ConnectInfo<std::net::SocketAddr>,
@@ -991,6 +1007,19 @@ pub async fn post_pair_device_reissue(
         );
         return StatusCode::NOT_FOUND.into_response();
     }
+
+    // Gate 5 below reads the window and the mint at the end of this function
+    // writes it, so those two steps have to be one transaction. They did not
+    // used to have a competitor: reissue was the only route that minted, and
+    // `post_pair_device_confirm` only consumed. `get_bootstrap_pair_device_uri`
+    // changed that — it mints too. Without a shared lock the interleaving is
+    // "reissue sees an empty window; the GET takes the mutation lock, mints A
+    // and answers with it; reissue then mints B on top" — and the URI the GET
+    // already returned names a nonce the window no longer holds. Take the same
+    // lock the GET and confirm take, before any state is read.
+    let _mutation_guard = crate::bootstrap_mutation_lock::BOOTSTRAP_MUTATION_LOCK
+        .lock()
+        .await;
 
     // Gate 2 — state gate. Only a Mac that has been named but not yet paired
     // (`named_awaiting_pair`) is eligible to re-open its owner pair window.
@@ -1183,6 +1212,230 @@ pub async fn post_pair_device_reissue(
         pair_qr_uri,
         hh_id: identity.record.hh_id.to_string(),
         expires_at_unix: token.expires_at_unix,
+    })
+}
+
+/// `GET /bootstrap/pair-device-uri` — the Mac-first, no-QR bridge (see
+/// `BootstrapPairDeviceURIClient` on the iOS side). A freshly-launched
+/// iPhone that discovers this Mac over Bonjour/tailnet while the household
+/// is `named_awaiting_pair` has no human present to scan a QR code, so it
+/// asks for the current owner pairing URI directly. Unlike
+/// `/bootstrap/pair-device/reissue`, this route widens the ACL from
+/// loopback-only to loopback-or-tailnet: remote reachability by the owner's
+/// own iPhone over the tailnet is the entire point. It does *not* widen it
+/// any further than that — see Gate 1.
+///
+/// GET is idempotent: `/bootstrap/initialize` itself already mints a
+/// pair-device window as part of house creation, so the common case here is
+/// an already-open window. That existing token's URI is returned as-is
+/// rather than minting a second, competing one — unlike the POST reissue
+/// route, which deliberately rejects that case so a QR mid-scan is never
+/// invalidated out from under the scanner. A GET has no such scanner to
+/// protect, and refusing to serve here would just reproduce the same
+/// "unavailable" failure this route exists to fix.
+pub async fn get_bootstrap_pair_device_uri(
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    State(state): State<BootstrapHandlerState>,
+) -> Response {
+    // Gate 1 — peer ACL. The response body is the complete first-owner
+    // pairing URI, so whoever can call this route can claim the household.
+    // An earlier revision of this handler had no peer check at all, on the
+    // reasoning that `HouseholdExposurePolicy::allows` denies
+    // `InterfaceClass::Lan` in `named_awaiting_pair` and so the listener
+    // could not be reached over LAN anyway. That reasoning was wrong twice:
+    //
+    //   1. the same policy *grants* `InterfaceClass::Mesh` in that state, so
+    //      any mesh peer could reach the route; and
+    //   2. the LAN listener is not torn down at the state transition — it is
+    //      unbound by the reconciliation loop in `household_listener.rs`,
+    //      which runs on a 500 ms tick, leaving a window in which the state
+    //      gate below already passes while the LAN socket is still accepting.
+    //
+    // Bind-time exposure is therefore not a substitute for an admission
+    // check, exactly as `HouseholdExposurePolicy::allows_terminal_attach_peer`
+    // already recognises for the other effectful route. Admit the same set
+    // the reachability echo admits, and give everyone else the bare 404 an
+    // unrouted path would return.
+    if !(peer.ip().is_loopback() || crate::tailnet_address::is_tailnet_ip(peer.ip())) {
+        tracing::warn!(
+            stage = "pair_device.uri.rejected",
+            reason = "peer_not_admitted",
+            peer = %peer,
+        );
+        return StatusCode::NOT_FOUND.into_response();
+    }
+
+    // The remaining gates read bootstrap state, identity and owner-auth, and
+    // then mutate the pairing window. `post_pair_device_confirm` writes owner
+    // auth, consumes the window and advances bootstrap state under
+    // `BOOTSTRAP_MUTATION_LOCK`; without taking the same lock this handler
+    // could pass its owner-not-paired gate, lose the race to a confirm that
+    // runs to completion, and then open a *fresh* pairing window behind an
+    // owner that is already persisted. Serialize the gates and the mutation
+    // together, so the check that decides is the check that holds.
+    let _mutation_guard = crate::bootstrap_mutation_lock::BOOTSTRAP_MUTATION_LOCK
+        .lock()
+        .await;
+
+    // Gate 2 — state gate. Only a Mac that has been named but not yet paired
+    // (`named_awaiting_pair`) has a first-owner pairing URI to hand out.
+    let current_bs = *state.bootstrap.read().await;
+    if current_bs != BootstrapState::NamedAwaitingPair {
+        tracing::warn!(
+            stage = "pair_device.uri.rejected",
+            reason = "wrong_state",
+            state = current_bs.as_str(),
+        );
+        return cbor_error(
+            StatusCode::NOT_FOUND,
+            BootstrapErrorCode::ReissueUnavailable.as_str(),
+            None,
+            Some(current_bs.as_str()),
+        );
+    }
+
+    // Gate 3 — identity must be loaded in memory.
+    let Some(identity) = state.household.current().await else {
+        tracing::warn!(stage = "pair_device.uri.rejected", reason = "identity_unavailable");
+        return cbor_error(
+            StatusCode::NOT_FOUND,
+            BootstrapErrorCode::IdentityUnavailable.as_str(),
+            None,
+            Some(current_bs.as_str()),
+        );
+    };
+
+    // Gate 4 — owner must NOT already be paired. Same in-memory + on-disk
+    // double check as `post_pair_device_reissue`'s Gate 4, for the same
+    // reason: a freshly-loaded engine that hasn't hydrated `owner_auth` into
+    // memory yet must still fail closed. Both halves run under the mutation
+    // lock taken above, so a confirm cannot land between them and the mint.
+    if state.household.current_owner_auth().await.is_some() {
+        tracing::warn!(stage = "pair_device.uri.rejected", reason = "owner_already_paired");
+        return cbor_error(
+            StatusCode::NOT_FOUND,
+            BootstrapErrorCode::AlreadyPaired.as_str(),
+            None,
+            None,
+        );
+    }
+    {
+        let now = crate::time_util::unix_now_secs_checked("pair_device.uri.clock").unwrap_or(0);
+        let record_for_auth = identity.record.clone();
+        let state_dir_auth = state.state_dir.clone();
+        match tokio::task::spawn_blocking(move || {
+            HouseholdAuthState::load_optional(&state_dir_auth, &record_for_auth, now)
+        })
+        .await
+        {
+            Ok(Ok(Some(_))) => {
+                tracing::warn!(
+                    stage = "pair_device.uri.rejected",
+                    reason = "owner_already_paired_on_disk",
+                );
+                return cbor_error(
+                    StatusCode::NOT_FOUND,
+                    BootstrapErrorCode::AlreadyPaired.as_str(),
+                    None,
+                    None,
+                );
+            }
+            Ok(Ok(None)) => {}
+            Ok(Err(e)) => {
+                tracing::warn!(stage = "pair_device.uri.owner_auth_load_failed", error = %e);
+                // Fail closed — an unreadable auth state is indistinguishable
+                // from a paired owner for the purposes of this route.
+                return cbor_error(
+                    StatusCode::NOT_FOUND,
+                    BootstrapErrorCode::AlreadyPaired.as_str(),
+                    None,
+                    None,
+                );
+            }
+            Err(e) => {
+                tracing::error!(stage = "pair_device.uri.owner_auth_task_failed", error = %e);
+                return cbor_error(
+                    StatusCode::NOT_FOUND,
+                    BootstrapErrorCode::AlreadyPaired.as_str(),
+                    None,
+                    None,
+                );
+            }
+        }
+    }
+
+    // Same tailnet-only-or-no-fallback rule as `post_pair_device_reissue`:
+    // the URI advertises a host only when a tailnet address exists, and
+    // never falls back to a LAN address. Gate 1 has already established that
+    // the caller is on loopback or the tailnet, so this is the address the
+    // caller can actually dial back on.
+    let port: u16 = std::env::var("THEYOS_HOUSEHOLD_PORT")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(8091);
+    let host = crate::tailnet_address::current_tailnet_ipv4().map(|ip| format!("{ip}:{port}"));
+
+    // Fingerprint before touching the window, same rationale as the reissue
+    // route: the identity is already validated, so a failure here is an
+    // internal fault, not an availability gap — and it must not leave a
+    // freshly-minted window open behind an error response.
+    let m_cert_fp = match household_rs::machine_cert::fingerprint(&identity.cert) {
+        Ok(fp) => fp,
+        Err(e) => {
+            tracing::error!(stage = "pair_device.uri.m_cert_fp_failed", error = %e);
+            return cbor_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                BootstrapErrorCode::InternalError.as_str(),
+                None,
+                None,
+            );
+        }
+    };
+
+    // Retrieve-or-mint must be one operation, not two. Reading
+    // `current_token()` and then calling `mint_token()` on a miss leaves a
+    // gap in which a second caller mints first; because `mint_token`
+    // *replaces* the stored token, both callers then return, and one of the
+    // two URIs is already dead on arrival.
+    let ttl = Duration::from_secs(crate::household_bootstrap::pair_window_ttl_secs_from_env(
+        "THEYOS_PAIR_DEVICE_TTL_SECS",
+    ));
+    let (token, minted) = match state.pair_device_window.get_or_mint(ttl, None).await {
+        Ok(pair) => pair,
+        Err(e) => {
+            tracing::warn!(stage = "pair_device.uri.mint_failed", error = %e);
+            return cbor_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                BootstrapErrorCode::InternalError.as_str(),
+                None,
+                None,
+            );
+        }
+    };
+
+    let pair_device_uri = token.to_uri_with_host_and_name(
+        &identity.record.hh_pub,
+        host.as_deref(),
+        Some(&identity.record.name),
+        &m_cert_fp,
+    );
+
+    tracing::info!(
+        stage = "pair_device.uri.served",
+        hh_id = %identity.record.hh_id,
+        expires_at_unix = token.expires_at_unix,
+        host = %host.as_deref().unwrap_or(""),
+        minted,
+    );
+
+    cbor_ok(PairDeviceUriResponse {
+        version: 1,
+        house_name: identity.record.name.clone(),
+        host_label: detect_host_label(),
+        hh_id: identity.record.hh_id.to_string(),
+        hh_pub: ByteBuf::from(*identity.record.hh_pub.as_bytes()),
+        pair_device_uri,
+        expires_at: token.expires_at_unix,
     })
 }
 
@@ -3205,5 +3458,410 @@ mod tests {
             !log_line.contains(&body.pair_qr_uri),
             "log line must not contain the full pair_qr_uri"
         );
+    }
+
+    // ── GET /bootstrap/pair-device-uri ──────────────────────────────────
+
+    fn pair_device_uri_request_from(peer: SocketAddr) -> Request<Body> {
+        let mut request = Request::builder()
+            .method("GET")
+            .uri("/bootstrap/pair-device-uri")
+            .body(Body::empty())
+            .unwrap();
+        request.extensions_mut().insert(ConnectInfo(peer));
+        request
+    }
+
+    /// A Tailnet peer — the case this route exists for, and the default for
+    /// the gate tests below so they exercise the admitted-but-not-loopback
+    /// branch rather than the trivial one.
+    fn tailnet_peer() -> SocketAddr {
+        SocketAddr::from(([100, 101, 102, 103], 41234))
+    }
+
+    fn pair_device_uri_request() -> Request<Body> {
+        pair_device_uri_request_from(tailnet_peer())
+    }
+
+    /// Decode a successful CBOR `PairDeviceUriResponse`. Field set mirrors
+    /// `BootstrapPairDeviceURIClient.requiredKeys`/`knownKeys` on the iOS
+    /// side exactly — an extra or missing key here must fail that client's
+    /// `requireKnown`/`requireRequired` checks.
+    #[derive(serde::Deserialize, Debug)]
+    struct PairDeviceUriResponseForTest {
+        #[serde(rename = "v")]
+        version: u8,
+        house_name: String,
+        host_label: String,
+        hh_id: String,
+        hh_pub: serde_bytes::ByteBuf,
+        pair_device_uri: String,
+        expires_at: u64,
+    }
+
+    async fn decode_pair_device_uri_ok(response: Response) -> PairDeviceUriResponseForTest {
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        household_rs::cbor::from_canonical_slice(&bytes).expect("CBOR decode")
+    }
+
+    #[tokio::test]
+    async fn pair_device_uri_admits_loopback_and_tailnet_peers() {
+        // Wider than reissue's loopback-only ACL: a freshly-launched iPhone
+        // reaching this Mac over the tailnet is the entire point.
+        for peer in [
+            SocketAddr::from(([127, 0, 0, 1], 41234)),
+            tailnet_peer(),
+            // Tailscale's IPv6 ULA range counts as tailnet too.
+            SocketAddr::from((
+                "fd7a:115c:a1e0::1".parse::<std::net::Ipv6Addr>().unwrap(),
+                41234,
+            )),
+        ] {
+            let (state, _td) = make_state_with_identity(BootstrapState::NamedAwaitingPair);
+            let app = bootstrap_router(state);
+            let resp = app
+                .oneshot(pair_device_uri_request_from(peer))
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), HStatus::OK, "peer {peer} must be admitted");
+        }
+    }
+
+    #[tokio::test]
+    async fn pair_device_uri_rejects_lan_and_mesh_peers() {
+        // The body is the complete first-owner pairing URI, so an admitted
+        // caller can claim the household. Bind-time exposure does not stand
+        // in for an admission check on either axis:
+        //
+        //   - LAN: `HouseholdExposurePolicy::allows` denies `Lan` in
+        //     `named_awaiting_pair`, but the listener is unbound by a 500 ms
+        //     reconciliation tick, not at the state transition — so the
+        //     state gate can already pass while the LAN socket still accepts.
+        //   - Mesh: that same policy *grants* `Mesh` in this state, so a mesh
+        //     peer reaches the route with no transition window needed at all.
+        //
+        // Both must get the bare 404 an unrouted path returns.
+        for peer in [
+            SocketAddr::from(([192, 168, 1, 50], 41234)),
+            SocketAddr::from(([10, 0, 0, 7], 41234)),
+            SocketAddr::from(([10, 44, 1, 5], 41234)),
+        ] {
+            let (state, _td) = make_state_with_identity(BootstrapState::NamedAwaitingPair);
+            let app = bootstrap_router(state);
+            let resp = app
+                .oneshot(pair_device_uri_request_from(peer))
+                .await
+                .unwrap();
+            assert_eq!(
+                resp.status(),
+                HStatus::NOT_FOUND,
+                "peer {peer} must be refused"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn pair_device_uri_rejected_peer_leaks_no_body() {
+        // A refused caller must not be able to tell this route apart from a
+        // path that does not exist — no CBOR error code, no state string.
+        let (state, _td) = make_state_with_identity(BootstrapState::NamedAwaitingPair);
+        let app = bootstrap_router(state);
+        let resp = app
+            .oneshot(pair_device_uri_request_from(SocketAddr::from((
+                [192, 168, 1, 50],
+                41234,
+            ))))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), HStatus::NOT_FOUND);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(
+            bytes.is_empty(),
+            "refused peer got a {}-byte body",
+            bytes.len()
+        );
+    }
+
+    #[tokio::test]
+    async fn reissue_waits_on_the_bootstrap_mutation_lock() {
+        // This is the test with teeth for the reissue half of the fix. The
+        // GET×reissue test below asserts the invariant the lock buys, but it
+        // cannot *prove* the lock: reissue has no await point between its
+        // Gate 5 window read and its mint, so the interleaving that fix
+        // closes is too narrow to provoke on demand — measured, that test
+        // stays green even with this lock removed. Blocking on the lock is
+        // the property that is directly observable, so assert that.
+        let (state, _td) = make_state_with_identity(BootstrapState::NamedAwaitingPair);
+        let app = bootstrap_router(state);
+        let guard = crate::bootstrap_mutation_lock::BOOTSTRAP_MUTATION_LOCK
+            .lock()
+            .await;
+        let inflight = tokio::spawn(async move {
+            app.oneshot(reissue_request(SocketAddr::from(([127, 0, 0, 1], 51001))))
+                .await
+        });
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(
+            !inflight.is_finished(),
+            "reissue answered while BOOTSTRAP_MUTATION_LOCK was held — it is not serialized \
+             against the pair-device-uri GET or against confirm"
+        );
+
+        drop(guard);
+        let resp = tokio::time::timeout(Duration::from_secs(5), inflight)
+            .await
+            .expect("reissue did not finish after the lock was released")
+            .expect("reissue task panicked")
+            .unwrap();
+        assert_eq!(resp.status(), HStatus::OK);
+    }
+
+    #[tokio::test]
+    async fn pair_device_uri_and_reissue_never_answer_with_different_nonces() {
+        // Reissue used to be the only route that minted, so its Gate 5 read
+        // (`current_token() == None`) needed no lock — nothing else could open
+        // a window underneath it. This GET mints too, which reintroduces the
+        // race at a higher level: reissue sees an empty window, the GET takes
+        // the lock and answers with A, and reissue then mints B on top, so the
+        // URI the GET already handed out names a nonce the window no longer
+        // holds. With both routes on BOOTSTRAP_MUTATION_LOCK only two outcomes
+        // survive — the GET wins and reissue is refused `window_still_open`, or
+        // reissue wins and the GET reuses its token.
+        for round in 0..40 {
+            let (state, _td) = make_state_with_identity(BootstrapState::NamedAwaitingPair);
+            assert!(state.pair_device_window.current_token().await.is_none());
+            let a = bootstrap_router(state.clone());
+            let b = bootstrap_router(state.clone());
+            let (get_res, reissue_res) = tokio::join!(
+                a.oneshot(pair_device_uri_request()),
+                b.oneshot(reissue_request(SocketAddr::from(([127, 0, 0, 1], 51000)))),
+            );
+            let (get_res, reissue_res) = (get_res.unwrap(), reissue_res.unwrap());
+            assert_eq!(
+                get_res.status(),
+                HStatus::OK,
+                "round {round}: the GET is always serviceable in this state"
+            );
+            let reissue_status = reissue_res.status();
+            let get_uri = decode_pair_device_uri_ok(get_res).await.pair_device_uri;
+
+            match reissue_status {
+                HStatus::CONFLICT => {
+                    let (_, body) = decode_cbor_error(reissue_res).await;
+                    assert_eq!(body.error, "window_still_open");
+                }
+                HStatus::OK => {
+                    let reissued = decode_reissue_ok(reissue_res).await.pair_qr_uri;
+                    let held = state
+                        .pair_device_window
+                        .current_token()
+                        .await
+                        .expect("a window must be open");
+                    let nonce = format!("&nonce={}", held.nonce.as_b64());
+                    assert!(
+                        get_uri.contains(&nonce) && reissued.contains(&nonce),
+                        "round {round}: both routes returned 200 naming different nonces"
+                    );
+                }
+                other => panic!("round {round}: unexpected reissue status {other}"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn pair_device_uri_serves_the_nonce_the_window_actually_holds() {
+        // The URI is only usable if the nonce inside it is the one the window
+        // will accept on confirm. Atomicity of retrieve-or-mint under
+        // concurrency is proven where it can actually be raced — see
+        // `household_rs::pair_device::tests::
+        // get_or_mint_hands_every_racing_caller_the_same_token`. Two GETs
+        // through this router cannot race: they serialize on
+        // `BOOTSTRAP_MUTATION_LOCK`, which is the point of taking it.
+        let (state, _td) = make_state_with_identity(BootstrapState::NamedAwaitingPair);
+        let window = Arc::clone(&state.pair_device_window);
+        assert!(window.current_token().await.is_none());
+        let app = bootstrap_router(state);
+        let resp = app.oneshot(pair_device_uri_request()).await.unwrap();
+        assert_eq!(resp.status(), HStatus::OK);
+        let uri = decode_pair_device_uri_ok(resp).await.pair_device_uri;
+        let live = window
+            .current_token()
+            .await
+            .expect("the GET must leave a window open");
+        assert!(
+            uri.contains(&format!("&nonce={}", live.nonce.as_b64())),
+            "served a URI whose nonce is not the one the window holds"
+        );
+    }
+
+    #[tokio::test]
+    async fn pair_device_uri_waits_on_the_bootstrap_mutation_lock() {
+        // `post_pair_device_confirm` writes owner auth, consumes the window
+        // and advances bootstrap state under `BOOTSTRAP_MUTATION_LOCK`. If
+        // this route does not take the same lock it can clear its
+        // owner-not-paired gate, lose the race to a confirm that runs to
+        // completion, and then open a fresh pairing window behind an owner
+        // that is already persisted. Hold the lock and prove the handler
+        // blocks on it rather than reading through it.
+        let (state, _td) = make_state_with_identity(BootstrapState::NamedAwaitingPair);
+        let app = bootstrap_router(state);
+        let guard = crate::bootstrap_mutation_lock::BOOTSTRAP_MUTATION_LOCK
+            .lock()
+            .await;
+        let inflight = tokio::spawn(async move { app.oneshot(pair_device_uri_request()).await });
+
+        // A handler that ignores the lock answers immediately; one that
+        // respects it cannot answer until the guard below is dropped. The
+        // sleep is what gives the spawned task time to actually reach the
+        // lock, so "not finished" means blocked rather than not-yet-started.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(
+            !inflight.is_finished(),
+            "handler answered while BOOTSTRAP_MUTATION_LOCK was held — it is not serialized \
+             against pair-device confirm"
+        );
+
+        drop(guard);
+        let resp = tokio::time::timeout(Duration::from_secs(5), inflight)
+            .await
+            .expect("handler did not finish after the lock was released")
+            .expect("handler task panicked")
+            .unwrap();
+        assert_eq!(resp.status(), HStatus::OK);
+    }
+
+    #[tokio::test]
+    async fn pair_device_uri_state_gate_rejects_non_named_awaiting_pair() {
+        for bs in [
+            BootstrapState::Uninitialized,
+            BootstrapState::ReadyForNaming,
+            BootstrapState::Ready,
+            BootstrapState::Recovering,
+        ] {
+            let (state, _td) = make_state_with_identity(bs);
+            let app = bootstrap_router(state);
+            let resp = app.oneshot(pair_device_uri_request()).await.unwrap();
+            let (status, body) = decode_cbor_error(resp).await;
+            assert_eq!(status, HStatus::NOT_FOUND, "state={bs:?}");
+            assert_eq!(body.error, "reissue_unavailable", "state={bs:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn pair_device_uri_identity_unavailable_when_no_identity_loaded() {
+        let mut state = make_state(BootstrapState::NamedAwaitingPair);
+        state.household = HouseholdState::empty();
+        let app = bootstrap_router(state);
+        let resp = app.oneshot(pair_device_uri_request()).await.unwrap();
+        let (status, body) = decode_cbor_error(resp).await;
+        assert_eq!(status, HStatus::NOT_FOUND);
+        assert_eq!(body.error, "identity_unavailable");
+    }
+
+    #[tokio::test]
+    async fn pair_device_uri_already_paired_when_owner_auth_present() {
+        let (state, td) = make_state_with_identity(BootstrapState::NamedAwaitingPair);
+        let identity = state.household.current().await.unwrap();
+        let owner_auth = real_owner_auth(&identity, Some(td.path()));
+        let household =
+            HouseholdState::loaded_with_owner_auth(Arc::clone(&identity), Some(owner_auth));
+        let state = BootstrapHandlerState { household, ..state };
+        let window = Arc::clone(&state.pair_device_window);
+        let app = bootstrap_router(state);
+        let resp = app.oneshot(pair_device_uri_request()).await.unwrap();
+        let (status, body) = decode_cbor_error(resp).await;
+        assert_eq!(status, HStatus::NOT_FOUND);
+        assert_eq!(body.error, "already_paired");
+        assert!(
+            window.current_token().await.is_none(),
+            "no token may be minted when already paired"
+        );
+    }
+
+    #[tokio::test]
+    async fn pair_device_uri_already_paired_via_on_disk_guard_only() {
+        let (state, td) = make_state_with_identity(BootstrapState::NamedAwaitingPair);
+        let identity = state.household.current().await.unwrap();
+        let _ = real_owner_auth(&identity, Some(td.path())); // persisted, not in memory
+        let app = bootstrap_router(state);
+        let resp = app.oneshot(pair_device_uri_request()).await.unwrap();
+        let (status, body) = decode_cbor_error(resp).await;
+        assert_eq!(status, HStatus::NOT_FOUND);
+        assert_eq!(body.error, "already_paired");
+    }
+
+    #[tokio::test]
+    async fn pair_device_uri_none_window_proceeds_and_opens_token() {
+        let (state, _td) = make_state_with_identity(BootstrapState::NamedAwaitingPair);
+        let window = Arc::clone(&state.pair_device_window);
+        assert!(window.current_token().await.is_none(), "precondition: no window");
+        let app = bootstrap_router(state);
+        let resp = app.oneshot(pair_device_uri_request()).await.unwrap();
+        assert_eq!(resp.status(), HStatus::OK);
+        assert!(window.current_token().await.is_some());
+    }
+
+    #[tokio::test]
+    async fn pair_device_uri_reuses_existing_open_window_instead_of_reissuing() {
+        // The behavioral point of this route vs. POST reissue: a window left
+        // open by `/bootstrap/initialize` (or an earlier call to this same
+        // route) must be served back as-is, not rejected and not replaced.
+        // Rejecting here would just reproduce the bug this route exists to
+        // fix — the iPhone's very first fetch would always lose the race
+        // against `/bootstrap/initialize`'s own mint.
+        let (state, _td) = make_state_with_identity(BootstrapState::NamedAwaitingPair);
+        let existing = state
+            .pair_device_window
+            .mint_token(Duration::from_secs(300), None)
+            .await
+            .expect("pre-mint");
+        let existing_nonce = existing.nonce.as_b64();
+        let window = Arc::clone(&state.pair_device_window);
+        let app = bootstrap_router(state);
+        let resp = app.oneshot(pair_device_uri_request()).await.unwrap();
+        assert_eq!(resp.status(), HStatus::OK);
+        let body = decode_pair_device_uri_ok(resp).await;
+        assert!(
+            body.pair_device_uri.contains(&format!("&nonce={existing_nonce}")),
+            "must echo the already-open window's nonce, not mint a new one: {}",
+            body.pair_device_uri
+        );
+        let still = window.current_token().await.expect("window still open");
+        assert_eq!(still.nonce.as_b64(), existing_nonce, "nonce must not be re-minted");
+    }
+
+    #[tokio::test]
+    async fn pair_device_uri_success_response_shape_and_contents() {
+        let (state, _td) = make_state_with_identity(BootstrapState::NamedAwaitingPair);
+        let hh_id = state.household.current().await.unwrap().record.hh_id.to_string();
+        let window = Arc::clone(&state.pair_device_window);
+        let app = bootstrap_router(state);
+        let resp = app.oneshot(pair_device_uri_request()).await.unwrap();
+        assert_eq!(resp.status(), HStatus::OK);
+        let body = decode_pair_device_uri_ok(resp).await;
+        assert_eq!(body.version, 1);
+        assert_eq!(body.hh_id, hh_id);
+        assert_eq!(body.house_name, "Reissue Home");
+        assert!(!body.host_label.is_empty());
+        assert_eq!(body.hh_pub.len(), 33, "hh_pub must be exactly 33 bytes (SEC1 compressed)");
+        assert!(
+            body.pair_device_uri
+                .starts_with("soyeht://household/pair-device?"),
+            "uri={}",
+            body.pair_device_uri
+        );
+        assert!(body.pair_device_uri.contains("v=1"));
+        assert!(body.pair_device_uri.contains("&hh_pub="));
+        assert!(body.pair_device_uri.contains("&nonce="));
+        assert!(body.pair_device_uri.contains("&ttl="));
+        assert!(body.pair_device_uri.contains("&m_cert_fp="));
+        assert!(body.pair_device_uri.contains("&crit=m_cert_fp"));
+        assert!(body.pair_device_uri.contains("&house_name="));
+        let token = window.current_token().await.unwrap();
+        assert_eq!(token.expires_at_unix, body.expires_at);
     }
 }

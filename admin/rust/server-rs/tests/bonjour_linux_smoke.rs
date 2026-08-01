@@ -37,6 +37,7 @@ fn base_params() -> PublishParams {
         owner_display_name: "Owner".into(),
         device_count: 2,
         bootstrap_state: "ready".into(),
+        tailnet_addr: None,
     }
 }
 
