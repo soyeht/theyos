@@ -170,6 +170,296 @@ PHASE0_INTEGRITY_OWNER_REVIEW_JSON="${OWNER_REVIEW_JSON}" \
 git -C "${REPO}" switch --quiet "${BRANCH}"
 echo "PASS transition_arm"
 
+# ─── ARM from the steady state (insertion path) ─────────────────────────────
+# The steady state of the arm/consume cycle carries NO versioned-transition
+# line and NO transition JSON: that is what the consume leaves behind, and it
+# is what every arm starts from after the first cycle. These cases pin the
+# insertion path (the normal case) and its seal: the expected policy is a pure
+# function of (base bytes, head authorization blob OID, fixed literals) — the
+# inserted line's mode, type, transition kind, path, and position are fixed
+# literals, only its OID field crosses from the head.
+
+STEADY_PLAN="${TMP_ROOT}/steady-plan"
+git clone --quiet --shared "${REPO}" "${STEADY_PLAN}"
+git -C "${STEADY_PLAN}" switch --quiet --detach "${HEAD_OK}"
+# A consume-shaped base: no transition line, no transition JSON.
+awk -F '\t' -v OFS='\t' -v auth="${TRANSITION_AUTH_REL}" \
+  '$5 != auth { print }' \
+  "${STEADY_PLAN}/${POLICY_REL}" > "${STEADY_PLAN}/${POLICY_REL}.tmp"
+mv "${STEADY_PLAN}/${POLICY_REL}.tmp" "${STEADY_PLAN}/${POLICY_REL}"
+rm "${STEADY_PLAN}/${TRANSITION_AUTH_REL}"
+git -C "${STEADY_PLAN}" add -A
+git -C "${STEADY_PLAN}" commit --quiet -m steady-state
+STEADY_BASE="$(git -C "${STEADY_PLAN}" rev-parse HEAD)"
+
+# Build one armed head on top of STEADY_BASE with a caller-supplied head
+# policy file. $1 = path of the fully-formed head policy TSV. Prints the arm
+# head SHA on stdout. The post-consume world equals the steady base exactly,
+# so the JSON's expected tree/policy OIDs come straight from STEADY_BASE.
+build_arm_head_from_steady() {
+  local head_policy_file="$1"
+  git -C "${STEADY_PLAN}" switch --quiet --detach "${STEADY_BASE}"
+  cp "${head_policy_file}" "${STEADY_PLAN}/${POLICY_REL}"
+  cat > "${STEADY_PLAN}/${TRANSITION_AUTH_REL}" <<JSON
+{
+  "contract": "soyeht-owner-present-proof-machinery-transition-v1",
+  "version": 1,
+  "state": "armed",
+  "generation": 1,
+  "armed_from_base_sha": "${STEADY_BASE}",
+  "expected_head_tree_oid": "$(git -C "${STEADY_PLAN}" rev-parse "${STEADY_BASE}^{tree}")",
+  "expected_policy_blob_oid": "$(git -C "${STEADY_PLAN}" rev-parse "${STEADY_BASE}:${POLICY_REL}")",
+  "allowed_paths": [
+    "${POLICY_REL}"
+  ],
+  "owner_authorization": {
+    "mode": "github-repository-admin-review-exact-arm-commit",
+    "requires_owner_review": true,
+    "requires_required_integrity_check": true,
+    "owner_review": {
+      "provider": "github",
+      "required_repository_permission": "admin",
+      "binds_to": "exact-arm-head-sha",
+      "latest_review_only": true
+    },
+    "merge_point": {
+      "provider": "github",
+      "mode": "required-merge-group-revalidation",
+      "requires_current_permission": true,
+      "direct_merge": "rejected-by-required-merge-queue-ruleset"
+    },
+    "canary": "arm-then-consume-merge-blocked-and-allowed",
+    "anti_replay": "base-sha-expected-head-tree-generation-one-shot-consumption"
+  }
+}
+JSON
+  git -C "${STEADY_PLAN}" add -A
+  git -C "${STEADY_PLAN}" commit --quiet -m steady-arm
+  git -C "${STEADY_PLAN}" rev-parse HEAD
+}
+
+# The head policy for a CORRECT insertion: steady base plus the transition
+# line as the first data line, carrying the arm authorization blob OID.
+STEADY_ARM_AUTH_JSON="${TMP_ROOT}/steady-arm-auth.json"
+# (1) Build the armed JSON first to learn its blob OID: the OID feeds the
+# inserted line, and the line feeds nothing else.
+git -C "${STEADY_PLAN}" switch --quiet --detach "${STEADY_BASE}"
+cat > "${STEADY_ARM_AUTH_JSON}" <<JSON
+{
+  "contract": "soyeht-owner-present-proof-machinery-transition-v1",
+  "version": 1,
+  "state": "armed",
+  "generation": 1,
+  "armed_from_base_sha": "${STEADY_BASE}",
+  "expected_head_tree_oid": "$(git -C "${STEADY_PLAN}" rev-parse "${STEADY_BASE}^{tree}")",
+  "expected_policy_blob_oid": "$(git -C "${STEADY_PLAN}" rev-parse "${STEADY_BASE}:${POLICY_REL}")",
+  "allowed_paths": [
+    "${POLICY_REL}"
+  ],
+  "owner_authorization": {
+    "mode": "github-repository-admin-review-exact-arm-commit",
+    "requires_owner_review": true,
+    "requires_required_integrity_check": true,
+    "owner_review": {
+      "provider": "github",
+      "required_repository_permission": "admin",
+      "binds_to": "exact-arm-head-sha",
+      "latest_review_only": true
+    },
+    "merge_point": {
+      "provider": "github",
+      "mode": "required-merge-group-revalidation",
+      "requires_current_permission": true,
+      "direct_merge": "rejected-by-required-merge-queue-ruleset"
+    },
+    "canary": "arm-then-consume-merge-blocked-and-allowed",
+    "anti_replay": "base-sha-expected-head-tree-generation-one-shot-consumption"
+  }
+}
+JSON
+STEADY_ARM_AUTH_OID="$(git -C "${STEADY_PLAN}" hash-object -w "${STEADY_ARM_AUTH_JSON}")"
+
+CORRECT_INSERT_POLICY="${TMP_ROOT}/correct-insert-policy.tsv"
+{
+  head -n 1 "${STEADY_PLAN}/${POLICY_REL}"
+  printf '100644\tblob\t%s\tversioned-transition\t%s\n' \
+    "${STEADY_ARM_AUTH_OID}" "${TRANSITION_AUTH_REL}"
+  tail -n +2 "${STEADY_PLAN}/${POLICY_REL}"
+} > "${CORRECT_INSERT_POLICY}"
+
+run_arm_case() {
+  # $1 = label, $2 = head policy file, $3 = "accept" or "refuse"
+  local label="$1" head_policy_file="$2" expectation="$3" arm_head
+  arm_head="$(build_arm_head_from_steady "${head_policy_file}")"
+  cat > "${OWNER_REVIEW_JSON}" <<JSON
+[
+  {
+    "user": {"id": 1, "login": "reviewer"},
+    "author_association": "MEMBER",
+    "repository_permission": "admin",
+    "state": "APPROVED",
+    "commit_id": "${arm_head}",
+    "submitted_at": "2026-01-01T00:00:00Z"
+  }
+]
+JSON
+  git -C "${STEADY_PLAN}" switch --quiet --detach "${STEADY_BASE}"
+  if PHASE0_INTEGRITY_LOCAL_TEST=1 \
+      PHASE0_INTEGRITY_OWNER_REVIEW_JSON="${OWNER_REVIEW_JSON}" \
+      "${STEADY_PLAN}/.github/scripts/check-mobile-claw-vpn-owner-present-phase0-integrity.sh" \
+      "${STEADY_PLAN}" "${STEADY_BASE}" "${arm_head}" 0 \
+      >"${TMP_ROOT}/${label}.log" 2>&1; then
+    [[ "${expectation}" == "accept" ]] || {
+      echo "error: integrity checker accepted ${label}" >&2
+      exit 1
+    }
+    echo "PASS ${label}"
+  else
+    [[ "${expectation}" == "refuse" ]] || {
+      cat "${TMP_ROOT}/${label}.log" >&2
+      exit 1
+    }
+    grep -Fq "arming transition may only update the authorization OID in the base policy" \
+      "${TMP_ROOT}/${label}.log" \
+      || { cat "${TMP_ROOT}/${label}.log" >&2; exit 1; }
+    echo "PASS ${label}_refused"
+  fi
+}
+
+# (1) base without the line + head inserting the CORRECT line: the case that
+# was impossible before the fix — the normal arm from the steady state.
+run_arm_case steady_arm_insert "${CORRECT_INSERT_POLICY}" accept
+
+# (2) base without the line + insertion carrying the WRONG OID: refused.
+WRONG_OID_POLICY="${TMP_ROOT}/wrong-oid-policy.tsv"
+{
+  head -n 1 "${STEADY_PLAN}/${POLICY_REL}"
+  printf '100644\tblob\t%s\tversioned-transition\t%s\n' \
+    "${STEADY_ARM_AUTH_OID//a/b}" "${TRANSITION_AUTH_REL}"
+  tail -n +2 "${STEADY_PLAN}/${POLICY_REL}"
+} > "${WRONG_OID_POLICY}"
+run_arm_case steady_arm_wrong_oid "${WRONG_OID_POLICY}" refuse
+
+# (3) base without the line + insertion in a DIFFERENT position (last line):
+# the position is a defended literal, not an ordering consequence.
+WRONG_POSITION_POLICY="${TMP_ROOT}/wrong-position-policy.tsv"
+{
+  cat "${STEADY_PLAN}/${POLICY_REL}"
+  printf '100644\tblob\t%s\tversioned-transition\t%s\n' \
+    "${STEADY_ARM_AUTH_OID}" "${TRANSITION_AUTH_REL}"
+} > "${WRONG_POSITION_POLICY}"
+run_arm_case steady_arm_wrong_position "${WRONG_POSITION_POLICY}" refuse
+
+# (4) base without the line + correct insertion AND another line altered: the
+# rest of the policy stays sealed.
+INSERT_PLUS_TAMPER_POLICY="${TMP_ROOT}/insert-plus-tamper-policy.tsv"
+awk -F '\t' -v OFS='\t' \
+  'NR == 3 { $3 = "0000000000000000000000000000000000000000" } { print }' \
+  "${CORRECT_INSERT_POLICY}" > "${INSERT_PLUS_TAMPER_POLICY}"
+run_arm_case steady_arm_insert_plus_tamper "${INSERT_PLUS_TAMPER_POLICY}" refuse
+
+# (5) base without the line + insertion with mode/type != 100644/blob: proves
+# the literals are not read from the head.
+WRONG_MODE_POLICY="${TMP_ROOT}/wrong-mode-policy.tsv"
+{
+  head -n 1 "${STEADY_PLAN}/${POLICY_REL}"
+  printf '100755\tblob\t%s\tversioned-transition\t%s\n' \
+    "${STEADY_ARM_AUTH_OID}" "${TRANSITION_AUTH_REL}"
+  tail -n +2 "${STEADY_PLAN}/${POLICY_REL}"
+} > "${WRONG_MODE_POLICY}"
+run_arm_case steady_arm_wrong_mode "${WRONG_MODE_POLICY}" refuse
+
+# (7) base WITH the line + head with the line DUPLICATED (a second
+# versioned-transition entry): duplication is an insertion in disguise, not a
+# substitution, and must be refused even on the legacy path.
+DUPLICATE_PLAN="${TMP_ROOT}/duplicate-plan"
+git clone --quiet --shared "${REPO}" "${DUPLICATE_PLAN}"
+git -C "${DUPLICATE_PLAN}" switch --quiet --detach "${HEAD_OK}"
+DUPLICATE_POLICY="${TMP_ROOT}/duplicate-policy.tsv"
+{
+  head -n 2 "${DUPLICATE_PLAN}/${POLICY_REL}"
+  printf '100644\tblob\t%s\tversioned-transition\t%s\n' \
+    "$(git -C "${DUPLICATE_PLAN}" hash-object -w "${TMP_ROOT}/future.txt")" \
+    "${TRANSITION_AUTH_REL}"
+  tail -n +3 "${DUPLICATE_PLAN}/${POLICY_REL}"
+} > "${DUPLICATE_POLICY}"
+cat > "${DUPLICATE_PLAN}/${TRANSITION_AUTH_REL}" <<JSON
+{
+  "contract": "soyeht-owner-present-proof-machinery-transition-v1",
+  "version": 1,
+  "state": "armed",
+  "generation": 1,
+  "armed_from_base_sha": "${HEAD_OK}",
+  "expected_head_tree_oid": "$(git -C "${DUPLICATE_PLAN}" rev-parse "${HEAD_OK}^{tree}")",
+  "expected_policy_blob_oid": "$(git -C "${DUPLICATE_PLAN}" rev-parse "${HEAD_OK}:${POLICY_REL}")",
+  "allowed_paths": [
+    "${POLICY_REL}"
+  ],
+  "owner_authorization": {
+    "mode": "github-repository-admin-review-exact-arm-commit",
+    "requires_owner_review": true,
+    "requires_required_integrity_check": true,
+    "owner_review": {
+      "provider": "github",
+      "required_repository_permission": "admin",
+      "binds_to": "exact-arm-head-sha",
+      "latest_review_only": true
+    },
+    "merge_point": {
+      "provider": "github",
+      "mode": "required-merge-group-revalidation",
+      "requires_current_permission": true,
+      "direct_merge": "rejected-by-required-merge-queue-ruleset"
+    },
+    "canary": "arm-then-consume-merge-blocked-and-allowed",
+    "anti_replay": "base-sha-expected-head-tree-generation-one-shot-consumption"
+  }
+}
+JSON
+cp "${DUPLICATE_POLICY}" "${DUPLICATE_PLAN}/${POLICY_REL}"
+git -C "${DUPLICATE_PLAN}" add -A
+git -C "${DUPLICATE_PLAN}" commit --quiet -m duplicate-arm
+DUPLICATE_HEAD="$(git -C "${DUPLICATE_PLAN}" rev-parse HEAD)"
+cat > "${OWNER_REVIEW_JSON}" <<JSON
+[
+  {
+    "user": {"id": 1, "login": "reviewer"},
+    "author_association": "MEMBER",
+    "repository_permission": "admin",
+    "state": "APPROVED",
+    "commit_id": "${DUPLICATE_HEAD}",
+    "submitted_at": "2026-01-01T00:00:00Z"
+  }
+]
+JSON
+git -C "${DUPLICATE_PLAN}" switch --quiet --detach "${HEAD_OK}"
+if PHASE0_INTEGRITY_LOCAL_TEST=1 \
+    PHASE0_INTEGRITY_OWNER_REVIEW_JSON="${OWNER_REVIEW_JSON}" \
+    "${DUPLICATE_PLAN}/.github/scripts/check-mobile-claw-vpn-owner-present-phase0-integrity.sh" \
+    "${DUPLICATE_PLAN}" "${HEAD_OK}" "${DUPLICATE_HEAD}" 0 \
+    >"${TMP_ROOT}/duplicate-arm.log" 2>&1; then
+  echo "error: integrity checker accepted a duplicated transition line" >&2
+  exit 1
+fi
+grep -Fq "arming transition may only update the authorization OID in the base policy" \
+  "${TMP_ROOT}/duplicate-arm.log" \
+  || { cat "${TMP_ROOT}/duplicate-arm.log" >&2; exit 1; }
+echo "PASS steady_arm_duplicate_line_refused"
+
+# Restore the review fixture the following cases expect (transition_arm's).
+cat > "${OWNER_REVIEW_JSON}" <<JSON
+[
+  {
+    "user": {"id": 1, "login": "reviewer"},
+    "author_association": "MEMBER",
+    "repository_permission": "admin",
+    "state": "APPROVED",
+    "commit_id": "${ARM_HEAD}",
+    "submitted_at": "2026-01-01T00:00:00Z"
+  }
+]
+JSON
+
 MERGE_GROUP_JSON="${TMP_ROOT}/merge-group.json"
 cat > "${MERGE_GROUP_JSON}" <<JSON
 {

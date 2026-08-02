@@ -1,5 +1,11 @@
 #!/usr/bin/env bash
 # Base-owned integrity check for the Phase 0 compile-out authority.
+#
+# Transition cycle (arm-then-consume): the steady-state protected-objects
+# policy carries NO versioned-transition line — the ARM inserts it (always as
+# the first data line), the CONSUME removes it again. The substitution path in
+# arm_policy_matches_base is the legacy case from before the cycle existed,
+# not the normal one: from the steady state, every arm is an insertion.
 set -euo pipefail
 
 REPO="${1:?usage: $0 REPO BASE_SHA HEAD_SHA PR_NUMBER}"
@@ -316,10 +322,31 @@ arm_policy_matches_base() {
   head_auth_oid="$(git -C "${REPO}" rev-parse "${HEAD_SHA}:${TRANSITION_AUTH_REL}" 2>/dev/null || true)"
   [[ "${head_auth_oid}" =~ ^[0-9a-f]{40}$ ]] \
     || die_transition "arming transition authorization blob is invalid"
-  awk -F '\t' -v OFS='\t' \
-    -v auth="${TRANSITION_AUTH_REL}" -v oid="${head_auth_oid}" \
-    '$5 == auth { $3 = oid } { print }' \
-    "${base_policy}" >"${expected_policy}"
+  if awk -F '\t' -v auth="${TRANSITION_AUTH_REL}" \
+      '$5 == auth { found = 1 } END { exit !found }' "${base_policy}"; then
+    # Legacy case (pre-cycle bases): the base still carries the transition
+    # line, and the arm may only replace its authorization OID.
+    awk -F '\t' -v OFS='\t' \
+      -v auth="${TRANSITION_AUTH_REL}" -v oid="${head_auth_oid}" \
+      '$5 == auth { $3 = oid } { print }' \
+      "${base_policy}" >"${expected_policy}"
+  else
+    # Steady state of the arm/consume cycle (the normal case): the base does
+    # NOT carry the transition line, so the arm INSERTS it as the first data
+    # line. `expected` stays a pure function of (base policy bytes, head
+    # authorization blob OID, fixed literals): every field of the inserted
+    # line is a fixed literal except the authorization blob OID ($3), which
+    # comes from the head blob only — never a mode/type/position read from
+    # the head policy. The position is literal by design (the TSV is grouped
+    # by mode, not sorted by path), so it is defended as a literal, not
+    # derived from any ordering.
+    {
+      head -n 1 "${base_policy}"
+      printf '100644\tblob\t%s\tversioned-transition\t%s\n' \
+        "${head_auth_oid}" "${TRANSITION_AUTH_REL}"
+      tail -n +2 "${base_policy}"
+    } >"${expected_policy}"
+  fi
   cmp -s "${expected_policy}" "${head_policy}" \
     || die_transition "arming transition may only update the authorization OID in the base policy"
 }
