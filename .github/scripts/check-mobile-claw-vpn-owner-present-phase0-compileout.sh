@@ -953,6 +953,7 @@ EXPECTED_BUILD_SCRIPTS="${TMP_ROOT}/expected-build-scripts.txt"
 ACTUAL_BUILD_SCRIPTS="${TMP_ROOT}/actual-build-scripts.txt"
 printf '%s\n' \
   "admin/rust/core-rs/build.rs" \
+  "admin/rust/device-key-rs/build.rs" \
   "admin/rust/household-rs/build.rs" \
   "admin/rust/server-rs/build.rs" \
   | LC_ALL=C sort > "${EXPECTED_BUILD_SCRIPTS}"

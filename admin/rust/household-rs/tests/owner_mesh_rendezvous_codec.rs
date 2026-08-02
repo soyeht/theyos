@@ -344,23 +344,29 @@ fn r1a7_enumerates_linked_targets_and_proves_zero_production_callers() {
     let root = repository_root();
     let rust_root = root.join("admin/rust");
     let members = workspace_members(&rust_root);
-    // 28 + 1 `tunnel-wire-rs` (S0). Derived, not bumped: the neutral wire crate
-    // is the mechanism for the S0 cross-import boundary — with no dependency
-    // edge to `household-rs`, no `pub use` chain there can make claw authority
-    // resolve from neutral code, which a grep over source text cannot enforce.
+    // 28 + 1 `tunnel-wire-rs` (S0) + 1 `device-key-rs` (S1). Derived, not
+    // bumped: the neutral wire crate is the mechanism for the S0 cross-import
+    // boundary — with no dependency edge to `household-rs`, no `pub use` chain
+    // there can make claw authority resolve from neutral code, which a grep
+    // over source text cannot enforce. `device-key-rs` is the S1 device-static
+    // crate: it enters with NO production caller (the S1 slice is the type,
+    // the keystore round-trip and its guards; the FFI stayed out per design
+    // §5.3), and its own guard forbids the `household-rs` edge so the R1a
+    // codec cannot become reachable through it.
     // Note the asymmetry with `targets` below: `parse_member_manifest` reads
-    // explicit targets only from `[[bin]]`/`[[test]]`/`[[example]]`, so this
-    // crate's single-bracket `[lib]` is invisible to it, and it ships its tests
-    // as inline `mod tests` rather than files under `tests/`. Members therefore
-    // moves by one and targets does not move at all.
-    assert_eq!(members.len(), 29, "workspace member inventory changed");
+    // explicit targets only from `[[bin]]`/`[[test]]`/`[[example]]`, so these
+    // crates' single-bracket `[lib]` is invisible to it, and tunnel-wire-rs
+    // ships its tests as inline `mod tests` rather than files under `tests/`.
+    // device-key-rs DOES ship files under `tests/` (device_static,
+    // s1_design_guards), so members moves by one and targets moves by two.
+    assert_eq!(members.len(), 30, "workspace member inventory changed");
     assert!(
         members
             .iter()
             .any(|member| member == "m1-household-mesh-smoke-rs")
     );
     let targets = enumerate_workspace_targets(&rust_root, &members);
-    assert_eq!(targets.len(), 199, "Cargo target inventory changed");
+    assert_eq!(targets.len(), 201, "Cargo target inventory changed");
     assert_eq!(
         targets.iter().filter(|target| target.kind == "bin").count(),
         50
@@ -370,7 +376,7 @@ fn r1a7_enumerates_linked_targets_and_proves_zero_production_callers() {
             .iter()
             .filter(|target| target.kind == "test")
             .count(),
-        149 // 146 + 2 R0a Fatia N + 1 B0a roster-currency integration targets
+        151 // 146 + 2 R0a Fatia N + 1 B0a roster-currency + 2 device-key-rs S1 integration targets
     );
     assert_eq!(
         targets

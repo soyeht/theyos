@@ -1,8 +1,7 @@
 # mode	type	oid	transition	path
-100644	blob	ac3e14e3a2e125d459e6b09886c8a1800865314d	versioned-transition	.github/owner-present-phase0-transition-v1.json
 100644	blob	00b38e713ac387de9bf0353febb5c0b6e2185403	frozen	.github/owner-present-phase0-toolchain-v1.json
 100755	blob	1d903e9af9dcdafc3493145d92d93c4921ea2509	land-exact	.github/scripts/check-mobile-claw-vpn-owner-present-contracts.sh
-100755	blob	9ee7a87fbe2e79573f9334bcb4baee2ab2d037db	land-exact	.github/scripts/check-mobile-claw-vpn-owner-present-phase0-compileout.sh
+100755	blob	4042714ca408012c12804da166297bdb56db6319	land-exact	.github/scripts/check-mobile-claw-vpn-owner-present-phase0-compileout.sh
 100755	blob	49c66ea7576b68ad8d96c4cfb44716ed671e8dd4	land-exact	.github/scripts/test-mobile-claw-vpn-owner-present-contracts.sh
 100755	blob	f8ec9c5d72a286cce669d7c077ebf96ec6c1dec3	land-exact	.github/scripts/test-mobile-claw-vpn-owner-present-phase0-compileout.sh
 100644	blob	d0b9229e4fe5744cb2c072ce690b29039bafc450	land-exact	.github/workflows/contracts-cross-repo-sync.yml
@@ -25,6 +24,6 @@
 100644	blob	1c5001db8e71d27dcdfb96df67f6577b872dbf98	land-exact	flake.nix
 100644	blob	a9d12674061e28e666d7bf35bff3479f715a102d	land-exact	nix/module.nix
 100644	blob	3b0aa0722bd015c688bfe351ca794794073753ea	land-exact	nix/modules/llm-proxy.nix
-100644	blob	b232c2ab10abec37a7685772c24fd4f217e6c870	land-exact	nix/packages/rust-workspace.nix
+100644	blob	739d57b9a25ebed3d41500bb0f0dc530e6299e88	land-exact	nix/packages/rust-workspace.nix
 100755	blob	964153c255ef7d554ff6d2c431bf10e415ebf75d	land-exact	scripts/make.sh
 100644	blob	f47d954fdd6a61451ca24583f58e44a884fb51e5	land-exact	flake.lock

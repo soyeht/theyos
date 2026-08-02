@@ -1,0 +1,22 @@
+[package]
+name    = "device-key-rs"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+
+[lib]
+name = "device_key_rs"
+path = "src/lib.rs"
+
+[dependencies]
+keystore-rs  = { path = "../keystore-rs" }
+x25519-dalek = { workspace = true }
+rand_core    = { workspace = true }
+zeroize      = { workspace = true }
+thiserror    = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+
+[lints]
+workspace = true
