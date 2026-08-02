@@ -80,6 +80,14 @@ let
     # without this the relative include_str! path escapes the sandbox.
     THEYOS_EMOJI_WORDLIST = emojiWordlistSrc;
 
+    # device-key-rs/build.rs requires an explicit channel in any release
+    # profile build: the dev channel is only ever a debug-context default,
+    # never a release one. The Nix build IS the release build, so it declares
+    # its channel here — set once in commonArgs, inherited by depsOnly and
+    # buildPackage alike. Without this line the device-key-rs build script
+    # refuses the build (by design).
+    THEYOS_CHANNEL = "release";
+
     # The repository Cargo config deliberately leaves this empty so a Nix
     # host path cannot leak into OCI/release builds. Nix supplies the real
     # target-aware pkg-config root here.

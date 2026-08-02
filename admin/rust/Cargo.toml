@@ -5,6 +5,7 @@ members = [
     "claw-rs",
     "claw-share-bridge-rs",
     "core-rs",
+    "device-key-rs",
     "e2e-rs",
     "executor-rs",
     "friend-cli-rs",
@@ -95,6 +96,8 @@ ciborium      = "0.2"
 keyring       = { version = "3", features = ["linux-native"] }
 data-encoding = "2"
 zeroize       = { version = "1", features = ["derive"] }
+x25519-dalek  = { version = "2", default-features = false, features = ["alloc", "static_secrets", "zeroize"] }
+rand_core     = { version = "0.6", features = ["getrandom"] }
 subtle        = "2"
 mdns-sd       = "0.13"
 gethostname   = "0.5"
