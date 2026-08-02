@@ -1,0 +1,43 @@
+{
+  "contract": "soyeht-owner-present-proof-machinery-transition-v1",
+  "version": 1,
+  "state": "armed",
+  "generation": 1,
+  "armed_from_base_sha": "288d7b748b4e1f770b63fd98ffc6a55d39add226",
+  "expected_head_tree_oid": "de12dbde6b7a95801e4a7242e97761a24ee97c66",
+  "expected_policy_blob_oid": "1dfb73a12621f26b9a19ca5d6100538100d3ca73",
+  "allowed_paths": [
+    ".github/owner-present-phase0-protected-objects-v1.tsv",
+    ".github/scripts/check-mobile-claw-vpn-owner-present-phase0-compileout.sh",
+    "admin/contracts/mobile-claw-vpn/v1/owner_present_phase0_artifact_boundary_v1.tsv",
+    "admin/rust/Cargo.lock",
+    "admin/rust/Cargo.toml",
+    "admin/rust/device-key-rs/Cargo.toml",
+    "admin/rust/device-key-rs/build.rs",
+    "admin/rust/device-key-rs/src/lib.rs",
+    "admin/rust/device-key-rs/tests/device_static.rs",
+    "admin/rust/device-key-rs/tests/s1_design_guards.rs",
+    "admin/rust/household-rs/tests/owner_mesh_rendezvous_codec.rs",
+    "admin/rust/household-rs/tests/r0a_implementation_scope_guard.rs",
+    "nix/packages/rust-workspace.nix"
+  ],
+  "owner_authorization": {
+    "mode": "github-repository-admin-review-exact-arm-commit",
+    "requires_owner_review": true,
+    "requires_required_integrity_check": true,
+    "owner_review": {
+      "provider": "github",
+      "required_repository_permission": "admin",
+      "binds_to": "exact-arm-head-sha",
+      "latest_review_only": true
+    },
+    "merge_point": {
+      "provider": "github",
+      "mode": "required-merge-group-revalidation",
+      "requires_current_permission": true,
+      "direct_merge": "rejected-by-required-merge-queue-ruleset"
+    },
+    "canary": "arm-then-consume-merge-blocked-and-allowed",
+    "anti_replay": "base-sha-expected-head-tree-generation-one-shot-consumption"
+  }
+}
