@@ -181,6 +181,8 @@ echo "PASS transition_arm"
 
 STEADY_PLAN="${TMP_ROOT}/steady-plan"
 git clone --quiet --shared "${REPO}" "${STEADY_PLAN}"
+git -C "${STEADY_PLAN}" config user.name "phase0-integrity-test"
+git -C "${STEADY_PLAN}" config user.email "phase0-integrity@example.invalid"
 git -C "${STEADY_PLAN}" switch --quiet --detach "${HEAD_OK}"
 # A consume-shaped base: no transition line, no transition JSON.
 awk -F '\t' -v OFS='\t' -v auth="${TRANSITION_AUTH_REL}" \
@@ -331,11 +333,19 @@ JSON
 run_arm_case steady_arm_insert "${CORRECT_INSERT_POLICY}" accept
 
 # (2) base without the line + insertion carrying the WRONG OID: refused.
+# The mutation must be wrong in EVERY run: ${oid//a/b} is vacuous whenever
+# the OID has no 'a' (measured: with a deterministic content hash the case
+# went green in a clean env). Flip the first hex char to a different one.
+WRONG_OID_FIRST=1
+[ "${STEADY_ARM_AUTH_OID:0:1}" = "1" ] && WRONG_OID_FIRST=2
+WRONG_OID="${WRONG_OID_FIRST}${STEADY_ARM_AUTH_OID:1}"
+[ "${WRONG_OID}" != "${STEADY_ARM_AUTH_OID}" ] \
+  || { echo "error: wrong-oid mutation was vacuous" >&2; exit 1; }
 WRONG_OID_POLICY="${TMP_ROOT}/wrong-oid-policy.tsv"
 {
   head -n 1 "${STEADY_PLAN}/${POLICY_REL}"
   printf '100644\tblob\t%s\tversioned-transition\t%s\n' \
-    "${STEADY_ARM_AUTH_OID//a/b}" "${TRANSITION_AUTH_REL}"
+    "${WRONG_OID}" "${TRANSITION_AUTH_REL}"
   tail -n +2 "${STEADY_PLAN}/${POLICY_REL}"
 } > "${WRONG_OID_POLICY}"
 run_arm_case steady_arm_wrong_oid "${WRONG_OID_POLICY}" refuse
@@ -374,6 +384,8 @@ run_arm_case steady_arm_wrong_mode "${WRONG_MODE_POLICY}" refuse
 # substitution, and must be refused even on the legacy path.
 DUPLICATE_PLAN="${TMP_ROOT}/duplicate-plan"
 git clone --quiet --shared "${REPO}" "${DUPLICATE_PLAN}"
+git -C "${DUPLICATE_PLAN}" config user.name "phase0-integrity-test"
+git -C "${DUPLICATE_PLAN}" config user.email "phase0-integrity@example.invalid"
 git -C "${DUPLICATE_PLAN}" switch --quiet --detach "${HEAD_OK}"
 DUPLICATE_POLICY="${TMP_ROOT}/duplicate-policy.tsv"
 {
