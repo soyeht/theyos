@@ -85,6 +85,25 @@ impl TpmKeystore {
         }
     }
 
+    /// The underlying file store, so callers inside this crate can reach the
+    /// hardened fd-relative readers rather than the legacy path-based
+    /// [`KeystoreBackend::get`]. Sealing happens above this: what the file
+    /// store holds is always ciphertext.
+    pub(crate) fn file_store(&self) -> &FileKeystore {
+        &self.inner
+    }
+
+    /// Decrypt a blob already fetched (and proven durable) by the caller.
+    /// Split out from [`KeystoreBackend::get`] so the hardened reader can
+    /// decide EXISTENCE from the storage layer and use decryption only to
+    /// interpret bytes it has already validated.
+    /// Takes no `self`: decryption is a pure function of the account name
+    /// and the blob, and keeping it that way makes it obvious that no
+    /// instance state can influence what a given blob decrypts to.
+    pub(crate) fn decrypt_blob(account: &str, ciphertext: &[u8]) -> Result<Vec<u8>, KeystoreError> {
+        decrypt_with_systemd_creds(account, ciphertext)
+    }
+
     /// Take the exclusive create-lock — see [`FileKeystore::lock_for_sweep`].
     pub fn lock_for_sweep(&self) -> Result<crate::file_backend::SweepGuard, KeystoreError> {
         self.inner.lock_for_sweep()
@@ -444,7 +463,7 @@ mod tests {
     /// so re-sealing the SAME plaintext produces a different ciphertext
     /// every time. A byte-level comparison (what File does) would see two
     /// different blobs and wrongly report Conflict on a caller's own
-    /// idempotent retry. This must converge to ExistingExactDurable
+    /// idempotent retry. This must converge to `ExistingExactDurable`
     /// instead, proving the plaintext-level comparison actually runs.
     #[test]
     #[ignore = "needs a real TPM2; see require_tpm2()"]

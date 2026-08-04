@@ -37,6 +37,8 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{ErrorKind, Read, Write};
 use std::path::{Path, PathBuf};
 
+use zeroize::Zeroize;
+
 use crate::{CreateOutcome, KeystoreBackend, KeystoreError};
 
 #[cfg(unix)]
@@ -315,6 +317,124 @@ impl FileKeystore {
         expected: &[u8],
     ) -> Result<CreateOutcome, KeystoreError> {
         self.reinspect_and_stabilize(account, |bytes| Ok(bytes == expected))
+    }
+
+    /// Read an entry through the hardened path AND prove what was read is
+    /// durable, all against descriptors held across the whole sequence.
+    ///
+    /// [`KeystoreBackend::get`] is the legacy path-based reader: it opens by
+    /// pathname, follows a symlink at the final component, applies no
+    /// owner/mode/type check, has no size cap, and proves nothing about
+    /// durability. That is acceptable for a best-effort byte fetch and NOT
+    /// acceptable for deciding that a key exists — an audit demonstrated
+    /// both failures against the opaque P-256 layer built on it: a slot
+    /// replaced by a symlink to a scalar outside the store loaded happily,
+    /// and a key that was merely *visible* after a failed directory barrier
+    /// was reported as an existing durable key.
+    ///
+    /// Returns `Ok(None)` for a genuinely absent entry, `Err(SecurityViolation)`
+    /// for anything this backend would not itself have written, and
+    /// `Err(Io)` when the entry cannot be proven durable — never a value
+    /// whose durability is unknown.
+    pub(crate) fn secure_durable_get(
+        &self,
+        account: &str,
+    ) -> Result<Option<Vec<u8>>, KeystoreError> {
+        let dir = self.open_secrets_dir().map_err(|e| KeystoreError::Io {
+            kind: e.kind().to_string(),
+            hint: format!("open {}: {e}", self.secrets_dir().display()),
+        })?;
+        self.check_fs_allowed(&dir)?;
+        let name = Self::account_file_name(account);
+        let label = || format!("{} (file fallback)", self.account_path(account).display());
+
+        let opened = dir
+            .open_file_read_nofollow(OsStr::new(&name))
+            .map_err(|e| KeystoreError::Io {
+                kind: e.kind().to_string(),
+                hint: format!("open {}: {e}", self.account_path(account).display()),
+            })?;
+        let (mut file, held_meta) = match opened {
+            SecureOpen::Found(file, meta) => (file, meta),
+            SecureOpen::NotFound => return Ok(None),
+            SecureOpen::SecurityViolation(hint) => {
+                return Err(KeystoreError::SecurityViolation {
+                    label: label(),
+                    hint,
+                });
+            }
+        };
+
+        let mut bytes = Vec::new();
+        std::io::Read::by_ref(&mut file)
+            .take(MAX_SECRET_BYTES + 1)
+            .read_to_end(&mut bytes)
+            .map_err(|e| KeystoreError::Io {
+                kind: e.kind().to_string(),
+                hint: format!("read {}: {e}", self.account_path(account).display()),
+            })?;
+        if bytes.len() as u64 > MAX_SECRET_BYTES {
+            // `clear()` would only set len=0 and leave the bytes in the
+            // heap allocation; this entry may be a private scalar.
+            bytes.zeroize();
+            return Err(KeystoreError::SecurityViolation {
+                label: label(),
+                hint: format!("entry exceeds the {MAX_SECRET_BYTES}-byte cap for a secret"),
+            });
+        }
+
+        // Prove durability of the EXACT thing just read, on the same fds.
+        let durable = file.sync_all().and_then(|()| dir.fsync());
+        if let Err(e) = durable {
+            // `clear()` would only set len=0 and leave the bytes in the
+            // heap allocation; this entry may be a private scalar.
+            bytes.zeroize();
+            return Err(KeystoreError::Io {
+                kind: e.kind().to_string(),
+                hint: format!(
+                    "{} is readable but could not be proven durable: {e}",
+                    self.account_path(account).display()
+                ),
+            });
+        }
+        // And that it is still the same inode after the barrier.
+        match dir.stat_at_nofollow(OsStr::new(&name)) {
+            Ok(Some(now)) if same_inode(&held_meta, &now) => Ok(Some(bytes)),
+            _ => {
+                // `clear()` would only set len=0 and leave the bytes in the
+                // heap allocation; this entry may be a private scalar.
+                bytes.zeroize();
+                Err(KeystoreError::Io {
+                    kind: "entry changed identity during read".into(),
+                    hint: format!(
+                        "{} was replaced while being proven durable",
+                        self.account_path(account).display()
+                    ),
+                })
+            }
+        }
+    }
+
+    /// Stable identity of the PHYSICAL store: device + inode of the secrets
+    /// directory, not a path string.
+    ///
+    /// Two stores configured with the same service name under different
+    /// state roots produced identical identifiers before this existed, so a
+    /// binding published by one was accepted by the other — an audit showed
+    /// a scalar copied from store A being validated against A's binding by
+    /// store B. A path string is also forgeable by moving directories
+    /// around; dev+ino is what actually names the directory the bytes live
+    /// in.
+    pub(crate) fn physical_store_id(&self) -> Result<String, KeystoreError> {
+        let dir = self.open_secrets_dir().map_err(|e| KeystoreError::Io {
+            kind: e.kind().to_string(),
+            hint: format!("open {}: {e}", self.secrets_dir().display()),
+        })?;
+        let (dev, ino) = dir.dev_ino().map_err(|e| KeystoreError::Io {
+            kind: e.kind().to_string(),
+            hint: format!("stat {}: {e}", self.secrets_dir().display()),
+        })?;
+        Ok(format!("dev{dev}:ino{ino}"))
     }
 
     fn create_only_unix(
@@ -910,8 +1030,7 @@ fn tmp_attempt_path_name(final_name: &str, bytes: &[u8], attempt: u32) -> String
     let n = COUNTER.fetch_add(1, Ordering::Relaxed);
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
+        .map_or(0, |d| d.as_nanos());
     let digest = content_digest_hex(Path::new(final_name), bytes);
     format!(
         "{final_name}.tmp.{}.{nanos}.{n}.{attempt}.{digest}",
@@ -1088,6 +1207,17 @@ impl DirHandle {
         Ok(())
     }
 
+    /// Device + inode of this directory, from `fstat` on the held fd.
+    fn dev_ino(&self) -> std::io::Result<(u64, u64)> {
+        use std::os::unix::fs::MetadataExt;
+        // SAFETY: the fd is valid and owned; `File::from_raw_fd` would take
+        // ownership, so borrow through a ManuallyDrop instead.
+        let borrowed =
+            std::mem::ManuallyDrop::new(unsafe { File::from_raw_fd(self.fd.as_raw_fd()) });
+        let meta = borrowed.metadata()?;
+        Ok((meta.dev(), meta.ino()))
+    }
+
     fn fchmod(&self, mode: libc::mode_t) -> std::io::Result<()> {
         // SAFETY: valid open fd.
         let r = unsafe { libc::fchmod(self.fd.as_raw_fd(), mode) };
@@ -1230,6 +1360,9 @@ impl DirHandle {
     /// `linkat(dirfd, from, dirfd, to, 0)` — publish within this directory.
     /// Fails with `EEXIST` rather than replacing an existing destination,
     /// which is the whole basis of the create-only guarantee.
+    /// Only reachable on targets without a link-from-fd primitive; Linux
+    /// publishes through `/proc/self/fd` instead and never calls this.
+    #[cfg(not(target_os = "linux"))]
     fn linkat_within(&self, from: &OsStr, to: &OsStr) -> std::io::Result<()> {
         let from_c = cstr(from)?;
         let to_c = cstr(to)?;
@@ -1501,7 +1634,13 @@ mod fs_gate {
         if r < 0 {
             return Err(std::io::Error::last_os_error());
         }
-        let magic = i64::from(st.f_type);
+        // `f_type` is `__fsword_t`, whose width varies by target: already
+        // i64 on 64-bit (so the conversion is a no-op and clippy says so),
+        // but narrower on 32-bit where it IS needed. Kept for portability
+        // with the lint silenced rather than dropped for one target's
+        // convenience.
+        #[allow(clippy::useless_conversion)]
+        let magic = i64::try_from(st.f_type).unwrap_or(0);
         if matches!(
             magic,
             EXT_SUPER_MAGIC
@@ -1752,8 +1891,7 @@ mod tests {
         let n = COUNTER.fetch_add(1, Ordering::Relaxed);
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0);
+            .map_or(0, |d| d.as_nanos());
         format!("{prefix}.{}.{nanos}.{n}", std::process::id())
     }
 
@@ -2128,6 +2266,37 @@ mod tests {
             ks.create_only(&account, b"value").unwrap(),
             CreateOutcome::ExistingExactDurable
         );
+    }
+
+    /// Ported verbatim from the independent audit's RED for b3849669. A key
+    /// that is merely VISIBLE after a failed directory barrier must not be
+    /// reported as an existing durable key by the opaque layer — that is the
+    /// same visibility-is-not-durability error this crate exists to prevent
+    /// one layer down, and the inspect-first shortcut had reintroduced it
+    /// at the top.
+    #[test]
+    fn opaque_create_does_not_promote_visible_but_indeterminate_key() {
+        use crate::opaque_p256::{ApprovedFallback, OpaqueP256Slots, Purpose, Slot, SlotOutcome};
+
+        struct AuditPurpose;
+        impl Purpose for AuditPurpose {
+            const PURPOSE: &'static str = "audit/indeterminate";
+        }
+
+        let td = tempfile::tempdir().unwrap();
+        let approval = ApprovedFallback::for_reason("audit-only fixture");
+        let slots = OpaqueP256Slots::approved_plaintext_file(td.path(), "audit", &approval);
+        let slot = Slot::<AuditPurpose>::new("same-slot").unwrap();
+        let _g = FailpointGuard(failpoints::disarm_dir_fsync);
+
+        failpoints::arm_dir_fsync(ErrorKind::Other);
+        let (outcome, binding) = slots.create_or_inspect(&slot).unwrap();
+        assert_eq!(
+            outcome,
+            SlotOutcome::Unresolved,
+            "visibility after failed directory fsync is not durability"
+        );
+        assert!(binding.is_none(), "no usable binding may escape ambiguity");
     }
 
     #[test]

@@ -273,10 +273,12 @@ impl<P: Purpose> PublicBinding<P> {
 
 /// Bytes to be signed, sealed to one [`Purpose`].
 ///
-/// Constructed only through [`Preimage::seal`], which prefixes the purpose,
-/// so the same message under two purposes produces different signed bytes.
-/// Signing takes this type rather than `&[u8]`, which is what makes raw-byte
-/// signing fail to compile.
+/// Carries the caller's canonical bytes VERBATIM — this type adds no
+/// framing of its own, because theyOS wire formats freeze the signed
+/// preimage exactly and anything extra yields a signature no verifier
+/// accepts. The purpose binding is at the type level: signing takes
+/// `Preimage<P>` rather than `&[u8]`, so raw-byte signing and cross-purpose
+/// signing both fail to compile.
 pub struct Preimage<P: Purpose> {
     bytes: Vec<u8>,
     _purpose: PhantomData<fn() -> P>,
@@ -300,19 +302,27 @@ impl<P: Purpose> Clone for Preimage<P> {
 }
 
 impl<P: Purpose> Preimage<P> {
-    /// Domain-separate `message` under this purpose.
+    /// Accept the EXACT bytes a protocol says are to be signed, adding
+    /// nothing.
+    ///
+    /// An earlier revision prepended `PURPOSE || 0x00` here as home-made
+    /// domain separation. That was wrong on two counts. It produced
+    /// signatures over bytes no verifier expects — theyOS wire formats
+    /// freeze the signed preimage exactly (`type_byte || canonical_cbor`),
+    /// so extra framing yields a signature that simply fails against the
+    /// real contract. And the separation it claimed was not sound anyway:
+    /// the doc justified it by a length prefix that was never implemented,
+    /// and a `PURPOSE` containing NUL would have collided regardless.
+    ///
+    /// Purpose separation here is by TYPE — a `Preimage<A>` cannot be handed
+    /// to an `OpaqueSigner<B>` — which prevents the mistake at compile time
+    /// without inventing bytes. Where a protocol needs *cryptographic*
+    /// domain separation it must define that framing itself, and the caller
+    /// passes the already-canonical result in here.
     #[must_use]
-    pub fn seal(message: &[u8]) -> Self {
-        let purpose = P::PURPOSE.as_bytes();
-        let mut bytes = Vec::with_capacity(purpose.len() + 1 + message.len());
-        bytes.extend_from_slice(purpose);
-        // A zero separator that cannot occur in the purpose (a Rust &str
-        // constant may contain NUL in principle, so the length prefix below
-        // is what actually makes this unambiguous).
-        bytes.push(0);
-        bytes.extend_from_slice(message);
+    pub fn exact(canonical_bytes: &[u8]) -> Self {
         Self {
-            bytes,
+            bytes: canonical_bytes.to_vec(),
             _purpose: PhantomData,
         }
     }
@@ -406,11 +416,42 @@ enum SlotStore {
 }
 
 impl SlotStore {
-    fn get(&self, account: &str) -> Result<Vec<u8>, KeystoreError> {
+    /// Read a slot's stored material through the HARDENED, durability-proving
+    /// path — never [`KeystoreBackend::get`], which opens by pathname,
+    /// follows a final symlink, is uncapped, and proves nothing about
+    /// durability. Using it here is what let a symlinked slot load
+    /// successfully and let a merely-visible key be reported as an existing
+    /// one.
+    ///
+    /// `Ok(None)` means genuinely absent. Anything unproven is an error, not
+    /// a value.
+    fn secure_durable_get(&self, account: &str) -> Result<Option<Vec<u8>>, KeystoreError> {
         match self {
             #[cfg(target_os = "linux")]
-            Self::SealedTpm(s) => s.get(account),
-            Self::ApprovedFile(s) => s.get(account),
+            Self::SealedTpm(s) => {
+                // Fetch and prove the CIPHERTEXT through the same hardened
+                // path the file store uses, then decrypt. The decrypt must
+                // not be what decides existence.
+                match s.file_store().secure_durable_get(account)? {
+                    Some(ciphertext) => {
+                        crate::tpm_backend::TpmKeystore::decrypt_blob(account, &ciphertext)
+                            .map(Some)
+                    }
+                    None => Ok(None),
+                }
+            }
+            Self::ApprovedFile(s) => s.secure_durable_get(account),
+        }
+    }
+
+    /// Identity of the physical store (device + inode of its secrets
+    /// directory), so a binding cannot be carried between two stores that
+    /// merely share a service name.
+    fn physical_id(&self) -> Result<String, KeystoreError> {
+        match self {
+            #[cfg(target_os = "linux")]
+            Self::SealedTpm(s) => s.file_store().physical_store_id(),
+            Self::ApprovedFile(s) => s.physical_store_id(),
         }
     }
 
@@ -505,10 +546,23 @@ impl OpaqueP256Slots {
         &self,
         slot: &Slot<P>,
     ) -> Result<(SlotOutcome, Option<PublicBinding<P>>), KeystoreError> {
-        // 1. Already there?
+        // 1. Already there? `try_binding` goes through the hardened,
+        //    durability-proving reader, so reaching a binding here means the
+        //    stored key was proven durable on the same descriptors it was
+        //    read from — not merely that a file was visible. That
+        //    distinction is the whole point: an audit showed this shortcut
+        //    reporting AlreadyExisted for a key that existed only because a
+        //    directory barrier had failed, which is exactly the
+        //    visibility-is-not-durability error this crate exists to avoid
+        //    one layer down.
+        //
+        //    An entry that cannot be proven durable surfaces as an error
+        //    from the reader and is mapped to Unresolved below, never to a
+        //    usable binding.
         match self.try_binding(slot) {
             Ok(Some(binding)) => return Ok((SlotOutcome::AlreadyExisted, Some(binding))),
             Ok(None) => {}
+            Err(KeystoreError::Io { .. }) => return Ok((SlotOutcome::Unresolved, None)),
             Err(e) => return Err(e),
         }
 
@@ -527,7 +581,7 @@ impl OpaqueP256Slots {
             // Someone else won, or our own earlier attempt did. Report what
             // is ACTUALLY stored, never our discarded candidate.
             CreateOutcome::ExistingExactDurable | CreateOutcome::Conflict => {
-                match self.try_binding(slot)? {
+                match self.binding_or_unresolved(slot)? {
                     Some(binding) => Ok((SlotOutcome::AlreadyExisted, Some(binding))),
                     None => Ok((SlotOutcome::Unresolved, None)),
                 }
@@ -537,7 +591,7 @@ impl OpaqueP256Slots {
             // Truly unresolved — refuse to mint a binding for a slot whose
             // stored state is unknown. Retry converges via the inspect-first
             // path above.
-            CreateOutcome::MayHaveTakenEffect => match self.try_binding(slot)? {
+            CreateOutcome::MayHaveTakenEffect => match self.binding_or_unresolved(slot)? {
                 Some(binding) => Ok((SlotOutcome::AlreadyExisted, Some(binding))),
                 None => Ok((SlotOutcome::Unresolved, None)),
             },
@@ -556,12 +610,13 @@ impl OpaqueP256Slots {
         slot: &Slot<P>,
         binding: &PublicBinding<P>,
     ) -> Result<OpaqueSigner<P>, KeystoreError> {
-        if binding.store_id != self.store_id {
+        let expected_store = self.composed_store_id()?;
+        if binding.store_id != expected_store {
             return Err(KeystoreError::SecurityViolation {
                 label: slot.label.clone(),
                 hint: format!(
-                    "binding was published by store {}, not {}",
-                    binding.store_id, self.store_id
+                    "binding was published by store {}, not {expected_store}",
+                    binding.store_id
                 ),
             });
         }
@@ -598,14 +653,67 @@ impl OpaqueP256Slots {
     /// revoking a key needs to distinguish "there was one and it is gone"
     /// from "there was nothing", because only the first is evidence that a
     /// revocation actually took effect.
-    pub fn gc_best_effort<P: Purpose>(&self, slot: &Slot<P>) -> Result<GcReport, KeystoreError> {
-        let existed = self.try_binding(slot)?.is_some();
+    /// Remove a slot's key ONLY if it still holds exactly the key described
+    /// by `expected`.
+    ///
+    /// Conditional rather than unconditional on purpose. An unconditional
+    /// `gc(slot)` collecting generation A will happily destroy generation B
+    /// if B replaced A in the meantime — the caller asked to retire one key
+    /// and silently destroyed a different, possibly live one. A mismatch is
+    /// therefore reported, never deleted: refusing is recoverable, deleting
+    /// a key nobody has a copy of is not.
+    pub fn gc_exact<P: Purpose>(
+        &self,
+        slot: &Slot<P>,
+        expected: &PublicBinding<P>,
+    ) -> Result<GcReport, KeystoreError> {
+        let before = self.binding_or_unresolved(slot)?;
+        let Some(before) = before else {
+            return Ok(GcReport {
+                existed_before: false,
+                matched_expected: false,
+                present_after: false,
+            });
+        };
+        if &before != expected {
+            return Ok(GcReport {
+                existed_before: true,
+                matched_expected: false,
+                present_after: true,
+            });
+        }
+
         self.store.delete(&slot.account())?;
-        let still_there = self.try_binding(slot)?.is_some();
+        let still_there = self.binding_or_unresolved(slot)?.is_some();
         Ok(GcReport {
-            existed_before: existed,
+            existed_before: true,
+            matched_expected: true,
             present_after: still_there,
         })
+    }
+
+    /// This store's full identity: namespace plus the physical identity of
+    /// the directory the bytes actually live in.
+    fn composed_store_id(&self) -> Result<String, KeystoreError> {
+        Ok(format!("{}|{}", self.store_id, self.store.physical_id()?))
+    }
+
+    /// [`Self::try_binding`], with an unprovable store state folded into
+    /// `Unresolved` instead of escaping as an error.
+    ///
+    /// Every branch of `create_or_inspect` needs this, not just the first:
+    /// the post-create branches re-inspect too, and propagating there let
+    /// exactly the ambiguity this is meant to contain leak out as an `Io`
+    /// error instead of the typed outcome a caller can retry on.
+    fn binding_or_unresolved<P: Purpose>(
+        &self,
+        slot: &Slot<P>,
+    ) -> Result<Option<PublicBinding<P>>, KeystoreError> {
+        match self.try_binding(slot) {
+            Ok(found) => Ok(found),
+            Err(KeystoreError::Io { .. }) => Ok(None),
+            Err(e) => Err(e),
+        }
     }
 
     /// Binding for a slot if it currently holds a usable key.
@@ -625,7 +733,11 @@ impl OpaqueP256Slots {
     /// wrong-length buffer may still be a truncated real scalar, so dropping
     /// it unzeroized would leave key material in freed memory.
     fn load_signing_key<P: Purpose>(&self, slot: &Slot<P>) -> Result<SigningKey, KeystoreError> {
-        let mut bytes = self.store.get(&slot.account())?;
+        let Some(mut bytes) = self.store.secure_durable_get(&slot.account())? else {
+            return Err(KeystoreError::NotFound {
+                label: slot.label.clone(),
+            });
+        };
         if bytes.len() != 32 {
             let len = bytes.len();
             bytes.zeroize();
@@ -657,7 +769,12 @@ impl OpaqueP256Slots {
             label: slot.label.clone(),
             public_key,
             backing: self.store.backing(),
-            store_id: self.store_id.clone(),
+            // Physical identity (dev+ino of the secrets directory), resolved
+            // now rather than baked in at construction from a service string:
+            // two stores sharing a service name under different state roots
+            // used to produce identical ids, so one's binding validated
+            // against the other's key material.
+            store_id: self.composed_store_id()?,
             _purpose: PhantomData,
         })
     }
@@ -713,11 +830,15 @@ pub enum SlotOutcome {
     Unresolved,
 }
 
-/// What [`OpaqueP256Slots::gc_best_effort`] observed.
+/// What [`OpaqueP256Slots::gc_exact`] observed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct GcReport {
     /// A usable key was present before the removal.
     pub existed_before: bool,
+    /// The key present matched the binding the caller expected to collect.
+    /// When false with `existed_before` true, a DIFFERENT key occupies the
+    /// slot and was deliberately left alone.
+    pub matched_expected: bool,
     /// A usable key is STILL present afterwards — removal did not take
     /// effect, so a caller must not treat this as a completed revocation.
     pub present_after: bool,
@@ -765,7 +886,7 @@ pub struct GcReport {
 /// struct B;
 /// impl Purpose for B { const PURPOSE: &'static str = "b"; }
 /// fn go(signer: &OpaqueSigner<A>) {
-///     let other: Preimage<B> = Preimage::seal(b"m");
+///     let other: Preimage<B> = Preimage::exact(b"m");
 ///     let _ = signer.sign(&other);
 /// }
 /// ```
@@ -879,7 +1000,7 @@ mod tests {
         let signer = s.load_exact(&slot, &binding).unwrap();
 
         for i in 0..32 {
-            let pre = Preimage::<MeshSession>::seal(format!("m-{i}").as_bytes());
+            let pre = Preimage::<MeshSession>::exact(format!("m-{i}").as_bytes());
             let sig = signer.sign(&pre);
             binding.verify(&pre, &sig).unwrap();
 
@@ -888,27 +1009,40 @@ mod tests {
         }
     }
 
-    /// A signature made for one purpose must not verify as another, even
-    /// with the same key — the preimage is domain-separated.
+    /// The signed bytes must be EXACTLY what the caller supplied.
+    ///
+    /// theyOS wire formats freeze the signed preimage precisely
+    /// (`type_byte || canonical_cbor`), so any framing this crate adds of
+    /// its own produces a signature that no real verifier accepts. A
+    /// previous revision prepended `PURPOSE || 0x00` as home-made domain
+    /// separation and had a test asserting that a signature did not
+    /// transfer across purposes — which passed, but only because of bytes
+    /// that broke the actual contract. The honest guarantee is narrower and
+    /// is asserted here: nothing is added.
+    ///
+    /// Cross-purpose misuse is prevented at COMPILE time instead (a
+    /// `Preimage<A>` cannot reach an `OpaqueSigner<B>`; see the
+    /// `compile_fail` doctests). Where a protocol needs cryptographic
+    /// domain separation, that protocol defines the framing and hands the
+    /// canonical result in.
     #[test]
-    fn signature_does_not_transfer_across_purposes() {
+    fn preimage_signs_exactly_the_supplied_bytes_and_adds_no_framing() {
         let td = tempfile::tempdir().unwrap();
         let s = store(td.path());
-        let slot = Slot::<MeshSession>::new("xfer").unwrap();
+        let slot = Slot::<MeshSession>::new("exact-bytes").unwrap();
         let (_, binding) = s.create_or_inspect(&slot).unwrap();
         let binding = binding.unwrap();
         let signer = s.load_exact(&slot, &binding).unwrap();
 
-        let sig = signer.sign(&Preimage::<MeshSession>::seal(b"message"));
+        let wire = b"\x07canonical-cbor-body";
+        let sig = signer.sign(&Preimage::<MeshSession>::exact(wire));
 
-        // Same key, same message bytes, different purpose framing.
+        // A verifier that knows only the protocol's own bytes must accept —
+        // it would not if we had prepended anything.
         let vk = VerifyingKey::from_sec1_bytes(binding.public_key()).unwrap();
-        let other = Preimage::<RosterSync>::seal(b"message");
         let parsed = EcdsaSignature::from_slice(sig.as_bytes()).unwrap();
-        assert!(
-            vk.verify(&other.bytes, &parsed).is_err(),
-            "a mesh-session signature must not verify as roster-sync"
-        );
+        vk.verify(wire.as_slice(), &parsed)
+            .expect("signature must be over the caller's exact bytes, with no added framing");
     }
 
     /// P0-4: a key swapped underneath through the generic byte API must be
@@ -953,31 +1087,124 @@ mod tests {
         }
     }
 
+    /// Ported verbatim from the independent audit's RED for b3849669. Two
+    /// stores under different state roots that merely share a service name
+    /// used to produce identical `store_id`s, so a binding published by one
+    /// validated against key material copied into the other.
+    #[test]
+    fn binding_is_scoped_to_physical_store_not_only_service_name() {
+        let a_dir = tempfile::tempdir().unwrap();
+        let b_dir = tempfile::tempdir().unwrap();
+        let approval = ApprovedFallback::for_reason("audit-only fixture");
+        let a = OpaqueP256Slots::approved_plaintext_file(a_dir.path(), "same-service", &approval);
+        let b = OpaqueP256Slots::approved_plaintext_file(b_dir.path(), "same-service", &approval);
+        let slot = Slot::<MeshSession>::new("copied").unwrap();
+        let (_, binding) = a.create_or_inspect(&slot).unwrap();
+        let binding = binding.unwrap();
+
+        let raw_a = FileKeystore::new(a_dir.path(), "same-service.p256-file");
+        let raw_b = FileKeystore::new(b_dir.path(), "same-service.p256-file");
+        let scalar = raw_a.get(&slot.account()).unwrap();
+        raw_b.set(&slot.account(), &scalar).unwrap();
+
+        assert!(
+            b.load_exact(&slot, &binding).is_err(),
+            "binding from one state root was accepted by a different physical store"
+        );
+    }
+
+    /// Ported verbatim from the independent audit's RED for b3849669. Opaque
+    /// loads went through the legacy path-based `get`, which follows a
+    /// final-component symlink — letting a same-UID actor redirect a
+    /// supposedly store-scoped slot at bytes outside the store while the
+    /// content still matched the published binding.
+    #[test]
+    fn load_exact_rejects_symlinked_slot_even_when_bytes_match() {
+        use std::os::unix::fs::symlink;
+
+        let td = tempfile::tempdir().unwrap();
+        let approval = ApprovedFallback::for_reason("audit-only fixture");
+        let slots = OpaqueP256Slots::approved_plaintext_file(td.path(), "symlink", &approval);
+        let slot = Slot::<MeshSession>::new("redirected").unwrap();
+        let (_, binding) = slots.create_or_inspect(&slot).unwrap();
+        let binding = binding.unwrap();
+
+        let raw = FileKeystore::new(td.path(), "symlink.p256-file");
+        let scalar = raw.get(&slot.account()).unwrap();
+        let account_path = raw.path_for(&slot.account());
+        let outside = td.path().join("outside-scalar");
+        std::fs::write(&outside, scalar).unwrap();
+        std::fs::remove_file(&account_path).unwrap();
+        symlink(&outside, &account_path).unwrap();
+
+        assert!(
+            slots.load_exact(&slot, &binding).is_err(),
+            "load_exact followed a final-component symlink outside the store"
+        );
+    }
+
     #[test]
     fn gc_reports_what_it_observed() {
         let td = tempfile::tempdir().unwrap();
         let s = store(td.path());
         let slot = Slot::<MeshSession>::new("gc").unwrap();
 
-        let absent = s.gc_best_effort(&slot).unwrap();
-        assert_eq!(
-            absent,
-            GcReport {
-                existed_before: false,
-                present_after: false
-            }
-        );
+        // Nothing there: a binding is still required, so mint-and-collect.
+        let (_, binding) = s.create_or_inspect(&slot).unwrap();
+        let binding = binding.unwrap();
 
-        s.create_or_inspect(&slot).unwrap();
-        let removed = s.gc_best_effort(&slot).unwrap();
+        let removed = s.gc_exact(&slot, &binding).unwrap();
         assert_eq!(
             removed,
             GcReport {
                 existed_before: true,
+                matched_expected: true,
                 present_after: false
             },
             "a real revocation must be distinguishable from a no-op"
         );
+
+        let again = s.gc_exact(&slot, &binding).unwrap();
+        assert_eq!(
+            again,
+            GcReport {
+                existed_before: false,
+                matched_expected: false,
+                present_after: false
+            }
+        );
+    }
+
+    /// Collecting generation A must NOT destroy generation B if B replaced
+    /// A in the meantime. Refusing is recoverable; deleting a live key that
+    /// nobody else holds a copy of is not.
+    #[test]
+    fn gc_refuses_to_collect_a_different_generation() {
+        let td = tempfile::tempdir().unwrap();
+        let s = store(td.path());
+        let slot = Slot::<MeshSession>::new("wrong-generation").unwrap();
+
+        let (_, gen_a) = s.create_or_inspect(&slot).unwrap();
+        let gen_a = gen_a.unwrap();
+
+        // B replaces A behind the module's back.
+        let raw = FileKeystore::new(td.path(), "opaque-p256-test.p256-file");
+        let other = SigningKey::random(&mut rand_core::OsRng);
+        raw.set(&slot.account(), other.to_bytes().as_slice())
+            .unwrap();
+
+        let report = s.gc_exact(&slot, &gen_a).unwrap();
+        assert_eq!(
+            report,
+            GcReport {
+                existed_before: true,
+                matched_expected: false,
+                present_after: true
+            },
+            "collecting A must leave B alone"
+        );
+        // And B really is still there.
+        assert!(s.try_binding(&slot).unwrap().is_some());
     }
 
     #[test]
