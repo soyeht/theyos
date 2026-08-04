@@ -94,6 +94,8 @@ pub enum RekeyError {
         "permit was issued by a different DirectionalRekeyState, or its generation/policy_count snapshot no longer matches current state"
     )]
     StalePermit,
+    #[error("OS RNG failed while minting a RekeyStateId")]
+    RngFailure,
 }
 
 /// Errors from the 5 auth frame schemas / K_mesh signing (Fila 1 follow-on,
@@ -138,6 +140,14 @@ pub enum AuthFrameError {
     SignerFailed,
     #[error("signer returned a byte string that does not parse as a valid P-256 signature")]
     InvalidSignatureScalar,
+    #[error(
+        "signer produced a signature that does not verify against its own preimage and public key"
+    )]
+    SignerProducedInvalidSignature,
+    #[error("signer's own public key does not match local.delegation.delegated_pub")]
+    SignerKeyMismatchDelegation,
+    #[error(transparent)]
+    Rekey(#[from] RekeyError),
 }
 
 /// Errors from Noise session-static setup (item 2).

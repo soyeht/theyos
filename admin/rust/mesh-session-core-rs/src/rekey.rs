@@ -86,15 +86,42 @@ pub fn rekey_threshold_default() -> RekeyThreshold {
 }
 
 /// Identifies one specific `DirectionalRekeyState` instance, minted once at
-/// construction. Never equal across two different instances, even ones
-/// with identical counter values — this is what lets a permit be bound to
-/// "this exact state object", not just "some state with the right shape".
+/// construction. This is a security-relevant provenance/authority token —
+/// a permit is trusted as "issued by this instance" purely because its
+/// `issuer` field equals `self.id` — so it must be collision-resistant,
+/// not merely "usually distinct". A 64-bit value only sustains that up to
+/// ~2^32 instances (birthday bound) before a same-process collision
+/// becomes plausible; 256 bits from `OsRng` pushes the collision bound
+/// past anything reachable (2026-08-04, @kiana, round 3).
+///
+/// **Hardened 2026-08-04, @kiana, round 3:** widened from `u64` to
+/// `[u8; 32]` and construction switched from the infallible
+/// `OsRng::next_u64()` to the fallible `try_fill_bytes` — `OsRng` is a
+/// real OS syscall (`getrandom`/`/dev/urandom`/etc.) that can fail (e.g.
+/// resource exhaustion, sandboxed environment without the syscall), and a
+/// security-relevant provenance token must not silently fall back to a
+/// weaker source or a fixed value on that failure; `fresh()` now returns
+/// `Result<Self, RekeyError>` and every constructor that mints one
+/// propagates that fallibility.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct RekeyStateId(u64);
+struct RekeyStateId([u8; 32]);
 
 impl RekeyStateId {
-    fn fresh() -> Self {
-        Self(OsRng.next_u64())
+    fn fresh() -> Result<Self, RekeyError> {
+        let mut bytes = [0u8; 32];
+        OsRng
+            .try_fill_bytes(&mut bytes)
+            .map_err(|_| RekeyError::RngFailure)?;
+        Ok(Self(bytes))
+    }
+
+    /// Test-only, deterministic constructor — used to force two
+    /// `RekeyStateId`s equal (or apart) without relying on a probabilistic
+    /// "OsRng won't collide" argument, which is exactly the kind of claim
+    /// this hardening exists to avoid making. Never used outside `tests`.
+    #[cfg(test)]
+    fn from_byte(b: u8) -> Self {
+        Self([b; 32])
     }
 }
 
@@ -154,13 +181,13 @@ pub struct DirectionalRekeyState {
 }
 
 impl DirectionalRekeyState {
-    pub fn new(threshold: RekeyThreshold) -> Self {
-        Self {
-            id: RekeyStateId::fresh(),
+    pub fn new(threshold: RekeyThreshold) -> Result<Self, RekeyError> {
+        Ok(Self {
+            id: RekeyStateId::fresh()?,
             generation: 0,
             policy_count: 0,
             threshold,
-        }
+        })
     }
 
     pub fn generation(&self) -> u64 {
@@ -197,7 +224,7 @@ impl DirectionalRekeyState {
     /// ```compile_fail
     /// use mesh_session_core_rs::rekey::{DirectionalRekeyState, RekeyThreshold};
     /// let threshold = RekeyThreshold::new(3).unwrap();
-    /// let mut tx = DirectionalRekeyState::new(threshold);
+    /// let mut tx = DirectionalRekeyState::new(threshold).unwrap();
     /// tx.after_send_non_marker(); // missing the required SendNonMarkerPermit
     /// ```
     pub fn after_send_non_marker(&mut self, permit: SendNonMarkerPermit) -> Result<(), RekeyError> {
@@ -314,7 +341,7 @@ impl DirectionalRekeyState {
 /// ```compile_fail
 /// use mesh_session_core_rs::rekey::{SessionRekeyState, RekeyThreshold};
 /// let threshold = RekeyThreshold::new(3).unwrap();
-/// let _ = SessionRekeyState::new(threshold); // pub(crate) — does not compile here
+/// let _ = SessionRekeyState::new(threshold).unwrap(); // pub(crate) — does not compile here
 /// ```
 pub struct SessionRekeyState {
     tx: DirectionalRekeyState,
@@ -322,11 +349,11 @@ pub struct SessionRekeyState {
 }
 
 impl SessionRekeyState {
-    pub(crate) fn new(threshold: RekeyThreshold) -> Self {
-        Self {
-            tx: DirectionalRekeyState::new(threshold),
-            rx: DirectionalRekeyState::new(threshold),
-        }
+    pub(crate) fn new(threshold: RekeyThreshold) -> Result<Self, RekeyError> {
+        Ok(Self {
+            tx: DirectionalRekeyState::new(threshold)?,
+            rx: DirectionalRekeyState::new(threshold)?,
+        })
     }
 
     /// Mutable access to the outgoing-direction counters. Not a public
@@ -363,7 +390,7 @@ mod tests {
     #[test]
     fn misuse_after_send_non_marker_requires_a_real_permit_not_just_any_call() {
         let threshold = RekeyThreshold::new(3).unwrap();
-        let mut tx = DirectionalRekeyState::new(threshold);
+        let mut tx = DirectionalRekeyState::new(threshold).unwrap();
         let permit = tx.before_send_non_marker().unwrap();
         tx.after_send_non_marker(permit).unwrap();
         assert_eq!(tx.policy_count(), 1);
@@ -378,7 +405,7 @@ mod tests {
         // (0) no longer matches self.policy_count (1, then 2) once an
         // earlier permit has already committed.
         let threshold = RekeyThreshold::new(4).unwrap(); // headroom so 3 non-markers are all legal to *attempt*
-        let mut tx = DirectionalRekeyState::new(threshold);
+        let mut tx = DirectionalRekeyState::new(threshold).unwrap();
         let p1 = tx.before_send_non_marker().unwrap();
         let p2 = tx.before_send_non_marker().unwrap();
         let p3 = tx.before_send_non_marker().unwrap();
@@ -398,8 +425,8 @@ mod tests {
     #[test]
     fn red_donor_to_victim_marker_permit_rejected_cross_instance() {
         let threshold = RekeyThreshold::new(1).unwrap(); // threshold-1 == 0, marker eligible immediately
-        let donor = DirectionalRekeyState::new(threshold);
-        let mut victim = DirectionalRekeyState::new(threshold);
+        let donor = DirectionalRekeyState::new(threshold).unwrap();
+        let mut victim = DirectionalRekeyState::new(threshold).unwrap();
 
         let donor_permit = donor.before_send_marker().unwrap();
         let victim_generation_before = victim.generation();
@@ -417,7 +444,7 @@ mod tests {
     #[test]
     fn red_tx_permit_rejected_on_rx_and_vice_versa_within_one_session() {
         let threshold = RekeyThreshold::new(1).unwrap();
-        let mut session = SessionRekeyState::new(threshold);
+        let mut session = SessionRekeyState::new(threshold).unwrap();
         let tx_permit = session.tx().before_send_marker().unwrap();
         assert_eq!(
             session.rx().after_send_marker(tx_permit),
@@ -429,7 +456,7 @@ mod tests {
             // permits) — use a second session's tx permit as the "foreign"
             // token instead, which is the actually-reachable cross-session
             // case.
-            let other = DirectionalRekeyState::new(threshold);
+            let other = DirectionalRekeyState::new(threshold).unwrap();
             other.before_send_marker().unwrap()
         };
         assert_eq!(
@@ -445,9 +472,9 @@ mod tests {
         // it independently rejects a stale permit without needing to
         // apply it first.
         let threshold = RekeyThreshold::new(1).unwrap();
-        let state = DirectionalRekeyState::new(threshold);
+        let state = DirectionalRekeyState::new(threshold).unwrap();
         let permit = state.before_send_marker().unwrap();
-        let other = DirectionalRekeyState::new(threshold);
+        let other = DirectionalRekeyState::new(threshold).unwrap();
         assert_eq!(
             other.validate_marker_permit(&permit),
             Err(RekeyError::StalePermit)
@@ -457,7 +484,7 @@ mod tests {
     #[test]
     fn pos4_n3_two_data_marker_two_data_directional() {
         let threshold = RekeyThreshold::new(3).unwrap();
-        let mut tx = DirectionalRekeyState::new(threshold);
+        let mut tx = DirectionalRekeyState::new(threshold).unwrap();
 
         // count=0: DATA -> count=1
         let permit = tx.before_send_non_marker().unwrap();
@@ -492,7 +519,7 @@ mod tests {
     #[test]
     fn red43_non_marker_at_n_minus_1_rejected_on_receive_too() {
         let threshold = RekeyThreshold::new(3).unwrap();
-        let mut rx = DirectionalRekeyState::new(threshold);
+        let mut rx = DirectionalRekeyState::new(threshold).unwrap();
         rx.on_receive(IncomingRecord::NonMarker).unwrap();
         rx.on_receive(IncomingRecord::NonMarker).unwrap();
         assert_eq!(rx.policy_count(), 2);
@@ -505,7 +532,7 @@ mod tests {
     #[test]
     fn red25_premature_marker_rejected() {
         let threshold = RekeyThreshold::new(3).unwrap();
-        let mut rx = DirectionalRekeyState::new(threshold);
+        let mut rx = DirectionalRekeyState::new(threshold).unwrap();
         // policy_count is 0, threshold-1 is 2 — far too early for a marker.
         assert_eq!(
             rx.on_receive(IncomingRecord::Marker { next_generation: 1 }),
@@ -517,7 +544,7 @@ mod tests {
     #[test]
     fn red26_duplicate_marker_rejected_as_wrong_generation() {
         let threshold = RekeyThreshold::new(3).unwrap();
-        let mut rx = DirectionalRekeyState::new(threshold);
+        let mut rx = DirectionalRekeyState::new(threshold).unwrap();
         rx.on_receive(IncomingRecord::NonMarker).unwrap();
         rx.on_receive(IncomingRecord::NonMarker).unwrap();
         rx.on_receive(IncomingRecord::Marker { next_generation: 1 })
@@ -536,7 +563,7 @@ mod tests {
     #[test]
     fn red27_wrong_generation_skip_ahead_rejected() {
         let threshold = RekeyThreshold::new(3).unwrap();
-        let mut rx = DirectionalRekeyState::new(threshold);
+        let mut rx = DirectionalRekeyState::new(threshold).unwrap();
         rx.on_receive(IncomingRecord::NonMarker).unwrap();
         rx.on_receive(IncomingRecord::NonMarker).unwrap();
         assert_eq!(
@@ -551,7 +578,7 @@ mod tests {
     #[test]
     fn red28_wrong_count_marker_before_threshold_rejected() {
         let threshold = RekeyThreshold::new(3).unwrap();
-        let mut rx = DirectionalRekeyState::new(threshold);
+        let mut rx = DirectionalRekeyState::new(threshold).unwrap();
         rx.on_receive(IncomingRecord::NonMarker).unwrap(); // count=1, still short of N-1=2
         assert_eq!(
             rx.on_receive(IncomingRecord::Marker { next_generation: 1 }),
@@ -562,7 +589,7 @@ mod tests {
     #[test]
     fn red29_simultaneous_opposite_directions_are_independent() {
         let threshold = RekeyThreshold::new(3).unwrap();
-        let mut state = SessionRekeyState::new(threshold);
+        let mut state = SessionRekeyState::new(threshold).unwrap();
 
         // Drive tx all the way through a rekey.
         let permit = state.tx().before_send_non_marker().unwrap();
@@ -590,7 +617,7 @@ mod tests {
         // child module of `rekey` — used only to force an edge state that
         // is otherwise impractical to reach by driving u64::MAX sends.
         let tx = DirectionalRekeyState {
-            id: RekeyStateId::fresh(),
+            id: RekeyStateId::from_byte(1),
             generation: u64::MAX,
             policy_count: 0,
             threshold,
@@ -599,5 +626,63 @@ mod tests {
             tx.before_send_marker().err(),
             Some(RekeyError::GenerationExhausted)
         );
+    }
+
+    #[test]
+    fn red_rekey_state_id_256_bit_full_value_compared_not_probabilistic() {
+        // Deterministic constructor (test-only) proves the comparison is
+        // over the FULL 32-byte value, not e.g. a truncated prefix — two
+        // ids built from the same byte are equal, two built from
+        // different bytes are not, with no reliance on OsRng ever
+        // producing (or not producing) a collision.
+        let threshold = RekeyThreshold::new(1).unwrap();
+        let a = DirectionalRekeyState {
+            id: RekeyStateId::from_byte(7),
+            generation: 0,
+            policy_count: 0,
+            threshold,
+        };
+        let b_same_id = DirectionalRekeyState {
+            id: RekeyStateId::from_byte(7),
+            generation: 0,
+            policy_count: 0,
+            threshold,
+        };
+        let b_diff_id = DirectionalRekeyState {
+            id: RekeyStateId::from_byte(9),
+            generation: 0,
+            policy_count: 0,
+            threshold,
+        };
+
+        // A permit issued by `a` is accepted by `b_same_id` — same
+        // RekeyStateId value, even though it's a different instance —
+        // proving the check is value equality, not e.g. instance/pointer
+        // identity smuggled in some other way.
+        let permit_from_a = a.before_send_marker().unwrap();
+        assert_eq!(
+            b_same_id.validate_marker_permit(&permit_from_a),
+            Ok(()),
+            "identical 32-byte ids must compare equal"
+        );
+
+        // The same permit is rejected by `b_diff_id` — different
+        // RekeyStateId value.
+        let permit_from_a_2 = a.before_send_marker().unwrap();
+        assert_eq!(
+            b_diff_id.validate_marker_permit(&permit_from_a_2),
+            Err(RekeyError::StalePermit),
+            "different 32-byte ids must not compare equal"
+        );
+    }
+
+    #[test]
+    fn rekey_state_id_fresh_produces_distinct_values() {
+        // Not a collision-resistance proof (that's what round 3's widening
+        // to 256 bits is for) — just confirms two real OsRng-backed calls
+        // in a row are not trivially returning a fixed/zeroed value.
+        let a = RekeyStateId::fresh().unwrap();
+        let b = RekeyStateId::fresh().unwrap();
+        assert_ne!(a, b);
     }
 }

@@ -142,6 +142,31 @@ fn check_h_final(frame_h_final: &[u8], expected: &[u8]) -> Result<(), AuthFrameE
     Ok(())
 }
 
+/// Binds the local K_mesh signer to the local delegation *before either
+/// handshake function writes anything* (2026-08-04, @kiana, round 3):
+/// previously `local.delegation` and `k_mesh` were accepted as two
+/// separate parameters with nothing proving they actually name the same
+/// key. A signer holding a different key than `delegation.delegated_pub`
+/// would sign real frames with real (locally self-consistent) signatures
+/// that any peer verifying against the delegation's `delegated_pub` would
+/// still reject — but only after a full round trip, and only because the
+/// peer happened to check. This closes it locally, at the very first
+/// opportunity: compare the signer's own reported public key (never
+/// secret material — see [`MeshSessionFrameSigner::public_key`]) against
+/// `local.delegation.delegated_pub()` and fail closed before the Noise
+/// handshake — and therefore before any byte reaches the wire — even
+/// starts.
+fn check_signer_matches_delegation<Sig: MeshSessionFrameSigner>(
+    k_mesh: &Sig,
+    delegation: &MeshSessionDelegation,
+) -> Result<(), AuthFrameError> {
+    let signer_pub = k_mesh.public_key().to_encoded_point(true);
+    if signer_pub.as_bytes() != delegation.delegated_pub() {
+        return Err(AuthFrameError::SignerKeyMismatchDelegation);
+    }
+    Ok(())
+}
+
 /// Compares all 4 checkpoint scalars a frame signs (v6 §6), not just
 /// `hash` (2026-08-04, @kiana: `hash` alone was checked, leaving
 /// `sequence`/`event_head`/`not_after` — also part of the signed body —
@@ -274,6 +299,8 @@ where
     Sig: MeshSessionFrameSigner,
     Ver: DelegationSignatureVerifier,
 {
+    check_signer_matches_delegation(k_mesh, &local.delegation)?;
+
     let (mut stream, ingress_evidence) = ingress.consume();
 
     let handshake = noise::run_xx_handshake(&mut stream, Role::Responder)?;
@@ -393,7 +420,7 @@ where
     Ok(ActiveMeshSession {
         stream,
         transport,
-        rekey: SessionRekeyState::new(rekey_threshold),
+        rekey: SessionRekeyState::new(rekey_threshold)?,
         peer_hh_id: initiator_hh_id,
         peer_m_id: initiator_m_id,
         peer_cert_fingerprint: initiator_cert_fingerprint,
@@ -423,6 +450,8 @@ where
     Sig: MeshSessionFrameSigner,
     Ver: DelegationSignatureVerifier,
 {
+    check_signer_matches_delegation(k_mesh, &local.delegation)?;
+
     let (mut stream, ingress_evidence) = ingress.consume();
 
     let handshake = noise::run_xx_handshake(&mut stream, Role::Initiator)?;
@@ -539,7 +568,7 @@ where
     Ok(ActiveMeshSession {
         stream,
         transport,
-        rekey: SessionRekeyState::new(rekey_threshold),
+        rekey: SessionRekeyState::new(rekey_threshold)?,
         peer_hh_id: expected.hh_id.clone(),
         peer_m_id: expected.m_id.clone(),
         peer_cert_fingerprint: expected.cert_fingerprint.to_vec(),
@@ -551,11 +580,11 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::delegation::test_support::sample_delegation;
     use crate::error::RekeyError;
     use p256::ecdsa::signature::Signer;
     use p256::ecdsa::{Signature, SigningKey, VerifyingKey};
     use rand_core::OsRng;
+    use std::io::{Read, Write};
     use std::net::{TcpListener, TcpStream};
     use std::thread;
 
@@ -568,6 +597,9 @@ mod tests {
             let sig: Signature = self.0.sign(preimage.as_bytes());
             let sig = sig.normalize_s().unwrap_or(sig);
             Ok(sig.to_bytes().into())
+        }
+        fn public_key(&self) -> VerifyingKey {
+            *self.0.verifying_key()
         }
     }
 
@@ -1041,11 +1073,104 @@ mod tests {
         ));
     }
 
+    /// A stream double that panics the instant anything touches it — used
+    /// to prove `check_signer_matches_delegation` rejects a mismatched
+    /// signer key *before any write* (2026-08-04, @kiana, round 3: "REDs:
+    /// ... signer public key != delegation rejeitado antes de qualquer
+    /// write"). A plain `matches!` on the returned error would only prove
+    /// the function eventually returns the right `Err` — it would not
+    /// prove the stream (and therefore the Noise handshake, and every
+    /// frame write) was never touched first. If the check ran even one
+    /// statement too late, this panics instead of silently passing.
+    struct PanicsOnIo;
+    impl Read for PanicsOnIo {
+        fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
+            panic!("stream was read before check_signer_matches_delegation rejected");
+        }
+    }
+    impl Write for PanicsOnIo {
+        fn write(&mut self, _buf: &[u8]) -> std::io::Result<usize> {
+            panic!("stream was written before check_signer_matches_delegation rejected");
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            panic!("stream was flushed before check_signer_matches_delegation rejected");
+        }
+    }
+
+    #[test]
+    fn red_responder_signer_key_mismatched_delegation_rejected_before_any_write() {
+        let delegation_key = SigningKey::random(&mut OsRng);
+        let delegation = delegation_for_key(
+            &VerifyingKey::from(&delegation_key),
+            "hh-1",
+            "responder-1",
+            vec![0xCC; 32],
+            0,
+            u64::MAX / 2,
+        );
+        let local = identity("hh-1", "responder-1", vec![0xCC; 32], delegation);
+        // Deliberately a DIFFERENT key than the one delegation.delegated_pub
+        // encodes — the signer does not hold the delegated key.
+        let mismatched_k_mesh = TestKMesh(SigningKey::random(&mut OsRng));
+
+        let ingress = PrevalidatedIngress::new(PanicsOnIo, IngressEvidence { observed_at: 1 });
+        let result = run_responder_handshake(
+            ingress,
+            &local,
+            &fixed_checkpoint(),
+            &DelegationPolicy::test(u64::MAX / 2),
+            &AlwaysAcceptDelegation,
+            &mismatched_k_mesh,
+            RekeyThreshold::new(3).unwrap(),
+        );
+        assert!(matches!(
+            result,
+            Err(AuthFrameError::SignerKeyMismatchDelegation)
+        ));
+    }
+
+    #[test]
+    fn red_initiator_signer_key_mismatched_delegation_rejected_before_any_write() {
+        let delegation_key = SigningKey::random(&mut OsRng);
+        let delegation = delegation_for_key(
+            &VerifyingKey::from(&delegation_key),
+            "hh-1",
+            "initiator-1",
+            vec![0xEE; 32],
+            0,
+            u64::MAX / 2,
+        );
+        let local = identity("hh-1", "initiator-1", vec![0xEE; 32], delegation);
+        let mismatched_k_mesh = TestKMesh(SigningKey::random(&mut OsRng));
+        let expected = ExpectedResponder {
+            hh_id: "hh-1".to_string(),
+            m_id: "responder-1".to_string(),
+            cert_fingerprint: [0xCC; 32],
+        };
+
+        let ingress = PrevalidatedIngress::new(PanicsOnIo, IngressEvidence { observed_at: 1 });
+        let result = run_initiator_handshake(
+            ingress,
+            &expected,
+            &local,
+            &fixed_checkpoint(),
+            ConnectionIntentDigest::from_bytes([0x11; 32]),
+            &DelegationPolicy::test(u64::MAX / 2),
+            &AlwaysAcceptDelegation,
+            &mismatched_k_mesh,
+            RekeyThreshold::new(3).unwrap(),
+        );
+        assert!(matches!(
+            result,
+            Err(AuthFrameError::SignerKeyMismatchDelegation)
+        ));
+    }
+
     #[test]
     fn red_commit_outgoing_rekey_with_foreign_permit_does_not_touch_transport() {
         let (mut initiator, _responder) = full_handshake();
         let other_threshold = RekeyThreshold::new(1).unwrap();
-        let donor = rekey::DirectionalRekeyState::new(other_threshold);
+        let donor = rekey::DirectionalRekeyState::new(other_threshold).unwrap();
         let foreign_permit = donor.before_send_marker().unwrap();
 
         let err = initiator.commit_outgoing_rekey(foreign_permit).unwrap_err();
@@ -1106,7 +1231,14 @@ mod tests {
             "hh-1",
             "initiator-1",
             vec![0xEE; 32],
-            sample_delegation(0, u64::MAX / 2),
+            delegation_for_key(
+                &VerifyingKey::from(&initiator_key),
+                "hh-1",
+                "initiator-1",
+                vec![0xEE; 32],
+                0,
+                u64::MAX / 2,
+            ),
         );
         let expected = ExpectedResponder {
             hh_id: "hh-1".to_string(),

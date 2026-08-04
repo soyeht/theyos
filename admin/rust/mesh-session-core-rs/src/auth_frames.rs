@@ -941,6 +941,21 @@ pub fn decode_auth_frame(plaintext: &[u8]) -> Result<AuthFrame, AuthFrameError> 
 /// except panicking or fabricating a signature; both are worse than an
 /// `Err`. `sign_frame` propagates the error as-is and never invents a
 /// signature on failure.
+///
+/// **`public_key` (hardened 2026-08-04, @kiana, round 3):** exposes only
+/// the signer's *public* key — never anything secret — so two things
+/// downstream can both be checked mathematically rather than assumed: (1)
+/// `sign_frame` verifies its own output against this exact key before
+/// ever writing it to a frame (a signer bug could otherwise return a
+/// syntactically-valid low-S signature that verifies against some *other*
+/// message or key, and it would go straight to the wire); (2)
+/// `auth_state_machine` compares this key against
+/// `local.delegation.delegated_pub()` before the first frame is sent, so
+/// a signer that does not actually hold the delegated key is caught
+/// before producing anything a peer would reject anyway. Self-consistency
+/// (a frame verifying against its own embedded key) still never
+/// substitutes for delegation authority — see the module scope note; this
+/// only proves the *local* signer and the *local* delegation agree.
 pub trait MeshSessionFrameSigner {
     /// Returns the P-256 fixed-size `r || s` encoding (64 bytes),
     /// **low-S canonical** — implementors must normalize before returning.
@@ -952,6 +967,11 @@ pub trait MeshSessionFrameSigner {
         &self,
         preimage: &MeshSessionFramePreimage,
     ) -> Result<[u8; 64], AuthFrameError>;
+
+    /// This signer's own P-256 public key. Never secret material — used
+    /// only to mathematically self-check `sign_mesh_session_frame`'s
+    /// output and to bind the signer to `local.delegation.delegated_pub`.
+    fn public_key(&self) -> VerifyingKey;
 }
 
 pub trait MeshSessionFrameVerifier {
@@ -1029,6 +1049,18 @@ pub(crate) fn verifier_from_delegated_pub(
 /// crate does not trust only the implementor's doc comment, or the
 /// receiving peer's own inbound check, to catch a malformed signature
 /// this side is about to put on the wire.
+///
+/// **Mathematically self-verified (hardened 2026-08-04, @kiana, round 3):**
+/// shape-and-low-S parsing alone does not prove the returned bytes are a
+/// signature *over this preimage* — a buggy signer could return a
+/// perfectly well-formed low-S signature that happens to verify against a
+/// completely different message (or nothing at all it was asked to sign),
+/// and it would previously have gone straight to the wire, condemned only
+/// once the peer eventually checked it. `sign_frame` now verifies the
+/// signature against the exact `preimage` and the signer's own
+/// [`MeshSessionFrameSigner::public_key`] before ever returning it —
+/// wrong-message and wrong-key both fail closed locally,
+/// `SignerProducedInvalidSignature`, before any write.
 pub(crate) fn sign_frame<F, Sig>(frame: F, k_mesh: &Sig) -> Result<F, AuthFrameError>
 where
     F: AuthFrameBody + FrameWithSig,
@@ -1036,7 +1068,11 @@ where
 {
     let preimage = MeshSessionFramePreimage::for_frame(&frame)?;
     let sig_bytes = k_mesh.sign_mesh_session_frame(&preimage)?;
-    parse_low_s_signature(&sig_bytes)?;
+    let sig = parse_low_s_signature(&sig_bytes)?;
+    k_mesh
+        .public_key()
+        .verify(preimage.as_bytes(), &sig)
+        .map_err(|_| AuthFrameError::SignerProducedInvalidSignature)?;
     Ok(frame.with_sig_bytes(sig_bytes.to_vec()))
 }
 
@@ -1116,18 +1152,68 @@ mod tests {
             let sig = sig.normalize_s().unwrap_or(sig);
             Ok(sig.to_bytes().into())
         }
+        fn public_key(&self) -> VerifyingKey {
+            *self.0.verifying_key()
+        }
+    }
+
+    /// Stands in for a buggy/malicious K_mesh that signs a DIFFERENT
+    /// message than the one it was asked for, but otherwise correctly
+    /// (low-S, matching its own key) — proves `sign_frame`'s new
+    /// mathematical self-check catches a wrong-preimage signature that
+    /// shape-and-low-S parsing alone would have let straight onto the
+    /// wire.
+    struct WrongMessageKMesh(SigningKey);
+    impl MeshSessionFrameSigner for WrongMessageKMesh {
+        fn sign_mesh_session_frame(
+            &self,
+            _preimage: &MeshSessionFramePreimage,
+        ) -> Result<[u8; 64], AuthFrameError> {
+            let sig: Signature = self.0.sign(b"not the preimage sign_frame asked for");
+            let sig = sig.normalize_s().unwrap_or(sig);
+            Ok(sig.to_bytes().into())
+        }
+        fn public_key(&self) -> VerifyingKey {
+            *self.0.verifying_key()
+        }
+    }
+
+    /// Stands in for a K_mesh that signs correctly but whose reported
+    /// `public_key()` does not match the key it actually signed with —
+    /// used to prove `sign_frame`'s self-check (and, separately,
+    /// `auth_state_machine`'s delegation binding check) catch a
+    /// key/signature mismatch rather than trusting either side alone.
+    struct MismatchedPublicKeyKMesh {
+        signs_with: SigningKey,
+        claims_to_be: SigningKey,
+    }
+    impl MeshSessionFrameSigner for MismatchedPublicKeyKMesh {
+        fn sign_mesh_session_frame(
+            &self,
+            preimage: &MeshSessionFramePreimage,
+        ) -> Result<[u8; 64], AuthFrameError> {
+            let sig: Signature = self.signs_with.sign(preimage.as_bytes());
+            let sig = sig.normalize_s().unwrap_or(sig);
+            Ok(sig.to_bytes().into())
+        }
+        fn public_key(&self) -> VerifyingKey {
+            *self.claims_to_be.verifying_key()
+        }
     }
 
     /// Stands in for a real K_mesh whose backend refuses to sign — e.g.
     /// revoked, stale epoch, expired delegation. `sign_frame` must
     /// propagate this, never fabricate a signature.
-    struct AlwaysFailingKMesh;
+    struct AlwaysFailingKMesh(SigningKey);
     impl MeshSessionFrameSigner for AlwaysFailingKMesh {
         fn sign_mesh_session_frame(
             &self,
             _preimage: &MeshSessionFramePreimage,
         ) -> Result<[u8; 64], AuthFrameError> {
             Err(AuthFrameError::SignerFailed)
+        }
+        fn public_key(&self) -> VerifyingKey {
+            *self.0.verifying_key()
         }
     }
 
@@ -1153,6 +1239,9 @@ mod tests {
                 }
             }
             panic!("expected at least one high-S signature among 255 probes");
+        }
+        fn public_key(&self) -> VerifyingKey {
+            *self.0.verifying_key()
         }
     }
 
@@ -1375,7 +1464,8 @@ mod tests {
 
     #[test]
     fn red_signer_failure_propagates_never_fabricates_a_signature() {
-        let err = sign_frame(sample_proof_r(), &AlwaysFailingKMesh).unwrap_err();
+        let k_mesh = AlwaysFailingKMesh(SigningKey::random(&mut OsRng));
+        let err = sign_frame(sample_proof_r(), &k_mesh).unwrap_err();
         assert!(matches!(err, AuthFrameError::SignerFailed));
     }
 
@@ -1385,6 +1475,39 @@ mod tests {
         let k_mesh = AlwaysHighSKMesh(signing_key);
         let err = sign_frame(sample_proof_r(), &k_mesh).unwrap_err();
         assert!(matches!(err, AuthFrameError::HighSRejected));
+    }
+
+    #[test]
+    fn red_signer_returning_a_valid_low_s_signature_for_a_different_message_is_rejected() {
+        // The core finding this closes: shape-and-low-S parsing alone
+        // does not prove the signature is OVER THIS PREIMAGE. A signer
+        // that returns a perfectly well-formed, low-S, key-consistent
+        // signature — just over the wrong message — must still be caught
+        // locally, before the frame is ever written.
+        let k_mesh = WrongMessageKMesh(SigningKey::random(&mut OsRng));
+        let err = sign_frame(sample_proof_r(), &k_mesh).unwrap_err();
+        assert!(matches!(
+            err,
+            AuthFrameError::SignerProducedInvalidSignature
+        ));
+    }
+
+    #[test]
+    fn red_signer_public_key_not_matching_its_own_signing_key_is_rejected() {
+        // A signer whose sign_mesh_session_frame and public_key report
+        // two DIFFERENT keys — the signature is real and over the right
+        // preimage, but does not verify against what the signer itself
+        // claims to be. Must fail the same way as a wrong-message
+        // signature: locally, before any write.
+        let k_mesh = MismatchedPublicKeyKMesh {
+            signs_with: SigningKey::random(&mut OsRng),
+            claims_to_be: SigningKey::random(&mut OsRng),
+        };
+        let err = sign_frame(sample_proof_r(), &k_mesh).unwrap_err();
+        assert!(matches!(
+            err,
+            AuthFrameError::SignerProducedInvalidSignature
+        ));
     }
 
     #[test]
