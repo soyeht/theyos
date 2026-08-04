@@ -30,6 +30,15 @@ pub(crate) struct OwnerSiteIntent {
 }
 
 impl OwnerSiteIntent {
+    /// The production constructor: wraps an already-built pre-auth intent
+    /// plus the actor id resolved from the roster binding — never from a
+    /// peer-supplied intent string.
+    #[allow(dead_code)]
+    #[must_use]
+    pub(crate) fn from_pre_auth(pre_auth: OwnerSitePreAuthIntent, actor_id: String) -> Self {
+        Self { pre_auth, actor_id }
+    }
+
     /// Builds a server-owned intent for crate-local route tests only.
     #[cfg(test)]
     pub(crate) fn injected_for_harness(
@@ -109,7 +118,6 @@ impl OwnerSiteIntent {
 /// caveat operations until the owner-site PoP/challenge design is reviewed.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum OwnerSiteOperation {
-    #[cfg(test)]
     Open,
 }
 
@@ -125,6 +133,28 @@ pub(crate) struct OwnerSitePreAuthIntent {
 }
 
 impl OwnerSitePreAuthIntent {
+    /// The production constructor for the responder: the expected pre-auth
+    /// intent from server-held config and the HTTP request being served —
+    /// never from the peer's claim.
+    #[allow(dead_code)]
+    pub(crate) fn new(
+        household_id: &str,
+        network_id: &str,
+        resource: OwnerSiteResource,
+        request: OwnerSiteCanonicalRequest,
+    ) -> Result<Self, OwnerSiteIntentError> {
+        if household_id.is_empty() || network_id.is_empty() {
+            return Err(OwnerSiteIntentError::InvalidComponent);
+        }
+        Ok(Self {
+            household_id: household_id.to_owned(),
+            network_id: network_id.to_owned(),
+            operation: OwnerSiteOperation::Open,
+            resource,
+            request,
+        })
+    }
+
     #[cfg(test)]
     pub(crate) fn injected_for_harness(
         household_id: &str,
@@ -193,8 +223,28 @@ pub(crate) struct OwnerSiteCanonicalRequest {
 
 #[allow(dead_code)] // consumed by the test-only A2 transcript until a provider is reviewed
 impl OwnerSiteCanonicalRequest {
+    /// The production constructor: same route validation as the harness
+    /// path, no test gate. The AKE handler builds it from the HTTP request
+    /// it is already serving.
+    #[allow(dead_code)]
+    pub(crate) fn new(
+        method: OwnerSiteRequestMethod,
+        route: &str,
+        body_hash: [u8; 32],
+    ) -> Result<Self, OwnerSiteIntentError> {
+        Self::validated(method, route, body_hash)
+    }
+
     #[cfg(test)]
     pub(crate) fn injected_for_harness(
+        method: OwnerSiteRequestMethod,
+        route: &str,
+        body_hash: [u8; 32],
+    ) -> Result<Self, OwnerSiteIntentError> {
+        Self::validated(method, route, body_hash)
+    }
+
+    fn validated(
         method: OwnerSiteRequestMethod,
         route: &str,
         body_hash: [u8; 32],
