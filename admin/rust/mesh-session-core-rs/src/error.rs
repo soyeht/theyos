@@ -148,6 +148,16 @@ pub enum AuthFrameError {
     SignerKeyMismatchDelegation,
     #[error(transparent)]
     Rekey(#[from] RekeyError),
+    #[error(
+        "delegation.roles does not exactly equal the roles this ceremony requires (no extras, duplicates, or omissions)"
+    )]
+    DelegationRolesMismatch,
+    #[error(
+        "delegation.transcript_kinds does not exactly equal the kinds this ceremony requires (no extras, duplicates, or omissions)"
+    )]
+    DelegationTranscriptKindsMismatch,
+    #[error("delegation.channel does not match the channel this ceremony expects")]
+    DelegationChannelMismatch,
 }
 
 /// Errors from Noise session-static setup (item 2).

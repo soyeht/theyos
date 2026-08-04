@@ -183,13 +183,28 @@ pub enum IncomingRecord {
 }
 
 /// Proof that [`DirectionalRekeyState::before_send_non_marker`] succeeded,
-/// bound to the exact instance and `policy_count` it was validated
-/// against. `after_send_non_marker` re-checks both before mutating —
-/// issued-by-someone-else and issued-against-a-now-stale-count are both
-/// rejected, not just "some permit exists".
+/// bound to the exact instance and `generation`/`policy_count` snapshot it
+/// was validated against. `after_send_non_marker` re-checks all three
+/// before mutating — issued-by-someone-else and issued-against-a-now-stale
+/// snapshot are both rejected, not just "some permit exists".
+///
+/// **`expected_generation` (2026-08-04, @kiana, round 5):** this permit
+/// used to snapshot only `policy_count`, not `generation`. `policy_count`
+/// cycles back through the same small range (`0..threshold`) every
+/// generation, so a permit minted at (generation 0, count 0) and never
+/// applied is later replayable: once real traffic advances the state
+/// through a full marker cycle to (generation 1, count 0), the stale
+/// permit's `expected_policy_count == 0` matches `self.policy_count == 0`
+/// again — coincidentally, not because it is still valid — and
+/// `after_send_non_marker` would wrongly accept it, advancing generation
+/// 1's count using a permit that was only ever validated against
+/// generation 0. Snapshotting `generation` too closes this: the permit
+/// from generation 0 no longer matches once `self.generation` is 1,
+/// regardless of what `policy_count` happens to read.
 #[must_use = "pass this to after_send_non_marker, or the send is never committed"]
 pub struct SendNonMarkerPermit {
     issuer: RekeyStateId,
+    expected_generation: u64,
     expected_policy_count: u64,
 }
 
@@ -256,6 +271,7 @@ impl DirectionalRekeyState {
         }
         Ok(SendNonMarkerPermit {
             issuer: self.id,
+            expected_generation: self.generation,
             expected_policy_count: self.policy_count,
         })
     }
@@ -275,7 +291,10 @@ impl DirectionalRekeyState {
     /// tx.after_send_non_marker(); // missing the required SendNonMarkerPermit
     /// ```
     pub fn after_send_non_marker(&mut self, permit: SendNonMarkerPermit) -> Result<(), RekeyError> {
-        if permit.issuer != self.id || permit.expected_policy_count != self.policy_count {
+        if permit.issuer != self.id
+            || permit.expected_generation != self.generation
+            || permit.expected_policy_count != self.policy_count
+        {
             return Err(RekeyError::StalePermit);
         }
         self.policy_count = self
@@ -467,6 +486,54 @@ mod tests {
         );
         assert_eq!(tx.after_send_non_marker(p3), Err(RekeyError::StalePermit));
         assert_eq!(tx.policy_count(), 1);
+    }
+
+    /// 2026-08-04, @kiana, round 5: `SendNonMarkerPermit` used to
+    /// snapshot only `policy_count`, not `generation`. `policy_count`
+    /// cycles through `0..threshold` every generation, so a permit
+    /// obtained early and held back is replayable once real traffic
+    /// completes a full marker cycle and `policy_count` coincidentally
+    /// reads the same value again — in a DIFFERENT generation. Entirely
+    /// through the public API (`before_send_non_marker`/
+    /// `before_send_marker`/`after_send_marker`/`after_send_non_marker`):
+    /// mint a permit at (generation 0, count 0); drive real traffic
+    /// through threshold-1 sends plus a marker, landing back at
+    /// (generation 1, count 0); the held-back generation-0 permit must
+    /// now be rejected, not silently accepted into generation 1.
+    #[test]
+    fn red_cross_generation_permit_replay_rejected_after_a_full_marker_cycle() {
+        let threshold = RekeyThreshold::new(2).unwrap(); // threshold-1 == 1
+        let mut tx = DirectionalRekeyState::new(threshold).unwrap();
+
+        // Mint a permit at (generation 0, count 0) and hold it back —
+        // this is the "stale, waiting to be replayed" permit.
+        let stale_permit = tx.before_send_non_marker().unwrap();
+
+        // Real traffic advances state through a full cycle: one
+        // non-marker (count 0 -> 1 == threshold-1), then a marker
+        // (generation 0 -> 1, count resets to 0).
+        let live_permit = tx.before_send_non_marker().unwrap();
+        tx.after_send_non_marker(live_permit).unwrap();
+        assert_eq!(tx.policy_count(), 1);
+        let marker_permit = tx.before_send_marker().unwrap();
+        tx.after_send_marker(marker_permit).unwrap();
+        assert_eq!(tx.generation(), 1);
+        assert_eq!(tx.policy_count(), 0);
+
+        // policy_count is back to 0 -- coincidentally identical to what
+        // stale_permit snapshotted -- but generation has moved from 0 to
+        // 1. Without expected_generation, this would be wrongly accepted.
+        assert_eq!(
+            tx.after_send_non_marker(stale_permit),
+            Err(RekeyError::StalePermit),
+            "a permit from generation 0 must not be usable in generation 1, \
+             even when policy_count happens to read the same value again"
+        );
+        assert_eq!(
+            tx.policy_count(),
+            0,
+            "a rejected cross-generation permit must not mutate state"
+        );
     }
 
     #[test]

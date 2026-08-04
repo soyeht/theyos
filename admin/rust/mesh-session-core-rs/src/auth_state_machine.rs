@@ -116,21 +116,84 @@ fn recv_frame<S: Read>(
     auth_frames::decode_auth_frame(&plaintext[..pt_len])
 }
 
+/// The channel this ceremony is running under. Typed rather than a bare
+/// `&str` (2026-08-04, @kiana, round 5) so a caller cannot pass an
+/// arbitrary string and have it silently trusted — only these two values
+/// exist, matching the same "dev"/"release" literals `delegation.rs`'s
+/// own shape validation already fixes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ExpectedChannel {
+    Dev,
+    Release,
+}
+
+impl ExpectedChannel {
+    fn as_str(self) -> &'static str {
+        match self {
+            ExpectedChannel::Dev => "dev",
+            ExpectedChannel::Release => "release",
+        }
+    }
+}
+
+/// The exact `roles`/`transcript_kinds` a delegation must carry to
+/// authorize a B-SESSAO mesh-session auth-frame ceremony specifically —
+/// a norm shared with D-4, not a generic property of every
+/// `MeshSessionDelegation` (v6 §5 deliberately leaves the schema itself
+/// unconstrained here; see `delegation.rs`'s own `validate_shape` note).
+/// A delegation validly signed and shaped, but scoped to a different
+/// role/kind/channel, must not be treated as authorizing frames it was
+/// never issued for (2026-08-04, @kiana, round 5).
+const EXPECTED_DELEGATION_ROLES: [&str; 2] = ["initiator", "responder"];
+const EXPECTED_TRANSCRIPT_KINDS: [&str; 3] = ["final-confirm", "activate", "activate-ack"];
+
+/// Exact-set comparison: same length, same elements — no extras,
+/// duplicates, or omissions, order-independent. A plain sorted-Vec
+/// compare already rejects a duplicate that displaces a required element
+/// (e.g. `["initiator","initiator"]` against `["initiator","responder"]`
+/// sorts to `["initiator","initiator"] != ["initiator","responder"]`).
+fn string_set_matches_exactly(actual: &[String], expected: &[&str]) -> bool {
+    let mut sorted_actual: Vec<&str> = actual.iter().map(String::as_str).collect();
+    sorted_actual.sort_unstable();
+    let mut sorted_expected: Vec<&str> = expected.to_vec();
+    sorted_expected.sort_unstable();
+    sorted_actual == sorted_expected
+}
+
 /// The delegation gate, strictly ordered: policy TTL, then injected
-/// signature verification, then partial binding. `NoVerifierConfigured`
-/// (this crate's only shipped `DelegationSignatureVerifier`) always fails
-/// the middle step, so this gate never opens on an unmodified build — see
-/// the module doc.
+/// signature verification, then this ceremony's exact role/kind/channel
+/// scope, then partial binding. `NoVerifierConfigured` (this crate's only
+/// shipped `DelegationSignatureVerifier`) always fails the middle step,
+/// so this gate never opens on an unmodified build — see the module doc.
+///
+/// **Scope checks added (2026-08-04, @kiana, round 5):** a validly-signed
+/// delegation, correctly bound to the presenting identity, used to be
+/// enough to pass this gate regardless of what `roles`/`transcript_kinds`/
+/// `channel` it actually declared — a delegation scoped to some other
+/// purpose or environment (e.g. a "release" delegation replayed into a
+/// "dev" ceremony) would still authorize frames here. Checked right after
+/// signature verification, before partial binding, so these REDs don't
+/// need a matching `ctx` to reach them.
 fn pass_delegation_gate<Ver: DelegationSignatureVerifier>(
     delegation: &MeshSessionDelegation,
     policy: &DelegationPolicy,
     verifier: &Ver,
     ctx: &PartialBindingInputs,
+    expected_channel: ExpectedChannel,
 ) -> Result<(), AuthFrameError> {
     policy.validate(delegation)?;
     delegation
         .verify_signature(verifier)
         .map_err(|_| AuthFrameError::DelegationGate)?;
+    if !string_set_matches_exactly(delegation.roles(), &EXPECTED_DELEGATION_ROLES) {
+        return Err(AuthFrameError::DelegationRolesMismatch);
+    }
+    if !string_set_matches_exactly(delegation.transcript_kinds(), &EXPECTED_TRANSCRIPT_KINDS) {
+        return Err(AuthFrameError::DelegationTranscriptKindsMismatch);
+    }
+    if delegation.channel() != expected_channel.as_str() {
+        return Err(AuthFrameError::DelegationChannelMismatch);
+    }
     delegation.check_partial_binding(ctx)?;
     Ok(())
 }
@@ -163,6 +226,23 @@ fn check_signer_matches_delegation<Sig: MeshSessionFrameSigner>(
     let signer_pub = k_mesh.public_key().to_encoded_point(true);
     if signer_pub.as_bytes() != delegation.delegated_pub() {
         return Err(AuthFrameError::SignerKeyMismatchDelegation);
+    }
+    Ok(())
+}
+
+/// Checks the LOCAL delegation's own `channel` against what the caller
+/// says this ceremony expects — before any I/O, same preflight spot as
+/// [`check_signer_matches_delegation`] (2026-08-04, @kiana, round 5).
+/// `pass_delegation_gate` separately re-checks channel on the RECEIVED
+/// (peer's) delegation; this is the local half of that same requirement
+/// — "channel deve... bater na delegação local antes de I/O e na
+/// delegação recebida antes de confiar K_mesh."
+fn check_local_delegation_channel(
+    delegation: &MeshSessionDelegation,
+    expected_channel: ExpectedChannel,
+) -> Result<(), AuthFrameError> {
+    if delegation.channel() != expected_channel.as_str() {
+        return Err(AuthFrameError::DelegationChannelMismatch);
     }
     Ok(())
 }
@@ -289,6 +369,7 @@ pub(crate) fn run_responder_handshake<S, Sig, Ver>(
     ingress: PrevalidatedIngress<S>,
     local: &LocalIdentity,
     checkpoint: &LocalCheckpoint,
+    expected_channel: ExpectedChannel,
     policy: &DelegationPolicy,
     delegation_verifier: &Ver,
     k_mesh: &Sig,
@@ -300,6 +381,7 @@ where
     Ver: DelegationSignatureVerifier,
 {
     check_signer_matches_delegation(k_mesh, &local.delegation)?;
+    check_local_delegation_channel(&local.delegation, expected_channel)?;
     // 2026-08-04, @kiana, round 4: minted here — before any I/O at all,
     // long before ActivateAck is ever written — not after. See the
     // hardening note on ActiveMeshSession's construction below for why.
@@ -360,6 +442,7 @@ where
             proof_self_m_id: proof_i.self_m_id().to_string(),
             proof_self_cert_fingerprint: proof_i.self_cert_fingerprint().to_vec(),
         },
+        expected_channel,
     )?;
     let initiator_verifier =
         auth_frames::verifier_from_delegated_pub(proof_i.delegation().delegated_pub())?;
@@ -453,6 +536,7 @@ pub(crate) fn run_initiator_handshake<S, Sig, Ver>(
     local: &LocalIdentity,
     checkpoint: &LocalCheckpoint,
     connection_intent_digest: ConnectionIntentDigest,
+    expected_channel: ExpectedChannel,
     policy: &DelegationPolicy,
     delegation_verifier: &Ver,
     k_mesh: &Sig,
@@ -464,6 +548,7 @@ where
     Ver: DelegationSignatureVerifier,
 {
     check_signer_matches_delegation(k_mesh, &local.delegation)?;
+    check_local_delegation_channel(&local.delegation, expected_channel)?;
     // 2026-08-04, @kiana, round 4: minted here — before Proof-I, before
     // Activate, before anything is sent at all. If the mint fails, this
     // side sends literally nothing, so there is no possibility the peer
@@ -506,6 +591,7 @@ where
             proof_self_m_id: proof_r.self_m_id().to_string(),
             proof_self_cert_fingerprint: proof_r.self_cert_fingerprint().to_vec(),
         },
+        expected_channel,
     )?;
     let responder_verifier =
         auth_frames::verifier_from_delegated_pub(proof_r.delegation().delegated_pub())?;
@@ -650,12 +736,17 @@ mod tests {
     /// A delegation whose `delegated_pub` really is the SEC1-compressed
     /// form of `verifying` (so `verifier_from_delegated_pub`, which reads
     /// `delegated_pub` straight out of the received frame, constructs a
-    /// verifier that actually matches the key `k_mesh` signs with) and
+    /// verifier that actually matches the key `k_mesh` signs with),
     /// whose `hh_id`/`delegator_m_id`/`delegator_cert_fingerprint` match
     /// the identity presenting it (so `check_partial_binding`'s
     /// non-roster triple-equality checks — which compare the frame's own
     /// `hh_id`/`self_m_id`/`self_cert_fingerprint` against these exact
-    /// fields — actually pass).
+    /// fields — actually pass), and whose `roles`/`transcript_kinds`
+    /// exactly match `EXPECTED_DELEGATION_ROLES`/`EXPECTED_TRANSCRIPT_KINDS`
+    /// (2026-08-04, @kiana, round 5: `pass_delegation_gate` now enforces
+    /// this exactly, so every fixture that expects to pass the gate needs
+    /// to already satisfy it — see the round-5 REDs for what happens when
+    /// it doesn't).
     fn delegation_for_key(
         verifying: &VerifyingKey,
         hh_id: &str,
@@ -675,8 +766,14 @@ mod tests {
             delegated_pub,
             delegated_key_id: "key-1".to_string(),
             profile: crate::delegation::DELEGATION_PROFILE.to_string(),
-            transcript_kinds: vec!["identity-proof".to_string()],
-            roles: vec!["initiator".to_string(), "responder".to_string()],
+            transcript_kinds: EXPECTED_TRANSCRIPT_KINDS
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
+            roles: EXPECTED_DELEGATION_ROLES
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
             channel: "dev".to_string(),
             serial: 1,
             not_before,
@@ -685,6 +782,56 @@ mod tests {
         }
         .try_into()
         .unwrap()
+    }
+
+    /// Like [`delegation_for_key`], but every scoping field is caller
+    /// controlled — used to build deliberately mis-scoped delegations for
+    /// the round-5 REDs (missing/extra/duplicate role or transcript kind,
+    /// wrong channel). `hh_id`/`delegator_m_id`/`delegator_cert_fingerprint`
+    /// still default to values `pass_delegation_gate`'s scoping checks
+    /// don't depend on — irrelevant for these tests since the checks
+    /// under test fire before `check_partial_binding` is ever reached.
+    fn delegation_wire_with(
+        verifying: &VerifyingKey,
+        roles: Vec<String>,
+        transcript_kinds: Vec<String>,
+        channel: &str,
+    ) -> MeshSessionDelegation {
+        let delegated_pub = verifying.to_encoded_point(true).as_bytes().to_vec();
+        crate::delegation::DelegationWire {
+            version: crate::delegation::DELEGATION_VERSION,
+            kind: crate::delegation::DELEGATION_KIND.to_string(),
+            domain: crate::delegation::DELEGATION_DOMAIN.to_string(),
+            hh_id: "hh-1".to_string(),
+            delegator_m_id: "someone-1".to_string(),
+            delegator_cert_fingerprint: vec![0xCC; 32],
+            delegated_pub,
+            delegated_key_id: "key-1".to_string(),
+            profile: crate::delegation::DELEGATION_PROFILE.to_string(),
+            transcript_kinds,
+            roles,
+            channel: channel.to_string(),
+            serial: 1,
+            not_before: 0,
+            not_after: u64::MAX / 2,
+            sig: vec![0u8; 64],
+        }
+        .try_into()
+        .unwrap()
+    }
+
+    fn valid_roles() -> Vec<String> {
+        EXPECTED_DELEGATION_ROLES
+            .iter()
+            .map(|s| s.to_string())
+            .collect()
+    }
+
+    fn valid_transcript_kinds() -> Vec<String> {
+        EXPECTED_TRANSCRIPT_KINDS
+            .iter()
+            .map(|s| s.to_string())
+            .collect()
     }
 
     fn identity(
@@ -737,6 +884,7 @@ mod tests {
                     ingress,
                     &responder_identity,
                     &checkpoint,
+                    ExpectedChannel::Dev,
                     &DelegationPolicy::test(u64::MAX / 2),
                     &AlwaysAcceptDelegation,
                     &k_mesh,
@@ -770,6 +918,7 @@ mod tests {
             &initiator_identity,
             &fixed_checkpoint(),
             ConnectionIntentDigest::from_bytes([0x11; 32]),
+            ExpectedChannel::Dev,
             &DelegationPolicy::test(u64::MAX / 2),
             &AlwaysAcceptDelegation,
             &k_mesh,
@@ -830,6 +979,7 @@ mod tests {
                     ingress,
                     &responder_identity,
                     &checkpoint,
+                    ExpectedChannel::Dev,
                     &DelegationPolicy::test(u64::MAX / 2),
                     &AlwaysAcceptDelegation,
                     &k_mesh,
@@ -862,6 +1012,7 @@ mod tests {
             &initiator_identity,
             &initiator_checkpoint,
             ConnectionIntentDigest::from_bytes([0x11; 32]),
+            ExpectedChannel::Dev,
             &DelegationPolicy::test(u64::MAX / 2),
             &AlwaysAcceptDelegation,
             &k_mesh,
@@ -947,6 +1098,7 @@ mod tests {
                     ingress,
                     &responder_identity,
                     &checkpoint,
+                    ExpectedChannel::Dev,
                     &DelegationPolicy::test(u64::MAX / 2),
                     &AlwaysAcceptDelegation,
                     &k_mesh,
@@ -1039,6 +1191,7 @@ mod tests {
                     ingress,
                     &responder_identity,
                     &checkpoint,
+                    ExpectedChannel::Dev,
                     &DelegationPolicy::test(u64::MAX / 2),
                     &AlwaysAcceptDelegation,
                     &k_mesh,
@@ -1139,6 +1292,7 @@ mod tests {
             ingress,
             &local,
             &fixed_checkpoint(),
+            ExpectedChannel::Dev,
             &DelegationPolicy::test(u64::MAX / 2),
             &AlwaysAcceptDelegation,
             &mismatched_k_mesh,
@@ -1176,6 +1330,7 @@ mod tests {
             &local,
             &fixed_checkpoint(),
             ConnectionIntentDigest::from_bytes([0x11; 32]),
+            ExpectedChannel::Dev,
             &DelegationPolicy::test(u64::MAX / 2),
             &AlwaysAcceptDelegation,
             &mismatched_k_mesh,
@@ -1219,6 +1374,7 @@ mod tests {
             ingress,
             &local,
             &fixed_checkpoint(),
+            ExpectedChannel::Dev,
             &DelegationPolicy::test(u64::MAX / 2),
             &AlwaysAcceptDelegation,
             &k_mesh,
@@ -1262,6 +1418,7 @@ mod tests {
             &local,
             &fixed_checkpoint(),
             ConnectionIntentDigest::from_bytes([0x11; 32]),
+            ExpectedChannel::Dev,
             &DelegationPolicy::test(u64::MAX / 2),
             &AlwaysAcceptDelegation,
             &k_mesh,
@@ -1270,6 +1427,431 @@ mod tests {
         assert!(matches!(
             result,
             Err(AuthFrameError::Rekey(RekeyError::RngFailure))
+        ));
+    }
+
+    // --- 2026-08-04, @kiana, round 5: pass_delegation_gate scope checks ---
+    // A validly-signed, correctly-bound delegation used to authorize
+    // frames regardless of what roles/transcript_kinds/channel it
+    // actually declared. These call `pass_delegation_gate` directly —
+    // it's a pure function of (delegation, policy, verifier, ctx,
+    // expected_channel) — since the new checks run right after signature
+    // verification and before check_partial_binding, `ctx` never needs
+    // to actually match for these to reach the check under test.
+
+    fn gate_ctx() -> PartialBindingInputs {
+        PartialBindingInputs {
+            proof_hh_id: "hh-1".to_string(),
+            local_hh_id: "hh-1".to_string(),
+            proof_self_m_id: "someone-1".to_string(),
+            proof_self_cert_fingerprint: vec![0xCC; 32],
+        }
+    }
+
+    #[test]
+    fn red_delegation_gate_rejects_roles_missing_a_required_role() {
+        let key = SigningKey::random(&mut OsRng);
+        let delegation = delegation_wire_with(
+            &VerifyingKey::from(&key),
+            vec!["initiator".to_string()], // omits "responder"
+            valid_transcript_kinds(),
+            "dev",
+        );
+        let result = pass_delegation_gate(
+            &delegation,
+            &DelegationPolicy::test(u64::MAX / 2),
+            &AlwaysAcceptDelegation,
+            &gate_ctx(),
+            ExpectedChannel::Dev,
+        );
+        assert!(matches!(
+            result,
+            Err(AuthFrameError::DelegationRolesMismatch)
+        ));
+    }
+
+    #[test]
+    fn red_delegation_gate_rejects_roles_with_an_unexpected_extra_role() {
+        let key = SigningKey::random(&mut OsRng);
+        let delegation = delegation_wire_with(
+            &VerifyingKey::from(&key),
+            vec![
+                "initiator".to_string(),
+                "responder".to_string(),
+                "observer".to_string(), // not in EXPECTED_DELEGATION_ROLES
+            ],
+            valid_transcript_kinds(),
+            "dev",
+        );
+        let result = pass_delegation_gate(
+            &delegation,
+            &DelegationPolicy::test(u64::MAX / 2),
+            &AlwaysAcceptDelegation,
+            &gate_ctx(),
+            ExpectedChannel::Dev,
+        );
+        assert!(matches!(
+            result,
+            Err(AuthFrameError::DelegationRolesMismatch)
+        ));
+    }
+
+    #[test]
+    fn red_delegation_gate_rejects_roles_with_a_duplicate() {
+        // Same length as EXPECTED_DELEGATION_ROLES (2), but a duplicate
+        // "initiator" displaces "responder" entirely -- proves the check
+        // is a real set comparison, not just a length check.
+        let key = SigningKey::random(&mut OsRng);
+        let delegation = delegation_wire_with(
+            &VerifyingKey::from(&key),
+            vec!["initiator".to_string(), "initiator".to_string()],
+            valid_transcript_kinds(),
+            "dev",
+        );
+        let result = pass_delegation_gate(
+            &delegation,
+            &DelegationPolicy::test(u64::MAX / 2),
+            &AlwaysAcceptDelegation,
+            &gate_ctx(),
+            ExpectedChannel::Dev,
+        );
+        assert!(matches!(
+            result,
+            Err(AuthFrameError::DelegationRolesMismatch)
+        ));
+    }
+
+    #[test]
+    fn red_delegation_gate_rejects_transcript_kinds_missing_a_required_kind() {
+        let key = SigningKey::random(&mut OsRng);
+        let delegation = delegation_wire_with(
+            &VerifyingKey::from(&key),
+            valid_roles(),
+            vec!["final-confirm".to_string(), "activate".to_string()], // omits "activate-ack"
+            "dev",
+        );
+        let result = pass_delegation_gate(
+            &delegation,
+            &DelegationPolicy::test(u64::MAX / 2),
+            &AlwaysAcceptDelegation,
+            &gate_ctx(),
+            ExpectedChannel::Dev,
+        );
+        assert!(matches!(
+            result,
+            Err(AuthFrameError::DelegationTranscriptKindsMismatch)
+        ));
+    }
+
+    #[test]
+    fn red_delegation_gate_rejects_transcript_kinds_with_an_unexpected_extra_kind() {
+        let key = SigningKey::random(&mut OsRng);
+        let delegation = delegation_wire_with(
+            &VerifyingKey::from(&key),
+            valid_roles(),
+            vec![
+                "final-confirm".to_string(),
+                "activate".to_string(),
+                "activate-ack".to_string(),
+                "proof-r".to_string(), // not in EXPECTED_TRANSCRIPT_KINDS
+            ],
+            "dev",
+        );
+        let result = pass_delegation_gate(
+            &delegation,
+            &DelegationPolicy::test(u64::MAX / 2),
+            &AlwaysAcceptDelegation,
+            &gate_ctx(),
+            ExpectedChannel::Dev,
+        );
+        assert!(matches!(
+            result,
+            Err(AuthFrameError::DelegationTranscriptKindsMismatch)
+        ));
+    }
+
+    #[test]
+    fn red_delegation_gate_rejects_transcript_kinds_with_a_duplicate() {
+        // Same length as EXPECTED_TRANSCRIPT_KINDS (3), but a duplicated
+        // "final-confirm" displaces "activate-ack" entirely.
+        let key = SigningKey::random(&mut OsRng);
+        let delegation = delegation_wire_with(
+            &VerifyingKey::from(&key),
+            valid_roles(),
+            vec![
+                "final-confirm".to_string(),
+                "final-confirm".to_string(),
+                "activate".to_string(),
+            ],
+            "dev",
+        );
+        let result = pass_delegation_gate(
+            &delegation,
+            &DelegationPolicy::test(u64::MAX / 2),
+            &AlwaysAcceptDelegation,
+            &gate_ctx(),
+            ExpectedChannel::Dev,
+        );
+        assert!(matches!(
+            result,
+            Err(AuthFrameError::DelegationTranscriptKindsMismatch)
+        ));
+    }
+
+    #[test]
+    fn red_delegation_gate_rejects_channel_not_matching_expected() {
+        let key = SigningKey::random(&mut OsRng);
+        let delegation = delegation_wire_with(
+            &VerifyingKey::from(&key),
+            valid_roles(),
+            valid_transcript_kinds(),
+            "release",
+        );
+        let result = pass_delegation_gate(
+            &delegation,
+            &DelegationPolicy::test(u64::MAX / 2),
+            &AlwaysAcceptDelegation,
+            &gate_ctx(),
+            ExpectedChannel::Dev, // caller expects dev; delegation says release
+        );
+        assert!(matches!(
+            result,
+            Err(AuthFrameError::DelegationChannelMismatch)
+        ));
+    }
+
+    /// Wiring confirmation, responder side: proves the roles/kinds/channel
+    /// check is actually reached via `run_responder_handshake`'s own call
+    /// to `pass_delegation_gate` on the RECEIVED (Proof-I) delegation, not
+    /// just correct in isolation as the direct `pass_delegation_gate`
+    /// tests above prove. Manual-attacker-harness pattern (real Noise
+    /// handshake + hand-built, correctly-addressed, validly-signed but
+    /// mis-scoped Proof-I).
+    #[test]
+    fn red_responder_rejects_received_delegation_with_missing_role() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let responder_key = SigningKey::random(&mut OsRng);
+        let responder_delegation = delegation_for_key(
+            &VerifyingKey::from(&responder_key),
+            "hh-1",
+            "responder-1",
+            vec![0xCC; 32],
+            0,
+            u64::MAX / 2,
+        );
+        let responder_identity =
+            identity("hh-1", "responder-1", vec![0xCC; 32], responder_delegation);
+
+        let responder = thread::spawn({
+            let checkpoint = fixed_checkpoint();
+            let k_mesh = TestKMesh(responder_key);
+            move || {
+                let (sock, _) = listener.accept().unwrap();
+                let ingress = PrevalidatedIngress::new(sock, IngressEvidence { observed_at: 1 });
+                run_responder_handshake(
+                    ingress,
+                    &responder_identity,
+                    &checkpoint,
+                    ExpectedChannel::Dev,
+                    &DelegationPolicy::test(u64::MAX / 2),
+                    &AlwaysAcceptDelegation,
+                    &k_mesh,
+                    RekeyThreshold::new(3).unwrap(),
+                )
+            }
+        });
+
+        let mut sock = TcpStream::connect(addr).unwrap();
+        let handshake = noise::run_xx_handshake(&mut sock, Role::Initiator).unwrap();
+        let mut transport = handshake.transport;
+        let h_final = handshake.handshake_hash;
+        match recv_frame(&mut sock, &mut transport).unwrap() {
+            AuthFrame::ProofR(_) => {}
+            _ => panic!("expected ProofR"),
+        }
+
+        let initiator_key = SigningKey::random(&mut OsRng);
+        let bad_delegation = delegation_wire_with(
+            &VerifyingKey::from(&initiator_key),
+            vec!["initiator".to_string()], // omits "responder"
+            valid_transcript_kinds(),
+            "dev",
+        );
+        let checkpoint = fixed_checkpoint();
+        let proof_i = ProofI::new(
+            h_final.clone(),
+            "hh-1".to_string(),
+            "initiator-1".to_string(),
+            "responder-1".to_string(),
+            vec![0xEE; 32],
+            vec![0xCC; 32],
+            checkpoint.hash.clone(),
+            checkpoint.sequence,
+            checkpoint.event_head.clone(),
+            checkpoint.not_after,
+            bad_delegation,
+            ConnectionIntentDigest::from_bytes([0x11; 32]),
+            vec![0u8; 64],
+        )
+        .unwrap();
+        let k_mesh = TestKMesh(initiator_key);
+        let proof_i = auth_frames::sign_frame(proof_i, &k_mesh).unwrap();
+        send_frame(&mut sock, &mut transport, &AuthFrame::ProofI(proof_i)).unwrap();
+
+        let responder_result = responder.join().unwrap();
+        assert!(matches!(
+            responder_result,
+            Err(AuthFrameError::DelegationRolesMismatch)
+        ));
+    }
+
+    /// Symmetric wiring confirmation, initiator side: a hand-built,
+    /// correctly-addressed, validly-signed but mis-scoped Proof-R must be
+    /// rejected via `run_initiator_handshake`'s own call to
+    /// `pass_delegation_gate`.
+    #[test]
+    fn red_initiator_rejects_received_delegation_with_missing_role() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let attacker = thread::spawn(move || {
+            let (mut sock, _) = listener.accept().unwrap();
+            let handshake = noise::run_xx_handshake(&mut sock, Role::Responder).unwrap();
+            let mut transport = handshake.transport;
+            let h_final = handshake.handshake_hash;
+
+            let responder_key = SigningKey::random(&mut OsRng);
+            let bad_delegation = delegation_wire_with(
+                &VerifyingKey::from(&responder_key),
+                vec!["initiator".to_string()], // omits "responder"
+                valid_transcript_kinds(),
+                "dev",
+            );
+            let checkpoint = fixed_checkpoint();
+            let proof_r = ProofR::new(
+                h_final.clone(),
+                "hh-1".to_string(),
+                "responder-1".to_string(),
+                vec![0xCC; 32],
+                checkpoint.hash.clone(),
+                checkpoint.sequence,
+                checkpoint.event_head.clone(),
+                checkpoint.not_after,
+                bad_delegation,
+                vec![0u8; 64],
+            )
+            .unwrap();
+            let k_mesh = TestKMesh(responder_key);
+            let proof_r = auth_frames::sign_frame(proof_r, &k_mesh).unwrap();
+            send_frame(&mut sock, &mut transport, &AuthFrame::ProofR(proof_r)).unwrap();
+        });
+
+        let initiator_key = SigningKey::random(&mut OsRng);
+        let initiator_delegation = delegation_for_key(
+            &VerifyingKey::from(&initiator_key),
+            "hh-1",
+            "initiator-1",
+            vec![0xEE; 32],
+            0,
+            u64::MAX / 2,
+        );
+        let initiator_identity =
+            identity("hh-1", "initiator-1", vec![0xEE; 32], initiator_delegation);
+        let expected = ExpectedResponder {
+            hh_id: "hh-1".to_string(),
+            m_id: "responder-1".to_string(),
+            cert_fingerprint: [0xCC; 32],
+        };
+        let sock = TcpStream::connect(addr).unwrap();
+        let ingress = PrevalidatedIngress::new(sock, IngressEvidence { observed_at: 2 });
+        let k_mesh = TestKMesh(initiator_key);
+        let result = run_initiator_handshake(
+            ingress,
+            &expected,
+            &initiator_identity,
+            &fixed_checkpoint(),
+            ConnectionIntentDigest::from_bytes([0x11; 32]),
+            ExpectedChannel::Dev,
+            &DelegationPolicy::test(u64::MAX / 2),
+            &AlwaysAcceptDelegation,
+            &k_mesh,
+            RekeyThreshold::new(3).unwrap(),
+        );
+        attacker.join().unwrap();
+        assert!(matches!(
+            result,
+            Err(AuthFrameError::DelegationRolesMismatch)
+        ));
+    }
+
+    /// Local pre-I/O channel check, responder side (2026-08-04, @kiana,
+    /// round 5): the LOCAL delegation's own channel must match what the
+    /// caller says this ceremony expects, checked before any I/O.
+    /// `PanicsOnIo` proves zero I/O, not just the right `Err`.
+    #[test]
+    fn red_responder_local_delegation_channel_mismatch_rejected_before_any_write() {
+        let responder_key = SigningKey::random(&mut OsRng);
+        let delegation = delegation_wire_with(
+            &VerifyingKey::from(&responder_key),
+            valid_roles(),
+            valid_transcript_kinds(),
+            "release", // local delegation says release
+        );
+        let local = identity("hh-1", "responder-1", vec![0xCC; 32], delegation);
+        let k_mesh = TestKMesh(responder_key);
+
+        let ingress = PrevalidatedIngress::new(PanicsOnIo, IngressEvidence { observed_at: 1 });
+        let result = run_responder_handshake(
+            ingress,
+            &local,
+            &fixed_checkpoint(),
+            ExpectedChannel::Dev, // caller expects dev
+            &DelegationPolicy::test(u64::MAX / 2),
+            &AlwaysAcceptDelegation,
+            &k_mesh,
+            RekeyThreshold::new(3).unwrap(),
+        );
+        assert!(matches!(
+            result,
+            Err(AuthFrameError::DelegationChannelMismatch)
+        ));
+    }
+
+    /// Symmetric to the above, initiator side.
+    #[test]
+    fn red_initiator_local_delegation_channel_mismatch_rejected_before_any_write() {
+        let initiator_key = SigningKey::random(&mut OsRng);
+        let delegation = delegation_wire_with(
+            &VerifyingKey::from(&initiator_key),
+            valid_roles(),
+            valid_transcript_kinds(),
+            "release",
+        );
+        let local = identity("hh-1", "initiator-1", vec![0xEE; 32], delegation);
+        let k_mesh = TestKMesh(initiator_key);
+        let expected = ExpectedResponder {
+            hh_id: "hh-1".to_string(),
+            m_id: "responder-1".to_string(),
+            cert_fingerprint: [0xCC; 32],
+        };
+
+        let ingress = PrevalidatedIngress::new(PanicsOnIo, IngressEvidence { observed_at: 1 });
+        let result = run_initiator_handshake(
+            ingress,
+            &expected,
+            &local,
+            &fixed_checkpoint(),
+            ConnectionIntentDigest::from_bytes([0x11; 32]),
+            ExpectedChannel::Dev,
+            &DelegationPolicy::test(u64::MAX / 2),
+            &AlwaysAcceptDelegation,
+            &k_mesh,
+            RekeyThreshold::new(3).unwrap(),
+        );
+        assert!(matches!(
+            result,
+            Err(AuthFrameError::DelegationChannelMismatch)
         ));
     }
 
@@ -1325,6 +1907,7 @@ mod tests {
                     ingress,
                     &responder_identity,
                     &checkpoint,
+                    ExpectedChannel::Dev,
                     &DelegationPolicy::test(u64::MAX / 2),
                     &crate::delegation::NoVerifierConfigured,
                     &k_mesh,
@@ -1361,6 +1944,7 @@ mod tests {
             &initiator_identity,
             &fixed_checkpoint(),
             ConnectionIntentDigest::from_bytes([0x11; 32]),
+            ExpectedChannel::Dev,
             &DelegationPolicy::test(u64::MAX / 2),
             &AlwaysAcceptDelegation,
             &k_mesh,
