@@ -244,8 +244,8 @@ pub struct SessionId(u64);
 ///   check and the lock acquisition are not atomic with each other, so a
 ///   writer's `fetch_add` could land in the gap between them). A counter,
 ///   not a bool: two different threads can call
-///   [`revoke`](SessionSync::revoke) on the same `SessionSync`
-///   concurrently (two different `observe_new_checkpoint`/
+///   [`announce_revoke`](SessionSync::announce_revoke) on the same
+///   `SessionSync` concurrently (two different `observe_new_checkpoint`/
 ///   `mark_unavailable` calls can both decide to revoke the same session
 ///   before either has removed it from the registry's bookkeeping maps),
 ///   and the signal must stay "a writer is active" until ALL of them
@@ -278,7 +278,7 @@ pub struct SessionId(u64);
 /// panic had anything to do with mutating `active_readers`; a `usize`
 /// field recovered via `into_inner` is not "torn" in any sense Rust's
 /// memory model can produce for a plain field store, so there was never a
-/// real reason to stop trusting it). [`revoke`](SessionSync::revoke)
+/// real reason to stop trusting it). [`drain_after_announce`](SessionSync::drain_after_announce)
 /// recovers a poisoned `state` via `into_inner` on both the initial lock
 /// and every `Condvar::wait`, but KEEPS WAITING on `active_readers`
 /// regardless — [`ForwardingGuard`]'s `Drop` recovers poison the same way
@@ -369,42 +369,40 @@ impl SessionSync {
         self.drained.notify_all();
     }
 
-    /// Writer side: announce intent on the lock-free counter (blocks every
-    /// NEW reader from this instant, structurally — see the struct doc
-    /// comment), wait out any readers already admitted, then commit the
-    /// fail-closed bit. A poisoned `state` (initial lock, or observed
-    /// during the `Condvar` wait) is recovered via `into_inner` but does
-    /// NOT short-circuit the wait — see the struct doc comment for why
-    /// `active_readers` remains trustworthy across poison and abandoning
-    /// the wait would violate the documented contract that `revoke` does
-    /// not return until every in-flight forward has actually finished.
-    ///
-    /// Composed of [`announce_revoke`](Self::announce_revoke) then
-    /// [`drain_after_announce`](Self::drain_after_announce) — split apart
-    /// (round D-1 successor, @kiana P0-1) so a caller revoking SEVERAL
-    /// sessions from one decision can announce to every target before
-    /// draining any of them. See [`revoke_batch`] for why that split
-    /// matters: calling this single-target `revoke` in a loop leaves each
-    /// LATER target's own `writer_intent` at zero — and therefore still
-    /// admitting brand-new readers — for the entire time an EARLIER
-    /// target's drain is in flight, even though the same decision already
-    /// condemned it.
-    fn revoke(&self) {
-        self.announce_revoke();
-        self.drain_after_announce();
-    }
-
     /// Phase 1 of a revoke: increment `writer_intent` only. Lock-free,
     /// cannot itself be delayed by another target's slow drain — see
-    /// [`revoke_batch`].
+    /// [`revoke_batch`]. Split from [`drain_after_announce`](Self::drain_after_announce)
+    /// (round D-1 successor, @kiana P0-1, sharpened by a second recheck)
+    /// so a caller can announce to every target in a batch — or, just as
+    /// importantly, announce while STILL HOLDING a coarser lock that is
+    /// about to publish some other state (a revoked machine's absence from
+    /// `by_machine`, a reduced `registered_count`, a new
+    /// `last_known_revision`) — strictly BEFORE that publication becomes
+    /// externally observable. `unregister` and `registered_count`'s
+    /// dead-Weak prune both call this while still under `self.inner`'s
+    /// lock for exactly that reason: without it, another caller could
+    /// already observe the session as gone/unregistered while a
+    /// `SessionGate` cloned earlier still obtains a fresh
+    /// `ForwardingGuard`, since nothing had announced revoke intent to its
+    /// `SessionSync` yet. A single combined "revoke now" method that
+    /// always announces immediately before draining does not offer this —
+    /// see [`revoke_batch`] for the equivalent batch-vs-sequential
+    /// argument.
     fn announce_revoke(&self) {
         self.writer_intent.fetch_add(1, Ordering::SeqCst);
     }
 
-    /// Phase 2 of a revoke: MUST be preceded by exactly one
-    /// [`announce_revoke`](Self::announce_revoke) on the same instance.
-    /// Waits out any already-admitted readers/pending-admissions, commits
-    /// the fail-closed bit, then balances `writer_intent` back down.
+    /// Must be preceded by exactly one [`announce_revoke`](Self::announce_revoke)
+    /// on the same instance — every call site in this file pairs them,
+    /// either directly or via [`revoke_batch`]/[`drain_batch`]. Waits out
+    /// any already-admitted readers/pending-admissions, commits the
+    /// fail-closed bit, then balances `writer_intent` back down. A
+    /// poisoned `state` (initial lock, or observed during the `Condvar`
+    /// wait) is recovered via `into_inner` but does NOT short-circuit the
+    /// wait — see the struct doc comment for why `active_readers` remains
+    /// trustworthy across poison and abandoning the wait would violate the
+    /// documented contract that draining does not return until every
+    /// in-flight forward has actually finished.
     fn drain_after_announce(&self) {
         let mut state = match self.state.lock() {
             Ok(state) => state,
@@ -1085,6 +1083,24 @@ impl<H: RevocableMeshSession> MeshSessionRegistry<H> {
     /// authority leak. `unregister` is therefore equivalent to a
     /// single-session revoke, not a "leave it be" removal.
     pub fn unregister(&self, session_id: SessionId) {
+        self.unregister_inner(session_id, || {});
+    }
+
+    /// Test-only seam (round D-1 successor, @kiana second recheck): runs
+    /// `after_unlock_before_drain` at the exact point between the
+    /// bookkeeping-removal lock releasing and the (possibly blocking)
+    /// drain starting — see
+    /// `unregister_announces_before_absence_is_externally_observable`.
+    #[cfg(test)]
+    pub(crate) fn unregister_with_hook_for_test(
+        &self,
+        session_id: SessionId,
+        after_unlock_before_drain: impl FnOnce(),
+    ) {
+        self.unregister_inner(session_id, after_unlock_before_drain);
+    }
+
+    fn unregister_inner(&self, session_id: SessionId, after_unlock_before_drain: impl FnOnce()) {
         let entry = {
             let Ok(mut guard) = self.inner.lock() else {
                 self.registry_live.store(false, Ordering::SeqCst);
@@ -1098,6 +1114,19 @@ impl<H: RevocableMeshSession> MeshSessionRegistry<H> {
             {
                 let removed = sessions.remove(&session_id);
                 if let Some(entry) = &removed {
+                    // Round D-1 successor (@kiana second recheck): announce
+                    // BEFORE this session's absence becomes externally
+                    // observable — i.e. before this lock releases, not
+                    // merely before the (unlocked, possibly slow) drain
+                    // below. Without this, `registered_count`/
+                    // `is_registered` for `entry.m_id` could already report
+                    // this session gone the instant the lock below
+                    // releases, while a `SessionGate` cloned before this
+                    // call still obtains a `ForwardingGuard`, since nothing
+                    // had announced revoke intent to its `SessionSync` yet.
+                    // Lock-free, cannot block — see `SessionSync`'s doc
+                    // comment.
+                    entry.sync.announce_revoke();
                     if let Some(ids) = by_machine.get_mut(&entry.m_id) {
                         ids.retain(|id| *id != session_id);
                         if ids.is_empty() {
@@ -1113,10 +1142,13 @@ impl<H: RevocableMeshSession> MeshSessionRegistry<H> {
         let Some(entry) = entry else {
             return;
         };
+        after_unlock_before_drain();
         // Unlocked (round 4): may block waiting out an in-flight
         // ForwardingGuard, same as every other revoke path in this file —
-        // never while `self.inner`'s lock is held.
-        entry.sync.revoke();
+        // never while `self.inner`'s lock is held. Announce already ran
+        // above, under the lock; only the (possibly blocking) drain
+        // remains.
+        entry.sync.drain_after_announce();
         if let Some(handle) = entry.handle.upgrade() {
             handle.send_best_effort_revoke_notice();
             handle.close();
@@ -1139,6 +1171,28 @@ impl<H: RevocableMeshSession> MeshSessionRegistry<H> {
     /// are tracked but not included.
     #[must_use]
     pub fn registered_count(&self, m_id: &MachineId) -> usize {
+        self.registered_count_inner(m_id, || {})
+    }
+
+    /// Test-only seam (round D-1 successor, @kiana second recheck): runs
+    /// `after_unlock_before_drain` at the exact point between the
+    /// dead-Weak-prune lock releasing and the (possibly blocking) drain
+    /// starting — see
+    /// `registered_count_prune_announces_before_absence_is_externally_observable`.
+    #[cfg(test)]
+    pub(crate) fn registered_count_with_hook_for_test(
+        &self,
+        m_id: &MachineId,
+        after_unlock_before_drain: impl FnOnce(),
+    ) -> usize {
+        self.registered_count_inner(m_id, after_unlock_before_drain)
+    }
+
+    fn registered_count_inner(
+        &self,
+        m_id: &MachineId,
+        after_unlock_before_drain: impl FnOnce(),
+    ) -> usize {
         let mut dead: Vec<Arc<SessionSync>> = Vec::new();
         let count = {
             let Ok(mut guard) = self.inner.lock() else {
@@ -1162,6 +1216,17 @@ impl<H: RevocableMeshSession> MeshSessionRegistry<H> {
                     .is_some_and(|entry| entry.handle.strong_count() > 0);
                 if !alive {
                     if let Some(entry) = sessions.remove(id) {
+                        // Round D-1 successor (@kiana second recheck):
+                        // announce BEFORE this prune's absence becomes
+                        // externally observable — i.e. before this lock
+                        // releases, not merely before the unlocked drain
+                        // below. Without this, `count` (and any sibling
+                        // `registered_count`/`is_registered` call for this
+                        // `m_id`) already reflects the removal the instant
+                        // this lock releases, while a `SessionGate` cloned
+                        // before this call still obtains a
+                        // `ForwardingGuard`. Lock-free, cannot block.
+                        entry.sync.announce_revoke();
                         dead.push(entry.sync);
                     }
                 }
@@ -1180,18 +1245,19 @@ impl<H: RevocableMeshSession> MeshSessionRegistry<H> {
             }
             count
         };
-        // Round D-1 successor (@kiana P0-2): a dead Weak's bookkeeping
-        // removal must not leave any `SessionGate` clone taken for it
-        // earlier still reading authorized — `try_authorize_forwarding`
-        // does not consult `handle`/`strong_count` at all, only
-        // `sync`/`registry_live`/`generation`, so dropping the entry here
-        // without revoking its `SessionSync` would make that clone
-        // permanently authorized and permanently unreachable by any future
-        // observation (this session is no longer in `sessions`/
-        // `by_machine`). `revoke_batch` on the (usually empty, so
-        // effectively free) dead set forces `authorized` false — unlocked,
+        // Round D-1 successor (@kiana P0-2, sharpened by a second recheck):
+        // a dead Weak's bookkeeping removal must not leave any
+        // `SessionGate` clone taken for it earlier still reading authorized
+        // — `try_authorize_forwarding` does not consult `handle`/
+        // `strong_count` at all, only `sync`/`registry_live`/`generation`,
+        // so dropping the entry here without revoking its `SessionSync`
+        // would make that clone permanently authorized and permanently
+        // unreachable by any future observation (this session is no longer
+        // in `sessions`/`by_machine`). `announce_revoke` already ran above,
+        // under the lock — only the (possibly blocking) drain, unlocked,
         // after `guard` above has already been dropped.
-        revoke_batch(dead.iter());
+        after_unlock_before_drain();
+        drain_batch(dead.iter());
         count
     }
 
@@ -3614,6 +3680,91 @@ mod tests {
         assert_eq!(outcome, ObserveOutcome::Applied);
         assert!(!gate_a.is_authorized());
         assert!(session_a.closed.load(Ordering::SeqCst));
+    }
+
+    /// Second recheck (@kiana): the SAME class of race as the Advance test
+    /// above, but in `unregister`. A dead-simple sequential read of the
+    /// code shows `unregister` removed the session from `sessions`/
+    /// `by_machine` under the lock, released it, and ONLY THEN called
+    /// revoke -- so `registered_count`/`is_registered` for this machine
+    /// would already report the session gone the instant the lock
+    /// released, while a `SessionGate` cloned earlier could still obtain a
+    /// fresh `ForwardingGuard`, since nothing had announced revoke intent
+    /// yet. Deterministic via the same hook technique: the hook runs
+    /// strictly after the bookkeeping-removal lock released and strictly
+    /// before the drain, and checks `writer_intent`/`try_authorize_forwarding`
+    /// from there.
+    #[test]
+    fn unregister_announces_before_absence_is_externally_observable() {
+        let m_id = test_m_id(78);
+        let snapshot = snapshot_at(1, [1u8; 32], &[(m_id.clone(), FP_A)], &[]);
+        let registry = MeshSessionRegistry::<RecordingSession>::new(&snapshot);
+        let binding = sealed_binding(&snapshot, &m_id);
+        let session = Arc::new(RecordingSession::default());
+        let (id, gate) = registry
+            .register(&binding, Arc::downgrade(&session))
+            .unwrap();
+        assert!(gate.is_authorized());
+
+        registry.unregister_with_hook_for_test(id, || {
+            // Runs strictly after the removal lock released (registry
+            // already reports this machine unregistered) and strictly
+            // before the drain.
+            assert_eq!(
+                registry.registered_count(&m_id),
+                0,
+                "the lock publishing this session's absence must already be released here"
+            );
+            assert!(
+                gate.sync.writer_intent.load(Ordering::SeqCst) > 0,
+                "revoke must be announced before this session's absence is externally \
+                 observable, not only before the (possibly slow) drain completes"
+            );
+            assert!(gate.try_authorize_forwarding().is_none());
+        });
+
+        assert!(!gate.is_authorized());
+        assert!(session.closed.load(Ordering::SeqCst));
+    }
+
+    /// Second recheck (@kiana): same class of race in `registered_count`'s
+    /// own dead-Weak prune. The dead entry's `SessionSync` was collected
+    /// and removed from bookkeeping under the lock, but announcing only
+    /// happened via `revoke_batch` AFTER the lock released and `count`
+    /// had already been computed/published -- so a sibling
+    /// `registered_count`/`is_registered` call, or a stale `SessionGate`
+    /// clone, could observe the contradiction (session absent, but its old
+    /// gate still forwards) in that window.
+    #[test]
+    fn registered_count_prune_announces_before_absence_is_externally_observable() {
+        let m_id = test_m_id(79);
+        let registry = new_registry_with(1, [1u8; 32], &[(m_id.clone(), FP_A)]);
+        let snapshot = snapshot_at(1, [1u8; 32], &[(m_id.clone(), FP_A)], &[]);
+        let binding = sealed_binding(&snapshot, &m_id);
+        let cloned_gate = {
+            let session = Arc::new(RecordingSession::default());
+            let (_id, gate) = registry
+                .register(&binding, Arc::downgrade(&session))
+                .unwrap();
+            let cloned = gate.clone();
+            assert!(cloned.is_authorized());
+            cloned
+            // `session` (the last strong Arc<H>) drops here.
+        };
+
+        let count = registry.registered_count_with_hook_for_test(&m_id, || {
+            // Runs strictly after the prune's removal lock released
+            // (count/absence already computed) and strictly before drain.
+            assert!(
+                cloned_gate.sync.writer_intent.load(Ordering::SeqCst) > 0,
+                "revoke must be announced before this prune's absence is externally \
+                 observable via `count`, not only before the drain completes"
+            );
+            assert!(cloned_gate.try_authorize_forwarding().is_none());
+        });
+
+        assert_eq!(count, 0);
+        assert!(!cloned_gate.is_authorized());
     }
 
     /// P0-2 — RED, now fixed: pruning a dead `Weak` bookkeeping entry (the
