@@ -88,6 +88,14 @@ pub enum TransitionError {
     NoSuchTerminalResult,
     #[error("two gc_pending entries would share the same slot")]
     DuplicateGcSlot,
+    #[error(
+        "IntentRecorded is only valid as (Empty, Create) or (Active, RoutineRotate) -- Revoked must go through ReactivateFromRevoked, never IntentRecorded directly"
+    )]
+    InvalidIntentForAuthority,
+    #[error(
+        "the same txn_id already has a different recorded terminal outcome for this transition kind"
+    )]
+    TerminalTxnReused,
 }
 
 pub enum RecordTransition {
@@ -138,7 +146,12 @@ pub enum RecordTransition {
         /// result for `next_txn_id` would conflict with this one.
         txn_id: [u8; 16],
         next_txn_id: [u8; 16],
-        kind: PendingOpKind,
+        /// No `kind` parameter — the closed matrix (round 4, item 2) means
+        /// this transition is the ONLY legitimate source of
+        /// `PendingOpKind::Reactivate`; accepting an arbitrary caller-chosen
+        /// kind here would let a caller mint a `Create`/`RoutineRotate`
+        /// pending op that never went through `IntentRecorded`'s own
+        /// authority check.
         backend: BackendKind,
     },
     /// Moves a non-current, lapsed `live_generations` entry into GC and out
@@ -159,6 +172,12 @@ pub enum RecordTransition {
         slot_id: String,
         found: Option<ExactBinding>,
     },
+    /// Valid on `AwaitingInspection`/`AbsentUnconfirmed` entries — the
+    /// backend reported `InspectOutcome::Conflict` (more than one
+    /// candidate at a slot that should hold at most one item). Moves to
+    /// `GcEntry::InspectionConflict`, never fabricating a single binding
+    /// out of an ambiguous read.
+    GcInspectionConflict { slot_id: String },
     /// Only valid on a `GcEntry::Bound` entry.
     GcResolved {
         slot_id: String,
@@ -186,6 +205,26 @@ pub fn apply(
     now: u64,
     max_cap: usize,
 ) -> Result<MeshSignerControlRecordV1, TransitionError> {
+    // Idempotent-replay check (round 4, item 3): a lost-ack retry of a
+    // terminal transition (Revoke/Reactivate/Activate) against a base that
+    // already reflects its own earlier success must not be treated as a
+    // fresh attempt. Without this, retrying RevokeUrgent after it already
+    // committed double-bumps epoch_high_water and then hits a genuine
+    // TerminalPushError::OutcomeConflict against its own prior commit;
+    // retrying ReactivateFromRevoked after the record has moved all the
+    // way to Active gets a confusing NotRevoked; retrying Activate after
+    // pending_op is already cleared gets NoPendingOp. None of those let the
+    // caller distinguish "already succeeded" from "genuinely wrong." A
+    // terminal txn_id already present in recent_terminal_results, with the
+    // outcome kind this transition would itself produce, is proof the
+    // retry already succeeded — return the current record unchanged (no
+    // revision bump, matching StabilizationRewrite's shape) rather than
+    // reprocessing. A different outcome kind for the same txn_id is a
+    // reused txn_id, fail-closed.
+    if let Some(result) = idempotent_replay(old, t) {
+        return result;
+    }
+
     let mut new = old.clone();
     let mut allowed_removal: Option<NonZeroU64> = None;
 
@@ -201,6 +240,23 @@ pub fn apply(
         } => {
             if old.pending_op.is_some() {
                 return Err(TransitionError::PendingAlreadyExists);
+            }
+            // Closed matrix — audit finding (round 4, item 2): the only
+            // legitimate (Authority, PendingOpKind) pairs for this
+            // transition are (Empty, Create) and (Active, RoutineRotate).
+            // Without this, IntentRecorded had no authority check at all
+            // (only the pending-op-absence check above), so a caller could
+            // go straight from Revoked through IntentRecorded ->
+            // KeyObserved -> ActivateFromKeyObserved back to Active,
+            // bypassing ReactivateFromRevoked and the epoch bump it is
+            // supposed to be the only path to.
+            let valid = matches!(
+                (&old.authority, kind),
+                (Authority::Empty, PendingOpKind::Create)
+                    | (Authority::Active, PendingOpKind::RoutineRotate)
+            );
+            if !valid {
+                return Err(TransitionError::InvalidIntentForAuthority);
             }
             let generation = derive_next_generation(old)?;
             let canonical_slot = SlotId {
@@ -359,7 +415,6 @@ pub fn apply(
         RecordTransition::ReactivateFromRevoked {
             txn_id,
             next_txn_id,
-            kind,
             backend,
         } => {
             if !matches!(old.authority, Authority::Revoked { .. }) {
@@ -382,7 +437,7 @@ pub fn apply(
             };
             new.pending_op = Some(PendingOp {
                 txn_id: *next_txn_id,
-                kind: *kind,
+                kind: PendingOpKind::Reactivate,
                 generation,
                 epoch: new.epoch_high_water,
                 purpose: old.purpose,
@@ -438,7 +493,9 @@ pub fn apply(
             let (slot, txn_id, is_first_observation) = match &new.gc_pending[idx] {
                 GcEntry::AwaitingInspection { slot, txn_id } => (slot.clone(), *txn_id, true),
                 GcEntry::AbsentUnconfirmed { slot, txn_id } => (slot.clone(), *txn_id, false),
-                GcEntry::Bound { .. } | GcEntry::Absent { .. } => {
+                GcEntry::Bound { .. }
+                | GcEntry::Absent { .. }
+                | GcEntry::InspectionConflict { .. } => {
                     return Err(TransitionError::WrongPhase);
                 }
             };
@@ -452,6 +509,25 @@ pub fn apply(
                     state: GcState::Pending,
                 },
             };
+            bump_revision(&mut new, old)?;
+        }
+
+        RecordTransition::GcInspectionConflict { slot_id } => {
+            let idx = new
+                .gc_pending
+                .iter()
+                .position(|e| e.slot().canonical_id() == *slot_id)
+                .ok_or(TransitionError::NoSuchGcEntry)?;
+            let (slot, txn_id) = match &new.gc_pending[idx] {
+                GcEntry::AwaitingInspection { slot, txn_id }
+                | GcEntry::AbsentUnconfirmed { slot, txn_id } => (slot.clone(), *txn_id),
+                GcEntry::Bound { .. }
+                | GcEntry::Absent { .. }
+                | GcEntry::InspectionConflict { .. } => {
+                    return Err(TransitionError::WrongPhase);
+                }
+            };
+            new.gc_pending[idx] = GcEntry::InspectionConflict { slot, txn_id };
             bump_revision(&mut new, old)?;
         }
 
@@ -477,7 +553,8 @@ pub fn apply(
                 }
                 GcEntry::AwaitingInspection { .. }
                 | GcEntry::AbsentUnconfirmed { .. }
-                | GcEntry::Absent { .. } => return Err(TransitionError::WrongPhase),
+                | GcEntry::Absent { .. }
+                | GcEntry::InspectionConflict { .. } => return Err(TransitionError::WrongPhase),
             }
             bump_revision(&mut new, old)?;
         }
@@ -512,6 +589,45 @@ pub fn apply(
 
     validate_shared_invariants(old, &new, allowed_removal, max_cap)?;
     Ok(new)
+}
+
+/// Returns `Some(Ok(old.clone()))` if `t` is a terminal transition whose
+/// own `txn_id` already has a matching-kind entry in
+/// `old.recent_terminal_results` (an already-succeeded lost-ack retry),
+/// `Some(Err(TerminalTxnReused))` if that txn_id is present with a
+/// *different* outcome kind (fail-closed), or `None` if `t` is not a
+/// terminal transition or its txn_id has no prior entry (proceed normally).
+/// Bounded by `recent_terminal_results`' own retention — a retry arriving
+/// after its entry has been acked-and-evicted is not covered and proceeds
+/// as a fresh attempt; that is an accepted limit of bounded retention, not
+/// a gap this check is meant to close.
+fn idempotent_replay(
+    old: &MeshSignerControlRecordV1,
+    t: &RecordTransition,
+) -> Option<Result<MeshSignerControlRecordV1, TransitionError>> {
+    let (txn_id, is_matching_outcome): (&[u8; 16], fn(&TerminalOutcome) -> bool) = match t {
+        RecordTransition::RevokeUrgent { txn_id, .. } => {
+            (txn_id, |o| matches!(o, TerminalOutcome::Revoked { .. }))
+        }
+        RecordTransition::ReactivateFromRevoked { txn_id, .. } => {
+            (txn_id, |o| matches!(o, TerminalOutcome::Reactivated { .. }))
+        }
+        RecordTransition::ActivateFromKeyObserved {
+            expected_txn_id, ..
+        } => (expected_txn_id, |o| {
+            matches!(o, TerminalOutcome::Activated { .. })
+        }),
+        _ => return None,
+    };
+    let existing = old
+        .recent_terminal_results
+        .iter()
+        .find(|r| r.txn_id == *txn_id)?;
+    if is_matching_outcome(&existing.outcome) {
+        Some(Ok(old.clone()))
+    } else {
+        Some(Err(TransitionError::TerminalTxnReused))
+    }
 }
 
 #[allow(clippy::too_many_arguments)]

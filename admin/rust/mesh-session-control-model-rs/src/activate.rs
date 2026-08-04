@@ -41,10 +41,23 @@ pub enum ActivateError {
     Commit(#[from] CommitError),
 }
 
-/// Loads fresh under an exclusive guard, confirms the physical key exists
-/// via `backend.load_exact`, runs the full validator, then commits
-/// `ActivateFromKeyObserved` — all in one continuously held critical
-/// section, so nothing observed here can go stale before the write.
+/// Confirms the physical key exists via `backend.load_exact` and runs the
+/// full validator with **no exclusive guard held**, then reacquires the
+/// guard only for a fresh reread-and-commit.
+///
+/// Second-round fix (round 4, item 5): the prior version acquired the
+/// `MutateGuard` before `backend.load_exact`/`roster.query_machine_currency`/
+/// `sig.verify` and held it through all three, blocking every other
+/// mutation — including an *urgent* `RevokeUrgent` — for however long those
+/// external calls took. Revocation must never be able to queue behind an
+/// unrelated, possibly slow activation attempt's I/O. The snapshot read and
+/// all slow validation now happen with no guard held at all; the guard is
+/// acquired only immediately before the commit, against a freshly reread
+/// base. If something preempted the pending op in the meantime (a revoke
+/// that ran while this was busy with I/O), the freshly built transition's
+/// own exact-token check (`apply`'s existing `StaleWorkerToken`/
+/// `NoPendingOp`/`WrongPhase`) rejects it — never silently activating a
+/// snapshot that has gone stale.
 #[allow(clippy::too_many_arguments)]
 pub fn activate_from_key_observed<P: PurposeMarker>(
     store: &dyn AtomicControlRecordStore,
@@ -58,7 +71,7 @@ pub fn activate_from_key_observed<P: PurposeMarker>(
     now: u64,
     max_cap: usize,
 ) -> Result<MeshSignerControlRecordV1, ActivateError> {
-    let guard = locks.acquire_for_mutation();
+    // No guard held for this read.
     let base = match store.load_canonical() {
         LoadOutcome::Exact(r) => *r,
         LoadOutcome::Missing => return Err(ActivateError::NoRecord),
@@ -80,32 +93,56 @@ pub fn activate_from_key_observed<P: PurposeMarker>(
         return Err(ActivateError::NothingToActivate);
     }
     let binding = p.binding.clone().ok_or(ActivateError::NothingToActivate)?;
+    let (
+        expected_txn_id,
+        expected_kind,
+        expected_generation,
+        expected_epoch,
+        expected_purpose,
+        expected_slot_id,
+    ) = (
+        p.txn_id,
+        p.kind,
+        p.generation,
+        p.epoch,
+        p.purpose,
+        p.canonical_slot.canonical_id(),
+    );
 
+    // Slow I/O below — no guard held, so an urgent RevokeUrgent (or
+    // anything else) can freely interleave.
     match backend.load_exact(&p.canonical_slot, &binding.public_key) {
         LoadExactOutcome::Ready(observed) if observed == binding => {}
         _ => return Err(ActivateError::PhysicalKeyNotConfirmed),
     }
-
     let generation_record = GenerationRecord {
         generation: p.generation,
         delegation: delegation.clone(),
-        binding: binding.clone(),
+        binding,
         not_after: delegation.not_after,
     };
     validate_full_binding::<P>(&generation_record, ctx, policy, roster, sig, now)?;
 
+    // Reacquire only now, reread fresh, and let apply()'s own exact-token
+    // check catch any divergence against this snapshot.
+    let guard = locks.acquire_for_mutation();
+    let fresh = match store.load_canonical() {
+        LoadOutcome::Exact(r) => *r,
+        LoadOutcome::Missing => return Err(ActivateError::NoRecord),
+        LoadOutcome::Corrupt => return Err(ActivateError::RecordCorrupt),
+    };
     let t = RecordTransition::ActivateFromKeyObserved {
-        expected_txn_id: p.txn_id,
-        expected_kind: p.kind,
-        expected_generation: p.generation,
-        expected_epoch: p.epoch,
-        expected_purpose: p.purpose,
-        expected_slot_id: p.canonical_slot.canonical_id(),
-        expected_revision: base.revision,
+        expected_txn_id,
+        expected_kind,
+        expected_generation,
+        expected_epoch,
+        expected_purpose,
+        expected_slot_id,
+        expected_revision: fresh.revision,
         delegation,
     };
-    let new = apply(&base, &t, now, max_cap)?;
-    commit_new_bytes(store, &guard, base.revision, &new, 8)?;
+    let new = apply(&fresh, &t, now, max_cap)?;
+    commit_new_bytes(store, &guard, fresh.revision, &new, 8)?;
     Ok(new)
 }
 

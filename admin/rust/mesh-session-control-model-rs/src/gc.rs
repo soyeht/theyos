@@ -127,18 +127,19 @@ pub fn gc_worker_tick(
                 if indeterminate_this_tick.contains(&e.slot().canonical_id()) {
                     return false;
                 }
-                // Quarantine is deliberately not auto-retried -- a
-                // backend-reported mismatch needs administrative
-                // resolution, not endless automatic re-attempts. Without
-                // this exclusion the loop would reselect and requarantine
-                // the same entry forever, since Quarantine is not `Done`
-                // and so never satisfies observation_complete_and_residual_zero().
+                // Quarantine and InspectionConflict are deliberately not
+                // auto-retried -- a backend-reported mismatch or ambiguity
+                // needs administrative resolution, not endless automatic
+                // re-attempts. Without this exclusion the loop would
+                // reselect and re-flag the same entry forever, since
+                // neither is `Done`/`Absent` and so neither ever satisfies
+                // observation_complete_and_residual_zero().
                 if matches!(
                     e,
                     GcEntry::Bound {
                         state: GcState::Quarantine,
                         ..
-                    }
+                    } | GcEntry::InspectionConflict { .. }
                 ) {
                     return false;
                 }
@@ -169,11 +170,39 @@ pub fn gc_worker_tick(
                 let found = match backend.inspect(slot) {
                     InspectOutcome::Present(b) => Some(b),
                     InspectOutcome::Absent => None,
-                    InspectOutcome::Indeterminate | InspectOutcome::Conflict => {
+                    InspectOutcome::Indeterminate => {
                         // Never treated as an absence observation — an
-                        // outage or an ambiguous read must not be able to
-                        // masquerade as a confirming inspection.
+                        // outage must not be able to masquerade as a
+                        // confirming inspection. Transient, so nothing is
+                        // persisted; the next tick retries fresh.
                         indeterminate_this_tick.insert(slot_id);
+                        continue;
+                    }
+                    InspectOutcome::Conflict => {
+                        // An inherent ambiguity, not a transient outage —
+                        // persist it durably (GcEntry::InspectionConflict)
+                        // rather than silently retrying forever with no
+                        // trace it was ever observed.
+                        let committed = read_build_commit(
+                            store,
+                            locks,
+                            |fresh| {
+                                fresh
+                                    .gc_pending
+                                    .iter()
+                                    .any(|e| {
+                                        e.slot().canonical_id() == slot_id && e.txn_id() == txn_id
+                                    })
+                                    .then(|| RecordTransition::GcInspectionConflict {
+                                        slot_id: slot_id.clone(),
+                                    })
+                            },
+                            now,
+                            max_cap,
+                        )?;
+                        if committed.is_some() {
+                            resolved_count += 1;
+                        }
                         continue;
                     }
                 };
@@ -232,6 +261,9 @@ pub fn gc_worker_tick(
             }
             GcEntry::Absent { .. } => {
                 unreachable!("Absent is already resolved and excluded by the selection filter")
+            }
+            GcEntry::InspectionConflict { .. } => {
+                unreachable!("InspectionConflict is excluded by the selection filter")
             }
         }
     }

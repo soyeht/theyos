@@ -174,8 +174,17 @@ pub struct FileBackedStore {
 }
 
 impl FileBackedStore {
+    /// `pub(crate)`, not `pub` — third-round fix (round 4, item 4): a
+    /// public constructor let external code build a second, independently
+    /// self-consistent `FileBackedStore`+`MeshSignerLocks` pair over the
+    /// same path as an existing one, each individually passing the
+    /// `LockToken` check but racing each other exactly like the pre-token
+    /// bug. `cell::open` is now the only way to obtain a real
+    /// `FileBackedStore` from outside this crate, backed by a process-wide
+    /// path-keyed registry that reuses a live pair rather than duplicating
+    /// it.
     #[must_use]
-    pub fn new(
+    pub(crate) fn new(
         path: PathBuf,
         token: LockToken,
         identity: ControlIdentity,

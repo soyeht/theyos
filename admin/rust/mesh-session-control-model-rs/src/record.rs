@@ -173,24 +173,56 @@ pub struct GenerationRecord {
     pub not_after: u64,
 }
 
-/// Minimal delegation shape sufficient to model D-9/B-SESSAO v6 binding
-/// checks. `role` mirrors Proof-R/Proof-I's wire field; delegations never
-/// carry a frame `kind` (FinalConfirm/Activate/ActivateAck never embed a
-/// delegation at all) — the earlier v10/v11 `transcript_kinds`/`KINDS`
-/// vocabulary conflated the two and is not reproduced here.
+/// `MeshSessionDelegation` §5 of the frozen wire schema
+/// (`daisy-bsessao-v6.7343d075…` + `daisy-bsessao-v6-erratum1.63222d40…`,
+/// self-hash verified). Second-round correction: the prior shape here
+/// (`role: String`, no `version`/`kind`/`transcript_kinds`/`serial`) was
+/// modeled from prose a second time despite this crate's own history of
+/// exactly that failure mode — its doc comment even claimed "delegations
+/// never carry a frame kind," conflating the *frame*-level `kind`
+/// (FinalConfirm/Activate/ActivateAck's own field, still never embedded
+/// alongside a delegation) with the *delegation object's own* `kind`
+/// (`"soyeht/mesh-session/delegation/v1"`), which the frozen schema does
+/// carry — a distinct field, orthogonal to any frame's `kind`. `roles` is
+/// genuinely plural at the delegation level (a delegation may authorize
+/// more than one role) even though each individual Proof-R/Proof-I frame
+/// still asserts a single `role`. `delegated_pub`/`sig` are fixed-size
+/// (`bstr .size 33`/`.size 64`) — P-256 compressed public key and ECDSA
+/// signature — not unconstrained byte vectors.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Delegation {
+    pub version: u64,
+    /// The delegation object's own schema kind
+    /// (`"soyeht/mesh-session/delegation/v1"`) — never a frame `kind`.
+    pub kind: String,
     pub domain: String,
-    pub profile: String,
-    pub role: String,
-    pub channel: Channel,
     pub hh_id: String,
     pub delegator_m_id: String,
     pub delegator_cert_fingerprint: [u8; 32],
-    pub delegated_key_id: String,
+    /// P-256 compressed public key — `bstr .size 33` on the wire. Modeled
+    /// as `Vec<u8>` (not `[u8;33]`) purely because serde's derive only
+    /// covers fixed arrays up to length 32 without an extra dependency;
+    /// the 33-byte length is a wire fact, not enforced by this type.
     pub delegated_pub: Vec<u8>,
+    pub delegated_key_id: String,
+    pub profile: String,
+    /// Session-transcript-kind vocabulary this delegation is scoped to.
+    /// This crate models the field for schema fidelity but does not (and
+    /// has no data to) validate its contents against a live transcript —
+    /// that cross-check belongs to the mesh-session protocol layer, not
+    /// this control-record model.
+    pub transcript_kinds: Vec<String>,
+    pub roles: Vec<String>,
+    pub channel: Channel,
+    /// Informative only per the frozen spec ("Serial é informativo.
+    /// checkpoint_floor não é autoridade.") — not itself a source of
+    /// authority, so `validate_full_binding` does not gate on its value.
+    pub serial: u64,
     pub not_before: u64,
     pub not_after: u64,
+    /// ECDSA P-256 signature — `bstr .size 64` on the wire; see
+    /// `delegated_pub`'s doc comment for why this is `Vec<u8>` not
+    /// `[u8;64]`.
     pub sig: Vec<u8>,
 }
 
@@ -247,6 +279,21 @@ pub enum GcEntry {
         slot: SlotId,
         txn_id: [u8; 16],
     },
+    /// Terminal-for-automation, not clean: the backend reported
+    /// `InspectOutcome::Conflict` (more than one candidate observed at a
+    /// slot that should hold at most one item). Audit finding (round 4,
+    /// item 6): a prior version treated `Conflict` identically to
+    /// `Indeterminate` — added to an in-memory, per-tick-only set and
+    /// silently discarded at the end of every tick, so an inherent
+    /// ambiguity was retried forever with zero durable trace it was ever
+    /// observed. This variant persists it in the record itself, excluded
+    /// from automatic re-selection like `GcState::Quarantine`, awaiting
+    /// administrative resolution — never auto-resolved, never fabricating
+    /// a single binding out of an ambiguous read.
+    InspectionConflict {
+        slot: SlotId,
+        txn_id: [u8; 16],
+    },
 }
 
 impl GcEntry {
@@ -256,7 +303,8 @@ impl GcEntry {
             GcEntry::AwaitingInspection { slot, .. }
             | GcEntry::AbsentUnconfirmed { slot, .. }
             | GcEntry::Bound { slot, .. }
-            | GcEntry::Absent { slot, .. } => slot,
+            | GcEntry::Absent { slot, .. }
+            | GcEntry::InspectionConflict { slot, .. } => slot,
         }
     }
 
@@ -266,7 +314,8 @@ impl GcEntry {
             GcEntry::AwaitingInspection { txn_id, .. }
             | GcEntry::AbsentUnconfirmed { txn_id, .. }
             | GcEntry::Bound { txn_id, .. }
-            | GcEntry::Absent { txn_id, .. } => *txn_id,
+            | GcEntry::Absent { txn_id, .. }
+            | GcEntry::InspectionConflict { txn_id, .. } => *txn_id,
         }
     }
 
@@ -276,6 +325,10 @@ impl GcEntry {
             GcEntry::AwaitingInspection { .. } | GcEntry::AbsentUnconfirmed { .. } => false,
             GcEntry::Bound { state, .. } => state.observation_complete_and_residual_zero(),
             GcEntry::Absent { .. } => true,
+            // Not clean -- ambiguous, needs administrative review -- but
+            // also not auto-retried; see the exclusion in
+            // gc::gc_worker_tick's selection filter.
+            GcEntry::InspectionConflict { .. } => false,
         }
     }
 }

@@ -1,9 +1,19 @@
-//! Full binding validator. Fixes the v11 sweep finding directly:
-//! delegations carry `role` (Proof-R/Proof-I's wire field: "initiator" |
-//! "responder"), never `kind` (only FinalConfirm/Activate/ActivateAck have
-//! `kind`, and none of those three ever embed a delegation) — there is no
-//! merged `transcript_kinds`/`KINDS` vocabulary here, and no `"identity-proof"`
-//! literal (v3-final vocabulary that v6 does not use).
+//! Full binding validator. Fixes the v11 sweep finding directly: no merged
+//! `transcript_kinds`/`KINDS` vocabulary conflating a *frame*'s `kind`
+//! (FinalConfirm/Activate/ActivateAck's own field — none of those three
+//! ever embed a delegation) with anything at the delegation level, and no
+//! `"identity-proof"` literal (v3-final vocabulary that v6 does not use).
+//!
+//! Third-round correction: the `Delegation` shape itself (see `record.rs`)
+//! is now modeled directly against the frozen wire schema
+//! (`daisy-bsessao-v6.7343d075…` §5 + `daisy-bsessao-v6-erratum1.63222d40…`,
+//! self-hash verified), not reconstructed from prose a second time. That
+//! schema turned out to have its own `kind` field
+//! (`"soyeht/mesh-session/delegation/v1"`) at the *delegation* level — this
+//! module's own prior doc comment claiming "delegations never carry kind"
+//! was itself the exact conflation it warned about, just inverted: it
+//! correctly separated frame-kind from delegation-kind but then denied the
+//! latter existed at all.
 //!
 //! Roster lookup and signature verification are trait-injected rather than
 //! calling invented `household-rs` functions directly — this crate does not
@@ -81,6 +91,11 @@ impl DelegationPolicy {
     }
 }
 
+/// The delegation object's own schema version — frozen at `uint = 1`
+/// (§5); there is only one defined version, so this is a fixed expected
+/// value, not something `PurposeMarker` varies.
+pub const DELEGATION_SCHEMA_VERSION: u64 = 1;
+
 pub trait PurposeMarker {
     /// The runtime `PurposeId` this type parameter stands for. Callers
     /// (`activate.rs`) must check this against the record's actual
@@ -88,6 +103,14 @@ pub trait PurposeMarker {
     /// which record it is being used against.
     const PURPOSE_ID: PurposeId;
     const DELEGATION_DOMAIN: &'static str;
+    /// The delegation object's own `kind` field. For `MeshSessionPurpose`
+    /// this is the frozen literal from §5,
+    /// `"soyeht/mesh-session/delegation/v1"`. `RosterSyncPurpose`'s value
+    /// is *mechanically derived* from that same frozen naming pattern
+    /// (`soyeht/{profile}/delegation/v1`) applied to its own profile, not
+    /// independently frozen anywhere — flagged for confirmation, not
+    /// treated as equally authoritative.
+    const DELEGATION_KIND: &'static str;
     const PROFILE: &'static str;
     const ROLES: &'static [&'static str];
 }
@@ -96,6 +119,7 @@ pub struct MeshSessionPurpose;
 impl PurposeMarker for MeshSessionPurpose {
     const PURPOSE_ID: PurposeId = PurposeId::MeshSession;
     const DELEGATION_DOMAIN: &'static str = "soyeht/mesh-session/v1";
+    const DELEGATION_KIND: &'static str = "soyeht/mesh-session/delegation/v1";
     const PROFILE: &'static str = "mesh-session";
     const ROLES: &'static [&'static str] = &["initiator", "responder"];
 }
@@ -104,18 +128,26 @@ pub struct RosterSyncPurpose;
 impl PurposeMarker for RosterSyncPurpose {
     const PURPOSE_ID: PurposeId = PurposeId::RosterSync;
     const DELEGATION_DOMAIN: &'static str = "soyeht/roster-sync/v1";
+    // Derived, not frozen -- see PurposeMarker::DELEGATION_KIND doc.
+    const DELEGATION_KIND: &'static str = "soyeht/roster-sync/delegation/v1";
     const PROFILE: &'static str = "roster-sync";
     const ROLES: &'static [&'static str] = &["initiator", "responder"];
 }
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum ValidationError {
+    #[error("delegation schema version mismatch")]
+    VersionMismatch,
+    #[error("delegation object kind mismatch")]
+    DelegationKindMismatch,
     #[error("delegation domain mismatch")]
     DomainMismatch,
     #[error("delegation profile mismatch")]
     ProfileMismatch,
-    #[error("delegation role not authorized for this purpose")]
+    #[error("delegation roles empty, or contains a role not authorized for this purpose")]
     RoleMismatch,
+    #[error("delegation transcript_kinds is empty")]
+    TranscriptKindsEmpty,
     #[error("channel mismatch")]
     ChannelMismatch,
     #[error("hh_id mismatch")]
@@ -168,14 +200,23 @@ pub fn validate_full_binding<P: PurposeMarker>(
 ) -> Result<(), ValidationError> {
     let d: &Delegation = &generation_record.delegation;
 
+    if d.version != DELEGATION_SCHEMA_VERSION {
+        return Err(ValidationError::VersionMismatch);
+    }
+    if d.kind != P::DELEGATION_KIND {
+        return Err(ValidationError::DelegationKindMismatch);
+    }
     if d.domain != P::DELEGATION_DOMAIN {
         return Err(ValidationError::DomainMismatch);
     }
     if d.profile != P::PROFILE {
         return Err(ValidationError::ProfileMismatch);
     }
-    if !P::ROLES.contains(&d.role.as_str()) {
+    if d.roles.is_empty() || !d.roles.iter().all(|r| P::ROLES.contains(&r.as_str())) {
         return Err(ValidationError::RoleMismatch);
+    }
+    if d.transcript_kinds.is_empty() {
+        return Err(ValidationError::TranscriptKindsEmpty);
     }
     if d.channel != ctx.channel {
         return Err(ValidationError::ChannelMismatch);
@@ -221,7 +262,7 @@ pub fn validate_full_binding<P: PurposeMarker>(
     if d.delegated_key_id != generation_record.binding.slot.canonical_id() {
         return Err(ValidationError::KeyIdMismatch);
     }
-    if d.delegated_pub != generation_record.binding.public_key {
+    if d.delegated_pub.as_slice() != generation_record.binding.public_key.as_slice() {
         return Err(ValidationError::DelegatedPubBindingMismatch);
     }
 

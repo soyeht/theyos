@@ -20,6 +20,7 @@
 //! unaffected by anything in this crate.
 
 pub mod activate;
+pub mod cell;
 pub mod commit;
 pub mod gc;
 pub mod locks;
