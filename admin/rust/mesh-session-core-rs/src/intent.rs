@@ -1084,14 +1084,21 @@ pub trait D1Admission {
         Self: 'a;
 
     /// Step 1 — see the ordering note above. A real implementation
-    /// re-verifies the *exact same* binding (`D1MembershipKey`'s full
+    /// verifies the *exact same* binding here (`D1MembershipKey`'s full
     /// session_id/authenticated-fingerprint/checkpoint fields — not
     /// merely a fresh read keyed by `peer_m_id` alone, which would let a
-    /// stale or substituted fingerprint/revision slip through) both here
-    /// and again before committing in [`D1Pending::commit_after_ack`] —
-    /// the latter only ever receives `self`, so a real implementation's
-    /// own internal state must carry the binding forward rather than
-    /// re-deriving a weaker one from scratch.
+    /// stale or substituted fingerprint/revision slip through). This is
+    /// the ONLY point that check runs (2026-08-04, @kiana, runtime-facade
+    /// audit `3cbbfb37…` CFX-2, correction — supersedes an earlier,
+    /// contradictory version of this doc that said "both here and again
+    /// before committing in `commit_after_ack`"): `commit_after_ack` is
+    /// infallible and performs no roster/revision/membership recheck at
+    /// all — see its own doc for why re-litigating this exact question
+    /// there would be wrong, not merely redundant. A real implementation's
+    /// own internal state must carry the reserved binding forward from
+    /// this call into the `Self::Pending<'a>` value it returns, rather
+    /// than re-deriving a weaker one from scratch or expecting a second
+    /// check to catch what this one missed.
     fn reserve_pending<'a>(
         &'a self,
         key: &D1MembershipKey,
@@ -1611,7 +1618,12 @@ mod tests {
     }
 
     /// Independently-computed 0x06 (`SignedMeshConnectionIntent`) golden
-    /// item 7d RED (2026-08-04, @kiana, runtime-facade audit `3cbbfb37…`):
+    /// item 7d mechanism-level RED (2026-08-04, @kiana, runtime-facade
+    /// audit `3cbbfb37…`; scope corrected per audit of `018aed57`'s CFX-1
+    /// — this unit test alone does NOT close item 7d, it only proves the
+    /// ledger's own concurrency contract in isolation; the full
+    /// entrypoint-level closure is
+    /// `auth_state_machine::tests::red_two_real_responder_ceremonies_racing_the_same_nonce_exactly_one_reaches_active`):
     /// two threads racing `IntentNonceLedger::consume` with the IDENTICAL
     /// key must produce exactly one `Committed` and one `AlreadyConsumed`
     /// — never two `Committed`s (a double-spend) and never two
@@ -1621,7 +1633,10 @@ mod tests {
     /// across genuine OS threads — not a sequential simulation. A
     /// `Barrier` maximizes the chance both threads are actually
     /// interleaved at the `consume` call, rather than trivially
-    /// serialized by scheduling luck.
+    /// serialized by scheduling luck. This test does NOT go through
+    /// `run_responder_handshake`/the combined check/D1, and does NOT
+    /// prove "the loser never reaches Active" — it cannot, since it never
+    /// constructs a session at all.
     #[test]
     fn two_concurrent_attempts_at_the_same_nonce_yield_exactly_one_winner() {
         use std::collections::HashSet;

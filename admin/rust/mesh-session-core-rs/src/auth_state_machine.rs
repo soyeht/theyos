@@ -395,14 +395,16 @@ fn sig_array(sig: &[u8]) -> Result<[u8; 64], AuthFrameError> {
 ///
 /// **`gate: G` embedded, not tupled (2026-08-04, @kiana, definitive A) —
 /// supersedes the earlier `(ActiveMeshSession<S>, D1::ActiveGate)`
-/// tuple-return formulation:** `D1Admission::activate_if_authorized`
-/// still returns the opaque gate, but the handshake function that
-/// constructs a session moves it directly into this private field in the
-/// same expression — the gate is never a separate value a caller could
-/// receive and then drop, hold, or move independently of the session that
-/// depends on it. There is no accessor: nothing in this crate, and
-/// nothing an external caller could write, can extract `gate` while
-/// retaining a usable `ActiveMeshSession`.
+/// tuple-return formulation:** [`D1Pending::commit_after_ack`](crate::intent::D1Pending::commit_after_ack)
+/// (name current as of the runtime-facade audit `3cbbfb37…` GAT
+/// redesign — this note previously named the superseded
+/// `D1Admission::activate_if_authorized`) still returns the opaque gate,
+/// but the handshake function that constructs a session moves it
+/// directly into this private field in the same expression — the gate is
+/// never a separate value a caller could receive and then drop, hold, or
+/// move independently of the session that depends on it. There is no
+/// accessor: nothing in this crate, and nothing an external caller could
+/// write, can extract `gate` while retaining a usable `ActiveMeshSession`.
 ///
 /// **This crate makes NO claim about what happens to `G` on drop
 /// (2026-08-04, @kiana, WIP audit, correction of an earlier, wrong claim
@@ -985,8 +987,12 @@ where
     // (delegated_key_id/delegated_pub/channel/generation) is a SEPARATE
     // concern — see `_signer_binding` above — D1 membership has no way to
     // verify it and the real registry's own binding type carries none of
-    // it either. A real D1 implementation must recheck this exact binding
-    // again in `commit_after_ack`, not merely re-read by `peer_m_id`.
+    // it either. A real D1 implementation must verify this exact full
+    // binding HERE, in `reserve_pending` — not merely by `peer_m_id` alone
+    // — and carry it forward into the returned permit: `commit_after_ack`
+    // (2026-08-04, @kiana, runtime-facade audit `3cbbfb37…` CFX-2,
+    // correction) performs no recheck of any kind, by design, once this
+    // call has reserved the permit.
     let d1_key = crate::intent::D1MembershipKey::new(
         h_final.clone(),
         initiator_hh_id.clone(),
@@ -1311,9 +1317,11 @@ where
         // reaching this point means a genuinely valid ActivateAck was
         // received — by construction, the responder already wrote that
         // Ack and (per this crate's own atomic-linearization discipline)
-        // immediately called its own `activate_if_authorized` right
-        // after, with nothing fallible in between. The responder may
-        // therefore already be Active by the time this initiator-side
+        // immediately called its own `commit_after_ack` right after
+        // (2026-08-04, @kiana, runtime-facade audit `3cbbfb37…` CFX-2,
+        // name corrected — the superseded `activate_if_authorized` no
+        // longer exists), with nothing fallible in between. The responder
+        // may therefore already be Active by the time this initiator-side
         // code runs. Rejecting here for `deadline` would cancel this
         // side's own Pending and never reach Active locally, while the
         // peer already did — the exact same split-brain
@@ -4216,6 +4224,326 @@ mod tests {
         assert!(
             cancel_called.load(std::sync::atomic::Ordering::SeqCst),
             "cancel_before_ack was never called on an invalid ActivateAck"
+        );
+    }
+
+    /// A `IntentNonceLedger` double whose `consume` blocks on a 2-party
+    /// `Barrier` as its very first action, before touching the shared
+    /// `HashSet` — forces two genuinely concurrent real ceremonies to
+    /// both arrive at the check-and-set before either one's `insert` can
+    /// run, so this is a forced interleaving, not scheduling luck
+    /// (2026-08-04, @kiana, runtime-facade audit `3cbbfb37…`, CFX-1 on
+    /// `018aed57`).
+    struct SyncedSharedLedger {
+        consumed: std::sync::Mutex<std::collections::HashSet<crate::intent::IntentNonceKey>>,
+        barrier: std::sync::Barrier,
+    }
+    impl crate::intent::IntentNonceLedger for SyncedSharedLedger {
+        fn consume(
+            &self,
+            key: &crate::intent::IntentNonceKey,
+            _not_after: u64,
+            _digest: &[u8; 32],
+            _channel: ExpectedChannel,
+            _deadline: &CeremonyDeadline,
+        ) -> Result<crate::intent::NonceConsumeOutcome, crate::error::IntentError> {
+            self.barrier.wait();
+            let mut set = self.consumed.lock().unwrap();
+            if !set.insert(key.clone()) {
+                return Ok(crate::intent::NonceConsumeOutcome::AlreadyConsumed);
+            }
+            Ok(crate::intent::NonceConsumeOutcome::Committed)
+        }
+    }
+
+    /// A D1 double that counts `reserve_pending` calls via a shared
+    /// counter and always succeeds — used to prove the LOSING ceremony
+    /// never reserves at all (nonce consume runs strictly before D1
+    /// reservation in both handshake functions, so a nonce rejection
+    /// structurally prevents `reserve_pending` from ever being called for
+    /// that attempt; this double makes that observable instead of merely
+    /// inferred from reading the source).
+    struct CountingD1 {
+        reserve_count: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+    struct CountingPending;
+    impl crate::intent::D1Pending<()> for CountingPending {
+        fn commit_after_ack(self) {}
+        fn cancel_before_ack(self) -> crate::intent::D1CancelOutcome {
+            crate::intent::D1CancelOutcome::CancelledAndRemoved
+        }
+    }
+    impl crate::intent::D1Admission for CountingD1 {
+        type Pending<'a> = CountingPending;
+        type Active<'a> = ();
+        fn reserve_pending<'a>(
+            &'a self,
+            _key: &crate::intent::D1MembershipKey,
+            _deadline: &CeremonyDeadline,
+        ) -> Result<Self::Pending<'a>, crate::error::IntentError> {
+            self.reserve_count
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(CountingPending)
+        }
+    }
+
+    /// item 7d RED, entrypoint-level closure (2026-08-04, @kiana,
+    /// runtime-facade audit `3cbbfb37…`, CFX-1 on `018aed57` — the
+    /// unit-level `intent::tests::two_concurrent_attempts_at_the_same_nonce_yield_exactly_one_winner`
+    /// alone did not close item 7d; this does). TWO real, independent
+    /// Noise handshakes/responder ceremonies, driven by hand-crafted
+    /// initiator threads that both replay the IDENTICAL signed 0x06
+    /// intent (same nonce — this genuinely IS a nonce-replay attack, the
+    /// exact scenario the ledger exists to stop), racing the SAME
+    /// `SyncedSharedLedger` and counted by the SAME `CountingD1`.
+    ///
+    /// A byte-for-byte `ProofI` cannot be replayed across the two
+    /// connections — its signature covers `h_final`, which is unique per
+    /// Noise handshake — so each attacker thread signs its OWN fresh
+    /// `ProofI` bound to its own connection's real `h_final`, but both
+    /// reference the SAME `connection_intent_digest` (computed from the
+    /// SAME replayed intent bytes), exactly as a real replay would need
+    /// to.
+    #[test]
+    fn red_two_real_responder_ceremonies_racing_the_same_nonce_exactly_one_reaches_active() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let responder_key = SigningKey::random(&mut OsRng);
+        let responder_verifying = VerifyingKey::from(&responder_key);
+        let responder_delegation = delegation_for_key(
+            &responder_verifying,
+            "hh-1",
+            "responder-1",
+            vec![0xCC; 32],
+            0,
+            u64::MAX / 2,
+        );
+
+        let initiator_key = SigningKey::random(&mut OsRng);
+        let initiator_verifying = VerifyingKey::from(&initiator_key);
+        let initiator_delegation = delegation_for_key(
+            &initiator_verifying,
+            "hh-1",
+            "initiator-1",
+            vec![0xEE; 32],
+            0,
+            u64::MAX / 2,
+        );
+        let initiator_identity = identity(
+            "hh-1",
+            "initiator-1",
+            vec![0xEE; 32],
+            initiator_delegation.clone(),
+        );
+        let initiator_resolver = FixedResolver {
+            delegated_pub: initiator_verifying
+                .to_encoded_point(true)
+                .as_bytes()
+                .to_vec(),
+            generation: 1,
+            not_after: u64::MAX / 2,
+        };
+        let k_mesh = TestKMesh(initiator_key);
+
+        // The SAME nonce, replayed on both connections.
+        let pending_intent = pending_intent_for(
+            &k_mesh,
+            &initiator_identity,
+            &fixed_checkpoint(),
+            "responder-1",
+            vec![0xCC; 32],
+            [0xA5; 32],
+            u64::MAX / 2,
+            ExpectedChannel::Dev,
+        );
+        let shared_intent = pending_intent.intent().clone();
+        let connection_intent_digest = ConnectionIntentDigest::from_bytes(
+            crate::intent::intent_digest(&shared_intent).unwrap(),
+        );
+
+        let ledger = std::sync::Arc::new(SyncedSharedLedger {
+            consumed: std::sync::Mutex::new(std::collections::HashSet::new()),
+            barrier: std::sync::Barrier::new(2),
+        });
+        let reserve_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+        // Attacker threads spawn FIRST: `TcpStream::connect` completes once
+        // the OS-level listen backlog accepts the SYN, independent of when
+        // this process calls `listener.accept()` — spawning them before
+        // the two `accept()` calls below avoids a connect-before-listener-
+        // is-ready deadlock without needing a separate acceptor thread.
+        let attacker_threads: Vec<_> = (0..2)
+            .map(|_| {
+                let shared_intent = shared_intent.clone();
+                let connection_intent_digest = connection_intent_digest.clone();
+                let initiator_identity_hh_id = initiator_identity.hh_id.clone();
+                let initiator_identity_m_id = initiator_identity.m_id.clone();
+                let initiator_cert_fingerprint = initiator_identity.cert_fingerprint.clone();
+                let initiator_delegation = initiator_delegation.clone();
+                let k_mesh = TestKMesh(k_mesh.0.clone());
+                thread::spawn(move || {
+                    let mut sock = TcpStream::connect(addr).unwrap();
+                    let handshake =
+                        noise::run_xx_handshake(&mut sock, Role::Initiator, &far_future_deadline())
+                            .unwrap();
+                    let mut transport = handshake.transport;
+                    let h_final = handshake.handshake_hash;
+                    match recv_frame(&mut sock, &mut transport, &far_future_deadline()).unwrap() {
+                        AuthFrame::ProofR(_) => {}
+                        _ => panic!("expected ProofR"),
+                    }
+                    send_intent_record(
+                        &mut sock,
+                        &mut transport,
+                        &shared_intent,
+                        &far_future_deadline(),
+                    )
+                    .unwrap();
+                    let checkpoint = fixed_checkpoint();
+                    let proof_i = ProofI::new(
+                        h_final.clone(),
+                        initiator_identity_hh_id,
+                        initiator_identity_m_id,
+                        "responder-1".to_string(),
+                        initiator_cert_fingerprint,
+                        vec![0xCC; 32],
+                        checkpoint.hash.clone(),
+                        checkpoint.sequence,
+                        checkpoint.event_head.clone(),
+                        checkpoint.not_after,
+                        initiator_delegation,
+                        connection_intent_digest,
+                        vec![0u8; 64],
+                    )
+                    .unwrap();
+                    let proof_i =
+                        auth_frames::sign_frame(proof_i, &k_mesh, &far_future_deadline()).unwrap();
+                    send_frame(
+                        &mut sock,
+                        &mut transport,
+                        &AuthFrame::ProofI(proof_i),
+                        &far_future_deadline(),
+                    )
+                    .unwrap();
+                    // Only the nonce winner ever receives a real FinalConfirm
+                    // — the loser's responder returns Err(NonceAlreadyConsumed)
+                    // and closes its socket without sending anything more.
+                    // Both attacker threads are prepared to complete the full
+                    // flight regardless, since neither knows in advance which
+                    // one will win.
+                    let final_confirm =
+                        match recv_frame(&mut sock, &mut transport, &far_future_deadline()) {
+                            Ok(AuthFrame::FinalConfirm(f)) => f,
+                            _ => return, // lost the race — connection closed/errored
+                        };
+                    let final_confirm_digest = auth_frames::frame_digest(&final_confirm).unwrap();
+                    let activate = Activate::new(
+                        h_final.clone(),
+                        "responder-1".to_string(),
+                        final_confirm_digest.to_vec(),
+                        vec![0u8; 64],
+                    )
+                    .unwrap();
+                    let activate =
+                        auth_frames::sign_frame(activate, &k_mesh, &far_future_deadline()).unwrap();
+                    send_frame(
+                        &mut sock,
+                        &mut transport,
+                        &AuthFrame::Activate(activate),
+                        &far_future_deadline(),
+                    )
+                    .unwrap();
+                    let _ = recv_frame(&mut sock, &mut transport, &far_future_deadline());
+                })
+            })
+            .collect();
+
+        // Accept both connections and spawn a real responder ceremony for
+        // each, sharing the same ledger/D1 counter.
+        let responder_threads: Vec<_> = (0..2)
+            .map(|_| {
+                let (sock, _) = listener.accept().unwrap();
+                let checkpoint = fixed_checkpoint();
+                let k_mesh = TestKMesh(responder_key.clone());
+                let responder_identity = identity(
+                    "hh-1",
+                    "responder-1",
+                    vec![0xCC; 32],
+                    responder_delegation.clone(),
+                );
+                let ledger = std::sync::Arc::clone(&ledger);
+                let d1 = CountingD1 {
+                    reserve_count: std::sync::Arc::clone(&reserve_count),
+                };
+                let initiator_resolver = FixedResolver {
+                    delegated_pub: initiator_resolver.delegated_pub.clone(),
+                    generation: initiator_resolver.generation,
+                    not_after: initiator_resolver.not_after,
+                };
+                thread::spawn(move || {
+                    let ingress = PrevalidatedIngress::admit_at_accept(
+                        sock,
+                        IngressEvidence {
+                            observed_at: 1,
+                            ingress_expiry: u64::MAX / 2,
+                        },
+                        far_future_budget(),
+                    );
+                    run_responder_handshake(
+                        ingress,
+                        &responder_identity,
+                        &checkpoint,
+                        ExpectedChannel::Dev,
+                        &DelegationPolicy::test(u64::MAX / 2),
+                        &AlwaysAcceptDelegation,
+                        &k_mesh,
+                        ledger.as_ref(),
+                        &d1,
+                        &FixedClock(0),
+                        &initiator_resolver,
+                        u64::MAX / 2,
+                        RekeyThreshold::new(3).unwrap(),
+                    )
+                })
+            })
+            .collect();
+
+        for h in attacker_threads {
+            let _ = h.join();
+        }
+        let responder_results: Vec<_> = responder_threads
+            .into_iter()
+            .map(|h| h.join().unwrap())
+            .collect();
+
+        let active_count = responder_results.iter().filter(|r| r.is_ok()).count();
+        let already_consumed_count = responder_results
+            .iter()
+            .filter(|r| {
+                matches!(
+                    r,
+                    Err(AuthFrameError::Intent(
+                        crate::error::IntentError::NonceAlreadyConsumed
+                    ))
+                )
+            })
+            .count();
+
+        assert_eq!(
+            active_count, 1,
+            "expected exactly one responder ceremony to reach Active"
+        );
+        assert_eq!(
+            already_consumed_count, 1,
+            "expected exactly one responder ceremony to be rejected with NonceAlreadyConsumed"
+        );
+        assert_eq!(
+            reserve_count.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "D1::reserve_pending must have been called exactly once — the losing \
+             ceremony's nonce rejection must happen strictly before D1 reservation, \
+             so it must never reserve at all"
         );
     }
 }
