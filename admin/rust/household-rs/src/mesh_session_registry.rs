@@ -378,8 +378,34 @@ impl SessionSync {
     /// `active_readers` remains trustworthy across poison and abandoning
     /// the wait would violate the documented contract that `revoke` does
     /// not return until every in-flight forward has actually finished.
+    ///
+    /// Composed of [`announce_revoke`](Self::announce_revoke) then
+    /// [`drain_after_announce`](Self::drain_after_announce) — split apart
+    /// (round D-1 successor, @kiana P0-1) so a caller revoking SEVERAL
+    /// sessions from one decision can announce to every target before
+    /// draining any of them. See [`revoke_batch`] for why that split
+    /// matters: calling this single-target `revoke` in a loop leaves each
+    /// LATER target's own `writer_intent` at zero — and therefore still
+    /// admitting brand-new readers — for the entire time an EARLIER
+    /// target's drain is in flight, even though the same decision already
+    /// condemned it.
     fn revoke(&self) {
+        self.announce_revoke();
+        self.drain_after_announce();
+    }
+
+    /// Phase 1 of a revoke: increment `writer_intent` only. Lock-free,
+    /// cannot itself be delayed by another target's slow drain — see
+    /// [`revoke_batch`].
+    fn announce_revoke(&self) {
         self.writer_intent.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// Phase 2 of a revoke: MUST be preceded by exactly one
+    /// [`announce_revoke`](Self::announce_revoke) on the same instance.
+    /// Waits out any already-admitted readers/pending-admissions, commits
+    /// the fail-closed bit, then balances `writer_intent` back down.
+    fn drain_after_announce(&self) {
         let mut state = match self.state.lock() {
             Ok(state) => state,
             Err(poisoned) => poisoned.into_inner(),
@@ -466,6 +492,29 @@ impl Drop for ForwardingGuard<'_> {
 ///   registry's current one, so a gate issued in an earlier generation
 ///   never reauthorizes after an `Unavailable -> Live` recovery even if
 ///   `registry_live` reads `true` again.
+///
+/// `Clone` is intentional, evaluated and kept (round D-1 successor,
+/// @kiana P0-2 asked this be weighed against a non-`Clone` structural
+/// wrapper joining registration and gate). Real concurrent forwarding
+/// needs an owned copy per worker/thread — this file's own tests already
+/// clone a `SessionGate` to move into a spawned thread for exactly that
+/// reason. A non-`Clone` wrapper would not remove that need; it would only
+/// force callers to reach for `Arc<SessionGate>` instead, which has the
+/// identical "can be held past what created it" shape `Arc` always has —
+/// no structural gain, just a renamed one. The property P0-2 actually
+/// needs — a clone can never outlive its session's REVOCABILITY — already
+/// holds by construction and does not depend on `Clone`'s absence: every
+/// field here is a shared `Arc`/`Arc<Atomic*>`, so revoking the underlying
+/// `sync` (or a registry-wide close/poison) is instantly visible to EVERY
+/// existing and future clone, because they all read the SAME atomics —
+/// `try_authorize_forwarding` rechecks all three on every single call, not
+/// once at construction. What P0-2's actual RED exercised was a DIFFERENT
+/// bug: a bookkeeping-removal path that dropped a session's tracking
+/// entry without ever calling `SessionSync::revoke()` on it at all, so
+/// there was nothing for a clone to observe — fixed at the three sites
+/// that remove entries (`observe_new_checkpoint`'s Advance-branch
+/// naturally-dead cleanup, `registered_count`'s dead-Weak prune, and
+/// `mark_unavailable`), not by touching `Clone`.
 #[derive(Clone)]
 pub struct SessionGate {
     sync: Arc<SessionSync>,
@@ -1090,41 +1139,59 @@ impl<H: RevocableMeshSession> MeshSessionRegistry<H> {
     /// are tracked but not included.
     #[must_use]
     pub fn registered_count(&self, m_id: &MachineId) -> usize {
-        let Ok(mut guard) = self.inner.lock() else {
-            self.registry_live.store(false, Ordering::SeqCst);
-            return 0;
-        };
-        let _poison_guard = PoisonGuard::new(&self.registry_live);
-        let Mode::Live {
-            sessions,
-            by_machine,
-        } = &mut guard.mode
-        else {
-            return 0;
-        };
-        let Some(ids) = by_machine.get_mut(m_id) else {
-            return 0;
-        };
-        ids.retain(|id| {
-            let alive = sessions
-                .get(id)
-                .is_some_and(|entry| entry.handle.strong_count() > 0);
-            if !alive {
-                sessions.remove(id);
-            }
-            alive
-        });
-        let count = ids
-            .iter()
-            .filter(|id| {
-                sessions
+        let mut dead: Vec<Arc<SessionSync>> = Vec::new();
+        let count = {
+            let Ok(mut guard) = self.inner.lock() else {
+                self.registry_live.store(false, Ordering::SeqCst);
+                return 0;
+            };
+            let _poison_guard = PoisonGuard::new(&self.registry_live);
+            let Mode::Live {
+                sessions,
+                by_machine,
+            } = &mut guard.mode
+            else {
+                return 0;
+            };
+            let Some(ids) = by_machine.get_mut(m_id) else {
+                return 0;
+            };
+            ids.retain(|id| {
+                let alive = sessions
                     .get(id)
-                    .is_some_and(|entry| entry.lifecycle == SessionLifecycle::Active)
-            })
-            .count();
-        if ids.is_empty() {
-            by_machine.remove(m_id);
-        }
+                    .is_some_and(|entry| entry.handle.strong_count() > 0);
+                if !alive {
+                    if let Some(entry) = sessions.remove(id) {
+                        dead.push(entry.sync);
+                    }
+                }
+                alive
+            });
+            let count = ids
+                .iter()
+                .filter(|id| {
+                    sessions
+                        .get(id)
+                        .is_some_and(|entry| entry.lifecycle == SessionLifecycle::Active)
+                })
+                .count();
+            if ids.is_empty() {
+                by_machine.remove(m_id);
+            }
+            count
+        };
+        // Round D-1 successor (@kiana P0-2): a dead Weak's bookkeeping
+        // removal must not leave any `SessionGate` clone taken for it
+        // earlier still reading authorized — `try_authorize_forwarding`
+        // does not consult `handle`/`strong_count` at all, only
+        // `sync`/`registry_live`/`generation`, so dropping the entry here
+        // without revoking its `SessionSync` would make that clone
+        // permanently authorized and permanently unreachable by any future
+        // observation (this session is no longer in `sessions`/
+        // `by_machine`). `revoke_batch` on the (usually empty, so
+        // effectively free) dead set forces `authorized` false — unlocked,
+        // after `guard` above has already been dropped.
+        revoke_batch(dead.iter());
         count
     }
 
@@ -1291,7 +1358,7 @@ impl<H: RevocableMeshSession> MeshSessionRegistry<H> {
                         .filter(|(_, entry)| should_revoke(entry, &new_revision))
                         .map(|(id, _)| *id)
                         .collect();
-                    to_revoke = to_revoke_ids
+                    let mut collected: Vec<(SessionId, Arc<SessionSync>, Weak<H>)> = to_revoke_ids
                         .iter()
                         .map(|id| {
                             let entry = &sessions[id];
@@ -1299,13 +1366,23 @@ impl<H: RevocableMeshSession> MeshSessionRegistry<H> {
                         })
                         .collect();
 
-                    // Cheap, non-blocking bookkeeping (upgrade()/
-                    // strong_count() only, no SessionSync/session methods
-                    // called): drop tracking for any remaining handle, NOT
+                    // Bookkeeping-only prune (upgrade()/strong_count()
+                    // only, no blocking I/O) for any remaining handle, NOT
                     // one of this round's to_revoke_ids, whose last Arc
-                    // already dropped elsewhere. to_revoke_ids are skipped
-                    // here — Phase C below removes those once their
-                    // SessionSync::revoke() has actually run.
+                    // already dropped elsewhere. Round D-1 successor
+                    // (@kiana — same root cause as P0-2): a naturally-dead
+                    // handle's `SessionSync` must still be revoked, not
+                    // merely dropped from tracking, or a `SessionGate`
+                    // clone taken for it earlier keeps reading authorized
+                    // forever with no future observation able to reach it
+                    // (it is no longer in `sessions`/`by_machine` at all).
+                    // Folded into the SAME `collected` batch as the
+                    // roster-driven revocations above so Phase B's
+                    // `revoke_batch` announces intent to everything
+                    // (roster-driven AND naturally-dead) in one pass —
+                    // to_revoke_ids entries are skipped here and left for
+                    // Phase C, which removes those once their
+                    // `SessionSync::revoke()` has actually run.
                     let still_tracked: Vec<MachineId> = by_machine.keys().cloned().collect();
                     for m_id in still_tracked {
                         if let Some(ids) = by_machine.get_mut(&m_id) {
@@ -1317,7 +1394,9 @@ impl<H: RevocableMeshSession> MeshSessionRegistry<H> {
                                     .get(id)
                                     .is_some_and(|entry| entry.handle.strong_count() > 0);
                                 if !alive {
-                                    sessions.remove(id);
+                                    if let Some(entry) = sessions.remove(id) {
+                                        collected.push((*id, entry.sync, entry.handle));
+                                    }
                                 }
                                 alive
                             });
@@ -1326,22 +1405,21 @@ impl<H: RevocableMeshSession> MeshSessionRegistry<H> {
                             }
                         }
                     }
+                    to_revoke = collected;
                     guard.last_known_revision = new_revision;
                     outcome = ObserveOutcome::Applied;
                 }
             }
         }
 
-        // Phase B (unlocked): for each session actually being revoked,
-        // announce revoke intent for the whole call (blocking out any NEW
-        // forwarding attempt for exactly this session from this instant,
-        // by state — see SessionSync's doc comment) and wait out any
-        // IN-FLIGHT forward for this session — all without holding
-        // `self.inner`'s lock, so unrelated registry operations are never
-        // blocked by a slow forward (round 4).
-        for (_, sync, _) in &to_revoke {
-            sync.revoke();
-        }
+        // Phase B (unlocked): announce revoke intent to EVERY collected
+        // target first, THEN drain each — not a plain per-target `revoke()`
+        // loop (round D-1 successor, @kiana P0-1: see `revoke_batch`'s doc
+        // comment for exactly why a sequential loop leaves later targets
+        // still admitting new forwarding while an earlier one drains). All
+        // without holding `self.inner`'s lock, so unrelated registry
+        // operations are never blocked by a slow forward (round 4).
+        revoke_batch(to_revoke.iter().map(|(_, sync, _)| sync));
 
         // Phase C: bookkeeping only. By this point every revoked session's
         // `room` already reads false — Phase B already closed authorization
@@ -1437,9 +1515,10 @@ impl<H: RevocableMeshSession> MeshSessionRegistry<H> {
                 .collect();
             self.registry_live.store(false, Ordering::SeqCst);
         }
-        for (_, sync, _) in &to_revoke {
-            sync.revoke();
-        }
+        // Round D-1 successor (@kiana P0-1): same batch-announce-then-drain
+        // discipline as `observe_new_checkpoint`'s Phase B — see
+        // `revoke_batch`'s doc comment.
+        revoke_batch(to_revoke.iter().map(|(_, sync, _)| sync));
         let to_finish: Vec<Arc<H>> = to_revoke
             .into_iter()
             .filter_map(|(_, _, handle)| handle.upgrade())
@@ -1468,6 +1547,29 @@ impl<H: RevocableMeshSession> MeshSessionRegistry<H> {
     }
 }
 
+/// Round D-1 successor (@kiana P0-1): revoking several sessions collected
+/// in one registry-wide decision (a batch fork/regression close, an
+/// `Advance` that tombstones/drops multiple machines at once, or
+/// `mark_unavailable`) must announce writer intent to EVERY target BEFORE
+/// draining ANY of them. `SessionSync::revoke()` called one target at a
+/// time in a plain loop does not do that: `writer_intent` lives on each
+/// individual `SessionSync`, so a later target's own gate keeps reading
+/// authorized — and can still admit a BRAND NEW `ForwardingGuard` or
+/// `PendingSessionAdmission::activate_if_authorized` — for the entire time
+/// an earlier target's drain is in flight, even though the very same
+/// decision already condemned it. `announce_revoke` is a lock-free atomic
+/// increment, so the first loop below cannot itself be delayed by a slow
+/// drain elsewhere in the batch; every target has stopped admitting new
+/// readers before the second loop starts draining any of them.
+fn revoke_batch<'a>(targets: impl Iterator<Item = &'a Arc<SessionSync>> + Clone) {
+    for sync in targets.clone() {
+        sync.announce_revoke();
+    }
+    for sync in targets {
+        sync.drain_after_announce();
+    }
+}
+
 fn should_revoke<H: RevocableMeshSession>(entry: &SessionEntry<H>, revision: &Revision) -> bool {
     if revision.revoked.contains(&entry.m_id) {
         return true;
@@ -1490,8 +1592,8 @@ mod tests {
     use crate::keys::P256PublicKey;
     use crate::machine_cert::PersonId;
     use crate::machine_roster_authority::{
-        AcceptedRosterData, ExpectedResponder, MachineRosterMemberV1, MachineRosterRevocationV1,
-        PeerExpectation, PeerSelectionSource,
+        AcceptedRosterData, AuthenticatedPeerClaim, ExpectedResponder, MachineRosterMemberV1,
+        MachineRosterRevocationV1, PeerExpectation, PeerSelectionSource,
     };
 
     #[derive(Default)]
@@ -1635,6 +1737,16 @@ mod tests {
         let responder = ExpectedResponder::from_peer_expectation(expectation, snapshot)
             .expect("test fixture: m_id must be active and non-revoked in snapshot");
         SealedBinding::from_expected_responder(&responder, snapshot)
+    }
+
+    /// Builds a `SealedBinding` via the RESPONDER-side origin (D-1
+    /// successor, @kiana E1) — an `AuthenticatedPeerClaim` and a real
+    /// snapshot, with no `PeerExpectation`/`ExpectedResponder` involved at
+    /// all.
+    fn sealed_binding_responder(snapshot: &RosterSnapshotView, m_id: &MachineId) -> SealedBinding {
+        let claim = AuthenticatedPeerClaim::injected_for_harness(m_id.clone());
+        SealedBinding::from_responding_peer(&claim, snapshot)
+            .expect("test fixture: m_id must be active and non-revoked in snapshot")
     }
 
     #[test]
@@ -3239,5 +3351,210 @@ mod tests {
             "revoke starved for more than {bound:?} under a continuous stream of short-lived forwarding guards"
         );
         assert!(gate.try_authorize_forwarding().is_none());
+    }
+
+    // ── D-1 successor (@kiana, 9664d363 audit) ──────────────────────────
+
+    /// P0/P1 E1 — compile/API proof, SCOPED: proves the REGISTRY's
+    /// production `preauthorize` -> `activate_if_authorized` machinery has
+    /// no structural bias toward initiator-shaped bindings — a
+    /// responder-shaped `SealedBinding` (from `from_responding_peer`, not
+    /// `from_expected_responder`) reaches Active through the exact same
+    /// path, with no `PeerExpectation`/`ExpectedResponder` involved at
+    /// all. This does NOT by itself close E1 in production: constructing
+    /// the `AuthenticatedPeerClaim` this test starts from still requires
+    /// `#[cfg(test)] pub(crate) injected_for_harness`, which — being
+    /// `pub(crate)` — is invisible to any OTHER crate in ANY build mode,
+    /// not merely gated pending a future source. A real, cross-crate
+    /// production responder (the not-yet-integrated B-SESSAO CORE
+    /// handshake) still has no legitimate way to construct a claim today;
+    /// that remains an open, separately-tracked integration blocker (see
+    /// `AuthenticatedPeerClaim`'s doc comment). What this test DOES prove,
+    /// and what is safe to rely on: once something proves a claim by
+    /// whatever mechanism is eventually approved, the roster-authority
+    /// projection and the registry's admission path are already correct
+    /// and already tested for it.
+    #[test]
+    fn responder_side_binding_reaches_active_via_the_production_preauthorize_path() {
+        let m_id = test_m_id(68);
+        let registry = new_registry_with(1, [1u8; 32], &[(m_id.clone(), FP_A)]);
+        let snapshot = snapshot_at(1, [1u8; 32], &[(m_id.clone(), FP_A)], &[]);
+        let binding = sealed_binding_responder(&snapshot, &m_id);
+        let session = Arc::new(RecordingSession::default());
+        let admission = registry
+            .preauthorize(&binding, Arc::downgrade(&session))
+            .expect("active machine, matching revision, matching fingerprint");
+        let (_id, gate) = admission
+            .activate_if_authorized()
+            .expect("uncontested Ack window");
+        assert!(gate.is_authorized());
+        assert!(registry.is_registered(&m_id));
+    }
+
+    /// P0-1 — RED, now fixed: a single `observe_new_checkpoint` call that
+    /// revokes TWO different sessions in one batch must not leave the
+    /// SECOND still admitting brand-new forwarding while the FIRST is
+    /// still draining a long-lived `ForwardingGuard`. Before the fix,
+    /// Phase B called `SessionSync::revoke()` sequentially per target, so
+    /// target B's own `writer_intent` stayed at zero — and its gate kept
+    /// reading authorized — for the entire time target A's drain was in
+    /// flight, even though the SAME checkpoint observation already
+    /// condemned both. See `revoke_batch`'s doc comment.
+    #[test]
+    fn batch_revoke_announces_to_every_target_before_draining_any() {
+        let m_id_a = test_m_id(69);
+        let m_id_b = test_m_id(70);
+        let snapshot = snapshot_at(
+            1,
+            [1u8; 32],
+            &[(m_id_a.clone(), FP_A), (m_id_b.clone(), FP_B)],
+            &[],
+        );
+        let registry = Arc::new(MeshSessionRegistry::<RecordingSession>::new(&snapshot));
+        let binding_a = sealed_binding(&snapshot, &m_id_a);
+        let binding_b = sealed_binding(&snapshot, &m_id_b);
+        let session_a = Arc::new(RecordingSession::default());
+        let session_b = Arc::new(RecordingSession::default());
+        let (_id_a, gate_a) = registry
+            .register(&binding_a, Arc::downgrade(&session_a))
+            .unwrap();
+        let (_id_b, gate_b) = registry
+            .register(&binding_b, Arc::downgrade(&session_b))
+            .unwrap();
+
+        // Session A holds an open ForwardingGuard across the whole revoke.
+        let (acquired_tx, acquired_rx) = mpsc::channel::<()>();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let holder = {
+            let gate_a = gate_a.clone();
+            thread::spawn(move || {
+                let guard = gate_a
+                    .try_authorize_forwarding()
+                    .expect("session A active before any revoke");
+                acquired_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+                drop(guard);
+            })
+        };
+        acquired_rx.recv().unwrap();
+
+        // Both A and B get revoked by the SAME checkpoint observation.
+        let revoke_snapshot = snapshot_at(2, [2u8; 32], &[], &[m_id_a.clone(), m_id_b.clone()]);
+        let revoker = {
+            let registry = Arc::clone(&registry);
+            thread::spawn(move || registry.observe_new_checkpoint(&revoke_snapshot))
+        };
+
+        // Observable barrier: wait until Phase B has genuinely started
+        // draining A (A's writer_intent > 0) before checking B — a real
+        // observation, not a timing guess.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if gate_a.sync.writer_intent.load(Ordering::SeqCst) > 0 {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "writer never announced intent on A within the deadline"
+            );
+            thread::yield_now();
+        }
+
+        // The crux assertion: B must ALREADY reject new forwarding, even
+        // though A's drain has not finished and B's own SessionSync was
+        // never individually revoke()'d yet.
+        assert!(
+            gate_b.try_authorize_forwarding().is_none(),
+            "B must already reject new forwarding once the batch announced revoke intent, \
+             not only after A's drain finishes"
+        );
+
+        release_tx.send(()).unwrap();
+        holder.join().unwrap();
+        let outcome = revoker.join().unwrap();
+
+        assert_eq!(outcome, ObserveOutcome::Applied);
+        assert!(!gate_a.is_authorized());
+        assert!(!gate_b.is_authorized());
+        assert!(session_a.closed.load(Ordering::SeqCst));
+        assert!(session_b.closed.load(Ordering::SeqCst));
+    }
+
+    /// P0-2 — RED, now fixed: pruning a dead `Weak` bookkeeping entry (the
+    /// session's last strong `Arc<H>` already dropped) must revoke its
+    /// `SessionSync`, not merely stop tracking it. Before the fix, a
+    /// `SessionGate` cloned BEFORE the handle was dropped kept reading
+    /// authorized forever after the prune, with no future observation
+    /// able to reach it (it is no longer in `sessions`/`by_machine` at
+    /// all).
+    #[test]
+    fn registered_count_prune_revokes_a_gate_cloned_before_the_handle_dropped() {
+        let m_id = test_m_id(71);
+        let registry = new_registry_with(1, [1u8; 32], &[(m_id.clone(), FP_A)]);
+        let snapshot = snapshot_at(1, [1u8; 32], &[(m_id.clone(), FP_A)], &[]);
+        let binding = sealed_binding(&snapshot, &m_id);
+        let cloned_gate = {
+            let session = Arc::new(RecordingSession::default());
+            let (_id, gate) = registry
+                .register(&binding, Arc::downgrade(&session))
+                .unwrap();
+            let cloned = gate.clone();
+            assert!(cloned.is_authorized());
+            cloned
+            // `session` (the last strong Arc<H>) drops here.
+        };
+
+        // Triggers the dead-Weak prune path.
+        assert_eq!(registry.registered_count(&m_id), 0);
+
+        assert!(
+            !cloned_gate.is_authorized(),
+            "a gate cloned before its handle dropped must be revoked by the prune, \
+             not merely untracked and left permanently authorized"
+        );
+        assert!(
+            cloned_gate.try_authorize_forwarding().is_none(),
+            "the production authorization surface must also reject it"
+        );
+    }
+
+    /// Same defect class as the previous test, exercised at the OTHER
+    /// site that prunes a naturally-dead handle without going through
+    /// `unregister` — `observe_new_checkpoint`'s `Advance` branch, for a
+    /// session whose machine is untouched by the new revision (so it is
+    /// never in `to_revoke_ids`) but whose handle already dropped.
+    #[test]
+    fn observe_new_checkpoint_advance_prune_revokes_a_gate_cloned_before_the_handle_dropped() {
+        let m_id = test_m_id(72);
+        let other = test_m_id(73);
+        let registry = new_registry_with(1, [1u8; 32], &[(m_id.clone(), FP_A)]);
+        let snapshot = snapshot_at(1, [1u8; 32], &[(m_id.clone(), FP_A)], &[]);
+        let binding = sealed_binding(&snapshot, &m_id);
+        let cloned_gate = {
+            let session = Arc::new(RecordingSession::default());
+            let (_id, gate) = registry
+                .register(&binding, Arc::downgrade(&session))
+                .unwrap();
+            let cloned = gate.clone();
+            assert!(cloned.is_authorized());
+            cloned
+            // `session` drops here; nothing observes it yet.
+        };
+
+        // `m_id` stays active with the SAME fingerprint (so `should_revoke`
+        // is false for it -- it is NOT in `to_revoke_ids`); only `other`,
+        // an unrelated machine never registered here, is tombstoned. Must
+        // still sweep `m_id`'s dead handle out of `by_machine` via the
+        // Advance branch's own bookkeeping-prune loop (`still_tracked`),
+        // not the to_revoke_ids machinery.
+        let unrelated_advance = snapshot_at(2, [2u8; 32], &[(m_id.clone(), FP_A)], &[other]);
+        let outcome = registry.observe_new_checkpoint(&unrelated_advance);
+        assert_eq!(outcome, ObserveOutcome::Applied);
+
+        assert!(
+            !cloned_gate.is_authorized(),
+            "a gate cloned before its handle dropped must be revoked when the Advance branch \
+             prunes the dead entry, not merely untracked"
+        );
     }
 }

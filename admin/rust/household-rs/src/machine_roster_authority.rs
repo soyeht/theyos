@@ -2083,6 +2083,116 @@ impl SealedBinding {
     }
 }
 
+// ─── Responder-side peer binding (D-1 successor, @kiana E1) ────────────────
+//
+// `PeerExpectation`/`ExpectedResponder` are structurally initiator-only: the
+// initiator pre-declares WHICH `m_id` it expects to reach before any
+// connection exists (`PeerExpectation::m_id`), then `from_peer_expectation`
+// checks that pre-declaration against a real snapshot. A RESPONDER has no
+// such pre-declaration to check — it learns a peer's claimed identity only
+// once an inbound connection attempt has already been authenticated at the
+// transport layer. That authentication (proving "this inbound bytestream
+// really is machine X") is NOT household-rs's job; it belongs to the
+// not-yet-integrated B-SESSAO CORE wire/session handshake (see this module's
+// scope notes elsewhere, and `mesh_session_registry.rs`'s own doc comment).
+// What IS household-rs's job, symmetrically with the initiator side, is the
+// roster-authority half only: given an m_id the transport layer has ALREADY
+// authenticated for this specific inbound attempt, check it against a real
+// `RosterSnapshotView` the same way `from_peer_expectation` does for the
+// initiator — active, non-revoked, at this exact revision.
+//
+// `AuthenticatedPeerClaim` is a SEPARATE type from `PeerExpectation`/
+// `ExpectedResponder` — not a wrapper, not a reuse. An inbound authenticated
+// claim and a locally pre-declared expectation are different authorities
+// with different failure semantics and different origins; folding them into
+// one type would let a future caller silently satisfy an initiator-shaped
+// check with responder-shaped evidence, or vice versa. Its only constructor
+// is `#[cfg(test)] pub(crate)`, for the same reason `PeerExpectation` has
+// none in production: there is no measured, authenticated source for an
+// inbound peer's claimed `m_id` wired into household-rs yet — that source
+// is the not-yet-built B-SESSAO CORE handshake. The absence IS the gate
+// (RED-R23's own reasoning, mirrored here), not a warning next to a
+// constructor that works.
+//
+// **Open integration blocker, registered explicitly, not closed here**
+// (round D-1 successor, @kiana recheck): `pub(crate)` is a HARD crate
+// boundary regardless of build mode — it is not merely "gated pending a
+// measured source" the way a `#[cfg(test)]`-only item is. Once the
+// B-SESSAO CORE handshake exists, it will live in a DIFFERENT crate
+// (`mesh-session-core-rs`/its runtime), and a `pub(crate)` item in
+// household-rs is structurally invisible to it FOREVER, in every build
+// mode — "integrate the handshake" alone can never make this path
+// reachable from production, no matter what else changes. Production
+// wiring needs one of: (a) an opaque, capability-shaped facade this type
+// accepts as proof (the shape D-9 is expected to define — not decided or
+// built here), or (b) an explicitly-approved typed dependency from
+// `mesh-session-core-rs` onto household-rs internals. Neither exists yet.
+// This round deliberately does NOT invent either — exposing a raw,
+// forgeable, cross-crate-reachable constructor "just to compile" would
+// itself be the vulnerability E1 exists to prevent. What this round DOES
+// close, and what is safe to rely on today: the roster-authority
+// projection itself (`SealedBinding::from_responding_peer`, below) is
+// real, tested, and origin-agnostic — whatever eventually proves an
+// `AuthenticatedPeerClaim` can hand it straight to this same, already-
+// audited check. Only the "how does a responder legitimately construct
+// the claim in production" half remains open.
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AuthenticatedPeerClaim {
+    m_id: MachineId,
+}
+
+impl AuthenticatedPeerClaim {
+    // NENHUM constructor público de produção existe ainda — mesma
+    // disciplina de `PeerExpectation::injected_for_harness` (RED-R23).
+
+    #[cfg(test)]
+    pub(crate) fn injected_for_harness(m_id: MachineId) -> Self {
+        Self { m_id }
+    }
+
+    #[must_use]
+    pub fn m_id(&self) -> &MachineId {
+        &self.m_id
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RespondingPeerError {
+    MachineRevoked,
+    MachineNotActive,
+}
+
+impl SealedBinding {
+    /// Responder-side origin (D-1 successor, @kiana E1) — see this
+    /// section's module-level comment for why this is a distinct path from
+    /// [`from_expected_responder`](Self::from_expected_responder), not a
+    /// variant of it. Performs exactly the roster-authority half
+    /// `ExpectedResponder::from_peer_expectation` performs for the
+    /// initiator: revoked first (mirroring RED-R18's ordering), then
+    /// active — both against `snapshot` — so a responder and an initiator
+    /// produce identically-shaped refusals for identically-shaped roster
+    /// states.
+    pub fn from_responding_peer(
+        claim: &AuthenticatedPeerClaim,
+        snapshot: &RosterSnapshotView,
+    ) -> Result<Self, RespondingPeerError> {
+        if snapshot.is_revoked(claim.m_id()) {
+            return Err(RespondingPeerError::MachineRevoked);
+        }
+        let member = snapshot
+            .lookup_active(claim.m_id())
+            .ok_or(RespondingPeerError::MachineNotActive)?;
+        Ok(Self {
+            hh_id: snapshot.hh_id().clone(),
+            m_id: claim.m_id().clone(),
+            machine_cert_fingerprint: member.machine_cert_fingerprint(),
+            checkpoint_hash: snapshot.checkpoint_hash(),
+            checkpoint_sequence: snapshot.checkpoint_sequence(),
+        })
+    }
+}
+
 // ─── Tests ──────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -9130,6 +9240,55 @@ mod tests {
         let responder = ExpectedResponder::from_peer_expectation(expectation, &snapshot)
             .expect("active machine, matching snapshot");
         let binding = SealedBinding::from_expected_responder(&responder, &snapshot);
+        assert_eq!(binding.hh_id(), &hh_id);
+        assert_eq!(binding.m_id(), &m_id);
+        assert_eq!(binding.machine_cert_fingerprint(), [0xAAu8; 32]);
+        assert_eq!(binding.checkpoint_hash(), checkpoint_hash);
+        assert_eq!(
+            binding.checkpoint_sequence(),
+            snapshot.checkpoint_sequence()
+        );
+    }
+
+    /// D-1 successor (@kiana E1): the responder path mirrors the
+    /// initiator path's revoked-first ordering — a revoked machine is
+    /// rejected as `MachineRevoked` even though (in a fixture with only
+    /// one of active/revoked populated) it is trivially also "not active".
+    #[test]
+    fn responding_peer_rejects_revoked_machine() {
+        let checkpoint_hash = [9u8; 32];
+        let m_id = MachineId("m-responder-inbound-revoked".to_string());
+        let claim = AuthenticatedPeerClaim::injected_for_harness(m_id.clone());
+        let snapshot = test_snapshot_for_responder(checkpoint_hash, None, Some(&m_id));
+        let result = SealedBinding::from_responding_peer(&claim, &snapshot);
+        assert_eq!(result, Err(RespondingPeerError::MachineRevoked));
+    }
+
+    #[test]
+    fn responding_peer_rejects_not_listed_machine() {
+        let checkpoint_hash = [10u8; 32];
+        let m_id = MachineId("m-responder-inbound-not-listed".to_string());
+        let claim = AuthenticatedPeerClaim::injected_for_harness(m_id);
+        let snapshot = test_snapshot_for_responder(checkpoint_hash, None, None);
+        let result = SealedBinding::from_responding_peer(&claim, &snapshot);
+        assert_eq!(result, Err(RespondingPeerError::MachineNotActive));
+    }
+
+    /// The end-to-end compile/API proof for E1: a responder — which has no
+    /// `PeerExpectation`/`ExpectedResponder` to redeem at all, only an
+    /// (already-authenticated, here harness-injected) claimed `m_id` — can
+    /// still produce a `SealedBinding` carrying exactly what the snapshot
+    /// proves for that machine, without ever constructing or naming
+    /// `PeerExpectation`/`ExpectedResponder` in this test.
+    #[test]
+    fn responding_peer_succeeds_for_active_machine_and_projects_into_sealed_binding() {
+        let checkpoint_hash = [11u8; 32];
+        let hh_id = HouseholdId("hh-expected-responder-test".to_string());
+        let m_id = MachineId("m-responder-inbound-active".to_string());
+        let claim = AuthenticatedPeerClaim::injected_for_harness(m_id.clone());
+        let snapshot = test_snapshot_for_responder(checkpoint_hash, Some(&m_id), None);
+        let binding = SealedBinding::from_responding_peer(&claim, &snapshot)
+            .expect("active machine, real snapshot");
         assert_eq!(binding.hh_id(), &hh_id);
         assert_eq!(binding.m_id(), &m_id);
         assert_eq!(binding.machine_cert_fingerprint(), [0xAAu8; 32]);
