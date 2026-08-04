@@ -70,6 +70,12 @@ tempfile      = { workspace = true }
 tracing-test  = { workspace = true, features = ["no-env-filter"] }
 rusqlite      = { workspace = true }
 webauthn-authenticator-rs = { version = "0.5.5", default-features = false, features = ["softpasskey"] }
+# RED-R23 (D-1/B-ROSTER-ADAPTER v2, erratum1): a real compile-fail proof
+# that PeerExpectation has no production constructor, not a comment
+# asserting it. Focused, household-rs-only addition, explicitly authorized
+# by @kiana for this purpose — not added to the workspace-wide dependency
+# set.
+trybuild      = "1"
 
 [lints]
 workspace = true

@@ -2014,6 +2014,75 @@ impl ExpectedResponder {
     }
 }
 
+/// D-1 (audit round 3): what `MeshSessionRegistry::register` accepts in
+/// place of a caller-supplied bare `MachineId` + a session-self-reported
+/// identity. A session handle claiming its own `peer_m_id()` is still just
+/// a claim — nothing stops a buggy or malicious `H` from lying. A
+/// `SealedBinding` instead carries exactly the fields an `ExpectedResponder`
+/// (itself only constructible by passing `ExpectedResponder::from_peer_expectation`'s
+/// revoked/active/hash-pairing checks against a real snapshot) already
+/// proved, plus the checkpoint revision that snapshot was captured at:
+/// `hh_id`, `m_id`, `machine_cert_fingerprint`, `checkpoint_hash`,
+/// `checkpoint_sequence`. The registry's `register` no longer trusts
+/// anything the handle itself reports.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SealedBinding {
+    hh_id: HouseholdId,
+    m_id: MachineId,
+    machine_cert_fingerprint: [u8; 32],
+    checkpoint_hash: [u8; 32],
+    checkpoint_sequence: u64,
+}
+
+impl SealedBinding {
+    /// `responder` proves `m_id` was active, non-revoked and paired to
+    /// `snapshot`'s exact `checkpoint_hash` at the moment
+    /// `from_peer_expectation` ran; `snapshot` additionally supplies the
+    /// `checkpoint_sequence` that `ExpectedResponder` itself does not carry
+    /// (`PeerExpectation` only seals a hash). Caller is expected to have
+    /// obtained `responder` from this same `snapshot` — nothing here
+    /// re-verifies that pairing beyond what `from_peer_expectation` already
+    /// checked, so this is a projection, not a second authorization step.
+    #[must_use]
+    pub fn from_expected_responder(
+        responder: &ExpectedResponder,
+        snapshot: &RosterSnapshotView,
+    ) -> Self {
+        Self {
+            hh_id: responder.hh_id().clone(),
+            m_id: responder.m_id().clone(),
+            machine_cert_fingerprint: responder.cert_fingerprint(),
+            checkpoint_hash: snapshot.checkpoint_hash(),
+            checkpoint_sequence: snapshot.checkpoint_sequence(),
+        }
+    }
+
+    #[must_use]
+    pub fn hh_id(&self) -> &HouseholdId {
+        &self.hh_id
+    }
+
+    #[must_use]
+    pub fn m_id(&self) -> &MachineId {
+        &self.m_id
+    }
+
+    #[must_use]
+    pub fn machine_cert_fingerprint(&self) -> [u8; 32] {
+        self.machine_cert_fingerprint
+    }
+
+    #[must_use]
+    pub fn checkpoint_hash(&self) -> [u8; 32] {
+        self.checkpoint_hash
+    }
+
+    #[must_use]
+    pub fn checkpoint_sequence(&self) -> u64 {
+        self.checkpoint_sequence
+    }
+}
+
 // ─── Tests ──────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -8876,6 +8945,47 @@ mod tests {
         assert_eq!(view.not_after(), 999);
     }
 
+    /// RED-R17, as a compile guard, not just runtime values (round 3, point
+    /// d): exhaustively destructures every field of `RosterSnapshotView`.
+    /// If a field is ever added without updating this pattern, this FAILS
+    /// TO COMPILE (E0027, pattern does not mention field) — caught before
+    /// any test even runs, not only if some other test happens to notice a
+    /// wrong value.
+    #[test]
+    fn roster_snapshot_view_field_set_is_exhaustively_matched_at_compile_time() {
+        let view = RosterSnapshotView::project(
+            &HouseholdId("hh-exhaustive-field-guard".to_string()),
+            &AcceptedRosterData {
+                epoch: [1u8; 32],
+                checkpoint_sequence: 1,
+                checkpoint_hash: [1u8; 32],
+                prev_checkpoint_hash: [1u8; 32],
+                event_sequence: 1,
+                event_head_hash: [1u8; 32],
+                predecessor_event_sequence: 0,
+                predecessor_event_head_hash: [0u8; 32],
+                issued_at: 1,
+                not_after: 1,
+                owner_cert_fingerprint: [1u8; 32],
+                genesis_basis: VerifiedGenesisRoster {
+                    epoch: [1u8; 32],
+                    members: Vec::new(),
+                },
+                active: Vec::new(),
+                tombstones: Vec::new(),
+            },
+        );
+        let RosterSnapshotView {
+            hh_id: _,
+            checkpoint_hash: _,
+            checkpoint_sequence: _,
+            checkpoint_event_head: _,
+            not_after: _,
+            active: _,
+            revoked_m_ids: _,
+        } = view;
+    }
+
     fn test_snapshot_for_responder(
         checkpoint_hash: [u8; 32],
         active_m_id: Option<&MachineId>,
@@ -9001,5 +9111,32 @@ mod tests {
         assert_eq!(responder.hh_id(), &hh_id);
         assert_eq!(responder.m_id(), &m_id);
         assert_eq!(responder.cert_fingerprint(), [0xAAu8; 32]);
+    }
+
+    /// D-1 (audit round 3): `SealedBinding` carries exactly the fields
+    /// derived from a real, snapshot-validated `ExpectedResponder`, plus the
+    /// checkpoint sequence `ExpectedResponder` itself does not carry.
+    #[test]
+    fn sealed_binding_projects_expected_responder_and_snapshot_sequence() {
+        let checkpoint_hash = [8u8; 32];
+        let hh_id = HouseholdId("hh-expected-responder-test".to_string());
+        let m_id = MachineId("m-sealed-binding".to_string());
+        let expectation = PeerExpectation::injected_for_harness(
+            checkpoint_hash,
+            m_id.clone(),
+            PeerSelectionSource::LocalOwnerPresentSelection,
+        );
+        let snapshot = test_snapshot_for_responder(checkpoint_hash, Some(&m_id), None);
+        let responder = ExpectedResponder::from_peer_expectation(expectation, &snapshot)
+            .expect("active machine, matching snapshot");
+        let binding = SealedBinding::from_expected_responder(&responder, &snapshot);
+        assert_eq!(binding.hh_id(), &hh_id);
+        assert_eq!(binding.m_id(), &m_id);
+        assert_eq!(binding.machine_cert_fingerprint(), [0xAAu8; 32]);
+        assert_eq!(binding.checkpoint_hash(), checkpoint_hash);
+        assert_eq!(
+            binding.checkpoint_sequence(),
+            snapshot.checkpoint_sequence()
+        );
     }
 }
