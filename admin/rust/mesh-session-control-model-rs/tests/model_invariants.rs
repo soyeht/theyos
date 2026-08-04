@@ -7,18 +7,18 @@
 use mesh_session_control_model_rs::activate::{
     ActivateError, activate_from_key_observed, revalidate_on_load,
 };
-use mesh_session_control_model_rs::cell::{self, ControlRecordCell};
+use mesh_session_control_model_rs::cell::{
+    self, CommitTransitionError, ControlRecordCell, OpenConflict,
+};
 use mesh_session_control_model_rs::commit::commit_new_bytes;
 use mesh_session_control_model_rs::gc::{gc_removal_pass, gc_worker_tick};
-use mesh_session_control_model_rs::locks::{GcSerialLock, LockEvent, MeshSignerLocks, OrderSpy};
+use mesh_session_control_model_rs::locks::{LockEvent, MeshSignerLocks, OrderSpy};
 use mesh_session_control_model_rs::record::*;
 use mesh_session_control_model_rs::secret_backend::{
     CreateOutcome, CreatedOrExisting, FakeSecretBackend, GcReport, InspectOutcome,
     LoadExactOutcome, SecretBackend,
 };
-use mesh_session_control_model_rs::store::{
-    AtomicControlRecordStore, FaultInjectingStore, LoadOutcome, ReplaceOutcome,
-};
+use mesh_session_control_model_rs::store::{AtomicControlRecordStore, LoadOutcome, ReplaceOutcome};
 use mesh_session_control_model_rs::transition::{RecordTransition, TransitionError, apply};
 use mesh_session_control_model_rs::validator::{
     BindingContext, DelegationPolicy, MeshSessionPurpose, RosterCurrency, RosterLookup,
@@ -61,7 +61,10 @@ fn delegation(not_before: u64, not_after: u64) -> Delegation {
         kind: "soyeht/mesh-session/delegation/v1".into(),
         domain: "soyeht/mesh-session/v1".into(),
         profile: "mesh-session".into(),
-        roles: vec!["initiator".into()],
+        // Round 5, item C8: MeshSessionPurpose's production scope now
+        // requires the EXACT set {initiator, responder} -- see
+        // validator.rs's `DelegationScopePolicy` doc comment.
+        roles: vec!["initiator".into(), "responder".into()],
         transcript_kinds: vec![
             "final-confirm".into(),
             "activate".into(),
@@ -87,6 +90,7 @@ fn test_cell(path: std::path::PathBuf) -> Arc<ControlRecordCell> {
         PurposeId::MeshSession,
         Arc::new(OrderSpy::new()),
     )
+    .expect("fresh path, no prior live cell registered for it")
 }
 
 // `revision: 1` -- the store's genesis check now only accepts the exact
@@ -103,19 +107,15 @@ fn record_with_gc_entries(entries: Vec<GcEntry>) -> MeshSignerControlRecordV1 {
 /// Writes the canonical bootstrap genesis, then `seeded` as the one
 /// mutation on top of it -- the only way to get an arbitrary fixture state
 /// onto disk now that genesis is restricted to the exact canonical shape.
-fn seed_record(
-    store: &dyn AtomicControlRecordStore,
-    locks: &MeshSignerLocks,
-    seeded: &MeshSignerControlRecordV1,
-) {
+fn seed_record(cell: &ControlRecordCell, seeded: &MeshSignerControlRecordV1) {
     let bootstrap = MeshSignerControlRecordV1::bootstrap(seeded.identity.clone(), seeded.purpose);
-    let g = locks.acquire_for_mutation();
+    let g = cell.acquire_for_mutation();
     assert_eq!(
-        store.replace_exact(&g, INITIAL_REVISION, &bootstrap),
+        cell.seed_for_test(&g, INITIAL_REVISION, &bootstrap),
         ReplaceOutcome::Committed
     );
     assert_eq!(
-        store.replace_exact(&g, bootstrap.revision, seeded),
+        cell.seed_for_test(&g, bootstrap.revision, seeded),
         ReplaceOutcome::Committed
     );
 }
@@ -150,6 +150,17 @@ fn active_roster() -> FixedRoster {
         member_pub: vec![1, 2, 3],
         member_cert_fingerprint: [9u8; 32],
     })
+}
+
+/// Shorthand `TerminalRequestFingerprint::Activate` for terminal-retention
+/// tests that only care about txn_id/eviction bookkeeping, not the request
+/// content itself -- `generation` just needs to be distinguishable when a
+/// test specifically wants two DIFFERENT requests sharing one txn_id.
+fn activate_request(generation: u64) -> TerminalRequestFingerprint {
+    TerminalRequestFingerprint::Activate {
+        generation: NonZeroU64::new(generation).unwrap(),
+        delegation: Box::new(delegation(0, 100)),
+    }
 }
 
 fn ctx() -> BindingContext<'static> {
@@ -197,13 +208,11 @@ fn stabilization_rewrite_never_bumps_revision() {
 fn store_cas_rejects_stale_revision() {
     let dir = tempfile::tempdir().unwrap();
     let cell = test_cell(dir.path().join("record"));
-    let store = cell.store();
-    let locks = cell.locks();
     let bootstrapped = MeshSignerControlRecordV1::bootstrap(identity(), PurposeId::MeshSession);
     {
-        let g = locks.acquire_for_mutation();
+        let g = cell.acquire_for_mutation();
         assert_eq!(
-            store.replace_exact(&g, INITIAL_REVISION, &bootstrapped),
+            cell.seed_for_test(&g, INITIAL_REVISION, &bootstrapped),
             ReplaceOutcome::Committed
         );
     }
@@ -220,9 +229,9 @@ fn store_cas_rejects_stale_revision() {
     )
     .unwrap();
     {
-        let g = locks.acquire_for_mutation();
+        let g = cell.acquire_for_mutation();
         assert_eq!(
-            store.replace_exact(&g, bootstrapped.revision, &writer_a_next),
+            cell.seed_for_test(&g, bootstrapped.revision, &writer_a_next),
             ReplaceOutcome::Committed
         );
     }
@@ -240,13 +249,13 @@ fn store_cas_rejects_stale_revision() {
         TEST_CAP,
     )
     .unwrap();
-    let g = locks.acquire_for_mutation();
+    let g = cell.acquire_for_mutation();
     assert_eq!(
-        store.replace_exact(&g, bootstrapped.revision, &writer_b_next),
+        cell.seed_for_test(&g, bootstrapped.revision, &writer_b_next),
         ReplaceOutcome::KnownNoEffect,
         "writer B's stale revision-0 CAS must be rejected once writer A already advanced to revision 1"
     );
-    let LoadOutcome::Exact(on_disk) = store.load_canonical() else {
+    let LoadOutcome::Exact(on_disk) = cell.load_canonical() else {
         panic!("expected record")
     };
     assert_eq!(*on_disk, writer_a_next);
@@ -258,10 +267,9 @@ fn two_writers_race_a_stale_base_under_a_barrier_exactly_one_commits() {
     let cell = test_cell(dir.path().join("record"));
     let bootstrapped = MeshSignerControlRecordV1::bootstrap(identity(), PurposeId::MeshSession);
     {
-        let g = cell.locks().acquire_for_mutation();
+        let g = cell.acquire_for_mutation();
         assert_eq!(
-            cell.store()
-                .replace_exact(&g, INITIAL_REVISION, &bootstrapped),
+            cell.seed_for_test(&g, INITIAL_REVISION, &bootstrapped),
             ReplaceOutcome::Committed
         );
     }
@@ -295,13 +303,13 @@ fn two_writers_race_a_stale_base_under_a_barrier_exactly_one_commits() {
     let base_rev = bootstrapped.revision;
     let h1 = std::thread::spawn(move || {
         b1.wait();
-        let g = c1.locks().acquire_for_mutation();
-        c1.store().replace_exact(&g, base_rev, &new_a)
+        let g = c1.acquire_for_mutation();
+        c1.seed_for_test(&g, base_rev, &new_a)
     });
     let h2 = std::thread::spawn(move || {
         b2.wait();
-        let g = c2.locks().acquire_for_mutation();
-        c2.store().replace_exact(&g, base_rev, &new_b)
+        let g = c2.acquire_for_mutation();
+        c2.seed_for_test(&g, base_rev, &new_b)
     });
     let o1 = h1.join().unwrap();
     let o2 = h2.join().unwrap();
@@ -327,21 +335,19 @@ fn two_writers_race_a_stale_base_under_a_barrier_exactly_one_commits() {
 fn store_rejects_new_record_revision_not_old_plus_one() {
     let dir = tempfile::tempdir().unwrap();
     let cell = test_cell(dir.path().join("record"));
-    let store = cell.store();
-    let locks = cell.locks();
     let bootstrapped = MeshSignerControlRecordV1::bootstrap(identity(), PurposeId::MeshSession);
     {
-        let g = locks.acquire_for_mutation();
+        let g = cell.acquire_for_mutation();
         assert_eq!(
-            store.replace_exact(&g, INITIAL_REVISION, &bootstrapped),
+            cell.seed_for_test(&g, INITIAL_REVISION, &bootstrapped),
             ReplaceOutcome::Committed
         );
     }
     let mut forged = bootstrapped.clone();
     forged.revision = 99;
-    let g = locks.acquire_for_mutation();
+    let g = cell.acquire_for_mutation();
     assert_eq!(
-        store.replace_exact(&g, INITIAL_REVISION, &forged),
+        cell.seed_for_test(&g, INITIAL_REVISION, &forged),
         ReplaceOutcome::KnownNoEffect,
         "new_record.revision must be exactly old.revision+1 (mutation) or == old.revision with byte-identical content (stabilization) -- never trusted verbatim"
     );
@@ -351,32 +357,28 @@ fn store_rejects_new_record_revision_not_old_plus_one() {
 fn store_missing_rejects_non_canonical_first_write() {
     let dir = tempfile::tempdir().unwrap();
     let cell = test_cell(dir.path().join("record"));
-    let store = cell.store();
-    let locks = cell.locks();
     let mut forged_genesis =
         MeshSignerControlRecordV1::bootstrap(identity(), PurposeId::MeshSession);
     forged_genesis.epoch_high_water = NonZeroU64::new(5).unwrap();
-    let g = locks.acquire_for_mutation();
+    let g = cell.acquire_for_mutation();
     assert_eq!(
-        store.replace_exact(&g, INITIAL_REVISION, &forged_genesis),
+        cell.seed_for_test(&g, INITIAL_REVISION, &forged_genesis),
         ReplaceOutcome::KnownNoEffect,
         "Missing must only accept the exact canonical bootstrap record"
     );
-    assert_eq!(store.load_canonical(), LoadOutcome::Missing);
+    assert_eq!(cell.load_canonical(), LoadOutcome::Missing);
 }
 
 #[test]
 fn genesis_write_is_validated_against_the_stores_own_bound_identity_not_new_records_claim() {
     let dir = tempfile::tempdir().unwrap();
     let cell = test_cell(dir.path().join("record"));
-    let store = cell.store();
-    let locks = cell.locks();
     let mut other_identity = identity();
     other_identity.hh_id = "hh_other".into();
     let forged = MeshSignerControlRecordV1::bootstrap(other_identity, PurposeId::MeshSession);
-    let g = locks.acquire_for_mutation();
+    let g = cell.acquire_for_mutation();
     assert_eq!(
-        store.replace_exact(&g, INITIAL_REVISION, &forged),
+        cell.seed_for_test(&g, INITIAL_REVISION, &forged),
         ReplaceOutcome::KnownNoEffect,
         "genesis must be checked against the store's own bound identity, never whatever new_record itself claims"
     );
@@ -397,8 +399,7 @@ fn store_rejects_a_guard_from_a_foreign_locks_instance() {
     let foreign_guard = foreign_locks.acquire_for_mutation();
     let rec = MeshSignerControlRecordV1::bootstrap(identity(), PurposeId::MeshSession);
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        cell.store()
-            .replace_exact(&foreign_guard, INITIAL_REVISION, &rec)
+        cell.seed_for_test(&foreign_guard, INITIAL_REVISION, &rec)
     }));
     assert!(
         result.is_err(),
@@ -419,8 +420,8 @@ fn cell_open_reuses_the_same_pair_for_the_same_path_while_alive() {
     let cell_a = test_cell(path.clone());
     let cell_b = test_cell(path);
     assert_eq!(
-        cell_a.locks().token(),
-        cell_b.locks().token(),
+        cell_a.token(),
+        cell_b.token(),
         "two open() calls for the same live path must return the identical pair, never two independently-consistent ones that could race"
     );
 }
@@ -431,12 +432,12 @@ fn cell_open_creates_a_fresh_pair_once_the_prior_one_is_fully_dropped() {
     let path = dir.path().join("record");
     let token_a = {
         let cell_a = test_cell(path.clone());
-        cell_a.locks().token()
+        cell_a.token()
     }; // cell_a's only Arc dropped here
     let cell_b = test_cell(path);
     assert_ne!(
         token_a,
-        cell_b.locks().token(),
+        cell_b.token(),
         "sequential, non-overlapping reuse after a full drop is expected and safe"
     );
 }
@@ -462,8 +463,7 @@ fn load_canonical_rejects_non_canonical_map_key_order() {
     std::fs::write(&path, &buf).unwrap();
 
     let cell = test_cell(path);
-    let store = cell.store();
-    assert_eq!(store.load_canonical(), LoadOutcome::Corrupt);
+    assert_eq!(cell.load_canonical(), LoadOutcome::Corrupt);
 }
 
 #[test]
@@ -485,8 +485,7 @@ fn load_canonical_rejects_duplicate_map_key() {
     std::fs::write(&path, &buf).unwrap();
 
     let cell = test_cell(path);
-    let store = cell.store();
-    assert_eq!(store.load_canonical(), LoadOutcome::Corrupt);
+    assert_eq!(cell.load_canonical(), LoadOutcome::Corrupt);
 }
 
 #[test]
@@ -500,8 +499,7 @@ fn load_canonical_rejects_trailing_bytes_after_a_complete_value() {
     std::fs::write(&path, &buf).unwrap();
 
     let cell = test_cell(path);
-    let store = cell.store();
-    assert_eq!(store.load_canonical(), LoadOutcome::Corrupt);
+    assert_eq!(cell.load_canonical(), LoadOutcome::Corrupt);
 }
 
 #[test]
@@ -514,23 +512,20 @@ fn load_canonical_rejects_non_minimal_integer_encoding() {
     std::fs::write(&path, &buf).unwrap();
 
     let cell = test_cell(path);
-    let store = cell.store();
-    assert_eq!(store.load_canonical(), LoadOutcome::Corrupt);
+    assert_eq!(cell.load_canonical(), LoadOutcome::Corrupt);
 }
 
 #[test]
 fn store_write_then_read_round_trips_through_canonicalization() {
     let dir = tempfile::tempdir().unwrap();
     let cell = test_cell(dir.path().join("record"));
-    let store = cell.store();
-    let locks = cell.locks();
     let rec = MeshSignerControlRecordV1::bootstrap(identity(), PurposeId::MeshSession);
-    let g = locks.acquire_for_mutation();
+    let g = cell.acquire_for_mutation();
     assert_eq!(
-        store.replace_exact(&g, INITIAL_REVISION, &rec),
+        cell.seed_for_test(&g, INITIAL_REVISION, &rec),
         ReplaceOutcome::Committed
     );
-    let LoadOutcome::Exact(read_back) = store.load_canonical() else {
+    let LoadOutcome::Exact(read_back) = cell.load_canonical() else {
         panic!("expected record")
     };
     assert_eq!(*read_back, rec);
@@ -541,17 +536,20 @@ fn store_write_then_read_round_trips_through_canonicalization() {
 #[test]
 fn may_have_taken_effect_recovery_requires_a_real_committing_rewrite_not_a_reread() {
     let dir = tempfile::tempdir().unwrap();
-    // FaultInjectingStore is test-only and never used by production call
-    // paths (gc.rs/activate.rs), so it is exempt from the cell registry --
-    // see cell.rs's doc comment for why the registry exists specifically
-    // for FileBackedStore.
-    let locks = MeshSignerLocks::new(Arc::new(OrderSpy::new()));
-    let store = FaultInjectingStore::new(
+    // Round 5, item A2: FaultInjectingStore now goes through its own
+    // registry (`cell::open_fault_injecting`) too, same as FileBackedStore
+    // -- two independently-constructed pairs over the same path would
+    // alias/race exactly like the pre-registry bug this crate already
+    // closed for the real store.
+    let fi_cell = cell::open_fault_injecting(
         dir.path().join("record"),
-        locks.token(),
         identity(),
         PurposeId::MeshSession,
-    );
+        Arc::new(OrderSpy::new()),
+    )
+    .unwrap();
+    let store = fi_cell.store();
+    let locks = fi_cell.locks();
     let bootstrapped = MeshSignerControlRecordV1::bootstrap(identity(), PurposeId::MeshSession);
     {
         let g = locks.acquire_for_mutation();
@@ -580,7 +578,7 @@ fn may_have_taken_effect_recovery_requires_a_real_committing_rewrite_not_a_rerea
     let calls_before = store.calls();
     store.force_may_have_taken_effect_for_next_calls(3);
     let guard = locks.acquire_for_mutation();
-    commit_new_bytes(&store, &guard, bootstrapped.revision, &mutated, 10)
+    commit_new_bytes(store, &guard, bootstrapped.revision, &mutated, 10)
         .expect("recovery must keep issuing real committing rewrites until one actually succeeds");
 
     assert_eq!(
@@ -597,17 +595,17 @@ fn may_have_taken_effect_recovery_requires_a_real_committing_rewrite_not_a_rerea
 #[test]
 fn failpoint_known_no_effect_leaves_store_untouched() {
     let dir = tempfile::tempdir().unwrap();
-    // FaultInjectingStore is test-only and never used by production call
-    // paths (gc.rs/activate.rs), so it is exempt from the cell registry --
-    // see cell.rs's doc comment for why the registry exists specifically
-    // for FileBackedStore.
-    let locks = MeshSignerLocks::new(Arc::new(OrderSpy::new()));
-    let store = FaultInjectingStore::new(
+    // Round 5, item A2: see the sibling test above for why this now goes
+    // through the registry instead of constructing directly.
+    let fi_cell = cell::open_fault_injecting(
         dir.path().join("record"),
-        locks.token(),
         identity(),
         PurposeId::MeshSession,
-    );
+        Arc::new(OrderSpy::new()),
+    )
+    .unwrap();
+    let store = fi_cell.store();
+    let locks = fi_cell.locks();
     let rec = MeshSignerControlRecordV1::bootstrap(identity(), PurposeId::MeshSession);
 
     store.force_next_outcome(ReplaceOutcome::KnownNoEffect);
@@ -631,11 +629,9 @@ fn orphan_tmp_is_swept_without_blocking_future_attempts() {
     )
     .unwrap();
     let cell = test_cell(record_path.clone());
-    let store = cell.store();
-    let locks = cell.locks();
     {
-        let g = locks.acquire_for_mutation();
-        store.sweep_orphan_tmp(&g);
+        let g = cell.acquire_for_mutation();
+        cell.sweep_orphan_tmp(&g);
     }
     assert!(
         !record_path
@@ -644,9 +640,9 @@ fn orphan_tmp_is_swept_without_blocking_future_attempts() {
         "an orphan tmp targeting a revision below current (there is no current record at all, so it predates this session) must be removed"
     );
     let rec = MeshSignerControlRecordV1::bootstrap(identity(), PurposeId::MeshSession);
-    let g = locks.acquire_for_mutation();
+    let g = cell.acquire_for_mutation();
     assert_eq!(
-        store.replace_exact(&g, INITIAL_REVISION, &rec),
+        cell.seed_for_test(&g, INITIAL_REVISION, &rec),
         ReplaceOutcome::Committed
     );
 }
@@ -1588,10 +1584,11 @@ fn terminal_push_is_idempotent_for_identical_outcome() {
         outcome: TerminalOutcome::Activated {
             generation: NonZeroU64::new(1).unwrap(),
         },
+        request: activate_request(1),
         recorded_at: 10,
         acked: false,
     };
-    let v = push_bounded_terminal(vec![], r).unwrap();
+    let v = push_bounded_terminal(vec![], r.clone()).unwrap();
     let v2 = push_bounded_terminal(v.clone(), r).unwrap();
     assert_eq!(v, v2);
 }
@@ -1603,6 +1600,7 @@ fn terminal_push_fails_closed_on_outcome_conflict() {
         outcome: TerminalOutcome::Activated {
             generation: NonZeroU64::new(1).unwrap(),
         },
+        request: activate_request(1),
         recorded_at: 10,
         acked: false,
     };
@@ -1611,12 +1609,13 @@ fn terminal_push_fails_closed_on_outcome_conflict() {
         outcome: TerminalOutcome::Activated {
             generation: NonZeroU64::new(2).unwrap(),
         },
+        request: activate_request(2),
         recorded_at: 11,
         acked: false,
     };
     let v = push_bounded_terminal(vec![], r1).unwrap();
     let err = push_bounded_terminal(v, r2).unwrap_err();
-    assert_eq!(err, TerminalPushError::OutcomeConflict);
+    assert_eq!(err, TerminalPushError::RequestConflict);
 }
 
 #[test]
@@ -1630,6 +1629,7 @@ fn terminal_retention_exhausted_when_all_unacked() {
                 outcome: TerminalOutcome::Activated {
                     generation: NonZeroU64::new(1).unwrap(),
                 },
+                request: activate_request(1),
                 recorded_at: i as u64,
                 acked: false,
             },
@@ -1642,6 +1642,7 @@ fn terminal_retention_exhausted_when_all_unacked() {
         outcome: TerminalOutcome::Activated {
             generation: NonZeroU64::new(1).unwrap(),
         },
+        request: activate_request(1),
         recorded_at: 999,
         acked: false,
     };
@@ -1664,6 +1665,7 @@ fn terminal_ack_makes_the_oldest_acked_entry_evictable() {
                 outcome: TerminalOutcome::Activated {
                     generation: NonZeroU64::new(1).unwrap(),
                 },
+                request: activate_request(1),
                 recorded_at: i as u64,
                 acked: false,
             },
@@ -1679,6 +1681,7 @@ fn terminal_ack_makes_the_oldest_acked_entry_evictable() {
         outcome: TerminalOutcome::Activated {
             generation: NonZeroU64::new(1).unwrap(),
         },
+        request: activate_request(1),
         recorded_at: 999,
         acked: false,
     };
@@ -1962,20 +1965,17 @@ fn gc_inspected_transition_moves_awaiting_inspection_to_bound_pending() {
 fn gc_worker_requires_two_ticks_to_confirm_absent() {
     let dir = tempfile::tempdir().unwrap();
     let cell = test_cell(dir.path().join("record"));
-    let store = cell.store();
-    let locks = cell.locks();
     let s = slot(NonZeroU64::new(1).unwrap(), [83; 16]);
     let rec = record_with_gc_entries(vec![GcEntry::AwaitingInspection {
         slot: s.clone(),
         txn_id: [83; 16],
     }]);
-    seed_record(store, locks, &rec);
+    seed_record(&cell, &rec);
     let backend = FakeSecretBackend::new(); // deliberately empty throughout
-    let gc_serial = GcSerialLock::new();
 
-    let resolved_1 = gc_worker_tick(store, &backend, locks, &gc_serial, 1000, TEST_CAP).unwrap();
+    let resolved_1 = gc_worker_tick(&cell, &backend, 1000, TEST_CAP).unwrap();
     assert_eq!(resolved_1, 1);
-    let LoadOutcome::Exact(r1) = store.load_canonical() else {
+    let LoadOutcome::Exact(r1) = cell.load_canonical() else {
         panic!("expected record")
     };
     match &r1.gc_pending[0] {
@@ -1985,9 +1985,9 @@ fn gc_worker_requires_two_ticks_to_confirm_absent() {
 
     // Crash-resume: this second call is a completely fresh gc_worker_tick,
     // with nothing carried over except what tick 1 durably wrote.
-    let resolved_2 = gc_worker_tick(store, &backend, locks, &gc_serial, 2000, TEST_CAP).unwrap();
+    let resolved_2 = gc_worker_tick(&cell, &backend, 2000, TEST_CAP).unwrap();
     assert_eq!(resolved_2, 1);
-    let LoadOutcome::Exact(r2) = store.load_canonical() else {
+    let LoadOutcome::Exact(r2) = cell.load_canonical() else {
         panic!("expected record")
     };
     match &r2.gc_pending[0] {
@@ -2000,25 +2000,22 @@ fn gc_worker_requires_two_ticks_to_confirm_absent() {
 fn gc_worker_tick_drains_inspect_and_destroy_in_one_call_when_found() {
     let dir = tempfile::tempdir().unwrap();
     let cell = test_cell(dir.path().join("record"));
-    let store = cell.store();
-    let locks = cell.locks();
     let s = slot(NonZeroU64::new(1).unwrap(), [10; 16]);
     let rec = record_with_gc_entries(vec![GcEntry::AwaitingInspection {
         slot: s.clone(),
         txn_id: [10; 16],
     }]);
-    seed_record(store, locks, &rec);
+    seed_record(&cell, &rec);
 
     let backend = FakeSecretBackend::new();
     backend.create_or_inspect(&s, None); // seed a real item
 
-    let gc_serial = GcSerialLock::new();
-    let resolved = gc_worker_tick(store, &backend, locks, &gc_serial, 1000, TEST_CAP).unwrap();
+    let resolved = gc_worker_tick(&cell, &backend, 1000, TEST_CAP).unwrap();
     assert_eq!(
         resolved, 2,
         "one commit for GcInspected, one for GcResolved"
     );
-    let LoadOutcome::Exact(r) = store.load_canonical() else {
+    let LoadOutcome::Exact(r) = cell.load_canonical() else {
         panic!("expected record")
     };
     match &r.gc_pending[0] {
@@ -2031,8 +2028,6 @@ fn gc_worker_tick_drains_inspect_and_destroy_in_one_call_when_found() {
 fn gc_is_plural_resolves_multiple_independent_entries_in_one_tick() {
     let dir = tempfile::tempdir().unwrap();
     let cell = test_cell(dir.path().join("record"));
-    let store = cell.store();
-    let locks = cell.locks();
     let s1 = slot(NonZeroU64::new(1).unwrap(), [11; 16]);
     let s2 = slot(NonZeroU64::new(2).unwrap(), [12; 16]);
     let rec = record_with_gc_entries(vec![
@@ -2045,16 +2040,15 @@ fn gc_is_plural_resolves_multiple_independent_entries_in_one_tick() {
             txn_id: [12; 16],
         },
     ]);
-    seed_record(store, locks, &rec);
+    seed_record(&cell, &rec);
 
     let backend = FakeSecretBackend::new();
-    let gc_serial = GcSerialLock::new();
-    let resolved = gc_worker_tick(store, &backend, locks, &gc_serial, 1000, TEST_CAP).unwrap();
+    let resolved = gc_worker_tick(&cell, &backend, 1000, TEST_CAP).unwrap();
     assert_eq!(
         resolved, 2,
         "one tick must drain every independently-resolvable entry, not just the first"
     );
-    let LoadOutcome::Exact(r) = store.load_canonical() else {
+    let LoadOutcome::Exact(r) = cell.load_canonical() else {
         panic!("expected record")
     };
     assert!(
@@ -2068,8 +2062,6 @@ fn gc_is_plural_resolves_multiple_independent_entries_in_one_tick() {
 fn gc_reprocesses_a_pending_bound_entry_next_tick_never_stuck() {
     let dir = tempfile::tempdir().unwrap();
     let cell = test_cell(dir.path().join("record"));
-    let store = cell.store();
-    let locks = cell.locks();
     let s = slot(NonZeroU64::new(1).unwrap(), [13; 16]);
     let b = binding(s.clone());
     let rec = record_with_gc_entries(vec![GcEntry::Bound {
@@ -2078,18 +2070,17 @@ fn gc_reprocesses_a_pending_bound_entry_next_tick_never_stuck() {
         binding: b.clone(),
         state: GcState::Pending,
     }]);
-    seed_record(store, locks, &rec);
+    seed_record(&cell, &rec);
 
     let backend = FakeSecretBackend::new();
     backend.create_or_inspect(&s, Some(&b));
 
-    let gc_serial = GcSerialLock::new();
-    let resolved = gc_worker_tick(store, &backend, locks, &gc_serial, 1000, TEST_CAP).unwrap();
+    let resolved = gc_worker_tick(&cell, &backend, 1000, TEST_CAP).unwrap();
     assert_eq!(
         resolved, 1,
         "a Pending entry from a crashed prior tick must be retried, not skipped forever"
     );
-    let LoadOutcome::Exact(r) = store.load_canonical() else {
+    let LoadOutcome::Exact(r) = cell.load_canonical() else {
         panic!("expected record")
     };
     match &r.gc_pending[0] {
@@ -2102,8 +2093,6 @@ fn gc_reprocesses_a_pending_bound_entry_next_tick_never_stuck() {
 fn gc_resolved_quarantines_on_backend_reported_mismatch() {
     let dir = tempfile::tempdir().unwrap();
     let cell = test_cell(dir.path().join("record"));
-    let store = cell.store();
-    let locks = cell.locks();
     let s = slot(NonZeroU64::new(1).unwrap(), [70; 16]);
     let expected_binding = binding(s.clone());
     let mut actual_binding = expected_binding.clone();
@@ -2115,14 +2104,13 @@ fn gc_resolved_quarantines_on_backend_reported_mismatch() {
         binding: expected_binding.clone(),
         state: GcState::Pending,
     }]);
-    seed_record(store, locks, &rec);
+    seed_record(&cell, &rec);
     let backend = FakeSecretBackend::new();
     backend.create_or_inspect(&s, Some(&actual_binding));
 
-    let gc_serial = GcSerialLock::new();
-    let resolved = gc_worker_tick(store, &backend, locks, &gc_serial, 1000, TEST_CAP).unwrap();
+    let resolved = gc_worker_tick(&cell, &backend, 1000, TEST_CAP).unwrap();
     assert_eq!(resolved, 1);
-    let LoadOutcome::Exact(r) = store.load_canonical() else {
+    let LoadOutcome::Exact(r) = cell.load_canonical() else {
         panic!("expected record")
     };
     match &r.gc_pending[0] {
@@ -2173,8 +2161,6 @@ impl SecretBackend for IndeterminateOnceBackend {
 fn gc_indeterminate_entry_does_not_block_other_entries_in_the_same_tick() {
     let dir = tempfile::tempdir().unwrap();
     let cell = test_cell(dir.path().join("record"));
-    let store = cell.store();
-    let locks = cell.locks();
     let s_indeterminate = slot(NonZeroU64::new(1).unwrap(), [60; 16]);
     let s_ok = slot(NonZeroU64::new(2).unwrap(), [61; 16]);
     let b_indeterminate = binding(s_indeterminate.clone());
@@ -2193,21 +2179,20 @@ fn gc_indeterminate_entry_does_not_block_other_entries_in_the_same_tick() {
             state: GcState::Pending,
         },
     ]);
-    seed_record(store, locks, &rec);
+    seed_record(&cell, &rec);
 
     let fake = FakeSecretBackend::new();
     fake.create_or_inspect(&s_indeterminate, Some(&b_indeterminate));
     fake.create_or_inspect(&s_ok, Some(&b_ok));
     let backend = IndeterminateOnceBackend::new(fake, s_indeterminate.canonical_id());
 
-    let gc_serial = GcSerialLock::new();
-    let resolved = gc_worker_tick(store, &backend, locks, &gc_serial, 1000, TEST_CAP).unwrap();
+    let resolved = gc_worker_tick(&cell, &backend, 1000, TEST_CAP).unwrap();
     assert_eq!(
         resolved, 1,
         "only the non-indeterminate entry resolves this tick"
     );
 
-    let LoadOutcome::Exact(r) = store.load_canonical() else {
+    let LoadOutcome::Exact(r) = cell.load_canonical() else {
         panic!("expected record")
     };
     let ok_entry = r
@@ -2238,8 +2223,6 @@ fn gc_indeterminate_entry_does_not_block_other_entries_in_the_same_tick() {
 fn gc_removal_pass_removes_done_and_absent_entries() {
     let dir = tempfile::tempdir().unwrap();
     let cell = test_cell(dir.path().join("record"));
-    let store = cell.store();
-    let locks = cell.locks();
     let s1 = slot(NonZeroU64::new(1).unwrap(), [90; 16]);
     let s2 = slot(NonZeroU64::new(2).unwrap(), [91; 16]);
     let rec = record_with_gc_entries(vec![
@@ -2254,10 +2237,10 @@ fn gc_removal_pass_removes_done_and_absent_entries() {
             txn_id: [91; 16],
         },
     ]);
-    seed_record(store, locks, &rec);
-    let removed = gc_removal_pass(store, locks, 1000, TEST_CAP).unwrap();
+    seed_record(&cell, &rec);
+    let removed = gc_removal_pass(&cell, 1000, TEST_CAP).unwrap();
     assert_eq!(removed, 2);
-    let LoadOutcome::Exact(r) = store.load_canonical() else {
+    let LoadOutcome::Exact(r) = cell.load_canonical() else {
         panic!("expected record")
     };
     assert!(r.gc_pending.is_empty());
@@ -2465,13 +2448,11 @@ fn pending_intent_record() -> (MeshSignerControlRecordV1, PendingOp) {
 fn activate_from_key_observed_rejects_purpose_type_mismatch() {
     let dir = tempfile::tempdir().unwrap();
     let cell = test_cell(dir.path().join("record"));
-    let store = cell.store();
-    let locks = cell.locks();
     let old = MeshSignerControlRecordV1::bootstrap(identity(), PurposeId::MeshSession);
     {
-        let g = locks.acquire_for_mutation();
+        let g = cell.acquire_for_mutation();
         assert_eq!(
-            store.replace_exact(&g, INITIAL_REVISION, &old),
+            cell.seed_for_test(&g, INITIAL_REVISION, &old),
             ReplaceOutcome::Committed
         );
     }
@@ -2484,13 +2465,12 @@ fn activate_from_key_observed_rejects_purpose_type_mismatch() {
     // never left to whatever domain/profile the caller's delegation
     // happens to claim.
     let err = activate_from_key_observed::<RosterSyncPurpose>(
-        store,
+        &cell,
         &backend,
-        locks,
         &active_roster(),
         &AlwaysTrueVerifier,
         &policy,
-        &ctx(),
+        [0; 16],
         d,
         50,
         TEST_CAP,
@@ -2506,18 +2486,16 @@ fn activate_from_key_observed_rejects_purpose_type_mismatch() {
 fn activate_from_key_observed_rejects_when_physical_key_not_confirmed() {
     let dir = tempfile::tempdir().unwrap();
     let cell = test_cell(dir.path().join("record"));
-    let store = cell.store();
-    let locks = cell.locks();
     let (with_intent, p) = pending_intent_record();
     {
-        let g = locks.acquire_for_mutation();
+        let g = cell.acquire_for_mutation();
         let base = MeshSignerControlRecordV1::bootstrap(identity(), PurposeId::MeshSession);
         assert_eq!(
-            store.replace_exact(&g, INITIAL_REVISION, &base),
+            cell.seed_for_test(&g, INITIAL_REVISION, &base),
             ReplaceOutcome::Committed
         );
         assert_eq!(
-            store.replace_exact(&g, base.revision, &with_intent),
+            cell.seed_for_test(&g, base.revision, &with_intent),
             ReplaceOutcome::Committed
         );
     }
@@ -2539,9 +2517,9 @@ fn activate_from_key_observed_rejects_when_physical_key_not_confirmed() {
     )
     .unwrap();
     {
-        let g = locks.acquire_for_mutation();
+        let g = cell.acquire_for_mutation();
         assert_eq!(
-            store.replace_exact(&g, with_intent.revision, &with_binding),
+            cell.seed_for_test(&g, with_intent.revision, &with_binding),
             ReplaceOutcome::Committed
         );
     }
@@ -2553,13 +2531,12 @@ fn activate_from_key_observed_rejects_when_physical_key_not_confirmed() {
     d.delegated_key_id = p.canonical_slot.canonical_id();
 
     let err = activate_from_key_observed::<MeshSessionPurpose>(
-        store,
+        &cell,
         &backend,
-        locks,
         &active_roster(),
         &AlwaysTrueVerifier,
         &policy,
-        &ctx(),
+        p.txn_id,
         d,
         50,
         TEST_CAP,
@@ -2572,8 +2549,6 @@ fn activate_from_key_observed_rejects_when_physical_key_not_confirmed() {
 fn activate_from_key_observed_succeeds_full_path() {
     let dir = tempfile::tempdir().unwrap();
     let cell = test_cell(dir.path().join("record"));
-    let store = cell.store();
-    let locks = cell.locks();
     let old = MeshSignerControlRecordV1::bootstrap(identity(), PurposeId::MeshSession);
     let with_intent = apply(
         &old,
@@ -2587,13 +2562,13 @@ fn activate_from_key_observed_succeeds_full_path() {
     )
     .unwrap();
     {
-        let g = locks.acquire_for_mutation();
+        let g = cell.acquire_for_mutation();
         assert_eq!(
-            store.replace_exact(&g, INITIAL_REVISION, &old),
+            cell.seed_for_test(&g, INITIAL_REVISION, &old),
             ReplaceOutcome::Committed
         );
         assert_eq!(
-            store.replace_exact(&g, old.revision, &with_intent),
+            cell.seed_for_test(&g, old.revision, &with_intent),
             ReplaceOutcome::Committed
         );
     }
@@ -2625,9 +2600,9 @@ fn activate_from_key_observed_succeeds_full_path() {
     )
     .unwrap();
     {
-        let g = locks.acquire_for_mutation();
+        let g = cell.acquire_for_mutation();
         assert_eq!(
-            store.replace_exact(&g, with_intent.revision, &with_binding),
+            cell.seed_for_test(&g, with_intent.revision, &with_binding),
             ReplaceOutcome::Committed
         );
     }
@@ -2638,13 +2613,12 @@ fn activate_from_key_observed_succeeds_full_path() {
     d.delegated_pub = real_binding.public_key.clone();
 
     let activated = activate_from_key_observed::<MeshSessionPurpose>(
-        store,
+        &cell,
         &backend,
-        locks,
         &active_roster(),
         &AlwaysTrueVerifier,
         &policy,
-        &ctx(),
+        p.txn_id,
         d,
         50,
         TEST_CAP,
@@ -2668,7 +2642,6 @@ fn revalidate_on_load_rejects_purpose_type_mismatch() {
     let policy = DelegationPolicy::test(1000);
     let err = revalidate_on_load::<RosterSyncPurpose>(
         &record,
-        &ctx(),
         &policy,
         &active_roster(),
         &AlwaysTrueVerifier,
@@ -2685,7 +2658,6 @@ fn revalidate_on_load_detects_roster_revocation() {
     let revoked_roster = FixedRoster(RosterCurrency::Revoked);
     let err = revalidate_on_load::<MeshSessionPurpose>(
         &rotated,
-        &ctx(),
         &policy,
         &revoked_roster,
         &AlwaysTrueVerifier,
@@ -2721,13 +2693,11 @@ impl RosterLookup for BlockingRoster {
 fn activate_does_not_block_a_concurrent_urgent_revoke_during_slow_roster_lookup() {
     let dir = tempfile::tempdir().unwrap();
     let cell = test_cell(dir.path().join("record"));
-    let store = cell.store();
-    let locks = cell.locks();
     let old = MeshSignerControlRecordV1::bootstrap(identity(), PurposeId::MeshSession);
     {
-        let g = locks.acquire_for_mutation();
+        let g = cell.acquire_for_mutation();
         assert_eq!(
-            store.replace_exact(&g, INITIAL_REVISION, &old),
+            cell.seed_for_test(&g, INITIAL_REVISION, &old),
             ReplaceOutcome::Committed
         );
     }
@@ -2768,13 +2738,13 @@ fn activate_does_not_block_a_concurrent_urgent_revoke_during_slow_roster_lookup(
     )
     .unwrap();
     {
-        let g = locks.acquire_for_mutation();
+        let g = cell.acquire_for_mutation();
         assert_eq!(
-            store.replace_exact(&g, old.revision, &with_intent),
+            cell.seed_for_test(&g, old.revision, &with_intent),
             ReplaceOutcome::Committed
         );
         assert_eq!(
-            store.replace_exact(&g, with_intent.revision, &with_binding),
+            cell.seed_for_test(&g, with_intent.revision, &with_binding),
             ReplaceOutcome::Committed
         );
     }
@@ -2793,13 +2763,12 @@ fn activate_does_not_block_a_concurrent_urgent_revoke_during_slow_roster_lookup(
     std::thread::scope(|scope| {
         let activate_handle = scope.spawn(|| {
             activate_from_key_observed::<MeshSessionPurpose>(
-                store,
+                &cell,
                 &backend,
-                locks,
                 &roster,
                 &AlwaysTrueVerifier,
                 &policy,
-                &ctx(),
+                p.txn_id,
                 d,
                 50,
                 TEST_CAP,
@@ -2813,7 +2782,7 @@ fn activate_does_not_block_a_concurrent_urgent_revoke_during_slow_roster_lookup(
         // While activate is blocked in the roster lookup, an urgent revoke
         // must still be able to proceed -- proving no exclusive guard is
         // held across that call.
-        let revoke_g = locks.acquire_for_mutation();
+        let revoke_g = cell.acquire_for_mutation();
         let revoked = apply(
             &with_binding,
             &RecordTransition::RevokeUrgent {
@@ -2825,7 +2794,7 @@ fn activate_does_not_block_a_concurrent_urgent_revoke_during_slow_roster_lookup(
         )
         .unwrap();
         assert_eq!(
-            store.replace_exact(&revoke_g, with_binding.revision, &revoked),
+            cell.seed_for_test(&revoke_g, with_binding.revision, &revoked),
             ReplaceOutcome::Committed,
             "revoke must be able to commit while activate is still busy with I/O"
         );
@@ -2839,7 +2808,9 @@ fn activate_does_not_block_a_concurrent_urgent_revoke_during_slow_roster_lookup(
         assert!(
             matches!(
                 result,
-                Err(ActivateError::Transition(TransitionError::NoPendingOp))
+                Err(ActivateError::Commit(CommitTransitionError::Transition(
+                    TransitionError::NoPendingOp
+                )))
             ),
             "activate must reject once it sees the revoke that preempted it, got {result:?}"
         );
@@ -2870,22 +2841,19 @@ impl SecretBackend for ConflictBackend {
 fn gc_worker_persists_inspection_conflict_and_excludes_it_from_retry() {
     let dir = tempfile::tempdir().unwrap();
     let cell = test_cell(dir.path().join("record"));
-    let store = cell.store();
-    let locks = cell.locks();
     let s = slot(NonZeroU64::new(1).unwrap(), [95; 16]);
     let rec = record_with_gc_entries(vec![GcEntry::AwaitingInspection {
         slot: s.clone(),
         txn_id: [95; 16],
     }]);
-    seed_record(store, locks, &rec);
+    seed_record(&cell, &rec);
 
     let backend = ConflictBackend {
         inner: FakeSecretBackend::new(),
     };
-    let gc_serial = GcSerialLock::new();
-    let resolved = gc_worker_tick(store, &backend, locks, &gc_serial, 1000, TEST_CAP).unwrap();
+    let resolved = gc_worker_tick(&cell, &backend, 1000, TEST_CAP).unwrap();
     assert_eq!(resolved, 1);
-    let LoadOutcome::Exact(r) = store.load_canonical() else {
+    let LoadOutcome::Exact(r) = cell.load_canonical() else {
         panic!("expected record")
     };
     match &r.gc_pending[0] {
@@ -2896,9 +2864,732 @@ fn gc_worker_persists_inspection_conflict_and_excludes_it_from_retry() {
     // A second tick must never reprocess it -- it stays excluded from
     // automatic retry pending administrative resolution, not silently
     // retried forever with no durable trace.
-    let resolved_2 = gc_worker_tick(store, &backend, locks, &gc_serial, 2000, TEST_CAP).unwrap();
+    let resolved_2 = gc_worker_tick(&cell, &backend, 2000, TEST_CAP).unwrap();
     assert_eq!(
         resolved_2, 0,
         "InspectionConflict must never be auto-retried"
     );
+}
+
+// ══════════════════════════════════════════════════════════════════════
+// Round 5 REDs/POS -- one section per audited finding on c5fb2da5.
+// ══════════════════════════════════════════════════════════════════════
+
+// ── C6: closed CBOR shape must reject an unknown field NESTED inside a
+// substruct, not just at the top level ──────────────────────────────────
+
+#[test]
+fn load_canonical_rejects_an_unknown_field_nested_inside_a_substruct() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("record");
+    let cell = test_cell(path.clone());
+    let rec = MeshSignerControlRecordV1::bootstrap(identity(), PurposeId::MeshSession);
+    {
+        let g = cell.acquire_for_mutation();
+        assert_eq!(
+            cell.seed_for_test(&g, INITIAL_REVISION, &rec),
+            ReplaceOutcome::Committed
+        );
+    }
+    // Read back the REAL canonical bytes this store just wrote, decode to
+    // the generic Value tree, and inject an extra key nested inside
+    // `identity` -- a key the generic Value round-trip preserves
+    // faithfully (so the bytes still pass the canonical-encoding check),
+    // but that the TYPED decode of `ControlIdentity` must now reject via
+    // `deny_unknown_fields`. Before that fix, serde's default behavior
+    // would have silently dropped this key and returned `Some(record)`
+    // anyway -- a load that claimed `Exact` for content it did not
+    // actually fully account for.
+    let bytes = std::fs::read(&path).unwrap();
+    let mut value: ciborium::Value = ciborium::from_reader(bytes.as_slice()).unwrap();
+    {
+        let ciborium::Value::Map(top) = &mut value else {
+            panic!("expected top-level map")
+        };
+        let (_, identity_val) = top
+            .iter_mut()
+            .find(|(k, _)| k.as_text() == Some("identity"))
+            .expect("record must have an identity field");
+        let ciborium::Value::Map(identity_map) = identity_val else {
+            panic!("expected identity to be a map")
+        };
+        identity_map.push((
+            ciborium::Value::Text("bogus_extra_field".into()),
+            ciborium::Value::Bool(true),
+        ));
+    }
+    let value = test_canonicalize(value);
+    let mut out = Vec::new();
+    ciborium::into_writer(&value, &mut out).unwrap();
+    std::fs::write(&path, &out).unwrap();
+
+    assert_eq!(cell.load_canonical(), LoadOutcome::Corrupt);
+}
+
+/// Local mirror of `store::canonicalize_value` (private to that module) --
+/// sorts every map's entries into RFC 8949 §4.2.3 canonical key order using
+/// the same `ciborium::value::CanonicalValue` comparator, so hand-mutated
+/// fixtures in these tests can be re-encoded into a form the real store's
+/// own canonical round-trip check will accept.
+fn test_canonicalize(v: ciborium::Value) -> ciborium::Value {
+    use ciborium::Value;
+    use ciborium::value::CanonicalValue;
+    match v {
+        Value::Array(items) => Value::Array(items.into_iter().map(test_canonicalize).collect()),
+        Value::Map(entries) => {
+            let mut entries: Vec<_> = entries
+                .into_iter()
+                .map(|(k, val)| (test_canonicalize(k), test_canonicalize(val)))
+                .collect();
+            entries.sort_by(|(k1, _), (k2, _)| {
+                CanonicalValue::from(k1.clone()).cmp(&CanonicalValue::from(k2.clone()))
+            });
+            Value::Map(entries)
+        }
+        Value::Tag(t, inner) => Value::Tag(t, Box::new(test_canonicalize(*inner))),
+        other => other,
+    }
+}
+
+// ── C7: byte-holding fields must encode as CBOR bstr, not array-of-ints ──
+
+#[test]
+fn byte_holding_fields_encode_as_cbor_bstr_not_array_of_ints() {
+    // Verified empirically via a standalone probe crate before this fix:
+    // Vec<u8>/[u8;N] serialize as CBOR arrays of individual integers by
+    // DEFAULT, not byte strings, unless `#[serde(with = "serde_bytes")]`
+    // is present. This asserts the actual wire form of real fields, not
+    // just that they round-trip.
+    let s = slot(NonZeroU64::new(1).unwrap(), [0xAB; 16]);
+    let mut bytes = Vec::new();
+    ciborium::into_writer(&s, &mut bytes).unwrap();
+    let value: ciborium::Value = ciborium::from_reader(bytes.as_slice()).unwrap();
+    let ciborium::Value::Map(entries) = value else {
+        panic!("expected map")
+    };
+    let (_, txn_id_value) = entries
+        .iter()
+        .find(|(k, _)| k.as_text() == Some("txn_id"))
+        .unwrap();
+    assert_eq!(
+        txn_id_value,
+        &ciborium::Value::Bytes(vec![0xAB; 16]),
+        "txn_id must encode as a CBOR byte string (major type 2), not an array of integers"
+    );
+    let (_, digest_value) = entries
+        .iter()
+        .find(|(k, _)| k.as_text() == Some("identity_digest"))
+        .unwrap();
+    assert!(
+        matches!(digest_value, ciborium::Value::Bytes(_)),
+        "identity_digest must also encode as bstr, got {digest_value:?}"
+    );
+}
+
+// ── C8: MeshSessionPurpose's ratified production scope is an EXACT set ──
+// (roles + transcript_kinds), not a nonempty subset -- see
+// validator::DelegationScopePolicy's doc comment for provenance: this is a
+// NEW integration clause, not a citation from the frozen B-SESSAO v6 wire
+// schema, which declares both fields as open lists.
+
+fn mesh_session_generation_record(d: Delegation, b: ExactBinding) -> GenerationRecord {
+    GenerationRecord {
+        generation: NonZeroU64::new(1).unwrap(),
+        delegation: d,
+        binding: b,
+        not_after: 100,
+    }
+}
+
+#[test]
+fn mesh_session_delegation_roles_subset_is_rejected() {
+    let s = slot(NonZeroU64::new(1).unwrap(), [120; 16]);
+    let b = binding(s.clone());
+    let mut d = delegation(0, 100);
+    d.delegated_key_id = s.canonical_id();
+    d.delegated_pub = b.public_key.clone();
+    d.roles = vec!["initiator".into()]; // missing "responder"
+    let policy = DelegationPolicy::test(1000);
+    let err = validate_full_binding::<MeshSessionPurpose>(
+        &mesh_session_generation_record(d, b),
+        &ctx(),
+        &policy,
+        &active_roster(),
+        &AlwaysTrueVerifier,
+        50,
+    )
+    .unwrap_err();
+    assert_eq!(err, ValidationError::RoleScopeMismatch);
+}
+
+#[test]
+fn mesh_session_delegation_roles_extra_is_rejected() {
+    let s = slot(NonZeroU64::new(1).unwrap(), [121; 16]);
+    let b = binding(s.clone());
+    let mut d = delegation(0, 100);
+    d.delegated_key_id = s.canonical_id();
+    d.delegated_pub = b.public_key.clone();
+    d.roles = vec!["initiator".into(), "responder".into(), "observer".into()]; // extra beyond the ratified scope
+    let policy = DelegationPolicy::test(1000);
+    let err = validate_full_binding::<MeshSessionPurpose>(
+        &mesh_session_generation_record(d, b),
+        &ctx(),
+        &policy,
+        &active_roster(),
+        &AlwaysTrueVerifier,
+        50,
+    )
+    .unwrap_err();
+    assert_eq!(err, ValidationError::RoleScopeMismatch);
+}
+
+#[test]
+fn mesh_session_delegation_roles_duplicate_is_rejected() {
+    let s = slot(NonZeroU64::new(1).unwrap(), [122; 16]);
+    let b = binding(s.clone());
+    let mut d = delegation(0, 100);
+    d.delegated_key_id = s.canonical_id();
+    d.delegated_pub = b.public_key.clone();
+    // Same length as the ratified scope, but "responder" is missing and
+    // "initiator" is duplicated -- must be rejected on the duplicate check,
+    // never silently collapsed to a set and treated as valid.
+    d.roles = vec!["initiator".into(), "initiator".into()];
+    let policy = DelegationPolicy::test(1000);
+    let err = validate_full_binding::<MeshSessionPurpose>(
+        &mesh_session_generation_record(d, b),
+        &ctx(),
+        &policy,
+        &active_roster(),
+        &AlwaysTrueVerifier,
+        50,
+    )
+    .unwrap_err();
+    assert_eq!(err, ValidationError::RoleScopeMismatch);
+}
+
+#[test]
+fn mesh_session_delegation_transcript_kinds_subset_is_rejected() {
+    let s = slot(NonZeroU64::new(1).unwrap(), [123; 16]);
+    let b = binding(s.clone());
+    let mut d = delegation(0, 100);
+    d.delegated_key_id = s.canonical_id();
+    d.delegated_pub = b.public_key.clone();
+    d.transcript_kinds = vec!["final-confirm".into(), "activate".into()]; // missing "activate-ack"
+    let policy = DelegationPolicy::test(1000);
+    let err = validate_full_binding::<MeshSessionPurpose>(
+        &mesh_session_generation_record(d, b),
+        &ctx(),
+        &policy,
+        &active_roster(),
+        &AlwaysTrueVerifier,
+        50,
+    )
+    .unwrap_err();
+    assert_eq!(err, ValidationError::TranscriptKindsScopeMismatch);
+}
+
+#[test]
+fn mesh_session_delegation_channel_mismatch_is_rejected() {
+    let s = slot(NonZeroU64::new(1).unwrap(), [124; 16]);
+    let b = binding(s.clone());
+    let mut d = delegation(0, 100);
+    d.delegated_key_id = s.canonical_id();
+    d.delegated_pub = b.public_key.clone();
+    d.channel = Channel::Release; // ctx() below is Dev
+    let policy = DelegationPolicy::test(1000);
+    let err = validate_full_binding::<MeshSessionPurpose>(
+        &mesh_session_generation_record(d, b),
+        &ctx(),
+        &policy,
+        &active_roster(),
+        &AlwaysTrueVerifier,
+        50,
+    )
+    .unwrap_err();
+    assert_eq!(err, ValidationError::ChannelMismatch);
+}
+
+#[test]
+fn mesh_session_delegation_exact_scope_is_accepted() {
+    // POS: the default fixture's roles/transcript_kinds are exactly the
+    // ratified scope -- confirms the exact-match case itself is accepted,
+    // not just that deviations are rejected.
+    let s = slot(NonZeroU64::new(1).unwrap(), [125; 16]);
+    let b = binding(s.clone());
+    let mut d = delegation(0, 100);
+    d.delegated_key_id = s.canonical_id();
+    d.delegated_pub = b.public_key.clone();
+    assert_eq!(d.roles, vec!["initiator", "responder"]);
+    assert_eq!(
+        d.transcript_kinds,
+        vec!["final-confirm", "activate", "activate-ack"]
+    );
+    let policy = DelegationPolicy::test(1000);
+    validate_full_binding::<MeshSessionPurpose>(
+        &mesh_session_generation_record(d, b),
+        &ctx(),
+        &policy,
+        &active_roster(),
+        &AlwaysTrueVerifier,
+        50,
+    )
+    .expect("the exact ratified scope must be accepted");
+}
+
+// ── A1: cell registry must validate identity/purpose on reuse, not hand
+// back a live cell for a mismatched request ──────────────────────────────
+
+#[test]
+fn cell_open_rejects_reuse_of_a_live_path_for_a_different_identity() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("record");
+    let _cell_a = test_cell(path.clone()); // held alive for the whole test
+    let mut other = identity();
+    other.hh_id = "hh_other".into();
+    match cell::open(
+        path,
+        other,
+        PurposeId::MeshSession,
+        Arc::new(OrderSpy::new()),
+    ) {
+        Err(e) => assert_eq!(e, OpenConflict),
+        Ok(_) => panic!("expected OpenConflict on identity mismatch"),
+    }
+}
+
+#[test]
+fn cell_open_rejects_reuse_of_a_live_path_for_a_different_purpose() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("record");
+    let _cell_a = test_cell(path.clone());
+    match cell::open(
+        path,
+        identity(),
+        PurposeId::RosterSync,
+        Arc::new(OrderSpy::new()),
+    ) {
+        Err(e) => assert_eq!(e, OpenConflict),
+        Ok(_) => panic!("expected OpenConflict on purpose mismatch"),
+    }
+}
+
+// ── A2: FaultInjectingStore goes through its own registry too ───────────
+
+#[test]
+fn open_fault_injecting_reuses_the_same_pair_and_rejects_identity_mismatch() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("record");
+    let cell_a = cell::open_fault_injecting(
+        path.clone(),
+        identity(),
+        PurposeId::MeshSession,
+        Arc::new(OrderSpy::new()),
+    )
+    .unwrap();
+    let cell_b = cell::open_fault_injecting(
+        path.clone(),
+        identity(),
+        PurposeId::MeshSession,
+        Arc::new(OrderSpy::new()),
+    )
+    .unwrap();
+    assert!(
+        Arc::ptr_eq(&cell_a, &cell_b),
+        "same path, same identity/purpose, still live -- must reuse the same pair"
+    );
+
+    let mut other = identity();
+    other.hh_id = "hh_other".into();
+    match cell::open_fault_injecting(
+        path,
+        other,
+        PurposeId::MeshSession,
+        Arc::new(OrderSpy::new()),
+    ) {
+        Err(e) => assert_eq!(e, OpenConflict),
+        Ok(_) => panic!("expected OpenConflict on identity mismatch"),
+    }
+}
+
+// ── B5: KeyObserved's binding must be for the pending op's OWN slot; the
+// fake backend must reject an expected_binding whose own .slot disagrees
+// with the key it is being stored under ─────────────────────────────────
+
+#[test]
+fn key_observed_rejects_a_binding_whose_slot_does_not_match_the_pending_ops_canonical_slot() {
+    let old = MeshSignerControlRecordV1::bootstrap(identity(), PurposeId::MeshSession);
+    let with_intent = apply(
+        &old,
+        &RecordTransition::IntentRecorded {
+            txn_id: [8; 16],
+            kind: PendingOpKind::Create,
+            backend: BackendKind::File,
+        },
+        1000,
+        TEST_CAP,
+    )
+    .unwrap();
+    let p = with_intent.pending_op.clone().unwrap();
+
+    // A binding for an unrelated slot -- different generation, so its
+    // canonical_id() differs from p.canonical_slot's.
+    let wrong_slot = slot(NonZeroU64::new(999).unwrap(), [9; 16]);
+    let err = apply(
+        &with_intent,
+        &RecordTransition::KeyObserved {
+            expected_txn_id: p.txn_id,
+            expected_kind: p.kind,
+            expected_generation: p.generation,
+            expected_epoch: p.epoch,
+            expected_purpose: p.purpose,
+            expected_slot_id: p.canonical_slot.canonical_id(),
+            expected_revision: with_intent.revision,
+            binding: binding(wrong_slot),
+        },
+        1000,
+        TEST_CAP,
+    )
+    .unwrap_err();
+    assert_eq!(err, TransitionError::BindingSlotMismatch);
+}
+
+#[test]
+fn fake_secret_backend_rejects_an_expected_binding_whose_own_slot_disagrees_with_the_key() {
+    let backend = FakeSecretBackend::new();
+    let target_slot = slot(NonZeroU64::new(1).unwrap(), [30; 16]);
+    let mismatched_binding = binding(slot(NonZeroU64::new(2).unwrap(), [31; 16])); // .slot claims a DIFFERENT slot
+    let outcome = backend.create_or_inspect(&target_slot, Some(&mismatched_binding));
+    assert_eq!(outcome, CreateOutcome::Conflict);
+}
+
+// ── D9: idempotent replay compares the FULL request, not just the outcome
+// variant; IntentRecorded/ReactivateFromRevoked reject reusing a txn_id
+// that already has a terminal result; a self-colliding
+// txn_id/next_txn_id pair is structurally safe, not silently corrupting ──
+
+#[test]
+fn activate_replay_with_a_different_delegation_for_the_same_txn_id_fails_closed() {
+    let old = MeshSignerControlRecordV1::bootstrap(identity(), PurposeId::MeshSession);
+    let with_intent = apply(
+        &old,
+        &RecordTransition::IntentRecorded {
+            txn_id: [7; 16],
+            kind: PendingOpKind::Create,
+            backend: BackendKind::File,
+        },
+        1000,
+        TEST_CAP,
+    )
+    .unwrap();
+    let p = with_intent.pending_op.clone().unwrap();
+    let with_binding = apply(
+        &with_intent,
+        &RecordTransition::KeyObserved {
+            expected_txn_id: p.txn_id,
+            expected_kind: p.kind,
+            expected_generation: p.generation,
+            expected_epoch: p.epoch,
+            expected_purpose: p.purpose,
+            expected_slot_id: p.canonical_slot.canonical_id(),
+            expected_revision: with_intent.revision,
+            binding: binding(p.canonical_slot.clone()),
+        },
+        1000,
+        TEST_CAP,
+    )
+    .unwrap();
+
+    let mut d1 = delegation(0, 100);
+    d1.delegated_key_id = p.canonical_slot.canonical_id();
+    d1.delegated_pub = binding(p.canonical_slot.clone()).public_key;
+    let activated = apply(
+        &with_binding,
+        &RecordTransition::ActivateFromKeyObserved {
+            expected_txn_id: p.txn_id,
+            expected_kind: p.kind,
+            expected_generation: p.generation,
+            expected_epoch: p.epoch,
+            expected_purpose: p.purpose,
+            expected_slot_id: p.canonical_slot.canonical_id(),
+            expected_revision: with_binding.revision,
+            delegation: d1.clone(),
+        },
+        1000,
+        TEST_CAP,
+    )
+    .unwrap();
+
+    // A retry of the SAME txn_id but with a DIFFERENT delegation (here:
+    // different not_after) must be rejected, never silently accepted as
+    // "the same replay" via a wildcard match on just the outcome variant.
+    let mut d2 = d1.clone();
+    d2.not_after = 200;
+    let err = apply(
+        &activated,
+        &RecordTransition::ActivateFromKeyObserved {
+            expected_txn_id: p.txn_id,
+            expected_kind: p.kind,
+            expected_generation: p.generation,
+            expected_epoch: p.epoch,
+            expected_purpose: p.purpose,
+            expected_slot_id: p.canonical_slot.canonical_id(),
+            expected_revision: activated.revision,
+            delegation: d2,
+        },
+        1000,
+        TEST_CAP,
+    )
+    .unwrap_err();
+    assert_eq!(err, TransitionError::TerminalTxnReused);
+
+    // Meanwhile the TRUE replay (byte-identical request) must still
+    // succeed as a no-op, proving this isn't just "reject everything."
+    let replayed = apply(
+        &activated,
+        &RecordTransition::ActivateFromKeyObserved {
+            expected_txn_id: p.txn_id,
+            expected_kind: p.kind,
+            expected_generation: p.generation,
+            expected_epoch: p.epoch,
+            expected_purpose: p.purpose,
+            expected_slot_id: p.canonical_slot.canonical_id(),
+            expected_revision: activated.revision,
+            delegation: d1,
+        },
+        1000,
+        TEST_CAP,
+    )
+    .unwrap();
+    assert_eq!(replayed, activated);
+}
+
+#[test]
+fn intent_recorded_rejects_reuse_of_a_txn_id_with_an_existing_terminal_result() {
+    let mut old = MeshSignerControlRecordV1::bootstrap(identity(), PurposeId::MeshSession);
+    old.recent_terminal_results = vec![TerminalResult {
+        txn_id: [55; 16],
+        outcome: TerminalOutcome::Revoked {
+            epoch: NonZeroU64::new(2).unwrap(),
+        },
+        request: TerminalRequestFingerprint::Revoke {
+            reason: RevocationReason::Compromised,
+        },
+        recorded_at: 10,
+        acked: false,
+    }];
+    // authority stays Empty (bootstrap default) so (Empty, Create) is
+    // otherwise a perfectly valid authority/kind pair -- the ONLY thing
+    // that must reject this is the txn_id reuse.
+    let err = apply(
+        &old,
+        &RecordTransition::IntentRecorded {
+            txn_id: [55; 16],
+            kind: PendingOpKind::Create,
+            backend: BackendKind::File,
+        },
+        1000,
+        TEST_CAP,
+    )
+    .unwrap_err();
+    assert_eq!(err, TransitionError::TerminalTxnReused);
+}
+
+#[test]
+fn reactivate_self_colliding_txn_id_blocks_the_new_pendings_own_later_activation() {
+    // Not an explicit up-front check inside ReactivateFromRevoked itself
+    // (nothing there compares txn_id to next_txn_id) -- but proven here to
+    // be structurally safe anyway: reusing the revoke-action's own txn_id
+    // as the new pending op's txn_id records a `Reactivated` terminal
+    // result under that id, and the later Activate attempt on the SAME id
+    // then hits idempotent_replay against that (different-shaped) request
+    // and fails closed, instead of silently completing or corrupting
+    // state.
+    let old = MeshSignerControlRecordV1::bootstrap(identity(), PurposeId::MeshSession);
+    let revoked = apply(
+        &old,
+        &RecordTransition::RevokeUrgent {
+            reason: RevocationReason::Compromised,
+            txn_id: [1; 16],
+        },
+        1000,
+        TEST_CAP,
+    )
+    .unwrap();
+
+    let colliding = [200; 16];
+    let reactivated = apply(
+        &revoked,
+        &RecordTransition::ReactivateFromRevoked {
+            txn_id: colliding,
+            next_txn_id: colliding, // deliberately identical to the action's own txn_id
+            backend: BackendKind::File,
+        },
+        1000,
+        TEST_CAP,
+    )
+    .unwrap();
+    assert!(
+        reactivated
+            .recent_terminal_results
+            .iter()
+            .any(|r| r.txn_id == colliding
+                && matches!(r.outcome, TerminalOutcome::Reactivated { .. }))
+    );
+    let p = reactivated.pending_op.clone().unwrap();
+    assert_eq!(p.txn_id, colliding);
+
+    let with_binding = apply(
+        &reactivated,
+        &RecordTransition::KeyObserved {
+            expected_txn_id: p.txn_id,
+            expected_kind: p.kind,
+            expected_generation: p.generation,
+            expected_epoch: p.epoch,
+            expected_purpose: p.purpose,
+            expected_slot_id: p.canonical_slot.canonical_id(),
+            expected_revision: reactivated.revision,
+            binding: binding(p.canonical_slot.clone()),
+        },
+        1000,
+        TEST_CAP,
+    )
+    .unwrap();
+
+    let mut d = delegation(0, 100);
+    d.delegated_key_id = p.canonical_slot.canonical_id();
+    d.delegated_pub = binding(p.canonical_slot.clone()).public_key;
+    let err = apply(
+        &with_binding,
+        &RecordTransition::ActivateFromKeyObserved {
+            expected_txn_id: p.txn_id,
+            expected_kind: p.kind,
+            expected_generation: p.generation,
+            expected_epoch: p.epoch,
+            expected_purpose: p.purpose,
+            expected_slot_id: p.canonical_slot.canonical_id(),
+            expected_revision: with_binding.revision,
+            delegation: d,
+        },
+        1000,
+        TEST_CAP,
+    )
+    .unwrap_err();
+    assert_eq!(
+        err,
+        TransitionError::TerminalTxnReused,
+        "the colliding txn_id already has a Reactivated terminal result with a different request shape, so Activate must fail closed rather than silently completing"
+    );
+}
+
+// ── D10: RevokeUrgent must never be blockable by terminal-result retention
+// capacity, even when every existing entry is unacked ───────────────────
+
+#[test]
+fn revoke_urgent_still_commits_when_terminal_retention_is_full_of_unacked_entries() {
+    let mut old = MeshSignerControlRecordV1::bootstrap(identity(), PurposeId::MeshSession);
+    old.recent_terminal_results = (0u8..MAX_RECENT_TERMINAL_RESULTS as u8)
+        .map(|i| TerminalResult {
+            txn_id: [i; 16],
+            outcome: TerminalOutcome::Revoked {
+                epoch: NonZeroU64::new(2).unwrap(),
+            },
+            request: TerminalRequestFingerprint::Revoke {
+                reason: RevocationReason::Lost,
+            },
+            recorded_at: i as u64,
+            acked: false, // every entry unacked -- ordinary push_bounded_terminal fails closed here
+        })
+        .collect();
+    assert_eq!(
+        old.recent_terminal_results.len(),
+        MAX_RECENT_TERMINAL_RESULTS
+    );
+
+    let new_txn_id = [0xEE; 16];
+    let new = apply(
+        &old,
+        &RecordTransition::RevokeUrgent {
+            reason: RevocationReason::Compromised,
+            txn_id: new_txn_id,
+        },
+        1000,
+        TEST_CAP,
+    )
+    .expect(
+        "RevokeUrgent must never fail closed due to retention capacity, even when every existing entry is unacked",
+    );
+    assert_eq!(
+        new.recent_terminal_results.len(),
+        MAX_RECENT_TERMINAL_RESULTS,
+        "still bounded -- the oldest entry was force-evicted, not appended without limit"
+    );
+    assert!(
+        new.recent_terminal_results
+            .iter()
+            .any(|r| r.txn_id == new_txn_id),
+        "the new urgent revoke's own terminal result must be present"
+    );
+    assert!(
+        !new.recent_terminal_results
+            .iter()
+            .any(|r| r.txn_id == [0; 16]),
+        "the oldest entry ([0;16]) must have been force-evicted to make room"
+    );
+}
+
+// ── D11: an already-Quarantine entry must never be silently overwritten by
+// a later GcResolved; GcSerialLock now belongs to the cell, so two ticks
+// against the SAME cell genuinely serialize ──────────────────────────────
+
+#[test]
+fn gc_resolved_never_overwrites_an_already_quarantined_entry() {
+    let s = slot(NonZeroU64::new(1).unwrap(), [40; 16]);
+    let b = binding(s.clone());
+    let old = record_with_gc_entries(vec![GcEntry::Bound {
+        slot: s.clone(),
+        txn_id: [40; 16],
+        binding: b,
+        state: GcState::Quarantine,
+    }]);
+    let err = apply(
+        &old,
+        &RecordTransition::GcResolved {
+            slot_id: s.canonical_id(),
+            residual_zero: true,
+            quarantine: false,
+        },
+        1000,
+        TEST_CAP,
+    )
+    .unwrap_err();
+    assert_eq!(err, TransitionError::WrongPhase);
+}
+
+#[test]
+fn gc_serial_is_owned_by_the_cell_so_two_ticks_against_the_same_cell_serialize() {
+    let dir = tempfile::tempdir().unwrap();
+    let cell = test_cell(dir.path().join("record"));
+    let (acquired_tx, acquired_rx) = std::sync::mpsc::channel();
+
+    let g1 = cell.acquire_gc_serial();
+    let c2 = Arc::clone(&cell);
+    let handle = std::thread::spawn(move || {
+        let _g2 = c2.acquire_gc_serial();
+        acquired_tx.send(()).unwrap();
+    });
+    // A short timeout proves the second acquire is genuinely BLOCKED (not
+    // just "hasn't run yet"): recv_timeout returning Timeout here, then
+    // succeeding immediately after g1 is dropped, is the same non-flaky
+    // pattern this suite already uses for the opposite property (see
+    // activate_does_not_block_a_concurrent_urgent_revoke_during_slow_roster_lookup).
+    assert_eq!(
+        acquired_rx.recv_timeout(std::time::Duration::from_millis(100)),
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout),
+        "a second gc_serial acquire on the SAME cell must block while the first is held"
+    );
+    drop(g1);
+    acquired_rx
+        .recv_timeout(std::time::Duration::from_secs(5))
+        .expect("must acquire promptly once released");
+    handle.join().unwrap();
 }

@@ -1,49 +1,198 @@
-//! `ControlRecordCell` — the sole way to obtain a real `FileBackedStore`
-//! from outside this crate, always paired with the one `MeshSignerLocks`
-//! it was constructed against.
+//! `ControlRecordCell` — the sole way to obtain a real, working store for a
+//! given `(path, identity, purpose)` from outside this crate. Owns its
+//! `FileBackedStore`, `MeshSignerLocks`, and `GcSerialLock` together;
+//! exposes only guard-gated, transition-mediated mutation — no raw store
+//! accessor.
 //!
-//! Third-round fix (round 4, item 4): the `LockToken` binding
-//! (`locks.rs`/`store.rs`) closes guard-vs-store mismatch *within* one
-//! pair, but did nothing to stop constructing two *independently
-//! self-consistent* pairs over the same path — each individually correct,
-//! together reopening the exact TOCTOU the token was meant to close (this
-//! crate's own earlier `two_stores_aliasing_the_same_path_...` test proved
-//! only the cross-pair-misuse half of this, never two consistent pairs
-//! racing each other). `FileBackedStore::new` is now `pub(crate)` —
-//! unreachable from outside this crate — so this factory, backed by a
-//! process-wide path-keyed registry, is the only way in: at most one live
-//! cell exists per resolved path at a time. A second `open` call for a
-//! path whose cell is still alive (any `Arc` clone still held anywhere)
-//! returns that same cell; only once every reference has been dropped does
-//! a later call create a genuinely fresh one (sequential, non-overlapping
-//! reuse is safe).
+//! Fourth-round fix (round 4, item 4): `FileBackedStore::new` is
+//! `pub(crate)`; this factory, backed by a process-wide path-keyed
+//! registry, is the only way in from outside, reusing a live pair rather
+//! than duplicating it.
+//!
+//! Fifth-round fixes (round 5):
+//! - item A1: `open` used to index the registry by path ALONE and hand
+//!   back a live cell regardless of whether the caller's requested
+//!   identity/purpose matched what that cell was actually built for —
+//!   opening path P for identity A, then (while A's cell is still alive)
+//!   opening the SAME path P for identity B, silently handed B's caller
+//!   A's cell with no error at all. `open` now returns `Result`, and a
+//!   mismatched reuse is a hard `OpenConflict`, never silent substitution.
+//! - item A2: `FaultInjectingStore::new` was public and unrelated to this
+//!   registry, wrapping its own internal `FileBackedStore` — two
+//!   independent `FaultInjectingStore`+`MeshSignerLocks` pairs could still
+//!   race on the same path exactly like the pre-registry bug. It now has
+//!   its own parallel, identically-structured registry
+//!   (`open_fault_injecting`), so both concrete store types are covered.
+//!   `FaultInjectingCell` exposes its store/locks directly (unlike
+//!   `ControlRecordCell`) — the whole type is test-only infrastructure by
+//!   construction, so there is no production-bypass concern to close there,
+//!   only the aliasing gap.
+//! - item A3: `ControlRecordCell::store()` used to hand out `&FileBackedStore`
+//!   directly, whose `replace_exact` (part of the public
+//!   `AtomicControlRecordStore` trait) let a caller write ANY
+//!   revision+1 content directly — completely bypassing
+//!   `transition::apply` and every invariant it enforces (authority
+//!   matrix, exact-token checks, cap, the GC state machine). That accessor
+//!   is gone; the only ways to mutate are `commit` (a fully-built
+//!   `RecordTransition`) and `commit_built` (a closure building one against
+//!   a freshly read base, used by `gc`), both of which always go through
+//!   `apply` first. `seed_for_test` remains as an explicitly-named escape
+//!   hatch for adversarial test setup — still guard-gated (so misuse is
+//!   still caught by the `LockToken` check), but its name makes clear it is
+//!   not part of the production surface.
+//! - item D11: `GcSerialLock` used to be constructed by whoever called
+//!   `gc::gc_worker_tick`, with nothing tying it to the cell/path — two
+//!   independent callers could each build their own lock and run two
+//!   concurrent ticks against the same record, defeating gc_serial's whole
+//!   purpose. It is now owned by the cell.
 
-use crate::locks::{MeshSignerLocks, OrderSpy};
-use crate::record::{ControlIdentity, PurposeId};
-use crate::store::FileBackedStore;
+use crate::commit::{CommitError, commit_new_bytes};
+use crate::locks::{GcSerialLock, MeshSignerLocks, MutateGuard, OrderSpy, SignGuard};
+use crate::record::{ControlIdentity, MeshSignerControlRecordV1, PurposeId};
+use crate::store::{
+    AtomicControlRecordStore, FaultInjectingStore, FileBackedStore, LoadOutcome, ReplaceOutcome,
+};
+use crate::transition::{RecordTransition, TransitionError, apply};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, OnceLock, Weak};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, Weak};
+
+#[derive(Debug, thiserror::Error)]
+pub enum CommitTransitionError {
+    #[error("store has no record for this identity")]
+    NoRecord,
+    #[error("record is corrupt")]
+    RecordCorrupt,
+    #[error(transparent)]
+    Transition(#[from] TransitionError),
+    #[error(transparent)]
+    Commit(#[from] CommitError),
+}
+
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+#[error("a live cell already exists for this path bound to a different identity/purpose")]
+pub struct OpenConflict;
 
 pub struct ControlRecordCell {
     store: FileBackedStore,
     locks: MeshSignerLocks,
+    gc_serial: GcSerialLock,
+    identity: ControlIdentity,
+    purpose: PurposeId,
 }
 
 impl ControlRecordCell {
     #[must_use]
-    pub fn store(&self) -> &FileBackedStore {
-        &self.store
+    pub fn identity(&self) -> &ControlIdentity {
+        &self.identity
     }
 
     #[must_use]
-    pub fn locks(&self) -> &MeshSignerLocks {
-        &self.locks
+    pub fn purpose(&self) -> PurposeId {
+        self.purpose
+    }
+
+    /// Opaque identity of the underlying `MeshSignerLocks` — safe to expose
+    /// on its own (it carries no mutation capability, just an
+    /// equality-comparable id), unlike a raw store/locks accessor. Lets a
+    /// caller confirm two `open()` calls returned the same live pair
+    /// without needing anything `seed_for_test` guards.
+    #[must_use]
+    pub fn token(&self) -> crate::locks::LockToken {
+        self.locks.token()
+    }
+
+    #[must_use]
+    pub fn load_canonical(&self) -> LoadOutcome {
+        self.store.load_canonical()
+    }
+
+    pub fn acquire_for_sign(&self) -> SignGuard<'_> {
+        self.locks.acquire_for_sign()
+    }
+
+    pub fn acquire_for_mutation(&self) -> MutateGuard<'_> {
+        self.locks.acquire_for_mutation()
+    }
+
+    /// Held for an entire GC tick (erratum1 E1) — see `gc::gc_worker_tick`.
+    pub fn acquire_gc_serial(&self) -> MutexGuard<'_, ()> {
+        self.gc_serial.acquire()
+    }
+
+    /// Builds `t` against a fresh read (guard held for the whole section)
+    /// and commits it. The sanctioned way to mutate from outside this
+    /// crate when the transition is already fully known.
+    pub fn commit(
+        &self,
+        t: &RecordTransition,
+        now: u64,
+        max_cap: usize,
+    ) -> Result<MeshSignerControlRecordV1, CommitTransitionError> {
+        let guard = self.locks.acquire_for_mutation();
+        let base = match self.store.load_canonical() {
+            LoadOutcome::Exact(r) => *r,
+            LoadOutcome::Missing => return Err(CommitTransitionError::NoRecord),
+            LoadOutcome::Corrupt => return Err(CommitTransitionError::RecordCorrupt),
+        };
+        let new = apply(&base, t, now, max_cap)?;
+        commit_new_bytes(&self.store, &guard, base.revision, &new, 8)?;
+        Ok(new)
+    }
+
+    /// GC-shaped variant: `build` runs against a freshly read base *under*
+    /// the guard and may report "nothing to do" (`None`) against that
+    /// fresh state (e.g. the targeted entry was already resolved by a
+    /// concurrent caller) — returns `Ok(None)` in that case rather than
+    /// committing anything.
+    pub fn commit_built(
+        &self,
+        build: impl FnOnce(&MeshSignerControlRecordV1) -> Option<RecordTransition>,
+        now: u64,
+        max_cap: usize,
+    ) -> Result<Option<MeshSignerControlRecordV1>, CommitTransitionError> {
+        let guard = self.locks.acquire_for_mutation();
+        let base = match self.store.load_canonical() {
+            LoadOutcome::Exact(r) => *r,
+            LoadOutcome::Missing => return Err(CommitTransitionError::NoRecord),
+            LoadOutcome::Corrupt => return Err(CommitTransitionError::RecordCorrupt),
+        };
+        let Some(t) = build(&base) else {
+            return Ok(None);
+        };
+        let new = apply(&base, &t, now, max_cap)?;
+        commit_new_bytes(&self.store, &guard, base.revision, &new, 8)?;
+        Ok(Some(new))
+    }
+
+    pub fn sweep_orphan_tmp(&self, guard: &MutateGuard<'_>) {
+        self.store.sweep_orphan_tmp(guard);
+    }
+
+    /// Explicit escape hatch for adversarial test setup ONLY — bypasses
+    /// `transition::apply` entirely, writing `record` verbatim if the CAS
+    /// (revision + this store's own identity/purpose binding) accepts it.
+    /// Still guard-gated (the `LockToken` check still applies), but its
+    /// name makes clear this is not part of the production surface — a
+    /// real caller has no legitimate reason to ever call this.
+    pub fn seed_for_test(
+        &self,
+        guard: &MutateGuard<'_>,
+        expected_revision: u64,
+        record: &MeshSignerControlRecordV1,
+    ) -> ReplaceOutcome {
+        self.store.replace_exact(guard, expected_revision, record)
     }
 }
 
-fn registry() -> &'static Mutex<HashMap<PathBuf, Weak<ControlRecordCell>>> {
-    static REG: OnceLock<Mutex<HashMap<PathBuf, Weak<ControlRecordCell>>>> = OnceLock::new();
+struct Registered<T> {
+    cell: Weak<T>,
+    identity: ControlIdentity,
+    purpose: PurposeId,
+}
+
+fn control_record_registry() -> &'static Mutex<HashMap<PathBuf, Registered<ControlRecordCell>>> {
+    static REG: OnceLock<Mutex<HashMap<PathBuf, Registered<ControlRecordCell>>>> = OnceLock::new();
     REG.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
@@ -67,21 +216,101 @@ fn registry_key(path: &Path) -> PathBuf {
 /// Opens (or reuses, if still live) the cell for `path`. `spy` is supplied
 /// by the caller (not generated internally) so callers retain their own
 /// handle for `OrderSpy` inspection in tests.
-#[must_use]
+///
+/// Returns `Err(OpenConflict)` if a cell is already live for this path but
+/// was built for a *different* `identity`/`purpose` — round 5, item A1: the
+/// prior version silently handed back the existing cell regardless of
+/// whether it matched what the caller actually asked for.
 pub fn open(
     path: PathBuf,
     identity: ControlIdentity,
     purpose: PurposeId,
     spy: Arc<OrderSpy>,
-) -> Arc<ControlRecordCell> {
+) -> Result<Arc<ControlRecordCell>, OpenConflict> {
     let key = registry_key(&path);
-    let mut reg = registry().lock().unwrap();
-    if let Some(existing) = reg.get(&key).and_then(Weak::upgrade) {
-        return existing;
+    let mut reg = control_record_registry().lock().unwrap();
+    if let Some(existing) = reg.get(&key) {
+        if let Some(cell) = existing.cell.upgrade() {
+            if existing.identity != identity || existing.purpose != purpose {
+                return Err(OpenConflict);
+            }
+            return Ok(cell);
+        }
     }
     let locks = MeshSignerLocks::new(spy);
-    let store = FileBackedStore::new(path, locks.token(), identity, purpose);
-    let cell = Arc::new(ControlRecordCell { store, locks });
-    reg.insert(key, Arc::downgrade(&cell));
-    cell
+    let store = FileBackedStore::new(path, locks.token(), identity.clone(), purpose);
+    let cell = Arc::new(ControlRecordCell {
+        store,
+        locks,
+        gc_serial: GcSerialLock::new(),
+        identity: identity.clone(),
+        purpose,
+    });
+    reg.insert(
+        key,
+        Registered {
+            cell: Arc::downgrade(&cell),
+            identity,
+            purpose,
+        },
+    );
+    Ok(cell)
+}
+
+/// Test-only double: wraps `FaultInjectingStore` instead of
+/// `FileBackedStore`, exposing it (and the paired `MeshSignerLocks`)
+/// directly — this whole type exists only for failpoint-injection tests
+/// exercising the store/commit retry machinery at a low level, so there is
+/// no production-bypass concern to close here, only the same path-aliasing
+/// gap `ControlRecordCell` closes (round 5, item A2).
+pub struct FaultInjectingCell {
+    store: FaultInjectingStore,
+    locks: MeshSignerLocks,
+}
+
+impl FaultInjectingCell {
+    #[must_use]
+    pub fn store(&self) -> &FaultInjectingStore {
+        &self.store
+    }
+
+    #[must_use]
+    pub fn locks(&self) -> &MeshSignerLocks {
+        &self.locks
+    }
+}
+
+fn fault_injecting_registry() -> &'static Mutex<HashMap<PathBuf, Registered<FaultInjectingCell>>> {
+    static REG: OnceLock<Mutex<HashMap<PathBuf, Registered<FaultInjectingCell>>>> = OnceLock::new();
+    REG.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+pub fn open_fault_injecting(
+    path: PathBuf,
+    identity: ControlIdentity,
+    purpose: PurposeId,
+    spy: Arc<OrderSpy>,
+) -> Result<Arc<FaultInjectingCell>, OpenConflict> {
+    let key = registry_key(&path);
+    let mut reg = fault_injecting_registry().lock().unwrap();
+    if let Some(existing) = reg.get(&key) {
+        if let Some(cell) = existing.cell.upgrade() {
+            if existing.identity != identity || existing.purpose != purpose {
+                return Err(OpenConflict);
+            }
+            return Ok(cell);
+        }
+    }
+    let locks = MeshSignerLocks::new(spy);
+    let store = FaultInjectingStore::new(path, locks.token(), identity.clone(), purpose);
+    let cell = Arc::new(FaultInjectingCell { store, locks });
+    reg.insert(
+        key,
+        Registered {
+            cell: Arc::downgrade(&cell),
+            identity,
+            purpose,
+        },
+    );
+    Ok(cell)
 }

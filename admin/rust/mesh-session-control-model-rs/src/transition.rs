@@ -35,8 +35,8 @@
 use crate::record::{
     Authority, BackendKind, ExactBinding, GcEntry, GcState, GenerationRecord,
     MeshSignerControlRecordV1, PendingOp, PendingOpKind, PendingPhase, PurposeId, RevocationReason,
-    SlotId, TerminalOutcome, TerminalPushError, TerminalResult, ack_terminal, identity_digest,
-    push_bounded_terminal,
+    SlotId, TerminalOutcome, TerminalPushError, TerminalRequestFingerprint, TerminalResult,
+    ack_terminal, identity_digest, push_bounded_terminal, push_bounded_terminal_urgent,
 };
 use std::num::NonZeroU64;
 
@@ -96,6 +96,8 @@ pub enum TransitionError {
         "the same txn_id already has a different recorded terminal outcome for this transition kind"
     )]
     TerminalTxnReused,
+    #[error("the observed binding's slot does not match the pending op's own canonical_slot")]
+    BindingSlotMismatch,
 }
 
 pub enum RecordTransition {
@@ -241,6 +243,21 @@ pub fn apply(
             if old.pending_op.is_some() {
                 return Err(TransitionError::PendingAlreadyExists);
             }
+            // Round 5, item D9: a txn_id that already has ANY terminal
+            // result must never be reused for a NEW pending op. Without
+            // this, a caller could mint a fresh pending op reusing an old,
+            // already-terminal txn_id; that new op's own later
+            // KeyObserved/Activate calls would then hit the
+            // idempotent-replay path below (matching the OLD terminal
+            // result) and report success without ever processing the new
+            // op, leaving it permanently wedged in KeyObserved phase.
+            if old
+                .recent_terminal_results
+                .iter()
+                .any(|r| r.txn_id == *txn_id)
+            {
+                return Err(TransitionError::TerminalTxnReused);
+            }
             // Closed matrix — audit finding (round 4, item 2): the only
             // legitimate (Authority, PendingOpKind) pairs for this
             // transition are (Empty, Create) and (Active, RoutineRotate).
@@ -311,6 +328,17 @@ pub fn apply(
             ) {
                 return Err(TransitionError::StaleWorkerToken);
             }
+            // Round 5, item B5: the observed binding must be FOR this
+            // pending op's own slot -- without this check, a caller could
+            // attach a physical key observed at an unrelated slot T onto
+            // pending op S, and nothing downstream (ActivateFromKeyObserved,
+            // the validator) ever re-derives or re-checks binding.slot
+            // against p.canonical_slot; the validator only checks the
+            // DELEGATION against binding.slot, which by then is already
+            // wrong.
+            if binding.slot != p.canonical_slot {
+                return Err(TransitionError::BindingSlotMismatch);
+            }
             let mut np = p.clone();
             np.phase = PendingPhase::KeyObserved;
             np.binding = Some(binding.clone());
@@ -366,6 +394,10 @@ pub fn apply(
                 TerminalResult {
                     txn_id,
                     outcome: TerminalOutcome::Activated { generation },
+                    request: TerminalRequestFingerprint::Activate {
+                        generation,
+                        delegation: Box::new(delegation.clone()),
+                    },
                     recorded_at: now,
                     acked: false,
                 },
@@ -398,13 +430,17 @@ pub fn apply(
                 new.gc_pending.push(entry);
             }
             new.pending_op = None;
-            new.recent_terminal_results = push_bounded_terminal(
+            // push_bounded_terminal_urgent, not push_bounded_terminal --
+            // round 5, item D10: an urgent, security-critical revoke must
+            // never be blockable by terminal-result retention capacity.
+            new.recent_terminal_results = push_bounded_terminal_urgent(
                 old.recent_terminal_results.clone(),
                 TerminalResult {
                     txn_id: *txn_id,
                     outcome: TerminalOutcome::Revoked {
                         epoch: new.epoch_high_water,
                     },
+                    request: TerminalRequestFingerprint::Revoke { reason: *reason },
                     recorded_at: now,
                     acked: false,
                 },
@@ -422,6 +458,15 @@ pub fn apply(
             }
             if old.pending_op.is_some() {
                 return Err(TransitionError::PendingAlreadyExists);
+            }
+            // Round 5, item D9: same wedge risk as IntentRecorded -- the
+            // new pending op's own txn_id must never already be terminal.
+            if old
+                .recent_terminal_results
+                .iter()
+                .any(|r| r.txn_id == *next_txn_id)
+            {
+                return Err(TransitionError::TerminalTxnReused);
             }
             new.epoch_high_water = old
                 .epoch_high_water
@@ -452,6 +497,10 @@ pub fn apply(
                     txn_id: *txn_id,
                     outcome: TerminalOutcome::Reactivated {
                         epoch: new.epoch_high_water,
+                    },
+                    request: TerminalRequestFingerprint::Reactivate {
+                        next_txn_id: *next_txn_id,
+                        backend: *backend,
                     },
                     recorded_at: now,
                     acked: false,
@@ -542,6 +591,19 @@ pub fn apply(
                 .find(|e| e.slot().canonical_id() == *slot_id)
                 .ok_or(TransitionError::NoSuchGcEntry)?;
             match entry {
+                // Round 5, item D11: an entry already in Quarantine must
+                // never be overwritten by GcResolved -- without this, a
+                // late/stale "clean" result (e.g. a delayed backend
+                // response for an earlier attempt, arriving after a LATER
+                // attempt already quarantined the entry) would silently
+                // flip it back to Done, auto-clearing what is supposed to
+                // require administrative review.
+                GcEntry::Bound {
+                    state: GcState::Quarantine,
+                    ..
+                } => {
+                    return Err(TransitionError::WrongPhase);
+                }
                 GcEntry::Bound { state, .. } => {
                     *state = if *quarantine {
                         GcState::Quarantine
@@ -591,39 +653,58 @@ pub fn apply(
     Ok(new)
 }
 
-/// Returns `Some(Ok(old.clone()))` if `t` is a terminal transition whose
-/// own `txn_id` already has a matching-kind entry in
-/// `old.recent_terminal_results` (an already-succeeded lost-ack retry),
+/// Returns `Some(Ok(old.clone()))` if `t` is a terminal transition whose own
+/// `txn_id` already has an entry in `old.recent_terminal_results` recording
+/// the exact SAME request (an already-succeeded lost-ack retry),
 /// `Some(Err(TerminalTxnReused))` if that txn_id is present with a
-/// *different* outcome kind (fail-closed), or `None` if `t` is not a
-/// terminal transition or its txn_id has no prior entry (proceed normally).
-/// Bounded by `recent_terminal_results`' own retention — a retry arriving
-/// after its entry has been acked-and-evicted is not covered and proceeds
-/// as a fresh attempt; that is an accepted limit of bounded retention, not
-/// a gap this check is meant to close.
+/// *different* request (fail-closed — round 5, item D9: comparing only the
+/// outcome *variant*, as an earlier version did via a wildcard match, would
+/// have silently accepted a genuinely different request — e.g. a second
+/// `RevokeUrgent` with a different `reason` — as "the same replay"), or
+/// `None` if `t` is not a terminal transition or its txn_id has no prior
+/// entry (proceed normally). Bounded by `recent_terminal_results`' own
+/// retention — a retry arriving after its entry has been acked-and-evicted
+/// is not covered and proceeds as a fresh attempt; that is an accepted
+/// limit of bounded retention, not a gap this check is meant to close.
 fn idempotent_replay(
     old: &MeshSignerControlRecordV1,
     t: &RecordTransition,
 ) -> Option<Result<MeshSignerControlRecordV1, TransitionError>> {
-    let (txn_id, is_matching_outcome): (&[u8; 16], fn(&TerminalOutcome) -> bool) = match t {
-        RecordTransition::RevokeUrgent { txn_id, .. } => {
-            (txn_id, |o| matches!(o, TerminalOutcome::Revoked { .. }))
-        }
-        RecordTransition::ReactivateFromRevoked { txn_id, .. } => {
-            (txn_id, |o| matches!(o, TerminalOutcome::Reactivated { .. }))
-        }
+    let (txn_id, candidate_request) = match t {
+        RecordTransition::RevokeUrgent { txn_id, reason } => (
+            txn_id,
+            TerminalRequestFingerprint::Revoke { reason: *reason },
+        ),
+        RecordTransition::ReactivateFromRevoked {
+            txn_id,
+            next_txn_id,
+            backend,
+        } => (
+            txn_id,
+            TerminalRequestFingerprint::Reactivate {
+                next_txn_id: *next_txn_id,
+                backend: *backend,
+            },
+        ),
         RecordTransition::ActivateFromKeyObserved {
-            expected_txn_id, ..
-        } => (expected_txn_id, |o| {
-            matches!(o, TerminalOutcome::Activated { .. })
-        }),
+            expected_txn_id,
+            expected_generation,
+            delegation,
+            ..
+        } => (
+            expected_txn_id,
+            TerminalRequestFingerprint::Activate {
+                generation: *expected_generation,
+                delegation: Box::new(delegation.clone()),
+            },
+        ),
         _ => return None,
     };
     let existing = old
         .recent_terminal_results
         .iter()
         .find(|r| r.txn_id == *txn_id)?;
-    if is_matching_outcome(&existing.outcome) {
+    if existing.request == candidate_request {
         Some(Ok(old.clone()))
     } else {
         Some(Err(TransitionError::TerminalTxnReused))

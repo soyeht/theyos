@@ -43,7 +43,7 @@
 //!   implements `verify` against mesh-core's eventual frozen preimage
 //!   function.
 
-use crate::record::{Channel, Delegation, GenerationRecord, PurposeId};
+use crate::record::{Channel, ControlIdentity, Delegation, GenerationRecord, PurposeId};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RosterCurrency {
@@ -112,7 +112,71 @@ pub trait PurposeMarker {
     /// treated as equally authoritative.
     const DELEGATION_KIND: &'static str;
     const PROFILE: &'static str;
+    /// Legacy vocabulary used only by the `required_scope() == None`
+    /// fallback path — a nonempty-subset check, not an exact-set one. Kept
+    /// for purposes (`RosterSyncPurpose`) that have no ratified production
+    /// scope; see `required_scope`'s doc comment.
     const ROLES: &'static [&'static str];
+
+    /// `Some` only for a purpose with a real, *ratified* production scope
+    /// (see `DelegationScopePolicy`'s doc comment for what "ratified"
+    /// means here and why). `None` means this purpose has no production
+    /// exact-scope requirement, and `validate_full_binding` falls back to
+    /// the legacy nonempty/subset check against `ROLES` plus a bare
+    /// nonempty check on `transcript_kinds`.
+    ///
+    /// Default `None` so the validator body never has to special-case a
+    /// purpose by name — it only ever asks "does this purpose have a
+    /// ratified scope," never "is this purpose == MeshSession."
+    /// `RosterSyncPurpose` deliberately keeps the default: it has no
+    /// ratified production scope here (D6 owns RosterSync's real authority
+    /// model — `M_priv` — and stays out of D4's production path);
+    /// overriding this to `Some` would invent authority this crate has no
+    /// basis for, the exact failure mode this crate's own history keeps
+    /// correcting (see the module doc's second-round fixes).
+    fn required_scope() -> Option<DelegationScopePolicy> {
+        None
+    }
+}
+
+/// Exact delegation scope required for a purpose's *production* path.
+///
+/// Round 5, item C8 — provenance, tracked explicitly because it was
+/// initially mis-cited: this is **not** a restatement of the frozen
+/// B-SESSAO v6 wire schema. §5 of that schema (self-hash verified,
+/// `daisy-bsessao-v6.7343d075…md`) declares `roles: [text]` and
+/// `transcript_kinds: [text]` as open lists with no stated exactness
+/// constraint — re-checked directly against the frozen text before this
+/// comment was written, specifically to avoid repeating this crate's own
+/// history of modeling from a remembered paraphrase instead of the source.
+/// This is a **new integration-level clause**, ratified by kiana for THIS
+/// implementation's `MeshSessionPurpose` on top of that open schema: the
+/// current slot/signer is not role-specific (one key signs both sides of a
+/// session), so accepting a delegation listing only a *subset* of roles
+/// would still let that same key act in a role the delegation never
+/// authorized, and accepting *extra* roles/transcript_kinds would broaden
+/// authority to scope the delegation never actually granted. Both
+/// directions — subset and superset — are closed by exact-set equality
+/// (order-independent, no duplicates), not subset containment.
+pub struct DelegationScopePolicy {
+    pub roles: &'static [&'static str],
+    pub transcript_kinds: &'static [&'static str],
+}
+
+/// `actual`, as a set (duplicates are a hard rejection, not silently
+/// collapsed), must equal `required` exactly — every required entry
+/// present, nothing else. Order-independent.
+fn is_exact_scope(actual: &[String], required: &[&str]) -> bool {
+    if actual.len() != required.len() {
+        return false;
+    }
+    let mut seen: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
+    for a in actual {
+        if !seen.insert(a.as_str()) {
+            return false; // duplicate entry
+        }
+    }
+    required.iter().all(|r| seen.contains(r))
 }
 
 pub struct MeshSessionPurpose;
@@ -122,6 +186,13 @@ impl PurposeMarker for MeshSessionPurpose {
     const DELEGATION_KIND: &'static str = "soyeht/mesh-session/delegation/v1";
     const PROFILE: &'static str = "mesh-session";
     const ROLES: &'static [&'static str] = &["initiator", "responder"];
+
+    fn required_scope() -> Option<DelegationScopePolicy> {
+        Some(DelegationScopePolicy {
+            roles: &["initiator", "responder"],
+            transcript_kinds: &["final-confirm", "activate", "activate-ack"],
+        })
+    }
 }
 
 pub struct RosterSyncPurpose;
@@ -132,6 +203,8 @@ impl PurposeMarker for RosterSyncPurpose {
     const DELEGATION_KIND: &'static str = "soyeht/roster-sync/delegation/v1";
     const PROFILE: &'static str = "roster-sync";
     const ROLES: &'static [&'static str] = &["initiator", "responder"];
+    // required_scope() deliberately left at the trait's default `None` --
+    // see that default's doc comment. D6 owns RosterSync's real scope.
 }
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
@@ -148,6 +221,14 @@ pub enum ValidationError {
     RoleMismatch,
     #[error("delegation transcript_kinds is empty")]
     TranscriptKindsEmpty,
+    #[error(
+        "delegation roles do not exactly equal this purpose's ratified production scope (subset, extra, or duplicate entries)"
+    )]
+    RoleScopeMismatch,
+    #[error(
+        "delegation transcript_kinds do not exactly equal this purpose's ratified production scope (subset, extra, or duplicate entries)"
+    )]
+    TranscriptKindsScopeMismatch,
     #[error("channel mismatch")]
     ChannelMismatch,
     #[error("hh_id mismatch")]
@@ -181,10 +262,30 @@ pub enum ValidationError {
 /// Identity context the validator checks the delegation against — grouped
 /// so the function signature stays under clippy's argument-count lint
 /// without losing any of the checks themselves.
+///
+/// Round 5, item B4: this used to be an independent parameter callers
+/// supplied to `activate.rs`'s orchestration functions, never cross-checked
+/// against the record actually being acted on — only `purpose` was
+/// verified (`PURPOSE_ID`), so a caller could activate record A while
+/// supplying a `ctx`/delegation for an unrelated identity B, and nothing
+/// caught it. Its three fields map 1:1 onto `ControlIdentity`, so it is now
+/// only ever constructed via `from_identity`, directly from the record's
+/// own `identity` — never independently caller-supplied.
 pub struct BindingContext<'a> {
     pub hh_id: &'a str,
     pub machine_id: &'a str,
     pub channel: Channel,
+}
+
+impl<'a> BindingContext<'a> {
+    #[must_use]
+    pub fn from_identity(identity: &'a ControlIdentity) -> Self {
+        Self {
+            hh_id: &identity.hh_id,
+            machine_id: &identity.machine_id,
+            channel: identity.channel,
+        }
+    }
 }
 
 /// One function, called both by `load()` (stable path, no pending op in
@@ -212,11 +313,25 @@ pub fn validate_full_binding<P: PurposeMarker>(
     if d.profile != P::PROFILE {
         return Err(ValidationError::ProfileMismatch);
     }
-    if d.roles.is_empty() || !d.roles.iter().all(|r| P::ROLES.contains(&r.as_str())) {
-        return Err(ValidationError::RoleMismatch);
-    }
-    if d.transcript_kinds.is_empty() {
-        return Err(ValidationError::TranscriptKindsEmpty);
+    match P::required_scope() {
+        Some(scope) => {
+            // Round 5, item C8 -- exact-set, both directions closed. See
+            // `DelegationScopePolicy`'s doc comment for provenance and why.
+            if !is_exact_scope(&d.roles, scope.roles) {
+                return Err(ValidationError::RoleScopeMismatch);
+            }
+            if !is_exact_scope(&d.transcript_kinds, scope.transcript_kinds) {
+                return Err(ValidationError::TranscriptKindsScopeMismatch);
+            }
+        }
+        None => {
+            if d.roles.is_empty() || !d.roles.iter().all(|r| P::ROLES.contains(&r.as_str())) {
+                return Err(ValidationError::RoleMismatch);
+            }
+            if d.transcript_kinds.is_empty() {
+                return Err(ValidationError::TranscriptKindsEmpty);
+            }
+        }
     }
     if d.channel != ctx.channel {
         return Err(ValidationError::ChannelMismatch);

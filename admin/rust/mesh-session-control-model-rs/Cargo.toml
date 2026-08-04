@@ -14,6 +14,7 @@ publish = false
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }
+serde_bytes = "0.11"
 ciborium = "0.2"
 sha2 = "0.10"
 thiserror = "2"

@@ -226,8 +226,18 @@ impl AtomicControlRecordStore for FileBackedStore {
             Err(e) if e.kind() == io::ErrorKind::NotFound => LoadOutcome::Missing,
             Err(_) => LoadOutcome::Corrupt,
             Ok(bytes) => match from_canonical_bytes(&bytes) {
-                Some(rec) => LoadOutcome::Exact(Box::new(rec)),
-                None => LoadOutcome::Corrupt,
+                // Round 5, item A1: cross-check the decoded record's own
+                // identity/purpose against what THIS store is bound to,
+                // never trust that the file at `self.path` necessarily
+                // holds content for the right identity — e.g. after a
+                // drop-and-reopen at the same path for a DIFFERENT
+                // identity, or any other way a leftover/foreign file could
+                // end up there. Without this, `LoadOutcome::Exact` could
+                // silently hand back a record for someone else's identity.
+                Some(rec) if rec.identity == self.identity && rec.purpose == self.purpose => {
+                    LoadOutcome::Exact(Box::new(rec))
+                }
+                Some(_) | None => LoadOutcome::Corrupt,
             },
         }
     }

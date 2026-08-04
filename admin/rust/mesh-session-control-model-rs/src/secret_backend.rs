@@ -151,6 +151,18 @@ impl SecretBackend for FakeSecretBackend {
         slot: &SlotId,
         expected_binding: Option<&ExactBinding>,
     ) -> CreateOutcome {
+        // Round 5, item B5: an `expected_binding` whose OWN `.slot` field
+        // does not match the `slot` parameter it is being inserted under
+        // is nonsensical and must never be accepted verbatim -- without
+        // this, the fake could store a binding keyed under slot S whose
+        // own `.slot` claims T, corrupting exactly the kind of
+        // slot-identity consistency `KeyObserved`'s own binding-slot check
+        // (transition.rs) depends on the backend never producing.
+        if let Some(exp) = expected_binding {
+            if exp.slot != *slot {
+                return CreateOutcome::Conflict;
+            }
+        }
         let mut items = self.items.lock().unwrap();
         if let Some(existing) = items.get(slot) {
             return match expected_binding {

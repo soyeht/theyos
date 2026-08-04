@@ -9,13 +9,36 @@
 //! confirmed the physical key material actually existed via
 //! `SecretBackend::load_exact` before trusting it. Both are now mandatory
 //! steps of this one function, not optional helpers.
+//!
+//! Round 5 fixes:
+//! - item B4: `BindingContext` used to be an independent parameter never
+//!   cross-checked against the record actually being acted on — only
+//!   `purpose` was verified, so a caller could activate record A while
+//!   supplying a context/delegation for an unrelated identity B. It is now
+//!   always derived from `base.identity`/`record.identity`, never
+//!   caller-supplied.
+//! - item D9: the prior version read `base.pending_op`, and if it was
+//!   already `None` (activation already committed by an earlier attempt)
+//!   immediately returned `NothingToActivate` — *before* ever reaching
+//!   `apply`'s own idempotent-replay logic. A lost-ack retry of an
+//!   already-succeeded activation therefore got a confusing error instead
+//!   of its own prior success, even though `apply` called directly proves
+//!   the replay logic itself is correct — the public surface a real caller
+//!   actually uses defeated it. `expected_txn_id` is now an explicit
+//!   parameter (the caller already knows it, from having driven
+//!   `IntentRecorded`/`KeyObserved` themselves), checked against
+//!   `recent_terminal_results` before any pending-op-presence check.
+//! - item A3: `store`/`locks` used to be independent parameters, which
+//!   required `ControlRecordCell` to hand back a raw store to any external
+//!   caller of this function — reopening exactly the bypass A3 closes.
+//!   This now takes `&ControlRecordCell` and commits only through
+//!   `commit_built`, which always goes through `transition::apply`.
 
-use crate::commit::{CommitError, commit_new_bytes};
-use crate::locks::MeshSignerLocks;
-use crate::record::{GenerationRecord, MeshSignerControlRecordV1, PendingPhase};
+use crate::cell::{CommitTransitionError, ControlRecordCell};
+use crate::record::{GenerationRecord, MeshSignerControlRecordV1, PendingPhase, TerminalOutcome};
 use crate::secret_backend::{LoadExactOutcome, SecretBackend};
-use crate::store::{AtomicControlRecordStore, LoadOutcome};
-use crate::transition::{RecordTransition, TransitionError, apply};
+use crate::store::LoadOutcome;
+use crate::transition::{RecordTransition, TransitionError};
 use crate::validator::{
     BindingContext, DelegationPolicy, PurposeMarker, RosterLookup, SignatureVerifier,
     ValidationError, validate_full_binding,
@@ -23,10 +46,6 @@ use crate::validator::{
 
 #[derive(Debug, thiserror::Error)]
 pub enum ActivateError {
-    #[error("store has no record for this identity")]
-    NoRecord,
-    #[error("record is corrupt")]
-    RecordCorrupt,
     #[error("no pending op, or not in KeyObserved phase, to activate")]
     NothingToActivate,
     #[error(
@@ -36,9 +55,13 @@ pub enum ActivateError {
     #[error(transparent)]
     Validation(#[from] ValidationError),
     #[error(transparent)]
-    Transition(#[from] TransitionError),
-    #[error(transparent)]
-    Commit(#[from] CommitError),
+    Commit(#[from] CommitTransitionError),
+}
+
+impl From<TransitionError> for ActivateError {
+    fn from(e: TransitionError) -> Self {
+        ActivateError::Commit(CommitTransitionError::Transition(e))
+    }
 }
 
 /// Confirms the physical key exists via `backend.load_exact` and runs the
@@ -60,22 +83,23 @@ pub enum ActivateError {
 /// snapshot that has gone stale.
 #[allow(clippy::too_many_arguments)]
 pub fn activate_from_key_observed<P: PurposeMarker>(
-    store: &dyn AtomicControlRecordStore,
+    cell: &ControlRecordCell,
     backend: &dyn SecretBackend,
-    locks: &MeshSignerLocks,
     roster: &dyn RosterLookup,
     sig: &dyn SignatureVerifier,
     policy: &DelegationPolicy,
-    ctx: &BindingContext<'_>,
+    expected_txn_id: [u8; 16],
     delegation: crate::record::Delegation,
     now: u64,
     max_cap: usize,
 ) -> Result<MeshSignerControlRecordV1, ActivateError> {
     // No guard held for this read.
-    let base = match store.load_canonical() {
+    let base = match cell.load_canonical() {
         LoadOutcome::Exact(r) => *r,
-        LoadOutcome::Missing => return Err(ActivateError::NoRecord),
-        LoadOutcome::Corrupt => return Err(ActivateError::RecordCorrupt),
+        LoadOutcome::Missing => return Err(ActivateError::Commit(CommitTransitionError::NoRecord)),
+        LoadOutcome::Corrupt => {
+            return Err(ActivateError::Commit(CommitTransitionError::RecordCorrupt));
+        }
     };
     if base.purpose != P::PURPOSE_ID {
         // The type parameter alone proves nothing about which record this
@@ -85,29 +109,42 @@ pub fn activate_from_key_observed<P: PurposeMarker>(
         // delegation with RosterSync's domain/profile/role.
         return Err(ActivateError::Validation(ValidationError::PurposeMismatch));
     }
+
+    // Idempotent-replay check FIRST, before any pending-op-presence check
+    // (item D9) -- a prior successful commit of this exact activation
+    // clears pending_op, so checking pending_op first would reject a
+    // legitimate lost-ack retry with a confusing NothingToActivate instead
+    // of recognizing its own earlier success.
+    if let Some(existing) = base
+        .recent_terminal_results
+        .iter()
+        .find(|r| r.txn_id == expected_txn_id)
+    {
+        return match &existing.outcome {
+            TerminalOutcome::Activated { .. } => Ok(base),
+            _ => Err(TransitionError::TerminalTxnReused.into()),
+        };
+    }
+
     let p = base
         .pending_op
         .as_ref()
+        .filter(|p| p.txn_id == expected_txn_id)
         .ok_or(ActivateError::NothingToActivate)?;
     if p.phase != PendingPhase::KeyObserved {
         return Err(ActivateError::NothingToActivate);
     }
     let binding = p.binding.clone().ok_or(ActivateError::NothingToActivate)?;
-    let (
-        expected_txn_id,
-        expected_kind,
-        expected_generation,
-        expected_epoch,
-        expected_purpose,
-        expected_slot_id,
-    ) = (
-        p.txn_id,
+    let (expected_kind, expected_generation, expected_epoch, expected_purpose, expected_slot_id) = (
         p.kind,
         p.generation,
         p.epoch,
         p.purpose,
         p.canonical_slot.canonical_id(),
     );
+    // Derived from the record's own identity -- never independently
+    // caller-supplied (item B4).
+    let ctx = BindingContext::from_identity(&base.identity);
 
     // Slow I/O below — no guard held, so an urgent RevokeUrgent (or
     // anything else) can freely interleave.
@@ -121,28 +158,30 @@ pub fn activate_from_key_observed<P: PurposeMarker>(
         binding,
         not_after: delegation.not_after,
     };
-    validate_full_binding::<P>(&generation_record, ctx, policy, roster, sig, now)?;
+    validate_full_binding::<P>(&generation_record, &ctx, policy, roster, sig, now)?;
 
-    // Reacquire only now, reread fresh, and let apply()'s own exact-token
-    // check catch any divergence against this snapshot.
-    let guard = locks.acquire_for_mutation();
-    let fresh = match store.load_canonical() {
-        LoadOutcome::Exact(r) => *r,
-        LoadOutcome::Missing => return Err(ActivateError::NoRecord),
-        LoadOutcome::Corrupt => return Err(ActivateError::RecordCorrupt),
-    };
-    let t = RecordTransition::ActivateFromKeyObserved {
-        expected_txn_id,
-        expected_kind,
-        expected_generation,
-        expected_epoch,
-        expected_purpose,
-        expected_slot_id,
-        expected_revision: fresh.revision,
-        delegation,
-    };
-    let new = apply(&fresh, &t, now, max_cap)?;
-    commit_new_bytes(store, &guard, fresh.revision, &new, 8)?;
+    // Reacquire only now, and build against a fresh read taken under that
+    // same guard (`commit_built`) — apply()'s own exact-token check catches
+    // any divergence against this snapshot (e.g. an urgent revoke that ran
+    // while the slow I/O above was in flight).
+    let new = cell
+        .commit_built(
+            |fresh| {
+                Some(RecordTransition::ActivateFromKeyObserved {
+                    expected_txn_id,
+                    expected_kind,
+                    expected_generation,
+                    expected_epoch,
+                    expected_purpose,
+                    expected_slot_id,
+                    expected_revision: fresh.revision,
+                    delegation,
+                })
+            },
+            now,
+            max_cap,
+        )?
+        .expect("build always returns Some");
     Ok(new)
 }
 
@@ -152,7 +191,6 @@ pub fn activate_from_key_observed<P: PurposeMarker>(
 /// without the record itself ever being mutated again.
 pub fn revalidate_on_load<P: PurposeMarker>(
     record: &MeshSignerControlRecordV1,
-    ctx: &BindingContext<'_>,
     policy: &DelegationPolicy,
     roster: &dyn RosterLookup,
     sig: &dyn SignatureVerifier,
@@ -161,8 +199,11 @@ pub fn revalidate_on_load<P: PurposeMarker>(
     if record.purpose != P::PURPOSE_ID {
         return Err(ValidationError::PurposeMismatch);
     }
+    // Derived from the record's own identity -- never independently
+    // caller-supplied (item B4).
+    let ctx = BindingContext::from_identity(&record.identity);
     for g in &record.live_generations {
-        validate_full_binding::<P>(g, ctx, policy, roster, sig, now)?;
+        validate_full_binding::<P>(g, &ctx, policy, roster, sig, now)?;
     }
     Ok(())
 }

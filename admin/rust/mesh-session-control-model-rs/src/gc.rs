@@ -27,71 +27,42 @@
 //!   unresolved entry is still processed.
 //! - a genuine backend mismatch (`GcReport::mismatch`) now routes to
 //!   `GcState::Quarantine`, not silently treated as an ordinary retry.
+//!
+//! Round 5 fix (items A3/D11): `store`/`locks`/`gc_serial` used to be three
+//! independent parameters a caller assembled itself — which meant a caller
+//! external to this crate needed `ControlRecordCell` to hand back a raw
+//! store (defeating A3's closure of that surface) and could construct its
+//! own, unrelated `GcSerialLock` not actually tied to the record it was
+//! ticking (defeating D11's serialization guarantee). Every entry point
+//! here now takes `&ControlRecordCell`, which owns all three together and
+//! only ever commits through `apply` (`commit_built`) — never a raw
+//! `replace_exact`.
 
-use crate::commit::{CommitError, commit_new_bytes};
-use crate::locks::{GcSerialLock, MeshSignerLocks};
-use crate::record::{GcEntry, GcState, MeshSignerControlRecordV1};
+use crate::cell::ControlRecordCell;
+use crate::record::{GcEntry, GcState};
 use crate::secret_backend::{InspectOutcome, SecretBackend};
-use crate::store::{AtomicControlRecordStore, LoadOutcome};
-use crate::transition::{RecordTransition, TransitionError, apply};
+use crate::store::LoadOutcome;
+use crate::transition::RecordTransition;
 use std::collections::HashSet;
 
-#[derive(Debug, thiserror::Error)]
-pub enum GcTickError {
-    #[error("store has no record for this identity")]
-    NoRecord,
-    #[error("record is corrupt")]
-    RecordCorrupt,
-    #[error(transparent)]
-    Transition(#[from] TransitionError),
-    #[error(transparent)]
-    Commit(#[from] CommitError),
-}
+pub use crate::cell::CommitTransitionError as GcTickError;
 
-/// One claim-or-result write: acquire the mutation guard, read fresh under
-/// it, hand the fresh record to `build`, and commit whatever it returns —
-/// all in one continuously held critical section. Returns `Ok(None)` if
-/// `build` reports there is nothing to do against the fresh state (e.g.
-/// the targeted entry was already resolved by a concurrent caller).
-fn read_build_commit(
-    store: &dyn AtomicControlRecordStore,
-    locks: &MeshSignerLocks,
-    build: impl FnOnce(&MeshSignerControlRecordV1) -> Option<RecordTransition>,
-    now: u64,
-    max_cap: usize,
-) -> Result<Option<MeshSignerControlRecordV1>, GcTickError> {
-    let guard = locks.acquire_for_mutation();
-    let base = match store.load_canonical() {
-        LoadOutcome::Exact(r) => *r,
-        LoadOutcome::Missing => return Err(GcTickError::NoRecord),
-        LoadOutcome::Corrupt => return Err(GcTickError::RecordCorrupt),
-    };
-    let Some(t) = build(&base) else {
-        return Ok(None);
-    };
-    let new = apply(&base, &t, now, max_cap)?;
-    commit_new_bytes(store, &guard, base.revision, &new, 8)?;
-    Ok(Some(new))
-}
-
-/// One GC tick for one identity. `gc_serial` is held for the entire call
-/// (erratum1 E1) including every slow `backend` call; each individual
-/// record read+write is its own separate, freshly acquired
+/// One GC tick for one identity. The cell's own `gc_serial` is held for the
+/// entire call (erratum1 E1) including every slow `backend` call; each
+/// individual record read+write is its own separate, freshly acquired
 /// `turnstile`→`access` critical section — the backend is always called
 /// with neither held.
 pub fn gc_worker_tick(
-    store: &dyn AtomicControlRecordStore,
+    cell: &ControlRecordCell,
     backend: &dyn SecretBackend,
-    locks: &MeshSignerLocks,
-    gc_serial: &GcSerialLock,
     now: u64,
     max_cap: usize,
 ) -> Result<usize, GcTickError> {
-    let _serial = gc_serial.acquire();
+    let _serial = cell.acquire_gc_serial();
 
     {
-        let guard = locks.acquire_for_mutation();
-        store.sweep_orphan_tmp(&guard);
+        let guard = cell.acquire_for_mutation();
+        cell.sweep_orphan_tmp(&guard);
     }
 
     let mut resolved_count = 0usize;
@@ -112,7 +83,7 @@ pub fn gc_worker_tick(
     let mut inspected_this_tick: HashSet<String> = HashSet::new();
 
     loop {
-        let rec = match store.load_canonical() {
+        let rec = match cell.load_canonical() {
             LoadOutcome::Exact(r) => *r,
             LoadOutcome::Missing => return Err(GcTickError::NoRecord),
             LoadOutcome::Corrupt => return Err(GcTickError::RecordCorrupt),
@@ -183,9 +154,7 @@ pub fn gc_worker_tick(
                         // persist it durably (GcEntry::InspectionConflict)
                         // rather than silently retrying forever with no
                         // trace it was ever observed.
-                        let committed = read_build_commit(
-                            store,
-                            locks,
+                        let committed = cell.commit_built(
                             |fresh| {
                                 fresh
                                     .gc_pending
@@ -206,9 +175,7 @@ pub fn gc_worker_tick(
                         continue;
                     }
                 };
-                let committed = read_build_commit(
-                    store,
-                    locks,
+                let committed = cell.commit_built(
                     |fresh| {
                         fresh
                             .gc_pending
@@ -238,9 +205,7 @@ pub fn gc_worker_tick(
                     indeterminate_this_tick.insert(slot_id);
                     continue; // this entry only — others still proceed
                 }
-                let committed = read_build_commit(
-                    store,
-                    locks,
+                let committed = cell.commit_built(
                     |fresh| {
                         fresh
                             .gc_pending
@@ -274,16 +239,13 @@ pub fn gc_worker_tick(
 /// crash between "resolved" and "removed" leaves the entry durably visible
 /// as resolved rather than ambiguous.
 pub fn gc_removal_pass(
-    store: &dyn AtomicControlRecordStore,
-    locks: &MeshSignerLocks,
+    cell: &ControlRecordCell,
     now: u64,
     max_cap: usize,
 ) -> Result<usize, GcTickError> {
     let mut removed = 0usize;
     loop {
-        let committed = read_build_commit(
-            store,
-            locks,
+        let committed = cell.commit_built(
             |fresh| {
                 let entry = fresh.gc_pending.iter().find(|e| {
                     matches!(
