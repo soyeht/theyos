@@ -56,7 +56,7 @@
 //! mapping returns [`crate::KeystoreError::PermissionDenied`] with the
 //! documented hint.
 
-use crate::{KeystoreBackend, KeystoreError, SERVICE, macos_keychain_denied_error};
+use crate::{CreateOutcome, KeystoreBackend, KeystoreError, SERVICE, macos_keychain_denied_error};
 
 use core_foundation::base::TCFType;
 use core_foundation::data::CFData;
@@ -123,11 +123,28 @@ impl KeystoreBackend for MacosSystemKeystore {
     /// `src/passwords.rs`) calls `SecItemAdd` and, on `errSecDuplicateItem`,
     /// falls through to `SecItemUpdate` — that's create-or-update, not
     /// create-only. This mirrors that same internal implementation up to
-    /// the duplicate check, then stops: on `errSecDuplicateItem` it reports
-    /// `Conflict` and leaves the existing item untouched instead of
-    /// overwriting it.
+    /// the duplicate check, then stops on `errSecDuplicateItem` instead of
+    /// overwriting.
+    ///
+    /// This is an intentionally NARROWER gate than the File/TPM backends'
+    /// full 5-way [`CreateOutcome`]. `SecItemAdd`'s `OSStatus` is a
+    /// synchronous, authoritative response from a local daemon (securityd) —
+    /// there is no separate "did the write survive a crash" fsync step the
+    /// way there is for a raw filesystem write, so a clean success genuinely
+    /// is [`CreateOutcome::CreatedDurable`] with no extra proof needed. But
+    /// for any `OSStatus` other than success or the well-defined
+    /// `errSecDuplicateItem`, this deliberately does NOT attempt to classify
+    /// the failure as `KnownNoEffect` vs. `MayHaveTakenEffect` — Apple's
+    /// retry-safety semantics across the full `OSStatus` space are not
+    /// something this crate has independently verified, and guessing would
+    /// be exactly the kind of invented guarantee this backend must not make.
+    /// Those cases stay a plain [`KeystoreError`], same as before this
+    /// change. Also does not attempt to model Secure Enclave cardinality or
+    /// return an opaque signer handle — this remains the generic
+    /// `(service, account) -> bytes` API described in the module docs; SE
+    /// identity material stays in `household-rs::keys_se`.
     #[allow(unsafe_code)]
-    fn create_only(&self, account: &str, value: &[u8]) -> Result<(), KeystoreError> {
+    fn create_only(&self, account: &str, value: &[u8]) -> Result<CreateOutcome, KeystoreError> {
         let mut options = PasswordOptions::new_generic_password(&self.service, account);
         options.query.push((
             // SAFETY: `kSecValueData` is a process-lifetime CF constant
@@ -148,18 +165,22 @@ impl KeystoreBackend for MacosSystemKeystore {
         // is documented safe to call with a null-initialized out-param.
         let status = unsafe { SecItemAdd(params.as_concrete_TypeRef(), &raw mut result) };
 
+        if status == 0 {
+            return Ok(CreateOutcome::CreatedDurable);
+        }
         if status == errSecDuplicateItem {
-            return Err(KeystoreError::Conflict {
-                label: format!("{}/{account} (macOS Keychain)", self.service),
-            });
+            // Duplicate alone doesn't say whose value is there — compare
+            // content, same as File/TPM's reinspection step.
+            return match get_generic_password(&self.service, account) {
+                Ok(existing) if existing == value => Ok(CreateOutcome::ExistingExactDurable),
+                Ok(_) => Ok(CreateOutcome::Conflict),
+                Err(e) => Err(map_keychain_err(e, account)),
+            };
         }
-        if status != 0 {
-            return Err(map_keychain_err(
-                security_framework::base::Error::from_code(status),
-                account,
-            ));
-        }
-        Ok(())
+        Err(map_keychain_err(
+            security_framework::base::Error::from_code(status),
+            account,
+        ))
     }
 }
 
@@ -230,21 +251,31 @@ mod tests {
             account: account.clone(),
         };
 
-        ks.create_only(&account, b"first-writer-wins").unwrap();
+        assert_eq!(
+            ks.create_only(&account, b"first-writer-wins").unwrap(),
+            CreateOutcome::CreatedDurable
+        );
         assert_eq!(ks.get(&account).unwrap(), b"first-writer-wins");
 
-        let err = ks
-            .create_only(&account, b"second-writer-loses")
-            .unwrap_err();
-        assert!(
-            matches!(err, KeystoreError::Conflict { .. }),
-            "expected Conflict, got {err:?}"
+        assert_eq!(
+            ks.create_only(&account, b"second-writer-loses").unwrap(),
+            CreateOutcome::Conflict,
+            "different content must report a real Conflict"
         );
         // Loser must not have clobbered the winner.
         assert_eq!(ks.get(&account).unwrap(), b"first-writer-wins");
 
+        assert_eq!(
+            ks.create_only(&account, b"first-writer-wins").unwrap(),
+            CreateOutcome::ExistingExactDurable,
+            "resubmitting the SAME content must converge, not conflict"
+        );
+
         ks.delete(&account).unwrap();
-        ks.create_only(&account, b"recreated-after-delete").unwrap();
+        assert_eq!(
+            ks.create_only(&account, b"recreated-after-delete").unwrap(),
+            CreateOutcome::CreatedDurable
+        );
         assert_eq!(ks.get(&account).unwrap(), b"recreated-after-delete");
     }
 }

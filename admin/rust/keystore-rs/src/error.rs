@@ -39,16 +39,16 @@ pub enum KeystoreError {
     #[error("keystore operation not supported: {hint}")]
     Unsupported { hint: String },
 
-    /// A [`KeystoreBackend::create_only`](crate::KeystoreBackend::create_only)
-    /// call's install step (the syscall that publishes the entry) reported
-    /// success, but the follow-up step that would *prove* durability failed
-    /// or could not run. The entry most likely exists right now — a
-    /// subsequent `create_only`/`get` will report which — but whether it
-    /// would survive a crash between the install and a future successful
-    /// durability barrier is unproven. Distinct from [`Self::Io`], which
-    /// means the install itself did not happen.
-    #[error("create-only durability unconfirmed for {label}: {hint}")]
-    AmbiguousDurability { label: String, hint: String },
+    /// A reinspection step (used to resolve a
+    /// [`CreateOutcome`](crate::CreateOutcome) after an ambiguous install)
+    /// found the on-disk entry is not what it should be: a symlink where a
+    /// regular file is required, a non-regular file, or a mode/owner that
+    /// doesn't match what this backend itself writes. Fails closed rather
+    /// than reading through it — an entry with these properties was never
+    /// produced by this backend's own `set`/`create_only`, so trusting its
+    /// content would mean trusting whatever placed it there.
+    #[error("keystore entry failed a security check for {label}: {hint}")]
+    SecurityViolation { label: String, hint: String },
 
     #[error("keystore I/O error: {kind}: {hint}")]
     Io { kind: String, hint: String },
@@ -73,7 +73,7 @@ impl KeystoreError {
             Self::NotFound { .. } => "keystore.not_found",
             Self::Conflict { .. } => "keystore.conflict",
             Self::Unsupported { .. } => "keystore.unsupported",
-            Self::AmbiguousDurability { .. } => "keystore.ambiguous_durability",
+            Self::SecurityViolation { .. } => "keystore.security_violation",
             Self::Io { .. } => "keystore.io",
             Self::SigningFailed(_) => "keystore.signing_failed",
             Self::InvalidKeyMaterial(_) => "keystore.invalid_key_material",
@@ -89,7 +89,7 @@ impl KeystoreError {
             | Self::SeUnavailable { hint }
             | Self::Io { hint, .. }
             | Self::Unsupported { hint }
-            | Self::AmbiguousDurability { hint, .. } => hint.clone(),
+            | Self::SecurityViolation { hint, .. } => hint.clone(),
             Self::NotFound { label } => format!("entry {label} missing from keystore"),
             Self::Conflict { label } => format!("entry {label} already exists"),
             Self::SigningFailed(msg) | Self::InvalidKeyMaterial(msg) => msg.clone(),

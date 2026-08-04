@@ -114,23 +114,18 @@ pub trait KeystoreBackend: Send + Sync {
     fn delete(&self, account: &str) -> Result<(), KeystoreError>;
 
     /// Atomically create `account` with `value` iff it does not already
-    /// exist. Never overwrites.
+    /// exist, converging on a *proven* outcome rather than a guess. See
+    /// [`CreateOutcome`] for what each variant proves and what it doesn't.
     ///
-    /// - `Ok(())` — this call created the entry.
-    /// - `Err(`[`KeystoreError::Conflict`]`)` — an entry already existed;
-    ///   nothing was written. Callers who need the existing bytes must call
-    ///   [`Self::get`] afterwards as a separate step — reading stale data is
-    ///   harmless, but this method will not silently perform that read for
-    ///   you, and doing an inspect-then-write yourself instead of calling
-    ///   this method reopens the exact TOCTOU window it exists to close.
-    /// - `Err(`[`KeystoreError::Unsupported`]`)` — this backend has no
-    ///   race-free create primitive in its underlying API. Do not fall back
-    ///   to `get`-then-`set`; that is not atomic and defeats the guarantee.
+    /// `Err(`[`KeystoreError::Unsupported`]`)` means this backend has no
+    /// race-free create primitive in its underlying API. Do not fall back to
+    /// `get`-then-`set` yourself; that is not atomic and defeats the
+    /// guarantee this method exists to provide.
     ///
     /// The guarantee is scoped to concurrent `create_only` callers racing
-    /// each other (and to `get`/`create_only` races): exactly one caller
-    /// observes `Ok(())` for a given account. It says nothing about a
-    /// concurrent [`Self::set`], which is documented to overwrite
+    /// each other (and to `get`/`create_only` races): exactly one caller's
+    /// bytes end up durably installed for a given account. It says nothing
+    /// about a concurrent [`Self::set`], which is documented to overwrite
     /// unconditionally by design — mixing `create_only` and `set` on the
     /// same account from different callers is a caller-level contract
     /// violation, not something this method can fix.
@@ -138,10 +133,51 @@ pub trait KeystoreBackend: Send + Sync {
     /// Defaults to [`KeystoreError::Unsupported`] so implementors of this
     /// trait outside this crate keep compiling; backends that can prove a
     /// real atomic primitive override it.
-    fn create_only(&self, account: &str, value: &[u8]) -> Result<(), KeystoreError> {
+    fn create_only(&self, account: &str, value: &[u8]) -> Result<CreateOutcome, KeystoreError> {
         let _ = (account, value);
         Err(KeystoreError::Unsupported {
             hint: "this keystore backend has no race-free create-only primitive".into(),
         })
     }
+}
+
+/// Outcome of [`KeystoreBackend::create_only`]. Five states, not a boolean,
+/// because "the install syscall returned success/failure" and "the effect on
+/// `account` is proven" are different claims — collapsing them either hides
+/// a real ambiguity behind a false `Ok`, or hides a real success behind a
+/// generic `Err` a caller can't act on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CreateOutcome {
+    /// This call installed `value` under `account`, and the durability of
+    /// that installation is proven (e.g. the parent-directory fsync that
+    /// makes a filesystem create survive a crash actually succeeded, or the
+    /// backend's own store is authoritative and synchronous about it).
+    CreatedDurable,
+    /// `account` already held exactly `value` (byte-for-byte), and that is
+    /// now freshly (re-)proven durable — either because a concurrent/prior
+    /// caller's `create_only` for the same bytes already won, or because
+    /// this call's own reinspection-and-stabilization step re-established
+    /// durability from the current on-disk state rather than trusting
+    /// whatever the original attempt's outcome was.
+    ExistingExactDurable,
+    /// `account` already held different bytes than `value`. Nothing was
+    /// written by this call. Distinct from [`Self::ExistingExactDurable`]:
+    /// this is a real content mismatch, not the caller's own value
+    /// re-observed.
+    Conflict,
+    /// Proven that this call had no effect on `account` — the failure
+    /// happened strictly before any publish/install attempt (e.g. writing
+    /// the private scratch file this call uses internally never even
+    /// succeeded), and reinspection confirms `account` does not hold this
+    /// call's bytes.
+    KnownNoEffect,
+    /// The install step's own result was itself inconclusive (e.g. the
+    /// publish syscall returned an error that does not unambiguously prove
+    /// "nothing happened" — see the general lesson that a syscall failure
+    /// does not always mean the underlying effect didn't land), and
+    /// reinspection could not resolve it to one of the other four outcomes
+    /// (matching content, an unambiguous conflict, or proven absence).
+    /// Callers must retry `create_only` with the same bytes rather than
+    /// assume either success or failure.
+    MayHaveTakenEffect,
 }

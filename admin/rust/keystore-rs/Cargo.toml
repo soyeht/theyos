@@ -12,10 +12,22 @@ path = "src/lib.rs"
 thiserror = { workspace = true }
 tracing   = { workspace = true }
 base64    = { workspace = true }
+blake3    = { workspace = true }
+zeroize   = { workspace = true }
 
-# Linux: Secret Service (gnome-keyring) or kernel keyring via the `keyring` crate.
+# Linux: Secret Service (gnome-keyring) or kernel keyring via the `keyring`
+# crate, and libc for the O_NOFOLLOW/fstat-based secure reinspection used by
+# create_only's stabilization step (regular unix target, not just Linux —
+# see the crate-root `[target.'cfg(unix)'.dependencies]` below.
 [target.'cfg(target_os = "linux")'.dependencies]
 keyring = { workspace = true }
+
+# unix (Linux + macOS): raw O_NOFOLLOW open + fstat for create_only's
+# reinspection step (file_backend.rs::secure_open_regular_nofollow). std
+# doesn't expose O_NOFOLLOW or geteuid(); libc is already an approved direct
+# dependency elsewhere in this workspace (server-rs's VPN backends).
+[target.'cfg(unix)'.dependencies]
+libc = { workspace = true }
 
 # macOS: security-framework wrapper around Keychain Services for generic-password
 # entries. The household crate's Secure-Enclave key path stays where it is

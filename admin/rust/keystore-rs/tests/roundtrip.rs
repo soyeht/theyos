@@ -3,7 +3,7 @@
 //! sandboxes — they have their own contract tests in household-rs that ARE
 //! invoked manually on workstations.
 
-use keystore_rs::{FileKeystore, KeystoreBackend, KeystoreError};
+use keystore_rs::{CreateOutcome, FileKeystore, KeystoreBackend, KeystoreError};
 use tempfile::tempdir;
 
 #[test]
@@ -104,13 +104,30 @@ fn file_backend_create_only_never_overwrites_a_winner() {
     let dir = tempdir().unwrap();
     let store = FileKeystore::new(dir.path(), "com.soyeht.theyos.test");
 
-    store.create_only("acct", b"first").unwrap();
-
-    match store.create_only("acct", b"second") {
-        Err(KeystoreError::Conflict { .. }) => {}
-        other => panic!("expected Conflict, got {other:?}"),
-    }
+    assert_eq!(
+        store.create_only("acct", b"first").unwrap(),
+        CreateOutcome::CreatedDurable
+    );
+    assert_eq!(
+        store.create_only("acct", b"second").unwrap(),
+        CreateOutcome::Conflict
+    );
     assert_eq!(store.get("acct").unwrap(), b"first");
+}
+
+#[test]
+fn file_backend_create_only_same_value_converges_not_conflict() {
+    let dir = tempdir().unwrap();
+    let store = FileKeystore::new(dir.path(), "com.soyeht.theyos.test");
+
+    assert_eq!(
+        store.create_only("acct", b"same").unwrap(),
+        CreateOutcome::CreatedDurable
+    );
+    assert_eq!(
+        store.create_only("acct", b"same").unwrap(),
+        CreateOutcome::ExistingExactDurable
+    );
 }
 
 #[test]
@@ -120,7 +137,10 @@ fn file_backend_create_only_then_delete_then_create_only_again() {
 
     store.create_only("acct", b"v1").unwrap();
     store.delete("acct").unwrap();
-    store.create_only("acct", b"v2").unwrap();
+    assert_eq!(
+        store.create_only("acct", b"v2").unwrap(),
+        CreateOutcome::CreatedDurable
+    );
 
     assert_eq!(store.get("acct").unwrap(), b"v2");
 }

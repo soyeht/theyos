@@ -3036,13 +3036,16 @@ name = "keystore-rs"
 version = "0.1.0"
 dependencies = [
  "base64 0.22.1",
+ "blake3",
  "core-foundation 0.9.4",
  "keyring",
+ "libc",
  "security-framework",
  "security-framework-sys",
  "tempfile",
  "thiserror 1.0.69",
  "tracing",
+ "zeroize",
 ]
 
 [[package]]

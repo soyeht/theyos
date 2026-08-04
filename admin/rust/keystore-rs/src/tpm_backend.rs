@@ -38,7 +38,10 @@ use std::path::Path;
 use std::process::{Command, Stdio};
 use std::sync::OnceLock;
 
-use crate::{FileKeystore, KeystoreBackend, KeystoreError};
+use zeroize::Zeroize;
+
+use crate::file_backend::InstallOutcome;
+use crate::{CreateOutcome, FileKeystore, KeystoreBackend, KeystoreError};
 
 /// Path to the `systemd-creds` binary. `which` would be more portable but
 /// this avoids pulling in a dep — the path resolution is one-shot and
@@ -91,17 +94,64 @@ impl KeystoreBackend for TpmKeystore {
 
     /// Seals `value` and publishes it iff `account` is absent.
     ///
-    /// Encryption happens before the race is resolved: two concurrent
-    /// callers each seal their own candidate, but [`FileKeystore::create_only`]
-    /// guarantees only one candidate's ciphertext is ever published — the
-    /// loser's sealed blob is never written to disk and its
-    /// `KeystoreError::Conflict` propagates unchanged, without needing to
-    /// decrypt and compare anything. Slightly wasteful (a losing caller pays
-    /// for a `systemd-creds encrypt` that gets discarded) but not incorrect,
-    /// and secret creation is not a hot path.
-    fn create_only(&self, account: &str, value: &[u8]) -> Result<(), KeystoreError> {
+    /// Does NOT delegate to [`FileKeystore::create_only`] — that backend
+    /// compares raw bytes, which is wrong here: `systemd-creds encrypt` is
+    /// randomized (each call produces a different sealed blob for the same
+    /// plaintext), so a byte-for-byte comparison of two ciphertexts of the
+    /// identical plaintext would never match, turning a caller's own
+    /// idempotent retry into a spurious [`CreateOutcome::Conflict`] instead
+    /// of the [`CreateOutcome::ExistingExactDurable`] it should see. Instead
+    /// this installs via the same underlying no-replace primitive
+    /// ([`FileKeystore::raw_attempt_install`]) but, on anything short of a
+    /// clean durable install, reinspects and compares at the PLAINTEXT
+    /// level — decrypting the on-disk ciphertext, comparing to `value`, and
+    /// zeroizing the decrypted buffer once the comparison is done. The
+    /// underlying encryption is never bypassed: File never sees plaintext,
+    /// only this module does, only transiently, and this method — like
+    /// File's — never overwrites an existing entry.
+    fn create_only(&self, account: &str, value: &[u8]) -> Result<CreateOutcome, KeystoreError> {
+        self.inner.ensure_dir().map_err(|e| KeystoreError::Io {
+            kind: e.kind().to_string(),
+            hint: format!("create secrets dir: {e}"),
+        })?;
         let ciphertext = encrypt_with_systemd_creds(account, value)?;
-        self.inner.create_only(account, &ciphertext)
+        match self.inner.raw_attempt_install(account, &ciphertext) {
+            Ok(InstallOutcome::Durable) => Ok(CreateOutcome::CreatedDurable),
+            Ok(InstallOutcome::Ambiguous(_) | InstallOutcome::ProvenConflict) | Err(_) => {
+                self.stabilize_and_classify_plaintext(account, value)
+            }
+        }
+    }
+}
+
+impl TpmKeystore {
+    /// Reinspect the sealed blob currently at `account`'s path (if any),
+    /// decrypt it, and compare the PLAINTEXT to `expected` — never the raw
+    /// ciphertext, since two sealed blobs of identical plaintext are never
+    /// byte-identical. See [`KeystoreBackend::create_only`]'s impl on this
+    /// type for why this exists instead of delegating to
+    /// [`FileKeystore::create_only`].
+    ///
+    /// Delegates to [`FileKeystore::reinspect_and_stabilize`] so the
+    /// durability proof runs against the SAME fd the ciphertext was read
+    /// from (no re-open-by-path between compare and fsync) — the same
+    /// TOCTOU guarantee File's own comparison gets, not a weaker one just
+    /// because the comparison itself needs a decrypt step first.
+    fn stabilize_and_classify_plaintext(
+        &self,
+        account: &str,
+        expected: &[u8],
+    ) -> Result<CreateOutcome, KeystoreError> {
+        self.inner.reinspect_and_stabilize(account, |ciphertext| {
+            // An existing blob that fails to decrypt at all (wrong TPM
+            // state, corrupted, sealed under a stale key) is a genuine
+            // operational failure, not an ambiguity a retry would resolve —
+            // propagate it (via `?`) rather than guessing.
+            let mut existing_plaintext = decrypt_with_systemd_creds(account, ciphertext)?;
+            let matches = existing_plaintext.as_slice() == expected;
+            existing_plaintext.zeroize();
+            Ok(matches)
+        })
     }
 }
 
@@ -302,8 +352,11 @@ mod tests {
         }
         let dir = TempDir::new().unwrap();
         let ks = TpmKeystore::new(dir.path(), "test.tpm.create_only");
-        ks.create_only("llm.api_key.created", b"sk-created-0123456789")
-            .unwrap();
+        assert_eq!(
+            ks.create_only("llm.api_key.created", b"sk-created-0123456789")
+                .unwrap(),
+            CreateOutcome::CreatedDurable
+        );
         assert_eq!(
             ks.get("llm.api_key.created").unwrap(),
             b"sk-created-0123456789"
@@ -311,20 +364,55 @@ mod tests {
     }
 
     #[test]
-    fn create_only_conflict_leaves_first_seal_untouched() {
+    fn create_only_different_plaintext_is_conflict_leaves_first_seal_untouched() {
         if !tpm2_available() {
             eprintln!("skipping: no TPM2 available on this host");
             return;
         }
         let dir = TempDir::new().unwrap();
         let ks = TpmKeystore::new(dir.path(), "test.tpm.create_only_conflict");
-        ks.create_only("acct", b"first").unwrap();
-
-        let err = ks.create_only("acct", b"second").unwrap_err();
-        assert!(
-            matches!(err, KeystoreError::Conflict { .. }),
-            "expected Conflict, got {err:?}"
+        assert_eq!(
+            ks.create_only("acct", b"first").unwrap(),
+            CreateOutcome::CreatedDurable
+        );
+        assert_eq!(
+            ks.create_only("acct", b"second").unwrap(),
+            CreateOutcome::Conflict
         );
         assert_eq!(ks.get("acct").unwrap(), b"first");
+    }
+
+    /// The whole reason `create_only` here does NOT delegate to
+    /// `FileKeystore::create_only`: `systemd-creds encrypt` is randomized,
+    /// so re-sealing the SAME plaintext produces a different ciphertext
+    /// every time. A byte-level comparison (what File does) would see two
+    /// different blobs and wrongly report Conflict on a caller's own
+    /// idempotent retry. This must converge to ExistingExactDurable
+    /// instead, proving the plaintext-level comparison actually runs.
+    #[test]
+    fn create_only_same_plaintext_retry_converges_despite_randomized_ciphertext() {
+        if !tpm2_available() {
+            eprintln!("skipping: no TPM2 available on this host");
+            return;
+        }
+        let dir = TempDir::new().unwrap();
+        let ks = TpmKeystore::new(dir.path(), "test.tpm.create_only_idempotent");
+        let plaintext = b"sk-same-plaintext-every-time";
+
+        assert_eq!(
+            ks.create_only("acct", plaintext).unwrap(),
+            CreateOutcome::CreatedDurable
+        );
+        let first_ciphertext = ks.inner.get("acct").unwrap();
+
+        assert_eq!(
+            ks.create_only("acct", plaintext).unwrap(),
+            CreateOutcome::ExistingExactDurable,
+            "same plaintext resubmitted must converge, not spuriously conflict"
+        );
+        // The on-disk ciphertext must be untouched by the retry (create_only
+        // never overwrites) — still decrypts to the same plaintext.
+        assert_eq!(ks.inner.get("acct").unwrap(), first_ciphertext);
+        assert_eq!(ks.get("acct").unwrap(), plaintext);
     }
 }
