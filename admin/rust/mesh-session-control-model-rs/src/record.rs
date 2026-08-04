@@ -2,6 +2,10 @@
 //! `aecc5ecf`, erratum1 `4d0e7e25`). One record per `(ControlIdentity,
 //! PurposeId)`; no satellite files. This module holds only data + pure
 //! invariant checks, no I/O.
+//!
+//! Successor to the generation audited at commit `d4ecb658` (NO-GO). Every
+//! type change here traces to a specific finding from that audit — see the
+//! doc comment on each item.
 
 use serde::{Deserialize, Serialize};
 use std::num::NonZeroU64;
@@ -16,13 +20,32 @@ pub struct ControlIdentity {
     pub channel: Channel,
 }
 
+/// Canonical, injective digest of `ControlIdentity` — length-prefixed so
+/// `("ab", "c")` and `("a", "bc")` can never collide. This is what
+/// `SlotId::identity_digest` must always be derived from (audit finding 4:
+/// generation/slot must be *derived*, never caller-supplied).
+#[must_use]
+pub fn identity_digest(identity: &ControlIdentity) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update((identity.hh_id.len() as u64).to_be_bytes());
+    h.update(identity.hh_id.as_bytes());
+    h.update((identity.machine_id.len() as u64).to_be_bytes());
+    h.update(identity.machine_id.as_bytes());
+    h.update([match identity.channel {
+        Channel::Dev => 0u8,
+        Channel::Release => 1u8,
+    }]);
+    h.finalize().into()
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Channel {
     Dev,
     Release,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum PurposeId {
     MeshSession,
     RosterSync,
@@ -60,7 +83,7 @@ pub enum PendingPhase {
     KeyObserved,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct SlotId {
     pub identity_digest: [u8; 32],
     pub purpose: PurposeId,
@@ -70,6 +93,12 @@ pub struct SlotId {
 }
 
 impl SlotId {
+    /// Injective encoding of every field, including `backend_instance` —
+    /// two slots identical except for backend (e.g. the same identity/
+    /// purpose/generation/txn_id once on `SecureEnclave` and once on
+    /// `TpmSealedSoftware`) must never collide on the string used
+    /// pervasively for GC-entry and delegation key-id lookups, since
+    /// `SlotId`'s own `Eq`/`Hash` already treat them as distinct.
     #[must_use]
     pub fn canonical_id(&self) -> String {
         let mut s = hex::encode(self.identity_digest);
@@ -82,11 +111,17 @@ impl SlotId {
         s.push_str(&self.generation.get().to_string());
         s.push('.');
         s.push_str(&hex::encode(self.txn_id));
+        s.push('.');
+        s.push_str(match self.backend_instance {
+            BackendKind::SecureEnclave => "se",
+            BackendKind::TpmSealedSoftware => "tpm",
+            BackendKind::File => "file",
+        });
         s
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum BackendKind {
     SecureEnclave,
     TpmSealedSoftware,
@@ -105,6 +140,14 @@ pub struct PendingOp {
     pub txn_id: [u8; 16],
     pub kind: PendingOpKind,
     pub generation: NonZeroU64,
+    /// `epoch_high_water` at the moment this pending op was created (by
+    /// `IntentRecorded` or `ReactivateFromRevoked`). `KeyObserved`/
+    /// `ActivateFromKeyObserved` must be called with this exact value as
+    /// `expected_epoch` — audit finding 1: a worker holding a stale
+    /// reference to an *earlier* pending op (preempted by a revoke, which
+    /// bumps `epoch_high_water`) must not be able to complete a *later*
+    /// pending op just because both happen to share the same `phase`.
+    pub epoch: NonZeroU64,
     pub purpose: PurposeId,
     pub backend: BackendKind,
     pub canonical_slot: SlotId,
@@ -177,11 +220,32 @@ pub enum GcEntry {
         slot: SlotId,
         txn_id: [u8; 16],
     },
+    /// First inspection observed nothing at this slot. Audit finding 6: a
+    /// backend may be eventually consistent, so a single absent reading is
+    /// not proof nothing will ever appear there — treating it as terminal
+    /// immediately risks leaking a late-materializing key with nothing left
+    /// tracking it. A second, independently fresh inspection is required
+    /// before this can be trusted as `Absent`. If that second inspection
+    /// instead observes a real item (a late apparition), this moves to
+    /// `Bound` with the real observed binding, never straight to `Absent`.
+    AbsentUnconfirmed {
+        slot: SlotId,
+        txn_id: [u8; 16],
+    },
     Bound {
         slot: SlotId,
         txn_id: [u8; 16],
         binding: ExactBinding,
         state: GcState,
+    },
+    /// Terminal: confirmed on two independent inspections that nothing was
+    /// ever created at this slot. No `binding` field — audit finding 6
+    /// ("nenhum binding fabricado"): the prior design forced a placeholder
+    /// `ExactBinding` into this state purely to satisfy `Bound`'s shape;
+    /// this variant has nothing to fabricate a placeholder for.
+    Absent {
+        slot: SlotId,
+        txn_id: [u8; 16],
     },
 }
 
@@ -189,15 +253,29 @@ impl GcEntry {
     #[must_use]
     pub fn slot(&self) -> &SlotId {
         match self {
-            GcEntry::AwaitingInspection { slot, .. } | GcEntry::Bound { slot, .. } => slot,
+            GcEntry::AwaitingInspection { slot, .. }
+            | GcEntry::AbsentUnconfirmed { slot, .. }
+            | GcEntry::Bound { slot, .. }
+            | GcEntry::Absent { slot, .. } => slot,
+        }
+    }
+
+    #[must_use]
+    pub fn txn_id(&self) -> [u8; 16] {
+        match self {
+            GcEntry::AwaitingInspection { txn_id, .. }
+            | GcEntry::AbsentUnconfirmed { txn_id, .. }
+            | GcEntry::Bound { txn_id, .. }
+            | GcEntry::Absent { txn_id, .. } => *txn_id,
         }
     }
 
     #[must_use]
     pub fn observation_complete_and_residual_zero(&self) -> bool {
         match self {
-            GcEntry::AwaitingInspection { .. } => false,
+            GcEntry::AwaitingInspection { .. } | GcEntry::AbsentUnconfirmed { .. } => false,
             GcEntry::Bound { state, .. } => state.observation_complete_and_residual_zero(),
+            GcEntry::Absent { .. } => true,
         }
     }
 }
@@ -214,16 +292,61 @@ pub struct TerminalResult {
     pub txn_id: [u8; 16],
     pub outcome: TerminalOutcome,
     pub recorded_at: u64,
+    /// Explicit retention: an unacked entry is never silently evicted, even
+    /// once the list is at `MAX_RECENT_TERMINAL_RESULTS`. Audit finding 5
+    /// ("sem FIFO silencioso"): a blind FIFO can drop a result a caller has
+    /// not yet observed, which is indistinguishable from that result never
+    /// having been recorded at all.
+    pub acked: bool,
 }
 
-/// Idempotent bounded push: re-recording the same `txn_id` replaces the
-/// prior entry instead of duplicating it (lost-ack recovery re-derives the
-/// same terminal result and must not grow the list).
-pub fn push_bounded_terminal(mut v: Vec<TerminalResult>, r: TerminalResult) -> Vec<TerminalResult> {
-    v.retain(|e| e.txn_id != r.txn_id);
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum TerminalPushError {
+    #[error("txn_id already has a different recorded outcome")]
+    OutcomeConflict,
+    #[error("terminal-result retention is full and no acked entry can be evicted")]
+    RetentionExhausted,
+}
+
+/// Idempotent-by-txn_id, bounded, fail-closed on conflict, ack-aware
+/// retention. Re-recording an existing `txn_id` with the *same* outcome is
+/// a no-op (lost-ack recovery re-derives the same terminal result and must
+/// not grow the list or disturb its ack state). Re-recording an existing
+/// `txn_id` with a *different* outcome is rejected — audit finding 5
+/// ("conflito fail-closed"): two different outcomes for one txn_id is an
+/// invariant violation, never something to silently paper over. When the
+/// list is full, only an already-acked entry may be evicted to make room
+/// (oldest-acked-first); if every entry is unacked, the push fails rather
+/// than dropping one nobody has observed yet.
+pub fn push_bounded_terminal(
+    mut v: Vec<TerminalResult>,
+    r: TerminalResult,
+) -> Result<Vec<TerminalResult>, TerminalPushError> {
+    if let Some(existing) = v.iter().find(|e| e.txn_id == r.txn_id) {
+        if existing.outcome != r.outcome {
+            return Err(TerminalPushError::OutcomeConflict);
+        }
+        return Ok(v);
+    }
+    if v.len() >= MAX_RECENT_TERMINAL_RESULTS {
+        match v.iter().position(|e| e.acked) {
+            Some(idx) => {
+                v.remove(idx);
+            }
+            None => return Err(TerminalPushError::RetentionExhausted),
+        }
+    }
     v.push(r);
-    if v.len() > MAX_RECENT_TERMINAL_RESULTS {
-        v.remove(0);
+    Ok(v)
+}
+
+/// Marks `txn_id` acknowledged so it becomes eligible for eviction once the
+/// retention list is full. A no-op if `txn_id` is not present.
+pub fn ack_terminal(mut v: Vec<TerminalResult>, txn_id: [u8; 16]) -> Vec<TerminalResult> {
+    for e in &mut v {
+        if e.txn_id == txn_id {
+            e.acked = true;
+        }
     }
     v
 }
@@ -265,7 +388,10 @@ impl MeshSignerControlRecordV1 {
     /// generations, an in-flight pending op (0 or 1), and unresolved GC
     /// entries. `RevokeUrgent` is provably cap-neutral (see
     /// `transition::apply`'s doc comment) precisely because it trades one
-    /// `pending_op` for at most one `gc_pending` entry.
+    /// `pending_op` for at most one `gc_pending` entry. Deliberately
+    /// excludes `recent_terminal_results`, which has its own separate,
+    /// ack-gated retention cap (`MAX_RECENT_TERMINAL_RESULTS`) — audit
+    /// finding 5 ("cap separado").
     #[must_use]
     pub fn cap_occupancy(&self) -> usize {
         self.live_generations.len()

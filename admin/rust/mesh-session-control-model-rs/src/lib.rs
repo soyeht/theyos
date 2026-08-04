@@ -19,6 +19,8 @@
 //! revoke transport, anti-rollback against filesystem snapshot restore) are
 //! unaffected by anything in this crate.
 
+pub mod activate;
+pub mod commit;
 pub mod gc;
 pub mod locks;
 pub mod record;

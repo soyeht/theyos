@@ -3,8 +3,38 @@
 //! A real file-backed implementation plus a fault-injecting test double that
 //! can simulate a crash at any of the three risky boundaries
 //! (pre-rename / rename itself / parent-fsync).
+//!
+//! Successor to the generation audited at commit `d4ecb658` (NO-GO, finding
+//! 2): the prior `replace_exact` did an internal `load_canonical()`
+//! (compare) fully decoupled from the later `rename()` (swap), with no lock
+//! spanning the two — two concurrent callers could both pass the revision
+//! check and both report `Committed`, one silently clobbering the other.
+//! It also trusted `new_record.revision` verbatim, and accepted *any*
+//! record as the first-ever write when the file was `Missing`. All three
+//! gaps are closed here:
+//! - `replace_exact` now requires a `&locks::MutateGuard` — a type that can
+//!   only be constructed by `MeshSignerLocks::acquire_for_mutation`
+//!   (turnstile-then-access-exclusive) — so compare-then-write happens in a
+//!   single section under exclusive access, not just by caller convention.
+//! - the revision relationship between `new_record` and the current disk
+//!   state is verified, not trusted: a mutation must land on exactly
+//!   `cur.revision + 1`; a stabilization rewrite must be byte-identical
+//!   (including `revision`) to what is already on disk.
+//! - `Missing` only accepts the canonical bootstrap record for the target
+//!   identity/purpose — not an arbitrary caller-supplied first record.
+//!
+//! Second-round fix: a `&MutateGuard` alone proved only "some exclusive
+//! guard exists," not that it came from the `MeshSignerLocks` this store is
+//! meant to be paired with — two independently constructed lock sets over
+//! the same path would not exclude each other. `FileBackedStore` is now
+//! constructed with the `LockToken` of the one lock set it accepts, plus
+//! the `(ControlIdentity, PurposeId)` it is bound to; `replace_exact`
+//! asserts the guard's token matches and validates every write — genesis
+//! included — against *this store's own binding*, never against whatever
+//! identity/purpose `new_record` itself happens to claim.
 
-use crate::record::MeshSignerControlRecordV1;
+use crate::locks::{LockToken, MutateGuard};
+use crate::record::{ControlIdentity, MeshSignerControlRecordV1, PurposeId};
 use std::fs::{self, File, OpenOptions};
 use std::io;
 use std::path::{Path, PathBuf};
@@ -14,10 +44,16 @@ use std::sync::atomic::{AtomicU64, Ordering};
 pub enum ReplaceOutcome {
     Committed,
     /// Provably no external effect: the failure happened strictly before
-    /// `rename` was invoked.
+    /// `rename` was invoked, or the proposed write was rejected outright
+    /// (stale revision, malformed revision relationship, non-canonical
+    /// genesis record).
     KnownNoEffect,
     /// The failure happened at or after `rename` — the new content may or
     /// may not be durably visible. Never conflated with `KnownNoEffect`.
+    /// Recovery must retry the identical bytes against the identical
+    /// `expected_revision` until a definitive outcome is reached — a
+    /// reread that merely "looks right" does not prove *this* write is
+    /// what produced it (see `commit::commit_under_guard`).
     MayHaveTakenEffect,
 }
 
@@ -32,50 +68,147 @@ pub trait AtomicControlRecordStore {
     fn load_canonical(&self) -> LoadOutcome;
     fn replace_exact(
         &self,
+        guard: &MutateGuard<'_>,
         expected_revision: u64,
         new_record: &MeshSignerControlRecordV1,
     ) -> ReplaceOutcome;
     /// Best-effort cleanup of orphaned temp files from a prior crashed
-    /// attempt. Only ever called by a caller already holding the exclusive
-    /// write lock for this record — see `ensure_durable`.
-    fn sweep_orphan_tmp(&self);
+    /// attempt. Requires the exclusive guard: the caller must not have
+    /// created a tmp file for its *own* current attempt yet (sweep always
+    /// runs first in a critical section), so anything found here predates
+    /// this section and cannot belong to a write still in flight.
+    fn sweep_orphan_tmp(&self, guard: &MutateGuard<'_>);
 }
 
+/// Recursively sorts every CBOR map's entries into RFC 7049 §3.9 / RFC 8949
+/// §4.2.3 canonical key order, using ciborium's own verified
+/// `CanonicalValue` comparator rather than a hand-rolled one. Arrays are
+/// positional and need no reordering. Integer/text-length minimality is
+/// already guaranteed by ciborium's encoder (its `Header::Positive` always
+/// picks the shortest representation for a given value) — the one thing it
+/// does *not* do automatically is sort map keys, which is what this closes.
+/// Rejects (returns `None`) if two entries in the same map canonically
+/// compare equal — a duplicate key, which sorting alone would only make
+/// adjacent, never detect.
+fn canonicalize_value(v: ciborium::Value) -> Option<ciborium::Value> {
+    use ciborium::Value;
+    use ciborium::value::CanonicalValue;
+    match v {
+        Value::Array(items) => Some(Value::Array(
+            items
+                .into_iter()
+                .map(canonicalize_value)
+                .collect::<Option<Vec<_>>>()?,
+        )),
+        Value::Map(entries) => {
+            let mut entries = entries
+                .into_iter()
+                .map(|(k, val)| Some((canonicalize_value(k)?, canonicalize_value(val)?)))
+                .collect::<Option<Vec<_>>>()?;
+            entries.sort_by(|(k1, _), (k2, _)| {
+                CanonicalValue::from(k1.clone()).cmp(&CanonicalValue::from(k2.clone()))
+            });
+            for w in entries.windows(2) {
+                if CanonicalValue::from(w[0].0.clone()) == CanonicalValue::from(w[1].0.clone()) {
+                    return None; // duplicate key
+                }
+            }
+            Some(Value::Map(entries))
+        }
+        Value::Tag(t, inner) => Some(Value::Tag(t, Box::new(canonicalize_value(*inner)?))),
+        other => Some(other),
+    }
+}
+
+/// Encodes `rec` normally, then re-derives it through the canonical `Value`
+/// tree so the bytes actually written are RFC-canonical regardless of the
+/// struct's field declaration order — the name `to_canonical_bytes` used to
+/// be aspirational only; this is what makes it true.
 fn to_canonical_bytes(rec: &MeshSignerControlRecordV1) -> Option<Vec<u8>> {
-    let mut buf = Vec::new();
-    ciborium::into_writer(rec, &mut buf).ok()?;
-    Some(buf)
+    let mut raw = Vec::new();
+    ciborium::into_writer(rec, &mut raw).ok()?;
+    let value: ciborium::Value = ciborium::from_reader(raw.as_slice()).ok()?;
+    let canonical_value = canonicalize_value(value)?;
+    let mut canonical = Vec::new();
+    ciborium::into_writer(&canonical_value, &mut canonical).ok()?;
+    Some(canonical)
 }
 
+/// Decodes `bytes` only if they are *already* canonical: reread through the
+/// same canonicalization pass used by `to_canonical_bytes` and require an
+/// exact byte match against the input before trusting it. This single
+/// round-trip check catches everything a bespoke validator would need
+/// separate cases for — non-canonical map key order, a duplicate key
+/// (rejected earlier, inside `canonicalize_value`), a non-minimal integer
+/// encoding (ciborium's encoder only ever emits the minimal form, so any
+/// input using a longer one re-encodes shorter and the lengths won't
+/// match), and trailing bytes after one complete value (the re-encoding
+/// only ever contains that one value, so a longer input can't match).
+/// Without this, `LoadOutcome::Exact` proved only "this parses," never
+/// "this is the one canonical encoding" — an important gap when this
+/// file's bytes may later be hashed for a content-addressed audit trail,
+/// where a non-canonical-but-semantically-equal encoding would silently
+/// produce a different, non-reproducible hash.
 fn from_canonical_bytes(bytes: &[u8]) -> Option<MeshSignerControlRecordV1> {
+    let value: ciborium::Value = ciborium::from_reader(bytes).ok()?;
+    let canonical_value = canonicalize_value(value)?;
+    let mut recomputed = Vec::new();
+    ciborium::into_writer(&canonical_value, &mut recomputed).ok()?;
+    if recomputed != bytes {
+        return None;
+    }
     ciborium::from_reader(bytes).ok()
 }
 
-/// Real file-backed store: temp file unique per attempt (never a fixed
-/// name — v10/v11 bug: a fixed `.tmp` orphaned by one crash permanently
-/// wedged every later attempt), `fsync` on the temp file, `rename`, then
-/// `fsync` on the parent directory. `Committed` only after the parent
-/// `fsync` returns `Ok`.
+/// Real file-backed store: temp file unique per attempt, its name
+/// authenticating the `expected_revision` it targets plus a per-attempt
+/// nonce (never a fixed name — v10/v11 bug: a fixed `.tmp` orphaned by one
+/// crash permanently wedged every later attempt), `fsync` on the temp file,
+/// `rename`, then `fsync` on the parent directory. `Committed` only after
+/// the parent `fsync` returns `Ok`.
 pub struct FileBackedStore {
     path: PathBuf,
+    token: LockToken,
+    identity: ControlIdentity,
+    purpose: PurposeId,
 }
 
 impl FileBackedStore {
     #[must_use]
-    pub fn new(path: PathBuf) -> Self {
-        Self { path }
+    pub fn new(
+        path: PathBuf,
+        token: LockToken,
+        identity: ControlIdentity,
+        purpose: PurposeId,
+    ) -> Self {
+        Self {
+            path,
+            token,
+            identity,
+            purpose,
+        }
     }
 
-    fn attempt_tmp_path(&self) -> PathBuf {
+    fn attempt_tmp_path(&self, expected_revision: u64) -> PathBuf {
         let nonce: u64 = rand::random();
         let mut name = self
             .path
             .file_name()
             .map(|n| n.to_os_string())
             .unwrap_or_default();
-        name.push(format!(".tmp.{nonce:016x}"));
+        name.push(format!(".tmp.{expected_revision:020}.{nonce:016x}"));
         self.path.with_file_name(name)
     }
+}
+
+/// Parses `<expected_revision>` back out of a tmp filename produced by
+/// `attempt_tmp_path`, given the `<base>.tmp.` prefix. Returns `None` for
+/// any name that does not match our own naming scheme — such a name was
+/// never produced by this store and is treated as garbage, not trusted.
+fn parse_tmp_revision(file_name: &str, prefix: &str) -> Option<u64> {
+    let rest = file_name.strip_prefix(prefix)?;
+    let (rev_str, _nonce) = rest.split_once('.')?;
+    rev_str.parse::<u64>().ok()
 }
 
 impl AtomicControlRecordStore for FileBackedStore {
@@ -92,23 +225,66 @@ impl AtomicControlRecordStore for FileBackedStore {
 
     fn replace_exact(
         &self,
+        guard: &MutateGuard<'_>,
         expected_revision: u64,
         new_record: &MeshSignerControlRecordV1,
     ) -> ReplaceOutcome {
-        match self.load_canonical() {
-            LoadOutcome::Missing if expected_revision != crate::record::INITIAL_REVISION => {
-                return ReplaceOutcome::KnownNoEffect;
+        assert_eq!(
+            guard.token(),
+            self.token,
+            "replace_exact called with a MutateGuard from a different MeshSignerLocks than this store is bound to — guards are not interchangeable across stores"
+        );
+        if new_record.identity != self.identity || new_record.purpose != self.purpose {
+            // Never validated against whatever `new_record` itself claims —
+            // always against this store's own fixed binding.
+            return ReplaceOutcome::KnownNoEffect;
+        }
+        let cur = match self.load_canonical() {
+            LoadOutcome::Missing => {
+                if expected_revision != crate::record::INITIAL_REVISION {
+                    return ReplaceOutcome::KnownNoEffect;
+                }
+                // Genesis: only the canonical bootstrap record for THIS
+                // store's own bound identity/purpose may be written when
+                // nothing exists yet.
+                let canonical =
+                    MeshSignerControlRecordV1::bootstrap(self.identity.clone(), self.purpose);
+                if *new_record != canonical {
+                    return ReplaceOutcome::KnownNoEffect;
+                }
+                None
             }
-            LoadOutcome::Exact(cur) if cur.revision != expected_revision => {
-                return ReplaceOutcome::KnownNoEffect;
+            LoadOutcome::Exact(cur) => {
+                if cur.revision != expected_revision {
+                    return ReplaceOutcome::KnownNoEffect;
+                }
+                Some(cur)
             }
             LoadOutcome::Corrupt => return ReplaceOutcome::KnownNoEffect,
-            _ => {}
+        };
+
+        // Two, and only two, legitimate write shapes: a mutation must land
+        // on exactly `cur.revision + 1`; a stabilization rewrite must be
+        // byte-identical (including `revision`) to what is already on
+        // disk. `new_record.revision` is verified here, never trusted.
+        let is_valid_write = match &cur {
+            None => true, // genesis already fully validated above
+            Some(cur) => {
+                if new_record.revision == cur.revision {
+                    *new_record == **cur
+                } else {
+                    Some(new_record.revision) == cur.revision.checked_add(1)
+                }
+            }
+        };
+        if !is_valid_write {
+            return ReplaceOutcome::KnownNoEffect;
         }
+
         let Some(bytes) = to_canonical_bytes(new_record) else {
             return ReplaceOutcome::KnownNoEffect;
         };
-        let tmp = self.attempt_tmp_path();
+        let tmp = self.attempt_tmp_path(expected_revision);
         let mut f = match OpenOptions::new()
             .write(true)
             .create_new(true)
@@ -136,7 +312,12 @@ impl AtomicControlRecordStore for FileBackedStore {
         }
     }
 
-    fn sweep_orphan_tmp(&self) {
+    fn sweep_orphan_tmp(&self, guard: &MutateGuard<'_>) {
+        assert_eq!(
+            guard.token(),
+            self.token,
+            "sweep_orphan_tmp called with a MutateGuard from a different MeshSignerLocks than this store is bound to"
+        );
         let Some(parent) = self.path.parent() else {
             return;
         };
@@ -144,11 +325,31 @@ impl AtomicControlRecordStore for FileBackedStore {
             return;
         };
         let prefix = format!("{base}.tmp.");
-        if let Ok(entries) = fs::read_dir(parent) {
-            for entry in entries.flatten() {
-                if entry.file_name().to_string_lossy().starts_with(&prefix) {
-                    let _ = fs::remove_file(entry.path());
-                }
+        let current_revision = match self.load_canonical() {
+            LoadOutcome::Exact(r) => Some(r.revision),
+            LoadOutcome::Missing | LoadOutcome::Corrupt => None,
+        };
+        let Ok(entries) = fs::read_dir(parent) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if !name.starts_with(&prefix) {
+                continue;
+            }
+            // Provably stale: this tmp targets a revision strictly older
+            // than what is on disk now, so no rename of it could ever
+            // legitimately land again. An unparseable name (never produced
+            // by this store) or no canonical record yet (nothing else can
+            // be mid-write under a guard we are holding first-in-section)
+            // is also swept.
+            let is_stale = match (parse_tmp_revision(&name, &prefix), current_revision) {
+                (Some(tmp_rev), Some(cur)) => tmp_rev < cur,
+                _ => true,
+            };
+            if is_stale {
+                let _ = fs::remove_file(entry.path());
             }
         }
     }
@@ -184,21 +385,39 @@ impl Mode0600 for OpenOptions {
 pub struct FaultInjectingStore {
     inner: FileBackedStore,
     forced_outcome: std::sync::Mutex<Option<ReplaceOutcome>>,
+    force_may_have_taken_effect_count: AtomicU64,
     call_count: AtomicU64,
 }
 
 impl FaultInjectingStore {
     #[must_use]
-    pub fn new(path: PathBuf) -> Self {
+    pub fn new(
+        path: PathBuf,
+        token: LockToken,
+        identity: ControlIdentity,
+        purpose: PurposeId,
+    ) -> Self {
         Self {
-            inner: FileBackedStore::new(path),
+            inner: FileBackedStore::new(path, token, identity, purpose),
             forced_outcome: std::sync::Mutex::new(None),
+            force_may_have_taken_effect_count: AtomicU64::new(0),
             call_count: AtomicU64::new(0),
         }
     }
 
     pub fn force_next_outcome(&self, outcome: ReplaceOutcome) {
         *self.forced_outcome.lock().unwrap() = Some(outcome);
+    }
+
+    /// Forces the next `n` `replace_exact` calls to report
+    /// `MayHaveTakenEffect` even though the real underlying write (rename,
+    /// visible immediately) always actually lands — simulating a parent
+    /// `fsync` that keeps failing while the rename itself keeps
+    /// succeeding. Used to prove recovery keeps issuing real, potentially
+    /// committing writes rather than concluding from a single reread.
+    pub fn force_may_have_taken_effect_for_next_calls(&self, n: u64) {
+        self.force_may_have_taken_effect_count
+            .store(n, Ordering::SeqCst);
     }
 
     #[must_use]
@@ -214,10 +433,28 @@ impl AtomicControlRecordStore for FaultInjectingStore {
 
     fn replace_exact(
         &self,
+        guard: &MutateGuard<'_>,
         expected_revision: u64,
         new_record: &MeshSignerControlRecordV1,
     ) -> ReplaceOutcome {
         self.call_count.fetch_add(1, Ordering::SeqCst);
+
+        let remaining = self
+            .force_may_have_taken_effect_count
+            .load(Ordering::SeqCst);
+        if remaining > 0 {
+            self.force_may_have_taken_effect_count
+                .fetch_sub(1, Ordering::SeqCst);
+            let real = self
+                .inner
+                .replace_exact(guard, expected_revision, new_record);
+            return if real == ReplaceOutcome::Committed {
+                ReplaceOutcome::MayHaveTakenEffect
+            } else {
+                real
+            };
+        }
+
         if let Some(forced) = self.forced_outcome.lock().unwrap().take() {
             // Simulate the outcome WITHOUT performing the real write when
             // forcing KnownNoEffect (nothing should happen); for
@@ -227,7 +464,9 @@ impl AtomicControlRecordStore for FaultInjectingStore {
             return match forced {
                 ReplaceOutcome::KnownNoEffect => ReplaceOutcome::KnownNoEffect,
                 ReplaceOutcome::Committed | ReplaceOutcome::MayHaveTakenEffect => {
-                    let real = self.inner.replace_exact(expected_revision, new_record);
+                    let real = self
+                        .inner
+                        .replace_exact(guard, expected_revision, new_record);
                     if real == ReplaceOutcome::Committed {
                         forced // report the forced (possibly weaker) outcome even though
                     // the real write landed, so the algorithm layer is tested
@@ -238,10 +477,11 @@ impl AtomicControlRecordStore for FaultInjectingStore {
                 }
             };
         }
-        self.inner.replace_exact(expected_revision, new_record)
+        self.inner
+            .replace_exact(guard, expected_revision, new_record)
     }
 
-    fn sweep_orphan_tmp(&self) {
-        self.inner.sweep_orphan_tmp();
+    fn sweep_orphan_tmp(&self, guard: &MutateGuard<'_>) {
+        self.inner.sweep_orphan_tmp(guard);
     }
 }

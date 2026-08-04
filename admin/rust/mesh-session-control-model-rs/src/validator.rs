@@ -12,8 +12,28 @@
 //! implementation of `RosterLookup` backed by
 //! `MachineRosterCoordinator::query_machine_currency` (verified real,
 //! `machine_roster_store.rs:1447`) outside this crate.
+//!
+//! Second-round fixes, both from the same root cause — this crate must
+//! never invent authority it has no basis for:
+//! - `PurposeMarker` carried `DELEGATION_DOMAIN`/`PROFILE`/`ROLES` but
+//!   nothing tying the *type* parameter to the record's actual *runtime*
+//!   `PurposeId` — nothing stopped
+//!   `activate_from_key_observed::<RosterSyncPurpose>` from validating and
+//!   activating a record whose `purpose` was really `MeshSession`, as long
+//!   as the caller also supplied a delegation with RosterSync's
+//!   domain/profile/role. `PURPOSE_ID` closes that: callers (`activate.rs`)
+//!   check it against the record's own `purpose` before doing anything
+//!   else.
+//! - `signed_preimage` computed an ad hoc byte concatenation and called it
+//!   canonical, but the real delegation preimage format is owned by
+//!   mesh-core and has not been frozen there — this model has no authority
+//!   to invent and promote its own wire bytes as if they were that frozen
+//!   form. `SignatureVerifier` now receives the typed `Delegation` itself,
+//!   not preimage bytes this crate fabricated; a real integration
+//!   implements `verify` against mesh-core's eventual frozen preimage
+//!   function.
 
-use crate::record::{Channel, Delegation, GenerationRecord};
+use crate::record::{Channel, Delegation, GenerationRecord, PurposeId};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RosterCurrency {
@@ -35,8 +55,13 @@ pub trait RosterLookup {
     fn query_machine_currency(&self, machine_id: &str) -> RosterCurrency;
 }
 
+/// Deliberately receives the typed `Delegation`, not preimage bytes — see
+/// the module doc's second-round fix. A real integration is expected to
+/// derive whatever bytes mesh-core's eventual frozen preimage function
+/// specifies from `delegation`, entirely inside its own implementation of
+/// this trait; this crate does not get a vote on that byte layout.
 pub trait SignatureVerifier {
-    fn verify(&self, public_key: &[u8], preimage: &[u8], sig: &[u8]) -> bool;
+    fn verify(&self, public_key: &[u8], delegation: &Delegation, sig: &[u8]) -> bool;
 }
 
 pub struct DelegationPolicy {
@@ -57,6 +82,11 @@ impl DelegationPolicy {
 }
 
 pub trait PurposeMarker {
+    /// The runtime `PurposeId` this type parameter stands for. Callers
+    /// (`activate.rs`) must check this against the record's actual
+    /// `purpose` field — the type parameter alone proves nothing about
+    /// which record it is being used against.
+    const PURPOSE_ID: PurposeId;
     const DELEGATION_DOMAIN: &'static str;
     const PROFILE: &'static str;
     const ROLES: &'static [&'static str];
@@ -64,6 +94,7 @@ pub trait PurposeMarker {
 
 pub struct MeshSessionPurpose;
 impl PurposeMarker for MeshSessionPurpose {
+    const PURPOSE_ID: PurposeId = PurposeId::MeshSession;
     const DELEGATION_DOMAIN: &'static str = "soyeht/mesh-session/v1";
     const PROFILE: &'static str = "mesh-session";
     const ROLES: &'static [&'static str] = &["initiator", "responder"];
@@ -71,6 +102,7 @@ impl PurposeMarker for MeshSessionPurpose {
 
 pub struct RosterSyncPurpose;
 impl PurposeMarker for RosterSyncPurpose {
+    const PURPOSE_ID: PurposeId = PurposeId::RosterSync;
     const DELEGATION_DOMAIN: &'static str = "soyeht/roster-sync/v1";
     const PROFILE: &'static str = "roster-sync";
     const ROLES: &'static [&'static str] = &["initiator", "responder"];
@@ -108,6 +140,10 @@ pub enum ValidationError {
     SignatureInvalid,
     #[error("delegated_key_id does not match the canonical slot id")]
     KeyIdMismatch,
+    #[error("delegation's delegated_pub does not match the physical binding's public_key")]
+    DelegatedPubBindingMismatch,
+    #[error("the type parameter's PURPOSE_ID does not match the record's own runtime purpose")]
+    PurposeMismatch,
 }
 
 /// Identity context the validator checks the delegation against — grouped
@@ -173,8 +209,7 @@ pub fn validate_full_binding<P: PurposeMarker>(
             if member_cert_fingerprint != d.delegator_cert_fingerprint {
                 return Err(ValidationError::DelegatorFingerprintMismatch);
             }
-            let preimage = signed_preimage(d);
-            if !sig.verify(&member_pub, &preimage, &d.sig) {
+            if !sig.verify(&member_pub, d, &d.sig) {
                 return Err(ValidationError::SignatureInvalid);
             }
         }
@@ -186,27 +221,9 @@ pub fn validate_full_binding<P: PurposeMarker>(
     if d.delegated_key_id != generation_record.binding.slot.canonical_id() {
         return Err(ValidationError::KeyIdMismatch);
     }
+    if d.delegated_pub != generation_record.binding.public_key {
+        return Err(ValidationError::DelegatedPubBindingMismatch);
+    }
 
     Ok(())
-}
-
-fn signed_preimage(d: &Delegation) -> Vec<u8> {
-    // Canonical preimage = everything except `sig` itself, domain-tagged —
-    // mirrors the `signed_preimage = type_byte || canonical_cbor(unsigned_body)`
-    // convention already used across this feature (B-SESSAO v6 §3,
-    // OwnerApprovalV2). The exact byte layout is an implementation detail of
-    // the real integration; this model only needs the *shape* (verify
-    // covers everything but `sig`) to be testable.
-    let mut buf = Vec::new();
-    buf.extend_from_slice(d.domain.as_bytes());
-    buf.extend_from_slice(d.profile.as_bytes());
-    buf.extend_from_slice(d.role.as_bytes());
-    buf.extend_from_slice(d.hh_id.as_bytes());
-    buf.extend_from_slice(d.delegator_m_id.as_bytes());
-    buf.extend_from_slice(&d.delegator_cert_fingerprint);
-    buf.extend_from_slice(d.delegated_key_id.as_bytes());
-    buf.extend_from_slice(&d.delegated_pub);
-    buf.extend_from_slice(&d.not_before.to_be_bytes());
-    buf.extend_from_slice(&d.not_after.to_be_bytes());
-    buf
 }
