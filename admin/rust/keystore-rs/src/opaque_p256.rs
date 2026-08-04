@@ -825,18 +825,38 @@ impl OpaqueP256Slots {
         }
     }
 
-    /// Obtain a signer for a slot, proving it still holds the exact key
-    /// described by `binding`.
+    /// Resolve a slot ONCE, returning both what was actually observed there
+    /// and the signer for that same key material.
     ///
     /// This is the ONLY way to sign. A key replaced underneath — for example
     /// by someone writing a different scalar through the generic byte API —
     /// derives a different public key, so the comparison fails and no
     /// signature is produced under a binding the caller published earlier.
+    ///
+    /// # Why this returns a pair rather than a bare signer
+    ///
+    /// It used to return only `OpaqueSigner<P>`, having derived the observed
+    /// binding on this very handle and then thrown it away. A caller that
+    /// needed to know WHICH key it was about to sign with therefore had to
+    /// ask again — `inspect`, or a remembered earlier binding — and that
+    /// second question is a second physical resolution of the store.
+    ///
+    /// Two resolutions can straddle a replacement. The caller then holds a
+    /// binding describing key A and a signer holding key B, with nothing in
+    /// the type system objecting, and publishes a signature attributed to a
+    /// key that did not produce it. Neither resolution is individually
+    /// wrong, which is what makes it hard to see.
+    ///
+    /// So the seam does not offer the separable form at all. There is no way
+    /// to obtain an owned `OpaqueSigner` without the [`PublicBinding`] that
+    /// was derived from the same bytes at the same instant, and no way to
+    /// construct a [`ResolvedSlot`] pairing an arbitrary binding with an
+    /// arbitrary signer.
     pub fn load_exact<P: Purpose>(
         &self,
         slot: &Slot<P>,
         binding: &PublicBinding<P>,
-    ) -> Result<OpaqueSigner<P>, KeystoreError> {
+    ) -> Result<ResolvedSlot<P>, KeystoreError> {
         // One resolution for the whole check. The scope validation reads the
         // store identity and the comparison below reads the material; taken
         // through separate path descents those two could describe different
@@ -846,16 +866,24 @@ impl OpaqueP256Slots {
         self.validate_binding_scope(&dir, slot, binding)?;
 
         let signing = self.load_signing_key(&dir, slot)?;
-        let derived = self.binding_for(&dir, slot, signing.verifying_key())?;
-        if derived.public_key != binding.public_key {
+        let observed = self.binding_for(&dir, slot, signing.verifying_key())?;
+        if observed.public_key != binding.public_key {
             return Err(KeystoreError::SecurityViolation {
                 label: slot.label.clone(),
                 hint: "stored key no longer matches the published binding — it was replaced".into(),
             });
         }
-        Ok(OpaqueSigner {
-            signing,
-            _purpose: PhantomData,
+        // `observed` and `signing` are derived from ONE read of ONE handle:
+        // `observed` is computed from `signing`'s own verifying key, so they
+        // cannot describe different keys even in principle. Handing them
+        // back together is what makes that fact available to the caller
+        // instead of being re-established by a second, separable lookup.
+        Ok(ResolvedSlot {
+            observed,
+            signer: OpaqueSigner {
+                signing,
+                _purpose: PhantomData,
+            },
         })
     }
 
@@ -1280,9 +1308,57 @@ impl OpaqueP256Slots {
     }
 }
 
-/// A signer bound to one slot, obtained only from
-/// [`OpaqueP256Slots::load_exact`] — so every signature is produced under a
-/// key already proven to match a published binding.
+/// One physical resolution of a slot: the binding actually OBSERVED there
+/// and the signer for that same key material.
+///
+/// Produced only by [`OpaqueP256Slots::load_exact`]. The fields are private
+/// and there is no constructor, so this cannot be forged and cannot be
+/// assembled from a binding and a signer that came from different reads —
+/// which is the whole point. The two are computed from a single read of a
+/// single retained handle, `observed` being derived from `signer`'s own
+/// verifying key.
+///
+/// The signer is reachable only by reference. There is deliberately no
+/// `into_signer()`: an owned signer that has been separated from its
+/// observed binding is exactly the value whose existence lets a caller
+/// attribute a signature to the wrong key, and offering the split as a
+/// convenience would put it back.
+pub struct ResolvedSlot<P: Purpose> {
+    observed: PublicBinding<P>,
+    signer: OpaqueSigner<P>,
+}
+
+impl<P: Purpose> std::fmt::Debug for ResolvedSlot<P> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ResolvedSlot")
+            .field("observed", &self.observed)
+            .finish_non_exhaustive()
+    }
+}
+
+impl<P: Purpose> ResolvedSlot<P> {
+    /// What this slot actually held at the instant it was resolved.
+    ///
+    /// Not "what the caller expected" — `load_exact` refuses when those
+    /// differ — but what was read. A caller publishing or logging which key
+    /// signed something must use THIS, never a binding it happens to be
+    /// holding from an earlier lookup.
+    #[must_use]
+    pub fn observed_binding(&self) -> &PublicBinding<P> {
+        &self.observed
+    }
+
+    /// The signer for the key `observed_binding` describes.
+    #[must_use]
+    pub fn signer(&self) -> &OpaqueSigner<P> {
+        &self.signer
+    }
+}
+
+/// A signer bound to one slot, obtained only through
+/// [`ResolvedSlot`] from [`OpaqueP256Slots::load_exact`] — so every
+/// signature is produced under a key already proven to match a published
+/// binding, and always alongside the binding actually observed for it.
 pub struct OpaqueSigner<P: Purpose> {
     signing: SigningKey,
     _purpose: PhantomData<fn() -> P>,
@@ -1373,6 +1449,31 @@ pub struct GcReport {
 /// impl Purpose for P { const PURPOSE: &'static str = "p"; }
 /// fn go(signer: &OpaqueSigner<P>) {
 ///     let _ = signer.sign(b"raw bytes");
+/// }
+/// ```
+///
+/// A `ResolvedSlot` must not be forgeable — its fields are private, so a
+/// binding and a signer from different reads cannot be paired up:
+///
+/// ```compile_fail
+/// use keystore_rs::opaque_p256::{OpaqueSigner, PublicBinding, Purpose, ResolvedSlot};
+/// struct P;
+/// impl Purpose for P { const PURPOSE: &'static str = "p"; }
+/// fn go(observed: PublicBinding<P>, signer: OpaqueSigner<P>) {
+///     let _ = ResolvedSlot { observed, signer };
+/// }
+/// ```
+///
+/// And the signer must not be extractable from the pair — an owned signer
+/// separated from its observed binding is the value that lets a signature be
+/// attributed to the wrong key:
+///
+/// ```compile_fail
+/// use keystore_rs::opaque_p256::{OpaqueSigner, Purpose, ResolvedSlot};
+/// struct P;
+/// impl Purpose for P { const PURPOSE: &'static str = "p"; }
+/// fn go(resolved: ResolvedSlot<P>) -> OpaqueSigner<P> {
+///     resolved.into_signer()
 /// }
 /// ```
 ///
@@ -1519,11 +1620,11 @@ mod tests {
         let slot = Slot::<MeshSession>::new("signer").unwrap();
         let (_, binding) = s.create_or_inspect(&slot).unwrap();
         let binding = binding.unwrap();
-        let signer = s.load_exact(&slot, &binding).unwrap();
+        let resolved = s.load_exact(&slot, &binding).unwrap();
 
         for i in 0..32 {
             let pre = Preimage::<MeshSession>::exact(format!("m-{i}").as_bytes());
-            let sig = signer.sign(&pre);
+            let sig = resolved.signer().sign(&pre);
             binding.verify(&pre, &sig).unwrap();
 
             let parsed = EcdsaSignature::from_slice(sig.as_bytes()).unwrap();
@@ -1554,10 +1655,12 @@ mod tests {
         let slot = Slot::<MeshSession>::new("exact-bytes").unwrap();
         let (_, binding) = s.create_or_inspect(&slot).unwrap();
         let binding = binding.unwrap();
-        let signer = s.load_exact(&slot, &binding).unwrap();
+        let resolved = s.load_exact(&slot, &binding).unwrap();
 
         let wire = b"\x07canonical-cbor-body";
-        let sig = signer.sign(&Preimage::<MeshSession>::exact(wire));
+        let sig = resolved
+            .signer()
+            .sign(&Preimage::<MeshSession>::exact(wire));
 
         // A verifier that knows only the protocol's own bytes must accept —
         // it would not if we had prepended anything.
@@ -1565,6 +1668,109 @@ mod tests {
         let parsed = EcdsaSignature::from_slice(sig.as_bytes()).unwrap();
         vk.verify(wire.as_slice(), &parsed)
             .expect("signature must be over the caller's exact bytes, with no added framing");
+    }
+
+    // -- B3: one resolution yields the observed binding AND its signer -----
+
+    /// RED (3): the pair really is a pair.
+    ///
+    /// `observed_binding()` must equal the expected binding field-by-field,
+    /// and the signer must hold the key that binding describes — proven by
+    /// verifying against a key parsed from the OBSERVED bytes, not from the
+    /// caller's copy.
+    #[test]
+    fn resolved_slot_observed_binding_matches_expected_and_its_own_signer() {
+        let td = tempfile::tempdir().unwrap();
+        let s = store(td.path());
+        let slot = Slot::<MeshSession>::new("resolved-pair").unwrap();
+        let (_, expected) = s.create_or_inspect(&slot).unwrap();
+        let expected = expected.unwrap();
+
+        let resolved = s.load_exact(&slot, &expected).unwrap();
+        let observed = resolved.observed_binding();
+
+        // Field by field, not just `==`, so a future `PartialEq` that stops
+        // comparing one of them cannot make this pass vacuously.
+        assert_eq!(observed.public_key(), expected.public_key());
+        assert_eq!(observed.label(), expected.label());
+        assert_eq!(observed.backing(), expected.backing());
+        assert_eq!(observed.store_id(), expected.store_id());
+        assert_eq!(observed, &expected);
+
+        // And the signer belongs to the OBSERVED key: verify with a key
+        // rebuilt from the observed bytes.
+        let pre = Preimage::<MeshSession>::exact(b"pair-proof");
+        let sig = resolved.signer().sign(&pre);
+        let vk = VerifyingKey::from_sec1_bytes(observed.public_key()).unwrap();
+        let parsed = EcdsaSignature::from_slice(sig.as_bytes()).unwrap();
+        p256::ecdsa::signature::Verifier::verify(&vk, b"pair-proof", &parsed)
+            .expect("signer must produce a signature under the observed key");
+    }
+
+    /// RED (1): a replacement landing between two resolutions must never
+    /// leave a caller holding binding A alongside signer B.
+    ///
+    /// The old seam returned a bare `OpaqueSigner`, so learning WHICH key
+    /// was about to sign meant asking a second time. This walks the exact
+    /// interleaving: resolve, let the key be replaced, resolve again — and
+    /// requires that no resolution ever reports a binding that disagrees
+    /// with the signer it came back with.
+    #[test]
+    fn replacement_between_resolutions_never_yields_binding_a_with_signer_b() {
+        let td = tempfile::tempdir().unwrap();
+        let s = store(td.path());
+        let slot = Slot::<MeshSession>::new("straddle").unwrap();
+        let (_, binding_a) = s.create_or_inspect(&slot).unwrap();
+        let binding_a = binding_a.unwrap();
+
+        let first = s.load_exact(&slot, &binding_a).unwrap();
+        assert_eq!(
+            first.observed_binding().public_key(),
+            binding_a.public_key()
+        );
+
+        // Replace A with B behind the module's back, exactly as the generic
+        // byte API path would.
+        let raw = raw_reserved(td.path(), "opaque-p256-test");
+        let key_b = SigningKey::random(&mut rand_core::OsRng);
+        raw.set(&slot.account(), key_b.to_bytes().as_slice())
+            .unwrap();
+
+        // The stale binding is refused outright — no signer for B is handed
+        // out under A's binding.
+        match s.load_exact(&slot, &binding_a) {
+            Err(KeystoreError::SecurityViolation { .. }) => {}
+            other => panic!("stale binding must be refused, got {other:?}"),
+        }
+
+        // Resolving with B's real binding succeeds, and what comes back
+        // describes B — never A.
+        let binding_b = s.inspect(&slot).unwrap().unwrap();
+        assert_ne!(
+            binding_b.public_key(),
+            binding_a.public_key(),
+            "the fixture must actually have replaced the key"
+        );
+        let second = s.load_exact(&slot, &binding_b).unwrap();
+        let observed = second.observed_binding();
+        assert_eq!(observed.public_key(), binding_b.public_key());
+        assert_ne!(
+            observed.public_key(),
+            binding_a.public_key(),
+            "a resolution must never report the superseded binding"
+        );
+
+        // The decisive check: each resolution's signer agrees with THAT
+        // resolution's own observed binding. Holding both at once, the pairs
+        // never cross.
+        for (label, r) in [("first", &first), ("second", &second)] {
+            let pre = Preimage::<MeshSession>::exact(b"straddle-proof");
+            let sig = r.signer().sign(&pre);
+            let vk = VerifyingKey::from_sec1_bytes(r.observed_binding().public_key()).unwrap();
+            let parsed = EcdsaSignature::from_slice(sig.as_bytes()).unwrap();
+            p256::ecdsa::signature::Verifier::verify(&vk, b"straddle-proof", &parsed)
+                .unwrap_or_else(|e| panic!("{label} resolution's pair disagreed: {e}"));
+        }
     }
 
     /// P0-4: a key swapped underneath through the generic byte API must be
