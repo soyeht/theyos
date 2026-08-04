@@ -476,27 +476,142 @@ impl FileKeystore {
         }
     }
 
-    /// Stable identity of the PHYSICAL store: device + inode of the secrets
-    /// directory, not a path string.
+    /// Compare-and-delete as ONE operation, under the store's exclusive
+    /// lock, with a durable absence.
     ///
-    /// Two stores configured with the same service name under different
-    /// state roots produced identical identifiers before this existed, so a
-    /// binding published by one was accepted by the other — an audit showed
-    /// a scalar copied from store A being validated against A's binding by
-    /// store B. A path string is also forgeable by moving directories
-    /// around; dev+ino is what actually names the directory the bytes live
-    /// in.
-    pub(crate) fn physical_store_id(&self) -> Result<String, KeystoreError> {
+    /// The previous shape — read the entry, compare it, then call the
+    /// path-based `delete` — was check-then-act with a real window: a
+    /// concurrent writer installing B between the compare of A and the
+    /// unlink caused B to be destroyed, and `remove_file` alone left the
+    /// absence unsynced, so a crash could resurrect the entry that was
+    /// just "revoked". Holding the exclusive lock across both halves shuts
+    /// out every other writer in this crate (installs take the shared
+    /// lock), the unlink is fd-relative through the validated dirfd, and
+    /// the parent directory is fsynced before reporting success.
+    ///
+    /// This closes concurrency among the crate's own writers. It does NOT
+    /// defend against a same-uid process writing the files behind the
+    /// crate's back — that boundary is the filesystem's.
+    pub(crate) fn delete_exact_locked(
+        &self,
+        account: &str,
+        matches: impl FnOnce(&[u8]) -> Result<bool, KeystoreError>,
+    ) -> Result<DeleteOutcome, KeystoreError> {
+        self.guard_reserved()?;
         let dir = self.open_secrets_dir().map_err(|e| KeystoreError::Io {
             kind: e.kind().to_string(),
             hint: format!("open {}: {e}", self.secrets_dir().display()),
         })?;
-        let (dev, ino) = dir.dev_ino().map_err(|e| KeystoreError::Io {
+        self.check_fs_allowed(&dir)?;
+
+        // Exclusive for the whole compare+unlink+barrier sequence.
+        let _exclusive = FlockGuard::acquire(&dir, true).map_err(|e| KeystoreError::Io {
             kind: e.kind().to_string(),
-            hint: format!("stat {}: {e}", self.secrets_dir().display()),
+            hint: format!("lock {}: {e}", self.secrets_dir().display()),
         })?;
-        Ok(format!("dev{dev}:ino{ino}"))
+
+        let name = Self::account_file_name(account);
+        let mut bytes = match dir.open_file_read_nofollow(OsStr::new(&name)) {
+            Ok(SecureOpen::Found(mut file, _)) => {
+                let mut buf = Vec::new();
+                std::io::Read::by_ref(&mut file)
+                    .take(MAX_SECRET_BYTES + 1)
+                    .read_to_end(&mut buf)
+                    .map_err(|e| KeystoreError::Io {
+                        kind: e.kind().to_string(),
+                        hint: format!("read {name}: {e}"),
+                    })?;
+                buf
+            }
+            Ok(SecureOpen::NotFound) => return Ok(DeleteOutcome::Absent),
+            Ok(SecureOpen::SecurityViolation(hint)) => {
+                return Err(KeystoreError::SecurityViolation {
+                    label: format!("{} (file fallback)", self.account_path(account).display()),
+                    hint,
+                });
+            }
+            Err(e) => {
+                return Err(KeystoreError::Io {
+                    kind: e.kind().to_string(),
+                    hint: format!("open {name}: {e}"),
+                });
+            }
+        };
+
+        let verdict = matches(&bytes);
+        bytes.zeroize();
+        if !verdict? {
+            return Ok(DeleteOutcome::Mismatch);
+        }
+
+        match dir.unlinkat(OsStr::new(&name)) {
+            Ok(()) => {}
+            Err(e) if e.kind() == ErrorKind::NotFound => return Ok(DeleteOutcome::Absent),
+            Err(e) => {
+                return Err(KeystoreError::Io {
+                    kind: e.kind().to_string(),
+                    hint: format!("unlink {name}: {e}"),
+                });
+            }
+        }
+        // The removal is only real once the directory entry is durable;
+        // without this a crash can bring a revoked key back.
+        dir.fsync().map_err(|e| KeystoreError::Io {
+            kind: e.kind().to_string(),
+            hint: format!("fsync after removing {name}: {e}"),
+        })?;
+        Ok(DeleteOutcome::Removed)
     }
+
+    /// Whether this store holds any account entry other than `exclude`.
+    ///
+    /// Needed by the store-identity restore policy: material present with
+    /// no identity marker must fail closed rather than have a fresh marker
+    /// minted over it, and that decision requires knowing whether anything
+    /// is actually there.
+    pub(crate) fn has_entries_besides(&self, exclude: &str) -> Result<bool, KeystoreError> {
+        let excluded_file = Self::account_file_name(exclude);
+        let listing = match fs::read_dir(self.secrets_dir()) {
+            Ok(listing) => listing,
+            Err(e) if e.kind() == ErrorKind::NotFound => return Ok(false),
+            Err(e) => {
+                return Err(KeystoreError::Io {
+                    kind: e.kind().to_string(),
+                    hint: format!("read_dir {}: {e}", self.secrets_dir().display()),
+                });
+            }
+        };
+        for entry in listing {
+            let entry = entry.map_err(|e| KeystoreError::Io {
+                kind: e.kind().to_string(),
+                hint: format!("read_dir {}: {e}", self.secrets_dir().display()),
+            })?;
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if name == excluded_file || name == LOCK_FILE_NAME {
+                continue;
+            }
+            // Scratch leftovers are not material; the sweep owns those.
+            if parse_create_attempt_tmp_name(&name).is_some() {
+                continue;
+            }
+            if name.ends_with(".bin") {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    // A `physical_store_id` based on the secrets directory's dev+ino used
+    // to live here and is deliberately gone. dev+ino is a sound guard for
+    // an OPEN HANDLE mid-operation (still used inside
+    // `secure_durable_get` to catch a file swapped under the fd), but it is
+    // not a durable STORE identity: it does not survive a remount or a
+    // restore, so bindings scoped to it would stop validating after either
+    // for no security reason. That role belongs to
+    // `opaque_p256::StoreIdentityV1`, which is committed durably and read
+    // back. Removed rather than kept around, so it cannot be picked up
+    // again for the job it is wrong for.
 
     fn create_only_unix(
         &self,
@@ -693,6 +808,18 @@ impl FileKeystore {
         }
         Ok(report)
     }
+}
+
+/// Result of [`FileKeystore::delete_exact_locked`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DeleteOutcome {
+    /// The entry matched and is durably gone.
+    Removed,
+    /// Nothing was there to remove.
+    Absent,
+    /// Something was there but it was NOT what the caller expected, so it
+    /// was left untouched.
+    Mismatch,
 }
 
 /// What a sweep actually did. `quarantined` is not a benign statistic: it
@@ -1272,17 +1399,6 @@ impl DirHandle {
             return Err(std::io::Error::last_os_error());
         }
         Ok(())
-    }
-
-    /// Device + inode of this directory, from `fstat` on the held fd.
-    fn dev_ino(&self) -> std::io::Result<(u64, u64)> {
-        use std::os::unix::fs::MetadataExt;
-        // SAFETY: the fd is valid and owned; `File::from_raw_fd` would take
-        // ownership, so borrow through a ManuallyDrop instead.
-        let borrowed =
-            std::mem::ManuallyDrop::new(unsafe { File::from_raw_fd(self.fd.as_raw_fd()) });
-        let meta = borrowed.metadata()?;
-        Ok((meta.dev(), meta.ino()))
     }
 
     fn fchmod(&self, mode: libc::mode_t) -> std::io::Result<()> {

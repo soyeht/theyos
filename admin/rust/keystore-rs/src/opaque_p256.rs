@@ -51,6 +51,7 @@ use p256::ecdsa::{
     signature::{Signer, Verifier},
 };
 
+use crate::file_backend::DeleteOutcome;
 use crate::{CreateOutcome, FileKeystore, KeystoreBackend, KeystoreError};
 
 /// SEC1-compressed P-256 public key length, matching the wire contract used
@@ -71,26 +72,12 @@ pub trait Purpose {
     const PURPOSE: &'static str;
 }
 
-/// Percent-encode a slot component so that concatenating components is
-/// injective.
-///
-/// `format!("p256.{purpose}.{label}")` on raw components is NOT injective:
-/// `("a", "b.c")` and `("a.b", "c")` both render `p256.a.b.c`, so two
-/// distinct slots would share one key. (This is the same non-injectivity
-/// class as the path-segment bug fixed in `file_backend`, reintroduced one
-/// layer up — encoding has to be applied at every layer that concatenates,
-/// not just the last one.) Encoding `%` and `.` makes the join injective.
-fn encode_component(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for ch in s.chars() {
-        match ch {
-            '%' => out.push_str("%25"),
-            '.' => out.push_str("%2E"),
-            _ => out.push(ch),
-        }
-    }
-    out
-}
+// The percent-encoding helper that used to live here is gone: the
+// canonical slot id (see `Slot::account`) now digests LENGTH-PREFIXED
+// components, which is injective by construction rather than by escaping
+// rules that have to be applied correctly at every layer that
+// concatenates. Deleted rather than left behind, so nothing can call a
+// weaker encoding by mistake.
 
 /// Maximum accepted slot-label length. Bounded so a caller cannot drive an
 /// unbounded filename or account string through this API.
@@ -168,12 +155,83 @@ impl<P: Purpose> Slot<P> {
         &self.label
     }
 
+    /// Canonical versioned slot id: `p256.v1.<64 hex>`.
+    ///
+    /// Fixed-width regardless of purpose or label length, and injective
+    /// because the digest is taken over LENGTH-PREFIXED components — the
+    /// concatenation `purpose || label` on its own is not injective, which
+    /// is the same defect that produced colliding accounts earlier in this
+    /// module and colliding paths one layer below it. Length prefixes make
+    /// `("a","b.c")` and `("a.b","c")` distinct preimages by construction
+    /// rather than by escaping rules that have to be got right at every
+    /// layer.
+    ///
+    /// Fixed width also removes truncation as a failure mode: an over-long
+    /// label is rejected at [`Slot::new`] rather than silently shortened
+    /// into a collision with another slot.
     fn account(&self) -> String {
-        format!(
-            "p256.{}.{}",
-            encode_component(P::PURPOSE),
-            encode_component(&self.label)
-        )
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(
+            &u64::try_from(P::PURPOSE.len())
+                .unwrap_or(u64::MAX)
+                .to_le_bytes(),
+        );
+        hasher.update(P::PURPOSE.as_bytes());
+        hasher.update(
+            &u64::try_from(self.label.len())
+                .unwrap_or(u64::MAX)
+                .to_le_bytes(),
+        );
+        hasher.update(self.label.as_bytes());
+        format!("p256.v1.{}", hasher.finalize().to_hex())
+    }
+}
+
+/// Account name of the store-identity marker. Inside the reserved
+/// namespace, so it is unreachable through the public byte API.
+const STORE_IDENTITY_ACCOUNT: &str = "store-identity.v1";
+
+/// Prefix tagging the marker's contents with its format version, so a
+/// future format is a recognisable mismatch rather than a silent
+/// misinterpretation.
+const STORE_IDENTITY_PREFIX: &str = "storeidv1:";
+
+/// A store's durable identity: 256 random bits, written once and read back
+/// on every restart.
+///
+/// This is what a [`PublicBinding`] is scoped to. Device+inode was used
+/// before and is the wrong tool for the job: it is a fine handle guard
+/// WHILE an operation is in flight (it detects a directory swapped under
+/// an open fd) but it is not stable across a remount or a restore, so a
+/// binding scoped to it would spuriously stop validating after either.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoreIdentityV1(String);
+
+impl StoreIdentityV1 {
+    fn generate() -> Self {
+        use rand_core::RngCore;
+        let mut raw = [0u8; 32];
+        rand_core::OsRng.fill_bytes(&mut raw);
+        let hex = raw.iter().fold(String::with_capacity(64), |mut acc, b| {
+            use std::fmt::Write as _;
+            let _ = write!(acc, "{b:02x}");
+            acc
+        });
+        Self(format!("{STORE_IDENTITY_PREFIX}{hex}"))
+    }
+
+    fn parse(bytes: &[u8]) -> Option<Self> {
+        let text = std::str::from_utf8(bytes).ok()?;
+        let hex = text.strip_prefix(STORE_IDENTITY_PREFIX)?;
+        if hex.len() != 64 || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return None;
+        }
+        Some(Self(text.to_string()))
+    }
+
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
     }
 }
 
@@ -444,14 +502,40 @@ impl SlotStore {
         }
     }
 
-    /// Identity of the physical store (device + inode of its secrets
-    /// directory), so a binding cannot be carried between two stores that
-    /// merely share a service name.
-    fn physical_id(&self) -> Result<String, KeystoreError> {
+    /// Interpret raw stored bytes as plaintext key material: identity for
+    /// the file store, decryption for TPM.
+    // Infallible on targets where the only variant is the plain file store,
+    // but the TPM arm decrypts and genuinely can fail. Keeping one
+    // signature across targets beats a cfg-split return type.
+    #[cfg_attr(not(target_os = "linux"), allow(clippy::unnecessary_wraps))]
+    fn interpret(&self, account: &str, stored: &[u8]) -> Result<Vec<u8>, KeystoreError> {
         match self {
             #[cfg(target_os = "linux")]
-            Self::SealedTpm(s) => s.file_store().physical_store_id(),
-            Self::ApprovedFile(s) => s.physical_store_id(),
+            Self::SealedTpm(_) => crate::tpm_backend::TpmKeystore::decrypt_blob(account, stored),
+            Self::ApprovedFile(_) => {
+                let _ = account;
+                Ok(stored.to_vec())
+            }
+        }
+    }
+
+    fn delete_exact_locked(
+        &self,
+        account: &str,
+        matches: impl FnOnce(&[u8]) -> Result<bool, KeystoreError>,
+    ) -> Result<DeleteOutcome, KeystoreError> {
+        match self {
+            #[cfg(target_os = "linux")]
+            Self::SealedTpm(s) => s.file_store().delete_exact_locked(account, matches),
+            Self::ApprovedFile(s) => s.delete_exact_locked(account, matches),
+        }
+    }
+
+    fn has_entries_besides(&self, exclude: &str) -> Result<bool, KeystoreError> {
+        match self {
+            #[cfg(target_os = "linux")]
+            Self::SealedTpm(s) => s.file_store().has_entries_besides(exclude),
+            Self::ApprovedFile(s) => s.has_entries_besides(exclude),
         }
     }
 
@@ -463,13 +547,11 @@ impl SlotStore {
         }
     }
 
-    fn delete(&self, account: &str) -> Result<(), KeystoreError> {
-        match self {
-            #[cfg(target_os = "linux")]
-            Self::SealedTpm(s) => s.delete(account),
-            Self::ApprovedFile(s) => s.delete(account),
-        }
-    }
+    // An unconditional `delete` shim used to sit here and is gone on
+    // purpose: every removal in this module must go through
+    // `delete_exact_locked`, which compares and unlinks as one locked,
+    // durably-synced operation. Leaving a plain delete reachable is how the
+    // check-then-act GC race existed in the first place.
 
     fn backing(&self) -> Backing {
         match self {
@@ -485,6 +567,11 @@ impl SlotStore {
 pub struct OpaqueP256Slots {
     store: SlotStore,
     store_id: String,
+    /// Resolved once per handle. Caching matters for correctness as well as
+    /// I/O: the quarantine rule keys off "material exists but no marker
+    /// does", so re-deriving it repeatedly during a single logical
+    /// operation would be both wasteful and easy to get wrong.
+    identity: std::sync::OnceLock<StoreIdentityV1>,
 }
 
 impl OpaqueP256Slots {
@@ -508,6 +595,7 @@ impl OpaqueP256Slots {
                 ),
             ),
             store_id: format!("tpm:{namespaced}"),
+            identity: std::sync::OnceLock::new(),
         }
     }
 
@@ -537,6 +625,7 @@ impl OpaqueP256Slots {
                 namespaced.clone(),
             )),
             store_id: format!("file:{namespaced}"),
+            identity: std::sync::OnceLock::new(),
         }
     }
 
@@ -561,6 +650,25 @@ impl OpaqueP256Slots {
         &self,
         slot: &Slot<P>,
     ) -> Result<(SlotOutcome, Option<PublicBinding<P>>), KeystoreError> {
+        // 0. Establish the store's durable identity BEFORE any key material
+        //    can exist. Ordering is load-bearing, not tidiness: the
+        //    quarantine rule refuses to mint a marker over existing
+        //    material, so resolving it after creating the first slot would
+        //    quarantine every brand-new store on its own first write.
+        //
+        //    An I/O failure here means the store's identity could not be
+        //    committed, so nothing usable can be returned — but that is
+        //    ambiguity, not absence, and it is retryable, so it maps to
+        //    Unresolved. A SecurityViolation (quarantine) is NOT retryable
+        //    and must keep propagating: it needs a human, not another
+        //    attempt.
+        if let Err(e) = self.resolve_identity() {
+            match e {
+                KeystoreError::Io { .. } => return Ok((SlotOutcome::Unresolved, None)),
+                other => return Err(other),
+            }
+        }
+
         // 1. Already there? `try_binding` goes through the hardened,
         //    durability-proving reader, so reaching a binding here means the
         //    stored key was proven durable on the same descriptors it was
@@ -682,35 +790,155 @@ impl OpaqueP256Slots {
         slot: &Slot<P>,
         expected: &PublicBinding<P>,
     ) -> Result<GcReport, KeystoreError> {
-        let before = self.binding_or_unresolved(slot)?;
-        let Some(before) = before else {
-            return Ok(GcReport {
+        // Compare and remove as ONE locked operation. Comparing here and
+        // deleting afterwards was check-then-act: a writer installing B
+        // between the two destroyed B, and the resulting absence was not
+        // durable either.
+        let expected_key = *expected.public_key();
+        let outcome = self.store.delete_exact_locked(&slot.account(), |stored| {
+            let material = Self::interpret_stored(&self.store, &slot.account(), stored)?;
+            let Some(signing) = material else {
+                return Ok(false);
+            };
+            let encoded = signing.verifying_key().to_encoded_point(true);
+            Ok(encoded.as_bytes() == expected_key.as_slice())
+        })?;
+
+        Ok(match outcome {
+            DeleteOutcome::Removed => GcReport {
+                existed_before: true,
+                matched_expected: true,
+                present_after: false,
+            },
+            DeleteOutcome::Absent => GcReport {
                 existed_before: false,
                 matched_expected: false,
                 present_after: false,
-            });
-        };
-        if &before != expected {
-            return Ok(GcReport {
+            },
+            DeleteOutcome::Mismatch => GcReport {
                 existed_before: true,
                 matched_expected: false,
                 present_after: true,
-            });
-        }
-
-        self.store.delete(&slot.account())?;
-        let still_there = self.binding_or_unresolved(slot)?.is_some();
-        Ok(GcReport {
-            existed_before: true,
-            matched_expected: true,
-            present_after: still_there,
+            },
         })
     }
 
-    /// This store's full identity: namespace plus the physical identity of
-    /// the directory the bytes actually live in.
+    /// Turn stored bytes into a signing key, applying the store's own
+    /// interpretation (TPM ciphertext must be decrypted first). Returns
+    /// `None` when the bytes are not usable key material at all.
+    fn interpret_stored(
+        store: &SlotStore,
+        account: &str,
+        stored: &[u8],
+    ) -> Result<Option<SigningKey>, KeystoreError> {
+        let mut plain = store.interpret(account, stored)?;
+        if plain.len() != 32 {
+            plain.zeroize();
+            return Ok(None);
+        }
+        let parsed = SigningKey::from_slice(&plain);
+        plain.zeroize();
+        Ok(parsed.ok())
+    }
+
+    /// This store's full identity: namespace plus its durable
+    /// [`StoreIdentityV1`].
+    ///
+    /// Deliberately NOT device+inode. That is a good handle guard while an
+    /// operation is in flight — [`FileKeystore::secure_durable_get`] still
+    /// uses it to detect a directory or file swapped under an open fd — but
+    /// it is not stable across a remount or a restore, so a binding scoped
+    /// to it would stop validating after either, for no security reason.
     fn composed_store_id(&self) -> Result<String, KeystoreError> {
-        Ok(format!("{}|{}", self.store_id, self.store.physical_id()?))
+        Ok(format!("{}|{}", self.store_id, self.resolve_identity()?.0))
+    }
+
+    /// Read this store's durable identity, creating it exactly once for a
+    /// genuinely empty store.
+    ///
+    /// Restore policy, stated explicitly because the failure modes differ
+    /// sharply:
+    ///
+    /// - Marker present and well-formed → that identity, so a backup
+    ///   restored WITH its marker keeps its bindings valid.
+    /// - Marker absent and the store holds no material → mint one, commit
+    ///   it durably via `create_only`.
+    /// - Marker absent or malformed while material EXISTS → quarantine,
+    ///   fail closed. Minting a fresh marker over existing key material
+    ///   would silently re-identify keys that were bound to a different
+    ///   store, which is exactly the confusion the identity exists to
+    ///   prevent; refusing is recoverable, re-identifying is not.
+    fn resolve_identity(&self) -> Result<StoreIdentityV1, KeystoreError> {
+        if let Some(cached) = self.identity.get() {
+            return Ok(cached.clone());
+        }
+        let resolved = self.resolve_identity_uncached()?;
+        // A concurrent resolve may have won; either value is the same
+        // durable marker, so ignore the race loser.
+        let _ = self.identity.set(resolved.clone());
+        Ok(resolved)
+    }
+
+    fn resolve_identity_uncached(&self) -> Result<StoreIdentityV1, KeystoreError> {
+        if let Some(raw) = self.store.secure_durable_get(STORE_IDENTITY_ACCOUNT)? {
+            return StoreIdentityV1::parse(&raw).ok_or_else(|| KeystoreError::SecurityViolation {
+                label: STORE_IDENTITY_ACCOUNT.into(),
+                hint: "store identity marker is present but malformed; refusing to guess an \
+                       identity for existing key material (quarantine)"
+                    .into(),
+            });
+        }
+
+        if self.store.has_entries_besides(STORE_IDENTITY_ACCOUNT)? {
+            return Err(KeystoreError::SecurityViolation {
+                label: STORE_IDENTITY_ACCOUNT.into(),
+                hint: "store holds key material but no identity marker; refusing to mint a new \
+                       one over it (quarantine) — restore the marker alongside the material"
+                    .into(),
+            });
+        }
+
+        let minted = StoreIdentityV1::generate();
+        match self
+            .store
+            .create_only(STORE_IDENTITY_ACCOUNT, minted.0.as_bytes())?
+        {
+            CreateOutcome::CreatedDurable => Ok(minted),
+            // Someone else minted first — theirs wins; read it back.
+            CreateOutcome::ExistingExactDurable | CreateOutcome::Conflict => {
+                match self.store.secure_durable_get(STORE_IDENTITY_ACCOUNT)? {
+                    Some(raw) => StoreIdentityV1::parse(&raw).ok_or_else(|| {
+                        KeystoreError::SecurityViolation {
+                            label: STORE_IDENTITY_ACCOUNT.into(),
+                            hint: "concurrently-written store identity marker is malformed".into(),
+                        }
+                    }),
+                    None => Err(KeystoreError::Io {
+                        kind: "store identity vanished".into(),
+                        hint: "identity marker disappeared immediately after being written".into(),
+                    }),
+                }
+            }
+            CreateOutcome::KnownNoEffect | CreateOutcome::MayHaveTakenEffect => {
+                Err(KeystoreError::Io {
+                    kind: "store identity not committed".into(),
+                    hint: "could not durably commit a store identity marker; retry".into(),
+                })
+            }
+        }
+    }
+
+    /// Report a slot's binding WITHOUT ever creating one.
+    ///
+    /// Separate from [`Self::create_or_inspect`] because "tell me what is
+    /// there" and "make sure something is there" are different
+    /// authorisations: a caller auditing or validating must not be able to
+    /// mint key material as a side effect of looking.
+    pub fn inspect<P: Purpose>(
+        &self,
+        slot: &Slot<P>,
+    ) -> Result<Option<PublicBinding<P>>, KeystoreError> {
+        self.try_binding(slot)
     }
 
     /// [`Self::try_binding`], with an unprovable store state folded into
@@ -1297,8 +1525,15 @@ mod tests {
     fn corrupt_slot_is_rejected_without_echoing_content() {
         let td = tempfile::tempdir().unwrap();
         let s = store(td.path());
-        let slot = Slot::<MeshSession>::new("corrupt").unwrap();
 
+        // Initialise the store first so its identity marker exists.
+        // Otherwise planting material into a marker-less store trips the
+        // quarantine rule and we would be testing that instead of the
+        // corrupt-slot handling we mean to exercise.
+        s.create_or_inspect(&Slot::<MeshSession>::new("initialiser").unwrap())
+            .unwrap();
+
+        let slot = Slot::<MeshSession>::new("corrupt").unwrap();
         let raw = raw_reserved(td.path(), "opaque-p256-test");
         raw.set(&slot.account(), b"too short").unwrap();
 
@@ -1309,6 +1544,111 @@ mod tests {
             }
             other => panic!("expected InvalidKeyMaterial, got {other:?}"),
         }
+    }
+
+    /// Restore policy, all three arms.
+    #[test]
+    fn store_identity_restore_policy() {
+        let td = tempfile::tempdir().unwrap();
+        let slot = Slot::<MeshSession>::new("identity").unwrap();
+
+        // Empty store mints once and is stable across reopen.
+        let first = store(td.path());
+        let (_, binding) = first.create_or_inspect(&slot).unwrap();
+        let original = binding.unwrap();
+
+        let reopened = store(td.path());
+        let after_restart = reopened.inspect(&slot).unwrap().unwrap();
+        assert_eq!(
+            original, after_restart,
+            "binding must be reconstructible after restart: marker + material preserved together"
+        );
+
+        // Marker removed while material remains → quarantine, never a
+        // freshly minted identity over existing keys.
+        let raw = raw_reserved(td.path(), "opaque-p256-test");
+        raw.delete(STORE_IDENTITY_ACCOUNT).unwrap();
+        let orphaned = store(td.path());
+        match orphaned.inspect(&slot) {
+            Err(KeystoreError::SecurityViolation { hint, .. }) => {
+                assert!(hint.contains("quarantine"), "hint={hint}");
+            }
+            other => panic!("expected quarantine, got {other:?}"),
+        }
+
+        // Malformed marker is equally refused, not guessed at.
+        raw.set(STORE_IDENTITY_ACCOUNT, b"not-a-store-identity")
+            .unwrap();
+        let malformed = store(td.path());
+        assert!(matches!(
+            malformed.inspect(&slot),
+            Err(KeystoreError::SecurityViolation { .. })
+        ));
+    }
+
+    /// `inspect` must never create.
+    #[test]
+    fn inspect_never_creates() {
+        let td = tempfile::tempdir().unwrap();
+        let s = store(td.path());
+        let slot = Slot::<MeshSession>::new("never-made").unwrap();
+
+        assert!(s.inspect(&slot).unwrap().is_none());
+        assert!(
+            s.inspect(&slot).unwrap().is_none(),
+            "a second inspect must still find nothing — inspecting is not creating"
+        );
+    }
+
+    /// The slot id must be fixed-width and injective over length-prefixed
+    /// components, so no pair of (purpose, label) can collide.
+    #[test]
+    fn slot_id_is_fixed_width_and_injective() {
+        struct A;
+        impl Purpose for A {
+            const PURPOSE: &'static str = "a";
+        }
+        struct AB;
+        impl Purpose for AB {
+            const PURPOSE: &'static str = "a.b";
+        }
+
+        let one = Slot::<A>::new("b.c").unwrap().account();
+        let two = Slot::<AB>::new("c").unwrap().account();
+        assert_ne!(one, two);
+        assert_eq!(one.len(), two.len(), "slot ids must be fixed width");
+        assert!(one.len() <= 128, "slot id must fit the 128-byte bound");
+
+        let long = Slot::<A>::new("x".repeat(MAX_LABEL_LEN)).unwrap().account();
+        assert_eq!(long.len(), one.len(), "width must not vary with label size");
+    }
+
+    /// GC must compare and remove atomically. A key swapped in after the
+    /// caller's binding was published must never be destroyed by a GC aimed
+    /// at the older generation — and the previous check-then-delete shape
+    /// could do exactly that.
+    #[test]
+    fn gc_is_atomic_and_durable() {
+        let td = tempfile::tempdir().unwrap();
+        let s = store(td.path());
+        let slot = Slot::<MeshSession>::new("atomic-gc").unwrap();
+
+        let (_, gen_a) = s.create_or_inspect(&slot).unwrap();
+        let gen_a = gen_a.unwrap();
+
+        // Swap in B, then try to collect A.
+        let raw = raw_reserved(td.path(), "opaque-p256-test");
+        let other = SigningKey::random(&mut rand_core::OsRng);
+        raw.set(&slot.account(), other.to_bytes().as_slice())
+            .unwrap();
+
+        let report = s.gc_exact(&slot, &gen_a).unwrap();
+        assert!(!report.matched_expected, "must not claim it collected A");
+        assert!(report.present_after, "B must survive a GC aimed at A");
+        assert!(
+            s.inspect(&slot).unwrap().is_some(),
+            "B must still be loadable"
+        );
     }
 
     #[test]
