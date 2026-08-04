@@ -90,6 +90,10 @@ pub enum RekeyError {
     WrongGeneration { expected: u64, got: u64 },
     #[error("generation counter exhausted")]
     GenerationExhausted,
+    #[error(
+        "permit was issued by a different DirectionalRekeyState, or its generation/policy_count snapshot no longer matches current state"
+    )]
+    StalePermit,
 }
 
 /// Errors from the 5 auth frame schemas / K_mesh signing (Fila 1 follow-on,
@@ -128,6 +132,12 @@ pub enum AuthFrameError {
     Noise(#[from] NoiseSetupError),
     #[error("write of the final frame did not complete — no state transition occurred")]
     ActivateAckWriteFailed,
+    #[error(
+        "K_mesh signer failed (revoked/stale/expired/backend unavailable) — no signature produced"
+    )]
+    SignerFailed,
+    #[error("signer returned a byte string that does not parse as a valid P-256 signature")]
+    InvalidSignatureScalar,
 }
 
 /// Errors from Noise session-static setup (item 2).

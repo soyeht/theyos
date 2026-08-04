@@ -330,6 +330,15 @@ impl ProofR {
     pub fn checkpoint_hash(&self) -> &[u8] {
         &self.checkpoint_hash
     }
+    pub fn checkpoint_sequence(&self) -> u64 {
+        self.checkpoint_sequence
+    }
+    pub fn checkpoint_event_head(&self) -> &[u8] {
+        &self.checkpoint_event_head
+    }
+    pub fn checkpoint_not_after(&self) -> u64 {
+        self.checkpoint_not_after
+    }
     pub fn delegation(&self) -> &MeshSessionDelegation {
         &self.delegation
     }
@@ -502,8 +511,29 @@ impl ProofI {
     pub fn self_cert_fingerprint(&self) -> &[u8] {
         &self.self_cert_fingerprint
     }
+    /// Who the initiator itself intended to reach — 2026-08-04, @kiana:
+    /// the responder must compare this (and
+    /// [`Self::expected_peer_cert_fingerprint`]) against its own identity
+    /// before accepting this frame. Without that check, a validly-signed
+    /// Proof-I addressed to a *different* machine (R2) would be silently
+    /// accepted by whichever machine (R1) it actually arrived at.
+    pub fn expected_peer_m_id(&self) -> &str {
+        &self.expected_peer_m_id
+    }
+    pub fn expected_peer_cert_fingerprint(&self) -> &[u8] {
+        &self.expected_peer_cert_fingerprint
+    }
     pub fn checkpoint_hash(&self) -> &[u8] {
         &self.checkpoint_hash
+    }
+    pub fn checkpoint_sequence(&self) -> u64 {
+        self.checkpoint_sequence
+    }
+    pub fn checkpoint_event_head(&self) -> &[u8] {
+        &self.checkpoint_event_head
+    }
+    pub fn checkpoint_not_after(&self) -> u64 {
+        self.checkpoint_not_after
     }
     pub fn delegation(&self) -> &MeshSessionDelegation {
         &self.delegation
@@ -888,25 +918,40 @@ pub fn decode_auth_frame(plaintext: &[u8]) -> Result<AuthFrame, AuthFrameError> 
 /// unforgeable preimage type:
 ///
 /// ```compile_fail
-/// use mesh_session_core_rs::auth_frames::MeshSessionFrameSigner;
+/// use mesh_session_core_rs::auth_frames::{MeshSessionFrameSigner, MeshSessionFramePreimage};
+/// use mesh_session_core_rs::error::AuthFrameError;
 /// use p256::ecdsa::SigningKey;
 /// use p256::ecdsa::signature::Signer;
 /// use rand_core::OsRng;
 ///
 /// struct AnySigner(SigningKey);
 /// impl MeshSessionFrameSigner for AnySigner {
-///     fn sign_mesh_session_frame(&self, preimage: &[u8]) -> [u8; 64] {
+///     fn sign_mesh_session_frame(&self, preimage: &[u8]) -> Result<[u8; 64], AuthFrameError> {
 ///         // wrong parameter type — the trait requires
 ///         // &MeshSessionFramePreimage, not a raw byte slice.
-///         self.0.sign(preimage).to_bytes().into()
+///         Ok(self.0.sign(preimage).to_bytes().into())
 ///     }
 /// }
 /// ```
+///
+/// **Fallible (hardened 2026-08-04, @kiana, round 2):** a real K_mesh
+/// signer (D-4's `sign_checked`) can legitimately fail — revoked, stale
+/// epoch, expired delegation, backend unavailable. An earlier, infallible
+/// version of this trait left an implementor no honest way to report that
+/// except panicking or fabricating a signature; both are worse than an
+/// `Err`. `sign_frame` propagates the error as-is and never invents a
+/// signature on failure.
 pub trait MeshSessionFrameSigner {
     /// Returns the P-256 fixed-size `r || s` encoding (64 bytes),
-    /// **low-S canonical** — implementors must normalize before returning;
-    /// [`RawP256FrameVerifier`] rejects high-S on the way back in.
-    fn sign_mesh_session_frame(&self, preimage: &MeshSessionFramePreimage) -> [u8; 64];
+    /// **low-S canonical** — implementors must normalize before returning.
+    /// `sign_frame` re-parses and re-checks this itself before the
+    /// signature ever reaches the wire (2026-08-04, @kiana: do not trust
+    /// only the implementor's doc comment or the peer's inbound verifier
+    /// to catch a non-canonical signature this side produced).
+    fn sign_mesh_session_frame(
+        &self,
+        preimage: &MeshSessionFramePreimage,
+    ) -> Result<[u8; 64], AuthFrameError>;
 }
 
 pub trait MeshSessionFrameVerifier {
@@ -930,16 +975,29 @@ pub trait MeshSessionFrameVerifier {
 /// outright, not silently accepted-after-normalizing.
 pub struct RawP256FrameVerifier(pub VerifyingKey);
 
+/// Parse `signature` as a P-256 ECDSA signature and require it to already
+/// be low-S canonical, rejecting high-S outright rather than normalizing
+/// and accepting. Shared by inbound verification
+/// ([`RawP256FrameVerifier`]) and outbound signing ([`sign_frame`]) — the
+/// same check runs on bytes this crate is about to trust *and* on bytes
+/// it is about to put on the wire, so a non-canonical signature can never
+/// pass in either direction.
+fn parse_low_s_signature(signature: &[u8; 64]) -> Result<Signature, AuthFrameError> {
+    let sig =
+        Signature::from_slice(signature).map_err(|_| AuthFrameError::InvalidSignatureScalar)?;
+    if sig.normalize_s().is_some() {
+        return Err(AuthFrameError::HighSRejected);
+    }
+    Ok(sig)
+}
+
 impl MeshSessionFrameVerifier for RawP256FrameVerifier {
     fn verify_mesh_session_frame(
         &self,
         preimage: &MeshSessionFramePreimage,
         signature: &[u8; 64],
     ) -> Result<(), AuthFrameError> {
-        let sig = Signature::from_slice(signature).map_err(|_| AuthFrameError::BadSignature)?;
-        if sig.normalize_s().is_some() {
-            return Err(AuthFrameError::HighSRejected);
-        }
+        let sig = parse_low_s_signature(signature)?;
         self.0
             .verify(preimage.as_bytes(), &sig)
             .map_err(|_| AuthFrameError::BadSignature)
@@ -962,14 +1020,24 @@ pub(crate) fn verifier_from_delegated_pub(
 
 /// Sign a frame with K_mesh and return the same frame with `sig` filled
 /// in. `pub(crate)`: only `auth_state_machine` orchestrates signing.
+///
+/// Propagates a fallible signer's error as-is (2026-08-04, @kiana: a real
+/// K_mesh signer can fail — revoked/stale/expired/backend — and must never
+/// be forced into fabricating a signature to satisfy an infallible
+/// return type). Before returning, re-parses whatever the signer produced
+/// and requires it to be a valid, low-S canonical P-256 signature — this
+/// crate does not trust only the implementor's doc comment, or the
+/// receiving peer's own inbound check, to catch a malformed signature
+/// this side is about to put on the wire.
 pub(crate) fn sign_frame<F, Sig>(frame: F, k_mesh: &Sig) -> Result<F, AuthFrameError>
 where
     F: AuthFrameBody + FrameWithSig,
     Sig: MeshSessionFrameSigner,
 {
     let preimage = MeshSessionFramePreimage::for_frame(&frame)?;
-    let sig = k_mesh.sign_mesh_session_frame(&preimage);
-    Ok(frame.with_sig_bytes(sig.to_vec()))
+    let sig_bytes = k_mesh.sign_mesh_session_frame(&preimage)?;
+    parse_low_s_signature(&sig_bytes)?;
+    Ok(frame.with_sig_bytes(sig_bytes.to_vec()))
 }
 
 /// Verify a frame's own `sig` against `verifier`. `pub(crate)`: only
@@ -1040,10 +1108,51 @@ mod tests {
 
     struct TestKMesh(SigningKey);
     impl MeshSessionFrameSigner for TestKMesh {
-        fn sign_mesh_session_frame(&self, preimage: &MeshSessionFramePreimage) -> [u8; 64] {
+        fn sign_mesh_session_frame(
+            &self,
+            preimage: &MeshSessionFramePreimage,
+        ) -> Result<[u8; 64], AuthFrameError> {
             let sig: Signature = self.0.sign(preimage.as_bytes());
             let sig = sig.normalize_s().unwrap_or(sig);
-            sig.to_bytes().into()
+            Ok(sig.to_bytes().into())
+        }
+    }
+
+    /// Stands in for a real K_mesh whose backend refuses to sign — e.g.
+    /// revoked, stale epoch, expired delegation. `sign_frame` must
+    /// propagate this, never fabricate a signature.
+    struct AlwaysFailingKMesh;
+    impl MeshSessionFrameSigner for AlwaysFailingKMesh {
+        fn sign_mesh_session_frame(
+            &self,
+            _preimage: &MeshSessionFramePreimage,
+        ) -> Result<[u8; 64], AuthFrameError> {
+            Err(AuthFrameError::SignerFailed)
+        }
+    }
+
+    /// Stands in for a buggy/non-compliant K_mesh that returns a high-S
+    /// signature — `sign_frame` must catch this itself, not rely on the
+    /// receiving peer's inbound check. RFC6979 signing is deterministic
+    /// per (key, message), so probe a small salt range for a message that
+    /// happens to sign high-S (roughly half do) rather than trying to
+    /// construct one directly — the `ecdsa` crate exposes no public
+    /// "denormalize" operation.
+    struct AlwaysHighSKMesh(SigningKey);
+    impl MeshSessionFrameSigner for AlwaysHighSKMesh {
+        fn sign_mesh_session_frame(
+            &self,
+            preimage: &MeshSessionFramePreimage,
+        ) -> Result<[u8; 64], AuthFrameError> {
+            for salt in 0u8..255 {
+                let mut salted = preimage.as_bytes().to_vec();
+                salted.push(salt);
+                let sig: Signature = self.0.sign(&salted);
+                if sig.normalize_s().is_some() {
+                    return Ok(sig.to_bytes().into());
+                }
+            }
+            panic!("expected at least one high-S signature among 255 probes");
         }
     }
 
@@ -1262,6 +1371,20 @@ mod tests {
         let signed = sign_frame(frame, &k_mesh).unwrap();
         let sig: [u8; 64] = signed.sig().to_vec().try_into().unwrap();
         verify_frame(&signed, &sig, &verifier).unwrap();
+    }
+
+    #[test]
+    fn red_signer_failure_propagates_never_fabricates_a_signature() {
+        let err = sign_frame(sample_proof_r(), &AlwaysFailingKMesh).unwrap_err();
+        assert!(matches!(err, AuthFrameError::SignerFailed));
+    }
+
+    #[test]
+    fn red_signer_returning_high_s_is_caught_before_the_wire() {
+        let signing_key = SigningKey::random(&mut OsRng);
+        let k_mesh = AlwaysHighSKMesh(signing_key);
+        let err = sign_frame(sample_proof_r(), &k_mesh).unwrap_err();
+        assert!(matches!(err, AuthFrameError::HighSRejected));
     }
 
     #[test]

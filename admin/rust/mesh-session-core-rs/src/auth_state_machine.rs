@@ -142,8 +142,24 @@ fn check_h_final(frame_h_final: &[u8], expected: &[u8]) -> Result<(), AuthFrameE
     Ok(())
 }
 
-fn check_checkpoint(frame_hash: &[u8], local: &LocalCheckpoint) -> Result<(), AuthFrameError> {
-    if frame_hash != local.hash.as_slice() {
+/// Compares all 4 checkpoint scalars a frame signs (v6 §6), not just
+/// `hash` (2026-08-04, @kiana: `hash` alone was checked, leaving
+/// `sequence`/`event_head`/`not_after` — also part of the signed body —
+/// unverified; a peer could send the right hash with mismatched
+/// sequence/event_head/not_after and nothing here would catch it).
+#[allow(clippy::too_many_arguments)]
+fn check_checkpoint(
+    frame_hash: &[u8],
+    frame_sequence: u64,
+    frame_event_head: &[u8],
+    frame_not_after: u64,
+    local: &LocalCheckpoint,
+) -> Result<(), AuthFrameError> {
+    if frame_hash != local.hash.as_slice()
+        || frame_sequence != local.sequence
+        || frame_event_head != local.event_head.as_slice()
+        || frame_not_after != local.not_after
+    {
         return Err(AuthFrameError::CheckpointMismatch);
     }
     Ok(())
@@ -208,10 +224,17 @@ impl<T> ActiveMeshSession<T> {
     }
     /// Couples the tx counter transition to the real
     /// `TransportState::rekey_outgoing()` — a caller cannot commit one
-    /// without the other.
-    pub fn commit_outgoing_rekey(&mut self, permit: rekey::SendMarkerPermit) {
+    /// without the other. Validates the permit (issuer + generation/
+    /// policy_count snapshot) *before* touching `transport` (2026-08-04,
+    /// @kiana): the real Noise-level rekey must never fire on a stale or
+    /// foreign permit, so the check that can reject it runs first.
+    pub fn commit_outgoing_rekey(
+        &mut self,
+        permit: rekey::SendMarkerPermit,
+    ) -> Result<(), crate::error::RekeyError> {
+        self.rekey.tx().validate_marker_permit(&permit)?;
         self.transport.rekey_outgoing();
-        self.rekey.tx().after_send_marker(permit);
+        self.rekey.tx().after_send_marker(permit)
     }
     pub fn observe_incoming_non_marker(&mut self) -> Result<(), crate::error::RekeyError> {
         self.rekey.rx().on_receive(rekey::IncomingRecord::NonMarker)
@@ -279,7 +302,23 @@ where
         _ => return Err(AuthFrameError::RoleOrKindMismatch),
     };
     check_h_final(proof_i.h_final(), &h_final)?;
-    check_checkpoint(proof_i.checkpoint_hash(), checkpoint)?;
+    // 2026-08-04, @kiana: the responder must confirm the initiator's own
+    // signed intent was actually to reach *this* machine — without this,
+    // a validly-signed Proof-I addressed to a different responder (R2)
+    // would be silently accepted by whichever responder (R1) it actually
+    // reached. Must fail before FinalConfirm is ever sent.
+    if proof_i.expected_peer_m_id() != local.m_id
+        || proof_i.expected_peer_cert_fingerprint() != local.cert_fingerprint
+    {
+        return Err(AuthFrameError::ExpectedPeerMismatch);
+    }
+    check_checkpoint(
+        proof_i.checkpoint_hash(),
+        proof_i.checkpoint_sequence(),
+        proof_i.checkpoint_event_head(),
+        proof_i.checkpoint_not_after(),
+        checkpoint,
+    )?;
     pass_delegation_gate(
         proof_i.delegation(),
         policy,
@@ -403,7 +442,13 @@ where
     {
         return Err(AuthFrameError::ExpectedPeerMismatch);
     }
-    check_checkpoint(proof_r.checkpoint_hash(), checkpoint)?;
+    check_checkpoint(
+        proof_r.checkpoint_hash(),
+        proof_r.checkpoint_sequence(),
+        proof_r.checkpoint_event_head(),
+        proof_r.checkpoint_not_after(),
+        checkpoint,
+    )?;
     pass_delegation_gate(
         proof_r.delegation(),
         policy,
@@ -519,10 +564,10 @@ mod tests {
         fn sign_mesh_session_frame(
             &self,
             preimage: &crate::auth_frames::MeshSessionFramePreimage,
-        ) -> [u8; 64] {
+        ) -> Result<[u8; 64], AuthFrameError> {
             let sig: Signature = self.0.sign(preimage.as_bytes());
             let sig = sig.normalize_s().unwrap_or(sig);
-            sig.to_bytes().into()
+            Ok(sig.to_bytes().into())
         }
     }
 
@@ -693,6 +738,325 @@ mod tests {
         assert_eq!(responder.ingress_evidence().observed_at, 1);
     }
 
+    /// Like `full_handshake`, but lets the caller substitute the
+    /// initiator's own checkpoint (used for the checkpoint-mutant REDs)
+    /// and returns both sides' raw `Result` instead of unwrapping, so a
+    /// test can assert on the responder's rejection.
+    fn full_handshake_with_initiator_checkpoint(
+        initiator_checkpoint: LocalCheckpoint,
+    ) -> (
+        Result<ActiveMeshSession<TcpStream>, AuthFrameError>,
+        Result<ActiveMeshSession<TcpStream>, AuthFrameError>,
+    ) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let responder_key = SigningKey::random(&mut OsRng);
+        let responder_verifying = VerifyingKey::from(&responder_key);
+        let initiator_key = SigningKey::random(&mut OsRng);
+        let initiator_verifying = VerifyingKey::from(&initiator_key);
+
+        let responder_delegation = delegation_for_key(
+            &responder_verifying,
+            "hh-1",
+            "responder-1",
+            vec![0xCC; 32],
+            0,
+            u64::MAX / 2,
+        );
+        let responder_identity =
+            identity("hh-1", "responder-1", vec![0xCC; 32], responder_delegation);
+
+        let responder = thread::spawn({
+            let checkpoint = fixed_checkpoint();
+            let k_mesh = TestKMesh(responder_key);
+            move || {
+                let (sock, _) = listener.accept().unwrap();
+                let ingress = PrevalidatedIngress::new(sock, IngressEvidence { observed_at: 1 });
+                run_responder_handshake(
+                    ingress,
+                    &responder_identity,
+                    &checkpoint,
+                    &DelegationPolicy::test(u64::MAX / 2),
+                    &AlwaysAcceptDelegation,
+                    &k_mesh,
+                    RekeyThreshold::new(3).unwrap(),
+                )
+            }
+        });
+
+        let initiator_delegation = delegation_for_key(
+            &initiator_verifying,
+            "hh-1",
+            "initiator-1",
+            vec![0xEE; 32],
+            0,
+            u64::MAX / 2,
+        );
+        let initiator_identity =
+            identity("hh-1", "initiator-1", vec![0xEE; 32], initiator_delegation);
+        let expected = ExpectedResponder {
+            hh_id: "hh-1".to_string(),
+            m_id: "responder-1".to_string(),
+            cert_fingerprint: [0xCC; 32],
+        };
+        let sock = TcpStream::connect(addr).unwrap();
+        let ingress = PrevalidatedIngress::new(sock, IngressEvidence { observed_at: 2 });
+        let k_mesh = TestKMesh(initiator_key);
+        let initiator_result = run_initiator_handshake(
+            ingress,
+            &expected,
+            &initiator_identity,
+            &initiator_checkpoint,
+            ConnectionIntentDigest::from_bytes([0x11; 32]),
+            &DelegationPolicy::test(u64::MAX / 2),
+            &AlwaysAcceptDelegation,
+            &k_mesh,
+            RekeyThreshold::new(3).unwrap(),
+        );
+
+        let responder_result = responder.join().unwrap();
+        (initiator_result, responder_result)
+    }
+
+    // These three mutate the INITIATOR's own local checkpoint away from
+    // what the responder's real Proof-R carries. Since the initiator
+    // checks received Proof-R against its own checkpoint *before* it ever
+    // builds/sends Proof-I, this is caught on the initiator side — proving
+    // check_checkpoint's full-4-scalar comparison on the Proof-R path.
+    // (The responder never receives a Proof-I at all in this shape, so it
+    // just observes the dropped connection, not CheckpointMismatch
+    // itself — see red_proof_i_checkpoint_mutant_rejected_by_responder
+    // below for the symmetric proof on the Proof-I/responder path.)
+    #[test]
+    fn red_checkpoint_sequence_mutant_rejected() {
+        let mut bad = fixed_checkpoint();
+        bad.sequence += 1; // hash still matches; sequence alone differs
+        let (initiator_result, _responder_result) = full_handshake_with_initiator_checkpoint(bad);
+        assert!(matches!(
+            initiator_result,
+            Err(AuthFrameError::CheckpointMismatch)
+        ));
+    }
+
+    #[test]
+    fn red_checkpoint_event_head_mutant_rejected() {
+        let mut bad = fixed_checkpoint();
+        bad.event_head = vec![0xFF; 32]; // hash still matches; event_head alone differs
+        let (initiator_result, _responder_result) = full_handshake_with_initiator_checkpoint(bad);
+        assert!(matches!(
+            initiator_result,
+            Err(AuthFrameError::CheckpointMismatch)
+        ));
+    }
+
+    #[test]
+    fn red_checkpoint_not_after_mutant_rejected() {
+        let mut bad = fixed_checkpoint();
+        bad.not_after += 1; // hash still matches; not_after alone differs
+        let (initiator_result, _responder_result) = full_handshake_with_initiator_checkpoint(bad);
+        assert!(matches!(
+            initiator_result,
+            Err(AuthFrameError::CheckpointMismatch)
+        ));
+    }
+
+    #[test]
+    fn red_proof_i_expected_peer_mismatch_rejected_before_final_confirm() {
+        // Simulates a validly-signed Proof-I whose signed intent was to
+        // reach a DIFFERENT responder (R2) arriving instead at this
+        // responder (R1) — constructed directly (bypassing
+        // run_initiator_handshake's own field population, which would
+        // never build this) to prove R1's own check is real and not
+        // merely redundant with the initiator's ExpectedResponder check.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let responder_key = SigningKey::random(&mut OsRng);
+        let responder_verifying = VerifyingKey::from(&responder_key);
+        let responder_delegation = delegation_for_key(
+            &responder_verifying,
+            "hh-1",
+            "responder-1",
+            vec![0xCC; 32],
+            0,
+            u64::MAX / 2,
+        );
+        let responder_identity =
+            identity("hh-1", "responder-1", vec![0xCC; 32], responder_delegation);
+
+        let responder = thread::spawn({
+            let checkpoint = fixed_checkpoint();
+            let k_mesh = TestKMesh(responder_key);
+            move || {
+                let (sock, _) = listener.accept().unwrap();
+                let ingress = PrevalidatedIngress::new(sock, IngressEvidence { observed_at: 1 });
+                run_responder_handshake(
+                    ingress,
+                    &responder_identity,
+                    &checkpoint,
+                    &DelegationPolicy::test(u64::MAX / 2),
+                    &AlwaysAcceptDelegation,
+                    &k_mesh,
+                    RekeyThreshold::new(3).unwrap(),
+                )
+            }
+        });
+
+        // Attacker/misdirected initiator: real Noise handshake, real
+        // Proof-R receipt, but a hand-built Proof-I whose
+        // expected_peer_m_id/fingerprint name a DIFFERENT machine
+        // ("responder-2") than the one it is actually talking to.
+        let mut sock = TcpStream::connect(addr).unwrap();
+        let handshake = noise::run_xx_handshake(&mut sock, Role::Initiator).unwrap();
+        let mut transport = handshake.transport;
+        let h_final = handshake.handshake_hash;
+        match recv_frame(&mut sock, &mut transport).unwrap() {
+            AuthFrame::ProofR(_) => {}
+            _ => panic!("expected ProofR"),
+        }
+
+        let initiator_key = SigningKey::random(&mut OsRng);
+        let initiator_delegation = delegation_for_key(
+            &VerifyingKey::from(&initiator_key),
+            "hh-1",
+            "initiator-1",
+            vec![0xEE; 32],
+            0,
+            u64::MAX / 2,
+        );
+        let checkpoint = fixed_checkpoint();
+        let proof_i = ProofI::new(
+            h_final.clone(),
+            "hh-1".to_string(),
+            "initiator-1".to_string(),
+            "responder-2".to_string(), // WRONG — real peer is responder-1
+            vec![0xEE; 32],
+            vec![0xDD; 32], // some other machine's fingerprint
+            checkpoint.hash.clone(),
+            checkpoint.sequence,
+            checkpoint.event_head.clone(),
+            checkpoint.not_after,
+            initiator_delegation,
+            ConnectionIntentDigest::from_bytes([0x11; 32]),
+            vec![0u8; 64],
+        )
+        .unwrap();
+        let k_mesh = TestKMesh(initiator_key);
+        let proof_i = auth_frames::sign_frame(proof_i, &k_mesh).unwrap();
+        send_frame(&mut sock, &mut transport, &AuthFrame::ProofI(proof_i)).unwrap();
+
+        let responder_result = responder.join().unwrap();
+        assert!(matches!(
+            responder_result,
+            Err(AuthFrameError::ExpectedPeerMismatch)
+        ));
+    }
+
+    #[test]
+    fn red_proof_i_checkpoint_mutant_rejected_by_responder() {
+        // Symmetric to the expected-peer test above: a hand-built Proof-I,
+        // correctly addressed this time, but with checkpoint_sequence
+        // mutated away from the responder's real checkpoint — proves the
+        // RESPONDER's own check_checkpoint call (on the Proof-I path)
+        // independently catches all 4 scalars, not just hash, mirroring
+        // the initiator-side proof above (which exercises the Proof-R
+        // path instead).
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let responder_key = SigningKey::random(&mut OsRng);
+        let responder_verifying = VerifyingKey::from(&responder_key);
+        let responder_delegation = delegation_for_key(
+            &responder_verifying,
+            "hh-1",
+            "responder-1",
+            vec![0xCC; 32],
+            0,
+            u64::MAX / 2,
+        );
+        let responder_identity =
+            identity("hh-1", "responder-1", vec![0xCC; 32], responder_delegation);
+
+        let responder = thread::spawn({
+            let checkpoint = fixed_checkpoint();
+            let k_mesh = TestKMesh(responder_key);
+            move || {
+                let (sock, _) = listener.accept().unwrap();
+                let ingress = PrevalidatedIngress::new(sock, IngressEvidence { observed_at: 1 });
+                run_responder_handshake(
+                    ingress,
+                    &responder_identity,
+                    &checkpoint,
+                    &DelegationPolicy::test(u64::MAX / 2),
+                    &AlwaysAcceptDelegation,
+                    &k_mesh,
+                    RekeyThreshold::new(3).unwrap(),
+                )
+            }
+        });
+
+        let mut sock = TcpStream::connect(addr).unwrap();
+        let handshake = noise::run_xx_handshake(&mut sock, Role::Initiator).unwrap();
+        let mut transport = handshake.transport;
+        let h_final = handshake.handshake_hash;
+        match recv_frame(&mut sock, &mut transport).unwrap() {
+            AuthFrame::ProofR(_) => {}
+            _ => panic!("expected ProofR"),
+        }
+
+        let initiator_key = SigningKey::random(&mut OsRng);
+        let initiator_delegation = delegation_for_key(
+            &VerifyingKey::from(&initiator_key),
+            "hh-1",
+            "initiator-1",
+            vec![0xEE; 32],
+            0,
+            u64::MAX / 2,
+        );
+        let mut bad_checkpoint = fixed_checkpoint();
+        bad_checkpoint.sequence += 1; // hash matches; sequence alone differs
+        let proof_i = ProofI::new(
+            h_final.clone(),
+            "hh-1".to_string(),
+            "initiator-1".to_string(),
+            "responder-1".to_string(), // correctly addressed this time
+            vec![0xEE; 32],
+            vec![0xCC; 32], // matches the real responder's fingerprint
+            bad_checkpoint.hash.clone(),
+            bad_checkpoint.sequence,
+            bad_checkpoint.event_head.clone(),
+            bad_checkpoint.not_after,
+            initiator_delegation,
+            ConnectionIntentDigest::from_bytes([0x11; 32]),
+            vec![0u8; 64],
+        )
+        .unwrap();
+        let k_mesh = TestKMesh(initiator_key);
+        let proof_i = auth_frames::sign_frame(proof_i, &k_mesh).unwrap();
+        send_frame(&mut sock, &mut transport, &AuthFrame::ProofI(proof_i)).unwrap();
+
+        let responder_result = responder.join().unwrap();
+        assert!(matches!(
+            responder_result,
+            Err(AuthFrameError::CheckpointMismatch)
+        ));
+    }
+
+    #[test]
+    fn red_commit_outgoing_rekey_with_foreign_permit_does_not_touch_transport() {
+        let (mut initiator, _responder) = full_handshake();
+        let other_threshold = RekeyThreshold::new(1).unwrap();
+        let donor = rekey::DirectionalRekeyState::new(other_threshold);
+        let foreign_permit = donor.before_send_marker().unwrap();
+
+        let err = initiator.commit_outgoing_rekey(foreign_permit).unwrap_err();
+        assert!(matches!(err, crate::error::RekeyError::StalePermit));
+        // The tx counter must be completely unaffected — validate_marker_permit
+        // rejected before transport.rekey_outgoing() or after_send_marker
+        // ever ran.
+        assert_eq!(initiator.rekey.tx().generation(), 0);
+        assert_eq!(initiator.rekey.tx().policy_count(), 0);
+    }
+
     #[test]
     fn delegation_gate_blocks_with_no_verifier_configured() {
         // The initiator side uses AlwaysAcceptDelegation (so it gets far
@@ -793,7 +1157,7 @@ mod tests {
         initiator.after_send_non_marker(p2).unwrap();
         let marker_permit = initiator.before_outgoing_rekey().unwrap();
         let next_generation = marker_permit.next_generation();
-        initiator.commit_outgoing_rekey(marker_permit);
+        initiator.commit_outgoing_rekey(marker_permit).unwrap();
 
         // Responder's RX mirrors it, coupled to a REAL
         // TransportState::rekey_incoming().
@@ -829,7 +1193,7 @@ mod tests {
         initiator.after_send_non_marker(p2).unwrap();
         let marker_permit = initiator.before_outgoing_rekey().unwrap();
         let tx_next_generation = marker_permit.next_generation();
-        initiator.commit_outgoing_rekey(marker_permit);
+        initiator.commit_outgoing_rekey(marker_permit).unwrap();
 
         // ...simultaneously with responder driving ITS OWN tx (opposite
         // direction) to a rekey, real coupling on both.
@@ -839,7 +1203,9 @@ mod tests {
         responder.after_send_non_marker(p2).unwrap();
         let responder_marker_permit = responder.before_outgoing_rekey().unwrap();
         let rx_next_generation = responder_marker_permit.next_generation();
-        responder.commit_outgoing_rekey(responder_marker_permit);
+        responder
+            .commit_outgoing_rekey(responder_marker_permit)
+            .unwrap();
 
         // Now settle both receive sides for the marks each peer sent.
         responder.observe_incoming_non_marker().unwrap();

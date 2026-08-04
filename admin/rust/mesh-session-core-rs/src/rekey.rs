@@ -10,19 +10,47 @@
 //! only tracks `policy_count`/`generation` per direction and answers
 //! "is a marker expected/allowed right now."
 //!
-//! **Hardened 2026-08-04, @kiana:** the send-side `before_*`/`after_*`
-//! pair used to be two independent calls — nothing stopped calling
-//! `after_send_non_marker` without `before_send_non_marker` first, or
-//! `after_send_marker` with an arbitrary `next_generation` never validated
-//! by `before_send_marker`. Both `after_*` methods now consume an opaque,
-//! move-only permit that only the matching `before_*` call can produce
-//! (misuse prevented by type, not by convention), and the marker permit
-//! itself carries the validated `next_generation` — there is no longer a
-//! parameter to substitute. `SessionRekeyState::new` is `pub(crate)`: it
-//! must only be minted by this crate's own post-ActivateAck transition,
-//! never called directly by an external consumer before auth completes.
+//! **Hardened 2026-08-04, @kiana, round 1:** the send-side `before_*`/
+//! `after_*` pair used to be two independent calls — nothing stopped
+//! calling `after_send_non_marker` without `before_send_non_marker` first,
+//! or `after_send_marker` with an arbitrary `next_generation` never
+//! validated by `before_send_marker`. Both `after_*` methods consume an
+//! opaque, move-only permit that only the matching `before_*` call can
+//! produce, and the marker permit carries the validated `next_generation`
+//! — no parameter to substitute.
+//!
+//! **Hardened 2026-08-04, @kiana, round 2 (independent audit of
+//! `e5afccfe`):** round 1's permits were still bare, contentless tokens —
+//! nothing tied a permit to *which* `DirectionalRekeyState` issued it, or
+//! to the exact `generation`/`policy_count` it was validated against.
+//! Reproduced externally: calling `before_send_non_marker(&self)` three
+//! times in a row (nothing mutates between calls) yielded three
+//! equally-"valid" permits, and applying all three via `after_*` drove
+//! `policy_count` from 0 straight to 3, jumping straight past the N-1
+//! marker-required boundary the whole mechanism exists to enforce. Worse,
+//! a permit issued by *one* `DirectionalRekeyState` (e.g. a donor session,
+//! or the `rx` half of a session) carried nothing preventing it from being
+//! applied to a *different* instance (a victim session, or the `tx` half)
+//! — `after_send_marker` would blindly overwrite `self.generation` with
+//! whatever `next_generation` the donor's permit happened to carry.
+//!
+//! Every `DirectionalRekeyState` now has a random [`RekeyStateId`], minted
+//! once at construction (`OsRng`, not a counter or pointer — a counter is
+//! guessable/collidable across instances built in the same process, and a
+//! pointer can be reused after a drop). Every permit records the
+//! `RekeyStateId` and the exact `generation`/`policy_count` snapshot it was
+//! validated against. `after_*` re-checks both — issuer identity *and*
+//! snapshot freshness — immediately before mutating state, so: a permit
+//! from a different instance is rejected (wrong issuer); a permit whose
+//! snapshot no longer matches current state (because some other permit
+//! already advanced it) is rejected as stale, closing the "three permits,
+//! one real state change" gap above without requiring `before_*` to take
+//! `&mut self` — only the first-applied permit for any given snapshot can
+//! ever successfully commit.
 
 use std::num::NonZeroU64;
+
+use rand_core::{OsRng, RngCore};
 
 use crate::error::RekeyError;
 
@@ -57,6 +85,19 @@ pub fn rekey_threshold_default() -> RekeyThreshold {
         .expect("REKEY_THRESHOLD_DEFAULT_VALUE is nonzero")
 }
 
+/// Identifies one specific `DirectionalRekeyState` instance, minted once at
+/// construction. Never equal across two different instances, even ones
+/// with identical counter values — this is what lets a permit be bound to
+/// "this exact state object", not just "some state with the right shape".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RekeyStateId(u64);
+
+impl RekeyStateId {
+    fn fresh() -> Self {
+        Self(OsRng.next_u64())
+    }
+}
+
 /// What the caller observed after decoding one post-ActivateAck record,
 /// abstracted away from whatever concrete wire format eventually carries
 /// it. Auth frames (ProofR..ActivateAck) are not represented here at all —
@@ -67,20 +108,27 @@ pub enum IncomingRecord {
     Marker { next_generation: u64 },
 }
 
-/// Proof that [`DirectionalRekeyState::before_send_non_marker`] succeeded.
-/// The only way to advance `policy_count` for a non-marker send —
-/// `after_send_non_marker` takes this by value (consumed once), so it
-/// cannot be called without a prior, successful `before_send_non_marker`,
-/// and cannot be replayed.
+/// Proof that [`DirectionalRekeyState::before_send_non_marker`] succeeded,
+/// bound to the exact instance and `policy_count` it was validated
+/// against. `after_send_non_marker` re-checks both before mutating —
+/// issued-by-someone-else and issued-against-a-now-stale-count are both
+/// rejected, not just "some permit exists".
 #[must_use = "pass this to after_send_non_marker, or the send is never committed"]
-pub struct SendNonMarkerPermit(());
+pub struct SendNonMarkerPermit {
+    issuer: RekeyStateId,
+    expected_policy_count: u64,
+}
 
 /// Proof that [`DirectionalRekeyState::before_send_marker`] succeeded,
-/// carrying the exact `next_generation` value that was validated.
-/// `after_send_marker` takes no separate generation parameter — there is
-/// nothing for a caller to substitute at commit time.
+/// bound to the exact instance and `generation`/`policy_count` snapshot it
+/// was validated against, and carrying the `next_generation` value that
+/// snapshot justifies. `after_send_marker` re-checks issuer and snapshot
+/// before mutating — there is nothing here a caller can substitute.
 #[must_use = "pass this to after_send_marker, or the rekey is never committed"]
 pub struct SendMarkerPermit {
+    issuer: RekeyStateId,
+    expected_generation: u64,
+    expected_policy_count: u64,
     next_generation: u64,
 }
 
@@ -97,14 +145,9 @@ impl SendMarkerPermit {
 /// (tx, rx) make up a session's rekey state; v6 §8 requires them fully
 /// independent, reset to `generation = 0, policy_count = 0` only once,
 /// immediately after ActivateAck.
-/// Deliberately not `Clone`/`Copy` (hardened 2026-08-04, @kiana): a permit
-/// is proof about *one specific* `DirectionalRekeyState` instance. If the
-/// state were copyable, a permit obtained from one copy could be applied
-/// to a different copy of what's nominally "the same" logical state,
-/// which defeats the point of the permit tying `before_*`/`after_*`
-/// together.
 #[derive(Debug)]
 pub struct DirectionalRekeyState {
+    id: RekeyStateId,
     generation: u64,
     policy_count: u64,
     threshold: RekeyThreshold,
@@ -113,6 +156,7 @@ pub struct DirectionalRekeyState {
 impl DirectionalRekeyState {
     pub fn new(threshold: RekeyThreshold) -> Self {
         Self {
+            id: RekeyStateId::fresh(),
             generation: 0,
             policy_count: 0,
             threshold,
@@ -130,17 +174,25 @@ impl DirectionalRekeyState {
     /// Call before encrypting a non-marker record. `policy_count ==
     /// threshold - 1` means the *next* record is required to be a marker
     /// (RED-43): a non-marker here is rejected before it is ever sent.
-    /// Returns a permit that [`Self::after_send_non_marker`] requires.
+    /// Returns a permit snapshotting the current `policy_count`, bound to
+    /// this instance — see the module hardening note.
     pub fn before_send_non_marker(&self) -> Result<SendNonMarkerPermit, RekeyError> {
         if self.policy_count == self.threshold.minus_one() {
             return Err(RekeyError::ExpectedRekeyMarker);
         }
-        Ok(SendNonMarkerPermit(()))
+        Ok(SendNonMarkerPermit {
+            issuer: self.id,
+            expected_policy_count: self.policy_count,
+        })
     }
 
-    /// Call after a non-marker record has been fully sent, consuming the
-    /// permit [`Self::before_send_non_marker`] issued. There is no
-    /// zero-argument overload — a permit is always required:
+    /// Call after a non-marker record has been fully sent. Re-validates
+    /// the permit's issuer and snapshot against current state before
+    /// mutating anything: a permit from a different instance, or one
+    /// whose `policy_count` snapshot no longer matches (because some
+    /// other permit already advanced it), is rejected as stale rather
+    /// than blindly applied. There is no zero-argument overload — a
+    /// permit is always required:
     ///
     /// ```compile_fail
     /// use mesh_session_core_rs::rekey::{DirectionalRekeyState, RekeyThreshold};
@@ -148,10 +200,10 @@ impl DirectionalRekeyState {
     /// let mut tx = DirectionalRekeyState::new(threshold);
     /// tx.after_send_non_marker(); // missing the required SendNonMarkerPermit
     /// ```
-    pub fn after_send_non_marker(
-        &mut self,
-        _permit: SendNonMarkerPermit,
-    ) -> Result<(), RekeyError> {
+    pub fn after_send_non_marker(&mut self, permit: SendNonMarkerPermit) -> Result<(), RekeyError> {
+        if permit.issuer != self.id || permit.expected_policy_count != self.policy_count {
+            return Err(RekeyError::StalePermit);
+        }
         self.policy_count = self
             .policy_count
             .checked_add(1)
@@ -162,7 +214,9 @@ impl DirectionalRekeyState {
     /// Call before sending a marker. The returned permit carries the
     /// `next_generation` value the marker must carry (v6 §8: "count é
     /// ainda N-1" at send time — this call does not itself increment
-    /// `policy_count`, `after_send_marker` resets it instead).
+    /// `policy_count`, `after_send_marker` resets it instead), bound to
+    /// this instance and the exact `generation`/`policy_count` it was
+    /// computed from.
     pub fn before_send_marker(&self) -> Result<SendMarkerPermit, RekeyError> {
         if self.policy_count != self.threshold.minus_one() {
             return Err(RekeyError::PrematureRekeyMarker);
@@ -171,25 +225,48 @@ impl DirectionalRekeyState {
             .generation
             .checked_add(1)
             .ok_or(RekeyError::GenerationExhausted)?;
-        Ok(SendMarkerPermit { next_generation })
+        Ok(SendMarkerPermit {
+            issuer: self.id,
+            expected_generation: self.generation,
+            expected_policy_count: self.policy_count,
+            next_generation,
+        })
     }
 
-    /// Call once the marker has been written in full, consuming the
-    /// permit [`Self::before_send_marker`] issued. Commits exactly the
-    /// generation that permit was validated against — see the module
-    /// gate note: `after_send_marker(next_generation: u64)` used to exist
-    /// and let a caller commit an ungvalidated value; it does not anymore.
-    pub fn after_send_marker(&mut self, permit: SendMarkerPermit) {
+    /// Checks a marker permit's issuer and snapshot against current state
+    /// *without* mutating anything — used to validate strictly before any
+    /// coupled, harder-to-undo side effect (e.g. `TransportState::
+    /// rekey_outgoing()`) runs, so that side effect never fires on a
+    /// stale/foreign permit. [`Self::after_send_marker`] calls this
+    /// internally too; calling it again there is cheap and keeps
+    /// `after_send_marker` safe to call on its own.
+    pub fn validate_marker_permit(&self, permit: &SendMarkerPermit) -> Result<(), RekeyError> {
+        if permit.issuer != self.id
+            || permit.expected_generation != self.generation
+            || permit.expected_policy_count != self.policy_count
+        {
+            return Err(RekeyError::StalePermit);
+        }
+        Ok(())
+    }
+
+    /// Call once the marker has been written in full. Re-validates (see
+    /// [`Self::validate_marker_permit`]) before committing exactly the
+    /// generation that permit was validated against.
+    pub fn after_send_marker(&mut self, permit: SendMarkerPermit) -> Result<(), RekeyError> {
+        self.validate_marker_permit(&permit)?;
         self.generation = permit.next_generation;
         self.policy_count = 0;
+        Ok(())
     }
 
     /// Process one decrypted incoming record. Advances `generation`/
     /// `policy_count` on success; returns the fail-closed error for every
     /// early/late/duplicate/wrong-generation/wrong-count case (v6 §8,
     /// erratum RED-19-adjacent discipline: reject, do not guess). This
-    /// side is a single atomic call already — no separate before/after to
-    /// harden.
+    /// side is a single atomic call already, driven by a value read off
+    /// the wire rather than a locally-issued permit — no separate
+    /// before/after or provenance concern to harden here.
     pub fn on_receive(&mut self, record: IncomingRecord) -> Result<(), RekeyError> {
         match record {
             IncomingRecord::NonMarker => {
@@ -225,7 +302,9 @@ impl DirectionalRekeyState {
 }
 
 /// Both directions of a session's rekey state, independent by construction
-/// (v6 §8: "Ambas direções independentes").
+/// (v6 §8: "Ambas direções independentes") — `tx`/`rx` each get their own
+/// random [`RekeyStateId`] at construction, so a permit issued by one can
+/// never be mistaken for the other's.
 ///
 /// `new` is `pub(crate)` on purpose: a `SessionRekeyState` asserts "this
 /// authenticated session has reached Active" simply by existing, so only
@@ -291,17 +370,88 @@ mod tests {
     }
 
     #[test]
-    fn misuse_permit_cannot_be_reused_the_type_system_enforces_this() {
-        // This test documents the property; the compiler enforces it — a
-        // second `tx.after_send_non_marker(permit)` using the same
-        // binding would be a use-after-move and simply does not compile,
-        // so there is no runtime assertion to make here beyond the happy
-        // path already covered above. See the compile_fail doctests on
-        // SendMarkerPermit/SessionRekeyState for the negative form.
-        let threshold = RekeyThreshold::new(3).unwrap();
+    fn red_multi_permit_same_count_only_the_first_commits() {
+        // Reproduces the audit finding literally: call before_* three
+        // times against the SAME unmutated state, then try to apply all
+        // three. Only the first succeeds; the second and third are
+        // rejected as stale, because their expected_policy_count snapshot
+        // (0) no longer matches self.policy_count (1, then 2) once an
+        // earlier permit has already committed.
+        let threshold = RekeyThreshold::new(4).unwrap(); // headroom so 3 non-markers are all legal to *attempt*
         let mut tx = DirectionalRekeyState::new(threshold);
-        let permit = tx.before_send_non_marker().unwrap();
-        tx.after_send_non_marker(permit).unwrap();
+        let p1 = tx.before_send_non_marker().unwrap();
+        let p2 = tx.before_send_non_marker().unwrap();
+        let p3 = tx.before_send_non_marker().unwrap();
+
+        tx.after_send_non_marker(p1).unwrap();
+        assert_eq!(tx.policy_count(), 1);
+        assert_eq!(tx.after_send_non_marker(p2), Err(RekeyError::StalePermit));
+        assert_eq!(
+            tx.policy_count(),
+            1,
+            "a rejected permit must not mutate state"
+        );
+        assert_eq!(tx.after_send_non_marker(p3), Err(RekeyError::StalePermit));
+        assert_eq!(tx.policy_count(), 1);
+    }
+
+    #[test]
+    fn red_donor_to_victim_marker_permit_rejected_cross_instance() {
+        let threshold = RekeyThreshold::new(1).unwrap(); // threshold-1 == 0, marker eligible immediately
+        let donor = DirectionalRekeyState::new(threshold);
+        let mut victim = DirectionalRekeyState::new(threshold);
+
+        let donor_permit = donor.before_send_marker().unwrap();
+        let victim_generation_before = victim.generation();
+        assert_eq!(
+            victim.after_send_marker(donor_permit),
+            Err(RekeyError::StalePermit)
+        );
+        assert_eq!(
+            victim.generation(),
+            victim_generation_before,
+            "a foreign permit must not mutate the victim"
+        );
+    }
+
+    #[test]
+    fn red_tx_permit_rejected_on_rx_and_vice_versa_within_one_session() {
+        let threshold = RekeyThreshold::new(1).unwrap();
+        let mut session = SessionRekeyState::new(threshold);
+        let tx_permit = session.tx().before_send_marker().unwrap();
+        assert_eq!(
+            session.rx().after_send_marker(tx_permit),
+            Err(RekeyError::StalePermit)
+        );
+
+        let rx_permit = {
+            // rx has no before_send_marker (it's driven by on_receive, not
+            // permits) — use a second session's tx permit as the "foreign"
+            // token instead, which is the actually-reachable cross-session
+            // case.
+            let other = DirectionalRekeyState::new(threshold);
+            other.before_send_marker().unwrap()
+        };
+        assert_eq!(
+            session.tx().after_send_marker(rx_permit),
+            Err(RekeyError::StalePermit)
+        );
+    }
+
+    #[test]
+    fn red_stale_permit_rejected_before_any_coupled_side_effect_would_run() {
+        // validate_marker_permit is what a caller (ActiveMeshSession)
+        // checks BEFORE touching TransportState::rekey_outgoing() — prove
+        // it independently rejects a stale permit without needing to
+        // apply it first.
+        let threshold = RekeyThreshold::new(1).unwrap();
+        let state = DirectionalRekeyState::new(threshold);
+        let permit = state.before_send_marker().unwrap();
+        let other = DirectionalRekeyState::new(threshold);
+        assert_eq!(
+            other.validate_marker_permit(&permit),
+            Err(RekeyError::StalePermit)
+        );
     }
 
     #[test]
@@ -326,7 +476,7 @@ mod tests {
         );
         let permit = tx.before_send_marker().unwrap();
         assert_eq!(permit.next_generation(), 1);
-        tx.after_send_marker(permit);
+        tx.after_send_marker(permit).unwrap();
         assert_eq!(tx.generation(), 1);
         assert_eq!(tx.policy_count(), 0);
 
@@ -420,7 +570,7 @@ mod tests {
         let permit = state.tx().before_send_non_marker().unwrap();
         state.tx().after_send_non_marker(permit).unwrap();
         let permit = state.tx().before_send_marker().unwrap();
-        state.tx().after_send_marker(permit);
+        state.tx().after_send_marker(permit).unwrap();
         assert_eq!(state.tx().generation(), 1);
 
         // rx never touched — must be completely unaffected.
@@ -440,6 +590,7 @@ mod tests {
         // child module of `rekey` — used only to force an edge state that
         // is otherwise impractical to reach by driving u64::MAX sends.
         let tx = DirectionalRekeyState {
+            id: RekeyStateId::fresh(),
             generation: u64::MAX,
             policy_count: 0,
             threshold,
