@@ -3040,6 +3040,8 @@ dependencies = [
  "core-foundation 0.9.4",
  "keyring",
  "libc",
+ "p256 0.13.2",
+ "rand_core 0.6.4",
  "security-framework",
  "security-framework-sys",
  "tempfile",

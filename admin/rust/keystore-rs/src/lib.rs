@@ -40,6 +40,10 @@ pub use error::KeystoreError;
 
 pub mod file_backend;
 
+/// Purpose-bound P-256 slots whose private scalar never crosses the API.
+/// Separate from the generic byte store on purpose — see the module docs.
+pub mod opaque_p256;
+
 #[cfg(target_os = "linux")]
 pub mod linux_backend;
 

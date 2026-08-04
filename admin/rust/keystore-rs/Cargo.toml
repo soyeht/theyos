@@ -15,6 +15,12 @@ base64    = { workspace = true }
 blake3    = { workspace = true }
 zeroize   = { workspace = true }
 
+# P-256 for the opaque signing-slot surface (src/opaque_p256.rs). The private
+# scalar is generated, used and zeroized entirely inside that module and never
+# crosses its API — see its docs for what that does and does not buy.
+p256      = { workspace = true }
+rand_core = { workspace = true }
+
 # Linux: Secret Service (gnome-keyring) or kernel keyring via the `keyring`
 # crate, and libc for the O_NOFOLLOW/fstat-based secure reinspection used by
 # create_only's stabilization step (regular unix target, not just Linux —

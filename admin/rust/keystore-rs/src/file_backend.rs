@@ -380,12 +380,18 @@ impl FileKeystore {
     /// Bounded to this keystore's own secrets directory and to names matching
     /// the exact scratch-file pattern [`tmp_attempt_path_name`] produces,
     /// parsed structurally from the END of the name. Each candidate's content
-    /// is re-hashed and checked against the digest embedded in its own name; a
-    /// mismatch (partial or corrupted write) is logged and still removed — it
-    /// is not recoverable state either way, and leaving it would keep
-    /// secret-shaped bytes on disk indefinitely. Everything is unlinked
-    /// through the retained directory fd, so no path relookup can redirect a
-    /// removal. Returns the number removed.
+    /// is re-hashed and checked against the digest embedded in its own name;
+    /// only a match is removed. A mismatch (partial write, corruption, or
+    /// something else entirely) is QUARANTINED — left on disk and counted in
+    /// [`SweepReport::quarantined`] — because deleting on a failed identity
+    /// check is what would make the check decorative, and it destroys the
+    /// evidence needed to explain the file. Everything is unlinked through
+    /// the retained directory fd, so no path relookup can redirect a removal.
+    ///
+    /// Subject to the same filesystem allowlist as `create_only`: a sweep
+    /// that reported success after an `fsync` on media whose durability this
+    /// crate refuses to vouch for would be claiming exactly the guarantee
+    /// `create_only` declines to make.
     pub fn sweep_orphaned_create_attempts(
         &self,
         guard: &SweepGuard,
@@ -413,6 +419,8 @@ impl FileKeystore {
                 });
             }
         };
+
+        self.check_fs_allowed(&dir)?;
 
         let listing = match fs::read_dir(self.secrets_dir()) {
             Ok(listing) => listing,
