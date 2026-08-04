@@ -2854,6 +2854,130 @@ mod tests {
 
     // -- directory hierarchy ----------------------------------------------
 
+    /// MEASUREMENT, not a guarantee.
+    ///
+    /// `create_only` publishes by linking a name on macOS and only detects
+    /// substitution afterwards, which is weaker than Linux's link-from-fd.
+    /// The candidate fix is `fclonefileat` (macOS) / `O_TMPFILE` + linkat
+    /// (Linux), but whether either actually works depends on the filesystem
+    /// and the uid the process really runs as — not on what the man page
+    /// says. This probe exercises the primitive for real and PRINTS what
+    /// happened, so the choice between mechanism and fallback rests on
+    /// evidence from each host rather than on assumption.
+    ///
+    /// `#[ignore]` because it reports rather than asserts: run it with
+    /// `cargo test -- --ignored --nocapture` on every target host.
+    #[test]
+    #[ignore = "measurement probe; run with --ignored --nocapture and read the output"]
+    #[allow(unsafe_code)]
+    fn probe_exact_publish_primitive_support() {
+        let td = tempfile::tempdir().unwrap();
+        let ks = FileKeystore::new(td.path(), "probe");
+        let dir = ks.open_secrets_dir().unwrap();
+
+        println!("== exact-publish probe ==");
+        println!("uid={} euid={}", nix_uid(), nix_euid());
+        println!("dir={}", ks.secrets_dir().display());
+
+        #[cfg(target_os = "macos")]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            let src_path = td.path().join("probe-src");
+            {
+                let mut f = OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .mode(0o600)
+                    .open(&src_path)
+                    .unwrap();
+                f.write_all(b"probe").unwrap();
+                f.sync_all().unwrap();
+            }
+            let src = OpenOptions::new().read(true).open(&src_path).unwrap();
+            let dst = cstr(OsStr::new("cloned.bin")).unwrap();
+            // SAFETY: `src` is an open regular-file fd; `dir` is an open
+            // directory fd; `dst` is a valid C string naming an entry in it.
+            let rc = unsafe { libc::fclonefileat(src.as_raw_fd(), dir.raw_fd(), dst.as_ptr(), 0) };
+            if rc == 0 {
+                println!("fclonefileat: OK (exact publish from fd is available)");
+                // Does it refuse to replace an existing destination?
+                // SAFETY: same argument validity as above.
+                let again =
+                    unsafe { libc::fclonefileat(src.as_raw_fd(), dir.raw_fd(), dst.as_ptr(), 0) };
+                let err = std::io::Error::last_os_error();
+                println!(
+                    "fclonefileat onto existing dst: rc={again} err={:?} (EEXIST means \
+                     create-only semantics hold)",
+                    err.kind()
+                );
+            } else {
+                println!(
+                    "fclonefileat: FAILED err={:?} — exact publish NOT available here",
+                    std::io::Error::last_os_error()
+                );
+            }
+        }
+
+        #[cfg(target_os = "linux")]
+        {
+            let dir_c = cstr(ks.secrets_dir().as_os_str()).unwrap();
+            // SAFETY: valid C string naming an existing directory.
+            let fd = unsafe {
+                libc::open(
+                    dir_c.as_ptr(),
+                    libc::O_TMPFILE | libc::O_RDWR | libc::O_CLOEXEC,
+                    libc::c_uint::from(0o600u16),
+                )
+            };
+            if fd < 0 {
+                println!(
+                    "O_TMPFILE: FAILED err={:?} — falling back to the named-scratch path",
+                    std::io::Error::last_os_error()
+                );
+            } else {
+                // SAFETY: fresh owned descriptor.
+                let tmp = unsafe { File::from_raw_fd(fd) };
+                println!("O_TMPFILE: OK (anonymous scratch available)");
+                let proc_path = CString::new(format!("/proc/self/fd/{}", tmp.as_raw_fd())).unwrap();
+                let dst = cstr(OsStr::new("linked.bin")).unwrap();
+                // SAFETY: proc path names our own fd; dir fd is valid.
+                let rc = unsafe {
+                    libc::linkat(
+                        libc::AT_FDCWD,
+                        proc_path.as_ptr(),
+                        dir.raw_fd(),
+                        dst.as_ptr(),
+                        libc::AT_SYMLINK_FOLLOW,
+                    )
+                };
+                // errno is only meaningful when the call FAILED. Printing
+                // it unconditionally reports whatever stale value was left
+                // by an earlier syscall, which reads exactly like a real
+                // result — this probe did print a leftover "AlreadyExists"
+                // next to a successful rc=0 before this was fixed.
+                if rc == 0 {
+                    println!("linkat(O_TMPFILE via /proc): OK (exact publish from fd available)");
+                } else {
+                    println!(
+                        "linkat(O_TMPFILE via /proc): FAILED err={:?}",
+                        std::io::Error::last_os_error()
+                    );
+                }
+            }
+        }
+    }
+
+    #[allow(unsafe_code)]
+    fn nix_uid() -> u32 {
+        // SAFETY: getuid takes no arguments and cannot fail.
+        unsafe { libc::getuid() }
+    }
+    #[allow(unsafe_code)]
+    fn nix_euid() -> u32 {
+        // SAFETY: geteuid takes no arguments and cannot fail.
+        unsafe { libc::geteuid() }
+    }
+
     #[test]
     fn open_secrets_dir_creates_nested_missing_hierarchy() {
         let td = tempfile::tempdir().unwrap();
