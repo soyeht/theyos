@@ -24,14 +24,32 @@
 //!   `theyos-llm-proxy` decrypt without elevated privileges. Trade-off
 //!   captured in the v1.1 followup as an option to harden further.
 //!
+//! ## What is NOT claimed
+//!
+//! - **No PCR policy.** This backend passes `--with-key=tpm2` and nothing
+//!   else; it does NOT pass `--tpm2-pcrs=`, so the sealed blob is bound to
+//!   the TPM but not to any measured boot state. An attacker who can boot
+//!   the same physical host with a modified kernel or initrd can still
+//!   unseal. Earlier revisions of these docs referred to "PCRs changed" as
+//!   a decrypt-failure cause, which implied a PCR binding that was never
+//!   configured — corrected here rather than left to read as a guarantee.
+//!   Adding a PCR policy is a deliberate decision (it makes every legitimate
+//!   firmware/kernel update invalidate every stored credential), so it needs
+//!   an explicit, measured policy choice rather than a silently-added flag.
+//! - **No crash-durability claim from the subprocess.** `systemd-creds`
+//!   returning success means the ciphertext was produced, not that anything
+//!   is on disk; the durability claim comes entirely from the
+//!   [`FileKeystore`] install protocol underneath.
+//!
 //! ## Operational notes
 //!
 //! - Requires systemd ≥ 250 (released 2021-12). NixOS 22.11+ ships this.
 //! - First-boot encryption needs the TPM2 to be present and writable;
 //!   subsequent unseal needs nothing from the operator.
-//! - Decrypt failures (host migrated, PCRs changed, TPM cleared) surface
-//!   as [`KeystoreError::Io`] with a hint pointing at the systemd-creds
-//!   error message — the operator must re-add the credential.
+//! - Decrypt failures (host migrated to different hardware, TPM cleared or
+//!   reprovisioned) surface as [`KeystoreError::Io`] with a hint pointing at
+//!   the systemd-creds error message — the operator must re-add the
+//!   credential.
 
 use std::io::Write;
 use std::path::Path;
@@ -67,13 +85,21 @@ impl TpmKeystore {
         }
     }
 
+    /// Take the exclusive create-lock — see [`FileKeystore::lock_for_sweep`].
+    pub fn lock_for_sweep(&self) -> Result<crate::file_backend::SweepGuard, KeystoreError> {
+        self.inner.lock_for_sweep()
+    }
+
     /// See [`FileKeystore::sweep_orphaned_create_attempts`] — `create_only`
-    /// on this backend delegates to the same file-backed install path, so a
-    /// crash mid-`create_only` leaves an orphaned tmp file the same way
+    /// on this backend uses the same file-backed install path, so a crash
+    /// mid-`create_only` leaves an orphaned scratch file the same way
     /// (holding sealed ciphertext here rather than plaintext, but still
     /// secret material that does not expire on its own).
-    pub fn sweep_orphaned_create_attempts(&self) -> std::io::Result<usize> {
-        self.inner.sweep_orphaned_create_attempts()
+    pub fn sweep_orphaned_create_attempts(
+        &self,
+        guard: &crate::file_backend::SweepGuard,
+    ) -> Result<crate::file_backend::SweepReport, KeystoreError> {
+        self.inner.sweep_orphaned_create_attempts(guard)
     }
 }
 
@@ -110,16 +136,20 @@ impl KeystoreBackend for TpmKeystore {
     /// only this module does, only transiently, and this method — like
     /// File's — never overwrites an existing entry.
     fn create_only(&self, account: &str, value: &[u8]) -> Result<CreateOutcome, KeystoreError> {
-        self.inner.ensure_dir().map_err(|e| KeystoreError::Io {
-            kind: e.kind().to_string(),
-            hint: format!("create secrets dir: {e}"),
-        })?;
+        // Directory setup and the filesystem-allowlist gate run BEFORE the
+        // encryption: if this store is somewhere we refuse to make durability
+        // claims about, fail closed without spending a `systemd-creds`
+        // invocation, and without the plaintext ever reaching a subprocess.
+        self.inner.preflight()?;
         let ciphertext = encrypt_with_systemd_creds(account, value)?;
         match self.inner.raw_attempt_install(account, &ciphertext) {
             Ok(InstallOutcome::Durable) => Ok(CreateOutcome::CreatedDurable),
-            Ok(InstallOutcome::Ambiguous(_) | InstallOutcome::ProvenConflict) | Err(_) => {
-                self.stabilize_and_classify_plaintext(account, value)
-            }
+            Ok(
+                InstallOutcome::Ambiguous(_)
+                | InstallOutcome::ProvenConflict
+                | InstallOutcome::TmpNameExhausted,
+            )
+            | Err(_) => self.stabilize_and_classify_plaintext(account, value),
         }
     }
 }

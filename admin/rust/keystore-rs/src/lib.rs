@@ -51,6 +51,9 @@ pub mod macos_backend;
 
 pub use file_backend::FileKeystore;
 
+#[cfg(unix)]
+pub use file_backend::{SweepGuard, SweepReport};
+
 #[cfg(target_os = "linux")]
 pub use linux_backend::LinuxSystemKeystore as SystemKeystore;
 
