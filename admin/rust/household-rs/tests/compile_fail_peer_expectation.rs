@@ -20,4 +20,5 @@ fn peer_expectation_has_no_production_constructor() {
     let t = trybuild::TestCases::new();
     t.compile_fail("tests/compile-fail/peer_expectation_struct_literal.rs");
     t.compile_fail("tests/compile-fail/peer_expectation_injected_for_harness.rs");
+    t.compile_fail("tests/compile-fail/mesh_intent_nonce_ledger_raw_open.rs");
 }

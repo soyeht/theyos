@@ -33,7 +33,7 @@ qrcode        = { workspace = true }
 hex           = { workspace = true }
 percent-encoding = { workspace = true }
 fs2           = { workspace = true }
-rustix        = { version = "0.38", features = ["fs"] }
+rustix        = { version = "0.38", features = ["fs", "process"] }
 rand          = "0.8"
 base64        = { workspace = true }
 core-rs       = { workspace = true }

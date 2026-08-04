@@ -18,6 +18,15 @@
 //! intent digest are retained evidence, not additional replay namespaces.
 //! Expired rows may be removed only when a caller-provided trusted wall floor
 //! is *strictly greater* than `not_after`.
+//!
+//! The store accepts only measured, local, persistent filesystem families
+//! (APFS on macOS; ext4, XFS, or Btrfs on Linux). It rejects tmpfs, NFS, and
+//! unknown filesystems before creating authority. The state root must be owned
+//! by the effective uid and not group/world writable; the ledger child and
+//! lock are private to that uid. A non-cooperative process running as the same
+//! uid and manipulating directory entries directly is outside this
+//! component's threat model; deployment must keep the state directory
+//! exclusive to the service account.
 
 use std::collections::BTreeMap;
 use std::fs::File;
@@ -25,7 +34,7 @@ use std::io::{Read, Seek, SeekFrom, Write};
 use std::num::NonZeroUsize;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, TryLockError};
+use std::sync::{Arc, Mutex, MutexGuard, TryLockError, mpsc};
 use std::time::{Duration, Instant};
 
 use fs2::FileExt;
@@ -38,8 +47,10 @@ use thiserror::Error;
 use crate::cbor;
 use crate::ids::{HouseholdId, MachineId};
 
+pub use crate::machine_roster_store::TrustedWallFloor;
+
 /// Domain component of every nonce replay key.
-pub const MESH_INTENT_NONCE_KEY_DOMAIN: &str = "soyeht/mesh-intent-nonce-key/v1";
+pub const MESH_INTENT_NONCE_KEY_DOMAIN: &str = "ledger-domain-v1";
 
 const STORE_SUBDIR: &str = "mesh_intent_nonce_ledger";
 const RECORD_FILENAME: &str = "ledger_v1.cbor";
@@ -52,6 +63,19 @@ const MAX_DELEGATED_KEY_ID_BYTES: usize = 256;
 const MAX_RECORD_BYTES: usize = 8 * 1024 * 1024;
 const MAX_CONFIGURED_ENTRIES: usize = 8_192;
 const LOCK_POLL_INTERVAL: Duration = Duration::from_millis(5);
+const WORKER_POLL_INTERVAL: Duration = Duration::from_millis(5);
+const WORKER_QUEUE_CAPACITY: usize = 1;
+
+#[cfg(any(test, target_os = "linux"))]
+const EXT4_SUPER_MAGIC: i64 = 0x0000_EF53;
+#[cfg(any(test, target_os = "linux"))]
+const XFS_SUPER_MAGIC: i64 = 0x5846_5342;
+#[cfg(any(test, target_os = "linux"))]
+const BTRFS_SUPER_MAGIC: i64 = 0x9123_683E;
+#[cfg(test)]
+const TMPFS_SUPER_MAGIC: i64 = 0x0102_1994;
+#[cfg(test)]
+const NFS_SUPER_MAGIC: i64 = 0x0000_6969;
 
 const MARKER_INITIALIZING: &[u8] = b"MSNL1:I\n";
 const MARKER_CLEAN: &[u8] = b"MSNL1:C\n";
@@ -186,30 +210,6 @@ pub enum MeshIntentNonceEvidenceError {
     ZeroNotAfter,
 }
 
-/// A wall-clock floor minted only by [`MachineRosterCoordinator`].
-///
-/// Downstream code cannot manufacture a high floor to erase replay history:
-///
-/// ```compile_fail
-/// use household_rs::mesh_intent_nonce_ledger::TrustedWallFloor;
-/// let forged = TrustedWallFloor(u64::MAX);
-/// ```
-///
-/// [`MachineRosterCoordinator`]: crate::machine_roster_store::MachineRosterCoordinator
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub struct TrustedWallFloor(u64);
-
-impl TrustedWallFloor {
-    pub(crate) const fn from_machine_roster(unix_seconds: u64) -> Self {
-        Self(unix_seconds)
-    }
-
-    #[must_use]
-    pub const fn unix_seconds(self) -> u64 {
-        self.0
-    }
-}
-
 /// Monotonic deadline inherited from the whole connection ceremony.
 ///
 /// Unlike the trusted wall floor this is not authority-bearing; a caller may
@@ -281,6 +281,11 @@ pub enum MeshIntentNonceLedgerConfigError {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MeshIntentNonceCommitStage {
+    /// The caller's deadline/cancellation won after a non-cancellable worker
+    /// took ownership of the transaction. The worker remains responsible for
+    /// reaching a durable terminal state; callers must reconcile by replaying
+    /// the exact same key.
+    WorkerInFlight,
     DirtyMarkerWrite,
     DirtyMarkerSync,
     TempInspect,
@@ -310,7 +315,8 @@ impl MeshIntentNonceCommitStage {
             | Self::TempFlush
             | Self::TempSync
             | Self::Rename => false,
-            Self::ParentSync
+            Self::WorkerInFlight
+            | Self::ParentSync
             | Self::Readback
             | Self::ReadbackMismatch
             | Self::CleanMarkerWrite
@@ -322,6 +328,7 @@ impl MeshIntentNonceCommitStage {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MeshIntentNonceUnavailable {
     WrongHousehold,
+    WrongTrustedFloorHousehold,
     EvidenceExpired,
     CapacityExhausted,
     GenerationExhausted,
@@ -330,6 +337,7 @@ pub enum MeshIntentNonceUnavailable {
     Cancelled,
     LockPoisoned,
     UnsafePath,
+    UnsupportedFilesystem,
     CorruptRecord,
     PolicyMismatch,
     RecordTooLarge,
@@ -355,6 +363,8 @@ pub enum MeshIntentNonceConsumeOutcome {
 pub enum MeshIntentNonceLedgerOpenError {
     #[error("ledger path is unsafe")]
     UnsafePath,
+    #[error("ledger requires an allowlisted local persistent filesystem")]
+    UnsupportedFilesystem,
     #[error("ledger lock timed out")]
     LockTimeout,
     #[error("ledger lock is poisoned")]
@@ -445,6 +455,65 @@ struct LedgerInner {
     state_dir: File,
     store_dir: File,
     lock_file: Mutex<File>,
+    worker_tx: mpsc::SyncSender<WorkerRequest>,
+    #[cfg(test)]
+    worker_block: Mutex<Option<Arc<TestWorkerBlock>>>,
+    #[cfg(test)]
+    queued_for_test: std::sync::atomic::AtomicUsize,
+    #[cfg(test)]
+    queue_waiters_for_test: std::sync::atomic::AtomicUsize,
+}
+
+struct WorkerRequest {
+    inner: Arc<LedgerInner>,
+    key: MeshIntentNonceKey,
+    evidence: MeshIntentNonceEvidence,
+    trusted_floor: TrustedWallFloor,
+    result_tx: mpsc::SyncSender<MeshIntentNonceConsumeOutcome>,
+    #[cfg(test)]
+    failpoint: Option<MeshIntentNonceCommitStage>,
+}
+
+#[cfg(test)]
+struct TestWorkerBlock {
+    entered: std::sync::Barrier,
+    release: std::sync::Barrier,
+}
+
+fn spawn_worker(
+    worker_rx: mpsc::Receiver<WorkerRequest>,
+) -> Result<(), MeshIntentNonceLedgerOpenError> {
+    std::thread::Builder::new()
+        .name("mesh-intent-nonce-ledger".to_owned())
+        .spawn(move || {
+            while let Ok(request) = worker_rx.recv() {
+                #[cfg(test)]
+                request.inner.queued_for_test.fetch_sub(1, Ordering::AcqRel);
+                #[cfg(test)]
+                let _worker_failpoint = request.failpoint.map(fail_injection::arm);
+                let ledger = MeshIntentNonceLedger {
+                    inner: request.inner,
+                };
+                let outcome = ledger.consume_in_worker(
+                    &request.key,
+                    &request.evidence,
+                    &request.trusted_floor,
+                );
+                let _ = request.result_tx.send(outcome);
+            }
+        })
+        .map(|_| ())
+        .map_err(|_| MeshIntentNonceLedgerOpenError::Io)
+}
+
+#[cfg(test)]
+impl TestWorkerBlock {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            entered: std::sync::Barrier::new(2),
+            release: std::sync::Barrier::new(2),
+        })
+    }
 }
 
 /// Narrow household-owned replay authority. It has no dependency on the
@@ -455,7 +524,10 @@ pub struct MeshIntentNonceLedger {
 }
 
 impl MeshIntentNonceLedger {
-    pub fn open(
+    /// Low-level constructor. Production callers obtain the unique authority
+    /// from `MachineRosterCoordinator::open_mesh_intent_nonce_ledger`, which
+    /// binds both the state directory and household id.
+    pub(crate) fn open(
         state_dir: impl AsRef<Path>,
         target_hh_id: HouseholdId,
         config: MeshIntentNonceLedgerConfig,
@@ -463,6 +535,7 @@ impl MeshIntentNonceLedger {
         let (state_dir, store_dir) = open_store_dirs(state_dir.as_ref())?;
         let (lock_file, lock_created) = open_lock_file(&store_dir)?;
         verify_or_create_lock_anchor(&state_dir, &store_dir, &lock_file, lock_created)?;
+        let (worker_tx, worker_rx) = mpsc::sync_channel(WORKER_QUEUE_CAPACITY);
         let ledger = Self {
             inner: Arc::new(LedgerInner {
                 target_hh_id,
@@ -470,9 +543,17 @@ impl MeshIntentNonceLedger {
                 state_dir,
                 store_dir,
                 lock_file: Mutex::new(lock_file),
+                worker_tx,
+                #[cfg(test)]
+                worker_block: Mutex::new(None),
+                #[cfg(test)]
+                queued_for_test: std::sync::atomic::AtomicUsize::new(0),
+                #[cfg(test)]
+                queue_waiters_for_test: std::sync::atomic::AtomicUsize::new(0),
             }),
         };
         ledger.initialize_or_recover()?;
+        spawn_worker(worker_rx)?;
         Ok(ledger)
     }
 
@@ -492,11 +573,126 @@ impl MeshIntentNonceLedger {
         if key.hh_id != self.inner.target_hh_id {
             return unavailable(MeshIntentNonceUnavailable::WrongHousehold);
         }
-        if evidence.not_after <= trusted_floor.0 {
+        if trusted_floor.household_id() != &self.inner.target_hh_id {
+            return unavailable(MeshIntentNonceUnavailable::WrongTrustedFloorHousehold);
+        }
+        if evidence.not_after <= trusted_floor.unix_seconds() {
             return unavailable(MeshIntentNonceUnavailable::EvidenceExpired);
         }
+        if let Some(reason) = abort_reason(control) {
+            return unavailable(reason);
+        }
 
-        let mut guard = match self.acquire(Some(control)) {
+        #[cfg(test)]
+        let worker_failpoint = fail_injection::take_armed();
+        let (result_tx, result_rx) = mpsc::sync_channel(1);
+        let mut request = WorkerRequest {
+            inner: self.inner.clone(),
+            key: key.clone(),
+            evidence: evidence.clone(),
+            trusted_floor,
+            result_tx,
+            #[cfg(test)]
+            failpoint: worker_failpoint,
+        };
+        #[cfg(test)]
+        let mut registered_waiter = false;
+        loop {
+            if let Some(reason) = abort_reason(control) {
+                #[cfg(test)]
+                if registered_waiter {
+                    self.inner
+                        .queue_waiters_for_test
+                        .fetch_sub(1, Ordering::AcqRel);
+                }
+                return unavailable(reason);
+            }
+            #[cfg(test)]
+            self.inner.queued_for_test.fetch_add(1, Ordering::AcqRel);
+            match self.inner.worker_tx.try_send(request) {
+                Ok(()) => {
+                    #[cfg(test)]
+                    if registered_waiter {
+                        self.inner
+                            .queue_waiters_for_test
+                            .fetch_sub(1, Ordering::AcqRel);
+                    }
+                    break;
+                }
+                Err(mpsc::TrySendError::Full(returned)) => {
+                    #[cfg(test)]
+                    {
+                        self.inner.queued_for_test.fetch_sub(1, Ordering::AcqRel);
+                        if !registered_waiter {
+                            self.inner
+                                .queue_waiters_for_test
+                                .fetch_add(1, Ordering::AcqRel);
+                        }
+                    }
+                    #[cfg(test)]
+                    {
+                        registered_waiter = true;
+                    }
+                    request = returned;
+                    std::thread::sleep(WORKER_POLL_INTERVAL);
+                }
+                Err(mpsc::TrySendError::Disconnected(_)) => {
+                    #[cfg(test)]
+                    {
+                        self.inner.queued_for_test.fetch_sub(1, Ordering::AcqRel);
+                        if registered_waiter {
+                            self.inner
+                                .queue_waiters_for_test
+                                .fetch_sub(1, Ordering::AcqRel);
+                        }
+                    }
+                    return unavailable(MeshIntentNonceUnavailable::Io);
+                }
+            }
+        }
+
+        // Only a successfully enqueued request can become WorkerInFlight.
+        loop {
+            match result_rx.try_recv() {
+                Ok(outcome) => return outcome,
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    return MeshIntentNonceConsumeOutcome::MayHaveTakenEffect {
+                        stage: MeshIntentNonceCommitStage::WorkerInFlight,
+                    };
+                }
+                Err(mpsc::TryRecvError::Empty) => {}
+            }
+            if abort_reason(control).is_some() {
+                return MeshIntentNonceConsumeOutcome::MayHaveTakenEffect {
+                    stage: MeshIntentNonceCommitStage::WorkerInFlight,
+                };
+            }
+            let remaining = control.deadline.saturating_duration_since(Instant::now());
+            match result_rx.recv_timeout(remaining.min(WORKER_POLL_INTERVAL)) {
+                Ok(outcome) => return outcome,
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    return MeshIntentNonceConsumeOutcome::MayHaveTakenEffect {
+                        stage: MeshIntentNonceCommitStage::WorkerInFlight,
+                    };
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+            }
+        }
+    }
+
+    fn consume_in_worker(
+        &self,
+        key: &MeshIntentNonceKey,
+        evidence: &MeshIntentNonceEvidence,
+        trusted_floor: &TrustedWallFloor,
+    ) -> MeshIntentNonceConsumeOutcome {
+        debug_assert_eq!(key.hh_id, self.inner.target_hh_id);
+        debug_assert_eq!(trusted_floor.household_id(), &self.inner.target_hh_id);
+
+        // Once spawned, this transaction is intentionally non-cancellable.
+        // `fsync`/`rename` cannot be safely interrupted; the worker owns the
+        // duty to finish or leave durable recovery evidence.
+        let mut guard = match self.acquire(None) {
             Ok(guard) => guard,
             Err(reason) => return unavailable(reason),
         };
@@ -504,15 +700,11 @@ impl MeshIntentNonceLedger {
             Ok(record) => record,
             Err(reason) => return unavailable(reason),
         };
-        if let Some(reason) = abort_reason(control) {
-            return unavailable(reason);
-        }
-
         // Strict `>` is intentional. Equality is still retained even though a
         // fresh intent at equality is no longer admissible.
         record
             .entries
-            .retain(|_, entry| trusted_floor.0 <= entry.not_after);
+            .retain(|_, entry| trusted_floor.unix_seconds() <= entry.not_after);
 
         let stored_key = StoredKeyV1::from(key);
         let Ok(entry_id) = entry_id(&stored_key) else {
@@ -549,41 +741,61 @@ impl MeshIntentNonceLedger {
             Ok(_) => return unavailable(MeshIntentNonceUnavailable::RecordTooLarge),
             Err(_) => return unavailable(MeshIntentNonceUnavailable::CorruptRecord),
         };
-        if let Some(reason) = abort_reason(control) {
-            return unavailable(reason);
-        }
         self.commit_semantic(&mut guard, &canonical, next_generation)
+    }
+
+    #[cfg(test)]
+    fn install_worker_block_for_test(&self, block: Arc<TestWorkerBlock>) {
+        *self.inner.worker_block.lock().unwrap() = Some(block);
+    }
+
+    #[cfg(test)]
+    fn block_worker_once_for_test(&self) {
+        let block = self.inner.worker_block.lock().unwrap().take();
+        if let Some(block) = block {
+            block.entered.wait();
+            block.release.wait();
+        }
     }
 
     fn initialize_or_recover(&self) -> Result<(), MeshIntentNonceLedgerOpenError> {
         let mut guard = self.acquire(None).map_err(map_unavailable_to_open)?;
         let marker = read_marker(&mut guard).map_err(map_open_io)?;
-        match marker.as_deref() {
-            None | Some(MARKER_INITIALIZING) => self.initialize_under_lock(&mut guard),
-            Some(MARKER_CLEAN) => {
-                self.read_and_validate_record()
+        let visible_record = read_optional_record(&self.inner.store_dir, RECORD_FILENAME)
+            .map_err(map_unavailable_to_open)?;
+
+        match (visible_record, marker.as_deref()) {
+            (Some(bytes), Some(MARKER_CLEAN)) => {
+                self.decode_and_validate(&bytes)
                     .map_err(map_unavailable_to_open)?;
                 Ok(())
             }
-            Some(MARKER_DIRTY) => self.recover_dirty_under_lock(&mut guard),
-            Some(_) => Err(MeshIntentNonceLedgerOpenError::Corrupt),
+            // A marker write can tear after truncate and before write_all or
+            // sync. Marker visibility is never authority: if a valid record is
+            // visible, rewrite those exact bytes through the full durability
+            // protocol and only then publish CLEAN. This covers DIRTY,
+            // INITIALIZING, empty, unknown, and every partial prefix.
+            (Some(bytes), _) => self.stabilize_visible_under_lock(&mut guard, &bytes),
+            // Crash after creating/anchoring the lock, or a torn first write
+            // of INITIALIZING, has no semantic record to lose. Empty and
+            // byte-prefix-only INITIALIZING therefore resume initialization.
+            (None, None) => self.initialize_fresh_under_lock(&mut guard),
+            (None, Some(marker)) if MARKER_INITIALIZING.starts_with(marker) => {
+                self.initialize_fresh_under_lock(&mut guard)
+            }
+            // CLEAN/DIRTY/unknown marker plus a missing record is not a fresh
+            // store. Treat it as deletion/corruption and fail closed.
+            (None, Some(_)) => Err(MeshIntentNonceLedgerOpenError::Corrupt),
         }
     }
 
-    fn initialize_under_lock(
+    fn initialize_fresh_under_lock(
         &self,
         guard: &mut LedgerLockGuard<'_>,
     ) -> Result<(), MeshIntentNonceLedgerOpenError> {
         write_marker_raw(guard, MARKER_INITIALIZING).map_err(map_open_io)?;
-        let record = match read_optional_record(&self.inner.store_dir, RECORD_FILENAME) {
-            Ok(Some(bytes)) => self
-                .decode_and_validate(&bytes)
-                .map_err(map_unavailable_to_open)?,
-            Ok(None) => {
-                LedgerRecordV1::empty(self.inner.target_hh_id.clone(), self.inner.config.capacity)
-            }
-            Err(reason) => return Err(map_unavailable_to_open(reason)),
-        };
+        let record =
+            LedgerRecordV1::empty(self.inner.target_hh_id.clone(), self.inner.config.capacity);
         let bytes =
             cbor::to_canonical_vec(&record).map_err(|_| MeshIntentNonceLedgerOpenError::Corrupt)?;
         match atomic_replace(
@@ -602,20 +814,14 @@ impl MeshIntentNonceLedger {
         }
     }
 
-    fn recover_dirty_under_lock(
+    fn stabilize_visible_under_lock(
         &self,
         guard: &mut LedgerLockGuard<'_>,
+        bytes: &[u8],
     ) -> Result<(), MeshIntentNonceLedgerOpenError> {
-        let bytes = read_record_bytes(&self.inner.store_dir, RECORD_FILENAME)
+        self.decode_and_validate(bytes)
             .map_err(map_unavailable_to_open)?;
-        self.decode_and_validate(&bytes)
-            .map_err(map_unavailable_to_open)?;
-        match atomic_replace(
-            &self.inner.store_dir,
-            RECORD_FILENAME,
-            TEMP_FILENAME,
-            &bytes,
-        ) {
+        match atomic_replace(&self.inner.store_dir, RECORD_FILENAME, TEMP_FILENAME, bytes) {
             DurableWrite::Committed => {
                 write_marker_raw(guard, MARKER_CLEAN).map_err(map_open_io)?;
                 Ok(())
@@ -702,17 +908,18 @@ impl MeshIntentNonceLedger {
         guard: &mut LedgerLockGuard<'_>,
     ) -> Result<LedgerRecordV1, MeshIntentNonceUnavailable> {
         let marker = read_marker(guard).map_err(|_| MeshIntentNonceUnavailable::Io)?;
-        match marker.as_deref() {
-            Some(MARKER_CLEAN) => self.read_and_validate_record(),
-            Some(MARKER_DIRTY) => {
-                self.recover_dirty_for_consume(guard)?;
-                self.read_and_validate_record()
-            }
-            _ => Err(MeshIntentNonceUnavailable::CorruptRecord),
+        if marker.as_deref() == Some(MARKER_CLEAN) {
+            return self.read_and_validate_record();
         }
+
+        // Same recovery rule as process startup: any non-clean marker may be
+        // a torn marker write. A valid visible record is stabilized byte-for-
+        // byte; an absent or corrupt record fails closed.
+        self.recover_visible_for_consume(guard)?;
+        self.read_and_validate_record()
     }
 
-    fn recover_dirty_for_consume(
+    fn recover_visible_for_consume(
         &self,
         guard: &mut LedgerLockGuard<'_>,
     ) -> Result<(), MeshIntentNonceUnavailable> {
@@ -786,6 +993,9 @@ impl MeshIntentNonceLedger {
             return unavailable(MeshIntentNonceUnavailable::WriteFailed(stage));
         }
 
+        #[cfg(test)]
+        self.block_worker_once_for_test();
+
         match atomic_replace(
             &self.inner.store_dir,
             RECORD_FILENAME,
@@ -793,7 +1003,10 @@ impl MeshIntentNonceLedger {
             canonical,
         ) {
             DurableWrite::NotCommitted { stage } => {
-                let _ = write_marker_raw(guard, MARKER_CLEAN);
+                // Leave DIRTY in place. A later operation rewrites the visible
+                // pre-existing record through the same committed protocol and
+                // then publishes CLEAN. A second best-effort clean here would
+                // turn a failed marker write into ambiguous state again.
                 unavailable(MeshIntentNonceUnavailable::WriteFailed(stage))
             }
             DurableWrite::Uncertain { stage } => {
@@ -834,6 +1047,9 @@ fn map_unavailable_to_open(reason: MeshIntentNonceUnavailable) -> MeshIntentNonc
         MeshIntentNonceUnavailable::LockTimeout => MeshIntentNonceLedgerOpenError::LockTimeout,
         MeshIntentNonceUnavailable::LockPoisoned => MeshIntentNonceLedgerOpenError::LockPoisoned,
         MeshIntentNonceUnavailable::UnsafePath => MeshIntentNonceLedgerOpenError::UnsafePath,
+        MeshIntentNonceUnavailable::UnsupportedFilesystem => {
+            MeshIntentNonceLedgerOpenError::UnsupportedFilesystem
+        }
         MeshIntentNonceUnavailable::CorruptRecord => MeshIntentNonceLedgerOpenError::Corrupt,
         MeshIntentNonceUnavailable::PolicyMismatch => {
             MeshIntentNonceLedgerOpenError::PolicyMismatch
@@ -845,6 +1061,7 @@ fn map_unavailable_to_open(reason: MeshIntentNonceUnavailable) -> MeshIntentNonc
             MeshIntentNonceLedgerOpenError::RecoveryRequired
         }
         MeshIntentNonceUnavailable::WrongHousehold
+        | MeshIntentNonceUnavailable::WrongTrustedFloorHousehold
         | MeshIntentNonceUnavailable::EvidenceExpired
         | MeshIntentNonceUnavailable::CapacityExhausted
         | MeshIntentNonceUnavailable::GenerationExhausted
@@ -893,6 +1110,11 @@ fn open_store_dirs(state_path: &Path) -> Result<(File, File), MeshIntentNonceLed
         )
         .map_err(map_open_errno)?,
     );
+    // The anchor and the child directory name both live in this directory;
+    // validating only the 0700 child would still let another uid replace both
+    // names through a writable parent.
+    validate_owned_non_writable_directory(&state_dir)?;
+    validate_supported_persistent_filesystem(&state_dir)?;
 
     let created = match rustix::fs::mkdirat(&state_dir, STORE_SUBDIR, Mode::RWXU) {
         Ok(()) => true,
@@ -918,6 +1140,7 @@ fn open_store_dirs(state_path: &Path) -> Result<(File, File), MeshIntentNonceLed
         rustix::fs::fchmod(&store_dir, Mode::RWXU).map_err(map_open_errno)?;
     }
     validate_private_directory(&store_dir)?;
+    validate_supported_persistent_filesystem(&store_dir)?;
     if !verify_store_dir_binding(&state_dir, &store_dir) {
         return Err(MeshIntentNonceLedgerOpenError::UnsafePath);
     }
@@ -929,13 +1152,72 @@ fn open_store_dirs(state_path: &Path) -> Result<(File, File), MeshIntentNonceLed
 }
 
 fn validate_private_directory(dir: &File) -> Result<(), MeshIntentNonceLedgerOpenError> {
-    use std::os::unix::fs::PermissionsExt;
+    validate_directory_mode(dir, 0o077)
+}
+
+fn validate_owned_non_writable_directory(dir: &File) -> Result<(), MeshIntentNonceLedgerOpenError> {
+    validate_directory_mode(dir, 0o022)
+}
+
+fn validate_directory_mode(
+    dir: &File,
+    forbidden_mode: u32,
+) -> Result<(), MeshIntentNonceLedgerOpenError> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
     let metadata = dir.metadata().map_err(map_open_io)?;
-    if !metadata.is_dir() || metadata.permissions().mode() & 0o077 != 0 {
+    if !metadata.is_dir()
+        || metadata.permissions().mode() & forbidden_mode != 0
+        || metadata.uid() != rustix::process::geteuid().as_raw()
+    {
         return Err(MeshIntentNonceLedgerOpenError::UnsafePath);
     }
     Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn validate_supported_persistent_filesystem(
+    dir: &File,
+) -> Result<(), MeshIntentNonceLedgerOpenError> {
+    let stat = rustix::fs::fstatfs(dir).map_err(map_open_errno)?;
+    let name: Vec<u8> = stat
+        .f_fstypename
+        .iter()
+        .map(|byte| byte.to_ne_bytes()[0])
+        .take_while(|byte| *byte != 0)
+        .collect();
+    if name == b"apfs" {
+        Ok(())
+    } else {
+        Err(MeshIntentNonceLedgerOpenError::UnsupportedFilesystem)
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn validate_supported_persistent_filesystem(
+    dir: &File,
+) -> Result<(), MeshIntentNonceLedgerOpenError> {
+    let stat = rustix::fs::fstatfs(dir).map_err(map_open_errno)?;
+    if linux_filesystem_is_allowlisted(stat.f_type) {
+        Ok(())
+    } else {
+        Err(MeshIntentNonceLedgerOpenError::UnsupportedFilesystem)
+    }
+}
+
+#[cfg(any(test, target_os = "linux"))]
+const fn linux_filesystem_is_allowlisted(fs_type: i64) -> bool {
+    matches!(
+        fs_type,
+        EXT4_SUPER_MAGIC | XFS_SUPER_MAGIC | BTRFS_SUPER_MAGIC
+    )
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn validate_supported_persistent_filesystem(
+    _: &File,
+) -> Result<(), MeshIntentNonceLedgerOpenError> {
+    Err(MeshIntentNonceLedgerOpenError::UnsupportedFilesystem)
 }
 
 fn verify_store_dir_binding(state_dir: &File, store_dir: &File) -> bool {
@@ -1130,12 +1412,15 @@ fn open_record_for_read(
 }
 
 fn validate_private_file_open(file: &File) -> Result<(), MeshIntentNonceUnavailable> {
-    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
     let meta = file
         .metadata()
         .map_err(|_| MeshIntentNonceUnavailable::Io)?;
-    if !meta.is_file() || meta.permissions().mode() & 0o077 != 0 {
+    if !meta.is_file()
+        || meta.permissions().mode() & 0o077 != 0
+        || meta.uid() != rustix::process::geteuid().as_raw()
+    {
         return Err(MeshIntentNonceUnavailable::UnsafePath);
     }
     Ok(())
@@ -1213,9 +1498,14 @@ fn atomic_replace(
         return not_committed(MeshIntentNonceCommitStage::TempSync);
     }
     drop(file);
-    if fail_injection::take(MeshIntentNonceCommitStage::Rename)
-        || rustix::fs::renameat(parent, temp_name, parent, target_name).is_err()
-    {
+    if fail_injection::take(MeshIntentNonceCommitStage::Rename) {
+        return not_committed(MeshIntentNonceCommitStage::Rename);
+    }
+    // `open` admits only local persistent filesystems with POSIX rename
+    // semantics. Therefore an actual failing rename did not replace the
+    // target and is KnownNoEffect. Without that gate this classification
+    // would be an unsupported assumption.
+    if rustix::fs::renameat(parent, temp_name, parent, target_name).is_err() {
         return not_committed(MeshIntentNonceCommitStage::Rename);
     }
 
@@ -1256,6 +1546,10 @@ mod fail_injection {
     pub(super) fn arm(stage: MeshIntentNonceCommitStage) -> Armed {
         ARMED.with(|armed| armed.set(Some(stage)));
         Armed
+    }
+
+    pub(super) fn take_armed() -> Option<MeshIntentNonceCommitStage> {
+        ARMED.with(|armed| armed.replace(None))
     }
 
     pub(super) fn take(stage: MeshIntentNonceCommitStage) -> bool {
@@ -1336,11 +1630,18 @@ mod tests {
     }
 
     fn open_at(path: &Path, capacity: usize) -> MeshIntentNonceLedger {
+        use std::os::unix::fs::PermissionsExt;
+
+        fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
         MeshIntentNonceLedger::open(path, household('a'), config(capacity)).unwrap()
     }
 
+    fn floor_for(hh_id: HouseholdId, unix_seconds: u64) -> TrustedWallFloor {
+        TrustedWallFloor::for_test(hh_id, unix_seconds)
+    }
+
     fn floor(unix_seconds: u64) -> TrustedWallFloor {
-        TrustedWallFloor::from_machine_roster(unix_seconds)
+        floor_for(household('a'), unix_seconds)
     }
 
     fn ceremony_control() -> MeshIntentNonceConsumeControl {
@@ -1370,6 +1671,42 @@ mod tests {
             panic!("same canonical replay key must be consumed across channels");
         };
         assert_eq!(observed, first, "the first durable evidence wins");
+    }
+
+    #[test]
+    fn canonical_key_domain_and_cbor_are_frozen_golden_bytes() {
+        assert_eq!(MESH_INTENT_NONCE_KEY_DOMAIN, "ledger-domain-v1");
+        let stored = StoredKeyV1::from(&key(0x2A));
+        let bytes = cbor::to_canonical_vec(&stored).unwrap();
+        assert_eq!(
+            hex::encode(bytes),
+            "a56568685f6964783768685f61616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161656e6f6e636558202a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a66646f6d61696e706c65646765722d646f6d61696e2d76316e696e69746961746f725f6d5f696478366d5f626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262627064656c6567617465645f6b65795f69646b6d6573682d6b65792d7631",
+            "the replay-key wire contract must not drift silently"
+        );
+    }
+
+    #[test]
+    fn trusted_wall_floor_is_bound_to_exact_household() {
+        let temp = TempDir::new().unwrap();
+        let ledger = open_at(temp.path(), 2);
+        assert_eq!(
+            ledger.consume(
+                &key(0x19),
+                &evidence(MeshIntentChannel::Dev, 0x19, 500),
+                floor_for(household('c'), 100),
+                &ceremony_control(),
+            ),
+            unavailable(MeshIntentNonceUnavailable::WrongTrustedFloorHousehold)
+        );
+        assert!(matches!(
+            ledger.consume(
+                &key(0x19),
+                &evidence(MeshIntentChannel::Dev, 0x19, 500),
+                floor(100),
+                &ceremony_control(),
+            ),
+            MeshIntentNonceConsumeOutcome::Committed { .. }
+        ));
     }
 
     #[test]
@@ -1561,7 +1898,7 @@ mod tests {
     }
 
     #[test]
-    fn cancellation_interrupts_an_in_process_lock_wait_without_effect() {
+    fn cancellation_during_local_lock_race_is_fail_closed() {
         let temp = TempDir::new().unwrap();
         let ledger = open_at(temp.path(), 2);
         let record_path = temp.path().join(STORE_SUBDIR).join(RECORD_FILENAME);
@@ -1590,10 +1927,169 @@ mod tests {
                 panic!("cancelled local-lock wait did not terminate: {error}");
             }
         };
-        assert_eq!(observed, unavailable(MeshIntentNonceUnavailable::Cancelled));
+        assert!(
+            observed == unavailable(MeshIntentNonceUnavailable::Cancelled)
+                || observed
+                    == MeshIntentNonceConsumeOutcome::MayHaveTakenEffect {
+                        stage: MeshIntentNonceCommitStage::WorkerInFlight,
+                    },
+            "cancel may win before spawn (known no effect) or after spawn (worker in flight): {observed:?}"
+        );
         assert_eq!(fs::read(record_path).unwrap(), before);
         drop(held);
         worker.join().unwrap();
+
+        // The detached worker keeps running after the caller stops waiting.
+        // A same-key replay eventually observes its durable terminal result.
+        let retry_deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            match ledger.consume(
+                &key(11),
+                &evidence(MeshIntentChannel::Dev, 11, 500),
+                floor(100),
+                &ceremony_control(),
+            ) {
+                MeshIntentNonceConsumeOutcome::AlreadyConsumed { .. } => break,
+                MeshIntentNonceConsumeOutcome::Committed { .. }
+                | MeshIntentNonceConsumeOutcome::MayHaveTakenEffect { .. } => {}
+                other @ MeshIntentNonceConsumeOutcome::Unavailable { .. } => {
+                    panic!("worker did not converge after cancellation: {other:?}")
+                }
+            }
+            assert!(Instant::now() < retry_deadline, "worker did not converge");
+        }
+    }
+
+    #[test]
+    fn blocking_io_worker_outlives_caller_cancel_and_stabilizes() {
+        let temp = TempDir::new().unwrap();
+        let ledger = open_at(temp.path(), 2);
+        let block = TestWorkerBlock::new();
+        ledger.install_worker_block_for_test(block.clone());
+        let control = ceremony_control();
+        let cancel = control.clone();
+        let caller_ledger = ledger.clone();
+        let caller = thread::spawn(move || {
+            caller_ledger.consume(
+                &key(0x33),
+                &evidence(MeshIntentChannel::Release, 0x33, 700),
+                floor(100),
+                &control,
+            )
+        });
+
+        block.entered.wait();
+        cancel.cancel();
+        assert_eq!(
+            caller.join().unwrap(),
+            MeshIntentNonceConsumeOutcome::MayHaveTakenEffect {
+                stage: MeshIntentNonceCommitStage::WorkerInFlight
+            }
+        );
+        block.release.wait();
+
+        assert!(matches!(
+            ledger.consume(
+                &key(0x33),
+                &evidence(MeshIntentChannel::Dev, 0x44, 900),
+                floor(100),
+                &ceremony_control(),
+            ),
+            MeshIntentNonceConsumeOutcome::AlreadyConsumed { .. }
+        ));
+    }
+
+    #[test]
+    fn bounded_worker_queue_refuses_unenqueued_work_on_cancel() {
+        let temp = TempDir::new().unwrap();
+        let ledger = open_at(temp.path(), 4);
+        let block = TestWorkerBlock::new();
+        ledger.install_worker_block_for_test(block.clone());
+
+        let first_ledger = ledger.clone();
+        let first = thread::spawn(move || {
+            first_ledger.consume(
+                &key(0x60),
+                &evidence(MeshIntentChannel::Dev, 0x60, 900),
+                floor(100),
+                &ceremony_control(),
+            )
+        });
+        block.entered.wait();
+
+        let second_ledger = ledger.clone();
+        let second = thread::spawn(move || {
+            second_ledger.consume(
+                &key(0x61),
+                &evidence(MeshIntentChannel::Dev, 0x61, 900),
+                floor(100),
+                &ceremony_control(),
+            )
+        });
+        let observation_deadline = Instant::now() + Duration::from_secs(2);
+        while ledger.inner.queued_for_test.load(Ordering::Acquire) != 1 {
+            assert!(
+                Instant::now() < observation_deadline,
+                "second request never occupied the single queue slot"
+            );
+            thread::yield_now();
+        }
+
+        let third_control = ceremony_control();
+        let third_cancel = third_control.clone();
+        let third_ledger = ledger.clone();
+        let third = thread::spawn(move || {
+            third_ledger.consume(
+                &key(0x62),
+                &evidence(MeshIntentChannel::Dev, 0x62, 900),
+                floor(100),
+                &third_control,
+            )
+        });
+        while ledger.inner.queue_waiters_for_test.load(Ordering::Acquire) != 1 {
+            assert!(
+                Instant::now() < observation_deadline,
+                "third request never observed the bounded queue as full"
+            );
+            thread::yield_now();
+        }
+        third_cancel.cancel();
+        assert_eq!(
+            third.join().unwrap(),
+            unavailable(MeshIntentNonceUnavailable::Cancelled),
+            "work that never entered the bounded queue is KnownNoEffect"
+        );
+
+        block.release.wait();
+        assert!(matches!(
+            first.join().unwrap(),
+            MeshIntentNonceConsumeOutcome::Committed { .. }
+        ));
+        assert!(matches!(
+            second.join().unwrap(),
+            MeshIntentNonceConsumeOutcome::Committed { .. }
+        ));
+        assert!(matches!(
+            ledger.consume(
+                &key(0x62),
+                &evidence(MeshIntentChannel::Dev, 0x62, 900),
+                floor(100),
+                &ceremony_control(),
+            ),
+            MeshIntentNonceConsumeOutcome::Committed { .. }
+        ));
+    }
+
+    #[test]
+    fn idle_worker_does_not_keep_ledger_inner_alive() {
+        let temp = TempDir::new().unwrap();
+        let ledger = open_at(temp.path(), 2);
+        let weak = Arc::downgrade(&ledger.inner);
+        drop(ledger);
+        assert!(
+            weak.upgrade().is_none(),
+            "worker must not form an Arc cycle"
+        );
     }
 
     #[test]
@@ -1782,6 +2278,137 @@ mod tests {
         assert_eq!(
             fs::read(temp.path().join(STORE_SUBDIR).join(LOCK_FILENAME)).unwrap(),
             MARKER_CLEAN
+        );
+    }
+
+    #[test]
+    fn partial_dirty_and_clean_markers_recover_across_restart() {
+        for partial in [&MARKER_DIRTY[..4], &MARKER_CLEAN[..6]] {
+            let temp = TempDir::new().unwrap();
+            let ledger = open_at(temp.path(), 2);
+            assert!(matches!(
+                ledger.consume(
+                    &key(0x45),
+                    &evidence(MeshIntentChannel::Dev, 0x45, 500),
+                    floor(100),
+                    &ceremony_control(),
+                ),
+                MeshIntentNonceConsumeOutcome::Committed { .. }
+            ));
+            let lock = temp.path().join(STORE_SUBDIR).join(LOCK_FILENAME);
+            let mut file = OpenOptions::new()
+                .write(true)
+                .truncate(true)
+                .open(&lock)
+                .unwrap();
+            file.write_all(partial).unwrap();
+            file.sync_all().unwrap();
+            drop(file);
+
+            let restarted = open_at(temp.path(), 2);
+            assert!(matches!(
+                restarted.consume(
+                    &key(0x45),
+                    &evidence(MeshIntentChannel::Release, 0x99, 700),
+                    floor(100),
+                    &ceremony_control(),
+                ),
+                MeshIntentNonceConsumeOutcome::AlreadyConsumed { .. }
+            ));
+            assert_eq!(fs::read(lock).unwrap(), MARKER_CLEAN);
+        }
+    }
+
+    #[test]
+    fn crash_after_lock_anchor_or_partial_initializing_resumes_fresh_init() {
+        for marker in [Vec::new(), MARKER_INITIALIZING[..5].to_vec()] {
+            use std::os::unix::fs::PermissionsExt;
+
+            let temp = TempDir::new().unwrap();
+            fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o700)).unwrap();
+            let (state_dir, store_dir) = open_store_dirs(temp.path()).unwrap();
+            let (mut lock_file, created) = open_lock_file(&store_dir).unwrap();
+            assert!(created);
+            verify_or_create_lock_anchor(&state_dir, &store_dir, &lock_file, created).unwrap();
+            lock_file.write_all(&marker).unwrap();
+            lock_file.sync_all().unwrap();
+            drop(lock_file);
+            drop(store_dir);
+            drop(state_dir);
+
+            let restarted = open_at(temp.path(), 2);
+            assert!(matches!(
+                restarted.consume(
+                    &key(0x46),
+                    &evidence(MeshIntentChannel::Dev, 0x46, 500),
+                    floor(100),
+                    &ceremony_control(),
+                ),
+                MeshIntentNonceConsumeOutcome::Committed { .. }
+            ));
+        }
+    }
+
+    #[test]
+    fn owner_readable_state_root_creates_a_private_ledger_child() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = TempDir::new().unwrap();
+        fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o755)).unwrap();
+        let ledger = MeshIntentNonceLedger::open(temp.path(), household('a'), config(2)).unwrap();
+        drop(ledger);
+        assert_eq!(
+            fs::metadata(temp.path().join(STORE_SUBDIR))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+    }
+
+    #[test]
+    fn group_or_world_writable_state_root_is_rejected_before_authority_creation() {
+        use std::os::unix::fs::PermissionsExt;
+
+        for mode in [0o775, 0o777] {
+            let temp = TempDir::new().unwrap();
+            fs::set_permissions(temp.path(), fs::Permissions::from_mode(mode)).unwrap();
+            assert_eq!(
+                MeshIntentNonceLedger::open(temp.path(), household('a'), config(2))
+                    .err()
+                    .unwrap(),
+                MeshIntentNonceLedgerOpenError::UnsafePath
+            );
+            assert!(!temp.path().join(STORE_SUBDIR).exists());
+        }
+    }
+
+    #[test]
+    fn linux_filesystem_allowlist_excludes_tmpfs_nfs_and_unknown_families() {
+        assert!(linux_filesystem_is_allowlisted(EXT4_SUPER_MAGIC));
+        assert!(linux_filesystem_is_allowlisted(XFS_SUPER_MAGIC));
+        assert!(linux_filesystem_is_allowlisted(BTRFS_SUPER_MAGIC));
+        assert!(!linux_filesystem_is_allowlisted(TMPFS_SUPER_MAGIC));
+        assert!(!linux_filesystem_is_allowlisted(NFS_SUPER_MAGIC));
+        assert!(!linux_filesystem_is_allowlisted(i64::MAX));
+    }
+
+    #[test]
+    fn writable_lock_is_rejected_on_restart() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = TempDir::new().unwrap();
+        let ledger = open_at(temp.path(), 2);
+        drop(ledger);
+
+        let lock = temp.path().join(STORE_SUBDIR).join(LOCK_FILENAME);
+        fs::set_permissions(&lock, fs::Permissions::from_mode(0o660)).unwrap();
+        assert_eq!(
+            MeshIntentNonceLedger::open(temp.path(), household('a'), config(2))
+                .err()
+                .unwrap(),
+            MeshIntentNonceLedgerOpenError::UnsafePath
         );
     }
 
