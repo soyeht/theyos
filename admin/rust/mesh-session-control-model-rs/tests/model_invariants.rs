@@ -5,8 +5,8 @@
 //! specifically because of it.
 
 use mesh_session_control_model_rs::activate::{
-    ActivateError, LoadRevalidatedError, activate_from_key_observed, load_revalidated_guarded,
-    load_revalidated_report, revalidate_on_load,
+    ActivateError, AuthorizedUseError, LoadRevalidatedError, activate_from_key_observed,
+    load_revalidated_report_for_test, revalidate_on_load, with_authorized_use,
 };
 use mesh_session_control_model_rs::cell::{
     self, CommitTransitionError, ControlRecordCell, OpenConflict,
@@ -3903,46 +3903,85 @@ fn gc_bound_entry_gets_at_most_one_destroy_attempt_per_tick_even_when_backend_ne
 // conflicting roster-side mutation until it is released -- not just a
 // bare revision-number recheck (this crate's own two prior attempts) ────
 
-/// Round 6, wave 6: replaces the now-obsolete `RevisionBumpingBlockingRoster`
-/// (which only re-checked a bare number, never actually enforcing
-/// anything). `acquire_currency_lease` holds `state`'s own `Mutex` for the
-/// lease's ENTIRE lifetime; `revoke_on_roster_side` needs that identical
-/// `Mutex`, so it is genuinely, mechanically blocked -- not merely
-/// "happened not to race" -- while a lease is outstanding.
+/// Round 6, wave 6 (rebuilt in wave 8): replaces the obsolete
+/// `RevisionBumpingBlockingRoster`, which only re-checked a bare number
+/// and enforced nothing.
+///
+/// Two SEPARATE locks, deliberately:
+/// - `mutation` is taken by `acquire_currency_lease` and held for the
+///   lease's entire lifetime, and is also what `revoke_on_roster_side`
+///   needs -- so a held lease genuinely, mechanically blocks a roster-side
+///   revoke rather than merely failing to notice one.
+/// - `currency` covers the cheap reads (`query_machine_currency`,
+///   `currency_revision`) and is released immediately.
+///
+/// Wave 8: these were ONE lock, which made a held lease also block every
+/// plain currency read. That masked the lock-order cycle the deadlock
+/// tests below exist to detect -- a thread blocked in step 1's roster
+/// query never reaches the acquisition order under test at all, so the
+/// cycle could never form and the test passed against deliberately
+/// inverted code. A real roster blocks conflicting MUTATIONS while a
+/// lease is out; it does not stop the world.
 struct LeaseEnforcingRoster {
-    // Optional rendezvous hook so a test can pause activate_from_key_observed
-    // mid-validation (inside query_machine_currency, which the real
-    // validate_full_binding call reaches AFTER currency_revision_before has
-    // already been captured but BEFORE acquire_currency_lease runs) to
-    // deterministically land a roster-side change in that exact window.
+    // Optional rendezvous hook so a test can pause a caller inside
+    // query_machine_currency (reached from validate_full_binding, AFTER
+    // currency_revision_before was captured but BEFORE
+    // acquire_currency_lease runs) to deterministically land a roster-side
+    // change in that exact window.
     sync: Option<RosterSync>,
-    state: Mutex<RosterLeaseState>,
+    // Optional rendezvous hook that fires once, immediately AFTER a lease
+    // is granted and while it is still held -- lets a test pin one thread
+    // in the "holds the roster lease, has not yet taken the cell guard"
+    // state that the lock-order cycle needs.
+    lease_sync: Option<RosterSync>,
+    currency: Mutex<RosterLeaseState>,
+    mutation: Mutex<()>,
 }
 struct RosterSync {
     ready_tx: Mutex<Option<std::sync::mpsc::Sender<()>>>,
     proceed_rx: Mutex<std::sync::mpsc::Receiver<()>>,
 }
+impl RosterSync {
+    /// Announce arrival, then park until released. Fires at most once.
+    fn rendezvous(&self) {
+        if let Some(tx) = self.ready_tx.lock().unwrap().take() {
+            let _ = tx.send(());
+            self.proceed_rx.lock().unwrap().recv().unwrap();
+        }
+    }
+}
 struct RosterLeaseState {
     currency: RosterCurrency,
     revision: u64,
 }
-// Held only for its Drop (releases the mutex); never read.
+// Held only for its Drop (releases `mutation`); never read.
 #[allow(dead_code)]
-struct HeldRosterLease<'a>(std::sync::MutexGuard<'a, RosterLeaseState>);
+struct HeldRosterLease<'a>(std::sync::MutexGuard<'a, ()>);
 impl CurrencyLease for HeldRosterLease<'_> {}
 
 impl LeaseEnforcingRoster {
-    fn active(member_pub: Vec<u8>, member_cert_fingerprint: [u8; 32]) -> Self {
+    fn new(
+        member_pub: Vec<u8>,
+        member_cert_fingerprint: [u8; 32],
+        sync: Option<RosterSync>,
+        lease_sync: Option<RosterSync>,
+    ) -> Self {
         Self {
-            sync: None,
-            state: Mutex::new(RosterLeaseState {
+            sync,
+            lease_sync,
+            currency: Mutex::new(RosterLeaseState {
                 currency: RosterCurrency::Active {
                     member_pub,
                     member_cert_fingerprint,
                 },
                 revision: 0,
             }),
+            mutation: Mutex::new(()),
         }
+    }
+
+    fn active(member_pub: Vec<u8>, member_cert_fingerprint: [u8; 32]) -> Self {
+        Self::new(member_pub, member_cert_fingerprint, None, None)
     }
 
     fn active_blocking(
@@ -3951,27 +3990,43 @@ impl LeaseEnforcingRoster {
         ready_tx: std::sync::mpsc::Sender<()>,
         proceed_rx: std::sync::mpsc::Receiver<()>,
     ) -> Self {
-        Self {
-            sync: Some(RosterSync {
+        Self::new(
+            member_pub,
+            member_cert_fingerprint,
+            Some(RosterSync {
                 ready_tx: Mutex::new(Some(ready_tx)),
                 proceed_rx: Mutex::new(proceed_rx),
             }),
-            state: Mutex::new(RosterLeaseState {
-                currency: RosterCurrency::Active {
-                    member_pub,
-                    member_cert_fingerprint,
-                },
-                revision: 0,
+            None,
+        )
+    }
+
+    /// Parks the first caller that is granted a lease, while it still
+    /// holds that lease -- see `lease_sync`.
+    fn active_parking_the_first_lease(
+        member_pub: Vec<u8>,
+        member_cert_fingerprint: [u8; 32],
+        ready_tx: std::sync::mpsc::Sender<()>,
+        proceed_rx: std::sync::mpsc::Receiver<()>,
+    ) -> Self {
+        Self::new(
+            member_pub,
+            member_cert_fingerprint,
+            None,
+            Some(RosterSync {
+                ready_tx: Mutex::new(Some(ready_tx)),
+                proceed_rx: Mutex::new(proceed_rx),
             }),
-        }
+        )
     }
 
     /// Blocks for as long as any lease is outstanding -- see the struct
     /// doc comment.
     fn revoke_on_roster_side(&self) {
-        let mut guard = self.state.lock().unwrap();
-        guard.currency = RosterCurrency::Revoked;
-        guard.revision += 1;
+        let _mutation = self.mutation.lock().unwrap();
+        let mut c = self.currency.lock().unwrap();
+        c.currency = RosterCurrency::Revoked;
+        c.revision += 1;
     }
 
     /// Simulates a roster-side change to a *different* machine bumping the
@@ -3983,33 +4038,35 @@ impl LeaseEnforcingRoster {
     /// `acquire_currency_lease`'s own revision check, not by
     /// `ValidationError::DelegatorRevoked`.
     fn bump_revision_for_an_unrelated_change(&self) {
-        let mut guard = self.state.lock().unwrap();
-        guard.revision += 1;
+        self.currency.lock().unwrap().revision += 1;
     }
 }
 impl RosterLookup for LeaseEnforcingRoster {
     fn query_machine_currency(&self, _machine_id: &str) -> RosterCurrency {
         if let Some(sync) = &self.sync {
-            if let Some(tx) = sync.ready_tx.lock().unwrap().take() {
-                let _ = tx.send(());
-            }
-            sync.proceed_rx.lock().unwrap().recv().unwrap();
+            sync.rendezvous();
         }
-        self.state.lock().unwrap().currency.clone()
+        self.currency.lock().unwrap().currency.clone()
     }
     fn currency_revision(&self, _machine_id: &str) -> u64 {
-        self.state.lock().unwrap().revision
+        self.currency.lock().unwrap().revision
     }
     fn acquire_currency_lease(
         &self,
         _machine_id: &str,
         expected_revision: u64,
     ) -> Result<Box<dyn CurrencyLease + '_>, RosterChanged> {
-        let guard = self.state.lock().unwrap();
-        if guard.revision != expected_revision {
+        let mutation = self.mutation.lock().unwrap();
+        if self.currency.lock().unwrap().revision != expected_revision {
             return Err(RosterChanged);
         }
-        Ok(Box::new(HeldRosterLease(guard)))
+        // Still holding `mutation` -- a test that parks here pins this
+        // caller in the "has the roster lease, has not yet taken any cell
+        // guard" state.
+        if let Some(lease_sync) = &self.lease_sync {
+            lease_sync.rendezvous();
+        }
+        Ok(Box::new(HeldRosterLease(mutation)))
     }
 }
 
@@ -4041,7 +4098,7 @@ fn roster_lease_genuinely_blocks_a_concurrent_revoke_until_dropped() {
             .recv_timeout(std::time::Duration::from_secs(5))
             .expect("must proceed promptly once the lease is released");
     });
-    assert_eq!(roster.state.lock().unwrap().revision, 1);
+    assert_eq!(roster.currency.lock().unwrap().revision, 1);
 }
 
 #[test]
@@ -4605,10 +4662,39 @@ fn invariants_hold_rejects_duplicate_terminal_txn_ids() {
 // tests demonstrate.
 // ══════════════════════════════════════════════════════════════════════
 
+/// Legacy unpinned spawn -- every worker commits from whatever revision it
+/// happens to read, with its own txn_id and no barrier. Kept ONLY for the
+/// fail-closed alias tests (where no worker gets far enough to commit at
+/// all) and for the negative control that demonstrates why this shape
+/// cannot support an exactly-one-commits assertion. See
+/// `src/bin/cas_race_helper.rs`'s module doc.
 fn run_cas_race_helper(record_path: &std::path::Path, worker_id: u8) -> std::process::Child {
     std::process::Command::new(env!("CARGO_BIN_EXE_cas_race_helper"))
         .arg(record_path)
         .arg(worker_id.to_string())
+        .arg("unpinned")
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .expect("failed to spawn cas_race_helper")
+}
+
+/// Pinned spawn: every worker is handed the SAME `expected_revision` and
+/// builds byte-identical content, then waits at `barrier_dir` until all
+/// `total_workers` have arrived before attempting its CAS.
+fn run_pinned_cas_race_helper(
+    record_path: &std::path::Path,
+    worker_id: u8,
+    expected_revision: u64,
+    barrier_dir: &std::path::Path,
+    total_workers: usize,
+) -> std::process::Child {
+    std::process::Command::new(env!("CARGO_BIN_EXE_cas_race_helper"))
+        .arg(record_path)
+        .arg(worker_id.to_string())
+        .arg("pinned")
+        .arg(expected_revision.to_string())
+        .arg(barrier_dir)
+        .arg(total_workers.to_string())
         .stdout(std::process::Stdio::piped())
         .spawn()
         .expect("failed to spawn cas_race_helper")
@@ -4619,13 +4705,70 @@ fn wait_and_read_stdout(child: std::process::Child) -> String {
     String::from_utf8(output.stdout).unwrap().trim().to_string()
 }
 
+/// Round 6, wave 8 (CFX-5). The predecessor of this test spawned six
+/// unpinned workers and asserted exactly one committed -- an assertion
+/// that did not follow from what the workers actually did, and that an
+/// independent audit run caught failing (120 passed / 1 failed, two
+/// COMMITTED). See `src/bin/cas_race_helper.rs`'s module doc for the full
+/// account. Every worker here starts from the SAME pinned revision with
+/// byte-identical content and only begins after all six have arrived at
+/// the barrier, so exactly one CAS genuinely can win.
 #[test]
-fn six_real_processes_racing_the_same_record_exactly_one_commits() {
+fn six_real_processes_racing_one_pinned_revision_exactly_one_cas_wins() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("record");
+    let barrier = dir.path().join("barrier");
+    std::fs::create_dir(&barrier).unwrap();
+
     // Seed the genesis bootstrap for real, through this process's own
-    // cell, before any race worker starts -- workers all revoke FROM
-    // revision 0, never create it.
+    // cell, before any race worker starts.
+    let pinned_revision = {
+        let cell = test_cell(path.clone());
+        let bootstrap = MeshSignerControlRecordV1::bootstrap(identity(), PurposeId::MeshSession);
+        let g = cell.acquire_for_mutation();
+        assert_eq!(
+            cell.seed_for_test(&g, INITIAL_REVISION, &bootstrap),
+            ReplaceOutcome::Committed
+        );
+        bootstrap.revision
+    };
+
+    let children: Vec<_> = (0u8..6)
+        .map(|i| run_pinned_cas_race_helper(&path, i, pinned_revision, &barrier, 6))
+        .collect();
+    let outputs: Vec<String> = children.into_iter().map(wait_and_read_stdout).collect();
+
+    assert!(
+        !outputs.iter().any(|o| o == "BARRIER_TIMEOUT"),
+        "every worker must reach the barrier -- a timeout means this measured startup skew, not the CAS; got {outputs:?}"
+    );
+    assert!(
+        !outputs.iter().any(|o| o == "BASE_MOVED"),
+        "every worker must start from the pinned revision -- BASE_MOVED means the race was never on a common base, the exact defect this test replaced; got {outputs:?}"
+    );
+    let committed = outputs.iter().filter(|o| o.as_str() == "COMMITTED").count();
+    assert_eq!(
+        committed, 1,
+        "exactly one of six independent processes proposing byte-identical content against one pinned revision must win the CAS; got {outputs:?}"
+    );
+    assert_eq!(
+        outputs.iter().filter(|o| o.as_str() == "NO_EFFECT").count(),
+        5,
+        "the five losers must each be a definitive no-effect rejection, never MAY_HAVE_TAKEN_EFFECT; got {outputs:?}"
+    );
+}
+
+/// Negative control for the test above, and the standing evidence that
+/// the predecessor's assertion was vacuous rather than merely unlucky:
+/// run two unpinned workers strictly SEQUENTIALLY (each fully finished
+/// before the next starts, so they provably never contend) and watch both
+/// commit. Under the old shape that was indistinguishable from a genuine
+/// race, which is why "exactly one committed" could flip to two on a
+/// machine where the workers happened not to overlap.
+#[test]
+fn unpinned_sequential_runs_both_commit_which_is_why_the_old_test_was_vacuous() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("record");
     {
         let cell = test_cell(path.clone());
         let bootstrap = MeshSignerControlRecordV1::bootstrap(identity(), PurposeId::MeshSession);
@@ -4636,16 +4779,13 @@ fn six_real_processes_racing_the_same_record_exactly_one_commits() {
         );
     }
 
-    // Spawn all six essentially simultaneously (spawn, don't wait, in a
-    // tight loop) so they genuinely contend rather than running
-    // sequentially.
-    let children: Vec<_> = (0u8..6).map(|i| run_cas_race_helper(&path, i)).collect();
-    let outputs: Vec<String> = children.into_iter().map(wait_and_read_stdout).collect();
+    let first = wait_and_read_stdout(run_cas_race_helper(&path, 0));
+    let second = wait_and_read_stdout(run_cas_race_helper(&path, 1));
 
-    let committed = outputs.iter().filter(|o| o.as_str() == "COMMITTED").count();
     assert_eq!(
-        committed, 1,
-        "exactly one of six independent processes racing the same file from the same base revision must commit; got {outputs:?}"
+        (first.as_str(), second.as_str()),
+        ("COMMITTED", "COMMITTED"),
+        "two strictly sequential unpinned workers both commit -- each reads the revision the previous one wrote and legitimately advances it. This is correct CAS behaviour, which is exactly why asserting 'exactly one committed' over unpinned workers measured scheduling luck instead of the CAS."
     );
 }
 
@@ -4772,7 +4912,7 @@ fn load_revalidated_succeeds_for_a_genuinely_active_record() {
     seed_record(&cell, &activated);
 
     let policy = DelegationPolicy::test(1000);
-    let loaded = load_revalidated_report::<MeshSessionPurpose>(
+    let loaded = load_revalidated_report_for_test::<MeshSessionPurpose>(
         &cell,
         &backend,
         &policy,
@@ -4805,7 +4945,7 @@ fn load_revalidated_rejects_when_physical_key_was_replaced() {
     backend.create_or_inspect(&tampered_slot, Some(&tampered_binding));
 
     let policy = DelegationPolicy::test(10_000);
-    let err = load_revalidated_report::<MeshSessionPurpose>(
+    let err = load_revalidated_report_for_test::<MeshSessionPurpose>(
         &cell,
         &backend,
         &policy,
@@ -4820,19 +4960,24 @@ fn load_revalidated_rejects_when_physical_key_was_replaced() {
     ));
 }
 
-// ── wave 7, P0-5: a RevalidatedGuard genuinely blocks a concurrent revoke,
-// so no "sign" can ever linearize after one -- unlike a plain
-// load_revalidated_report snapshot, which carries no such guarantee ──────
+// ── wave 8, CFX-1/2/3/4: with_authorized_use replaces RevalidatedGuard ──
+//
+// The wave-7 RevalidatedGuard is gone. It handed back
+// `&MeshSignerControlRecordV1` from a `record()` accessor, and that type
+// derives Clone -- so `let r = g.record().clone(); drop(g);` detached a
+// fully "validated" snapshot from the only thing making it true. It also
+// took the cell's SignGuard BEFORE its slow backend/roster/sig I/O, which
+// both blocked urgent revokes for the whole duration and established a
+// cell -> roster lock order that deadlocked against activation's
+// roster -> cell order. See `AuthorizedUse`'s doc comment in activate.rs.
 
-#[test]
-fn revalidated_guard_genuinely_blocks_a_concurrent_revoke_so_no_sign_can_linearize_after_it() {
-    let dir = tempfile::tempdir().unwrap();
-    let cell = test_cell(dir.path().join("record"));
+/// The common fixture: a fully activated, backend-confirmed record.
+fn activated_fixture(txn_seed: u8) -> (FakeSecretBackend, MeshSignerControlRecordV1) {
     let old = MeshSignerControlRecordV1::bootstrap(identity(), PurposeId::MeshSession);
     let with_intent = apply(
         &old,
         &RecordTransition::IntentRecorded {
-            txn_id: [140; 16],
+            txn_id: [txn_seed; 16],
             kind: PendingOpKind::Create,
             backend: BackendKind::File,
         },
@@ -4885,69 +5030,406 @@ fn revalidated_guard_genuinely_blocks_a_concurrent_revoke_so_no_sign_can_lineari
     )
     .unwrap();
     activated.revision = 1; // see seed_record's own two-step requirement
-    seed_record(&cell, &activated);
+    (backend, activated)
+}
 
-    let policy = DelegationPolicy::test(1000);
-    let guard = load_revalidated_guarded::<MeshSessionPurpose>(
-        &cell,
-        &backend,
-        &policy,
-        &active_roster(),
-        &AlwaysTrueVerifier,
-        50,
+/// Like `activated_fixture`, but the record ALSO carries an in-flight
+/// `RoutineRotate` pending op already in `KeyObserved` phase -- so
+/// `activate_from_key_observed` can be driven against it concurrently
+/// with a `with_authorized_use` against the still-current generation.
+/// That pairing is the only one that can exercise the wave-7 lock cycle:
+/// both paths touch the roster AND the cell, which `cell.commit` alone
+/// (no roster involvement at all) never does.
+fn activated_with_pending_rotation_fixture(
+    txn_seed: u8,
+) -> (
+    FakeSecretBackend,
+    MeshSignerControlRecordV1,
+    [u8; 16],
+    Delegation,
+) {
+    let (backend, activated) = activated_fixture(txn_seed);
+    let rotate_txn = [txn_seed.wrapping_add(1); 16];
+    let with_intent = apply(
+        &activated,
+        &RecordTransition::IntentRecorded {
+            txn_id: rotate_txn,
+            kind: PendingOpKind::RoutineRotate,
+            backend: BackendKind::File,
+        },
+        1000,
+        TEST_CAP,
     )
-    .expect("a genuinely valid, backend-confirmed record must load");
-    assert_eq!(*guard.record(), activated);
+    .unwrap();
+    let p = with_intent.pending_op.clone().unwrap();
+    let CreateOutcome::Unique {
+        binding: rotate_binding,
+        ..
+    } = backend.create_or_inspect(&p.canonical_slot, None)
+    else {
+        panic!()
+    };
+    let mut with_binding = apply(
+        &with_intent,
+        &RecordTransition::KeyObserved {
+            expected_txn_id: p.txn_id,
+            expected_kind: p.kind,
+            expected_generation: p.generation,
+            expected_epoch: p.epoch,
+            expected_purpose: p.purpose,
+            expected_slot_id: p.canonical_slot.canonical_id(),
+            expected_revision: with_intent.revision,
+            binding: rotate_binding.clone(),
+        },
+        1000,
+        TEST_CAP,
+    )
+    .unwrap();
+    let mut d2 = delegation(0, 100);
+    d2.delegated_key_id = p.canonical_slot.canonical_id();
+    d2.delegated_pub = rotate_binding.public_key.clone();
+    with_binding.revision = 1; // see seed_record's own two-step requirement
+    (backend, with_binding, rotate_txn, d2)
+}
 
+#[test]
+fn with_authorized_use_blocks_a_concurrent_revoke_so_no_use_linearizes_after_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let cell = test_cell(dir.path().join("record"));
+    let (backend, activated) = activated_fixture(140);
+    seed_record(&cell, &activated);
+    let policy = DelegationPolicy::test(1000);
     let order = Arc::new(Mutex::new(Vec::new()));
-    let (done_tx, done_rx) = std::sync::mpsc::channel();
+
     std::thread::scope(|scope| {
-        let order_ref = Arc::clone(&order);
-        let cell_ref = &cell;
-        scope.spawn(move || {
-            let result = cell_ref.commit(
-                &RecordTransition::RevokeUrgent {
-                    reason: RevocationReason::OwnerAction,
-                    txn_id: [141; 16],
-                },
-                60,
-                TEST_CAP,
-            );
-            order_ref.lock().unwrap().push("revoke_done");
-            done_tx.send(result).unwrap();
-        });
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
 
-        // RevokeUrgent needs the same MeshSignerLocks' write side the held
-        // guard's SignGuard blocks -- it must not be able to complete
-        // while the guard is still outstanding.
-        assert!(
-            matches!(
-                done_rx.recv_timeout(std::time::Duration::from_millis(100)),
-                Err(std::sync::mpsc::RecvTimeoutError::Timeout)
-            ),
-            "RevokeUrgent must be genuinely blocked while a RevalidatedGuard is outstanding"
-        );
+        let generation = with_authorized_use::<MeshSessionPurpose, _>(
+            &cell,
+            &backend,
+            &policy,
+            &active_roster(),
+            &AlwaysTrueVerifier,
+            50,
+            |authorized| {
+                // Spawned from INSIDE the closure on purpose: the
+                // SignGuard is provably already held at this point, so
+                // there is no window in which the revoke could win the
+                // race and turn this into a flaky test rather than a
+                // deterministic one.
+                let order_ref = Arc::clone(&order);
+                let cell_ref = &cell;
+                scope.spawn(move || {
+                    started_tx.send(()).unwrap();
+                    let r = cell_ref.commit(
+                        &RecordTransition::RevokeUrgent {
+                            reason: RevocationReason::OwnerAction,
+                            txn_id: [141; 16],
+                        },
+                        60,
+                        TEST_CAP,
+                    );
+                    order_ref.lock().unwrap().push("revoke_done");
+                    done_tx.send(r).unwrap();
+                });
+                // Wait until the revoke thread is genuinely live before
+                // asserting it cannot finish -- otherwise a thread that
+                // simply had not started yet would make the assertion
+                // below pass without proving anything.
+                started_rx.recv().unwrap();
+                assert!(
+                    matches!(
+                        done_rx.recv_timeout(std::time::Duration::from_millis(150)),
+                        Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+                    ),
+                    "RevokeUrgent must be genuinely blocked while an authorized use is in flight"
+                );
+                order.lock().unwrap().push("use_done");
+                authorized.generation()
+            },
+        )
+        .expect("a genuinely active, backend-confirmed record must authorize a use");
+        assert_eq!(generation, activated.current_generation.unwrap());
 
-        // The simulated "sign": still safe to trust guard.record() here --
-        // no revoke could have landed since the reload.
-        assert_eq!(guard.record().identity, activated.identity);
-        order.lock().unwrap().push("sign_done");
-        drop(guard);
-
-        let result = done_rx
+        done_rx
             .recv_timeout(std::time::Duration::from_secs(5))
-            .expect("must proceed promptly once the guard is released");
-        result.expect("revoke must succeed once unblocked");
+            .expect("revoke must proceed promptly once the authorized use returns")
+            .expect("revoke must succeed once unblocked");
     });
 
     assert_eq!(
         *order.lock().unwrap(),
-        vec!["sign_done", "revoke_done"],
-        "no sign can ever linearize after a revoke -- proven here by the converse: revoke cannot complete until the guard-covered sign already happened and the guard was dropped"
+        vec!["use_done", "revoke_done"],
+        "no authorized use can ever linearize after a revoke -- proven by the converse: the revoke cannot complete until the use already happened and released the guard"
     );
 }
 
-// ── wave 6: pre-existing-tamper identity checks fail closed ─────────────
+#[test]
+fn with_authorized_use_holds_no_cell_lock_during_slow_io_and_then_refuses_the_stale_snapshot() {
+    // Two properties at once, both required by the wave-8 lock order:
+    // (1) step 1's slow roster I/O holds NO cell lock -- proven because a
+    //     RevokeUrgent commits to completion while it is in flight;
+    // (2) the snapshot validated during that window is then refused,
+    //     rather than authorizing a use that a revoke already invalidated.
+    let dir = tempfile::tempdir().unwrap();
+    let cell = test_cell(dir.path().join("record"));
+    let (backend, activated) = activated_fixture(142);
+    seed_record(&cell, &activated);
+    let policy = DelegationPolicy::test(1000);
+
+    let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+    let (proceed_tx, proceed_rx) = std::sync::mpsc::channel();
+    let roster = BlockingRoster {
+        ready_tx: Mutex::new(Some(ready_tx)),
+        proceed_rx: Mutex::new(proceed_rx),
+    };
+
+    std::thread::scope(|scope| {
+        let handle = scope.spawn(|| {
+            with_authorized_use::<MeshSessionPurpose, _>(
+                &cell,
+                &backend,
+                &policy,
+                &roster,
+                &AlwaysTrueVerifier,
+                50,
+                |_authorized| panic!("the closure must never run against a stale snapshot"),
+            )
+        });
+
+        ready_rx.recv().unwrap(); // now parked inside the slow roster query
+        cell.commit(
+            &RecordTransition::RevokeUrgent {
+                reason: RevocationReason::OwnerAction,
+                txn_id: [143; 16],
+            },
+            60,
+            TEST_CAP,
+        )
+        .expect("a revoke must be able to commit while step 1's slow I/O is in flight -- that is the whole point of holding no cell lock there");
+        proceed_tx.send(()).unwrap();
+
+        let err = handle.join().unwrap().unwrap_err();
+        assert!(
+            matches!(err, AuthorizedUseError::RecordChangedDuringAcquire),
+            "got {err:?}"
+        );
+    });
+}
+
+#[test]
+fn a_held_currency_lease_blocks_a_roster_side_revoke_for_the_whole_authorized_use() {
+    let dir = tempfile::tempdir().unwrap();
+    let cell = test_cell(dir.path().join("record"));
+    let (backend, activated) = activated_fixture(144);
+    seed_record(&cell, &activated);
+    let policy = DelegationPolicy::test(1000);
+    let roster = LeaseEnforcingRoster::active(vec![1, 2, 3], [9u8; 32]);
+
+    std::thread::scope(|scope| {
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+
+        with_authorized_use::<MeshSessionPurpose, _>(
+            &cell,
+            &backend,
+            &policy,
+            &roster,
+            &AlwaysTrueVerifier,
+            50,
+            |_authorized| {
+                let roster_ref = &roster;
+                scope.spawn(move || {
+                    started_tx.send(()).unwrap();
+                    roster_ref.revoke_on_roster_side();
+                    done_tx.send(()).unwrap();
+                });
+                started_rx.recv().unwrap();
+                assert!(
+                    matches!(
+                        done_rx.recv_timeout(std::time::Duration::from_millis(150)),
+                        Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+                    ),
+                    "a roster-side revoke must be genuinely blocked by the held currency lease for the whole authorized use"
+                );
+            },
+        )
+        .expect("a genuinely active record must authorize a use");
+
+        done_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("the roster-side revoke must proceed once the lease is released");
+    });
+
+    assert_eq!(roster.currency.lock().unwrap().revision, 1);
+}
+
+// ── the lock-order cycle itself ────────────────────────────────────────
+
+#[test]
+fn activation_and_authorized_use_running_concurrently_never_deadlock() {
+    // The absence-of-cycle RED, made DETERMINISTIC rather than hopeful.
+    //
+    // A first attempt at this test simply spawned both paths and asserted
+    // both finished. That instrument was vacuous: run against deliberately
+    // inverted (cell -> roster) code in a scratch copy it still passed,
+    // because nothing forced the two threads into the interleaving the
+    // cycle needs. It confirmed its own prior. This version pins the
+    // interleaving:
+    //
+    //   1. the activation thread is parked the instant it holds the roster
+    //      lease and before it takes any cell guard (`lease_sync`);
+    //   2. only then does the authorized-use thread start;
+    //   3. only then is the activation thread released.
+    //
+    // Under the sanctioned roster -> cell order, the use thread blocks on
+    // the roster lease while holding NO cell guard, so activation takes
+    // the cell guard freely and both finish. Under the inverted
+    // cell -> roster order, the use thread holds the cell's SignGuard
+    // while waiting for the lease, activation blocks forever on the cell
+    // guard, and neither finishes -- which this test then reports as the
+    // cycle it is. Verified against an inverted scratch copy: this version
+    // times out there and passes here.
+    let dir = tempfile::tempdir().unwrap();
+    let cell = test_cell(dir.path().join("record"));
+    let (backend, seeded, rotate_txn, d2) = activated_with_pending_rotation_fixture(150);
+    seed_record(&cell, &seeded);
+    let policy = DelegationPolicy::test(1000);
+
+    let (lease_held_tx, lease_held_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let roster = LeaseEnforcingRoster::active_parking_the_first_lease(
+        vec![1, 2, 3],
+        [9u8; 32],
+        lease_held_tx,
+        release_rx,
+    );
+
+    // Detached, not scoped: a genuinely deadlocked thread can never be
+    // joined, so the harness must be able to give up on it.
+    let shared = Arc::new((cell, backend, policy, roster));
+    let (activate_done_tx, activate_done_rx) = std::sync::mpsc::channel();
+    let (use_done_tx, use_done_rx) = std::sync::mpsc::channel();
+
+    {
+        let shared = Arc::clone(&shared);
+        std::thread::spawn(move || {
+            let (cell, backend, policy, roster) = (&shared.0, &shared.1, &shared.2, &shared.3);
+            // roster lease -> cell MutateGuard
+            let _ = activate_from_key_observed::<MeshSessionPurpose>(
+                cell,
+                backend,
+                roster,
+                &AlwaysTrueVerifier,
+                policy,
+                rotate_txn,
+                d2,
+                50,
+                TEST_CAP,
+            );
+            let _ = activate_done_tx.send(());
+        });
+    }
+
+    // Activation now holds the roster lease and has taken no cell guard.
+    lease_held_rx
+        .recv_timeout(std::time::Duration::from_secs(10))
+        .expect("activation must reach its lease");
+
+    {
+        let shared = Arc::clone(&shared);
+        std::thread::spawn(move || {
+            let (cell, backend, policy, roster) = (&shared.0, &shared.1, &shared.2, &shared.3);
+            // cell SignGuard + roster lease -- the pair whose ORDER is
+            // the whole question.
+            let _ = with_authorized_use::<MeshSessionPurpose, _>(
+                cell,
+                backend,
+                policy,
+                roster,
+                &AlwaysTrueVerifier,
+                50,
+                |authorized| authorized.generation(),
+            );
+            let _ = use_done_tx.send(());
+        });
+    }
+
+    // Let the use thread reach whichever acquisition its order takes
+    // first, then release activation into its cell guard.
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    release_tx.send(()).unwrap();
+
+    activate_done_rx
+        .recv_timeout(std::time::Duration::from_secs(10))
+        .expect("activation must not deadlock -- a timeout here IS the cycle");
+    use_done_rx
+        .recv_timeout(std::time::Duration::from_secs(10))
+        .expect("the authorized use must not deadlock -- a timeout here IS the cycle");
+}
+
+#[test]
+fn the_deadlock_instrument_itself_can_detect_a_real_cycle() {
+    // Non-vacuity control for the test above. A "no deadlock" assertion
+    // built on recv_timeout is only worth something if that harness would
+    // actually catch a cycle -- otherwise it confirms its own prior.
+    //
+    // A first version of this control just spawned two threads taking two
+    // locks in opposite orders and expected a deadlock. That was itself
+    // racy (2 of 15 suite runs saw the second thread take both locks
+    // before the first had taken either, and trip its own `unreachable!`).
+    // The acquisitions are now explicitly sequenced, so the cycle forms
+    // every time:
+    //
+    //   T1 takes A, announces      -> T2 takes B, announces
+    //   T2 reaches for A (blocked) -> T1 reaches for B (blocked)
+    let a = Arc::new(Mutex::new(()));
+    let b = Arc::new(Mutex::new(()));
+    let (a_held_tx, a_held_rx) = std::sync::mpsc::channel();
+    let (b_held_tx, b_held_rx) = std::sync::mpsc::channel();
+    let (progressed_tx, progressed_rx) = std::sync::mpsc::channel();
+
+    {
+        let (a, b) = (Arc::clone(&a), Arc::clone(&b));
+        let progressed_tx = progressed_tx.clone();
+        // Detached, not scoped: a genuinely deadlocked thread can never
+        // be joined.
+        std::thread::spawn(move || {
+            let _ga = a.lock().unwrap();
+            a_held_tx.send(()).unwrap();
+            b_held_rx.recv().unwrap(); // B is provably taken by now
+            let _gb = b.lock().unwrap(); // blocks forever
+            let _ = progressed_tx.send("t1");
+        });
+    }
+    {
+        let (a, b) = (Arc::clone(&a), Arc::clone(&b));
+        std::thread::spawn(move || {
+            a_held_rx.recv().unwrap(); // A is provably taken by now
+            let _gb = b.lock().unwrap();
+            b_held_tx.send(()).unwrap();
+            let _ga = a.lock().unwrap(); // blocks forever
+            let _ = progressed_tx.send("t2");
+        });
+    }
+
+    assert!(
+        matches!(
+            progressed_rx.recv_timeout(std::time::Duration::from_millis(500)),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+        ),
+        "neither thread may get past its second acquisition -- if one did, this harness cannot detect a cycle and the no-deadlock test above proves nothing"
+    );
+    assert!(
+        a.try_lock().is_err() && b.try_lock().is_err(),
+        "both locks must still be held by the deadlocked pair"
+    );
+    // The two threads stay blocked for the rest of the process. That is
+    // what a cycle looks like, and it is exactly what
+    // activation_and_authorized_use_running_concurrently_never_deadlock
+    // asserts cannot happen between the two real code paths.
+}
 
 #[test]
 fn load_canonical_rejects_a_symlink_at_the_record_path() {

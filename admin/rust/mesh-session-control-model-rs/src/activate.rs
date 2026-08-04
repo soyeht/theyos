@@ -294,31 +294,30 @@ fn load_and_revalidate<P: PurposeMarker>(
     Ok(record)
 }
 
-/// Round 6 fix (wave 4/6, item 5), corrected in wave 7 (P0-5): this used
-/// to be `pub fn load_revalidated`, returning a plain, unguarded snapshot
-/// — the "sanctioned way" doc comment made it *look* authority-bearing,
-/// but nothing about the return value kept it true. A caller could load +
-/// revalidate as `Active`, then a concurrent `RevokeUrgent` could commit,
-/// and the caller could still go on to "sign"/forward using the now-stale
-/// snapshot — the exact load→validate→[gap]→use race this crate has
-/// closed everywhere else it appears. Renamed to make the narrower
-/// contract explicit, and its authority-bearing twin below added for
-/// callers that actually need the record to *stay* authorized through the
-/// moment they use it:
-/// - `load_revalidated_report` (this function), for callers that only
-///   need a point-in-time answer (e.g. "is this identity Active right
-///   now") and will never use the result to authorize a sign/forward
-///   action;
-/// - `load_revalidated_guarded`, which returns a `RevalidatedGuard`
-///   holding the same `SignGuard` `RevokeUrgent` contends on, for exactly
-///   that purpose.
+/// Raw point-in-time snapshot: genuinely revalidated at the instant it
+/// returns, and stale from any instant after — no lock is held past this
+/// call, so a `RevokeUrgent` may commit immediately afterward.
 ///
-/// The record is genuinely `Active`/revalidated *at the moment this
-/// returns*, but nothing stops it from becoming stale immediately after:
-/// no guard is held past this call, so a `RevokeUrgent` can commit right
-/// after this returns. Never use this result to decide whether to sign or
-/// forward anything; use `load_revalidated_guarded` for that.
-pub fn load_revalidated_report<P: PurposeMarker>(
+/// Round 6, wave 8 (CFX-1): this is now `pub(crate)`, not `pub`. It was
+/// public in wave 7 on the theory that a plain snapshot is fine as long
+/// as its doc comment says "reporting only, never authorizes a sign." A
+/// doc comment is not a control — this crate has now made that same
+/// mistake twice (see `ControlRecordCell::load_canonical`, closed in wave
+/// 7 for exactly the same reason), and a caller who wanted a record to
+/// act on had no reason to look past a public function that returns one.
+///
+/// The only door onto it from outside this crate is now this
+/// `test-support`-gated one, so a plain `cargo build` exposes no way to
+/// obtain a detachable validated record at all. Production callers get
+/// `with_authorized_use`, which never hands one back.
+///
+/// (There is deliberately no `pub(crate)` non-test twin: nothing inside
+/// this crate wants a bare revalidated snapshot either — the internal
+/// consumer is `load_and_revalidate`, called by `with_authorized_use`
+/// under the locks. An unused `pub(crate)` wrapper would just be dead
+/// code in the default build.)
+#[cfg(feature = "test-support")]
+pub fn load_revalidated_report_for_test<P: PurposeMarker>(
     cell: &ControlRecordCell,
     backend: &dyn SecretBackend,
     policy: &DelegationPolicy,
@@ -329,69 +328,181 @@ pub fn load_revalidated_report<P: PurposeMarker>(
     load_and_revalidate::<P>(cell, backend, policy, roster, sig, now)
 }
 
-/// A live, authority-bearing handle on a record that has just been
-/// reloaded and revalidated (backend confirmation + roster/signature
-/// check) — obtained and held under the same `SignGuard` a `RevokeUrgent`
-/// needs the write side of (`ControlRecordCell::acquire_for_mutation`) to
-/// commit. As long as one of these stays alive, no `RevokeUrgent` can have
-/// landed on this cell since the reload: `RevokeUrgent` genuinely blocks
-/// on `acquire_for_mutation` until this guard drops, rather than merely
-/// racing it. This is what closes the P0-5 gap `load_revalidated_report`
-/// cannot: a caller that reads `record()` and acts on it (e.g. signs)
-/// before dropping the guard is guaranteed no revoke has linearized before
-/// that action.
+/// # The one global lock order in this crate
 ///
-/// Deliberately not `Clone` and exposes no way to detach the record from
-/// the guard — kiana rejected an earlier design (an arbitrary
-/// caller-supplied closure run under `SignGuard`) specifically because
-/// unbounded caller work held under the guard could delay `RevokeUrgent`
-/// indefinitely, reopening the property round 4/5 protects (`RevokeUrgent`
-/// must never queue behind unrelated slow work). This type is instead a
-/// narrow RAII handle: the caller reads `record()`, does its own bounded
-/// work, and drops it promptly — it cannot be squirreled away and outlive
-/// the operation it was obtained for the way a plain returned snapshot
-/// could.
+/// Round 6, wave 8 (CFX-3): the previous wave introduced a genuine
+/// ABBA deadlock cycle. `activate_from_key_observed` takes the roster
+/// currency lease and *then* the cell's mutation guard; the guarded-load
+/// it added took the cell's `SignGuard` and *then* queried the roster
+/// (inside `validate_full_binding`). Two callers, one of each, could each
+/// hold what the other needed. Nothing about either function read as
+/// wrong in isolation — the cycle only exists between them.
 ///
-/// This crate has no `backend.sign()` concept yet, so a narrower
-/// `sign_revalidated`/`sign_checked`-shaped operation (holding the guard
-/// only across reload + checks + the actual sign call, with bounded
-/// measured latency) is not buildable here yet. When it lands, prefer
-/// that shape; this type is the interim, still-correct alternative in the
-/// meantime.
-pub struct RevalidatedGuard<'a> {
-    _sign: SignGuard<'a>,
-    record: MeshSignerControlRecordV1,
+/// The single order every path in this crate must obey, from here on:
+///
+/// 1. **All slow I/O with NO lock of any kind held** — `backend.load_exact`,
+///    `roster.query_machine_currency`, `sig.verify`. This is also what
+///    keeps an urgent `RevokeUrgent` from ever queueing behind unrelated
+///    slow work (the round 4/5 property).
+/// 2. **Then** the roster currency lease (`acquire_currency_lease`).
+/// 3. **Then** the cell's own guard (`acquire_for_sign`/`acquire_for_mutation`).
+/// 4. Under both, re-read cheaply and compare the exact revision/binding
+///    against what was actually validated in step 1.
+/// 5. Run only the short authorized operation.
+/// 6. Release in reverse.
+///
+/// **Never cell → roster.** A cell guard must never be held across any
+/// roster call.
+///
+/// A narrow, non-`Clone`, closure-scoped view of a record that has just
+/// been revalidated and re-confirmed unchanged under both locks.
+///
+/// Round 6, wave 8 (CFX-1/CFX-4): this replaces a `RevalidatedGuard` that
+/// handed back `&MeshSignerControlRecordV1` from a `record()` accessor.
+/// That design claimed linearized authority it did not have:
+/// `MeshSignerControlRecordV1` derives `Clone`, so
+/// `let r = guard.record().clone(); drop(guard);` detached a fully
+/// "validated" snapshot from the guard that was the only thing making it
+/// true — the exact defect the guard was introduced to close, reachable
+/// in two lines. Making the *guard* non-`Clone` was worthless while the
+/// thing it guarded was `Clone`.
+///
+/// So this type deliberately exposes **no record and no raw signer** —
+/// only the few narrow facts an authorized use site actually needs, all
+/// borrowed for strictly less than the closure's own lifetime, so nothing
+/// authority-bearing can outlive the locks. Copying a slot id or a public
+/// key out is harmless: those are locators, not authority. What can no
+/// longer escape is a whole record labelled "revalidated."
+///
+/// ## What this does and does not enforce
+///
+/// It *mechanically* prevents detaching authority from the locks. It does
+/// **not** mechanically bound how long the caller's closure runs — no
+/// type can force that on an arbitrary `FnOnce`. Keeping the closure
+/// short is a documented caller obligation, stated here rather than
+/// claimed as a control (a prohibition without a mechanism is not a
+/// control). The closure form is still strictly better than the RAII
+/// handle it replaces: a returned guard could be parked in a struct and
+/// held indefinitely; a closure cannot outlive this call.
+pub struct AuthorizedUse<'a> {
+    identity: &'a crate::record::ControlIdentity,
+    purpose: crate::record::PurposeId,
+    generation: std::num::NonZeroU64,
+    binding: &'a crate::record::ExactBinding,
 }
 
-impl RevalidatedGuard<'_> {
-    /// The record as it stood at the moment of revalidation, still
-    /// covered by the guard this handle holds — see the struct doc
-    /// comment. Do not clone this out and act on it after the guard
-    /// drops; that reopens exactly the race this type exists to close.
+impl AuthorizedUse<'_> {
     #[must_use]
-    pub fn record(&self) -> &MeshSignerControlRecordV1 {
-        &self.record
+    pub fn identity(&self) -> &crate::record::ControlIdentity {
+        self.identity
+    }
+
+    #[must_use]
+    pub fn purpose(&self) -> crate::record::PurposeId {
+        self.purpose
+    }
+
+    /// The current generation this use is attributed to.
+    #[must_use]
+    pub fn generation(&self) -> std::num::NonZeroU64 {
+        self.generation
+    }
+
+    /// Where the key lives and which public key identifies it — a
+    /// locator for the actual sign call a real backend would make, not
+    /// the private key and not the record.
+    #[must_use]
+    pub fn binding(&self) -> &crate::record::ExactBinding {
+        self.binding
     }
 }
 
-/// Acquires `cell`'s `SignGuard` *before* loading, so the load +
-/// revalidation itself, and everything the caller does with the returned
-/// guard afterward, all happen under one continuous hold — see
-/// `RevalidatedGuard`'s doc comment. On any failure (no record, corrupt,
-/// or revalidation rejects it) the guard is dropped immediately and no
-/// handle is returned.
-pub fn load_revalidated_guarded<'a, P: PurposeMarker>(
-    cell: &'a ControlRecordCell,
+#[derive(Debug, thiserror::Error)]
+pub enum AuthorizedUseError {
+    #[error(transparent)]
+    Load(#[from] LoadRevalidatedError),
+    #[error("record has no current generation to authorize a use against")]
+    NoCurrentGeneration,
+    #[error(transparent)]
+    RosterChanged(#[from] crate::validator::RosterChanged),
+    #[error(
+        "record changed between revalidation and acquiring the locks -- the validated snapshot is stale and must not authorize anything"
+    )]
+    RecordChangedDuringAcquire,
+}
+
+/// Runs `use_` against a record that is revalidated **and still provably
+/// unchanged** at the moment the closure runs, under both the roster
+/// currency lease and the cell's `SignGuard` — acquired in the one global
+/// order documented on `AuthorizedUse`, after all slow I/O has already
+/// completed with nothing held.
+///
+/// This is the only sanctioned way to perform an action whose correctness
+/// depends on the delegation still being live (a signature, a forward).
+/// While the closure runs, a concurrent `RevokeUrgent` genuinely blocks on
+/// `acquire_for_mutation` and a conflicting roster-side change genuinely
+/// blocks on the lease — so no such change can linearize before the use,
+/// and the use cannot act on a snapshot that a change already invalidated.
+pub fn with_authorized_use<P: PurposeMarker, R>(
+    cell: &ControlRecordCell,
     backend: &dyn SecretBackend,
     policy: &DelegationPolicy,
     roster: &dyn RosterLookup,
     sig: &dyn SignatureVerifier,
     now: u64,
-) -> Result<RevalidatedGuard<'a>, LoadRevalidatedError> {
-    let sign = cell.acquire_for_sign();
-    let record = load_and_revalidate::<P>(cell, backend, policy, roster, sig, now)?;
-    Ok(RevalidatedGuard {
-        _sign: sign,
-        record,
-    })
+    use_: impl FnOnce(&AuthorizedUse<'_>) -> R,
+) -> Result<R, AuthorizedUseError> {
+    // ---- step 1: everything slow, with NO lock of any kind held ----
+    //
+    // A cheap unguarded read first, only to learn which delegator the
+    // current generation belongs to -- `currency_revision` needs that id,
+    // and it must be sampled BEFORE the slow roster query for the
+    // comparison in step 2 to mean anything.
+    let peek = match cell.load_canonical() {
+        LoadOutcome::Exact(r) => *r,
+        LoadOutcome::Missing => return Err(LoadRevalidatedError::NoRecord.into()),
+        LoadOutcome::Corrupt => return Err(LoadRevalidatedError::RecordCorrupt.into()),
+    };
+    let delegator_m_id = current_generation_of(&peek)
+        .ok_or(AuthorizedUseError::NoCurrentGeneration)?
+        .delegation
+        .delegator_m_id
+        .clone();
+    let roster_revision_before = roster.currency_revision(&delegator_m_id);
+
+    let validated = load_and_revalidate::<P>(cell, backend, policy, roster, sig, now)?;
+
+    // ---- step 2: roster lease, THEN cell guard. Never the reverse. ----
+    let _lease = roster.acquire_currency_lease(&delegator_m_id, roster_revision_before)?;
+    let _sign: SignGuard<'_> = cell.acquire_for_sign();
+
+    // ---- step 3: cheap re-read under both, compared exactly ----
+    //
+    // `validated` was produced with nothing held, so anything could have
+    // committed between then and the two acquisitions above. Comparing the
+    // whole record (not just the revision) is the strongest available
+    // check and costs one cheap local read.
+    let fresh = match cell.load_canonical() {
+        LoadOutcome::Exact(r) => *r,
+        LoadOutcome::Missing => return Err(LoadRevalidatedError::NoRecord.into()),
+        LoadOutcome::Corrupt => return Err(LoadRevalidatedError::RecordCorrupt.into()),
+    };
+    if fresh != validated {
+        return Err(AuthorizedUseError::RecordChangedDuringAcquire);
+    }
+    let current = current_generation_of(&fresh).ok_or(AuthorizedUseError::NoCurrentGeneration)?;
+
+    // ---- step 4: only the short authorized operation ----
+    Ok(use_(&AuthorizedUse {
+        identity: &fresh.identity,
+        purpose: fresh.purpose,
+        generation: current.generation,
+        binding: &current.binding,
+    }))
+    // ---- step 5: `_sign` then `_lease` drop here, in reverse order ----
+}
+
+fn current_generation_of(record: &MeshSignerControlRecordV1) -> Option<&GenerationRecord> {
+    let g = record.current_generation?;
+    record.live_generations.iter().find(|lg| lg.generation == g)
 }
