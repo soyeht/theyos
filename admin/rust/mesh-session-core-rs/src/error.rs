@@ -15,6 +15,10 @@ pub enum WireError {
     TypeKeyInBody,
     #[error("unknown post-handshake type byte {0:#04x}")]
     UnknownTypeByte(u8),
+    #[error("ceremony deadline exceeded before this I/O call could even be attempted")]
+    DeadlineExceeded,
+    #[error("failed to arm the per-call I/O deadline (e.g. setsockopt failure) — failing closed")]
+    DeadlineArmingFailed,
 }
 
 /// Errors from the canonical-CBOR layer (item 1 support).
@@ -158,6 +162,90 @@ pub enum AuthFrameError {
     DelegationTranscriptKindsMismatch,
     #[error("delegation.channel does not match the channel this ceremony expects")]
     DelegationChannelMismatch,
+    #[error(transparent)]
+    Intent(#[from] IntentError),
+}
+
+/// Errors from `SignedMeshConnectionIntent` (0x06 carrier, D9 addendum
+/// `kiana-d9-intent-carrier-b-addendum.c203463c…`). Deliberately separate
+/// from `AuthFrameError`'s frame-shaped errors: `IntentRecord` is not an
+/// `AuthFrameBody` and never goes through `sign_frame`/`verify_frame`.
+#[derive(Debug, Error)]
+pub enum IntentError {
+    #[error(transparent)]
+    Cbor(#[from] CborError),
+    #[error(transparent)]
+    Wire(#[from] WireError),
+    #[error("intent's protocol_version/domain does not match the frozen literal")]
+    VersionOrDomainMismatch,
+    #[error("intent field does not match its fixed wire shape")]
+    ShapeMismatch,
+    #[error("intent record's type byte is not 0x06")]
+    UnexpectedTypeByte(u8),
+    #[error("intent signature does not verify")]
+    BadSignature,
+    #[error("intent signature is not low-S canonical")]
+    HighSRejected,
+    #[error("signer returned a byte string that does not parse as a valid P-256 signature")]
+    InvalidSignatureScalar,
+    #[error("K_mesh signer failed — no intent signature produced")]
+    SignerFailed,
+    #[error(
+        "signer produced an intent signature that does not verify against its own preimage and public key"
+    )]
+    SignerProducedInvalidSignature,
+    #[error("intent.delegated_key_id does not match Proof-I.delegation.delegated_key_id")]
+    KeyIdMismatch,
+    #[error("intent and Proof-I signatures do not resolve to the same delegated public key")]
+    DelegatedKeyMismatch,
+    #[error("Proof-I.connection_intent_digest does not match the received intent record")]
+    DigestMismatch,
+    #[error(
+        "intent's household/initiator/target identity or fingerprint does not match Proof-I/local"
+    )]
+    IdentityMismatch,
+    #[error(
+        "intent.not_after is not within now..=delegation.not_after (expired, not yet valid, or exceeds the delegation's own window)"
+    )]
+    TtlInvalid,
+    #[error("this intent's nonce has already been consumed")]
+    NonceAlreadyConsumed,
+    #[error(
+        "nonce ledger commit outcome is ambiguous (may have taken effect) — treated as consumed, never as committed"
+    )]
+    NonceCommitAmbiguous,
+    #[error("nonce ledger unavailable")]
+    NonceLedgerUnavailable,
+    #[error("no nonce ledger configured — fails closed until a real one is injected")]
+    NoLedgerConfigured,
+    #[error("intent's channel does not match the channel this ceremony expects")]
+    ChannelMismatch,
+    #[error("no D1 admission hook configured — fails closed until a real one is injected")]
+    NoD1AdmissionConfigured,
+    #[error("trusted clock unavailable — failing closed rather than assuming freshness")]
+    ClockUnavailable,
+    #[error("ceremony's absolute deadline has passed")]
+    DeadlineExceeded,
+    #[error(
+        "D1 admission binding at activate time does not match the exact binding reserved (session_id/fingerprint/revision/channel) — a fresh read by m_id alone is not enough"
+    )]
+    D1BindingMismatch,
+    #[error("signer's own public key does not match the key PendingIntent was built to bind")]
+    SignerKeyMismatchPendingIntent,
+    #[error(
+        "failed to clear the ceremony's per-syscall I/O deadline before exposing the Active session — closing rather than risking a leaked timeout on future DATA/CLOSE/rekey I/O"
+    )]
+    PostActivationCleanupFailed,
+    #[error(
+        "PendingIntent's captured delegation binding (key bytes/serial/window) does not match the local delegation now in use"
+    )]
+    PendingIntentDelegationMismatch,
+    #[error(
+        "PendingIntent's own (signed) checkpoint_hash does not match the checkpoint this ceremony is about to present"
+    )]
+    PendingIntentCheckpointMismatch,
+    #[error("intent record carries an empty hh_id/initiator_m_id/target_m_id/delegated_key_id")]
+    EmptyIdentifier,
 }
 
 /// Errors from Noise session-static setup (item 2).

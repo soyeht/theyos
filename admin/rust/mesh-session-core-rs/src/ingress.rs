@@ -18,10 +18,20 @@
 //! this crate's own `start_session` (the auth state machine) may take the
 //! aggregate apart, and it does so internally, embedding the evidence in
 //! whatever session type it returns rather than handing either piece back
-//! out. `new` stays `pub`: the adapter (a different crate) legitimately
-//! needs to construct the pair — v6 §11, CORE only trusts the adapter for
-//! prefilter, never for identity, and construction is where that trust is
-//! exercised, not extraction.
+//! out.
+//!
+//! **`CeremonyDeadline` (2026-08-04, @kiana, D9 carrier-B erratum1 E3,
+//! definitive):** a monotonic time budget, never a caller-suppliable
+//! wall-clock `u64`. The only production constructor is
+//! [`PrevalidatedIngress::admit_at_accept`], which captures
+//! `Instant::now()` internally, once — there is no production path for a
+//! caller to hand in their own `Instant`/`u64`/timestamp. The token stays
+//! private inside `PrevalidatedIngress` and is moved out only via
+//! `consume`, into the handshake, alongside the stream and evidence it
+//! was born with. `#[cfg(test)]` gets its own deterministic
+//! constructors — never reachable from a production build.
+
+use std::time::{Duration, Instant};
 
 /// Evidence an adapter attaches to a stream it has already prefiltered
 /// (e.g. accepted a TCP connection, matched some coarse allow-list). CORE
@@ -34,6 +44,107 @@ pub struct IngressEvidence {
     pub observed_at: u64,
 }
 
+/// A hard ceiling on how large a [`CeremonyBudget`] may be, supplied by
+/// the runtime/config, never invented inside this crate (2026-08-04,
+/// @kiana: the frozen D9/B-SESSAO spec does not itself fix a numeric
+/// protocol maximum for this window, so the core must not guess one —
+/// it requires an explicit policy from its caller and never falls back to
+/// "unlimited"). There is deliberately no `Default` impl: a
+/// [`CeremonyBudget`] cannot be constructed without a policy reaching this
+/// type first, so "no policy configured" fails closed by construction,
+/// the same discipline as `NoD1AdmissionConfigured`/`NoClockConfigured`.
+#[derive(Debug, Clone, Copy)]
+pub struct CeremonyDeadlinePolicy {
+    max_budget: Duration,
+}
+
+impl CeremonyDeadlinePolicy {
+    /// `max_budget` itself must be nonzero — a zero ceiling would make
+    /// every [`CeremonyBudget::new`] call fail, which is a config bug to
+    /// reject at the policy boundary rather than surface as a mysterious
+    /// per-connection admission failure later.
+    pub fn new(max_budget: Duration) -> Option<Self> {
+        if max_budget.is_zero() {
+            None
+        } else {
+            Some(Self { max_budget })
+        }
+    }
+}
+
+/// A validated ceremony time budget — nonzero AND within the runtime's
+/// declared [`CeremonyDeadlinePolicy`] ceiling, checked once at
+/// construction rather than trusted to already be sane. `pub`: the
+/// adapter (a different crate) must be able to construct one; the
+/// *duration itself* carries no authority, only [`CeremonyDeadline`]
+/// (which additionally binds it to a specific `Instant`) does.
+///
+/// (2026-08-04, @kiana, CFX: an earlier version of this type accepted any
+/// nonzero duration including `Duration::MAX`, which let an adapter
+/// construct a budget that is "nonzero" by the letter of the check but
+/// unlimited in practice — defeating the whole anti-slow-loris purpose.
+/// The frozen decision said nonzero *and* bounded by policy; both halves
+/// are now enforced together, not just the first.)
+#[derive(Debug, Clone, Copy)]
+pub struct CeremonyBudget(Duration);
+
+impl CeremonyBudget {
+    pub fn new(duration: Duration, policy: &CeremonyDeadlinePolicy) -> Option<Self> {
+        if duration.is_zero() || duration > policy.max_budget {
+            None
+        } else {
+            Some(Self(duration))
+        }
+    }
+}
+
+/// Opaque, monotonic ceremony deadline. `started`/`budget` are private —
+/// the only ways to obtain a value of this type are
+/// [`PrevalidatedIngress::admit_at_accept`] (production; mints `started`
+/// from `Instant::now()` internally) or the `#[cfg(test)]`-only
+/// constructors below (test doubles, never reachable from a production
+/// build). Nothing here is wall-clock/`u64`-based — `Instant` cannot go
+/// backwards and is immune to wall-clock adjustment, exactly the property
+/// an anti-slow-loris deadline needs and a `SystemTime`/`u64` timestamp
+/// does not have.
+#[derive(Debug, Clone, Copy)]
+pub struct CeremonyDeadline {
+    started: Instant,
+    budget: Duration,
+}
+
+impl CeremonyDeadline {
+    /// Time left before this deadline, recomputed fresh against the same
+    /// `started` `Instant` every call — never cached, never reset.
+    pub(crate) fn remaining(&self) -> Duration {
+        self.budget.saturating_sub(self.started.elapsed())
+    }
+
+    pub(crate) fn is_expired(&self) -> bool {
+        self.remaining().is_zero()
+    }
+
+    /// Test-only, deterministic constructor — lets a test build a
+    /// `CeremonyDeadline` from a specific `Instant`/`Duration` pair
+    /// (e.g. already expired) without depending on real wall-clock
+    /// timing. Never reachable outside `#[cfg(test)]`.
+    #[cfg(test)]
+    pub(crate) fn for_test(started: Instant, budget: Duration) -> Self {
+        Self { started, budget }
+    }
+
+    /// Test-only: a deadline that has already expired by construction —
+    /// used by REDs that need "expired before any I/O" without a real
+    /// sleep.
+    #[cfg(test)]
+    pub(crate) fn already_expired_for_test() -> Self {
+        Self {
+            started: Instant::now() - Duration::from_secs(3600),
+            budget: Duration::from_secs(1),
+        }
+    }
+}
+
 /// `stream` and `evidence` are inseparable from the moment the adapter
 /// builds this: no `Clone`, no public accessor that returns one without
 /// the other, and the only way to get either out —
@@ -44,8 +155,10 @@ pub struct IngressEvidence {
 /// when `T` itself is `Clone` (`u32` is) — does not compile:
 ///
 /// ```compile_fail
-/// use mesh_session_core_rs::ingress::{PrevalidatedIngress, IngressEvidence};
-/// let ingress = PrevalidatedIngress::new(42u32, IngressEvidence { observed_at: 100 });
+/// use mesh_session_core_rs::ingress::{PrevalidatedIngress, IngressEvidence, CeremonyBudget, CeremonyDeadlinePolicy};
+/// use std::time::Duration;
+/// let policy = CeremonyDeadlinePolicy::new(Duration::from_secs(60)).unwrap();
+/// let ingress = PrevalidatedIngress::admit_at_accept(42u32, IngressEvidence { observed_at: 100 }, CeremonyBudget::new(Duration::from_secs(30), &policy).unwrap());
 /// let _duplicate = ingress.clone(); // no Clone impl — does not compile
 /// ```
 ///
@@ -53,8 +166,10 @@ pub struct IngressEvidence {
 /// — both fields are private:
 ///
 /// ```compile_fail
-/// use mesh_session_core_rs::ingress::{PrevalidatedIngress, IngressEvidence};
-/// let ingress = PrevalidatedIngress::new(42u32, IngressEvidence { observed_at: 100 });
+/// use mesh_session_core_rs::ingress::{PrevalidatedIngress, IngressEvidence, CeremonyBudget, CeremonyDeadlinePolicy};
+/// use std::time::Duration;
+/// let policy = CeremonyDeadlinePolicy::new(Duration::from_secs(60)).unwrap();
+/// let ingress = PrevalidatedIngress::admit_at_accept(42u32, IngressEvidence { observed_at: 100 }, CeremonyBudget::new(Duration::from_secs(30), &policy).unwrap());
 /// let _just_the_stream: u32 = ingress.stream; // field is private
 /// ```
 ///
@@ -63,32 +178,63 @@ pub struct IngressEvidence {
 /// adapter, a different crate) but not taken apart except internally:
 ///
 /// ```compile_fail
-/// use mesh_session_core_rs::ingress::{PrevalidatedIngress, IngressEvidence};
-/// let ingress = PrevalidatedIngress::new(42u32, IngressEvidence { observed_at: 100 });
+/// use mesh_session_core_rs::ingress::{PrevalidatedIngress, IngressEvidence, CeremonyBudget, CeremonyDeadlinePolicy};
+/// use std::time::Duration;
+/// let policy = CeremonyDeadlinePolicy::new(Duration::from_secs(60)).unwrap();
+/// let ingress = PrevalidatedIngress::admit_at_accept(42u32, IngressEvidence { observed_at: 100 }, CeremonyBudget::new(Duration::from_secs(30), &policy).unwrap());
 /// let _ = ingress.consume(); // pub(crate) — does not compile from outside the crate
 /// ```
 #[derive(Debug)]
 pub struct PrevalidatedIngress<T> {
     stream: T,
     evidence: IngressEvidence,
+    deadline: CeremonyDeadline,
 }
 
 impl<T> PrevalidatedIngress<T> {
-    /// Only an adapter should call this — CORE itself never fabricates
-    /// evidence for a stream it did not prefilter.
-    pub fn new(stream: T, evidence: IngressEvidence) -> Self {
-        Self { stream, evidence }
+    /// The only production constructor. Mints [`CeremonyDeadline`]
+    /// internally from `Instant::now()` — there is no parameter through
+    /// which a caller could supply their own instant, timestamp, or raw
+    /// `u64`. CORE itself never fabricates evidence for a stream it did
+    /// not prefilter, and never trusts a deadline it did not mint itself
+    /// at this exact call.
+    pub fn admit_at_accept(stream: T, evidence: IngressEvidence, budget: CeremonyBudget) -> Self {
+        Self {
+            stream,
+            evidence,
+            deadline: CeremonyDeadline {
+                started: Instant::now(),
+                budget: budget.0,
+            },
+        }
     }
 
-    /// Consume `self` once, returning the stream and its evidence as an
-    /// inseparable pair. `pub(crate)`: only this crate's own
-    /// `start_session` may call this, and it does so internally, embedding
-    /// the evidence in whatever session type it returns rather than
-    /// handing either piece back out to its own caller. Taking `self` by
-    /// value (not `&PrevalidatedIngress<T>`) also means a second call on
-    /// the same binding is a use-after-move the compiler rejects outright.
-    pub(crate) fn consume(self) -> (T, IngressEvidence) {
-        (self.stream, self.evidence)
+    /// Test-only constructor accepting a pre-built [`CeremonyDeadline`]
+    /// (e.g. already-expired, for REDs) — never reachable from a
+    /// production build.
+    #[cfg(test)]
+    pub(crate) fn new_for_test(
+        stream: T,
+        evidence: IngressEvidence,
+        deadline: CeremonyDeadline,
+    ) -> Self {
+        Self {
+            stream,
+            evidence,
+            deadline,
+        }
+    }
+
+    /// Consume `self` once, returning the stream, its evidence, and its
+    /// ceremony deadline as an inseparable triple. `pub(crate)`: only
+    /// this crate's own `start_session` may call this, and it does so
+    /// internally, embedding the evidence in whatever session type it
+    /// returns rather than handing either piece back out to its own
+    /// caller. Taking `self` by value (not `&PrevalidatedIngress<T>`)
+    /// also means a second call on the same binding is a use-after-move
+    /// the compiler rejects outright.
+    pub(crate) fn consume(self) -> (T, IngressEvidence, CeremonyDeadline) {
+        (self.stream, self.evidence, self.deadline)
     }
 }
 
@@ -96,11 +242,62 @@ impl<T> PrevalidatedIngress<T> {
 mod tests {
     use super::*;
 
+    fn test_policy() -> CeremonyDeadlinePolicy {
+        CeremonyDeadlinePolicy::new(Duration::from_secs(60)).unwrap()
+    }
+
     #[test]
     fn consume_yields_the_same_stream_and_evidence_it_was_built_from() {
-        let ingress = PrevalidatedIngress::new(42u32, IngressEvidence { observed_at: 100 });
-        let (stream, evidence) = ingress.consume();
+        let ingress = PrevalidatedIngress::admit_at_accept(
+            42u32,
+            IngressEvidence { observed_at: 100 },
+            CeremonyBudget::new(Duration::from_secs(30), &test_policy()).unwrap(),
+        );
+        let (stream, evidence, deadline) = ingress.consume();
         assert_eq!(stream, 42);
         assert_eq!(evidence.observed_at, 100);
+        assert!(!deadline.is_expired());
+    }
+
+    #[test]
+    fn zero_budget_rejected_at_construction() {
+        assert!(CeremonyBudget::new(Duration::ZERO, &test_policy()).is_none());
+    }
+
+    #[test]
+    fn zero_max_policy_rejected_at_construction() {
+        assert!(CeremonyDeadlinePolicy::new(Duration::ZERO).is_none());
+    }
+
+    #[test]
+    fn budget_at_exactly_the_policy_ceiling_is_accepted() {
+        let policy = test_policy();
+        assert!(CeremonyBudget::new(Duration::from_secs(60), &policy).is_some());
+    }
+
+    #[test]
+    fn red_budget_one_epsilon_over_the_policy_ceiling_is_rejected() {
+        let policy = test_policy();
+        assert!(
+            CeremonyBudget::new(Duration::from_secs(60) + Duration::from_nanos(1), &policy)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn red_duration_max_does_not_bypass_the_policy_ceiling() {
+        // The bug this guards against: an earlier CeremonyBudget::new
+        // checked only "nonzero", so Duration::MAX passed the check and
+        // silently produced a de-facto-unlimited budget. Duration::MAX
+        // must be rejected against ANY finite policy ceiling.
+        let policy = test_policy();
+        assert!(CeremonyBudget::new(Duration::MAX, &policy).is_none());
+    }
+
+    #[test]
+    fn already_expired_test_deadline_reports_expired() {
+        let deadline = CeremonyDeadline::already_expired_for_test();
+        assert!(deadline.is_expired());
+        assert_eq!(deadline.remaining(), Duration::ZERO);
     }
 }

@@ -28,6 +28,7 @@ use snow::{Builder, HandshakeState, TransportState};
 use zeroize::Zeroizing;
 
 use crate::error::NoiseSetupError;
+use crate::ingress::CeremonyDeadline;
 use crate::wire::{self, MAX_NOISE_HANDSHAKE_MESSAGE_LEN};
 
 pub const PROTOCOL_NAME: &str = "soyeht/mesh-session/v1";
@@ -102,9 +103,10 @@ pub(crate) struct HandshakeOutcome {
 /// v6 §1). Returns once the handshake is finished, transport mode has been
 /// entered, and the handshake hash has been captured. `pub(crate)` — see
 /// [`HandshakeOutcome`].
-pub(crate) fn run_xx_handshake<S: Read + Write>(
+pub(crate) fn run_xx_handshake<S: Read + Write + wire::DeadlineBoundedIo>(
     stream: &mut S,
     role: Role,
+    deadline: &CeremonyDeadline,
 ) -> Result<HandshakeOutcome, NoiseSetupError> {
     let mut handshake = build_handshake_state(role)?;
     // Scratch buffer sized to the same ceiling the wire layer enforces on
@@ -115,7 +117,7 @@ pub(crate) fn run_xx_handshake<S: Read + Write>(
     let mut send =
         |handshake: &mut HandshakeState, stream: &mut S| -> Result<(), NoiseSetupError> {
             let len = handshake.write_message(&[], &mut buf)?;
-            wire::write_handshake_flight(stream, &buf[..len])?;
+            wire::write_handshake_flight(stream, &buf[..len], deadline)?;
             Ok(())
         };
     // v6 §1: "Payload dos 3 flights é vazio obrigatório." snow's
@@ -127,7 +129,7 @@ pub(crate) fn run_xx_handshake<S: Read + Write>(
                 stream: &mut S,
                 buf: &mut [u8]|
      -> Result<(), NoiseSetupError> {
-        let msg = wire::read_handshake_flight(stream)?;
+        let msg = wire::read_handshake_flight(stream, deadline)?;
         let payload_len = handshake.read_message(&msg, buf)?;
         if payload_len != 0 {
             return Err(NoiseSetupError::NonEmptyHandshakePayload(payload_len));
@@ -168,6 +170,11 @@ mod tests {
     use super::*;
     use std::net::{TcpListener, TcpStream};
     use std::thread;
+    use std::time::{Duration, Instant};
+
+    fn far_future_deadline() -> CeremonyDeadline {
+        CeremonyDeadline::for_test(Instant::now(), Duration::from_secs(3600))
+    }
 
     #[test]
     fn nonempty_handshake_payload_is_rejected() {
@@ -183,10 +190,11 @@ mod tests {
             .unwrap();
 
         let mut framed = Vec::new();
-        wire::write_handshake_flight(&mut framed, &buf[..len]).unwrap();
+        wire::write_handshake_flight(&mut framed, &buf[..len], &far_future_deadline()).unwrap();
         let mut stream = Cursor::new(framed);
 
-        let err = run_xx_handshake(&mut stream, Role::Responder).unwrap_err();
+        let err =
+            run_xx_handshake(&mut stream, Role::Responder, &far_future_deadline()).unwrap_err();
         assert!(
             matches!(err, NoiseSetupError::NonEmptyHandshakePayload(n) if n == b"unexpected payload".len())
         );
@@ -207,11 +215,12 @@ mod tests {
 
         let responder = thread::spawn(move || {
             let (mut sock, _) = listener.accept().unwrap();
-            run_xx_handshake(&mut sock, Role::Responder).unwrap()
+            run_xx_handshake(&mut sock, Role::Responder, &far_future_deadline()).unwrap()
         });
 
         let mut initiator_sock = TcpStream::connect(addr).unwrap();
-        let initiator_outcome = run_xx_handshake(&mut initiator_sock, Role::Initiator).unwrap();
+        let initiator_outcome =
+            run_xx_handshake(&mut initiator_sock, Role::Initiator, &far_future_deadline()).unwrap();
         let responder_outcome = responder.join().unwrap();
 
         // Both sides must agree on the transcript hash — this is what
@@ -231,11 +240,12 @@ mod tests {
 
         let responder = thread::spawn(move || {
             let (mut sock, _) = listener.accept().unwrap();
-            run_xx_handshake(&mut sock, Role::Responder).unwrap()
+            run_xx_handshake(&mut sock, Role::Responder, &far_future_deadline()).unwrap()
         });
 
         let mut initiator_sock = TcpStream::connect(addr).unwrap();
-        let mut initiator_outcome = run_xx_handshake(&mut initiator_sock, Role::Initiator).unwrap();
+        let mut initiator_outcome =
+            run_xx_handshake(&mut initiator_sock, Role::Initiator, &far_future_deadline()).unwrap();
         let mut responder_outcome = responder.join().unwrap();
 
         let plaintext = b"post-handshake application data";
@@ -261,7 +271,7 @@ mod tests {
         let mut evil = Vec::new();
         evil.extend_from_slice(&65_536u32.to_be_bytes());
         let mut cursor = Cursor::new(evil);
-        let err = wire::read_handshake_flight(&mut cursor).unwrap_err();
+        let err = wire::read_handshake_flight(&mut cursor, &far_future_deadline()).unwrap_err();
         assert!(matches!(
             err,
             crate::error::WireError::OversizeFrame {

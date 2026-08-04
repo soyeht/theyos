@@ -105,15 +105,24 @@ pub(crate) struct ExpectedResponder {
 }
 
 /// D9 Point2 (`zain…d013ac29` §1): the digest of a `SignedMeshConnectionIntent`
-/// this crate does not implement (Point 1, out of scope). Carried here as
-/// an opaque, fixed-size, *typed* field — never a bare `[u8; 32]` that
-/// could be confused with `h_final` or a cert fingerprint — and never
-/// computed or checked against anything by this crate.
+/// (Point 1, now implemented in [`crate::intent`] — D9 carrier-B addendum).
+/// Carried here as an opaque, fixed-size, *typed* field — never a bare
+/// `[u8; 32]` that could be confused with `h_final` or a cert fingerprint.
+///
+/// **`from_bytes` is `pub(crate)` (2026-08-04, @kiana, integration
+/// addendum):** a raw, freely-constructible `ConnectionIntentDigest` must
+/// never be able to substitute for one genuinely derived from a validated,
+/// signed intent — "raw digest/bare ids não iniciam handshake". The only
+/// production path to a value of this type is `intent::intent_digest`
+/// (via `run_initiator_handshake`, which derives it internally from the
+/// same `PendingIntent` it sends as the 0x06 record) or the combined
+/// check reading one back off the wire; `from_bytes` remains only for
+/// this crate's own tests to build fixtures.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ConnectionIntentDigest([u8; 32]);
 
 impl ConnectionIntentDigest {
-    pub fn from_bytes(bytes: [u8; 32]) -> Self {
+    pub(crate) fn from_bytes(bytes: [u8; 32]) -> Self {
         Self(bytes)
     }
     pub fn as_bytes(&self) -> &[u8; 32] {
@@ -537,6 +546,13 @@ impl ProofI {
     }
     pub fn delegation(&self) -> &MeshSessionDelegation {
         &self.delegation
+    }
+    /// D9 Point2/carrier-B: the responder's combined intent check compares
+    /// this against `intent::intent_digest` of the received 0x06 record
+    /// (addendum §4 item 5) — before this accessor existed, the field was
+    /// carried but never read back out anywhere.
+    pub fn connection_intent_digest(&self) -> &ConnectionIntentDigest {
+        &self.connection_intent_digest
     }
     pub fn sig(&self) -> &[u8] {
         &self.sig
@@ -972,6 +988,21 @@ pub trait MeshSessionFrameSigner {
     /// only to mathematically self-check `sign_mesh_session_frame`'s
     /// output and to bind the signer to `local.delegation.delegated_pub`.
     fn public_key(&self) -> VerifyingKey;
+
+    /// Sign a `SignedMeshConnectionIntent` (0x06 carrier). Deliberately a
+    /// separate method, not a reuse of `sign_mesh_session_frame` (2026-08-04,
+    /// D9 carrier-B addendum): the intent is never an `AuthFrameBody` and
+    /// never passes through `sign_frame`. Reusing the SAME signer object
+    /// (and therefore the SAME physical key) for both this and
+    /// `sign_mesh_session_frame` structurally guarantees "the same K_mesh
+    /// signs both the intent and Proof-I" — addendum §4 item 3 — rather
+    /// than requiring a caller to prove it separately. Same low-S-canonical
+    /// contract as `sign_mesh_session_frame`; `intent::sign_intent_record`
+    /// re-parses and mathematically self-verifies this output too.
+    fn sign_intent(
+        &self,
+        preimage: &crate::intent::IntentSigningPreimage,
+    ) -> Result<[u8; 64], AuthFrameError>;
 }
 
 pub trait MeshSessionFrameVerifier {
@@ -980,6 +1011,17 @@ pub trait MeshSessionFrameVerifier {
         preimage: &MeshSessionFramePreimage,
         signature: &[u8; 64],
     ) -> Result<(), AuthFrameError>;
+
+    /// Verify a `SignedMeshConnectionIntent` signature — same rationale as
+    /// `MeshSessionFrameSigner::sign_intent`: a separate method so the
+    /// intent never needs to pretend to be an `AuthFrameBody` to be
+    /// verified. Returns `IntentError`, not `AuthFrameError` — this trait
+    /// method is intent-specific even though the trait itself is shared.
+    fn verify_intent(
+        &self,
+        preimage: &crate::intent::IntentSigningPreimage,
+        signature: &[u8; 64],
+    ) -> Result<(), crate::error::IntentError>;
 }
 
 /// Verifies a mesh-session frame signature against a specific, already-in-
@@ -1002,7 +1044,7 @@ pub struct RawP256FrameVerifier(pub VerifyingKey);
 /// same check runs on bytes this crate is about to trust *and* on bytes
 /// it is about to put on the wire, so a non-canonical signature can never
 /// pass in either direction.
-fn parse_low_s_signature(signature: &[u8; 64]) -> Result<Signature, AuthFrameError> {
+pub(crate) fn parse_low_s_signature(signature: &[u8; 64]) -> Result<Signature, AuthFrameError> {
     let sig =
         Signature::from_slice(signature).map_err(|_| AuthFrameError::InvalidSignatureScalar)?;
     if sig.normalize_s().is_some() {
@@ -1021,6 +1063,20 @@ impl MeshSessionFrameVerifier for RawP256FrameVerifier {
         self.0
             .verify(preimage.as_bytes(), &sig)
             .map_err(|_| AuthFrameError::BadSignature)
+    }
+
+    fn verify_intent(
+        &self,
+        preimage: &crate::intent::IntentSigningPreimage,
+        signature: &[u8; 64],
+    ) -> Result<(), crate::error::IntentError> {
+        let sig = parse_low_s_signature(signature).map_err(|e| match e {
+            AuthFrameError::HighSRejected => crate::error::IntentError::HighSRejected,
+            _ => crate::error::IntentError::InvalidSignatureScalar,
+        })?;
+        self.0
+            .verify(preimage.as_bytes(), &sig)
+            .map_err(|_| crate::error::IntentError::BadSignature)
     }
 }
 
@@ -1155,6 +1211,14 @@ mod tests {
         fn public_key(&self) -> VerifyingKey {
             *self.0.verifying_key()
         }
+        fn sign_intent(
+            &self,
+            preimage: &crate::intent::IntentSigningPreimage,
+        ) -> Result<[u8; 64], AuthFrameError> {
+            let sig: Signature = self.0.sign(preimage.as_bytes());
+            let sig = sig.normalize_s().unwrap_or(sig);
+            Ok(sig.to_bytes().into())
+        }
     }
 
     /// Stands in for a buggy/malicious K_mesh that signs a DIFFERENT
@@ -1175,6 +1239,16 @@ mod tests {
         }
         fn public_key(&self) -> VerifyingKey {
             *self.0.verifying_key()
+        }
+        fn sign_intent(
+            &self,
+            _preimage: &crate::intent::IntentSigningPreimage,
+        ) -> Result<[u8; 64], AuthFrameError> {
+            let sig: Signature = self
+                .0
+                .sign(b"not the preimage sign_intent_record asked for");
+            let sig = sig.normalize_s().unwrap_or(sig);
+            Ok(sig.to_bytes().into())
         }
     }
 
@@ -1199,6 +1273,14 @@ mod tests {
         fn public_key(&self) -> VerifyingKey {
             *self.claims_to_be.verifying_key()
         }
+        fn sign_intent(
+            &self,
+            preimage: &crate::intent::IntentSigningPreimage,
+        ) -> Result<[u8; 64], AuthFrameError> {
+            let sig: Signature = self.signs_with.sign(preimage.as_bytes());
+            let sig = sig.normalize_s().unwrap_or(sig);
+            Ok(sig.to_bytes().into())
+        }
     }
 
     /// Stands in for a real K_mesh whose backend refuses to sign — e.g.
@@ -1214,6 +1296,12 @@ mod tests {
         }
         fn public_key(&self) -> VerifyingKey {
             *self.0.verifying_key()
+        }
+        fn sign_intent(
+            &self,
+            _preimage: &crate::intent::IntentSigningPreimage,
+        ) -> Result<[u8; 64], AuthFrameError> {
+            Err(AuthFrameError::SignerFailed)
         }
     }
 
@@ -1242,6 +1330,20 @@ mod tests {
         }
         fn public_key(&self) -> VerifyingKey {
             *self.0.verifying_key()
+        }
+        fn sign_intent(
+            &self,
+            preimage: &crate::intent::IntentSigningPreimage,
+        ) -> Result<[u8; 64], AuthFrameError> {
+            for salt in 0u8..255 {
+                let mut salted = preimage.as_bytes().to_vec();
+                salted.push(salt);
+                let sig: Signature = self.0.sign(&salted);
+                if sig.normalize_s().is_some() {
+                    return Ok(sig.to_bytes().into());
+                }
+            }
+            panic!("expected at least one high-S signature among 255 probes");
         }
     }
 

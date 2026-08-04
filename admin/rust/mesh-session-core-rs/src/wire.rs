@@ -13,9 +13,10 @@
 //! - The generic `max_len`-parameterized framing functions are now
 //!   `pub(crate)` — nothing outside this crate can call them with an
 //!   arbitrary (possibly wrong, possibly attacker-influenced-by-accident)
-//!   ceiling. The *public* surface is four purpose-named entry points, each
-//!   with its ceiling baked in as a constant, so there is no parameter to
-//!   get wrong.
+//!   ceiling. The four purpose-named entry points, each with its ceiling
+//!   baked in as a constant, are `pub(crate)` too (2026-08-04, @kiana:
+//!   nothing production-facing exists yet, matching `auth_state_machine`'s
+//!   own `pub(crate)` posture pending real D-1/D-9).
 //! - `encode_typed_frame` now requires the body to already be canonical CBOR
 //!   (checked via `cbor::verify_canonical`, not assumed) and within the
 //!   frozen `MAX_CBOR_BODY_LEN` (65_518) ceiling *before* framing it — the
@@ -25,11 +26,84 @@
 //!   decode surface for real frames is `auth_frames::decode_auth_frame`,
 //!   which returns a closed `AuthFrame` enum over exactly the 5 known type
 //!   bytes rather than a raw `(u8, &[u8])` a caller could mishandle.
+//!
+//! **`DeadlineBoundedIo` (2026-08-04, @kiana, D9 carrier-B erratum1 E3,
+//! definitive):** `pub(crate)` — sealed against external no-op
+//! implementations that would defeat the whole point. Every read/write in
+//! this crate goes through an explicit byte-by-byte loop (never
+//! `read_exact`/`write_all`, which hide however many underlying syscalls
+//! they need behind one call) so the deadline is recomputed against the
+//! same monotonic [`crate::ingress::CeremonyDeadline`] before *every*
+//! individual syscall, not once per logical frame. `arm_io_deadline`
+//! returns `io::Result<()>`; a real `setsockopt` failure propagates as an
+//! error (fails closed), never silently ignored.
 
 use std::io::{Read, Write};
+use std::time::Duration;
 
 use crate::cbor;
 use crate::error::WireError;
+use crate::ingress::CeremonyDeadline;
+
+/// Arms exactly the *next* blocking read/write call with a remaining-time
+/// budget. `pub(crate)`: only this crate's own `TcpStream`/in-memory
+/// implementations exist — an external crate cannot implement a no-op
+/// version and silently defeat the deadline.
+///
+/// **`clear_io_deadline` (2026-08-04, @kiana, lifecycle CFX):** a real
+/// `TcpStream`'s `SO_RCVTIMEO`/`SO_SNDTIMEO` are socket-level options that
+/// persist across `arm_io_deadline` calls — they do not expire or reset
+/// themselves once the ceremony that armed them ends. Without an explicit
+/// clear, a freshly `Active` session would silently inherit whatever
+/// (possibly tiny, possibly already near-zero) timeout the *last* ceremony
+/// syscall happened to arm, and every later DATA/CLOSE/rekey read or write
+/// on that same socket would be bounded by a budget that was never meant
+/// to apply to them. `auth_state_machine` calls this exactly once, right
+/// before exposing an `ActiveMeshSession`, and refuses to return the
+/// session at all if clearing fails (see its construction site) — see
+/// [`Self::arm_io_deadline`]'s sibling method.
+pub(crate) trait DeadlineBoundedIo {
+    fn arm_io_deadline(&mut self, remaining: Duration) -> std::io::Result<()>;
+    /// Removes any per-call deadline previously armed, restoring
+    /// unbounded (blocking-forever, at this layer) I/O. Called exactly
+    /// once, at the ceremony→Active transition boundary.
+    fn clear_io_deadline(&mut self) -> std::io::Result<()>;
+}
+
+impl DeadlineBoundedIo for std::net::TcpStream {
+    fn arm_io_deadline(&mut self, remaining: Duration) -> std::io::Result<()> {
+        // `remaining` is always > 0 here (callers check `is_zero()` first)
+        // — `set_read_timeout`/`set_write_timeout` themselves error on a
+        // zero `Duration`, so this ordering also avoids that failure mode
+        // on the boundary case rather than working around it.
+        self.set_read_timeout(Some(remaining))?;
+        self.set_write_timeout(Some(remaining))?;
+        Ok(())
+    }
+    fn clear_io_deadline(&mut self) -> std::io::Result<()> {
+        self.set_read_timeout(None)?;
+        self.set_write_timeout(None)?;
+        Ok(())
+    }
+}
+
+impl<T> DeadlineBoundedIo for std::io::Cursor<T> {
+    fn arm_io_deadline(&mut self, _remaining: Duration) -> std::io::Result<()> {
+        Ok(()) // in-memory, never blocks — nothing to bound
+    }
+    fn clear_io_deadline(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl DeadlineBoundedIo for Vec<u8> {
+    fn arm_io_deadline(&mut self, _remaining: Duration) -> std::io::Result<()> {
+        Ok(())
+    }
+    fn clear_io_deadline(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
 
 /// Ceiling for a single length-prefixed frame during the Noise handshake.
 /// Snow XX handshake messages are always well under this; it exists purely
@@ -46,23 +120,94 @@ const TYPE_BYTE_LEN: u32 = 1;
 /// Maximum canonical-CBOR body inside one post-handshake plaintext frame.
 pub const MAX_CBOR_BODY_LEN: u32 = MAX_PLAINTEXT_LEN - TYPE_BYTE_LEN;
 
+/// Fill `buf` completely, one syscall at a time, re-arming the deadline
+/// fresh before each one (2026-08-04, @kiana: "não uma chamada read_exact
+/// ... que esconde múltiplos syscalls"). Zero remaining budget fails
+/// closed *before* attempting the syscall, not after it hangs.
+fn read_exact_with_deadline<R: Read + DeadlineBoundedIo>(
+    r: &mut R,
+    buf: &mut [u8],
+    deadline: &CeremonyDeadline,
+) -> Result<(), WireError> {
+    let mut filled = 0;
+    while filled < buf.len() {
+        let remaining = deadline.remaining();
+        if remaining.is_zero() {
+            return Err(WireError::DeadlineExceeded);
+        }
+        r.arm_io_deadline(remaining)
+            .map_err(|_| WireError::DeadlineArmingFailed)?;
+        let n = r.read(&mut buf[filled..])?;
+        if n == 0 {
+            return Err(WireError::Io(std::io::Error::from(
+                std::io::ErrorKind::UnexpectedEof,
+            )));
+        }
+        filled += n;
+        // 2026-08-04, @kiana, WIP audit (a): the armed read timeout
+        // bounds how long the syscall itself may block, but does not
+        // PROVE it returned before the deadline — a syscall that raced
+        // right up against the armed timeout (or a misbehaving/test
+        // implementation that ignores it) could still hand back a full
+        // read after the real budget was already exhausted. Recheck
+        // immediately after EVERY syscall, including the one that just
+        // completed the buffer — not only before starting the next one.
+        if deadline.is_expired() {
+            return Err(WireError::DeadlineExceeded);
+        }
+    }
+    Ok(())
+}
+
+/// Write all of `buf`, one syscall at a time — see
+/// [`read_exact_with_deadline`].
+fn write_all_with_deadline<W: Write + DeadlineBoundedIo>(
+    w: &mut W,
+    mut buf: &[u8],
+    deadline: &CeremonyDeadline,
+) -> Result<(), WireError> {
+    while !buf.is_empty() {
+        let remaining = deadline.remaining();
+        if remaining.is_zero() {
+            return Err(WireError::DeadlineExceeded);
+        }
+        w.arm_io_deadline(remaining)
+            .map_err(|_| WireError::DeadlineArmingFailed)?;
+        let n = w.write(buf)?;
+        if n == 0 {
+            return Err(WireError::Io(std::io::Error::from(
+                std::io::ErrorKind::WriteZero,
+            )));
+        }
+        buf = &buf[n..];
+        // 2026-08-04, @kiana, WIP audit (a) — see the identical note in
+        // `read_exact_with_deadline`: recheck immediately after EVERY
+        // syscall, including the final one that empties `buf`.
+        if deadline.is_expired() {
+            return Err(WireError::DeadlineExceeded);
+        }
+    }
+    Ok(())
+}
+
 /// Read one `[4-byte BE length][bytes]` frame from `r`. Internal building
 /// block only — see the module-level hardening note for why the public
 /// surface is the four fixed-ceiling wrappers below instead of this
 /// directly.
 ///
 /// The length prefix is validated against `max_len` before any
-/// length-sized buffer is allocated. `read_exact` is used for both the
-/// prefix and the body, so a reader that only delivers a few bytes per
-/// `read()` call (fragmentation) is handled transparently; a `Read` that
-/// coalesces multiple frames into one underlying buffer works too, because
-/// only the bytes belonging to this one frame are ever consumed.
-pub(crate) fn read_length_prefixed_frame<R: Read>(
+/// length-sized buffer is allocated. Fragmented/short reads are handled
+/// transparently by the explicit loop in [`read_exact_with_deadline`]; a
+/// `Read` that coalesces multiple frames into one underlying buffer works
+/// too, because only the bytes belonging to this one frame are ever
+/// consumed.
+pub(crate) fn read_length_prefixed_frame<R: Read + DeadlineBoundedIo>(
     r: &mut R,
     max_len: u32,
+    deadline: &CeremonyDeadline,
 ) -> Result<Vec<u8>, WireError> {
     let mut len_buf = [0u8; 4];
-    r.read_exact(&mut len_buf)?;
+    read_exact_with_deadline(r, &mut len_buf, deadline)?;
     let declared = u32::from_be_bytes(len_buf);
     if declared > max_len {
         return Err(WireError::OversizeFrame {
@@ -71,16 +216,17 @@ pub(crate) fn read_length_prefixed_frame<R: Read>(
         });
     }
     let mut body = vec![0u8; declared as usize];
-    r.read_exact(&mut body)?;
+    read_exact_with_deadline(r, &mut body, deadline)?;
     Ok(body)
 }
 
 /// Write one `[4-byte BE length][bytes]` frame to `w`. Internal building
 /// block only — see [`read_length_prefixed_frame`].
-pub(crate) fn write_length_prefixed_frame<W: Write>(
+pub(crate) fn write_length_prefixed_frame<W: Write + DeadlineBoundedIo>(
     w: &mut W,
     body: &[u8],
     max_len: u32,
+    deadline: &CeremonyDeadline,
 ) -> Result<(), WireError> {
     let declared = u32::try_from(body.len()).map_err(|_| WireError::OversizeFrame {
         declared: u32::MAX,
@@ -92,33 +238,49 @@ pub(crate) fn write_length_prefixed_frame<W: Write>(
             max: max_len,
         });
     }
-    w.write_all(&declared.to_be_bytes())?;
-    w.write_all(body)?;
+    write_all_with_deadline(w, &declared.to_be_bytes(), deadline)?;
+    write_all_with_deadline(w, body, deadline)?;
     Ok(())
 }
 
 /// Read one Noise handshake flight. Ceiling fixed at
-/// `MAX_NOISE_HANDSHAKE_MESSAGE_LEN` — not a parameter.
-pub fn read_handshake_flight<R: Read>(r: &mut R) -> Result<Vec<u8>, WireError> {
-    read_length_prefixed_frame(r, MAX_NOISE_HANDSHAKE_MESSAGE_LEN)
+/// `MAX_NOISE_HANDSHAKE_MESSAGE_LEN` — not a parameter. `deadline`
+/// (2026-08-04, @kiana, erratum1 E3) bounds every individual syscall this
+/// makes — see [`DeadlineBoundedIo`].
+pub(crate) fn read_handshake_flight<R: Read + DeadlineBoundedIo>(
+    r: &mut R,
+    deadline: &CeremonyDeadline,
+) -> Result<Vec<u8>, WireError> {
+    read_length_prefixed_frame(r, MAX_NOISE_HANDSHAKE_MESSAGE_LEN, deadline)
 }
 
 /// Write one Noise handshake flight. Ceiling fixed at
 /// `MAX_NOISE_HANDSHAKE_MESSAGE_LEN` — not a parameter.
-pub fn write_handshake_flight<W: Write>(w: &mut W, body: &[u8]) -> Result<(), WireError> {
-    write_length_prefixed_frame(w, body, MAX_NOISE_HANDSHAKE_MESSAGE_LEN)
+pub(crate) fn write_handshake_flight<W: Write + DeadlineBoundedIo>(
+    w: &mut W,
+    body: &[u8],
+    deadline: &CeremonyDeadline,
+) -> Result<(), WireError> {
+    write_length_prefixed_frame(w, body, MAX_NOISE_HANDSHAKE_MESSAGE_LEN, deadline)
 }
 
 /// Read one post-handshake Noise transport record (ciphertext). Ceiling
 /// fixed at `MAX_NOISE_RECORD_LEN` — not a parameter.
-pub fn read_transport_record<R: Read>(r: &mut R) -> Result<Vec<u8>, WireError> {
-    read_length_prefixed_frame(r, MAX_NOISE_RECORD_LEN)
+pub(crate) fn read_transport_record<R: Read + DeadlineBoundedIo>(
+    r: &mut R,
+    deadline: &CeremonyDeadline,
+) -> Result<Vec<u8>, WireError> {
+    read_length_prefixed_frame(r, MAX_NOISE_RECORD_LEN, deadline)
 }
 
 /// Write one post-handshake Noise transport record (ciphertext). Ceiling
 /// fixed at `MAX_NOISE_RECORD_LEN` — not a parameter.
-pub fn write_transport_record<W: Write>(w: &mut W, body: &[u8]) -> Result<(), WireError> {
-    write_length_prefixed_frame(w, body, MAX_NOISE_RECORD_LEN)
+pub(crate) fn write_transport_record<W: Write + DeadlineBoundedIo>(
+    w: &mut W,
+    body: &[u8],
+    deadline: &CeremonyDeadline,
+) -> Result<(), WireError> {
+    write_length_prefixed_frame(w, body, MAX_NOISE_RECORD_LEN, deadline)
 }
 
 /// Build a post-handshake plaintext frame: `[type_byte][canonical CBOR
@@ -168,7 +330,13 @@ pub(crate) fn decode_typed_frame(plaintext: &[u8]) -> Result<(u8, &[u8]), WireEr
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ingress::CeremonyDeadline;
     use std::io::Cursor;
+    use std::time::Instant;
+
+    fn far_future() -> CeremonyDeadline {
+        CeremonyDeadline::for_test(Instant::now(), Duration::from_secs(3600))
+    }
 
     /// A `Read` that yields the 4-byte length prefix on the first call and
     /// then errors on any further call — proves the frame reader never
@@ -191,6 +359,14 @@ mod tests {
             }
         }
     }
+    impl DeadlineBoundedIo for PrefixOnlyThenFail {
+        fn arm_io_deadline(&mut self, _remaining: Duration) -> std::io::Result<()> {
+            Ok(())
+        }
+        fn clear_io_deadline(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
 
     #[test]
     fn red44_oversize_prefix_65536_rejected_without_body_read() {
@@ -198,7 +374,7 @@ mod tests {
             prefix: 65_536u32.to_be_bytes(),
             served_prefix: false,
         };
-        let err = read_handshake_flight(&mut r).unwrap_err();
+        let err = read_handshake_flight(&mut r, &far_future()).unwrap_err();
         assert!(matches!(
             err,
             WireError::OversizeFrame {
@@ -214,7 +390,7 @@ mod tests {
             prefix: 0xFFFF_FFFFu32.to_be_bytes(),
             served_prefix: false,
         };
-        let err = read_handshake_flight(&mut r).unwrap_err();
+        let err = read_handshake_flight(&mut r, &far_future()).unwrap_err();
         assert!(matches!(
             err,
             WireError::OversizeFrame {
@@ -228,9 +404,9 @@ mod tests {
     fn valid_frame_at_the_ceiling_is_accepted() {
         let body = vec![0x42u8; MAX_NOISE_HANDSHAKE_MESSAGE_LEN as usize];
         let mut buf = Vec::new();
-        write_handshake_flight(&mut buf, &body).unwrap();
+        write_handshake_flight(&mut buf, &body, &far_future()).unwrap();
         let mut cursor = Cursor::new(buf);
-        let read_back = read_handshake_flight(&mut cursor).unwrap();
+        let read_back = read_handshake_flight(&mut cursor, &far_future()).unwrap();
         assert_eq!(read_back, body);
     }
 
@@ -238,7 +414,7 @@ mod tests {
     fn one_byte_over_the_handshake_ceiling_is_rejected() {
         let body = vec![0x42u8; MAX_NOISE_HANDSHAKE_MESSAGE_LEN as usize + 1];
         let mut buf = Vec::new();
-        let err = write_handshake_flight(&mut buf, &body).unwrap_err();
+        let err = write_handshake_flight(&mut buf, &body, &far_future()).unwrap_err();
         assert!(matches!(err, WireError::OversizeFrame { .. }));
     }
 
@@ -256,17 +432,25 @@ mod tests {
             Ok(n)
         }
     }
+    impl<'a> DeadlineBoundedIo for Dribble<'a> {
+        fn arm_io_deadline(&mut self, _remaining: Duration) -> std::io::Result<()> {
+            Ok(())
+        }
+        fn clear_io_deadline(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
 
     #[test]
     fn fragmentation_one_byte_at_a_time_still_assembles_the_frame() {
         let body = b"hello mesh session".to_vec();
         let mut framed = Vec::new();
-        write_handshake_flight(&mut framed, &body).unwrap();
+        write_handshake_flight(&mut framed, &body, &far_future()).unwrap();
         let mut r = Dribble {
             remaining: &framed,
             chunk: 1,
         };
-        let read_back = read_handshake_flight(&mut r).unwrap();
+        let read_back = read_handshake_flight(&mut r, &far_future()).unwrap();
         assert_eq!(read_back, body);
     }
 
@@ -275,13 +459,277 @@ mod tests {
         let body_a = b"flight one".to_vec();
         let body_b = b"flight two, a different length".to_vec();
         let mut framed = Vec::new();
-        write_handshake_flight(&mut framed, &body_a).unwrap();
-        write_handshake_flight(&mut framed, &body_b).unwrap();
+        write_handshake_flight(&mut framed, &body_a, &far_future()).unwrap();
+        write_handshake_flight(&mut framed, &body_b, &far_future()).unwrap();
         let mut cursor = Cursor::new(framed);
-        let first = read_handshake_flight(&mut cursor).unwrap();
-        let second = read_handshake_flight(&mut cursor).unwrap();
+        let first = read_handshake_flight(&mut cursor, &far_future()).unwrap();
+        let second = read_handshake_flight(&mut cursor, &far_future()).unwrap();
         assert_eq!(first, body_a);
         assert_eq!(second, body_b);
+    }
+
+    /// A stream double proving the anti-slow-loris contract end to end
+    /// (2026-08-04, @kiana): `arm_io_deadline` is called before EVERY
+    /// syscall (not once per frame), and once the deadline is expired,
+    /// zero further bytes are ever read — `read` itself must never even
+    /// be reached once `remaining()` is zero.
+    struct ExpiresAfterNReads {
+        remaining_reads: std::cell::Cell<usize>,
+        armed_count: std::cell::Cell<usize>,
+    }
+    impl Read for ExpiresAfterNReads {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            if self.remaining_reads.get() == 0 {
+                panic!("read() called after the deadline should already have rejected this call");
+            }
+            self.remaining_reads.set(self.remaining_reads.get() - 1);
+            buf[0] = 0xAA;
+            Ok(1)
+        }
+    }
+    impl DeadlineBoundedIo for ExpiresAfterNReads {
+        fn arm_io_deadline(&mut self, _remaining: Duration) -> std::io::Result<()> {
+            self.armed_count.set(self.armed_count.get() + 1);
+            Ok(())
+        }
+        fn clear_io_deadline(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn red_already_expired_deadline_rejects_before_the_first_syscall() {
+        // An already-expired deadline must reject the very first byte,
+        // never reach `read()` at all — proving the check happens BEFORE
+        // I/O, not as a post-hoc timeout on a call already in flight.
+        // NOTE: this alone does NOT prove the check is re-done before
+        // EVERY syscall (a deadline checked once at entry would pass this
+        // too) — see
+        // `red_deadline_expiring_between_two_syscalls_stops_the_second_one`
+        // below for that (2026-08-04, @kiana CFX: this test alone was
+        // flagged as a vacuously weak gate for that stronger claim).
+        let mut r = ExpiresAfterNReads {
+            remaining_reads: std::cell::Cell::new(0),
+            armed_count: std::cell::Cell::new(0),
+        };
+        let expired = CeremonyDeadline::already_expired_for_test();
+        let err = read_handshake_flight(&mut r, &expired).unwrap_err();
+        assert!(matches!(err, WireError::DeadlineExceeded));
+        assert_eq!(
+            r.armed_count.get(),
+            0,
+            "arm_io_deadline must not even be called once remaining() is zero"
+        );
+    }
+
+    /// Succeeds its first `read()` call, but only after real wall-clock
+    /// time has genuinely advanced past `EXPIRING_BUDGET` — chosen with a
+    /// wide safety margin so this is not a scheduling race — then panics
+    /// if ever called a second time. This is the test kiana's CFX asked
+    /// for: alive at syscall #1, provably expired before #2, proving the
+    /// budget is recomputed against the same `Instant` fresh before EVERY
+    /// syscall, not cached once per logical frame/call.
+    const EXPIRING_BUDGET: Duration = Duration::from_millis(20);
+
+    struct ExpiresBetweenSyscalls {
+        calls: std::cell::Cell<usize>,
+        armed_count: std::cell::Cell<usize>,
+    }
+    impl Read for ExpiresBetweenSyscalls {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            let call = self.calls.get();
+            self.calls.set(call + 1);
+            if call > 0 {
+                panic!(
+                    "read() called a second time — the deadline should have expired and rejected it before reaching here"
+                );
+            }
+            // Guarantee (not race) that EXPIRING_BUDGET has elapsed by
+            // the time the loop rechecks `deadline.remaining()`.
+            std::thread::sleep(EXPIRING_BUDGET * 5);
+            buf[0] = 0xAA;
+            Ok(1)
+        }
+    }
+    impl DeadlineBoundedIo for ExpiresBetweenSyscalls {
+        fn arm_io_deadline(&mut self, _remaining: Duration) -> std::io::Result<()> {
+            self.armed_count.set(self.armed_count.get() + 1);
+            Ok(())
+        }
+        fn clear_io_deadline(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn red_deadline_expiring_between_two_syscalls_stops_the_second_one() {
+        let deadline = CeremonyDeadline::for_test(Instant::now(), EXPIRING_BUDGET);
+        let mut r = ExpiresBetweenSyscalls {
+            calls: std::cell::Cell::new(0),
+            armed_count: std::cell::Cell::new(0),
+        };
+        // 2 bytes requested: the first syscall only ever fills 1, forcing
+        // the loop to recheck the deadline before a second syscall it
+        // must now refuse.
+        let mut buf = [0u8; 2];
+        let err = read_exact_with_deadline(&mut r, &mut buf, &deadline).unwrap_err();
+        assert!(matches!(err, WireError::DeadlineExceeded));
+        assert_eq!(
+            r.calls.get(),
+            1,
+            "read() must not be attempted a second time"
+        );
+        assert_eq!(
+            r.armed_count.get(),
+            1,
+            "arm_io_deadline must not be called for a syscall that never happens"
+        );
+    }
+
+    /// Returns the FULL requested buffer in a SINGLE call, but only after
+    /// sleeping past the deadline's budget — simulating a syscall that
+    /// itself raced right up to (or past) its armed timeout and still
+    /// produced a complete result. `SO_RCVTIMEO` bounds how long a real
+    /// syscall may block, but does not *prove* it returned before the
+    /// deadline; this double proves the loop rechecks `deadline` after
+    /// THIS syscall too, not only before a next one that (since the
+    /// buffer is already full) never happens (2026-08-04, @kiana, WIP
+    /// audit item (a)).
+    struct SleepsPastBudgetThenReturnsFull;
+    impl Read for SleepsPastBudgetThenReturnsFull {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            std::thread::sleep(EXPIRING_BUDGET * 5);
+            buf.fill(0xAA);
+            Ok(buf.len())
+        }
+    }
+    impl DeadlineBoundedIo for SleepsPastBudgetThenReturnsFull {
+        fn arm_io_deadline(&mut self, _remaining: Duration) -> std::io::Result<()> {
+            Ok(())
+        }
+        fn clear_io_deadline(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn red_single_read_syscall_racing_past_the_budget_and_returning_full_still_fails() {
+        let deadline = CeremonyDeadline::for_test(Instant::now(), EXPIRING_BUDGET);
+        let mut r = SleepsPastBudgetThenReturnsFull;
+        let mut buf = [0u8; 2];
+        let err = read_exact_with_deadline(&mut r, &mut buf, &deadline).unwrap_err();
+        assert!(matches!(err, WireError::DeadlineExceeded));
+    }
+
+    /// Write-side symmetric case of
+    /// `red_single_read_syscall_racing_past_the_budget_and_returning_full_still_fails`.
+    struct SleepsPastBudgetThenWritesFull;
+    impl Write for SleepsPastBudgetThenWritesFull {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            std::thread::sleep(EXPIRING_BUDGET * 5);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    impl DeadlineBoundedIo for SleepsPastBudgetThenWritesFull {
+        fn arm_io_deadline(&mut self, _remaining: Duration) -> std::io::Result<()> {
+            Ok(())
+        }
+        fn clear_io_deadline(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn red_single_write_syscall_racing_past_the_budget_and_writing_full_still_fails() {
+        let deadline = CeremonyDeadline::for_test(Instant::now(), EXPIRING_BUDGET);
+        let mut w = SleepsPastBudgetThenWritesFull;
+        let err = write_all_with_deadline(&mut w, b"ab", &deadline).unwrap_err();
+        assert!(matches!(err, WireError::DeadlineExceeded));
+    }
+
+    /// `arm_io_deadline` failing (e.g. a real `setsockopt` rejecting the
+    /// timeout) must fail the read/write closed, never silently proceed
+    /// as if unbounded.
+    struct ArmingAlwaysFails;
+    impl Read for ArmingAlwaysFails {
+        fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
+            panic!("read() must never be reached once arm_io_deadline failed");
+        }
+    }
+    impl DeadlineBoundedIo for ArmingAlwaysFails {
+        fn arm_io_deadline(&mut self, _remaining: Duration) -> std::io::Result<()> {
+            Err(std::io::Error::other("simulated setsockopt failure"))
+        }
+        fn clear_io_deadline(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn red_deadline_arming_failure_fails_closed_before_io() {
+        let mut r = ArmingAlwaysFails;
+        let err = read_handshake_flight(&mut r, &far_future()).unwrap_err();
+        assert!(matches!(err, WireError::DeadlineArmingFailed));
+    }
+
+    /// Arms successfully on the first syscall (which only partially
+    /// writes), then fails arming on the *second* — proving the write
+    /// loop re-arms fresh before every syscall rather than only guarding
+    /// the very first one (2026-08-04, @kiana CFX: "não basta setsockopt
+    /// failure no primeiro call").
+    struct WriteArmingFailsOnSecondCall {
+        arm_calls: std::cell::Cell<usize>,
+        write_calls: std::cell::Cell<usize>,
+    }
+    impl Write for WriteArmingFailsOnSecondCall {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.write_calls.set(self.write_calls.get() + 1);
+            // Always a short (1-byte) write, forcing a second syscall for
+            // any multi-byte buffer.
+            Ok(1.min(buf.len()))
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    impl DeadlineBoundedIo for WriteArmingFailsOnSecondCall {
+        fn arm_io_deadline(&mut self, _remaining: Duration) -> std::io::Result<()> {
+            let call = self.arm_calls.get();
+            self.arm_calls.set(call + 1);
+            if call == 0 {
+                Ok(())
+            } else {
+                Err(std::io::Error::other(
+                    "simulated setsockopt failure on a later syscall",
+                ))
+            }
+        }
+        fn clear_io_deadline(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn red_write_deadline_arming_failure_on_a_later_syscall_fails_closed() {
+        let mut w = WriteArmingFailsOnSecondCall {
+            arm_calls: std::cell::Cell::new(0),
+            write_calls: std::cell::Cell::new(0),
+        };
+        let err = write_all_with_deadline(&mut w, b"ab", &far_future()).unwrap_err();
+        assert!(matches!(err, WireError::DeadlineArmingFailed));
+        assert_eq!(
+            w.arm_calls.get(),
+            2,
+            "arming must be attempted fresh before the second syscall too, not just the first"
+        );
+        assert_eq!(
+            w.write_calls.get(),
+            1,
+            "write() must not be attempted once the second arm has already failed"
+        );
     }
 
     #[derive(serde::Serialize)]
