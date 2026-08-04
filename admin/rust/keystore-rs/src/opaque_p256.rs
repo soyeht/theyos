@@ -513,41 +513,72 @@ impl SlotStore {
     ///
     /// `Ok(None)` means genuinely absent. Anything unproven is an error, not
     /// a value.
-    fn secure_durable_get(&self, account: &str) -> Result<Option<Vec<u8>>, KeystoreError> {
+    /// Against a handle the caller already holds, so several reads can be
+    /// proven to describe the same store. Fetch and prove the stored bytes
+    /// through the hardened path, then interpret — the decrypt must not be
+    /// what decides existence.
+    fn secure_durable_get_in(
+        &self,
+        dir: &crate::file_backend::DirHandle,
+        account: &str,
+    ) -> Result<Option<Vec<u8>>, KeystoreError> {
+        let raw = self.file_backing().secure_durable_get_in(dir, account)?;
+        self.interpret_read(account, raw)
+    }
+
+    /// The file store underneath either backing.
+    ///
+    /// The TPM variant still rests its ciphertext in the very same hardened
+    /// file store; only the interpretation of the bytes differs. Naming that
+    /// once keeps the two read paths from drifting apart — they previously
+    /// duplicated the dispatch, which is how one of them could acquire a
+    /// retained handle while the other kept re-resolving by path.
+    fn file_backing(&self) -> &FileKeystore {
         match self {
             #[cfg(target_os = "linux")]
-            Self::SealedTpm(s) => {
-                // Fetch and prove the CIPHERTEXT through the same hardened
-                // path the file store uses, then decrypt. The decrypt must
-                // not be what decides existence.
-                match s.file_store().secure_durable_get(account)? {
-                    Some(ciphertext) => {
-                        match crate::tpm_backend::TpmKeystore::decrypt_blob(account, &ciphertext) {
-                            Ok(plain) => Ok(Some(plain)),
-                            // A blob that is present and durable but will not
-                            // decrypt is a PERMANENT condition — corruption,
-                            // a cleared or replaced TPM, a host migration —
-                            // not the transient ambiguity a caller should
-                            // retry through. Surfacing it as a security
-                            // violation keeps it distinguishable from
-                            // "unresolved, try again", which would otherwise
-                            // spin forever against material that will never
-                            // decrypt on this host.
-                            Err(e) => Err(KeystoreError::SecurityViolation {
-                                label: account.to_string(),
-                                hint: format!(
-                                    "sealed material exists and is durable but does not decrypt \
-                                     on this host ({}); this does not resolve by retrying — the \
-                                     credential must be re-added",
-                                    e.kind()
-                                ),
-                            }),
-                        }
-                    }
-                    None => Ok(None),
+            Self::SealedTpm(s) => s.file_store(),
+            Self::ApprovedFile(s) => s,
+        }
+    }
+
+    /// Turn proven-durable stored bytes into plaintext material.
+    ///
+    /// Shared by both read paths so the TPM classification cannot drift: a
+    /// blob that is present and durable but will not decrypt is a PERMANENT
+    /// condition — corruption, a cleared or replaced TPM, a host migration —
+    /// not the transient ambiguity a caller should retry through. Surfacing
+    /// it as a security violation keeps it distinguishable from "unresolved,
+    /// try again", which would otherwise spin forever against material that
+    /// will never decrypt on this host.
+    #[cfg_attr(not(target_os = "linux"), allow(clippy::unnecessary_wraps))]
+    fn interpret_read(
+        &self,
+        account: &str,
+        raw: Option<Vec<u8>>,
+    ) -> Result<Option<Vec<u8>>, KeystoreError> {
+        let Some(stored) = raw else {
+            return Ok(None);
+        };
+        match self {
+            #[cfg(target_os = "linux")]
+            Self::SealedTpm(_) => {
+                match crate::tpm_backend::TpmKeystore::decrypt_blob(account, &stored) {
+                    Ok(plain) => Ok(Some(plain)),
+                    Err(e) => Err(KeystoreError::SecurityViolation {
+                        label: account.to_string(),
+                        hint: format!(
+                            "sealed material exists and is durable but does not decrypt on this \
+                             host ({}); this does not resolve by retrying — the credential must \
+                             be re-added",
+                            e.kind()
+                        ),
+                    }),
                 }
             }
-            Self::ApprovedFile(s) => s.secure_durable_get(account),
+            Self::ApprovedFile(_) => {
+                let _ = account;
+                Ok(Some(stored))
+            }
         }
     }
 
@@ -580,12 +611,25 @@ impl SlotStore {
         }
     }
 
-    fn has_entries_besides(&self, exclude: &str) -> Result<bool, KeystoreError> {
-        match self {
-            #[cfg(target_os = "linux")]
-            Self::SealedTpm(s) => s.file_store().has_entries_besides(exclude),
-            Self::ApprovedFile(s) => s.has_entries_besides(exclude),
-        }
+    fn has_entries_besides_in(
+        &self,
+        dir: &crate::file_backend::DirHandle,
+        exclude: &str,
+    ) -> Result<bool, KeystoreError> {
+        self.file_backing().has_entries_besides_in(dir, exclude)
+    }
+
+    /// Resolve the store once for a whole operation. `open_session` creates
+    /// the hierarchy (writers); `open_session_existing` never does
+    /// (observers).
+    fn open_session(&self) -> Result<crate::file_backend::DirHandle, KeystoreError> {
+        self.file_backing().open_session()
+    }
+
+    fn open_session_existing(
+        &self,
+    ) -> Result<Option<crate::file_backend::DirHandle>, KeystoreError> {
+        self.file_backing().open_session_existing()
     }
 
     fn create_only(&self, account: &str, value: &[u8]) -> Result<CreateOutcome, KeystoreError> {
@@ -711,7 +755,18 @@ impl OpaqueP256Slots {
         //    Unresolved. A SecurityViolation (quarantine) is NOT retryable
         //    and must keep propagating: it needs a human, not another
         //    attempt.
-        if let Err(e) = self.resolve_identity() {
+        //
+        //    The whole operation runs against ONE resolution of the store,
+        //    opened here. Identity, the inspect-first read, and the binding
+        //    built afterwards all go through this handle, so they cannot
+        //    describe different directories.
+        let dir = match self.store.open_session() {
+            Ok(dir) => dir,
+            Err(KeystoreError::Io { .. }) => return Ok((SlotOutcome::Unresolved, None)),
+            Err(other) => return Err(other),
+        };
+
+        if let Err(e) = self.resolve_identity(&dir) {
             match e {
                 KeystoreError::Io { .. } => return Ok((SlotOutcome::Unresolved, None)),
                 other => return Err(other),
@@ -731,7 +786,7 @@ impl OpaqueP256Slots {
         //    An entry that cannot be proven durable surfaces as an error
         //    from the reader and is mapped to Unresolved below, never to a
         //    usable binding.
-        match self.try_binding(slot) {
+        match self.try_binding(&dir, slot) {
             Ok(Some(binding)) => return Ok((SlotOutcome::AlreadyExisted, Some(binding))),
             Ok(None) => {}
             Err(KeystoreError::Io { .. }) => return Ok((SlotOutcome::Unresolved, None)),
@@ -747,13 +802,13 @@ impl OpaqueP256Slots {
 
         match outcome? {
             CreateOutcome::CreatedDurable => {
-                let binding = self.binding_for(slot, signing.verifying_key())?;
+                let binding = self.binding_for(&dir, slot, signing.verifying_key())?;
                 Ok((SlotOutcome::Created, Some(binding)))
             }
             // Someone else won, or our own earlier attempt did. Report what
             // is ACTUALLY stored, never our discarded candidate.
             CreateOutcome::ExistingExactDurable | CreateOutcome::Conflict => {
-                match self.binding_or_unresolved(slot)? {
+                match self.binding_or_unresolved(&dir, slot)? {
                     Some(binding) => Ok((SlotOutcome::AlreadyExisted, Some(binding))),
                     None => Ok((SlotOutcome::Unresolved, None)),
                 }
@@ -763,7 +818,7 @@ impl OpaqueP256Slots {
             // Truly unresolved — refuse to mint a binding for a slot whose
             // stored state is unknown. Retry converges via the inspect-first
             // path above.
-            CreateOutcome::MayHaveTakenEffect => match self.binding_or_unresolved(slot)? {
+            CreateOutcome::MayHaveTakenEffect => match self.binding_or_unresolved(&dir, slot)? {
                 Some(binding) => Ok((SlotOutcome::AlreadyExisted, Some(binding))),
                 None => Ok((SlotOutcome::Unresolved, None)),
             },
@@ -782,10 +837,16 @@ impl OpaqueP256Slots {
         slot: &Slot<P>,
         binding: &PublicBinding<P>,
     ) -> Result<OpaqueSigner<P>, KeystoreError> {
-        self.validate_binding_scope(slot, binding)?;
+        // One resolution for the whole check. The scope validation reads the
+        // store identity and the comparison below reads the material; taken
+        // through separate path descents those two could describe different
+        // stores, which is the same class of gap the binding scope exists to
+        // close in the first place.
+        let dir = self.store.open_session()?;
+        self.validate_binding_scope(&dir, slot, binding)?;
 
-        let signing = self.load_signing_key(slot)?;
-        let derived = self.binding_for(slot, signing.verifying_key())?;
+        let signing = self.load_signing_key(&dir, slot)?;
+        let derived = self.binding_for(&dir, slot, signing.verifying_key())?;
         if derived.public_key != binding.public_key {
             return Err(KeystoreError::SecurityViolation {
                 label: slot.label.clone(),
@@ -824,8 +885,10 @@ impl OpaqueP256Slots {
         // a different slot, would authorise a delete here as soon as the
         // same scalar existed in both places — and copying a scalar between
         // stores is exactly the scenario the store identity exists for.
-        // Same checks `load_exact` makes before it will sign.
-        self.validate_binding_scope(slot, expected)?;
+        // Same checks `load_exact` makes before it will sign, against one
+        // resolution of the store.
+        let dir = self.store.open_session()?;
+        self.validate_binding_scope(&dir, slot, expected)?;
 
         // Compare and remove as ONE locked operation. Comparing then
         // deleting was check-then-act: a writer installing B between the
@@ -869,10 +932,11 @@ impl OpaqueP256Slots {
     /// happened to match.
     fn validate_binding_scope<P: Purpose>(
         &self,
+        dir: &crate::file_backend::DirHandle,
         slot: &Slot<P>,
         binding: &PublicBinding<P>,
     ) -> Result<(), KeystoreError> {
-        let expected_store = self.composed_store_id()?;
+        let expected_store = self.composed_store_id(dir)?;
         if binding.store_id != expected_store {
             return Err(KeystoreError::SecurityViolation {
                 label: slot.label.clone(),
@@ -923,8 +987,15 @@ impl OpaqueP256Slots {
     /// uses it to detect a directory or file swapped under an open fd — but
     /// it is not stable across a remount or a restore, so a binding scoped
     /// to it would stop validating after either, for no security reason.
-    fn composed_store_id(&self) -> Result<String, KeystoreError> {
-        Ok(format!("{}|{}", self.store_id, self.resolve_identity()?.0))
+    fn composed_store_id(
+        &self,
+        dir: &crate::file_backend::DirHandle,
+    ) -> Result<String, KeystoreError> {
+        Ok(format!(
+            "{}|{}",
+            self.store_id,
+            self.resolve_identity(dir)?.0
+        ))
     }
 
     /// Read this store's durable identity, creating it exactly once for a
@@ -942,19 +1013,81 @@ impl OpaqueP256Slots {
     ///   would silently re-identify keys that were bound to a different
     ///   store, which is exactly the confusion the identity exists to
     ///   prevent; refusing is recoverable, re-identifying is not.
-    fn resolve_identity(&self) -> Result<StoreIdentityV1, KeystoreError> {
+    fn resolve_identity(
+        &self,
+        dir: &crate::file_backend::DirHandle,
+    ) -> Result<StoreIdentityV1, KeystoreError> {
         if let Some(cached) = self.identity.get() {
             return Ok(cached.clone());
         }
-        let resolved = self.resolve_identity_uncached()?;
+        let resolved = self.resolve_identity_uncached(dir)?;
         // A concurrent resolve may have won; either value is the same
         // durable marker, so ignore the race loser.
         let _ = self.identity.set(resolved.clone());
         Ok(resolved)
     }
 
-    fn resolve_identity_uncached(&self) -> Result<StoreIdentityV1, KeystoreError> {
-        if let Some(raw) = self.store.secure_durable_get(STORE_IDENTITY_ACCOUNT)? {
+    /// Read the store's identity without ever WRITING one.
+    ///
+    /// `resolve_identity` mints and durably commits a marker for a store
+    /// that has none — correct for a writer establishing an identity before
+    /// its first key, and unacceptable for an observer. `inspect` must be
+    /// able to report on a store without changing it.
+    ///
+    /// `Ok(None)` means "no marker and no material" — an empty store, which
+    /// has nothing to report and nothing to quarantine. The quarantine arm
+    /// is preserved exactly: material with a missing or malformed marker is
+    /// still a `SecurityViolation`, never a silent repair.
+    ///
+    /// On success this populates the same cache `resolve_identity` uses.
+    /// That is load-bearing, not an optimisation: it means a later
+    /// `composed_store_id` on this handle returns from the cache and cannot
+    /// reach the minting branch at all. The read-only guarantee is then a
+    /// property of the code path rather than a claim about which branch
+    /// happens to be taken.
+    fn resolve_identity_readonly(
+        &self,
+        dir: &crate::file_backend::DirHandle,
+    ) -> Result<Option<StoreIdentityV1>, KeystoreError> {
+        if let Some(cached) = self.identity.get() {
+            return Ok(Some(cached.clone()));
+        }
+        if let Some(raw) = self
+            .store
+            .secure_durable_get_in(dir, STORE_IDENTITY_ACCOUNT)?
+        {
+            let parsed =
+                StoreIdentityV1::parse(&raw).ok_or_else(|| KeystoreError::SecurityViolation {
+                    label: STORE_IDENTITY_ACCOUNT.into(),
+                    hint: "store identity marker is present but malformed; refusing to guess an \
+                           identity for existing key material (quarantine)"
+                        .into(),
+                })?;
+            let _ = self.identity.set(parsed.clone());
+            return Ok(Some(parsed));
+        }
+        if self
+            .store
+            .has_entries_besides_in(dir, STORE_IDENTITY_ACCOUNT)?
+        {
+            return Err(KeystoreError::SecurityViolation {
+                label: STORE_IDENTITY_ACCOUNT.into(),
+                hint: "store holds key material but no identity marker; refusing to mint a new \
+                       one over it (quarantine) — restore the marker alongside the material"
+                    .into(),
+            });
+        }
+        Ok(None)
+    }
+
+    fn resolve_identity_uncached(
+        &self,
+        dir: &crate::file_backend::DirHandle,
+    ) -> Result<StoreIdentityV1, KeystoreError> {
+        if let Some(raw) = self
+            .store
+            .secure_durable_get_in(dir, STORE_IDENTITY_ACCOUNT)?
+        {
             return StoreIdentityV1::parse(&raw).ok_or_else(|| KeystoreError::SecurityViolation {
                 label: STORE_IDENTITY_ACCOUNT.into(),
                 hint: "store identity marker is present but malformed; refusing to guess an \
@@ -963,7 +1096,10 @@ impl OpaqueP256Slots {
             });
         }
 
-        if self.store.has_entries_besides(STORE_IDENTITY_ACCOUNT)? {
+        if self
+            .store
+            .has_entries_besides_in(dir, STORE_IDENTITY_ACCOUNT)?
+        {
             return Err(KeystoreError::SecurityViolation {
                 label: STORE_IDENTITY_ACCOUNT.into(),
                 hint: "store holds key material but no identity marker; refusing to mint a new \
@@ -980,7 +1116,10 @@ impl OpaqueP256Slots {
             CreateOutcome::CreatedDurable => Ok(minted),
             // Someone else minted first — theirs wins; read it back.
             CreateOutcome::ExistingExactDurable | CreateOutcome::Conflict => {
-                match self.store.secure_durable_get(STORE_IDENTITY_ACCOUNT)? {
+                match self
+                    .store
+                    .secure_durable_get_in(dir, STORE_IDENTITY_ACCOUNT)?
+                {
                     Some(raw) => StoreIdentityV1::parse(&raw).ok_or_else(|| {
                         KeystoreError::SecurityViolation {
                             label: STORE_IDENTITY_ACCOUNT.into(),
@@ -1012,14 +1151,33 @@ impl OpaqueP256Slots {
         &self,
         slot: &Slot<P>,
     ) -> Result<Option<PublicBinding<P>>, KeystoreError> {
+        // Open the store WITHOUT creating it. A store that does not exist
+        // has no slot and no quarantine condition, and an observer must be
+        // able to learn that without leaving a `0700` store directory behind
+        // on a host that had none — "is there a key here?" must not answer
+        // by starting a store.
+        let Some(dir) = self.store.open_session_existing()? else {
+            return Ok(None);
+        };
+
         // Resolve identity FIRST, even though an absent slot needs no
         // binding. Otherwise a store whose marker is missing or corrupt
         // while material exists reports a clean `None` for any slot that
         // happens not to exist — hiding a quarantine condition behind an
         // ordinary-looking answer, and letting a caller conclude "no key
         // here" about a store that should not be trusted at all.
-        self.resolve_identity()?;
-        self.try_binding(slot)
+        //
+        // Both reads go through the one handle opened above, so the identity
+        // that decides trust and the material that answers the question are
+        // provably the same store.
+        //
+        // `None` here is an empty store: no marker AND no material. There is
+        // no slot to report and nothing to quarantine — and, critically, no
+        // marker is minted to reach that conclusion.
+        if self.resolve_identity_readonly(&dir)?.is_none() {
+            return Ok(None);
+        }
+        self.try_binding(&dir, slot)
     }
 
     /// [`Self::try_binding`], with an unprovable store state folded into
@@ -1031,9 +1189,10 @@ impl OpaqueP256Slots {
     /// error instead of the typed outcome a caller can retry on.
     fn binding_or_unresolved<P: Purpose>(
         &self,
+        dir: &crate::file_backend::DirHandle,
         slot: &Slot<P>,
     ) -> Result<Option<PublicBinding<P>>, KeystoreError> {
-        match self.try_binding(slot) {
+        match self.try_binding(dir, slot) {
             Ok(found) => Ok(found),
             Err(KeystoreError::Io { .. }) => Ok(None),
             Err(e) => Err(e),
@@ -1041,12 +1200,24 @@ impl OpaqueP256Slots {
     }
 
     /// Binding for a slot if it currently holds a usable key.
+    ///
+    /// Takes the operation's retained handle so the material read here and
+    /// the store identity that scopes the binding come from the SAME
+    /// resolved directory. Reading them through two independent path
+    /// descents left a window in which the store could be replaced between
+    /// them, and the resulting binding would carry one store's identity over
+    /// another store's key.
     fn try_binding<P: Purpose>(
         &self,
+        dir: &crate::file_backend::DirHandle,
         slot: &Slot<P>,
     ) -> Result<Option<PublicBinding<P>>, KeystoreError> {
-        match self.load_signing_key(slot) {
-            Ok(signing) => Ok(Some(self.binding_for(slot, signing.verifying_key())?)),
+        match self.load_signing_key(dir, slot) {
+            Ok(signing) => Ok(Some(self.binding_for(
+                dir,
+                slot,
+                signing.verifying_key(),
+            )?)),
             Err(KeystoreError::NotFound { .. }) => Ok(None),
             Err(e) => Err(e),
         }
@@ -1056,8 +1227,12 @@ impl OpaqueP256Slots {
     /// exists; every path zeroizes, including the error paths — a
     /// wrong-length buffer may still be a truncated real scalar, so dropping
     /// it unzeroized would leave key material in freed memory.
-    fn load_signing_key<P: Purpose>(&self, slot: &Slot<P>) -> Result<SigningKey, KeystoreError> {
-        let Some(mut bytes) = self.store.secure_durable_get(&slot.account())? else {
+    fn load_signing_key<P: Purpose>(
+        &self,
+        dir: &crate::file_backend::DirHandle,
+        slot: &Slot<P>,
+    ) -> Result<SigningKey, KeystoreError> {
+        let Some(mut bytes) = self.store.secure_durable_get_in(dir, &slot.account())? else {
             return Err(KeystoreError::NotFound {
                 label: slot.label.clone(),
             });
@@ -1076,6 +1251,7 @@ impl OpaqueP256Slots {
 
     fn binding_for<P: Purpose>(
         &self,
+        dir: &crate::file_backend::DirHandle,
         slot: &Slot<P>,
         verifying: &VerifyingKey,
     ) -> Result<PublicBinding<P>, KeystoreError> {
@@ -1098,7 +1274,7 @@ impl OpaqueP256Slots {
             // two stores sharing a service name under different state roots
             // used to produce identical ids, so one's binding validated
             // against the other's key material.
-            store_id: self.composed_store_id()?,
+            store_id: self.composed_store_id(dir)?,
             _purpose: PhantomData,
         })
     }
@@ -1526,7 +1702,7 @@ mod tests {
         }
 
         // And the key is untouched: the opaque API still loads it.
-        assert!(s.try_binding(&slot).unwrap().is_some());
+        assert!(s.inspect(&slot).unwrap().is_some());
     }
 
     /// The reservation must not break the rest of the crate: ordinary
@@ -1600,7 +1776,7 @@ mod tests {
             "collecting A must leave B alone"
         );
         // And B really is still there.
-        assert!(s.try_binding(&slot).unwrap().is_some());
+        assert!(s.inspect(&slot).unwrap().is_some());
     }
 
     #[test]
@@ -1680,6 +1856,58 @@ mod tests {
             s.inspect(&slot).unwrap().is_none(),
             "a second inspect must still find nothing — inspecting is not creating"
         );
+
+        // The above is all this test used to assert, and it passed while
+        // `inspect` was still materialising the whole store: the creating
+        // descent ran `mkdirat` + `fsync` + `fchmod` down to the secrets
+        // directory, and an empty store then had an identity marker MINTED
+        // and durably committed just to answer "is there a key here?".
+        //
+        // Observing that no SLOT appeared never covered any of that. So
+        // assert the real property — the observation left no trace at all.
+        let after_inspect = tree(td.path());
+        assert!(
+            after_inspect.is_empty(),
+            "inspect must create no hierarchy, marker or lock; found {after_inspect:?}"
+        );
+
+        // Positive control, in the same test: the walker must be capable of
+        // seeing the things whose absence is being asserted. Without this,
+        // a walker that silently returned nothing would make the assertion
+        // above pass for the wrong reason.
+        s.create_or_inspect(&slot).unwrap();
+        let after_create = tree(td.path());
+        assert!(
+            after_create.iter().any(|p| p.contains("store-identity")),
+            "the walker must observe what a real create leaves behind — including the very \
+             identity marker asserted absent above; found {after_create:?}"
+        );
+    }
+
+    /// Every path under `root`, relative and sorted. Used to assert that a
+    /// read-only operation left the filesystem untouched.
+    fn tree(root: &std::path::Path) -> Vec<String> {
+        fn walk(dir: &std::path::Path, base: &std::path::Path, out: &mut Vec<String>) {
+            let Ok(listing) = std::fs::read_dir(dir) else {
+                return;
+            };
+            for entry in listing.flatten() {
+                let path = entry.path();
+                out.push(
+                    path.strip_prefix(base)
+                        .unwrap_or(&path)
+                        .display()
+                        .to_string(),
+                );
+                if path.is_dir() {
+                    walk(&path, base, out);
+                }
+            }
+        }
+        let mut out = Vec::new();
+        walk(root, root, &mut out);
+        out.sort();
+        out
     }
 
     /// The slot id must be fixed-width, and distinct `(purpose, label)`

@@ -221,6 +221,68 @@ impl FileKeystore {
         Ok(dir)
     }
 
+    /// Resolve this store ONCE for a whole logical operation, checking the
+    /// filesystem allowlist, and hand back the retained handle.
+    ///
+    /// Callers that need several reads to describe the SAME store — the
+    /// identity marker and the material it authorises, above all — must take
+    /// one of these and pass it to the `_in` variants, rather than making
+    /// each read resolve the path for itself.
+    pub(crate) fn open_session(&self) -> Result<DirHandle, KeystoreError> {
+        let dir = self.open_secrets_dir().map_err(|e| KeystoreError::Io {
+            kind: e.kind().to_string(),
+            hint: format!("open {}: {e}", self.secrets_dir().display()),
+        })?;
+        self.check_fs_allowed(&dir)?;
+        Ok(dir)
+    }
+
+    /// [`Self::open_session`] that creates nothing.
+    ///
+    /// `Ok(None)` means the store does not exist yet — which an observer
+    /// must be able to learn WITHOUT bringing it into being.
+    pub(crate) fn open_session_existing(&self) -> Result<Option<DirHandle>, KeystoreError> {
+        let Some(dir) = self
+            .open_secrets_dir_existing()
+            .map_err(|e| KeystoreError::Io {
+                kind: e.kind().to_string(),
+                hint: format!("open {}: {e}", self.secrets_dir().display()),
+            })?
+        else {
+            return Ok(None);
+        };
+        self.check_fs_allowed(&dir)?;
+        Ok(Some(dir))
+    }
+
+    /// Descend to the secrets directory WITHOUT creating any level of it.
+    ///
+    /// [`Self::open_secrets_dir`] materialises the hierarchy on the way
+    /// down — `mkdirat`, `fsync`, `fchmod`. That is right for a writer and
+    /// wrong for an observer, and the difference is not cosmetic: an
+    /// `inspect` built on the creating descent leaves a `0700` store
+    /// directory behind on a host that had none, so "is there a key here?"
+    /// silently answers by starting a store.
+    ///
+    /// `Ok(None)` means a level is genuinely absent. A level that exists but
+    /// is a symlink, not a directory, or unreadable still errors — see
+    /// [`DirHandle::openat_dir_nofollow_existing`].
+    fn open_secrets_dir_existing(&self) -> std::io::Result<Option<DirHandle>> {
+        let mut dir = match DirHandle::open_base(&self.state_dir) {
+            Ok(dir) => dir,
+            Err(e) if e.kind() == ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(e),
+        };
+        let service_segment = sanitize_path_segment(&self.service);
+        for name in [OsStr::new("secrets"), OsStr::new(&service_segment)] {
+            match dir.openat_dir_nofollow_existing(name)? {
+                Some(next) => dir = next,
+                None => return Ok(None),
+            }
+        }
+        Ok(Some(dir))
+    }
+
     /// Open the secrets directory and confirm its filesystem is one whose
     /// `fsync` semantics this crate is willing to make durability claims
     /// about. Fails closed BEFORE any mutation. Exposed `pub(crate)` so
@@ -393,15 +455,24 @@ impl FileKeystore {
     /// for anything this backend would not itself have written, and
     /// `Err(Io)` when the entry cannot be proven durable — never a value
     /// whose durability is unknown.
-    pub(crate) fn secure_durable_get(
+    /// Read one entry against a directory handle the CALLER
+    /// already holds and has already had checked.
+    ///
+    /// This is the ONLY entry-point shape now. The self-resolving variant
+    /// that used to sit here — open the store by path, then read — is
+    /// DELETED rather than left for convenience. With it present, reading
+    /// the store identity and then reading a slot's material were two
+    /// independent path descents, so the identity that authorised an answer
+    /// was not provably the identity of the directory the material came
+    /// from: the store could be swapped between them. Requiring the caller
+    /// to supply the handle makes "one operation, one resolution" the only
+    /// thing that can be expressed, instead of the thing callers are asked
+    /// to remember.
+    pub(crate) fn secure_durable_get_in(
         &self,
+        dir: &DirHandle,
         account: &str,
     ) -> Result<Option<Vec<u8>>, KeystoreError> {
-        let dir = self.open_secrets_dir().map_err(|e| KeystoreError::Io {
-            kind: e.kind().to_string(),
-            hint: format!("open {}: {e}", self.secrets_dir().display()),
-        })?;
-        self.check_fs_allowed(&dir)?;
         let name = Self::account_file_name(account);
         let label = || format!("{} (file fallback)", self.account_path(account).display());
 
@@ -559,24 +630,27 @@ impl FileKeystore {
     /// no identity marker must fail closed rather than have a fresh marker
     /// minted over it, and that decision requires knowing whether anything
     /// is actually there.
-    pub(crate) fn has_entries_besides(&self, exclude: &str) -> Result<bool, KeystoreError> {
+    /// Against a handle the caller holds — there is deliberately no
+    /// self-resolving variant.
+    ///
+    /// This one mattered most to convert. It used to list the store with
+    /// `fs::read_dir(self.secrets_dir())` — a fresh path resolution,
+    /// entirely outside the dirfd discipline the rest of this file keeps —
+    /// and its answer decides the quarantine rule. Asking "does material
+    /// exist?" of a re-resolved path, then answering about the store the
+    /// caller has open, is how the check ends up describing a different
+    /// directory than the one being protected.
+    pub(crate) fn has_entries_besides_in(
+        &self,
+        dir: &DirHandle,
+        exclude: &str,
+    ) -> Result<bool, KeystoreError> {
         let excluded_file = Self::account_file_name(exclude);
-        let listing = match fs::read_dir(self.secrets_dir()) {
-            Ok(listing) => listing,
-            Err(e) if e.kind() == ErrorKind::NotFound => return Ok(false),
-            Err(e) => {
-                return Err(KeystoreError::Io {
-                    kind: e.kind().to_string(),
-                    hint: format!("read_dir {}: {e}", self.secrets_dir().display()),
-                });
-            }
-        };
-        for entry in listing {
-            let entry = entry.map_err(|e| KeystoreError::Io {
-                kind: e.kind().to_string(),
-                hint: format!("read_dir {}: {e}", self.secrets_dir().display()),
-            })?;
-            let name = entry.file_name();
+        let names = dir.read_dir_names().map_err(|e| KeystoreError::Io {
+            kind: e.kind().to_string(),
+            hint: format!("read_dir {}: {e}", self.secrets_dir().display()),
+        })?;
+        for name in names {
             let name = name.to_string_lossy();
             if name == excluded_file || name == LOCK_FILE_NAME {
                 continue;
@@ -1380,8 +1454,33 @@ enum SecureOpen {
 /// lookup that a concurrent rename or symlink swap could redirect.
 #[cfg(unix)]
 #[derive(Debug)]
-struct DirHandle {
+/// A retained, validated directory descriptor.
+///
+/// `pub(crate)` on the TYPE only, so it can appear in the `_in` signatures a
+/// caller outside this module uses to keep one resolution alive across a
+/// whole operation. Every method stays module-private on purpose: outside
+/// `file_backend` this is an opaque token that can be held and handed back
+/// and nothing else. A sibling module must not be able to descend, list,
+/// unlink or publish through it — the point of handing out the handle is to
+/// stop the store being re-resolved, not to export the filesystem.
+pub(crate) struct DirHandle {
     fd: OwnedFd,
+}
+
+/// This thread's `errno` slot. The two supported targets name it
+/// differently, and `readdir` needs it cleared to separate end-of-stream
+/// from failure — `std::io::Error::last_os_error()` can only read it.
+#[cfg(all(unix, target_os = "linux"))]
+#[allow(unsafe_code)]
+unsafe fn errno_slot() -> *mut libc::c_int {
+    // SAFETY: libc's own accessor; valid for this thread.
+    unsafe { libc::__errno_location() }
+}
+#[cfg(all(unix, target_os = "macos"))]
+#[allow(unsafe_code)]
+unsafe fn errno_slot() -> *mut libc::c_int {
+    // SAFETY: libc's own accessor; valid for this thread.
+    unsafe { libc::__error() }
 }
 
 #[cfg(unix)]
@@ -1428,6 +1527,104 @@ impl DirHandle {
         Ok(Self {
             fd: unsafe { OwnedFd::from_raw_fd(fd) },
         })
+    }
+
+    /// [`Self::openat_dir_nofollow`] that reports a missing level as
+    /// `Ok(None)` instead of an error.
+    ///
+    /// This is what lets a genuinely read-only descent exist. Every other
+    /// entry point creates the hierarchy on the way down, which is correct
+    /// for a writer and wrong for an observer: an audit that has to
+    /// materialise the thing it is auditing cannot distinguish "absent" from
+    /// "absent until I looked".
+    ///
+    /// Only ENOENT is folded. ENOTDIR, ELOOP and EACCES stay errors — a
+    /// level that exists but is the wrong type, a symlink, or unreadable is
+    /// a finding, not an absence, and flattening those into `None` would
+    /// report a clean empty store for a tampered one.
+    fn openat_dir_nofollow_existing(&self, name: &OsStr) -> std::io::Result<Option<Self>> {
+        match self.openat_dir_nofollow(name) {
+            Ok(dir) => Ok(Some(dir)),
+            Err(e) if e.kind() == ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Entry names in this directory, read from the RETAINED descriptor.
+    ///
+    /// `fs::read_dir` takes a path, so using it re-resolves the directory
+    /// from the top and can therefore list a *different* directory than the
+    /// one the caller has open and has already validated. That matters most
+    /// in the one place the listing is load-bearing: the store-identity
+    /// quarantine rule decides "material exists but no marker does", and
+    /// getting that from a re-resolved path is how a swapped directory
+    /// answers a question about the wrong store.
+    ///
+    /// `closedir` closes the descriptor it is handed, so this duplicates
+    /// first and hands over the copy; `self.fd` stays owned by this handle.
+    fn read_dir_names(&self) -> std::io::Result<Vec<std::ffi::OsString>> {
+        use std::os::unix::ffi::OsStrExt;
+
+        // SAFETY: `self.fd` is an open directory fd.
+        let dup_fd = unsafe { libc::dup(self.fd.as_raw_fd()) };
+        if dup_fd < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        // SAFETY: fresh, valid, exclusively-owned descriptor; `fdopendir`
+        // takes ownership of it on success.
+        let dir = unsafe { libc::fdopendir(dup_fd) };
+        if dir.is_null() {
+            let e = std::io::Error::last_os_error();
+            // SAFETY: `fdopendir` failed, so it did not take ownership and
+            // the descriptor is still ours to close.
+            unsafe { libc::close(dup_fd) };
+            return Err(e);
+        }
+
+        // Rewind, because a duplicated descriptor shares its file offset
+        // with the original: a previous traversal would otherwise leave this
+        // one starting mid-stream and silently returning a partial listing.
+        // SAFETY: `dir` is a valid open DIR*.
+        unsafe { libc::rewinddir(dir) };
+
+        let mut names = Vec::new();
+        let mut err = None;
+        loop {
+            // `readdir` reports end-of-stream and failure the same way, so
+            // errno must be cleared first to tell them apart. Treating an
+            // error as end-of-stream would truncate the listing, and a
+            // truncated listing reads as "no material here" — the exact
+            // wrong answer for the quarantine check.
+            // SAFETY: `errno_slot` returns this thread's valid errno.
+            unsafe { *errno_slot() = 0 };
+            // SAFETY: `dir` is a valid open DIR*; the returned pointer is
+            // owned by it and stays valid until the next `readdir`.
+            let ent = unsafe { libc::readdir(dir) };
+            if ent.is_null() {
+                // SAFETY: `errno_slot` returns this thread's valid errno.
+                let e = unsafe { *errno_slot() };
+                if e != 0 {
+                    err = Some(std::io::Error::from_raw_os_error(e));
+                }
+                break;
+            }
+            // SAFETY: `ent` is non-null and points at a valid dirent owned
+            // by `dir`; `d_name` is a NUL-terminated array within it.
+            let raw = unsafe { std::ffi::CStr::from_ptr((*ent).d_name.as_ptr()) };
+            let name = OsStr::from_bytes(raw.to_bytes());
+            if name == "." || name == ".." {
+                continue;
+            }
+            names.push(name.to_os_string());
+        }
+
+        // SAFETY: `dir` is a valid open DIR* not yet closed; this also
+        // closes the duplicated descriptor it owns.
+        unsafe { libc::closedir(dir) };
+        match err {
+            Some(e) => Err(e),
+            None => Ok(names),
+        }
     }
 
     fn mkdirat(&self, name: &OsStr, mode: libc::mode_t) -> std::io::Result<()> {
