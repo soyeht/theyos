@@ -175,6 +175,20 @@
 //! `unregister_waits_for_an_in_flight_forward_before_returning`, and
 //! `generation_exhaustion_refuses_to_recover_rather_than_wrap`.
 //!
+//! ## D-9 carrier B erratum1 E4: Pending -> Ack -> Active
+//!
+//! Production admission is now deliberately two-phase.
+//! [`MeshSessionRegistry::preauthorize`]
+//! performs the exact D-1 revision/membership recheck and inserts a tracked
+//! Pending session with no forwarding gate. Its opaque, non-clonable
+//! [`PendingSessionAdmission`] holds a barrier across the one Ack write, so
+//! a concurrent revoke can announce and wait but cannot finish early. A
+//! successful write is followed immediately by
+//! [`PendingSessionAdmission::activate_if_authorized`], which rechecks the
+//! exact binding and atomically opens the gate; Drop is the fail-closed Ack
+//! failure/timeout path. The old immediate `register` helper exists only in
+//! this module's tests and is absent from production builds.
+//!
 //! D-6 (the roster-sync transport that decides *when* a new checkpoint is
 //! durably observed) is out of scope here too — see
 //! [`observe_new_checkpoint`]'s doc comment.
@@ -189,7 +203,8 @@ use crate::machine_roster_authority::{RosterSnapshotError, RosterSnapshotView, S
 /// What `MeshSessionRegistry` needs from a live session once it has
 /// decided to revoke it. No identity method — see the module doc comment,
 /// point 1. No "mark not authorized" method either — see point 2; that
-/// signal is the `SessionGate` `register` returns, not a trait call.
+/// signal is the [`SessionGate`] returned only after Pending -> Active, not
+/// a trait call.
 pub trait RevocableMeshSession {
     /// May block (e.g. network I/O for a notice). The registry never calls
     /// this while its internal lock is held.
@@ -200,8 +215,9 @@ pub trait RevocableMeshSession {
     fn close(&self);
 }
 
-/// Opaque handle to one registered session. Returned by `register`, needed
-/// by `unregister`.
+/// Opaque handle to one Active session. Returned by
+/// [`PendingSessionAdmission::activate_if_authorized`], needed by
+/// [`MeshSessionRegistry::unregister`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct SessionId(u64);
 
@@ -238,8 +254,9 @@ pub struct SessionId(u64);
 ///   admission bookkeeping below — reading it and admitting a reader
 ///   happen in the one critical section, so there is no window between the
 ///   two for a writer to interleave into;
-/// - `writer_active`: set once a writer has drained `active_readers` to
-///   zero and is doing its (here, trivial) exclusive work;
+/// - `writer_active`: set once a writer has drained both `active_readers`
+///   and the pre-Ack `pending_admissions` barrier to zero and is doing its
+///   (here, trivial) exclusive work;
 /// - `active_readers`: readers currently holding a [`ForwardingGuard`].
 ///   `revoke` waits on `drained` (a `Condvar`) until this reaches zero —
 ///   woken by a `ForwardingGuard`'s `Drop`, which decrements it under the
@@ -280,6 +297,11 @@ struct GateState {
     authorized: bool,
     writer_active: bool,
     active_readers: usize,
+    /// A pre-Ack admission owns exactly one barrier. It is deliberately
+    /// distinct from `active_readers`: Pending sessions cannot forward,
+    /// but revoke still must wait until the runtime either commits or
+    /// aborts the Ack window before it can finish closing the session.
+    pending_admissions: usize,
 }
 
 struct SessionSync {
@@ -287,23 +309,64 @@ struct SessionSync {
     /// `Mutex`.
     writer_intent: AtomicUsize,
     state: Mutex<GateState>,
-    /// Signaled by a `ForwardingGuard`'s `Drop` when `active_readers`
-    /// reaches zero, so a writer waiting in `revoke` wakes promptly rather
-    /// than polling.
+    /// Signaled when either an Active forwarding guard or a Pending Ack
+    /// barrier drains, so a writer waiting in `revoke` wakes promptly
+    /// rather than polling.
     drained: Condvar,
 }
 
 impl SessionSync {
-    fn new() -> Arc<Self> {
+    fn new_pending() -> Arc<Self> {
         Arc::new(Self {
             writer_intent: AtomicUsize::new(0),
             state: Mutex::new(GateState {
-                authorized: true,
+                authorized: false,
                 writer_active: false,
                 active_readers: 0,
+                pending_admissions: 1,
             }),
             drained: Condvar::new(),
         })
+    }
+
+    /// Consumes the Pending barrier and opens forwarding in one
+    /// per-session critical section. A writer that announced before this
+    /// transition wins; a writer that announces afterward observes an
+    /// Active session and revokes it normally.
+    fn activate_pending(&self) -> bool {
+        if self.writer_intent.load(Ordering::SeqCst) > 0 {
+            return false;
+        }
+        let Ok(mut state) = self.state.lock() else {
+            return false;
+        };
+        if self.writer_intent.load(Ordering::SeqCst) > 0
+            || state.writer_active
+            || state.pending_admissions != 1
+            || state.authorized
+        {
+            return false;
+        }
+        state.authorized = true;
+        state.pending_admissions = 0;
+        self.drained.notify_all();
+        true
+    }
+
+    /// Fail-closed completion for an Ack failure/timeout or a dropped
+    /// admission permit. Poison is recovered here for the same reason it
+    /// is recovered by `revoke`: the completion path must actually release
+    /// the barrier rather than merely pretend it did.
+    fn abort_pending(&self) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.authorized = false;
+        if state.pending_admissions > 0 {
+            state.pending_admissions -= 1;
+        }
+        self.drained.notify_all();
     }
 
     /// Writer side: announce intent on the lock-free counter (blocks every
@@ -321,7 +384,7 @@ impl SessionSync {
             Ok(state) => state,
             Err(poisoned) => poisoned.into_inner(),
         };
-        while state.active_readers > 0 {
+        while state.active_readers > 0 || state.pending_admissions > 0 {
             state = match self.drained.wait(state) {
                 Ok(next) => next,
                 Err(poisoned) => poisoned.into_inner(),
@@ -484,6 +547,72 @@ pub enum RegisterRefusal {
     SessionIdSpaceExhausted,
 }
 
+/// Why a Pending session could not become Active after the caller's Ack
+/// write completed. Every refusal is fail-closed: consuming the permit on
+/// an error removes the Pending entry, keeps forwarding disabled, and
+/// closes the supplied session handle.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ActivateRefusal {
+    RegistryUnavailable,
+    RevisionMismatch,
+    MachineRevoked,
+    MachineNotActive,
+    HandleAlreadyDropped,
+    PendingMissing,
+    RevocationInProgress,
+}
+
+struct PendingBinding {
+    hh_id: HouseholdId,
+    m_id: MachineId,
+    machine_cert_fingerprint: [u8; 32],
+    checkpoint_hash: [u8; 32],
+    checkpoint_sequence: u64,
+}
+
+/// Opaque, non-clonable proof that one session is tracked as Pending at an
+/// exact D-1 revision. The permit deliberately exposes neither a
+/// [`SessionGate`] nor the fields needed to forge another permit: Pending
+/// cannot forward. Hold it only across the single Ack write, then consume
+/// it with [`activate_if_authorized`](Self::activate_if_authorized).
+///
+/// Dropping without activation is the Ack-failure/timeout path: the
+/// registry removes the Pending entry, keeps its forwarding state closed,
+/// releases the barrier a concurrent revoke is waiting on, and closes the
+/// session handle. This type intentionally does not implement `Clone`.
+#[must_use = "dropping the admission aborts and closes the Pending session"]
+pub struct PendingSessionAdmission<'registry, H: RevocableMeshSession> {
+    registry: &'registry MeshSessionRegistry<H>,
+    session_id: SessionId,
+    binding: PendingBinding,
+    handle: Weak<H>,
+    sync: Arc<SessionSync>,
+    generation: u64,
+    completed: bool,
+}
+
+impl<H: RevocableMeshSession> PendingSessionAdmission<'_, H> {
+    /// Commits Pending -> Active and returns the only forwarding gate for
+    /// this session. Call immediately after a successful Ack `write_all`,
+    /// with no external/fallible operation in between. The exact roster
+    /// revision, active/non-revoked membership, session identity, registry
+    /// generation, and absence of an announced revoke are rechecked inside
+    /// the transition.
+    pub fn activate_if_authorized(mut self) -> Result<(SessionId, SessionGate), ActivateRefusal> {
+        let activated = self.registry.activate_pending(&self)?;
+        self.completed = true;
+        Ok(activated)
+    }
+}
+
+impl<H: RevocableMeshSession> Drop for PendingSessionAdmission<'_, H> {
+    fn drop(&mut self) {
+        if !self.completed {
+            self.registry.abort_pending(self);
+        }
+    }
+}
+
 /// Result of `observe_new_checkpoint`/`observe_authority_result`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ObserveOutcome {
@@ -560,8 +689,17 @@ enum RevisionComparison {
 struct SessionEntry<H: RevocableMeshSession> {
     m_id: MachineId,
     machine_cert_fingerprint: [u8; 32],
+    checkpoint_hash: [u8; 32],
+    checkpoint_sequence: u64,
     handle: Weak<H>,
     sync: Arc<SessionSync>,
+    lifecycle: SessionLifecycle,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SessionLifecycle {
+    Pending,
+    Active,
 }
 
 // `Live`'s bookkeeping maps vs `Unavailable`'s unit-ish payload trips
@@ -626,11 +764,11 @@ struct Inner<H: RevocableMeshSession> {
     mode: Mode<H>,
 }
 
-/// Registers live sessions by the `MachineId` of their peer and revokes them
-/// when the roster observes that machine has since been revoked, dropped,
-/// or re-certified. `Weak`, not `Arc`: the registry does not keep a session
-/// alive — a session whose last strong owner already dropped it is pruned
-/// (nothing to revoke) rather than kept alive artificially by this
+/// Tracks Pending and Active sessions by the `MachineId` of their peer and
+/// revokes them when the roster observes that machine has since been
+/// revoked, dropped, or re-certified. `Weak`, not `Arc`: the registry does
+/// not keep a session alive — a session whose last strong owner already
+/// dropped it is pruned rather than kept alive artificially by this
 /// bookkeeping.
 pub struct MeshSessionRegistry<H: RevocableMeshSession> {
     inner: Mutex<Inner<H>>,
@@ -649,8 +787,8 @@ pub struct MeshSessionRegistry<H: RevocableMeshSession> {
 impl<H: RevocableMeshSession> MeshSessionRegistry<H> {
     /// Constructs the registry already bound to a validated initial
     /// snapshot and the household it was captured for — there is no
-    /// `Default`/empty construction, so `register` can never run before any
-    /// roster state has been observed.
+    /// `Default`/empty construction, so `preauthorize` can never run before
+    /// any roster state has been observed.
     #[must_use]
     pub fn new(initial: &RosterSnapshotView) -> Self {
         Self {
@@ -668,20 +806,17 @@ impl<H: RevocableMeshSession> MeshSessionRegistry<H> {
         }
     }
 
-    /// Registers a live session, or refuses and returns why. `binding` must
-    /// name this registry's household, match the current revision exactly
-    /// (`checkpoint_hash` + `checkpoint_sequence`), and name a machine that
-    /// is active in that revision with a matching
-    /// `machine_cert_fingerprint`; `handle` must still be alive. On
-    /// success, returns the `SessionId` (for `unregister`) and an
-    /// `Arc<AtomicBool>` gate, initially `true`, that the caller's
-    /// forwarding hot path should read — the registry flips it to `false`
-    /// (never anything else) if this session is later revoked.
-    pub fn register(
+    /// Performs the final exact D-1 recheck and inserts a tracked Pending
+    /// session whose forwarding gate is closed. The returned opaque permit
+    /// is the only production route to Active; hold it across exactly one
+    /// Ack write and then consume it with
+    /// [`PendingSessionAdmission::activate_if_authorized`]. No registry
+    /// mutex remains held after this function returns.
+    pub fn preauthorize(
         &self,
         binding: &SealedBinding,
         handle: Weak<H>,
-    ) -> Result<(SessionId, SessionGate), RegisterRefusal> {
+    ) -> Result<PendingSessionAdmission<'_, H>, RegisterRefusal> {
         let Ok(mut guard) = self.inner.lock() else {
             self.registry_live.store(false, Ordering::SeqCst);
             return Err(RegisterRefusal::RegistryUnavailable);
@@ -723,27 +858,170 @@ impl<H: RevocableMeshSession> MeshSessionRegistry<H> {
             .ok_or(RegisterRefusal::SessionIdSpaceExhausted)?;
         *next_session_id = id;
         let session_id = SessionId(id);
-        let sync = SessionSync::new();
+        let sync = SessionSync::new_pending();
         sessions.insert(
             session_id,
             SessionEntry {
                 m_id: binding.m_id().clone(),
                 machine_cert_fingerprint: binding.machine_cert_fingerprint(),
-                handle,
+                checkpoint_hash: binding.checkpoint_hash(),
+                checkpoint_sequence: binding.checkpoint_sequence(),
+                handle: handle.clone(),
                 sync: Arc::clone(&sync),
+                lifecycle: SessionLifecycle::Pending,
             },
         );
         by_machine
             .entry(binding.m_id().clone())
             .or_default()
             .push(session_id);
-        let gate = SessionGate {
+        Ok(PendingSessionAdmission {
+            registry: self,
+            session_id,
+            binding: PendingBinding {
+                hh_id: binding.hh_id().clone(),
+                m_id: binding.m_id().clone(),
+                machine_cert_fingerprint: binding.machine_cert_fingerprint(),
+                checkpoint_hash: binding.checkpoint_hash(),
+                checkpoint_sequence: binding.checkpoint_sequence(),
+            },
+            handle,
             sync,
-            registry_live: Arc::clone(&self.registry_live),
             generation: self.generation.load(Ordering::SeqCst),
+            completed: false,
+        })
+    }
+
+    /// Compatibility helper for this module's pre-existing tests. It is
+    /// deliberately absent from production builds: making an immediately
+    /// Active session without an Ack boundary would be an authorization
+    /// bypass for D-9.
+    #[cfg(test)]
+    fn register(
+        &self,
+        binding: &SealedBinding,
+        handle: Weak<H>,
+    ) -> Result<(SessionId, SessionGate), RegisterRefusal> {
+        self.preauthorize(binding, handle)?
+            .activate_if_authorized()
+            .map_err(|error| match error {
+                ActivateRefusal::RevisionMismatch => RegisterRefusal::RevisionMismatch,
+                ActivateRefusal::MachineRevoked => RegisterRefusal::MachineRevoked,
+                ActivateRefusal::MachineNotActive => RegisterRefusal::MachineNotActive,
+                ActivateRefusal::HandleAlreadyDropped => RegisterRefusal::HandleAlreadyDropped,
+                ActivateRefusal::RegistryUnavailable
+                | ActivateRefusal::PendingMissing
+                | ActivateRefusal::RevocationInProgress => RegisterRefusal::RegistryUnavailable,
+            })
+    }
+
+    fn activate_pending(
+        &self,
+        admission: &PendingSessionAdmission<'_, H>,
+    ) -> Result<(SessionId, SessionGate), ActivateRefusal> {
+        let Ok(mut guard) = self.inner.lock() else {
+            self.registry_live.store(false, Ordering::SeqCst);
+            return Err(ActivateRefusal::RegistryUnavailable);
+        };
+        let _poison_guard = PoisonGuard::new(&self.registry_live);
+        if !self.registry_live.load(Ordering::SeqCst)
+            || admission.generation != self.generation.load(Ordering::SeqCst)
+        {
+            return Err(ActivateRefusal::RegistryUnavailable);
+        }
+        if admission.binding.hh_id != guard.hh_id {
+            return Err(ActivateRefusal::RegistryUnavailable);
+        }
+        if guard.last_known_revision.checkpoint_hash != admission.binding.checkpoint_hash
+            || guard.last_known_revision.checkpoint_sequence
+                != admission.binding.checkpoint_sequence
+        {
+            return Err(ActivateRefusal::RevisionMismatch);
+        }
+        if guard
+            .last_known_revision
+            .revoked
+            .contains(&admission.binding.m_id)
+        {
+            return Err(ActivateRefusal::MachineRevoked);
+        }
+        match guard
+            .last_known_revision
+            .active
+            .get(&admission.binding.m_id)
+        {
+            Some(fingerprint) if *fingerprint == admission.binding.machine_cert_fingerprint => {}
+            _ => return Err(ActivateRefusal::MachineNotActive),
+        }
+        if admission.handle.upgrade().is_none() {
+            return Err(ActivateRefusal::HandleAlreadyDropped);
+        }
+
+        let Mode::Live { sessions, .. } = &mut guard.mode else {
+            return Err(ActivateRefusal::RegistryUnavailable);
+        };
+        let Some(entry) = sessions.get_mut(&admission.session_id) else {
+            return Err(ActivateRefusal::PendingMissing);
+        };
+        if entry.lifecycle != SessionLifecycle::Pending
+            || !Arc::ptr_eq(&entry.sync, &admission.sync)
+            || entry.m_id != admission.binding.m_id
+            || entry.machine_cert_fingerprint != admission.binding.machine_cert_fingerprint
+            || entry.checkpoint_hash != admission.binding.checkpoint_hash
+            || entry.checkpoint_sequence != admission.binding.checkpoint_sequence
+        {
+            return Err(ActivateRefusal::PendingMissing);
+        }
+        if !entry.sync.activate_pending() {
+            return Err(ActivateRefusal::RevocationInProgress);
+        }
+        entry.lifecycle = SessionLifecycle::Active;
+        let gate = SessionGate {
+            sync: Arc::clone(&entry.sync),
+            registry_live: Arc::clone(&self.registry_live),
+            generation: admission.generation,
             current_generation: Arc::clone(&self.generation),
         };
-        Ok((session_id, gate))
+        Ok((admission.session_id, gate))
+    }
+
+    fn abort_pending(&self, admission: &PendingSessionAdmission<'_, H>) {
+        let mut close_handle = false;
+        if let Ok(mut guard) = self.inner.lock() {
+            let _poison_guard = PoisonGuard::new(&self.registry_live);
+            if let Mode::Live {
+                sessions,
+                by_machine,
+            } = &mut guard.mode
+            {
+                let matches_pending = sessions.get(&admission.session_id).is_some_and(|entry| {
+                    entry.lifecycle == SessionLifecycle::Pending
+                        && Arc::ptr_eq(&entry.sync, &admission.sync)
+                });
+                if matches_pending {
+                    sessions.remove(&admission.session_id);
+                    if let Some(ids) = by_machine.get_mut(&admission.binding.m_id) {
+                        ids.retain(|id| *id != admission.session_id);
+                        if ids.is_empty() {
+                            by_machine.remove(&admission.binding.m_id);
+                        }
+                    }
+                    close_handle = true;
+                }
+            }
+        } else {
+            self.registry_live.store(false, Ordering::SeqCst);
+            close_handle = true;
+        }
+
+        // Never while the registry mutex is held. This is the operation
+        // that releases a concurrently waiting revoke.
+        admission.sync.abort_pending();
+        if close_handle {
+            if let Some(handle) = admission.handle.upgrade() {
+                handle.close();
+            }
+        }
     }
 
     /// Removes `session_id` AND disables its `SessionGate` first (round 4,
@@ -796,17 +1074,20 @@ impl<H: RevocableMeshSession> MeshSessionRegistry<H> {
         }
     }
 
-    /// True if at least one still-live (upgradable) session is registered
-    /// for `m_id`. Prunes any dead `Weak` entries for `m_id` it finds along
-    /// the way (round 3, point b) — a read can observe and clean up
-    /// staleness without waiting for the next checkpoint to do it.
+    /// True if at least one still-live (upgradable) **Active** session is
+    /// registered for `m_id`. Pending entries stay tracked for revocation
+    /// but are deliberately not counted as registered/forwardable. Prunes
+    /// any dead `Weak` entries for `m_id` it finds along the way (round 3,
+    /// point b) — a read can observe and clean up staleness without waiting
+    /// for the next checkpoint to do it.
     #[must_use]
     pub fn is_registered(&self, m_id: &MachineId) -> bool {
         self.registered_count(m_id) > 0
     }
 
-    /// Count of still-live (upgradable) sessions registered for `m_id`.
-    /// Same pruning behavior as `is_registered`.
+    /// Count of still-live (upgradable) Active sessions registered for
+    /// `m_id`. Same pruning behavior as `is_registered`; Pending entries
+    /// are tracked but not included.
     #[must_use]
     pub fn registered_count(&self, m_id: &MachineId) -> usize {
         let Ok(mut guard) = self.inner.lock() else {
@@ -833,7 +1114,14 @@ impl<H: RevocableMeshSession> MeshSessionRegistry<H> {
             }
             alive
         });
-        let count = ids.len();
+        let count = ids
+            .iter()
+            .filter(|id| {
+                sessions
+                    .get(id)
+                    .is_some_and(|entry| entry.lifecycle == SessionLifecycle::Active)
+            })
+            .count();
         if ids.is_empty() {
             by_machine.remove(m_id);
         }
@@ -1431,6 +1719,259 @@ mod tests {
             .expect("active machine, matching revision, matching fingerprint");
         assert!(gate.is_authorized());
         assert!(registry.is_registered(&m_id));
+    }
+
+    #[test]
+    fn pending_has_no_forwarding_gate_and_drop_aborts_closed() {
+        let m_id = test_m_id(60);
+        let snapshot = snapshot_at(1, [1u8; 32], &[(m_id.clone(), FP_A)], &[]);
+        let registry = MeshSessionRegistry::<RecordingSession>::new(&snapshot);
+        let binding = sealed_binding(&snapshot, &m_id);
+        let session = Arc::new(RecordingSession::default());
+
+        let admission = registry
+            .preauthorize(&binding, Arc::downgrade(&session))
+            .expect("exact live binding must enter Pending");
+
+        assert_eq!(registry.registered_count(&m_id), 0);
+        assert!(admission.sync.try_enter().is_none());
+        assert!(!session.closed.load(Ordering::SeqCst));
+
+        drop(admission);
+
+        assert_eq!(registry.registered_count(&m_id), 0);
+        assert!(session.closed.load(Ordering::SeqCst));
+        let guard = registry.inner.lock().unwrap();
+        let Mode::Live { sessions, .. } = &guard.mode else {
+            panic!("registry must remain live after a local Ack abort");
+        };
+        assert!(sessions.is_empty(), "dropped permit must remove Pending");
+    }
+
+    #[test]
+    fn successful_ack_commit_is_the_only_path_that_opens_forwarding() {
+        let m_id = test_m_id(61);
+        let snapshot = snapshot_at(1, [1u8; 32], &[(m_id.clone(), FP_A)], &[]);
+        let registry = MeshSessionRegistry::<RecordingSession>::new(&snapshot);
+        let binding = sealed_binding(&snapshot, &m_id);
+        let session = Arc::new(RecordingSession::default());
+
+        let admission = registry
+            .preauthorize(&binding, Arc::downgrade(&session))
+            .expect("exact live binding must enter Pending");
+        assert_eq!(registry.registered_count(&m_id), 0);
+
+        // This call models the statement immediately following a
+        // successful write_all(Ack). There is no exposed gate before it.
+        let (_id, gate) = admission
+            .activate_if_authorized()
+            .expect("unchanged exact authority must activate");
+
+        assert_eq!(registry.registered_count(&m_id), 1);
+        let forwarding = gate
+            .try_authorize_forwarding()
+            .expect("Active gate must authorize forwarding");
+        drop(forwarding);
+        assert!(!session.closed.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn pending_permit_holds_no_registry_mutex_across_ack_io() {
+        let m_id = test_m_id(66);
+        let snapshot = snapshot_at(1, [1u8; 32], &[(m_id.clone(), FP_A)], &[]);
+        let registry = Arc::new(MeshSessionRegistry::<RecordingSession>::new(&snapshot));
+        let binding = sealed_binding(&snapshot, &m_id);
+        let session = Arc::new(RecordingSession::default());
+        let admission = registry
+            .preauthorize(&binding, Arc::downgrade(&session))
+            .unwrap();
+        let (done_tx, done_rx) = mpsc::channel();
+
+        let observer = {
+            let registry = Arc::clone(&registry);
+            let m_id = m_id.clone();
+            thread::spawn(move || {
+                done_tx.send(registry.registered_count(&m_id)).unwrap();
+            })
+        };
+
+        assert_eq!(
+            done_rx.recv_timeout(Duration::from_secs(5)).unwrap(),
+            0,
+            "Pending is not Active, but unrelated registry access must not block behind its permit"
+        );
+        observer.join().unwrap();
+        drop(admission);
+    }
+
+    #[test]
+    fn unrelated_revision_advance_between_pending_and_ack_fails_closed() {
+        let m_id = test_m_id(62);
+        let other = test_m_id(63);
+        let snapshot = snapshot_at(1, [1u8; 32], &[(m_id.clone(), FP_A)], &[]);
+        let registry = MeshSessionRegistry::<RecordingSession>::new(&snapshot);
+        let binding = sealed_binding(&snapshot, &m_id);
+        let session = Arc::new(RecordingSession::default());
+        let admission = registry
+            .preauthorize(&binding, Arc::downgrade(&session))
+            .unwrap();
+
+        let advanced = snapshot_at(2, [2u8; 32], &[(m_id.clone(), FP_A)], &[other]);
+        assert_eq!(
+            registry.observe_new_checkpoint(&advanced),
+            ObserveOutcome::Applied
+        );
+
+        let outcome = admission.activate_if_authorized();
+        assert_eq!(outcome.err(), Some(ActivateRefusal::RevisionMismatch));
+        assert_eq!(registry.registered_count(&m_id), 0);
+        assert!(session.closed.load(Ordering::SeqCst));
+    }
+
+    /// RED-CARRIER-E1-ACK-FAIL: the permit itself is the observable
+    /// barrier. Once `writer_intent` is non-zero, revoke has completed its
+    /// short registry phase and is deterministically waiting on this
+    /// Pending admission — no sleep is used as the proof of ordering.
+    #[test]
+    fn ack_failure_drops_pending_then_waiting_revoke_completes() {
+        let m_id = test_m_id(64);
+        let snapshot = snapshot_at(1, [1u8; 32], &[(m_id.clone(), FP_A)], &[]);
+        let registry = Arc::new(MeshSessionRegistry::<RecordingSession>::new(&snapshot));
+        let binding = sealed_binding(&snapshot, &m_id);
+        let session = Arc::new(RecordingSession::default());
+        let admission = registry
+            .preauthorize(&binding, Arc::downgrade(&session))
+            .unwrap();
+        let (done_tx, done_rx) = mpsc::channel();
+
+        let revoker = {
+            let registry = Arc::clone(&registry);
+            let m_id = m_id.clone();
+            thread::spawn(move || {
+                let revoked = snapshot_at(2, [2u8; 32], &[], &[m_id]);
+                let outcome = registry.observe_new_checkpoint(&revoked);
+                done_tx.send(outcome).unwrap();
+            })
+        };
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while admission.sync.writer_intent.load(Ordering::SeqCst) == 0 {
+            assert!(
+                Instant::now() < deadline,
+                "revoke never announced intent while Pending was held"
+            );
+            thread::yield_now();
+        }
+        assert!(
+            done_rx.try_recv().is_err(),
+            "revoke must not finish before Ack failure releases the permit"
+        );
+
+        // Simulated partial/failed Ack: no activation call, just unwind.
+        drop(admission);
+        assert_eq!(done_rx.recv().unwrap(), ObserveOutcome::Applied);
+        revoker.join().unwrap();
+
+        assert_eq!(registry.registered_count(&m_id), 0);
+        assert!(session.closed.load(Ordering::SeqCst));
+    }
+
+    /// RED-CARRIER-E1-REVOKE-RACE: a revoke whose writer intent is already
+    /// observable wins over an Ack completion. Consuming the permit releases
+    /// the barrier, but cannot manufacture an Active gate for the revoked
+    /// peer.
+    #[test]
+    fn revoke_announced_during_ack_window_prevents_activation() {
+        let m_id = test_m_id(65);
+        let snapshot = snapshot_at(1, [1u8; 32], &[(m_id.clone(), FP_A)], &[]);
+        let registry = Arc::new(MeshSessionRegistry::<RecordingSession>::new(&snapshot));
+        let binding = sealed_binding(&snapshot, &m_id);
+        let session = Arc::new(RecordingSession::default());
+        let admission = registry
+            .preauthorize(&binding, Arc::downgrade(&session))
+            .unwrap();
+        let (done_tx, done_rx) = mpsc::channel();
+
+        let revoker = {
+            let registry = Arc::clone(&registry);
+            let m_id = m_id.clone();
+            thread::spawn(move || {
+                let revoked = snapshot_at(2, [2u8; 32], &[], &[m_id]);
+                done_tx
+                    .send(registry.observe_new_checkpoint(&revoked))
+                    .unwrap();
+            })
+        };
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while admission.sync.writer_intent.load(Ordering::SeqCst) == 0 {
+            assert!(
+                Instant::now() < deadline,
+                "revoke never announced intent while Pending was held"
+            );
+            thread::yield_now();
+        }
+        assert!(done_rx.try_recv().is_err());
+
+        let outcome = admission.activate_if_authorized();
+        assert!(matches!(
+            outcome,
+            Err(ActivateRefusal::RevisionMismatch
+                | ActivateRefusal::MachineRevoked
+                | ActivateRefusal::RevocationInProgress
+                | ActivateRefusal::PendingMissing)
+        ));
+        assert_eq!(done_rx.recv().unwrap(), ObserveOutcome::Applied);
+        revoker.join().unwrap();
+
+        assert_eq!(registry.registered_count(&m_id), 0);
+        assert!(session.closed.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn pending_barrier_survives_poison_and_revoke_still_waits_for_abort() {
+        let m_id = test_m_id(67);
+        let snapshot = snapshot_at(1, [1u8; 32], &[(m_id.clone(), FP_A)], &[]);
+        let registry = Arc::new(MeshSessionRegistry::<RecordingSession>::new(&snapshot));
+        let binding = sealed_binding(&snapshot, &m_id);
+        let session = Arc::new(RecordingSession::default());
+        let admission = registry
+            .preauthorize(&binding, Arc::downgrade(&session))
+            .unwrap();
+
+        let sync = Arc::clone(&admission.sync);
+        let poisoner = thread::spawn(move || {
+            let _state = sync.state.lock().unwrap();
+            panic!("deliberate Pending SessionSync poison");
+        });
+        assert!(poisoner.join().is_err());
+
+        let (done_tx, done_rx) = mpsc::channel();
+        let revoker = {
+            let registry = Arc::clone(&registry);
+            let m_id = m_id.clone();
+            thread::spawn(move || {
+                let revoked = snapshot_at(2, [2u8; 32], &[], &[m_id]);
+                done_tx
+                    .send(registry.observe_new_checkpoint(&revoked))
+                    .unwrap();
+            })
+        };
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while admission.sync.writer_intent.load(Ordering::SeqCst) == 0 {
+            assert!(Instant::now() < deadline);
+            thread::yield_now();
+        }
+        assert!(
+            done_rx.try_recv().is_err(),
+            "poison must not let revoke abandon the Pending barrier"
+        );
+
+        drop(admission);
+        assert_eq!(done_rx.recv().unwrap(), ObserveOutcome::Applied);
+        revoker.join().unwrap();
+        assert!(session.closed.load(Ordering::SeqCst));
     }
 
     #[test]
