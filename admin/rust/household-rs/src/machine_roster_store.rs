@@ -23,8 +23,9 @@ use crate::machine_cert::PersonId;
 use crate::machine_roster_authority::{
     AcceptedRosterChainState, AdmissionContext, CanonicalCheckpoint, CheckpointAdmissionResult,
     HistoricalBridgeError, MachineCurrencyResult, MachineRosterCheckpointV1, ProjectionError,
-    RosterAuthorityContext, RosterCryptoError, UnavailableReason, admit_checkpoint,
-    derive_machine_currency, derive_owner_binding_from_cert, historical_reapply_next,
+    RosterAuthorityContext, RosterCryptoError, RosterSnapshotError, RosterSnapshotView,
+    UnavailableReason, admit_checkpoint, admit_current_accepted_data, derive_machine_currency,
+    derive_owner_binding_from_cert, historical_reapply_next,
 };
 use crate::owner_auth::{HouseholdAuthState, OwnerAuthError};
 
@@ -1622,6 +1623,58 @@ impl MachineRosterCoordinator {
             RosterEvidenceOutcome::Available => (outcome, Some(snapshot)),
             _ => (outcome, None),
         })
+    }
+
+    /// D-1 (B-ROSTER-ADAPTER v2 CFX-2): the same floor/owner-authority/
+    /// freshness sequence as `query_machine_currency`, stopping before the
+    /// per-machine lookup via the shared `admit_current_accepted_data`
+    /// helper (RED-R21 pins that the two never diverge), then projects a
+    /// `RosterSnapshotView` instead of a per-machine currency result.
+    pub fn current_snapshot(&self) -> Result<RosterSnapshotView, RosterSnapshotError> {
+        let lock = RosterLock::acquire(&self.state_dir, &self.hh_id)?;
+        let mut latch = self
+            .latch
+            .lock()
+            .map_err(|_| RosterSnapshotError::LatchPoisoned)?;
+
+        let chain_rec = self
+            .read_chain_record_inner(&lock)?
+            .ok_or(RosterSnapshotError::NotInitialized)?;
+
+        let policy = if chain_rec.state_kind == ChainStateKind::NoGenesis
+            && !latch.failure_latched
+            && latch.failed_target.is_none()
+        {
+            MissingFloorPolicy::InitializeNoGenesis
+        } else {
+            MissingFloorPolicy::RejectUnavailable
+        };
+
+        let floor = match self.observe_wall_floor(&lock, &mut latch, &policy) {
+            Ok(f) => f,
+            Err(FloorUnavailable) => return Err(RosterSnapshotError::ClockStateUnavailable),
+        };
+
+        let hh_ctx = HistoricalHouseholdContext {
+            hh_id: self.hh_id.clone(),
+            hh_pub: self.hh_pub.clone(),
+        };
+        let (current_state, historical_fp) = Self::rederive_current_state(&chain_rec, &hh_ctx)?;
+        let bound = self.current_owner_binding(historical_fp, floor);
+        let query_ctx = AdmissionContext {
+            authority: RosterAuthorityContext {
+                hh_pub: &self.hh_pub,
+                expected_hh_id: &self.hh_id,
+                expected_p_id: &self.owner_p_id,
+                expected_p_pub: &self.owner_p_pub,
+                effective_now: floor,
+            },
+            clock_available: true,
+            bound_owner_cert_fingerprint: bound,
+        };
+
+        let data = admit_current_accepted_data(&current_state, &query_ctx)?;
+        Ok(RosterSnapshotView::project(&self.hh_id, data))
     }
 
     fn rederive_current_state(
@@ -4782,6 +4835,219 @@ mod tests {
             1,
             "an accepted chain is state_kind 1 regardless of the machine asked about"
         );
+    }
+
+    /// D-1 (B-ROSTER-ADAPTER v2 CFX-1/CFX-2), POS-R8/RED-R17: an accepted,
+    /// fresh, owner-available chain projects a `RosterSnapshotView` whose
+    /// `checkpoint_event_head` is exactly the genesis checkpoint's
+    /// `event_head_hash`, and whose `lookup_active`/`is_revoked` reflect the
+    /// same membership `query_machine_currency` sees for the same machine.
+    #[test]
+    fn current_snapshot_reflects_active_member_with_exact_checkpoint_event_head() {
+        use crate::machine_roster_authority::{RosterAuthorityContext, sign_checkpoint};
+
+        let clock = TestClock::new(vec![Ok(1000); 4]);
+        let (rig, _dir) = make_coord_rig(clock);
+        rig.coord.provision_no_genesis().unwrap();
+
+        let root_kp = P256Keypair::from_secret_scalar(&SCALAR_ROOT).unwrap();
+        let owner_kp = P256Keypair::from_secret_scalar(&SCALAR_OWNER).unwrap();
+        let root_pub = root_kp.public();
+        let owner_pub = owner_kp.public();
+        let hh_id = derive_household_id(&root_pub);
+        let cert_bytes = rig.coord.owner_cert_bytes.clone();
+        let fp = rig.coord.owner_cert_fp;
+
+        let member_kp = P256Keypair::from_secret_scalar(&[
+            3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0,
+        ])
+        .unwrap();
+        let member_pub = member_kp.public();
+        let member_m_id = crate::ids::derive_machine_id(&member_pub);
+        let member_cert = crate::machine_cert::MachineCert::sign(
+            &root_kp,
+            &member_pub,
+            &crate::machine_cert::SignOptions {
+                hh_id: hh_id.clone(),
+                hostname: "listed-member".into(),
+                platform: crate::machine_cert::Platform::Macos,
+                joined_at: 500,
+            },
+        )
+        .unwrap();
+        let member = crate::machine_roster_authority::MachineRosterMemberV1 {
+            m_id: member_m_id.clone(),
+            m_pub: member_pub.clone(),
+            machine_cert: crate::cbor::to_canonical_vec(&member_cert).unwrap(),
+            machine_cert_fingerprint: crate::machine_roster_authority::machine_cert_fingerprint(
+                &member_cert,
+            )
+            .unwrap(),
+        };
+
+        let mut genesis = MachineRosterCheckpointV1 {
+            v: CHECKPOINT_VERSION,
+            kind: CHECKPOINT_KIND.to_string(),
+            hh_id: hh_id.clone(),
+            epoch: [0xAA; 32],
+            checkpoint_sequence: 1,
+            prev_checkpoint_hash: [0u8; 32],
+            event_sequence: 0,
+            event_head_hash: [0u8; 32],
+            mesh_log_digest: [0xDD; 32],
+            issued_at: 1000,
+            not_after: 1200,
+            owner_p_id: crate::person_cert::derive_person_id(&owner_pub),
+            owner_cert_fingerprint: fp,
+            active: vec![member],
+            revocations: vec![],
+            owner_person_cert: cert_bytes.clone(),
+            signature: P256Signature([0u8; 64]),
+        };
+        let ctx = RosterAuthorityContext {
+            hh_pub: &root_pub,
+            expected_hh_id: &hh_id,
+            expected_p_id: &crate::person_cert::derive_person_id(&owner_pub),
+            expected_p_pub: &owner_pub,
+            effective_now: 1000,
+        };
+        sign_checkpoint(&mut genesis, &owner_kp, &cert_bytes, &ctx).unwrap();
+        let genesis_bytes = crate::cbor::to_canonical_vec(&genesis).unwrap();
+        assert_eq!(
+            rig.coord.admit_checkpoint(&genesis_bytes).unwrap(),
+            PublicAdmissionOutcome::Accepted
+        );
+
+        let stranger_m_id = crate::ids::derive_machine_id(
+            &P256Keypair::from_secret_scalar(&[
+                4, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                0, 0, 0, 0,
+            ])
+            .unwrap()
+            .public(),
+        );
+
+        // RED-R21 control: current_snapshot and query_machine_currency must
+        // not diverge on the same chain state — both see the member Active.
+        assert!(matches!(
+            rig.coord.query_machine_currency(&member_m_id).unwrap(),
+            PublicCurrencyOutcome::Active { .. }
+        ));
+
+        let view = rig
+            .coord
+            .current_snapshot()
+            .expect("accepted, fresh, owner available");
+        assert_eq!(view.hh_id(), &hh_id);
+        assert_eq!(view.checkpoint_sequence(), 1);
+        assert_eq!(
+            view.checkpoint_event_head(),
+            genesis.event_head_hash,
+            "checkpoint_event_head must be exactly AcceptedRosterData::event_head_hash, not a \
+             different field"
+        );
+        assert!(view.is_active(&member_m_id));
+        assert!(view.lookup_active(&stranger_m_id).is_none());
+        assert!(!view.is_revoked(&member_m_id));
+    }
+
+    /// RED-R11..R16: `current_snapshot()` fails closed through the same six
+    /// cases as `derive_machine_currency`'s prefix, before ever looking at
+    /// per-machine membership. `NoGenesis` is the cheapest of the six to
+    /// reach without a full checkpoint fixture.
+    #[test]
+    fn current_snapshot_no_genesis_is_unavailable() {
+        let clock = TestClock::new(vec![Ok(1000)]);
+        let (rig, _dir) = make_coord_rig(clock);
+        rig.coord.provision_no_genesis().unwrap();
+        let result = rig.coord.current_snapshot();
+        assert!(matches!(
+            result,
+            Err(crate::machine_roster_authority::RosterSnapshotError::NoGenesis)
+        ));
+    }
+
+    /// RED-R14: a clock read failure must fail `current_snapshot()` closed
+    /// with `ClockStateUnavailable`, the same as it already does for
+    /// `query_machine_currency` (this test exercises `current_snapshot`
+    /// directly rather than relying only on RED-R21's equivalence proof).
+    #[test]
+    fn current_snapshot_clock_unavailable_is_unavailable() {
+        let clock = TestClock::new(vec![Err(ClockError::BeforeEpoch)]);
+        let (rig, _dir) = make_coord_rig(clock);
+        rig.coord.provision_no_genesis().unwrap();
+        let result = rig.coord.current_snapshot();
+        assert!(matches!(
+            result,
+            Err(crate::machine_roster_authority::RosterSnapshotError::ClockStateUnavailable)
+        ));
+    }
+
+    /// RED-R15 boundary, direct on `current_snapshot()`: `effective_now ==
+    /// not_after` is still fresh (`>`, not `>=`, is the staleness test) —
+    /// only strictly exceeding `not_after` is stale. Exercises both sides
+    /// of the boundary in one test so an off-by-one mutant on the
+    /// comparison operator fails one arm or the other.
+    #[test]
+    fn current_snapshot_stale_boundary_is_exclusive() {
+        use crate::machine_roster_authority::{RosterAuthorityContext, sign_checkpoint};
+
+        let not_after = 1200;
+        let clock = TestClock::new(vec![Ok(1000), Ok(not_after), Ok(not_after + 1)]);
+        let (rig, _dir) = make_coord_rig(clock);
+        rig.coord.provision_no_genesis().unwrap();
+
+        let root_kp = P256Keypair::from_secret_scalar(&SCALAR_ROOT).unwrap();
+        let owner_kp = P256Keypair::from_secret_scalar(&SCALAR_OWNER).unwrap();
+        let root_pub = root_kp.public();
+        let owner_pub = owner_kp.public();
+        let hh_id = derive_household_id(&root_pub);
+        let cert_bytes = rig.coord.owner_cert_bytes.clone();
+        let fp = rig.coord.owner_cert_fp;
+
+        let mut genesis = MachineRosterCheckpointV1 {
+            v: CHECKPOINT_VERSION,
+            kind: CHECKPOINT_KIND.to_string(),
+            hh_id: hh_id.clone(),
+            epoch: [0xAA; 32],
+            checkpoint_sequence: 1,
+            prev_checkpoint_hash: [0u8; 32],
+            event_sequence: 0,
+            event_head_hash: [0u8; 32],
+            mesh_log_digest: [0xDD; 32],
+            issued_at: 1000,
+            not_after,
+            owner_p_id: crate::person_cert::derive_person_id(&owner_pub),
+            owner_cert_fingerprint: fp,
+            active: vec![],
+            revocations: vec![],
+            owner_person_cert: cert_bytes.clone(),
+            signature: P256Signature([0u8; 64]),
+        };
+        let ctx = RosterAuthorityContext {
+            hh_pub: &root_pub,
+            expected_hh_id: &hh_id,
+            expected_p_id: &crate::person_cert::derive_person_id(&owner_pub),
+            expected_p_pub: &owner_pub,
+            effective_now: 1000,
+        };
+        sign_checkpoint(&mut genesis, &owner_kp, &cert_bytes, &ctx).unwrap();
+        let genesis_bytes = crate::cbor::to_canonical_vec(&genesis).unwrap();
+        assert_eq!(
+            rig.coord.admit_checkpoint(&genesis_bytes).unwrap(),
+            PublicAdmissionOutcome::Accepted
+        );
+
+        // effective_now == not_after: still fresh, Ok.
+        assert!(rig.coord.current_snapshot().is_ok());
+
+        // effective_now == not_after + 1: stale, Err(CheckpointStale).
+        let result = rig.coord.current_snapshot();
+        assert!(matches!(
+            result,
+            Err(crate::machine_roster_authority::RosterSnapshotError::CheckpointStale)
+        ));
     }
 
     #[test]

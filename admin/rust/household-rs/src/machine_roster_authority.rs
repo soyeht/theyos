@@ -1672,56 +1672,345 @@ pub(crate) fn historical_reapply_next(
 
 // ─── Currency derivation (internal only) ────────────────────────────────────
 
+/// Shared prefix of `derive_machine_currency`: clock → terminal chain →
+/// owner authority → stale, stopping before the per-machine lookup. Exists
+/// so `current_snapshot()` (`machine_roster_store.rs`) and
+/// `derive_machine_currency` below run through the identical admissibility
+/// check and cannot silently diverge — see RED-R21.
+pub(crate) fn admit_current_accepted_data<'a>(
+    state: &'a AcceptedRosterChainState,
+    ctx: &AdmissionContext<'_>,
+) -> Result<&'a AcceptedRosterData, UnavailableReason> {
+    if !ctx.clock_available {
+        return Err(UnavailableReason::ClockStateUnavailable);
+    }
+    match state {
+        AcceptedRosterChainState::NoGenesis => Err(UnavailableReason::NoGenesis),
+        AcceptedRosterChainState::CheckpointForkConflict { .. } => {
+            Err(UnavailableReason::CheckpointForkConflict)
+        }
+        AcceptedRosterChainState::EventForkConflict { .. } => {
+            Err(UnavailableReason::EventForkConflict)
+        }
+        AcceptedRosterChainState::Accepted(data) => {
+            if !ctx.owner_available_for_currency(&data.owner_cert_fingerprint) {
+                return Err(UnavailableReason::OwnerAuthorityUnavailable);
+            }
+            if ctx.authority.effective_now > data.not_after {
+                return Err(UnavailableReason::CheckpointStale);
+            }
+            Ok(data)
+        }
+    }
+}
+
 pub(crate) fn derive_machine_currency(
     state: &AcceptedRosterChainState,
     m_id: &MachineId,
     ctx: &AdmissionContext<'_>,
 ) -> MachineCurrencyResult {
-    // T: Priority: clock → terminal chain → owner authority → stale → per-machine
-    if !ctx.clock_available {
-        return MachineCurrencyResult::Unavailable {
-            reason: UnavailableReason::ClockStateUnavailable,
+    let data = match admit_current_accepted_data(state, ctx) {
+        Ok(data) => data,
+        Err(reason) => return MachineCurrencyResult::Unavailable { reason },
+    };
+    if let Some(rev) = data.tombstones.iter().find(|r| r.m_id == *m_id) {
+        return MachineCurrencyResult::Revoked {
+            tombstone: Box::new(rev.clone()),
         };
     }
-    match state {
-        AcceptedRosterChainState::NoGenesis => MachineCurrencyResult::Unavailable {
-            reason: UnavailableReason::NoGenesis,
-        },
-        AcceptedRosterChainState::CheckpointForkConflict { .. } => {
-            MachineCurrencyResult::Unavailable {
-                reason: UnavailableReason::CheckpointForkConflict,
-            }
+    if let Some(member) = data.active.iter().find(|m| m.m_id == *m_id) {
+        return MachineCurrencyResult::Active {
+            member: Box::new(member.clone()),
+        };
+    }
+    MachineCurrencyResult::NotListed
+}
+
+// ─── Roster snapshot view (D-1, B-ROSTER-ADAPTER v2 CFX-1/CFX-2) ────────────
+//
+// Projection of `AcceptedRosterData` exposed outside household-rs: exactly
+// the four `checkpoint_*` fields Proof-R/Proof-I v6 sign
+// (`checkpoint_hash`, `checkpoint_sequence`, `checkpoint_event_head`,
+// `not_after`), plus `hh_id`/`active`/`revoked_m_ids`. Everything else on
+// `AcceptedRosterData` (`epoch`, `prev_checkpoint_hash`, `event_sequence`,
+// `predecessor_*`, `owner_cert_fingerprint`, `genesis_basis`) does not cross
+// this boundary.
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RosterMemberView {
+    m_id: MachineId,
+    m_pub: P256PublicKey,
+    machine_cert_fingerprint: [u8; 32],
+}
+
+impl RosterMemberView {
+    #[must_use]
+    pub fn m_id(&self) -> &MachineId {
+        &self.m_id
+    }
+
+    #[must_use]
+    pub fn m_pub(&self) -> &P256PublicKey {
+        &self.m_pub
+    }
+
+    #[must_use]
+    pub fn machine_cert_fingerprint(&self) -> [u8; 32] {
+        self.machine_cert_fingerprint
+    }
+}
+
+impl From<&MachineRosterMemberV1> for RosterMemberView {
+    fn from(member: &MachineRosterMemberV1) -> Self {
+        Self {
+            m_id: member.m_id.clone(),
+            m_pub: member.m_pub.clone(),
+            machine_cert_fingerprint: member.machine_cert_fingerprint,
         }
-        AcceptedRosterChainState::EventForkConflict { .. } => MachineCurrencyResult::Unavailable {
-            reason: UnavailableReason::EventForkConflict,
-        },
-        AcceptedRosterChainState::Accepted(data) => {
-            let active = &data.active;
-            let tombstones = &data.tombstones;
-            let not_after = &data.not_after;
-            let owner_cert_fingerprint = &data.owner_cert_fingerprint;
-            if !ctx.owner_available_for_currency(owner_cert_fingerprint) {
-                return MachineCurrencyResult::Unavailable {
-                    reason: UnavailableReason::OwnerAuthorityUnavailable,
-                };
-            }
-            if ctx.authority.effective_now > *not_after {
-                return MachineCurrencyResult::Unavailable {
-                    reason: UnavailableReason::CheckpointStale,
-                };
-            }
-            if let Some(rev) = tombstones.iter().find(|r| r.m_id == *m_id) {
-                return MachineCurrencyResult::Revoked {
-                    tombstone: Box::new(rev.clone()),
-                };
-            }
-            if let Some(member) = active.iter().find(|m| m.m_id == *m_id) {
-                return MachineCurrencyResult::Active {
-                    member: Box::new(member.clone()),
-                };
-            }
-            MachineCurrencyResult::NotListed
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RosterSnapshotView {
+    hh_id: HouseholdId,
+    checkpoint_hash: [u8; 32],
+    checkpoint_sequence: u64,
+    checkpoint_event_head: [u8; 32],
+    not_after: u64,
+    active: Vec<RosterMemberView>,
+    revoked_m_ids: Vec<MachineId>,
+}
+
+impl RosterSnapshotView {
+    pub(crate) fn project(hh_id: &HouseholdId, data: &AcceptedRosterData) -> Self {
+        Self {
+            hh_id: hh_id.clone(),
+            checkpoint_hash: data.checkpoint_hash,
+            checkpoint_sequence: data.checkpoint_sequence,
+            checkpoint_event_head: data.event_head_hash,
+            not_after: data.not_after,
+            active: data.active.iter().map(RosterMemberView::from).collect(),
+            revoked_m_ids: data.tombstones.iter().map(|r| r.m_id.clone()).collect(),
         }
+    }
+
+    #[must_use]
+    pub fn hh_id(&self) -> &HouseholdId {
+        &self.hh_id
+    }
+
+    #[must_use]
+    pub fn checkpoint_hash(&self) -> [u8; 32] {
+        self.checkpoint_hash
+    }
+
+    #[must_use]
+    pub fn checkpoint_sequence(&self) -> u64 {
+        self.checkpoint_sequence
+    }
+
+    #[must_use]
+    pub fn checkpoint_event_head(&self) -> [u8; 32] {
+        self.checkpoint_event_head
+    }
+
+    #[must_use]
+    pub fn not_after(&self) -> u64 {
+        self.not_after
+    }
+
+    #[must_use]
+    pub fn lookup_active(&self, m_id: &MachineId) -> Option<&RosterMemberView> {
+        self.active.iter().find(|m| m.m_id == *m_id)
+    }
+
+    #[must_use]
+    pub fn is_revoked(&self, m_id: &MachineId) -> bool {
+        self.revoked_m_ids.iter().any(|r| r == m_id)
+    }
+
+    #[must_use]
+    pub fn revoked_m_ids(&self) -> &[MachineId] {
+        &self.revoked_m_ids
+    }
+
+    pub fn active_m_ids(&self) -> impl Iterator<Item = &MachineId> + '_ {
+        self.active.iter().map(RosterMemberView::m_id)
+    }
+
+    #[must_use]
+    pub fn is_active(&self, m_id: &MachineId) -> bool {
+        self.lookup_active(m_id).is_some() && !self.is_revoked(m_id)
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum RosterSnapshotError {
+    #[error("not initialized")]
+    NotInitialized,
+    #[error("latch poisoned")]
+    LatchPoisoned,
+    #[error(transparent)]
+    Io(#[from] crate::machine_roster_store::RosterStoreError),
+    #[error("clock state unavailable")]
+    ClockStateUnavailable,
+    #[error("no genesis")]
+    NoGenesis,
+    #[error("checkpoint fork conflict")]
+    CheckpointForkConflict,
+    #[error("event fork conflict")]
+    EventForkConflict,
+    #[error("owner authority unavailable")]
+    OwnerAuthorityUnavailable,
+    #[error("checkpoint stale")]
+    CheckpointStale,
+}
+
+impl From<UnavailableReason> for RosterSnapshotError {
+    fn from(reason: UnavailableReason) -> Self {
+        match reason {
+            UnavailableReason::ClockStateUnavailable => Self::ClockStateUnavailable,
+            UnavailableReason::NoGenesis => Self::NoGenesis,
+            UnavailableReason::CheckpointForkConflict => Self::CheckpointForkConflict,
+            UnavailableReason::EventForkConflict => Self::EventForkConflict,
+            UnavailableReason::OwnerAuthorityUnavailable => Self::OwnerAuthorityUnavailable,
+            UnavailableReason::CheckpointStale => Self::CheckpointStale,
+        }
+    }
+}
+
+// ─── Peer expectation (D-1, B-ROSTER-ADAPTER v2 CFX-4, erratum1) ────────────
+//
+// erratum1 (`daisy-b-roster-adapter-v2-erratum1.0f8b9952…`) blocks this on
+// D-9: no authenticated source for `selected_m_id` exists or is measured
+// yet, so no PUBLIC production constructor exists for `PeerExpectation` —
+// not even for the `LocalOwnerPresentSelection` variant alone. The only
+// constructor is `#[cfg(test)] pub(crate)`, same pattern already used by
+// `OwnerSiteRosterSnapshot::injected_for_harness` and
+// `MachineRosterCoordinator::from_validated_with_clock` in this codebase.
+// `ExpectedResponder`/`from_peer_expectation` are therefore out of scope
+// this round too — with no production constructor for `PeerExpectation`,
+// there is nothing that can reach them in production.
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PeerSelectionSource {
+    LocalOwnerPresentSelection,
+    // Variantes futuras (SignedConnectionIntent, AuthenticatedRendezvousOffer,
+    // ...) só entram quando D-9 tiver uma fonte medida.
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PeerExpectation {
+    checkpoint_hash: [u8; 32],
+    m_id: MachineId,
+    source: PeerSelectionSource,
+}
+
+impl PeerExpectation {
+    // NENHUM constructor público de produção existe ainda. A ausência É o
+    // gate de D-9 (RED-R23), não uma nota de aviso ao lado de um
+    // constructor que funciona.
+
+    #[cfg(test)]
+    pub(crate) fn injected_for_harness(
+        checkpoint_hash: [u8; 32],
+        m_id: MachineId,
+        source: PeerSelectionSource,
+    ) -> Self {
+        Self {
+            checkpoint_hash,
+            m_id,
+            source,
+        }
+    }
+
+    #[must_use]
+    pub fn checkpoint_hash(&self) -> [u8; 32] {
+        self.checkpoint_hash
+    }
+
+    #[must_use]
+    pub fn m_id(&self) -> &MachineId {
+        &self.m_id
+    }
+
+    #[must_use]
+    pub fn source(&self) -> PeerSelectionSource {
+        self.source
+    }
+}
+
+/// The redemption side of CFX-4: turning a `PeerExpectation` into an
+/// `ExpectedResponder` bound to a specific snapshot. `ExpectedResponder`
+/// itself does not exist anywhere else in this repository yet (`grep -rn
+/// ExpectedResponder admin/rust` is empty) — there is no bare-`MachineId`
+/// constructor to remove (RED-R19 is trivially true: it never existed).
+///
+/// This *is* implementable and testable now, independent of D-9/erratum1:
+/// the only way to obtain a `PeerExpectation` to pass in is
+/// `#[cfg(test)] injected_for_harness` (no production constructor exists),
+/// so `from_peer_expectation` has no production caller regardless of
+/// whether this function itself is gated — gating the function would only
+/// hide its own logic from tests. What erratum1 blocks is `PeerExpectation`
+/// acquiring a production source; it does not need this pairing check
+/// itself to also be hidden.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ExpectedResponder {
+    hh_id: HouseholdId,
+    m_id: MachineId,
+    cert_fingerprint: [u8; 32],
+}
+
+impl ExpectedResponder {
+    #[must_use]
+    pub fn hh_id(&self) -> &HouseholdId {
+        &self.hh_id
+    }
+
+    #[must_use]
+    pub fn m_id(&self) -> &MachineId {
+        &self.m_id
+    }
+
+    #[must_use]
+    pub fn cert_fingerprint(&self) -> [u8; 32] {
+        self.cert_fingerprint
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ExpectedResponderError {
+    /// `expectation` was sealed against a different snapshot revision than
+    /// `snapshot` — checked FIRST: a stale/foreign expectation must not
+    /// fall through to "not active" or "revoked" and produce a misleading
+    /// reason for what is really a pairing error (RED-R18).
+    ExpectationSnapshotMismatch,
+    MachineRevoked,
+    MachineNotActive,
+}
+
+impl ExpectedResponder {
+    /// Order matters and is pinned by test: checkpoint-hash mismatch first
+    /// (RED-R18 — a pairing error, not a membership error), then revoked,
+    /// then not-active, then success with the member's fingerprint.
+    pub fn from_peer_expectation(
+        expectation: PeerExpectation,
+        snapshot: &RosterSnapshotView,
+    ) -> Result<Self, ExpectedResponderError> {
+        if expectation.checkpoint_hash != snapshot.checkpoint_hash() {
+            return Err(ExpectedResponderError::ExpectationSnapshotMismatch);
+        }
+        if snapshot.is_revoked(&expectation.m_id) {
+            return Err(ExpectedResponderError::MachineRevoked);
+        }
+        let member = snapshot
+            .lookup_active(&expectation.m_id)
+            .ok_or(ExpectedResponderError::MachineNotActive)?;
+        Ok(Self {
+            hh_id: snapshot.hh_id().clone(),
+            m_id: expectation.m_id,
+            cert_fingerprint: member.machine_cert_fingerprint(),
+        })
     }
 }
 
@@ -8522,5 +8811,195 @@ mod tests {
         );
         let rev_hash = hex::decode(f["revocation"]["event_hash_hex"].as_str().unwrap()).unwrap();
         assert_eq!(refresh.event_head_hash.as_slice(), rev_hash.as_slice());
+    }
+
+    /// D-1 (B-ROSTER-ADAPTER v2 CFX-4, erratum1): `PeerExpectation` has no
+    /// production constructor — this exercises the only implementable code
+    /// this round, the `#[cfg(test)]` harness constructor, and pins that it
+    /// round-trips the fields it was given. RED-R23 (no production
+    /// constructor exists at all) is a compile-time property, not a runtime
+    /// assertion: it is proven by `from_snapshot` simply not existing
+    /// outside `#[cfg(test)]` anywhere in this file.
+    #[test]
+    fn peer_expectation_test_constructor_round_trips_its_fields() {
+        let m_id = MachineId("m-peer-expectation-test".to_string());
+        let checkpoint_hash = [9u8; 32];
+        let expectation = PeerExpectation::injected_for_harness(
+            checkpoint_hash,
+            m_id.clone(),
+            PeerSelectionSource::LocalOwnerPresentSelection,
+        );
+        assert_eq!(expectation.checkpoint_hash(), checkpoint_hash);
+        assert_eq!(expectation.m_id(), &m_id);
+        assert_eq!(
+            expectation.source(),
+            PeerSelectionSource::LocalOwnerPresentSelection
+        );
+    }
+
+    /// RED-R17/POS-R8, mutant-proof: `checkpoint_hash`, `event_head_hash`
+    /// and `prev_checkpoint_hash` are three DISTINCT byte patterns here
+    /// (0xAA / 0xBB / 0xCC), not all-zero as a fresh-genesis fixture would
+    /// naturally have them. A `project()` that wired
+    /// `checkpoint_event_head` to `checkpoint_hash` or
+    /// `prev_checkpoint_hash` by mistake would still pass a test built on
+    /// an all-zero genesis (every field reads back as the same zero value)
+    /// but fails this one, since the three fields disagree.
+    #[test]
+    fn project_wires_checkpoint_event_head_to_event_head_hash_specifically() {
+        let hh_id = HouseholdId("hh-project-field-wiring-test".to_string());
+        let data = AcceptedRosterData {
+            epoch: [1u8; 32],
+            checkpoint_sequence: 7,
+            checkpoint_hash: [0xAAu8; 32],
+            prev_checkpoint_hash: [0xCCu8; 32],
+            event_sequence: 3,
+            event_head_hash: [0xBBu8; 32],
+            predecessor_event_sequence: 2,
+            predecessor_event_head_hash: [0xDDu8; 32],
+            issued_at: 1,
+            not_after: 999,
+            owner_cert_fingerprint: [4u8; 32],
+            genesis_basis: VerifiedGenesisRoster {
+                epoch: [1u8; 32],
+                members: Vec::new(),
+            },
+            active: Vec::new(),
+            tombstones: Vec::new(),
+        };
+        let view = RosterSnapshotView::project(&hh_id, &data);
+        assert_eq!(view.checkpoint_hash(), [0xAAu8; 32]);
+        assert_eq!(view.checkpoint_event_head(), [0xBBu8; 32]);
+        assert_ne!(view.checkpoint_event_head(), view.checkpoint_hash());
+        assert_ne!(view.checkpoint_event_head(), data.prev_checkpoint_hash);
+        assert_eq!(view.checkpoint_sequence(), 7);
+        assert_eq!(view.not_after(), 999);
+    }
+
+    fn test_snapshot_for_responder(
+        checkpoint_hash: [u8; 32],
+        active_m_id: Option<&MachineId>,
+        revoked_m_id: Option<&MachineId>,
+    ) -> RosterSnapshotView {
+        let hh_id = HouseholdId("hh-expected-responder-test".to_string());
+        let active = active_m_id
+            .map(|m_id| MachineRosterMemberV1 {
+                m_id: m_id.clone(),
+                m_pub: crate::keys::P256PublicKey([0x02; 33]),
+                machine_cert: Vec::new(),
+                machine_cert_fingerprint: [0xAAu8; 32],
+            })
+            .into_iter()
+            .collect();
+        let tombstones = revoked_m_id
+            .map(|m_id| MachineRosterRevocationV1 {
+                v: 1,
+                kind: "machine_roster_revocation_v1".to_string(),
+                hh_id: hh_id.clone(),
+                epoch: [1u8; 32],
+                sequence: 1,
+                prev_event_hash: [0u8; 32],
+                m_id: m_id.clone(),
+                m_pub: crate::keys::P256PublicKey([0x02; 33]),
+                machine_cert_fingerprint: [0xBBu8; 32],
+                revoked_at: 1,
+                reason: RevocationReason::OwnerAction,
+                cascade: RevocationCascade::MachineOnly,
+                owner_p_id: crate::machine_cert::PersonId("owner".to_string()),
+                owner_cert_fingerprint: [4u8; 32],
+                owner_person_cert: Vec::new(),
+                signature: crate::keys::P256Signature([7u8; 64]),
+            })
+            .into_iter()
+            .collect();
+        let data = AcceptedRosterData {
+            epoch: [1u8; 32],
+            checkpoint_sequence: 1,
+            checkpoint_hash,
+            prev_checkpoint_hash: [0u8; 32],
+            event_sequence: 1,
+            event_head_hash: [3u8; 32],
+            predecessor_event_sequence: 0,
+            predecessor_event_head_hash: [0u8; 32],
+            issued_at: 1,
+            not_after: u64::MAX,
+            owner_cert_fingerprint: [4u8; 32],
+            genesis_basis: VerifiedGenesisRoster {
+                epoch: [1u8; 32],
+                members: Vec::new(),
+            },
+            active,
+            tombstones,
+        };
+        RosterSnapshotView::project(&hh_id, &data)
+    }
+
+    /// RED-R18, checked first: a `PeerExpectation` sealed against one
+    /// `checkpoint_hash` redeemed against a snapshot with a different hash
+    /// is `ExpectationSnapshotMismatch` — even though, in this fixture, the
+    /// `m_id` would ALSO fail "not active" if the hash check didn't run
+    /// first. Pins the order, not just the outcome.
+    #[test]
+    fn expected_responder_rejects_snapshot_hash_mismatch_before_checking_membership() {
+        let m_id = MachineId("m-responder-hash-mismatch".to_string());
+        let expectation = PeerExpectation::injected_for_harness(
+            [1u8; 32],
+            m_id.clone(),
+            PeerSelectionSource::LocalOwnerPresentSelection,
+        );
+        // Different hash AND m_id absent from active — if "not active" were
+        // checked first this would return MachineNotActive instead.
+        let snapshot = test_snapshot_for_responder([2u8; 32], None, None);
+        let result = ExpectedResponder::from_peer_expectation(expectation, &snapshot);
+        assert_eq!(
+            result,
+            Err(ExpectedResponderError::ExpectationSnapshotMismatch)
+        );
+    }
+
+    #[test]
+    fn expected_responder_rejects_revoked_machine_on_matching_snapshot() {
+        let checkpoint_hash = [5u8; 32];
+        let m_id = MachineId("m-responder-revoked".to_string());
+        let expectation = PeerExpectation::injected_for_harness(
+            checkpoint_hash,
+            m_id.clone(),
+            PeerSelectionSource::LocalOwnerPresentSelection,
+        );
+        let snapshot = test_snapshot_for_responder(checkpoint_hash, None, Some(&m_id));
+        let result = ExpectedResponder::from_peer_expectation(expectation, &snapshot);
+        assert_eq!(result, Err(ExpectedResponderError::MachineRevoked));
+    }
+
+    #[test]
+    fn expected_responder_rejects_not_listed_machine_on_matching_snapshot() {
+        let checkpoint_hash = [6u8; 32];
+        let m_id = MachineId("m-responder-not-listed".to_string());
+        let expectation = PeerExpectation::injected_for_harness(
+            checkpoint_hash,
+            m_id.clone(),
+            PeerSelectionSource::LocalOwnerPresentSelection,
+        );
+        let snapshot = test_snapshot_for_responder(checkpoint_hash, None, None);
+        let result = ExpectedResponder::from_peer_expectation(expectation, &snapshot);
+        assert_eq!(result, Err(ExpectedResponderError::MachineNotActive));
+    }
+
+    #[test]
+    fn expected_responder_succeeds_for_active_machine_on_matching_snapshot() {
+        let checkpoint_hash = [7u8; 32];
+        let hh_id = HouseholdId("hh-expected-responder-test".to_string());
+        let m_id = MachineId("m-responder-active".to_string());
+        let expectation = PeerExpectation::injected_for_harness(
+            checkpoint_hash,
+            m_id.clone(),
+            PeerSelectionSource::LocalOwnerPresentSelection,
+        );
+        let snapshot = test_snapshot_for_responder(checkpoint_hash, Some(&m_id), None);
+        let responder = ExpectedResponder::from_peer_expectation(expectation, &snapshot)
+            .expect("active machine, matching snapshot");
+        assert_eq!(responder.hh_id(), &hh_id);
+        assert_eq!(responder.m_id(), &m_id);
+        assert_eq!(responder.cert_fingerprint(), [0xAAu8; 32]);
     }
 }

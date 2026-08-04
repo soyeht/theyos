@@ -69,6 +69,7 @@ pub mod machine_roster_authority;
 pub mod machine_roster_evidence;
 pub mod machine_roster_store;
 pub mod member_identity;
+pub mod mesh_session_registry;
 pub mod owner_approval_v2;
 pub mod owner_auth;
 pub mod owner_events;
