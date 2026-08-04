@@ -1,6 +1,8 @@
 //! Durable replay authority for signed mesh connection-intent nonces.
 //!
-//! One canonical record is the complete authority for one target household.
+//! One canonical record below `state_dir/household/mesh_intent_nonce_ledger`
+//! is the complete authority for one target household, so production teardown
+//! carries or removes the replay authority with the household lifecycle.
 //! A stable `fs2` lock serializes the read/modify/write transaction across
 //! processes. The lock file also carries a tiny durable clean/dirty marker:
 //! an operation marks the record dirty *before* replacing it and marks it
@@ -8,10 +10,11 @@
 //! A later process therefore never treats a merely visible post-rename record
 //! as proof of durability; it first rewrites the same canonical bytes until
 //! they are committed.
-//! The lock inode is hard-linked into the parent as a durable anchor. Every
-//! record operation is relative to the retained store-directory descriptor,
-//! and both directory and lock bindings are rechecked after locking, so a
-//! renamed/recreated path cannot create a second authority.
+//! The lock inode is hard-linked inside the household as a durable anchor.
+//! Every record operation is relative to retained root, household, and store
+//! directory descriptors. The complete root→household→store chain and lock
+//! binding are checked before and after locking, so a detached household
+//! handle cannot keep mutating teardown state.
 //!
 //! The replay key is exactly
 //! `(domain, hh_id, initiator_m_id, delegated_key_id, nonce[32])`. Channel and
@@ -28,13 +31,13 @@
 //! component's threat model; deployment must keep the state directory
 //! exclusive to the service account.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::num::NonZeroUsize;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, TryLockError, mpsc};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, TryLockError, Weak, mpsc};
 use std::time::{Duration, Instant};
 
 use fs2::FileExt;
@@ -46,6 +49,7 @@ use thiserror::Error;
 
 use crate::cbor;
 use crate::ids::{HouseholdId, MachineId};
+use crate::storage::HOUSEHOLD_SUBDIR;
 
 pub use crate::machine_roster_store::TrustedWallFloor;
 
@@ -122,6 +126,12 @@ impl MeshIntentNonceKey {
         delegated_key_id: impl Into<String>,
         nonce: [u8; 32],
     ) -> Result<Self, MeshIntentNonceKeyError> {
+        if !HouseholdId::is_well_formed(hh_id.as_str()) {
+            return Err(MeshIntentNonceKeyError::InvalidHouseholdId);
+        }
+        if !MachineId::is_well_formed(initiator_m_id.as_str()) {
+            return Err(MeshIntentNonceKeyError::InvalidInitiatorMachineId);
+        }
         let delegated_key_id = delegated_key_id.into();
         if delegated_key_id.is_empty()
             || delegated_key_id.len() > MAX_DELEGATED_KEY_ID_BYTES
@@ -160,6 +170,10 @@ impl MeshIntentNonceKey {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Error)]
 pub enum MeshIntentNonceKeyError {
+    #[error("household id is malformed")]
+    InvalidHouseholdId,
+    #[error("initiator machine id is malformed")]
+    InvalidInitiatorMachineId,
     #[error("delegated key id is empty, oversized, or contains a control character")]
     InvalidDelegatedKeyId,
 }
@@ -361,6 +375,10 @@ pub enum MeshIntentNonceConsumeOutcome {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Error)]
 pub enum MeshIntentNonceLedgerOpenError {
+    #[error("ledger household identity is malformed")]
+    InvalidIdentity,
+    #[error("the physical ledger authority is already bound to another household")]
+    AuthorityConflict,
     #[error("ledger path is unsafe")]
     UnsafePath,
     #[error("ledger requires an allowlisted local persistent filesystem")]
@@ -453,6 +471,7 @@ struct LedgerInner {
     target_hh_id: HouseholdId,
     config: MeshIntentNonceLedgerConfig,
     state_dir: File,
+    household_dir: File,
     store_dir: File,
     lock_file: Mutex<File>,
     worker_tx: mpsc::SyncSender<WorkerRequest>,
@@ -462,6 +481,22 @@ struct LedgerInner {
     queued_for_test: std::sync::atomic::AtomicUsize,
     #[cfg(test)]
     queue_waiters_for_test: std::sync::atomic::AtomicUsize,
+}
+
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
+struct LedgerAuthorityId {
+    state_dev: u64,
+    state_ino: u64,
+    household_dev: u64,
+    household_ino: u64,
+    store_dev: u64,
+    store_ino: u64,
+}
+
+fn process_ledger_registry() -> &'static Mutex<HashMap<LedgerAuthorityId, Weak<LedgerInner>>> {
+    static REGISTRY: OnceLock<Mutex<HashMap<LedgerAuthorityId, Weak<LedgerInner>>>> =
+        OnceLock::new();
+    REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
 struct WorkerRequest {
@@ -532,15 +567,43 @@ impl MeshIntentNonceLedger {
         target_hh_id: HouseholdId,
         config: MeshIntentNonceLedgerConfig,
     ) -> Result<Self, MeshIntentNonceLedgerOpenError> {
-        let (state_dir, store_dir) = open_store_dirs(state_dir.as_ref())?;
+        if !HouseholdId::is_well_formed(target_hh_id.as_str()) {
+            return Err(MeshIntentNonceLedgerOpenError::InvalidIdentity);
+        }
+        let (state_dir, household_dir, store_dir) = open_store_dirs(state_dir.as_ref())?;
+        let authority_id = ledger_authority_id(&state_dir, &household_dir, &store_dir)?;
+        let mut registry = process_ledger_registry()
+            .lock()
+            .map_err(|_| MeshIntentNonceLedgerOpenError::LockPoisoned)?;
+        registry.retain(|_, authority| authority.strong_count() != 0);
+        if let Some(existing) = registry.get(&authority_id).and_then(Weak::upgrade) {
+            if existing.target_hh_id != target_hh_id {
+                return Err(MeshIntentNonceLedgerOpenError::AuthorityConflict);
+            }
+            if existing.config != config {
+                return Err(MeshIntentNonceLedgerOpenError::PolicyMismatch);
+            }
+            if !verify_authority_binding(
+                &existing.state_dir,
+                &existing.household_dir,
+                &existing.store_dir,
+            ) {
+                return Err(MeshIntentNonceLedgerOpenError::UnsafePath);
+            }
+            let ledger = Self { inner: existing };
+            ledger.initialize_or_recover()?;
+            return Ok(ledger);
+        }
+
         let (lock_file, lock_created) = open_lock_file(&store_dir)?;
-        verify_or_create_lock_anchor(&state_dir, &store_dir, &lock_file, lock_created)?;
+        verify_or_create_lock_anchor(&household_dir, &store_dir, &lock_file, lock_created)?;
         let (worker_tx, worker_rx) = mpsc::sync_channel(WORKER_QUEUE_CAPACITY);
         let ledger = Self {
             inner: Arc::new(LedgerInner {
                 target_hh_id,
                 config,
                 state_dir,
+                household_dir,
                 store_dir,
                 lock_file: Mutex::new(lock_file),
                 worker_tx,
@@ -554,12 +617,18 @@ impl MeshIntentNonceLedger {
         };
         ledger.initialize_or_recover()?;
         spawn_worker(worker_rx)?;
+        registry.insert(authority_id, Arc::downgrade(&ledger.inner));
         Ok(ledger)
     }
 
     #[must_use]
     pub fn target_household_id(&self) -> &HouseholdId {
         &self.inner.target_hh_id
+    }
+
+    #[cfg(test)]
+    pub(crate) fn shares_process_worker_with(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.inner, &other.inner)
     }
 
     #[must_use]
@@ -836,7 +905,11 @@ impl MeshIntentNonceLedger {
         &self,
         control: Option<&MeshIntentNonceConsumeControl>,
     ) -> Result<LedgerLockGuard<'_>, MeshIntentNonceUnavailable> {
-        if !verify_store_dir_binding(&self.inner.state_dir, &self.inner.store_dir) {
+        if !verify_authority_binding(
+            &self.inner.state_dir,
+            &self.inner.household_dir,
+            &self.inner.store_dir,
+        ) {
             return Err(MeshIntentNonceUnavailable::UnsafePath);
         }
         if let Some(reason) = control.and_then(abort_reason) {
@@ -871,7 +944,7 @@ impl MeshIntentNonceLedger {
                 }
             }
         };
-        if !verify_lock_anchor(&self.inner.state_dir, &guard) {
+        if !verify_lock_anchor(&self.inner.household_dir, &guard) {
             return Err(MeshIntentNonceUnavailable::UnsafePath);
         }
         loop {
@@ -881,10 +954,14 @@ impl MeshIntentNonceLedger {
             match guard.try_lock_exclusive() {
                 Ok(()) => {
                     let locked = LedgerLockGuard { file: guard };
-                    if !verify_store_dir_binding(&self.inner.state_dir, &self.inner.store_dir) {
+                    if !verify_authority_binding(
+                        &self.inner.state_dir,
+                        &self.inner.household_dir,
+                        &self.inner.store_dir,
+                    ) {
                         return Err(MeshIntentNonceUnavailable::UnsafePath);
                     }
-                    if !verify_lock_anchor(&self.inner.state_dir, &locked.file) {
+                    if !verify_lock_anchor(&self.inner.household_dir, &locked.file) {
                         return Err(MeshIntentNonceUnavailable::UnsafePath);
                     }
                     if let Some(reason) = control.and_then(abort_reason) {
@@ -1101,7 +1178,9 @@ impl Drop for LedgerLockGuard<'_> {
     }
 }
 
-fn open_store_dirs(state_path: &Path) -> Result<(File, File), MeshIntentNonceLedgerOpenError> {
+fn open_store_dirs(
+    state_path: &Path,
+) -> Result<(File, File, File), MeshIntentNonceLedgerOpenError> {
     let state_dir = File::from(
         rustix::fs::open(
             state_path,
@@ -1110,20 +1189,35 @@ fn open_store_dirs(state_path: &Path) -> Result<(File, File), MeshIntentNonceLed
         )
         .map_err(map_open_errno)?,
     );
-    // The anchor and the child directory name both live in this directory;
-    // validating only the 0700 child would still let another uid replace both
-    // names through a writable parent.
+    // The named household is the production teardown boundary. Retain its
+    // parent descriptor so every operation can prove that this exact
+    // household directory is still installed there.
     validate_owned_non_writable_directory(&state_dir)?;
     validate_supported_persistent_filesystem(&state_dir)?;
 
-    let created = match rustix::fs::mkdirat(&state_dir, STORE_SUBDIR, Mode::RWXU) {
+    let household_dir = File::from(
+        rustix::fs::openat(
+            &state_dir,
+            HOUSEHOLD_SUBDIR,
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .map_err(map_open_errno)?,
+    );
+    validate_owned_non_writable_directory(&household_dir)?;
+    validate_supported_persistent_filesystem(&household_dir)?;
+    if !verify_named_directory_binding(&state_dir, HOUSEHOLD_SUBDIR, &household_dir) {
+        return Err(MeshIntentNonceLedgerOpenError::UnsafePath);
+    }
+
+    let created = match rustix::fs::mkdirat(&household_dir, STORE_SUBDIR, Mode::RWXU) {
         Ok(()) => true,
         Err(Errno::EXIST) => false,
         Err(error) => return Err(map_open_errno(error)),
     };
     let store_dir = File::from(
         rustix::fs::openat(
-            &state_dir,
+            &household_dir,
             STORE_SUBDIR,
             OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
             Mode::empty(),
@@ -1141,14 +1235,14 @@ fn open_store_dirs(state_path: &Path) -> Result<(File, File), MeshIntentNonceLed
     }
     validate_private_directory(&store_dir)?;
     validate_supported_persistent_filesystem(&store_dir)?;
-    if !verify_store_dir_binding(&state_dir, &store_dir) {
+    if !verify_authority_binding(&state_dir, &household_dir, &store_dir) {
         return Err(MeshIntentNonceLedgerOpenError::UnsafePath);
     }
 
     // Unconditional: an earlier attempt may have made the child visible but
     // failed the parent barrier. Visibility is never reused as durability.
-    state_dir.sync_all().map_err(map_open_io)?;
-    Ok((state_dir, store_dir))
+    household_dir.sync_all().map_err(map_open_io)?;
+    Ok((state_dir, household_dir, store_dir))
 }
 
 fn validate_private_directory(dir: &File) -> Result<(), MeshIntentNonceLedgerOpenError> {
@@ -1220,14 +1314,39 @@ fn validate_supported_persistent_filesystem(
     Err(MeshIntentNonceLedgerOpenError::UnsupportedFilesystem)
 }
 
-fn verify_store_dir_binding(state_dir: &File, store_dir: &File) -> bool {
-    let Ok(opened) = rustix::fs::fstat(store_dir) else {
+fn verify_named_directory_binding(parent: &File, name: &str, opened: &File) -> bool {
+    let Ok(opened) = rustix::fs::fstat(opened) else {
         return false;
     };
-    let Ok(named) = rustix::fs::statat(state_dir, STORE_SUBDIR, AtFlags::SYMLINK_NOFOLLOW) else {
+    let Ok(named) = rustix::fs::statat(parent, name, AtFlags::SYMLINK_NOFOLLOW) else {
         return false;
     };
     opened.st_dev == named.st_dev && opened.st_ino == named.st_ino
+}
+
+fn verify_authority_binding(state_dir: &File, household_dir: &File, store_dir: &File) -> bool {
+    verify_named_directory_binding(state_dir, HOUSEHOLD_SUBDIR, household_dir)
+        && verify_named_directory_binding(household_dir, STORE_SUBDIR, store_dir)
+}
+
+fn ledger_authority_id(
+    state_dir: &File,
+    household_dir: &File,
+    store_dir: &File,
+) -> Result<LedgerAuthorityId, MeshIntentNonceLedgerOpenError> {
+    use std::os::unix::fs::MetadataExt;
+
+    let state = state_dir.metadata().map_err(map_open_io)?;
+    let household = household_dir.metadata().map_err(map_open_io)?;
+    let store = store_dir.metadata().map_err(map_open_io)?;
+    Ok(LedgerAuthorityId {
+        state_dev: state.dev(),
+        state_ino: state.ino(),
+        household_dev: household.dev(),
+        household_ino: household.ino(),
+        store_dev: store.dev(),
+        store_ino: store.ino(),
+    })
 }
 
 fn open_lock_file(store_dir: &File) -> Result<(File, bool), MeshIntentNonceLedgerOpenError> {
@@ -1268,12 +1387,12 @@ fn open_lock_file(store_dir: &File) -> Result<(File, bool), MeshIntentNonceLedge
 }
 
 fn verify_or_create_lock_anchor(
-    state_dir: &File,
+    household_dir: &File,
     store_dir: &File,
     lock_file: &File,
     lock_created: bool,
 ) -> Result<(), MeshIntentNonceLedgerOpenError> {
-    if let Some(anchor) = open_anchor(state_dir)? {
+    if let Some(anchor) = open_anchor(household_dir)? {
         if !same_file(&anchor, lock_file) {
             return Err(MeshIntentNonceLedgerOpenError::UnsafePath);
         }
@@ -1285,23 +1404,24 @@ fn verify_or_create_lock_anchor(
     match rustix::fs::linkat(
         store_dir,
         LOCK_FILENAME,
-        state_dir,
+        household_dir,
         LOCK_ANCHOR_FILENAME,
         AtFlags::empty(),
     ) {
         Ok(()) | Err(Errno::EXIST) => {}
         Err(error) => return Err(map_open_errno(error)),
     }
-    let anchor = open_anchor(state_dir)?.ok_or(MeshIntentNonceLedgerOpenError::RecoveryRequired)?;
+    let anchor =
+        open_anchor(household_dir)?.ok_or(MeshIntentNonceLedgerOpenError::RecoveryRequired)?;
     if !same_file(&anchor, lock_file) {
         return Err(MeshIntentNonceLedgerOpenError::UnsafePath);
     }
-    state_dir.sync_all().map_err(map_open_io)
+    household_dir.sync_all().map_err(map_open_io)
 }
 
-fn open_anchor(state_dir: &File) -> Result<Option<File>, MeshIntentNonceLedgerOpenError> {
+fn open_anchor(household_dir: &File) -> Result<Option<File>, MeshIntentNonceLedgerOpenError> {
     match rustix::fs::openat(
-        state_dir,
+        household_dir,
         LOCK_ANCHOR_FILENAME,
         OFlags::RDWR | OFlags::NOFOLLOW | OFlags::CLOEXEC,
         Mode::empty(),
@@ -1324,8 +1444,8 @@ fn same_file(left: &File, right: &File) -> bool {
     left.st_dev == right.st_dev && left.st_ino == right.st_ino
 }
 
-fn verify_lock_anchor(state_dir: &File, lock_file: &File) -> bool {
-    open_anchor(state_dir)
+fn verify_lock_anchor(household_dir: &File, lock_file: &File) -> bool {
+    open_anchor(household_dir)
         .ok()
         .flatten()
         .is_some_and(|anchor| same_file(&anchor, lock_file))
@@ -1612,13 +1732,11 @@ mod tests {
     }
 
     fn key(nonce_byte: u8) -> MeshIntentNonceKey {
-        MeshIntentNonceKey::new(
-            household('a'),
-            machine('b'),
-            "mesh-key-v1",
-            [nonce_byte; 32],
-        )
-        .unwrap()
+        key_for(household('a'), nonce_byte)
+    }
+
+    fn key_for(hh_id: HouseholdId, nonce_byte: u8) -> MeshIntentNonceKey {
+        MeshIntentNonceKey::new(hh_id, machine('b'), "mesh-key-v1", [nonce_byte; 32]).unwrap()
     }
 
     fn evidence(
@@ -1630,10 +1748,21 @@ mod tests {
     }
 
     fn open_at(path: &Path, capacity: usize) -> MeshIntentNonceLedger {
+        prepare_household(path);
+        MeshIntentNonceLedger::open(path, household('a'), config(capacity)).unwrap()
+    }
+
+    fn prepare_household(path: &Path) {
         use std::os::unix::fs::PermissionsExt;
 
-        fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
-        MeshIntentNonceLedger::open(path, household('a'), config(capacity)).unwrap()
+        fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
+        let household = path.join(HOUSEHOLD_SUBDIR);
+        fs::create_dir_all(&household).unwrap();
+        fs::set_permissions(household, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    fn store_path(path: &Path) -> PathBuf {
+        path.join(HOUSEHOLD_SUBDIR).join(STORE_SUBDIR)
     }
 
     fn floor_for(hh_id: HouseholdId, unix_seconds: u64) -> TrustedWallFloor {
@@ -1683,6 +1812,46 @@ mod tests {
             "a56568685f6964783768685f61616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161656e6f6e636558202a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a66646f6d61696e706c65646765722d646f6d61696e2d76316e696e69746961746f725f6d5f696478366d5f626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262627064656c6567617465645f6b65795f69646b6d6573682d6b65792d7631",
             "the replay-key wire contract must not drift silently"
         );
+    }
+
+    #[test]
+    fn malformed_public_tuple_ids_are_rejected_before_record_io() {
+        let temp = TempDir::new().unwrap();
+        let ledger = open_at(temp.path(), 2);
+        let record = store_path(temp.path()).join(RECORD_FILENAME);
+        let before = fs::read(&record).unwrap();
+
+        assert_eq!(
+            MeshIntentNonceKey::new(
+                household('a'),
+                MachineId("not-a-machine-id".to_owned()),
+                "mesh-key-v1",
+                [0x70; 32],
+            ),
+            Err(MeshIntentNonceKeyError::InvalidInitiatorMachineId)
+        );
+        assert_eq!(
+            MeshIntentNonceKey::new(
+                HouseholdId("not-a-household-id".to_owned()),
+                machine('b'),
+                "mesh-key-v1",
+                [0x71; 32],
+            ),
+            Err(MeshIntentNonceKeyError::InvalidHouseholdId)
+        );
+        assert_eq!(fs::read(&record).unwrap(), before);
+
+        drop(ledger);
+        let restarted = open_at(temp.path(), 2);
+        assert!(matches!(
+            restarted.consume(
+                &key(0x72),
+                &evidence(MeshIntentChannel::Dev, 0x72, 500),
+                floor(100),
+                &ceremony_control(),
+            ),
+            MeshIntentNonceConsumeOutcome::Committed { .. }
+        ));
     }
 
     #[test]
@@ -1781,7 +1950,7 @@ mod tests {
             ),
             MeshIntentNonceConsumeOutcome::Committed { .. }
         ));
-        let bytes = fs::read(temp.path().join(STORE_SUBDIR).join(RECORD_FILENAME)).unwrap();
+        let bytes = fs::read(store_path(temp.path()).join(RECORD_FILENAME)).unwrap();
         let decoded: LedgerRecordV1 = cbor::from_canonical_slice_strict(&bytes).unwrap();
         assert_eq!(cbor::to_canonical_vec(&decoded).unwrap(), bytes);
         assert_eq!(decoded.entries.len(), 1);
@@ -1800,7 +1969,7 @@ mod tests {
             ),
             MeshIntentNonceConsumeOutcome::Committed { .. }
         ));
-        let record_path = temp.path().join(STORE_SUBDIR).join(RECORD_FILENAME);
+        let record_path = store_path(temp.path()).join(RECORD_FILENAME);
         OpenOptions::new()
             .append(true)
             .open(&record_path)
@@ -1861,7 +2030,7 @@ mod tests {
     fn expired_ceremony_deadline_is_refused_without_touching_the_record() {
         let temp = TempDir::new().unwrap();
         let ledger = open_at(temp.path(), 2);
-        let record_path = temp.path().join(STORE_SUBDIR).join(RECORD_FILENAME);
+        let record_path = store_path(temp.path()).join(RECORD_FILENAME);
         let before = fs::read(&record_path).unwrap();
 
         assert_eq!(
@@ -1880,7 +2049,7 @@ mod tests {
     fn cancelled_ceremony_is_refused_without_touching_the_record() {
         let temp = TempDir::new().unwrap();
         let ledger = open_at(temp.path(), 2);
-        let record_path = temp.path().join(STORE_SUBDIR).join(RECORD_FILENAME);
+        let record_path = store_path(temp.path()).join(RECORD_FILENAME);
         let before = fs::read(&record_path).unwrap();
         let control = ceremony_control();
         control.cancel();
@@ -1901,7 +2070,7 @@ mod tests {
     fn cancellation_during_local_lock_race_is_fail_closed() {
         let temp = TempDir::new().unwrap();
         let ledger = open_at(temp.path(), 2);
-        let record_path = temp.path().join(STORE_SUBDIR).join(RECORD_FILENAME);
+        let record_path = store_path(temp.path()).join(RECORD_FILENAME);
         let before = fs::read(&record_path).unwrap();
         let held = ledger.inner.lock_file.lock().unwrap();
         let control = ceremony_control();
@@ -2000,9 +2169,26 @@ mod tests {
     }
 
     #[test]
-    fn bounded_worker_queue_refuses_unenqueued_work_on_cancel() {
+    fn factory_reopens_share_one_bounded_worker_queue() {
         let temp = TempDir::new().unwrap();
         let ledger = open_at(temp.path(), 4);
+        let reopened = MeshIntentNonceLedger::open(temp.path(), household('a'), config(4)).unwrap();
+        assert!(
+            Arc::ptr_eq(&ledger.inner, &reopened.inner),
+            "one physical authority must have one process worker and queue"
+        );
+        assert_eq!(
+            MeshIntentNonceLedger::open(temp.path(), household('a'), config(3))
+                .err()
+                .unwrap(),
+            MeshIntentNonceLedgerOpenError::PolicyMismatch
+        );
+        assert_eq!(
+            MeshIntentNonceLedger::open(temp.path(), household('c'), config(4))
+                .err()
+                .unwrap(),
+            MeshIntentNonceLedgerOpenError::AuthorityConflict
+        );
         let block = TestWorkerBlock::new();
         ledger.install_worker_block_for_test(block.clone());
 
@@ -2017,7 +2203,7 @@ mod tests {
         });
         block.entered.wait();
 
-        let second_ledger = ledger.clone();
+        let second_ledger = reopened.clone();
         let second = thread::spawn(move || {
             second_ledger.consume(
                 &key(0x61),
@@ -2037,7 +2223,7 @@ mod tests {
 
         let third_control = ceremony_control();
         let third_cancel = third_control.clone();
-        let third_ledger = ledger.clone();
+        let third_ledger = reopened;
         let third = thread::spawn(move || {
             third_ledger.consume(
                 &key(0x62),
@@ -2098,7 +2284,7 @@ mod tests {
 
         let temp = TempDir::new().unwrap();
         let ledger = open_at(temp.path(), 2);
-        let named = temp.path().join(STORE_SUBDIR);
+        let named = store_path(temp.path());
         let detached = temp.path().join("detached-ledger");
         let detached_record = named.join(RECORD_FILENAME);
         let before = fs::read(&detached_record).unwrap();
@@ -2131,12 +2317,76 @@ mod tests {
     }
 
     #[test]
+    fn household_teardown_detaches_old_authority_and_new_household_starts_fresh() {
+        let temp = TempDir::new().unwrap();
+        let old = open_at(temp.path(), 4);
+        assert!(matches!(
+            old.consume(
+                &key(0x73),
+                &evidence(MeshIntentChannel::Dev, 0x73, 500),
+                floor(100),
+                &ceremony_control(),
+            ),
+            MeshIntentNonceConsumeOutcome::Committed { .. }
+        ));
+
+        let installed = temp.path().join(HOUSEHOLD_SUBDIR);
+        let detached = temp.path().join("household.tearing-down");
+        fs::rename(&installed, &detached).unwrap();
+        let detached_record = detached.join(STORE_SUBDIR).join(RECORD_FILENAME);
+        let old_bytes = fs::read(&detached_record).unwrap();
+
+        prepare_household(temp.path());
+        let replacement =
+            MeshIntentNonceLedger::open(temp.path(), household('c'), config(4)).unwrap();
+        assert!(!Arc::ptr_eq(&old.inner, &replacement.inner));
+        assert_eq!(
+            old.consume(
+                &key(0x74),
+                &evidence(MeshIntentChannel::Dev, 0x74, 500),
+                floor(100),
+                &ceremony_control(),
+            ),
+            unavailable(MeshIntentNonceUnavailable::UnsafePath),
+            "a live pre-teardown handle must not write into the detached household"
+        );
+        assert_eq!(fs::read(&detached_record).unwrap(), old_bytes);
+
+        assert!(matches!(
+            replacement.consume(
+                &key_for(household('c'), 0x73),
+                &evidence(MeshIntentChannel::Release, 0x75, 700),
+                floor_for(household('c'), 100),
+                &ceremony_control(),
+            ),
+            MeshIntentNonceConsumeOutcome::Committed { generation: 2 }
+        ));
+        assert!(
+            !temp.path().join(LOCK_ANCHOR_FILENAME).exists(),
+            "the lock anchor must never outlive the household boundary"
+        );
+        assert!(
+            !temp.path().join(STORE_SUBDIR).exists(),
+            "no replay authority may live beside the household boundary"
+        );
+        assert!(
+            installed.join(LOCK_ANCHOR_FILENAME).exists(),
+            "the replacement authority owns an anchor inside its household"
+        );
+
+        drop(old);
+        fs::remove_dir_all(&detached).unwrap();
+        assert!(!detached.exists(), "the old household authority is gone");
+        assert_eq!(replacement.target_household_id(), &household('c'));
+    }
+
+    #[test]
     fn replacing_the_named_lock_never_creates_a_second_cross_process_authority() {
         use std::os::unix::fs::OpenOptionsExt;
 
         let temp = TempDir::new().unwrap();
         let ledger = open_at(temp.path(), 4);
-        let lock_path = temp.path().join(STORE_SUBDIR).join(LOCK_FILENAME);
+        let lock_path = store_path(temp.path()).join(LOCK_FILENAME);
         fs::remove_file(&lock_path).unwrap();
         OpenOptions::new()
             .read(true)
@@ -2194,7 +2444,7 @@ mod tests {
             if stage == MeshIntentNonceCommitStage::TempCleanup {
                 use std::os::unix::fs::PermissionsExt;
 
-                let stale = temp.path().join(STORE_SUBDIR).join(TEMP_FILENAME);
+                let stale = store_path(temp.path()).join(TEMP_FILENAME);
                 fs::write(&stale, b"stale").unwrap();
                 fs::set_permissions(stale, fs::Permissions::from_mode(0o600)).unwrap();
             }
@@ -2261,7 +2511,7 @@ mod tests {
         );
         drop(armed);
         assert_eq!(
-            fs::read(temp.path().join(STORE_SUBDIR).join(LOCK_FILENAME)).unwrap(),
+            fs::read(store_path(temp.path()).join(LOCK_FILENAME)).unwrap(),
             MARKER_DIRTY
         );
 
@@ -2276,7 +2526,7 @@ mod tests {
             MeshIntentNonceConsumeOutcome::AlreadyConsumed { .. }
         ));
         assert_eq!(
-            fs::read(temp.path().join(STORE_SUBDIR).join(LOCK_FILENAME)).unwrap(),
+            fs::read(store_path(temp.path()).join(LOCK_FILENAME)).unwrap(),
             MARKER_CLEAN
         );
     }
@@ -2295,7 +2545,7 @@ mod tests {
                 ),
                 MeshIntentNonceConsumeOutcome::Committed { .. }
             ));
-            let lock = temp.path().join(STORE_SUBDIR).join(LOCK_FILENAME);
+            let lock = store_path(temp.path()).join(LOCK_FILENAME);
             let mut file = OpenOptions::new()
                 .write(true)
                 .truncate(true)
@@ -2322,18 +2572,17 @@ mod tests {
     #[test]
     fn crash_after_lock_anchor_or_partial_initializing_resumes_fresh_init() {
         for marker in [Vec::new(), MARKER_INITIALIZING[..5].to_vec()] {
-            use std::os::unix::fs::PermissionsExt;
-
             let temp = TempDir::new().unwrap();
-            fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o700)).unwrap();
-            let (state_dir, store_dir) = open_store_dirs(temp.path()).unwrap();
+            prepare_household(temp.path());
+            let (state_dir, household_dir, store_dir) = open_store_dirs(temp.path()).unwrap();
             let (mut lock_file, created) = open_lock_file(&store_dir).unwrap();
             assert!(created);
-            verify_or_create_lock_anchor(&state_dir, &store_dir, &lock_file, created).unwrap();
+            verify_or_create_lock_anchor(&household_dir, &store_dir, &lock_file, created).unwrap();
             lock_file.write_all(&marker).unwrap();
             lock_file.sync_all().unwrap();
             drop(lock_file);
             drop(store_dir);
+            drop(household_dir);
             drop(state_dir);
 
             let restarted = open_at(temp.path(), 2);
@@ -2354,11 +2603,11 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
 
         let temp = TempDir::new().unwrap();
-        fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o755)).unwrap();
+        prepare_household(temp.path());
         let ledger = MeshIntentNonceLedger::open(temp.path(), household('a'), config(2)).unwrap();
         drop(ledger);
         assert_eq!(
-            fs::metadata(temp.path().join(STORE_SUBDIR))
+            fs::metadata(store_path(temp.path()))
                 .unwrap()
                 .permissions()
                 .mode()
@@ -2380,7 +2629,7 @@ mod tests {
                     .unwrap(),
                 MeshIntentNonceLedgerOpenError::UnsafePath
             );
-            assert!(!temp.path().join(STORE_SUBDIR).exists());
+            assert!(!store_path(temp.path()).exists());
         }
     }
 
@@ -2402,7 +2651,7 @@ mod tests {
         let ledger = open_at(temp.path(), 2);
         drop(ledger);
 
-        let lock = temp.path().join(STORE_SUBDIR).join(LOCK_FILENAME);
+        let lock = store_path(temp.path()).join(LOCK_FILENAME);
         fs::set_permissions(&lock, fs::Permissions::from_mode(0o660)).unwrap();
         assert_eq!(
             MeshIntentNonceLedger::open(temp.path(), household('a'), config(2))

@@ -4697,13 +4697,18 @@ mod tests {
         let clock = TestClock::new(vec![]);
         let (rig, dir) = make_coord_rig(clock);
         std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+        let household_dir = crate::storage::household_dir(dir.path());
+        std::fs::create_dir(&household_dir).unwrap();
+        std::fs::set_permissions(household_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
         let config = crate::mesh_intent_nonce_ledger::MeshIntentNonceLedgerConfig::new(
             NonZeroUsize::new(8).unwrap(),
             Duration::from_secs(1),
         )
         .unwrap();
         let ledger = rig.coord.open_mesh_intent_nonce_ledger(config).unwrap();
+        let reopened = rig.coord.open_mesh_intent_nonce_ledger(config).unwrap();
         assert_eq!(ledger.target_household_id(), &rig.coord.hh_id);
+        assert!(ledger.shares_process_worker_with(&reopened));
     }
 
     #[test]
