@@ -50,6 +50,60 @@
 //! ```compile_fail
 //! use mesh_session_control_model_rs::validator::RosterSyncPurpose;
 //! ```
+//!
+//! Round 6, wave 9 — the audit of `6bd957a4` noted the previous wave added
+//! `load_revalidated_report_for_test` without a matching compile-fail, so
+//! the gating was asserted rather than proven. It is proven here:
+//!
+//! ```compile_fail
+//! use mesh_session_control_model_rs::activate::load_revalidated_report_for_test;
+//! ```
+//!
+//! The signing surface is sealed, not merely documented. **No downstream
+//! crate can implement `SignPrimitive`**, so no foreign code can ever run
+//! inside the roster-lease + `SignGuard` critical section — this is the
+//! mechanism that replaces the removed public closure, and it is what makes
+//! "the closure cannot capture a different signer" and "the operation
+//! cannot self-deadlock by calling `cell.commit`" structural rather than
+//! advisory:
+//!
+//! ```compile_fail
+//! use mesh_session_control_model_rs::sign::{
+//!     OpaqueSignPreimage, OpaqueSignature, SignPrimitive,
+//! };
+//! struct Evil;
+//! impl SignPrimitive for Evil {
+//!     fn sign_opaque(&self, _p: &OpaqueSignPreimage) -> OpaqueSignature {
+//!         OpaqueSignature::new(vec![])
+//!     }
+//! }
+//! ```
+//!
+//! The only implementation that exists anywhere is gated out of a default
+//! build, which is what "the production signing surface stays closed until
+//! the keystore bridge lands" means concretely:
+//!
+//! ```compile_fail
+//! use mesh_session_control_model_rs::sign::FakeSignPrimitive;
+//! ```
+//!
+//! And the sign path never hands back anything detachable — there is no
+//! accessor for the sealed binding, so the wave-8 defect
+//! (`|a| a.binding().clone()`) has no spelling at all:
+//!
+//! ```compile_fail
+//! fn detach(c: &mesh_session_control_model_rs::sign::SignerCapability<'_>) {
+//!     let _ = c.binding();
+//! }
+//! ```
+//!
+//! Taking the sign-path guard directly is likewise no longer public:
+//!
+//! ```compile_fail
+//! fn take(cell: &mesh_session_control_model_rs::cell::ControlRecordCell) {
+//!     let _ = cell.acquire_for_sign();
+//! }
+//! ```
 
 pub mod activate;
 pub mod cell;
@@ -58,6 +112,7 @@ pub mod gc;
 pub mod locks;
 pub mod record;
 pub mod secret_backend;
+pub mod sign;
 pub mod store;
 pub mod transition;
 pub mod validator;

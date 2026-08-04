@@ -144,7 +144,13 @@ impl ControlRecordCell {
         self.load_canonical()
     }
 
-    pub fn acquire_for_sign(&self) -> SignGuard<'_> {
+    /// Round 6, wave 9 (P0-1): this used to be `pub`. A public way to take
+    /// the sign-path guard is a public way to hold the lock and then run
+    /// arbitrary work outside the validator -- exactly the route the
+    /// removed `with_authorized_use` offered. The only caller is now
+    /// `sign::sign_checked`, which takes it in the one sanctioned order and
+    /// releases it as soon as the sealed primitive returns.
+    pub(crate) fn acquire_for_sign_internal(&self) -> SignGuard<'_> {
         self.locks.acquire_for_sign()
     }
 

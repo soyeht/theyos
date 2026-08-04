@@ -5,8 +5,8 @@
 //! specifically because of it.
 
 use mesh_session_control_model_rs::activate::{
-    ActivateError, AuthorizedUseError, LoadRevalidatedError, activate_from_key_observed,
-    load_revalidated_report_for_test, revalidate_on_load, with_authorized_use,
+    ActivateError, LoadRevalidatedError, activate_from_key_observed,
+    load_revalidated_report_for_test, revalidate_on_load,
 };
 use mesh_session_control_model_rs::cell::{
     self, CommitTransitionError, ControlRecordCell, OpenConflict,
@@ -18,6 +18,10 @@ use mesh_session_control_model_rs::record::*;
 use mesh_session_control_model_rs::secret_backend::{
     CreateOutcome, CreatedOrExisting, FakeSecretBackend, GcReport, InspectOutcome,
     LoadExactOutcome, SecretBackend,
+};
+use mesh_session_control_model_rs::sign::{
+    FakeSignPrimitive, FixedClock, OpaqueSignPreimage, RendezvousClock, SignCheckedError,
+    SignerCapabilityError, SteppableClock, load_signer_capability, sign_checked,
 };
 use mesh_session_control_model_rs::store::{AtomicControlRecordStore, LoadOutcome, ReplaceOutcome};
 use mesh_session_control_model_rs::transition::{RecordTransition, TransitionError, apply};
@@ -3903,6 +3907,72 @@ fn gc_bound_entry_gets_at_most_one_destroy_attempt_per_tick_even_when_backend_ne
 // conflicting roster-side mutation until it is released -- not just a
 // bare revision-number recheck (this crate's own two prior attempts) ────
 
+/// Round 6, wave 9 (CFX-4): a roster double that RECORDS which machine_id
+/// each lease was requested for, and can be configured to grant leases for
+/// exactly one machine. The predecessor doubles ignored the `machine_id`
+/// argument entirely, so a lease taken over the WRONG machine was
+/// undetectable by construction -- the audit called that out as the reason
+/// the delegator-equality gap could not have been caught by its own tests.
+struct MachineRecordingRoster {
+    currency: RosterCurrency,
+    only_for: Option<String>,
+    leased: Mutex<Vec<String>>,
+}
+impl MachineRecordingRoster {
+    fn active(member_pub: Vec<u8>, member_cert_fingerprint: [u8; 32]) -> Self {
+        Self {
+            currency: RosterCurrency::Active {
+                member_pub,
+                member_cert_fingerprint,
+            },
+            only_for: None,
+            leased: Mutex::new(Vec::new()),
+        }
+    }
+    fn active_only_for(
+        member_pub: Vec<u8>,
+        member_cert_fingerprint: [u8; 32],
+        machine: String,
+    ) -> Self {
+        Self {
+            currency: RosterCurrency::Active {
+                member_pub,
+                member_cert_fingerprint,
+            },
+            only_for: Some(machine),
+            leased: Mutex::new(Vec::new()),
+        }
+    }
+    fn leased_machines(&self) -> Vec<String> {
+        self.leased.lock().unwrap().clone()
+    }
+}
+impl RosterLookup for MachineRecordingRoster {
+    fn query_machine_currency(&self, _machine_id: &str) -> RosterCurrency {
+        self.currency.clone()
+    }
+    fn currency_revision(&self, _machine_id: &str) -> u64 {
+        0
+    }
+    fn acquire_currency_lease(
+        &self,
+        machine_id: &str,
+        expected_revision: u64,
+    ) -> Result<Box<dyn CurrencyLease + '_>, RosterChanged> {
+        if let Some(only) = &self.only_for
+            && only != machine_id
+        {
+            return Err(RosterChanged);
+        }
+        self.leased.lock().unwrap().push(machine_id.to_string());
+        if expected_revision == 0 {
+            Ok(Box::new(TrivialLease))
+        } else {
+            Err(RosterChanged)
+        }
+    }
+}
+
 /// Round 6, wave 6 (rebuilt in wave 8): replaces the obsolete
 /// `RevisionBumpingBlockingRoster`, which only re-checked a bare number
 /// and enforced nothing.
@@ -3936,6 +4006,7 @@ struct LeaseEnforcingRoster {
     lease_sync: Option<RosterSync>,
     currency: Mutex<RosterLeaseState>,
     mutation: Mutex<()>,
+    lease_attempts: std::sync::atomic::AtomicU64,
 }
 struct RosterSync {
     ready_tx: Mutex<Option<std::sync::mpsc::Sender<()>>>,
@@ -3977,6 +4048,7 @@ impl LeaseEnforcingRoster {
                 revision: 0,
             }),
             mutation: Mutex::new(()),
+            lease_attempts: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -4040,6 +4112,26 @@ impl LeaseEnforcingRoster {
     fn bump_revision_for_an_unrelated_change(&self) {
         self.currency.lock().unwrap().revision += 1;
     }
+
+    /// Real observable barrier: blocks until `n` callers have ATTEMPTED to
+    /// acquire a lease. The counter is bumped immediately before the
+    /// `mutation` lock is requested, so once the count is reached and that
+    /// lock is known to be held elsewhere, the attempting thread is
+    /// genuinely blocked there -- not merely spawned, and not slept for.
+    fn wait_for_lease_attempts(&self, n: u64) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while std::time::Instant::now() < deadline {
+            if self
+                .lease_attempts
+                .load(std::sync::atomic::Ordering::SeqCst)
+                >= n
+            {
+                return;
+            }
+            std::thread::yield_now();
+        }
+        panic!("timed out waiting for {n} lease attempts");
+    }
 }
 impl RosterLookup for LeaseEnforcingRoster {
     fn query_machine_currency(&self, _machine_id: &str) -> RosterCurrency {
@@ -4056,6 +4148,8 @@ impl RosterLookup for LeaseEnforcingRoster {
         _machine_id: &str,
         expected_revision: u64,
     ) -> Result<Box<dyn CurrencyLease + '_>, RosterChanged> {
+        self.lease_attempts
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let mutation = self.mutation.lock().unwrap();
         if self.currency.lock().unwrap().revision != expected_revision {
             return Err(RosterChanged);
@@ -4960,16 +5054,18 @@ fn load_revalidated_rejects_when_physical_key_was_replaced() {
     ));
 }
 
-// ── wave 8, CFX-1/2/3/4: with_authorized_use replaces RevalidatedGuard ──
+// ── wave 9: sealed, typed sign_checked replaces with_authorized_use ─────
 //
-// The wave-7 RevalidatedGuard is gone. It handed back
-// `&MeshSignerControlRecordV1` from a `record()` accessor, and that type
-// derives Clone -- so `let r = g.record().clone(); drop(g);` detached a
-// fully "validated" snapshot from the only thing making it true. It also
-// took the cell's SignGuard BEFORE its slow backend/roster/sig I/O, which
-// both blocked urgent revokes for the whole duration and established a
-// cell -> roster lock order that deadlocked against activation's
-// roster -> cell order. See `AuthorizedUse`'s doc comment in activate.rs.
+// The wave-8 closure surface is gone. It let a caller clone an ExactBinding
+// out of the locks, ignore the supplied view and sign with a separately
+// captured signer, hold both locks for unbounded work, and self-deadlock by
+// capturing `cell` and calling commit. See src/sign.rs's module doc.
+//
+// The compile-fail halves of this section's REDs (no downstream
+// SignPrimitive impl, no binding accessor, no public acquire_for_sign, no
+// FakeSignPrimitive by default) live in src/lib.rs's doctests, because
+// "this must not compile" cannot be expressed from inside a test binary
+// that has to compile.
 
 /// The common fixture: a fully activated, backend-confirmed record.
 fn activated_fixture(txn_seed: u8) -> (FakeSecretBackend, MeshSignerControlRecordV1) {
@@ -5036,7 +5132,7 @@ fn activated_fixture(txn_seed: u8) -> (FakeSecretBackend, MeshSignerControlRecor
 /// Like `activated_fixture`, but the record ALSO carries an in-flight
 /// `RoutineRotate` pending op already in `KeyObserved` phase -- so
 /// `activate_from_key_observed` can be driven against it concurrently
-/// with a `with_authorized_use` against the still-current generation.
+/// with a `sign_checked` against the still-current generation.
 /// That pairing is the only one that can exercise the wave-7 lock cycle:
 /// both paths touch the roster AND the cell, which `cell.commit` alone
 /// (no roster involvement at all) never does.
@@ -5092,91 +5188,334 @@ fn activated_with_pending_rotation_fixture(
     (backend, with_binding, rotate_txn, d2)
 }
 
-#[test]
-fn with_authorized_use_blocks_a_concurrent_revoke_so_no_use_linearizes_after_it() {
-    let dir = tempfile::tempdir().unwrap();
-    let cell = test_cell(dir.path().join("record"));
-    let (backend, activated) = activated_fixture(140);
-    seed_record(&cell, &activated);
-    let policy = DelegationPolicy::test(1000);
-    let order = Arc::new(Mutex::new(Vec::new()));
-
-    std::thread::scope(|scope| {
-        let (started_tx, started_rx) = std::sync::mpsc::channel();
-        let (done_tx, done_rx) = std::sync::mpsc::channel();
-
-        let generation = with_authorized_use::<MeshSessionPurpose, _>(
-            &cell,
-            &backend,
-            &policy,
-            &active_roster(),
-            &AlwaysTrueVerifier,
-            50,
-            |authorized| {
-                // Spawned from INSIDE the closure on purpose: the
-                // SignGuard is provably already held at this point, so
-                // there is no window in which the revoke could win the
-                // race and turn this into a flaky test rather than a
-                // deterministic one.
-                let order_ref = Arc::clone(&order);
-                let cell_ref = &cell;
-                scope.spawn(move || {
-                    started_tx.send(()).unwrap();
-                    let r = cell_ref.commit(
-                        &RecordTransition::RevokeUrgent {
-                            reason: RevocationReason::OwnerAction,
-                            txn_id: [141; 16],
-                        },
-                        60,
-                        TEST_CAP,
-                    );
-                    order_ref.lock().unwrap().push("revoke_done");
-                    done_tx.send(r).unwrap();
-                });
-                // Wait until the revoke thread is genuinely live before
-                // asserting it cannot finish -- otherwise a thread that
-                // simply had not started yet would make the assertion
-                // below pass without proving anything.
-                started_rx.recv().unwrap();
-                assert!(
-                    matches!(
-                        done_rx.recv_timeout(std::time::Duration::from_millis(150)),
-                        Err(std::sync::mpsc::RecvTimeoutError::Timeout)
-                    ),
-                    "RevokeUrgent must be genuinely blocked while an authorized use is in flight"
-                );
-                order.lock().unwrap().push("use_done");
-                authorized.generation()
-            },
-        )
-        .expect("a genuinely active, backend-confirmed record must authorize a use");
-        assert_eq!(generation, activated.current_generation.unwrap());
-
-        done_rx
-            .recv_timeout(std::time::Duration::from_secs(5))
-            .expect("revoke must proceed promptly once the authorized use returns")
-            .expect("revoke must succeed once unblocked");
-    });
-
+/// Two genuinely live generations, BOTH with correctly matched delegations
+/// (the shared `delegation()` fixture's placeholder `delegated_key_id`
+/// never matches a real `canonical_slot`, so `rotated_record_with_two_generations`
+/// cannot be used where the full validator actually has to pass). Returns
+/// `(backend, record, older_generation, current_generation)`.
+fn two_live_generations_fixture(
+    txn_seed: u8,
+) -> (
+    FakeSecretBackend,
+    MeshSignerControlRecordV1,
+    NonZeroU64,
+    NonZeroU64,
+) {
+    let (backend, mut seeded, rotate_txn, d2) = activated_with_pending_rotation_fixture(txn_seed);
+    let older = seeded.current_generation.unwrap();
+    let p = seeded.pending_op.clone().unwrap();
+    // `activated_with_pending_rotation_fixture` pre-sets revision for
+    // seed_record's two-step write; undo that before applying one more
+    // transition, then re-apply it at the end.
+    seeded.revision = 2;
+    let mut activated = apply(
+        &seeded,
+        &RecordTransition::ActivateFromKeyObserved {
+            expected_txn_id: rotate_txn,
+            expected_kind: p.kind,
+            expected_generation: p.generation,
+            expected_epoch: p.epoch,
+            expected_purpose: p.purpose,
+            expected_slot_id: p.canonical_slot.canonical_id(),
+            expected_revision: seeded.revision,
+            delegation: d2,
+        },
+        1000,
+        TEST_CAP,
+    )
+    .expect("activating the rotation must succeed");
+    let current = activated.current_generation.unwrap();
+    assert_ne!(current, older);
     assert_eq!(
-        *order.lock().unwrap(),
-        vec!["use_done", "revoke_done"],
-        "no authorized use can ever linearize after a revoke -- proven by the converse: the revoke cannot complete until the use already happened and released the guard"
+        activated.live_generations.len(),
+        2,
+        "both generations must still be live -- this fixture exists for the overlap case"
+    );
+    activated.revision = 1; // see seed_record's own two-step requirement
+    (backend, activated, older, current)
+}
+
+/// Waits until `spy` has recorded `n` occurrences of `event`.
+///
+/// The real observable barrier this suite needed: `MeshSignerLocks` records
+/// `TurnstileAcquire` *after* taking the turnstile and *before* blocking on
+/// `access`, so seeing that event proves a contending thread has genuinely
+/// reached its acquisition rather than merely having been spawned. The
+/// audit called out the previous `started_tx`-before-the-attempt pattern
+/// (and a `sleep(200ms)`) as evidence of scheduling, not of blocking.
+fn wait_for_events(spy: &OrderSpy, event: LockEvent, n: usize, what: &str) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while std::time::Instant::now() < deadline {
+        if spy.events().iter().filter(|e| **e == event).count() >= n {
+            return;
+        }
+        std::thread::yield_now();
+    }
+    panic!("timed out waiting for {n} x {event:?} ({what})");
+}
+
+fn test_cell_with_spy(path: std::path::PathBuf, spy: Arc<OrderSpy>) -> Arc<ControlRecordCell> {
+    cell::open(path, identity(), PurposeId::MeshSession, spy).expect("open")
+}
+
+/// Seeds an activated record and returns everything the sign tests need.
+fn sign_fixture(
+    path: std::path::PathBuf,
+    spy: Arc<OrderSpy>,
+) -> (
+    Arc<ControlRecordCell>,
+    FakeSecretBackend,
+    MeshSignerControlRecordV1,
+) {
+    let cell = test_cell_with_spy(path, spy);
+    let (backend, activated) = activated_fixture(160);
+    seed_record(&cell, &activated);
+    (cell, backend, activated)
+}
+
+fn preimage() -> OpaqueSignPreimage {
+    OpaqueSignPreimage::new(vec![0xAB, 0xCD, 0xEF])
+}
+
+#[test]
+fn sign_checked_accepts_the_correct_current_signer() {
+    let dir = tempfile::tempdir().unwrap();
+    let spy = Arc::new(OrderSpy::new());
+    let (cell, backend, activated) = sign_fixture(dir.path().join("record"), Arc::clone(&spy));
+    let policy = DelegationPolicy::test(1000);
+    let clock = FixedClock(50);
+    let primitive = FakeSignPrimitive::new(7);
+    let generation = activated.current_generation.unwrap();
+
+    let cap = load_signer_capability::<MeshSessionPurpose>(
+        &cell,
+        &backend,
+        &policy,
+        &active_roster(),
+        &AlwaysTrueVerifier,
+        &clock,
+        &primitive,
+        generation,
+    )
+    .expect("a genuinely live current generation must load a capability");
+    assert_eq!(cap.generation(), generation);
+
+    let sig = sign_checked(&cell, &active_roster(), &clock, &cap, &preimage())
+        .expect("a sealed, still-valid capability must sign");
+    assert_eq!(sig.as_bytes()[0], 7, "the SAME signer's primitive must run");
+    assert_eq!(&sig.as_bytes()[1..], preimage().as_bytes());
+    assert_eq!(primitive.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+}
+
+#[test]
+fn sign_checked_accepts_an_older_still_live_overlapping_generation() {
+    // The predecessor made this case impossible to express: it always
+    // selected `current_generation`, so a signer on an older generation
+    // that is still live until its own not_after could never ask for
+    // authorization for ITS OWN generation. That is a legitimate rotate
+    // overlap, not an attack.
+    let dir = tempfile::tempdir().unwrap();
+    let spy = Arc::new(OrderSpy::new());
+    let cell = test_cell_with_spy(dir.path().join("record"), Arc::clone(&spy));
+    let (backend, record, older, current) = two_live_generations_fixture(180);
+    seed_record(&cell, &record);
+    assert!(
+        older < current,
+        "the overlap generation must be the older one"
+    );
+
+    let policy = DelegationPolicy::test(1000);
+    let clock = FixedClock(50);
+    let primitive = FakeSignPrimitive::new(9);
+    let cap = load_signer_capability::<MeshSessionPurpose>(
+        &cell,
+        &backend,
+        &policy,
+        &active_roster(),
+        &AlwaysTrueVerifier,
+        &clock,
+        &primitive,
+        older,
+    )
+    .expect("an older generation that is still live must be able to authorize its own signer");
+    assert_eq!(cap.generation(), older);
+    sign_checked(&cell, &active_roster(), &clock, &cap, &preimage())
+        .expect("the overlapping older signer must be able to sign");
+}
+
+#[test]
+fn sign_checked_rejects_a_signer_held_across_a_revoke_reactivate_cycle() {
+    // The core P0-1 case: an old signer still in memory after the record
+    // has been revoked and reactivated. RevokeUrgent + Reactivate strictly
+    // increase epoch_high_water, and the capability is sealed to the epoch
+    // it was loaded under, so the stale signer fails under the guard even
+    // though a brand-new generation may be perfectly live.
+    let dir = tempfile::tempdir().unwrap();
+    let spy = Arc::new(OrderSpy::new());
+    let (cell, backend, activated) = sign_fixture(dir.path().join("record"), Arc::clone(&spy));
+    let policy = DelegationPolicy::test(1000);
+    let clock = FixedClock(50);
+    let primitive = FakeSignPrimitive::new(3);
+    let generation = activated.current_generation.unwrap();
+
+    let cap = load_signer_capability::<MeshSessionPurpose>(
+        &cell,
+        &backend,
+        &policy,
+        &active_roster(),
+        &AlwaysTrueVerifier,
+        &clock,
+        &primitive,
+        generation,
+    )
+    .expect("loads while still active");
+
+    // Revoke, then reactivate -- the epoch strictly increases.
+    cell.commit(
+        &RecordTransition::RevokeUrgent {
+            reason: RevocationReason::OwnerAction,
+            txn_id: [161; 16],
+        },
+        60,
+        TEST_CAP,
+    )
+    .expect("revoke commits");
+    cell.commit(
+        &RecordTransition::ReactivateFromRevoked {
+            txn_id: [162; 16],
+            next_txn_id: [165; 16],
+            backend: BackendKind::File,
+        },
+        60,
+        TEST_CAP,
+    )
+    .expect("reactivate commits");
+
+    let err = sign_checked(&cell, &active_roster(), &clock, &cap, &preimage()).unwrap_err();
+    assert!(
+        matches!(
+            err,
+            SignCheckedError::EpochMismatch
+                | SignCheckedError::NotActive
+                | SignCheckedError::GenerationNotLive
+        ),
+        "a signer from before a revoke/reactivate cycle must be refused; got {err:?}"
+    );
+    assert_eq!(
+        primitive.calls.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "the physical primitive must never run for a refused signer"
     );
 }
 
 #[test]
-fn with_authorized_use_holds_no_cell_lock_during_slow_io_and_then_refuses_the_stale_snapshot() {
-    // Two properties at once, both required by the wave-8 lock order:
-    // (1) step 1's slow roster I/O holds NO cell lock -- proven because a
-    //     RevokeUrgent commits to completion while it is in flight;
-    // (2) the snapshot validated during that window is then refused,
-    //     rather than authorizing a use that a revoke already invalidated.
+fn sign_checked_rejects_epoch_binding_slot_and_purpose_mismatches() {
     let dir = tempfile::tempdir().unwrap();
-    let cell = test_cell(dir.path().join("record"));
-    let (backend, activated) = activated_fixture(142);
-    seed_record(&cell, &activated);
+    let spy = Arc::new(OrderSpy::new());
+    let (cell, backend, activated) = sign_fixture(dir.path().join("record"), Arc::clone(&spy));
     let policy = DelegationPolicy::test(1000);
+    let clock = FixedClock(50);
+    let primitive = FakeSignPrimitive::new(1);
+    let generation = activated.current_generation.unwrap();
+
+    // purpose: the type parameter alone must not decide which record this
+    // is -- loading a MeshSession record as RosterSync must fail.
+    let purpose_err = load_signer_capability::<RosterSyncPurpose>(
+        &cell,
+        &backend,
+        &policy,
+        &active_roster(),
+        &AlwaysTrueVerifier,
+        &clock,
+        &primitive,
+        generation,
+    )
+    .unwrap_err();
+    assert!(
+        matches!(
+            purpose_err,
+            SignerCapabilityError::Validation(ValidationError::PurposeMismatch)
+        ),
+        "got {purpose_err:?}"
+    );
+
+    // generation: a generation that is not live cannot be sealed at all.
+    let bogus_generation = NonZeroU64::new(generation.get() + 41).unwrap();
+    let gen_err = load_signer_capability::<MeshSessionPurpose>(
+        &cell,
+        &backend,
+        &policy,
+        &active_roster(),
+        &AlwaysTrueVerifier,
+        &clock,
+        &primitive,
+        bogus_generation,
+    )
+    .unwrap_err();
+    assert!(
+        matches!(gen_err, SignerCapabilityError::GenerationNotLive),
+        "got {gen_err:?}"
+    );
+
+    // binding/slot: seal a capability against the OLDER of two live
+    // generations, then let that generation lapse out of live_generations.
+    // (GenerationExpired legitimately refuses to remove the *current*
+    // generation, so the overlap fixture is what makes this reachable.)
+    let dir2 = tempfile::tempdir().unwrap();
+    let cell2 = test_cell_with_spy(dir2.path().join("record"), Arc::new(OrderSpy::new()));
+    let (backend2, record2, older, _current) = two_live_generations_fixture(190);
+    seed_record(&cell2, &record2);
+    let older_not_after = record2
+        .live_generations
+        .iter()
+        .find(|g| g.generation == older)
+        .unwrap()
+        .not_after;
+    let primitive2 = FakeSignPrimitive::new(11);
+    let cap = load_signer_capability::<MeshSessionPurpose>(
+        &cell2,
+        &backend2,
+        &policy,
+        &active_roster(),
+        &AlwaysTrueVerifier,
+        &clock,
+        &primitive2,
+        older,
+    )
+    .expect("loads against the older, still-live generation");
+    cell2
+        .commit(
+            &RecordTransition::GenerationExpired { generation: older },
+            older_not_after + 1,
+            TEST_CAP,
+        )
+        .expect("expiring a non-current lapsed generation commits");
+    let err = sign_checked(&cell2, &active_roster(), &clock, &cap, &preimage()).unwrap_err();
+    assert!(
+        matches!(err, SignCheckedError::GenerationNotLive),
+        "a capability whose generation left live_generations must be refused; got {err:?}"
+    );
+    assert_eq!(
+        primitive2.calls.load(std::sync::atomic::Ordering::SeqCst),
+        0
+    );
+    assert_eq!(primitive.calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+}
+
+#[test]
+fn sign_checked_refuses_when_the_clock_crosses_expiry_during_the_slow_load() {
+    // P0-2. The predecessor took one scalar `now` before the slow I/O and
+    // never re-read it, so a delegation validated at not_after - 1 still ran
+    // the authorized operation after not_after. The clock is now injected
+    // and re-sampled under both locks; this test advances it past not_after
+    // WHILE the slow roster query is parked, using a real rendezvous.
+    let dir = tempfile::tempdir().unwrap();
+    let spy = Arc::new(OrderSpy::new());
+    let (cell, backend, activated) = sign_fixture(dir.path().join("record"), Arc::clone(&spy));
+    let policy = DelegationPolicy::test(1000);
+    let primitive = FakeSignPrimitive::new(5);
+    let generation = activated.current_generation.unwrap();
+    let not_after = activated.live_generations[0].not_after;
 
     let (ready_tx, ready_rx) = std::sync::mpsc::channel();
     let (proceed_tx, proceed_rx) = std::sync::mpsc::channel();
@@ -5184,143 +5523,342 @@ fn with_authorized_use_holds_no_cell_lock_during_slow_io_and_then_refuses_the_st
         ready_tx: Mutex::new(Some(ready_tx)),
         proceed_rx: Mutex::new(proceed_rx),
     };
+    // Starts comfortably inside the delegation's validity window.
+    let clock = SteppableClock::new(not_after - 1);
 
     std::thread::scope(|scope| {
         let handle = scope.spawn(|| {
-            with_authorized_use::<MeshSessionPurpose, _>(
+            let cap = load_signer_capability::<MeshSessionPurpose>(
                 &cell,
                 &backend,
                 &policy,
                 &roster,
                 &AlwaysTrueVerifier,
-                50,
-                |_authorized| panic!("the closure must never run against a stale snapshot"),
-            )
+                &clock,
+                &primitive,
+                generation,
+            )?;
+            sign_checked(&cell, &active_roster(), &clock, &cap, &preimage())
+                .map_err(|_| SignerCapabilityError::Expired)
         });
 
-        ready_rx.recv().unwrap(); // now parked inside the slow roster query
-        cell.commit(
-            &RecordTransition::RevokeUrgent {
-                reason: RevocationReason::OwnerAction,
-                txn_id: [143; 16],
-            },
-            60,
-            TEST_CAP,
-        )
-        .expect("a revoke must be able to commit while step 1's slow I/O is in flight -- that is the whole point of holding no cell lock there");
+        // Parked inside the slow roster query, i.e. after the load-time
+        // clock sample and before any lock is taken.
+        ready_rx.recv().unwrap();
+        clock.set(not_after + 1);
         proceed_tx.send(()).unwrap();
 
         let err = handle.join().unwrap().unwrap_err();
         assert!(
-            matches!(err, AuthorizedUseError::RecordChangedDuringAcquire),
-            "got {err:?}"
+            matches!(err, SignerCapabilityError::Expired),
+            "crossing not_after during the slow step must refuse, never sign; got {err:?}"
         );
     });
+
+    assert_eq!(
+        primitive.calls.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "zero signatures may be produced once the delegation has expired"
+    );
 }
 
 #[test]
-fn a_held_currency_lease_blocks_a_roster_side_revoke_for_the_whole_authorized_use() {
+fn sign_checked_refuses_a_lease_taken_for_the_wrong_delegator_machine() {
+    // CFX-4. The lease must be taken for the delegator of the generation
+    // actually being signed with. This roster double RECORDS the machine_id
+    // it was asked to lease -- the predecessor's double ignored the
+    // argument entirely, so a lease over the wrong machine was undetectable.
     let dir = tempfile::tempdir().unwrap();
-    let cell = test_cell(dir.path().join("record"));
-    let (backend, activated) = activated_fixture(144);
-    seed_record(&cell, &activated);
+    let spy = Arc::new(OrderSpy::new());
+    let (cell, backend, activated) = sign_fixture(dir.path().join("record"), Arc::clone(&spy));
     let policy = DelegationPolicy::test(1000);
-    let roster = LeaseEnforcingRoster::active(vec![1, 2, 3], [9u8; 32]);
+    let clock = FixedClock(50);
+    let primitive = FakeSignPrimitive::new(2);
+    let generation = activated.current_generation.unwrap();
+    let expected_machine = activated.live_generations[0]
+        .delegation
+        .delegator_m_id
+        .clone();
 
+    let roster = MachineRecordingRoster::active(vec![1, 2, 3], [9u8; 32]);
+    let cap = load_signer_capability::<MeshSessionPurpose>(
+        &cell,
+        &backend,
+        &policy,
+        &roster,
+        &AlwaysTrueVerifier,
+        &clock,
+        &primitive,
+        generation,
+    )
+    .expect("loads");
+    sign_checked(&cell, &roster, &clock, &cap, &preimage()).expect("signs");
+
+    assert_eq!(
+        roster.leased_machines(),
+        vec![expected_machine.clone()],
+        "the lease must be taken for the delegator of the signing generation, never another machine"
+    );
+
+    // Negative half: a roster that only grants leases for a DIFFERENT
+    // machine must make the operation fail rather than silently proceed on
+    // an unrelated machine's lease.
+    let wrong = MachineRecordingRoster::active_only_for(
+        vec![1, 2, 3],
+        [9u8; 32],
+        "m_some_other_machine".to_string(),
+    );
+    let cap2 = load_signer_capability::<MeshSessionPurpose>(
+        &cell,
+        &backend,
+        &policy,
+        &wrong,
+        &AlwaysTrueVerifier,
+        &clock,
+        &primitive,
+        generation,
+    )
+    .expect("loads");
+    let err = sign_checked(&cell, &wrong, &clock, &cap2, &preimage()).unwrap_err();
+    assert!(
+        matches!(err, SignCheckedError::RosterChanged(_)),
+        "a lease that cannot be granted for the correct machine must fail closed; got {err:?}"
+    );
+}
+
+#[test]
+fn a_concurrent_revoke_cannot_land_while_sign_checked_holds_the_critical_section() {
+    // The linearization property, proven with a REAL observable barrier
+    // rather than a sleep: the rendezvous clock parks the signer at step 6,
+    // under both locks, and the revoke thread is observed reaching its own
+    // acquisition via the lock spy's TurnstileAcquire event.
+    let dir = tempfile::tempdir().unwrap();
+    let spy = Arc::new(OrderSpy::new());
+    let (cell, backend, activated) = sign_fixture(dir.path().join("record"), Arc::clone(&spy));
+    let policy = DelegationPolicy::test(1000);
+    let primitive = FakeSignPrimitive::new(4);
+    let generation = activated.current_generation.unwrap();
+
+    let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+    let (proceed_tx, proceed_rx) = std::sync::mpsc::channel();
+    // park_on_call = 2: the first sample is in load_signer_capability
+    // (outside every lock); the second is sign_checked's, under both.
+    let clock = RendezvousClock::new(50, 2, ready_tx, proceed_rx);
+
+    let cap = load_signer_capability::<MeshSessionPurpose>(
+        &cell,
+        &backend,
+        &policy,
+        &active_roster(),
+        &AlwaysTrueVerifier,
+        &clock,
+        &primitive,
+        generation,
+    )
+    .expect("loads");
+
+    let order = Arc::new(Mutex::new(Vec::new()));
     std::thread::scope(|scope| {
-        let (started_tx, started_rx) = std::sync::mpsc::channel();
-        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let signer =
+            scope.spawn(|| sign_checked(&cell, &active_roster(), &clock, &cap, &preimage()));
 
-        with_authorized_use::<MeshSessionPurpose, _>(
-            &cell,
-            &backend,
-            &policy,
-            &roster,
-            &AlwaysTrueVerifier,
-            50,
-            |_authorized| {
-                let roster_ref = &roster;
-                scope.spawn(move || {
-                    started_tx.send(()).unwrap();
-                    roster_ref.revoke_on_roster_side();
-                    done_tx.send(()).unwrap();
-                });
-                started_rx.recv().unwrap();
-                assert!(
-                    matches!(
-                        done_rx.recv_timeout(std::time::Duration::from_millis(150)),
-                        Err(std::sync::mpsc::RecvTimeoutError::Timeout)
-                    ),
-                    "a roster-side revoke must be genuinely blocked by the held currency lease for the whole authorized use"
-                );
-            },
-        )
-        .expect("a genuinely active record must authorize a use");
+        // Provably inside the critical section now.
+        ready_rx.recv().unwrap();
+        let turnstiles_before = spy
+            .events()
+            .iter()
+            .filter(|e| **e == LockEvent::TurnstileAcquire)
+            .count();
 
-        done_rx
-            .recv_timeout(std::time::Duration::from_secs(5))
-            .expect("the roster-side revoke must proceed once the lease is released");
+        let order_ref = Arc::clone(&order);
+        let cell_ref = &cell;
+        let revoker = scope.spawn(move || {
+            let r = cell_ref.commit(
+                &RecordTransition::RevokeUrgent {
+                    reason: RevocationReason::OwnerAction,
+                    txn_id: [163; 16],
+                },
+                60,
+                TEST_CAP,
+            );
+            order_ref.lock().unwrap().push("revoke_done");
+            r
+        });
+
+        // The revoke thread has taken the turnstile and is now blocked on
+        // access-exclusive -- observed, not assumed, not slept for.
+        wait_for_events(
+            &spy,
+            LockEvent::TurnstileAcquire,
+            turnstiles_before + 1,
+            "the revoke thread reaching its access acquisition",
+        );
+        assert!(
+            order.lock().unwrap().is_empty(),
+            "the revoke must not have completed while the signer holds the critical section"
+        );
+
+        order.lock().unwrap().push("sign_done");
+        proceed_tx.send(()).unwrap();
+
+        signer
+            .join()
+            .unwrap()
+            .expect("the sign itself must succeed");
+        revoker
+            .join()
+            .unwrap()
+            .expect("the revoke must succeed once unblocked");
     });
 
-    assert_eq!(roster.currency.lock().unwrap().revision, 1);
+    assert_eq!(
+        *order.lock().unwrap(),
+        vec!["sign_done", "revoke_done"],
+        "no signature can ever linearize after a revoke"
+    );
+    assert_eq!(primitive.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+}
+
+#[test]
+fn repeated_bounded_signing_never_starves_an_urgent_revoke() {
+    // P0-3's remaining half: with the closure gone, each sign_checked holds
+    // the guards only across a sealed, CPU-local primitive, so a revoke
+    // contending against a hot signing loop still gets in promptly. The
+    // turnstile (see locks.rs) is what makes this a real guarantee rather
+    // than luck.
+    let dir = tempfile::tempdir().unwrap();
+    let spy = Arc::new(OrderSpy::new());
+    let (cell, backend, activated) = sign_fixture(dir.path().join("record"), Arc::clone(&spy));
+    let policy = DelegationPolicy::test(1000);
+    let clock = FixedClock(50);
+    let primitive = FakeSignPrimitive::new(6);
+    let generation = activated.current_generation.unwrap();
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+    std::thread::scope(|scope| {
+        let stop_ref = Arc::clone(&stop);
+        let cell_ref = &cell;
+        let backend_ref = &backend;
+        let policy_ref = &policy;
+        let primitive_ref = &primitive;
+        scope.spawn(move || {
+            while !stop_ref.load(std::sync::atomic::Ordering::SeqCst) {
+                let Ok(cap) = load_signer_capability::<MeshSessionPurpose>(
+                    cell_ref,
+                    backend_ref,
+                    policy_ref,
+                    &active_roster(),
+                    &AlwaysTrueVerifier,
+                    &clock,
+                    primitive_ref,
+                    generation,
+                ) else {
+                    break; // the revoke landed; nothing left to sign with
+                };
+                if sign_checked(cell_ref, &active_roster(), &clock, &cap, &preimage()).is_err() {
+                    break;
+                }
+            }
+        });
+
+        // Let the loop get genuinely hot before contending.
+        wait_for_events(
+            &spy,
+            LockEvent::AccessAcquireShared,
+            20,
+            "the signing loop to become hot",
+        );
+
+        let started = std::time::Instant::now();
+        cell.commit(
+            &RecordTransition::RevokeUrgent {
+                reason: RevocationReason::OwnerAction,
+                txn_id: [164; 16],
+            },
+            60,
+            TEST_CAP,
+        )
+        .expect("an urgent revoke must still commit against a hot signing loop");
+        let waited = started.elapsed();
+        stop.store(true, std::sync::atomic::Ordering::SeqCst);
+
+        assert!(
+            waited < std::time::Duration::from_secs(5),
+            "an urgent revoke waited {waited:?} behind a bounded signing loop -- that is starvation"
+        );
+    });
+
+    assert!(
+        primitive.calls.load(std::sync::atomic::Ordering::SeqCst) > 0,
+        "the loop must actually have signed, or this proves nothing"
+    );
 }
 
 // ── the lock-order cycle itself ────────────────────────────────────────
 
 #[test]
-fn activation_and_authorized_use_running_concurrently_never_deadlock() {
-    // The absence-of-cycle RED, made DETERMINISTIC rather than hopeful.
+fn activation_and_sign_checked_running_concurrently_never_deadlock() {
+    // The absence-of-cycle RED. Both real paths take roster lease -> cell
+    // guard. Under the inverted order this hangs.
     //
-    // A first attempt at this test simply spawned both paths and asserted
-    // both finished. That instrument was vacuous: run against deliberately
-    // inverted (cell -> roster) code in a scratch copy it still passed,
-    // because nothing forced the two threads into the interleaving the
-    // cycle needs. It confirmed its own prior. This version pins the
-    // interleaving:
-    //
-    //   1. the activation thread is parked the instant it holds the roster
-    //      lease and before it takes any cell guard (`lease_sync`);
-    //   2. only then does the authorized-use thread start;
-    //   3. only then is the activation thread released.
-    //
-    // Under the sanctioned roster -> cell order, the use thread blocks on
-    // the roster lease while holding NO cell guard, so activation takes
-    // the cell guard freely and both finish. Under the inverted
-    // cell -> roster order, the use thread holds the cell's SignGuard
-    // while waiting for the lease, activation blocks forever on the cell
-    // guard, and neither finishes -- which this test then reports as the
-    // cycle it is. Verified against an inverted scratch copy: this version
-    // times out there and passes here.
+    // The audit found the previous version's only evidence that the second
+    // thread had reached its first acquisition was `sleep(200ms)`, so a
+    // descheduled thread could make it pass against inverted code. The
+    // interleaving is now pinned by an observable rendezvous inside the
+    // roster double itself: activation parks holding the lease, and the
+    // signing thread is observed ATTEMPTING its own lease before activation
+    // is released.
     let dir = tempfile::tempdir().unwrap();
-    let cell = test_cell(dir.path().join("record"));
-    let (backend, seeded, rotate_txn, d2) = activated_with_pending_rotation_fixture(150);
+    let spy = Arc::new(OrderSpy::new());
+    let cell = test_cell_with_spy(dir.path().join("record"), Arc::clone(&spy));
+    let (backend, seeded, rotate_txn, d2) = activated_with_pending_rotation_fixture(170);
     seed_record(&cell, &seeded);
-    let policy = DelegationPolicy::test(1000);
+    // Detached threads below require 'static, so the fixtures that must
+    // outlive this frame are leaked deliberately (a small, bounded, test-only
+    // allocation) rather than smuggled across a scope that a deadlocked
+    // thread could never be joined out of.
+    let policy: &'static DelegationPolicy = Box::leak(Box::new(DelegationPolicy::test(1000)));
+    let backend: &'static FakeSecretBackend = Box::leak(Box::new(backend));
+    let primitive: &'static FakeSignPrimitive = Box::leak(Box::new(FakeSignPrimitive::new(8)));
+    let clock = FixedClock(50);
+    let generation = seeded.current_generation.unwrap();
 
     let (lease_held_tx, lease_held_rx) = std::sync::mpsc::channel();
     let (release_tx, release_rx) = std::sync::mpsc::channel();
-    let roster = LeaseEnforcingRoster::active_parking_the_first_lease(
+    let roster = Arc::new(LeaseEnforcingRoster::active_parking_the_first_lease(
         vec![1, 2, 3],
         [9u8; 32],
         lease_held_tx,
         release_rx,
-    );
+    ));
+
+    // The capability is loaded BEFORE the cycle is set up: loading is step
+    // 1 and takes no locks, so it must not contend at all.
+    let cap = load_signer_capability::<MeshSessionPurpose>(
+        &cell,
+        backend,
+        policy,
+        roster.as_ref(),
+        &AlwaysTrueVerifier,
+        &clock,
+        primitive,
+        generation,
+    )
+    .expect("loads with no lock held");
+
+    let (activate_done_tx, activate_done_rx) = std::sync::mpsc::channel();
+    let (sign_done_tx, sign_done_rx) = std::sync::mpsc::channel();
 
     // Detached, not scoped: a genuinely deadlocked thread can never be
     // joined, so the harness must be able to give up on it.
-    let shared = Arc::new((cell, backend, policy, roster));
-    let (activate_done_tx, activate_done_rx) = std::sync::mpsc::channel();
-    let (use_done_tx, use_done_rx) = std::sync::mpsc::channel();
-
     {
-        let shared = Arc::clone(&shared);
+        let (cell, roster) = (Arc::clone(&cell), Arc::clone(&roster));
         std::thread::spawn(move || {
-            let (cell, backend, policy, roster) = (&shared.0, &shared.1, &shared.2, &shared.3);
             // roster lease -> cell MutateGuard
             let _ = activate_from_key_observed::<MeshSessionPurpose>(
-                cell,
+                &cell,
                 backend,
-                roster,
+                roster.as_ref(),
                 &AlwaysTrueVerifier,
                 policy,
                 rotate_txn,
@@ -5338,49 +5876,36 @@ fn activation_and_authorized_use_running_concurrently_never_deadlock() {
         .expect("activation must reach its lease");
 
     {
-        let shared = Arc::clone(&shared);
+        let (cell, roster) = (Arc::clone(&cell), Arc::clone(&roster));
         std::thread::spawn(move || {
-            let (cell, backend, policy, roster) = (&shared.0, &shared.1, &shared.2, &shared.3);
-            // cell SignGuard + roster lease -- the pair whose ORDER is
-            // the whole question.
-            let _ = with_authorized_use::<MeshSessionPurpose, _>(
-                cell,
-                backend,
-                policy,
-                roster,
-                &AlwaysTrueVerifier,
-                50,
-                |authorized| authorized.generation(),
-            );
-            let _ = use_done_tx.send(());
+            // roster lease -> cell SignGuard: the pair whose ORDER is the
+            // whole question.
+            let _ = sign_checked(&cell, roster.as_ref(), &FixedClock(50), &cap, &preimage());
+            let _ = sign_done_tx.send(());
         });
     }
 
-    // Let the use thread reach whichever acquisition its order takes
-    // first, then release activation into its cell guard.
-    std::thread::sleep(std::time::Duration::from_millis(200));
+    // Observed, not slept for: the signing thread has reached its lease
+    // attempt, and that lease is held by the parked activation thread, so
+    // it is genuinely blocked there.
+    roster.wait_for_lease_attempts(2);
     release_tx.send(()).unwrap();
 
     activate_done_rx
         .recv_timeout(std::time::Duration::from_secs(10))
         .expect("activation must not deadlock -- a timeout here IS the cycle");
-    use_done_rx
+    sign_done_rx
         .recv_timeout(std::time::Duration::from_secs(10))
-        .expect("the authorized use must not deadlock -- a timeout here IS the cycle");
+        .expect("sign_checked must not deadlock -- a timeout here IS the cycle");
 }
 
 #[test]
 fn the_deadlock_instrument_itself_can_detect_a_real_cycle() {
-    // Non-vacuity control for the test above. A "no deadlock" assertion
-    // built on recv_timeout is only worth something if that harness would
-    // actually catch a cycle -- otherwise it confirms its own prior.
-    //
-    // A first version of this control just spawned two threads taking two
-    // locks in opposite orders and expected a deadlock. That was itself
-    // racy (2 of 15 suite runs saw the second thread take both locks
-    // before the first had taken either, and trip its own `unreachable!`).
-    // The acquisitions are now explicitly sequenced, so the cycle forms
-    // every time:
+    // Non-vacuity control: a "no deadlock" assertion built on recv_timeout
+    // is only worth something if that harness would actually catch a cycle.
+    // The acquisitions are explicitly sequenced so the cycle forms every
+    // time (an earlier version was itself racy, tripping its own
+    // `unreachable!` in 2 of 15 suite runs):
     //
     //   T1 takes A, announces      -> T2 takes B, announces
     //   T2 reaches for A (blocked) -> T1 reaches for B (blocked)
@@ -5393,8 +5918,6 @@ fn the_deadlock_instrument_itself_can_detect_a_real_cycle() {
     {
         let (a, b) = (Arc::clone(&a), Arc::clone(&b));
         let progressed_tx = progressed_tx.clone();
-        // Detached, not scoped: a genuinely deadlocked thread can never
-        // be joined.
         std::thread::spawn(move || {
             let _ga = a.lock().unwrap();
             a_held_tx.send(()).unwrap();
@@ -5425,10 +5948,6 @@ fn the_deadlock_instrument_itself_can_detect_a_real_cycle() {
         a.try_lock().is_err() && b.try_lock().is_err(),
         "both locks must still be held by the deadlocked pair"
     );
-    // The two threads stay blocked for the rest of the process. That is
-    // what a cycle looks like, and it is exactly what
-    // activation_and_authorized_use_running_concurrently_never_deadlock
-    // asserts cannot happen between the two real code paths.
 }
 
 #[test]
