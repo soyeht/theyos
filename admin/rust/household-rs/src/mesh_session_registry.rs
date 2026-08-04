@@ -1155,6 +1155,110 @@ impl<H: RevocableMeshSession> MeshSessionRegistry<H> {
         }
     }
 
+    /// Callback-free local retirement — the `Drop`-safe counterpart to
+    /// [`unregister`](Self::unregister) (round D-1 successor, @kiana, from
+    /// the D-9 runtime-facade audit).
+    ///
+    /// Does exactly what `unregister` does to THIS registry's own state:
+    /// removes `session_id` from `sessions`/`by_machine`, announces revoke
+    /// intent under `self.inner`'s lock (before the removal is externally
+    /// observable — see [`announce_revoke`](SessionSync::announce_revoke)),
+    /// and drains any in-flight [`ForwardingGuard`] after releasing it. So
+    /// the same authority guarantee holds: on return, this session's
+    /// `SessionGate` (and every clone of it) is closed, and no forward that
+    /// was in flight is still running.
+    ///
+    /// What it deliberately does NOT do: it never calls
+    /// [`send_best_effort_revoke_notice`](RevocableMeshSession::send_best_effort_revoke_notice),
+    /// never calls [`close`](RevocableMeshSession::close), and never calls
+    /// ANY other method of `H` — it does not even `upgrade()` the `Weak<H>`.
+    /// That is the whole point: a runtime facade that owns an Active session
+    /// needs a fail-closed `Drop`, and `unregister`'s notice/close are
+    /// external protocol I/O — a blocking, fallible, possibly-reentrant
+    /// callback into `H`, which is exactly what must not run from a `Drop`
+    /// (including a `Drop` during panic unwind). Dropping the removed
+    /// `SessionEntry` here cannot reach `H` either: the entry holds a
+    /// `Weak<H>`, and dropping a `Weak` never runs `H`'s destructor.
+    ///
+    /// Use [`unregister`](Self::unregister) for the ordinary explicit path,
+    /// where telling the peer is wanted. Use this one when local authority
+    /// must be given up unconditionally and telling the peer is either
+    /// impossible, unsafe, or someone else's job.
+    ///
+    /// **Poison, stated honestly:** if `self.inner` is poisoned this sets
+    /// `registry_live = false` and returns. That denies every outstanding
+    /// `SessionGate` on this registry, including this session's, so no
+    /// authority survives — but it is NOT the same guarantee as the normal
+    /// path: the poisoned interior cannot be reached to find this entry, so
+    /// nothing can announce or drain its `SessionSync`, and a forward
+    /// already in flight is therefore NOT waited out. Fail-closed on
+    /// authorization, not on completion. Same asymmetry
+    /// [`SessionSync`]'s doc comment draws for `try_enter` vs draining, and
+    /// the same one every other method here has in the poison case.
+    pub fn retire_locally(&self, session_id: SessionId) {
+        self.retire_locally_inner(session_id, || {});
+    }
+
+    /// Test-only seam (same technique as
+    /// [`unregister_with_hook_for_test`](Self::unregister_with_hook_for_test)):
+    /// runs `after_unlock_before_drain` exactly between the
+    /// bookkeeping-removal lock releasing and the drain starting.
+    #[cfg(test)]
+    pub(crate) fn retire_locally_with_hook_for_test(
+        &self,
+        session_id: SessionId,
+        after_unlock_before_drain: impl FnOnce(),
+    ) {
+        self.retire_locally_inner(session_id, after_unlock_before_drain);
+    }
+
+    fn retire_locally_inner(
+        &self,
+        session_id: SessionId,
+        after_unlock_before_drain: impl FnOnce(),
+    ) {
+        // Only the `Arc<SessionSync>` escapes this block — deliberately NOT
+        // the whole `SessionEntry`, so there is no `Weak<H>` in scope below
+        // that a later edit could be tempted to `upgrade()`. "No callback
+        // into H" is thereby a property of what this function can still
+        // reach, not only of what it currently writes.
+        let sync = {
+            let Ok(mut guard) = self.inner.lock() else {
+                self.registry_live.store(false, Ordering::SeqCst);
+                return;
+            };
+            let _poison_guard = PoisonGuard::new(&self.registry_live);
+            if let Mode::Live {
+                sessions,
+                by_machine,
+            } = &mut guard.mode
+            {
+                let removed = sessions.remove(&session_id);
+                if let Some(entry) = &removed {
+                    // Before the removal below makes this session's absence
+                    // externally observable — identical ordering to
+                    // `unregister_inner`, for identical reasons.
+                    entry.sync.announce_revoke();
+                    if let Some(ids) = by_machine.get_mut(&entry.m_id) {
+                        ids.retain(|id| *id != session_id);
+                        if ids.is_empty() {
+                            by_machine.remove(&entry.m_id);
+                        }
+                    }
+                }
+                removed.map(|entry| entry.sync)
+            } else {
+                None
+            }
+        };
+        let Some(sync) = sync else {
+            return;
+        };
+        after_unlock_before_drain();
+        // Unlocked: may block waiting out an in-flight ForwardingGuard.
+        sync.drain_after_announce();
+    }
+
     /// True if at least one still-live (upgradable) **Active** session is
     /// registered for `m_id`. Pending entries stay tracked for revocation
     /// but are deliberately not counted as registered/forwardable. Prunes
@@ -3843,5 +3947,193 @@ mod tests {
             "a gate cloned before its handle dropped must be revoked when the Advance branch \
              prunes the dead entry, not merely untracked"
         );
+    }
+
+    // ── retire_locally: callback-free retirement (D-9 facade seam) ──────
+
+    /// A session handle whose every trait method panics. Registering one and
+    /// keeping a strong `Arc` alive means ANY call into `H` — even a single
+    /// `handle.upgrade().close()` — aborts the test loudly. Non-vacuity is
+    /// established by `unregister_does_call_into_the_session_handle_positive_control`
+    /// below, which uses this same double and MUST panic.
+    struct PanicOnCallbackSession;
+
+    impl RevocableMeshSession for PanicOnCallbackSession {
+        fn send_best_effort_revoke_notice(&self) {
+            panic!("retire_locally must never call send_best_effort_revoke_notice");
+        }
+
+        fn close(&self) {
+            panic!("retire_locally must never call close");
+        }
+    }
+
+    /// RED 1 (@kiana): `retire_locally` must not call into `H` at all — it
+    /// is the operation a runtime facade's `Drop` uses, where external
+    /// protocol I/O is exactly what must not run.
+    ///
+    /// Non-vacuous by construction: `session` (the strong `Arc`) is held
+    /// alive across the whole call, so `entry.handle.upgrade()` WOULD
+    /// succeed if anything tried it — the panicking double is genuinely
+    /// reachable, not silently skipped by a dead `Weak`. Asserted
+    /// explicitly below, and cross-checked by the positive control.
+    #[test]
+    fn retire_locally_never_calls_into_the_session_handle() {
+        let m_id = test_m_id(80);
+        let snapshot = snapshot_at(1, [1u8; 32], &[(m_id.clone(), FP_A)], &[]);
+        let registry = MeshSessionRegistry::<PanicOnCallbackSession>::new(&snapshot);
+        let binding = sealed_binding(&snapshot, &m_id);
+        let session = Arc::new(PanicOnCallbackSession);
+        let (id, gate) = registry
+            .register(&binding, Arc::downgrade(&session))
+            .unwrap();
+        assert!(gate.is_authorized());
+
+        registry.retire_locally(id);
+
+        assert_eq!(
+            Arc::strong_count(&session),
+            1,
+            "the handle must still be alive here — otherwise upgrade() would return None \
+             and this test would pass without ever exercising the callback path"
+        );
+        // The authority guarantee still holds, callbacks or not.
+        assert!(!gate.is_authorized());
+        assert!(gate.try_authorize_forwarding().is_none());
+        assert_eq!(registry.registered_count(&m_id), 0);
+        drop(session);
+    }
+
+    /// Positive control for the test above: the SAME panicking double, the
+    /// SAME registration, but via `unregister` — which is documented to
+    /// notify and close. It must panic. Without this, "retire_locally did
+    /// not panic" would be consistent with the double never being wired up
+    /// correctly in the first place.
+    #[test]
+    #[should_panic(expected = "send_best_effort_revoke_notice")]
+    fn unregister_does_call_into_the_session_handle_positive_control() {
+        let m_id = test_m_id(81);
+        let snapshot = snapshot_at(1, [1u8; 32], &[(m_id.clone(), FP_A)], &[]);
+        let registry = MeshSessionRegistry::<PanicOnCallbackSession>::new(&snapshot);
+        let binding = sealed_binding(&snapshot, &m_id);
+        let session = Arc::new(PanicOnCallbackSession);
+        let (id, _gate) = registry
+            .register(&binding, Arc::downgrade(&session))
+            .unwrap();
+        registry.unregister(id);
+    }
+
+    /// RED 2 (@kiana): `retire_locally` must genuinely linearize against an
+    /// in-flight forward — it must not return while a `ForwardingGuard` for
+    /// this session is still held, and the gate must reject afterward.
+    /// Same observable-barrier technique as
+    /// `unregister_waits_for_an_in_flight_forward_before_returning` (poll
+    /// `writer_intent` to confirm the announce landed; since this test alone
+    /// controls when the guard is released, the retirement is then
+    /// deterministically still blocked, not merely probably).
+    #[test]
+    fn retire_locally_waits_for_an_in_flight_forward_before_returning() {
+        let m_id = test_m_id(82);
+        let registry = Arc::new(new_registry_with(1, [1u8; 32], &[(m_id.clone(), FP_A)]));
+        let snapshot = snapshot_at(1, [1u8; 32], &[(m_id.clone(), FP_A)], &[]);
+        let binding = sealed_binding(&snapshot, &m_id);
+        let session = Arc::new(RecordingSession::default());
+        let (id, gate) = registry
+            .register(&binding, Arc::downgrade(&session))
+            .unwrap();
+
+        let log: Arc<StdMutex<Vec<&'static str>>> = Arc::new(StdMutex::new(Vec::new()));
+        let (acquired_tx, acquired_rx) = mpsc::channel::<()>();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+
+        let holder = {
+            let gate = gate.clone();
+            let log = Arc::clone(&log);
+            thread::spawn(move || {
+                let guard = gate
+                    .try_authorize_forwarding()
+                    .expect("session active, no retirement has started yet");
+                acquired_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+                log.lock().unwrap().push("guard_released");
+                drop(guard);
+            })
+        };
+        acquired_rx.recv().unwrap();
+
+        let retirer = {
+            let registry = Arc::clone(&registry);
+            let log = Arc::clone(&log);
+            thread::spawn(move || {
+                registry.retire_locally(id);
+                log.lock().unwrap().push("retire_returned");
+            })
+        };
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if gate.sync.writer_intent.load(Ordering::SeqCst) > 0 {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "retire_locally never announced revoke intent within the deadline"
+            );
+            thread::yield_now();
+        }
+        assert!(
+            log.lock().unwrap().is_empty(),
+            "retire_locally must not return while a ForwardingGuard for this session is \
+             still held"
+        );
+
+        release_tx.send(()).unwrap();
+        holder.join().unwrap();
+        retirer.join().unwrap();
+
+        assert_eq!(
+            &*log.lock().unwrap(),
+            &["guard_released", "retire_returned"]
+        );
+        assert!(!gate.is_authorized());
+        assert!(gate.try_authorize_forwarding().is_none());
+        // No notice/close ever ran, even though this handle records them.
+        assert_eq!(session.notices_sent.load(Ordering::SeqCst), 0);
+        assert!(!session.closed.load(Ordering::SeqCst));
+    }
+
+    /// RED 3 (@kiana): same happens-before property proven for `unregister`
+    /// and the Advance branch, now for `retire_locally` — announce must land
+    /// before this session's absence is externally observable, not merely
+    /// before the (possibly slow) drain completes.
+    #[test]
+    fn retire_locally_announces_before_absence_is_externally_observable() {
+        let m_id = test_m_id(83);
+        let snapshot = snapshot_at(1, [1u8; 32], &[(m_id.clone(), FP_A)], &[]);
+        let registry = MeshSessionRegistry::<RecordingSession>::new(&snapshot);
+        let binding = sealed_binding(&snapshot, &m_id);
+        let session = Arc::new(RecordingSession::default());
+        let (id, gate) = registry
+            .register(&binding, Arc::downgrade(&session))
+            .unwrap();
+        assert!(gate.is_authorized());
+
+        registry.retire_locally_with_hook_for_test(id, || {
+            assert_eq!(
+                registry.registered_count(&m_id),
+                0,
+                "the lock publishing this session's absence must already be released here"
+            );
+            assert!(
+                gate.sync.writer_intent.load(Ordering::SeqCst) > 0,
+                "revoke must be announced before this session's absence is externally \
+                 observable, not only before the drain completes"
+            );
+            assert!(gate.try_authorize_forwarding().is_none());
+        });
+
+        assert!(!gate.is_authorized());
+        assert_eq!(session.notices_sent.load(Ordering::SeqCst), 0);
+        assert!(!session.closed.load(Ordering::SeqCst));
     }
 }
