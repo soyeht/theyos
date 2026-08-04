@@ -74,7 +74,7 @@
 //! struct Evil;
 //! impl SignPrimitive for Evil {
 //!     fn sign_opaque(&self, _p: &OpaqueSignPreimage) -> OpaqueSignature {
-//!         OpaqueSignature::new(vec![])
+//!         unimplemented!()
 //!     }
 //! }
 //! ```
@@ -94,6 +94,55 @@
 //! ```compile_fail
 //! fn detach(c: &mesh_session_control_model_rs::sign::SignerCapability<'_>) {
 //!     let _ = c.binding();
+//! }
+//! ```
+//!
+//! Round 6, wave 10 (item 4): the mutation surface is closed too. The
+//! public `commit_built` — which ran a caller-supplied closure while
+//! holding the EXCLUSIVE guard, and so could both starve an urgent revoke
+//! and self-deadlock by re-entering `commit` on the same thread — is gone
+//! entirely, and the exclusive/GC guards are no longer publicly takeable.
+//! `commit`, which takes an already-built transition and runs no foreign
+//! code under the guard, remains the public mutation surface.
+//!
+//! ```compile_fail
+//! fn build(cell: &mesh_session_control_model_rs::cell::ControlRecordCell) {
+//!     let _ = cell.commit_built(|_| None, 0, 8);
+//! }
+//! ```
+//!
+//! ```compile_fail
+//! fn hold(cell: &mesh_session_control_model_rs::cell::ControlRecordCell) {
+//!     let _ = cell.acquire_for_mutation();
+//! }
+//! ```
+//!
+//! ```compile_fail
+//! fn hold_gc(cell: &mesh_session_control_model_rs::cell::ControlRecordCell) {
+//!     let _ = cell.acquire_gc_serial();
+//! }
+//! ```
+//!
+//! Item 5 — the signing-oracle seam is constrained ahead of the bridge:
+//! preimage bytes cannot be minted by an outside caller, so a future real
+//! signer cannot be turned into an oracle over attacker-chosen input.
+//!
+//! ```compile_fail
+//! use mesh_session_control_model_rs::sign::OpaqueSignPreimage;
+//! fn mint() { let _ = OpaqueSignPreimage(vec![1, 2, 3]); }
+//! ```
+//!
+//! And the signer is derived, never injected — there is no downstream way
+//! to implement the source that yields one:
+//!
+//! ```compile_fail
+//! use mesh_session_control_model_rs::record::ExactBinding;
+//! use mesh_session_control_model_rs::sign::{LoadExactSignerOutcome, SignerSource};
+//! struct Evil;
+//! impl SignerSource for Evil {
+//!     fn load_exact_signer(&self, _e: &ExactBinding) -> LoadExactSignerOutcome<'_> {
+//!         LoadExactSignerOutcome::Absent
+//!     }
 //! }
 //! ```
 //!

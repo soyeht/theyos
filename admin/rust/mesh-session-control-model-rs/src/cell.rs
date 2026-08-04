@@ -154,13 +154,27 @@ impl ControlRecordCell {
         self.locks.acquire_for_sign()
     }
 
-    pub fn acquire_for_mutation(&self) -> MutateGuard<'_> {
+    /// Round 6, wave 10 (item 4): `pub(crate)`, mirroring
+    /// `acquire_for_sign_internal`. A public way to take the EXCLUSIVE
+    /// guard is a public way to hold it indefinitely and stall every
+    /// revoke; wave 9 closed that on the sign side and left this one open.
+    pub(crate) fn acquire_for_mutation(&self) -> MutateGuard<'_> {
         self.locks.acquire_for_mutation()
     }
 
+    #[cfg(feature = "test-support")]
+    pub fn acquire_for_mutation_for_test(&self) -> MutateGuard<'_> {
+        self.acquire_for_mutation()
+    }
+
     /// Held for an entire GC tick (erratum1 E1) — see `gc::gc_worker_tick`.
-    pub fn acquire_gc_serial(&self) -> MutexGuard<'_, ()> {
+    pub(crate) fn acquire_gc_serial(&self) -> MutexGuard<'_, ()> {
         self.gc_serial.acquire()
+    }
+
+    #[cfg(feature = "test-support")]
+    pub fn acquire_gc_serial_for_test(&self) -> MutexGuard<'_, ()> {
+        self.acquire_gc_serial()
     }
 
     /// Builds `t` against a fresh read (guard held for the whole section)
@@ -199,22 +213,24 @@ impl ControlRecordCell {
         Ok(new)
     }
 
-    /// GC-shaped variant: `build` runs against a freshly read base *under*
-    /// the guard and may report "nothing to do" (`None`) against that
-    /// fresh state (e.g. the targeted entry was already resolved by a
-    /// concurrent caller) — returns `Ok(None)` in that case rather than
-    /// committing anything. Same privileged-transition rejection as
-    /// `commit` — `build`'s output is checked after it runs, since the
-    /// whole point of this variant is that the transition is not known
-    /// until `build` sees a fresh read.
-    pub fn commit_built(
-        &self,
-        build: impl FnOnce(&MeshSignerControlRecordV1) -> Option<RecordTransition>,
-        now: u64,
-        max_cap: usize,
-    ) -> Result<Option<MeshSignerControlRecordV1>, CommitTransitionError> {
-        self.commit_built_impl(build, now, max_cap, true)
-    }
+    // Round 6, wave 10 (item 4): the public `commit_built` is GONE.
+    //
+    // It ran a caller-supplied `FnOnce` while holding the EXCLUSIVE
+    // `MutateGuard` (the closure executed between acquiring the guard and
+    // the commit, see `commit_built_impl`). That is the same defect class
+    // wave 9 removed from the sign path and it survived here on the
+    // mutation path: the closure could hold the write guard for unbounded
+    // work (starving an urgent `RevokeUrgent`), and could capture `cell`
+    // and call back into `commit`/`acquire_for_mutation` on the SAME
+    // thread, asking for `access` exclusive while already holding it —
+    // a self-deadlock reachable straight from the public API.
+    //
+    // It had zero callers anywhere (neither `src/` nor `tests/`), so this
+    // is a removal, not a migration. `commit` — which takes an
+    // already-built transition and runs no foreign code under the guard —
+    // remains the public mutation surface, and `commit_built_privileged`
+    // below stays crate-internal for `gc`/`activate`, which must build
+    // against a fresh read under the guard after gathering real evidence.
 
     /// Crate-internal only: identical to `commit_built` but WITHOUT the
     /// privileged-transition rejection. Exists solely for
@@ -229,7 +245,7 @@ impl ControlRecordCell {
         now: u64,
         max_cap: usize,
     ) -> Result<Option<MeshSignerControlRecordV1>, CommitTransitionError> {
-        self.commit_built_impl(build, now, max_cap, false)
+        self.commit_built_impl(build, now, max_cap)
     }
 
     fn commit_built_impl(
@@ -237,7 +253,6 @@ impl ControlRecordCell {
         build: impl FnOnce(&MeshSignerControlRecordV1) -> Option<RecordTransition>,
         now: u64,
         max_cap: usize,
-        reject_privileged: bool,
     ) -> Result<Option<MeshSignerControlRecordV1>, CommitTransitionError> {
         let guard = self.locks.acquire_for_mutation();
         let base = match self.store.load_canonical() {
@@ -248,16 +263,18 @@ impl ControlRecordCell {
         let Some(t) = build(&base) else {
             return Ok(None);
         };
-        if reject_privileged && is_privileged(&t) {
-            return Err(CommitTransitionError::PrivilegedTransition);
-        }
         let new = apply(&base, &t, now, max_cap)?;
         commit_new_bytes(&self.store, &guard, base.revision, &new, 8)?;
         Ok(Some(new))
     }
 
-    pub fn sweep_orphan_tmp(&self, guard: &MutateGuard<'_>) {
+    pub(crate) fn sweep_orphan_tmp(&self, guard: &MutateGuard<'_>) {
         self.store.sweep_orphan_tmp(guard);
+    }
+
+    #[cfg(feature = "test-support")]
+    pub fn sweep_orphan_tmp_for_test(&self, guard: &MutateGuard<'_>) {
+        self.sweep_orphan_tmp(guard);
     }
 
     /// Explicit escape hatch for adversarial test setup ONLY — bypasses

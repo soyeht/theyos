@@ -20,8 +20,8 @@ use mesh_session_control_model_rs::secret_backend::{
     LoadExactOutcome, SecretBackend,
 };
 use mesh_session_control_model_rs::sign::{
-    FakeSignPrimitive, FixedClock, OpaqueSignPreimage, RendezvousClock, SignCheckedError,
-    SignerCapabilityError, SteppableClock, load_signer_capability, sign_checked,
+    FakeSignPrimitive, FakeSignerSource, FixedClock, OpaqueSignPreimage, RendezvousClock,
+    SignCheckedError, SignerCapabilityError, SteppableClock, load_signer_capability, sign_checked,
 };
 use mesh_session_control_model_rs::store::{AtomicControlRecordStore, LoadOutcome, ReplaceOutcome};
 use mesh_session_control_model_rs::transition::{RecordTransition, TransitionError, apply};
@@ -130,7 +130,7 @@ fn record_with_gc_entries(entries: Vec<GcEntry>) -> MeshSignerControlRecordV1 {
 /// onto disk now that genesis is restricted to the exact canonical shape.
 fn seed_record(cell: &ControlRecordCell, seeded: &MeshSignerControlRecordV1) {
     let bootstrap = MeshSignerControlRecordV1::bootstrap(seeded.identity.clone(), seeded.purpose);
-    let g = cell.acquire_for_mutation();
+    let g = cell.acquire_for_mutation_for_test();
     assert_eq!(
         cell.seed_for_test(&g, INITIAL_REVISION, &bootstrap),
         ReplaceOutcome::Committed
@@ -253,7 +253,7 @@ fn store_cas_rejects_stale_revision() {
     let cell = test_cell(dir.path().join("record"));
     let bootstrapped = MeshSignerControlRecordV1::bootstrap(identity(), PurposeId::MeshSession);
     {
-        let g = cell.acquire_for_mutation();
+        let g = cell.acquire_for_mutation_for_test();
         assert_eq!(
             cell.seed_for_test(&g, INITIAL_REVISION, &bootstrapped),
             ReplaceOutcome::Committed
@@ -272,7 +272,7 @@ fn store_cas_rejects_stale_revision() {
     )
     .unwrap();
     {
-        let g = cell.acquire_for_mutation();
+        let g = cell.acquire_for_mutation_for_test();
         assert_eq!(
             cell.seed_for_test(&g, bootstrapped.revision, &writer_a_next),
             ReplaceOutcome::Committed
@@ -292,7 +292,7 @@ fn store_cas_rejects_stale_revision() {
         TEST_CAP,
     )
     .unwrap();
-    let g = cell.acquire_for_mutation();
+    let g = cell.acquire_for_mutation_for_test();
     assert_eq!(
         cell.seed_for_test(&g, bootstrapped.revision, &writer_b_next),
         ReplaceOutcome::KnownNoEffect,
@@ -310,7 +310,7 @@ fn two_writers_race_a_stale_base_under_a_barrier_exactly_one_commits() {
     let cell = test_cell(dir.path().join("record"));
     let bootstrapped = MeshSignerControlRecordV1::bootstrap(identity(), PurposeId::MeshSession);
     {
-        let g = cell.acquire_for_mutation();
+        let g = cell.acquire_for_mutation_for_test();
         assert_eq!(
             cell.seed_for_test(&g, INITIAL_REVISION, &bootstrapped),
             ReplaceOutcome::Committed
@@ -346,12 +346,12 @@ fn two_writers_race_a_stale_base_under_a_barrier_exactly_one_commits() {
     let base_rev = bootstrapped.revision;
     let h1 = std::thread::spawn(move || {
         b1.wait();
-        let g = c1.acquire_for_mutation();
+        let g = c1.acquire_for_mutation_for_test();
         c1.seed_for_test(&g, base_rev, &new_a)
     });
     let h2 = std::thread::spawn(move || {
         b2.wait();
-        let g = c2.acquire_for_mutation();
+        let g = c2.acquire_for_mutation_for_test();
         c2.seed_for_test(&g, base_rev, &new_b)
     });
     let o1 = h1.join().unwrap();
@@ -380,7 +380,7 @@ fn store_rejects_new_record_revision_not_old_plus_one() {
     let cell = test_cell(dir.path().join("record"));
     let bootstrapped = MeshSignerControlRecordV1::bootstrap(identity(), PurposeId::MeshSession);
     {
-        let g = cell.acquire_for_mutation();
+        let g = cell.acquire_for_mutation_for_test();
         assert_eq!(
             cell.seed_for_test(&g, INITIAL_REVISION, &bootstrapped),
             ReplaceOutcome::Committed
@@ -388,7 +388,7 @@ fn store_rejects_new_record_revision_not_old_plus_one() {
     }
     let mut forged = bootstrapped.clone();
     forged.revision = 99;
-    let g = cell.acquire_for_mutation();
+    let g = cell.acquire_for_mutation_for_test();
     assert_eq!(
         cell.seed_for_test(&g, INITIAL_REVISION, &forged),
         ReplaceOutcome::KnownNoEffect,
@@ -403,7 +403,7 @@ fn store_missing_rejects_non_canonical_first_write() {
     let mut forged_genesis =
         MeshSignerControlRecordV1::bootstrap(identity(), PurposeId::MeshSession);
     forged_genesis.epoch_high_water = NonZeroU64::new(5).unwrap();
-    let g = cell.acquire_for_mutation();
+    let g = cell.acquire_for_mutation_for_test();
     assert_eq!(
         cell.seed_for_test(&g, INITIAL_REVISION, &forged_genesis),
         ReplaceOutcome::KnownNoEffect,
@@ -419,7 +419,7 @@ fn genesis_write_is_validated_against_the_stores_own_bound_identity_not_new_reco
     let mut other_identity = identity();
     other_identity.hh_id = "hh_other".into();
     let forged = MeshSignerControlRecordV1::bootstrap(other_identity, PurposeId::MeshSession);
-    let g = cell.acquire_for_mutation();
+    let g = cell.acquire_for_mutation_for_test();
     assert_eq!(
         cell.seed_for_test(&g, INITIAL_REVISION, &forged),
         ReplaceOutcome::KnownNoEffect,
@@ -563,7 +563,7 @@ fn store_write_then_read_round_trips_through_canonicalization() {
     let dir = tempfile::tempdir().unwrap();
     let cell = test_cell(dir.path().join("record"));
     let rec = MeshSignerControlRecordV1::bootstrap(identity(), PurposeId::MeshSession);
-    let g = cell.acquire_for_mutation();
+    let g = cell.acquire_for_mutation_for_test();
     assert_eq!(
         cell.seed_for_test(&g, INITIAL_REVISION, &rec),
         ReplaceOutcome::Committed
@@ -673,8 +673,8 @@ fn orphan_tmp_is_swept_without_blocking_future_attempts() {
     .unwrap();
     let cell = test_cell(record_path.clone());
     {
-        let g = cell.acquire_for_mutation();
-        cell.sweep_orphan_tmp(&g);
+        let g = cell.acquire_for_mutation_for_test();
+        cell.sweep_orphan_tmp_for_test(&g);
     }
     assert!(
         !record_path
@@ -683,7 +683,7 @@ fn orphan_tmp_is_swept_without_blocking_future_attempts() {
         "an orphan tmp targeting a revision below current (there is no current record at all, so it predates this session) must be removed"
     );
     let rec = MeshSignerControlRecordV1::bootstrap(identity(), PurposeId::MeshSession);
-    let g = cell.acquire_for_mutation();
+    let g = cell.acquire_for_mutation_for_test();
     assert_eq!(
         cell.seed_for_test(&g, INITIAL_REVISION, &rec),
         ReplaceOutcome::Committed
@@ -2493,7 +2493,7 @@ fn activate_from_key_observed_rejects_purpose_type_mismatch() {
     let cell = test_cell(dir.path().join("record"));
     let old = MeshSignerControlRecordV1::bootstrap(identity(), PurposeId::MeshSession);
     {
-        let g = cell.acquire_for_mutation();
+        let g = cell.acquire_for_mutation_for_test();
         assert_eq!(
             cell.seed_for_test(&g, INITIAL_REVISION, &old),
             ReplaceOutcome::Committed
@@ -2531,7 +2531,7 @@ fn activate_from_key_observed_rejects_when_physical_key_not_confirmed() {
     let cell = test_cell(dir.path().join("record"));
     let (with_intent, p) = pending_intent_record();
     {
-        let g = cell.acquire_for_mutation();
+        let g = cell.acquire_for_mutation_for_test();
         let base = MeshSignerControlRecordV1::bootstrap(identity(), PurposeId::MeshSession);
         assert_eq!(
             cell.seed_for_test(&g, INITIAL_REVISION, &base),
@@ -2560,7 +2560,7 @@ fn activate_from_key_observed_rejects_when_physical_key_not_confirmed() {
     )
     .unwrap();
     {
-        let g = cell.acquire_for_mutation();
+        let g = cell.acquire_for_mutation_for_test();
         assert_eq!(
             cell.seed_for_test(&g, with_intent.revision, &with_binding),
             ReplaceOutcome::Committed
@@ -2605,7 +2605,7 @@ fn activate_from_key_observed_succeeds_full_path() {
     )
     .unwrap();
     {
-        let g = cell.acquire_for_mutation();
+        let g = cell.acquire_for_mutation_for_test();
         assert_eq!(
             cell.seed_for_test(&g, INITIAL_REVISION, &old),
             ReplaceOutcome::Committed
@@ -2643,7 +2643,7 @@ fn activate_from_key_observed_succeeds_full_path() {
     )
     .unwrap();
     {
-        let g = cell.acquire_for_mutation();
+        let g = cell.acquire_for_mutation_for_test();
         assert_eq!(
             cell.seed_for_test(&g, with_intent.revision, &with_binding),
             ReplaceOutcome::Committed
@@ -2759,7 +2759,7 @@ fn activate_does_not_block_a_concurrent_urgent_revoke_during_slow_roster_lookup(
     let cell = test_cell(dir.path().join("record"));
     let old = MeshSignerControlRecordV1::bootstrap(identity(), PurposeId::MeshSession);
     {
-        let g = cell.acquire_for_mutation();
+        let g = cell.acquire_for_mutation_for_test();
         assert_eq!(
             cell.seed_for_test(&g, INITIAL_REVISION, &old),
             ReplaceOutcome::Committed
@@ -2802,7 +2802,7 @@ fn activate_does_not_block_a_concurrent_urgent_revoke_during_slow_roster_lookup(
     )
     .unwrap();
     {
-        let g = cell.acquire_for_mutation();
+        let g = cell.acquire_for_mutation_for_test();
         assert_eq!(
             cell.seed_for_test(&g, old.revision, &with_intent),
             ReplaceOutcome::Committed
@@ -2846,7 +2846,7 @@ fn activate_does_not_block_a_concurrent_urgent_revoke_during_slow_roster_lookup(
         // While activate is blocked in the roster lookup, an urgent revoke
         // must still be able to proceed -- proving no exclusive guard is
         // held across that call.
-        let revoke_g = cell.acquire_for_mutation();
+        let revoke_g = cell.acquire_for_mutation_for_test();
         let revoked = apply(
             &with_binding,
             &RecordTransition::RevokeUrgent {
@@ -2949,7 +2949,7 @@ fn load_canonical_rejects_an_unknown_field_nested_inside_a_substruct() {
     let cell = test_cell(path.clone());
     let rec = MeshSignerControlRecordV1::bootstrap(identity(), PurposeId::MeshSession);
     {
-        let g = cell.acquire_for_mutation();
+        let g = cell.acquire_for_mutation_for_test();
         assert_eq!(
             cell.seed_for_test(&g, INITIAL_REVISION, &rec),
             ReplaceOutcome::Committed
@@ -3635,10 +3635,10 @@ fn gc_serial_is_owned_by_the_cell_so_two_ticks_against_the_same_cell_serialize()
     let cell = test_cell(dir.path().join("record"));
     let (acquired_tx, acquired_rx) = std::sync::mpsc::channel();
 
-    let g1 = cell.acquire_gc_serial();
+    let g1 = cell.acquire_gc_serial_for_test();
     let c2 = Arc::clone(&cell);
     let handle = std::thread::spawn(move || {
-        let _g2 = c2.acquire_gc_serial();
+        let _g2 = c2.acquire_gc_serial_for_test();
         acquired_tx.send(()).unwrap();
     });
     // A short timeout proves the second acquire is genuinely BLOCKED (not
@@ -4237,7 +4237,7 @@ fn activate_rejects_when_roster_already_changed_before_the_lease_attempt() {
     )
     .unwrap();
     {
-        let g = cell.acquire_for_mutation();
+        let g = cell.acquire_for_mutation_for_test();
         assert_eq!(
             cell.seed_for_test(&g, INITIAL_REVISION, &old),
             ReplaceOutcome::Committed
@@ -4312,7 +4312,7 @@ fn commit_rejects_activate_from_key_observed_directly() {
     let cell = test_cell(dir.path().join("record"));
     let old = MeshSignerControlRecordV1::bootstrap(identity(), PurposeId::MeshSession);
     {
-        let g = cell.acquire_for_mutation();
+        let g = cell.acquire_for_mutation_for_test();
         assert_eq!(
             cell.seed_for_test(&g, INITIAL_REVISION, &old),
             ReplaceOutcome::Committed
@@ -4435,7 +4435,7 @@ fn load_canonical_rejects_a_cbor_valid_but_semantically_inconsistent_record() {
     // produce this; only a hand-corrupted file can.
     corrupt.authority = Authority::Active;
     {
-        let g = cell.acquire_for_mutation();
+        let g = cell.acquire_for_mutation_for_test();
         assert_eq!(
             cell.seed_for_test(&g, INITIAL_REVISION, &bootstrap),
             ReplaceOutcome::Committed
@@ -4819,7 +4819,7 @@ fn six_real_processes_racing_one_pinned_revision_exactly_one_cas_wins() {
     let pinned_revision = {
         let cell = test_cell(path.clone());
         let bootstrap = MeshSignerControlRecordV1::bootstrap(identity(), PurposeId::MeshSession);
-        let g = cell.acquire_for_mutation();
+        let g = cell.acquire_for_mutation_for_test();
         assert_eq!(
             cell.seed_for_test(&g, INITIAL_REVISION, &bootstrap),
             ReplaceOutcome::Committed
@@ -4866,7 +4866,7 @@ fn unpinned_sequential_runs_both_commit_which_is_why_the_old_test_was_vacuous() 
     {
         let cell = test_cell(path.clone());
         let bootstrap = MeshSignerControlRecordV1::bootstrap(identity(), PurposeId::MeshSession);
-        let g = cell.acquire_for_mutation();
+        let g = cell.acquire_for_mutation_for_test();
         assert_eq!(
             cell.seed_for_test(&g, INITIAL_REVISION, &bootstrap),
             ReplaceOutcome::Committed
@@ -4906,7 +4906,7 @@ fn preexisting_hardlink_alias_makes_every_process_fail_closed_not_double_commit(
     {
         let cell = test_cell(path.clone());
         let bootstrap = MeshSignerControlRecordV1::bootstrap(identity(), PurposeId::MeshSession);
-        let g = cell.acquire_for_mutation();
+        let g = cell.acquire_for_mutation_for_test();
         assert_eq!(
             cell.seed_for_test(&g, INITIAL_REVISION, &bootstrap),
             ReplaceOutcome::Committed
@@ -5274,27 +5274,48 @@ fn sign_fixture(
 }
 
 fn preimage() -> OpaqueSignPreimage {
-    OpaqueSignPreimage::new(vec![0xAB, 0xCD, 0xEF])
+    OpaqueSignPreimage::for_test(vec![0xAB, 0xCD, 0xEF])
+}
+
+fn binding_of(record: &MeshSignerControlRecordV1, generation: NonZeroU64) -> ExactBinding {
+    record
+        .live_generations
+        .iter()
+        .find(|g| g.generation == generation)
+        .expect("generation must be live")
+        .binding
+        .clone()
+}
+
+/// A source holding exactly the signer for `generation`.
+fn source_for(
+    record: &MeshSignerControlRecordV1,
+    generation: NonZeroU64,
+    tag: u8,
+) -> FakeSignerSource {
+    FakeSignerSource::new(vec![(
+        binding_of(record, generation),
+        FakeSignPrimitive::new(tag),
+    )])
 }
 
 #[test]
 fn sign_checked_accepts_the_correct_current_signer() {
     let dir = tempfile::tempdir().unwrap();
     let spy = Arc::new(OrderSpy::new());
-    let (cell, backend, activated) = sign_fixture(dir.path().join("record"), Arc::clone(&spy));
+    let (cell, _backend, activated) = sign_fixture(dir.path().join("record"), Arc::clone(&spy));
     let policy = DelegationPolicy::test(1000);
     let clock = FixedClock(50);
-    let primitive = FakeSignPrimitive::new(7);
     let generation = activated.current_generation.unwrap();
+    let source = source_for(&activated, generation, 7);
 
     let cap = load_signer_capability::<MeshSessionPurpose>(
         &cell,
-        &backend,
+        &source,
         &policy,
         &active_roster(),
         &AlwaysTrueVerifier,
         &clock,
-        &primitive,
         generation,
     )
     .expect("a genuinely live current generation must load a capability");
@@ -5302,22 +5323,198 @@ fn sign_checked_accepts_the_correct_current_signer() {
 
     let sig = sign_checked(&cell, &active_roster(), &clock, &cap, &preimage())
         .expect("a sealed, still-valid capability must sign");
-    assert_eq!(sig.as_bytes()[0], 7, "the SAME signer's primitive must run");
+    assert_eq!(
+        sig.as_bytes()[0],
+        7,
+        "the derived signer's primitive must run"
+    );
     assert_eq!(&sig.as_bytes()[1..], preimage().as_bytes());
-    assert_eq!(primitive.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert_eq!(source.total_calls(), 1);
+}
+
+/// RED for kiana's independent point (1), restated structurally: with two
+/// physically distinct signers present, validating generation B must reach
+/// B's signer and can never reach A's. There is no longer a parameter
+/// through which A could be supplied at all — the compile-fail half of this
+/// lives in `src/lib.rs` (no `SignerSource`/`SignPrimitive` impl is
+/// nameable downstream), and this half proves the runtime wiring.
+#[test]
+fn sign_checked_can_only_reach_the_signer_of_the_validated_entry() {
+    let dir = tempfile::tempdir().unwrap();
+    let spy = Arc::new(OrderSpy::new());
+    let cell = test_cell_with_spy(dir.path().join("record"), Arc::clone(&spy));
+    let (_backend, record, older, current) = two_live_generations_fixture(200);
+    seed_record(&cell, &record);
+
+    let binding_a = binding_of(&record, older); // the signer that must NEVER run
+    let binding_b = binding_of(&record, current); // the one being validated
+    assert_ne!(binding_a, binding_b);
+    let source = FakeSignerSource::new(vec![
+        (binding_a.clone(), FakeSignPrimitive::new(0xAA)),
+        (binding_b.clone(), FakeSignPrimitive::new(0xBB)),
+    ]);
+
+    let policy = DelegationPolicy::test(1000);
+    let clock = FixedClock(50);
+    let cap = load_signer_capability::<MeshSessionPurpose>(
+        &cell,
+        &source,
+        &policy,
+        &active_roster(),
+        &AlwaysTrueVerifier,
+        &clock,
+        current,
+    )
+    .expect("loads against the current generation");
+
+    let sig = sign_checked(&cell, &active_roster(), &clock, &cap, &preimage()).expect("signs");
+    assert_eq!(
+        sig.as_bytes()[0],
+        0xBB,
+        "the signature must come from the signer of the VALIDATED entry"
+    );
+    assert_eq!(source.calls_for(&binding_b), Some(1));
+    assert_eq!(
+        source.calls_for(&binding_a),
+        Some(0),
+        "the other physically distinct signer must never be called -- it is not reachable from a capability validated against B"
+    );
+}
+
+#[test]
+fn a_capability_cannot_be_born_from_an_entry_the_source_does_not_have() {
+    // The Absent arm carries no signer at all, so there is nothing to seal.
+    let dir = tempfile::tempdir().unwrap();
+    let spy = Arc::new(OrderSpy::new());
+    let (cell, _backend, activated) = sign_fixture(dir.path().join("record"), Arc::clone(&spy));
+    let generation = activated.current_generation.unwrap();
+    let empty = FakeSignerSource::new(vec![]);
+    let err = load_signer_capability::<MeshSessionPurpose>(
+        &cell,
+        &empty,
+        &DelegationPolicy::test(1000),
+        &active_roster(),
+        &AlwaysTrueVerifier,
+        &FixedClock(50),
+        generation,
+    )
+    .unwrap_err();
+    assert!(
+        matches!(
+            err,
+            SignerCapabilityError::Validation(ValidationError::PhysicalKeyNotConfirmed)
+        ),
+        "got {err:?}"
+    );
+    assert_eq!(empty.total_calls(), 0);
+}
+
+/// RED for kiana's independent point (2): a capability validated against
+/// roster revision 0 must not sign after the roster moved to revision 1.
+/// The predecessor sampled the revision at USE time, so the lease compared
+/// the current revision with itself and could never fail.
+#[test]
+fn a_roster_change_after_validation_refuses_the_sign_with_zero_primitive_calls() {
+    let dir = tempfile::tempdir().unwrap();
+    let spy = Arc::new(OrderSpy::new());
+    let (cell, _backend, activated) = sign_fixture(dir.path().join("record"), Arc::clone(&spy));
+    let policy = DelegationPolicy::test(1000);
+    let clock = FixedClock(50);
+    let generation = activated.current_generation.unwrap();
+    let source = source_for(&activated, generation, 12);
+    // A genuinely mutable roster: revision 0 at validation, 1 after the
+    // revoke. FixedRoster could not express this at all -- its
+    // `currency_revision` is a hardcoded 0, which is exactly why the
+    // predecessor's REDs could not catch this.
+    let roster = LeaseEnforcingRoster::active(vec![1, 2, 3], [9u8; 32]);
+
+    let cap = load_signer_capability::<MeshSessionPurpose>(
+        &cell,
+        &source,
+        &policy,
+        &roster,
+        &AlwaysTrueVerifier,
+        &clock,
+        generation,
+    )
+    .expect("validates against roster revision 0");
+
+    roster.revoke_on_roster_side(); // revision 0 -> 1, delegator revoked
+
+    let err = sign_checked(&cell, &roster, &clock, &cap, &preimage()).unwrap_err();
+    assert!(
+        matches!(err, SignCheckedError::RosterChanged(_)),
+        "a capability validated at revision 0 must not sign under revision 1; got {err:?}"
+    );
+    assert_eq!(
+        source.total_calls(),
+        0,
+        "zero signatures may be produced once the roster moved"
+    );
+}
+
+/// RED for kiana's independent point (3): a delegation field that the old
+/// enumerated projection did not compare (here `sig`) must still refuse,
+/// even though slot/binding/delegator/not_after are all unchanged.
+#[test]
+fn a_changed_delegation_signature_refuses_even_with_an_identical_binding_tuple() {
+    let dir = tempfile::tempdir().unwrap();
+    let spy = Arc::new(OrderSpy::new());
+    let (cell, _backend, activated) = sign_fixture(dir.path().join("record"), Arc::clone(&spy));
+    let policy = DelegationPolicy::test(1000);
+    let clock = FixedClock(50);
+    let generation = activated.current_generation.unwrap();
+    let source = source_for(&activated, generation, 13);
+
+    let cap = load_signer_capability::<MeshSessionPurpose>(
+        &cell,
+        &source,
+        &policy,
+        &active_roster(),
+        &AlwaysTrueVerifier,
+        &clock,
+        generation,
+    )
+    .expect("loads");
+
+    // Same slot, same binding, same delegator, same not_after -- only the
+    // delegation signature differs.
+    let mut tampered = activated.clone();
+    let g = &mut tampered.live_generations[0];
+    assert_eq!(g.generation, generation);
+    let before = g.clone();
+    g.delegation.sig = vec![0xDE, 0xAD, 0xBE, 0xEF];
+    assert_eq!(g.binding, before.binding);
+    assert_eq!(g.binding.slot, before.binding.slot);
+    assert_eq!(
+        g.delegation.delegator_m_id,
+        before.delegation.delegator_m_id
+    );
+    assert_eq!(g.not_after, before.not_after);
+    assert_ne!(*g, before, "only the non-projected field changed");
+    tampered.revision = activated.revision + 1;
+    {
+        let guard = cell.acquire_for_mutation_for_test();
+        assert_eq!(
+            cell.seed_for_test(&guard, activated.revision, &tampered),
+            ReplaceOutcome::Committed
+        );
+    }
+
+    let err = sign_checked(&cell, &active_roster(), &clock, &cap, &preimage()).unwrap_err();
+    assert!(
+        matches!(err, SignCheckedError::GenerationChanged),
+        "a delegation change outside the old projection must still refuse; got {err:?}"
+    );
+    assert_eq!(source.total_calls(), 0);
 }
 
 #[test]
 fn sign_checked_accepts_an_older_still_live_overlapping_generation() {
-    // The predecessor made this case impossible to express: it always
-    // selected `current_generation`, so a signer on an older generation
-    // that is still live until its own not_after could never ask for
-    // authorization for ITS OWN generation. That is a legitimate rotate
-    // overlap, not an attack.
     let dir = tempfile::tempdir().unwrap();
     let spy = Arc::new(OrderSpy::new());
     let cell = test_cell_with_spy(dir.path().join("record"), Arc::clone(&spy));
-    let (backend, record, older, current) = two_live_generations_fixture(180);
+    let (_backend, record, older, current) = two_live_generations_fixture(180);
     seed_record(&cell, &record);
     assert!(
         older < current,
@@ -5326,51 +5523,44 @@ fn sign_checked_accepts_an_older_still_live_overlapping_generation() {
 
     let policy = DelegationPolicy::test(1000);
     let clock = FixedClock(50);
-    let primitive = FakeSignPrimitive::new(9);
+    let source = source_for(&record, older, 9);
     let cap = load_signer_capability::<MeshSessionPurpose>(
         &cell,
-        &backend,
+        &source,
         &policy,
         &active_roster(),
         &AlwaysTrueVerifier,
         &clock,
-        &primitive,
         older,
     )
     .expect("an older generation that is still live must be able to authorize its own signer");
     assert_eq!(cap.generation(), older);
     sign_checked(&cell, &active_roster(), &clock, &cap, &preimage())
         .expect("the overlapping older signer must be able to sign");
+    assert_eq!(source.total_calls(), 1);
 }
 
 #[test]
 fn sign_checked_rejects_a_signer_held_across_a_revoke_reactivate_cycle() {
-    // The core P0-1 case: an old signer still in memory after the record
-    // has been revoked and reactivated. RevokeUrgent + Reactivate strictly
-    // increase epoch_high_water, and the capability is sealed to the epoch
-    // it was loaded under, so the stale signer fails under the guard even
-    // though a brand-new generation may be perfectly live.
     let dir = tempfile::tempdir().unwrap();
     let spy = Arc::new(OrderSpy::new());
-    let (cell, backend, activated) = sign_fixture(dir.path().join("record"), Arc::clone(&spy));
+    let (cell, _backend, activated) = sign_fixture(dir.path().join("record"), Arc::clone(&spy));
     let policy = DelegationPolicy::test(1000);
     let clock = FixedClock(50);
-    let primitive = FakeSignPrimitive::new(3);
     let generation = activated.current_generation.unwrap();
+    let source = source_for(&activated, generation, 3);
 
     let cap = load_signer_capability::<MeshSessionPurpose>(
         &cell,
-        &backend,
+        &source,
         &policy,
         &active_roster(),
         &AlwaysTrueVerifier,
         &clock,
-        &primitive,
         generation,
     )
     .expect("loads while still active");
 
-    // Revoke, then reactivate -- the epoch strictly increases.
     cell.commit(
         &RecordTransition::RevokeUrgent {
             reason: RevocationReason::OwnerAction,
@@ -5401,33 +5591,26 @@ fn sign_checked_rejects_a_signer_held_across_a_revoke_reactivate_cycle() {
         ),
         "a signer from before a revoke/reactivate cycle must be refused; got {err:?}"
     );
-    assert_eq!(
-        primitive.calls.load(std::sync::atomic::Ordering::SeqCst),
-        0,
-        "the physical primitive must never run for a refused signer"
-    );
+    assert_eq!(source.total_calls(), 0);
 }
 
 #[test]
-fn sign_checked_rejects_epoch_binding_slot_and_purpose_mismatches() {
+fn sign_checked_rejects_generation_and_purpose_mismatches() {
     let dir = tempfile::tempdir().unwrap();
     let spy = Arc::new(OrderSpy::new());
-    let (cell, backend, activated) = sign_fixture(dir.path().join("record"), Arc::clone(&spy));
+    let (cell, _backend, activated) = sign_fixture(dir.path().join("record"), Arc::clone(&spy));
     let policy = DelegationPolicy::test(1000);
     let clock = FixedClock(50);
-    let primitive = FakeSignPrimitive::new(1);
     let generation = activated.current_generation.unwrap();
+    let source = source_for(&activated, generation, 1);
 
-    // purpose: the type parameter alone must not decide which record this
-    // is -- loading a MeshSession record as RosterSync must fail.
     let purpose_err = load_signer_capability::<RosterSyncPurpose>(
         &cell,
-        &backend,
+        &source,
         &policy,
         &active_roster(),
         &AlwaysTrueVerifier,
         &clock,
-        &primitive,
         generation,
     )
     .unwrap_err();
@@ -5439,16 +5622,14 @@ fn sign_checked_rejects_epoch_binding_slot_and_purpose_mismatches() {
         "got {purpose_err:?}"
     );
 
-    // generation: a generation that is not live cannot be sealed at all.
     let bogus_generation = NonZeroU64::new(generation.get() + 41).unwrap();
     let gen_err = load_signer_capability::<MeshSessionPurpose>(
         &cell,
-        &backend,
+        &source,
         &policy,
         &active_roster(),
         &AlwaysTrueVerifier,
         &clock,
-        &primitive,
         bogus_generation,
     )
     .unwrap_err();
@@ -5457,13 +5638,10 @@ fn sign_checked_rejects_epoch_binding_slot_and_purpose_mismatches() {
         "got {gen_err:?}"
     );
 
-    // binding/slot: seal a capability against the OLDER of two live
-    // generations, then let that generation lapse out of live_generations.
-    // (GenerationExpired legitimately refuses to remove the *current*
-    // generation, so the overlap fixture is what makes this reachable.)
+    // A capability whose generation later leaves live_generations.
     let dir2 = tempfile::tempdir().unwrap();
     let cell2 = test_cell_with_spy(dir2.path().join("record"), Arc::new(OrderSpy::new()));
-    let (backend2, record2, older, _current) = two_live_generations_fixture(190);
+    let (_backend2, record2, older, _current) = two_live_generations_fixture(190);
     seed_record(&cell2, &record2);
     let older_not_after = record2
         .live_generations
@@ -5471,15 +5649,14 @@ fn sign_checked_rejects_epoch_binding_slot_and_purpose_mismatches() {
         .find(|g| g.generation == older)
         .unwrap()
         .not_after;
-    let primitive2 = FakeSignPrimitive::new(11);
+    let source2 = source_for(&record2, older, 11);
     let cap = load_signer_capability::<MeshSessionPurpose>(
         &cell2,
-        &backend2,
+        &source2,
         &policy,
         &active_roster(),
         &AlwaysTrueVerifier,
         &clock,
-        &primitive2,
         older,
     )
     .expect("loads against the older, still-live generation");
@@ -5493,28 +5670,20 @@ fn sign_checked_rejects_epoch_binding_slot_and_purpose_mismatches() {
     let err = sign_checked(&cell2, &active_roster(), &clock, &cap, &preimage()).unwrap_err();
     assert!(
         matches!(err, SignCheckedError::GenerationNotLive),
-        "a capability whose generation left live_generations must be refused; got {err:?}"
+        "got {err:?}"
     );
-    assert_eq!(
-        primitive2.calls.load(std::sync::atomic::Ordering::SeqCst),
-        0
-    );
-    assert_eq!(primitive.calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+    assert_eq!(source2.total_calls(), 0);
+    assert_eq!(source.total_calls(), 0);
 }
 
 #[test]
 fn sign_checked_refuses_when_the_clock_crosses_expiry_during_the_slow_load() {
-    // P0-2. The predecessor took one scalar `now` before the slow I/O and
-    // never re-read it, so a delegation validated at not_after - 1 still ran
-    // the authorized operation after not_after. The clock is now injected
-    // and re-sampled under both locks; this test advances it past not_after
-    // WHILE the slow roster query is parked, using a real rendezvous.
     let dir = tempfile::tempdir().unwrap();
     let spy = Arc::new(OrderSpy::new());
-    let (cell, backend, activated) = sign_fixture(dir.path().join("record"), Arc::clone(&spy));
+    let (cell, _backend, activated) = sign_fixture(dir.path().join("record"), Arc::clone(&spy));
     let policy = DelegationPolicy::test(1000);
-    let primitive = FakeSignPrimitive::new(5);
     let generation = activated.current_generation.unwrap();
+    let source = source_for(&activated, generation, 5);
     let not_after = activated.live_generations[0].not_after;
 
     let (ready_tx, ready_rx) = std::sync::mpsc::channel();
@@ -5523,27 +5692,23 @@ fn sign_checked_refuses_when_the_clock_crosses_expiry_during_the_slow_load() {
         ready_tx: Mutex::new(Some(ready_tx)),
         proceed_rx: Mutex::new(proceed_rx),
     };
-    // Starts comfortably inside the delegation's validity window.
     let clock = SteppableClock::new(not_after - 1);
 
     std::thread::scope(|scope| {
         let handle = scope.spawn(|| {
             let cap = load_signer_capability::<MeshSessionPurpose>(
                 &cell,
-                &backend,
+                &source,
                 &policy,
                 &roster,
                 &AlwaysTrueVerifier,
                 &clock,
-                &primitive,
                 generation,
             )?;
             sign_checked(&cell, &active_roster(), &clock, &cap, &preimage())
                 .map_err(|_| SignerCapabilityError::Expired)
         });
 
-        // Parked inside the slow roster query, i.e. after the load-time
-        // clock sample and before any lock is taken.
         ready_rx.recv().unwrap();
         clock.set(not_after + 1);
         proceed_tx.send(()).unwrap();
@@ -5555,26 +5720,18 @@ fn sign_checked_refuses_when_the_clock_crosses_expiry_during_the_slow_load() {
         );
     });
 
-    assert_eq!(
-        primitive.calls.load(std::sync::atomic::Ordering::SeqCst),
-        0,
-        "zero signatures may be produced once the delegation has expired"
-    );
+    assert_eq!(source.total_calls(), 0);
 }
 
 #[test]
 fn sign_checked_refuses_a_lease_taken_for_the_wrong_delegator_machine() {
-    // CFX-4. The lease must be taken for the delegator of the generation
-    // actually being signed with. This roster double RECORDS the machine_id
-    // it was asked to lease -- the predecessor's double ignored the
-    // argument entirely, so a lease over the wrong machine was undetectable.
     let dir = tempfile::tempdir().unwrap();
     let spy = Arc::new(OrderSpy::new());
-    let (cell, backend, activated) = sign_fixture(dir.path().join("record"), Arc::clone(&spy));
+    let (cell, _backend, activated) = sign_fixture(dir.path().join("record"), Arc::clone(&spy));
     let policy = DelegationPolicy::test(1000);
     let clock = FixedClock(50);
-    let primitive = FakeSignPrimitive::new(2);
     let generation = activated.current_generation.unwrap();
+    let source = source_for(&activated, generation, 2);
     let expected_machine = activated.live_generations[0]
         .delegation
         .delegator_m_id
@@ -5583,26 +5740,21 @@ fn sign_checked_refuses_a_lease_taken_for_the_wrong_delegator_machine() {
     let roster = MachineRecordingRoster::active(vec![1, 2, 3], [9u8; 32]);
     let cap = load_signer_capability::<MeshSessionPurpose>(
         &cell,
-        &backend,
+        &source,
         &policy,
         &roster,
         &AlwaysTrueVerifier,
         &clock,
-        &primitive,
         generation,
     )
     .expect("loads");
     sign_checked(&cell, &roster, &clock, &cap, &preimage()).expect("signs");
-
     assert_eq!(
         roster.leased_machines(),
-        vec![expected_machine.clone()],
-        "the lease must be taken for the delegator of the signing generation, never another machine"
+        vec![expected_machine],
+        "the lease must be taken for the delegator of the signing generation"
     );
 
-    // Negative half: a roster that only grants leases for a DIFFERENT
-    // machine must make the operation fail rather than silently proceed on
-    // an unrelated machine's lease.
     let wrong = MachineRecordingRoster::active_only_for(
         vec![1, 2, 3],
         [9u8; 32],
@@ -5610,12 +5762,11 @@ fn sign_checked_refuses_a_lease_taken_for_the_wrong_delegator_machine() {
     );
     let cap2 = load_signer_capability::<MeshSessionPurpose>(
         &cell,
-        &backend,
+        &source,
         &policy,
         &wrong,
         &AlwaysTrueVerifier,
         &clock,
-        &primitive,
         generation,
     )
     .expect("loads");
@@ -5628,31 +5779,24 @@ fn sign_checked_refuses_a_lease_taken_for_the_wrong_delegator_machine() {
 
 #[test]
 fn a_concurrent_revoke_cannot_land_while_sign_checked_holds_the_critical_section() {
-    // The linearization property, proven with a REAL observable barrier
-    // rather than a sleep: the rendezvous clock parks the signer at step 6,
-    // under both locks, and the revoke thread is observed reaching its own
-    // acquisition via the lock spy's TurnstileAcquire event.
     let dir = tempfile::tempdir().unwrap();
     let spy = Arc::new(OrderSpy::new());
-    let (cell, backend, activated) = sign_fixture(dir.path().join("record"), Arc::clone(&spy));
+    let (cell, _backend, activated) = sign_fixture(dir.path().join("record"), Arc::clone(&spy));
     let policy = DelegationPolicy::test(1000);
-    let primitive = FakeSignPrimitive::new(4);
     let generation = activated.current_generation.unwrap();
+    let source = source_for(&activated, generation, 4);
 
     let (ready_tx, ready_rx) = std::sync::mpsc::channel();
     let (proceed_tx, proceed_rx) = std::sync::mpsc::channel();
-    // park_on_call = 2: the first sample is in load_signer_capability
-    // (outside every lock); the second is sign_checked's, under both.
     let clock = RendezvousClock::new(50, 2, ready_tx, proceed_rx);
 
     let cap = load_signer_capability::<MeshSessionPurpose>(
         &cell,
-        &backend,
+        &source,
         &policy,
         &active_roster(),
         &AlwaysTrueVerifier,
         &clock,
-        &primitive,
         generation,
     )
     .expect("loads");
@@ -5662,7 +5806,6 @@ fn a_concurrent_revoke_cannot_land_while_sign_checked_holds_the_critical_section
         let signer =
             scope.spawn(|| sign_checked(&cell, &active_roster(), &clock, &cap, &preimage()));
 
-        // Provably inside the critical section now.
         ready_rx.recv().unwrap();
         let turnstiles_before = spy
             .events()
@@ -5685,8 +5828,6 @@ fn a_concurrent_revoke_cannot_land_while_sign_checked_holds_the_critical_section
             r
         });
 
-        // The revoke thread has taken the turnstile and is now blocked on
-        // access-exclusive -- observed, not assumed, not slept for.
         wait_for_events(
             &spy,
             LockEvent::TurnstileAcquire,
@@ -5716,81 +5857,252 @@ fn a_concurrent_revoke_cannot_land_while_sign_checked_holds_the_critical_section
         vec!["sign_done", "revoke_done"],
         "no signature can ever linearize after a revoke"
     );
-    assert_eq!(primitive.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert_eq!(source.total_calls(), 1);
 }
 
+/// Item 4: with the public closure form removed, the only public mutation
+/// surface is `commit`, which runs no caller code under the write guard.
+/// An urgent revoke contending against a hot stream of public mutations
+/// must therefore always get in promptly. Scoped threads only — no detached
+/// thread is leaked here.
 #[test]
-fn repeated_bounded_signing_never_starves_an_urgent_revoke() {
-    // P0-3's remaining half: with the closure gone, each sign_checked holds
-    // the guards only across a sealed, CPU-local primitive, so a revoke
-    // contending against a hot signing loop still gets in promptly. The
-    // turnstile (see locks.rs) is what makes this a real guarantee rather
-    // than luck.
+fn no_public_mutation_surface_can_block_an_urgent_revoke() {
     let dir = tempfile::tempdir().unwrap();
     let spy = Arc::new(OrderSpy::new());
-    let (cell, backend, activated) = sign_fixture(dir.path().join("record"), Arc::clone(&spy));
-    let policy = DelegationPolicy::test(1000);
-    let clock = FixedClock(50);
-    let primitive = FakeSignPrimitive::new(6);
-    let generation = activated.current_generation.unwrap();
+    let cell = test_cell_with_spy(dir.path().join("record"), Arc::clone(&spy));
+    let bootstrap = MeshSignerControlRecordV1::bootstrap(identity(), PurposeId::MeshSession);
+    seed_record(&cell, &{
+        let mut b = bootstrap.clone();
+        b.revision = 1;
+        b
+    });
     let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
     std::thread::scope(|scope| {
         let stop_ref = Arc::clone(&stop);
         let cell_ref = &cell;
-        let backend_ref = &backend;
-        let policy_ref = &policy;
-        let primitive_ref = &primitive;
         scope.spawn(move || {
+            let mut n = 0u8;
             while !stop_ref.load(std::sync::atomic::Ordering::SeqCst) {
-                let Ok(cap) = load_signer_capability::<MeshSessionPurpose>(
-                    cell_ref,
-                    backend_ref,
-                    policy_ref,
-                    &active_roster(),
-                    &AlwaysTrueVerifier,
-                    &clock,
-                    primitive_ref,
-                    generation,
-                ) else {
-                    break; // the revoke landed; nothing left to sign with
-                };
-                if sign_checked(cell_ref, &active_roster(), &clock, &cap, &preimage()).is_err() {
-                    break;
-                }
+                // The public, already-built-transition surface. Each call
+                // holds the write guard only for apply + the commit.
+                let _ = cell_ref.commit(
+                    &RecordTransition::IntentRecorded {
+                        txn_id: [n; 16],
+                        kind: PendingOpKind::Create,
+                        backend: BackendKind::File,
+                    },
+                    1000,
+                    TEST_CAP,
+                );
+                n = n.wrapping_add(1);
             }
         });
 
-        // Let the loop get genuinely hot before contending.
         wait_for_events(
             &spy,
-            LockEvent::AccessAcquireShared,
+            LockEvent::AccessAcquireExclusive,
             20,
-            "the signing loop to become hot",
+            "the mutation loop to become hot",
         );
 
         let started = std::time::Instant::now();
-        cell.commit(
+        let _ = cell.commit(
             &RecordTransition::RevokeUrgent {
                 reason: RevocationReason::OwnerAction,
-                txn_id: [164; 16],
+                txn_id: [200; 16],
             },
             60,
             TEST_CAP,
-        )
-        .expect("an urgent revoke must still commit against a hot signing loop");
+        );
         let waited = started.elapsed();
         stop.store(true, std::sync::atomic::Ordering::SeqCst);
 
         assert!(
             waited < std::time::Duration::from_secs(5),
-            "an urgent revoke waited {waited:?} behind a bounded signing loop -- that is starvation"
+            "an urgent revoke waited {waited:?} behind the public mutation surface -- that is starvation"
         );
     });
+}
 
+// ── @kiana's three independent REDs, ported ────────────────────────────
+//
+// Her literal bodies cannot compile against the corrected API, and that is
+// itself the point of fix (1): `load_signer_capability` no longer HAS a
+// primitive parameter, so "supply a primitive that did not come from the
+// validated entry" has no spelling. Ported here with her names, her doubles
+// and her assertions preserved; only the call shape is adapted. Her
+// `MutableCurrencyRoster` is reproduced verbatim so RED-2 is measured by her
+// instrument, not mine.
+
+struct MutableCurrencyRoster {
+    state: Mutex<(u64, [u8; 32])>,
+}
+impl MutableCurrencyRoster {
+    fn new() -> Self {
+        Self {
+            state: Mutex::new((0, [9u8; 32])),
+        }
+    }
+    fn replace_member_currency(&self) {
+        *self.state.lock().unwrap() = (1, [8u8; 32]);
+    }
+}
+impl RosterLookup for MutableCurrencyRoster {
+    fn query_machine_currency(&self, _machine_id: &str) -> RosterCurrency {
+        let (_, fingerprint) = *self.state.lock().unwrap();
+        RosterCurrency::Active {
+            member_pub: vec![1, 2, 3],
+            member_cert_fingerprint: fingerprint,
+        }
+    }
+    fn currency_revision(&self, _machine_id: &str) -> u64 {
+        self.state.lock().unwrap().0
+    }
+    fn acquire_currency_lease(
+        &self,
+        _machine_id: &str,
+        expected_revision: u64,
+    ) -> Result<Box<dyn CurrencyLease + '_>, RosterChanged> {
+        if self.state.lock().unwrap().0 == expected_revision {
+            Ok(Box::new(TrivialLease))
+        } else {
+            Err(RosterChanged)
+        }
+    }
+}
+
+#[test]
+fn df19_rejects_a_primitive_not_returned_by_the_validated_backend_binding() {
+    // Her shape: two distinct primitives, only one of which belongs to the
+    // validated entry. Under the corrected API the wrong one is not
+    // *rejected* — it is unreachable, because the only way to obtain a
+    // signer is the source lookup keyed by the validated binding.
+    let dir = tempfile::tempdir().unwrap();
+    let spy = Arc::new(OrderSpy::new());
+    let (cell, _backend, activated) = sign_fixture(dir.path().join("record"), spy);
+    let generation = activated.current_generation.unwrap();
+    let policy = DelegationPolicy::test(1000);
+    let clock = FixedClock(50);
+
+    let bound = binding_of(&activated, generation);
+    let mut foreign = bound.clone();
+    foreign.public_key = vec![0x99, 0x98, 0x97];
+    let source = FakeSignerSource::new(vec![
+        (bound.clone(), FakeSignPrimitive::new(0xB2)),
+        (foreign.clone(), FakeSignPrimitive::new(0xA1)),
+    ]);
+
+    let cap = load_signer_capability::<MeshSessionPurpose>(
+        &cell,
+        &source,
+        &policy,
+        &active_roster(),
+        &AlwaysTrueVerifier,
+        &clock,
+        generation,
+    )
+    .expect("control: the entry's own signer is accepted");
+    let sig = sign_checked(&cell, &active_roster(), &clock, &cap, &preimage())
+        .expect("control primitive signs");
+
+    assert_eq!(
+        sig.as_bytes()[0],
+        0xB2,
+        "only the validated entry's signer may run"
+    );
+    assert_eq!(source.calls_for(&bound), Some(1));
+    assert_eq!(
+        source.calls_for(&foreign),
+        Some(0),
+        "a primitive that did not come from the validated entry must not inherit that binding's authority"
+    );
+}
+
+#[test]
+fn df19_roster_change_after_validation_cannot_be_adopted_without_revalidation() {
+    let dir = tempfile::tempdir().unwrap();
+    let spy = Arc::new(OrderSpy::new());
+    let (cell, _backend, activated) = sign_fixture(dir.path().join("record"), spy);
+    let generation = activated.current_generation.unwrap();
+    let policy = DelegationPolicy::test(1000);
+    let clock = FixedClock(50);
+    let source = source_for(&activated, generation, 0xC3);
+    let roster = MutableCurrencyRoster::new();
+
+    let cap = load_signer_capability::<MeshSessionPurpose>(
+        &cell,
+        &source,
+        &policy,
+        &roster,
+        &AlwaysTrueVerifier,
+        &clock,
+        generation,
+    )
+    .expect("revision 0 validates");
+
+    roster.replace_member_currency();
+    let result = sign_checked(&cell, &roster, &clock, &cap, &preimage());
     assert!(
-        primitive.calls.load(std::sync::atomic::Ordering::SeqCst) > 0,
-        "the loop must actually have signed, or this proves nothing"
+        result.is_err(),
+        "a capability validated against revision 0 must not silently lease revision 1 without revalidation"
+    );
+    assert_eq!(
+        source.total_calls(),
+        0,
+        "the physical primitive must not run after roster currency changed"
+    );
+}
+
+#[test]
+fn df19_rejects_a_changed_delegation_even_when_binding_tuple_is_unchanged() {
+    let dir = tempfile::tempdir().unwrap();
+    let spy = Arc::new(OrderSpy::new());
+    let (cell, _backend, activated) = sign_fixture(dir.path().join("record"), spy);
+    let generation = activated.current_generation.unwrap();
+    let policy = DelegationPolicy::test(1000);
+    let clock = FixedClock(50);
+    let source = source_for(&activated, generation, 0xD4);
+
+    let cap = load_signer_capability::<MeshSessionPurpose>(
+        &cell,
+        &source,
+        &policy,
+        &active_roster(),
+        &AlwaysTrueVerifier,
+        &clock,
+        generation,
+    )
+    .expect("original generation validates");
+
+    let mut changed = match cell.load_canonical_for_test() {
+        LoadOutcome::Exact(record) => *record,
+        other => panic!("expected record, got {other:?}"),
+    };
+    let old_revision = changed.revision;
+    changed.revision = old_revision.checked_add(1).unwrap();
+    let live = changed
+        .live_generations
+        .iter_mut()
+        .find(|g| g.generation == generation)
+        .unwrap();
+    live.delegation.sig = vec![0xFA, 0x11];
+    let guard = cell.acquire_for_mutation_for_test();
+    assert_eq!(
+        cell.seed_for_test(&guard, old_revision, &changed),
+        ReplaceOutcome::Committed
+    );
+    drop(guard);
+
+    let result = sign_checked(&cell, &active_roster(), &clock, &cap, &preimage());
+    assert!(
+        result.is_err(),
+        "fresh authorization must reject a changed delegation even when slot/binding/delegator/not_after stayed equal"
+    );
+    assert_eq!(
+        source.total_calls(),
+        0,
+        "the primitive must not run after the validated delegation changed"
     );
 }
 
@@ -5819,7 +6131,10 @@ fn activation_and_sign_checked_running_concurrently_never_deadlock() {
     // thread could never be joined out of.
     let policy: &'static DelegationPolicy = Box::leak(Box::new(DelegationPolicy::test(1000)));
     let backend: &'static FakeSecretBackend = Box::leak(Box::new(backend));
-    let primitive: &'static FakeSignPrimitive = Box::leak(Box::new(FakeSignPrimitive::new(8)));
+    let source: &'static FakeSignerSource = Box::leak(Box::new(FakeSignerSource::new(vec![(
+        binding_of(&seeded, seeded.current_generation.unwrap()),
+        FakeSignPrimitive::new(8),
+    )])));
     let clock = FixedClock(50);
     let generation = seeded.current_generation.unwrap();
 
@@ -5836,12 +6151,11 @@ fn activation_and_sign_checked_running_concurrently_never_deadlock() {
     // 1 and takes no locks, so it must not contend at all.
     let cap = load_signer_capability::<MeshSessionPurpose>(
         &cell,
-        backend,
+        source,
         policy,
         roster.as_ref(),
         &AlwaysTrueVerifier,
         &clock,
-        primitive,
         generation,
     )
     .expect("loads with no lock held");
@@ -5958,7 +6272,7 @@ fn load_canonical_rejects_a_symlink_at_the_record_path() {
     {
         let cell = test_cell(real_path.clone());
         let bootstrap = MeshSignerControlRecordV1::bootstrap(identity(), PurposeId::MeshSession);
-        let g = cell.acquire_for_mutation();
+        let g = cell.acquire_for_mutation_for_test();
         assert_eq!(
             cell.seed_for_test(&g, INITIAL_REVISION, &bootstrap),
             ReplaceOutcome::Committed
@@ -5981,7 +6295,7 @@ fn six_processes_via_a_preexisting_symlink_all_fail_closed() {
     {
         let cell = test_cell(real_path.clone());
         let bootstrap = MeshSignerControlRecordV1::bootstrap(identity(), PurposeId::MeshSession);
-        let g = cell.acquire_for_mutation();
+        let g = cell.acquire_for_mutation_for_test();
         assert_eq!(
             cell.seed_for_test(&g, INITIAL_REVISION, &bootstrap),
             ReplaceOutcome::Committed
@@ -6010,7 +6324,7 @@ fn store_directory_that_is_world_writable_is_rejected() {
     {
         let cell = test_cell(path.clone());
         let bootstrap = MeshSignerControlRecordV1::bootstrap(identity(), PurposeId::MeshSession);
-        let g = cell.acquire_for_mutation();
+        let g = cell.acquire_for_mutation_for_test();
         assert_eq!(
             cell.seed_for_test(&g, INITIAL_REVISION, &bootstrap),
             ReplaceOutcome::Committed
@@ -6026,7 +6340,7 @@ fn store_directory_that_is_world_writable_is_rejected() {
     let outcome = {
         let cell = test_cell(dir.path().join("record2")); // different path, same (now-tampered) dir
         let bootstrap = MeshSignerControlRecordV1::bootstrap(identity(), PurposeId::MeshSession);
-        let g = cell.acquire_for_mutation();
+        let g = cell.acquire_for_mutation_for_test();
         cell.seed_for_test(&g, INITIAL_REVISION, &bootstrap)
     };
     assert_eq!(

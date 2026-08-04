@@ -142,7 +142,7 @@ fn main() {
             // Every worker reaches this line with byte-identical `target`
             // and the identical `expected_revision`. Exactly one CAS can
             // win.
-            let g = cell.acquire_for_mutation();
+            let g = cell.acquire_for_mutation_for_test();
             match cell.seed_for_test(&g, expected_revision, &target) {
                 ReplaceOutcome::Committed => println!("COMMITTED"),
                 ReplaceOutcome::KnownNoEffect => println!("NO_EFFECT"),
