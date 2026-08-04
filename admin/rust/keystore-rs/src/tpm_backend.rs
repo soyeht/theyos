@@ -326,6 +326,41 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
+    /// Environment variable that turns the TPM tests from "skipped" into
+    /// "must work".
+    const REQUIRE_TPM_ENV: &str = "THEYOS_REQUIRE_TPM2";
+
+    /// Gate for tests that need a real TPM2.
+    ///
+    /// These tests are `#[ignore]`d, so they never run by accident and can
+    /// never be counted as passing when they did nothing. That matters:
+    /// previously each of them opened with an early `return` when no TPM was
+    /// present, which the harness reported as `ok` — a bignix run showed six
+    /// TPM tests "passing" on a host with no `/dev/tpm*` at all, none of
+    /// which had exercised a single line of the sealing path.
+    ///
+    /// Run them explicitly with `cargo test -- --ignored`. In that mode a
+    /// missing TPM still cannot silently pass: with `THEYOS_REQUIRE_TPM2=1`
+    /// set (how a real functional gate should invoke this) the absence is a
+    /// hard panic rather than a skip.
+    fn require_tpm2() {
+        if tpm2_available() {
+            return;
+        }
+        let demanded = std::env::var(REQUIRE_TPM_ENV).is_ok_and(|v| v != "0");
+        assert!(
+            !demanded,
+            "{REQUIRE_TPM_ENV} is set but no usable TPM2 was found on this host: the \
+             functional TPM gate cannot be satisfied here, and reporting success would \
+             claim coverage that does not exist"
+        );
+        panic!(
+            "no usable TPM2 on this host, so this test cannot verify anything. It is \
+             #[ignore]d for exactly this reason; set {REQUIRE_TPM_ENV}=1 on a TPM-equipped \
+             host to run the functional gate."
+        );
+    }
+
     #[test]
     fn delete_is_idempotent_without_tpm() {
         // Delete only touches the file backend; safe to test without a TPM.
@@ -338,11 +373,9 @@ mod tests {
     /// Round-trip end-to-end. Gated on a real TPM2 + systemd-creds — CI
     /// runners without TPM skip. Run locally on bignix/devs to verify.
     #[test]
+    #[ignore = "needs a real TPM2; see require_tpm2()"]
     fn encrypt_then_decrypt_round_trip() {
-        if !tpm2_available() {
-            eprintln!("skipping: no TPM2 available on this host");
-            return;
-        }
+        require_tpm2();
         let dir = TempDir::new().unwrap();
         let ks = TpmKeystore::new(dir.path(), "test.tpm.roundtrip");
         let plaintext = b"sk-aurora-test-0123456789abcdef";
@@ -352,11 +385,9 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "needs a real TPM2; see require_tpm2()"]
     fn name_binding_rejects_mismatched_account() {
-        if !tpm2_available() {
-            eprintln!("skipping: no TPM2 available on this host");
-            return;
-        }
+        require_tpm2();
         let dir = TempDir::new().unwrap();
         let ks = TpmKeystore::new(dir.path(), "test.tpm.binding");
         ks.set("provider.a", b"secret-a").unwrap();
@@ -375,11 +406,9 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "needs a real TPM2; see require_tpm2()"]
     fn create_only_seals_and_round_trips() {
-        if !tpm2_available() {
-            eprintln!("skipping: no TPM2 available on this host");
-            return;
-        }
+        require_tpm2();
         let dir = TempDir::new().unwrap();
         let ks = TpmKeystore::new(dir.path(), "test.tpm.create_only");
         assert_eq!(
@@ -394,11 +423,9 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "needs a real TPM2; see require_tpm2()"]
     fn create_only_different_plaintext_is_conflict_leaves_first_seal_untouched() {
-        if !tpm2_available() {
-            eprintln!("skipping: no TPM2 available on this host");
-            return;
-        }
+        require_tpm2();
         let dir = TempDir::new().unwrap();
         let ks = TpmKeystore::new(dir.path(), "test.tpm.create_only_conflict");
         assert_eq!(
@@ -420,11 +447,9 @@ mod tests {
     /// idempotent retry. This must converge to ExistingExactDurable
     /// instead, proving the plaintext-level comparison actually runs.
     #[test]
+    #[ignore = "needs a real TPM2; see require_tpm2()"]
     fn create_only_same_plaintext_retry_converges_despite_randomized_ciphertext() {
-        if !tpm2_available() {
-            eprintln!("skipping: no TPM2 available on this host");
-            return;
-        }
+        require_tpm2();
         let dir = TempDir::new().unwrap();
         let ks = TpmKeystore::new(dir.path(), "test.tpm.create_only_idempotent");
         let plaintext = b"sk-same-plaintext-every-time";

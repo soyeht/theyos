@@ -809,11 +809,17 @@ fn attempt_install(
     for attempt in 0u32..8 {
         let tmp_name = tmp_attempt_path_name(final_name, bytes, attempt);
         match dir.create_new_file(OsStr::new(&tmp_name), 0o600, bytes) {
-            Ok(written_meta) => {
+            Ok((scratch, written_meta)) => {
                 substitute_scratch_hook(dir, &tmp_name);
-                let publish = publish_link_override(
-                    dir.linkat_within(OsStr::new(&tmp_name), OsStr::new(final_name)),
-                );
+                // `scratch` stays alive across this whole block: while it is
+                // open the inode it refers to cannot be freed, so its inode
+                // number cannot be recycled under us and the dev+ino
+                // comparison below is a real identity check.
+                let publish = publish_link_override(dir.publish_from_fd(
+                    &scratch,
+                    OsStr::new(&tmp_name),
+                    OsStr::new(final_name),
+                ));
                 let outcome = match publish {
                     Ok(()) => {
                         // `linkat` resolves its SOURCE by name within the
@@ -874,6 +880,7 @@ fn attempt_install(
                         ),
                     }
                 }
+                drop(scratch);
                 return Ok(outcome);
             }
             Err(e) if e.kind() == ErrorKind::AlreadyExists => {
@@ -1119,12 +1126,26 @@ impl DirHandle {
     }
 
     /// Create `name` exclusively, write `bytes`, and `fsync` the file.
+    /// Create `name` exclusively, write `bytes`, `fsync`, and return the
+    /// still-OPEN descriptor together with its metadata.
+    ///
+    /// Returning the open file is load-bearing, not a convenience: while a
+    /// descriptor references an inode the kernel cannot free it, so its
+    /// inode number cannot be recycled. Closing the scratch file before
+    /// publishing (what this used to do) let the inode be freed — and Linux
+    /// promptly hands the same inode number to the next file created at that
+    /// name, so a substituted file compared EQUAL under dev+ino and the
+    /// post-publish identity check silently passed. macOS/APFS does not
+    /// recycle that aggressively, which is why the defect was invisible
+    /// there and only surfaced on the Linux gate. Holding the descriptor
+    /// makes the check sound on both, without relying on a platform's
+    /// allocation policy.
     fn create_new_file(
         &self,
         name: &OsStr,
         mode: libc::mode_t,
         bytes: &[u8],
-    ) -> std::io::Result<std::fs::Metadata> {
+    ) -> std::io::Result<(File, std::fs::Metadata)> {
         if let Some(e) = write_tmp_failpoint() {
             return Err(e);
         }
@@ -1155,8 +1176,55 @@ impl DirHandle {
             return Err(e);
         }
         // Identity of exactly what we wrote, captured from the fd we wrote
-        // it through — the anchor for the post-publish inode proof.
-        file.metadata()
+        // it through — the anchor for the post-publish inode proof. The file
+        // is returned still open so that inode stays pinned.
+        let meta = file.metadata()?;
+        Ok((file, meta))
+    }
+
+    /// Publish the scratch file as `to`, failing rather than replacing if
+    /// `to` already exists.
+    ///
+    /// On Linux the link is made from the OPEN DESCRIPTOR via
+    /// `/proc/self/fd/N`, so the inode published is exactly the one this
+    /// call wrote — the substitution window is eliminated rather than
+    /// detected afterwards. (`AT_EMPTY_PATH` would express the same thing
+    /// directly but requires `CAP_DAC_READ_SEARCH`, which a service user
+    /// does not have; the `/proc` form is the unprivileged equivalent.)
+    ///
+    /// Other unix targets have no equivalent, so they link by name and rely
+    /// on the post-publish dev+ino check. That is a genuinely weaker
+    /// mechanism — detect-after rather than prevent — and is not claimed to
+    /// be equivalent. It is sound only because the caller holds the scratch
+    /// descriptor open across the whole sequence, which keeps the inode from
+    /// being freed and its number recycled.
+    #[cfg(target_os = "linux")]
+    fn publish_from_fd(&self, scratch: &File, _from: &OsStr, to: &OsStr) -> std::io::Result<()> {
+        let proc_path = CString::new(format!("/proc/self/fd/{}", scratch.as_raw_fd()))
+            .map_err(|_| std::io::Error::new(ErrorKind::InvalidInput, "fd path contains NUL"))?;
+        let to_c = cstr(to)?;
+        // SAFETY: `proc_path` names this process's own open descriptor;
+        // `self.fd` is a valid directory fd; both C strings outlive the call.
+        // AT_SYMLINK_FOLLOW is required so the /proc symlink resolves to the
+        // target inode rather than being linked as a symlink.
+        let r = unsafe {
+            libc::linkat(
+                libc::AT_FDCWD,
+                proc_path.as_ptr(),
+                self.fd.as_raw_fd(),
+                to_c.as_ptr(),
+                libc::AT_SYMLINK_FOLLOW,
+            )
+        };
+        if r < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn publish_from_fd(&self, _scratch: &File, from: &OsStr, to: &OsStr) -> std::io::Result<()> {
+        self.linkat_within(from, to)
     }
 
     /// `linkat(dirfd, from, dirfd, to, 0)` — publish within this directory.
@@ -2376,15 +2444,47 @@ mod tests {
         let outcome = ks.create_only(&account, b"our-own-value").unwrap();
         failpoints::disarm_substitute_scratch();
 
+        // The invariant that must hold on EVERY platform: a substituted
+        // scratch file must never be reported as this call installing its
+        // own bytes.
         assert_ne!(
             outcome,
             CreateOutcome::CreatedDurable,
             "publishing a substituted inode must never be reported as installing our bytes"
         );
-        // What actually landed is the substituted content, and reinspection
-        // reports that honestly as a conflict rather than claiming success.
-        assert_eq!(outcome, CreateOutcome::Conflict);
-        assert_ne!(ks.get(&account).unwrap(), b"our-own-value");
+
+        // Beyond that the two platforms differ, because the mechanisms
+        // genuinely differ and pretending otherwise would hide which one is
+        // actually in force:
+        //
+        // Linux PREVENTS the substitution: publication links the exact open
+        // descriptor, and once the hook unlinks the scratch name that inode
+        // has no remaining links, so `linkat` refuses outright. Nothing is
+        // installed, which reinspection then confirms as KnownNoEffect.
+        //
+        // Elsewhere publication is by NAME, so the substituted inode really
+        // is what gets linked. That is only DETECTED afterwards — the
+        // post-publish dev+ino comparison sees a different inode than the
+        // one written, and reinspection reports the foreign content as a
+        // Conflict. Weaker, and labelled as such rather than presented as
+        // equivalent.
+        #[cfg(target_os = "linux")]
+        {
+            assert_eq!(
+                outcome,
+                CreateOutcome::KnownNoEffect,
+                "linking from the held fd should refuse an unlinked scratch inode"
+            );
+            assert!(matches!(
+                ks.get(&account),
+                Err(KeystoreError::NotFound { .. })
+            ));
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            assert_eq!(outcome, CreateOutcome::Conflict);
+            assert_ne!(ks.get(&account).unwrap(), b"our-own-value");
+        }
     }
 
     // -- directory hierarchy ----------------------------------------------
