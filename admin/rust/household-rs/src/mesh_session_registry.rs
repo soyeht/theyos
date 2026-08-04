@@ -1237,15 +1237,24 @@ impl<H: RevocableMeshSession> MeshSessionRegistry<H> {
         if handle.upgrade().is_none() {
             return Err(RegisterRefusal::HandleAlreadyDropped);
         }
-        // Every SUCCESSFUL reserve pays down the deferred-cancel debt
-        // (round D-1 bounded admission, @kiana recheck of `d721f889`).
+        // The LAST fallible step, computed before anything is mutated —
+        // `checked_add` only reads (round D-1 bounded admission, @kiana
+        // recheck of `28c5e992`). Sequencing this ahead of the sweep is
+        // what keeps "a refusal changes nothing" true without exception:
+        // with the sweep first, an exhausted id space would have returned a
+        // refusal that had already mutated the map, quietly contradicting
+        // the contract documented right below.
+        let id = next_session_id
+            .checked_add(1)
+            .ok_or(RegisterRefusal::SessionIdSpaceExhausted)?;
+        // Every SUCCESSFUL reserve — and only a successful one — pays down
+        // the deferred-cancel debt (@kiana recheck of `d721f889`).
         //
         // Placement is exact and load-bearing in both directions. AFTER
-        // every admission check, so a refusal still leaves the registry
-        // bit-for-bit unchanged — "reserve fails without inserting" stays
-        // structural. BEFORE `next_session_id` is consumed and before the
-        // insert, so the sweep is part of the same critical section that
-        // adds the new entry.
+        // every fallible check, including the id-space one above, so a
+        // refusal leaves the registry bit-for-bit unchanged and "reserve
+        // fails without inserting" stays structural. BEFORE the insert, so
+        // the sweep shares the critical section that grows the map.
         //
         // Without this, the reconcile claim was stronger than the
         // mechanism: `prune_closed_locked` ran only in
@@ -1255,9 +1264,6 @@ impl<H: RevocableMeshSession> MeshSessionRegistry<H> {
         // entries without bound — each with a live `Weak`, so the
         // dead-handle prune would never have reclaimed them either.
         prune_closed_locked(sessions, by_machine);
-        let id = next_session_id
-            .checked_add(1)
-            .ok_or(RegisterRefusal::SessionIdSpaceExhausted)?;
         *next_session_id = id;
         let session_id = SessionId(id);
         let sync = SessionSync::new_pending();
@@ -5145,5 +5151,65 @@ mod tests {
             panic!("registry must be live");
         };
         sessions.len()
+    }
+
+    /// RED for @kiana's recheck of `28c5e992`: `SessionIdSpaceExhausted` is
+    /// a REFUSAL, so like every other refusal it must leave the registry
+    /// bit-for-bit unchanged — including not paying down reconcile debt.
+    ///
+    /// The previous ordering swept Closed entries before `checked_add`, so
+    /// an exhausted id space returned a refusal that had already mutated
+    /// the map. Small, but it silently contradicted the contract documented
+    /// at that very call site, and "refusals change nothing" is the
+    /// property the whole bounded-reserve design leans on.
+    ///
+    /// Debt is created with a LIVE handle so the dead-`Weak` prune cannot
+    /// be what does (or does not) remove it.
+    #[test]
+    fn an_exhausted_session_id_space_refuses_without_paying_debt() {
+        let m_id = test_m_id(96);
+        let snapshot = snapshot_at(1, [1u8; 32], &[(m_id.clone(), FP_A)], &[]);
+        let registry = MeshSessionRegistry::<RecordingSession>::new(&snapshot);
+        let binding = sealed_binding(&snapshot, &m_id);
+
+        // Deferred-cancel debt, handle kept strongly alive throughout.
+        let victim_session = Arc::new(RecordingSession::default());
+        let victim = registry
+            .preauthorize(&binding, Arc::downgrade(&victim_session))
+            .unwrap();
+        assert_eq!(
+            registry.hold_inner_while(|| victim.cancel_before_ack()),
+            PendingCancelOutcome::ClosedCleanupDeferred
+        );
+        assert_eq!(live_entry_count(&registry), 1, "debt is present");
+
+        // Exhaust the id space.
+        registry.inner.lock().unwrap().next_session_id = u64::MAX;
+
+        let session = Arc::new(RecordingSession::default());
+        let outcome = registry.try_preauthorize_before(
+            &binding,
+            Arc::downgrade(&session),
+            Instant::now() + Duration::from_secs(60),
+        );
+
+        assert_eq!(
+            outcome.err(),
+            Some(TryPreauthorizeError::Refused(
+                RegisterRefusal::SessionIdSpaceExhausted
+            ))
+        );
+        assert_eq!(
+            live_entry_count(&registry),
+            1,
+            "a refused reserve must not sweep debt — refusals change nothing"
+        );
+        assert_eq!(
+            registry.inner.lock().unwrap().next_session_id,
+            u64::MAX,
+            "a refused reserve must not consume a SessionId"
+        );
+        assert!(Arc::strong_count(&victim_session) > 0);
+        drop(victim_session);
     }
 }
