@@ -496,12 +496,17 @@ impl OpaqueP256Slots {
     /// path and be told apart only by a decrypt failure.
     #[cfg(target_os = "linux")]
     pub fn sealed_tpm(state_dir: impl AsRef<std::path::Path>, service: &str) -> Self {
-        let namespaced = format!("{service}.p256-tpm");
+        let namespaced = format!(
+            "{service}{}-tpm",
+            crate::file_backend::RESERVED_OPAQUE_NAMESPACE_MARKER
+        );
         Self {
-            store: SlotStore::SealedTpm(crate::tpm_backend::TpmKeystore::new(
-                state_dir,
-                namespaced.clone(),
-            )),
+            store: SlotStore::SealedTpm(
+                crate::tpm_backend::TpmKeystore::new_for_reserved_namespace(
+                    state_dir,
+                    namespaced.clone(),
+                ),
+            ),
             store_id: format!("tpm:{namespaced}"),
         }
     }
@@ -518,9 +523,19 @@ impl OpaqueP256Slots {
             "P-256 private scalars will rest as PLAINTEXT; only appropriate where no \
              sealing store exists"
         );
-        let namespaced = format!("{service}.p256-file");
+        // Reserved namespace + the `pub(crate)` capability constructor: a
+        // downstream can name this service but every operation from a
+        // publicly-built handle fails closed, so the scalar is not
+        // reachable through the generic byte API.
+        let namespaced = format!(
+            "{service}{}-file",
+            crate::file_backend::RESERVED_OPAQUE_NAMESPACE_MARKER
+        );
         Self {
-            store: SlotStore::ApprovedFile(FileKeystore::new(state_dir, namespaced.clone())),
+            store: SlotStore::ApprovedFile(FileKeystore::new_for_reserved_namespace(
+                state_dir,
+                namespaced.clone(),
+            )),
             store_id: format!("file:{namespaced}"),
         }
     }
@@ -907,6 +922,27 @@ mod tests {
         const PURPOSE: &'static str = "roster-sync";
     }
 
+    /// A handle into the reserved namespace, for tests that must simulate
+    /// tampering with stored key material.
+    ///
+    /// These tests deliberately need the `pub(crate)` capability
+    /// constructor now: the same tampering used to be possible with the
+    /// PUBLIC `FileKeystore::new`, which is exactly the hole the
+    /// reservation closes. That these adversarial fixtures no longer
+    /// compile against the public API is itself evidence the boundary
+    /// holds — and it also names the residual threat model honestly, since
+    /// this stands in for an actor who can write the files directly rather
+    /// than one merely holding the crate's public types.
+    fn raw_reserved(dir: &std::path::Path, service_base: &str) -> FileKeystore {
+        FileKeystore::new_for_reserved_namespace(
+            dir,
+            format!(
+                "{service_base}{}-file",
+                crate::file_backend::RESERVED_OPAQUE_NAMESPACE_MARKER
+            ),
+        )
+    }
+
     fn store(dir: &std::path::Path) -> OpaqueP256Slots {
         OpaqueP256Slots::approved_plaintext_file(
             dir,
@@ -1056,7 +1092,7 @@ mod tests {
         let binding = binding.unwrap();
 
         // Swap A for B behind the module's back.
-        let raw = FileKeystore::new(td.path(), "opaque-p256-test.p256-file");
+        let raw = raw_reserved(td.path(), "opaque-p256-test");
         let other = SigningKey::random(&mut rand_core::OsRng);
         raw.set(&slot.account(), other.to_bytes().as_slice())
             .unwrap();
@@ -1102,8 +1138,8 @@ mod tests {
         let (_, binding) = a.create_or_inspect(&slot).unwrap();
         let binding = binding.unwrap();
 
-        let raw_a = FileKeystore::new(a_dir.path(), "same-service.p256-file");
-        let raw_b = FileKeystore::new(b_dir.path(), "same-service.p256-file");
+        let raw_a = raw_reserved(a_dir.path(), "same-service");
+        let raw_b = raw_reserved(b_dir.path(), "same-service");
         let scalar = raw_a.get(&slot.account()).unwrap();
         raw_b.set(&slot.account(), &scalar).unwrap();
 
@@ -1129,7 +1165,7 @@ mod tests {
         let (_, binding) = slots.create_or_inspect(&slot).unwrap();
         let binding = binding.unwrap();
 
-        let raw = FileKeystore::new(td.path(), "symlink.p256-file");
+        let raw = raw_reserved(td.path(), "symlink");
         let scalar = raw.get(&slot.account()).unwrap();
         let account_path = raw.path_for(&slot.account());
         let outside = td.path().join("outside-scalar");
@@ -1141,6 +1177,56 @@ mod tests {
             slots.load_exact(&slot, &binding).is_err(),
             "load_exact followed a final-component symlink outside the store"
         );
+    }
+
+    /// THE containment test. A downstream holds the public byte API and the
+    /// slot coordinates are deterministic, so before the namespace was
+    /// reserved it could simply rebuild the store and read the scalar —
+    /// which made the `compile_fail` "no accessor" proofs beside the point.
+    /// Every operation from a publicly-constructed handle must now fail
+    /// closed on the reserved namespace.
+    #[test]
+    fn reserved_namespace_is_unreachable_through_the_public_byte_api() {
+        let td = tempfile::tempdir().unwrap();
+        let s = store(td.path());
+        let slot = Slot::<MeshSession>::new("contained").unwrap();
+        let (_, binding) = s.create_or_inspect(&slot).unwrap();
+        assert!(binding.is_some(), "fixture must actually create a key");
+
+        // Reconstruct exactly what the opaque store uses, the way a
+        // determined downstream would.
+        let reserved_service = format!(
+            "opaque-p256-test{}-file",
+            crate::file_backend::RESERVED_OPAQUE_NAMESPACE_MARKER
+        );
+        let attacker = FileKeystore::new(td.path(), &reserved_service);
+
+        for outcome in [
+            attacker.get(&slot.account()).err(),
+            attacker.set(&slot.account(), b"overwrite").err(),
+            attacker.delete(&slot.account()).err(),
+            attacker.create_only(&slot.account(), b"x").err(),
+        ] {
+            match outcome {
+                Some(KeystoreError::Unsupported { hint }) => {
+                    assert!(hint.contains("reserved"), "hint={hint}");
+                }
+                other => panic!("reserved namespace was reachable: {other:?}"),
+            }
+        }
+
+        // And the key is untouched: the opaque API still loads it.
+        assert!(s.try_binding(&slot).unwrap().is_some());
+    }
+
+    /// The reservation must not break the rest of the crate: ordinary
+    /// services keep working exactly as before.
+    #[test]
+    fn ordinary_services_are_unaffected_by_the_reservation() {
+        let td = tempfile::tempdir().unwrap();
+        let ks = FileKeystore::new(td.path(), "ordinary-service");
+        ks.set("acct", b"value").unwrap();
+        assert_eq!(ks.get("acct").unwrap(), b"value");
     }
 
     #[test]
@@ -1188,7 +1274,7 @@ mod tests {
         let gen_a = gen_a.unwrap();
 
         // B replaces A behind the module's back.
-        let raw = FileKeystore::new(td.path(), "opaque-p256-test.p256-file");
+        let raw = raw_reserved(td.path(), "opaque-p256-test");
         let other = SigningKey::random(&mut rand_core::OsRng);
         raw.set(&slot.account(), other.to_bytes().as_slice())
             .unwrap();
@@ -1213,7 +1299,7 @@ mod tests {
         let s = store(td.path());
         let slot = Slot::<MeshSession>::new("corrupt").unwrap();
 
-        let raw = FileKeystore::new(td.path(), "opaque-p256-test.p256-file");
+        let raw = raw_reserved(td.path(), "opaque-p256-test");
         raw.set(&slot.account(), b"too short").unwrap();
 
         match s.create_or_inspect(&slot) {

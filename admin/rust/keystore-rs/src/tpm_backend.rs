@@ -85,6 +85,18 @@ impl TpmKeystore {
         }
     }
 
+    /// Build a TPM keystore permitted to operate inside the crate-reserved
+    /// opaque namespace. `pub(crate)`: the capability [`crate::opaque_p256`]
+    /// holds and no downstream can obtain.
+    pub(crate) fn new_for_reserved_namespace(
+        state_dir: impl AsRef<Path>,
+        service: impl Into<String>,
+    ) -> Self {
+        Self {
+            inner: FileKeystore::new_for_reserved_namespace(state_dir, service),
+        }
+    }
+
     /// The underlying file store, so callers inside this crate can reach the
     /// hardened fd-relative readers rather than the legacy path-based
     /// [`KeystoreBackend::get`]. Sealing happens above this: what the file

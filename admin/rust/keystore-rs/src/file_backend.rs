@@ -74,6 +74,31 @@ const MAX_SECRET_BYTES: u64 = 1 << 20;
 pub struct FileKeystore {
     state_dir: PathBuf,
     service: String,
+    /// Whether this handle is permitted to touch the crate-reserved
+    /// namespace. Only [`Self::new_for_reserved_namespace`] sets it, and
+    /// that is `pub(crate)`.
+    reserved_access: bool,
+}
+
+/// Service-name marker reserving a namespace for this crate's own opaque
+/// key material.
+///
+/// Nothing outside this crate may read or write under it. Note what this
+/// does and does not buy: it stops a downstream crate from reaching opaque
+/// key material through the ordinary byte API — by accident, by refactor,
+/// or by deliberately reconstructing the coordinates — because every
+/// operation on a reserved service from a publicly-constructed handle fails
+/// closed. It does NOT defend against code in this same process and uid
+/// that goes around the crate entirely (reading the files directly, or
+/// attaching a debugger). That boundary is the filesystem's and the OS's,
+/// not this type's, and pretending otherwise would be the same
+/// overclaim as calling a missing accessor "containment".
+pub const RESERVED_OPAQUE_NAMESPACE_MARKER: &str = ".p256-opaque-v1";
+
+/// `true` when `service` lies inside the crate-reserved namespace.
+#[must_use]
+pub fn is_reserved_namespace(service: &str) -> bool {
+    service.contains(RESERVED_OPAQUE_NAMESPACE_MARKER)
 }
 
 impl FileKeystore {
@@ -81,12 +106,48 @@ impl FileKeystore {
     /// `service`. Distinct services share `state_dir` but get distinct
     /// subdirectories — this is what lets one host's file fallback hold
     /// household secrets AND LLM API keys without colliding.
+    ///
+    /// A handle built here can never operate on the crate-reserved opaque
+    /// namespace: every operation checks and refuses. Construction itself
+    /// stays infallible so existing callers are unaffected.
     #[must_use]
     pub fn new(state_dir: impl AsRef<Path>, service: impl Into<String>) -> Self {
         Self {
             state_dir: state_dir.as_ref().to_path_buf(),
             service: service.into(),
+            reserved_access: false,
         }
+    }
+
+    /// Build a handle permitted to operate inside the crate-reserved
+    /// namespace. `pub(crate)` — this is the capability that
+    /// [`crate::opaque_p256`] holds and no downstream can obtain.
+    pub(crate) fn new_for_reserved_namespace(
+        state_dir: impl AsRef<Path>,
+        service: impl Into<String>,
+    ) -> Self {
+        Self {
+            state_dir: state_dir.as_ref().to_path_buf(),
+            service: service.into(),
+            reserved_access: true,
+        }
+    }
+
+    /// Fail closed when a publicly-constructed handle is pointed at the
+    /// reserved namespace. Called by EVERY operation rather than only the
+    /// constructor, so reconstructing the coordinates after the fact does
+    /// not help either.
+    fn guard_reserved(&self) -> Result<(), KeystoreError> {
+        if self.reserved_access || !is_reserved_namespace(&self.service) {
+            return Ok(());
+        }
+        Err(KeystoreError::Unsupported {
+            hint: format!(
+                "service {:?} is inside the namespace reserved for keystore-rs's own opaque \
+                 key material; it is not reachable through the generic byte API",
+                self.service
+            ),
+        })
     }
 
     fn secrets_dir(&self) -> PathBuf {
@@ -470,6 +531,7 @@ impl FileKeystore {
     /// [`FileKeystore`]'s sweep is rejected, so the token cannot be
     /// laundered into standing for exclusion it never established.
     pub fn lock_for_sweep(&self) -> Result<SweepGuard, KeystoreError> {
+        self.guard_reserved()?;
         let dir = self.open_secrets_dir().map_err(|e| KeystoreError::Io {
             kind: e.kind().to_string(),
             hint: format!("open {}: {e}", self.secrets_dir().display()),
@@ -516,6 +578,7 @@ impl FileKeystore {
         &self,
         guard: &SweepGuard,
     ) -> Result<SweepReport, KeystoreError> {
+        self.guard_reserved()?;
         if guard.state_dir != self.state_dir || guard.service != self.service {
             return Err(KeystoreError::Unsupported {
                 hint: format!(
@@ -662,6 +725,7 @@ pub struct SweepGuard {
 
 impl KeystoreBackend for FileKeystore {
     fn get(&self, account: &str) -> Result<Vec<u8>, KeystoreError> {
+        self.guard_reserved()?;
         let path = self.account_path(account);
         let mut file = match OpenOptions::new().read(true).open(&path) {
             Ok(f) => f,
@@ -687,6 +751,7 @@ impl KeystoreBackend for FileKeystore {
     }
 
     fn set(&self, account: &str, value: &[u8]) -> Result<(), KeystoreError> {
+        self.guard_reserved()?;
         let dir = self.secrets_dir();
         if let Err(e) = ensure_private_dir_path_based(&dir) {
             return Err(KeystoreError::Io {
@@ -703,6 +768,7 @@ impl KeystoreBackend for FileKeystore {
     }
 
     fn delete(&self, account: &str) -> Result<(), KeystoreError> {
+        self.guard_reserved()?;
         let path = self.account_path(account);
         match fs::remove_file(&path) {
             Ok(()) => Ok(()),
@@ -715,6 +781,7 @@ impl KeystoreBackend for FileKeystore {
     }
 
     fn create_only(&self, account: &str, value: &[u8]) -> Result<CreateOutcome, KeystoreError> {
+        self.guard_reserved()?;
         #[cfg(unix)]
         {
             self.create_only_unix(account, value)
