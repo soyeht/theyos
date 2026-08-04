@@ -68,7 +68,7 @@
 //!    is still rejected — recovering into overtly conflicting state is not
 //!    "coming back online". Poison is still permanent — see round 1.
 //!
-//! ## Round 4 (@kiana, four passes): `is_authorized()` was
+//! ## Round 4 (@kiana, five passes): `is_authorized()` was
 //! check-then-forward, not a linearization
 //!
 //! **Pass 1.** A bare `Arc<AtomicBool>` read by a caller, followed *later*
@@ -97,7 +97,7 @@
 //! signal (`waiting_writers`) still lived *inside* that same `Mutex`, which
 //! pass 4 found was not enough on its own.
 //!
-//! **Pass 4 (final).** Four more @kiana catches on the same recheck:
+//! **Pass 4.** Four more @kiana catches on the same recheck:
 //!
 //! 1. Parking the writer-announcement counter inside `state`'s `Mutex`
 //!    meant a writer had to *win that Mutex* just to announce — and
@@ -116,11 +116,7 @@
 //!    fail-*open*, exactly the hazard this type exists to close, despite a
 //!    comment claiming otherwise. Fixed: the reader side now uses
 //!    `.lock().ok()?` — ANY poison fails closed immediately, no recovery,
-//!    no trust. [`SessionSync::revoke`] still recovers via `into_inner`,
-//!    but only to *force* `authorized = false` regardless of torn content,
-//!    and stops trusting `active_readers` (which could be an unreliable
-//!    count post-poison) the moment poison is observed, rather than
-//!    looping on it.
+//!    no trust.
 //! 3. `unregister` removed a session from tracking but left its gate
 //!    `true` — "for a session ending normally". But losing tracking also
 //!    means no FUTURE checkpoint observation can ever reach this session
@@ -139,17 +135,43 @@
 //!    (stays `Unavailable`) rather than wrap — see
 //!    `generation_exhaustion_refuses_to_recover_rather_than_wrap`.
 //!
+//! **Pass 5 (final).** A REAL executable RED from @kiana's own audit
+//! worktree, not a reading pass: admit a `ForwardingGuard`, poison
+//! `SessionSync.state` from an unrelated thread WHILE that guard is still
+//! held, then call `revoke` from a third thread — `revoke` returned
+//! immediately, before the guard was ever dropped, violating the
+//! documented contract that it does not return until every in-flight
+//! forward has finished. Root cause: pass 4's `revoke` treated ANY poison
+//! as license to stop trusting `active_readers` and abandon the wait —
+//! but poisoning a `Mutex` only records that SOME panic happened while it
+//! was held, not that the guarded data is torn, and a plain `usize` field
+//! recovered via `into_inner` is not torn in any sense Rust's memory model
+//! can produce for it. [`ForwardingGuard`]'s `Drop` already recovers
+//! poison the same way and still correctly decrements `active_readers`
+//! and notifies — so the counter stays meaningful, and `revoke` had no
+//! real reason to stop trusting it. Fixed: `revoke` now recovers a
+//! poisoned `state` (on the initial lock, or on any `Condvar::wait`) via
+//! `into_inner` and KEEPS WAITING on `active_readers` regardless, exactly
+//! as it would unpoisoned — only `authorized` is forced unconditionally.
+//! See [`SessionSync`]'s own doc comment for the sharper distinction this
+//! pass drew out: `try_enter`'s poison handling is a security decision
+//! (refuse under any doubt — correct to fail closed), `revoke`'s is a
+//! completion guarantee (has everyone actually drained — giving up under
+//! doubt does not achieve that, it only pretends to by returning early).
+//! See `revoke_waits_for_an_admitted_reader_even_if_the_state_lock_is_poisoned_meanwhile`.
+//!
 //! Revoking a per-session `SessionSync` never happens while `self.inner`'s
 //! registry-wide lock is held (it can block waiting for readers to drain)
 //! — every revoke path (including `unregister`) collects the sessions to
 //! close under one short lock, releases it, calls `SessionSync::revoke()`
 //! on each unlocked, then briefly re-locks only to remove the now-closed
 //! entries from the bookkeeping maps. See [`SessionSync`]'s own doc comment
-//! for the full pass-4 construction, and
+//! for the full construction, and
 //! `forwarding_guard_blocks_revoke_until_released_and_reader1_precedes_revoke_returned`,
 //! `reader_that_attempts_after_writer_announces_intent_never_authorizes`,
 //! `revoke_is_not_starved_by_a_continuous_stream_of_short_lived_forwarding_guards`,
 //! `poisoned_session_state_never_admits_a_reader`,
+//! `revoke_waits_for_an_admitted_reader_even_if_the_state_lock_is_poisoned_meanwhile`,
 //! `unregister_waits_for_an_in_flight_forward_before_returning`, and
 //! `generation_exhaustion_refuses_to_recover_rather_than_wrap`.
 //!
@@ -229,17 +251,31 @@ pub struct SessionId(u64);
 ///   announced intent, regardless of how many more readers arrive
 ///   afterward.
 ///
-/// Poison is handled differently on each side, deliberately:
-/// [`revoke`](SessionSync::revoke) recovers a poisoned `state` via
-/// `into_inner` and stops trusting `active_readers` the moment it observes
-/// poison (either on the initial lock or during the wait) rather than
-/// looping on a now-uncertain counter that might never reach zero —
-/// forcing `authorized = false` immediately either way, since that is the
-/// one outcome that must hold regardless of what the torn state says.
-/// [`try_enter`](SessionSync::try_enter) does NOT recover a poisoned
-/// `state` at all — `.lock().ok()?` fails closed immediately on ANY
-/// poison, full stop. Trusting a recovered-but-torn `authorized == true`
-/// there would be exactly the fail-open hazard this type exists to close.
+/// Poison is handled differently on each side, deliberately — and for a
+/// more precise reason than "the data might be torn" (round 4, pass 5,
+/// @kiana catch: an earlier revision of `revoke` treated ANY poison as
+/// license to abandon its wait on `active_readers`, which broke the
+/// documented contract that `revoke` does not return until every in-flight
+/// forward has actually finished — a panic marks the `Mutex` poisoned
+/// whenever ANY panic happens while it is held, regardless of whether that
+/// panic had anything to do with mutating `active_readers`; a `usize`
+/// field recovered via `into_inner` is not "torn" in any sense Rust's
+/// memory model can produce for a plain field store, so there was never a
+/// real reason to stop trusting it). [`revoke`](SessionSync::revoke)
+/// recovers a poisoned `state` via `into_inner` on both the initial lock
+/// and every `Condvar::wait`, but KEEPS WAITING on `active_readers`
+/// regardless — [`ForwardingGuard`]'s `Drop` recovers poison the same way
+/// and still correctly decrements it and notifies, so the counter remains
+/// meaningful and will still reach zero. `authorized` is still forced to
+/// `false` unconditionally, since that is the one outcome that must hold
+/// regardless of what the recovered state says. [`try_enter`](SessionSync::try_enter)
+/// is different again — it does NOT recover a poisoned `state` at all,
+/// `.lock().ok()?` fails closed immediately on ANY poison. That asymmetry
+/// is deliberate: `try_enter`'s job is a security decision (admit or not),
+/// where refusing under any doubt is the correct fail-closed posture;
+/// `revoke`'s job is a completion guarantee (has everyone actually
+/// drained), where giving up under doubt does not achieve the guarantee —
+/// it only pretends to by returning early.
 struct GateState {
     authorized: bool,
     writer_active: bool,
@@ -273,43 +309,28 @@ impl SessionSync {
     /// Writer side: announce intent on the lock-free counter (blocks every
     /// NEW reader from this instant, structurally — see the struct doc
     /// comment), wait out any readers already admitted, then commit the
-    /// fail-closed bit.
+    /// fail-closed bit. A poisoned `state` (initial lock, or observed
+    /// during the `Condvar` wait) is recovered via `into_inner` but does
+    /// NOT short-circuit the wait — see the struct doc comment for why
+    /// `active_readers` remains trustworthy across poison and abandoning
+    /// the wait would violate the documented contract that `revoke` does
+    /// not return until every in-flight forward has actually finished.
     fn revoke(&self) {
         self.writer_intent.fetch_add(1, Ordering::SeqCst);
-        match self.state.lock() {
-            Ok(mut state) => {
-                loop {
-                    if state.active_readers == 0 {
-                        break;
-                    }
-                    match self.drained.wait(state) {
-                        Ok(next) => state = next,
-                        Err(poisoned) => {
-                            // A panic happened elsewhere while this thread
-                            // was asleep waiting — active_readers is no
-                            // longer trustworthy (the panicking thread
-                            // could have been mid-mutation of it). Stop
-                            // waiting on an uncertain counter rather than
-                            // loop; force the one outcome that must hold
-                            // regardless.
-                            state = poisoned.into_inner();
-                            break;
-                        }
-                    }
-                }
-                state.writer_active = true;
-                state.authorized = false;
-                state.writer_active = false;
-            }
-            Err(poisoned) => {
-                // Already poisoned before this call ever looked at
-                // active_readers: do not wait on an untrustworthy counter
-                // at all — force the one outcome that must hold
-                // regardless, immediately.
-                let mut state = poisoned.into_inner();
-                state.authorized = false;
-            }
+        let mut state = match self.state.lock() {
+            Ok(state) => state,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        while state.active_readers > 0 {
+            state = match self.drained.wait(state) {
+                Ok(next) => next,
+                Err(poisoned) => poisoned.into_inner(),
+            };
         }
+        state.writer_active = true;
+        state.authorized = false;
+        state.writer_active = false;
+        drop(state);
         self.writer_intent.fetch_sub(1, Ordering::SeqCst);
     }
 
@@ -2346,6 +2367,93 @@ mod tests {
                 "attempt {attempt}: poisoned session state must never admit a reader"
             );
         }
+    }
+
+    /// Round 4, pass 5 (@kiana, a REAL executable RED from an independent
+    /// audit worktree, not a reading pass): admits a `ForwardingGuard`,
+    /// poisons `SessionSync.state` from an UNRELATED thread while that
+    /// guard is still held (mirrors `poisoned_session_state_never_admits_a_reader`'s
+    /// pattern — a panic that never touches `active_readers` at all), then
+    /// calls `revoke` from a third thread. `revoke` must NOT return before
+    /// the still-held guard is dropped, because poisoning the mutex does
+    /// not make its `active_readers` count untrustworthy (a plain `usize`
+    /// field cannot be torn by a panic that happened elsewhere in the same
+    /// critical section), and `ForwardingGuard::drop` already keeps that
+    /// count correct across poison — so `revoke` giving up on it early was
+    /// a real bug, not a defensible fail-closed choice.
+    #[test]
+    fn revoke_waits_for_an_admitted_reader_even_if_the_state_lock_is_poisoned_meanwhile() {
+        let m_id = test_m_id(57);
+        let snapshot = snapshot_at(1, [1u8; 32], &[(m_id.clone(), FP_A)], &[]);
+        let registry = Arc::new(MeshSessionRegistry::<RecordingSession>::new(&snapshot));
+        let binding = sealed_binding(&snapshot, &m_id);
+        let session = Arc::new(RecordingSession::default());
+        let (_id, gate) = registry
+            .register(&binding, Arc::downgrade(&session))
+            .unwrap();
+
+        // (1) Admit a ForwardingGuard, held by this test thread for the
+        // whole scenario.
+        let guard = gate
+            .try_authorize_forwarding()
+            .expect("session active, no revoke has started yet");
+
+        // (2) Poison SessionSync.state from an UNRELATED thread while the
+        // guard above is still alive. This panic never touches
+        // active_readers -- it only proves poisoning the mutex, not
+        // corrupting the count.
+        let sync = Arc::clone(&gate.sync);
+        let poisoner = thread::spawn(move || {
+            let _lock = sync.state.lock().unwrap();
+            panic!("deliberate poison for RED test: revoke must still wait out an admitted reader");
+        });
+        assert!(
+            poisoner.join().is_err(),
+            "poisoning thread must have panicked while holding SessionSync.state"
+        );
+
+        // (3) A third thread calls revoke() (via observe_new_checkpoint)
+        // while the guard from (1) is STILL held.
+        let log: Arc<StdMutex<Vec<&'static str>>> = Arc::new(StdMutex::new(Vec::new()));
+        let revoker = {
+            let registry = Arc::clone(&registry);
+            let revoke_snapshot = snapshot_at(2, [2u8; 32], &[], std::slice::from_ref(&m_id));
+            let log = Arc::clone(&log);
+            thread::spawn(move || {
+                registry.observe_new_checkpoint(&revoke_snapshot);
+                log.lock().unwrap().push("revoke_returned");
+            })
+        };
+
+        // Observable barrier: confirm the writer has actually announced
+        // intent (real observation, not a timing guess) before checking
+        // that it has not (yet) returned.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if gate.sync.writer_intent.load(Ordering::SeqCst) > 0 {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "writer never announced intent within the deadline"
+            );
+            thread::yield_now();
+        }
+        // A real window for the writer to have (incorrectly, if the bug
+        // were still present) returned early -- then confirm it has not.
+        thread::sleep(Duration::from_millis(200));
+        assert!(
+            log.lock().unwrap().is_empty(),
+            "revoke must not return while an admitted ForwardingGuard is still held, \
+             even if SessionSync.state was poisoned by an unrelated panic meanwhile"
+        );
+
+        // (4) Drop the guard -- revoke must complete promptly afterward.
+        drop(guard);
+        revoker.join().unwrap();
+
+        assert_eq!(&*log.lock().unwrap(), &["revoke_returned"]);
+        assert!(!gate.is_authorized());
     }
 
     /// The core linearization proof: a `ForwardingGuard` acquired BEFORE a
