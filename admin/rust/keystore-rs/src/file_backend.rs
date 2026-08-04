@@ -60,6 +60,72 @@ impl FileKeystore {
     pub fn path_for(&self, account: &str) -> PathBuf {
         self.account_path(account)
     }
+
+    /// Remove tmp files left behind by a [`KeystoreBackend::create_only`]
+    /// call ([`KeystoreBackend`](crate::KeystoreBackend)) that crashed
+    /// between installing its content and its own best-effort cleanup — the
+    /// narrow window between `write_new_tmp_0600` succeeding and the
+    /// `fs::remove_file` right after the `hard_link` attempt in
+    /// `create_new_0600`. Those files hold the same plaintext bytes
+    /// `create_only` was asked to store; they do not expire on their own.
+    ///
+    /// Deliberately NOT wired into `create_only`'s own hot path: a
+    /// sweep-before-write step would race a genuinely concurrent sibling
+    /// `create_only` call for the same account, deleting its in-flight tmp
+    /// file out from under it (unlinking an open fd is safe on its own, but
+    /// the sibling's subsequent `hard_link` would then fail against a
+    /// source that no longer exists). Call this explicitly — e.g. once at
+    /// startup, before any `create_only` traffic for this
+    /// `(state_dir, service)` begins — not concurrently with live callers.
+    ///
+    /// Bounded to this keystore's own secrets directory (already `0700`,
+    /// owner-only — nothing else can have planted a file there) and to
+    /// names matching the exact tmp-attempt pattern `create_new_0600`
+    /// produces (`<sanitized-account>.bin.tmp.<pid>.<nanos>.<n>.<attempt>`,
+    /// all four trailing fields numeric); anything else, including a
+    /// legitimate `<account>.bin` entry, is left untouched. Returns the
+    /// number removed.
+    pub fn sweep_orphaned_create_attempts(&self) -> std::io::Result<usize> {
+        let dir = self.secrets_dir();
+        let entries = match fs::read_dir(&dir) {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == ErrorKind::NotFound => return Ok(0),
+            Err(e) => return Err(e),
+        };
+        let mut removed = 0usize;
+        for entry in entries {
+            let entry = entry?;
+            let name = entry.file_name();
+            if !is_orphaned_create_attempt_name(&name.to_string_lossy()) {
+                continue;
+            }
+            match fs::remove_file(entry.path()) {
+                Ok(()) => removed += 1,
+                Err(e) if e.kind() == ErrorKind::NotFound => {}
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(removed)
+    }
+}
+
+/// Matches exactly the names [`tmp_attempt_path`] produces: an original
+/// `<account>.bin` final-path stem, followed by `.tmp.` and four numeric,
+/// dot-separated fields (pid, nanos, counter, attempt). Deliberately strict
+/// — a name that merely contains `.tmp.` somewhere is not enough, since an
+/// account label could itself legitimately contain that substring.
+fn is_orphaned_create_attempt_name(name: &str) -> bool {
+    let Some((base, suffix)) = name.split_once(".tmp.") else {
+        return false;
+    };
+    if Path::new(base).extension().and_then(|e| e.to_str()) != Some("bin") {
+        return false;
+    }
+    let fields: Vec<&str> = suffix.split('.').collect();
+    fields.len() == 4
+        && fields
+            .iter()
+            .all(|f| !f.is_empty() && f.bytes().all(|b| b.is_ascii_digit()))
 }
 
 impl KeystoreBackend for FileKeystore {
@@ -125,18 +191,20 @@ impl KeystoreBackend for FileKeystore {
             });
         }
         let path = self.account_path(account);
-        create_new_0600(&path, value).map_err(|e| {
-            if e.kind() == ErrorKind::AlreadyExists {
-                KeystoreError::Conflict {
-                    label: format!("{} (file fallback)", path.display()),
-                }
-            } else {
-                KeystoreError::Io {
-                    kind: e.kind().to_string(),
-                    hint: format!("create {}: {e}", path.display()),
-                }
-            }
-        })
+        match create_new_0600(&path, value) {
+            Ok(CreateOutcome::Created) => Ok(()),
+            Ok(CreateOutcome::AmbiguousDurability(e)) => Err(KeystoreError::AmbiguousDurability {
+                label: format!("{} (file fallback)", path.display()),
+                hint: format!("linked but parent-dir fsync unconfirmed: {e}"),
+            }),
+            Err(e) if e.kind() == ErrorKind::AlreadyExists => Err(KeystoreError::Conflict {
+                label: format!("{} (file fallback)", path.display()),
+            }),
+            Err(e) => Err(KeystoreError::Io {
+                kind: e.kind().to_string(),
+                hint: format!("create {}: {e}", path.display()),
+            }),
+        }
     }
 }
 
@@ -240,9 +308,29 @@ fn write_0600(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     Ok(())
 }
 
-/// Create `final_path` with `bytes` iff it does not already exist. Returns
-/// an `io::Error` with `kind() == AlreadyExists` when it does — that is the
-/// conflict signal, not a real I/O failure.
+/// Result of a successful install attempt in [`create_new_0600`]. "Success"
+/// at the syscall level splits into two cases that a caller must not
+/// conflate: the link either landed *and* its durability was proven, or it
+/// landed but the follow-up proof step failed/couldn't run. Only the first
+/// is `Created`.
+enum CreateOutcome {
+    /// The link landed and the parent-directory fsync that proves it
+    /// completed successfully.
+    Created,
+    /// The link landed but the parent-directory fsync failed or could not
+    /// be attempted. The entry most likely exists; whether it would survive
+    /// a crash before some future successful fsync is unproven.
+    AmbiguousDurability(std::io::Error),
+}
+
+/// Create `final_path` with `bytes` iff it does not already exist.
+///
+/// - `Ok(Created)` / `Ok(AmbiguousDurability(_))` — the link syscall
+///   installed the entry; see [`CreateOutcome`] for what distinguishes them.
+/// - `Err(e)` with `e.kind() == AlreadyExists` — the link syscall itself
+///   refused because the destination is already there. Nothing was
+///   installed by this call.
+/// - `Err(e)` otherwise — a real I/O failure; nothing was installed.
 ///
 /// Plain `tmp + rename` (as [`write_0600`] uses for `set`) is NOT create-only:
 /// `rename(2)` silently replaces an existing destination. This instead
@@ -250,7 +338,7 @@ fn write_0600(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
 /// `link(2)` (via [`fs::hard_link`]), which fails with `EEXIST` rather than
 /// replacing when the destination is already there — genuine no-replace
 /// atomicity, not a race window narrowed by convention.
-fn create_new_0600(final_path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+fn create_new_0600(final_path: &Path, bytes: &[u8]) -> std::io::Result<CreateOutcome> {
     let parent = final_path
         .parent()
         .expect("account_path is always inside secrets_dir, which has a parent");
@@ -263,19 +351,19 @@ fn create_new_0600(final_path: &Path, bytes: &[u8]) -> std::io::Result<()> {
                 let publish = fs::hard_link(&tmp_path, final_path);
                 let _ = fs::remove_file(&tmp_path);
                 return match publish {
-                    // The entry now genuinely exists (the link landed) even
-                    // if we can't prove the directory entry is durable —
-                    // propagate the fsync failure instead of swallowing it,
-                    // matching `write_0600`'s `?` below. A caller who sees
-                    // this Err and retries will get a definitive answer:
-                    // `Conflict` if the link already survived, another `Io`
-                    // error otherwise. Silently returning `Ok(())` here would
-                    // claim durability this function never actually proved.
-                    Ok(()) => {
-                        let dir = OpenOptions::new().read(true).open(parent)?;
-                        dir.sync_all()?;
-                        Ok(())
-                    }
+                    // The link landed — the entry genuinely exists now.
+                    // Whether it survives a crash depends on this fsync,
+                    // which we report distinctly instead of collapsing into
+                    // an ordinary I/O failure: `Io` here would wrongly imply
+                    // nothing was installed.
+                    Ok(()) => match OpenOptions::new()
+                        .read(true)
+                        .open(parent)
+                        .and_then(|dir| dir.sync_all())
+                    {
+                        Ok(()) => Ok(CreateOutcome::Created),
+                        Err(e) => Ok(CreateOutcome::AmbiguousDurability(e)),
+                    },
                     Err(e) => Err(e),
                 };
             }
@@ -500,5 +588,68 @@ mod tests {
             .map(|d| d.as_nanos())
             .unwrap_or(0);
         format!("{prefix}.{}.{nanos}.{n}", std::process::id())
+    }
+
+    #[test]
+    fn orphaned_create_attempt_name_matcher_is_exact() {
+        assert!(is_orphaned_create_attempt_name(
+            "llm.api_key.anthropic.bin.tmp.1234.567890123.7.0"
+        ));
+        // A real, non-orphaned entry must never match.
+        assert!(!is_orphaned_create_attempt_name(
+            "llm.api_key.anthropic.bin"
+        ));
+        // Wrong field count / non-numeric fields must not match.
+        assert!(!is_orphaned_create_attempt_name("acct.bin.tmp.1234.567"));
+        assert!(!is_orphaned_create_attempt_name("acct.bin.tmp.a.b.c.d"));
+        // Merely containing the substring, without the required `.bin`
+        // stem right before it, must not match — an account label could
+        // legitimately contain `.tmp.` itself.
+        assert!(!is_orphaned_create_attempt_name("weird.tmp.1.2.3.4"));
+        // set()'s own tmp file (fixed `.bin.tmp` suffix, no per-attempt
+        // fields) must not match either — sweeping is scoped to
+        // create_only's orphans only, not write_0600's.
+        assert!(!is_orphaned_create_attempt_name("acct.bin.tmp"));
+    }
+
+    #[test]
+    fn sweep_removes_only_orphaned_create_attempts() {
+        let td = tempfile::tempdir().unwrap();
+        let ks = FileKeystore::new(td.path(), "svc");
+        let account = random_account("sweep");
+
+        // A real, live entry that must survive the sweep.
+        ks.create_only(&account, b"real-value").unwrap();
+
+        // Simulate what a crash between write_new_tmp_0600 succeeding and
+        // its own cleanup would leave behind: a tmp file matching the exact
+        // pattern create_new_0600 produces, containing secret bytes.
+        let orphan = ks.path_for(&account).with_file_name(format!(
+            "{}.bin.tmp.99999.123456789.0.0",
+            sanitize_path_segment(&account)
+        ));
+        fs::write(&orphan, b"leaked-plaintext-from-a-crash").unwrap();
+
+        // An unrelated file in the same directory must also survive.
+        let unrelated = ks.path_for(&account).with_file_name("unrelated.bin");
+        fs::write(&unrelated, b"not ours").unwrap();
+
+        let removed = ks.sweep_orphaned_create_attempts().unwrap();
+        assert_eq!(removed, 1, "must remove exactly the one orphan");
+
+        assert!(!orphan.exists(), "orphaned tmp file must be gone");
+        assert!(unrelated.exists(), "unrelated file must be untouched");
+        assert_eq!(
+            ks.get(&account).unwrap(),
+            b"real-value",
+            "the real entry must be untouched"
+        );
+    }
+
+    #[test]
+    fn sweep_on_missing_dir_is_a_noop() {
+        let td = tempfile::tempdir().unwrap();
+        let ks = FileKeystore::new(td.path(), "svc-never-written-to");
+        assert_eq!(ks.sweep_orphaned_create_attempts().unwrap(), 0);
     }
 }

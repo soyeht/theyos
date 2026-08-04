@@ -39,6 +39,17 @@ pub enum KeystoreError {
     #[error("keystore operation not supported: {hint}")]
     Unsupported { hint: String },
 
+    /// A [`KeystoreBackend::create_only`](crate::KeystoreBackend::create_only)
+    /// call's install step (the syscall that publishes the entry) reported
+    /// success, but the follow-up step that would *prove* durability failed
+    /// or could not run. The entry most likely exists right now — a
+    /// subsequent `create_only`/`get` will report which — but whether it
+    /// would survive a crash between the install and a future successful
+    /// durability barrier is unproven. Distinct from [`Self::Io`], which
+    /// means the install itself did not happen.
+    #[error("create-only durability unconfirmed for {label}: {hint}")]
+    AmbiguousDurability { label: String, hint: String },
+
     #[error("keystore I/O error: {kind}: {hint}")]
     Io { kind: String, hint: String },
 
@@ -62,6 +73,7 @@ impl KeystoreError {
             Self::NotFound { .. } => "keystore.not_found",
             Self::Conflict { .. } => "keystore.conflict",
             Self::Unsupported { .. } => "keystore.unsupported",
+            Self::AmbiguousDurability { .. } => "keystore.ambiguous_durability",
             Self::Io { .. } => "keystore.io",
             Self::SigningFailed(_) => "keystore.signing_failed",
             Self::InvalidKeyMaterial(_) => "keystore.invalid_key_material",
@@ -76,7 +88,8 @@ impl KeystoreError {
             | Self::PermissionDenied { hint }
             | Self::SeUnavailable { hint }
             | Self::Io { hint, .. }
-            | Self::Unsupported { hint } => hint.clone(),
+            | Self::Unsupported { hint }
+            | Self::AmbiguousDurability { hint, .. } => hint.clone(),
             Self::NotFound { label } => format!("entry {label} missing from keystore"),
             Self::Conflict { label } => format!("entry {label} already exists"),
             Self::SigningFailed(msg) | Self::InvalidKeyMaterial(msg) => msg.clone(),

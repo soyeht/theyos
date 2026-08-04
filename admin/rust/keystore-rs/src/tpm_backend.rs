@@ -63,6 +63,15 @@ impl TpmKeystore {
             inner: FileKeystore::new(state_dir, service),
         }
     }
+
+    /// See [`FileKeystore::sweep_orphaned_create_attempts`] — `create_only`
+    /// on this backend delegates to the same file-backed install path, so a
+    /// crash mid-`create_only` leaves an orphaned tmp file the same way
+    /// (holding sealed ciphertext here rather than plaintext, but still
+    /// secret material that does not expire on its own).
+    pub fn sweep_orphaned_create_attempts(&self) -> std::io::Result<usize> {
+        self.inner.sweep_orphaned_create_attempts()
+    }
 }
 
 impl KeystoreBackend for TpmKeystore {
