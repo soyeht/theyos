@@ -5,8 +5,8 @@
 //! specifically because of it.
 
 use mesh_session_control_model_rs::activate::{
-    ActivateError, LoadRevalidatedError, activate_from_key_observed, load_revalidated,
-    revalidate_on_load,
+    ActivateError, LoadRevalidatedError, activate_from_key_observed, load_revalidated_guarded,
+    load_revalidated_report, revalidate_on_load,
 };
 use mesh_session_control_model_rs::cell::{
     self, CommitTransitionError, ControlRecordCell, OpenConflict,
@@ -22,8 +22,9 @@ use mesh_session_control_model_rs::secret_backend::{
 use mesh_session_control_model_rs::store::{AtomicControlRecordStore, LoadOutcome, ReplaceOutcome};
 use mesh_session_control_model_rs::transition::{RecordTransition, TransitionError, apply};
 use mesh_session_control_model_rs::validator::{
-    BindingContext, DelegationPolicy, MeshSessionPurpose, RosterCurrency, RosterLookup,
-    RosterSyncPurpose, SignatureVerifier, ValidationError, validate_full_binding,
+    BindingContext, CurrencyLease, DelegationPolicy, MeshSessionPurpose, RosterChanged,
+    RosterCurrency, RosterLookup, RosterSyncPurpose, SignatureVerifier, ValidationError,
+    validate_full_binding,
 };
 use std::num::NonZeroU64;
 use std::sync::{Arc, Mutex};
@@ -154,6 +155,12 @@ impl SignatureVerifier for RecordingVerifier {
     }
 }
 
+/// Trivial `CurrencyLease` for test doubles whose currency never actually
+/// changes -- holding it guarantees nothing extra, because there is
+/// nothing to guarantee against.
+struct TrivialLease;
+impl CurrencyLease for TrivialLease {}
+
 struct FixedRoster(RosterCurrency);
 impl RosterLookup for FixedRoster {
     fn query_machine_currency(&self, _machine_id: &str) -> RosterCurrency {
@@ -163,6 +170,17 @@ impl RosterLookup for FixedRoster {
         // Never changes -- a before/after comparison always matches,
         // which is correct: FixedRoster never goes stale mid-flight.
         0
+    }
+    fn acquire_currency_lease(
+        &self,
+        _machine_id: &str,
+        expected_revision: u64,
+    ) -> Result<Box<dyn CurrencyLease + '_>, RosterChanged> {
+        if expected_revision == 0 {
+            Ok(Box::new(TrivialLease))
+        } else {
+            Err(RosterChanged)
+        }
     }
 }
 
@@ -276,7 +294,7 @@ fn store_cas_rejects_stale_revision() {
         ReplaceOutcome::KnownNoEffect,
         "writer B's stale revision-0 CAS must be rejected once writer A already advanced to revision 1"
     );
-    let LoadOutcome::Exact(on_disk) = cell.load_canonical() else {
+    let LoadOutcome::Exact(on_disk) = cell.load_canonical_for_test() else {
         panic!("expected record")
     };
     assert_eq!(*on_disk, writer_a_next);
@@ -387,7 +405,7 @@ fn store_missing_rejects_non_canonical_first_write() {
         ReplaceOutcome::KnownNoEffect,
         "Missing must only accept the exact canonical bootstrap record"
     );
-    assert_eq!(cell.load_canonical(), LoadOutcome::Missing);
+    assert_eq!(cell.load_canonical_for_test(), LoadOutcome::Missing);
 }
 
 #[test]
@@ -484,7 +502,7 @@ fn load_canonical_rejects_non_canonical_map_key_order() {
     std::fs::write(&path, &buf).unwrap();
 
     let cell = test_cell(path);
-    assert_eq!(cell.load_canonical(), LoadOutcome::Corrupt);
+    assert_eq!(cell.load_canonical_for_test(), LoadOutcome::Corrupt);
 }
 
 #[test]
@@ -506,7 +524,7 @@ fn load_canonical_rejects_duplicate_map_key() {
     std::fs::write(&path, &buf).unwrap();
 
     let cell = test_cell(path);
-    assert_eq!(cell.load_canonical(), LoadOutcome::Corrupt);
+    assert_eq!(cell.load_canonical_for_test(), LoadOutcome::Corrupt);
 }
 
 #[test]
@@ -520,7 +538,7 @@ fn load_canonical_rejects_trailing_bytes_after_a_complete_value() {
     std::fs::write(&path, &buf).unwrap();
 
     let cell = test_cell(path);
-    assert_eq!(cell.load_canonical(), LoadOutcome::Corrupt);
+    assert_eq!(cell.load_canonical_for_test(), LoadOutcome::Corrupt);
 }
 
 #[test]
@@ -533,7 +551,7 @@ fn load_canonical_rejects_non_minimal_integer_encoding() {
     std::fs::write(&path, &buf).unwrap();
 
     let cell = test_cell(path);
-    assert_eq!(cell.load_canonical(), LoadOutcome::Corrupt);
+    assert_eq!(cell.load_canonical_for_test(), LoadOutcome::Corrupt);
 }
 
 #[test]
@@ -546,7 +564,7 @@ fn store_write_then_read_round_trips_through_canonicalization() {
         cell.seed_for_test(&g, INITIAL_REVISION, &rec),
         ReplaceOutcome::Committed
     );
-    let LoadOutcome::Exact(read_back) = cell.load_canonical() else {
+    let LoadOutcome::Exact(read_back) = cell.load_canonical_for_test() else {
         panic!("expected record")
     };
     assert_eq!(*read_back, rec);
@@ -1996,7 +2014,7 @@ fn gc_worker_requires_two_ticks_to_confirm_absent() {
 
     let resolved_1 = gc_worker_tick(&cell, &backend, 1000, TEST_CAP).unwrap();
     assert_eq!(resolved_1, 1);
-    let LoadOutcome::Exact(r1) = cell.load_canonical() else {
+    let LoadOutcome::Exact(r1) = cell.load_canonical_for_test() else {
         panic!("expected record")
     };
     match &r1.gc_pending[0] {
@@ -2008,7 +2026,7 @@ fn gc_worker_requires_two_ticks_to_confirm_absent() {
     // with nothing carried over except what tick 1 durably wrote.
     let resolved_2 = gc_worker_tick(&cell, &backend, 2000, TEST_CAP).unwrap();
     assert_eq!(resolved_2, 1);
-    let LoadOutcome::Exact(r2) = cell.load_canonical() else {
+    let LoadOutcome::Exact(r2) = cell.load_canonical_for_test() else {
         panic!("expected record")
     };
     match &r2.gc_pending[0] {
@@ -2036,7 +2054,7 @@ fn gc_worker_tick_drains_inspect_and_destroy_in_one_call_when_found() {
         resolved, 2,
         "one commit for GcInspected, one for GcResolved"
     );
-    let LoadOutcome::Exact(r) = cell.load_canonical() else {
+    let LoadOutcome::Exact(r) = cell.load_canonical_for_test() else {
         panic!("expected record")
     };
     match &r.gc_pending[0] {
@@ -2069,7 +2087,7 @@ fn gc_is_plural_resolves_multiple_independent_entries_in_one_tick() {
         resolved, 2,
         "one tick must drain every independently-resolvable entry, not just the first"
     );
-    let LoadOutcome::Exact(r) = cell.load_canonical() else {
+    let LoadOutcome::Exact(r) = cell.load_canonical_for_test() else {
         panic!("expected record")
     };
     assert!(
@@ -2101,7 +2119,7 @@ fn gc_reprocesses_a_pending_bound_entry_next_tick_never_stuck() {
         resolved, 1,
         "a Pending entry from a crashed prior tick must be retried, not skipped forever"
     );
-    let LoadOutcome::Exact(r) = cell.load_canonical() else {
+    let LoadOutcome::Exact(r) = cell.load_canonical_for_test() else {
         panic!("expected record")
     };
     match &r.gc_pending[0] {
@@ -2131,7 +2149,7 @@ fn gc_resolved_quarantines_on_backend_reported_mismatch() {
 
     let resolved = gc_worker_tick(&cell, &backend, 1000, TEST_CAP).unwrap();
     assert_eq!(resolved, 1);
-    let LoadOutcome::Exact(r) = cell.load_canonical() else {
+    let LoadOutcome::Exact(r) = cell.load_canonical_for_test() else {
         panic!("expected record")
     };
     match &r.gc_pending[0] {
@@ -2213,7 +2231,7 @@ fn gc_indeterminate_entry_does_not_block_other_entries_in_the_same_tick() {
         "only the non-indeterminate entry resolves this tick"
     );
 
-    let LoadOutcome::Exact(r) = cell.load_canonical() else {
+    let LoadOutcome::Exact(r) = cell.load_canonical_for_test() else {
         panic!("expected record")
     };
     let ok_entry = r
@@ -2261,7 +2279,7 @@ fn gc_removal_pass_removes_done_and_absent_entries() {
     seed_record(&cell, &rec);
     let removed = gc_removal_pass(&cell, 1000, TEST_CAP).unwrap();
     assert_eq!(removed, 2);
-    let LoadOutcome::Exact(r) = cell.load_canonical() else {
+    let LoadOutcome::Exact(r) = cell.load_canonical_for_test() else {
         panic!("expected record")
     };
     assert!(r.gc_pending.is_empty());
@@ -2718,6 +2736,17 @@ impl RosterLookup for BlockingRoster {
     fn currency_revision(&self, _machine_id: &str) -> u64 {
         0
     }
+    fn acquire_currency_lease(
+        &self,
+        _machine_id: &str,
+        expected_revision: u64,
+    ) -> Result<Box<dyn CurrencyLease + '_>, RosterChanged> {
+        if expected_revision == 0 {
+            Ok(Box::new(TrivialLease))
+        } else {
+            Err(RosterChanged)
+        }
+    }
 }
 
 #[test]
@@ -2884,7 +2913,7 @@ fn gc_worker_persists_inspection_conflict_and_excludes_it_from_retry() {
     };
     let resolved = gc_worker_tick(&cell, &backend, 1000, TEST_CAP).unwrap();
     assert_eq!(resolved, 1);
-    let LoadOutcome::Exact(r) = cell.load_canonical() else {
+    let LoadOutcome::Exact(r) = cell.load_canonical_for_test() else {
         panic!("expected record")
     };
     match &r.gc_pending[0] {
@@ -2954,7 +2983,7 @@ fn load_canonical_rejects_an_unknown_field_nested_inside_a_substruct() {
     ciborium::into_writer(&value, &mut out).unwrap();
     std::fs::write(&path, &out).unwrap();
 
-    assert_eq!(cell.load_canonical(), LoadOutcome::Corrupt);
+    assert_eq!(cell.load_canonical_for_test(), LoadOutcome::Corrupt);
 }
 
 /// Local mirror of `store::canonicalize_value` (private to that module) --
@@ -3869,32 +3898,154 @@ fn gc_bound_entry_gets_at_most_one_destroy_attempt_per_tick_even_when_backend_ne
     );
 }
 
-// ── wave 2, item 3: activate must reject if roster currency changed
-// between validation and commit, without holding the guard during I/O ───
+// ── wave 2/4/6, item 3: activate must reject if roster currency changed
+// before the lease could be granted, and a real lease genuinely blocks a
+// conflicting roster-side mutation until it is released -- not just a
+// bare revision-number recheck (this crate's own two prior attempts) ────
 
-struct RevisionBumpingBlockingRoster {
+/// Round 6, wave 6: replaces the now-obsolete `RevisionBumpingBlockingRoster`
+/// (which only re-checked a bare number, never actually enforcing
+/// anything). `acquire_currency_lease` holds `state`'s own `Mutex` for the
+/// lease's ENTIRE lifetime; `revoke_on_roster_side` needs that identical
+/// `Mutex`, so it is genuinely, mechanically blocked -- not merely
+/// "happened not to race" -- while a lease is outstanding.
+struct LeaseEnforcingRoster {
+    // Optional rendezvous hook so a test can pause activate_from_key_observed
+    // mid-validation (inside query_machine_currency, which the real
+    // validate_full_binding call reaches AFTER currency_revision_before has
+    // already been captured but BEFORE acquire_currency_lease runs) to
+    // deterministically land a roster-side change in that exact window.
+    sync: Option<RosterSync>,
+    state: Mutex<RosterLeaseState>,
+}
+struct RosterSync {
     ready_tx: Mutex<Option<std::sync::mpsc::Sender<()>>>,
     proceed_rx: Mutex<std::sync::mpsc::Receiver<()>>,
-    revision: std::sync::atomic::AtomicU64,
 }
-impl RosterLookup for RevisionBumpingBlockingRoster {
-    fn query_machine_currency(&self, _machine_id: &str) -> RosterCurrency {
-        if let Some(tx) = self.ready_tx.lock().unwrap().take() {
-            let _ = tx.send(());
-        }
-        self.proceed_rx.lock().unwrap().recv().unwrap();
-        RosterCurrency::Active {
-            member_pub: vec![1, 2, 3],
-            member_cert_fingerprint: [9u8; 32],
+struct RosterLeaseState {
+    currency: RosterCurrency,
+    revision: u64,
+}
+// Held only for its Drop (releases the mutex); never read.
+#[allow(dead_code)]
+struct HeldRosterLease<'a>(std::sync::MutexGuard<'a, RosterLeaseState>);
+impl CurrencyLease for HeldRosterLease<'_> {}
+
+impl LeaseEnforcingRoster {
+    fn active(member_pub: Vec<u8>, member_cert_fingerprint: [u8; 32]) -> Self {
+        Self {
+            sync: None,
+            state: Mutex::new(RosterLeaseState {
+                currency: RosterCurrency::Active {
+                    member_pub,
+                    member_cert_fingerprint,
+                },
+                revision: 0,
+            }),
         }
     }
+
+    fn active_blocking(
+        member_pub: Vec<u8>,
+        member_cert_fingerprint: [u8; 32],
+        ready_tx: std::sync::mpsc::Sender<()>,
+        proceed_rx: std::sync::mpsc::Receiver<()>,
+    ) -> Self {
+        Self {
+            sync: Some(RosterSync {
+                ready_tx: Mutex::new(Some(ready_tx)),
+                proceed_rx: Mutex::new(proceed_rx),
+            }),
+            state: Mutex::new(RosterLeaseState {
+                currency: RosterCurrency::Active {
+                    member_pub,
+                    member_cert_fingerprint,
+                },
+                revision: 0,
+            }),
+        }
+    }
+
+    /// Blocks for as long as any lease is outstanding -- see the struct
+    /// doc comment.
+    fn revoke_on_roster_side(&self) {
+        let mut guard = self.state.lock().unwrap();
+        guard.currency = RosterCurrency::Revoked;
+        guard.revision += 1;
+    }
+
+    /// Simulates a roster-side change to a *different* machine bumping the
+    /// shared monotonic revision counter (see `RosterLookup::currency_revision`'s
+    /// doc comment) without touching this machine's own currency -- unlike
+    /// `revoke_on_roster_side`, `query_machine_currency` still reports
+    /// `Active` afterward, so `validate_full_binding` still passes and the
+    /// rejection this simulates can only be caught by
+    /// `acquire_currency_lease`'s own revision check, not by
+    /// `ValidationError::DelegatorRevoked`.
+    fn bump_revision_for_an_unrelated_change(&self) {
+        let mut guard = self.state.lock().unwrap();
+        guard.revision += 1;
+    }
+}
+impl RosterLookup for LeaseEnforcingRoster {
+    fn query_machine_currency(&self, _machine_id: &str) -> RosterCurrency {
+        if let Some(sync) = &self.sync {
+            if let Some(tx) = sync.ready_tx.lock().unwrap().take() {
+                let _ = tx.send(());
+            }
+            sync.proceed_rx.lock().unwrap().recv().unwrap();
+        }
+        self.state.lock().unwrap().currency.clone()
+    }
     fn currency_revision(&self, _machine_id: &str) -> u64 {
-        self.revision.load(std::sync::atomic::Ordering::SeqCst)
+        self.state.lock().unwrap().revision
+    }
+    fn acquire_currency_lease(
+        &self,
+        _machine_id: &str,
+        expected_revision: u64,
+    ) -> Result<Box<dyn CurrencyLease + '_>, RosterChanged> {
+        let guard = self.state.lock().unwrap();
+        if guard.revision != expected_revision {
+            return Err(RosterChanged);
+        }
+        Ok(Box::new(HeldRosterLease(guard)))
     }
 }
 
 #[test]
-fn activate_rejects_commit_when_roster_revision_changed_after_validation() {
+fn roster_lease_genuinely_blocks_a_concurrent_revoke_until_dropped() {
+    // Direct, deterministic proof of the MECHANISM itself (not threaded
+    // through activate_from_key_observed, which would add unrelated
+    // timing noise to what this specifically needs to prove): a held
+    // lease REALLY blocks a conflicting roster-side mutation, using the
+    // same recv_timeout non-flaky pattern this suite already uses for the
+    // analogous gc_serial_is_owned_by_the_cell test.
+    let roster = LeaseEnforcingRoster::active(vec![1, 2, 3], [9u8; 32]);
+    let lease = roster.acquire_currency_lease("m_test", 0).unwrap();
+
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    std::thread::scope(|scope| {
+        let roster_ref = &roster;
+        scope.spawn(move || {
+            roster_ref.revoke_on_roster_side();
+            done_tx.send(()).unwrap();
+        });
+        assert_eq!(
+            done_rx.recv_timeout(std::time::Duration::from_millis(100)),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout),
+            "a roster-side revoke must be genuinely blocked while a lease is outstanding"
+        );
+        drop(lease);
+        done_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("must proceed promptly once the lease is released");
+    });
+    assert_eq!(roster.state.lock().unwrap().revision, 1);
+}
+
+#[test]
+fn activate_rejects_when_roster_already_changed_before_the_lease_attempt() {
     let dir = tempfile::tempdir().unwrap();
     let cell = test_cell(dir.path().join("record"));
     let old = MeshSignerControlRecordV1::bootstrap(identity(), PurposeId::MeshSession);
@@ -3952,11 +4103,13 @@ fn activate_rejects_commit_when_roster_revision_changed_after_validation() {
 
     let (ready_tx, ready_rx) = std::sync::mpsc::channel();
     let (proceed_tx, proceed_rx) = std::sync::mpsc::channel();
-    let roster = RevisionBumpingBlockingRoster {
-        ready_tx: Mutex::new(Some(ready_tx)),
-        proceed_rx: Mutex::new(proceed_rx),
-        revision: std::sync::atomic::AtomicU64::new(0),
-    };
+    // currency_revision_before is captured BEFORE validate_full_binding runs,
+    // so the roster-side change has to land inside query_machine_currency
+    // (which validate_full_binding calls) to fall in the exact
+    // captured-revision -> acquire_currency_lease window this test needs to
+    // prove is closed.
+    let roster =
+        LeaseEnforcingRoster::active_blocking(vec![1, 2, 3], [9u8; 32], ready_tx, proceed_rx);
     let policy = DelegationPolicy::test(1000);
     let mut d = delegation(0, 100);
     d.delegated_key_id = p.canonical_slot.canonical_id();
@@ -3977,10 +4130,8 @@ fn activate_rejects_commit_when_roster_revision_changed_after_validation() {
             )
         });
         ready_rx.recv().unwrap(); // activate is now inside query_machine_currency
-        roster
-            .revision
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst); // simulated roster change
-        proceed_tx.send(()).unwrap(); // let query_machine_currency return (Active, unchanged answer)
+        roster.bump_revision_for_an_unrelated_change(); // lands after currency_revision_before was captured; currency itself stays Active
+        proceed_tx.send(()).unwrap(); // let query_machine_currency return (still Active, stale answer)
         let result = handle.join().unwrap();
         assert!(
             matches!(
@@ -3992,6 +4143,13 @@ fn activate_rejects_commit_when_roster_revision_changed_after_validation() {
             "got {result:?}"
         );
     });
+
+    // Zero commits: the record must be exactly as it was before the
+    // rejected activation attempt.
+    let LoadOutcome::Exact(still_pending) = cell.load_canonical_for_test() else {
+        panic!("record must still be present")
+    };
+    assert_eq!(*still_pending, with_binding);
 }
 
 // ── wave 2, item 4: ControlRecordCell::commit must reject
@@ -4137,7 +4295,7 @@ fn load_canonical_rejects_a_cbor_valid_but_semantically_inconsistent_record() {
             "the store's CAS/genesis checks don't validate semantic invariants -- only load_canonical does"
         );
     }
-    assert_eq!(cell.load_canonical(), LoadOutcome::Corrupt);
+    assert_eq!(cell.load_canonical_for_test(), LoadOutcome::Corrupt);
 }
 
 // ── wave 3, item 5: revalidate_on_load detects physical key replacement ──
@@ -4253,7 +4411,7 @@ fn public_gc_bypass_cannot_forge_a_clean_destroy_and_erase_the_marker() {
     ));
 
     // The marker must still be there, untouched, exactly as seeded.
-    let LoadOutcome::Exact(still_there) = cell.load_canonical() else {
+    let LoadOutcome::Exact(still_there) = cell.load_canonical_for_test() else {
         panic!("expected record")
     };
     assert_eq!(still_there.gc_pending.len(), 1);
@@ -4492,17 +4650,22 @@ fn six_real_processes_racing_the_same_record_exactly_one_commits() {
 }
 
 #[test]
-fn hardlink_alias_makes_every_racing_process_fail_closed_not_double_commit() {
-    // Round 6, wave 5/6: closing the cross-process CAS race with a
-    // per-derived-path lock file was NOT enough on its own -- a hardlink
-    // alias (`record` / `alias`, same inode, two different names) still
-    // produced two independent lock files (`record.lock` / `alias.lock`)
-    // and two separate winners, one per spelling, confirmed by an earlier
-    // real 6-process run. `open_non_aliased`'s nlink check closes this
-    // structurally: it does not matter which of a hardlinked file's names
-    // a process used to open it -- nlink is a property of the shared
-    // inode, so every worker sees it and every worker fails closed. Never
-    // a "double commit"; always zero, safely, once any alias exists.
+fn preexisting_hardlink_alias_makes_every_process_fail_closed_not_double_commit() {
+    // Round 6, wave 6 (corrected, retracting an earlier false claim in
+    // this same test): `open_non_aliased`'s nlink check does NOT make
+    // this store immune to a hardlink alias in general -- see store.rs's
+    // top doc comment for the full, honest boundary. A hardlink created
+    // DURING a `replace_exact` call (between its nlink check and its
+    // rename) is NOT caught by this or any check in this crate: after
+    // that rename, the two names permanently and independently show
+    // nlink == 1, because they are, from that point on, genuinely two
+    // separate files -- there is nothing left to detect.
+    //
+    // What IS true, and is what this test actually demonstrates: an alias
+    // that already exists BEFORE any operation begins is detected and
+    // rejected, fail-closed, by every process that tries to use either
+    // spelling -- the hardlink here is created before any worker starts,
+    // not raced against one.
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("record");
     let alias_path = dir.path().join("alias");
@@ -4609,7 +4772,7 @@ fn load_revalidated_succeeds_for_a_genuinely_active_record() {
     seed_record(&cell, &activated);
 
     let policy = DelegationPolicy::test(1000);
-    let loaded = load_revalidated::<MeshSessionPurpose>(
+    let loaded = load_revalidated_report::<MeshSessionPurpose>(
         &cell,
         &backend,
         &policy,
@@ -4633,7 +4796,7 @@ fn load_revalidated_rejects_when_physical_key_was_replaced() {
     }
     seed_record(&cell, &rotated);
 
-    // Tamper the physical key AFTER seeding -- load_revalidated must
+    // Tamper the physical key AFTER seeding -- load_revalidated_report must
     // catch this; the low-level load_canonical alone never could.
     let tampered_slot = rotated.live_generations[0].binding.slot.clone();
     let mut tampered_binding = rotated.live_generations[0].binding.clone();
@@ -4642,7 +4805,7 @@ fn load_revalidated_rejects_when_physical_key_was_replaced() {
     backend.create_or_inspect(&tampered_slot, Some(&tampered_binding));
 
     let policy = DelegationPolicy::test(10_000);
-    let err = load_revalidated::<MeshSessionPurpose>(
+    let err = load_revalidated_report::<MeshSessionPurpose>(
         &cell,
         &backend,
         &policy,
@@ -4655,4 +4818,225 @@ fn load_revalidated_rejects_when_physical_key_was_replaced() {
         err,
         LoadRevalidatedError::Validation(ValidationError::PhysicalKeyNotConfirmed)
     ));
+}
+
+// ── wave 7, P0-5: a RevalidatedGuard genuinely blocks a concurrent revoke,
+// so no "sign" can ever linearize after one -- unlike a plain
+// load_revalidated_report snapshot, which carries no such guarantee ──────
+
+#[test]
+fn revalidated_guard_genuinely_blocks_a_concurrent_revoke_so_no_sign_can_linearize_after_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let cell = test_cell(dir.path().join("record"));
+    let old = MeshSignerControlRecordV1::bootstrap(identity(), PurposeId::MeshSession);
+    let with_intent = apply(
+        &old,
+        &RecordTransition::IntentRecorded {
+            txn_id: [140; 16],
+            kind: PendingOpKind::Create,
+            backend: BackendKind::File,
+        },
+        1000,
+        TEST_CAP,
+    )
+    .unwrap();
+    let p = with_intent.pending_op.clone().unwrap();
+    let backend = FakeSecretBackend::new();
+    let CreateOutcome::Unique {
+        binding: real_binding,
+        ..
+    } = backend.create_or_inspect(&p.canonical_slot, None)
+    else {
+        panic!()
+    };
+    let with_binding = apply(
+        &with_intent,
+        &RecordTransition::KeyObserved {
+            expected_txn_id: p.txn_id,
+            expected_kind: p.kind,
+            expected_generation: p.generation,
+            expected_epoch: p.epoch,
+            expected_purpose: p.purpose,
+            expected_slot_id: p.canonical_slot.canonical_id(),
+            expected_revision: with_intent.revision,
+            binding: real_binding.clone(),
+        },
+        1000,
+        TEST_CAP,
+    )
+    .unwrap();
+    let mut d = delegation(0, 100);
+    d.delegated_key_id = p.canonical_slot.canonical_id();
+    d.delegated_pub = real_binding.public_key.clone();
+    let mut activated = apply(
+        &with_binding,
+        &RecordTransition::ActivateFromKeyObserved {
+            expected_txn_id: p.txn_id,
+            expected_kind: p.kind,
+            expected_generation: p.generation,
+            expected_epoch: p.epoch,
+            expected_purpose: p.purpose,
+            expected_slot_id: p.canonical_slot.canonical_id(),
+            expected_revision: with_binding.revision,
+            delegation: d,
+        },
+        1000,
+        TEST_CAP,
+    )
+    .unwrap();
+    activated.revision = 1; // see seed_record's own two-step requirement
+    seed_record(&cell, &activated);
+
+    let policy = DelegationPolicy::test(1000);
+    let guard = load_revalidated_guarded::<MeshSessionPurpose>(
+        &cell,
+        &backend,
+        &policy,
+        &active_roster(),
+        &AlwaysTrueVerifier,
+        50,
+    )
+    .expect("a genuinely valid, backend-confirmed record must load");
+    assert_eq!(*guard.record(), activated);
+
+    let order = Arc::new(Mutex::new(Vec::new()));
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    std::thread::scope(|scope| {
+        let order_ref = Arc::clone(&order);
+        let cell_ref = &cell;
+        scope.spawn(move || {
+            let result = cell_ref.commit(
+                &RecordTransition::RevokeUrgent {
+                    reason: RevocationReason::OwnerAction,
+                    txn_id: [141; 16],
+                },
+                60,
+                TEST_CAP,
+            );
+            order_ref.lock().unwrap().push("revoke_done");
+            done_tx.send(result).unwrap();
+        });
+
+        // RevokeUrgent needs the same MeshSignerLocks' write side the held
+        // guard's SignGuard blocks -- it must not be able to complete
+        // while the guard is still outstanding.
+        assert!(
+            matches!(
+                done_rx.recv_timeout(std::time::Duration::from_millis(100)),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+            ),
+            "RevokeUrgent must be genuinely blocked while a RevalidatedGuard is outstanding"
+        );
+
+        // The simulated "sign": still safe to trust guard.record() here --
+        // no revoke could have landed since the reload.
+        assert_eq!(guard.record().identity, activated.identity);
+        order.lock().unwrap().push("sign_done");
+        drop(guard);
+
+        let result = done_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("must proceed promptly once the guard is released");
+        result.expect("revoke must succeed once unblocked");
+    });
+
+    assert_eq!(
+        *order.lock().unwrap(),
+        vec!["sign_done", "revoke_done"],
+        "no sign can ever linearize after a revoke -- proven here by the converse: revoke cannot complete until the guard-covered sign already happened and the guard was dropped"
+    );
+}
+
+// ── wave 6: pre-existing-tamper identity checks fail closed ─────────────
+
+#[test]
+fn load_canonical_rejects_a_symlink_at_the_record_path() {
+    let dir = tempfile::tempdir().unwrap();
+    let real_path = dir.path().join("real_record");
+    let symlink_path = dir.path().join("record");
+    {
+        let cell = test_cell(real_path.clone());
+        let bootstrap = MeshSignerControlRecordV1::bootstrap(identity(), PurposeId::MeshSession);
+        let g = cell.acquire_for_mutation();
+        assert_eq!(
+            cell.seed_for_test(&g, INITIAL_REVISION, &bootstrap),
+            ReplaceOutcome::Committed
+        );
+    }
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(&real_path, &symlink_path).unwrap();
+    #[cfg(unix)]
+    {
+        let cell = test_cell(symlink_path);
+        assert_eq!(cell.load_canonical_for_test(), LoadOutcome::Corrupt);
+    }
+}
+
+#[test]
+fn six_processes_via_a_preexisting_symlink_all_fail_closed() {
+    let dir = tempfile::tempdir().unwrap();
+    let real_path = dir.path().join("real_record");
+    let symlink_path = dir.path().join("record");
+    {
+        let cell = test_cell(real_path.clone());
+        let bootstrap = MeshSignerControlRecordV1::bootstrap(identity(), PurposeId::MeshSession);
+        let g = cell.acquire_for_mutation();
+        assert_eq!(
+            cell.seed_for_test(&g, INITIAL_REVISION, &bootstrap),
+            ReplaceOutcome::Committed
+        );
+    }
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink(&real_path, &symlink_path).unwrap();
+        let children: Vec<_> = (0u8..6)
+            .map(|i| run_cas_race_helper(&symlink_path, i))
+            .collect();
+        let outputs: Vec<String> = children.into_iter().map(wait_and_read_stdout).collect();
+        assert!(
+            outputs.iter().all(|o| o == "REJECTED:RecordCorrupt"),
+            "opening the record through a symlink must fail closed for every worker; got {outputs:?}"
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn store_directory_that_is_world_writable_is_rejected() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("record");
+    {
+        let cell = test_cell(path.clone());
+        let bootstrap = MeshSignerControlRecordV1::bootstrap(identity(), PurposeId::MeshSession);
+        let g = cell.acquire_for_mutation();
+        assert_eq!(
+            cell.seed_for_test(&g, INITIAL_REVISION, &bootstrap),
+            ReplaceOutcome::Committed
+        );
+    }
+    let mut perms = std::fs::metadata(dir.path()).unwrap().permissions();
+    perms.set_mode(0o777);
+    std::fs::set_permissions(dir.path(), perms).unwrap();
+
+    // A fresh cell (fresh registry entry, since the path is the same but
+    // this proves the OPEN-TIME check, not a cached decision) must now
+    // refuse to trust anything under this directory.
+    let outcome = {
+        let cell = test_cell(dir.path().join("record2")); // different path, same (now-tampered) dir
+        let bootstrap = MeshSignerControlRecordV1::bootstrap(identity(), PurposeId::MeshSession);
+        let g = cell.acquire_for_mutation();
+        cell.seed_for_test(&g, INITIAL_REVISION, &bootstrap)
+    };
+    assert_eq!(
+        outcome,
+        ReplaceOutcome::KnownNoEffect,
+        "a world-writable store directory must be rejected fail-closed, not silently trusted"
+    );
+
+    // Restore permissions so tempfile's own cleanup doesn't choke on a
+    // world-writable directory it didn't expect.
+    let mut perms = std::fs::metadata(dir.path()).unwrap().permissions();
+    perms.set_mode(0o700);
+    std::fs::set_permissions(dir.path(), perms).unwrap();
 }

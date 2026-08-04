@@ -121,9 +121,27 @@ impl ControlRecordCell {
         self.locks.token()
     }
 
+    /// Round 6 fix (wave 6, item 3): this used to be `pub` — a raw,
+    /// non-revalidated record, straight from disk, reachable by any
+    /// consumer of this crate as a library, with only a doc comment
+    /// ("sanctioned way...") suggesting `activate::load_revalidated_report`/
+    /// `load_revalidated_guarded` instead. A doc comment is not a
+    /// control. `pub(crate)` closes the default surface entirely:
+    /// `gc.rs`/`activate.rs` (same crate) keep using this directly for
+    /// their own mediated, narrower purposes (which are not "is this
+    /// record currently Active and authorized" — see each call site);
+    /// nothing outside this crate can reach it at all.
+    /// `load_canonical_for_test`, gated behind `test-support`, is the
+    /// test suite's own equivalent escape hatch.
     #[must_use]
-    pub fn load_canonical(&self) -> LoadOutcome {
+    pub(crate) fn load_canonical(&self) -> LoadOutcome {
         self.store.load_canonical()
+    }
+
+    #[cfg(feature = "test-support")]
+    #[must_use]
+    pub fn load_canonical_for_test(&self) -> LoadOutcome {
+        self.load_canonical()
     }
 
     pub fn acquire_for_sign(&self) -> SignGuard<'_> {

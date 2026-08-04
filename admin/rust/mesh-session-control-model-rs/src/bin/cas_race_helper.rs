@@ -40,7 +40,7 @@ fn main() {
     )
     .expect("open should not conflict -- same identity/purpose every worker");
 
-    if matches!(cell.load_canonical(), LoadOutcome::Missing) {
+    if matches!(cell.load_canonical_for_test(), LoadOutcome::Missing) {
         println!("NO_RECORD");
         return;
     }

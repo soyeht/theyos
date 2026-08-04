@@ -64,26 +64,53 @@ pub enum RosterCurrency {
 pub trait RosterLookup {
     fn query_machine_currency(&self, machine_id: &str) -> RosterCurrency;
 
-    /// Round 6 fix (item 3): `activate_from_key_observed` used to call
-    /// `query_machine_currency` once, with no guard held (deliberately —
-    /// see that function's own doc comment on why slow I/O must never
-    /// block a concurrent urgent revoke), and then commit against a
-    /// *stale* answer: if the roster flipped `Active` → `Revoked` for this
-    /// machine in the gap between that call and the eventual commit, the
-    /// activation still went through. Closing that gap with a second full
-    /// `query_machine_currency` call *inside* the commit guard would just
-    /// reopen the original blocking problem this crate already fixed once.
-    /// This method exists to let a real integration expose a CHEAP, purely
-    /// local staleness signal instead — no I/O, safe to call while holding
-    /// the guard — so the caller can prove nothing changed between the
-    /// slow lookup and the moment of commit without ever doing slow I/O
-    /// under lock. A real integration bumps its own revision counter on
-    /// any change to any machine's currency; comparing two calls' results
-    /// for the same `machine_id` is the whole contract. No default impl:
-    /// a test double or integration that cannot honor "no I/O" should not
-    /// silently inherit one that pretends to.
+    /// Cheap, purely local (no I/O) read of a monotonic counter a real
+    /// implementation bumps on any change to any machine's currency —
+    /// used only to obtain the `expected_revision` passed to
+    /// `acquire_currency_lease` right after the slow
+    /// `query_machine_currency` call succeeds.
     fn currency_revision(&self, machine_id: &str) -> u64;
+
+    /// Round 6 fix (item 4, corrected in wave 6): the first version of
+    /// this fix re-checked `currency_revision` as a bare, separately-timed
+    /// number comparison — read once, build the transition, read again
+    /// inside the commit closure. That leaves a real gap: the roster can
+    /// change in the instants between the second read and the disk write
+    /// actually going durable, and nothing re-observes it. This replaces
+    /// that with an atomic acquire: check `expected_revision` against the
+    /// CURRENT revision, and only grant the lease, under the SAME internal
+    /// lock the implementation's own revocation path must also acquire
+    /// before changing that machine's currency. A real implementation
+    /// therefore genuinely BLOCKS its own conflicting mutation for as long
+    /// as the returned lease stays alive — this is not a re-check, it is
+    /// mutual exclusion. `activate_from_key_observed` acquires this
+    /// immediately after slow validation succeeds (no lock/I/O overlap:
+    /// the slow `query_machine_currency`/`sig.verify`/`backend.load_exact`
+    /// calls all happen with no lease held) and holds it through the
+    /// short local commit that follows, dropping it only once that commit
+    /// has returned `Committed` or failed. Returns `RosterChanged`
+    /// immediately, granting nothing, if the revision has already moved by
+    /// the time this is called — i.e. a same-machine conflicting change
+    /// that landed strictly BEFORE the lease attempt, not one racing
+    /// against it (that case is instead genuinely blocked, per the
+    /// paragraph above, and does not need this branch at all).
+    fn acquire_currency_lease(
+        &self,
+        machine_id: &str,
+        expected_revision: u64,
+    ) -> Result<Box<dyn CurrencyLease + '_>, RosterChanged>;
 }
+
+/// RAII marker: for as long as one of these stays alive, the
+/// implementation that produced it must not let the currency it was
+/// checked against change — see `RosterLookup::acquire_currency_lease`'s
+/// doc comment for the full contract. Deliberately has no methods: its
+/// entire meaning is in being held, not in being queried.
+pub trait CurrencyLease {}
+
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+#[error("roster currency for this delegator already changed before the lease could be granted")]
+pub struct RosterChanged;
 
 /// Deliberately receives the typed `Delegation`, not preimage bytes — see
 /// the module doc's second-round fix. A real integration is expected to

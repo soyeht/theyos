@@ -32,6 +32,50 @@
 //! asserts the guard's token matches and validates every write — genesis
 //! included — against *this store's own binding*, never against whatever
 //! identity/purpose `new_record` itself happens to claim.
+//!
+//! ## Round 6, wave 6: hardlink-alias threat-model boundary (ratified)
+//!
+//! A prior fix here claimed opening the record via `open_non_aliased`
+//! (rejecting any path whose file has `nlink != 1`) made the cross-process
+//! lock "naturally immune" to a hardlink alias, and that any write racing
+//! through such an alias would be self-healing on the next load. **Both
+//! claims were false**, demonstrated by two real multi-process
+//! repros: (1) an attacker creating a hardlink between this store's own
+//! `nlink` check and its `rename()` leaves BOTH the canonical path and the
+//! alias at `nlink == 1` independently and *permanently* afterward — there
+//! is nothing left to detect on a later read, because by then two
+//! genuinely distinct, individually-valid files exist; (2) switching to a
+//! lock held directly on the record file's own inode does not fix this
+//! either — `rename()` swaps the directory entry, but a lock *waiter*
+//! already queued for the pre-rename inode can still acquire it after the
+//! swap and proceed against a now-orphaned file while a separate opener
+//! acquires the new inode's lock, reopening the same split. There is no
+//! POSIX primitive for an atomic "check refcount, then rename" or
+//! "check refcount, then acquire" — `link()`/`unlink()`/`rename()` are
+//! never gated by `flock()`, and `O_NOFOLLOW` (the one thing pulling in
+//! `libc` would buy) defends against a *symlink*, not a *hardlink* — it is
+//! not applicable to this class of attack at all.
+//!
+//! **Ratified boundary**: this model's locking (the sibling `<record>.lock`
+//! file, restored below to its original per-path design rather than moved
+//! onto the record's own inode) assumes a *cooperative* deployment — the
+//! directory holding the record is not writable by any actor other than
+//! the legitimate participants in this store's own protocol. It does NOT
+//! defend against a non-cooperative same-uid (or higher-privilege) actor
+//! deliberately manipulating directory entries (hardlink creation, or
+//! unlinking and recreating the lock/record path itself) concurrently with
+//! this store's own operations. `validate_directory_policy` and
+//! `open_non_aliased`/`acquire_process_lock`'s own checks (parent must be a
+//! real, non-group/world-writable directory; the lock/record path itself
+//! must be a regular file, not a symlink, owned by the same owner as the
+//! parent, with `nlink == 1`) close the *pre-existing* case — an alias or
+//! tampered lock that already exists before an operation begins is
+//! detected and rejected, fail-closed — but do not and cannot close a
+//! *race* against an adversary acting during the operation itself. A real
+//! production store serving a genuinely hostile multi-tenant filesystem
+//! needs an OS-integrated adapter (a `dirfd`/`StoreIdentity`-based design,
+//! outside this model crate's scope) — this is not sold as protection
+//! against a local attacker.
 
 use crate::locks::{LockToken, MutateGuard};
 use crate::record::{ControlIdentity, MeshSignerControlRecordV1, PurposeId};
@@ -235,17 +279,14 @@ impl FileBackedStore {
     /// Blocking cross-process exclusive lock, held for as long as the
     /// returned `File` stays alive (released automatically on drop — see
     /// `replace_exact`'s own doc comment for why this exists). Returns
-    /// `None` only if the lock file could not even be opened/created or
-    /// the OS-level lock call itself failed — in both cases nothing this
-    /// store could have done depends on holding it, so the caller treats
-    /// that the same as `KnownNoEffect`.
+    /// `None` if the lock file could not even be opened/created, failed
+    /// `open_lock_path`'s own fail-closed identity checks (see that
+    /// function and this module's top doc comment for exactly what those
+    /// do and do not cover), or the OS-level lock call itself failed — in
+    /// all cases nothing this store could have done depends on holding it,
+    /// so the caller treats that the same as `KnownNoEffect`.
     fn acquire_process_lock(&self) -> Option<File> {
-        let f = OpenOptions::new()
-            .create(true)
-            .write(true)
-            .mode_0600()
-            .open(self.lock_path())
-            .ok()?;
+        let f = open_lock_path(&self.lock_path()).ok()?;
         f.lock().ok()?;
         Some(f)
     }
@@ -479,53 +520,143 @@ fn fsync_parent(path: &Path) -> io::Result<()> {
     dir.sync_all()
 }
 
-/// Round 6: opens `path`, refusing to trust it at all if it is aliasable —
-/// hardlinked (`nlink != 1`) or a symlink. `nlink` is checked on the
-/// OPENED HANDLE's own metadata (`fstat`, not a separate path-based `stat`
-/// call), so it is immune to TOCTOU once open, and — being a property of
-/// the inode itself — reports identically no matter which of the inode's
-/// several names was used to open it: as soon as ANY hardlink alias of
-/// this file exists anywhere, opening it through ANY of its names is
-/// rejected, closing exactly the gap a per-path lock file (see
-/// `acquire_process_lock`'s own corrected doc comment) cannot: two
-/// different processes each holding a real, uncontended lock on their own
-/// derived `<their-path>.lock` still raced the SAME record through two
-/// different hardlinked spellings before this existed (confirmed by a
-/// real 6-process test, half via each name — sibling locks correctly
-/// serialize each spelling on its own, but the two spellings still
-/// produce two separate winners).
+/// Round 6, wave 6: the parent directory's own owner and mode are the
+/// trust anchor for everything below it. `nlink`/owner/mode checks on a
+/// single file mean nothing if ANY co-resident actor can freely create,
+/// unlink, or relink entries in that file's own directory — see this
+/// module's top doc comment for the ratified boundary this establishes:
+/// a cooperative deployment where the directory is not writable by any
+/// actor outside this store's own protocol. Returns the parent's owner
+/// uid, which callers use as the "expected owner" for files within it —
+/// no `getuid()`/`libc` dependency needed, since self-consistency with
+/// the directory's own owner is exactly the property that matters here
+/// (this is fail-closed either way: whoever legitimately owns the
+/// directory is, by construction, the one trusted party).
+#[cfg(unix)]
+fn validate_directory_policy(dir: &Path) -> io::Result<u32> {
+    use std::os::unix::fs::MetadataExt;
+    let meta = fs::symlink_metadata(dir)?;
+    if !meta.is_dir() {
+        return Err(io::Error::other(
+            "refusing to trust a store directory that is not a real directory",
+        ));
+    }
+    if meta.mode() & 0o022 != 0 {
+        return Err(io::Error::other(
+            "refusing to trust a store directory that is group- or world-writable",
+        ));
+    }
+    Ok(meta.uid())
+}
+
+/// Round 6, wave 6: opens `path`, refusing to trust it at all unless it is
+/// a regular file (never a symlink), owned by the same owner as its own
+/// parent directory (see `validate_directory_policy`), with `nlink == 1`.
 ///
-/// The symlink check (`fs::symlink_metadata` on `path` immediately before
-/// open) has a narrow, honestly-documented residual TOCTOU window this
-/// crate does not close: doing so atomically requires an `O_NOFOLLOW` open
-/// flag, whose raw value is platform-specific and not something this
-/// crate is willing to hardcode without the `libc` crate providing it —
-/// an external dependency this fix does not otherwise need.
+/// This closes the *pre-existing* case fail-closed: an alias, a symlink,
+/// or a foreign-owned file already sitting at `path` before this call
+/// begins is detected and rejected. It does **not** close a race against
+/// an adversary acting concurrently with this very call (see this
+/// module's top doc comment — a prior version of this comment claimed
+/// exactly that, which two independent multi-process repros proved
+/// false). `nlink`/owner/mode are read from the OPENED HANDLE's own
+/// metadata (`fstat`, not a separate path-based `stat` call), so at least
+/// they are immune to drifting between the check and the read that
+/// follows it in THIS call.
 #[cfg(unix)]
 fn open_non_aliased(path: &Path) -> io::Result<File> {
     use std::os::unix::fs::MetadataExt;
+    let Some(parent) = path.parent() else {
+        return Err(io::Error::other("path has no parent"));
+    };
+    let expected_uid = validate_directory_policy(parent)?;
     if let Ok(meta) = fs::symlink_metadata(path)
-        && meta.file_type().is_symlink()
+        && !meta.file_type().is_file()
     {
         return Err(io::Error::other(
-            "refusing to trust a path whose final component is a symlink",
+            "refusing to trust a path that is not a regular file (e.g. a symlink)",
         ));
     }
     let f = File::open(path)?;
-    if f.metadata()?.nlink() != 1 {
+    let meta = f.metadata()?;
+    if meta.nlink() != 1 {
         return Err(io::Error::other(
             "refusing to trust a path with more than one hard link",
+        ));
+    }
+    if meta.uid() != expected_uid {
+        return Err(io::Error::other(
+            "refusing to trust a path not owned by its parent directory's own owner",
+        ));
+    }
+    if meta.mode() & 0o022 != 0 {
+        return Err(io::Error::other(
+            "refusing to trust a path that is group- or world-writable",
         ));
     }
     Ok(f)
 }
 
-/// Non-unix fallback: `nlink`/hardlink identity is not portably available
-/// via `std::fs`, so this reduces to a plain open. Documented gap, not a
-/// silent one.
+/// Non-unix fallback: `nlink`/owner/mode identity is not portably
+/// available via `std::fs`, so this reduces to a plain open. Documented
+/// gap, not a silent one.
 #[cfg(not(unix))]
 fn open_non_aliased(path: &Path) -> io::Result<File> {
     File::open(path)
+}
+
+/// Round 6, wave 6: same fail-closed identity discipline as
+/// `open_non_aliased`, adapted for the lock file specifically — creating
+/// it (mode 0600) if it does not exist yet, since (unlike the record) a
+/// missing lock file is not a distinct outcome callers need to observe.
+/// Re-validates on EVERY call (never caches a prior success), so a lock
+/// file that was replaced or tampered with between two `replace_exact`
+/// calls is caught on the very next one.
+#[cfg(unix)]
+fn open_lock_path(path: &Path) -> io::Result<File> {
+    use std::os::unix::fs::MetadataExt;
+    let Some(parent) = path.parent() else {
+        return Err(io::Error::other("lock path has no parent"));
+    };
+    let expected_uid = validate_directory_policy(parent)?;
+    if let Ok(meta) = fs::symlink_metadata(path)
+        && !meta.file_type().is_file()
+    {
+        return Err(io::Error::other(
+            "refusing to trust a lock path that is not a regular file (e.g. a symlink)",
+        ));
+    }
+    let f = OpenOptions::new()
+        .create(true)
+        .write(true)
+        .mode_0600()
+        .open(path)?;
+    let meta = f.metadata()?;
+    if meta.nlink() != 1 {
+        return Err(io::Error::other(
+            "refusing to trust a lock path with more than one hard link",
+        ));
+    }
+    if meta.uid() != expected_uid {
+        return Err(io::Error::other(
+            "refusing to trust a lock path not owned by its parent directory's own owner",
+        ));
+    }
+    if meta.mode() & 0o022 != 0 {
+        return Err(io::Error::other(
+            "refusing to trust a lock path that is group- or world-writable",
+        ));
+    }
+    Ok(f)
+}
+
+#[cfg(not(unix))]
+fn open_lock_path(path: &Path) -> io::Result<File> {
+    OpenOptions::new()
+        .create(true)
+        .write(true)
+        .mode_0600()
+        .open(path)
 }
 
 trait Mode0600 {

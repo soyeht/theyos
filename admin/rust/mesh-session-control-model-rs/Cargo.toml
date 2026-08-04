@@ -48,6 +48,15 @@ rand = "0.8"
 [dev-dependencies]
 tempfile = "3"
 
+[[bin]]
+name = "cas_race_helper"
+path = "src/bin/cas_race_helper.rs"
+# Test-only infrastructure (spawned as a genuinely separate OS process by
+# the multi-process CAS tests) -- calls the test-support-gated
+# `load_canonical_for_test`, so it must not even attempt to build under a
+# plain `cargo build`.
+required-features = ["test-support"]
+
 [[test]]
 name = "model_invariants"
 path = "tests/model_invariants.rs"

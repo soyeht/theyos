@@ -35,6 +35,7 @@
 //!   `commit_built`, which always goes through `transition::apply`.
 
 use crate::cell::{CommitTransitionError, ControlRecordCell};
+use crate::locks::SignGuard;
 use crate::record::{
     GenerationRecord, MeshSignerControlRecordV1, PendingPhase, TerminalRequestFingerprint,
 };
@@ -177,52 +178,53 @@ pub fn activate_from_key_observed<P: PurposeMarker>(
         binding,
         not_after: delegation.not_after,
     };
-    // Captured immediately before the slow roster query so the later
-    // recheck covers the whole window `query_machine_currency`'s answer
-    // could have gone stale over -- round 6, item 3.
+    // Captured immediately before the slow roster query, used only to know
+    // what to pass as `expected_revision` to `acquire_currency_lease` once
+    // the slow validation below succeeds.
     let roster_revision_before = roster.currency_revision(&delegation.delegator_m_id);
     validate_full_binding::<P>(&generation_record, &ctx, policy, roster, sig, now)?;
 
+    // Round 6 fix (item 3, corrected in wave 6): a bare revision-number
+    // re-check (this crate's own first attempt) still left a real gap —
+    // the roster could change in the instants between that re-check and
+    // the disk write actually going durable, since a NUMBER cannot BLOCK
+    // anything. `acquire_currency_lease` is atomic (checks
+    // `roster_revision_before` against the CURRENT revision and only
+    // grants a lease under the roster implementation's own internal lock)
+    // and, unlike a number, is a held object: for as long as `_lease`
+    // stays alive here, a real implementation genuinely blocks its own
+    // conflicting mutation for this machine — not just fails to notice
+    // one. Acquired only now, after all slow I/O (`query_machine_currency`
+    // above, `backend.load_exact` earlier) has already completed with no
+    // lease held; dropped as soon as this function returns, whether the
+    // commit below succeeds or fails.
+    let _lease = roster
+        .acquire_currency_lease(&delegation.delegator_m_id, roster_revision_before)
+        .map_err(|_| ActivateError::Validation(ValidationError::RosterChangedDuringActivation))?;
+
     // Reacquire only now, and build against a fresh read taken under that
-    // same guard (`commit_built`) — apply()'s own exact-token check catches
-    // any divergence against this snapshot (e.g. an urgent revoke that ran
-    // while the slow I/O above was in flight).
-    //
-    // Round 6, item 3: `query_machine_currency` above ran with no guard
-    // held, so a roster change (e.g. the delegator's Active -> Revoked)
-    // landing in the gap between that call and this commit previously went
-    // completely undetected -- the commit proceeded against a validation
-    // result that was no longer current. `currency_revision` is a cheap,
-    // purely local check (no I/O, see its doc comment), so it is safe to
-    // call from inside the closure the guard is held for, unlike a second
-    // `query_machine_currency` call would be.
-    let roster_went_stale = std::cell::Cell::new(false);
-    let new = cell.commit_built_privileged(
-        |fresh| {
-            if roster.currency_revision(&delegation.delegator_m_id) != roster_revision_before {
-                roster_went_stale.set(true);
-                return None;
-            }
-            Some(RecordTransition::ActivateFromKeyObserved {
-                expected_txn_id,
-                expected_kind,
-                expected_generation,
-                expected_epoch,
-                expected_purpose,
-                expected_slot_id,
-                expected_revision: fresh.revision,
-                delegation,
-            })
-        },
-        now,
-        max_cap,
-    )?;
-    if roster_went_stale.get() {
-        return Err(ActivateError::Validation(
-            ValidationError::RosterChangedDuringActivation,
-        ));
-    }
-    Ok(new.expect("build always returns Some unless roster_went_stale was set, handled above"))
+    // same guard (`commit_built_privileged`) — apply()'s own exact-token
+    // check catches any divergence against this snapshot (e.g. an urgent
+    // revoke that ran while the slow I/O above was in flight).
+    let new = cell
+        .commit_built_privileged(
+            |fresh| {
+                Some(RecordTransition::ActivateFromKeyObserved {
+                    expected_txn_id,
+                    expected_kind,
+                    expected_generation,
+                    expected_epoch,
+                    expected_purpose,
+                    expected_slot_id,
+                    expected_revision: fresh.revision,
+                    delegation,
+                })
+            },
+            now,
+            max_cap,
+        )?
+        .expect("build always returns Some");
+    Ok(new)
 }
 
 /// Re-validates every live generation's delegation/binding against the
@@ -275,25 +277,7 @@ pub enum LoadRevalidatedError {
     Validation(#[from] ValidationError),
 }
 
-/// Round 6 fix (wave 4/6, item 5): `ControlRecordCell::load_canonical` is
-/// a low-level primitive — it only ever proves CBOR shape and
-/// `MeshSignerControlRecordV1::invariants_hold`'s structural invariants,
-/// never that a live generation's delegation is still authorized or its
-/// physical key still actually exists. Nothing stopped a caller from
-/// calling `load_canonical` directly and treating an `Active` record as
-/// trustworthy without ever calling `revalidate_on_load` — an opt-in a
-/// caller could simply forget, the exact same failure shape `activate_from_key_observed`
-/// closed for activation itself (see this module's top doc comment).
-/// This is the one sanctioned way to obtain a record for any purpose that
-/// depends on its live generations still being genuinely authorized (e.g.
-/// signing, or reporting "is this identity currently Active" to a caller)
-/// — full structural load, backend confirmation, and roster/signature
-/// revalidation, or a typed error explaining exactly which step failed.
-/// `load_canonical` remains available as the low-level primitive the
-/// mediated orchestration in this crate (`gc`, the guard-held sections of
-/// `commit_built_impl`) uses internally, where full delegation
-/// revalidation is not the question being asked.
-pub fn load_revalidated<P: PurposeMarker>(
+fn load_and_revalidate<P: PurposeMarker>(
     cell: &ControlRecordCell,
     backend: &dyn SecretBackend,
     policy: &DelegationPolicy,
@@ -308,4 +292,106 @@ pub fn load_revalidated<P: PurposeMarker>(
     };
     revalidate_on_load::<P>(&record, backend, policy, roster, sig, now)?;
     Ok(record)
+}
+
+/// Round 6 fix (wave 4/6, item 5), corrected in wave 7 (P0-5): this used
+/// to be `pub fn load_revalidated`, returning a plain, unguarded snapshot
+/// — the "sanctioned way" doc comment made it *look* authority-bearing,
+/// but nothing about the return value kept it true. A caller could load +
+/// revalidate as `Active`, then a concurrent `RevokeUrgent` could commit,
+/// and the caller could still go on to "sign"/forward using the now-stale
+/// snapshot — the exact load→validate→[gap]→use race this crate has
+/// closed everywhere else it appears. Renamed to make the narrower
+/// contract explicit, and its authority-bearing twin below added for
+/// callers that actually need the record to *stay* authorized through the
+/// moment they use it:
+/// - `load_revalidated_report` (this function), for callers that only
+///   need a point-in-time answer (e.g. "is this identity Active right
+///   now") and will never use the result to authorize a sign/forward
+///   action;
+/// - `load_revalidated_guarded`, which returns a `RevalidatedGuard`
+///   holding the same `SignGuard` `RevokeUrgent` contends on, for exactly
+///   that purpose.
+///
+/// The record is genuinely `Active`/revalidated *at the moment this
+/// returns*, but nothing stops it from becoming stale immediately after:
+/// no guard is held past this call, so a `RevokeUrgent` can commit right
+/// after this returns. Never use this result to decide whether to sign or
+/// forward anything; use `load_revalidated_guarded` for that.
+pub fn load_revalidated_report<P: PurposeMarker>(
+    cell: &ControlRecordCell,
+    backend: &dyn SecretBackend,
+    policy: &DelegationPolicy,
+    roster: &dyn RosterLookup,
+    sig: &dyn SignatureVerifier,
+    now: u64,
+) -> Result<MeshSignerControlRecordV1, LoadRevalidatedError> {
+    load_and_revalidate::<P>(cell, backend, policy, roster, sig, now)
+}
+
+/// A live, authority-bearing handle on a record that has just been
+/// reloaded and revalidated (backend confirmation + roster/signature
+/// check) — obtained and held under the same `SignGuard` a `RevokeUrgent`
+/// needs the write side of (`ControlRecordCell::acquire_for_mutation`) to
+/// commit. As long as one of these stays alive, no `RevokeUrgent` can have
+/// landed on this cell since the reload: `RevokeUrgent` genuinely blocks
+/// on `acquire_for_mutation` until this guard drops, rather than merely
+/// racing it. This is what closes the P0-5 gap `load_revalidated_report`
+/// cannot: a caller that reads `record()` and acts on it (e.g. signs)
+/// before dropping the guard is guaranteed no revoke has linearized before
+/// that action.
+///
+/// Deliberately not `Clone` and exposes no way to detach the record from
+/// the guard — kiana rejected an earlier design (an arbitrary
+/// caller-supplied closure run under `SignGuard`) specifically because
+/// unbounded caller work held under the guard could delay `RevokeUrgent`
+/// indefinitely, reopening the property round 4/5 protects (`RevokeUrgent`
+/// must never queue behind unrelated slow work). This type is instead a
+/// narrow RAII handle: the caller reads `record()`, does its own bounded
+/// work, and drops it promptly — it cannot be squirreled away and outlive
+/// the operation it was obtained for the way a plain returned snapshot
+/// could.
+///
+/// This crate has no `backend.sign()` concept yet, so a narrower
+/// `sign_revalidated`/`sign_checked`-shaped operation (holding the guard
+/// only across reload + checks + the actual sign call, with bounded
+/// measured latency) is not buildable here yet. When it lands, prefer
+/// that shape; this type is the interim, still-correct alternative in the
+/// meantime.
+pub struct RevalidatedGuard<'a> {
+    _sign: SignGuard<'a>,
+    record: MeshSignerControlRecordV1,
+}
+
+impl RevalidatedGuard<'_> {
+    /// The record as it stood at the moment of revalidation, still
+    /// covered by the guard this handle holds — see the struct doc
+    /// comment. Do not clone this out and act on it after the guard
+    /// drops; that reopens exactly the race this type exists to close.
+    #[must_use]
+    pub fn record(&self) -> &MeshSignerControlRecordV1 {
+        &self.record
+    }
+}
+
+/// Acquires `cell`'s `SignGuard` *before* loading, so the load +
+/// revalidation itself, and everything the caller does with the returned
+/// guard afterward, all happen under one continuous hold — see
+/// `RevalidatedGuard`'s doc comment. On any failure (no record, corrupt,
+/// or revalidation rejects it) the guard is dropped immediately and no
+/// handle is returned.
+pub fn load_revalidated_guarded<'a, P: PurposeMarker>(
+    cell: &'a ControlRecordCell,
+    backend: &dyn SecretBackend,
+    policy: &DelegationPolicy,
+    roster: &dyn RosterLookup,
+    sig: &dyn SignatureVerifier,
+    now: u64,
+) -> Result<RevalidatedGuard<'a>, LoadRevalidatedError> {
+    let sign = cell.acquire_for_sign();
+    let record = load_and_revalidate::<P>(cell, backend, policy, roster, sig, now)?;
+    Ok(RevalidatedGuard {
+        _sign: sign,
+        record,
+    })
 }
