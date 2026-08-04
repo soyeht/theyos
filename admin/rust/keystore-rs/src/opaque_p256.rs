@@ -65,10 +65,23 @@ pub const P256_SIGNATURE_LEN: usize = 64;
 /// distinct signing preimages, so a key minted for one role cannot sign for
 /// another — not by passing a different string, and not by reusing bytes.
 pub trait Purpose {
-    /// Stable, domain-separating label. Part of both the storage slot
-    /// identity and the signed preimage, so changing it both orphans
-    /// existing keys and invalidates existing signatures. Treat as a wire
-    /// constant.
+    /// Stable label that domain-separates STORAGE: it is hashed into the
+    /// canonical slot id, so changing it orphans existing keys. Treat it as
+    /// a wire constant.
+    ///
+    /// It is NOT part of the signed preimage. [`Preimage::exact`] signs the
+    /// caller's canonical bytes verbatim, because theyOS wire formats
+    /// freeze the signed preimage and any framing added here would produce
+    /// signatures no verifier accepts. (An earlier revision did prepend
+    /// `PURPOSE || 0x00` and this doc still described that behaviour after
+    /// the code stopped doing it — a stale claim of cryptographic domain
+    /// separation is worse than none, because a caller would rely on it.)
+    ///
+    /// Cross-purpose misuse is prevented at COMPILE time instead: a
+    /// `Preimage<A>` cannot reach an `OpaqueSigner<B>`. Two purposes
+    /// signing identical bytes with the same key therefore produce
+    /// identical signatures; where a protocol needs cryptographic
+    /// separation, that protocol must put it in the bytes it hands here.
     const PURPOSE: &'static str;
 }
 
@@ -492,8 +505,27 @@ impl SlotStore {
                 // not be what decides existence.
                 match s.file_store().secure_durable_get(account)? {
                     Some(ciphertext) => {
-                        crate::tpm_backend::TpmKeystore::decrypt_blob(account, &ciphertext)
-                            .map(Some)
+                        match crate::tpm_backend::TpmKeystore::decrypt_blob(account, &ciphertext) {
+                            Ok(plain) => Ok(Some(plain)),
+                            // A blob that is present and durable but will not
+                            // decrypt is a PERMANENT condition — corruption,
+                            // a cleared or replaced TPM, a host migration —
+                            // not the transient ambiguity a caller should
+                            // retry through. Surfacing it as a security
+                            // violation keeps it distinguishable from
+                            // "unresolved, try again", which would otherwise
+                            // spin forever against material that will never
+                            // decrypt on this host.
+                            Err(e) => Err(KeystoreError::SecurityViolation {
+                                label: account.to_string(),
+                                hint: format!(
+                                    "sealed material exists and is durable but does not decrypt \
+                                     on this host ({}); this does not resolve by retrying — the \
+                                     credential must be re-added",
+                                    e.kind()
+                                ),
+                            }),
+                        }
                     }
                     None => Ok(None),
                 }

@@ -337,15 +337,11 @@ impl FileKeystore {
             Err(_) => return Ok(CreateOutcome::MayHaveTakenEffect),
         };
 
-        let mut bytes = Vec::new();
-        if std::io::Read::by_ref(&mut file)
-            .take(MAX_SECRET_BYTES + 1)
-            .read_to_end(&mut bytes)
-            .is_err()
-        {
+        let Ok(mut bytes) = read_bounded_zeroizing(&mut file, MAX_SECRET_BYTES) else {
             return Ok(CreateOutcome::MayHaveTakenEffect);
-        }
+        };
         if bytes.len() as u64 > MAX_SECRET_BYTES {
+            bytes.zeroize();
             return Err(KeystoreError::SecurityViolation {
                 label: format!("{} (file fallback)", self.account_path(account).display()),
                 hint: format!(
@@ -426,11 +422,8 @@ impl FileKeystore {
             }
         };
 
-        let mut bytes = Vec::new();
-        std::io::Read::by_ref(&mut file)
-            .take(MAX_SECRET_BYTES + 1)
-            .read_to_end(&mut bytes)
-            .map_err(|e| KeystoreError::Io {
+        let mut bytes =
+            read_bounded_zeroizing(&mut file, MAX_SECRET_BYTES).map_err(|e| KeystoreError::Io {
                 kind: e.kind().to_string(),
                 hint: format!("read {}: {e}", self.account_path(account).display()),
             })?;
@@ -513,15 +506,12 @@ impl FileKeystore {
         let name = Self::account_file_name(account);
         let mut bytes = match dir.open_file_read_nofollow(OsStr::new(&name)) {
             Ok(SecureOpen::Found(mut file, _)) => {
-                let mut buf = Vec::new();
-                std::io::Read::by_ref(&mut file)
-                    .take(MAX_SECRET_BYTES + 1)
-                    .read_to_end(&mut buf)
-                    .map_err(|e| KeystoreError::Io {
+                read_bounded_zeroizing(&mut file, MAX_SECRET_BYTES).map_err(|e| {
+                    KeystoreError::Io {
                         kind: e.kind().to_string(),
                         hint: format!("read {name}: {e}"),
-                    })?;
-                buf
+                    }
+                })?
             }
             Ok(SecureOpen::NotFound) => return Ok(DeleteOutcome::Absent),
             Ok(SecureOpen::SecurityViolation(hint)) => {
@@ -748,15 +738,17 @@ impl FileKeystore {
             // so a planted non-regular file is quarantined, not read.
             let content = match dir.open_file_read_nofollow(&raw_name) {
                 Ok(SecureOpen::Found(mut f, _)) => {
-                    let mut buf = Vec::new();
-                    match std::io::Read::by_ref(&mut f)
-                        .take(MAX_SECRET_BYTES + 1)
-                        .read_to_end(&mut buf)
-                    {
-                        Ok(_) if buf.len() as u64 <= MAX_SECRET_BYTES => Some(buf),
-                        // Oversized or unreadable: cannot be verified, so it
-                        // is not ours to delete.
-                        _ => None,
+                    match read_bounded_zeroizing(&mut f, MAX_SECRET_BYTES) {
+                        Ok(buf) if buf.len() as u64 <= MAX_SECRET_BYTES => Some(buf),
+                        // Oversized: wipe before discarding — a scratch file
+                        // holds the same secret bytes as a real entry.
+                        Ok(mut buf) => {
+                            buf.zeroize();
+                            None
+                        }
+                        // Unreadable: `read_bounded_zeroizing` already wiped
+                        // whatever it managed to read.
+                        Err(_) => None,
                     }
                 }
                 Ok(SecureOpen::NotFound) => continue,
@@ -807,6 +799,27 @@ impl FileKeystore {
             })?;
         }
         Ok(report)
+    }
+}
+
+/// Read at most `cap` bytes, wiping whatever was read if the read FAILS.
+///
+/// `read_to_end` appends as it goes, so an error partway through leaves
+/// real bytes in the buffer — and for these entries those bytes may be
+/// part of a private scalar. Dropping the `Vec` then frees that memory
+/// without clearing it. Every scalar-carrying read goes through here so
+/// the failure paths wipe too, not just the success paths.
+fn read_bounded_zeroizing(file: &mut File, cap: u64) -> std::io::Result<Vec<u8>> {
+    let mut buf = Vec::new();
+    match std::io::Read::by_ref(file)
+        .take(cap + 1)
+        .read_to_end(&mut buf)
+    {
+        Ok(_) => Ok(buf),
+        Err(e) => {
+            buf.zeroize();
+            Err(e)
+        }
     }
 }
 
