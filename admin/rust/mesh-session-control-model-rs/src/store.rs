@@ -38,6 +38,7 @@ use crate::record::{ControlIdentity, MeshSignerControlRecordV1, PurposeId};
 use std::fs::{self, File, OpenOptions};
 use std::io;
 use std::path::{Path, PathBuf};
+#[cfg(feature = "test-support")]
 use std::sync::atomic::{AtomicU64, Ordering};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -157,7 +158,14 @@ fn from_canonical_bytes(bytes: &[u8]) -> Option<MeshSignerControlRecordV1> {
     if recomputed != bytes {
         return None;
     }
-    ciborium::from_reader(bytes).ok()
+    let rec: MeshSignerControlRecordV1 = ciborium::from_reader(bytes).ok()?;
+    // Round 6, item (new) 4: CBOR shape validity says nothing about the
+    // record's own semantic invariants — see
+    // `MeshSignerControlRecordV1::invariants_hold`'s doc comment.
+    if !rec.invariants_hold() {
+        return None;
+    }
+    Some(rec)
 }
 
 /// Real file-backed store: temp file unique per attempt, its name
@@ -208,6 +216,39 @@ impl FileBackedStore {
         name.push(format!(".tmp.{expected_revision:020}.{nonce:016x}"));
         self.path.with_file_name(name)
     }
+
+    /// A stable sibling path -- `<record>.lock` -- always created if
+    /// absent, never removed. Deliberately a fixed name (not per-attempt
+    /// like `attempt_tmp_path`): every process/attempt targeting this
+    /// record must contend for the exact same lock, which requires them
+    /// all opening the exact same path.
+    fn lock_path(&self) -> PathBuf {
+        let mut name = self
+            .path
+            .file_name()
+            .map(|n| n.to_os_string())
+            .unwrap_or_default();
+        name.push(".lock");
+        self.path.with_file_name(name)
+    }
+
+    /// Blocking cross-process exclusive lock, held for as long as the
+    /// returned `File` stays alive (released automatically on drop — see
+    /// `replace_exact`'s own doc comment for why this exists). Returns
+    /// `None` only if the lock file could not even be opened/created or
+    /// the OS-level lock call itself failed — in both cases nothing this
+    /// store could have done depends on holding it, so the caller treats
+    /// that the same as `KnownNoEffect`.
+    fn acquire_process_lock(&self) -> Option<File> {
+        let f = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .mode_0600()
+            .open(self.lock_path())
+            .ok()?;
+        f.lock().ok()?;
+        Some(f)
+    }
 }
 
 /// Parses `<expected_revision>` back out of a tmp filename produced by
@@ -222,23 +263,32 @@ fn parse_tmp_revision(file_name: &str, prefix: &str) -> Option<u64> {
 
 impl AtomicControlRecordStore for FileBackedStore {
     fn load_canonical(&self) -> LoadOutcome {
-        match fs::read(&self.path) {
-            Err(e) if e.kind() == io::ErrorKind::NotFound => LoadOutcome::Missing,
-            Err(_) => LoadOutcome::Corrupt,
-            Ok(bytes) => match from_canonical_bytes(&bytes) {
-                // Round 5, item A1: cross-check the decoded record's own
-                // identity/purpose against what THIS store is bound to,
-                // never trust that the file at `self.path` necessarily
-                // holds content for the right identity — e.g. after a
-                // drop-and-reopen at the same path for a DIFFERENT
-                // identity, or any other way a leftover/foreign file could
-                // end up there. Without this, `LoadOutcome::Exact` could
-                // silently hand back a record for someone else's identity.
-                Some(rec) if rec.identity == self.identity && rec.purpose == self.purpose => {
-                    LoadOutcome::Exact(Box::new(rec))
-                }
-                Some(_) | None => LoadOutcome::Corrupt,
-            },
+        let mut file = match open_non_aliased(&self.path) {
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return LoadOutcome::Missing,
+            Err(_) => return LoadOutcome::Corrupt,
+            Ok(f) => f,
+        };
+        let bytes = {
+            use std::io::Read;
+            let mut buf = Vec::new();
+            match file.read_to_end(&mut buf) {
+                Ok(_) => buf,
+                Err(_) => return LoadOutcome::Corrupt,
+            }
+        };
+        match from_canonical_bytes(&bytes) {
+            // Round 5, item A1: cross-check the decoded record's own
+            // identity/purpose against what THIS store is bound to,
+            // never trust that the file at `self.path` necessarily
+            // holds content for the right identity — e.g. after a
+            // drop-and-reopen at the same path for a DIFFERENT
+            // identity, or any other way a leftover/foreign file could
+            // end up there. Without this, `LoadOutcome::Exact` could
+            // silently hand back a record for someone else's identity.
+            Some(rec) if rec.identity == self.identity && rec.purpose == self.purpose => {
+                LoadOutcome::Exact(Box::new(rec))
+            }
+            Some(_) | None => LoadOutcome::Corrupt,
         }
     }
 
@@ -258,6 +308,34 @@ impl AtomicControlRecordStore for FileBackedStore {
             // always against this store's own fixed binding.
             return ReplaceOutcome::KnownNoEffect;
         }
+        // Round 6: a REAL cross-process advisory lock for this whole
+        // critical section (held until this function returns, released
+        // automatically when `_process_lock` drops). `MeshSignerLocks`
+        // alone only excludes other threads/calls WITHIN this process —
+        // two independent processes, each with their own in-process lock
+        // and their own `load_canonical` + `rename`, had nothing
+        // preventing both from reading the same revision and both
+        // renaming, one silently clobbering the other (confirmed: 6 real
+        // processes racing the same file from revision 0 all reported
+        // Committed).
+        //
+        // Correction (caught by audit before this claim shipped): this
+        // lock is on `<self.path>.lock`, a path DERIVED from `self.path`
+        // — NOT on `self.path`'s own inode. flock IS inode-scoped in
+        // general, but that fact is irrelevant here, because a hardlink
+        // alias of the RECORD (`record` / `alias`, same inode, different
+        // names) produces TWO DIFFERENT derived lock paths
+        // (`record.lock` / `alias.lock`, different inodes) — confirmed by
+        // a real 6-process test: half via each name, sibling locks
+        // correctly serialize each spelling on its own, but the two
+        // spellings still produce two separate winners. This lock alone
+        // does NOT close a hardlink alias; `open_non_aliased` (used by
+        // `load_canonical`, and therefore inherited here) is what closes
+        // it, by refusing to trust `self.path` at all once it has more
+        // than one link.
+        let Some(_process_lock) = self.acquire_process_lock() else {
+            return ReplaceOutcome::KnownNoEffect; // could not even acquire -- no effect possible
+        };
         let cur = match self.load_canonical() {
             LoadOutcome::Missing => {
                 if expected_revision != crate::record::INITIAL_REVISION {
@@ -337,6 +415,27 @@ impl AtomicControlRecordStore for FileBackedStore {
             self.token,
             "sweep_orphan_tmp called with a MutateGuard from a different MeshSignerLocks than this store is bound to"
         );
+        // Round 6 fix: this used to hold only the in-process `MutateGuard`
+        // — "nothing else can be mid-write under a guard we are holding
+        // first-in-section" was true only within THIS process. A second,
+        // independent process's `replace_exact` could be past its own tmp
+        // file's `sync_all` (durably on disk) but not yet at its own
+        // `rename` — genuinely in-flight, not stale — and this function,
+        // seeing no cross-process signal at all, would classify that tmp
+        // as an orphan (its target revision, from the tmp's own filename,
+        // being `>= current_revision` on disk right now doesn't save it
+        // either — the classification logic never distinguished "stale"
+        // from "legitimately in flight elsewhere" without a shared lock).
+        // Deleting it out from under that other process's still-open
+        // write would surface as a `rename` failure there —
+        // conservatively `MayHaveTakenEffect`, but a real durability bug
+        // nonetheless. The same stable process lock `replace_exact` holds
+        // for its own tmp-write-through-rename section now also covers
+        // sweep's classify-and-unlink section, so the two can never
+        // interleave.
+        let Some(_process_lock) = self.acquire_process_lock() else {
+            return;
+        };
         let Some(parent) = self.path.parent() else {
             return;
         };
@@ -361,8 +460,8 @@ impl AtomicControlRecordStore for FileBackedStore {
             // than what is on disk now, so no rename of it could ever
             // legitimately land again. An unparseable name (never produced
             // by this store) or no canonical record yet (nothing else can
-            // be mid-write under a guard we are holding first-in-section)
-            // is also swept.
+            // be mid-write under the process lock we are holding
+            // first-in-section, now true cross-process too) is also swept.
             let is_stale = match (parse_tmp_revision(&name, &prefix), current_revision) {
                 (Some(tmp_rev), Some(cur)) => tmp_rev < cur,
                 _ => true,
@@ -378,6 +477,55 @@ fn fsync_parent(path: &Path) -> io::Result<()> {
     let parent = path.parent().ok_or_else(|| io::Error::other("no parent"))?;
     let dir = File::open(parent)?;
     dir.sync_all()
+}
+
+/// Round 6: opens `path`, refusing to trust it at all if it is aliasable —
+/// hardlinked (`nlink != 1`) or a symlink. `nlink` is checked on the
+/// OPENED HANDLE's own metadata (`fstat`, not a separate path-based `stat`
+/// call), so it is immune to TOCTOU once open, and — being a property of
+/// the inode itself — reports identically no matter which of the inode's
+/// several names was used to open it: as soon as ANY hardlink alias of
+/// this file exists anywhere, opening it through ANY of its names is
+/// rejected, closing exactly the gap a per-path lock file (see
+/// `acquire_process_lock`'s own corrected doc comment) cannot: two
+/// different processes each holding a real, uncontended lock on their own
+/// derived `<their-path>.lock` still raced the SAME record through two
+/// different hardlinked spellings before this existed (confirmed by a
+/// real 6-process test, half via each name — sibling locks correctly
+/// serialize each spelling on its own, but the two spellings still
+/// produce two separate winners).
+///
+/// The symlink check (`fs::symlink_metadata` on `path` immediately before
+/// open) has a narrow, honestly-documented residual TOCTOU window this
+/// crate does not close: doing so atomically requires an `O_NOFOLLOW` open
+/// flag, whose raw value is platform-specific and not something this
+/// crate is willing to hardcode without the `libc` crate providing it —
+/// an external dependency this fix does not otherwise need.
+#[cfg(unix)]
+fn open_non_aliased(path: &Path) -> io::Result<File> {
+    use std::os::unix::fs::MetadataExt;
+    if let Ok(meta) = fs::symlink_metadata(path)
+        && meta.file_type().is_symlink()
+    {
+        return Err(io::Error::other(
+            "refusing to trust a path whose final component is a symlink",
+        ));
+    }
+    let f = File::open(path)?;
+    if f.metadata()?.nlink() != 1 {
+        return Err(io::Error::other(
+            "refusing to trust a path with more than one hard link",
+        ));
+    }
+    Ok(f)
+}
+
+/// Non-unix fallback: `nlink`/hardlink identity is not portably available
+/// via `std::fs`, so this reduces to a plain open. Documented gap, not a
+/// silent one.
+#[cfg(not(unix))]
+fn open_non_aliased(path: &Path) -> io::Result<File> {
+    File::open(path)
 }
 
 trait Mode0600 {
@@ -401,6 +549,13 @@ impl Mode0600 for OpenOptions {
 /// happened on disk — this is what lets a test assert "the algorithm layer
 /// behaves correctly under `MayHaveTakenEffect`" without needing to
 /// actually corrupt the OS's rename() syscall.
+///
+/// Round 6 fix (item 4): gated behind `test-support` here too, not just at
+/// `cell::open_fault_injecting` — this type and its `new` constructor were
+/// fully `pub` regardless of that gate, so an external consumer could
+/// reach `FaultInjectingStore::new` directly, bypassing the registry
+/// entirely, even after `cell::open_fault_injecting` itself was closed.
+#[cfg(feature = "test-support")]
 pub struct FaultInjectingStore {
     inner: FileBackedStore,
     forced_outcome: std::sync::Mutex<Option<ReplaceOutcome>>,
@@ -408,6 +563,7 @@ pub struct FaultInjectingStore {
     call_count: AtomicU64,
 }
 
+#[cfg(feature = "test-support")]
 impl FaultInjectingStore {
     #[must_use]
     pub fn new(
@@ -445,6 +601,7 @@ impl FaultInjectingStore {
     }
 }
 
+#[cfg(feature = "test-support")]
 impl AtomicControlRecordStore for FaultInjectingStore {
     fn load_canonical(&self) -> LoadOutcome {
         self.inner.load_canonical()

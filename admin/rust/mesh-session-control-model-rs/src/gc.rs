@@ -81,6 +81,19 @@ pub fn gc_worker_tick(
     // confirm it `Absent` within the same tick, collapsing two observations
     // into one and defeating the protection entirely.
     let mut inspected_this_tick: HashSet<String> = HashSet::new();
+    // Round 6 fix: a `Bound` entry whose `gc_best_effort` attempt completed
+    // (`observation_complete: true`) but reported residual (still
+    // `GcState::Pending` afterward — not `Done`, not `Quarantine`) was
+    // NOT excluded from re-selection within the same tick at all: nothing
+    // about it changes `observation_complete_and_residual_zero()`, isn't
+    // `Quarantine`/`InspectionConflict`, and isn't covered by
+    // `inspected_this_tick` (which only ever guards
+    // `AwaitingInspection`/`AbsentUnconfirmed`). The `loop` would reselect
+    // and re-attempt destroy on it immediately, forever, within this one
+    // tick call if the backend keeps reporting residual — a genuine
+    // infinite loop, not just a slow retry. One destroy attempt per
+    // `Bound` entry per tick, same discipline as inspection.
+    let mut bound_attempted_this_tick: HashSet<String> = HashSet::new();
 
     loop {
         let rec = match cell.load_canonical() {
@@ -125,6 +138,11 @@ pub fn gc_worker_tick(
                 {
                     return false;
                 }
+                if matches!(e, GcEntry::Bound { .. })
+                    && bound_attempted_this_tick.contains(&e.slot().canonical_id())
+                {
+                    return false;
+                }
                 true
             })
             .cloned()
@@ -154,7 +172,7 @@ pub fn gc_worker_tick(
                         // persist it durably (GcEntry::InspectionConflict)
                         // rather than silently retrying forever with no
                         // trace it was ever observed.
-                        let committed = cell.commit_built(
+                        let committed = cell.commit_built_privileged(
                             |fresh| {
                                 fresh
                                     .gc_pending
@@ -175,7 +193,7 @@ pub fn gc_worker_tick(
                         continue;
                     }
                 };
-                let committed = cell.commit_built(
+                let committed = cell.commit_built_privileged(
                     |fresh| {
                         fresh
                             .gc_pending
@@ -199,13 +217,43 @@ pub fn gc_worker_tick(
             }
             GcEntry::Bound { slot, binding, .. } => {
                 let binding = binding.clone();
-                // Backend call with no lock held.
+                bound_attempted_this_tick.insert(slot_id.clone());
+                // Round 6 fix (wave 3, item 2): before any DESTRUCTIVE
+                // backend call, prove the record state that justifies it is
+                // durably on disk -- not merely visible via a rename() that
+                // may not have survived to the parent directory's fsync
+                // yet. A crash in that window could roll the record back to
+                // a state that never recorded this GC entry at all, while
+                // the physical key it justified destroying is already
+                // gone: the marker lost, the destructive action already
+                // done. `StabilizationRewrite` -- an identical-byte rewrite
+                // that must report `Committed`, via the same
+                // retry-until-fsynced discipline (`commit_new_bytes`) as
+                // any other commit -- is exactly the mechanism this crate
+                // already has for proving durability; it was simply never
+                // invoked before a destructive action until now.
+                let stabilized = cell.commit_built_privileged(
+                    |fresh| {
+                        fresh
+                            .gc_pending
+                            .iter()
+                            .any(|e| e.slot().canonical_id() == slot_id && e.txn_id() == txn_id)
+                            .then_some(RecordTransition::StabilizationRewrite)
+                    },
+                    now,
+                    max_cap,
+                )?;
+                if stabilized.is_none() {
+                    continue; // entry resolved/vanished concurrently -- reselect against fresh state
+                }
+                // Backend call with no lock held -- now provably safe to
+                // destroy: the record durably reflects this entry.
                 let report = backend.gc_best_effort(slot, &binding);
                 if !report.observation_complete {
                     indeterminate_this_tick.insert(slot_id);
                     continue; // this entry only — others still proceed
                 }
-                let committed = cell.commit_built(
+                let committed = cell.commit_built_privileged(
                     |fresh| {
                         fresh
                             .gc_pending
@@ -245,7 +293,7 @@ pub fn gc_removal_pass(
 ) -> Result<usize, GcTickError> {
     let mut removed = 0usize;
     loop {
-        let committed = cell.commit_built(
+        let committed = cell.commit_built_privileged(
             |fresh| {
                 let entry = fresh.gc_pending.iter().find(|e| {
                     matches!(

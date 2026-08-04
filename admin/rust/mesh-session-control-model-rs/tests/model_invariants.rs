@@ -5,7 +5,8 @@
 //! specifically because of it.
 
 use mesh_session_control_model_rs::activate::{
-    ActivateError, activate_from_key_observed, revalidate_on_load,
+    ActivateError, LoadRevalidatedError, activate_from_key_observed, load_revalidated,
+    revalidate_on_load,
 };
 use mesh_session_control_model_rs::cell::{
     self, CommitTransitionError, ControlRecordCell, OpenConflict,
@@ -38,8 +39,14 @@ fn identity() -> ControlIdentity {
 }
 
 fn slot(generation: NonZeroU64, txn_id: [u8; 16]) -> SlotId {
+    // Round 6, wave 6: must use the REAL derived digest for `identity()`,
+    // not a fixed placeholder -- invariants_hold now cross-checks every
+    // gc_pending/live_generations/pending_op slot's identity_digest
+    // against `identity_digest(&record.identity)`, so a fixture built
+    // with an arbitrary constant here would fail that check even though
+    // every other field is legitimate.
     SlotId {
-        identity_digest: [7u8; 32],
+        identity_digest: identity_digest(&identity()),
         purpose: PurposeId::MeshSession,
         generation,
         txn_id,
@@ -99,6 +106,15 @@ fn test_cell(path: std::path::PathBuf) -> Arc<ControlRecordCell> {
 // real canonical bootstrap first, then this as a one-step mutation on top.
 fn record_with_gc_entries(entries: Vec<GcEntry>) -> MeshSignerControlRecordV1 {
     let mut r = MeshSignerControlRecordV1::bootstrap(identity(), PurposeId::MeshSession);
+    // Round 6, wave 6: invariants_hold now requires every gc_pending
+    // entry's slot.generation <= generation_high_water -- bump it to
+    // cover whatever generations these fixture entries actually
+    // reference, rather than leaving it at the bootstrap default of 1.
+    for e in &entries {
+        if e.slot().generation > r.generation_high_water {
+            r.generation_high_water = e.slot().generation;
+        }
+    }
     r.gc_pending = entries;
     r.revision = 1;
     r
@@ -142,6 +158,11 @@ struct FixedRoster(RosterCurrency);
 impl RosterLookup for FixedRoster {
     fn query_machine_currency(&self, _machine_id: &str) -> RosterCurrency {
         self.0.clone()
+    }
+    fn currency_revision(&self, _machine_id: &str) -> u64 {
+        // Never changes -- a before/after comparison always matches,
+        // which is correct: FixedRoster never goes stale mid-flight.
+        0
     }
 }
 
@@ -2640,8 +2661,10 @@ fn activate_from_key_observed_succeeds_full_path() {
 fn revalidate_on_load_rejects_purpose_type_mismatch() {
     let record = MeshSignerControlRecordV1::bootstrap(identity(), PurposeId::MeshSession);
     let policy = DelegationPolicy::test(1000);
+    let backend = FakeSecretBackend::new();
     let err = revalidate_on_load::<RosterSyncPurpose>(
         &record,
+        &backend,
         &policy,
         &active_roster(),
         &AlwaysTrueVerifier,
@@ -2654,10 +2677,15 @@ fn revalidate_on_load_rejects_purpose_type_mismatch() {
 #[test]
 fn revalidate_on_load_detects_roster_revocation() {
     let rotated = rotated_record_with_two_generations(5000, 6000);
+    let backend = FakeSecretBackend::new();
+    for g in &rotated.live_generations {
+        backend.create_or_inspect(&g.binding.slot, Some(&g.binding));
+    }
     let policy = DelegationPolicy::test(10_000);
     let revoked_roster = FixedRoster(RosterCurrency::Revoked);
     let err = revalidate_on_load::<MeshSessionPurpose>(
         &rotated,
+        &backend,
         &policy,
         &revoked_roster,
         &AlwaysTrueVerifier,
@@ -2686,6 +2714,9 @@ impl RosterLookup for BlockingRoster {
             member_pub: vec![1, 2, 3],
             member_cert_fingerprint: [9u8; 32],
         }
+    }
+    fn currency_revision(&self, _machine_id: &str) -> u64 {
+        0
     }
 }
 
@@ -3592,4 +3623,1036 @@ fn gc_serial_is_owned_by_the_cell_so_two_ticks_against_the_same_cell_serialize()
         .recv_timeout(std::time::Duration::from_secs(5))
         .expect("must acquire promptly once released");
     handle.join().unwrap();
+}
+
+// ── Round 6, item 3: SlotId::canonical_id -- distinct "mesh-slot.v1."
+// namespace (never the keystore's own internal "p256.v1." account
+// coordinate), fixed-width, well under the keystore integration's
+// tested 128-byte bound ──────────────────────────────────────────────────
+
+#[test]
+fn canonical_id_matches_a_golden_vector() {
+    // Locks the exact algorithm (BLAKE3 over 8-byte-LE-length-prefixed
+    // identity_digest/purpose/generation/txn_id/backend, "mesh-slot.v1."
+    // prefix) against silent drift -- computed once from the real
+    // implementation, not hand-derived.
+    let s = SlotId {
+        identity_digest: [7u8; 32],
+        purpose: PurposeId::MeshSession,
+        generation: NonZeroU64::new(1).unwrap(),
+        txn_id: [0xAB; 16],
+        backend_instance: BackendKind::SecureEnclave,
+    };
+    assert_eq!(
+        s.canonical_id(),
+        "mesh-slot.v1.4085288b37d50cc619697ffa77e1b9615bbeaca768162d6609b679dec205faee"
+    );
+}
+
+#[test]
+fn canonical_id_is_fixed_width_and_under_the_128_byte_keystore_bound() {
+    for purpose in [PurposeId::MeshSession, PurposeId::RosterSync] {
+        for backend_instance in [
+            BackendKind::SecureEnclave,
+            BackendKind::TpmSealedSoftware,
+            BackendKind::File,
+        ] {
+            let s = SlotId {
+                identity_digest: [0xFF; 32], // worst-case byte value, not that it matters for a fixed-width digest
+                purpose,
+                generation: NonZeroU64::new(u64::MAX).unwrap(),
+                txn_id: [0xFF; 16],
+                backend_instance,
+            };
+            let id = s.canonical_id();
+            assert_eq!(
+                id.len(),
+                77,
+                "\"mesh-slot.v1.\" (13) + 64 hex chars must be exactly 77 bytes regardless of field values"
+            );
+            assert!(
+                id.len() <= 128,
+                "must stay under the keystore integration's own tested 128-byte bound"
+            );
+            assert!(
+                id.starts_with("mesh-slot.v1."),
+                "must never collide with the keystore's own internal \"p256.v1.\" account namespace"
+            );
+        }
+    }
+}
+
+#[test]
+fn canonical_id_distinguishes_slots_that_differ_only_by_generation_or_txn_id() {
+    let base = slot(NonZeroU64::new(1).unwrap(), [10; 16]);
+    let mut other_generation = base.clone();
+    other_generation.generation = NonZeroU64::new(2).unwrap();
+    assert_ne!(base.canonical_id(), other_generation.canonical_id());
+
+    let mut other_txn = base.clone();
+    other_txn.txn_id = [11; 16];
+    assert_ne!(base.canonical_id(), other_txn.canonical_id());
+}
+
+// ══════════════════════════════════════════════════════════════════════
+// Round 6 REDs -- second and third audit waves on bef34379.
+// ══════════════════════════════════════════════════════════════════════
+
+// ── wave 2, item 1: generation must not reset after revoke; defense in
+// depth against a derived slot colliding with an unresolved GC entry ────
+
+#[test]
+fn generation_continues_incrementing_after_revoke_not_reset_to_one() {
+    let old = MeshSignerControlRecordV1::bootstrap(identity(), PurposeId::MeshSession);
+    let with_intent = apply(
+        &old,
+        &RecordTransition::IntentRecorded {
+            txn_id: [1; 16],
+            kind: PendingOpKind::Create,
+            backend: BackendKind::File,
+        },
+        1000,
+        TEST_CAP,
+    )
+    .unwrap();
+    let p = with_intent.pending_op.clone().unwrap();
+    let with_binding = apply(
+        &with_intent,
+        &RecordTransition::KeyObserved {
+            expected_txn_id: p.txn_id,
+            expected_kind: p.kind,
+            expected_generation: p.generation,
+            expected_epoch: p.epoch,
+            expected_purpose: p.purpose,
+            expected_slot_id: p.canonical_slot.canonical_id(),
+            expected_revision: with_intent.revision,
+            binding: binding(p.canonical_slot.clone()),
+        },
+        1000,
+        TEST_CAP,
+    )
+    .unwrap();
+    let activated = apply(
+        &with_binding,
+        &RecordTransition::ActivateFromKeyObserved {
+            expected_txn_id: p.txn_id,
+            expected_kind: p.kind,
+            expected_generation: p.generation,
+            expected_epoch: p.epoch,
+            expected_purpose: p.purpose,
+            expected_slot_id: p.canonical_slot.canonical_id(),
+            expected_revision: with_binding.revision,
+            delegation: delegation(0, 100),
+        },
+        1000,
+        TEST_CAP,
+    )
+    .unwrap();
+    assert_eq!(activated.generation_high_water, NonZeroU64::new(1).unwrap());
+
+    let revoked = apply(
+        &activated,
+        &RecordTransition::RevokeUrgent {
+            reason: RevocationReason::Compromised,
+            txn_id: [2; 16],
+        },
+        1000,
+        TEST_CAP,
+    )
+    .unwrap();
+    assert!(revoked.current_generation.is_none());
+    assert!(revoked.live_generations.is_empty());
+
+    let reactivated = apply(
+        &revoked,
+        &RecordTransition::ReactivateFromRevoked {
+            txn_id: [3; 16],
+            next_txn_id: [4; 16],
+            backend: BackendKind::File,
+        },
+        1000,
+        TEST_CAP,
+    )
+    .unwrap();
+    let p2 = reactivated.pending_op.clone().unwrap();
+    assert_eq!(
+        p2.generation,
+        NonZeroU64::new(2).unwrap(),
+        "must continue the monotonic sequence from generation_high_water, never reset to 1 just because current_generation was legitimately cleared by revoke"
+    );
+}
+
+#[test]
+fn intent_recorded_rejects_a_derived_slot_that_collides_with_an_unresolved_gc_entry() {
+    let mut old = MeshSignerControlRecordV1::bootstrap(identity(), PurposeId::MeshSession);
+    let would_derive = SlotId {
+        identity_digest: identity_digest(&old.identity),
+        purpose: PurposeId::MeshSession,
+        generation: NonZeroU64::new(1).unwrap(),
+        txn_id: [9; 16],
+        backend_instance: BackendKind::File,
+    };
+    old.gc_pending.push(GcEntry::AwaitingInspection {
+        slot: would_derive,
+        txn_id: [9; 16],
+    });
+    let err = apply(
+        &old,
+        &RecordTransition::IntentRecorded {
+            txn_id: [9; 16],
+            kind: PendingOpKind::Create,
+            backend: BackendKind::File,
+        },
+        1000,
+        TEST_CAP,
+    )
+    .unwrap_err();
+    assert_eq!(err, TransitionError::SlotCollidesWithPendingGc);
+}
+
+// ── wave 2, item 2: a Bound entry gets at most one destroy attempt per
+// tick, even when the backend never resolves it ──────────────────────────
+
+struct AlwaysResidualBackend {
+    inner: FakeSecretBackend,
+    calls: std::sync::atomic::AtomicU64,
+}
+impl SecretBackend for AlwaysResidualBackend {
+    fn create_or_inspect(&self, slot: &SlotId, expected: Option<&ExactBinding>) -> CreateOutcome {
+        self.inner.create_or_inspect(slot, expected)
+    }
+    fn load_exact(&self, slot: &SlotId, expected_public_key: &[u8]) -> LoadExactOutcome {
+        self.inner.load_exact(slot, expected_public_key)
+    }
+    fn inspect(&self, slot: &SlotId) -> InspectOutcome {
+        self.inner.inspect(slot)
+    }
+    fn gc_best_effort(&self, _slot: &SlotId, _expected_binding: &ExactBinding) -> GcReport {
+        self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        GcReport {
+            attempted: true,
+            residual: true,
+            observation_complete: true,
+            mismatch: false,
+        }
+    }
+}
+
+#[test]
+fn gc_bound_entry_gets_at_most_one_destroy_attempt_per_tick_even_when_backend_never_resolves() {
+    let dir = tempfile::tempdir().unwrap();
+    let cell = test_cell(dir.path().join("record"));
+    let s = slot(NonZeroU64::new(1).unwrap(), [50; 16]);
+    let rec = record_with_gc_entries(vec![GcEntry::Bound {
+        slot: s.clone(),
+        txn_id: [50; 16],
+        binding: binding(s.clone()),
+        state: GcState::Pending,
+    }]);
+    seed_record(&cell, &rec);
+    let backend = AlwaysResidualBackend {
+        inner: FakeSecretBackend::new(),
+        calls: std::sync::atomic::AtomicU64::new(0),
+    };
+
+    let resolved = gc_worker_tick(&cell, &backend, 1000, TEST_CAP).unwrap();
+    // `resolved` counts commits, not terminal resolutions -- a residual
+    // report still commits a (Pending -> Pending) GcResolved, so this is 1,
+    // not 0. The property under test is the call count below: the entry
+    // stays Pending forever if the backend never stops reporting residual,
+    // so without the fix this tick would never terminate at all.
+    assert_eq!(resolved, 1);
+    assert_eq!(
+        backend.calls.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "a Bound entry must get at most one destroy attempt per tick, not be reselected in a tight loop within the same call"
+    );
+}
+
+// ── wave 2, item 3: activate must reject if roster currency changed
+// between validation and commit, without holding the guard during I/O ───
+
+struct RevisionBumpingBlockingRoster {
+    ready_tx: Mutex<Option<std::sync::mpsc::Sender<()>>>,
+    proceed_rx: Mutex<std::sync::mpsc::Receiver<()>>,
+    revision: std::sync::atomic::AtomicU64,
+}
+impl RosterLookup for RevisionBumpingBlockingRoster {
+    fn query_machine_currency(&self, _machine_id: &str) -> RosterCurrency {
+        if let Some(tx) = self.ready_tx.lock().unwrap().take() {
+            let _ = tx.send(());
+        }
+        self.proceed_rx.lock().unwrap().recv().unwrap();
+        RosterCurrency::Active {
+            member_pub: vec![1, 2, 3],
+            member_cert_fingerprint: [9u8; 32],
+        }
+    }
+    fn currency_revision(&self, _machine_id: &str) -> u64 {
+        self.revision.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+#[test]
+fn activate_rejects_commit_when_roster_revision_changed_after_validation() {
+    let dir = tempfile::tempdir().unwrap();
+    let cell = test_cell(dir.path().join("record"));
+    let old = MeshSignerControlRecordV1::bootstrap(identity(), PurposeId::MeshSession);
+    let with_intent = apply(
+        &old,
+        &RecordTransition::IntentRecorded {
+            txn_id: [60; 16],
+            kind: PendingOpKind::Create,
+            backend: BackendKind::File,
+        },
+        1000,
+        TEST_CAP,
+    )
+    .unwrap();
+    let p = with_intent.pending_op.clone().unwrap();
+    let backend = FakeSecretBackend::new();
+    let CreateOutcome::Unique {
+        binding: real_binding,
+        ..
+    } = backend.create_or_inspect(&p.canonical_slot, None)
+    else {
+        panic!()
+    };
+    let with_binding = apply(
+        &with_intent,
+        &RecordTransition::KeyObserved {
+            expected_txn_id: p.txn_id,
+            expected_kind: p.kind,
+            expected_generation: p.generation,
+            expected_epoch: p.epoch,
+            expected_purpose: p.purpose,
+            expected_slot_id: p.canonical_slot.canonical_id(),
+            expected_revision: with_intent.revision,
+            binding: real_binding.clone(),
+        },
+        1000,
+        TEST_CAP,
+    )
+    .unwrap();
+    {
+        let g = cell.acquire_for_mutation();
+        assert_eq!(
+            cell.seed_for_test(&g, INITIAL_REVISION, &old),
+            ReplaceOutcome::Committed
+        );
+        assert_eq!(
+            cell.seed_for_test(&g, old.revision, &with_intent),
+            ReplaceOutcome::Committed
+        );
+        assert_eq!(
+            cell.seed_for_test(&g, with_intent.revision, &with_binding),
+            ReplaceOutcome::Committed
+        );
+    }
+
+    let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+    let (proceed_tx, proceed_rx) = std::sync::mpsc::channel();
+    let roster = RevisionBumpingBlockingRoster {
+        ready_tx: Mutex::new(Some(ready_tx)),
+        proceed_rx: Mutex::new(proceed_rx),
+        revision: std::sync::atomic::AtomicU64::new(0),
+    };
+    let policy = DelegationPolicy::test(1000);
+    let mut d = delegation(0, 100);
+    d.delegated_key_id = p.canonical_slot.canonical_id();
+    d.delegated_pub = real_binding.public_key.clone();
+
+    std::thread::scope(|scope| {
+        let handle = scope.spawn(|| {
+            activate_from_key_observed::<MeshSessionPurpose>(
+                &cell,
+                &backend,
+                &roster,
+                &AlwaysTrueVerifier,
+                &policy,
+                p.txn_id,
+                d,
+                50,
+                TEST_CAP,
+            )
+        });
+        ready_rx.recv().unwrap(); // activate is now inside query_machine_currency
+        roster
+            .revision
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst); // simulated roster change
+        proceed_tx.send(()).unwrap(); // let query_machine_currency return (Active, unchanged answer)
+        let result = handle.join().unwrap();
+        assert!(
+            matches!(
+                result,
+                Err(ActivateError::Validation(
+                    ValidationError::RosterChangedDuringActivation
+                ))
+            ),
+            "got {result:?}"
+        );
+    });
+}
+
+// ── wave 2, item 4: ControlRecordCell::commit must reject
+// ActivateFromKeyObserved directly ────────────────────────────────────────
+
+#[test]
+fn commit_rejects_activate_from_key_observed_directly() {
+    let dir = tempfile::tempdir().unwrap();
+    let cell = test_cell(dir.path().join("record"));
+    let old = MeshSignerControlRecordV1::bootstrap(identity(), PurposeId::MeshSession);
+    {
+        let g = cell.acquire_for_mutation();
+        assert_eq!(
+            cell.seed_for_test(&g, INITIAL_REVISION, &old),
+            ReplaceOutcome::Committed
+        );
+    }
+    let t = RecordTransition::ActivateFromKeyObserved {
+        expected_txn_id: [1; 16],
+        expected_kind: PendingOpKind::Create,
+        expected_generation: NonZeroU64::new(1).unwrap(),
+        expected_epoch: NonZeroU64::new(1).unwrap(),
+        expected_purpose: PurposeId::MeshSession,
+        expected_slot_id: "bogus".into(),
+        expected_revision: old.revision,
+        delegation: delegation(0, 100),
+    };
+    let err = cell.commit(&t, 50, TEST_CAP).unwrap_err();
+    assert!(matches!(err, CommitTransitionError::PrivilegedTransition));
+}
+
+// ── wave 3, item 3: cap must only block growth, never a cap-neutral or
+// cap-reducing transition, even when already at/over a lowered cap ──────
+
+#[test]
+fn revoke_urgent_succeeds_even_when_max_cap_was_lowered_below_current_occupancy() {
+    let old = MeshSignerControlRecordV1::bootstrap(identity(), PurposeId::MeshSession);
+    let with_intent = apply(
+        &old,
+        &RecordTransition::IntentRecorded {
+            txn_id: [80; 16],
+            kind: PendingOpKind::Create,
+            backend: BackendKind::File,
+        },
+        1000,
+        8,
+    )
+    .unwrap();
+    let p = with_intent.pending_op.clone().unwrap();
+    let with_binding = apply(
+        &with_intent,
+        &RecordTransition::KeyObserved {
+            expected_txn_id: p.txn_id,
+            expected_kind: p.kind,
+            expected_generation: p.generation,
+            expected_epoch: p.epoch,
+            expected_purpose: p.purpose,
+            expected_slot_id: p.canonical_slot.canonical_id(),
+            expected_revision: with_intent.revision,
+            binding: binding(p.canonical_slot.clone()),
+        },
+        1000,
+        8,
+    )
+    .unwrap();
+    let activated = apply(
+        &with_binding,
+        &RecordTransition::ActivateFromKeyObserved {
+            expected_txn_id: p.txn_id,
+            expected_kind: p.kind,
+            expected_generation: p.generation,
+            expected_epoch: p.epoch,
+            expected_purpose: p.purpose,
+            expected_slot_id: p.canonical_slot.canonical_id(),
+            expected_revision: with_binding.revision,
+            delegation: delegation(0, 100),
+        },
+        1000,
+        8,
+    )
+    .unwrap();
+    assert_eq!(activated.cap_occupancy(), 1);
+
+    // max_cap is now LOWER than current occupancy (simulating a config
+    // change) -- an absolute check would reject EVERYTHING, including
+    // RevokeUrgent, which is cap-neutral (see its own doc comment).
+    let lowered_cap = 0;
+    let revoked = apply(
+        &activated,
+        &RecordTransition::RevokeUrgent {
+            reason: RevocationReason::Compromised,
+            txn_id: [81; 16],
+        },
+        1000,
+        lowered_cap,
+    )
+    .expect(
+        "cap-neutral RevokeUrgent must succeed even when max_cap was lowered below current occupancy",
+    );
+    assert_eq!(
+        revoked.cap_occupancy(),
+        activated.cap_occupancy(),
+        "cap-neutral, confirmed"
+    );
+
+    let gc_entry_slot = revoked.gc_pending[0].slot().canonical_id();
+    let resolved = apply(
+        &revoked,
+        &RecordTransition::GcResolved {
+            slot_id: gc_entry_slot,
+            residual_zero: true,
+            quarantine: false,
+        },
+        1000,
+        lowered_cap,
+    )
+    .expect("cap-reducing GcResolved must succeed even under a lowered cap");
+    assert!(resolved.cap_occupancy() < revoked.cap_occupancy());
+}
+
+// ── wave 3, item 4: load_canonical rejects a CBOR-valid but semantically
+// inconsistent record ─────────────────────────────────────────────────────
+
+#[test]
+fn load_canonical_rejects_a_cbor_valid_but_semantically_inconsistent_record() {
+    let dir = tempfile::tempdir().unwrap();
+    let cell = test_cell(dir.path().join("record"));
+    let bootstrap = MeshSignerControlRecordV1::bootstrap(identity(), PurposeId::MeshSession);
+    let mut corrupt = bootstrap.clone();
+    corrupt.revision = bootstrap.revision + 1;
+    // Active authority with no current_generation -- apply() would never
+    // produce this; only a hand-corrupted file can.
+    corrupt.authority = Authority::Active;
+    {
+        let g = cell.acquire_for_mutation();
+        assert_eq!(
+            cell.seed_for_test(&g, INITIAL_REVISION, &bootstrap),
+            ReplaceOutcome::Committed
+        );
+        assert_eq!(
+            cell.seed_for_test(&g, bootstrap.revision, &corrupt),
+            ReplaceOutcome::Committed,
+            "the store's CAS/genesis checks don't validate semantic invariants -- only load_canonical does"
+        );
+    }
+    assert_eq!(cell.load_canonical(), LoadOutcome::Corrupt);
+}
+
+// ── wave 3, item 5: revalidate_on_load detects physical key replacement ──
+
+#[test]
+fn revalidate_on_load_detects_physical_key_replacement() {
+    let rotated = rotated_record_with_two_generations(5000, 6000);
+    let backend = FakeSecretBackend::new();
+    for g in &rotated.live_generations {
+        backend.create_or_inspect(&g.binding.slot, Some(&g.binding));
+    }
+    // Simulate physical tampering: the backend's item at this slot is
+    // replaced with a different public key, entirely outside this
+    // record's own state machine.
+    let tampered_slot = rotated.live_generations[0].binding.slot.clone();
+    let mut tampered_binding = rotated.live_generations[0].binding.clone();
+    tampered_binding.public_key = vec![0xDE, 0xAD, 0xBE, 0xEF];
+    backend.gc_best_effort(&tampered_slot, &rotated.live_generations[0].binding);
+    backend.create_or_inspect(&tampered_slot, Some(&tampered_binding));
+
+    let policy = DelegationPolicy::test(10_000);
+    let err = revalidate_on_load::<MeshSessionPurpose>(
+        &rotated,
+        &backend,
+        &policy,
+        &active_roster(),
+        &AlwaysTrueVerifier,
+        50,
+    )
+    .unwrap_err();
+    assert_eq!(err, ValidationError::PhysicalKeyNotConfirmed);
+}
+
+// ══════════════════════════════════════════════════════════════════════
+// Round 6, wave 4 -- read-only audit against the WIP successor.
+// ══════════════════════════════════════════════════════════════════════
+
+// ── item 1: commit()/commit_built() must reject every Gc* transition
+// directly, not just ActivateFromKeyObserved -- otherwise a caller can
+// forge "the backend confirmed a clean destroy" with no backend at all ──
+
+#[test]
+fn commit_rejects_every_gc_transition_directly() {
+    let dir = tempfile::tempdir().unwrap();
+    let cell = test_cell(dir.path().join("record"));
+    let s = slot(NonZeroU64::new(1).unwrap(), [90; 16]);
+    let b = binding(s.clone());
+    let rec = record_with_gc_entries(vec![GcEntry::Bound {
+        slot: s.clone(),
+        txn_id: [90; 16],
+        binding: b,
+        state: GcState::Pending,
+    }]);
+    seed_record(&cell, &rec);
+
+    for t in [
+        RecordTransition::GcInspected {
+            slot_id: s.canonical_id(),
+            found: None,
+        },
+        RecordTransition::GcInspectionConflict {
+            slot_id: s.canonical_id(),
+        },
+        RecordTransition::GcResolved {
+            slot_id: s.canonical_id(),
+            residual_zero: true,
+            quarantine: false,
+        },
+        RecordTransition::GcRemoval {
+            slot_id: s.canonical_id(),
+            txn_id: [90; 16],
+        },
+    ] {
+        let err = cell.commit(&t, 1000, TEST_CAP).unwrap_err();
+        assert!(
+            matches!(err, CommitTransitionError::PrivilegedTransition),
+            "got {err:?}"
+        );
+    }
+}
+
+#[test]
+fn public_gc_bypass_cannot_forge_a_clean_destroy_and_erase_the_marker() {
+    // The exact exploit chain from the audit: commit(GcResolved{clean})
+    // followed by GcRemoval, with no SecretBackend ever consulted, used
+    // to be able to erase a live-key GC marker entirely.
+    let dir = tempfile::tempdir().unwrap();
+    let cell = test_cell(dir.path().join("record"));
+    let s = slot(NonZeroU64::new(1).unwrap(), [91; 16]);
+    let b = binding(s.clone());
+    let rec = record_with_gc_entries(vec![GcEntry::Bound {
+        slot: s.clone(),
+        txn_id: [91; 16],
+        binding: b,
+        state: GcState::Pending,
+    }]);
+    seed_record(&cell, &rec);
+
+    let resolve_err = cell
+        .commit(
+            &RecordTransition::GcResolved {
+                slot_id: s.canonical_id(),
+                residual_zero: true,
+                quarantine: false,
+            },
+            1000,
+            TEST_CAP,
+        )
+        .unwrap_err();
+    assert!(matches!(
+        resolve_err,
+        CommitTransitionError::PrivilegedTransition
+    ));
+
+    // The marker must still be there, untouched, exactly as seeded.
+    let LoadOutcome::Exact(still_there) = cell.load_canonical() else {
+        panic!("expected record")
+    };
+    assert_eq!(still_there.gc_pending.len(), 1);
+    match &still_there.gc_pending[0] {
+        GcEntry::Bound { state, .. } => assert_eq!(*state, GcState::Pending),
+        other => panic!("unexpected: {other:?}"),
+    }
+}
+
+// ── item 4 (wave 4): the generation_high_water reservation fix -- an
+// in-flight RoutineRotate/Reactivate must pass invariants_hold, not be
+// rejected as semantically corrupt (round 6's own regression, caught by
+// kiana's independent audit before this successor froze) ────────────────
+
+#[test]
+fn invariants_hold_accepts_an_in_flight_routine_rotate() {
+    let old = MeshSignerControlRecordV1::bootstrap(identity(), PurposeId::MeshSession);
+    let with_intent = apply(
+        &old,
+        &RecordTransition::IntentRecorded {
+            txn_id: [1; 16],
+            kind: PendingOpKind::Create,
+            backend: BackendKind::File,
+        },
+        1000,
+        TEST_CAP,
+    )
+    .unwrap();
+    let p = with_intent.pending_op.clone().unwrap();
+    let with_binding = apply(
+        &with_intent,
+        &RecordTransition::KeyObserved {
+            expected_txn_id: p.txn_id,
+            expected_kind: p.kind,
+            expected_generation: p.generation,
+            expected_epoch: p.epoch,
+            expected_purpose: p.purpose,
+            expected_slot_id: p.canonical_slot.canonical_id(),
+            expected_revision: with_intent.revision,
+            binding: binding(p.canonical_slot.clone()),
+        },
+        1000,
+        TEST_CAP,
+    )
+    .unwrap();
+    let activated = apply(
+        &with_binding,
+        &RecordTransition::ActivateFromKeyObserved {
+            expected_txn_id: p.txn_id,
+            expected_kind: p.kind,
+            expected_generation: p.generation,
+            expected_epoch: p.epoch,
+            expected_purpose: p.purpose,
+            expected_slot_id: p.canonical_slot.canonical_id(),
+            expected_revision: with_binding.revision,
+            delegation: delegation(0, 100),
+        },
+        1000,
+        TEST_CAP,
+    )
+    .unwrap();
+    assert!(activated.invariants_hold());
+
+    let rotate_intent = apply(
+        &activated,
+        &RecordTransition::IntentRecorded {
+            txn_id: [2; 16],
+            kind: PendingOpKind::RoutineRotate,
+            backend: BackendKind::File,
+        },
+        1000,
+        TEST_CAP,
+    )
+    .unwrap();
+    let p2 = rotate_intent.pending_op.clone().unwrap();
+    assert_eq!(p2.generation, NonZeroU64::new(2).unwrap());
+    assert_eq!(
+        rotate_intent.generation_high_water,
+        NonZeroU64::new(2).unwrap(),
+        "reserved at Intent time, not left until Activate -- see transition::apply's IntentRecorded arm"
+    );
+    assert!(
+        rotate_intent.invariants_hold(),
+        "a legitimate in-flight RoutineRotate (pending.generation == generation_high_water) must pass -- this is the exact regression kiana's independent audit caught"
+    );
+
+    let rotate_key_observed = apply(
+        &rotate_intent,
+        &RecordTransition::KeyObserved {
+            expected_txn_id: p2.txn_id,
+            expected_kind: p2.kind,
+            expected_generation: p2.generation,
+            expected_epoch: p2.epoch,
+            expected_purpose: p2.purpose,
+            expected_slot_id: p2.canonical_slot.canonical_id(),
+            expected_revision: rotate_intent.revision,
+            binding: binding(p2.canonical_slot.clone()),
+        },
+        1000,
+        TEST_CAP,
+    )
+    .unwrap();
+    assert!(rotate_key_observed.invariants_hold());
+}
+
+// ── item 7 (wave 4): invariants_hold must also catch cross-purpose
+// pending ops, foreign (non-derived) slots, and a GC binding whose own
+// .slot disagrees with the entry it's filed under ────────────────────────
+
+#[test]
+fn invariants_hold_rejects_a_pending_op_with_the_wrong_purpose() {
+    let old = MeshSignerControlRecordV1::bootstrap(identity(), PurposeId::MeshSession);
+    let mut with_intent = apply(
+        &old,
+        &RecordTransition::IntentRecorded {
+            txn_id: [10; 16],
+            kind: PendingOpKind::Create,
+            backend: BackendKind::File,
+        },
+        1000,
+        TEST_CAP,
+    )
+    .unwrap();
+    assert!(with_intent.invariants_hold());
+    with_intent.pending_op.as_mut().unwrap().purpose = PurposeId::RosterSync;
+    assert!(!with_intent.invariants_hold());
+}
+
+#[test]
+fn invariants_hold_rejects_a_pending_op_with_a_foreign_canonical_slot() {
+    let old = MeshSignerControlRecordV1::bootstrap(identity(), PurposeId::MeshSession);
+    let mut with_intent = apply(
+        &old,
+        &RecordTransition::IntentRecorded {
+            txn_id: [11; 16],
+            kind: PendingOpKind::Create,
+            backend: BackendKind::File,
+        },
+        1000,
+        TEST_CAP,
+    )
+    .unwrap();
+    assert!(with_intent.invariants_hold());
+    // A slot that could never have been derived from this record's own
+    // identity -- a foreign identity_digest.
+    with_intent
+        .pending_op
+        .as_mut()
+        .unwrap()
+        .canonical_slot
+        .identity_digest = [0xEE; 32];
+    assert!(!with_intent.invariants_hold());
+}
+
+#[test]
+fn invariants_hold_rejects_a_gc_bound_entry_whose_binding_slot_disagrees_with_its_own_slot() {
+    let s = slot(NonZeroU64::new(1).unwrap(), [92; 16]);
+    let foreign_binding = binding(slot(NonZeroU64::new(2).unwrap(), [93; 16]));
+    let corrupt = record_with_gc_entries(vec![GcEntry::Bound {
+        slot: s,
+        txn_id: [92; 16],
+        binding: foreign_binding,
+        state: GcState::Pending,
+    }]);
+    assert!(!corrupt.invariants_hold());
+}
+
+#[test]
+fn invariants_hold_rejects_duplicate_terminal_txn_ids() {
+    let mut old = MeshSignerControlRecordV1::bootstrap(identity(), PurposeId::MeshSession);
+    let one = TerminalResult {
+        txn_id: [95; 16],
+        outcome: TerminalOutcome::Revoked {
+            epoch: NonZeroU64::new(2).unwrap(),
+        },
+        request: TerminalRequestFingerprint::Revoke {
+            reason: RevocationReason::Compromised,
+        },
+        recorded_at: 0,
+        acked: false,
+    };
+    old.recent_terminal_results = vec![one.clone(), one];
+    assert!(!old.invariants_hold());
+}
+
+// ══════════════════════════════════════════════════════════════════════
+// Round 6, wave 5 -- REAL cross-process CAS, via genuinely separate OS
+// processes (see src/bin/cas_race_helper.rs). Threads within this one
+// test process would all share the same process-local
+// MeshSignerLocks/registry and so could never demonstrate what these
+// tests demonstrate.
+// ══════════════════════════════════════════════════════════════════════
+
+fn run_cas_race_helper(record_path: &std::path::Path, worker_id: u8) -> std::process::Child {
+    std::process::Command::new(env!("CARGO_BIN_EXE_cas_race_helper"))
+        .arg(record_path)
+        .arg(worker_id.to_string())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .expect("failed to spawn cas_race_helper")
+}
+
+fn wait_and_read_stdout(child: std::process::Child) -> String {
+    let output = child.wait_with_output().unwrap();
+    String::from_utf8(output.stdout).unwrap().trim().to_string()
+}
+
+#[test]
+fn six_real_processes_racing_the_same_record_exactly_one_commits() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("record");
+    // Seed the genesis bootstrap for real, through this process's own
+    // cell, before any race worker starts -- workers all revoke FROM
+    // revision 0, never create it.
+    {
+        let cell = test_cell(path.clone());
+        let bootstrap = MeshSignerControlRecordV1::bootstrap(identity(), PurposeId::MeshSession);
+        let g = cell.acquire_for_mutation();
+        assert_eq!(
+            cell.seed_for_test(&g, INITIAL_REVISION, &bootstrap),
+            ReplaceOutcome::Committed
+        );
+    }
+
+    // Spawn all six essentially simultaneously (spawn, don't wait, in a
+    // tight loop) so they genuinely contend rather than running
+    // sequentially.
+    let children: Vec<_> = (0u8..6).map(|i| run_cas_race_helper(&path, i)).collect();
+    let outputs: Vec<String> = children.into_iter().map(wait_and_read_stdout).collect();
+
+    let committed = outputs.iter().filter(|o| o.as_str() == "COMMITTED").count();
+    assert_eq!(
+        committed, 1,
+        "exactly one of six independent processes racing the same file from the same base revision must commit; got {outputs:?}"
+    );
+}
+
+#[test]
+fn hardlink_alias_makes_every_racing_process_fail_closed_not_double_commit() {
+    // Round 6, wave 5/6: closing the cross-process CAS race with a
+    // per-derived-path lock file was NOT enough on its own -- a hardlink
+    // alias (`record` / `alias`, same inode, two different names) still
+    // produced two independent lock files (`record.lock` / `alias.lock`)
+    // and two separate winners, one per spelling, confirmed by an earlier
+    // real 6-process run. `open_non_aliased`'s nlink check closes this
+    // structurally: it does not matter which of a hardlinked file's names
+    // a process used to open it -- nlink is a property of the shared
+    // inode, so every worker sees it and every worker fails closed. Never
+    // a "double commit"; always zero, safely, once any alias exists.
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("record");
+    let alias_path = dir.path().join("alias");
+    {
+        let cell = test_cell(path.clone());
+        let bootstrap = MeshSignerControlRecordV1::bootstrap(identity(), PurposeId::MeshSession);
+        let g = cell.acquire_for_mutation();
+        assert_eq!(
+            cell.seed_for_test(&g, INITIAL_REVISION, &bootstrap),
+            ReplaceOutcome::Committed
+        );
+    }
+    std::fs::hard_link(&path, &alias_path).expect("hard_link must succeed on a local filesystem");
+
+    let children: Vec<_> = (0u8..6)
+        .map(|i| {
+            let target = if i % 2 == 0 { &path } else { &alias_path };
+            run_cas_race_helper(target, i)
+        })
+        .collect();
+    let outputs: Vec<String> = children.into_iter().map(wait_and_read_stdout).collect();
+
+    let committed = outputs.iter().filter(|o| o.as_str() == "COMMITTED").count();
+    assert_eq!(
+        committed, 0,
+        "once a hardlink alias exists, every process (via either spelling) must fail closed -- never a silent double-commit through the two spellings; got {outputs:?}"
+    );
+    assert!(
+        outputs.iter().all(|o| o.starts_with("REJECTED")),
+        "every worker must observe the alias as a rejection, not silently succeed or crash; got {outputs:?}"
+    );
+}
+
+// ── mandatory (not opt-in) validated load ─────────────────────────────
+
+#[test]
+fn load_revalidated_succeeds_for_a_genuinely_active_record() {
+    // rotated_record_with_two_generations's shared `delegation()` fixture
+    // uses a placeholder delegated_key_id that never matches a real
+    // canonical_slot -- fine for the roster-revocation test (which fails
+    // closed before ever reaching that check), not fine here, where this
+    // test specifically wants full end-to-end success. Built directly
+    // instead, mirroring activate_from_key_observed_succeeds_full_path's
+    // own correctly-matched delegation.
+    let dir = tempfile::tempdir().unwrap();
+    let cell = test_cell(dir.path().join("record"));
+    let old = MeshSignerControlRecordV1::bootstrap(identity(), PurposeId::MeshSession);
+    let with_intent = apply(
+        &old,
+        &RecordTransition::IntentRecorded {
+            txn_id: [130; 16],
+            kind: PendingOpKind::Create,
+            backend: BackendKind::File,
+        },
+        1000,
+        TEST_CAP,
+    )
+    .unwrap();
+    let p = with_intent.pending_op.clone().unwrap();
+    let backend = FakeSecretBackend::new();
+    let CreateOutcome::Unique {
+        binding: real_binding,
+        ..
+    } = backend.create_or_inspect(&p.canonical_slot, None)
+    else {
+        panic!()
+    };
+    let with_binding = apply(
+        &with_intent,
+        &RecordTransition::KeyObserved {
+            expected_txn_id: p.txn_id,
+            expected_kind: p.kind,
+            expected_generation: p.generation,
+            expected_epoch: p.epoch,
+            expected_purpose: p.purpose,
+            expected_slot_id: p.canonical_slot.canonical_id(),
+            expected_revision: with_intent.revision,
+            binding: real_binding.clone(),
+        },
+        1000,
+        TEST_CAP,
+    )
+    .unwrap();
+    let mut d = delegation(0, 100);
+    d.delegated_key_id = p.canonical_slot.canonical_id();
+    d.delegated_pub = real_binding.public_key.clone();
+    let mut activated = apply(
+        &with_binding,
+        &RecordTransition::ActivateFromKeyObserved {
+            expected_txn_id: p.txn_id,
+            expected_kind: p.kind,
+            expected_generation: p.generation,
+            expected_epoch: p.epoch,
+            expected_purpose: p.purpose,
+            expected_slot_id: p.canonical_slot.canonical_id(),
+            expected_revision: with_binding.revision,
+            delegation: d,
+        },
+        1000,
+        TEST_CAP,
+    )
+    .unwrap();
+    activated.revision = 1; // see seed_record's own two-step requirement
+    seed_record(&cell, &activated);
+
+    let policy = DelegationPolicy::test(1000);
+    let loaded = load_revalidated::<MeshSessionPurpose>(
+        &cell,
+        &backend,
+        &policy,
+        &active_roster(),
+        &AlwaysTrueVerifier,
+        50,
+    )
+    .expect("a genuinely valid, backend-confirmed record must load");
+    assert_eq!(loaded, activated);
+}
+
+#[test]
+fn load_revalidated_rejects_when_physical_key_was_replaced() {
+    let dir = tempfile::tempdir().unwrap();
+    let cell = test_cell(dir.path().join("record"));
+    let mut rotated = rotated_record_with_two_generations(5000, 6000);
+    rotated.revision = 1; // see the sibling test above for why
+    let backend = FakeSecretBackend::new();
+    for g in &rotated.live_generations {
+        backend.create_or_inspect(&g.binding.slot, Some(&g.binding));
+    }
+    seed_record(&cell, &rotated);
+
+    // Tamper the physical key AFTER seeding -- load_revalidated must
+    // catch this; the low-level load_canonical alone never could.
+    let tampered_slot = rotated.live_generations[0].binding.slot.clone();
+    let mut tampered_binding = rotated.live_generations[0].binding.clone();
+    tampered_binding.public_key = vec![0xDE, 0xAD];
+    backend.gc_best_effort(&tampered_slot, &rotated.live_generations[0].binding);
+    backend.create_or_inspect(&tampered_slot, Some(&tampered_binding));
+
+    let policy = DelegationPolicy::test(10_000);
+    let err = load_revalidated::<MeshSessionPurpose>(
+        &cell,
+        &backend,
+        &policy,
+        &active_roster(),
+        &AlwaysTrueVerifier,
+        50,
+    )
+    .unwrap_err();
+    assert!(matches!(
+        err,
+        LoadRevalidatedError::Validation(ValidationError::PhysicalKeyNotConfirmed)
+    ));
 }

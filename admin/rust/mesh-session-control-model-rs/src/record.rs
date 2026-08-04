@@ -41,10 +41,16 @@ pub struct ControlIdentity {
     pub channel: Channel,
 }
 
-/// Canonical, injective digest of `ControlIdentity` — length-prefixed so
-/// `("ab", "c")` and `("a", "bc")` can never collide. This is what
-/// `SlotId::identity_digest` must always be derived from (audit finding 4:
-/// generation/slot must be *derived*, never caller-supplied).
+/// Canonical, collision-resistant digest of `ControlIdentity`, with an
+/// unambiguous preimage across its two variable-length string fields —
+/// length-prefixed so `("ab", "c")` and `("a", "bc")` can never collide on
+/// the *input* side. Round 6 terminology correction: this is not literally
+/// "injective" (a fixed-width 256-bit digest over an unbounded input
+/// domain cannot be, by pigeonhole) — it is collision-resistant (finding a
+/// genuine collision is computationally infeasible), which is the property
+/// actually being relied on here. This is what `SlotId::identity_digest`
+/// must always be derived from (audit finding 4: generation/slot must be
+/// *derived*, never caller-supplied).
 #[must_use]
 pub fn identity_digest(identity: &ControlIdentity) -> [u8; 32] {
     use sha2::{Digest, Sha256};
@@ -119,31 +125,57 @@ pub struct SlotId {
 }
 
 impl SlotId {
-    /// Injective encoding of every field, including `backend_instance` —
-    /// two slots identical except for backend (e.g. the same identity/
-    /// purpose/generation/txn_id once on `SecureEnclave` and once on
-    /// `TpmSealedSoftware`) must never collide on the string used
-    /// pervasively for GC-entry and delegation key-id lookups, since
-    /// `SlotId`'s own `Eq`/`Hash` already treat them as distinct.
+    /// Round 6, item 3: the prior concatenation-based encoding reached 139
+    /// bytes for a real input — over the keystore integration's own tested
+    /// bound (128 bytes; `admin/rust/keystore-rs/src/opaque_p256.rs`,
+    /// commit `91bb74f6`, test `slot_id_is_fixed_width_and_injective`) —
+    /// and was not fixed-width.
+    ///
+    /// Correction mid-fix (kiana): the first draft of this fix copied that
+    /// commit's own `"p256.v1."` string prefix literally. That was wrong —
+    /// `p256.v1.<...>` is `Slot::account()`'s output, a keystore-*internal*
+    /// coordinate that re-hashes `(purpose, label)` on its own side of the
+    /// integration boundary. This crate produces the *label* a real
+    /// integration hands *to* `Slot::new` — a different value in a
+    /// different namespace, which must never collide with or be mistaken
+    /// for the keystore's own internal `account()` string. Hence the
+    /// distinct `"mesh-slot.v1."` prefix below, not `"p256.v1."` (which
+    /// would also be a category error for the `TpmSealedSoftware`/`File`
+    /// backend kinds this type covers and P-256/Secure-Enclave does not).
+    ///
+    /// What *is* adopted from that commit is the structural technique: a
+    /// BLAKE3 digest over every field, each preceded by an 8-byte
+    /// little-endian length prefix — an unambiguous preimage across
+    /// variable-length fields (the same technique `identity_digest`
+    /// already uses with SHA-256/big-endian; little-endian and BLAKE3 here
+    /// specifically to match this cited integration point). The result is
+    /// collision-resistant and has an unambiguous preimage, not literally
+    /// injective — a fixed-width 256-bit digest over an unbounded input
+    /// domain cannot be, by pigeonhole (round 6 terminology correction:
+    /// the prior doc comment here overclaimed "injective").
     #[must_use]
     pub fn canonical_id(&self) -> String {
-        let mut s = hex::encode(self.identity_digest);
-        s.push('.');
-        s.push_str(match self.purpose {
+        let purpose_str = match self.purpose {
             PurposeId::MeshSession => "mesh-session",
             PurposeId::RosterSync => "roster-sync",
-        });
-        s.push_str(".gen");
-        s.push_str(&self.generation.get().to_string());
-        s.push('.');
-        s.push_str(&hex::encode(self.txn_id));
-        s.push('.');
-        s.push_str(match self.backend_instance {
+        };
+        let backend_str = match self.backend_instance {
             BackendKind::SecureEnclave => "se",
             BackendKind::TpmSealedSoftware => "tpm",
             BackendKind::File => "file",
-        });
-        s
+        };
+        let mut hasher = blake3::Hasher::new();
+        for field in [
+            self.identity_digest.as_slice(),
+            purpose_str.as_bytes(),
+            &self.generation.get().to_le_bytes(),
+            &self.txn_id,
+            backend_str.as_bytes(),
+        ] {
+            hasher.update(&(field.len() as u64).to_le_bytes());
+            hasher.update(field);
+        }
+        format!("mesh-slot.v1.{}", hasher.finalize().to_hex())
     }
 }
 
@@ -551,5 +583,205 @@ impl MeshSignerControlRecordV1 {
                 .iter()
                 .filter(|e| !e.observation_complete_and_residual_zero())
                 .count()
+    }
+
+    /// Round 6, item (new) 4: `store::FileBackedStore::load_canonical` used
+    /// to only validate CBOR shape plus this store's own identity/purpose
+    /// binding — never the record's own SEMANTIC invariants. A
+    /// hand-corrupted (but still CBOR-canonical, still identity/purpose
+    /// correct) file on disk could satisfy both of those checks and still
+    /// describe a state `transition::apply` itself could never produce —
+    /// `Active` authority with no `current_generation`, two live
+    /// generations sharing a number, a `KeyObserved` pending op with no
+    /// binding, a terminal result whose `outcome` doesn't match its own
+    /// `request`'s shape. Loading such a record as `LoadOutcome::Exact`
+    /// would hand every caller a state the rest of this crate's logic
+    /// implicitly assumes can never happen. `load_canonical` treats a
+    /// failure here the same as a CBOR-level defect (`LoadOutcome::Corrupt`)
+    /// — this crate has no auto-recovery path for either case, so a
+    /// distinct "quarantine" outcome is not yet load-bearing.
+    #[must_use]
+    pub fn invariants_hold(&self) -> bool {
+        // Active <=> current_generation is Some, and if Some it must name
+        // an actual live generation.
+        if matches!(self.authority, Authority::Active) != self.current_generation.is_some() {
+            return false;
+        }
+        if let Some(cur) = self.current_generation {
+            if !self.live_generations.iter().any(|g| g.generation == cur) {
+                return false;
+            }
+            if cur > self.generation_high_water {
+                return false;
+            }
+        }
+        // No two live_generations share a generation number, and none
+        // exceeds the high-water mark. Round 6, wave 4: high_water is now
+        // RESERVED at Intent time (see `transition`'s IntentRecorded /
+        // ReactivateFromRevoked arms), so a not-yet-activated pending op's
+        // own generation (checked further below) is also always
+        // `<= generation_high_water`, never `high_water + 1` — the prior
+        // version of this check used the old (pre-reservation) assumption
+        // and rejected every legitimate in-flight rotation/reactivation.
+        let mut seen_generations = std::collections::HashSet::new();
+        for g in &self.live_generations {
+            if !seen_generations.insert(g.generation) || g.generation > self.generation_high_water {
+                return false;
+            }
+            // Round 6, wave 4: a live generation's own binding must be
+            // for the slot it claims -- catches a "foreign" binding
+            // swapped onto an unrelated live generation.
+            let expected_slot = SlotId {
+                identity_digest: identity_digest(&self.identity),
+                purpose: self.purpose,
+                generation: g.generation,
+                txn_id: g.binding.slot.txn_id,
+                backend_instance: g.binding.slot.backend_instance,
+            };
+            if g.binding.slot != expected_slot {
+                return false;
+            }
+        }
+        // No two slots (across live_generations, gc_pending, and any
+        // pending_op together) coincide — a legitimate history never lets
+        // a slot be both live and pending GC at once (see
+        // `transition::slot_collides_with_unresolved_gc`).
+        let mut seen_slots = std::collections::HashSet::new();
+        for g in &self.live_generations {
+            if !seen_slots.insert(g.binding.slot.canonical_id()) {
+                return false;
+            }
+        }
+        for e in &self.gc_pending {
+            if !seen_slots.insert(e.slot().canonical_id()) {
+                return false;
+            }
+            // Round 6, wave 4: a Bound entry's own binding must be for
+            // the slot the entry itself claims -- catches a "foreign" GC
+            // binding whose .slot disagrees with the key entry.slot()
+            // names.
+            if let GcEntry::Bound { slot, binding, .. } = e
+                && binding.slot != *slot
+            {
+                return false;
+            }
+            // Round 6, wave 6: internal consistency (binding.slot ==
+            // entry.slot()) is not enough on its own -- it says nothing
+            // about whether the slot actually belongs to THIS record at
+            // all. Without this, a GC entry naming a completely different
+            // identity's slot (but internally self-consistent) still
+            // loaded as Exact, and a real gc_worker_tick would then call
+            // the backend against a foreign slot with no relationship to
+            // this record whatsoever.
+            let slot = e.slot();
+            if e.txn_id() != slot.txn_id
+                || slot.identity_digest != identity_digest(&self.identity)
+                || slot.purpose != self.purpose
+                || slot.generation > self.generation_high_water
+            {
+                return false;
+            }
+        }
+        // pending_op must belong to THIS record (purpose), its
+        // canonical_slot must be exactly what the derivation formula
+        // produces from this record's own identity/purpose/generation/
+        // txn_id/backend (never a foreign slot), its binding must be
+        // present iff phase is KeyObserved (and for that binding, for
+        // the pending op's own slot), its generation must not exceed the
+        // high-water mark, its own slot must not collide with a live or
+        // gc_pending slot, and its kind must be the one the closed
+        // authority matrix (round 4, item 2) actually allows for the
+        // record's current authority.
+        if let Some(p) = &self.pending_op {
+            if p.purpose != self.purpose {
+                return false;
+            }
+            // Round 6, wave 6: this must read `p.txn_id` -- PendingOp's
+            // own independent field -- not `p.canonical_slot.txn_id`.
+            // Building `expected_slot` from the very field being checked
+            // made the comparison tautological on that dimension: it
+            // could never catch a canonical_slot whose txn_id disagreed
+            // with the pending op's own txn_id.
+            let expected_slot = SlotId {
+                identity_digest: identity_digest(&self.identity),
+                purpose: self.purpose,
+                generation: p.generation,
+                txn_id: p.txn_id,
+                backend_instance: p.backend,
+            };
+            if p.canonical_slot != expected_slot {
+                return false;
+            }
+            // epoch is set once, at Intent/Reactivate time, to whatever
+            // epoch_high_water was at that moment -- and nothing can bump
+            // epoch_high_water again without also clearing or replacing
+            // pending_op in that SAME transition (RevokeUrgent,
+            // ReactivateFromRevoked). So a live pending_op's epoch must
+            // always equal the record's current epoch_high_water exactly.
+            if p.epoch != self.epoch_high_water {
+                return false;
+            }
+            let binding_matches_phase = match p.phase {
+                PendingPhase::Intent => p.binding.is_none(),
+                PendingPhase::KeyObserved => p.binding.is_some(),
+            };
+            if !binding_matches_phase {
+                return false;
+            }
+            if let Some(b) = &p.binding
+                && b.slot != p.canonical_slot
+            {
+                return false;
+            }
+            if p.generation > self.generation_high_water {
+                return false;
+            }
+            if !seen_slots.insert(p.canonical_slot.canonical_id()) {
+                return false;
+            }
+            let kind_matches_authority = matches!(
+                (&self.authority, p.kind),
+                (Authority::Empty, PendingOpKind::Create)
+                    | (Authority::Active, PendingOpKind::RoutineRotate)
+                    | (Authority::Revoked { .. }, PendingOpKind::Reactivate)
+            );
+            if !kind_matches_authority {
+                return false;
+            }
+        }
+        // recent_terminal_results: no two entries share a txn_id, and the
+        // list never exceeds its own bounded-retention cap -- both are
+        // supposed to be structurally guaranteed by `push_bounded_terminal`/
+        // `push_bounded_terminal_urgent`, never independently violable.
+        if self.recent_terminal_results.len() > MAX_RECENT_TERMINAL_RESULTS {
+            return false;
+        }
+        let mut seen_terminal_txns = std::collections::HashSet::new();
+        for r in &self.recent_terminal_results {
+            if !seen_terminal_txns.insert(r.txn_id) {
+                return false;
+            }
+            // Every terminal result's outcome must match its own
+            // request's shape — the two are always written together by
+            // `apply`, never independently.
+            let consistent = match (&r.outcome, &r.request) {
+                (
+                    TerminalOutcome::Activated { generation: og },
+                    TerminalRequestFingerprint::Activate { generation: rg, .. },
+                ) => og == rg,
+                (TerminalOutcome::Revoked { .. }, TerminalRequestFingerprint::Revoke { .. }) => {
+                    true
+                }
+                (
+                    TerminalOutcome::Reactivated { .. },
+                    TerminalRequestFingerprint::Reactivate { .. },
+                ) => true,
+                _ => false,
+            };
+            if !consistent {
+                return false;
+            }
+        }
+        true
     }
 }

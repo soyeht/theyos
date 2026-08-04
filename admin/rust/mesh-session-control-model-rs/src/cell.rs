@@ -49,9 +49,9 @@
 use crate::commit::{CommitError, commit_new_bytes};
 use crate::locks::{GcSerialLock, MeshSignerLocks, MutateGuard, OrderSpy, SignGuard};
 use crate::record::{ControlIdentity, MeshSignerControlRecordV1, PurposeId};
-use crate::store::{
-    AtomicControlRecordStore, FaultInjectingStore, FileBackedStore, LoadOutcome, ReplaceOutcome,
-};
+use crate::store::{AtomicControlRecordStore, FileBackedStore, LoadOutcome};
+#[cfg(feature = "test-support")]
+use crate::store::{FaultInjectingStore, ReplaceOutcome};
 use crate::transition::{RecordTransition, TransitionError, apply};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -67,6 +67,25 @@ pub enum CommitTransitionError {
     Transition(#[from] TransitionError),
     #[error(transparent)]
     Commit(#[from] CommitError),
+    #[error(
+        "this transition represents backend/admin-observed evidence and cannot be committed directly -- ActivateFromKeyObserved requires backend.load_exact + the full validator (activate::activate_from_key_observed); GcInspected/GcInspectionConflict/GcResolved/GcRemoval require a real SecretBackend call (gc::gc_worker_tick/gc_removal_pass)"
+    )]
+    PrivilegedTransition,
+}
+
+/// Transitions that assert something was actually observed from the
+/// backend (or, for `ActivateFromKeyObserved`, validated against it) —
+/// never safely constructible by a caller who hasn't actually gathered
+/// that evidence. See `CommitTransitionError::PrivilegedTransition`.
+fn is_privileged(t: &RecordTransition) -> bool {
+    matches!(
+        t,
+        RecordTransition::ActivateFromKeyObserved { .. }
+            | RecordTransition::GcInspected { .. }
+            | RecordTransition::GcInspectionConflict { .. }
+            | RecordTransition::GcResolved { .. }
+            | RecordTransition::GcRemoval { .. }
+    )
 }
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
@@ -123,12 +142,28 @@ impl ControlRecordCell {
     /// Builds `t` against a fresh read (guard held for the whole section)
     /// and commits it. The sanctioned way to mutate from outside this
     /// crate when the transition is already fully known.
+    ///
+    /// Round 6 fix (item 4, then widened in wave 4): this used to accept
+    /// ANY `RecordTransition`. `ActivateFromKeyObserved` was closed off
+    /// first (bypassed `backend.load_exact` + the full validator) — but
+    /// the same bypass existed for every `Gc*` variant too: a caller could
+    /// commit `GcResolved { residual_zero: true, .. }` directly, claiming
+    /// a clean destroy that never actually touched `SecretBackend`, then
+    /// `GcRemoval` to erase the tracking entry entirely — forging GC
+    /// evidence with no backend involved at all. All five variants that
+    /// represent "the backend/admin was actually consulted" are rejected
+    /// here now; only the crate-internal `commit_built_privileged` (used
+    /// exclusively by `activate.rs`/`gc.rs`, after they have actually
+    /// gathered that evidence) may commit one.
     pub fn commit(
         &self,
         t: &RecordTransition,
         now: u64,
         max_cap: usize,
     ) -> Result<MeshSignerControlRecordV1, CommitTransitionError> {
+        if is_privileged(t) {
+            return Err(CommitTransitionError::PrivilegedTransition);
+        }
         let guard = self.locks.acquire_for_mutation();
         let base = match self.store.load_canonical() {
             LoadOutcome::Exact(r) => *r,
@@ -144,12 +179,41 @@ impl ControlRecordCell {
     /// the guard and may report "nothing to do" (`None`) against that
     /// fresh state (e.g. the targeted entry was already resolved by a
     /// concurrent caller) — returns `Ok(None)` in that case rather than
-    /// committing anything.
+    /// committing anything. Same privileged-transition rejection as
+    /// `commit` — `build`'s output is checked after it runs, since the
+    /// whole point of this variant is that the transition is not known
+    /// until `build` sees a fresh read.
     pub fn commit_built(
         &self,
         build: impl FnOnce(&MeshSignerControlRecordV1) -> Option<RecordTransition>,
         now: u64,
         max_cap: usize,
+    ) -> Result<Option<MeshSignerControlRecordV1>, CommitTransitionError> {
+        self.commit_built_impl(build, now, max_cap, true)
+    }
+
+    /// Crate-internal only: identical to `commit_built` but WITHOUT the
+    /// privileged-transition rejection. Exists solely for
+    /// `activate::activate_from_key_observed` (which performs
+    /// `backend.load_exact` + the full validator itself first) and
+    /// `gc::gc_worker_tick`/`gc_removal_pass` (which call the real
+    /// `SecretBackend` first) — never `pub`, so nothing outside this
+    /// crate can reach it.
+    pub(crate) fn commit_built_privileged(
+        &self,
+        build: impl FnOnce(&MeshSignerControlRecordV1) -> Option<RecordTransition>,
+        now: u64,
+        max_cap: usize,
+    ) -> Result<Option<MeshSignerControlRecordV1>, CommitTransitionError> {
+        self.commit_built_impl(build, now, max_cap, false)
+    }
+
+    fn commit_built_impl(
+        &self,
+        build: impl FnOnce(&MeshSignerControlRecordV1) -> Option<RecordTransition>,
+        now: u64,
+        max_cap: usize,
+        reject_privileged: bool,
     ) -> Result<Option<MeshSignerControlRecordV1>, CommitTransitionError> {
         let guard = self.locks.acquire_for_mutation();
         let base = match self.store.load_canonical() {
@@ -160,6 +224,9 @@ impl ControlRecordCell {
         let Some(t) = build(&base) else {
             return Ok(None);
         };
+        if reject_privileged && is_privileged(&t) {
+            return Err(CommitTransitionError::PrivilegedTransition);
+        }
         let new = apply(&base, &t, now, max_cap)?;
         commit_new_bytes(&self.store, &guard, base.revision, &new, 8)?;
         Ok(Some(new))
@@ -175,6 +242,14 @@ impl ControlRecordCell {
     /// Still guard-gated (the `LockToken` check still applies), but its
     /// name makes clear this is not part of the production surface — a
     /// real caller has no legitimate reason to ever call this.
+    ///
+    /// Round 6 fix (item 4): a doc-comment name was the ONLY thing
+    /// enforcing "test-only" — in a normal (non-test) build this was a
+    /// fully `pub` method, reachable by any consumer of this crate as a
+    /// library, letting it write ANY record content directly. Gated behind
+    /// `test-support`, off by default; this crate's own `cargo test`
+    /// enables it via the dev-dependency-on-self declared in `Cargo.toml`.
+    #[cfg(feature = "test-support")]
     pub fn seed_for_test(
         &self,
         guard: &MutateGuard<'_>,
@@ -229,13 +304,13 @@ pub fn open(
 ) -> Result<Arc<ControlRecordCell>, OpenConflict> {
     let key = registry_key(&path);
     let mut reg = control_record_registry().lock().unwrap();
-    if let Some(existing) = reg.get(&key) {
-        if let Some(cell) = existing.cell.upgrade() {
-            if existing.identity != identity || existing.purpose != purpose {
-                return Err(OpenConflict);
-            }
-            return Ok(cell);
+    if let Some(existing) = reg.get(&key)
+        && let Some(cell) = existing.cell.upgrade()
+    {
+        if existing.identity != identity || existing.purpose != purpose {
+            return Err(OpenConflict);
         }
+        return Ok(cell);
     }
     let locks = MeshSignerLocks::new(spy);
     let store = FileBackedStore::new(path, locks.token(), identity.clone(), purpose);
@@ -263,11 +338,17 @@ pub fn open(
 /// exercising the store/commit retry machinery at a low level, so there is
 /// no production-bypass concern to close here, only the same path-aliasing
 /// gap `ControlRecordCell` closes (round 5, item A2).
+///
+/// Round 6 fix (item 4): this whole module was fully `pub` in a normal
+/// build despite being test-only in intent — gated behind `test-support`,
+/// same as `seed_for_test`, for the same reason.
+#[cfg(feature = "test-support")]
 pub struct FaultInjectingCell {
     store: FaultInjectingStore,
     locks: MeshSignerLocks,
 }
 
+#[cfg(feature = "test-support")]
 impl FaultInjectingCell {
     #[must_use]
     pub fn store(&self) -> &FaultInjectingStore {
@@ -280,11 +361,13 @@ impl FaultInjectingCell {
     }
 }
 
+#[cfg(feature = "test-support")]
 fn fault_injecting_registry() -> &'static Mutex<HashMap<PathBuf, Registered<FaultInjectingCell>>> {
     static REG: OnceLock<Mutex<HashMap<PathBuf, Registered<FaultInjectingCell>>>> = OnceLock::new();
     REG.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+#[cfg(feature = "test-support")]
 pub fn open_fault_injecting(
     path: PathBuf,
     identity: ControlIdentity,
@@ -293,13 +376,13 @@ pub fn open_fault_injecting(
 ) -> Result<Arc<FaultInjectingCell>, OpenConflict> {
     let key = registry_key(&path);
     let mut reg = fault_injecting_registry().lock().unwrap();
-    if let Some(existing) = reg.get(&key) {
-        if let Some(cell) = existing.cell.upgrade() {
-            if existing.identity != identity || existing.purpose != purpose {
-                return Err(OpenConflict);
-            }
-            return Ok(cell);
+    if let Some(existing) = reg.get(&key)
+        && let Some(cell) = existing.cell.upgrade()
+    {
+        if existing.identity != identity || existing.purpose != purpose {
+            return Err(OpenConflict);
         }
+        return Ok(cell);
     }
     let locks = MeshSignerLocks::new(spy);
     let store = FaultInjectingStore::new(path, locks.token(), identity.clone(), purpose);

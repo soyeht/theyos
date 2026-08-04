@@ -63,6 +63,26 @@ pub enum RosterCurrency {
 /// business holding).
 pub trait RosterLookup {
     fn query_machine_currency(&self, machine_id: &str) -> RosterCurrency;
+
+    /// Round 6 fix (item 3): `activate_from_key_observed` used to call
+    /// `query_machine_currency` once, with no guard held (deliberately —
+    /// see that function's own doc comment on why slow I/O must never
+    /// block a concurrent urgent revoke), and then commit against a
+    /// *stale* answer: if the roster flipped `Active` → `Revoked` for this
+    /// machine in the gap between that call and the eventual commit, the
+    /// activation still went through. Closing that gap with a second full
+    /// `query_machine_currency` call *inside* the commit guard would just
+    /// reopen the original blocking problem this crate already fixed once.
+    /// This method exists to let a real integration expose a CHEAP, purely
+    /// local staleness signal instead — no I/O, safe to call while holding
+    /// the guard — so the caller can prove nothing changed between the
+    /// slow lookup and the moment of commit without ever doing slow I/O
+    /// under lock. A real integration bumps its own revision counter on
+    /// any change to any machine's currency; comparing two calls' results
+    /// for the same `machine_id` is the whole contract. No default impl:
+    /// a test double or integration that cannot honor "no I/O" should not
+    /// silently inherit one that pretends to.
+    fn currency_revision(&self, machine_id: &str) -> u64;
 }
 
 /// Deliberately receives the typed `Delegation`, not preimage bytes — see
@@ -195,7 +215,18 @@ impl PurposeMarker for MeshSessionPurpose {
     }
 }
 
+/// Round 6 fix (item 5): gated behind `roster-sync-unratified`, off by
+/// default. A doc comment saying "no production path here, D6 owns it"
+/// was not a control — in a normal build this type was fully `pub` and
+/// activatable through `activate::activate_from_key_observed::<RosterSyncPurpose>`
+/// exactly like `MeshSessionPurpose`, despite having no ratified
+/// production authority model at all. `PurposeId::RosterSync` itself stays
+/// part of the wire format (it is a real value other purposes' data must
+/// coexist with), but the ability to validate/activate a record AS that
+/// purpose through the `PurposeMarker` mechanism is now gated.
+#[cfg(feature = "roster-sync-unratified")]
 pub struct RosterSyncPurpose;
+#[cfg(feature = "roster-sync-unratified")]
 impl PurposeMarker for RosterSyncPurpose {
     const PURPOSE_ID: PurposeId = PurposeId::RosterSync;
     const DELEGATION_DOMAIN: &'static str = "soyeht/roster-sync/v1";
@@ -257,6 +288,14 @@ pub enum ValidationError {
     DelegatedPubBindingMismatch,
     #[error("the type parameter's PURPOSE_ID does not match the record's own runtime purpose")]
     PurposeMismatch,
+    #[error(
+        "a live generation's physical key is no longer present in the backend with a matching public key -- replaced or deleted outside this record's own state machine"
+    )]
+    PhysicalKeyNotConfirmed,
+    #[error(
+        "roster currency for the delegator changed between validation and commit -- the delegation may no longer be authorized; retry to re-validate against current state"
+    )]
+    RosterChangedDuringActivation,
 }
 
 /// Identity context the validator checks the delegation against — grouped

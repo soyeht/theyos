@@ -158,10 +158,10 @@ impl SecretBackend for FakeSecretBackend {
         // own `.slot` claims T, corrupting exactly the kind of
         // slot-identity consistency `KeyObserved`'s own binding-slot check
         // (transition.rs) depends on the backend never producing.
-        if let Some(exp) = expected_binding {
-            if exp.slot != *slot {
-                return CreateOutcome::Conflict;
-            }
+        if let Some(exp) = expected_binding
+            && exp.slot != *slot
+        {
+            return CreateOutcome::Conflict;
         }
         let mut items = self.items.lock().unwrap();
         if let Some(existing) = items.get(slot) {

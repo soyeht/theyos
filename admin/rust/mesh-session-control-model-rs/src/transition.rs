@@ -98,6 +98,24 @@ pub enum TransitionError {
     TerminalTxnReused,
     #[error("the observed binding's slot does not match the pending op's own canonical_slot")]
     BindingSlotMismatch,
+    #[error(
+        "derived canonical_slot collides with a slot still awaiting GC resolution -- a physical destroy targeting the old entry could hit a newly created key sharing the same slot id"
+    )]
+    SlotCollidesWithPendingGc,
+}
+
+/// Which `live_generations` removal(s) a given transition is legitimately
+/// allowed to make this call to `apply` — `validate_shared_invariants`
+/// rejects any removal not covered by this. `AllLive` exists for
+/// `RevokeUrgent` (round 6, item 1): unlike `GenerationExpired`, which
+/// removes exactly one specific, already-lapsed generation, an urgent
+/// revoke must be able to clear every currently-live generation (there may
+/// be more than one mid-rotation-grace-period) in the same transition that
+/// flips `authority` to `Revoked`.
+enum AllowedRemoval {
+    None,
+    One(NonZeroU64),
+    AllLive,
 }
 
 pub enum RecordTransition {
@@ -228,7 +246,7 @@ pub fn apply(
     }
 
     let mut new = old.clone();
-    let mut allowed_removal: Option<NonZeroU64> = None;
+    let mut allowed_removal = AllowedRemoval::None;
 
     match t {
         RecordTransition::StabilizationRewrite => {
@@ -276,6 +294,17 @@ pub fn apply(
                 return Err(TransitionError::InvalidIntentForAuthority);
             }
             let generation = derive_next_generation(old)?;
+            // Round 6 fix (wave 4, item 6): generation_high_water is now
+            // RESERVED here, at Intent time, not left to Activate to bump
+            // later. Two things this closes: (a) invariants_hold's own
+            // bound on a pending op's generation (see below) needs
+            // high_water to already reflect an in-flight, not-yet-active
+            // generation, or it would reject every legitimate mid-rotation
+            // record; (b) without a reservation, an abandoned/preempted
+            // attempt that never activated would leave high_water
+            // unbumped, letting a LATER attempt derive the exact same
+            // generation number again for a different txn_id/slot.
+            new.generation_high_water = generation;
             let canonical_slot = SlotId {
                 identity_digest: identity_digest(&old.identity),
                 purpose: old.purpose,
@@ -283,6 +312,9 @@ pub fn apply(
                 txn_id: *txn_id,
                 backend_instance: *backend,
             };
+            if slot_collides_with_unresolved_gc(old, &canonical_slot) {
+                return Err(TransitionError::SlotCollidesWithPendingGc);
+            }
             new.pending_op = Some(PendingOp {
                 txn_id: *txn_id,
                 kind: *kind,
@@ -430,6 +462,27 @@ pub fn apply(
                 new.gc_pending.push(entry);
             }
             new.pending_op = None;
+            // Round 6, item 1: every LIVE generation's physical key must
+            // also be queued for destruction here -- `authority` flipping
+            // to `Revoked` says nothing may sign anymore, but says nothing
+            // about the physical key material for what WAS the active (or
+            // any other still-retained, non-expired) generation; without
+            // this it just sits in the backend indefinitely with nothing
+            // ever tracking it for GC. Cap-neutral: each live_generations
+            // entry removed here is exactly one new gc_pending entry
+            // added, same shape as the pending_op swap above (see
+            // `MeshSignerControlRecordV1::cap_occupancy`'s doc).
+            for g in &old.live_generations {
+                new.gc_pending.push(GcEntry::Bound {
+                    slot: g.binding.slot.clone(),
+                    txn_id: g.binding.slot.txn_id,
+                    binding: g.binding.clone(),
+                    state: GcState::Pending,
+                });
+            }
+            new.live_generations.clear();
+            new.current_generation = None;
+            allowed_removal = AllowedRemoval::AllLive;
             // push_bounded_terminal_urgent, not push_bounded_terminal --
             // round 5, item D10: an urgent, security-critical revoke must
             // never be blockable by terminal-result retention capacity.
@@ -473,6 +526,9 @@ pub fn apply(
                 .checked_add(1)
                 .ok_or(TransitionError::EpochExhausted)?;
             let generation = derive_next_generation(old)?;
+            // Reserved here, at Intent time -- see the identical fix and
+            // its doc comment in the IntentRecorded arm above.
+            new.generation_high_water = generation;
             let canonical_slot = SlotId {
                 identity_digest: identity_digest(&old.identity),
                 purpose: old.purpose,
@@ -480,6 +536,9 @@ pub fn apply(
                 txn_id: *next_txn_id,
                 backend_instance: *backend,
             };
+            if slot_collides_with_unresolved_gc(old, &canonical_slot) {
+                return Err(TransitionError::SlotCollidesWithPendingGc);
+            }
             new.pending_op = Some(PendingOp {
                 txn_id: *next_txn_id,
                 kind: PendingOpKind::Reactivate,
@@ -529,7 +588,7 @@ pub fn apply(
             });
             new.live_generations
                 .retain(|lg| lg.generation != *generation);
-            allowed_removal = Some(*generation);
+            allowed_removal = AllowedRemoval::One(*generation);
             bump_revision(&mut new, old)?;
         }
 
@@ -729,13 +788,46 @@ fn pending_matches_token(
         && p.canonical_slot.canonical_id() == *expected_slot_id
 }
 
+/// Round 6 fix: this used to branch on `old.current_generation.is_some()`
+/// — which broke the moment `RevokeUrgent` started legitimately clearing
+/// `current_generation` to `None` (round 6, item 1: revoked live
+/// generations must move to GC). A subsequent `ReactivateFromRevoked`
+/// would then see `current_generation.is_none()` and incorrectly restart
+/// at generation 1 — a number already used and now sitting in
+/// `gc_pending` — instead of continuing the monotonic sequence from
+/// `generation_high_water`. If the caller also reused the preempted
+/// pending op's own txn_id as the new `next_txn_id` (nothing forbids
+/// that — the preempted op itself never got its own terminal result), the
+/// newly derived `canonical_slot` collided byte-for-byte with the
+/// still-unresolved `gc_pending` entry for the ORIGINAL key, and GC could
+/// destroy the new key believing it was cleaning up the old one.
+///
+/// `Authority::Empty` is the correct discriminator instead: it is the
+/// bootstrap/pristine state and nothing ever transitions authority back to
+/// it once left, so "authority is Empty" means "never activated" exactly,
+/// independent of whatever `current_generation`/`live_generations` a later
+/// `RevokeUrgent` legitimately clears.
+/// Round 6, item (new) 1 -- defense in depth, independent of whatever
+/// combination of generation/txn_id caused it: a freshly derived
+/// `canonical_slot` must never coincide with a slot that still has an
+/// unresolved `gc_pending` entry (i.e. not yet `Absent`/`Done` residual
+/// zero). Physical destroy is keyed by slot id on the backend side, so a
+/// collision here means the destroy meant for the OLD entry could instead
+/// hit a brand-new key that happens to share that id.
+fn slot_collides_with_unresolved_gc(old: &MeshSignerControlRecordV1, slot: &SlotId) -> bool {
+    let id = slot.canonical_id();
+    old.gc_pending
+        .iter()
+        .any(|e| e.slot().canonical_id() == id && !e.observation_complete_and_residual_zero())
+}
+
 fn derive_next_generation(old: &MeshSignerControlRecordV1) -> Result<NonZeroU64, TransitionError> {
-    if old.current_generation.is_some() {
+    if matches!(old.authority, Authority::Empty) {
+        Ok(NonZeroU64::new(1).unwrap())
+    } else {
         old.generation_high_water
             .checked_add(1)
             .ok_or(TransitionError::GenerationExhausted)
-    } else {
-        Ok(NonZeroU64::new(1).unwrap())
     }
 }
 
@@ -752,13 +844,16 @@ fn bump_revision(
 
 /// Invariants shared by every transition except `StabilizationRewrite`
 /// (checked separately: it must leave `new == old` byte-for-byte, so none
-/// of these can fire). `allowed_removal`, when `Some(g)`, permits exactly
-/// one live-generation removal — `g` — for `GenerationExpired`; every other
-/// transition passes `None` and the blanket prohibition applies.
+/// of these can fire). `allowed_removal` states which live-generation
+/// removal(s), if any, this specific transition is legitimately allowed to
+/// make — `One(g)` for `GenerationExpired` removing exactly `g`, `AllLive`
+/// for `RevokeUrgent` clearing every currently-live generation at once
+/// (round 6, item 1); every other transition passes `None` and the blanket
+/// prohibition applies.
 fn validate_shared_invariants(
     old: &MeshSignerControlRecordV1,
     new: &MeshSignerControlRecordV1,
-    allowed_removal: Option<NonZeroU64>,
+    allowed_removal: AllowedRemoval,
     max_cap: usize,
 ) -> Result<(), TransitionError> {
     if new.identity != old.identity || new.purpose != old.purpose {
@@ -776,14 +871,27 @@ fn validate_shared_invariants(
             if still_referenced_by_number {
                 return Err(TransitionError::RetainedGenerationMutated);
             }
-            if allowed_removal == Some(g.generation) {
-                continue; // deliberately, provably removed by GenerationExpired
+            let removal_allowed = match allowed_removal {
+                AllowedRemoval::None => false,
+                AllowedRemoval::One(allowed) => allowed == g.generation,
+                AllowedRemoval::AllLive => true,
+            };
+            if removal_allowed {
+                continue; // deliberately, provably removed by this transition
             }
             return Err(TransitionError::RetainedGenerationMutated);
         }
     }
-    if let Some(cur) = old.current_generation {
-        if !new.live_generations.iter().any(|g| g.generation == cur) {
+    if let Some(cur) = old.current_generation
+        && !new.live_generations.iter().any(|g| g.generation == cur)
+    {
+        // Only legitimate when EVERY live generation was allowed
+        // removal (RevokeUrgent's AllLive) and current_generation was
+        // correspondingly cleared too — never a dangling pointer to a
+        // generation that no longer exists.
+        let ok =
+            matches!(allowed_removal, AllowedRemoval::AllLive) && new.current_generation.is_none();
+        if !ok {
             return Err(TransitionError::RemovesCurrent);
         }
     }
@@ -801,7 +909,19 @@ fn validate_shared_invariants(
             return Err(TransitionError::DuplicateGcSlot);
         }
     }
-    if new.cap_occupancy() > max_cap {
+    // Round 6, item (new) 3: this used to be an absolute check
+    // (`new.cap_occupancy() > max_cap`) applied to every transition,
+    // including ones that are cap-neutral (`RevokeUrgent`, cap-neutral by
+    // construction -- see its own doc comment) or cap-*reducing*
+    // (`GcResolved` moving a `Bound` entry to `Done`). If `max_cap` was
+    // ever lowered under a record already sitting at or above the new
+    // value, or occupancy reached the cap through legitimate prior
+    // activity, the absolute check would block the ONLY kinds of
+    // transitions capable of bringing it back down -- trapping the record
+    // over cap forever. The cap must only ever block *growth*: a
+    // transition that does not increase occupancy is always allowed,
+    // regardless of where `old` already sat relative to `max_cap`.
+    if new.cap_occupancy() > max_cap && new.cap_occupancy() > old.cap_occupancy() {
         return Err(TransitionError::CapExceeded);
     }
     Ok(())

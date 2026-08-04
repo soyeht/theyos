@@ -18,6 +18,38 @@
 //! Enclave measurements, real TPM round-trip, `ApprovedFallback`, cross-peer
 //! revoke transport, anti-rollback against filesystem snapshot restore) are
 //! unaffected by anything in this crate.
+//!
+//! # Default build surface (round 6, items 4/5)
+//!
+//! Two things are gated OFF by default, each behind its own Cargo feature,
+//! because a doc comment saying "test-only" or "no production path" is not
+//! a control — in a normal build both were previously just as `pub` as
+//! everything else:
+//! - `test-support`: `cell::FaultInjectingCell`, `cell::open_fault_injecting`,
+//!   `store::FaultInjectingStore`, and `ControlRecordCell::seed_for_test` —
+//!   the fault-injection test double and the one escape hatch that bypasses
+//!   `transition::apply` entirely.
+//! - `roster-sync-unratified`: `validator::RosterSyncPurpose` — this crate
+//!   has no ratified production authority model for `PurposeId::RosterSync`
+//!   (D6 owns that and has not ratified anything here).
+//!
+//! The three `compile_fail` blocks below prove the gated surface is
+//! genuinely absent under a plain `cargo test`/`cargo build` (no
+//! `--features`) — if any of these three imports ever start compiling by
+//! default, the corresponding doctest starts *passing* instead of failing
+//! its own "must not compile" check, which itself then fails the doctest.
+//!
+//! ```compile_fail
+//! use mesh_session_control_model_rs::cell::FaultInjectingCell;
+//! ```
+//!
+//! ```compile_fail
+//! use mesh_session_control_model_rs::cell::open_fault_injecting;
+//! ```
+//!
+//! ```compile_fail
+//! use mesh_session_control_model_rs::validator::RosterSyncPurpose;
+//! ```
 
 pub mod activate;
 pub mod cell;
