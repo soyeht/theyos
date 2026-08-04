@@ -1224,14 +1224,47 @@ impl<H: RevocableMeshSession> MeshSessionRegistry<H> {
     /// `Result<RosterSnapshotView, RosterSnapshotError>` straight from
     /// `MachineRosterCoordinator::current_snapshot()` — it routes the `Err`
     /// case to `mark_unavailable` for you.
+    /// Production entry point — always runs with an empty (no-op) hook. See
+    /// [`observe_new_checkpoint_inner`](Self::observe_new_checkpoint_inner)
+    /// for the actual logic.
     pub fn observe_new_checkpoint(&self, snapshot: &RosterSnapshotView) -> ObserveOutcome {
+        self.observe_new_checkpoint_inner(snapshot, || {})
+    }
+
+    /// Test-only seam (round D-1 successor, @kiana recheck): runs
+    /// `after_unlock_before_phase_b` at the exact point between `self.inner`'s
+    /// lock releasing and Phase B starting, so a test can deterministically
+    /// inspect what is externally observable in that window — see
+    /// `advance_revocation_announces_before_the_new_revision_is_externally_observable`.
+    /// Production code always goes through
+    /// [`observe_new_checkpoint`](Self::observe_new_checkpoint), which
+    /// passes an empty closure; this exists only so the hook never has to
+    /// live on the struct itself or be threaded through every call site.
+    #[cfg(test)]
+    pub(crate) fn observe_new_checkpoint_with_hook_for_test(
+        &self,
+        snapshot: &RosterSnapshotView,
+        after_unlock_before_phase_b: impl FnOnce(),
+    ) -> ObserveOutcome {
+        self.observe_new_checkpoint_inner(snapshot, after_unlock_before_phase_b)
+    }
+
+    fn observe_new_checkpoint_inner(
+        &self,
+        snapshot: &RosterSnapshotView,
+        after_unlock_before_phase_b: impl FnOnce(),
+    ) -> ObserveOutcome {
         // Phase A (short registry-mutex critical section): decide, mutate
         // registry-owned bookkeeping, and collect which sessions need
-        // revoking -- but do NOT call SessionSync::revoke() on any of them
-        // yet. revoke() can block, waiting out an in-flight
-        // ForwardingGuard; calling it here, still holding `self.inner`'s
-        // lock, would block every unrelated register/unregister/observe on
-        // this registry for as long as that one forward takes (round 4).
+        // revoking -- but do NOT call SessionSync::drain_after_announce()
+        // (blocking) on any of them yet. Draining can block, waiting out an
+        // in-flight ForwardingGuard; calling it here, still holding
+        // `self.inner`'s lock, would block every unrelated
+        // register/unregister/observe on this registry for as long as that
+        // one forward takes (round 4). `announce_revoke` (lock-free, never
+        // blocks) DOES run before this block ends — see the round D-1
+        // successor comment right before Phase B below for why that part
+        // cannot wait for Phase B.
         let to_revoke: Vec<(SessionId, Arc<SessionSync>, Weak<H>)>;
         let outcome;
         {
@@ -1410,16 +1443,41 @@ impl<H: RevocableMeshSession> MeshSessionRegistry<H> {
                     outcome = ObserveOutcome::Applied;
                 }
             }
+
+            // Round D-1 successor (@kiana recheck, on top of P0-1): must run
+            // HERE, still holding `self.inner`'s lock -- not merely before
+            // Phase B starts draining a sibling target (P0-1's own fix,
+            // still correct and still needed on its own). The Advance branch
+            // above just published `guard.last_known_revision` as the new
+            // truth; the instant this lock releases, any OTHER caller
+            // (e.g. a concurrent `preauthorize` for an unrelated machine)
+            // can already see and act on it. `announce_revoke` is the ONLY
+            // thing that makes a revoked target's gate stop admitting new
+            // forwarding, and it is lock-free/non-blocking (a single atomic
+            // increment per target — see `SessionSync`'s doc comment), so
+            // running it here cannot introduce the very blocking-under-lock
+            // problem Phase A's split from Phase B exists to avoid. Without
+            // this, a revoked session's gate would remain fully authorized
+            // during the (however brief) window between this lock releasing
+            // and Phase B's own announce actually executing — breaking the
+            // linearization-point contract this method documents itself as
+            // providing (module doc comment, CFX-5): the roster's own
+            // truth and this registry's per-session authorization would be
+            // observably out of sync. Empty for every branch except
+            // Advance/Fork-Regression; a no-op loop otherwise.
+            announce_batch(to_revoke.iter().map(|(_, sync, _)| sync));
         }
 
-        // Phase B (unlocked): announce revoke intent to EVERY collected
-        // target first, THEN drain each — not a plain per-target `revoke()`
-        // loop (round D-1 successor, @kiana P0-1: see `revoke_batch`'s doc
-        // comment for exactly why a sequential loop leaves later targets
-        // still admitting new forwarding while an earlier one drains). All
-        // without holding `self.inner`'s lock, so unrelated registry
-        // operations are never blocked by a slow forward (round 4).
-        revoke_batch(to_revoke.iter().map(|(_, sync, _)| sync));
+        after_unlock_before_phase_b();
+
+        // Phase B (unlocked): drain each already-announced target. Announcing
+        // already happened above, for EVERY collected target, before this
+        // lock released — so there is no window, at any granularity, where
+        // an external caller could observe the new revision as truth while
+        // any of these gates was still admitting new forwarding. All without
+        // holding `self.inner`'s lock here, so unrelated registry operations
+        // are never blocked by a slow forward (round 4).
+        drain_batch(to_revoke.iter().map(|(_, sync, _)| sync));
 
         // Phase C: bookkeeping only. By this point every revoked session's
         // `room` already reads false — Phase B already closed authorization
@@ -1562,9 +1620,25 @@ impl<H: RevocableMeshSession> MeshSessionRegistry<H> {
 /// drain elsewhere in the batch; every target has stopped admitting new
 /// readers before the second loop starts draining any of them.
 fn revoke_batch<'a>(targets: impl Iterator<Item = &'a Arc<SessionSync>> + Clone) {
-    for sync in targets.clone() {
+    announce_batch(targets.clone());
+    drain_batch(targets);
+}
+
+/// Phase 1 of [`revoke_batch`], split out (round D-1 successor, @kiana
+/// recheck) so a caller that itself already holds a coarser lock guarding
+/// the decision being published can announce BEFORE releasing that lock —
+/// see `observe_new_checkpoint`'s Advance branch, and that method's own
+/// comment for exactly why lock-release-before-announce is its own,
+/// narrower race than the one `revoke_batch` alone closes.
+fn announce_batch<'a>(targets: impl Iterator<Item = &'a Arc<SessionSync>>) {
+    for sync in targets {
         sync.announce_revoke();
     }
+}
+
+/// Phase 2 of [`revoke_batch`] — MUST be preceded by exactly one
+/// [`announce_batch`] over the SAME targets.
+fn drain_batch<'a>(targets: impl Iterator<Item = &'a Arc<SessionSync>>) {
     for sync in targets {
         sync.drain_after_announce();
     }
@@ -3478,6 +3552,68 @@ mod tests {
         assert!(!gate_b.is_authorized());
         assert!(session_a.closed.load(Ordering::SeqCst));
         assert!(session_b.closed.load(Ordering::SeqCst));
+    }
+
+    /// Recheck (@kiana), on top of P0-1's own fix above: `announce_revoke`
+    /// for a revoked-by-Advance session must happen BEFORE
+    /// `last_known_revision` becomes externally observable (before
+    /// `self.inner`'s lock releases) — not merely before Phase B drains a
+    /// DIFFERENT target, which is all the previous test proves. Otherwise a
+    /// concurrent `preauthorize` for an unrelated machine could already act
+    /// on the new revision while the just-revoked session's gate is still
+    /// fully authorized, not even announced — breaking the
+    /// linearization-point contract this registry documents itself as
+    /// providing (module doc comment, CFX-5).
+    ///
+    /// Uses the `#[cfg(test)]`-only hook rather than a timing race: with
+    /// the fix, `announce_batch` runs strictly before the SAME lock
+    /// `preauthorize` (for the new machine) must acquire to succeed, so the
+    /// hook -- which runs strictly AFTER that lock releases -- is
+    /// GUARANTEED by `Mutex`'s release/acquire semantics to observe
+    /// `writer_intent` already incremented, deterministically, not merely
+    /// probably. Both checks happen synchronously on one thread from
+    /// inside the hook, so this is a structural proof, not a race.
+    #[test]
+    fn advance_revocation_announces_before_the_new_revision_is_externally_observable() {
+        let m_id_a = test_m_id(76);
+        let m_id_new = test_m_id(77);
+        let snapshot = snapshot_at(1, [1u8; 32], &[(m_id_a.clone(), FP_A)], &[]);
+        let registry = MeshSessionRegistry::<RecordingSession>::new(&snapshot);
+        let binding_a = sealed_binding(&snapshot, &m_id_a);
+        let session_a = Arc::new(RecordingSession::default());
+        let (_id_a, gate_a) = registry
+            .register(&binding_a, Arc::downgrade(&session_a))
+            .unwrap();
+        assert!(gate_a.is_authorized());
+
+        // A is revoked, and a brand-new machine becomes active, in the
+        // SAME Advance.
+        let snapshot2 = snapshot_at(2, [2u8; 32], &[(m_id_new.clone(), FP_A)], &[m_id_a.clone()]);
+        let binding_new = sealed_binding(&snapshot2, &m_id_new);
+        let session_new = Arc::new(RecordingSession::default());
+
+        let outcome = registry.observe_new_checkpoint_with_hook_for_test(&snapshot2, || {
+            // Runs strictly after Phase A's lock released
+            // (last_known_revision is already snapshot2) and strictly
+            // before Phase B starts draining.
+            let admission = registry
+                .preauthorize(&binding_new, Arc::downgrade(&session_new))
+                .expect("the new revision must already be authoritative here");
+            // A must already be refusing new forwarding at this EXACT
+            // instant -- not "will be revoked soon", not "refused once
+            // Phase B gets around to it".
+            assert!(
+                gate_a.sync.writer_intent.load(Ordering::SeqCst) > 0,
+                "A's revoke must be announced before the lock publishing the new \
+                 revision is released, not only before Phase B drains a sibling target"
+            );
+            assert!(gate_a.try_authorize_forwarding().is_none());
+            drop(admission); // aborts cleanly; not what this test is about
+        });
+
+        assert_eq!(outcome, ObserveOutcome::Applied);
+        assert!(!gate_a.is_authorized());
+        assert!(session_a.closed.load(Ordering::SeqCst));
     }
 
     /// P0-2 — RED, now fixed: pruning a dead `Weak` bookkeeping entry (the
