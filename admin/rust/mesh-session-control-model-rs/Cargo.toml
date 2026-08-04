@@ -1,0 +1,24 @@
+[workspace]
+# Own workspace root — deliberately breaks out of admin/rust's [workspace].
+# This crate is standalone: it is never added to admin/rust/Cargo.toml's
+# `members`, never touches admin/rust/Cargo.lock, and has its own Cargo.lock.
+members = ["."]
+resolver = "2"
+
+[package]
+name = "mesh-session-control-model-rs"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+publish = false
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+ciborium = "0.2"
+sha2 = "0.10"
+thiserror = "2"
+rand = "0.8"
+hex = "0.4"
+
+[dev-dependencies]
+tempfile = "3"
