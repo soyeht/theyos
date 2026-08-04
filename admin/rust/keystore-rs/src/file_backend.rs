@@ -1160,30 +1160,45 @@ fn attempt_install(
                 ));
                 let outcome = match publish {
                     Ok(()) => {
-                        // `linkat` resolves its SOURCE by name within the
-                        // directory, so the bytes actually published are
-                        // whatever that name pointed at at link time — not
-                        // necessarily the bytes we wrote and synced. (A
-                        // link-from-fd primitive would avoid the question
-                        // entirely, but `AT_EMPTY_PATH` is Linux-only and
-                        // macOS has no equivalent, so it is not portable
-                        // here.) Instead, prove it after the fact: a hard
-                        // link shares its inode, so the published entry MUST
-                        // have the same dev+ino as the file we wrote. If it
-                        // does not, the scratch name was substituted between
-                        // write and publish and this call must not claim to
-                        // have installed its own bytes.
-                        match dir.stat_at_nofollow(OsStr::new(final_name)) {
-                            Ok(Some(published)) if same_inode(&written_meta, &published) => {
-                                match dir.fsync() {
-                                    Ok(()) => InstallOutcome::Durable,
-                                    Err(e) => InstallOutcome::Ambiguous(e),
-                                }
+                        // Both supported publishes take their SOURCE from the
+                        // retained descriptor, so a substituted scratch NAME
+                        // can no longer change what gets published. The
+                        // window is prevented, not detected afterwards.
+                        //
+                        // The post-publish identity proof must therefore
+                        // match the mechanism, and the two differ:
+                        //
+                        // - Linux links from the fd, so the published entry
+                        //   is the SAME inode we wrote; dev+ino equality is
+                        //   the right invariant and is still checked.
+                        // - macOS CLONES from the fd. A clone is not a hard
+                        //   link: it is a new inode with identical content by
+                        //   construction. Asserting dev+ino equality there
+                        //   would fail on every correct publish — it did,
+                        //   until this was split — because it would be
+                        //   testing an invariant the mechanism never had.
+                        //
+                        // Keeping one shared check would have meant either a
+                        // false substitution report on macOS or dropping a
+                        // real guarantee on Linux.
+                        let identity_ok = if cfg!(target_os = "macos") {
+                            true
+                        } else {
+                            matches!(
+                                dir.stat_at_nofollow(OsStr::new(final_name)),
+                                Ok(Some(ref published)) if same_inode(&written_meta, published)
+                            )
+                        };
+                        if identity_ok {
+                            match dir.fsync() {
+                                Ok(()) => InstallOutcome::Durable,
+                                Err(e) => InstallOutcome::Ambiguous(e),
                             }
-                            _ => InstallOutcome::Ambiguous(std::io::Error::other(
+                        } else {
+                            InstallOutcome::Ambiguous(std::io::Error::other(
                                 "published entry is not the inode this call wrote — the scratch \
                                  name was substituted between write and publish",
-                            )),
+                            ))
                         }
                     }
                     Err(e) if e.kind() == ErrorKind::AlreadyExists => {
@@ -1487,13 +1502,23 @@ impl DirHandle {
             return Err(e);
         }
         let c = cstr(name)?;
+        // O_RDWR, not O_WRONLY: the publish step CLONES from this descriptor
+        // (macOS `fclonefileat`), which has to read it. A write-only scratch
+        // fd fails there — and it failed silently in a way that looked like
+        // a durability fault rather than a permissions one, because the
+        // failed publish is classified as "no effect".
+        //
+        // This is also why the earlier standalone probe was not a faithful
+        // control: it cloned from a fd opened read-only, so it measured a
+        // mode this call site never uses. A control has to carry the same
+        // flags as the real path or it answers a different question.
         // SAFETY: valid dir fd + valid C string; O_CREAT is paired with the
         // mode argument as required.
         let fd = unsafe {
             libc::openat(
                 self.fd.as_raw_fd(),
                 c.as_ptr(),
-                libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                libc::O_RDWR | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
                 libc::c_uint::from(mode),
             )
         };
@@ -1529,12 +1554,17 @@ impl DirHandle {
     /// directly but requires `CAP_DAC_READ_SEARCH`, which a service user
     /// does not have; the `/proc` form is the unprivileged equivalent.)
     ///
-    /// Other unix targets have no equivalent, so they link by name and rely
-    /// on the post-publish dev+ino check. That is a genuinely weaker
-    /// mechanism — detect-after rather than prevent — and is not claimed to
-    /// be equivalent. It is sound only because the caller holds the scratch
-    /// descriptor open across the whole sequence, which keeps the inode from
-    /// being freed and its number recycled.
+    /// On macOS the equivalent is `fclonefileat`, which clones from the open
+    /// descriptor and refuses an existing destination with `EEXIST` — so it
+    /// supplies BOTH halves this protocol needs (exact-inode source and
+    /// create-only semantics) in one call. Both were measured on this
+    /// hardware before being relied on, rather than taken from the man page.
+    ///
+    /// Every other target FAILS CLOSED with `Unsupported`. There is
+    /// deliberately no name-based fallback: publishing by name can only
+    /// DETECT a substituted source afterwards, never prevent it, and
+    /// silently degrading to it would leave callers believing they had the
+    /// stronger guarantee the two supported platforms actually provide.
     #[cfg(target_os = "linux")]
     fn publish_from_fd(&self, scratch: &File, _from: &OsStr, to: &OsStr) -> std::io::Result<()> {
         let proc_path = CString::new(format!("/proc/self/fd/{}", scratch.as_raw_fd()))
@@ -1559,35 +1589,43 @@ impl DirHandle {
         Ok(())
     }
 
-    #[cfg(not(target_os = "linux"))]
-    fn publish_from_fd(&self, _scratch: &File, from: &OsStr, to: &OsStr) -> std::io::Result<()> {
-        self.linkat_within(from, to)
-    }
-
-    /// `linkat(dirfd, from, dirfd, to, 0)` — publish within this directory.
-    /// Fails with `EEXIST` rather than replacing an existing destination,
-    /// which is the whole basis of the create-only guarantee.
-    /// Only reachable on targets without a link-from-fd primitive; Linux
-    /// publishes through `/proc/self/fd` instead and never calls this.
-    #[cfg(not(target_os = "linux"))]
-    fn linkat_within(&self, from: &OsStr, to: &OsStr) -> std::io::Result<()> {
-        let from_c = cstr(from)?;
+    #[cfg(target_os = "macos")]
+    fn publish_from_fd(&self, scratch: &File, _from: &OsStr, to: &OsStr) -> std::io::Result<()> {
         let to_c = cstr(to)?;
-        // SAFETY: valid dir fd used for both ends + two valid C strings.
+        // SAFETY: `scratch` is an open regular-file descriptor owned by the
+        // caller for the whole call; `self.fd` is an open directory fd;
+        // `to_c` is a valid NUL-terminated name within it. Flags 0 is the
+        // documented default clone behaviour.
         let r = unsafe {
-            libc::linkat(
-                self.fd.as_raw_fd(),
-                from_c.as_ptr(),
-                self.fd.as_raw_fd(),
-                to_c.as_ptr(),
-                0,
-            )
+            libc::fclonefileat(scratch.as_raw_fd(), self.fd.as_raw_fd(), to_c.as_ptr(), 0)
         };
         if r < 0 {
+            // EEXIST here is create-only refusal, not an I/O fault; the
+            // caller maps it to a conflict exactly as it maps `linkat`'s.
             return Err(std::io::Error::last_os_error());
         }
         Ok(())
     }
+
+    /// Fail closed on every target without a measured exact-publish
+    /// primitive. Returning `Unsupported` rather than degrading to a
+    /// name-based link is the point: a weaker mechanism that still reports
+    /// success would hand callers a guarantee this crate cannot keep.
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    fn publish_from_fd(&self, _scratch: &File, _from: &OsStr, _to: &OsStr) -> std::io::Result<()> {
+        Err(std::io::Error::new(
+            ErrorKind::Unsupported,
+            "create_only requires an exact-publish primitive (Linux O_TMPFILE/linkat-from-fd \
+             or macOS fclonefileat); this target has neither",
+        ))
+    }
+
+    // The name-based `linkat(dirfd, from, dirfd, to, 0)` publish that used
+    // to live here is DELETED, not merely unused. It resolved its source by
+    // NAME, so it could only detect a substituted scratch file after the
+    // fact; both supported targets now publish from the exact descriptor and
+    // every other target fails closed. Leaving a weaker publish reachable is
+    // how a future edit silently reintroduces the window.
 
     fn unlinkat(&self, name: &OsStr) -> std::io::Result<()> {
         let c = cstr(name)?;
@@ -1980,21 +2018,39 @@ mod failpoints {
 
     thread_local! {
         static SUBSTITUTE_SCRATCH: Cell<bool> = const { Cell::new(false) };
+        static SUBSTITUTE_FIRED: Cell<bool> = const { Cell::new(false) };
     }
 
-    /// While armed, the scratch file is replaced by a DIFFERENT inode with
-    /// different content between its write+fsync and the publishing
-    /// `linkat` — the source-substitution window that exists because
-    /// `linkat` resolves its source by name. The post-publish inode proof is
-    /// what must catch this.
+    /// While armed, the scratch NAME is unlinked and re-created as a
+    /// DIFFERENT inode with different content, between the scratch file's
+    /// write+fsync and its publication.
+    ///
+    /// Both supported publishes now take their source from the retained
+    /// descriptor rather than from this name, so the point of the hook has
+    /// changed: it no longer probes a window the post-publish inode proof
+    /// has to *catch*, it proves the window is not there to be exploited.
     pub(crate) fn arm_substitute_scratch() {
         SUBSTITUTE_SCRATCH.with(|c| c.set(true));
+        SUBSTITUTE_FIRED.with(|c| c.set(false));
     }
     pub(crate) fn disarm_substitute_scratch() {
         SUBSTITUTE_SCRATCH.with(|c| c.set(false));
     }
     pub(crate) fn peek_substitute_scratch() -> bool {
         SUBSTITUTE_SCRATCH.with(Cell::get)
+    }
+    /// Set by the hook only once the foreign inode is actually in place.
+    ///
+    /// Without this the test would be vacuous on any platform whose expected
+    /// outcome is a SUCCESS: "published our own bytes" is equally what you
+    /// observe when the substitution silently never happened. The hook used
+    /// to discard both of its syscall results with `let _`, so that was a
+    /// real possibility rather than a theoretical one.
+    pub(crate) fn note_substitute_fired() {
+        SUBSTITUTE_FIRED.with(|c| c.set(true));
+    }
+    pub(crate) fn peek_substitute_fired() -> bool {
+        SUBSTITUTE_FIRED.with(Cell::get)
     }
 }
 
@@ -2072,10 +2128,19 @@ fn substitute_scratch_hook(dir: &DirHandle, tmp_name: &str) {
     }
     // Replace the scratch entry with a different inode holding different
     // bytes, exactly as an attacker (or a racing sweep plus a re-creation)
-    // could between our write+fsync and our linkat.
+    // could between our write+fsync and our publish.
+    //
+    // Both results are checked, not discarded: the fired flag is what makes
+    // the calling test non-vacuous, so it must mean "the foreign inode is
+    // really in place", never "we attempted it".
     let n = OsStr::new(tmp_name);
-    let _ = dir.unlinkat(n);
-    let _ = dir.create_new_file(n, 0o600, b"substituted-by-someone-else");
+    if dir.unlinkat(n).is_ok()
+        && dir
+            .create_new_file(n, 0o600, b"substituted-by-someone-else")
+            .is_ok()
+    {
+        failpoints::note_substitute_fired();
+    }
 }
 
 #[cfg(all(not(test), unix))]
@@ -2820,30 +2885,41 @@ mod tests {
         let outcome = ks.create_only(&account, b"our-own-value").unwrap();
         failpoints::disarm_substitute_scratch();
 
-        // The invariant that must hold on EVERY platform: a substituted
-        // scratch file must never be reported as this call installing its
-        // own bytes.
-        assert_ne!(
-            outcome,
-            CreateOutcome::CreatedDurable,
-            "publishing a substituted inode must never be reported as installing our bytes"
+        // Non-vacuity FIRST, because on macOS the expected outcome below is a
+        // success — and "published our own bytes" is exactly what a run where
+        // the substitution never happened would also produce. Without this
+        // the assertions would hold for the wrong reason.
+        assert!(
+            failpoints::peek_substitute_fired(),
+            "the substitution hook never placed its foreign inode, so this test \
+             proves nothing about surviving a substitution"
         );
 
-        // Beyond that the two platforms differ, because the mechanisms
-        // genuinely differ and pretending otherwise would hide which one is
-        // actually in force:
+        // THE invariant, on every platform: the substituted bytes must never
+        // become the stored value, and the caller must never be told its own
+        // bytes were installed when they were not. Both publishes now take
+        // their source from the retained descriptor, so this is PREVENTION —
+        // the attacker's content simply cannot reach the entry.
+        assert_ne!(
+            ks.get(&account).ok().as_deref(),
+            Some(b"substituted-by-someone-else".as_slice()),
+            "the substituted content must never become the stored value"
+        );
+
+        // The two mechanisms then differ in HOW they prevent it, and the
+        // outcomes differ accordingly. Asserting one shared outcome would
+        // mean asserting something false on one of the platforms.
         //
-        // Linux PREVENTS the substitution: publication links the exact open
-        // descriptor, and once the hook unlinks the scratch name that inode
-        // has no remaining links, so `linkat` refuses outright. Nothing is
-        // installed, which reinspection then confirms as KnownNoEffect.
+        // Linux links the exact inode from the fd. The hook unlinked the
+        // scratch name, so that inode has no remaining links and `linkat`
+        // refuses outright — nothing is installed at all.
         //
-        // Elsewhere publication is by NAME, so the substituted inode really
-        // is what gets linked. That is only DETECTED afterwards — the
-        // post-publish dev+ino comparison sees a different inode than the
-        // one written, and reinspection reports the foreign content as a
-        // Conflict. Weaker, and labelled as such rather than presented as
-        // equivalent.
+        // macOS CLONES from the fd, which does not depend on the name still
+        // existing. Our own bytes are published successfully, so
+        // CreatedDurable is the TRUTHFUL outcome here: the substitution
+        // never touched what we wrote. (This assertion previously demanded
+        // "never CreatedDurable", which was correct only for the older
+        // name-based publish that could actually be tricked.)
         #[cfg(target_os = "linux")]
         {
             assert_eq!(
@@ -2856,10 +2932,18 @@ mod tests {
                 Err(KeystoreError::NotFound { .. })
             ));
         }
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(target_os = "macos")]
         {
-            assert_eq!(outcome, CreateOutcome::Conflict);
-            assert_ne!(ks.get(&account).unwrap(), b"our-own-value");
+            assert_eq!(
+                outcome,
+                CreateOutcome::CreatedDurable,
+                "cloning from the held fd is immune to the scratch name being replaced"
+            );
+            assert_eq!(
+                ks.get(&account).unwrap(),
+                b"our-own-value",
+                "the entry must hold exactly the bytes this call wrote"
+            );
         }
     }
 
