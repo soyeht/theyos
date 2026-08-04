@@ -3806,4 +3806,416 @@ mod tests {
         assert!(matches!(err, RekeyError::WrongGeneration { .. }));
         assert_eq!(initiator.rekey.rx().generation(), before);
     }
+
+    /// A D1 double that records whether `cancel_before_ack` ran and always
+    /// reports a specific, injected [`crate::intent::D1CancelOutcome`] —
+    /// used by the two integration REDs below to prove the outcome is
+    /// actually threaded into the propagated error, not merely that SOME
+    /// error came back (2026-08-04, @kiana, runtime-facade audit
+    /// `3cbbfb37…` item 7c).
+    struct RecordingD1 {
+        cancel_called: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        outcome: crate::intent::D1CancelOutcome,
+    }
+    struct RecordingPending {
+        cancel_called: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        outcome: crate::intent::D1CancelOutcome,
+    }
+    impl crate::intent::D1Pending<()> for RecordingPending {
+        fn commit_after_ack(self) {}
+        fn cancel_before_ack(self) -> crate::intent::D1CancelOutcome {
+            self.cancel_called
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            self.outcome
+        }
+    }
+    impl crate::intent::D1Admission for RecordingD1 {
+        type Pending<'a> = RecordingPending;
+        type Active<'a> = ();
+        fn reserve_pending<'a>(
+            &'a self,
+            _key: &crate::intent::D1MembershipKey,
+            _deadline: &CeremonyDeadline,
+        ) -> Result<Self::Pending<'a>, crate::error::IntentError> {
+            Ok(RecordingPending {
+                cancel_called: std::sync::Arc::clone(&self.cancel_called),
+                outcome: self.outcome,
+            })
+        }
+    }
+
+    /// Wraps a real `TcpStream`, letting the first `fail_from - 1` top-level
+    /// `.write()` calls through untouched and failing every call from
+    /// `fail_from` on. Small buffers over a healthy loopback socket
+    /// complete in exactly one `.write()` syscall per
+    /// `write_all_with_deadline` frame (the same assumption this crate's
+    /// own wire-level tests already rely on), so `fail_from` reliably
+    /// targets one specific top-level frame — here, the responder's third
+    /// and final write, `ActivateAck`.
+    struct FailWriteFromCall {
+        inner: TcpStream,
+        calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        fail_from: usize,
+    }
+    impl Read for FailWriteFromCall {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            self.inner.read(buf)
+        }
+    }
+    impl Write for FailWriteFromCall {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            let call_number = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+            if call_number >= self.fail_from {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "test-injected write failure",
+                ));
+            }
+            self.inner.write(buf)
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            self.inner.flush()
+        }
+    }
+    impl wire::DeadlineBoundedIo for FailWriteFromCall {
+        fn arm_io_deadline(&mut self, remaining: Duration) -> std::io::Result<()> {
+            self.inner.arm_io_deadline(remaining)
+        }
+    }
+
+    /// item 7c RED, responder side: the `ActivateAck` write itself fails
+    /// (partial/broken-pipe) — `cancel_before_ack` must run and its
+    /// specific `D1CancelOutcome` must be threaded into the propagated
+    /// error (`AckExchangeFailedWithCancelOutcome`), never discarded via
+    /// `let _ =`, and the session must never reach `Active`.
+    #[test]
+    fn red_responder_ack_write_failure_cancels_pending_and_surfaces_cancel_outcome() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let responder_key = SigningKey::random(&mut OsRng);
+        let responder_verifying = VerifyingKey::from(&responder_key);
+        let initiator_key = SigningKey::random(&mut OsRng);
+        let initiator_verifying = VerifyingKey::from(&initiator_key);
+
+        let responder_delegation = delegation_for_key(
+            &responder_verifying,
+            "hh-1",
+            "responder-1",
+            vec![0xCC; 32],
+            0,
+            u64::MAX / 2,
+        );
+        let responder_identity =
+            identity("hh-1", "responder-1", vec![0xCC; 32], responder_delegation);
+        let initiator_resolver = FixedResolver {
+            delegated_pub: initiator_verifying
+                .to_encoded_point(true)
+                .as_bytes()
+                .to_vec(),
+            generation: 1,
+            not_after: u64::MAX / 2,
+        };
+
+        let cancel_called = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let d1 = RecordingD1 {
+            cancel_called: std::sync::Arc::clone(&cancel_called),
+            outcome: crate::intent::D1CancelOutcome::BarrierReleasedBookkeepingDeferred,
+        };
+        let write_calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+        let responder = thread::spawn({
+            let checkpoint = fixed_checkpoint();
+            let k_mesh = TestKMesh(responder_key);
+            let write_calls = std::sync::Arc::clone(&write_calls);
+            move || {
+                let (sock, _) = listener.accept().unwrap();
+                let wrapped = FailWriteFromCall {
+                    inner: sock,
+                    calls: write_calls,
+                    // Each logical frame is 2 raw `.write()` calls
+                    // (length-prefix, then body — `write_length_prefixed_frame`).
+                    // Noise handshake message 2 (calls 1-2), ProofR (3-4),
+                    // FinalConfirm (5-6) succeed; ActivateAck's own
+                    // length-prefix write (7) fails first, so zero
+                    // ActivateAck bytes ever reach the peer.
+                    fail_from: 7,
+                };
+                let ingress = PrevalidatedIngress::admit_at_accept(
+                    wrapped,
+                    IngressEvidence {
+                        observed_at: 1,
+                        ingress_expiry: u64::MAX / 2,
+                    },
+                    far_future_budget(),
+                );
+                run_responder_handshake(
+                    ingress,
+                    &responder_identity,
+                    &checkpoint,
+                    ExpectedChannel::Dev,
+                    &DelegationPolicy::test(u64::MAX / 2),
+                    &AlwaysAcceptDelegation,
+                    &k_mesh,
+                    &InMemoryLedger::new(),
+                    &d1,
+                    &FixedClock(0),
+                    &initiator_resolver,
+                    u64::MAX / 2,
+                    RekeyThreshold::new(3).unwrap(),
+                )
+            }
+        });
+
+        let initiator_delegation = delegation_for_key(
+            &initiator_verifying,
+            "hh-1",
+            "initiator-1",
+            vec![0xEE; 32],
+            0,
+            u64::MAX / 2,
+        );
+        let initiator_identity =
+            identity("hh-1", "initiator-1", vec![0xEE; 32], initiator_delegation);
+        let sock = TcpStream::connect(addr).unwrap();
+        let ingress = PrevalidatedIngress::admit_at_accept(
+            sock,
+            IngressEvidence {
+                observed_at: 2,
+                ingress_expiry: u64::MAX / 2,
+            },
+            far_future_budget(),
+        );
+        let k_mesh = TestKMesh(initiator_key);
+        let pending_intent = pending_intent_for(
+            &k_mesh,
+            &initiator_identity,
+            &fixed_checkpoint(),
+            "responder-1",
+            vec![0xCC; 32],
+            [0x83; 32],
+            u64::MAX / 2,
+            ExpectedChannel::Dev,
+        );
+        // The initiator side will fail too (the Ack it's waiting for never
+        // arrives, and the responder's socket closes when its thread
+        // returns) — its own result isn't the point of this test.
+        let _initiator_result = run_initiator_handshake(
+            ingress,
+            pending_intent,
+            &initiator_identity,
+            &fixed_checkpoint(),
+            ExpectedChannel::Dev,
+            &DelegationPolicy::test(u64::MAX / 2),
+            &AlwaysAcceptDelegation,
+            &k_mesh,
+            &AlwaysAdmitD1,
+            &FixedClock(0),
+            u64::MAX / 2,
+            RekeyThreshold::new(3).unwrap(),
+        );
+
+        let responder_result = responder.join().unwrap();
+        match responder_result {
+            Err(AuthFrameError::AckExchangeFailedWithCancelOutcome { cancel_outcome, .. }) => {
+                assert_eq!(
+                    cancel_outcome,
+                    crate::intent::D1CancelOutcome::BarrierReleasedBookkeepingDeferred
+                );
+            }
+            Err(other) => panic!("expected AckExchangeFailedWithCancelOutcome, got {other:?}"),
+            Ok(_) => panic!("expected the responder to fail, but it reached Active"),
+        }
+        assert!(
+            cancel_called.load(std::sync::atomic::Ordering::SeqCst),
+            "cancel_before_ack was never called on ActivateAck write failure"
+        );
+    }
+
+    /// item 7c RED, initiator side: a COMPLETE but cryptographically
+    /// INVALID `ActivateAck` (correct shape/digest, wrong signature) —
+    /// `cancel_before_ack` must run and its outcome must be threaded into
+    /// the propagated error, and the initiator must never reach `Active`.
+    /// Hand-crafted-attacker pattern (bypasses `run_responder_handshake`,
+    /// which would never produce an invalid signature) so this is a
+    /// genuine defense-in-depth proof, not merely redundant with a
+    /// well-behaved responder.
+    #[test]
+    fn red_initiator_invalid_activate_ack_cancels_pending_and_surfaces_cancel_outcome() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let responder_key = SigningKey::random(&mut OsRng);
+        let responder_verifying = VerifyingKey::from(&responder_key);
+        let responder_delegation = delegation_for_key(
+            &responder_verifying,
+            "hh-1",
+            "responder-1",
+            vec![0xCC; 32],
+            0,
+            u64::MAX / 2,
+        );
+        let expected_fp = vec![0xCCu8; 32];
+
+        let cancel_called = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let d1 = RecordingD1 {
+            cancel_called: std::sync::Arc::clone(&cancel_called),
+            outcome: crate::intent::D1CancelOutcome::RegistryUnavailable,
+        };
+
+        // Fake responder thread: real Noise + real ProofR/FinalConfirm, but
+        // the final ActivateAck is signed with a DIFFERENT key than the
+        // one Proof-R/FinalConfirm used — a complete, well-shaped frame
+        // that fails signature verification, not a truncated one.
+        let responder_handle = thread::spawn(move || {
+            let (mut sock, _) = listener.accept().unwrap();
+            let handshake =
+                noise::run_xx_handshake(&mut sock, Role::Responder, &far_future_deadline())
+                    .unwrap();
+            let mut transport = handshake.transport;
+            let h_final = handshake.handshake_hash;
+            let k_mesh = TestKMesh(responder_key);
+            let checkpoint = fixed_checkpoint();
+
+            let proof_r = ProofR::new(
+                h_final.clone(),
+                "hh-1".to_string(),
+                "responder-1".to_string(),
+                expected_fp.clone(),
+                checkpoint.hash.clone(),
+                checkpoint.sequence,
+                checkpoint.event_head.clone(),
+                checkpoint.not_after,
+                responder_delegation.clone(),
+                vec![0u8; 64],
+            )
+            .unwrap();
+            let proof_r =
+                auth_frames::sign_frame(proof_r, &k_mesh, &far_future_deadline()).unwrap();
+            send_frame(
+                &mut sock,
+                &mut transport,
+                &AuthFrame::ProofR(proof_r),
+                &far_future_deadline(),
+            )
+            .unwrap();
+
+            let _intent =
+                recv_intent_record(&mut sock, &mut transport, &far_future_deadline()).unwrap();
+            let proof_i =
+                match recv_frame(&mut sock, &mut transport, &far_future_deadline()).unwrap() {
+                    AuthFrame::ProofI(f) => f,
+                    _ => panic!("expected ProofI"),
+                };
+
+            let final_confirm = FinalConfirm::new(
+                h_final.clone(),
+                proof_i.self_m_id().to_string(),
+                proof_i.self_cert_fingerprint().to_vec(),
+                "responder-1".to_string(),
+                vec![0u8; 64],
+            )
+            .unwrap();
+            let final_confirm =
+                auth_frames::sign_frame(final_confirm, &k_mesh, &far_future_deadline()).unwrap();
+            send_frame(
+                &mut sock,
+                &mut transport,
+                &AuthFrame::FinalConfirm(final_confirm.clone()),
+                &far_future_deadline(),
+            )
+            .unwrap();
+
+            let activate =
+                match recv_frame(&mut sock, &mut transport, &far_future_deadline()).unwrap() {
+                    AuthFrame::Activate(f) => f,
+                    _ => panic!("expected Activate"),
+                };
+            let activate_digest = auth_frames::frame_digest(&activate).unwrap();
+
+            // Complete, well-shaped ActivateAck — but signed with a
+            // DIFFERENT key than proof_r/final_confirm, so it fails
+            // signature verification despite arriving intact.
+            let wrong_k_mesh = TestKMesh(SigningKey::random(&mut OsRng));
+            let activate_ack = ActivateAck::new(
+                h_final.clone(),
+                "responder-1".to_string(),
+                activate_digest.to_vec(),
+                vec![0u8; 64],
+            )
+            .unwrap();
+            let activate_ack =
+                auth_frames::sign_frame(activate_ack, &wrong_k_mesh, &far_future_deadline())
+                    .unwrap();
+            send_frame(
+                &mut sock,
+                &mut transport,
+                &AuthFrame::ActivateAck(activate_ack),
+                &far_future_deadline(),
+            )
+            .unwrap();
+        });
+
+        let initiator_key = SigningKey::random(&mut OsRng);
+        let initiator_delegation = delegation_for_key(
+            &VerifyingKey::from(&initiator_key),
+            "hh-1",
+            "initiator-1",
+            vec![0xEE; 32],
+            0,
+            u64::MAX / 2,
+        );
+        let initiator_identity =
+            identity("hh-1", "initiator-1", vec![0xEE; 32], initiator_delegation);
+        let sock = TcpStream::connect(addr).unwrap();
+        let ingress = PrevalidatedIngress::admit_at_accept(
+            sock,
+            IngressEvidence {
+                observed_at: 2,
+                ingress_expiry: u64::MAX / 2,
+            },
+            far_future_budget(),
+        );
+        let k_mesh = TestKMesh(initiator_key);
+        let pending_intent = pending_intent_for(
+            &k_mesh,
+            &initiator_identity,
+            &fixed_checkpoint(),
+            "responder-1",
+            vec![0xCC; 32],
+            [0x87; 32],
+            u64::MAX / 2,
+            ExpectedChannel::Dev,
+        );
+        let initiator_result = run_initiator_handshake(
+            ingress,
+            pending_intent,
+            &initiator_identity,
+            &fixed_checkpoint(),
+            ExpectedChannel::Dev,
+            &DelegationPolicy::test(u64::MAX / 2),
+            &AlwaysAcceptDelegation,
+            &k_mesh,
+            &d1,
+            &FixedClock(0),
+            u64::MAX / 2,
+            RekeyThreshold::new(3).unwrap(),
+        );
+        responder_handle.join().unwrap();
+
+        match initiator_result {
+            Err(AuthFrameError::AckExchangeFailedWithCancelOutcome { cancel_outcome, .. }) => {
+                assert_eq!(
+                    cancel_outcome,
+                    crate::intent::D1CancelOutcome::RegistryUnavailable
+                );
+            }
+            Err(other) => panic!("expected AckExchangeFailedWithCancelOutcome, got {other:?}"),
+            Ok(_) => panic!("expected the initiator to fail, but it reached Active"),
+        }
+        assert!(
+            cancel_called.load(std::sync::atomic::Ordering::SeqCst),
+            "cancel_before_ack was never called on an invalid ActivateAck"
+        );
+    }
 }
