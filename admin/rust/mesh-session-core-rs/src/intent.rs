@@ -804,6 +804,17 @@ impl IntentNonceLedger for NoIntentLedgerConfigured {
 /// as the nonce ledger and D1 admission.
 /// `pub` (2026-08-04, @kiana, WIP audit, seam-visibility correction) —
 /// see [`NonceConsumeOutcome`]'s doc.
+///
+/// **Contractually non-blocking (2026-08-04, @kiana, runtime-facade audit
+/// `3cbbfb37…` P1-1):** called mid-ceremony, after the official
+/// `CeremonyDeadline` has already been checked for that step but before
+/// it is checked again — a `now()` that blocks indefinitely (e.g. on a
+/// slow NTP round trip) would never reach a subsequent deadline check at
+/// all. A real implementation must read a local, already-synchronized
+/// clock and return in bounded, effectively-constant time; `Err` (never a
+/// block) is the correct response to "no reliable time source right
+/// now" (mirroring `require_reliable_time_floor`-style designs
+/// elsewhere in this system).
 pub trait Clock {
     fn now(&self) -> Result<u64, IntentError>;
 }
@@ -817,86 +828,182 @@ impl Clock for NoClockConfigured {
     }
 }
 
-/// Two-stage D1 admission hook (2026-08-04, @kiana, D1 seam erratum +
-/// erratum1 E4): registering a session and opening forwarding must never
-/// be tied to `ActivateAck`'s write succeeding in one step — a
-/// concurrent revoke landing between "Ack write succeeded" and "session
-/// marked Active" must still be able to close the session before
-/// forwarding ever opens. This crate models the SEAM only; no real D1
-/// persistence, locking, or revision tracking lives here.
+/// Outcome of [`D1Pending::cancel_before_ack`] (2026-08-04, @kiana,
+/// runtime-facade audit `3cbbfb37…`, items 1+3 — replaces the earlier
+/// `Result<(), IntentError>` `cancel_pending` signature). Authority is
+/// closed in **every** variant before any of them is even computed — a
+/// real implementation's token closes its own phase (an atomic CAS) as
+/// the unconditional first step of cancellation, never gated on whether
+/// the registry lock can be acquired. These variants describe only what
+/// happened to the *bookkeeping entry*, never whether the session can
+/// still forward (it structurally cannot, in every variant).
 ///
-/// Ordering enforced by `run_responder_handshake`, not by this trait's
-/// signature alone (erratum1 E4):
+/// Verified directly against the real household-rs D1 registry
+/// (`mesh_session_registry.rs`, worktree `goal/d1-pending-admission-v1`
+/// @ `d721f889`, `PendingCancelOutcome`): its three variants
+/// (`ClosedAndRemoved`/`ClosedCleanupDeferred`/`RegistryUnavailable`) map
+/// 1:1 to the three here — this crate's names are chosen to read
+/// correctly for any adapter, not just that one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum D1CancelOutcome {
+    /// Authority closed, and the tracking entry was removed.
+    CancelledAndRemoved,
+    /// Authority closed, but the registry's bookkeeping was busy (e.g. a
+    /// non-blocking lock attempt lost) — NOT an error and NOT an
+    /// authority gap: the session cannot forward, and a later registry
+    /// operation (or an explicit reconcile sweep) removes the stale
+    /// entry. The barrier this permit held is still released.
+    BarrierReleasedBookkeepingDeferred,
+    /// Authority closed, but the registry itself is unavailable
+    /// (`Unavailable`/poisoned), so no per-session bookkeeping could run
+    /// at all.
+    RegistryUnavailable,
+}
+
+/// The terminal operations on a reserved-but-not-yet-decided D1 admission
+/// permit (2026-08-04, @kiana, runtime-facade audit `3cbbfb37…`, items
+/// 1+2+3 — replaces the earlier `D1Admission::activate_if_authorized`/
+/// `cancel_pending` methods). Generic over `Active`, the type this
+/// specific `Self` commits into — see [`D1Admission::Pending`]'s doc for
+/// why this is a type *parameter* here rather than an associated type of
+/// this trait: it lets [`D1Admission`] force, at the trait-bound level,
+/// that whatever `Active<'a>` a `Pending<'a>` commits into is the SAME
+/// `'a` the permit itself borrowed, for every lifetime at once — not a
+/// convention an adapter author could get wrong.
+///
+/// **`commit_after_ack` is infallible and takes no deadline — on
+/// purpose, definitively (2026-08-04, @kiana, runtime-facade audit
+/// `3cbbfb37…` P0-1/P0-4, P0-2's closure criterion 2):** the earlier
+/// `activate_if_authorized(self, deadline) -> Result<ActiveGate,
+/// IntentError>` shape allowed a real implementation to refuse — with a
+/// real roster/revision/membership recheck, and a real deadline check —
+/// AFTER the peer already held a complete, valid `ActivateAck`. That is
+/// exactly the split-brain the audit's P0-1 finding proved: the peer
+/// believes the session is Active (it received a fully-written,
+/// fully-valid Ack), while a local refusal at that point would leave
+/// this side denying it. Verified directly against the real registry
+/// (`PendingSessionAdmission::commit_after_ack`, same file/commit as
+/// above): it takes `self` by value, returns `ActiveSessionRegistration`
+/// directly (no `Result`, no deadline parameter), does no roster
+/// recheck, takes no lock, and is NOT vetoed by an already-announced
+/// revoke — its own doc explains why that is safe: an announced revoke
+/// has already raised a lock-free counter that this crate's own
+/// `try_authorize_forwarding`-equivalent rejects on *before* it ever
+/// looks at Active/Closed, so the interval between commit and a
+/// revoker's subsequent close admits no forwarding regardless of commit
+/// having "succeeded" past the revoke's announcement. Call this as the
+/// very next statement after the write that completed the Ack — see the
+/// dedicated terminal-Ack helper this crate's own handshake functions
+/// use, not the general frame-send functions.
+///
+/// **`cancel_before_ack` returns [`D1CancelOutcome`] directly, not
+/// `Result<D1CancelOutcome, IntentError>`:** there is no distinct
+/// "the call itself failed" case to report — every real outcome
+/// (including "the registry was unreachable") is itself one of
+/// [`D1CancelOutcome`]'s variants, matching the real
+/// `cancel_before_ack(self) -> PendingCancelOutcome` signature exactly.
+///
+/// **`Self` must itself be Drop-idempotent-safe, lock-free, and
+/// callback-free (2026-08-04, @kiana, runtime-facade audit `3cbbfb37…`
+/// P0-3, required):** because both terminal methods take `self` by
+/// value, a permit that is simply dropped without calling either — a
+/// panic unwind, an early return via `?` before either is reached —
+/// still needs a defined, safe outcome. This crate cannot express a
+/// "must impl `Drop`, and that `Drop` must be lock-free" bound on a GAT
+/// (Rust has no such bound), so it is a documented requirement on every
+/// real `Pending<'a>`: dropping one that never reached either terminal
+/// method MUST close authority idempotently, and — verified against the
+/// real `PendingSessionAdmission`'s own `Drop` — that closure must be
+/// EXACTLY "one atomic CAS plus a wake, nothing else": no mutex
+/// acquisition, no wait, no `Weak`/handle upgrade, no call into any
+/// caller-supplied callback, no allocation. Everything that could block
+/// or re-enter is therefore structurally absent, which is what lets it
+/// run safely from a panic unwind and while other locks this same
+/// registry owns are held by other threads. See
+/// `red_pending_drop_never_blocks_even_while_a_shared_mutex_the_double_also_holds_is_locked_elsewhere`
+/// below for a non-vacuous RED against a borrowed double proving exactly
+/// this — not merely documented, actually measured.
+pub trait D1Pending<Active> {
+    fn commit_after_ack(self) -> Active;
+    #[must_use]
+    fn cancel_before_ack(self) -> D1CancelOutcome;
+}
+
+/// Two-stage D1 admission hook (2026-08-04, @kiana, D1 seam erratum +
+/// erratum1 E4 + runtime-facade audit `3cbbfb37…` items 1+2+3): registering
+/// a session and opening forwarding must never be tied to `ActivateAck`'s
+/// write succeeding in one step — a concurrent revoke landing between "Ack
+/// write succeeded" and "session marked Active" must still be able to
+/// close the session before forwarding ever opens. This crate models the
+/// SEAM only; no real D1 persistence, locking, or revision tracking lives
+/// here.
+///
+/// **`Pending<'a>` is a GAT, not a plain associated type (2026-08-04,
+/// @kiana, runtime-facade audit `3cbbfb37…` P0-2, definitive):** the real
+/// token this seam must be implementable against,
+/// `PendingSessionAdmission<'registry, H>` (household-rs
+/// `mesh_session_registry.rs`, worktree `goal/d1-pending-admission-v1` @
+/// `d721f889`), *borrows* `&'registry MeshSessionRegistry<H>` — there is
+/// no single lifetime a non-generic `type Pending;` could name that fits
+/// every call. `Active<'a>` is a GAT for the identical reason: the real
+/// terminal type, `ActiveSessionRegistration<'registry, H>`, borrows the
+/// SAME `'registry`. Both live directly on this trait — not `Active` as a
+/// plain associated type of [`D1Pending`] — specifically so the bound
+/// below can force them to share one lifetime:
+///
+/// ```text
+/// type Pending<'a>: D1Pending<Self::Active<'a>> where Self: 'a;
+/// type Active<'a> where Self: 'a;
+/// ```
+///
+/// A real implementor's `Pending<'a>` MUST commit into that same-`'a`
+/// `Active<'a>` — not some unrelated or `'static` type — because the
+/// trait bound states it structurally, at the type-system level, not as
+/// documentation an adapter author could satisfy incorrectly. This is
+/// what lets `run_responder_handshake`/`run_initiator_handshake` carry
+/// `D1::Active<'d1>` all the way into `ActiveMeshSession` without ever
+/// needing to erase or re-box the borrow.
+///
+/// Ordering enforced by `run_responder_handshake`/`run_initiator_handshake`,
+/// not by this trait's signature alone (erratum1 E4):
 ///
 /// - Step 1, [`Self::reserve_pending`]: a real implementation does the
-///   exact final D1 revision/snapshot recheck here and inserts the
+///   exact final D1 revision/membership recheck here and inserts the
 ///   session as `Pending` (forwarding gate CLOSED), returning an opaque,
-///   `!Clone` permit conceptually bound to `(session_id, peer_m_id,
-///   exact_revision)` — this crate only sees `Self::Pending`, an
-///   associated type, and never inspects its contents. Called BEFORE the
-///   `ActivateAck` write; a real implementation must not hold any
+///   `!Clone` permit borrowed for `'a` — this crate only sees
+///   `Self::Pending<'a>` and never inspects its contents. Called BEFORE
+///   the `ActivateAck` write; a real implementation must not hold any
 ///   registry mutex across that write, but a concurrent revoke must not
 ///   be able to *complete* while the permit is alive either (an
 ///   admission barrier, not a lock held across I/O).
-/// - Step 2: `ActivateAck` `write_all`, executed exactly once.
-/// - Step 3, write succeeds: [`Self::activate_if_authorized`] runs
-///   IMMEDIATELY, with no other fallible or external operation between
-///   the write's success and this call (`run_responder_handshake`
-///   enforces this by construction, not this trait) — atomic; either
-///   opens Active/forwarding under the registry's synchronized state, or
-///   a concurrent revoke observed in the meantime closes it instead.
-///   Either outcome is terminal and consumes the permit. Releasing the
-///   barrier here lets any revoke that was waiting on it proceed
-///   immediately afterward.
-/// - Step 3, write fails/times out: [`Self::cancel_pending`] aborts and
-///   removes the Pending entry, keeps the gate closed, and releases the
-///   barrier — nothing ever becomes Active for this attempt.
+/// - Step 2: `ActivateAck` `write_all`, executed exactly once, via this
+///   crate's dedicated terminal-Ack helper.
+/// - Step 2 succeeds: [`D1Pending::commit_after_ack`] runs IMMEDIATELY,
+///   infallibly, with no other fallible or external operation between the
+///   write's success and this call — see that method's own doc for why
+///   it is infallible and unvetoed by an already-announced revoke.
+/// - Step 2 fails/times out (partial write, or the read side never
+///   observes a complete valid Ack): [`D1Pending::cancel_before_ack`]
+///   aborts and removes the Pending entry, keeps the gate closed, and
+///   releases the barrier — nothing ever becomes Active for this
+///   attempt. The returned [`D1CancelOutcome`] is folded into the
+///   propagated error, never discarded (`3cbbfb37…` P0-3).
 ///
 /// No DATA is ever delivered against a `Pending` gate, and no session
 /// exists without being tracked under one of these two terminal outcomes
 /// — there is no third path.
 ///
-/// **`ActiveGate`, embedded not tupled (2026-08-04, @kiana, definitive —
-/// supersedes the earlier tuple-return formulation):** `activate_if_authorized`
-/// returning bare `()` left nothing for the caller to retain — once
-/// `run_responder_handshake` returned, there was no live handle a later
-/// revoke could act on and nothing an eventual DATA path could check.
-/// `activate_if_authorized` returns an opaque `Self::ActiveGate`, which
-/// the handshake function moves *immediately* into a private field of the
-/// `ActiveMeshSession` it constructs — never returned as a second tuple
-/// element, never exposed via any accessor, so a session can never be
-/// separated from its gate while still claiming to be usable. This crate
-/// makes NO claim about what embedding/dropping `Self::ActiveGate` does
-/// (2026-08-04, @kiana, WIP audit, correction of an earlier, wrong claim
-/// here that dropping it "runs G's own Drop... unregister/revoke
-/// semantics"): verified against the real household-rs `SessionGate`
-/// type and found false — `SessionGate` is `#[derive(Clone)]` with no
-/// `Drop` impl at all; real revocation is a shared `Arc`-backed
-/// atomic/sync state every clone rechecks fresh on each
-/// `try_authorize_forwarding()` call, not a drop side effect. `Pending`/
-/// `ActiveGate` are not `Clone`-bound at the trait level (Rust has no
-/// stable "not Clone" bound, and the real `ActiveGate`/`SessionGate` type
-/// genuinely is `Clone`); this crate's own calling code never clones
-/// either regardless — each value is moved into exactly one of
-/// `activate_if_authorized`/`cancel_pending`, enforced by the borrow
-/// checker at each call site, not by convention.
-///
-/// **`deadline` on every method (2026-08-04, @kiana, C.1):** a real
-/// implementation must not block indefinitely on `flock`/`fsync` or an
-/// ambiguous concurrent-revoke race; it must respect `deadline` itself
-/// and fail closed (never transition to Active) on expiry or an
-/// indeterminate outcome.
-///
-/// **`pub` (2026-08-04, @kiana, WIP audit, seam-visibility correction)** —
-/// see [`NonceConsumeOutcome`]'s doc; `Self::Pending`/`Self::ActiveGate`
-/// stay caller-defined associated types, so this crate never names a
-/// concrete adapter type. This is genuinely, positively implementable
-/// from outside the crate — not just something that survives a
-/// `compile_fail` negative check — because the doctest below actually
-/// compiles a real external-style `impl`:
+/// This is genuinely, positively implementable from outside the crate —
+/// not just something that survives a `compile_fail` negative check —
+/// because the doctest below actually compiles a real external-style
+/// `impl` against an owned double. A fuller, *borrowed*-lifetime double
+/// whose `Drop` mutates a shared `Atomic` (proving the GAT shape is
+/// satisfiable by something that actually borrows, the way the real
+/// household token does) lives as a non-vacuous `#[test]` in this
+/// module's test suite, not a doctest, so it can assert on outcomes.
 ///
 /// ```
-/// use mesh_session_core_rs::intent::{D1Admission, D1AdmissionKey};
+/// use mesh_session_core_rs::intent::{D1Admission, D1CancelOutcome, D1MembershipKey, D1Pending};
 /// use mesh_session_core_rs::ingress::CeremonyDeadline;
 /// use mesh_session_core_rs::error::IntentError;
 ///
@@ -904,224 +1011,120 @@ impl Clock for NoClockConfigured {
 /// // its own registry/lock/session-table state here instead.
 /// struct ExternalAdapter;
 ///
-/// impl D1Admission for ExternalAdapter {
-///     type Pending = u64; // a real adapter's own opaque permit type
-///     type ActiveGate = u64; // a real adapter's own opaque gate type
+/// struct OwnedPending(u64);
+/// impl D1Pending<u64> for OwnedPending {
+///     fn commit_after_ack(self) -> u64 {
+///         self.0 // a real adapter's own opaque gate value
+///     }
+///     fn cancel_before_ack(self) -> D1CancelOutcome {
+///         D1CancelOutcome::CancelledAndRemoved
+///     }
+/// }
 ///
-///     fn reserve_pending(
-///         &self,
-///         key: &D1AdmissionKey,
+/// impl D1Admission for ExternalAdapter {
+///     type Pending<'a> = OwnedPending;
+///     type Active<'a> = u64; // a real adapter's own opaque gate type
+///
+///     fn reserve_pending<'a>(
+///         &'a self,
+///         key: &D1MembershipKey,
 ///         deadline: &CeremonyDeadline,
-///     ) -> Result<Self::Pending, IntentError> {
+///     ) -> Result<Self::Pending<'a>, IntentError> {
 ///         // A real implementation reads `key`'s accessors (session_id(),
-///         // peer_m_id(), delegated_pub(), checkpoint_hash(), ...) and
+///         // peer_m_id(), checkpoint_hash(), ...) and
 ///         // `deadline.remaining()`/`is_expired()` to do its own D1
 ///         // revision recheck and admission-barrier insert here.
 ///         let _ = (key.session_id(), deadline.is_expired());
-///         Ok(1)
-///     }
-///     fn activate_if_authorized(
-///         &self,
-///         pending: Self::Pending,
-///         _deadline: &CeremonyDeadline,
-///     ) -> Result<Self::ActiveGate, IntentError> {
-///         Ok(pending)
-///     }
-///     fn cancel_pending(
-///         &self,
-///         _pending: Self::Pending,
-///         _deadline: &CeremonyDeadline,
-///     ) -> Result<(), IntentError> {
-///         Ok(())
+///         Ok(OwnedPending(1))
 ///     }
 /// }
 ///
 /// let _adapter = ExternalAdapter; // compiles: the trait is usable from outside
 /// ```
 pub trait D1Admission {
-    type Pending;
-    type ActiveGate;
+    type Pending<'a>: D1Pending<Self::Active<'a>>
+    where
+        Self: 'a;
+    type Active<'a>
+    where
+        Self: 'a;
 
     /// Step 1 — see the ordering note above. A real implementation
-    /// re-verifies the *exact same* binding (`D1AdmissionKey`'s full
-    /// session_id/authenticated-fingerprint/delegated-pub/checkpoint
-    /// fields — not merely a fresh read keyed by `initiator_m_id` alone,
-    /// which would let a stale or substituted fingerprint/revision slip
-    /// through) both here and again before committing in
-    /// [`Self::activate_if_authorized`] — the latter only ever receives
-    /// the opaque `Self::Pending` this call returned, so a real
-    /// implementation's own internal state must carry the binding
-    /// forward rather than re-deriving a weaker one from scratch.
-    fn reserve_pending(
-        &self,
-        key: &D1AdmissionKey,
+    /// re-verifies the *exact same* binding (`D1MembershipKey`'s full
+    /// session_id/authenticated-fingerprint/checkpoint fields — not
+    /// merely a fresh read keyed by `peer_m_id` alone, which would let a
+    /// stale or substituted fingerprint/revision slip through) both here
+    /// and again before committing in [`D1Pending::commit_after_ack`] —
+    /// the latter only ever receives `self`, so a real implementation's
+    /// own internal state must carry the binding forward rather than
+    /// re-deriving a weaker one from scratch.
+    fn reserve_pending<'a>(
+        &'a self,
+        key: &D1MembershipKey,
         deadline: &CeremonyDeadline,
-    ) -> Result<Self::Pending, IntentError>;
-    fn activate_if_authorized(
-        &self,
-        pending: Self::Pending,
-        deadline: &CeremonyDeadline,
-    ) -> Result<Self::ActiveGate, IntentError>;
-    /// **`Result`-returning (2026-08-04, @kiana, WIP audit item (b)) —
-    /// cleanup here is not best-effort-silent.** An earlier `-> ()`
-    /// signature gave a real implementation no way to signal "I could not
-    /// confirm this cancellation actually landed" — most concretely, if
-    /// `deadline` is already expired by the time this runs, a real
-    /// implementation might not be able to reach its own registry/lock at
-    /// all, yet `()` forced it to either block anyway (exactly what this
-    /// trait exists to forbid) or silently return as if cleanup
-    /// succeeded, potentially leaving a `Pending` entry stranded. `Err`
-    /// here means "cancellation could not be confirmed" — a caller
-    /// receiving it must still treat the attempt as closed/never-Active
-    /// (the caller never had an `ActiveGate` to begin with; there is
-    /// nothing to activate), but should surface/log the ambiguity rather
-    /// than assume the registry is clean, since a real implementation may
-    /// need out-of-band reconciliation for a `Pending` it could not
-    /// positively confirm removing.
-    ///
-    /// **`Self::Pending` must itself be Drop-idempotent-safe (2026-08-04,
-    /// @kiana, WIP audit item (b), required):** because `pending` is
-    /// taken *by value*, an `Err` return here does NOT hand the token
-    /// back — it is already moved into (and, ordinarily, consumed/dropped
-    /// by) this call. A `Result` return alone would therefore let a
-    /// cancel failure silently strand a registry entry with nothing left
-    /// for any caller to act on. This crate cannot itself enforce a
-    /// "must impl `Drop`" bound on an associated type (Rust has no such
-    /// bound), so it is a documented requirement on every real
-    /// `Self::Pending`: dropping a `Pending` value that never reached
-    /// [`Self::activate_if_authorized`] — including via a partially- or
-    /// fully-failed `cancel_pending` call — MUST itself trigger the same
-    /// unregister/close effect, idempotently (safe whether or not
-    /// `cancel_pending` also ran). `cancel_pending`'s own `Result` is a
-    /// best-effort synchronous confirmation signal, never the sole
-    /// cleanup mechanism; the type's own `Drop` is the structural safety
-    /// net that guarantees nothing is ever truly lost.
-    fn cancel_pending(
-        &self,
-        pending: Self::Pending,
-        deadline: &CeremonyDeadline,
-    ) -> Result<(), IntentError>;
+    ) -> Result<Self::Pending<'a>, IntentError>;
 }
 
-/// The exact binding D1 admission is granted against (2026-08-04, @kiana,
-/// C.4, definitive — replaces the earlier "scalar bag" shape that carried
-/// only `hh_id`/`initiator_m_id`/`target_m_id`/`delegated_key_id`/
-/// `channel`, none of it AUTHENTICATED beyond what a peer merely claimed
-/// in its own frame). `session_id` is this ceremony's own `h_final` — the
-/// Noise handshake hash, unique per completed handshake and bound to both
-/// parties' keys and full transcript — so admission can never be
-/// carried over to a different ceremony by coincidence of matching
-/// `m_id`.
+/// The exact binding D1 *membership* admission is granted against
+/// (2026-08-04, @kiana, runtime-facade audit `3cbbfb37…` P0-5/item 4,
+/// definitive — replaces `D1AdmissionKey`, which mixed this with D4
+/// signer authority; see [`IntentSignerBinding`] for that half).
+/// `session_id` is this ceremony's own `h_final` — the Noise handshake
+/// hash, unique per completed handshake and bound to both parties' keys
+/// and full transcript — so admission can never be carried over to a
+/// different ceremony by coincidence of matching `m_id`.
 ///
-/// **`local_*`/`peer_*`, not `initiator_*`/`target_*` (2026-08-04, @kiana,
-/// WIP audit — role-neutral, definitive):** the earlier `initiator_*`/
-/// `target_*` naming was responder-shaped — on the responder side
-/// `initiator_*` names the PEER and `target_*` names local, but on the
-/// initiator side that flips (`initiator_*` names local, `target_*` names
-/// the peer). Reusing those names unchanged on the initiator side meant
-/// mechanically re-mapping which physical party each field held per call
-/// site, exactly the kind of swap-prone shape a future edit could get
-/// backwards. `local_*`/`peer_*` are unconditionally symmetric: `local_*`
-/// is always this function's own `LocalIdentity`, `peer_*` is always the
-/// other party, on both call sites, so both construction sites should
-/// look structurally identical modulo which concrete values they read
-/// from. `peer_cert_fingerprint` is the AUTHENTICATED fingerprint already
-/// verified via `pass_delegation_gate`/`verify_frame`, not a bare claim.
-///
-/// **`delegated_key_id`/`delegated_pub` stay protocol-role-scoped, NOT
-/// local/peer-scoped:** these always name *the initiator's* delegation —
-/// the party that actually signed the 0x06 intent — regardless of
-/// whether the initiator is `local` or the `peer` in this particular
-/// call. Renaming these to `local_*`/`peer_*` would be actively wrong on
-/// the responder side, where they name the peer's (not local's)
-/// delegation. `delegated_pub` lets a real implementation bind to the
-/// actual key bytes, not just the `delegated_key_id` label.
-///
-/// The checkpoint/`not_after` fields let `reserve_pending`/
-/// `activate_if_authorized` recheck the identical revision/expiry, not a
-/// fresh unrelated read. A real implementation must recheck this WHOLE
-/// binding at both `reserve_pending` and `activate_if_authorized` time —
-/// re-reading only `peer_m_id` and forgetting the rest (fingerprint,
-/// revision, delegated key) is exactly the gap this richer key exists to
-/// close.
-///
-/// **`checkpoint_hash`/`checkpoint_sequence` are the D1-registry-relevant
-/// revision (2026-08-04, @kiana, WIP audit correction — supersedes an
-/// earlier framing of this as a strict 4-scalar requirement):**
-/// `checkpoint_event_head`/`checkpoint_not_after` are carried too, as
-/// useful additional hardening (a real implementation gets to recheck the
-/// FULL live `LocalCheckpoint`, not just the 2 fields D1 registry
-/// admission strictly needs), but only `hash`/`sequence` are the actual
-/// "revisão D1 vigente" this key must bind to — `event_head`/`not_after`
-/// are already covered by this ceremony's own separate auth checks
-/// (`check_checkpoint` against the peer's claimed values) before this key
-/// is ever built.
-/// `pub` with private fields + read-only accessors (2026-08-04, @kiana,
-/// WIP audit, seam-visibility correction — same discipline as
+/// **Shape verified directly against the real D1 registry's own binding
+/// type, not guessed (2026-08-04, @kiana, runtime-facade audit
+/// `3cbbfb37…` P0-5):** `household-rs`'s `SealedBinding`
+/// (`machine_roster_authority.rs`, same worktree/commit as
+/// [`D1Admission`]'s doc) carries exactly `hh_id`, one `m_id`, one
+/// `machine_cert_fingerprint`, `checkpoint_hash`, `checkpoint_sequence` —
+/// a single peer identity, not a local/peer pair, and no
+/// delegation/channel/expiry fields at all. D1 registry membership is
+/// never asked to know or verify *this machine's own* identity — only
+/// whether the PEER is active, non-revoked, and fingerprint-matched at
+/// the exact revision — so `local_m_id`/`local_cert_fingerprint` (present
+/// in the old `D1AdmissionKey`) are dropped here rather than carried as
+/// dead weight a real adapter would never read.
+/// `checkpoint_event_head`/`checkpoint_not_after`/`expires_at` are
+/// likewise dropped: `SealedBinding` only ever compares
+/// `checkpoint_hash`/`checkpoint_sequence` against its own tracked
+/// revision, and the other three are already covered by this ceremony's
+/// own separate auth checks (`check_checkpoint` against the peer's
+/// claimed values, `effective_expires_at`) before this key is ever
+/// built — carrying them here would be data a real D1 registry adapter
+/// has no read site for.
+/// `pub` with private fields + read-only accessors (same discipline as
 /// [`IntentNonceKey`]): a real `D1Admission` adapter needs to read this
 /// binding to persist/recheck it, but only this crate's own handshake
 /// code may construct one.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct D1AdmissionKey {
+pub struct D1MembershipKey {
     session_id: Vec<u8>,
     hh_id: String,
-    local_m_id: String,
-    local_cert_fingerprint: Vec<u8>,
     peer_m_id: String,
     peer_cert_fingerprint: Vec<u8>,
-    delegated_key_id: String,
-    delegated_pub: Vec<u8>,
     checkpoint_hash: Vec<u8>,
     checkpoint_sequence: u64,
-    checkpoint_event_head: Vec<u8>,
-    checkpoint_not_after: u64,
-    /// **Renamed from `not_after` to `expires_at` (2026-08-04, @kiana, WIP
-    /// audit, correction):** both call sites previously passed the raw
-    /// intent's own claimed `not_after` here — but the actual expiry this
-    /// D1 binding should be scoped to is the FULL `effective_expires_at =
-    /// min(checkpoint, local delegation, peer delegation, lease, ingress,
-    /// intent)` composite, already computed earlier in the same function.
-    /// Using only the intent's own (possibly larger, unenforced) claim
-    /// would let a session's D1 binding outlive the shortest of the other
-    /// 5 components — changing e.g. `lease_expires_at` alone, with
-    /// `intent.not_after` held fixed, must still change this key.
-    expires_at: u64,
-    channel: ExpectedChannel,
 }
 
-#[allow(clippy::too_many_arguments)]
-impl D1AdmissionKey {
+impl D1MembershipKey {
     pub(crate) fn new(
         session_id: Vec<u8>,
         hh_id: String,
-        local_m_id: String,
-        local_cert_fingerprint: Vec<u8>,
         peer_m_id: String,
         peer_cert_fingerprint: Vec<u8>,
-        delegated_key_id: String,
-        delegated_pub: Vec<u8>,
         checkpoint_hash: Vec<u8>,
         checkpoint_sequence: u64,
-        checkpoint_event_head: Vec<u8>,
-        checkpoint_not_after: u64,
-        expires_at: u64,
-        channel: ExpectedChannel,
     ) -> Self {
         Self {
             session_id,
             hh_id,
-            local_m_id,
-            local_cert_fingerprint,
             peer_m_id,
             peer_cert_fingerprint,
-            delegated_key_id,
-            delegated_pub,
             checkpoint_hash,
             checkpoint_sequence,
-            checkpoint_event_head,
-            checkpoint_not_after,
-            expires_at,
-            channel,
         }
     }
 
@@ -1131,23 +1134,11 @@ impl D1AdmissionKey {
     pub fn hh_id(&self) -> &str {
         &self.hh_id
     }
-    pub fn local_m_id(&self) -> &str {
-        &self.local_m_id
-    }
-    pub fn local_cert_fingerprint(&self) -> &[u8] {
-        &self.local_cert_fingerprint
-    }
     pub fn peer_m_id(&self) -> &str {
         &self.peer_m_id
     }
     pub fn peer_cert_fingerprint(&self) -> &[u8] {
         &self.peer_cert_fingerprint
-    }
-    pub fn delegated_key_id(&self) -> &str {
-        &self.delegated_key_id
-    }
-    pub fn delegated_pub(&self) -> &[u8] {
-        &self.delegated_pub
     }
     pub fn checkpoint_hash(&self) -> &[u8] {
         &self.checkpoint_hash
@@ -1155,142 +1146,433 @@ impl D1AdmissionKey {
     pub fn checkpoint_sequence(&self) -> u64 {
         self.checkpoint_sequence
     }
-    pub fn checkpoint_event_head(&self) -> &[u8] {
-        &self.checkpoint_event_head
+}
+
+/// The D4 signer-authority half of the old `D1AdmissionKey`
+/// (2026-08-04, @kiana, runtime-facade audit `3cbbfb37…` P0-5/item 4,
+/// definitive). D1 membership (above) and D4 signer-generation authority
+/// are separate authorities with separate real backends — `SealedBinding`
+/// has no delegation/channel/generation fields at all, and D1's registry
+/// has no way to resolve or prove any of them. This type exists so a
+/// caller can carry the RESOLVED (never peer-claimed) D4 authority
+/// alongside the D1 binding without the two being forced through one
+/// constructor that neither authority can fully satisfy.
+///
+/// **`delegated_key_id`/`delegated_pub` stay protocol-role-scoped, not
+/// local/peer-scoped:** these always name *the initiator's* delegation —
+/// the party that actually signed the 0x06 intent — regardless of
+/// whether the initiator is `local` or the peer in a given ceremony.
+///
+/// **`delegated_pub`/`generation`/`not_after` come from
+/// [`ResolvedSignerAuthority`], never from a peer-embedded claim
+/// (2026-08-04, @kiana, item 5):** this is the whole point of the split —
+/// a `D1AdmissionKey.delegated_pub` populated from
+/// `proof_i.delegation().delegated_pub()` was exactly the
+/// self-consistency-only gap the audit's P0-5 finding closed.
+/// `delegation_serial` is `MeshSessionDelegation::serial()` — the
+/// delegation's own rotation number, a DIFFERENT axis from D4's
+/// `generation` (which physical signing key/record generation is live) —
+/// both are carried because [`RetainedGenerationResolver`]'s real
+/// backend (frozen design `zain-mesh-session-signer-d4-v11.cbb757f8…`,
+/// `GenerationRecord`/`sign_checked`, not yet real code anywhere in this
+/// repository — "Zero código, admin/rust não tocado") revalidates both
+/// against its own live record.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IntentSignerBinding {
+    hh_id: String,
+    initiator_m_id: String,
+    channel: ExpectedChannel,
+    delegated_key_id: String,
+    delegated_pub: Vec<u8>,
+    generation: u64,
+    delegation_serial: u64,
+    not_after: u64,
+}
+
+impl IntentSignerBinding {
+    pub(crate) fn new(
+        hh_id: String,
+        initiator_m_id: String,
+        channel: ExpectedChannel,
+        delegated_key_id: String,
+        resolved: &ResolvedSignerAuthority,
+        delegation_serial: u64,
+    ) -> Self {
+        Self {
+            hh_id,
+            initiator_m_id,
+            channel,
+            delegated_key_id,
+            delegated_pub: resolved.delegated_pub.clone(),
+            generation: resolved.generation,
+            delegation_serial,
+            not_after: resolved.not_after,
+        }
     }
-    pub fn checkpoint_not_after(&self) -> u64 {
-        self.checkpoint_not_after
+
+    pub fn hh_id(&self) -> &str {
+        &self.hh_id
     }
-    pub fn expires_at(&self) -> u64 {
-        self.expires_at
+    pub fn initiator_m_id(&self) -> &str {
+        &self.initiator_m_id
     }
     pub fn channel(&self) -> ExpectedChannel {
         self.channel
     }
+    pub fn delegated_key_id(&self) -> &str {
+        &self.delegated_key_id
+    }
+    pub fn delegated_pub(&self) -> &[u8] {
+        &self.delegated_pub
+    }
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+    pub fn delegation_serial(&self) -> u64 {
+        self.delegation_serial
+    }
+    pub fn not_after(&self) -> u64 {
+        self.not_after
+    }
 }
 
-/// Ships no real D1 wiring. `Pending = Infallible` — fail-closed *by
-/// type*, not by decision: `reserve_pending` always errs, so
-/// `activate_if_authorized`/`cancel_pending` are structurally
-/// unreachable (an uninhabited-type match), not merely convention.
-pub(crate) struct NoD1AdmissionConfigured;
-impl D1Admission for NoD1AdmissionConfigured {
-    type Pending = std::convert::Infallible;
-    type ActiveGate = std::convert::Infallible;
+/// A verified, D4-resolved signer authority for one initiator generation
+/// (2026-08-04, @kiana, runtime-facade audit `3cbbfb37…`, item 5). Never
+/// constructed from a peer's own claimed `delegated_pub` — only from
+/// [`RetainedGenerationResolver::resolve`], which a real implementation
+/// backs with an independent, live D4 read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedSignerAuthority {
+    delegated_pub: Vec<u8>,
+    generation: u64,
+    not_after: u64,
+}
 
-    fn reserve_pending(
+impl ResolvedSignerAuthority {
+    pub fn new(delegated_pub: Vec<u8>, generation: u64, not_after: u64) -> Self {
+        Self {
+            delegated_pub,
+            generation,
+            not_after,
+        }
+    }
+
+    pub fn delegated_pub(&self) -> &[u8] {
+        &self.delegated_pub
+    }
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+    pub fn not_after(&self) -> u64 {
+        self.not_after
+    }
+}
+
+/// D4 retained-generation resolver seam (2026-08-04, @kiana,
+/// runtime-facade audit `3cbbfb37…`, item 5). Closes the gap the audit's
+/// P0-5 finding identified: this crate previously built its verifier for
+/// the initiator's frames/intent directly from
+/// `proof_i.delegation().delegated_pub()` — the key the PEER embeds in
+/// its own frame — which proves only self-consistency, never that the
+/// embedded key is the one D4 actually still authorizes for
+/// `(hh_id, initiator_m_id, channel, delegated_key_id)`. Called on the
+/// responder side, BEFORE nonce consumption (`run_responder_handshake`
+/// enforces this ordering, not this trait alone) — 0x06 and Proof-I must
+/// be verified against the KEY THIS RETURNS, never the peer-claimed one.
+///
+/// **This crate does not implement D4** (same posture as the nonce
+/// ledger/D1 admission — "não inventar D1/D4 persistence dentro do
+/// core"). `zain-mesh-session-signer-d4-v11.cbb757f83666181cd6f253a3fecdfbbe0a960a262a5537eb2da14628a26a1b2d.md`
+/// (self-hash verified) is a frozen DESIGN for the real backend
+/// (`MeshSignerControlRecordV1`/`GenerationRecord`/`TypedSigner::sign_checked`)
+/// but is explicitly "Zero código, admin/rust não tocado" — not real code
+/// anywhere in this repository yet. This trait models the seam a real
+/// implementation of that design would satisfy; it is deliberately
+/// informed by, but never literally coupled to, those not-yet-real types.
+pub trait RetainedGenerationResolver {
+    /// Resolve and prove the exact retained D4 generation for
+    /// `(hh_id, initiator_m_id, channel, delegated_key_id)` — public key,
+    /// generation, and expiry all independently verified against D4's own
+    /// live record, never assumed from a caller-supplied claim.
+    fn resolve(
         &self,
-        _key: &D1AdmissionKey,
+        hh_id: &str,
+        initiator_m_id: &str,
+        channel: ExpectedChannel,
+        delegated_key_id: &str,
+        deadline: &CeremonyDeadline,
+    ) -> Result<ResolvedSignerAuthority, IntentError>;
+}
+
+/// Ships no real D4 wiring — fails closed. Same precedent as
+/// `NoIntentLedgerConfigured`/`NoD1AdmissionConfigured`.
+pub(crate) struct NoRetainedGenerationResolverConfigured;
+impl RetainedGenerationResolver for NoRetainedGenerationResolverConfigured {
+    fn resolve(
+        &self,
+        _hh_id: &str,
+        _initiator_m_id: &str,
+        _channel: ExpectedChannel,
+        _delegated_key_id: &str,
         _deadline: &CeremonyDeadline,
-    ) -> Result<Self::Pending, IntentError> {
+    ) -> Result<ResolvedSignerAuthority, IntentError> {
+        Err(IntentError::NoRetainedGenerationResolverConfigured)
+    }
+}
+
+/// Ships no real D1 wiring. `Pending<'a> = Infallible` — fail-closed *by
+/// type*, not by decision: `reserve_pending` always errs, so
+/// `D1Pending`'s methods are structurally unreachable (an
+/// uninhabited-type match), not merely convention.
+pub(crate) struct NoD1AdmissionConfigured;
+
+impl<Active> D1Pending<Active> for std::convert::Infallible {
+    fn commit_after_ack(self) -> Active {
+        match self {}
+    }
+    fn cancel_before_ack(self) -> D1CancelOutcome {
+        match self {}
+    }
+}
+
+impl D1Admission for NoD1AdmissionConfigured {
+    type Pending<'a> = std::convert::Infallible;
+    type Active<'a> = std::convert::Infallible;
+
+    fn reserve_pending<'a>(
+        &'a self,
+        _key: &D1MembershipKey,
+        _deadline: &CeremonyDeadline,
+    ) -> Result<Self::Pending<'a>, IntentError> {
         Err(IntentError::NoD1AdmissionConfigured)
-    }
-    fn activate_if_authorized(
-        &self,
-        pending: Self::Pending,
-        _deadline: &CeremonyDeadline,
-    ) -> Result<Self::ActiveGate, IntentError> {
-        match pending {}
-    }
-    fn cancel_pending(
-        &self,
-        pending: Self::Pending,
-        _deadline: &CeremonyDeadline,
-    ) -> Result<(), IntentError> {
-        match pending {}
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicU8, Ordering};
+    use std::sync::{Arc, Mutex, mpsc};
+    use std::thread;
+    use std::time::{Duration, Instant};
 
-    fn base_key() -> D1AdmissionKey {
-        D1AdmissionKey {
+    fn base_membership_key() -> D1MembershipKey {
+        D1MembershipKey {
             session_id: vec![1u8; 32],
             hh_id: "hh-1".to_string(),
-            local_m_id: "m-local".to_string(),
-            local_cert_fingerprint: vec![0xAAu8; 32],
             peer_m_id: "m-peer".to_string(),
             peer_cert_fingerprint: vec![0xBBu8; 32],
-            delegated_key_id: "key-1".to_string(),
-            delegated_pub: vec![0x02u8; 33],
             checkpoint_hash: vec![0xCCu8; 32],
             checkpoint_sequence: 7,
-            checkpoint_event_head: vec![0xDDu8; 32],
-            checkpoint_not_after: 2_000,
-            expires_at: 1_000,
-            channel: ExpectedChannel::Dev,
         }
     }
 
-    /// WIP audit item (1) RED: a key differing only in
-    /// `checkpoint_event_head` must not compare equal.
+    /// C.4 RED, preserved across the item-4 split: a D1MembershipKey that
+    /// differs ONLY in the authenticated peer fingerprint (same m_id)
+    /// must not be treated as the same binding.
     #[test]
-    fn red_d1_admission_key_distinguishes_a_checkpoint_event_head_swap() {
-        let a = base_key();
-        let mut b = a.clone();
-        b.checkpoint_event_head = vec![0xEEu8; 32];
-        assert_ne!(a, b);
-    }
-
-    /// WIP audit item (1) RED: a key differing only in
-    /// `checkpoint_not_after` must not compare equal.
-    #[test]
-    fn red_d1_admission_key_distinguishes_a_checkpoint_not_after_swap() {
-        let a = base_key();
-        let mut b = a.clone();
-        b.checkpoint_not_after = a.checkpoint_not_after + 1;
-        assert_ne!(a, b);
-    }
-
-    /// WIP audit RED (2026-08-04, @kiana): `expires_at` (the FULL
-    /// `effective_expires_at` composite, not just `intent.not_after`)
-    /// must independently distinguish keys — changing only the smallest
-    /// cap among checkpoint/local delegation/peer delegation/lease/
-    /// ingress (simulated here by directly mutating `expires_at`, since
-    /// that is exactly what a changed minimum looks like once computed)
-    /// changes the D1AdmissionKey even with every other field, including
-    /// whatever the intent itself claims, held fixed.
-    #[test]
-    fn red_d1_admission_key_distinguishes_an_expires_at_swap_from_a_smaller_cap() {
-        let a = base_key();
-        let mut b = a.clone();
-        b.expires_at = a.expires_at - 1;
-        assert_ne!(a, b);
-    }
-
-    /// C.4 RED: a D1AdmissionKey that differs ONLY in the authenticated
-    /// peer fingerprint (same m_id) must not be treated as the same
-    /// binding — proves this crate's key type can actually distinguish a
-    /// fingerprint swap rather than silently coalescing distinct
-    /// authenticated identities down to `m_id` alone.
-    #[test]
-    fn red_d1_admission_key_distinguishes_a_fingerprint_swap_at_same_m_id() {
-        let a = base_key();
+    fn red_d1_membership_key_distinguishes_a_fingerprint_swap_at_same_m_id() {
+        let a = base_membership_key();
         let mut b = a.clone();
         b.peer_cert_fingerprint = vec![0xFFu8; 32];
         assert_ne!(a, b);
     }
 
-    /// C.4 RED: a key differing only in checkpoint_sequence (a revision
-    /// swap) must likewise not compare equal.
+    /// C.4 RED, preserved: a key differing only in checkpoint_sequence (a
+    /// revision swap) must likewise not compare equal.
     #[test]
-    fn red_d1_admission_key_distinguishes_a_revision_swap() {
-        let a = base_key();
+    fn red_d1_membership_key_distinguishes_a_revision_swap() {
+        let a = base_membership_key();
         let mut b = a.clone();
         b.checkpoint_sequence = a.checkpoint_sequence + 1;
         assert_ne!(a, b);
     }
 
-    /// C.4 RED: a key differing only in session_id (a different ceremony
-    /// entirely) must not compare equal — admission must not carry over
-    /// across ceremonies by m_id coincidence.
+    /// C.4 RED, preserved: a key differing only in session_id (a
+    /// different ceremony entirely) must not compare equal — admission
+    /// must not carry over across ceremonies by m_id coincidence.
     #[test]
-    fn red_d1_admission_key_distinguishes_a_different_session() {
-        let a = base_key();
+    fn red_d1_membership_key_distinguishes_a_different_session() {
+        let a = base_membership_key();
         let mut b = a.clone();
         b.session_id = vec![2u8; 32];
         assert_ne!(a, b);
+    }
+
+    fn base_signer_binding(resolved: &ResolvedSignerAuthority) -> IntentSignerBinding {
+        IntentSignerBinding::new(
+            "hh-1".to_string(),
+            "m-initiator".to_string(),
+            ExpectedChannel::Dev,
+            "key-1".to_string(),
+            resolved,
+            3,
+        )
+    }
+
+    /// item 4 RED: `IntentSignerBinding` carries the RESOLVED
+    /// `delegated_pub`/`generation`/`not_after`, not fields a caller could
+    /// pass independently of `ResolvedSignerAuthority` — a resolver that
+    /// returns a different key must produce a different binding.
+    #[test]
+    fn red_intent_signer_binding_distinguishes_a_resolved_key_swap() {
+        let a = ResolvedSignerAuthority::new(vec![0x02u8; 33], 5, 9_000);
+        let b = ResolvedSignerAuthority::new(vec![0x03u8; 33], 5, 9_000);
+        assert_ne!(base_signer_binding(&a), base_signer_binding(&b));
+    }
+
+    /// item 4 RED: a generation swap (same key bytes, different D4
+    /// generation) must also distinguish the binding — generation and key
+    /// bytes are independent axes `sign_checked`-style revalidation needs
+    /// both of.
+    #[test]
+    fn red_intent_signer_binding_distinguishes_a_generation_swap() {
+        let a = ResolvedSignerAuthority::new(vec![0x02u8; 33], 5, 9_000);
+        let b = ResolvedSignerAuthority::new(vec![0x02u8; 33], 6, 9_000);
+        assert_ne!(base_signer_binding(&a), base_signer_binding(&b));
+    }
+
+    const PHASE_PENDING: u8 = 0;
+    const PHASE_ACTIVE: u8 = 1;
+    const PHASE_CLOSED: u8 = 2;
+
+    /// A borrowed double proving [`D1Admission`]'s GAT shape is
+    /// satisfiable by something that genuinely borrows `&'a self` —
+    /// unlike the doctest's owned `u64` mock — and whose `Drop`, exactly
+    /// like the real `PendingSessionAdmission`, mutates only a shared
+    /// `AtomicU8` (2026-08-04, @kiana, runtime-facade audit `3cbbfb37…`
+    /// P0-2).
+    struct BorrowedRegistryDouble {
+        phase: AtomicU8,
+    }
+
+    impl BorrowedRegistryDouble {
+        fn new() -> Self {
+            Self {
+                phase: AtomicU8::new(PHASE_PENDING),
+            }
+        }
+    }
+
+    struct BorrowedPendingDouble<'a> {
+        phase: &'a AtomicU8,
+        completed: bool,
+    }
+
+    struct BorrowedActiveDouble<'a> {
+        phase: &'a AtomicU8,
+    }
+
+    impl<'a> D1Pending<BorrowedActiveDouble<'a>> for BorrowedPendingDouble<'a> {
+        fn commit_after_ack(mut self) -> BorrowedActiveDouble<'a> {
+            self.completed = true;
+            self.phase.store(PHASE_ACTIVE, Ordering::SeqCst);
+            BorrowedActiveDouble { phase: self.phase }
+        }
+        fn cancel_before_ack(mut self) -> D1CancelOutcome {
+            self.completed = true;
+            self.phase.store(PHASE_CLOSED, Ordering::SeqCst);
+            D1CancelOutcome::CancelledAndRemoved
+        }
+    }
+
+    /// Mirrors the real `PendingSessionAdmission::drop`: one atomic store,
+    /// nothing else — no lock, no wait, no callback, no allocation.
+    impl Drop for BorrowedPendingDouble<'_> {
+        fn drop(&mut self) {
+            if !self.completed {
+                self.phase.store(PHASE_CLOSED, Ordering::SeqCst);
+            }
+        }
+    }
+
+    impl D1Admission for BorrowedRegistryDouble {
+        type Pending<'a> = BorrowedPendingDouble<'a>;
+        type Active<'a> = BorrowedActiveDouble<'a>;
+
+        fn reserve_pending<'a>(
+            &'a self,
+            _key: &D1MembershipKey,
+            _deadline: &CeremonyDeadline,
+        ) -> Result<Self::Pending<'a>, IntentError> {
+            self.phase.store(PHASE_PENDING, Ordering::SeqCst);
+            Ok(BorrowedPendingDouble {
+                phase: &self.phase,
+                completed: false,
+            })
+        }
+    }
+
+    /// Non-vacuous compile-positive + behavioral proof (2026-08-04,
+    /// @kiana, runtime-facade audit `3cbbfb37…` P0-2): the GAT shape is
+    /// satisfiable by a type that genuinely borrows `&'a self` (not an
+    /// owned `u64`), `commit_after_ack` is infallible and reachable
+    /// through the trait, and `Active<'a>` really does share `Pending<'a>`'s
+    /// borrow — this would not compile at all if `D1Pending`'s `Active`
+    /// were a free-standing associated type an adapter could mismatch.
+    #[test]
+    fn borrowed_adapter_satisfies_the_gat_shape_and_commit_reaches_active() {
+        let registry = BorrowedRegistryDouble::new();
+        let key = base_membership_key();
+        let deadline = far_future_deadline();
+        let pending = registry.reserve_pending(&key, &deadline).unwrap();
+        assert_eq!(registry.phase.load(Ordering::SeqCst), PHASE_PENDING);
+        let active = pending.commit_after_ack();
+        assert_eq!(registry.phase.load(Ordering::SeqCst), PHASE_ACTIVE);
+        assert_eq!(active.phase.load(Ordering::SeqCst), PHASE_ACTIVE);
+    }
+
+    #[test]
+    fn borrowed_adapter_cancel_before_ack_reports_cancelled_and_removed() {
+        let registry = BorrowedRegistryDouble::new();
+        let key = base_membership_key();
+        let deadline = far_future_deadline();
+        let pending = registry.reserve_pending(&key, &deadline).unwrap();
+        let outcome = pending.cancel_before_ack();
+        assert_eq!(outcome, D1CancelOutcome::CancelledAndRemoved);
+        assert_eq!(registry.phase.load(Ordering::SeqCst), PHASE_CLOSED);
+    }
+
+    /// RED, non-vacuous (2026-08-04, @kiana, runtime-facade audit
+    /// `3cbbfb37…` P0-3): a real `Drop` must be lock-free. Proven here,
+    /// not merely documented, by holding a `Mutex` on a background thread
+    /// for far longer than any lock-free operation could take, then
+    /// dropping a `Pending` value and asserting the drop returns almost
+    /// immediately — a wrong `Drop` that tried `mutex.lock()` on a
+    /// registry-wide lock like this one would block for the full hold
+    /// duration and fail this assertion.
+    #[test]
+    fn red_pending_drop_never_blocks_even_while_a_shared_mutex_the_double_also_holds_is_locked_elsewhere()
+     {
+        let registry_wide_lock = Arc::new(Mutex::new(()));
+        let held = Arc::clone(&registry_wide_lock);
+        let (tx, rx) = mpsc::channel::<()>();
+        let handle = thread::spawn(move || {
+            let _guard = held.lock().unwrap();
+            tx.send(()).unwrap();
+            thread::sleep(Duration::from_millis(300));
+        });
+        rx.recv().unwrap(); // the other thread now holds `registry_wide_lock`
+
+        let phase = AtomicU8::new(PHASE_PENDING);
+        let pending = BorrowedPendingDouble {
+            phase: &phase,
+            completed: false,
+        };
+        let start = Instant::now();
+        drop(pending); // must NOT touch `registry_wide_lock` at all
+        let elapsed = start.elapsed();
+
+        handle.join().unwrap();
+        assert!(
+            elapsed < Duration::from_millis(100),
+            "Pending::drop took {elapsed:?} — a lock-free Drop must return almost \
+             immediately even while an unrelated registry-wide mutex is held elsewhere",
+        );
+        assert_eq!(phase.load(Ordering::SeqCst), PHASE_CLOSED);
+    }
+
+    fn far_future_deadline() -> CeremonyDeadline {
+        CeremonyDeadline::for_test(Instant::now(), Duration::from_secs(3600))
     }
 }

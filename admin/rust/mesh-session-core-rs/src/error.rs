@@ -147,6 +147,14 @@ pub enum AuthFrameError {
     #[error("write of the final frame did not complete — no state transition occurred")]
     ActivateAckWriteFailed,
     #[error(
+        "the ActivateAck exchange failed (cause: {source}); D1 pending-admission cancel outcome: {cancel_outcome:?} — the cause is why this attempt failed, the outcome is what happened to the reserved D1 permit as a result, never silently discarded"
+    )]
+    AckExchangeFailedWithCancelOutcome {
+        #[source]
+        source: Box<AuthFrameError>,
+        cancel_outcome: crate::intent::D1CancelOutcome,
+    },
+    #[error(
         "K_mesh signer failed (revoked/stale/expired/backend unavailable) — no signature produced"
     )]
     SignerFailed,
@@ -230,6 +238,14 @@ pub enum IntentError {
     ChannelMismatch,
     #[error("no D1 admission hook configured — fails closed until a real one is injected")]
     NoD1AdmissionConfigured,
+    #[error(
+        "no D4 retained-generation resolver configured — fails closed until a real one is injected"
+    )]
+    NoRetainedGenerationResolverConfigured,
+    #[error(
+        "D4-resolved generation's not_after does not match the delegation's own not_after — the resolver's record has drifted from what this delegation claims"
+    )]
+    ResolvedGenerationNotAfterMismatch,
     #[error("trusted clock unavailable — failing closed rather than assuming freshness")]
     ClockUnavailable,
     #[error("ceremony's absolute deadline has passed")]

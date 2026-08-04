@@ -997,6 +997,19 @@ pub trait MeshSessionFrameSigner {
     /// This signer's own P-256 public key. Never secret material — used
     /// only to mathematically self-check `sign_mesh_session_frame`'s
     /// output and to bind the signer to `local.delegation.delegated_pub`.
+    ///
+    /// **Contractually non-blocking (2026-08-04, @kiana, runtime-facade
+    /// audit `3cbbfb37…` P1-1):** called from multiple pre-I/O preflight
+    /// checks (`check_signer_matches_delegation`,
+    /// `PendingIntent::build_and_sign`/`verify_binds_to`) before this
+    /// crate's own `CeremonyDeadline` has necessarily been checked again.
+    /// No `&CeremonyDeadline` parameter is threaded through here — instead
+    /// a real implementation MUST return in bounded, effectively-constant
+    /// time (an in-memory P-256 scalar read, never network/disk I/O or a
+    /// lock that can be held by an unrelated slow operation). A signer
+    /// backend whose key material genuinely requires I/O to read must
+    /// cache the public half at construction time, not read it fresh on
+    /// every call.
     fn public_key(&self) -> VerifyingKey;
 
     /// Sign a `SignedMeshConnectionIntent` (0x06 carrier). Deliberately a

@@ -53,6 +53,7 @@ use crate::delegation::{
 };
 use crate::error::{AuthFrameError, NoiseSetupError};
 use crate::ingress::{CeremonyDeadline, IngressEvidence, PrevalidatedIngress};
+use crate::intent::D1Pending;
 use crate::noise::{self, Role};
 use crate::rekey::{self, RekeyThreshold, SessionRekeyState};
 use crate::wire;
@@ -693,7 +694,7 @@ fn run_combined_intent_check(
 /// (hardened 2026-08-04). See the module doc for why this is
 /// `pub(crate)`.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn run_responder_handshake<S, Sig, Ver, Ledger, D1, C>(
+pub(crate) fn run_responder_handshake<'d1, S, Sig, Ver, Ledger, D1, C, Res>(
     ingress: PrevalidatedIngress<S>,
     local: &LocalIdentity,
     checkpoint: &LocalCheckpoint,
@@ -702,15 +703,16 @@ pub(crate) fn run_responder_handshake<S, Sig, Ver, Ledger, D1, C>(
     delegation_verifier: &Ver,
     k_mesh: &Sig,
     nonce_ledger: &Ledger,
-    d1_admission: &D1,
+    d1_admission: &'d1 D1,
     clock: &C,
+    resolver: &Res,
     // 2026-08-04, @kiana, WIP audit point A, v6 §7: one of the
     // `effective_expires_at` components this crate does not itself
     // measure — the caller's own live lease bound, wall-clock `u64`,
     // required rather than defaulted to unbounded.
     lease_expires_at: u64,
     rekey_threshold: RekeyThreshold,
-) -> Result<ActiveMeshSession<S, D1::ActiveGate>, AuthFrameError>
+) -> Result<ActiveMeshSession<S, D1::Active<'d1>>, AuthFrameError>
 where
     S: Read + Write + wire::DeadlineBoundedIo,
     Sig: MeshSessionFrameSigner,
@@ -718,13 +720,10 @@ where
     Ledger: crate::intent::IntentNonceLedger,
     D1: crate::intent::D1Admission,
     C: crate::intent::Clock,
+    Res: crate::intent::RetainedGenerationResolver,
 {
     check_signer_matches_delegation(k_mesh, &local.delegation)?;
     check_local_delegation_channel(&local.delegation, expected_channel)?;
-    // 2026-08-04, @kiana, round 4: minted here — before any I/O at all,
-    // long before ActivateAck is ever written — not after. See the
-    // hardening note on ActiveMeshSession's construction below for why.
-    let rekey = SessionRekeyState::new(rekey_threshold)?;
 
     let (mut stream, ingress_evidence, deadline) = ingress.consume();
     // 2026-08-04, @kiana, definitive B: `deadline` is the opaque,
@@ -734,6 +733,15 @@ where
     // not only after — an already-expired admission never even attempts
     // the handshake.
     check_ceremony_deadline(&deadline)?;
+
+    // 2026-08-04, @kiana, round 4 + runtime-facade audit `3cbbfb37…` P1-1
+    // (reordered — supersedes minting this before `deadline` even
+    // existed): still before any I/O at all, long before ActivateAck is
+    // ever written, but now also after the FIRST deadline check has run —
+    // an already-expired admission never even mints rekey state. See the
+    // hardening note on ActiveMeshSession's construction below for why
+    // minting stays this early relative to I/O.
+    let rekey = SessionRekeyState::new(rekey_threshold)?;
 
     let handshake = noise::run_xx_handshake(&mut stream, Role::Responder, &deadline)?;
     let mut transport = handshake.transport;
@@ -811,13 +819,56 @@ where
         expected_channel,
         &deadline,
     )?;
-    let initiator_verifier =
-        auth_frames::verifier_from_delegated_pub(proof_i.delegation().delegated_pub())?;
+
+    // 2026-08-04, @kiana, runtime-facade audit `3cbbfb37…` P0-5/item 5
+    // (definitive — supersedes building `initiator_verifier` directly
+    // from `proof_i.delegation().delegated_pub()`): that was
+    // self-consistency only — proof the frame matches a key the PEER
+    // itself embeds, never that D4 still authorizes that key for this
+    // exact `(hh_id, initiator_m_id, channel, delegated_key_id)` tuple.
+    // Resolve the actually-authorized key BEFORE building any verifier
+    // from it, and BEFORE nonce consumption (erratum1 E4 ordering) —
+    // deadline checked immediately before this seam, same discipline as
+    // every other potentially-blocking pre-seam step (item 6).
+    check_ceremony_deadline(&deadline)?;
+    let resolved = resolver.resolve(
+        proof_i.hh_id(),
+        proof_i.self_m_id(),
+        expected_channel,
+        proof_i.delegation().delegated_key_id(),
+        &deadline,
+    )?;
+    // D4's own record ties a generation's `not_after` to its delegation's
+    // `not_after` (`RecordDelegationNotAfterDrift`,
+    // zain-mesh-session-signer-d4-v11.cbb757f8…, §7) — a resolver whose
+    // returned generation has drifted from what this delegation itself
+    // claims is rejected here, before it is ever trusted for anything.
+    if resolved.not_after() != proof_i.delegation().not_after() {
+        return Err(crate::error::IntentError::ResolvedGenerationNotAfterMismatch.into());
+    }
+    let initiator_verifier = auth_frames::verifier_from_delegated_pub(resolved.delegated_pub())?;
+    // Verified against the RESOLVED key, never the peer-claimed one — a
+    // resolver that (correctly) returns a different key than whatever the
+    // peer embedded makes this fail here, not silently pass on
+    // self-consistency alone.
     auth_frames::verify_frame(&proof_i, &sig_array(proof_i.sig())?, &initiator_verifier)?;
 
     let initiator_m_id = proof_i.self_m_id().to_string();
     let initiator_cert_fingerprint = proof_i.self_cert_fingerprint().to_vec();
     let initiator_hh_id = proof_i.hh_id().to_string();
+    // Not read by anything else in this crate yet — assembled here as the
+    // D4 half of the old combined key, so a future facade has a single,
+    // already-validated value to consume rather than re-deriving one from
+    // scratch (2026-08-04, @kiana, item 4). Same "carried, not dead"
+    // posture as `ActiveMeshSession.gate`/`.stream`.
+    let _signer_binding = crate::intent::IntentSignerBinding::new(
+        initiator_hh_id.clone(),
+        initiator_m_id.clone(),
+        expected_channel,
+        proof_i.delegation().delegated_key_id().to_string(),
+        &resolved,
+        proof_i.delegation().serial(),
+    );
 
     // --- Combined intent check (D9 carrier-B addendum §4), then the
     // single nonce-consumption call site (addendum §5) ---
@@ -924,38 +975,47 @@ where
     let now = clock.now().map_err(AuthFrameError::from)?;
     check_effective_expiry(now, expires_at)?;
 
-    // 2026-08-04, @kiana, erratum1 E4 + C.4 (definitive): reserve the D1
-    // Pending permit BEFORE the Ack write, against the FULL authenticated
-    // binding — this ceremony's own session_id (h_final), the AUTHENTICATED
-    // initiator fingerprint (verified above via pass_delegation_gate/
-    // verify_frame, not a bare claim), the resolved delegated_pub, and the
-    // live checkpoint/expiry this ceremony actually ran against. A real
-    // implementation must recheck this exact binding again in
-    // `activate_if_authorized`, not merely re-read by `peer_m_id`.
-    // Role-neutral (2026-08-04, @kiana): on the responder side, `peer_*`
-    // is the initiator (the other party) and `local_*` is this machine.
-    let d1_key = crate::intent::D1AdmissionKey::new(
+    // 2026-08-04, @kiana, erratum1 E4 + C.4 + runtime-facade audit
+    // `3cbbfb37…` item 4 (definitive): reserve the D1 Pending permit
+    // BEFORE the Ack write, against the AUTHENTICATED peer-membership
+    // binding — this ceremony's own session_id (h_final), the
+    // AUTHENTICATED initiator fingerprint (verified above via
+    // pass_delegation_gate/verify_frame, not a bare claim), and the live
+    // checkpoint this ceremony actually ran against. D4 signer authority
+    // (delegated_key_id/delegated_pub/channel/generation) is a SEPARATE
+    // concern — see `_signer_binding` above — D1 membership has no way to
+    // verify it and the real registry's own binding type carries none of
+    // it either. A real D1 implementation must recheck this exact binding
+    // again in `commit_after_ack`, not merely re-read by `peer_m_id`.
+    let d1_key = crate::intent::D1MembershipKey::new(
         h_final.clone(),
         initiator_hh_id.clone(),
-        local.m_id.clone(),
-        local.cert_fingerprint.clone(),
         initiator_m_id.clone(),
         initiator_cert_fingerprint.clone(),
-        nonce_key.delegated_key_id().to_string(),
-        proof_i.delegation().delegated_pub().to_vec(),
         checkpoint.hash.clone(),
         checkpoint.sequence,
-        checkpoint.event_head.clone(),
-        checkpoint.not_after,
-        expires_at,
-        expected_channel,
     );
     let pending = d1_admission.reserve_pending(&d1_key, &deadline)?;
 
     // 3. write_all (write_transport_record uses write_all internally).
     // 2026-08-04, @kiana, round 4: `rekey` was minted at the top of this
     // function, before any I/O — nothing fallible runs between here and
-    // the D1 outcome below except the two D1 calls themselves.
+    // the D1 outcome below except the D1 terminal call itself.
+    //
+    // 2026-08-04, @kiana, runtime-facade audit `3cbbfb37…` P0-1/P0-2/P0-3/
+    // P0-4 (definitive — supersedes the earlier fallible-`Result`
+    // `activate_if_authorized` shape): `commit_after_ack` is infallible
+    // and takes no deadline (see `D1Pending`'s own doc for why that is
+    // safe) — reaching this write's `Ok(())` arm now commits directly,
+    // with nothing fallible or external between the write's success and
+    // the commit call. `gate` is embedded directly into the session
+    // (2026-08-04, @kiana, definitive A — never returned separately,
+    // never droppable while the session lives). A partial/failed write
+    // cancels the just-reserved permit and folds the (never discarded)
+    // `D1CancelOutcome` into the propagated error alongside the original
+    // write failure — the write failure is why this attempt failed; the
+    // cancel outcome is what happened to the D1 permit as a result
+    // (2026-08-04, @kiana, WIP audit item (b) + P0-3, no more `let _ =`).
     match send_frame(
         &mut stream,
         &mut transport,
@@ -964,45 +1024,14 @@ where
     ) {
         Ok(()) => {}
         Err(e) => {
-            // 3b: write failed/partial — abort, remove Pending, gate
-            // never opens, zero effect for this attempt (same "erratum"
-            // discipline the write itself already had, now extended one
-            // step further to cover the D1 permit too). 2026-08-04,
-            // @kiana, WIP audit item (b): `e` (the write failure) is the
-            // actual cause and is what this attempt reports; a
-            // cancel-confirmation failure is explicitly acknowledged
-            // (not left as an unchecked Result) rather than silently
-            // discarded — `Self::Pending`'s own Drop is the structural
-            // safety net if cancellation itself cannot be confirmed, see
-            // `D1Admission::cancel_pending`'s doc.
-            let _ = d1_admission.cancel_pending(pending, &deadline);
-            return Err(e);
+            let cancel_outcome = pending.cancel_before_ack();
+            return Err(AuthFrameError::AckExchangeFailedWithCancelOutcome {
+                source: Box::new(e),
+                cancel_outcome,
+            });
         }
     }
-
-    // 3a/4: write succeeded. NOTHING fallible or external runs between
-    // this line and the call below — activate_if_authorized is the very
-    // next statement, consuming `pending` — so a concurrent revoke
-    // observed by a real implementation at this exact synchronized point
-    // can still close the session instead of opening it; only on Ok(gate)
-    // below does an ActiveMeshSession ever get constructed, and `gate` is
-    // embedded directly into it (2026-08-04, @kiana, definitive A —
-    // never returned separately, never droppable while the session lives).
-    // 2026-08-04, @kiana, WIP audit point F/G, terminal (definitive —
-    // supersedes an earlier version that rechecked `deadline.is_expired()`
-    // here and dropped `gate` on expiry): `Ok(gate)` above already IS the
-    // adapter's terminal Active transition — the real `SessionGate` does
-    // no cleanup on `Drop` at all (verified: `#[derive(Clone)]`, no `Drop`
-    // impl, shared `Arc`-backed atomic state instead), so dropping `gate`
-    // here would not un-activate anything in the registry; it would only
-    // discard this crate's own handle while the registry keeps believing
-    // the session is Active — strictly worse than doing nothing. Deadline
-    // linearization against this exact moment is the real
-    // `activate_if_authorized` implementation's own responsibility (it
-    // already receives `&CeremonyDeadline` for precisely this) — this
-    // crate does not and must not re-check or second-guess that decision
-    // after the fact.
-    let gate = d1_admission.activate_if_authorized(pending, &deadline)?;
+    let gate = pending.commit_after_ack();
 
     Ok(ActiveMeshSession {
         stream,
@@ -1023,7 +1052,7 @@ where
 /// AwaitingActivateAck → Active. See the module doc for why this is
 /// `pub(crate)`.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn run_initiator_handshake<S, Sig, Ver, D1, C>(
+pub(crate) fn run_initiator_handshake<'d1, S, Sig, Ver, D1, C>(
     ingress: PrevalidatedIngress<S>,
     pending_intent: crate::intent::PendingIntent,
     local: &LocalIdentity,
@@ -1032,7 +1061,7 @@ pub(crate) fn run_initiator_handshake<S, Sig, Ver, D1, C>(
     policy: &DelegationPolicy,
     delegation_verifier: &Ver,
     k_mesh: &Sig,
-    d1_admission: &D1,
+    d1_admission: &'d1 D1,
     // 2026-08-04, @kiana, WIP audit point A: now used — the initiator's
     // own `effective_expires_at` check (v6 §7) needs a live `now` reading
     // once `proof_r`'s delegation is verified, the same requirement the
@@ -1041,7 +1070,7 @@ pub(crate) fn run_initiator_handshake<S, Sig, Ver, D1, C>(
     // See the identical parameter on `run_responder_handshake`.
     lease_expires_at: u64,
     rekey_threshold: RekeyThreshold,
-) -> Result<ActiveMeshSession<S, D1::ActiveGate>, AuthFrameError>
+) -> Result<ActiveMeshSession<S, D1::Active<'d1>>, AuthFrameError>
 where
     S: Read + Write + wire::DeadlineBoundedIo,
     Sig: MeshSessionFrameSigner,
@@ -1065,17 +1094,19 @@ where
     // second, independently-suppliable parameter — the initiator is the
     // ONLY side that ever has or trusts one.
     let expected = pending_intent.expected_responder();
-    // 2026-08-04, @kiana, round 4: minted here — before Proof-I, before
-    // Activate, before anything is sent at all. If the mint fails, this
-    // side sends literally nothing, so there is no possibility the peer
-    // observes any progress from this attempt at all.
-    let rekey = SessionRekeyState::new(rekey_threshold)?;
 
     let (mut stream, ingress_evidence, deadline) = ingress.consume();
     // 2026-08-04, @kiana, definitive B: opaque monotonic deadline born at
     // admission, same as the responder side — checked before the first
     // Noise byte too.
     check_ceremony_deadline(&deadline)?;
+
+    // 2026-08-04, @kiana, round 4 + runtime-facade audit `3cbbfb37…` P1-1
+    // (reordered — supersedes minting this before `deadline` even
+    // existed): still before Proof-I, before Activate, before anything is
+    // sent at all — if the mint fails, this side sends literally nothing —
+    // but now also after the FIRST deadline check has run.
+    let rekey = SessionRekeyState::new(rekey_threshold)?;
 
     let handshake = noise::run_xx_handshake(&mut stream, Role::Initiator, &deadline)?;
     let mut transport = handshake.transport;
@@ -1219,29 +1250,30 @@ where
     let now = clock.now().map_err(AuthFrameError::from)?;
     check_effective_expiry(now, expires_at)?;
 
-    // 2026-08-04, @kiana, erratum1 E4 closing paragraph + C.4 (definitive):
-    // the initiator applies the SAME local discipline while awaiting
-    // ActivateAck, against the SAME richer, authenticated binding as the
-    // responder side — Pending/gate closed before Activate is sent,
-    // commit immediately on a valid Ack, cancel on any error/timeout in
-    // between.
-    // Role-neutral (2026-08-04, @kiana): on the initiator side, `local_*`
-    // is this machine (the initiator) and `peer_*` is the responder.
-    let d1_key = crate::intent::D1AdmissionKey::new(
+    // 2026-08-04, @kiana, erratum1 E4 closing paragraph + C.4 + runtime-
+    // facade audit `3cbbfb37…` item 4 (definitive): the initiator applies
+    // the SAME local discipline while awaiting ActivateAck, against the
+    // SAME authenticated D1-membership binding as the responder side —
+    // Pending/gate closed before Activate is sent, commit immediately on
+    // a valid Ack, cancel on any error/timeout in between. `peer_*` is
+    // the responder here (role-neutral naming, unchanged from before the
+    // split). D4 signer authority for the LOCAL delegation
+    // (`local.delegation.delegated_pub()`/`serial()`) is deliberately NOT
+    // assembled into an `IntentSignerBinding` on this side yet — doing so
+    // would mean either fabricating a D4 `generation` this crate has no
+    // resolver for on the initiator side, or silently reusing a
+    // placeholder value; item 5 scopes the initiator-side seam to a
+    // future facade's `load_exact` for the LOCAL signer (already modeled
+    // by the existing `Sig: MeshSessionFrameSigner` bound this function
+    // takes), not to resolving the PEER's generation the way the
+    // responder now does.
+    let d1_key = crate::intent::D1MembershipKey::new(
         h_final.clone(),
         local.hh_id.clone(),
-        local.m_id.clone(),
-        local.cert_fingerprint.clone(),
         expected.m_id.clone(),
         expected.cert_fingerprint.to_vec(),
-        pending_intent.intent().delegated_key_id().to_string(),
-        local.delegation.delegated_pub().to_vec(),
         checkpoint.hash.clone(),
         checkpoint.sequence,
-        checkpoint.event_head.clone(),
-        checkpoint.not_after,
-        expires_at,
-        expected_channel,
     );
     let pending = d1_admission.reserve_pending(&d1_key, &deadline)?;
 
@@ -1295,28 +1327,30 @@ where
     let _activate_ack = match ack_result {
         Ok(ack) => ack,
         Err(e) => {
-            // 2026-08-04, @kiana, WIP audit item (b): cancel_pending now
-            // returns Result rather than silently swallowing a real
-            // implementation's own inability to confirm cleanup. The
-            // ORIGINAL failure `e` is still what this attempt reports —
-            // it is the actual cause — but a cancel-confirmation failure
-            // is not silently discarded either; it is explicitly
-            // acknowledged here rather than left as an unchecked Result.
-            // A residual gap: this narrow abort path has nowhere to
-            // surface a cancel-ambiguity distinctly from `e` without this
-            // crate inventing an error-aggregation mechanism the frozen
-            // spec does not otherwise call for.
-            let _ = d1_admission.cancel_pending(pending, &deadline);
-            return Err(e);
+            // 2026-08-04, @kiana, runtime-facade audit `3cbbfb37…` P0-3
+            // (definitive — supersedes the earlier `let _ =`):
+            // `cancel_before_ack` returns `D1CancelOutcome` directly, and
+            // it is folded into the propagated error rather than
+            // discarded — same discipline as the responder side's write
+            // failure. `e` (the original Ack failure) is still the
+            // reported cause.
+            let cancel_outcome = pending.cancel_before_ack();
+            return Err(AuthFrameError::AckExchangeFailedWithCancelOutcome {
+                source: Box::new(e),
+                cancel_outcome,
+            });
         }
     };
 
     // Ack valid, verified in full: commit the local Pending immediately,
-    // nothing fallible/external between the check above and this call.
-    // 2026-08-04, @kiana, WIP audit point F/G, terminal — see the
-    // identical note in run_responder_handshake: `Ok(gate)` here IS the
-    // terminal Active transition; no post-hoc recheck-and-drop.
-    let gate = d1_admission.activate_if_authorized(pending, &deadline)?;
+    // infallibly, with nothing fallible/external between the check above
+    // and this call (2026-08-04, @kiana, runtime-facade audit `3cbbfb37…`
+    // P0-1/P0-2/P0-4, definitive — supersedes the earlier fallible
+    // `activate_if_authorized`). See the identical note in
+    // `run_responder_handshake` and `D1Pending::commit_after_ack`'s own
+    // doc for why this is safe even though a revoke may have already
+    // announced.
+    let gate = pending.commit_after_ack();
 
     // 2026-08-04, @kiana, round 4: `rekey` was minted at the top of this
     // function, before Activate was ever sent — nothing fallible remains
@@ -1387,33 +1421,58 @@ mod tests {
         }
     }
 
-    /// Always-succeeding D1Admission double: `Pending`/`ActiveGate` are
+    /// Always-succeeding D1Admission double: `Pending<'a>`/`Active<'a>` are
     /// just `()`. Used by tests where D1 admission's own mechanism isn't
-    /// under test — the dedicated D1 REDs inject their own doubles.
+    /// under test — the dedicated D1 REDs (and the GAT/Drop-lock-free
+    /// proofs in `intent.rs`'s own test module) inject their own,
+    /// genuinely borrowed doubles.
+    impl crate::intent::D1Pending<()> for () {
+        fn commit_after_ack(self) {}
+        fn cancel_before_ack(self) -> crate::intent::D1CancelOutcome {
+            crate::intent::D1CancelOutcome::CancelledAndRemoved
+        }
+    }
+
     struct AlwaysAdmitD1;
     impl crate::intent::D1Admission for AlwaysAdmitD1 {
-        type Pending = ();
-        type ActiveGate = ();
+        type Pending<'a> = ();
+        type Active<'a> = ();
         fn reserve_pending(
             &self,
-            _key: &crate::intent::D1AdmissionKey,
+            _key: &crate::intent::D1MembershipKey,
             _deadline: &CeremonyDeadline,
         ) -> Result<(), crate::error::IntentError> {
             Ok(())
         }
-        fn activate_if_authorized(
+    }
+
+    /// D4 resolver double pre-configured with a fixed, independently-known
+    /// authority — NOT derived from whatever a peer's frame claims
+    /// (2026-08-04, item 5). Every call site builds one from the SAME
+    /// values it independently used to construct the initiator's own
+    /// `LocalIdentity`/delegation, so this stays a genuine (if simplified)
+    /// resolver double rather than routing the peer's claim back through
+    /// itself — the dedicated resolver REDs additionally inject one
+    /// configured to return a deliberately MISMATCHED key/generation.
+    struct FixedResolver {
+        delegated_pub: Vec<u8>,
+        generation: u64,
+        not_after: u64,
+    }
+    impl crate::intent::RetainedGenerationResolver for FixedResolver {
+        fn resolve(
             &self,
-            _pending: (),
+            _hh_id: &str,
+            _initiator_m_id: &str,
+            _channel: ExpectedChannel,
+            _delegated_key_id: &str,
             _deadline: &CeremonyDeadline,
-        ) -> Result<(), crate::error::IntentError> {
-            Ok(())
-        }
-        fn cancel_pending(
-            &self,
-            _pending: (),
-            _deadline: &CeremonyDeadline,
-        ) -> Result<(), crate::error::IntentError> {
-            Ok(())
+        ) -> Result<crate::intent::ResolvedSignerAuthority, crate::error::IntentError> {
+            Ok(crate::intent::ResolvedSignerAuthority::new(
+                self.delegated_pub.clone(),
+                self.generation,
+                self.not_after,
+            ))
         }
     }
 
@@ -1679,6 +1738,15 @@ mod tests {
         let responder_identity =
             identity("hh-1", "responder-1", vec![0xCC; 32], responder_delegation);
 
+        let initiator_resolver = FixedResolver {
+            delegated_pub: initiator_verifying
+                .to_encoded_point(true)
+                .as_bytes()
+                .to_vec(),
+            generation: 1,
+            not_after: u64::MAX / 2,
+        };
+
         let responder = thread::spawn({
             let checkpoint = fixed_checkpoint();
             let k_mesh = TestKMesh(responder_key);
@@ -1703,6 +1771,7 @@ mod tests {
                     &InMemoryLedger::new(),
                     &AlwaysAdmitD1,
                     &FixedClock(0),
+                    &initiator_resolver,
                     u64::MAX / 2,
                     RekeyThreshold::new(3).unwrap(),
                 )
@@ -1758,6 +1827,141 @@ mod tests {
 
         let responder_session = responder.join().unwrap();
         (initiator_session, responder_session)
+    }
+
+    /// item 5 RED (2026-08-04, @kiana, runtime-facade audit `3cbbfb37…`
+    /// P0-5): a `RetainedGenerationResolver` that returns a genuinely
+    /// DIFFERENT key than the one the initiator actually signed with must
+    /// cause rejection — proving `initiator_verifier` is built from the
+    /// RESOLVED key, not `proof_i.delegation().delegated_pub()` (the
+    /// peer's own embedded, self-consistency-only claim). If this crate
+    /// regressed to building the verifier from the peer's claim again,
+    /// this test would incorrectly pass (Active) instead of failing.
+    #[test]
+    fn red_responder_resolver_returning_a_different_key_than_signed_is_rejected() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let responder_key = SigningKey::random(&mut OsRng);
+        let responder_verifying = VerifyingKey::from(&responder_key);
+        let initiator_key = SigningKey::random(&mut OsRng);
+        let initiator_verifying = VerifyingKey::from(&initiator_key);
+        // A THIRD, unrelated key — never used to sign anything — is what
+        // the resolver (wrongly, deliberately for this test) returns.
+        let wrong_key = SigningKey::random(&mut OsRng);
+        let wrong_verifying = VerifyingKey::from(&wrong_key);
+        assert_ne!(
+            initiator_verifying.to_encoded_point(true).as_bytes(),
+            wrong_verifying.to_encoded_point(true).as_bytes(),
+            "test fixture bug: wrong_key must differ from the real initiator key"
+        );
+
+        let responder_delegation = delegation_for_key(
+            &responder_verifying,
+            "hh-1",
+            "responder-1",
+            vec![0xCC; 32],
+            0,
+            u64::MAX / 2,
+        );
+        let responder_identity =
+            identity("hh-1", "responder-1", vec![0xCC; 32], responder_delegation);
+        let resolver_returning_wrong_key = FixedResolver {
+            delegated_pub: wrong_verifying.to_encoded_point(true).as_bytes().to_vec(),
+            generation: 1,
+            not_after: u64::MAX / 2,
+        };
+
+        let responder = thread::spawn({
+            let checkpoint = fixed_checkpoint();
+            let k_mesh = TestKMesh(responder_key);
+            move || {
+                let (sock, _) = listener.accept().unwrap();
+                let ingress = PrevalidatedIngress::admit_at_accept(
+                    sock,
+                    IngressEvidence {
+                        observed_at: 1,
+                        ingress_expiry: u64::MAX / 2,
+                    },
+                    far_future_budget(),
+                );
+                run_responder_handshake(
+                    ingress,
+                    &responder_identity,
+                    &checkpoint,
+                    ExpectedChannel::Dev,
+                    &DelegationPolicy::test(u64::MAX / 2),
+                    &AlwaysAcceptDelegation,
+                    &k_mesh,
+                    &InMemoryLedger::new(),
+                    &AlwaysAdmitD1,
+                    &FixedClock(0),
+                    &resolver_returning_wrong_key,
+                    u64::MAX / 2,
+                    RekeyThreshold::new(3).unwrap(),
+                )
+            }
+        });
+
+        let initiator_delegation = delegation_for_key(
+            &initiator_verifying,
+            "hh-1",
+            "initiator-1",
+            vec![0xEE; 32],
+            0,
+            u64::MAX / 2,
+        );
+        let initiator_identity =
+            identity("hh-1", "initiator-1", vec![0xEE; 32], initiator_delegation);
+        let sock = TcpStream::connect(addr).unwrap();
+        let ingress = PrevalidatedIngress::admit_at_accept(
+            sock,
+            IngressEvidence {
+                observed_at: 2,
+                ingress_expiry: u64::MAX / 2,
+            },
+            far_future_budget(),
+        );
+        let k_mesh = TestKMesh(initiator_key);
+        let pending_intent = pending_intent_for(
+            &k_mesh,
+            &initiator_identity,
+            &fixed_checkpoint(),
+            "responder-1",
+            vec![0xCC; 32],
+            [0x81; 32],
+            u64::MAX / 2,
+            ExpectedChannel::Dev,
+        );
+        // The initiator genuinely signs with its real key — the responder
+        // will reject not because the initiator misbehaved, but because
+        // the (misconfigured, for this test) resolver disagrees.
+        let _initiator_result = run_initiator_handshake(
+            ingress,
+            pending_intent,
+            &initiator_identity,
+            &fixed_checkpoint(),
+            ExpectedChannel::Dev,
+            &DelegationPolicy::test(u64::MAX / 2),
+            &AlwaysAcceptDelegation,
+            &k_mesh,
+            &AlwaysAdmitD1,
+            &FixedClock(0),
+            u64::MAX / 2,
+            RekeyThreshold::new(3).unwrap(),
+        );
+
+        let responder_result = responder.join().unwrap();
+        match responder_result {
+            Err(AuthFrameError::BadSignature) => {}
+            Err(other) => {
+                panic!("expected BadSignature (resolver's wrong key rejected), got {other:?}")
+            }
+            Ok(_) => panic!(
+                "expected the responder to reject Proof-I's signature against the \
+                 resolver's (wrong) key, but it reached Active"
+            ),
+        }
     }
 
     #[test]
@@ -1842,6 +2046,26 @@ mod tests {
         let responder_identity =
             identity("hh-1", "responder-1", vec![0xCC; 32], responder_delegation);
 
+        // Initiator delegation authorizes only up to not_after = 1_000 —
+        // strictly less than the intent's own claimed not_after below.
+        // `now` (FixedClock(0)) stays below both, so the min-based
+        // composite alone would incorrectly accept this. Generated before
+        // the responder thread spawns so the resolver double can be
+        // pre-configured with the real key/expiry, same as every other
+        // call site.
+        const DELEGATION_NOT_AFTER: u64 = 1_000;
+        const INTENT_NOT_AFTER: u64 = 2_000;
+        let initiator_key = SigningKey::random(&mut OsRng);
+        let initiator_verifying = VerifyingKey::from(&initiator_key);
+        let initiator_resolver = FixedResolver {
+            delegated_pub: initiator_verifying
+                .to_encoded_point(true)
+                .as_bytes()
+                .to_vec(),
+            generation: 1,
+            not_after: DELEGATION_NOT_AFTER,
+        };
+
         let responder = thread::spawn({
             let checkpoint = fixed_checkpoint();
             let k_mesh = TestKMesh(responder_key);
@@ -1866,6 +2090,7 @@ mod tests {
                     &PanicsIfConsumed,
                     &AlwaysAdmitD1,
                     &FixedClock(0),
+                    &initiator_resolver,
                     u64::MAX / 2,
                     RekeyThreshold::new(3).unwrap(),
                 )
@@ -1882,15 +2107,8 @@ mod tests {
             _ => panic!("expected ProofR"),
         }
 
-        // Initiator delegation authorizes only up to not_after = 1_000 —
-        // strictly less than the intent's own claimed not_after below.
-        // `now` (FixedClock(0)) stays below both, so the min-based
-        // composite alone would incorrectly accept this.
-        const DELEGATION_NOT_AFTER: u64 = 1_000;
-        const INTENT_NOT_AFTER: u64 = 2_000;
-        let initiator_key = SigningKey::random(&mut OsRng);
         let initiator_delegation = delegation_for_key(
-            &VerifyingKey::from(&initiator_key),
+            &initiator_verifying,
             "hh-1",
             "initiator-1",
             vec![0xEE; 32],
@@ -1985,6 +2203,14 @@ mod tests {
         );
         let responder_identity =
             identity("hh-1", "responder-1", vec![0xCC; 32], responder_delegation);
+        let initiator_resolver = FixedResolver {
+            delegated_pub: initiator_verifying
+                .to_encoded_point(true)
+                .as_bytes()
+                .to_vec(),
+            generation: 1,
+            not_after: u64::MAX / 2,
+        };
 
         let responder = thread::spawn({
             let checkpoint = fixed_checkpoint();
@@ -2010,6 +2236,7 @@ mod tests {
                     &InMemoryLedger::new(),
                     &AlwaysAdmitD1,
                     &FixedClock(0),
+                    &initiator_resolver,
                     u64::MAX / 2,
                     RekeyThreshold::new(3).unwrap(),
                 )
@@ -2130,6 +2357,20 @@ mod tests {
         let responder_identity =
             identity("hh-1", "responder-1", vec![0xCC; 32], responder_delegation);
 
+        // Generated before the responder thread spawns (this test never
+        // reaches the resolver — it rejects on ExpectedPeerMismatch first
+        // — but every call site pre-configures a real one regardless).
+        let initiator_key = SigningKey::random(&mut OsRng);
+        let initiator_verifying = VerifyingKey::from(&initiator_key);
+        let initiator_resolver = FixedResolver {
+            delegated_pub: initiator_verifying
+                .to_encoded_point(true)
+                .as_bytes()
+                .to_vec(),
+            generation: 1,
+            not_after: u64::MAX / 2,
+        };
+
         let responder = thread::spawn({
             let checkpoint = fixed_checkpoint();
             let k_mesh = TestKMesh(responder_key);
@@ -2154,6 +2395,7 @@ mod tests {
                     &InMemoryLedger::new(),
                     &AlwaysAdmitD1,
                     &FixedClock(0),
+                    &initiator_resolver,
                     u64::MAX / 2,
                     RekeyThreshold::new(3).unwrap(),
                 )
@@ -2174,9 +2416,8 @@ mod tests {
             _ => panic!("expected ProofR"),
         }
 
-        let initiator_key = SigningKey::random(&mut OsRng);
         let initiator_delegation = delegation_for_key(
-            &VerifyingKey::from(&initiator_key),
+            &initiator_verifying,
             "hh-1",
             "initiator-1",
             vec![0xEE; 32],
@@ -2265,6 +2506,16 @@ mod tests {
         );
         let responder_identity =
             identity("hh-1", "responder-1", vec![0xCC; 32], responder_delegation);
+        let initiator_key = SigningKey::random(&mut OsRng);
+        let initiator_verifying = VerifyingKey::from(&initiator_key);
+        let initiator_resolver = FixedResolver {
+            delegated_pub: initiator_verifying
+                .to_encoded_point(true)
+                .as_bytes()
+                .to_vec(),
+            generation: 1,
+            not_after: u64::MAX / 2,
+        };
 
         let responder = thread::spawn({
             let checkpoint = fixed_checkpoint();
@@ -2290,6 +2541,7 @@ mod tests {
                     &InMemoryLedger::new(),
                     &AlwaysAdmitD1,
                     &FixedClock(0),
+                    &initiator_resolver,
                     u64::MAX / 2,
                     RekeyThreshold::new(3).unwrap(),
                 )
@@ -2306,9 +2558,8 @@ mod tests {
             _ => panic!("expected ProofR"),
         }
 
-        let initiator_key = SigningKey::random(&mut OsRng);
         let initiator_delegation = delegation_for_key(
-            &VerifyingKey::from(&initiator_key),
+            &initiator_verifying,
             "hh-1",
             "initiator-1",
             vec![0xEE; 32],
@@ -2439,6 +2690,13 @@ mod tests {
             &InMemoryLedger::new(),
             &AlwaysAdmitD1,
             &FixedClock(0),
+            // Never reached — rejection happens before the first Noise
+            // byte, let alone the resolver seam.
+            &FixedResolver {
+                delegated_pub: vec![],
+                generation: 0,
+                not_after: 0,
+            },
             u64::MAX / 2,
             RekeyThreshold::new(3).unwrap(),
         );
@@ -2595,6 +2853,13 @@ mod tests {
             &InMemoryLedger::new(),
             &AlwaysAdmitD1,
             &FixedClock(0),
+            // Never reached — the deadline is already expired before any
+            // I/O, let alone the resolver seam.
+            &FixedResolver {
+                delegated_pub: vec![],
+                generation: 0,
+                not_after: 0,
+            },
             u64::MAX / 2,
             RekeyThreshold::new(3).unwrap(),
         );
@@ -2652,6 +2917,13 @@ mod tests {
             &InMemoryLedger::new(),
             &AlwaysAdmitD1,
             &FixedClock(0),
+            // Never reached — the rekey mint fails before any I/O, let
+            // alone the resolver seam.
+            &FixedResolver {
+                delegated_pub: vec![],
+                generation: 0,
+                not_after: 0,
+            },
             u64::MAX / 2,
             RekeyThreshold::new(3).unwrap(),
         );
@@ -3004,6 +3276,14 @@ mod tests {
                     &InMemoryLedger::new(),
                     &AlwaysAdmitD1,
                     &FixedClock(0),
+                    // Never reached — the missing-role delegation is
+                    // rejected by pass_delegation_gate, before the
+                    // resolver seam.
+                    &FixedResolver {
+                        delegated_pub: vec![],
+                        generation: 0,
+                        not_after: 0,
+                    },
                     u64::MAX / 2,
                     RekeyThreshold::new(3).unwrap(),
                 )
@@ -3223,6 +3503,13 @@ mod tests {
             &InMemoryLedger::new(),
             &AlwaysAdmitD1,
             &FixedClock(0),
+            // Never reached — the local channel mismatch is rejected
+            // before any I/O, let alone the resolver seam.
+            &FixedResolver {
+                delegated_pub: vec![],
+                generation: 0,
+                not_after: 0,
+            },
             u64::MAX / 2,
             RekeyThreshold::new(3).unwrap(),
         );
@@ -3349,6 +3636,13 @@ mod tests {
                     &InMemoryLedger::new(),
                     &AlwaysAdmitD1,
                     &FixedClock(0),
+                    // Never reached — NoVerifierConfigured always fails
+                    // pass_delegation_gate, before the resolver seam.
+                    &FixedResolver {
+                        delegated_pub: vec![],
+                        generation: 0,
+                        not_after: 0,
+                    },
                     u64::MAX / 2,
                     RekeyThreshold::new(3).unwrap(),
                 )
