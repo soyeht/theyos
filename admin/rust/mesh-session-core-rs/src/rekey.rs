@@ -107,7 +107,18 @@ pub fn rekey_threshold_default() -> RekeyThreshold {
 struct RekeyStateId([u8; 32]);
 
 impl RekeyStateId {
+    /// **Failpoint-checked (2026-08-04, @kiana, round 4):** a test can
+    /// force this specific call to fail via [`test_failpoint`] —
+    /// deterministically, without depending on real `OsRng` ever actually
+    /// failing — so callers that mint a rekey state late (e.g. after an
+    /// irreversible wire write) can be proven wrong by a REAL failure
+    /// path, not just argued about. See the module docs on
+    /// `auth_state_machine`'s two handshake functions for what this
+    /// closes.
     fn fresh() -> Result<Self, RekeyError> {
+        if test_failpoint::forced_failure() {
+            return Err(RekeyError::RngFailure);
+        }
         let mut bytes = [0u8; 32];
         OsRng
             .try_fill_bytes(&mut bytes)
@@ -122,6 +133,42 @@ impl RekeyStateId {
     #[cfg(test)]
     fn from_byte(b: u8) -> Self {
         Self([b; 32])
+    }
+}
+
+/// Test-only failpoint letting a test force the *next*
+/// `RekeyStateId::fresh()` call on the current thread to fail with
+/// `RngFailure`, one-shot (cleared the moment it's consumed). Exists so
+/// callers elsewhere in the crate (`auth_state_machine`'s handshake
+/// functions) can be tested against a real, deterministic mint failure —
+/// proving what happens on failure — rather than only against the happy
+/// path, since real `OsRng` failure cannot be reliably induced in a test.
+/// `pub(crate)`, not just `#[cfg(test)]`-private to this module: other
+/// modules' `#[cfg(test)]` test code needs to trigger it too.
+#[cfg(test)]
+pub(crate) mod test_failpoint {
+    use std::cell::Cell;
+
+    thread_local! {
+        static FORCE_NEXT_FRESH_TO_FAIL: Cell<bool> = const { Cell::new(false) };
+    }
+
+    /// Forces the next `RekeyStateId::fresh()` call **on this thread** to
+    /// return `RngFailure`. One-shot: cleared as soon as `fresh()`
+    /// consumes it, so it never leaks into a later, unrelated mint.
+    pub(crate) fn force_next_fresh_to_fail() {
+        FORCE_NEXT_FRESH_TO_FAIL.with(|f| f.set(true));
+    }
+
+    pub(crate) fn forced_failure() -> bool {
+        FORCE_NEXT_FRESH_TO_FAIL.with(|f| f.replace(false))
+    }
+}
+
+#[cfg(not(test))]
+mod test_failpoint {
+    pub(crate) fn forced_failure() -> bool {
+        false
     }
 }
 

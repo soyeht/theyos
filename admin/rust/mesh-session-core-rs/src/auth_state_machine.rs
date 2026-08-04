@@ -300,6 +300,10 @@ where
     Ver: DelegationSignatureVerifier,
 {
     check_signer_matches_delegation(k_mesh, &local.delegation)?;
+    // 2026-08-04, @kiana, round 4: minted here — before any I/O at all,
+    // long before ActivateAck is ever written — not after. See the
+    // hardening note on ActiveMeshSession's construction below for why.
+    let rekey = SessionRekeyState::new(rekey_threshold)?;
 
     let (mut stream, ingress_evidence) = ingress.consume();
 
@@ -411,6 +415,15 @@ where
     // 4. only on success does an ActiveMeshSession get constructed below;
     // 5. on failure this returns Err and NO ActiveMeshSession, EVER,
     //    exists for this attempt — zero effect, matching the erratum.
+    //
+    // 2026-08-04, @kiana, round 4: `rekey` (below) is NOT minted here.
+    // It was minted at the top of this function, before any I/O — a
+    // fallible RNG-backed mint running *after* this write would have let
+    // this write durably succeed (the peer can observe and act on it)
+    // while the RNG then failed locally, leaving no ActiveMeshSession on
+    // this side and a peer that could still reach Active on its own —
+    // exactly the asymmetric, non-atomic outcome the erratum forbids.
+    // Nothing between this write and `Ok` below is fallible.
     send_frame(
         &mut stream,
         &mut transport,
@@ -420,7 +433,7 @@ where
     Ok(ActiveMeshSession {
         stream,
         transport,
-        rekey: SessionRekeyState::new(rekey_threshold)?,
+        rekey,
         peer_hh_id: initiator_hh_id,
         peer_m_id: initiator_m_id,
         peer_cert_fingerprint: initiator_cert_fingerprint,
@@ -451,6 +464,11 @@ where
     Ver: DelegationSignatureVerifier,
 {
     check_signer_matches_delegation(k_mesh, &local.delegation)?;
+    // 2026-08-04, @kiana, round 4: minted here — before Proof-I, before
+    // Activate, before anything is sent at all. If the mint fails, this
+    // side sends literally nothing, so there is no possibility the peer
+    // observes any progress from this attempt at all.
+    let rekey = SessionRekeyState::new(rekey_threshold)?;
 
     let (mut stream, ingress_evidence) = ingress.consume();
 
@@ -565,10 +583,13 @@ where
         &responder_verifier,
     )?;
 
+    // 2026-08-04, @kiana, round 4: `rekey` was minted at the top of this
+    // function, before Activate was ever sent — nothing fallible remains
+    // between ActivateAck's verification above and this `Ok` below.
     Ok(ActiveMeshSession {
         stream,
         transport,
-        rekey: SessionRekeyState::new(rekey_threshold)?,
+        rekey,
         peer_hh_id: expected.hh_id.clone(),
         peer_m_id: expected.m_id.clone(),
         peer_cert_fingerprint: expected.cert_fingerprint.to_vec(),
@@ -1163,6 +1184,92 @@ mod tests {
         assert!(matches!(
             result,
             Err(AuthFrameError::SignerKeyMismatchDelegation)
+        ));
+    }
+
+    /// 2026-08-04, @kiana, round 4: `SessionRekeyState::new`'s RNG-backed
+    /// mint used to run AFTER the responder durably wrote ActivateAck —
+    /// a real (if rare) RNG failure there would have let the write reach
+    /// the peer while this side returned `Err` and produced no
+    /// `ActiveMeshSession`, breaking the erratum's atomic-linearization
+    /// guarantee (peer could still reach Active alone). The mint now
+    /// runs first, before any I/O. Uses the `test_failpoint` (real
+    /// deterministic failure injection, not a hope that `OsRng` fails)
+    /// plus `PanicsOnIo` to prove not just that the right `Err` comes
+    /// back, but that the responder never touches the stream at all —
+    /// so, a fortiori, ActivateAck (and every earlier frame) is never
+    /// written.
+    #[test]
+    fn red_responder_rekey_mint_failure_writes_zero_bytes_before_returning() {
+        let responder_key = SigningKey::random(&mut OsRng);
+        let delegation = delegation_for_key(
+            &VerifyingKey::from(&responder_key),
+            "hh-1",
+            "responder-1",
+            vec![0xCC; 32],
+            0,
+            u64::MAX / 2,
+        );
+        let local = identity("hh-1", "responder-1", vec![0xCC; 32], delegation);
+        let k_mesh = TestKMesh(responder_key);
+
+        crate::rekey::test_failpoint::force_next_fresh_to_fail();
+        let ingress = PrevalidatedIngress::new(PanicsOnIo, IngressEvidence { observed_at: 1 });
+        let result = run_responder_handshake(
+            ingress,
+            &local,
+            &fixed_checkpoint(),
+            &DelegationPolicy::test(u64::MAX / 2),
+            &AlwaysAcceptDelegation,
+            &k_mesh,
+            RekeyThreshold::new(3).unwrap(),
+        );
+        assert!(matches!(
+            result,
+            Err(AuthFrameError::Rekey(RekeyError::RngFailure))
+        ));
+    }
+
+    /// Same finding, initiator side (2026-08-04, @kiana, round 4): the
+    /// mint now runs before Proof-I, before Activate — before anything
+    /// is ever sent. If it fails, this side sends literally nothing, so
+    /// there is no way this attempt could cause a peer to reach Active.
+    /// `PanicsOnIo` proves zero I/O, not just the right `Err`.
+    #[test]
+    fn red_initiator_rekey_mint_failure_writes_zero_bytes_before_returning() {
+        let initiator_key = SigningKey::random(&mut OsRng);
+        let delegation = delegation_for_key(
+            &VerifyingKey::from(&initiator_key),
+            "hh-1",
+            "initiator-1",
+            vec![0xEE; 32],
+            0,
+            u64::MAX / 2,
+        );
+        let local = identity("hh-1", "initiator-1", vec![0xEE; 32], delegation);
+        let k_mesh = TestKMesh(initiator_key);
+        let expected = ExpectedResponder {
+            hh_id: "hh-1".to_string(),
+            m_id: "responder-1".to_string(),
+            cert_fingerprint: [0xCC; 32],
+        };
+
+        crate::rekey::test_failpoint::force_next_fresh_to_fail();
+        let ingress = PrevalidatedIngress::new(PanicsOnIo, IngressEvidence { observed_at: 1 });
+        let result = run_initiator_handshake(
+            ingress,
+            &expected,
+            &local,
+            &fixed_checkpoint(),
+            ConnectionIntentDigest::from_bytes([0x11; 32]),
+            &DelegationPolicy::test(u64::MAX / 2),
+            &AlwaysAcceptDelegation,
+            &k_mesh,
+            RekeyThreshold::new(3).unwrap(),
+        );
+        assert!(matches!(
+            result,
+            Err(AuthFrameError::Rekey(RekeyError::RngFailure))
         ));
     }
 
