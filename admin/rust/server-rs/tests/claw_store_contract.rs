@@ -375,7 +375,7 @@ fn owner_site_ake_route_is_single_ws_record_aead_and_stays_pre_effect_after_c3()
         "OwnerSiteAkePendingFinished",
         "next_a2_binary",
         "A2_HARNESS_WS_STEP_TIMEOUT",
-        "claim_after_verified_pop_for_harness",
+        "claim_after_verified_pop",
         "pause_after_claim_for_harness",
         "pause_after_s2_for_harness",
         "post_claim_recheck_rejections",
@@ -389,6 +389,13 @@ fn owner_site_ake_route_is_single_ws_record_aead_and_stays_pre_effect_after_c3()
     ] {
         assert!(ake.contains(required), "A2 source must retain `{required}`");
     }
+    // S2 promoted claim_after_verified_pop from cfg(test) harness to production.
+    // The _for_harness name must NOT survive — if it reappears, the AKE has
+    // regressed to a test-only claim path.
+    assert!(
+        !ake.contains("claim_after_verified_pop_for_harness"),
+        "A2 must use the production claim_after_verified_pop, not a test-only variant"
+    );
     assert!(
         !ake.contains("\"Noise_XX_25519_ChaChaPoly_SHA256\""),
         "A2 must not silently accept the unprofiled XX protocol name"
@@ -644,12 +651,52 @@ fn owner_site_pre_effect_route_is_router_only_and_capability_sibling() {
         !handler.contains("owner_site_challenge"),
         "the inert preflight handler must not issue or claim an A2 challenge"
     );
+    // S2 promoted OwnerSiteChallengeTable from cfg(test) to production.
+    // The table must be: production (no cfg(test) gate on the struct),
+    // bounded (MAX_OUTSTANDING cap), one-shot (atomic remove on claim),
+    // and constant-time (ct_eq on the secret hash). Harness constructors
+    // and accessors stay cfg(test); no serde/Clone/Default/public escape.
     assert!(
-        challenge.contains("#[cfg(test)]\npub(crate) struct OwnerSiteChallengeTable")
-            && challenge.contains("Sha256::digest")
-            && challenge.contains("ct_eq"),
-        "the B+C table must be test-only here and retain only a constant-time checked hash"
+        challenge.contains("pub(crate) struct OwnerSiteChallengeTable {")
+            && !challenge.contains("#[cfg(test)]\npub(crate) struct OwnerSiteChallengeTable"),
+        "the challenge table is production — no cfg(test) gate on the struct"
     );
+    assert!(
+        challenge.contains("MAX_OUTSTANDING_OWNER_SITE_CHALLENGES: usize = 16_384")
+            && challenge.contains("fn with_capacity(")
+            && challenge.contains("if entries.len() >= self.capacity"),
+        "the production table must be bounded by a fixed capacity ceiling"
+    );
+    assert!(
+        challenge.contains("fn claim_after_verified_pop(")
+            && challenge.contains("entries.remove(challenge_id);"),
+        "the production claim is one-shot: atomic remove after verified proof"
+    );
+    assert!(
+        challenge.contains("use subtle::ConstantTimeEq;") && challenge.contains("ct_eq"),
+        "the production table retains constant-time secret comparison"
+    );
+    assert!(
+        challenge.contains("#[cfg(test)]\n    #[must_use]\n    pub(crate) fn injected_for_harness"),
+        "injected_for_harness constructors stay cfg(test) — no production forging"
+    );
+    assert!(
+        challenge.contains("#[cfg(test)]\n    #[must_use]\n    pub(crate) fn bytes_for_harness"),
+        "bytes_for_harness accessors stay cfg(test)"
+    );
+    for forbidden in [
+        "Serialize for OwnerSiteChallengeTable",
+        "Deserialize for OwnerSiteChallengeTable",
+        "impl Default for OwnerSiteChallengeTable",
+        "impl Clone for OwnerSiteChallengeTable",
+        "pub fn new",
+        "pub struct OwnerSiteChallengeTable",
+    ] {
+        assert!(
+            !challenge.contains(forbidden),
+            "the production table must not acquire {forbidden}"
+        );
+    }
     for source in [authority, challenge] {
         for forbidden in [
             "use axum",
@@ -864,9 +911,12 @@ fn amendment_a1_challenge_accessors_are_projection_only() {
         challenge.contains("#[cfg(test)]\n    #[must_use]\n    pub(crate) fn injected_for_harness"),
         "injected_for_harness constructors stay test-only"
     );
+    // S2 promoted OwnerSiteChallengeTable from cfg(test) to production.
+    // The struct must NOT carry cfg(test); harness constructors do.
     assert!(
-        challenge.contains("#[cfg(test)]\npub(crate) struct OwnerSiteChallengeTable"),
-        "the challenge table stays test-only"
+        challenge.contains("pub(crate) struct OwnerSiteChallengeTable {")
+            && !challenge.contains("#[cfg(test)]\npub(crate) struct OwnerSiteChallengeTable"),
+        "the challenge table is production — promoted from cfg(test), no longer gated"
     );
     assert!(
         challenge.contains("pub(crate) fn bytes_for_harness(&self) -> &[u8; 32]"),

@@ -8,18 +8,12 @@
 
 #![allow(dead_code)] // staged until a reviewed production authority provider exists
 
-#[cfg(test)]
 use std::collections::HashMap;
-#[cfg(test)]
 use std::sync::Mutex;
 
-#[cfg(test)]
 use rand::RngCore;
-#[cfg(test)]
 use rand::rngs::OsRng;
-#[cfg(test)]
 use sha2::{Digest, Sha256};
-#[cfg(test)]
 use subtle::ConstantTimeEq;
 
 #[cfg(test)]
@@ -27,7 +21,6 @@ use crate::owner_site_authority::OwnerSiteBindingDigest;
 use crate::owner_site_authority::{
     OwnerSiteAuthorityGeneration, OwnerSiteBindingId, OwnerSiteResolvedBinding,
 };
-#[cfg(test)]
 use crate::owner_site_capability::OwnerSiteIntentError;
 use crate::owner_site_capability::{OwnerSiteIntent, OwnerSitePreAuthIntent};
 use zeroize::{Zeroize, ZeroizeOnDrop};
@@ -40,7 +33,6 @@ pub(crate) const OWNER_SITE_CHALLENGE_BYTES: usize = 32;
 pub(crate) const OWNER_SITE_CHALLENGE_TTL_SECS: u64 = 60;
 
 /// Bounded outstanding server-held challenge state.
-#[cfg(test)]
 const MAX_OUTSTANDING_OWNER_SITE_CHALLENGES: usize = 16_384;
 
 /// Server-created identifier that is safe to name in a future M2 payload. It
@@ -49,6 +41,19 @@ const MAX_OUTSTANDING_OWNER_SITE_CHALLENGES: usize = 16_384;
 pub(crate) struct OwnerSiteChallengeId([u8; OWNER_SITE_CHALLENGE_BYTES]);
 
 impl OwnerSiteChallengeId {
+    /// The production constructor: CSPRNG bytes, no test gate. Used by the
+    /// M1/M2 responder (3a-5 follow-on).
+    #[allow(dead_code)]
+    #[must_use]
+    pub(crate) fn generate() -> Self {
+        random_id()
+    }
+
+    #[must_use]
+    pub(crate) fn as_bytes(&self) -> &[u8; OWNER_SITE_CHALLENGE_BYTES] {
+        &self.0
+    }
+
     #[cfg(test)]
     #[must_use]
     pub(crate) fn bytes_for_harness(&self) -> &[u8; OWNER_SITE_CHALLENGE_BYTES] {
@@ -68,6 +73,19 @@ impl std::fmt::Debug for OwnerSiteChallengeId {
 pub(crate) struct OwnerSiteChallengeSecret([u8; OWNER_SITE_CHALLENGE_BYTES]);
 
 impl OwnerSiteChallengeSecret {
+    /// The production constructor: CSPRNG bytes, no test gate. Used by the
+    /// M1/M2 responder (3a-5 follow-on).
+    #[allow(dead_code)]
+    #[must_use]
+    pub(crate) fn generate() -> Self {
+        random_secret()
+    }
+
+    #[must_use]
+    pub(crate) fn as_bytes(&self) -> &[u8; OWNER_SITE_CHALLENGE_BYTES] {
+        &self.0
+    }
+
     #[cfg(test)]
     #[must_use]
     pub(crate) fn bytes_for_harness(&self) -> &[u8; OWNER_SITE_CHALLENGE_BYTES] {
@@ -90,6 +108,15 @@ impl std::fmt::Debug for OwnerSiteChallengeSecret {
 pub(crate) struct OwnerSiteWebSocketInstance([u8; 32]);
 
 impl OwnerSiteWebSocketInstance {
+    /// The production constructor: CSPRNG bytes, no test gate.
+    #[allow(dead_code)]
+    #[must_use]
+    pub(crate) fn generate() -> Self {
+        let mut bytes = [0u8; 32];
+        rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut bytes);
+        Self(bytes)
+    }
+
     #[cfg(test)]
     #[must_use]
     pub(crate) fn injected_for_harness(bytes: [u8; 32]) -> Self {
@@ -109,6 +136,15 @@ impl OwnerSiteWebSocketInstance {
 pub(crate) struct OwnerSiteChannelId([u8; 32]);
 
 impl OwnerSiteChannelId {
+    /// The production constructor: CSPRNG bytes, no test gate.
+    #[allow(dead_code)]
+    #[must_use]
+    pub(crate) fn generate() -> Self {
+        let mut bytes = [0u8; 32];
+        rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut bytes);
+        Self(bytes)
+    }
+
     #[cfg(test)]
     #[must_use]
     pub(crate) fn injected_for_harness(bytes: [u8; 32]) -> Self {
@@ -135,6 +171,15 @@ impl OwnerSiteChannelId {
 pub(crate) struct OwnerSiteChannelEpoch(std::num::NonZeroU64);
 
 impl OwnerSiteChannelEpoch {
+    /// The production constructor: validated nonzero, no test gate. The
+    /// responder's counter supplies the value; resumption does not exist.
+    #[allow(dead_code)]
+    pub(crate) fn new(value: u64) -> Result<Self, OwnerSiteChallengeError> {
+        std::num::NonZeroU64::new(value)
+            .map(Self)
+            .ok_or(OwnerSiteChallengeError::ZeroChannelEpoch)
+    }
+
     #[cfg(test)]
     pub(crate) fn injected_for_harness(value: u64) -> Result<Self, OwnerSiteChallengeError> {
         std::num::NonZeroU64::new(value)
@@ -153,6 +198,15 @@ impl OwnerSiteChannelEpoch {
 pub(crate) struct OwnerSiteTranscriptT1([u8; 32]);
 
 impl OwnerSiteTranscriptT1 {
+    /// The production constructor: wraps the T1 the responder JUST computed
+    /// with `server_auth_t1` — never wire bytes (the challenge commits the
+    /// server's own transcript).
+    #[allow(dead_code)]
+    #[must_use]
+    pub(crate) fn from_computed_t1(bytes: [u8; 32]) -> Self {
+        Self(bytes)
+    }
+
     #[cfg(test)]
     #[must_use]
     pub(crate) fn injected_for_harness(bytes: [u8; 32]) -> Self {
@@ -176,6 +230,20 @@ pub(crate) struct OwnerSiteEngineIdentityCommitment {
 }
 
 impl OwnerSiteEngineIdentityCommitment {
+    /// The production constructor: the engine's own machine-certificate
+    /// digest and key id, from the loaded household identity — never from a
+    /// peer message.
+    #[allow(dead_code)]
+    pub(crate) fn from_engine_identity(
+        machine_certificate_digest: [u8; 32],
+        engine_key_id: &str,
+    ) -> Result<Self, OwnerSiteIntentError> {
+        Ok(Self {
+            machine_certificate_digest,
+            engine_key_id: validated_engine_key_id(engine_key_id)?,
+        })
+    }
+
     #[cfg(test)]
     pub(crate) fn injected_for_harness(
         machine_certificate_digest: [u8; 32],
@@ -202,7 +270,6 @@ impl OwnerSiteEngineIdentityCommitment {
 /// the existing `engine:test` and `engine.v1` forms while remaining bounded and
 /// ASCII-only; the AKE/provider slice will bind the exact id to a household
 /// authority before it has any meaning.
-#[cfg(test)]
 fn validated_engine_key_id(value: &str) -> Result<String, OwnerSiteIntentError> {
     if value.is_empty()
         || value.len() > 128
@@ -236,6 +303,34 @@ pub(crate) struct OwnerSiteChallengeIssueScope {
 }
 
 impl OwnerSiteChallengeIssueScope {
+    /// The production constructor for the responder's `begin_m1`: every field
+    /// arrives from server-held state (see the field docs above).
+    #[allow(dead_code)]
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn from_responder(
+        pre_auth_intent: OwnerSitePreAuthIntent,
+        claimed_binding_id: OwnerSiteBindingId,
+        ws_instance: OwnerSiteWebSocketInstance,
+        channel_id: OwnerSiteChannelId,
+        channel_epoch: OwnerSiteChannelEpoch,
+        engine_identity: OwnerSiteEngineIdentityCommitment,
+        transcript_t1: OwnerSiteTranscriptT1,
+        authority_generation: OwnerSiteAuthorityGeneration,
+        fresh_until: u64,
+    ) -> Self {
+        Self {
+            pre_auth_intent,
+            claimed_binding_id,
+            ws_instance,
+            channel_id,
+            channel_epoch,
+            engine_identity,
+            transcript_t1,
+            authority_generation,
+            fresh_until,
+        }
+    }
+
     #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn injected_for_harness(
@@ -276,6 +371,32 @@ pub(crate) struct OwnerSiteChallengeClaimScope {
 }
 
 impl OwnerSiteChallengeClaimScope {
+    /// The production constructor: builds the claim scope from the server's
+    /// OWN session state (issue from `begin_m1`, resolved intent and binding
+    /// from roster resolution), with the same consistency checks as the
+    /// harness path.
+    #[allow(dead_code)]
+    pub(crate) fn from_session(
+        issue: OwnerSiteChallengeIssueScope,
+        resolved_intent: OwnerSiteIntent,
+        resolved_binding: OwnerSiteResolvedBinding,
+    ) -> Result<Self, OwnerSiteChallengeError> {
+        if issue.pre_auth_intent != *resolved_intent.pre_auth()
+            || issue.claimed_binding_id != resolved_binding.binding_id()
+            || issue.authority_generation.digest() == [0; 32]
+        {
+            return Err(OwnerSiteChallengeError::ClaimContextMismatch);
+        }
+        if issue.authority_generation.authz_epoch() == 0 {
+            return Err(OwnerSiteChallengeError::ClaimContextMismatch);
+        }
+        Ok(Self {
+            issue,
+            resolved_intent,
+            resolved_binding,
+        })
+    }
+
     #[cfg(test)]
     pub(crate) fn injected_for_harness(
         issue: OwnerSiteChallengeIssueScope,
@@ -283,7 +404,7 @@ impl OwnerSiteChallengeClaimScope {
         resolved_binding: OwnerSiteResolvedBinding,
     ) -> Result<Self, OwnerSiteChallengeError> {
         if issue.pre_auth_intent != *resolved_intent.pre_auth()
-            || issue.claimed_binding_id != resolved_binding.binding_id_for_harness()
+            || issue.claimed_binding_id != resolved_binding.binding_id()
             || issue.authority_generation.digest() == [0; 32]
         {
             return Err(OwnerSiteChallengeError::ClaimContextMismatch);
@@ -318,13 +439,34 @@ impl OwnerSiteIssuedChallenge {
     /// A2 transcript commits both values, so a later atomic table insertion
     /// receives the completed issue scope rather than accepting caller-chosen
     /// entropy.
-    #[cfg(test)]
+    /// The production constructor: CSPRNG challenge material, no test gate.
+    #[allow(dead_code)]
     #[must_use]
-    pub(crate) fn generated_for_ake_harness() -> Self {
+    pub(crate) fn generate() -> Self {
         Self {
             challenge_id: random_id(),
             challenge_secret: random_secret(),
         }
+    }
+
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn generated_for_ake_harness() -> Self {
+        Self::generate()
+    }
+
+    /// The issued id, for the M2 wire and the transcript commit.
+    #[allow(dead_code)]
+    #[must_use]
+    pub(crate) fn id(&self) -> &OwnerSiteChallengeId {
+        &self.challenge_id
+    }
+
+    /// The issued secret, for the M2 wire and the transcript commit.
+    #[allow(dead_code)]
+    #[must_use]
+    pub(crate) fn secret(&self) -> &OwnerSiteChallengeSecret {
+        &self.challenge_secret
     }
 
     #[cfg(test)]
@@ -340,7 +482,6 @@ impl OwnerSiteIssuedChallenge {
     }
 }
 
-#[cfg(test)]
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct OwnerSiteChallengeEntry {
     challenge_hash: [u8; 32],
@@ -352,33 +493,34 @@ struct OwnerSiteChallengeEntry {
 /// The only state present before atomic claim is `Unused`. A later handler
 /// removes the entry at its point of no return; there is no retry/resumption
 /// state in this model.
-#[cfg(test)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum OwnerSiteChallengeState {
     Unused,
 }
 
-/// Test-only implementation of the bounded one-shot A2 challenge table.
+/// The bounded one-shot A2 challenge table, PROMOTED to production (S2).
 ///
-/// Keeping mutation under `cfg(test)` prevents the pre-effect HTTP endpoint
-/// from accidentally becoming an issuance or claim surface. The later AKE PR
-/// must promote it only together with the single-WS local gate and full M1/M2/
-/// M3 validation order.
-#[cfg(test)]
+/// DOWNGRADE, SAID OUT LOUD: before this promotion, no challenge could exist
+/// in production at all — fail-closed by ABSENCE, the table uninhabitable.
+/// After it, challenges exist under bounds: capacity, 60s TTL, one-shot
+/// atomic claim, and the authority-lease check (`AuthorityLeaseTooShort` —
+/// a challenge may never outlive the authority freshness that issued it).
+/// That is fail-closed by DECISION, strictly weaker than absence. Named so
+/// the next reader does not mistake a promoted guarantee for a kept one.
 pub(crate) struct OwnerSiteChallengeTable {
     entries: Mutex<HashMap<OwnerSiteChallengeId, OwnerSiteChallengeEntry>>,
     capacity: usize,
 }
 
-#[cfg(test)]
+#[allow(dead_code)] // consumed by the A2 responder (next increment)
 impl OwnerSiteChallengeTable {
     #[must_use]
-    pub(crate) fn new_for_harness() -> Self {
-        Self::with_capacity_for_harness(MAX_OUTSTANDING_OWNER_SITE_CHALLENGES)
+    pub(crate) fn new() -> Self {
+        Self::with_capacity(MAX_OUTSTANDING_OWNER_SITE_CHALLENGES)
     }
 
     #[must_use]
-    pub(crate) fn with_capacity_for_harness(capacity: usize) -> Self {
+    pub(crate) fn with_capacity(capacity: usize) -> Self {
         Self {
             entries: Mutex::new(HashMap::new()),
             capacity,
@@ -387,20 +529,20 @@ impl OwnerSiteChallengeTable {
 
     /// Generates distinct CSPRNG id and secret values, retaining only
     /// `SHA-256(secret)` plus the complete pre-auth A2 issuance context.
-    pub(crate) fn issue_for_harness(
+    pub(crate) fn issue(
         &self,
         issue: OwnerSiteChallengeIssueScope,
         now_unix: u64,
     ) -> Result<OwnerSiteIssuedChallenge, OwnerSiteChallengeError> {
-        let issued = OwnerSiteIssuedChallenge::generated_for_ake_harness();
-        self.insert_generated_for_harness(issue, &issued, now_unix)?;
+        let issued = OwnerSiteIssuedChallenge::generate();
+        self.insert_generated(issue, &issued, now_unix)?;
         Ok(issued)
     }
 
     /// Inserts CSPRNG material already generated by the A2 responder after it
     /// has committed that exact material into T1.  This is crate-test-only
     /// while no reviewed production authority provider can enter the handler.
-    pub(crate) fn insert_generated_for_harness(
+    pub(crate) fn insert_generated(
         &self,
         issue: OwnerSiteChallengeIssueScope,
         issued: &OwnerSiteIssuedChallenge,
@@ -437,7 +579,7 @@ impl OwnerSiteChallengeTable {
     /// Atomically removes one exact, unexpired entry after the caller supplies
     /// the full M3-resolved scope and the secret that hashes to the stored
     /// digest. A wrong secret or scope deliberately leaves the entry intact.
-    pub(crate) fn claim_once_for_harness(
+    pub(crate) fn claim_once(
         &self,
         challenge_id: &OwnerSiteChallengeId,
         challenge_secret: &OwnerSiteChallengeSecret,
@@ -465,7 +607,7 @@ impl OwnerSiteChallengeTable {
     /// The secret is intentionally not echoed in M3: the table retains only
     /// its hash, while the ephemeral M1/M2/M3 state supplies it to the signed
     /// transcript verifier before this atomic transition.
-    pub(crate) fn claim_after_verified_pop_for_harness(
+    pub(crate) fn claim_after_verified_pop(
         &self,
         challenge_id: &OwnerSiteChallengeId,
         expected: &OwnerSiteChallengeClaimScope,
@@ -483,18 +625,13 @@ impl OwnerSiteChallengeTable {
         Ok(())
     }
 
-    #[must_use]
-    pub(crate) fn outstanding_for_harness(
-        &self,
-        now_unix: u64,
-    ) -> Result<usize, OwnerSiteChallengeError> {
+    pub(crate) fn outstanding(&self, now_unix: u64) -> Result<usize, OwnerSiteChallengeError> {
         let mut entries = self.lock_entries()?;
         entries.retain(|_, entry| entry.expires_at > now_unix);
         Ok(entries.len())
     }
 
-    #[must_use]
-    pub(crate) fn stored_hash_for_harness(
+    pub(crate) fn stored_hash(
         &self,
         challenge_id: &OwnerSiteChallengeId,
     ) -> Result<[u8; 32], OwnerSiteChallengeError> {
@@ -516,21 +653,18 @@ impl OwnerSiteChallengeTable {
     }
 }
 
-#[cfg(test)]
 fn random_id() -> OwnerSiteChallengeId {
     let mut bytes = [0u8; OWNER_SITE_CHALLENGE_BYTES];
     OsRng.fill_bytes(&mut bytes);
     OwnerSiteChallengeId(bytes)
 }
 
-#[cfg(test)]
 fn random_secret() -> OwnerSiteChallengeSecret {
     let mut bytes = [0u8; OWNER_SITE_CHALLENGE_BYTES];
     OsRng.fill_bytes(&mut bytes);
     OwnerSiteChallengeSecret(bytes)
 }
 
-#[cfg(test)]
 fn hash_secret(secret: &OwnerSiteChallengeSecret) -> [u8; 32] {
     Sha256::digest(secret.0).into()
 }
@@ -653,17 +787,17 @@ mod tests {
 
     #[test]
     fn issue_keeps_only_hash_of_distinct_csprng_secret_and_claims_once() {
-        let table = OwnerSiteChallengeTable::new_for_harness();
+        let table = OwnerSiteChallengeTable::new();
         let (issue, claim) = matching_scopes();
-        let issued = table.issue_for_harness(issue, 1_000).expect("challenge");
+        let issued = table.issue(issue, 1_000).expect("challenge");
         let stored = table
-            .stored_hash_for_harness(issued.id_for_harness())
+            .stored_hash(issued.id_for_harness())
             .expect("stored hash");
 
         assert_ne!(stored, issued.secret_for_harness().0);
-        assert_eq!(table.outstanding_for_harness(1_001), Ok(1));
+        assert_eq!(table.outstanding(1_001), Ok(1));
         assert_eq!(
-            table.claim_once_for_harness(
+            table.claim_once(
                 issued.id_for_harness(),
                 issued.secret_for_harness(),
                 &claim,
@@ -671,20 +805,20 @@ mod tests {
             ),
             Ok(())
         );
-        assert_eq!(table.outstanding_for_harness(1_002), Ok(0));
+        assert_eq!(table.outstanding(1_002), Ok(0));
     }
 
     #[test]
     fn wrong_secret_ws_channel_or_canonical_request_does_not_claim() {
-        let table = OwnerSiteChallengeTable::new_for_harness();
+        let table = OwnerSiteChallengeTable::new();
         let (issue, claim) = matching_scopes();
-        let issued = table.issue_for_harness(issue, 1_000).expect("challenge");
+        let issued = table.issue(issue, 1_000).expect("challenge");
         let wrong_secret = OwnerSiteChallengeSecret([0x99; OWNER_SITE_CHALLENGE_BYTES]);
         assert_eq!(
-            table.claim_once_for_harness(issued.id_for_harness(), &wrong_secret, &claim, 1_001,),
+            table.claim_once(issued.id_for_harness(), &wrong_secret, &claim, 1_001,),
             Err(OwnerSiteChallengeError::ClaimContextMismatch)
         );
-        assert_eq!(table.outstanding_for_harness(1_001), Ok(1));
+        assert_eq!(table.outstanding(1_001), Ok(1));
 
         let wrong_ws = issue_scope(
             "/api/v1/household/claws/{name}/owner-site/preflight",
@@ -694,7 +828,7 @@ mod tests {
         );
         let wrong_ws_claim = claim_scope(wrong_ws, [0x44; 32]).expect("wrong-ws claim scope");
         assert_eq!(
-            table.claim_once_for_harness(
+            table.claim_once(
                 issued.id_for_harness(),
                 issued.secret_for_harness(),
                 &wrong_ws_claim,
@@ -712,7 +846,7 @@ mod tests {
         let wrong_channel_claim =
             claim_scope(wrong_channel, [0x44; 32]).expect("wrong-channel claim scope");
         assert_eq!(
-            table.claim_once_for_harness(
+            table.claim_once(
                 issued.id_for_harness(),
                 issued.secret_for_harness(),
                 &wrong_channel_claim,
@@ -731,7 +865,7 @@ mod tests {
             claim_scope(wrong_request, [0x44; 32]),
             Err(OwnerSiteChallengeError::ClaimContextMismatch)
         );
-        assert_eq!(table.outstanding_for_harness(1_001), Ok(1));
+        assert_eq!(table.outstanding(1_001), Ok(1));
     }
 
     #[test]
@@ -748,16 +882,14 @@ mod tests {
 
     #[test]
     fn expiry_capacity_and_short_authority_lease_fail_closed() {
-        let table = OwnerSiteChallengeTable::with_capacity_for_harness(1);
+        let table = OwnerSiteChallengeTable::with_capacity(1);
         let (issue, _) = matching_scopes();
-        let issued = table
-            .issue_for_harness(issue.clone(), 1_000)
-            .expect("challenge");
+        let issued = table.issue(issue.clone(), 1_000).expect("challenge");
         assert_eq!(
-            table.issue_for_harness(issue.clone(), 1_001),
+            table.issue(issue.clone(), 1_001),
             Err(OwnerSiteChallengeError::CapacityReached)
         );
-        assert_eq!(table.outstanding_for_harness(1_060), Ok(0));
+        assert_eq!(table.outstanding(1_060), Ok(0));
 
         let too_short = OwnerSiteChallengeIssueScope::injected_for_harness(
             issue.pre_auth_intent,
@@ -771,11 +903,11 @@ mod tests {
             1_059,
         );
         assert_eq!(
-            table.issue_for_harness(too_short, 1_000),
+            table.issue(too_short, 1_000),
             Err(OwnerSiteChallengeError::AuthorityLeaseTooShort)
         );
         assert_eq!(
-            table.claim_once_for_harness(
+            table.claim_once(
                 issued.id_for_harness(),
                 issued.secret_for_harness(),
                 &matching_scopes().1,
@@ -787,9 +919,9 @@ mod tests {
 
     #[test]
     fn concurrent_claim_has_exactly_one_winner() {
-        let table = Arc::new(OwnerSiteChallengeTable::new_for_harness());
+        let table = Arc::new(OwnerSiteChallengeTable::new());
         let (issue, claim) = matching_scopes();
-        let issued = table.issue_for_harness(issue, 1_000).expect("challenge");
+        let issued = table.issue(issue, 1_000).expect("challenge");
         let barrier = Arc::new(Barrier::new(3));
         let mut joins = Vec::new();
 
@@ -802,7 +934,7 @@ mod tests {
             joins.push(std::thread::spawn(move || {
                 barrier.wait();
                 table
-                    .claim_once_for_harness(&challenge_id, &challenge_secret, &claim, 1_001)
+                    .claim_once(&challenge_id, &challenge_secret, &claim, 1_001)
                     .is_ok()
             }));
         }
@@ -820,7 +952,7 @@ mod tests {
 
     #[test]
     fn poisoned_table_fails_closed() {
-        let table = Arc::new(OwnerSiteChallengeTable::new_for_harness());
+        let table = Arc::new(OwnerSiteChallengeTable::new());
         let poison = Arc::clone(&table);
         let _ = std::thread::spawn(move || {
             let _guard = poison.entries.lock().expect("lock");
@@ -830,8 +962,43 @@ mod tests {
 
         let (issue, _) = matching_scopes();
         assert_eq!(
-            table.issue_for_harness(issue, 1_000),
+            table.issue(issue, 1_000),
             Err(OwnerSiteChallengeError::Unavailable)
         );
+    }
+}
+
+#[cfg(test)]
+mod production_constructor_tests {
+    //! REDs for the production constructors: CSPRNG material differs across
+    //! calls (a constant-source mutant fails), epochs are nonzero, and the
+    //! harness constructors keep their exact old behavior.
+
+    use super::*;
+
+    #[test]
+    fn two_generated_challenges_differ() {
+        let a = OwnerSiteIssuedChallenge::generate();
+        let b = OwnerSiteIssuedChallenge::generate();
+        assert_ne!(a.id().as_bytes(), b.id().as_bytes());
+        assert_ne!(a.secret().as_bytes(), b.secret().as_bytes());
+    }
+
+    #[test]
+    fn channel_ids_and_ws_instances_are_random_per_call() {
+        assert_ne!(
+            OwnerSiteChannelId::generate().as_bytes(),
+            OwnerSiteChannelId::generate().as_bytes()
+        );
+        assert_ne!(
+            OwnerSiteWebSocketInstance::generate().as_bytes(),
+            OwnerSiteWebSocketInstance::generate().as_bytes()
+        );
+    }
+
+    #[test]
+    fn production_epoch_rejects_zero() {
+        assert!(OwnerSiteChannelEpoch::new(0).is_err());
+        assert_eq!(OwnerSiteChannelEpoch::new(7).unwrap().get(), 7);
     }
 }

@@ -28,13 +28,101 @@ pub(crate) const OWNER_SITE_AKE_MAX_RECORD_ENVELOPE_BYTES: usize = 16_389;
 
 /// Provider seam for the one-WebSocket A2 handshake.
 ///
-/// There is deliberately no production constructor.  A future reviewed
-/// provider must supply a machine identity and a signed, fresh roster without
-/// involving `ConnectInfo`, interface names, or address classification.
+/// S2 PAIR-1 PROMOTION — declaration (counted criterion, 1 of 2 real pairs):
+/// * *Before:* `#[cfg(not(test))]` returned `false` unconditionally — a layer
+///   that does nothing rejects everything perfectly.
+/// * *After:* the `cfg(not(test))` block is **deleted, deliberately** — not
+///   as a side effect of lifting test code. Production now evaluates the
+///   shared roster arm, and with `roster: None` (nothing installed) that
+///   evaluates to `false`: **the old production behavior is preserved
+///   exactly until the startup install lands.** The only cfg fork left is
+///   the harness early-return, additions-only.
+/// * *Why this arm may change:* S2 installs the first production provider
+///   (the startup install is its own named increment; this commit lands the
+///   arm and the shape, still unreachable from production wiring).
+/// * The roster arm holds NO address-derived input: identity facts only —
+///   the server-owned resource and the observation produced by
+///   `owner_site_roster_adapter` (co-possession authority; see its
+///   five-element declaration).
 #[derive(Clone)]
 pub(crate) struct OwnerSiteAkeProvider {
     #[cfg(test)]
     harness: Option<std::sync::Arc<OwnerSiteAkeHarness>>,
+    roster: Option<OwnerSiteRosterArm>,
+}
+
+/// The production arm's roster-backed admission state: which resources this
+/// provider serves (the admitted claw set, by name), and the latest
+/// observation the adapter produced. The observation arrives through a
+/// refresh loop (the roster coordinator does blocking file I/O, so it never
+/// runs inline in an admission check).
+#[derive(Clone)]
+pub(crate) struct OwnerSiteRosterArm {
+    admitted: std::sync::Arc<std::sync::RwLock<std::collections::BTreeSet<String>>>,
+    latest: std::sync::Arc<
+        std::sync::RwLock<Option<crate::owner_site_authority::OwnerSiteAuthorityObservation>>,
+    >,
+}
+
+// Consumed by the refresh loop when the startup install lands (named
+// increment); the allows come off then — same pattern as
+// OwnerSitePromotionWitness.
+#[allow(dead_code)]
+impl OwnerSiteRosterArm {
+    /// Single-resource arm (the pair-1 shape): a set of one.
+    #[must_use]
+    pub(crate) fn new(resource: &OwnerSiteResource) -> Self {
+        Self::with_admitted([resource.as_str().to_string()])
+    }
+
+    /// The admitted set is COARSE gating only — "is this claw served at
+    /// all". The EXACT binding check is downstream (pair 2), so a claw name
+    /// present here never implies admission of any intent against it.
+    #[must_use]
+    pub(crate) fn with_admitted(names: impl IntoIterator<Item = String>) -> Self {
+        Self {
+            admitted: std::sync::Arc::new(std::sync::RwLock::new(names.into_iter().collect())),
+            latest: std::sync::Arc::new(std::sync::RwLock::new(None)),
+        }
+    }
+
+    /// Handle for the refresh loop: replace the latest observation. The loop
+    /// replaces on success and leaves the previous value in place on failure
+    /// — a roster that goes dark does NOT clear a previously good
+    /// observation; admission freshness lives inside `observe()` itself
+    /// (the coordinator rejects stale checkpoints at query time).
+    #[must_use]
+    pub(crate) fn observation_slot(
+        &self,
+    ) -> std::sync::Arc<
+        std::sync::RwLock<Option<crate::owner_site_authority::OwnerSiteAuthorityObservation>>,
+    > {
+        std::sync::Arc::clone(&self.latest)
+    }
+
+    #[must_use]
+    fn admits(&self, resource: &OwnerSiteResource) -> bool {
+        let in_set = self
+            .admitted
+            .read()
+            .map(|set| set.contains(resource.as_str()))
+            .unwrap_or(false);
+        if !in_set {
+            return false;
+        }
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(u64::MAX);
+        self.latest
+            .read()
+            .map(|guard| {
+                guard
+                    .as_ref()
+                    .is_some_and(|observation| observation.is_fresh_at(now))
+            })
+            .unwrap_or(false)
+    }
 }
 
 impl OwnerSiteAkeProvider {
@@ -45,6 +133,7 @@ impl OwnerSiteAkeProvider {
     pub(crate) fn injected_for_harness(harness: OwnerSiteAkeHarness) -> Self {
         Self {
             harness: Some(std::sync::Arc::new(harness)),
+            roster: None,
         }
     }
 
@@ -54,20 +143,49 @@ impl OwnerSiteAkeProvider {
         self.harness.clone()
     }
 
+    /// The first production-shaped provider: roster-backed, no address
+    /// inputs. Still NOT installed by any production wiring — the startup
+    /// install is a separate named increment.
+    #[allow(dead_code)]
+    #[must_use]
+    pub(crate) fn for_roster(resource: &OwnerSiteResource) -> Self {
+        Self {
+            #[cfg(test)]
+            harness: None,
+            roster: Some(OwnerSiteRosterArm::new(resource)),
+        }
+    }
+
+    /// The production install shape: one provider serving the admitted claw
+    /// set (coarse gate; exact binding checks are downstream).
+    #[allow(dead_code)]
+    #[must_use]
+    pub(crate) fn for_roster_set(names: impl IntoIterator<Item = String>) -> Self {
+        Self {
+            #[cfg(test)]
+            harness: None,
+            roster: Some(OwnerSiteRosterArm::with_admitted(names)),
+        }
+    }
+
+    /// The roster arm, for the refresh loop to feed (and for tests to
+    /// observe). `None` for the harness provider.
+    #[allow(dead_code)]
+    #[must_use]
+    pub(crate) fn roster_arm(&self) -> Option<&OwnerSiteRosterArm> {
+        self.roster.as_ref()
+    }
+
     /// Checks the server-owned resource before accepting a WebSocket upgrade.
     #[must_use]
     pub(crate) fn admits_resource(&self, resource: &OwnerSiteResource) -> bool {
         #[cfg(test)]
         {
-            self.harness
-                .as_ref()
-                .is_some_and(|harness| harness.admits_resource(resource))
+            if let Some(harness) = &self.harness {
+                return harness.admits_resource(resource);
+            }
         }
-        #[cfg(not(test))]
-        {
-            let _ = (self, resource);
-            false
-        }
+        self.roster.as_ref().is_some_and(|arm| arm.admits(resource))
     }
 
     /// Drives the test-only A2 handshake and S2/C3 confirmation on one WebSocket.
@@ -106,6 +224,9 @@ mod harness {
         atomic::{AtomicU64, AtomicUsize, Ordering},
     };
 
+    use crate::owner_site_a2_wire::{
+        CanonicalIntent, ClientHello, ClientHelloCore, ClientProof, ServerHello,
+    };
     use axum::extract::ws::{Message, WebSocket};
     use futures_util::{SinkExt, StreamExt};
     use household_rs::machine_cert::SignOptions;
@@ -387,7 +508,7 @@ mod harness {
             let signature_d = sign_p256(
                 self.channel_auth_signer.as_ref(),
                 &device_auth_hash(
-                    binding_pre,
+                    &binding_pre,
                     self.binding_id,
                     self.binding_digest,
                     &self.participant_npub,
@@ -395,7 +516,7 @@ mod harness {
                 )?,
             )?;
             let action_hash = owner_action_hash(
-                binding_pre,
+                &binding_pre,
                 &m2,
                 &self.c1.core,
                 self.binding_id,
@@ -696,7 +817,7 @@ mod harness {
                 engine_signer,
                 engine_machine_certificate: certificate.clone(),
                 engine_key_id: A2_ENGINE_KEY_ID.to_owned(),
-                challenges: OwnerSiteChallengeTable::new_for_harness(),
+                challenges: OwnerSiteChallengeTable::new(),
                 next_channel_epoch: AtomicU64::new(1),
                 revoked_roster,
                 after_claim_pause: Mutex::new(None),
@@ -981,7 +1102,7 @@ mod harness {
                 fresh_until,
             );
             self.challenges
-                .insert_generated_for_harness(issue.clone(), &issued, A2_NOW)
+                .insert_generated(issue.clone(), &issued, A2_NOW)
                 .map_err(|_| OwnerSiteAkeFailure::Rejected)?;
             self.effects.challenge_issues.fetch_add(1, Ordering::SeqCst);
 
@@ -1139,7 +1260,7 @@ mod harness {
 
             let binding_pre = pop_binding_pre(self.t1, device_static)?;
             let d_auth = device_auth_hash(
-                binding_pre,
+                &binding_pre,
                 resolved.binding_id(),
                 resolved.binding_digest(),
                 resolved.participant_npub(),
@@ -1151,7 +1272,7 @@ mod harness {
                 &proof.device_signature,
             )?;
             let action = owner_action_hash(
-                binding_pre,
+                &binding_pre,
                 &self.m2,
                 &self.c1.core,
                 resolved.binding_id(),
@@ -1172,7 +1293,7 @@ mod harness {
             .map_err(|_| OwnerSiteAkeFailure::Rejected)?;
             harness
                 .challenges
-                .claim_after_verified_pop_for_harness(self.issued.id_for_harness(), &claim, A2_NOW)
+                .claim_after_verified_pop(self.issued.id_for_harness(), &claim, A2_NOW)
                 .map_err(|_| OwnerSiteAkeFailure::Rejected)?;
             harness
                 .effects
@@ -1478,19 +1599,6 @@ mod harness {
         }
     }
 
-    #[derive(Clone, Deserialize, Serialize)]
-    struct ClientHelloCore {
-        domain: String,
-        version: u8,
-        household_id: String,
-        network_id: String,
-        route: String,
-        resource: String,
-        intent: CanonicalIntent,
-        #[serde(with = "serde_bytes")]
-        claimed_binding_id: Vec<u8>,
-    }
-
     impl ClientHelloCore {
         fn from_intent(
             intent: &OwnerSiteIntent,
@@ -1513,56 +1621,6 @@ mod harness {
         }
     }
 
-    #[derive(Clone, Deserialize, Serialize)]
-    struct ClientHello {
-        core: ClientHelloCore,
-        #[serde(with = "serde_bytes")]
-        device_ephemeral: Vec<u8>,
-    }
-
-    #[derive(Clone, Deserialize, Serialize)]
-    struct CanonicalIntent {
-        method: String,
-        target: String,
-        #[serde(with = "serde_bytes")]
-        body_hash: Vec<u8>,
-    }
-
-    #[derive(Clone, Deserialize, Serialize)]
-    struct ServerHello {
-        #[serde(with = "serde_bytes")]
-        engine_machine_certificate: Vec<u8>,
-        engine_key_id: String,
-        #[serde(with = "serde_bytes")]
-        channel_id: Vec<u8>,
-        channel_epoch: u64,
-        #[serde(with = "serde_bytes")]
-        challenge_id: Vec<u8>,
-        #[serde(with = "serde_bytes")]
-        challenge_secret: Vec<u8>,
-        authz_epoch: u64,
-        #[serde(with = "serde_bytes")]
-        roster_digest: Vec<u8>,
-        fresh_until: u64,
-        #[serde(with = "serde_bytes")]
-        engine_signature: Vec<u8>,
-    }
-
-    #[derive(Clone, Deserialize, Serialize)]
-    struct ClientProof {
-        #[serde(with = "serde_bytes")]
-        binding_id: Vec<u8>,
-        #[serde(with = "serde_bytes")]
-        binding_digest: Vec<u8>,
-        participant_npub: String,
-        channel_auth_key_id: String,
-        action_pop_key_id: String,
-        #[serde(with = "serde_bytes")]
-        device_signature: Vec<u8>,
-        #[serde(with = "serde_bytes")]
-        action_pop: Vec<u8>,
-    }
-
     // Every transcript is a fixed-arity CBOR array.  Nested protocol objects
     // enter the array only as bstr(canonical-CBOR(X)); none is structurally
     // re-embedded into a signing hash.
@@ -1578,48 +1636,6 @@ mod harness {
         #[serde(with = "serde_bytes")] &'a [u8],
         u64,
         #[serde(with = "serde_bytes")] &'a [u8],
-        #[serde(with = "serde_bytes")] &'a [u8],
-        u64,
-        #[serde(with = "serde_bytes")] &'a [u8],
-        u64,
-    );
-
-    #[derive(Serialize)]
-    struct PopBindingTranscript<'a>(
-        &'a str,
-        &'a str,
-        #[serde(with = "serde_bytes")] &'a [u8],
-        #[serde(with = "serde_bytes")] &'a [u8],
-    );
-
-    #[derive(Serialize)]
-    struct DeviceAuthTranscript<'a>(
-        &'a str,
-        &'a str,
-        #[serde(with = "serde_bytes")] &'a [u8],
-        #[serde(with = "serde_bytes")] &'a [u8],
-        #[serde(with = "serde_bytes")] &'a [u8],
-        &'a str,
-        &'a str,
-    );
-
-    #[derive(Serialize)]
-    struct OwnerActionTranscript<'a>(
-        &'a str,
-        &'a str,
-        #[serde(with = "serde_bytes")] &'a [u8],
-        #[serde(with = "serde_bytes")] &'a [u8],
-        u64,
-        #[serde(with = "serde_bytes")] &'a [u8],
-        #[serde(with = "serde_bytes")] &'a [u8],
-        &'a str,
-        &'a str,
-        &'a str,
-        #[serde(with = "serde_bytes")] &'a [u8],
-        #[serde(with = "serde_bytes")] &'a [u8],
-        &'a str,
-        &'a str,
-        &'a str,
         #[serde(with = "serde_bytes")] &'a [u8],
         u64,
         #[serde(with = "serde_bytes")] &'a [u8],
@@ -1950,35 +1966,38 @@ mod harness {
         ))
     }
 
-    fn pop_binding_pre(t1: [u8; 32], device_static: [u8; 32]) -> AkeResult<[u8; 32]> {
-        hash_canonical(&PopBindingTranscript(
-            A2_DOMAIN,
-            "pop-binding",
-            &t1,
-            &device_static,
-        ))
+    // These two are shared with production through `owner_site_binding_glue`:
+    // ONE implementation of each preimage, called by both sides. Do NOT
+    // reintroduce local copies — two implementations of the same preimage
+    // diverge in silence and the symptom is "handshake never works".
+    fn pop_binding_pre(
+        t1: [u8; 32],
+        device_static: [u8; 32],
+    ) -> AkeResult<crate::owner_site_binding_glue::ChannelBindingPre> {
+        crate::owner_site_binding_glue::pop_binding_pre(t1, device_static)
+            .map_err(|_| OwnerSiteAkeFailure::Rejected)
     }
 
     fn device_auth_hash(
-        channel_binding_pre: [u8; 32],
+        channel_binding_pre: &crate::owner_site_binding_glue::ChannelBindingPre,
         binding_id: OwnerSiteBindingId,
         binding_digest: OwnerSiteBindingDigest,
         participant_npub: &str,
         channel_auth_key_id: &OwnerSiteChannelAuthKeyId,
     ) -> AkeResult<[u8; 32]> {
-        hash_canonical(&DeviceAuthTranscript(
-            A2_DOMAIN,
-            "D-auth",
-            &channel_binding_pre,
-            binding_id.as_bytes(),
-            binding_digest.as_bytes(),
+        let hash = crate::owner_site_binding_glue::device_auth_hash(
+            channel_binding_pre,
+            &binding_id,
+            &binding_digest,
             participant_npub,
-            channel_auth_key_id.as_str(),
-        ))
+            channel_auth_key_id,
+        )
+        .map_err(|_| OwnerSiteAkeFailure::Rejected)?;
+        Ok(*hash.as_bytes())
     }
 
     fn owner_action_hash(
-        channel_binding_pre: [u8; 32],
+        channel_binding_pre: &crate::owner_site_binding_glue::ChannelBindingPre,
         m2: &ServerHello,
         c1: &ClientHelloCore,
         binding_id: OwnerSiteBindingId,
@@ -1986,31 +2005,22 @@ mod harness {
         participant_npub: &str,
     ) -> AkeResult<[u8; 32]> {
         let intent_wire = encode_canonical(&c1.intent)?;
-        hash_canonical(&OwnerActionTranscript(
-            A2_DOMAIN,
-            "owner-action",
-            &channel_binding_pre,
-            &m2.channel_id,
-            m2.channel_epoch,
-            &m2.challenge_id,
-            &m2.challenge_secret,
-            &c1.household_id,
-            &c1.network_id,
-            &m2.engine_key_id,
-            binding_id.as_bytes(),
-            binding_digest.as_bytes(),
+        let hash = crate::owner_site_binding_glue::owner_action_hash(
+            channel_binding_pre,
+            m2,
+            c1,
+            &binding_id,
+            &binding_digest,
             participant_npub,
-            &c1.route,
-            &c1.resource,
             &intent_wire,
-            m2.authz_epoch,
-            &m2.roster_digest,
-            m2.fresh_until,
-        ))
+        )
+        .map_err(|_| OwnerSiteAkeFailure::Rejected)?;
+        Ok(*hash.as_bytes())
     }
 
     fn hash_canonical<T: Serialize>(value: &T) -> AkeResult<[u8; 32]> {
-        Ok(sha256(&encode_canonical(value)?))
+        crate::owner_site_binding_glue::hash_canonical(value)
+            .map_err(|_| OwnerSiteAkeFailure::Rejected)
     }
 
     #[cfg(test)]
@@ -3293,3 +3303,154 @@ mod harness {
 
 #[cfg(test)]
 pub(crate) use harness::{OwnerSiteAkeEffectSnapshot, OwnerSiteAkeFixture, OwnerSiteAkeHarness};
+
+#[cfg(test)]
+mod pair1_promotion_tests {
+    //! RED for the pair-1 promotion: the roster arm preserves default-deny
+    //! until an observation exists, admits only the exact server-owned
+    //! resource, and never admits on resource mismatch. The observation is
+    //! injected through the refresh-loop slot — the same path production
+    //! uses, not a test backdoor into the decision.
+
+    use super::*;
+    use crate::owner_site_authority::OwnerSiteAuthorityObservation;
+
+    fn resource(name: &str) -> OwnerSiteResource {
+        OwnerSiteResource::from_route_claw(name).expect("valid resource")
+    }
+
+    fn observation() -> OwnerSiteAuthorityObservation {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        OwnerSiteAuthorityObservation::from_roster_adapter(
+            "hh-test".to_string(),
+            1,
+            [7u8; 32],
+            1,
+            0,
+            [3u8; 33],
+            now,
+            now + 86_400,
+        )
+        .expect("non-degenerate observation")
+    }
+
+    #[test]
+    fn roster_arm_denies_everything_until_an_observation_exists() {
+        let provider = OwnerSiteAkeProvider::for_roster(&resource("claw-a"));
+        assert!(
+            !provider.admits_resource(&resource("claw-a")),
+            "default-deny must hold until the adapter produces an observation"
+        );
+    }
+
+    #[test]
+    fn roster_arm_admits_the_exact_resource_once_observing() {
+        let provider = OwnerSiteAkeProvider::for_roster(&resource("claw-a"));
+        let slot = provider
+            .roster_arm()
+            .expect("roster arm present")
+            .observation_slot();
+        *slot.write().expect("slot write") = Some(observation());
+
+        assert!(provider.admits_resource(&resource("claw-a")));
+        assert!(
+            !provider.admits_resource(&resource("claw-b")),
+            "resource mismatch must still refuse, observation or not"
+        );
+    }
+
+    #[test]
+    fn replacing_the_slot_with_none_closes_again() {
+        let provider = OwnerSiteAkeProvider::for_roster(&resource("claw-a"));
+        let slot = provider
+            .roster_arm()
+            .expect("roster arm present")
+            .observation_slot();
+        *slot.write().expect("slot write") = Some(observation());
+        assert!(provider.admits_resource(&resource("claw-a")));
+        *slot.write().expect("slot write") = None;
+        assert!(!provider.admits_resource(&resource("claw-a")));
+    }
+}
+
+#[cfg(test)]
+mod refresh_budget_tests {
+    //! THE REFRESH-FAILURE-BUDGET RED (the coordinator's condition for the
+    //! staleness term): the refresh loop stopped (slot holds an OLD
+    //! observation whose checkpoint `not_after` is far in the future) and
+    //! admission must REFUSE once the observation is older than
+    //! REFRESH_FAILURE_BUDGET_SECS — measured at the decision, which is the
+    //! effect this module owns. Without this pin the staleness term is
+    //! decoration and a future "simplification" removes it.
+
+    use super::*;
+    use crate::owner_site_authority::{OwnerSiteAuthorityObservation, REFRESH_FAILURE_BUDGET_SECS};
+
+    fn resource(name: &str) -> OwnerSiteResource {
+        OwnerSiteResource::from_route_claw(name).expect("valid resource")
+    }
+
+    fn observation_observed_at(
+        observed_at: u64,
+        checkpoint_not_after: u64,
+    ) -> OwnerSiteAuthorityObservation {
+        OwnerSiteAuthorityObservation::from_roster_adapter(
+            "hh".to_string(),
+            1,
+            [7u8; 32],
+            1,
+            0,
+            [3u8; 33],
+            observed_at,
+            checkpoint_not_after,
+        )
+        .expect("non-degenerate observation")
+    }
+
+    #[test]
+    fn a_fresh_observation_admits() {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let provider = OwnerSiteAkeProvider::for_roster(&resource("claw-a"));
+        let slot = provider.roster_arm().unwrap().observation_slot();
+        *slot.write().unwrap() = Some(observation_observed_at(now, now + 86_400));
+        assert!(provider.admits_resource(&resource("claw-a")));
+    }
+
+    #[test]
+    fn refresh_stopped_with_future_checkpoint_still_refuses_after_the_budget() {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        // The checkpoint is valid for another DAY (authority's not_after is
+        // far away), but the observation is TEN MINUTES old — the refresh
+        // loop has been dead for ten minutes.
+        let stale_observation = observation_observed_at(now - 600, now + 86_400);
+        assert!(
+            !stale_observation.is_fresh_at(now),
+            "observed_at + 300s budget has passed: not fresh even with a day of checkpoint validity"
+        );
+        let provider = OwnerSiteAkeProvider::for_roster(&resource("claw-a"));
+        let slot = provider.roster_arm().unwrap().observation_slot();
+        *slot.write().unwrap() = Some(stale_observation);
+        assert!(
+            !provider.admits_resource(&resource("claw-a")),
+            "refresh stopped + future not_after must STILL refuse after the budget"
+        );
+    }
+
+    #[test]
+    fn the_authority_ceiling_is_never_exceeded() {
+        // not_after is BEFORE observed_at + budget: the min picks the
+        // authority, never the budget.
+        let obs = observation_observed_at(1_000, 1_100);
+        assert!(!obs.is_fresh_at(1_101), "the authority ceiling rules");
+        assert!(obs.is_fresh_at(1_100));
+    }
+}
