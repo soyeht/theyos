@@ -34,6 +34,16 @@ pub enum CborError {
     TrailingBytes,
     #[error("CBOR map contains an unknown field for this schema")]
     UnknownField,
+    #[error("CBOR tag major type is not used by any B-SESSAO schema")]
+    TagNotAllowed,
+    #[error("CBOR float major type is not used by any B-SESSAO schema")]
+    FloatNotAllowed,
+    #[error("CBOR map key is not a text string")]
+    NonTextKey,
+    #[error("CBOR value uses a shape no B-SESSAO schema recognizes")]
+    DisallowedShape,
+    #[error("expected exactly one top-level \"sig\" entry, found a different count")]
+    MissingOrDuplicateSigField,
 }
 
 /// Errors from `MeshSessionDelegation` schema/policy handling (item 3a).
@@ -51,6 +61,18 @@ pub enum DelegationError {
     HouseholdBindingMismatch,
     #[error("proof.self_m_id does not match delegation.delegator_m_id")]
     DelegatorBindingMismatch,
+    #[error("delegation.version is not the frozen literal 1")]
+    VersionMismatch,
+    #[error("delegation.kind is not the frozen literal")]
+    KindMismatch,
+    #[error("delegation.domain is not the frozen literal")]
+    DomainMismatch,
+    #[error("delegation.profile is not the frozen literal")]
+    ProfileMismatch,
+    #[error("delegation.channel is not \"dev\" or \"release\"")]
+    ChannelInvalid,
+    #[error("delegation.delegated_pub is not a valid SEC1-compressed P-256 point")]
+    InvalidDelegatedPubPoint,
 }
 
 /// Errors from the rekey state machine (item 4).
@@ -70,6 +92,44 @@ pub enum RekeyError {
     GenerationExhausted,
 }
 
+/// Errors from the 5 auth frame schemas / K_mesh signing (Fila 1 follow-on,
+/// D9 Point2).
+#[derive(Debug, Error)]
+pub enum AuthFrameError {
+    #[error(transparent)]
+    Cbor(#[from] CborError),
+    #[error(transparent)]
+    Wire(#[from] WireError),
+    #[error("field does not match its fixed wire shape")]
+    ShapeMismatch,
+    #[error("signature does not verify")]
+    BadSignature,
+    #[error("signature is not low-S canonical")]
+    HighSRejected,
+    #[error("frame's protocol_version/domain does not match the frozen literal")]
+    VersionOrDomainMismatch,
+    #[error("frame's role/kind does not match what this step of the handshake expects")]
+    RoleOrKindMismatch,
+    #[error("h_final does not match this session's own handshake hash")]
+    HFinalMismatch,
+    #[error("peer identity does not match ExpectedResponder")]
+    ExpectedPeerMismatch,
+    #[error("checkpoint_hash does not match the local live snapshot")]
+    CheckpointMismatch,
+    #[error(transparent)]
+    Delegation(#[from] DelegationError),
+    #[error(
+        "delegation policy/signature/binding check failed before the frame signature was even checked"
+    )]
+    DelegationGate,
+    #[error("frame_digest cross-reference does not match")]
+    DigestMismatch,
+    #[error(transparent)]
+    Noise(#[from] NoiseSetupError),
+    #[error("write of the final frame did not complete — no state transition occurred")]
+    ActivateAckWriteFailed,
+}
+
 /// Errors from Noise session-static setup (item 2).
 #[derive(Debug, Error)]
 pub enum NoiseSetupError {
@@ -77,6 +137,10 @@ pub enum NoiseSetupError {
     Snow(#[from] snow::Error),
     #[error("handshake did not reach the finished state after 3 flights")]
     HandshakeNotFinished,
+    #[error(
+        "handshake flight carried a non-empty payload ({0} bytes) — v6 §1 requires payload empty"
+    )]
+    NonEmptyHandshakePayload(usize),
     #[error(transparent)]
     Wire(#[from] WireError),
 }
