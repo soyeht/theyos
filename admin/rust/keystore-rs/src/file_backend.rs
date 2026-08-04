@@ -333,6 +333,22 @@ impl FileKeystore {
         account: &str,
         bytes: &[u8],
     ) -> Result<InstallOutcome, KeystoreError> {
+        // The reserved-namespace guard belongs HERE, at the shared
+        // chokepoint, not only on the `KeystoreBackend` methods.
+        //
+        // It was on `get`/`set`/`delete`/`create_only` and on the sweep and
+        // delete paths — everywhere except this one. `TpmKeystore::create_only`
+        // reaches the store through this function rather than through
+        // `FileKeystore::create_only`, so the sealed backing had a PUBLIC
+        // constructor (`TpmKeystore::new`) that could write into the
+        // namespace reserved for this crate's own opaque key material. Not
+        // overwrite — `create_only` never does — but planting a chosen blob
+        // at a slot's path before the opaque layer mints one is precisely
+        // what the reservation exists to prevent.
+        //
+        // Guarding each caller separately is what produced the gap; guarding
+        // the chokepoint means a future caller inherits it.
+        self.guard_reserved()?;
         let dir = self.open_secrets_dir().map_err(|e| KeystoreError::Io {
             kind: e.kind().to_string(),
             hint: format!("open {}: {e}", self.secrets_dir().display()),
@@ -412,7 +428,19 @@ impl FileKeystore {
                 ),
             });
         }
-        if !compare(&bytes)? {
+        // Wipe BEFORE branching. `bytes` holds whatever the store had at
+        // this account — a private scalar on the plaintext backing — and the
+        // previous shape wiped it on exactly one exit out of six: the
+        // oversize arm above. The `compare(&bytes)?` propagation, the
+        // conflict return, both `MayHaveTakenEffect` returns and the final
+        // match all dropped it intact.
+        //
+        // Taking the verdict, wiping, and only then applying `?` makes the
+        // wipe unconditional instead of something each new early return has
+        // to remember. Same shape `delete_exact_locked` already uses.
+        let verdict = compare(&bytes);
+        bytes.zeroize();
+        if !verdict? {
             return Ok(CreateOutcome::Conflict);
         }
         post_compare_hook(&dir, &name);
@@ -584,7 +612,26 @@ impl FileKeystore {
                     }
                 })?
             }
-            Ok(SecureOpen::NotFound) => return Ok(DeleteOutcome::Absent),
+            // Absent — but not yet PROVEN absent. Returning here directly
+            // reported a durable absence on the strength of one lookup,
+            // which is the mirror image of the mistake `create_only` exists
+            // to avoid: a name being invisible is no more proof that it is
+            // durably gone than a name being visible is proof that it is
+            // durably there. If an earlier unlink of this entry was never
+            // synced, a crash restores it — and the caller has already been
+            // told, as revocation evidence, that no key is present.
+            //
+            // The barrier below is what turns the observation into the
+            // claim. Its failure is an operational error and is reported as
+            // one; flattening it back into `Absent` would reinstate exactly
+            // the unproven claim.
+            Ok(SecureOpen::NotFound) => {
+                dir.fsync().map_err(|e| KeystoreError::Io {
+                    kind: e.kind().to_string(),
+                    hint: format!("fsync while proving {name} absent: {e}"),
+                })?;
+                return Ok(DeleteOutcome::Absent);
+            }
             Ok(SecureOpen::SecurityViolation(hint)) => {
                 return Err(KeystoreError::SecurityViolation {
                     label: format!("{} (file fallback)", self.account_path(account).display()),
@@ -607,7 +654,16 @@ impl FileKeystore {
 
         match dir.unlinkat(OsStr::new(&name)) {
             Ok(()) => {}
-            Err(e) if e.kind() == ErrorKind::NotFound => return Ok(DeleteOutcome::Absent),
+            // The entry we just read and matched is already gone. Same rule
+            // as above: the absence still has to be made durable before it
+            // can be reported, and the barrier's failure stays an error.
+            Err(e) if e.kind() == ErrorKind::NotFound => {
+                dir.fsync().map_err(|e| KeystoreError::Io {
+                    kind: e.kind().to_string(),
+                    hint: format!("fsync while proving {name} absent: {e}"),
+                })?;
+                return Ok(DeleteOutcome::Absent);
+            }
             Err(e) => {
                 return Err(KeystoreError::Io {
                     kind: e.kind().to_string(),
@@ -624,14 +680,14 @@ impl FileKeystore {
         Ok(DeleteOutcome::Removed)
     }
 
-    /// Whether this store holds any account entry other than `exclude`.
+    /// Whether this store holds any account entry other than `exclude`,
+    /// against a handle the caller holds — there is deliberately no
+    /// self-resolving variant.
     ///
     /// Needed by the store-identity restore policy: material present with
     /// no identity marker must fail closed rather than have a fresh marker
     /// minted over it, and that decision requires knowing whether anything
     /// is actually there.
-    /// Against a handle the caller holds — there is deliberately no
-    /// self-resolving variant.
     ///
     /// This one mattered most to convert. It used to list the store with
     /// `fs::read_dir(self.secrets_dir())` — a fresh path resolution,
@@ -884,12 +940,66 @@ impl FileKeystore {
 /// without clearing it. Every scalar-carrying read goes through here so
 /// the failure paths wipe too, not just the success paths.
 fn read_bounded_zeroizing(file: &mut File, cap: u64) -> std::io::Result<Vec<u8>> {
-    let mut buf = Vec::new();
-    match std::io::Read::by_ref(file)
-        .take(cap + 1)
-        .read_to_end(&mut buf)
-    {
-        Ok(_) => Ok(buf),
+    use std::io::Read;
+
+    // The previous shape was `Vec::new()` + `read_to_end`, which wiped the
+    // buffer on error and looked complete. It was not: a growing `Vec`
+    // REALLOCATES, and each reallocation copies the bytes read so far into a
+    // new allocation and frees the old one WITHOUT wiping it. Zeroizing the
+    // result only ever reaches the final allocation, so every intermediate
+    // one kept a copy of the secret in freed memory — invisible to the
+    // zeroize call that appeared to cover it.
+    //
+    // So growth happens here, explicitly, and the old allocation is wiped
+    // before it is dropped. Sizing from the file's length alone would not be
+    // enough: a concurrent writer can extend the file after the `fstat`, and
+    // the read would silently reallocate again.
+    let limit = cap.saturating_add(1);
+    let hint = file
+        .metadata()
+        .map(|m| m.len())
+        .unwrap_or(0)
+        .min(limit)
+        .max(64);
+    let mut buf: Vec<u8> = Vec::with_capacity(usize::try_from(hint).unwrap_or(usize::MAX));
+    let mut chunk = [0u8; 8192];
+    let mut total: u64 = 0;
+
+    let outcome = loop {
+        if total >= limit {
+            break Ok(());
+        }
+        let want = usize::try_from(limit - total)
+            .unwrap_or(chunk.len())
+            .min(chunk.len());
+        match file.read(&mut chunk[..want]) {
+            Ok(0) => break Ok(()),
+            Ok(n) => {
+                total += n as u64;
+                if buf.len() + n > buf.capacity() {
+                    let target = (buf.len() + n).saturating_mul(2).min(
+                        usize::try_from(limit)
+                            .unwrap_or(usize::MAX)
+                            .saturating_add(1),
+                    );
+                    let mut bigger: Vec<u8> = Vec::with_capacity(target);
+                    bigger.extend_from_slice(&buf);
+                    // Wipe BEFORE the old allocation is freed by the move.
+                    buf.zeroize();
+                    buf = bigger;
+                }
+                buf.extend_from_slice(&chunk[..n]);
+            }
+            // EINTR is not a read failure — retrying is the contract.
+            Err(e) if e.kind() == ErrorKind::Interrupted => {}
+            Err(e) => break Err(e),
+        }
+    };
+
+    // The stack chunk held plaintext too, on every path.
+    chunk.zeroize();
+    match outcome {
+        Ok(()) => Ok(buf),
         Err(e) => {
             buf.zeroize();
             Err(e)
@@ -1223,6 +1333,9 @@ fn attempt_install(
         match dir.create_new_file(OsStr::new(&tmp_name), 0o600, bytes) {
             Ok((scratch, written_meta)) => {
                 substitute_scratch_hook(dir, &tmp_name);
+                // The scratch file exists and has been written+fsynced, but
+                // nothing is published yet.
+                crash_point("after-scratch-write");
                 // `scratch` stays alive across this whole block: while it is
                 // open the inode it refers to cannot be freed, so its inode
                 // number cannot be recycled under us and the dev+ino
@@ -1264,7 +1377,14 @@ fn attempt_install(
                             )
                         };
                         if identity_ok {
-                            match dir.fsync() {
+                            // Published and verified, but the directory
+                            // barrier has NOT run: the entry is visible and
+                            // not yet proven durable. This is the interval
+                            // the whole protocol is built around.
+                            crash_point("after-publish-before-dir-fsync");
+                            let synced = dir.fsync();
+                            crash_point("after-dir-fsync");
+                            match synced {
                                 Ok(()) => InstallOutcome::Durable,
                                 Err(e) => InstallOutcome::Ambiguous(e),
                             }
@@ -2343,6 +2463,50 @@ fn substitute_scratch_hook(dir: &DirHandle, tmp_name: &str) {
 #[cfg(all(not(test), unix))]
 fn substitute_scratch_hook(_dir: &DirHandle, _tmp_name: &str) {}
 
+/// Environment variable naming the stage at which this process should park
+/// so a parent can kill it there.
+#[cfg(all(test, unix))]
+pub(crate) const CRASH_STAGE_ENV: &str = "THEYOS_KEYSTORE_CRASH_STAGE";
+/// Environment variable naming the file this process touches to tell the
+/// parent it has ARRIVED at that stage.
+#[cfg(all(test, unix))]
+pub(crate) const CRASH_READY_ENV: &str = "THEYOS_KEYSTORE_CRASH_READY";
+
+/// Park forever at `stage` if this process was asked to.
+///
+/// Driven by the ENVIRONMENT, not by a thread-local, and that is the entire
+/// point. The thread-local failpoints elsewhere in this file inject an error
+/// and let the function return — which exercises the error classification
+/// but proves nothing about a crash, because the process stays alive and
+/// unwinds normally. Every buffered write it made is still flushed, every
+/// destructor still runs, and the store is left in a state no real crash
+/// would produce.
+///
+/// A parent sets these two variables, waits for the ready file, and SIGKILLs
+/// this process at exactly this line. The death is real, so what the store
+/// looks like afterwards is evidence rather than simulation.
+#[cfg(all(test, unix))]
+fn crash_point(stage: &str) {
+    let Ok(want) = std::env::var(CRASH_STAGE_ENV) else {
+        return;
+    };
+    if want != stage {
+        return;
+    }
+    if let Ok(ready) = std::env::var(CRASH_READY_ENV) {
+        // Signal arrival. The parent is watching for this path to appear.
+        let _ = fs::write(&ready, stage.as_bytes());
+    }
+    // Park. The parent kills us here; this must never return, or the process
+    // would continue past the stage the test is trying to freeze it at.
+    loop {
+        std::thread::sleep(std::time::Duration::from_secs(3600));
+    }
+}
+
+#[cfg(all(not(test), unix))]
+fn crash_point(_stage: &str) {}
+
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
@@ -2735,6 +2899,225 @@ mod tests {
             ks.create_only(&account, b"value").unwrap(),
             CreateOutcome::ExistingExactDurable
         );
+    }
+
+    /// The bounded reader now loops over a fixed chunk and grows its buffer
+    /// under its own control, so that no intermediate allocation is freed
+    /// holding a copy of the secret. That replaced a single `read_to_end`,
+    /// and it introduced a loop that nothing exercised past its first
+    /// iteration: the largest value any existing test read was ~208 bytes,
+    /// against an 8 KiB chunk.
+    ///
+    /// So walk the boundaries — empty, either side of the initial capacity
+    /// floor, and either side of one and two full chunks — and require the
+    /// bytes back verbatim.
+    #[test]
+    fn bounded_reader_round_trips_across_chunk_boundaries() {
+        let td = tempfile::tempdir().unwrap();
+        let ks = FileKeystore::new(td.path(), "svc");
+        let dir = ks.open_session().unwrap();
+
+        for len in [0usize, 1, 63, 64, 65, 8191, 8192, 8193, 16384, 16385, 70000] {
+            let account = random_account(&format!("chunk-{len}"));
+            // A repeating but position-dependent pattern, so a chunk read
+            // out of order or a byte dropped at a boundary changes the
+            // value rather than landing on an identical byte.
+            let value: Vec<u8> = (0..len).map(|i| u8::try_from(i % 251).unwrap()).collect();
+
+            assert_eq!(
+                ks.create_only(&account, &value).unwrap(),
+                CreateOutcome::CreatedDurable,
+                "len={len}"
+            );
+            let read = ks
+                .secure_durable_get_in(&dir, &account)
+                .unwrap()
+                .unwrap_or_else(|| panic!("len={len} vanished"));
+            assert_eq!(read.len(), len, "wrong length at len={len}");
+            assert_eq!(read, value, "content differs at len={len}");
+        }
+    }
+
+    // -- real cross-process crash matrix ----------------------------------
+    //
+    // Everything else in this file that models a failure injects an error
+    // through a thread-local and lets the call return. That verifies the
+    // classification, and it is NOT a crash: the process survives, unwinds,
+    // flushes and runs destructors. A store left behind by an orderly
+    // unwind is not the store a killed process leaves.
+    //
+    // So: a real child process, parked at a named stage inside the install
+    // protocol, SIGKILLed there by this parent, and then the store is
+    // inspected by a process that never shared its address space.
+
+    const CRASH_CHILD_DIR_ENV: &str = "THEYOS_KEYSTORE_CRASH_CHILD_DIR";
+
+    /// The child half. Not a test of its own — it is `#[ignore]`d so a normal
+    /// run never executes it, and it does nothing at all unless the parent
+    /// has handed it a directory through the environment.
+    #[test]
+    #[ignore = "child process for crash_matrix_*; spawned by the parent test"]
+    fn crash_matrix_child() {
+        let Ok(dir) = std::env::var(CRASH_CHILD_DIR_ENV) else {
+            panic!(
+                "crash_matrix_child ran without {CRASH_CHILD_DIR_ENV}; it is not a standalone test"
+            );
+        };
+        let ks = FileKeystore::new(std::path::Path::new(&dir), "crashsvc");
+        // Parks inside `crash_point` at the stage named by the environment,
+        // where the parent kills it. If it ever returns, the parent's
+        // assertion about the stage will catch it.
+        let _ = ks.create_only("victim", b"child-value");
+    }
+
+    /// Kill a child at `stage`, then report what the store looks like to a
+    /// fresh process, plus whether a retry converges.
+    fn run_crash_at(stage: &str) -> (Option<Vec<u8>>, CreateOutcome) {
+        let td = tempfile::tempdir().unwrap();
+        let ready = td.path().join(format!("ready-{stage}"));
+
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "file_backend::tests::crash_matrix_child"])
+            .args(["--ignored", "--nocapture", "--test-threads=1"])
+            .env(CRASH_CHILD_DIR_ENV, td.path())
+            .env(CRASH_STAGE_ENV, stage)
+            .env(CRASH_READY_ENV, &ready)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn crash child");
+
+        // Wait for the child to ARRIVE at the stage. Killing on a timer
+        // instead would make the test's meaning depend on scheduling — it
+        // would sometimes kill before the stage and still pass, which is how
+        // a crash test quietly stops testing the stage it names.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        let mut arrived = false;
+        while std::time::Instant::now() < deadline {
+            if ready.exists() {
+                arrived = true;
+                break;
+            }
+            if let Ok(Some(status)) = child.try_wait() {
+                panic!("child exited ({status}) before reaching stage {stage:?}");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(arrived, "child never reached stage {stage:?}");
+
+        // SIGKILL: no unwinding, no destructors, no flush. The closest thing
+        // to a power cut this harness can produce.
+        child.kill().expect("kill child");
+        let status = child.wait().expect("reap child");
+        assert!(
+            !status.success(),
+            "child at {stage:?} must have been killed, not have exited cleanly"
+        );
+
+        // Now read the store from THIS process, which never shared the
+        // child's address space or its page cache view.
+        let ks = FileKeystore::new(td.path(), "crashsvc");
+        let dir = ks.open_session().unwrap();
+        let after = ks.secure_durable_get_in(&dir, "victim").ok().flatten();
+        let retry = ks.create_only("victim", b"child-value").unwrap();
+        (after, retry)
+    }
+
+    /// A crash BEFORE anything is published must leave no entry, and a retry
+    /// must then install cleanly.
+    #[test]
+    fn crash_before_publish_leaves_no_entry_and_retry_creates() {
+        let (after, retry) = run_crash_at("after-scratch-write");
+        assert!(
+            after.is_none(),
+            "a crash before publication must leave no readable entry, found {after:?}"
+        );
+        assert_eq!(
+            retry,
+            CreateOutcome::CreatedDurable,
+            "a retry after a pre-publication crash must install the value"
+        );
+    }
+
+    /// A crash AFTER publication but BEFORE the directory barrier is the
+    /// interesting one: the entry may or may not survive, and BOTH are
+    /// acceptable — what is not acceptable is a retry that fails to
+    /// converge, or an entry holding something other than the child's bytes.
+    #[test]
+    fn crash_after_publish_before_barrier_converges_on_retry() {
+        let (after, retry) = run_crash_at("after-publish-before-dir-fsync");
+        if let Some(ref bytes) = after {
+            assert_eq!(
+                bytes.as_slice(),
+                b"child-value",
+                "a surviving entry must hold the bytes the child wrote, nothing else"
+            );
+        }
+        assert!(
+            matches!(
+                retry,
+                CreateOutcome::CreatedDurable | CreateOutcome::ExistingExactDurable
+            ),
+            "a retry must converge on the same value whether or not the entry survived; got \
+             {retry:?}"
+        );
+    }
+
+    /// A crash AFTER the barrier: the value was proven durable before the
+    /// child died, so it MUST still be there, and the retry must recognise
+    /// it as already present rather than reporting a fresh creation.
+    #[test]
+    fn crash_after_barrier_keeps_the_durable_value() {
+        let (after, retry) = run_crash_at("after-dir-fsync");
+        assert_eq!(
+            after.as_deref(),
+            Some(b"child-value".as_slice()),
+            "a value proven durable before the crash must survive it"
+        );
+        assert_eq!(
+            retry,
+            CreateOutcome::ExistingExactDurable,
+            "the surviving value must be recognised as already present"
+        );
+    }
+
+    /// An absence is a CLAIM, and it needs the same barrier a presence does.
+    ///
+    /// `delete_exact_locked` used to return `Absent` straight from the
+    /// lookup that failed to find the entry. A caller revoking a key reads
+    /// that as evidence that no key is there — but if an earlier unlink of
+    /// the name was never synced, a crash restores it. Invisible is no more
+    /// proof of durable absence than visible is of durable presence.
+    ///
+    /// With the barrier failing, the honest answer is an error. Reporting
+    /// `Absent` anyway is what this pins shut.
+    #[test]
+    fn absent_is_not_reported_when_the_barrier_proving_it_fails() {
+        let td = tempfile::tempdir().unwrap();
+        let ks = FileKeystore::new(td.path(), "svc");
+        let account = random_account("absent-barrier");
+        let _g = FailpointGuard(failpoints::disarm_dir_fsync);
+
+        // Control first: with a working barrier the absence IS provable, so
+        // the failure below is attributable to the barrier and not to the
+        // entry being unreachable for some unrelated reason.
+        assert_eq!(
+            ks.delete_exact_locked(&account, |_| Ok(true)).unwrap(),
+            DeleteOutcome::Absent,
+            "a genuinely absent entry must be reportable when the barrier works"
+        );
+
+        failpoints::arm_dir_fsync(ErrorKind::Other);
+        let outcome = ks.delete_exact_locked(&account, |_| Ok(true));
+        failpoints::disarm_dir_fsync();
+
+        match outcome {
+            Err(KeystoreError::Io { .. }) => {}
+            other => panic!(
+                "an unprovable absence must surface as an operational error, not as a durable \
+                 absence: {other:?}"
+            ),
+        }
     }
 
     /// Ported verbatim from the independent audit's RED for b3849669. A key

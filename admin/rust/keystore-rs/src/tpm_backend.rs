@@ -136,13 +136,22 @@ impl TpmKeystore {
 
 impl KeystoreBackend for TpmKeystore {
     fn get(&self, account: &str) -> Result<Vec<u8>, KeystoreError> {
-        let ciphertext = self.inner.get(account)?;
-        decrypt_with_systemd_creds(account, &ciphertext)
+        let mut ciphertext = self.inner.get(account)?;
+        let plain = decrypt_with_systemd_creds(account, &ciphertext);
+        // Wipe on BOTH outcomes, so the `?` shorthand cannot skip it. The
+        // sealed blob is derived from a private scalar; leaving it in a
+        // freed allocation is a smaller leak than the plaintext but it is
+        // still one, and the whole point of the rule is not to relitigate
+        // each buffer's severity at each site.
+        ciphertext.zeroize();
+        plain
     }
 
     fn set(&self, account: &str, value: &[u8]) -> Result<(), KeystoreError> {
-        let ciphertext = encrypt_with_systemd_creds(account, value)?;
-        self.inner.set(account, &ciphertext)
+        let mut ciphertext = encrypt_with_systemd_creds(account, value)?;
+        let stored = self.inner.set(account, &ciphertext);
+        ciphertext.zeroize();
+        stored
     }
 
     fn delete(&self, account: &str) -> Result<(), KeystoreError> {
@@ -172,15 +181,35 @@ impl KeystoreBackend for TpmKeystore {
         // claims about, fail closed without spending a `systemd-creds`
         // invocation, and without the plaintext ever reaching a subprocess.
         self.inner.preflight()?;
-        let ciphertext = encrypt_with_systemd_creds(account, value)?;
-        match self.inner.raw_attempt_install(account, &ciphertext) {
+        let mut ciphertext = encrypt_with_systemd_creds(account, value)?;
+        let installed = self.inner.raw_attempt_install(account, &ciphertext);
+        // Wiped before the classification below branches, so no arm can
+        // return without it having happened.
+        ciphertext.zeroize();
+        match installed {
             Ok(InstallOutcome::Durable) => Ok(CreateOutcome::CreatedDurable),
+            // These three are genuine ambiguity about the DESTINATION, and
+            // reinspecting the store is how they get resolved.
             Ok(
                 InstallOutcome::Ambiguous(_)
                 | InstallOutcome::ProvenConflict
                 | InstallOutcome::TmpNameExhausted,
-            )
-            | Err(_) => self.stabilize_and_classify_plaintext(account, value),
+            ) => self.stabilize_and_classify_plaintext(account, value),
+            // An `Err` here is NOT one of those. It comes from before the
+            // install could be attempted at all — the store would not open,
+            // the filesystem allowlist refused it, the lock could not be
+            // taken — and it used to be swallowed by an `| Err(_)` arm that
+            // sent it down the same stabilization path.
+            //
+            // That flattened a refusal into an outcome. A `SecurityViolation`
+            // from the allowlist would come back as a `Conflict` or a
+            // `MayHaveTakenEffect` derived from whatever happened to be in
+            // the store, with the reason for refusing gone. The file backing
+            // has always propagated this (`raw_attempt_install(...)?` in
+            // `create_only_unix`); the sealed backing simply did not, so the
+            // two disagreed about the same condition and the sealed one was
+            // the weaker.
+            Err(e) => Err(e),
         }
     }
 }
@@ -216,11 +245,51 @@ impl TpmKeystore {
     }
 }
 
+/// Stand-in for the `systemd-creds` subprocess.
+///
+/// Everything this backend does around the seal — the pre-publish ordering,
+/// the outcome classification, the zeroize discipline — is logic that has
+/// nothing to do with a TPM, but on a host without one the subprocess fails
+/// immediately and none of it is ever reached. That is why those paths went
+/// unverified: the only hosts that could exercise them were the ones nobody
+/// runs the suite on.
+///
+/// With the runner injected, a host with no TPM can drive the classification
+/// directly. It does NOT substitute for the functional TPM gate — a fake
+/// seal proves nothing about sealing — and the tests that need real hardware
+/// stay `#[ignore]`d behind `require_tpm2`.
+#[cfg(test)]
+#[derive(Clone, Copy)]
+pub(crate) struct CredsRunner {
+    pub encrypt: fn(&str, &[u8]) -> Result<Vec<u8>, KeystoreError>,
+    pub decrypt: fn(&str, &[u8]) -> Result<Vec<u8>, KeystoreError>,
+}
+
+#[cfg(test)]
+thread_local! {
+    static CREDS_RUNNER: std::cell::Cell<Option<CredsRunner>> =
+        const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) fn set_creds_runner(runner: Option<CredsRunner>) {
+    CREDS_RUNNER.with(|c| c.set(runner));
+}
+
+#[cfg(test)]
+fn injected_runner() -> Option<CredsRunner> {
+    CREDS_RUNNER.with(std::cell::Cell::get)
+}
+
 /// Run `systemd-creds encrypt --with-key=tpm2 --name=<account> - -`,
 /// feeding `plaintext` through stdin and reading the sealed blob from
 /// stdout. The blob is binary by default (no `--pretty`); we keep it as
 /// raw bytes to round-trip cleanly.
 fn encrypt_with_systemd_creds(account: &str, plaintext: &[u8]) -> Result<Vec<u8>, KeystoreError> {
+    #[cfg(test)]
+    if let Some(runner) = injected_runner() {
+        return (runner.encrypt)(account, plaintext);
+    }
     let mut child = Command::new(SYSTEMD_CREDS)
         .arg("encrypt")
         .arg("--with-key=tpm2")
@@ -246,11 +315,18 @@ fn encrypt_with_systemd_creds(account: &str, plaintext: &[u8]) -> Result<Vec<u8>
         })?;
     }
 
-    let output = child.wait_with_output().map_err(|e| KeystoreError::Io {
+    let mut output = child.wait_with_output().map_err(|e| KeystoreError::Io {
         kind: e.kind().to_string(),
         hint: format!("wait {SYSTEMD_CREDS}: {e}"),
     })?;
     if !output.status.success() {
+        // Ciphertext rather than plaintext, and a failed encrypt may have
+        // emitted only a fragment of it — but a partial seal of a private
+        // scalar is still derived from that scalar, and the buffer costs
+        // nothing to wipe. The rule is that no buffer downstream of key
+        // material is dropped unwiped, not that each one is individually
+        // argued to be harmless.
+        output.stdout.zeroize();
         let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
         return Err(KeystoreError::Io {
             kind: format!("systemd-creds encrypt exit {}", output.status),
@@ -266,6 +342,11 @@ fn encrypt_with_systemd_creds(account: &str, plaintext: &[u8]) -> Result<Vec<u8>
 /// this is the bind that turns a path-traversal bug elsewhere into a
 /// decrypt-failure rather than a credential mixup.
 fn decrypt_with_systemd_creds(account: &str, ciphertext: &[u8]) -> Result<Vec<u8>, KeystoreError> {
+    #[cfg(test)]
+    if let Some(runner) = injected_runner() {
+        return (runner.decrypt)(account, ciphertext);
+    }
+
     let mut child = Command::new(SYSTEMD_CREDS)
         .arg("decrypt")
         .arg(format!("--name={account}"))
@@ -290,11 +371,21 @@ fn decrypt_with_systemd_creds(account: &str, ciphertext: &[u8]) -> Result<Vec<u8
         })?;
     }
 
-    let output = child.wait_with_output().map_err(|e| KeystoreError::Io {
+    let mut output = child.wait_with_output().map_err(|e| KeystoreError::Io {
         kind: e.kind().to_string(),
         hint: format!("wait {SYSTEMD_CREDS}: {e}"),
     })?;
     if !output.status.success() {
+        // `output.stdout` on THIS path is the most sensitive buffer in the
+        // crate that nothing was wiping: a decrypt that fails part-way still
+        // wrote whatever plaintext it had already produced, so a truncated
+        // private scalar can be sitting in it. Dropping the `Output` frees
+        // that allocation without clearing it.
+        //
+        // A failed decrypt is exactly when this is most likely — a changed
+        // PCR state or a replaced TPM can fail after some output has already
+        // been emitted.
+        output.stdout.zeroize();
         let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
         return Err(KeystoreError::Io {
             kind: format!("systemd-creds decrypt exit {}", output.status),
@@ -304,6 +395,9 @@ fn decrypt_with_systemd_creds(account: &str, ciphertext: &[u8]) -> Result<Vec<u8
             ),
         });
     }
+    // On success ownership moves to the caller, which zeroizes it — see
+    // `OpaqueP256Slots::load_signing_key`, which wipes the buffer on the
+    // success path AND on every rejection path.
     Ok(output.stdout)
 }
 
@@ -399,6 +493,94 @@ mod tests {
         let ks = TpmKeystore::new(dir.path(), "test.service");
         ks.delete("never.existed")
             .expect("missing key delete is ok");
+    }
+
+    /// Restores the real subprocess even if the test panics, so one failing
+    /// test cannot leave a fake seal armed for the next one on this thread.
+    struct RunnerGuard;
+    impl Drop for RunnerGuard {
+        fn drop(&mut self) {
+            set_creds_runner(None);
+        }
+    }
+
+    /// A seal that is trivially reversible. It proves NOTHING about sealing —
+    /// that is what the `require_tpm2` gate is for — and exists only so the
+    /// logic wrapped AROUND the subprocess can be driven on a host with no
+    /// TPM.
+    fn fake_runner() -> CredsRunner {
+        // The `Result` is not removable: this has to match the fn-pointer
+        // type in `CredsRunner`, which the real subprocess also inhabits and
+        // which genuinely fails. A fake that cannot fail is the point here.
+        #[allow(clippy::unnecessary_wraps)]
+        fn encrypt(account: &str, plaintext: &[u8]) -> Result<Vec<u8>, KeystoreError> {
+            let mut out = format!("fake:{account}:").into_bytes();
+            out.extend_from_slice(plaintext);
+            Ok(out)
+        }
+        fn decrypt(account: &str, ciphertext: &[u8]) -> Result<Vec<u8>, KeystoreError> {
+            // Bound to the account exactly as `--name=` binds the real one,
+            // so a blob from another account fails here too.
+            let prefix = format!("fake:{account}:").into_bytes();
+            ciphertext
+                .strip_prefix(prefix.as_slice())
+                .map(<[u8]>::to_vec)
+                .ok_or_else(|| KeystoreError::Io {
+                    kind: "fake decrypt refused".into(),
+                    hint: "blob was sealed under a different account".into(),
+                })
+        }
+        CredsRunner { encrypt, decrypt }
+    }
+
+    /// A pre-install refusal must reach the caller AS a refusal.
+    ///
+    /// The sealed backing used to funnel every `Err` from
+    /// `raw_attempt_install` into the same stabilization path as a genuine
+    /// destination ambiguity. A `SecurityViolation` — the filesystem
+    /// allowlist refusing the store — therefore came back as an ordinary
+    /// `CreateOutcome` derived from whatever was already on disk, with the
+    /// reason for refusing discarded.
+    ///
+    /// The reserved-namespace guard is used to produce a real refusal from
+    /// that same call, because it fails for a reason the store's contents
+    /// cannot mask.
+    #[test]
+    fn pre_install_refusal_is_not_reclassified_as_an_outcome() {
+        set_creds_runner(Some(fake_runner()));
+        let _g = RunnerGuard;
+
+        let dir = TempDir::new().unwrap();
+        // Control: with the fake seal in place the ordinary path works, so a
+        // failure below is attributable to the refusal and not to the fake.
+        let ok = TpmKeystore::new(dir.path(), "test.classify");
+        assert_eq!(
+            ok.create_only("slot", b"value").unwrap(),
+            CreateOutcome::CreatedDurable
+        );
+        assert_eq!(
+            ok.create_only("slot", b"value").unwrap(),
+            CreateOutcome::ExistingExactDurable,
+            "the same plaintext must converge despite randomized ciphertext"
+        );
+        assert_eq!(
+            ok.create_only("slot", b"different").unwrap(),
+            CreateOutcome::Conflict,
+            "a different plaintext under the same account is a conflict"
+        );
+
+        // The refusal itself.
+        let reserved = TpmKeystore::new(
+            dir.path(),
+            format!(
+                "svc{}-x",
+                crate::file_backend::RESERVED_OPAQUE_NAMESPACE_MARKER
+            ),
+        );
+        match reserved.create_only("slot", b"value") {
+            Err(KeystoreError::Unsupported { .. } | KeystoreError::SecurityViolation { .. }) => {}
+            other => panic!("a refusal must not be reported as an outcome: {other:?}"),
+        }
     }
 
     /// Round-trip end-to-end. Gated on a real TPM2 + systemd-creds — CI
