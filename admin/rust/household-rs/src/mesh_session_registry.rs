@@ -609,6 +609,34 @@ pub enum ActivateRefusal {
     RevocationInProgress,
 }
 
+/// Result of [`MeshSessionRegistry::retire_locally`] (round D-1 successor,
+/// @kiana): which caller the *completion* half of the guarantee actually
+/// belongs to.
+///
+/// Authority is closed in every variant — that part never depends on who
+/// won. Only [`RetiredAndDrained`](Self::RetiredAndDrained) additionally
+/// means "and nothing was still in flight when this returned".
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RetireOutcome {
+    /// This call is the one that removed the session: it announced under
+    /// `self.inner`'s lock and then drained. Full guarantee — on return the
+    /// session's `SessionGate` (and every clone) is closed AND no forward
+    /// that was in flight is still running.
+    RetiredAndDrained,
+    /// The session was already absent when this call reached the lock —
+    /// concurrently retired by another caller, already unregistered, or
+    /// never registered. This call announced nothing and drained nothing.
+    /// Authority is still closed (whoever removed it announced under the
+    /// lock, before the absence this call observed), but the drain
+    /// guarantee belongs to that caller, not this one.
+    NotTracked,
+    /// The registry is `Unavailable`, or its lock is poisoned. Registry-wide
+    /// fail-closed has been applied (`registry_live = false`), so no gate on
+    /// this registry authorizes anything — but no per-session announce or
+    /// drain could run.
+    RegistryUnavailable,
+}
+
 struct PendingBinding {
     hh_id: HouseholdId,
     m_id: MachineId,
@@ -1163,10 +1191,28 @@ impl<H: RevocableMeshSession> MeshSessionRegistry<H> {
     /// removes `session_id` from `sessions`/`by_machine`, announces revoke
     /// intent under `self.inner`'s lock (before the removal is externally
     /// observable — see [`announce_revoke`](SessionSync::announce_revoke)),
-    /// and drains any in-flight [`ForwardingGuard`] after releasing it. So
-    /// the same authority guarantee holds: on return, this session's
-    /// `SessionGate` (and every clone of it) is closed, and no forward that
-    /// was in flight is still running.
+    /// and drains any in-flight [`ForwardingGuard`] after releasing it.
+    ///
+    /// **The completion half of the guarantee is scoped to the caller that
+    /// actually removed the entry** (round D-1 successor, @kiana — the
+    /// first cut claimed it unconditionally, which is too strong). Only
+    /// [`RetireOutcome::RetiredAndDrained`] means "on return, no forward
+    /// that was in flight is still running". Two concurrent
+    /// `retire_locally` calls for the same `SessionId` are the case that
+    /// breaks the unconditional claim: the loser finds the entry already
+    /// gone and returns [`NotTracked`](RetireOutcome::NotTracked)
+    /// immediately, while the WINNER may still be draining. Authority is
+    /// closed either way — the winner's `announce_revoke` landed under the
+    /// lock, strictly before the removal the loser observed — so nothing
+    /// can newly authorize; it is specifically the "already in flight has
+    /// finished" part that a `NotTracked` caller must not assume.
+    ///
+    /// The official one-owner facade wrapper never produces this race, and
+    /// its `Drop` may ignore the outcome outright: `writer_intent` and
+    /// `registry_live` have already fail-closed by then, so there is
+    /// nothing for a `Drop` to decide. The explicit path, which can care
+    /// whether it was the one that drained, is free to observe it. Hence
+    /// no `#[must_use]`.
     ///
     /// What it deliberately does NOT do: it never calls
     /// [`send_best_effort_revoke_notice`](RevocableMeshSession::send_best_effort_revoke_notice),
@@ -1186,17 +1232,19 @@ impl<H: RevocableMeshSession> MeshSessionRegistry<H> {
     /// impossible, unsafe, or someone else's job.
     ///
     /// **Poison, stated honestly:** if `self.inner` is poisoned this sets
-    /// `registry_live = false` and returns. That denies every outstanding
-    /// `SessionGate` on this registry, including this session's, so no
-    /// authority survives — but it is NOT the same guarantee as the normal
-    /// path: the poisoned interior cannot be reached to find this entry, so
-    /// nothing can announce or drain its `SessionSync`, and a forward
-    /// already in flight is therefore NOT waited out. Fail-closed on
-    /// authorization, not on completion. Same asymmetry
-    /// [`SessionSync`]'s doc comment draws for `try_enter` vs draining, and
-    /// the same one every other method here has in the poison case.
-    pub fn retire_locally(&self, session_id: SessionId) {
-        self.retire_locally_inner(session_id, || {});
+    /// `registry_live = false` and returns
+    /// [`RegistryUnavailable`](RetireOutcome::RegistryUnavailable). That
+    /// denies every outstanding `SessionGate` on this registry, including
+    /// this session's, so no authority survives — but it is NOT the same
+    /// guarantee as the normal path: the poisoned interior cannot be
+    /// reached to find this entry, so nothing can announce or drain its
+    /// `SessionSync`, and a forward already in flight is therefore NOT
+    /// waited out. Fail-closed on authorization, not on completion. Same
+    /// asymmetry [`SessionSync`]'s doc comment draws for `try_enter` vs
+    /// draining, and the same one every other method here has in the poison
+    /// case.
+    pub fn retire_locally(&self, session_id: SessionId) -> RetireOutcome {
+        self.retire_locally_inner(session_id, || {})
     }
 
     /// Test-only seam (same technique as
@@ -1208,15 +1256,15 @@ impl<H: RevocableMeshSession> MeshSessionRegistry<H> {
         &self,
         session_id: SessionId,
         after_unlock_before_drain: impl FnOnce(),
-    ) {
-        self.retire_locally_inner(session_id, after_unlock_before_drain);
+    ) -> RetireOutcome {
+        self.retire_locally_inner(session_id, after_unlock_before_drain)
     }
 
     fn retire_locally_inner(
         &self,
         session_id: SessionId,
         after_unlock_before_drain: impl FnOnce(),
-    ) {
+    ) -> RetireOutcome {
         // Only the `Arc<SessionSync>` escapes this block — deliberately NOT
         // the whole `SessionEntry`, so there is no `Weak<H>` in scope below
         // that a later edit could be tempted to `upgrade()`. "No callback
@@ -1225,38 +1273,42 @@ impl<H: RevocableMeshSession> MeshSessionRegistry<H> {
         let sync = {
             let Ok(mut guard) = self.inner.lock() else {
                 self.registry_live.store(false, Ordering::SeqCst);
-                return;
+                return RetireOutcome::RegistryUnavailable;
             };
             let _poison_guard = PoisonGuard::new(&self.registry_live);
-            if let Mode::Live {
+            let Mode::Live {
                 sessions,
                 by_machine,
             } = &mut guard.mode
-            {
-                let removed = sessions.remove(&session_id);
-                if let Some(entry) = &removed {
-                    // Before the removal below makes this session's absence
-                    // externally observable — identical ordering to
-                    // `unregister_inner`, for identical reasons.
-                    entry.sync.announce_revoke();
-                    if let Some(ids) = by_machine.get_mut(&entry.m_id) {
-                        ids.retain(|id| *id != session_id);
-                        if ids.is_empty() {
-                            by_machine.remove(&entry.m_id);
-                        }
+            else {
+                return RetireOutcome::RegistryUnavailable;
+            };
+            let removed = sessions.remove(&session_id);
+            if let Some(entry) = &removed {
+                // Before the removal below makes this session's absence
+                // externally observable — identical ordering to
+                // `unregister_inner`, for identical reasons.
+                entry.sync.announce_revoke();
+                if let Some(ids) = by_machine.get_mut(&entry.m_id) {
+                    ids.retain(|id| *id != session_id);
+                    if ids.is_empty() {
+                        by_machine.remove(&entry.m_id);
                     }
                 }
-                removed.map(|entry| entry.sync)
-            } else {
-                None
             }
+            removed.map(|entry| entry.sync)
         };
+        // Already absent when this call reached the lock: this call
+        // announced nothing and drains nothing, so it cannot claim the
+        // completion half of the guarantee — a concurrent winner may still
+        // be draining right now. See `retire_locally`'s doc comment.
         let Some(sync) = sync else {
-            return;
+            return RetireOutcome::NotTracked;
         };
         after_unlock_before_drain();
         // Unlocked: may block waiting out an in-flight ForwardingGuard.
         sync.drain_after_announce();
+        RetireOutcome::RetiredAndDrained
     }
 
     /// True if at least one still-live (upgradable) **Active** session is
@@ -4135,5 +4187,90 @@ mod tests {
         assert!(!gate.is_authorized());
         assert_eq!(session.notices_sent.load(Ordering::SeqCst), 0);
         assert!(!session.closed.load(Ordering::SeqCst));
+    }
+
+    /// Round D-1 successor (@kiana): the completion half of
+    /// `retire_locally`'s guarantee belongs to the caller that actually
+    /// removed the entry, and the API must say so rather than claim it
+    /// unconditionally.
+    ///
+    /// Reproduces the exact race deterministically, without threads or
+    /// timing: the hook runs after the winner released the lock but BEFORE
+    /// the winner drained, and a second `retire_locally` issued from
+    /// exactly that point finds the entry already gone. That second call is
+    /// the "loser" — it must report `NotTracked`, not
+    /// `RetiredAndDrained`, because at that instant the winner genuinely
+    /// has not drained yet.
+    #[test]
+    fn a_second_retire_that_finds_the_entry_already_gone_reports_not_tracked() {
+        let m_id = test_m_id(84);
+        let snapshot = snapshot_at(1, [1u8; 32], &[(m_id.clone(), FP_A)], &[]);
+        let registry = MeshSessionRegistry::<RecordingSession>::new(&snapshot);
+        let binding = sealed_binding(&snapshot, &m_id);
+        let session = Arc::new(RecordingSession::default());
+        let (id, gate) = registry
+            .register(&binding, Arc::downgrade(&session))
+            .unwrap();
+
+        let loser_outcome: StdMutex<Option<RetireOutcome>> = StdMutex::new(None);
+        let winner_outcome = registry.retire_locally_with_hook_for_test(id, || {
+            // The winner has removed + announced and released the lock, but
+            // has NOT drained yet. A concurrent retirement arriving now
+            // sees the absence.
+            *loser_outcome.lock().unwrap() = Some(registry.retire_locally(id));
+        });
+
+        assert_eq!(winner_outcome, RetireOutcome::RetiredAndDrained);
+        assert_eq!(
+            *loser_outcome.lock().unwrap(),
+            Some(RetireOutcome::NotTracked),
+            "a caller that found the entry already gone must not claim the drain guarantee"
+        );
+        // Authority is closed regardless of which caller observed what.
+        assert!(!gate.is_authorized());
+        assert!(gate.try_authorize_forwarding().is_none());
+    }
+
+    /// The ordinary single-owner path — what the official facade wrapper
+    /// does — reports the full guarantee.
+    #[test]
+    fn a_sole_retire_reports_retired_and_drained() {
+        let m_id = test_m_id(85);
+        let snapshot = snapshot_at(1, [1u8; 32], &[(m_id.clone(), FP_A)], &[]);
+        let registry = MeshSessionRegistry::<RecordingSession>::new(&snapshot);
+        let binding = sealed_binding(&snapshot, &m_id);
+        let session = Arc::new(RecordingSession::default());
+        let (id, _gate) = registry
+            .register(&binding, Arc::downgrade(&session))
+            .unwrap();
+
+        assert_eq!(
+            registry.retire_locally(id),
+            RetireOutcome::RetiredAndDrained
+        );
+        // Retiring an unknown session is NotTracked, not a full guarantee.
+        assert_eq!(registry.retire_locally(id), RetireOutcome::NotTracked);
+    }
+
+    /// An `Unavailable` registry cannot announce or drain any individual
+    /// session, and must say so rather than report a guarantee it did not
+    /// provide.
+    #[test]
+    fn retire_on_an_unavailable_registry_reports_registry_unavailable() {
+        let m_id = test_m_id(86);
+        let snapshot = snapshot_at(1, [1u8; 32], &[(m_id.clone(), FP_A)], &[]);
+        let registry = MeshSessionRegistry::<RecordingSession>::new(&snapshot);
+        let binding = sealed_binding(&snapshot, &m_id);
+        let session = Arc::new(RecordingSession::default());
+        let (id, _gate) = registry
+            .register(&binding, Arc::downgrade(&session))
+            .unwrap();
+
+        registry.mark_unavailable();
+
+        assert_eq!(
+            registry.retire_locally(id),
+            RetireOutcome::RegistryUnavailable
+        );
     }
 }
