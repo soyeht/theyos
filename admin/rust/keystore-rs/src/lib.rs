@@ -112,4 +112,36 @@ pub trait KeystoreBackend: Send + Sync {
     /// absent — the post-condition is "the entry is gone", not "we unlinked
     /// it ourselves".
     fn delete(&self, account: &str) -> Result<(), KeystoreError>;
+
+    /// Atomically create `account` with `value` iff it does not already
+    /// exist. Never overwrites.
+    ///
+    /// - `Ok(())` — this call created the entry.
+    /// - `Err(`[`KeystoreError::Conflict`]`)` — an entry already existed;
+    ///   nothing was written. Callers who need the existing bytes must call
+    ///   [`Self::get`] afterwards as a separate step — reading stale data is
+    ///   harmless, but this method will not silently perform that read for
+    ///   you, and doing an inspect-then-write yourself instead of calling
+    ///   this method reopens the exact TOCTOU window it exists to close.
+    /// - `Err(`[`KeystoreError::Unsupported`]`)` — this backend has no
+    ///   race-free create primitive in its underlying API. Do not fall back
+    ///   to `get`-then-`set`; that is not atomic and defeats the guarantee.
+    ///
+    /// The guarantee is scoped to concurrent `create_only` callers racing
+    /// each other (and to `get`/`create_only` races): exactly one caller
+    /// observes `Ok(())` for a given account. It says nothing about a
+    /// concurrent [`Self::set`], which is documented to overwrite
+    /// unconditionally by design — mixing `create_only` and `set` on the
+    /// same account from different callers is a caller-level contract
+    /// violation, not something this method can fix.
+    ///
+    /// Defaults to [`KeystoreError::Unsupported`] so implementors of this
+    /// trait outside this crate keep compiling; backends that can prove a
+    /// real atomic primitive override it.
+    fn create_only(&self, account: &str, value: &[u8]) -> Result<(), KeystoreError> {
+        let _ = (account, value);
+        Err(KeystoreError::Unsupported {
+            hint: "this keystore backend has no race-free create-only primitive".into(),
+        })
+    }
 }

@@ -115,6 +115,29 @@ impl KeystoreBackend for FileKeystore {
             }),
         }
     }
+
+    fn create_only(&self, account: &str, value: &[u8]) -> Result<(), KeystoreError> {
+        let dir = self.secrets_dir();
+        if let Err(e) = ensure_private_dir(&dir) {
+            return Err(KeystoreError::Io {
+                kind: e.kind().to_string(),
+                hint: format!("create {}: {e}", dir.display()),
+            });
+        }
+        let path = self.account_path(account);
+        create_new_0600(&path, value).map_err(|e| {
+            if e.kind() == ErrorKind::AlreadyExists {
+                KeystoreError::Conflict {
+                    label: format!("{} (file fallback)", path.display()),
+                }
+            } else {
+                KeystoreError::Io {
+                    kind: e.kind().to_string(),
+                    hint: format!("create {}: {e}", path.display()),
+                }
+            }
+        })
+    }
 }
 
 /// Sanitise a value used as a path segment so it stays inside the secrets
@@ -217,6 +240,115 @@ fn write_0600(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Create `final_path` with `bytes` iff it does not already exist. Returns
+/// an `io::Error` with `kind() == AlreadyExists` when it does — that is the
+/// conflict signal, not a real I/O failure.
+///
+/// Plain `tmp + rename` (as [`write_0600`] uses for `set`) is NOT create-only:
+/// `rename(2)` silently replaces an existing destination. This instead
+/// writes to a per-attempt, randomly-suffixed tmp file, then publishes with
+/// `link(2)` (via [`fs::hard_link`]), which fails with `EEXIST` rather than
+/// replacing when the destination is already there — genuine no-replace
+/// atomicity, not a race window narrowed by convention.
+fn create_new_0600(final_path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    let parent = final_path
+        .parent()
+        .expect("account_path is always inside secrets_dir, which has a parent");
+
+    let mut last_collision = None;
+    for attempt in 0u32..8 {
+        let tmp_path = tmp_attempt_path(final_path, attempt);
+        match write_new_tmp_0600(&tmp_path, bytes) {
+            Ok(()) => {
+                let publish = fs::hard_link(&tmp_path, final_path);
+                let _ = fs::remove_file(&tmp_path);
+                return match publish {
+                    // The entry now genuinely exists (the link landed) even
+                    // if we can't prove the directory entry is durable —
+                    // propagate the fsync failure instead of swallowing it,
+                    // matching `write_0600`'s `?` below. A caller who sees
+                    // this Err and retries will get a definitive answer:
+                    // `Conflict` if the link already survived, another `Io`
+                    // error otherwise. Silently returning `Ok(())` here would
+                    // claim durability this function never actually proved.
+                    Ok(()) => {
+                        let dir = OpenOptions::new().read(true).open(parent)?;
+                        dir.sync_all()?;
+                        Ok(())
+                    }
+                    Err(e) => Err(e),
+                };
+            }
+            Err(e) if e.kind() == ErrorKind::AlreadyExists => {
+                // Our own randomized tmp name collided with a leftover or a
+                // sibling attempt — vanishingly unlikely, just retry.
+                last_collision = Some(e);
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    Err(last_collision.unwrap_or_else(|| {
+        std::io::Error::new(
+            ErrorKind::AlreadyExists,
+            "exhausted create-only tmp name attempts",
+        )
+    }))
+}
+
+/// Per-attempt tmp path for [`create_new_0600`]. Named per-attempt (not a
+/// fixed `.tmp` suffix like [`write_0600`] uses) so two concurrent
+/// `create_only` callers never contend on the same tmp file.
+fn tmp_attempt_path(final_path: &Path, attempt: u32) -> PathBuf {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let mut name = final_path.file_name().unwrap_or_default().to_os_string();
+    name.push(format!(".tmp.{}.{nanos}.{n}.{attempt}", std::process::id()));
+    final_path.with_file_name(name)
+}
+
+#[cfg(unix)]
+fn write_new_tmp_0600(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)?;
+    if let Err(e) = file.write_all(bytes) {
+        drop(file);
+        let _ = fs::remove_file(path);
+        return Err(e);
+    }
+    if let Err(e) = file.sync_all() {
+        drop(file);
+        let _ = fs::remove_file(path);
+        return Err(e);
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn write_new_tmp_0600(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    let mut file = OpenOptions::new().write(true).create_new(true).open(path)?;
+    if let Err(e) = file.write_all(bytes) {
+        drop(file);
+        let _ = fs::remove_file(path);
+        return Err(e);
+    }
+    if let Err(e) = file.sync_all() {
+        drop(file);
+        let _ = fs::remove_file(path);
+        return Err(e);
+    }
+    Ok(())
+}
+
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
@@ -264,5 +396,109 @@ mod tests {
         let ks = FileKeystore::new(td.path(), "svc");
         ks.set("a", b"hello world").unwrap();
         assert_eq!(ks.get("a").unwrap(), b"hello world");
+    }
+
+    #[test]
+    fn create_only_uses_owner_only_file_and_dir() {
+        let td = tempfile::tempdir().unwrap();
+        let ks = FileKeystore::new(td.path(), "household");
+        ks.create_only("acct", b"secret-bytes").unwrap();
+
+        let file = ks.path_for("acct");
+        assert_eq!(mode_of(&file), 0o600, "create_only file must be owner-only");
+        assert_eq!(
+            mode_of(file.parent().unwrap()),
+            0o700,
+            "create_only must tighten the secrets dir too"
+        );
+        // No leftover per-attempt tmp files.
+        let leftovers: Vec<_> = fs::read_dir(file.parent().unwrap())
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|e| e.file_name().to_string_lossy().contains(".tmp."))
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "tmp attempt file not cleaned up: {leftovers:?}"
+        );
+    }
+
+    #[test]
+    fn create_only_never_overwrites_a_winner() {
+        let td = tempfile::tempdir().unwrap();
+        let ks = FileKeystore::new(td.path(), "svc");
+        let account = random_account("create-only-conflict");
+
+        ks.create_only(&account, b"first-writer-wins").unwrap();
+
+        match ks.create_only(&account, b"second-writer-loses") {
+            Err(KeystoreError::Conflict { label }) => {
+                assert!(label.contains(&account), "label={label}");
+            }
+            other => panic!("expected Conflict, got {other:?}"),
+        }
+
+        // The original value must be intact, not clobbered by the loser.
+        assert_eq!(ks.get(&account).unwrap(), b"first-writer-wins");
+    }
+
+    #[test]
+    fn create_only_succeeds_again_after_delete() {
+        let td = tempfile::tempdir().unwrap();
+        let ks = FileKeystore::new(td.path(), "svc");
+        let account = random_account("create-only-recreate");
+
+        ks.create_only(&account, b"v1").unwrap();
+        ks.delete(&account).unwrap();
+        ks.create_only(&account, b"v2").unwrap();
+
+        assert_eq!(ks.get(&account).unwrap(), b"v2");
+    }
+
+    #[test]
+    fn create_only_races_have_exactly_one_winner() {
+        use std::sync::{Arc, Barrier};
+        use std::thread;
+
+        let td = tempfile::tempdir().unwrap();
+        let ks = Arc::new(FileKeystore::new(td.path(), "svc"));
+        let account = random_account("create-only-race");
+        let workers = 8;
+        let barrier = Arc::new(Barrier::new(workers));
+
+        let handles: Vec<_> = (0..workers)
+            .map(|i| {
+                let ks = ks.clone();
+                let account = account.clone();
+                let barrier = barrier.clone();
+                thread::spawn(move || {
+                    barrier.wait();
+                    ks.create_only(&account, format!("writer-{i}").as_bytes())
+                        .is_ok()
+                })
+            })
+            .collect();
+
+        let wins = handles
+            .into_iter()
+            .map(|h| h.join().unwrap())
+            .filter(|ok| *ok)
+            .count();
+        assert_eq!(wins, 1, "exactly one concurrent create_only must win");
+    }
+
+    /// Random-suffixed account label so parallel test runs / repeated local
+    /// runs never collide on shared on-disk state — same hygiene the
+    /// `keys_se` test contract asks for, applied here to keystore-rs's own
+    /// tests.
+    fn random_account(prefix: &str) -> String {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        format!("{prefix}.{}.{nanos}.{n}", std::process::id())
     }
 }

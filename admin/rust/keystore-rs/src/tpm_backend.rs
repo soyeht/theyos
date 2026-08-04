@@ -79,6 +79,21 @@ impl KeystoreBackend for TpmKeystore {
     fn delete(&self, account: &str) -> Result<(), KeystoreError> {
         self.inner.delete(account)
     }
+
+    /// Seals `value` and publishes it iff `account` is absent.
+    ///
+    /// Encryption happens before the race is resolved: two concurrent
+    /// callers each seal their own candidate, but [`FileKeystore::create_only`]
+    /// guarantees only one candidate's ciphertext is ever published — the
+    /// loser's sealed blob is never written to disk and its
+    /// `KeystoreError::Conflict` propagates unchanged, without needing to
+    /// decrypt and compare anything. Slightly wasteful (a losing caller pays
+    /// for a `systemd-creds encrypt` that gets discarded) but not incorrect,
+    /// and secret creation is not a hot path.
+    fn create_only(&self, account: &str, value: &[u8]) -> Result<(), KeystoreError> {
+        let ciphertext = encrypt_with_systemd_creds(account, value)?;
+        self.inner.create_only(account, &ciphertext)
+    }
 }
 
 /// Run `systemd-creds encrypt --with-key=tpm2 --name=<account> - -`,
@@ -268,5 +283,39 @@ mod tests {
             matches!(err, KeystoreError::Io { .. }),
             "expected Io error, got {err:?}",
         );
+    }
+
+    #[test]
+    fn create_only_seals_and_round_trips() {
+        if !tpm2_available() {
+            eprintln!("skipping: no TPM2 available on this host");
+            return;
+        }
+        let dir = TempDir::new().unwrap();
+        let ks = TpmKeystore::new(dir.path(), "test.tpm.create_only");
+        ks.create_only("llm.api_key.created", b"sk-created-0123456789")
+            .unwrap();
+        assert_eq!(
+            ks.get("llm.api_key.created").unwrap(),
+            b"sk-created-0123456789"
+        );
+    }
+
+    #[test]
+    fn create_only_conflict_leaves_first_seal_untouched() {
+        if !tpm2_available() {
+            eprintln!("skipping: no TPM2 available on this host");
+            return;
+        }
+        let dir = TempDir::new().unwrap();
+        let ks = TpmKeystore::new(dir.path(), "test.tpm.create_only_conflict");
+        ks.create_only("acct", b"first").unwrap();
+
+        let err = ks.create_only("acct", b"second").unwrap_err();
+        assert!(
+            matches!(err, KeystoreError::Conflict { .. }),
+            "expected Conflict, got {err:?}"
+        );
+        assert_eq!(ks.get("acct").unwrap(), b"first");
     }
 }

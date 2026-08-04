@@ -58,9 +58,17 @@
 
 use crate::{KeystoreBackend, KeystoreError, SERVICE, macos_keychain_denied_error};
 
+use core_foundation::base::TCFType;
+use core_foundation::data::CFData;
+use core_foundation::dictionary::CFDictionary;
+use core_foundation::string::CFString;
 use security_framework::passwords::{
     delete_generic_password, get_generic_password, set_generic_password,
 };
+use security_framework::passwords_options::PasswordOptions;
+use security_framework_sys::base::errSecDuplicateItem;
+use security_framework_sys::item::kSecValueData;
+use security_framework_sys::keychain_item::SecItemAdd;
 
 /// macOS system keystore backed by Keychain Services. See module-level docs.
 #[derive(Debug, Clone)]
@@ -106,6 +114,53 @@ impl KeystoreBackend for MacosSystemKeystore {
             Err(e) => Err(map_keychain_err(e, account)),
         }
     }
+
+    /// Adds a generic-password item iff one does not already exist for
+    /// `(service, account)`, using the raw `SecItemAdd` primitive directly.
+    ///
+    /// [`set_generic_password`] cannot be reused here: its
+    /// `set_password_internal` (security-framework 2.11.1's own
+    /// `src/passwords.rs`) calls `SecItemAdd` and, on `errSecDuplicateItem`,
+    /// falls through to `SecItemUpdate` — that's create-or-update, not
+    /// create-only. This mirrors that same internal implementation up to
+    /// the duplicate check, then stops: on `errSecDuplicateItem` it reports
+    /// `Conflict` and leaves the existing item untouched instead of
+    /// overwriting it.
+    #[allow(unsafe_code)]
+    fn create_only(&self, account: &str, value: &[u8]) -> Result<(), KeystoreError> {
+        let mut options = PasswordOptions::new_generic_password(&self.service, account);
+        options.query.push((
+            // SAFETY: `kSecValueData` is a process-lifetime CF constant
+            // owned by the Security framework; `wrap_under_get_rule` takes
+            // a +0 (borrowed) reference, matching how `security-framework`
+            // itself uses this exact constant in `passwords.rs`.
+            unsafe { CFString::wrap_under_get_rule(kSecValueData) },
+            CFData::from_buffer(value).into_CFType(),
+        ));
+        let params = CFDictionary::from_CFType_pairs(&options.query);
+
+        let mut result = std::ptr::null();
+        // SAFETY: `params` is a fully-owned CFDictionary built the same way
+        // `security-framework`'s own `set_password_internal` builds its
+        // query (service + account + class + kSecValueData). We pass no
+        // `kSecReturn*` attribute, so Keychain Services does not populate
+        // `result` on success and there is nothing to release; `SecItemAdd`
+        // is documented safe to call with a null-initialized out-param.
+        let status = unsafe { SecItemAdd(params.as_concrete_TypeRef(), &raw mut result) };
+
+        if status == errSecDuplicateItem {
+            return Err(KeystoreError::Conflict {
+                label: format!("{}/{account} (macOS Keychain)", self.service),
+            });
+        }
+        if status != 0 {
+            return Err(map_keychain_err(
+                security_framework::base::Error::from_code(status),
+                account,
+            ));
+        }
+        Ok(())
+    }
 }
 
 fn is_not_found(e: security_framework::base::Error) -> bool {
@@ -129,5 +184,67 @@ fn map_keychain_err(e: security_framework::base::Error, account: &str) -> Keysto
     KeystoreError::Io {
         kind: format!("OSStatus {code}"),
         hint: e.to_string(),
+    }
+}
+
+// Real Login Keychain round-trip tests. `#[ignore]`d for the same reason
+// `tests/roundtrip.rs` keeps System-keystore coverage out of the default
+// `cargo test` run: this hits a real user-session Keychain daemon, which a
+// CI sandbox or headless host does not have. Run explicitly on a workstation
+// with `cargo test -- --ignored`; each test deletes its own random-suffixed
+// account on the way out (RAII guard below) even on assertion panic, so
+// repeated local runs never collide with leftover state from a prior run.
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct CleanupGuard<'a> {
+        ks: &'a MacosSystemKeystore,
+        account: String,
+    }
+
+    impl Drop for CleanupGuard<'_> {
+        fn drop(&mut self) {
+            let _ = self.ks.delete(&self.account);
+        }
+    }
+
+    fn random_account(prefix: &str) -> String {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        format!("{prefix}.{}.{nanos}.{n}", std::process::id())
+    }
+
+    #[test]
+    #[ignore = "hits the real macOS Login Keychain; run manually on a workstation"]
+    fn create_only_round_trips_then_conflicts_then_recreates() {
+        let ks = MacosSystemKeystore::new("com.soyeht.theyos.test.create_only");
+        let account = random_account("create-only");
+        let _cleanup = CleanupGuard {
+            ks: &ks,
+            account: account.clone(),
+        };
+
+        ks.create_only(&account, b"first-writer-wins").unwrap();
+        assert_eq!(ks.get(&account).unwrap(), b"first-writer-wins");
+
+        let err = ks
+            .create_only(&account, b"second-writer-loses")
+            .unwrap_err();
+        assert!(
+            matches!(err, KeystoreError::Conflict { .. }),
+            "expected Conflict, got {err:?}"
+        );
+        // Loser must not have clobbered the winner.
+        assert_eq!(ks.get(&account).unwrap(), b"first-writer-wins");
+
+        ks.delete(&account).unwrap();
+        ks.create_only(&account, b"recreated-after-delete").unwrap();
+        assert_eq!(ks.get(&account).unwrap(), b"recreated-after-delete");
     }
 }

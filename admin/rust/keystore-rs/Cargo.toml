@@ -20,9 +20,22 @@ keyring = { workspace = true }
 # macOS: security-framework wrapper around Keychain Services for generic-password
 # entries. The household crate's Secure-Enclave key path stays where it is
 # (household-rs::keys_se) — keystore-rs is only the generic (service, account)
-# → bytes API.
+# → bytes API. security-framework-sys/core-foundation are needed directly
+# (not just transitively) for the raw SecItemAdd call behind `create_only`:
+# the safe `security-framework::passwords` wrapper only exposes create-or-
+# update semantics, never create-only.
+#
+# core-foundation is pinned to "0.9.4" here, NOT `workspace = true` (which
+# resolves to 0.10.x elsewhere in the workspace) — security-framework 2.11.1
+# itself depends on core-foundation "0.9.4" and its public
+# `passwords_options::PasswordOptions.query: Vec<(CFString, CFType)>` uses
+# those 0.9.4 types. A workspace-aliased 0.10.x CFString is a different,
+# non-interchangeable type despite the identical name (confirmed by
+# `cargo check`: E0277, two versions of `core_foundation` in the graph).
 [target.'cfg(target_os = "macos")'.dependencies]
-security-framework = { workspace = true }
+security-framework     = { workspace = true }
+security-framework-sys = { workspace = true }
+core-foundation         = "0.9.4"
 
 [dev-dependencies]
 tempfile = { workspace = true }

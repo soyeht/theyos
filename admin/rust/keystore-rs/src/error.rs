@@ -26,6 +26,19 @@ pub enum KeystoreError {
     #[error("entry not found: {label}")]
     NotFound { label: String },
 
+    /// A [`KeystoreBackend::create_only`](crate::KeystoreBackend::create_only)
+    /// call found an existing entry and left it untouched.
+    #[error("keystore entry already exists: {label}")]
+    Conflict { label: String },
+
+    /// A backend cannot perform the requested operation at all (structurally,
+    /// not "temporarily down") — e.g. `create_only` on a backend whose
+    /// underlying API has no race-free create primitive. Distinct from
+    /// [`Self::Unavailable`], which means the same operation would work if
+    /// the service were reachable/unlocked.
+    #[error("keystore operation not supported: {hint}")]
+    Unsupported { hint: String },
+
     #[error("keystore I/O error: {kind}: {hint}")]
     Io { kind: String, hint: String },
 
@@ -47,6 +60,8 @@ impl KeystoreError {
             Self::PermissionDenied { .. } => "se.permission_denied",
             Self::SeUnavailable { .. } => "se.unavailable",
             Self::NotFound { .. } => "keystore.not_found",
+            Self::Conflict { .. } => "keystore.conflict",
+            Self::Unsupported { .. } => "keystore.unsupported",
             Self::Io { .. } => "keystore.io",
             Self::SigningFailed(_) => "keystore.signing_failed",
             Self::InvalidKeyMaterial(_) => "keystore.invalid_key_material",
@@ -60,8 +75,10 @@ impl KeystoreError {
             Self::Unavailable { hint }
             | Self::PermissionDenied { hint }
             | Self::SeUnavailable { hint }
-            | Self::Io { hint, .. } => hint.clone(),
+            | Self::Io { hint, .. }
+            | Self::Unsupported { hint } => hint.clone(),
             Self::NotFound { label } => format!("entry {label} missing from keystore"),
+            Self::Conflict { label } => format!("entry {label} already exists"),
             Self::SigningFailed(msg) | Self::InvalidKeyMaterial(msg) => msg.clone(),
         }
     }

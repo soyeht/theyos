@@ -100,6 +100,59 @@ fn file_backend_isolates_services() {
 }
 
 #[test]
+fn file_backend_create_only_never_overwrites_a_winner() {
+    let dir = tempdir().unwrap();
+    let store = FileKeystore::new(dir.path(), "com.soyeht.theyos.test");
+
+    store.create_only("acct", b"first").unwrap();
+
+    match store.create_only("acct", b"second") {
+        Err(KeystoreError::Conflict { .. }) => {}
+        other => panic!("expected Conflict, got {other:?}"),
+    }
+    assert_eq!(store.get("acct").unwrap(), b"first");
+}
+
+#[test]
+fn file_backend_create_only_then_delete_then_create_only_again() {
+    let dir = tempdir().unwrap();
+    let store = FileKeystore::new(dir.path(), "com.soyeht.theyos.test");
+
+    store.create_only("acct", b"v1").unwrap();
+    store.delete("acct").unwrap();
+    store.create_only("acct", b"v2").unwrap();
+
+    assert_eq!(store.get("acct").unwrap(), b"v2");
+}
+
+#[test]
+fn linux_and_macos_system_keystore_backends_default_create_only_to_unsupported() {
+    // We can't instantiate the platform System backend cross-platform from
+    // this test, but the default trait method itself is exercised directly
+    // here via a minimal in-crate implementor that only overrides get/set/
+    // delete — proving the default really is Unsupported, not silently Ok,
+    // for any implementor (in or outside this crate) that doesn't opt in.
+    struct ByteOrientedOnly;
+    impl keystore_rs::KeystoreBackend for ByteOrientedOnly {
+        fn get(&self, _account: &str) -> Result<Vec<u8>, KeystoreError> {
+            unimplemented!()
+        }
+        fn set(&self, _account: &str, _value: &[u8]) -> Result<(), KeystoreError> {
+            unimplemented!()
+        }
+        fn delete(&self, _account: &str) -> Result<(), KeystoreError> {
+            unimplemented!()
+        }
+    }
+
+    let err = ByteOrientedOnly.create_only("acct", b"v").unwrap_err();
+    assert!(
+        matches!(err, KeystoreError::Unsupported { .. }),
+        "expected Unsupported, got {err:?}"
+    );
+}
+
+#[test]
 fn file_backend_sanitises_path_traversal_attempts() {
     let dir = tempdir().unwrap();
     let store = FileKeystore::new(dir.path(), "com.soyeht.theyos.test");
