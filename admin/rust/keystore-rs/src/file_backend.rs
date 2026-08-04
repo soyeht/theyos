@@ -996,15 +996,26 @@ fn create_ancestors_durably(dir: &Path) -> std::io::Result<()> {
     let mut built = PathBuf::new();
     for component in dir.components() {
         built.push(component);
-        match fs::create_dir(&built) {
-            Ok(()) => {
-                if let Some(parent) = built.parent() {
-                    let d = OpenOptions::new().read(true).open(parent)?;
-                    d.sync_all()?;
-                }
+        if let Err(e) = fs::create_dir(&built) {
+            if e.kind() != ErrorKind::AlreadyExists {
+                return Err(e);
             }
-            Err(e) if e.kind() == ErrorKind::AlreadyExists => {}
-            Err(e) => return Err(e),
+        }
+        // Fsync the parent UNCONDITIONALLY, including when the level
+        // already existed.
+        //
+        // I previously skipped this on AlreadyExists, reasoning that a
+        // pre-existing ancestor is the caller's own tree and not ours to
+        // prove. That reasoning has a hole: if THIS crate created the level
+        // on an earlier call and its fsync failed, the retry sees the
+        // directory present and skips the barrier forever — visibility
+        // standing in for durability, which is the exact confusion this
+        // module exists to prevent, in the one place I had argued it did
+        // not apply. Paying an extra fsync per level is cheaper than a
+        // silently unprovable hierarchy.
+        if let Some(parent) = built.parent() {
+            let d = OpenOptions::new().read(true).open(parent)?;
+            d.sync_all()?;
         }
     }
     Ok(())

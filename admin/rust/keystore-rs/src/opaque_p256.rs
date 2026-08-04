@@ -61,9 +61,11 @@ pub const P256_PUBLIC_KEY_LEN: usize = 33;
 /// Raw `r || s` ECDSA P-256 signature length (NOT DER), same contract.
 pub const P256_SIGNATURE_LEN: usize = 64;
 
-/// Compile-time purpose tag. Distinct purposes derive distinct slots AND
-/// distinct signing preimages, so a key minted for one role cannot sign for
-/// another — not by passing a different string, and not by reusing bytes.
+/// Compile-time purpose tag. Distinct purposes derive distinct STORAGE
+/// slots, and the type system stops a key minted for one role from signing
+/// for another. It does NOT alter the signed bytes — see the note on
+/// [`Purpose::PURPOSE`], which this summary previously contradicted by also
+/// claiming distinct signing preimages.
 pub trait Purpose {
     /// Stable label that domain-separates STORAGE: it is hashed into the
     /// canonical slot id, so changing it orphans existing keys. Treat it as
@@ -168,20 +170,35 @@ impl<P: Purpose> Slot<P> {
         &self.label
     }
 
-    /// Canonical versioned slot id: `p256.v1.<64 hex>`.
+    /// Canonical versioned slot id: `p256.v1.<64 hex>`, an account name
+    /// PRIVATE to this crate.
     ///
-    /// Fixed-width regardless of purpose or label length, and injective
-    /// because the digest is taken over LENGTH-PREFIXED components — the
-    /// concatenation `purpose || label` on its own is not injective, which
-    /// is the same defect that produced colliding accounts earlier in this
-    /// module and colliding paths one layer below it. Length prefixes make
-    /// `("a","b.c")` and `("a.b","c")` distinct preimages by construction
-    /// rather than by escaping rules that have to be got right at every
-    /// layer.
+    /// Two separate properties, which an earlier version of this comment
+    /// wrongly merged into one by calling the result "injective by
+    /// construction":
+    ///
+    /// 1. The digest PREIMAGE is unambiguous. Components are
+    ///    LENGTH-PREFIXED, so `("a","b.c")` and `("a.b","c")` are distinct
+    ///    inputs by construction — unlike a bare `purpose || label` join,
+    ///    which produced the colliding accounts this module had earlier and
+    ///    the colliding paths one layer below it.
+    /// 2. The MAPPING to the id is collision-RESISTANT, not injective. A
+    ///    256-bit digest over an unbounded domain cannot be injective;
+    ///    distinct slots are believed distinct because finding a BLAKE3
+    ///    collision is infeasible, not because a collision is impossible.
+    ///    Claiming injectivity would assert something mathematically false,
+    ///    and the guarantee actually relied upon is the weaker one.
     ///
     /// Fixed width also removes truncation as a failure mode: an over-long
     /// label is rejected at [`Slot::new`] rather than silently shortened
     /// into a collision with another slot.
+    ///
+    /// NOTE for the D4 adapter integration: this `p256.v1.*` account is
+    /// internal storage addressing and is not the public
+    /// `delegated_key_id`. That identifier belongs to a DISTINCT namespace
+    /// label which this crate re-hashes into a slot; the two layers must
+    /// not share the `p256.v1.` prefix, or a public identifier and a
+    /// private storage address become confusable.
     fn account(&self) -> String {
         let mut hasher = blake3::Hasher::new();
         hasher.update(
@@ -765,28 +782,7 @@ impl OpaqueP256Slots {
         slot: &Slot<P>,
         binding: &PublicBinding<P>,
     ) -> Result<OpaqueSigner<P>, KeystoreError> {
-        let expected_store = self.composed_store_id()?;
-        if binding.store_id != expected_store {
-            return Err(KeystoreError::SecurityViolation {
-                label: slot.label.clone(),
-                hint: format!(
-                    "binding was published by store {}, not {expected_store}",
-                    binding.store_id
-                ),
-            });
-        }
-        if binding.backing != self.store.backing() {
-            return Err(KeystoreError::SecurityViolation {
-                label: slot.label.clone(),
-                hint: "binding's at-rest backing does not match this store".into(),
-            });
-        }
-        if binding.label != slot.label {
-            return Err(KeystoreError::SecurityViolation {
-                label: slot.label.clone(),
-                hint: "binding describes a different slot label".into(),
-            });
-        }
+        self.validate_binding_scope(slot, binding)?;
 
         let signing = self.load_signing_key(slot)?;
         let derived = self.binding_for(slot, signing.verifying_key())?;
@@ -822,10 +818,18 @@ impl OpaqueP256Slots {
         slot: &Slot<P>,
         expected: &PublicBinding<P>,
     ) -> Result<GcReport, KeystoreError> {
-        // Compare and remove as ONE locked operation. Comparing here and
-        // deleting afterwards was check-then-act: a writer installing B
-        // between the two destroyed B, and the resulting absence was not
-        // durable either.
+        // The binding must belong to THIS store and THIS slot before it can
+        // authorise destroying anything. Matching on the public key alone
+        // was not enough: a binding published by a different store, or for
+        // a different slot, would authorise a delete here as soon as the
+        // same scalar existed in both places — and copying a scalar between
+        // stores is exactly the scenario the store identity exists for.
+        // Same checks `load_exact` makes before it will sign.
+        self.validate_binding_scope(slot, expected)?;
+
+        // Compare and remove as ONE locked operation. Comparing then
+        // deleting was check-then-act: a writer installing B between the
+        // two destroyed B, and the resulting absence was not durable.
         let expected_key = *expected.public_key();
         let outcome = self.store.delete_exact_locked(&slot.account(), |stored| {
             let material = Self::interpret_stored(&self.store, &slot.account(), stored)?;
@@ -853,6 +857,44 @@ impl OpaqueP256Slots {
                 present_after: true,
             },
         })
+    }
+
+    /// Confirm a binding actually describes THIS store and THIS slot.
+    ///
+    /// Shared by [`Self::load_exact`] and [`Self::gc_exact`] rather than
+    /// written twice: signing under a foreign binding and destroying a key
+    /// under a foreign binding are the same authorisation question, and
+    /// having one of them implement a weaker check than the other is
+    /// precisely how `gc_exact` came to accept any binding whose public key
+    /// happened to match.
+    fn validate_binding_scope<P: Purpose>(
+        &self,
+        slot: &Slot<P>,
+        binding: &PublicBinding<P>,
+    ) -> Result<(), KeystoreError> {
+        let expected_store = self.composed_store_id()?;
+        if binding.store_id != expected_store {
+            return Err(KeystoreError::SecurityViolation {
+                label: slot.label.clone(),
+                hint: format!(
+                    "binding was published by store {}, not {expected_store}",
+                    binding.store_id
+                ),
+            });
+        }
+        if binding.backing != self.store.backing() {
+            return Err(KeystoreError::SecurityViolation {
+                label: slot.label.clone(),
+                hint: "binding's at-rest backing does not match this store".into(),
+            });
+        }
+        if binding.label != slot.label {
+            return Err(KeystoreError::SecurityViolation {
+                label: slot.label.clone(),
+                hint: "binding describes a different slot label".into(),
+            });
+        }
+        Ok(())
     }
 
     /// Turn stored bytes into a signing key, applying the store's own
@@ -970,6 +1012,13 @@ impl OpaqueP256Slots {
         &self,
         slot: &Slot<P>,
     ) -> Result<Option<PublicBinding<P>>, KeystoreError> {
+        // Resolve identity FIRST, even though an absent slot needs no
+        // binding. Otherwise a store whose marker is missing or corrupt
+        // while material exists reports a clean `None` for any slot that
+        // happens not to exist — hiding a quarantine condition behind an
+        // ordinary-looking answer, and letting a caller conclude "no key
+        // here" about a store that should not be trusted at all.
+        self.resolve_identity()?;
         self.try_binding(slot)
     }
 
@@ -1259,9 +1308,10 @@ mod tests {
     }
 
     /// `("a", "b.c")` and `("a.b", "c")` must not collide. The unencoded
-    /// join `p256.{purpose}.{label}` produced the same account for both.
+    /// join `p256.{purpose}.{label}` produced the same account for both —
+    /// an ambiguous preimage, which length-prefixing now rules out.
     #[test]
-    fn purpose_label_join_is_injective() {
+    fn ambiguous_purpose_label_join_no_longer_collides() {
         struct A;
         impl Purpose for A {
             const PURPOSE: &'static str = "a";
@@ -1632,10 +1682,17 @@ mod tests {
         );
     }
 
-    /// The slot id must be fixed-width and injective over length-prefixed
-    /// components, so no pair of (purpose, label) can collide.
+    /// The slot id must be fixed-width, and distinct `(purpose, label)`
+    /// pairs must map to distinct ids.
+    ///
+    /// Named for what is actually checked: these are DISTINCT INPUTS
+    /// producing distinct outputs. That is not injectivity — a 256-bit
+    /// digest over an unbounded domain cannot be injective — and no test
+    /// could establish injectivity anyway. What the length-prefixing buys
+    /// is an unambiguous preimage; what the hash buys is collision
+    /// resistance.
     #[test]
-    fn slot_id_is_fixed_width_and_injective() {
+    fn slot_id_is_fixed_width_and_separates_distinct_inputs() {
         struct A;
         impl Purpose for A {
             const PURPOSE: &'static str = "a";
@@ -1681,6 +1738,64 @@ mod tests {
             s.inspect(&slot).unwrap().is_some(),
             "B must still be loadable"
         );
+    }
+
+    /// A binding from ANOTHER store must not authorise deleting a key
+    /// here, even when the same scalar (hence the same public key) exists
+    /// in both places. Comparing only the public key made GC accept any
+    /// binding that happened to match — and copying a scalar between stores
+    /// is the exact scenario store identity exists to catch.
+    #[test]
+    fn gc_refuses_a_binding_from_another_store_even_with_matching_key() {
+        let a_dir = tempfile::tempdir().unwrap();
+        let b_dir = tempfile::tempdir().unwrap();
+        let approval = ApprovedFallback::for_reason("audit-only fixture");
+        let a = OpaqueP256Slots::approved_plaintext_file(a_dir.path(), "same-service", &approval);
+        let b = OpaqueP256Slots::approved_plaintext_file(b_dir.path(), "same-service", &approval);
+        let slot = Slot::<MeshSession>::new("shared-scalar").unwrap();
+
+        let (_, a_binding) = a.create_or_inspect(&slot).unwrap();
+        let a_binding = a_binding.unwrap();
+        // Initialise B, then copy A's scalar into it so the public keys match.
+        b.create_or_inspect(&Slot::<MeshSession>::new("init").unwrap())
+            .unwrap();
+        let raw_a = raw_reserved(a_dir.path(), "same-service");
+        let raw_b = raw_reserved(b_dir.path(), "same-service");
+        let scalar = raw_a.get(&slot.account()).unwrap();
+        raw_b.set(&slot.account(), &scalar).unwrap();
+
+        match b.gc_exact(&slot, &a_binding) {
+            Err(KeystoreError::SecurityViolation { .. }) => {}
+            other => panic!("a foreign binding authorised deletion: {other:?}"),
+        }
+        assert!(
+            b.inspect(&slot).unwrap().is_some(),
+            "the key in B must survive a GC authorised by A's binding"
+        );
+    }
+
+    /// A quarantine condition must not be hidden behind a clean `None` just
+    /// because the slot being inspected happens not to exist.
+    #[test]
+    fn inspect_surfaces_quarantine_even_for_an_absent_slot() {
+        let td = tempfile::tempdir().unwrap();
+        let s = store(td.path());
+        s.create_or_inspect(&Slot::<MeshSession>::new("material").unwrap())
+            .unwrap();
+
+        // Remove the identity marker, leaving material behind.
+        raw_reserved(td.path(), "opaque-p256-test")
+            .delete(STORE_IDENTITY_ACCOUNT)
+            .unwrap();
+
+        let reopened = store(td.path());
+        let absent = Slot::<MeshSession>::new("never-existed").unwrap();
+        match reopened.inspect(&absent) {
+            Err(KeystoreError::SecurityViolation { hint, .. }) => {
+                assert!(hint.contains("quarantine"), "hint={hint}");
+            }
+            other => panic!("quarantine hidden behind an absent slot: {other:?}"),
+        }
     }
 
     #[test]
