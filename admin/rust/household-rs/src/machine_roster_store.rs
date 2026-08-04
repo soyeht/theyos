@@ -1631,6 +1631,26 @@ impl MachineRosterCoordinator {
     /// helper (RED-R21 pins that the two never diverge), then projects a
     /// `RosterSnapshotView` instead of a per-machine currency result.
     pub fn current_snapshot(&self) -> Result<RosterSnapshotView, RosterSnapshotError> {
+        self.current_snapshot_with_trusted_wall_floor()
+            .map(|(snapshot, _floor)| snapshot)
+    }
+
+    /// Capture the accepted roster and the same durable trusted wall floor
+    /// under one `RosterLock` acquisition.
+    ///
+    /// The opaque floor is the only production token accepted by the mesh
+    /// intent nonce ledger for retention. Keeping its constructor private to
+    /// this crate prevents downstream code from forging a far-future floor and
+    /// pruning live replay entries.
+    pub fn current_snapshot_with_trusted_wall_floor(
+        &self,
+    ) -> Result<
+        (
+            RosterSnapshotView,
+            crate::mesh_intent_nonce_ledger::TrustedWallFloor,
+        ),
+        RosterSnapshotError,
+    > {
         let lock = RosterLock::acquire(&self.state_dir, &self.hh_id)?;
         let mut latch = self
             .latch
@@ -1674,7 +1694,10 @@ impl MachineRosterCoordinator {
         };
 
         let data = admit_current_accepted_data(&current_state, &query_ctx)?;
-        Ok(RosterSnapshotView::project(&self.hh_id, data))
+        Ok((
+            RosterSnapshotView::project(&self.hh_id, data),
+            crate::mesh_intent_nonce_ledger::TrustedWallFloor::from_machine_roster(floor),
+        ))
     }
 
     fn rederive_current_state(
