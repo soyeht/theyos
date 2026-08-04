@@ -175,19 +175,40 @@
 //! `unregister_waits_for_an_in_flight_forward_before_returning`, and
 //! `generation_exhaustion_refuses_to_recover_rather_than_wrap`.
 //!
-//! ## D-9 carrier B erratum1 E4: Pending -> Ack -> Active
+//! ## D-9 carrier B erratum1 E4 + bounded admission: Pending -> Ack -> Active
 //!
-//! Production admission is now deliberately two-phase.
-//! [`MeshSessionRegistry::preauthorize`]
-//! performs the exact D-1 revision/membership recheck and inserts a tracked
-//! Pending session with no forwarding gate. Its opaque, non-clonable
-//! [`PendingSessionAdmission`] holds a barrier across the one Ack write, so
-//! a concurrent revoke can announce and wait but cannot finish early. A
-//! successful write is followed immediately by
-//! [`PendingSessionAdmission::activate_if_authorized`], which rechecks the
-//! exact binding and atomically opens the gate; Drop is the fail-closed Ack
-//! failure/timeout path. The old immediate `register` helper exists only in
-//! this module's tests and is absent from production builds.
+//! Production admission is deliberately two-phase, and the boundary between
+//! the phases is the **full `ActivateAck`**, which is a point of no return
+//! (round D-1 bounded admission, @kiana audit `caf6d1e4`).
+//!
+//! [`MeshSessionRegistry::try_preauthorize_before`] performs the exact D-1
+//! revision/membership checks and inserts a tracked Pending session with no
+//! forwarding gate. It never waits: it `try_lock`s, and a `Busy` result has
+//! no effect at all, leaving the ceremony-deadline backoff to the runtime
+//! adapter.
+//!
+//! A fully successful Ack write is followed immediately by
+//! [`PendingSessionAdmission::commit_after_ack`], which is **infallible by
+//! design** — no deadline, no roster/revision/membership recheck, no
+//! registry lock, no call into `H`, no `Result`. Once the peer holds the
+//! complete Ack, a local refusal would leave the two sides disagreeing
+//! about whether the session exists. A revoke announced during the Ack
+//! window does not veto the commit; it closes the session immediately
+//! afterward instead, and nothing can forward in between because
+//! [`SessionSync::try_enter`] rejects on `writer_intent` *before* it reads
+//! the phase.
+//!
+//! A partial or failed Ack takes [`PendingSessionAdmission::cancel_before_ack`],
+//! and simply dropping the permit is the same fail-closed path reduced to
+//! its minimum: one atomic phase CAS plus a notify, with no lock, no wait,
+//! and no callback into `H`.
+//!
+//! **Do not reintroduce a post-Ack recheck.** The evidence it would need
+//! (the pre-Ack binding copy) was deliberately deleted, precisely so the
+//! decision cannot be made.
+//!
+//! The old immediate `register` helper exists only in this module's tests
+//! and is absent from production builds.
 //!
 //! D-6 (the roster-sync transport that decides *when* a new checkpoint is
 //! durably observed) is out of scope here too — see
@@ -216,9 +237,11 @@ pub trait RevocableMeshSession {
     fn close(&self);
 }
 
-/// Opaque handle to one Active session. Returned by
-/// [`PendingSessionAdmission::activate_if_authorized`], needed by
-/// [`MeshSessionRegistry::unregister`].
+/// Opaque handle to one Active session. Reachable via
+/// [`ActiveSessionRegistration::session_id`] after
+/// [`PendingSessionAdmission::commit_after_ack`], and needed by
+/// [`MeshSessionRegistry::unregister`]/
+/// [`MeshSessionRegistry::retire_locally`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct SessionId(u64);
 
@@ -251,13 +274,14 @@ pub struct SessionId(u64);
 ///   before either has removed it from the registry's bookkeeping maps),
 ///   and the signal must stay "a writer is active" until ALL of them
 ///   finish, not drop to zero the moment the first one does;
-/// - `authorized`: the actual bit, folded into the SAME lock as the
-///   admission bookkeeping below — reading it and admitting a reader
-///   happen in the one critical section, so there is no window between the
-///   two for a writer to interleave into;
-/// - `writer_active`: set once a writer has drained both `active_readers`
-///   and the pre-Ack `pending_admissions` barrier to zero and is doing its
-///   (here, trivial) exclusive work;
+/// - `phase`: the single source of truth for whether this session may
+///   forward — an `AtomicU8` OUTSIDE `state`'s `Mutex`, so cancel and the
+///   Pending `Drop` can close authority with no lock at all. It replaced
+///   the former `authorized` bool and `pending_admissions` counter, which
+///   lived inside the `Mutex` and duplicated a fact that
+///   `SessionEntry.lifecycle` also stored;
+/// - `writer_active`: set once a writer has drained `active_readers` to
+///   zero and is doing its (here, trivial) exclusive work;
 /// - `active_readers`: readers currently holding a [`ForwardingGuard`].
 ///   `revoke` waits on `drained` (a `Condvar`) until this reaches zero —
 ///   woken by a `ForwardingGuard`'s `Drop`, which decrements it under the
@@ -1110,8 +1134,8 @@ pub struct MeshSessionRegistry<H: RevocableMeshSession> {
 impl<H: RevocableMeshSession> MeshSessionRegistry<H> {
     /// Constructs the registry already bound to a validated initial
     /// snapshot and the household it was captured for — there is no
-    /// `Default`/empty construction, so `preauthorize` can never run before
-    /// any roster state has been observed.
+    /// `Default`/empty construction, so `try_preauthorize_before` can never
+    /// run before any roster state has been observed.
     #[must_use]
     pub fn new(initial: &RosterSnapshotView) -> Self {
         Self {
@@ -1213,6 +1237,24 @@ impl<H: RevocableMeshSession> MeshSessionRegistry<H> {
         if handle.upgrade().is_none() {
             return Err(RegisterRefusal::HandleAlreadyDropped);
         }
+        // Every SUCCESSFUL reserve pays down the deferred-cancel debt
+        // (round D-1 bounded admission, @kiana recheck of `d721f889`).
+        //
+        // Placement is exact and load-bearing in both directions. AFTER
+        // every admission check, so a refusal still leaves the registry
+        // bit-for-bit unchanged — "reserve fails without inserting" stays
+        // structural. BEFORE `next_session_id` is consumed and before the
+        // insert, so the sweep is part of the same critical section that
+        // adds the new entry.
+        //
+        // Without this, the reconcile claim was stronger than the
+        // mechanism: `prune_closed_locked` ran only in
+        // `reconcile_closed_pending`, `registered_count_inner` and the
+        // Advance branch, so a peer could cancel under a busy `inner` and
+        // then issue nothing but successful reserves, growing Closed
+        // entries without bound — each with a live `Weak`, so the
+        // dead-handle prune would never have reclaimed them either.
+        prune_closed_locked(sessions, by_machine);
         let id = next_session_id
             .checked_add(1)
             .ok_or(RegisterRefusal::SessionIdSpaceExhausted)?;
@@ -1963,7 +2005,8 @@ impl<H: RevocableMeshSession> MeshSessionRegistry<H> {
             // still correct and still needed on its own). The Advance branch
             // above just published `guard.last_known_revision` as the new
             // truth; the instant this lock releases, any OTHER caller
-            // (e.g. a concurrent `preauthorize` for an unrelated machine)
+            // (e.g. a concurrent `try_preauthorize_before` for an unrelated
+            // machine)
             // can already see and act on it. `announce_revoke` is the ONLY
             // thing that makes a revoked target's gate stop admitting new
             // forwarding, and it is lock-free/non-blocking (a single atomic
@@ -2136,11 +2179,10 @@ impl<H: RevocableMeshSession> MeshSessionRegistry<H> {
 /// `mark_unavailable`) must announce writer intent to EVERY target BEFORE
 /// draining ANY of them. `SessionSync::revoke()` called one target at a
 /// time in a plain loop does not do that: `writer_intent` lives on each
-/// individual `SessionSync`, so a later target's own gate keeps reading
-/// authorized — and can still admit a BRAND NEW `ForwardingGuard` or
-/// `PendingSessionAdmission::activate_if_authorized` — for the entire time
-/// an earlier target's drain is in flight, even though the very same
-/// decision already condemned it. `announce_revoke` is a lock-free atomic
+/// individual `SessionSync`, so a later target's phase stays `Active` — and
+/// can still admit a BRAND NEW `ForwardingGuard` — for the entire time an
+/// earlier target's drain is in flight, even though the very same decision
+/// already condemned it. `announce_revoke` is a lock-free atomic
 /// increment, so the first loop below cannot itself be delayed by a slow
 /// drain elsewhere in the batch; every target has stopped admitting new
 /// readers before the second loop starts draining any of them.
@@ -2171,9 +2213,16 @@ fn drain_batch<'a>(targets: impl Iterator<Item = &'a Arc<SessionSync>>) {
 
 /// Removes every entry whose phase is already `Closed` (round D-1 bounded
 /// admission, @kiana audit `caf6d1e4`, D4). Cheap, allocation-light, and
-/// callable from any path that already holds `inner`, so a cancel that had
-/// to defer its own cleanup converges without a queue, a worker thread, or
-/// an explicit reconcile call from the runtime.
+/// called from every path that both holds `inner` and can grow or inspect
+/// the maps — `reconcile_closed_pending`, `registered_count_inner`, the
+/// `Advance` branch, and (since @kiana's recheck of `d721f889`)
+/// `preauthorize_locked` — so a cancel that had to defer its own cleanup
+/// converges without a queue, a worker thread, or an explicit reconcile
+/// call from the runtime.
+///
+/// The reserve call site is what makes that claim true rather than
+/// aspirational: it is the one path an adversary can drive indefinitely
+/// while touching nothing else.
 ///
 /// Deliberately keyed on PHASE, not on `handle.strong_count()`. A cancelled
 /// Pending session can keep a perfectly live `Weak<H>` — the runtime may
@@ -4037,7 +4086,7 @@ mod tests {
     // ── D-1 successor (@kiana, 9664d363 audit) ──────────────────────────
 
     /// P0/P1 E1 — compile/API proof, SCOPED: proves the REGISTRY's
-    /// production `preauthorize` -> `activate_if_authorized` machinery has
+    /// production `try_preauthorize_before` -> `commit_after_ack` machinery has
     /// no structural bias toward initiator-shaped bindings — a
     /// responder-shaped `SealedBinding` (from `from_responding_peer`, not
     /// `from_expected_responder`) reaches Active through the exact same
@@ -5026,5 +5075,75 @@ mod tests {
         let active = <MeshSessionRegistry<RecordingSession> as D1AdmissionSeam>::commit(pending);
         assert!(active.try_authorize_forwarding().is_some());
         assert_eq!(registry.registered_count(&m_id), 1);
+    }
+
+    /// RED for @kiana's recheck of `d721f889`: a successful reserve — and
+    /// ONLY a successful reserve — must pay down deferred-cancel debt.
+    ///
+    /// The adversarial shape this closes: cancel while `inner` is busy (so
+    /// cleanup defers), then never call `reconcile_closed_pending`,
+    /// `registered_count`/`is_registered`, or `observe_new_checkpoint`
+    /// again — just keep reserving. Before the fix each Closed entry stayed
+    /// in the map forever and the set grew without bound.
+    ///
+    /// Deliberately does NOT let the handle die: keeping `victim_session`
+    /// strongly alive means the pre-existing dead-`Weak` prune cannot be
+    /// what removes the entry, so the assertion can only be satisfied by
+    /// phase-based pruning at the reserve site.
+    #[test]
+    fn a_successful_reserve_pays_down_deferred_cancel_debt() {
+        let m_id = test_m_id(95);
+        let snapshot = snapshot_at(1, [1u8; 32], &[(m_id.clone(), FP_A)], &[]);
+        let registry = MeshSessionRegistry::<RecordingSession>::new(&snapshot);
+        let binding = sealed_binding(&snapshot, &m_id);
+
+        // Keep the victim's handle ALIVE for the whole test.
+        let victim_session = Arc::new(RecordingSession::default());
+        let victim = registry
+            .preauthorize(&binding, Arc::downgrade(&victim_session))
+            .unwrap();
+
+        // Cancel under contention -> authority closed, cleanup deferred.
+        let outcome = registry.hold_inner_while(|| victim.cancel_before_ack());
+        assert_eq!(outcome, PendingCancelOutcome::ClosedCleanupDeferred);
+        assert_eq!(
+            live_entry_count(&registry),
+            1,
+            "the Closed entry is still tracked debt at this point"
+        );
+
+        // From here on: no reconcile, no registered_count/is_registered, no
+        // observe_new_checkpoint. A single successful reserve, nothing else.
+        let next_session = Arc::new(RecordingSession::default());
+        let admission = registry
+            .try_preauthorize_before(
+                &binding,
+                Arc::downgrade(&next_session),
+                Instant::now() + Duration::from_secs(60),
+            )
+            .expect("uncontended, unexpired");
+
+        assert_eq!(
+            live_entry_count(&registry),
+            1,
+            "the debt must be gone, leaving only the newly reserved entry"
+        );
+        assert!(
+            Arc::strong_count(&victim_session) > 0,
+            "the victim handle stayed alive — a dead-Weak prune cannot be what cleaned up"
+        );
+        drop(admission);
+        drop(victim_session);
+    }
+
+    /// Reads the tracked-entry count directly, without going through
+    /// `registered_count`/`is_registered` — those prune, which would mask
+    /// exactly the property under test.
+    fn live_entry_count<H: RevocableMeshSession>(registry: &MeshSessionRegistry<H>) -> usize {
+        let guard = registry.inner.lock().unwrap();
+        let Mode::Live { sessions, .. } = &guard.mode else {
+            panic!("registry must be live");
+        };
+        sessions.len()
     }
 }
