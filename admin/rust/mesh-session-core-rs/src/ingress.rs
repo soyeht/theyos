@@ -39,9 +39,20 @@ use std::time::{Duration, Instant};
 ///
 /// Concrete fields are the adapter's decision (Fila 3/4), not restated
 /// here; `observed_at` is a placeholder shape, not a normative field list.
+///
+/// **`ingress_expiry` (2026-08-04, @kiana, WIP audit point A, v6 §7,
+/// self-hash verified against `daisy-bsessao-v6.7343d075…`):** one of the
+/// components of `effective_expires_at = min(checkpoint.not_after,
+/// local_delegation.not_after, peer_delegation.not_after,
+/// lease_expires_at, ingress_expiry)` — the adapter's own bound on how
+/// long this specific ingress admission may be treated as valid, wall-clock
+/// (the same `u64` domain as `intent`/delegation `not_after`, never the
+/// monotonic anti-slow-loris `CeremonyDeadline`). Required, not optional:
+/// v6 §7 does not permit an unmeasured component to default to unbounded.
 #[derive(Debug)]
 pub struct IngressEvidence {
     pub observed_at: u64,
+    pub ingress_expiry: u64,
 }
 
 /// A hard ceiling on how large a [`CeremonyBudget`] may be, supplied by
@@ -116,11 +127,18 @@ pub struct CeremonyDeadline {
 impl CeremonyDeadline {
     /// Time left before this deadline, recomputed fresh against the same
     /// `started` `Instant` every call — never cached, never reset.
-    pub(crate) fn remaining(&self) -> Duration {
+    ///
+    /// `pub` (2026-08-04, @kiana, WIP audit, seam-visibility correction):
+    /// a real `D1Admission`/`IntentNonceLedger` adapter (a different
+    /// crate) receives `&CeremonyDeadline` and must be able to inspect it
+    /// to linearize its own commit against the same deadline this crate
+    /// enforces — an opaque token it could not read at all would defeat
+    /// the entire point of threading it through.
+    pub fn remaining(&self) -> Duration {
         self.budget.saturating_sub(self.started.elapsed())
     }
 
-    pub(crate) fn is_expired(&self) -> bool {
+    pub fn is_expired(&self) -> bool {
         self.remaining().is_zero()
     }
 
@@ -158,7 +176,7 @@ impl CeremonyDeadline {
 /// use mesh_session_core_rs::ingress::{PrevalidatedIngress, IngressEvidence, CeremonyBudget, CeremonyDeadlinePolicy};
 /// use std::time::Duration;
 /// let policy = CeremonyDeadlinePolicy::new(Duration::from_secs(60)).unwrap();
-/// let ingress = PrevalidatedIngress::admit_at_accept(42u32, IngressEvidence { observed_at: 100 }, CeremonyBudget::new(Duration::from_secs(30), &policy).unwrap());
+/// let ingress = PrevalidatedIngress::admit_at_accept(42u32, IngressEvidence { observed_at: 100, ingress_expiry: u64::MAX / 2 }, CeremonyBudget::new(Duration::from_secs(30), &policy).unwrap());
 /// let _duplicate = ingress.clone(); // no Clone impl — does not compile
 /// ```
 ///
@@ -169,7 +187,7 @@ impl CeremonyDeadline {
 /// use mesh_session_core_rs::ingress::{PrevalidatedIngress, IngressEvidence, CeremonyBudget, CeremonyDeadlinePolicy};
 /// use std::time::Duration;
 /// let policy = CeremonyDeadlinePolicy::new(Duration::from_secs(60)).unwrap();
-/// let ingress = PrevalidatedIngress::admit_at_accept(42u32, IngressEvidence { observed_at: 100 }, CeremonyBudget::new(Duration::from_secs(30), &policy).unwrap());
+/// let ingress = PrevalidatedIngress::admit_at_accept(42u32, IngressEvidence { observed_at: 100, ingress_expiry: u64::MAX / 2 }, CeremonyBudget::new(Duration::from_secs(30), &policy).unwrap());
 /// let _just_the_stream: u32 = ingress.stream; // field is private
 /// ```
 ///
@@ -181,7 +199,7 @@ impl CeremonyDeadline {
 /// use mesh_session_core_rs::ingress::{PrevalidatedIngress, IngressEvidence, CeremonyBudget, CeremonyDeadlinePolicy};
 /// use std::time::Duration;
 /// let policy = CeremonyDeadlinePolicy::new(Duration::from_secs(60)).unwrap();
-/// let ingress = PrevalidatedIngress::admit_at_accept(42u32, IngressEvidence { observed_at: 100 }, CeremonyBudget::new(Duration::from_secs(30), &policy).unwrap());
+/// let ingress = PrevalidatedIngress::admit_at_accept(42u32, IngressEvidence { observed_at: 100, ingress_expiry: u64::MAX / 2 }, CeremonyBudget::new(Duration::from_secs(30), &policy).unwrap());
 /// let _ = ingress.consume(); // pub(crate) — does not compile from outside the crate
 /// ```
 #[derive(Debug)]
@@ -250,7 +268,10 @@ mod tests {
     fn consume_yields_the_same_stream_and_evidence_it_was_built_from() {
         let ingress = PrevalidatedIngress::admit_at_accept(
             42u32,
-            IngressEvidence { observed_at: 100 },
+            IngressEvidence {
+                observed_at: 100,
+                ingress_expiry: u64::MAX / 2,
+            },
             CeremonyBudget::new(Duration::from_secs(30), &test_policy()).unwrap(),
         );
         let (stream, evidence, deadline) = ingress.consume();

@@ -77,6 +77,14 @@ pub enum DelegationError {
     ChannelInvalid,
     #[error("delegation.delegated_pub is not a valid SEC1-compressed P-256 point")]
     InvalidDelegatedPubPoint,
+    #[error(
+        "ceremony deadline exceeded before/while verifying the delegation signature — a real verifier must respect the same deadline, never block past it"
+    )]
+    DeadlineExceeded,
+    #[error(
+        "delegation signature verifier unavailable (backend/roster I/O failed) — failing closed"
+    )]
+    VerifierUnavailable,
 }
 
 /// Errors from the rekey state machine (item 4).
@@ -232,10 +240,6 @@ pub enum IntentError {
     D1BindingMismatch,
     #[error("signer's own public key does not match the key PendingIntent was built to bind")]
     SignerKeyMismatchPendingIntent,
-    #[error(
-        "failed to clear the ceremony's per-syscall I/O deadline before exposing the Active session — closing rather than risking a leaked timeout on future DATA/CLOSE/rekey I/O"
-    )]
-    PostActivationCleanupFailed,
     #[error(
         "PendingIntent's captured delegation binding (key bytes/serial/window) does not match the local delegation now in use"
     )]

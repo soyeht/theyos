@@ -43,6 +43,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::cbor;
 use crate::error::DelegationError;
+use crate::ingress::CeremonyDeadline;
 
 pub const DELEGATION_KIND: &str = "soyeht/mesh-session/delegation/v1";
 pub const DELEGATION_DOMAIN: &str = "soyeht/mesh-session/v1";
@@ -275,22 +276,25 @@ impl MeshSessionDelegation {
     ///
     /// ```compile_fail
     /// use mesh_session_core_rs::delegation::MeshSessionDelegation;
+    /// use mesh_session_core_rs::ingress::{CeremonyDeadline, CeremonyBudget, CeremonyDeadlinePolicy};
     /// use p256::ecdsa::{SigningKey, VerifyingKey};
     /// use rand_core::OsRng;
     ///
     /// fn some_delegation() -> MeshSessionDelegation { unimplemented!() }
+    /// fn some_deadline() -> CeremonyDeadline { unimplemented!() }
     /// let d = some_delegation();
     /// let generic_key = SigningKey::random(&mut OsRng);
     /// let generic_verifying_key = VerifyingKey::from(&generic_key);
     /// // A bare p256 VerifyingKey does not implement
     /// // DelegationSignatureVerifier, so this does not compile.
-    /// d.verify_signature(&generic_verifying_key).unwrap();
+    /// d.verify_signature(&generic_verifying_key, &some_deadline()).unwrap();
     /// ```
     pub fn verify_signature(
         &self,
         verifier: &impl DelegationSignatureVerifier,
+        deadline: &CeremonyDeadline,
     ) -> Result<(), DelegationError> {
-        verifier.verify_delegation(self)
+        verifier.verify_delegation(self, deadline)
     }
 
     /// The two triple-equality members that do not require a live roster.
@@ -315,8 +319,22 @@ impl MeshSessionDelegation {
 /// `sig` actually covers (the preimage) is explicitly deferred (GATE,
 /// @kiana). This trait exists only so a *future*, real implementation has
 /// a fail-closed-shaped seam to plug into; it decides nothing about bytes.
+///
+/// **`deadline` (2026-08-04, @kiana, WIP audit, E3 seam):** a real
+/// implementation may consult a roster/lock/backend during Proof-R/Proof-I
+/// and could otherwise block indefinitely, bypassing the anti-slow-loris
+/// discipline every other potentially-blocking seam in this crate
+/// (`IntentNonceLedger`, `D1Admission`) already respects. The SAME
+/// absolute `CeremonyDeadline` already threaded through the ceremony is
+/// passed here too — never a fresh, independently-resettable timeout a
+/// real implementation could use to extend its own budget past what the
+/// ceremony allows.
 pub trait DelegationSignatureVerifier {
-    fn verify_delegation(&self, delegation: &MeshSessionDelegation) -> Result<(), DelegationError>;
+    fn verify_delegation(
+        &self,
+        delegation: &MeshSessionDelegation,
+        deadline: &CeremonyDeadline,
+    ) -> Result<(), DelegationError>;
 }
 
 /// The only verifier this crate provides: always fails closed. Standing in
@@ -328,6 +346,7 @@ impl DelegationSignatureVerifier for NoVerifierConfigured {
     fn verify_delegation(
         &self,
         _delegation: &MeshSessionDelegation,
+        _deadline: &CeremonyDeadline,
     ) -> Result<(), DelegationError> {
         Err(DelegationError::BadSignature)
     }
@@ -425,7 +444,12 @@ pub(crate) mod test_support {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::{Duration, Instant};
     use test_support::sample_delegation as sample;
+
+    fn far_future_deadline() -> CeremonyDeadline {
+        CeremonyDeadline::for_test(Instant::now(), Duration::from_secs(3600))
+    }
 
     fn wire(not_before: u64, not_after: u64) -> DelegationWire {
         DelegationWire {
@@ -610,7 +634,7 @@ mod tests {
     fn no_verifier_configured_fails_closed_even_for_an_internally_consistent_delegation() {
         let d = sample(100, 200);
         assert_eq!(
-            d.verify_signature(&NoVerifierConfigured),
+            d.verify_signature(&NoVerifierConfigured, &far_future_deadline()),
             Err(DelegationError::BadSignature)
         );
     }

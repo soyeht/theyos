@@ -157,8 +157,13 @@ fn recv_intent_record<S: Read + wire::DeadlineBoundedIo>(
 /// arbitrary string and have it silently trusted — only these two values
 /// exist, matching the same "dev"/"release" literals `delegation.rs`'s
 /// own shape validation already fixes.
+///
+/// `pub` (2026-08-04, @kiana, WIP audit, seam-visibility correction):
+/// appears in [`crate::intent::D1AdmissionKey::channel`]'s return type, a
+/// `pub` accessor a real, different-crate `D1Admission` adapter must be
+/// able to name.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub(crate) enum ExpectedChannel {
+pub enum ExpectedChannel {
     Dev,
     Release,
 }
@@ -210,16 +215,18 @@ fn string_set_matches_exactly(actual: &[String], expected: &[&str]) -> bool {
 /// "dev" ceremony) would still authorize frames here. Checked right after
 /// signature verification, before partial binding, so these REDs don't
 /// need a matching `ctx` to reach them.
+#[allow(clippy::too_many_arguments)]
 fn pass_delegation_gate<Ver: DelegationSignatureVerifier>(
     delegation: &MeshSessionDelegation,
     policy: &DelegationPolicy,
     verifier: &Ver,
     ctx: &PartialBindingInputs,
     expected_channel: ExpectedChannel,
+    deadline: &CeremonyDeadline,
 ) -> Result<(), AuthFrameError> {
     policy.validate(delegation)?;
     delegation
-        .verify_signature(verifier)
+        .verify_signature(verifier, deadline)
         .map_err(|_| AuthFrameError::DelegationGate)?;
     if !string_set_matches_exactly(delegation.roles(), &EXPECTED_DELEGATION_ROLES) {
         return Err(AuthFrameError::DelegationRolesMismatch);
@@ -257,6 +264,55 @@ fn check_ceremony_deadline(deadline: &CeremonyDeadline) -> Result<(), AuthFrameE
         return Err(crate::error::IntentError::DeadlineExceeded.into());
     }
     Ok(())
+}
+
+/// `effective_expires_at = min(checkpoint.not_after, local_delegation.not_after,
+/// peer_delegation.not_after, lease_expires_at, ingress_expiry)` — B-SESSAO
+/// v6 §7 (2026-08-04, @kiana, WIP audit point A; self-hash verified
+/// against `daisy-bsessao-v6.7343d0752d21b1487e387e74fcd4aa4d28d44bea6b7d3264f7d8a08e0619ac67.md`,
+/// §7). D9 carrier-B adds `intent.not_after` as an additional cap on top
+/// of the v6 §5 components. Distinct from [`check_ceremony_deadline`]'s
+/// monotonic anti-slow-loris `CeremonyDeadline` — this uses the SAME
+/// wall-clock `u64` domain as every other TTL/`not_after` check in this
+/// crate (a `Clock` reading, never `Instant`), consistent with "wall
+/// clock/now u64 continua SEPARADO... nunca para anti-slow-loris."
+///
+/// **Split into compute + check (2026-08-04, @kiana, WIP audit, v6 §10):**
+/// v6 §10 requires `expires_at` stored on the Active wrapper itself —
+/// expiration is auth-off before EVERY DATA operation, not just a
+/// point-in-time check during the handshake. The computed value is
+/// returned so the caller can carry it into `ActiveMeshSession`, not just
+/// discarded once this one check passes.
+#[allow(clippy::too_many_arguments)]
+fn effective_expires_at(
+    checkpoint_not_after: u64,
+    local_delegation_not_after: u64,
+    peer_delegation_not_after: u64,
+    lease_expires_at: u64,
+    ingress_expiry: u64,
+    intent_not_after: u64,
+) -> u64 {
+    [
+        checkpoint_not_after,
+        local_delegation_not_after,
+        peer_delegation_not_after,
+        lease_expires_at,
+        ingress_expiry,
+        intent_not_after,
+    ]
+    .into_iter()
+    .min()
+    .expect("literal array is non-empty")
+}
+
+/// Half-open: `now < expires_at`; equality means already expired (v6 §7:
+/// "Em equality: auth-off antes de DATA").
+fn check_effective_expiry(now: u64, expires_at: u64) -> Result<(), AuthFrameError> {
+    if now < expires_at {
+        Ok(())
+    } else {
+        Err(crate::error::IntentError::TtlInvalid.into())
+    }
 }
 
 /// Binds the local K_mesh signer to the local delegation *before either
@@ -345,10 +401,22 @@ fn sig_array(sig: &[u8]) -> Result<[u8; 64], AuthFrameError> {
 /// receive and then drop, hold, or move independently of the session that
 /// depends on it. There is no accessor: nothing in this crate, and
 /// nothing an external caller could write, can extract `gate` while
-/// retaining a usable `ActiveMeshSession`. Dropping the session drops
-/// `G`, running whatever unregister/revoke semantics the real
-/// `D1::ActiveGate` type's own `Drop` impl gives it — the session's own
-/// lifetime *is* the gate's.
+/// retaining a usable `ActiveMeshSession`.
+///
+/// **This crate makes NO claim about what happens to `G` on drop
+/// (2026-08-04, @kiana, WIP audit, correction of an earlier, wrong claim
+/// here):** an earlier version of this note asserted that dropping the
+/// session "runs whatever unregister/revoke semantics `G`'s own `Drop`
+/// impl gives it" — verified against the real household-rs
+/// `SessionGate` type and found false: `SessionGate` is `#[derive(Clone)]`
+/// with no `Drop` impl at all; its actual revocation model is a shared
+/// `Arc`-backed atomic/sync state that every clone reads fresh on each
+/// `try_authorize_forwarding()` call, not a drop-triggered side effect.
+/// This crate embeds `G` honestly as an opaque, generic value — it is
+/// carried for exactly as long as the session lives and never
+/// independently extractable, but this crate neither knows nor asserts
+/// *what* embedding/dropping it does; that is entirely the real
+/// `D1::ActiveGate` implementation's own contract, undocumented here.
 ///
 /// Even a caller who already holds a value of this type (the type itself
 /// is `pub` so it can appear in a signature — only *constructing* one is
@@ -360,6 +428,31 @@ fn sig_array(sig: &[u8]) -> Result<[u8; 64], AuthFrameError> {
 /// fn takes_gate_only<T, G>(session: ActiveMeshSession<T, G>) -> G {
 ///     let ActiveMeshSession { gate, .. } = session; // field is private — does not compile
 ///     gate
+/// }
+/// ```
+///
+/// **2026-08-04, @kiana, WIP audit point E:** the rekey-advancing methods
+/// (`before_send_non_marker`, `after_send_non_marker`,
+/// `before_outgoing_rekey`, `commit_outgoing_rekey`,
+/// `observe_incoming_non_marker`, `commit_incoming_rekey`) are
+/// `pub(crate)`, not `pub` — no external crate can reach any of them, even
+/// though the type itself is nameable:
+///
+/// ```compile_fail
+/// use mesh_session_core_rs::auth_state_machine::ActiveMeshSession;
+/// fn advance_rekey<T, G>(mut session: ActiveMeshSession<T, G>) {
+///     let _ = session.observe_incoming_non_marker(); // pub(crate) — does not compile
+/// }
+/// ```
+///
+/// **2026-08-04, @kiana, WIP audit point A:** `expires_at` is likewise
+/// `pub(crate)`-accessor-only and field-private — no external crate can
+/// read or extract it, even via destructuring:
+///
+/// ```compile_fail
+/// use mesh_session_core_rs::auth_state_machine::ActiveMeshSession;
+/// fn read_expiry<T, G>(session: &ActiveMeshSession<T, G>) -> u64 {
+///     session.expires_at // field is private — does not compile
 /// }
 /// ```
 pub struct ActiveMeshSession<T, G> {
@@ -374,9 +467,26 @@ pub struct ActiveMeshSession<T, G> {
     ingress_evidence: IngressEvidence,
     h_final: Vec<u8>,
     #[allow(dead_code)]
-    // never read by this crate — its entire purpose is to exist and Drop
-    // at the right time; see the struct doc.
+    // never read by this crate — carried for exactly as long as the
+    // session lives, never independently extractable; see the struct doc
+    // for why this crate makes no claim about what embedding/dropping it
+    // does (that is the real D1::ActiveGate implementation's own
+    // contract).
     gate: G,
+    /// `effective_expires_at` (2026-08-04, @kiana, WIP audit point A, v6
+    /// §10) — computed once during the ceremony (see
+    /// [`effective_expires_at`]) and carried here because v6 §10 requires
+    /// expiry to be auth-off before EVERY DATA operation, not just a
+    /// point-in-time check during the handshake. `pub(crate)` accessor
+    /// only: DATA itself is still out of this module's scope (see the
+    /// module doc), so nothing here enforces `now < expires_at` on any
+    /// operation yet — a future guarded DATA path is structurally
+    /// obligated to check this alongside its gate before any syscall, but
+    /// that check does not exist in this crate today. May already be in
+    /// the past by the time this field is read — see `run_responder_handshake`'s/
+    /// `run_initiator_handshake`'s own doc on why the ceremony deliberately
+    /// does not re-fail if the terminal Ack write races past it.
+    expires_at: u64,
 }
 
 impl<T, G> ActiveMeshSession<T, G> {
@@ -395,19 +505,42 @@ impl<T, G> ActiveMeshSession<T, G> {
     pub fn ingress_evidence(&self) -> &IngressEvidence {
         &self.ingress_evidence
     }
+    /// `pub(crate)` (2026-08-04, @kiana, WIP audit point A, v6 §10) —
+    /// see the field's own doc. Not `pub`: no external, DATA-capable
+    /// caller exists yet to consult this against a trusted clock.
+    pub(crate) fn expires_at(&self) -> u64 {
+        self.expires_at
+    }
 
-    pub fn before_send_non_marker(
+    /// **`pub(crate)` (2026-08-04, @kiana, WIP audit point E, minimal fix):**
+    /// these 6 methods advance real protocol state (the rekey
+    /// counter/generation *and* the coupled `snow::TransportState`
+    /// rekey), with no gate consulted before doing so — `ActiveGate`
+    /// being embedded and un-droppable-separately (definitive A) stops a
+    /// caller from *extracting* the gate, but nothing here stops a caller
+    /// who already holds an `&mut ActiveMeshSession` from calling these
+    /// directly regardless of whatever forwarding authorization state a
+    /// real D1 registry might have moved to (e.g. a concurrent revoke).
+    /// DATA/CLOSE/REKEY wire is out of this module's stated scope (see
+    /// the module doc) — inventing a per-operation `ActiveAuthorization`
+    /// guard now would mean designing that surface without a frozen wire
+    /// format to design it against. The minimal, honest fix available
+    /// today is downgrading these to `pub(crate)`: nothing outside this
+    /// crate can reach them at all (verified below), so there is no
+    /// external bypass surface until a real guarded DATA path exists to
+    /// replace this with atomic guard-acquiring operations.
+    pub(crate) fn before_send_non_marker(
         &mut self,
     ) -> Result<rekey::SendNonMarkerPermit, crate::error::RekeyError> {
         self.rekey.tx().before_send_non_marker()
     }
-    pub fn after_send_non_marker(
+    pub(crate) fn after_send_non_marker(
         &mut self,
         permit: rekey::SendNonMarkerPermit,
     ) -> Result<(), crate::error::RekeyError> {
         self.rekey.tx().after_send_non_marker(permit)
     }
-    pub fn before_outgoing_rekey(
+    pub(crate) fn before_outgoing_rekey(
         &mut self,
     ) -> Result<rekey::SendMarkerPermit, crate::error::RekeyError> {
         self.rekey.tx().before_send_marker()
@@ -418,7 +551,7 @@ impl<T, G> ActiveMeshSession<T, G> {
     /// policy_count snapshot) *before* touching `transport` (2026-08-04,
     /// @kiana): the real Noise-level rekey must never fire on a stale or
     /// foreign permit, so the check that can reject it runs first.
-    pub fn commit_outgoing_rekey(
+    pub(crate) fn commit_outgoing_rekey(
         &mut self,
         permit: rekey::SendMarkerPermit,
     ) -> Result<(), crate::error::RekeyError> {
@@ -426,13 +559,13 @@ impl<T, G> ActiveMeshSession<T, G> {
         self.transport.rekey_outgoing();
         self.rekey.tx().after_send_marker(permit)
     }
-    pub fn observe_incoming_non_marker(&mut self) -> Result<(), crate::error::RekeyError> {
+    pub(crate) fn observe_incoming_non_marker(&mut self) -> Result<(), crate::error::RekeyError> {
         self.rekey.rx().on_receive(rekey::IncomingRecord::NonMarker)
     }
     /// Couples the rx counter transition to the real
     /// `TransportState::rekey_incoming()` — validated first, and the real
     /// rekey only happens if validation succeeds.
-    pub fn commit_incoming_rekey(
+    pub(crate) fn commit_incoming_rekey(
         &mut self,
         next_generation: u64,
     ) -> Result<(), crate::error::RekeyError> {
@@ -465,8 +598,11 @@ fn run_combined_intent_check(
     proof_i: &ProofI,
     initiator_verifier: &auth_frames::RawP256FrameVerifier,
     local: &LocalIdentity,
+    checkpoint: &LocalCheckpoint,
+    lease_expires_at: u64,
+    ingress_expiry: u64,
     now: u64,
-) -> Result<crate::intent::IntentNonceKey, AuthFrameError> {
+) -> Result<(crate::intent::IntentNonceKey, u64), AuthFrameError> {
     // Item 3: intent signature verified against the SAME resolved key as
     // Proof-I's own delegation — never a key the intent names itself
     // (self-consistency does not authorize).
@@ -496,13 +632,42 @@ fn run_combined_intent_check(
         return Err(crate::error::IntentError::IdentityMismatch.into());
     }
 
-    // Item 8: half-open TTL against the delegation's own window, not just
-    // the intent's own claim.
-    if !(now < intent_record.not_after()
-        && intent_record.not_after() <= proof_i.delegation().not_after())
-    {
+    // Item 8, D9 addendum §4.8 (2026-08-04, @kiana, WIP audit BLOCKER —
+    // restored: the `effective_expires_at = min(...)` check below does
+    // NOT imply this. Example that makes the gap concrete: intent.not_after
+    // = 10_000, peer delegation.not_after = 1_000, now = 500 — `now <
+    // min(...)` passes (500 < 1_000), but the intent still claims an
+    // authority window (10_000) wider than what the delegation actually
+    // grants (1_000). That is an authority-scoping violation independent
+    // of whether `now` currently happens to fall inside every window —
+    // the min-based half-open check only asks "is `now` still within
+    // every relevant window", never "does the intent's OWN claim
+    // overstate what was actually delegated". Both must hold.
+    if intent_record.not_after() > proof_i.delegation().not_after() {
         return Err(crate::error::IntentError::TtlInvalid.into());
     }
+
+    // Item 8, B-SESSAO v6 §7 (2026-08-04, @kiana, WIP audit point A,
+    // definitive; self-hash verified against
+    // `daisy-bsessao-v6.7343d0752d21b1487e387e74fcd4aa4d28d44bea6b7d3264f7d8a08e0619ac67.md`,
+    // §7): `effective_expires_at = min(checkpoint.not_after,
+    // local_delegation.not_after, peer_delegation.not_after,
+    // lease_expires_at, ingress_expiry)`, D9 carrier adding
+    // `intent.not_after` as one more cap — a SEPARATE, complementary check
+    // from the authority-scoping inequality above, not a replacement for
+    // it. Half-open: `now < effective_expires_at`; equality is already
+    // expired. Computed once here and returned (v6 §10) so the caller can
+    // both re-check it later (immediately before the reversible
+    // reserve/Ack point) and carry it into the Active session itself.
+    let expires_at = effective_expires_at(
+        checkpoint.not_after,
+        local.delegation.not_after(),
+        proof_i.delegation().not_after(),
+        lease_expires_at,
+        ingress_expiry,
+        intent_record.not_after(),
+    );
+    check_effective_expiry(now, expires_at)?;
 
     // 2026-08-04, @kiana, erratum1 E2: the nonce key deliberately excludes
     // both channel and intent_digest — see IntentNonceKey's own doc.
@@ -510,12 +675,15 @@ fn run_combined_intent_check(
         .nonce()
         .try_into()
         .map_err(|_| crate::error::IntentError::ShapeMismatch)?;
-    Ok(crate::intent::IntentNonceKey {
-        hh_id: intent_record.hh_id().to_string(),
-        initiator_m_id: intent_record.initiator_m_id().to_string(),
-        delegated_key_id: intent_record.delegated_key_id().to_string(),
-        nonce,
-    })
+    Ok((
+        crate::intent::IntentNonceKey::new(
+            intent_record.hh_id().to_string(),
+            intent_record.initiator_m_id().to_string(),
+            intent_record.delegated_key_id().to_string(),
+            nonce,
+        ),
+        expires_at,
+    ))
 }
 
 /// Drive the responder side: Idle → Handshaking → SendingProofR →
@@ -536,6 +704,11 @@ pub(crate) fn run_responder_handshake<S, Sig, Ver, Ledger, D1, C>(
     nonce_ledger: &Ledger,
     d1_admission: &D1,
     clock: &C,
+    // 2026-08-04, @kiana, WIP audit point A, v6 §7: one of the
+    // `effective_expires_at` components this crate does not itself
+    // measure — the caller's own live lease bound, wall-clock `u64`,
+    // required rather than defaulted to unbounded.
+    lease_expires_at: u64,
     rekey_threshold: RekeyThreshold,
 ) -> Result<ActiveMeshSession<S, D1::ActiveGate>, AuthFrameError>
 where
@@ -580,7 +753,7 @@ where
         local.delegation.clone(),
         vec![0u8; 64],
     )?;
-    let proof_r = auth_frames::sign_frame(proof_r, k_mesh)?;
+    let proof_r = auth_frames::sign_frame(proof_r, k_mesh, &deadline)?;
     send_frame(
         &mut stream,
         &mut transport,
@@ -636,6 +809,7 @@ where
             proof_self_cert_fingerprint: proof_i.self_cert_fingerprint().to_vec(),
         },
         expected_channel,
+        &deadline,
     )?;
     let initiator_verifier =
         auth_frames::verifier_from_delegated_pub(proof_i.delegation().delegated_pub())?;
@@ -648,12 +822,15 @@ where
     // --- Combined intent check (D9 carrier-B addendum §4), then the
     // single nonce-consumption call site (addendum §5) ---
     let now = clock.now().map_err(AuthFrameError::from)?;
-    let nonce_key = run_combined_intent_check(
+    let (nonce_key, expires_at) = run_combined_intent_check(
         &intent_record,
         &received_intent_digest,
         &proof_i,
         &initiator_verifier,
         local,
+        checkpoint,
+        lease_expires_at,
+        ingress_evidence.ingress_expiry,
         now,
     )?;
     // 2026-08-04, @kiana, C.3: checked immediately before consume — an
@@ -669,6 +846,7 @@ where
         &nonce_key,
         intent_record.not_after(),
         &received_intent_digest,
+        expected_channel,
         &deadline,
     )? {
         crate::intent::NonceConsumeOutcome::Committed => {}
@@ -692,7 +870,7 @@ where
         local.m_id.clone(),
         vec![0u8; 64],
     )?;
-    let final_confirm = auth_frames::sign_frame(final_confirm, k_mesh)?;
+    let final_confirm = auth_frames::sign_frame(final_confirm, k_mesh, &deadline)?;
     send_frame(
         &mut stream,
         &mut transport,
@@ -729,7 +907,22 @@ where
         activate_digest.to_vec(),
         vec![0u8; 64],
     )?;
-    let activate_ack = auth_frames::sign_frame(activate_ack, k_mesh)?;
+    let activate_ack = auth_frames::sign_frame(activate_ack, k_mesh, &deadline)?;
+
+    // 2026-08-04, @kiana, WIP audit point A, terminal-expiry refinement:
+    // revalidate `now < expires_at` once more, right before the reversible
+    // reserve/Ack point — the ceremony may have consumed real time since
+    // the first check (right after Proof-I/nonce). Deliberately NOT
+    // repeated again after this: once the Ack write completes, that is
+    // the same irreversible-transmission boundary as everywhere else in
+    // this crate (see `write_all_with_deadline`'s doc) — if expiry crosses
+    // during the final write syscall itself, the physical Ack wins the
+    // race, the session is born already past `expires_at`, and the first
+    // future authorization/DATA check (once one exists) denies it; this
+    // preserves linearization without inventing a new fallible check
+    // between Ack-complete and activation.
+    let now = clock.now().map_err(AuthFrameError::from)?;
+    check_effective_expiry(now, expires_at)?;
 
     // 2026-08-04, @kiana, erratum1 E4 + C.4 (definitive): reserve the D1
     // Pending permit BEFORE the Ack write, against the FULL authenticated
@@ -741,22 +934,22 @@ where
     // `activate_if_authorized`, not merely re-read by `peer_m_id`.
     // Role-neutral (2026-08-04, @kiana): on the responder side, `peer_*`
     // is the initiator (the other party) and `local_*` is this machine.
-    let d1_key = crate::intent::D1AdmissionKey {
-        session_id: h_final.clone(),
-        hh_id: initiator_hh_id.clone(),
-        peer_m_id: initiator_m_id.clone(),
-        peer_cert_fingerprint: initiator_cert_fingerprint.clone(),
-        local_m_id: local.m_id.clone(),
-        local_cert_fingerprint: local.cert_fingerprint.clone(),
-        delegated_key_id: nonce_key.delegated_key_id.clone(),
-        delegated_pub: proof_i.delegation().delegated_pub().to_vec(),
-        checkpoint_hash: checkpoint.hash.clone(),
-        checkpoint_sequence: checkpoint.sequence,
-        checkpoint_event_head: checkpoint.event_head.clone(),
-        checkpoint_not_after: checkpoint.not_after,
-        not_after: intent_record.not_after(),
-        channel: expected_channel,
-    };
+    let d1_key = crate::intent::D1AdmissionKey::new(
+        h_final.clone(),
+        initiator_hh_id.clone(),
+        local.m_id.clone(),
+        local.cert_fingerprint.clone(),
+        initiator_m_id.clone(),
+        initiator_cert_fingerprint.clone(),
+        nonce_key.delegated_key_id().to_string(),
+        proof_i.delegation().delegated_pub().to_vec(),
+        checkpoint.hash.clone(),
+        checkpoint.sequence,
+        checkpoint.event_head.clone(),
+        checkpoint.not_after,
+        expires_at,
+        expected_channel,
+    );
     let pending = d1_admission.reserve_pending(&d1_key, &deadline)?;
 
     // 3. write_all (write_transport_record uses write_all internally).
@@ -795,23 +988,21 @@ where
     // below does an ActiveMeshSession ever get constructed, and `gate` is
     // embedded directly into it (2026-08-04, @kiana, definitive A —
     // never returned separately, never droppable while the session lives).
+    // 2026-08-04, @kiana, WIP audit point F/G, terminal (definitive —
+    // supersedes an earlier version that rechecked `deadline.is_expired()`
+    // here and dropped `gate` on expiry): `Ok(gate)` above already IS the
+    // adapter's terminal Active transition — the real `SessionGate` does
+    // no cleanup on `Drop` at all (verified: `#[derive(Clone)]`, no `Drop`
+    // impl, shared `Arc`-backed atomic state instead), so dropping `gate`
+    // here would not un-activate anything in the registry; it would only
+    // discard this crate's own handle while the registry keeps believing
+    // the session is Active — strictly worse than doing nothing. Deadline
+    // linearization against this exact moment is the real
+    // `activate_if_authorized` implementation's own responsibility (it
+    // already receives `&CeremonyDeadline` for precisely this) — this
+    // crate does not and must not re-check or second-guess that decision
+    // after the fact.
     let gate = d1_admission.activate_if_authorized(pending, &deadline)?;
-
-    // 2026-08-04, @kiana, lifecycle CFX: exactly one operation between Ack
-    // write success and here (the call above) — now, and only now, clear
-    // the per-ceremony socket deadline this stream may have accumulated,
-    // BEFORE the session is ever exposed. A real `TcpStream`'s
-    // `SO_RCVTIMEO`/`SO_SNDTIMEO` persist across `arm_io_deadline` calls;
-    // without this, Active's own future DATA/CLOSE/rekey I/O would
-    // silently inherit whatever (possibly near-zero) timeout the last
-    // ceremony syscall happened to arm. If clearing fails, `gate` is
-    // dropped right here — never embedded into a session — so its own
-    // `Drop` unregisters/revokes exactly as if this attempt had failed at
-    // any earlier step; no `ActiveMeshSession` is ever returned.
-    if stream.clear_io_deadline().is_err() {
-        drop(gate);
-        return Err(crate::error::IntentError::PostActivationCleanupFailed.into());
-    }
 
     Ok(ActiveMeshSession {
         stream,
@@ -823,6 +1014,7 @@ where
         ingress_evidence,
         h_final,
         gate,
+        expires_at,
     })
 }
 
@@ -841,14 +1033,13 @@ pub(crate) fn run_initiator_handshake<S, Sig, Ver, D1, C>(
     delegation_verifier: &Ver,
     k_mesh: &Sig,
     d1_admission: &D1,
-    // 2026-08-04: kept for signature symmetry with `run_responder_handshake`
-    // (which needs `Clock` for the combined intent check's TTL read) —
-    // the initiator side's own TTL/freshness checks all run through
-    // `PendingIntent::verify_binds_to` against `local.delegation`
-    // directly, so this crate never reads a live clock here. Flagged to
-    // kiana as a candidate for removal rather than dropped unilaterally,
-    // since it changes this function's public shape.
-    #[allow(unused_variables)] clock: &C,
+    // 2026-08-04, @kiana, WIP audit point A: now used — the initiator's
+    // own `effective_expires_at` check (v6 §7) needs a live `now` reading
+    // once `proof_r`'s delegation is verified, the same requirement the
+    // responder side already had via the combined intent check.
+    clock: &C,
+    // See the identical parameter on `run_responder_handshake`.
+    lease_expires_at: u64,
     rekey_threshold: RekeyThreshold,
 ) -> Result<ActiveMeshSession<S, D1::ActiveGate>, AuthFrameError>
 where
@@ -922,10 +1113,30 @@ where
             proof_self_cert_fingerprint: proof_r.self_cert_fingerprint().to_vec(),
         },
         expected_channel,
+        &deadline,
     )?;
     let responder_verifier =
         auth_frames::verifier_from_delegated_pub(proof_r.delegation().delegated_pub())?;
     auth_frames::verify_frame(&proof_r, &sig_array(proof_r.sig())?, &responder_verifier)?;
+
+    // 2026-08-04, @kiana, WIP audit point A, v6 §7/§10 (definitive;
+    // self-hash verified against
+    // `daisy-bsessao-v6.7343d0752d21b1487e387e74fcd4aa4d28d44bea6b7d3264f7d8a08e0619ac67.md`,
+    // §7): the initiator's own `effective_expires_at` check, now that
+    // `proof_r`'s delegation (the peer's) is fully verified — the
+    // symmetric counterpart of the responder side's combined intent
+    // check's item 8. Computed once and captured (`expires_at`) so it can
+    // be re-checked later and carried into the Active session (v6 §10).
+    let now = clock.now().map_err(AuthFrameError::from)?;
+    let expires_at = effective_expires_at(
+        checkpoint.not_after,
+        local.delegation.not_after(),
+        proof_r.delegation().not_after(),
+        lease_expires_at,
+        ingress_evidence.ingress_expiry,
+        pending_intent.intent().not_after(),
+    );
+    check_effective_expiry(now, expires_at)?;
 
     // --- Intent record, 0x06, I -> R (D9 carrier-B addendum §3) ---
     // Sent only now that Proof-R has been verified in full — "Proof-R
@@ -960,7 +1171,7 @@ where
         connection_intent_digest,
         vec![0u8; 64],
     )?;
-    let proof_i = auth_frames::sign_frame(proof_i, k_mesh)?;
+    let proof_i = auth_frames::sign_frame(proof_i, k_mesh, &deadline)?;
     send_frame(
         &mut stream,
         &mut transport,
@@ -996,7 +1207,17 @@ where
         final_confirm_digest.to_vec(),
         vec![0u8; 64],
     )?;
-    let activate = auth_frames::sign_frame(activate, k_mesh)?;
+    let activate = auth_frames::sign_frame(activate, k_mesh, &deadline)?;
+
+    // 2026-08-04, @kiana, WIP audit point A, terminal-expiry refinement —
+    // see the identical note in run_responder_handshake: revalidate once
+    // more right before the reversible reserve/Activate-send point:
+    // nothing fallible is added after Activate is sent/ActivateAck is
+    // verified — that boundary already has its own atomic
+    // cancel-or-activate discipline (erratum1 E4), unrelated to this
+    // wall-clock check.
+    let now = clock.now().map_err(AuthFrameError::from)?;
+    check_effective_expiry(now, expires_at)?;
 
     // 2026-08-04, @kiana, erratum1 E4 closing paragraph + C.4 (definitive):
     // the initiator applies the SAME local discipline while awaiting
@@ -1006,22 +1227,22 @@ where
     // between.
     // Role-neutral (2026-08-04, @kiana): on the initiator side, `local_*`
     // is this machine (the initiator) and `peer_*` is the responder.
-    let d1_key = crate::intent::D1AdmissionKey {
-        session_id: h_final.clone(),
-        hh_id: local.hh_id.clone(),
-        local_m_id: local.m_id.clone(),
-        local_cert_fingerprint: local.cert_fingerprint.clone(),
-        peer_m_id: expected.m_id.clone(),
-        peer_cert_fingerprint: expected.cert_fingerprint.to_vec(),
-        delegated_key_id: pending_intent.intent().delegated_key_id().to_string(),
-        delegated_pub: local.delegation.delegated_pub().to_vec(),
-        checkpoint_hash: checkpoint.hash.clone(),
-        checkpoint_sequence: checkpoint.sequence,
-        checkpoint_event_head: checkpoint.event_head.clone(),
-        checkpoint_not_after: checkpoint.not_after,
-        not_after: pending_intent.intent().not_after(),
-        channel: expected_channel,
-    };
+    let d1_key = crate::intent::D1AdmissionKey::new(
+        h_final.clone(),
+        local.hh_id.clone(),
+        local.m_id.clone(),
+        local.cert_fingerprint.clone(),
+        expected.m_id.clone(),
+        expected.cert_fingerprint.to_vec(),
+        pending_intent.intent().delegated_key_id().to_string(),
+        local.delegation.delegated_pub().to_vec(),
+        checkpoint.hash.clone(),
+        checkpoint.sequence,
+        checkpoint.event_head.clone(),
+        checkpoint.not_after,
+        expires_at,
+        expected_channel,
+    );
     let pending = d1_admission.reserve_pending(&d1_key, &deadline)?;
 
     // --- Frame 5: ActivateAck, R -> I ---
@@ -1053,7 +1274,21 @@ where
             &sig_array(activate_ack.sig())?,
             &responder_verifier,
         )?;
-        check_ceremony_deadline(&deadline)?;
+        // 2026-08-04, @kiana, WIP audit point (3), terminal-expiry
+        // symmetry (definitive — this check REMOVED, not added):
+        // reaching this point means a genuinely valid ActivateAck was
+        // received — by construction, the responder already wrote that
+        // Ack and (per this crate's own atomic-linearization discipline)
+        // immediately called its own `activate_if_authorized` right
+        // after, with nothing fallible in between. The responder may
+        // therefore already be Active by the time this initiator-side
+        // code runs. Rejecting here for `deadline` would cancel this
+        // side's own Pending and never reach Active locally, while the
+        // peer already did — the exact same split-brain
+        // `write_all_with_deadline`'s own doc describes for the writer
+        // side, just from the reader's side of the identical exchange.
+        // `deadline` still bounds reserve/I/O/cancel; it does not undo an
+        // already-fully-verified terminal Ack.
         Ok(activate_ack)
     })();
 
@@ -1078,17 +1313,10 @@ where
 
     // Ack valid, verified in full: commit the local Pending immediately,
     // nothing fallible/external between the check above and this call.
+    // 2026-08-04, @kiana, WIP audit point F/G, terminal — see the
+    // identical note in run_responder_handshake: `Ok(gate)` here IS the
+    // terminal Active transition; no post-hoc recheck-and-drop.
     let gate = d1_admission.activate_if_authorized(pending, &deadline)?;
-
-    // 2026-08-04, @kiana, lifecycle CFX — see the identical note in
-    // run_responder_handshake: clear the per-ceremony socket deadline
-    // before ever exposing the session; if that fails, drop `gate`
-    // (triggering its own revoke) and return an error instead of a
-    // session with a leaked timeout.
-    if stream.clear_io_deadline().is_err() {
-        drop(gate);
-        return Err(crate::error::IntentError::PostActivationCleanupFailed.into());
-    }
 
     // 2026-08-04, @kiana, round 4: `rekey` was minted at the top of this
     // function, before Activate was ever sent — nothing fallible remains
@@ -1103,6 +1331,7 @@ where
         ingress_evidence,
         h_final,
         gate,
+        expires_at,
     })
 }
 
@@ -1124,6 +1353,7 @@ mod tests {
         fn sign_mesh_session_frame(
             &self,
             preimage: &crate::auth_frames::MeshSessionFramePreimage,
+            _deadline: &CeremonyDeadline,
         ) -> Result<[u8; 64], AuthFrameError> {
             let sig: Signature = self.0.sign(preimage.as_bytes());
             let sig = sig.normalize_s().unwrap_or(sig);
@@ -1151,6 +1381,7 @@ mod tests {
         fn verify_delegation(
             &self,
             _delegation: &MeshSessionDelegation,
+            _deadline: &CeremonyDeadline,
         ) -> Result<(), crate::error::DelegationError> {
             Ok(())
         }
@@ -1207,6 +1438,7 @@ mod tests {
             key: &crate::intent::IntentNonceKey,
             _not_after: u64,
             _digest: &[u8; 32],
+            _channel: ExpectedChannel,
             _deadline: &CeremonyDeadline,
         ) -> Result<crate::intent::NonceConsumeOutcome, crate::error::IntentError> {
             let mut set = self.consumed.lock().unwrap();
@@ -1214,6 +1446,26 @@ mod tests {
                 return Ok(crate::intent::NonceConsumeOutcome::AlreadyConsumed);
             }
             Ok(crate::intent::NonceConsumeOutcome::Committed)
+        }
+    }
+
+    /// Panics if `consume` is ever called — proves a rejection happened
+    /// strictly BEFORE the single nonce-consumption call site (D9
+    /// addendum §5), the same "zero X before Y" discipline `PanicsOnIo`
+    /// already applies to I/O elsewhere in this test suite.
+    struct PanicsIfConsumed;
+    impl crate::intent::IntentNonceLedger for PanicsIfConsumed {
+        fn consume(
+            &self,
+            _key: &crate::intent::IntentNonceKey,
+            _not_after: u64,
+            _digest: &[u8; 32],
+            _channel: ExpectedChannel,
+            _deadline: &CeremonyDeadline,
+        ) -> Result<crate::intent::NonceConsumeOutcome, crate::error::IntentError> {
+            panic!(
+                "nonce was consumed before the D9 addendum SS4.8 authority-scoping check rejected"
+            );
         }
     }
 
@@ -1434,7 +1686,10 @@ mod tests {
                 let (sock, _) = listener.accept().unwrap();
                 let ingress = PrevalidatedIngress::admit_at_accept(
                     sock,
-                    IngressEvidence { observed_at: 1 },
+                    IngressEvidence {
+                        observed_at: 1,
+                        ingress_expiry: u64::MAX / 2,
+                    },
                     far_future_budget(),
                 );
                 run_responder_handshake(
@@ -1448,6 +1703,7 @@ mod tests {
                     &InMemoryLedger::new(),
                     &AlwaysAdmitD1,
                     &FixedClock(0),
+                    u64::MAX / 2,
                     RekeyThreshold::new(3).unwrap(),
                 )
                 .unwrap()
@@ -1467,7 +1723,10 @@ mod tests {
         let sock = TcpStream::connect(addr).unwrap();
         let ingress = PrevalidatedIngress::admit_at_accept(
             sock,
-            IngressEvidence { observed_at: 2 },
+            IngressEvidence {
+                observed_at: 2,
+                ingress_expiry: u64::MAX / 2,
+            },
             far_future_budget(),
         );
         let k_mesh = TestKMesh(initiator_key);
@@ -1492,6 +1751,7 @@ mod tests {
             &k_mesh,
             &AlwaysAdmitD1,
             &FixedClock(0),
+            u64::MAX / 2,
             RekeyThreshold::new(3).unwrap(),
         )
         .unwrap();
@@ -1508,6 +1768,194 @@ mod tests {
         assert_eq!(responder.peer_m_id(), "initiator-1");
         assert_eq!(initiator.ingress_evidence().observed_at, 2);
         assert_eq!(responder.ingress_evidence().observed_at, 1);
+        // WIP audit point A, v6 §10: both sides carry the SAME computed
+        // expires_at. `full_handshake`'s fixtures use `u64::MAX / 2` for
+        // local/peer delegation, lease, ingress_expiry, and the intent's
+        // own not_after — but `fixed_checkpoint().not_after` is
+        // `1_000_000`, strictly the smallest of the 6, so the true
+        // minimum (and therefore the stored value) must be exactly
+        // `1_000_000`, not `u64::MAX / 2` — proving `effective_expires_at`
+        // actually picked the checkpoint component, not just echoed
+        // whichever component happens to be listed first/last.
+        assert_eq!(initiator.expires_at(), 1_000_000);
+        assert_eq!(responder.expires_at(), 1_000_000);
+    }
+
+    /// WIP audit point A unit tests: `effective_expires_at` genuinely
+    /// picks the minimum across all 6 components (not just the first/last
+    /// one), and `check_effective_expiry`'s half-open boundary is exact —
+    /// `expires_at - 1` accepted, `== expires_at` rejected.
+    #[test]
+    fn effective_expires_at_picks_the_true_minimum_from_any_position() {
+        // Each of the 6 positions gets a turn being the unique minimum.
+        let base = 1_000_000u64;
+        let components = |min_at: usize| -> [u64; 6] {
+            let mut c = [base; 6];
+            c[min_at] = 500;
+            c
+        };
+        for pos in 0..6 {
+            let c = components(pos);
+            let got = effective_expires_at(c[0], c[1], c[2], c[3], c[4], c[5]);
+            assert_eq!(got, 500, "position {pos} should have been the minimum");
+        }
+    }
+
+    #[test]
+    fn red_check_effective_expiry_boundary_expires_at_minus_one_accepted_equality_rejected() {
+        let expires_at = 1_000u64;
+        assert!(check_effective_expiry(expires_at - 1, expires_at).is_ok());
+        assert!(matches!(
+            check_effective_expiry(expires_at, expires_at),
+            Err(AuthFrameError::Intent(
+                crate::error::IntentError::TtlInvalid
+            ))
+        ));
+    }
+
+    /// D9 addendum SS4.8 RED (2026-08-04, @kiana, blocker): a real,
+    /// validly-signed intent whose OWN `not_after` (2_000) exceeds the
+    /// initiator delegation's `not_after` (1_000) — an authority-scoping
+    /// violation the `effective_expires_at = min(...)` composite alone
+    /// does NOT catch, since `now` (0, via `FixedClock(0)`) is still
+    /// below both values. `PanicsIfConsumed` proves the rejection happens
+    /// strictly before the single nonce-consume call site. Hand-crafted
+    /// (bypassing `run_initiator_handshake`, whose own
+    /// `PendingIntent::verify_binds_to` preflight would otherwise reject
+    /// this before any byte is sent) to exercise the RESPONDER's
+    /// independent, defense-in-depth check on what a peer actually sent
+    /// — same pattern as `red_proof_i_checkpoint_mutant_rejected_by_responder`.
+    #[test]
+    fn red_intent_not_after_exceeding_delegation_not_after_rejected_before_nonce_consume() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let responder_key = SigningKey::random(&mut OsRng);
+        let responder_verifying = VerifyingKey::from(&responder_key);
+        let responder_delegation = delegation_for_key(
+            &responder_verifying,
+            "hh-1",
+            "responder-1",
+            vec![0xCC; 32],
+            0,
+            u64::MAX / 2,
+        );
+        let responder_identity =
+            identity("hh-1", "responder-1", vec![0xCC; 32], responder_delegation);
+
+        let responder = thread::spawn({
+            let checkpoint = fixed_checkpoint();
+            let k_mesh = TestKMesh(responder_key);
+            move || {
+                let (sock, _) = listener.accept().unwrap();
+                let ingress = PrevalidatedIngress::admit_at_accept(
+                    sock,
+                    IngressEvidence {
+                        observed_at: 1,
+                        ingress_expiry: u64::MAX / 2,
+                    },
+                    far_future_budget(),
+                );
+                run_responder_handshake(
+                    ingress,
+                    &responder_identity,
+                    &checkpoint,
+                    ExpectedChannel::Dev,
+                    &DelegationPolicy::test(u64::MAX / 2),
+                    &AlwaysAcceptDelegation,
+                    &k_mesh,
+                    &PanicsIfConsumed,
+                    &AlwaysAdmitD1,
+                    &FixedClock(0),
+                    u64::MAX / 2,
+                    RekeyThreshold::new(3).unwrap(),
+                )
+            }
+        });
+
+        let mut sock = TcpStream::connect(addr).unwrap();
+        let handshake =
+            noise::run_xx_handshake(&mut sock, Role::Initiator, &far_future_deadline()).unwrap();
+        let mut transport = handshake.transport;
+        let h_final = handshake.handshake_hash;
+        match recv_frame(&mut sock, &mut transport, &far_future_deadline()).unwrap() {
+            AuthFrame::ProofR(_) => {}
+            _ => panic!("expected ProofR"),
+        }
+
+        // Initiator delegation authorizes only up to not_after = 1_000 —
+        // strictly less than the intent's own claimed not_after below.
+        // `now` (FixedClock(0)) stays below both, so the min-based
+        // composite alone would incorrectly accept this.
+        const DELEGATION_NOT_AFTER: u64 = 1_000;
+        const INTENT_NOT_AFTER: u64 = 2_000;
+        let initiator_key = SigningKey::random(&mut OsRng);
+        let initiator_delegation = delegation_for_key(
+            &VerifyingKey::from(&initiator_key),
+            "hh-1",
+            "initiator-1",
+            vec![0xEE; 32],
+            0,
+            DELEGATION_NOT_AFTER,
+        );
+        let k_mesh = TestKMesh(initiator_key);
+        let pending_intent = pending_intent_for(
+            &k_mesh,
+            &identity(
+                "hh-1",
+                "initiator-1",
+                vec![0xEE; 32],
+                initiator_delegation.clone(),
+            ),
+            &fixed_checkpoint(),
+            "responder-1",
+            vec![0xCC; 32],
+            [0x85; 32],
+            INTENT_NOT_AFTER,
+            ExpectedChannel::Dev,
+        );
+        send_intent_record(
+            &mut sock,
+            &mut transport,
+            pending_intent.intent(),
+            &far_future_deadline(),
+        )
+        .unwrap();
+        let connection_intent_digest = ConnectionIntentDigest::from_bytes(
+            crate::intent::intent_digest(pending_intent.intent()).unwrap(),
+        );
+        let checkpoint = fixed_checkpoint();
+        let proof_i = ProofI::new(
+            h_final.clone(),
+            "hh-1".to_string(),
+            "initiator-1".to_string(),
+            "responder-1".to_string(),
+            vec![0xEE; 32],
+            vec![0xCC; 32],
+            checkpoint.hash.clone(),
+            checkpoint.sequence,
+            checkpoint.event_head.clone(),
+            checkpoint.not_after,
+            initiator_delegation,
+            connection_intent_digest,
+            vec![0u8; 64],
+        )
+        .unwrap();
+        let proof_i = auth_frames::sign_frame(proof_i, &k_mesh, &far_future_deadline()).unwrap();
+        send_frame(
+            &mut sock,
+            &mut transport,
+            &AuthFrame::ProofI(proof_i),
+            &far_future_deadline(),
+        )
+        .unwrap();
+
+        let responder_result = responder.join().unwrap();
+        assert!(matches!(
+            responder_result,
+            Err(AuthFrameError::Intent(
+                crate::error::IntentError::TtlInvalid
+            ))
+        ));
     }
 
     /// Like `full_handshake`, but lets the caller substitute the
@@ -1545,7 +1993,10 @@ mod tests {
                 let (sock, _) = listener.accept().unwrap();
                 let ingress = PrevalidatedIngress::admit_at_accept(
                     sock,
-                    IngressEvidence { observed_at: 1 },
+                    IngressEvidence {
+                        observed_at: 1,
+                        ingress_expiry: u64::MAX / 2,
+                    },
                     far_future_budget(),
                 );
                 run_responder_handshake(
@@ -1559,6 +2010,7 @@ mod tests {
                     &InMemoryLedger::new(),
                     &AlwaysAdmitD1,
                     &FixedClock(0),
+                    u64::MAX / 2,
                     RekeyThreshold::new(3).unwrap(),
                 )
             }
@@ -1577,7 +2029,10 @@ mod tests {
         let sock = TcpStream::connect(addr).unwrap();
         let ingress = PrevalidatedIngress::admit_at_accept(
             sock,
-            IngressEvidence { observed_at: 2 },
+            IngressEvidence {
+                observed_at: 2,
+                ingress_expiry: u64::MAX / 2,
+            },
             far_future_budget(),
         );
         let k_mesh = TestKMesh(initiator_key);
@@ -1602,6 +2057,7 @@ mod tests {
             &k_mesh,
             &AlwaysAdmitD1,
             &FixedClock(0),
+            u64::MAX / 2,
             RekeyThreshold::new(3).unwrap(),
         );
 
@@ -1681,7 +2137,10 @@ mod tests {
                 let (sock, _) = listener.accept().unwrap();
                 let ingress = PrevalidatedIngress::admit_at_accept(
                     sock,
-                    IngressEvidence { observed_at: 1 },
+                    IngressEvidence {
+                        observed_at: 1,
+                        ingress_expiry: u64::MAX / 2,
+                    },
                     far_future_budget(),
                 );
                 run_responder_handshake(
@@ -1695,6 +2154,7 @@ mod tests {
                     &InMemoryLedger::new(),
                     &AlwaysAdmitD1,
                     &FixedClock(0),
+                    u64::MAX / 2,
                     RekeyThreshold::new(3).unwrap(),
                 )
             }
@@ -1766,7 +2226,7 @@ mod tests {
             vec![0u8; 64],
         )
         .unwrap();
-        let proof_i = auth_frames::sign_frame(proof_i, &k_mesh).unwrap();
+        let proof_i = auth_frames::sign_frame(proof_i, &k_mesh, &far_future_deadline()).unwrap();
         send_frame(
             &mut sock,
             &mut transport,
@@ -1813,7 +2273,10 @@ mod tests {
                 let (sock, _) = listener.accept().unwrap();
                 let ingress = PrevalidatedIngress::admit_at_accept(
                     sock,
-                    IngressEvidence { observed_at: 1 },
+                    IngressEvidence {
+                        observed_at: 1,
+                        ingress_expiry: u64::MAX / 2,
+                    },
                     far_future_budget(),
                 );
                 run_responder_handshake(
@@ -1827,6 +2290,7 @@ mod tests {
                     &InMemoryLedger::new(),
                     &AlwaysAdmitD1,
                     &FixedClock(0),
+                    u64::MAX / 2,
                     RekeyThreshold::new(3).unwrap(),
                 )
             }
@@ -1895,7 +2359,7 @@ mod tests {
             vec![0u8; 64],
         )
         .unwrap();
-        let proof_i = auth_frames::sign_frame(proof_i, &k_mesh).unwrap();
+        let proof_i = auth_frames::sign_frame(proof_i, &k_mesh, &far_future_deadline()).unwrap();
         send_frame(
             &mut sock,
             &mut transport,
@@ -1936,10 +2400,7 @@ mod tests {
     }
     impl wire::DeadlineBoundedIo for PanicsOnIo {
         fn arm_io_deadline(&mut self, _remaining: Duration) -> std::io::Result<()> {
-            panic!("stream deadline was armed before check_signer_matches_delegation rejected");
-        }
-        fn clear_io_deadline(&mut self) -> std::io::Result<()> {
-            panic!("stream deadline was cleared before check_signer_matches_delegation rejected");
+            panic!("stream deadline was armed before rejection");
         }
     }
 
@@ -1961,7 +2422,10 @@ mod tests {
 
         let ingress = PrevalidatedIngress::admit_at_accept(
             PanicsOnIo,
-            IngressEvidence { observed_at: 1 },
+            IngressEvidence {
+                observed_at: 1,
+                ingress_expiry: u64::MAX / 2,
+            },
             far_future_budget(),
         );
         let result = run_responder_handshake(
@@ -1975,6 +2439,7 @@ mod tests {
             &InMemoryLedger::new(),
             &AlwaysAdmitD1,
             &FixedClock(0),
+            u64::MAX / 2,
             RekeyThreshold::new(3).unwrap(),
         );
         assert!(matches!(
@@ -2009,7 +2474,10 @@ mod tests {
 
         let ingress = PrevalidatedIngress::admit_at_accept(
             PanicsOnIo,
-            IngressEvidence { observed_at: 1 },
+            IngressEvidence {
+                observed_at: 1,
+                ingress_expiry: u64::MAX / 2,
+            },
             far_future_budget(),
         );
         let result = run_initiator_handshake(
@@ -2023,6 +2491,7 @@ mod tests {
             &mismatched_k_mesh,
             &AlwaysAdmitD1,
             &FixedClock(0),
+            u64::MAX / 2,
             RekeyThreshold::new(3).unwrap(),
         );
         assert!(matches!(
@@ -2065,7 +2534,10 @@ mod tests {
 
         let ingress = PrevalidatedIngress::new_for_test(
             PanicsOnIo,
-            IngressEvidence { observed_at: 1 },
+            IngressEvidence {
+                observed_at: 1,
+                ingress_expiry: u64::MAX / 2,
+            },
             CeremonyDeadline::already_expired_for_test(),
         );
         let result = run_initiator_handshake(
@@ -2079,6 +2551,7 @@ mod tests {
             &k_mesh,
             &AlwaysAdmitD1,
             &FixedClock(0),
+            u64::MAX / 2,
             RekeyThreshold::new(3).unwrap(),
         );
         assert!(matches!(
@@ -2105,7 +2578,10 @@ mod tests {
 
         let ingress = PrevalidatedIngress::new_for_test(
             PanicsOnIo,
-            IngressEvidence { observed_at: 1 },
+            IngressEvidence {
+                observed_at: 1,
+                ingress_expiry: u64::MAX / 2,
+            },
             CeremonyDeadline::already_expired_for_test(),
         );
         let result = run_responder_handshake(
@@ -2119,6 +2595,7 @@ mod tests {
             &InMemoryLedger::new(),
             &AlwaysAdmitD1,
             &FixedClock(0),
+            u64::MAX / 2,
             RekeyThreshold::new(3).unwrap(),
         );
         assert!(matches!(
@@ -2158,7 +2635,10 @@ mod tests {
         crate::rekey::test_failpoint::force_next_fresh_to_fail();
         let ingress = PrevalidatedIngress::admit_at_accept(
             PanicsOnIo,
-            IngressEvidence { observed_at: 1 },
+            IngressEvidence {
+                observed_at: 1,
+                ingress_expiry: u64::MAX / 2,
+            },
             far_future_budget(),
         );
         let result = run_responder_handshake(
@@ -2172,6 +2652,7 @@ mod tests {
             &InMemoryLedger::new(),
             &AlwaysAdmitD1,
             &FixedClock(0),
+            u64::MAX / 2,
             RekeyThreshold::new(3).unwrap(),
         );
         assert!(matches!(
@@ -2212,7 +2693,10 @@ mod tests {
         crate::rekey::test_failpoint::force_next_fresh_to_fail();
         let ingress = PrevalidatedIngress::admit_at_accept(
             PanicsOnIo,
-            IngressEvidence { observed_at: 1 },
+            IngressEvidence {
+                observed_at: 1,
+                ingress_expiry: u64::MAX / 2,
+            },
             far_future_budget(),
         );
         let result = run_initiator_handshake(
@@ -2226,6 +2710,7 @@ mod tests {
             &k_mesh,
             &AlwaysAdmitD1,
             &FixedClock(0),
+            u64::MAX / 2,
             RekeyThreshold::new(3).unwrap(),
         );
         assert!(matches!(
@@ -2252,6 +2737,47 @@ mod tests {
         }
     }
 
+    /// Reads `deadline` itself and fails if already expired — proves the
+    /// SAME token `pass_delegation_gate` receives genuinely reaches a
+    /// real verifier's own check, not a fresh/independently-resettable
+    /// one a real implementation could use to extend its own budget past
+    /// what the ceremony allows (2026-08-04, @kiana, WIP audit, E3 seam).
+    struct DeadlineAwareVerifier;
+    impl DelegationSignatureVerifier for DeadlineAwareVerifier {
+        fn verify_delegation(
+            &self,
+            _delegation: &MeshSessionDelegation,
+            deadline: &CeremonyDeadline,
+        ) -> Result<(), crate::error::DelegationError> {
+            if deadline.is_expired() {
+                return Err(crate::error::DelegationError::DeadlineExceeded);
+            }
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn red_pass_delegation_gate_propagates_the_official_ceremony_deadline_to_the_verifier() {
+        let delegation = delegation_for_key(
+            &VerifyingKey::from(&SigningKey::random(&mut OsRng)),
+            "hh-1",
+            "someone-1",
+            vec![0xCC; 32],
+            0,
+            u64::MAX / 2,
+        );
+        let expired = CeremonyDeadline::already_expired_for_test();
+        let result = pass_delegation_gate(
+            &delegation,
+            &DelegationPolicy::test(u64::MAX / 2),
+            &DeadlineAwareVerifier,
+            &gate_ctx(),
+            ExpectedChannel::Dev,
+            &expired,
+        );
+        assert!(matches!(result, Err(AuthFrameError::DelegationGate)));
+    }
+
     #[test]
     fn red_delegation_gate_rejects_roles_missing_a_required_role() {
         let key = SigningKey::random(&mut OsRng);
@@ -2267,6 +2793,7 @@ mod tests {
             &AlwaysAcceptDelegation,
             &gate_ctx(),
             ExpectedChannel::Dev,
+            &far_future_deadline(),
         );
         assert!(matches!(
             result,
@@ -2293,6 +2820,7 @@ mod tests {
             &AlwaysAcceptDelegation,
             &gate_ctx(),
             ExpectedChannel::Dev,
+            &far_future_deadline(),
         );
         assert!(matches!(
             result,
@@ -2318,6 +2846,7 @@ mod tests {
             &AlwaysAcceptDelegation,
             &gate_ctx(),
             ExpectedChannel::Dev,
+            &far_future_deadline(),
         );
         assert!(matches!(
             result,
@@ -2340,6 +2869,7 @@ mod tests {
             &AlwaysAcceptDelegation,
             &gate_ctx(),
             ExpectedChannel::Dev,
+            &far_future_deadline(),
         );
         assert!(matches!(
             result,
@@ -2367,6 +2897,7 @@ mod tests {
             &AlwaysAcceptDelegation,
             &gate_ctx(),
             ExpectedChannel::Dev,
+            &far_future_deadline(),
         );
         assert!(matches!(
             result,
@@ -2395,6 +2926,7 @@ mod tests {
             &AlwaysAcceptDelegation,
             &gate_ctx(),
             ExpectedChannel::Dev,
+            &far_future_deadline(),
         );
         assert!(matches!(
             result,
@@ -2417,6 +2949,7 @@ mod tests {
             &AlwaysAcceptDelegation,
             &gate_ctx(),
             ExpectedChannel::Dev, // caller expects dev; delegation says release
+            &far_future_deadline(),
         );
         assert!(matches!(
             result,
@@ -2454,7 +2987,10 @@ mod tests {
                 let (sock, _) = listener.accept().unwrap();
                 let ingress = PrevalidatedIngress::admit_at_accept(
                     sock,
-                    IngressEvidence { observed_at: 1 },
+                    IngressEvidence {
+                        observed_at: 1,
+                        ingress_expiry: u64::MAX / 2,
+                    },
                     far_future_budget(),
                 );
                 run_responder_handshake(
@@ -2468,6 +3004,7 @@ mod tests {
                     &InMemoryLedger::new(),
                     &AlwaysAdmitD1,
                     &FixedClock(0),
+                    u64::MAX / 2,
                     RekeyThreshold::new(3).unwrap(),
                 )
             }
@@ -2533,7 +3070,7 @@ mod tests {
             vec![0u8; 64],
         )
         .unwrap();
-        let proof_i = auth_frames::sign_frame(proof_i, &k_mesh).unwrap();
+        let proof_i = auth_frames::sign_frame(proof_i, &k_mesh, &far_future_deadline()).unwrap();
         send_frame(
             &mut sock,
             &mut transport,
@@ -2588,7 +3125,8 @@ mod tests {
             )
             .unwrap();
             let k_mesh = TestKMesh(responder_key);
-            let proof_r = auth_frames::sign_frame(proof_r, &k_mesh).unwrap();
+            let proof_r =
+                auth_frames::sign_frame(proof_r, &k_mesh, &far_future_deadline()).unwrap();
             send_frame(
                 &mut sock,
                 &mut transport,
@@ -2612,7 +3150,10 @@ mod tests {
         let sock = TcpStream::connect(addr).unwrap();
         let ingress = PrevalidatedIngress::admit_at_accept(
             sock,
-            IngressEvidence { observed_at: 2 },
+            IngressEvidence {
+                observed_at: 2,
+                ingress_expiry: u64::MAX / 2,
+            },
             far_future_budget(),
         );
         let k_mesh = TestKMesh(initiator_key);
@@ -2637,6 +3178,7 @@ mod tests {
             &k_mesh,
             &AlwaysAdmitD1,
             &FixedClock(0),
+            u64::MAX / 2,
             RekeyThreshold::new(3).unwrap(),
         );
         attacker.join().unwrap();
@@ -2664,7 +3206,10 @@ mod tests {
 
         let ingress = PrevalidatedIngress::admit_at_accept(
             PanicsOnIo,
-            IngressEvidence { observed_at: 1 },
+            IngressEvidence {
+                observed_at: 1,
+                ingress_expiry: u64::MAX / 2,
+            },
             far_future_budget(),
         );
         let result = run_responder_handshake(
@@ -2678,6 +3223,7 @@ mod tests {
             &InMemoryLedger::new(),
             &AlwaysAdmitD1,
             &FixedClock(0),
+            u64::MAX / 2,
             RekeyThreshold::new(3).unwrap(),
         );
         assert!(matches!(
@@ -2711,7 +3257,10 @@ mod tests {
 
         let ingress = PrevalidatedIngress::admit_at_accept(
             PanicsOnIo,
-            IngressEvidence { observed_at: 1 },
+            IngressEvidence {
+                observed_at: 1,
+                ingress_expiry: u64::MAX / 2,
+            },
             far_future_budget(),
         );
         let result = run_initiator_handshake(
@@ -2725,6 +3274,7 @@ mod tests {
             &k_mesh,
             &AlwaysAdmitD1,
             &FixedClock(0),
+            u64::MAX / 2,
             RekeyThreshold::new(3).unwrap(),
         );
         assert!(matches!(
@@ -2782,7 +3332,10 @@ mod tests {
                 let (sock, _) = listener.accept().unwrap();
                 let ingress = PrevalidatedIngress::admit_at_accept(
                     sock,
-                    IngressEvidence { observed_at: 1 },
+                    IngressEvidence {
+                        observed_at: 1,
+                        ingress_expiry: u64::MAX / 2,
+                    },
                     far_future_budget(),
                 );
                 run_responder_handshake(
@@ -2796,6 +3349,7 @@ mod tests {
                     &InMemoryLedger::new(),
                     &AlwaysAdmitD1,
                     &FixedClock(0),
+                    u64::MAX / 2,
                     RekeyThreshold::new(3).unwrap(),
                 )
             }
@@ -2818,7 +3372,10 @@ mod tests {
         let sock = TcpStream::connect(addr).unwrap();
         let ingress = PrevalidatedIngress::admit_at_accept(
             sock,
-            IngressEvidence { observed_at: 2 },
+            IngressEvidence {
+                observed_at: 2,
+                ingress_expiry: u64::MAX / 2,
+            },
             far_future_budget(),
         );
         let k_mesh = TestKMesh(initiator_key);
@@ -2843,6 +3400,7 @@ mod tests {
             &k_mesh,
             &AlwaysAdmitD1,
             &FixedClock(0),
+            u64::MAX / 2,
             RekeyThreshold::new(3).unwrap(),
         );
 

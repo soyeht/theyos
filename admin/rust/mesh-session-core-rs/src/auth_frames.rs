@@ -54,6 +54,7 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use crate::cbor;
 use crate::delegation::MeshSessionDelegation;
 use crate::error::AuthFrameError;
+use crate::ingress::CeremonyDeadline;
 
 pub const TYPE_PROOF_R: u8 = 0x01;
 pub const TYPE_PROOF_I: u8 = 0x02;
@@ -979,9 +980,18 @@ pub trait MeshSessionFrameSigner {
     /// signature ever reaches the wire (2026-08-04, @kiana: do not trust
     /// only the implementor's doc comment or the peer's inbound verifier
     /// to catch a non-canonical signature this side produced).
+    /// `deadline` (2026-08-04, @kiana, WIP audit, E3 seam): the real D4
+    /// signer (guard/revalidation/backend.sign) may block. The SAME
+    /// absolute `CeremonyDeadline` already threaded through the rest of
+    /// the ceremony is passed here too — never a fresh, independently-
+    /// resettable timeout. A real implementation must return
+    /// `SignerFailed`/an equivalent unavailable outcome before any
+    /// terminal effect if it cannot produce a signature within budget,
+    /// never block past it.
     fn sign_mesh_session_frame(
         &self,
         preimage: &MeshSessionFramePreimage,
+        deadline: &CeremonyDeadline,
     ) -> Result<[u8; 64], AuthFrameError>;
 
     /// This signer's own P-256 public key. Never secret material — used
@@ -999,6 +1009,17 @@ pub trait MeshSessionFrameSigner {
     /// than requiring a caller to prove it separately. Same low-S-canonical
     /// contract as `sign_mesh_session_frame`; `intent::sign_intent_record`
     /// re-parses and mathematically self-verifies this output too.
+    /// **No `deadline` parameter (2026-08-04, @kiana, WIP audit, E3 seam
+    /// — conditional: "se 0x06 for assinado on-path"):** unlike
+    /// `sign_mesh_session_frame`, signing the 0x06 intent is NOT on-path
+    /// within the timed ceremony in this crate's design — `PendingIntent::
+    /// build_and_sign` (the only caller of this method) is built by the
+    /// initiator's own caller before dialing, outside any
+    /// `CeremonyDeadline`'s scope (see the intent module's own "what this
+    /// module does not do" note: this crate does not decide how an
+    /// initiator obtains/mints its own intent before dialing). If a real
+    /// integration ever signs 0x06 on-path instead, that call site would
+    /// need its own deadline threading at that point — not assumed here.
     fn sign_intent(
         &self,
         preimage: &crate::intent::IntentSigningPreimage,
@@ -1117,13 +1138,17 @@ pub(crate) fn verifier_from_delegated_pub(
 /// [`MeshSessionFrameSigner::public_key`] before ever returning it —
 /// wrong-message and wrong-key both fail closed locally,
 /// `SignerProducedInvalidSignature`, before any write.
-pub(crate) fn sign_frame<F, Sig>(frame: F, k_mesh: &Sig) -> Result<F, AuthFrameError>
+pub(crate) fn sign_frame<F, Sig>(
+    frame: F,
+    k_mesh: &Sig,
+    deadline: &CeremonyDeadline,
+) -> Result<F, AuthFrameError>
 where
     F: AuthFrameBody + FrameWithSig,
     Sig: MeshSessionFrameSigner,
 {
     let preimage = MeshSessionFramePreimage::for_frame(&frame)?;
-    let sig_bytes = k_mesh.sign_mesh_session_frame(&preimage)?;
+    let sig_bytes = k_mesh.sign_mesh_session_frame(&preimage, deadline)?;
     let sig = parse_low_s_signature(&sig_bytes)?;
     k_mesh
         .public_key()
@@ -1197,12 +1222,18 @@ mod tests {
     use p256::ecdsa::SigningKey;
     use p256::ecdsa::signature::Signer;
     use rand_core::OsRng;
+    use std::time::{Duration, Instant};
+
+    fn far_future_deadline() -> CeremonyDeadline {
+        CeremonyDeadline::for_test(Instant::now(), Duration::from_secs(3600))
+    }
 
     struct TestKMesh(SigningKey);
     impl MeshSessionFrameSigner for TestKMesh {
         fn sign_mesh_session_frame(
             &self,
             preimage: &MeshSessionFramePreimage,
+            _deadline: &CeremonyDeadline,
         ) -> Result<[u8; 64], AuthFrameError> {
             let sig: Signature = self.0.sign(preimage.as_bytes());
             let sig = sig.normalize_s().unwrap_or(sig);
@@ -1232,6 +1263,7 @@ mod tests {
         fn sign_mesh_session_frame(
             &self,
             _preimage: &MeshSessionFramePreimage,
+            _deadline: &CeremonyDeadline,
         ) -> Result<[u8; 64], AuthFrameError> {
             let sig: Signature = self.0.sign(b"not the preimage sign_frame asked for");
             let sig = sig.normalize_s().unwrap_or(sig);
@@ -1265,6 +1297,7 @@ mod tests {
         fn sign_mesh_session_frame(
             &self,
             preimage: &MeshSessionFramePreimage,
+            _deadline: &CeremonyDeadline,
         ) -> Result<[u8; 64], AuthFrameError> {
             let sig: Signature = self.signs_with.sign(preimage.as_bytes());
             let sig = sig.normalize_s().unwrap_or(sig);
@@ -1291,6 +1324,7 @@ mod tests {
         fn sign_mesh_session_frame(
             &self,
             _preimage: &MeshSessionFramePreimage,
+            _deadline: &CeremonyDeadline,
         ) -> Result<[u8; 64], AuthFrameError> {
             Err(AuthFrameError::SignerFailed)
         }
@@ -1317,6 +1351,7 @@ mod tests {
         fn sign_mesh_session_frame(
             &self,
             preimage: &MeshSessionFramePreimage,
+            _deadline: &CeremonyDeadline,
         ) -> Result<[u8; 64], AuthFrameError> {
             for salt in 0u8..255 {
                 let mut salted = preimage.as_bytes().to_vec();
@@ -1559,15 +1594,56 @@ mod tests {
         let verifier = RawP256FrameVerifier(VerifyingKey::from(&signing_key));
 
         let frame = sample_proof_r();
-        let signed = sign_frame(frame, &k_mesh).unwrap();
+        let signed = sign_frame(frame, &k_mesh, &far_future_deadline()).unwrap();
         let sig: [u8; 64] = signed.sig().to_vec().try_into().unwrap();
         verify_frame(&signed, &sig, &verifier).unwrap();
+    }
+
+    /// Reads `deadline` itself and fails if already expired — proves the
+    /// SAME token `sign_frame` receives genuinely reaches a real signer's
+    /// own check (2026-08-04, @kiana, WIP audit, E3 seam: "todo hook
+    /// potencialmente I/O deve receber o mesmo token"), the signing-side
+    /// counterpart of `DeadlineAwareVerifier` in
+    /// `auth_state_machine::tests`.
+    struct DeadlineAwareSigner(SigningKey);
+    impl MeshSessionFrameSigner for DeadlineAwareSigner {
+        fn sign_mesh_session_frame(
+            &self,
+            preimage: &MeshSessionFramePreimage,
+            deadline: &CeremonyDeadline,
+        ) -> Result<[u8; 64], AuthFrameError> {
+            if deadline.is_expired() {
+                return Err(AuthFrameError::SignerFailed);
+            }
+            let sig: Signature = self.0.sign(preimage.as_bytes());
+            let sig = sig.normalize_s().unwrap_or(sig);
+            Ok(sig.to_bytes().into())
+        }
+        fn public_key(&self) -> VerifyingKey {
+            *self.0.verifying_key()
+        }
+        fn sign_intent(
+            &self,
+            preimage: &crate::intent::IntentSigningPreimage,
+        ) -> Result<[u8; 64], AuthFrameError> {
+            let sig: Signature = self.0.sign(preimage.as_bytes());
+            let sig = sig.normalize_s().unwrap_or(sig);
+            Ok(sig.to_bytes().into())
+        }
+    }
+
+    #[test]
+    fn red_sign_frame_propagates_the_official_ceremony_deadline_to_the_signer() {
+        let k_mesh = DeadlineAwareSigner(SigningKey::random(&mut OsRng));
+        let expired = CeremonyDeadline::already_expired_for_test();
+        let err = sign_frame(sample_proof_r(), &k_mesh, &expired).unwrap_err();
+        assert!(matches!(err, AuthFrameError::SignerFailed));
     }
 
     #[test]
     fn red_signer_failure_propagates_never_fabricates_a_signature() {
         let k_mesh = AlwaysFailingKMesh(SigningKey::random(&mut OsRng));
-        let err = sign_frame(sample_proof_r(), &k_mesh).unwrap_err();
+        let err = sign_frame(sample_proof_r(), &k_mesh, &far_future_deadline()).unwrap_err();
         assert!(matches!(err, AuthFrameError::SignerFailed));
     }
 
@@ -1575,7 +1651,7 @@ mod tests {
     fn red_signer_returning_high_s_is_caught_before_the_wire() {
         let signing_key = SigningKey::random(&mut OsRng);
         let k_mesh = AlwaysHighSKMesh(signing_key);
-        let err = sign_frame(sample_proof_r(), &k_mesh).unwrap_err();
+        let err = sign_frame(sample_proof_r(), &k_mesh, &far_future_deadline()).unwrap_err();
         assert!(matches!(err, AuthFrameError::HighSRejected));
     }
 
@@ -1587,7 +1663,7 @@ mod tests {
         // signature — just over the wrong message — must still be caught
         // locally, before the frame is ever written.
         let k_mesh = WrongMessageKMesh(SigningKey::random(&mut OsRng));
-        let err = sign_frame(sample_proof_r(), &k_mesh).unwrap_err();
+        let err = sign_frame(sample_proof_r(), &k_mesh, &far_future_deadline()).unwrap_err();
         assert!(matches!(
             err,
             AuthFrameError::SignerProducedInvalidSignature
@@ -1605,7 +1681,7 @@ mod tests {
             signs_with: SigningKey::random(&mut OsRng),
             claims_to_be: SigningKey::random(&mut OsRng),
         };
-        let err = sign_frame(sample_proof_r(), &k_mesh).unwrap_err();
+        let err = sign_frame(sample_proof_r(), &k_mesh, &far_future_deadline()).unwrap_err();
         assert!(matches!(
             err,
             AuthFrameError::SignerProducedInvalidSignature
@@ -1619,7 +1695,7 @@ mod tests {
         let verifier = RawP256FrameVerifier(VerifyingKey::from(&signing_key));
 
         let frame = sample_proof_r();
-        let signed = sign_frame(frame, &k_mesh).unwrap();
+        let signed = sign_frame(frame, &k_mesh, &far_future_deadline()).unwrap();
         let sig: [u8; 64] = signed.sig().to_vec().try_into().unwrap();
 
         let tampered = ProofR::new(

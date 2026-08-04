@@ -647,8 +647,13 @@ impl PendingIntent {
 /// [`Self::MayHaveTakenEffect`] specifically requires a real
 /// implementation to reread/reconcile before it may ever be tried again,
 /// never assume either outcome.
+/// `pub` (2026-08-04, @kiana, WIP audit, seam-visibility correction — a
+/// `pub(crate)` trait/enum cannot be implemented/matched on from a real,
+/// different-crate `IntentNonceLedger` adapter at all; Rust visibility
+/// requires the trait, its associated types, and everything in its method
+/// signatures to be at least as visible as the impl needs).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum NonceConsumeOutcome {
+pub enum NonceConsumeOutcome {
     /// Consumed for the first time, durably. Exactly one caller ever
     /// observes this for a given key.
     Committed,
@@ -665,7 +670,9 @@ pub(crate) enum NonceConsumeOutcome {
     Unavailable,
 }
 
-pub(crate) trait IntentNonceLedger {
+/// `pub` (2026-08-04, @kiana, WIP audit, seam-visibility correction) —
+/// see [`NonceConsumeOutcome`]'s doc.
+pub trait IntentNonceLedger {
     /// Atomic check-and-set. `key` is the pure replay identity (erratum1
     /// E2 — never includes `channel`/digest). `not_after` and `digest`
     /// are passed *separately*, not folded into `key`'s own `Eq`/`Hash`
@@ -689,11 +696,21 @@ pub(crate) trait IntentNonceLedger {
     /// matches on, not this method's failure mode); `Err` is reserved for
     /// this call itself failing to produce any outcome (e.g. the deadline
     /// was already exceeded).
+    ///
+    /// **`channel` (2026-08-04, @kiana, WIP audit, runtime-integration
+    /// mismatch):** a real implementation persists an evidence record
+    /// (e.g. household's `MeshIntentNonceEvidence { channel, digest,
+    /// not_after }`) that includes the channel this ceremony ran under —
+    /// same status as `not_after`/`digest`: audit/storage EVIDENCE, never
+    /// part of the key's own `Eq`/`Hash` (erratum1 E2 still holds: folding
+    /// `channel` into the key would let the same signed bytes replay once
+    /// per channel).
     fn consume(
         &self,
         key: &IntentNonceKey,
         not_after: u64,
         digest: &[u8; 32],
+        channel: crate::auth_state_machine::ExpectedChannel,
         deadline: &CeremonyDeadline,
     ) -> Result<NonceConsumeOutcome, IntentError>;
 }
@@ -716,15 +733,50 @@ pub(crate) trait IntentNonceLedger {
 /// built. A real implementation's persisted key should be prefixed with
 /// the fixed literal `"ledger-domain-v1"` to separate this namespace
 /// from any other ledger the same store might hold.
+/// `pub` with private fields + read-only accessors (2026-08-04, @kiana,
+/// WIP audit, seam-visibility correction): a real `IntentNonceLedger`
+/// adapter needs to read this key's identity to persist/look it up, but
+/// only this crate's own handshake code may construct one — matching the
+/// crate-wide "typed facade, opaque requests/read-only getters, never a
+/// caller-suppliable arbitrary constructor" discipline.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub(crate) struct IntentNonceKey {
-    pub(crate) hh_id: String,
-    pub(crate) initiator_m_id: String,
-    pub(crate) delegated_key_id: String,
-    pub(crate) nonce: [u8; 32],
+pub struct IntentNonceKey {
+    hh_id: String,
+    initiator_m_id: String,
+    delegated_key_id: String,
+    nonce: [u8; 32],
 }
 
-pub(crate) const LEDGER_DOMAIN: &str = "ledger-domain-v1";
+impl IntentNonceKey {
+    pub(crate) fn new(
+        hh_id: String,
+        initiator_m_id: String,
+        delegated_key_id: String,
+        nonce: [u8; 32],
+    ) -> Self {
+        Self {
+            hh_id,
+            initiator_m_id,
+            delegated_key_id,
+            nonce,
+        }
+    }
+
+    pub fn hh_id(&self) -> &str {
+        &self.hh_id
+    }
+    pub fn initiator_m_id(&self) -> &str {
+        &self.initiator_m_id
+    }
+    pub fn delegated_key_id(&self) -> &str {
+        &self.delegated_key_id
+    }
+    pub fn nonce(&self) -> &[u8; 32] {
+        &self.nonce
+    }
+}
+
+pub const LEDGER_DOMAIN: &str = "ledger-domain-v1";
 
 /// Ships no real ledger — always fails closed, so a caller cannot forget
 /// to inject a real one and silently get replay "protection" that
@@ -736,6 +788,7 @@ impl IntentNonceLedger for NoIntentLedgerConfigured {
         _key: &IntentNonceKey,
         _not_after: u64,
         _digest: &[u8; 32],
+        _channel: crate::auth_state_machine::ExpectedChannel,
         _deadline: &CeremonyDeadline,
     ) -> Result<NonceConsumeOutcome, IntentError> {
         Err(IntentError::NoLedgerConfigured)
@@ -749,7 +802,9 @@ impl IntentNonceLedger for NoIntentLedgerConfigured {
 /// again at each checkpoint can). This crate does not implement a real
 /// clock/timer subsystem — same "não inventar... dentro do core" posture
 /// as the nonce ledger and D1 admission.
-pub(crate) trait Clock {
+/// `pub` (2026-08-04, @kiana, WIP audit, seam-visibility correction) —
+/// see [`NonceConsumeOutcome`]'s doc.
+pub trait Clock {
     fn now(&self) -> Result<u64, IntentError>;
 }
 
@@ -809,13 +864,20 @@ impl Clock for NoClockConfigured {
 /// `activate_if_authorized` returns an opaque `Self::ActiveGate`, which
 /// the handshake function moves *immediately* into a private field of the
 /// `ActiveMeshSession` it constructs — never returned as a second tuple
-/// element, never exposed via any accessor. Dropping the session runs
-/// `G`'s own `Drop` (whatever unregister/revoke semantics the real D1
-/// implementation gives its gate type), so a session can never be
-/// separated from its gate while still claiming to be usable. `Pending`/
+/// element, never exposed via any accessor, so a session can never be
+/// separated from its gate while still claiming to be usable. This crate
+/// makes NO claim about what embedding/dropping `Self::ActiveGate` does
+/// (2026-08-04, @kiana, WIP audit, correction of an earlier, wrong claim
+/// here that dropping it "runs G's own Drop... unregister/revoke
+/// semantics"): verified against the real household-rs `SessionGate`
+/// type and found false — `SessionGate` is `#[derive(Clone)]` with no
+/// `Drop` impl at all; real revocation is a shared `Arc`-backed
+/// atomic/sync state every clone rechecks fresh on each
+/// `try_authorize_forwarding()` call, not a drop side effect. `Pending`/
 /// `ActiveGate` are not `Clone`-bound at the trait level (Rust has no
-/// stable "not Clone" bound); this crate's own calling code never clones
-/// either — each value is moved into exactly one of
+/// stable "not Clone" bound, and the real `ActiveGate`/`SessionGate` type
+/// genuinely is `Clone`); this crate's own calling code never clones
+/// either regardless — each value is moved into exactly one of
 /// `activate_if_authorized`/`cancel_pending`, enforced by the borrow
 /// checker at each call site, not by convention.
 ///
@@ -824,7 +886,59 @@ impl Clock for NoClockConfigured {
 /// ambiguous concurrent-revoke race; it must respect `deadline` itself
 /// and fail closed (never transition to Active) on expiry or an
 /// indeterminate outcome.
-pub(crate) trait D1Admission {
+///
+/// **`pub` (2026-08-04, @kiana, WIP audit, seam-visibility correction)** —
+/// see [`NonceConsumeOutcome`]'s doc; `Self::Pending`/`Self::ActiveGate`
+/// stay caller-defined associated types, so this crate never names a
+/// concrete adapter type. This is genuinely, positively implementable
+/// from outside the crate — not just something that survives a
+/// `compile_fail` negative check — because the doctest below actually
+/// compiles a real external-style `impl`:
+///
+/// ```
+/// use mesh_session_core_rs::intent::{D1Admission, D1AdmissionKey};
+/// use mesh_session_core_rs::ingress::CeremonyDeadline;
+/// use mesh_session_core_rs::error::IntentError;
+///
+/// // A real adapter (e.g. household-rs's MeshSessionRegistry) would wrap
+/// // its own registry/lock/session-table state here instead.
+/// struct ExternalAdapter;
+///
+/// impl D1Admission for ExternalAdapter {
+///     type Pending = u64; // a real adapter's own opaque permit type
+///     type ActiveGate = u64; // a real adapter's own opaque gate type
+///
+///     fn reserve_pending(
+///         &self,
+///         key: &D1AdmissionKey,
+///         deadline: &CeremonyDeadline,
+///     ) -> Result<Self::Pending, IntentError> {
+///         // A real implementation reads `key`'s accessors (session_id(),
+///         // peer_m_id(), delegated_pub(), checkpoint_hash(), ...) and
+///         // `deadline.remaining()`/`is_expired()` to do its own D1
+///         // revision recheck and admission-barrier insert here.
+///         let _ = (key.session_id(), deadline.is_expired());
+///         Ok(1)
+///     }
+///     fn activate_if_authorized(
+///         &self,
+///         pending: Self::Pending,
+///         _deadline: &CeremonyDeadline,
+///     ) -> Result<Self::ActiveGate, IntentError> {
+///         Ok(pending)
+///     }
+///     fn cancel_pending(
+///         &self,
+///         _pending: Self::Pending,
+///         _deadline: &CeremonyDeadline,
+///     ) -> Result<(), IntentError> {
+///         Ok(())
+///     }
+/// }
+///
+/// let _adapter = ExternalAdapter; // compiles: the trait is usable from outside
+/// ```
+pub trait D1Admission {
     type Pending;
     type ActiveGate;
 
@@ -942,22 +1056,117 @@ pub(crate) trait D1Admission {
 /// are already covered by this ceremony's own separate auth checks
 /// (`check_checkpoint` against the peer's claimed values) before this key
 /// is ever built.
+/// `pub` with private fields + read-only accessors (2026-08-04, @kiana,
+/// WIP audit, seam-visibility correction — same discipline as
+/// [`IntentNonceKey`]): a real `D1Admission` adapter needs to read this
+/// binding to persist/recheck it, but only this crate's own handshake
+/// code may construct one.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct D1AdmissionKey {
-    pub(crate) session_id: Vec<u8>,
-    pub(crate) hh_id: String,
-    pub(crate) local_m_id: String,
-    pub(crate) local_cert_fingerprint: Vec<u8>,
-    pub(crate) peer_m_id: String,
-    pub(crate) peer_cert_fingerprint: Vec<u8>,
-    pub(crate) delegated_key_id: String,
-    pub(crate) delegated_pub: Vec<u8>,
-    pub(crate) checkpoint_hash: Vec<u8>,
-    pub(crate) checkpoint_sequence: u64,
-    pub(crate) checkpoint_event_head: Vec<u8>,
-    pub(crate) checkpoint_not_after: u64,
-    pub(crate) not_after: u64,
-    pub(crate) channel: ExpectedChannel,
+pub struct D1AdmissionKey {
+    session_id: Vec<u8>,
+    hh_id: String,
+    local_m_id: String,
+    local_cert_fingerprint: Vec<u8>,
+    peer_m_id: String,
+    peer_cert_fingerprint: Vec<u8>,
+    delegated_key_id: String,
+    delegated_pub: Vec<u8>,
+    checkpoint_hash: Vec<u8>,
+    checkpoint_sequence: u64,
+    checkpoint_event_head: Vec<u8>,
+    checkpoint_not_after: u64,
+    /// **Renamed from `not_after` to `expires_at` (2026-08-04, @kiana, WIP
+    /// audit, correction):** both call sites previously passed the raw
+    /// intent's own claimed `not_after` here — but the actual expiry this
+    /// D1 binding should be scoped to is the FULL `effective_expires_at =
+    /// min(checkpoint, local delegation, peer delegation, lease, ingress,
+    /// intent)` composite, already computed earlier in the same function.
+    /// Using only the intent's own (possibly larger, unenforced) claim
+    /// would let a session's D1 binding outlive the shortest of the other
+    /// 5 components — changing e.g. `lease_expires_at` alone, with
+    /// `intent.not_after` held fixed, must still change this key.
+    expires_at: u64,
+    channel: ExpectedChannel,
+}
+
+#[allow(clippy::too_many_arguments)]
+impl D1AdmissionKey {
+    pub(crate) fn new(
+        session_id: Vec<u8>,
+        hh_id: String,
+        local_m_id: String,
+        local_cert_fingerprint: Vec<u8>,
+        peer_m_id: String,
+        peer_cert_fingerprint: Vec<u8>,
+        delegated_key_id: String,
+        delegated_pub: Vec<u8>,
+        checkpoint_hash: Vec<u8>,
+        checkpoint_sequence: u64,
+        checkpoint_event_head: Vec<u8>,
+        checkpoint_not_after: u64,
+        expires_at: u64,
+        channel: ExpectedChannel,
+    ) -> Self {
+        Self {
+            session_id,
+            hh_id,
+            local_m_id,
+            local_cert_fingerprint,
+            peer_m_id,
+            peer_cert_fingerprint,
+            delegated_key_id,
+            delegated_pub,
+            checkpoint_hash,
+            checkpoint_sequence,
+            checkpoint_event_head,
+            checkpoint_not_after,
+            expires_at,
+            channel,
+        }
+    }
+
+    pub fn session_id(&self) -> &[u8] {
+        &self.session_id
+    }
+    pub fn hh_id(&self) -> &str {
+        &self.hh_id
+    }
+    pub fn local_m_id(&self) -> &str {
+        &self.local_m_id
+    }
+    pub fn local_cert_fingerprint(&self) -> &[u8] {
+        &self.local_cert_fingerprint
+    }
+    pub fn peer_m_id(&self) -> &str {
+        &self.peer_m_id
+    }
+    pub fn peer_cert_fingerprint(&self) -> &[u8] {
+        &self.peer_cert_fingerprint
+    }
+    pub fn delegated_key_id(&self) -> &str {
+        &self.delegated_key_id
+    }
+    pub fn delegated_pub(&self) -> &[u8] {
+        &self.delegated_pub
+    }
+    pub fn checkpoint_hash(&self) -> &[u8] {
+        &self.checkpoint_hash
+    }
+    pub fn checkpoint_sequence(&self) -> u64 {
+        self.checkpoint_sequence
+    }
+    pub fn checkpoint_event_head(&self) -> &[u8] {
+        &self.checkpoint_event_head
+    }
+    pub fn checkpoint_not_after(&self) -> u64 {
+        self.checkpoint_not_after
+    }
+    pub fn expires_at(&self) -> u64 {
+        self.expires_at
+    }
+    pub fn channel(&self) -> ExpectedChannel {
+        self.channel
+    }
 }
 
 /// Ships no real D1 wiring. `Pending = Infallible` — fail-closed *by
@@ -1010,7 +1219,7 @@ mod tests {
             checkpoint_sequence: 7,
             checkpoint_event_head: vec![0xDDu8; 32],
             checkpoint_not_after: 2_000,
-            not_after: 1_000,
+            expires_at: 1_000,
             channel: ExpectedChannel::Dev,
         }
     }
@@ -1032,6 +1241,22 @@ mod tests {
         let a = base_key();
         let mut b = a.clone();
         b.checkpoint_not_after = a.checkpoint_not_after + 1;
+        assert_ne!(a, b);
+    }
+
+    /// WIP audit RED (2026-08-04, @kiana): `expires_at` (the FULL
+    /// `effective_expires_at` composite, not just `intent.not_after`)
+    /// must independently distinguish keys — changing only the smallest
+    /// cap among checkpoint/local delegation/peer delegation/lease/
+    /// ingress (simulated here by directly mutating `expires_at`, since
+    /// that is exactly what a changed minimum looks like once computed)
+    /// changes the D1AdmissionKey even with every other field, including
+    /// whatever the intent itself claims, held fixed.
+    #[test]
+    fn red_d1_admission_key_distinguishes_an_expires_at_swap_from_a_smaller_cap() {
+        let a = base_key();
+        let mut b = a.clone();
+        b.expires_at = a.expires_at - 1;
         assert_ne!(a, b);
     }
 

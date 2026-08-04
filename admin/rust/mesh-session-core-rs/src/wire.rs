@@ -50,24 +50,29 @@ use crate::ingress::CeremonyDeadline;
 /// implementations exist — an external crate cannot implement a no-op
 /// version and silently defeat the deadline.
 ///
-/// **`clear_io_deadline` (2026-08-04, @kiana, lifecycle CFX):** a real
-/// `TcpStream`'s `SO_RCVTIMEO`/`SO_SNDTIMEO` are socket-level options that
-/// persist across `arm_io_deadline` calls — they do not expire or reset
-/// themselves once the ceremony that armed them ends. Without an explicit
-/// clear, a freshly `Active` session would silently inherit whatever
-/// (possibly tiny, possibly already near-zero) timeout the *last* ceremony
-/// syscall happened to arm, and every later DATA/CLOSE/rekey read or write
-/// on that same socket would be bounded by a budget that was never meant
-/// to apply to them. `auth_state_machine` calls this exactly once, right
-/// before exposing an `ActiveMeshSession`, and refuses to return the
-/// session at all if clearing fails (see its construction site) — see
-/// [`Self::arm_io_deadline`]'s sibling method.
+/// **No `clear`/`capture`/restore step (2026-08-04, @kiana, lifecycle CFX,
+/// definitive — supersedes the earlier `capture_io_deadline`/
+/// `clear_io_deadline` pair):** `PrevalidatedIngress` gives this crate
+/// *exclusive* ownership of the stream (v6 §10: raw `T` never comes back
+/// out to an external caller). Between the Ack write succeeding and any
+/// future operation, no I/O happens at all — there is nothing to leave in
+/// a bad state. Every future Active-side I/O operation (once a real,
+/// guarded DATA path exists — see `ActiveMeshSession`'s module doc) is
+/// required to call `arm_io_deadline` again, with its own budget, before
+/// its own first syscall — exactly the same "recompute fresh before every
+/// syscall" discipline `read_exact_with_deadline`/`write_all_with_deadline`
+/// already apply during the ceremony itself. That next arm always
+/// overwrites whatever timeout the stream currently holds, so nothing
+/// about the ceremony's *last* armed value is ever observable by a
+/// well-behaved caller; if there never is a next operation, the stream
+/// (and its socket options along with it) is simply dropped. A prior
+/// design tried to restore the stream to its pre-ceremony timeout instead
+/// — that added a fallible syscall on the terminal, already-committed
+/// path (right after `activate_if_authorized`, when a real D1 registry
+/// may already consider the session Active) for no benefit this ownership
+/// model doesn't already provide for free.
 pub(crate) trait DeadlineBoundedIo {
     fn arm_io_deadline(&mut self, remaining: Duration) -> std::io::Result<()>;
-    /// Removes any per-call deadline previously armed, restoring
-    /// unbounded (blocking-forever, at this layer) I/O. Called exactly
-    /// once, at the ceremony→Active transition boundary.
-    fn clear_io_deadline(&mut self) -> std::io::Result<()>;
 }
 
 impl DeadlineBoundedIo for std::net::TcpStream {
@@ -80,27 +85,16 @@ impl DeadlineBoundedIo for std::net::TcpStream {
         self.set_write_timeout(Some(remaining))?;
         Ok(())
     }
-    fn clear_io_deadline(&mut self) -> std::io::Result<()> {
-        self.set_read_timeout(None)?;
-        self.set_write_timeout(None)?;
-        Ok(())
-    }
 }
 
 impl<T> DeadlineBoundedIo for std::io::Cursor<T> {
     fn arm_io_deadline(&mut self, _remaining: Duration) -> std::io::Result<()> {
         Ok(()) // in-memory, never blocks — nothing to bound
     }
-    fn clear_io_deadline(&mut self) -> std::io::Result<()> {
-        Ok(())
-    }
 }
 
 impl DeadlineBoundedIo for Vec<u8> {
     fn arm_io_deadline(&mut self, _remaining: Duration) -> std::io::Result<()> {
-        Ok(())
-    }
-    fn clear_io_deadline(&mut self) -> std::io::Result<()> {
         Ok(())
     }
 }
@@ -160,7 +154,25 @@ fn read_exact_with_deadline<R: Read + DeadlineBoundedIo>(
 }
 
 /// Write all of `buf`, one syscall at a time — see
-/// [`read_exact_with_deadline`].
+/// [`read_exact_with_deadline`] for the pre-syscall check this shares.
+///
+/// **No post-syscall recheck here (2026-08-04, @kiana, WIP audit,
+/// definitive — corrects an earlier version of this function that DID
+/// recheck `deadline` after every syscall, symmetrically with
+/// `read_exact_with_deadline`):** a write, once a syscall has put its
+/// bytes on the wire, is irreversible — the peer has them regardless of
+/// how long that syscall took. For a terminal write like `ActivateAck`,
+/// the erratum's own rule is "write succeeded → proceed to
+/// `activate_if_authorized` immediately"; retroactively turning a
+/// completed transmission into a local `DeadlineExceeded` error would
+/// create exactly the split-brain this crate works hard everywhere else
+/// to avoid — peer believes Active, this side reports failure and never
+/// even calls `activate_if_authorized`. The deadline still bounds
+/// whether a NEXT syscall may be *attempted*: the `while` condition's own
+/// top-of-loop check (`remaining.is_zero()`) already fails a still-partial
+/// write before its next chunk, satisfying "a partial write that crosses
+/// the deadline fails on the next iteration" without needing a separate
+/// post-syscall check that could fire on the syscall that just finished.
 fn write_all_with_deadline<W: Write + DeadlineBoundedIo>(
     w: &mut W,
     mut buf: &[u8],
@@ -180,12 +192,6 @@ fn write_all_with_deadline<W: Write + DeadlineBoundedIo>(
             )));
         }
         buf = &buf[n..];
-        // 2026-08-04, @kiana, WIP audit (a) — see the identical note in
-        // `read_exact_with_deadline`: recheck immediately after EVERY
-        // syscall, including the final one that empties `buf`.
-        if deadline.is_expired() {
-            return Err(WireError::DeadlineExceeded);
-        }
     }
     Ok(())
 }
@@ -363,9 +369,6 @@ mod tests {
         fn arm_io_deadline(&mut self, _remaining: Duration) -> std::io::Result<()> {
             Ok(())
         }
-        fn clear_io_deadline(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
     }
 
     #[test]
@@ -436,9 +439,6 @@ mod tests {
         fn arm_io_deadline(&mut self, _remaining: Duration) -> std::io::Result<()> {
             Ok(())
         }
-        fn clear_io_deadline(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
     }
 
     #[test]
@@ -490,9 +490,6 @@ mod tests {
     impl DeadlineBoundedIo for ExpiresAfterNReads {
         fn arm_io_deadline(&mut self, _remaining: Duration) -> std::io::Result<()> {
             self.armed_count.set(self.armed_count.get() + 1);
-            Ok(())
-        }
-        fn clear_io_deadline(&mut self) -> std::io::Result<()> {
             Ok(())
         }
     }
@@ -556,9 +553,6 @@ mod tests {
             self.armed_count.set(self.armed_count.get() + 1);
             Ok(())
         }
-        fn clear_io_deadline(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
     }
 
     #[test]
@@ -607,9 +601,6 @@ mod tests {
         fn arm_io_deadline(&mut self, _remaining: Duration) -> std::io::Result<()> {
             Ok(())
         }
-        fn clear_io_deadline(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
     }
 
     #[test]
@@ -621,10 +612,19 @@ mod tests {
         assert!(matches!(err, WireError::DeadlineExceeded));
     }
 
-    /// Write-side symmetric case of
-    /// `red_single_read_syscall_racing_past_the_budget_and_returning_full_still_fails`.
-    struct SleepsPastBudgetThenWritesFull;
-    impl Write for SleepsPastBudgetThenWritesFull {
+    /// A write that only fully drains `buf` on its final syscall, and only
+    /// AFTER that syscall returns does the deadline actually expire (the
+    /// sleep happens strictly *before* the write, so the "budget expiring
+    /// during the syscall" scenario is deterministic, not a race) —
+    /// proves `write_all_with_deadline` treats a write that genuinely
+    /// completed as a terminal success, never retroactively failed
+    /// (2026-08-04, @kiana, definitive — corrects the earlier, wrong
+    /// expectation that this must fail; see the function's own doc for
+    /// why: the peer already has the bytes once this returns `Ok`, so
+    /// failing afterward would create exactly the split-brain this crate
+    /// avoids everywhere else).
+    struct SleepsThenWritesFullOnFinalSyscall;
+    impl Write for SleepsThenWritesFullOnFinalSyscall {
         fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
             std::thread::sleep(EXPIRING_BUDGET * 5);
             Ok(buf.len())
@@ -633,21 +633,25 @@ mod tests {
             Ok(())
         }
     }
-    impl DeadlineBoundedIo for SleepsPastBudgetThenWritesFull {
+    impl DeadlineBoundedIo for SleepsThenWritesFullOnFinalSyscall {
         fn arm_io_deadline(&mut self, _remaining: Duration) -> std::io::Result<()> {
-            Ok(())
-        }
-        fn clear_io_deadline(&mut self) -> std::io::Result<()> {
             Ok(())
         }
     }
 
     #[test]
-    fn red_single_write_syscall_racing_past_the_budget_and_writing_full_still_fails() {
+    fn red_write_that_completes_on_its_final_syscall_is_terminal_success_not_retroactive_failure() {
         let deadline = CeremonyDeadline::for_test(Instant::now(), EXPIRING_BUDGET);
-        let mut w = SleepsPastBudgetThenWritesFull;
-        let err = write_all_with_deadline(&mut w, b"ab", &deadline).unwrap_err();
-        assert!(matches!(err, WireError::DeadlineExceeded));
+        let mut w = SleepsThenWritesFullOnFinalSyscall;
+        // The sleep inside `write()` (5x the budget) guarantees the
+        // deadline is already expired by the time this call returns —
+        // yet the write itself fully succeeded, so the overall result
+        // must still be `Ok`.
+        write_all_with_deadline(&mut w, b"ab", &deadline).unwrap();
+        assert!(
+            deadline.is_expired(),
+            "the deadline must genuinely have expired during the sleep, or this test proves nothing"
+        );
     }
 
     /// `arm_io_deadline` failing (e.g. a real `setsockopt` rejecting the
@@ -662,9 +666,6 @@ mod tests {
     impl DeadlineBoundedIo for ArmingAlwaysFails {
         fn arm_io_deadline(&mut self, _remaining: Duration) -> std::io::Result<()> {
             Err(std::io::Error::other("simulated setsockopt failure"))
-        }
-        fn clear_io_deadline(&mut self) -> std::io::Result<()> {
-            Ok(())
         }
     }
 
@@ -706,9 +707,6 @@ mod tests {
                     "simulated setsockopt failure on a later syscall",
                 ))
             }
-        }
-        fn clear_io_deadline(&mut self) -> std::io::Result<()> {
-            Ok(())
         }
     }
 
