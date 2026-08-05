@@ -2806,13 +2806,13 @@ mod tests {
     // This loopback-only test observes Hyper draining the response body
     // during graceful shutdown. It goes through the shared choke-point
     // wrapper (`core_rs::product_a_phase0::serve`), not the raw `axum::serve`
-    // primitive: the phase0 gate permits `#[allow(clippy::disallowed_methods)]`
-    // in exactly one file (core-rs/src/product_a_phase0.rs), so a second
-    // occurrence here trips it and silently stops exercising the
-    // module-crossing negative control for the Product A boundary. The
-    // wrapper only intercepts `/api/v1/mobile/claw-vpn*` paths; this test's
-    // route is `/terminal`, so the swap does not change what the test
-    // observes.
+    // primitive: the phase0 gate permits the disallowed-clippy-method escape
+    // hatch in exactly one file (core-rs/src/product_a_phase0.rs), so a
+    // second file carrying that same escape hatch trips it and silently
+    // stops exercising the module-crossing negative control for the
+    // Product A boundary. The wrapper only intercepts
+    // `/api/v1/mobile/claw-vpn*` paths; this test's route is `/terminal`,
+    // so the swap does not change what the test observes.
     async fn signaled_response_survives_immediate_tcp_graceful_shutdown(
         status: StatusCode,
         body: Vec<u8>,
