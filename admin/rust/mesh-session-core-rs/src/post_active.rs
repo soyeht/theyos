@@ -153,6 +153,39 @@ pub(crate) fn decode_post_active_record(
 mod tests {
     use super::*;
 
+    // addendum §8 item 14 (2026-08-04, @kiana): non-vacuous proof that
+    // post-Active types never enter `AuthFrameBody`/`AuthFrame`/any K_mesh
+    // signing API. `static_assertions::assert_not_impl_any!` expands to a
+    // real trait-resolution check evaluated at normal compile time — if a
+    // later change ever made either type satisfy `AuthFrameBody`, this
+    // crate would stop compiling, not merely fail a runtime test. Neither
+    // `PostActiveRecord` nor `RekeyMarkerWire` is made `pub` to enable
+    // this — `static_assertions` runs inside this crate's own test
+    // compilation, which already sees every `pub(crate)` item, so no
+    // production visibility was widened to write this proof.
+    //
+    // Doubly true by construction, not just by this assertion:
+    // `AuthFrameBody: sealed::Sealed + Serialize` is a SEALED trait (see
+    // `auth_frames.rs`) — no type outside that module could implement it
+    // even by accident, regardless of `Serialize`. `PostActiveRecord`
+    // additionally doesn't even derive `Serialize` at all (it is never
+    // encoded directly — `encode_data_record`/`encode_close_record`/etc.
+    // build wire bytes by hand), so it fails both independent halves of
+    // the bound.
+    static_assertions::assert_not_impl_any!(
+        PostActiveRecord: crate::auth_frames::AuthFrameBody
+    );
+    static_assertions::assert_not_impl_any!(
+        RekeyMarkerWire: crate::auth_frames::AuthFrameBody
+    );
+    // `AuthFrame` itself is a closed enum over exactly the 5 sealed
+    // variants (see `auth_frames::AuthFrame`) with no `From`/`Into`
+    // conversion defined from anything in this module — asserting
+    // non-convertibility the same way, for both directions kiana asked
+    // about ("não entra em AuthFrameBody/AuthFrame").
+    static_assertions::assert_not_impl_any!(PostActiveRecord: Into<crate::auth_frames::AuthFrame>);
+    static_assertions::assert_not_impl_any!(RekeyMarkerWire: Into<crate::auth_frames::AuthFrame>);
+
     #[test]
     fn data_round_trips_exact_bytes() {
         let payload = b"hello mesh".to_vec();

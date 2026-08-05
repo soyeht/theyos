@@ -320,6 +320,14 @@ pub enum PostActiveError {
         "REKEY may only be emitted by this crate to immediately precede CLOSE while in the terminal Closing substate"
     )]
     RekeyOnlyAllowedBeforeClose,
+    /// 2026-08-04, @khai audit `d7e45e10…`: `send_data`/`receive_data` take
+    /// a `Clock` and re-sample it fresh after the guard is acquired,
+    /// exactly like the handshake's own `clock.now()` call sites — a
+    /// clock failure is treated identically to an expired lease (fail
+    /// closed, never assume freshness), but kept as its own variant so a
+    /// caller can distinguish "no reliable time source" from "time is up".
+    #[error(transparent)]
+    Intent(#[from] IntentError),
 }
 
 /// Errors from Noise session-static setup (item 2).

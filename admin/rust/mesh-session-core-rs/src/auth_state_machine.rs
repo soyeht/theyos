@@ -483,13 +483,16 @@ pub struct ActiveMeshSession<T, G> {
     /// §10) — computed once during the ceremony (see
     /// [`effective_expires_at`]) and carried here because v6 §10 requires
     /// expiry to be auth-off before EVERY DATA operation, not just a
-    /// point-in-time check during the handshake. `pub(crate)` accessor
-    /// only: DATA itself is still out of this module's scope (see the
-    /// module doc), so nothing here enforces `now < expires_at` on any
-    /// operation yet — a future guarded DATA path is structurally
-    /// obligated to check this alongside its gate before any syscall, but
-    /// that check does not exist in this crate today. May already be in
-    /// the past by the time this field is read — see `run_responder_handshake`'s/
+    /// point-in-time check during the handshake. **This check now exists**
+    /// (2026-08-04, post-Active wire addendum `b14fcf95…` §5, hardened
+    /// against @khai audit `d7e45e10…`'s BLOCKER): [`ActiveMeshSession::send_data`]/
+    /// [`ActiveMeshSession::receive_data`] both compare this field against
+    /// a freshly re-sampled [`crate::intent::Clock`] reading — taken after
+    /// the D1 guard is acquired, immediately before the write/copy, never
+    /// a caller-supplied scalar — before any DATA syscall. `pub(crate)`
+    /// accessor only: still no external, DATA-capable caller exists to
+    /// read it directly. May already be in the past by the time this
+    /// field is read at handshake completion — see `run_responder_handshake`'s/
     /// `run_initiator_handshake`'s own doc on why the ceremony deliberately
     /// does not re-fail if the terminal Ack write races past it.
     expires_at: u64,
@@ -502,6 +505,21 @@ pub struct ActiveMeshSession<T, G> {
     /// immediately with [`PostActiveError::Closed`] without touching the
     /// stream again; repetition/EOF cannot resurrect state (addendum §7).
     closed: bool,
+    /// `#[cfg(test)]`-only synchronization seam (2026-08-04, post-Active
+    /// wire addendum §8 item 8). Lets a test force a deterministic pause
+    /// strictly CPU-local, inside the D1-guarded copy in
+    /// `receive_data_inner`'s `Data` arm — AFTER the guard is acquired,
+    /// AFTER the buffer-size check, immediately BEFORE `copy_from_slice`
+    /// — so a concurrent `revoke_and_wait_for_drain`-style call can be
+    /// proven to block until this guard actually drops. This field and
+    /// its call site do not exist in a production build at all (`cfg`
+    /// strips them entirely, not merely guards them at runtime); the
+    /// production `receive_data`/`send_data` signatures never accept a
+    /// callback, sink, or closure of any kind — see
+    /// `red_receive_data_and_send_data_signatures_have_no_callback_parameter`
+    /// for a dedicated structural proof of that claim.
+    #[cfg(test)]
+    receive_before_copy_hook: Option<Box<dyn FnMut() + Send>>,
 }
 
 impl<T, G> ActiveMeshSession<T, G> {
@@ -521,8 +539,10 @@ impl<T, G> ActiveMeshSession<T, G> {
         &self.ingress_evidence
     }
     /// `pub(crate)` (2026-08-04, @kiana, WIP audit point A, v6 §10) —
-    /// see the field's own doc. Not `pub`: no external, DATA-capable
-    /// caller exists yet to consult this against a trusted clock.
+    /// see the field's own doc: [`ActiveMeshSession::send_data`]/
+    /// [`ActiveMeshSession::receive_data`] consult this against a freshly
+    /// re-sampled [`crate::intent::Clock`] reading. Not `pub`: no
+    /// external caller exists yet outside this crate.
     pub(crate) fn expires_at(&self) -> u64 {
         self.expires_at
     }
@@ -703,6 +723,13 @@ impl<T: Read + Write + wire::DeadlineBoundedIo, G: ActiveGateAuthorization>
         self.closed
     }
 
+    /// `#[cfg(test)]`-only — see [`Self`]'s `receive_before_copy_hook`
+    /// field doc. Not reachable from any production build.
+    #[cfg(test)]
+    pub(crate) fn set_receive_before_copy_hook<F: FnMut() + Send + 'static>(&mut self, hook: F) {
+        self.receive_before_copy_hook = Some(Box::new(hook));
+    }
+
     /// addendum §6: control-plane, no D1 guard. Bound to the exact
     /// `SendMarkerPermit` `before_send_marker` issued — commits via the
     /// already-existing, already-audited `commit_outgoing_rekey` (couples
@@ -728,27 +755,39 @@ impl<T: Read + Write + wire::DeadlineBoundedIo, G: ActiveGateAuthorization>
     /// holding the D1 forwarding guard for the entire write. Any failure —
     /// including a marker write failure, a denied guard, or expiry —
     /// closes the session; there is no partial/retryable state.
-    pub fn send_data(
+    ///
+    /// **`clock` is re-sampled, never a caller scalar (2026-08-04, @khai
+    /// audit `d7e45e10…`, BLOCKER):** an earlier revision of this method
+    /// took `now: u64` — a value the caller necessarily sampled *before*
+    /// this call, including before the marker's own blocking write when
+    /// one is due. That let the expiry decision use a reading taken before
+    /// a real network write, exactly the staleness addendum §5's
+    /// "reamostrar" (re-sample) wording forbids. `clock.now()` is now
+    /// called fresh, *after* the marker (if any) and *after* the guard is
+    /// acquired, immediately before the write — matching `Clock`'s own
+    /// contract of "never cached, called again at each checkpoint"
+    /// (`intent.rs`).
+    pub fn send_data<C: crate::intent::Clock>(
         &mut self,
         payload: &[u8],
         budget: Duration,
-        now: u64,
+        clock: &C,
     ) -> Result<(), PostActiveError> {
         if self.closed {
             return Err(PostActiveError::Closed);
         }
-        let result = self.send_data_inner(payload, budget, now);
+        let result = self.send_data_inner(payload, budget, clock);
         if result.is_err() {
             self.closed = true;
         }
         result
     }
 
-    fn send_data_inner(
+    fn send_data_inner<C: crate::intent::Clock>(
         &mut self,
         payload: &[u8],
         budget: Duration,
-        now: u64,
+        clock: &C,
     ) -> Result<(), PostActiveError> {
         let permit = match self.rekey.tx().before_send_non_marker() {
             Ok(permit) => permit,
@@ -762,6 +801,7 @@ impl<T: Read + Write + wire::DeadlineBoundedIo, G: ActiveGateAuthorization>
             .gate
             .try_authorize()
             .ok_or(PostActiveError::NotAuthorized)?;
+        let now = clock.now()?;
         if now >= self.expires_at {
             return Err(PostActiveError::Expired);
         }
@@ -790,27 +830,33 @@ impl<T: Read + Write + wire::DeadlineBoundedIo, G: ActiveGateAuthorization>
     /// closes the session and copies zero bytes (addendum §5: "Se o guard
     /// falha ou o buffer é pequeno, nenhum byte é copiado; descartar e
     /// fechar").
-    pub fn receive_data(
+    ///
+    /// **`clock` is re-sampled, never a caller scalar** — see
+    /// [`Self::send_data`]'s doc for the full rationale (@khai audit
+    /// `d7e45e10…`). Here the fresh `clock.now()` call happens *after* the
+    /// blocking read/decrypt and *after* the guard is acquired, immediately
+    /// before the copy into `buffer` — never before either.
+    pub fn receive_data<C: crate::intent::Clock>(
         &mut self,
         buffer: &mut [u8],
         budget: Duration,
-        now: u64,
+        clock: &C,
     ) -> Result<usize, PostActiveError> {
         if self.closed {
             return Err(PostActiveError::Closed);
         }
-        let result = self.receive_data_inner(buffer, budget, now);
+        let result = self.receive_data_inner(buffer, budget, clock);
         if result.is_err() {
             self.closed = true;
         }
         result
     }
 
-    fn receive_data_inner(
+    fn receive_data_inner<C: crate::intent::Clock>(
         &mut self,
         buffer: &mut [u8],
         budget: Duration,
-        now: u64,
+        clock: &C,
     ) -> Result<usize, PostActiveError> {
         loop {
             let deadline = OperationDeadline::new(budget).ok_or(PostActiveError::Expired)?;
@@ -846,6 +892,7 @@ impl<T: Read + Write + wire::DeadlineBoundedIo, G: ActiveGateAuthorization>
                         .gate
                         .try_authorize()
                         .ok_or(PostActiveError::NotAuthorized)?;
+                    let now = clock.now()?;
                     if now >= self.expires_at {
                         return Err(PostActiveError::Expired);
                     }
@@ -854,6 +901,10 @@ impl<T: Read + Write + wire::DeadlineBoundedIo, G: ActiveGateAuthorization>
                             buffer_len: buffer.len(),
                             payload_len: payload.len(),
                         });
+                    }
+                    #[cfg(test)]
+                    if let Some(hook) = self.receive_before_copy_hook.as_mut() {
+                        hook();
                     }
                     buffer[..payload.len()].copy_from_slice(&payload);
                     drop(guard);
@@ -1400,6 +1451,8 @@ where
         gate,
         expires_at,
         closed: false,
+        #[cfg(test)]
+        receive_before_copy_hook: None,
     })
 }
 
@@ -1725,6 +1778,8 @@ where
         gate,
         expires_at,
         closed: false,
+        #[cfg(test)]
+        receive_before_copy_hook: None,
     })
 }
 
@@ -5091,6 +5146,372 @@ mod tests {
         )
     }
 
+    // ---- @khai audit d7e45e10… BLOCKER fix: clock is re-sampled fresh,
+    // never a caller scalar (post-Active wire addendum §5, "reamostrar") ----
+
+    /// A clock double whose reading the test can flip at runtime
+    /// (2026-08-04, @khai audit `d7e45e10…` BLOCKER fix). Shared via
+    /// `Clone` (cheap `Arc` clone) so the session's injected `&C` and the
+    /// test's own handle observe the SAME underlying value.
+    #[derive(Clone)]
+    struct MutableClock(std::sync::Arc<std::sync::atomic::AtomicU64>);
+    impl MutableClock {
+        fn new(initial: u64) -> Self {
+            Self(std::sync::Arc::new(std::sync::atomic::AtomicU64::new(
+                initial,
+            )))
+        }
+        fn set(&self, value: u64) {
+            self.0.store(value, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+    impl crate::intent::Clock for MutableClock {
+        fn now(&self) -> Result<u64, crate::error::IntentError> {
+            Ok(self.0.load(std::sync::atomic::Ordering::SeqCst))
+        }
+    }
+
+    /// Flips a `MutableClock` the instant the wrapped stream's raw
+    /// read/write call count reaches a runtime-armed target — a
+    /// deterministic, single-threaded "rendezvous": the flip is a direct
+    /// causal consequence of one specific syscall completing, not a sleep
+    /// or a real thread race. `arm(n, flip_to)` is called by the test
+    /// AFTER the handshake completes (whose own raw call count this
+    /// struct does not need to know or hard-code — it counts relative to
+    /// whatever the call count already is) and BEFORE the one post-Active
+    /// call under test, so `n` only has to describe that single call's own
+    /// raw-syscall shape: 2 per logical record (length-prefix, then
+    /// body) — the same model `FailWriteFromCall` already documents for
+    /// writes, symmetric for reads since both go through
+    /// `read_exact_with_deadline`/`write_all_with_deadline`, one syscall
+    /// per frame piece on a healthy loopback with small buffers.
+    struct ClockFlipTrigger {
+        calls: std::sync::atomic::AtomicUsize,
+        trigger_at: std::sync::atomic::AtomicUsize,
+        flip_to: std::sync::atomic::AtomicU64,
+        clock: MutableClock,
+    }
+    impl ClockFlipTrigger {
+        fn new(clock: MutableClock) -> Self {
+            Self {
+                calls: std::sync::atomic::AtomicUsize::new(0),
+                trigger_at: std::sync::atomic::AtomicUsize::new(usize::MAX),
+                flip_to: std::sync::atomic::AtomicU64::new(0),
+                clock,
+            }
+        }
+        fn arm(&self, n: usize, flip_to: u64) {
+            self.flip_to
+                .store(flip_to, std::sync::atomic::Ordering::SeqCst);
+            let current = self.calls.load(std::sync::atomic::Ordering::SeqCst);
+            self.trigger_at
+                .store(current + n, std::sync::atomic::Ordering::SeqCst);
+        }
+        fn tick(&self) {
+            let call_number = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+            if call_number == self.trigger_at.load(std::sync::atomic::Ordering::SeqCst) {
+                self.clock
+                    .set(self.flip_to.load(std::sync::atomic::Ordering::SeqCst));
+            }
+        }
+    }
+
+    /// Flips the trigger's clock the instant a raw `.write()` call
+    /// completes — proves `send_data`'s fresh `clock.now()` reflects time
+    /// that "passed" during a due marker's own write, not a reading taken
+    /// before it.
+    struct ClockFlipOnWriteStream {
+        inner: TcpStream,
+        trigger: std::sync::Arc<ClockFlipTrigger>,
+    }
+    impl Read for ClockFlipOnWriteStream {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            self.inner.read(buf)
+        }
+    }
+    impl Write for ClockFlipOnWriteStream {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            let n = self.inner.write(buf)?;
+            self.trigger.tick();
+            Ok(n)
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            self.inner.flush()
+        }
+    }
+    impl wire::DeadlineBoundedIo for ClockFlipOnWriteStream {
+        fn arm_io_deadline(&mut self, remaining: Duration) -> std::io::Result<()> {
+            self.inner.arm_io_deadline(remaining)
+        }
+    }
+
+    /// Flips the trigger's clock the instant a raw `.read()` call
+    /// completes — proves `receive_data`'s fresh `clock.now()` reflects
+    /// time that "passed" during the blocking read/decrypt, not a reading
+    /// taken before it.
+    struct ClockFlipOnReadStream {
+        inner: TcpStream,
+        trigger: std::sync::Arc<ClockFlipTrigger>,
+    }
+    impl Read for ClockFlipOnReadStream {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            let n = self.inner.read(buf)?;
+            self.trigger.tick();
+            Ok(n)
+        }
+    }
+    impl Write for ClockFlipOnReadStream {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.inner.write(buf)
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            self.inner.flush()
+        }
+    }
+    impl wire::DeadlineBoundedIo for ClockFlipOnReadStream {
+        fn arm_io_deadline(&mut self, remaining: Duration) -> std::io::Result<()> {
+            self.inner.arm_io_deadline(remaining)
+        }
+    }
+
+    /// Same shape as `full_handshake_with_gate()`, but the INITIATOR's
+    /// stream is wrapped by the caller-supplied `wrap` closure (the
+    /// responder side is untouched: plain `TcpStream`, spawned thread).
+    /// `clock` drives both the initiator's own handshake-time
+    /// `effective_expires_at` check and, when reused by the caller for the
+    /// post-Active calls under test, the same freshness check this whole
+    /// section exists to prove.
+    fn full_handshake_with_gate_and_wrapped_initiator<W, F>(
+        clock: &MutableClock,
+        wrap: F,
+    ) -> (
+        ActiveMeshSession<W, std::sync::Arc<TestGate>>,
+        GatedSession,
+        std::sync::Arc<TestGate>,
+        std::sync::Arc<TestGate>,
+    )
+    where
+        W: Read + Write + wire::DeadlineBoundedIo,
+        F: FnOnce(TcpStream) -> W,
+    {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let responder_key = SigningKey::random(&mut OsRng);
+        let responder_verifying = VerifyingKey::from(&responder_key);
+        let initiator_key = SigningKey::random(&mut OsRng);
+        let initiator_verifying = VerifyingKey::from(&initiator_key);
+
+        let responder_delegation = delegation_for_key(
+            &responder_verifying,
+            "hh-1",
+            "responder-1",
+            vec![0xCC; 32],
+            0,
+            u64::MAX / 2,
+        );
+        let responder_identity =
+            identity("hh-1", "responder-1", vec![0xCC; 32], responder_delegation);
+
+        let initiator_resolver = FixedResolver {
+            delegated_pub: initiator_verifying
+                .to_encoded_point(true)
+                .as_bytes()
+                .to_vec(),
+            generation: 1,
+            not_after: u64::MAX / 2,
+        };
+        let responder_gate = TestGate::new();
+        let initiator_gate = TestGate::new();
+
+        let responder = thread::spawn({
+            let checkpoint = fixed_checkpoint();
+            let k_mesh = TestKMesh(responder_key);
+            let d1 = GatedD1 {
+                gate: std::sync::Arc::clone(&responder_gate),
+            };
+            move || {
+                let (sock, _) = listener.accept().unwrap();
+                let ingress = PrevalidatedIngress::admit_at_accept(
+                    sock,
+                    IngressEvidence {
+                        observed_at: 1,
+                        ingress_expiry: u64::MAX / 2,
+                    },
+                    far_future_budget(),
+                );
+                run_responder_handshake(
+                    ingress,
+                    &responder_identity,
+                    &checkpoint,
+                    ExpectedChannel::Dev,
+                    &DelegationPolicy::test(u64::MAX / 2),
+                    &AlwaysAcceptDelegation,
+                    &k_mesh,
+                    &InMemoryLedger::new(),
+                    &d1,
+                    &FixedClock(0),
+                    &initiator_resolver,
+                    u64::MAX / 2,
+                    RekeyThreshold::new(3).unwrap(),
+                )
+                .unwrap()
+            }
+        });
+
+        let initiator_delegation = delegation_for_key(
+            &initiator_verifying,
+            "hh-1",
+            "initiator-1",
+            vec![0xEE; 32],
+            0,
+            u64::MAX / 2,
+        );
+        let initiator_identity =
+            identity("hh-1", "initiator-1", vec![0xEE; 32], initiator_delegation);
+        let sock = TcpStream::connect(addr).unwrap();
+        let wrapped = wrap(sock);
+        let ingress = PrevalidatedIngress::admit_at_accept(
+            wrapped,
+            IngressEvidence {
+                observed_at: 2,
+                ingress_expiry: u64::MAX / 2,
+            },
+            far_future_budget(),
+        );
+        let k_mesh = TestKMesh(initiator_key);
+        let pending_intent = pending_intent_for(
+            &k_mesh,
+            &initiator_identity,
+            &fixed_checkpoint(),
+            "responder-1",
+            vec![0xCC; 32],
+            [0xB7; 32],
+            u64::MAX / 2,
+            ExpectedChannel::Dev,
+        );
+        let initiator_d1 = GatedD1 {
+            gate: std::sync::Arc::clone(&initiator_gate),
+        };
+        let initiator_session = run_initiator_handshake(
+            ingress,
+            pending_intent,
+            &initiator_identity,
+            &fixed_checkpoint(),
+            ExpectedChannel::Dev,
+            &DelegationPolicy::test(u64::MAX / 2),
+            &AlwaysAcceptDelegation,
+            &k_mesh,
+            &initiator_d1,
+            clock,
+            u64::MAX / 2,
+            RekeyThreshold::new(3).unwrap(),
+        )
+        .unwrap();
+
+        let responder_session = responder.join().unwrap();
+        (
+            initiator_session,
+            responder_session,
+            initiator_gate,
+            responder_gate,
+        )
+    }
+
+    /// @khai audit `d7e45e10…` BLOCKER fix, RED 1/2: `send_data`'s
+    /// `clock.now()` must reflect time that passed DURING a due marker's
+    /// own write, not a reading taken before it. The clock flips to an
+    /// already-expired value the instant the marker's own raw write
+    /// completes (deterministic single-threaded rendezvous, no sleep);
+    /// `send_data` must still reject with `Expired`, and the DATA record
+    /// itself must never be written — the raw write-call count must freeze
+    /// at exactly the marker's own 2 calls.
+    #[test]
+    fn red_send_data_clock_advances_during_marker_write_rejects_before_data_is_sent() {
+        let clock = MutableClock::new(0);
+        let trigger = std::sync::Arc::new(ClockFlipTrigger::new(clock.clone()));
+        let (mut initiator, _responder, _ig, _rg) = {
+            let trigger = std::sync::Arc::clone(&trigger);
+            full_handshake_with_gate_and_wrapped_initiator(&clock, move |sock| {
+                ClockFlipOnWriteStream {
+                    inner: sock,
+                    trigger,
+                }
+            })
+        };
+
+        let expires_at = initiator.expires_at();
+
+        // Drive N-1 = 2 ordinary DATA sends (threshold=3) so the 3rd send
+        // owes a marker. Not yet armed, so these cannot spuriously flip
+        // the clock no matter how many raw writes the handshake itself used.
+        for i in 0..2u8 {
+            initiator.send_data(&[i], OP_BUDGET, &clock).unwrap();
+        }
+
+        // Arm relative to the CURRENT call count: the marker's own write
+        // is exactly 2 raw calls (prefix, body) — flip the instant the
+        // 2nd of those completes, i.e. immediately after the marker is
+        // fully on the wire but before `send_data_inner` re-samples the
+        // clock for the DATA record that follows it.
+        trigger.arm(2, expires_at);
+        let calls_before = trigger.calls.load(std::sync::atomic::Ordering::SeqCst);
+
+        let err = initiator.send_data(b"late", OP_BUDGET, &clock).unwrap_err();
+        assert!(matches!(err, PostActiveError::Expired));
+        assert!(initiator.is_closed());
+        assert_eq!(
+            trigger.calls.load(std::sync::atomic::Ordering::SeqCst) - calls_before,
+            2,
+            "only the marker's own 2 raw writes should have happened — \
+             the DATA record must never be sent once the fresh clock \
+             reading rejects the operation"
+        );
+    }
+
+    /// @khai audit `d7e45e10…` BLOCKER fix, RED 2/2: `receive_data`'s
+    /// `clock.now()` must reflect time that passed DURING the blocking
+    /// read/decrypt, not a reading taken before it. The clock flips to an
+    /// already-expired value the instant the DATA record's own raw read
+    /// completes; `receive_data` must still reject with `Expired`, and the
+    /// caller's buffer — pre-filled with a sentinel pattern — must be
+    /// provably untouched (addendum §5: a rejected operation copies zero
+    /// bytes).
+    #[test]
+    fn red_receive_data_clock_advances_during_read_rejects_and_leaves_buffer_untouched() {
+        let clock = MutableClock::new(0);
+        let trigger = std::sync::Arc::new(ClockFlipTrigger::new(clock.clone()));
+        let (mut initiator, mut responder, _ig, _rg) = {
+            let trigger = std::sync::Arc::clone(&trigger);
+            full_handshake_with_gate_and_wrapped_initiator(&clock, move |sock| {
+                ClockFlipOnReadStream {
+                    inner: sock,
+                    trigger,
+                }
+            })
+        };
+
+        let expires_at = initiator.expires_at();
+        responder
+            .send_data(b"0123456789", OP_BUDGET, &FixedClock(0))
+            .unwrap();
+
+        // The DATA record is exactly 2 raw reads (length-prefix, body) —
+        // flip the instant the body's own read completes, i.e. right
+        // after the plaintext is fully decrypted but before
+        // `receive_data_inner` re-samples the clock for the delivery
+        // decision.
+        trigger.arm(2, expires_at);
+
+        let mut buf = [0xAAu8; 16];
+        let err = initiator
+            .receive_data(&mut buf, OP_BUDGET, &clock)
+            .unwrap_err();
+        assert!(matches!(err, PostActiveError::Expired));
+        assert!(initiator.is_closed());
+        assert_eq!(buf, [0xAAu8; 16], "buffer must be untouched on rejection");
+    }
+
     const FAR_FUTURE_NOW: u64 = 0;
     const OP_BUDGET: Duration = Duration::from_secs(5);
 
@@ -5107,10 +5528,10 @@ mod tests {
         for i in 0..4u8 {
             let payload = [i; 4];
             initiator
-                .send_data(&payload, OP_BUDGET, FAR_FUTURE_NOW)
+                .send_data(&payload, OP_BUDGET, &FixedClock(FAR_FUTURE_NOW))
                 .unwrap();
             let n = responder
-                .receive_data(&mut buf, OP_BUDGET, FAR_FUTURE_NOW)
+                .receive_data(&mut buf, OP_BUDGET, &FixedClock(FAR_FUTURE_NOW))
                 .unwrap();
             assert_eq!(&buf[..n], &payload);
         }
@@ -5120,10 +5541,10 @@ mod tests {
         for i in 0..4u8 {
             let payload = [0x80 + i; 4];
             responder
-                .send_data(&payload, OP_BUDGET, FAR_FUTURE_NOW)
+                .send_data(&payload, OP_BUDGET, &FixedClock(FAR_FUTURE_NOW))
                 .unwrap();
             let n = initiator
-                .receive_data(&mut buf, OP_BUDGET, FAR_FUTURE_NOW)
+                .receive_data(&mut buf, OP_BUDGET, &FixedClock(FAR_FUTURE_NOW))
                 .unwrap();
             assert_eq!(&buf[..n], &payload);
         }
@@ -5141,13 +5562,13 @@ mod tests {
         let (mut initiator, _responder, initiator_gate, _rg) = full_handshake_with_gate();
         initiator_gate.revoke();
         let err = initiator
-            .send_data(b"hello", OP_BUDGET, FAR_FUTURE_NOW)
+            .send_data(b"hello", OP_BUDGET, &FixedClock(FAR_FUTURE_NOW))
             .unwrap_err();
         assert!(matches!(err, PostActiveError::NotAuthorized));
         assert!(initiator.is_closed());
         // Idempotent: a second call fails closed without touching the gate again.
         let err2 = initiator
-            .send_data(b"hello", OP_BUDGET, FAR_FUTURE_NOW)
+            .send_data(b"hello", OP_BUDGET, &FixedClock(FAR_FUTURE_NOW))
             .unwrap_err();
         assert!(matches!(err2, PostActiveError::Closed));
     }
@@ -5160,7 +5581,7 @@ mod tests {
         let (mut initiator, _responder, _ig, _rg) = full_handshake_with_gate();
         let expires_at = initiator.expires_at();
         let err = initiator
-            .send_data(b"hello", OP_BUDGET, expires_at)
+            .send_data(b"hello", OP_BUDGET, &FixedClock(expires_at))
             .unwrap_err();
         assert!(matches!(err, PostActiveError::Expired));
         assert!(initiator.is_closed());
@@ -5174,11 +5595,11 @@ mod tests {
         let (mut initiator, mut responder, _ig, _rg) = full_handshake_with_gate();
         let expires_at = initiator.expires_at();
         initiator
-            .send_data(b"hi", OP_BUDGET, expires_at - 1)
+            .send_data(b"hi", OP_BUDGET, &FixedClock(expires_at - 1))
             .unwrap();
         let mut buf = [0u8; 8];
         let n = responder
-            .receive_data(&mut buf, OP_BUDGET, expires_at - 1)
+            .receive_data(&mut buf, OP_BUDGET, &FixedClock(expires_at - 1))
             .unwrap();
         assert_eq!(&buf[..n], b"hi");
         assert!(!initiator.is_closed());
@@ -5195,7 +5616,7 @@ mod tests {
 
         let mut buf = [0u8; 8];
         let err = responder
-            .receive_data(&mut buf, OP_BUDGET, FAR_FUTURE_NOW)
+            .receive_data(&mut buf, OP_BUDGET, &FixedClock(FAR_FUTURE_NOW))
             .unwrap_err();
         assert!(matches!(err, PostActiveError::PeerClosed));
         assert!(responder.is_closed());
@@ -5207,7 +5628,7 @@ mod tests {
         initiator.close_gracefully(OP_BUDGET).unwrap();
         let mut buf = [0u8; 8];
         let err = initiator
-            .receive_data(&mut buf, OP_BUDGET, FAR_FUTURE_NOW)
+            .receive_data(&mut buf, OP_BUDGET, &FixedClock(FAR_FUTURE_NOW))
             .unwrap_err();
         assert!(matches!(err, PostActiveError::Closed));
     }
@@ -5220,7 +5641,7 @@ mod tests {
 
         let mut buf = [0u8; 8];
         let err = responder
-            .receive_data(&mut buf, OP_BUDGET, FAR_FUTURE_NOW)
+            .receive_data(&mut buf, OP_BUDGET, &FixedClock(FAR_FUTURE_NOW))
             .unwrap_err();
         assert!(matches!(err, PostActiveError::PeerRevoked));
         assert!(responder.is_closed());
@@ -5233,11 +5654,11 @@ mod tests {
     fn red_receive_data_buffer_too_small_closes_and_copies_nothing() {
         let (mut initiator, mut responder, _ig, _rg) = full_handshake_with_gate();
         initiator
-            .send_data(b"0123456789", OP_BUDGET, FAR_FUTURE_NOW)
+            .send_data(b"0123456789", OP_BUDGET, &FixedClock(FAR_FUTURE_NOW))
             .unwrap();
         let mut tiny = [0xAAu8; 4];
         let err = responder
-            .receive_data(&mut tiny, OP_BUDGET, FAR_FUTURE_NOW)
+            .receive_data(&mut tiny, OP_BUDGET, &FixedClock(FAR_FUTURE_NOW))
             .unwrap_err();
         assert!(matches!(
             err,
@@ -5263,11 +5684,11 @@ mod tests {
         // Drive N-1 = 2 ordinary DATA records the normal way first.
         for i in 0..2u8 {
             initiator
-                .send_data(&[i], OP_BUDGET, FAR_FUTURE_NOW)
+                .send_data(&[i], OP_BUDGET, &FixedClock(FAR_FUTURE_NOW))
                 .unwrap();
             let mut buf = [0u8; 8];
             responder
-                .receive_data(&mut buf, OP_BUDGET, FAR_FUTURE_NOW)
+                .receive_data(&mut buf, OP_BUDGET, &FixedClock(FAR_FUTURE_NOW))
                 .unwrap();
         }
         // Now policy_count == threshold-1 == 2 on both sides. Hand-craft
@@ -5288,12 +5709,675 @@ mod tests {
 
         let mut buf = [0u8; 8];
         let err = responder
-            .receive_data(&mut buf, OP_BUDGET, FAR_FUTURE_NOW)
+            .receive_data(&mut buf, OP_BUDGET, &FixedClock(FAR_FUTURE_NOW))
             .unwrap_err();
         assert!(matches!(
             err,
             PostActiveError::Rekey(crate::error::RekeyError::ExpectedRekeyMarker)
         ));
         assert!(responder.is_closed());
+    }
+
+    // ---- addendum §8 item 7: revoke racing an in-flight receive_data ----
+
+    /// addendum §8 item 7: a REVOKE announced while `receive_data`'s
+    /// read/decrypt is genuinely in flight — no bytes even exist on the
+    /// wire for it to read yet — still correctly fails the operation once
+    /// the read completes: `try_authorize()` runs fresh, AFTER decrypt,
+    /// and by then observes the revocation. Buffer intact, session closes.
+    ///
+    /// **Forced interleaving, not a race.** A `Barrier` makes the receiver
+    /// thread enter `receive_data` before this thread proceeds; from
+    /// there, `revoke()` and the DATA write both happen on THIS thread,
+    /// strictly in that order — and TCP's blocking-read semantics
+    /// guarantee the receiver thread cannot return from
+    /// `read_transport_record` until those exact bytes exist. So the
+    /// revoke is unconditionally complete, in real memory-visible terms
+    /// (`SeqCst`), before the read can possibly unblock: there is no
+    /// window in which the outcome depends on scheduler timing.
+    #[test]
+    fn red_revoke_while_receive_in_flight_final_authorization_fails_buffer_intact() {
+        let (mut initiator, mut responder, _ig, responder_gate) = full_handshake_with_gate();
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+
+        let receiver = thread::spawn({
+            let barrier = std::sync::Arc::clone(&barrier);
+            move || {
+                let mut buf = [0xAAu8; 16];
+                barrier.wait();
+                let result = responder.receive_data(&mut buf, OP_BUDGET, &FixedClock(0));
+                (result, buf, responder)
+            }
+        });
+
+        barrier.wait();
+        // At this point the receiver thread has entered `receive_data`
+        // and is blocked in `read_transport_record` — no bytes exist yet,
+        // since the write below has not happened. Revoke first, THEN
+        // write: the read cannot return before this write, so it cannot
+        // observe anything but the already-revoked gate.
+        responder_gate.revoke();
+        initiator
+            .send_data(b"0123456789", OP_BUDGET, &FixedClock(0))
+            .unwrap();
+
+        let (result, buf, responder) = receiver.join().unwrap();
+        let err = result.unwrap_err();
+        assert!(matches!(err, PostActiveError::NotAuthorized));
+        assert_eq!(
+            buf, [0xAAu8; 16],
+            "buffer must be byte-for-byte intact — the guard failed before any copy"
+        );
+        assert!(responder.is_closed());
+    }
+
+    // ---- addendum §8 item 8: real blocking guard + no-callback proof ----
+
+    /// A real blocking-guard synchronization double, modeled directly on
+    /// the household `SessionSync`/`ForwardingGuard` (verified earlier
+    /// this engagement by reading `mesh_session_registry.rs`): a
+    /// lock-protected `authorized` bit plus an `active_readers` counter
+    /// and a `Condvar` a revoker waits on until it reaches zero.
+    /// `TestGate`'s plain `AtomicBool` cannot express this at all —
+    /// nothing there can block a revoke behind an in-flight guard — which
+    /// is exactly why item 7 (a `TestGate` is authorized/not at the
+    /// instant it's checked, no window to hold) did not need this double
+    /// but item 8 does.
+    struct BlockingGateState {
+        authorized: bool,
+        active_readers: usize,
+    }
+    struct BlockingGate {
+        state: std::sync::Mutex<BlockingGateState>,
+        drained: std::sync::Condvar,
+    }
+    impl BlockingGate {
+        fn new() -> std::sync::Arc<Self> {
+            std::sync::Arc::new(Self {
+                state: std::sync::Mutex::new(BlockingGateState {
+                    authorized: true,
+                    active_readers: 0,
+                }),
+                drained: std::sync::Condvar::new(),
+            })
+        }
+        /// Matches the real `SessionSync::revoke`'s wait-for-drain
+        /// contract exactly: withdraws authorization first (so no NEW
+        /// guard can be acquired from this point on), then blocks until
+        /// every already-issued guard has dropped.
+        fn revoke_and_wait_for_drain(&self) {
+            self.revoke_and_wait_for_drain_with_hook(|| {});
+        }
+        /// Test-only extension point: `before_wait` fires exactly once
+        /// per loop iteration, synchronously on THIS thread, immediately
+        /// before the actual blocking `Condvar::wait` call — i.e. only
+        /// once it's confirmed `active_readers != 0` and this call is
+        /// genuinely about to block. A test can observe "the revoker has
+        /// reached the point of blocking" with no race against it,
+        /// because nothing on this thread can proceed past this specific
+        /// point except by actually calling (and being woken from)
+        /// `.wait()` — there is no path from "before_wait ran" to
+        /// "the function returned" that skips the wait.
+        fn revoke_and_wait_for_drain_with_hook(&self, mut before_wait: impl FnMut()) {
+            let mut guard = self.state.lock().unwrap();
+            guard.authorized = false;
+            while guard.active_readers != 0 {
+                before_wait();
+                guard = self.drained.wait(guard).unwrap();
+            }
+        }
+    }
+    struct BlockingGateGuard {
+        gate: std::sync::Arc<BlockingGate>,
+    }
+    impl Drop for BlockingGateGuard {
+        fn drop(&mut self) {
+            let mut state = self.gate.state.lock().unwrap();
+            state.active_readers -= 1;
+            if state.active_readers == 0 {
+                self.gate.drained.notify_all();
+            }
+        }
+    }
+    impl ActiveGateAuthorization for std::sync::Arc<BlockingGate> {
+        type Guard<'a> = BlockingGateGuard;
+        fn try_authorize(&self) -> Option<BlockingGateGuard> {
+            let mut state = self.state.lock().unwrap();
+            if state.authorized {
+                state.active_readers += 1;
+                Some(BlockingGateGuard {
+                    gate: std::sync::Arc::clone(self),
+                })
+            } else {
+                None
+            }
+        }
+    }
+
+    struct BlockingGatedD1 {
+        gate: std::sync::Arc<BlockingGate>,
+    }
+    struct BlockingGatedPending {
+        gate: std::sync::Arc<BlockingGate>,
+    }
+    impl crate::intent::D1Pending<std::sync::Arc<BlockingGate>> for BlockingGatedPending {
+        fn commit_after_ack(self) -> std::sync::Arc<BlockingGate> {
+            self.gate
+        }
+        fn cancel_before_ack(self) -> crate::intent::D1CancelOutcome {
+            crate::intent::D1CancelOutcome::CancelledAndRemoved
+        }
+    }
+    impl crate::intent::D1Admission for BlockingGatedD1 {
+        type Pending<'a> = BlockingGatedPending;
+        type Active<'a> = std::sync::Arc<BlockingGate>;
+        fn reserve_pending<'a>(
+            &'a self,
+            _key: &crate::intent::D1MembershipKey,
+            _deadline: &CeremonyDeadline,
+        ) -> Result<Self::Pending<'a>, crate::error::IntentError> {
+            Ok(BlockingGatedPending {
+                gate: std::sync::Arc::clone(&self.gate),
+            })
+        }
+    }
+
+    type BlockingGatedSession = ActiveMeshSession<TcpStream, std::sync::Arc<BlockingGate>>;
+
+    /// Same shape as `full_handshake_with_gate()`, but both sides use
+    /// `BlockingGate` instead of `TestGate`.
+    fn full_handshake_with_blocking_gate() -> (
+        BlockingGatedSession,
+        BlockingGatedSession,
+        std::sync::Arc<BlockingGate>,
+        std::sync::Arc<BlockingGate>,
+    ) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let responder_key = SigningKey::random(&mut OsRng);
+        let responder_verifying = VerifyingKey::from(&responder_key);
+        let initiator_key = SigningKey::random(&mut OsRng);
+        let initiator_verifying = VerifyingKey::from(&initiator_key);
+
+        let responder_delegation = delegation_for_key(
+            &responder_verifying,
+            "hh-1",
+            "responder-1",
+            vec![0xCC; 32],
+            0,
+            u64::MAX / 2,
+        );
+        let responder_identity =
+            identity("hh-1", "responder-1", vec![0xCC; 32], responder_delegation);
+
+        let initiator_resolver = FixedResolver {
+            delegated_pub: initiator_verifying
+                .to_encoded_point(true)
+                .as_bytes()
+                .to_vec(),
+            generation: 1,
+            not_after: u64::MAX / 2,
+        };
+        let responder_gate = BlockingGate::new();
+        let initiator_gate = BlockingGate::new();
+
+        let responder = thread::spawn({
+            let checkpoint = fixed_checkpoint();
+            let k_mesh = TestKMesh(responder_key);
+            let d1 = BlockingGatedD1 {
+                gate: std::sync::Arc::clone(&responder_gate),
+            };
+            move || {
+                let (sock, _) = listener.accept().unwrap();
+                let ingress = PrevalidatedIngress::admit_at_accept(
+                    sock,
+                    IngressEvidence {
+                        observed_at: 1,
+                        ingress_expiry: u64::MAX / 2,
+                    },
+                    far_future_budget(),
+                );
+                run_responder_handshake(
+                    ingress,
+                    &responder_identity,
+                    &checkpoint,
+                    ExpectedChannel::Dev,
+                    &DelegationPolicy::test(u64::MAX / 2),
+                    &AlwaysAcceptDelegation,
+                    &k_mesh,
+                    &InMemoryLedger::new(),
+                    &d1,
+                    &FixedClock(0),
+                    &initiator_resolver,
+                    u64::MAX / 2,
+                    RekeyThreshold::new(3).unwrap(),
+                )
+                .unwrap()
+            }
+        });
+
+        let initiator_delegation = delegation_for_key(
+            &initiator_verifying,
+            "hh-1",
+            "initiator-1",
+            vec![0xEE; 32],
+            0,
+            u64::MAX / 2,
+        );
+        let initiator_identity =
+            identity("hh-1", "initiator-1", vec![0xEE; 32], initiator_delegation);
+        let sock = TcpStream::connect(addr).unwrap();
+        let ingress = PrevalidatedIngress::admit_at_accept(
+            sock,
+            IngressEvidence {
+                observed_at: 2,
+                ingress_expiry: u64::MAX / 2,
+            },
+            far_future_budget(),
+        );
+        let k_mesh = TestKMesh(initiator_key);
+        let pending_intent = pending_intent_for(
+            &k_mesh,
+            &initiator_identity,
+            &fixed_checkpoint(),
+            "responder-1",
+            vec![0xCC; 32],
+            [0xB7; 32],
+            u64::MAX / 2,
+            ExpectedChannel::Dev,
+        );
+        let initiator_d1 = BlockingGatedD1 {
+            gate: std::sync::Arc::clone(&initiator_gate),
+        };
+        let initiator_session = run_initiator_handshake(
+            ingress,
+            pending_intent,
+            &initiator_identity,
+            &fixed_checkpoint(),
+            ExpectedChannel::Dev,
+            &DelegationPolicy::test(u64::MAX / 2),
+            &AlwaysAcceptDelegation,
+            &k_mesh,
+            &initiator_d1,
+            &FixedClock(0),
+            u64::MAX / 2,
+            RekeyThreshold::new(3).unwrap(),
+        )
+        .unwrap();
+
+        let responder_session = responder.join().unwrap();
+        (
+            initiator_session,
+            responder_session,
+            initiator_gate,
+            responder_gate,
+        )
+    }
+
+    /// addendum §8 item 8: a real blocking guard proves
+    /// `revoke_and_wait_for_drain` genuinely waits until an in-flight
+    /// `receive_data` copy's guard drops, and that once it returns, zero
+    /// new DATA can be delivered.
+    ///
+    /// **Deterministic, not timing-based — two independent rendezvous, no
+    /// flag ever raced against.** (1) The copy hook blocks
+    /// `receive_data_inner` mid-copy (guard held, `active_readers == 1`)
+    /// until this test explicitly releases it. (2)
+    /// `revoke_and_wait_for_drain_with_hook`'s `before_wait` fires
+    /// synchronously, on the REVOKER's own thread, immediately before its
+    /// one and only `Condvar::wait` call — so once this test observes
+    /// that signal, `revoker_done` is checked on THIS (main) thread and is
+    /// guaranteed `false`: the revoker cannot have returned without first
+    /// completing that specific `.wait()` call, which cannot complete
+    /// before this test notifies it (by releasing the copy hook). There is
+    /// no window where two independently-scheduled threads race over a
+    /// shared flag — every ordering claim here reduces to single-thread
+    /// program order plus condvar wait/notify happens-before.
+    #[test]
+    fn item8_revoke_and_wait_for_drain_blocks_until_guard_drops_then_zero_new_data() {
+        let (mut initiator, responder, _initiator_gate, responder_gate) =
+            full_handshake_with_blocking_gate();
+
+        let hook_entered =
+            std::sync::Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+        let release_hook = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let release_signal =
+            std::sync::Arc::new((std::sync::Mutex::new(()), std::sync::Condvar::new()));
+
+        let mut responder = responder;
+        {
+            let hook_entered = std::sync::Arc::clone(&hook_entered);
+            let release_hook = std::sync::Arc::clone(&release_hook);
+            let release_signal = std::sync::Arc::clone(&release_signal);
+            responder.set_receive_before_copy_hook(move || {
+                {
+                    let (lock, cvar) = &*hook_entered;
+                    let mut entered = lock.lock().unwrap();
+                    *entered = true;
+                    cvar.notify_all();
+                }
+                let (lock, cvar) = &*release_signal;
+                let mut g = lock.lock().unwrap();
+                while !release_hook.load(std::sync::atomic::Ordering::SeqCst) {
+                    g = cvar.wait(g).unwrap();
+                }
+            });
+        }
+
+        initiator
+            .send_data(b"hello", OP_BUDGET, &FixedClock(0))
+            .unwrap();
+
+        let receiver = thread::spawn(move || {
+            let mut buf = [0u8; 8];
+            let result = responder.receive_data(&mut buf, OP_BUDGET, &FixedClock(0));
+            (responder, buf, result)
+        });
+
+        // Rendezvous 1: block until the copy hook has actually fired —
+        // the guard is held (active_readers == 1) for as long as it stays
+        // blocked here.
+        {
+            let (lock, cvar) = &*hook_entered;
+            let mut entered = lock.lock().unwrap();
+            while !*entered {
+                entered = cvar.wait(entered).unwrap();
+            }
+        }
+
+        let before_wait_signal =
+            std::sync::Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+        let revoker_done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let revoker = thread::spawn({
+            let gate = std::sync::Arc::clone(&responder_gate);
+            let before_wait_signal = std::sync::Arc::clone(&before_wait_signal);
+            let revoker_done = std::sync::Arc::clone(&revoker_done);
+            move || {
+                gate.revoke_and_wait_for_drain_with_hook(|| {
+                    let (lock, cvar) = &*before_wait_signal;
+                    let mut fired = lock.lock().unwrap();
+                    *fired = true;
+                    cvar.notify_all();
+                });
+                revoker_done.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+        });
+
+        // Rendezvous 2: block until the revoker has reached its own
+        // Condvar::wait call.
+        {
+            let (lock, cvar) = &*before_wait_signal;
+            let mut fired = lock.lock().unwrap();
+            while !*fired {
+                fired = cvar.wait(fired).unwrap();
+            }
+        }
+        // At this exact point `revoke_and_wait_for_drain` CANNOT have
+        // returned: the only path to returning goes through the
+        // `.wait()` call this test just confirmed is about to happen (or
+        // is already happening), and that wait cannot complete before
+        // the guard drops below — which this test has not yet done.
+        assert!(
+            !revoker_done.load(std::sync::atomic::Ordering::SeqCst),
+            "revoke_and_wait_for_drain returned before the in-flight guard dropped"
+        );
+
+        // Only now let the copy hook — and therefore the guard — drop.
+        release_hook.store(true, std::sync::atomic::Ordering::SeqCst);
+        release_signal.1.notify_all();
+
+        revoker.join().unwrap();
+        assert!(
+            revoker_done.load(std::sync::atomic::Ordering::SeqCst),
+            "revoke_and_wait_for_drain must have returned after the guard dropped"
+        );
+
+        let (mut responder, buf, result) = receiver.join().unwrap();
+        result.unwrap();
+        assert_eq!(&buf[..5], b"hello");
+
+        // "then zero new DATA": the gate is now permanently revoked — a
+        // subsequent receive_data must reject with NotAuthorized, never
+        // deliver.
+        initiator
+            .send_data(b"more", OP_BUDGET, &FixedClock(0))
+            .unwrap();
+        let mut buf2 = [0xAAu8; 8];
+        let err = responder
+            .receive_data(&mut buf2, OP_BUDGET, &FixedClock(0))
+            .unwrap_err();
+        assert!(matches!(err, PostActiveError::NotAuthorized));
+        assert_eq!(buf2, [0xAAu8; 8], "no new DATA delivered post-revoke");
+    }
+
+    /// addendum §8 item 8, "no callback under the guard" half: a
+    /// dedicated structural proof, not just true-by-construction-and-
+    /// trust-me. Reads this crate's OWN source (`include_str!`) and
+    /// asserts the production `pub fn receive_data`/`pub fn send_data`
+    /// signature lines contain none of Rust's closure/trait-object
+    /// spellings. This is deliberately a proof about THIS file's current
+    /// text, not a runtime guarantee about future edits — same accepted
+    /// class of self-check as item 14's `static_assertions` — but it is
+    /// scoped to the two production signature lines specifically (found
+    /// by their exact, unique `pub fn ... -> Result<...PostActiveError>`
+    /// text), not the whole file, so it cannot be satisfied by the
+    /// `#[cfg(test)]`-only hook living elsewhere in this same file.
+    #[test]
+    fn red_receive_data_and_send_data_signatures_have_no_callback_parameter() {
+        let source = include_str!("auth_state_machine.rs");
+        let forbidden = ["Box<dyn Fn", "impl Fn", "&dyn Fn", "FnMut", "FnOnce"];
+
+        let receive_data_sig = "pub fn receive_data<C: crate::intent::Clock>(\n        &mut self,\n        buffer: &mut [u8],\n        budget: Duration,\n        clock: &C,\n    ) -> Result<usize, PostActiveError> {";
+        assert!(
+            source.contains(receive_data_sig),
+            "receive_data's exact production signature text was not found — \
+             this test's anchor is stale and must be updated to match the \
+             real signature before it can prove anything"
+        );
+        for token in forbidden {
+            assert!(
+                !receive_data_sig.contains(token),
+                "receive_data's production signature must never contain {token}"
+            );
+        }
+
+        let send_data_sig = "pub fn send_data<C: crate::intent::Clock>(\n        &mut self,\n        payload: &[u8],\n        budget: Duration,\n        clock: &C,\n    ) -> Result<(), PostActiveError> {";
+        assert!(
+            source.contains(send_data_sig),
+            "send_data's exact production signature text was not found — \
+             this test's anchor is stale and must be updated to match the \
+             real signature before it can prove anything"
+        );
+        for token in forbidden {
+            assert!(
+                !send_data_sig.contains(token),
+                "send_data's production signature must never contain {token}"
+            );
+        }
+    }
+
+    // ---- addendum §8 item 12: partial write never diverges count/generation ----
+
+    /// Runtime-armed raw-write-call counter/failure trigger — same
+    /// "arm relative to the current call count, after the handshake"
+    /// design as `ClockFlipTrigger`, so `n` only has to describe the one
+    /// post-Active write under test, never the handshake's own call
+    /// count.
+    struct FailAfterTrigger {
+        calls: std::sync::atomic::AtomicUsize,
+        fail_at: std::sync::atomic::AtomicUsize,
+    }
+    impl FailAfterTrigger {
+        fn new() -> Self {
+            Self {
+                calls: std::sync::atomic::AtomicUsize::new(0),
+                fail_at: std::sync::atomic::AtomicUsize::new(usize::MAX),
+            }
+        }
+        fn arm(&self, n: usize) {
+            let current = self.calls.load(std::sync::atomic::Ordering::SeqCst);
+            self.fail_at
+                .store(current + n, std::sync::atomic::Ordering::SeqCst);
+        }
+        fn should_fail(&self) -> bool {
+            let call_number = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+            call_number == self.fail_at.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    /// Fails the raw `.write()` call the trigger is armed for — the
+    /// underlying write never runs at all for that one call (unlike
+    /// `FailWriteFromCall`, which fails every call from a fixed point on;
+    /// this fails exactly one, then lets any further calls through,
+    /// matching "one partial write" rather than "the connection is now
+    /// dead").
+    struct FailWriteAfterCall {
+        inner: TcpStream,
+        trigger: std::sync::Arc<FailAfterTrigger>,
+    }
+    impl Read for FailWriteAfterCall {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            self.inner.read(buf)
+        }
+    }
+    impl Write for FailWriteAfterCall {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            if self.trigger.should_fail() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "test-injected partial-write failure",
+                ));
+            }
+            self.inner.write(buf)
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            self.inner.flush()
+        }
+    }
+    impl wire::DeadlineBoundedIo for FailWriteAfterCall {
+        fn arm_io_deadline(&mut self, remaining: Duration) -> std::io::Result<()> {
+            self.inner.arm_io_deadline(remaining)
+        }
+    }
+
+    /// addendum §8 item 12, DATA half: a failed write during `send_data`
+    /// must never advance `policy_count` or `generation` — the record
+    /// never landed, so the sender's own bookkeeping must not move either.
+    /// Fails on the DATA record's 2nd raw write (the body) — the
+    /// length-prefix goes out, the body never does: a genuinely partial
+    /// record left dangling mid-write, not merely "nothing sent at all."
+    #[test]
+    fn item12_partial_write_during_data_send_never_advances_count_or_generation() {
+        let clock = MutableClock::new(0);
+        let trigger = std::sync::Arc::new(FailAfterTrigger::new());
+        let (mut initiator, _responder, _ig, _rg) = {
+            let trigger = std::sync::Arc::clone(&trigger);
+            full_handshake_with_gate_and_wrapped_initiator(&clock, move |sock| FailWriteAfterCall {
+                inner: sock,
+                trigger,
+            })
+        };
+
+        let gen_before = initiator.rekey.tx().generation();
+        let count_before = initiator.rekey.tx().policy_count();
+
+        trigger.arm(2);
+        let err = initiator
+            .send_data(b"partial", OP_BUDGET, &clock)
+            .unwrap_err();
+        assert!(matches!(err, PostActiveError::Wire(_)));
+        assert!(initiator.is_closed());
+        assert_eq!(
+            initiator.rekey.tx().generation(),
+            gen_before,
+            "generation must not advance on a failed write"
+        );
+        assert_eq!(
+            initiator.rekey.tx().policy_count(),
+            count_before,
+            "policy_count must not advance on a failed write either"
+        );
+    }
+
+    /// addendum §8 item 12, CLOSE half: a failed write during
+    /// `close_gracefully` (no marker due) still leaves the session
+    /// terminal — `closed` is set true before any write is even
+    /// attempted (addendum §6/§7), so a failed CLOSE write can never
+    /// leave the session re-openable, and a second call is a harmless
+    /// no-op rather than a resend attempt or a panic.
+    #[test]
+    fn item12_partial_write_during_close_still_leaves_session_closed() {
+        let clock = MutableClock::new(0);
+        let trigger = std::sync::Arc::new(FailAfterTrigger::new());
+        let (mut initiator, _responder, _ig, _rg) = {
+            let trigger = std::sync::Arc::clone(&trigger);
+            full_handshake_with_gate_and_wrapped_initiator(&clock, move |sock| FailWriteAfterCall {
+                inner: sock,
+                trigger,
+            })
+        };
+
+        // No marker due yet — CLOSE's own record is exactly 2 raw writes;
+        // fail on the 2nd (the body).
+        trigger.arm(2);
+        let err = initiator.close_gracefully(OP_BUDGET).unwrap_err();
+        assert!(matches!(err, PostActiveError::Wire(_)));
+        assert!(initiator.is_closed());
+        assert!(
+            initiator.close_gracefully(OP_BUDGET).is_ok(),
+            "a second call after a failed write must be a harmless no-op"
+        );
+    }
+
+    /// addendum §8 item 12, the "highest-value of the four" case @khai's
+    /// own audit flagged as worth the fault-injecting double: a marker
+    /// whose write is fully integral (peer legitimately rekeyed,
+    /// generation/count committed) followed by a CLOSE whose own write
+    /// then fails. This must still be a coherent terminal state — never a
+    /// panic, never a re-attempt, never a rollback of the marker's
+    /// already-committed rekey (that would desynchronize from a peer who
+    /// really did receive it) — matching the addendum's own framing: "the
+    /// peer, having legitimately rekeyed, then observes EOF" rather than
+    /// an explicit CLOSE.
+    #[test]
+    fn item12_marker_integral_close_failed_is_coherent_terminal_state() {
+        let clock = MutableClock::new(0);
+        let trigger = std::sync::Arc::new(FailAfterTrigger::new());
+        let (mut initiator, _responder, _ig, _rg) = {
+            let trigger = std::sync::Arc::clone(&trigger);
+            full_handshake_with_gate_and_wrapped_initiator(&clock, move |sock| FailWriteAfterCall {
+                inner: sock,
+                trigger,
+            })
+        };
+
+        // Drive N-1 = 2 ordinary sends (threshold=3) so a marker becomes
+        // due on the next send/close.
+        for i in 0..2u8 {
+            initiator.send_data(&[i], OP_BUDGET, &clock).unwrap();
+        }
+        assert_eq!(initiator.rekey.tx().generation(), 0);
+        assert_eq!(initiator.rekey.tx().policy_count(), 2);
+
+        // Let the marker's own 2 raw writes (prefix, body) succeed; fail
+        // on the 3rd upcoming call — CLOSE's own length-prefix write.
+        trigger.arm(3);
+        let err = initiator.close_gracefully(OP_BUDGET).unwrap_err();
+        assert!(matches!(err, PostActiveError::Wire(_)));
+
+        assert_eq!(
+            initiator.rekey.tx().generation(),
+            1,
+            "the marker's own rekey commit must survive CLOSE's own later write failure"
+        );
+        assert_eq!(initiator.rekey.tx().policy_count(), 0);
+        assert!(initiator.is_closed());
+
+        // Idempotent even in this partially-failed state.
+        assert!(
+            initiator.close_gracefully(OP_BUDGET).is_ok(),
+            "close_gracefully must be idempotent even after a prior write failure"
+        );
     }
 }

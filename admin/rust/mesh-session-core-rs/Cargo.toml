@@ -27,3 +27,9 @@ thiserror   = "1"
 sha2        = "0.10"
 
 [dev-dependencies]
+# Compile-time-only, zero runtime cost, no macro-generated code beyond a
+# trait-resolution trick — used exactly once (2026-08-04, @kiana, post-Active
+# wire addendum §8 item 14) to non-vacuously prove post-Active types never
+# implement `AuthFrameBody`, without widening any production `pub(crate)`
+# item to `pub` just to make it doctest/trybuild-reachable.
+static_assertions = "1"
