@@ -10,6 +10,12 @@ path = "src/lib.rs"
 
 [features]
 default = []
+# Lane R (@ilia): exposes the D1 membership-projection surface used by the
+# not-yet-landed runtime facade. Mirrors keystore-rs's own `mesh-session`
+# feature pattern exactly — household-rs -> mesh-session-core-rs (excluded
+# from this workspace, see admin/rust/Cargo.toml) is a legitimate edge,
+# household-rs never depends on the facade crate itself.
+mesh-session-runtime = ["dep:mesh-session-core-rs"]
 
 [dependencies]
 serde         = { workspace = true }
@@ -38,6 +44,7 @@ base64        = { workspace = true }
 core-rs       = { workspace = true }
 keystore-rs   = { workspace = true }
 store-rs      = { workspace = true }
+mesh-session-core-rs = { path = "../mesh-session-core-rs", optional = true }
 # S0: the neutral wire mechanics moved out of this crate so the boundary is a
 # dependency edge `cargo check` enforces, not a grep. The edge runs THIS way
 # only — product depends on neutral, never the reverse.

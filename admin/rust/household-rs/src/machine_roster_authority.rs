@@ -2193,11 +2193,343 @@ impl SealedBinding {
     }
 }
 
+// ─── Runtime-facade membership projection (Lane R, @ilia) ──────────────────
+//
+// Feature-gated: only compiled when `mesh-session-runtime` is enabled.
+// `D1MembershipKey` (mesh-session-core-rs) is the ceremony's own
+// capability — constructed only by that crate's own handshake code,
+// after `verify_frame` + delegation + checkpoint all succeed (and after
+// nonce consumption), carrying 6 fields: `session_id`, `hh_id`,
+// `peer_m_id`, `peer_cert_fingerprint`, `checkpoint_hash`,
+// `checkpoint_sequence`. `session_id` is a ceremony-freshness token that
+// belongs entirely to the core/D1 admission layer (its own nonce ledger
+// already closes replay) — it is deliberately never read here and never
+// enters `SealedBinding`. The other 5 fields are compared, in full,
+// against the CURRENT roster snapshot before a `SealedBinding` is ever
+// produced — a stronger check than `from_responding_peer` above, which
+// never had `peer_cert_fingerprint` to compare against at all.
+//
+// Error is a single, opaque, fieldless type — see `MembershipKeyRejected`
+// and `validate_membership_fields`'s own doc for exactly how "no oracle"
+// is enforced structurally, not just by convention.
+
+#[cfg(feature = "mesh-session-runtime")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MembershipKeyRejected;
+
+#[cfg(feature = "mesh-session-runtime")]
+impl std::fmt::Display for MembershipKeyRejected {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "membership key rejected")
+    }
+}
+
+#[cfg(feature = "mesh-session-runtime")]
+impl std::error::Error for MembershipKeyRejected {}
+
+#[cfg(feature = "mesh-session-runtime")]
+impl SealedBinding {
+    /// Projects a real `D1MembershipKey` into a `SealedBinding`, or
+    /// rejects it. `session_id` is read by nothing here — see the module
+    /// comment above.
+    pub fn from_membership_key(
+        key: &mesh_session_core_rs::intent::D1MembershipKey,
+        snapshot: &RosterSnapshotView,
+    ) -> Result<Self, MembershipKeyRejected> {
+        validate_membership_fields(
+            key.hh_id(),
+            key.peer_m_id(),
+            key.peer_cert_fingerprint(),
+            key.checkpoint_hash(),
+            key.checkpoint_sequence(),
+            snapshot,
+        )
+    }
+}
+
+/// The real comparison logic, factored to primitive-typed arguments so it
+/// is directly, non-vacuously testable without a real `D1MembershipKey`
+/// — its constructor is `pub(crate)` to mesh-session-core-rs, genuinely
+/// unreachable from any other crate, including this one, even in tests
+/// (verified: the only two construction sites are inside that crate's
+/// own `run_responder_handshake`/`run_initiator_handshake`, both
+/// `pub(crate)` there too).
+///
+/// Revoked/not-active is checked FIRST, matching `from_responding_peer`'s
+/// existing ordering exactly — an unavoidable, pre-existing short-circuit
+/// (there is no member to compare fields against if the `m_id` isn't
+/// active), not something new introduced here. Past that gate, all 4
+/// remaining field comparisons (`hh_id`, fingerprint, `checkpoint_hash`,
+/// `checkpoint_sequence`) are evaluated UNCONDITIONALLY and combined with
+/// a single `&&`, checked once — no per-field early return, so no
+/// observable control-flow or timing difference between fingerprint
+/// being wrong and `checkpoint_sequence` being wrong.
+#[cfg(feature = "mesh-session-runtime")]
+fn validate_membership_fields(
+    hh_id: &str,
+    peer_m_id: &str,
+    peer_cert_fingerprint: &[u8],
+    checkpoint_hash: &[u8],
+    checkpoint_sequence: u64,
+    snapshot: &RosterSnapshotView,
+) -> Result<SealedBinding, MembershipKeyRejected> {
+    let m_id = MachineId(peer_m_id.to_string());
+    if snapshot.is_revoked(&m_id) {
+        return Err(MembershipKeyRejected);
+    }
+    let member = snapshot.lookup_active(&m_id).ok_or(MembershipKeyRejected)?;
+
+    let hh_id_matches = hh_id == snapshot.hh_id().0.as_str();
+    let fingerprint_matches = peer_cert_fingerprint == member.machine_cert_fingerprint().as_slice();
+    let checkpoint_hash_matches = checkpoint_hash == snapshot.checkpoint_hash().as_slice();
+    let checkpoint_sequence_matches = checkpoint_sequence == snapshot.checkpoint_sequence();
+
+    if !(hh_id_matches
+        && fingerprint_matches
+        && checkpoint_hash_matches
+        && checkpoint_sequence_matches)
+    {
+        return Err(MembershipKeyRejected);
+    }
+
+    Ok(SealedBinding {
+        hh_id: snapshot.hh_id().clone(),
+        m_id,
+        machine_cert_fingerprint: member.machine_cert_fingerprint(),
+        checkpoint_hash: snapshot.checkpoint_hash(),
+        checkpoint_sequence: snapshot.checkpoint_sequence(),
+    })
+}
+
 // ─── Tests ──────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ─── Lane R (@ilia): membership-key projection REDs ─────────────────
+
+    #[cfg(feature = "mesh-session-runtime")]
+    #[allow(clippy::too_many_arguments)]
+    fn membership_test_snapshot(
+        hh_id: &str,
+        m_id: &str,
+        fingerprint: [u8; 32],
+        checkpoint_hash: [u8; 32],
+        checkpoint_sequence: u64,
+        revoked: bool,
+    ) -> RosterSnapshotView {
+        let hh_id = HouseholdId(hh_id.to_string());
+        let machine_id = MachineId(m_id.to_string());
+        let active = if revoked {
+            Vec::new()
+        } else {
+            vec![MachineRosterMemberV1 {
+                m_id: machine_id.clone(),
+                m_pub: crate::keys::P256PublicKey([0x02; 33]),
+                machine_cert: Vec::new(),
+                machine_cert_fingerprint: fingerprint,
+            }]
+        };
+        let tombstones = if revoked {
+            vec![MachineRosterRevocationV1 {
+                v: 1,
+                kind: "machine_roster_revocation_v1".to_string(),
+                hh_id: hh_id.clone(),
+                epoch: [1u8; 32],
+                sequence: 1,
+                prev_event_hash: [0u8; 32],
+                m_id: machine_id.clone(),
+                m_pub: crate::keys::P256PublicKey([0x02; 33]),
+                machine_cert_fingerprint: fingerprint,
+                revoked_at: 1,
+                reason: RevocationReason::OwnerAction,
+                cascade: RevocationCascade::MachineOnly,
+                owner_p_id: crate::machine_cert::PersonId("owner".to_string()),
+                owner_cert_fingerprint: [4u8; 32],
+                owner_person_cert: Vec::new(),
+                signature: crate::keys::P256Signature([7u8; 64]),
+            }]
+        } else {
+            Vec::new()
+        };
+        let data = AcceptedRosterData {
+            epoch: [1u8; 32],
+            checkpoint_sequence,
+            checkpoint_hash,
+            prev_checkpoint_hash: [0u8; 32],
+            event_sequence: 1,
+            event_head_hash: [3u8; 32],
+            predecessor_event_sequence: 0,
+            predecessor_event_head_hash: [0u8; 32],
+            issued_at: 1,
+            not_after: u64::MAX,
+            owner_cert_fingerprint: [4u8; 32],
+            genesis_basis: VerifiedGenesisRoster {
+                epoch: [1u8; 32],
+                members: Vec::new(),
+            },
+            active,
+            tombstones,
+        };
+        RosterSnapshotView::project(&hh_id, &data)
+    }
+
+    #[cfg(feature = "mesh-session-runtime")]
+    #[test]
+    fn membership_key_all_fields_match_produces_sealed_binding() {
+        let snapshot =
+            membership_test_snapshot("hh-runtime-1", "m-1", [0xAAu8; 32], [0xCCu8; 32], 7, false);
+        let bound = validate_membership_fields(
+            "hh-runtime-1",
+            "m-1",
+            &[0xAAu8; 32],
+            &[0xCCu8; 32],
+            7,
+            &snapshot,
+        )
+        .unwrap();
+        assert_eq!(bound.hh_id().0, "hh-runtime-1");
+        assert_eq!(bound.m_id().0, "m-1");
+        assert_eq!(bound.machine_cert_fingerprint(), [0xAAu8; 32]);
+        assert_eq!(bound.checkpoint_hash(), [0xCCu8; 32]);
+        assert_eq!(bound.checkpoint_sequence(), 7);
+    }
+
+    #[cfg(feature = "mesh-session-runtime")]
+    #[test]
+    fn red_membership_key_hh_id_mismatch_rejected() {
+        let snapshot =
+            membership_test_snapshot("hh-runtime-1", "m-1", [0xAAu8; 32], [0xCCu8; 32], 7, false);
+        let err = validate_membership_fields(
+            "hh-DIFFERENT",
+            "m-1",
+            &[0xAAu8; 32],
+            &[0xCCu8; 32],
+            7,
+            &snapshot,
+        )
+        .unwrap_err();
+        assert_eq!(err, MembershipKeyRejected);
+    }
+
+    #[cfg(feature = "mesh-session-runtime")]
+    #[test]
+    fn red_membership_key_unknown_peer_m_id_rejected() {
+        let snapshot =
+            membership_test_snapshot("hh-runtime-1", "m-1", [0xAAu8; 32], [0xCCu8; 32], 7, false);
+        let err = validate_membership_fields(
+            "hh-runtime-1",
+            "m-DOES-NOT-EXIST",
+            &[0xAAu8; 32],
+            &[0xCCu8; 32],
+            7,
+            &snapshot,
+        )
+        .unwrap_err();
+        assert_eq!(err, MembershipKeyRejected);
+    }
+
+    #[cfg(feature = "mesh-session-runtime")]
+    #[test]
+    fn red_membership_key_fingerprint_mismatch_rejected() {
+        let snapshot =
+            membership_test_snapshot("hh-runtime-1", "m-1", [0xAAu8; 32], [0xCCu8; 32], 7, false);
+        let err = validate_membership_fields(
+            "hh-runtime-1",
+            "m-1",
+            &[0xFFu8; 32],
+            &[0xCCu8; 32],
+            7,
+            &snapshot,
+        )
+        .unwrap_err();
+        assert_eq!(err, MembershipKeyRejected);
+    }
+
+    #[cfg(feature = "mesh-session-runtime")]
+    #[test]
+    fn red_membership_key_checkpoint_hash_mismatch_rejected() {
+        let snapshot =
+            membership_test_snapshot("hh-runtime-1", "m-1", [0xAAu8; 32], [0xCCu8; 32], 7, false);
+        let err = validate_membership_fields(
+            "hh-runtime-1",
+            "m-1",
+            &[0xAAu8; 32],
+            &[0xEEu8; 32],
+            7,
+            &snapshot,
+        )
+        .unwrap_err();
+        assert_eq!(err, MembershipKeyRejected);
+    }
+
+    #[cfg(feature = "mesh-session-runtime")]
+    #[test]
+    fn red_membership_key_checkpoint_sequence_mismatch_rejected() {
+        let snapshot =
+            membership_test_snapshot("hh-runtime-1", "m-1", [0xAAu8; 32], [0xCCu8; 32], 7, false);
+        let err = validate_membership_fields(
+            "hh-runtime-1",
+            "m-1",
+            &[0xAAu8; 32],
+            &[0xCCu8; 32],
+            999,
+            &snapshot,
+        )
+        .unwrap_err();
+        assert_eq!(err, MembershipKeyRejected);
+    }
+
+    #[cfg(feature = "mesh-session-runtime")]
+    #[test]
+    fn red_membership_key_revoked_rejected() {
+        let snapshot =
+            membership_test_snapshot("hh-runtime-1", "m-1", [0xAAu8; 32], [0xCCu8; 32], 7, true);
+        let err = validate_membership_fields(
+            "hh-runtime-1",
+            "m-1",
+            &[0xAAu8; 32],
+            &[0xCCu8; 32],
+            7,
+            &snapshot,
+        )
+        .unwrap_err();
+        assert_eq!(err, MembershipKeyRejected);
+    }
+
+    /// Key minted against an OLDER checkpoint (seq 7) is rejected once the
+    /// roster has genuinely advanced (seq 8) — even though it would have
+    /// been accepted against the exact snapshot it was minted for. Proves
+    /// temporal correctness, not just flat field equality.
+    #[cfg(feature = "mesh-session-runtime")]
+    #[test]
+    fn red_membership_key_stale_against_advanced_roster_rejected() {
+        let old_snapshot =
+            membership_test_snapshot("hh-runtime-1", "m-1", [0xAAu8; 32], [0xCCu8; 32], 7, false);
+        validate_membership_fields(
+            "hh-runtime-1",
+            "m-1",
+            &[0xAAu8; 32],
+            &[0xCCu8; 32],
+            7,
+            &old_snapshot,
+        )
+        .unwrap();
+
+        let advanced_snapshot =
+            membership_test_snapshot("hh-runtime-1", "m-1", [0xAAu8; 32], [0xDDu8; 32], 8, false);
+        let err = validate_membership_fields(
+            "hh-runtime-1",
+            "m-1",
+            &[0xAAu8; 32],
+            &[0xCCu8; 32],
+            7,
+            &advanced_snapshot,
+        )
+        .unwrap_err();
+        assert_eq!(err, MembershipKeyRejected);
+    }
 
     // Local wrappers preserving old call signatures for tests
     fn sign_revocation(

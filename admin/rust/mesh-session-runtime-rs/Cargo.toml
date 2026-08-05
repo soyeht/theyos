@@ -1,0 +1,45 @@
+[workspace]
+# TEMPORARY holding pattern, not a final decision — see report to @ilia:
+# building/testing this crate at all requires cargo to know its
+# relationship to the ambient admin/rust workspace (member, excluded, or
+# self-contained); joining as a real member (as instructed) triggers
+# household-rs's r1a7_enumerates_linked_targets_and_proves_zero_production_callers
+# ratchet (hard-pinned members.len()==30/targets.len()==201/bin==50/
+# test==151), a shared file outside this crate. This empty table + the
+# path-deps below (instead of `workspace = true`) let the crate compile
+# and its tests run standalone right now, without deciding that question.
+
+[package]
+name    = "mesh-session-runtime-rs"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+
+[lib]
+name = "mesh_session_runtime_rs"
+path = "src/lib.rs"
+
+[features]
+default = []
+# Lane R (@ilia, correction after @zain's measurement): household-rs,
+# keystore-rs, AND mesh-session-core-rs are all OPTIONAL here, gated
+# behind this crate's own non-default feature. A required (non-optional)
+# `keystore-rs = { features = ["mesh-session"] }` would let resolver-2's
+# feature unification turn `mesh-session` on for keystore-rs across the
+# WHOLE workspace unconditionally, silently making the "feature OFF, this
+# surface doesn't exist" RED unprovable. Measured three ways before this
+# shape was chosen: `cargo metadata` without `--features` on this crate,
+# `cargo tree -e features -i keystore-rs`, and the presence/absence of a
+# built `libmesh_session_core_rs*.rmeta` artifact.
+mesh-session-runtime = [
+    "dep:household-rs",
+    "dep:keystore-rs",
+    "dep:mesh-session-core-rs",
+    "household-rs/mesh-session-runtime",
+    "keystore-rs/mesh-session",
+]
+
+[dependencies]
+household-rs = { path = "../household-rs", optional = true }
+keystore-rs  = { path = "../keystore-rs", optional = true }
+mesh-session-core-rs = { path = "../mesh-session-core-rs", optional = true }

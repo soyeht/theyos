@@ -2451,6 +2451,7 @@ dependencies = [
  "keyring",
  "keystore-rs",
  "mdns-sd",
+ "mesh-session-core-rs",
  "openssl",
  "p256 0.13.2",
  "percent-encoding",
