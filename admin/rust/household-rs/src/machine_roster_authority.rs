@@ -2588,16 +2588,39 @@ mod tests {
         let revoked_check = fn_body
             .find("snapshot.is_revoked(")
             .expect("revoked check must exist in validate_membership_fields");
-        let hh_id_comparison = fn_body
-            .find("let hh_id_matches")
-            .expect("hh_id_matches comparison must exist in validate_membership_fields");
+
+        // @khai's cross-audit (2026-08-05): anchoring on `hh_id_matches`
+        // alone only proved `is_revoked` precedes ONE of the four
+        // comparisons, not all of them, despite the assertion's own name
+        // claiming "field comparisons" plural. A mutant that reorders the
+        // four so `hh_id_matches` sits last (with `is_revoked` moved to
+        // after the other three but still before `hh_id_matches`) left
+        // this pin green while `is_revoked` had already stopped preceding
+        // 3 of the 4. Anchoring on the MINIMUM of all four indices closes
+        // that gap — `is_revoked` must precede every one of them, not just
+        // whichever one this pin happened to name.
+        let earliest_field_comparison = [
+            "let hh_id_matches",
+            "let fingerprint_matches",
+            "let checkpoint_hash_matches",
+            "let checkpoint_sequence_matches",
+        ]
+        .into_iter()
+        .map(|needle| {
+            fn_body.find(needle).unwrap_or_else(|| {
+                panic!("{needle} comparison must exist in validate_membership_fields")
+            })
+        })
+        .min()
+        .expect("four comparisons are listed above, so a minimum always exists");
 
         assert!(
-            revoked_check < hh_id_comparison,
+            revoked_check < earliest_field_comparison,
             "is_revoked has no data dependency forcing this order — unlike lookup_active, whose \
              result the field comparisons directly consume — so this position is not \
-             compiler-guaranteed and needs this explicit pin. If this genuinely changed, update \
-             it deliberately, not by accident."
+             compiler-guaranteed and needs this explicit pin. It must precede ALL FOUR field \
+             comparisons, not just one of them. If this genuinely changed, update it deliberately, \
+             not by accident."
         );
     }
 

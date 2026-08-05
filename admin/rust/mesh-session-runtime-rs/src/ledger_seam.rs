@@ -171,4 +171,27 @@ mod tests {
     static_assertions::assert_not_impl_any!(TimeSourceUnavailable: Into<NonceConsumeOutcome>);
     static_assertions::assert_not_impl_any!(NonceConsumeOutcome: Into<TimeSourceUnavailable>);
     static_assertions::assert_not_impl_any!(TimeSourceUnavailable: PartialEq<NonceConsumeOutcome>);
+    // @khai's cross-audit (2026-08-05) found this direction missing: the
+    // orphan rule permits a foreign trait (`PartialEq`) on a foreign
+    // `Self` (`NonceConsumeOutcome`) as long as the type PARAMETER is
+    // local (`TimeSourceUnavailable`) — so `impl PartialEq<TimeSourceUnavailable>
+    // for NonceConsumeOutcome` compiles today, the three checks above all
+    // still pass with it present, and `NonceConsumeOutcome::MayHaveTakenEffect
+    // == TimeSourceUnavailable` would silently return `true`. The module
+    // doc's "never comparable... in either direction" claim was wider than
+    // what the mechanism actually enforced until this line.
+    //
+    // If this line's build ever breaks, it will very likely surface as
+    // `E0283` (type-annotations-needed / ambiguity), NOT the plainer
+    // "trait is implemented for this type" diagnostic the other three
+    // checks produce. That is not this assertion failing to compile as
+    // itself — `NonceConsumeOutcome` already derives `PartialEq` for
+    // comparisons with its own type, so a foreign `impl
+    // PartialEq<TimeSourceUnavailable> for NonceConsumeOutcome` makes
+    // `static_assertions`' own trait-resolution probe ambiguous between
+    // the two impls, and rustc reports that ambiguity rather than a clean
+    // "yes, it's implemented." It still fails the build, and the build
+    // failing is exactly what this assertion exists to force — do not
+    // read an `E0283` here as this check being broken and remove it.
+    static_assertions::assert_not_impl_any!(NonceConsumeOutcome: PartialEq<TimeSourceUnavailable>);
 }
