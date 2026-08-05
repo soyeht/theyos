@@ -440,6 +440,156 @@ mod bridge_reds {
         cell
     }
 
+    /// A roster that is Active at a chosen revision and can be moved.
+    struct MovableRoster {
+        state: std::sync::Mutex<(u64, RosterCurrency)>,
+        /// When set, the revision moves DURING validation -- on the query
+        /// that `validate_full_binding` itself makes, i.e. after
+        /// `load_signer_capability` already sealed the revision and before
+        /// `sign_checked` asks for the lease. That is the only window the
+        /// sealed revision exists to protect; moving it before the call
+        /// merely means the capability is validated against the new value.
+        advance_during_validation: bool,
+    }
+    impl MovableRoster {
+        fn active() -> Self {
+            Self {
+                state: std::sync::Mutex::new((
+                    0,
+                    RosterCurrency::Active {
+                        member_pub: vec![7, 7, 7],
+                        member_cert_fingerprint: [5u8; 32],
+                    },
+                )),
+                advance_during_validation: false,
+            }
+        }
+        fn moving_during_validation() -> Self {
+            let mut r = Self::active();
+            r.advance_during_validation = true;
+            r
+        }
+    }
+    impl RosterLookup for MovableRoster {
+        fn query_machine_currency(&self, _m: &str) -> RosterCurrency {
+            let mut g = self.state.lock().unwrap();
+            if self.advance_during_validation {
+                g.0 += 1;
+            }
+            g.1.clone()
+        }
+        fn currency_revision(&self, _m: &str) -> u64 {
+            self.state.lock().unwrap().0
+        }
+        fn acquire_currency_lease(
+            &self,
+            _m: &str,
+            expected: u64,
+        ) -> Result<Box<dyn crate::validator::CurrencyLease + '_>, crate::validator::RosterChanged>
+        {
+            if self.state.lock().unwrap().0 == expected {
+                Ok(Box::new(GrantedLease))
+            } else {
+                Err(crate::validator::RosterChanged)
+            }
+        }
+    }
+    struct GrantedLease;
+    impl crate::validator::CurrencyLease for GrantedLease {}
+
+    struct AlwaysVerify;
+    impl SignatureVerifier for AlwaysVerify {
+        fn verify(&self, _pk: &[u8], _d: &crate::record::Delegation, _s: &[u8]) -> bool {
+            true
+        }
+    }
+
+    /// A record with ONE fully valid, active generation bound to the real
+    /// keystore key -- everything `validate_full_binding` demands.
+    fn active_record_for(
+        public_key: &[u8],
+        id: &ControlIdentity,
+    ) -> (MeshSignerControlRecordV1, NonZeroU64) {
+        let generation = NonZeroU64::new(1).unwrap();
+        let slot = crate::record::SlotId {
+            identity_digest: crate::record::identity_digest(id),
+            purpose: PurposeId::MeshSession,
+            generation,
+            txn_id: [3u8; 16],
+            backend_instance: crate::record::BackendKind::File,
+        };
+        let binding = crate::record::ExactBinding {
+            slot: slot.clone(),
+            public_key: public_key.to_vec(),
+            attributes: Vec::new(),
+        };
+        let delegation = crate::record::Delegation {
+            version: crate::validator::DELEGATION_SCHEMA_VERSION,
+            kind: "soyeht/mesh-session/delegation/v1".into(),
+            domain: "soyeht/mesh-session/v1".into(),
+            hh_id: id.hh_id.clone(),
+            delegator_m_id: id.machine_id.clone(),
+            delegator_cert_fingerprint: [5u8; 32],
+            delegated_pub: public_key.to_vec(),
+            delegated_key_id: slot.canonical_id(),
+            profile: "mesh-session".into(),
+            transcript_kinds: vec![
+                "final-confirm".into(),
+                "activate".into(),
+                "activate-ack".into(),
+            ],
+            roles: vec!["initiator".into(), "responder".into()],
+            channel: Channel::Dev,
+            serial: 1,
+            not_before: 0,
+            not_after: 10_000,
+            sig: vec![9, 9],
+        };
+        let mut rec = MeshSignerControlRecordV1::bootstrap(id.clone(), PurposeId::MeshSession);
+        rec.authority = crate::record::Authority::Active;
+        rec.current_generation = Some(generation);
+        rec.generation_high_water = generation;
+        rec.live_generations = vec![crate::record::GenerationRecord {
+            generation,
+            delegation,
+            binding,
+            not_after: 10_000,
+        }];
+        rec.revision = 1;
+        (rec, generation)
+    }
+
+    fn cell_with(
+        dir: &std::path::Path,
+        id: &ControlIdentity,
+        rec: &MeshSignerControlRecordV1,
+    ) -> Arc<crate::cell::ControlRecordCell> {
+        let cell = crate::cell::open(
+            dir.join("rec2"),
+            id.clone(),
+            PurposeId::MeshSession,
+            Arc::new(crate::locks::OrderSpy::new()),
+        )
+        .unwrap();
+        let boot = MeshSignerControlRecordV1::bootstrap(id.clone(), PurposeId::MeshSession);
+        let g = cell.acquire_for_mutation();
+        cell.seed_for_test(&g, crate::record::INITIAL_REVISION, &boot);
+        assert_eq!(
+            cell.seed_for_test(&g, boot.revision, rec),
+            crate::store::ReplaceOutcome::Committed
+        );
+        drop(g);
+        cell
+    }
+
+    fn bridge_identity() -> ControlIdentity {
+        ControlIdentity {
+            hh_id: "hh_bridge".into(),
+            machine_id: "m_bridge".into(),
+            channel: Channel::Dev,
+        }
+    }
+
     /// The announced key is observed once at construction and is a plain
     /// local read afterwards -- no lock, lease or filesystem on that path.
     #[test]
@@ -524,5 +674,121 @@ mod bridge_reds {
         assert_eq!(signer.announced_public_key(), announced.public_key());
         // And refuses, because the authorised path re-resolves every call.
         assert!(signer.sign_authorised(b"x").is_err());
+    }
+
+    /// NON-VACUITY CONTROL for the three REDs below: with a fully valid
+    /// active record, a matching roster and an unmoved revision, the
+    /// authorised path SUCCEEDS and the real signature is produced. Without
+    /// this, a refusal-only suite would pass even if the fixture were
+    /// simply broken.
+    #[test]
+    fn a_fully_valid_active_record_actually_signs() {
+        let dir = tempfile::tempdir().unwrap();
+        let (slots, slot) = keystore_with_key(dir.path());
+        let pk = slots.inspect(&slot).unwrap().unwrap().public_key().to_vec();
+        let id = bridge_identity();
+        let (rec, generation) = active_record_for(&pk, &id);
+        let cell = cell_with(dir.path(), &id, &rec);
+        let policy = DelegationPolicy::test(100_000);
+        let roster = MovableRoster::active();
+        let (sig, clock) = (AlwaysVerify, FixedClock(50));
+        let signer = MeshSessionBridgeSigner::new_internal(
+            slots, slot, &cell, &policy, &roster, &sig, &clock, generation,
+        )
+        .unwrap();
+        let out = signer
+            .sign_authorised(b"canonical bytes from core")
+            .expect("a fully valid, unmoved, in-window record must sign");
+        assert_eq!(out.len(), 64, "P-256 r||s");
+    }
+
+    /// RED: the roster revision moves between validation and use. The
+    /// capability sealed revision 0; the lease is asked for THAT revision,
+    /// so revision 1 refuses -- and nothing signs.
+    #[test]
+    fn a_roster_revision_move_refuses_with_no_signature() {
+        let dir = tempfile::tempdir().unwrap();
+        let (slots, slot) = keystore_with_key(dir.path());
+        let pk = slots.inspect(&slot).unwrap().unwrap().public_key().to_vec();
+        let id = bridge_identity();
+        let (rec, generation) = active_record_for(&pk, &id);
+        let cell = cell_with(dir.path(), &id, &rec);
+        let policy = DelegationPolicy::test(100_000);
+        let roster = MovableRoster::moving_during_validation();
+        let (sig, clock) = (AlwaysVerify, FixedClock(50));
+        let signer = MeshSessionBridgeSigner::new_internal(
+            slots, slot, &cell, &policy, &roster, &sig, &clock, generation,
+        )
+        .unwrap();
+        // The currency for this machine never changes -- ONLY the revision
+        // moves, and it moves inside validation, so the sealed-revision
+        // check is the sole thing that can catch it.
+        let err = signer.sign_authorised(b"x").unwrap_err();
+        assert!(matches!(err, BridgeError::NotAuthorised(_)), "got {err:?}");
+    }
+
+    /// RED: asking for a generation the record does not hold live refuses
+    /// before any primitive runs.
+    #[test]
+    fn a_wrong_generation_refuses_before_any_primitive() {
+        let dir = tempfile::tempdir().unwrap();
+        let (slots, slot) = keystore_with_key(dir.path());
+        let pk = slots.inspect(&slot).unwrap().unwrap().public_key().to_vec();
+        let id = bridge_identity();
+        let (rec, _generation) = active_record_for(&pk, &id);
+        let cell = cell_with(dir.path(), &id, &rec);
+        let policy = DelegationPolicy::test(100_000);
+        let roster = MovableRoster::active();
+        let (sig, clock) = (AlwaysVerify, FixedClock(50));
+        let signer = MeshSessionBridgeSigner::new_internal(
+            slots,
+            slot,
+            &cell,
+            &policy,
+            &roster,
+            &sig,
+            &clock,
+            NonZeroU64::new(42).unwrap(),
+        )
+        .unwrap();
+        let err = signer.sign_authorised(b"x").unwrap_err();
+        assert!(matches!(err, BridgeError::NotAuthorised(_)), "got {err:?}");
+    }
+
+    /// RED: the whole record is compared, not a projection. Rewriting the
+    /// record between the capability load and the guarded re-read -- here by
+    /// expiring the generation out of `live_generations` -- must refuse.
+    #[test]
+    fn a_record_rewritten_after_validation_refuses() {
+        let dir = tempfile::tempdir().unwrap();
+        let (slots, slot) = keystore_with_key(dir.path());
+        let pk = slots.inspect(&slot).unwrap().unwrap().public_key().to_vec();
+        let id = bridge_identity();
+        let (rec, generation) = active_record_for(&pk, &id);
+        let cell = cell_with(dir.path(), &id, &rec);
+        let policy = DelegationPolicy::test(100_000);
+        let roster = MovableRoster::active();
+        let (sig, clock) = (AlwaysVerify, FixedClock(50));
+        let signer = MeshSessionBridgeSigner::new_internal(
+            slots, slot, &cell, &policy, &roster, &sig, &clock, generation,
+        )
+        .unwrap();
+        // Drop the generation out of the live set, keeping everything else.
+        let mut rewritten = rec.clone();
+        rewritten.live_generations.clear();
+        rewritten.current_generation = None;
+        rewritten.authority = crate::record::Authority::Revoked {
+            reason: crate::record::RevocationReason::OwnerAction,
+        };
+        rewritten.revision = rec.revision + 1;
+        {
+            let g = cell.acquire_for_mutation();
+            assert_eq!(
+                cell.seed_for_test(&g, rec.revision, &rewritten),
+                crate::store::ReplaceOutcome::Committed
+            );
+        }
+        let err = signer.sign_authorised(b"x").unwrap_err();
+        assert!(matches!(err, BridgeError::NotAuthorised(_)), "got {err:?}");
     }
 }
