@@ -997,3 +997,87 @@ fn public_constructors_reject_invalid_shapes_without_state_or_io() {
         Err(CodecError::FrameTooLarge)
     );
 }
+
+/// True if this manifest inherits the workspace lint table, in EITHER spelling.
+///
+/// Both forms are accepted deliberately. Cargo treats
+///
+/// ```toml
+/// [lints]
+/// workspace = true
+/// ```
+///
+/// and the dotted `lints.workspace = true` as the same thing, and every member
+/// here happens to use the table form. A checker that recognised only the
+/// dotted spelling would report zero of thirty members opting in and conclude
+/// the workspace lint table was inert — which is exactly the wrong conclusion,
+/// reached exactly that way, before this guard existed. Matching one spelling
+/// is how a search fails toward "nobody is protected".
+fn declares_workspace_lint_inheritance(manifest: &str) -> bool {
+    let code = |line: &str| {
+        line.split('#')
+            .next()
+            .unwrap_or("")
+            .replace(char::is_whitespace, "")
+    };
+    if manifest.lines().any(|l| code(l) == "lints.workspace=true") {
+        return true;
+    }
+    let mut in_lints = false;
+    for line in manifest.lines() {
+        let stripped = code(&line);
+        if stripped.starts_with('[') {
+            in_lints = stripped == "[lints]";
+            continue;
+        }
+        if in_lints && stripped == "workspace=true" {
+            return true;
+        }
+    }
+    false
+}
+
+/// Every workspace member must inherit `[workspace.lints]`.
+///
+/// The line is load-bearing and its absence is SILENT. Drop it from a member and
+/// the real gate — `cargo clippy --workspace -- -D warnings` — stops applying
+/// `clippy::all` and `pedantic` to that crate entirely, while still exiting 0.
+/// The crate simply stops being linted, and no existing check notices: the only
+/// other mention of `[lints]` in test code uses the string as a delimiter for
+/// slicing a `[dependencies]` section, not as a property to enforce.
+///
+/// So the thirty members that do inherit are correct by convention, not by
+/// mechanism — a thirty-first joins unlinted and nothing fails. That is worse
+/// than the target ratchet, which at least shouts when its number moves.
+#[test]
+fn every_workspace_member_inherits_the_workspace_lint_table() {
+    let rust_root = repository_root().join("admin/rust");
+    let members = workspace_members(&rust_root);
+
+    // Positive control: a broken enumerator returning an empty list would make
+    // the emptiness check below pass while examining nothing.
+    assert!(
+        members.len() >= 25,
+        "only {} workspace members enumerated; the member parse is broken, so \
+         this guard would pass without checking anything",
+        members.len()
+    );
+
+    let missing: Vec<&String> = members
+        .iter()
+        .filter(|member| {
+            let manifest = fs::read_to_string(rust_root.join(member).join("Cargo.toml"))
+                .unwrap_or_else(|error| panic!("read {member}/Cargo.toml: {error}"));
+            !declares_workspace_lint_inheritance(&manifest)
+        })
+        .collect();
+
+    assert!(
+        missing.is_empty(),
+        "workspace members that do NOT inherit `[workspace.lints]`: {missing:?}. \
+         Without it the member is silently exempt from `clippy::all` and \
+         `pedantic` under the real gate, which still exits 0 — the crate stops \
+         being linted and nothing else notices. Add `[lints]` with \
+         `workspace = true` to each."
+    );
+}
