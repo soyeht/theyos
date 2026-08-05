@@ -3313,4 +3313,300 @@ mod tests {
             "a crash before the rename must not cost the caller its nonce"
         );
     }
+
+    /// The correct partition: production ends at the real test MODULE
+    /// boundary, never at the first bare `#[cfg(test)]` attribute — a file
+    /// can have (and this one does, 27 times) individual test-only items
+    /// scattered through production code long before the module starts.
+    /// Built via `concat!` on purpose: writing the marker as one literal
+    /// string would make this function's own source a hit for any guard
+    /// (including the one below) that greps this file for its own marker.
+    fn split_at_test_module(text: &str) -> (&str, &str) {
+        let marker = concat!("#[cfg(test)]", "\n", "mod tests {");
+        match text.find(marker) {
+            Some(idx) => (&text[..idx], &text[idx..]),
+            None => (text, ""),
+        }
+    }
+
+    /// The WRONG partition, kept only so `split_partition_control_has_teeth`
+    /// below can demonstrate it fails where `split_at_test_module` succeeds.
+    /// Never used by the real guard.
+    fn split_at_first_cfg_test_attribute(text: &str) -> (&str, &str) {
+        let marker = concat!("#[cfg(test)]");
+        match text.find(marker) {
+            Some(idx) => (&text[..idx], &text[idx..]),
+            None => (text, ""),
+        }
+    }
+
+    /// Proves the containment check that
+    /// `mesh_intent_nonce_ledger_open_has_exactly_one_production_call_site`
+    /// relies on actually discriminates a too-early cut from a correct
+    /// one — on a SYNTHETIC fixture, not `include_str!` of a real file.
+    ///
+    /// A real-file demonstration is only as good as that file's current,
+    /// incidental shape: `machine_roster_store.rs`'s first bare
+    /// `#[cfg(test)]` happens to sit after
+    /// `open_mesh_intent_nonce_ledger`'s definition today, so naive and
+    /// correct partitioning coincide there — proving nothing about
+    /// whether the check itself has teeth, only that this file hasn't
+    /// been reorganised yet. A synthetic fixture with the SAME shape as
+    /// the real trap (an early scattered `#[cfg(test)]`, then the
+    /// definition, then the real module) demonstrates the property
+    /// itself, independent of any file's future edits. (@zain)
+    #[test]
+    fn split_partition_control_has_teeth() {
+        let fixture = concat!(
+            "//! doc\n",
+            "#[cfg(test)]\n",
+            "fn helper_only_in_tests() {}\n",
+            "\n",
+            "pub(crate) fn open(path: &Path) -> Self {\n",
+            "    todo!()\n",
+            "}\n",
+            "\n",
+            "#[cfg(test)]\n",
+            "mod tests {\n",
+            "    // real test module\n",
+            "}\n",
+        );
+
+        let (naive_production, _) = split_at_first_cfg_test_attribute(fixture);
+        assert!(
+            !naive_production.contains("pub(crate) fn open("),
+            "control failed to fire: the naive first-attribute split must \
+             lose the definition on this fixture, or the control proves \
+             nothing"
+        );
+
+        let (correct_production, _) = split_at_test_module(fixture);
+        assert!(
+            correct_production.contains("pub(crate) fn open("),
+            "the module-boundary split must keep the definition on a \
+             fixture shaped exactly like the real trap"
+        );
+    }
+
+    /// `MeshIntentNonceLedger::open` is `pub(crate)`: visibility already
+    /// proves no crate OUTSIDE household-rs can call it (the
+    /// `mesh_intent_nonce_ledger_raw_open.rs` compile-fail fixture proves
+    /// that half). Visibility says nothing about INSIDE household-rs —
+    /// nothing stops a second call site from opening a ledger with
+    /// caller-chosen coordinates instead of going through
+    /// `MachineRosterCoordinator::open_mesh_intent_nonce_ledger`, which
+    /// supplies `&self.state_dir` and `self.hh_id.clone()` — the
+    /// coordinator's own bound state, never a caller's choice. This proves
+    /// the internal half: exactly one production call site exists in the
+    /// whole crate, and it is that one.
+    ///
+    /// Anchored on the TYPE this file's own guard measures, qualified as
+    /// `Type::open(`, never the bare verb `open(` alone — this crate has
+    /// several unrelated private `open_*`
+    /// helpers (`open_store_dirs`, `open_lock_file`, `open_anchor`,
+    /// `open_record_for_read`) a verb-only anchor would also match.
+    ///
+    /// Excludes `tests/compile-fail/peer_expectation/mesh_intent_nonce_ledger_raw_open.rs`
+    /// and its `.stderr` sibling on purpose: neither ever compiles into
+    /// anything, so neither is a call site in any artifact this crate
+    /// produces, and both live outside `src/`, which is all this sweeps.
+    // (@khai) Grep-discoverability note: `needle` below is built via
+    // `concat!` so this guard cannot match its own source — deliberate
+    // (see `split_partition_control_has_teeth`'s doc), but it means a plain
+    // text search for "MeshIntentNonceLedger::open" will NOT find this
+    // guard. Anyone inventorying every reference to the ledger's `open`
+    // should also search for `open_mesh_intent_nonce_ledger` and for this
+    // function's own name.
+    //
+    // This co-habitation is a CHOICE, not a technical requirement (@khai,
+    // @zain): the checks below are purely textual (`include_str!` plus
+    // counting) and touch nothing `pub(crate)`, so a `tests/*.rs` file
+    // using `include_str!("../src/mesh_intent_nonce_ledger.rs")` would
+    // read the identical text without ever including ITS OWN source —
+    // `include_str!` reads the target file, never the file containing the
+    // call — and the self-reference this `concat!` works around would not
+    // exist there at all. Kept here instead for two reasons: a new
+    // `tests/*.rs` file is a new Cargo target, which moves the ratchet's
+    // pinned count in both its sites for zero behavioral gain; and this
+    // guard belongs with the rest of this module's ledger assertions
+    // rather than split across two files.
+    //
+    // (@zain) One direct consequence of that choice: `this_test`'s
+    // expected count of 13 below is no longer only a fact about this
+    // file's test module — it also depends on `needle` staying `concat!`'d
+    // rather than a plain literal. A future cleanup that "simplifies"
+    // `needle` back to one string would make this function's own source
+    // match itself once compiled into the test half, and the symptom
+    // would be an unexplained 14. If this guard ever moves to its own
+    // `tests/*.rs` file, `needle` can safely go back to a plain literal at
+    // the same time — not before.
+    #[test]
+    fn mesh_intent_nonce_ledger_open_has_exactly_one_production_call_site() {
+        let needle = concat!("MeshIntentNonceLedger", "::open(");
+
+        let this_file = include_str!("mesh_intent_nonce_ledger.rs");
+        let (this_production, this_test) = split_at_test_module(this_file);
+
+        // Non-vacuity, direction 1 (@zain): if the partition ever matched
+        // NOTHING and fell back to treating the whole file as "production"
+        // (e.g. a broken `needle`/`marker` after a refactor), the 13 known
+        // test call sites would show up right here, in the 0-expected
+        // count below — this assertion is the upper bound, catching a
+        // partition that swallowed the test module into "production".
+        assert_eq!(
+            this_production.matches(needle).count(),
+            0,
+            "no production call site in mesh_intent_nonce_ledger.rs itself \
+             may call MeshIntentNonceLedger::open directly — if this is \
+             13, the partition matched nothing and fell back to the whole \
+             file"
+        );
+        // Non-vacuity, direction 2 (@zain): the count above passing is not
+        // enough — a too-early cut ALSO reports 0 calls, for the wrong
+        // reason (it excised the definition along with everything else).
+        // This is the lower bound: the production half must still contain
+        // the symbol being measured. Together, direction 1 and direction 2
+        // are non-redundant — each catches a partition failure the other
+        // does not. `split_partition_control_has_teeth` above proves this
+        // specific check discriminates; here it guards the real
+        // measurement.
+        // This also catches the real `open` definition being moved or
+        // removed (not just a too-early partition cut) — but only because
+        // this guard lives in `mod tests`, on the far side of `marker`
+        // from `this_production`. The residual (@zain): it takes all
+        // three of (1) `marker` flattened to a plain literal, (2) this
+        // guard itself relocated out of `mod tests` into production, and
+        // (3) `needle` still `concat!`'d, for that to pass spuriously —
+        // (1)+(2) alone would put this assertion's own plain copy of the
+        // definer literal on the production side regardless of the
+        // real definition's fate; (3) is what keeps the earlier
+        // `this_production.matches(needle).count() == 0` check from
+        // catching the same relocation via the guard's own needle use.
+        // Improbable as a conjunction, but worth naming so nobody creates
+        // it by accident while tidying one of the three in isolation.
+        assert!(
+            this_production.contains("pub(crate) fn open("),
+            "production half of mesh_intent_nonce_ledger.rs lost the \
+             `open` definition itself — either the partition cut too \
+             early, or the real definition was moved/removed. This \
+             assertion assumes the guard stays inside `mod tests`; see \
+             the comment above for the narrow case where that stops \
+             being true"
+        );
+        assert_eq!(
+            this_test.matches(needle).count(),
+            13,
+            "expected exactly the known 13 test call sites; a different \
+             count means either a call site was added/removed here, the \
+             module-boundary split broke, or `needle` above was flattened \
+             back to a plain literal — it lives in this same file's test \
+             module, so a plain copy would count itself as a 14th match"
+        );
+
+        let coordinator_fn = concat!("fn open_mesh_intent_nonce_ledger", "(");
+        let coordinator_file = include_str!("machine_roster_store.rs");
+        let (coordinator_production, _coordinator_test) = split_at_test_module(coordinator_file);
+
+        assert!(
+            coordinator_production.contains(coordinator_fn),
+            "production half of machine_roster_store.rs lost \
+             open_mesh_intent_nonce_ledger's own definition — the \
+             partition cut too early"
+        );
+        assert_eq!(
+            coordinator_production.matches(needle).count(),
+            1,
+            "exactly one production call site to MeshIntentNonceLedger::open \
+             may exist in the whole crate, and it must be in \
+             machine_roster_store.rs"
+        );
+
+        // Not just "one call exists in production" — that one call must be
+        // INSIDE open_mesh_intent_nonce_ledger's own body, not merely
+        // somewhere else in the same production half. Isolate the
+        // function's body by brace-matching from its signature.
+        let fn_start = coordinator_production
+            .find(coordinator_fn)
+            .expect("checked above: the definition is present");
+        let brace_open = coordinator_production[fn_start..]
+            .find('{')
+            .map(|offset| fn_start + offset)
+            .expect("a fn definition must have an opening brace");
+        let mut depth = 0i32;
+        let mut fn_end = coordinator_production.len();
+        for (offset, ch) in coordinator_production[brace_open..].char_indices() {
+            match ch {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        fn_end = brace_open + offset + 1;
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        let fn_body = &coordinator_production[fn_start..fn_end];
+        assert_eq!(
+            fn_body.matches(needle).count(),
+            1,
+            "the one production call to MeshIntentNonceLedger::open must be \
+             inside open_mesh_intent_nonce_ledger's own body — a call \
+             elsewhere in production would still pass the crate-wide count \
+             above while bypassing the coordinator"
+        );
+
+        // Non-vacuity, closing the gap a minimum-cardinality check would
+        // leave open: membership (which files DEFINE the symbol) must be
+        // decided on each file's WHOLE content, never on a partitioned
+        // half — a broken partition that cuts before the definition would
+        // otherwise make this file look like it doesn't define `open` at
+        // all, silently excluding it from every assertion above rather
+        // than failing one. And the expected value is the SET `{
+        // "mesh_intent_nonce_ledger.rs" }`, not `>= 1`: a minimum would
+        // stay green if a second file quietly started defining `open` too
+        // — exactly the drift this guard exists to catch. (@zain)
+        //
+        // This scan excludes ITSELF by `file!()` rather than by
+        // obfuscating the literal (@khai): unlike the `needle`/`marker`
+        // checks above — which must read this exact file's own two halves
+        // and cannot avoid it — this loop scans MANY files, and this file
+        // is only incidentally one of them. `file!()`-exclusion survives
+        // a future `git mv` of this guard to another file; a hidden
+        // literal would silently start matching itself again the moment
+        // the guard moved into (or a walked directory started including)
+        // wherever it now lives. The literal below is therefore left
+        // PLAIN and grep-findable. Excluding this file from the walk does
+        // not weaken the check: this file's own definition is already
+        // proven present by the direct `contains` assertion above, so the
+        // walk only needs to prove no OTHER file also defines it.
+        let definer = "pub(crate) fn open(";
+        let self_basename = Path::new(file!())
+            .file_name()
+            .expect("file!() must have a basename")
+            .to_owned();
+        let src_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut defining_files_other_than_self: Vec<String> = std::fs::read_dir(&src_dir)
+            .expect("household-rs/src must exist")
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "rs"))
+            .filter(|entry| entry.file_name() != self_basename)
+            .filter_map(|entry| {
+                let path = entry.path();
+                let text = std::fs::read_to_string(&path).ok()?;
+                text.contains(definer)
+                    .then(|| path.file_name().unwrap().to_string_lossy().into_owned())
+            })
+            .collect();
+        defining_files_other_than_self.sort();
+        assert_eq!(
+            defining_files_other_than_self,
+            Vec::<String>::new(),
+            "no file OTHER than mesh_intent_nonce_ledger.rs (excluded from \
+             this scan by file!(), already proven to define `open` by the \
+             direct assertion above) may also define `open` on this type — \
+             any name here means the definition moved or duplicated"
+        );
+    }
 }
