@@ -1313,7 +1313,25 @@ fn msrv_lint_debt_keeps_its_justification() {
 /// this string is chosen by us. Accepting variants of something we define would
 /// multiply controls without closing anything, and would let a near-miss read
 /// as compliance. Near-misses are therefore a hard failure, not a shrug.
-const DOC_SCOPE_MARKER: &str = "doc-scope: every declared module is named in this crate doc.";
+/// Split with `concat!` so this file does not contain the marker as a
+/// contiguous string. Today two independent barriers already stop the guard
+/// finding itself -- the scan domain is a path CONSTRUCTED as
+/// `<member>/src/lib.rs`, and `crate_doc_block` reads only `//!` lines, where
+/// none of these literals live. Both were measured, and an attempt to pin the
+/// first with an assertion was withdrawn: it re-derived the path instead of
+/// asking the scanner, so it stayed GREEN under the very mutation its name
+/// claimed to catch.
+///
+/// `concat!` needs neither barrier to hold. It resolves at compile time, the
+/// `&str` is identical, and it survives ANY future widening -- a new guard that
+/// walks whole files, a copied fixture, these literals moving into a doc
+/// comment. The sibling `r0a_implementation_scope_guard.rs` already uses it
+/// seven times; this file used it zero, which is why the hazard existed here
+/// and not there.
+const DOC_SCOPE_MARKER: &str = concat!(
+    "doc-",
+    "scope: every declared module is named in this crate doc."
+);
 
 /// Crates that have opted in, committed so that LEAVING the scope costs a
 /// visible diff exactly like joining it. The marker lives in a doc comment, so
@@ -1407,9 +1425,21 @@ fn doc_scope_marker_near_misses_are_rejected() {
     // of these is opting in as far as its author is concerned and is invisible
     // to the exact-match check above.
     let near_misses = [
-        "doc scope: every declared module is named in this crate doc.",
-        "doc-scope: every declared module is named in this crate doc",
-        "DOC-SCOPE: every declared module is named in this crate doc.",
+        // `concat!` for the same reason as the marker above: these are the
+        // spellings the guard hunts for, so a contiguous copy here is exactly
+        // the needle a widened scan would find in its own fixture.
+        concat!(
+            "doc ",
+            "scope: every declared module is named in this crate doc."
+        ),
+        concat!(
+            "doc-",
+            "scope: every declared module is named in this crate doc"
+        ),
+        concat!(
+            "DOC-",
+            "SCOPE: every declared module is named in this crate doc."
+        ),
     ];
     for member in workspace_members(&rust_root) {
         let Some(lib_rs) = crate_lib_rs(&rust_root, &member) else {
