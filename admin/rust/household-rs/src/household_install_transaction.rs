@@ -1909,6 +1909,10 @@ mod install_fail_injection {
 mod tests {
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
+    use std::path::PathBuf;
+    use std::process::Command;
+    use std::thread;
+    use std::time::{Duration, Instant};
 
     use tempfile::TempDir;
 
@@ -2566,6 +2570,129 @@ mod tests {
                 .exists(),
             "foreign generation preserves quarantine evidence"
         );
+    }
+
+    const ACK_CRASH_WORKER: &str =
+        "household_install_transaction::tests::finalize_ack_delivery_crash_worker";
+    const ACK_CHILD_PATH_ENV: &str = "THEYOS_ACK_CRASH_CHILD_PATH";
+    const ACK_CHILD_READY_ENV: &str = "THEYOS_ACK_CRASH_CHILD_READY";
+
+    /// Child: drive a real install to its terminal result, announce the
+    /// delivery boundary, then stop dead — standing in for a process that is
+    /// about to write the Ack to the peer and never gets to finish.
+    #[test]
+    fn finalize_ack_delivery_crash_worker() {
+        let Some(path_out) = std::env::var_os(ACK_CHILD_PATH_ENV).map(PathBuf::from) else {
+            return;
+        };
+        let ready = PathBuf::from(std::env::var_os(ACK_CHILD_READY_ENV).unwrap());
+
+        // The child owns the state dir. `TempDir` would delete it on drop, but
+        // the parent SIGKILLs this process, so no destructor runs and the
+        // directory survives for inspection — which is exactly the state a
+        // crashed installer leaves behind.
+        let state = TempDir::new().unwrap();
+        fs::write(&path_out, state.path().to_str().unwrap()).unwrap();
+
+        let lifecycle = HouseholdLifecycleLock::open_verified(state.path()).unwrap();
+        let (guard, expectation) = begin(&state, &lifecycle);
+        install_exact_marker(&state, &expectation);
+        let outcome =
+            finish_household_install_under_lifecycle(&guard, &expectation, |_| Ok(())).unwrap();
+        let terminal = match outcome {
+            HouseholdInstallFinalizeOutcome::RotatedAndCleared {
+                terminal_result, ..
+            }
+            | HouseholdInstallFinalizeOutcome::AlreadyRotatedAndCleared {
+                terminal_result, ..
+            } => terminal_result,
+        };
+
+        // Announce BEFORE the send. Everything after this point is the window
+        // in which the peer may or may not have received the Ack.
+        let announced = prepare_finalize_ack_delivery_under_lifecycle(&guard, &terminal).unwrap();
+        assert!(matches!(
+            announced,
+            FinalizeAckDeliveryRecoveryOutcome::MayHaveTakenEffect(_)
+        ));
+
+        fs::write(&ready, b"announced").unwrap();
+        std::mem::forget(state); // belt and braces if a fallback path ever exits
+        thread::sleep(Duration::from_secs(30));
+    }
+
+    /// A local send is NEVER evidence the peer processed the Ack.
+    ///
+    /// The type already refuses to say otherwise — `FinalizeAckDeliveryRecoveryOutcome`
+    /// has no `Delivered` variant, so no code path can record delivery. This
+    /// is the other half, by execution rather than by reading: kill the
+    /// process in the window where the Ack may or may not have reached the
+    /// peer, and a restart must still report `MayHaveTakenEffect`.
+    ///
+    /// `Absent` here would be the real defect — a retry would conclude nothing
+    /// had happened and re-run an effect the peer may already have applied.
+    #[test]
+    fn sigkill_after_announcing_delivery_never_recovers_as_absent() {
+        let scratch = TempDir::new().unwrap();
+        let path_out = scratch.path().join("child-state-path");
+        let ready = scratch.path().join("child-announced");
+
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            .arg("--exact")
+            .arg(ACK_CRASH_WORKER)
+            .arg("--nocapture")
+            .env(ACK_CHILD_PATH_ENV, &path_out)
+            .env(ACK_CHILD_READY_ENV, &ready)
+            .spawn()
+            .unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while !ready.exists() {
+            if let Ok(Some(status)) = child.try_wait() {
+                panic!("child exited ({status}) without announcing the delivery boundary");
+            }
+            assert!(
+                Instant::now() < deadline,
+                "child never announced the delivery boundary"
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
+        child.kill().unwrap();
+        assert!(
+            !child.wait().unwrap().success(),
+            "the child was supposed to be killed in the delivery window"
+        );
+
+        let state_path = PathBuf::from(fs::read_to_string(&path_out).unwrap());
+        let lifecycle = HouseholdLifecycleLock::open_verified(&state_path).unwrap();
+        let guard = lifecycle.lock_exclusive().unwrap();
+
+        let recovered = load_finalize_ack_delivery_under_lifecycle(&guard).unwrap();
+        let retained = match recovered {
+            FinalizeAckDeliveryRecoveryOutcome::MayHaveTakenEffect(retained) => retained,
+            FinalizeAckDeliveryRecoveryOutcome::Absent => panic!(
+                "recovery reported Absent after a crash in the delivery window: a retry                  would conclude nothing had happened and re-apply an effect the peer may                  already have processed"
+            ),
+        };
+
+        // Retry must complete at the EXACT persisted endpoint. Replaying the
+        // retained result is accepted; anything divergent, even by one byte,
+        // is quarantine evidence rather than a second delivery.
+        assert!(matches!(
+            prepare_finalize_ack_delivery_under_lifecycle(&guard, &retained).unwrap(),
+            FinalizeAckDeliveryRecoveryOutcome::MayHaveTakenEffect(ref again)
+                if again == &retained
+        ));
+
+        let mut divergent = (*retained).clone();
+        divergent.ack_bytes.push(0);
+        assert_eq!(
+            prepare_finalize_ack_delivery_under_lifecycle(&guard, &divergent).unwrap_err(),
+            HouseholdInstallTransactionError::Quarantined,
+            "a retry that is not byte-exact must fail closed, not deliver again"
+        );
+
+        fs::remove_dir_all(&state_path).ok();
     }
 
     #[test]
