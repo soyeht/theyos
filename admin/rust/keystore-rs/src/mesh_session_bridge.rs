@@ -101,6 +101,138 @@ pub enum BridgeError {
     Keystore(KeystoreError),
 }
 
+// ─── Runtime facade seam (Lane R, @ilia, authorized 2026-08-05) ────────────
+//
+// `crate::validator::RosterLookup`/`SignatureVerifier`/`Clock` (all
+// `d4_inline` re-exports, `pub(crate) use d4_inline::*;` at this crate's
+// root) are invisible outside THIS crate — `pub(crate)`-capped regardless
+// of what visibility they carry in their own defining module. And this
+// crate cannot depend on `household-rs` to bridge them directly:
+// `household-rs` already depends on `keystore-rs`, so the reverse edge
+// would be a cyclic package dependency, rejected outright by cargo — same
+// class of constraint as this module's own doc on why the signer lives
+// here and not in a separate bridge crate.
+//
+// So the bridge runs the other way: this crate exposes a narrow, `pub`
+// seam trait built ONLY from primitive/std types (never a household-rs or
+// D4 type by name), a caller outside this crate implements it against
+// their own real source, and a private adapter here lifts that into the
+// `pub(crate)` D4 trait `new_internal` actually requires. Same "typed
+// facade, opaque internals" shape used throughout this engagement.
+
+/// External seam for `crate::validator::RosterLookup` — implement this
+/// against a real roster-authority source (e.g. household-rs's
+/// `MachineRosterCoordinator::query_machine_currency`) from outside this
+/// crate; [`RosterLookupBridge`] lifts it into the real D4 trait.
+///
+/// **Deliberately covers only 2 of D4's 3 `RosterLookup` methods.** There
+/// is no `acquire_currency_lease` here — see
+/// [`RosterLookupBridge::acquire_currency_lease`]'s own doc for why: a
+/// method whose result this seam would only ever discard is not a real
+/// seam, it is a fabricated one, and this round was told explicitly not
+/// to build those.
+pub trait RosterLookupSource {
+    /// Mirrors `crate::validator::RosterLookup::query_machine_currency`
+    /// exactly, but through [`RosterCurrencyView`] instead of naming the
+    /// D4 type directly.
+    fn query_machine_currency(&self, machine_id: &str) -> RosterCurrencyView;
+
+    /// Mirrors `crate::validator::RosterLookup::currency_revision`.
+    fn currency_revision(&self, machine_id: &str) -> u64;
+}
+
+/// Mirrors `crate::validator::RosterCurrency` field-for-field, so
+/// [`RosterLookupBridge`] can convert losslessly — this type exists only
+/// because the real one cannot be named outside this crate.
+#[derive(Debug, Clone)]
+pub enum RosterCurrencyView {
+    Active {
+        member_pub: Vec<u8>,
+        member_cert_fingerprint: [u8; 32],
+    },
+    Revoked,
+    NotListed,
+    Unavailable,
+}
+
+/// External seam for `crate::sign::Clock` — trivially real (a wall clock
+/// needs no bridge to household-rs at all), but still needs a `pub` seam
+/// for the exact same visibility reason as [`RosterLookupSource`].
+/// `Send + Sync` mirrors `crate::sign::Clock`'s own bound exactly.
+pub trait ClockSource: Send + Sync {
+    fn now(&self) -> u64;
+}
+
+/// Lifts a [`RosterLookupSource`] into the real, `pub(crate)`
+/// `crate::validator::RosterLookup` D4 requires.
+// Narrow and deliberate, same posture as `new_internal`'s own allow: this
+// has no NON-test caller until `SignatureVerifier`/`cell::open` real
+// construction/policy/generation sourcing (this round's declared, NOT
+// implemented seams) also land — a `RosterLookup`/`Clock` alone cannot
+// feed `new_internal`, which needs all five. Exercised by this module's
+// own tests below. Scoped to this one struct, never module-wide.
+#[allow(dead_code)]
+struct RosterLookupBridge<'a, T: RosterLookupSource>(&'a T);
+
+impl<T: RosterLookupSource> crate::validator::RosterLookup for RosterLookupBridge<'_, T> {
+    fn query_machine_currency(&self, machine_id: &str) -> crate::validator::RosterCurrency {
+        match self.0.query_machine_currency(machine_id) {
+            RosterCurrencyView::Active {
+                member_pub,
+                member_cert_fingerprint,
+            } => crate::validator::RosterCurrency::Active {
+                member_pub,
+                member_cert_fingerprint,
+            },
+            RosterCurrencyView::Revoked => crate::validator::RosterCurrency::Revoked,
+            RosterCurrencyView::NotListed => crate::validator::RosterCurrency::NotListed,
+            RosterCurrencyView::Unavailable => crate::validator::RosterCurrency::Unavailable,
+        }
+    }
+
+    fn currency_revision(&self, machine_id: &str) -> u64 {
+        self.0.currency_revision(machine_id)
+    }
+
+    /// **Honestly incomplete, fail-closed — not a fabricated success.**
+    /// D4's real contract is mutual exclusion: the returned lease must
+    /// genuinely BLOCK a conflicting mutation for as long as it stays
+    /// alive (see `RosterLookup::acquire_currency_lease`'s own doc).
+    /// household-rs has no externally-reachable primitive that provides
+    /// this today — its own internal lock (`RosterLock`,
+    /// `machine_roster_store.rs`) is `pub(crate)` to household-rs itself,
+    /// scoped to the duration of a single internal call, never handed to
+    /// an external caller. There is deliberately no way to plug a real
+    /// implementation into this method through [`RosterLookupSource`] —
+    /// see that trait's own doc for why a discarded-result method would
+    /// be worse than no method at all. This unconditionally reports the
+    /// roster as changed, `RosterChanged` — the SAME outcome a real
+    /// implementation reports for a genuine conflicting mutation, never a
+    /// false grant. Closing this for real needs household-rs to grow a
+    /// real, externally-holdable mutual-exclusion primitive — out of this
+    /// round's scope.
+    fn acquire_currency_lease(
+        &self,
+        _machine_id: &str,
+        _expected_revision: u64,
+    ) -> Result<Box<dyn crate::validator::CurrencyLease + '_>, crate::validator::RosterChanged>
+    {
+        Err(crate::validator::RosterChanged)
+    }
+}
+
+/// Lifts a [`ClockSource`] into the real, `pub(crate)` `crate::sign::Clock`
+/// D4 requires.
+// Same posture and reason as `RosterLookupBridge`'s own allow.
+#[allow(dead_code)]
+struct ClockBridge<'a, T: ClockSource>(&'a T);
+
+impl<T: ClockSource> Clock for ClockBridge<'_, T> {
+    fn now(&self) -> u64 {
+        self.0.now()
+    }
+}
+
 /// Everything the authorised path needs, held privately.
 ///
 /// Core's trait hands `sign_mesh_session_frame` only a preimage and a
@@ -797,5 +929,118 @@ mod bridge_reds {
         }
         let err = signer.sign_authorised(b"x").unwrap_err();
         assert!(matches!(err, BridgeError::NotAuthorised(_)), "got {err:?}");
+    }
+}
+
+#[cfg(test)]
+mod runtime_facade_seam_tests {
+    use super::*;
+
+    struct FixedRosterSource {
+        currency: RosterCurrencyView,
+        revision: u64,
+    }
+    impl RosterLookupSource for FixedRosterSource {
+        fn query_machine_currency(&self, _machine_id: &str) -> RosterCurrencyView {
+            self.currency.clone()
+        }
+        fn currency_revision(&self, _machine_id: &str) -> u64 {
+            self.revision
+        }
+    }
+
+    struct FixedClockSource(u64);
+    impl ClockSource for FixedClockSource {
+        fn now(&self) -> u64 {
+            self.0
+        }
+    }
+
+    #[test]
+    fn roster_lookup_bridge_maps_active_losslessly() {
+        let source = FixedRosterSource {
+            currency: RosterCurrencyView::Active {
+                member_pub: vec![0xAA; 33],
+                member_cert_fingerprint: [0xBB; 32],
+            },
+            revision: 7,
+        };
+        let bridge = RosterLookupBridge(&source);
+        match crate::validator::RosterLookup::query_machine_currency(&bridge, "m-1") {
+            crate::validator::RosterCurrency::Active {
+                member_pub,
+                member_cert_fingerprint,
+            } => {
+                assert_eq!(member_pub, vec![0xAA; 33]);
+                assert_eq!(member_cert_fingerprint, [0xBB; 32]);
+            }
+            other => panic!("expected Active, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn roster_lookup_bridge_maps_revoked_not_listed_unavailable() {
+        for (view, expect_revoked, expect_not_listed) in [
+            (RosterCurrencyView::Revoked, true, false),
+            (RosterCurrencyView::NotListed, false, true),
+            (RosterCurrencyView::Unavailable, false, false),
+        ] {
+            let source = FixedRosterSource {
+                currency: view,
+                revision: 0,
+            };
+            let bridge = RosterLookupBridge(&source);
+            let mapped = crate::validator::RosterLookup::query_machine_currency(&bridge, "m-1");
+            assert_eq!(
+                matches!(mapped, crate::validator::RosterCurrency::Revoked),
+                expect_revoked
+            );
+            assert_eq!(
+                matches!(mapped, crate::validator::RosterCurrency::NotListed),
+                expect_not_listed
+            );
+        }
+    }
+
+    #[test]
+    fn roster_lookup_bridge_delegates_currency_revision() {
+        let source = FixedRosterSource {
+            currency: RosterCurrencyView::NotListed,
+            revision: 42,
+        };
+        let bridge = RosterLookupBridge(&source);
+        assert_eq!(
+            crate::validator::RosterLookup::currency_revision(&bridge, "m-1"),
+            42
+        );
+    }
+
+    /// Pins the fail-closed contract documented on
+    /// `RosterLookupBridge::acquire_currency_lease` — it must NEVER grant
+    /// a lease, regardless of `machine_id`/`expected_revision`, because no
+    /// real mutual-exclusion primitive is reachable from household-rs
+    /// today. A future accidental "make it grant sometimes" edit fails
+    /// this test.
+    #[test]
+    fn red_roster_lookup_bridge_never_grants_a_lease() {
+        let source = FixedRosterSource {
+            currency: RosterCurrencyView::Active {
+                member_pub: vec![],
+                member_cert_fingerprint: [0u8; 32],
+            },
+            revision: 0,
+        };
+        let bridge = RosterLookupBridge(&source);
+        let err = crate::validator::RosterLookup::acquire_currency_lease(&bridge, "m-1", 0)
+            .err()
+            .expect("must never grant a lease");
+        assert_eq!(err, crate::validator::RosterChanged);
+    }
+
+    #[test]
+    fn clock_bridge_delegates_now() {
+        let source = FixedClockSource(1_767_225_600);
+        let bridge = ClockBridge(&source);
+        assert_eq!(Clock::now(&bridge), 1_767_225_600);
     }
 }
