@@ -28,6 +28,24 @@ Deliberate choices, each of which changes what the gate can claim:
 * Metadata is read WITHOUT `--filter-platform`, so the closure is the union
   over every target platform. That is a superset of any single build, which is
   the conservative direction for an "X must not reach Y" claim.
+
+* PRESENCE, not reachability, is what the feature-off phase forbids. A crate can
+  sit in the resolve graph with no normal edge to it -- reached only through
+  [dev-dependencies] -- and that still counts: a dev-only edge compiles the crate
+  for test builds and leaves it one feature flag from a normal one. The phase
+  tests presence and its message must say presence. It said "reachable" once, and
+  a reader went and measured reachability with `cargo tree`, got a correct answer
+  to a different question, and wrote a mitigation into the ledger. The word did
+  that, not the missing detail.
+
+* LIMIT, declared 2026-08-05 (@khai, measured in both feature arms): a crate
+  compiled in by `#[path = "..."]` produces NO NODE and NO EDGE. `keystore-rs`
+  compiles `mesh-session-control-model-rs`'s real sources under its
+  `mesh-session` feature, and that crate is absent from the resolve graph with
+  the feature both OFF and ON. So the opening claim -- that the resolve graph
+  describes what cargo actually built -- holds for dependency edges and NOT for
+  source inclusion. No graph-based check can see a `#[path]` crate; a containment
+  claim across such a boundary needs a different instrument.
 """
 
 from __future__ import annotations
@@ -282,14 +300,32 @@ def cmd_regress(args: argparse.Namespace) -> int:
     for name in new_pkgs:
         print(f"  NEW-PKG {name}")
 
+    # An exemption is scoped to ONE (watched, parent) pair, spelled WATCHED=PARENT.
+    # It used to be a bare parent name applying to every watched package at once,
+    # which is wider than any caller ever meant: `--allow-new-parent household-rs`,
+    # written to permit household-rs -> mesh-session-core-rs, silently also permits
+    # household-rs -> mesh-session-control-model-rs, and PHASE 2 constrains the
+    # parent set of core-rs only -- so that second edge would have appeared with
+    # both phases green. A bare name is now a hard error rather than a quietly
+    # coarser reading; the sole bare use at the call site was measured inert
+    # (identical output with and without it) before the form was changed.
+    allowed = set()
+    for spec in args.allow_new_parent or []:
+        if "=" not in spec:
+            print(f"ERROR --allow-new-parent must be WATCHED=PARENT, got {spec!r}")
+            return 2
+        w, _, p = spec.partition("=")
+        if w not in WATCHLIST:
+            print(f"ERROR --allow-new-parent names {w!r}, which is not watched: {WATCHLIST}")
+            return 2
+        allowed.add((w, p))
+
     violations = []
     for watched in sorted(set(base["watchlist_parents"]) | set(cand["watchlist_parents"])):
         b = set(base["watchlist_parents"].get(watched, []))
         c = set(cand["watchlist_parents"].get(watched, []))
         added = sorted(c - b)
-        # A brand-new package is allowed to be a parent only if it is the crate
-        # under review; anything else means an existing crate grew the edge.
-        unexpected = [a for a in added if a not in (args.allow_new_parent or [])]
+        unexpected = [a for a in added if (watched, a) not in allowed]
         print(f"watch {watched}: base_parents={sorted(b)} added={added}")
         if unexpected:
             violations.append((watched, unexpected))
@@ -327,8 +363,10 @@ def main() -> int:
     p_r = sub.add_parser("regress", help="no NEW parent for a watched package")
     p_r.add_argument("--metadata", required=True)
     p_r.add_argument("--baseline", required=True)
-    p_r.add_argument("--allow-new-parent", nargs="*",
-                     help="packages permitted to become a new parent (the crate under review)")
+    p_r.add_argument("--allow-new-parent", nargs="*", metavar="WATCHED=PARENT",
+                     help="exempt ONE watched package gaining ONE named parent, e.g. "
+                          "mesh-session-core-rs=household-rs. A bare parent name is "
+                          "rejected: it would exempt that parent for every watched package.")
     p_r.set_defaults(func=cmd_regress)
 
     args = ap.parse_args()

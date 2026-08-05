@@ -333,6 +333,40 @@ jobs:
         working-directory: admin/rust
         run: cargo test -p claw-share-bridge-rs
 
+      - name: Lane C graph gate (Product A / D4 boundary, blocking)
+        # The gate existed from 6bd1f57c with a baseline, an allowlist, and two
+        # non-vacuity probes -- and no job invoked it, in any spelling. It has
+        # failed since 6d1ce46c and nobody saw it for 63 commits, including the
+        # approval that declared "gates green". This workflow already says, of
+        # another job, "A job that cannot fail the build is not a gate"; this
+        # step is that sentence applied to the instrument that enforces the
+        # Product A / nvpn and feature-off boundaries.
+        #
+        # The `skip=0` assertion below is DEFENCE IN DEPTH, not the primary fix.
+        # It was written against a script that ended with `[ "$fail" -eq 0 ] ||
+        # exit 1`, so `pass=0 fail=0 skip=7` exited 0 -- the script's own header
+        # refused to count SKIP as PASS while its exit code did. That defect is
+        # fixed in this same commit at both exit sites (structural and full), and
+        # `fail=0 skip=7` now exits 1 on its own. The assertion is kept anyway:
+        # it fails the build on the summary CI can actually see, so a future
+        # regression in the script's exit path cannot silently restore the hole.
+        #
+        # Measured on this tree (worktree at b750f2c6 + this movement):
+        #   before the movement                 -> pass=4 fail=3 skip=0, exit 1
+        #   after                               -> pass=7 fail=0 skip=0, exit 0
+        #   synthetic normal edge to core-rs    -> FAIL (the predicate's own RED)
+        working-directory: admin/rust
+        run: |
+          set -o pipefail
+          bash scripts/graph-gate/run_gate.sh structural 2>&1 | tee /tmp/graph-gate.log
+          summary="$(grep -E '^pass=[0-9]+ fail=[0-9]+ skip=[0-9]+$' /tmp/graph-gate.log | tail -1)"
+          echo "summary: ${summary}"
+          case "${summary}" in
+            *" skip=0") ;;
+            "") echo "::error::graph gate printed no summary line -- it did not run to completion"; exit 1 ;;
+            *) echo "::error::graph gate reported SKIPs (${summary}); a skipped configuration is not a pass"; exit 1 ;;
+          esac
+
   no-bash-policy:
     name: No-Bash Policy Check
     runs-on: ubuntu-latest
