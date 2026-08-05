@@ -41,11 +41,16 @@ const GENERATION_TOKEN_BYTES: usize = 32;
 const GENERATION_FILE_BYTES: usize = 1 + GENERATION_TOKEN_BYTES;
 const GENERATION_TMP_PREFIX: &str = ".household-lifecycle-generation-v1.tmp.";
 
-#[cfg(target_os = "linux")]
+// `any(test, target_os = "linux")`, matching the ledger's twin: the allowlist
+// below and its equality assertions must exist under `cfg(test)` on every
+// host, or the pin that keeps the two allowlists from drifting would only run
+// on Linux — and a set-equality gate that is absent on the developer's own
+// machine is exactly the kind that stops catching things.
+#[cfg(any(test, target_os = "linux"))]
 const EXT4_SUPER_MAGIC: i64 = 0x0000_EF53;
-#[cfg(target_os = "linux")]
+#[cfg(any(test, target_os = "linux"))]
 const XFS_SUPER_MAGIC: i64 = 0x5846_5342;
-#[cfg(target_os = "linux")]
+#[cfg(any(test, target_os = "linux"))]
 const BTRFS_SUPER_MAGIC: i64 = 0x9123_683E;
 
 /// Failure to establish or acquire the stable lifecycle lock.
@@ -947,7 +952,7 @@ fn validate_supported_persistent_filesystem(dir: &File) -> Result<(), HouseholdL
         .map(|byte| byte.to_ne_bytes()[0])
         .take_while(|byte| *byte != 0)
         .collect();
-    if name == b"apfs" {
+    if macos_lifecycle_filesystem_is_allowlisted(&name) {
         Ok(())
     } else {
         Err(HouseholdLifecycleLockError::UnsupportedFilesystem)
@@ -957,14 +962,61 @@ fn validate_supported_persistent_filesystem(dir: &File) -> Result<(), HouseholdL
 #[cfg(target_os = "linux")]
 fn validate_supported_persistent_filesystem(dir: &File) -> Result<(), HouseholdLifecycleLockError> {
     let stat = rustix::fs::fstatfs(dir).map_err(|_| HouseholdLifecycleLockError::Io)?;
-    if matches!(
-        stat.f_type,
-        EXT4_SUPER_MAGIC | XFS_SUPER_MAGIC | BTRFS_SUPER_MAGIC
-    ) {
+    if linux_lifecycle_filesystem_is_allowlisted(stat.f_type) {
         Ok(())
     } else {
         Err(HouseholdLifecycleLockError::UnsupportedFilesystem)
     }
+}
+
+/// The EXACT set of Linux filesystems on which a household lifecycle LOCK may
+/// exist.
+///
+/// A named array rather than a `matches!` arm, for the same reason the ledger
+/// uses one: `matches!(f_type, A | B | C)` over an `i64` has a 2^64 domain and
+/// therefore cannot be compared against an expected set. A test can only probe
+/// members it thought to name, so adding an unanticipated magic changes
+/// behaviour with every existing assertion still green. As an array the set is
+/// a value, and any edit — addition, removal, reordering — fails an equality
+/// assertion.
+///
+/// This gate decides whether [`HouseholdLifecycleLockError::UnsupportedFilesystem`]
+/// is returned, i.e. whether the lifecycle lock can exist at all. Every guard
+/// built on that lock inherits this set.
+///
+/// Deliberately the SAME set as the ledger's
+/// `LINUX_RENAME_KNOWN_NO_EFFECT_FILESYSTEMS`; they are pinned equal to each
+/// other by `the_two_filesystem_allowlists_are_the_same_set`.
+#[cfg(any(test, target_os = "linux"))]
+const LINUX_LIFECYCLE_LOCK_FILESYSTEMS: [i64; 3] =
+    [EXT4_SUPER_MAGIC, XFS_SUPER_MAGIC, BTRFS_SUPER_MAGIC];
+
+/// The EXACT set of macOS filesystems on which a household lifecycle LOCK may
+/// exist. Same reasoning; a bare `== b"apfs"` cannot be asserted equal to an
+/// expected set.
+#[cfg(any(test, target_os = "macos"))]
+const MACOS_LIFECYCLE_LOCK_FILESYSTEMS: [&[u8]; 1] = [b"apfs"];
+
+// `const fn` with an indexed loop rather than `.contains()`: slice search is
+// not a `const fn`, and keeping this const means the compile-time set and the
+// runtime notion of "admitted" cannot drift apart. The ledger's twin dropped
+// const when it moved to `.contains()`; recovering it here is cheap, so it is
+// recovered rather than silently lost.
+#[cfg(any(test, target_os = "linux"))]
+const fn linux_lifecycle_filesystem_is_allowlisted(fs_type: i64) -> bool {
+    let mut i = 0;
+    while i < LINUX_LIFECYCLE_LOCK_FILESYSTEMS.len() {
+        if LINUX_LIFECYCLE_LOCK_FILESYSTEMS[i] == fs_type {
+            return true;
+        }
+        i += 1;
+    }
+    false
+}
+
+#[cfg(any(test, target_os = "macos"))]
+fn macos_lifecycle_filesystem_is_allowlisted(name: &[u8]) -> bool {
+    MACOS_LIFECYCLE_LOCK_FILESYSTEMS.contains(&name)
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
@@ -1020,6 +1072,92 @@ mod tests {
         );
         drop(armed);
         HouseholdLifecycleLock::open_verified(temp.path()).unwrap();
+    }
+
+    /// The lifecycle-lock allowlist, pinned by EXACT SET EQUALITY.
+    ///
+    /// This gate returns [`HouseholdLifecycleLockError::UnsupportedFilesystem`],
+    /// so it decides whether the lifecycle lock can exist at all — every guard
+    /// built on that lock inherits this set. It was the LAST `matches!` arm of
+    /// its kind in this crate: the ledger's twin was pinned by equality while
+    /// this one kept the or-pattern on Linux and a bare `== b"apfs"` on macOS,
+    /// with nothing asserting either. Closing one and leaving the other is
+    /// shutting the door and leaving the window.
+    ///
+    /// Membership assertions would not do. They catch only the magics they
+    /// happen to name; add one nobody anticipated and every assertion stays
+    /// green while the gate quietly admits it.
+    #[test]
+    fn lifecycle_lock_filesystem_allowlist_is_exact_and_review_gated() {
+        assert_eq!(
+            LINUX_LIFECYCLE_LOCK_FILESYSTEMS,
+            [EXT4_SUPER_MAGIC, XFS_SUPER_MAGIC, BTRFS_SUPER_MAGIC],
+            "the Linux lifecycle-lock allowlist changed. This set decides whether a \
+             lifecycle lock may exist, and every guard built on that lock inherits it; \
+             re-justify admission before changing this set"
+        );
+        assert_eq!(
+            MACOS_LIFECYCLE_LOCK_FILESYSTEMS,
+            [b"apfs".as_slice()],
+            "the macOS lifecycle-lock allowlist changed; same obligation as the Linux set"
+        );
+
+        for magic in LINUX_LIFECYCLE_LOCK_FILESYSTEMS {
+            assert!(linux_lifecycle_filesystem_is_allowlisted(magic));
+        }
+        for name in MACOS_LIFECYCLE_LOCK_FILESYSTEMS {
+            assert!(macos_lifecycle_filesystem_is_allowlisted(name));
+        }
+        // 0x0102_1994 tmpfs, 0x0000_6969 NFS — named locally because this
+        // module does not define them, and the point is to probe OUTSIDE the
+        // admitted set.
+        for magic in [0x0102_1994, 0x0000_6969, i64::MAX, 0] {
+            assert!(!linux_lifecycle_filesystem_is_allowlisted(magic));
+        }
+        // `apfs2` is the load-bearing one: an implementation using
+        // `starts_with` instead of equality would admit it, and someone could
+        // make that change believing it equivalent.
+        for name in [b"tmpfs".as_slice(), b"nfs", b"hfs", b"", b"apfs2", b"apf"] {
+            assert!(
+                !macos_lifecycle_filesystem_is_allowlisted(name),
+                "{} must not be admitted",
+                String::from_utf8_lossy(name)
+            );
+        }
+    }
+
+    /// The crate has TWO filesystem allowlists. This pins them to the SAME set
+    /// and fails when EITHER moves alone.
+    ///
+    /// That is the property that makes the crosscheck worth having: two copies
+    /// that must agree, with nothing comparing them, is drift waiting to
+    /// happen — and they had already diverged in FORM (the ledger read a named
+    /// set on both platforms while this module used an or-pattern and a bare
+    /// literal), which is how content diverges next without a signal.
+    ///
+    /// They must agree because they answer the same physical question about
+    /// the same directory: the lifecycle lock and the ledger record live under
+    /// one household. A filesystem good enough to hold the lock but not the
+    /// record — or the reverse — is not a state this crate can represent.
+    ///
+    /// If a future change makes them legitimately differ, do not delete this
+    /// test: assert the intended difference here, with the reason, so the
+    /// divergence stays declared instead of silent.
+    #[test]
+    fn the_two_filesystem_allowlists_are_the_same_set() {
+        assert_eq!(
+            LINUX_LIFECYCLE_LOCK_FILESYSTEMS,
+            crate::mesh_intent_nonce_ledger::LINUX_RENAME_KNOWN_NO_EFFECT_FILESYSTEMS,
+            "the lifecycle-lock and nonce-ledger Linux allowlists drifted apart. They \
+             govern the same household directory and must admit the same filesystems; \
+             change both together, or declare the difference here with its reason"
+        );
+        assert_eq!(
+            MACOS_LIFECYCLE_LOCK_FILESYSTEMS,
+            crate::mesh_intent_nonce_ledger::MACOS_RENAME_KNOWN_NO_EFFECT_FILESYSTEMS,
+            "the lifecycle-lock and nonce-ledger macOS allowlists drifted apart; same \
+             obligation as the Linux sets"
+        );
     }
 
     #[test]

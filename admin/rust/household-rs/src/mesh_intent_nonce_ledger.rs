@@ -85,11 +85,15 @@ const EXT4_SUPER_MAGIC: i64 = 0x0000_EF53;
 const XFS_SUPER_MAGIC: i64 = 0x5846_5342;
 #[cfg(any(test, target_os = "linux"))]
 const BTRFS_SUPER_MAGIC: i64 = 0x9123_683E;
+// `pub(crate)` ONLY so `household_lifecycle` can pin its own allowlist equal
+// to this one. There are two filesystem allowlists in this crate and they must
+// not drift; a crosscheck cannot exist if neither can see the other. Not
+// widened beyond the crate, and nothing outside the crosscheck reads it.
 #[cfg(any(test, target_os = "linux"))]
-const LINUX_RENAME_KNOWN_NO_EFFECT_FILESYSTEMS: [i64; 3] =
+pub(crate) const LINUX_RENAME_KNOWN_NO_EFFECT_FILESYSTEMS: [i64; 3] =
     [EXT4_SUPER_MAGIC, XFS_SUPER_MAGIC, BTRFS_SUPER_MAGIC];
 #[cfg(any(test, target_os = "macos"))]
-const MACOS_RENAME_KNOWN_NO_EFFECT_FILESYSTEMS: [&[u8]; 1] = [b"apfs"];
+pub(crate) const MACOS_RENAME_KNOWN_NO_EFFECT_FILESYSTEMS: [&[u8]; 1] = [b"apfs"];
 #[cfg(test)]
 const TMPFS_SUPER_MAGIC: i64 = 0x0102_1994;
 #[cfg(test)]
