@@ -95,48 +95,77 @@ impl<H: RevocableMeshSession> D1Admission for RegistryD1Admission<'_, H> {
         let binding = SealedBinding::from_membership_key(key, &snapshot)
             .map_err(|_| IntentError::D1MembershipRejected)?;
 
-        loop {
-            let deadline_at = Instant::now() + deadline.remaining();
-            match self
-                .registry
-                .try_preauthorize_before(&binding, self.handle.clone(), deadline_at)
-            {
-                Ok(pending) => return Ok(RegistryD1Pending(pending)),
-                Err(err) => match map_preauthorize_error(err, deadline.is_expired()) {
-                    PreauthorizeAction::Retry => {
-                        // household's own registry never waits internally
-                        // (`try_lock` only) — the backoff loop is
-                        // explicitly this adapter's job. A yield, not a
-                        // sleep: the registry's lock is held only for
-                        // in-memory HashMap/Vec mutation, never I/O, so
-                        // the contended holder is expected back almost
-                        // immediately.
-                        std::thread::yield_now();
-                    }
-                    PreauthorizeAction::Fail(e) => return Err(e),
-                },
-            }
+        retry_until_admitted(
+            || {
+                let deadline_at = Instant::now() + deadline.remaining();
+                self.registry
+                    .try_preauthorize_before(&binding, self.handle.clone(), deadline_at)
+            },
+            || deadline.is_expired(),
+        )
+        .map(RegistryD1Pending)
+    }
+}
+
+/// The retry loop itself, inverted into a pure function over an `attempt`
+/// closure and an `is_deadline_expired` closure (@ilia, 2026-08-05,
+/// measured finding — this replaces an earlier version where the loop
+/// lived directly in `reserve_pending` and was completely untested,
+/// including its own termination): `attempt` stands in for one
+/// `try_preauthorize_before` call, `is_deadline_expired` for
+/// `deadline.is_expired()`. Neither closure needs a real
+/// `MeshSessionRegistry` or `CeremonyDeadline` to construct in a test —
+/// `CeremonyDeadline`'s own test-only constructors are `pub(crate)` to
+/// mesh-session-core-rs and unreachable from here, so this was the only
+/// way to exercise termination directly at all.
+///
+/// **Why this was more than a documentation gap:** household's own
+/// registry returns `Busy` from `Mutex::try_lock`'s `WouldBlock` arm
+/// BEFORE it ever reaches its internal `Instant::now() >= deadline_at`
+/// check — that check only runs once the lock is actually acquired
+/// (`mesh_session_registry.rs`, `try_preauthorize_before`). Under
+/// sustained contention the registry can return `Busy` forever and NEVER
+/// return `Expired`. This adapter's own `is_deadline_expired` check was
+/// therefore not a redundant second guard — it was the ONLY thing that
+/// could ever end the loop on that path. Untested, a future edit could
+/// silently drop or miscompute it (as a stray `false` literal in place
+/// of the real call once did, transiently, in this exact function) and
+/// turn `Busy` under contention into an unbounded spin burning a core,
+/// with `DeadlineExceeded` permanently unreachable.
+fn retry_until_admitted<T>(
+    mut attempt: impl FnMut() -> Result<T, TryPreauthorizeError>,
+    mut is_deadline_expired: impl FnMut() -> bool,
+) -> Result<T, IntentError> {
+    loop {
+        match attempt() {
+            Ok(v) => return Ok(v),
+            Err(err) => match map_preauthorize_error(err, is_deadline_expired()) {
+                PreauthorizeAction::Retry => {
+                    // household's own registry never waits internally
+                    // (`try_lock` only) — the backoff loop is explicitly
+                    // this adapter's job. A yield, not a sleep: the
+                    // registry's lock is held only for in-memory
+                    // HashMap/Vec mutation, never I/O, so the contended
+                    // holder is expected back almost immediately.
+                    std::thread::yield_now();
+                }
+                PreauthorizeAction::Fail(e) => return Err(e),
+            },
         }
     }
 }
 
-/// What `reserve_pending`'s retry loop does with one
-/// `try_preauthorize_before` refusal. Factored out to a pure function so
-/// it is directly testable against constructed `TryPreauthorizeError`
-/// values, without a live `MeshSessionRegistry` — same discipline as
-/// `roster_bridge::map_currency_outcome`, whose own doc explains why:
-/// the actual registry call is a thin, no-branching delegation that
-/// needs no duplicate coverage here, but the DECISION this adapter makes
-/// about each outcome does.
+/// What one `try_preauthorize_before` refusal decides for
+/// `retry_until_admitted` above. Factored to a pure function so it is
+/// directly testable against constructed `TryPreauthorizeError` values —
+/// same discipline as `roster_bridge::map_currency_outcome`.
 ///
-/// (@zain) The delegation is not tested by construction — its thinness
-/// is a property of the current code, not an invariant. If a future
-/// edit adds a branch inside `reserve_pending`'s own call sites (an
-/// `if` on the snapshot/registry outcome, an extra `map_err`), these
-/// pure-function tests stay green and that new branch goes unexercised:
-/// they cover the callee, not the call site. Same shape as `cce11a86`'s
-/// gap, mirrored — there it was the call site pinned and the callee
-/// untested; here it is the reverse.
+/// (@zain) The registry/coordinator calls in `reserve_pending` itself
+/// remain untested by construction — their thinness is a property of
+/// the current code, not an invariant. What moved `retry_until_admitted`
+/// out of that same category (@ilia) is that a decision — the retry
+/// loop's own termination condition — used to live only at that
+/// untested call site; it does not anymore.
 #[derive(Debug)]
 enum PreauthorizeAction {
     Retry,
@@ -235,6 +264,83 @@ mod tests {
     // enums household-rs already exports. The registry/coordinator calls
     // themselves are thin, no-branching delegations covered by
     // household-rs's own test suite, not duplicated here.
+
+    // ── `retry_until_admitted` termination (@ilia, 2026-08-05) ──────────
+    //
+    // The property that matters here is LIVENESS under sustained `Busy`,
+    // not any particular return value — a mutant that hardcoded the
+    // `is_deadline_expired` argument survived the entire suite (17
+    // passed, 0 failed) precisely because nothing exercised
+    // `reserve_pending`'s own retry loop at all before this loop was
+    // inverted into a pure function over closures. These three tests are
+    // what closes that: they need no `MeshSessionRegistry` and no real
+    // `CeremonyDeadline` (whose own test-only constructors are
+    // `pub(crate)` to mesh-session-core-rs and unreachable from here) —
+    // only a closure standing in for one `try_preauthorize_before` call.
+
+    /// The exact scenario `try_preauthorize_before`'s own doc warns
+    /// about: `Busy` under sustained contention, with the deadline
+    /// already expired. Must return promptly, never loop.
+    #[test]
+    fn busy_forever_with_expired_deadline_returns_immediately_not_a_hang() {
+        let attempts = std::cell::Cell::new(0);
+        let result = retry_until_admitted(
+            || {
+                attempts.set(attempts.get() + 1);
+                Err::<(), _>(TryPreauthorizeError::Busy)
+            },
+            || true,
+        );
+        assert!(matches!(result, Err(IntentError::DeadlineExceeded)));
+        // Exactly one attempt: the first `Busy` observed against an
+        // already-expired deadline must fail, not retry once "to be
+        // sure" — a `2` here would mean the deadline check runs AFTER
+        // deciding to retry rather than gating it.
+        assert_eq!(attempts.get(), 1);
+    }
+
+    /// The happy liveness path: genuinely transient contention resolves,
+    /// and the loop returns the real success value once `attempt`
+    /// stops failing — proving this is a retry loop, not just an
+    /// early-exit wrapper that happens to pass the deadline-exceeded
+    /// test above.
+    #[test]
+    fn busy_a_few_times_then_success_returns_the_value_after_retrying() {
+        let attempts = std::cell::Cell::new(0);
+        let result = retry_until_admitted(
+            || {
+                attempts.set(attempts.get() + 1);
+                if attempts.get() < 4 {
+                    Err(TryPreauthorizeError::Busy)
+                } else {
+                    Ok(42u32)
+                }
+            },
+            || false,
+        );
+        assert!(matches!(result, Ok(42)));
+        assert_eq!(attempts.get(), 4);
+    }
+
+    /// The deadline transitioning mid-retry: not expired for the first
+    /// two attempts (retries), expired from the third attempt onward
+    /// (fails) — proves the loop re-checks the deadline on every
+    /// iteration rather than caching a stale answer from its first call.
+    #[test]
+    fn deadline_expiring_between_retries_stops_the_loop_on_the_next_one() {
+        let attempts = std::cell::Cell::new(0);
+        let result = retry_until_admitted(
+            || {
+                attempts.set(attempts.get() + 1);
+                Err::<(), _>(TryPreauthorizeError::Busy)
+            },
+            || attempts.get() >= 2,
+        );
+        assert!(matches!(result, Err(IntentError::DeadlineExceeded)));
+        // Attempt 1: not expired yet -> retry. Attempt 2: now expired ->
+        // fail. Never reaches a third attempt.
+        assert_eq!(attempts.get(), 2);
+    }
 
     #[test]
     fn busy_before_deadline_retries() {
