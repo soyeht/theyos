@@ -451,8 +451,24 @@ async fn sign_machine_cert_409_without_local_household_private_key_or_follower()
 async fn sign_machine_cert_500_when_audit_append_fails() {
     let td = tempfile::tempdir().unwrap();
     let (router, _identity, person) = router_with_state(td.path());
-    let owner_events_path = household_rs::storage::household_dir(td.path()).join("owner_events");
-    std::fs::write(&owner_events_path, b"not a directory").unwrap();
+    // Anchor the injection on a property the append itself must satisfy — the
+    // audit log path opens as a regular file — rather than on a window in
+    // which `owner_events/` does not yet exist. The earlier form planted a
+    // file at the log directory between router construction and the request;
+    // the directory is now created when the log is opened rather than at
+    // first append, which closed that window and made this test fail during
+    // setup instead of exercising the handler. A directory at the log path
+    // fails the append's `openat` with `EISDIR` whenever the append runs, so
+    // the injection no longer depends on when anything is created.
+    let log_path = household_rs::owner_events::log_path(td.path());
+    if log_path.exists() {
+        std::fs::remove_file(&log_path).unwrap();
+    }
+    std::fs::create_dir(&log_path).unwrap();
+    assert!(
+        log_path.is_dir(),
+        "audit append must be blocked by a non-regular log path"
+    );
     let body = cbor_req(&subject_fixture(), b"challenge");
 
     let (status, resp) = post_cbor(router, body, Some(&person)).await;
