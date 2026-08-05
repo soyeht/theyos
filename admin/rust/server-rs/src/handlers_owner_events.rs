@@ -6611,11 +6611,34 @@ pub async fn owner_approve_handler(
             }
         };
     txn.preserve_staged_for_recovery();
-    if let Err(e) = household_rs::pair_machine::finish_phase3_manifest_under_lifecycle(
+    // T063: failure-injection crash point -- fires synchronously after the
+    // household record is promoted (manifest equivalent of 2PC step 12,
+    // the canonical commit marker at shamir_n=2) and BEFORE the sole-shard
+    // unlink (step 13). A registered EarlyReject models "M1 crash between
+    // staged-rename and sole-shard delete". On reboot, M1 has a
+    // post-Shamir record + sole-shard still present; boot-time recovery
+    // (`recover_post_join_sole_shard`) unlinks the orphan.
+    let post_rename_hook = || {
+        #[cfg(any(test, feature = "failure-injection"))]
+        {
+            match crate::failure_injection::apply_sync(
+                crate::failure_injection::InjectionPoint::M1AfterStagedRename,
+            ) {
+                crate::failure_injection::Outcome::EarlyReject(msg) => {
+                    return household_rs::pair_machine::PostRenameHookOutcome::EarlyReject(msg);
+                }
+                crate::failure_injection::Outcome::Skip
+                | crate::failure_injection::Outcome::Continue => {}
+            }
+        }
+        household_rs::pair_machine::PostRenameHookOutcome::Continue
+    };
+    if let Err(e) = household_rs::pair_machine::finish_phase3_manifest_under_lifecycle_with_hook(
         &state.state_dir,
         &recovery_namespace,
         &post_ack_lifecycle_guard,
         manifest.clone(),
+        post_rename_hook,
     )
     .await
     {

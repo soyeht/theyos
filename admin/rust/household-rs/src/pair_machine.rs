@@ -3110,7 +3110,33 @@ pub async fn finish_phase3_manifest_under_lifecycle(
     lifecycle: &crate::household_lifecycle::LifecycleWriteGuard,
     manifest: Phase3RecoveryManifestV1,
 ) -> Result<(), RecoveryError> {
-    finish_phase3_locally(state_dir, namespace, Some(lifecycle), manifest).await
+    finish_phase3_locally(state_dir, namespace, Some(lifecycle), manifest, || {
+        PostRenameHookOutcome::Continue
+    })
+    .await
+}
+
+/// Like [`finish_phase3_manifest_under_lifecycle`], but runs `hook`
+/// synchronously AFTER the household record is promoted (the manifest
+/// equivalent of 2PC step 12 -- the record hits `shamir_n=2`, the
+/// canonical commit marker) and BEFORE the sole-shard unlink (step 13).
+/// The hook is the extension point the failure-injection harness uses to
+/// model "M1 crash between step 12 and step 13" -- the same window
+/// `commit_preserve_on_error_with_hook` covers for the legacy staged-commit
+/// path. `EarlyReject` skips the unlink so boot-time recovery observes the
+/// half-committed state (post-Shamir record on disk, sole-shard still
+/// present).
+pub async fn finish_phase3_manifest_under_lifecycle_with_hook<F>(
+    state_dir: &Path,
+    namespace: &PairWindowNamespaceV2,
+    lifecycle: &crate::household_lifecycle::LifecycleWriteGuard,
+    manifest: Phase3RecoveryManifestV1,
+    hook: F,
+) -> Result<(), RecoveryError>
+where
+    F: FnOnce() -> PostRenameHookOutcome + Send + 'static,
+{
+    finish_phase3_locally(state_dir, namespace, Some(lifecycle), manifest, hook).await
 }
 
 async fn recover_phase3_ceremony_inner(
@@ -3180,7 +3206,10 @@ async fn recover_phase3_ceremony_inner(
             blake3::hash(&bytes).as_bytes() == manifest.staged_household_record_hash.as_ref()
         });
     if record_is_manifest_final {
-        finish_phase3_locally(state_dir, namespace, lifecycle, manifest).await?;
+        finish_phase3_locally(state_dir, namespace, lifecycle, manifest, || {
+            PostRenameHookOutcome::Continue
+        })
+        .await?;
         return Ok(RecoveryOutcome::RolledForwardPostCommit);
     }
 
@@ -3219,7 +3248,10 @@ async fn recover_phase3_ceremony_inner(
                     addr = %m2_addr,
                     "M2 ack'd JoinResponse re-POST; finishing M1 step 12+ locally"
                 );
-                finish_phase3_locally(state_dir, namespace, lifecycle, manifest.clone()).await?;
+                finish_phase3_locally(state_dir, namespace, lifecycle, manifest.clone(), || {
+                    PostRenameHookOutcome::Continue
+                })
+                .await?;
                 return Ok(RecoveryOutcome::RolledForwardPreCommit);
             }
             Err(e) => {
@@ -3674,12 +3706,16 @@ fn remove_phase3_file_durably(path: &Path) -> Result<(), RecoveryError> {
 /// recovery driver runs before the owner-events broadcaster is wired.
 /// The manifest remains as a durable terminal outbox until the startup/handler
 /// layer appends the exact `MachineJoined` event and explicitly clears it.
-async fn finish_phase3_locally(
+async fn finish_phase3_locally<F>(
     state_dir: &Path,
     namespace: &PairWindowNamespaceV2,
     lifecycle: Option<&crate::household_lifecycle::LifecycleWriteGuard>,
     manifest: Phase3RecoveryManifestV1,
-) -> Result<(), RecoveryError> {
+    hook: F,
+) -> Result<(), RecoveryError>
+where
+    F: FnOnce() -> PostRenameHookOutcome + Send + 'static,
+{
     let state_dir_owned = state_dir.to_path_buf();
     let state_dir_for_promotion = state_dir_owned.clone();
     let manifest_for_promotion = manifest.clone();
@@ -3709,6 +3745,20 @@ async fn finish_phase3_locally(
             manifest_for_promotion.staged_household_record_hash.as_ref(),
             true,
         )?;
+        // The manifest equivalent of 2PC step 12: the household record is
+        // now at shamir_n=2, the canonical commit marker. `hook` is the
+        // failure-injection extension point that models "M1 crash between
+        // step 12 and step 13 (sole-shard unlink)" -- same window
+        // `commit_preserve_on_error_with_hook` covers for the legacy
+        // staged-commit path.
+        match hook() {
+            PostRenameHookOutcome::Continue => {}
+            PostRenameHookOutcome::EarlyReject(msg) => {
+                return Err(RecoveryError::Promotion(format!(
+                    "post-rename hook abort: {msg}"
+                )));
+            }
+        }
         remove_phase3_file_durably(&household_root_sole_path(&state_dir_for_promotion))?;
         Ok(())
     })

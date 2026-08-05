@@ -27,11 +27,8 @@ use std::time::Duration;
 
 use axum::http::StatusCode;
 use axum::http::header;
-use household_rs::KeyBackingPolicy;
-use household_rs::machine_cert::Platform;
 use household_rs::pair_machine::{
-    JoinTransport, PairMachineState, PairMachineWindow, PrepareCandidateOpts,
-    household_root_sole_path, prepare_candidate, shamir_self_shard_path,
+    PairMachineState, PairMachineWindow, household_root_sole_path, shamir_self_shard_path,
 };
 use household_rs::storage::{
     detect_orphan_staged_files, machine_cert_for, phase3_finalize_ack_marker_exists,
@@ -105,56 +102,13 @@ async fn drive_to_awaiting_owner_with_ttl(
     (founder, candidate, accepted, anchor_secret)
 }
 
-/// Like `candidate_harness()` from `phase3_support`, but with a custom
-/// `PairMachineWindow` TTL so the timeout test (T066) can drive an
-/// expiry without waiting 5 minutes.
-async fn candidate_harness_with_ttl(ttl: Duration) -> CandidateHarness {
-    use server_rs::handlers_pair_machine::{PreHouseholdRouterState, pre_household_router};
-    use std::sync::Arc;
-    use tokio::net::TcpListener;
-
-    let dir = tempfile::tempdir().expect("m2 tempdir");
-    let listener = TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("bind candidate listener");
-    let addr = listener.local_addr().expect("candidate local addr");
-    let window = Arc::new(
-        household_rs::pair_machine::PairMachineWindow::with_persistence(dir.path().to_path_buf())
-            .expect("m2 window"),
-    );
-    let prepared = prepare_candidate(
-        &window,
-        PrepareCandidateOpts {
-            state_dir: dir.path().to_path_buf(),
-            transport: JoinTransport::Tailscale,
-            addr: addr.to_string(),
-            hostname: "studio-m2".into(),
-            platform: Platform::LinuxNix,
-            policy: KeyBackingPolicy::ForceSoftware,
-            ttl,
-            now_unix: unix_now(),
-        },
-    )
-    .await
-    .expect("prepare candidate");
-    let router = pre_household_router(PreHouseholdRouterState {
-        window: Arc::clone(&window),
-        state_dir: dir.path().to_path_buf(),
-        key_policy: KeyBackingPolicy::ForceSoftware,
-        bootstrap: None,
-        runtime_signal: None,
-    });
-    let served_router = router.clone();
-    let server = tokio::spawn(async move {
-        let _ = axum::serve(listener, served_router).await;
-    });
-
-    // The CandidateHarness fields aren't all `pub`; we construct it via
-    // the same path the support module uses internally. Importing the
-    // helper directly is cleaner — but the support `candidate_harness()`
-    // hard-codes a 300s TTL. Replicate just the bits we need locally.
-    CandidateHarness::__new_for_test(dir, window, prepared, router, server)
-}
+// `candidate_harness_with_ttl` (custom PairMachineWindow TTL for the T066
+// timeout test) lives in `phase3_support` now -- it shares the same
+// restart-simulating finalize route as every other candidate harness there
+// instead of duplicating a `runtime_signal: None` router locally. That
+// duplicate was the cause of this file's four rollback tests hanging
+// against RECOVERY_TIMEOUT before this fix: no receiver, no simulated
+// restart, no converging retry.
 
 fn assert_no_phase3_residue_on_founder(founder: &FounderHarness, candidate_m_id: &str) {
     let dir = founder.dir.path();
@@ -302,13 +256,23 @@ async fn test_m2_disconnect_after_approval_rolls_back() {
     );
 
     let dir = founder.dir.path();
+    // The manifest is written durably (arm_manifest_recovery) BEFORE the
+    // finalize POST is even launched, and the ambiguous-failure arm
+    // (handlers_owner_events.rs) returns 500 without clearing it — so it
+    // survives this failure path by construction, unlike the legacy marker
+    // which this version's approve handler no longer writes at all.
     assert!(
-        phase3_finalize_ack_marker_exists(dir),
-        "marker must survive ambiguous finalize failure (boot recovery needs it)"
+        household_rs::storage::phase3_recovery_manifest_exists(dir),
+        "the ack marker is legacy on-disk evidence retained only for upgraded \
+         households; a ceremony on this version writes the recovery manifest"
     );
+    let manifest = household_rs::storage::read_phase3_recovery_manifest(dir)
+        .expect("read recovery manifest")
+        .expect("recovery manifest present");
     assert!(
-        phase3_pending_join_response_exists(dir),
-        "pending JoinResponse must survive ambiguous finalize failure"
+        !manifest.exact_join_response().is_empty(),
+        "the pending JoinResponse is legacy on-disk evidence retained only for upgraded \
+         households; a ceremony on this version embeds it in the recovery manifest"
     );
     assert!(
         !detect_orphan_staged_files(dir).is_empty(),
@@ -320,30 +284,32 @@ async fn test_m2_disconnect_after_approval_rolls_back() {
         .await
         .expect("simulate v2 approval claim before crash");
 
-    // Now drive boot recovery with a short timeout. M2 is unreachable
-    // (server stopped), so both probes fail and recovery rolls back
-    // past the timeout.
+    // A launched finalize POST is MayHaveTakenEffect (step 10 sent, step 11
+    // not received) regardless of why M2 never acked — timeout alone can
+    // never authorize rollback to N=1 (pair_machine.rs:44). Recovery fails
+    // closed and retains the manifest + .staged evidence for exact replay
+    // or manual recovery.
     let outcome = household_rs::pair_machine::recover_phase3_ceremony(
         founder.dir.path(),
         Duration::from_millis(200),
     )
-    .await
-    .expect("recovery completes");
+    .await;
     assert!(
         matches!(
             outcome,
-            household_rs::pair_machine::RecoveryOutcome::RolledBack
+            Err(household_rs::pair_machine::RecoveryError::FinalizeOutcomeIndeterminate)
         ),
-        "expected RolledBack, got {outcome:?}"
+        "expected FinalizeOutcomeIndeterminate, got {outcome:?}"
     );
 
-    let m2_id = candidate.prepared.m_id.to_string();
-    assert_no_phase3_residue_on_founder(&founder, &m2_id);
-    let recovered_window = PairMachineWindow::with_persistence(founder.dir.path().to_path_buf())
-        .expect("reload recovered founder window");
-    let snapshot = recovered_window.snapshot().await;
-    assert_eq!(snapshot.state, PairMachineState::Aborted);
-    assert!(snapshot.approval_claim.is_none());
+    assert!(
+        household_rs::storage::phase3_recovery_manifest_exists(dir),
+        "the recovery manifest must be retained after an indeterminate outcome"
+    );
+    assert!(
+        !detect_orphan_staged_files(dir).is_empty(),
+        ".staged set must be retained after an indeterminate outcome"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -403,15 +369,13 @@ async fn test_m2_finalize_partial_write_rolls_back() {
 
 #[tokio::test]
 async fn test_m1_crash_between_step10_and_step11_recovers_to_rollback() {
-    // "M1 sent the POST but lost it (M2 never heard); M1 reboots with
-    // .staged files + sole-shard still present; recovery probes M2 and
-    // finds no commit; deletes .staged; ceremony rolls back."
-    //
-    // We model this by stopping M2's server BEFORE M1's POST (so M2
-    // never receives anything), submitting approval (M1 transport
-    // error → ambiguous → marker + .staged on disk), then running the
-    // recovery driver against the stopped M2. Both probes fail; past
-    // the test timeout, recovery rolls back.
+    // Originally modeled as "M1 sent the POST but lost it, M2 never heard,
+    // recovery finds no commit and rolls back." That premise was wrong:
+    // once step 10 (the `local/finalize` POST, pair_machine.rs:1625) is
+    // launched, the outcome is MayHaveTakenEffect regardless of whether M2
+    // ever received it — timeout alone can never authorize rollback to
+    // N=1 (pair_machine.rs:44). Recovery fails closed and retains the
+    // manifest + .staged evidence for exact replay or manual recovery.
     let (founder, mut candidate, accepted, _anchor) =
         drive_to_awaiting_owner(Duration::from_secs(300)).await;
 
@@ -424,15 +388,24 @@ async fn test_m1_crash_between_step10_and_step11_recovers_to_rollback() {
         founder.dir.path(),
         Duration::from_millis(200),
     )
-    .await
-    .expect("recovery completes");
-    assert!(matches!(
-        outcome,
-        household_rs::pair_machine::RecoveryOutcome::RolledBack
-    ));
+    .await;
+    assert!(
+        matches!(
+            outcome,
+            Err(household_rs::pair_machine::RecoveryError::FinalizeOutcomeIndeterminate)
+        ),
+        "expected FinalizeOutcomeIndeterminate, got {outcome:?}"
+    );
 
-    let m2_id = candidate.prepared.m_id.to_string();
-    assert_no_phase3_residue_on_founder(&founder, &m2_id);
+    let dir = founder.dir.path();
+    assert!(
+        household_rs::storage::phase3_recovery_manifest_exists(dir),
+        "the recovery manifest must be retained after an indeterminate outcome"
+    );
+    assert!(
+        !detect_orphan_staged_files(dir).is_empty(),
+        ".staged set must be retained after an indeterminate outcome"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -478,9 +451,16 @@ async fn test_m1_crash_between_step11_and_step12_recovers_to_commit() {
     // M1AfterAck fires AFTER finalize_with_m2 returns Ok (FinalizeAck
     // received, M2 committed) and BEFORE commit_preserve_on_error
     // runs. EarlyReject calls preserve_staged_for_recovery and
-    // returns 500, leaving the staged set + marker + pending
-    // JoinResponse on disk. M2 is committed at this point —
-    // candidate.window.snapshot().state == Committed.
+    // returns 500, leaving the staged set + recovery manifest + pending
+    // JoinResponse on disk (the manifest is written durably by
+    // arm_manifest_recovery before the finalize POST, so it is already
+    // present regardless of the injection). M2 is committed at this
+    // point, but its ceremony window is generation-scoped and reads
+    // Idle in the post-rotation generation once the harness reloads it
+    // after the 503 restart-required response
+    // (`SharedCandidateWindow::reload_after_restart_required`), so the
+    // durable observable is the household record, not the window
+    // snapshot (same substitution as `linux_candidate_join.rs`).
     let _guard = lock_injection_tests();
     reset();
     arm(
@@ -499,8 +479,19 @@ async fn test_m1_crash_between_step11_and_step12_recovers_to_commit() {
     );
 
     let dir = founder.dir.path();
-    assert!(phase3_finalize_ack_marker_exists(dir));
-    assert!(phase3_pending_join_response_exists(dir));
+    assert!(
+        household_rs::storage::phase3_recovery_manifest_exists(dir),
+        "the ack marker is legacy on-disk evidence retained only for upgraded \
+         households; a ceremony on this version writes the recovery manifest"
+    );
+    let manifest = household_rs::storage::read_phase3_recovery_manifest(dir)
+        .expect("read recovery manifest")
+        .expect("recovery manifest present");
+    assert!(
+        !manifest.exact_join_response().is_empty(),
+        "the pending JoinResponse is legacy on-disk evidence retained only for upgraded \
+         households; a ceremony on this version embeds it in the recovery manifest"
+    );
     assert!(!detect_orphan_staged_files(dir).is_empty());
     founder
         .window
@@ -509,9 +500,19 @@ async fn test_m1_crash_between_step11_and_step12_recovers_to_commit() {
         .expect("simulate v2 approval claim before crash");
 
     // M2 has already committed via local/finalize.
-    assert_eq!(
-        candidate.window.snapshot().await.state,
-        PairMachineState::Committed,
+    let candidate_record: household_rs::HouseholdRecord =
+        household_rs::storage::read_optional_cbor(&household_rs::storage::household_record_path(
+            candidate.dir.path(),
+        ))
+        .expect("read candidate household record")
+        .expect("candidate household record exists");
+    assert!(
+        candidate_record.shamir_n > 1,
+        "shamir_n > 1 is what distinguishes a committed Phase-3 transition from a \
+         sole-shard record that boot classifies as logically rolled back \
+         (storage.rs:798, recover_partial_phase3_commit's own post_shamir check); \
+         the ceremony window is generation-scoped and reads Idle in the \
+         post-rotation generation"
     );
 
     // Recovery: re-POST the staged JoinResponse to M2. M2's
@@ -602,6 +603,30 @@ async fn test_m1_crash_between_step12_and_step13_recovers_to_commit() {
         "boot-time sweep must unlink leftover sole-shard"
     );
 
+    // load_state_dir alone does not clear the .staged siblings: while a
+    // Phase-3 recovery manifest is present, recover_partial_phase3_commit's
+    // preservation gate defers to the manifest recovery driver on purpose
+    // (its own cleanup loop deletes .staged without hash verification;
+    // only the manifest driver's promote_phase3_artifact_exact verifies
+    // the exact hash before promoting/clearing evidence). This mirrors
+    // what the real daemon does on boot
+    // (bootstrap_household -> recover_phase3_under_lifecycle ->
+    // recover_phase3_ceremony_under_lifecycle).
+    let recovery_outcome = household_rs::pair_machine::recover_phase3_ceremony(
+        dir,
+        Duration::from_millis(500),
+    )
+    .await
+    .expect("recovery completes");
+    assert!(
+        matches!(
+            recovery_outcome,
+            household_rs::pair_machine::RecoveryOutcome::RolledForwardPreCommit
+                | household_rs::pair_machine::RecoveryOutcome::RolledForwardPostCommit
+        ),
+        "expected RolledForward*, got {recovery_outcome:?}"
+    );
+
     let m2_id = candidate.prepared.m_id.to_string();
     assert_rolled_forward_on_founder(&founder, &m2_id);
 }
@@ -660,11 +685,13 @@ async fn test_m1_crash_during_step13_is_idempotent() {
 async fn test_recovery_timeout_rolls_back_when_m2_permanently_lost() {
     // Per FR-013a: when M2 is permanently unreachable after approval,
     // M1's recovery driver loops on probes until RECOVERY_TIMEOUT
-    // elapses, then rolls back. This test reuses the T067 setup
-    // (M2 server stopped pre-approval → ambiguous finalize failure)
-    // and explicitly asserts the timing: the Recover call must take
-    // AT LEAST `recovery_timeout` to elapse, AND must return
-    // RolledBack.
+    // elapses. This test reuses the T067 setup (M2 server stopped
+    // pre-approval → ambiguous finalize failure) and explicitly asserts
+    // the timing: the Recover call must take AT LEAST `recovery_timeout`
+    // to elapse. The launched finalize POST is MayHaveTakenEffect
+    // (pair_machine.rs:44), so the timeout itself can never authorize a
+    // rollback to N=1 — it fails closed with FinalizeOutcomeIndeterminate
+    // and retains every piece of recovery evidence instead.
     use std::time::Instant;
 
     let (founder, mut candidate, accepted, _anchor) =
@@ -688,27 +715,29 @@ async fn test_recovery_timeout_rolls_back_when_m2_permanently_lost() {
     let start = Instant::now();
     let outcome =
         household_rs::pair_machine::recover_phase3_ceremony(founder.dir.path(), test_timeout)
-            .await
-            .expect("recovery completes");
+            .await;
     let elapsed = start.elapsed();
     assert!(
         matches!(
             outcome,
-            household_rs::pair_machine::RecoveryOutcome::RolledBack
+            Err(household_rs::pair_machine::RecoveryError::FinalizeOutcomeIndeterminate)
         ),
-        "expected RolledBack past timeout, got {outcome:?}"
+        "expected FinalizeOutcomeIndeterminate past timeout, got {outcome:?}"
     );
     assert!(
         elapsed >= test_timeout,
-        "recovery rolled back too early: elapsed {elapsed:?} < timeout {test_timeout:?}"
+        "recovery gave up too early: elapsed {elapsed:?} < timeout {test_timeout:?}"
     );
 
-    // FR-013a: full residue cleanup after timeout rollback.
-    let m2_id = candidate.prepared.m_id.to_string();
-    assert_no_phase3_residue_on_founder(&founder, &m2_id);
-    let recovered_window = PairMachineWindow::with_persistence(founder.dir.path().to_path_buf())
-        .expect("reload recovered founder window");
-    let snapshot = recovered_window.snapshot().await;
-    assert_eq!(snapshot.state, PairMachineState::Aborted);
-    assert!(snapshot.approval_claim.is_none());
+    // FR-013a (revised): the driver fails closed past timeout and
+    // retains full recovery evidence instead of cleaning it up.
+    let dir = founder.dir.path();
+    assert!(
+        household_rs::storage::phase3_recovery_manifest_exists(dir),
+        "the recovery manifest must be retained after an indeterminate outcome"
+    );
+    assert!(
+        !detect_orphan_staged_files(dir).is_empty(),
+        ".staged set must be retained after an indeterminate outcome"
+    );
 }
