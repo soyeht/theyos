@@ -18,7 +18,8 @@ fn read(file: &str) -> String {
     fs::read_to_string(&p).unwrap_or_else(|e| panic!("read {}: {e}", p.display()))
 }
 
-/// The body of `sig`, bounded to the next top-level fn declaration.
+/// The body of `sig`, bounded to the next top-level fn declaration, or to the
+/// start of the file's test module if `sig` names the last top-level fn.
 fn fn_body(src: &str, sig: &str) -> String {
     let start = src.find(sig).unwrap_or_else(|| panic!("missing fn: {sig}"));
     let rest = &src[start + sig.len()..];
@@ -28,6 +29,11 @@ fn fn_body(src: &str, sig: &str) -> String {
         "\nasync fn ",
         "\npub fn ",
         "\nfn ",
+        // When `sig` names the file's last top-level fn, none of the above
+        // ever match and `rest` runs to EOF, swallowing `mod tests` (its `fn`s
+        // are indented, so they can never bound the search). Cut at the
+        // module's own `#[cfg(test)]` instead.
+        "\n#[cfg(test)]",
     ]
     .iter()
     .filter_map(|m| rest.find(m))
@@ -43,8 +49,13 @@ fn core_gates_guest_image_before_rate_limit_insert_and_job() {
     // never enqueues work that can only fail late.
     let src = read("instance_create.rs");
     let body = fn_body(&src, "pub(crate) async fn create_instance_core");
+    // The call site uses the guest_os-aware wrapper, not the inner responder
+    // directly: macOS guests gate on base-image readiness, Linux guests boot
+    // from their own rootfs and must pass even with no macOS image present.
+    // Accept either spelling so the guard tracks whichever the call site uses.
     let gate = body
-        .find("guest_image_not_ready_response")
+        .find("guest_image_gate_for_guest_os")
+        .or_else(|| body.find("guest_image_not_ready_response"))
         .expect("create_instance_core must call the shared macOS guest-image gate");
     for (needle, what) in [
         ("rate_limiter", "rate limit"),
