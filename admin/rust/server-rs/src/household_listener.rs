@@ -1017,6 +1017,127 @@ fn is_lan(ip: &IpAddr) -> bool {
 }
 
 #[cfg(test)]
+mod router_startup_reachability_lock {
+    //! Locks *who* can start the household router.
+    //!
+    //! A pair-machine reexec must not reopen the household router, "not even
+    //! transitively". Closing that by reading the reexec continuation shows
+    //! only that one small function does not start a router today; it says
+    //! nothing about a path someone adds later. This closes it by call graph
+    //! instead: the router is reachable from exactly one chain, and that chain
+    //! is rooted at process startup, not at any request handler.
+    //!
+    //!   main.rs -> bootstrap_household -> spawn_household_listeners
+    //!
+    //! A second caller of either link -- especially from a handler -- fails
+    //! here and has to be argued explicitly.
+    //!
+    //! Scope, stated so nobody reads more into this than it proves: this locks
+    //! *starting* the router. It deliberately does NOT claim that bootstrap
+    //! state changes have no effect on exposure. They do, and by design:
+    //! `refresh_loop` polls `Arc<RwLock<BootstrapState>>` on a timer and
+    //! re-filters bind targets through `HouseholdExposurePolicy`. So a reexec
+    //! that commits `Ready` will change what an ALREADY-RUNNING listener
+    //! exposes, within one poll interval, without calling anything here. That
+    //! transitive effect is governed by the exposure policy arms and is pinned
+    //! by the exposure-decision guard, not by this lock.
+
+    use std::path::{Path, PathBuf};
+
+    fn server_src() -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("src")
+    }
+
+    /// Production call sites of `needle`, ignoring the definition itself,
+    /// comments, and `#[cfg(test)]` modules' own fixtures.
+    fn production_call_sites(needle: &str) -> Vec<String> {
+        let mut hits = Vec::new();
+        let mut stack = vec![server_src()];
+        while let Some(dir) = stack.pop() {
+            let Ok(entries) = std::fs::read_dir(&dir) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    stack.push(path);
+                    continue;
+                }
+                if path.extension().is_none_or(|ext| ext != "rs") {
+                    continue;
+                }
+                let Ok(text) = std::fs::read_to_string(&path) else {
+                    continue;
+                };
+                let mut in_test_mod = false;
+                let mut test_mod_depth = 0i32;
+                let mut depth = 0i32;
+                for line in text.lines() {
+                    let trimmed = line.trim_start();
+                    if trimmed.starts_with("#[cfg(test)]") {
+                        in_test_mod = true;
+                        test_mod_depth = depth;
+                    }
+                    let opens = line.matches('{').count() as i32;
+                    let closes = line.matches('}').count() as i32;
+
+                    let is_comment = trimmed.starts_with("//");
+                    let is_definition = trimmed.contains(&format!("fn {needle}"));
+                    if !is_comment
+                        && !is_definition
+                        && !in_test_mod
+                        && line.contains(&format!("{needle}("))
+                    {
+                        hits.push(format!(
+                            "{}",
+                            path.file_name().unwrap_or_default().to_string_lossy()
+                        ));
+                    }
+
+                    depth += opens - closes;
+                    if in_test_mod && depth <= test_mod_depth && closes > 0 {
+                        in_test_mod = false;
+                    }
+                }
+            }
+        }
+        hits.sort();
+        hits.dedup();
+        hits
+    }
+
+    #[test]
+    fn household_router_is_startable_only_from_process_startup() {
+        // Positive control: the sweep must find the chain it claims to guard.
+        // A typo'd needle would otherwise return an empty vec and let both
+        // assertions below pass while checking nothing.
+        let spawn_sites = production_call_sites("spawn_household_listeners");
+        assert!(
+            !spawn_sites.is_empty(),
+            "sweep found no call site at all; the search is broken, so this \
+             lock would pass vacuously"
+        );
+
+        assert_eq!(
+            spawn_sites,
+            vec!["household_bootstrap.rs".to_string()],
+            "`spawn_household_listeners` gained a production caller. The \
+             household router must remain reachable only from process startup; \
+             a handler-reachable path would let a pair-machine reexec reopen it."
+        );
+
+        let bootstrap_sites = production_call_sites("bootstrap_household");
+        assert_eq!(
+            bootstrap_sites,
+            vec!["main.rs".to_string()],
+            "`bootstrap_household` gained a production caller. It is the only \
+             function that starts the household router, so it must stay rooted \
+             at process startup and unreachable from any request handler."
+        );
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
 
