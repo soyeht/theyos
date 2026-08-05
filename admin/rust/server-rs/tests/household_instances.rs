@@ -1205,7 +1205,7 @@ async fn household_instances_list_requires_pop_authorization() {
 }
 
 #[tokio::test]
-async fn household_instance_status_allows_legacy_and_matching_household_rows_only() {
+async fn household_instance_status_hides_legacy_unscoped_rows_and_allows_matching() {
     let fx = fixture();
     let other_hh = household_rs::derive_household_id(&P256Keypair::generate().public()).to_string();
 
@@ -1242,15 +1242,30 @@ async fn household_instance_status_allows_legacy_and_matching_household_rows_onl
     assert_eq!(status, StatusCode::OK);
     assert_eq!(json["status"], "active");
 
-    let (status, json) = get_json(
+    let (status, _) = get_json(
         fx.app.clone(),
         &fx.person,
         "/api/v1/household/instances/inst-legacy/status",
     )
     .await;
-    assert_eq!(status, StatusCode::OK);
-    assert_eq!(json["status"], "active");
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "security verdict (2026-08), executed in 5b04e135 and declared on \
+         store-rs/src/instance_db.rs::get_for_household_status: a row without \
+         household_id belongs to NO household — unscoped rows are hidden here \
+         exactly as list_for_household hides them, so status and listing answer \
+         the same question the same way by construction. Recovery path: a legacy \
+         row regains visibility only by being stamped via stamp_mac_host_household \
+         once the household is loaded and the assignment is unambiguous — \
+         stamping rather than widening the query is deliberate. Do NOT 'fix' \
+         this back to 200: that would revert the verdict. The store-level unit \
+         test household_status_rejects_unscoped_rows was inverted on purpose in \
+         the same commit and kept so the rule change stays visible in review."
+    );
 
+    // Foreign-household, soft-deleted and missing rows are equally invisible:
+    // 404, without leaking which case applied.
     for id in ["inst-other-household", "inst-deleted", "inst-missing"] {
         let path = format!("/api/v1/household/instances/{id}/status");
         let (status, _) = get_json(fx.app.clone(), &fx.person, &path).await;
