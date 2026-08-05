@@ -2161,13 +2161,13 @@ mod tests {
             RelayStreamIssuerTrust, RelayStreamTrustContext,
         };
         use server_rs::claw_share_relay_stream_noise::generate_relay_stream_noise_static_keypair;
+        use server_rs::claw_share_relay_stream_reopen_limiter::{
+            ReopenLimiterConfig, ReopenStreamLimiter,
+        };
         use server_rs::claw_share_relay_stream_responder_params::RelayStreamResponderParams;
         use server_rs::claw_share_relay_stream_responder_reverse_connect::{
             RelayStreamResponderReverseConnectConfig,
             serve_relay_stream_responder_reverse_connect_binding,
-        };
-        use server_rs::claw_share_relay_stream_reopen_limiter::{
-            ReopenLimiterConfig, ReopenStreamLimiter,
         };
         use server_rs::claw_share_relay_stream_reverse_connect_binding::bind_relay_stream_reverse_connect_with_ip_tunnel_router;
         use server_rs::claw_share_relay_stream_target_router::RelayStreamIpTunnelUnavailableRouter;
@@ -2341,10 +2341,13 @@ mod tests {
                     RelayStreamIpTunnelUnavailableRouter,
                     RelayStreamIpTunnelUnavailableRouter,
                     claw_router,
-                    // Default limiter, as every other caller of this function
-                    // constructs it (reverse_connect_pool.rs:556, :590 and
-                    // reverse_connect_binding.rs:305, :411). This test opens one
-                    // stream, so the reopen budget is never the thing under test.
+                    // Default limiter, matching the one other test-side caller of
+                    // THIS function (reverse_connect_binding.rs:402). The
+                    // production caller (claw_share_relay_stream_runtime.rs:441)
+                    // passes one built from `config.reopen_limiter`, so this is
+                    // deliberately the test pattern and not the general one.
+                    // This site opens a single stream, so the reopen budget is
+                    // never the thing under test.
                     Arc::new(ReopenStreamLimiter::new(ReopenLimiterConfig::default())),
                     || Some(NOW),
                 );

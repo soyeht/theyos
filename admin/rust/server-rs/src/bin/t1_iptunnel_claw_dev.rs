@@ -36,6 +36,7 @@ use server_rs::claw_share_relay_stream_issuer_trust::{
     RelayStreamIssuerTrust, RelayStreamTrustContext,
 };
 use server_rs::claw_share_relay_stream_noise::generate_relay_stream_noise_static_keypair;
+use server_rs::claw_share_relay_stream_reopen_limiter::{ReopenLimiterConfig, ReopenStreamLimiter};
 use server_rs::claw_share_relay_stream_responder_params::RelayStreamResponderParams;
 use server_rs::claw_share_relay_stream_responder_reverse_connect::{
     RelayStreamResponderReverseConnectConfig, serve_relay_stream_responder_reverse_connect_binding,
@@ -542,6 +543,12 @@ async fn main() -> std::io::Result<()> {
         RelayStreamIpTunnelUnavailableRouter,
         RelayStreamIpTunnelUnavailableRouter,
         router,
+        // Default: this dev harness has no runtime config to draw a limiter
+        // from, unlike the production caller (claw_share_relay_stream_runtime
+        // .rs:441, which passes one built from `config.reopen_limiter`). It
+        // opens a single stream for one hardware observation, so the reopen
+        // budget is not what it exercises.
+        Arc::new(ReopenStreamLimiter::new(ReopenLimiterConfig::default())),
         || Some(now_unix()),
     );
     let config = RelayStreamResponderReverseConnectConfig {
