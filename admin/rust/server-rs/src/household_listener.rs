@@ -2055,15 +2055,55 @@ mod tests {
             }
         }
         scanned_crates.sort();
+        // Non-vacuity by set, not by cardinality. `>= 25` in a workspace of
+        // thirty-one tolerates six members dropping out of the scan in
+        // silence, and a scan that stops seeing members is precisely the
+        // failure this guard exists to prevent -- the weak form fails only in
+        // the extreme case. Read the declared list from the manifest and
+        // require every member to have been reached: that fails on a shrunken
+        // scan AND on a new member the walk cannot reach, and adding a member
+        // needs no re-pinning here.
+        let manifest =
+            std::fs::read_to_string(workspace.join("Cargo.toml")).expect("read workspace manifest");
+        let declared: Vec<String> = manifest
+            .split_once("members = [")
+            .expect("workspace manifest declares members")
+            .1
+            .split_once(']')
+            .expect("members list terminates")
+            .0
+            .lines()
+            .filter_map(|l| l.trim().trim_end_matches(',').strip_prefix('"'))
+            .filter_map(|l| l.strip_suffix('"'))
+            .map(str::to_owned)
+            .collect();
+        // Control on the parser, not on the workspace: if this parse silently
+        // yielded few or no members the loop below would pass vacuously, so
+        // require the crate that defines the token to be among what was
+        // parsed. A parse that breaks fails here rather than downstream.
         assert!(
-            scanned_crates.len() >= 25,
-            "expected to scan the whole workspace, saw only {} crates: {scanned_crates:?}",
-            scanned_crates.len()
+            declared.iter().any(|m| m == "server-rs"),
+            "manifest parse did not yield the defining crate -- the parser shrank, not the scan: {declared:?}"
         );
-        assert!(
-            scanned_crates.iter().any(|c| c == "server-rs"),
-            "the crate that defines the token must be among those scanned"
-        );
+        for member in &declared {
+            assert!(
+                scanned_crates.contains(member),
+                "declared workspace member was never scanned: {member} (scanned: {scanned_crates:?})"
+            );
+        }
+        // The walk is deliberately WIDER than `members`. The `exclude`d roots
+        // depend on `server-rs` by path and compile, so they can park the
+        // token in a field even though `--workspace` never builds them.
+        // `read_dir` covers them; iterating `members` would not. Asserted so
+        // that narrowing this walk to the declared list -- which reads like
+        // tidying -- fails instead of quietly shedding the coverage.
+        for excluded in ["mesh-session-core-rs", "mesh-session-control-model-rs"] {
+            assert!(
+                scanned_crates.iter().any(|c| c == excluded),
+                "excluded root {excluded} must still be scanned: it compiles against \
+                 server-rs and can hold the token"
+            );
+        }
         while let Some(dir) = stack.pop() {
             for entry in std::fs::read_dir(&dir).expect("read src dir") {
                 let path = entry.expect("dir entry").path();
