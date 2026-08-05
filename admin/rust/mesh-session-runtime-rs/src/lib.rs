@@ -3,9 +3,24 @@
 //! (`household-rs`, `keystore-rs`). This round's scope, exactly:
 //!
 //! - `SystemClock`: a real `mesh_session_core_rs::intent::Clock`.
-//! - `ledger_seam`: documents, but does not implement, the
-//!   `IntentNonceLedger` requirement a future admission adapter will
-//!   carry — no concrete backend exists in this workspace yet.
+//! - `intent_nonce_ledger_bridge::HouseholdIntentNonceLedger`: a real
+//!   `mesh_session_core_rs::intent::IntentNonceLedger` over
+//!   `household_rs::mesh_intent_nonce_ledger::MeshIntentNonceLedger`.
+//!   Exhaustive channel mapping (no wildcard arm — `ExpectedChannel` and
+//!   household's `MeshIntentChannel` are two distinct enums); the
+//!   `TrustedWallFloor` it needs is sourced fresh on every call from
+//!   `MachineRosterCoordinator::current_snapshot_with_trusted_wall_floor`,
+//!   never constructed by this crate (that type's only constructor is
+//!   private to household-rs); `MayHaveTakenEffect` is never reclassified
+//!   into `Committed`/`AlreadyConsumed` for any of the real ledger's
+//!   commit stages — see that module's own doc and tests.
+//! - `ledger_seam`: predates the bridge above and is NOT used by it —
+//!   see that module's own doc for why (the bridge sources its floor
+//!   fresh per call rather than through this seam's construction-time
+//!   `TrustedFloorProof`, which would go stale across a long-lived
+//!   adapter instance). Kept for the type-level discipline it still
+//!   documents for anything else in this crate that later needs durable
+//!   nonce consumption.
 //! - `roster_bridge::HouseholdRosterSource`: a real
 //!   `keystore_rs::mesh_session_bridge::RosterLookupSource` against
 //!   `household_rs::machine_roster_store::MachineRosterCoordinator::query_machine_currency`.
@@ -20,8 +35,9 @@
 //!   concrete `H` and whatever produces real `Weak<H>` handles are a
 //!   different piece of the pipeline (see that module's own doc).
 //!
-//! Explicitly NOT in this round's scope (declared, not built — see each
-//! module's own doc for why real material does not exist yet):
+//! Explicitly NOT in this round's scope (declared, not built — see
+//! `signer_seam` and each other module's own doc for why real material
+//! does not exist yet):
 //! `SignatureVerifier`, a real `cell::open` call site, a TTL source, a
 //! `generation: NonZeroU64` source, and a concrete `H: RevocableMeshSession`
 //! (and whatever produces real `Weak<H>` handles for it). `household-rs`'s
