@@ -356,7 +356,7 @@ impl PairWindowNamespaceV2 {
                 error,
             )
         })?;
-        let named_dev = u64::try_from(named.st_dev).map_err(|_| {
+        let named_dev = namespace_dev_as_u64(&named).ok_or_else(|| {
             unsafe_storage_error(
                 &self.inner.state_path.join(&self.inner.namespace_name),
                 "pair-window namespace device id is not representable",
@@ -779,6 +779,32 @@ fn lifecycle_storage_error(path: &Path, error: HouseholdLifecycleLockError) -> S
         kind: "household_lifecycle".into(),
         hint: error.to_string(),
     }
+}
+
+/// Widens `Stat::st_dev` to the `u64` that `namespace_dev` is stored as.
+///
+/// `namespace_dev` comes from `MetadataExt::dev()`, which is `u64` on every
+/// Unix, but `st_dev` is `dev_t`, whose width is decided by the target *vendor*:
+/// `libc` defines it in `unix/bsd/apple/mod.rs` as `i32` for all five Apple
+/// targets, and as `u64` for every Linux flavour (gnu and musl alike).
+///
+/// So the narrowing check is real on Apple and an identity on Linux, where
+/// `u64::try_from` would trip `clippy::useless_conversion`. It must stay
+/// fallible on Apple: `st_dev as u64` would silence the lint on both sides and
+/// map a negative `dev_t` onto a huge `u64`, deleting the caller's
+/// "not representable" error path — the one case that path exists for.
+///
+/// The split is on `target_vendor` rather than `any(macos, ios)` because vendor
+/// is the property `libc` itself switches on; enumerating OSes would break if a
+/// sixth Apple target appeared.
+#[cfg(target_vendor = "apple")]
+fn namespace_dev_as_u64(named: &rustix::fs::Stat) -> Option<u64> {
+    u64::try_from(named.st_dev).ok()
+}
+
+#[cfg(not(target_vendor = "apple"))]
+fn namespace_dev_as_u64(named: &rustix::fs::Stat) -> Option<u64> {
+    Some(named.st_dev)
 }
 
 fn unsafe_storage_error(path: &Path, hint: &str) -> StorageError {
