@@ -1650,6 +1650,7 @@ mod tests {
                 claw_static_pub: claw_static_pub(),
                 not_after: NOW + 60,
                 now_unix: NOW,
+                app_presentation: None,
             },
             &owner as &dyn IdentityKey,
         )
@@ -1674,6 +1675,7 @@ mod tests {
                 claw_static_pub: claw_static_pub(),
                 not_after: NOW + 60,
                 now_unix: NOW,
+                app_presentation: None,
             },
             &owner as &dyn IdentityKey,
         )
