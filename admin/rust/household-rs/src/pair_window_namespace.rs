@@ -802,7 +802,14 @@ fn namespace_dev_as_u64(named: &rustix::fs::Stat) -> Option<u64> {
     u64::try_from(named.st_dev).ok()
 }
 
+// The `Option` is trivially `Some` here, which `clippy::unnecessary_wraps`
+// (pedantic, on via the workspace lint table) rejects. It is not unnecessary —
+// it is unnecessary *on this platform*. Both arms must expose the same
+// signature so the single call site stays cfg-free and keeps one `ok_or_else`
+// carrying the "not representable" error; narrowing this arm to `-> u64` would
+// force the caller to be cfg-gated too.
 #[cfg(not(target_vendor = "apple"))]
+#[allow(clippy::unnecessary_wraps)]
 fn namespace_dev_as_u64(named: &rustix::fs::Stat) -> Option<u64> {
     Some(named.st_dev)
 }
