@@ -3291,6 +3291,7 @@ dependencies = [
  "household-rs",
  "keystore-rs",
  "mesh-session-core-rs",
+ "static_assertions",
 ]
 
 [[package]]

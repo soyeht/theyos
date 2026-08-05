@@ -2234,25 +2234,37 @@ impl SealedBinding {
     /// comment above.
     ///
     /// **Declared partition (2026-08-05, @ilia audit of `29dc6139`,
-    /// independently verified line-by-line — not a defect, but
-    /// undeclared before this note, which promised more than the code
-    /// delivered):** `peer_m_id` does NOT go through the same
-    /// unconditional-then-combine path as the other 4 fields. It is
-    /// resolved by roster lookup FIRST, with two early returns — revoked,
-    /// then absent — both completing before any of the 4 comparisons
-    /// below ever run. `MembershipKeyRejected` itself still leaks nothing
-    /// (no variant, no field, identical `Display`/`Debug` on every path),
-    /// but the CONTROL FLOW differs, and is timing-distinguishable, from
-    /// "m_id valid but one of the other 4 fields wrong." Accepted as-is,
-    /// not closed, because calling this function already requires holding
-    /// the exact `&RosterSnapshotView` the m_id would be looked up
-    /// against — a caller who can observe this distinction could have
-    /// read the roster directly and learned the same thing; the check
-    /// reveals only existence/revocation status the caller's own snapshot
-    /// already carries, never a secret. See
-    /// `membership_key_field_comparison_order_is_pinned` below, which
-    /// locks this exact source-level ordering so a future reordering is a
-    /// deliberate, visible edit — not an accidental drift.
+    /// independently verified line-by-line, narrowed by @zain's
+    /// structural analysis — not a defect, but undeclared before this
+    /// note, which promised more than the code delivered):** `peer_m_id`
+    /// does NOT go through the same unconditional-then-combine path as
+    /// the other 4 fields. It is resolved by roster lookup FIRST, with
+    /// two early returns — revoked, then absent — both completing before
+    /// any of the 4 comparisons below ever run. `MembershipKeyRejected`
+    /// itself still leaks nothing (no variant, no field, identical
+    /// `Display`/`Debug` on every path), but the CONTROL FLOW differs,
+    /// and is timing-distinguishable, from "m_id valid but one of the
+    /// other 4 fields wrong." Accepted as-is, not closed, because calling
+    /// this function already requires holding the exact
+    /// `&RosterSnapshotView` the m_id would be looked up against — a
+    /// caller who can observe this distinction could have read the
+    /// roster directly and learned the same thing; the check reveals
+    /// only existence/revocation status the caller's own snapshot already
+    /// carries, never a secret. **This condition is load-bearing: if this
+    /// code path ever becomes reachable by a principal that does NOT
+    /// already hold the snapshot, the partition stops being acceptable**
+    /// (@zain) — re-audit this note if that ever changes.
+    ///
+    /// Two DIFFERENT reasons hold the two halves of this ordering, not
+    /// one: `lookup_active` before `fingerprint_matches` needs no test at
+    /// all — it is a DATA dependency the compiler enforces
+    /// (`fingerprint_matches` reads `member.machine_cert_fingerprint()`,
+    /// and `member` IS `lookup_active`'s return value). `is_revoked`
+    /// before the 4 comparisons has no such dependency and is
+    /// behaviorally unobservable if moved — see
+    /// `membership_key_is_revoked_check_precedes_field_comparisons`
+    /// below, which pins exactly that ONE relationship, not the whole
+    /// function's shape.
     pub fn from_membership_key(
         key: &mesh_session_core_rs::intent::D1MembershipKey,
         snapshot: &RosterSnapshotView,
@@ -2280,14 +2292,18 @@ impl SealedBinding {
 /// existing ordering exactly — an unavoidable, pre-existing short-circuit
 /// (there is no member to compare fields against if the `m_id` isn't
 /// active), not something new introduced here. **This IS an observable
-/// partition** — see `SealedBinding::from_membership_key`'s own doc for
-/// why it is declared-and-accepted rather than closed. Past that gate,
-/// all 4 remaining field comparisons (`hh_id`, fingerprint,
-/// `checkpoint_hash`, `checkpoint_sequence`) are evaluated
-/// UNCONDITIONALLY and combined with a single `&&`, checked once — no
-/// per-field early return among THESE four, so no observable
-/// control-flow or timing difference between fingerprint being wrong and
-/// `checkpoint_sequence` being wrong specifically.
+/// partition, and only `is_revoked`'s position within it is a genuine,
+/// pinned choice** — see `SealedBinding::from_membership_key`'s own doc
+/// for the full declaration, including why `lookup_active` before
+/// `fingerprint_matches` needs no pin at all (compiler-enforced data
+/// dependency) while `is_revoked`'s position does (no such dependency,
+/// behaviorally unobservable if moved). Past that gate, all 4 remaining
+/// field comparisons (`hh_id`, fingerprint, `checkpoint_hash`,
+/// `checkpoint_sequence`) are evaluated UNCONDITIONALLY and combined with
+/// a single `&&`, checked once — no per-field early return among THESE
+/// four, so no observable control-flow or timing difference between
+/// fingerprint being wrong and `checkpoint_sequence` being wrong
+/// specifically.
 #[cfg(feature = "mesh-session-runtime")]
 fn validate_membership_fields(
     hh_id: &str,
@@ -2526,22 +2542,39 @@ mod tests {
         assert_eq!(err, MembershipKeyRejected);
     }
 
-    /// Pins the declared partition (@ilia audit of `29dc6139`): `peer_m_id`
-    /// resolves via early-returning lookup BEFORE the 4 unconditional field
-    /// comparisons — not merely documented in prose, but locked to the
-    /// function's own source text, so a future reordering fails this test
-    /// and must be a deliberate edit, not silent drift. Structural, not
-    /// behavioral: `MembershipKeyRejected` carries no data, so no
-    /// black-box call sequence can observe this ordering by return value
-    /// alone — this is exactly why a source-level pin is the only proof
-    /// available today. Verified against the CURRENT text of this file
-    /// only, same accepted class of self-check as this crate's own
-    /// `r1a7_enumerates_linked_targets_and_proves_zero_production_callers`
-    /// (parses its own Cargo.toml text) and `mesh-session-core-rs`'s
-    /// `static_assertions` compile-time checks.
+    /// Pins the ONE half of the declared partition (@ilia audit of
+    /// `29dc6139`, narrowed by @zain's structural analysis) that actually
+    /// needs pinning — `is_revoked`'s position relative to the 4
+    /// unconditional field comparisons.
+    ///
+    /// **The `lookup_active` → `fingerprint_matches` order is NOT pinned
+    /// here, deliberately: it needs no pin at all.** `fingerprint_matches`
+    /// reads `member.machine_cert_fingerprint()`, and `member` is exactly
+    /// `lookup_active`'s own return value — this is a DATA dependency the
+    /// compiler enforces; `lookup_active` cannot be moved after that
+    /// comparison because the value it produces would not exist yet.
+    /// Pinning something the type system already guarantees would
+    /// wrongly imply this test is what secures it.
+    ///
+    /// **`is_revoked` has no such dependency** — nothing downstream reads
+    /// its result besides the early return itself, so it could freely
+    /// move to after the 4 comparisons and the code would still compile.
+    /// Moving it is also BEHAVIORALLY UNOBSERVABLE: the error stays the
+    /// same fieldless `MembershipKeyRejected` either way, so no black-box
+    /// call sequence can distinguish the two orderings by return value —
+    /// which is exactly why a source-position pin is the only proof
+    /// available for this half, not a weaker substitute for something
+    /// free elsewhere.
+    ///
+    /// **`include_str!` limitation, stated plainly:** this reads the
+    /// current SOURCE FILE at compile time — it proves what the source
+    /// says, not what the compiled binary does. Accepted here only
+    /// because this test lives in the same crate and recompiles whenever
+    /// the source it reads changes; a copy or a stale build would not be
+    /// covered.
     #[cfg(feature = "mesh-session-runtime")]
     #[test]
-    fn membership_key_field_comparison_order_is_pinned() {
+    fn membership_key_is_revoked_check_precedes_field_comparisons() {
         let source = include_str!("machine_roster_authority.rs");
         let fn_start = source
             .find("fn validate_membership_fields(")
@@ -2555,30 +2588,16 @@ mod tests {
         let revoked_check = fn_body
             .find("snapshot.is_revoked(")
             .expect("revoked check must exist in validate_membership_fields");
-        let lookup_check = fn_body
-            .find("snapshot.lookup_active(")
-            .expect("lookup_active call must exist in validate_membership_fields");
         let hh_id_comparison = fn_body
             .find("let hh_id_matches")
             .expect("hh_id_matches comparison must exist in validate_membership_fields");
-        let combined_check = fn_body
-            .find("if !(hh_id_matches")
-            .expect("combined field check must exist in validate_membership_fields");
 
         assert!(
-            revoked_check < lookup_check,
-            "revoked check must precede the active-lookup, matching from_responding_peer's ordering"
-        );
-        assert!(
-            lookup_check < hh_id_comparison,
-            "peer_m_id resolution (revoked + lookup) must precede the 4 unconditional field \
-             comparisons — this is the declared, accepted partition; if this genuinely changed, \
-             update this pin deliberately, not by accident"
-        );
-        assert!(
-            hh_id_comparison < combined_check,
-            "the 4 field comparisons must be computed before the single combined check that \
-             uses them — proves they run unconditionally, not short-circuited among themselves"
+            revoked_check < hh_id_comparison,
+            "is_revoked has no data dependency forcing this order — unlike lookup_active, whose \
+             result the field comparisons directly consume — so this position is not \
+             compiler-guaranteed and needs this explicit pin. If this genuinely changed, update \
+             it deliberately, not by accident."
         );
     }
 
