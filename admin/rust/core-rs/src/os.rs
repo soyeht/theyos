@@ -28,12 +28,12 @@ unsafe extern "C" {
 #[must_use]
 pub fn resolve_slirp4netns() -> Option<PathBuf> {
     // 1. Env var
-    if let Ok(v) = std::env::var("SLIRP4NETNS_BIN") {
-        if !v.is_empty() {
-            let p = PathBuf::from(&v);
-            if p.exists() {
-                return Some(p);
-            }
+    if let Ok(v) = std::env::var("SLIRP4NETNS_BIN")
+        && !v.is_empty()
+    {
+        let p = PathBuf::from(&v);
+        if p.exists() {
+            return Some(p);
         }
     }
     // 2. PATH lookup
@@ -42,21 +42,21 @@ pub fn resolve_slirp4netns() -> Option<PathBuf> {
     }
     // 3. Nix store scan
     let nix_store = Path::new("/nix/store");
-    if nix_store.is_dir() {
-        if let Ok(rd) = std::fs::read_dir(nix_store) {
-            let mut candidates: Vec<PathBuf> = rd
-                .flatten()
-                .filter_map(|entry| {
-                    let candidate = entry.path().join("bin/slirp4netns");
-                    candidate.is_file().then_some(candidate)
-                })
-                .collect();
-            // Sort descending by name so newest Nix store path wins
-            candidates.sort();
-            candidates.reverse();
-            if let Some(c) = candidates.into_iter().next() {
-                return Some(c);
-            }
+    if nix_store.is_dir()
+        && let Ok(rd) = std::fs::read_dir(nix_store)
+    {
+        let mut candidates: Vec<PathBuf> = rd
+            .flatten()
+            .filter_map(|entry| {
+                let candidate = entry.path().join("bin/slirp4netns");
+                candidate.is_file().then_some(candidate)
+            })
+            .collect();
+        // Sort descending by name so newest Nix store path wins
+        candidates.sort();
+        candidates.reverse();
+        if let Some(c) = candidates.into_iter().next() {
+            return Some(c);
         }
     }
     None
