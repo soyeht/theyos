@@ -3556,31 +3556,52 @@ mod tests {
              elsewhere in production would still pass the crate-wide count \
              above while bypassing the coordinator"
         );
+    }
 
-        // Non-vacuity, closing the gap a minimum-cardinality check would
-        // leave open: membership (which files DEFINE the symbol) must be
-        // decided on each file's WHOLE content, never on a partitioned
-        // half — a broken partition that cuts before the definition would
-        // otherwise make this file look like it doesn't define `open` at
-        // all, silently excluding it from every assertion above rather
-        // than failing one. And the expected value is the SET `{
-        // "mesh_intent_nonce_ledger.rs" }`, not `>= 1`: a minimum would
-        // stay green if a second file quietly started defining `open` too
-        // — exactly the drift this guard exists to catch. (@zain)
-        //
-        // This scan excludes ITSELF by `file!()` rather than by
-        // obfuscating the literal (@khai): unlike the `needle`/`marker`
-        // checks above — which must read this exact file's own two halves
-        // and cannot avoid it — this loop scans MANY files, and this file
-        // is only incidentally one of them. `file!()`-exclusion survives
-        // a future `git mv` of this guard to another file; a hidden
-        // literal would silently start matching itself again the moment
-        // the guard moved into (or a walked directory started including)
-        // wherever it now lives. The literal below is therefore left
-        // PLAIN and grep-findable. Excluding this file from the walk does
-        // not weaken the check: this file's own definition is already
-        // proven present by the direct `contains` assertion above, so the
-        // walk only needs to prove no OTHER file also defines it.
+    // Split from the call-site test above (@zain, @khai): both tests read
+    // the same `mod tests` boundary and the same production text, but the
+    // containment assertion above and the membership check below panic on
+    // DIFFERENT causes. Kept in one `#[test]`, a definition-loss mutation
+    // that trips the containment assert masks this one — `cargo test`
+    // stops that thread at the first panic, so a real, symmetric mutant
+    // (rename/move the real definition) only ever shows ONE red, never
+    // both, and whichever assertion happens to run second is silently
+    // unexercised on every such run. As two `#[test]`s, both are
+    // independently observable in the same `cargo test` invocation: a
+    // mutation that only breaks containment fails just this file's own
+    // call-site test; a mutation that lets a second file start defining
+    // `open` fails just the membership test below; a mutation that does
+    // both (e.g. the real definition genuinely moves to another file)
+    // fails both, visibly, in the same run.
+    //
+    // Non-vacuity, closing the gap a minimum-cardinality check would
+    // leave open: membership (which files DEFINE the symbol) must be
+    // decided on each file's WHOLE content, never on a partitioned
+    // half — a broken partition that cuts before the definition would
+    // otherwise make this file look like it doesn't define `open` at
+    // all, silently excluding it from every assertion above rather
+    // than failing one. And the expected value is the SET `{
+    // "mesh_intent_nonce_ledger.rs" }`, not `>= 1`: a minimum would
+    // stay green if a second file quietly started defining `open` too
+    // — exactly the drift this guard exists to catch. (@zain)
+    //
+    // This scan excludes ITSELF by `file!()` rather than by
+    // obfuscating the literal (@khai): unlike the `needle`/`marker`
+    // checks in the call-site test above — which must read this exact
+    // file's own two halves and cannot avoid it — this loop scans MANY
+    // files, and this file is only incidentally one of them.
+    // `file!()`-exclusion survives a future `git mv` of this guard to
+    // another file; a hidden literal would silently start matching
+    // itself again the moment the guard moved into (or a walked
+    // directory started including) wherever it now lives. The literal
+    // below is therefore left PLAIN and grep-findable. Excluding this
+    // file from the walk does not weaken the check: this file's own
+    // definition is proven present by the OTHER test's direct `contains`
+    // assertion, so this walk only needs to prove no OTHER file also
+    // defines it — the two tests together cover both halves of
+    // membership; neither alone does.
+    #[test]
+    fn mesh_intent_nonce_ledger_open_is_defined_in_exactly_one_file() {
         let definer = "pub(crate) fn open(";
         let self_basename = Path::new(file!())
             .file_name()
