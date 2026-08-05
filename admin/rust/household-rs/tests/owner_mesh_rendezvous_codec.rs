@@ -363,10 +363,17 @@ fn r1a7_enumerates_linked_targets_and_proves_zero_production_callers() {
     // +1 `mesh-session-runtime-rs` (D6 runtime facade). Derived, not bumped: it
     // joins as a REAL member rather than staying standalone, because a crate
     // outside the workspace is not built by `--workspace` and therefore has no
-    // CI at all. It declares no `[[bin]]`/`[[test]]`/`[[example]]` and ships no
-    // `src/main.rs`, `src/bin/`, `tests/` or `examples/`, so by
-    // `enumerate_workspace_targets`'s own rule it contributes ZERO targets --
-    // members moves by one and targets does not move for it.
+    // CI at all. At the commit where it joined, it declared no
+    // `[[bin]]`/`[[test]]`/`[[example]]` and shipped no `src/main.rs`,
+    // `src/bin/`, `tests/` or `examples/`, so by `enumerate_workspace_targets`'s
+    // own rule it contributed ZERO targets at that point -- members moved by
+    // one and targets did not move for it THEN. That stopped being true at
+    // `bc8f5e55`, which gave it its first `tests/` file — see the target
+    // count's own comment below for the +1 that landed with it. Left here,
+    // unedited except for this note, because the member-count assertion two
+    // lines down is still exactly what it says: members moved by one when
+    // this crate joined, and that fact does not change just because targets
+    // later did.
     assert_eq!(members.len(), 31, "workspace member inventory changed");
     assert!(
         members
@@ -399,13 +406,29 @@ fn r1a7_enumerates_linked_targets_and_proves_zero_production_callers() {
     // The other two, `mesh-session-control-model-rs/tests/{cas_multiprocess,
     // model_invariants}.rs`, do NOT count: that crate is in the workspace's
     // `exclude` list, so it is not a member and `enumerate_workspace_targets`
-    // never walks it. `mesh-session-runtime-rs` joins as a member but declares
-    // no explicit targets and ships no `tests/`, so it adds zero here.
+    // never walks it. `mesh-session-runtime-rs` joined as a member at this
+    // composition declaring no explicit targets and shipping no `tests/`, so
+    // it added zero here AT THAT POINT — see the +1 immediately below for
+    // where that stopped being true.
     //
     // Every arithmetic prediction of this number made during composition was
     // wrong (206, then 207, by two different routes). The value below is what
     // the enumerator reported; the list above is why.
-    assert_eq!(targets.len(), 206, "Cargo target inventory changed");
+    //
+    // 206 + 1. Derived, not bumped: @daisy's `bc8f5e55` adds
+    // `mesh-session-runtime-rs/tests/compile_fail_channel_mapping.rs`, a real
+    // `[[test]]`-kind integration target (the trybuild runner for the
+    // channel-mapping exhaustiveness proof) — `mesh-session-runtime-rs`'s own
+    // entry above only claimed it "ships no `tests/`" as of the commit that
+    // added it as a member; that was true then and stopped being true here.
+    // Found by @khai bisecting a red the two verifications that ran before
+    // composition both missed for a legitimate reason each: `bc8f5e55`'s own
+    // check covered `household-rs`'s LIB tests (1160) and this crate's own
+    // suite, neither of which is this integration-test inventory; the
+    // composition's graph-gate run covers the dependency graph, not target
+    // counts. Re-measured directly against this tree, not inferred from the
+    // diff.
+    assert_eq!(targets.len(), 207, "Cargo target inventory changed");
     assert_eq!(
         targets.iter().filter(|target| target.kind == "bin").count(),
         50
@@ -421,7 +444,11 @@ fn r1a7_enumerates_linked_targets_and_proves_zero_production_callers() {
         // targets, not 5. Decomposing by kind is what exposed both -- the
         // total assertion fires first and hides the sub-counters, and one
         // wrong count is visible where two that cancel are not.
-        156
+        //
+        // 156 + 1: `compile_fail_channel_mapping.rs` (see the total assert's
+        // own comment above) is a `[[test]]`-kind target, not `bin`/`example`
+        // — those two counts below are unaffected.
+        157
     );
     assert_eq!(
         targets
