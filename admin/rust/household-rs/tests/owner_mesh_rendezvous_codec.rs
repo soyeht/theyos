@@ -1283,3 +1283,150 @@ fn msrv_lint_debt_keeps_its_justification() {
         );
     }
 }
+
+// ---------------------------------------------------------------- doc-scope
+//
+// A crate doc that lists "this round's scope, exactly:" and then omits a module
+// is not a style nit: a reader concludes the module does not exist. Measured on
+// `90ff54db`, `mesh-session-runtime-rs` had shipped with `intent_nonce_ledger_bridge`
+// absent from that list while `lib.rs` declared AND exported it, and the same
+// list never named `signer_seam` (a `pub mod`).
+//
+// WHAT THIS GUARD CATCHES: a module declared in `lib.rs` and not named in that
+// crate's `//!` block.
+//
+// WHAT IT DOES NOT CATCH, and this limit is the reason it is written here and
+// not in a commit message: a doc sentence that is syntactically perfect and
+// semantically dead. The same delivery carried a stale "no concrete backend
+// exists in this workspace yet" duplicated verbatim inside `ledger_seam.rs`,
+// which no structural check can read as false. Do not treat a green here as
+// coverage of "the crate docs are accurate".
+//
+// SCOPE LIMIT: `workspace_members()` reads `members = [...]`, so the two
+// deliberately-excluded roots (`mesh-session-core-rs`,
+// `mesh-session-control-model-rs`) are unreachable by this guard even if they
+// adopt the marker. They are the nearest crates to the convention (1 missing
+// module each, measured), so this is a real gap, not a theoretical one.
+
+/// The opt-in, as ONE exact literal. Unlike Rust's three `mod` spellings --
+/// which the language gives us, so the enumerator must accept all of them --
+/// this string is chosen by us. Accepting variants of something we define would
+/// multiply controls without closing anything, and would let a near-miss read
+/// as compliance. Near-misses are therefore a hard failure, not a shrug.
+const DOC_SCOPE_MARKER: &str = "doc-scope: every declared module is named in this crate doc.";
+
+/// Crates that have opted in, committed so that LEAVING the scope costs a
+/// visible diff exactly like joining it. The marker lives in a doc comment, so
+/// an ordinary doc rewrite would otherwise drop a crate silently and this guard
+/// would stay green while measuring less.
+const DOC_SCOPE_MEMBERS: &[&str] = &["mesh-session-runtime-rs"];
+
+fn crate_lib_rs(rust_root: &Path, member: &str) -> Option<String> {
+    fs::read_to_string(rust_root.join(member).join("src").join("lib.rs")).ok()
+}
+
+/// The `//!` block only. Doc comments on items (`///`) are not the crate doc.
+fn crate_doc_block(lib_rs: &str) -> String {
+    lib_rs
+        .lines()
+        .filter(|l| l.trim_start().starts_with("//!"))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Every `mod x;` form Rust accepts: `mod`, `pub mod`, `pub(crate) mod`,
+/// `pub(super) mod`, ... Enumerating one spelling is how a guard silently
+/// measures a subset.
+fn declared_modules(lib_rs: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for line in lib_rs.lines() {
+        let code = line.split("//").next().unwrap_or("").trim();
+        let rest = match code.strip_prefix("pub") {
+            Some(after_pub) => after_pub.trim_start().trim_start_matches(|c| c != 'm'),
+            None => code,
+        };
+        if let Some(name) = rest
+            .strip_prefix("mod ")
+            .and_then(|n| n.strip_suffix(';'))
+            .map(str::trim)
+        {
+            if !name.is_empty() && name.chars().all(|c| c.is_alphanumeric() || c == '_') {
+                out.push(name.to_owned());
+            }
+        }
+    }
+    out
+}
+
+#[test]
+fn doc_scope_opted_in_crates_name_every_declared_module() {
+    let rust_root = repository_root().join("admin/rust");
+    for member in DOC_SCOPE_MEMBERS {
+        let lib_rs = crate_lib_rs(&rust_root, member)
+            .unwrap_or_else(|| panic!("{member} is in DOC_SCOPE_MEMBERS but has no src/lib.rs"));
+        let doc = crate_doc_block(&lib_rs);
+        let missing: Vec<_> = declared_modules(&lib_rs)
+            .into_iter()
+            .filter(|m| !doc.contains(m.as_str()))
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "{member} declares {missing:?} but its crate doc never names them. A \
+             scope list that omits a module tells the reader the module does not \
+             exist -- which is how a bridge got documented as absent while being \
+             exported three lines away."
+        );
+    }
+}
+
+#[test]
+fn doc_scope_membership_matches_the_marker_in_both_directions() {
+    let rust_root = repository_root().join("admin/rust");
+    for member in workspace_members(&rust_root) {
+        let Some(lib_rs) = crate_lib_rs(&rust_root, &member) else {
+            continue;
+        };
+        let has_marker = crate_doc_block(&lib_rs).contains(DOC_SCOPE_MARKER);
+        let in_snapshot = DOC_SCOPE_MEMBERS.contains(&member.as_str());
+        assert_eq!(
+            has_marker, in_snapshot,
+            "doc-scope membership disagrees for `{member}`: marker={has_marker}, \
+             snapshot={in_snapshot}. BOTH directions fail on purpose. Dropping the \
+             marker without editing DOC_SCOPE_MEMBERS would silently shrink what \
+             this guard measures; adding it without editing the snapshot would \
+             leave a crate believing it is checked when nothing checks it. A set \
+             that only fails when it shrinks tolerates growing unobserved."
+        );
+    }
+}
+
+#[test]
+fn doc_scope_marker_near_misses_are_rejected() {
+    let rust_root = repository_root().join("admin/rust");
+    // Deliberately NOT the marker: each differs from it, so a crate carrying one
+    // of these is opting in as far as its author is concerned and is invisible
+    // to the exact-match check above.
+    let near_misses = [
+        "doc scope: every declared module is named in this crate doc.",
+        "doc-scope: every declared module is named in this crate doc",
+        "DOC-SCOPE: every declared module is named in this crate doc.",
+    ];
+    for member in workspace_members(&rust_root) {
+        let Some(lib_rs) = crate_lib_rs(&rust_root, &member) else {
+            continue;
+        };
+        let doc = crate_doc_block(&lib_rs);
+        if doc.contains(DOC_SCOPE_MARKER) {
+            continue;
+        }
+        for near in near_misses {
+            assert!(
+                !doc.contains(near),
+                "`{member}` carries a near-miss of the doc-scope marker (`{near}`) \
+                 rather than the exact literal, so it reads as opted in to a human \
+                 and is invisible to the guard. The marker is one exact spelling \
+                 BECAUSE we define it: `{DOC_SCOPE_MARKER}`"
+            );
+        }
+    }
+}

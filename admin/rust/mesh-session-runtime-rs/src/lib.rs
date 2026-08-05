@@ -51,6 +51,8 @@
 //! feature-gated dependencies rather than required ones (resolver-2
 //! feature unification would otherwise make `keystore-rs`'s own
 //! `mesh-session` feature un-disable-able workspace-wide).
+//!
+//! doc-scope: every declared module is named in this crate doc.
 
 #[cfg(feature = "mesh-session-runtime")]
 mod clock;
