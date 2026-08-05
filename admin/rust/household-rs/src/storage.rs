@@ -1568,6 +1568,126 @@ fn io_to_storage(e: &std::io::Error, path: &Path) -> StorageError {
 }
 
 #[cfg(test)]
+mod stage_commit_files_caller_lock {
+    //! Source lock on `stage_commit_files`.
+    //!
+    //! `stage_commit_files` is `pub` inside a `pub mod storage`, and it calls
+    //! `fs::create_dir_all(parent)` by *path*. A path-based ancestor create can
+    //! re-materialise a directory whose removal was itself the security event —
+    //! that is precisely the shape of the B-1 path escape and the B-2
+    //! `OwnerEventLog` defect. Today every caller is inside this crate and uses
+    //! a lifecycle-guarded wrapper, but nothing except caller convention keeps
+    //! it that way, and a prohibition with no mechanism is not a control.
+    //!
+    //! This locks the caller set by exact equality. A new call site — above all
+    //! one in another crate, which the public visibility permits — fails here
+    //! and forces the author to state whether it may create ancestors by path.
+    //! Converting the function to `pub(crate)` would be the stronger fix; it is
+    //! deferred only because `tests/storage_2pc.rs` consumes it as an external
+    //! integration-test crate.
+
+    use std::collections::BTreeMap;
+    use std::path::{Path, PathBuf};
+
+    fn rust_workspace() -> PathBuf {
+        // CARGO_MANIFEST_DIR is <repo>/admin/rust/household-rs
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("household-rs sits inside admin/rust")
+            .to_path_buf()
+    }
+
+    /// Every `.rs` file in the workspace, so the sweep covers the universe it
+    /// claims rather than a directory that happens to be convenient.
+    fn all_rust_sources(root: &Path, out: &mut Vec<PathBuf>) {
+        let Ok(entries) = std::fs::read_dir(root) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                // `target/` holds build products, not authored call sites.
+                if path.file_name().is_some_and(|name| name == "target") {
+                    continue;
+                }
+                all_rust_sources(&path, out);
+            } else if path.extension().is_some_and(|ext| ext == "rs") {
+                out.push(path);
+            }
+        }
+    }
+
+    #[test]
+    fn stage_commit_files_callers_are_exactly_the_reviewed_set() {
+        let workspace = rust_workspace();
+        let mut sources = Vec::new();
+        all_rust_sources(&workspace, &mut sources);
+
+        // Positive control: the sweep must actually reach a broad slice of the
+        // workspace. A broken walk that finds nothing would make the equality
+        // below pass vacuously, which is the classic way a guard search fails
+        // toward "unprotected".
+        assert!(
+            sources.len() > 400,
+            "source sweep found only {} files; the walk is broken, so this \
+             guard would pass without checking anything",
+            sources.len()
+        );
+
+        let mut found: BTreeMap<String, usize> = BTreeMap::new();
+        for path in &sources {
+            let Ok(text) = std::fs::read_to_string(path) else {
+                continue;
+            };
+            let count = text
+                .lines()
+                .filter(|line| {
+                    let trimmed = line.trim_start();
+                    // Match call/definition syntax, not the bare identifier.
+                    // Skipping comments keeps prose references out; requiring
+                    // the open paren keeps this module's own name, its test
+                    // function and its message strings from counting themselves,
+                    // which would make the lock churn whenever its own comments
+                    // were edited.
+                    !trimmed.starts_with("//") && line.contains("stage_commit_files(")
+                })
+                .count();
+            if count > 0 {
+                let rel = path
+                    .strip_prefix(&workspace)
+                    .unwrap_or(path)
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                found.insert(rel, count);
+            }
+        }
+
+        let expected: BTreeMap<String, usize> = [
+            // The definition, plus this module's own two in-crate test calls.
+            ("household-rs/src/storage.rs", 3),
+            ("household-rs/src/bootstrap.rs", 3),
+            ("household-rs/src/machine_cert.rs", 1),
+            ("household-rs/src/pair_machine.rs", 1),
+            // The lifecycle-guarded namespace: appends its own generation-scoped
+            // target rather than accepting a raw path from the caller.
+            ("household-rs/src/pair_window_namespace.rs", 1),
+            ("household-rs/tests/storage_2pc.rs", 4),
+        ]
+        .into_iter()
+        .map(|(path, count)| (path.to_string(), count))
+        .collect();
+
+        assert_eq!(
+            found, expected,
+            "the `stage_commit_files` caller set changed. This function creates \
+             ancestors by path, which can resurrect a directory whose removal \
+             was the security event. If the new call site is legitimate, state \
+             why it may do that and update this lock deliberately."
+        );
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use serde::{Deserialize, Serialize};
