@@ -741,20 +741,62 @@ impl FinalizeTerminalResultRecordV1 {
     }
 
     fn matches_expectation(&self, expectation: &HouseholdInstallExpectation) -> bool {
-        self.request_fingerprint_blake3_256.as_ref()
+        // Exhaustive destructuring, deliberately with no `..` rest pattern. This
+        // compares a record against an *expectation* -- two different types --
+        // so total `==` is not available, and a hand-enumerated projection was
+        // what stood here before. That projection silently omitted `phase`, and
+        // a field added to `FinalizeTerminalResultRecordV1` would have escaped
+        // retry identity without any compile error: the guarantee would rest on
+        // every future author remembering to extend the list. Binding every
+        // field by name moves that from a decision into the type system -- the
+        // next added field fails to compile here until someone states whether it
+        // belongs to retry identity.
+        let Self {
+            version,
+            kind,
+            phase,
+            request_fingerprint_blake3_256,
+            join_request_bytes,
+            candidate_generation,
+            terminal_generation,
+            hh_id,
+            m_id,
+            commit_marker_blake3_256,
+            ack_version,
+            ack_m_id,
+            ack_machine_cert_hash,
+            ack_bytes,
+        } = self;
+
+        // `version` and `kind` are the record's own shape, already enforced by
+        // `validate()` before any record reaches this comparison; re-checking
+        // them here would compare a constant against itself.
+        let _ = (version, kind);
+
+        // `phase` is deliberately NOT part of retry identity, and this is a
+        // behavioural requirement rather than an oversight:
+        // `ensure_terminal_result_prepared` must return an existing *Prepared*
+        // record that matches its expectation. Folding `phase` in here would
+        // send that path to the replacement branch and quarantine a legitimate
+        // resume. Both call sites carry their own explicit phase check next to
+        // the call -- `finalize` requires `phase == Final` before accepting a
+        // terminal result, and `ensure_terminal_result_prepared` requires it
+        // before replacing one.
+        let _ = phase;
+
+        request_fingerprint_blake3_256.as_ref()
             == expectation.terminal_intent.request_fingerprint.0
-            && self.candidate_generation.as_ref() == expectation.candidate_generation.token_bytes()
-            && self.terminal_generation.as_ref().map(ByteBuf::as_ref)
+            && candidate_generation.as_ref() == expectation.candidate_generation.token_bytes()
+            && terminal_generation.as_ref().map(ByteBuf::as_ref)
                 == Some(expectation.terminal_generation.token_bytes().as_slice())
-            && self.join_request_bytes.as_ref() == expectation.terminal_intent.join_request_bytes
-            && self.hh_id == expectation.expected_hh_id
-            && self.m_id == expectation.expected_m_id
-            && self.commit_marker_blake3_256.as_ref() == expectation.commit_marker_blake3_256
-            && self.ack_version == expectation.terminal_intent.ack_version
-            && self.ack_m_id == expectation.terminal_intent.ack_m_id
-            && self.ack_machine_cert_hash.as_ref()
-                == expectation.terminal_intent.ack_machine_cert_hash
-            && self.ack_bytes.as_ref() == expectation.terminal_intent.ack_bytes
+            && join_request_bytes.as_ref() == expectation.terminal_intent.join_request_bytes
+            && *hh_id == expectation.expected_hh_id
+            && *m_id == expectation.expected_m_id
+            && commit_marker_blake3_256.as_ref() == expectation.commit_marker_blake3_256
+            && *ack_version == expectation.terminal_intent.ack_version
+            && *ack_m_id == expectation.terminal_intent.ack_m_id
+            && ack_machine_cert_hash.as_ref() == expectation.terminal_intent.ack_machine_cert_hash
+            && ack_bytes.as_ref() == expectation.terminal_intent.ack_bytes
     }
 
     fn into_final_result(self) -> Result<FinalizeTerminalResult, HouseholdInstallTransactionError> {
