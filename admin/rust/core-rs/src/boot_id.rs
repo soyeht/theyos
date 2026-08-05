@@ -35,22 +35,21 @@ pub fn current_boot_id() -> String {
     if let Ok(out) = std::process::Command::new("sysctl")
         .args(["-n", "kern.boottime"])
         .output()
+        && let Ok(s) = String::from_utf8(out.stdout)
     {
-        if let Ok(s) = String::from_utf8(out.stdout) {
-            // e.g. "{ sec = 1700000000, usec = 0 } Wed Jan ..."
-            if let Some(idx) = s.find("sec = ") {
-                let digits: String = s[idx + 6..]
-                    .chars()
-                    .take_while(char::is_ascii_digit)
-                    .collect();
-                if !digits.is_empty() {
-                    return format!("boottime:{digits}");
-                }
+        // e.g. "{ sec = 1700000000, usec = 0 } Wed Jan ..."
+        if let Some(idx) = s.find("sec = ") {
+            let digits: String = s[idx + 6..]
+                .chars()
+                .take_while(char::is_ascii_digit)
+                .collect();
+            if !digits.is_empty() {
+                return format!("boottime:{digits}");
             }
-            let trimmed = s.trim();
-            if !trimmed.is_empty() {
-                return format!("boottime-raw:{trimmed}");
-            }
+        }
+        let trimmed = s.trim();
+        if !trimmed.is_empty() {
+            return format!("boottime-raw:{trimmed}");
         }
     }
     "boottime:unknown".to_string()

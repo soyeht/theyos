@@ -217,13 +217,12 @@ fn detect_lan(port: u16) -> Option<ChannelStatus> {
 fn get_lan_ips() -> Vec<String> {
     // Try `ip` first — always in the NixOS systemd PATH (iproute2 package)
     if let Some(output) = run_command_capture("ip", &["-4", "addr", "show"], Duration::from_secs(1))
+        && output.status.success()
     {
-        if output.status.success() {
-            let text = String::from_utf8_lossy(&output.stdout);
-            let ips = parse_ip_addr_output(&text);
-            if !ips.is_empty() {
-                return ips;
-            }
+        let text = String::from_utf8_lossy(&output.stdout);
+        let ips = parse_ip_addr_output(&text);
+        if !ips.is_empty() {
+            return ips;
         }
     }
 
@@ -256,13 +255,14 @@ fn parse_ip_addr_output(text: &str) -> Vec<String> {
             // Format: "inet 192.0.2.8/24 ..."
             let ip_str = rest.split('/').next().unwrap_or("");
             let ip_str = ip_str.split_whitespace().next().unwrap_or(ip_str);
-            if let Ok(IpAddr::V4(v4)) = ip_str.parse::<IpAddr>() {
-                if !v4.is_loopback() && !v4.is_link_local() {
-                    let octets = v4.octets();
-                    // Skip Tailscale CGNAT range (100.64.0.0/10)
-                    if !(octets[0] == 100 && (64..128).contains(&octets[1])) {
-                        ips.push(v4.to_string());
-                    }
+            if let Ok(IpAddr::V4(v4)) = ip_str.parse::<IpAddr>()
+                && !v4.is_loopback()
+                && !v4.is_link_local()
+            {
+                let octets = v4.octets();
+                // Skip Tailscale CGNAT range (100.64.0.0/10)
+                if !(octets[0] == 100 && (64..128).contains(&octets[1])) {
+                    ips.push(v4.to_string());
                 }
             }
         }
@@ -283,12 +283,13 @@ fn parse_ifconfig_output(text: &str) -> Vec<String> {
         if let Some(rest) = line.strip_prefix("inet ") {
             let ip_str = rest.split_whitespace().next().unwrap_or("");
             let ip_str = ip_str.split('/').next().unwrap_or(ip_str);
-            if let Ok(IpAddr::V4(v4)) = ip_str.parse::<IpAddr>() {
-                if !v4.is_loopback() && !v4.is_link_local() {
-                    let octets = v4.octets();
-                    if !(octets[0] == 100 && (64..128).contains(&octets[1])) {
-                        ips.push(v4.to_string());
-                    }
+            if let Ok(IpAddr::V4(v4)) = ip_str.parse::<IpAddr>()
+                && !v4.is_loopback()
+                && !v4.is_link_local()
+            {
+                let octets = v4.octets();
+                if !(octets[0] == 100 && (64..128).contains(&octets[1])) {
+                    ips.push(v4.to_string());
                 }
             }
         }
@@ -352,11 +353,11 @@ fn detect_tailscale(port: u16) -> ChannelStatus {
     {
         // First IPv4 address
         for ip_val in ips {
-            if let Some(ip_str) = ip_val.as_str() {
-                if !ip_str.contains(':') {
-                    status.ip = Some(ip_str.to_string());
-                    break;
-                }
+            if let Some(ip_str) = ip_val.as_str()
+                && !ip_str.contains(':')
+            {
+                status.ip = Some(ip_str.to_string());
+                break;
             }
         }
     }

@@ -28,12 +28,12 @@ unsafe extern "C" {
 #[must_use]
 pub fn resolve_slirp4netns() -> Option<PathBuf> {
     // 1. Env var
-    if let Ok(v) = std::env::var("SLIRP4NETNS_BIN") {
-        if !v.is_empty() {
-            let p = PathBuf::from(&v);
-            if p.exists() {
-                return Some(p);
-            }
+    if let Ok(v) = std::env::var("SLIRP4NETNS_BIN")
+        && !v.is_empty()
+    {
+        let p = PathBuf::from(&v);
+        if p.exists() {
+            return Some(p);
         }
     }
     // 2. PATH lookup
@@ -42,21 +42,21 @@ pub fn resolve_slirp4netns() -> Option<PathBuf> {
     }
     // 3. Nix store scan
     let nix_store = Path::new("/nix/store");
-    if nix_store.is_dir() {
-        if let Ok(rd) = std::fs::read_dir(nix_store) {
-            let mut candidates: Vec<PathBuf> = rd
-                .flatten()
-                .filter_map(|entry| {
-                    let candidate = entry.path().join("bin/slirp4netns");
-                    candidate.is_file().then_some(candidate)
-                })
-                .collect();
-            // Sort descending by name so newest Nix store path wins
-            candidates.sort();
-            candidates.reverse();
-            if let Some(c) = candidates.into_iter().next() {
-                return Some(c);
-            }
+    if nix_store.is_dir()
+        && let Ok(rd) = std::fs::read_dir(nix_store)
+    {
+        let mut candidates: Vec<PathBuf> = rd
+            .flatten()
+            .filter_map(|entry| {
+                let candidate = entry.path().join("bin/slirp4netns");
+                candidate.is_file().then_some(candidate)
+            })
+            .collect();
+        // Sort descending by name so newest Nix store path wins
+        candidates.sort();
+        candidates.reverse();
+        if let Some(c) = candidates.into_iter().next() {
+            return Some(c);
         }
     }
     None
@@ -1046,7 +1046,10 @@ mod tests {
 
     #[test]
     fn own_pgrp_returns_nonzero() {
-        assert!(own_pgrp() > 0, "a running process always has a process group");
+        assert!(
+            own_pgrp() > 0,
+            "a running process always has a process group"
+        );
     }
 
     #[test]
@@ -1345,9 +1348,15 @@ mod tests {
     fn process_identity_is_stable_and_present_for_the_current_process() {
         let pid = std::process::id();
         let first = process_identity(pid);
-        assert!(first.is_some(), "a running process must have a determinable identity");
+        assert!(
+            first.is_some(),
+            "a running process must have a determinable identity"
+        );
         let second = process_identity(pid);
-        assert_eq!(first, second, "identity must be stable across repeated calls");
+        assert_eq!(
+            first, second,
+            "identity must be stable across repeated calls"
+        );
     }
 
     #[test]
@@ -1364,7 +1373,10 @@ mod tests {
         // identities rather than this always returning some constant.
         let mine = process_identity(std::process::id());
         let init = process_identity(1);
-        assert_ne!(mine, init, "distinct concurrently-running processes must not collide");
+        assert_ne!(
+            mine, init,
+            "distinct concurrently-running processes must not collide"
+        );
     }
 
     // ── F1 macOS per-fd rdev classifier — red-first behavioural matrix ──
