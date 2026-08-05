@@ -6673,6 +6673,7 @@ pub async fn owner_approve_handler(
     state.household.set_loaded(Arc::new(reloaded)).await;
     if let Err(e) = state
         .window
+        .under_lifecycle(&post_ack_lifecycle_guard)
         .enter_committed(finalize.join_response_bytes.clone())
         .await
     {
@@ -7315,19 +7316,34 @@ mod tests {
     #[test]
     fn post_ack_commit_holds_lifecycle_through_reload_and_window_publication() {
         let source = include_str!("handlers_owner_events.rs");
-        let commit_window = source
-            .split_once("The remote finalize is complete before either lock is acquired")
+        // Bound the search to production text before searching for anything.
+        // `include_str!` makes this test part of its own haystack: unbounded,
+        // every marker below is found inside this function's own literals, in
+        // the order they are written here, and the assertions pass against an
+        // empty handler.
+        let production = source
+            .split_once("#[cfg(test)]")
+            .expect("owner-events test module boundary")
+            .0;
+        let anchor = "From this point forward M2 has returned the exact manifest-bound Ack";
+        assert_eq!(
+            production.matches(anchor).count(),
+            1,
+            "post-ACK window anchor must exist exactly once in production text"
+        );
+        let commit_window = production
+            .split_once(anchor)
             .expect("post-ACK lifecycle commit window")
             .1;
         let ordered = [
             "BOOTSTRAP_MUTATION_LOCK",
             "acquire_owner_events_lifecycle_exclusive",
             "verify_installed_identity_under_lifecycle",
-            "commit_preserve_on_error_with_hook",
             "try_load_existing_under_lifecycle",
             "set_loaded",
+            "under_lifecycle(&post_ack_lifecycle_guard)",
             "enter_committed",
-            "drop(post_ack_lifecycle_guard)",
+            "drop(post_ack_mutation_guard)",
         ];
         let mut remainder = commit_window;
         for marker in ordered {
@@ -7336,6 +7352,22 @@ mod tests {
                 .unwrap_or_else(|| panic!("missing or out-of-order post-ACK marker: {marker}"));
             remainder = after;
         }
+        // Ordering is not the property that matters here. The window commit
+        // must RECEIVE the guard acquired above; the reacquiring variant
+        // (`enter_committed` on the bare window) takes a shared lock on the
+        // lifecycle file this task already holds exclusively, blocks against
+        // itself for CURRENT_LOCK_TIMEOUT, and returns 500 over a commit that
+        // is already durable on disk.
+        let commit_call = commit_window
+            .find(".enter_committed(")
+            .expect("post-ACK window commit call");
+        let guarded = commit_window
+            .find(".under_lifecycle(&post_ack_lifecycle_guard)")
+            .expect("post-ACK window commit must reuse the retained lifecycle guard");
+        assert!(
+            guarded < commit_call && commit_call - guarded < 80,
+            "post-ACK enter_committed must be chained onto the retained guard, never reacquire it"
+        );
     }
 
     fn household_id() -> HouseholdId {
