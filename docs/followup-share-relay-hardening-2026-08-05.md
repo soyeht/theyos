@@ -41,10 +41,16 @@ session, retain existing legacy behavior, and include a direct regression test.
 
 ## 4. Turn the 1,000-pair S0 result into an operational capacity policy
 
-The S0 run establishes a demonstrated floor of 1,000 concurrent pairs; it did
-not discover a capacity ceiling. If a higher target or service-level objective
-is needed, define it first and run a separately authorized capacity experiment
-in an isolated environment.
+The S0 run establishes a demonstrated floor of 1,000 concurrent pairs for its
+temporary elevated test configuration; it did not discover a capacity ceiling.
+It is not a capacity claim for a currently deployed service, whose effective
+process limits and admission settings may differ from a test unit.
+
+Before publishing a production capacity claim, inspect the limits actually
+received by the running process and the live admission settings, rather than
+relying only on declared unit or configuration values. Any production tuning
+or restart belongs to a separately authorized maintenance plan, followed by a
+fresh capacity run.
 
 The next run should capture process CPU and resident memory during the known
 full-occupancy hold, preserve before/after status snapshots, and stop on the
