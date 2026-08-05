@@ -1216,6 +1216,99 @@ mod tests {
             .unwrap();
     }
 
+    const ROTATE_CRASH_WORKER: &str = "household_lifecycle::tests::generation_rotate_crash_worker";
+
+    /// Child: rotate the generation, parking after the rename so the parent
+    /// can SIGKILL it in exactly that window.
+    #[test]
+    fn generation_rotate_crash_worker() {
+        let Some(state_path) = std::env::var_os(CHILD_STATE_ENV).map(PathBuf::from) else {
+            return;
+        };
+        let lifecycle = HouseholdLifecycleLock::open_verified(&state_path).unwrap();
+        let write = lifecycle.lock_exclusive().unwrap();
+        // Arm only now, with the lock already held: arming earlier would let
+        // the park fire on some other generation write during open, and the
+        // crash would land on a different operation than the one under test.
+        crate::crash_park::arm_from_env();
+        let _ = write.rotate_lifecycle_generation();
+    }
+
+    /// G0 -> G1 across a REAL crash in the post-rename window.
+    ///
+    /// `rotate_lifecycle_generation` renames the new witness into place, and
+    /// only then syncs the parent and reads it back. A process killed between
+    /// those leaves a generation file that is VISIBLE but whose parent barrier
+    /// never completed, and no caller alive to be told the rotation failed.
+    ///
+    /// Two things must hold afterwards:
+    /// - the witness still reads back as a well-formed generation (never torn,
+    ///   never a partial write) — it is fixed-width and renamed, so tearing
+    ///   would mean the atomicity claim is wrong;
+    /// - the household can still make progress, and the generation it moves to
+    ///   is distinct from BOTH the pre-crash G0 and whatever became visible.
+    ///   Landing back on G0 would be the ABA that lets artifacts tagged with
+    ///   the old generation be adopted as current.
+    #[test]
+    fn sigkill_after_generation_rename_leaves_a_readable_witness_and_no_aba() {
+        let temp = TempDir::new().unwrap();
+        let g0 = {
+            let lifecycle = HouseholdLifecycleLock::open_verified(temp.path()).unwrap();
+            let write = lifecycle.lock_exclusive().unwrap();
+            write.ensure_lifecycle_generation().unwrap()
+        };
+
+        let ready = temp.path().join("parked-generation-after-rename");
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            .arg("--exact")
+            .arg(ROTATE_CRASH_WORKER)
+            .arg("--nocapture")
+            .env(CHILD_STATE_ENV, temp.path())
+            .env(crate::crash_park::PARK_SITE_ENV, "generation:after_rename")
+            .env(crate::crash_park::PARK_READY_ENV, &ready)
+            .spawn()
+            .unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while !ready.exists() {
+            if let Ok(Some(status)) = child.try_wait() {
+                panic!("child exited ({status}) without reaching the post-rename window");
+            }
+            assert!(
+                Instant::now() < deadline,
+                "child never reached generation:after_rename"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+        child.kill().unwrap();
+        assert!(
+            !child.wait().unwrap().success(),
+            "the child was supposed to be killed in the window, not to exit cleanly"
+        );
+
+        // Restart: a fresh lock over the same state directory.
+        let lifecycle = HouseholdLifecycleLock::open_verified(temp.path()).unwrap();
+        let write = lifecycle.lock_exclusive().unwrap();
+
+        let visible = write
+            .lifecycle_generation()
+            .expect("witness must still parse after a crash in the rename window");
+        let visible = visible.expect("a witness was established before the crash");
+        assert_ne!(
+            visible, g0,
+            "the rename had already landed, so the visible witness must be the new one"
+        );
+
+        let g2 = write
+            .rotate_lifecycle_generation()
+            .expect("the household must still be able to advance after the crash");
+        assert_ne!(g2, visible, "a rotation must advance");
+        assert_ne!(
+            g2, g0,
+            "rotating after the crash must not land back on the pre-crash generation:              that is the ABA that lets old-generation artifacts be adopted as current"
+        );
+    }
+
     #[test]
     fn multiprocess_shared_lifecycle_worker() {
         let Some(state_path) = std::env::var_os(CHILD_STATE_ENV).map(PathBuf::from) else {
