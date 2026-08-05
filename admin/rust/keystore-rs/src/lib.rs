@@ -114,6 +114,18 @@ extern crate self as mesh_session_control_model_rs;
     feature = "roster-sync-unratified"
 ))]
 #[path = "../../mesh-session-control-model-rs/tests/model_invariants.rs"]
+// Pre-existing lints of that ONE source file under keystore-rs's stricter
+// profile -- enumerated from a single `clippy --message-format=json` capture
+// of THIS exact config, not guessed, and scoped to this inclusion so neither
+// the package nor any other module is touched. The file is still gated by
+// its own crate's `-D warnings`; silencing style here does not weaken that.
+#[allow(
+    clippy::assigning_clones,
+    clippy::cast_lossless,
+    clippy::cast_possible_truncation,
+    clippy::doc_markdown,
+    clippy::similar_names
+)]
 mod d4_reds;
 
 #[cfg(feature = "mesh-session")]

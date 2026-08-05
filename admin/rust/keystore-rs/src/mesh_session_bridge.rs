@@ -663,8 +663,8 @@ mod bridge_reds {
         .unwrap();
         // Destroy and recreate the slot: same label, different scalar.
         let dir2 = tempfile::tempdir().unwrap();
-        let (slots2, slot2) = keystore_with_key(dir2.path());
-        let rotated = slots2.inspect(&slot2).unwrap().unwrap();
+        let (rotated_slots, rotated_key_slot) = keystore_with_key(dir2.path());
+        let rotated = rotated_slots.inspect(&rotated_key_slot).unwrap().unwrap();
         assert_ne!(
             announced.public_key(),
             rotated.public_key(),
@@ -727,10 +727,17 @@ mod bridge_reds {
         assert!(matches!(err, BridgeError::NotAuthorised(_)), "got {err:?}");
     }
 
-    /// RED: asking for a generation the record does not hold live refuses
-    /// before any primitive runs.
+    /// RED: asking for a generation the record does not hold live is
+    /// refused.
+    ///
+    /// Deliberately does NOT claim "zero primitive calls": this bridge has
+    /// no visibility into whether D4 invoked a signing primitive, so
+    /// asserting it here would be a claim the test cannot observe. The
+    /// call-count property is measured where it IS observable -- D4's own
+    /// REDs over `FakeSignerSource::total_calls`. What this proves is the
+    /// bridge-level outcome: refusal, and no signature returned.
     #[test]
-    fn a_wrong_generation_refuses_before_any_primitive() {
+    fn a_wrong_generation_is_refused() {
         let dir = tempfile::tempdir().unwrap();
         let (slots, slot) = keystore_with_key(dir.path());
         let pk = slots.inspect(&slot).unwrap().unwrap().public_key().to_vec();
