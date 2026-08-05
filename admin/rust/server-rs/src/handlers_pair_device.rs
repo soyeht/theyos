@@ -409,13 +409,8 @@ pub async fn confirm(
                 }
             };
             if let Err(error) =
-                persist_ready_then_publish(
-                    &lifecycle_guard,
-                    &state_dir,
-                    ready_generation,
-                    publish,
-                )
-                .await
+                persist_ready_then_publish(&lifecycle_guard, &state_dir, ready_generation, publish)
+                    .await
             {
                 tracing::error!(
                     stage = "pair_device.confirm.state_persist_indeterminate",

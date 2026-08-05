@@ -587,9 +587,7 @@ fn every_ready_writer_is_in_the_lifecycle_generation_inventory() {
             continue;
         }
         let source = std::fs::read_to_string(&path).expect("read server source");
-        let production_end = source
-            .find("\n#[cfg(test)]\nmod ")
-            .unwrap_or(source.len());
+        let production_end = source.find("\n#[cfg(test)]\nmod ").unwrap_or(source.len());
         let production = &source[..production_end];
         let count = production
             .match_indices("persist_ready_under_lifecycle(")

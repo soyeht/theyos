@@ -626,21 +626,15 @@ impl FinalizeTerminalResultRecordV1 {
             version: TERMINAL_RESULT_VERSION,
             kind: TERMINAL_RESULT_KIND.to_string(),
             phase: FinalizeTerminalPhaseV1::Final,
-            request_fingerprint_blake3_256: ByteBuf::from(
-                result.request_fingerprint.0.to_vec(),
-            ),
+            request_fingerprint_blake3_256: ByteBuf::from(result.request_fingerprint.0.to_vec()),
             join_request_bytes: ByteBuf::from(result.join_request_bytes.clone()),
-            candidate_generation: ByteBuf::from(
-                result.candidate_generation.token_bytes().to_vec(),
-            ),
+            candidate_generation: ByteBuf::from(result.candidate_generation.token_bytes().to_vec()),
             terminal_generation: Some(ByteBuf::from(
                 result.terminal_generation.token_bytes().to_vec(),
             )),
             hh_id: result.hh_id.clone(),
             m_id: result.m_id.clone(),
-            commit_marker_blake3_256: ByteBuf::from(
-                result.commit_marker_blake3_256.to_vec(),
-            ),
+            commit_marker_blake3_256: ByteBuf::from(result.commit_marker_blake3_256.to_vec()),
             ack_version: result.ack_version,
             ack_m_id: result.ack_m_id.clone(),
             ack_machine_cert_hash: ByteBuf::from(result.ack_machine_cert_hash.to_vec()),
@@ -1513,9 +1507,9 @@ fn write_delivery_record(
         )
         .map_err(map_errno)?;
         renamed = true;
-        state_dir.sync_all().map_err(|_| {
-            HouseholdInstallTransactionError::FinalizeAckDeliveryMayHaveTakenEffect
-        })?;
+        state_dir
+            .sync_all()
+            .map_err(|_| HouseholdInstallTransactionError::FinalizeAckDeliveryMayHaveTakenEffect)?;
         let readback = read_delivery_record(state_dir).map_err(|error| match error {
             HouseholdInstallTransactionError::Quarantined => error,
             _ => HouseholdInstallTransactionError::FinalizeAckDeliveryMayHaveTakenEffect,
@@ -1578,9 +1572,8 @@ fn read_delivery_record(
         return Ok(None);
     };
     let bytes = read_bounded(&mut file, MAX_DELIVERY_RECORD_BYTES)?;
-    let record: FinalizeAckDeliveryRecordV1 =
-        crate::cbor::from_canonical_slice_strict(&bytes)
-            .map_err(|_| HouseholdInstallTransactionError::Quarantined)?;
+    let record: FinalizeAckDeliveryRecordV1 = crate::cbor::from_canonical_slice_strict(&bytes)
+        .map_err(|_| HouseholdInstallTransactionError::Quarantined)?;
     record.validate().map(Some)
 }
 
@@ -2534,8 +2527,8 @@ mod tests {
         let lifecycle = HouseholdLifecycleLock::open_verified(state.path()).unwrap();
         let (guard, expectation) = begin(&state, &lifecycle);
         install_exact_marker(&state, &expectation);
-        let outcome = finish_household_install_under_lifecycle(&guard, &expectation, |_| Ok(()))
-            .unwrap();
+        let outcome =
+            finish_household_install_under_lifecycle(&guard, &expectation, |_| Ok(())).unwrap();
         let terminal = match outcome {
             HouseholdInstallFinalizeOutcome::RotatedAndCleared {
                 terminal_result, ..
@@ -2559,11 +2552,8 @@ mod tests {
         let mut same_generation_but_divergent = terminal.clone();
         same_generation_but_divergent.ack_bytes.push(0);
         assert_eq!(
-            prepare_finalize_ack_delivery_under_lifecycle(
-                &guard,
-                &same_generation_but_divergent,
-            )
-            .unwrap_err(),
+            prepare_finalize_ack_delivery_under_lifecycle(&guard, &same_generation_but_divergent,)
+                .unwrap_err(),
             HouseholdInstallTransactionError::Quarantined
         );
 

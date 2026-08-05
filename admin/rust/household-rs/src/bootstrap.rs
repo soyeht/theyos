@@ -1013,18 +1013,17 @@ fn prepare_accept_household_impl(
             source: e,
             stage: "accept_household.encode_pending",
         })?;
-    let state_item = bootstrap_state::staged_non_ready_item(
-        state_dir,
-        BootstrapState::ReadyForNaming,
-    )
-    .map_err(|e| BootstrapError::Storage {
-        source: StorageError::Io {
-            path: state_dir.join("identity.bootstrap_state"),
-            kind: "invalid_bootstrap_state".into(),
-            hint: e.to_string(),
-        },
-        stage: "accept_household.encode_bootstrap_state",
-    })?;
+    let state_item =
+        bootstrap_state::staged_non_ready_item(state_dir, BootstrapState::ReadyForNaming).map_err(
+            |e| BootstrapError::Storage {
+                source: StorageError::Io {
+                    path: state_dir.join("identity.bootstrap_state"),
+                    kind: "invalid_bootstrap_state".into(),
+                    hint: e.to_string(),
+                },
+                stage: "accept_household.encode_bootstrap_state",
+            },
+        )?;
     let staged = storage::stage_commit_files(&[
         state_item,
         (household_record_path(state_dir), record_bytes),

@@ -599,8 +599,15 @@ async fn load_cold_terminal_replay(
             bootstrap.as_str()
         )));
     }
-    let delivery = household_rs::household_install_transaction::load_finalize_ack_delivery_under_lifecycle(&guard)
-        .map_err(|error| InstallCliError::Other(format!("failed to inspect finalize delivery boundary: {error}")))?;
+    let delivery =
+        household_rs::household_install_transaction::load_finalize_ack_delivery_under_lifecycle(
+            &guard,
+        )
+        .map_err(|error| {
+            InstallCliError::Other(format!(
+                "failed to inspect finalize delivery boundary: {error}"
+            ))
+        })?;
     match (&bootstrap, &delivery, active_terminal.as_ref()) {
         (
             household_rs::bootstrap_state::BootstrapState::Ready,

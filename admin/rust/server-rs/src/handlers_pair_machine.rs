@@ -1465,18 +1465,17 @@ pub async fn local_finalize_handler(
                     // later exact replays return only retained Ack bytes.
                     cache_known_peer_addrs(&state.state_dir, &response);
                     let bootstrap = state.bootstrap.clone();
-                    if let Err(error) =
-                        persist_ready_then_publish(
-                            &lifecycle_guard,
-                            &state.state_dir,
-                            *terminal.terminal_generation(),
-                            async move {
-                                if let Some(bs_lock) = bootstrap {
-                                    *bs_lock.write().await = BootstrapState::Ready;
-                                }
-                            },
-                        )
-                        .await
+                    if let Err(error) = persist_ready_then_publish(
+                        &lifecycle_guard,
+                        &state.state_dir,
+                        *terminal.terminal_generation(),
+                        async move {
+                            if let Some(bs_lock) = bootstrap {
+                                *bs_lock.write().await = BootstrapState::Ready;
+                            }
+                        },
+                    )
+                    .await
                     {
                         tracing::warn!(
                             stage = "pair_machine.local_finalize.bootstrap_state_persist_failed",

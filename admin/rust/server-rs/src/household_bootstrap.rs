@@ -146,8 +146,11 @@ fn active_terminal_replay_addr(
         .verify_state_root(state_dir)
         .map_err(|error| format!("verify terminal state root: {error}"))?;
     let bootstrap = bootstrap_state::load(state_dir)
-    .map_err(|error| format!("load terminal bootstrap state: {error}"))?;
-    let delivery = household_rs::household_install_transaction::load_finalize_ack_delivery_under_lifecycle(lifecycle)
+        .map_err(|error| format!("load terminal bootstrap state: {error}"))?;
+    let delivery =
+        household_rs::household_install_transaction::load_finalize_ack_delivery_under_lifecycle(
+            lifecycle,
+        )
         .map_err(|error| format!("load pair-machine delivery boundary: {error}"))?;
     match (&bootstrap, &delivery) {
         (
@@ -881,15 +884,12 @@ pub async fn bootstrap_household(shared_state: Option<SharedState>) {
         }
     };
     let loaded_arc = identity_load.loaded.clone();
-    let terminal_replay_endpoint =
-        active_terminal_replay_addr(
-            identity_load.lifecycle_guard(),
-            &state_dir,
-            loaded_arc.as_deref(),
-        )
-            .unwrap_or_else(|error| {
-                panic!("pair-machine terminal replay recovery failed: {error}")
-            });
+    let terminal_replay_endpoint = active_terminal_replay_addr(
+        identity_load.lifecycle_guard(),
+        &state_dir,
+        loaded_arc.as_deref(),
+    )
+    .unwrap_or_else(|error| panic!("pair-machine terminal replay recovery failed: {error}"));
     if loaded_arc.is_none() {
         info!(
             stage = "bootstrap.cold",

@@ -2510,10 +2510,7 @@ pub async fn post_accept_household_confirm(
         })?;
         bootstrap_state::persist_ready_under_lifecycle(&guard, &state_dir, ready_generation)
             .map_err(|error| {
-                ConfirmDiskError::Lifecycle(lifecycle_io(
-                    "persist accept-household ready",
-                    error,
-                ))
+                ConfirmDiskError::Lifecycle(lifecycle_io("persist accept-household ready", error))
             })?;
         Ok::<_, ConfirmDiskError>(ConfirmDiskOutcome::Confirmed(Box::new(loaded), guard))
     })
