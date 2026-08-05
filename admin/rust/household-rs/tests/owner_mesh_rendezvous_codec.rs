@@ -1139,3 +1139,75 @@ fn lint_inheritance_recogniser_accepts_and_rejects_the_right_shapes() {
         "[lints]\n# workspace = true\n"
     ));
 }
+
+/// A silencing `allow` must keep its receipt.
+///
+/// `[workspace.lints.clippy]` carries two entries that suppress real findings —
+/// `collapsible_if` and `manual_is_multiple_of` — allowed rather than fixed
+/// because the fixes are ~180 mechanical edits across 15 crates that would
+/// collide with branches held mid-composition. That trade is defensible only
+/// while the reasoning travels with it. Delete the explanation and what remains
+/// is indistinguishable from policy: two lints nobody enforces, for reasons
+/// nobody can reconstruct.
+///
+/// Scope, stated honestly because it is narrower than it looks: this guards the
+/// RECEIPT, not the repayment. It cannot make the post-composition sweep happen,
+/// and it does not stop the suppressed count from growing — an `allow` silences
+/// the gate, so new violations land free. The stronger instrument is a count
+/// ratchet (tolerate today's N, fail at N+1), which needs a second
+/// whole-workspace clippy run to measure; that cost is exactly what gets a gate
+/// switched off, so it is a composition-time decision rather than something
+/// smuggled in here.
+#[test]
+fn msrv_lint_debt_keeps_its_justification() {
+    let manifest = fs::read_to_string(repository_root().join("admin/rust/Cargo.toml"))
+        .expect("read workspace Cargo.toml");
+
+    for lint in ["collapsible_if", "manual_is_multiple_of"] {
+        let Some(line) = manifest
+            .lines()
+            .find(|line| line.trim_start().starts_with(lint))
+        else {
+            // Absent is fine and is the intended end state: the sweep happened
+            // and the entry was removed.
+            continue;
+        };
+        assert!(
+            line.contains("allow"),
+            "`{lint}` is declared at workspace level but not as an allow; if its \
+             level changed, this guard's premise changed with it"
+        );
+        assert!(
+            line.contains('#'),
+            "the `{lint}` allow lost its inline measurement. The number of sites \
+             it suppresses is what makes the trade auditable — without it the \
+             entry is an unexplained silence."
+        );
+    }
+
+    let suppresses_anything = ["collapsible_if", "manual_is_multiple_of"]
+        .iter()
+        .any(|lint| {
+            manifest
+                .lines()
+                .any(|line| line.trim_start().starts_with(lint))
+        });
+    if !suppresses_anything {
+        return; // debt repaid; nothing left to justify
+    }
+
+    for marker in [
+        "MSRV-woken lint debt",
+        "FOLLOW-UP",
+        "DELETE these two lines",
+    ] {
+        assert!(
+            manifest.contains(marker),
+            "the MSRV lint-debt receipt lost its `{marker}` section. These allows \
+             were accepted as debt with a written reason and an explicit \
+             repayment instruction; strip either and the next reader inherits \
+             two silenced lints with no way to tell whether that was a decision \
+             or an accident."
+        );
+    }
+}
