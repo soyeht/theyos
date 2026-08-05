@@ -52,6 +52,11 @@ mod d1_admission;
 pub use d1_admission::{RegistryActiveGate, RegistryD1Admission, RegistryD1Pending};
 
 #[cfg(feature = "mesh-session-runtime")]
+mod intent_nonce_ledger_bridge;
+#[cfg(feature = "mesh-session-runtime")]
+pub use intent_nonce_ledger_bridge::HouseholdIntentNonceLedger;
+
+#[cfg(feature = "mesh-session-runtime")]
 mod roster_bridge;
 #[cfg(feature = "mesh-session-runtime")]
 pub use roster_bridge::HouseholdRosterSource;

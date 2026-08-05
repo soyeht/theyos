@@ -298,6 +298,20 @@ pub enum IntentError {
     /// seam over.
     #[error("D1 registry unavailable")]
     D1RegistryUnavailable,
+    /// 2026-08-05, @daisy, runtime-facade `IntentNonceLedger` bridge
+    /// (`HouseholdIntentNonceLedger`, `mesh-session-runtime-rs`): this
+    /// ceremony's own `hh_id`/`initiator_m_id`/`delegated_key_id`/
+    /// `not_after`, once projected into household-rs's stricter
+    /// `MeshIntentNonceKey`/`MeshIntentNonceEvidence` shapes, failed
+    /// THEIR validation (malformed id, oversized/control-character
+    /// delegated key id, or a zero `not_after`). Expected to be
+    /// unreachable in practice — this data already passed this crate's
+    /// own upstream identity/TTL checks before `consume` is ever called
+    /// — but the projection is real code with a real `Result`, so this
+    /// gives it a distinct, honest failure class rather than an
+    /// `unreachable!()` or a silent fold into an unrelated variant.
+    #[error("nonce evidence rejected by the ledger's own shape validation")]
+    NonceEvidenceRejected,
 }
 
 /// Errors from post-Active records (DATA/REVOKE_NOTICE/CLOSE/REKEY),
