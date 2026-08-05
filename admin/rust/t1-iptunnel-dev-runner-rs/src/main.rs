@@ -1044,7 +1044,13 @@ mod dev_datapath {
                         }
                         TunnelFrame::Error(_) => bail!("dev datapath peer returned target error"),
                         TunnelFrame::Exit(_) => return Ok(()),
-                        TunnelFrame::Health(_) | TunnelFrame::Open => {
+                        // `OpenPersistent` joins `Open` rather than getting an arm of
+                        // its own: both are client-to-server control frames, and this
+                        // dev runner is the client. Receiving either means the peer
+                        // sent something it never should, so it stays fail-closed.
+                        TunnelFrame::Health(_)
+                        | TunnelFrame::Open
+                        | TunnelFrame::OpenPersistent => {
                             bail!("dev datapath peer sent unexpected control frame");
                         }
                         TunnelFrame::NetworkSettings(sealed) => {
@@ -1650,6 +1656,7 @@ mod tests {
                 claw_static_pub: claw_static_pub(),
                 not_after: NOW + 60,
                 now_unix: NOW,
+                app_presentation: None,
             },
             &owner as &dyn IdentityKey,
         )
@@ -1674,6 +1681,7 @@ mod tests {
                 claw_static_pub: claw_static_pub(),
                 not_after: NOW + 60,
                 now_unix: NOW,
+                app_presentation: None,
             },
             &owner as &dyn IdentityKey,
         )
@@ -2153,6 +2161,9 @@ mod tests {
             RelayStreamIssuerTrust, RelayStreamTrustContext,
         };
         use server_rs::claw_share_relay_stream_noise::generate_relay_stream_noise_static_keypair;
+        use server_rs::claw_share_relay_stream_reopen_limiter::{
+            ReopenLimiterConfig, ReopenStreamLimiter,
+        };
         use server_rs::claw_share_relay_stream_responder_params::RelayStreamResponderParams;
         use server_rs::claw_share_relay_stream_responder_reverse_connect::{
             RelayStreamResponderReverseConnectConfig,
@@ -2330,6 +2341,14 @@ mod tests {
                     RelayStreamIpTunnelUnavailableRouter,
                     RelayStreamIpTunnelUnavailableRouter,
                     claw_router,
+                    // Default limiter, matching the one other test-side caller of
+                    // THIS function (reverse_connect_binding.rs:402). The
+                    // production caller (claw_share_relay_stream_runtime.rs:441)
+                    // passes one built from `config.reopen_limiter`, so this is
+                    // deliberately the test pattern and not the general one.
+                    // This site opens a single stream, so the reopen budget is
+                    // never the thing under test.
+                    Arc::new(ReopenStreamLimiter::new(ReopenLimiterConfig::default())),
                     || Some(NOW),
                 );
                 // The fixed synthetic clock is usable by construction, so the seam
@@ -2461,6 +2480,12 @@ mod tests {
                 reaper_interval: Duration::from_millis(50),
                 splice_idle_timeout: Duration::from_secs(3),
                 splice_max_lifetime: Duration::from_secs(10),
+                // `None` = no per-direction byte cap, matching the other test-side
+                // listener config (`claw_share_relay_stream_reverse_connect_pool.rs`).
+                // Production parses a real cap from env; this loopback relay exists
+                // to carry a handful of frames, and a cap here would test the cap
+                // rather than the datapath.
+                splice_max_bytes_per_direction: None,
                 abuse: RelayAbuseConfig::default(),
             };
             (addr, serve_rendezvous_stream_relay(listener, config))
