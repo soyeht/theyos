@@ -1785,6 +1785,7 @@ mod fail_injection {
     }
 
     pub(super) fn take(stage: MeshIntentNonceCommitStage) -> bool {
+        crate::crash_park::park_if_armed(&format!("ledger:{stage:?}"));
         ARMED.with(|armed| {
             if armed.get() == Some(stage) {
                 armed.set(None);
@@ -3057,5 +3058,255 @@ mod tests {
             },
         };
         fs::write(result, label).unwrap();
+    }
+
+    // =====================================================================
+    // Crash-window harness (@khai, lane L1).
+    //
+    // The existing multiprocess test proves exactly-once across processes
+    // that EXIT CLEANLY. That is not the case the durability protocol is
+    // for. Markers, DIRTY/CLEAN and restart recovery only carry weight when
+    // the process vanished mid-write and nothing got to run afterwards — no
+    // unwinding, no Drop, no best-effort cleanup.
+    //
+    // So the child parks INSIDE the real commit routine at a named stage
+    // (`crash_park`, reached through the same `fail_injection::take` every
+    // stage already calls) and the parent SIGKILLs it there.
+    // =====================================================================
+
+    /// Every commit stage, with COMPILE-TIME exhaustiveness.
+    ///
+    /// The array alone would silently miss a stage added later, so
+    /// `stage_index` carries an exhaustive `match`: a new variant fails to
+    /// compile here (E0004) instead of quietly escaping the crash sweep.
+    const ALL_COMMIT_STAGES: [MeshIntentNonceCommitStage; 16] = [
+        MeshIntentNonceCommitStage::WorkerInFlight,
+        MeshIntentNonceCommitStage::DirtyMarkerWrite,
+        MeshIntentNonceCommitStage::DirtyMarkerSync,
+        MeshIntentNonceCommitStage::TempInspect,
+        MeshIntentNonceCommitStage::TempCleanup,
+        MeshIntentNonceCommitStage::TempOpen,
+        MeshIntentNonceCommitStage::TempWrite,
+        MeshIntentNonceCommitStage::TempFlush,
+        MeshIntentNonceCommitStage::TempSync,
+        MeshIntentNonceCommitStage::Rename,
+        MeshIntentNonceCommitStage::ParentSync,
+        MeshIntentNonceCommitStage::Readback,
+        MeshIntentNonceCommitStage::ReadbackMismatch,
+        MeshIntentNonceCommitStage::CleanMarkerWrite,
+        MeshIntentNonceCommitStage::CleanMarkerSync,
+        MeshIntentNonceCommitStage::PostCommitBinding,
+    ];
+
+    const fn stage_index(stage: MeshIntentNonceCommitStage) -> usize {
+        use MeshIntentNonceCommitStage as S;
+        match stage {
+            S::WorkerInFlight => 0,
+            S::DirtyMarkerWrite => 1,
+            S::DirtyMarkerSync => 2,
+            S::TempInspect => 3,
+            S::TempCleanup => 4,
+            S::TempOpen => 5,
+            S::TempWrite => 6,
+            S::TempFlush => 7,
+            S::TempSync => 8,
+            S::Rename => 9,
+            S::ParentSync => 10,
+            S::Readback => 11,
+            S::ReadbackMismatch => 12,
+            S::CleanMarkerWrite => 13,
+            S::CleanMarkerSync => 14,
+            S::PostCommitBinding => 15,
+        }
+    }
+
+    #[test]
+    fn all_commit_stages_is_exhaustive() {
+        for (index, stage) in ALL_COMMIT_STAGES.into_iter().enumerate() {
+            assert_eq!(
+                stage_index(stage),
+                index,
+                "ALL_COMMIT_STAGES is out of sync"
+            );
+        }
+    }
+
+    const CRASH_WORKER_TEST_NAME: &str =
+        "mesh_intent_nonce_ledger::tests::crash_park_consume_worker";
+
+    /// Spawn a child that will park at `site` inside the real commit, wait
+    /// until it has demonstrably ARRIVED, then `SIGKILL` it there.
+    ///
+    /// Returns once the child is reaped. The ready-file wait is what makes
+    /// this deterministic: killing on a timer would sometimes kill before the
+    /// window and the test would pass for the wrong reason.
+    fn kill_child_parked_at(dir: &Path, site: &str) {
+        let ready = dir.join(format!("parked-{}", site.replace(':', "_")));
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            .arg("--exact")
+            .arg(CRASH_WORKER_TEST_NAME)
+            .arg("--nocapture")
+            .env(CHILD_DIR_ENV, dir)
+            .env(crate::crash_park::PARK_SITE_ENV, site)
+            .env(crate::crash_park::PARK_READY_ENV, &ready)
+            .spawn()
+            .unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while !ready.exists() {
+            if let Ok(Some(status)) = child.try_wait() {
+                panic!("child exited ({status}) without ever reaching site {site}");
+            }
+            assert!(
+                Instant::now() < deadline,
+                "child never reached park site {site}"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+
+        // A real SIGKILL. Not a simulated Drop, not an early return: the
+        // process is destroyed with the ledger lock held and whatever bytes
+        // it had written still exactly as the filesystem has them.
+        child.kill().unwrap();
+        let status = child.wait().unwrap();
+        assert!(
+            !status.success(),
+            "child at {site} was supposed to be killed, not to exit cleanly"
+        );
+    }
+
+    /// Child half: consume once, parking wherever the environment says.
+    #[test]
+    fn crash_park_consume_worker() {
+        let Some(dir) = std::env::var_os(CHILD_DIR_ENV).map(PathBuf::from) else {
+            return;
+        };
+        let ledger = open_at(&dir, 32);
+        // Arm ONLY now: the subject is open, so the park can no longer fire on
+        // initialization's own atomic_replace instead of the consume.
+        crate::crash_park::arm_from_env();
+        let _ = ledger.consume(
+            &key(0xC7),
+            &evidence(MeshIntentChannel::Dev, 0x7C, 1_000),
+            floor(100),
+            &ceremony_control(),
+        );
+    }
+
+    /// Replay the SAME key in a fresh process-equivalent ledger and report
+    /// what a caller would observe after the crash.
+    fn replay_same_key(dir: &Path) -> MeshIntentNonceConsumeOutcome {
+        let ledger = open_at(dir, 32);
+        ledger.consume(
+            &key(0xC7),
+            &evidence(MeshIntentChannel::Dev, 0x7C, 1_000),
+            floor(100),
+            &ceremony_control(),
+        )
+    }
+
+    /// THE crash-window invariant.
+    ///
+    /// For every stage the module itself classifies as possibly having
+    /// changed the record, a `SIGKILL` there must never leave the nonce
+    /// re-consumable: a later replay may report `AlreadyConsumed`, or refuse,
+    /// but reporting a fresh `Committed` would mean the same nonce was
+    /// consumed twice across a crash.
+    ///
+    /// Driven off `may_have_changed_record()` rather than a hand-written list
+    /// so a stage added later is covered without anyone remembering to add
+    /// it here.
+    #[test]
+    fn sigkill_after_the_record_may_have_changed_never_permits_a_second_commit() {
+        for stage in ALL_COMMIT_STAGES {
+            if !stage.may_have_changed_record() {
+                continue;
+            }
+            if stage == MeshIntentNonceCommitStage::WorkerInFlight {
+                // Not a filesystem stage: no park site on the write path.
+                continue;
+            }
+            let temp = TempDir::new().unwrap();
+            kill_child_parked_at(temp.path(), &format!("ledger:{stage:?}"));
+
+            match replay_same_key(temp.path()) {
+                MeshIntentNonceConsumeOutcome::Committed { .. } => panic!(
+                    "SIGKILL at {stage:?} (may_have_changed_record) left the nonce \
+                     re-consumable: replay reported a fresh Committed, which is the \
+                     same nonce taking effect twice across a crash"
+                ),
+                other => {
+                    eprintln!("stage {stage:?} -> replay {other:?}");
+                }
+            }
+        }
+    }
+
+    /// Diagnostic: what does the filesystem actually hold after a SIGKILL at
+    /// `ParentSync`, and what does recovery then decide?
+    ///
+    /// Written because the sweep flagged `ParentSync` and "replay committed
+    /// again" has at least three explanations — recovery discarding a renamed
+    /// record, a deliberate fail-toward-unconsumed design, or SIGKILL simply
+    /// not being power loss (the rename survives in page cache). Naming which
+    /// one it is requires looking, not reasoning.
+    #[test]
+    fn diagnose_parent_sync_crash_state() {
+        let temp = TempDir::new().unwrap();
+        kill_child_parked_at(temp.path(), "ledger:ParentSync");
+
+        let store = store_path(temp.path());
+        eprintln!("--- store dir after SIGKILL at ParentSync ---");
+        if let Ok(entries) = fs::read_dir(&store) {
+            for entry in entries.flatten() {
+                let meta = entry.metadata().ok();
+                eprintln!(
+                    "  {} ({} bytes)",
+                    entry.file_name().to_string_lossy(),
+                    meta.map_or(0, |m| m.len())
+                );
+            }
+        } else {
+            eprintln!("  <store dir absent>");
+        }
+        let record = store.join(RECORD_FILENAME);
+        eprintln!("record present: {}", record.exists());
+        eprintln!(
+            "record bytes:   {}",
+            fs::metadata(&record).map_or(0, |m| m.len())
+        );
+        let lock = store.join(LOCK_FILENAME);
+        let marker = fs::read(&lock).unwrap_or_default();
+        eprintln!("marker raw:     {:?}", String::from_utf8_lossy(&marker));
+        eprintln!(
+            "marker is:      {}",
+            match marker.as_slice() {
+                m if m == MARKER_CLEAN => "CLEAN",
+                m if m == MARKER_DIRTY => "DIRTY",
+                m if m == MARKER_INITIALIZING => "INITIALIZING",
+                _ => "other/empty",
+            }
+        );
+        eprintln!("--- replay ---");
+        eprintln!("{:?}", replay_same_key(temp.path()));
+    }
+
+    /// Non-vacuity for the harness itself: a `SIGKILL` BEFORE anything can
+    /// have changed the record must leave the nonce still consumable.
+    ///
+    /// Without this, the test above would also pass on a ledger that simply
+    /// refused everything forever — "never commits again" is only meaningful
+    /// against a control that shows it still commits when it should.
+    #[test]
+    fn sigkill_before_the_record_can_change_leaves_the_nonce_consumable() {
+        let temp = TempDir::new().unwrap();
+        kill_child_parked_at(temp.path(), "ledger:TempWrite");
+        assert!(
+            matches!(
+                replay_same_key(temp.path()),
+                MeshIntentNonceConsumeOutcome::Committed { .. }
+            ),
+            "a crash before the rename must not cost the caller its nonce"
+        );
     }
 }

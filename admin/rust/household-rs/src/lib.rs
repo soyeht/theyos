@@ -51,6 +51,10 @@ pub mod claw_vpn;
 pub mod claw_vpn_mobile_mesh_store;
 #[cfg(test)]
 pub mod claw_vpn_mobile_state;
+/// Test-only park used by the crash-window harness. Not compiled into
+/// production: every caller is a `#[cfg(test)]` fail-injection module.
+#[cfg(test)]
+pub(crate) mod crash_park;
 pub mod device_admission;
 pub mod device_cert;
 pub mod emoji_code;
