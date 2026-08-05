@@ -83,6 +83,19 @@ webauthn-authenticator-rs = { version = "0.5.5", default-features = false, featu
 # by @kiana for this purpose — not added to the workspace-wide dependency
 # set.
 trybuild      = "1"
+# Lane R (@ilia, authorized 2026-08-05): unconditionally available for
+# TEST builds only (coexists with the optional, `mesh-session-runtime`-
+# gated entry in [dependencies] above, which alone governs whether this
+# crate is reachable from a normal library build). `test-support` unlocks
+# `D1MembershipKey::new_for_test`, needed so this crate's own REDs can
+# exercise the real `SealedBinding::from_membership_key` wrapper end to
+# end, not just the private `validate_membership_fields` helper — that
+# crate's `new` is `pub(crate)`, unreachable from here otherwise. The
+# feature-gated test functions that use this stay behind
+# `#[cfg(feature = "mesh-session-runtime")]` regardless, so a plain
+# `cargo test` (no `--features`) still compiles none of them even though
+# this dependency itself is always resolved for test builds.
+mesh-session-core-rs = { path = "../mesh-session-core-rs", features = ["test-support"] }
 
 [lints]
 workspace = true

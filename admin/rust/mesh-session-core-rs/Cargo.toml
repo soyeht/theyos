@@ -11,6 +11,16 @@ edition = "2024"
 rust-version = "1.85"
 publish = false
 
+[features]
+default = []
+# Lane R (@ilia, authorized 2026-08-05, scoped to exactly this): gates
+# `D1MembershipKey::new_for_test` out of a default build entirely. Never
+# activated by any production dependency — mirrors
+# mesh-session-control-model-rs's own `test-support` pattern
+# (`seed_for_test`/`load_canonical_for_test`) precisely, including its
+# proof technique: see the `compile_fail` doctest in `src/lib.rs`.
+test-support = []
+
 [lints.rust]
 unsafe_code = "forbid"
 

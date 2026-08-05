@@ -21,6 +21,7 @@ members = [
     "keystore-rs",
     "llm-proxy-rs",
     "m1-household-mesh-smoke-rs",
+    "mesh-session-runtime-rs",
     "session-rs",
     "server-rs",
     "store-rs",

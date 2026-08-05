@@ -2232,6 +2232,27 @@ impl SealedBinding {
     /// Projects a real `D1MembershipKey` into a `SealedBinding`, or
     /// rejects it. `session_id` is read by nothing here — see the module
     /// comment above.
+    ///
+    /// **Declared partition (2026-08-05, @ilia audit of `29dc6139`,
+    /// independently verified line-by-line — not a defect, but
+    /// undeclared before this note, which promised more than the code
+    /// delivered):** `peer_m_id` does NOT go through the same
+    /// unconditional-then-combine path as the other 4 fields. It is
+    /// resolved by roster lookup FIRST, with two early returns — revoked,
+    /// then absent — both completing before any of the 4 comparisons
+    /// below ever run. `MembershipKeyRejected` itself still leaks nothing
+    /// (no variant, no field, identical `Display`/`Debug` on every path),
+    /// but the CONTROL FLOW differs, and is timing-distinguishable, from
+    /// "m_id valid but one of the other 4 fields wrong." Accepted as-is,
+    /// not closed, because calling this function already requires holding
+    /// the exact `&RosterSnapshotView` the m_id would be looked up
+    /// against — a caller who can observe this distinction could have
+    /// read the roster directly and learned the same thing; the check
+    /// reveals only existence/revocation status the caller's own snapshot
+    /// already carries, never a secret. See
+    /// `membership_key_field_comparison_order_is_pinned` below, which
+    /// locks this exact source-level ordering so a future reordering is a
+    /// deliberate, visible edit — not an accidental drift.
     pub fn from_membership_key(
         key: &mesh_session_core_rs::intent::D1MembershipKey,
         snapshot: &RosterSnapshotView,
@@ -2258,12 +2279,15 @@ impl SealedBinding {
 /// Revoked/not-active is checked FIRST, matching `from_responding_peer`'s
 /// existing ordering exactly — an unavoidable, pre-existing short-circuit
 /// (there is no member to compare fields against if the `m_id` isn't
-/// active), not something new introduced here. Past that gate, all 4
-/// remaining field comparisons (`hh_id`, fingerprint, `checkpoint_hash`,
-/// `checkpoint_sequence`) are evaluated UNCONDITIONALLY and combined with
-/// a single `&&`, checked once — no per-field early return, so no
-/// observable control-flow or timing difference between fingerprint
-/// being wrong and `checkpoint_sequence` being wrong.
+/// active), not something new introduced here. **This IS an observable
+/// partition** — see `SealedBinding::from_membership_key`'s own doc for
+/// why it is declared-and-accepted rather than closed. Past that gate,
+/// all 4 remaining field comparisons (`hh_id`, fingerprint,
+/// `checkpoint_hash`, `checkpoint_sequence`) are evaluated
+/// UNCONDITIONALLY and combined with a single `&&`, checked once — no
+/// per-field early return among THESE four, so no observable
+/// control-flow or timing difference between fingerprint being wrong and
+/// `checkpoint_sequence` being wrong specifically.
 #[cfg(feature = "mesh-session-runtime")]
 fn validate_membership_fields(
     hh_id: &str,
@@ -2375,20 +2399,42 @@ mod tests {
         RosterSnapshotView::project(&hh_id, &data)
     }
 
+    /// Real `D1MembershipKey`, via the `test-support`-gated escape hatch
+    /// — every field-mismatch RED below drives the REAL public
+    /// `SealedBinding::from_membership_key` wrapper, not the private
+    /// `validate_membership_fields` helper alone. A test that only
+    /// exercises a helper parallel to the caller cannot catch the caller
+    /// itself (@ilia) — if the wrapper ever mis-ordered its own field
+    /// extraction or passed the wrong accessor to the helper, these REDs
+    /// would still catch it; the earlier helper-only version could not.
+    /// `session_id` is a fixed, arbitrary fixture value — it is read by
+    /// nothing on either side of this call chain (see this section's own
+    /// module doc for why).
+    #[cfg(feature = "mesh-session-runtime")]
+    fn membership_key_for_test(
+        hh_id: &str,
+        peer_m_id: &str,
+        peer_cert_fingerprint: [u8; 32],
+        checkpoint_hash: [u8; 32],
+        checkpoint_sequence: u64,
+    ) -> mesh_session_core_rs::intent::D1MembershipKey {
+        mesh_session_core_rs::intent::D1MembershipKey::new_for_test(
+            b"fixture-session-id".to_vec(),
+            hh_id.to_string(),
+            peer_m_id.to_string(),
+            peer_cert_fingerprint.to_vec(),
+            checkpoint_hash.to_vec(),
+            checkpoint_sequence,
+        )
+    }
+
     #[cfg(feature = "mesh-session-runtime")]
     #[test]
     fn membership_key_all_fields_match_produces_sealed_binding() {
         let snapshot =
             membership_test_snapshot("hh-runtime-1", "m-1", [0xAAu8; 32], [0xCCu8; 32], 7, false);
-        let bound = validate_membership_fields(
-            "hh-runtime-1",
-            "m-1",
-            &[0xAAu8; 32],
-            &[0xCCu8; 32],
-            7,
-            &snapshot,
-        )
-        .unwrap();
+        let key = membership_key_for_test("hh-runtime-1", "m-1", [0xAAu8; 32], [0xCCu8; 32], 7);
+        let bound = SealedBinding::from_membership_key(&key, &snapshot).unwrap();
         assert_eq!(bound.hh_id().0, "hh-runtime-1");
         assert_eq!(bound.m_id().0, "m-1");
         assert_eq!(bound.machine_cert_fingerprint(), [0xAAu8; 32]);
@@ -2401,15 +2447,8 @@ mod tests {
     fn red_membership_key_hh_id_mismatch_rejected() {
         let snapshot =
             membership_test_snapshot("hh-runtime-1", "m-1", [0xAAu8; 32], [0xCCu8; 32], 7, false);
-        let err = validate_membership_fields(
-            "hh-DIFFERENT",
-            "m-1",
-            &[0xAAu8; 32],
-            &[0xCCu8; 32],
-            7,
-            &snapshot,
-        )
-        .unwrap_err();
+        let key = membership_key_for_test("hh-DIFFERENT", "m-1", [0xAAu8; 32], [0xCCu8; 32], 7);
+        let err = SealedBinding::from_membership_key(&key, &snapshot).unwrap_err();
         assert_eq!(err, MembershipKeyRejected);
     }
 
@@ -2418,15 +2457,14 @@ mod tests {
     fn red_membership_key_unknown_peer_m_id_rejected() {
         let snapshot =
             membership_test_snapshot("hh-runtime-1", "m-1", [0xAAu8; 32], [0xCCu8; 32], 7, false);
-        let err = validate_membership_fields(
+        let key = membership_key_for_test(
             "hh-runtime-1",
             "m-DOES-NOT-EXIST",
-            &[0xAAu8; 32],
-            &[0xCCu8; 32],
+            [0xAAu8; 32],
+            [0xCCu8; 32],
             7,
-            &snapshot,
-        )
-        .unwrap_err();
+        );
+        let err = SealedBinding::from_membership_key(&key, &snapshot).unwrap_err();
         assert_eq!(err, MembershipKeyRejected);
     }
 
@@ -2435,15 +2473,8 @@ mod tests {
     fn red_membership_key_fingerprint_mismatch_rejected() {
         let snapshot =
             membership_test_snapshot("hh-runtime-1", "m-1", [0xAAu8; 32], [0xCCu8; 32], 7, false);
-        let err = validate_membership_fields(
-            "hh-runtime-1",
-            "m-1",
-            &[0xFFu8; 32],
-            &[0xCCu8; 32],
-            7,
-            &snapshot,
-        )
-        .unwrap_err();
+        let key = membership_key_for_test("hh-runtime-1", "m-1", [0xFFu8; 32], [0xCCu8; 32], 7);
+        let err = SealedBinding::from_membership_key(&key, &snapshot).unwrap_err();
         assert_eq!(err, MembershipKeyRejected);
     }
 
@@ -2452,15 +2483,8 @@ mod tests {
     fn red_membership_key_checkpoint_hash_mismatch_rejected() {
         let snapshot =
             membership_test_snapshot("hh-runtime-1", "m-1", [0xAAu8; 32], [0xCCu8; 32], 7, false);
-        let err = validate_membership_fields(
-            "hh-runtime-1",
-            "m-1",
-            &[0xAAu8; 32],
-            &[0xEEu8; 32],
-            7,
-            &snapshot,
-        )
-        .unwrap_err();
+        let key = membership_key_for_test("hh-runtime-1", "m-1", [0xAAu8; 32], [0xEEu8; 32], 7);
+        let err = SealedBinding::from_membership_key(&key, &snapshot).unwrap_err();
         assert_eq!(err, MembershipKeyRejected);
     }
 
@@ -2469,15 +2493,8 @@ mod tests {
     fn red_membership_key_checkpoint_sequence_mismatch_rejected() {
         let snapshot =
             membership_test_snapshot("hh-runtime-1", "m-1", [0xAAu8; 32], [0xCCu8; 32], 7, false);
-        let err = validate_membership_fields(
-            "hh-runtime-1",
-            "m-1",
-            &[0xAAu8; 32],
-            &[0xCCu8; 32],
-            999,
-            &snapshot,
-        )
-        .unwrap_err();
+        let key = membership_key_for_test("hh-runtime-1", "m-1", [0xAAu8; 32], [0xCCu8; 32], 999);
+        let err = SealedBinding::from_membership_key(&key, &snapshot).unwrap_err();
         assert_eq!(err, MembershipKeyRejected);
     }
 
@@ -2486,15 +2503,8 @@ mod tests {
     fn red_membership_key_revoked_rejected() {
         let snapshot =
             membership_test_snapshot("hh-runtime-1", "m-1", [0xAAu8; 32], [0xCCu8; 32], 7, true);
-        let err = validate_membership_fields(
-            "hh-runtime-1",
-            "m-1",
-            &[0xAAu8; 32],
-            &[0xCCu8; 32],
-            7,
-            &snapshot,
-        )
-        .unwrap_err();
+        let key = membership_key_for_test("hh-runtime-1", "m-1", [0xAAu8; 32], [0xCCu8; 32], 7);
+        let err = SealedBinding::from_membership_key(&key, &snapshot).unwrap_err();
         assert_eq!(err, MembershipKeyRejected);
     }
 
@@ -2507,28 +2517,69 @@ mod tests {
     fn red_membership_key_stale_against_advanced_roster_rejected() {
         let old_snapshot =
             membership_test_snapshot("hh-runtime-1", "m-1", [0xAAu8; 32], [0xCCu8; 32], 7, false);
-        validate_membership_fields(
-            "hh-runtime-1",
-            "m-1",
-            &[0xAAu8; 32],
-            &[0xCCu8; 32],
-            7,
-            &old_snapshot,
-        )
-        .unwrap();
+        let key = membership_key_for_test("hh-runtime-1", "m-1", [0xAAu8; 32], [0xCCu8; 32], 7);
+        SealedBinding::from_membership_key(&key, &old_snapshot).unwrap();
 
         let advanced_snapshot =
             membership_test_snapshot("hh-runtime-1", "m-1", [0xAAu8; 32], [0xDDu8; 32], 8, false);
-        let err = validate_membership_fields(
-            "hh-runtime-1",
-            "m-1",
-            &[0xAAu8; 32],
-            &[0xCCu8; 32],
-            7,
-            &advanced_snapshot,
-        )
-        .unwrap_err();
+        let err = SealedBinding::from_membership_key(&key, &advanced_snapshot).unwrap_err();
         assert_eq!(err, MembershipKeyRejected);
+    }
+
+    /// Pins the declared partition (@ilia audit of `29dc6139`): `peer_m_id`
+    /// resolves via early-returning lookup BEFORE the 4 unconditional field
+    /// comparisons — not merely documented in prose, but locked to the
+    /// function's own source text, so a future reordering fails this test
+    /// and must be a deliberate edit, not silent drift. Structural, not
+    /// behavioral: `MembershipKeyRejected` carries no data, so no
+    /// black-box call sequence can observe this ordering by return value
+    /// alone — this is exactly why a source-level pin is the only proof
+    /// available today. Verified against the CURRENT text of this file
+    /// only, same accepted class of self-check as this crate's own
+    /// `r1a7_enumerates_linked_targets_and_proves_zero_production_callers`
+    /// (parses its own Cargo.toml text) and `mesh-session-core-rs`'s
+    /// `static_assertions` compile-time checks.
+    #[cfg(feature = "mesh-session-runtime")]
+    #[test]
+    fn membership_key_field_comparison_order_is_pinned() {
+        let source = include_str!("machine_roster_authority.rs");
+        let fn_start = source
+            .find("fn validate_membership_fields(")
+            .expect("validate_membership_fields must exist");
+        let fn_body = &source[fn_start..];
+        let fn_end = fn_body
+            .find("\n}\n")
+            .expect("validate_membership_fields must have a closing brace");
+        let fn_body = &fn_body[..fn_end];
+
+        let revoked_check = fn_body
+            .find("snapshot.is_revoked(")
+            .expect("revoked check must exist in validate_membership_fields");
+        let lookup_check = fn_body
+            .find("snapshot.lookup_active(")
+            .expect("lookup_active call must exist in validate_membership_fields");
+        let hh_id_comparison = fn_body
+            .find("let hh_id_matches")
+            .expect("hh_id_matches comparison must exist in validate_membership_fields");
+        let combined_check = fn_body
+            .find("if !(hh_id_matches")
+            .expect("combined field check must exist in validate_membership_fields");
+
+        assert!(
+            revoked_check < lookup_check,
+            "revoked check must precede the active-lookup, matching from_responding_peer's ordering"
+        );
+        assert!(
+            lookup_check < hh_id_comparison,
+            "peer_m_id resolution (revoked + lookup) must precede the 4 unconditional field \
+             comparisons — this is the declared, accepted partition; if this genuinely changed, \
+             update this pin deliberately, not by accident"
+        );
+        assert!(
+            hh_id_comparison < combined_check,
+            "the 4 field comparisons must be computed before the single combined check that \
+             uses them — proves they run unconditionally, not short-circuited among themselves"
+        );
     }
 
     // Local wrappers preserving old call signatures for tests

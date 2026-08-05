@@ -3285,6 +3285,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "mesh-session-runtime-rs"
+version = "0.1.0"
+dependencies = [
+ "household-rs",
+ "keystore-rs",
+ "mesh-session-core-rs",
+]
+
+[[package]]
 name = "mime"
 version = "0.3.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"
