@@ -272,6 +272,12 @@ pub const FRAME_EXIT: u8 = 0x16;
 /// `IpTunnel`-only: post-Open server→client interface settings.
 /// Body is canonical CBOR of [`NetworkSettings`].
 pub const FRAME_NETWORK_SETTINGS: u8 = 0x17;
+/// Open one sequential target stream while retaining the authenticated
+/// transport after that target closes.
+///
+/// This is a framing distinction only. The product decides whether a session
+/// may use it and enforces its target/open/byte budgets.
+pub const FRAME_OPEN_PERSISTENT: u8 = 0x18;
 
 /// Typed exit status of an interactive target process.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -322,6 +328,9 @@ pub enum TunnelFrame {
     Health(Vec<u8>),
     /// Open the persistent stream to the session's target.
     Open,
+    /// Open one sequential target stream while retaining the authenticated
+    /// connection after this target closes.
+    OpenPersistent,
     /// Bidirectional stream bytes.
     Data(Vec<u8>),
     /// Clean close of the stream (either direction).
@@ -380,6 +389,7 @@ impl fmt::Debug for TunnelFrame {
                 .field(&RedactedFramePayload { len: payload.len() })
                 .finish(),
             Self::Open => f.write_str("Open"),
+            Self::OpenPersistent => f.write_str("OpenPersistent"),
             Self::Data(payload) => f
                 .debug_tuple("Data")
                 .field(&RedactedFramePayload { len: payload.len() })
@@ -413,6 +423,7 @@ impl TunnelFrame {
                 out.extend_from_slice(p);
             }
             Self::Open => out.push(FRAME_OPEN),
+            Self::OpenPersistent => out.push(FRAME_OPEN_PERSISTENT),
             Self::Data(p) => {
                 out.push(FRAME_DATA);
                 out.extend_from_slice(p);
@@ -454,6 +465,7 @@ impl TunnelFrame {
         match kind {
             FRAME_HEALTH => Ok(Self::Health(payload.to_vec())),
             FRAME_OPEN => Ok(Self::Open),
+            FRAME_OPEN_PERSISTENT => Ok(Self::OpenPersistent),
             FRAME_DATA => Ok(Self::Data(payload.to_vec())),
             FRAME_CLOSE => Ok(Self::Close),
             FRAME_ERROR => Ok(Self::Error(String::from_utf8_lossy(payload).into_owned())),

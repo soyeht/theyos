@@ -627,6 +627,7 @@ mod tests {
             claw_static_pub: static_pub(0x77),
             not_after: NOT_AFTER,
             now_unix: NOW,
+            app_presentation: None,
         }
     }
 
@@ -652,7 +653,7 @@ mod tests {
                 "g_a".to_string(),
                 guest().public(),
                 claw.to_string(),
-                RelayStreamResource::Pty,
+                RelayStreamResource::ClawSite,
                 "relay-stream://127.0.0.1:49152".to_string(),
                 static_pub(0x33),
                 NOT_AFTER,

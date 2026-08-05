@@ -24,11 +24,12 @@ use household_rs::caveats::Operation;
 use household_rs::cbor;
 use household_rs::claw_share::{
     ClawShareClaim, ClawShareError, ClawShareInvite, ClawShareSlotStore, SlotId, TunnelHandle,
-    owner_mint_invite,
+    owner_mint_invite_with_presentation,
 };
 use household_rs::claw_share_flow::{EngineContext, engine_handle_claim};
+use household_rs::claw_share_relay_stream_contract::ShareableAppPresentation;
 use household_rs::household_mesh_log::{
-    LogEntry, MeshEvent, MeshLogStore, MeshMembership, ProjectedState,
+    LogEntry, MeshEvent, MeshLogStore, MeshMembership, ProjectedState, SlotProjectedStatus,
 };
 use household_rs::ids::HouseholdId;
 use household_rs::keys::{IdentityKey, P256PublicKey, P256Signature, verify_signature};
@@ -36,6 +37,9 @@ use household_rs::machine_cert::MachineCert;
 use household_rs::member_identity::MemberDeviceBinding;
 use serde::{Deserialize, Serialize};
 
+use crate::claw_share_app_descriptor::{
+    DeviceShareAppId, LegacyClawId, ShareReadiness, ShareResolution, resolve_device_share_app,
+};
 use crate::claw_share_relay_offer_challenge::{
     RELAY_OFFER_CHALLENGE_TTL_SECS, RelayOfferChallengeTable,
 };
@@ -48,12 +52,13 @@ use crate::claw_share_relay_stream_mount::{
 };
 use crate::household_auth;
 use crate::household_state::HouseholdState;
+use crate::state::SharedState;
 
 // ConnectInfo gates the production relay-offer endpoints (loopback-or-mesh peer
 // check), so it is always compiled. Query is only used by the dev mint fixture.
-use axum::extract::ConnectInfo;
 #[cfg(feature = "dev_claw_share_mint")]
 use axum::extract::Query;
+use axum::extract::{ConnectInfo, Path};
 
 const CBOR_CONTENT_TYPE: &str = "application/cbor";
 
@@ -95,6 +100,10 @@ pub struct ClawShareRouterState {
     /// Per-source admission / rate-limit for the relay-offer endpoints (reuses
     /// the D3 abuse model). Not `Sync`, so wrapped in a `std::sync::Mutex`.
     pub relay_offer_abuse: Arc<std::sync::Mutex<RelayAbuseState>>,
+    /// Main-daemon state used by the D6 shareable-app authority. Short-lived
+    /// install paths deliberately leave this absent and the Share API returns
+    /// `503` instead of opening a second database or guessing an identity.
+    pub shared_state: Option<SharedState>,
 }
 
 /// Build + sign a `MeshEvent` and append it to the durable log. Returns
@@ -239,6 +248,7 @@ pub fn router(state: ClawShareRouterState) -> axum::Router {
             post(handle_invite_to_claw),
         )
         .route("/api/v1/claw-share/groups", get(handle_list_groups))
+        .route("/api/v1/claw-share/shares", get(handle_list_active_shares))
         .route(
             "/api/v1/claw-share/relay-offer/challenge",
             post(handle_relay_offer_challenge),
@@ -250,6 +260,14 @@ pub fn router(state: ClawShareRouterState) -> axum::Router {
         .route(
             "/api/v1/claw-share/relay-offer/public",
             post(handle_relay_offer_public),
+        )
+        .route(
+            "/api/v1/household/shareable-apps",
+            get(handle_list_shareable_apps),
+        )
+        .route(
+            "/api/v1/household/shareable-apps/{app_id}/rename",
+            post(handle_rename_shareable_app),
         );
     // Dev-only fixture route (C7c-2c-e): absent entirely without the feature.
     #[cfg(feature = "dev_claw_share_mint")]
@@ -594,7 +612,13 @@ async fn handle_relay_offer_public(
 struct MintInviteRequest {
     /// Schema version.
     v: u8,
-    claw_id: String,
+    /// Legacy Group/Public identifier. Exactly one of this and `app_id` is
+    /// required.
+    #[serde(default)]
+    claw_id: Option<String>,
+    /// D6 `shareable_apps.app_id` for Device+ClawSite invitations.
+    #[serde(default)]
+    app_id: Option<String>,
     /// Optional TTL. Engine clamps to [`household_rs::claw_share::MAX_INVITE_TTL_SECS`].
     ttl_secs: Option<u64>,
     /// Optional transport hint. Defaults to a loopback channel; the
@@ -733,8 +757,8 @@ fn parse_public_data_tunnel_addr(raw: &str) -> Option<TunnelHandle> {
 
 /// Mint flow shared by the production `/api/v1/claw-share/invites` route and the
 /// dev-only fixture: resolve the live dev household owner, mint the slot + invite
-/// via `owner_mint_invite`, persist the `ClawShareSlotMinted` event (fail-closed),
-/// record the per-claw mesh network, and build the response. The CALLER's
+/// with its optional presentation snapshot, persist the `ClawShareSlotMinted`
+/// event (fail-closed), record the per-claw mesh network, and build the response. The CALLER's
 /// owner-PoP is verified by the production handler BEFORE calling this; this fn
 /// performs NO authorization itself, so callers MUST gate it.
 async fn mint_invite_inner(
@@ -755,6 +779,74 @@ async fn mint_invite_inner(
             "owner_auth_unavailable",
             None,
         ));
+    };
+
+    let target = select_mint_target(req.claw_id.clone(), req.app_id.clone()).map_err(|error| {
+        let code = match error {
+            MintTargetError::BothPresent => "claw_id_and_app_id_mutually_exclusive",
+            MintTargetError::NonePresent => "claw_id_or_app_id_required",
+            MintTargetError::ClawIdMalformed => "claw_id_malformed",
+            MintTargetError::AppIdMalformed => "app_id_malformed",
+        };
+        error_response(StatusCode::BAD_REQUEST, code, None)
+    })?;
+
+    let (claw_id, app_presentation) = match target {
+        MintTargetChoice::Legacy(claw_id) => (claw_id, None),
+        MintTargetChoice::Device(app_id) => {
+            let Some(shared) = state.shared_state.clone() else {
+                return Err(error_response(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "share_apps_unavailable",
+                    None,
+                ));
+            };
+            let household_id = identity.record.hh_id.to_string();
+            let owner_display_name = owner_auth.owner_person_cert.display_name.clone();
+            match tokio::task::spawn_blocking(move || {
+                resolve_mint_app_core(
+                    &shared.instance_db,
+                    &app_id,
+                    &household_id,
+                    &owner_display_name,
+                )
+            })
+            .await
+            {
+                Ok(Ok((claw_id, presentation))) => (claw_id, Some(presentation)),
+                Ok(Err(MintAppCoreError::Terminal)) => {
+                    return Err(error_response(
+                        StatusCode::NOT_FOUND,
+                        "share-app-no-longer-available",
+                        None,
+                    ));
+                }
+                Ok(Err(MintAppCoreError::Store(error))) => {
+                    tracing::warn!(stage = "claw_share.mint.resolve_failed", error = %error);
+                    return Err(error_response(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "share_resolve_failed",
+                        None,
+                    ));
+                }
+                Ok(Err(MintAppCoreError::InvalidPresentation)) => {
+                    tracing::warn!(stage = "claw_share.mint.presentation_invalid");
+                    return Err(error_response(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "presentation_invalid",
+                        None,
+                    ));
+                }
+                Err(error) => {
+                    tracing::warn!(stage = "claw_share.mint.resolve_panic", error = %error);
+                    return Err(error_response(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "share_resolve_failed",
+                        None,
+                    ));
+                }
+            }
+        }
     };
 
     let owner_key = identity.m_priv.as_ref();
@@ -788,7 +880,7 @@ async fn mint_invite_inner(
     let transport_hint = req
         .transport_hint
         .unwrap_or_else(|| TunnelHandle::Loopback {
-            channel: format!("ch-{}", req.claw_id),
+            channel: format!("ch-{claw_id}"),
         });
 
     // Relay claim path — SINGLE SOURCE OF TRUTH + FAIL CLOSED. See
@@ -804,17 +896,18 @@ async fn mint_invite_inner(
         Err(code) => return Err(error_response(StatusCode::SERVICE_UNAVAILABLE, code, None)),
     };
 
-    let invite = match owner_mint_invite(
+    let invite = match owner_mint_invite_with_presentation(
         owner_key,
         owner_p_id,
         hh_id,
-        &req.claw_id,
+        &claw_id,
         transport_hint,
         ttl_secs,
         now,
         owner_engine_npub,
         claim_relays,
         &state.slot_store,
+        app_presentation.clone(),
     ) {
         Ok(i) => i,
         Err(e) => {
@@ -828,7 +921,7 @@ async fn mint_invite_inner(
     };
 
     if let Err(error) = verify_invite_machine_attestation(&invite, &identity.cert) {
-        // `owner_mint_invite` inserted the slot. Do not leave it open when the
+        // Minting inserted the slot. Do not leave it open when the
         // response-bound attestation invariant fails.
         let rollback = state.slot_store.revoke(&invite.slot_id, now);
         tracing::error!(
@@ -843,30 +936,36 @@ async fn mint_invite_inner(
         ));
     }
 
-    // Persist the mint event. Slot store + log diverging on a restart
-    // would leave the engine in a state where an invite is "live" in
-    // RAM but the log thinks it never happened (or vice versa); fail
-    // closed if the log append fails.
-    let mint_event = MeshEvent::ClawShareSlotMinted {
-        slot_id: invite.slot_id.clone(),
-        claw_id: invite.claw_id.clone(),
-        expires_at: invite.expires_at,
-    };
-    if let Err(e) = log_event(&state.mesh_log, owner_key, now, mint_event) {
-        tracing::warn!(stage = "claw_share.mint.log_failed", error = %e);
-        return Err(error_response(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "log_persist_failed",
-            None,
-        ));
-    }
-
-    let Ok(uri) = invite.to_uri() else {
-        return Err(error_response(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "uri_encode_failed",
-            None,
-        ));
+    // Build the durable event from the exact snapshot captured at mint. The
+    // finalizer computes the URI before append and revokes the in-memory slot
+    // on either failure, so RAM can never authorize a mint the log denies.
+    let mint_event = mint_event_for_invite(&invite, app_presentation);
+    let uri = match finalize_mint_with_append(
+        &state.slot_store,
+        &invite,
+        mint_event,
+        |event| {
+            log_event(&state.mesh_log, owner_key, now, event).map_err(|error| {
+                tracing::warn!(stage = "claw_share.mint.log_failed", error = %error);
+            })
+        },
+        now,
+    ) {
+        Ok(uri) => uri,
+        Err(FinalizeError::UriFailed) => {
+            return Err(error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "uri_encode_failed",
+                None,
+            ));
+        }
+        Err(FinalizeError::AppendFailed) => {
+            return Err(error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "log_persist_failed",
+                None,
+            ));
+        }
     };
 
     Ok(MintInviteResponse {
@@ -979,7 +1078,10 @@ async fn handle_dev_mint_invite(
         .unwrap_or_else(|| "claw_dev_smoke".to_string());
     let req = MintInviteRequest {
         v: 1,
-        claw_id,
+        // Legacy semantics preserved exactly: this dev fixture mints a
+        // Group/Public-namespace claw invite, never a D6 app_id one.
+        claw_id: Some(claw_id),
+        app_id: None,
         ttl_secs: None,
         transport_hint: None,
     };
@@ -1461,40 +1563,102 @@ async fn handle_revoke(
             None,
         );
     };
-    match state.slot_store.revoke(&slot_id, now) {
-        Ok(()) => {
-            // Persist the revoke. If the log write fails we surface the
-            // failure to the caller — the in-memory revoke happened but
-            // it WILL be reverted by the next restart's projection, so
-            // we should not return 204.
-            let revoke_event = MeshEvent::ClawShareSlotRevoked {
-                slot_id: slot_id.clone(),
-            };
-            let owner_key = identity.m_priv.as_ref();
-            if let Err(e) = log_event(&state.mesh_log, owner_key, now, revoke_event) {
-                tracing::warn!(stage = "claw_share.revoke.log_failed", error = %e);
-                return error_response(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "log_persist_failed",
-                    None,
-                );
-            }
-            // The signed `ClawShareSlotRevoked` op-log entry above is the durable
-            // revocation; the per-session credential gate is the authoritative
-            // access boundary. The roster / deny-list re-publish + live
-            // peer-removal are part of the L3 overlay subset and are
-            // intentionally not wired in this relay/membership subset.
-            let _ = owner_key;
-            StatusCode::NO_CONTENT.into_response()
-        }
-        Err(ClawShareError::SlotNotFound) => {
+    match revoke_slot_core(
+        &state.slot_store,
+        &state.mesh_log,
+        identity.m_priv.as_ref(),
+        &slot_id,
+        now,
+    ) {
+        // The signed `ClawShareSlotRevoked` op-log entry is the durable
+        // revocation; the per-session credential gate is the authoritative
+        // access boundary. The roster / deny-list re-publish + live
+        // peer-removal are part of the L3 overlay subset and are
+        // intentionally not wired in this relay/membership subset.
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(RevokeCoreError::SlotNotFound) => {
             error_response(StatusCode::NOT_FOUND, "slot_not_found", None)
         }
-        Err(e) => {
+        Err(RevokeCoreError::LogPersistFailed(e)) => {
+            tracing::warn!(stage = "claw_share.revoke.log_failed", error = %e);
+            error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "log_persist_failed",
+                None,
+            )
+        }
+        Err(RevokeCoreError::Revoke(e)) => {
             tracing::warn!(stage = "claw_share.revoke.failed", error = %e);
             error_response(StatusCode::INTERNAL_SERVER_ERROR, "revoke_failed", None)
         }
     }
+}
+
+#[derive(Debug)]
+pub(crate) enum RevokeCoreError {
+    SlotNotFound,
+    Revoke(ClawShareError),
+    LogPersistFailed(ClawShareError),
+}
+
+/// Deterministic core of [`handle_revoke`], split out so the canonical-timestamp
+/// rule is testable without standing up owner `PoP` — and so a test cannot pass by
+/// re-implementing it. After request validation and the identity lookup, the
+/// handler delegates the entire mutation/persistence path to this core.
+///
+/// The whole idempotence property lives on ONE line here: the durable event is
+/// signed with the timestamp `revoke` RETURNED, not with `now`. `entry_id`
+/// digests (timestamp, event, issuer) and not the signature, so a repeat with a
+/// later clock still yields a byte-identical id that `append` dedupes, while a
+/// retry after a failed append persists the entry the first attempt would have
+/// written.
+pub(crate) fn revoke_slot_core(
+    slot_store: &ClawShareSlotStore,
+    mesh_log: &MeshLogStore,
+    owner_key: &dyn IdentityKey,
+    slot_id: &SlotId,
+    now: u64,
+) -> Result<(), RevokeCoreError> {
+    revoke_slot_with_append(slot_store, slot_id, now, |revoked_at, event| {
+        log_event(mesh_log, owner_key, revoked_at, event)
+    })
+}
+
+/// The revoke state machine, with persistence as an injected seam.
+///
+/// Split out so a test can fail the append for REAL instead of approximating it
+/// by skipping the call — approximating cannot distinguish "we kept the revoke
+/// and surfaced the error" from "we rolled the slot back", and those differ:
+/// on rollback the retry would re-revoke on the LATER clock and persist the
+/// wrong timestamp.
+///
+/// Deliberately NOT the in-memory revoke's undo path: the revoke stands even
+/// when the append fails, because the caller reports failure and the next
+/// restart's projection is what reconciles. The seam is a plain parameter, so
+/// production behavior carries no `cfg`, no fake handler and no global registry
+/// — `revoke_slot_core` above passes the real `log_event`.
+fn revoke_slot_with_append<F>(
+    slot_store: &ClawShareSlotStore,
+    slot_id: &SlotId,
+    now: u64,
+    append: F,
+) -> Result<(), RevokeCoreError>
+where
+    F: FnOnce(u64, MeshEvent) -> Result<(), ClawShareError>,
+{
+    let revoked_at = match slot_store.revoke(slot_id, now) {
+        Ok(revoked_at) => revoked_at,
+        Err(ClawShareError::SlotNotFound) => return Err(RevokeCoreError::SlotNotFound),
+        Err(e) => return Err(RevokeCoreError::Revoke(e)),
+    };
+    // If the log write fails we surface it to the caller — the in-memory revoke
+    // happened but WILL be reverted by the next restart's projection, so the
+    // caller must not report success. The slot stays Revoked at the canonical
+    // timestamp so a retry re-signs the SAME entry.
+    let revoke_event = MeshEvent::ClawShareSlotRevoked {
+        slot_id: slot_id.clone(),
+    };
+    append(revoked_at, revoke_event).map_err(RevokeCoreError::LogPersistFailed)
 }
 
 // ─── Fase E1: owner group-management endpoint ────────────────────────────────
@@ -1861,6 +2025,1216 @@ async fn handle_invite_to_claw(
     }
 
     StatusCode::NO_CONTENT.into_response()
+}
+
+// ── Shareable apps (Slice B, D6) ─────────────────────────────────────────────
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum MintTargetChoice {
+    Legacy(String),
+    Device(DeviceShareAppId),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MintTargetError {
+    BothPresent,
+    NonePresent,
+    ClawIdMalformed,
+    AppIdMalformed,
+}
+
+pub(crate) fn select_mint_target(
+    claw_id: Option<String>,
+    app_id: Option<String>,
+) -> Result<MintTargetChoice, MintTargetError> {
+    match (claw_id, app_id) {
+        (Some(raw), None) => {
+            let cid = LegacyClawId::try_from(raw).map_err(|_| MintTargetError::ClawIdMalformed)?;
+            Ok(MintTargetChoice::Legacy(cid.as_str().to_string()))
+        }
+        (None, Some(raw)) => {
+            let aid = DeviceShareAppId::try_from(raw.as_str())
+                .map_err(|_| MintTargetError::AppIdMalformed)?;
+            Ok(MintTargetChoice::Device(aid))
+        }
+        (Some(_), Some(_)) => Err(MintTargetError::BothPresent),
+        (None, None) => Err(MintTargetError::NonePresent),
+    }
+}
+
+#[derive(Debug)]
+pub(crate) enum MintAppCoreError {
+    Terminal,
+    Store(store_rs::StoreError),
+    InvalidPresentation,
+}
+
+pub(crate) fn resolve_mint_app_core(
+    db: &store_rs::instance_db::InstanceDb,
+    app_id: &DeviceShareAppId,
+    hh_id: &str,
+    owner_display_name: &str,
+) -> Result<(String, ShareableAppPresentation), MintAppCoreError> {
+    let resolution =
+        resolve_device_share_app(db, app_id, hh_id).map_err(MintAppCoreError::Store)?;
+    // Minting is identity work, so Ready and Unavailable are treated alike here
+    // (D1: a recoverable runtime state still mints). The port `Ready` now
+    // carries is deliberately dropped — this path never dials.
+    let desc = match resolution {
+        ShareResolution::Ready(ready) => ready.descriptor,
+        ShareResolution::Unavailable(desc) => desc,
+        ShareResolution::Terminal => return Err(MintAppCoreError::Terminal),
+    };
+    let pres = ShareableAppPresentation::try_new(
+        desc.app_id.as_str().to_string(),
+        desc.display_name.clone(),
+        owner_display_name.to_string(),
+    )
+    .map_err(|_| MintAppCoreError::InvalidPresentation)?;
+    Ok((desc.claw_id.into_wire_string(), pres))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FinalizeError {
+    UriFailed,
+    AppendFailed,
+}
+
+fn mint_event_for_invite(
+    invite: &ClawShareInvite,
+    app_presentation: Option<ShareableAppPresentation>,
+) -> MeshEvent {
+    MeshEvent::ClawShareSlotMinted {
+        slot_id: invite.slot_id.clone(),
+        claw_id: invite.claw_id.clone(),
+        expires_at: invite.expires_at,
+        app_presentation,
+    }
+}
+
+pub(crate) fn finalize_mint_with_append(
+    slot_store: &ClawShareSlotStore,
+    invite: &ClawShareInvite,
+    event: MeshEvent,
+    append: impl FnOnce(MeshEvent) -> Result<(), ()>,
+    now: u64,
+) -> Result<String, FinalizeError> {
+    let Ok(uri) = invite.to_uri() else {
+        let _ = slot_store.revoke(&invite.slot_id, now);
+        return Err(FinalizeError::UriFailed);
+    };
+    if append(event).is_err() {
+        let _ = slot_store.revoke(&invite.slot_id, now);
+        return Err(FinalizeError::AppendFailed);
+    }
+    Ok(uri)
+}
+
+#[derive(Serialize, Clone)]
+pub(crate) struct ShareableAppResponse {
+    pub app_id: String,
+    pub claw_id: String,
+    pub display_name: String,
+    pub resource: String,
+    pub readiness: String,
+}
+
+#[derive(Serialize)]
+struct ListShareableAppsResponse {
+    v: u8,
+    apps: Vec<ShareableAppResponse>,
+}
+
+#[derive(Deserialize)]
+struct RenameShareableAppRequest {
+    v: u8,
+    display_name: String,
+}
+
+/// `GET /api/v1/claw-share/shares` — the owner's Active Shares.
+///
+/// Owner-authorized read (`HouseholdInvite`, the same operation the sibling
+/// shareable-apps list uses); revoking stays on `HouseholdRevoke`. Returns the
+/// complete household-scoped list, deliberately unpaginated — see
+/// [`list_active_shares_core`].
+async fn handle_list_active_shares(
+    State(state): State<ClawShareRouterState>,
+    method: Method,
+    uri: Uri,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let now = match SystemTime::now().duration_since(UNIX_EPOCH) {
+        Ok(d) => d.as_secs(),
+        Err(_) => return StatusCode::UNAUTHORIZED.into_response(),
+    };
+    if household_auth::authorize_request(
+        &state.household,
+        &headers,
+        &method,
+        &uri.path_and_query()
+            .map_or_else(|| uri.path().to_string(), |pq| pq.as_str().to_string()),
+        &body,
+        Operation::HouseholdInvite,
+        now,
+    )
+    .await
+    .is_err()
+    {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    let Some(identity) = state.household.current().await else {
+        return error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "household_unavailable",
+            None,
+        );
+    };
+    let Some(shared) = state.shared_state.clone() else {
+        return error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "share_apps_unavailable",
+            None,
+        );
+    };
+    let hh_id = identity.record.hh_id.to_string();
+    let projection = state.mesh_log.project();
+    let rows = match tokio::task::spawn_blocking(move || {
+        list_active_shares_core(&shared.instance_db, &projection, &hh_id, now)
+    })
+    .await
+    {
+        Ok(Ok(rows)) => rows,
+        Ok(Err(e)) => {
+            tracing::warn!(stage = "claw_share.active_shares.list_failed", error = %e);
+            return error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "active_shares_list_failed",
+                None,
+            );
+        }
+        Err(e) => {
+            tracing::warn!(stage = "claw_share.active_shares.list_panic", error = %e);
+            return error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "active_shares_list_failed",
+                None,
+            );
+        }
+    };
+    match cbor::to_canonical_vec(&ListActiveSharesResponse { v: 1, shares: rows }) {
+        Ok(bytes) => cbor_response(StatusCode::OK, bytes),
+        Err(_) => error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "response_encode_failed",
+            None,
+        ),
+    }
+}
+
+fn readiness_str(r: ShareReadiness) -> &'static str {
+    match r {
+        ShareReadiness::Running => "running",
+        ShareReadiness::Starting => "starting",
+        ShareReadiness::Stopped => "stopped",
+        ShareReadiness::Unavailable => "unavailable",
+    }
+}
+
+pub(crate) fn list_shareable_apps_core(
+    db: &store_rs::instance_db::InstanceDb,
+    hh_id: &str,
+) -> Result<Vec<ShareableAppResponse>, store_rs::StoreError> {
+    let rows = db.list_for_household(hh_id)?;
+    let mut apps = Vec::new();
+    for row in rows {
+        let binding = db.ensure_shareable_app(&row.id, hh_id)?;
+        let app_id = DeviceShareAppId::try_from(binding.app_id.as_str())
+            .map_err(|_| store_rs::StoreError::Internal("app_id shape".to_string()))?;
+        // Listing reports identity + readiness for both live states; the port
+        // `Ready` carries is not part of the list contract.
+        let desc = match resolve_device_share_app(db, &app_id, hh_id)? {
+            ShareResolution::Ready(ready) => ready.descriptor,
+            ShareResolution::Unavailable(desc) => desc,
+            ShareResolution::Terminal => {
+                tracing::warn!(
+                    stage = "claw_share.share_apps.terminal_after_ensure",
+                    app_id = %binding.app_id,
+                    instance_id = %row.id,
+                    "binding went terminal between ensure and resolve — skipping"
+                );
+                continue;
+            }
+        };
+        apps.push(ShareableAppResponse {
+            app_id: desc.app_id.into_wire_string(),
+            claw_id: desc.claw_id.into_wire_string(),
+            display_name: desc.display_name,
+            resource: "clawsite".to_string(),
+            readiness: readiness_str(desc.readiness).to_string(),
+        });
+    }
+    Ok(apps)
+}
+
+// ─── Slice C2: Active Shares listing ─────────────────────────────────────────
+
+/// One row of the owner's Active Shares list.
+///
+/// Carries NO guest key, npub, credential or invite material. The share link is
+/// a bearer capability and is deliberately absent from this wire: Copy Link is
+/// served from the iOS local cache, never from the server or the mesh log.
+#[derive(Serialize, PartialEq, Eq, Debug)]
+pub(crate) struct ActiveShareResponse {
+    /// Raw `SlotId` bytes; the client treats it as opaque.
+    #[serde(with = "serde_bytes")]
+    pub slot_id: Vec<u8>,
+    pub app_id: String,
+    /// CURRENT name when the app still resolves; the signed snapshot's name
+    /// only as an explicitly terminal fallback.
+    pub display_name: String,
+    /// Slot lifecycle: `waiting|accepted|expired|revoked`.
+    pub status: String,
+    /// App runtime, an INDEPENDENT axis: `running|starting|stopped|unavailable`.
+    /// A Waiting share whose app is Stopped is a real, expressible state.
+    pub readiness: String,
+    pub created_at: u64,
+    pub expires_at: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub accepted_at: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub revoked_at: Option<u64>,
+}
+
+#[derive(Serialize)]
+struct ListActiveSharesResponse {
+    v: u8,
+    shares: Vec<ActiveShareResponse>,
+}
+
+/// Slot lifecycle, derived server-side. Revoked wins; an accepted share stays
+/// Accepted even past its expiry (it WAS accepted — expiry does not rewrite
+/// history); only a still-open slot becomes Expired.
+fn share_status(status: &SlotProjectedStatus, expires_at: u64, now: u64) -> &'static str {
+    match status {
+        SlotProjectedStatus::Revoked { .. } => "revoked",
+        SlotProjectedStatus::Consumed { .. } => "accepted",
+        SlotProjectedStatus::Open if expires_at <= now => "expired",
+        SlotProjectedStatus::Open => "waiting",
+    }
+}
+
+/// Build the owner's Active Shares list from the DURABLE projection.
+///
+/// The projection is the authority, not the in-memory slot store: it survives
+/// restart, it is ordered by `slot_id`, and it is the only place `created_at`
+/// and `accepted_at` live. The RAM store is not enumerable by design and is not
+/// widened for this.
+///
+/// The response is the COMPLETE household-scoped list — no pagination, matching
+/// the sibling `shareable-apps` surface. That is O(n) in projected slots per
+/// request and is known debt, not an oversight; adding `limit`/`cursor` here
+/// without a client that pages would be inventing scope.
+pub(crate) fn list_active_shares_core(
+    db: &store_rs::instance_db::InstanceDb,
+    projection: &household_rs::household_mesh_log::ProjectedState,
+    hh_id: &str,
+    now: u64,
+) -> Result<Vec<ActiveShareResponse>, store_rs::StoreError> {
+    let mut shares = Vec::new();
+    for (slot_id, slot) in &projection.slots {
+        // The snapshot is what marks a slot as a D6 Device+ClawSite share.
+        // Group/Public slots carry none and are not Active Shares.
+        let Some(snapshot) = slot.app_presentation.as_ref() else {
+            continue;
+        };
+        // A presentation-backed slot with no creation time is corrupt: the mint
+        // that wrote the snapshot also carries the timestamp. Omit it loudly
+        // rather than invent a plausible-looking one.
+        let Some(created_at) = slot.created_at else {
+            tracing::warn!(
+                stage = "claw_share.active_shares.missing_created_at",
+                app_id = %snapshot.app_id,
+                "presentation-backed slot without created_at — omitting"
+            );
+            continue;
+        };
+        let Ok(app_id) = DeviceShareAppId::try_from(snapshot.app_id.as_str()) else {
+            tracing::warn!(
+                stage = "claw_share.active_shares.app_id_shape",
+                "snapshot app_id is not a D6 id — omitting"
+            );
+            continue;
+        };
+        // Same fence the signed offer enforces at verify: the snapshot must
+        // describe THIS slot's claw. A projection that arrived over gossip, or
+        // is corrupt, could otherwise carry a well-formed presentation naming a
+        // DIFFERENT app — and we would resolve and list that one under this
+        // slot's identity. A covered signature over two contradictory values is
+        // still a contradiction.
+        if snapshot.app_id != slot.claw_id {
+            tracing::warn!(
+                stage = "claw_share.active_shares.app_id_claw_mismatch",
+                "snapshot app_id does not match the slot's claw_id — omitting"
+            );
+            continue;
+        }
+
+        // Name and readiness come from the LIVE resolution, so a rename shows
+        // up. Terminal carries no descriptor at all — unknown, retired, foreign
+        // and deleted are deliberately indistinguishable — so it falls back to
+        // the frozen snapshot name and reports the app as unavailable. The row
+        // stays listable and revocable either way: dropping it would erase the
+        // owner's history and their ability to revoke it.
+        let (display_name, readiness) = match resolve_device_share_app(db, &app_id, hh_id)? {
+            ShareResolution::Ready(ready) => (
+                ready.descriptor.display_name,
+                readiness_str(ready.descriptor.readiness),
+            ),
+            ShareResolution::Unavailable(desc) => {
+                (desc.display_name, readiness_str(desc.readiness))
+            }
+            ShareResolution::Terminal => (snapshot.display_name.clone(), "unavailable"),
+        };
+
+        let (accepted_at, revoked_at) = match &slot.status {
+            SlotProjectedStatus::Consumed { consumed_at, .. } => (Some(*consumed_at), None),
+            SlotProjectedStatus::Revoked {
+                revoked_at,
+                accepted_at,
+                ..
+            } => (*accepted_at, Some(*revoked_at)),
+            SlotProjectedStatus::Open => (None, None),
+        };
+
+        shares.push(ActiveShareResponse {
+            slot_id: slot_id.0.to_vec(),
+            app_id: app_id.into_wire_string(),
+            display_name,
+            status: share_status(&slot.status, slot.expires_at, now).to_string(),
+            readiness: readiness.to_string(),
+            created_at,
+            expires_at: slot.expires_at,
+            accepted_at,
+            revoked_at,
+        });
+    }
+    Ok(shares)
+}
+
+pub(crate) fn rename_shareable_app_core(
+    db: &store_rs::instance_db::InstanceDb,
+    app_id: &DeviceShareAppId,
+    hh_id: &str,
+    display_name: &str,
+) -> Result<(), store_rs::StoreError> {
+    db.rename_shareable_app(app_id.as_str(), hh_id, display_name)
+}
+
+async fn handle_list_shareable_apps(
+    State(state): State<ClawShareRouterState>,
+    method: Method,
+    uri: Uri,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let now = match SystemTime::now().duration_since(UNIX_EPOCH) {
+        Ok(d) => d.as_secs(),
+        Err(_) => return StatusCode::UNAUTHORIZED.into_response(),
+    };
+    if household_auth::authorize_request(
+        &state.household,
+        &headers,
+        &method,
+        &uri.path_and_query()
+            .map_or_else(|| uri.path().to_string(), |pq| pq.as_str().to_string()),
+        &body,
+        Operation::HouseholdInvite,
+        now,
+    )
+    .await
+    .is_err()
+    {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    let Some(identity) = state.household.current().await else {
+        return error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "household_unavailable",
+            None,
+        );
+    };
+    let Some(shared) = state.shared_state.clone() else {
+        return error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "share_apps_unavailable",
+            None,
+        );
+    };
+    let hh_id = identity.record.hh_id.to_string();
+    let apps = match tokio::task::spawn_blocking(move || {
+        list_shareable_apps_core(&shared.instance_db, &hh_id)
+    })
+    .await
+    {
+        Ok(Ok(apps)) => apps,
+        Ok(Err(e)) => {
+            tracing::warn!(stage = "claw_share.share_apps.list_failed", error = %e);
+            return error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "share_apps_list_failed",
+                None,
+            );
+        }
+        Err(e) => {
+            tracing::warn!(stage = "claw_share.share_apps.list_panic", error = %e);
+            return error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "share_apps_list_failed",
+                None,
+            );
+        }
+    };
+    match cbor::to_canonical_vec(&ListShareableAppsResponse { v: 1, apps }) {
+        Ok(bytes) => cbor_response(StatusCode::OK, bytes),
+        Err(_) => error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "response_encode_failed",
+            None,
+        ),
+    }
+}
+
+async fn handle_rename_shareable_app(
+    State(state): State<ClawShareRouterState>,
+    Path(app_id_raw): Path<String>,
+    method: Method,
+    uri: Uri,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let now = match SystemTime::now().duration_since(UNIX_EPOCH) {
+        Ok(d) => d.as_secs(),
+        Err(_) => return StatusCode::UNAUTHORIZED.into_response(),
+    };
+    if household_auth::authorize_request(
+        &state.household,
+        &headers,
+        &method,
+        &uri.path_and_query()
+            .map_or_else(|| uri.path().to_string(), |pq| pq.as_str().to_string()),
+        &body,
+        Operation::HouseholdInvite,
+        now,
+    )
+    .await
+    .is_err()
+    {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    let Some(identity) = state.household.current().await else {
+        return error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "household_unavailable",
+            None,
+        );
+    };
+    let Some(shared) = state.shared_state.clone() else {
+        return error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "share_apps_unavailable",
+            None,
+        );
+    };
+    let req: RenameShareableAppRequest = match cbor::from_canonical_slice(&body) {
+        Ok(r) => r,
+        Err(_) => return error_response(StatusCode::BAD_REQUEST, "request_malformed", None),
+    };
+    if req.v != 1 {
+        return error_response(StatusCode::BAD_REQUEST, "version_unsupported", None);
+    }
+    let Ok(app_id) = DeviceShareAppId::try_from(app_id_raw.as_str()) else {
+        return error_response(StatusCode::BAD_REQUEST, "app_id_malformed", None);
+    };
+    let hh_id = identity.record.hh_id.to_string();
+    let new_name = req.display_name;
+    match tokio::task::spawn_blocking(move || {
+        rename_shareable_app_core(&shared.instance_db, &app_id, &hh_id, &new_name)
+    })
+    .await
+    {
+        Ok(Ok(())) => StatusCode::NO_CONTENT.into_response(),
+        Ok(Err(store_rs::StoreError::InstanceNotFound)) => {
+            error_response(StatusCode::NOT_FOUND, "share-app-no-longer-available", None)
+        }
+        Ok(Err(e)) => {
+            tracing::warn!(stage = "claw_share.share_apps.rename_failed", error = %e);
+            error_response(StatusCode::INTERNAL_SERVER_ERROR, "rename_failed", None)
+        }
+        Err(e) => {
+            tracing::warn!(stage = "claw_share.share_apps.rename_panic", error = %e);
+            error_response(StatusCode::INTERNAL_SERVER_ERROR, "rename_failed", None)
+        }
+    }
+}
+
+#[cfg(test)]
+mod shareable_apps_tests {
+    use super::*;
+    use household_rs::claw_share::{SlotRecord, SlotState};
+    use household_rs::keys::P256Keypair;
+    use household_rs::{PersonId, derive_household_id};
+    use store_rs::instance_db::{InstanceDb, InstanceStatus, NewInstance, StatusUpdate};
+
+    const HOUSEHOLD: &str = "hh_alpha";
+
+    fn instance<'a>(id: &'a str, name: &'a str, container: &'a str) -> NewInstance<'a> {
+        NewInstance {
+            id,
+            name,
+            container,
+            claw_type: "picoclaw",
+            sunset_date: "2026-12-31",
+            guest_os: None,
+            aux_storage_path: None,
+            cpu_cores: None,
+            ram_config_mb: None,
+            disk_gb: None,
+            household_id: Some(HOUSEHOLD),
+            household_machine_id: Some("m_alpha"),
+        }
+    }
+
+    // ── Slice C2: Active Shares listing ──────────────────────────────────────
+
+    /// A projection holding exactly one slot, so each test states the whole
+    /// world it asserts on.
+    fn projection_with(slot: household_rs::household_mesh_log::ProjectedSlot) -> ProjectedState {
+        let mut state = ProjectedState::default();
+        state.slots.insert(slot.slot_id.clone(), slot);
+        state
+    }
+
+    fn c2_slot(
+        app_id: &DeviceShareAppId,
+        snapshot_name: &str,
+        status: SlotProjectedStatus,
+        expires_at: u64,
+        created_at: Option<u64>,
+    ) -> household_rs::household_mesh_log::ProjectedSlot {
+        household_rs::household_mesh_log::ProjectedSlot {
+            slot_id: SlotId([0x77; 16]),
+            claw_id: app_id.as_str().to_string(),
+            expires_at,
+            status,
+            app_presentation: Some(
+                ShareableAppPresentation::try_new(
+                    app_id.as_str().to_string(),
+                    snapshot_name,
+                    "Caio",
+                )
+                .expect("valid snapshot"),
+            ),
+            created_at,
+        }
+    }
+
+    fn set_instance_status(db: &InstanceDb, status: InstanceStatus) {
+        db.update_status(&StatusUpdate {
+            id: "inst-app",
+            status,
+            message: "",
+            error: "",
+            job_id: "",
+            phase: "",
+        })
+        .expect("update status");
+    }
+
+    fn active_shares(
+        db: &InstanceDb,
+        projection: &ProjectedState,
+        now: u64,
+    ) -> Vec<ActiveShareResponse> {
+        list_active_shares_core(db, projection, HOUSEHOLD, now).expect("list")
+    }
+
+    #[test]
+    fn status_and_readiness_are_independent_axes() {
+        let db = db_with_instance();
+        let app_id = device_id(&db);
+        let guest = P256Keypair::generate().public();
+        set_instance_status(&db, InstanceStatus::Stopped);
+
+        // WAITING slot + STOPPED app on the same row.
+        let rows = active_shares(
+            &db,
+            &projection_with(c2_slot(
+                &app_id,
+                "Study",
+                SlotProjectedStatus::Open,
+                9_000,
+                Some(1_000),
+            )),
+            5_000,
+        );
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].status, "waiting");
+        assert_eq!(
+            rows[0].readiness, "stopped",
+            "readiness must come from the APP, not the slot"
+        );
+        assert_eq!(rows[0].created_at, 1_000);
+        assert_eq!(rows[0].expires_at, 9_000);
+        assert_eq!(rows[0].accepted_at, None);
+        assert_eq!(rows[0].revoked_at, None);
+
+        // ACCEPTED slot + UNAVAILABLE app on the same row: Active with no host
+        // port resolves Unavailable, so the two axes disagree honestly.
+        set_instance_status(&db, InstanceStatus::Active);
+        let rows = active_shares(
+            &db,
+            &projection_with(c2_slot(
+                &app_id,
+                "Study",
+                SlotProjectedStatus::Consumed {
+                    guest_device_pub: guest,
+                    consumed_at: 2_000,
+                    participant_npub: None,
+                },
+                9_000,
+                Some(1_000),
+            )),
+            5_000,
+        );
+        assert_eq!(rows[0].status, "accepted");
+        assert_eq!(rows[0].readiness, "unavailable");
+    }
+
+    #[test]
+    fn status_priority_revoked_beats_expiry_and_accepted_survives_it() {
+        let db = db_with_instance();
+        let app_id = device_id(&db);
+        let guest = P256Keypair::generate().public();
+
+        // Accepted, and ALREADY past expiry: it was accepted, and expiry does
+        // not rewrite that.
+        let accepted = active_shares(
+            &db,
+            &projection_with(c2_slot(
+                &app_id,
+                "Study",
+                SlotProjectedStatus::Consumed {
+                    guest_device_pub: guest.clone(),
+                    consumed_at: 2_000,
+                    participant_npub: None,
+                },
+                3_000,
+                Some(1_000),
+            )),
+            9_999,
+        );
+        assert_eq!(accepted[0].status, "accepted");
+        assert_eq!(accepted[0].accepted_at, Some(2_000));
+
+        // Revoked wins over everything, and still reports when it was accepted.
+        let revoked = active_shares(
+            &db,
+            &projection_with(c2_slot(
+                &app_id,
+                "Study",
+                SlotProjectedStatus::Revoked {
+                    revoked_at: 4_000,
+                    participant_npub: None,
+                    accepted_at: Some(2_000),
+                },
+                3_000,
+                Some(1_000),
+            )),
+            9_999,
+        );
+        assert_eq!(revoked[0].status, "revoked");
+        assert_eq!(revoked[0].revoked_at, Some(4_000));
+        assert_eq!(revoked[0].accepted_at, Some(2_000));
+
+        // Only a still-open slot expires.
+        let expired = active_shares(
+            &db,
+            &projection_with(c2_slot(
+                &app_id,
+                "Study",
+                SlotProjectedStatus::Open,
+                3_000,
+                Some(1_000),
+            )),
+            9_999,
+        );
+        assert_eq!(expired[0].status, "expired");
+    }
+
+    #[test]
+    fn live_rename_shows_the_current_name_not_the_frozen_snapshot() {
+        let db = db_with_instance();
+        let app_id = device_id(&db);
+        db.rename_shareable_app(app_id.as_str(), HOUSEHOLD, "Renamed")
+            .expect("rename");
+        let projection = projection_with(c2_slot(
+            &app_id,
+            "OldSnapshotName",
+            SlotProjectedStatus::Open,
+            9_000,
+            Some(1_000),
+        ));
+
+        // BOTH resolution arms must report the CURRENT name, and they are
+        // independent code paths — a regression in either alone must fail.
+        // The snapshot name is deliberately distinct from the live one, or
+        // reading the snapshot would be indistinguishable from resolving.
+        //
+        // Arm 1, Unavailable: Active with no host port.
+        set_instance_status(&db, InstanceStatus::Active);
+        let rows = active_shares(&db, &projection, 5_000);
+        assert_eq!(rows[0].display_name, "Renamed");
+        assert_eq!(rows[0].readiness, "unavailable");
+
+        // Arm 2, Ready: same app, now with a port.
+        db.update_port("inst-app", 8080).expect("port");
+        let rows = active_shares(&db, &projection, 5_000);
+        assert_eq!(
+            rows[0].display_name, "Renamed",
+            "the list must resolve the CURRENT name, not read the snapshot"
+        );
+        assert_eq!(rows[0].readiness, "running");
+        // A rename touches ONLY the name: status and created_at are untouched...
+        assert_eq!(rows[0].status, "waiting");
+        assert_eq!(rows[0].created_at, 1_000);
+        // ...and the signed snapshot itself stays frozen. Without this the test
+        // cannot tell "resolved the current name" from "read the snapshot".
+        let slot = projection.slots.values().next().expect("one slot");
+        assert_eq!(
+            slot.app_presentation.as_ref().unwrap().display_name,
+            "OldSnapshotName",
+            "the signed snapshot must never be rewritten by a rename"
+        );
+    }
+
+    #[test]
+    fn a_terminal_app_keeps_its_row_with_the_snapshot_name() {
+        let db = db_with_instance();
+        // An app_id the store does not know: resolution is Terminal, which is
+        // detail-free by design (unknown, retired, foreign and deleted are
+        // deliberately indistinguishable), so it carries no current name.
+        let gone = DeviceShareAppId::try_from(format!("app_{:032x}", 0xdead_u128).as_str())
+            .expect("valid shape");
+
+        let rows = active_shares(
+            &db,
+            &projection_with(c2_slot(
+                &gone,
+                "FrozenName",
+                SlotProjectedStatus::Open,
+                9_000,
+                Some(1_000),
+            )),
+            5_000,
+        );
+        assert_eq!(rows.len(), 1, "a dead app must not erase the owner's row");
+        assert_eq!(rows[0].display_name, "FrozenName");
+        assert_eq!(rows[0].readiness, "unavailable");
+    }
+
+    #[test]
+    fn slots_without_a_snapshot_or_without_created_at_are_omitted() {
+        let db = db_with_instance();
+        let app_id = device_id(&db);
+
+        // Group/Public slot: no snapshot, so not an Active Share.
+        let mut legacy = c2_slot(
+            &app_id,
+            "Study",
+            SlotProjectedStatus::Open,
+            9_000,
+            Some(1_000),
+        );
+        legacy.app_presentation = None;
+        assert!(active_shares(&db, &projection_with(legacy), 5_000).is_empty());
+
+        // Presentation-backed but no created_at: corrupt, omitted, never
+        // given an invented timestamp.
+        let corrupt = c2_slot(&app_id, "Study", SlotProjectedStatus::Open, 9_000, None);
+        assert!(active_shares(&db, &projection_with(corrupt), 5_000).is_empty());
+    }
+
+    #[test]
+    fn a_snapshot_naming_another_app_is_omitted_not_resolved() {
+        let db = db_with_instance();
+        let app_id = device_id(&db);
+        db.rename_shareable_app(app_id.as_str(), HOUSEHOLD, "RealApp")
+            .expect("rename");
+
+        // A well-formed snapshot for the REAL app, but the slot's claw_id says
+        // a different one — the shape check alone would let this through and we
+        // would list the real app under a foreign slot's identity.
+        let mut forged = c2_slot(
+            &app_id,
+            "Study",
+            SlotProjectedStatus::Open,
+            9_000,
+            Some(1_000),
+        );
+        forged.claw_id = format!("app_{:032x}", 0xbeef_u128);
+
+        assert!(
+            active_shares(&db, &projection_with(forged), 5_000).is_empty(),
+            "a snapshot that does not describe THIS slot's claw must be omitted"
+        );
+    }
+
+    #[test]
+    fn the_wire_row_carries_no_bearer_material() {
+        let db = db_with_instance();
+        let app_id = device_id(&db);
+        let guest = P256Keypair::generate().public();
+        let rows = active_shares(
+            &db,
+            &projection_with(c2_slot(
+                &app_id,
+                "Study",
+                SlotProjectedStatus::Consumed {
+                    guest_device_pub: guest.clone(),
+                    consumed_at: 2_000,
+                    participant_npub: Some("npub_alice".to_string()),
+                },
+                9_000,
+                Some(1_000),
+            )),
+            5_000,
+        );
+        let encoded = cbor::to_canonical_vec(&ListActiveSharesResponse { v: 1, shares: rows })
+            .expect("encode");
+
+        // The guest key and the bound npub are in the projection this row was
+        // built from; neither may reach the wire, and there is no invite/URI.
+        let guest_bytes = guest.as_bytes();
+        assert!(
+            !encoded
+                .windows(guest_bytes.len())
+                .any(|w| w == guest_bytes.as_slice()),
+            "guest device key must never reach the Active Shares wire"
+        );
+        for forbidden in [b"npub_alice".as_slice(), b"claw-share/invite".as_slice()] {
+            assert!(
+                !encoded.windows(forbidden.len()).any(|w| w == forbidden),
+                "no bearer/participant material on the wire"
+            );
+        }
+    }
+
+    fn db_with_instance() -> InstanceDb {
+        let db = InstanceDb::open(":memory:").expect("open in-memory instance db");
+        db.insert(&instance("inst-app", "study", "picoclaw-study"))
+            .expect("insert instance");
+        db
+    }
+
+    fn device_id(db: &InstanceDb) -> DeviceShareAppId {
+        let binding = db
+            .ensure_shareable_app("inst-app", HOUSEHOLD)
+            .expect("ensure binding");
+        DeviceShareAppId::try_from(binding.app_id.as_str()).expect("valid app id")
+    }
+
+    #[test]
+    fn mint_target_requires_exactly_one_typed_namespace() {
+        assert_eq!(
+            select_mint_target(None, None),
+            Err(MintTargetError::NonePresent)
+        );
+        assert_eq!(
+            select_mint_target(Some("legacy".into()), Some(format!("app_{:032x}", 1))),
+            Err(MintTargetError::BothPresent)
+        );
+        assert_eq!(
+            select_mint_target(Some("   ".into()), None),
+            Err(MintTargetError::ClawIdMalformed)
+        );
+        assert_eq!(
+            select_mint_target(None, Some("inst-study".into())),
+            Err(MintTargetError::AppIdMalformed)
+        );
+        assert!(matches!(
+            select_mint_target(Some("legacy".into()), None),
+            Ok(MintTargetChoice::Legacy(id)) if id == "legacy"
+        ));
+        assert!(matches!(
+            select_mint_target(None, Some(format!("app_{:032x}", 1))),
+            Ok(MintTargetChoice::Device(_))
+        ));
+    }
+
+    #[test]
+    fn list_ensures_once_and_preserves_independent_renames() {
+        let db = InstanceDb::open(":memory:").expect("open in-memory instance db");
+        db.insert(&instance("inst-one", "one", "picoclaw-one"))
+            .unwrap();
+        db.insert(&instance("inst-two", "two", "picoclaw-two"))
+            .unwrap();
+
+        let first = list_shareable_apps_core(&db, HOUSEHOLD).unwrap();
+        assert_eq!(first.len(), 2);
+        assert_ne!(first[0].app_id, first[1].app_id);
+        for app in &first {
+            let app_id = DeviceShareAppId::try_from(app.app_id.as_str()).unwrap();
+            rename_shareable_app_core(&db, &app_id, HOUSEHOLD, "Study").unwrap();
+        }
+
+        let second = list_shareable_apps_core(&db, HOUSEHOLD).unwrap();
+        assert_eq!(second.len(), 2);
+        assert!(second.iter().all(|app| app.display_name == "Study"));
+        assert_eq!(
+            first
+                .iter()
+                .map(|app| &app.app_id)
+                .collect::<std::collections::BTreeSet<_>>(),
+            second
+                .iter()
+                .map(|app| &app.app_id)
+                .collect::<std::collections::BTreeSet<_>>(),
+            "list read-through must not remint or resync renamed bindings",
+        );
+        assert!(second.iter().all(|app| app.resource == "clawsite"));
+    }
+
+    #[test]
+    fn rename_is_household_scoped_and_fail_closed() {
+        let db = db_with_instance();
+        let app_id = device_id(&db);
+        assert!(matches!(
+            rename_shareable_app_core(&db, &app_id, "hh_foreign", "Nope"),
+            Err(store_rs::StoreError::InstanceNotFound)
+        ));
+        rename_shareable_app_core(&db, &app_id, HOUSEHOLD, "Current Name").unwrap();
+        let listed = list_shareable_apps_core(&db, HOUSEHOLD).unwrap();
+        assert_eq!(listed[0].display_name, "Current Name");
+    }
+
+    #[test]
+    fn stopped_app_mints_the_signed_snapshot_from_binding_and_person_cert() {
+        let db = db_with_instance();
+        let app_id = device_id(&db);
+        rename_shareable_app_core(&db, &app_id, HOUSEHOLD, "Study App").unwrap();
+        db.update_status(&StatusUpdate {
+            id: "inst-app",
+            status: InstanceStatus::Stopped,
+            message: "",
+            error: "",
+            job_id: "",
+            phase: "",
+        })
+        .unwrap();
+
+        let (claw_id, presentation) =
+            resolve_mint_app_core(&db, &app_id, HOUSEHOLD, "Caio").unwrap();
+        assert_eq!(claw_id, app_id.as_str());
+        assert_eq!(presentation.app_id, app_id.as_str());
+        assert_eq!(presentation.display_name, "Study App");
+        assert_eq!(presentation.owner_display_name, "Caio");
+    }
+
+    #[test]
+    fn retired_or_foreign_binding_is_terminal_and_never_reensured() {
+        let db = db_with_instance();
+        let app_id = device_id(&db);
+        assert!(matches!(
+            resolve_mint_app_core(&db, &app_id, "hh_foreign", "Caio"),
+            Err(MintAppCoreError::Terminal)
+        ));
+
+        db.soft_delete("inst-app").unwrap();
+        assert!(matches!(
+            resolve_mint_app_core(&db, &app_id, HOUSEHOLD, "Caio"),
+            Err(MintAppCoreError::Terminal)
+        ));
+        assert!(matches!(
+            db.ensure_shareable_app("inst-app", HOUSEHOLD),
+            Err(store_rs::StoreError::InstanceNotFound)
+        ));
+    }
+
+    #[test]
+    fn invalid_owner_presentation_is_an_error_not_a_panic() {
+        let db = db_with_instance();
+        let app_id = device_id(&db);
+        assert!(matches!(
+            resolve_mint_app_core(&db, &app_id, HOUSEHOLD, &"x".repeat(129)),
+            Err(MintAppCoreError::InvalidPresentation)
+        ));
+    }
+
+    #[test]
+    fn mint_event_carries_the_exact_optional_snapshot() {
+        let (store, invite) = invite_and_slot();
+        let presentation =
+            ShareableAppPresentation::try_new(format!("app_{:032x}", 7), "Study", "Caio").unwrap();
+        let event = mint_event_for_invite(&invite, Some(presentation.clone()));
+        match event {
+            MeshEvent::ClawShareSlotMinted {
+                slot_id,
+                claw_id,
+                app_presentation,
+                ..
+            } => {
+                assert_eq!(slot_id, invite.slot_id);
+                assert_eq!(claw_id, invite.claw_id);
+                assert_eq!(app_presentation, Some(presentation));
+            }
+            _ => panic!("mint helper must build ClawShareSlotMinted"),
+        }
+        assert!(matches!(
+            store.get(&invite.slot_id).unwrap().state,
+            SlotState::Open
+        ));
+    }
+
+    #[test]
+    fn append_failure_revokes_the_inserted_slot() {
+        let (store, invite) = invite_and_slot();
+        let event = mint_event_for_invite(&invite, None);
+        assert_eq!(
+            finalize_mint_with_append(&store, &invite, event, |_| Err(()), 1_800_000_001),
+            Err(FinalizeError::AppendFailed)
+        );
+        assert!(matches!(
+            store.get(&invite.slot_id).unwrap().state,
+            SlotState::Revoked {
+                revoked_at: 1_800_000_001,
+                accepted_at: None
+            }
+        ));
+    }
+
+    /// The end-to-end idempotence property: revoking twice must leave ONE
+    /// durable event, because the handler re-signs with the canonical timestamp
+    /// and `entry_id` digests (timestamp, event, issuer) — not the signature.
+    /// A fresh `now` on the second call must not produce a second entry.
+    #[test]
+    fn revoking_twice_appends_exactly_one_log_entry() {
+        let (store, invite) = invite_and_slot();
+        let owner = P256Keypair::from_secret_scalar(&[0x31; 32]).unwrap();
+        let log = MeshLogStore::new();
+
+        // Drives the SAME core the handler calls. Re-implementing the
+        // build+append here would let a handler that signs with `now` pass.
+        for now in [1_800_000_001_u64, 1_900_000_999] {
+            revoke_slot_core(&store, &log, &owner, &invite.slot_id, now)
+                .expect("both revocations must succeed");
+        }
+
+        assert_eq!(
+            log.snapshot()
+                .iter()
+                .filter(|e| matches!(e.event, MeshEvent::ClawShareSlotRevoked { .. }))
+                .count(),
+            1,
+            "a second revoke must not add a second durable revocation"
+        );
+        assert!(matches!(
+            store.get(&invite.slot_id).unwrap().state,
+            SlotState::Revoked {
+                revoked_at: 1_800_000_001,
+                accepted_at: None
+            }
+        ));
+    }
+
+    /// Retry after a FAILED append must still persist — and with the original
+    /// timestamp, so the entry is the one the first attempt would have written.
+    #[test]
+    fn retry_after_a_failed_append_persists_with_the_original_timestamp() {
+        let (store, invite) = invite_and_slot();
+        let owner = P256Keypair::from_secret_scalar(&[0x31; 32]).unwrap();
+        let log = MeshLogStore::new();
+
+        // A CONSUMED slot, so the seam closes `accepted_at` as well as the
+        // timestamp: a rollback that restored the previous state, or an error
+        // arm that cleared the acceptance, both become visible.
+        let guest = P256Keypair::generate();
+        store
+            .consume_atomic(
+                &invite.slot_id,
+                &invite.claw_id,
+                guest.public(),
+                1_750_000_000,
+            )
+            .expect("slot accepted before revoke");
+
+        // FIRST attempt: the append genuinely fails at the seam the production
+        // core uses. Skipping the call instead would not distinguish "kept the
+        // revoke and reported failure" from "rolled the slot back".
+        let mut seen_timestamp = None;
+        let failed = revoke_slot_with_append(
+            &store,
+            &invite.slot_id,
+            1_800_000_001,
+            |revoked_at, _event| {
+                seen_timestamp = Some(revoked_at);
+                Err(ClawShareError::SlotNotFound)
+            },
+        );
+        assert!(matches!(failed, Err(RevokeCoreError::LogPersistFailed(_))));
+        assert_eq!(seen_timestamp, Some(1_800_000_001));
+        assert!(log.snapshot().is_empty(), "nothing may have persisted");
+        // The revoke MUST stand, at the canonical timestamp AND still carrying
+        // the acceptance. A rollback to the previous state, or an error arm
+        // that cleared `accepted_at`, breaks this.
+        let expected = SlotState::Revoked {
+            revoked_at: 1_800_000_001,
+            accepted_at: Some(1_750_000_000),
+        };
+        assert_eq!(store.get(&invite.slot_id).unwrap().state, expected);
+
+        // RETRY through the real production core, on a LATER clock: it must
+        // persist, and carry the ORIGINAL timestamp rather than the retry's.
+        revoke_slot_core(&store, &log, &owner, &invite.slot_id, 1_900_000_999)
+            .expect("the retry must persist");
+        assert_eq!(log.snapshot().len(), 1);
+        assert_eq!(log.snapshot()[0].timestamp, 1_800_000_001);
+        // ...and both halves are unchanged after the successful retry.
+        assert_eq!(store.get(&invite.slot_id).unwrap().state, expected);
+    }
+
+    fn invite_and_slot() -> (ClawShareSlotStore, ClawShareInvite) {
+        let owner = P256Keypair::from_secret_scalar(&[0x31; 32]).unwrap();
+        let household_id = derive_household_id(&owner.public());
+        let slot_id = SlotId::random();
+        let invite = ClawShareInvite::sign(
+            household_id,
+            PersonId(format!("p_{}", "a".repeat(52))),
+            owner.public(),
+            "legacy".into(),
+            slot_id.clone(),
+            TunnelHandle::Loopback {
+                channel: "test".into(),
+            },
+            1_800_000_900,
+            "relay-npub".into(),
+            vec!["wss://relay.invalid".into()],
+            &owner,
+        )
+        .unwrap();
+        let store = ClawShareSlotStore::new();
+        store
+            .insert(SlotRecord {
+                slot_id,
+                claw_id: invite.claw_id.clone(),
+                expires_at: invite.expires_at,
+                state: SlotState::Open,
+                app_presentation: None,
+                created_at: None,
+            })
+            .unwrap();
+        (store, invite)
+    }
 }
 
 #[cfg(test)]
@@ -2905,6 +4279,7 @@ mod relay_offer_tests {
             state_dir,
             relay_offer_challenges: Arc::new(RelayOfferChallengeTable::new()),
             relay_offer_abuse: Arc::new(std::sync::Mutex::new(RelayAbuseState::default())),
+            shared_state: None,
         }
     }
 

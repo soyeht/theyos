@@ -461,6 +461,23 @@ async fn main() {
                 tokio::time::sleep(std::time::Duration::from_secs(5)).await;
             }
 
+            // Re-apply public site targets now that the restarted VMs are
+            // back up, then regenerate the cloudflared config. Without this,
+            // every macOS public site points at its pre-reboot IP after a
+            // host restart (502s) until someone manually adds/removes a
+            // domain — the startup sync at boot ran BEFORE the VMs came up.
+            for (instance_id, container, _, _) in &previously_active {
+                if let Err(e) =
+                    server_rs::public_sites::ensure_public_site_targets_for_instance(&st, instance_id)
+                        .await
+                {
+                    tracing::warn!(
+                        "[startup] public site target refresh failed for {container}: {e}"
+                    );
+                }
+            }
+            server_rs::cloudflared_sync::sync_cloudflared_config(&st).await;
+
             tracing::info!(
                 "[startup] auto-restart complete ({} instance(s))",
                 previously_active.len()

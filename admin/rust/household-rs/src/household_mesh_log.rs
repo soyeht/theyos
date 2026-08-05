@@ -44,6 +44,15 @@ pub enum MeshEvent {
         slot_id: SlotId,
         claw_id: String,
         expires_at: u64,
+        /// Slice B (ADDITIVE). Stable Share app presentation captured at mint
+        /// time — a durable snapshot so the claim path never recomputes it.
+        /// Omitted (`None`) on the wire for legacy mints, byte-identical to
+        /// pre-4A events. `Some(_)` is set only by the `_with_presentation`
+        /// helpers; product callers pass `None` until 4B wires it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        app_presentation: Option<
+            crate::claw_share_relay_stream_contract::ShareableAppPresentation,
+        >,
     },
     /// Owner revoked a claw-share slot. **Wins** against any prior or
     /// concurrent `ClawShareSlotMinted` or `ClawShareSlotConsumed` for
@@ -345,6 +354,13 @@ pub struct ProjectedSlot {
     pub claw_id: String,
     pub expires_at: u64,
     pub status: SlotProjectedStatus,
+    pub app_presentation:
+        Option<crate::claw_share_relay_stream_contract::ShareableAppPresentation>,
+    /// `entry.timestamp` of the `ClawShareSlotMinted` event. `None` when the
+    /// mint was never observed — the two out-of-order arms below synthesize a
+    /// slot from a consume or a revoke and genuinely do not know when it was
+    /// created. Never guessed from the observing event's timestamp.
+    pub created_at: Option<u64>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -365,6 +381,10 @@ pub enum SlotProjectedStatus {
         /// name the npub to drop. `None` when the slot was revoked while still
         /// open (no consume), or when the consume bound no mesh identity.
         participant_npub: Option<String>,
+        /// `consumed_at` of the consume this revoke superseded, preserved so the
+        /// owner surface can still report whether and when the share was
+        /// accepted after it was revoked. `None` when revoked while still Open.
+        accepted_at: Option<u64>,
     },
 }
 
@@ -550,12 +570,16 @@ impl ProjectedState {
                     slot_id,
                     claw_id,
                     expires_at,
+                    app_presentation,
                 } => {
                     state.slots.entry(slot_id.clone()).or_insert(ProjectedSlot {
                         slot_id: slot_id.clone(),
                         claw_id: claw_id.clone(),
                         expires_at: *expires_at,
                         status: SlotProjectedStatus::Open,
+                        app_presentation: app_presentation.clone(),
+                        // The one arm that actually knows: this IS the mint.
+                        created_at: Some(entry.timestamp),
                     });
                 }
                 MeshEvent::ClawShareSlotConsumed {
@@ -575,6 +599,10 @@ impl ProjectedState {
                         claw_id: claw_id.clone(),
                         expires_at: *expires_at,
                         status: SlotProjectedStatus::Open,
+                        app_presentation: None,
+                        // Consume seen before its mint: the mint timestamp is
+                        // unknown, and this event's is an over-estimate.
+                        created_at: None,
                     });
                     if matches!(slot.status, SlotProjectedStatus::Open) {
                         slot.status = SlotProjectedStatus::Consumed {
@@ -635,16 +663,34 @@ impl ProjectedState {
                     if let Some(slot) = state.slots.get_mut(slot_id) {
                         // Preserve the bound consume npub (if any) on the Revoked
                         // status so the deny-list (routing hygiene) can name the
-                        // npub to drop — the projection otherwise loses it.
-                        let participant_npub = match &slot.status {
+                        // npub to drop — the projection otherwise loses it, and
+                        // `accepted_at` for the same reason on the owner surface.
+                        //
+                        // `order` is ascending, so the FIRST revoke wins and any
+                        // later duplicate is a no-op: it must not move
+                        // `revoked_at` nor drop what the first one preserved.
+                        // That also heals logs that already carry duplicates.
+                        let (participant_npub, accepted_at, revoked_at) = match &slot.status {
                             SlotProjectedStatus::Consumed {
-                                participant_npub, ..
-                            } => participant_npub.clone(),
-                            _ => None,
+                                participant_npub,
+                                consumed_at,
+                                ..
+                            } => (
+                                participant_npub.clone(),
+                                Some(*consumed_at),
+                                entry.timestamp,
+                            ),
+                            SlotProjectedStatus::Revoked {
+                                participant_npub,
+                                accepted_at,
+                                revoked_at,
+                            } => (participant_npub.clone(), *accepted_at, *revoked_at),
+                            SlotProjectedStatus::Open => (None, None, entry.timestamp),
                         };
                         slot.status = SlotProjectedStatus::Revoked {
-                            revoked_at: entry.timestamp,
+                            revoked_at,
                             participant_npub,
+                            accepted_at,
                         };
                     } else {
                         // A revoke arrived before the mint event in the
@@ -661,7 +707,12 @@ impl ProjectedState {
                                 status: SlotProjectedStatus::Revoked {
                                     revoked_at: entry.timestamp,
                                     participant_npub: None,
+                                    accepted_at: None,
                                 },
+                                app_presentation: None,
+                                // The mint was never observed, so the creation
+                                // time is genuinely unknown here.
+                                created_at: None,
                             },
                         );
                     }
@@ -1138,6 +1189,7 @@ pub fn build_slot_revoke_event(
 }
 
 /// Helper: mint a signed `ClawShareSlotMinted` event ready to append.
+/// Legacy wrapper — no app presentation (durable snapshot stays `None`).
 pub fn build_slot_mint_event(
     slot_id: SlotId,
     claw_id: String,
@@ -1146,6 +1198,33 @@ pub fn build_slot_mint_event(
     issuer_pub: P256PublicKey,
     issuer_key: &dyn IdentityKey,
 ) -> Result<LogEntry, MeshLogError> {
+    build_slot_mint_event_with_presentation(
+        slot_id,
+        claw_id,
+        expires_at,
+        timestamp,
+        issuer_pub,
+        issuer_key,
+        None,
+    )
+}
+
+/// Helper: mint a signed `ClawShareSlotMinted` event carrying a Share app
+/// presentation snapshot. The snapshot is captured HERE (mint time) and
+/// persisted in the log; the claim path reads it from the projection —
+/// never recomputed.
+#[allow(clippy::too_many_arguments)]
+pub fn build_slot_mint_event_with_presentation(
+    slot_id: SlotId,
+    claw_id: String,
+    expires_at: u64,
+    timestamp: u64,
+    issuer_pub: P256PublicKey,
+    issuer_key: &dyn IdentityKey,
+    app_presentation: Option<
+        crate::claw_share_relay_stream_contract::ShareableAppPresentation,
+    >,
+) -> Result<LogEntry, MeshLogError> {
     LogEntry::sign(
         timestamp,
         issuer_pub,
@@ -1153,6 +1232,7 @@ pub fn build_slot_mint_event(
             slot_id,
             claw_id,
             expires_at,
+            app_presentation,
         },
         issuer_key,
     )
@@ -1449,6 +1529,171 @@ mod tests {
 
     fn mint(key: &P256Keypair, ts: u64, event: MeshEvent) -> LogEntry {
         LogEntry::sign(ts, key.public(), event, key as &dyn IdentityKey).expect("sign")
+    }
+
+    // ── Slice C1: created_at + revoke idempotence in the projection ──────────
+
+    #[test]
+    fn projected_created_at_comes_from_the_mint_entry_only() {
+        let owner = P256Keypair::generate();
+        let minted = SlotId::random();
+        let orphan_consume = SlotId::random();
+        let orphan_revoke = SlotId::random();
+        let entries = vec![
+            mint(
+                &owner,
+                1_000,
+                MeshEvent::ClawShareSlotMinted {
+                    slot_id: minted.clone(),
+                    claw_id: "claw_a".to_string(),
+                    expires_at: 5_000,
+                    app_presentation: None,
+                },
+            ),
+            // Consume with no mint in view, and revoke with no mint in view.
+            mint(
+                &owner,
+                1_100,
+                MeshEvent::ClawShareSlotConsumed {
+                    slot_id: orphan_consume.clone(),
+                    claw_id: "claw_b".to_string(),
+                    expires_at: 5_000,
+                    guest_device_pub: P256Keypair::generate().public(),
+                    participant_npub: None,
+                },
+            ),
+            mint(
+                &owner,
+                1_200,
+                MeshEvent::ClawShareSlotRevoked {
+                    slot_id: orphan_revoke.clone(),
+                },
+            ),
+        ];
+        let state = ProjectedState::project(&entries);
+
+        assert_eq!(
+            state.slots[&minted].created_at,
+            Some(1_000),
+            "the mint entry's own timestamp is the creation time"
+        );
+        // The observing event's timestamp is NOT the creation time, and
+        // inventing one would be indistinguishable from a real value.
+        assert_eq!(state.slots[&orphan_consume].created_at, None);
+        assert_eq!(state.slots[&orphan_revoke].created_at, None);
+        // Non-vacuity: created_at must not be aliasing expires_at.
+        assert_ne!(
+            state.slots[&minted].created_at,
+            Some(state.slots[&minted].expires_at)
+        );
+    }
+
+    #[test]
+    fn duplicate_revokes_keep_the_first_timestamp_and_what_it_preserved() {
+        let owner = P256Keypair::generate();
+        let guest = P256Keypair::generate().public();
+        let slot = SlotId::random();
+        let entries = vec![
+            mint(
+                &owner,
+                1_000,
+                MeshEvent::ClawShareSlotMinted {
+                    slot_id: slot.clone(),
+                    claw_id: "claw_a".to_string(),
+                    expires_at: 9_000,
+                    app_presentation: None,
+                },
+            ),
+            mint(
+                &owner,
+                2_000,
+                MeshEvent::ClawShareSlotConsumed {
+                    slot_id: slot.clone(),
+                    claw_id: "claw_a".to_string(),
+                    expires_at: 9_000,
+                    guest_device_pub: guest.clone(),
+                    participant_npub: Some("npub_alice".to_string()),
+                },
+            ),
+            mint(
+                &owner,
+                3_000,
+                MeshEvent::ClawShareSlotRevoked {
+                    slot_id: slot.clone(),
+                },
+            ),
+            // A duplicate revoke, LATER. It must be inert — this is also what
+            // heals logs that already carry duplicates.
+            mint(
+                &owner,
+                4_000,
+                MeshEvent::ClawShareSlotRevoked {
+                    slot_id: slot.clone(),
+                },
+            ),
+        ];
+        let state = ProjectedState::project(&entries);
+
+        assert_eq!(
+            state.slots[&slot].status,
+            SlotProjectedStatus::Revoked {
+                revoked_at: 3_000,
+                participant_npub: Some("npub_alice".to_string()),
+                accepted_at: Some(2_000),
+            },
+            "first revoke wins; the second must not move revoked_at nor drop \
+             accepted_at/participant_npub"
+        );
+        assert_eq!(state.slots[&slot].created_at, Some(1_000));
+    }
+
+    #[test]
+    fn replay_carries_created_at_and_accepted_at_into_the_slot_store() {
+        let owner = P256Keypair::generate();
+        let guest = P256Keypair::generate().public();
+        let slot = SlotId::random();
+        let entries = vec![
+            mint(
+                &owner,
+                1_000,
+                MeshEvent::ClawShareSlotMinted {
+                    slot_id: slot.clone(),
+                    claw_id: "claw_a".to_string(),
+                    expires_at: 9_000,
+                    app_presentation: None,
+                },
+            ),
+            mint(
+                &owner,
+                2_000,
+                MeshEvent::ClawShareSlotConsumed {
+                    slot_id: slot.clone(),
+                    claw_id: "claw_a".to_string(),
+                    expires_at: 9_000,
+                    guest_device_pub: guest,
+                    participant_npub: None,
+                },
+            ),
+            mint(
+                &owner,
+                3_000,
+                MeshEvent::ClawShareSlotRevoked {
+                    slot_id: slot.clone(),
+                },
+            ),
+        ];
+        let state = ProjectedState::project(&entries);
+        let store = crate::claw_share::ClawShareSlotStore::seeded_from(&state);
+        let record = store.get(&slot).expect("slot rehydrates");
+
+        assert_eq!(record.created_at, Some(1_000));
+        assert_eq!(
+            record.state,
+            crate::claw_share::SlotState::Revoked {
+                revoked_at: 3_000,
+                accepted_at: Some(2_000),
+            }
+        );
     }
 
     // ── Fase E1: first-class group + member-device projection ────────────────
@@ -1968,6 +2213,7 @@ mod tests {
                 slot_id: SlotId::random(),
                 claw_id: "claw_a".to_string(),
                 expires_at: 2_000,
+                app_presentation: None,
             },
         );
         entry.verify().expect("verify");
@@ -1983,6 +2229,7 @@ mod tests {
                 slot_id: SlotId::random(),
                 claw_id: "claw_a".to_string(),
                 expires_at: 2_000,
+                app_presentation: None,
             },
         );
         // Change a body field — entry_id and signature both invalidate.
@@ -2003,6 +2250,7 @@ mod tests {
                 slot_id: slot_a.clone(),
                 claw_id: "claw_a".to_string(),
                 expires_at: 5_000,
+                app_presentation: None,
             },
         );
         let mint_b = mint(
@@ -2012,6 +2260,7 @@ mod tests {
                 slot_id: slot_b.clone(),
                 claw_id: "claw_b".to_string(),
                 expires_at: 5_000,
+                app_presentation: None,
             },
         );
         let consume_a = mint(
@@ -2052,6 +2301,7 @@ mod tests {
                 slot_id: slot_a.clone(),
                 claw_id: "claw_a".to_string(),
                 expires_at: 5_000,
+                app_presentation: None,
             },
         );
         let revoke_evt = mint(
@@ -2092,6 +2342,7 @@ mod tests {
                 slot_id: SlotId::random(),
                 claw_id: "claw_d".to_string(),
                 expires_at: 2_000,
+                app_presentation: None,
             },
         );
         let store = MeshLogStore::new();
@@ -2110,6 +2361,7 @@ mod tests {
                 slot_id: SlotId::random(),
                 claw_id: "claw_d".to_string(),
                 expires_at: 2_000,
+                app_presentation: None,
             },
         );
         entry.timestamp = 9_999;
@@ -2142,6 +2394,7 @@ mod tests {
                 slot_id: slot_id.clone(),
                 claw_id: "claw_g".to_string(),
                 expires_at: 5_000,
+                app_presentation: None,
             },
         );
         let revoke_evt = mint(
@@ -2206,6 +2459,7 @@ mod tests {
                     slot_id: slot_id.clone(),
                     claw_id: "claw_persist".to_string(),
                     expires_at: 5_000,
+                    app_presentation: None,
                 },
             );
             store.append(entry).expect("append");
@@ -2243,6 +2497,7 @@ mod tests {
                         slot_id: slot_id.clone(),
                         claw_id: "claw_r".to_string(),
                         expires_at: 5_000,
+                        app_presentation: None,
                     },
                 ))
                 .expect("mint");
@@ -2290,6 +2545,7 @@ mod tests {
                         slot_id: slot_id.clone(),
                         claw_id: "claw_c".to_string(),
                         expires_at: 5_000,
+                        app_presentation: None,
                     },
                 ))
                 .expect("mint");
@@ -2331,6 +2587,7 @@ mod tests {
                 slot_id: SlotId::random(),
                 claw_id: "claw_a".to_string(),
                 expires_at: 5_000,
+                app_presentation: None,
             },
         );
         let e2 = mint(
@@ -2363,6 +2620,7 @@ mod tests {
                 slot_id: SlotId::random(),
                 claw_id: "claw_a".to_string(),
                 expires_at: 5_000,
+                app_presentation: None,
             },
         );
         let store_a = MeshLogStore::new();
@@ -2786,5 +3044,155 @@ mod tests {
             log.project().shares_for_guest(alice.as_bytes(), now),
             shares
         );
+    }
+
+    // ── Slice B step 4A: durable app presentation snapshot ────────────────
+
+    use crate::claw_share::ClawShareSlotStore;
+    use crate::claw_share_relay_stream_contract::ShareableAppPresentation;
+
+    const APP_ID: &str = "app_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+
+    // Pinned canonical CBOR hex of a ClawShareSlotMinted EVENT (not LogEntry)
+    // extracted from the clean parent 82019f5b with slot [0x42;16],
+    // claw_id APP_ID, expires_at 1_700_000_000. A 4A event with
+    // app_presentation=None MUST produce byte-identical bytes.
+    const LEGACY_MINTED_EVENT_HEX: &str = "a4646b696e6476636c61775f73686172655f736c6f745f6d696e74656467636c61775f696478246170705f616161616161616161616161616161616161616161616161616161616161616167736c6f745f696450424242424242424242424242424242426a657870697265735f61741a6553f100";
+
+    fn test_presentation() -> ShareableAppPresentation {
+        ShareableAppPresentation::try_new(APP_ID.to_string(), "Study", "Caio").unwrap()
+    }
+
+    #[test]
+    fn slot_minted_without_presentation_is_byte_identical_to_legacy() {
+        // A 4A event with app_presentation=None must produce the EXACT same
+        // canonical CBOR as a pre-4A event. This is the merge-gate: the
+        // skip_serializing_if makes the key vanish from the wire.
+        let event = MeshEvent::ClawShareSlotMinted {
+            slot_id: SlotId([0x42; 16]),
+            claw_id: APP_ID.to_string(),
+            expires_at: 1_700_000_000,
+            app_presentation: None,
+        };
+        let hex_actual = hex::encode(cbor::to_canonical_vec(&event).unwrap());
+        assert_eq!(
+            hex_actual, LEGACY_MINTED_EVENT_HEX,
+            "a None-presentation event must be byte-identical to pre-4A"
+        );
+    }
+
+    #[test]
+    fn slot_minted_with_presentation_round_trips() {
+        let event = MeshEvent::ClawShareSlotMinted {
+            slot_id: SlotId([0x42; 16]),
+            claw_id: APP_ID.to_string(),
+            expires_at: 1_700_000_000,
+            app_presentation: Some(test_presentation()),
+        };
+        let bytes = cbor::to_canonical_vec(&event).unwrap();
+        let decoded: MeshEvent = cbor::from_canonical_slice(&bytes).unwrap();
+        assert_eq!(decoded, event);
+    }
+
+    #[test]
+    fn projection_preserves_app_presentation_from_mint() {
+        let entry = build_slot_mint_event_with_presentation(
+            SlotId([0x42; 16]),
+            APP_ID.to_string(),
+            1_700_000_000,
+            1_600_000_000,
+            P256Keypair::from_secret_scalar(&[0x11; 32]).unwrap().public(),
+            &P256Keypair::from_secret_scalar(&[0x11; 32]).unwrap(),
+            Some(test_presentation()),
+        )
+        .unwrap();
+        let state = ProjectedState::project(std::slice::from_ref(&entry));
+        let slot = state.slots.get(&SlotId([0x42; 16])).unwrap();
+        assert_eq!(slot.app_presentation.as_ref().unwrap().app_id, APP_ID);
+    }
+
+    #[test]
+    fn seeded_from_reidrates_app_presentation() {
+        let keypair = P256Keypair::from_secret_scalar(&[0x11; 32]).unwrap();
+        let entry = build_slot_mint_event_with_presentation(
+            SlotId([0x42; 16]),
+            APP_ID.to_string(),
+            1_700_000_000,
+            1_600_000_000,
+            keypair.public(),
+            &keypair,
+            Some(test_presentation()),
+        )
+        .unwrap();
+        let state = ProjectedState::project(std::slice::from_ref(&entry));
+        let store = ClawShareSlotStore::seeded_from(&state);
+        let record = store.get(&SlotId([0x42; 16])).unwrap();
+        assert!(record.app_presentation.is_some());
+        assert_eq!(
+            record.app_presentation.as_ref().unwrap().display_name,
+            "Study"
+        );
+    }
+
+    #[test]
+    fn consume_does_not_overwrite_app_presentation() {
+        let keypair = P256Keypair::from_secret_scalar(&[0x11; 32]).unwrap();
+        let mint = build_slot_mint_event_with_presentation(
+            SlotId([0x42; 16]),
+            APP_ID.to_string(),
+            1_700_000_000,
+            1_600_000_000,
+            keypair.public(),
+            &keypair,
+            Some(test_presentation()),
+        )
+        .unwrap();
+        let consume = build_slot_consume_event(
+            SlotId([0x42; 16]),
+            P256Keypair::from_secret_scalar(&[0x33; 32]).unwrap().public(),
+            APP_ID.to_string(),
+            1_700_000_000,
+            None,
+            1_600_000_001,
+            keypair.public(),
+            &keypair,
+        )
+        .unwrap();
+        let state = ProjectedState::project(&[mint, consume]);
+        let slot = state.slots.get(&SlotId([0x42; 16])).unwrap();
+        assert_eq!(slot.app_presentation.as_ref().unwrap().app_id, APP_ID);
+    }
+
+    #[test]
+    fn legacy_slot_without_presentation_projects_none() {
+        let keypair = P256Keypair::from_secret_scalar(&[0x11; 32]).unwrap();
+        let entry = build_slot_mint_event(
+            SlotId([0x42; 16]),
+            APP_ID.to_string(),
+            1_700_000_000,
+            1_600_000_000,
+            keypair.public(),
+            &keypair,
+        )
+        .unwrap();
+        let state = ProjectedState::project(std::slice::from_ref(&entry));
+        let slot = state.slots.get(&SlotId([0x42; 16])).unwrap();
+        assert!(slot.app_presentation.is_none());
+    }
+
+    #[test]
+    fn pre_4a_event_decodes_with_default_none() {
+        // Decode the PINNED pre-4A hex literal — no app_presentation key on
+        // the wire. serde default must hydrate it as None without error.
+        let bytes = hex::decode(LEGACY_MINTED_EVENT_HEX).unwrap();
+        let decoded: MeshEvent = cbor::from_canonical_slice(&bytes).unwrap();
+        match decoded {
+            MeshEvent::ClawShareSlotMinted {
+                app_presentation, ..
+            } => {
+                assert!(app_presentation.is_none());
+            }
+            other => panic!("expected ClawShareSlotMinted, got {other:?}"),
+        }
     }
 }

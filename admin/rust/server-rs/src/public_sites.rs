@@ -286,18 +286,19 @@ pub async fn ensure_public_site_targets_for_instance(
 ) -> Result<(), ApiError> {
     let st = state.clone();
     let iid = instance_id.to_string();
-    blocking(move || -> Result<(), ApiError> {
+    let refreshed = blocking(move || -> Result<usize, ApiError> {
         let Some(inst) = st.instance_db.get(&iid).map_err(ApiError::from)? else {
-            return Ok(());
+            return Ok(0);
         };
         if inst.status != InstanceStatus::Active {
-            return Ok(());
+            return Ok(0);
         }
         let sites = st
             .instance_db
             .list_public_sites_for_instance(&iid)
             .map_err(ApiError::from)?;
 
+        let mut refreshed = 0usize;
         for site in sites.into_iter().filter(|site| site.enabled) {
             let guest_port = u16::try_from(site.guest_port)
                 .map_err(|_| ApiError::internal("stored public site guest_port is invalid"))?;
@@ -327,10 +328,20 @@ pub async fn ensure_public_site_targets_for_instance(
                     enabled: true,
                 })
                 .map_err(ApiError::from)?;
+            refreshed += 1;
         }
-        Ok(())
+        Ok(refreshed)
     })
-    .await?
+    .await??;
+
+    // A refreshed target can point at a different vm_ip (macOS DHCP across
+    // restarts); regenerate the cloudflared config so a UI-driven restart
+    // can't leave every site 502-ing until someone manually adds/removes a
+    // domain. No-op when cloudflared isn't configured on this host.
+    if refreshed > 0 {
+        crate::cloudflared_sync::sync_cloudflared_config(state).await;
+    }
+    Ok(())
 }
 
 /// Create the matching CNAME for a freshly upserted public site, if the

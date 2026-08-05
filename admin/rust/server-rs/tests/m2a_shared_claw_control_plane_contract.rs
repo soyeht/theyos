@@ -23,6 +23,8 @@ use tower::ServiceExt;
 
 const INVITE_TO_CLAW_PATH: &str = "/api/v1/claw-share/invite-to-claw";
 const GROUP_OP_PATH: &str = "/api/v1/claw-share/group-op";
+const SHAREABLE_APPS_PATH: &str = "/api/v1/household/shareable-apps";
+const ACTIVE_SHARES_PATH: &str = "/api/v1/claw-share/shares";
 const GROUP_ID: &str = "m2a_group";
 const CLAW_A: &str = "m2a_claw_a";
 const CLAW_B: &str = "m2a_claw_b";
@@ -81,6 +83,7 @@ fn fixture() -> Fixture {
         state_dir: state_dir.path().to_path_buf(),
         relay_offer_challenges: Arc::new(RelayOfferChallengeTable::new()),
         relay_offer_abuse: Arc::new(std::sync::Mutex::new(RelayAbuseState::default())),
+        shared_state: None,
     });
     Fixture {
         app,
@@ -90,9 +93,9 @@ fn fixture() -> Fixture {
     }
 }
 
-fn owner_pop(owner: &P256Keypair, path: &str, body: &[u8]) -> String {
+fn owner_pop_for_method(owner: &P256Keypair, method: &str, path: &str, body: &[u8]) -> String {
     let timestamp = unix_now();
-    let context = RequestSigningContext::new("POST", path, timestamp, body);
+    let context = RequestSigningContext::new(method, path, timestamp, body);
     let signature = owner
         .sign(
             &context
@@ -106,6 +109,10 @@ fn owner_pop(owner: &P256Keypair, path: &str, body: &[u8]) -> String {
         timestamp,
         B64URL.encode(signature.as_bytes())
     )
+}
+
+fn owner_pop(owner: &P256Keypair, path: &str, body: &[u8]) -> String {
+    owner_pop_for_method(owner, "POST", path, body)
 }
 
 async fn post_owner_cbor(
@@ -435,6 +442,89 @@ async fn m2a_owner_pop_invite_rejects_cross_claw_scope_without_effect() {
         invite_body(&binding_two.member_id, "member two", CLAW_B),
     )
     .await;
+}
+
+/// C2: proves the Active Shares route is actually MOUNTED at this path and
+/// method and sits behind owner auth — the core unit tests cannot show any of
+/// that. Reaching the 503 means routing + method + `HouseholdInvite` all
+/// resolved; a missing route would 404 and a rejected PoP would 401.
+#[tokio::test]
+async fn active_shares_list_is_mounted_and_fails_closed_without_shared_state() {
+    let Fixture {
+        app,
+        owner,
+        _state_dir,
+        ..
+    } = fixture();
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(ACTIVE_SHARES_PATH)
+                .header(
+                    header::AUTHORIZATION,
+                    owner_pop_for_method(&owner, "GET", ACTIVE_SHARES_PATH, &[]),
+                )
+                .body(Body::empty())
+                .expect("build active-shares list request"),
+        )
+        .await
+        .expect("active-shares list response");
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let body = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("read active-shares error body");
+    let error: ErrorEnvelope = household_rs::cbor::from_canonical_slice(&body)
+        .expect("canonical CBOR active-shares error envelope");
+    assert_eq!(error.version, 1);
+    assert_eq!(error.code, "share_apps_unavailable");
+
+    // Non-vacuity: without owner PoP the same route rejects, so the 503 above
+    // was reached THROUGH the auth gate rather than around it.
+    let unauthenticated = app
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(ACTIVE_SHARES_PATH)
+                .body(Body::empty())
+                .expect("build unauthenticated request"),
+        )
+        .await
+        .expect("unauthenticated response");
+    assert_eq!(unauthenticated.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn shareable_apps_list_fails_closed_without_shared_state() {
+    let Fixture {
+        app,
+        owner,
+        _state_dir,
+        ..
+    } = fixture();
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(SHAREABLE_APPS_PATH)
+                .header(
+                    header::AUTHORIZATION,
+                    owner_pop_for_method(&owner, "GET", SHAREABLE_APPS_PATH, &[]),
+                )
+                .body(Body::empty())
+                .expect("build shareable-apps list request"),
+        )
+        .await
+        .expect("shareable-apps list response");
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let body = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("read shareable-apps error body");
+    let error: ErrorEnvelope = household_rs::cbor::from_canonical_slice(&body)
+        .expect("canonical CBOR shareable-apps error envelope");
+    assert_eq!(error.version, 1);
+    assert_eq!(error.code, "share_apps_unavailable");
 }
 
 #[test]

@@ -23,6 +23,7 @@ use household_rs::ids::HouseholdId;
 
 use crate::claw_share_relay_stream_contract::RelayStreamOfferContract;
 use crate::claw_share_relay_stream_issuer_trust::RelayStreamIssuerTrust;
+use crate::claw_share_relay_stream_reopen_limiter::ReopenStreamLimiter;
 use crate::claw_share_relay_stream_responder::ResponderDataTunnelDeps;
 #[cfg(any(test, feature = "dev_t1_datapath"))]
 use crate::claw_share_relay_stream_target_router::RelayStreamIpTunnelRouter;
@@ -70,6 +71,7 @@ pub fn bind_relay_stream_reverse_connect<P, S>(
     replay: Arc<ReplayGuard>,
     pty_router: P,
     clawsite_router: S,
+    reopen_limiter: Arc<ReopenStreamLimiter>,
     now_unix: impl Fn() -> Option<u64> + Send + Sync + 'static,
 ) -> RelayStreamReverseConnectBinding<P, S>
 where
@@ -84,7 +86,13 @@ where
         clawsite_router,
         now_unix,
     );
-    let deps = ResponderDataTunnelDeps::new(household_id, Arc::clone(&slots), replay, router);
+    let deps = ResponderDataTunnelDeps::new(
+        household_id,
+        Arc::clone(&slots),
+        replay,
+        router,
+        reopen_limiter,
+    );
     RelayStreamReverseConnectBinding { offer, trust, deps }
 }
 
@@ -99,6 +107,7 @@ pub fn bind_relay_stream_reverse_connect_with_ip_tunnel_router<P, S, I>(
     pty_router: P,
     clawsite_router: S,
     ip_tunnel_router: I,
+    reopen_limiter: Arc<ReopenStreamLimiter>,
     now_unix: impl Fn() -> Option<u64> + Send + Sync + 'static,
 ) -> RelayStreamReverseConnectBinding<P, S, I>
 where
@@ -115,7 +124,13 @@ where
         ip_tunnel_router,
         now_unix,
     );
-    let deps = ResponderDataTunnelDeps::new(household_id, Arc::clone(&slots), replay, router);
+    let deps = ResponderDataTunnelDeps::new(
+        household_id,
+        Arc::clone(&slots),
+        replay,
+        router,
+        reopen_limiter,
+    );
     RelayStreamReverseConnectBinding { offer, trust, deps }
 }
 
@@ -123,6 +138,7 @@ where
 mod tests {
     use super::*;
 
+    use crate::claw_share_relay_stream_reopen_limiter::ReopenLimiterConfig;
     use household_rs::claw_share::{SlotRecord, SlotState};
     use household_rs::claw_share_data_tunnel::{
         ClawTargetRouter, DataTunnelError, TargetSession, TcpStreamRouter,
@@ -240,6 +256,8 @@ mod tests {
                 claw_id: RELAY_STREAM_CLAW_ID.to_string(),
                 expires_at: NOW + 86_400,
                 state: SlotState::Open,
+                app_presentation: None,
+                created_at: None,
             })
             .unwrap();
         store
@@ -284,6 +302,7 @@ mod tests {
             Arc::new(ReplayGuard::new()),
             TcpStreamRouter::new(pty_addr),
             TcpStreamRouter::new(site_addr),
+            Arc::new(ReopenStreamLimiter::new(ReopenLimiterConfig::default())),
             || Some(NOW),
         )
     }
@@ -389,6 +408,7 @@ mod tests {
             TcpStreamRouter::new(pty_addr),
             TcpStreamRouter::new(site_addr),
             AckIpTunnelRouter::new(ip_addr),
+            Arc::new(ReopenStreamLimiter::new(ReopenLimiterConfig::default())),
             || Some(NOW),
         );
 

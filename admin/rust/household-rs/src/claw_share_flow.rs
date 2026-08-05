@@ -321,6 +321,8 @@ mod tests {
                 claw_id: claw_id.to_string(),
                 expires_at,
                 state: SlotState::Open,
+                app_presentation: None,
+                created_at: None,
             })
             .expect("insert slot");
         ClawShareInvite::sign(
@@ -645,6 +647,8 @@ mod tests {
                 claw_id: target_b.to_string(),
                 expires_at: 2_000_000_000,
                 state: SlotState::Open,
+                app_presentation: None,
+                created_at: None,
             })
             .expect("insert B slot");
 

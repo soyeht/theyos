@@ -366,7 +366,9 @@ fn r1a7_enumerates_linked_targets_and_proves_zero_production_callers() {
             .any(|member| member == "m1-household-mesh-smoke-rs")
     );
     let targets = enumerate_workspace_targets(&rust_root, &members);
-    assert_eq!(targets.len(), 201, "Cargo target inventory changed");
+    // Main added the two S1 integration targets (199 → 201); this merge adds
+    // the single deliberate S0 harness example (201 → 202).
+    assert_eq!(targets.len(), 202, "Cargo target inventory changed");
     assert_eq!(
         targets.iter().filter(|target| target.kind == "bin").count(),
         50
@@ -383,8 +385,18 @@ fn r1a7_enumerates_linked_targets_and_proves_zero_production_callers() {
             .iter()
             .filter(|target| target.kind == "example")
             .count(),
-        0
+        1 // ONLY the S0 relay capacity harness (plan §7.5). Deliberately kept
+          // an exact `==`, never `>=`: a second example must break this and be
+          // argued for, exactly as this one was.
     );
+    // ...and it must be THAT example. The count alone would let an unrelated
+    // example replace the harness silently.
+    assert!(targets.iter().any(|target| {
+        target.package == "server-rs"
+            && target.kind == "example"
+            && target.name == "relay_stream_s0_load"
+            && target.path == "server-rs/examples/relay_stream_s0_load.rs"
+    }));
     assert!(targets.iter().any(|target| {
         target.package == "server-rs" && target.kind == "bin" && target.name == "server"
     }));
