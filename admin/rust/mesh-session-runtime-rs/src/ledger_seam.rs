@@ -1,8 +1,24 @@
-//! Lane R (@ilia): the `IntentNonceLedger` seam this facade will require
-//! once wired to a real backend. **Not implemented here — no concrete
-//! adapter exists in this workspace yet, and this crate deliberately
-//! does not fabricate one.** Every future constructor in this crate that
-//! needs durable nonce consumption must accept
+//! Lane R (@ilia): the `IntentNonceLedger` seam this facade required
+//! before it had a real backend to wire to.
+//!
+//! **Superseded by a real adapter (2026-08-05, @daisy):**
+//! `intent_nonce_ledger_bridge::HouseholdIntentNonceLedger` now
+//! implements `IntentNonceLedger` for real, against household-rs's
+//! `MeshIntentNonceLedger`. That bridge does NOT use the
+//! [`TrustedTimeSource`]/[`TrustedFloorProof`] types below — it sources
+//! its `TrustedWallFloor` fresh on every `consume()` call directly from
+//! `MachineRosterCoordinator::current_snapshot_with_trusted_wall_floor`,
+//! rather than through a construction-time mandatory parameter. That is
+//! a deliberate divergence from this seam's original prescription, not
+//! an oversight: a `TrustedFloorProof` captured once at construction and
+//! reused across many later `consume()` calls on a long-lived adapter
+//! would go stale the same way a cached `RosterSnapshotView` would —
+//! sourcing it per-call is strictly tighter than what this seam asked
+//! for.
+//!
+//! This module still stands for anything ELSE in this crate that later
+//! needs durable nonce consumption and does not have a natural per-call
+//! floor source of its own: every such future constructor must accept
 //! `L: mesh_session_core_rs::intent::IntentNonceLedger` generically,
 //! exactly the way `mesh-session-core-rs`'s own handshake functions
 //! already do — the re-export below exists so that requirement is
