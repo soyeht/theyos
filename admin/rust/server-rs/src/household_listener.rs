@@ -1940,4 +1940,81 @@ mod tests {
             "spawn_household_listeners must route initial binds through the policy-aware sync helper"
         );
     }
+
+    /// The token closes *construction* by type; this closes *propagation*.
+    ///
+    /// `ProcessStartupToken(())` cannot be built outside this module, and
+    /// `claim` hands out at most one per process. Neither fact stops the
+    /// resulting `&ProcessStartupToken` from being stored -- parking it in a
+    /// struct field reachable from `AppState` compiles, and a handler holding
+    /// that state could call `spawn_household_listeners` a second time. That
+    /// call is not idempotent: it reconciles through
+    /// `sync_interface_targets(.., "startup")`, which opens bind targets and
+    /// not only closes them.
+    ///
+    /// Nothing in the type system keeps the token on the stack. Today it is
+    /// there because no field holds it -- a fact about the current tree, not an
+    /// invariant, until something checks it. So enumerate every occurrence in
+    /// the crate and pin the set: any new one, including a struct field, has to
+    /// be looked at rather than merely compiled.
+    #[test]
+    fn the_startup_token_is_never_stored_only_passed() {
+        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut found: Vec<String> = Vec::new();
+        let mut stack = vec![src.clone()];
+        while let Some(dir) = stack.pop() {
+            for entry in std::fs::read_dir(&dir).expect("read src dir") {
+                let path = entry.expect("dir entry").path();
+                if path.is_dir() {
+                    stack.push(path);
+                    continue;
+                }
+                if path.extension().is_none_or(|ext| ext != "rs") {
+                    continue;
+                }
+                let text = std::fs::read_to_string(&path).expect("read source file");
+                // Scan production only. This guard names the token in its own
+                // expected set, so an unbounded scan matches those literals and
+                // the assertion compares the guard against itself -- the same
+                // `include_str!` self-reference that made the post-ACK guard
+                // pass against an empty handler.
+                let text = text
+                    .split_once("\n#[cfg(test)]")
+                    .map_or(text.as_str(), |(p, _)| p);
+                for line in text.lines() {
+                    if !line.contains("ProcessStartupToken") {
+                        continue;
+                    }
+                    let trimmed = line.trim();
+                    if trimmed.starts_with("///") || trimmed.starts_with("//") {
+                        continue;
+                    }
+                    let name = path
+                        .strip_prefix(&src)
+                        .expect("path under src")
+                        .to_string_lossy()
+                        .into_owned();
+                    found.push(format!("{name}: {trimmed}"));
+                }
+            }
+        }
+        found.sort();
+
+        let expected = [
+            "household_bootstrap.rs: startup: &household_listener::ProcessStartupToken,",
+            "household_listener.rs: _startup: &ProcessStartupToken,",
+            "household_listener.rs: impl ProcessStartupToken {",
+            "household_listener.rs: pub struct ProcessStartupToken(());",
+            "main.rs: let startup_token = server_rs::household_listener::ProcessStartupToken::claim()",
+        ];
+
+        assert_eq!(
+            found, expected,
+            "the startup token's occurrence set changed. It may be DEFINED, \
+             IMPLEMENTED, taken by reference as a function parameter, and \
+             claimed exactly once in main -- nothing else. A struct field \
+             holding it would let a handler start the listeners again, and \
+             `spawn_household_listeners` opens bind targets on every call."
+        );
+    }
 }
