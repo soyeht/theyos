@@ -1941,6 +1941,70 @@ mod tests {
         );
     }
 
+    /// The half of a source file that is not the test module.
+    ///
+    /// Anchored on `#[cfg(test)]` immediately followed by `mod tests`, never on
+    /// the first `#[cfg(test)]` alone: files with cfg-gated items scattered
+    /// through production have many of the latter, and cutting at the first one
+    /// discards the code the caller means to measure. `mesh_intent_nonce_ledger
+    /// .rs` has seven at column zero, the first on line 55, with the definition
+    /// on 588 -- the naive cut keeps 54 lines and finds nothing.
+    fn production_half(text: &str) -> &str {
+        text.split_once("\n#[cfg(test)]\nmod tests")
+            .map_or(text, |(production, _)| production)
+    }
+
+    /// Exercises [`production_half`] against input that exhibits the failure.
+    ///
+    /// `household_listener.rs` cannot: it has exactly one `#[cfg(test)]` at
+    /// column zero and that one *is* the module, so both partitions are the
+    /// same cut and mutating the anchor cannot turn the guard below red. The
+    /// guard's control would therefore be armed and never exercised, which is a
+    /// green with no red behind it.
+    ///
+    /// The fixture is synthetic rather than a real file on purpose. Pointing it
+    /// at `mesh_intent_nonce_ledger.rs` would make this test depend on that
+    /// file keeping its scattered `#[cfg(test)]` attributes: tidy them and the
+    /// input stops exhibiting the property, and the test goes green without
+    /// anyone learning why. That is the `include_str!` self-reference one level
+    /// up -- a fixture measuring another file's present instead of the property
+    /// it means to demonstrate.
+    #[test]
+    fn production_half_cuts_at_the_module_not_the_first_attribute() {
+        let fixture = "\
+use std::fs;
+
+#[cfg(test)]
+fn helper_used_only_by_tests() {}
+
+pub(crate) fn open(path: &str) {}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn t() {}
+}
+";
+        let naive = fixture
+            .split_once("\n#[cfg(test)]")
+            .map_or(fixture, |(production, _)| production);
+        assert!(
+            !naive.contains("pub(crate) fn open"),
+            "the naive cut must lose the definition -- if it does not, this \
+             fixture no longer exhibits the failure and proves nothing"
+        );
+
+        let correct = production_half(fixture);
+        assert!(
+            correct.contains("pub(crate) fn open"),
+            "the module-anchored cut must keep the definition"
+        );
+        assert!(
+            !correct.contains("fn t()"),
+            "the module-anchored cut must still exclude the test module"
+        );
+    }
+
     /// The token closes *construction* by type; this closes *propagation*.
     ///
     /// `ProcessStartupToken(())` cannot be built outside this module, and
@@ -1979,19 +2043,7 @@ mod tests {
                 // `include_str!` self-reference that made the post-ACK guard
                 // pass against an empty handler.
                 //
-                // Partition at the test MODULE, not at the first `#[cfg(test)]`.
-                // Splitting on the attribute happens to work in this file --
-                // it has exactly one at column 0, and that one is the module --
-                // but the recipe is unsafe to copy: `mesh_intent_nonce_ledger.rs`
-                // has seven at column 0, the first on line 55, so the same split
-                // would keep 54 lines as "production", find nothing, and pass
-                // green having measured no code at all. A guard reading its own
-                // file fails by matching itself; a guard cut at the wrong
-                // boundary fails by reading nothing, and only the first is
-                // visible in the output.
-                let text = text
-                    .split_once("\n#[cfg(test)]\nmod tests")
-                    .map_or(text.as_str(), |(p, _)| p);
+                let text = production_half(&text);
                 for line in text.lines() {
                     if !line.contains("ProcessStartupToken") {
                         continue;
