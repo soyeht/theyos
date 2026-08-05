@@ -153,7 +153,11 @@ fn source_slice(mount: &Mount) -> &'static str {
         ),
         ("admin/rust/server-rs/src/household_bootstrap.rs", "household_claws_router") => between(
             household_bootstrap_source(),
-            "let claws_router = shared_state.map(|state| {",
+            // Not the full statement: `shared_state` grew a second consumer
+            // (the post-pairing relay-stream remounts, see the `shared_state`
+            // field doc-comment) and now needs `.clone()` here. This prefix
+            // is unique to the one call site regardless of what follows it.
+            "let claws_router = shared_state",
             "// Pre-household router.",
         ),
         other => panic!("unknown mount source/slice: {other:?}"),
@@ -174,6 +178,22 @@ fn production_main_mounts_the_canonical_mobile_router_once() {
             .count(),
         1,
         "production main must delegate to the complete app composer exactly once"
+    );
+}
+
+#[test]
+fn household_claws_router_start_marker_is_unique() {
+    // The `household_claws_router` slice above starts on a prefix, not the
+    // full statement, so it survives `shared_state` growing more consumers
+    // (it already gained a `.clone()` once — see the field doc-comment on
+    // `shared_state` in household_bootstrap.rs). A prefix marker is only
+    // safe to shorten as long as it stays unique to the one call site.
+    assert_eq!(
+        household_bootstrap_source()
+            .matches("let claws_router = shared_state")
+            .count(),
+        1,
+        "the household_claws_router start marker must match exactly one call site"
     );
 }
 
