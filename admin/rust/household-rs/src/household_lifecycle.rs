@@ -790,10 +790,12 @@ mod generation_fail_injection {
     }
 
     pub(super) fn fail_after_generation_rename() -> bool {
+        crate::crash_park::park_if_armed("generation:after_rename");
         FAIL_AFTER_RENAME.with(|armed| armed.replace(false))
     }
 
     pub(super) fn fail_existing_parent_sync() -> bool {
+        crate::crash_park::park_if_armed("generation:existing_parent_sync");
         FAIL_EXISTING_PARENT_SYNC.with(Cell::get)
     }
 }

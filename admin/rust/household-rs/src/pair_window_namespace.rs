@@ -825,6 +825,7 @@ mod namespace_fail_injection {
     }
 
     pub(super) fn take_delete_parent_sync() -> bool {
+        crate::crash_park::park_if_armed("namespace:delete_parent_sync");
         FAIL_DELETE_PARENT_SYNC.with(|armed| armed.replace(false))
     }
 }

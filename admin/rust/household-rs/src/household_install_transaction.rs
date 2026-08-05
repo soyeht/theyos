@@ -1848,26 +1848,32 @@ mod install_fail_injection {
     }
 
     pub(super) fn take_after_breadcrumb_rename() -> bool {
+        crate::crash_park::park_if_armed("install:after_breadcrumb_rename");
         AFTER_BREADCRUMB_RENAME.with(|armed| armed.replace(false))
     }
 
     pub(super) fn take_before_rotation() -> bool {
+        crate::crash_park::park_if_armed("install:before_rotation");
         BEFORE_ROTATION.with(|armed| armed.replace(false))
     }
 
     pub(super) fn take_before_terminal_result() -> bool {
+        crate::crash_park::park_if_armed("install:before_terminal_result");
         BEFORE_TERMINAL_RESULT.with(|armed| armed.replace(false))
     }
 
     pub(super) fn take_after_terminal_result_rename() -> bool {
+        crate::crash_park::park_if_armed("install:after_terminal_result_rename");
         AFTER_TERMINAL_RESULT_RENAME.with(|armed| armed.replace(false))
     }
 
     pub(super) fn take_before_terminal_finalize() -> bool {
+        crate::crash_park::park_if_armed("install:before_terminal_finalize");
         BEFORE_TERMINAL_FINALIZE.with(|armed| armed.replace(false))
     }
 
     pub(super) fn take_before_clear() -> bool {
+        crate::crash_park::park_if_armed("install:before_clear");
         BEFORE_CLEAR.with(|armed| armed.replace(false))
     }
 }
