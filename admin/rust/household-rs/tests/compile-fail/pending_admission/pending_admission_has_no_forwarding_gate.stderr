@@ -1,5 +1,5 @@
 error[E0599]: no method named `try_authorize_forwarding` found for reference `&PendingSessionAdmission<'_, Session>` in the current scope
-  --> tests/compile-fail/pending_admission_has_no_forwarding_gate.rs:11:23
+  --> tests/compile-fail/pending_admission/pending_admission_has_no_forwarding_gate.rs:11:23
    |
 11 |     let _ = admission.try_authorize_forwarding();
    |                       ^^^^^^^^^^^^^^^^^^^^^^^^ method not found in `&PendingSessionAdmission<'_, Session>`

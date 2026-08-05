@@ -1,0 +1,153 @@
+{
+  "watchlist_parents": {
+    "mesh-session-control-model-rs": [],
+    "mesh-session-core-rs": [],
+    "snow": [
+      "household-rs",
+      "server-rs"
+    ]
+  },
+  "workspace_local_edges": {
+    "backup-rs": [
+      "core-rs"
+    ],
+    "claw-autoupdate-rs": [
+      "core-rs"
+    ],
+    "claw-rs": [
+      "core-rs"
+    ],
+    "claw-share-bridge-rs": [
+      "household-rs",
+      "nostr-relay-rs"
+    ],
+    "core-rs": [],
+    "device-key-rs": [
+      "keystore-rs"
+    ],
+    "e2e-rs": [
+      "core-rs",
+      "household-rs",
+      "server-rs",
+      "store-rs"
+    ],
+    "executor-rs": [
+      "core-rs",
+      "vmrunner-common-rs"
+    ],
+    "friend-cli-rs": [
+      "household-rs",
+      "nostr-relay-rs"
+    ],
+    "household-rs": [
+      "core-rs",
+      "keystore-rs",
+      "store-rs",
+      "tunnel-wire-rs"
+    ],
+    "imagebuilder-rs": [
+      "core-rs",
+      "vmrunner-rs"
+    ],
+    "jobs-rs": [
+      "core-rs"
+    ],
+    "keystore-rs": [],
+    "launcher-rs": [
+      "core-rs"
+    ],
+    "llm-proxy-rs": [
+      "core-rs",
+      "keystore-rs"
+    ],
+    "m1-household-mesh-smoke-rs": [],
+    "nostr-relay-rs": [
+      "household-rs"
+    ],
+    "rootfsbuilder-rs": [
+      "core-rs"
+    ],
+    "server-rs": [
+      "claw-rs",
+      "core-rs",
+      "executor-rs",
+      "household-rs",
+      "jobs-rs",
+      "keystore-rs",
+      "nostr-relay-rs",
+      "session-rs",
+      "store-rs",
+      "terminal-rs",
+      "tunnel-wire-rs",
+      "vmrunner-common-rs",
+      "vmrunner-rs"
+    ],
+    "session-rs": [
+      "core-rs"
+    ],
+    "soyeht-rs": [
+      "claw-rs",
+      "core-rs",
+      "e2e-rs",
+      "vmrunner-common-rs",
+      "vmrunner-rs"
+    ],
+    "store-rs": [
+      "core-rs"
+    ],
+    "t1-iptunnel-dev-runner-rs": [
+      "household-rs"
+    ],
+    "terminal-rs": [
+      "core-rs"
+    ],
+    "theyos-engine-build-rs": [],
+    "tunnel-wire-rs": [],
+    "updater-rs": [
+      "core-rs"
+    ],
+    "vmrunner-common-rs": [
+      "core-rs"
+    ],
+    "vmrunner-macos-rs": [
+      "core-rs",
+      "vmrunner-common-rs"
+    ],
+    "vmrunner-rs": [
+      "core-rs",
+      "vmrunner-common-rs"
+    ]
+  },
+  "workspace_local_packages": [
+    "backup-rs",
+    "claw-autoupdate-rs",
+    "claw-rs",
+    "claw-share-bridge-rs",
+    "core-rs",
+    "device-key-rs",
+    "e2e-rs",
+    "executor-rs",
+    "friend-cli-rs",
+    "household-rs",
+    "imagebuilder-rs",
+    "jobs-rs",
+    "keystore-rs",
+    "launcher-rs",
+    "llm-proxy-rs",
+    "m1-household-mesh-smoke-rs",
+    "nostr-relay-rs",
+    "rootfsbuilder-rs",
+    "server-rs",
+    "session-rs",
+    "soyeht-rs",
+    "store-rs",
+    "t1-iptunnel-dev-runner-rs",
+    "terminal-rs",
+    "theyos-engine-build-rs",
+    "tunnel-wire-rs",
+    "updater-rs",
+    "vmrunner-common-rs",
+    "vmrunner-macos-rs",
+    "vmrunner-rs"
+  ]
+}

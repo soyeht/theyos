@@ -997,3 +997,145 @@ fn public_constructors_reject_invalid_shapes_without_state_or_io() {
         Err(CodecError::FrameTooLarge)
     );
 }
+
+/// True if this manifest inherits the workspace lint table, in EITHER spelling.
+///
+/// Both forms are accepted deliberately. Cargo treats
+///
+/// ```toml
+/// [lints]
+/// workspace = true
+/// ```
+///
+/// and the dotted `lints.workspace = true` as the same thing, and every member
+/// here happens to use the table form. A checker that recognised only the
+/// dotted spelling would report zero of thirty members opting in and conclude
+/// the workspace lint table was inert — which is exactly the wrong conclusion,
+/// reached exactly that way, before this guard existed. Matching one spelling
+/// is how a search fails toward "nobody is protected".
+fn declares_workspace_lint_inheritance(manifest: &str) -> bool {
+    let code = |line: &str| {
+        line.split('#')
+            .next()
+            .unwrap_or("")
+            .replace(char::is_whitespace, "")
+    };
+    if manifest.lines().any(|l| code(l) == "lints.workspace=true") {
+        return true;
+    }
+    let mut in_lints = false;
+    for line in manifest.lines() {
+        let stripped = code(&line);
+        if stripped.starts_with('[') {
+            in_lints = stripped == "[lints]";
+            continue;
+        }
+        if in_lints && stripped == "workspace=true" {
+            return true;
+        }
+    }
+    false
+}
+
+/// Every workspace member must inherit `[workspace.lints]`.
+///
+/// The line is load-bearing and its absence is SILENT. Drop it from a member and
+/// the real gate — `cargo clippy --workspace -- -D warnings` — stops applying
+/// `clippy::all` and `pedantic` to that crate entirely, while still exiting 0.
+/// The crate simply stops being linted, and no existing check notices: the only
+/// other mention of `[lints]` in test code uses the string as a delimiter for
+/// slicing a `[dependencies]` section, not as a property to enforce.
+///
+/// So the thirty members that do inherit are correct by convention, not by
+/// mechanism — a thirty-first joins unlinted and nothing fails. That is worse
+/// than the target ratchet, which at least shouts when its number moves.
+#[test]
+fn every_workspace_member_inherits_the_workspace_lint_table() {
+    let rust_root = repository_root().join("admin/rust");
+    let members = workspace_members(&rust_root);
+
+    // Positive control: a broken enumerator returning an empty list would make
+    // the emptiness check below pass while examining nothing.
+    assert!(
+        members.len() >= 25,
+        "only {} workspace members enumerated; the member parse is broken, so \
+         this guard would pass without checking anything",
+        members.len()
+    );
+
+    let missing: Vec<&String> = members
+        .iter()
+        .filter(|member| {
+            let manifest = fs::read_to_string(rust_root.join(member).join("Cargo.toml"))
+                .unwrap_or_else(|error| panic!("read {member}/Cargo.toml: {error}"));
+            !declares_workspace_lint_inheritance(&manifest)
+        })
+        .collect();
+
+    assert!(
+        missing.is_empty(),
+        "workspace members that do NOT inherit `[workspace.lints]`: {missing:?}. \
+         Without it the member is silently exempt from `clippy::all` and \
+         `pedantic` under the real gate, which still exits 0 — the crate stops \
+         being linted and nothing else notices. Add `[lints]` with \
+         `workspace = true` to each."
+    );
+}
+
+/// Unit coverage for [`declares_workspace_lint_inheritance`] itself.
+///
+/// The workspace-wide test above can only exercise the shapes that happen to be
+/// in the tree — today that is thirty identical table-form declarations, so it
+/// proves the recogniser works for exactly one case. @khai's independent
+/// verification of the guard supplied two more shapes by mutating a real
+/// manifest and running the gate. That kind of check evaporates when the
+/// transcript scrolls away, so it is restated here as a standing assertion:
+/// each accepted and each rejected shape gets its own case, because a
+/// recogniser claiming to handle several forms and only ever exercised on one
+/// looks identical and has a fraction of the coverage.
+#[test]
+fn lint_inheritance_recogniser_accepts_and_rejects_the_right_shapes() {
+    // Accepted: the two spellings cargo treats as equivalent.
+    assert!(declares_workspace_lint_inheritance(
+        "[package]\nname = \"x\"\n\n[lints]\nworkspace = true\n"
+    ));
+    assert!(declares_workspace_lint_inheritance(
+        "lints.workspace = true\n[package]\nname = \"x\"\n"
+    ));
+    assert!(
+        declares_workspace_lint_inheritance("[lints]\nworkspace   =   true\n"),
+        "whitespace around the value must not change the meaning"
+    );
+
+    // Rejected: present but explicitly NOT inheriting. This is the shape a
+    // recogniser that merely looked for the `[lints]` section would wave
+    // through, and it is the one that matters -- the member opts OUT on
+    // purpose and would be silently unlinted.
+    assert!(!declares_workspace_lint_inheritance(
+        "[package]\nname = \"x\"\n\n[lints]\nworkspace = false\n"
+    ));
+
+    // Rejected: a member declaring its OWN lint table instead of inheriting.
+    // `[lints.clippy]` is a different section from `[lints]`, and the workspace
+    // table does not reach it.
+    assert!(!declares_workspace_lint_inheritance(
+        "[package]\nname = \"x\"\n\n[lints.clippy]\nall = \"warn\"\n"
+    ));
+
+    // Rejected: absent entirely, and absent-after-another-section, which is
+    // where a section-scanner that forgets to reset its state goes wrong.
+    assert!(!declares_workspace_lint_inheritance(
+        "[package]\nname = \"x\"\n"
+    ));
+    assert!(!declares_workspace_lint_inheritance(
+        "[lints]\nworkspace = true\n[dependencies]\nserde = \"1\"\n[other]\nworkspace = true\n"
+            .replace("[lints]\nworkspace = true\n", "")
+            .as_str()
+    ));
+
+    // Rejected: commented out. A guard that counts commented declarations
+    // reports protection that is not there.
+    assert!(!declares_workspace_lint_inheritance(
+        "[lints]\n# workspace = true\n"
+    ));
+}
