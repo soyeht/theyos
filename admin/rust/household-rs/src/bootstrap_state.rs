@@ -280,6 +280,128 @@ fn persist_impl(state_dir: &Path, state: BootstrapState) -> Result<(), Bootstrap
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
+mod durable_ready_writer_containment {
+    //! Gate: the set of code paths that can durably write `Ready` is exactly one.
+    //!
+    //! `Ready` cannot carry its own authority token. `BootstrapState` derives
+    //! `Deserialize`, so a `Ready(Witness)` would be mintable by any
+    //! deserializer -- authority arriving over the wire, same alphabet and
+    //! different authority. And every `== BootstrapState::Ready` comparison would
+    //! need to *construct* a `Ready` to compare against, demanding mint authority
+    //! in pure observers.
+    //!
+    //! The handle is on the PATH instead, and it already exists:
+    //!
+    //!   persist_impl                                 PRIVATE, sole file writer
+    //!     caller 1: persist()                        REJECTS Ready
+    //!     caller 2: persist_ready_under_lifecycle()  requires &LifecycleWriteGuard
+    //!
+    //! `LifecycleWriteGuard` is immune to the serde objection precisely because
+    //! it is not the value that travels on the wire -- it is a lock guard.
+    //! Because `persist_impl` is private, the caller universe is bounded by this
+    //! module, so the durable writer set is compiler-bounded rather than swept.
+    //!
+    //! What this test adds is the part the compiler CANNOT express: that nobody
+    //! widens `persist_impl` to `pub` (which would unbound the universe), and
+    //! that no third in-module caller appears. Both are legal edits; only a gate
+    //! catches them.
+    //!
+    //! Deliberately NOT covered: the in-memory `Arc<RwLock<BootstrapState>>`
+    //! cell, whose three `Ready` writers were enumerated mechanically by a
+    //! compiler oracle and are tracked as named debt. This gate is about the
+    //! durable path.
+
+    const SOURCE: &str = include_str!("bootstrap_state.rs");
+
+    #[test]
+    fn persist_impl_stays_private_and_has_exactly_two_callers() {
+        // Positive control: if the needle stops matching, everything below would
+        // pass vacuously against empty sets.
+        // Every check below is LINE-ANCHORED, never `contains`. This module
+        // quotes the very strings it checks for, and `include_str!` of the file
+        // that holds it means self-reference breaks BOTH directions: a negative
+        // `contains` finds its own literal and fails spuriously, and a positive
+        // `contains` finds its own literal and passes vacuously even if the item
+        // were deleted. Anchoring at line start makes a quoted needle inert.
+        let starts = |needle: &str| SOURCE.lines().any(|l| l.trim_start().starts_with(needle));
+
+        assert!(
+            starts("fn persist_impl(") || starts("pub fn persist_impl("),
+            "persist_impl not found -- this gate is measuring nothing"
+        );
+
+        // 1. It must stay PRIVATE. `pub fn persist_impl` would unbound the caller
+        //    universe and make the containment argument false, silently.
+        assert!(
+            !starts("pub fn persist_impl("),
+            "persist_impl became public. The durable-Ready containment argument \
+             rests on its caller universe being bounded by this module; making it \
+             pub removes that bound and any crate could then write Ready directly."
+        );
+
+        // 2. The in-module caller set must stay exactly two. Count call sites --
+        //    `persist_impl(` with an open paren -- excluding the definition and
+        //    comment lines, so prose references never count.
+        // Match a line that BEGINS with the call form, not one that merely
+        // contains it: this module names the needle inside its own filter, and a
+        // `contains` would count that literal as a third caller.
+        // This module quotes "fn persist_impl(" and "pub fn persist_impl(" inside
+        // its own assertions, and a bare-identifier needle would count those and
+        // make the gate churn whenever its own text is edited -- the same
+        // self-reference that has already bitten two guards in this delivery.
+        let call_sites: Vec<&str> = SOURCE
+            .lines()
+            .filter(|line| {
+                let t = line.trim_start();
+                !t.starts_with("//")
+                    && !t.starts_with("fn persist_impl(")
+                    && t.starts_with("persist_impl(state_dir")
+            })
+            .map(str::trim)
+            .collect();
+
+        assert_eq!(
+            call_sites.len(),
+            2,
+            "the persist_impl caller set changed: {call_sites:?}. Exactly two are \
+             sanctioned -- persist(), which REJECTS Ready, and \
+             persist_ready_under_lifecycle(), which requires a &LifecycleWriteGuard \
+             and revalidates the generation before AND after the write. A third \
+             caller is a third way to durably write bootstrap state; if it is \
+             legitimate, say why it may bypass the guard and update this gate."
+        );
+    }
+
+    #[test]
+    fn the_guarded_caller_is_the_only_one_that_may_write_ready() {
+        let starts = |needle: &str| SOURCE.lines().any(|l| l.trim_start().starts_with(needle));
+
+        // DELIBERATELY NOT ASSERTED HERE: "persist() still rejects Ready".
+        //
+        // A source check for `ReadyRequiresLifecycleGuard` is TOOTHLESS: the
+        // identifier also appears in the error enum declaration, so the check is
+        // satisfied whether or not the rejection exists. Measured, not assumed --
+        // deleting the rejection body from persist() left such a check GREEN.
+        //
+        // The property is gated behaviourally instead, by
+        // `tests::ready_requires_the_exact_lifecycle_generation`, which calls
+        // persist(dir, Ready) and asserts the error. Measured: deleting that same
+        // rejection body makes THAT test FAIL. Keeping a source assertion that
+        // cannot fail, beside a behavioural one that can, would add the
+        // appearance of coverage and none of the coverage.
+        assert!(
+            starts("pub fn persist_ready_under_lifecycle("),
+            "the guarded durable-Ready entry point is gone or renamed"
+        );
+        assert!(
+            starts("lifecycle: &LifecycleWriteGuard"),
+            "persist_ready_under_lifecycle no longer takes the lifecycle guard -- \
+             the token that makes this path authoritative"
+        );
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::household_lifecycle::HouseholdLifecycleLock;
