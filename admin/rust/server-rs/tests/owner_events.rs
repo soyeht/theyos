@@ -11969,6 +11969,78 @@ mod device_roster_read {
         assert_device_rejected(result);
     }
 
+    /// The refusal *class* must be a function of server state alone.
+    ///
+    /// Every other test here pins one reason to one class, so none of them
+    /// would notice a new availability condition that reads the request: each
+    /// would keep passing on its own reason while the wire gained an oracle.
+    /// This asserts the property instead — materially different device-side
+    /// failures come back indistinguishable, and the availability class appears
+    /// only when the *server* is deprived, with the request bytes unchanged.
+    #[tokio::test]
+    async fn the_refusal_class_is_never_selectable_by_the_caller() {
+        let seam = seam(None);
+        admit(&seam, 1);
+        let now = unix_now();
+        let p_id = seam.owner_cert.p_id.0.clone();
+        let good = device_pop_header(&seam.device, &p_id, URI, now);
+
+        let stranger = P256Keypair::generate();
+        let stranger_id = household_rs::device_cert::derive_device_id(&stranger.public());
+        let unknown = device_pop_header(&stranger, &p_id, URI, now);
+
+        let stranger_p_id = household_rs::derive_person_id(&P256Keypair::generate().public()).0;
+        let wrong_person = device_pop_header(&seam.device, &stranger_p_id, URI, now);
+        let wrong_path = device_pop_header(&seam.device, &p_id, "/api/v1/household/other", now);
+
+        let mut malformed = seam.cert.d_id.0.clone();
+        malformed.pop();
+        malformed.push('1');
+
+        for (label, request) in [
+            ("unknown device", headers(&unknown, Some(&stranger_id.0))),
+            (
+                "wrong person slot",
+                headers(&wrong_person, Some(&seam.cert.d_id.0)),
+            ),
+            (
+                "signature bound elsewhere",
+                headers(&wrong_path, Some(&seam.cert.d_id.0)),
+            ),
+            ("malformed device id", headers(&good, Some(&malformed))),
+        ] {
+            match call(&seam, request, now).await {
+                Err(RosterReadAuthError::DeviceUnauthenticated) => {}
+                Err(other) => panic!(
+                    "{label}: a request-derived refusal escaped the collapsed class: {other:?}"
+                ),
+                Ok(_) => panic!("{label}: must not authorize"),
+            }
+        }
+
+        // Byte-identical request, server deprived of its loaded identity. The
+        // class may differ here and only here: nothing about the caller moved.
+        let deprived = HouseholdState::empty();
+        let result = authorize_roster_read(
+            &deprived,
+            &seam.state_dir,
+            &headers(&good, Some(&seam.cert.d_id.0)),
+            &Method::GET,
+            URI,
+            b"",
+            READ_OP,
+            now,
+        )
+        .await;
+        match result {
+            Err(RosterReadAuthError::AuthorityUnavailable) => {}
+            Err(other) => {
+                panic!("a deprived server must answer the availability class, got {other:?}")
+            }
+            Ok(_) => panic!("a deprived server must never authorize"),
+        }
+    }
+
     #[tokio::test]
     async fn owner_cert_digest_drift_refuses_the_device() {
         let seam = seam(None);

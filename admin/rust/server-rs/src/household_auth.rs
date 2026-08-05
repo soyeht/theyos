@@ -29,21 +29,54 @@ const TIMESTAMP_TOLERANCE_SECS: u64 = 60;
 /// finishes all path-based I/O. Exact record equality prevents a stale daemon
 /// from operating on a replacement household after it finally acquires the
 /// lock.
+/// Why an exact-household lifecycle acquisition refused.
+///
+/// [`Self::RecordChanged`] is a **cross-binding**: the durable record no longer
+/// matches the identity the request was authorized against. On the delegated
+/// device path that class must collapse into
+/// [`RosterReadAuthError::DeviceUnauthenticated`] like every other device-side
+/// refusal — it is a property of the request's binding, not of the server's
+/// availability. The remaining three are genuine availability faults.
+///
+/// These are kept apart **in the type** rather than as reason strings so that a
+/// caller cannot flatten a cross-binding into an availability answer with a
+/// `map_err(|_| ...)`; doing so silently answers a question the collapse exists
+/// to refuse.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ExactLifecycleRefusal {
+    OpenFailed,
+    SharedFailed,
+    RecordReadFailed,
+    RecordChanged,
+}
+
+impl ExactLifecycleRefusal {
+    /// Log-facing reason class. Never reaches the wire.
+    pub(crate) fn reason(self) -> &'static str {
+        match self {
+            Self::OpenFailed => "lifecycle_open_failed",
+            Self::SharedFailed => "lifecycle_shared_failed",
+            Self::RecordReadFailed => "household_record_read_failed",
+            Self::RecordChanged => "household_record_changed",
+        }
+    }
+}
+
 pub(crate) fn acquire_exact_household_lifecycle(
     state_dir: &Path,
     expected: &HouseholdRecord,
-) -> Result<LifecycleReadGuard, &'static str> {
-    let lifecycle =
-        HouseholdLifecycleLock::open_verified(state_dir).map_err(|_| "lifecycle_open_failed")?;
+) -> Result<LifecycleReadGuard, ExactLifecycleRefusal> {
+    let lifecycle = HouseholdLifecycleLock::open_verified(state_dir)
+        .map_err(|_| ExactLifecycleRefusal::OpenFailed)?;
     let guard = lifecycle
         .lock_shared()
-        .map_err(|_| "lifecycle_shared_failed")?;
+        .map_err(|_| ExactLifecycleRefusal::SharedFailed)?;
     let observed: Option<HouseholdRecord> = household_rs::storage::read_optional_cbor(
         &household_rs::storage::household_record_path(state_dir),
     )
-    .map_err(|_| "household_record_read_failed")?;
+    .map_err(|_| ExactLifecycleRefusal::RecordReadFailed)?;
     if observed.as_ref() != Some(expected) {
-        return Err("household_record_changed");
+        return Err(ExactLifecycleRefusal::RecordChanged);
     }
     Ok(guard)
 }
@@ -717,17 +750,28 @@ pub async fn authorize_roster_read(
         let hh_id = identity.record.hh_id.clone();
         let hh_pub = identity.record.hh_pub.clone();
         match tokio::task::spawn_blocking(move || {
-            let _lifecycle = acquire_exact_household_lifecycle(&state_dir, &record)
-                .map_err(|_| DeviceAdmissionError::Unavailable)?;
-            HouseholdDeviceAdmissionAuthorityV1::new(&state_dir, hh_id, hh_pub).live_snapshot()
+            let lifecycle = acquire_exact_household_lifecycle(&state_dir, &record)?;
+            let snapshot =
+                HouseholdDeviceAdmissionAuthorityV1::new(&state_dir, hh_id, hh_pub).live_snapshot();
+            drop(lifecycle);
+            Ok::<_, ExactLifecycleRefusal>(snapshot)
         })
         .await
         {
-            Ok(Ok(snapshot)) => snapshot,
-            Ok(Err(DeviceAdmissionError::Unavailable)) => {
+            Ok(Ok(Ok(snapshot))) => snapshot,
+            Ok(Ok(Err(DeviceAdmissionError::Unavailable))) => {
                 return Err(authority_unavailable("authority_absent"));
             }
-            Ok(Err(_)) => return Err(device_rejected("authority_read_rejected")),
+            Ok(Ok(Err(_))) => return Err(device_rejected("authority_read_rejected")),
+            // The durable record no longer matches the identity this request was
+            // authorized against. That is a cross-binding — a property of the
+            // request's binding — and the wire class above requires it to
+            // collapse. Answering `AuthorityUnavailable` here would distinguish
+            // it from the other fifteen device-side refusals.
+            Ok(Err(ExactLifecycleRefusal::RecordChanged)) => {
+                return Err(device_rejected("cross_binding"));
+            }
+            Ok(Err(refusal)) => return Err(authority_unavailable(refusal.reason())),
             Err(_) => return Err(authority_unavailable("authority_join_failed")),
         }
     };
@@ -887,7 +931,7 @@ mod lifecycle_tests {
         .unwrap();
         assert_eq!(
             acquire_exact_household_lifecycle(temp.path(), &first).unwrap_err(),
-            "household_record_changed"
+            ExactLifecycleRefusal::RecordChanged
         );
     }
 }
