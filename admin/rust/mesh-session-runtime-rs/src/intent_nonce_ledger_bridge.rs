@@ -140,6 +140,191 @@ mod tests {
 
     use super::*;
 
+    // ── `map_channel` arm-qualification guard (@khai, 2026-08-05) ───────
+    //
+    // Complements, does not replace, `compile_fail_channel_mapping.rs`'s
+    // trybuild proof. The two cover opposite halves of the same risk:
+    // a new variant added to the real `ExpectedChannel` upstream trips
+    // the trybuild fixture (its own copy of the arms goes non-exhaustive,
+    // E0004) — but the trybuild fixture has its OWN copy of the arms
+    // precisely because `map_channel` is private, so it can never see a
+    // `_ =>` (or a bare-identifier catch-all like `other =>`) added to
+    // the REAL function: that would compile clean and the fixture would
+    // not change at all. This guard reads the real function's own source
+    // and asserts every arm pattern is fully qualified — not a `grep '_
+    // =>'`, which misses a bare-identifier catch-all binding with no
+    // underscore at all (`other => MeshIntentChannel::Dev` is a
+    // catch-all and contains no `_`).
+
+    /// Parses top-level arm PATTERNS (the text before each `=>`) out of a
+    /// match block's inner text. Scoped to this file's actual shape —
+    /// simple `Pattern => Expr,` arms with no commas inside either half
+    /// — not a general Rust parser: if `map_channel`'s match ever grows
+    /// an arm whose body contains a comma (a tuple, a multi-arg call), a
+    /// naive split here would mis-parse. The count assertion below is
+    /// the tripwire for that: a mis-parse changes the arm count away
+    /// from the pinned `2`, which fails loud instead of silently
+    /// approving a miscounted arm as "qualified".
+    fn arm_patterns(match_body: &str) -> Vec<&str> {
+        match_body
+            .split(',')
+            .map(str::trim)
+            .filter(|chunk| !chunk.is_empty())
+            .map(|chunk| {
+                chunk
+                    .split_once("=>")
+                    .map_or(chunk, |(pattern, _body)| pattern)
+                    .trim()
+            })
+            .collect()
+    }
+
+    /// A pattern counts as "qualified" only if it names a specific
+    /// variant via `Type::Variant` — never a bare identifier (which
+    /// binds everything, functioning as a catch-all with no `_` in
+    /// sight) and never `_` itself.
+    fn is_qualified_arm(pattern: &str) -> bool {
+        pattern.contains("::")
+    }
+
+    /// Positive control (@zain's standing requirement): proves
+    /// `is_qualified_arm`/`arm_patterns` actually discriminate, on a
+    /// synthetic fixture whose shape is deliberately NOT the real file
+    /// — same reasoning as `mesh_intent_nonce_ledger.rs`'s own
+    /// `split_partition_control_has_teeth`, so this demonstration never
+    /// depends on the real match block's own, incidentally-editable
+    /// shape.
+    #[test]
+    fn arm_qualification_control_has_teeth() {
+        let all_qualified = "Channel::Dev => Other::Dev, Channel::Release => Other::Release";
+        assert!(
+            arm_patterns(all_qualified)
+                .into_iter()
+                .all(is_qualified_arm),
+            "control fixture with two qualified arms must pass, or the \
+             check itself is broken"
+        );
+
+        let bare_wildcard = "Channel::Dev => Other::Dev, _ => Other::Dev";
+        assert!(
+            !arm_patterns(bare_wildcard)
+                .into_iter()
+                .all(is_qualified_arm),
+            "control failed to fire: a `_` arm must be rejected, or the \
+             check discriminates nothing"
+        );
+
+        let bare_binding = "Channel::Dev => Other::Dev, other => Other::Dev";
+        assert!(
+            !arm_patterns(bare_binding).into_iter().all(is_qualified_arm),
+            "control failed to fire: a bare-identifier catch-all (no \
+             underscore, still matches everything) must be rejected too \
+             — this is the exact gap a `grep '_ =>'` would miss"
+        );
+    }
+
+    /// The real measurement. Reads this file's own source — `needle` is
+    /// `concat!`'d so this guard's own search literal, living in this
+    /// same file's test module, cannot match itself (same reasoning as
+    /// `mesh_intent_nonce_ledger.rs`'s own `needle`/`marker`).
+    #[test]
+    fn map_channel_every_arm_is_fully_qualified() {
+        let needle = concat!("fn map_channel", "(");
+        // Partitioned at the real `mod tests` boundary rather than
+        // trusting `find` to land on the right occurrence by luck of
+        // ordering (@ilia): today `fn_body`'s own brace-matching already
+        // scopes the search to `map_channel` alone, so nothing in this
+        // test module's `=>` tokens can leak in — but a whole-file
+        // search for `needle` itself has no such protection if a future
+        // test ever needed a second, unrelated occurrence of the same
+        // text. Marker is `concat!`'d for the same reason `needle` is:
+        // this guard reads its own file and cannot avoid seeing its own
+        // source.
+        let marker = concat!("#[cfg(test)]", "\n", "mod tests {");
+        let this_file = include_str!("intent_nonce_ledger_bridge.rs");
+        let production = this_file
+            .split_once(marker)
+            .map_or(this_file, |(production, _test)| production);
+        let fn_start = production
+            .find(needle)
+            .expect("map_channel's own definition must be present in production");
+
+        let fn_brace_open = production[fn_start..]
+            .find('{')
+            .map(|offset| fn_start + offset)
+            .expect("a fn definition must have an opening brace");
+        let mut depth = 0i32;
+        let mut fn_end = production.len();
+        for (offset, ch) in production[fn_brace_open..].char_indices() {
+            match ch {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        fn_end = fn_brace_open + offset + 1;
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        let fn_body = &production[fn_start..fn_end];
+
+        let match_kw = fn_body
+            .find("match ")
+            .expect("map_channel must still dispatch on channel via a match");
+        let match_brace_open = fn_body[match_kw..]
+            .find('{')
+            .map(|offset| match_kw + offset)
+            .expect("the match must have a body");
+        let mut depth = 0i32;
+        let mut match_brace_close = fn_body.len();
+        for (offset, ch) in fn_body[match_brace_open..].char_indices() {
+            match ch {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        match_brace_close = match_brace_open + offset + 1;
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        let match_body = &fn_body[match_brace_open + 1..match_brace_close - 1];
+
+        let arms = arm_patterns(match_body);
+        // Non-vacuity: pinned to the known-today count, not `>= 1` — a
+        // wrong count (including from the naive-parse limitation noted
+        // above) fails loud instead of silently checking a subset.
+        assert_eq!(
+            arms.len(),
+            2,
+            "expected exactly the 2 known arms (Dev, Release); a \
+             different count means either a real arm was added/removed \
+             or this guard's naive comma-split mis-parsed a more complex \
+             match body — in either case, verify by hand before trusting \
+             this guard's verdict again"
+        );
+        let unqualified: Vec<&str> = arms
+            .iter()
+            .copied()
+            .filter(|pattern| !is_qualified_arm(pattern))
+            .collect();
+        assert!(
+            unqualified.is_empty(),
+            "map_channel has an unqualified arm pattern: {unqualified:?} — \
+             a bare `_` or bare-identifier catch-all here would silently \
+             swallow a new upstream ExpectedChannel variant instead of \
+             failing to compile. The trybuild fixture in \
+             compile_fail_channel_mapping.rs cannot see this: it holds \
+             its own copy of the arms and only fails when \
+             ExpectedChannel itself changes, never when this real match \
+             grows a catch-all"
+        );
+    }
+
     #[test]
     fn channel_maps_one_to_one() {
         assert!(matches!(
