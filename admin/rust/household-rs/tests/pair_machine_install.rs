@@ -235,9 +235,39 @@ async fn pin_household_anchor_rolls_back_in_memory_state_on_persist_failure() {
     .unwrap();
     assert_eq!(window.snapshot().await.state, PairMachineState::Staging);
 
-    // Revoke write permission on household_dir to force atomic_write_cbor
-    // to fail at open_tmp_0600.
-    let hh_dir = td.path().join("household");
+    // Revoke write permission on the directory the subject ACTUALLY writes to,
+    // DERIVED from the tree rather than hardcoded by layout.
+    //
+    // This used to chmod `household/`, which was correct while the pair-machine
+    // window lived at `household/pair_machine_window.cbor`. The B-1 change moved
+    // that write into a generation-scoped `PairWindowNamespaceV2`, a SIBLING of
+    // `household/`. The chmod then covered a directory the subject no longer
+    // touched, so persist stopped failing and this test went red claiming
+    // something false -- "persist must fail when household_dir is read-only",
+    // where household_dir had become irrelevant.
+    //
+    // Worse, the skip-probe below wrote to `household/` too: still blocked, so
+    // it did NOT skip, while the subject wrote elsewhere and did not fail. The
+    // precondition and the operation had come to point at different paths, and a
+    // skip evaluated somewhere other than the operation is worse than no skip --
+    // it certifies an environment nobody checked.
+    //
+    // Deriving the target keeps the observation bound to the operation, so the
+    // next relocation cannot silently repeat this.
+    let hh_dir = fs::read_dir(td.path())
+        .expect("state dir readable")
+        .filter_map(Result::ok)
+        .map(|e| e.path())
+        .find(|p| {
+            p.is_dir()
+                && p.file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.starts_with(".pair-windows-v2."))
+        })
+        .expect(
+            "pair-window namespace must exist after staging -- if this fires, the \
+             subject's write target moved again and this test must follow it",
+        );
     let restore_perm = fs::metadata(&hh_dir).unwrap().permissions();
     let mut ro = restore_perm.clone();
     ro.set_mode(0o500);

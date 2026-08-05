@@ -5610,7 +5610,17 @@ fn owner_webauthn_add_credential_finish_source_guards_mutation_contract() {
     assert!(handler.contains("finish_owner_approval_assertion"));
     assert!(handler.contains("OwnerWebauthnAuthority::sign_append"));
     assert!(handler.contains("OwnerWebauthnCredentialEventAction::Add"));
-    assert!(handler.contains(".save("));
+    // Was `.save(`. The B-2 lifecycle hardening replaced that call with
+    // `persist_owner_auth_under_lifecycle`, which persists the same thing under
+    // a lifecycle guard -- strictly stronger. Asserting the OLD spelling made
+    // this guard fail on a change that improved the property it guards.
+    //
+    // This is the second instance in this composition of the same shape: a
+    // security change RELOCATES or RENAMES a mechanism, and an incidental
+    // property of the old site -- here a literal call spelling -- is removed in
+    // silence, breaking whatever depended on it. Assert the guarded call, so the
+    // guard tracks the property rather than the wording of one era.
+    assert!(handler.contains("persist_owner_auth_under_lifecycle"));
     assert!(handler.contains("set_owner_auth"));
     assert!(handler.contains("verify_or_update_owner_webauthn_authority_anchor"));
     assert!(!handler.contains("OwnerWebauthnAuthority::sign_recovery_add"));
