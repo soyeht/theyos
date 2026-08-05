@@ -101,6 +101,134 @@ pub enum BridgeError {
     Keystore(KeystoreError),
 }
 
+// ─── Public control-cell factory (#45, @ilia authorized 2026-08-05) ────────
+//
+// The channel is this crate's OWN enum, never `&str`. @delia's contract is
+// not "do not write `_`" but "the compiler must stop when a third channel
+// appears" -- and `&str` cannot satisfy it: its domain is unbounded, so the
+// compiler DEMANDS a final arm, that arm is a catch-all under another name,
+// and a third channel lands there at runtime instead of failing to build.
+// Enum-to-enum keeps the mapping exhaustive with no catch-all, in the shape
+// `intent_nonce_ledger_bridge.rs:102-105` already landed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ControlChannel {
+    Dev,
+    Release,
+}
+
+impl ControlChannel {
+    /// Exhaustive by construction: no `_` arm and no bare binding, so adding
+    /// a variant on either side stops the build rather than defaulting.
+    fn to_d4(self) -> crate::record::Channel {
+        match self {
+            ControlChannel::Dev => crate::record::Channel::Dev,
+            ControlChannel::Release => crate::record::Channel::Release,
+        }
+    }
+}
+
+/// Why [`open_control_cell`] refused.
+#[derive(Debug)]
+pub enum OpenControlCellError {
+    /// The parent directory could not be prepared.
+    ///
+    /// This step exists because of a MEASURED hole, not out of caution.
+    /// `cell::open` keys its process-wide dedup registry on the path, and
+    /// `registry_key` falls back to the RAW path when the parent cannot be
+    /// canonicalised. `open` performs no filesystem work at all, so nothing
+    /// else fails first: two spellings of one file under a not-yet-created
+    /// parent produce two keys, two live cells, and two independent
+    /// `FileBackedStore`+`MeshSignerLocks` pairs over the same file -- which
+    /// `store.rs` describes as "racing each other exactly like the pre-token
+    /// bug", the thing the registry exists to prevent. Probed on
+    /// `64e03838`: parent absent -> two distinct `LockToken`s; parent
+    /// present, same two spellings -> one. Preparing the parent first makes
+    /// the key canonical, closing the window at this entry point without
+    /// depending on auditing every caller's path spelling.
+    PrepareParentDir(std::io::Error),
+    /// A cell is already live for this path, bound to a different
+    /// identity/purpose.
+    ///
+    /// Deliberately NOT flattened into the success path: the prior version
+    /// of `open` handed back the existing cell regardless of whether it
+    /// matched what the caller asked for (round 5, item A1).
+    ///
+    /// The name says "already open", not "invalid", because this is a
+    /// LIVENESS fact and not a validation one: `open` only conflicts while
+    /// another holder still owns the cell, so the identical call succeeds
+    /// once that holder drops it. A caller that reads this as an argument
+    /// error will never retry, and retrying is legitimate here.
+    AlreadyOpenForOtherIdentity,
+}
+
+/// An opaque handle to a live control-record cell.
+///
+/// The D4 cell is held privately: `ControlRecordCell` is `pub(crate)` in this
+/// crate (`pub(crate) use d4_inline::*;` at the root), and wrapping it here
+/// keeps it off every public signature. Callers hold the handle and pass it
+/// back in; they never name a D4 type.
+// Same narrow posture as `new_internal`'s own allow, and for the same reason:
+// this factory closes the CELL half of the seam, and nothing in a non-test
+// build consumes the handle until the runtime facade lands and composes the
+// SIGNER half. Measured, not assumed -- removing this allow leaves
+// `cargo clippy --all-targets -D warnings` reporting `field 0 is never read`
+// and `method cell is never used`. Scoped to the struct and its one method,
+// never module- or crate-wide, so it cannot mask anything else.
+#[allow(dead_code)]
+pub struct ControlCellHandle(std::sync::Arc<crate::cell::ControlRecordCell>);
+
+impl std::fmt::Debug for ControlCellHandle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // No D4 type named, and no path or identity leaked into logs.
+        f.write_str("ControlCellHandle")
+    }
+}
+
+impl ControlCellHandle {
+    // The struct-level allow does not reach a separate `impl` block, so the
+    // method carries its own -- same scope discipline, one item at a time.
+    #[allow(dead_code)]
+    pub(crate) fn cell(&self) -> &crate::cell::ControlRecordCell {
+        &self.0
+    }
+}
+
+/// Opens (or joins, while live) the control-record cell for `path`.
+///
+/// The short signature is what the measurement allows: `cell::open` takes
+/// `ControlIdentity` (a `pub` struct of two `String`s and a two-variant
+/// enum), `PurposeId`, and an `OrderSpy` built by a zero-argument `new()`.
+/// All three are constructible from primitives inside this crate, so the
+/// opaque-parameter design is unnecessary and NO D4 type crosses the
+/// boundary -- including `OpenConflict`, which is translated rather than
+/// re-exported even though it carries no payload.
+pub fn open_control_cell(
+    path: std::path::PathBuf,
+    hh_id: String,
+    machine_id: String,
+    channel: ControlChannel,
+) -> Result<ControlCellHandle, OpenControlCellError> {
+    // Before `open`, never after: see `PrepareParentDir`. `create_dir_all`
+    // is idempotent, so the common case (directory already there) costs one
+    // stat and cannot fail spuriously.
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(OpenControlCellError::PrepareParentDir)?;
+    }
+    let identity = crate::record::ControlIdentity {
+        hh_id,
+        machine_id,
+        channel: channel.to_d4(),
+    };
+    crate::cell::open(
+        path,
+        identity,
+        crate::record::PurposeId::MeshSession,
+        std::sync::Arc::new(crate::locks::OrderSpy::new()),
+    )
+    .map(ControlCellHandle)
+    .map_err(|_| OpenControlCellError::AlreadyOpenForOtherIdentity)
+}
+
 // ─── Runtime facade seam (Lane R, @ilia, authorized 2026-08-05) ────────────
 //
 // `crate::validator::RosterLookup`/`SignatureVerifier`/`Clock` (all
@@ -929,6 +1057,101 @@ mod bridge_reds {
         }
         let err = signer.sign_authorised(b"x").unwrap_err();
         assert!(matches!(err, BridgeError::NotAuthorised(_)), "got {err:?}");
+    }
+}
+
+#[cfg(test)]
+mod control_cell_factory_tests {
+    use super::*;
+
+    fn ids() -> (String, String) {
+        ("hh-1".to_string(), "machine-1".to_string())
+    }
+
+    /// The window measured on `64e03838`: two spellings of one file under a
+    /// parent that does not exist yet split `cell::open`'s dedup key, giving
+    /// two live cells and two independent `LockToken`s over the same file.
+    ///
+    /// This asserts the FACTORY closes it. The negative control is the probe
+    /// itself, which is why this test is not vacuous: calling `cell::open`
+    /// directly with these same two spellings and no prepared parent yields
+    /// DIFFERENT tokens (measured -- `LockToken(16882036528562507219)` vs
+    /// `LockToken(4040523314997620666)`). If `create_dir_all` were dropped
+    /// from `open_control_cell`, this test fails.
+    #[test]
+    fn factory_dedups_two_spellings_under_a_parent_that_does_not_exist_yet() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("not-created-yet");
+        let (hh, machine) = ids();
+        let a = open_control_cell(
+            missing.join("record"),
+            hh.clone(),
+            machine.clone(),
+            ControlChannel::Dev,
+        )
+        .expect("first open");
+        let b = open_control_cell(
+            missing.join("..").join("not-created-yet").join("record"),
+            hh,
+            machine,
+            ControlChannel::Dev,
+        )
+        .expect("second open");
+        assert_eq!(
+            a.cell().token(),
+            b.cell().token(),
+            "the factory prepares the parent before open(), so registry_key canonicalises and both spellings reach ONE cell -- two tokens here means two independent FileBackedStore+MeshSignerLocks pairs over one file, which is the race store.rs:229-237 describes"
+        );
+    }
+
+    /// The conflict is a LIVENESS fact, not a validation one, so the error
+    /// must survive as its own class rather than collapsing into the reuse
+    /// path -- round 5, item A1.
+    #[test]
+    fn factory_reports_a_conflicting_identity_instead_of_handing_back_the_live_cell() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("record");
+        let (hh, machine) = ids();
+        let _held =
+            open_control_cell(path.clone(), hh, machine, ControlChannel::Dev).expect("first open");
+        let clash = open_control_cell(
+            path,
+            "hh-2".to_string(),
+            "machine-2".to_string(),
+            ControlChannel::Dev,
+        );
+        assert!(
+            matches!(
+                clash,
+                Err(OpenControlCellError::AlreadyOpenForOtherIdentity)
+            ),
+            "a live cell bound to a different identity must refuse, never silently hand back the existing one"
+        );
+    }
+
+    /// `Dev` and `Release` must not collapse: they are part of the identity
+    /// the registry deduplicates on, so a channel mix-up is a conflict and
+    /// not a reuse.
+    #[test]
+    fn factory_treats_the_two_channels_as_distinct_identities() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("record");
+        let (hh, machine) = ids();
+        let _held = open_control_cell(
+            path.clone(),
+            hh.clone(),
+            machine.clone(),
+            ControlChannel::Dev,
+        )
+        .expect("first open");
+        let other_channel = open_control_cell(path, hh, machine, ControlChannel::Release);
+        assert!(
+            matches!(
+                other_channel,
+                Err(OpenControlCellError::AlreadyOpenForOtherIdentity)
+            ),
+            "Dev and Release map to distinct D4 Channel variants, so they must not share a cell"
+        );
     }
 }
 
