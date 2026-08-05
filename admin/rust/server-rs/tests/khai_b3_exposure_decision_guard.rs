@@ -110,12 +110,12 @@ fn expected_exposure(state: BootstrapState, class: InterfaceClass) -> bool {
             InterfaceClass::Loopback | InterfaceClass::Lan | InterfaceClass::Tailscale
         ),
         // Post-onboarding: no LAN HTTP, Mesh permitted.
-        BootstrapState::NamedAwaitingPair
-        | BootstrapState::Ready
-        | BootstrapState::Recovering => matches!(
-            class,
-            InterfaceClass::Loopback | InterfaceClass::Tailscale | InterfaceClass::Mesh
-        ),
+        BootstrapState::NamedAwaitingPair | BootstrapState::Ready | BootstrapState::Recovering => {
+            matches!(
+                class,
+                InterfaceClass::Loopback | InterfaceClass::Tailscale | InterfaceClass::Mesh
+            )
+        }
         // Interrupted install: the intersection of every legal predecessor.
         // Written literally rather than inherited from any other arm.
         BootstrapState::PairMachineInstallRestartRequired => {
