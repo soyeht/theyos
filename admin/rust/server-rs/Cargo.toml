@@ -27,14 +27,15 @@ name = "relay_stream_claw_dev"
 path = "src/bin/relay_stream_claw_dev.rs"
 required-features = ["dev_claw_share_mint"]
 
-# Dev-only relay_stream Public smoke helpers. Like `relay_stream_claw_dev`,
-# these are gated at the TARGET level: without `dev_claw_share_mint` they are
-# ABSENT from the build entirely, keeping them off the normal release surface.
+# Public blind relay. Unlike the owner-authority bypass fixtures around it,
+# this target contains no mint or target access and is part of the deployable
+# Share transport surface. Runtime remains default-off and requires
+# `THEYOS_RELAY_STREAM_PUBLIC_RELAY=1` plus hardened public/status binds.
 [[bin]]
 name = "relay_stream_public_relay"
 path = "src/bin/relay_stream_public_relay.rs"
-required-features = ["dev_claw_share_mint"]
 
+# Dev-only in-process relay smoke helper.
 [[bin]]
 name = "relay_stream_relay_dev"
 path = "src/bin/relay_stream_relay_dev.rs"

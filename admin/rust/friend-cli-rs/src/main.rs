@@ -1710,6 +1710,7 @@ mod tests {
                 claw_static_pub: RelayStreamClawStaticPublicKey::try_new([0x33; 32]).unwrap(),
                 not_after,
                 now_unix: OFFER_NOW,
+                app_presentation: None,
             },
             owner as &dyn IdentityKey,
         )
@@ -2286,15 +2287,15 @@ mod tests {
         assert!(member_key_from_hex(&"zz".repeat(32)).is_err()); // not hex
     }
 
-    // Group dial e2e (no-net): drive the credential-less auth + PTY payload over a
+    // Group dial e2e (no-net): drive the credential-less auth + ClawSite payload over a
     // duplex into the household data-tunnel serve loop, with a server verifier that
     // faithfully mirrors the engine's verify_relay_stream_offer_session (PoP under
     // offer.guest_device_pub, hash = blake3(THIS offer), target == claw, replay).
     // Proves the friend-cli Group/Public dial produces a frame the claw accepts and
-    // completes the PTY marker. (The REAL verifier is tested in server-rs half B;
+    // completes an HTTP response. (The REAL verifier is tested in server-rs half B;
     // the real responder over Noise is the gated hardware smoke.)
     #[tokio::test]
-    async fn group_dial_authenticates_and_runs_pty_against_household_server() {
+    async fn group_dial_authenticates_and_runs_clawsite_against_household_server() {
         // Server-side authorized session (credential-less; correlation only).
         struct TestSession;
         impl DataTunnelSession for TestSession {
@@ -2315,7 +2316,7 @@ mod tests {
             "g_a".to_string(),
             device.public(),
             "claw_alpha".to_string(),
-            RelayStreamResource::Pty,
+            RelayStreamResource::ClawSite,
             "relay-stream://127.0.0.1:49152".to_string(),
             RelayStreamClawStaticPublicKey::try_new([0x33; 32]).unwrap(),
             OFFER_NOW + 60,
@@ -2345,7 +2346,7 @@ mod tests {
             claw_io,
             OFFER_NOW,
             verify,
-            &PtyEchoTargetRouter,
+            &ClawSiteHttpTargetRouter,
             |_: &TestSession| false,
             std::time::Duration::from_secs(5),
         );
@@ -2353,7 +2354,7 @@ mod tests {
             let mut tunnel =
                 authenticate_open_relay_stream_session(guest_io, &offer, &device, OFFER_NOW)
                     .await?;
-            run_pty_command(&mut tunnel, "echo relay-stream-ok").await
+            run_http_request(&mut tunnel).await
         };
 
         let (claw_res, guest_res) =
@@ -2363,10 +2364,10 @@ mod tests {
             .await
             .expect("group dial round-trip should not hang");
 
-        let output = guest_res.expect("guest PTY payload over household server");
+        let output = guest_res.expect("guest ClawSite payload over household server");
         assert!(
-            output.contains("relay-stream-ok"),
-            "expected marker in PTY output, got: {output:?}"
+            output.starts_with("HTTP/1.1 200 OK") && output.contains("hello"),
+            "expected ClawSite HTTP response, got: {output:?}"
         );
         let _ = claw_res;
     }
@@ -2385,7 +2386,7 @@ mod tests {
             SlotId([0x98; 16]),
             device_a.public(),
             "claw_alpha".to_string(),
-            RelayStreamResource::Pty,
+            RelayStreamResource::ClawSite,
             "relay-stream://127.0.0.1:49152".to_string(),
             RelayStreamClawStaticPublicKey::try_new([0x33; 32]).unwrap(),
             OFFER_NOW + 60,

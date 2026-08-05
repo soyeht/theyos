@@ -28,6 +28,7 @@ use crate::claw_share_relay_stream_issuer_trust::{
     RelayStreamIssuerTrust, RelayStreamTrustContext,
 };
 use crate::claw_share_relay_stream_noise::RelayStreamNoiseStaticKeypair;
+use crate::claw_share_relay_stream_reopen_limiter::{ReopenLimiterConfig, ReopenStreamLimiter};
 use crate::claw_share_relay_stream_responder::ResponderDataTunnelDeps;
 use crate::claw_share_relay_stream_responder_params::RelayStreamResponderParams;
 use crate::claw_share_relay_stream_trust_context_health::{
@@ -228,6 +229,8 @@ pub(crate) fn data_tunnel_store() -> Arc<ClawShareSlotStore> {
             claw_id: DATA_TUNNEL_CLAW_ID.to_string(),
             expires_at: now_unix() + 86_400,
             state: SlotState::Open,
+            app_presentation: None,
+            created_at: None,
         })
         .unwrap();
     store
@@ -277,6 +280,7 @@ pub(crate) fn data_tunnel_deps(
         slots,
         replay,
         TcpStreamRouter::new(target_addr),
+        Arc::new(ReopenStreamLimiter::new(ReopenLimiterConfig::default())),
     )
 }
 

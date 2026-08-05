@@ -56,6 +56,7 @@ use household_rs::machine_cert::{MachineCert, Platform, SignOptions};
 use server_rs::claw_share_pty_target::{PtyPolicy, PtyTargetRouter};
 use server_rs::claw_share_relay_stream_admission::RelayStreamAdmission;
 use server_rs::claw_share_relay_stream_noise::generate_relay_stream_noise_static_keypair;
+use server_rs::claw_share_relay_stream_reopen_limiter::{ReopenLimiterConfig, ReopenStreamLimiter};
 use server_rs::claw_share_relay_stream_responder::ResponderDataTunnelDeps;
 use server_rs::claw_share_relay_stream_responder_params::RelayStreamResponderParams;
 use server_rs::claw_share_relay_stream_responder_reverse_connect::{
@@ -311,6 +312,7 @@ async fn main() -> std::io::Result<()> {
         Arc::new(ClawShareSlotStore::new()),
         Arc::new(ReplayGuard::new()),
         PtyTargetRouter::new(PtyPolicy::from_env()),
+        Arc::new(ReopenStreamLimiter::new(ReopenLimiterConfig::default())),
     ));
 
     let allow_non_loopback = !relay_addr.ip().is_loopback();

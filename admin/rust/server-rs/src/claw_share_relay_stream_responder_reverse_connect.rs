@@ -324,6 +324,7 @@ mod tests {
             reaper_interval: Duration::from_millis(50),
             splice_idle_timeout: Duration::from_secs(5),
             splice_max_lifetime: Duration::from_secs(60),
+            splice_max_bytes_per_direction: None,
             abuse: crate::claw_share_relay_stream_abuse::RelayAbuseConfig::default(),
         }
     }

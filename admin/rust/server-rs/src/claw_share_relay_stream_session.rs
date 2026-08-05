@@ -16,13 +16,14 @@
 
 use std::fmt::Write as _;
 
+use household_rs::claw_share::GuestCredential;
 use household_rs::claw_share_data_tunnel::{
     AuthEnvelope, DataTunnelError, DataTunnelSession, ReplayGuard, credential_hash,
 };
 
 use crate::claw_share_relay_stream_contract::{
-    RelayStreamAudience, RelayStreamOfferContract, check_relay_stream_group_membership,
-    check_relay_stream_public,
+    RelayStreamAudience, RelayStreamOfferContract, RelayStreamResource,
+    check_relay_stream_group_membership, check_relay_stream_public,
 };
 use crate::claw_share_relay_stream_issuer_trust::RelayStreamIssuerTrust;
 
@@ -38,6 +39,7 @@ use crate::claw_share_relay_stream_issuer_trust::RelayStreamIssuerTrust;
 pub struct RelayStreamOfferSession {
     session_id: String,
     mesh_ipv6: String,
+    allows_persistent_targets: bool,
 }
 
 impl RelayStreamOfferSession {
@@ -67,6 +69,7 @@ impl RelayStreamOfferSession {
         Ok(Self {
             session_id,
             mesh_ipv6,
+            allows_persistent_targets: offer.payload.resource == RelayStreamResource::ClawSite,
         })
     }
 }
@@ -77,6 +80,54 @@ impl DataTunnelSession for RelayStreamOfferSession {
     }
     fn mesh_ipv6(&self) -> String {
         self.mesh_ipv6.clone()
+    }
+
+    fn allows_persistent_targets(&self) -> bool {
+        self.allows_persistent_targets
+    }
+}
+
+/// Device-audience authorized session: the owner-signed [`GuestCredential`]
+/// plus persistent-target eligibility keyed on the OFFER's signed resource.
+///
+/// The ack stays byte-identical to the legacy Device path — `session_id` and
+/// `mesh_ipv6` delegate VERBATIM to the inner credential's slot-derived
+/// helpers. Only `allows_persistent_targets` is new, and it is keyed on
+/// `offer.payload.resource` (verified via the Noise prologue at handshake and
+/// re-verified by the live gate), so a caller cannot flip it without breaking
+/// the offer's signature. `ClawSite` enables sequential `OpenPersistent`
+/// targets; `Pty` and `IpTunnel` retain the legacy single-target shape.
+pub struct RelayStreamDeviceSession {
+    credential: GuestCredential,
+    allows_persistent_targets: bool,
+}
+
+impl RelayStreamDeviceSession {
+    #[must_use]
+    pub fn new(credential: GuestCredential, resource: RelayStreamResource) -> Self {
+        Self {
+            credential,
+            allows_persistent_targets: resource == RelayStreamResource::ClawSite,
+        }
+    }
+
+    /// The credential the slot-revocation predicate keys on.
+    #[must_use]
+    pub fn credential(&self) -> &GuestCredential {
+        &self.credential
+    }
+}
+
+impl DataTunnelSession for RelayStreamDeviceSession {
+    fn session_id(&self) -> String {
+        self.credential.session_id()
+    }
+    fn mesh_ipv6(&self) -> String {
+        self.credential.mesh_ipv6()
+    }
+
+    fn allows_persistent_targets(&self) -> bool {
+        self.allows_persistent_targets
     }
 }
 
@@ -195,10 +246,29 @@ mod tests {
     };
     use crate::claw_share_relay_stream_issuer_trust::RelayStreamTrustContext;
     use crate::claw_share_relay_stream_test_support::{
-        RELAY_STREAM_CLAW_ID, RELAY_STREAM_ENDPOINT, attacker_signer, guest_pub, guest_signer,
-        now_unix, owner_pub, owner_signer, relay_stream_household_record,
+        RELAY_STREAM_CLAW_ID, RELAY_STREAM_ENDPOINT, attacker_signer, data_tunnel_credential,
+        guest_pub, guest_signer, now_unix, owner_pub, owner_signer, relay_stream_household_record,
         relay_stream_machine_cert, rendezvous_token, spawn_ack_target,
     };
+
+    #[test]
+    fn device_session_persistent_eligibility_keys_on_signed_clawsite_resource() {
+        let credential = data_tunnel_credential();
+        let clawsite = RelayStreamDeviceSession::new(credential.clone(), RelayStreamResource::ClawSite);
+        let pty = RelayStreamDeviceSession::new(credential.clone(), RelayStreamResource::Pty);
+        let ip_tunnel =
+            RelayStreamDeviceSession::new(credential.clone(), RelayStreamResource::IpTunnel);
+
+        assert!(clawsite.allows_persistent_targets());
+        assert!(!pty.allows_persistent_targets());
+        assert!(!ip_tunnel.allows_persistent_targets());
+        // The ack stays byte-identical to the legacy Device path: the wrapper
+        // delegates both correlation values to the inner credential verbatim.
+        assert_eq!(clawsite.session_id(), credential.session_id());
+        assert_eq!(clawsite.mesh_ipv6(), credential.mesh_ipv6());
+        assert_eq!(pty.session_id(), credential.session_id());
+        assert_eq!(clawsite.credential().slot_id, credential.slot_id);
+    }
 
     fn static_pub() -> RelayStreamClawStaticPublicKey {
         RelayStreamClawStaticPublicKey::try_new([0x77; 32]).unwrap()
@@ -214,7 +284,7 @@ mod tests {
             "g_a".to_string(),
             guest_pub(),
             RELAY_STREAM_CLAW_ID.to_string(),
-            RelayStreamResource::Pty,
+            RelayStreamResource::ClawSite,
             RELAY_STREAM_ENDPOINT.to_string(),
             static_pub(),
             not_after,
@@ -230,7 +300,7 @@ mod tests {
             SlotId([0x98; 16]),
             guest_pub(),
             RELAY_STREAM_CLAW_ID.to_string(),
-            RelayStreamResource::Pty,
+            RelayStreamResource::ClawSite,
             RELAY_STREAM_ENDPOINT.to_string(),
             static_pub(),
             not_after,
@@ -353,6 +423,23 @@ mod tests {
         // Different offer → different session id.
         let other = RelayStreamOfferSession::from_offer(&public_offer(now + 60)).unwrap();
         assert_ne!(s1.session_id(), other.session_id());
+    }
+
+    #[test]
+    fn persistent_targets_are_clawsite_only() {
+        let now = now_unix();
+        let offer = group_offer(now + 60);
+        let clawsite = RelayStreamOfferSession::from_offer(&offer).unwrap();
+        let mut pty_offer = offer.clone();
+        pty_offer.payload.resource = RelayStreamResource::Pty;
+        let pty = RelayStreamOfferSession::from_offer(&pty_offer).unwrap();
+        let mut ip_tunnel_offer = offer;
+        ip_tunnel_offer.payload.resource = RelayStreamResource::IpTunnel;
+        let ip_tunnel = RelayStreamOfferSession::from_offer(&ip_tunnel_offer).unwrap();
+
+        assert!(clawsite.allows_persistent_targets());
+        assert!(!pty.allows_persistent_targets());
+        assert!(!ip_tunnel.allows_persistent_targets());
     }
 
     #[test]

@@ -699,11 +699,11 @@ async fn run_install_claw_macos(state: &SharedState, job: &jobs_rs::Job) -> Resu
     let claw_name = job.instance_id.clone();
     let job_id = job.id.clone();
 
-    update_job_message(state, &job_id, "checking macOS base image...").await;
-    info!("[install-worker] {claw_name}: checking macOS base image...");
+    update_job_message(state, &job_id, "checking guest base image...").await;
+    info!("[install-worker] {claw_name}: checking guest base image...");
 
-    if let Err(e) = check_macos_base_ready() {
-        let msg = format!("macOS base image not ready: {e}");
+    if let Err(e) = check_any_guest_base_ready() {
+        let msg = format!("no guest base image ready: {e}");
         error!("[install-worker] {claw_name}: {msg}");
         if let Err(e) = state.claw_store.mark_failed(&claw_name, &msg) {
             error!("[install-worker] {claw_name}: mark_failed failed: {e}");
@@ -792,6 +792,65 @@ fn check_macos_base_ready() -> Result<(), String> {
         )),
         None => Err("init-state.json missing phase field — run 'theyos init-macos-guest'".into()),
     }
+}
+
+/// Resolve the Linux guest base directory on a macOS host
+/// (`$THEYOS_VM_ASSETS_DIR/linux-base`, default
+/// `~/Library/Application Support/theyos/vms/linux-base`).
+#[cfg(target_os = "macos")]
+fn linux_base_dir() -> PathBuf {
+    if let Ok(d) = std::env::var("THEYOS_VM_ASSETS_DIR") {
+        return PathBuf::from(d).join("linux-base");
+    }
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
+    PathBuf::from(home).join("Library/Application Support/theyos/vms/linux-base")
+}
+
+/// Check that the Linux guest base is fully initialized.
+///
+/// `disk.img` alone is NOT sufficient (it appears mid-init, before first
+/// boot); require `init-state.json` with `phase == "complete"`, mirroring
+/// `check_macos_base_ready` and the availability probe
+/// (`availability.rs::linux_base_ready_at`). Unreadable/unparseable state
+/// fails closed.
+#[cfg(target_os = "macos")]
+fn check_linux_base_ready() -> Result<(), String> {
+    let base_dir = linux_base_dir();
+    if !base_dir.join("disk.img").exists() {
+        return Err("disk.img missing — Linux base not installed".into());
+    }
+    let state_file = base_dir.join("init-state.json");
+    let content = std::fs::read_to_string(&state_file)
+        .map_err(|e| format!("read linux-base init-state.json: {e}"))?;
+    let state: serde_json::Value = serde_json::from_str(&content)
+        .map_err(|e| format!("parse linux-base init-state.json: {e}"))?;
+    match state.get("phase").and_then(|v| v.as_str()) {
+        Some("complete") => Ok(()),
+        Some(phase) => Err(format!("linux-base init incomplete (phase: {phase})")),
+        None => Err("linux-base init-state.json missing phase field".into()),
+    }
+}
+
+/// Install-time base precondition: at least ONE guest base must be ready.
+///
+/// The macOS install path is state-only (`mark_ready`) and serves BOTH guest
+/// types — the `guest_os` is only chosen later, at instance create time, so a
+/// per-guest precondition cannot exist at this layer. What this layer can
+/// legitimately ask is "can this host run anything?", which is exactly
+/// linux-base-complete OR macos-base-complete. Per-guest enforcement lives
+/// where `guest_os` exists: the create gate
+/// (`instance_create.rs::guest_image_gate_for_guest_os`). Consequence, made
+/// explicit in the tests: a host with only linux-base marks the claw Ready,
+/// and a later macOS-guest create still fails at the create gate — right
+/// error, right layer.
+#[cfg(target_os = "macos")]
+fn check_any_guest_base_ready() -> Result<(), String> {
+    let linux_err = match check_linux_base_ready() {
+        Ok(()) => return Ok(()),
+        Err(e) => e,
+    };
+    check_macos_base_ready()
+        .map_err(|macos_err| format!("linux-base: {linux_err}; macos-base: {macos_err}"))
 }
 
 // ─── Tests ───────────────────────────────────────────────────────────────────
@@ -1052,9 +1111,17 @@ mod tests {
 
     // check_macos_base_ready (macOS only)
 
+    /// Serializes the macOS-only base-readiness tests: they all mutate the
+    /// process-global THEYOS_VM_ASSETS_DIR and would otherwise race under the
+    /// default parallel test runner (same pattern as RELOAD_ENV_LOCK in
+    /// cloudflared_sync.rs).
+    #[cfg(target_os = "macos")]
+    static VM_ASSETS_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[cfg(target_os = "macos")]
     #[test]
     fn check_macos_base_ready_state_machine() {
+        let _guard = VM_ASSETS_ENV_LOCK.lock().unwrap();
         // Owns THEYOS_VM_ASSETS_DIR for the duration; macos_base_dir() reads it.
         let tmp = tempfile::TempDir::new().unwrap();
         let base = tmp.path().join("macos-base");
@@ -1085,6 +1152,64 @@ mod tests {
         let err = check_macos_base_ready().unwrap_err();
         assert!(err.contains("parse init-state.json"), "got: {err}");
 
+        core_rs::env::remove_test_env("THEYOS_VM_ASSETS_DIR");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn check_any_guest_base_ready_passes_with_linux_base_only() {
+        // Acceptance: installing a claw must pass with the macOS base ABSENT
+        // when the Linux base is complete — the install is state-only and
+        // serves both guest types. Explicit side effect (per review): a later
+        // macOS-guest create still fails at the instance_create gate, which
+        // is tested there (`gate_still_blocks_macos_guests_until_image_done`).
+        // Owns THEYOS_VM_ASSETS_DIR for the duration (same convention as the
+        // sibling macos-base test above).
+        let _guard = VM_ASSETS_ENV_LOCK.lock().unwrap();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let linux = tmp.path().join("linux-base");
+        std::fs::create_dir_all(&linux).unwrap();
+        core_rs::env::set_test_env("THEYOS_VM_ASSETS_DIR", tmp.path().to_str().unwrap());
+
+        // Neither base present -> Err naming both probes.
+        let err = check_any_guest_base_ready().unwrap_err();
+        assert!(
+            err.contains("linux-base") && err.contains("macos-base"),
+            "error should report both probes, got: {err}"
+        );
+
+        // disk.img alone is NOT enough (it appears mid-init).
+        std::fs::write(linux.join("disk.img"), b"x").unwrap();
+        assert!(check_any_guest_base_ready().is_err());
+
+        // Complete Linux base with NO macos-base -> Ok.
+        std::fs::write(linux.join("init-state.json"), r#"{"phase":"complete"}"#).unwrap();
+        assert!(
+            check_any_guest_base_ready().is_ok(),
+            "a complete Linux base must satisfy the install precondition"
+        );
+
+        // Interrupted init (phase not complete) fails closed again.
+        std::fs::write(
+            linux.join("init-state.json"),
+            r#"{"phase":"convert_image"}"#,
+        )
+        .unwrap();
+        assert!(check_any_guest_base_ready().is_err());
+
+        core_rs::env::remove_test_env("THEYOS_VM_ASSETS_DIR");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn check_any_guest_base_ready_passes_with_macos_base_only() {
+        let _guard = VM_ASSETS_ENV_LOCK.lock().unwrap();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let macos = tmp.path().join("macos-base");
+        std::fs::create_dir_all(&macos).unwrap();
+        core_rs::env::set_test_env("THEYOS_VM_ASSETS_DIR", tmp.path().to_str().unwrap());
+        std::fs::write(macos.join("init-state.json"), r#"{"phase":"complete"}"#).unwrap();
+        assert!(check_any_guest_base_ready().is_ok());
         core_rs::env::remove_test_env("THEYOS_VM_ASSETS_DIR");
     }
 }

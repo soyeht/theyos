@@ -201,6 +201,23 @@ pub(crate) fn guest_image_not_ready_response(guest: &GuestImageState) -> Option<
     )
 }
 
+/// guest_os-aware wrapper around [`guest_image_not_ready_response`]: the macOS
+/// base-image gate only applies to macOS guests. Linux guests boot from their
+/// own rootfs and must pass even when no macOS base image exists on this host —
+/// otherwise `409 GUEST_IMAGE_NOT_READY` blocks every Linux create and the
+/// Linux capacity exemption (`capacity.rs`, guarded on `guest_os == "macos"`)
+/// is never reached.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub(crate) fn guest_image_gate_for_guest_os(
+    guest_os: &str,
+    guest: &GuestImageState,
+) -> Option<Response> {
+    if guest_os != "macos" {
+        return None;
+    }
+    guest_image_not_ready_response(guest)
+}
+
 /// Household scope stamped onto instances created through household `PoP` routes.
 /// `PoP` authorization stays ABOVE the core; the core only threads this onto the
 /// inserted row (`household_id` / `household_machine_id`).
@@ -438,9 +455,11 @@ pub(crate) async fn create_instance_core(
     };
 
     // Host-level macOS guest-image gate (PR-1; `#[cfg(target_os = "macos")]`).
+    // Only macOS guests are gated — Linux guests boot from their own rootfs.
     #[cfg(target_os = "macos")]
     {
-        if let Some(resp) = guest_image_not_ready_response(
+        if let Some(resp) = guest_image_gate_for_guest_os(
+            &guest_os,
             &crate::guest_image_state::GuestImageState::read_current(),
         ) {
             return Ok(CreateOutcome::EarlyResponse(resp));
@@ -765,6 +784,37 @@ mod tests {
             ..Default::default()
         };
         assert!(guest_image_not_ready_response(&done).is_none());
+    }
+
+    #[test]
+    fn gate_skips_linux_guests_even_without_macos_image() {
+        // A host with NO macOS base image (state file absent → not_applicable)
+        // must still admit Linux guests: they boot from their own rootfs.
+        assert!(guest_image_gate_for_guest_os("linux", &GuestImageState::not_applicable()).is_none());
+        // ...and the same holds while the macOS image is pending, installing,
+        // or failed — none of those concern a Linux guest.
+        for status in ["pending", "in_progress", "failed"] {
+            let guest = GuestImageState {
+                status: Some(status.to_string()),
+                ..Default::default()
+            };
+            assert!(
+                guest_image_gate_for_guest_os("linux", &guest).is_none(),
+                "linux guest must bypass the macOS image gate (status {status:?})"
+            );
+        }
+    }
+
+    #[test]
+    fn gate_still_blocks_macos_guests_until_image_done() {
+        let resp = guest_image_gate_for_guest_os("macos", &GuestImageState::not_applicable())
+            .expect("macOS guest without a base image must still be gated");
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
+        let done = GuestImageState {
+            status: Some("done".to_string()),
+            ..Default::default()
+        };
+        assert!(guest_image_gate_for_guest_os("macos", &done).is_none());
     }
 
     #[tokio::test]

@@ -8,7 +8,7 @@
 use std::fmt;
 use std::sync::Arc;
 
-use household_rs::claw_share::{ClawShareSlotStore, GuestCredential, SlotState};
+use household_rs::claw_share::{ClawShareSlotStore, SlotState};
 use household_rs::claw_share_data_tunnel::{
     AuthEnvelope, ClawTargetRouter, DataTunnelError, ReplayGuard, authorize_session,
     serve_connection_io_with_auth_deadline,
@@ -17,12 +17,16 @@ use household_rs::ids::HouseholdId;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::time::timeout;
 
-use crate::claw_share_relay_stream_contract::{RelayStreamAudience, RelayStreamOfferContract};
+use crate::claw_share_relay_stream_contract::{
+    RelayStreamAudience, RelayStreamOfferContract, RelayStreamResource,
+};
 use crate::claw_share_relay_stream_issuer_trust::RelayStreamIssuerTrust;
 use crate::claw_share_relay_stream_noise::{RelayStreamNoiseError, responder_handshake_with_trust};
+use crate::claw_share_relay_stream_reopen_limiter::ReopenStreamLimiter;
 use crate::claw_share_relay_stream_responder_params::RelayStreamResponderParams;
 use crate::claw_share_relay_stream_session::{
-    RelayStreamOfferSession, relay_stream_offer_session_revoked, verify_relay_stream_offer_session,
+    RelayStreamDeviceSession, RelayStreamOfferSession, relay_stream_offer_session_revoked,
+    verify_relay_stream_offer_session,
 };
 use crate::claw_share_session_clock::{AdmissionInstant, ClockVerdict, SessionClock};
 
@@ -31,6 +35,14 @@ pub struct ResponderDataTunnelDeps<R> {
     pub slots: Arc<ClawShareSlotStore>,
     pub replay: Arc<ReplayGuard>,
     pub router: R,
+    /// Per-`(claw_id, guest_device_pub)` reopen-rate gate for `ClawSite`
+    /// dials — see `claw_share_relay_stream_reopen_limiter` for why this is
+    /// independent of the `OpenPersistent` per-connection byte/open budget.
+    /// The Group/Public arm invokes it on the offer's authenticated pair and
+    /// the Device arm on the authorized credential's pair, both ONLY when the
+    /// resource is `RelayStreamResource::ClawSite` — `IpTunnel` (Product
+    /// A/nvpn's T1 datapath) and `Pty` stay untouched.
+    pub reopen_limiter: Arc<ReopenStreamLimiter>,
 }
 
 impl<R> ResponderDataTunnelDeps<R> {
@@ -40,12 +52,14 @@ impl<R> ResponderDataTunnelDeps<R> {
         slots: Arc<ClawShareSlotStore>,
         replay: Arc<ReplayGuard>,
         router: R,
+        reopen_limiter: Arc<ReopenStreamLimiter>,
     ) -> Self {
         Self {
             household_id,
             slots,
             replay,
             router,
+            reopen_limiter,
         }
     }
 }
@@ -57,6 +71,7 @@ impl<R> fmt::Debug for ResponderDataTunnelDeps<R> {
             .field("slots", &"ClawShareSlotStore(redacted)")
             .field("replay", &"ReplayGuard(redacted)")
             .field("router", &"redacted")
+            .field("reopen_limiter", &"redacted")
             .finish()
     }
 }
@@ -152,14 +167,34 @@ where
             let revocation_slots = Arc::clone(&deps.slots);
             let device_clock = clock.clone();
             let device_live_now = Arc::clone(&live_now);
+            let reopen_limiter = Arc::clone(&deps.reopen_limiter);
+            // Persistent-target eligibility keys on the OFFER's signed resource
+            // (ClawSite only); the ack stays byte-identical because the wrapper
+            // delegates session_id/mesh_ipv6 to the inner credential verbatim.
+            let device_resource = offer.payload.resource;
             serve_connection_io_with_auth_deadline(
                 noise_stream,
                 now_unix,
                 move |envelope: &AuthEnvelope, now| {
-                    authorize_session(envelope, &household_id, &auth_slots, &replay, now)
+                    let cred =
+                        authorize_session(envelope, &household_id, &auth_slots, &replay, now)?;
+                    // ClawSite-only (same boundary as Group/Public): the
+                    // per-connection budget resets on every reconnect, so bound
+                    // how often this AUTHENTICATED principal mints a fresh one.
+                    // Keyed on the authorized credential's own pair — never on
+                    // caller-claimed fields before auth — and never consulted
+                    // for Pty (legacy reconnects) or IpTunnel (Product A/nvpn).
+                    if device_resource == RelayStreamResource::ClawSite {
+                        reopen_limiter.check_and_record(
+                            &cred.claw_id,
+                            &cred.guest_device_pub,
+                            now,
+                        )?;
+                    }
+                    Ok(RelayStreamDeviceSession::new(cred, device_resource))
                 },
                 &deps.router,
-                move |cred: &GuestCredential| {
+                move |session: &RelayStreamDeviceSession| {
                     // Slot revocation OR clock failure. Without the clock term a
                     // Device session would survive an unusable/regressed clock
                     // and a passed `not_after` — the same mid-session fail-open
@@ -169,7 +204,7 @@ where
                     }
                     matches!(
                         revocation_slots
-                            .get(&cred.slot_id)
+                            .get(&session.credential().slot_id)
                             .map(|record| record.state),
                         Some(SlotState::Revoked { .. })
                     )
@@ -188,6 +223,7 @@ where
         // same one the handshake + router used — single-source binding).
         RelayStreamAudience::Group { .. } | RelayStreamAudience::Public => {
             let verify_replay = Arc::clone(&deps.replay);
+            let reopen_limiter = Arc::clone(&deps.reopen_limiter);
             let rev_offer = offer.clone();
             let rev_trust = trust.clone();
             let rev_live_now = Arc::clone(&live_now);
@@ -200,7 +236,30 @@ where
                 noise_stream,
                 now_unix,
                 move |envelope: &AuthEnvelope, now| {
-                    verify_relay_stream_offer_session(offer, &verify_replay, envelope, now)
+                    // Reopen-rate check runs AFTER possession is proven, keyed
+                    // on the SAME (claw_id, guest_device_pub) the proof just
+                    // authenticated — checking on caller-claimed fields before
+                    // this would let an attacker burn another principal's
+                    // bucket by spoofing its key.
+                    let session =
+                        verify_relay_stream_offer_session(offer, &verify_replay, envelope, now)?;
+                    // ClawSite-only: this gate exists because of the ClawSite
+                    // OpenPersistent byte/open budget specifically, not as a
+                    // general Group/Public throttle. Pty can't reach here at
+                    // all (validate_resource_for_audience already forbids Pty
+                    // for Group/Public). IpTunnel — Product A/nvpn's T1
+                    // datapath, reachable in dev_t1_datapath builds — must
+                    // stay byte-identical/unbucketed: applying a ClawSite
+                    // control there would extend into Product A/nvpn without
+                    // authorization.
+                    if offer.payload.resource == RelayStreamResource::ClawSite {
+                        reopen_limiter.check_and_record(
+                            &offer.payload.claw_id,
+                            &offer.payload.guest_device_pub,
+                            now,
+                        )?;
+                    }
+                    Ok(session)
                 },
                 &deps.router,
                 move |_session: &RelayStreamOfferSession| {
@@ -248,7 +307,7 @@ mod tests {
     use household_rs::cbor;
     use household_rs::claw_share_data_tunnel::{
         HEALTH_PROBE, SessionAuthToken, TunnelAck, TunnelFrame, client_authenticate, client_health,
-        client_open_stream, recv_frame, send_frame,
+        client_open_persistent_stream, client_open_stream, recv_frame, send_frame,
     };
     use household_rs::keys::P256Keypair;
     use tokio::io::duplex;
@@ -350,6 +409,400 @@ mod tests {
         .await
         .unwrap()
         .into_async_stream()
+    }
+
+    /// A request/response target that answers then closes each accepted TCP
+    /// connection. Two accepts prove the responder reopened a fresh backend
+    /// for a second sequential persistent target on one Noise session.
+    async fn spawn_two_ack_target() -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let target = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = target.local_addr().unwrap().to_string();
+        tokio::spawn(async move {
+            for index in 1..=2_u8 {
+                let (mut sock, _) = target.accept().await.unwrap();
+                let mut request = vec![0_u8; 1024];
+                let n = sock.read(&mut request).await.unwrap();
+                assert!(n > 0, "request {index} must reach the target");
+                let mut reply = b"ACK:".to_vec();
+                reply.extend_from_slice(&request[..n]);
+                sock.write_all(&reply).await.unwrap();
+                sock.shutdown().await.unwrap();
+            }
+        });
+        addr
+    }
+
+    fn device_clawsite_offer(
+        label: u8,
+        keypair: &crate::claw_share_relay_stream_noise::RelayStreamNoiseStaticKeypair,
+    ) -> RelayStreamOfferContract {
+        let mut offer = relay_stream_offer(rendezvous_token(label), keypair);
+        offer.payload.resource = RelayStreamResource::ClawSite;
+        RelayStreamOfferContract::sign(offer.payload, &owner_signer()).unwrap()
+    }
+
+    /// One full real dial — Noise handshake plus Device credential auth — over
+    /// its own duplex pair, returning the ack the responder sent. The server
+    /// result is intentionally discarded: rate-limited connections are
+    /// supposed to make it fail.
+    async fn device_auth_round(
+        offer: &RelayStreamOfferContract,
+        params: &RelayStreamResponderParams,
+        deps: &ResponderDataTunnelDeps<household_rs::claw_share_data_tunnel::TcpStreamRouter>,
+        trust: &RelayStreamIssuerTrust,
+        serve_now: u64,
+        cbor: &[u8],
+        nonce: &[u8],
+    ) -> TunnelAck {
+        let (client_io, server_io) = duplex(64 * 1024);
+        let server = serve_relay_stream_responder_connection(
+            server_io,
+            offer,
+            params,
+            trust,
+            AdmissionInstant::from_seam_wall(serve_now).expect("plausible test clock"),
+            deps,
+        );
+        let client = async {
+            let mut stream = client_noise_stream(client_io, offer, serve_now).await;
+            client_authenticate(&mut stream, cbor, data_tunnel_token(cbor, nonce))
+                .await
+                .unwrap()
+        };
+        let (_server_result, ack) = tokio::join!(server, client);
+        ack
+    }
+
+    #[tokio::test]
+    async fn relay_stream_responder_device_clawsite_reopen_rate_rejects_ninth_connection() {
+        timeout(Duration::from_secs(15), async {
+            let keypair = generate_relay_stream_noise_static_keypair().unwrap();
+            let offer = device_clawsite_offer(0x91, &keypair);
+            let params = params(keypair, Duration::from_secs(2)).await;
+            let slots = data_tunnel_store();
+            let deps = data_tunnel_deps(
+                Arc::clone(&slots),
+                Arc::new(ReplayGuard::new()),
+                "127.0.0.1:1".to_string(),
+            );
+            let credential = data_tunnel_credential();
+            let cbor = cbor::to_canonical_vec(&credential).unwrap();
+            let serve_now = now_unix();
+            let trust = params.admission.admit(serve_now).unwrap();
+
+            for index in 1..=8_u8 {
+                let ack = device_auth_round(
+                    &offer,
+                    &params,
+                    &deps,
+                    &trust,
+                    serve_now,
+                    &cbor,
+                    &[0xa0, index],
+                )
+                .await;
+                assert!(
+                    matches!(ack, TunnelAck::Ok { .. }),
+                    "connection {index} within the window must authenticate"
+                );
+            }
+
+            let ninth = device_auth_round(
+                &offer, &params, &deps, &trust, serve_now, &cbor, &[0xa0, 9],
+            )
+            .await;
+            assert!(
+                matches!(ninth, TunnelAck::Rejected { ref reason } if reason == "relay-stream-reopen-rate-exceeded"),
+                "the 9th mint in one window must be rate-rejected, got {ninth:?}"
+            );
+            assert_eq!(
+                deps.reopen_limiter
+                    .count_for(&credential.claw_id, &credential.guest_device_pub),
+                9,
+                "the rejected attempt is still recorded against the window"
+            );
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn relay_stream_responder_device_clawsite_forged_auth_never_touches_reopen_bucket() {
+        timeout(Duration::from_secs(5), async {
+            let keypair = generate_relay_stream_noise_static_keypair().unwrap();
+            let offer = device_clawsite_offer(0x92, &keypair);
+            let params = params(keypair, Duration::from_secs(2)).await;
+            let slots = data_tunnel_store();
+            let deps = data_tunnel_deps(
+                Arc::clone(&slots),
+                Arc::new(ReplayGuard::new()),
+                "127.0.0.1:1".to_string(),
+            );
+            let credential = data_tunnel_credential();
+            let cbor = cbor::to_canonical_vec(&credential).unwrap();
+            let serve_now = now_unix();
+            let trust = params.admission.admit(serve_now).unwrap();
+
+            let (client_io, server_io) = duplex(64 * 1024);
+            let server = serve_relay_stream_responder_connection(
+                server_io,
+                &offer,
+                &params,
+                &trust,
+                AdmissionInstant::from_seam_wall(serve_now).expect("plausible test clock"),
+                &deps,
+            );
+            let client = async {
+                let mut stream = client_noise_stream(client_io, &offer, serve_now).await;
+                // Signed by attacker_signer(), NOT the credential's guest key:
+                // authorize_session rejects before the limiter is ever read.
+                client_authenticate(
+                    &mut stream,
+                    &cbor,
+                    data_tunnel_token_signed(&cbor, &attacker_signer(), b"forged"),
+                )
+                .await
+                .unwrap()
+            };
+
+            let (server_result, ack) = tokio::join!(server, client);
+            assert!(matches!(ack, TunnelAck::Rejected { .. }));
+            assert!(server_result.is_err());
+            assert_eq!(
+                deps.reopen_limiter
+                    .count_for(&credential.claw_id, &credential.guest_device_pub),
+                0,
+                "a forged attempt must never record against the real principal's bucket"
+            );
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn relay_stream_responder_device_pty_never_touches_reopen_limiter() {
+        timeout(Duration::from_secs(15), async {
+            let keypair = generate_relay_stream_noise_static_keypair().unwrap();
+            // Default helper mints a Pty Device offer: legacy PTY reconnects
+            // must stay unbucketed even past the ClawSite window cap.
+            let offer = relay_stream_offer(rendezvous_token(0x93), &keypair);
+            let params = params(keypair, Duration::from_secs(2)).await;
+            let slots = data_tunnel_store();
+            let deps = data_tunnel_deps(
+                Arc::clone(&slots),
+                Arc::new(ReplayGuard::new()),
+                "127.0.0.1:1".to_string(),
+            );
+            let credential = data_tunnel_credential();
+            let cbor = cbor::to_canonical_vec(&credential).unwrap();
+            let serve_now = now_unix();
+            let trust = params.admission.admit(serve_now).unwrap();
+
+            for index in 1..=10_u8 {
+                let ack = device_auth_round(
+                    &offer,
+                    &params,
+                    &deps,
+                    &trust,
+                    serve_now,
+                    &cbor,
+                    &[0xb0, index],
+                )
+                .await;
+                assert!(
+                    matches!(ack, TunnelAck::Ok { .. }),
+                    "PTY connection {index} must authenticate past the ClawSite cap"
+                );
+            }
+            assert_eq!(
+                deps.reopen_limiter
+                    .count_for(&credential.claw_id, &credential.guest_device_pub),
+                0,
+                "PTY dials must never record against the ClawSite reopen bucket"
+            );
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn relay_stream_responder_device_clawsite_serves_two_persistent_targets() {
+        timeout(Duration::from_secs(5), async {
+            let keypair = generate_relay_stream_noise_static_keypair().unwrap();
+            let offer = device_clawsite_offer(0x81, &keypair);
+            let params = params(keypair, Duration::from_secs(2)).await;
+            let slots = data_tunnel_store();
+            let deps = data_tunnel_deps(
+                Arc::clone(&slots),
+                Arc::new(ReplayGuard::new()),
+                spawn_two_ack_target().await,
+            );
+            let cbor = cbor::to_canonical_vec(&data_tunnel_credential()).unwrap();
+            let (client_io, server_io) = duplex(64 * 1024);
+            let serve_now = now_unix();
+            let trust = params.admission.admit(serve_now).unwrap();
+
+            let server = serve_relay_stream_responder_connection(
+                server_io,
+                &offer,
+                &params,
+                &trust,
+                AdmissionInstant::from_seam_wall(serve_now).expect("plausible test clock"),
+                &deps,
+            );
+            let client = async {
+                let mut stream = client_noise_stream(client_io, &offer, serve_now).await;
+                assert!(matches!(
+                    client_authenticate(
+                        &mut stream,
+                        &cbor,
+                        data_tunnel_token(&cbor, b"persistent-ok")
+                    )
+                    .await
+                    .unwrap(),
+                    TunnelAck::Ok { .. }
+                ));
+                for index in 1..=2_u8 {
+                    client_open_persistent_stream(&mut stream).await.unwrap();
+                    send_frame(
+                        &mut stream,
+                        &TunnelFrame::Data(format!("req-{index}").into_bytes()),
+                    )
+                    .await
+                    .unwrap();
+                    assert_eq!(
+                        recv_frame(&mut stream).await.unwrap(),
+                        TunnelFrame::Data(format!("ACK:req-{index}").into_bytes())
+                    );
+                    assert_eq!(recv_frame(&mut stream).await.unwrap(), TunnelFrame::Close);
+                }
+            };
+
+            let (server_result, ()) = tokio::join!(server, client);
+            server_result.unwrap();
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn relay_stream_responder_device_pty_rejects_open_persistent() {
+        timeout(Duration::from_secs(5), async {
+            let keypair = generate_relay_stream_noise_static_keypair().unwrap();
+            // Default helper mints a Pty Device offer — the legacy single-target
+            // shape must be preserved for PTY even on the persistent-aware path.
+            let offer = relay_stream_offer(rendezvous_token(0x82), &keypair);
+            let params = params(keypair, Duration::from_secs(2)).await;
+            let slots = data_tunnel_store();
+            let deps = data_tunnel_deps(
+                Arc::clone(&slots),
+                Arc::new(ReplayGuard::new()),
+                "127.0.0.1:1".to_string(),
+            );
+            let cbor = cbor::to_canonical_vec(&data_tunnel_credential()).unwrap();
+            let (client_io, server_io) = duplex(64 * 1024);
+            let serve_now = now_unix();
+            let trust = params.admission.admit(serve_now).unwrap();
+
+            let server = serve_relay_stream_responder_connection(
+                server_io,
+                &offer,
+                &params,
+                &trust,
+                AdmissionInstant::from_seam_wall(serve_now).expect("plausible test clock"),
+                &deps,
+            );
+            let client = async {
+                let mut stream = client_noise_stream(client_io, &offer, serve_now).await;
+                client_authenticate(&mut stream, &cbor, data_tunnel_token(&cbor, b"pty-legacy"))
+                    .await
+                    .unwrap();
+                let error = match client_open_persistent_stream(&mut stream).await {
+                    Ok(()) => panic!("PTY Device session must not allow OpenPersistent"),
+                    Err(error) => error,
+                };
+                assert!(matches!(
+                    error,
+                    DataTunnelError::TargetUnavailable(ref reason)
+                        if reason == "persistent-target-not-authorized"
+                ));
+            };
+
+            let (server_result, ()) = tokio::join!(server, client);
+            assert!(matches!(
+                server_result,
+                Err(RelayStreamResponderError::DataTunnel(
+                    DataTunnelError::TargetUnavailable(_)
+                ))
+            ));
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn relay_stream_responder_device_clawsite_revocation_blocks_next_persistent_open(
+    ) {
+        timeout(Duration::from_secs(5), async {
+            let keypair = generate_relay_stream_noise_static_keypair().unwrap();
+            let offer = device_clawsite_offer(0x83, &keypair);
+            let params = params(keypair, Duration::from_secs(2)).await;
+            let slots = data_tunnel_store();
+            let deps = data_tunnel_deps(
+                Arc::clone(&slots),
+                Arc::new(ReplayGuard::new()),
+                spawn_two_ack_target().await,
+            );
+            let cbor = cbor::to_canonical_vec(&data_tunnel_credential()).unwrap();
+            let (client_io, server_io) = duplex(64 * 1024);
+            let serve_now = now_unix();
+            let trust = params.admission.admit(serve_now).unwrap();
+
+            let server = serve_relay_stream_responder_connection(
+                server_io,
+                &offer,
+                &params,
+                &trust,
+                AdmissionInstant::from_seam_wall(serve_now).expect("plausible test clock"),
+                &deps,
+            );
+            let revoke_slots = Arc::clone(&slots);
+            let client = async {
+                let mut stream = client_noise_stream(client_io, &offer, serve_now).await;
+                client_authenticate(
+                    &mut stream,
+                    &cbor,
+                    data_tunnel_token(&cbor, b"persistent-revoke"),
+                )
+                .await
+                .unwrap();
+                client_open_persistent_stream(&mut stream).await.unwrap();
+                send_frame(&mut stream, &TunnelFrame::Data(b"req-1".to_vec()))
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    recv_frame(&mut stream).await.unwrap(),
+                    TunnelFrame::Data(b"ACK:req-1".to_vec())
+                );
+                assert_eq!(recv_frame(&mut stream).await.unwrap(), TunnelFrame::Close);
+
+                revoke_slots.revoke(&DATA_TUNNEL_SLOT, serve_now).unwrap();
+                send_frame(&mut stream, &TunnelFrame::OpenPersistent)
+                    .await
+                    .unwrap();
+                let after = recv_frame(&mut stream).await;
+                assert!(
+                    after.is_err(),
+                    "revocation between persistent targets must close before a second backend opens: {after:?}"
+                );
+            };
+
+            let (server_result, ()) = tokio::join!(server, client);
+            assert!(server_result.is_err());
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
@@ -739,12 +1192,12 @@ mod tests {
 
     // Capstone e2e through the REAL responder: a credential-less GROUP dial over
     // Noise (responder_handshake_with_trust) → the audience branch →
-    // verify_relay_stream_offer_session → live-gate Rev → PTY echo marker. Proves
+    // verify_relay_stream_offer_session → live-gate Rev → target echo marker. Proves
     // the whole stack (Noise + branch + real verifier + real Rev) accepts a group
     // dial. The offer's claw_static_pub is the responder's Noise key; the PoP token
     // binds to blake3(offer) and is signed by the dialing device key (guest_signer).
     #[tokio::test]
-    async fn relay_stream_responder_group_dial_e2e_pipes_pty_marker() {
+    async fn relay_stream_responder_group_dial_e2e_pipes_clawsite_marker() {
         timeout(Duration::from_secs(5), async {
             let keypair = generate_relay_stream_noise_static_keypair().unwrap();
             let serve_now = now_unix();
@@ -755,7 +1208,7 @@ mod tests {
                 "g_a".to_string(),
                 guest_pub(),
                 RELAY_STREAM_CLAW_ID.to_string(),
-                RelayStreamResource::Pty,
+                RelayStreamResource::ClawSite,
                 RELAY_STREAM_ENDPOINT.to_string(),
                 keypair.public_key().clone(),
                 serve_now + 60,
@@ -829,6 +1282,201 @@ mod tests {
 
             let (server_result, ()) = tokio::join!(server, client);
             server_result.unwrap();
+        })
+        .await
+        .unwrap();
+    }
+
+    // A dialer who never held the guest private key (has only the public offer
+    // — e.g. captured off the wire) cannot forge the PoP signature, so
+    // verify_relay_stream_offer_session fails BEFORE the reopen-rate check
+    // runs. Proves the limiter's bucket for the REAL (claw_id,
+    // guest_device_pub) stays untouched by a forged attempt — an attacker
+    // cannot burn another principal's rate budget by spoofing its key.
+    #[tokio::test]
+    async fn relay_stream_responder_group_dial_without_pop_key_never_touches_reopen_bucket() {
+        timeout(Duration::from_secs(5), async {
+            let keypair = generate_relay_stream_noise_static_keypair().unwrap();
+            let serve_now = now_unix();
+            let offer = mint_relay_stream_group_offer(
+                rendezvous_token(0x7c),
+                SlotId([0x9b; 16]),
+                "g".to_string(),
+                "g_a".to_string(),
+                guest_pub(),
+                RELAY_STREAM_CLAW_ID.to_string(),
+                RelayStreamResource::ClawSite,
+                RELAY_STREAM_ENDPOINT.to_string(),
+                keypair.public_key().clone(),
+                serve_now + 60,
+                serve_now,
+                &owner_signer(),
+            )
+            .unwrap();
+            let params = params(keypair, Duration::from_secs(3)).await;
+            let deps = data_tunnel_deps(
+                data_tunnel_store(),
+                Arc::new(ReplayGuard::new()),
+                spawn_ack_target().await,
+            );
+            let proj = group_projection_active();
+            let trust = RelayStreamIssuerTrust::new(move || RelayStreamTrustContext {
+                record: relay_stream_household_record(),
+                cert: relay_stream_machine_cert(),
+                projection: proj.clone(),
+            });
+            let (client_io, server_io) = duplex(64 * 1024);
+
+            let server = serve_relay_stream_responder_connection(
+                server_io,
+                &offer,
+                &params,
+                &trust,
+                AdmissionInstant::from_seam_wall(serve_now).expect("plausible test clock"),
+                &deps,
+            );
+            let client = async {
+                let mut stream = client_noise_stream(client_io, &offer, serve_now).await;
+                let offer_cbor = offer.payload.to_canonical_bytes().unwrap();
+                // Signed by attacker_signer(), NOT guest_signer(): the offer
+                // pins guest_pub() as guest_device_pub, so this signature
+                // cannot verify against it — no PoP without the real key.
+                let token = SessionAuthToken::sign(
+                    "relay-stream-group-no-pop".to_string(),
+                    &offer_cbor,
+                    RELAY_STREAM_ENDPOINT.to_string(),
+                    RELAY_STREAM_CLAW_ID.to_string(),
+                    b"g3".to_vec(),
+                    serve_now + 60,
+                    &attacker_signer(),
+                )
+                .unwrap();
+                match client_authenticate(&mut stream, &offer_cbor, token)
+                    .await
+                    .unwrap()
+                {
+                    TunnelAck::Rejected { reason } => assert_eq!(reason, "signature-invalid"),
+                    other => panic!("forged PoP must be rejected inside Noise, got {other:?}"),
+                }
+            };
+
+            let (server_result, ()) = tokio::join!(server, client);
+            assert!(matches!(
+                server_result,
+                Err(RelayStreamResponderError::DataTunnel(
+                    DataTunnelError::TokenRejected(reason)
+                )) if reason == "signature-invalid"
+            ));
+            assert_eq!(
+                deps.reopen_limiter
+                    .count_for(&offer.payload.claw_id, &offer.payload.guest_device_pub),
+                0,
+                "a forged/PoP-less attempt must never record against the real principal's bucket"
+            );
+        })
+        .await
+        .unwrap();
+    }
+
+    // The reopen-rate gate is a ClawSite-specific consequence of the ClawSite
+    // OpenPersistent budget, not a general Group/Public throttle. A Group
+    // IpTunnel dial (Product A/nvpn's T1 datapath) must still authenticate
+    // normally through verify_relay_stream_offer_session, but must never
+    // touch the limiter's bucket — extending a ClawSite control onto
+    // Product A/nvpn traffic is out of scope without explicit authorization.
+    #[tokio::test]
+    async fn relay_stream_responder_group_iptunnel_dial_verifies_but_does_not_touch_reopen_limiter()
+    {
+        timeout(Duration::from_secs(5), async {
+            let keypair = generate_relay_stream_noise_static_keypair().unwrap();
+            let serve_now = now_unix();
+            let offer = mint_relay_stream_group_offer(
+                rendezvous_token(0x7d),
+                SlotId([0x9c; 16]),
+                "g".to_string(),
+                "g_a".to_string(),
+                guest_pub(),
+                RELAY_STREAM_CLAW_ID.to_string(),
+                RelayStreamResource::IpTunnel,
+                RELAY_STREAM_ENDPOINT.to_string(),
+                keypair.public_key().clone(),
+                serve_now + 60,
+                serve_now,
+                &owner_signer(),
+            )
+            .unwrap();
+            let params = params(keypair, Duration::from_secs(3)).await;
+            let deps = data_tunnel_deps(
+                data_tunnel_store(),
+                Arc::new(ReplayGuard::new()),
+                spawn_ack_target().await,
+            );
+            let proj = group_projection_active();
+            let trust = RelayStreamIssuerTrust::new(move || RelayStreamTrustContext {
+                record: relay_stream_household_record(),
+                cert: relay_stream_machine_cert(),
+                projection: proj.clone(),
+            });
+            let (client_io, server_io) = duplex(64 * 1024);
+
+            let server = serve_relay_stream_responder_connection(
+                server_io,
+                &offer,
+                &params,
+                &trust,
+                AdmissionInstant::from_seam_wall(serve_now).expect("plausible test clock"),
+                &deps,
+            );
+            let client = async {
+                let mut stream = client_noise_stream(client_io, &offer, serve_now).await;
+                let offer_cbor = offer.payload.to_canonical_bytes().unwrap();
+                let token = SessionAuthToken::sign(
+                    "relay-stream-group-iptunnel-scope".to_string(),
+                    &offer_cbor,
+                    RELAY_STREAM_ENDPOINT.to_string(),
+                    RELAY_STREAM_CLAW_ID.to_string(),
+                    b"g4".to_vec(),
+                    serve_now + 60,
+                    &guest_signer(),
+                )
+                .unwrap();
+                assert!(matches!(
+                    client_authenticate(&mut stream, &offer_cbor, token)
+                        .await
+                        .unwrap(),
+                    TunnelAck::Ok { .. }
+                ));
+                assert_eq!(
+                    client_health(&mut stream, HEALTH_PROBE).await.unwrap(),
+                    HEALTH_PROBE
+                );
+                client_open_stream(&mut stream).await.unwrap();
+                send_frame(
+                    &mut stream,
+                    &TunnelFrame::Data(b"echo relay-stream-iptunnel-scope".to_vec()),
+                )
+                .await
+                .unwrap();
+                match recv_frame(&mut stream).await.unwrap() {
+                    TunnelFrame::Data(d) => assert!(
+                        String::from_utf8_lossy(&d).contains("relay-stream-iptunnel-scope"),
+                        "expected echoed marker, got {d:?}"
+                    ),
+                    other => panic!("expected echoed Data, got {other:?}"),
+                }
+                send_frame(&mut stream, &TunnelFrame::Close).await.unwrap();
+            };
+
+            let (server_result, ()) = tokio::join!(server, client);
+            server_result.unwrap();
+            assert_eq!(
+                deps.reopen_limiter
+                    .count_for(&offer.payload.claw_id, &offer.payload.guest_device_pub),
+                0,
+                "IpTunnel is Product A/nvpn's T1 datapath — a successful dial must \
+                 authenticate normally without ever recording against the ClawSite-only \
+                 reopen-rate bucket"
+            );
         })
         .await
         .unwrap();

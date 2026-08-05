@@ -684,6 +684,14 @@ pub struct SlotRecord {
     pub claw_id: String,
     pub expires_at: u64,
     pub state: SlotState,
+    pub app_presentation:
+        Option<crate::claw_share_relay_stream_contract::ShareableAppPresentation>,
+    /// When the invite was minted. `None` only where the mint event was never
+    /// observed — a projection that saw a consume or a revoke before its mint.
+    /// Never synthesized: an owner surface must be able to tell "minted then"
+    /// from "we do not know", and a fabricated timestamp would be
+    /// indistinguishable from a real one.
+    pub created_at: Option<u64>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -695,6 +703,10 @@ pub enum SlotState {
     },
     Revoked {
         revoked_at: u64,
+        /// Preserved across `Consumed -> Revoked`: the owner surface must still
+        /// say whether — and when — the share was accepted, after revoking it.
+        /// `None` means it was revoked while still Open.
+        accepted_at: Option<u64>,
     },
 }
 
@@ -739,8 +751,13 @@ impl ClawShareSlotStore {
                     guest_device_pub: guest_device_pub.clone(),
                     consumed_at: *consumed_at,
                 },
-                SlotProjectedStatus::Revoked { revoked_at, .. } => SlotState::Revoked {
+                SlotProjectedStatus::Revoked {
+                    revoked_at,
+                    accepted_at,
+                    ..
+                } => SlotState::Revoked {
                     revoked_at: *revoked_at,
+                    accepted_at: *accepted_at,
                 },
             };
             guard.insert(
@@ -750,6 +767,10 @@ impl ClawShareSlotStore {
                     claw_id: projected.claw_id.clone(),
                     expires_at: projected.expires_at,
                     state,
+                    app_presentation: projected.app_presentation.clone(),
+                    // Carried straight from the projection — the replay is the
+                    // only place the runtime store learns it.
+                    created_at: projected.created_at,
                 },
             );
         }
@@ -805,18 +826,40 @@ impl ClawShareSlotStore {
         Ok(record.clone())
     }
 
-    /// Force-revoke a slot regardless of current state.
+    /// Force-revoke a slot regardless of current state, and return the
+    /// CANONICAL revocation timestamp — the one from the FIRST revoke.
+    ///
+    /// Fully idempotent, not merely convergent on the status:
+    /// - `Open` -> `Revoked { revoked_at: now, accepted_at: None }`
+    /// - `Consumed` -> `Revoked { revoked_at: now, accepted_at: Some(consumed_at) }`,
+    ///   so revoking never erases the fact that the share was accepted.
+    /// - `Revoked` -> unchanged, and `now_unix` is ignored.
+    ///
+    /// Returning the canonical timestamp is what makes the caller's persistence
+    /// retry-safe: signing the log event with THIS value yields the same
+    /// `entry_id` every time, so a retry after a failed append still persists
+    /// while a retry after a successful one dedupes.
     ///
     /// # Panics
     ///
     /// Panics if the internal mutex is poisoned.
-    pub fn revoke(&self, slot_id: &SlotId, now_unix: u64) -> Result<(), ClawShareError> {
+    pub fn revoke(&self, slot_id: &SlotId, now_unix: u64) -> Result<u64, ClawShareError> {
         let mut guard = self.inner.lock().expect("slot store mutex poisoned");
         let record = guard.get_mut(slot_id).ok_or(ClawShareError::SlotNotFound)?;
-        record.state = SlotState::Revoked {
-            revoked_at: now_unix,
+        let (revoked_at, accepted_at) = match &record.state {
+            SlotState::Open => (now_unix, None),
+            SlotState::Consumed { consumed_at, .. } => (now_unix, Some(*consumed_at)),
+            // Already revoked: keep the original decision intact.
+            SlotState::Revoked {
+                revoked_at,
+                accepted_at,
+            } => (*revoked_at, *accepted_at),
         };
-        Ok(())
+        record.state = SlotState::Revoked {
+            revoked_at,
+            accepted_at,
+        };
+        Ok(revoked_at)
     }
 
     /// Snapshot the slot record by id, if present.
@@ -949,6 +992,37 @@ pub fn owner_mint_invite(
     claim_relays: Vec<String>,
     slot_store: &ClawShareSlotStore,
 ) -> Result<ClawShareInvite, ClawShareError> {
+    owner_mint_invite_with_presentation(
+        owner_key,
+        owner_p_id,
+        hh_id,
+        claw_id,
+        transport_hint,
+        ttl_secs,
+        now_unix,
+        owner_engine_npub,
+        claim_relays,
+        slot_store,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn owner_mint_invite_with_presentation(
+    owner_key: &dyn IdentityKey,
+    owner_p_id: &PersonId,
+    hh_id: &HouseholdId,
+    claw_id: &str,
+    transport_hint: TunnelHandle,
+    ttl_secs: u64,
+    now_unix: u64,
+    owner_engine_npub: String,
+    claim_relays: Vec<String>,
+    slot_store: &ClawShareSlotStore,
+    app_presentation: Option<
+        crate::claw_share_relay_stream_contract::ShareableAppPresentation,
+    >,
+) -> Result<ClawShareInvite, ClawShareError> {
     let ttl_capped = ttl_secs.min(MAX_INVITE_TTL_SECS);
     let expires_at = now_unix.saturating_add(ttl_capped);
     let slot_id = SlotId::random();
@@ -974,6 +1048,11 @@ pub fn owner_mint_invite(
         claw_id: invite.claw_id.clone(),
         expires_at: invite.expires_at,
         state: SlotState::Open,
+        app_presentation,
+        // The real mint: `now` here is the same value the durable
+        // `ClawShareSlotMinted` carries, so the live store and a later replay
+        // agree on the creation time.
+        created_at: Some(now_unix),
     })?;
 
     Ok(invite)
@@ -1839,6 +1918,8 @@ mod tests {
                 claw_id: "claw_a".to_string(),
                 expires_at: 2_000_000_000,
                 state: SlotState::Open,
+                app_presentation: None,
+                created_at: None,
             })
             .expect("insert");
 
@@ -1866,6 +1947,8 @@ mod tests {
                 claw_id: "claw_a".to_string(),
                 expires_at: 2_000_000_000,
                 state: SlotState::Open,
+                app_presentation: None,
+                created_at: None,
             })
             .expect("insert");
 
@@ -1900,6 +1983,45 @@ mod tests {
         assert_eq!(slot.claw_id, "claw_atomic");
         assert!(matches!(slot.state, SlotState::Open));
         assert_eq!(slot.expires_at, invite.expires_at);
+        // Legacy wrapper leaves no presentation.
+        assert!(slot.app_presentation.is_none());
+    }
+
+    #[test]
+    fn owner_mint_invite_with_presentation_persists_snapshot() {
+        use crate::claw_share_relay_stream_contract::ShareableAppPresentation;
+
+        let (owner_key, hh_id, owner_p_id) = fresh_owner();
+        let store = ClawShareSlotStore::new();
+        let app_id = "app_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string();
+        let presentation =
+            ShareableAppPresentation::try_new(app_id.clone(), "Study", "Caio").unwrap();
+
+        let invite = owner_mint_invite_with_presentation(
+            &owner_key,
+            &owner_p_id,
+            &hh_id,
+            &app_id,
+            TunnelHandle::Loopback {
+                channel: "ch".to_string(),
+            },
+            300,
+            1_000_000_000,
+            String::new(),
+            Vec::new(),
+            &store,
+            Some(presentation),
+        )
+        .expect("mint");
+
+        let slot = store.get(&invite.slot_id).expect("slot present");
+        let stored = slot
+            .app_presentation
+            .as_ref()
+            .expect("presentation must be persisted in the SlotRecord");
+        assert_eq!(stored.app_id, app_id);
+        assert_eq!(stored.display_name, "Study");
+        assert_eq!(stored.owner_display_name, "Caio");
     }
 
     #[test]
@@ -1968,6 +2090,97 @@ mod tests {
         assert!(matches!(err, ClawShareError::UriMalformed));
     }
 
+    /// Open slot for the revoke-idempotence tests.
+    fn revoke_fixture() -> (ClawShareSlotStore, SlotId) {
+        let store = ClawShareSlotStore::new();
+        let slot_id = SlotId::random();
+        store
+            .insert(SlotRecord {
+                slot_id: slot_id.clone(),
+                claw_id: "claw_a".to_string(),
+                expires_at: 2_000_000_000,
+                state: SlotState::Open,
+                app_presentation: None,
+                created_at: Some(1_700_000_000),
+            })
+            .unwrap();
+        (store, slot_id)
+    }
+
+    #[test]
+    fn revoke_returns_the_canonical_timestamp_and_a_second_revoke_moves_nothing() {
+        let (store, slot_id) = revoke_fixture();
+
+        let first = store.revoke(&slot_id, 1_800_000_001).unwrap();
+        assert_eq!(first, 1_800_000_001);
+        let after_first = store.get(&slot_id).unwrap().state;
+
+        // A LATER clock must not move anything: the canonical value is the
+        // first one, and it is what the caller re-signs on every retry.
+        let second = store.revoke(&slot_id, 1_900_000_999).unwrap();
+        assert_eq!(
+            second, 1_800_000_001,
+            "second revoke must not move revoked_at"
+        );
+        assert_eq!(
+            store.get(&slot_id).unwrap().state,
+            after_first,
+            "second revoke must not change the state at all"
+        );
+        assert_eq!(
+            store.get(&slot_id).unwrap().created_at,
+            Some(1_700_000_000),
+            "revoking must not disturb created_at"
+        );
+    }
+
+    #[test]
+    fn revoking_a_consumed_slot_preserves_when_it_was_accepted() {
+        let (store, slot_id) = revoke_fixture();
+        let guest = P256Keypair::generate();
+        store
+            .consume_atomic(&slot_id, "claw_a", guest.public(), 1_750_000_000)
+            .unwrap();
+
+        let revoked_at = store.revoke(&slot_id, 1_800_000_001).unwrap();
+        assert_eq!(revoked_at, 1_800_000_001);
+        assert_eq!(
+            store.get(&slot_id).unwrap().state,
+            SlotState::Revoked {
+                revoked_at: 1_800_000_001,
+                // The owner surface must still be able to say the share WAS
+                // accepted, and when, after it has been revoked.
+                accepted_at: Some(1_750_000_000),
+            }
+        );
+
+        // And a repeat keeps both halves.
+        assert_eq!(
+            store.revoke(&slot_id, 1_999_999_999).unwrap(),
+            1_800_000_001
+        );
+        assert_eq!(
+            store.get(&slot_id).unwrap().state,
+            SlotState::Revoked {
+                revoked_at: 1_800_000_001,
+                accepted_at: Some(1_750_000_000),
+            }
+        );
+    }
+
+    #[test]
+    fn revoking_an_open_slot_records_no_acceptance() {
+        let (store, slot_id) = revoke_fixture();
+        store.revoke(&slot_id, 1_800_000_001).unwrap();
+        assert_eq!(
+            store.get(&slot_id).unwrap().state,
+            SlotState::Revoked {
+                revoked_at: 1_800_000_001,
+                accepted_at: None,
+            }
+        );
+    }
+
     #[test]
     fn slot_store_revoke_blocks_consume() {
         let guest_key = P256Keypair::generate();
@@ -1979,6 +2192,8 @@ mod tests {
                 claw_id: "claw_a".to_string(),
                 expires_at: 2_000_000_000,
                 state: SlotState::Open,
+                app_presentation: None,
+                created_at: None,
             })
             .expect("insert");
         store.revoke(&slot_id, 1_000_000_000).expect("revoke");

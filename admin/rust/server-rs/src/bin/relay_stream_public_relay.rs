@@ -70,13 +70,15 @@ async fn main() -> io::Result<()> {
     );
     eprintln!(
         "relay_stream public relay limits: global_active={} pending={} token_ttl_secs={} \
-         idle_timeout_secs={} splice_lifetime_secs={} source_unpaired={} source_pending={} \
+         idle_timeout_secs={} splice_lifetime_secs={} splice_max_bytes_per_direction={:?} \
+         source_unpaired={} source_pending={} \
          source_paired={:?} source_buckets={} ipv6_prefix_len={}",
         config.listener.max_active_connections,
         config.listener.max_pending,
         config.listener.token_ttl.as_secs(),
         config.listener.splice_idle_timeout.as_secs(),
         config.listener.splice_max_lifetime.as_secs(),
+        config.listener.splice_max_bytes_per_direction,
         config.listener.abuse.max_unpaired_active_per_source,
         config.listener.abuse.max_pending_per_source,
         config.listener.abuse.max_paired_splices_per_source,
@@ -153,10 +155,10 @@ fn read_status_token_file(path: &std::path::Path) -> io::Result<String> {
             format!("failed to read relay_stream status token file: {error}"),
         )
     })?;
-    parse_status_token(token)
+    parse_status_token(&token)
 }
 
-fn parse_status_token(token: String) -> io::Result<String> {
+fn parse_status_token(token: &str) -> io::Result<String> {
     let token = token.trim().to_string();
     if token.len() < 32 || token.chars().any(char::is_whitespace) {
         return Err(io::Error::new(
@@ -173,10 +175,10 @@ mod tests {
 
     #[test]
     fn status_token_requires_long_non_whitespace_secret() {
-        assert!(parse_status_token("short".to_string()).is_err());
-        assert!(parse_status_token("abcdefghijklmnopqrstuvwxyz123456".to_string()).is_ok());
-        assert!(parse_status_token("abcdefghijklmnopqrstuvwxyz123456\n".to_string()).is_ok());
-        assert!(parse_status_token("abcdefghijklmnopqrstuvwxyz 123456".to_string()).is_err());
+        assert!(parse_status_token("short").is_err());
+        assert!(parse_status_token("abcdefghijklmnopqrstuvwxyz123456").is_ok());
+        assert!(parse_status_token("abcdefghijklmnopqrstuvwxyz123456\n").is_ok());
+        assert!(parse_status_token("abcdefghijklmnopqrstuvwxyz 123456").is_err());
     }
 
     #[test]

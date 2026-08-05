@@ -289,6 +289,7 @@ mod tests {
     use crate::claw_share_relay_stream_noise_keystore::{
         DEFAULT_RELAY_STREAM_NOISE_KEY_ID, RelayStreamNoiseKeyStore,
     };
+    use crate::claw_share_relay_stream_reopen_limiter::{ReopenLimiterConfig, ReopenStreamLimiter};
     use crate::claw_share_relay_stream_test_support::{
         attacker_signer, data_tunnel_credential_with_owner, data_tunnel_store,
         data_tunnel_token as support_data_tunnel_token, guest_pub,
@@ -436,6 +437,7 @@ mod tests {
             slots,
             Arc::new(ReplayGuard::new()),
             TcpStreamRouter::new(target_addr),
+            Arc::new(ReopenStreamLimiter::new(ReopenLimiterConfig::default())),
         ))
     }
 

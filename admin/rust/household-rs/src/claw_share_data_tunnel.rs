@@ -259,7 +259,7 @@ pub fn decode_network_settings_body(
 // imports are unchanged.
 pub use tunnel_wire_rs::tunnel_wire::{
     FRAME_CLOSE, FRAME_DATA, FRAME_ERROR, FRAME_EXIT, FRAME_HEALTH, FRAME_NETWORK_SETTINGS,
-    FRAME_OPEN, FRAME_RESIZE, FRAME_WINDOW, TargetExit,
+    FRAME_OPEN, FRAME_OPEN_PERSISTENT, FRAME_RESIZE, FRAME_WINDOW, TargetExit,
 };
 
 // The frame codec itself moved to the `tunnel-wire-rs` crate (S0), redaction included
@@ -268,6 +268,12 @@ pub use tunnel_wire_rs::tunnel_wire::{
 // `From` impl below lets every existing `?` site keep working unchanged, which
 // is why 156 error sites across 14 files did not have to be touched.
 pub use tunnel_wire_rs::tunnel_wire::{TunnelFrame, WireError};
+
+/// Aggregate safety budget for sequential target streams inside one
+/// authenticated connection. The relay remains opaque and cannot count HTTP
+/// requests, so the endpoint owns this authorization/resource boundary.
+pub const PERSISTENT_MAX_TARGET_OPENS: u32 = 128;
+pub const PERSISTENT_MAX_BYTES_PER_DIRECTION: u64 = 64 * 1024 * 1024;
 
 /// Widen a transport failure into this product's error.
 ///
@@ -289,7 +295,6 @@ impl From<WireError> for DataTunnelError {
         }
     }
 }
-
 // ─── Frame IO ────────────────────────────────────────────────────────────────
 
 async fn write_frame<W: AsyncWrite + Unpin>(
@@ -414,6 +419,16 @@ pub trait DataTunnelSession {
     fn session_id(&self) -> String;
     /// Placeholder ULA-style mesh address surfaced in the ack.
     fn mesh_ipv6(&self) -> String;
+
+    /// Whether this authorized session may reuse its authenticated Noise
+    /// connection for sequential target streams.
+    ///
+    /// This is denied by default. The first product cut enables it only for a
+    /// relay-stream offer whose signed resource is `ClawSite`; direct Device
+    /// credentials, PTY, and `IpTunnel` retain the legacy single-target shape.
+    fn allows_persistent_targets(&self) -> bool {
+        false
+    }
 }
 
 impl DataTunnelSession for GuestCredential {
@@ -621,7 +636,7 @@ pub fn authorize_session(
 
 // ─── Interactive target (engine side) ─────────────────────────────────────────
 
-/// One opened, PERSISTENT interactive target the engine pipes a session to.
+/// One opened target stream the engine pipes inside an authenticated session.
 ///
 /// The byte halves (`reader`/`writer`) carry terminal stdout/stdin; `resize`
 /// applies the client's terminal dimensions to the target (a PTY honours it,
@@ -671,9 +686,10 @@ impl TargetSession {
     }
 }
 
-/// Opens a PERSISTENT interactive target for a session. One target per
-/// session, reused for the whole stream; the engine pipes bytes both ways
-/// (plus resize / exit) until close.
+/// Opens one target stream. Legacy sessions call this once; an explicitly
+/// authorized persistent `ClawSite` session may call it again sequentially after
+/// the previous target closes. The engine pipes bytes both ways (plus resize /
+/// exit) until that target closes.
 pub trait ClawTargetRouter: Send + Sync {
     fn open(
         &self,
@@ -734,8 +750,10 @@ const TARGET_EXIT_GRACE: std::time::Duration = std::time::Duration::from_secs(2)
 
 /// Serve one data-tunnel connection: authenticate (credential +
 /// proof-of-possession token via `verify`, usually [`authorize_session`]),
-/// answer health probes, then on `Open` open a PERSISTENT interactive target
-/// via `router` and pipe `Data` both ways until close/EOF/error.
+/// answer health probes, then either open one legacy target with `Open`, or a
+/// bounded sequence of `ClawSite` targets with `OpenPersistent`. Each target is
+/// piped bidirectionally until close/EOF/error; only the explicit persistent
+/// mode returns to the authenticated pre-target loop.
 ///
 /// Interactive control: a client `Resize` frame is applied to the target's
 /// terminal (best-effort); when the target process exits, its output reaches
@@ -885,214 +903,309 @@ where
         return Err(DataTunnelError::AuthTimeout);
     };
 
-    // 2. Pre-stream: answer Health (liveness) until the client opens.
+    let mut persistent_negotiated = false;
+    let mut persistent_target_opens = 0_u32;
+    let mut persistent_bytes_to_target = 0_u64;
+    let mut persistent_bytes_from_target = 0_u64;
+
+    // 2. One authenticated connection may carry either the legacy single
+    // target stream (`Open`) or a sequence of target streams
+    // (`OpenPersistent`). Persistent streams are strictly sequential: this
+    // loop does not accept the next Open until the current target has closed.
     loop {
-        match recv_frame(&mut tunnel_r).await {
-            Ok(TunnelFrame::Health(p)) => {
-                tracing::debug!(
-                    stage = "claw_share.data_tunnel.health_received",
-                    len = p.len()
-                );
-                send_frame(&mut tunnel_w, &TunnelFrame::Health(p)).await?;
-                tracing::debug!(stage = "claw_share.data_tunnel.health_echo_sent");
+        let persistent = loop {
+            match recv_frame(&mut tunnel_r).await {
+                Ok(TunnelFrame::Health(p)) => {
+                    tracing::debug!(
+                        stage = "claw_share.data_tunnel.health_received",
+                        len = p.len()
+                    );
+                    send_frame(&mut tunnel_w, &TunnelFrame::Health(p)).await?;
+                    tracing::debug!(stage = "claw_share.data_tunnel.health_echo_sent");
+                }
+                Ok(TunnelFrame::Open) if !persistent_negotiated => {
+                    tracing::debug!(stage = "claw_share.data_tunnel.open_received", target_id = %short_str(&target_id), persistent = false);
+                    break false;
+                }
+                Ok(TunnelFrame::OpenPersistent) => {
+                    if !cred.allows_persistent_targets() {
+                        let _ = send_frame(
+                            &mut tunnel_w,
+                            &TunnelFrame::Error("persistent-target-not-authorized".into()),
+                        )
+                        .await;
+                        return Err(DataTunnelError::TargetUnavailable(
+                            "persistent-target-not-authorized".into(),
+                        ));
+                    }
+                    persistent_negotiated = true;
+                    persistent_target_opens = persistent_target_opens.saturating_add(1);
+                    if persistent_target_opens > PERSISTENT_MAX_TARGET_OPENS {
+                        let _ = send_frame(
+                            &mut tunnel_w,
+                            &TunnelFrame::Error("session-open-budget-exhausted".into()),
+                        )
+                        .await;
+                        return Err(DataTunnelError::TargetUnavailable(
+                            "session-open-budget-exhausted".into(),
+                        ));
+                    }
+                    tracing::debug!(stage = "claw_share.data_tunnel.open_received", target_id = %short_str(&target_id), persistent = true, target_open = persistent_target_opens);
+                    break true;
+                }
+                Ok(TunnelFrame::Open) => {
+                    return Err(DataTunnelError::InvalidFrame(
+                        "legacy open is forbidden after persistent mode".into(),
+                    ));
+                }
+                // A persistent target can close from either side. If the
+                // target reached EOF just before the client sent its own
+                // Close, the server has already emitted the authoritative
+                // Close notification and returned here; the client's Close
+                // is then an exact retry racing that notification. Treat it
+                // as an idempotent no-op. Do NOT emit a second Close ack: the
+                // original target-close notification is already ordered on
+                // the wire, and a duplicate ack would be mistaken for the
+                // next target's lifecycle frame.
+                Ok(TunnelFrame::Close) if persistent_negotiated => {
+                    tracing::debug!(
+                        stage = "claw_share.data_tunnel.persistent_close_retry_ignored",
+                        target_id = %short_str(&target_id),
+                    );
+                }
+                Ok(frame) => {
+                    tracing::debug!(stage = "claw_share.data_tunnel.pre_stream_unexpected", frame = ?frame);
+                    return Err(DataTunnelError::InvalidFrame(
+                        "expected health or open before stream".into(),
+                    ));
+                }
+                Err(DataTunnelError::Closed(_)) => return Ok(()),
+                Err(other) => return Err(other),
             }
-            Ok(TunnelFrame::Open) => {
-                tracing::debug!(stage = "claw_share.data_tunnel.open_received", target_id = %short_str(&target_id));
-                break;
-            }
-            Ok(frame) => {
-                tracing::debug!(stage = "claw_share.data_tunnel.pre_stream_unexpected", frame = ?frame);
-                return Err(DataTunnelError::InvalidFrame(
-                    "expected health or open before stream".into(),
-                ));
-            }
-            Err(DataTunnelError::Closed(_)) => return Ok(()),
-            Err(other) => return Err(other),
-        }
-    }
-
-    // 3. Open the PERSISTENT interactive target.
-    //
-    // Fence: re-check revocation AFTER Open and BEFORE `router.open`. The client
-    // may sit in the Health loop indefinitely, so authorization can lapse in
-    // that window — and until now the first `is_revoked` call happened only on
-    // the per-`Data` path, i.e. AFTER the target was opened and the Open-ack
-    // (and any `NetworkSettings`) had already been sent. For the Group/Public
-    // audience this predicate is the FULL live gate, so it also covers a wall
-    // clock that became unusable mid-wait. Same static deny as elsewhere; no
-    // new frame, kind, codec, or callback.
-    if is_revoked(&cred) {
-        tracing::debug!(
-            stage = "claw_share.data_tunnel.revoked_before_open",
-            target_id = %short_str(&target_id),
-        );
-        return Err(DataTunnelError::TargetUnavailable("revoked".into()));
-    }
-
-    let TargetSession {
-        mut reader,
-        mut writer,
-        resize,
-        mut exit,
-        vpn_mesh_ipv4,
-    } = match router.open(&target_id).await {
-        Ok(t) => t,
-        Err(e) => {
-            tracing::debug!(stage = "claw_share.data_tunnel.target_open_failed", target_id = %short_str(&target_id), error = %e);
-            let _ = send_frame(&mut tunnel_w, &TunnelFrame::Error(e.to_string())).await;
-            return Err(e);
-        }
-    };
-    send_frame(&mut tunnel_w, &TunnelFrame::Open).await?; // stream-ready ack
-    tracing::debug!(stage = "claw_share.data_tunnel.open_ack_sent", target_id = %short_str(&target_id));
-
-    // IpTunnel path only: deliver the real, pool-allocated VPN interface settings
-    // in a typed frame IMMEDIATELY after the Open-ack.
-    //
-    // RATCHET (inert -> live): this is the point at which a real, routable IPv4
-    // address first reaches the client. The allocation only exists after
-    // `router.open` (§step 3), which is exactly why it cannot ride the auth
-    // `TunnelAck` — that ack stays address-free for ALL paths. PTY/ClawSite/Device
-    // leave `network_settings` = None and send no such frame (unchanged). A send
-    // failure here just closes the connection: fail-closed, no interface set.
-    if let Some(mesh_ipv4) = vpn_mesh_ipv4 {
-        // Stamp the SAME session_id we put in the auth TunnelAck (cred.session_id()).
-        // The client stored the ack's session_id and fail-closes if this differs —
-        // an explicit cross-phase binding beyond the Noise channel. mtu matches the
-        // ack's, and the address is the real pool allocation (route-scope validated
-        // at the router before it ever reaches here).
-        let settings = NetworkSettings {
-            mesh_ipv4,
-            mtu: 1280,
-            session_id: cred.session_id(),
         };
-        // The product encodes its own body; the neutral frame carries it opaque.
-        // Same canonical CBOR, so the wire is byte-identical.
-        let body = encode_network_settings_body(&settings);
-        send_frame(&mut tunnel_w, &TunnelFrame::NetworkSettings(body)).await?;
-        tracing::debug!(stage = "claw_share.data_tunnel.network_settings_sent", target_id = %short_str(&target_id));
-    }
 
-    // 4. Bidirectional interactive pipe, driven from a single task so the two
-    //    directions, resize, and process exit share the target without
-    //    contending. First terminal condition ends the session.
-    //    (`AsyncReadExt`/`AsyncWriteExt` are imported at module scope.)
-    let mut rbuf = vec![0u8; STREAM_READ_CHUNK];
-    // Idle revocation: a quiet interactive session sends no `Data` frames, so
-    // the per-`Data` `is_revoked` check below never fires and the only other
-    // client traffic (e.g. a `Window` credit/keepalive) is a no-op. Poll the
-    // revocation predicate on a short interval so revoking the slot tears an
-    // IDLE session down within the tick — well under the <2s revocation SLA —
-    // regardless of whether the client is sending. The first tick fires
-    // immediately (a fresh, just-authorized session is not revoked, so it is a
-    // cheap no-op); subsequent ticks every `REVOKE_POLL`.
-    // SECURITY INVARIANT (audit D4 — load-bearing ordering; do not reorder).
-    // For the Group/Public audience `is_revoked` is the FULL live authorization gate
-    // (relay_stream_offer_session_revoked: not_after + machine-issuer-active +
-    // membership/published on the live projection), not merely a slot check. Two
-    // orderings enforce mid-session deauthorization and MUST be preserved across
-    // refactors: (1) the revoke_poll first tick fires IMMEDIATELY (below), so a
-    // principal deauthorized between authorize and the first loop turn is cut before
-    // any data flows; (2) the per-`Data` `is_revoked` check PRECEDES the
-    // forward/write below, so no frame is delivered after deauthorization. Removing
-    // the immediate first tick, or moving the per-`Data` check after the write,
-    // would open a forward-after-revoke window.
-    let mut revoke_poll = tokio::time::interval(REVOKE_POLL_INTERVAL);
-    revoke_poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    loop {
-        // CANCEL SAFETY (load-bearing; do not inline this back into the
-        // `select!`). `recv_frame` is two sequential `read_exact` awaits — the
-        // 4-byte length prefix, then the body — so it is NOT cancel-safe. When
-        // it was built inline as a `select!` arm it was reconstructed every
-        // turn, which means every sibling win DROPPED it; if it was parked
-        // between the two reads, the prefix bytes were already off the socket
-        // and were lost with the future, and the next read consumed body bytes
-        // as a length. That desynchronises the stream and surfaces to the peer
-        // as `connection closed during frame`.
+        // 3. Open one target stream.
         //
-        // Instead the future is built ONCE per inbound frame and pinned here,
-        // then held across the inner loop. A sibling arm winning merely stops
-        // polling it; the partially-read state lives in the future, which is
-        // still alive, so the next turn RESUMES the same read. It is dropped
-        // and rebuilt only after it has produced a value — completion, error,
-        // or idle timeout. Covered by
-        // `sibling_select_arm_cannot_desync_a_partially_read_frame`.
+        // Fence: re-check revocation AFTER Open and BEFORE `router.open`. The client
+        // may sit in the Health loop indefinitely, so authorization can lapse in
+        // that window — and until now the first `is_revoked` call happened only on
+        // the per-`Data` path, i.e. AFTER the target was opened and the Open-ack
+        // (and any `NetworkSettings`) had already been sent. For the Group/Public
+        // audience this predicate is the FULL live gate, so it also covers a wall
+        // clock that became unusable mid-wait. Same static deny as elsewhere; no
+        // new frame, kind, codec, or callback.
+        if is_revoked(&cred) {
+            tracing::debug!(
+                stage = "claw_share.data_tunnel.revoked_before_open",
+                target_id = %short_str(&target_id),
+            );
+            return Err(DataTunnelError::TargetUnavailable("revoked".into()));
+        }
+
+        let TargetSession {
+            mut reader,
+            mut writer,
+            resize,
+            mut exit,
+            vpn_mesh_ipv4,
+        } = match router.open(&target_id).await {
+            Ok(t) => t,
+            Err(e) => {
+                tracing::debug!(stage = "claw_share.data_tunnel.target_open_failed", target_id = %short_str(&target_id), error = %e);
+                let _ = send_frame(&mut tunnel_w, &TunnelFrame::Error(e.to_string())).await;
+                return Err(e);
+            }
+        };
+        send_frame(&mut tunnel_w, &TunnelFrame::Open).await?; // stream-ready ack
+        tracing::debug!(stage = "claw_share.data_tunnel.open_ack_sent", target_id = %short_str(&target_id));
+
+        // IpTunnel path only: deliver the real, pool-allocated VPN interface settings
+        // in a typed frame IMMEDIATELY after the Open-ack.
         //
-        // The sibling arms are cancel-safe by construction and unaffected:
-        // `interval.tick()` and `AsyncReadExt::read` both document that no
-        // progress is lost when they are dropped un-polled.
-        let mut inbound = std::pin::pin!(tokio::time::timeout(
-            STREAM_IDLE_TIMEOUT,
-            recv_frame(&mut tunnel_r)
-        ));
-        let inbound_result = loop {
-            tokio::select! {
-                // Revocation watcher: closes an idle (or active) session promptly
-                // once the slot is revoked, independent of inbound `Data` frames.
-                _ = revoke_poll.tick() => {
+        // RATCHET (inert -> live): this is the point at which a real, routable IPv4
+        // address first reaches the client. The allocation only exists after
+        // `router.open` (§step 3), which is exactly why it cannot ride the auth
+        // `TunnelAck` — that ack stays address-free for ALL paths. PTY/ClawSite/Device
+        // leave `network_settings` = None and send no such frame (unchanged). A send
+        // failure here just closes the connection: fail-closed, no interface set.
+        if let Some(mesh_ipv4) = vpn_mesh_ipv4 {
+            // Stamp the SAME session_id we put in the auth TunnelAck (cred.session_id()).
+            // The client stored the ack's session_id and fail-closes if this differs —
+            // an explicit cross-phase binding beyond the Noise channel. mtu matches the
+            // ack's, and the address is the real pool allocation (route-scope validated
+            // at the router before it ever reaches here).
+            let settings = NetworkSettings {
+                mesh_ipv4,
+                mtu: 1280,
+                session_id: cred.session_id(),
+            };
+            // The product encodes its identity-bearing body; the neutral frame
+            // carries it opaque. This remains byte-identical on the wire.
+            let body = encode_network_settings_body(&settings);
+            send_frame(&mut tunnel_w, &TunnelFrame::NetworkSettings(body)).await?;
+            tracing::debug!(stage = "claw_share.data_tunnel.network_settings_sent", target_id = %short_str(&target_id));
+        }
+
+        // 4. Bidirectional interactive pipe, driven from a single task so the two
+        //    directions, resize, and process exit share the target without
+        //    contending. First terminal condition ends the session.
+        //    (`AsyncReadExt`/`AsyncWriteExt` are imported at module scope.)
+        let mut rbuf = vec![0u8; STREAM_READ_CHUNK];
+        // Idle revocation: a quiet interactive session sends no `Data` frames, so
+        // the per-`Data` `is_revoked` check below never fires and the only other
+        // client traffic (e.g. a `Window` credit/keepalive) is a no-op. Poll the
+        // revocation predicate on a short interval so revoking the slot tears an
+        // IDLE session down within the tick — well under the <2s revocation SLA —
+        // regardless of whether the client is sending. The first tick fires
+        // immediately (a fresh, just-authorized session is not revoked, so it is a
+        // cheap no-op); subsequent ticks every `REVOKE_POLL`.
+        // SECURITY INVARIANT (audit D4 — load-bearing ordering; do not reorder).
+        // For the Group/Public audience `is_revoked` is the FULL live authorization gate
+        // (relay_stream_offer_session_revoked: not_after + machine-issuer-active +
+        // membership/published on the live projection), not merely a slot check. Two
+        // orderings enforce mid-session deauthorization and MUST be preserved across
+        // refactors: (1) the revoke_poll first tick fires IMMEDIATELY (below), so a
+        // principal deauthorized between authorize and the first loop turn is cut before
+        // any data flows; (2) the per-`Data` `is_revoked` check PRECEDES the
+        // forward/write below, so no frame is delivered after deauthorization. Removing
+        // the immediate first tick, or moving the per-`Data` check after the write,
+        // would open a forward-after-revoke window.
+        let mut revoke_poll = tokio::time::interval(REVOKE_POLL_INTERVAL);
+        revoke_poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        'target: loop {
+            // CANCEL SAFETY (load-bearing; do not inline this back into the
+            // `select!`). `recv_frame` is two sequential `read_exact` awaits — the
+            // 4-byte length prefix, then the body — so it is NOT cancel-safe. When
+            // it was built inline as a `select!` arm it was reconstructed every
+            // turn, which means every sibling win DROPPED it; if it was parked
+            // between the two reads, the prefix bytes were already off the socket
+            // and were lost with the future, and the next read consumed body bytes
+            // as a length. That desynchronises the stream and surfaces to the peer
+            // as `connection closed during frame`.
+            //
+            // Instead the future is built ONCE per inbound frame and pinned here,
+            // then held across the inner loop. A sibling arm winning merely stops
+            // polling it; the partially-read state lives in the future, which is
+            // still alive, so the next turn RESUMES the same read. It is dropped
+            // and rebuilt only after it has produced a value — completion, error,
+            // or idle timeout. Covered by
+            // `sibling_select_arm_cannot_desync_a_partially_read_frame`.
+            //
+            // The sibling arms are cancel-safe by construction and unaffected:
+            // `interval.tick()` and `AsyncReadExt::read` both document that no
+            // progress is lost when they are dropped un-polled.
+            let mut inbound = std::pin::pin!(tokio::time::timeout(
+                STREAM_IDLE_TIMEOUT,
+                recv_frame(&mut tunnel_r)
+            ));
+            let inbound_result = loop {
+                tokio::select! {
+                    // Revocation watcher: closes an idle (or active) session promptly
+                    // once the slot is revoked, independent of inbound `Data` frames.
+                    _ = revoke_poll.tick() => {
+                        if is_revoked(&cred) {
+                            let _ = writer.shutdown().await;
+                            return Err(DataTunnelError::Rejected("slot-revoked".into()));
+                        }
+                    }
+                    // tunnel → target: resumed, never restarted, across sibling wins.
+                    res = &mut inbound => break res,
+                    // target → tunnel
+                    read = reader.read(&mut rbuf) => {
+                        match read {
+                            Ok(n) if n > 0 => {
+                                if persistent {
+                                    persistent_bytes_from_target = persistent_bytes_from_target
+                                        .saturating_add(u64::try_from(n).unwrap_or(u64::MAX));
+                                    if persistent_bytes_from_target
+                                        > PERSISTENT_MAX_BYTES_PER_DIRECTION
+                                    {
+                                        let _ = send_frame(
+                                            &mut tunnel_w,
+                                            &TunnelFrame::Error(
+                                                "session-byte-budget-exhausted".into(),
+                                            ),
+                                        )
+                                        .await;
+                                        return Err(DataTunnelError::TargetUnavailable(
+                                            "session-byte-budget-exhausted".into(),
+                                        ));
+                                    }
+                                }
+                                send_frame(&mut tunnel_w, &TunnelFrame::Data(rbuf[..n].to_vec())).await?;
+                            }
+                            // End of the target's output: either a clean EOF (`Ok(0)`,
+                            // e.g. a closed socket or macOS PTY) OR a read error — on
+                            // Linux a PTY master returns `EIO` when the child exits
+                            // rather than EOF, so both mean "the target is done".
+                            // Capture the process exit status (if it has one and
+                            // resolves promptly) and propagate it typed before Close.
+                            _ => {
+                                if let Ok(status) = tokio::time::timeout(TARGET_EXIT_GRACE, &mut exit).await {
+                                    let _ = send_frame(&mut tunnel_w, &TunnelFrame::Exit(status)).await;
+                                }
+                                let _ = send_frame(&mut tunnel_w, &TunnelFrame::Close).await;
+                                if persistent {
+                                    break 'target;
+                                }
+                                return Ok(());
+                            }
+                        }
+                    }
+                }
+            };
+            let Ok(frame) = inbound_result else {
+                return Err(DataTunnelError::Closed("idle-timeout"));
+            };
+            match frame {
+                Ok(TunnelFrame::Data(d)) => {
                     if is_revoked(&cred) {
-                        let _ = writer.shutdown().await;
                         return Err(DataTunnelError::Rejected("slot-revoked".into()));
                     }
-                }
-                // tunnel → target: resumed, never restarted, across sibling wins.
-                res = &mut inbound => break res,
-                // target → tunnel
-                read = reader.read(&mut rbuf) => {
-                    match read {
-                        Ok(n) if n > 0 => {
-                            send_frame(&mut tunnel_w, &TunnelFrame::Data(rbuf[..n].to_vec())).await?;
-                        }
-                        // End of the target's output: either a clean EOF (`Ok(0)`,
-                        // e.g. a closed socket or macOS PTY) OR a read error — on
-                        // Linux a PTY master returns `EIO` when the child exits
-                        // rather than EOF, so both mean "the target is done".
-                        // Capture the process exit status (if it has one and
-                        // resolves promptly) and propagate it typed before Close.
-                        _ => {
-                            if let Ok(status) = tokio::time::timeout(TARGET_EXIT_GRACE, &mut exit).await {
-                                let _ = send_frame(&mut tunnel_w, &TunnelFrame::Exit(status)).await;
-                            }
-                            let _ = send_frame(&mut tunnel_w, &TunnelFrame::Close).await;
-                            return Ok(());
+                    if persistent {
+                        persistent_bytes_to_target = persistent_bytes_to_target
+                            .saturating_add(u64::try_from(d.len()).unwrap_or(u64::MAX));
+                        if persistent_bytes_to_target > PERSISTENT_MAX_BYTES_PER_DIRECTION {
+                            let _ = send_frame(
+                                &mut tunnel_w,
+                                &TunnelFrame::Error("session-byte-budget-exhausted".into()),
+                            )
+                            .await;
+                            return Err(DataTunnelError::TargetUnavailable(
+                                "session-byte-budget-exhausted".into(),
+                            ));
                         }
                     }
+                    writer
+                        .write_all(&d)
+                        .await
+                        .map_err(|e| DataTunnelError::Io(e.to_string()))?;
+                    writer
+                        .flush()
+                        .await
+                        .map_err(|e| DataTunnelError::Io(e.to_string()))?;
                 }
-            }
-        };
-        let Ok(frame) = inbound_result else {
-            return Err(DataTunnelError::Closed("idle-timeout"));
-        };
-        match frame {
-            Ok(TunnelFrame::Data(d)) => {
-                if is_revoked(&cred) {
-                    return Err(DataTunnelError::Rejected("slot-revoked".into()));
+                // Apply the client's terminal size to the target. Best
+                // effort: a resize hiccup must not tear down the session.
+                Ok(TunnelFrame::Resize { cols, rows }) => {
+                    let _ = resize(cols, rows);
                 }
-                writer
-                    .write_all(&d)
-                    .await
-                    .map_err(|e| DataTunnelError::Io(e.to_string()))?;
-                writer
-                    .flush()
-                    .await
-                    .map_err(|e| DataTunnelError::Io(e.to_string()))?;
+                Ok(TunnelFrame::Window(_)) => {} // credit ack; await-based backpressure governs
+                Ok(TunnelFrame::Close) | Err(DataTunnelError::Closed(_)) => {
+                    let _ = writer.shutdown().await;
+                    if persistent {
+                        send_frame(&mut tunnel_w, &TunnelFrame::Close).await?;
+                        break 'target;
+                    }
+                    return Ok(());
+                }
+                Ok(_) => {
+                    return Err(DataTunnelError::InvalidFrame(
+                        "unexpected frame in stream".into(),
+                    ));
+                }
+                Err(other) => return Err(other),
             }
-            // Apply the client's terminal size to the target. Best
-            // effort: a resize hiccup must not tear down the session.
-            Ok(TunnelFrame::Resize { cols, rows }) => {
-                let _ = resize(cols, rows);
-            }
-            Ok(TunnelFrame::Window(_)) => {} // credit ack; await-based backpressure governs
-            Ok(TunnelFrame::Close) | Err(DataTunnelError::Closed(_)) => {
-                let _ = writer.shutdown().await;
-                return Ok(());
-            }
-            Ok(_) => {
-                return Err(DataTunnelError::InvalidFrame(
-                    "unexpected frame in stream".into(),
-                ));
-            }
-            Err(other) => return Err(other),
         }
     }
 }
@@ -1174,6 +1287,22 @@ where
     S: AsyncRead + AsyncWrite + Unpin,
 {
     send_frame(stream, &TunnelFrame::Open).await?;
+    match recv_frame(stream).await? {
+        TunnelFrame::Open => Ok(()),
+        TunnelFrame::Error(reason) => Err(DataTunnelError::TargetUnavailable(reason)),
+        _ => Err(DataTunnelError::InvalidFrame("expected open ack".into())),
+    }
+}
+
+/// Open one target stream while retaining the authenticated connection for a
+/// later sequential target. The server acknowledges with the legacy `Open`
+/// frame so existing ready/error handling stays byte-identical after the new
+/// request mode is selected.
+pub async fn client_open_persistent_stream<S>(stream: &mut S) -> Result<(), DataTunnelError>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    send_frame(stream, &TunnelFrame::OpenPersistent).await?;
     match recv_frame(stream).await? {
         TunnelFrame::Open => Ok(()),
         TunnelFrame::Error(reason) => Err(DataTunnelError::TargetUnavailable(reason)),
@@ -1361,6 +1490,10 @@ mod tests {
         assert_eq!(cred.mesh_ipv6(), derive_mesh_ipv6(&cred));
         assert_eq!(cred.session_id(), "22222222222222222222222222222222");
         assert_eq!(cred.mesh_ipv6(), "fd00:c1aw::2222:2222");
+        assert!(
+            !cred.allows_persistent_targets(),
+            "Device credentials must retain the legacy single-target protocol"
+        );
     }
 
     /// Slot store with `SLOT` open then consumed by `guest`, for `claw_test`.
@@ -1372,6 +1505,8 @@ mod tests {
                 claw_id: claw_id.to_string(),
                 expires_at: EXPIRES,
                 state: SlotState::Open,
+                app_presentation: None,
+                created_at: None,
             })
             .unwrap();
         store
@@ -1629,6 +1764,56 @@ mod tests {
         addr
     }
 
+    /// A request/response target that closes each accepted TCP connection.
+    /// Two accepts prove that the data-tunnel can reopen a fresh ClawSite
+    /// backend without repeating rendezvous, Noise, or auth.
+    async fn spawn_two_request_target() -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let target = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = target.local_addr().unwrap().to_string();
+        tokio::spawn(async move {
+            for index in 1..=2 {
+                let (mut sock, _) = target.accept().await.unwrap();
+                let mut request = vec![0_u8; 1024];
+                let n = sock.read(&mut request).await.unwrap();
+                assert!(n > 0, "request {index} must reach the target");
+                sock.write_all(format!("response-{index}").as_bytes())
+                    .await
+                    .unwrap();
+                sock.shutdown().await.unwrap();
+            }
+        });
+        addr
+    }
+
+    /// Two keep-alive-style request targets. Each accepted target stays open
+    /// after its response until the data-tunnel explicitly closes it. This
+    /// pins the opposite lifecycle ordering from `spawn_two_request_target`:
+    /// client-close first rather than target-EOF first.
+    async fn spawn_two_keepalive_targets() -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let target = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = target.local_addr().unwrap().to_string();
+        tokio::spawn(async move {
+            for index in 1..=2 {
+                let (mut sock, _) = target.accept().await.unwrap();
+                let mut request = vec![0_u8; 1024];
+                let n = sock.read(&mut request).await.unwrap();
+                assert!(n > 0, "request {index} must reach the target");
+                sock.write_all(format!("response-{index}").as_bytes())
+                    .await
+                    .unwrap();
+                let mut drain = [0_u8; 1];
+                assert_eq!(
+                    sock.read(&mut drain).await.unwrap(),
+                    0,
+                    "target {index} must remain open until the client closes it"
+                );
+            }
+        });
+        addr
+    }
+
     fn spawn_engine(
         store: Arc<ClawShareSlotStore>,
         target_addr: String,
@@ -1658,6 +1843,120 @@ mod tests {
             .await;
         });
         addr
+    }
+
+    struct PersistentTestSession(GuestCredential);
+
+    impl DataTunnelSession for PersistentTestSession {
+        fn session_id(&self) -> String {
+            self.0.session_id()
+        }
+
+        fn mesh_ipv6(&self) -> String {
+            self.0.mesh_ipv6()
+        }
+
+        fn allows_persistent_targets(&self) -> bool {
+            true
+        }
+    }
+
+    fn spawn_persistent_engine_with_router<R>(
+        store: Arc<ClawShareSlotStore>,
+        guard: Arc<ReplayGuard>,
+        router: R,
+    ) -> std::net::SocketAddr
+    where
+        R: ClawTargetRouter + Send + Sync + 'static,
+    {
+        let hh = engine_hh();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let listener = TcpListener::from_std(listener).unwrap();
+        tokio::spawn(async move {
+            let (sock, _) = listener.accept().await.unwrap();
+            let rev_store = Arc::clone(&store);
+            let _ = serve_connection_io_with_auth_deadline(
+                sock,
+                NOW,
+                move |e, n| authorize_session(e, &hh, &store, &guard, n).map(PersistentTestSession),
+                &router,
+                move |session: &PersistentTestSession| {
+                    matches!(
+                        rev_store.get(&session.0.slot_id).map(|r| r.state),
+                        Some(SlotState::Revoked { .. })
+                    )
+                },
+                DEFAULT_AUTH_DEADLINE,
+            )
+            .await;
+        });
+        addr
+    }
+
+    fn spawn_persistent_engine(
+        store: Arc<ClawShareSlotStore>,
+        target_addr: String,
+        guard: Arc<ReplayGuard>,
+    ) -> std::net::SocketAddr {
+        spawn_persistent_engine_with_router(store, guard, TcpStreamRouter::new(target_addr))
+    }
+
+    struct ImmediateCloseRouter {
+        opens: Arc<std::sync::atomic::AtomicU32>,
+    }
+
+    impl ClawTargetRouter for ImmediateCloseRouter {
+        async fn open(&self, _target_id: &str) -> Result<TargetSession, DataTunnelError> {
+            self.opens.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let (stream, peer) = tokio::io::duplex(1);
+            drop(peer);
+            let (reader, writer) = tokio::io::split(stream);
+            Ok(TargetSession {
+                reader: Box::new(reader),
+                writer: Box::new(writer),
+                resize: Box::new(|_, _| Ok(())),
+                exit: Box::pin(std::future::ready(TargetExit::Code(0))),
+                vpn_mesh_ipv4: None,
+            })
+        }
+    }
+
+    struct DrainRouter;
+
+    impl ClawTargetRouter for DrainRouter {
+        async fn open(&self, _target_id: &str) -> Result<TargetSession, DataTunnelError> {
+            use tokio::io::AsyncReadExt as _;
+            let (stream, mut peer) = tokio::io::duplex(MAX_FRAME_LEN * 2);
+            tokio::spawn(async move {
+                let mut buf = vec![0_u8; MAX_FRAME_LEN];
+                while peer.read(&mut buf).await.is_ok_and(|n| n > 0) {}
+            });
+            Ok(TargetSession::from_stream(stream))
+        }
+    }
+
+    struct FloodRouter;
+
+    impl ClawTargetRouter for FloodRouter {
+        async fn open(&self, _target_id: &str) -> Result<TargetSession, DataTunnelError> {
+            use tokio::io::AsyncWriteExt as _;
+            let (stream, mut peer) = tokio::io::duplex(STREAM_READ_CHUNK * 2);
+            tokio::spawn(async move {
+                let chunk = vec![0xa5; STREAM_READ_CHUNK];
+                let full_chunks = PERSISTENT_MAX_BYTES_PER_DIRECTION / STREAM_READ_CHUNK as u64;
+                for _ in 0..full_chunks {
+                    peer.write_all(&chunk).await.unwrap();
+                }
+                let remainder = PERSISTENT_MAX_BYTES_PER_DIRECTION % STREAM_READ_CHUNK as u64;
+                if remainder > 0 {
+                    peer.write_all(&chunk[..remainder as usize]).await.unwrap();
+                }
+                peer.write_all(&[0xa5]).await.unwrap();
+            });
+            Ok(TargetSession::from_stream(stream))
+        }
     }
 
     async fn serve_with_short_auth_deadline<S>(
@@ -1766,6 +2065,373 @@ mod tests {
         }
 
         send_frame(&mut client, &TunnelFrame::Close).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn persistent_connection_reopens_two_sequential_target_streams() {
+        let store = Arc::new(consumed_store("claw_test"));
+        let addr = spawn_persistent_engine(
+            store,
+            spawn_two_request_target().await,
+            Arc::new(ReplayGuard::new()),
+        );
+
+        let cbor = cred_cbor();
+        let mut client = TcpStream::connect(addr).await.unwrap();
+        client_authenticate(&mut client, &cbor, valid_token(b"persistent-reopen"))
+            .await
+            .unwrap();
+
+        for index in 1..=2 {
+            client_open_persistent_stream(&mut client).await.unwrap();
+            send_frame(
+                &mut client,
+                &TunnelFrame::Data(format!("request-{index}").into_bytes()),
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                recv_frame(&mut client).await.unwrap(),
+                TunnelFrame::Data(format!("response-{index}").into_bytes())
+            );
+            assert_eq!(recv_frame(&mut client).await.unwrap(), TunnelFrame::Close);
+        }
+    }
+
+    #[tokio::test]
+    async fn persistent_close_retry_after_target_race_is_idempotent_and_does_not_poison_next_open()
+    {
+        let store = Arc::new(consumed_store("claw_test"));
+        let addr = spawn_persistent_engine(
+            store,
+            spawn_two_keepalive_targets().await,
+            Arc::new(ReplayGuard::new()),
+        );
+
+        let cbor = cred_cbor();
+        let mut client = TcpStream::connect(addr).await.unwrap();
+        client_authenticate(
+            &mut client,
+            &cbor,
+            valid_token(b"persistent-idempotent-close"),
+        )
+        .await
+        .unwrap();
+
+        client_open_persistent_stream(&mut client).await.unwrap();
+        send_frame(&mut client, &TunnelFrame::Data(b"request-1".to_vec()))
+            .await
+            .unwrap();
+        assert_eq!(
+            recv_frame(&mut client).await.unwrap(),
+            TunnelFrame::Data(b"response-1".to_vec())
+        );
+
+        // The first Close ends target 1 and produces exactly one Close ack.
+        // The second models the legitimate race where the target had already
+        // reached EOF and the client independently closes the same target.
+        // It must be ignored in pre-stream state and must not produce a second
+        // ack that could poison target 2.
+        send_frame(&mut client, &TunnelFrame::Close).await.unwrap();
+        send_frame(&mut client, &TunnelFrame::Close).await.unwrap();
+        assert_eq!(recv_frame(&mut client).await.unwrap(), TunnelFrame::Close);
+
+        client_open_persistent_stream(&mut client).await.unwrap();
+        send_frame(&mut client, &TunnelFrame::Data(b"request-2".to_vec()))
+            .await
+            .unwrap();
+        assert_eq!(
+            recv_frame(&mut client).await.unwrap(),
+            TunnelFrame::Data(b"response-2".to_vec()),
+            "a duplicate Close must not leave a stale ack ahead of target 2"
+        );
+        send_frame(&mut client, &TunnelFrame::Close).await.unwrap();
+        assert_eq!(recv_frame(&mut client).await.unwrap(), TunnelFrame::Close);
+    }
+
+    #[tokio::test]
+    async fn device_session_rejects_persistent_target_before_backend_open() {
+        let store = Arc::new(consumed_store("claw_test"));
+        let addr = spawn_engine(
+            store,
+            "127.0.0.1:1".to_string(),
+            Arc::new(ReplayGuard::new()),
+        );
+
+        let mut client = TcpStream::connect(addr).await.unwrap();
+        client_authenticate(
+            &mut client,
+            &cred_cbor(),
+            valid_token(b"device-persistent-denied"),
+        )
+        .await
+        .unwrap();
+        let denied = client_open_persistent_stream(&mut client)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            denied,
+            DataTunnelError::TargetUnavailable("persistent-target-not-authorized".into())
+        );
+    }
+
+    #[tokio::test]
+    async fn persistent_mode_rejects_legacy_open_downgrade() {
+        let store = Arc::new(consumed_store("claw_test"));
+        let addr = spawn_persistent_engine(
+            store,
+            spawn_two_request_target().await,
+            Arc::new(ReplayGuard::new()),
+        );
+
+        let mut client = TcpStream::connect(addr).await.unwrap();
+        client_authenticate(
+            &mut client,
+            &cred_cbor(),
+            valid_token(b"persistent-no-downgrade"),
+        )
+        .await
+        .unwrap();
+        client_open_persistent_stream(&mut client).await.unwrap();
+        send_frame(&mut client, &TunnelFrame::Data(b"request-1".to_vec()))
+            .await
+            .unwrap();
+        assert!(matches!(
+            recv_frame(&mut client).await.unwrap(),
+            TunnelFrame::Data(_)
+        ));
+        assert_eq!(recv_frame(&mut client).await.unwrap(), TunnelFrame::Close);
+
+        send_frame(&mut client, &TunnelFrame::Open).await.unwrap();
+        assert!(
+            recv_frame(&mut client).await.is_err(),
+            "persistent mode must not silently downgrade to legacy Open"
+        );
+    }
+
+    #[tokio::test]
+    async fn persistent_open_budget_rejects_129th_before_target_allocation() {
+        let store = Arc::new(consumed_store("claw_test"));
+        let opens = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let addr = spawn_persistent_engine_with_router(
+            store,
+            Arc::new(ReplayGuard::new()),
+            ImmediateCloseRouter {
+                opens: Arc::clone(&opens),
+            },
+        );
+
+        let mut client = TcpStream::connect(addr).await.unwrap();
+        client_authenticate(
+            &mut client,
+            &cred_cbor(),
+            valid_token(b"persistent-open-budget"),
+        )
+        .await
+        .unwrap();
+
+        for index in 1..=PERSISTENT_MAX_TARGET_OPENS {
+            client_open_persistent_stream(&mut client).await.unwrap();
+            assert_eq!(
+                recv_frame(&mut client).await.unwrap(),
+                TunnelFrame::Exit(TargetExit::Code(0)),
+                "target {index} must close normally"
+            );
+            assert_eq!(recv_frame(&mut client).await.unwrap(), TunnelFrame::Close);
+        }
+
+        let exhausted = client_open_persistent_stream(&mut client)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            exhausted,
+            DataTunnelError::TargetUnavailable("session-open-budget-exhausted".into())
+        );
+        assert_eq!(
+            opens.load(std::sync::atomic::Ordering::SeqCst),
+            PERSISTENT_MAX_TARGET_OPENS,
+            "the rejected 129th open must allocate no target"
+        );
+    }
+
+    #[tokio::test]
+    async fn persistent_revocation_blocks_second_open_before_target_allocation() {
+        // §3 baseline item 4 / §7.1: "before every new persistent target
+        // open" must be a PINNED ordering property, not an accident of the
+        // 500 ms revoke-poll interval. A test that only observes the client
+        // eventually seeing an error cannot tell "the fence ran before
+        // `router.open`" (correct) apart from "the fence ran after
+        // `router.open`, but something else — the poll, or the next Data
+        // check — tore the session down anyway" (a real regression that
+        // would still look green). `ImmediateCloseRouter`'s open counter
+        // makes the two distinguishable: if the fence ever moves after
+        // `router.open`, this test goes red because `opens` reaches 2, even
+        // though the client-observed outcome (rejection) looks unchanged.
+        let store = Arc::new(consumed_store("claw_test"));
+        let opens = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let addr = spawn_persistent_engine_with_router(
+            Arc::clone(&store),
+            Arc::new(ReplayGuard::new()),
+            ImmediateCloseRouter {
+                opens: Arc::clone(&opens),
+            },
+        );
+
+        let mut client = TcpStream::connect(addr).await.unwrap();
+        client_authenticate(
+            &mut client,
+            &cred_cbor(),
+            valid_token(b"persistent-revocation-ordering"),
+        )
+        .await
+        .unwrap();
+
+        // Target #1: opens and closes normally, exactly once.
+        client_open_persistent_stream(&mut client).await.unwrap();
+        assert_eq!(
+            recv_frame(&mut client).await.unwrap(),
+            TunnelFrame::Exit(TargetExit::Code(0))
+        );
+        assert_eq!(recv_frame(&mut client).await.unwrap(), TunnelFrame::Close);
+        assert_eq!(opens.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        // Revoke between the two opens, then ask for target #2. The fence
+        // returns before sending any frame (unlike a `router.open` failure,
+        // which does send `TunnelFrame::Error` first) — the connection is
+        // simply dropped, so the client observes EOF here, matching the
+        // `is_err()`-only assertion already used by the sibling tests
+        // (`revoking_during_health_wait_blocks_open_before_the_target_is_opened`
+        // and the responder-level
+        // `relay_stream_responder_device_clawsite_revocation_blocks_next_persistent_open`).
+        store.revoke(&SLOT, NOW).unwrap();
+        assert!(
+            client_open_persistent_stream(&mut client).await.is_err(),
+            "revocation between persistent targets must reject the second open"
+        );
+
+        // The pin: `router.open` must never have run a second time. A
+        // count of 2 here means the fence ran too late — the target was
+        // already allocated before the rejection reached the client.
+        assert_eq!(
+            opens.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "revocation must block the second open before target allocation, not just \
+             eventually close the connection"
+        );
+    }
+
+    #[tokio::test]
+    async fn persistent_upload_budget_accepts_exact_boundary_and_rejects_one_more_byte() {
+        let store = Arc::new(consumed_store("claw_test"));
+        let addr =
+            spawn_persistent_engine_with_router(store, Arc::new(ReplayGuard::new()), DrainRouter);
+
+        let mut client = TcpStream::connect(addr).await.unwrap();
+        client_authenticate(
+            &mut client,
+            &cred_cbor(),
+            valid_token(b"persistent-byte-budget"),
+        )
+        .await
+        .unwrap();
+        client_open_persistent_stream(&mut client).await.unwrap();
+
+        let chunk_len = MAX_FRAME_LEN - 1;
+        let full_chunks = PERSISTENT_MAX_BYTES_PER_DIRECTION / chunk_len as u64;
+        let remainder = PERSISTENT_MAX_BYTES_PER_DIRECTION % chunk_len as u64;
+        let chunk = vec![0x5a; chunk_len];
+        for _ in 0..full_chunks {
+            send_frame(&mut client, &TunnelFrame::Data(chunk.clone()))
+                .await
+                .unwrap();
+        }
+        if remainder > 0 {
+            send_frame(
+                &mut client,
+                &TunnelFrame::Data(vec![0x5a; remainder as usize]),
+            )
+            .await
+            .unwrap();
+        }
+
+        send_frame(&mut client, &TunnelFrame::Data(vec![0x5a]))
+            .await
+            .unwrap();
+        assert_eq!(
+            recv_frame(&mut client).await.unwrap(),
+            TunnelFrame::Error("session-byte-budget-exhausted".into())
+        );
+    }
+
+    #[tokio::test]
+    async fn persistent_download_budget_accepts_exact_boundary_and_rejects_one_more_byte() {
+        let store = Arc::new(consumed_store("claw_test"));
+        let addr =
+            spawn_persistent_engine_with_router(store, Arc::new(ReplayGuard::new()), FloodRouter);
+
+        let mut client = TcpStream::connect(addr).await.unwrap();
+        client_authenticate(
+            &mut client,
+            &cred_cbor(),
+            valid_token(b"persistent-download-budget"),
+        )
+        .await
+        .unwrap();
+        client_open_persistent_stream(&mut client).await.unwrap();
+
+        let mut received = 0_u64;
+        loop {
+            match recv_frame(&mut client).await.unwrap() {
+                TunnelFrame::Data(bytes) => {
+                    received = received.saturating_add(bytes.len() as u64);
+                }
+                TunnelFrame::Error(reason) => {
+                    assert_eq!(reason, "session-byte-budget-exhausted");
+                    break;
+                }
+                frame => panic!("unexpected frame at download boundary: {frame:?}"),
+            }
+        }
+        assert_eq!(received, PERSISTENT_MAX_BYTES_PER_DIRECTION);
+    }
+
+    #[tokio::test]
+    async fn revocation_between_persistent_targets_blocks_the_next_open() {
+        let store = Arc::new(consumed_store("claw_test"));
+        let addr = spawn_persistent_engine(
+            Arc::clone(&store),
+            spawn_two_request_target().await,
+            Arc::new(ReplayGuard::new()),
+        );
+
+        let cbor = cred_cbor();
+        let mut client = TcpStream::connect(addr).await.unwrap();
+        client_authenticate(
+            &mut client,
+            &cbor,
+            valid_token(b"persistent-revoke-between"),
+        )
+        .await
+        .unwrap();
+        client_open_persistent_stream(&mut client).await.unwrap();
+        send_frame(&mut client, &TunnelFrame::Data(b"request-1".to_vec()))
+            .await
+            .unwrap();
+        assert_eq!(
+            recv_frame(&mut client).await.unwrap(),
+            TunnelFrame::Data(b"response-1".to_vec())
+        );
+        assert_eq!(recv_frame(&mut client).await.unwrap(), TunnelFrame::Close);
+
+        store.revoke(&SLOT, NOW).unwrap();
+        send_frame(&mut client, &TunnelFrame::OpenPersistent)
+            .await
+            .unwrap();
+        let after = recv_frame(&mut client).await;
+        assert!(
+            after.is_err(),
+            "revocation between targets must close before a second backend opens: {after:?}"
+        );
     }
 
     #[tokio::test]
@@ -2038,6 +2704,13 @@ mod tests {
             rows: u16::MAX,
         };
         assert_eq!(TunnelFrame::decode(&fmax.encode()).unwrap(), fmax);
+    }
+
+    #[test]
+    fn open_persistent_frame_round_trips() {
+        let frame = TunnelFrame::OpenPersistent;
+        assert_eq!(frame.encode(), vec![FRAME_OPEN_PERSISTENT]);
+        assert_eq!(TunnelFrame::decode(&frame.encode()).unwrap(), frame);
     }
 
     #[test]

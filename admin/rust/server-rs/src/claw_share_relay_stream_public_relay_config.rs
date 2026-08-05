@@ -11,6 +11,7 @@ use std::time::Duration;
 
 use crate::claw_share_relay_stream_abuse::RelayAbuseConfig;
 use crate::claw_share_rendezvous_stream_relay_listener::RendezvousStreamRelayListenerConfig;
+use household_rs::claw_share_data_tunnel::PERSISTENT_MAX_BYTES_PER_DIRECTION;
 
 pub const RELAY_STREAM_PUBLIC_RELAY_ENV: &str = "THEYOS_RELAY_STREAM_PUBLIC_RELAY";
 pub const RELAY_STREAM_PUBLIC_BIND_ADDR_ENV: &str = "THEYOS_RELAY_STREAM_PUBLIC_BIND_ADDR";
@@ -27,6 +28,51 @@ pub const RELAY_STREAM_PUBLIC_SPLICE_IDLE_TIMEOUT_SECS_ENV: &str =
     "THEYOS_RELAY_STREAM_PUBLIC_SPLICE_IDLE_TIMEOUT_SECS";
 pub const RELAY_STREAM_PUBLIC_SPLICE_MAX_LIFETIME_SECS_ENV: &str =
     "THEYOS_RELAY_STREAM_PUBLIC_SPLICE_MAX_LIFETIME_SECS";
+pub const RELAY_STREAM_PUBLIC_SPLICE_MAX_BYTES_PER_DIRECTION_ENV: &str =
+    "THEYOS_RELAY_STREAM_PUBLIC_SPLICE_MAX_BYTES_PER_DIRECTION";
+
+/// Per-direction byte budget for the PUBLIC relay splice, and the POLICY
+/// FLOOR any explicit override must meet (see `parse_byte_cap`). This is
+/// Share public-relay POLICY — the generic listener default stays unlimited
+/// (None) so legacy/IpTunnel callers are byte-identical; only this config
+/// applies it.
+///
+/// This is a normal-path backstop against gross misconfiguration, NOT a
+/// proof that the endpoint's typed `session-byte-budget-exhausted` always
+/// fires before the relay's own cap. The relay is blind: it counts every
+/// wire byte of the Noise-encrypted transport (AEAD tag + length framing on
+/// EVERY message, plus `Health`/`Resize`/`Open`/`Close`/`Exit` control
+/// frames), while the endpoint counts only `TunnelFrame::Data` payload
+/// bytes. A peer that spams `Health` keepalives (unbounded — there is no
+/// cap on how many round trips a session may do) can make the relay cut
+/// first regardless of how large this margin is.
+///
+/// What actually bounds that WITHIN one session is the relay's own byte
+/// cap (a hard close once total wire bytes — including the `Health` spam —
+/// reach it) and `splice_max_lifetime` (a hard duration bound regardless of
+/// activity pattern). `Health` traffic is activity, so it defers idle
+/// timeout rather than being caught by it, and it never touches
+/// `PERSISTENT_MAX_TARGET_OPENS` (that budget counts successful target
+/// opens, not frames). The reopen limiter and the per-source
+/// unpaired/pending/paired caps bound REPETITION and CONCURRENCY — a new
+/// dial, or how many sessions run at once — not sustained activity inside
+/// an already-authorized connection. This margin exists to catch the case
+/// where a relay cap is configured smaller than what ordinary,
+/// non-adversarial framing overhead requires for a single legitimate
+/// 64 MiB transfer.
+pub const DEFAULT_PUBLIC_SPLICE_MAX_BYTES_PER_DIRECTION: u64 = 72 * 1024 * 1024;
+
+/// Independent of `parse_byte_cap`'s runtime floor check: the default itself
+/// must satisfy the invariant it becomes the floor for. Checking `bytes >=
+/// DEFAULT_PUBLIC_SPLICE_MAX_BYTES_PER_DIRECTION` alone would be tautological
+/// here — a regression of the default to <= the endpoint budget would still
+/// satisfy `bytes >= DEFAULT` for any config using the (now-broken) default,
+/// and nothing would catch it. This compile-time assertion is that
+/// independent check: it fails the BUILD, not a test, if the default ever
+/// regresses.
+const _: () = assert!(
+    DEFAULT_PUBLIC_SPLICE_MAX_BYTES_PER_DIRECTION > PERSISTENT_MAX_BYTES_PER_DIRECTION
+);
 
 pub const RELAY_STREAM_PUBLIC_MAX_UNPAIRED_ACTIVE_PER_SOURCE_ENV: &str =
     "THEYOS_RELAY_STREAM_PUBLIC_MAX_UNPAIRED_ACTIVE_PER_SOURCE";
@@ -196,6 +242,9 @@ impl RelayStreamPublicRelayConfig {
                     MAX_SPLICE_IDLE_TIMEOUT,
                 )?,
                 splice_max_lifetime,
+                // 0 is explicitly rejected by parse_byte_cap: a public relay
+                // may not run with the byte cap disabled.
+                splice_max_bytes_per_direction: Some(parse_byte_cap(&get)?),
                 abuse,
             },
         }))
@@ -293,6 +342,51 @@ fn parse_status_bind_addr(raw: &str) -> Result<SocketAddr, RelayStreamPublicRela
         return Err(RelayStreamPublicRelayConfigError::NonLoopbackStatusBindAddr);
     }
     Ok(addr)
+}
+
+/// Parse the per-direction splice byte cap. Unset/empty means the safe
+/// default (72 MiB). An explicit `0` is REJECTED in public mode: it would
+/// either disable the cap or block every byte, and a public relay must run
+/// with a real, finite budget.
+///
+/// The default and an explicit override are resolved to the same `bytes`
+/// value FIRST, then zero and policy-floor validation apply uniformly to
+/// that value — neither check may live only on the explicit-override
+/// branch, or a future change to the default itself could silently ship a
+/// value that violates its own floor.
+///
+/// The floor is `DEFAULT_PUBLIC_SPLICE_MAX_BYTES_PER_DIRECTION`
+/// (inclusive), not merely "greater than the endpoint's 64 MiB budget" — a
+/// margin of a single byte over the endpoint budget is not enough to
+/// absorb even ORDINARY per-message Noise/framing overhead for a
+/// legitimate transfer (see the constant's doc comment for why this is a
+/// backstop, not a proof of ordering).
+fn parse_byte_cap(
+    get: &impl Fn(&'static str) -> Option<Result<String, RelayStreamPublicRelayConfigError>>,
+) -> Result<u64, RelayStreamPublicRelayConfigError> {
+    let override_value = transpose_env(get(RELAY_STREAM_PUBLIC_SPLICE_MAX_BYTES_PER_DIRECTION_ENV))?
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+    let bytes = match override_value {
+        Some(value) => value.parse::<u64>().map_err(|_| {
+            RelayStreamPublicRelayConfigError::InvalidNumber {
+                field: RELAY_STREAM_PUBLIC_SPLICE_MAX_BYTES_PER_DIRECTION_ENV,
+            }
+        })?,
+        None => DEFAULT_PUBLIC_SPLICE_MAX_BYTES_PER_DIRECTION,
+    };
+    if bytes == 0 {
+        return Err(RelayStreamPublicRelayConfigError::OutOfRange {
+            field: RELAY_STREAM_PUBLIC_SPLICE_MAX_BYTES_PER_DIRECTION_ENV,
+        });
+    }
+    if bytes < DEFAULT_PUBLIC_SPLICE_MAX_BYTES_PER_DIRECTION {
+        return Err(RelayStreamPublicRelayConfigError::RelayCapBelowPolicyFloor {
+            relay_cap: bytes,
+            policy_floor: DEFAULT_PUBLIC_SPLICE_MAX_BYTES_PER_DIRECTION,
+        });
+    }
+    Ok(bytes)
 }
 
 fn parse_duration_secs(
@@ -446,6 +540,16 @@ pub enum RelayStreamPublicRelayConfigError {
 
     #[error("relay_stream public relay numeric field is out of range: {field}")]
     OutOfRange { field: &'static str },
+
+    /// A normal-path policy-floor backstop, not a proof that the endpoint's
+    /// typed budget error always fires before the relay's own cap — see
+    /// `DEFAULT_PUBLIC_SPLICE_MAX_BYTES_PER_DIRECTION`'s doc comment.
+    #[error(
+        "relay_stream public relay splice byte cap ({relay_cap}) is below the policy floor \
+         ({policy_floor}) — this is a backstop against gross misconfiguration, not a proof of \
+         ordering against adversarial framing"
+    )]
+    RelayCapBelowPolicyFloor { relay_cap: u64, policy_floor: u64 },
 }
 
 #[cfg(test)]
@@ -671,6 +775,182 @@ mod tests {
                 field: RELAY_STREAM_PUBLIC_IPV6_SOURCE_PREFIX_LEN_ENV
             }
         );
+    }
+
+    #[test]
+    fn public_relay_config_splice_byte_cap_defaults_and_forbids_zero() {
+        // Unset: the safe default (72 MiB) applies.
+        let config = config_from_getter(&[
+            (RELAY_STREAM_PUBLIC_RELAY_ENV, "1"),
+            (RELAY_STREAM_PUBLIC_BIND_ADDR_ENV, "192.168.15.10:49152"),
+        ])
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            config.listener.splice_max_bytes_per_direction,
+            Some(DEFAULT_PUBLIC_SPLICE_MAX_BYTES_PER_DIRECTION)
+        );
+
+        // Explicit override above the endpoint budget is honored.
+        let config = config_from_getter(&[
+            (RELAY_STREAM_PUBLIC_RELAY_ENV, "1"),
+            (RELAY_STREAM_PUBLIC_BIND_ADDR_ENV, "192.168.15.10:49152"),
+            (
+                RELAY_STREAM_PUBLIC_SPLICE_MAX_BYTES_PER_DIRECTION_ENV,
+                "83886080",
+            ),
+        ])
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            config.listener.splice_max_bytes_per_direction,
+            Some(83_886_080)
+        );
+
+        // 0 is forbidden in public mode: the cap may not be disabled.
+        assert_eq!(
+            config_from_getter(&[
+                (RELAY_STREAM_PUBLIC_RELAY_ENV, "1"),
+                (RELAY_STREAM_PUBLIC_BIND_ADDR_ENV, "192.168.15.10:49152"),
+                (RELAY_STREAM_PUBLIC_SPLICE_MAX_BYTES_PER_DIRECTION_ENV, "0"),
+            ])
+            .unwrap_err(),
+            RelayStreamPublicRelayConfigError::OutOfRange {
+                field: RELAY_STREAM_PUBLIC_SPLICE_MAX_BYTES_PER_DIRECTION_ENV
+            }
+        );
+
+        // Non-numeric is a config error, never a silent default.
+        assert_eq!(
+            config_from_getter(&[
+                (RELAY_STREAM_PUBLIC_RELAY_ENV, "1"),
+                (RELAY_STREAM_PUBLIC_BIND_ADDR_ENV, "192.168.15.10:49152"),
+                (
+                    RELAY_STREAM_PUBLIC_SPLICE_MAX_BYTES_PER_DIRECTION_ENV,
+                    "unlimited",
+                ),
+            ])
+            .unwrap_err(),
+            RelayStreamPublicRelayConfigError::InvalidNumber {
+                field: RELAY_STREAM_PUBLIC_SPLICE_MAX_BYTES_PER_DIRECTION_ENV
+            }
+        );
+    }
+
+    #[test]
+    fn public_relay_config_rejects_relay_cap_below_policy_floor() {
+        // A relay cap configured below the policy floor
+        // (`DEFAULT_PUBLIC_SPLICE_MAX_BYTES_PER_DIRECTION`, 72 MiB) must
+        // fail configuration startup with a typed error. This is a
+        // normal-path backstop against gross misconfiguration — it does
+        // NOT prove the endpoint's typed budget error always fires before
+        // the relay's own cap under adversarial framing (unbounded
+        // `Health` keepalive spam in particular, see the constant's doc
+        // comment for what actually bounds that: the relay's own byte cap
+        // and `splice_max_lifetime` intra-session; the reopen limiter and
+        // per-source caps bound repetition/concurrency, not sustained
+        // activity within one already-authorized connection).
+
+        // Exactly equal to the endpoint's own 64 MiB budget: forbidden,
+        // same as before this revision — nowhere near the policy floor.
+        assert_eq!(
+            config_from_getter(&[
+                (RELAY_STREAM_PUBLIC_RELAY_ENV, "1"),
+                (RELAY_STREAM_PUBLIC_BIND_ADDR_ENV, "192.168.15.10:49152"),
+                (
+                    RELAY_STREAM_PUBLIC_SPLICE_MAX_BYTES_PER_DIRECTION_ENV,
+                    "67108864",
+                ),
+            ])
+            .unwrap_err(),
+            RelayStreamPublicRelayConfigError::RelayCapBelowPolicyFloor {
+                relay_cap: PERSISTENT_MAX_BYTES_PER_DIRECTION,
+                policy_floor: DEFAULT_PUBLIC_SPLICE_MAX_BYTES_PER_DIRECTION,
+            }
+        );
+
+        // One byte above the endpoint's 64 MiB budget: this used to be the
+        // accepted boundary under the old "strictly greater than the
+        // endpoint budget" property. It is NOT enough margin to absorb
+        // even ordinary per-message Noise/framing overhead for a single
+        // legitimate transfer, so it must now be forbidden too.
+        assert_eq!(
+            config_from_getter(&[
+                (RELAY_STREAM_PUBLIC_RELAY_ENV, "1"),
+                (RELAY_STREAM_PUBLIC_BIND_ADDR_ENV, "192.168.15.10:49152"),
+                (
+                    RELAY_STREAM_PUBLIC_SPLICE_MAX_BYTES_PER_DIRECTION_ENV,
+                    "67108865",
+                ),
+            ])
+            .unwrap_err(),
+            RelayStreamPublicRelayConfigError::RelayCapBelowPolicyFloor {
+                relay_cap: PERSISTENT_MAX_BYTES_PER_DIRECTION + 1,
+                policy_floor: DEFAULT_PUBLIC_SPLICE_MAX_BYTES_PER_DIRECTION,
+            }
+        );
+
+        // Well below the endpoint budget (the value this test used to
+        // accept, before either invariant existed): also forbidden.
+        assert_eq!(
+            config_from_getter(&[
+                (RELAY_STREAM_PUBLIC_RELAY_ENV, "1"),
+                (RELAY_STREAM_PUBLIC_BIND_ADDR_ENV, "192.168.15.10:49152"),
+                (
+                    RELAY_STREAM_PUBLIC_SPLICE_MAX_BYTES_PER_DIRECTION_ENV,
+                    "1048576",
+                ),
+            ])
+            .unwrap_err(),
+            RelayStreamPublicRelayConfigError::RelayCapBelowPolicyFloor {
+                relay_cap: 1_048_576,
+                policy_floor: DEFAULT_PUBLIC_SPLICE_MAX_BYTES_PER_DIRECTION,
+            }
+        );
+
+        // One byte BELOW the policy floor itself: still forbidden — the
+        // floor is inclusive, not "greater than the floor".
+        assert_eq!(
+            config_from_getter(&[
+                (RELAY_STREAM_PUBLIC_RELAY_ENV, "1"),
+                (RELAY_STREAM_PUBLIC_BIND_ADDR_ENV, "192.168.15.10:49152"),
+                (
+                    RELAY_STREAM_PUBLIC_SPLICE_MAX_BYTES_PER_DIRECTION_ENV,
+                    "75497471",
+                ),
+            ])
+            .unwrap_err(),
+            RelayStreamPublicRelayConfigError::RelayCapBelowPolicyFloor {
+                relay_cap: DEFAULT_PUBLIC_SPLICE_MAX_BYTES_PER_DIRECTION - 1,
+                policy_floor: DEFAULT_PUBLIC_SPLICE_MAX_BYTES_PER_DIRECTION,
+            }
+        );
+
+        // The policy floor exactly: accepted — the floor is inclusive.
+        let config = config_from_getter(&[
+            (RELAY_STREAM_PUBLIC_RELAY_ENV, "1"),
+            (RELAY_STREAM_PUBLIC_BIND_ADDR_ENV, "192.168.15.10:49152"),
+            (
+                RELAY_STREAM_PUBLIC_SPLICE_MAX_BYTES_PER_DIRECTION_ENV,
+                "75497472",
+            ),
+        ])
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            config.listener.splice_max_bytes_per_direction,
+            Some(DEFAULT_PUBLIC_SPLICE_MAX_BYTES_PER_DIRECTION)
+        );
+
+        // The default itself must satisfy its own floor — proven at
+        // runtime by `public_relay_config_splice_byte_cap_defaults_and_forbids_zero`'s
+        // unset-env case succeeding through this same `bytes >= floor`
+        // check. `const _: () = assert!(...)` right after the constant's
+        // definition is the INDEPENDENT check for this: it fails the BUILD
+        // if the default ever regresses below the endpoint's 64 MiB
+        // budget, so a regression cannot hide behind this runtime check
+        // becoming tautological (`bytes >= DEFAULT` trivially holds for
+        // any config using a broken default, no matter how broken).
     }
 
     #[test]

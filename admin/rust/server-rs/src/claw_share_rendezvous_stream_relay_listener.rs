@@ -22,7 +22,8 @@ use crate::claw_share_relay_stream_abuse::{
 };
 use crate::claw_share_rendezvous_stream_relay::{
     MAX_RENDEZVOUS_TOKEN_LEN, RendezvousHello, RendezvousOfferOutcome, RendezvousTokenTable,
-    RendezvousTokenTableConfig, splice_opaque_streams,
+    RendezvousTokenTableConfig, SpliceByteCapDirection, SpliceByteLedger,
+    splice_opaque_streams_capped,
 };
 use crate::claw_share_rendezvous_stream_relay_status::{
     RelayStatusAbuseGateFailure, RelayStatusHelloErrorKind, RendezvousStreamRelayStatusHandle,
@@ -43,6 +44,12 @@ pub struct RendezvousStreamRelayListenerConfig {
     pub reaper_interval: Duration,
     pub splice_idle_timeout: Duration,
     pub splice_max_lifetime: Duration,
+    /// Per-direction byte budget for the blind splice. The relay counts
+    /// forwarded bytes (never parses them); byte B+1 hard-closes the splice.
+    /// `None` is the legacy unlimited behavior — the byte cap is a policy of
+    /// the PUBLIC relay, not of this listener, so the generic default stays
+    /// unlimited and legacy callers are byte-identical.
+    pub splice_max_bytes_per_direction: Option<u64>,
     pub abuse: RelayAbuseConfig,
 }
 
@@ -56,6 +63,7 @@ impl Default for RendezvousStreamRelayListenerConfig {
             reaper_interval: Duration::from_secs(10),
             splice_idle_timeout: Duration::from_secs(300),
             splice_max_lifetime: Duration::from_secs(60 * 60),
+            splice_max_bytes_per_direction: None,
             abuse: RelayAbuseConfig::default(),
         }
     }
@@ -490,6 +498,7 @@ async fn handle_rendezvous_stream(
                     claw,
                     nonzero_duration_or(config.splice_idle_timeout, Duration::from_secs(300)),
                     nonzero_duration_or(config.splice_max_lifetime, Duration::from_secs(60 * 60)),
+                    config.splice_max_bytes_per_direction,
                 )
                 .await
                 {
@@ -504,6 +513,33 @@ async fn handle_rendezvous_stream(
                             claw_to_guest,
                         );
                     }
+                    Ok(RendezvousSpliceOutcome::ByteCapExceeded {
+                        direction,
+                        guest_to_claw,
+                        claw_to_guest,
+                    }) => {
+                        status.record_splice_byte_cap_exceeded(
+                            direction,
+                            guest_to_claw,
+                            claw_to_guest,
+                        );
+                        tracing::debug!(
+                            stage = "claw_share.rendezvous_stream_relay.splice_byte_cap_exceeded",
+                            direction = ?direction,
+                            guest_to_claw,
+                            claw_to_guest,
+                        );
+                    }
+                    // KNOWN DEBT, deliberately not fixed in this slice: an I/O
+                    // failure mid-splice (peer reset, broken pipe) reports NO
+                    // bytes, because every `?` inside the pump discards its
+                    // local outcome and this arm has no ledger in scope. The
+                    // shared ledger added here would make it recoverable, but
+                    // doing so means widening `io::Result` into a typed
+                    // error-with-bytes, which is explicitly out of scope. So a
+                    // high-volume transfer killed by a reset still under-counts
+                    // by its whole length. Recorded so this reads as a decision,
+                    // not an oversight.
                     Err(error) => {
                         status.record_splice_failed();
                         tracing::debug!(
@@ -511,16 +547,26 @@ async fn handle_rendezvous_stream(
                             error = %error,
                         );
                     }
-                    Ok(RendezvousSpliceOutcome::IdleTimedOut) => {
-                        status.record_splice_idle_timeout();
+                    Ok(RendezvousSpliceOutcome::IdleTimedOut {
+                        guest_to_claw,
+                        claw_to_guest,
+                    }) => {
+                        status.record_splice_idle_timeout(guest_to_claw, claw_to_guest);
                         tracing::debug!(
-                            stage = "claw_share.rendezvous_stream_relay.splice_idle_timeout"
+                            stage = "claw_share.rendezvous_stream_relay.splice_idle_timeout",
+                            guest_to_claw,
+                            claw_to_guest,
                         );
                     }
-                    Ok(RendezvousSpliceOutcome::LifetimeElapsed) => {
-                        status.record_splice_lifetime_elapsed();
+                    Ok(RendezvousSpliceOutcome::LifetimeElapsed {
+                        guest_to_claw,
+                        claw_to_guest,
+                    }) => {
+                        status.record_splice_lifetime_elapsed(guest_to_claw, claw_to_guest);
                         tracing::debug!(
-                            stage = "claw_share.rendezvous_stream_relay.splice_lifetime_elapsed"
+                            stage = "claw_share.rendezvous_stream_relay.splice_lifetime_elapsed",
+                            guest_to_claw,
+                            claw_to_guest,
                         );
                     }
                 }
@@ -575,8 +621,23 @@ enum RendezvousSpliceOutcome {
         guest_to_claw: u64,
         claw_to_guest: u64,
     },
-    IdleTimedOut,
-    LifetimeElapsed,
+    ByteCapExceeded {
+        direction: SpliceByteCapDirection,
+        guest_to_claw: u64,
+        claw_to_guest: u64,
+    },
+    /// Bytes come from the shared observational ledger, not from the pump's
+    /// return value: on this path the pump future lost the `select!` and was
+    /// dropped, so its local outcome no longer exists to be read.
+    IdleTimedOut {
+        guest_to_claw: u64,
+        claw_to_guest: u64,
+    },
+    /// Same as `IdleTimedOut`: cancelled, so the bytes come from the ledger.
+    LifetimeElapsed {
+        guest_to_claw: u64,
+        claw_to_guest: u64,
+    },
 }
 
 async fn splice_opaque_streams_until_idle<A, B>(
@@ -584,6 +645,7 @@ async fn splice_opaque_streams_until_idle<A, B>(
     claw: B,
     idle_timeout: Duration,
     max_lifetime: Duration,
+    max_bytes_per_direction: Option<u64>,
 ) -> io::Result<RendezvousSpliceOutcome>
 where
     A: AsyncRead + AsyncWrite + Unpin,
@@ -592,19 +654,39 @@ where
     let last_activity = Arc::new(StdMutex::new(Instant::now()));
     let tracked_guest = ActivityTrackedStream::new(guest, Arc::clone(&last_activity));
     let tracked_claw = ActivityTrackedStream::new(claw, Arc::clone(&last_activity));
+    // Lives OUTSIDE the racing future on purpose: the two timer arms below win
+    // by cancelling the pump, which destroys its local counters. Observational
+    // only — the pump's own budget/hard-close never consults it.
+    let ledger = SpliceByteLedger::new();
 
     tokio::select! {
-        copied = splice_opaque_streams(tracked_guest, tracked_claw) => {
-            copied.map(|(guest_to_claw, claw_to_guest)| RendezvousSpliceOutcome::Closed {
-                guest_to_claw,
-                claw_to_guest,
+        spliced = splice_opaque_streams_capped(
+            tracked_guest,
+            tracked_claw,
+            max_bytes_per_direction,
+            &ledger,
+        ) => {
+            // The pump returned, so its local counters are authoritative and
+            // exact here; the ledger is not consulted on this path.
+            spliced.map(|outcome| match outcome.capped_direction {
+                Some(direction) => RendezvousSpliceOutcome::ByteCapExceeded {
+                    direction,
+                    guest_to_claw: outcome.guest_to_claw,
+                    claw_to_guest: outcome.claw_to_guest,
+                },
+                None => RendezvousSpliceOutcome::Closed {
+                    guest_to_claw: outcome.guest_to_claw,
+                    claw_to_guest: outcome.claw_to_guest,
+                },
             })
         }
         () = wait_for_idle(last_activity, idle_timeout) => {
-            Ok(RendezvousSpliceOutcome::IdleTimedOut)
+            let (guest_to_claw, claw_to_guest) = ledger.snapshot();
+            Ok(RendezvousSpliceOutcome::IdleTimedOut { guest_to_claw, claw_to_guest })
         }
         () = sleep(max_lifetime) => {
-            Ok(RendezvousSpliceOutcome::LifetimeElapsed)
+            let (guest_to_claw, claw_to_guest) = ledger.snapshot();
+            Ok(RendezvousSpliceOutcome::LifetimeElapsed { guest_to_claw, claw_to_guest })
         }
     }
 }
@@ -931,6 +1013,7 @@ mod tests {
             reaper_interval: Duration::from_millis(50),
             splice_idle_timeout: Duration::from_secs(2),
             splice_max_lifetime: Duration::from_secs(60),
+            splice_max_bytes_per_direction: None,
             abuse: RelayAbuseConfig::default(),
         }
     }
@@ -1057,6 +1140,8 @@ mod tests {
                 claw_id: "claw_test".to_string(),
                 expires_at: now_unix() + 86_400,
                 state: SlotState::Open,
+                app_presentation: None,
+                created_at: None,
             })
             .unwrap();
         store
@@ -1268,6 +1353,190 @@ mod tests {
         assert_eq!(guest_received, claw_plaintext);
         assert_eq!(claw_received, guest_plaintext);
 
+        server.abort();
+    }
+
+    // The listener wires the per-direction byte cap end to end: 65 bytes
+    // against a 64-byte cap delivers exactly 64, hard-closes, and attributes
+    // the cap to the offending direction in the status counters.
+    #[tokio::test]
+    async fn rendezvous_stream_listener_byte_cap_hard_closes_and_counts_direction() {
+        let config = RendezvousStreamRelayListenerConfig {
+            splice_max_bytes_per_direction: Some(64),
+            splice_idle_timeout: Duration::from_secs(5),
+            ..test_config()
+        };
+        let (addr, server, status) = spawn_test_listener_with_status(config).await;
+        let token = token(0x7b);
+
+        let mut guest = connect_with_hello(addr, RendezvousRole::Guest, token.clone()).await;
+        let mut claw = connect_with_hello(addr, RendezvousRole::Claw, token).await;
+
+        guest.write_all(&vec![0x42; 65]).await.unwrap();
+        let mut received = Vec::new();
+        timeout(Duration::from_secs(2), claw.read_to_end(&mut received))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(received.len(), 64, "byte B+1 must never be delivered");
+
+        let snapshot = wait_until_status(&status, |s| {
+            s.counters.splice_byte_cap_exceeded_guest_to_claw == 1
+        })
+        .await;
+        assert_eq!(snapshot.counters.splice_byte_cap_exceeded_guest_to_claw, 1);
+        assert_eq!(snapshot.counters.splice_byte_cap_exceeded_claw_to_guest, 0);
+        // §6.2: the forwarded bytes reach the status surface, and stop at the
+        // cap. 65 was offered, 64 forwarded — the counter must read 64, not 65.
+        assert_eq!(snapshot.counters.bytes_guest_to_claw, 64);
+        assert_eq!(snapshot.counters.bytes_claw_to_guest, 0);
+        server.abort();
+    }
+
+    // The opposite cap direction, end to end. §6.2 asks for BOTH directions and
+    // only guest->claw existed at the listener level before this slice.
+    #[tokio::test]
+    async fn rendezvous_stream_listener_byte_cap_counts_claw_to_guest_bytes() {
+        let config = RendezvousStreamRelayListenerConfig {
+            splice_max_bytes_per_direction: Some(64),
+            splice_idle_timeout: Duration::from_secs(5),
+            ..test_config()
+        };
+        let (addr, server, status) = spawn_test_listener_with_status(config).await;
+        let token = token(0x81);
+
+        let mut guest = connect_with_hello(addr, RendezvousRole::Guest, token.clone()).await;
+        let mut claw = connect_with_hello(addr, RendezvousRole::Claw, token).await;
+
+        claw.write_all(&vec![0x43; 65]).await.unwrap();
+        let mut received = Vec::new();
+        timeout(Duration::from_secs(2), guest.read_to_end(&mut received))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(received.len(), 64, "byte B+1 must never be delivered");
+
+        let snapshot = wait_until_status(&status, |s| {
+            s.counters.splice_byte_cap_exceeded_claw_to_guest == 1
+        })
+        .await;
+        assert_eq!(snapshot.counters.splice_byte_cap_exceeded_claw_to_guest, 1);
+        assert_eq!(snapshot.counters.splice_byte_cap_exceeded_guest_to_claw, 0);
+        assert_eq!(snapshot.counters.bytes_claw_to_guest, 64);
+        assert_eq!(snapshot.counters.bytes_guest_to_claw, 0);
+        server.abort();
+    }
+
+    // §6.2 normal close: real bytes in BOTH directions reach the status
+    // surface. The pre-existing end-to-end tests asserted payload equality
+    // only, never the counters.
+    #[tokio::test]
+    async fn rendezvous_stream_listener_normal_close_counts_bytes_both_directions() {
+        let (addr, server, status) = spawn_test_listener_with_status(test_config()).await;
+        let token = token(0x82);
+
+        let mut guest = connect_with_hello(addr, RendezvousRole::Guest, token.clone()).await;
+        let mut claw = connect_with_hello(addr, RendezvousRole::Claw, token).await;
+
+        guest.write_all(&vec![0xa1; 100]).await.unwrap();
+        claw.write_all(&vec![0xb2; 40]).await.unwrap();
+        let mut to_claw = vec![0_u8; 100];
+        claw.read_exact(&mut to_claw).await.unwrap();
+        let mut to_guest = vec![0_u8; 40];
+        guest.read_exact(&mut to_guest).await.unwrap();
+        guest.shutdown().await.unwrap();
+        claw.shutdown().await.unwrap();
+
+        let snapshot = wait_until_status(&status, |s| s.counters.splice_closed == 1).await;
+        assert_eq!(snapshot.counters.splice_closed, 1);
+        assert_eq!(snapshot.counters.bytes_guest_to_claw, 100);
+        assert_eq!(snapshot.counters.bytes_claw_to_guest, 40);
+        server.abort();
+    }
+
+    // §6.2's headline gap: a splice that ends by IDLE TIMEOUT used to report
+    // zero bytes, because the timer arm cancelled the pump and its local
+    // counters died with it. Non-zero here is the whole point — mutating the
+    // timeout path back to reporting 0 must turn this RED.
+    #[tokio::test]
+    async fn rendezvous_stream_listener_idle_timeout_counts_the_bytes_it_forwarded() {
+        let config = RendezvousStreamRelayListenerConfig {
+            splice_idle_timeout: Duration::from_millis(200),
+            ..test_config()
+        };
+        let (addr, server, status) = spawn_test_listener_with_status(config).await;
+        let token = token(0x83);
+
+        let mut guest = connect_with_hello(addr, RendezvousRole::Guest, token.clone()).await;
+        let mut claw = connect_with_hello(addr, RendezvousRole::Claw, token).await;
+
+        // Forward real traffic, then go quiet and let the idle timer win.
+        guest.write_all(&vec![0xc3; 77]).await.unwrap();
+        let mut to_claw = vec![0_u8; 77];
+        claw.read_exact(&mut to_claw).await.unwrap();
+
+        let snapshot = wait_until_status(&status, |s| s.counters.splice_idle_timeout == 1).await;
+        assert_eq!(snapshot.counters.splice_idle_timeout, 1);
+        assert_eq!(
+            snapshot.counters.bytes_guest_to_claw, 77,
+            "an idle-timed-out splice must still report what it forwarded"
+        );
+        server.abort();
+    }
+
+    // Same gap, the lifetime cap. In practice the worse of the two: a
+    // long-lived high-volume splice hitting the absolute lifetime used to
+    // report zero.
+    #[tokio::test]
+    async fn rendezvous_stream_listener_lifetime_elapsed_counts_the_bytes_it_forwarded() {
+        let config = RendezvousStreamRelayListenerConfig {
+            splice_idle_timeout: Duration::from_secs(30),
+            splice_max_lifetime: Duration::from_millis(300),
+            ..test_config()
+        };
+        let (addr, server, status) = spawn_test_listener_with_status(config).await;
+        let token = token(0x84);
+
+        let mut guest = connect_with_hello(addr, RendezvousRole::Guest, token.clone()).await;
+        let mut claw = connect_with_hello(addr, RendezvousRole::Claw, token).await;
+
+        guest.write_all(&vec![0xd4; 55]).await.unwrap();
+        let mut to_claw = vec![0_u8; 55];
+        claw.read_exact(&mut to_claw).await.unwrap();
+        claw.write_all(&vec![0xe5; 33]).await.unwrap();
+        let mut to_guest = vec![0_u8; 33];
+        guest.read_exact(&mut to_guest).await.unwrap();
+
+        let snapshot =
+            wait_until_status(&status, |s| s.counters.splice_lifetime_elapsed == 1).await;
+        assert_eq!(snapshot.counters.splice_lifetime_elapsed, 1);
+        assert_eq!(
+            snapshot.counters.bytes_guest_to_claw, 55,
+            "a lifetime-capped splice must still report what it forwarded"
+        );
+        assert_eq!(snapshot.counters.bytes_claw_to_guest, 33);
+        server.abort();
+    }
+
+    // Legacy default stays unlimited: with the generic test_config (no cap),
+    // a payload far above the public-relay budget splices intact.
+    #[tokio::test]
+    async fn rendezvous_stream_listener_default_config_has_no_byte_cap() {
+        let (addr, server) = spawn_test_listener(test_config()).await;
+        let token = token(0x7c);
+
+        let mut guest = connect_with_hello(addr, RendezvousRole::Guest, token.clone()).await;
+        let mut claw = connect_with_hello(addr, RendezvousRole::Claw, token).await;
+
+        let payload = vec![0x24; 128 * 1024];
+        guest.write_all(&payload).await.unwrap();
+        guest.shutdown().await.unwrap();
+        let mut received = Vec::new();
+        timeout(Duration::from_secs(5), claw.read_to_end(&mut received))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(received, payload);
         server.abort();
     }
 

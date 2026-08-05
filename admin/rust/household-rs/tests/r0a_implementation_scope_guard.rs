@@ -384,7 +384,7 @@ fn r0a_n_ratchet_names_new_targets() {
     let ratchet_path = ["owner_mesh_", "rendezvous_codec.rs"].concat();
     let r1a7 = read(package_dir().join("tests").join(ratchet_path));
     for needle in [
-        "assert_eq!(targets.len(), 207",
+        "assert_eq!(targets.len(), 208",
         "filter(|target| target.kind == \"test\")",
         "right total by two errors that cancel: the base was 152 in the tree,",
         "name == \"caveat_narrowing\"",
@@ -458,7 +458,7 @@ fn r0a_d2a_paths_are_limited_and_registered() {
 #[test]
 fn r0a_d2a_tests_stay_inline_and_off_the_cargo_target_ratchet() {
     // Each `household-rs/tests/*.rs` file is its own Cargo target, and R1a.7
-    // pins the workspace target inventory at 207 (157 of them tests) in this
+    // pins the workspace target inventory at 208 (157 of them tests) in this
     // composed inventory: the 197/148 D2a was written against, plus the one
     // B0a roster-currency integration target (which is the +1 test), plus the
     // `claw-share-bridge-rs` workspace member (which is the +1 bin), plus the
@@ -478,14 +478,14 @@ fn r0a_d2a_tests_stay_inline_and_off_the_cargo_target_ratchet() {
     ] {
         assert!(
             !package_dir().join(absent).exists(),
-            "D2a adds no Cargo test target; R1a.7 pins 207/157 and none of it \
+            "D2a adds no Cargo test target; R1a.7 pins 208/157 and none of it \
              is D2a's: {absent}"
         );
     }
 
     let ratchet_path = ["owner_mesh_", "rendezvous_codec.rs"].concat();
     let r1a7 = read(package_dir().join("tests").join(ratchet_path));
-    assert!(r1a7.contains("assert_eq!(targets.len(), 207"));
+    assert!(r1a7.contains("assert_eq!(targets.len(), 208"));
     assert!(r1a7.contains("right total by two errors that cancel: the base was 152 in the tree,"));
 
     // Coverage ratchet: counts the `#[test]` attribute itself, not any `fn`, so

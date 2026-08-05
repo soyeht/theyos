@@ -585,6 +585,7 @@ mod tests {
                 claw_static_pub: static_pub(),
                 not_after: NOW + 60,
                 now_unix: NOW,
+                app_presentation: None,
             },
             &owner(),
         )
@@ -597,6 +598,8 @@ mod tests {
             claw_id: CLAW_ID.to_string(),
             expires_at: NOW + 600,
             state,
+            app_presentation: None,
+            created_at: None,
         })
     }
 
@@ -980,6 +983,18 @@ mod tests {
         group_offer(RelayStreamResource::ClawSite)
     }
 
+    // Simulates a validly signed Group/PTY contract minted before the policy
+    // fix (or assembled without the official mint helper). The open-time gate
+    // must reject it before either backend is contacted.
+    fn legacy_group_pty_offer() -> RelayStreamOfferContract {
+        let mut payload = offer(RelayStreamResource::Pty).payload;
+        payload.authz = Some(RelayStreamAudience::Group {
+            group_id: "g".to_string(),
+            member_id: "g_a".to_string(),
+        });
+        RelayStreamOfferContract::sign(payload, &owner()).unwrap()
+    }
+
     fn group_iptunnel_offer() -> RelayStreamOfferContract {
         group_offer(RelayStreamResource::IpTunnel)
     }
@@ -1006,6 +1021,24 @@ mod tests {
         let response = open_and_roundtrip(&router).await.unwrap();
 
         assert_eq!(response, b"SITE:hello");
+    }
+
+    #[tokio::test]
+    async fn relay_stream_target_router_rejects_legacy_group_pty_before_backend() {
+        let router = RelayStreamOfferTargetRouter::new(
+            legacy_group_pty_offer(),
+            group_trust(group_projection(true, true, true)),
+            empty_slots(),
+            TcpStreamRouter::new("127.0.0.1:1"),
+            TcpStreamRouter::new("127.0.0.1:1"),
+            || Some(NOW),
+        );
+
+        let error = open_error(&router).await;
+
+        assert!(
+            matches!(error, DataTunnelError::TargetUnavailable(reason) if reason == "relay-stream-offer-invalid")
+        );
     }
 
     #[tokio::test]
@@ -1156,6 +1189,8 @@ mod tests {
                 guest_device_pub: guest().public(),
                 consumed_at: NOW - 30,
             },
+            app_presentation: None,
+            created_at: None,
         });
         let router = router_for(RelayStreamResource::Pty, slots).await;
 
@@ -1181,7 +1216,10 @@ mod tests {
     async fn relay_stream_target_router_rejects_revoked_slot() {
         let router = router_for(
             RelayStreamResource::Pty,
-            slots_with(SlotState::Revoked { revoked_at: NOW }),
+            slots_with(SlotState::Revoked {
+                revoked_at: NOW,
+                accepted_at: None,
+            }),
         )
         .await;
 
@@ -1220,6 +1258,8 @@ mod tests {
                 guest_device_pub: guest().public(),
                 consumed_at: NOW - 30,
             },
+            app_presentation: None,
+            created_at: None,
         });
         let router = router_for(RelayStreamResource::Pty, slots).await;
 

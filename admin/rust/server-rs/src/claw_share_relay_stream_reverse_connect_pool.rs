@@ -350,6 +350,7 @@ mod tests {
     use crate::claw_share_relay_stream_noise::{
         RelayStreamNoiseFramed, generate_relay_stream_noise_static_keypair,
     };
+    use crate::claw_share_relay_stream_reopen_limiter::{ReopenLimiterConfig, ReopenStreamLimiter};
     use crate::claw_share_relay_stream_responder_params::RelayStreamResponderParams;
     use crate::claw_share_relay_stream_responder_reverse_connect::{
         RelayStreamResponderReverseConnectConfig,
@@ -408,6 +409,8 @@ mod tests {
                 claw_id: DATA_TUNNEL_CLAW_ID.to_string(),
                 expires_at: now_unix() + 86_400,
                 state: SlotState::Open,
+                app_presentation: None,
+                created_at: None,
             })
             .unwrap();
         store
@@ -470,6 +473,7 @@ mod tests {
             reaper_interval: Duration::from_millis(50),
             splice_idle_timeout: Duration::from_secs(5),
             splice_max_lifetime: Duration::from_secs(60),
+            splice_max_bytes_per_direction: None,
             abuse: crate::claw_share_relay_stream_abuse::RelayAbuseConfig::default(),
         };
         let handle = serve_rendezvous_stream_relay(listener, config);
@@ -549,6 +553,7 @@ mod tests {
                 Arc::new(ReplayGuard::new()),
                 TcpStreamRouter::new(pty_addr.clone()),
                 TcpStreamRouter::new(site_addr.clone()),
+                Arc::new(ReopenStreamLimiter::new(ReopenLimiterConfig::default())),
                 || Some(now_unix()),
             ))
         })
@@ -582,6 +587,7 @@ mod tests {
                 Arc::new(ReplayGuard::new()),
                 TcpStreamRouter::new(pty_addr),
                 TcpStreamRouter::new(site_addr),
+                Arc::new(ReopenStreamLimiter::new(ReopenLimiterConfig::default())),
                 || Some(now_unix()),
             );
             let claw = tokio::spawn(async move {
@@ -1048,6 +1054,7 @@ mod tests {
                             .unwrap(),
                         not_after,
                         now_unix: now_unix(),
+                        app_presentation: None,
                     },
                     &owner_signer(),
                     &trust,

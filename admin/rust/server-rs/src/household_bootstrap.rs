@@ -595,6 +595,7 @@ fn build_claw_share_router(
     state_dir: PathBuf,
     runtime: &ClawShareRuntimeHandles,
     engine_relay_npub: Option<String>,
+    shared_state: Option<SharedState>,
 ) -> axum::Router {
     handlers_claw_share::router(handlers_claw_share::ClawShareRouterState {
         household,
@@ -604,6 +605,7 @@ fn build_claw_share_router(
         state_dir,
         relay_offer_challenges: Arc::clone(&runtime.relay_offer_challenges),
         relay_offer_abuse: Arc::clone(&runtime.relay_offer_abuse),
+        shared_state,
     })
 }
 
@@ -644,6 +646,7 @@ async fn mount_claw_share_relay_stream_live_if_enabled(
     state_dir: PathBuf,
     household: HouseholdState,
     runtime: &ClawShareRuntimeHandles,
+    shared_state: Option<SharedState>,
 ) {
     if let Err(e) = crate::claw_share_relay_stream_mount::mount_relay_stream_live_if_enabled(
         state_dir,
@@ -651,6 +654,7 @@ async fn mount_claw_share_relay_stream_live_if_enabled(
         Arc::clone(&runtime.mesh_log),
         Arc::clone(&runtime.slot_store),
         Arc::clone(&runtime.replayguard),
+        shared_state,
     )
     .await
     {
@@ -901,6 +905,41 @@ pub async fn bootstrap_household(
     }
     let identity_state = HouseholdState::empty();
     identity_load.publish_into(&identity_state).await;
+
+    // Give the seeded `mac-host` row the household scope it was born without.
+    //
+    // `seed_mac_host_instance` runs in `main` well before this point — the
+    // household is not loaded yet there, so the row is inserted with a null
+    // `household_id`. `list_for_household` filters on that column, so the row
+    // stays invisible to the owner's Share picker and sharing an app reports
+    // "No apps to share yet" on a machine that plainly has a running mac-host.
+    //
+    // This is the first moment the household id is actually known, so it is
+    // where the scope can honestly be applied. The alternative — teaching
+    // `list_for_household` to accept unscoped rows — was rejected: an unscoped
+    // row belongs to no household, and the list should keep saying so. Stamping
+    // fixes the row; widening the query would move a boundary.
+    //
+    // `stamp_mac_host_household` only touches a row that is still fully
+    // unscoped, and reports whether it did, so a partially scoped row (which is
+    // ambiguous about its owner) is left alone rather than guessed at.
+    if let (Some(arc), Some(state)) = (loaded_arc.as_ref(), shared_state.as_ref()) {
+        let hh_id = arc.record.hh_id.to_string();
+        let m_id = arc.cert.m_id.to_string();
+        match state.instance_db.stamp_mac_host_household(&hh_id, &m_id) {
+            Ok(true) => info!(
+                stage = "bootstrap.mac_host.scoped",
+                hh_id = %hh_id,
+                "seeded mac-host instance adopted into the household"
+            ),
+            Ok(false) => {}
+            Err(e) => tracing::warn!(
+                stage = "bootstrap.mac_host.scope_failed",
+                error = %e,
+                "could not scope the seeded mac-host instance to the household"
+            ),
+        }
+    }
 
     // ── Bootstrap state machine (T007 / T011) ─────────────────────────────
     //
@@ -1548,7 +1587,7 @@ pub async fn bootstrap_household(
     // Only mounted when caller supplies `SharedState` (main daemon path).
     // Short-lived bring-up paths (e.g. `theyos install` post-commit
     // listener) pass `None` and omit these routes.
-    let claws_router = shared_state.map(|state| {
+    let claws_router = shared_state.clone().map(|state| {
         let claws_state = handlers_household_claws::HouseholdClawsState {
             shared: state,
             household: identity_state.clone(),
@@ -1667,11 +1706,13 @@ pub async fn bootstrap_household(
             .engine_relay_identity
             .as_ref()
             .map(|identity| identity.npub_hex.clone()),
+        shared_state.clone(),
     );
     mount_claw_share_relay_stream_live_if_enabled(
         state_dir.clone(),
         identity_state.clone(),
         &claw_share_runtime,
+        shared_state.clone(),
     )
     .await;
     spawn_claw_share_relay_loop_if_configured(
@@ -1812,6 +1853,7 @@ pub async fn bootstrap_household(
             port,
             bonjour_browser_state,
             claw_share: Some(claw_share_runtime),
+            shared_state: shared_state.clone(),
         };
         spawn_household_identity_watcher(state_dir, identity_state, key_policy, deps);
     }
@@ -1924,6 +1966,11 @@ struct HouseholdIdentityWatcherDeps {
     port: u16,
     bonjour_browser_state: Option<handlers_pair_machine::PairMachineRouterState>,
     claw_share: Option<ClawShareRuntimeHandles>,
+    /// Carried solely so the two post-pairing REMOUNTS below can hand it to the
+    /// relay-stream mount. The watcher closure cannot reach `bootstrap_household`'s
+    /// `shared_state` any other way, and without it those remounts would silently
+    /// mount with `None` while the first mount had it.
+    shared_state: Option<SharedState>,
 }
 
 fn spawn_household_identity_watcher(
@@ -1955,6 +2002,7 @@ fn spawn_household_identity_watcher_with_interval(
         port,
         bonjour_browser_state,
         claw_share,
+        shared_state,
     } = deps;
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(poll_interval);
@@ -1986,6 +2034,7 @@ fn spawn_household_identity_watcher_with_interval(
                         state_dir.clone(),
                         identity_state.clone(),
                         runtime,
+                        shared_state.clone(),
                     )
                     .await;
                 }
@@ -2020,6 +2069,7 @@ fn spawn_household_identity_watcher_with_interval(
                             state_dir.clone(),
                             identity_state.clone(),
                             runtime,
+                            shared_state.clone(),
                         )
                         .await;
                     }
@@ -2562,6 +2612,7 @@ mod tests {
                 slot_id: open_slot.clone(),
                 claw_id: "claw-open".to_string(),
                 expires_at: now + 600,
+                app_presentation: None,
             },
         );
         append_log_event(
@@ -2572,6 +2623,7 @@ mod tests {
                 slot_id: consumed_slot.clone(),
                 claw_id: "claw-consumed".to_string(),
                 expires_at: now + 600,
+                app_presentation: None,
             },
         );
         append_log_event(
@@ -2594,6 +2646,7 @@ mod tests {
                 slot_id: revoked_slot.clone(),
                 claw_id: "claw-revoked".to_string(),
                 expires_at: now + 600,
+                app_presentation: None,
             },
         );
         append_log_event(
@@ -2778,6 +2831,7 @@ mod tests {
                 port: 8091,
                 bonjour_browser_state: None,
                 claw_share: None,
+                shared_state: None,
             },
         );
 

@@ -43,6 +43,8 @@ impl RendezvousStreamRelayStatusHandle {
                 splice_idle_timeout: AtomicU64::new(0),
                 splice_lifetime_elapsed: AtomicU64::new(0),
                 splice_failed: AtomicU64::new(0),
+                splice_byte_cap_exceeded_guest_to_claw: AtomicU64::new(0),
+                splice_byte_cap_exceeded_claw_to_guest: AtomicU64::new(0),
                 pending_expired: AtomicU64::new(0),
                 source_buckets_pruned: AtomicU64::new(0),
                 bytes_guest_to_claw: AtomicU64::new(0),
@@ -72,6 +74,14 @@ impl RendezvousStreamRelayStatusHandle {
                 splice_idle_timeout: self.inner.splice_idle_timeout.load(Ordering::Relaxed),
                 splice_lifetime_elapsed: self.inner.splice_lifetime_elapsed.load(Ordering::Relaxed),
                 splice_failed: self.inner.splice_failed.load(Ordering::Relaxed),
+                splice_byte_cap_exceeded_guest_to_claw: self
+                    .inner
+                    .splice_byte_cap_exceeded_guest_to_claw
+                    .load(Ordering::Relaxed),
+                splice_byte_cap_exceeded_claw_to_guest: self
+                    .inner
+                    .splice_byte_cap_exceeded_claw_to_guest
+                    .load(Ordering::Relaxed),
                 pending_expired: self.inner.pending_expired.load(Ordering::Relaxed),
                 source_buckets_pruned: self.inner.source_buckets_pruned.load(Ordering::Relaxed),
                 bytes_guest_to_claw: self.inner.bytes_guest_to_claw.load(Ordering::Relaxed),
@@ -141,20 +151,63 @@ impl RendezvousStreamRelayStatusHandle {
             .fetch_add(claw_to_guest, Ordering::Relaxed);
     }
 
-    pub(crate) fn record_splice_idle_timeout(&self) {
+    /// Bytes are the observational ledger's snapshot: this splice ended by
+    /// cancellation, so they are what was forwarded before the timer fired.
+    /// They land in the SAME cumulative byte counters as a normal close — a
+    /// forwarded byte is a forwarded byte regardless of how the splice ended.
+    pub(crate) fn record_splice_idle_timeout(&self, guest_to_claw: u64, claw_to_guest: u64) {
         self.inner
             .splice_idle_timeout
             .fetch_add(1, Ordering::Relaxed);
+        self.inner
+            .bytes_guest_to_claw
+            .fetch_add(guest_to_claw, Ordering::Relaxed);
+        self.inner
+            .bytes_claw_to_guest
+            .fetch_add(claw_to_guest, Ordering::Relaxed);
     }
 
-    pub(crate) fn record_splice_lifetime_elapsed(&self) {
+    /// See [`Self::record_splice_idle_timeout`] — same cancellation shape.
+    pub(crate) fn record_splice_lifetime_elapsed(&self, guest_to_claw: u64, claw_to_guest: u64) {
         self.inner
             .splice_lifetime_elapsed
             .fetch_add(1, Ordering::Relaxed);
+        self.inner
+            .bytes_guest_to_claw
+            .fetch_add(guest_to_claw, Ordering::Relaxed);
+        self.inner
+            .bytes_claw_to_guest
+            .fetch_add(claw_to_guest, Ordering::Relaxed);
     }
 
     pub(crate) fn record_splice_failed(&self) {
         self.inner.splice_failed.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_splice_byte_cap_exceeded(
+        &self,
+        direction: crate::claw_share_rendezvous_stream_relay::SpliceByteCapDirection,
+        guest_to_claw: u64,
+        claw_to_guest: u64,
+    ) {
+        match direction {
+            crate::claw_share_rendezvous_stream_relay::SpliceByteCapDirection::GuestToClaw => {
+                self.inner
+                    .splice_byte_cap_exceeded_guest_to_claw
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            crate::claw_share_rendezvous_stream_relay::SpliceByteCapDirection::ClawToGuest => {
+                self.inner
+                    .splice_byte_cap_exceeded_claw_to_guest
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        self.inner
+            .bytes_guest_to_claw
+            .fetch_add(guest_to_claw, Ordering::Relaxed);
+        self.inner
+            .bytes_claw_to_guest
+            .fetch_add(claw_to_guest, Ordering::Relaxed);
     }
 
     pub(crate) fn record_global_active_limit_drop(&self) {
@@ -262,6 +315,12 @@ impl RendezvousStreamRelayStatusHandle {
                     .offer_capacity_exceeded
                     .fetch_add(1, Ordering::Relaxed);
             }
+            RendezvousRejectReason::ConsumedCapacityExceeded => {
+                self.inner
+                    .drops
+                    .offer_consumed_capacity_exceeded
+                    .fetch_add(1, Ordering::Relaxed);
+            }
         }
     }
 }
@@ -295,6 +354,8 @@ struct RendezvousStreamRelayStatusInner {
     splice_idle_timeout: AtomicU64,
     splice_lifetime_elapsed: AtomicU64,
     splice_failed: AtomicU64,
+    splice_byte_cap_exceeded_guest_to_claw: AtomicU64,
+    splice_byte_cap_exceeded_claw_to_guest: AtomicU64,
     pending_expired: AtomicU64,
     source_buckets_pruned: AtomicU64,
     bytes_guest_to_claw: AtomicU64,
@@ -302,15 +363,37 @@ struct RendezvousStreamRelayStatusInner {
     drops: RendezvousStreamRelayDropAtomicCounters,
 }
 
+/// Two measurement classes live in here, and confusing them produces wrong
+/// alerts. The distinction is documented rather than encoded in the field
+/// names because these names ARE the `/status` wire format (no
+/// `#[serde(rename)]` anywhere), so renaming them would be a breaking change
+/// for any operator scraping it.
+///
+/// - **LIVE GAUGES** — instantaneous, can go DOWN: [`Self::active_connections`],
+///   [`Self::pending_tokens`], [`Self::source_buckets`]. Alert on their level.
+/// - **CUMULATIVE COUNTERS** — monotonic for the life of the process, never
+///   reset or decremented: everything nested under [`Self::counters`] and
+///   [`Self::drops`]. Alert on their RATE; a raw level is just uptime.
+/// - [`Self::uptime_secs`] is monotonic too, but derived from the clock rather
+///   than counted, so it belongs to neither class.
+///
+/// The nesting is the only structural hint (gauges at top level, cumulative
+/// under `counters`/`drops`) and it is NOT airtight — `uptime_secs` sits at
+/// top level and is monotonic. Trust this doc, not the shape.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct RendezvousStreamRelayStatusSnapshot {
     pub enabled: bool,
     pub bind_addr: String,
     pub public_mode: bool,
     pub external_reachability: &'static str,
+    /// Monotonic, but clock-derived — neither a gauge nor a counted total.
     pub uptime_secs: u64,
+    /// LIVE GAUGE: connections open right now. Incremented on accept and
+    /// decremented on drop (RAII permit), so it falls back to 0 when idle.
     pub active_connections: usize,
+    /// LIVE GAUGE: tokens currently awaiting their pair.
     pub pending_tokens: usize,
+    /// LIVE GAUGE: per-source buckets currently held.
     pub source_buckets: usize,
     pub limits: RendezvousStreamRelayLimitSnapshot,
     pub counters: RendezvousStreamRelayAggregateCounters,
@@ -325,6 +408,7 @@ pub struct RendezvousStreamRelayLimitSnapshot {
     pub hello_timeout_secs: u64,
     pub splice_idle_timeout_secs: u64,
     pub splice_max_lifetime_secs: u64,
+    pub splice_max_bytes_per_direction: Option<u64>,
     pub max_unpaired_active_per_source: usize,
     pub max_pending_per_source: usize,
     pub max_hello_attempts_per_source_per_window: u32,
@@ -345,6 +429,7 @@ impl RendezvousStreamRelayLimitSnapshot {
             hello_timeout_secs: config.hello_timeout.as_secs(),
             splice_idle_timeout_secs: config.splice_idle_timeout.as_secs(),
             splice_max_lifetime_secs: config.splice_max_lifetime.as_secs(),
+            splice_max_bytes_per_direction: config.splice_max_bytes_per_direction,
             max_unpaired_active_per_source: config.abuse.max_unpaired_active_per_source,
             max_pending_per_source: config.abuse.max_pending_per_source,
             max_hello_attempts_per_source_per_window: config
@@ -362,15 +447,32 @@ impl RendezvousStreamRelayLimitSnapshot {
     }
 }
 
+/// **Every field here is CUMULATIVE** — monotonic for the process lifetime,
+/// never decremented and never reset. Alert on rate, not level.
+///
+/// In particular `paired_sessions` is a lifetime total, NOT a count of
+/// currently-paired sessions; there is no live gauge for that. The
+/// live-connection gauge is `RendezvousStreamRelayStatusSnapshot
+/// ::active_connections`, one level up — note how close
+/// `accepted_connections` (cumulative, here) and `active_connections`
+/// (gauge, there) read, which is exactly why this is written down.
+///
+/// The two byte totals accumulate across ALL splice endings that can report
+/// bytes — normal close, byte-cap, idle timeout and lifetime expiry alike.
+/// They under-count only the I/O-error path, a documented debt (see the `Err`
+/// arm in `claw_share_rendezvous_stream_relay_listener.rs`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct RendezvousStreamRelayAggregateCounters {
     pub accepted_connections: u64,
     pub parked_hellos: u64,
+    /// Cumulative lifetime total of pairings — never a live gauge.
     pub paired_sessions: u64,
     pub splice_closed: u64,
     pub splice_idle_timeout: u64,
     pub splice_lifetime_elapsed: u64,
     pub splice_failed: u64,
+    pub splice_byte_cap_exceeded_guest_to_claw: u64,
+    pub splice_byte_cap_exceeded_claw_to_guest: u64,
     pub pending_expired: u64,
     pub source_buckets_pruned: u64,
     pub bytes_guest_to_claw: u64,
@@ -392,6 +494,7 @@ struct RendezvousStreamRelayDropAtomicCounters {
     offer_duplicate_role: AtomicU64,
     offer_expired: AtomicU64,
     offer_capacity_exceeded: AtomicU64,
+    offer_consumed_capacity_exceeded: AtomicU64,
     abuse_state_unavailable: AtomicU64,
     unexpected_abuse_permit: AtomicU64,
 }
@@ -412,6 +515,9 @@ impl RendezvousStreamRelayDropAtomicCounters {
             offer_duplicate_role: self.offer_duplicate_role.load(Ordering::Relaxed),
             offer_expired: self.offer_expired.load(Ordering::Relaxed),
             offer_capacity_exceeded: self.offer_capacity_exceeded.load(Ordering::Relaxed),
+            offer_consumed_capacity_exceeded: self
+                .offer_consumed_capacity_exceeded
+                .load(Ordering::Relaxed),
             abuse_state_unavailable: self.abuse_state_unavailable.load(Ordering::Relaxed),
             unexpected_abuse_permit: self.unexpected_abuse_permit.load(Ordering::Relaxed),
         }
@@ -433,6 +539,7 @@ pub struct RendezvousStreamRelayDropCounters {
     pub offer_duplicate_role: u64,
     pub offer_expired: u64,
     pub offer_capacity_exceeded: u64,
+    pub offer_consumed_capacity_exceeded: u64,
     pub abuse_state_unavailable: u64,
     pub unexpected_abuse_permit: u64,
 }

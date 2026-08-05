@@ -322,6 +322,62 @@ pub struct InstanceDb {
     conn: std::sync::Mutex<Connection>,
 }
 
+/// A row from `shareable_apps` — the Share's own identity authority (D6).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ShareableAppRow {
+    pub app_id: String,
+    pub instance_id: String,
+    pub household_id: String,
+    pub display_name: String,
+    pub resource: String,
+    pub retired_at: Option<i64>,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+/// The only resource this cycle mints Share bindings for.
+pub const SHAREABLE_APP_RESOURCE_CLAWSITE: &str = "clawsite";
+
+const SHAREABLE_APP_DISPLAY_NAME_MAX_CHARS: usize = 128;
+
+fn validate_shareable_display_name(display_name: &str) -> Result<(), StoreError> {
+    let len = display_name.chars().count();
+    if len == 0 || len > SHAREABLE_APP_DISPLAY_NAME_MAX_CHARS || display_name.trim().is_empty() {
+        return Err(StoreError::Internal(
+            "shareable_app display_name must be nonempty and length-bounded".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+/// `app_` + 32 lowercase hex = 128 bits CSPRNG (pinned format). Never derived
+/// from any name, so delete+recreate always yields a different id.
+fn generate_shareable_app_id() -> String {
+    use rand::Rng;
+    let mut rng = rand::thread_rng();
+    let bytes: [u8; 16] = rng.r#gen();
+    let mut id = String::with_capacity(4 + 32);
+    id.push_str("app_");
+    for byte in bytes {
+        use std::fmt::Write as _;
+        let _ = write!(id, "{byte:02x}");
+    }
+    id
+}
+
+fn shareable_app_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ShareableAppRow> {
+    Ok(ShareableAppRow {
+        app_id: row.get(0)?,
+        instance_id: row.get(1)?,
+        household_id: row.get(2)?,
+        display_name: row.get(3)?,
+        resource: row.get(4)?,
+        retired_at: row.get(5)?,
+        created_at: row.get(6)?,
+        updated_at: row.get(7)?,
+    })
+}
+
 /// A row from the `audit_events` table.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct AuditEvent {
@@ -576,6 +632,8 @@ impl InstanceDb {
         Self::migrate_cloudflare_config(conn)?;
         // Migration: add provisioning_failure_code column (idempotent)
         Self::migrate_provisioning_failure_code(conn)?;
+        // Migration: add the shareable_apps Share identity authority (D6)
+        Self::migrate_shareable_apps(conn)?;
         Ok(())
     }
 
@@ -1089,6 +1147,231 @@ impl InstanceDb {
         Ok(())
     }
 
+    /// Give the seeded `mac-host` row the household scope it was born without.
+    ///
+    /// `seed_mac_host_instance` runs at engine start (main.rs, before the
+    /// household is loaded at `bootstrap_household`), so it cannot know the
+    /// household id and inserts the row unscoped. `list_for_household` filters
+    /// on `household_id`, so the row is invisible to the owner's Share picker —
+    /// which is why sharing an app shows "No apps to share yet" on a machine
+    /// that plainly has a running mac-host.
+    ///
+    /// Stamping rather than widening the query is deliberate: an unscoped row
+    /// belongs to no household, and `list_for_household` should keep saying so.
+    /// The row is given an owner here, once, when one is actually known.
+    ///
+    /// Only stamps a row that is still fully unscoped — both columns null. A
+    /// row already carrying a household, or one carrying a machine id without a
+    /// household, is left alone and reported as not stamped: a partially scoped
+    /// row is ambiguous, and guessing at its owner is exactly the mistake this
+    /// is meant to prevent.
+    ///
+    /// Returns whether a row was stamped.
+    pub fn stamp_mac_host_household(
+        &self,
+        household_id: &str,
+        household_machine_id: &str,
+    ) -> Result<bool, StoreError> {
+        let conn = self.conn()?;
+        let changed = conn
+            .execute(
+                "UPDATE instances SET household_id = ?1, household_machine_id = ?2, \
+                 updated_at = CURRENT_TIMESTAMP \
+                 WHERE container = 'mac-host' \
+                   AND household_id IS NULL AND household_machine_id IS NULL \
+                   AND deleted_at IS NULL",
+                params![household_id, household_machine_id],
+            )
+            .map_err(|e| StoreError::Internal(format!("stamp_mac_host_household: {e}")))?;
+        Ok(changed > 0)
+    }
+
+    // ── Shareable app identity authority (D6) ─────────────────────────────
+
+    /// Pinned D6 schema: the Share's own identity authority. `app_id` is
+    /// CSPRNG-random, immutable, and NEVER derived from any name; the partial
+    /// unique index keeps at most one LIVE binding per instance while letting
+    /// a tombstone coexist with a fresh binding. `host_port` deliberately
+    /// stays out: it is runtime readiness, read live from `instances`.
+    fn migrate_shareable_apps(conn: &Connection) -> Result<(), StoreError> {
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS shareable_apps (
+                app_id       TEXT PRIMARY KEY,
+                instance_id  TEXT NOT NULL,
+                household_id TEXT NOT NULL,
+                display_name TEXT NOT NULL,
+                resource     TEXT NOT NULL,
+                retired_at   INTEGER,
+                created_at   INTEGER NOT NULL,
+                updated_at   INTEGER NOT NULL
+            );
+            CREATE UNIQUE INDEX IF NOT EXISTS ux_shareable_apps_live_instance
+                ON shareable_apps(instance_id) WHERE retired_at IS NULL;
+            CREATE INDEX IF NOT EXISTS ix_shareable_apps_household
+                ON shareable_apps(household_id);",
+        )
+        .map_err(|e| StoreError::Internal(format!("migrate shareable_apps: {e}")))?;
+        Ok(())
+    }
+
+    /// Lazily bind a household-scoped instance to a stable Share identity.
+    ///
+    /// The instance's OWN row is the authority, proven inside this same
+    /// transaction BEFORE any binding decision: the row must be live
+    /// (`deleted_at IS NULL`) and stamped with exactly this `household_id`.
+    /// Unknown, deleted, unscoped, or foreign instances are one uniform
+    /// fail-closed `InstanceNotFound` — they never create a binding and they
+    /// never tombstone someone else's. After that proof, a LIVE binding in
+    /// the same household is returned read-through (`display_name` is never
+    /// re-synced from `instances.name`); a live binding from a DIFFERENT
+    /// household is stale (the instance was re-scoped, e.g. after a re-pair)
+    /// and is tombstoned here before a fresh `app_id` is minted. A tombstoned
+    /// binding is never revived. The initial `display_name` derives from the
+    /// instance row's name ONCE; the resource is pinned to `clawsite`.
+    pub fn ensure_shareable_app(
+        &self,
+        instance_id: &str,
+        household_id: &str,
+    ) -> Result<ShareableAppRow, StoreError> {
+        let mut conn = self.conn()?;
+        let tx = conn
+            .transaction()
+            .map_err(|e| StoreError::Internal(format!("ensure_shareable_app begin: {e}")))?;
+        // 1. Prove instance authority FIRST, in the same tx: live row scoped
+        //    to exactly this household. Anything else is uniform fail-closed.
+        let instance = tx
+            .query_row(
+                &format!(
+                    "SELECT {INSTANCE_COLS} FROM instances \
+                     WHERE id = ?1 AND deleted_at IS NULL"
+                ),
+                params![instance_id],
+                row_to_instance,
+            )
+            .optional()
+            .map_err(|e| StoreError::Internal(format!("ensure_shareable_app instance: {e}")))?;
+        let instance = match instance {
+            Some(row) if row.household_id.as_deref() == Some(household_id) => row,
+            _ => return Err(StoreError::InstanceNotFound),
+        };
+        // 2. Only now may a binding decision happen.
+        let live = tx
+            .query_row(
+                "SELECT app_id, instance_id, household_id, display_name, resource, \
+                        retired_at, created_at, updated_at \
+                 FROM shareable_apps WHERE instance_id = ?1 AND retired_at IS NULL",
+                params![instance_id],
+                shareable_app_from_row,
+            )
+            .optional()
+            .map_err(|e| StoreError::Internal(format!("ensure_shareable_app lookup: {e}")))?;
+        if let Some(binding) = live {
+            if binding.household_id == household_id {
+                tx.commit()
+                    .map_err(|e| StoreError::Internal(format!("ensure_shareable_app commit: {e}")))?;
+                return Ok(binding);
+            }
+            // Household-stale binding: tombstone before minting the fresh one.
+            tx.execute(
+                "UPDATE shareable_apps SET retired_at = unixepoch(), updated_at = unixepoch() \
+                 WHERE app_id = ?1 AND retired_at IS NULL",
+                params![binding.app_id],
+            )
+            .map_err(|e| StoreError::Internal(format!("ensure_shareable_app stale tombstone: {e}")))?;
+        }
+        let app_id = generate_shareable_app_id();
+        tx.execute(
+            "INSERT INTO shareable_apps \
+             (app_id, instance_id, household_id, display_name, resource, retired_at, created_at, updated_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, NULL, unixepoch(), unixepoch())",
+            params![
+                app_id,
+                instance_id,
+                household_id,
+                instance.name,
+                SHAREABLE_APP_RESOURCE_CLAWSITE
+            ],
+        )
+        .map_err(|e| StoreError::Internal(format!("ensure_shareable_app insert: {e}")))?;
+        let row = tx
+            .query_row(
+                "SELECT app_id, instance_id, household_id, display_name, resource, \
+                        retired_at, created_at, updated_at \
+                 FROM shareable_apps WHERE app_id = ?1",
+                params![app_id],
+                shareable_app_from_row,
+            )
+            .map_err(|e| StoreError::Internal(format!("ensure_shareable_app reread: {e}")))?;
+        tx.commit()
+            .map_err(|e| StoreError::Internal(format!("ensure_shareable_app commit: {e}")))?;
+        Ok(row)
+    }
+
+    /// Strict resolution for the dial/mint path, one JOIN as pinned: `Some`
+    /// only when the binding is LIVE, its household matches BOTH the caller
+    /// and the instance's current scope, and the instance is not deleted.
+    /// Unknown, retired, foreign, stale-scoped, or deleted are one
+    /// indistinguishable fail-closed `None` — terminal. Readiness
+    /// (`host_port`, status) is NOT filtered: it rides the instance row for
+    /// the caller to classify as recoverable-unavailable, never terminal.
+    pub fn resolve_live_shareable_app(
+        &self,
+        app_id: &str,
+        household_id: &str,
+    ) -> Result<Option<(ShareableAppRow, InstanceRow)>, StoreError> {
+        let conn = self.conn()?;
+        let instance_cols = INSTANCE_COLS
+            .split(',')
+            .map(|col| format!("i.{}", col.trim()))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let row = conn
+            .query_row(
+                &format!(
+                    "SELECT s.app_id, s.instance_id, s.household_id, s.display_name, s.resource, \
+                            s.retired_at, s.created_at, s.updated_at, {instance_cols} \
+                     FROM shareable_apps s \
+                     JOIN instances i ON i.id = s.instance_id \
+                     WHERE s.app_id = ?1 AND s.household_id = ?2 AND s.retired_at IS NULL \
+                       AND i.deleted_at IS NULL AND i.household_id = ?2"
+                ),
+                params![app_id, household_id],
+                |row| {
+                    Ok((
+                        shareable_app_from_row(row)?,
+                        row_to_instance_offset(row, 8)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(|e| StoreError::Internal(format!("resolve_shareable_app: {e}")))?;
+        Ok(row)
+    }
+
+    /// The ONLY way to change a binding's display name. Scoped by household
+    /// and restricted to live bindings; unknown, retired, or foreign is an
+    /// indistinguishable fail-closed `InstanceNotFound`.
+    pub fn rename_shareable_app(
+        &self,
+        app_id: &str,
+        household_id: &str,
+        new_display_name: &str,
+    ) -> Result<(), StoreError> {
+        validate_shareable_display_name(new_display_name)?;
+        let conn = self.conn()?;
+        let rows = conn
+            .execute(
+                "UPDATE shareable_apps SET display_name = ?3, updated_at = unixepoch() \
+                 WHERE app_id = ?1 AND household_id = ?2 AND retired_at IS NULL",
+                params![app_id, household_id, new_display_name],
+            )
+            .map_err(|e| StoreError::Internal(format!("rename_shareable_app: {e}")))?;
+        if rows == 0 {
+            return Err(StoreError::InstanceNotFound);
+        }
+        Ok(())
+    }
+
     /// Look up a user by username.
     ///
     /// # Errors
@@ -1398,8 +1681,15 @@ impl InstanceDb {
         .collect()
     }
 
-    /// Get a non-deleted instance when it is either scoped to the supplied
-    /// household or still fully legacy/unscoped.
+    /// Get a non-deleted instance when it is scoped to the supplied household.
+    ///
+    /// Strict rule (security verdict, 2026-08): a row without `household_id`
+    /// belongs to NO household — unscoped rows are hidden here exactly as
+    /// [`Self::list_for_household`] hides them, so status and listing answer
+    /// the same question the same way by construction. Legacy unscoped rows
+    /// regain visibility only by being stamped via
+    /// [`Self::stamp_mac_host_household`] once the household is
+    /// loaded and the assignment is unambiguous.
     ///
     /// Partially-scoped rows and rows scoped to another household are hidden.
     ///
@@ -1419,7 +1709,6 @@ impl InstanceDb {
         }
         match &row.household_id {
             Some(row_household) if row_household == household_id => Ok(Some(row)),
-            None if row.household_machine_id.is_none() => Ok(Some(row)),
             _ => Ok(None),
         }
     }
@@ -1612,6 +1901,16 @@ impl InstanceDb {
         let tx = conn
             .transaction()
             .map_err(|e| StoreError::Internal(format!("delete begin: {e}")))?;
+        // Tombstone any live Share bindings atomically BEFORE the row removal
+        // (D6): there is no bare-delete path, so a hard delete can never leave
+        // a resolvable binding pointing at a gone — or future same-id —
+        // instance.
+        tx.execute(
+            "UPDATE shareable_apps SET retired_at = unixepoch(), updated_at = unixepoch() \
+             WHERE instance_id = ?1 AND retired_at IS NULL",
+            params![id],
+        )
+        .map_err(|e| StoreError::Internal(format!("delete binding tombstone: {e}")))?;
         tx.execute("DELETE FROM invites WHERE instance_id = ?1", params![id])
             .map_err(|e| StoreError::Internal(format!("delete invites: {e}")))?;
         tx.execute("DELETE FROM instances WHERE id = ?1", params![id])
@@ -2735,8 +3034,11 @@ impl InstanceDb {
     ///
     /// Returns `StoreError` if the update fails.
     pub fn soft_delete(&self, id: &str) -> Result<(), StoreError> {
-        let conn = self.conn()?;
-        let rows = conn
+        let mut conn = self.conn()?;
+        let tx = conn
+            .transaction()
+            .map_err(|e| StoreError::Internal(format!("soft_delete begin: {e}")))?;
+        let rows = tx
             .execute(
                 "UPDATE instances SET desired_state = 'deleted', observed_state = 'deleted', \
              deleted_at = unixepoch(), status = 'stopped', \
@@ -2747,6 +3049,17 @@ impl InstanceDb {
         if rows == 0 {
             return Err(StoreError::InstanceNotFound);
         }
+        // Tombstone any live Share bindings in the SAME transaction: a deleted
+        // instance must never resolve, and a same-name recreate must mint a
+        // fresh app_id rather than inheriting this one's identity.
+        tx.execute(
+            "UPDATE shareable_apps SET retired_at = unixepoch(), updated_at = unixepoch() \
+             WHERE instance_id = ?1 AND retired_at IS NULL",
+            params![id],
+        )
+        .map_err(|e| StoreError::Internal(format!("soft_delete binding tombstone: {e}")))?;
+        tx.commit()
+            .map_err(|e| StoreError::Internal(format!("soft_delete commit: {e}")))?;
         Ok(())
     }
 
@@ -4058,49 +4371,56 @@ fn row_to_public_site(row: &rusqlite::Row<'_>) -> rusqlite::Result<PublicSiteRow
 
 /// Shared row mapper for instance queries.
 fn row_to_instance(row: &rusqlite::Row<'_>) -> rusqlite::Result<InstanceRow> {
-    let status_str: String = row.get(5)?;
+    row_to_instance_offset(row, 0)
+}
+
+/// Same mapping as [`row_to_instance`] but reading the instance columns at an
+/// offset, for JOINs that prepend other columns (e.g. the `shareable_apps`
+/// resolution JOIN).
+fn row_to_instance_offset(row: &rusqlite::Row<'_>, o: usize) -> rusqlite::Result<InstanceRow> {
+    let status_str: String = row.get(o + 5)?;
     let status = status_str
         .parse::<InstanceStatus>()
         .unwrap_or(InstanceStatus::Provisioning);
     Ok(InstanceRow {
-        id: row.get(0)?,
-        name: row.get(1)?,
-        container: row.get(2)?,
-        claw_type: row.get(3)?,
-        host_port: row.get(4)?,
+        id: row.get(o)?,
+        name: row.get(o + 1)?,
+        container: row.get(o + 2)?,
+        claw_type: row.get(o + 3)?,
+        host_port: row.get(o + 4)?,
         status,
-        provisioning_message: row.get(6)?,
-        provisioning_error: row.get(7)?,
-        provisioning_phase: row.get(8)?,
-        job_id: row.get(9)?,
-        auto_update: row.get(10)?,
-        custom_domain: row.get(11)?,
-        cf_hostname_id: row.get(12)?,
-        vm_id: row.get(15)?,
-        pid: row.get(16)?,
-        snapshot_path: row.get(17)?,
-        config_json: row.get(18)?,
-        vm_ip: row.get(19)?,
-        vm_mac: row.get(20)?,
-        efi_store_path: row.get(21)?,
-        cidata_iso_path: row.get(22)?,
-        disk_path: row.get(23)?,
+        provisioning_message: row.get(o + 6)?,
+        provisioning_error: row.get(o + 7)?,
+        provisioning_phase: row.get(o + 8)?,
+        job_id: row.get(o + 9)?,
+        auto_update: row.get(o + 10)?,
+        custom_domain: row.get(o + 11)?,
+        cf_hostname_id: row.get(o + 12)?,
+        vm_id: row.get(o + 15)?,
+        pid: row.get(o + 16)?,
+        snapshot_path: row.get(o + 17)?,
+        config_json: row.get(o + 18)?,
+        vm_ip: row.get(o + 19)?,
+        vm_mac: row.get(o + 20)?,
+        efi_store_path: row.get(o + 21)?,
+        cidata_iso_path: row.get(o + 22)?,
+        disk_path: row.get(o + 23)?,
         guest_os: row
             .get::<_, Option<String>>(24)?
             .unwrap_or_else(|| "linux".to_string()),
-        aux_storage_path: row.get(25)?,
-        owner_id: row.get(26)?,
-        cpu_cores: row.get(27)?,
-        ram_config_mb: row.get(28)?,
-        disk_gb: row.get(29)?,
-        created_at: row.get(13)?,
-        updated_at: row.get(14)?,
-        desired_state: row.get(30)?,
-        observed_state: row.get(31)?,
-        deleted_at: row.get(32)?,
-        household_id: row.get(33)?,
-        household_machine_id: row.get(34)?,
-        provisioning_failure_code: row.get(35)?,
+        aux_storage_path: row.get(o + 25)?,
+        owner_id: row.get(o + 26)?,
+        cpu_cores: row.get(o + 27)?,
+        ram_config_mb: row.get(o + 28)?,
+        disk_gb: row.get(o + 29)?,
+        created_at: row.get(o + 13)?,
+        updated_at: row.get(o + 14)?,
+        desired_state: row.get(o + 30)?,
+        observed_state: row.get(o + 31)?,
+        deleted_at: row.get(o + 32)?,
+        household_id: row.get(o + 33)?,
+        household_machine_id: row.get(o + 34)?,
+        provisioning_failure_code: row.get(o + 35)?,
     })
 }
 
@@ -4459,7 +4779,13 @@ mod instance_db_tests {
     }
 
     #[test]
-    fn household_status_accepts_legacy_unscoped_rows() {
+    fn household_status_rejects_unscoped_rows() {
+        // INVERTED from `household_status_accepts_legacy_unscoped_rows` by the
+        // 2026-08 security verdict (option (b), strict): a row without
+        // household_id belongs to NO household. Status and listing must agree
+        // by rule — unscoped rows are hidden from both until stamped via
+        // `stamp_mac_host_household`. Kept (not deleted) so the rule
+        // change is visible in review.
         let db = open_temp();
         db.insert(&NewInstance {
             id: "inst-legacy",
@@ -4480,7 +4806,177 @@ mod instance_db_tests {
         assert!(
             db.get_for_household_status("inst-legacy", "hh_alpha")
                 .unwrap()
+                .is_none(),
+            "unscoped rows must be hidden from household status under the strict rule"
+        );
+    }
+
+    #[test]
+    fn household_status_and_list_agree_for_the_same_row() {
+        // The two read paths must answer the SAME question for the SAME row —
+        // the original bug was status accepting rows the listing excluded.
+        let db = open_temp();
+        let insert = |id: &str, hh: Option<&str>, m: Option<&str>| {
+            db.insert(&NewInstance {
+                id,
+                name: id,
+                container: &format!("c-{id}"),
+                claw_type: "picoclaw",
+                sunset_date: "2026-12-31",
+                guest_os: None,
+                aux_storage_path: None,
+                cpu_cores: None,
+                ram_config_mb: None,
+                disk_gb: None,
+                household_id: hh,
+                household_machine_id: m,
+            })
+            .unwrap();
+        };
+        insert("inst-scoped", Some("hh_alpha"), Some("m_alpha"));
+        insert("inst-unscoped", None, None);
+        insert("inst-machine-only", None, Some("m_alpha"));
+        insert("inst-other-household", Some("hh_beta"), Some("m_beta"));
+        insert("inst-deleted", Some("hh_alpha"), Some("m_alpha"));
+        db.soft_delete("inst-deleted").unwrap();
+
+        let listed: Vec<String> = db
+            .list_for_household("hh_alpha")
+            .unwrap()
+            .into_iter()
+            .map(|r| r.id)
+            .collect();
+        for id in [
+            "inst-scoped",
+            "inst-unscoped",
+            "inst-machine-only",
+            "inst-other-household",
+            "inst-deleted",
+        ] {
+            let in_status = db
+                .get_for_household_status(id, "hh_alpha")
+                .unwrap()
+                .is_some();
+            let in_list = listed.iter().any(|listed_id| listed_id == id);
+            assert_eq!(
+                in_status, in_list,
+                "status and list disagree for row {id} (status={in_status}, list={in_list})"
+            );
+        }
+        assert_eq!(listed, vec!["inst-scoped".to_string()]);
+    }
+
+    #[test]
+    fn stamp_mac_host_household_makes_seeded_mac_host_visible() {
+        // Boot-order reproduction: the mac-host seed runs BEFORE the household
+        // identity loads, so the row is born unscoped and invisible. Stamping
+        // after bootstrap is what puts it in the sharing picker.
+        let db = open_temp();
+        let admin_id = db.seed_admin("admin").unwrap();
+        db.seed_mac_host_instance(&admin_id).unwrap();
+
+        let mac_host = db.get("inst-mac-host").unwrap().expect("seeded row");
+        assert!(mac_host.household_id.is_none());
+        assert!(mac_host.household_machine_id.is_none());
+        assert!(db.list_for_household("hh_alpha").unwrap().is_empty());
+        assert!(
+            db.get_for_household_status("inst-mac-host", "hh_alpha")
+                .unwrap()
+                .is_none()
+        );
+
+        let stamped = db.stamp_mac_host_household("hh_alpha", "m_alpha").unwrap();
+        assert!(stamped, "mac-host seed row must be stamped");
+
+        let mac_host = db.get("inst-mac-host").unwrap().expect("seeded row");
+        assert_eq!(mac_host.household_id.as_deref(), Some("hh_alpha"));
+        assert_eq!(mac_host.household_machine_id.as_deref(), Some("m_alpha"));
+        let listed: Vec<String> = db
+            .list_for_household("hh_alpha")
+            .unwrap()
+            .into_iter()
+            .map(|r| r.id)
+            .collect();
+        assert_eq!(listed, vec!["inst-mac-host".to_string()]);
+        assert!(
+            db.get_for_household_status("inst-mac-host", "hh_alpha")
+                .unwrap()
                 .is_some()
+        );
+
+        // Idempotent: a second stamp (next boot) touches nothing.
+        assert!(!db.stamp_mac_host_household("hh_alpha", "m_alpha").unwrap());
+    }
+
+    #[test]
+    fn stamp_mac_host_household_fails_closed_on_ambiguous_or_foreign_rows() {
+        // Narrow stamping (security verdict, 2026-08): ONLY the mac-host seed
+        // row is eligible. A fully-unscoped NON-mac-host row — possibly a
+        // leftover from a previous household — must NOT be adopted by the
+        // current one. Partial scope (ambiguous provenance), another
+        // household's rows, and soft-deleted rows are likewise untouched.
+        let db = open_temp();
+        let insert = |id: &str, container: &str, hh: Option<&str>, m: Option<&str>| {
+            db.insert(&NewInstance {
+                id,
+                name: id,
+                container,
+                claw_type: "picoclaw",
+                sunset_date: "2026-12-31",
+                guest_os: None,
+                aux_storage_path: None,
+                cpu_cores: None,
+                ram_config_mb: None,
+                disk_gb: None,
+                household_id: hh,
+                household_machine_id: m,
+            })
+            .unwrap();
+        };
+        insert("inst-legacy-unscoped", "picoclaw-legacy", None, None);
+        insert(
+            "inst-machine-only",
+            "picoclaw-m-only",
+            None,
+            Some("m_unknown"),
+        );
+        insert(
+            "inst-household-only",
+            "picoclaw-h-only",
+            Some("hh_alpha"),
+            None,
+        );
+        insert(
+            "inst-other-household",
+            "picoclaw-other",
+            Some("hh_beta"),
+            Some("m_beta"),
+        );
+        insert("mac-host-lookalike", "mac-host-impostor", None, None);
+
+        let stamped = db.stamp_mac_host_household("hh_alpha", "m_alpha").unwrap();
+        assert!(!stamped, "no row here is eligible for stamping");
+
+        let legacy = db.get("inst-legacy-unscoped").unwrap().unwrap();
+        assert!(
+            legacy.household_id.is_none() && legacy.household_machine_id.is_none(),
+            "unscoped non-mac-host rows must NOT be adopted by the current household"
+        );
+        let machine_only = db.get("inst-machine-only").unwrap().unwrap();
+        assert!(machine_only.household_id.is_none());
+        assert_eq!(
+            machine_only.household_machine_id.as_deref(),
+            Some("m_unknown")
+        );
+        let household_only = db.get("inst-household-only").unwrap().unwrap();
+        assert_eq!(household_only.household_id.as_deref(), Some("hh_alpha"));
+        assert!(household_only.household_machine_id.is_none());
+        let other = db.get("inst-other-household").unwrap().unwrap();
+        assert_eq!(other.household_id.as_deref(), Some("hh_beta"));
+        let lookalike = db.get("mac-host-lookalike").unwrap().unwrap();
+        assert!(
+            lookalike.household_id.is_none(),
+            "only the exact mac-host container is eligible"
         );
     }
 
@@ -6585,6 +7081,318 @@ mod instance_db_tests {
             db.sum_active_runtime_leases().unwrap(),
             (0, 0),
             "released lease must not leak into allocation"
+        );
+    }
+
+    // ── shareable_apps: the Share's own identity authority (D6) ────────────
+
+    fn scoped_inst<'a>(id: &'a str, name: &'a str, container: &'a str) -> NewInstance<'a> {
+        NewInstance {
+            id,
+            name,
+            container,
+            claw_type: "picoclaw",
+            sunset_date: "2026-12-31",
+            guest_os: None,
+            aux_storage_path: None,
+            cpu_cores: None,
+            ram_config_mb: None,
+            disk_gb: None,
+            household_id: Some("hh_alpha"),
+            household_machine_id: Some("m_alpha"),
+        }
+    }
+
+    #[test]
+    fn shareable_ensure_is_idempotent_and_never_resyncs_display_name() {
+        let db = open_temp();
+        db.insert(&scoped_inst("inst-alpha", "alpha", "picoclaw-alpha"))
+            .unwrap();
+        let first = db.ensure_shareable_app("inst-alpha", "hh_alpha").unwrap();
+        assert!(first.app_id.starts_with("app_"));
+        assert_eq!(first.app_id.len(), 4 + 32);
+        assert_eq!(first.display_name, "alpha");
+        assert_eq!(first.resource, SHAREABLE_APP_RESOURCE_CLAWSITE);
+
+        // Instance renamed in the catalog AFTER the binding exists.
+        let conn = db.conn().unwrap();
+        conn.execute(
+            "UPDATE instances SET name = 'alpha-renamed' WHERE id = 'inst-alpha'",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+
+        let second = db.ensure_shareable_app("inst-alpha", "hh_alpha").unwrap();
+        assert_eq!(second.app_id, first.app_id, "ensure must reuse the live binding");
+        assert_eq!(
+            second.display_name, "alpha",
+            "ensure must NEVER re-sync display_name from instances.name"
+        );
+    }
+
+    #[test]
+    fn shareable_ensure_proves_instance_authority_before_any_binding() {
+        let db = open_temp();
+        // Unknown instance: no binding, uniform fail-closed.
+        assert!(matches!(
+            db.ensure_shareable_app("inst-ghost", "hh_alpha"),
+            Err(StoreError::InstanceNotFound)
+        ));
+        // Unscoped instance (household NULL): same.
+        db.insert(&NewInstance {
+            household_id: None,
+            household_machine_id: None,
+            ..scoped_inst("inst-unscoped", "unscoped", "picoclaw-unscoped")
+        })
+        .unwrap();
+        assert!(matches!(
+            db.ensure_shareable_app("inst-unscoped", "hh_alpha"),
+            Err(StoreError::InstanceNotFound)
+        ));
+        // Foreign-scoped instance: same, and nothing was ever written.
+        db.insert(&NewInstance {
+            household_id: Some("hh_other"),
+            ..scoped_inst("inst-foreign", "foreign", "picoclaw-foreign")
+        })
+        .unwrap();
+        assert!(matches!(
+            db.ensure_shareable_app("inst-foreign", "hh_alpha"),
+            Err(StoreError::InstanceNotFound)
+        ));
+        let conn = db.conn().unwrap();
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM shareable_apps", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 0, "failed authority proofs must never write bindings");
+    }
+
+    #[test]
+    fn shareable_foreign_ensure_cannot_tombstone_another_households_binding() {
+        let db = open_temp();
+        db.insert(&scoped_inst("inst-alpha", "alpha", "picoclaw-alpha"))
+            .unwrap();
+        let app = db.ensure_shareable_app("inst-alpha", "hh_alpha").unwrap();
+
+        // A caller naming a DIFFERENT household while the row is still
+        // hh_alpha-scoped is rejected BEFORE touching the binding.
+        assert!(matches!(
+            db.ensure_shareable_app("inst-alpha", "hh_evil"),
+            Err(StoreError::InstanceNotFound)
+        ));
+        let (binding, _) = db
+            .resolve_live_shareable_app(&app.app_id, "hh_alpha")
+            .unwrap()
+            .expect("the live binding must survive the foreign attempt");
+        assert_eq!(binding.app_id, app.app_id);
+        assert!(binding.retired_at.is_none());
+    }
+
+    #[test]
+    fn shareable_same_display_name_bindings_resolve_independently() {
+        let db = open_temp();
+        db.insert(&scoped_inst("inst-one", "one", "picoclaw-one")).unwrap();
+        db.insert(&scoped_inst("inst-two", "two", "picoclaw-two")).unwrap();
+        let app_one = db.ensure_shareable_app("inst-one", "hh_alpha").unwrap();
+        let app_two = db.ensure_shareable_app("inst-two", "hh_alpha").unwrap();
+        assert_ne!(app_one.app_id, app_two.app_id);
+
+        // BOTH renamed to the same display name: identity/routing never keys on it.
+        db.rename_shareable_app(&app_one.app_id, "hh_alpha", "Study")
+            .unwrap();
+        db.rename_shareable_app(&app_two.app_id, "hh_alpha", "Study")
+            .unwrap();
+        db.update_port("inst-one", 8101).unwrap();
+        db.update_port("inst-two", 8202).unwrap();
+
+        let (binding_one, instance_one) = db
+            .resolve_live_shareable_app(&app_one.app_id, "hh_alpha")
+            .unwrap()
+            .expect("app one resolves");
+        let (binding_two, instance_two) = db
+            .resolve_live_shareable_app(&app_two.app_id, "hh_alpha")
+            .unwrap()
+            .expect("app two resolves");
+        assert_eq!(binding_one.display_name, binding_two.display_name);
+        assert_eq!(instance_one.host_port, Some(8101));
+        assert_eq!(instance_two.host_port, Some(8202));
+        assert_ne!(instance_one.id, instance_two.id);
+    }
+
+    #[test]
+    fn shareable_rename_preserves_identity_and_is_scoped_fail_closed() {
+        let db = open_temp();
+        db.insert(&scoped_inst("inst-alpha", "alpha", "picoclaw-alpha"))
+            .unwrap();
+        let app = db.ensure_shareable_app("inst-alpha", "hh_alpha").unwrap();
+
+        db.rename_shareable_app(&app.app_id, "hh_alpha", "French 101")
+            .unwrap();
+        let (binding, _) = db
+            .resolve_live_shareable_app(&app.app_id, "hh_alpha")
+            .unwrap()
+            .unwrap();
+        assert_eq!(binding.app_id, app.app_id);
+        assert_eq!(binding.display_name, "French 101");
+
+        // Foreign household and invalid names all fail closed.
+        assert!(matches!(
+            db.rename_shareable_app(&app.app_id, "hh_other", "nope"),
+            Err(StoreError::InstanceNotFound)
+        ));
+        assert!(db.rename_shareable_app(&app.app_id, "hh_alpha", "").is_err());
+        assert!(db.rename_shareable_app(&app.app_id, "hh_alpha", "   ").is_err());
+        assert!(db
+            .rename_shareable_app(&app.app_id, "hh_alpha", &"x".repeat(129))
+            .is_err());
+    }
+
+    #[test]
+    fn shareable_soft_delete_tombstones_and_recreate_mints_fresh_id() {
+        let db = open_temp();
+        db.insert(&scoped_inst("inst-alpha", "alpha", "picoclaw-alpha"))
+            .unwrap();
+        let old = db.ensure_shareable_app("inst-alpha", "hh_alpha").unwrap();
+
+        db.soft_delete("inst-alpha").unwrap();
+        assert!(
+            db.resolve_live_shareable_app(&old.app_id, "hh_alpha")
+                .unwrap()
+                .is_none(),
+            "deleted instance must fail closed"
+        );
+        {
+            let conn = db.conn().unwrap();
+            let retired: Option<i64> = conn
+                .query_row(
+                    "SELECT retired_at FROM shareable_apps WHERE app_id = ?1",
+                    params![old.app_id],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert!(
+                retired.is_some(),
+                "soft delete must tombstone the binding in the SAME transaction"
+            );
+        }
+
+        // Hard delete frees the name/id; recreate with the SAME technical slug.
+        db.delete("inst-alpha").unwrap();
+        db.insert(&scoped_inst("inst-alpha", "alpha", "picoclaw-alpha"))
+            .unwrap();
+        let new = db.ensure_shareable_app("inst-alpha", "hh_alpha").unwrap();
+        assert_ne!(
+            old.app_id, new.app_id,
+            "delete+recreate must yield a different app_id"
+        );
+        assert!(
+            db.resolve_live_shareable_app(&old.app_id, "hh_alpha")
+                .unwrap()
+                .is_none(),
+            "the old binding stays tombstoned forever"
+        );
+        assert!(
+            db.resolve_live_shareable_app(&new.app_id, "hh_alpha")
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn shareable_hard_delete_never_leaves_a_live_binding() {
+        let db = open_temp();
+        db.insert(&scoped_inst("inst-alpha", "alpha", "picoclaw-alpha"))
+            .unwrap();
+        let app = db.ensure_shareable_app("inst-alpha", "hh_alpha").unwrap();
+
+        // The provisioning rollback path: succeeds AND leaves nothing resolvable.
+        db.delete("inst-alpha").unwrap();
+        assert!(
+            db.resolve_live_shareable_app(&app.app_id, "hh_alpha")
+                .unwrap()
+                .is_none()
+        );
+        let conn = db.conn().unwrap();
+        let retired: Option<i64> = conn
+            .query_row(
+                "SELECT retired_at FROM shareable_apps WHERE app_id = ?1",
+                params![app.app_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(retired.is_some(), "hard delete must tombstone in the same tx");
+    }
+
+    #[test]
+    fn shareable_resolve_is_household_scoped_and_readiness_is_not_terminal() {
+        let db = open_temp();
+        db.insert(&scoped_inst("inst-alpha", "alpha", "picoclaw-alpha"))
+            .unwrap();
+        let app = db.ensure_shareable_app("inst-alpha", "hh_alpha").unwrap();
+
+        // Foreign household: indistinguishable fail-closed None.
+        assert!(
+            db.resolve_live_shareable_app(&app.app_id, "hh_other")
+                .unwrap()
+                .is_none()
+        );
+        // No host_port yet: identity VALID, readiness absent — Some, not terminal.
+        let (_, instance) = db
+            .resolve_live_shareable_app(&app.app_id, "hh_alpha")
+            .unwrap()
+            .expect("identity resolves even without host_port");
+        assert_eq!(instance.host_port, None);
+    }
+
+    #[test]
+    fn shareable_repair_retires_stale_binding_only_after_row_rescope() {
+        let db = open_temp();
+        db.insert(&scoped_inst("inst-alpha", "alpha", "picoclaw-alpha"))
+            .unwrap();
+        let old = db.ensure_shareable_app("inst-alpha", "hh_alpha").unwrap();
+
+        // While the row is still hh_alpha-scoped, an hh_beta ensure is rejected
+        // and the live binding is untouched.
+        assert!(matches!(
+            db.ensure_shareable_app("inst-alpha", "hh_beta"),
+            Err(StoreError::InstanceNotFound)
+        ));
+        assert!(
+            db.resolve_live_shareable_app(&old.app_id, "hh_alpha")
+                .unwrap()
+                .is_some()
+        );
+
+        // Re-pair: the row itself is re-scoped to hh_beta. The JOIN pin makes
+        // the old identity stop resolving IMMEDIATELY (scope moved), and only
+        // NOW may ensure tombstone the stale binding and re-mint.
+        let conn = db.conn().unwrap();
+        conn.execute(
+            "UPDATE instances SET household_id = 'hh_beta', household_machine_id = 'm_beta' \
+             WHERE id = 'inst-alpha'",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+        assert!(
+            db.resolve_live_shareable_app(&old.app_id, "hh_alpha")
+                .unwrap()
+                .is_none(),
+            "re-scoped instance must strand the old identity at once"
+        );
+        let new = db.ensure_shareable_app("inst-alpha", "hh_beta").unwrap();
+        assert_ne!(old.app_id, new.app_id);
+        assert_eq!(new.household_id, "hh_beta");
+        assert!(
+            db.resolve_live_shareable_app(&old.app_id, "hh_beta")
+                .unwrap()
+                .is_none(),
+            "the stale binding must not resolve under any household"
+        );
+        assert!(
+            db.resolve_live_shareable_app(&new.app_id, "hh_beta")
+                .unwrap()
+                .is_some()
         );
     }
 }

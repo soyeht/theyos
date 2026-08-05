@@ -428,7 +428,16 @@ fn r1a7_enumerates_linked_targets_and_proves_zero_production_callers() {
     // composition's graph-gate run covers the dependency graph, not target
     // counts. Re-measured directly against this tree, not inferred from the
     // diff.
-    assert_eq!(targets.len(), 207, "Cargo target inventory changed");
+    //
+    // MERGE with main (Share). Both sides bumped correctly for their OWN
+    // lineage and NEITHER value survives the merge: from the common base
+    // `aa3f4caa` (201), main went 201 → 202 (+1: the S0 harness example
+    // `server-rs/examples/relay_stream_s0_load.rs`) while this branch went
+    // 201 → … → 207 (+6). The merged tree carries both sets, so 202 and 207
+    // are each right about half of it. The value below is what the enumerator
+    // reported on the MERGED tree -- not 202 + 6, which is the arithmetic this
+    // file already records as having been wrong twice.
+    assert_eq!(targets.len(), 208, "Cargo target inventory changed");
     assert_eq!(
         targets.iter().filter(|target| target.kind == "bin").count(),
         50
@@ -455,8 +464,18 @@ fn r1a7_enumerates_linked_targets_and_proves_zero_production_callers() {
             .iter()
             .filter(|target| target.kind == "example")
             .count(),
-        0
+        1 // ONLY the S0 relay capacity harness (plan §7.5). Deliberately kept
+          // an exact `==`, never `>=`: a second example must break this and be
+          // argued for, exactly as this one was.
     );
+    // ...and it must be THAT example. The count alone would let an unrelated
+    // example replace the harness silently.
+    assert!(targets.iter().any(|target| {
+        target.package == "server-rs"
+            && target.kind == "example"
+            && target.name == "relay_stream_s0_load"
+            && target.path == "server-rs/examples/relay_stream_s0_load.rs"
+    }));
     assert!(targets.iter().any(|target| {
         target.package == "server-rs" && target.kind == "bin" && target.name == "server"
     }));

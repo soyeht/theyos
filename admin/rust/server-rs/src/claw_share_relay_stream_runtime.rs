@@ -22,6 +22,7 @@ use tokio::sync::Notify;
 use crate::claw_share_relay_stream_admission::RelayStreamAdmission;
 use crate::claw_share_relay_stream_contract::{RelayStreamContractError, RelayStreamOfferContract};
 use crate::claw_share_relay_stream_offer_store::RelayStreamOfferStoreError;
+use crate::claw_share_relay_stream_reopen_limiter::{ReopenLimiterConfig, ReopenStreamLimiter};
 use crate::claw_share_relay_stream_responder_config::{
     DEFAULT_RELAY_STREAM_RESPONDER_AUTH_DEADLINE, DEFAULT_RELAY_STREAM_RESPONDER_IDLE_TIMEOUT,
     RelayStreamResponderConfig,
@@ -68,6 +69,12 @@ pub struct RelayStreamLiveConfig {
     /// How often the offer re-sync driver re-reads the store and reconciles
     /// workers so claim-provisioned offers are served without a restart.
     pub resync_tick: Duration,
+    /// V1 defaults for the per-`(claw_id, guest_device_pub)` reopen-rate gate,
+    /// applied only to `ClawSite` Group/Public dials (see
+    /// `claw_share_relay_stream_reopen_limiter`). Bounds mint RATE across
+    /// reconnects; independent of the `OpenPersistent` per-connection
+    /// byte/open budget, which bounds VOLUME within one connection.
+    pub reopen_limiter: ReopenLimiterConfig,
 }
 
 impl Default for RelayStreamLiveConfig {
@@ -89,6 +96,7 @@ impl Default for RelayStreamLiveConfig {
             trust_refresh: RelayStreamTrustRefreshConfig::new(Duration::from_secs(10)),
             pool: RelayStreamReverseConnectPoolConfig::default(),
             resync_tick: Duration::from_secs(30),
+            reopen_limiter: ReopenLimiterConfig::default(),
         }
     }
 }
@@ -108,7 +116,10 @@ pub struct RelayStreamLiveInputs<'a, P, S> {
     pub slots: Arc<ClawShareSlotStore>,
     pub replay: Arc<ReplayGuard>,
     pub pty_router_factory: Arc<dyn Fn() -> P + Send + Sync>,
-    pub clawsite_router_factory: Arc<dyn Fn() -> S + Send + Sync>,
+    /// Offer-aware: the `ClawSite` implementation is chosen per offer from its
+    /// SIGNED audience. PTY and `IpTunnel` stay zero-arg — only `ClawSite` has
+    /// two namespaces to tell apart.
+    pub clawsite_router_factory: Arc<dyn Fn(&RelayStreamOfferContract) -> S + Send + Sync>,
     pub refresh_trigger: Arc<Notify>,
     pub now_unix: Arc<dyn Fn() -> Option<u64> + Send + Sync>,
 }
@@ -134,6 +145,13 @@ impl RelayStreamLiveHandles {
     #[must_use]
     pub fn pool_task_count(&self) -> usize {
         self.resync_driver.task_count()
+    }
+
+    /// Pulse an immediate offer re-sync so a just-provisioned offer is served
+    /// now instead of at the next tick. Concedes nothing: every resync re-loads
+    /// the store and re-verifies it against live trust.
+    pub fn trigger_resync(&self) {
+        self.resync_driver.trigger_resync();
     }
 
     #[must_use]
@@ -225,6 +243,11 @@ where
         )
         .await?,
     );
+    // Constructed ONCE here, not inside the binding factory closure: the
+    // resync driver rebuilds bindings on every tick, and a limiter recreated
+    // per binding would reset every principal's window on each tick instead
+    // of tracking reconnect rate across the binding's real lifetime.
+    let reopen_limiter = Arc::new(ReopenStreamLimiter::new(config.reopen_limiter));
     let binding_factory = build_binding_factory_phase0(
         admission,
         inputs.household_id,
@@ -232,6 +255,7 @@ where
         Arc::clone(&inputs.replay),
         Arc::clone(&inputs.pty_router_factory),
         Arc::clone(&inputs.clawsite_router_factory),
+        reopen_limiter,
         Arc::clone(&inputs.now_unix),
     );
     let refresh_driver = spawn_relay_stream_trust_refresh_driver(
@@ -301,6 +325,8 @@ where
         .await?,
     );
 
+    // Same single-construction reasoning as the phase0 path above.
+    let reopen_limiter = Arc::new(ReopenStreamLimiter::new(config.reopen_limiter));
     let binding_factory = build_binding_factory(
         admission,
         inputs.household_id,
@@ -309,6 +335,7 @@ where
         Arc::clone(&inputs.pty_router_factory),
         Arc::clone(&inputs.clawsite_router_factory),
         ip_tunnel_router_factory,
+        reopen_limiter,
         Arc::clone(&inputs.now_unix),
     );
 
@@ -350,7 +377,8 @@ fn build_binding_factory_phase0<P, S>(
     slots: Arc<ClawShareSlotStore>,
     replay: Arc<ReplayGuard>,
     pty_router_factory: Arc<dyn Fn() -> P + Send + Sync>,
-    clawsite_router_factory: Arc<dyn Fn() -> S + Send + Sync>,
+    clawsite_router_factory: Arc<dyn Fn(&RelayStreamOfferContract) -> S + Send + Sync>,
+    reopen_limiter: Arc<ReopenStreamLimiter>,
     now_unix: Arc<dyn Fn() -> Option<u64> + Send + Sync>,
 ) -> Arc<RelayStreamReverseConnectBindingFactory<P, S>>
 where
@@ -365,6 +393,9 @@ where
             RelayStreamReverseConnectBindingBuildError::Unhealthy(error.to_string())
         })?;
         let router_clock = Arc::clone(&now_unix);
+        // Built BEFORE `offer` is moved into the binding, and inert: choosing
+        // the implementation reads the signed audience only.
+        let clawsite_router = clawsite_router_factory(&offer);
         Ok(bind_relay_stream_reverse_connect(
             offer,
             trust,
@@ -372,7 +403,8 @@ where
             Arc::clone(&slots),
             Arc::clone(&replay),
             pty_router_factory(),
-            clawsite_router_factory(),
+            clawsite_router,
+            Arc::clone(&reopen_limiter),
             move || router_clock(),
         ))
     })
@@ -386,8 +418,9 @@ fn build_binding_factory<P, S, I>(
     slots: Arc<ClawShareSlotStore>,
     replay: Arc<ReplayGuard>,
     pty_router_factory: Arc<dyn Fn() -> P + Send + Sync>,
-    clawsite_router_factory: Arc<dyn Fn() -> S + Send + Sync>,
+    clawsite_router_factory: Arc<dyn Fn(&RelayStreamOfferContract) -> S + Send + Sync>,
     ip_tunnel_router_factory: Arc<dyn Fn() -> I + Send + Sync>,
+    reopen_limiter: Arc<ReopenStreamLimiter>,
     now_unix: Arc<dyn Fn() -> Option<u64> + Send + Sync>,
 ) -> Arc<RelayStreamReverseConnectBindingFactory<P, S, I>>
 where
@@ -403,6 +436,8 @@ where
             RelayStreamReverseConnectBindingBuildError::Unhealthy(error.to_string())
         })?;
         let router_clock = Arc::clone(&now_unix);
+        // Same ordering constraint as the phase0 arm above.
+        let clawsite_router = clawsite_router_factory(&offer);
         Ok(bind_relay_stream_reverse_connect_with_ip_tunnel_router(
             offer,
             trust,
@@ -410,8 +445,9 @@ where
             Arc::clone(&slots),
             Arc::clone(&replay),
             pty_router_factory(),
-            clawsite_router_factory(),
+            clawsite_router,
             ip_tunnel_router_factory(),
+            Arc::clone(&reopen_limiter),
             move || router_clock(),
         ))
     })
@@ -520,6 +556,7 @@ mod tests {
                 .unwrap(),
             },
             resync_tick: Duration::from_secs(30),
+            reopen_limiter: ReopenLimiterConfig::default(),
         }
     }
 
@@ -552,7 +589,7 @@ mod tests {
             slots: data_tunnel_store(),
             replay: Arc::new(ReplayGuard::new()),
             pty_router_factory: Arc::new(|| TcpStreamRouter::new("127.0.0.1:1")),
-            clawsite_router_factory: Arc::new(|| TcpStreamRouter::new("127.0.0.1:1")),
+            clawsite_router_factory: Arc::new(|_offer| TcpStreamRouter::new("127.0.0.1:1")),
             refresh_trigger,
             now_unix: Arc::new(|| Some(now_unix())),
         }
@@ -605,6 +642,7 @@ mod tests {
                     claw_static_pub: keypair.public_key().clone(),
                     not_after: now_unix() + 600,
                     now_unix: now_unix(),
+                    app_presentation: None,
                 },
                 &owner_signer(),
                 &relay_stream_issuer_trust(),
@@ -868,13 +906,14 @@ mod tests {
             data_tunnel_store(),
             Arc::new(ReplayGuard::new()),
             Arc::new(|| TcpStreamRouter::new("127.0.0.1:1")),
-            Arc::new(|| TcpStreamRouter::new("127.0.0.1:1")),
+            Arc::new(|_offer| TcpStreamRouter::new("127.0.0.1:1")),
             {
                 let opens = Arc::clone(&opens);
                 Arc::new(move || CountingIpTunnelRouter {
                     opens: Arc::clone(&opens),
                 })
             },
+            Arc::new(ReopenStreamLimiter::new(ReopenLimiterConfig::default())),
             Arc::new(|| Some(now_unix())),
         );
         let binding = binding_factory(offer, now_unix()).unwrap();

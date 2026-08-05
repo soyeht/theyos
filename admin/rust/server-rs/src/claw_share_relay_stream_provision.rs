@@ -20,7 +20,7 @@ use rand::rngs::OsRng;
 use crate::claw_share_relay_stream_contract::{
     RelayStreamClawStaticPublicKey, RelayStreamContractError, RelayStreamExpectedPath,
     RelayStreamOfferContract, RelayStreamOfferMintInput, RelayStreamResource,
-    mint_relay_stream_group_offer, mint_relay_stream_public_offer,
+    ShareableAppPresentation, mint_relay_stream_group_offer, mint_relay_stream_public_offer,
 };
 use crate::claw_share_relay_stream_issuer_trust::RelayStreamIssuerTrust;
 use crate::claw_share_relay_stream_offer_store::{
@@ -54,6 +54,7 @@ pub fn provision_relay_stream_offer(
     owner_key: &dyn IdentityKey,
     trust: &RelayStreamIssuerTrust,
     now: u64,
+    app_presentation: Option<ShareableAppPresentation>,
 ) -> Result<RelayStreamOfferContract, RelayStreamProvisionError> {
     let mut token_bytes = [0u8; RENDEZVOUS_TOKEN_BYTES];
     OsRng.fill_bytes(&mut token_bytes);
@@ -69,6 +70,7 @@ pub fn provision_relay_stream_offer(
         claw_static_pub,
         not_after,
         now_unix: now,
+        app_presentation,
     };
 
     let offer = store.put_minted(input, owner_key, trust)?;
@@ -190,6 +192,96 @@ mod tests {
         RelayStreamOfferStore::load(dir.path(), &relay_stream_issuer_trust(), now_unix()).unwrap()
     }
 
+    fn share_app_id() -> String {
+        format!("app_{:032x}", 0x5eed_u128)
+    }
+
+    /// A credential whose `claw_id` IS a valid Share app id. The offer's
+    /// `claw_id` comes from the credential, and the presentation fence demands
+    /// `presentation.app_id == claw_id`, so the credential is where the match
+    /// has to be made — not by loosening the fence.
+    fn app_credential(app_id: &str) -> GuestCredential {
+        let owner = owner_signer();
+        let issued_at = now_unix().saturating_sub(60);
+        GuestCredential::sign(
+            household_rs::ids::derive_household_id(&owner.public()),
+            household_rs::person_cert::derive_person_id(&owner.public()),
+            owner.public(),
+            app_id.to_string(),
+            crate::claw_share_relay_stream_test_support::guest_signer().public(),
+            SlotId([0x22; 16]),
+            issued_at,
+            issued_at + 86_400,
+            &owner,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn provision_passes_the_presentation_through_to_the_signed_offer() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = store(&dir);
+        let app_id = share_app_id();
+        let credential = app_credential(&app_id);
+        let presentation =
+            ShareableAppPresentation::try_new(app_id.clone(), "Study", "Caio").unwrap();
+        let now = now_unix();
+
+        let offer = provision_relay_stream_offer(
+            &mut store,
+            &credential,
+            RelayStreamResource::ClawSite,
+            static_pub(),
+            ENDPOINT.to_string(),
+            credential.expires_at,
+            &owner_signer(),
+            &relay_stream_issuer_trust(),
+            now,
+            Some(presentation.clone()),
+        )
+        .unwrap();
+
+        // Survives the whole provision → mint → sign → store path.
+        assert_eq!(offer.payload.app_presentation.as_ref(), Some(&presentation));
+        assert_eq!(offer.payload.claw_id, app_id);
+        // And the store re-verifies on read, so a snapshot that broke the fence
+        // would not come back out.
+        let active = store
+            .list_active(&relay_stream_issuer_trust(), now)
+            .unwrap();
+        assert_eq!(
+            active
+                .iter()
+                .filter_map(|o| o.payload.app_presentation.as_ref())
+                .collect::<Vec<_>>(),
+            vec![&presentation]
+        );
+    }
+
+    #[test]
+    fn provision_without_a_presentation_leaves_the_offer_snapshot_free() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = store(&dir);
+        let credential = data_tunnel_credential();
+        let now = now_unix();
+
+        let offer = provision_relay_stream_offer(
+            &mut store,
+            &credential,
+            RelayStreamResource::Pty,
+            static_pub(),
+            ENDPOINT.to_string(),
+            credential.expires_at,
+            &owner_signer(),
+            &relay_stream_issuer_trust(),
+            now,
+            None,
+        )
+        .unwrap();
+
+        assert!(offer.payload.app_presentation.is_none());
+    }
+
     #[test]
     fn provision_stores_active_offer_verifiable_by_audience() {
         let dir = tempfile::tempdir().unwrap();
@@ -207,6 +299,7 @@ mod tests {
             &owner_signer(),
             &relay_stream_issuer_trust(),
             now,
+            None,
         )
         .unwrap();
 
@@ -246,6 +339,7 @@ mod tests {
             &owner_signer(),
             &relay_stream_issuer_trust(),
             now,
+            None,
         )
         .unwrap();
         let second = provision_relay_stream_offer(
@@ -258,6 +352,7 @@ mod tests {
             &owner_signer(),
             &relay_stream_issuer_trust(),
             now,
+            None,
         )
         .unwrap();
 
@@ -370,6 +465,7 @@ mod tests {
             &owner_signer(),
             &relay_stream_issuer_trust(),
             now,
+            None,
         )
         .unwrap_err();
 
@@ -397,6 +493,7 @@ mod tests {
             &attacker_signer(),
             &relay_stream_issuer_trust(),
             now,
+            None,
         )
         .unwrap_err();
 
@@ -427,6 +524,7 @@ mod tests {
             &owner_signer(),
             &relay_stream_issuer_trust(),
             now,
+            None,
         )
         .unwrap_err();
 

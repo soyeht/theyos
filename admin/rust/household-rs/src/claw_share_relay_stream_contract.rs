@@ -125,6 +125,80 @@ pub struct RelayStreamOfferPayload {
     /// downgraded to Device (or across modes) without breaking the signature.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub authz: Option<RelayStreamAudience>,
+    /// Slice B (ADDITIVE, optional). Stable Share app presentation for the
+    /// Device+ClawSite path: the app identity, current display name, and
+    /// owner display name AT MINT TIME. This is a signed SNAPSHOT for
+    /// presentation, never an authority — routing and authorization key on
+    /// `claw_id`/live checks, and a later rename does not invalidate the
+    /// offer. `None` is omitted from the wire, so an offer WITHOUT this
+    /// field keeps the exact canonical CBOR, signature, and v2 fixtures it
+    /// had before the field existed; `Some(_)` is covered by the signature
+    /// and the Noise prologue like every other field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub app_presentation: Option<ShareableAppPresentation>,
+}
+
+/// Slice B: the signed app presentation embedded in a Device+ClawSite offer.
+/// Constructed through [`Self::try_new`] at mint call sites (provision is
+/// required to use it; `RelayStreamOfferContract::sign` does NOT validate)
+/// and re-validated by the payload's `validate` at verify: `app_id` is the
+/// pinned Share identity shape (`app_` + 32 lowercase hex), both names are
+/// nonempty and length-bounded. `deny_unknown_fields` is load-bearing, not
+/// hygiene: an ignored nested key would vanish on the re-encode used by
+/// signature verification, accepting bytes that were never authenticated.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ShareableAppPresentation {
+    pub app_id: String,
+    pub display_name: String,
+    pub owner_display_name: String,
+}
+
+/// `app_` + 32 lowercase hex = 128 bits CSPRNG (pinned `shareable_apps` id).
+const SHARE_APP_ID_PREFIX: &str = "app_";
+const SHARE_APP_ID_HEX_LEN: usize = 32;
+const SHARE_PRESENTATION_NAME_MAX_CHARS: usize = 128;
+
+impl ShareableAppPresentation {
+    pub fn try_new(
+        app_id: impl Into<String>,
+        display_name: impl Into<String>,
+        owner_display_name: impl Into<String>,
+    ) -> Result<Self, RelayStreamContractError> {
+        let presentation = Self {
+            app_id: app_id.into(),
+            display_name: display_name.into(),
+            owner_display_name: owner_display_name.into(),
+        };
+        presentation.validate()?;
+        Ok(presentation)
+    }
+
+    fn validate(&self) -> Result<(), RelayStreamContractError> {
+        let hex = self
+            .app_id
+            .strip_prefix(SHARE_APP_ID_PREFIX)
+            .filter(|hex| {
+                hex.len() == SHARE_APP_ID_HEX_LEN
+                    && hex
+                        .chars()
+                        .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
+            })
+            .ok_or(RelayStreamContractError::InvalidPresentation(
+                "app_id",
+            ))?;
+        let _ = hex;
+        for (name, field) in [
+            (&self.display_name, "display_name"),
+            (&self.owner_display_name, "owner_display_name"),
+        ] {
+            let len = name.chars().count();
+            if len == 0 || len > SHARE_PRESENTATION_NAME_MAX_CHARS || name.trim().is_empty() {
+                return Err(RelayStreamContractError::InvalidPresentation(field));
+            }
+        }
+        Ok(())
+    }
 }
 
 /// Fase E2: how a `relay_stream` offer is authorized at the dial gate. The offer's
@@ -143,6 +217,25 @@ pub enum RelayStreamAudience {
     Public,
 }
 
+/// Fail closed on resource/audience combinations that would turn a broadly
+/// shared offer into an interactive shell on the engine host. Device remains
+/// the only audience allowed to request PTY until the target router can attach
+/// the session to the selected isolated instance.
+fn validate_resource_for_audience(
+    resource: RelayStreamResource,
+    audience: &RelayStreamAudience,
+) -> Result<(), RelayStreamContractError> {
+    if resource == RelayStreamResource::Pty
+        && matches!(
+            audience,
+            RelayStreamAudience::Group { .. } | RelayStreamAudience::Public
+        )
+    {
+        return Err(RelayStreamContractError::PtyForbiddenForSharedAudience);
+    }
+    Ok(())
+}
+
 pub struct RelayStreamOfferMintInput<'a> {
     pub rendezvous_token: RendezvousToken,
     pub credential: &'a GuestCredential,
@@ -152,6 +245,11 @@ pub struct RelayStreamOfferMintInput<'a> {
     pub claw_static_pub: RelayStreamClawStaticPublicKey,
     pub not_after: u64,
     pub now_unix: u64,
+    /// Owned so the caller hands over a already-validated snapshot
+    /// (`ShareableAppPresentation::try_new`); the mint copies it onto the
+    /// payload before signing and does NOT re-validate — `verify` does, via
+    /// the payload's `validate`.
+    pub app_presentation: Option<ShareableAppPresentation>,
 }
 
 impl fmt::Debug for RelayStreamOfferMintInput<'_> {
@@ -171,6 +269,10 @@ impl fmt::Debug for RelayStreamOfferMintInput<'_> {
             .field("claw_static_pub", &self.claw_static_pub)
             .field("not_after", &self.not_after)
             .field("now_unix", &self.now_unix)
+            // Presence only: the snapshot carries human names
+            // (`display_name`, `owner_display_name`), which must never reach a
+            // log line.
+            .field("app_presentation", &self.app_presentation.is_some())
             .finish()
     }
 }
@@ -193,7 +295,7 @@ pub fn mint_relay_stream_offer(
         return Err(RelayStreamContractError::MintNotAfterExceedsCredentialExpiry);
     }
 
-    let payload = RelayStreamOfferPayload::new(
+    let mut payload = RelayStreamOfferPayload::new(
         input.rendezvous_token,
         input.credential.claw_id.clone(),
         input.credential.slot_id.clone(),
@@ -204,6 +306,12 @@ pub fn mint_relay_stream_offer(
         input.claw_static_pub,
         input.not_after,
     );
+    // Copied BEFORE signing so the snapshot is covered by the signature like
+    // every other field. Assigned rather than passed through
+    // `RelayStreamOfferPayload::new` on purpose: `new` has 19 call sites, and
+    // this mirrors how `authz` is already set (target_router.rs). No validation
+    // here — `try_new` guarded it at the caller, and `verify` revalidates.
+    payload.app_presentation = input.app_presentation;
     RelayStreamOfferContract::sign(payload, owner_key)
 }
 
@@ -232,6 +340,11 @@ pub fn mint_relay_stream_group_offer(
     now_unix: u64,
     owner_key: &dyn IdentityKey,
 ) -> Result<RelayStreamOfferContract, RelayStreamContractError> {
+    let audience = RelayStreamAudience::Group {
+        group_id,
+        member_id,
+    };
+    validate_resource_for_audience(resource, &audience)?;
     if not_after <= now_unix {
         return Err(RelayStreamContractError::Expired);
     }
@@ -246,10 +359,7 @@ pub fn mint_relay_stream_group_offer(
         claw_static_pub,
         not_after,
     )
-    .with_authz(RelayStreamAudience::Group {
-        group_id,
-        member_id,
-    });
+    .with_authz(audience);
     RelayStreamOfferContract::sign(payload, owner_key)
 }
 
@@ -273,6 +383,7 @@ pub fn mint_relay_stream_public_offer(
     now_unix: u64,
     owner_key: &dyn IdentityKey,
 ) -> Result<RelayStreamOfferContract, RelayStreamContractError> {
+    validate_resource_for_audience(resource, &RelayStreamAudience::Public)?;
     if not_after <= now_unix {
         return Err(RelayStreamContractError::Expired);
     }
@@ -368,6 +479,7 @@ impl RelayStreamOfferPayload {
             claw_static_pub,
             not_after,
             authz: None,
+            app_presentation: None,
         }
     }
 
@@ -399,6 +511,26 @@ impl RelayStreamOfferPayload {
         if self.not_after <= now_unix {
             return Err(RelayStreamContractError::Expired);
         }
+        validate_resource_for_audience(self.resource, &self.audience())?;
+        if let Some(presentation) = &self.app_presentation {
+            presentation.validate()?;
+            // Namespace fences: the signed snapshot may exist ONLY on the
+            // Device+ClawSite path it was designed for, and it must describe
+            // THIS offer's claw — a covered signature over two contradictory
+            // values is still a contradiction.
+            if self.audience() != RelayStreamAudience::Device
+                || self.resource != RelayStreamResource::ClawSite
+            {
+                return Err(RelayStreamContractError::InvalidPresentation(
+                    "audience-resource",
+                ));
+            }
+            if presentation.app_id != self.claw_id {
+                return Err(RelayStreamContractError::InvalidPresentation(
+                    "app_id-claw-mismatch",
+                ));
+            }
+        }
         Ok(())
     }
 }
@@ -418,6 +550,11 @@ impl fmt::Debug for RelayStreamOfferPayload {
             .field("claw_static_pub", &self.claw_static_pub)
             .field("not_after", &self.not_after)
             .field("authz", &self.authz)
+            // Presence only, same reason as the mint input's Debug: the
+            // snapshot holds `display_name`/`owner_display_name`. The derived
+            // Debug on ShareableAppPresentation itself is deliberately left
+            // intact — this is about what a payload log line emits.
+            .field("app_presentation", &self.app_presentation.is_some())
             .finish()
     }
 }
@@ -713,6 +850,12 @@ pub enum RelayStreamContractError {
     #[error("relay stream offer audience did not match expected guest")]
     AudienceMismatch,
 
+    #[error("relay stream PTY is forbidden for group and public audiences")]
+    PtyForbiddenForSharedAudience,
+
+    #[error("relay stream app presentation field is invalid: {0}")]
+    InvalidPresentation(&'static str),
+
     #[error("relay stream offer not_after exceeds credential expiry")]
     MintNotAfterExceedsCredentialExpiry,
 
@@ -743,6 +886,16 @@ mod tests {
 
     const NOW: u64 = 1_800_000_000;
     const NOT_AFTER: u64 = NOW + 60;
+
+    /// CBOR map header `ab` = map(11): exactly the 11 v2 fields, authz omitted
+    /// (a Some(authz) offer would be `ac`/map(12)). This IS the byte-identity
+    /// anchor — the Swift fixture must pin this same literal. Module-scoped so
+    /// the payload fixture and the mint-path test share ONE copy; two hand-kept
+    /// copies of the same hex would drift silently.
+    const EXPECTED_OFFER_V2_AUTHZ_NONE_HEX: &str = "ab617602646b696e64781d636c61772d73686172652f72656c61792d73747265616d2d6f6666657267636c61775f69646a636c61775f616c70686167736c6f745f69645022222222222222222222222222222222687265736f7572636563707479696e6f745f61667465721a6b49d23c6d65787065637465645f706174686c72656c61795f73747265616d6e72656c61795f656e64706f696e74781e72656c61792d73747265616d3a2f2f3132372e302e302e313a34393135326f636c61775f7374617469635f707562582033333333333333333333333333333333333333333333333333333333333333337067756573745f6465766963655f70756258210351a7580833898ea1b183cbd7350a4099078c6ef1c1e18e970cd7683035f25e7d7072656e64657a766f75735f746f6b656e5042424242424242424242424242424242";
+
+    /// The wire key, as bytes, for the omitted-when-None assertion.
+    const SHARE_APP_PRESENTATION_KEY: &[u8] = b"app_presentation";
 
     fn signer() -> P256Keypair {
         P256Keypair::from_secret_scalar(&[0x11; 32]).unwrap()
@@ -927,6 +1080,50 @@ mod tests {
         assert!(check_relay_stream_public(&unpub, "claw_alpha").is_err());
     }
 
+    #[test]
+    fn pty_is_refused_for_group_and_public_audiences() {
+        // Device is the deliberately retained 1:1, owner-approved PTY path.
+        let credential = credential();
+        mint_relay_stream_offer(mint_input_for(&credential), &signer())
+            .expect("Device audience must retain PTY access");
+
+        let group = mint_relay_stream_group_offer(
+            token(0x42),
+            SlotId([0x99; 16]),
+            "g".to_string(),
+            "g_a".to_string(),
+            member_device().public(),
+            "claw_alpha".to_string(),
+            RelayStreamResource::Pty,
+            "relay-stream://127.0.0.1:49152".to_string(),
+            static_pub(0x33),
+            NOT_AFTER,
+            NOW,
+            &signer(),
+        );
+        assert!(matches!(
+            group,
+            Err(RelayStreamContractError::PtyForbiddenForSharedAudience)
+        ));
+
+        let public = mint_relay_stream_public_offer(
+            token(0x42),
+            SlotId([0x98; 16]),
+            guest_pub(),
+            "claw_alpha".to_string(),
+            RelayStreamResource::Pty,
+            "relay-stream://127.0.0.1:49152".to_string(),
+            static_pub(0x33),
+            NOT_AFTER,
+            NOW,
+            &signer(),
+        );
+        assert!(matches!(
+            public,
+            Err(RelayStreamContractError::PtyForbiddenForSharedAudience)
+        ));
+    }
+
     fn attacker() -> P256Keypair {
         P256Keypair::from_secret_scalar(&[0x55; 32]).unwrap()
     }
@@ -1057,6 +1254,7 @@ mod tests {
             claw_static_pub: static_pub(0x33),
             not_after: NOT_AFTER,
             now_unix: NOW,
+            app_presentation: None,
         }
     }
 
@@ -1090,7 +1288,7 @@ mod tests {
             "g_a".to_string(),
             member_device().public(),
             "claw_alpha".to_string(),
-            RelayStreamResource::Pty,
+            RelayStreamResource::ClawSite,
             "relay-stream://127.0.0.1:49152".to_string(),
             static_pub(0x33),
             NOT_AFTER,
@@ -1116,7 +1314,7 @@ mod tests {
             SlotId([0x98; 16]),
             guest_pub(),
             "claw_alpha".to_string(),
-            RelayStreamResource::Pty,
+            RelayStreamResource::ClawSite,
             "relay-stream://127.0.0.1:49152".to_string(),
             static_pub(0x33),
             NOT_AFTER,
@@ -1242,6 +1440,7 @@ mod tests {
             claw_static_pub: static_pub(0x33),
             not_after: NOT_AFTER,
             now_unix: NOW,
+            app_presentation: None,
         };
         let debug = format!("{input:?}");
 
@@ -1467,20 +1666,28 @@ mod tests {
                 payload.relay_endpoint = "relay-stream://127.0.0.1:49153".to_string();
             }),
             signed_offer_with(|payload| payload.not_after = NOT_AFTER + 1),
-            // Fase E2: the audience mode is bound into the prologue (via the
-            // embedded offer_payload_cbor), so a Group/Public offer can never
-            // share a transcript with the Device offer it would be downgraded to.
-            signed_offer_with(|payload| {
-                payload.authz = Some(RelayStreamAudience::Group {
-                    group_id: "g".to_string(),
-                    member_id: "g_a".to_string(),
-                });
-            }),
         ];
 
         for variant in variants {
             assert_ne!(noise_prologue_for(&variant), base);
         }
+
+        // Fase E2: compare an allowed resource so the audience binding is
+        // exercised independently of the shared-audience PTY policy.
+        let device_clawsite = signed_offer_with(|payload| {
+            payload.resource = RelayStreamResource::ClawSite;
+        });
+        let group_clawsite = signed_offer_with(|payload| {
+            payload.resource = RelayStreamResource::ClawSite;
+            payload.authz = Some(RelayStreamAudience::Group {
+                group_id: "g".to_string(),
+                member_id: "g_a".to_string(),
+            });
+        });
+        assert_ne!(
+            noise_prologue_for(&group_clawsite),
+            noise_prologue_for(&device_clawsite)
+        );
     }
 
     #[test]
@@ -1527,6 +1734,7 @@ mod tests {
         // upgraded to Group, without breaking the owner signature.
         let group = || {
             signed_offer_with(|payload| {
+                payload.resource = RelayStreamResource::ClawSite;
                 payload.authz = Some(RelayStreamAudience::Group {
                     group_id: "g".to_string(),
                     member_id: "g_a".to_string(),
@@ -1554,7 +1762,9 @@ mod tests {
         ));
 
         // Reverse: a signed Device offer (authz None) cannot be upgraded to Group.
-        let mut upgraded = signed_offer();
+        let mut upgraded = signed_offer_with(|payload| {
+            payload.resource = RelayStreamResource::ClawSite;
+        });
         upgraded.payload.authz = Some(RelayStreamAudience::Group {
             group_id: "g".to_string(),
             member_id: "g_a".to_string(),
@@ -1644,11 +1854,6 @@ mod tests {
     // 1_800_000_060.
     #[test]
     fn cross_language_fixture_relay_stream_offer_authz_none_v2_hex() {
-        // CBOR map header `ab` = map(11): exactly the 11 v2 fields, authz omitted
-        // (a Some(authz) offer would be `ac`/map(12)). This IS the byte-identity
-        // anchor — the Swift fixture must pin this same literal.
-        const EXPECTED_OFFER_V2_AUTHZ_NONE_HEX: &str = "ab617602646b696e64781d636c61772d73686172652f72656c61792d73747265616d2d6f6666657267636c61775f69646a636c61775f616c70686167736c6f745f69645022222222222222222222222222222222687265736f7572636563707479696e6f745f61667465721a6b49d23c6d65787065637465645f706174686c72656c61795f73747265616d6e72656c61795f656e64706f696e74781e72656c61792d73747265616d3a2f2f3132372e302e302e313a34393135326f636c61775f7374617469635f707562582033333333333333333333333333333333333333333333333333333333333333337067756573745f6465766963655f70756258210351a7580833898ea1b183cbd7350a4099078c6ef1c1e18e970cd7683035f25e7d7072656e64657a766f75735f746f6b656e5042424242424242424242424242424242";
-
         let payload = RelayStreamOfferPayload::new(
             token(0x42),
             "claw_alpha".to_string(),
@@ -1759,6 +1964,293 @@ mod tests {
             hex::encode(&bytes),
             EXPECTED_OFFER_V2_AUTHZ_PUBLIC_HEX,
             "relay_stream Public offer v2 wire drift — regenerate the Swift fixture in lockstep"
+        );
+    }
+
+    // ── Slice B: signed app presentation ────────────────────────────────────
+
+    /// A credential whose `claw_id` IS a valid Share app id. The presentation
+    /// fence requires `presentation.app_id == payload.claw_id`, and the mint
+    /// takes `claw_id` from the credential — so satisfying the fence honestly
+    /// means minting from a credential like this, never relaxing the check.
+    fn app_credential(app_id: &str) -> GuestCredential {
+        GuestCredential::sign(
+            derive_household_id(&owner_pub()),
+            derive_person_id(&owner_pub()),
+            owner_pub(),
+            app_id.to_string(),
+            guest_pub(),
+            SlotId([0x22; 16]),
+            NOW - 60,
+            NOW + 600,
+            &signer(),
+        )
+        .unwrap()
+    }
+
+    fn share_app_id() -> String {
+        format!("app_{:032x}", 0x5eed_u128)
+    }
+
+    #[test]
+    fn mint_without_presentation_stays_byte_identical_to_the_pinned_v2_fixture() {
+        let credential = credential();
+        let offer = mint_relay_stream_offer(mint_input_for(&credential), &signer()).unwrap();
+        let bytes = offer.payload.to_canonical_bytes().unwrap();
+
+        assert!(
+            !bytes
+                .windows(SHARE_APP_PRESENTATION_KEY.len())
+                .any(|w| w == SHARE_APP_PRESENTATION_KEY),
+            "app_presentation must be omitted from the wire when None"
+        );
+        // The anchor: adding the field to the mint input must not move a single
+        // byte of an offer that does not carry a snapshot.
+        assert_eq!(
+            hex::encode(&bytes),
+            EXPECTED_OFFER_V2_AUTHZ_NONE_HEX,
+            "minting with app_presentation: None disturbed the v2 wire"
+        );
+    }
+
+    #[test]
+    fn mint_carries_the_presentation_into_the_signed_payload() {
+        let app_id = share_app_id();
+        let credential = app_credential(&app_id);
+        let presentation =
+            ShareableAppPresentation::try_new(app_id.clone(), "Study", "Caio").unwrap();
+        let input = RelayStreamOfferMintInput {
+            resource: RelayStreamResource::ClawSite,
+            app_presentation: Some(presentation.clone()),
+            ..mint_input_for(&credential)
+        };
+
+        let offer = mint_relay_stream_offer(input, &signer()).unwrap();
+
+        // Not silently dropped between the input and the payload.
+        assert_eq!(offer.payload.app_presentation.as_ref(), Some(&presentation));
+        assert_eq!(offer.payload.claw_id, app_id);
+        // And covered by the signature: verify re-runs the whole fence
+        // (Device + ClawSite + app_id == claw_id) and must accept.
+        offer.verify_owner_signature(&owner_pub(), NOW).unwrap();
+        offer
+            .verify_for_audience(&owner_pub(), &guest_pub(), NOW)
+            .unwrap();
+    }
+
+    #[test]
+    fn mint_input_and_payload_debug_show_presence_without_names() {
+        let app_id = share_app_id();
+        let credential = app_credential(&app_id);
+        let presentation =
+            ShareableAppPresentation::try_new(app_id.clone(), "Study", "Caio").unwrap();
+        let input = RelayStreamOfferMintInput {
+            resource: RelayStreamResource::ClawSite,
+            app_presentation: Some(presentation),
+            ..mint_input_for(&credential)
+        };
+        let input_debug = format!("{input:?}");
+        let offer = mint_relay_stream_offer(input, &signer()).unwrap();
+        let payload_debug = format!("{:?}", offer.payload);
+
+        for (label, text) in [("mint input", &input_debug), ("payload", &payload_debug)] {
+            assert!(
+                text.contains("app_presentation: true"),
+                "{label} Debug must record that a snapshot is present"
+            );
+            assert!(!text.contains("Study"), "{label} Debug leaked display_name");
+            assert!(
+                !text.contains("Caio"),
+                "{label} Debug leaked owner_display_name"
+            );
+        }
+
+        // The derived Debug on the type ITSELF is deliberately left intact —
+        // the redaction belongs to the log-bearing containers, not the value.
+        let direct = format!(
+            "{:?}",
+            ShareableAppPresentation::try_new(app_id, "Study", "Caio").unwrap()
+        );
+        assert!(direct.contains("Study") && direct.contains("Caio"));
+    }
+
+    fn device_clawsite_payload() -> RelayStreamOfferPayload {
+        let mut payload = payload();
+        payload.claw_id = format!("app_{:032x}", 0x5eed_u128);
+        payload.resource = RelayStreamResource::ClawSite;
+        payload
+    }
+
+    fn presentation_for(payload: &RelayStreamOfferPayload) -> ShareableAppPresentation {
+        ShareableAppPresentation::try_new(
+            payload.claw_id.clone(),
+            "Study",
+            "Caio",
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn presentation_round_trips_signed_and_tampering_breaks_verify() {
+        let mut payload = device_clawsite_payload();
+        payload.app_presentation = Some(presentation_for(&payload));
+
+        let bytes = payload.to_canonical_bytes().unwrap();
+        let decoded: RelayStreamOfferPayload = crate::cbor::from_canonical_slice(&bytes).unwrap();
+        assert_eq!(decoded, payload);
+
+        let contract = RelayStreamOfferContract::sign(payload.clone(), &signer()).unwrap();
+        contract.verify(&signer().public(), NOW).unwrap();
+
+        // The snapshot is INSIDE the signature: editing any presentation field
+        // after minting breaks verification.
+        let mut tampered = contract.clone();
+        tampered
+            .payload
+            .app_presentation
+            .as_mut()
+            .unwrap()
+            .display_name = "Other App".to_string();
+        assert!(matches!(
+            tampered.verify(&signer().public(), NOW),
+            Err(RelayStreamContractError::SignatureRejected)
+        ));
+    }
+
+    #[test]
+    fn presentation_is_rejected_outside_device_clawsite() {
+        // Group audience with presentation: namespace violation even though
+        // the signature would cover it.
+        let mut group = device_clawsite_payload();
+        group.app_presentation = Some(presentation_for(&group));
+        group.authz = Some(RelayStreamAudience::Group {
+            group_id: "g".to_string(),
+            member_id: "g_a".to_string(),
+        });
+        let group = RelayStreamOfferContract::sign(group, &signer()).unwrap();
+        assert!(matches!(
+            group.verify(&signer().public(), NOW),
+            Err(RelayStreamContractError::InvalidPresentation(
+                "audience-resource"
+            ))
+        ));
+
+        // Public audience with presentation.
+        let mut public = device_clawsite_payload();
+        public.app_presentation = Some(presentation_for(&public));
+        public.authz = Some(RelayStreamAudience::Public);
+        let public = RelayStreamOfferContract::sign(public, &signer()).unwrap();
+        assert!(matches!(
+            public.verify(&signer().public(), NOW),
+            Err(RelayStreamContractError::InvalidPresentation(
+                "audience-resource"
+            ))
+        ));
+
+        // Device + Pty with presentation: legacy PTY must not grow a Share
+        // presentation.
+        let mut pty = device_clawsite_payload();
+        pty.app_presentation = Some(presentation_for(&pty));
+        pty.resource = RelayStreamResource::Pty;
+        let pty = RelayStreamOfferContract::sign(pty, &signer()).unwrap();
+        assert!(matches!(
+            pty.verify(&signer().public(), NOW),
+            Err(RelayStreamContractError::InvalidPresentation(
+                "audience-resource"
+            ))
+        ));
+
+        // Device + IpTunnel with presentation: Product A/nvpn boundary.
+        let mut ip_tunnel = device_clawsite_payload();
+        ip_tunnel.app_presentation = Some(presentation_for(&ip_tunnel));
+        ip_tunnel.resource = RelayStreamResource::IpTunnel;
+        let ip_tunnel = RelayStreamOfferContract::sign(ip_tunnel, &signer()).unwrap();
+        assert!(matches!(
+            ip_tunnel.verify(&signer().public(), NOW),
+            Err(RelayStreamContractError::InvalidPresentation(
+                "audience-resource"
+            ))
+        ));
+    }
+
+    #[test]
+    fn presentation_app_id_must_equal_offer_claw_id() {
+        let mut payload = device_clawsite_payload();
+        let mut presentation = presentation_for(&payload);
+        presentation.app_id = format!("app_{:032x}", 0xdead_u128);
+        payload.app_presentation = Some(presentation);
+        let contract = RelayStreamOfferContract::sign(payload, &signer()).unwrap();
+        assert!(matches!(
+            contract.verify(&signer().public(), NOW),
+            Err(RelayStreamContractError::InvalidPresentation(
+                "app_id-claw-mismatch"
+            ))
+        ));
+    }
+
+    #[test]
+    fn presentation_validates_id_shape_and_names() {
+        let app_id = format!("app_{:032x}", 0x5eed_u128);
+        assert!(matches!(
+            ShareableAppPresentation::try_new("claw_alpha", "Study", "Caio"),
+            Err(RelayStreamContractError::InvalidPresentation("app_id"))
+        ));
+        for bad_name in ["", "   "] {
+            assert!(matches!(
+                ShareableAppPresentation::try_new(app_id.clone(), bad_name, "Caio"),
+                Err(RelayStreamContractError::InvalidPresentation(
+                    "display_name"
+                ))
+            ));
+            assert!(matches!(
+                ShareableAppPresentation::try_new(app_id.clone(), "Study", bad_name),
+                Err(RelayStreamContractError::InvalidPresentation(
+                    "owner_display_name"
+                ))
+            ));
+        }
+        let oversized = "x".repeat(129);
+        assert!(matches!(
+            ShareableAppPresentation::try_new(app_id.clone(), oversized, "Caio"),
+            Err(RelayStreamContractError::InvalidPresentation(
+                "display_name"
+            ))
+        ));
+    }
+
+    #[test]
+    fn presentation_nested_unknown_field_fails_closed() {
+        let mut payload = device_clawsite_payload();
+        payload.app_presentation = Some(presentation_for(&payload));
+        let bytes = payload.to_canonical_bytes().unwrap();
+
+        // Inject an extra key INSIDE the nested app_presentation map. The
+        // nested deny_unknown_fields must reject the decode: an ignored key
+        // would vanish on re-encode and let unauthenticated bytes verify.
+        let mut value: ciborium::value::Value =
+            ciborium::de::from_reader(bytes.as_slice()).unwrap();
+        let ciborium::value::Value::Map(entries) = &mut value else {
+            panic!("payload must decode to a map");
+        };
+        let presentation_entry = entries
+            .iter_mut()
+            .find(|(key, _)| matches!(key, ciborium::value::Value::Text(text) if text == "app_presentation"))
+            .expect("presentation key present");
+        let ciborium::value::Value::Map(nested) = &mut presentation_entry.1 else {
+            panic!("presentation must be a map");
+        };
+        nested.push((
+            ciborium::value::Value::Text("evil".to_string()),
+            ciborium::value::Value::Text("injected".to_string()),
+        ));
+        let mut poisoned = Vec::new();
+        ciborium::ser::into_writer(&value, &mut poisoned).unwrap();
+
+        let decoded: Result<RelayStreamOfferPayload, _> =
+            crate::cbor::from_canonical_slice(&poisoned);
+        assert!(
+            decoded.is_err(),
+            "a nested unknown field must fail the decode, not be silently dropped"
         );
     }
 }

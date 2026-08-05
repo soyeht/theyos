@@ -300,6 +300,8 @@ mod tests {
             claw_id: "claw_test".to_string(),
             expires_at: 1_800_086_400,
             state: SlotState::Open,
+            app_presentation: None,
+            created_at: None,
         })
         .unwrap();
         s.consume_atomic(&SLOT, "claw_test", guest().public(), 1_800_000_001)
