@@ -10,6 +10,12 @@ path = "src/lib.rs"
 
 [features]
 default = []
+# Lane R (@ilia): exposes the D1 membership-projection surface used by the
+# not-yet-landed runtime facade. Mirrors keystore-rs's own `mesh-session`
+# feature pattern exactly — household-rs -> mesh-session-core-rs (excluded
+# from this workspace, see admin/rust/Cargo.toml) is a legitimate edge,
+# household-rs never depends on the facade crate itself.
+mesh-session-runtime = ["dep:mesh-session-core-rs"]
 
 [dependencies]
 serde         = { workspace = true }
@@ -39,6 +45,7 @@ base64        = { workspace = true }
 core-rs       = { workspace = true }
 keystore-rs   = { workspace = true }
 store-rs      = { workspace = true }
+mesh-session-core-rs = { path = "../mesh-session-core-rs", optional = true }
 # S0: the neutral wire mechanics moved out of this crate so the boundary is a
 # dependency edge `cargo check` enforces, not a grep. The edge runs THIS way
 # only — product depends on neutral, never the reverse.
@@ -77,6 +84,19 @@ webauthn-authenticator-rs = { version = "0.5.5", default-features = false, featu
 # by @kiana for this purpose — not added to the workspace-wide dependency
 # set.
 trybuild      = "1"
+# Lane R (@ilia, authorized 2026-08-05): unconditionally available for
+# TEST builds only (coexists with the optional, `mesh-session-runtime`-
+# gated entry in [dependencies] above, which alone governs whether this
+# crate is reachable from a normal library build). `test-support` unlocks
+# `D1MembershipKey::new_for_test`, needed so this crate's own REDs can
+# exercise the real `SealedBinding::from_membership_key` wrapper end to
+# end, not just the private `validate_membership_fields` helper — that
+# crate's `new` is `pub(crate)`, unreachable from here otherwise. The
+# feature-gated test functions that use this stay behind
+# `#[cfg(feature = "mesh-session-runtime")]` regardless, so a plain
+# `cargo test` (no `--features`) still compiles none of them even though
+# this dependency itself is always resolved for test builds.
+mesh-session-core-rs = { path = "../mesh-session-core-rs", features = ["test-support"] }
 
 [lints]
 workspace = true

@@ -1169,6 +1169,37 @@ impl D1MembershipKey {
         }
     }
 
+    /// Lane R (@ilia, authorized 2026-08-05, scoped to exactly this):
+    /// the runtime facade's own tests need a real `D1MembershipKey` to
+    /// exercise `household-rs::SealedBinding::from_membership_key`
+    /// end to end — this crate's own `new` is `pub(crate)` and its only
+    /// two real construction sites
+    /// (`run_responder_handshake`/`run_initiator_handshake`) are
+    /// `pub(crate)` too, genuinely unreachable from any other crate. This
+    /// is the escape hatch, gated `test-support`, mirroring
+    /// `mesh-session-control-model-rs`'s own `_for_test` convention
+    /// exactly (`ControlRecordCell::load_canonical_for_test`, etc.) —
+    /// see the `compile_fail` doctest in `src/lib.rs` proving this does
+    /// not exist in a default build.
+    #[cfg(feature = "test-support")]
+    pub fn new_for_test(
+        session_id: Vec<u8>,
+        hh_id: String,
+        peer_m_id: String,
+        peer_cert_fingerprint: Vec<u8>,
+        checkpoint_hash: Vec<u8>,
+        checkpoint_sequence: u64,
+    ) -> Self {
+        Self::new(
+            session_id,
+            hh_id,
+            peer_m_id,
+            peer_cert_fingerprint,
+            checkpoint_hash,
+            checkpoint_sequence,
+        )
+    }
+
     pub fn session_id(&self) -> &[u8] {
         &self.session_id
     }

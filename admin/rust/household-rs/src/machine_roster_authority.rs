@@ -2193,11 +2193,436 @@ impl SealedBinding {
     }
 }
 
+// ─── Runtime-facade membership projection (Lane R, @ilia) ──────────────────
+//
+// Feature-gated: only compiled when `mesh-session-runtime` is enabled.
+// `D1MembershipKey` (mesh-session-core-rs) is the ceremony's own
+// capability — constructed only by that crate's own handshake code,
+// after `verify_frame` + delegation + checkpoint all succeed (and after
+// nonce consumption), carrying 6 fields: `session_id`, `hh_id`,
+// `peer_m_id`, `peer_cert_fingerprint`, `checkpoint_hash`,
+// `checkpoint_sequence`. `session_id` is a ceremony-freshness token that
+// belongs entirely to the core/D1 admission layer (its own nonce ledger
+// already closes replay) — it is deliberately never read here and never
+// enters `SealedBinding`. The other 5 fields are compared, in full,
+// against the CURRENT roster snapshot before a `SealedBinding` is ever
+// produced — a stronger check than `from_responding_peer` above, which
+// never had `peer_cert_fingerprint` to compare against at all.
+//
+// Error is a single, opaque, fieldless type — see `MembershipKeyRejected`
+// and `validate_membership_fields`'s own doc for exactly how "no oracle"
+// is enforced structurally, not just by convention.
+
+#[cfg(feature = "mesh-session-runtime")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MembershipKeyRejected;
+
+#[cfg(feature = "mesh-session-runtime")]
+impl std::fmt::Display for MembershipKeyRejected {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "membership key rejected")
+    }
+}
+
+#[cfg(feature = "mesh-session-runtime")]
+impl std::error::Error for MembershipKeyRejected {}
+
+#[cfg(feature = "mesh-session-runtime")]
+impl SealedBinding {
+    /// Projects a real `D1MembershipKey` into a `SealedBinding`, or
+    /// rejects it. `session_id` is read by nothing here — see the module
+    /// comment above.
+    ///
+    /// **Declared partition (2026-08-05, @ilia audit of `29dc6139`,
+    /// independently verified line-by-line, narrowed by @zain's
+    /// structural analysis — not a defect, but undeclared before this
+    /// note, which promised more than the code delivered):** `peer_m_id`
+    /// does NOT go through the same unconditional-then-combine path as
+    /// the other 4 fields. It is resolved by roster lookup FIRST, with
+    /// two early returns — revoked, then absent — both completing before
+    /// any of the 4 comparisons below ever run. `MembershipKeyRejected`
+    /// itself still leaks nothing (no variant, no field, identical
+    /// `Display`/`Debug` on every path), but the CONTROL FLOW differs,
+    /// and is timing-distinguishable, from "m_id valid but one of the
+    /// other 4 fields wrong." Accepted as-is, not closed, because calling
+    /// this function already requires holding the exact
+    /// `&RosterSnapshotView` the m_id would be looked up against — a
+    /// caller who can observe this distinction could have read the
+    /// roster directly and learned the same thing; the check reveals
+    /// only existence/revocation status the caller's own snapshot already
+    /// carries, never a secret. **This condition is load-bearing: if this
+    /// code path ever becomes reachable by a principal that does NOT
+    /// already hold the snapshot, the partition stops being acceptable**
+    /// (@zain) — re-audit this note if that ever changes.
+    ///
+    /// Two DIFFERENT reasons hold the two halves of this ordering, not
+    /// one: `lookup_active` before `fingerprint_matches` needs no test at
+    /// all — it is a DATA dependency the compiler enforces
+    /// (`fingerprint_matches` reads `member.machine_cert_fingerprint()`,
+    /// and `member` IS `lookup_active`'s return value). `is_revoked`
+    /// before the 4 comparisons has no such dependency and is
+    /// behaviorally unobservable if moved — see
+    /// `membership_key_is_revoked_check_precedes_field_comparisons`
+    /// below, which pins exactly that ONE relationship, not the whole
+    /// function's shape.
+    pub fn from_membership_key(
+        key: &mesh_session_core_rs::intent::D1MembershipKey,
+        snapshot: &RosterSnapshotView,
+    ) -> Result<Self, MembershipKeyRejected> {
+        validate_membership_fields(
+            key.hh_id(),
+            key.peer_m_id(),
+            key.peer_cert_fingerprint(),
+            key.checkpoint_hash(),
+            key.checkpoint_sequence(),
+            snapshot,
+        )
+    }
+}
+
+/// The real comparison logic, factored to primitive-typed arguments so it
+/// is directly, non-vacuously testable without a real `D1MembershipKey`
+/// — its constructor is `pub(crate)` to mesh-session-core-rs, genuinely
+/// unreachable from any other crate, including this one, even in tests
+/// (verified: the only two construction sites are inside that crate's
+/// own `run_responder_handshake`/`run_initiator_handshake`, both
+/// `pub(crate)` there too).
+///
+/// Revoked/not-active is checked FIRST, matching `from_responding_peer`'s
+/// existing ordering exactly — an unavoidable, pre-existing short-circuit
+/// (there is no member to compare fields against if the `m_id` isn't
+/// active), not something new introduced here. **This IS an observable
+/// partition, and only `is_revoked`'s position within it is a genuine,
+/// pinned choice** — see `SealedBinding::from_membership_key`'s own doc
+/// for the full declaration, including why `lookup_active` before
+/// `fingerprint_matches` needs no pin at all (compiler-enforced data
+/// dependency) while `is_revoked`'s position does (no such dependency,
+/// behaviorally unobservable if moved). Past that gate, all 4 remaining
+/// field comparisons (`hh_id`, fingerprint, `checkpoint_hash`,
+/// `checkpoint_sequence`) are evaluated UNCONDITIONALLY and combined with
+/// a single `&&`, checked once — no per-field early return among THESE
+/// four, so no observable control-flow or timing difference between
+/// fingerprint being wrong and `checkpoint_sequence` being wrong
+/// specifically.
+#[cfg(feature = "mesh-session-runtime")]
+fn validate_membership_fields(
+    hh_id: &str,
+    peer_m_id: &str,
+    peer_cert_fingerprint: &[u8],
+    checkpoint_hash: &[u8],
+    checkpoint_sequence: u64,
+    snapshot: &RosterSnapshotView,
+) -> Result<SealedBinding, MembershipKeyRejected> {
+    let m_id = MachineId(peer_m_id.to_string());
+    if snapshot.is_revoked(&m_id) {
+        return Err(MembershipKeyRejected);
+    }
+    let member = snapshot.lookup_active(&m_id).ok_or(MembershipKeyRejected)?;
+
+    let hh_id_matches = hh_id == snapshot.hh_id().0.as_str();
+    let fingerprint_matches = peer_cert_fingerprint == member.machine_cert_fingerprint().as_slice();
+    let checkpoint_hash_matches = checkpoint_hash == snapshot.checkpoint_hash().as_slice();
+    let checkpoint_sequence_matches = checkpoint_sequence == snapshot.checkpoint_sequence();
+
+    if !(hh_id_matches
+        && fingerprint_matches
+        && checkpoint_hash_matches
+        && checkpoint_sequence_matches)
+    {
+        return Err(MembershipKeyRejected);
+    }
+
+    Ok(SealedBinding {
+        hh_id: snapshot.hh_id().clone(),
+        m_id,
+        machine_cert_fingerprint: member.machine_cert_fingerprint(),
+        checkpoint_hash: snapshot.checkpoint_hash(),
+        checkpoint_sequence: snapshot.checkpoint_sequence(),
+    })
+}
+
 // ─── Tests ──────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ─── Lane R (@ilia): membership-key projection REDs ─────────────────
+
+    #[cfg(feature = "mesh-session-runtime")]
+    #[allow(clippy::too_many_arguments)]
+    fn membership_test_snapshot(
+        hh_id: &str,
+        m_id: &str,
+        fingerprint: [u8; 32],
+        checkpoint_hash: [u8; 32],
+        checkpoint_sequence: u64,
+        revoked: bool,
+    ) -> RosterSnapshotView {
+        let hh_id = HouseholdId(hh_id.to_string());
+        let machine_id = MachineId(m_id.to_string());
+        let active = if revoked {
+            Vec::new()
+        } else {
+            vec![MachineRosterMemberV1 {
+                m_id: machine_id.clone(),
+                m_pub: crate::keys::P256PublicKey([0x02; 33]),
+                machine_cert: Vec::new(),
+                machine_cert_fingerprint: fingerprint,
+            }]
+        };
+        let tombstones = if revoked {
+            vec![MachineRosterRevocationV1 {
+                v: 1,
+                kind: "machine_roster_revocation_v1".to_string(),
+                hh_id: hh_id.clone(),
+                epoch: [1u8; 32],
+                sequence: 1,
+                prev_event_hash: [0u8; 32],
+                m_id: machine_id.clone(),
+                m_pub: crate::keys::P256PublicKey([0x02; 33]),
+                machine_cert_fingerprint: fingerprint,
+                revoked_at: 1,
+                reason: RevocationReason::OwnerAction,
+                cascade: RevocationCascade::MachineOnly,
+                owner_p_id: crate::machine_cert::PersonId("owner".to_string()),
+                owner_cert_fingerprint: [4u8; 32],
+                owner_person_cert: Vec::new(),
+                signature: crate::keys::P256Signature([7u8; 64]),
+            }]
+        } else {
+            Vec::new()
+        };
+        let data = AcceptedRosterData {
+            epoch: [1u8; 32],
+            checkpoint_sequence,
+            checkpoint_hash,
+            prev_checkpoint_hash: [0u8; 32],
+            event_sequence: 1,
+            event_head_hash: [3u8; 32],
+            predecessor_event_sequence: 0,
+            predecessor_event_head_hash: [0u8; 32],
+            issued_at: 1,
+            not_after: u64::MAX,
+            owner_cert_fingerprint: [4u8; 32],
+            genesis_basis: VerifiedGenesisRoster {
+                epoch: [1u8; 32],
+                members: Vec::new(),
+            },
+            active,
+            tombstones,
+        };
+        RosterSnapshotView::project(&hh_id, &data)
+    }
+
+    /// Real `D1MembershipKey`, via the `test-support`-gated escape hatch
+    /// — every field-mismatch RED below drives the REAL public
+    /// `SealedBinding::from_membership_key` wrapper, not the private
+    /// `validate_membership_fields` helper alone. A test that only
+    /// exercises a helper parallel to the caller cannot catch the caller
+    /// itself (@ilia) — if the wrapper ever mis-ordered its own field
+    /// extraction or passed the wrong accessor to the helper, these REDs
+    /// would still catch it; the earlier helper-only version could not.
+    /// `session_id` is a fixed, arbitrary fixture value — it is read by
+    /// nothing on either side of this call chain (see this section's own
+    /// module doc for why).
+    #[cfg(feature = "mesh-session-runtime")]
+    fn membership_key_for_test(
+        hh_id: &str,
+        peer_m_id: &str,
+        peer_cert_fingerprint: [u8; 32],
+        checkpoint_hash: [u8; 32],
+        checkpoint_sequence: u64,
+    ) -> mesh_session_core_rs::intent::D1MembershipKey {
+        mesh_session_core_rs::intent::D1MembershipKey::new_for_test(
+            b"fixture-session-id".to_vec(),
+            hh_id.to_string(),
+            peer_m_id.to_string(),
+            peer_cert_fingerprint.to_vec(),
+            checkpoint_hash.to_vec(),
+            checkpoint_sequence,
+        )
+    }
+
+    #[cfg(feature = "mesh-session-runtime")]
+    #[test]
+    fn membership_key_all_fields_match_produces_sealed_binding() {
+        let snapshot =
+            membership_test_snapshot("hh-runtime-1", "m-1", [0xAAu8; 32], [0xCCu8; 32], 7, false);
+        let key = membership_key_for_test("hh-runtime-1", "m-1", [0xAAu8; 32], [0xCCu8; 32], 7);
+        let bound = SealedBinding::from_membership_key(&key, &snapshot).unwrap();
+        assert_eq!(bound.hh_id().0, "hh-runtime-1");
+        assert_eq!(bound.m_id().0, "m-1");
+        assert_eq!(bound.machine_cert_fingerprint(), [0xAAu8; 32]);
+        assert_eq!(bound.checkpoint_hash(), [0xCCu8; 32]);
+        assert_eq!(bound.checkpoint_sequence(), 7);
+    }
+
+    #[cfg(feature = "mesh-session-runtime")]
+    #[test]
+    fn red_membership_key_hh_id_mismatch_rejected() {
+        let snapshot =
+            membership_test_snapshot("hh-runtime-1", "m-1", [0xAAu8; 32], [0xCCu8; 32], 7, false);
+        let key = membership_key_for_test("hh-DIFFERENT", "m-1", [0xAAu8; 32], [0xCCu8; 32], 7);
+        let err = SealedBinding::from_membership_key(&key, &snapshot).unwrap_err();
+        assert_eq!(err, MembershipKeyRejected);
+    }
+
+    #[cfg(feature = "mesh-session-runtime")]
+    #[test]
+    fn red_membership_key_unknown_peer_m_id_rejected() {
+        let snapshot =
+            membership_test_snapshot("hh-runtime-1", "m-1", [0xAAu8; 32], [0xCCu8; 32], 7, false);
+        let key = membership_key_for_test(
+            "hh-runtime-1",
+            "m-DOES-NOT-EXIST",
+            [0xAAu8; 32],
+            [0xCCu8; 32],
+            7,
+        );
+        let err = SealedBinding::from_membership_key(&key, &snapshot).unwrap_err();
+        assert_eq!(err, MembershipKeyRejected);
+    }
+
+    #[cfg(feature = "mesh-session-runtime")]
+    #[test]
+    fn red_membership_key_fingerprint_mismatch_rejected() {
+        let snapshot =
+            membership_test_snapshot("hh-runtime-1", "m-1", [0xAAu8; 32], [0xCCu8; 32], 7, false);
+        let key = membership_key_for_test("hh-runtime-1", "m-1", [0xFFu8; 32], [0xCCu8; 32], 7);
+        let err = SealedBinding::from_membership_key(&key, &snapshot).unwrap_err();
+        assert_eq!(err, MembershipKeyRejected);
+    }
+
+    #[cfg(feature = "mesh-session-runtime")]
+    #[test]
+    fn red_membership_key_checkpoint_hash_mismatch_rejected() {
+        let snapshot =
+            membership_test_snapshot("hh-runtime-1", "m-1", [0xAAu8; 32], [0xCCu8; 32], 7, false);
+        let key = membership_key_for_test("hh-runtime-1", "m-1", [0xAAu8; 32], [0xEEu8; 32], 7);
+        let err = SealedBinding::from_membership_key(&key, &snapshot).unwrap_err();
+        assert_eq!(err, MembershipKeyRejected);
+    }
+
+    #[cfg(feature = "mesh-session-runtime")]
+    #[test]
+    fn red_membership_key_checkpoint_sequence_mismatch_rejected() {
+        let snapshot =
+            membership_test_snapshot("hh-runtime-1", "m-1", [0xAAu8; 32], [0xCCu8; 32], 7, false);
+        let key = membership_key_for_test("hh-runtime-1", "m-1", [0xAAu8; 32], [0xCCu8; 32], 999);
+        let err = SealedBinding::from_membership_key(&key, &snapshot).unwrap_err();
+        assert_eq!(err, MembershipKeyRejected);
+    }
+
+    #[cfg(feature = "mesh-session-runtime")]
+    #[test]
+    fn red_membership_key_revoked_rejected() {
+        let snapshot =
+            membership_test_snapshot("hh-runtime-1", "m-1", [0xAAu8; 32], [0xCCu8; 32], 7, true);
+        let key = membership_key_for_test("hh-runtime-1", "m-1", [0xAAu8; 32], [0xCCu8; 32], 7);
+        let err = SealedBinding::from_membership_key(&key, &snapshot).unwrap_err();
+        assert_eq!(err, MembershipKeyRejected);
+    }
+
+    /// Key minted against an OLDER checkpoint (seq 7) is rejected once the
+    /// roster has genuinely advanced (seq 8) — even though it would have
+    /// been accepted against the exact snapshot it was minted for. Proves
+    /// temporal correctness, not just flat field equality.
+    #[cfg(feature = "mesh-session-runtime")]
+    #[test]
+    fn red_membership_key_stale_against_advanced_roster_rejected() {
+        let old_snapshot =
+            membership_test_snapshot("hh-runtime-1", "m-1", [0xAAu8; 32], [0xCCu8; 32], 7, false);
+        let key = membership_key_for_test("hh-runtime-1", "m-1", [0xAAu8; 32], [0xCCu8; 32], 7);
+        SealedBinding::from_membership_key(&key, &old_snapshot).unwrap();
+
+        let advanced_snapshot =
+            membership_test_snapshot("hh-runtime-1", "m-1", [0xAAu8; 32], [0xDDu8; 32], 8, false);
+        let err = SealedBinding::from_membership_key(&key, &advanced_snapshot).unwrap_err();
+        assert_eq!(err, MembershipKeyRejected);
+    }
+
+    /// Pins the ONE half of the declared partition (@ilia audit of
+    /// `29dc6139`, narrowed by @zain's structural analysis) that actually
+    /// needs pinning — `is_revoked`'s position relative to the 4
+    /// unconditional field comparisons.
+    ///
+    /// **The `lookup_active` → `fingerprint_matches` order is NOT pinned
+    /// here, deliberately: it needs no pin at all.** `fingerprint_matches`
+    /// reads `member.machine_cert_fingerprint()`, and `member` is exactly
+    /// `lookup_active`'s own return value — this is a DATA dependency the
+    /// compiler enforces; `lookup_active` cannot be moved after that
+    /// comparison because the value it produces would not exist yet.
+    /// Pinning something the type system already guarantees would
+    /// wrongly imply this test is what secures it.
+    ///
+    /// **`is_revoked` has no such dependency** — nothing downstream reads
+    /// its result besides the early return itself, so it could freely
+    /// move to after the 4 comparisons and the code would still compile.
+    /// Moving it is also BEHAVIORALLY UNOBSERVABLE: the error stays the
+    /// same fieldless `MembershipKeyRejected` either way, so no black-box
+    /// call sequence can distinguish the two orderings by return value —
+    /// which is exactly why a source-position pin is the only proof
+    /// available for this half, not a weaker substitute for something
+    /// free elsewhere.
+    ///
+    /// **`include_str!` limitation, stated plainly:** this reads the
+    /// current SOURCE FILE at compile time — it proves what the source
+    /// says, not what the compiled binary does. Accepted here only
+    /// because this test lives in the same crate and recompiles whenever
+    /// the source it reads changes; a copy or a stale build would not be
+    /// covered.
+    #[cfg(feature = "mesh-session-runtime")]
+    #[test]
+    fn membership_key_is_revoked_check_precedes_field_comparisons() {
+        let source = include_str!("machine_roster_authority.rs");
+        let fn_start = source
+            .find("fn validate_membership_fields(")
+            .expect("validate_membership_fields must exist");
+        let fn_body = &source[fn_start..];
+        let fn_end = fn_body
+            .find("\n}\n")
+            .expect("validate_membership_fields must have a closing brace");
+        let fn_body = &fn_body[..fn_end];
+
+        let revoked_check = fn_body
+            .find("snapshot.is_revoked(")
+            .expect("revoked check must exist in validate_membership_fields");
+
+        // @khai's cross-audit (2026-08-05): anchoring on `hh_id_matches`
+        // alone only proved `is_revoked` precedes ONE of the four
+        // comparisons, not all of them, despite the assertion's own name
+        // claiming "field comparisons" plural. A mutant that reorders the
+        // four so `hh_id_matches` sits last (with `is_revoked` moved to
+        // after the other three but still before `hh_id_matches`) left
+        // this pin green while `is_revoked` had already stopped preceding
+        // 3 of the 4. Anchoring on the MINIMUM of all four indices closes
+        // that gap — `is_revoked` must precede every one of them, not just
+        // whichever one this pin happened to name.
+        let earliest_field_comparison = [
+            "let hh_id_matches",
+            "let fingerprint_matches",
+            "let checkpoint_hash_matches",
+            "let checkpoint_sequence_matches",
+        ]
+        .into_iter()
+        .map(|needle| {
+            fn_body.find(needle).unwrap_or_else(|| {
+                panic!("{needle} comparison must exist in validate_membership_fields")
+            })
+        })
+        .min()
+        .expect("four comparisons are listed above, so a minimum always exists");
+
+        assert!(
+            revoked_check < earliest_field_comparison,
+            "is_revoked has no data dependency forcing this order — unlike lookup_active, whose \
+             result the field comparisons directly consume — so this position is not \
+             compiler-guaranteed and needs this explicit pin. It must precede ALL FOUR field \
+             comparisons, not just one of them. If this genuinely changed, update it deliberately, \
+             not by accident."
+        );
+    }
 
     // Local wrappers preserving old call signatures for tests
     fn sign_revocation(

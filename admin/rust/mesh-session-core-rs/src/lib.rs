@@ -45,6 +45,24 @@
 //! stream IDs/compression/keepalive/close-reasons/retransmission/
 //! fragmentation (addendum §9). Nothing in this crate reaches into
 //! `household-rs`, `keystore-rs`, or any other sibling crate.
+//!
+//! `test-support` (Lane R, @ilia, authorized 2026-08-05, scoped to
+//! exactly this): gates [`intent::D1MembershipKey::new_for_test`] out of
+//! a default build entirely — never activated by any production
+//! dependency. Mirrors `mesh-session-control-model-rs`'s own
+//! `test-support` pattern and its proof technique exactly: the
+//! `compile_fail` block below proves the gated surface is genuinely
+//! absent under a plain `cargo test`/`cargo build` (no `--features`) —
+//! if this import ever starts compiling by default, this doctest starts
+//! *passing* instead of failing its own "must not compile" check, which
+//! itself then fails the doctest.
+//!
+//! ```compile_fail
+//! use mesh_session_core_rs::intent::D1MembershipKey;
+//! let _ = D1MembershipKey::new_for_test(
+//!     Vec::new(), String::new(), String::new(), Vec::new(), Vec::new(), 0,
+//! );
+//! ```
 
 pub mod auth_frames;
 pub mod auth_state_machine;

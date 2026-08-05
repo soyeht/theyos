@@ -2451,6 +2451,7 @@ dependencies = [
  "keyring",
  "keystore-rs",
  "mdns-sd",
+ "mesh-session-core-rs",
  "openssl",
  "p256 0.13.2",
  "percent-encoding",
@@ -3282,6 +3283,16 @@ dependencies = [
  "snow",
  "thiserror 1.0.69",
  "zeroize",
+]
+
+[[package]]
+name = "mesh-session-runtime-rs"
+version = "0.1.0"
+dependencies = [
+ "household-rs",
+ "keystore-rs",
+ "mesh-session-core-rs",
+ "static_assertions",
 ]
 
 [[package]]

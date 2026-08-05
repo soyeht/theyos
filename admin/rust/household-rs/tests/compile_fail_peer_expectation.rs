@@ -40,3 +40,17 @@ fn peer_authority_claims_have_no_production_constructor() {
     // `compile_fail_fixture_coverage`.
     t.compile_fail("tests/compile-fail/peer_expectation/*.rs");
 }
+
+/// Lane R (@ilia): a real `D1MembershipKey` is the ONLY thing
+/// `SealedBinding::from_membership_key` accepts — a raw `ProofI` or a bare
+/// m_id string must fail to compile, not merely be rejected at runtime.
+/// Same one-target-per-crate discipline as the test above (see this
+/// file's own module doc) — a new fixture pair here, not a new `tests/`
+/// target.
+#[cfg(feature = "mesh-session-runtime")]
+#[test]
+fn membership_key_rejects_raw_proof_i_and_raw_m_id() {
+    let t = trybuild::TestCases::new();
+    t.compile_fail("tests/compile-fail/membership_key_from_raw_proof_i.rs");
+    t.compile_fail("tests/compile-fail/membership_key_from_raw_m_id.rs");
+}
