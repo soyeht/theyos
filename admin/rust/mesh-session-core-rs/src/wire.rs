@@ -71,6 +71,30 @@ use crate::ingress::CeremonyDeadline;
 /// path (right after `activate_if_authorized`, when a real D1 registry
 /// may already consider the session Active) for no benefit this ownership
 /// model doesn't already provide for free.
+/// Anything that can bound a per-syscall I/O loop the same way
+/// [`CeremonyDeadline`] does: monotonic, rechecked fresh before (and,
+/// where the caller needs it, after) every syscall, never cached.
+/// `pub(crate)` — generic-ized (2026-08-04, @kiana, post-Active wire
+/// addendum work) so the bounded read/write loops below can be reused for
+/// a per-operation deadline that outlives a single ceremony, without
+/// giving [`CeremonyDeadline`] itself a second, non-ingress-admission
+/// constructor — see that type's own doc for why that boundary is
+/// deliberate. [`CeremonyDeadline`] implements this unchanged; nothing
+/// about its existing behavior changes.
+pub(crate) trait BoundedDeadline {
+    fn remaining(&self) -> Duration;
+    fn is_expired(&self) -> bool;
+}
+
+impl BoundedDeadline for CeremonyDeadline {
+    fn remaining(&self) -> Duration {
+        CeremonyDeadline::remaining(self)
+    }
+    fn is_expired(&self) -> bool {
+        CeremonyDeadline::is_expired(self)
+    }
+}
+
 pub(crate) trait DeadlineBoundedIo {
     fn arm_io_deadline(&mut self, remaining: Duration) -> std::io::Result<()>;
 }
@@ -118,10 +142,10 @@ pub const MAX_CBOR_BODY_LEN: u32 = MAX_PLAINTEXT_LEN - TYPE_BYTE_LEN;
 /// fresh before each one (2026-08-04, @kiana: "não uma chamada read_exact
 /// ... que esconde múltiplos syscalls"). Zero remaining budget fails
 /// closed *before* attempting the syscall, not after it hangs.
-fn read_exact_with_deadline<R: Read + DeadlineBoundedIo>(
+fn read_exact_with_deadline<R: Read + DeadlineBoundedIo, D: BoundedDeadline>(
     r: &mut R,
     buf: &mut [u8],
-    deadline: &CeremonyDeadline,
+    deadline: &D,
 ) -> Result<(), WireError> {
     let mut filled = 0;
     while filled < buf.len() {
@@ -173,10 +197,10 @@ fn read_exact_with_deadline<R: Read + DeadlineBoundedIo>(
 /// write before its next chunk, satisfying "a partial write that crosses
 /// the deadline fails on the next iteration" without needing a separate
 /// post-syscall check that could fire on the syscall that just finished.
-fn write_all_with_deadline<W: Write + DeadlineBoundedIo>(
+fn write_all_with_deadline<W: Write + DeadlineBoundedIo, D: BoundedDeadline>(
     w: &mut W,
     mut buf: &[u8],
-    deadline: &CeremonyDeadline,
+    deadline: &D,
 ) -> Result<(), WireError> {
     while !buf.is_empty() {
         let remaining = deadline.remaining();
@@ -207,10 +231,10 @@ fn write_all_with_deadline<W: Write + DeadlineBoundedIo>(
 /// `Read` that coalesces multiple frames into one underlying buffer works
 /// too, because only the bytes belonging to this one frame are ever
 /// consumed.
-pub(crate) fn read_length_prefixed_frame<R: Read + DeadlineBoundedIo>(
+pub(crate) fn read_length_prefixed_frame<R: Read + DeadlineBoundedIo, D: BoundedDeadline>(
     r: &mut R,
     max_len: u32,
-    deadline: &CeremonyDeadline,
+    deadline: &D,
 ) -> Result<Vec<u8>, WireError> {
     let mut len_buf = [0u8; 4];
     read_exact_with_deadline(r, &mut len_buf, deadline)?;
@@ -228,11 +252,11 @@ pub(crate) fn read_length_prefixed_frame<R: Read + DeadlineBoundedIo>(
 
 /// Write one `[4-byte BE length][bytes]` frame to `w`. Internal building
 /// block only — see [`read_length_prefixed_frame`].
-pub(crate) fn write_length_prefixed_frame<W: Write + DeadlineBoundedIo>(
+pub(crate) fn write_length_prefixed_frame<W: Write + DeadlineBoundedIo, D: BoundedDeadline>(
     w: &mut W,
     body: &[u8],
     max_len: u32,
-    deadline: &CeremonyDeadline,
+    deadline: &D,
 ) -> Result<(), WireError> {
     let declared = u32::try_from(body.len()).map_err(|_| WireError::OversizeFrame {
         declared: u32::MAX,
@@ -253,38 +277,38 @@ pub(crate) fn write_length_prefixed_frame<W: Write + DeadlineBoundedIo>(
 /// `MAX_NOISE_HANDSHAKE_MESSAGE_LEN` — not a parameter. `deadline`
 /// (2026-08-04, @kiana, erratum1 E3) bounds every individual syscall this
 /// makes — see [`DeadlineBoundedIo`].
-pub(crate) fn read_handshake_flight<R: Read + DeadlineBoundedIo>(
+pub(crate) fn read_handshake_flight<R: Read + DeadlineBoundedIo, D: BoundedDeadline>(
     r: &mut R,
-    deadline: &CeremonyDeadline,
+    deadline: &D,
 ) -> Result<Vec<u8>, WireError> {
     read_length_prefixed_frame(r, MAX_NOISE_HANDSHAKE_MESSAGE_LEN, deadline)
 }
 
 /// Write one Noise handshake flight. Ceiling fixed at
 /// `MAX_NOISE_HANDSHAKE_MESSAGE_LEN` — not a parameter.
-pub(crate) fn write_handshake_flight<W: Write + DeadlineBoundedIo>(
+pub(crate) fn write_handshake_flight<W: Write + DeadlineBoundedIo, D: BoundedDeadline>(
     w: &mut W,
     body: &[u8],
-    deadline: &CeremonyDeadline,
+    deadline: &D,
 ) -> Result<(), WireError> {
     write_length_prefixed_frame(w, body, MAX_NOISE_HANDSHAKE_MESSAGE_LEN, deadline)
 }
 
 /// Read one post-handshake Noise transport record (ciphertext). Ceiling
 /// fixed at `MAX_NOISE_RECORD_LEN` — not a parameter.
-pub(crate) fn read_transport_record<R: Read + DeadlineBoundedIo>(
+pub(crate) fn read_transport_record<R: Read + DeadlineBoundedIo, D: BoundedDeadline>(
     r: &mut R,
-    deadline: &CeremonyDeadline,
+    deadline: &D,
 ) -> Result<Vec<u8>, WireError> {
     read_length_prefixed_frame(r, MAX_NOISE_RECORD_LEN, deadline)
 }
 
 /// Write one post-handshake Noise transport record (ciphertext). Ceiling
 /// fixed at `MAX_NOISE_RECORD_LEN` — not a parameter.
-pub(crate) fn write_transport_record<W: Write + DeadlineBoundedIo>(
+pub(crate) fn write_transport_record<W: Write + DeadlineBoundedIo, D: BoundedDeadline>(
     w: &mut W,
     body: &[u8],
-    deadline: &CeremonyDeadline,
+    deadline: &D,
 ) -> Result<(), WireError> {
     write_length_prefixed_frame(w, body, MAX_NOISE_RECORD_LEN, deadline)
 }

@@ -41,8 +41,10 @@
 #![allow(dead_code)]
 
 use std::io::{Read, Write};
+use std::time::{Duration, Instant};
 
 use snow::TransportState;
+use zeroize::Zeroizing;
 
 use crate::auth_frames::{
     self, Activate, ActivateAck, AuthFrame, ConnectionIntentDigest, FinalConfirm,
@@ -51,10 +53,11 @@ use crate::auth_frames::{
 use crate::delegation::{
     DelegationPolicy, DelegationSignatureVerifier, MeshSessionDelegation, PartialBindingInputs,
 };
-use crate::error::{AuthFrameError, NoiseSetupError};
+use crate::error::{AuthFrameError, NoiseSetupError, PostActiveError};
 use crate::ingress::{CeremonyDeadline, IngressEvidence, PrevalidatedIngress};
 use crate::intent::D1Pending;
 use crate::noise::{self, Role};
+use crate::post_active::{self, PostActiveRecord};
 use crate::rekey::{self, RekeyThreshold, SessionRekeyState};
 use crate::wire;
 
@@ -490,6 +493,15 @@ pub struct ActiveMeshSession<T, G> {
     /// `run_initiator_handshake`'s own doc on why the ceremony deliberately
     /// does not re-fail if the terminal Ack write races past it.
     expires_at: u64,
+    /// Local terminal flag (2026-08-04, @kiana, post-Active wire addendum
+    /// `b14fcf95…` + erratum1 `4be4cd3d…`, §7). Set the instant local
+    /// authority is withdrawn — before any CLOSE/REVOKE_NOTICE write is
+    /// even attempted, and before any received CLOSE/REVOKE_NOTICE or
+    /// post-Active error is exposed to the caller — never after. Once
+    /// `true`, every guarded post-Active operation below fails closed
+    /// immediately with [`PostActiveError::Closed`] without touching the
+    /// stream again; repetition/EOF cannot resurrect state (addendum §7).
+    closed: bool,
 }
 
 impl<T, G> ActiveMeshSession<T, G> {
@@ -576,6 +588,343 @@ impl<T, G> ActiveMeshSession<T, G> {
             .rx()
             .on_receive(rekey::IncomingRecord::Marker { next_generation })?;
         self.transport.rekey_incoming();
+        Ok(())
+    }
+}
+
+/// A single post-Active operation's own bounded budget (2026-08-04,
+/// @kiana, post-Active wire addendum `b14fcf95…` §5: "cada operação de
+/// I/O recebe deadline monotônico bounded"). Deliberately NOT
+/// [`CeremonyDeadline`]: that type's only constructors are
+/// ingress-admission-scoped by design — see its own doc ("the only ways
+/// to obtain a value of this type are `PrevalidatedIngress::admit_at_accept`
+/// ... or the `#[cfg(test)]`-only constructors"). Reusing it here would
+/// blur "this proves the stream was validly ingress-admitted" with an
+/// unrelated, session-lifetime-spanning per-operation timeout that has
+/// nothing to do with ingress. Same mechanics (monotonic `Instant`,
+/// rechecked fresh, never cached) via [`wire::BoundedDeadline`] — the
+/// generic-ized bounded I/O loops in `wire.rs` accept either type
+/// identically; `wire::DeadlineBoundedIo::arm_io_deadline`'s own doc
+/// already anticipated this exact seam ("Every future Active-side I/O
+/// operation ... is required to call `arm_io_deadline` again, with its
+/// own budget").
+#[derive(Debug, Clone, Copy)]
+pub struct OperationDeadline {
+    started: Instant,
+    budget: Duration,
+}
+
+impl OperationDeadline {
+    /// `None` on a zero budget — same fail-closed posture as
+    /// `CeremonyBudget::new` (a zero-duration deadline that never lets any
+    /// syscall run is not meaningfully different from refusing to start).
+    pub fn new(budget: Duration) -> Option<Self> {
+        if budget.is_zero() {
+            return None;
+        }
+        Some(Self {
+            started: Instant::now(),
+            budget,
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn already_expired_for_test() -> Self {
+        Self {
+            started: Instant::now() - Duration::from_secs(3600),
+            budget: Duration::from_secs(1),
+        }
+    }
+}
+
+impl wire::BoundedDeadline for OperationDeadline {
+    fn remaining(&self) -> Duration {
+        self.budget.saturating_sub(self.started.elapsed())
+    }
+    fn is_expired(&self) -> bool {
+        self.remaining().is_zero()
+    }
+}
+
+/// What a real `D1::Active<'a>` gate must provide for `ActiveMeshSession`
+/// to check live, per-operation forwarding authorization (2026-08-04,
+/// @kiana, post-Active wire addendum `b14fcf95…` §5). Mirrors the real
+/// household `SessionGate::try_authorize_forwarding(&self) -> Option<ForwardingGuard<'_>>`
+/// exactly (verified directly against that type earlier this engagement —
+/// see `intent::D1Admission`'s own doc) — a real adapter implements this
+/// by forwarding to that method. `None` means "not authorized right
+/// now": revoked, registry poisoned/unavailable, or a stale generation —
+/// this crate treats every one of those identically, fail-closed, and
+/// never distinguishes among them (a real D1 registry is the only thing
+/// that could, and this crate does not second-guess it).
+pub trait ActiveGateAuthorization {
+    type Guard<'a>
+    where
+        Self: 'a;
+    fn try_authorize(&self) -> Option<Self::Guard<'_>>;
+}
+
+/// Post-Active guarded operations (2026-08-04, @kiana, post-Active wire
+/// addendum `b14fcf9520222ad3ab3ac3443ae4b0e7ba219411f41e3389751c92a402b64d8a.md`
+/// and its provenance-only erratum1
+/// `4be4cd3d0963cbc145b4aeb1f5450e5753e84f1b65e94e84af9ecd29832bf203.md`,
+/// both self-hash verified before this code was written). A separate,
+/// `G: ActiveGateAuthorization`-bounded `impl` block — the unconstrained
+/// one above is untouched, so an adapter whose `Active<'a>` does not (yet)
+/// implement the gate trait still gets everything it already had.
+///
+/// **No `TransportState`/raw stream ever returned to the caller**
+/// (addendum's own implicit requirement, restated by this task): every
+/// method here takes/returns only scalars, `&[u8]`/`&mut [u8]`, and typed
+/// errors. `self.stream`/`self.transport` never leave this `impl` block.
+///
+/// **Gate per operation, not a static session property** (addendum §5):
+/// `send_data` acquires the guard and holds it for the entire write;
+/// `receive_data` acquires it only for the final, CPU-local copy into the
+/// caller's buffer, after decrypt — never around the blocking read/decrypt
+/// itself. `REKEY`/`CLOSE`/`REVOKE_NOTICE` are control-plane (addendum
+/// §7) and never acquire the gate at all — see [`Self::send_outgoing_rekey_marker`]/
+/// [`Self::close_gracefully`]/[`Self::notify_revoked_and_close`].
+///
+/// `#[allow(private_bounds)]`: `wire::DeadlineBoundedIo` is deliberately
+/// `pub(crate)` (sealed against a no-op external implementation defeating
+/// the whole deadline discipline — see its own doc) — no external crate
+/// could satisfy this bound regardless, exactly like every existing
+/// `pub(crate)` handshake function already bounded on it. The methods
+/// below are reachable in principle (the struct/methods are `pub`) but
+/// callable in practice only from this crate's own test suite today,
+/// same posture as `run_responder_handshake`/`run_initiator_handshake`
+/// pending a real external facade.
+#[allow(private_bounds)]
+impl<T: Read + Write + wire::DeadlineBoundedIo, G: ActiveGateAuthorization>
+    ActiveMeshSession<T, G>
+{
+    pub fn is_closed(&self) -> bool {
+        self.closed
+    }
+
+    /// addendum §6: control-plane, no D1 guard. Bound to the exact
+    /// `SendMarkerPermit` `before_send_marker` issued — commits via the
+    /// already-existing, already-audited `commit_outgoing_rekey` (couples
+    /// the counter transition to the real `TransportState::rekey_outgoing()`,
+    /// validated before that irreversible call, same as it always has).
+    fn send_outgoing_rekey_marker(&mut self, budget: Duration) -> Result<(), PostActiveError> {
+        let permit = self.rekey.tx().before_send_marker()?;
+        let next_generation = permit.next_generation();
+        let deadline = OperationDeadline::new(budget).ok_or(PostActiveError::Expired)?;
+        let record = Zeroizing::new(post_active::encode_rekey_record(next_generation)?);
+        let mut ciphertext = Zeroizing::new(vec![0u8; record.len() + 16]);
+        let ct_len = self
+            .transport
+            .write_message(&record, &mut ciphertext)
+            .map_err(NoiseSetupError::from)?;
+        wire::write_transport_record(&mut self.stream, &ciphertext[..ct_len], &deadline)?;
+        self.commit_outgoing_rekey(permit)?;
+        Ok(())
+    }
+
+    /// addendum §3.1/§5/§6. Sends the required `REKEY` marker first if one
+    /// is due (`ExpectedRekeyMarker`), then the `DATA` record itself,
+    /// holding the D1 forwarding guard for the entire write. Any failure —
+    /// including a marker write failure, a denied guard, or expiry —
+    /// closes the session; there is no partial/retryable state.
+    pub fn send_data(
+        &mut self,
+        payload: &[u8],
+        budget: Duration,
+        now: u64,
+    ) -> Result<(), PostActiveError> {
+        if self.closed {
+            return Err(PostActiveError::Closed);
+        }
+        let result = self.send_data_inner(payload, budget, now);
+        if result.is_err() {
+            self.closed = true;
+        }
+        result
+    }
+
+    fn send_data_inner(
+        &mut self,
+        payload: &[u8],
+        budget: Duration,
+        now: u64,
+    ) -> Result<(), PostActiveError> {
+        let permit = match self.rekey.tx().before_send_non_marker() {
+            Ok(permit) => permit,
+            Err(crate::error::RekeyError::ExpectedRekeyMarker) => {
+                self.send_outgoing_rekey_marker(budget)?;
+                self.rekey.tx().before_send_non_marker()?
+            }
+            Err(e) => return Err(e.into()),
+        };
+        let guard = self
+            .gate
+            .try_authorize()
+            .ok_or(PostActiveError::NotAuthorized)?;
+        if now >= self.expires_at {
+            return Err(PostActiveError::Expired);
+        }
+        let deadline = OperationDeadline::new(budget).ok_or(PostActiveError::Expired)?;
+        let record = Zeroizing::new(post_active::encode_data_record(payload)?);
+        let mut ciphertext = Zeroizing::new(vec![0u8; record.len() + 16]);
+        let ct_len = self
+            .transport
+            .write_message(&record, &mut ciphertext)
+            .map_err(NoiseSetupError::from)?;
+        wire::write_transport_record(&mut self.stream, &ciphertext[..ct_len], &deadline)?;
+        drop(guard);
+        self.rekey.tx().after_send_non_marker(permit)?;
+        Ok(())
+    }
+
+    /// addendum §3.1/§5/§6. Reads and decrypts without a guard; transparently
+    /// consumes `REKEY` markers (coupling the rx counter to the real
+    /// `TransportState::rekey_incoming()`); closes on `CLOSE`/`REVOKE_NOTICE`
+    /// (addendum §7: withdraw locally before exposing any new effect);
+    /// for `DATA`, acquires the D1 guard only for the final copy into
+    /// `buffer`, releasing it before returning — never around the
+    /// blocking read/decrypt, and never via a caller-supplied callback
+    /// (2026-08-04, @kiana catch: no callback/sink/closure under the
+    /// guard, ever). `buffer` too small to hold the delivered payload
+    /// closes the session and copies zero bytes (addendum §5: "Se o guard
+    /// falha ou o buffer é pequeno, nenhum byte é copiado; descartar e
+    /// fechar").
+    pub fn receive_data(
+        &mut self,
+        buffer: &mut [u8],
+        budget: Duration,
+        now: u64,
+    ) -> Result<usize, PostActiveError> {
+        if self.closed {
+            return Err(PostActiveError::Closed);
+        }
+        let result = self.receive_data_inner(buffer, budget, now);
+        if result.is_err() {
+            self.closed = true;
+        }
+        result
+    }
+
+    fn receive_data_inner(
+        &mut self,
+        buffer: &mut [u8],
+        budget: Duration,
+        now: u64,
+    ) -> Result<usize, PostActiveError> {
+        loop {
+            let deadline = OperationDeadline::new(budget).ok_or(PostActiveError::Expired)?;
+            let ciphertext = wire::read_transport_record(&mut self.stream, &deadline)?;
+            let mut plaintext = Zeroizing::new(vec![0u8; ciphertext.len()]);
+            let pt_len = self
+                .transport
+                .read_message(&ciphertext, &mut plaintext)
+                .map_err(NoiseSetupError::from)?;
+            let record = post_active::decode_post_active_record(&plaintext[..pt_len])?;
+            match record {
+                PostActiveRecord::Rekey { next_generation } => {
+                    self.commit_incoming_rekey(next_generation)?;
+                    continue;
+                }
+                PostActiveRecord::Close => {
+                    self.rekey
+                        .rx()
+                        .on_receive(rekey::IncomingRecord::NonMarker)?;
+                    return Err(PostActiveError::PeerClosed);
+                }
+                PostActiveRecord::RevokeNotice => {
+                    self.rekey
+                        .rx()
+                        .on_receive(rekey::IncomingRecord::NonMarker)?;
+                    return Err(PostActiveError::PeerRevoked);
+                }
+                PostActiveRecord::Data(payload) => {
+                    self.rekey
+                        .rx()
+                        .on_receive(rekey::IncomingRecord::NonMarker)?;
+                    let guard = self
+                        .gate
+                        .try_authorize()
+                        .ok_or(PostActiveError::NotAuthorized)?;
+                    if now >= self.expires_at {
+                        return Err(PostActiveError::Expired);
+                    }
+                    if payload.len() > buffer.len() {
+                        return Err(PostActiveError::ReceiveBufferTooSmall {
+                            buffer_len: buffer.len(),
+                            payload_len: payload.len(),
+                        });
+                    }
+                    buffer[..payload.len()].copy_from_slice(&payload);
+                    drop(guard);
+                    return Ok(payload.len());
+                }
+            }
+        }
+    }
+
+    /// addendum §6/§7: graceful, local-initiated close. Withdraws
+    /// authority FIRST (before any write is attempted), then — if a
+    /// `REKEY` marker is due — emits it and commits the real
+    /// `rekey_outgoing()` transition, THEN sends `CLOSE` under the new
+    /// key. Idempotent: a second call is a no-op `Ok(())`. Best-effort
+    /// from here on — a write failure at any step still leaves the
+    /// session closed (never un-withdraws authority), and is reported
+    /// back rather than silently discarded so a caller can notice a
+    /// non-graceful teardown, but does not change the terminal outcome.
+    pub fn close_gracefully(&mut self, budget: Duration) -> Result<(), PostActiveError> {
+        if self.closed {
+            return Ok(());
+        }
+        self.closed = true;
+        let permit = match self.rekey.tx().before_send_non_marker() {
+            Ok(permit) => permit,
+            Err(crate::error::RekeyError::ExpectedRekeyMarker) => {
+                self.send_outgoing_rekey_marker(budget)?;
+                self.rekey.tx().before_send_non_marker()?
+            }
+            Err(e) => return Err(e.into()),
+        };
+        let deadline = OperationDeadline::new(budget).ok_or(PostActiveError::Expired)?;
+        let record = Zeroizing::new(post_active::encode_close_record());
+        let mut ciphertext = Zeroizing::new(vec![0u8; record.len() + 16]);
+        let ct_len = self
+            .transport
+            .write_message(&record, &mut ciphertext)
+            .map_err(NoiseSetupError::from)?;
+        wire::write_transport_record(&mut self.stream, &ciphertext[..ct_len], &deadline)?;
+        self.rekey.tx().after_send_non_marker(permit)?;
+        Ok(())
+    }
+
+    /// addendum §6/§7: best-effort `REVOKE_NOTICE` after local authority
+    /// withdrawal. Deliberately does NOT force a `REKEY` marker cycle the
+    /// way [`Self::close_gracefully`] does — addendum §6: "se não puder
+    /// ser enviado imediatamente (inclusive porque um marker seria
+    /// obrigatório), omitir e fechar é correto." If a marker is due, the
+    /// notice is simply omitted; the session still closes. Never mutates
+    /// any roster — closing/retiring the local session is the only
+    /// effect (addendum §3.2).
+    pub fn notify_revoked_and_close(&mut self, budget: Duration) -> Result<(), PostActiveError> {
+        if self.closed {
+            return Ok(());
+        }
+        self.closed = true;
+        let permit = match self.rekey.tx().before_send_non_marker() {
+            Ok(permit) => permit,
+            Err(_) => return Ok(()), // marker would be required — omit the notice, still closed
+        };
+        let Some(deadline) = OperationDeadline::new(budget) else {
+            return Ok(());
+        };
+        let record = Zeroizing::new(post_active::encode_revoke_notice_record());
+        let mut ciphertext = Zeroizing::new(vec![0u8; record.len() + 16]);
+        let ct_len = match self.transport.write_message(&record, &mut ciphertext) {
+            Ok(n) => n,
+            Err(_) => return Ok(()),
+        };
+        let _ = wire::write_transport_record(&mut self.stream, &ciphertext[..ct_len], &deadline);
+        let _ = self.rekey.tx().after_send_non_marker(permit);
         Ok(())
     }
 }
@@ -1050,6 +1399,7 @@ where
         h_final,
         gate,
         expires_at,
+        closed: false,
     })
 }
 
@@ -1374,6 +1724,7 @@ where
         h_final,
         gate,
         expires_at,
+        closed: false,
     })
 }
 
@@ -4545,5 +4896,404 @@ mod tests {
              ceremony's nonce rejection must happen strictly before D1 reservation, \
              so it must never reserve at all"
         );
+    }
+
+    // ---- post-Active wire addendum (b14fcf95…/erratum1 4be4cd3d…) tests ----
+
+    /// A `D1::Active<'a>` gate double whose authorization can be flipped
+    /// externally by the test, shared via `Arc` so both the session and
+    /// the test hold a handle to the SAME underlying flag.
+    struct TestGate {
+        authorized: std::sync::atomic::AtomicBool,
+    }
+    impl TestGate {
+        fn new() -> std::sync::Arc<Self> {
+            std::sync::Arc::new(Self {
+                authorized: std::sync::atomic::AtomicBool::new(true),
+            })
+        }
+        fn revoke(&self) {
+            self.authorized
+                .store(false, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+    impl ActiveGateAuthorization for std::sync::Arc<TestGate> {
+        type Guard<'a> = ();
+        fn try_authorize(&self) -> Option<()> {
+            if self.authorized.load(std::sync::atomic::Ordering::SeqCst) {
+                Some(())
+            } else {
+                None
+            }
+        }
+    }
+
+    struct GatedD1 {
+        gate: std::sync::Arc<TestGate>,
+    }
+    struct GatedPending {
+        gate: std::sync::Arc<TestGate>,
+    }
+    impl crate::intent::D1Pending<std::sync::Arc<TestGate>> for GatedPending {
+        fn commit_after_ack(self) -> std::sync::Arc<TestGate> {
+            self.gate
+        }
+        fn cancel_before_ack(self) -> crate::intent::D1CancelOutcome {
+            crate::intent::D1CancelOutcome::CancelledAndRemoved
+        }
+    }
+    impl crate::intent::D1Admission for GatedD1 {
+        type Pending<'a> = GatedPending;
+        type Active<'a> = std::sync::Arc<TestGate>;
+        fn reserve_pending<'a>(
+            &'a self,
+            _key: &crate::intent::D1MembershipKey,
+            _deadline: &CeremonyDeadline,
+        ) -> Result<Self::Pending<'a>, crate::error::IntentError> {
+            Ok(GatedPending {
+                gate: std::sync::Arc::clone(&self.gate),
+            })
+        }
+    }
+
+    type GatedSession = ActiveMeshSession<TcpStream, std::sync::Arc<TestGate>>;
+
+    /// Same shape as `full_handshake()`, but with a `GatedD1` double whose
+    /// gate the test can flip after the ceremony completes — needed for
+    /// every post-Active RED that depends on live D1 authorization, which
+    /// `AlwaysAdmitD1`'s `()` gate cannot express at all.
+    fn full_handshake_with_gate() -> (
+        GatedSession,
+        GatedSession,
+        std::sync::Arc<TestGate>,
+        std::sync::Arc<TestGate>,
+    ) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let responder_key = SigningKey::random(&mut OsRng);
+        let responder_verifying = VerifyingKey::from(&responder_key);
+        let initiator_key = SigningKey::random(&mut OsRng);
+        let initiator_verifying = VerifyingKey::from(&initiator_key);
+
+        let responder_delegation = delegation_for_key(
+            &responder_verifying,
+            "hh-1",
+            "responder-1",
+            vec![0xCC; 32],
+            0,
+            u64::MAX / 2,
+        );
+        let responder_identity =
+            identity("hh-1", "responder-1", vec![0xCC; 32], responder_delegation);
+
+        let initiator_resolver = FixedResolver {
+            delegated_pub: initiator_verifying
+                .to_encoded_point(true)
+                .as_bytes()
+                .to_vec(),
+            generation: 1,
+            not_after: u64::MAX / 2,
+        };
+        let responder_gate = TestGate::new();
+        let initiator_gate = TestGate::new();
+
+        let responder = thread::spawn({
+            let checkpoint = fixed_checkpoint();
+            let k_mesh = TestKMesh(responder_key);
+            let d1 = GatedD1 {
+                gate: std::sync::Arc::clone(&responder_gate),
+            };
+            move || {
+                let (sock, _) = listener.accept().unwrap();
+                let ingress = PrevalidatedIngress::admit_at_accept(
+                    sock,
+                    IngressEvidence {
+                        observed_at: 1,
+                        ingress_expiry: u64::MAX / 2,
+                    },
+                    far_future_budget(),
+                );
+                run_responder_handshake(
+                    ingress,
+                    &responder_identity,
+                    &checkpoint,
+                    ExpectedChannel::Dev,
+                    &DelegationPolicy::test(u64::MAX / 2),
+                    &AlwaysAcceptDelegation,
+                    &k_mesh,
+                    &InMemoryLedger::new(),
+                    &d1,
+                    &FixedClock(0),
+                    &initiator_resolver,
+                    u64::MAX / 2,
+                    RekeyThreshold::new(3).unwrap(),
+                )
+                .unwrap()
+            }
+        });
+
+        let initiator_delegation = delegation_for_key(
+            &initiator_verifying,
+            "hh-1",
+            "initiator-1",
+            vec![0xEE; 32],
+            0,
+            u64::MAX / 2,
+        );
+        let initiator_identity =
+            identity("hh-1", "initiator-1", vec![0xEE; 32], initiator_delegation);
+        let sock = TcpStream::connect(addr).unwrap();
+        let ingress = PrevalidatedIngress::admit_at_accept(
+            sock,
+            IngressEvidence {
+                observed_at: 2,
+                ingress_expiry: u64::MAX / 2,
+            },
+            far_future_budget(),
+        );
+        let k_mesh = TestKMesh(initiator_key);
+        let pending_intent = pending_intent_for(
+            &k_mesh,
+            &initiator_identity,
+            &fixed_checkpoint(),
+            "responder-1",
+            vec![0xCC; 32],
+            [0xB7; 32],
+            u64::MAX / 2,
+            ExpectedChannel::Dev,
+        );
+        let initiator_d1 = GatedD1 {
+            gate: std::sync::Arc::clone(&initiator_gate),
+        };
+        let initiator_session = run_initiator_handshake(
+            ingress,
+            pending_intent,
+            &initiator_identity,
+            &fixed_checkpoint(),
+            ExpectedChannel::Dev,
+            &DelegationPolicy::test(u64::MAX / 2),
+            &AlwaysAcceptDelegation,
+            &k_mesh,
+            &initiator_d1,
+            &FixedClock(0),
+            u64::MAX / 2,
+            RekeyThreshold::new(3).unwrap(),
+        )
+        .unwrap();
+
+        let responder_session = responder.join().unwrap();
+        (
+            initiator_session,
+            responder_session,
+            initiator_gate,
+            responder_gate,
+        )
+    }
+
+    const FAR_FUTURE_NOW: u64 = 0;
+    const OP_BUDGET: Duration = Duration::from_secs(5);
+
+    /// POS-5-equivalent, addendum §8 item 5: N=3, `DATA, DATA, marker,
+    /// DATA, DATA` in EACH direction, real Snow transport, real socket —
+    /// proves `send_data` auto-emits the required marker and
+    /// `receive_data` transparently consumes it, end to end, in both
+    /// directions independently.
+    #[test]
+    fn post_active_n3_data_data_marker_data_data_each_direction_real_snow() {
+        let (mut initiator, mut responder, _ig, _rg) = full_handshake_with_gate();
+        let mut buf = [0u8; 64];
+
+        for i in 0..4u8 {
+            let payload = [i; 4];
+            initiator
+                .send_data(&payload, OP_BUDGET, FAR_FUTURE_NOW)
+                .unwrap();
+            let n = responder
+                .receive_data(&mut buf, OP_BUDGET, FAR_FUTURE_NOW)
+                .unwrap();
+            assert_eq!(&buf[..n], &payload);
+        }
+        assert_eq!(initiator.rekey.tx().generation(), 1);
+        assert_eq!(responder.rekey.rx().generation(), 1);
+
+        for i in 0..4u8 {
+            let payload = [0x80 + i; 4];
+            responder
+                .send_data(&payload, OP_BUDGET, FAR_FUTURE_NOW)
+                .unwrap();
+            let n = initiator
+                .receive_data(&mut buf, OP_BUDGET, FAR_FUTURE_NOW)
+                .unwrap();
+            assert_eq!(&buf[..n], &payload);
+        }
+        assert_eq!(responder.rekey.tx().generation(), 1);
+        assert_eq!(initiator.rekey.rx().generation(), 1);
+
+        assert!(!initiator.is_closed());
+        assert!(!responder.is_closed());
+    }
+
+    /// addendum §5/§8 item 7: a D1 gate rejection on `send_data` closes
+    /// the session — no bytes are ever written for that attempt.
+    #[test]
+    fn red_send_data_rejected_when_gate_denies_and_closes_session() {
+        let (mut initiator, _responder, initiator_gate, _rg) = full_handshake_with_gate();
+        initiator_gate.revoke();
+        let err = initiator
+            .send_data(b"hello", OP_BUDGET, FAR_FUTURE_NOW)
+            .unwrap_err();
+        assert!(matches!(err, PostActiveError::NotAuthorized));
+        assert!(initiator.is_closed());
+        // Idempotent: a second call fails closed without touching the gate again.
+        let err2 = initiator
+            .send_data(b"hello", OP_BUDGET, FAR_FUTURE_NOW)
+            .unwrap_err();
+        assert!(matches!(err2, PostActiveError::Closed));
+    }
+
+    /// addendum §5/§8 item 9: `now >= expires_at` closes `send_data`
+    /// (equality is already-expired, half-open, same convention as the
+    /// handshake's own `check_effective_expiry`).
+    #[test]
+    fn red_send_data_expired_at_equality_closes_session() {
+        let (mut initiator, _responder, _ig, _rg) = full_handshake_with_gate();
+        let expires_at = initiator.expires_at();
+        let err = initiator
+            .send_data(b"hello", OP_BUDGET, expires_at)
+            .unwrap_err();
+        assert!(matches!(err, PostActiveError::Expired));
+        assert!(initiator.is_closed());
+    }
+
+    /// addendum §8 item 9, positive half: `now == expires_at - 1` still
+    /// delivers — proves the boundary is exclusive on the expired side
+    /// only, not off-by-one in the other direction.
+    #[test]
+    fn expiry_minus_one_still_delivers() {
+        let (mut initiator, mut responder, _ig, _rg) = full_handshake_with_gate();
+        let expires_at = initiator.expires_at();
+        initiator
+            .send_data(b"hi", OP_BUDGET, expires_at - 1)
+            .unwrap();
+        let mut buf = [0u8; 8];
+        let n = responder
+            .receive_data(&mut buf, OP_BUDGET, expires_at - 1)
+            .unwrap();
+        assert_eq!(&buf[..n], b"hi");
+        assert!(!initiator.is_closed());
+        assert!(!responder.is_closed());
+    }
+
+    #[test]
+    fn close_gracefully_is_idempotent() {
+        let (mut initiator, mut responder, _ig, _rg) = full_handshake_with_gate();
+        initiator.close_gracefully(OP_BUDGET).unwrap();
+        assert!(initiator.is_closed());
+        initiator.close_gracefully(OP_BUDGET).unwrap(); // no-op, does not error or reopen
+        assert!(initiator.is_closed());
+
+        let mut buf = [0u8; 8];
+        let err = responder
+            .receive_data(&mut buf, OP_BUDGET, FAR_FUTURE_NOW)
+            .unwrap_err();
+        assert!(matches!(err, PostActiveError::PeerClosed));
+        assert!(responder.is_closed());
+    }
+
+    #[test]
+    fn red_receive_data_after_local_close_fails_without_touching_stream() {
+        let (mut initiator, _responder, _ig, _rg) = full_handshake_with_gate();
+        initiator.close_gracefully(OP_BUDGET).unwrap();
+        let mut buf = [0u8; 8];
+        let err = initiator
+            .receive_data(&mut buf, OP_BUDGET, FAR_FUTURE_NOW)
+            .unwrap_err();
+        assert!(matches!(err, PostActiveError::Closed));
+    }
+
+    #[test]
+    fn notify_revoked_and_close_delivers_peer_revoked() {
+        let (mut initiator, mut responder, _ig, _rg) = full_handshake_with_gate();
+        initiator.notify_revoked_and_close(OP_BUDGET).unwrap();
+        assert!(initiator.is_closed());
+
+        let mut buf = [0u8; 8];
+        let err = responder
+            .receive_data(&mut buf, OP_BUDGET, FAR_FUTURE_NOW)
+            .unwrap_err();
+        assert!(matches!(err, PostActiveError::PeerRevoked));
+        assert!(responder.is_closed());
+    }
+
+    /// addendum §5: "Se ... o buffer é pequeno, nenhum byte é copiado;
+    /// descartar e fechar" — a too-small receive buffer closes the
+    /// session and leaves the buffer untouched.
+    #[test]
+    fn red_receive_data_buffer_too_small_closes_and_copies_nothing() {
+        let (mut initiator, mut responder, _ig, _rg) = full_handshake_with_gate();
+        initiator
+            .send_data(b"0123456789", OP_BUDGET, FAR_FUTURE_NOW)
+            .unwrap();
+        let mut tiny = [0xAAu8; 4];
+        let err = responder
+            .receive_data(&mut tiny, OP_BUDGET, FAR_FUTURE_NOW)
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            PostActiveError::ReceiveBufferTooSmall {
+                buffer_len: 4,
+                payload_len: 10
+            }
+        ));
+        assert!(responder.is_closed());
+        assert_eq!(tiny, [0xAAu8; 4], "buffer must be untouched on rejection");
+    }
+
+    /// addendum §6/§8 item 6: a non-marker record arriving when the
+    /// sender's own policy_count already reached `threshold - 1` (i.e. a
+    /// marker was required and never sent) is rejected by the receiver's
+    /// own rekey bookkeeping — hand-crafted attacker path, bypassing
+    /// `send_data`'s auto-marker-emission, to prove the RECEIVER's own
+    /// check is real, not merely never exercised because the well-behaved
+    /// sender never triggers it.
+    #[test]
+    fn red_non_marker_at_threshold_minus_one_without_marker_rejected_by_receiver() {
+        let (mut initiator, mut responder, _ig, _rg) = full_handshake_with_gate();
+        // Drive N-1 = 2 ordinary DATA records the normal way first.
+        for i in 0..2u8 {
+            initiator
+                .send_data(&[i], OP_BUDGET, FAR_FUTURE_NOW)
+                .unwrap();
+            let mut buf = [0u8; 8];
+            responder
+                .receive_data(&mut buf, OP_BUDGET, FAR_FUTURE_NOW)
+                .unwrap();
+        }
+        // Now policy_count == threshold-1 == 2 on both sides. Hand-craft
+        // a THIRD DATA record directly onto the wire, bypassing
+        // send_data's auto-marker-emission entirely.
+        let record = post_active::encode_data_record(b"late").unwrap();
+        let mut ciphertext = vec![0u8; record.len() + 16];
+        let ct_len = initiator
+            .transport
+            .write_message(&record, &mut ciphertext)
+            .unwrap();
+        wire::write_transport_record(
+            &mut initiator.stream,
+            &ciphertext[..ct_len],
+            &OperationDeadline::new(OP_BUDGET).unwrap(),
+        )
+        .unwrap();
+
+        let mut buf = [0u8; 8];
+        let err = responder
+            .receive_data(&mut buf, OP_BUDGET, FAR_FUTURE_NOW)
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            PostActiveError::Rekey(crate::error::RekeyError::ExpectedRekeyMarker)
+        ));
+        assert!(responder.is_closed());
     }
 }

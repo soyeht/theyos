@@ -268,6 +268,60 @@ pub enum IntentError {
     EmptyIdentifier,
 }
 
+/// Errors from post-Active records (DATA/REVOKE_NOTICE/CLOSE/REKEY),
+/// frozen by `kiana-bsessao-post-active-wire-addendum.b14fcf9520222ad3ab3ac3443ae4b0e7ba219411f41e3389751c92a402b64d8a.md`
+/// (+ provenance-only erratum1 `4be4cd3d0963cbc145b4aeb1f5450e5753e84f1b65e94e84af9ecd29832bf203.md`),
+/// both self-hash verified 2026-08-04. Deliberately separate from
+/// [`AuthFrameError`]/[`IntentError`] — these records are neither
+/// `AuthFrameBody` nor the 0x06 intent carrier, and never pass through
+/// `sign_frame`/`verify_frame`/`sign_intent_record`.
+#[derive(Debug, Error)]
+pub enum PostActiveError {
+    #[error(transparent)]
+    Wire(#[from] WireError),
+    #[error(transparent)]
+    Cbor(#[from] CborError),
+    #[error("post-Active plaintext is empty — no type byte present")]
+    EmptyRecord,
+    #[error("body length {declared} exceeds the maximum {max}")]
+    OversizeBody { declared: u32, max: u32 },
+    #[error("CLOSE/REVOKE_NOTICE body must be exactly empty (addendum §3.2/§3.3)")]
+    NonEmptyControlBody,
+    #[error("auth frame type byte {0:#04x} is not valid after Active")]
+    UnexpectedAuthFrame(u8),
+    #[error("0x06 intent record is not valid after Active")]
+    UnexpectedIntentRecord,
+    #[error("0x07 is reserved and unreachable")]
+    ReservedTypeByte,
+    #[error("unknown post-Active type byte {0:#04x}")]
+    UnknownTypeByte(u8),
+    #[error("session is already closed")]
+    Closed,
+    #[error("D1 forwarding authorization was not granted for this operation")]
+    NotAuthorized,
+    #[error("session has expired (now >= expires_at)")]
+    Expired,
+    #[error(transparent)]
+    Rekey(#[from] RekeyError),
+    #[error(transparent)]
+    Noise(#[from] NoiseSetupError),
+    #[error(
+        "caller-provided receive buffer ({buffer_len}) is smaller than the delivered DATA payload ({payload_len})"
+    )]
+    ReceiveBufferTooSmall {
+        buffer_len: usize,
+        payload_len: usize,
+    },
+    #[error("peer sent CLOSE")]
+    PeerClosed,
+    #[error("peer sent REVOKE_NOTICE")]
+    PeerRevoked,
+    #[error(
+        "REKEY may only be emitted by this crate to immediately precede CLOSE while in the terminal Closing substate"
+    )]
+    RekeyOnlyAllowedBeforeClose,
+}
+
 /// Errors from Noise session-static setup (item 2).
 #[derive(Debug, Error)]
 pub enum NoiseSetupError {
