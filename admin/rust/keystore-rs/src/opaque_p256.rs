@@ -66,7 +66,34 @@ pub const P256_SIGNATURE_LEN: usize = 64;
 /// for another. It does NOT alter the signed bytes — see the note on
 /// [`Purpose::PURPOSE`], which this summary previously contradicted by also
 /// claiming distinct signing preimages.
-pub trait Purpose {
+pub(crate) mod purpose_sealed {
+    /// Not nameable outside this crate, so `Purpose` cannot be implemented
+    /// outside it either.
+    pub trait Sealed {}
+}
+
+/// The ratified signing/storage purpose, declared HERE by the crate that
+/// owns the slot namespace — the only place that can guarantee the property
+/// the whole type-level separation rests on: two distinct `Purpose` types
+/// never share a `PURPOSE` string.
+///
+/// Before the seal, a downstream crate could declare its own type with
+/// `PURPOSE = "mesh-session"` and reach the SAME physical key, because the
+/// string is hashed into the canonical slot id. It could then mint a
+/// `Preimage` for its own type and sign arbitrary bytes with the real key,
+/// bypassing D4. Measured, not theorised: an external probe read the
+/// identical public key through a forged purpose and signed attacker-chosen
+/// bytes.
+///
+/// `RosterSync` is deliberately absent — D6 has ratified no authority model
+/// for it, so it gets no purpose type.
+pub struct MeshSessionPurpose;
+impl purpose_sealed::Sealed for MeshSessionPurpose {}
+impl Purpose for MeshSessionPurpose {
+    const PURPOSE: &'static str = "mesh-session";
+}
+
+pub trait Purpose: purpose_sealed::Sealed {
     /// Stable label that domain-separates STORAGE: it is hashed into the
     /// canonical slot id, so changing it orphans existing keys. Treat it as
     /// a wire constant.
@@ -1499,11 +1526,13 @@ mod tests {
     use super::*;
 
     struct MeshSession;
+    impl super::purpose_sealed::Sealed for MeshSession {}
     impl Purpose for MeshSession {
         const PURPOSE: &'static str = "mesh-session";
     }
 
     struct RosterSync;
+    impl super::purpose_sealed::Sealed for RosterSync {}
     impl Purpose for RosterSync {
         const PURPOSE: &'static str = "roster-sync";
     }
@@ -1590,10 +1619,12 @@ mod tests {
     #[test]
     fn ambiguous_purpose_label_join_no_longer_collides() {
         struct A;
+        impl super::purpose_sealed::Sealed for A {}
         impl Purpose for A {
             const PURPOSE: &'static str = "a";
         }
         struct AB;
+        impl super::purpose_sealed::Sealed for AB {}
         impl Purpose for AB {
             const PURPOSE: &'static str = "a.b";
         }
@@ -2128,10 +2159,12 @@ mod tests {
     #[test]
     fn slot_id_is_fixed_width_and_separates_distinct_inputs() {
         struct A;
+        impl super::purpose_sealed::Sealed for A {}
         impl Purpose for A {
             const PURPOSE: &'static str = "a";
         }
         struct AB;
+        impl super::purpose_sealed::Sealed for AB {}
         impl Purpose for AB {
             const PURPOSE: &'static str = "a.b";
         }

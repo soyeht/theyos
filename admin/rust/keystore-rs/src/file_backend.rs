@@ -3131,6 +3131,7 @@ mod tests {
         use crate::opaque_p256::{ApprovedFallback, OpaqueP256Slots, Purpose, Slot, SlotOutcome};
 
         struct AuditPurpose;
+        impl crate::opaque_p256::purpose_sealed::Sealed for AuditPurpose {}
         impl Purpose for AuditPurpose {
             const PURPOSE: &'static str = "audit/indeterminate";
         }
