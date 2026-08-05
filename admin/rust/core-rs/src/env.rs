@@ -134,15 +134,15 @@ fn pick_sudo_invoker_home(
     sudo_uid: Option<u32>,
     sudo_home: Option<&str>,
 ) -> Option<PathBuf> {
-    if let Some(user) = sudo_user.filter(|user| !user.is_empty() && *user != "root")
-        && let Some(home) = home_of_user(user)
-    {
-        return Some(home);
+    if let Some(user) = sudo_user.filter(|user| !user.is_empty() && *user != "root") {
+        if let Some(home) = home_of_user(user) {
+            return Some(home);
+        }
     }
-    if let Some(uid) = sudo_uid
-        && let Some(home) = home_of_uid(uid)
-    {
-        return Some(home);
+    if let Some(uid) = sudo_uid {
+        if let Some(home) = home_of_uid(uid) {
+            return Some(home);
+        }
     }
     sudo_home.filter(|home| !home.is_empty()).map(PathBuf::from)
 }

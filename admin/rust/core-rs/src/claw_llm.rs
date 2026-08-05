@@ -667,10 +667,10 @@ fn resolve_context_window(
         return (context_window, "env".to_string());
     }
 
-    if env_flag_default_any_with_profile(&["THEYOS_LLM_CONTEXT_AUTO_DETECT"], true, profile)
-        && let Some(context_window) = detect_runtime_context_window(provider, model, base_url)
-    {
-        return (context_window, "runtime".to_string());
+    if env_flag_default_any_with_profile(&["THEYOS_LLM_CONTEXT_AUTO_DETECT"], true, profile) {
+        if let Some(context_window) = detect_runtime_context_window(provider, model, base_url) {
+            return (context_window, "runtime".to_string());
+        }
     }
 
     if let Some(context_window) = known_model_context_window(provider, model) {
@@ -719,13 +719,14 @@ fn find_context_value(value: &Value) -> Option<u32> {
         Value::Object(map) => {
             for (key, nested) in map {
                 let key = key.as_str();
-                if (matches!(
+                if matches!(
                     key,
                     "context_length" | "contextWindow" | "context_window" | "n_ctx" | "ctx_size"
-                ) || key.ends_with(".context_length"))
-                    && let Some(context_window) = value_to_positive_u32(nested)
+                ) || key.ends_with(".context_length")
                 {
-                    return Some(context_window);
+                    if let Some(context_window) = value_to_positive_u32(nested) {
+                        return Some(context_window);
+                    }
                 }
             }
             map.values().find_map(find_context_value)
