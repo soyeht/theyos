@@ -39,6 +39,10 @@ mesh-session-core-rs = { path = "../mesh-session-core-rs", optional = true }
 # same technique and precedent as mesh-session-core-rs's own item-14
 # checks this session.
 static_assertions = "1"
+# Real, separate rustc invocations whose failure IS the proof — same
+# version pin and usage pattern as household-rs's own compile-fail
+# suite (`tests/compile-fail/`).
+trybuild = "1"
 
 [lints]
 workspace = true
