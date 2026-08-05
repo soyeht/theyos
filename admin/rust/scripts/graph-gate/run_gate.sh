@@ -37,6 +37,16 @@ run() {
   "$@" > "$OUT/$label.out" 2> "$OUT/$label.err"
   local rc=$?
   echo "RC=$rc"
+  # On failure, EMIT the captured stderr instead of leaving it in $OUT. That
+  # directory is a runner-local tempdir: in CI the log showed only `RC=101`
+  # and the reason had to be reproduced on a developer machine to be known at
+  # all. A gate whose failures cannot be diagnosed from its own output is a
+  # gate someone will rerun until it goes green rather than read.
+  if [ "$rc" -ne 0 ] && [ -s "$OUT/$label.err" ]; then
+    echo "--- $label STDERR (first 40 lines)"
+    head -40 "$OUT/$label.err"
+    echo "--- end $label STDERR"
+  fi
   if [ "$rc" -eq 0 ]; then pass=$((pass+1)); else fail=$((fail+1)); fi
   return $rc
 }
@@ -48,8 +58,13 @@ skip_cfg() {
   skip=$((skip+1))
 }
 
+# `--locked` here for the same reason as below, and it matters more than it
+# looks: this decides whether the runtime phases run at all, and it swallows
+# stderr, so an `--offline` failure here reports the package as ABSENT and the
+# phases become SKIP rather than FAIL -- a gate reporting green for a
+# configuration it never ran, which is the failure this lane exists to prevent.
 have_pkg() {
-  cargo metadata --format-version 1 --no-deps --offline 2>/dev/null \
+  cargo metadata --format-version 1 --no-deps --locked 2>/dev/null \
     | python3 -c "import json,sys;print(any(p['name']=='$1' for p in json.load(sys.stdin)['packages']))" \
     | grep -q True
 }
@@ -57,14 +72,21 @@ have_pkg() {
 # ---------------------------------------------------------------- structural
 echo "=== PHASE 1: graph structure (cargo metadata, not manifest reading) ==="
 
-run md-default cargo metadata --format-version 1 --offline
+# `--locked`, NOT `--offline`. `--offline` needs a populated registry cache and
+# returned RC=101 on the CI runner (`no matching package named serde`), which
+# took all seven phases down with it -- pass=0 fail=7 -- because every phase
+# consumes this JSON. Reproduced with a cold CARGO_HOME locally: --offline
+# RC=101, --locked RC=0 with the lockfile untouched. `--locked` still refuses
+# to change Cargo.lock, so the resolution being measured is the committed one;
+# it only permits the fetch that makes measuring possible at all.
+run md-default cargo metadata --format-version 1 --locked
 cp "$OUT/md-default.out" "$OUT/md-default.json" 2>/dev/null
 
 run cycles-default python3 "$GATE_PY" cycles --metadata "$OUT/md-default.json"
 cat "$OUT/cycles-default.out"
 
 if have_pkg mesh-session-runtime-rs; then
-  run md-runtime-on cargo metadata --format-version 1 --offline \
+  run md-runtime-on cargo metadata --format-version 1 --locked \
       --features mesh-session-runtime-rs/mesh-session-runtime
   cp "$OUT/md-runtime-on.out" "$OUT/md-runtime-on.json" 2>/dev/null
   run cycles-runtime-on python3 "$GATE_PY" cycles --metadata "$OUT/md-runtime-on.json"
