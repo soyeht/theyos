@@ -69,3 +69,8 @@ path = "tests/model_invariants.rs"
 #   cargo test                                            -- closed surface
 #   cargo test --features test-support,roster-sync-unratified -- full suite
 required-features = ["test-support", "roster-sync-unratified"]
+
+[[test]]
+name = "cas_multiprocess"
+path = "tests/cas_multiprocess.rs"
+required-features = ["test-support", "roster-sync-unratified"]

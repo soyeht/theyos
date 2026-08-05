@@ -1,5 +1,10 @@
 [workspace]
 resolver = "2"
+# Both declare their own [workspace] (deliberately standalone). Once
+# keystore-rs path-depends on one under the `mesh-session` feature, cargo
+# would otherwise report "multiple workspace roots found in the same
+# workspace"; excluding them keeps them detached AND depended-upon.
+exclude = ["mesh-session-control-model-rs", "mesh-session-core-rs"]
 members = [
     "backup-rs",
     "claw-rs",
@@ -35,7 +40,16 @@ members = [
 
 [workspace.package]
 edition = "2024"
-rust-version = "1.85"
+# Raised 1.85 -> 1.89 for the bridge batch. This is not a new requirement,
+# it is an honest one: the co-located D4 control model uses std's
+# `File::lock` (stabilised 1.89) in store.rs for its cross-process CAS, so
+# 1.89 was already the effective floor for anything hosting it. Clippy
+# reported it as `incompatible_msrv` rather than letting it pass silently.
+# Deliberately NOT a per-package override on keystore-rs: keystore is a
+# dependency of device-key-rs/household-rs/llm-proxy-rs/server-rs, so those
+# four inherit the floor in practice regardless, and an override would only
+# hide that from the manifest.
+rust-version = "1.89"
 
 [workspace.lints.rust]
 unsafe_code = "warn"

@@ -120,6 +120,14 @@ impl OpaqueSignPreimage {
     /// domain-separated preimage of its own, never from caller-supplied
     /// bytes. No wire format is invented here; that stays core/keystore's
     /// to define.
+    /// Crate-internal constructor for the co-located bridge adapter, which
+    /// wraps bytes core already derived from a sealed frame body. Never
+    /// public: outside callers still have no way to mint a preimage.
+    #[must_use]
+    pub(crate) fn from_core_bytes(bytes: Vec<u8>) -> Self {
+        Self(bytes)
+    }
+
     #[cfg(feature = "test-support")]
     #[must_use]
     pub fn for_test(bytes: Vec<u8>) -> Self {
@@ -136,13 +144,20 @@ impl OpaqueSignPreimage {
 pub struct OpaqueSignature(Vec<u8>);
 
 impl OpaqueSignature {
+    /// Crate-internal constructor for the co-located bridge adapter, which
+    /// returns what the keystore signer actually produced.
+    #[must_use]
+    pub(crate) fn from_backend_bytes(bytes: Vec<u8>) -> Self {
+        Self(bytes)
+    }
+
     #[must_use]
     pub fn as_bytes(&self) -> &[u8] {
         &self.0
     }
 }
 
-mod sealed {
+pub(crate) mod sealed {
     /// Not nameable outside this crate, so `SignPrimitive` cannot be
     /// implemented outside it either. This is the mechanism that keeps
     /// arbitrary caller code out of the critical section.

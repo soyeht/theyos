@@ -42,6 +42,82 @@ pub mod file_backend;
 
 /// Purpose-bound P-256 slots whose private scalar never crosses the API.
 /// Separate from the generic byte store on purpose — see the module docs.
+/// D4 co-located, feature-gated, by INCLUDING its real sources — no copy,
+/// no rewrite, one source of truth. `mesh-session-control-model-rs` remains
+/// the sole home of those files and of its 138 REDs; this compiles the SAME
+/// files as part of `keystore-rs` so that D4's `pub(crate)` sign guard and
+/// the P-256 scalar finally live in one crate.
+///
+/// That co-location is the entire point (Option C): across crates,
+/// `ControlRecordCell::acquire_for_sign_internal` is `E0624 private method`,
+/// so no keystore function could hold the guard and sign in one call without
+/// handing a guard-owning token to the caller — which was measured to stall
+/// `RevokeUrgent` for as long as the caller cared to hold it.
+#[cfg(feature = "mesh-session")]
+#[path = "../../mesh-session-control-model-rs/src/lib.rs"]
+// keystore-rs runs a stricter lint profile than the D4 crate does. These are
+// scoped HERE, on the inclusion, rather than by editing D4's sources: those
+// files have exactly one home and must stay byte-identical to the ones its
+// own 138 REDs are gated on. Silencing style lints at the seam is not the
+// same as weakening D4's gates -- it still compiles under its own crate's
+// `-D warnings`.
+#[allow(
+    // Style lints pre-existing in the byte-identical D4 sources. Enumerated
+    // from ONE `cargo clippy --message-format=json` capture, not guessed;
+    // scoped to this inclusion so keystore-rs's own lint profile is
+    // untouched. `incompatible_msrv` is deliberately ABSENT -- it was a real
+    // finding, fixed by raising the workspace floor, not silenced.
+    clippy::doc_markdown,
+    clippy::items_after_statements,
+    clippy::manual_let_else,
+    clippy::match_same_arms,
+    clippy::needless_pass_by_value,
+    clippy::redundant_closure_for_method_calls,
+    clippy::single_match_else,
+    clippy::struct_excessive_bools,
+    clippy::trivially_copy_pass_by_ref,
+    clippy::unused_self,
+    // The D4 surface beyond the signing path (gc, activation, transitions)
+    // is unused by THIS crate's library build -- the bridge drives only the
+    // sign path. Not dead in any real sense: the 138 REDs exercise it (134
+    // via the co-located harness here, 4 in the standalone target) and it is
+    // the API a future facade composes. Allowed only now that the adapter
+    // exists; before it, this same allow would have masked "nothing uses D4
+    // at all".
+    dead_code
+)]
+mod d4_inline;
+#[cfg(feature = "mesh-session")]
+#[allow(clippy::wildcard_imports)]
+pub(crate) use d4_inline::*;
+
+/// Makes the D4 REDs -- which name `mesh_session_control_model_rs::…` --
+/// resolve to THIS crate, so they exercise the co-located instance rather
+/// than the parallel standalone crate. Publishes nothing: the alias names
+/// self, and everything it reaches is `pub(crate)`.
+#[cfg(all(
+    test,
+    feature = "mesh-session",
+    feature = "test-support",
+    feature = "roster-sync-unratified"
+))]
+extern crate self as mesh_session_control_model_rs;
+
+/// The 134 non-multiprocess REDs, included from their ONE source. The other
+/// 4 need `CARGO_BIN_EXE_*`, which cargo injects only for integration
+/// targets, so they stay gated in the standalone crate -- see
+/// `mesh-session-control-model-rs/tests/cas_multiprocess.rs`.
+#[cfg(all(
+    test,
+    feature = "mesh-session",
+    feature = "test-support",
+    feature = "roster-sync-unratified"
+))]
+#[path = "../../mesh-session-control-model-rs/tests/model_invariants.rs"]
+mod d4_reds;
+
+#[cfg(feature = "mesh-session")]
+pub mod mesh_session_bridge;
 pub mod opaque_p256;
 
 #[cfg(target_os = "linux")]

@@ -1180,10 +1180,14 @@ fn create_ancestors_durably(dir: &Path) -> std::io::Result<()> {
     let mut built = PathBuf::new();
     for component in dir.components() {
         built.push(component);
-        if let Err(e) = fs::create_dir(&built) {
-            if e.kind() != ErrorKind::AlreadyExists {
-                return Err(e);
-            }
+        // Let-chain, newly available now that the workspace floor is 1.89
+        // (raised for the co-located D4's `File::lock`). Collapsing is
+        // clippy's own suggestion under that floor -- the behaviour is
+        // unchanged: any error other than "already exists" propagates.
+        if let Err(e) = fs::create_dir(&built)
+            && e.kind() != ErrorKind::AlreadyExists
+        {
+            return Err(e);
         }
         // Fsync the parent UNCONDITIONALLY, including when the level
         // already existed.
