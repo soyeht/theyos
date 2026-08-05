@@ -763,14 +763,15 @@ pub async fn authorize_roster_read(
                 return Err(authority_unavailable("authority_absent"));
             }
             Ok(Ok(Err(_))) => return Err(device_rejected("authority_read_rejected")),
-            // The durable record no longer matches the identity this request was
-            // authorized against. That is a cross-binding — a property of the
-            // request's binding — and the wire class above requires it to
-            // collapse. Answering `AuthorityUnavailable` here would distinguish
-            // it from the other fifteen device-side refusals.
-            Ok(Err(ExactLifecycleRefusal::RecordChanged)) => {
-                return Err(device_rejected("cross_binding"));
-            }
+            // All four causes are decided by server state alone -- the record is
+            // the identity this server loaded, the path is this server's state
+            // dir -- so none of them is selectable by the caller and all belong
+            // to the availability class. `RecordChanged` in particular is the
+            // server disagreeing with its own durable record, not a device bound
+            // to another household; that device-side cross-binding is caught by
+            // `pop_person_mismatch` / `owner_person_mismatch` below and still
+            // collapses. Answering `DeviceUnauthenticated` here would hide a
+            // server misconfiguration behind a client-facing 401.
             Ok(Err(refusal)) => return Err(authority_unavailable(refusal.reason())),
             Err(_) => return Err(authority_unavailable("authority_join_failed")),
         }

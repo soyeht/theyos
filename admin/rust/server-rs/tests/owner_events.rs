@@ -11951,6 +11951,18 @@ mod device_roster_read {
         // state dir. Its owner cert verifies under its own root, so the refusal
         // is attributable to the durable record belonging to another root —
         // not to a cert or clock failure earlier in the chain.
+        //
+        // This is the *server* disagreeing with its own durable record: the
+        // record comes from the identity this server loaded and the path from
+        // this server's state dir, so no request byte selects the branch. It is
+        // therefore the availability class, not the collapsed device class — the
+        // device-side cross-binding (a device bound to another household) is a
+        // different condition, is caller-selectable, and still collapses via
+        // `pop_person_slot_must_equal_the_entry_parent`. Answering 401 here
+        // would hide a misconfigured server behind a client-facing refusal.
+        // `the_refusal_class_is_never_selectable_by_the_caller` is what holds
+        // the anti-enumeration property; this test only pins where this one
+        // condition belongs.
         let foreign_seam = self::seam(None);
         let foreign_state = foreign_seam.state;
         let now = unix_now();
@@ -11966,7 +11978,13 @@ mod device_roster_read {
             now,
         )
         .await;
-        assert_device_rejected(result);
+        match result {
+            Err(RosterReadAuthError::AuthorityUnavailable) => {}
+            Err(other) => {
+                panic!("expected the cross-root authority to be unavailable, got {other:?}")
+            }
+            Ok(_) => panic!("a foreign household root must never authorize"),
+        }
     }
 
     /// The refusal *class* must be a function of server state alone.
