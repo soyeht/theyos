@@ -125,6 +125,21 @@ jobs:
         run: cd admin/rust && cargo build --workspace 2>&1
       - name: Run tests (serialised)
         run: cd admin/rust && cargo test --workspace -- --test-threads=1 2>&1
+      - name: Feature-gated compile-fail proofs (mesh-session-runtime)
+        # `cargo test --workspace` runs with DEFAULT features, so any trybuild
+        # case inside a `#[cfg(feature = "...")]` test fn is never executed --
+        # it is merely NAMED in the source. Two of them guard
+        # `SealedBinding::from_membership_key` against a raw `ProofI` and a bare
+        # `m_id`, which is the "never a raw ProofI" rule, and neither was being
+        # run anywhere.
+        #
+        # `cargo check --features` (the feature-surface step above) compiles the
+        # crate but does NOT execute trybuild, so it cannot substitute for this.
+        #
+        # Measured before adding: break `membership_key_from_raw_proof_i.rs` so
+        # it compiles, and this step exits 101 while the default `cargo test`
+        # above still exits 0. The step is the only thing that sees it.
+        run: cd admin/rust && cargo test -p household-rs --features mesh-session-runtime --test compile_fail_peer_expectation -- --test-threads=1 2>&1
       - name: APNS dispatcher opacity lint (Constitution III source-level gate)
         # Third leg of the three-layer "no household metadata reaches the
         # push provider" enforcement stack (compile-time API shape +
@@ -199,6 +214,21 @@ jobs:
         run: cd admin/rust && cargo build --workspace 2>&1
       - name: Run tests (serialised)
         run: cd admin/rust && cargo test --workspace -- --test-threads=1 2>&1
+      - name: Feature-gated compile-fail proofs (mesh-session-runtime)
+        # `cargo test --workspace` runs with DEFAULT features, so any trybuild
+        # case inside a `#[cfg(feature = "...")]` test fn is never executed --
+        # it is merely NAMED in the source. Two of them guard
+        # `SealedBinding::from_membership_key` against a raw `ProofI` and a bare
+        # `m_id`, which is the "never a raw ProofI" rule, and neither was being
+        # run anywhere.
+        #
+        # `cargo check --features` (the feature-surface step above) compiles the
+        # crate but does NOT execute trybuild, so it cannot substitute for this.
+        #
+        # Measured before adding: break `membership_key_from_raw_proof_i.rs` so
+        # it compiles, and this step exits 101 while the default `cargo test`
+        # above still exits 0. The step is the only thing that sees it.
+        run: cd admin/rust && cargo test -p household-rs --features mesh-session-runtime --test compile_fail_peer_expectation -- --test-threads=1 2>&1
       - name: APNS dispatcher opacity lint (Constitution III source-level gate)
         # Third leg of the three-layer "no household metadata reaches the
         # push provider" enforcement stack (compile-time API shape +
