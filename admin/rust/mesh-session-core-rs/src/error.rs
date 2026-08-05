@@ -266,6 +266,38 @@ pub enum IntentError {
     PendingIntentCheckpointMismatch,
     #[error("intent record carries an empty hh_id/initiator_m_id/target_m_id/delegated_key_id")]
     EmptyIdentifier,
+    /// 2026-08-05, @daisy, runtime-facade `D1Admission` adapter
+    /// (`RegistryD1Admission`, `mesh-session-runtime-rs`): a real
+    /// `reserve_pending` needs a current `RosterSnapshotView` to project a
+    /// `D1MembershipKey` into a `SealedBinding` before it can even ask the
+    /// registry to admit anything. Deliberately its OWN variant, never
+    /// folded into [`Self::D1MembershipRejected`] (@zain, explicit): "the
+    /// snapshot could not be acquired" and "the roster, once acquired,
+    /// rejected this binding" are different failures with different
+    /// remediation — the first is a local/IO condition the caller might
+    /// retry, the second is a genuine admission decision.
+    #[error("could not acquire a current roster snapshot for D1 admission")]
+    RosterSnapshotUnavailable,
+    /// 2026-08-05, @daisy, same adapter: the roster — whether checked by
+    /// this adapter's own pre-check (`SealedBinding::from_membership_key`)
+    /// or by the registry's own internal recheck against a possibly-more-
+    /// advanced revision inside `try_preauthorize_before` — rejected this
+    /// exact binding. One flat class covering every sub-reason (household
+    /// mismatch, revision mismatch, revoked, not active, or a stale
+    /// `D1MembershipKey` field), matching `MembershipKeyRejected`'s own
+    /// "no variant, no field" discipline: this is the seam boundary, not a
+    /// place to re-leak household-rs's internal refusal taxonomy across
+    /// crates.
+    #[error("D1 registry roster check rejected this membership binding")]
+    D1MembershipRejected,
+    /// 2026-08-05, @daisy, same adapter: the D1 registry itself is
+    /// unavailable (its lock poisoned, or the tracked household's mode is
+    /// no longer `Live`) — distinct from [`Self::D1MembershipRejected`]:
+    /// this is an infrastructure failure with no binding-specific cause to
+    /// report, matching [`Self::NonceLedgerUnavailable`]'s own shape one
+    /// seam over.
+    #[error("D1 registry unavailable")]
+    D1RegistryUnavailable,
 }
 
 /// Errors from post-Active records (DATA/REVOKE_NOTICE/CLOSE/REKEY),

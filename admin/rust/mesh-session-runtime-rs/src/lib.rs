@@ -13,14 +13,21 @@
 //!   `keystore_rs::mesh_session_bridge::ClockSource` (D4's own `Clock`,
 //!   distinct from `mesh_session_core_rs::intent::Clock` above).
 //!
+//! - `d1_admission::RegistryD1Admission`: a real
+//!   `mesh_session_core_rs::intent::D1Admission` +
+//!   `ActiveGateAuthorization` over `household_rs::mesh_session_registry
+//!   ::MeshSessionRegistry`. Generic over `H: RevocableMeshSession`; the
+//!   concrete `H` and whatever produces real `Weak<H>` handles are a
+//!   different piece of the pipeline (see that module's own doc).
+//!
 //! Explicitly NOT in this round's scope (declared, not built — see each
 //! module's own doc for why real material does not exist yet):
 //! `SignatureVerifier`, a real `cell::open` call site, a TTL source, a
-//! `generation: NonZeroU64` source, `D1Admission`, `ActiveGateAuthorization`
-//! real adapters. `household-rs`'s own `SealedBinding::from_membership_key`
-//! (feature `mesh-session-runtime` on that crate) is a separate,
-//! already-landed piece this facade will eventually call into, not
-//! duplicated here.
+//! `generation: NonZeroU64` source, and a concrete `H: RevocableMeshSession`
+//! (and whatever produces real `Weak<H>` handles for it). `household-rs`'s
+//! own `SealedBinding::from_membership_key` (feature `mesh-session-runtime`
+//! on that crate) is a separate, already-landed piece this facade calls
+//! into, not duplicated here.
 //!
 //! Everything real in this crate lives behind the `mesh-session-runtime`
 //! feature (non-default) — see this crate's own `Cargo.toml` for why
@@ -38,6 +45,11 @@ pub use clock::SystemClock;
 mod d4_clock;
 #[cfg(feature = "mesh-session-runtime")]
 pub use d4_clock::SystemD4Clock;
+
+#[cfg(feature = "mesh-session-runtime")]
+mod d1_admission;
+#[cfg(feature = "mesh-session-runtime")]
+pub use d1_admission::{RegistryActiveGate, RegistryD1Admission, RegistryD1Pending};
 
 #[cfg(feature = "mesh-session-runtime")]
 mod roster_bridge;
