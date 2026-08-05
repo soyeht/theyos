@@ -44,6 +44,16 @@
 //! ## Operational notes
 //!
 //! - Requires systemd ≥ 250 (released 2021-12). NixOS 22.11+ ships this.
+//! - **Running unprivileged needs two separate grants, not one.** This
+//!   backend does not talk to `/dev/tpmrm0` itself — it shells out to
+//!   `systemd-creds`, and systemd performs the TPM operation in a separate
+//!   privileged service reached over varlink, which authorizes by CALLER
+//!   UID. So the service user needs (a) access to the TPM device (on NixOS:
+//!   `security.tpm2.enable = true` plus `tss` group membership) *and* (b) a
+//!   polkit rule permitting it to call `io.systemd.credentials.*`. Granting
+//!   only (a) yields a process that can open the device and is still refused
+//!   at the first seal. [`tpm2_availability`] detects exactly this and
+//!   reports [`Tpm2Availability::AuthorizationDenied`].
 //! - First-boot encryption needs the TPM2 to be present and writable;
 //!   subsequent unseal needs nothing from the operator.
 //! - Decrypt failures (host migrated to different hardware, TPM cleared or
@@ -281,6 +291,37 @@ fn injected_runner() -> Option<CredsRunner> {
     CREDS_RUNNER.with(std::cell::Cell::get)
 }
 
+/// Test-only override for the two filesystem facts the probe reads, so a
+/// host with no TPM can drive every branch of the classification.
+///
+/// Only the filesystem answers are faked. The seal step still goes through
+/// [`encrypt_with_systemd_creds`], i.e. through [`CredsRunner`] — so a test
+/// that wants "device is fine but the service refuses" injects a runner that
+/// refuses, exactly as the real service would. Nothing here substitutes for
+/// the functional gate: a fake seal proves nothing about sealing.
+#[cfg(test)]
+#[derive(Clone, Copy)]
+pub(crate) struct ProbeOverrides {
+    pub sys_tpm0_exists: bool,
+    pub tpmrm0_openable: bool,
+}
+
+#[cfg(test)]
+thread_local! {
+    static PROBE_OVERRIDES: std::cell::Cell<Option<ProbeOverrides>> =
+        const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) fn set_probe_overrides(o: Option<ProbeOverrides>) {
+    PROBE_OVERRIDES.with(|c| c.set(o));
+}
+
+#[cfg(test)]
+fn probe_overrides() -> Option<ProbeOverrides> {
+    PROBE_OVERRIDES.with(std::cell::Cell::get)
+}
+
 /// Run `systemd-creds encrypt --with-key=tpm2 --name=<account> - -`,
 /// feeding `plaintext` through stdin and reading the sealed blob from
 /// stdout. The blob is binary by default (no `--pretty`); we keep it as
@@ -401,47 +442,203 @@ fn decrypt_with_systemd_creds(account: &str, ciphertext: &[u8]) -> Result<Vec<u8
     Ok(output.stdout)
 }
 
-/// `true` when the running host can probably seal credentials to a TPM2.
+/// Kernel's view of a TPM chip. Absent ⇒ the host has no TPM at all.
+const SYS_TPM0: &str = "/sys/class/tpm/tpm0";
+/// Resource-manager device the TPM stack talks through.
+const DEV_TPMRM0: &str = "/dev/tpmrm0";
+
+/// Credential name used by the capability probe. Distinct from any real
+/// account: the probe seals a constant, never a caller's value.
+const PROBE_NAME: &str = "theyos-tpm2-capability-probe";
+/// Constant, non-secret probe plaintext. Sealing it proves the capability
+/// without putting any real key material through the subprocess.
+const PROBE_PLAINTEXT: &[u8] = b"theyos-tpm2-capability-probe";
+
+/// Varlink error names systemd returns when the CALLER is not authorized to
+/// use the credentials service, as distinct from anything being wrong with
+/// the TPM. `InteractiveAuthenticationRequired` is what systemd 259 returns
+/// when polkit would need to ask; `PermissionDenied` is the systemd 261
+/// wording when it refuses outright.
 ///
-/// Cached for the process lifetime — TPM presence does not change at
-/// runtime, and the probe is non-trivial (it spawns systemd-creds). A
-/// `false` return is a sticky decision: the caller picks the file
-/// fallback and we stay there until restart.
+/// This is string matching on stderr, which is fragile — but it is the only
+/// channel the CLI exposes, and misclassification is deliberately not
+/// safety-relevant: every non-success outcome is unavailable and fails
+/// closed. The distinction changes only which remediation we log.
+const AUTHZ_DENIED_MARKERS: &[&str] = &[
+    "InteractiveAuthenticationRequired",
+    "PermissionDenied",
+    "Permission denied",
+];
+
+/// Why the TPM2 backend is (or is not) usable *by this process, as this uid*.
+///
+/// The distinction that matters operationally is
+/// [`Self::AuthorizationDenied`] vs the rest: it is the only one an operator
+/// fixes with a policy rule rather than with hardware or a device permission.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Tpm2Availability {
+    /// A dummy seal actually succeeded as this uid.
+    Available,
+    /// No `/sys/class/tpm/tpm0` — the host has no TPM chip.
+    NoTpmDevice,
+    /// TPM present, but `/dev/tpmrm0` is not openable by this process.
+    DeviceNotAccessible,
+    /// TPM present and reachable, but `systemd-creds` refused the caller.
+    /// Hardware is fine; this uid is not permitted to use the credentials
+    /// service.
+    AuthorizationDenied,
+    /// TPM present and reachable, caller authorized (or the refusal was not
+    /// an authorization one), but the seal did not succeed: TPM busy or
+    /// unprovisioned, `systemd-creds` missing, or another operational fault.
+    SealUnavailable,
+}
+
+impl Tpm2Availability {
+    /// Whether the TPM backend may be selected.
+    #[must_use]
+    pub fn is_available(self) -> bool {
+        matches!(self, Self::Available)
+    }
+
+    /// Operator-facing remediation for this outcome.
+    #[must_use]
+    pub fn remediation(self) -> &'static str {
+        match self {
+            Self::Available => "none",
+            Self::NoTpmDevice => {
+                "this host has no TPM2 chip; provision one or accept the file backend"
+            }
+            Self::DeviceNotAccessible => {
+                "grant this process access to /dev/tpmrm0 (on NixOS: `security.tpm2.enable = true` \
+                 and add the service user to the `tss` group)"
+            }
+            Self::AuthorizationDenied => {
+                "authorize this uid to call the systemd credentials service (polkit rule for \
+                 `io.systemd.credentials.*`); device permission alone is NOT sufficient"
+            }
+            Self::SealUnavailable => {
+                "check that systemd-creds is installed and the TPM is provisioned and not in use"
+            }
+        }
+    }
+}
+
+/// `true` when this process, **as the uid it is running under**, can actually
+/// seal a credential to the host TPM2.
+///
+/// Cached for the process lifetime — neither TPM presence nor this process's
+/// uid changes at runtime, and the probe is non-trivial (it spawns
+/// `systemd-creds` and performs a real seal). A `false` return is a sticky
+/// decision: the caller picks the file fallback and we stay there until
+/// restart.
 #[must_use]
 pub fn tpm2_available() -> bool {
-    static CACHED: OnceLock<bool> = OnceLock::new();
+    tpm2_availability().is_available()
+}
+
+/// Like [`tpm2_available`] but reports *why*, so the selection site can log
+/// a remediation the operator can act on.
+#[must_use]
+pub fn tpm2_availability() -> Tpm2Availability {
+    static CACHED: OnceLock<Tpm2Availability> = OnceLock::new();
     *CACHED.get_or_init(probe_tpm2)
 }
 
-fn probe_tpm2() -> bool {
-    // Cheap kernel-level check first: if there's no /sys/class/tpm/tpm0
-    // the host literally has no TPM device, so don't even spawn.
-    if !Path::new("/sys/class/tpm/tpm0").exists() {
-        tracing::debug!("no /sys/class/tpm/tpm0 — TPM2 backend unavailable");
-        return false;
+/// Does the kernel see a TPM chip?
+fn sys_tpm0_present() -> bool {
+    #[cfg(test)]
+    if let Some(o) = probe_overrides() {
+        return o.sys_tpm0_exists;
+    }
+    Path::new(SYS_TPM0).exists()
+}
+
+/// Can THIS process open the resource-manager device?
+fn tpmrm0_openable() -> bool {
+    #[cfg(test)]
+    if let Some(o) = probe_overrides() {
+        return o.tpmrm0_openable;
+    }
+    match std::fs::OpenOptions::new().read(true).open(DEV_TPMRM0) {
+        Ok(_) => true,
+        Err(e) => {
+            tracing::debug!(error = %e, "{DEV_TPMRM0} not openable by this process");
+            false
+        }
+    }
+}
+
+/// Attempt a harmless dummy seal as this uid.
+///
+/// This is the capability check proper. It runs the SAME code path the
+/// backend uses (`encrypt_with_systemd_creds`), so whatever would refuse a
+/// real seal refuses this one, and it leaves **no persistent artifact**:
+/// `systemd-creds encrypt … - -` reads stdin and writes stdout, touching no
+/// file, and the resulting blob is wiped rather than returned.
+fn effective_seal_probe() -> Result<(), KeystoreError> {
+    let mut sealed = encrypt_with_systemd_creds(PROBE_NAME, PROBE_PLAINTEXT)?;
+    sealed.zeroize();
+    Ok(())
+}
+
+/// Split a failed probe seal into "you are not allowed" vs "it did not work".
+fn classify_seal_failure(err: &KeystoreError) -> Tpm2Availability {
+    let text = err.to_string();
+    if AUTHZ_DENIED_MARKERS.iter().any(|m| text.contains(m)) {
+        Tpm2Availability::AuthorizationDenied
+    } else {
+        Tpm2Availability::SealUnavailable
+    }
+}
+
+fn probe_tpm2() -> Tpm2Availability {
+    // Cheap kernel-level check first: if there's no /sys/class/tpm/tpm0 the
+    // host literally has no TPM device, so don't even spawn.
+    if !sys_tpm0_present() {
+        tracing::debug!("no {SYS_TPM0} — TPM2 backend unavailable");
+        return Tpm2Availability::NoTpmDevice;
     }
 
-    // The kernel knows about a TPM; now check whether we can actually
-    // talk to it. `has-tpm2` only tests kernel support — on hosts
-    // where /dev/tpmrm0 is root-only (NixOS without
-    // `security.tpm2.enable`), the proxy daemon (running as the
-    // service user) would pass this check and then fail at first
-    // encrypt/decrypt with InteractiveAuthenticationRequired. So we
-    // must verify the resource-manager device is reachable from THIS
-    // process, not just from the kernel's point of view.
-    match std::fs::OpenOptions::new().read(true).open("/dev/tpmrm0") {
-        Ok(_) => {
-            tracing::debug!("TPM2 backend available (/dev/tpmrm0 readable)");
-            true
+    // The kernel knows about a TPM; check the device is reachable from THIS
+    // process. Cheap, and it separates "no permission on the device" from
+    // "no permission at the service" in the reported reason.
+    if !tpmrm0_openable() {
+        tracing::warn!(
+            remediation = Tpm2Availability::DeviceNotAccessible.remediation(),
+            "TPM2 device {DEV_TPMRM0} not accessible to this process; falling back"
+        );
+        return Tpm2Availability::DeviceNotAccessible;
+    }
+
+    // Device access is NOT the permission that decides. The backend never
+    // talks to /dev/tpmrm0 itself: it shells out to `systemd-creds`, and
+    // systemd performs the TPM operation in a separate privileged service
+    // reached over varlink, which authorizes by CALLER UID. A service user
+    // can therefore hold `tss` membership, open the device, and still be
+    // refused at first encrypt.
+    //
+    // That is not hypothetical — it is this backend's own deployment. The
+    // module docs choose `--with-key=tpm2` over `host+tpm2` precisely so the
+    // proxy can run as the service user rather than root, which is exactly
+    // the uid that gets refused. An earlier revision of this probe stopped at
+    // the device check and documented that check as preventing "pass the
+    // check then fail at first encrypt"; measured on a vTPM guest, it did not
+    // — the service user passed and then failed. So the probe now performs
+    // the capability itself.
+    match effective_seal_probe() {
+        Ok(()) => {
+            tracing::debug!("TPM2 backend available (dummy seal succeeded as this uid)");
+            Tpm2Availability::Available
         }
         Err(e) => {
+            let outcome = classify_seal_failure(&e);
             tracing::warn!(
                 error = %e,
-                "TPM2 device /dev/tpmrm0 not accessible to this process; falling back. \
-                 On NixOS enable `security.tpm2.enable = true` and add the proxy user \
-                 to the `tss` group."
+                outcome = ?outcome,
+                remediation = outcome.remediation(),
+                "TPM2 present and reachable but sealing failed as this uid; falling back"
             );
-            false
+            outcome
         }
     }
 }
@@ -469,15 +666,17 @@ mod tests {
     /// set (how a real functional gate should invoke this) the absence is a
     /// hard panic rather than a skip.
     fn require_tpm2() {
-        if tpm2_available() {
+        let availability = tpm2_availability();
+        if availability.is_available() {
             return;
         }
         let demanded = std::env::var(REQUIRE_TPM_ENV).is_ok_and(|v| v != "0");
         assert!(
             !demanded,
-            "{REQUIRE_TPM_ENV} is set but no usable TPM2 was found on this host: the \
-             functional TPM gate cannot be satisfied here, and reporting success would \
-             claim coverage that does not exist"
+            "{REQUIRE_TPM_ENV} is set but this process cannot seal to a TPM2 here \
+             ({availability:?}): the functional TPM gate cannot be satisfied, and reporting \
+             success would claim coverage that does not exist. Remediation: {}",
+            availability.remediation()
         );
         panic!(
             "no usable TPM2 on this host, so this test cannot verify anything. It is \
@@ -682,5 +881,271 @@ mod tests {
         // never overwrites) — still decrypts to the same plaintext.
         assert_eq!(ks.inner.get("acct").unwrap(), first_ciphertext);
         assert_eq!(ks.get("acct").unwrap(), plaintext);
+    }
+
+    // ---------------------------------------------------------------------
+    // Effective-capability probe.
+    //
+    // These drive `probe_tpm2` (uncached) rather than `tpm2_available` (which
+    // memoizes for the process and so could only ever be observed once).
+    // ---------------------------------------------------------------------
+
+    thread_local! {
+        /// Every seal attempted, in order, as `(account, plaintext)`.
+        ///
+        /// A bare counter would not discriminate: with the capability probe
+        /// removed, the ONE call observed is `create_only`'s rather than the
+        /// probe's, and a count of 1 reads identically either way. What
+        /// separates the two is *who* was sealed, so record that.
+        static ENCRYPT_LOG: std::cell::RefCell<Vec<(String, Vec<u8>)>> =
+            const { std::cell::RefCell::new(Vec::new()) };
+    }
+
+    fn reset_probe_counters() {
+        ENCRYPT_LOG.with(|c| c.borrow_mut().clear());
+    }
+    fn encrypt_log() -> Vec<(String, Vec<u8>)> {
+        ENCRYPT_LOG.with(|c| c.borrow().clone())
+    }
+    fn encrypt_calls() -> usize {
+        ENCRYPT_LOG.with(|c| c.borrow().len())
+    }
+    fn record_encrypt(account: &str, plaintext: &[u8]) {
+        let entry = (account.to_owned(), plaintext.to_vec());
+        ENCRYPT_LOG.with(|c| c.borrow_mut().push(entry));
+    }
+
+    /// Restores the real filesystem probe even if the test panics.
+    struct ProbeGuard;
+    impl Drop for ProbeGuard {
+        fn drop(&mut self) {
+            set_probe_overrides(None);
+        }
+    }
+
+    fn device_is_fine() {
+        set_probe_overrides(Some(ProbeOverrides {
+            sys_tpm0_exists: true,
+            tpmrm0_openable: true,
+        }));
+    }
+
+    /// A runner that refuses every seal with the stderr systemd actually
+    /// emits. `refusal` selects the wording.
+    macro_rules! refusing_runner {
+        ($name:ident, $kind:expr, $hint:expr) => {
+            fn $name() -> CredsRunner {
+                fn encrypt(account: &str, plaintext: &[u8]) -> Result<Vec<u8>, KeystoreError> {
+                    record_encrypt(account, plaintext);
+                    Err(KeystoreError::Io {
+                        kind: $kind.into(),
+                        hint: $hint.into(),
+                    })
+                }
+                fn decrypt(_a: &str, _c: &[u8]) -> Result<Vec<u8>, KeystoreError> {
+                    unreachable!("the capability probe never decrypts")
+                }
+                CredsRunner { encrypt, decrypt }
+            }
+        };
+    }
+
+    // systemd 261 wording, observed in the vTPM guest for a `tss` member with
+    // no polkit authorization.
+    refusing_runner!(
+        denies_permission_runner,
+        "systemd-creds encrypt exit exit status: 1",
+        "Failed to encrypt: org.varlink.service.PermissionDenied"
+    );
+    // systemd 259 wording, observed on bignix for a non-root caller.
+    refusing_runner!(
+        interactive_auth_runner,
+        "systemd-creds encrypt exit exit status: 1",
+        "Failed to encrypt: io.systemd.InteractiveAuthenticationRequired"
+    );
+    // A genuinely operational failure: nothing to do with who is calling.
+    refusing_runner!(
+        tpm_busy_runner,
+        "systemd-creds encrypt exit exit status: 1",
+        "Failed to encrypt: TPM2 device is busy"
+    );
+
+    /// Succeeds, and records what it was asked to seal.
+    fn counting_ok_runner() -> CredsRunner {
+        #[allow(clippy::unnecessary_wraps)]
+        fn encrypt(account: &str, plaintext: &[u8]) -> Result<Vec<u8>, KeystoreError> {
+            record_encrypt(account, plaintext);
+            let mut out = format!("fake:{account}:").into_bytes();
+            out.extend_from_slice(plaintext);
+            Ok(out)
+        }
+        fn decrypt(account: &str, ciphertext: &[u8]) -> Result<Vec<u8>, KeystoreError> {
+            let prefix = format!("fake:{account}:").into_bytes();
+            ciphertext
+                .strip_prefix(prefix.as_slice())
+                .map(<[u8]>::to_vec)
+                .ok_or_else(|| KeystoreError::Io {
+                    kind: "fake decrypt refused".into(),
+                    hint: "blob was sealed under a different account".into(),
+                })
+        }
+        CredsRunner { encrypt, decrypt }
+    }
+
+    /// THE regression this whole change exists for.
+    ///
+    /// Device access and the permission that decides are different resources.
+    /// A `tss` member opens `/dev/tpmrm0` fine and is still refused by the
+    /// credentials service, because the TPM work happens in a separate
+    /// privileged service that authorizes by caller uid. The previous probe
+    /// stopped at the device and returned "available" here.
+    #[test]
+    fn probe_refuses_when_the_device_is_readable_but_the_service_denies_this_uid() {
+        reset_probe_counters();
+        device_is_fine();
+        set_creds_runner(Some(denies_permission_runner()));
+        let (_p, _r) = (ProbeGuard, RunnerGuard);
+
+        assert_eq!(
+            probe_tpm2(),
+            Tpm2Availability::AuthorizationDenied,
+            "device readable + service refusal must be reported as an authorization denial, \
+             not as availability"
+        );
+        assert_eq!(
+            encrypt_calls(),
+            1,
+            "the probe must actually attempt the capability, not infer it"
+        );
+    }
+
+    /// The systemd 259 spelling of the same refusal.
+    #[test]
+    fn probe_refuses_on_interactive_authentication_required_too() {
+        reset_probe_counters();
+        device_is_fine();
+        set_creds_runner(Some(interactive_auth_runner()));
+        let (_p, _r) = (ProbeGuard, RunnerGuard);
+
+        assert_eq!(probe_tpm2(), Tpm2Availability::AuthorizationDenied);
+    }
+
+    /// An authorization denial must be distinguishable from the TPM simply
+    /// not working — same fail-closed outcome, different remediation.
+    #[test]
+    fn probe_separates_an_operational_failure_from_an_authorization_one() {
+        reset_probe_counters();
+        device_is_fine();
+        set_creds_runner(Some(tpm_busy_runner()));
+        let (_p, _r) = (ProbeGuard, RunnerGuard);
+
+        let outcome = probe_tpm2();
+        assert_eq!(outcome, Tpm2Availability::SealUnavailable);
+        assert_ne!(
+            outcome,
+            Tpm2Availability::AuthorizationDenied,
+            "a busy TPM must not be reported as a policy problem — the operator would \
+             go add a polkit rule that changes nothing"
+        );
+        assert!(!outcome.is_available(), "still fails closed");
+    }
+
+    /// The authorized path: available is claimed only after a seal SUCCEEDS.
+    #[test]
+    fn probe_reports_available_only_after_a_seal_succeeds() {
+        reset_probe_counters();
+        device_is_fine();
+        set_creds_runner(Some(counting_ok_runner()));
+        let (_p, _r) = (ProbeGuard, RunnerGuard);
+
+        assert_eq!(probe_tpm2(), Tpm2Availability::Available);
+        assert!(probe_tpm2().is_available());
+    }
+
+    /// The dummy seal must be harmless: a constant, under a probe-specific
+    /// name, never a caller's account or value.
+    #[test]
+    fn the_capability_probe_seals_only_a_constant_under_its_own_name() {
+        reset_probe_counters();
+        device_is_fine();
+        set_creds_runner(Some(counting_ok_runner()));
+        let (_p, _r) = (ProbeGuard, RunnerGuard);
+
+        assert_eq!(probe_tpm2(), Tpm2Availability::Available);
+        assert_eq!(
+            encrypt_log(),
+            vec![(PROBE_NAME.to_owned(), PROBE_PLAINTEXT.to_vec())],
+            "the probe must seal its own constant, never a caller's account or value"
+        );
+    }
+
+    /// No TPM at all: classify as such, and do not spend a subprocess.
+    #[test]
+    fn probe_reports_no_tpm_device_without_attempting_a_seal() {
+        reset_probe_counters();
+        set_probe_overrides(Some(ProbeOverrides {
+            sys_tpm0_exists: false,
+            tpmrm0_openable: false,
+        }));
+        set_creds_runner(Some(counting_ok_runner()));
+        let (_p, _r) = (ProbeGuard, RunnerGuard);
+
+        assert_eq!(probe_tpm2(), Tpm2Availability::NoTpmDevice);
+        assert_eq!(encrypt_calls(), 0, "no TPM ⇒ no subprocess");
+    }
+
+    /// TPM present but the device is not ours to open: still a device-level
+    /// finding, distinct from a service-level one.
+    #[test]
+    fn probe_reports_device_not_accessible_without_attempting_a_seal() {
+        reset_probe_counters();
+        set_probe_overrides(Some(ProbeOverrides {
+            sys_tpm0_exists: true,
+            tpmrm0_openable: false,
+        }));
+        set_creds_runner(Some(counting_ok_runner()));
+        let (_p, _r) = (ProbeGuard, RunnerGuard);
+
+        assert_eq!(probe_tpm2(), Tpm2Availability::DeviceNotAccessible);
+        assert_eq!(encrypt_calls(), 0);
+    }
+
+    /// Fail closed BEFORE `create_only`.
+    ///
+    /// This models the selection site (`llm_proxy_rs::resolve_kind`): consult
+    /// availability, and only then use the backend. With the refusal detected
+    /// at the probe, `create_only` is never attempted — so the caller's
+    /// plaintext never reaches a subprocess and nothing is installed. If the
+    /// probe wrongly reported availability, `create_only` would run and the
+    /// encrypt count would be 2.
+    #[test]
+    fn authorization_denial_fails_closed_before_create_only() {
+        reset_probe_counters();
+        device_is_fine();
+        set_creds_runner(Some(denies_permission_runner()));
+        let (_p, _r) = (ProbeGuard, RunnerGuard);
+
+        let dir = TempDir::new().unwrap();
+        let ks = TpmKeystore::new(dir.path(), "test.tpm.fail_closed");
+
+        let availability = probe_tpm2();
+        if availability.is_available() {
+            // Deliberately reachable: this is the branch a wrong probe takes.
+            let _ = ks.create_only("acct", b"sk-real-caller-secret");
+        }
+
+        // The identity of what was sealed is the discriminator, not the count:
+        // remove the capability probe and this is still exactly one call, but
+        // it is `create_only`'s, carrying the caller's real secret.
+        assert_eq!(
+            encrypt_log(),
+            vec![(PROBE_NAME.to_owned(), PROBE_PLAINTEXT.to_vec())],
+            "the only seal attempted must be the probe's own constant — create_only must \
+             never have been reached, so the caller's plaintext never enters a subprocess"
+        );
+        assert!(
+            ks.get("acct").is_err(),
+            "nothing may be installed when the backend was refused"
+        );
     }
 }
