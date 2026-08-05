@@ -78,14 +78,14 @@ enum LifecycleIdentityLoadError {
 /// startup call site to accidentally return a naked `LoadedIdentity` and drop
 /// lifecycle protection before publication.
 struct LifecycleIdentityLoad {
-    _guard: LifecycleWriteGuard,
+    guard: LifecycleWriteGuard,
     loaded: Option<Arc<household_rs::LoadedIdentity>>,
     owner_auth: Option<Arc<household_rs::HouseholdAuthState>>,
 }
 
 impl LifecycleIdentityLoad {
-    fn lifecycle_guard(&self) -> &LifecycleWriteGuard {
-        &self._guard
+    fn lifecycleguard(&self) -> &LifecycleWriteGuard {
+        &self.guard
     }
 
     async fn publish_into(&self, household: &HouseholdState) {
@@ -120,7 +120,7 @@ fn load_identity_under_lifecycle(
         .as_deref()
         .and_then(|identity| load_owner_auth_for_identity(state_dir, identity));
     Ok(LifecycleIdentityLoad {
-        _guard: guard,
+        guard,
         loaded,
         owner_auth,
     })
@@ -346,7 +346,7 @@ pub fn global_bootstrap_state() -> Option<BootstrapStateArc> {
 struct ClawShareRuntimeHandles {
     slot_store: Arc<ClawShareSlotStore>,
     mesh_log: Arc<MeshLogStore>,
-    replay_guard: Arc<ReplayGuard>,
+    replayguard: Arc<ReplayGuard>,
     relay_offer_challenges: Arc<RelayOfferChallengeTable>,
     group_claim_nonces: Arc<GroupClaimNonceTable>,
     relay_offer_abuse: Arc<Mutex<RelayAbuseState>>,
@@ -551,7 +551,7 @@ fn prepare_claw_share_bootstrap_state(
     let mesh_log = open_claw_share_mesh_log(state_dir);
     let projection = mesh_log.project();
     let slot_store = Arc::new(ClawShareSlotStore::seeded_from(&projection));
-    let replay_guard = Arc::new(ReplayGuard::new());
+    let replayguard = Arc::new(ReplayGuard::new());
     let relay_offer_challenges = Arc::new(RelayOfferChallengeTable::new());
     let group_claim_nonces = Arc::new(GroupClaimNonceTable::new());
     let relay_offer_abuse = Arc::new(Mutex::new(RelayAbuseState::default()));
@@ -580,7 +580,7 @@ fn prepare_claw_share_bootstrap_state(
         runtime: ClawShareRuntimeHandles {
             slot_store,
             mesh_log,
-            replay_guard,
+            replayguard,
             relay_offer_challenges,
             group_claim_nonces,
             relay_offer_abuse,
@@ -650,7 +650,7 @@ async fn mount_claw_share_relay_stream_live_if_enabled(
         household,
         Arc::clone(&runtime.mesh_log),
         Arc::clone(&runtime.slot_store),
-        Arc::clone(&runtime.replay_guard),
+        Arc::clone(&runtime.replayguard),
     )
     .await
     {
@@ -719,7 +719,10 @@ pub fn pair_window_ttl_secs_from_env(env_var: &str) -> u64 {
 /// Panics if the on-disk identity is corrupted or fails chain verification —
 /// refuse-to-start (US1 acceptance C6). The structured-log envelope at
 /// `bootstrap.error` carries the underlying cause before the panic.
-pub async fn bootstrap_household(shared_state: Option<SharedState>) {
+pub async fn bootstrap_household(
+    startup: &household_listener::ProcessStartupToken,
+    shared_state: Option<SharedState>,
+) {
     let state_dir = resolve_household_state_dir();
     if let Err(e) = std::fs::create_dir_all(&state_dir) {
         tracing::warn!(
@@ -736,7 +739,7 @@ pub async fn bootstrap_household(shared_state: Option<SharedState>) {
     // transaction. In particular, a concurrent teardown cannot detach
     // household A after we load it and before the handler state publishes A.
     let lifecycle_state_dir = state_dir.clone();
-    let lifecycle_guard = match tokio::task::spawn_blocking(move || {
+    let lifecycleguard = match tokio::task::spawn_blocking(move || {
         acquire_recovered_household_lifecycle(&lifecycle_state_dir)
     })
     .await
@@ -767,7 +770,7 @@ pub async fn bootstrap_household(shared_state: Option<SharedState>) {
     // generations and therefore must happen only after this recovery.
     let install_rotated = handlers_pair_machine::recover_candidate_install_under_lifecycle(
         &state_dir,
-        &lifecycle_guard,
+        &lifecycleguard,
         key_policy,
     )
     .await
@@ -787,12 +790,12 @@ pub async fn bootstrap_household(shared_state: Option<SharedState>) {
     let pair_device_window = Arc::new(
         household_rs::pair_device::PairDeviceWindow::with_persistence_under_lifecycle(
             state_dir.clone(),
-            &lifecycle_guard,
+            &lifecycleguard,
         )
         .unwrap_or_else(|error| panic!("pair-device namespace recovery failed: {error}")),
     );
     let pair_machine_window = Arc::new(
-        PairMachineWindow::with_persistence_under_lifecycle(state_dir.clone(), &lifecycle_guard)
+        PairMachineWindow::with_persistence_under_lifecycle(state_dir.clone(), &lifecycleguard)
             .unwrap_or_else(|error| panic!("pair-machine namespace recovery failed: {error}")),
     );
 
@@ -811,7 +814,7 @@ pub async fn bootstrap_household(shared_state: Option<SharedState>) {
     let phase3_recovery_completed = match pair_machine_window
         .recover_phase3_under_lifecycle(
             &state_dir,
-            &lifecycle_guard,
+            &lifecycleguard,
             household_rs::pair_machine::RECOVERY_TIMEOUT,
         )
         .await
@@ -842,7 +845,7 @@ pub async fn bootstrap_household(shared_state: Option<SharedState>) {
                     stage = "bootstrap.phase3_recovery_fail_stop_persist_failed",
                     error = %state_error,
                 );
-            } else if let Err(sync_error) = lifecycle_guard.sync_state_root() {
+            } else if let Err(sync_error) = lifecycleguard.sync_state_root() {
                 tracing::error!(
                     stage = "bootstrap.phase3_recovery_fail_stop_sync_failed",
                     error = %sync_error,
@@ -857,7 +860,7 @@ pub async fn bootstrap_household(shared_state: Option<SharedState>) {
 
     let load_state_dir = state_dir.clone();
     let identity_load = match tokio::task::spawn_blocking(move || {
-        load_identity_under_lifecycle(lifecycle_guard, &load_state_dir, key_policy)
+        load_identity_under_lifecycle(lifecycleguard, &load_state_dir, key_policy)
     })
     .await
     {
@@ -885,7 +888,7 @@ pub async fn bootstrap_household(shared_state: Option<SharedState>) {
     };
     let loaded_arc = identity_load.loaded.clone();
     let terminal_replay_endpoint = active_terminal_replay_addr(
-        identity_load.lifecycle_guard(),
+        identity_load.lifecycleguard(),
         &state_dir,
         loaded_arc.as_deref(),
     )
@@ -939,7 +942,7 @@ pub async fn bootstrap_household(shared_state: Option<SharedState>) {
                     initial_bootstrap_state,
                     inferred,
                     persist_bootstrap_state_under_lifecycle(
-                        identity_load.lifecycle_guard(),
+                        identity_load.lifecycleguard(),
                         &state_dir,
                         inferred,
                     ),
@@ -968,7 +971,7 @@ pub async fn bootstrap_household(shared_state: Option<SharedState>) {
     // it between the disk observation and the in-memory adoption.
     if identity_state.current_owner_auth().await.is_some() {
         pair_device_window
-            .close_under_lifecycle(identity_load.lifecycle_guard())
+            .close_under_lifecycle(identity_load.lifecycleguard())
             .await
             .unwrap_or_else(|error| {
                 panic!("failed to close owner-complete pair-device window: {error}")
@@ -976,7 +979,7 @@ pub async fn bootstrap_household(shared_state: Option<SharedState>) {
     } else {
         load_persisted_pair_device_window_under_lifecycle(
             &pair_device_window,
-            identity_load.lifecycle_guard(),
+            identity_load.lifecycleguard(),
         )
         .await
         .unwrap_or_else(|error| panic!("pair-device snapshot recovery failed closed: {error}"));
@@ -989,7 +992,7 @@ pub async fn bootstrap_household(shared_state: Option<SharedState>) {
     let owner_event_broadcaster = OwnerEventsBroadcaster::new();
     let owner_event_log = identity_load.loaded.as_ref().map(|loaded| {
         OwnerEventLog::open_with_broadcaster_under_lifecycle(
-            identity_load.lifecycle_guard(),
+            identity_load.lifecycleguard(),
             state_dir.clone(),
             loaded.record.hh_id.as_str(),
             owner_event_broadcaster.clone(),
@@ -1006,7 +1009,7 @@ pub async fn bootstrap_household(shared_state: Option<SharedState>) {
         (Some(loaded), Some(Ok(log))) => {
             match handlers_owner_events::reconcile_phase3_machine_joined_outbox_under_lifecycle(
                 &state_dir,
-                identity_load.lifecycle_guard(),
+                identity_load.lifecycleguard(),
                 loaded,
                 log,
             ) {
@@ -1024,8 +1027,7 @@ pub async fn bootstrap_household(shared_state: Option<SharedState>) {
                             stage = "bootstrap.phase3_outbox_fail_stop_persist_failed",
                             error = %state_error,
                         );
-                    } else if let Err(sync_error) =
-                        identity_load.lifecycle_guard().sync_state_root()
+                    } else if let Err(sync_error) = identity_load.lifecycleguard().sync_state_root()
                     {
                         tracing::error!(
                             stage = "bootstrap.phase3_outbox_fail_stop_sync_failed",
@@ -1052,7 +1054,7 @@ pub async fn bootstrap_household(shared_state: Option<SharedState>) {
                     stage = "bootstrap.phase3_outbox_fail_stop_persist_failed",
                     error = %state_error,
                 );
-            } else if let Err(sync_error) = identity_load.lifecycle_guard().sync_state_root() {
+            } else if let Err(sync_error) = identity_load.lifecycleguard().sync_state_root() {
                 tracing::error!(
                     stage = "bootstrap.phase3_outbox_fail_stop_sync_failed",
                     error = %sync_error,
@@ -1089,7 +1091,7 @@ pub async fn bootstrap_household(shared_state: Option<SharedState>) {
                 return;
             }
             if let Err(error) = persist_bootstrap_state_under_lifecycle(
-                identity_load.lifecycle_guard(),
+                identity_load.lifecycleguard(),
                 &state_dir,
                 recovered_state,
             ) {
@@ -1099,7 +1101,7 @@ pub async fn bootstrap_household(shared_state: Option<SharedState>) {
                 );
                 return;
             }
-            if let Err(error) = identity_load.lifecycle_guard().sync_state_root() {
+            if let Err(error) = identity_load.lifecycleguard().sync_state_root() {
                 tracing::error!(
                     stage = "bootstrap.phase3_recovery_state_sync_failed",
                     error = %error,
@@ -1111,7 +1113,7 @@ pub async fn bootstrap_household(shared_state: Option<SharedState>) {
         }
 
         if let Err(error) = household_rs::storage::clear_phase3_recovery_manifest(
-            identity_load.lifecycle_guard(),
+            identity_load.lifecycleguard(),
             &state_dir,
         ) {
             tracing::error!(
@@ -1126,7 +1128,7 @@ pub async fn bootstrap_household(shared_state: Option<SharedState>) {
                     stage = "bootstrap.phase3_outbox_fail_stop_persist_failed",
                     error = %state_error,
                 );
-            } else if let Err(sync_error) = identity_load.lifecycle_guard().sync_state_root() {
+            } else if let Err(sync_error) = identity_load.lifecycleguard().sync_state_root() {
                 tracing::error!(
                     stage = "bootstrap.phase3_outbox_fail_stop_sync_failed",
                     error = %sync_error,
@@ -1696,6 +1698,7 @@ pub async fn bootstrap_household(shared_state: Option<SharedState>) {
 
     let bound_set = household_listener::BoundSet::default();
     let initial_bound = household_listener::spawn_household_listeners(
+        startup,
         household_router.clone(),
         port,
         Arc::clone(&bootstrap_state_arc),
@@ -2499,16 +2502,16 @@ mod tests {
         )
         .unwrap();
         let lifecycle = HouseholdLifecycleLock::open_verified(td.path()).unwrap();
-        let lifecycle_guard = lifecycle.lock_exclusive().unwrap();
+        let lifecycleguard = lifecycle.lock_exclusive().unwrap();
         let broadcaster = OwnerEventsBroadcaster::new();
         let event_log = OwnerEventLog::open_with_broadcaster_under_lifecycle(
-            &lifecycle_guard,
+            &lifecycleguard,
             td.path().to_path_buf(),
             identity.record.hh_id.as_str(),
             broadcaster.clone(),
         )
         .unwrap();
-        drop(lifecycle_guard);
+        drop(lifecycleguard);
         let window = Arc::new(PairMachineWindow::new_in_memory());
         let state = handlers_owner_events::OwnerEventsRouterState::new(
             HouseholdState::empty(),

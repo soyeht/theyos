@@ -130,14 +130,11 @@ pub async fn sign_machine_cert_handler(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    let lifecycle_guard = match acquire_lifecycle_read(state.state_dir.clone()).await {
-        Ok(guard) => guard,
-        Err(()) => {
-            return cbor_error(
-                StatusCode::CONFLICT,
-                BootstrapErrorCode::HouseholdNotInitialized.as_str(),
-            );
-        }
+    let Ok(lifecycle_guard) = acquire_lifecycle_read(state.state_dir.clone()).await else {
+        return cbor_error(
+            StatusCode::CONFLICT,
+            BootstrapErrorCode::HouseholdNotInitialized.as_str(),
+        );
     };
     let Some(now) = time_util::unix_now_secs_checked("sign_machine_cert.clock") else {
         return cbor_error(

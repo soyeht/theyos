@@ -85,7 +85,7 @@ enum PairMachineWaitOutcome {
 
 enum ColdTerminalRecovery {
     /// A terminal G1 install is active. The ordinary daemon owns the exact
-    /// supervised replay listener in both RestartRequired and Ready, so a cold
+    /// supervised replay listener in both `RestartRequired` and Ready, so a cold
     /// invocation must start it immediately instead of making daemon liveness
     /// depend on another Ack arriving within a finite CLI timeout.
     ReadyForDaemon,
@@ -550,7 +550,7 @@ fn emit_minted_pair_device_window(minted: MintedPairDeviceWindow) -> i32 {
 /// Resolve a retained G1 terminal install before any fresh-network discovery.
 ///
 /// Both terminal states converge immediately to the ordinary daemon, which
-/// supervises replay on the address signed into the original JoinRequest.
+/// supervises replay on the address signed into the original `JoinRequest`.
 /// Re-enumerating interfaces during a cold exec could silently authorize a
 /// different coordinate, so this path validates the exact persisted socket
 /// address before exec and the daemon repeats that validation at startup.

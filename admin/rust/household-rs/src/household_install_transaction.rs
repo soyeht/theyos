@@ -234,7 +234,7 @@ impl FinalizeTerminalResult {
         &self.request_fingerprint
     }
 
-    /// Exact canonical JoinRequest durably anchored before lifecycle rotation.
+    /// Exact canonical `JoinRequest` durably anchored before lifecycle rotation.
     #[must_use]
     pub fn join_request_bytes(&self) -> &[u8] {
         &self.join_request_bytes
@@ -784,8 +784,7 @@ impl FinalizeTerminalResultRecordV1 {
         // before replacing one.
         let _ = phase;
 
-        request_fingerprint_blake3_256.as_ref()
-            == expectation.terminal_intent.request_fingerprint.0
+        request_fingerprint_blake3_256.as_ref() == expectation.terminal_intent.request_fingerprint.0
             && candidate_generation.as_ref() == expectation.candidate_generation.token_bytes()
             && terminal_generation.as_ref().map(ByteBuf::as_ref)
                 == Some(expectation.terminal_generation.token_bytes().as_slice())
@@ -1011,7 +1010,7 @@ pub fn has_active_finalize_terminal_result_under_lifecycle(
 
 /// Load the active terminal result for cold exact-replay recovery.
 ///
-/// The returned JoinRequest and Ack were both anchored in the stable state
+/// The returned `JoinRequest` and `Ack` were both anchored in the stable state
 /// root before G0 rotated. The active-generation and installed-marker checks
 /// are identical to exact finalize lookup; no generation-scoped pairing
 /// snapshot is treated as authority here.

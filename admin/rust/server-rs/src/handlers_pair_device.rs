@@ -261,12 +261,9 @@ pub async fn confirm(
             return StatusCode::NOT_FOUND.into_response();
         }
     };
-    let ready_generation = match lifecycle_guard.lifecycle_generation() {
-        Ok(Some(generation)) => generation,
-        Ok(None) | Err(_) => {
-            log_pair_rejected("identity_unavailable");
-            return StatusCode::NOT_FOUND.into_response();
-        }
+    let Ok(Some(ready_generation)) = lifecycle_guard.lifecycle_generation() else {
+        log_pair_rejected("identity_unavailable");
+        return StatusCode::NOT_FOUND.into_response();
     };
 
     // Pair-device confirm writes owner auth, consumes the pairing window, and

@@ -387,11 +387,8 @@ pub async fn device_pairing_request_handler(
     let Some(now) = time_util::unix_now_secs_checked("device_pairing.request.clock") else {
         return sanitized_error(StatusCode::SERVICE_UNAVAILABLE, "clock_unavailable");
     };
-    let lifecycle_guard = match acquire_lifecycle_read(state.state_dir.clone()).await {
-        Ok(guard) => guard,
-        Err(()) => {
-            return sanitized_error(StatusCode::SERVICE_UNAVAILABLE, "household_unavailable");
-        }
+    let Ok(lifecycle_guard) = acquire_lifecycle_read(state.state_dir.clone()).await else {
+        return sanitized_error(StatusCode::SERVICE_UNAVAILABLE, "household_unavailable");
     };
     let Some(identity) = state.household.current().await else {
         return sanitized_error(StatusCode::SERVICE_UNAVAILABLE, "household_unavailable");

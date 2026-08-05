@@ -245,8 +245,8 @@ fn validate_terminal_join_request_binding(
     verify_join_request(&request)
         .map_err(|error| install_artifacts_error(format!("terminal JoinRequest: {error}")))?;
     if snapshot.addr_hint.as_deref() != Some(request.addr.as_str())
-        || snapshot.m_pub.as_ref().map(|bytes| bytes.as_ref()) != Some(request.m_pub.as_ref())
-        || snapshot.nonce.as_ref().map(|bytes| bytes.as_ref()) != Some(request.nonce.as_ref())
+        || snapshot.m_pub.as_ref().map(std::convert::AsRef::as_ref) != Some(request.m_pub.as_ref())
+        || snapshot.nonce.as_ref().map(std::convert::AsRef::as_ref) != Some(request.nonce.as_ref())
         || snapshot.transport != Some(request.transport)
     {
         return Err(install_artifacts_error(
@@ -1346,7 +1346,7 @@ pub async fn local_finalize_handler(
     let terminal_lookup =
         match household_rs::household_install_transaction::lookup_finalize_terminal_result_under_lifecycle(
             &lifecycle_guard,
-            request_fingerprint.clone(),
+            request_fingerprint,
             &response.household_record.hh_id,
             &response.machine_cert.m_id,
         ) {
@@ -1921,7 +1921,7 @@ pub async fn local_finalize_handler(
         }
     };
     let terminal_intent = match household_rs::household_install_transaction::FinalizeTerminalIntent::from_exact_ack_bytes(
-        request_fingerprint.clone(),
+        request_fingerprint,
         &response.machine_cert.m_id,
         cached_join_request.as_ref(),
         &exact_ack_bytes,
@@ -2159,13 +2159,13 @@ pub async fn local_finalize_handler(
                 );
                 return StatusCode::INTERNAL_SERVER_ERROR.into_response();
             }
-            return unauthenticated_response();
+            unauthenticated_response()
         }
         Ok(household_rs::household_install_transaction::HouseholdInstallRecoveryOutcome::NotApplicable) => {
             tracing::error!(
                 stage = "pair_machine.local_finalize.install_evidence_missing",
             );
-            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
         }
         Err(error) => {
             tracing::error!(
@@ -2173,7 +2173,7 @@ pub async fn local_finalize_handler(
                 error = %error,
                 hint = "never rolling back an install whose canonical record may be committed",
             );
-            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
         }
     }
 }

@@ -182,8 +182,8 @@ async fn append_owner_event_with_shared_lifecycle(
 /// Reconcile the manifest-retained `MachineJoined` outbox before startup may
 /// publish listeners, or from an exact handler retry after local promotion.
 ///
-/// The exact candidate certificate in the signed JoinResponse supplies the
-/// event payload. The log method uses candidate m_id as an idempotency key,
+/// The exact candidate certificate in the signed `JoinResponse` supplies the
+/// event payload. The log method uses candidate `m_id` as an idempotency key,
 /// stabilizes an ambiguous existing tail, and rejects any conflicting event.
 /// This function deliberately leaves the manifest in place. Startup must
 /// first repair any Phase-3-specific fail-stop bootstrap breadcrumb and only

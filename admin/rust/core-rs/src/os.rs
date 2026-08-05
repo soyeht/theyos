@@ -1046,7 +1046,10 @@ mod tests {
 
     #[test]
     fn own_pgrp_returns_nonzero() {
-        assert!(own_pgrp() > 0, "a running process always has a process group");
+        assert!(
+            own_pgrp() > 0,
+            "a running process always has a process group"
+        );
     }
 
     #[test]
@@ -1345,9 +1348,15 @@ mod tests {
     fn process_identity_is_stable_and_present_for_the_current_process() {
         let pid = std::process::id();
         let first = process_identity(pid);
-        assert!(first.is_some(), "a running process must have a determinable identity");
+        assert!(
+            first.is_some(),
+            "a running process must have a determinable identity"
+        );
         let second = process_identity(pid);
-        assert_eq!(first, second, "identity must be stable across repeated calls");
+        assert_eq!(
+            first, second,
+            "identity must be stable across repeated calls"
+        );
     }
 
     #[test]
@@ -1364,7 +1373,10 @@ mod tests {
         // identities rather than this always returning some constant.
         let mine = process_identity(std::process::id());
         let init = process_identity(1);
-        assert_ne!(mine, init, "distinct concurrently-running processes must not collide");
+        assert_ne!(
+            mine, init,
+            "distinct concurrently-running processes must not collide"
+        );
     }
 
     // ── F1 macOS per-fd rdev classifier — red-first behavioural matrix ──
