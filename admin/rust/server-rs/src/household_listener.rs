@@ -72,8 +72,28 @@ impl HouseholdExposurePolicy {
                 class,
                 InterfaceClass::Loopback | InterfaceClass::Lan | InterfaceClass::Tailscale
             ),
+            // An interrupted install gets its OWN arm, and deliberately the
+            // narrowest one. `allows` is a function of the state alone -- it
+            // cannot see which state we arrived from -- so this set has to be
+            // safe from *every* legal predecessor. The transition table admits
+            // `Uninitialized | ReadyForNaming | NamedAwaitingPair` into this
+            // state, whose sets are {Loopback, Lan, Tailscale} and
+            // {Loopback, Tailscale, Mesh}. Their intersection is
+            // {Loopback, Tailscale}, and that is what this arm may grant.
+            //
+            // Sharing `Ready`'s arm was measurably wrong, not merely untidy: a
+            // household that never completed onboarding gained `Mesh` on
+            // entering this state, applied by the 60 s `sync_interface_targets`
+            // refresh without the router ever restarting. The or-pattern let a
+            // new variant inherit `Ready`'s exposure with nobody deciding it.
+            //
+            // Rule, so the next variant does not repeat this: entering
+            // `PairMachineInstallRestartRequired` must never widen the exposed
+            // class set relative to any legal predecessor.
+            BootstrapState::PairMachineInstallRestartRequired => {
+                matches!(class, InterfaceClass::Loopback | InterfaceClass::Tailscale)
+            }
             BootstrapState::NamedAwaitingPair
-            | BootstrapState::PairMachineInstallRestartRequired
             | BootstrapState::Ready
             | BootstrapState::Recovering => {
                 matches!(
