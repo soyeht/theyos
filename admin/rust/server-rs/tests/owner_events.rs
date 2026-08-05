@@ -5621,7 +5621,13 @@ fn owner_webauthn_add_credential_finish_source_guards_mutation_contract() {
     // silence, breaking whatever depended on it. Assert the guarded call, so the
     // guard tracks the property rather than the wording of one era.
     assert!(handler.contains("persist_owner_auth_under_lifecycle"));
-    assert!(handler.contains("set_owner_auth"));
+    // The handler no longer calls `.save(` / `.set_owner_auth(` directly: the B-2
+    // hardening EXTRACTED both into `persist_owner_auth_under_lifecycle`, which
+    // performs them under a lifecycle guard. These guards slice the handler's
+    // byte range, so a call moved into a shared helper becomes invisible to them
+    // even though the property still holds -- and holds more strongly.
+    // Assert the helper, which is the thing the handler must now call.
+    assert!(handler.contains("persist_owner_auth_under_lifecycle"));
     assert!(handler.contains("verify_or_update_owner_webauthn_authority_anchor"));
     assert!(!handler.contains("OwnerWebauthnAuthority::sign_recovery_add"));
     assert!(!handler.contains("OwnerWebauthnRecoveryAuthority::sign_consume"));
@@ -5640,8 +5646,12 @@ fn owner_webauthn_add_credential_finish_source_guards_mutation_contract() {
     let registration_finish = handler.find("finish_registration_with_binding").unwrap();
     let approval_finish = handler.find("finish_owner_approval_assertion").unwrap();
     let append = handler.find("OwnerWebauthnAuthority::sign_append").unwrap();
-    let save = handler.find(".save(").unwrap();
-    let memory = handler.find("set_owner_auth").unwrap();
+    // `.save(` and `set_owner_auth` were DEDUPLICATED into
+    // `persist_owner_auth_under_lifecycle` (five inline copies collapsed into
+    // one). They are no longer inside this handler's segment, so locate the
+    // helper call instead -- the ordering property is unchanged, only its
+    // anchor moved.
+    let persist = handler.find("persist_owner_auth_under_lifecycle").unwrap();
     let anchor = handler
         .find("verify_or_update_owner_webauthn_authority_anchor")
         .unwrap();
@@ -5651,9 +5661,8 @@ fn owner_webauthn_add_credential_finish_source_guards_mutation_contract() {
     assert!(approval_context < registration_finish);
     assert!(registration_finish < approval_finish);
     assert!(approval_finish < append);
-    assert!(append < save);
-    assert!(save < memory);
-    assert!(memory < anchor);
+    assert!(append < persist);
+    assert!(persist < anchor);
 
     let auth_source = include_str!("../src/household_auth.rs");
     let auth_helper = source_segment(
@@ -5703,7 +5712,7 @@ fn owner_webauthn_revoke_finish_source_guards_mutation_contract() {
     assert!(handler.contains("finish_owner_approval_assertion"));
     assert!(handler.contains("OwnerWebauthnAuthority::sign_append"));
     assert!(handler.contains("OwnerWebauthnCredentialEventAction::Revoke"));
-    assert!(handler.contains("set_owner_auth"));
+    assert!(handler.contains("persist_owner_auth_under_lifecycle"));
     assert!(handler.contains("OwnerWebauthnAnchorMode::Enforcement"));
     assert!(!handler.contains("MigrationDefaultOff"));
     assert!(!handler.contains("OwnerAuthEnrollInitial"));
@@ -5718,8 +5727,9 @@ fn owner_webauthn_revoke_finish_source_guards_mutation_contract() {
         .unwrap();
     let challenge_finish = handler.find("finish_owner_approval_assertion").unwrap();
     let append = handler.find("OwnerWebauthnAuthority::sign_append").unwrap();
-    let save = handler.find(".save(").unwrap();
-    let memory = handler.find("set_owner_auth").unwrap();
+    // Deduplicated into `persist_owner_auth_under_lifecycle`; the ordering
+    // property is unchanged, only its anchor moved out of this segment.
+    let persist = handler.find("persist_owner_auth_under_lifecycle").unwrap();
     let anchor = handler
         .find("verify_or_update_owner_webauthn_authority_anchor")
         .unwrap();
@@ -5727,9 +5737,8 @@ fn owner_webauthn_revoke_finish_source_guards_mutation_contract() {
     assert!(context_check < challenge_check);
     assert!(challenge_check < challenge_finish);
     assert!(challenge_finish < append);
-    assert!(append < save);
-    assert!(save < memory);
-    assert!(memory < anchor);
+    assert!(append < persist);
+    assert!(persist < anchor);
 
     let auth_source = include_str!("../src/household_auth.rs");
     let auth_helper = source_segment(
@@ -5810,8 +5819,14 @@ fn owner_webauthn_recovery_source_guards_provision_readiness_contract() {
     assert!(finish_handler.contains("require_owner_approval_challenge_context"));
     assert!(finish_handler.contains("finish_owner_approval_assertion"));
     assert!(finish_handler.contains("OwnerWebauthnRecoveryAuthority::sign_next"));
-    assert!(finish_handler.contains(".save("));
-    assert!(finish_handler.contains("set_owner_auth"));
+    // The handler no longer calls `.save(` / `.set_owner_auth(` directly: the B-2
+    // hardening EXTRACTED both into `persist_owner_auth_under_lifecycle`, which
+    // performs them under a lifecycle guard. These guards slice the handler's
+    // byte range, so a call moved into a shared helper becomes invisible to them
+    // even though the property still holds -- and holds more strongly.
+    // Assert the helper, which is the thing the handler must now call.
+    assert!(finish_handler.contains("persist_owner_auth_under_lifecycle"));
+    assert!(finish_handler.contains("persist_owner_auth_under_lifecycle"));
     assert!(finish_handler.contains("advance_owner_webauthn_recovery_anchor_after_commit"));
     assert!(!finish_handler.contains("MigrationDefaultOff"));
     assert!(!finish_handler.contains("OwnerAuthEnrollInitial"));
@@ -5827,8 +5842,11 @@ fn owner_webauthn_recovery_source_guards_provision_readiness_contract() {
     let append = finish_handler
         .find("OwnerWebauthnRecoveryAuthority::sign_next")
         .unwrap();
-    let save = finish_handler.find(".save(").unwrap();
-    let memory = finish_handler.find("set_owner_auth").unwrap();
+    // Deduplicated into `persist_owner_auth_under_lifecycle`; the ordering
+    // property is unchanged, only its anchor moved out of this segment.
+    let persist = finish_handler
+        .find("persist_owner_auth_under_lifecycle")
+        .unwrap();
     let anchor = finish_handler
         .find("advance_owner_webauthn_recovery_anchor_after_commit")
         .unwrap();
@@ -5836,9 +5854,8 @@ fn owner_webauthn_recovery_source_guards_provision_readiness_contract() {
     assert!(context_check < challenge_check);
     assert!(challenge_check < challenge_finish);
     assert!(challenge_finish < append);
-    assert!(append < save);
-    assert!(save < memory);
-    assert!(memory < anchor);
+    assert!(append < persist);
+    assert!(persist < anchor);
 
     let consume_plan = source_segment(
         source,
@@ -5919,8 +5936,8 @@ fn owner_webauthn_recovery_source_guards_provision_readiness_contract() {
     assert!(consume_finish_handler.contains("finish_registration_with_binding"));
     assert!(consume_finish_handler.contains("OwnerWebauthnAuthority::sign_recovery_add"));
     assert!(consume_finish_handler.contains("OwnerWebauthnRecoveryAuthority::sign_consume"));
-    assert!(consume_finish_handler.contains(".save("));
-    assert!(consume_finish_handler.contains("set_owner_auth"));
+    assert!(consume_finish_handler.contains("persist_owner_auth_under_lifecycle"));
+    assert!(consume_finish_handler.contains("persist_owner_auth_under_lifecycle"));
     assert!(consume_finish_handler.contains("verify_or_update_owner_webauthn_authority_anchor"));
     assert!(consume_finish_handler.contains("advance_owner_webauthn_recovery_anchor_after_commit"));
     assert!(!consume_finish_handler.contains("finish_owner_approval_assertion"));
@@ -5945,8 +5962,10 @@ fn owner_webauthn_recovery_source_guards_provision_readiness_contract() {
     let consume = consume_finish_handler
         .find("OwnerWebauthnRecoveryAuthority::sign_consume")
         .unwrap();
-    let save = consume_finish_handler.find(".save(").unwrap();
-    let memory = consume_finish_handler.find("set_owner_auth").unwrap();
+    // Deduplicated into `persist_owner_auth_under_lifecycle`.
+    let persist = consume_finish_handler
+        .find("persist_owner_auth_under_lifecycle")
+        .unwrap();
     let webauthn_anchor = consume_finish_handler
         .find("verify_or_update_owner_webauthn_authority_anchor")
         .unwrap();
@@ -5958,9 +5977,8 @@ fn owner_webauthn_recovery_source_guards_provision_readiness_contract() {
     assert!(plan < challenge_finish);
     assert!(challenge_finish < add);
     assert!(add < consume);
-    assert!(consume < save);
-    assert!(save < memory);
-    assert!(memory < webauthn_anchor);
+    assert!(consume < persist);
+    assert!(persist < webauthn_anchor);
     assert!(webauthn_anchor < recovery_anchor);
 
     let pair_machine_policy = source_segment(
