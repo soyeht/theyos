@@ -2023,9 +2023,47 @@ mod tests {
     /// be looked at rather than merely compiled.
     #[test]
     fn the_startup_token_is_never_stored_only_passed() {
-        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        // Scan the whole workspace, not just this crate. `ProcessStartupToken`
+        // is `pub` and `server-rs` is a `[lib]`, so a dependent could park it
+        // in a struct field where a crate-local scan would never look --
+        // `t1-iptunnel-dev-runner-rs` and `e2e-rs` both declare a dependency
+        // edge today. Scanning one crate in a workspace of thirty-one made the
+        // assertion message ("a struct field holding it would let a handler
+        // start the listeners again") broader than the evidence behind it.
+        let workspace = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("crate dir has a workspace parent")
+            .to_path_buf();
         let mut found: Vec<String> = Vec::new();
-        let mut stack = vec![src.clone()];
+        let mut scanned_crates: Vec<String> = Vec::new();
+        let mut stack: Vec<std::path::PathBuf> = Vec::new();
+        for entry in std::fs::read_dir(&workspace).expect("read workspace dir") {
+            let member = entry.expect("workspace entry").path();
+            if !member.is_dir() || member.file_name().is_some_and(|n| n == "target") {
+                continue;
+            }
+            let member_src = member.join("src");
+            if member_src.is_dir() {
+                scanned_crates.push(
+                    member
+                        .file_name()
+                        .expect("member dir name")
+                        .to_string_lossy()
+                        .into_owned(),
+                );
+                stack.push(member_src);
+            }
+        }
+        scanned_crates.sort();
+        assert!(
+            scanned_crates.len() >= 25,
+            "expected to scan the whole workspace, saw only {} crates: {scanned_crates:?}",
+            scanned_crates.len()
+        );
+        assert!(
+            scanned_crates.iter().any(|c| c == "server-rs"),
+            "the crate that defines the token must be among those scanned"
+        );
         while let Some(dir) = stack.pop() {
             for entry in std::fs::read_dir(&dir).expect("read src dir") {
                 let path = entry.expect("dir entry").path();
@@ -2053,8 +2091,8 @@ mod tests {
                         continue;
                     }
                     let name = path
-                        .strip_prefix(&src)
-                        .expect("path under src")
+                        .strip_prefix(&workspace)
+                        .expect("path under the workspace")
                         .to_string_lossy()
                         .into_owned();
                     found.push(format!("{name}: {trimmed}"));
@@ -2079,11 +2117,11 @@ mod tests {
         );
 
         let expected = [
-            "household_bootstrap.rs: startup: &household_listener::ProcessStartupToken,",
-            "household_listener.rs: _startup: &ProcessStartupToken,",
-            "household_listener.rs: impl ProcessStartupToken {",
-            "household_listener.rs: pub struct ProcessStartupToken(());",
-            "main.rs: let startup_token = server_rs::household_listener::ProcessStartupToken::claim()",
+            "server-rs/src/household_bootstrap.rs: startup: &household_listener::ProcessStartupToken,",
+            "server-rs/src/household_listener.rs: _startup: &ProcessStartupToken,",
+            "server-rs/src/household_listener.rs: impl ProcessStartupToken {",
+            "server-rs/src/household_listener.rs: pub struct ProcessStartupToken(());",
+            "server-rs/src/main.rs: let startup_token = server_rs::household_listener::ProcessStartupToken::claim()",
         ];
 
         assert_eq!(
