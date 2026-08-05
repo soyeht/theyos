@@ -2142,7 +2142,7 @@ pub async fn local_finalize_handler(
                 );
                 return StatusCode::INTERNAL_SERVER_ERROR.into_response();
             }
-            return terminal_install_restart_response(&lifecycle_guard, &state).await;
+            terminal_install_restart_response(&lifecycle_guard, &state).await
         }
         Ok(household_rs::household_install_transaction::HouseholdInstallRecoveryOutcome::PartialNeedsRollback(ticket)) => {
             if let Err(error) = rollback_partial_candidate_install(
@@ -2803,6 +2803,10 @@ mod tests {
         );
     }
 
+    // This loopback-only test needs the raw serve primitive so it can observe
+    // Hyper draining the response body during graceful shutdown. It does not
+    // expose a production listener or a Product A route.
+    #[allow(clippy::disallowed_methods)]
     async fn signaled_response_survives_immediate_tcp_graceful_shutdown(
         status: StatusCode,
         body: Vec<u8>,

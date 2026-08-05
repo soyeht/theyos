@@ -228,10 +228,9 @@ pub fn phase3_recovery_manifest_exists(state_dir: &Path) -> bool {
     // merging is not a mechanical rewrite.
     #[allow(clippy::match_same_arms)]
     match fs::symlink_metadata(phase3_recovery_manifest_path(state_dir)) {
-        Ok(_) => true,
         Err(error) if error.kind() == ErrorKind::NotFound => false,
         // Failure to inspect is uncertainty, never cleanup authority.
-        Err(_) => true,
+        Ok(_) | Err(_) => true,
     }
 }
 
@@ -1683,6 +1682,12 @@ mod tests {
         );
     }
 
+    type Phase3EvidenceCase = (
+        &'static [u8],
+        fn(&Path, &[u8]) -> Result<(), StorageError>,
+        fn(&Path) -> PathBuf,
+    );
+
     #[test]
     fn atomic_round_trip() {
         let td = tempdir().unwrap();
@@ -1813,11 +1818,7 @@ mod tests {
     #[test]
     fn phase3_evidence_parent_barrier_failure_blocks_dispatch_until_exact_retry() {
         let td = tempdir().unwrap();
-        let cases: [(
-            &[u8],
-            fn(&Path, &[u8]) -> Result<(), StorageError>,
-            fn(&Path) -> PathBuf,
-        ); 2] = [
+        let cases: [Phase3EvidenceCase; 2] = [
             (
                 b"exact canonical JoinResponse",
                 write_phase3_pending_join_response,

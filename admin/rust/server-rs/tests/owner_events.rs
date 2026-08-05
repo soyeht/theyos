@@ -56,7 +56,7 @@ use household_rs::secure_upgrade::{
     SecureUpgradePlatform, SecureUpgradeProofEnvironment, SecureUpgradeTranscript,
 };
 use household_rs::storage::{
-    household_record_path, machine_cert_for, phase3_finalize_ack_marker_exists, staged_path_for,
+    household_record_path, machine_cert_for, read_phase3_recovery_manifest, staged_path_for,
 };
 use household_rs::{BootstrapOpts, HouseholdAuthState, KeyBackingPolicy};
 use keystore_rs::{FileKeystore, KeystoreBackend, KeystoreError};
@@ -69,7 +69,7 @@ use server_rs::handlers_owner_events::{
     self, OwnerApprovalEnforcementPolicy, OwnerEventsRouterState, OwnerOperationEnforcement,
     RecoveryCodeEnforcement, SecureUpgradeEnforcement, SecureUpgradeRuntimeConfig,
 };
-use server_rs::handlers_pair_machine::{PreHouseholdRouterState, pre_household_router};
+use server_rs::handlers_pair_machine::PreHouseholdRouterState;
 use server_rs::household_state::HouseholdState;
 use server_rs::macos_local_caller_auth::{
     MacosLocalAppProfile, MacosLocalCallerAuth, MacosLocalCallerAuthError,
@@ -79,7 +79,7 @@ use server_rs::macos_local_caller_auth::{
 use server_rs::macos_local_registration_listener::MacosLocalPeerConnectInfo;
 use tempfile::TempDir;
 use tokio::net::TcpListener;
-use tokio::sync::Notify;
+use tokio::sync::{Notify, RwLock};
 use tower::ServiceExt;
 use webauthn_authenticator_rs::WebauthnAuthenticator;
 use webauthn_authenticator_rs::softpasskey::SoftPasskey;
@@ -2043,9 +2043,33 @@ struct CandidateHarness {
     addr: String,
 }
 
+impl CandidateHarness {
+    async fn current_window_snapshot(
+        &self,
+    ) -> household_rs::pair_machine::PairMachineWindowSnapshot {
+        PairMachineWindow::with_persistence(self.td.path().to_path_buf())
+            .unwrap()
+            .snapshot()
+            .await
+    }
+
+    async fn assert_terminal_reexec_ready(&self) {
+        assert_eq!(
+            household_rs::bootstrap_state::load(self.td.path()).unwrap(),
+            household_rs::bootstrap_state::BootstrapState::Ready,
+        );
+        assert_eq!(
+            self.current_window_snapshot().await.state,
+            PairMachineState::Idle,
+            "the cold G1 process must not adopt the stale G0 pair window",
+        );
+    }
+}
+
 #[derive(Default)]
 struct BlockingFinalizeGate {
     calls: AtomicUsize,
+    released: AtomicBool,
     entered: Notify,
     release: Notify,
 }
@@ -2065,17 +2089,19 @@ impl BlockingFinalizeGate {
     }
 
     fn release_all(&self) {
+        self.released.store(true, Ordering::SeqCst);
         self.release.notify_waiters();
     }
 }
 
 #[derive(Clone)]
-struct BlockingFinalizeState {
-    inner: PreHouseholdRouterState,
-    gate: Arc<BlockingFinalizeGate>,
+struct RestartingFinalizeState {
+    current: Arc<RwLock<PreHouseholdRouterState>>,
+    mode: CandidateFinalizeMode,
+    gate: Option<Arc<BlockingFinalizeGate>>,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum CandidateFinalizeMode {
     Normal,
     CommitThenBadAck,
@@ -2087,37 +2113,46 @@ async fn start_candidate_harness() -> CandidateHarness {
 }
 
 async fn start_candidate_harness_with_mode(mode: CandidateFinalizeMode) -> CandidateHarness {
-    start_candidate_harness_with_router(|state| match mode {
-        CandidateFinalizeMode::Normal => pre_household_router(state),
-        CandidateFinalizeMode::CommitThenBadAck => Router::new()
-            .route(
-                "/pair-machine/local/finalize",
-                post(commit_then_bad_finalize_ack),
-            )
-            .with_state(state),
-        CandidateFinalizeMode::RejectFinalize => Router::new()
-            .route("/pair-machine/local/finalize", post(reject_finalize))
-            .with_state(state),
-    })
-    .await
+    match mode {
+        CandidateFinalizeMode::Normal | CandidateFinalizeMode::CommitThenBadAck => {
+            start_restarting_candidate_harness(mode, None).await
+        }
+        CandidateFinalizeMode::RejectFinalize => {
+            start_candidate_harness_with_router(|state| {
+                Router::new()
+                    .route("/pair-machine/local/finalize", post(reject_finalize))
+                    .with_state(state)
+            })
+            .await
+        }
+    }
 }
 
 async fn start_blocking_candidate_harness() -> (CandidateHarness, Arc<BlockingFinalizeGate>) {
     let gate = Arc::new(BlockingFinalizeGate::default());
-    let gate_for_router = Arc::clone(&gate);
-    let candidate = start_candidate_harness_with_router(move |state| {
+    let candidate =
+        start_restarting_candidate_harness(CandidateFinalizeMode::Normal, Some(Arc::clone(&gate)))
+            .await;
+    (candidate, gate)
+}
+
+async fn start_restarting_candidate_harness(
+    mode: CandidateFinalizeMode,
+    gate: Option<Arc<BlockingFinalizeGate>>,
+) -> CandidateHarness {
+    start_candidate_harness_with_router(move |state| {
         Router::new()
             .route(
                 "/pair-machine/local/finalize",
-                post(blocking_finalize_handler),
+                post(restarting_finalize_handler),
             )
-            .with_state(BlockingFinalizeState {
-                inner: state,
-                gate: Arc::clone(&gate_for_router),
+            .with_state(RestartingFinalizeState {
+                current: Arc::new(RwLock::new(state)),
+                mode,
+                gate,
             })
     })
-    .await;
-    (candidate, gate)
+    .await
 }
 
 async fn start_candidate_harness_with_router(
@@ -2161,26 +2196,43 @@ async fn start_candidate_harness_with_router(
     }
 }
 
-async fn blocking_finalize_handler(
-    State(state): State<BlockingFinalizeState>,
+async fn restarting_finalize_handler(
+    State(state): State<RestartingFinalizeState>,
     body: Bytes,
 ) -> Response {
-    state.gate.calls.fetch_add(1, Ordering::SeqCst);
-    state.gate.entered.notify_waiters();
-    state.gate.release.notified().await;
-    server_rs::handlers_pair_machine::local_finalize_handler(State(state.inner), body).await
-}
-
-async fn commit_then_bad_finalize_ack(
-    State(state): State<PreHouseholdRouterState>,
-    body: Bytes,
-) -> Response {
-    let committed =
-        server_rs::handlers_pair_machine::local_finalize_handler(State(state), body).await;
-    if committed.status() != StatusCode::OK {
-        return committed;
+    if let Some(gate) = state.gate.as_ref() {
+        gate.calls.fetch_add(1, Ordering::SeqCst);
+        gate.entered.notify_waiters();
+        if !gate.released.load(Ordering::SeqCst) {
+            gate.release.notified().await;
+        }
     }
-    (StatusCode::OK, b"not-cbor".to_vec()).into_response()
+    let current = state.current.read().await.clone();
+    let response =
+        server_rs::handlers_pair_machine::local_finalize_handler(State(current.clone()), body)
+            .await;
+    if response.status() == StatusCode::SERVICE_UNAVAILABLE {
+        let lifecycle = HouseholdLifecycleLock::open_verified(&current.state_dir).unwrap();
+        let guard = lifecycle.lock_exclusive().unwrap();
+        let cold_window = Arc::new(
+            PairMachineWindow::with_persistence_under_lifecycle(current.state_dir.clone(), &guard)
+                .unwrap(),
+        );
+        drop(guard);
+        *state.current.write().await = PreHouseholdRouterState {
+            window: cold_window,
+            state_dir: current.state_dir,
+            key_policy: current.key_policy,
+            bootstrap: current.bootstrap,
+            runtime_signal: current.runtime_signal,
+        };
+        return response;
+    }
+    if response.status() == StatusCode::OK && state.mode == CandidateFinalizeMode::CommitThenBadAck
+    {
+        return (StatusCode::OK, b"not-cbor".to_vec()).into_response();
+    }
+    response
 }
 
 async fn reject_finalize() -> Response {
@@ -5601,6 +5653,16 @@ fn owner_webauthn_add_credential_start_source_guards_challenge_only_contract() {
 #[test]
 fn owner_webauthn_add_credential_finish_source_guards_mutation_contract() {
     let source = include_str!("../src/handlers_owner_events.rs");
+    let persistence = source_segment(
+        source,
+        "async fn persist_owner_auth_under_lifecycle(",
+        "#[derive(Clone)]\npub struct OwnerEventsRouterState",
+    );
+    assert!(persistence.contains("acquire_owner_events_lifecycle_exclusive"));
+    assert!(persistence.contains("verify_installed_identity_under_lifecycle"));
+    assert!(persistence.contains(".save("));
+    assert!(persistence.contains("MayHaveTakenEffect"));
+    assert!(persistence.contains("set_owner_auth"));
     let plan = source_segment(
         source,
         "fn owner_webauthn_add_credential_finish_plan(",
@@ -9743,7 +9805,7 @@ async fn owner_webauthn_registration_rejects_non_empty_authority_without_anchor(
     let owner_auth_for_assert = owner_auth.clone();
     let anchor_store: Arc<dyn keystore_rs::KeystoreBackend> =
         Arc::new(FileKeystore::new(td.path(), keystore_rs::SERVICE));
-    let (_td, router, _log, _broadcaster, person, identity, _window) =
+    let (td, router, _log, _broadcaster, person, identity, _window) =
         router_from_owner_auth(td, identity, owner_auth, person, Duration::from_secs(45), {
             let anchor_store = Arc::clone(&anchor_store);
             move |state| {
@@ -9774,7 +9836,7 @@ async fn owner_webauthn_registration_rejects_non_empty_authority_without_anchor(
     assert_generic_unauth(status, &resp_bytes);
 
     let (_td, router, _log, _broadcaster, person, identity, _window) = router_from_owner_auth(
-        tempfile::tempdir().unwrap(),
+        td,
         Arc::clone(&identity),
         owner_auth_for_assert.clone(),
         person,
@@ -10263,10 +10325,7 @@ async fn approve_happy_path_drives_commit() {
     assert!(machine_cert_for(candidate.td.path(), &m2_id).exists());
     assert_eq!(window.snapshot().await.state, PairMachineState::Committed);
     assert!(window.snapshot().await.cached_response.is_some());
-    assert_eq!(
-        candidate.window.snapshot().await.state,
-        PairMachineState::Committed
-    );
+    candidate.assert_terminal_reexec_ready().await;
     assert!(!household_root_sole_path(td.path()).exists());
     let events = read_owner_events_since(td.path(), &log, event.cursor);
     assert_eq!(events.len(), 1);
@@ -10335,10 +10394,7 @@ async fn approve_legacy_policy_allows_tierless_owner_before_strong_minting() {
     let ack: OwnerApprovalAck = household_rs::cbor::from_canonical_slice(&resp_bytes).unwrap();
     assert_eq!(ack.version, 1);
     assert_eq!(window.snapshot().await.state, PairMachineState::Committed);
-    assert_eq!(
-        candidate.window.snapshot().await.state,
-        PairMachineState::Committed
-    );
+    candidate.assert_terminal_reexec_ready().await;
     let events = read_owner_events_since(td.path(), &log, event.cursor);
     assert_eq!(events.len(), 1);
     assert!(matches!(
@@ -10640,7 +10696,7 @@ async fn approve_v2_reviewed_rollout_rejects_tierless_owner_before_fan_out() {
     );
     assert!(read_owner_events_since(td.path(), &log, event.cursor).is_empty());
     assert_ne!(
-        candidate.window.snapshot().await.state,
+        candidate.current_window_snapshot().await.state,
         PairMachineState::Committed
     );
 }
@@ -11155,10 +11211,7 @@ async fn approve_v2_double_prepare_claim_rejects_second_valid_approval() {
     assert_eq!(ack.version, 1);
     assert_eq!(window.snapshot().await.state, PairMachineState::Committed);
     assert!(window.snapshot().await.approval_claim.is_none());
-    assert_eq!(
-        candidate.window.snapshot().await.state,
-        PairMachineState::Committed
-    );
+    candidate.assert_terminal_reexec_ready().await;
     let events = read_owner_events_since(td.path(), &log, event.cursor);
     assert_eq!(events.len(), 1);
     assert!(matches!(
@@ -11392,15 +11445,15 @@ async fn approve_preserves_m1_evidence_when_m2_commits_but_ack_is_bad() {
     assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
     let parsed: GenericUnauth = household_rs::cbor::from_canonical_slice(&resp_bytes).unwrap();
     assert_eq!(parsed.error, "internal");
-    assert_eq!(
-        candidate.window.snapshot().await.state,
-        PairMachineState::Committed
-    );
+    candidate.assert_terminal_reexec_ready().await;
     assert_eq!(
         window.snapshot().await.state,
         PairMachineState::AwaitingOwner
     );
-    assert!(phase3_finalize_ack_marker_exists(td.path()));
+    assert!(
+        read_phase3_recovery_manifest(td.path()).unwrap().is_some(),
+        "the exact manifest is the sole M1 recovery authority after launch",
+    );
     assert!(staged_path_for(&household_record_path(td.path())).exists());
     assert!(staged_path_for(&shamir_self_shard_path(td.path())).exists());
     let m2_id = household_rs::derive_machine_id(
@@ -11983,7 +12036,7 @@ mod device_roster_read {
             Err(other) => {
                 panic!("expected the cross-root authority to be unavailable, got {other:?}")
             }
-            Ok(_) => panic!("a foreign household root must never authorize"),
+            Ok(_) => panic!("a cross-root authority must never authorize"),
         }
     }
 

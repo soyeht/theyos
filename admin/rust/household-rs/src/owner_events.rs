@@ -1183,9 +1183,8 @@ mod lifecycle_tests {
             state.path().to_path_buf(),
             "hh_intentionally-not-the-installed-household",
         );
-        let error = match result {
-            Ok(_) => panic!("mismatched household id must not open the log"),
-            Err(error) => error,
+        let Err(error) = result else {
+            panic!("mismatched household id must not open the log");
         };
         assert!(matches!(error, EventError::StaleLifecycleBinding));
         assert!(!log_dir(state.path()).exists());

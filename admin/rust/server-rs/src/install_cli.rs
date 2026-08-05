@@ -85,7 +85,7 @@ enum PairMachineWaitOutcome {
 
 enum ColdTerminalRecovery {
     /// A terminal G1 install is active. The ordinary daemon owns the exact
-    /// supervised replay listener in both `RestartRequired` and Ready, so a cold
+    /// supervised replay listener in both `RestartRequired` and `Ready`, so a cold
     /// invocation must start it immediately instead of making daemon liveness
     /// depend on another Ack arriving within a finite CLI timeout.
     ReadyForDaemon,

@@ -6656,11 +6656,12 @@ pub async fn owner_approve_handler(
     // see the post-Shamir household and `founder_stage_join_request`'s
     // `shamir_n == 1` gate refuses any further add-machine attempts on
     // the now-stale single-machine path. (B6.)
-    let Ok(Some(reloaded)) = household_rs::bootstrap::try_load_existing_under_lifecycle(
+    let reloaded_result = household_rs::bootstrap::try_load_existing_under_lifecycle(
         &post_ack_lifecycle_guard,
         &state.state_dir,
         state.key_backing_policy,
-    ) else {
+    );
+    let Ok(Some(reloaded)) = reloaded_result else {
         // Disk is already authoritative and cannot be rolled back. Refuse
         // to publish the committed window alongside a stale pre-Shamir
         // in-memory identity; boot recovery will reload the durable state.

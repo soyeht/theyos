@@ -374,15 +374,27 @@ fn r1a7_enumerates_linked_targets_and_proves_zero_production_callers() {
             .any(|member| member == "m1-household-mesh-smoke-rs")
     );
     let targets = enumerate_workspace_targets(&rust_root, &members);
-    // 201 + 5. DERIVED FROM MEASUREMENT, then explained -- not summed. The
-    // composition adds seven files under `tests/`, of which exactly five are
-    // enumerated targets:
+    // 202 + 4, and BOTH halves of that were wrong here before. The composition
+    // adds six files under `tests/`, of which exactly four are enumerated
+    // targets:
     //
-    //   household-rs/tests/compile_fail_peer_expectation.rs      (lifecycle)
     //   household-rs/tests/compile_fail_pending_admission.rs     (integration)
     //   household-rs/tests/compile_fail_fixture_coverage.rs      (orphan gate)
     //   household-rs/tests/workspace_msrv_invariant.rs           (MSRV floor)
     //   server-rs/tests/khai_b3_exposure_decision_guard.rs       (B-3 exposure)
+    //
+    // Two corrections, found by running the enumerator on both trees and
+    // diffing the LISTS rather than the counts:
+    //
+    //   - `compile_fail_peer_expectation.rs` was listed here and is NOT new:
+    //     it exists in `8ff3788a`, in the freeze, and in the author's leg. The
+    //     list said five; the enumerator's own diff says four, and names them.
+    //   - the base was not 201. Run against `31cc5ae8` the enumerator reports
+    //     202, so that pin was already one low against its own tree -- the
+    //     ratchet there fails with `left: 202, right: 201`. Re-measuring here
+    //     silently corrected it, which is exactly the failure mode of taking
+    //     the expected value from the instrument being pinned: it absorbs the
+    //     defect instead of reporting it. 202 + 4 = 206.
     //
     // The other two, `mesh-session-control-model-rs/tests/{cas_multiprocess,
     // model_invariants}.rs`, do NOT count: that crate is in the workspace's

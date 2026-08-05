@@ -1993,9 +1993,9 @@ mod tests {
         .unwrap()
     }
 
-    fn begin<'a>(
+    fn begin(
         state: &TempDir,
-        lifecycle: &'a HouseholdLifecycleLock,
+        lifecycle: &HouseholdLifecycleLock,
     ) -> (
         crate::household_lifecycle::LifecycleWriteGuard,
         HouseholdInstallExpectation,

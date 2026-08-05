@@ -1003,6 +1003,10 @@ mod tests {
 
     #[tokio::test]
     async fn every_uri_variant_carries_the_critical_machine_cert_fingerprint() {
+        // RFC 5737 documentation address — the same one `PairDeviceQR.swift`
+        // uses in its frozen examples. No real or tailnet address in fixtures.
+        const DOC_HOST: &str = "192.0.2.10:8091";
+
         let fp: [u8; 32] = [
             0x9a, 0x3f, 0x01, 0xff, 0x10, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa,
             0xbb, 0xcc, 0xdd, 0xee, 0xff, 0x00, 0x12, 0x34, 0x56, 0x78, 0x9a, 0xbc, 0xde, 0xf0,
@@ -1015,9 +1019,6 @@ mod tests {
         // Every entry point, not just the widest one: `to_uri` and
         // `to_uri_with_host` delegate today, but a future edit could give one
         // of them its own body and silently drop the critical field.
-        // RFC 5737 documentation address — the same one `PairDeviceQR.swift`
-        // uses in its frozen examples. No real or tailnet address in fixtures.
-        const DOC_HOST: &str = "192.0.2.10:8091";
         assert_ios_pair_device_qr_contract(&token.to_uri(&hh, &fp), &fp);
         assert_ios_pair_device_qr_contract(&token.to_uri_with_host(&hh, Some(DOC_HOST), &fp), &fp);
         assert_ios_pair_device_qr_contract(

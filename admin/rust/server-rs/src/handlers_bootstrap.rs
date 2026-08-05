@@ -4179,10 +4179,10 @@ mod tests {
     }
 
     /// No-secret logging: the data the handler logs on success is derived
-    /// purely from non-secret fields (stage/hh_id/ttl_secs/expires_at_unix/
-    /// host). The nonce lives ONLY in `pair_qr_uri`, which is returned in the
+    /// purely from non-secret fields (`stage`/`hh_id`/`ttl_secs`/
+    /// `expires_at_unix`/`host`). The nonce lives ONLY in `pair_qr_uri`, which is returned in the
     /// CBOR body and is never written to the log. We assert that the value we
-    /// would log (the `host` fallback + hh_id + numeric fields) never carries
+    /// would log (the `host` fallback + `hh_id` + numeric fields) never carries
     /// the nonce that appears in the response URI.
     #[tokio::test]
     async fn reissue_log_fields_exclude_nonce_and_uri() {
