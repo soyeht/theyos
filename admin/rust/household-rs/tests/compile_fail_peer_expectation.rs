@@ -29,8 +29,14 @@
 #[test]
 fn peer_authority_claims_have_no_production_constructor() {
     let t = trybuild::TestCases::new();
-    t.compile_fail("tests/compile-fail/peer_expectation_struct_literal.rs");
-    t.compile_fail("tests/compile-fail/peer_expectation_injected_for_harness.rs");
-    t.compile_fail("tests/compile-fail/authenticated_peer_claim_struct_literal.rs");
-    t.compile_fail("tests/compile-fail/authenticated_peer_claim_injected_for_harness.rs");
+    // Glob, not a hand-written list. A list duplicates what the directory
+    // already says, and the two drift: this file's list and the lifecycle
+    // branch's grew independently, so resolving that conflict either way
+    // silently drops whichever proofs the losing side added -- and the suite
+    // stays green, because a fixture nobody names simply never runs.
+    //
+    // With a glob the set IS the directory. A new fixture runs by existing,
+    // and a fixture in no globbed directory is caught by
+    // `compile_fail_fixture_coverage`.
+    t.compile_fail("tests/compile-fail/peer_expectation/*.rs");
 }

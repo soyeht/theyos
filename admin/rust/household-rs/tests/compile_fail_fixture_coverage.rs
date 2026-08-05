@@ -93,9 +93,18 @@ fn fixtures_referenced(tests: &Path) -> BTreeSet<String> {
                 continue;
             };
             let arg = &rest[open + 1..open + 1 + close];
-            // Normalise to the stem so `tests/compile-fail/x.rs`, a glob
-            // expansion, or any future path shape all compare equally.
-            if let Some(stem) = Path::new(arg).file_stem() {
+            if arg.contains('*') {
+                // trybuild 1 expands globs itself (`expand_globs` ->
+                // `glob::glob`), so a globbed directory covers every fixture
+                // in it. Expand the same way here, or this test would report
+                // every globbed fixture as an orphan and the runner change
+                // that removes the drift would look like the drift.
+                let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join(Path::new(arg).parent().unwrap_or(Path::new("")));
+                let mut covered = BTreeSet::new();
+                fixtures_on_disk(&dir, &mut covered);
+                referenced.extend(covered);
+            } else if let Some(stem) = Path::new(arg).file_stem() {
                 referenced.insert(stem.to_string_lossy().into_owned());
             }
         }
@@ -144,17 +153,41 @@ fn every_compile_fail_fixture_is_run_by_some_runner() {
     );
 }
 
+/// Full fixture paths, so the `.stderr` sibling is looked for NEXT TO the
+/// fixture. Keying this on the stem and joining it to the root directory was
+/// wrong the moment fixtures moved into per-runner subdirectories: every
+/// sibling suddenly "went missing" at once. A check that reports all N items
+/// failing is usually measuring the checker, not the code.
+fn fixture_paths(dir: &Path, out: &mut Vec<PathBuf>) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            fixture_paths(&path, out);
+        } else if path.extension().is_some_and(|ext| ext == "rs") {
+            out.push(path);
+        }
+    }
+}
+
 #[test]
 fn every_compile_fail_fixture_has_expected_stderr() {
     let dir = tests_dir().join("compile-fail");
-    let mut on_disk = BTreeSet::new();
-    fixtures_on_disk(&dir, &mut on_disk);
-    assert!(on_disk.len() >= 5, "directory walk is broken");
+    let mut paths = Vec::new();
+    fixture_paths(&dir, &mut paths);
+    assert!(paths.len() >= 5, "directory walk is broken");
 
-    let missing: Vec<String> = on_disk
+    let missing: Vec<String> = paths
         .iter()
-        .filter(|stem| !dir.join(format!("{stem}.stderr")).exists())
-        .cloned()
+        .filter(|rs| !rs.with_extension("stderr").exists())
+        .map(|rs| {
+            rs.strip_prefix(&dir)
+                .unwrap_or(rs)
+                .to_string_lossy()
+                .into_owned()
+        })
         .collect();
     assert!(
         missing.is_empty(),
